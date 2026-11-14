@@ -125,6 +125,17 @@ int main(void) {
         check("grown net computes the donor's mapped outputs", emax < 1e-3);
         free(h); free(od); free(og); nn_free(dx); unet_free(donor); unet_free(grown);
     }
+    {   /* non-finite weights (ops audit #10): unet_save refuses (-2) and leaves the previous file whole, no .tmp behind */
+        unet *u = unet_create(&cfg); unet_init(u, 3);
+        check("save a good state", unet_save(u, a, 5, nullptr) == 0);
+        const size_t n = unet_nparams(u); float *g = calloc(n, 4); g[n / 2] = NAN; unet_grad_h2d(u, g); free(g);
+        update(u, 0, 6);
+        char tp[120]; snprintf(tp, sizeof tp, "%s.tmp", a);
+        check("non-finite weights: save refused", unet_save(u, a, 6, nullptr) == -2);
+        unet *r = unet_create(&cfg);
+        check("the previous checkpoint is intact", unet_load(r, a) == 5 && access(tp, F_OK) != 0);
+        unet_free(r); unet_free(u);
+    }
     const char *e = nn_check(); check("CUDA checks", !e); if (e) printf("%s\n", e);
     unlink(base); unlink(a); unlink(b); unlink(old); unlink(cut);
     return failures != 0;

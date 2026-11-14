@@ -29,6 +29,7 @@ def run(*args, ok=0, extra_env=None):
     env.update(extra_env or {})
     r = subprocess.run([str(BIN), *map(str, args)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60, env=env)
     assert r.returncode == ok, r.stdout
+    assert "DEFAULTED:" not in r.stdout, "a fallback changed a result (DEFAULTED line, src/defaulted.h):\n" + r.stdout   # (ops audit #10)
     return r.stdout
 
 

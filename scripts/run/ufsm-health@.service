@@ -1,0 +1,17 @@
+# systemd --user unit: the health watcher of training run %i (scripts/run/health.py; installed by scripts/run/install_health.sh).
+# Per-run options (run root, extra disks) in ~/.config/ufsm/health-%i.env: UFSM_RUN_ROOT=..., HEALTH_ARGS=...
+[Unit]
+Description=ufsm health watcher for run %i
+
+[Service]
+Type=simple
+Environment=UFSM_RUN_ROOT=/vesuvius/ufsm/v2/lat/runs
+EnvironmentFile=-%h/.config/ufsm/health-%i.env
+ExecStart=/usr/bin/python3 %h/.local/share/ufsm/health.py %i $HEALTH_ARGS
+Restart=always
+RestartSec=30
+Nice=10
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

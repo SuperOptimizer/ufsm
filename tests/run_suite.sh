@@ -14,22 +14,35 @@
 #               "none" runs no GPU test (they are reported SKIP)
 #     -G N      GPU tests at a time per GPU (default: free memory / 2.5 GB, 2..8; env SUITE_GPU_SLOTS)
 #     -x S      per-test timeout in seconds (default 1800)
+#     -W S      how long a GPU test waits for a card held by someone else (a training run's exclusive lock, or a foreign process
+#               with >= 1 GB on it) before it is reported BUSY (default 300; env SUITE_LOCK_WAIT); the wait is per card and suite:
+#               once a card timed out, later tests give up on it at once while it stays held
+#     -F        ignore foreign GPU processes (only the locks decide)
+#     -I        incomplete is fine: exit 0 instead of 3 when GPU tests were not run (the edit loop; never a merge gate)
 #     -P        profile: strace marks the tests that open /dev/nvidia* (gpu column "+nv"), nvidia-smi samples their GPU memory
 #     -l        list the selected tests and exit
 # Manifest lines: NAME | TAGS | EST_SECONDS | COMMAND   (bash, run from the repo root, $B = the build dir; # comments)
 #   tags: gpu (takes a GPU lock, CUDA_VISIBLE_DEVICES = that GPU), gpu2 (both GPUs when there are two), slow (test-slow tier),
 #   flaky (a failure is retried once and reported FLAKY when the retry passes), solo (runs with nothing else in this suite).
-# GPU locks are machine-wide ($SUITE_LOCK_DIR, default /tmp/ufsm-suite-locks/gpu<i>.<slot>): concurrent suites (several agents
-# on one machine) share the GPUs one test at a time instead of piling up. Tests start longest-first (EST) so -j packs well.
-# Exit 0 when every selected test passed (FLAKY counts as passed), 1 otherwise. A test that prints a line starting "SKIP" and exits
-# 0 is reported SKIP.
+# GPU locks are machine-wide ($SUITE_LOCK_DIR, default /tmp/ufsm-suite-locks): a test holds gpu<i>.excl SHARED (flock -s) and one
+# slot lock gpu<i>.<slot>. A training run takes gpu<i>.excl EXCLUSIVE (flock -x) for its lifetime, so no suite test lands on its
+# card whatever the slot count (the old slot-only scheme leaked: a trainer held slots .0 / .1, a suite sized for free memory took .2+).
+# A card with a foreign compute process (>= 1 GB, not a suite test: /proc/<pid>/environ has no UFSM_SUITE_TEST) counts as held too.
+# Concurrent suites (several agents on one machine) share the GPUs one test at a time. Tests start longest-first (EST).
+# gpu2 tests on a machine with one GPU: the ones tagged l2 run there on two logical devices (UFSM_TEST_GPUS=0,0: train --gpus 0,0);
+# the others are reported NEED2.
+# Statuses: PASS, FLAKY (passed on the retry), SKIP (the test printed a line starting "SKIP" and exited 0), FAIL, TIMEOUT, and the
+# not-run ones NOGPU (no GPU here / -g none), BUSY (its card stayed held -W seconds), NEED2 (a gpu2 test, one GPU, not l2).
+# Exit 0: everything selected passed. 1: a FAIL / TIMEOUT. 3: no failure, but GPU tests were not run (INCOMPLETE: not a merge gate;
+# -I turns it into 0). 2: usage / manifest errors.
 set -u
 H=$(cd "$(dirname "$0")/.." && pwd); cd "$H" || exit 2
 MANIFEST=${SUITE_MANIFEST:-$H/tests/suite.txt}
 TIER=fast; CHANGED=; J=${SUITE_J:-}; T=${SUITE_THREADS:-}; BDIR=build-verify; OUT=; GPUS=; GSLOTS=${SUITE_GPU_SLOTS:-}; TO=1800; PROF=0; LIST=0
-while getopts "t:c:j:T:B:o:g:G:x:Plh" o; do case $o in
+LWAIT=${SUITE_LOCK_WAIT:-300}; NOFOREIGN=0; INCOK=0
+while getopts "t:c:j:T:B:o:g:G:x:W:FIPlh" o; do case $o in
   t) TIER=$OPTARG;; c) CHANGED=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; B) BDIR=$OPTARG;; o) OUT=$OPTARG;; g) GPUS=$OPTARG;; G) GSLOTS=$OPTARG;;
-  x) TO=$OPTARG;; P) PROF=1;; l) LIST=1;; *) sed -n '2,24p' "$0"; exit 2;; esac; done
+  x) TO=$OPTARG;; W) LWAIT=$OPTARG;; F) NOFOREIGN=1;; I) INCOK=1;; P) PROF=1;; l) LIST=1;; *) sed -n '2,40p' "$0"; exit 2;; esac; done
 shift $((OPTIND - 1)); FILTERS=("$@")
 case $TIER in fast|slow|all|smoke) ;; *) echo "run_suite: tier $TIER (fast|slow|all|smoke)" >&2; exit 2;; esac
 
@@ -126,6 +139,12 @@ isgpu() { hastag "$1" gpu || hastag "$1" gpu2; }
 mapfile -t QUEUE < <(for n in "${NAMES[@]}"; do echo "${EST[$n]} $n"; done | sort -k1,1nr -s | cut -d' ' -f2-)
 if [ $LIST = 1 ]; then for n in "${QUEUE[@]}"; do printf '%-48s %-14s %6s  %s\n' "$n" "${TAGS[$n]:--}" "${EST[$n]}" "${CMD[$n]}"; done; exit 0; fi
 
+# old default output dirs (failed runs keep theirs; on tmpfs that is RAM): this user's, older than 2 days, their runner gone
+for d in "${TMPDIR:-/tmp}"/ufsm-suite-*; do
+  [ -d "$d" ] && [ -O "$d" ] && [[ ${d##*/} =~ ^ufsm-suite-([0-9]+)$ ]] || continue
+  kill -0 "${BASH_REMATCH[1]}" 2> /dev/null && continue
+  [ -n "$(find "$d" -maxdepth 0 -mtime +2 2> /dev/null)" ] && case "$d" in */ufsm-suite-[0-9]*) rm -rf -- "$d";; esac
+done
 [ -z "$OUT" ] && OUT=${TMPDIR:-/tmp}/ufsm-suite-$$
 mkdir -p "$OUT/logs" "$OUT/res" "$OUT/tmp" || exit 2
 OUT=$(cd "$OUT" && pwd)
@@ -146,26 +165,83 @@ fi
 
 # one test (runs in a background subshell): GPU lock, timeout, timing, one retry for flaky tests -> $OUT/res/<name>
 # res line: status rc wall user sys maxrss_mb gpus attempts
+# who holds card $1: the exclusive lock's holder (lslocks), else a foreign compute process (>= 1 GB, no UFSM_SUITE_TEST in its
+# environment; nvidia-smi sampled at most every 10 s into $OUT/gpuusers); prints "pid command" or nothing when the card is free of both
+UUIDS=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2> /dev/null | tr -d ' ')
+holder() {
+  local i=$1 lf=$LOCKD/gpu$1.excl p u m f c t
+  if command -v lslocks > /dev/null; then
+    p=$(lslocks -n -o PID,MODE,PATH 2> /dev/null | awk -v f="$lf" '$3 == f && $2 == "WRITE" {print $1; exit}')
+    [ -n "$p" ] && { echo "$p $(tr '\0' ' ' < /proc/$p/cmdline 2> /dev/null | cut -c1-120) (exclusive lock $lf)"; return; }
+  fi
+  [ $NOFOREIGN = 1 ] && return
+  f=$OUT/gpuusers; t=$f.$BASHPID
+  if [ ! -f "$f" ] || [ $(( $(date +%s) - $(stat -c %Y "$f" 2> /dev/null || echo 0) )) -ge 10 ]; then
+    nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory --format=csv,noheader,nounits 2> /dev/null | tr -d ' ' > "$t" && mv -f "$t" "$f"
+  fi
+  [ -f "$f" ] || return
+  u=$(echo "$UUIDS" | awk -F, -v i="$i" '$1 == i {print $2}'); [ -z "$u" ] && return
+  while IFS=, read -r p c m; do
+    [ "$c" = "$u" ] && [ "${m:-0}" -ge 1024 ] || continue
+    tr '\0' '\n' < /proc/$p/environ 2> /dev/null | grep -q '^UFSM_SUITE_TEST=' && continue
+    echo "$p $(tr '\0' ' ' < /proc/$p/cmdline 2> /dev/null | cut -c1-120) (${m} MiB on GPU $i, not a suite test)"; return
+  done < "$f"
+}
+
+# one test (runs in a background subshell): GPU lock, timeout, timing, one retry for flaky tests -> $OUT/res/<name>
+# res line: status rc wall user sys maxrss_mb gpus attempts
 run_one() {
-  local n=$1 cm=${CMD[$1]} log=$OUT/logs/$1.log tmp=$OUT/tmp/$1 g= fds=() a rc st=FAIL wall=0 us=0 sy=0 rss=0 want=1
+  local n=$1 cm=${CMD[$1]} log=$OUT/logs/$1.log tmp=$OUT/tmp/$1 g= fds=() a rc st=FAIL wall=0 us=0 sy=0 rss=0 want=1 lg=
   if isgpu "$n"; then
     hastag "$n" gpu2 && [ $NG -ge 2 ] && want=2
-    local got=() fd i k lf
+    hastag "$n" gpu2 && [ $NG = 1 ] && lg=0,0      # (only l2 tests get here on one GPU: the scheduler reports the others NEED2)
+    local got=() fd fx i k lf h w0 said= busy
+    w0=$(date +%s)
     while [ ${#got[@]} -lt $want ]; do      # first free slot, GPUs in preference order; poll (machine-wide locks)
+      busy=0
       for i in "${GL[@]}"; do
         [[ " ${got[*]} " == *" $i "* ]] && continue
+        exec {fx}> "$LOCKD/gpu$i.excl" || continue
+        if ! flock -s -n $fx || { h=$(holder "$i"); [ -n "$h" ]; }; then   # held exclusively (a trainer) or a foreign process on it
+          exec {fx}>&-; busy=$((busy + 1)); h=${h:-$(holder "$i")}
+          [ -z "$said" ] && { echo "run_suite: $n waits for GPU $i: held by ${h:-? (exclusive lock)}"; said=1; }
+          continue
+        fi
         for ((k = 0; k < GSLOTS; k++)); do
           lf=$LOCKD/gpu$i.$k; exec {fd}> "$lf" || continue
-          if flock -n $fd; then got+=("$i"); fds+=($fd); break; fi
+          if flock -n $fd; then got+=("$i"); fds+=($fd $fx); break; fi
           exec {fd}>&-
         done
+        if [[ " ${got[*]} " == *" $i "* ]]; then rm -f "$OUT/busy.$i"
+        else   # every slot held: by this suite's own tests (it never starts more than its slots: wait) or by someone else
+          exec {fx}>&-
+          local own=0; for ((k = 0; k < GSLOTS; k++)); do grep -qx "$i.$k" "$OUT"/slots.* 2> /dev/null && own=$((own + 1)); done
+          if [ $own -lt $GSLOTS ]; then busy=$((busy + 1))
+            [ -z "$said" ] && { h=$(lslocks -n -o PID,PATH 2> /dev/null | awk -v d="$LOCKD/gpu$i." 'index($2, d) == 1 {print $1; exit}')
+              echo "run_suite: $n waits for GPU $i: its slot locks are held by pid ${h:-?} $( [ -n "$h" ] && tr '\0' ' ' < /proc/$h/cmdline 2> /dev/null | cut -c1-120)"; said=1; }
+          fi
+        fi
         [ ${#got[@]} -ge $want ] && break
       done
       # all or nothing: a gpu2 test that holds one slot while it polls for the second deadlocks once every slot is held that way (4 gpu2
       # tests on 2 GPUs x 2 slots stalled the 2026-11-11 suite for 80 min), so a partial set is released before the retry
-      if [ ${#got[@]} -lt $want ]; then for fd in "${fds[@]}"; do exec {fd}>&-; done; got=(); fds=(); sleep 0.$((RANDOM % 5 + 2)); fi
+      if [ ${#got[@]} -lt $want ]; then
+        for fd in "${fds[@]}"; do exec {fd}>&-; done; got=(); fds=()
+        # held cards: give up after -W s; a card another test of this suite already timed out on (busy.<i>) gives up at once
+        if [ $busy -gt 0 ] && [ $busy -gt $(( ${#GL[@]} - want )) ]; then
+          local allb=1; for i in "${GL[@]}"; do [ -f "$OUT/busy.$i" ] || allb=0; done
+          if [ $allb = 1 ] || [ $(( $(date +%s) - w0 )) -ge "$LWAIT" ]; then
+            for i in "${GL[@]}"; do touch "$OUT/busy.$i"; done
+            { echo "# $n [${TAGS[$n]}]: BUSY, not run: no GPU free after $(( $(date +%s) - w0 )) s"; for i in "${GL[@]}"; do echo "#   GPU $i: $(holder "$i")"; done; } > "$log"
+            echo "BUSY 0 0 0 0 0 - 0" > "$OUT/res/$n"; return
+          fi
+        fi
+        sleep 0.$((RANDOM % 5 + 2))
+      fi
     done
     g=$(IFS=,; echo "${got[*]}")
+    local slotrec=$OUT/slots.$BASHPID; : > "$slotrec"
+    for fd in "${fds[@]}"; do lf=$(readlink /proc/$BASHPID/fd/$fd 2> /dev/null); [[ $lf =~ /gpu([0-9]+)\.([0-9]+)$ ]] && echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" >> "$slotrec"; done
   fi
   for a in 1 2; do
     rm -rf -- "$tmp"; mkdir -p "$tmp"
@@ -177,6 +253,7 @@ run_one() {
       # a test without the gpu tag sees no GPU: one that needs it fails or skips here instead of using a card without the lock (2026-11-13:
       # test_attn, test_attn_ray / _dfm, test_spiralfit, test_countfield, test_mesh_phase ran untagged on GPUs held by training runs)
       if [ -n "$g" ]; then export CUDA_VISIBLE_DEVICES=$g; else export CUDA_VISIBLE_DEVICES=; fi
+      [ -n "$lg" ] && export UFSM_TEST_GPUS=$lg      # (an l2 test on one card: two logical devices)
       echo $BASHPID > "$OUT/tmp/$n.pid"
       echo "# $n [${TAGS[$n]}] attempt $a gpu=${g:--} $(date '+%F %T') on $(hostname)"; echo "# $cm"
       if [ -n "$TIMEBIN" ]; then exec $TIMEBIN -f '%e %U %S %M' -o "$OUT/tmp/$n.time" timeout -k 20 "$TO" "${pre[@]}" bash -c "$cm"
@@ -194,6 +271,7 @@ run_one() {
   if [ $PROF = 1 ] && [ -f "$OUT/tmp/$n.strace" ]; then grep -q '/dev/nvidia' "$OUT/tmp/$n.strace" && g="${g:-}+nv"; rm -f "$OUT/tmp/$n.strace"; fi
   rm -f "$OUT/tmp/$n.pid"
   for fd in "${fds[@]}"; do exec {fd}>&-; done
+  rm -f "$OUT/slots.$BASHPID"
   [ $rc = 0 ] && rm -rf -- "$tmp"
   echo "$st $rc $wall $us $sy $rss ${g:--} $a" > "$OUT/res/$n"
 }
@@ -217,8 +295,10 @@ while [ ${#QUEUE[@]} -gt 0 ] || [ $RUN -gt 0 ]; do
     for i in "${!QUEUE[@]}"; do
       n=${QUEUE[$i]}
       if isgpu "$n"; then
-        if [ $NG = 0 ]; then echo "SKIP 0 0 0 0 0 - 0" > "$OUT/res/$n"; echo "# no GPU (-g none / no nvidia-smi)" > "$OUT/logs/$n.log"
-          unset "QUEUE[$i]"; QUEUE=("${QUEUE[@]}"); DONE=$((DONE + 1)); printf '[%3d/%d] SKIP    (no GPU)  %s\n' $DONE $TOT "$n"; started=1; break; fi
+        nr=; [ $NG = 0 ] && nr="NOGPU no GPU (-g none / no nvidia-smi)"
+        [ $NG = 1 ] && hastag "$n" gpu2 && ! hastag "$n" l2 && nr="NEED2 a gpu2 test without the l2 tag, one GPU here"
+        if [ -n "$nr" ]; then echo "${nr%% *} 0 0 0 0 0 - 0" > "$OUT/res/$n"; echo "# not run: ${nr#* }" > "$OUT/logs/$n.log"
+          unset "QUEUE[$i]"; QUEUE=("${QUEUE[@]}"); DONE=$((DONE + 1)); printf '[%3d/%d] %-7s (%s)  %s\n' $DONE $TOT "${nr%% *}" "${nr#* }" "$n"; started=1; break; fi
         [ $GBUSY -ge $GCAP ] && continue
       fi
       if hastag "$n" solo; then [ $RUN -gt 0 ] && continue; SOLO=1; fi
@@ -241,6 +321,7 @@ done
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$gm" "${TAGS[$n]:--}"
   done; } > "$OUT/results.tsv"
 WALL=$(( $(date +%s) - T0 ))
+NINC=$(awk -F'\t' 'NR > 1 && ($2 == "NOGPU" || $2 == "BUSY" || $2 == "NEED2")' "$OUT/results.tsv" | wc -l)
 FAILS=$(awk -F'\t' 'NR > 1 && ($2 == "FAIL" || $2 == "TIMEOUT") {print $1}' "$OUT/results.tsv")
 { echo; echo "==== failing tests: logs (last 40 lines; full logs in $OUT/logs)"
   for n in $FAILS; do echo; echo "---- $n: $(awk -F'\t' -v t="$n" '$1 == t {print $2 " rc " $3 " after " $4 " s"}' "$OUT/results.tsv")"; echo "     $OUT/logs/$n.log"
@@ -249,7 +330,11 @@ FAILS=$(awk -F'\t' 'NR > 1 && ($2 == "FAIL" || $2 == "TIMEOUT") {print $1}' "$OU
   echo "==== summary ($TIER, $BDIR, $(hostname), wall ${WALL} s, -j $J)"
   awk -F'\t' 'NR > 1 {c[$2]++; cpu += $5 + $6} END {for (s in c) printf "  %-8s %d\n", s, c[s]; printf "  cpu      %.0f s (user + sys)\n", cpu}' "$OUT/results.tsv"
   F=$(awk -F'\t' 'NR > 1 && $2 == "FLAKY" {printf " %s", $1}' "$OUT/results.tsv"); [ -n "$F" ] && echo "  flaky (passed on the retry):$F"
-  [ -n "$FAILS" ] && echo "  FAILED: $(echo $FAILS)" || echo "  ALL PASSED"
+  if [ -n "$FAILS" ]; then echo "  FAILED: $(echo $FAILS)"
+  elif [ "$NINC" -gt 0 ]; then echo "  INCOMPLETE: $NINC GPU tests not run (NOGPU / BUSY / NEED2): the passes above are no merge gate"
+  else echo "  ALL PASSED"; fi
 } | tee "$OUT/summary.txt" | { [ -n "$FAILS" ] && cat || sed -n '/^==== summary/,$p'; }
 echo "results: $OUT/results.tsv"
-[ -z "$FAILS" ]
+[ -n "$FAILS" ] && exit 1
+[ "$NINC" -gt 0 ] && [ $INCOK = 0 ] && exit 3
+exit 0

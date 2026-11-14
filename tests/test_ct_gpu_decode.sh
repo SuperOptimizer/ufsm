@@ -10,7 +10,7 @@
 # Usage: test_ct_gpu_decode.sh <ufsm binary> <make_wind_fixture binary>
 set -u
 U=$1 F=$2
-D=$(mktemp -d /tmp/test_ctgd_XXXXXX)
+D=$(mktemp -d "${TMPDIR:-/tmp}/test_ctgd_XXXXXX")
 fail() { echo "FAIL: $*"; echo "kept $D"; exit 1; }
 "$F" "$D/fx" 256 2 1 > "$D/fx.log" 2>&1 || fail "fixture"
 for k in $(ls "$D/fx/ct" | grep -v json); do

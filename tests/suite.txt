@@ -100,6 +100,7 @@ test_geom_check                                |              |     3 | ./$B/tes
 test_sheetpbr                                  |              |     2 | ./$B/test_sheetpbr
 test_pairacc                                   |              |     1 | ./$B/test_pairacc
 test_wbench_stats                              |              |     2 | bash tests/test_wbench_stats.sh $B/ufsm
+test_run_suite                                 |              |    17 | bash tests/test_run_suite.sh
 test_gpuq                                      | flaky        |    14 | bash tests/test_gpuq.sh
 test_robust                                    | gpu          |     1 | ./$B/test_robust
 test_reg                                       |              |    27 | ./$B/test_reg
@@ -199,6 +200,7 @@ test_volcomp                                   | smoke        |     1 | ./$B/tes
 test_typed_zarr                                | smoke        |     7 | ./$B/test_typed_zarr
 test_http_reader                               |              |   166 | python3 tests/test_http_reader.py
 test_checkpoint_runtime                        | smoke        |     1 | ./$B/test_checkpoint_runtime
+test_ckring                                    |              |     1 | ./$B/test_ckring
 test_infer_buffers                             | gpu          |     6 | ./$B/test_infer_buffers
 test_recompute_live                            | gpu          |     7 | ./$B/test_recompute_live
 test_share_enc_a1                              | gpu          |     5 | ./$B/test_share_enc_a1
