@@ -343,6 +343,7 @@ sources *sources_load(const char *path) {
                 f->map = sdup(json_str(json_get(fj, "map"), nullptr)); f->tr = sdup(json_str(json_get(fj, "tr"), nullptr));
                 f->rad = json_num(json_get(fj, "radius"), 2); f->guard = json_num(json_get(fj, "guard"), 3); f->ring = json_num(json_get(fj, "ring"), 0);
                 f->iso = (int)json_num(json_get(fj, "iso"), 64); f->plane = !strcmp(pl, "V");
+                f->piso = (int)json_num(json_get(fj, "pos_iso"), s->iso > 0 ? s->iso : 64);   /* (data audit lower: positives below it are unknown; "pos_iso": -1 keeps them) */
                 if (!f->afv || (strcmp(pl, "H") && strcmp(pl, "V")) || !(f->rad > 0) || f->guard < 0 || f->ring < 0 || f->rad + f->guard + f->ring > 15) {
                     fprintf(stderr, "sources: %s/%s: \"fibre\": {\"afv\": PATH, \"plane\": \"H\" | \"V\", radius 2, guard 3, ring 0 (radius + guard + ring <= 15), iso 64, extra, map | tr}\n", s->name, CHNAME[c]);
                     free(f); json_free(j); sources_free(S); return nullptr;
@@ -753,14 +754,14 @@ z3 *source_lat(source *s, int level) {
 
 static int fib_same(const struct fib_spec *a, const struct fib_spec *b) {
     const int ss = !strcmp(a->afv, b->afv) && !strcmp(a->extra, b->extra) && !strcmp(a->map ? a->map : "", b->map ? b->map : "") && !strcmp(a->tr ? a->tr : "", b->tr ? b->tr : "");
-    return ss && a->rad == b->rad && a->guard == b->guard && a->ring == b->ring && a->iso == b->iso;
+    return ss && a->rad == b->rad && a->guard == b->guard && a->ring == b->ring && a->iso == b->iso && a->piso == b->piso;
 }
 /* a "fibre" target: both planes from one computation; the other plane goes to a channel with the same options and the other plane */
 static z3 *source_tgt_fibre(source *s, int ch, int level) {
     if (s->tgt[ch][level]) return s->tgt[ch][level];
     const struct fib_spec *f = s->tgt_fib[ch]; z3 *pl[2];
     z3 *c0 = open_ct_level(s, level), *c1 = c0 ? open_ct_level(s, level) : nullptr, *c2 = c1 ? open_ct_level(s, level) : nullptr;
-    const int bad = fiber_onfly_open(f->afv, f->extra, f->map, f->tr, f->rad, f->guard, f->ring, f->iso, level, c0, c1, c2, pl);
+    const int bad = fiber_onfly_open(f->afv, f->extra, f->map, f->tr, f->rad, f->guard, f->ring, f->iso, f->piso, level, c0, c1, c2, pl);
     pthread_mutex_lock(&g_open_mu);
     if (bad) { if (!s->tgt[ch][level]) s->tgt_present[ch][level] = 0; pthread_mutex_unlock(&g_open_mu); return s->tgt[ch][level]; }
     if (!s->tgt[ch][level]) { s->tgt[ch][level] = pl[f->plane]; pl[f->plane] = nullptr; }
