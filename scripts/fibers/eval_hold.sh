@@ -11,9 +11,11 @@ RUN=${1:?RUN dir}; CK=${2:-$RUN/last.ckpt}; U=${U:-/home/forrest/ufsm-fib/build/
 CT=${CT:-/vesuvius/ufsm/v2/ct}; KEY=${KEY:-PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr}
 # (pod: CT=https://dl.ash2txt.org/community-uploads/forrest/volcomp KEY=PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
 #  PREDICT_ONLY=1: the two predicts only; copy RUN/eval/hold-STEP/{H,V} to the desk and rerun there for the trace + GT judge)
-GT=${GT:-/vesuvius/ufsm/gt/paris4-wind-20261019}; PHK=${PHK:-phaseB/9.6}; W=/vesuvius/ufsm/fibers/work
+GT=${GT:-/vesuvius/ufsm/gt/paris4-phaseA-evalboxes-20261114}; PHK=${PHK:-phaseA/9.6}; W=/vesuvius/ufsm/fibers/work   # (11-14: phaseA rebuilt for the eval boxes, HOLD included; see below)
 # (eval audit 11-14 #5: phaseA, the GT these rows used until 11-12, was deleted; phaseB (the july set) is the only Paris 4 phase left, so
-#  judge rows from here on are not comparable to the earlier phaseA ones. A missing GT now stops the script instead of printing nothing.)
+#  judge rows from here on are not comparable to the earlier phaseA ones. A missing GT now stops the script instead of printing nothing.
+#  Later 11-14: phaseA rebuilt for the eval boxes only (/vesuvius/ufsm/gt/paris4-phaseA-evalboxes-20261114, build.sh there: p4kit.sh's recipe from the June qA
+#  surfaces), so the default is phaseA again and rows are comparable with the pre-11-12 ones; PHK=phaseB/9.6 GT=/vesuvius/ufsm/gt/paris4-wind-20261019 for the july set.)
 [ -e $GT/$PHK/zarr.json ] || { echo "eval_hold: no GT phase $GT/$PHK (set GT / PHK)" >&2; exit 1; }
 BOX=12288,4096,3584,512,576,768          # HOLD in level-2 voxels (l0 49152,16384,14336,2048,2304,3072)
 J="--um 2.4 --level 2 --slab 12288,512 --region 4096,4608,3584,4352 --tile 256 --d-mm 0.3,0.6,1.2,2.4"

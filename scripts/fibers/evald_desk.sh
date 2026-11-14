@@ -2,7 +2,7 @@
 # scripts/fibers/evald_desk.sh STEP...: the desk half of the fibhv-d hold evaluation (scripts/fibers/evald.sh runs on the eval pod EP).
 # Per step: starts evald.sh STEP on EP (if not running / done), waits for its done flag, copies the traced lines and logs back, then
 # prints per box / family / mode the line statistics (fibre_lens.py: count, metres, median, arc-weighted median, p90, arc share in lines
-# >= 1 mm and >= 2 mm) and, on Paris 4 HOLD, the GT judge (fiber-judge --phase against paris4-wind-20261019 phaseB since 11-14: phaseA, fibhv-c's GT, was deleted 11-12).
+# >= 1 mm and >= 2 mm) and, on Paris 4 HOLD, the GT judge (fiber-judge --phase against phaseA, fibhv-c's GT: deleted 11-12, rebuilt 11-14 for the eval boxes in /vesuvius/ufsm/gt/paris4-phaseA-evalboxes-20261114; PHG / PHK override).
 # Output: /vesuvius/ufsm/fibers/runs/fibhv-d/eval/hold-STEP.desk.log (+ the copied hold-STEP/ dir).
 set -u
 EP=${EP:?EP: the eval pod, user@host (pods change daily)}; EPP=${EPP:?EPP: its ssh port}; P="ssh -p $EPP -i $HOME/.ssh/id_ed25519"; D=$(dirname "$(readlink -f "$0")")
@@ -17,7 +17,7 @@ for s in "$@"; do
   { for b in HOLD 1447; do um=2.4; [ $b = 1447 ] && um=8.64
       for f in H V; do for m in tube dyad; do
         echo "== $b $f $m | $(python3 -I $D/fibre_lens.py $o/$b/$f-$m.fib $um)"; grep 'line ends' $o/$b/trace_$f-$m.log
-        [ $b = HOLD ] && nice -n 19 $U fiber-judge $o/$b/$f-$m.fib --phase /vesuvius/ufsm/gt/paris4-wind-20261019 ${PHK:-phaseB/9.6} $J 2>&1 | grep "$f:" || echo "FAILED: fiber-judge $b $f $m printed no $f: line"
+        [ $b = HOLD ] && nice -n 19 $U fiber-judge $o/$b/$f-$m.fib --phase ${PHG:-/vesuvius/ufsm/gt/paris4-phaseA-evalboxes-20261114} ${PHK:-phaseA/9.6} $J 2>&1 | grep "$f:" || echo "FAILED: fiber-judge $b $f $m printed no $f: line"
       done; done
       [ $b = 1447 ] && for f in H V; do echo "-- 1447-HOLD $f mask vs held-out labels"; grep -iE 'thr|dice|prec|recall' $o/1447/eval_$f.txt | head -6; done
     done; echo done; } > $o.desk.log 2>&1

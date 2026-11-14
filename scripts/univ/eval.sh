@@ -75,7 +75,9 @@ if has fib && [ "${FIB:-1}" = 1 ] && { [ -n "$FIBCH" ] || [ "${FIBP:-}" = heads 
     #  missing GT left a non-empty .judge that later runs skipped as done. The .judge file is now written only when the trace and the judge
     #  both succeed and the judge printed its family line; the GT is phaseB (the july set, the only Paris 4 phase left; rows before 11-14
     #  were judged against phaseA and are not comparable). FIBPH / FIBPHK override.)
-    ph=${FIBPH:-/vesuvius/ufsm/gt/paris4-wind-20261019}; phk=${FIBPHK:-phaseB/9.6}
+    # (11-14 later: phaseA rebuilt for the eval boxes only (HOLD, PH1-3, the 4 slab sites; p4kit.sh's recipe from the June qA surfaces) in
+    #  /vesuvius/ufsm/gt/paris4-phaseA-evalboxes-20261114: the judge is back on phaseA, comparable with the rows before 11-12. Outside those boxes it is unknown.)
+    ph=${FIBPH:-/vesuvius/ufsm/gt/paris4-phaseA-evalboxes-20261114}; phk=${FIBPHK:-phaseA/9.6}
     [ -e $ph/$phk/zarr.json ] || { log "fib: FAILED, no GT phase $ph/$phk"; FIBFAIL=1; continue; }
     nice -n 10 $U fiber-trace - - $o/$f-$m.fib --mask $o/$f 9.6 --mask-origin 12288,4096,3584 --box $BOX --scaledown 2 --family $f --half 1024 --min-len 48 --threads 4 $x > $o/trace_$f-$m.log 2>&1 ||
       { log "fib: FAILED, fiber-trace $f-$m (see $o/trace_$f-$m.log)"; FIBFAIL=1; continue; }
