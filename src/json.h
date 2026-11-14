@@ -2,6 +2,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 typedef enum { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ } json_type;
 
@@ -27,3 +28,6 @@ const json *json_at(const json *arr, size_t i);              /* nullptr if out o
 const json *json_path(const json *j, const char *path);      /* "a.b.0.c" style, nullptr if absent */
 double json_num(const json *j, double dflt);
 const char *json_str(const json *j, const char *dflt);
+/* fprintf for JSON fragments: printf's "nan" / "-nan" / "inf" / "-inf" outside strings are written as null (json_parse refuses them since
+   mini/json 5; reg inkstat's empty rows broke test_reg_render 11-14). Each call's format must keep its quotes balanced. Returns bytes or -1 */
+int json_fprintf(FILE *f, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
