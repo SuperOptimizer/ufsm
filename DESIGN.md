@@ -6,6 +6,27 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Sampler GPU work vs the training stream; the pair rule on both cards (2026-11-14, branch w4stream-20261114)
+
+**The w4 context stream was blocking.** Training kernels launch on the legacy default stream (no stream argument, no per-thread
+default stream). nn_w4.cu's sampler contexts (--gpu-aug 3: the winding mod 4 runs on the device) created their stream with a plain
+cudaStreamCreate, which synchronises with the legacy stream both ways. So each w4 op of a worker waited for the queued training work
+on that card (try5: a worker spun 0.7 core inside cudaMemcpy2DAsync in ctx_run), and the next training kernel waited for the w4 op.
+Now cudaStreamNonBlocking; the context's buffers are its own. Perf pod, scratch2's net on one card, P 512, --det 1, 8 workers / 6
+slots, 30 steps after 10: 0.864 -> 0.908 samp/s (+5.1 %), sampler wait 11.2 -> 5.7 %; UFSM_BATCH_HASH identical (5 batches); the step
+losses differ at the level two runs of master differ. Audit of the other sampler-side GPU paths (nn_band pair rule / codes, nn_fibre,
+nn_inkfly, nn_mcodes, nn_gpudec, nn_ctdev): all on non-blocking streams; the legacy-stream calls left are one-time (constant tables,
+gpudec's position table) or buffer growth (cudaFree / cudaMalloc, a device sync but only when a box exceeds the reserve).
+
+**Host side of the step otherwise clean.** nsys on the same setup at P 768, gaps before the trainer thread's ops attributed to its
+previous API call: 26 ms of host-caused idle per 11.7 s busy (0.2 %), plus ~120 ms of cuBLASLt lazy loading in the first steps.
+
+**--onfly-gpu A,B.** try6 (P 768 data parallel, the pair rule's 3 slots on GPU 0, fibre and ink on GPU 1): GPU 0 100 % / 15.7 GB,
+GPU 1 74 % / 13.7 GB, the gradient all-reduce waiting for GPU 0. band_pair_gpu_devices puts --onfly-slots contexts on each listed
+device, taken round robin (bg_ctx.dev, cudaSetDevice per call); the planner's budget is the minimum free memory over the cards, so
+2 + 2 slots (1.54 GB each) instead of 3 on GPU 0 (2.3 GB) also raises it. test_phase_onfly: --onfly-gpu 0,0 --onfly-slots 2 gives
+the stored-phase batches.
+
 ## Gradient noise scale in the trainer (2026-11-14, branch gns-20261114)
 
 `--gns 1` logs the gradient noise scale B_noise (McCandlish et al. 2018, "An Empirical Model of Large-Batch Training", app. A.1), the
