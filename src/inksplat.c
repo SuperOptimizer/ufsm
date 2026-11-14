@@ -1050,7 +1050,7 @@ int cmd_ink_vscore(int argc, char **argv) {
     const int L = opt_atoi("--level", sopt(argc, argv, "--level", "1")), nth = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 8);
     long long b[6];
     if (gi < 0 || pi < 0 || gi + 2 >= argc || pi + 2 >= argc || !bx || sscanf(bx, "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6 || L < 0 || L > 6) {
-        fprintf(stderr, "usage: ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx (level-0) [--level 1] [--row TAG] [--threads 8] [--cache DIR] [--holdouts H.json --ct KEY]\n"
+        fprintf(stderr, "usage: ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx (level-0) [--level 1] [--row TAG] [--threads 8] [--cache DIR] [--holdouts H.json --ct KEY] [--pred-unknown auto|255|none]\n"
                         "  voxelwise AUC / best F1 / F1 at 0.5 of a prob254 prediction vs a prob254 reference at the voxels known in both (the box on level L)\n"); return 2;
     }
     store *gs = store_open(argv[gi + 1]), *ps = store_open(argv[pi + 1]);
@@ -1075,8 +1075,15 @@ int cmd_ink_vscore(int argc, char **argv) {
             for (int e = 0; e < hc.nexcl && !in; e++) { in = 1; for (int d = 0; d < 3; d++) in &= c0[d] >= hc.excl[e][d] && c0[d] < hc.excl[e][d] + hc.excl[e][3 + d]; }
             const size_t k = ((size_t)z * n[1] + y) * n[2] + x; if (!in) A[k] = 255; else kept++; }
         fprintf(stderr, "ink-vscore: holdout-only: %llu of %zu voxels inside the %d held-out boxes of %s\n", (unsigned long long)kept, nv, hc.nexcl, hct); }
-    double h[2][255] = {{0}}; uint64_t ngt = 0;
-    for (size_t k = 0; k < nv; k++) { if (A[k] == 255) continue; ngt++; if (B[k] == 255) continue; h[A[k] >= 127][B[k]]++; }
+    /* the prediction's 255: "unknown" only in prob254 arrays (ink-splat: fill_value 255). The ink heads write round(255 sigmoid), so
+       there 255 is p >= 0.998, the most confident ink: skipping it dropped a sharper model's true positives from AUC and F1 and made
+       the scored voxel sets differ between models (audit eval#13). --pred-unknown auto (the array's fill 255) | 255 | none; with none,
+       255 is scored as 254 (the histogram's top bin). */
+    const char *pu = sopt(argc, argv, "--pred-unknown", "auto");
+    const int pskip = !strcmp(pu, "255") ? 1 : !strcmp(pu, "none") ? 0 : z3_meta_of(p)->fill == 255;
+    double h[2][255] = {{0}}; uint64_t ngt = 0, nsat = 0;
+    for (size_t k = 0; k < nv; k++) { if (A[k] == 255) continue; ngt++; uint8_t q = B[k]; if (q == 255) { if (pskip) continue; q = 254; nsat++; } h[A[k] >= 127][q]++; }
+    if (nsat) fprintf(stderr, "ink-vscore: %llu saturated predictions (255 = p >= 0.998) scored as ink-most-confident (--pred-unknown %s)\n", (unsigned long long)nsat, pu);
     double P = 0, N = 0; for (int v = 0; v < 255; v++) { P += h[1][v]; N += h[0][v]; }
     double auc = 0, below = 0; for (int v = 0; v < 255; v++) { auc += h[1][v] * (below + 0.5 * h[0][v]); below += h[0][v]; }
     auc = P > 0 && N > 0 ? auc / (P * N) : NAN;
