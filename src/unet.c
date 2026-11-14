@@ -1312,7 +1312,10 @@ static void build_acts(unet *u, shape5 xs, int train) {
     }
     if (u->tbn) {   /* attention stage: its output block, fp32 token rows (one set per block input), one block's scratch, gradients */
         g_mlab = "attention stage";
-        if (!nn_get_tf32() || (sp_on(u) && !sp_top_on(u))) { fprintf(stderr, "unet: attention blocks need the tensor-core path and no spatial split (but split_top)\n"); abort(); }
+        /* (the fp32 path: never used in training; test_unet's finite-difference check opts in with UFSM_ATTN_FP32_PATH=1, sweep 11-14:
+           the stage itself is fp32 throughout, tb_fwd / tb_bwd convert through fp32 token rows, and the level output's silu(gn(.)) is
+           materialised in s2 as for every fp32-path block) */
+        if ((!nn_get_tf32() && !getenv("UFSM_ATTN_FP32_PATH")) || (sp_on(u) && !sp_top_on(u))) { fprintf(stderr, "unet: attention blocks need the tensor-core path (UFSM_ATTN_FP32_PATH=1: the fp32 path, tests) and no spatial split (but split_top)\n"); abort(); }
         shape5 y = u->ls[L - 1]; y.c = w[L - 1];
         build_block_acts(u, &u->tb, y, train, 1, nullptr, nullptr, nullptr);
         const long Sg = (long)shape_spatial(y), T = (long)y.n * (Sg + u->nrg); const int C = w[L - 1];

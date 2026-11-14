@@ -87,6 +87,7 @@ int main(void) {
     if (cfg.attn_blocks) {
         if (cfg.ds_levels || cfg.emb_lev || cfg.film || cfg.scale_cond) { printf("UFSM_ATTN_BLOCKS: not combined with UFSM_DS / UFSM_EMB / UFSM_FILM / UFSM_SCALE_COND\n"); return 2; }
         if (!getenv("UFSM_ATTN_CORE")) setenv("UFSM_ATTN_CORE", "0", 1);   /* (read at the first attention call: the fp32 core for the finite differences) */
+        setenv("UFSM_ATTN_FP32_PATH", "1", 1);   /* (unet refuses the stage on the fp32 path otherwise: the check runs with tensor cores off) */
         unet_cfg c0 = cfg; c0.attn_blocks = 0; unet *u0 = unet_create(&c0); a0 = unet_nparams(u0); unet_free(u0);
     }
     unet *u = unet_create(&cfg);
