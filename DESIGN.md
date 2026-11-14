@@ -39,7 +39,8 @@ band at level 1, so only the band's edges grew; partial blocks are now soft targ
 **Paris4-july's 19.2 um phase stored (#6).** Its 19.2 windows pooled the 9.6 um phaseB per read (8x the voxels decoded, an atan2 per
 coarse voxel, no cache). `source_phase_at` now reads a stored coarser level from the phase's group when present; phaseB/19.2 was written
 by `ufsm downsample --mode phase` (12 GB, 55 min). `test_phase_pool --compare` on 6 boxes of 384^3: 0.02 % of the known voxels known in
-one only, 4.1 % of the rest 1 code apart (double vs float sums), none more; read 0.90 s vs 15.34 s (17x).
+one only, 4.1 % of the rest 1 code apart (double vs float sums), none more; read 0.90 s vs 15.34 s (17x). Sampler-only on Paris4-july alone at the 19.2 rung (P 256, CPU): the phase read stage 2218 -> 244 ms
+per window, 48 -> 147 Mvox/s; at P 768 the view's cost scales 27x.
 
 **Warp fill (#7).** Voxels a rotation pulls from outside the source cube were 0 after z-scoring (the window's mean density, fake material);
 now `warp_fill`, the z-scored raw 0 (air, as a masked scan's outside and predict's past-the-volume voxels), jittered like any voxel, on the
