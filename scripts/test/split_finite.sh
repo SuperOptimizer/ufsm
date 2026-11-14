@@ -8,6 +8,8 @@ set -u
 U=${1:?BIN}; C=${2:?CMDFILE}; O=${3:-$(mktemp -d /vesuvius/ufsm/tmp-split-finite.XXXX)}; mkdir -p $O
 read -ra A < $C; A=("${A[@]:2}")
 for i in "${!A[@]}"; do case "${A[$i]}" in --out) A[$((i+1))]=$O/run;; --steps) A[$((i+1))]=2;; --gpu-aug) A[$((i+1))]=1;; --ckpt-every|--val-every) A[$((i+1))]=100000;; esac; done
+B=(); skip=0; for a in "${A[@]}"; do   # gpu-aug 1 has no cube batches: --echo-max / --replay N would be refused ("needs --gpu-aug 2")
+    if ((skip)); then skip=0; continue; fi; case "$a" in --echo-max|--replay) skip=1; continue;; esac; B+=("$a"); done; A=("${B[@]}")
 LOCKS="/vesuvius/ufsm/opt/gpu0.lock /vesuvius/ufsm/opt/gpu1.lock /tmp/ufsm-suite-locks/gpu0.0 /tmp/ufsm-suite-locks/gpu0.1 /tmp/ufsm-suite-locks/gpu1.0 /tmp/ufsm-suite-locks/gpu1.1"
 fd=9; for lk in $LOCKS; do eval "exec $fd> $lk"; flock -w 1800 $fd || { echo "lock $lk busy"; exit 2; }; fd=$((fd + 1)); done
 env MALLOC_ARENA_MAX=4 UFSM_HEAD_SLAB_Z=8 CUDA_VISIBLE_DEVICES=0,1 UFSM_GRAD_DUMP=$O/grad.bin timeout -k 10 ${TMO:-300} ~/bin/memcap -t $U train "${A[@]}" > $O/train.log 2>&1
