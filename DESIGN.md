@@ -41,7 +41,17 @@ The recompute left in every mode is recompute 1: GN + SiLU applied in the conv's
 part rebuilt, both cheap; UFSM_RECOMPUTE=0 is not supported with MX storage (aborts "MX storage needs MX inputs and outputs of one
 format"). The step is 75-85 % convolutions (UFSM_PROF), so the memory modes cannot give 5-10 % here. Larger head slabs: no gain.
 
-Use: MEMMODE=fast in the launch env (u1.train2.sh passes --mem $MEMMODE) for P 512 runs; keep --mem auto at P 1024.
+**P 768 data parallel (try6 from 09:01: accum 5, --onfly-slots 3 x 768 MB on GPU 0)**: GPU 0 has 11.04 GB free at the planner
+(15.75 of 16.3 GB used live). Plan at that free memory (UFSM_MEM_FREE_GB 11.04): auto / fast both pick lean 2 + chunked + offloads,
+9.70 GB (2.54 GB offloads each way); the smallest mode without offloads needs 11.51 GB (lean 2 + shared a1 re-run), mode 0 19.06.
+So --mem fast changes nothing at P 768 (it falls back, no refusal). Upper bound if it fit (pod uncapped, UFSM_MEM_FREE_GB 14, same
+batch, 20 steps): auto 3.421 s/step, peak 12.35 GB; fast (lean 1, no offloads) 3.414 s/step, peak 15.76 GB: **-0.2 %**.
+split3's bench_s2 sweep at the P 1024 split card share (128 x 256^2 cells, network only) agrees: each of the six offload / share
+switches and lean 1 within +-0.5 % (3.41-3.45 s); the offloads overlap the kernels.
+
+Use: MEMMODE=fast only where the window leaves ~1.3 GB spare (P 512: -1.4 %); at P 768 / 1024 keep --mem auto. No memory mode
+gains more than 2 % on this net: the remaining host-side cost is PCIe contention in the trainer (perf2's ~180 ms exposed), not the
+activation offloads or recompute.
 tests/bench_s2: one desk card's share of the P 1024 split trunk on one GPU (synthetic input; the unet env switches, BS2_CAP_GB ballast).
 ## Kernel fusion for scratch2: what is left to fuse, the head slabs (2026-11-14, branch fuse-20261114)
 
