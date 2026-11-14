@@ -285,14 +285,20 @@ __device__ unsigned keep22t_(const float M[4][4]) {
 }
 /* one thread per group: mode 2 (co, ci / 8, tap), mode 3 (co / 8, ci / 8, tap). out = w masked (in place allowed); g != nullptr: the SR-STE
    term g += lambda w on the pruned weights instead (out unused) */
-__global__ void mask_sp_k(const float *w, float *out, float *g, float lambda, int Co, int Ci, int T, int mode) {
+/* (r: the pruned weights' factor in out, 0 = pruned; aux != nullptr: aux masked in place by the same keep, out unused unless set; e2: when
+   set, [0] += sum w^2, [1] += sum of the kept w^2 (double atomics; the pruning's energy report)) */
+/* kb (nullptr: none): the keep bytes, one per (co, 8 input channels, tap) (bit b: channel pair b kept); kin: read them instead of the magnitude
+   selection (the step's fixed mask), else written */
+__global__ void mask_sp_k(const float *w, float *out, float *g, float lambda, int Co, int Ci, int T, int mode, float r, float *aux, double *e2,
+                          uint8_t *kb, int kin) {
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     const int nci = Ci / 8, nco = mode == 3 ? Co / 8 : Co;
     if (i >= (size_t)nco * nci * T) return;
     const int t = (int)(i % T), cb = (int)((i / T) % nci), ob = (int)(i / ((size_t)T * nci));
     const int nr = mode == 3 ? 8 : 1, co0 = mode == 3 ? 8 * ob : ob, ci0 = 8 * cb;
     unsigned keep[8];
-    if (mode == 3) {
+    if (kb && kin) { for (int q = 0; q < nr; q++) keep[q] = kb[((size_t)(co0 + q) * nci + cb) * T + t]; }
+    else if (mode == 3) {
         float M[4][4];
         for (int a = 0; a < 4; a++) for (int b = 0; b < 4; b++) {
             float s = 0.f;
@@ -306,12 +312,17 @@ __global__ void mask_sp_k(const float *w, float *out, float *g, float lambda, in
         for (int b = 0; b < 4; b++) m[b] = fabsf(w[((size_t)co0 * Ci + ci0 + 2 * b) * T + t]) + fabsf(w[((size_t)co0 * Ci + ci0 + 2 * b + 1) * T + t]);
         keep[0] = keep48_(m);
     }
-    for (int r = 0; r < nr; r++) for (int c = 0; c < 8; c++) {
-        const size_t j = ((size_t)(co0 + r) * Ci + ci0 + c) * T + t;
-        const bool kp = (keep[r] >> (c >> 1)) & 1u;
+    if (kb && !kin) for (int q = 0; q < nr; q++) kb[((size_t)(co0 + q) * nci + cb) * T + t] = (uint8_t)keep[q];
+    double ea = 0., ek = 0.;
+    for (int q = 0; q < nr; q++) for (int c = 0; c < 8; c++) {
+        const size_t j = ((size_t)(co0 + q) * Ci + ci0 + c) * T + t;
+        const bool kp = (keep[q] >> (c >> 1)) & 1u;
+        if (e2) { const double v = (double)w[j] * w[j]; ea += v; if (kp) ek += v; }
+        if (aux) { if (!kp) aux[j] = 0.f; }
         if (g) { if (!kp) g[j] += lambda * w[j]; }
-        else out[j] = kp ? w[j] : 0.f;
+        else if (out) out[j] = kp ? w[j] : r * w[j];
     }
+    if (e2) { atomicAdd(e2, ea); atomicAdd(e2 + 1, ek); }
 }
 __global__ void wquant_k(float *w, int Co, int Ci, int T, int bits, unsigned seed) {
     size_t nb = (size_t)Co * ((Ci + 31) / 32) * T, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -443,13 +454,21 @@ extern "C" void nn_mask24m(const float *w, float *out, int co, int ci, int taps,
     if (mode <= 1) { nn_mask24(w, out, co, ci, taps); return; }
     if (!nn_sp24_eligible(co, ci, mode)) { if (out != w) cudaMemcpyAsync(out, w, (size_t)co * ci * taps * 4, cudaMemcpyDeviceToDevice); return; }
     const size_t ng = (size_t)(mode == 3 ? co / 8 : co) * (ci / 8) * taps;
-    mask_sp_k<<<nblk(ng, 128), 128>>>(w, out, nullptr, 0.f, co, ci, taps, mode); KCHECK();
+    mask_sp_k<<<nblk(ng, 128), 128>>>(w, out, nullptr, 0.f, co, ci, taps, mode, 0.f, nullptr, nullptr, nullptr, 0); KCHECK();
+}
+/* the general form (modes 2 / 3): out = w with the pruned weights times r (nullptr: none), aux (nullptr: none) zeroed where pruned, e2
+   (nullptr: none) += {sum w^2, kept w^2}; kb (nullptr: none, else co * ci / 8 * taps bytes): the keep mask written (kin 0) or used instead of
+   the magnitude selection (kin 1); w may alias out or aux */
+extern "C" void nn_mask24x(const float *w, float *out, float r, float *aux, double *e2, int co, int ci, int taps, int mode, uint8_t *kb, int kin) {
+    if (mode < 2 || !nn_sp24_eligible(co, ci, mode)) { if (out && out != w) cudaMemcpyAsync(out, w, (size_t)co * ci * taps * 4, cudaMemcpyDeviceToDevice); return; }
+    const size_t ng = (size_t)(mode == 3 ? co / 8 : co) * (ci / 8) * taps;
+    mask_sp_k<<<nblk(ng, 128), 128>>>(w, out, nullptr, 0.f, co, ci, taps, mode, r, aux, e2, kb, kin); KCHECK();
 }
 extern "C" void nn_srste24m(float *g, const float *w, int co, int ci, int taps, float lambda, int mode) {
     if (mode <= 1) { nn_srste24(g, w, co, ci, taps, lambda); return; }
     if (!nn_sp24_eligible(co, ci, mode)) return;
     const size_t ng = (size_t)(mode == 3 ? co / 8 : co) * (ci / 8) * taps;
-    mask_sp_k<<<nblk(ng, 128), 128>>>(w, nullptr, g, lambda, co, ci, taps, mode); KCHECK();
+    mask_sp_k<<<nblk(ng, 128), 128>>>(w, nullptr, g, lambda, co, ci, taps, mode, 0.f, nullptr, nullptr, nullptr, 0); KCHECK();
 }
 extern "C" void nn_srste24(float *g, const float *w, int co, int ci, int taps, float lambda) {
     if (ci % 4) return;

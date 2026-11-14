@@ -1735,6 +1735,27 @@ static int uw_selftest(void) {
    (base g << 24; GPU 0 as one GPU always had), carried from the forward to the backward, so every schedule (one host thread per GPU,
    phased, in turn) draws the same numbers */
 static int g_sp24_mode = 2, g_sp24_lv;   /* --sparse24-mode / --sparse24-levels (bitmask, 0 = all) */
+static int g_sp24_ramp, g_sp24_hard = -1;   /* --sparse24-ramp N (steps over which the pruned weights fade out), --sparse24-hard (default 1 for modes 2 / 3) */
+/* every step from --sparse24 STEP: the mode / levels, the ramp factor r = 1 - (step - STEP + 1) / N (>= 0), hard pruning after the ramp;
+   the per-level energy the mask keeps reported when the mask first applies fully */
+static void sp24_switch(unet *u, int g, int step, int sparse_at, float srste) {
+    const int hard = g_sp24_hard >= 0 ? g_sp24_hard : g_sp24_mode >= 2;
+    const float r = g_sp24_ramp > 0 ? fmaxf(0.f, 1.f - (float)(step - sparse_at + 1) / g_sp24_ramp) : 0.f;
+    const int was = unet_get_sparse24(u), on = was == g_sp24_mode && unet_get_sparse24_levels(u) == g_sp24_lv;
+    const float r0 = unet_get_sparse24_ramp(u);
+    if (!on) { unet_set_sparse24_levels(u, g_sp24_lv); unet_set_sparse24(u, g_sp24_mode); }
+    unet_set_sparse24_ramp(u, g_sp24_mode >= 2 ? r : 0.f, hard);
+    if (g) return;
+    if (!on) fprintf(stderr, "step %d: 2:4 sparsity on (mode %d, levels %s, ramp %d steps, %s)\n", step, g_sp24_mode, g_sp24_lv ? "masked" : "all", g_sp24_ramp,
+                     hard ? "hard: pruned master, masked Muon" : "SR-STE");
+    (void)srste;
+    if ((!on || r0 > 0.f) && unet_get_sparse24_ramp(u) == 0.f && g_sp24_mode >= 2) {
+        double e[2 * UNET_MAXLEV] = {0}; unet_sp24_energy(u, e);
+        fprintf(stderr, "step %d: sparse24 mask applied; kept |w|^2 per level:", step);
+        for (int l = 0; l < UNET_MAXLEV; l++) if (e[2 * l] > 0) fprintf(stderr, " L%d %.3f", l, e[2 * l + 1] / e[2 * l]);
+        fprintf(stderr, "\n");
+    }
+}
 typedef struct { gpu_state *d; int g, step, B, P; float dice_w; int cout; float srste; int sparse_at, rc; nn_tls out; } gstep_arg;   /* out: the op state after the backward */
 static void test_nan_inject(gpu_state *d, int step, int where, int P);
 static int sync_check(gpu_state *d, int step, const char *what);
@@ -1761,7 +1782,7 @@ static void gstep_fwd(gstep_arg *a) {
                     unet_params_d2h(d->u, h); snprintf(fn, sizeof fn, "%s/p%d.f32", dd, step); FILE *f = fopen(fn, "wb"); if (f) { fwrite(h, 4, np, f); fclose(f); }
                     nn_d2h(h, unet_grad_ptr(d->u), np * 4); snprintf(fn, sizeof fn, "%s/g%d.f32", dd, step); f = fopen(fn, "wb"); if (f) { fwrite(h, 4, np, f); fclose(f); } free(h); }
             }
-            if (sparse_at && step >= sparse_at && (unet_get_sparse24(d->u) != g_sp24_mode || unet_get_sparse24_levels(d->u) != g_sp24_lv)) { unet_set_sparse24_levels(d->u, g_sp24_lv); unet_set_sparse24(d->u, g_sp24_mode); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (mode %d, levels %s, SR-STE lambda %g)\n", step, g_sp24_mode, g_sp24_lv ? "masked" : "all", srste); }
+            if (sparse_at && step >= sparse_at) sp24_switch(d->u, g, step, sparse_at, srste);
             unet_zero_grad(d->u);
             d->last = d->cur;
             if (g_fstem) { uint64_t h = (uint64_t)step * 0xD1B54A32D192ED03ull + (uint64_t)seed * 31 + (uint64_t)g; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
@@ -2387,7 +2408,7 @@ int cmd_train(int argc, char **argv) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 512] [--B 1] [--steps 20000] [--lr 1e-3] [--warmup 500] [--wd 0.01]\n"
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12 (new runs with --gpu-aug 2: 3)] [--gpu-aug 0|1|2 (new runs: 2)] [--sampler-slots N] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
                         "       [--rv 1 [--rv-iso 64] [--rv-verso-w 1]]\n"
-                        "       [--val-batches 8] [--val-P N (validation windows of N^3 whatever P: the same voxels across window sizes)] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--sparse24-mode 1|2|3] [--sparse24-levels 0,1,...] [--srste 2e-4] [--pos-weight 1] [--tol 0..2] [--sr 1]\n"
+                        "       [--val-batches 8] [--val-P N (validation windows of N^3 whatever P: the same voxels across window sizes)] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--sparse24-mode 1|2|3] [--sparse24-levels 0,1,...] [--sparse24-ramp N] [--sparse24-hard 0|1] [--srste 2e-4] [--pos-weight 1] [--tol 0..2] [--sr 1]\n"
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
                         "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across finite-cover evaluation pauses\n"
                         "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--cover-next-pass 1] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
@@ -2749,6 +2770,8 @@ int cmd_train(int argc, char **argv) {
         for (const char *q = lv; *q;) { char *e; const long l = strtol(q, &e, 10); if (e == q) break; if (l >= 0 && l < 31) g_sp24_lv |= 1 << l; q = *e == ',' ? e + 1 : e; }
     }
     if (g_sp24_mode < 1 || g_sp24_mode > 3) { fprintf(stderr, "--sparse24-mode: 1, 2 or 3\n"); return 2; }
+    g_sp24_ramp = atoi(opt(argc, argv, "--sparse24-ramp", "0"));
+    g_sp24_hard = atoi(opt(argc, argv, "--sparse24-hard", "-1"));
     float srste = (float)atof(opt(argc, argv, "--srste", "2e-4"));
     nn_set_pos_weight((float)atof(opt(argc, argv, "--pos-weight", "1")));   /* BCE weight of surface voxels */
     int overfit = atoi(opt(argc, argv, "--overfit", "0"));   /* diagnostic: train on the first batch forever */
@@ -4471,7 +4494,7 @@ int cmd_train(int argc, char **argv) {
                 gpu_state *d = &G[g];
                 nn_init(d->dev);
                 nn_stream_wait(0, d->ev_up[d->cur]);
-                if (sparse_at && step >= sparse_at && (unet_get_sparse24(d->u) != g_sp24_mode || unet_get_sparse24_levels(d->u) != g_sp24_lv)) { unet_set_sparse24_levels(d->u, g_sp24_lv); unet_set_sparse24(d->u, g_sp24_mode); if (g == 0) fprintf(stderr, "step %d: 2:4 sparsity on (mode %d, levels %s, SR-STE lambda %g)\n", step, g_sp24_mode, g_sp24_lv ? "masked" : "all", srste); }
+                if (sparse_at && step >= sparse_at) sp24_switch(d->u, g, step, sparse_at, srste);
                 unet_zero_grad(d->u);
                 if (g_fstem) { uint64_t h = (uint64_t)step * 0xD1B54A32D192ED03ull + (uint64_t)seed * 31; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
                                d->fs_drop = (double)(h >> 11) * 0x1p-53 < g_fs_drop; }   /* (--fstem-drop: one draw for the window, both halves) */
@@ -4676,7 +4699,8 @@ int cmd_train(int argc, char **argv) {
             }
             if (g_head_only) unet_grad_head_only(d->u, g_head_only - 1);   /* --train-head-only N: head + last N-1 decoder blocks (frozen rest: --wd 0) */
             if (clip > 0 && gn > clip) unet_clip_grad(d->u, clip);
-            unet_srste24(d->u, srste);                       /* no-op unless sparse */
+            if (unet_get_sparse24_hard(d->u)) unet_sp24_grad_mask(d->u);   /* hard 2:4: the pruned weights' gradient 0 (Muon's momentum stays masked) */
+            else unet_srste24(d->u, srste);                  /* no-op unless sparse */
             const float lrr = lr0 > 0.f ? lr / lr0 : 0.f;   /* (lr0 0: 0 / 0 was NaN -> NaN weights after step 1; CAL 11-01) */
             const int ostep = accum > 1 ? (step + accum - 1) / accum : step;   /* (the optimizer's own step count: Adam's bias correction) */
             if (use_anvil) unet_anvil(d->u, anvil_lr * lrr, anvil_wd, ostep, steps / accum, lr, 0.9f, 0.999f, 1e-8f, wd);
@@ -4692,6 +4716,7 @@ int cmd_train(int argc, char **argv) {
                 }
                 unet_qk_clip(d->u, qk_tau);
             }
+            unet_sp24_project(d->u);                         /* hard 2:4: the update's pruned part dropped (no-op unless after the ramp) */
             unet_ema(d->u, ostep < 100 ? 0.9f : ema);
             unet_wquant(d->u, (unsigned)step);              /* no-op unless --wq */
             if (prof) nn_prof_end();
