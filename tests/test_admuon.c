@@ -85,7 +85,7 @@ static void test_stats(int ext, int nm) {
 
 static double mscale(int Co, int K) { return sqrt(fmax(1.0, (double)Co / K)); }
 /* lars / dog on batch A against the reference; B gives the direction */
-static void test_adapt(int nm, int lars, float tgt, int dog) {
+static void test_adapt(int nm, int lars, float tgt, int dog, float kappa) {
     batch a, b; batch_new(&a, 9); batch_new(&b, 9);
     const float lr0 = 0.02f, wd = 0.1f, sched[5] = {1.f, 1.f, 0.7f, 0.4f, 0.1f}, lb = 0.9f, lc = 2.f, dmax = 3.f;
     float *lrm = nn_malloc(N * 4), *ema = nn_malloc(N * 4), *disp[N]; double *dst = nn_malloc(4 * sizeof(double)), *part = nn_malloc((size_t)64 * N * sizeof(double));
@@ -93,7 +93,7 @@ static void test_adapt(int nm, int lars, float tgt, int dog) {
     for (int i = 0; i < N; i++) { const size_t nw = (size_t)CO[i] * KK[i]; disp[i] = nn_malloc(nw * 4); nn_zero(disp[i], nw * 4); }
     void *ddisp = nn_malloc(sizeof disp); nn_h2d(ddisp, disp, sizeof disp);
     const nn_madapt ad = {.lrm = lrm, .ema = ema, .dog = dst, .disp = (float *const *)ddisp, .part = part, .lr_peak = lr0, .lars_tgt = tgt, .lars_b = lb, .lars_c = lc,
-                          .dog_eta0 = lr0, .dog_max = dmax * lr0, .on_lars = lars, .on_dog = dog};
+                          .dog_eta0 = lr0, .dog_max = dmax * lr0, .dog_kappa = kappa, .on_lars = lars, .on_dog = dog};
     double *P[N], *Dd[N], rema[N] = {0}, rdog[4] = {0}, worst = 0, worst_s = 0; int clamped = 0;
     for (int i = 0; i < N; i++) { float *p = get_p(&a, i); const size_t nw = (size_t)CO[i] * KK[i]; P[i] = malloc(nw * sizeof(double)); Dd[i] = calloc(nw, sizeof(double)); for (size_t j = 0; j < nw; j++) P[i][j] = p[j]; free(p); }
     for (int it = 0; it < 5; it++) {
@@ -113,7 +113,7 @@ static void test_adapt(int nm, int lars, float tgt, int dog) {
         for (int i = 0; i < N; i++) { m[i] = lars ? fmin(fmax(t / rema[i], 1 / (double)lc), lc) : 1; if (lars && (m[i] == lc || m[i] == 1 / (double)lc)) clamped++;
             v2 += m[i] * m[i] * mscale(CO[i], KK[i]) * mscale(CO[i], KK[i]) * so[i]; }
         double f = 1;
-        if (dog) { const double sc = sched[it], gi = sc * sc * v2;
+        if (dog) { const double sc = sched[it], gi = (double)kappa * sc * sc * v2;
             if (rdog[1] <= 0) rdog[0] = fmax(rdog[0], lr0 * sqrt(gi));
             rdog[1] += gi; rdog[0] = fmax(rdog[0], rdog[3]); rdog[2] = fmin(rdog[0] / sqrt(rdog[1]), dmax * lr0); f = rdog[2] / lr0; }
         double dd = 0, sn[N];
@@ -137,7 +137,7 @@ static void test_adapt(int nm, int lars, float tgt, int dog) {
         if (it == 4) printf("  step 5: m [%.3f .. %.3f], eta %.4g (lr0 %.3g), rbar %.4g, G %.4g, dist %.4g\n", lars ? fmin(fmin(m[0], m[1]), fmin(m[2], fmin(m[3], m[4]))) : 1.,
                             lars ? fmax(fmax(m[0], m[1]), fmax(m[2], fmax(m[3], m[4]))) : 1., dog ? hd[2] : lr0, lr0, hd[0], hd[1], hd[3]);
     }
-    printf("adapt nm %d lars %d (target %g) dog %d: weights worst rel %.2e, state worst rel %.2e%s\n", nm, lars, tgt, dog, worst, worst_s, clamped ? " (clamp hit)" : "");
+    printf("adapt nm %d lars %d (target %g) dog %d (kappa %g): weights worst rel %.2e, state worst rel %.2e%s\n", nm, lars, tgt, dog, kappa, worst, worst_s, clamped ? " (clamp hit)" : "");
     CHECK(worst < 3e-4, "adaptive weights off: %.3e", worst);
     CHECK(worst_s < 1e-4, "adaptive state off: %.3e", worst_s);
     if (tgt > 0) CHECK(clamped, "the absolute target should hit the clamp");
@@ -150,10 +150,10 @@ int main(void) {
     test_stats(0, 0);
     test_stats(1, 0);
     test_stats(1, 1);
-    test_adapt(0, 1, 0.f, 0);
-    test_adapt(0, 1, 0.05f, 0);
-    test_adapt(0, 0, 0.f, 1);
-    test_adapt(1, 1, 0.f, 1);
+    test_adapt(0, 1, 0.f, 0, 1.f);
+    test_adapt(0, 1, 0.05f, 0, 1.f);
+    test_adapt(0, 0, 0.f, 1, 1.f);    /* kappa 1: the distance overtakes rbar_0 within the 5 steps (the max branch) */
+    test_adapt(1, 1, 0.f, 1, 19.f);   /* unet's kappa at beta 0.9 */
     if (fails) { printf("test_admuon: %d FAILED\n", fails); return 1; }
     printf("test_admuon: OK\n");
     return 0;
