@@ -1375,7 +1375,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                    winding mod 4 byte | papyrus / first aux plane byte (255 = unknown); UFSM_DUMP_N (8) windows (launch2 2026-11-14) */
                 static int ndd = 0; const char *dpre = getenv("UFSM_DUMP_DEV"); const int zm = D / 2;
                 static int dwhy = 0; if (dpre && !dwhy++) fprintf(stderr, "dump dev: D %d H %d W %d z %d..%d hsplit %d xfmt %d xs %d lat %d\n", D, H, W, z0, z1, d->hsplit, g_xfmt, g_xs, g_lat);
-                if (dpre && !pass && ndd < (getenv("UFSM_DUMP_N") ? atoi(getenv("UFSM_DUMP_N")) : 8) && z0 <= zm && zm < z1 && !d->hsplit) {
+                if (dpre && !pass && ndd < (getenv("UFSM_DUMP_N") ? atoi(getenv("UFSM_DUMP_N")) : 8) && z0 <= zm && zm < z1) {   /* (hsplit only times the uploads; the planes are whole) */
                     const size_t pl = (size_t)H * W, xb = xbytes(); uint8_t *hx = malloc(pl); uint8_t *hp[3] = {malloc(pl), malloc(pl), malloc(pl)};
                     /* the device input d->x (--gpu-input: the warped CT channel only, g_xs 1, full resolution), plane zm, min / max scaled */
                     char *cx = malloc(pl * xb); nn_d2h(cx, (const char *)d->x + (size_t)zm * pl * xb, pl * xb); float *cf = malloc(pl * sizeof(float)), lo = 1e30f, hi = -1e30f;
