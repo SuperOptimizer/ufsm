@@ -184,6 +184,9 @@ void unet_set_muon_vr(unet *u, float gamma);
    formats them per group (L0 convs, deeper convs, attention linears, the 1^3 heads, the other AdamW parameters); 0: nothing collected */
 /* adaptive Muon (train --muon-lars / --muon-dog; DESIGN.md 2026-11-14): (b) per-layer lr multipliers steering each matrix's update / weight
    ratio to tgt at the peak lr (0: their geometric mean), EMA beta, clamp C; (c) the DoG global step, capped at dog_max x lr_peak */
+/* --attn-muon-lr F / --attn-muon-lr-out F2 (audit train #3): the attention linears at F x the Muon lr, the zero-initialised out-projections
+   (wo, w2) at F x F2; 0 / 1 = off. Plain batched Muon and the ext path; not with --init-lr-mult */
+void unet_set_attn_muon_lr(unet *u, float all, float out);
 void unet_set_muon_adapt(unet *u, int lars, float tgt, float beta, float clamp, int dog, float dog_max, float lr_peak);
 void unet_opt_stats_arm(unet *u);
 int unet_opt_stats_str(unet *u, char *buf, size_t cap);

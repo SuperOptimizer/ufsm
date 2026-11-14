@@ -479,7 +479,8 @@ __global__ void ad_ctl_k(const muon_desc_t *d, int n, const double *po, const do
     const double tgt = a.lars_tgt > 0.f ? (double)a.lars_tgt / a.lr_peak : exp(lsum / n);
     double v2 = 0;
     for (int i = 0; i < n; i++) {
-        const double m = a.on_lars ? fmin(fmax(tgt / fmax((double)a.ema[i], 1e-30), 1.0 / a.lars_c), (double)a.lars_c) : 1.0;
+        double m = a.on_lars ? fmin(fmax(tgt / fmax((double)a.ema[i], 1e-30), 1.0 / a.lars_c), (double)a.lars_c) : 1.0;
+        if (a.base) m *= a.base[i];   /* (--attn-muon-lr: the fixed multipliers) */
         v2 += m * m * (double)a.lrm[i] * a.lrm[i]; a.lrm[i] = (float)m;
     }
     if (a.on_dog) {

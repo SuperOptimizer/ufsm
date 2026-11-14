@@ -2802,6 +2802,11 @@ int cmd_train(int argc, char **argv) {
     const float kron_b2 = (float)atof(opt(argc, argv, "--muon-kron-b2", "0.99")), kron_eps = (float)atof(opt(argc, argv, "--muon-kron-eps", "1e-3"));
     const int ns_mode = !strcmp(muon_ns, "polar") ? 1 : !strcmp(muon_ns, "fixed") ? 0 : -1;
     if (ns_mode < 0 || normuon < 0 || normuon > 1 || !(normuon_b2 >= 0.f && normuon_b2 < 1.f)) { fprintf(stderr, "--muon-ns fixed | polar, --normuon 0 | 1, --normuon-beta2 in [0, 1)\n"); return 2; }
+    /* --attn-muon-lr F [--attn-muon-lr-out F2] (audit 2026-11-14 train #3; default 1 = off): the attention stage's Muon linears at F x the
+       Muon lr, the zero-initialised out-projections wo / w2 at F x F2 (their relative step is large while |W| is small; --opt-stats attn) */
+    const float attn_mlr = (float)atof(opt(argc, argv, "--attn-muon-lr", "1")), attn_mlr_out = (float)atof(opt(argc, argv, "--attn-muon-lr-out", "1"));
+    if (!(attn_mlr > 0.f) || !(attn_mlr_out > 0.f)) { fprintf(stderr, "--attn-muon-lr / --attn-muon-lr-out: > 0\n"); return 2; }
+    if ((attn_mlr != 1.f || attn_mlr_out != 1.f) && (!use_muon || muon_c || hyperball)) { fprintf(stderr, "--attn-muon-lr: needs --opt muon, not with --muon-c / --hyperball\n"); return 2; }
     if ((muon_lars || muon_dog) && (!use_muon || muon_c || hyperball)) { fprintf(stderr, "--muon-lars / --muon-dog / --muon-adaptive need --opt muon, not with --muon-c / --hyperball\n"); return 2; }
     if ((ns_mode || normuon || muon_vr != 0.f || muon_kron || muon_caut || mix_a != 0.f) && !use_muon) { fprintf(stderr, "--muon-ns polar / --normuon / --muon-vr / --muon-kron / --muon-cautious / --muon-ademamix need --opt muon\n"); return 2; }
     if (muon_kron < 0 || muon_kron > 1 || kron_every < 1 || !(kron_b2 >= 0.f && kron_b2 < 1.f) || !(kron_eps > 0.f)) { fprintf(stderr, "--muon-kron 0 | 1, --muon-kron-every >= 1, --muon-kron-b2 in [0, 1), --muon-kron-eps > 0\n"); return 2; }
@@ -2822,7 +2827,7 @@ int cmd_train(int argc, char **argv) {
     const float init_lr = (float)atof(opt(argc, argv, "--init-lr-mult", "1"));
     const int init_lr_steps = atoi(opt(argc, argv, "--init-lr-steps", "0"));
     if (!(init_lr >= 0.f) || init_lr_steps < 0) { fprintf(stderr, "--init-lr-mult >= 0, --init-lr-steps >= 0\n"); return 2; }
-    if (init_lr != 1.f && (trunk_lr != 1.f || use_anvil || muon_c || hyperball || ns_mode || normuon || muon_vr != 0.f || muon_caut || muon_kron || mix_a != 0.f || muon_lars || muon_dog)) { fprintf(stderr, "--init-lr-mult: not with --trunk-lr-mult, --opt anvil, --muon-c, --hyperball, --muon-ns polar, --normuon or --muon-vr\n"); return 2; }
+    if (init_lr != 1.f && (trunk_lr != 1.f || use_anvil || muon_c || hyperball || ns_mode || normuon || muon_vr != 0.f || muon_caut || muon_kron || mix_a != 0.f || muon_lars || muon_dog || attn_mlr != 1.f || attn_mlr_out != 1.f)) { fprintf(stderr, "--init-lr-mult: not with --trunk-lr-mult, --opt anvil, --muon-c, --hyperball, --muon-ns polar, --normuon or --muon-vr\n"); return 2; }
     float anvil_lr = (float)atof(opt(argc, argv, "--anvil-lr", "0.023")), anvil_wd = (float)atof(opt(argc, argv, "--anvil-wd", "2.25"));
     const char *sched = opt(argc, argv, "--sched", "cos");   /* cos | wsd (warmup, constant, linear cooldown over the last --cooldown fraction; extendable runs) */
     int schedule_start = atoi(opt(argc, argv, "--schedule-start", "0"));
@@ -3655,6 +3660,7 @@ int cmd_train(int argc, char **argv) {
         unet_set_muon_vr(d->u, muon_vr);
         unet_set_muon_cautious(d->u, muon_caut);
         unet_set_muon_adapt(d->u, muon_lars, lars_tgt, lars_b, lars_c, muon_dog, dog_max, muon_lr);
+        unet_set_attn_muon_lr(d->u, attn_mlr, attn_mlr_out);
         nn_muon_tc(muon_tc);
         unet_set_muon_qkv_split(d->u, muon_qkv);
         nn_muon_scale_mode(muon_spec); unet_set_rest_sign(d->u, rest_sign, rest_mult);
