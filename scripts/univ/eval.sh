@@ -87,6 +87,8 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
     [ -n "${INKONLY:-}" ] && [ "$cr" != "$INKONLY" ] && continue   # INKONLY=CROP: that crop alone (a caller yielding GPU 0 between crops)
     ctk=${ctk:-$P4K}; case $M in http*) ;; *) ctk=${ctk/\/volumes\//\/};; esac   # (a local CT tree, e.g. the desk's /vesuvius/ufsm/v2/ct: keys without volumes/)
     um=$(python3 -I -c "import json; print(json.load(open('$C/$cr/crop.json')).get('um', 2.4))")
+    # INK_AXIS (default 1; audit inkmil #2): the scroll's axis for the heads predict, as 97 % of the ink training weight carried one (0: none, the old behaviour)
+    AXI=; if [ "${INK_AXIS:-1}" = 1 ]; then ax=$(awk -F'\t' -v s="${scr:-PHercParis4}" '$1 == s {print $2}' ${INK_AXES:-$(dirname $(readlink -f $0))/ink_axes.tsv}); [ -n "$ax" ] && [ -s "$ax" ] && AXI="--axis $ax"; fi
     g=/nonexistent; for gd in ${INKGT:-}; do [ -d $gd/$cr.zarr ] && { g=$gd/$cr.zarr; break; }; done; vs=0; [ -d $g ] && ! grep -qP "^$cr\t" $o/vscores.tsv && vs=1   # INKGT: one or more dirs
     grep -qP "^$cr\t" $o/scores.tsv && [ $vs = 0 ] && continue
     AXF=$(bash $H/scripts/unroll/axis_for.sh ${scr:-PHercParis4}) || { log "ink: $cr: no axis for ${scr:-PHercParis4} (predict needs one)"; continue; }

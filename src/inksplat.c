@@ -1803,7 +1803,7 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
         if (drop && drop[i]) continue;
         inkray *r = &Rr[nr++];
         for (int d = 0; d < 3; d++) { r->p[d] = (float)((x->P[d] - f->off) / V - o[d]); r->n[d] = (float)(x->N[d] * sign); }
-        r->y = x->y; r->w = 1; memset(r->pad, 0, sizeof r->pad);
+        r->y = x->y; r->w = 1; r->rs = 1; memset(r->pad, 0, sizeof r->pad);
     }
     free(drop); *out = Rr; *nout = nr; rc = 0;
 done:

@@ -2171,7 +2171,7 @@ int sample_mil_map(void *rays, int n, const int perm[3], const int flip[3], cons
         double nn2 = 0; for (int d = 0; d < 3; d++) { q[1][d] -= q[0][d]; nn2 += q[1][d] * q[1][d]; }
         int in = nn2 > 1e-12; for (int d = 0; d < 3; d++) in &= q[0][d] >= -.5 && q[0][d] < nd[d] - .5;
         if (!in) continue;
-        for (int d = 0; d < 3; d++) { r.p[d] = (float)q[0][d]; r.n[d] = (float)(q[1][d] / sqrt(nn2)); }
+        for (int d = 0; d < 3; d++) { r.p[d] = (float)q[0][d]; r.n[d] = (float)(q[1][d] / sqrt(nn2)) * (r.rs > 0.f ? r.rs : 1.f); }
         rs[k2++] = r;
     }
     return k2;
@@ -2728,6 +2728,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     g_last_si = si;
     source *s = &sp->S->src[si];
     if (c->holdout && !s->hold_n[0]) return 1;
+    source_set_val_read(c->holdout != 0);   /* (the validation sampler reads the onfly ink targets without the holdout exclusions) */
     if (b->nbank && bank_assign(sp, s, b)) return -1;   /* (--plane bank, B 1: this window's label roles) */
     /* regions target? pick one region, then a level in {0,1} */
     int region_ch = -1, ri = -1;
@@ -2908,7 +2909,11 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (inkfly_rays && ich >= 0 && l >= L && l <= L + 1 && !crushed && !torn && !delam && !curved) {
             const int f = 1 << (l - L); const int64_t o2[3] = {o[0] * f, o[1] * f, o[2] * f}, n2[3] = {n[0] * f, n[1] * f, n[2] * f};
             inkray *rs = nullptr; size_t nr = 0;
-            if (inkfly_rays(s->ink_fly[ich], o2, n2, c->mil_mode, c->mil_stride > 0 ? c->mil_stride : 1, c->mil_R * f, &rs, &nr)) { free(rs); return -1; }
+            /* --ink-mil-r-um (2026-11-14, audit inkmil #5): the reach in microns. R was in window voxels (+-48 um at 4.8, +-96 um at 9.6); the K samples
+               now span +-r_um at every rung: the ray's normal is stretched by r_um / (R voxel um), the held-out guard uses the same reach */
+            const float rsc = c->mil_r_um > 0 && c->mil_R > 0 && s->um > 0 ? (float)(c->mil_r_um / (s->um * ldexp(1.0, l)) / c->mil_R) : 1.f;
+            if (inkfly_rays(s->ink_fly[ich], o2, n2, c->mil_mode, c->mil_stride > 0 ? c->mil_stride : 1, c->mil_R * rsc * f, &rs, &nr)) { free(rs); return -1; }
+            for (size_t k = 0; k < nr; k++) rs[k].rs = rsc;
             size_t k2 = 0;
             for (size_t k = 0; k < nr; k++) {
                 inkray r = rs[k]; int out = 0;
@@ -3300,6 +3305,10 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         if (cont) y = sym_of(cs->symi);
         else for (int k = 0; k < 48; k++) { const sym t = sym_of(k); if (!memcmp(&t, &y, sizeof t)) { symi = k; break; } }
     }
+    /* --ink-radial-drop P (audit inkmil #2): an ink-source window with probability P takes no radial channels at all (the all-zero input predicts without --axis
+       feed the head; 97 % of the ink training weight carried an axis). The draw happens only with the flag on, so the random stream is unchanged otherwise. */
+    int hax = s->ax.n > 0;
+    if (hax && c->ink_radial_drop > 0) { int inks = 0; for (int q = 0; q < NTG; q++) inks |= s->ink_fly[q] != nullptr; if (inks && runif(r) < c->ink_radial_drop) hax = 0; }
     if (c->augment && c->axis_jitter > 0 && s->ax.n > 0 && runif(r) < (c->axis_jitter_p > 0 ? c->axis_jitter_p : .1)) {
         float jy = (float)((2 * runif(r) - 1) * c->axis_jitter / scale);
         float jx = (float)((2 * runif(r) - 1) * c->axis_jitter / scale);
@@ -3552,15 +3561,15 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         for (int sz=0;sz<P;sz++) sheet_parameters(c->sheet,o[0]+sz,params[sz]);
     }
     if (lw || (tmu && spatial.active)) rskip(r, (uint64_t)Pz * P * (uint64_t)(P / 4 + P % 4));   /* (write_spatial_tm's noise draws; tmu: with --gpu-input it writes T / M only) */
-    else if (spatial.active) write_spatial_tm(ctu,ttmp,mask,T,M,P,o,(float)mean,(float)(1.0/sd),s->ax.n>0,cyz,cxz,y,&spatial,
+    else if (spatial.active) write_spatial_tm(ctu,ttmp,mask,T,M,P,o,(float)mean,(float)(1.0/sd),hax,cyz,cxz,y,&spatial,
             ia,ib,isg,r,nrow,c->xfmt,X,H,app,noise_state,noise_state?noise_state+P:nullptr,c->sheet,params,(float *)(big+p3),c->pack_tm,c->gpu_input,TMd);
-    else if (c->sheet || (app && Pz != P)) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
+    else if (c->sheet || (app && Pz != P)) write_x_aug(ctu, P, o, (float)mean, (float)(1.0 / sd), hax, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt,
             X, H, app, noise_state, noise_state ? noise_state + P : nullptr,c->sheet,params);
     else if (grec) { if (c->augment) rskip(r, (uint64_t)Pz * P * (uint64_t)(P / 4 + P % 4)); }   /* (write_x's jitter draws) */
-    else write_x(ctu, Pz, P, o, (float)mean, (float)(1.0 / sd), s->ax.n > 0, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H,
+    else write_x(ctu, Pz, P, o, (float)mean, (float)(1.0 / sd), hax, cyz, cxz, y, c->augment != 0, ia, ib, isg, r, nrow, c->xfmt, X, H,
                  app, noise_state, noise_state ? noise_state + P : nullptr, c->gpu_input);   /* the CT appearance plan in the row-vectorised writer (cubes) */
-    if (c->gpu_input) rad_record((char *)b->rad + (size_t)i * NN_RAD_REC(Pz), o, Pz, P, s->ax.n > 0, y, cyz, cxz, &spatial);   /* the radial channels: on the device */
-    if (c->axis_rec > 0) axis_record(b->axr + (size_t)i * SAMPLE_AXR(Pz > P ? Pz : P), o, Pz, P, s->ax.n > 0, y, cyz, cxz, &spatial, c->axis_rec);
+    if (c->gpu_input) rad_record((char *)b->rad + (size_t)i * NN_RAD_REC(Pz), o, Pz, P, hax, y, cyz, cxz, &spatial);   /* the radial channels: on the device */
+    if (c->axis_rec > 0) axis_record(b->axr + (size_t)i * SAMPLE_AXR(Pz > P ? Pz : P), o, Pz, P, hax, y, cyz, cxz, &spatial, c->axis_rec);
     free(params); tp_put(tmscr, p3);
     if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
         uint8_t *aw = tp_get(p3, 1), *as = tp_get(p3, 0);

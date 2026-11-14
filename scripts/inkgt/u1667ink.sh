@@ -52,6 +52,10 @@ a = [max(int(bx[d] * s), int(lo[d] / f) - 64) for d in range(3)]; e = [min(int((
 print(",".join(map(str, a + [e[d] - a[d] for d in range(3)])))
 PY
 ) || { log "box failed"; exit 1; }
+# INK_AXIS (default 1; audit inkmil #2): the unroll's axis file for the predict, as the ink windows trained with an axis (97 % of the ink weight); 0: none
+AXA=; [ "${INK_AXIS:-1}" = 1 ] && [ -s $O/axis.json ] && AXA="--axis $O/axis.json"
+[ "${INK_AXIS:-1}" = 1 ] && [ -z "$AXA" ] && log "WARNING: no $O/axis.json, predicting without --axis (radial channels zero)"
+# LV=1 (4.8 um, the crop evals' level) is the level the head's held-out numbers were measured at (audit inkmil #3); LV=2 (default, 9.6 um) has no crop number yet
 log "ckpt $CK, level $LV ($key um), box $box, labels ${SEGS:-none (render only)}"
 if [ ! -e $INK/ink.done ]; then
   # BLEND=1 (default): the latent ink head's level depends on its window (inkpod-9000: steps of 10-30 / 255 at the window seams, halo 16..256

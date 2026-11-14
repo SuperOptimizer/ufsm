@@ -280,7 +280,7 @@ static int unwrap2_heads_moved(const char *init_from) {
 }
 static double g_reject_warn = 100;
 static double g_outward_warn = 0.9;   /* --outward-warn S: warn when a source's aligned phase-gradient samples rise outward less often than S (0 off) */   /* mgpu: config */
-static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static float g_mil_R = 10.f, g_mil_step = 1.f, g_mil_tau = 0.f, g_mil_lambda = 1.f;   /* --ink-mil L
+static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static float g_mil_r_um = 0.f, g_mil_R = 10.f, g_mil_step = 1.f, g_mil_tau = 0.f, g_mil_lambda = 1.f;   /* --ink-mil L
    (--ink-head): the normal-pooled MIL ink loss on each window's rays (inkmil.h): per supervised label pixel (mode 1: only those without an open face, the
    voxel target's unknowns), BCE of the pooled ink logit along the normal over +-R window voxels at step (tau 0: max; > 0: tau log mean exp), the mean
    over the window's rays x L x the source's ink weight; at most --ink-mil-max rays a window (the device buffers; the backward's sort ~300 B per sample) */
@@ -2800,7 +2800,7 @@ int cmd_train(int argc, char **argv) {
             g_w4_lambda = (float)atof(opt(argc,argv,"--wind4-lambda","1"));
             g_ink2 = atoi(opt(argc,argv,"--ink-head","0")); g_ink_smooth = (float)atof(opt(argc,argv,"--ink-smooth","0"));
             g_mil_lambda = (float)atof(opt(argc,argv,"--ink-mil","0")); g_mil = g_mil_lambda > 0;
-            g_mil_R = (float)atof(opt(argc,argv,"--ink-mil-r","10")); g_mil_step = (float)atof(opt(argc,argv,"--ink-mil-step","1")); g_mil_tau = (float)atof(opt(argc,argv,"--ink-mil-tau","0"));
+            g_mil_R = (float)atof(opt(argc,argv,"--ink-mil-r","10")); g_mil_r_um = (float)atof(opt(argc,argv,"--ink-mil-r-um","0"));   /* (0: R in window voxels as before; > 0: the reach in um, the K samples spanning it at every rung) */ g_mil_step = (float)atof(opt(argc,argv,"--ink-mil-step","1")); g_mil_tau = (float)atof(opt(argc,argv,"--ink-mil-tau","0"));
             g_mil_mode = atoi(opt(argc,argv,"--ink-mil-mode","1")); g_mil_stride = atoi(opt(argc,argv,"--ink-mil-stride","2")); g_mil_max = atoi(opt(argc,argv,"--ink-mil-max","65536")); if (ink_mil_set_max) ink_mil_set_max(g_mil_max);
             if (!(g_mil_lambda >= 0) || (g_mil && (!ink_mil_fwd_slab || !(g_mil_R > 0) || !(g_mil_step > 0) || !(g_mil_tau >= 0) || ink_mil_samples(g_mil_R, g_mil_step) > 256 || g_mil_mode < 0 || g_mil_mode > 1 || g_mil_stride < 1 || g_mil_max < 1))) {
                 fprintf(stderr, "--ink-mil L >= 0 (needs nn_inkmil in the binary), --ink-mil-r R > 0, --ink-mil-step > 0 (2R / step + 1 <= 256 samples), --ink-mil-tau >= 0, --ink-mil-mode 0|1, --ink-mil-stride >= 1, --ink-mil-max >= 1\n"); return 2; }   /* --ink-head 1: the ink logit as output channel 11 (the universal model) */
@@ -3529,7 +3529,7 @@ int cmd_train(int argc, char **argv) {
     sc.strict_sources = opt_atoi("--strict-sources", opt(argc, argv, "--strict-sources", "0"));
     g_outward_warn = opt_atof("--outward-warn", opt(argc, argv, "--outward-warn", "0.9"));
     g_reject_warn = opt_atof("--reject-warn", opt(argc, argv, "--reject-warn", "100"));   /* the draws line's per-source drops per new window above which it warns */   /* 1: a weighted source the sampler cannot draw is fatal (launchers: on) */
-    sc.ink_mil = g_mil; sc.mil_mode = g_mil_mode; sc.mil_stride = g_mil_stride; sc.mil_max = g_mil_max; sc.mil_R = g_mil_R;   /* --ink-mil: the windows' rays (batch.mil) */
+    sc.ink_mil = g_mil; sc.mil_mode = g_mil_mode; sc.mil_stride = g_mil_stride; sc.mil_max = g_mil_max; sc.mil_R = g_mil_R; sc.mil_r_um = g_mil_r_um;   /* --ink-mil: the windows' rays (batch.mil) */
     sc.ink_plane = IPLANE;   /* --ink-head: the sources' "ink" targets on their own plane (batch.ink); --rv: the papyrus plane there */
     sc.ink_fib = g_aux_of[AUX_FIB] == 0; sc.fib_sheet = g_fibn && !g_ink2;   /* --fib-normal-lambda: the "fibre" target, else (no ink head) the "sheet" / "ink" one */
     sc.aux_n = g_naux > 1 ? g_naux - 1 : 0;
@@ -3592,6 +3592,7 @@ int cmd_train(int argc, char **argv) {
     sc.axis_jitter = (float)optd(argc, argv, "--axis-jitter", sc.axis_jitter);
     /* --axis-jitter-p P (default 0.1), --axis-jitter-deg D (default 2): how often the axis moves and the cap on the radial input's
        direction change; an estimated umbilicus on another scroll is off by ~1-3 mm (on block B, 3 mm costs phase confidence .65 -> .58) */
+    sc.ink_radial_drop = (float)optd(argc, argv, "--ink-radial-drop", 0);   /* (P: ink-source windows without radial channels) */
     sc.axis_jitter_p = (float)optd(argc, argv, "--axis-jitter-p", sc.axis_jitter_p); sc.axis_jitter_deg = (float)optd(argc, argv, "--axis-jitter-deg", sc.axis_jitter_deg);
     sc.geometry_augment = (int)optd(argc,argv,"--geometry-aug",sc.geometry_augment);
     sc.rotate_degrees=(float)optd(argc,argv,"--rotate-deg",sc.rotate_degrees);
@@ -4961,7 +4962,7 @@ int cmd_train(int argc, char **argv) {
     double acc_siden = 0, acc_normn = 0, acc_w4n = 0;   /* windows that carry side / phase, normal, wind4 labels (their loss > 0): the logged means are over them, as ink / fib */
     double acc_fh[2] = {0}, acc_fhn = 0;   /* --fib-head: mask / direction bce sums, windows with known fibre labels */
     double acc_kl[8] = {0}, acc_kln[8] = {0};   /* head slabs: the KL (bce - the targets' entropy) of phase / side, rv, normal, wind4, ink, fibre, fibre direction; [7] the phase angle error */
-    double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
+    double *viks = nullptr; double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
     train_unread_flags(argc, argv);
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
         {   /* UFSM_CUPROF=A,B: cudaProfilerStart before step A, Stop after step B (nsys --capture-range=cudaProfilerApi: a steady-state window of a P 1024 run) */
@@ -5449,7 +5450,9 @@ int cmd_train(int argc, char **argv) {
                             if (q->w4_loss > 0) { vw4[0] += q->w4h[0]; vw4[1] += q->w4h[5]; vw4n[0] += 1; } vw4[2] += q->w4h[1] * q->w4h[2]; vw4[3] += q->w4h[2];
                             if (q->side_loss > 0) { vw4[4] += q->side_loss / (g_side_lambda ? g_side_lambda : 1.f); vw4n[1] += 1; }
                             if (q->norm_loss > 0) { vw4[5] += q->norm_raw; vw4n[2] += 1; } }
-                        if (g_ink2 && q->iout[2] > 0) { vik[0] += q->iout[0]; vik[1] += 1; }
+                        if (g_ink2 && q->iout[2] > 0) { vik[0] += q->iout[0]; vik[1] += 1;
+                            const int si_k = vbt->src ? vbt->src[0] : -1;   /* per source (= per scroll) ink val: 1667's memorisation shows as its val bce rising while the train bce falls */
+                            if (si_k >= 0 && si_k < S->n) { if (!viks) viks = calloc((size_t)S->n * 2, sizeof *viks); if (viks) { viks[2 * si_k] += q->iout[0]; viks[2 * si_k + 1] += 1; } } }
                         const int vsi = vbt->src ? vbt->src[0] : -1;   /* per source (the holdout boxes of each scroll) */
                         if (vsi >= 0 && vsi < S->n) { double *u = vsrc + (size_t)vsi * 8;
                             const double hv[4] = {g_unwrap2 && q->side_loss > 0 ? q->side_loss / (g_side_lambda ? g_side_lambda : 1.f) : -1, g_unwrap2 && q->w4_loss > 0 ? q->w4h[0] : -1,
@@ -5506,6 +5509,8 @@ int cmd_train(int argc, char **argv) {
                     memset(vsrc, 0, (size_t)S->n * 8 * sizeof *vsrc);
                 }
                 if (g_ink2 && nval) fprintf(stderr, "val ink: bce %.5f over %.0f of %d windows with known ink\n", vik[1] > 0 ? vik[0] / vik[1] : 0.0, vik[1], nval);
+                if (g_ink2 && nval && viks) for (int k = 0; k < S->n; k++) if (viks[2 * k + 1] > 0) fprintf(stderr, "val ink %s: bce %.5f over %.0f windows\n", S->src[k].name, viks[2 * k] / viks[2 * k + 1], viks[2 * k + 1]);
+                if (viks) memset(viks, 0, (size_t)S->n * 2 * sizeof *viks);
                 vik[0] = vik[1] = 0;
                 vcrit = vl;
                 if (g_restore && g_rpairs && nval) restore_pair_report(S, out, step, &vcrit);

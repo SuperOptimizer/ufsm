@@ -6,6 +6,28 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Ink head: per-scroll gating, validation twin, radial dropout, MIL reach in um (2026-11-14, branch inkfix-20261114)
+
+From the inkmil audit (/vesuvius/ufsm/audit-20261114/targeted/inkmil.md). The head is not at chance: inkpod-10000 crop AUC Paris 4 0.795, 0500P2 0.729,
+0841 (unseen scroll) 0.715, 0139 0.634, 1667 0.539; 1667 is the floor for every model (ink3d-ext 0.527 at 2.4 um). What this branch changes:
+- **Gate (`scripts/univ/ink_gate.py`)**: per-scroll crop AUC from eval.sh's vscores.tsv, headline = mean over Paris 4 / 0500P2 / 0841 / 0139, 1667
+  non-regression only (>= base - 0.03), no scroll may fall > 0.03 against a base. The 1667 banner AUC is not a gate (published model output).
+- **Validation twin (eval audit #2)**: an onfly ink target with a holdout_file opens a second inkfly without the held-out exclusions (`tgt_val`,
+  `val_twin: 0` in the onfly entry turns it off); `source_read_target` reads it when the validation sampler's draw set `source_set_val_read`. Train
+  keeps the exclusions (the sampler's window mask is the guard). The log prints `val ink <source>: bce .. over N windows` per source after the
+  aggregate line, so 1667 memorisation (train bce down, val bce up; 0.832 vs 0.53-0.56 in wrapscore) is visible in the run.
+- **`--ink-radial-drop P`**: ink-source windows take no radial channels with probability P (97 % of the ink weight had an axis; predicts without
+  --axis feed zeros). The draw happens only with the flag on (stream unchanged otherwise); replays keep the flag in the radial record.
+- **`--ink-mil-r-um U`**: the MIL reach in microns. `--ink-mil-r` / `--ink-mil-step` keep K = 21 samples, the ray normal is stretched by
+  U / (R x window voxel um) (`inkray.rs`, applied in `sample_mil_map`, also on replays), the held-out guard uses the same reach. Default 0 = the
+  old voxel reach (+-48 um at 4.8, +-96 um at 9.6). Suggested 50. Not in any recipe yet: changes the loss.
+- **Predict / scripts**: predict warns without --axis (UFSM_PRED_AXIS_WARN=0 silences); eval.sh passes the scroll's ink-source axis
+  (`scripts/univ/ink_axes.tsv`, INK_AXIS=0 for the old behaviour); u1667ink.sh passes `$O/axis.json` (INK_AXIS=0) and notes LV=1 as the crop level.
+- **GPU check, to run in a window**: `scripts/univ/ink_check_axis_level.sh CKPT TAG` = inkpod-10000 on the 34 crops at level 1 / 2 with / without
+  axis, gate table in `$OUT/TAG.gate.txt`. L1-noax must reproduce the 0.795 / 0.729 / 0.715 / 0.634 / 0.539 rows; (L1 ax - noax) is the axis effect,
+  (L1 - L2) the 9.6 um cost. Production ink at 4.8 um on the labelled boxes = `LV=1 scripts/inkgt/u1667ink.sh` (the shell-only predict is not built).
+- Not done: ink-specific fine stem / no stem dropout on ink windows (needs a training run), scroll-weight rebalancing.
+
 ## Head slabs: seam fixes from the targeted audit (2026-11-14, branch hsfix-20261114)
 
 Audit /vesuvius/ufsm/audit-20261114/targeted/headslab.md: BCE / dice / wind4 / MIL / the streamed latent head are exactly slabbed == unslabbed

@@ -29,7 +29,7 @@ typedef struct {
     int holdout_reject;      /* training windows that overlap a held-out box (any same-CT source's): 0 = keep the window, every label unknown
                                 inside the box grown by holdout_guard level-l voxels ("mask", the default); 1 = drop and redraw ("reject").
                                 A source's "holdout_mode" overrides it */
-    int ink_mil, mil_mode, mil_stride, mil_max; float mil_R;   /* --ink-mil: each window's normal-pooled MIL rays (inksplat.h inkfly_rays of the source's onfly ink target:
+    int ink_mil, mil_mode, mil_stride, mil_max; float mil_R, mil_r_um;   /* --ink-mil: each window's normal-pooled MIL rays (inksplat.h inkfly_rays of the source's onfly ink target:
                                 mode, stride, reach R in window voxels; at most mil_max, evenly subsampled) into batch.mil / nmil, on the source grid (train maps them through the symmetry) */
     int strict_sources;      /* train --strict-sources 1: a weighted source with no eligible level ("excluded: no ... patch fits") stops sampler_start (fatal) */
     int holdout_guard;       /* the mask's margin around each held-out box, in voxels of the window's level (default 16) */
@@ -56,7 +56,7 @@ typedef struct {
     int ct_augment;         /* conservative reconstructed-CT appearance augmentation */
     float symmetry_p;       /* chance of drawing a symmetry when augment enables geometry */
     float axis_jitter;      /* max auxiliary axis error in native voxels, p=.1, angle capped at 2 degrees */
-    float axis_jitter_p, axis_jitter_deg;   /* its probability and angle cap (0: .1 and 2 degrees): an estimated umbilicus on other scrolls */
+    float ink_radial_drop; float axis_jitter_p, axis_jitter_deg;   /* its probability and angle cap (0: .1 and 2 degrees): an estimated umbilicus on other scrolls */
     int geometry_augment;  /* all 48 symmetries, including Z flips, with registered continuous warps */
     float rotate_degrees, rotate_p, elastic, elastic_p;
     float zoom_min, zoom_p;  /* zoom-in augmentation: with probability zoom_p the window shows a 1/z of the read cube, z uniform

@@ -1945,6 +1945,8 @@ static int predict_one(int argc, char **argv) {
     }
     axis ax = {0};
     if (axisf && axis_load(&ax, axisf)) { fprintf(stderr, "cannot load axis %s\n", axisf); return 1; }
+    if (!axisf && (getenv("UFSM_PRED_AXIS_WARN") ? atoi(getenv("UFSM_PRED_AXIS_WARN")) : 1))   /* (audit inkmil #2 / eval#3: no refusal, the fixture and fit paths run axis-less on purpose) */
+        fprintf(stderr, "predict: WARNING no --axis: the radial input channels are zero (and scroll attention positions invalid). Nets trained with an axis (most ink / winding sources) see an input they were not trained on; UFSM_PRED_AXIS_WARN=0 silences this\n");
     double um_l = um * (1 << level), scale = (double)(1 << level);
     { const float ls = (float)opt_atof("--attn-lscale", opt(argc, argv, "--attn-lscale", "0")); if (ls > 1.f) at_set_lscale(ls); }   /* tokens the net was trained on (216 at P 768; audit attn #2) */
     if (unet_cfg_axis(&cfg) && !ax.n) {   /* the PE / radial attention would silently fall back to grid indices (audit attn 11-14 #1) */
