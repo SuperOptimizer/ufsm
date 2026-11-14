@@ -188,7 +188,7 @@ __global__ void __launch_bounds__(288, LP_MINB(2)) conv_bwd_w_f4_k(const T *__re
             for (int j = 0; j < 18; j++) {
                 const float xv = __uint_as_float((j & 1) ? wv[(j + 1) >> 1] << 16 : wv[j >> 1] & 0xffff0000u);   /* position j = bf16 3 + j */
                 const float u = fmaf(xv, ca, cb), h = 0.5f * u;
-                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+                float th = tanh_silu(h);
                 v[j] = rok && j >= jlo && j < jhi ? (G ? fmaf(h, th, h) : xv) : 0.f;
                 am = amax_u(am, v[j]);
             }
@@ -903,7 +903,7 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
                         for (int j = 0; j < 18; j++) {
                             const float xv = xd[j];
                             const float h = fmaf(xv, ha, hb);
-                            float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+                            float th = tanh_silu(h);
                             v[j] = fmaf(h, th, h);
                             am = amax_xs(am, v[j]);
                         }
@@ -917,7 +917,7 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
                     for (int j = 0; j < 18; j++) {
                         const float xv = xd[j];
                         const float h = fmaf(xv, ha, hb);
-                        float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+                        float th = tanh_silu(h);
                         v[j] = rok && j >= jlo && j < jhi ? (G ? fmaf(h, th, h) : xv) : 0.f;
                         am = amax_xs(am, v[j]);
                     }

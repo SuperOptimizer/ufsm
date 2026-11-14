@@ -3,7 +3,7 @@
 /* d silu(u) / du = sg (1 + u (1 - sg)), sg = sigmoid(u) = 1/2 + tanh(u / 2) / 2: one MUFU op (exp + reciprocal took two;
    tanh.approx ~2^-11 relative, far below the e4m3 rounding of the stored gradient) */
 __device__ __forceinline__ float dsilu(float u) {
-    float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(0.5f * u));
+    float th = tanh_silu(0.5f * u);
     const float sg = fmaf(0.5f, th, 0.5f);
     return sg * (1.f + u * (1.f - sg));
 }
@@ -166,7 +166,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_k(const uint8_t *x,
             if (FULL ? k < NK : k < kmax) {
                 const float4 c4 = cf[h0 + k];
                 const float p = fmaf(r[k], c4.x, c4.y);
-                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+                float th = tanh_silu(p);
                 const float t = g[k] * ((1.f + th) * (fmaf(-p, th, p) + 1.f)) * fg;   /* gy 2 dsilu(u) */
                 s1[k] += t; s2[k] = fmaf(t, r[k] - c4.z, s2[k]);
             }
@@ -316,7 +316,7 @@ __global__ void __launch_bounds__(256, 5) gn_silu_bwd_apply_mx2_k(const uint8_t 
             if (FULL ? k < NK : k < kmax) {
                 const float4 c4 = cf[h0 + k];
                 const float p = fmaf(r[k], c4.x, c4.y);
-                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+                float th = tanh_silu(p);
                 const float d2 = (1.f + th) * (fmaf(-p, th, p) + 1.f);   /* 2 dsilu(2p) */
                 out[k] = fmaf(g[k] * d2 * c4.x, fg, fmaf(r[k], c4.z, c4.w));
                 am = amax_u(am, out[k]);
@@ -437,7 +437,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_hg_k(const uint8_t 
             if (FULL || k < kmax) {
                 const float4 c4 = cf[h0 + k];
                 const float p = fmaf(r[k], c4.x, c4.y);
-                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+                float th = tanh_silu(p);
                 const float t = g[k] * ((1.f + th) * (fmaf(-p, th, p) + 1.f)) * fg;   /* gy 2 dsilu(u) */
                 s1[k] += t; s2[k] = fmaf(t, r[k] - c4.z, s2[k]);
             }
@@ -498,7 +498,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_hg_k(uint8_t *x, co
         if (FULL || k < kmax) {
             const float4 c4 = cf[h0 + k];
             const float p = fmaf(r[k], c4.x, c4.y);
-            float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+            float th = tanh_silu(p);
             const float d2 = (1.f + th) * (fmaf(-p, th, p) + 1.f);   /* 2 dsilu(2p) */
             out[k] = fmaf(g[k] * d2 * c4.x, fg, fmaf(r[k], c4.z, c4.w));
             am = amax_u(am, out[k]);
@@ -602,7 +602,7 @@ __global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t 
             for (int k = 0; k < BW; k++) {
                 const float4 c4 = cf[k];
                 const float p = fmaf(r[k], c4.x, c4.y);
-                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+                float th = tanh_silu(p);
                 const float d2 = (1.f + th) * (fmaf(-p, th, p) + 1.f);
                 o[k] = fmaf(g[k] * d2 * c4.x, fg, fmaf(r[k], c4.z, c4.w));
                 am = amax_u(am, o[k]);
