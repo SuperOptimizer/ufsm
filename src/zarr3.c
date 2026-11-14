@@ -314,7 +314,7 @@ static int mkdirs(const char *path) {
     return mkdir(tmp, 0755) && errno != EEXIST ? -1 : 0;
 }
 
-/* cache file for (shard, item): item = "idx" or the inner chunk number (a "missing" marker of older runs is ignored) */
+/* cache file for (shard, item): item = "idx" or the inner chunk number (a "missing" marker of older runs is honoured for UFSM_CACHE_MISSING_TTL_S, then unlinked: load_index) */
 static void cache_path(const z3 *z, const char *skey, const char *item, char *buf, size_t n) {
     snprintf(buf, n, "%s/%s.%s", z->cache, skey, item);
 }

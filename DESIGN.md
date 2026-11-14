@@ -6,6 +6,77 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## PHerc1667: the spiral had the wrong hand; same-sheet (fibre) pairs in count-field (2026-11-14, branch fibfit-20261114)
+
+Task: fibre-continuity constraints in the winding fit, measured against the published PHerc1667 unwrap (section "The 1667 unroll
+against the published full unwrap" below: our wrap id matched the published sheet 48 % of the time, +1 / +2 in a sector "about
+-180..-50 deg"). Measuring first showed a different cause, the spiral's direction; the fibre term is in, opt-in, with an oracle bound.
+
+**The hand.** Per published vertex, the offset our id - published sheet is not a sector of voids. It ramps with the axis angle: 0 at
++60..+180 deg (same 0.80-0.87), +1 at -60..-140, +2 at -180 (0.67), then it resets at our theta cut. That is 2 sheets of drift per
+revolution: the wraps are a spiral of the OPPOSITE hand. They follow the right sheets where the phase is confident and hop where it is
+weak, i.e. in the voids, hence the void crossings. The published surface's turn grows as atan2(y - cy, x - cx) DEcreases
+(|mean e^{2 pi i T} e^{+i theta}| = 1.00), i.e. W = U - dir theta / 2 pi needs dir -1. The 11-12 run had dir +1, and following our
+field across the seam, wrap k's end continues into wrap k-1's start (radii at z 18000). The cause: count-field takes dir from
+fit_init_prior on its middle chunk, and the ring vote demodulates by a fixed pitch, so with sheets this far from circles (one turn's
+radius 3.7..5.4 mm) no ring was coherent ("median winding per ring 0.000 over 0 rings") and dir fell back to +1, silently; the slabs
+take --dir from the ref. Every unroll on disk has dir +1 (P4, 1299, 1667); P4 is +1 by measurement (fit.h).
+
+Sheet identity of a W field against the published surface (`wpub.py`: W at every 20th published vertex, minus T - u, the published
+turn and the angle fraction from theta = pi; the share of the modal integer; 1.95 M vertices). The ref decides it: the 11-12 ref
+gives 0.461, surfcmp on the final wraps 0.482.
+
+| ref (count-field, the run's flags) | same | +1 | -1 | r 3 / 5 / 7 / 9 / 11 mm |
+|---|---|---|---|---|
+| dir +1 (11-12 run) | 0.461 | 0.314 | 0.034 | - |
+| dir -1 | 0.731 | 0.088 | 0.103 | 0.42 / 0.77 / 0.83 / 0.76 / 0.53 |
+| dir -1 + oracle short pairs (0.2-0.4 mm, 2 % of vertices, 3.7 M, --cf-fib 1, 3 IRLS) | 0.768 | 0.086 | 0.094 | 0.49 / 0.80 / 0.86 / 0.79 / 0.58 |
+| dir -1 + oracle long pairs (0.8-3 mm, 1 %, 2.7 M, --cf-fib 4, 1 IRLS) | 0.844 | 0.017 | 0.096 | 0.98 / 0.98 / 0.97 / 0.78 / 0.48 |
+
+With dir -1 the per-angle share is flat (0.65-0.86 in every 30 deg sector; with +1 it was 0.01 at -180 and 0.85 at +90).
+
+The whole chain with dir -1 (ref-dm1 -> 73 slab fits with the run's flags, on CPUs: desk `fit --cpu` + 23 slabs on the perf pod's CPU,
+~50 s / slab uncontended -> fit-join -> wraps -> wrap-snap mix -> wrap-dump every 4th vertex), surfcmp.py on every 4th published
+vertex and every 4th of ours (`--sub 4 --rev-every 4`; the full run OOMs in the shared 40 GB dev slice), both runs measured the same way:
+
+| PHerc1667 wraps_snap | same sheet | +1 | -1 | +2 | pub cov 100 / 200 um | pub d med | ours cov 50 / 100 um | ours d med |
+|---|---|---|---|---|---|---|---|---|
+| 11-12 run (dir +1) | 0.487 | 0.309 | 0.030 | 0.115 | 0.792 / 0.883 | 70 um | 0.498 / 0.726 | 51 um |
+| dir -1 | **0.762** | 0.089 | 0.089 | 0.015 | 0.794 / 0.883 | 70 um | 0.503 / 0.730 | 49 um |
+
+(The distances are larger than the pub1667 section's 19 / 17 um because only every 4th vertex of ours is the nearest-vertex set.) Same
+geometry, a different sheet assignment: 0.762 against the 0.482 there. fit-join's overlap agreement is 0.9507.
+
+**Direction code.** `fit_init_prior` now walks the network phase around circles about the axis when the ring vote is empty
+(`loop_winding`: 16 rows, a loop per 3 cells of radius, 2/3-cell steps, confident cells only; the unwrapped total of a loop is -dir,
+no pitch assumed) and prints a WARNING with that vote. `--dir-loops 1` (fit, count-field) takes it; default off, because it is noisy
+on Paris 4: per z row the +-1 loops split 4:0 .. 16:71, and the middle row votes -1 (79 + / 6 - of all signs) against P4's measured +1.
+1667 middle rows: 44:28 .. 80:8 for -1. unroll.sh passes the ref `--dir` from SPIRALDIR or `scripts/unroll/spiral_dir.tsv`
+(PHerc1667 -1, with its evidence) and copies an empty-vote warning to progress.log. test_fit_dir (CPU): a non-circular spiral (radius x
+(1 + 0.35 cos 2 theta)) gives no ring vote for either hand (+1 by default); the loops get both hands right; circular: the rings do.
+
+**Fibre (same-sheet) pairs in count-field.** The slabs snap their integers to the ref (`--ref-snap 1`), so a fibre term in the slab fit
+(`fit --w-fib`, 10-26) cannot move a turn step; the integer reference is count-field's LS solve. `count-field --fibers F.fib`
+(fiber-export frame) or `--pairs F.f32` (za ya xa zb yb xb dW) with `--cf-fib W`: rows c . U = t, c = trilinear(b) - trilinear(a)
+on the solve grid, t = dW + dir dtheta / 2 pi (U = W + dir theta / 2 pi; a fibre: dW = 0, pairs every 4th native-voxel sample at
+spans 16 / 32 / 64 / 128, `--cf-fib-spans`), on every level; Huber `--cf-fib-huber 0.25` over `--cf-fib-irls 3` reweighted level-0
+solves. The CG gathers the pairs per cell (cell -> pair-entry index), so the z-row threads stay race-free; with pairs the CG runs on
+the CPU (1667 level 0 with 3.7 M pairs: 291 s vs 54 s without). test_countfield: a band that counts 0.75 of its 3 sheets in one
+sector leaves W off by > 0.5 turn on 1.000 of the sector beyond it; arcs along the true sheets (`--cf-fib 4`) bring it to 0.000.
+
+**What fibres can do here (oracle).** Pairs sampled from the published surface itself are leaky (the score is against that surface):
+upper bounds. Short pairs, at about the length of our fibhv traces (0.6 mm median, 11-11), add +0.04. Long pairs, at the length
+of the AFV tracings (2 mm median), fix the inner turns (r 3-7 mm 0.42-0.83 -> 0.97-0.98) but not the outer ones. r >= 9 mm stays at
+-1 (0.16-0.29). That is a radial miscount around the whole circumference, one sheet missing beyond ~8 mm. It has no curl, so no
+along-sheet constraint can see it; it needs a count fix (CT peaks, wrap-check). 1667 has no AFV and no published fibre
+prediction (open data: lasagna only). wgraph's fibhv-d predicts for one 1667 slab (pod) failed at the time of writing. So no real-fibre
+run yet: the term waits for mm-long fibres (AFV-like tracings or a longer-tracing fibre model).
+
+Files: /vesuvius/ufsm/fibfit/1667 (ref-dm1 = the dir -1 ref, pool.bin its pass-1 sums, ref-orc02 / ref-orclong the oracles,
+dm1/ the dir -1 chain: slabs, joined, wraps, wraps_snap; cmps-* the surfcmp outputs). Scripts: scripts/fibfit/ (offang.py, wpub.py,
+oracle.py, loops2.py; surfcmp.py is on pub1667-20261114, run here with a `--sub 4` vertex stride) and /vesuvius/ufsm/fibfit/deskpipe.sh.
+Next: re-run the 1667 unroll with SPIRALDIR -1 (or the tsv) on master; the outer-turn miscount; mm-long fibres for 1667.
+
 ## I/O error paths: atomic zarr writes, HTTP retry by time, chunk CRC, checked writers (2026-11-14, branch iofix-20261114)
 
 Fixes for the mini audit items store 1-10, zarr 1-8, errpaths 1-8 and volcomp 1-7 (/vesuvius/ufsm/audit-20261114/mini/). Source only,
