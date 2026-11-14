@@ -21,7 +21,8 @@
         arc-length parametrisation shared by every row, so the strip stays one straight band of the scroll's height;
      2. chunks of 2 S columns centred every S columns (full height): each SLIM-flattened (src/flatten.h, every connected component,
         multilevel, flip-free) and every component rigidly aligned (rotation + translation, no scale) onto T;
-     3. partition of unity: each lattice vertex's uv = sum over chunks of hat(c) x that chunk's uv (hats of half-width S, summing to 1):
+     3. partition of unity: each lattice vertex's uv = sum over chunks of w(c) x that chunk's uv (cos^2 windows of half-width S, summing to 1,
+        zero slope at chunk centres and edges; --blend hat: the linear hats before 2026-11-14, whose slope jumps there):
         neighbouring chunks agree on their overlap, the residual bend of the true development is spread smoothly instead of torn. Holes
         and disconnected pieces cannot tear the layout: every piece is placed by T.
      4. distortion of T and of the result on the lattice mesh (area-weighted aniso p50 / p95, flips) overall and per stride segment;
@@ -624,6 +625,7 @@ static void k_rast(void *ctx, long lo, long hi) {
 typedef struct {
     sflat *F; int nchunk, S, nth, ngpu, iters, cg, verbose; double tol; FILE *cf;
     pthread_mutex_t mu; pthread_cond_t cv; int j0, commit; _Atomic int fail; int j1; _Atomic int next;
+    int hat;   /* --blend hat: the old partition of unity (linear hats); default cos^2 */
 } sf_ctx;
 typedef struct { sf_ctx *X; int w; } sf_warg;
 static void *sf_worker(void *arg) {
@@ -651,7 +653,11 @@ static void *sf_worker(void *arg) {
         if (have) {
             for (int v = 0; v < m.nv; v++) {
                 const int g = m.gi[v], c = g % nc, r = g / nc, gc = a + c; if (gc % F->D || r % F->D) continue;
-                const double wgt = fmax(0, 1 - fabs((double)gc - C) / S); if (!(wgt > 0)) continue;
+                /* the chunk weight: cos^2 (default) or the hat; both sum to 1 over neighbouring chunks, but the hat's slope jumps at every chunk
+                   centre and edge (multiples of S), so the blended map had a kink there wherever two chunks' layouts disagree: 1667 folded 2.6x
+                   more within 0.5 cm of those columns (urender audit 11-14 #7); cos^2 has zero slope at both */
+                const double x = fabs((double)gc - C) / S; if (!(x < 1)) continue;
+                const double wgt = X->hat ? 1 - x : cos(0.5 * M_PI * x) * cos(0.5 * M_PI * x); if (!(wgt > 0)) continue;
                 const size_t li = (size_t)(r / F->D) * F->lw + gc / F->D;
                 F->du[li] += (float)(wgt * (m.uv[2 * v] - T_u(F, gc))); F->dv[li] += (float)(wgt * (m.uv[2 * v + 1] - T_v(F, r))); F->wt[li] += (float)wgt;
             }
@@ -720,7 +726,7 @@ static void *ss_worker(void *arg) {
 }
 
 int cmd_strip_flatten(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: ufsm strip-flatten <strip-dir> [--out DIR] [--decim D] [--stride S] [--iters 30] [--cg 200] [--threads 16] [--ostep S] [--stripe-px 60000] [--px-scale 1] [--flip-rows 1] [--max-edge 3] [--reuse 1] [--gpu 1] [--jobs J] [--stripe-jobs 3] [--chunks J0,J1]\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: ufsm strip-flatten <strip-dir> [--out DIR] [--decim D] [--stride S] [--iters 30] [--cg 200] [--threads 16] [--ostep S] [--stripe-px 60000] [--px-scale 1] [--flip-rows 1] [--max-edge 3] [--blend cos2|hat] [--reuse 1] [--gpu 1] [--jobs J] [--stripe-jobs 3] [--chunks J0,J1]\n"); return 2; }
     const char *sd = argv[2]; char od[1400]; snprintf(od, sizeof od, "%s", sopt(argc, argv, "--out", "")); if (!*od) snprintf(od, sizeof od, "%s/flat", sd);
     sflat F; memset(&F, 0, sizeof F);
     if (st_open(sd, &F.S)) return 1;
@@ -780,6 +786,7 @@ int cmd_strip_flatten(int argc, char **argv) {
         sf_ctx X = {&F, nchunk, S, nth / jobs > 0 ? nth / jobs : 1, ngpu, atoi(sopt(argc, argv, "--iters", "30")), atoi(sopt(argc, argv, "--cg", "200")),
                     atoi(sopt(argc, argv, "--verbose", "0")), atof(sopt(argc, argv, "--tol", "1e-5")), cf, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, j0, j0, 0, j1};
         atomic_store(&X.next, j0);
+        { const char *bl = sopt(argc, argv, "--blend", "cos2"); X.hat = !strcmp(bl, "hat"); if (!X.hat && strcmp(bl, "cos2")) { fprintf(stderr, "strip-flatten: --blend cos2 | hat\n"); return 2; } }
         fprintf(stderr, "strip-flatten: chunks %d..%d on %d jobs x %d threads, SLIM on %s\n", j0, j1, jobs, X.nth, ngpu ? "the GPU" : "the CPU");
         pthread_t th[64]; sf_warg wa[64];
         for (int k = 0; k < jobs; k++) { wa[k] = (sf_warg){&X, k}; pthread_create(&th[k], nullptr, sf_worker, &wa[k]); }
