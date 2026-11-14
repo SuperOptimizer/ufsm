@@ -97,7 +97,8 @@ void lp_set_gyrec_off(int off);     /* test hook: 1 no gy records at all (the pl
 int lp_get_gyrec_off(void);
 int lp_gyrec_narrow(void);
 int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp);   /* stride 2; gp: input gn+silu; 0, or 3 when the fp4 kernel ran */
-void lp_set_head_btc(int on);   /* the wide head backward-data (lp_conv1_to_mx_r, > 16 fp16 inputs) on the tensor cores: 1 on, 0 the FFMA kernel, -1 env UFSM_HEAD_BTC (default off: untested) */
+void lp_set_head_btc(int on);   /* the wide head backward-data (lp_conv1_to_mx_r, > 16 fp16 inputs) on the tensor cores: 1 on, 0 the FFMA kernel, -1 env UFSM_HEAD_BTC (default on) */
+int lp_head_btc_on(void);       /* the setting in force */
 void lp_set_head_tc(int on);   /* the wide (> 16 outputs) MX-fp4 head forward on the tensor cores: 1 on, 0 the FFMA passes, -1 env UFSM_HEAD_TC (default on) */
 void lp_set_s2_f4g(int on);   /* the coarse down convs' fp4 forward (conv_fwd_s2_f4_k GEN): 1 on, 0 off, -1 env UFSM_S2_F4G (default off) */
 int lp_bwd_w_s2_f8(const void *x, int xbf, shape5 xs, const void *gy, int gybf, shape5 ys, float *gw, float *gb, gnp_t gp);   /* stride 2, gw / gb accumulated */

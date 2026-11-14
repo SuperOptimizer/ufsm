@@ -174,6 +174,27 @@ Use: MEMMODE=fast only where the window leaves ~1.3 GB spare (P 512: -1.4 %); at
 gains more than 2 % on this net: the remaining host-side cost is PCIe contention in the trainer (perf2's ~180 ms exposed), not the
 activation offloads or recompute.
 tests/bench_s2: one desk card's share of the P 1024 split trunk on one GPU (synthetic input; the unet env switches, BS2_CAP_GB ballast).
+## The head's backward-data on the tensor cores by default (2026-11-14, branch headtc-20261114)
+
+conv1_to_mx_tc_k (perf2 11-13: the latent cell head's 160 fp16 logit gradients -> 256 MX-fp4 channels with m16n8k16 MMAs) was off by
+default since test_lat_head failed with it on. On the pod (RTX PRO 4000), old kernel vs perf2's row-scale patch (c1b_wh_k: each
+weight row times 2^e so that its largest |w| sits in [2^14, 2^15) before the fp16 conversion, 2^-e back on the fp32 sums: exact):
+
+| check (UFSM_HEAD_BTC=1) | old | row scales |
+|---|---|---|
+| test_head_tc bwd-data, |w| ~0.1 (6 shapes): rel L2 vs FFMA | 7.5e-3 .. 8.1e-3 | the same |
+| test_head_tc bwd-data, |w| ~3e-7 (new case: fp16 subnormal weights) | 0.257 FAIL | 8.1e-3 |
+| test_lat_head "a second equal net" | passes (4e-9) | passes |
+| test_lat_head 144 head vs the 8-output net, trunk grads | rel 0.28-0.32 FAIL | rel 0.28-0.32 FAIL |
+
+The last row is not a kernel fault: the 8-output net takes the FFMA kernel (K <= 16), so its gx differs from the tensor-core one by
+the ~8e-3 of fp16 weights and another sum order, and each MX-fp4 SR flip behind it spreads through the small test trunk. Measured
+against the SR noise floor of the same net (the FFMA kernel, the backward's SR seed moved): tensor cores vs FFMA rel 0.33-0.39, the
+other seed 0.65-0.73. The check now runs its exact comparison with the FFMA kernel (1.4e-9) and requires the tensor-core gradient
+within 1.5x that floor + 0.15 (TLH_FP8, MX-fp8 gradients without SR: floor ~1e-7, tensor cores vs FFMA rel 0.063-0.074,
+the fp16 weights' rounding through e4m3 steps). Default on (UFSM_HEAD_BTC=0: the FFMA kernel); test_head_tc keeps the tiny-weight case. Time (nsys, scratch2 net + heads, P 768 one card,
+the wind fixture): conv1_to_mx_t_k 111.1 ms a step -> conv1_to_mx_tc_k 20.4 + c1b_wh_k 0.1 ms, -91 ms (~2.5 % of the kernel time).
+
 ## Two fast-tier failures on master: test_lldec pool 3, test_wbench_stats without bc (2026-11-14, branch fixtests-20261114)
 
 - test_lldec: the pooled codes views 8x deep (pool 3) returned rc -2 from phase_onfly_decode_gpu since 2dd6744 (band gpu, 11-13),
