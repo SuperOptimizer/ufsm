@@ -6,6 +6,37 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Packed-sheet label targets: unit-step gradient, sheet-voxel weight, physical density code (2026-11-14, branch phaselab-20261114)
+
+Audit (/vesuvius/ufsm/audit-20261114/targeted/phaselab.md) of the on-the-fly winding labels. The normal / density / packed-weight targets
+are derived on the GPU from the phase codes (`nn_elem.cu` unwrap_tg_k), not from any spacing estimate, so phase defects feed them.
+- **Stencil aliasing (fixed).** The gradient was one wrapped difference of the two end voxels over +-s: valid only while the phase moves
+  < 0.5 turn over 2 s voxels (sp >= 4 s; live s = 1: sp >= 4). At the 19.2 um rung every sheet under 77 um is below that, and
+  `--packed-weight 8` sits at <= 60 um (3 voxels): the density target fell as packing tightened (rho x sp = 1.0 / 0.5 / 0.2 / 0 at sp 4 / 3 /
+  2.5 / 2), tilted sheets got wrong normals, and the weight was computed from the aliased rho. `src/phase_grad.h` `pg_grad` sums the 2 s
+  wrapped UNIT steps (alias-free down to sp 2; a step over 120 codes is unresolved: masked). Bit-identical to the old stencil where that
+  was valid. Used by `phase_grad` (targets, packed mask). tests/test_phaselab.c, simulated flat sheets (stamped like meshcodes.c, pair
+  rule on the CPU), median rho x sp and share of gradients off by > 25 %: axis sheets sp 3: 0.50 / 1.00 -> 1.00 / 0.00; sp 2.5: 0.42 -> 0.83
+  (half masked); sheet (0.1, 0.2, 1) sp 3: 0.51 / 0.83 -> 1.01 / 0.00 with |cos| to the true normal 0.92 -> 0.98; (0, 1, 1) sp 2.5: share
+  wrong 0.99 -> 0.45. sp >= 6 unchanged (asserted). Below sp 3 the labels stay poor: the phase noise (below) flips unit steps.
+- **Sheet-voxel phase (`--sheet-mask LO,HI`, new, off by default; on in scripts/v2/train-common.sh as 3,8).** The pair rule writes phase 0 on
+  every stamped voxel, which lies up to 0.87 voxel off its mesh: phase error rms 0.13-0.19 turn at sp 2-3, 0.10 at 4, 0.06 at 6, 0.04 at 10
+  (oblique), on 33-65 % of the voxels at sp 2-3. A true sub-voxel offset would need the stamp to carry it (a byte per voxel has no room), so the
+  phase loss weight of phase-0 voxels is scaled instead: 0 at a local spacing (`pg_rate`: the largest |step| to a non-sheet known neighbour; none
+  known = dense) <= LO voxels, 1 at >= HI. Test: mean weight 0.00 at sp <= 3, 0.2 at 4, 0.2-0.6 at 6, 0.75-0.94 at 10; the weighted error
+  of the labelled voxels stays at the plain value where kept.
+- **Density** `--density-packed 0` now in train-common.sh (the packed weight on the density channel pulled ambiguous gap voxels toward the
+  packed value: a 50 / 50 mix of (w 8, d .6) and (w 1, d .3) trains .567 instead of .45, x +60 %). `--density-um U` (new, off): physical code x =
+  density_scale x rho x U / (window um); the header gets `density_um` only when set and `predict --fit-fields` divides it out, so the fit sets
+  stay in turns per voxel of the predicted level. Not enabled: a net trained on the per-voxel code reads wrong with it.
+- **Not done / negative.** (#3) Tightening the pair rule's accept test (cos <= -0.5 -> -0.8 / -0.9) on clean flat sheets leaves the gap-phase
+  rms unchanged (0.04 at sp 4) and cuts the known share from 0.90 to 0.64 / 0.60 ((0, 1, 1)) and the full-stencil share to 0: the rejected voxels
+  are raster staircases, not lateral features, so the constant stays. A real fix for the wedge / touching-sheet errors (0.17-0.24 turn) needs
+  conflict dilation, which also changes the byte-identical GPU twin (nn_band.cu, test_band_pair): not attempted without a GPU. (#4) orientation
+  bias of the 7-voxel stencil is a property of the pair rule's holes; unchanged. Density centre-to-centre bias (+3..6 %) unchanged.
+- No stored label byte changes (phase codes are produced by the unchanged pair rule; targets are derived per batch), so no cache key bump.
+
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the
