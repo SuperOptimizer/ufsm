@@ -28,7 +28,7 @@ int dcache_set_batch(z3 *z, int edge);
 int dcache_key_dir(const char *dir, const char *key, char *out, size_t nout);
 /* the default cache root: $UFSM_DERIVED_CACHE ("off" / "0" = none), else $HOME/.cache/ufsm/derived */
 const char *dcache_default_dir(void);
-typedef struct { uint64_t reads, cells_mem, cells_disk, cells_computed, cells_fill, disk_bytes_written; double s_compute, s_disk; } dcache_stats;
+typedef struct { uint64_t reads, cells_mem, cells_disk, cells_computed, cells_fill, disk_bytes_written; double s_compute, s_disk; uint64_t cells_evicted, cells_recomputed, bytes_evicted; } dcache_stats;
 void dcache_get_stats(dcache_stats *st);   /* process-wide sums over every cached array */
 /* one eviction pass over a cache root (the background thread's; tests): LRU key dirs deleted while the root is over UFSM_DCACHE_GB or its
    filesystem under UFSM_DCACHE_FREE_GB, keys used within UFSM_DCACHE_PROTECT_MIN kept. 1: another process holds the root's lock */

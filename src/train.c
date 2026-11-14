@@ -5196,7 +5196,9 @@ int cmd_train(int argc, char **argv) {
             {   /* the derived-array caches (dcache.h: the onfly phase of meshes and, since 2026-11-13, of stored codes; the onfly ink) since the last line */
                 static dcache_stats d0; dcache_stats d1; dcache_get_stats(&d1);
                 const unsigned long long cm = d1.cells_mem - d0.cells_mem, cd = d1.cells_disk - d0.cells_disk, cc = d1.cells_computed - d0.cells_computed;
-                if (cm + cd + cc) fprintf(stderr, "  derived cache: %llu cells from memory, %llu from disk, %llu computed (%.1f s)\n", cm, cd, cc, d1.s_compute - d0.s_compute);
+                const unsigned long long ce = d1.cells_evicted - d0.cells_evicted, cr = d1.cells_recomputed - d0.cells_recomputed;
+                if (cm + cd + cc) fprintf(stderr, "  derived cache: %llu cells from memory, %llu from disk, %llu computed (%.1f s)%s", cm, cd, cc, d1.s_compute - d0.s_compute, ce + cr || d1.cells_evicted ? "" : "\n");
+                if ((cm + cd + cc) && (ce + cr || d1.cells_evicted)) fprintf(stderr, ", %llu of them recomputes of evicted cells; %llu cells (%.1f GB) evicted since the last line\n", cr, ce, (d1.bytes_evicted - d0.bytes_evicted) / 1e9);
                 d0 = d1; }
             { static int memlog = -1; if (memlog < 0) memlog = ufsm_env_on("UFSM_SYNC_CHECK");   /* device memory free per GPU at each log line (a leak) */
               if (memlog) { fprintf(stderr, "  device memory free:"); for (int g = 0; g < ng; g++) { nn_init(G[g].dev); fprintf(stderr, " GPU %d %.1f MB", G[g].dev, nn_mem_free() / 1e6); } fprintf(stderr, "\n"); nn_init(G[0].dev); } }

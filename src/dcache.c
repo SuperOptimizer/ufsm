@@ -27,11 +27,12 @@ typedef struct dc {
     z3 *in; int C, fill; int64_t shape[3], gc[3]; char *dir;   /* dir: ROOT/<hash> or nullptr (memory only) */
     dcache_pool *P; dent **hash; size_t nhash; _Atomic int disk_warned; _Atomic int64_t touched;   /* touched: the key dir's last-use stamp (s) */
 } dc;
-static struct { _Atomic uint64_t reads, mem, disk, comp, fill, wbytes, ns_comp, ns_disk; } g_dc;
+static struct { _Atomic uint64_t reads, mem, disk, comp, fill, wbytes, ns_comp, ns_disk, evicted, recomp, evbytes; } g_dc;
 static double dnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 void dcache_get_stats(dcache_stats *st) {
     st->reads = g_dc.reads; st->cells_mem = g_dc.mem; st->cells_disk = g_dc.disk; st->cells_computed = g_dc.comp; st->cells_fill = g_dc.fill;
     st->disk_bytes_written = g_dc.wbytes; st->s_compute = 1e-9 * (double)g_dc.ns_comp; st->s_disk = 1e-9 * (double)g_dc.ns_disk;
+    st->cells_evicted = g_dc.evicted; st->cells_recomputed = g_dc.recomp; st->bytes_evicted = g_dc.evbytes;
 }
 const char *dcache_default_dir(void) {
     static char b[1024]; const char *e = getenv("UFSM_DERIVED_CACHE");
@@ -110,9 +111,11 @@ static dent *cell_wait(dc *c, dent *e) {
 /* ---- the disk cap (2026-11-14): ~/.cache/ufsm/derived grew to 336 GB and filled the desk's root filesystem under try6 ----
    Each key dir's inputs.txt mtime is its last use (touched at open and every 5 min of reads). A background thread per process (one at a
    time per root: flock on ROOT/.evict.lock) checks every UFSM_DCACHE_CHECK_S (600) s and deletes whole key dirs, least recently used
-   first, while the root holds more than UFSM_DCACHE_GB (150; 0 no size cap) or its filesystem has less than UFSM_DCACHE_FREE_GB (50; 0
-   off) free; keys used in the last UFSM_DCACHE_PROTECT_MIN (60) minutes, or open in this process, are kept. Deleting is safe (missing
-   cells are recomputed, a writer recreates its dirs). Below half the free floor no cell is written (memory only) until space returns. */
+   first, while the root holds more than UFSM_DCACHE_GB (200; 0 no size cap) or its filesystem has less than UFSM_DCACHE_FREE_GB (50; 0
+   off) free; keys used in the last UFSM_DCACHE_PROTECT_MIN (60) minutes, or open in this process, are kept. If the kept (live) keys
+   are still over, single cells go, least recently used first (a cell file's mtime: its write, or its last disk read), down to
+   UFSM_DCACHE_CELL_FILL (0.9) x the cap. Deleting is safe (missing cells are recomputed, a writer recreates its dirs; recomputes of
+   cells this process evicted are counted). Below half the free floor no cell is written (memory only) until space returns. */
 static double env_num(const char *k, double d) { const char *e = getenv(k); return e && *e ? atof(e) : d; }
 static int64_t wsec(void) { return (int64_t)time(nullptr); }
 static void key_touch(dc *c) {
@@ -134,13 +137,35 @@ static _Thread_local uint64_t t_du; static _Thread_local int64_t t_mt;   /* (the
 static int du_cb(const char *p, const struct stat *st, int fl, struct FTW *f) { (void)p; (void)f; t_du += (uint64_t)st->st_blocks * 512; if (fl == FTW_D && st->st_mtime > t_mt) t_mt = st->st_mtime; return 0; }
 static int rm_cb(const char *p, const struct stat *st, int fl, struct FTW *f) { (void)st; (void)f; return fl == FTW_DP ? rmdir(p) : unlink(p); }
 typedef struct { char name[64]; int64_t used; uint64_t bytes; } kent;
+/* the cells this process evicted (64-bit hashes of their paths, open addressing): a later compute of one counts as a recompute */
+static struct { pthread_mutex_t mu; uint64_t *h; size_t cap, n; } g_ev = {.mu = PTHREAD_MUTEX_INITIALIZER};
+static uint64_t phash(const char *p) { uint64_t h = 1469598103934665603ull; for (; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ull; return h | 1; }
+static void ev_add(uint64_t h) {
+    if (g_ev.n * 2 >= g_ev.cap) { const size_t nc = g_ev.cap ? 2 * g_ev.cap : 1 << 16; uint64_t *nh = calloc(nc, 8); if (!nh) return;
+        for (size_t i = 0; i < g_ev.cap; i++) if (g_ev.h[i]) { size_t j = g_ev.h[i] % nc; while (nh[j]) j = (j + 1) % nc; nh[j] = g_ev.h[i]; }
+        free(g_ev.h); g_ev.h = nh; g_ev.cap = nc; }
+    size_t j = h % g_ev.cap; while (g_ev.h[j] && g_ev.h[j] != h) j = (j + 1) % g_ev.cap; if (!g_ev.h[j]) { g_ev.h[j] = h; g_ev.n++; }
+}
+static int ev_has(uint64_t h) { if (!g_ev.cap) return 0; size_t j = h % g_ev.cap; while (g_ev.h[j]) { if (g_ev.h[j] == h) return 1; j = (j + 1) % g_ev.cap; } return 0; }
+/* the per-cell pass (2026-11-14: try6's live keys alone held 334 GB): every cell file of every key with its mtime (its last disk read
+   or write) and size; the oldest unlinked until the root is under UFSM_DCACHE_CELL_FILL (0.9) x the cap. Open keys too: an evicted
+   cell is recomputed on its next miss (counted: dcache_stats cells_recomputed) */
+typedef struct { int64_t t; uint32_t bytes; uint16_t key; char rel[26]; } centry;
+static _Thread_local centry *t_ce; static _Thread_local size_t t_nce, t_cce; static _Thread_local int t_key; static _Thread_local size_t t_kl;
+static int ce_cb(const char *p, const struct stat *st, int fl, struct FTW *f) {
+    if (fl != FTW_F || f->level != 2 || strlen(p) - t_kl >= sizeof t_ce->rel || !strchr(p + t_kl, '.') || strstr(p + t_kl, ".tmp")) return 0;
+    if (t_nce == t_cce) { const size_t nc = t_cce ? 2 * t_cce : 1 << 16; centry *n = realloc(t_ce, nc * sizeof *n); if (!n) return 1; t_ce = n; t_cce = nc; }
+    centry *e = &t_ce[t_nce++]; e->t = st->st_mtime; e->bytes = (uint32_t)((uint64_t)st->st_blocks * 512 > 0xffffffffu ? 0xffffffffu : (uint64_t)st->st_blocks * 512); e->key = (uint16_t)t_key;
+    snprintf(e->rel, sizeof e->rel, "%s", p + t_kl); return 0;
+}
+static int ce_cmp(const void *a, const void *b) { const int64_t x = ((const centry *)a)->t, y = ((const centry *)b)->t; return x < y ? -1 : x > y; }
 static int kent_cmp(const void *a, const void *b) { const int64_t x = ((const kent *)a)->used, y = ((const kent *)b)->used; return x < y ? -1 : x > y; }
 /* one pass: 0 nothing to do / done, 1 another process holds the lock */
 int dcache_evict_pass(const char *root) {
     char lp[1100]; snprintf(lp, sizeof lp, "%s/.evict.lock", root);
     const int fd = open(lp, O_RDWR | O_CREAT | O_CLOEXEC, 0664); if (fd < 0) return 0;
     if (flock(fd, LOCK_EX | LOCK_NB)) { close(fd); return 1; }
-    const double cap = env_num("UFSM_DCACHE_GB", 150) * 1e9, floor_b = env_num("UFSM_DCACHE_FREE_GB", 50) * 1e9;
+    const double cap = env_num("UFSM_DCACHE_GB", 200) * 1e9, floor_b = env_num("UFSM_DCACHE_FREE_GB", 50) * 1e9;
     const int64_t prot = (int64_t)(env_num("UFSM_DCACHE_PROTECT_MIN", 60) * 60), now = wsec();
     DIR *d = opendir(root); kent *k = nullptr; size_t nk = 0, ck = 0; uint64_t tot = 0;
     for (struct dirent *de; d && (de = readdir(d));) {
@@ -168,6 +193,25 @@ int dcache_evict_pass(const char *root) {
                 (tot + evb) / 1e9, nk, cap / 1e9, (fr - evb) / 1e9, floor_b / 1e9, ev, evb / 1e9,
                 (cap > 0 && tot > cap) || (floor_b > 0 && fr < floor_b) ? "; still over: the rest are open here or used within the protect window" : "");
     }
+    if (((cap > 0 && tot > cap) || (floor_b > 0 && fr < floor_b)) && nk && nk < 65536) {   /* the live keys themselves over the cap / under the floor: the least recently used cells */
+        t_nce = 0;
+        for (size_t i = 0; i < nk; i++) { char kp[1200]; snprintf(kp, sizeof kp, "%s/%s/", root, k[i].name); t_key = (int)i; t_kl = strlen(kp); nftw(kp, ce_cb, 16, FTW_PHYS); }
+        qsort(t_ce, t_nce, sizeof *t_ce, ce_cmp);
+        const double fill = env_num("UFSM_DCACHE_CELL_FILL", 0.9), target = cap * (fill > 0.1 && fill <= 1 ? fill : 0.9);
+        size_t ne = 0; uint64_t eb = 0; const int64_t newest_ev = t_nce ? t_ce[0].t : 0; int64_t last_t = 0;
+        pthread_mutex_lock(&g_ev.mu);
+        for (size_t i = 0; i < t_nce && ((cap > 0 && (double)tot > target) || (floor_b > 0 && fr < floor_b * 1.1)); i++) {
+            char cp[1300]; snprintf(cp, sizeof cp, "%s/%s/%s", root, k[t_ce[i].key].name, t_ce[i].rel);
+            if (unlink(cp)) continue;
+            ev_add(phash(cp)); tot -= t_ce[i].bytes; fr += t_ce[i].bytes; eb += t_ce[i].bytes; ne++; last_t = t_ce[i].t;
+        }
+        pthread_mutex_unlock(&g_ev.mu);
+        atomic_fetch_add(&g_dc.evicted, ne); atomic_fetch_add(&g_dc.evbytes, eb);
+        fprintf(stderr, "dcache: %s over the cap in live keys: evicted %zu least recently used cells (%.1f GB, last used %.1f to %.1f h ago) of %zu, now %.1f GB; "
+                "this process so far: %llu cells evicted, %llu of them recomputed\n", root, ne, eb / 1e9, ne ? (now - newest_ev) / 3600.0 : 0.0, ne ? (now - last_t) / 3600.0 : 0.0,
+                t_nce, tot / 1e9, (unsigned long long)atomic_load(&g_dc.evicted), (unsigned long long)atomic_load(&g_dc.recomp));
+        free(t_ce); t_ce = nullptr; t_nce = t_cce = 0;
+    }
     free(k); flock(fd, LOCK_UN); close(fd); return 0;
 }
 static void *evict_thread(void *a) {
@@ -178,7 +222,7 @@ static void *evict_thread(void *a) {
 static void cap_open(dc *c, const char *root) {   /* (an array with a disk dir opened: register it, start the evictor once) */
     pthread_mutex_lock(&g_cap.mu);
     if (g_cap.nopen < 512) g_cap.open[g_cap.nopen++] = strdup(c->dir);
-    if (!g_cap.started && (env_num("UFSM_DCACHE_GB", 150) > 0 || env_num("UFSM_DCACHE_FREE_GB", 50) > 0)) {
+    if (!g_cap.started && (env_num("UFSM_DCACHE_GB", 200) > 0 || env_num("UFSM_DCACHE_FREE_GB", 50) > 0)) {
         snprintf(g_cap.root, sizeof g_cap.root, "%s", root); pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
         if (!pthread_create(&th, &at, evict_thread, nullptr)) g_cap.started = 1; pthread_attr_destroy(&at); }
     pthread_mutex_unlock(&g_cap.mu);
@@ -197,6 +241,7 @@ static int cell_disk(dc *c, dent *e) {   /* a claimed cell from disk: 1 found (d
     char p[1300]; int64_t cz; cell_path_k(c, e->key, p, sizeof p, &cz);
     const double t = dnow(); uint8_t *data = nullptr, cval = 0;
     if (disk_get(c, p, &data, &cval)) return 0;
+    utimensat(AT_FDCWD, p, nullptr, 0);   /* (the cell's last use: the per-cell LRU's order) */
     atomic_fetch_add(&g_dc.disk, 1); atomic_fetch_add(&g_dc.ns_disk, (uint64_t)((dnow() - t) * 1e9));
     e->data = data; e->cval = cval; return 1;
 }
@@ -208,7 +253,8 @@ static void cell_computed(dc *c, dent *e, uint8_t *data) {
     atomic_fetch_add(&g_dc.comp, 1);
     char p[1300]; int64_t cz;
     if (c->dir && !disk_room(c->dir)) atomic_fetch_add(&g_cap.skipped, 1);
-    else if (c->dir) { cell_path_k(c, e->key, p, sizeof p, &cz);   /* (a failed write is retried on the next cell: the state recovers once space returns) */
+    else if (c->dir) { cell_path_k(c, e->key, p, sizeof p, &cz);
+        if (atomic_load(&g_dc.evicted)) { pthread_mutex_lock(&g_ev.mu); if (ev_has(phash(p))) atomic_fetch_add(&g_dc.recomp, 1); pthread_mutex_unlock(&g_ev.mu); }   /* (a failed write is retried on the next cell: the state recovers once space returns) */
         if (disk_put(c, cz, p, data, cval) && !atomic_exchange(&c->disk_warned, 1)) fprintf(stderr, "dcache: cannot write %s (%s): this cell in memory only (later cells retried; warned once)\n", p, strerror(errno)); }
     e->data = data; e->cval = cval;
 }
