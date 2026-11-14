@@ -488,6 +488,11 @@ void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
    parameter gradients from fp16 gradient planes of that layout into gp. 1: a shape the kernels do not take (odd sizes, C or nout > 16) */
 int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns);
 int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, const void *g, size_t ns, float *gp);
+/* the head slab's forward chain in one pass: the logit planes chs[o] written (not added to) as nn_lat_up_slab_c (from the fp16 cell logits
+   lc [*][qd][D/4][H/4][W/4], planes from q0) + nn_lat_shuffle_c (the side pair: channels side, side + 1 when side >= 0; base) + nn_fstem_fwd
+   would leave them, byte for byte; C 0: no stem term (an --fstem-drop window). 1: a shape it does not take (multiples of 4) */
+int nn_fstem_up_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns,
+                    const void *lc, int q0, int qd, int side, int base);
 /* a latent-grid net's head straight from the cell logits lg [cout][d][h][w] into a device shard (src/nn_lathead.cu, predict --heads): the
    window interior ([hz, 4d - hz) x [halo, 4w - halo)^2) inside the shard [0, e) at offset o; channel c0 (a probability) or the recto / verso
    pair c0, c1 (nn_rv_fuse); sb0 / sb1 the sub-cell outputs' base of each (lat_guide 64: 16 + 64 j for the phase pair, else -1), s0 / s1 the
