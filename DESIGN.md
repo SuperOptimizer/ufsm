@@ -6,6 +6,14 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Scroll PE / attention audit fixes (2026-11-14, branch attnfix-20261114)
+From /vesuvius/ufsm/audit-20261114/targeted/attn.md. On by default: `predict` refuses a scroll-axis checkpoint without `--axis` (`UFSM_PRED_NO_AXIS_OK=1` overrides, with a warning)
+and refuses `--cond-sweep` with one (it never set the axis); an axis record whose plane count does not fit the bottleneck grid aborts instead of being dropped; training warns
+loudly (first and every 1000th time) when samples of an attn_pe 3 net carry no axis (they get grid-index positions). Flags, default off (change the positions / logits, so a net
+must be trained or evaluated with them): `UFSM_SCROLL_PE_V2=1` (one reference angle and radius per sample for all planes: no inside/outside angle-origin jump, no per-plane rc x theta
+offset; the seam for an axis inside the window remains, a scalar angle cannot avoid it), `--attn-lscale N0` / `UFSM_ATTN_LSCALE=N0` (logits x max(1, ln S / ln N0), fp16 core only;
+N0 = 216 at P 768). Measure with scripts/eval/attn_window_compare.sh (window 768 vs 1152 vs 1152 + lscale, GPU window). Not run: no GPU; only the build was checked.
+
 ## Sampler balance: snap jitter, edge boost, zboost, rejection-aware draws, loss cap, packed focus (2026-11-14, branch sampbias-20261114)
 
 From the targeted sampler audit (/vesuvius/ufsm/audit-20261114/targeted/sampler.md; chunk maps read from the shard indices). All options default off, one flag each:

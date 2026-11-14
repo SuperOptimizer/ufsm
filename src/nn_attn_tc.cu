@@ -357,11 +357,18 @@ extern "C" void at_fa_pack_bf(const void *qkv, const float *qg, const float *kg,
 }
 static thread_local float *g_lmax;   /* at_set_lmax: device [H] running max logit per head (nullptr: off); per thread: each replica sets its own before its launch (process-wide, P 512 data parallel launched GPU 0 with GPU 1's pointer, 2026-11-14) */
 extern "C" void at_set_lmax(float *lmax) { g_lmax = lmax; }
+/* at_set_lscale / UFSM_ATTN_LSCALE=n0 (audit attn 11-14 #2): the logits times max(1, ln S / ln n0) for sequences of S > n0 keys (S = registers + grid tokens), n0 = the
+   token count the net was trained on (216 at P 768): the attention keeps its sharpness at larger predict windows (729 tokens at 1152). 0: off (the default). Forward and
+   backward use the same factor; core 1 (this file) only, at_block_fwd / _bwd refuse the others while it is on. */
+static float g_ls_n0 = -1.f;
+extern "C" void at_set_lscale(float n0) { g_ls_n0 = n0 > 0.f ? n0 : 0.f; }
+extern "C" float at_get_lscale(void) { if (g_ls_n0 < 0.f) { const char *e = getenv("UFSM_ATTN_LSCALE"); g_ls_n0 = e && atof(e) > 1.0 ? (float)atof(e) : 0.f; } return g_ls_n0; }
+static float ls_factor(int S) { const float n0 = at_get_lscale(); return n0 > 1.f && S > n0 ? logf((float)S) / logf(n0) : 1.f; }
 template <typename TO> static void fa_fwd(const void *qkvh, TO *o, float *lse, const at_geom *g, int H, int C) {
     const long long Tp = (long long)g->nseq * g->S + FT;
     const __half *Qh = (const __half *)qkvh, *Kh = Qh + (size_t)H * Tp * HD, *Vh = Kh + (size_t)H * Tp * HD;
     dim3 gr(nbk(g->S, FT), H, g->nseq);
-    k_fa_fwd<TO><<<gr, 128>>>(Qh, Kh, Vh, o, lse, g->S, H, C, Tp, 1.4426950408889634f / sqrtf((float)HD), g->lens, g_lmax);
+    k_fa_fwd<TO><<<gr, 128>>>(Qh, Kh, Vh, o, lse, g->S, H, C, Tp, ls_factor(g->S) * 1.4426950408889634f / sqrtf((float)HD), g->lens, g_lmax);
 }
 extern "C" void at_fa_fwd(const void *qkvh, float *o, float *lse, const at_geom *g, int H, int C) { fa_fwd(qkvh, o, lse, g, H, C); }
 extern "C" void at_fa_fwd_bf(const void *qkvh, void *o, float *lse, const at_geom *g, int H, int C) { fa_fwd(qkvh, (__nv_bfloat16 *)o, lse, g, H, C); }
@@ -369,7 +376,7 @@ template <typename TO> static void fa_bwd(const void *qkvh, void *doh, const TO 
     const long long T = (long long)g->nseq * g->S, Tp = T + FT;
     const __half *Qh = (const __half *)qkvh, *Kh = Qh + (size_t)H * Tp * HD, *Vh = Kh + (size_t)H * Tp * HD; __half *Gh = (__half *)doh;
     fa_bprep(o, dO, amx, Gh, Dv, g, C);
-    const float scale = 1.f / sqrtf((float)HD), sl2 = scale * 1.4426950408889634f;
+    const float scale = ls_factor(g->S) / sqrtf((float)HD), sl2 = scale * 1.4426950408889634f;
     dim3 gr(nbk(g->S, FT), H, g->nseq);
     k_fa_dkv<<<gr, 128>>>(Qh, Kh, Vh, Gh, lse, Dv, amx, dqkn, g->S, H, C, Tp, sl2, scale, g->lens);
     k_fa_dq<<<gr, 128>>>(Qh, Kh, Vh, Gh, lse, Dv, amx, dqkn, g->S, H, C, Tp, sl2, scale, g->lens);

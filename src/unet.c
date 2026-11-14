@@ -260,7 +260,7 @@ struct unet {
     int tba;                                 /* block applications: tbn x cfg.attn_repeat (application a runs block a % tbn) */
     /* cfg.attn_axis 1 / attn_pe 3: the scroll geometry. tb_rb: one device buffer for the ray table, lengths, axis dims, ray positions, the
        stencil weight sums, the grid tokens' scroll positions and the axis frames (at_rays_plan); the host side of a plan; the axis records */
-    at_rays tbr; float *tb_rb, *tb_rayh, *tb_cenh, *tb_axb, *tb_axh; int *tb_lensh, *tb_adh; int tb_Q, tb_Nt, tb_Nr, tb_axn, tb_axs, tb_axdirty, tb_axwarn;
+    at_rays tbr; float *tb_rb, *tb_rayh, *tb_cenh, *tb_axb, *tb_axh; int *tb_lensh, *tb_adh; int tb_Q, tb_Nt, tb_Nr, tb_axn, tb_axs, tb_axdirty, tb_axwarn, tb_noax, tb_noax_warn; long tb_noax_tot;
     int nrg, tb_memn; size_t mem_gate, mem_woff; float *tb_memin, *tb_memf, *tb_memout, *tb_memfh; const float *tb_memsrc;   /* register rows (attn_reg + attn_mem); window memory */
     int tb_nv, tb_vn; size_t view_w, view_b; float *tb_vxp, *tb_ve; const uint8_t *tb_vsrc;   /* scan fusion: view rows per sample, the crops' count; patches, embeddings */
     float *tb_gpos; float *tb_cen; long tb_Tr;
@@ -2636,6 +2636,7 @@ static void tb_geom(unet *u) {
     if (!u->tb_rb || !u->tb_axdirty) return;
     const shape5 ys = u->tb.ys; const int n = ys.n, D = ys.d, Hh = ys.h, W = ys.w, Pm = D > Hh ? (D > W ? D : W) : (Hh > W ? Hh : W);
     const int fp = 1 << (u->cfg.nlev - 1), have = u->tb_axh && u->tb_axn == n;
+    u->tb_noax = 0;
     if (!have && !u->tb_axwarn) { fprintf(stderr, "unet: the attention stage has no scroll axis records for %d samples (unet_set_attn_axis): rays along the grid rows\n", n); u->tb_axwarn = 1; }
     for (int b = 0; b < n; b++) {
         float *o = u->tb_axb + (size_t)b * AT_AXR(Pm);
@@ -2646,7 +2647,10 @@ static void tb_geom(unet *u) {
         if (ad < 0 || ad > 2) continue;
         int Np, Nu, Nv; at_ray_plane(ad, D, Hh, W, &Np, &Nu, &Nv);
         o[0] = (float)ad;
-        if (r[1] == 0.f || np != Np * F || u->tb_axs < UNET_AXR(np)) continue;
+        if (r[1] != 0.f && (np != Np * F || u->tb_axs < UNET_AXR(np))) {   /* (a valid axis whose plane count does not fit the grid used to be dropped silently) */
+            fprintf(stderr, "unet: scroll axis record of sample %d has %d planes (stride %d), the bottleneck grid needs %d x %d (planes x div %d x 2^(nlev-1)): "
+                            "the window depth must be a multiple of %d window voxels\n", b, np, u->tb_axs, Np, F, div, F); abort(); }
+        if (r[1] == 0.f) { u->tb_noax++; continue; }
         o[1] = 1.f;
         for (int k = 0; k < Np; k++) {
             double su = 0, sv = 0;
@@ -2654,6 +2658,10 @@ static void tb_geom(unet *u) {
             o[2 + 2 * k] = (float)((su / F + 0.5) / F - 0.5); o[3 + 2 * k] = (float)((sv / F + 0.5) / F - 0.5);
         }
     }
+    if (have && u->tb_noax && u->cfg.attn_pe == 3) u->tb_noax_tot += u->tb_noax;
+    if (have && u->tb_noax && u->cfg.attn_pe == 3 && (u->tb_noax_warn++ % 1000) == 0)
+        fprintf(stderr, "unet: WARNING %d of %d samples have no scroll axis (--axis / the source's axis missing): the scroll PE falls back to GRID-INDEX positions "
+                        "for them, a different meaning than the trained (r, arc, z) (%ld such samples so far; this message repeats every 1000th)\n", u->tb_noax, n, u->tb_noax_tot);
     at_rays_plan(n, D, Hh, W, attn_ray_mult(), u->tb_axb, u->tb_rayh, u->tb_lensh, u->tb_adh, u->tb_cenh);
     nn_h2d((void *)u->tbr.ray, u->tb_rayh, (size_t)n * u->tb_Q * AT_RAY_F * sizeof(float));
     nn_h2d((void *)u->tbr.lens, u->tb_lensh, (size_t)n * u->tb_Q * sizeof(int));
