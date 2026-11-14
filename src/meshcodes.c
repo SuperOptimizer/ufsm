@@ -76,7 +76,10 @@ static void mc_free(void *vp) {
    (12 n bytes), val (4 n), valid (n). */
 #define MC_AL(x) (((x) + 7) & ~(size_t)7)
 static void mc_key(char *k, size_t nk, const char *dir, char **names, int nn, const char *value, const char *mapp) {
-    size_t u = (size_t)snprintf(k, nk, "meshcodes pack v1|value %s|", value); struct stat st;
+    /* v2 (2026-11-14 datafix): the mesh dir's realpath is in the key: two sets with the same mesh names, sizes and mtimes (copies,
+       tests) had shared one pack, so the second set read the first one's meshes */
+    char drp[4200]; if (!realpath(dir, drp)) snprintf(drp, sizeof drp, "%s", dir);
+    size_t u = (size_t)snprintf(k, nk, "meshcodes pack v2|dir %s|value %s|", drp, value); struct stat st;
     for (int i = 0; i < nn && u < nk; i++) { u += (size_t)snprintf(k + u, nk - u, "%s", names[i]);
         const char *f[4] = {"x.tif", "y.tif", "z.tif", value};
         for (int a = 0; a < 4 && u < nk; a++) { char p[2400]; snprintf(p, sizeof p, "%s/%s/%s", dir, names[i], f[a]);

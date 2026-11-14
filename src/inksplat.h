@@ -53,6 +53,8 @@ typedef struct {
     const char *val; int val_mode;   /* --val V --val-mode exclude|only: a validation raster (as the mask): exclude (1) drops its pixels (>= 128) from the
                                        supervision (training), only (2) keeps nothing else (the validation GT); 0 ignores it. On the fly: per segment "validation" */
     int nexcl; int64_t excl[64][6];   /* --exclude z,y,x,nz,ny,nx (level-0 voxels, repeatable): output voxels touching a box are never written (held-out regions) */
+    int excl_cells_only;   /* on the fly (inkfly_open): the boxes only drop draw cells (inkfly_cells); the derived array keeps the ink inside them, so
+                              validation windows in a box have known ink and the sampler's holdout mask hides it from training (eval audit 11-14 #2) */
 } inksplat_cfg;
 
 void inksplat_defaults(inksplat_cfg *c);

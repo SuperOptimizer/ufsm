@@ -4833,6 +4833,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-raster")) return cmd_fiber_raster(argc, argv);
     if (!strcmp(cmd, "fiber-onfly")) return cmd_fiber_onfly(argc, argv);
     if (!strcmp(cmd, "codes-onfly")) return cmd_codes_onfly(argc, argv);
+    if (!strcmp(cmd, "holdout-cover")) { int cmd_holdout_cover(int, char **); return cmd_holdout_cover(argc, argv); }
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);
     if (!strcmp(cmd, "hires-phase")) return cmd_hires_phase(argc, argv);
     if (!strcmp(cmd, "phase-gate")) return cmd_phase_gate(argc, argv);

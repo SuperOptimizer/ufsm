@@ -34,11 +34,11 @@ int main(int argc, char **argv) {
         uint8_t *zero = calloc((size_t)128 * 128 * 128, 1); z3w_write_shard(w, 0, 0, 0, zero, 1); free(zero); z3w_close(w);
     }
     for (int X0 = 40; X0 < 48; X0++) {
-        char md[4096]; snprintf(md, sizeof md, "%s/p%d", D, X0); mkdir(md, 0755); snprintf(p, sizeof p, "%s/plane%d.tifxyz", md, X0);   /* (distinct names: the pack key is the names + sizes + mtimes, not the dir) */ mkdir(p, 0755);
+        char md[4096]; snprintf(md, sizeof md, "%s/p%d", D, X0); mkdir(md, 0755); snprintf(p, sizeof p, "%s/plane.tifxyz", md);   /* (one name in every dir: the pack key holds the dir since v2; v1 shared one pack across them) */ mkdir(p, 0755);
         for (int r = 0; r < H; r++) for (int c = 0; c < W; c++) { const int i = r * W + c; x[i] = (float)X0; y[i] = 30.f + c * 1.7f; z[i] = 30.f + r * 1.7f; q[i] = 3.0f; }
         const char *nm[4] = {"x", "y", "z", "q"}; const float *ar[4] = {x, y, z, q};
         for (int k = 0; k < 4; k++) { char t[4200]; snprintf(t, sizeof t, "%s/%s.tif", p, nm[k]); if (tif(t, W, H, ar[k])) return 1; }
-        snprintf(p, sizeof p, "%s/plane%d.tifxyz/meta.json", md, X0); FILE *f = fopen(p, "w"); fputs("{}", f); fclose(f);
+        snprintf(p, sizeof p, "%s/plane.tifxyz/meta.json", md); FILE *f = fopen(p, "w"); fputs("{}", f); fclose(f);
         for (int L = 0; L <= 3; L++) {
             char key[32]; snprintf(key, sizeof key, "ct/%d", L);
             z3 *ct = z3_open(st, key, nullptr); if (!ct) { fprintf(stderr, "z3_open %s\n", key); return 1; }

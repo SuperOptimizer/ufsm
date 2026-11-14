@@ -1090,6 +1090,7 @@ typedef struct {
     ifunit *U; int nU;
     iftile *T; size_t nT;
     int64_t gcell, gdim[3]; uint32_t *gstart, *glist;   /* tile grid: cells of gcell level-0 voxels -> tile ids (CSR) */
+    int ncx; int64_t cx[64][6];   /* the held-out boxes whose draw cells inkfly_cells drops (cfg excl; f->c.nexcl is 0 under excl_cells_only) */
 } inkfly;
 static struct { _Atomic uint64_t reads, chunks, empty, hits, px, us, ct_us, gpu_chunks, gpu_us; } g_ifs;
 /* tests: UFSM_INKFLY_FAIL=N: the first N GPU chunks fail as if out of device memory (the CPU fallback from there) */
@@ -1478,7 +1479,7 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
     fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *txt = malloc((size_t)sz + 1); size_t rd = fread(txt, 1, (size_t)sz, fp); fclose(fp); txt[rd] = 0;
     json *j = json_parse(txt, rd); const json *sg = json_get(j, "segments"); char *sg_txt = txt;   /* (the segments text goes into the cache key) */
     if (!sg || sg->type != J_ARR || !sg->n) { fprintf(stderr, "ink onfly: %s: no \"segments\" array\n", segs_path); json_free(j); free(sg_txt); z3_close(ct); return nullptr; }
-    inkfly *f = calloc(1, sizeof *f); f->c = *cfg; f->L = cfg->level; f->V = (double)(1 << f->L); f->off = (f->V - 1) / 2; f->base_ct = ct;
+    inkfly *f = calloc(1, sizeof *f); f->c = *cfg; f->ncx = cfg->nexcl; memcpy(f->cx, cfg->excl, sizeof f->cx); if (cfg->excl_cells_only) f->c.nexcl = 0; f->L = cfg->level; f->V = (double)(1 << f->L); f->off = (f->V - 1) / 2; f->base_ct = ct;
     memcpy(f->shape, z3_meta_of(ct)->shape, sizeof f->shape);
     f->reach = fmax(fmax(fabs(cfg->face_lo), fabs(cfg->face_hi)) + 1, fmax(fabs(cfg->face_lo + cfg->face_a), fabs(cfg->face_hi + cfg->face_b)));
     const int nseg = (int)sg->n; f->S = calloc(nseg, sizeof *f->S); f->Spath = calloc(nseg, sizeof *f->Spath); f->Ls = calloc(3 * nseg, sizeof *f->Ls); f->Lpath = calloc(3 * nseg, sizeof *f->Lpath); f->U = calloc(nseg, sizeof *f->U);
@@ -1504,7 +1505,7 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
         u->ntx = (int)((u->lw + TS - 1) / TS); u->nty = (int)((u->lh + TS - 1) / TS);
         f->nU++;
     }
-    char *key = inkfly_key(f, cfg, sg_txt), kdir[1200] = "", ixp[1300] = ""; int have_ix = 0;
+    char *key = inkfly_key(f, &f->c, sg_txt), kdir[1200] = "", ixp[1300] = ""; int have_ix = 0;
     if (dcache_dir && *dcache_dir && !dcache_key_dir(dcache_dir, key, kdir, sizeof kdir)) {   /* the index cached beside the chunks (same inputs key) */
         snprintf(ixp, sizeof ixp, "%s/index.bin", kdir); FILE *ix = fopen(ixp, "rb");
         if (ix) { char m[4]; uint32_t nu = 0; uint64_t nt = 0;
@@ -1813,13 +1814,14 @@ int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits) {
        out with no known ink and was dropped as empty (Paris 4 under U2: 10 of 14 picked windows; its 16 eval crops sit where the labels
        are densest). Cells straddling a box edge stay: their window reaches the known labels outside it */
     size_t nx = 0;
-    for (int e = 0; e < f->c.nexcl; e++) {
-        const int64_t *bx = f->c.excl[e]; int64_t a[3], b[3]; int ok = 1;
+    for (int e = 0; e < f->ncx; e++) {
+        const int64_t *bx = f->cx[e]; int64_t a[3], b[3]; int ok = 1;
         for (int d = 0; d < 3; d++) { a[d] = (bx[d] + cs - 1) / cs; b[d] = (bx[d] + bx[3 + d]) / cs - 1; if (a[d] < 0) a[d] = 0; if (b[d] >= shape[d]) b[d] = shape[d] - 1; ok &= a[d] <= b[d]; }
         if (!ok) continue;
         for (int64_t z = a[0]; z <= b[0]; z++) for (int64_t y = a[1]; y <= b[1]; y++) for (int64_t x = a[2]; x <= b[2]; x++) { uint8_t *q = &bits[((size_t)z * shape[1] + y) * shape[2] + x]; nx += *q; *q = 0; }
     }
-    if (f->c.nexcl) fprintf(stderr, "ink onfly: %zu of %zu level-%d draw cells lie inside the %d held-out boxes: dropped\n", nx, n, lev, f->c.nexcl);
+    if (f->ncx) fprintf(stderr, "ink onfly: %zu of %zu level-%d draw cells lie inside the %d held-out boxes: dropped%s\n", nx, n, lev, f->ncx,
+                        f->c.nexcl ? "" : " (the ink inside them is kept: the sampler's holdout mask hides it from training, validation reads it)");
     n -= nx;
     return (int)(n > 2000000000 ? 2000000000 : n);
 }

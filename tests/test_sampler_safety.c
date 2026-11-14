@@ -194,6 +194,23 @@ int main(int argc, char **argv) {
         for (int bi = 0; lp && bi < 8; bi++) { batch *b = sampler_next(lp); if (!b) { avoid = 0; break; }
             for (int i = 0; i < lc.B; i++) avoid &= b->corner[i][0] + lc.P <= 64; sampler_release(lp, b); }
         sampler_stop(lp); check("training windows avoid holdout_file boxes", avoid); sources_free(L);
+        /* eval audit 11-14 #7: validation draws every held-out box (box 0 only before), malformed / foreign boxes are errors */
+        L = fixture(argv[1], ",\"holdout\":[[0,0,0,32,128,128],[96,0,0,32,128,128]]");
+        sample_cfg vc = config(); vc.holdout = 1; lp = sampler_start(L, &vc); int nlo = 0, nhi = 0, inside = lp != nullptr;
+        for (int bi = 0; lp && bi < 32; bi++) { batch *b = sampler_next(lp); if (!b) { inside = 0; break; }
+            for (int i = 0; i < vc.B; i++) { const int64_t z = b->corner[i][0]; nlo += z + vc.P <= 32; nhi += z >= 96 && z + vc.P <= 128; inside &= (z + vc.P <= 32) || (z >= 96 && z + vc.P <= 128); }
+            sampler_release(lp, b); }
+        sampler_stop(lp); sources_free(L); check("validation draws from every held-out box", inside && nlo > 8 && nhi > 8);
+        char rp[1400]; snprintf(rp, sizeof rp, "%s/bad-sources.json", argv[1]);
+        const char *bad[3] = {"\"holdout\":[0,0,0,64,128]", "\"holdout\":[0,0,0,0,128,128]", "\"holdout\":[[0,0,0,64,128,128],[0,-4,0,64,128,128]]"};
+        int refused = 1;
+        for (int q = 0; q < 3; q++) { FILE *bf = fopen(rp, "w"); assert(bf);
+            fprintf(bf, "{\"sources\":[{\"name\":\"a\",\"root\":\"%s\",\"ct\":\"ct\",\"um\":1,\"targets\":{\"recto\":\"labels\"},%s}]}\n", argv[1], bad[q]); assert(!fclose(bf));
+            sources *B = sources_load(rp); refused &= B == nullptr; if (B) sources_free(B); }
+        check("malformed held-out boxes are refused", refused);
+        FILE *bf = fopen(rp, "w"); assert(bf);   /* a holdout_file with no box of this CT: a warning, fatal under holdout_strict */
+        fprintf(bf, "{\"holdout_strict\":1,\"sources\":[{\"name\":\"a\",\"root\":\"%s\",\"ct\":\"ct2\",\"um\":1,\"targets\":{\"recto\":\"labels\"},\"holdout_file\":\"%s\"}]}\n", argv[1], hp); assert(!fclose(bf));
+        sources *B = sources_load(rp); check("holdout_strict refuses a holdout_file with no box of the CT", B == nullptr); if (B) sources_free(B);
     }
 #ifndef TEST_LEGACY
     /* Compare the corner preflight with exhaustive integer origins for varied overlapping boxes. */

@@ -395,7 +395,7 @@ static void free_batch(batch *b, int B) { free(b->latd); free(b->lvc); free(b->l
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
 /* which levels a source can serve (CT and at least one target open): computed once per (source, region channel) since
    source_ct / source_tgt take the global open lock and may open remote stores; before this every draw re-checked every level */
-/* Inclusive level-l origins whose whole patch lies in the CT, region and validation box.
+/* Inclusive level-l origins whose whole patch lies in the CT, region and validation box (validation: 0 none, k + 1 held-out box k).
    Round starts up and ends down: flooring a non-aligned holdout start leaks outside it. */
 static int patch_bounds(const source *s, const z3_meta *m, const int64_t wn[3], int l, const regions *r, int ri, int validation, int64_t lo[3], int64_t hi[3]) {
     int64_t f = (int64_t)1 << l;
@@ -408,9 +408,11 @@ static int patch_bounds(const source *s, const z3_meta *m, const int64_t wn[3], 
             if (rl > lo[d]) lo[d] = rl;
             if (rh < hi[d]) hi[d] = rh;
         }
-        if (validation) {
-            if (s->hold_n[d] <= 0) return 0;
-            int64_t hl = (s->hold_o[d] + f - 1) / f, hh = (s->hold_o[d] + s->hold_n[d]) / f - P;
+        if (validation) {   /* (validation k + 1: held-out box k; 1 = box 0 = hold_o / hold_n) */
+            const int k = validation - 1; if (k >= (s->hold_n[0] > 0 ? (s->nhold > 1 ? s->nhold : 1) : 0)) return 0;
+            const int64_t bo = k ? s->hold[k][d] : s->hold_o[d], bn = k ? s->hold[k][3 + d] : s->hold_n[d];
+            if (bn <= 0) return 0;
+            int64_t hl = (bo + f - 1) / f, hh = (bo + bn) / f - P;
             if (hl > lo[d]) lo[d] = hl;
             if (hh < hi[d]) hi[d] = hh;
         }
@@ -422,8 +424,19 @@ static int patch_bounds(const source *s, const z3_meta *m, const int64_t wn[3], 
 static inline int src_nhold(const source *h) { return h->hold_n[0] > 0 ? (h->nhold > 1 ? h->nhold : 1) : 0; }
 static inline int64_t hb_o(const source *h, int k, int d) { return k ? h->hold[k][d] : h->hold_o[d]; }
 static inline int64_t hb_n(const source *h, int k, int d) { return k ? h->hold[k][3 + d] : h->hold_n[d]; }
+/* eval audit 11-14 #7: the same scan by CT basename (+ um), not root + key: a local copy and the http mirror of one scan (the ink
+   sources read local CT, the winding ones dl.ash2txt) are one scan, and each source's boxes must mask the other's labels */
+static size_t ct_base(const char *p, const char **t) {   /* the last path component past trailing slashes and level digits */
+    size_t n = strlen(p);
+    for (;;) { while (n && p[n - 1] == '/') n--; size_t b = n; while (b && p[b - 1] != '/') b--;
+        int dig = b < n; for (size_t c = b; c < n; c++) dig &= p[c] >= '0' && p[c] <= '9';
+        if (dig && b) { n = b - 1; continue; } *t = p + b; return n - b; }
+}
 static int same_ct(const source *a, const source *b) {
-    return a == b || (a->um == b->um && !strcmp(a->ct_key, b->ct_key) && !strcmp(store_root(a->s), store_root(b->s)));
+    if (a == b) return 1;
+    if (a->um != b->um) return 0;
+    const char *ta, *tb; const size_t na = ct_base(a->ct_key, &ta), nb = ct_base(b->ct_key, &tb);
+    return na == nb && na && !memcmp(ta, tb, na);
 }
 static int hits_holdout_span(const sampler *sp, const source *s, const int64_t o[3], int l, int only_rej, int unit) {   /* unit: a 1-voxel span, not the window */
     const int64_t span[3] = {(int64_t)(unit ? 1 : PZ(&sp->cfg)) << l, (int64_t)(unit ? 1 : sp->cfg.P) << l, (int64_t)(unit ? 1 : sp->cfg.P) << l};
@@ -513,8 +526,9 @@ static int level_ok(sampler *sp, source *s, int si, int l, int region_ch) {
             const z3_meta *m = z3_meta_of(source_ct(s, l));
             regions *r = region_ch >= 0 ? s->reg[region_ch] : nullptr;
             int fits = 0; int64_t lo[3], hi[3]; const int64_t wn[3] = {PZ(&sp->cfg), sp->cfg.P, sp->cfg.P};
-            for (int i = 0; i < (r ? r->n : 1); i++) if (patch_bounds(s, m, wn, l, r, i, sp->cfg.holdout, lo, hi) &&
-                (sp->cfg.holdout || training_corner_exists(sp, s, l, lo, hi))) { fits = 1; break; }
+            const int nbx = sp->cfg.holdout ? (s->hold_n[0] > 0 ? (s->nhold > 1 ? s->nhold : 1) : 0) : 1;   /* validation: any held-out box a window fits */
+            for (int i = 0; i < (r ? r->n : 1) && !fits; i++) for (int k = 0; k < nbx && !fits; k++) if (patch_bounds(s, m, wn, l, r, i, sp->cfg.holdout ? k + 1 : 0, lo, hi) &&
+                (sp->cfg.holdout || training_corner_exists(sp, s, l, lo, hi))) fits = 1;
             ok = fits;
         }
         if (ok && !sp->cfg.restore) {   /* (task restore: no targets) */
@@ -2699,7 +2713,12 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         int64_t lo[3], hi[3]; if (!patch_bounds(s, m, n, l, R, ri, c->holdout, lo, hi)) SL_OTHER_RET();
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (c->holdout) {
-        int64_t lo[3], hi[3]; if (!patch_bounds(s, m, n, l, nullptr, 0, 1, lo, hi)) SL_OTHER_RET();
+        /* a held-out box drawn uniformly among those a window fits at this level (eval audit 11-14 #7: box 0 only before) */
+        int fitk[256], nf = 0; const int nbx = s->hold_n[0] > 0 ? (s->nhold > 1 ? s->nhold : 1) : 0;
+        for (int k = 0; k < nbx && nf < 256; k++) { int64_t a_[3], b_[3]; if (patch_bounds(s, m, n, l, nullptr, 0, k + 1, a_, b_)) fitk[nf++] = k; }
+        if (!nf) SL_OTHER_RET();
+        const int kk = fitk[rint_below(r, nf)];
+        int64_t lo[3], hi[3]; if (!patch_bounds(s, m, n, l, nullptr, 0, kk + 1, lo, hi)) SL_OTHER_RET();
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (s->nbox) {   /* "boxes": training windows inside them (e.g. the emb-only distillation boxes) */
         int64_t *lo = blo, *hi = bhi; if (box_bounds(s, m, n, l, r, lo, hi)) SL_OTHER_RET(); inbox = 1;
