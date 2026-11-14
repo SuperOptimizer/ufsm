@@ -1,6 +1,7 @@
 /* Analytic 3D ramps verify interpolation and registration independently of
    learned predictions. Round trips/Jacobians check the sparse supervision map. */
 #include "../src/sample.c"
+#include "test_part.h"   /* UFSM_TEST_PART=K/3: the cache-blocked writer (1), the fused warp (2), the rest (0); ~6 s each */
 #include <assert.h>
 void *nn_host_alloc(size_t n) { return malloc(n); }
 void nn_host_free(void *p) { free(p); }
@@ -17,7 +18,7 @@ int main(void) {
         sheet_parameters(&sheet,z,params[z]); cy[z]=params[z][0]; cx[z]=params[z][1];
         for (int y=0;y<P;y++) for (int x=0;x<P;x++) { size_t k=((size_t)z*P+y)*P+x; ct[k]=60+z+2*y+3*x; target[k]=z+2*y+3*x; mask[k]=z!=0; }
     }
-    for (int mode=0;mode<5;mode++) {   /* 0 rotation, 1 elastic, 2 both, 3 both + zoom-in 0.8, 4 both + anisotropic scale/shear */
+    TEST_PART(0) for (int mode=0;mode<5;mode++) {   /* 0 rotation, 1 elastic, 2 both, 3 both + zoom-in 0.8, 4 both + anisotropic scale/shear */
         spatial_aug a,b; spatial_aug_make(&a,17,P,mode==1?0:5,1,mode==0?0:1,1);
         spatial_aug_make(&b,17,P,mode==1?0:5,1,mode==0?0:1,1); assert(!memcmp(&a,&b,sizeof a));
         if (mode==3) spatial_aug_zoom(&a,.8);
@@ -61,7 +62,7 @@ int main(void) {
         assert(batch.terms[0].target==.2f && batch.points[1].q==3.2f);
         printf("spatial mode %d: %d registered voxels, %d ignored corners, 48 symmetries, sparse round trip: ok\n",mode,checked,cropped);
     }
-    {   /* the stored phase through the same warps (warp_phase, task unwrap): a planar phase ramp of 0.02 / 0.03 / 0.025 turns per voxel
+    TEST_PART(3) {   /* the stored phase through the same warps (warp_phase, task unwrap): a planar phase ramp of 0.02 / 0.03 / 0.025 turns per voxel
            pulled through each mode and every 6th symmetry equals the analytic phase at the pulled source point (phasor interpolation of
            a linear ramp: < 0.01 turn), unknown where the pull leaves the window */
         uint8_t *ph=malloc(n),*out=malloc(n); const double g[3]={.02,.03,.025};
@@ -90,7 +91,7 @@ int main(void) {
         }
         free(ph); free(out);
     }
-    {   /* hard targets (packed side classes): every warped voxel takes the code of its nearest source voxel (0 / 255, never a blend);
+    TEST_PART(6) {   /* hard targets (packed side classes): every warped voxel takes the code of its nearest source voxel (0 / 255, never a blend);
            the CT-only writer (--gpu-input) gives channel 0, targets and mask bit for bit as the 4-channel one */
         uint8_t *hard=malloc(NCH*n),*T1=malloc(NCH*n),*M1=malloc(n); uint16_t *H1=malloc(n*2);
         for (size_t k=0;k<n;k++) { int z=(int)(k/(P*P)),y=(int)(k/P%P),x=(int)(k%P); hard[k]=(x+2*y+3*z)%7<3?255:0; hard[n+k]=hard[k]?0:(z+x)%5?255:0; mask[k]=(x*y+z)%11!=0; }
@@ -122,7 +123,7 @@ int main(void) {
         assert(!blends && !mismatch && !ctdiff && checked>10000);
         free(hard); free(T1); free(M1); free(H1);
     }
-    {   /* the cache-blocked writer against the per-voxel reference loop (write_spatial_ref), bit for bit: output formats, CT-only,
+    TEST_PART(1) {   /* the cache-blocked writer against the per-voxel reference loop (write_spatial_ref), bit for bit: output formats, CT-only,
            hard / blended targets, appearance plans (LUT, filter, shading, correlated noise), the sheet prior, warps, odd sizes */
         int diffs=0,runs=0;
         for (int Pq=0;Pq<2;Pq++) {
@@ -158,7 +159,7 @@ int main(void) {
         assert(!diffs);
     }
 #ifdef __AVX2__
-    {   /* the vector arctangent: every lane it does not hand to atan2f (need) carries atan2f's code, over random phasors of all sizes
+    TEST_PART(9) {   /* the vector arctangent: every lane it does not hand to atan2f (need) carries atan2f's code, over random phasors of all sizes
            and phasors on / next to the rounding boundaries and the wrap */
         uint64_t s = 12345; long bad = 0, fall = 0, tot = 0, rfall = 0, rtot = 0;
         for (int it = 0; it < 400000; it++) {
@@ -180,7 +181,7 @@ int main(void) {
         assert(!bad);
     }
 #endif
-    {   /* warp_phase_w4 (vector, fused) against the per-voxel reference loops warp_phase_ref / warp_w4_ref, bytes equal: a spiral phase
+    TEST_PART(2) {   /* warp_phase_w4 (vector, fused) against the per-voxel reference loops warp_phase_ref / warp_w4_ref, bytes equal: a spiral phase
            with unknowns and its winding mod 4 (band_wind4_tiled components), rotation / elastic / both / zoom / affine, symmetries,
            P 37 (odd: vector lanes and per-voxel tails), 64, 128, 256 and 512 */
         const int Ps[] = {37, 64, 128, 256, 512};
@@ -220,7 +221,7 @@ int main(void) {
         printf("fused vector phase / winding warp vs the per-voxel loops: %d of %d configurations differ\n", diffs, runs);
         assert(!diffs);
     }
-    {   /* the trainer's CT writer (--gpu-input --pack-targets: hard targets, CT-only, packed codes straight from the warp) at P 128, 256
+    TEST_PART(12) {   /* the trainer's CT writer (--gpu-input --pack-targets: hard targets, CT-only, packed codes straight from the warp) at P 128, 256
            and 512 against the per-voxel reference loop + sample_pack_tm, with no appearance plan, the --ct-aug LUT (gamma, shading,
            correlated noise) and the filter plan: fp16 CT and packed codes equal */
         int diffs = 0, runs = 0;
@@ -250,7 +251,7 @@ int main(void) {
         printf("trainer CT writer (packed, fp16, plans none / LUT / filter) vs the per-voxel loop at P 128-512: %d of %d differ\n", diffs, runs);
         assert(!diffs);
     }
-    {   /* band_wind4 (run-pending union-find) vs band_wind4_ref (per-voxel finds and unions): w4, comp and the stats byte for byte on
+    TEST_PART(15) {   /* band_wind4 (run-pending union-find) vs band_wind4_ref (per-voxel finds and unions): w4, comp and the stats byte for byte on
            spiral phases with noise (joins that break or wrap), label conflicts (a sheared wall whose phase jumps), unknown blobs and air,
            several shapes, step limits, minimum sizes and component counts, whole windows and tiled */
         int diffs = 0, runs = 0; size_t tot_conf = 0, tot_kept = 0, tot_known = 0;

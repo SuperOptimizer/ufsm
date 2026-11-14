@@ -12,6 +12,7 @@
 #      to fp16 as the slab path does: 0.64 % of the fixture's bytes land across a code boundary)
 # Usage: test_predict_heads.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
+. "$(dirname "$0")/test_part.sh"   # UFSM_TEST_PART=K/3: (1) | (1b) (1c) | (1d) (2) (3); each part trains net (1) and its --heads all run first
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 "$MF" fx 256 2 1 > fx.log 2>&1
@@ -33,6 +34,7 @@ PY
 "$U" predict s/last.ckpt fx ct h "${P[@]}" --heads all > h.log 2>&1 || fail "predict --heads all ($D/h.log)"
 grep -q 'predict: 2 heads from one trunk pass: rv (ch 1[0-9]+1[0-9] stem) ink (ch 1[0-9] stem)' h.log || fail "heads line ($D/h.log)"
 for n in rv ink; do [ -e h/$n/9.6/zarr.json ] && [ -e h/$n/zarr.json ] || fail "store h/$n"; done
+if part 0; then   # the rest of (1)
 UFSM_PRED_HEADS=0 "$U" predict s/last.ckpt fx ct old "${P[@]}" --channel rv > old.log 2>&1 || fail "predict, old path ($D/old.log)"
 cmpb old h/rv 0.001 || fail "rv: the heads path against the slab path"
 "$U" predict s/last.ckpt fx ct one "${P[@]}" --channel rv > one.log 2>&1 || fail "predict --channel rv ($D/one.log)"
@@ -64,6 +66,8 @@ cmpf f4z f5z
 # the fit writer's staging ring (UFSM_PRED_FIT_NBUF 2 / 8 against the default 4; 1 MB planes: many chunks a window) writes the same fields
 for nbf in 2 8; do UFSM_PRED_FIT_NBUF=$nbf UFSM_PRED_FIT_PLANES_MB=1 "$U" predict s/last.ckpt fx ct fn$nbf "${P[@]}" --fit-zarr fn${nbf}z --no-out 1 > fn$nbf.log 2>&1 || fail "predict --fit-zarr, ring $nbf ($D/fn$nbf.log)"
                   cmpf f2z fn${nbf}z; done
+fi
+if part 1; then   # (1b), (1c)
 # (1b) the GPU pyramid (each level-0 shard pooled on the device, levels >= 1 encoded from the pieces) against the CPU pyramid (each level
 #      decoded back and pooled): at q 0 the same bytes, shard 128 (pieces below a chunk, gathered raw) and 256 (level 1 encoded at once)
 for sh in 128 256; do
@@ -85,6 +89,8 @@ for sh in 128 256; do
   grep -Eq 'head writers: .*, [1-9][0-9]* from their bytes' gv$sh.log || fail "shard $sh: the over-capacity fallback not taken ($D/gv$sh.log)"
   [ "$(cd gv$sh && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" = "$(cd ge${sh}0 && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" ] || fail "shard $sh: the over-capacity shards differ from the CPU encoder's"
 done
+fi
+if part 2; then   # (1d), (2), (3)
 # (1d) the CT windows decoded on the GPU into device memory (UFSM_PRED_DEVREAD): the same stores as the host reader's (windows over the
 #      array's edges: fill), and the chunks went through the GPU
 UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dv "${P[@]}" --heads rv,ink > dv.log 2>&1 || fail "predict UFSM_PRED_DEVREAD ($D/dv.log)"
@@ -108,4 +114,5 @@ grep -q 'sub-cell head: outputs 32-159 start at zero' fs.log || fail "(3): not a
 grep '^step      3' fs.log | grep -qv 'nan' || fail "(3): no finite step 3 ($D/fs.log)"
 "$U" predict fs/last.ckpt fx ct gs "${P[@]}" --heads all > gs.log 2>&1 || fail "predict --heads all, sub-cell fibre ($D/gs.log)"
 for n in rv fib/H fib/V fib/fam; do [ -e gs/$n/9.6/zarr.json ] || fail "store gs/$n ($D/gs.log)"; done
+fi
 echo "test_predict_heads: ok"

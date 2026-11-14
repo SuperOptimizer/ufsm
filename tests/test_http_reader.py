@@ -145,6 +145,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def serve(self, head=False):
         mode, _, key = self.path.lstrip("/").partition("/")
+        mode, _, tag = mode.partition("~")  # a per-read tag (concurrent reads): requests and per-mode counts are kept apart by it
         auth = {"auth-a": "Bearer fixture-a", "auth-b": "Bearer fixture-b", "noauth": None, "drop-idle": None}
         if mode in auth:
             with LOCK:
@@ -155,8 +156,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True  # Deliberately omit Connection: close in a valid response.
         request_range = self.headers.get("Range")
         with LOCK:
-            REQUESTS.append((mode, key, self.command, request_range))
-            count_key = (mode, key, self.command)
+            REQUESTS.append((mode, key, self.command, request_range, tag))
+            count_key = (tag, mode, key, self.command)
             COUNTS[count_key] = COUNTS.get(count_key, 0) + 1
             count = COUNTS[count_key]
         if mode == "transport-once" and count == 1:
@@ -243,11 +244,11 @@ def main():
             counter = 0
             manifests = []
             def read(mode="ok", key="array", origin=(-2, -1, -3), shape=(17, 18, 18), threads=4,
-                     cache=None, coalesce="1", parallel="1", success=True, multi=None, imem="1"):
+                     cache=None, coalesce="1", parallel="1", success=True, multi=None, imem="1", tag=None):
                 nonlocal counter
                 with LOCK:
                     counter += 1; out = tmp / f"out-{counter}.raw"
-                cmd = [BINARY, "read", url + "/" + mode, key, *origin, *shape, out, "--threads", threads]
+                cmd = [BINARY, "read", url + "/" + mode + ("" if tag is None else "~" + tag), key, *origin, *shape, out, "--threads", threads]
                 if cache is not None:
                     cmd += ["--cache", cache]
                 env = dict(clean, UFSM_Z3_COALESCE=coalesce, UFSM_Z3_INDEX_PARALLEL=parallel, UFSM_Z3_INDEX_MEM=imem)
@@ -264,14 +265,26 @@ def main():
 
             # Independent voxel reference, cold/hot caches, outside bounds, thread counts and both controls.
             # Byte-exact across coalescing, the multi fetcher, the index memory cache and the parallel index fetch.
-            for coalesce, parallel, multi, threads in itertools.product(("0", "1"), ("0", "1"), ("0", "1"), (1, 4, 16)):
+            # The 24 combinations run concurrently (8 at a time: 30 -> 8 s of the test's wall time), each under its own URL tag so the
+            # warm-cache check sees only its own requests; a cache's .root records its URL (tag included), so the manifests skip it and
+            # a later read of a copy of cache-0-0-0-1 uses that cache's tag (another URL would get a fresh @hash subdirectory).
+            def manifest(cache):
+                return {str(p.relative_to(cache)): p.read_bytes() for p in cache.rglob("*") if p.is_file() and p.name != ".root"}
+            def combo(c):
+                coalesce, parallel, multi, threads = c; tag = f"{coalesce}{parallel}{multi}-{threads}"
                 cache = tmp / f"cache-{coalesce}-{parallel}-{multi}-{threads}"
-                read(cache=cache, coalesce=coalesce, parallel=parallel, threads=threads, multi=multi, imem=parallel)
-                manifests.append({str(p.relative_to(cache)): p.read_bytes() for p in cache.rglob("*") if p.is_file()})
-                before = len(REQUESTS)
-                read(cache=cache, coalesce=coalesce, parallel=parallel, threads=threads, multi=multi)
-                assert all("/c/" not in r[1] for r in REQUESTS[before:]), "warm cache fetched shard data"
-                read(coalesce=coalesce, parallel=parallel, threads=threads, multi=multi, imem=parallel)  # no disk cache
+                read(cache=cache, coalesce=coalesce, parallel=parallel, threads=threads, multi=multi, imem=parallel, tag=tag)
+                m = manifest(cache)
+                with LOCK:
+                    n0 = sum(r[4] == tag for r in REQUESTS)
+                read(cache=cache, coalesce=coalesce, parallel=parallel, threads=threads, multi=multi, tag=tag)  # (the cache's own URL)
+                with LOCK:
+                    warm = [r for r in REQUESTS if r[4] == tag][n0:]
+                assert warm and all("/c/" not in r[1] for r in warm), "warm cache fetched shard data"
+                read(coalesce=coalesce, parallel=parallel, threads=threads, multi=multi, imem=parallel, tag=tag + "n")  # no disk cache
+                return m
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                manifests = list(pool.map(combo, itertools.product(("0", "1"), ("0", "1"), ("0", "1"), (1, 4, 16))))
             assert all(m == manifests[0] for m in manifests), "encoded cache differs across execution modes"
             for threads in (1, 16):
                 read(threads=threads)
@@ -283,7 +296,7 @@ def main():
             for i, p in enumerate(sorted(partial.rglob("*"))):
                 if p.is_file() and i % 3 == 0:
                     p.unlink()
-            read(cache=partial)
+            read(cache=partial, tag="000-1")
             run([HELPER, "prefetch", url + "/ok", "single", tmp / "prefetch"], clean)
             repeat_out = tmp / "repeat.raw"
             run([HELPER, "repeat", url + "/ok", "array", tmp / "repeat", repeat_out], clean)
@@ -313,30 +326,38 @@ def main():
             finally:
                 other.shutdown(); other.server_close(); other_thread.join()
             # Distinguish true sparse absence from failures, with both metadata/chunk scheduling paths.
-            for coalesce, parallel, multi in itertools.product(("0", "1"), repeat=3):
-                for mode in ("wrong-range", "wrong-total", "no-range", "ignored", "short", "forbidden", "crc", "bounds", "overflow", "payload-missing"):
-                    cache = tmp / f"bad-{mode}-{coalesce}-{parallel}-{multi}"
-                    read(mode, cache=cache, coalesce=coalesce, parallel=parallel, multi=multi, success=False)
-                    assert all(str(p.relative_to(cache))[:-8] not in OBJECTS for p in cache.rglob("*.missing")), "failure was cached as absent"
-                read("missing", cache=tmp / f"missing-{coalesce}-{parallel}-{multi}", coalesce=coalesce, parallel=parallel, multi=multi)
+            # (independent reads, each with its own cache: 8 at a time)
+            def bad(c):
+                coalesce, parallel, multi, mode = c
+                if mode == "missing":
+                    return read("missing", cache=tmp / f"missing-{coalesce}-{parallel}-{multi}", coalesce=coalesce, parallel=parallel, multi=multi)
+                cache = tmp / f"bad-{mode}-{coalesce}-{parallel}-{multi}"
+                read(mode, cache=cache, coalesce=coalesce, parallel=parallel, multi=multi, success=False)
+                assert all(str(p.relative_to(cache))[:-8] not in OBJECTS for p in cache.rglob("*.missing")), "failure was cached as absent"
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(bad, itertools.product(("0", "1"), ("0", "1"), ("0", "1"), ("wrong-range", "wrong-total", "no-range", "ignored", "short",
+                                                                                            "forbidden", "crc", "bounds", "overflow", "payload-missing", "missing"))))
             # Header-less 429s back off briefly (the old fixed 30 s sleep per thread stalled whole runs); Retry-After is honoured.
-            for multi in ("0", "1"):
-                t0 = time.monotonic()
-                read("throttle", cache=tmp / f"throttle-{multi}", multi=multi, threads=16)
-                read("throttle-hdr", cache=tmp / f"throttle-hdr-{multi}", multi=multi)
-                assert time.monotonic() - t0 < 20, "429 back-off too slow"
+            # The four reads run at once (each its own tag, so its own 429 counts): the back-offs are real sleeps, 15 -> 5 s of wall time.
+            def throttled(c):
+                multi, mode = c; t0 = time.monotonic()
+                read(mode, cache=tmp / f"{mode}-{multi}", multi=multi, threads=16 if mode == "throttle" else 4, tag=f"t{multi}")
+                return time.monotonic() - t0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                tt = list(pool.map(throttled, itertools.product(("0", "1"), ("throttle", "throttle-hdr"))))
+            assert tt[0] + tt[1] < 20 and tt[2] + tt[3] < 20, ("429 back-off too slow", tt)
             read("plain-forbidden", key="plain", success=False)
             read("retry", cache=tmp / "retry")
             read("redirect", cache=tmp / "redirect")
             corrupt = tmp / "corrupt-cache"; shutil.copytree(tmp / "cache-0-0-0-1", corrupt)
             p = next(corrupt.rglob("*.idx")); data = bytearray(p.read_bytes()); data[-1] ^= 1; p.write_bytes(data)
-            read(cache=corrupt, success=False)
+            read(cache=corrupt, success=False, tag="000-1")
             # Multiple processes can populate one cache without temporary-file collisions.
             shared = tmp / "shared"
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
                 for future in [pool.submit(read, cache=shared, threads=16) for _ in range(4)]:
                     future.result()
-            assert {str(p.relative_to(shared)): p.read_bytes() for p in shared.rglob("*") if p.is_file()} == manifests[0]
+            assert manifest(shared) == manifests[0]
             # Direct store contract, including legal whole responses at offset zero and redirects.
             for mode, off, length, result in [("ok", 7, 64, 64), ("redirect", 7, 64, 64), ("transport-once", 7, 64, 64),
                     ("ignored", 0, 128, 128), ("ignored", 7, 64, -1), ("short", 7, 64, -1),

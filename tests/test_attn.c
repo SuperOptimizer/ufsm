@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h>
 
 static uint64_t rs = 12345;
 static double urand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (double)(rs >> 11) * 0x1.0p-53; }
@@ -88,6 +90,38 @@ static double ref_loss(const blk *B, const double *P, const double *x, const dou
     free(y); return L;
 }
 
+/* ---- central differences, in parallel and shared between the attention cores ----
+   Each coordinate's difference quotient is computed exactly as the serial loop did (private copies of P and x, the same expression),
+   so the values are bit for bit the serial ones. The cores run the same block calls on the same draws (main restores the generator
+   for core 1), so core 1 reuses core 0's reference values (fd_cache, keyed by call order) instead of recomputing them.
+   (2026-11-13: the finite differences were 180 of test_attn's 204 s on the pod; UFSM_NCPU threads.) */
+typedef struct { const blk *B; const at_bp *b2; size_t lo; const double *P, *x, *R; size_t np, nx; int isx; size_t off; const size_t *js; int n;
+                 double *r; int nt, ti; } fd_job;
+static double vr_loss(const blk *B, const at_bp *b2, const double *P, const double *x, const double *R, size_t lo);
+static void *fd_worker(void *arg) {
+    const fd_job *J = arg; double *P = malloc(J->np * 8), *x = malloc(J->nx * 8);
+    memcpy(P, J->P, J->np * 8); memcpy(x, J->x, J->nx * 8);
+    for (int i = J->ti; i < J->n; i += J->nt) {
+        const size_t j = J->js[i];
+        double *v = J->isx ? x + j : P + J->off + j, v0 = *v, e = 1e-4 * (fabs(v0) > 1 ? fabs(v0) : 1);
+        *v = v0 + e; double lp = J->b2 ? vr_loss(J->B, J->b2, P, x, J->R, J->lo) : ref_loss(J->B, P, x, J->R);
+        *v = v0 - e; double lm = J->b2 ? vr_loss(J->B, J->b2, P, x, J->R, J->lo) : ref_loss(J->B, P, x, J->R); *v = v0;
+        J->r[i] = (lp - lm) / (2 * e);
+    }
+    free(P); free(x); return nullptr;
+}
+static int g_fdcall;              /* the finite-difference call of this core pass (main resets it per core) */
+static double *g_fdcache[256];    /* per call: the reference values (the same draws on every core) */
+static int fd_threads(void) { const char *e = getenv("UFSM_NCPU"); long n = e && atoi(e) > 0 ? atoi(e) : sysconf(_SC_NPROCESSORS_ONLN); return n < 1 ? 1 : n > 32 ? 32 : (int)n; }
+static void fd_run(fd_job J, double *r) {
+    const int call = g_fdcall++;
+    if (call < 256 && g_fdcache[call]) { memcpy(r, g_fdcache[call], (size_t)J.n * 8); return; }
+    J.r = r; J.nt = fd_threads(); if (J.nt > J.n) J.nt = J.n;
+    pthread_t th[32]; fd_job jb[32];
+    for (int t = 0; t < J.nt; t++) { jb[t] = J; jb[t].ti = t; pthread_create(&th[t], nullptr, fd_worker, &jb[t]); }
+    for (int t = 0; t < J.nt; t++) pthread_join(th[t], nullptr);
+    if (call < 256) { g_fdcache[call] = malloc((size_t)J.n * 8); memcpy(g_fdcache[call], r, (size_t)J.n * 8); }
+}
 static float *dev(const double *h, size_t n) { float *f = malloc(n * 4); for (size_t i = 0; i < n; i++) f[i] = (float)h[i]; float *d = nn_malloc(n * 4); nn_h2d(d, f, n * 4); free(f); return d; }
 static double *host(const float *d, size_t n) { float *f = malloc(n * 4); nn_d2h(f, d, n * 4); double *h = malloc(n * 8); for (size_t i = 0; i < n; i++) h[i] = f[i]; free(f); return h; }
 /* max |a - b| / rms(b) < g_tmax and (g_tl2 > 0) the relative L2 error < g_tl2. Defaults 2e-3 / off; the fp16 tensor-core attention
@@ -130,16 +164,16 @@ static int test_block(int nseq, int D, int Hh, int W, int nreg, int C, int F, in
         {"qg", bp->qg, C}, {"kg", bp->kg, C}, {"wo", bp->wo, (size_t)C * C}, {"bo", bp->bo, C}, {"ln2g", bp->ln2g, C}, {"ln2b", bp->ln2b, C},
         {"w1", bp->w1, (size_t)2 * F * C}, {"b1", bp->b1, (size_t)2 * F}, {"w2", bp->w2, (size_t)C * F}, {"b2", bp->b2, C}};
     double *a = malloc(npts * 8), *r = malloc(npts * 8);
+    size_t *js = malloc(npts * sizeof *js);
     for (size_t k = 0; k < sizeof ts / sizeof ts[0]; k++) {
         for (int i = 0; i < npts; i++) {
             size_t j = (size_t)(urand() * ts[k].n); if (j >= ts[k].n) j = ts[k].n - 1;
-            double *v = k == 0 ? x + j : P + ts[k].off + j, v0 = *v, e = 1e-4 * (fabs(v0) > 1 ? fabs(v0) : 1);
-            *v = v0 + e; double lp = ref_loss(&B, P, x, R); *v = v0 - e; double lm = ref_loss(&B, P, x, R); *v = v0;
-            r[i] = (lp - lm) / (2 * e); a[i] = k == 0 ? gx[j] : gP[ts[k].off + j];
+            js[i] = j; a[i] = k == 0 ? gx[j] : gP[ts[k].off + j];
         }
+        fd_run((fd_job){&B, nullptr, 0, P, x, R, np, (size_t)(T * C), k == 0, ts[k].off, js, npts, nullptr, 0, 0}, r);
         bad += report(ts[k].nm, a, r, npts);
     }
-    free(a); free(r); free(gx); free(gP); free(P); free(x); free(R);
+    free(js); free(a); free(r); free(gx); free(gP); free(P); free(x); free(R);
     nn_free(Pd); nn_free(xd); nn_free(gd); nn_free(yd); nn_free(Gd); nn_free(wb);
     return bad;
 }
@@ -185,17 +219,17 @@ static int test_vres(int npts) {
     struct { const char *nm; size_t off, n; } ts[] = {{"x", 0, (size_t)T * C}, {"wqkv1", B.bp.wqkv, (size_t)3 * C * C}, {"bqkv1", B.bp.bqkv, (size_t)3 * C},
         {"wqkv2", b2.wqkv, (size_t)3 * C * C}, {"w1 1", B.bp.w1, (size_t)2 * F * C}, {"lam", lo, (size_t)B.d.H}};
     double *a = malloc(npts * 8), *r = malloc(npts * 8);
+    size_t *js = malloc((npts > B.d.H ? npts : B.d.H) * sizeof *js);
     for (size_t k = 0; k < sizeof ts / sizeof ts[0]; k++) {
         const int n = k == 5 ? B.d.H : npts;
         for (int i = 0; i < n; i++) {
             size_t j = k == 5 ? (size_t)i : (size_t)(urand() * ts[k].n); if (j >= ts[k].n) j = ts[k].n - 1;
-            double *v = k == 0 ? x + j : P + ts[k].off + j, v0 = *v, e = 1e-4 * (fabs(v0) > 1 ? fabs(v0) : 1);
-            *v = v0 + e; double lp = vr_loss(&B, &b2, P, x, R, lo); *v = v0 - e; double lm = vr_loss(&B, &b2, P, x, R, lo); *v = v0;
-            r[i] = (lp - lm) / (2 * e); a[i] = k == 0 ? gx[j] : gP[ts[k].off + j];
+            js[i] = j; a[i] = k == 0 ? gx[j] : gP[ts[k].off + j];
         }
+        fd_run((fd_job){&B, &b2, lo, P, x, R, np, (size_t)(T * C), k == 0, ts[k].off, js, n, nullptr, 0, 0}, r);
         bad += report(ts[k].nm, a, r, n);
     }
-    free(a); free(r); free(gx); free(gP); free(P); free(x); free(R);
+    free(js); free(a); free(r); free(gx); free(gP); free(P); free(x); free(R);
     nn_free(Pd); nn_free(xd); nn_free(gd); nn_free(y1); nn_free(y2); nn_free(Gd); nn_free(vb); nn_free(wb);
     return bad;
 }
@@ -391,7 +425,10 @@ static int test_block_mx(int bits, int core, double tol) {   /* bits: the linear
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
     int bad = 0;
+    uint64_t rs0 = rs;
     for (int core = 0; core < 2; core++) {   /* fp32 CUDA-core attention, fp16 tensor-core attention */
+        if (core == 0) rs0 = rs; else rs = rs0;   /* the same draws for both cores: their block / value-residual references are shared */
+        g_fdcall = 0;
         at_set_core(core); printf("== attention core %d\n", core);
         bad += test_block(2, 4, 4, 4, 1, 96, 128, 0, 24);
         bad += test_block(2, 4, 4, 4, 2, 192, 256, 1, 16);
