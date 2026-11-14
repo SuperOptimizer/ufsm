@@ -234,7 +234,7 @@ static void tc(void) {   /* fp16 tensor-core Newton-Schulz vs the fp32 path: 3 M
    enc3 c2 448 x 448 27 = 448 x 12096 and dec3 c1 448 x (288 up + 448 skip) 27 = 448 x 19872 (unet.c muon_collect: Co = cout, K = cin k^3),
    the bottleneck attention linears qkv 864 x 288, w1 1536 x 288 (SwiGLU 2F x C), w2 288 x 768 and wo 288 x 288 (C 288, F 768). 3 Muon steps
    TF32 vs fp32: rel L2 of the parameters < 1e-2 (as tc()); then one step from p = 0, mom = 0, beta 0, lr 1, wd 0 on the TF32 path:
-   O = p / sqrt(max(1, Co / K)), O O^T (Co <= K) or O^T O ~ I as test_muon (max |diag - 1|, max |offdiag| < 0.35; the two wide convs on
+   O = p / sqrt(max(1, Co / K)), O O^T (Co <= K) or O^T O ~ I as test_muon (max |diag - 1| < 0.55 (the map's [0.682, 1.134] band squared, see the check), max |offdiag| < 0.35; the two wide convs on
    every 4th row and column of the Gram, to bound the host time). wo, square, is reported only (a random square gradient is ill-conditioned).
    6 matrices, not tc()'s 5: ns5_lt caches its host copy of the descriptor table by (pointer, count), and a freed table's address can come back */
 static void tc_try6(void) {
@@ -281,7 +281,11 @@ static void tc_try6(void) {
                 const int sq = Co == K;
                 printf("  muon-tc 2 try6 %-8s %4d x %5d: %s ~ I (rows step %d): max |diag - 1| %.3f, max |offdiag| %.3f%s\n", nm[i], Co, K, Co <= K ? "O O^T" : "O^T O", st,
                        wd, wo, sq ? " (square: reported only)" : "");
-                if (!sq) CHECK(wd < 0.35 && wo < 0.35, "tc2 try6 %s orthogonality: diag %.3f offdiag %.3f", nm[i], wd, wo);
+                /* the diagonal bound is the fixed map's own: 5 iterations land every singular value in [0.682, 1.134] (sigma0 >= 3e-3), so a row's |o|^2 lies in [0.465, 1.287]
+                   and |diag - 1| can reach 0.535. This test's gradient (rows scaled 1 / 2 / 3) packs the singular values against the 0.682 floor: fp64 / fp32 NS on the same
+                   matrix gives 0.470 (448 x 12096) and 0.475 (448 x 19872), the values the TF32 run printed (numpy reproduction of the generator, no TF32 involved), so 0.35 was
+                   a bound the map cannot meet here, not a TF32 error (the TF32-vs-fp32 3-step check above passed) */
+                if (!sq) CHECK(wd < 0.55 && wo < 0.35, "tc2 try6 %s orthogonality: diag %.3f offdiag %.3f", nm[i], wd, wo);
                 free(o); free(R);
             }
         }
