@@ -5145,6 +5145,14 @@ int cmd_train(int argc, char **argv) {
             g_ds_frac = (float)fmax(0.0, 1.0 - pr);
         }
         if (soft_end != sc.soft) sampler_set_soft(sp, sc.soft + (soft_end - sc.soft) * (step < steps ? (float)step / (float)steps : 1.f));
+        if (ng > 1 && cfg.gn_ema) {   /* --gn-ema, data parallel: every window's statistics were pooled into each replica's own running set; the replicas
+            now agree on their mean (finite sets only), so the saved set sees all windows and the constants match across cards (targeted/gnorm.md #3) */
+            const size_t cn = unet_gn_ema_count(G[0].u); float *av = malloc(cn * 4 * 2), *th = av + cn; int *cnt = calloc(cn, sizeof *cnt); double *sum = calloc(cn, sizeof *sum);
+            for (int q = 0; q < ng; q++) { nn_init(G[q].dev); unet_gn_ema_get(G[q].u, th); for (size_t i = 0; i < cn; i++) if (isfinite(th[i])) { sum[i] += th[i]; cnt[i]++; } }
+            for (size_t i = 0; i < cn; i++) av[i] = cnt[i] ? (float)(sum[i] / cnt[i]) : NAN;
+            for (int q = 0; q < ng; q++) { nn_init(G[q].dev); unet_gn_ema_put(G[q].u, av); }
+            free(av); free(cnt); free(sum);
+        }
         double gn = 0; int upd_now = 0;   /* (upd_now: this step's optimizer update number, 0 when no update) */
         for (int g = 0; g < ng; g++) {
             gpu_state *d = &G[g];

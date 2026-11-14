@@ -715,6 +715,25 @@ __global__ void ema_finite_k(float *e, const float *p, size_t n, float d, unsign
     if (__syncthreads_or(bad)) { if (!threadIdx.x && skips) atomicAdd(skips, 1u); return; }
     for (size_t i = threadIdx.x; i < n; i += blockDim.x) e[i] = d * e[i] + (1.f - d) * p[i];
 }
+/* gn_ema statistics, [mean G | var G] pairs per site (pv[i]: the index of i's mean when i is a variance slot, else -1): e <- d e + (1 - d) p,
+   and the variance slots additionally + d (1 - d) (e_mean - p_mean)^2: the EMA of the second moment minus the square of the EMA of the mean, i.e.
+   the variance of the POOLED windows (law of total variance), not the mean of the within-window variances (targeted/gnorm.md #1). Nothing
+   written when any p is non-finite (++*skips). One block, n <= 4096 */
+__global__ void gn_pool_k(float *e, const float *p, size_t n, const int *pv, float d, unsigned *skips) {
+    int bad = 0; float nv[4];
+    for (size_t i = threadIdx.x; i < n; i += blockDim.x) bad |= !isfinite(p[i]);
+    if (__syncthreads_or(bad)) { if (!threadIdx.x && skips) atomicAdd(skips, 1u); return; }
+    int k = 0;
+    for (size_t i = threadIdx.x; i < n && k < 4; i += blockDim.x, k++) {
+        float v = d * e[i] + (1.f - d) * p[i];
+        if (pv[i] >= 0) { const float dm = e[pv[i]] - p[pv[i]]; v += d * (1.f - d) * dm * dm; }
+        nv[k] = v;
+    }
+    __syncthreads();
+    k = 0;
+    for (size_t i = threadIdx.x; i < n && k < 4; i += blockDim.x, k++) e[i] = nv[k];
+}
+extern "C" void nn_gn_pool(float *e, const float *p, size_t n, const int *pv, float decay, unsigned *skips) { if (!n) return; gn_pool_k<<<1, 1024>>>(e, p, n, pv, decay, skips); KCHECK(); }
 extern "C" void nn_ema_finite(float *ema, const float *p, size_t n, float decay, unsigned *skips) { if (!n) return; ema_finite_k<<<1, 1024>>>(ema, p, n, decay, skips); KCHECK(); }
 __global__ void sum_k(const float *x, size_t n, float *out, int sq) {
     double s = 0;

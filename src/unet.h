@@ -240,6 +240,8 @@ void unet_set_l0_ema(unet *u, float mom, int warm);
    mom toward each training forward's batch statistics (the first replaces them; forwards with the EMA weights do not update); the first
    warm training forwards normalise with their own statistics, later ones and every inference forward (once there are statistics) with
    the running ones. Defaults 0.01, 500. unet_gn_ema_updates: training forwards so far (saved with the statistics) */
+size_t unet_gn_ema_count(unet *u); void unet_gn_ema_get(unet *u, float *h); void unet_gn_ema_put(unet *u, const float *h);   /* 3 x ns: run | rune | last window's */
+double unet_gn_ema_stale(unet *u); void unet_gn_ema_use_run(unet *u, int on);   /* worst per-site var ratio rune / run (max(r, 1 / r)); EMA weights with the live set */
 unsigned unet_gn_ema_skips(const unet *u);   /* gn_ema: training forwards whose non-finite batch statistics were not pooled */
 void unet_gn_ema_override(unet *u, float mom, int warm);   /* after unet_load: mom / warm >= 0 replace the checkpoint's (train --gn-ema-mom / -warm on a resume) */
 int unet_gn_ema_warm(const unet *u);
