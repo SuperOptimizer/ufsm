@@ -6,6 +6,36 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Unroll output quality vs the published 1667 unwrap; render / ink fixes (2026-11-14, branch urenderfix-20261114)
+
+Audit `/vesuvius/ufsm/audit-20261114/urender.md` (images in `urender/`). Its method is now `scripts/unroll/pubcmp.py`, a CPU check of a strip
+against a published unwrap.
+- **Correspondence:** each banner pixel goes to the published flattened grid, through the inverse of the r2 affine (held-out rms 0.77 vx), to
+  the nearest vertex of our stripes.
+- **Banner registration:** one of the 4 flips, chosen by FFT cross-correlation of the papyrus mask with our CT, plus a linear column drift.
+- **1667 dir +1 strip, renders inkr/inkpod-9000** (7.5 min, 30 GB cap):
+  - our surface is within 50 um of 71.5 % of the published px (median 24.5 um);
+  - banner = grid rotated 180 deg, +1 / -467 px, drift -0.016 / px; P(published papyrus | ours) 0.908;
+  - **direction FAIL:** local slope +3.38, global -3.50 of our columns per published px; 9.5 % of the 8-px steps are sheet hops. Inside every
+    published turn our strip runs backwards (the image side of the opposite handedness, unroll audit #1);
+  - **AUC against the published ink:** ink 0.514, CT 0.511 (589 k ink px), flat under +-0.5 mm shifts. That is the model, not the registration.
+- **Scale:** our flattening matches the 3-D surface within about 1 %. The published flat grid is 8.1 % / 4.5 % shorter than 3-D (along / across).
+
+Changes:
+- **`render --fill-ct` threshold:** with the default 1, only masked-zero CT was void, so the fill never recentred off unmasked air. On the 1667
+  renders 45-54 % of the flag-0 surface pixels have CT < 80 (31-42 % < 50), and the ink there is read in air (p95 98-133).
+  - The CLI default goes to 80 on unrollfix-20261114 (37dadf0, it owns the line); FILLCT=80 in unroll.sh (c9e4756); u1667ink GATE=1.
+  - test_render_fill: a threshold case (thr 201: sheet A counts as void, the gap bands move to sheet B).
+  - Post-pass GPU check: `scripts/unroll/urender_post.sh`.
+- **`ink-blend --q`** defaults to 0 (lossless). The inputs are already q-coded by predict; the old second lossy pass (32) stacked errors.
+- **strip-mosaic look flags** (default off; before / after in `urender/stretch_before_after.jpg`):
+  - `--ct-stretch-papyrus 1`: the CT window from pixels >= --ct-level only. On 1667 that is 80..224 instead of 1..202, where air set the low end.
+  - `--ink-fixed 1`: ink grey = probability, the same in every run and model, instead of the percentile stretch (9..232 on 1667).
+- **pubcmp.py gate:**
+  - fails when the local and global slopes differ in sign or more than 5 % of the steps jump;
+  - with renders, also fails when the ink AUC < CT AUC + 0.02;
+  - `--ink-gate c12,c13` scores the papyrus-gated ink.
+
 ## try6-shaped tests for the non-conv kernels (2026-11-14, branch kshape-20261114)
 
 The kernel audit (/vesuvius/ufsm/audit-20261114/kernels.md, #14-#18) found the try6 paths outside the conv kernels tested only at toy
@@ -385,6 +415,37 @@ sum |W|^2) and, for the Muon groups, the range of the per-matrix ratios.
 - Coordination with gns (gradient noise scale, `--accum auto`): the controllers here read only update / weight ratios and the weights'
   displacement, never the noise scale or the batch size. (c) and `--accum auto` both change the effective step, so they are not combined
   in an A/B.
+
+**DoG and momentum (fixed 2026-11-14 evening).** In the first A/B arm, DoG reached its cap (2x --muon-lr) by update ~10 and stayed there,
+with |x - x_0| growing linearly. Plain DoG assumes uncorrelated steps. Muon's directions are momentum outputs, correlated over
+~1 / (1 - beta) updates, so even on pure noise the displacement grows as sqrt(kappa G) with kappa = (1 + beta) / (1 - beta) (39 at
+beta 0.95), and DoG mistakes that for signal. G is now scaled by kappa: noise holds eta, and only drift beyond the momentum's own
+correlation grows it. test_admuon covers kappa 1 (the max branch) and 19.
+
+**Optimizer cost** (bench_muonx, 103 M net, RTX PRO 4000, ms per update): `--muon-tc 2` 36.9; with a stats step 39.6; + NorMuon 39.2;
++ lars 37.7; + dog 39.4; + all three 42.1 (+5.1 ms, 14 % of the optimizer, < 0.2 % of a try6 update). dog adds 392 MB of displacement
+per GPU.
+
+**A/B** (perf pod, scripts/opt/admuon_ab.sh + admuon_queue.sh)
+- Setup: the scratch2 net single card, P 512, wind fixture (the only pod-legal data), --init-from try6's snap/1000.ckpt, --det 1 seed 7
+  (the same windows in every arm), --accum 5 (400 updates of 5 windows), Muon 0.006 / AdamW 6e-4, WSD warmup 50, cooldown 0.2, and
+  try6's XFLAGS.
+- A first control without `--gn-ema-warm 1e9` blew up after the GN-EMA switch at step 501 (gn 9 -> 98, loss 1.27 -> 5.6 by step 630).
+- Compared: per log line (10 windows) paired against the control on the same windows; block-bootstrap 95 % CI.
+
+| arm | loss | phase | rv | normal | wind4 | acc | ink | gn mean / max |
+|---|---|---|---|---|---|---|---|---|
+| muon (control), windows 1521-1920 | 1.2326 | 0.3969 | 0.0143 | 0.4328 | 0.4457 | 0.919 | 0.2772 | 2.8 / 9.5 |
+| adaptive, uncorrected DoG (pinned at 2x lr), paired diff | -0.0161 [-0.0176, -0.0153] | -0.0046 [-0.0058, -0.0036] | -0.0031 | -0.0022 | -0.0153 [-0.0184, -0.0126] | +0.008 | -0.0024 | 1.4 / 4.8 |
+
+- The adaptive arm was better on all 40 log lines of the window. The gap opens after window ~500 (-0.023 over 501-1000).
+- The arm was cut at window 1920 of 2000: main took the pod's GPU lock for a merge pass.
+- Its update / weight ratio was ~3x the control's: L0 6e-3 vs 1.7e-3, deeper convs 7e-3 vs 2.7e-3, attention 8e-3 vs 5e-3.
+- Control ratios at try6's LR: L0 1.7e-3, deeper convs 2.7e-3 (per matrix 1.2e-3 .. 4e-3), attention 5e-3, heads 1.5e-3, AdamW 5e-4.
+- The lower gn may come from the scale-invariant layers' weights growing faster (their gradients scale as 1 / |W|), not from extra
+  stability.
+- Still to run: control at 2x lr (muon2x), NorMuon alone, lars alone, the corrected DoG alone and in the adaptive set, and a seed-8
+  control.
 ## Sampler GPU work vs the training stream; the pair rule on both cards (2026-11-14, branch w4stream-20261114)
 
 **The w4 context stream was blocking.** Training kernels launch on the legacy default stream (no stream argument, no per-thread
