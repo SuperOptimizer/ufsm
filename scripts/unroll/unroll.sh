@@ -159,7 +159,8 @@ mstage() {
     ref)    mset dir "$(jq -r .dir $REF/model.json 2> /dev/null)"; mset ref_line "$(lastline '^count-field: .*dir [+-]' $O/logs/ref.log)"
             mset dir_vote_line "$(lastline 'dir.*(vote|rings|default)' $O/logs/ref.log)";;
     slabs)  mset slab_ref_coherence "$(for d in $O/slabs/s???; do c=$(lastline 'U_ref - phase' $d/fit.log | grep -oE 'coherence [0-9.]+' | cut -d' ' -f2); printf '%s:%s ' ${d##*/} ${c:-na}; done)";;
-    join)   mset join_agreement "$(lastline 'integer agreement on the overlaps' $O/logs/join.log | sed 's/^ *//')";;
+    join)   mset join_agreement "$(lastline 'integer agreement on the overlaps' $O/logs/join.log | sed 's/^ *//')"; mset join_gauges "$(lastline '^fit-join: gauges' $O/logs/join.log)"
+            grep -q 'fit-join: WARNING slab' $O/logs/join.log && log "join: $(grep -c 'fit-join: WARNING slab' $O/logs/join.log) slabs with an unconstrained gauge (no ref, no overlap cells; logs/join.log)";;
     check)  mset wrapcheck "$(lastline '^wrap-check: verdicts' $O/logs/check.log)";;
     trim)   mset strip_args "$(cat $O/state/strip.args)"; mset trim "$(grep -h '^[0-9-]* [0-9:]* trim: ' $O/progress.log | tail -3 | cut -d' ' -f3- | cut -c1-600 | tr '\n' '|')";;
     stripflat) mset stripflat "$(lastline '^strip-flatten: flattened' $O/logs/stripflat.log)";;
@@ -603,18 +604,18 @@ stripimg() {
     [ -e $ST/img_fill/overview.jpg ] && log "stripimg: $(grep '^strip-mosaic: .* overview' $ST/logs/mosaic_fill.log | head -1)"
 }
 # --- per-wrap renders (p4full3.sh) and faces ---
-pw_one() {   # pw_one WRAP GPU (a background subshell: the cache env stays in it)
-  zcon; local w=$1 gpu=$2 L=$O/logs/pw/$1 nv dc d=$O/r/$1
-  nv=$(stat -c %s $O/wraps/$w.sfc); dc=$(awk -v n=$nv -v m=1500000 'BEGIN { d = 1; while (n / (d * d) > m) d++; print d }')
+pw_one() {   # pw_one WRAP GPU (a background subshell: the cache env stays in it); the wraps the strip uses (wraps_snap with SNAP=1, audit 11-14 #12)
+  zcon; local w=$1 gpu=$2 L=$O/logs/pw/$1 nv dc d=$O/r/$1 WD=$(wrapsdir)
+  nv=$(stat -c %s $WD/$w.sfc); dc=$(awk -v n=$nv -v m=1500000 'BEGIN { d = 1; while (n / (d * d) > m) d++; print d }')
   if [ ! -e $O/flat/$w/x.tif ]; then
-    nice -n 10 $U tifxyz-scale $O/wraps $O/orig 1 --wraps $w > $L.scale.log 2>&1 || return 1
+    nice -n 10 $U tifxyz-scale $WD $O/orig 1 --wraps $w > $L.scale.log 2>&1 || return 1
     rm -rf $O/flat/$w
     CUDA_VISIBLE_DEVICES=$gpu nice -n 10 $U flatten $O/orig $O/flat --wraps $w --decim $dc --threads ${FTH:-4} --crop none --gpu 1 > $L.flat.log 2>&1 || return 1
   fi
   nice -n 10 $U tifxyz-scale $O/flat $O/up 1 --wraps $w --flip-rows 1 > /dev/null 2>&1 || return 1
   mkdir -p $d/in; ln -sfn $O/up/$w $d/in/$w
   UFSM_RENDER_MEM=16 UFSM_RENDER_CHUNKED=1 UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} CUDA_VISIBLE_DEVICES=$gpu nice -n 10 $U render $d/in $d --volume $INK $LUM --ct $R $K/$LV --depth 1 --scale 1 --threads ${RTH:-8} > $d/render.log 2>&1 || return 1
-  nice -n 10 $U ink-compare $O/img/${w}_full_side.jpg --ct $d/${w}_ct.tif --ink "ift3=$d/$w.tif" --px-um $LUM --stretch --stretch-ct --max-px 65000 --threads ${RTH:-8} \
+  nice -n 10 $U ink-compare $O/img/${w}_full_side.jpg --ct $d/${w}_ct.tif --ink "$INKNAME=$d/$w.tif" --px-um $LUM --stretch --stretch-ct --max-px 65000 --threads ${RTH:-8} \
     --then $O/prev/${w}_side.jpg --max-px 8000 > $d/stats.txt 2>&1
   [ -e $O/img/${w}_full_side.jpg ] && rm -f $d/$w.tif $d/${w}_ct.tif
   echo "$(date '+%F %T') $w $(grep -E '^[^ ]+: input' $L.flat.log | head -1 | grep -oE '= [0-9.]+ cm2')" >> $O/logs/perwrap.list
@@ -622,13 +623,15 @@ pw_one() {   # pw_one WRAP GPU (a background subshell: the cache env stays in it
 perwrap() {
   [ "$DRY" = 1 ] && { echo "    per wrap (largest first, SPAR ${SPAR:-4}, GPUs of FITGPUS in turn): tifxyz-scale -> flatten --gpu 1 -> tifxyz-scale --flip-rows 1 -> render (ink + CT) -> ink-compare --then"; return 0; }
   mkdir -p $O/orig $O/flat $O/up $O/r $O/img $O/prev $O/logs/pw
-  local w k=0 rc=0 pg=($FITGPUS)
-  for w in $(for f in $O/wraps/w*.sfc; do w=$(basename $f .sfc); [ -e $O/img/${w}_full_side.jpg ] || echo "$(stat -c %s $f) $w"; done | sort -rn | awk '{print $2}'); do
+  local w k=0 nf=0 p pg=($FITGPUS) WD=$(wrapsdir); local -A pid
+  for w in $(for f in $WD/w*.sfc; do w=$(basename $f .sfc); [ -e $O/img/${w}_full_side.jpg ] || echo "$(stat -c %s $f) $w"; done | sort -rn | awk '{print $2}'); do
     stopped && break
     while [ $(jobs -r | wc -l) -ge ${SPAR:-4} ]; do sleep 5; done; memok
-    pw_one $w ${pg[$((k % ${#pg[@]}))]} & k=$((k + 1))
-  done; wait
-  echo "perwrap: $(ls $O/img/*_full_side.jpg 2>/dev/null | wc -l) wraps rendered" >> $O/logs/perwrap.log
+    pw_one $w ${pg[$((k % ${#pg[@]}))]} & pid[$w]=$!; k=$((k + 1))
+  done
+  for w in "${!pid[@]}"; do wait ${pid[$w]} || { nf=$((nf + 1)); echo "perwrap: $w FAILED (logs $O/logs/pw/$w.*, $O/r/$w/render.log)" >> $O/logs/perwrap.log; }; done   # (each job's rc, audit 11-14 #12)
+  echo "perwrap: $(ls $O/img/*_full_side.jpg 2>/dev/null | wc -l) wraps rendered from $WD, $nf of $k failed" >> $O/logs/perwrap.log
+  [ $nf = 0 ]
 }
 faces() {
   [ "$DRY" = 1 ] && { echo "    ufsm faces per flattened wrap ($O/flat) -> $O/faces (faces_p4e.sh recipe)"; return 0; }
