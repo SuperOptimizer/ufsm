@@ -6,6 +6,39 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The 1667 unroll against the published full unwrap (2026-11-14, branch pub1667-20261114)
+
+The Vesuvius Challenge published its full PHerc1667 unwrap (2026-06-25) as one continuous tifxyz,
+`s3://vesuvius-challenge-open-data/PHerc1667/segments/20260612121456-w011_20260108140509268_merged_v4_flatboi_straightened_v4/mesh/`,
+expressed on several scans; `...-on-20251217075048-2.399um.tifxyz` is on our scan's level-0 grid (2061 x 30097, 20 voxel = 48 um
+grid; `-t2` is the same surface at 66 voxels, t2 vs full nearest 21 um median = the grid spacing). Local copy
+`/vesuvius/ufsm/gt/pub1667-unwrap/`, comparison `/vesuvius/ufsm/gt/pub1667-cmp/full`, images `/vesuvius/ufsm/previews-20261114/pub1667/`.
+Tools (CPU, Python): `scripts/pub1667/surfcmp.py` (KD-tree point-to-plane distances both ways, per published turn / our wrap,
+sheet identity per vertex), `ctmask.py` (split by the masked CT under the surface), `viz_flat.py` (distance / sheet maps on the
+published grid), `xsec.py` (CT slices with both surfaces). Ours = `wraps_snap` (u1, level 2) via `ufsm wrap-dump --grid-um 2.399`.
+
+| | published | ours (strip w000-w039) |
+|---|---|---|
+| turns / wraps | 31.06 turns, r 3.9-11.3 mm | 40 strip wraps (80 in wraps_snap, w-17..w062) |
+| length / area | 140.0 cm / 1195 cm2 | 157.7 cm / 1218 cm2 valid |
+
+- Coverage of the published surface by any of our wraps: 0.785 / 0.860 / 0.893 at 50 / 100 / 200 um, distance median 19 um,
+  p90 272 um; signed (ours - published, along the outward normal, matched vertices) median +4 um, p10 / p90 -30 / +35 um: the same face.
+  On CT (89 % of the published area; 11 % = 131 cm2 lies where the masked CT is 0): 0.879 / 0.959 / 0.986, median 17 um.
+  Off CT: 0.05 at 100 um. The misses are the outer 6 turns (published turns 24-30, r 10.4-11.3 mm, 26-59 % of their area on
+  masked-out CT; our w040-w062 pile up at the mask edge, r 10.75-11.36 mm) and the inner end of each turn's top/bottom z edge.
+- The reverse: 0.70 / 0.79 / 0.85 of our strip vertices within 50 / 100 / 200 um of the published surface. Our w000-w011
+  (r 0.5-3.6 mm, ~13 cm of strip length) lie inside the published surface's first turn (median 0.2-2.3 mm away): the umbilicus
+  core, mostly no papyrus in the CT slices. w012-w034 cover the published turns 0-23 one to one (cov100 0.85-0.97, median 14-23 um).
+- Wrap matching: w(12 + k) <-> published turn k for all k = 0..30, no skipped or merged wrap in the ordering.
+- Sheet identity is where it disagrees: per matched vertex, our wrap id against the published sheet index along the axis ray
+  (`off`): same sheet 0.48, our id +1 0.31, +2 0.12, -1 0.03 (d median 15 / 15 / 17 / 24 um: locally both are on papyrus). The
+  +1 / +2 areas are angular sectors (about -180..-50 deg about the axis) repeated in every turn over the whole z range. The local
+  gap to the next of our wraps is the same in both (median 159 vs 152 um), so it is not dense-bundle ambiguity; CT slices at the
+  sector boundaries show our wraps crossing the wide delamination voids diagonally (`example_void_crossing_z18160.png`, w020)
+  while the published surface stays on papyrus: our winding field puts the turn step inside the voids. Locally our surface is on
+  a papyrus sheet, but the strip switches to the neighbouring sheet twice per turn.
+
 ## Sampler GPU work vs the training stream; the pair rule on both cards (2026-11-14, branch w4stream-20261114)
 
 **The w4 context stream was blocking.** Training kernels launch on the legacy default stream (no stream argument, no per-thread
