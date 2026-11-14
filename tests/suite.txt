@@ -313,3 +313,4 @@ test_mesh_phase                                | gpu          |     8 | tests/te
 test_lldec                                     | gpu,smoke    |     3 | ./$B/test_lldec $TMPDIR/lldec
 test_echo                                      | gpu          |    40 | tests/test_echo.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/echo
 test_lab_early_split                           | gpu          |    40 | tests/test_lab_early_split.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/labearlysplit
+test_split_ab                                  | gpu2,slow    |   150 | tests/test_split_ab.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/splitab

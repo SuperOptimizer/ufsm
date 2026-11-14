@@ -4822,7 +4822,7 @@ int cmd_train(int argc, char **argv) {
         if (getenv("UFSM_GRAD_DUMP") && step == 1) {   /* tests: the first step's summed parameter gradient (fp32) and loss to a file, then exit (split vs one GPU A/B) */
             nn_init(G[0].dev); float *hg = malloc(np * 4); nn_sync(); unet_grad_d2h(G[0].u, hg); FILE *f = fopen(getenv("UFSM_GRAD_DUMP"), "wb");
             if (f) { fwrite(&loss, sizeof loss, 1, f); fwrite(hg, 4, np, f); fclose(f); } free(hg);
-            fprintf(stderr, "UFSM_GRAD_DUMP: step 1 loss %.9g, %zu gradients to %s\n", loss, np, getenv("UFSM_GRAD_DUMP")); exit(0);
+            fprintf(stderr, "UFSM_GRAD_DUMP: step 1 loss %.9g, %zu gradients to %s (gfilm block from %zu)\n", loss, np, getenv("UFSM_GRAD_DUMP"), cfg.gfilm ? unet_gfilm_off(G[0].u) : np); exit(0);
         }
         if (G[0].gc_on) { nn_init(G[0].dev); gc_report(&G[0], step); G[0].gc_on = 0; }
         if (g_uw) { double L[SH_N]; uw_mean(G, nl, L); uw_step(L); }   /* the s_h step: the GPUs' mean unscaled head losses */
