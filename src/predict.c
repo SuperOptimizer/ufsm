@@ -18,6 +18,7 @@
 #include "unet.h"
 #include "fit.h"
 #include "tta.h"
+#include "attn.h"
 #include "view.h"
 #include "sweep.h"
 #include "z3w.h"
@@ -1360,7 +1361,8 @@ static int predict_one(int argc, char **argv) {
                         "                        rv (recto / verso fused), ink, fib (fib/H, fib/V, fib/dyad/c2..c7, fib/fam), cN (channel N), all; with --fit-zarr too\n"
                         "       [--fit-fields DIR] [--fit-h 8]   task unwrap checkpoints: also the winding fitter's input fields of the box (ufsm fit DIR)\n"
                         "       [--fit-zarr DIR]                 the same fields as zarr arrays, flushed slab by slab (whole volumes)\n"
-                        "       [--tta K]   the fit fields, or without --fit-*: the probability, averaged over K window symmetries (z / y / x flips, y <-> x swap; 1..12, src/tta.h)\n"
+                        "       [--attn-lscale N0]   attention logits x max(1, ln S / ln N0) for S > N0 bottleneck tokens (N0 = the trained count, 216 at P 768; larger windows)\n"
+"       [--tta K]   the fit fields, or without --fit-*: the probability, averaged over K window symmetries (z / y / x flips, y <-> x swap; 1..12, src/tta.h)\n"
                         "       [--view-level L] [--view-map REG.json]   scan-fusion checkpoints (view_P): the view crop per window from level L of this scan\n"
                         "                   or, with a map, the registered partner scan on this scan's level-L grid (use the training window size)\n"
                         "       [--fit-w4-d 32]   task unwrap2 checkpoints: the winding mod 4 relative planes dz dy dx dq over this many voxels (<= the halos)\n"
@@ -1837,6 +1839,13 @@ static int predict_one(int argc, char **argv) {
     axis ax = {0};
     if (axisf && axis_load(&ax, axisf)) { fprintf(stderr, "cannot load axis %s\n", axisf); return 1; }
     double um_l = um * (1 << level), scale = (double)(1 << level);
+    { const float ls = (float)atof(opt(argc, argv, "--attn-lscale", "0")); if (ls > 1.f) at_set_lscale(ls); }   /* tokens the net was trained on (216 at P 768; audit attn #2) */
+    if (unet_cfg_axis(&cfg) && !ax.n) {   /* the PE / radial attention would silently fall back to grid indices (audit attn 11-14 #1) */
+        if (!ufsm_env_on("UFSM_PRED_NO_AXIS_OK")) { fprintf(stderr, "predict: this checkpoint uses the scroll axis (--attn-pe scroll / --attn-axis radial / deform-init normal): --axis is required "
+                                                                    "(UFSM_PRED_NO_AXIS_OK=1 to run with grid-index positions anyway)\n"); return 2; }
+        fprintf(stderr, "predict: WARNING no --axis: the scroll PE runs on grid-index positions (UFSM_PRED_NO_AXIS_OK)\n");
+    }
+    if (sweep_out && unet_cfg_axis(&cfg)) { fprintf(stderr, "predict: --cond-sweep does not set the attention stage's scroll axis; not supported with a scroll-axis checkpoint\n"); return 2; }
     if (sweep_out) {   /* conditioned inference: its own window loop and outputs (src/sweep.c) */
         if (split || ngpu > 1 || !box || !ax.n) { fprintf(stderr, "predict: --cond-sweep runs on one GPU over a --box, with --axis\n"); return 2; }
         if (!win_given) { W = 128; halo = 32; }

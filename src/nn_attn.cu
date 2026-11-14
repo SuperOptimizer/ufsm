@@ -568,7 +568,11 @@ static const at_geom *att_geom(const at_dims *d, const at_geom *g, at_geom *gr) 
     *gr = (at_geom){R->n * R->Q, R->Nr, 1, 1, R->Nr, R->lens, d->rope == 2 ? R->pos : nullptr, nullptr};
     return gr;
 }
-static int att_core(const at_geom *g) { const int c = at_get_core(); return c == 2 && g->rays ? 1 : c; }   /* (MX-fp8 has no ray lengths: fp16) */
+static int att_core(const at_geom *g) {
+    const int c = at_get_core() == 2 && g->rays ? 1 : at_get_core();
+    if (c != 1 && at_get_lscale() > 0.f) { fprintf(stderr, "attention: --attn-lscale / UFSM_ATTN_LSCALE needs the fp16 tensor-core core (UFSM_ATTN_CORE=1)\n"); abort(); }
+    return c;
+}   /* (MX-fp8 has no ray lengths: fp16) */
 extern "C" int at_block_fwd(const at_dims *d, const float *P, const at_bp *bp, const float *x, float *y, const at_geom *g, at_ws *w) {
     if (at_get_mx() == 16 && at_block_h16_ok(d, g, w)) return at_block_fwd_h16(d, P, bp, x, y, g, w, 0);
     const long T = (long)g->nseq * g->S; const int C = d->C, F = d->F; const double t = (double)T;
