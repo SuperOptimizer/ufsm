@@ -143,14 +143,14 @@ int main(void) {
                     nn_zero(dacc, 64); nn_fibn(dls, ns, dfib, D, H, W, z0, z1, r, thr, nullptr, dacc, nullptr, nullptr, 0, 0);
                     double a2[2]; nn_d2h(a2, dacc, sizeof a2); double c2; const double s2 = host_sum(fib, ls, D, H, W, z0, z1, r, thr, &c2);
                     printf("%d slabs, slab %d..%d: %g valid voxels (host %g), sum t^T N t %.5f (host %.5f)\n", nsl, z0, z1, a2[0], c2, a2[1], s2);
-                    CHECK(fabs(a2[0] - c2) <= 0.01 * c2 + 2 && c2 > 0, "slab %d: valid voxels %g, host %g", s, a2[0], c2);
+                    CHECK(fabs(a2[0] - c2) <= 0.01 * c2 + 2, "slab %d: valid voxels %g, host %g", s, a2[0], c2);   /* (a slab may hold none of the tube) */
                     CHECK(c2 == 0 || fabs(a2[1] - s2) < 2e-3 * fabs(c2) + 1e-3, "slab %d: sum %g, host %g", s, a2[1], s2);
                     tc += a2[0]; ts += a2[1]; hc += c2; hs += s2;
                     nn_free(dls); free(ls); free(lh); free(pz);
                 }
                 printf("%d slabs: %g valid voxels in all, whole window %g\n", nsl, tc, a0[0]);
                 CHECK(fabs(tc - a0[0]) <= 0.001 * a0[0] + 1 && fabs(ts - a0[1]) < 2e-3 * fabs(a0[0]) + 1e-3, "%d slabs: %g voxels / sum %g against the whole window's %g / %g (seams must not drop voxels)", nsl, tc, ts, a0[0], a0[1]);
-                (void)hc; (void)hs;
+                CHECK(hc > 0, "%d slabs: the host found no valid voxel at all", nsl);
             }
             nn_h2d(dfib, fib, n);
         }
