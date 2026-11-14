@@ -136,14 +136,16 @@ fi
   fi
   blk fit && echo "== TRAINING-FIT block (every label below is in the net's training: convergence / head interference, not generalisation)"
   if has wind && [ -s $WB/res/$T.tsv ]; then echo "-- wind, training-fit: wbench core rows $(($(wc -l < $WB/res/$T.tsv) - 1))"
-    for r in $REFS; do [ -s $WB/res/$r.tsv ] && { echo "   vs $r"; $B wbench-stats $WB/res/$r.tsv $WB/res/$T.tsv --metric p05x,ids 2>&1 | grep -E '^(p05x|ids) '; }; done
+    for r in $REFS; do [ -s $WB/res/$r.tsv ] && { echo "   vs $r (diff = $T - $r, as the unseen block's B - A)"; $B wbench-stats $WB/res/$T.tsv $WB/res/$r.tsv --metric p05x,ids 2>&1 | grep -E '^(p05x|ids) '; }; done
     [ -z "$REFS" ] && $B wbench-stats $WB/res/$T.tsv --metric p05x,ids 2>&1 | grep -E '^(p05x|ids) '; fi
   has rv && { echo "-- rv, training-fit (turns per GT turn / share of intervals off >= 0.5 turn)"; for s in $RVSC; do echo "   $s $(grep -E '^ +all' $RVE/$T/$s/ruler.log 2>/dev/null | tail -1)"; done; }
   if has ink && [ -s $E/$T/ink/vscores.tsv ]; then echo "-- ink, training-fit (3-D AUC / best F1, $([ ${BLEND:-1} = 1 ] && echo 2-pass blend || echo single pass); every crop's labels are in training)"
     awk -F'\t' -v t=$T '{ s = ($1 ~ /^w[0-9]/) ? "PHercParis4" : substr($1, 1, index($1, "_w") - 1); c[s]++; A[s] += $6; F[s] += $8; n++; AA += $6; FF += $8 }
       END { printf "%-16s  training-fit ink:", t; split("PHercParis4 PHerc0139 PHerc1667 PHerc0500P2 PHerc0841", o, " ")
         for (i = 1; i <= 5; i++) if (c[o[i]]) printf "  %s %.3f/%.3f", o[i], A[o[i]] / c[o[i]], F[o[i]] / c[o[i]]; printf "  all%d %.3f/%.3f\n", n, AA / n, FF / n }' \
-      $E/$T/ink/vscores.tsv | tee $E/$T/ink-row.txt; fi
+      $E/$T/ink/vscores.tsv | tee $E/$T/ink-row.txt
+    python3 -I $H/scripts/univ/inkci.py $E/$T/ink/vscores.tsv | sed 's/^/   /'
+    for r in $REFS; do [ -s $E/$r/ink/vscores.tsv ] && { echo "   vs $r"; python3 -I $H/scripts/univ/inkci.py $E/$T/ink/vscores.tsv $E/$r/ink/vscores.tsv | sed 's/^/   /'; }; done; fi
   has fib && { echo "-- fib, training-fit (fiber-judge vs the phase GT)"; for f in $E/$T/fib/*.judge; do [ -s $f ] && sed "s|^|   $(basename $f .judge) |" $f; done; }
 } > $E/$T.ueval.txt
 [ -s $E/$T/ink-row.txt ] && while IFS= read -r l; do grep -qxF "$l" $E/ink-rows.txt 2>/dev/null || echo "$l" >> $E/ink-rows.txt; done < $E/$T/ink-row.txt

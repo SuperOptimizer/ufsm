@@ -157,9 +157,10 @@ fi
   [ -s $E/$T/ink/scores.tsv ] && { echo "-- ink (ink-score vs human labels: crop map n inkfrac f1best thr f1_05 prec05 rec05 auc)"; cat $E/$T/ink/scores.tsv
     awk -F'\t' '{n++; f+=$5; a+=$10} END {if (n) printf "mean over %d crops: f1best %.4f auc %.4f\n", n, f / n, a / n}' $E/$T/ink/scores.tsv; }
     [ -s $E/$T/ink/vscores.tsv ] && echo "-- ink voxelwise (ink-vscore vs 3-D ink-splat refs: crop P N known_frac ink_share auc thr f1best f1_05 prec05 rec05)" && cat $E/$T/ink/vscores.tsv && awk -F"\t" "{n++; a+=\$6; f+=\$8} END {if (n) printf \"voxelwise vs 3-D refs over %d crops: auc %.4f f1best %.4f\\n\", n, a / n, f / n}" $E/$T/ink/vscores.tsv;
-    # per scroll (crop names: w.. = Paris 4, else SCROLL_w..): held-out rows named for what the trunk saw (INKSEEN "SCROLL=label ...")
+    # per scroll (crop names: w.. = Paris 4, else SCROLL_w..): held-out rows named for what the trunk saw (INKSEEN "SCROLL=label ...") (no default since 11-14: 0500P2 / 0841 are training sources of scratch1, eval audit #1; set it per checkpoint)
+    [ -s $E/$T/ink/vscores.tsv ] && python3 -I $H/scripts/univ/inkci.py $E/$T/ink/vscores.tsv   # (bootstrap CIs over label segments, F1 above its all-ink floor)
     for f in scores:5:10 vscores:8:6; do IFS=: read -r fn fc ac <<< "$f"; [ -s $E/$T/ink/$fn.tsv ] || continue
-      awk -F'\t' -v fc=$fc -v ac=$ac -v lab="${INKSEEN:-PHerc0500P2=unseen-ink-labels,seen-CT PHerc0841=unseen-scroll}" -v w=$fn 'BEGIN {n = split(lab, L, " "); for (i = 1; i <= n; i++) { split(L[i], kv, "="); D[kv[1]] = kv[2] } }
+      awk -F'\t' -v fc=$fc -v ac=$ac -v lab="${INKSEEN:-}" -v w=$fn 'BEGIN {n = split(lab, L, " "); for (i = 1; i <= n; i++) { split(L[i], kv, "="); D[kv[1]] = kv[2] } }
         { s = ($1 ~ /^w[0-9]/) ? "PHercParis4" : substr($1, 1, index($1, "_w") - 1); c[s]++; F[s] += $fc; A[s] += $ac }
         END { for (s in c) printf "%s per scroll %-12s %-28s n %2d auc %.4f f1best %.4f\n", w, s, (s in D) ? D[s] : "", c[s], A[s] / c[s], F[s] / c[s] }' $E/$T/ink/$fn.tsv | sort; done
   if [ -s $E/$T/reslog.line ] && [ -s ${RESLOG:-/workspace/univA/u2.log} ]; then   # (step lines: '... X samp/s Y Mvox/s')
