@@ -37,4 +37,5 @@ PY
   fi
 done
 awk -F'\t' '{n++; a+=$6; f+=$8} END {if (n) printf "3-D mean over %d crops: AUC %.4f best F1 %.4f\n", n, a / n, f / n}' $o/vscores.tsv
+python3 -I $(dirname $(readlink -f $0))/segci.py $o/vscores.tsv 6 8   # (AUC, best F1: CIs by segment; audit eval#20)
 [ -s $o/scores.tsv ] && awk -F'\t' '{n++; f+=$5; a+=$10} END {if (n) printf "2-D mean over %d crops: f1best %.4f auc %.4f\n", n, f / n, a / n}' $o/scores.tsv
