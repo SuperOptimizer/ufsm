@@ -72,25 +72,34 @@ static void mc_free(void *vp) {
    load and ~7 GB of heap per process). <dir>/.meshcodes-<16 hex>.pack, or under $UFSM_MESHCODES_CACHE when set (a read-only meshes dir);
    UFSM_MESHCODES_CACHE=off: none. The key names every input (each mesh's four TIFFs with size and mtime, the value name, the map file
    with size and mtime, this layout's version); a pack whose stored key differs is rebuilt. Written to a temporary name and renamed.
-   Layout (8-byte aligned): "UFMC0001", u64 key length, u64 meshes, u64 tiles, key, {i32 w, i32 h} per mesh, tiles, then per mesh xyz
+   Layout (8-byte aligned): "UFMC0002" (0001: the v1 key, rebuilt), u64 key length, u64 meshes, u64 tiles, key, {i32 w, i32 h} per mesh, tiles, then per mesh xyz
    (12 n bytes), val (4 n), valid (n). */
 #define MC_AL(x) (((x) + 7) & ~(size_t)7)
+#if __has_include("label_versions.h")
+#include "label_versions.h"
+#endif
+#ifndef LBL_MESHCODES_LOAD
+#define LBL_MESHCODES_LOAD 2   /* (label_versions.h, dckey-20261114: 2 = the pack key with the mesh dir and ns mtimes) */
+#endif
+/* the pack key: LBL_MESHCODES_LOAD, the mesh dir's realpath (two sets with the same mesh names / sizes / mtimes, copies or tests, shared one
+   pack before: the second read the first one's meshes), per mesh its tifxyz files' size + mtime in ns (st_mtim: a rewrite within the same
+   second changed nothing in the key), and the map's realpath / size / mtime with its field */
 static void mc_key(char *k, size_t nk, const char *dir, char **names, int nn, const char *value, const char *mapp) {
-    /* v2 (2026-11-14 datafix): the mesh dir's realpath is in the key: two sets with the same mesh names, sizes and mtimes (copies,
-       tests) had shared one pack, so the second set read the first one's meshes */
     char drp[4200]; if (!realpath(dir, drp)) snprintf(drp, sizeof drp, "%s", dir);
-    size_t u = (size_t)snprintf(k, nk, "meshcodes pack v2|dir %s|value %s|", drp, value); struct stat st;
+    size_t u = (size_t)snprintf(k, nk, "meshcodes pack v%d|dir %s|value %s|", LBL_MESHCODES_LOAD, drp, value); struct stat st;
+#define MC_NS(s_) (long long)(s_).st_mtim.tv_sec, (long long)(s_).st_mtim.tv_nsec
     for (int i = 0; i < nn && u < nk; i++) { u += (size_t)snprintf(k + u, nk - u, "%s", names[i]);
         const char *f[4] = {"x.tif", "y.tif", "z.tif", value};
         for (int a = 0; a < 4 && u < nk; a++) { char p[2400]; snprintf(p, sizeof p, "%s/%s/%s", dir, names[i], f[a]);
             if (stat(p, &st)) memset(&st, 0, sizeof st);
-            u += (size_t)snprintf(k + u, nk - u, ":%lld.%lld", (long long)st.st_size, (long long)st.st_mtime); }
+            u += (size_t)snprintf(k + u, nk - u, ":%lld.%lld.%09lld", (long long)st.st_size, MC_NS(st)); }
         if (u < nk) u += (size_t)snprintf(k + u, nk - u, "|"); }
     if (mapp && *mapp && u < nk) { char rp[4200]; if (!realpath(mapp, rp)) snprintf(rp, sizeof rp, "%s", mapp);
         if (stat(rp, &st)) memset(&st, 0, sizeof st);
-        char fp[4300]; snprintf(fp, sizeof fp, "%s", rp); char *sl = strrchr(fp, '/'); struct stat sf; long long fs = 0, fm = 0;   /* (the field beside reg.json) */
-        if (sl) { snprintf(sl + 1, sizeof fp - (size_t)(sl + 1 - fp), "field.f32"); if (!stat(fp, &sf)) { fs = sf.st_size; fm = sf.st_mtime; } }
-        snprintf(k + u, nk - u, "map %s:%lld.%lld:field %lld.%lld", rp, (long long)st.st_size, (long long)st.st_mtime, fs, fm); }
+        char fp[4300]; snprintf(fp, sizeof fp, "%s", rp); char *sl = strrchr(fp, '/'); struct stat sf; memset(&sf, 0, sizeof sf);   /* (the field beside reg.json) */
+        if (sl) { snprintf(sl + 1, sizeof fp - (size_t)(sl + 1 - fp), "field.f32"); if (stat(fp, &sf)) memset(&sf, 0, sizeof sf); }
+        snprintf(k + u, nk - u, "map %s:%lld.%lld.%09lld:field %lld.%lld.%09lld", rp, (long long)st.st_size, MC_NS(st), (long long)sf.st_size, MC_NS(sf)); }
+#undef MC_NS
 }
 static uint64_t mc_hash(const char *s) { uint64_t h = 1469598103934665603ull; for (; *s; s++) { h ^= (uint8_t)*s; h *= 1099511628211ull; } return h; }
 static int mc_pack_path(char *out, size_t n, const char *dir, const char *key) {
@@ -102,7 +111,7 @@ static int mc_pack_write(const mc_ctx *X, const char *path, const char *key) {
     FILE *f = fopen(tmp, "wb"); if (!f) return -1;
     const uint64_t hd[3] = {strlen(key), (uint64_t)X->nm, X->nt}; const char z8[8] = {0}; int ok = 1;
 #define MC_W(p, n) do { const size_t n_ = (n); ok = ok && fwrite((p), 1, n_, f) == n_ && fwrite(z8, 1, MC_AL(n_) - n_, f) == MC_AL(n_) - n_; } while (0)
-    MC_W("UFMC0001", 8); MC_W(hd, sizeof hd); MC_W(key, hd[0]);
+    MC_W("UFMC0002", 8); MC_W(hd, sizeof hd); MC_W(key, hd[0]);
     for (int i = 0; i < X->nm; i++) { const int32_t wh[2] = {X->m[i].w, X->m[i].h}; MC_W(wh, 8); }
     MC_W(X->t, X->nt * sizeof *X->t);
     for (int i = 0; i < X->nm; i++) { const size_t n = (size_t)X->m[i].w * X->m[i].h; MC_W(X->m[i].xyz, n * 12); MC_W(X->m[i].val, n * 4); MC_W(X->m[i].valid, n); }
@@ -117,7 +126,7 @@ static mc_ctx *mc_pack_open(const char *path, const char *key) {
     uint8_t *b = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0); close(fd); if (b == MAP_FAILED) return nullptr;
     const size_t N = (size_t)st.st_size, kl = strlen(key); uint64_t hd[3]; memcpy(hd, b + 8, sizeof hd); size_t u = 32;
     mc_ctx *X = nullptr;
-    if (!memcmp(b, "UFMC0001", 8) && hd[0] == kl && u + MC_AL(kl) <= N && !memcmp(b + u, key, kl) && hd[1] > 0 && hd[1] < (1u << 20)) {
+    if (!memcmp(b, "UFMC0002", 8) && hd[0] == kl && u + MC_AL(kl) <= N && !memcmp(b + u, key, kl) && hd[1] > 0 && hd[1] < (1u << 20)) {
         u += MC_AL(kl); X = calloc(1, sizeof *X); X->nm = (int)hd[1]; X->nt = hd[2]; X->m = calloc(hd[1], sizeof *X->m); X->pk = b; X->pkn = N;
         int ok = u + 8 * hd[1] <= N;
         for (int i = 0; ok && i < X->nm; i++) { int32_t wh[2]; memcpy(wh, b + u + 8 * (size_t)i, 8); X->m[i].w = wh[0]; X->m[i].h = wh[1]; ok = wh[0] > 1 && wh[1] > 1; }

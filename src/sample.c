@@ -1509,13 +1509,15 @@ static void tp_put_(void *p, size_t n, int line) {
     }
 }
 static void tp_drain(void) { while (tpool.k) { tpool.k--; free(tpool.b[tpool.k]); if (tp_wid >= 0) atomic_fetch_sub(&g_wm[tp_wid].tpv, tpool.n[tpool.k]); } tpool.bytes = 0; }
+/* the band codes are stored 2x coarser: fine voxel x lies in coarse voxel x >> 1 (block centre, band.h grid_coarse_j; axis_at below
+   already put coarse j at fine 2 j + 0.5). (x + 1) >> 1 before 11-14 (data audit grid conventions): half a fine voxel off. */
 static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8_t *side, int phase, int dense, uint64_t seed) {
     band_params bp = {s->band_radius, s->band_span, 0};
     const int halo = (int)ceilf((bp.radius + bp.span) / 2.f) + 2;
     int64_t lo[3], ln[3], ro[3], rn[3]; int ni[3];
     const z3_meta *m = z3_meta_of(s->band);
     for (int d = 0; d < 3; d++) {
-        lo[d] = ((o[d] + 1) >> 1) - halo; ln[d] = ((o[d] + P) >> 1) - ((o[d] + 1) >> 1) + 1 + 2 * halo; ni[d] = (int)ln[d];
+        lo[d] = (o[d] >> 1) - halo; ln[d] = ((o[d] + P) >> 1) - (o[d] >> 1) + 1 + 2 * halo; ni[d] = (int)ln[d];
         ro[d] = lo[d] < 0 ? 0 : lo[d]; const int64_t e = lo[d] + ln[d] < m->shape[d] ? lo[d] + ln[d] : m->shape[d]; rn[d] = e - ro[d];
     }
     const size_t N = (size_t)ln[0] * ln[1] * ln[2];
@@ -1535,16 +1537,16 @@ static int band_window(source *s, const int64_t o[3], int P, uint8_t *out, uint8
         rc = phase ? band_field_phase(codes, ni, lo, cy, cx, bp, bl, sl, sp) : band_field_side(codes, ni, lo, cy, cx, bp, bl, sl);
     }
     if (!rc) for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) {
-        const size_t r0 = ((size_t)(((o[0] + z + 1) >> 1) - lo[0]) * ln[1] + (((o[1] + y + 1) >> 1) - lo[1])) * ln[2];
+        const size_t r0 = ((size_t)(((o[0] + z) >> 1) - lo[0]) * ln[1] + (((o[1] + y) >> 1) - lo[1])) * ln[2];
         const uint8_t *row = bl + r0;
         uint8_t *dst = out + ((size_t)z * P + y) * P;
-        for (int x = 0; x < P; x++) dst[x] = row[((o[2] + x + 1) >> 1) - lo[2]];
-        if (side) { const uint8_t *sr = sl + r0; uint8_t *sd = side + ((size_t)z * P + y) * P; for (int x = 0; x < P; x++) sd[x] = sr[((o[2] + x + 1) >> 1) - lo[2]]; }
+        for (int x = 0; x < P; x++) dst[x] = row[((o[2] + x) >> 1) - lo[2]];
+        if (side) { const uint8_t *sr = sl + r0; uint8_t *sd = side + ((size_t)z * P + y) * P; for (int x = 0; x < P; x++) sd[x] = sr[((o[2] + x) >> 1) - lo[2]]; }
         if (sp) {
             const uint8_t *spr = sp + r0; uint8_t *sd = side + ((size_t)z * P + y) * P;
             const uint64_t hz = mix64(seed ^ (uint64_t)(o[0] + z) * 0x9e3779b97f4a7c15ull ^ (uint64_t)(o[1] + y) * 0xc2b2ae3d27d4eb4full);
             for (int x = 0; x < P; x++) {
-                const int v = spr[((o[2] + x + 1) >> 1) - lo[2]];
+                const int v = spr[((o[2] + x) >> 1) - lo[2]];
                 if (sd[x] >= PHASE_PERIOD || v <= dense) continue;
                 if ((mix64(hz ^ (uint64_t)(o[2] + x)) >> 40) * (uint64_t)v >= ((uint64_t)dense << 24)) sd[x] = PHASE_UNKNOWN;   /* keep with p = dense / v */
             }
