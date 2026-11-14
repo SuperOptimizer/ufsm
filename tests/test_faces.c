@@ -18,6 +18,7 @@ static double cyl_sample(void *ctx, double z, double y, double x) { const cyl *C
 /* 3. the GPU path (src/nn_faces.cu) against the CPU path on a chunked uint8 volume (noisy two-sheet cylinder): bit-identical outputs */
 #include "faces_core.h"
 #include <string.h>
+#include "test_gpu.h"
 enum { CS = 128 };
 typedef struct { int64_t shape[3]; int g[3]; uint8_t **ch; fgpu *G; uint32_t mk[9]; } tvol;
 static double tv_sample(void *ctx, double z, double y, double x) {   /* faces_cli fcc_sample */
@@ -57,7 +58,7 @@ static int gpu_vs_cpu(void) {
     for (int k = 0; k < 40; k++) { const size_t i = (size_t)(k * 7919) % n; X[i] = Y[i] = Z[i] = -1; }   /* holes */
     float *out[2][7]; uint8_t *cf[2]; faces_stats st[2]; int rc = 0;
     T.G = fgpu_open(T.shape);
-    if (!T.G) { printf("test_faces_gpu: no CUDA device, GPU comparison skipped\n"); return 0; }
+    if (!T.G) return test_no_gpu("test_faces_gpu", "fgpu_open failed: the GPU comparison");
     for (int g = 0; g < 2; g++) {
         for (int k = 0; k < 7; k++) out[g][k] = malloc(n * 4);
         cf[g] = malloc(n); memset(&st[g], 0, sizeof st[g]); st[g].ct_thr = 90;

@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "test_gpu.h"
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static uint64_t rs = 88172645463325252ull;
 static float frand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (float)((rs >> 40) / 16777216.0 - 0.5) * 1e-3f; }
@@ -40,8 +41,8 @@ int main(void) {
     const int quick = getenv("UFSM_TEST_QUICK") && atoi(getenv("UFSM_TEST_QUICK"));
     if (quick) setenv("UFSM_AR_CHUNK", "1000003", 1);
     const size_t n = quick ? 9000017 : 92400000;
-    int dv[2] = {0, 1}; if (nn_init(0)) { fprintf(stderr, "no GPU (skipped)\n"); return 0; }
-    if (nn_init(1)) { dv[1] = 0; nn_check(); }
+    int dv[2] = {0, 1}; if (nn_init(0)) return test_no_gpu("test_grad_ar", "nn_init(0) failed");
+    if (nn_init(1)) { dv[1] = 0; nn_check(); test_partial("test_grad_ar", "one GPU: both ranks on device 0"); }
     fprintf(stderr, "grad allreduce2: GPUs %d, %d, %zu floats\n", dv[0], dv[1], n);
     float *ha = malloc(n * 4), *hb = malloc(n * 4), *hs = malloc(n * 4), *hr = malloc(n * 4); int fails = 0;
     float *g[2];

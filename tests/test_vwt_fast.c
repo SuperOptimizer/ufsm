@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "test_gpu.h"
 
 size_t vtf_conv_scratch(vt_t x, int co, int k, int sd, int sh, int sw);
 int vtf_conv_fwd(vt_t x, const float *w, const float *b, int k, int sd, int sh, int sw, vt_t y, void *scratch);
@@ -36,7 +37,7 @@ static const int NS = (int)(sizeof S / sizeof S[0]);
 static int stems(const char *nm) { return !strcmp(nm, "stem") ? 4 : 1; }
 
 int main(int argc, char **argv) {
-    if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_vwt_fast", "nn_init(0) failed");
     int bench = 0, mx8 = 0;
     for (int i = 1; i < argc; i++) { if (!strcmp(argv[i], "bench")) bench = 1; if (!strcmp(argv[i], "mx8")) mx8 = 1; }
     if (mx8) vtf_set_mx(8);

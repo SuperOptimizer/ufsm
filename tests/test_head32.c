@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "test_gpu.h"
 static uint64_t rs = 777;
 static float h2f(uint16_t v) { int e = (v >> 10) & 31, m = v & 1023; float f = e == 0 ? ldexpf((float)m, -24) : e == 31 ? INFINITY : ldexpf((float)(m | 1024), e - 25); return (v >> 15) ? -f : f; }
 static uint16_t f2h(float f) { uint32_t u; memcpy(&u, &f, 4); const uint32_t s = (u >> 16) & 0x8000; const float a = fabsf(f);
@@ -92,7 +93,7 @@ static int check(int CO) {
 int main(void) {
     setenv("UFSM_ACT_MX4", "1", 0); setenv("UFSM_XIN_PREC", "8", 0); setenv("UFSM_GRAD_MX8", "1", 0); setenv("UFSM_GRAD_MX4", "1", 0);
     setenv("UFSM_F4_WGRAD", "1", 0); setenv("UFSM_DOWN_NORM", "1", 0);
-    if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_head32", "nn_init(0) failed");
     nn_set_tf32(1); nn_set_f16(1); nn_set_prec_policy("all=fp4:fp4:fp4,enc0.c1=fp16"); nn_set_gn_stored(1); nn_set_sr(1);
     const int bad = check(32) + check(48);
     printf("%s\n", bad ? "test_head32: FAIL" : "test_head32: OK");

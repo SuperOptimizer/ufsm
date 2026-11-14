@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 static uint64_t rs = 88172645463325252ull;
 static double ru(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (rs >> 11) * (1.0 / 9007199254740992.0); }
@@ -55,7 +56,7 @@ static void check(const char *what, double fd, double an, double scale) {
     if (err > 2e-3) { printf("  %s: fd %.6e analytic %.6e (rel %.2e) FAIL\n", what, fd, an, err); fails++; }
 }
 int main(void) {
-    if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_dino_loss", "nn_init(0) failed");
     const int D = getenv("UFSM_TEST_D") ? atoi(getenv("UFSM_TEST_D")) : 32, N = 96, N2 = 96;   /* embedding width 16 or 32 */
     /* ---- SupCon ---- */
     float *a = malloc(N * D * 4), *t = malloc(N2 * D * 4); int *code = malloc(N * 4), *xyz = malloc(N * 12);

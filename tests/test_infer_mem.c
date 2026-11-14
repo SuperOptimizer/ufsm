@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "test_part.h"   /* UFSM_TEST_PART=K/6: phase 1 | phase 2 | 2b + offload / split | 16-wide input | speed paths 16-wide | 32-wide */
+#include "test_gpu.h"
 
 static int fails;
 static int g_quick;   /* UFSM_TEST_QUICK (make test): fewer CT-stem cases (P 128, every path once) */
@@ -137,7 +138,7 @@ static size_t split_run_ct(split_ctx *ctx, const unet_cfg *cfg, int sc, int P, i
 int main(void) {
     g_quick = getenv("UFSM_TEST_QUICK") && atoi(getenv("UFSM_TEST_QUICK"));
     nn_init(0); nn_set_tf32(1); nn_set_f16(1); nn_set_prec(3); nn_set_gn_stored(1);
-    if (!nn_mx_ok()) { printf("test_infer_mem: skipped (the MX paths are off: no fp4 / fp8 tensor cores and UFSM_MX_EMU not 1)\n"); return 0; }   /* (MX-fp4 placement only) */
+    if (!nn_mx_ok()) { printf("SKIP: test_infer_mem: the MX paths are off: no fp4 / fp8 tensor cores and UFSM_MX_EMU not 1)\n"); return 0; }   /* (MX-fp4 placement only) */
     unet_set_act_mx4(1); unet_set_act_mx8(0); unet_set_grad_mx8(0); unet_set_input_mx(1);
     if (unet_set_input_prec(8)) return 2;
     TEST_PART(0) for (int sc = 0; sc < 2; sc++) {
@@ -218,7 +219,7 @@ int main(void) {
        halves, on two GPUs or both on one): CT-stem logits identical to the one-GPU phase-1 reference (split: on the planes each half
        owns) */
     TEST_PART(8) {
-        int dev1 = 1; if (nn_init(1)) { dev1 = 0; nn_check(); } nn_init(0);
+        int dev1 = 1; if (nn_init(1)) { dev1 = 0; nn_check(); test_partial("test_infer_mem", "one GPU: the split halves on device 0"); } nn_init(0);
         split_ctx *ctx = split_create(0, dev1);
         for (int sc = 0; sc < 2; sc++) for (int P = 128; P <= 192; P += 64) {
             if (g_quick && (P > 128 || sc)) continue;   /* (make test: P 128, scale_cond 0 (1 above); the rest in make test-slow) */
@@ -249,7 +250,7 @@ int main(void) {
        and 1 with 16-channel MX blocks, the coarse offload, the split, the CT stem with an MX-fp8 or an MX-fp4 input (train
        --gpu-input's UFSM_XIN_PREC=4): logits identical to the phase-1 reference of the same input precision */
     TEST_PART(3) {
-        int dev1 = 1; if (nn_init(1)) { dev1 = 0; nn_check(); } nn_init(0);
+        int dev1 = 1; if (nn_init(1)) { dev1 = 0; nn_check(); test_partial("test_infer_mem", "one GPU: the split halves on device 0"); } nn_init(0);
         split_ctx *ctx = split_create(0, dev1);
         const unet_cfg cfg = {7, {16, 16, 32, 64, 128, 192, 256}, 4, 2, 8, 0, 0};
         for (int lh = 0; lh < 2; lh++) for (int ip = 8; ip >= 4; ip -= 4) for (int P = 128; P <= 256; P += 128) {

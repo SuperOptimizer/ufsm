@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "test_gpu.h"
 static uint64_t rs = 4242;
 static float frand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (float)((rs >> 11) * 0x1.0p-53 * 2 - 1); }
 static double rel_l2(const float *a, const float *b, size_t n) { double e = 0, r = 0; for (size_t i = 0; i < n; i++) { double d = (double)a[i] - b[i]; e += d * d; r += (double)b[i] * b[i]; } return sqrt(e / (r > 0 ? r : 1)); }
@@ -24,7 +25,7 @@ static float *logits_f32(unet *u, const float *lg, size_t n) {
 int main(void) {
     setenv("UFSM_ACT_MX4", "1", 0); setenv("UFSM_XIN_PREC", "8", 0); setenv("UFSM_GRAD_MX8", "1", 0); setenv("UFSM_GRAD_MX4", "1", 0);
     setenv("UFSM_F4_WGRAD", "1", 0); setenv("UFSM_DOWN_NORM", "1", 0);
-    if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_hybrid_identity", "nn_init(0) failed");
     nn_set_tf32(1); nn_set_f16(1); nn_set_prec_policy("all=fp4:fp4:fp4,enc0.c1=fp16"); nn_set_gn_stored(1); nn_set_sr(1);
     unet_cfg c0 = {0}; c0.nlev = 3; c0.widths[0] = 16; c0.widths[1] = 32; c0.widths[2] = 96; c0.cin = 1; c0.cout = 16; c0.G = 8; c0.down_norm = 1;
     unet_cfg c1 = c0; c1.attn_blocks = 2; c1.attn_pe = 0; c1.attn_reg = 2;

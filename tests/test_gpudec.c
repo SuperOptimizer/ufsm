@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <time.h>
+#include "test_gpu.h"
 
 #define CV VOLCOMP_CHUNK_VOXELS
 static uint64_t lcg(uint64_t *s) { *s = *s * 6364136223846793005ull + 1442695040888963407ull; return *s >> 17; }
@@ -259,7 +260,7 @@ static int real_main(int argc, char **argv) {
 int main(int argc, char **argv) {
     setenv("UFSM_GPU_DECODE", "1", 0);
     if (!(argc > 1 && !strcmp(argv[1], "--real"))) { setenv("UFSM_GPU_DECODE_MIN_BYTES", "0", 1); setenv("UFSM_GPU_DECODE_MAX_MS", "1e9", 1); }   /* the tests: every request on the GPU */
-    if (!gpudec_enabled()) { printf("test_gpudec: no GPU decoder (no CUDA device): skipped\n"); return 0; }
+    if (!gpudec_enabled()) return test_no_gpu("test_gpudec", "no GPU decoder (gpudec_enabled 0)");
     if (argc > 1 && !strcmp(argv[1], "--real")) return real_main(argc, argv);
     char dir[] = "/tmp/test_gpudecXXXXXX"; if (!mkdtemp(dir)) return 1;
     part12();

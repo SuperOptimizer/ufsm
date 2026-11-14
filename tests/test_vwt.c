@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 static uint64_t rs = 777;
 static double urand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (double)(rs >> 11) * 0x1.0p-53; }
@@ -28,7 +29,7 @@ static double J(vwt *m) {
 
 int main(void) {
     setenv("UFSM_VWT_REF", "1", 1);   /* the fp32 reference convs (bf16 would sit under the FD noise floor) */
-    if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_vwt", "nn_init(0) failed");
     at_set_core(0); at_set_mx(0);
     vwt_cfg c = {T, L, {8, 8, 16}, 48, 1, 1, 1, 32, 8, 0.04f};
     vwt *m = vwt_create(&c, 5); if (!m) { printf("FAIL: create\n"); return 1; }

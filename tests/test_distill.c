@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "test_gpu.h"
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
@@ -172,7 +173,7 @@ int main(void) {
         free(ct); free(p2); free(out); free(ref); free(V);
     }
     /* (3) the loss on the GPU */
-    if (nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0)) { printf("no cuda: the loss check skipped\n"); return fails ? 1 : 0; }
+    if (nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0)) { const int r = test_no_gpu("test_distill", "nn_init failed: the GPU loss check"); return fails ? 1 : r; }
     {
         const int N = 2, Cc = 5; const size_t S = 37, M = (size_t)N * Cc * S; const float w = 0.7f;
         float *y = malloc(M * 4), *g = malloc(M * 4); int8_t *t = malloc(M);
