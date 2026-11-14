@@ -13,7 +13,7 @@
 #include <string.h>
 static const char *hc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static const char *hc_base(const char *p) {   /* sources.c src_base: the last path component past trailing slashes / level digits */
-    static char b[512]; snprintf(b, sizeof b, "%s", p ? p : "");
+    static char b[512]; snprintf(b, sizeof b, "%s", p ? p : "");   /* mgpu: main (host-side string helper, not on the GPU threads) */
     for (;;) { size_t n = strlen(b); while (n && b[n - 1] == '/') b[--n] = 0;
         char *sl = strrchr(b, '/'); const char *t = sl ? sl + 1 : b; int dig = *t != 0; for (const char *c = t; *c; c++) dig &= *c >= '0' && *c <= '9';
         if (dig && sl) { *sl = 0; continue; } return t; }

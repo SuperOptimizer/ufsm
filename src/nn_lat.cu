@@ -338,7 +338,7 @@ __global__ void __launch_bounds__(AXT) lat_adj_xy_t_k(const f16 *g, int h, int w
     }
     t[((size_t)cs * h + cy) * w + cx] = s;
 }
-static int g_adj_tile = -1;
+static int g_adj_tile = -1;   /* mgpu: config */
 extern "C" int nn_lat_set_adj_tile(int on) { if (g_adj_tile < 0) { const char *e = getenv("UFSM_LAT_ADJ_TILE"); g_adj_tile = !(e && *e == '0'); } const int was = g_adj_tile; if (on >= 0) g_adj_tile = on; return was; }
 /* stage 2 (z): coarse planes [cz0, cz1) add their fine planes of the slab */
 __global__ void lat_adj_z_k(const float *t, int C, int d, int h, int w, int z0, int nz, int cz0, int cz1, float *gc, int q0, int qd) {

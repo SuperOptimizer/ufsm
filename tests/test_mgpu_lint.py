@@ -13,17 +13,18 @@ comment `mgpu: TAG` on its line or the line above:
   debug        tests / profiling / debug dumps only
 
 thread_local / __thread / _Thread_local, const and constexpr variables need nothing. The variables that existed when the lint was added are
-listed in tests/mgpu_baseline_net.txt (file name per line) and pass unannotated; a new one fails the suite until it carries a tag (or, with a
+listed in tests/mgpu_baseline.txt (FILE NAME CLASS per line) and pass unannotated; a new one fails the suite until it carries a tag (or, with a
 reason, is added to the baseline). Today's bugs of this kind: at_set_lmax's pointer, the cuBLASLt handles / plans, lp_mxgemm's packed
 buffer, the VMM rings' device.
 
-usage: test_mgpu_lint.py [SRC_DIR] [BASELINE]  |  --baseline SRC_DIR > tests/mgpu_baseline_net.txt  (regenerate)
+usage: test_mgpu_lint.py [SRC_DIR] [BASELINE]  |  --baseline SRC_DIR > tests/mgpu_baseline.txt  (regenerate)
 """
 import os
 import re
 import sys
 
-TAGS = ("per-thread", "per-device", "guarded", "config", "env", "main", "process", "debug")
+TAGS = ("per-thread", "per-device", "guarded", "config", "env", "main", "process", "debug",
+        "device", "BUG", "unknown")   # (device = per-device; BUG: a known 2-GPU bug awaiting its fix, listed; unknown: baseline only)
 SAFE_WORDS = re.compile(r"\b(constexpr|thread_local|__thread|_Thread_local|typedef|extern|using|template|static_assert|return|operator"
                         r"|pthread_mutex_t|pthread_cond_t|pthread_once_t|pthread_rwlock_t|mutex|once_flag|atomic_int|_Atomic)\b")   # (locks are their own guard)
 IDENT = re.compile(r"[A-Za-z_]\w*")
@@ -79,6 +80,8 @@ def names_of(decl):
     names = []
     for p in parts:
         p = p.split("=")[0]
+        fp = re.search(r"\(\s*\*\s*([A-Za-z_]\w*)\s*\)", p)   # (*name)[N]: a pointer to an array
+        if fp: names.append(fp.group(1)); continue
         p = re.sub(r"\[[^\]]*\]", "", p)           # array bounds
         p = re.sub(r"\([^)]*\)\s*$", "", p)        # constructor-style init
         ids = IDENT.findall(p)
@@ -129,7 +132,8 @@ def scan(path):
             if re.match(r"^static\s+(struct|union|enum)\s+\w+\s*$", s): i += 1; continue
             head = s.split("=")[0]
             head_noinit = re.sub(r"\{.*\}", "", head)
-            if "(" in head_noinit and not re.search(r"\(\s*\*", head_noinit) and "__align__(" not in head_noinit:
+            fm = re.search(r"[A-Za-z_]\w*\s*\(\s*(\S)", head_noinit.replace("__align__(", "__align__ ("))
+            if fm and fm.group(1) != "*" and not head_noinit.lstrip().startswith("__align__"):
                 i += 1; continue   # a prototype or a call
             if "__global__" in s or "__forceinline__" in s or re.search(r"\binline\b", s): i += 1; continue
             if at_file and not re.search(r"\b(static|__device__|__constant__)\b", s):
@@ -184,7 +188,7 @@ def main():
     regen = "--baseline" in sys.argv
     here = os.path.dirname(os.path.abspath(__file__))
     src = args[0] if args else os.path.join(here, "..", "src")
-    base = args[1] if len(args) > 1 else os.path.join(here, "mgpu_baseline_net.txt")
+    base = args[1] if len(args) > 1 else os.path.join(here, "mgpu_baseline.txt")   # FILE NAME [CLASS] per line (the class: ops' lint_mgpu vocabulary, informational)
     files = sorted(f for f in os.listdir(src) if f.endswith((".c", ".cu", ".cuh", ".h")))
     known = set()
     if not regen and os.path.exists(base):
@@ -207,7 +211,7 @@ def main():
                     bad.append(f"{f}:{a}: {nm}: process-wide variable without an mgpu tag   [{s[:110]}]")
     if regen:
         print("# tests/test_mgpu_lint.py baseline: the process-wide variables in src/ that predate the lint (2026-11-14), file name per line.")
-        print("# Regenerate: python3 tests/test_mgpu_lint.py --baseline src > tests/mgpu_baseline_net.txt (only to drop entries; new ones get an mgpu tag)")
+        print("# Regenerate: python3 tests/test_mgpu_lint.py --baseline src > tests/mgpu_baseline.txt (only to drop entries; new ones get an mgpu tag)")
         for x in sorted(seen_regen): print(x)
         return 0
     stale = sorted(known - seen)

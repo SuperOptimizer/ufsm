@@ -63,7 +63,7 @@ static int src_add_hold(source *s, const json *b, int rej, int nos) {   /* one [
     if (s->nhold == 1) for (int d = 0; d < 3; d++) { s->hold_o[d] = v[d]; s->hold_n[d] = v[3 + d]; }
     return 0;
 }
-static int g_hold_strict;   /* "holdout_strict": 1 (top level) or UFSM_HOLD_STRICT=1: a holdout_file with no box for a source is fatal */
+static int g_hold_strict;   /* "holdout_strict": 1 (top level) or UFSM_HOLD_STRICT=1: a holdout_file with no box for a source is fatal */   /* mgpu: config */
 static const char *src_base(const char *p) {   /* the last path component, ignoring trailing slashes and a trailing "/<level digits>" */
     static _Thread_local char b[512]; snprintf(b, sizeof b, "%s", p ? p : "");
     for (;;) {
@@ -269,7 +269,7 @@ static z3 *onfly_phase_open(const source *s, const json *of, int extra, int plev
     *rmx = rm;
     return z;
 }
-static int g_strict;
+static int g_strict;   /* mgpu: config */
 void sources_set_strict(int on) { g_strict = on; }
 static void sources_unread_cb(const char *p, void *u) { (void)u; fprintf(stderr, "sources: WARNING: key \"%s\" is not one sources_load reads (a typo?)\n", p); }
 sources *sources_load(const char *path) {
