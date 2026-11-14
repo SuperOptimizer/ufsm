@@ -287,6 +287,7 @@ static int unwrap2_heads_moved(const char *init_from) {
     return (g_rv == 2 && drv >= 0 && drv != g_rv_ch) || (g_ink2 && dink >= 0 && dink != g_ink2_ch) || (g_ink2 && dink < 0 && drv == g_ink2_ch);
 }
 static double g_reject_warn = 100;
+static double g_outward_warn = 0.9;   /* --outward-warn S: warn when a source's aligned phase-gradient samples rise outward less often than S (0 off) */
 static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static float g_mil_R = 10.f, g_mil_step = 1.f, g_mil_tau = 0.f, g_mil_lambda = 1.f;   /* --ink-mil L
    (--ink-head): the normal-pooled MIL ink loss on each window's rays (inkmil.h): per supervised label pixel (mode 1: only those without an open face, the
    voxel target's unknowns), BCE of the pooled ink logit along the normal over +-R window voxels at step (tau 0: max; > 0: tau log mean exp), the mean
@@ -3274,6 +3275,7 @@ int cmd_train(int argc, char **argv) {
     sc.aux = g_xc == 5; sc.cond = g_cond; sc.cond_outside = g_cond_outside; sc.pap_head = g_pap_head ? &g_paph : nullptr;
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
     sc.strict_sources = atoi(opt(argc, argv, "--strict-sources", "0"));
+    g_outward_warn = atof(opt(argc, argv, "--outward-warn", "0.9"));
     g_reject_warn = atof(opt(argc, argv, "--reject-warn", "100"));   /* the draws line's per-source drops per new window above which it warns */   /* 1: a weighted source the sampler cannot draw is fatal (launchers: on) */
     sc.ink_mil = g_mil; sc.mil_mode = g_mil_mode; sc.mil_stride = g_mil_stride; sc.mil_max = g_mil_max; sc.mil_R = g_mil_R;   /* --ink-mil: the windows' rays (batch.mil) */
     sc.ink_plane = IPLANE;   /* --ink-head: the sources' "ink" targets on their own plane (batch.ink); --rv: the papyrus plane there */
@@ -3594,6 +3596,10 @@ int cmd_train(int argc, char **argv) {
                 else if (S->src[s].phase_pl[l] && S->src[s].phase_onfly > 0) snprintf(pl, sizeof pl, "; phase from the codes pooled 2x (on the fly)");
                 if (any) fprintf(stderr, "sampler-only:   %-20s level %d (%.3g um): %d windows (%u holdout-masked), phase known of material %.3f; draws dropped: %u holdout overlaps, %u empty targets, %u coarse probe, %u CT min_fg%s\n",
                                  S->src[s].name, l, S->src[s].um * ldexp(1.0, l), lvc[s][l], rs[SL_MASKED], lvm[s][l][0] > 0 ? lvm[s][l][1] / lvm[s][l][0] : 0., rs[SL_HOLD], rs[SL_EMPTY], rs[SL_PROBE], rs[SL_FG], pl); }
+            for (int s = 0; s < S->n; s++) { uint64_t oc[2]; sampler_outward_stats(sq, s, oc); if (!(oc[0] + oc[1])) continue;   /* (the label direction check) */
+                const double sh = (double)oc[0] / (double)(oc[0] + oc[1]);
+                fprintf(stderr, "sampler-only: source %-34s phase outward %.4f of %llu aligned gradient samples%s\n", S->src[s].name, sh, (unsigned long long)(oc[0] + oc[1]),
+                        oc[0] + oc[1] >= 2000 && sh < g_outward_warn ? "  WARNING: below --outward-warn, numbered inward?" : ""); }
             free(lvm);
             free(lvc);
             free(cov);
@@ -4629,7 +4635,7 @@ int cmd_train(int argc, char **argv) {
     double acc_rn = 0, acc_re = 0, acc_rb = 0;   /* restore: training voxels, error^2, input error^2 since the last log line */
     float parts[8][2 * TCMAX + 1];
     double acc_fib = 0, acc_fibv = 0, acc_fibn = 0;   /* --fib-normal-lambda: mean t^T N t over the windows with fibre voxels, their mean count */
-    const int mix_every = atoi(opt(argc, argv, "--mix-every", "0")); double *mixn = nullptr, *mixrv = nullptr, *mixrvn = nullptr;
+    const int mix_every = atoi(opt(argc, argv, "--mix-every", "0")); double *mixn = nullptr, *mixrv = nullptr, *mixrvn = nullptr, *mixh = nullptr;   /* mixh: per source phase / wind4 / normal bce sums + counts (4 x 2) */
     double acc_ssl = 0, acc_sslv = 0, acc_ssls = 0, acc_sslc = 0, acc_ssln = 0, acc_sslh[SSLH_MAX] = {0}, acc_sslhg[SSLH_MAX] = {0};   /* (+ --ssl-heads: per head loss, targeted share of its channels' cells) */   /* --ssl: cosine part, hinge, std, targeted cells, unlabelled windows (all GPUs) */
     double acc_emb = 0, acc_embc = 0, acc_ds = 0, acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0, acc_ck = 0, acc_cr = 0, acc_pap = 0, acc_cnt = 0, acc_cnr = 0, acc_cbin[18] = {0}, acc_w4 = 0, acc_w4w = 0, acc_w4a = 0, acc_pg = 0, acc_rv = 0;   /* (acc_pg: --pgrad-lambda loss; acc_cnt / acc_cnr: --count-lambda loss, Tp / Tg) verso channel, side channel; --cond (loss, known / right counts); --pap-head */
     double acc_siden = 0, acc_normn = 0, acc_w4n = 0;   /* windows that carry side / phase, normal, wind4 labels (their loss > 0): the logged means are over them, as ink / fib */
@@ -4937,10 +4943,13 @@ int cmd_train(int argc, char **argv) {
         if (g_side && G[0].side_loss > 0) { acc_side += G[0].sout[0]; acc_siden += 1; }
         if (g_rv == 2) acc_rv += G[0].rvout[0]; }
         if (mix_every > 0) {   /* --mix-every N: the realised windows per source x level and (--rv 2) each source's rv bce, every N steps */
-            if (!mixn) { mixn = calloc((size_t)S->n * MAXLEV, sizeof *mixn); mixrv = calloc((size_t)S->n, sizeof *mixrv); mixrvn = calloc((size_t)S->n, sizeof *mixrvn); }
+            if (!mixn) { mixn = calloc((size_t)S->n * MAXLEV, sizeof *mixn); mixrv = calloc((size_t)S->n, sizeof *mixrv); mixrvn = calloc((size_t)S->n, sizeof *mixrvn); mixh = calloc((size_t)S->n * 6, sizeof *mixh); }
             for (int g = 0; g < ng; g++) { const int bf = G[g].last & 1, si = G[g].srcb[bf], lv = G[g].lvlb[bf];
                 if (si < 0 || si >= S->n || lv < 0 || lv >= MAXLEV) continue;
-                mixn[(size_t)si * MAXLEV + lv]++; if (g_rv == 2) { mixrv[si] += G[g].rv_own; mixrvn[si]++; } }
+                mixn[(size_t)si * MAXLEV + lv]++; if (g_rv == 2) { mixrv[si] += G[g].rv_own; mixrvn[si]++; }
+                if (g_unwrap2) {   /* the per-source head losses (as uw_mean reads them: a head with no known voxel in the window has loss 0, not counted) */
+                    const double hv[3] = {g_rv == 1 || !(G[g].side_loss > 0) ? 0 : G[g].sout[0], G[g].w4_loss > 0 ? G[g].w4h[0] : 0, G[g].norm_loss > 0 ? G[g].norm_raw : 0};
+                    for (int h = 0; h < 3; h++) if (hv[h] > 0 && isfinite(hv[h])) { mixh[(size_t)si * 6 + 2 * h] += hv[h]; mixh[(size_t)si * 6 + 2 * h + 1] += 1; } } }
             if (step % mix_every == 0) {
                 double tot = 0; for (int k = 0; k < S->n * MAXLEV; k++) tot += mixn[k];
                 char ln[8192]; int o = snprintf(ln, sizeof ln, "mix steps %d-%d (%.0f windows):", step - mix_every + 1, step, tot);
@@ -4974,6 +4983,30 @@ int cmd_train(int argc, char **argv) {
                 if (g_rv == 2) { o = snprintf(ln, sizeof ln, "rv bce by source steps %d-%d:", step - mix_every + 1, step);
                     for (int si = 0; si < S->n; si++) if (mixrvn[si] > 0) o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " %s %.4f (%.0f)", S->src[si].name, mixrv[si] / mixrvn[si], mixrvn[si]);
                     fprintf(stderr, "%s\n", ln); }
+                if (g_unwrap2) {   /* phase / wind4 / normal bce per source (audit 2026-11-14: only rv was broken out, so a source at chance could not be
+                                      pinned on its phase or its rv), then the sampler's outward share of the phase gradient per source (sample.c
+                                      phase_outward_count: a label set numbered inward reverses phase, rv, normals and wind4 silently) */
+                    o = snprintf(ln, sizeof ln, "head bce by source steps %d-%d (phase / wind4 / normal, windows):", step - mix_every + 1, step);
+                    for (int si = 0; si < S->n; si++) { const double *q = mixh + (size_t)si * 6; if (q[1] + q[3] + q[5] <= 0) continue;
+                        o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " %s", S->src[si].name);
+                        for (int h = 0; h < 3; h++) o += q[2 * h + 1] > 0 ? snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, "%s%.4f", h ? "/" : " ", q[2 * h] / q[2 * h + 1])
+                                                                          : snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, "%s-", h ? "/" : " ");
+                        o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " (%.0f)", q[1] > q[3] ? q[1] : q[3]); }
+                    fprintf(stderr, "%s\n", ln);
+                    memset(mixh, 0, (size_t)S->n * 6 * sizeof *mixh);
+                    static uint64_t (*oprev)[2]; if (!oprev) oprev = calloc((size_t)S->n, sizeof *oprev);
+                    o = snprintf(ln, sizeof ln, "phase outward by source steps %d-%d (share of radially aligned gradient samples rising outward, samples):", step - mix_every + 1, step);
+                    int any = 0;
+                    for (int si = 0; si < S->n; si++) { uint64_t c2[2]; sampler_outward_stats(sp, si, c2); const uint64_t po = c2[0] - oprev[si][0], pi = c2[1] - oprev[si][1];
+                        oprev[si][0] = c2[0]; oprev[si][1] = c2[1]; if (!(po + pi)) continue; any = 1;
+                        const double sh = (double)po / (double)(po + pi);
+                        o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " %s %.3f (%llu)", S->src[si].name, sh, (unsigned long long)(po + pi));
+                        if (po + pi >= 2000 && sh < g_outward_warn)
+                            fprintf(stderr, "WARNING outward: %s: only %.3f of %llu aligned phase-gradient samples rise outward (< %.2f): its label set may be numbered inward "
+                                            "(phase, rv, normals and wind4 reversed); check its codes / phase with phase-check, \"phase_sign\": -1 flips it\n",
+                                    S->src[si].name, sh, (unsigned long long)(po + pi), g_outward_warn); }
+                    if (any) fprintf(stderr, "%s\n", ln);
+                }
                 memset(mixn, 0, (size_t)S->n * MAXLEV * sizeof *mixn); memset(mixrv, 0, (size_t)S->n * sizeof *mixrv); memset(mixrvn, 0, (size_t)S->n * sizeof *mixrvn);
             }
         }

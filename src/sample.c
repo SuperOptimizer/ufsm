@@ -226,6 +226,7 @@ struct sampler {
     int64_t *rdue, *rseq, nserved, nrel; int rgap;   /* --replay interleave (under mu): a pending replay's due serve count / release order; batches handed out / released */   /* --replay: per slot replays left, in the replay pipeline (REPLAY or READY as one); its thread */
     atomic_int stop, failed;
     atomic_uint_fast64_t produced, rejected;
+    _Atomic uint64_t outw[64][2];   /* per source (< 64): aligned phase-gradient samples rising outward / inward (sample_phase_outward) */
     _Atomic uint32_t rej_sl[64][MAXLEV][SL_N];   /* per source (< 64) and level, by SL_* (sampler_level_stats) */
     atomic_uint_fast64_t rej_why[4];   /* draws dropped: coarse CT probe, CT read (min_fg), empty targets, holdout overlap (not in rejected) */
     atomic_uint_fast64_t crushed;      /* --aug-crush windows drawn */
@@ -1650,6 +1651,25 @@ static int phase_window_interp(z3 *a, const int64_t o[3], int D, int P, int shif
     tp_put(ph, N);
     return 0;
 }
+void sample_phase_outward(const uint8_t *ph, int Pz, int P, const int64_t o[3], const float *cyz, const float *cxz, uint64_t out[2]) {
+    const size_t PP = (size_t)P * P; uint64_t po = 0, pi = 0;
+    for (int z = 0; z + 1 < Pz; z += 8) for (int y = 0; y + 1 < P; y += 8) {
+        const uint8_t *row = ph + (size_t)z * PP + (size_t)y * P; const float ry = (float)(o[1] + y) - cyz[z];
+        for (int x = 0; x + 1 < P; x += 8) {
+            const int v = row[x], vz = row[x + PP], vy = row[x + P], vx = row[x + 1];
+            if (v >= PHASE_PERIOD || vz >= PHASE_PERIOD || vy >= PHASE_PERIOD || vx >= PHASE_PERIOD) continue;
+            const int H = PHASE_PERIOD / 2;   /* circular differences in (-H, H]: the 1 -> 0 wrap at a recto is a step of +1 */
+            const int dz = (vz - v + PHASE_PERIOD + H) % PHASE_PERIOD - H, dy = (vy - v + PHASE_PERIOD + H) % PHASE_PERIOD - H, dx = (vx - v + PHASE_PERIOD + H) % PHASE_PERIOD - H;
+            const float rx = (float)(o[2] + x) - cxz[z], rn2 = ry * ry + rx * rx, g2 = (float)(dz * dz + dy * dy + dx * dx);
+            if (rn2 < 1.f || g2 <= 0.f) continue;
+            const float dot = (float)dy * ry + (float)dx * rx;
+            if (dot * dot < 0.49f * g2 * rn2) continue;   /* (|cos| < 0.7: a sheet facing sideways says little about the direction) */
+            if (dot > 0) po++; else pi++;
+        }
+    }
+    out[0] += po; out[1] += pi;
+}
+void sampler_outward_stats(sampler *sp, int si, uint64_t out[2]) { for (int k = 0; k < 2; k++) out[k] = si >= 0 && si < 64 ? atomic_load(&sp->outw[si][k]) : 0; }
 /* sources "phase": {"weight"}: per 8^3 block of a Pz x P x P window, the block keeps its phase with probability (mean w) / 255
    (a draw from seed and the block index; w outside the array reads 255 = keep), else its voxels become unknown. Exposed for tests. */
 void phase_weight_drop(uint8_t *ph, const uint8_t *w, int Pz, int P, uint64_t seed) {
@@ -3300,6 +3320,16 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             uint16_t *wq = nullptr;   /* warped --task unwrap2: the winding and its component for warp_phase_w4 (one pass with the phase) */
             if (!sw || (g_crush.ph ? (memcpy(sw, g_crush.ph, p3), 0) : phase_window(phz, o, Pz, P, psh, sw))) { SW_PUT(); return -1; }
             if (s->phase_sign < 0) phase_negate(sw, p3);   /* (before the winding mod 4: it unwraps this phase) */
+            {   /* the per-source outward share (train's "phase outward by source" line): the labels as trained, against the unjittered axis */
+                const int si_ = (int)(s - sp->S->src);
+                if (s->ax.n > 0 && si_ >= 0 && si_ < 64 && !g_crush.ph) {
+                    float *ay = malloc(2 * (size_t)Pz * sizeof *ay);
+                    if (ay) { const double sc = (double)(1 << l); uint64_t oc[2] = {0, 0};
+                        for (int z = 0; z < Pz; z++) { double cy, cx; axis_at(&s->ax, (double)(o[0] + z) * sc, &cy, &cx); ay[z] = (float)(cy / sc); ay[Pz + z] = (float)(cx / sc); }
+                        sample_phase_outward(sw, Pz, P, o, ay, ay + Pz, oc); atomic_fetch_add(&sp->outw[si_][0], oc[0]); atomic_fetch_add(&sp->outw[si_][1], oc[1]);
+                        free(ay); }
+                }
+            }
             if (nhb) hold_fill(sw, (const int32_t (*)[6])hb, nhb, P, PHASE_UNKNOWN);   /* (holdout mask: the phase, so the winding mod 4 too) */
             const int ign_none = ignz && psh == 0 && !g_crush.ig && z3_box_any(ignz, o, (const int64_t[3]){Pz, P, P}) == 0;   /* (no stored chunk in the window: all fill, which keeps every phase) */
             if (ignz && psh < 2 && !g_crush.pre && !ign_none) {   /* (--aug-tear: applied before the cut) (interpolated 2.4 um windows: no mask) "ignore": label sets that disagree there (ufsm phase-conflict): unknown, not trained on */

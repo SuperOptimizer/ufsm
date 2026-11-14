@@ -46,6 +46,7 @@ test_lathead                                     | gpu          |     3 | ./$B/t
 test_fit_lat                                     | gpu          |     3 | ./$B/test_fit_lat
 test_restore_task                              | gpu          |     7 | ./$B/test_restore_task
 test_phase_interp                              |              |    20 | ./$B/test_phase_interp
+test_phase_outward                             |              |     1 | ./$B/test_phase_outward
 test_spatial_augment~part0of3                 |              |     7 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=0/3 ./$B/test_spatial_augment
 test_spatial_augment~part1of3                 |              |     7 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=1/3 ./$B/test_spatial_augment
 test_spatial_augment~part2of3                 |              |     7 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=2/3 ./$B/test_spatial_augment

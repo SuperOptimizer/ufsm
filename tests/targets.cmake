@@ -191,6 +191,9 @@ ufsm_exe(test_phase_check SUITE tests/test_phase_check.c OBJS phase_check LIBS m
 ufsm_exe(test_phase_interp SUITE tests/test_phase_interp.c OBJS sample scannorm sample_emb embz edt band sheet ct_augment scan_augment
          spatial_augment crush scrollaug cover sources band_onfly fuse fiberraster afv reg regmap zarr2 srpair view zarr3 store json z3w
          tiff zipr hf NN LP LIBS m curl zstd blosc z crypto CUDA)
+ufsm_exe(test_phase_outward SUITE tests/test_phase_outward.c OBJS sample scannorm sample_emb embz edt band sheet ct_augment scan_augment
+         spatial_augment crush scrollaug cover sources band_onfly fuse fiberraster afv reg regmap zarr2 srpair view zarr3 store json z3w
+         tiff zipr hf NN LP LIBS m curl zstd blosc z crypto CUDA)
 ufsm_exe(test_phase_pool SUITE tests/test_phase_pool.c OBJS band_onfly fuse band edt zarr3 zarr2 store json z3w hf NN LP LIBS m curl zstd
          blosc z crypto CUDA)
 ufsm_exe(test_phasepack SUITE tests/test_phasepack.c OBJS phasepack store zarr3 json z3w LIBS LDLIBS)

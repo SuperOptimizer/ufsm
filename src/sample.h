@@ -270,6 +270,12 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
    first voxel lo, PHASE_UNKNOWN outside the array), o the window corner, D x P x P codes out. sample_phase_interp: separable, polynomial
    atan2 (the sampler's path); _ref: 8 neighbours per voxel, atan2f (codes agree but for +-1 at float ties; tests/test_phase_interp.c) */
 void phase_weight_drop(uint8_t *ph, const uint8_t *w, int Pz, int P, uint64_t seed);   /* sources "phase" "weight": 8^3 blocks kept with probability w / 255 */
+/* the outward test of a window's phase (Pz x P x P, source grid, the window corner o in level voxels; cyz / cxz: the scroll axis centre per window
+   z in the same voxels): every 8th voxel per axis with a known phase and known +z / +y / +x neighbours gives the phase gradient (circular
+   differences); where it is radially aligned (|cos| >= 0.7 with the direction from the axis), out[0] counts it rising outward, out[1] inward.
+   A label set whose windings are numbered inward (phase, rv, normals, wind4 reversed) shows out[1] > out[0]. Adds to out */
+void sample_phase_outward(const uint8_t *ph, int Pz, int P, const int64_t o[3], const float *cyz, const float *cxz, uint64_t out[2]);
+void sampler_outward_stats(sampler *sp, int si, uint64_t out[2]);   /* the per-source totals of sample_phase_outward over the drawn windows */
 void sample_phase_interp(const uint8_t *ph, const int64_t ln[3], const int64_t lo[3], const int64_t o[3], int D, int P, int shift, uint8_t *side);
 void sample_phase_interp_ref(const uint8_t *ph, const int64_t ln[3], const int64_t lo[3], const int64_t o[3], int D, int P, int shift, uint8_t *side);
 sampler *sampler_start(sources *S, const sample_cfg *cfg);
