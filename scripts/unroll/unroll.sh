@@ -321,7 +321,9 @@ ctcal() {
 # REFPH="--phase-w 4" = the old ref.
 # refpool: the ref's pass-1 (pooling) flags; refcz FIELDSJSON: the chunk rows count-field picks from --mem-gb CFMEM when memory is not
 # short (12 B per cell of a cross-section, a multiple of the pool 8, then of 128): the streamed pass 1 and the solve run pass it explicitly
-refpool() { echo "--R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --model-only 1 --model-stride ${MSTRIDE:-4} ${REFX:-}"; }
+# MSTRIDE 1 (was 4): the model's local gauge from every chunk. With 4 only every 4th chunk had one (count-field now interpolates the rows
+# between, but the 1667 refs were coherent on 1 / K of z: unroll #8 recheck 11-14); the full pass costs ~4x a 7 s GPU model pass
+refpool() { echo "--R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --model-only 1 --model-stride ${MSTRIDE:-1} ${REFX:-}"; }
 refcz() { jq -r --argjson m ${CFMEM:-24} '(.shape[1] * .shape[2]) as $hw | (($m * 1e9 / (12 * $hw)) | floor) as $c | (($c / 8 | floor) * 8) as $c8 |
                                          (if $c8 >= 128 then ($c8 / 128 | floor) * 128 else $c8 end) as $cz | if $cz < 8 then 8 else $cz end' $1; }
 # SPIRALDIR: the spiral's hand for the ref (count-field --dir; the slabs take it from the ref). Default: scripts/unroll/spiral_dir.tsv

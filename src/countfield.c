@@ -563,6 +563,27 @@ static float *cf_gradW(const cf_lvl *L, const float *cy, const float *cx, int na
     (void)cy; (void)cx; (void)na; return g;
 }
 
+/* --model-stride K: the gauge sums exist only on the solve rows of every K-th chunk; the rows between (all-zero planes) take them linearly
+   in z from the nearest summed rows above and below, per column (the nearest one at the ends). Before, those rows kept gg = 0 (no local
+   gauge: U + the global gauge only) beyond the +-model-R smoothing, so the ref's phase agreement alternated with the chunk stride: 1667
+   ref-dm1 (128-row chunks, K 4) coherent on ~256 of every 512 field rows, the low rows 0.03-0.34 (unroll #8 recheck, pub1667 11-14) */
+static void cf_gauge_fill_z(float *gr, float *gi, int d, size_t hw) {
+    char *has = calloc((size_t)d, 1); if (!has) return;
+    for (int z = 0; z < d; z++) { const float *a = gr + (size_t)z * hw, *b = gi + (size_t)z * hw; for (size_t i = 0; i < hw; i++) if (a[i] != 0.f || b[i] != 0.f) { has[z] = 1; break; } }
+    int zp = -1, nf = 0;
+    for (int z = 0; z < d; z++) {
+        if (has[z]) { zp = z; continue; }
+        int zn = z + 1; while (zn < d && !has[zn]) zn++;
+        if (zp < 0 && zn >= d) break;   /* (no summed row at all) */
+        const double t = zp < 0 ? 1 : zn >= d ? 0 : (double)(z - zp) / (zn - zp);
+        const float *ap = gr + (size_t)(zp < 0 ? zn : zp) * hw, *bp = gi + (size_t)(zp < 0 ? zn : zp) * hw, *an = gr + (size_t)(zn < d ? zn : zp) * hw, *bn = gi + (size_t)(zn < d ? zn : zp) * hw;
+        float *a = gr + (size_t)z * hw, *b = gi + (size_t)z * hw;
+        for (size_t i = 0; i < hw; i++) { a[i] = (float)((1 - t) * ap[i] + t * an[i]); b[i] = (float)((1 - t) * bp[i] + t * bn[i]); }
+        nf++;
+    }
+    if (nf) fprintf(stderr, "count-field: --model-stride: the gauge of %d of %d solve rows interpolated in z from the summed rows\n", nf, d);
+    free(has);
+}
 typedef struct { fit_model *m; const cf_lvl *L; const float *gr, *gi, *cy, *cx; int na; double gauge, pitch; } cf_lat;
 static void cf_lat_run(void *a_, long a0, long a1, int t_) {   /* model lattice planes [a0, a1): U + the gauges - r / pitch */
     const cf_lat *T = a_; fit_model *m = T->m; const cf_lvl *L = T->L;
@@ -1183,6 +1204,7 @@ int cmd_count_field(int argc, char **argv) {
     }
     if (*mdir) {   /* W as a fit model on the solve lattice: U + the phase gauge smoothed over +-Rm solve cells */
         const double tlat = cf_now();
+        if (mo && mstride > 1) cf_gauge_fill_z(gr, gi, L->d, (size_t)L->hh * L->w);
         if (Rm > 0) cf_boxsmooth2_par(gr, gi, L->d, L->hh, L->w, Rm);
         fit_model m; memset(&m, 0, sizeof m);
         m.dir = dir; m.nk = 2; m.knot_dz = kdz; m.pitch = kpitch; m.offset = koff; m.D = D; m.H = H; m.W = W; m.h = h; m.um = g.um; m.cy = g.cy; m.cx = g.cx;

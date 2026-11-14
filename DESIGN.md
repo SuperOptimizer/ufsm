@@ -524,6 +524,21 @@ Coordinates:
 - #7: tifxyz_shift writes a vertex moved past z = 0 as invalid (-1, -1, -1), tifxyz_scaled's rule, instead of clamping it to a valid
   z = 0. test_imgops checks it.
 
+Ref model gauge under --model-stride (unroll #8 follow-up, 2026-11-14; source only, not built or run: user order).
+- The finding: pub1667's recheck on fibfit's dir -1 refit (ref-dm1) found coherence that alternates in z. About 256 field rows are high
+  (0.41-0.70), then about 256 low (0.03-0.34).
+- The cause: count-field --model-only --model-stride K sums the model's local phase gauge (gr / gi) only on the chunks with
+  chunk % K == 0. cf_lat_run then sets gg = 0 wherever the smoothed sums are empty. ref-dm1 used 128-row chunks and K 4, so its sums
+  exist on rows [512k, 512k + 128). The +-8 solve-cell smoothing (+-64 rows) widens that to roughly [512k - 64, 512k + 192), and the
+  measured switches fall at about 704 / 960 + 512k. The production 1667 ref (768-row chunks, K 4) had a local gauge on about 30 % of z.
+- The fix:
+  - cf_gauge_fill_z: solve rows with all-zero sums take the sums linearly in z from the nearest summed rows, per column, before the
+    smoothing. This is on whenever --model-only and K > 1.
+  - unroll.sh MSTRIDE now defaults to 1. On the GPU that is about 4x a 7 s model pass. corpus desk.sh / fd.sh keep K 4 (CPU time),
+    with the interpolation.
+- To verify (post-pass, CPU): rerun the ref-dm1 count-field with --model-stride 4, then 1, and repeat pub1667's per-plane coherence
+  scan. The alternation should be gone.
+
 Fused --fit-h 2 fit fields (audit unroll #9, the deferred item; main 11-14: write it behind a flag, profile post-pass).
 - nn_fit_accum_lat now takes field cells of 1, 2 or 4 voxels as well as 8. Production runs --fit-h 2 and used to take the plane path:
   upsample, shuffle and stem into [11][nz][W][W] fp16 planes, then fit_accum_cell_k and fit_accum_w4_k.
