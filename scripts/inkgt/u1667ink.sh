@@ -126,5 +126,7 @@ CUDA_VISIBLE_DEVICES= ~/bin/lowprio ~/bin/memcap -m 24G $U strip-mosaic $O/strip
 log "done: $RD/img/overview.jpg $(tail -1 $RD/logs/mosaic.log)"
 fi
 [ -n "$SEGS" ] || exit 0
-printf 'set\ttol\tcoverage\tink_auc\tink_f1best\tct_auc\n'
-for t in $SD/inkscore-u1 $ST; do awk -F'\t' -v t=$(basename $t) '$2 == "all" { printf "%s\t%s\t%s\t%s\t%s\t%s\n", (t == "inkscore-u1" ? "ift3-24000" : t), $1, $5, $7, $8, $9 }' $t.tsv; done
+printf 'set\tsplit\ttol\tcoverage\tink_auc\tink_f1best\tct_auc\n'   # (holdout and validation first: "all" includes the trained-on labels; audit eval#16)
+for sp in holdout validation all; do
+  for t in $SD/inkscore-u1 $ST; do awk -F'\t' -v t=$(basename $t) -v sp=$sp '$2 == sp { printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", (t == "inkscore-u1" ? "ift3-24000" : t), sp, $1, $5, $7, $8, $9 }' $t.tsv; done
+done

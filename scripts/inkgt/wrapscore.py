@@ -31,13 +31,15 @@ ap.add_argument("--self-test", action="store_true", help="map onto the published
 a = ap.parse_args()
 tols = [float(t) for t in a.tol.split(",")]
 
+RD2_SHAPE = {}   # path -> the raster's full (H, W) (the label -> canvas factor F)
 def rd2(p, step):   # a 2-D raster at 1/step (zarr array dir or tif) -> bool >= half
     if p.endswith((".tif", ".tiff")):
         x = tifffile.imread(p)
         if x.ndim == 3: x = x[..., 0] if x.shape[-1] in (3, 4) else x[0]
+        RD2_SHAPE[p] = x.shape[:2]
         x = x[::step, ::step]
     else:
-        z = zarr.open_array(p, mode="r"); H, W = z.shape; rows = []
+        z = zarr.open_array(p, mode="r"); H, W = z.shape; rows = []; RD2_SHAPE[p] = (H, W)
         for r in range(0, H, 4096): rows.append(np.asarray(z[r:min(H, r + 4096), :])[(-r) % step::step, ::step])
         x = np.concatenate(rows, 0)
     return x >= (1 if x.max() <= 1 else 128)
@@ -69,7 +71,13 @@ for g in J["segments"]:
     if g.get("crop"):   # the label window [c0, r0, w, h] (label px): only its pixels (segments listed once per window)
         c0, r0, cw, chh = g["crop"]; win = np.zeros_like(M); win[r0 // a.step:(r0 + chh) // a.step, c0 // a.step:(c0 + cw) // a.step] = True; M = M & win
     rr, cc = np.nonzero(M)
-    gr, gc = rr * a.step * sc, cc * a.step * sc   # label px -> canvas px (F = 1: label px = canvas px, ink-score's (c + 0.5) F - 0.5) -> grid (canvas x scale)
+    # label px -> canvas px with ink-score's F ((c + 0.5) F - 0.5; inksplat.c: the canvas / label size ratio, a power of two when within 0.2 %)
+    # -> grid (canvas x scale). It was F = 1, wrong for labels on another resolution's canvas (audit eval#16).
+    LH, LW = RD2_SHAPE[g["labels"]]; ew, eh = Z.shape[1] / sc, Z.shape[0] / sc
+    F = 0.5 * (ew / LW + eh / LH); p2 = 2.0 ** round(np.log2(F))
+    if abs(F - p2) < 0.002 * p2: F = p2
+    if abs(F - 1) > 1e-3: print(f"labels: {g['name'][:44]:44s} F {F:.5f} canvas px per label px (labels {LW} x {LH}, canvas {ew:.0f} x {eh:.0f})", flush=True)
+    gr, gc = ((rr * a.step + 0.5) * F - 0.5) * sc, ((cc * a.step + 0.5) * F - 0.5) * sc
     ok = (gr >= 0) & (gc >= 0) & (gr <= Z.shape[0] - 1) & (gc <= Z.shape[1] - 1); gr, gc, rr, cc = gr[ok], gc[ok], rr[ok], cc[ok]
     r0 = np.floor(gr).astype(int).clip(0, Z.shape[0] - 2); c0 = np.floor(gc).astype(int).clip(0, Z.shape[1] - 2)
     valid = (Z[r0, c0] > 0) & (Z[r0 + 1, c0] > 0) & (Z[r0, c0 + 1] > 0) & (Z[r0 + 1, c0 + 1] > 0)
