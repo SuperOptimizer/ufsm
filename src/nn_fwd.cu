@@ -3,19 +3,31 @@
 
 gnp_t to_gnp(const nn_gn_t *g) { return g && g->G ? gnp_mk(g->gamma, g->beta, g->mean, g->rstd, g->G) : gnp_t{}; }
 /* slab-local GroupNorm registry (nn_lp.h): the statistics arrays that are per (sample, z-slab) and their geometry */
-static struct { const float *mean; int zs, zo, ns, zhw; } g_slab[8];
-static int g_nslab;
-extern "C" void lp_gn_slab_reg(const float *mean, int zs, int zo, int ns, int zhw) {   /* ns <= 0: remove mean's entry */
-    if (!mean) { g_nslab = 0; return; }
-    for (int i = 0; i < g_nslab; i++) if (g_slab[i].mean == mean) { if (ns > 0) g_slab[i] = {mean, zs, zo, ns, zhw}; else g_slab[i] = g_slab[--g_nslab]; return; }
-    if (ns <= 0) return;
-    if (g_nslab == 8) { fprintf(stderr, "lp_gn_slab_reg: more than 8 slab statistics arrays\n"); abort(); }
-    g_slab[g_nslab++] = {mean, zs, zo, ns, zhw};
+/* (2026-11-14 audit: written by every replica's build while the other GPU thread reads it; 8 entries = exactly 2 replicas x 4) */
+#include <pthread.h>
+#define GN_SLAB_MAX 32
+static struct { const float *mean; int zs, zo, ns, zhw; } g_slab[GN_SLAB_MAX];   /* mgpu: guarded (g_slab_mu; keys are device pointers, unique across GPUs) */
+static int g_nslab;   /* mgpu: guarded (g_slab_mu; read without it only as the "any" fast path) */
+static pthread_mutex_t g_slab_mu = PTHREAD_MUTEX_INITIALIZER;
+extern "C" void lp_gn_slab_reg(const float *mean, int zs, int zo, int ns, int zhw) {   /* ns <= 0: remove mean's entry; mean nullptr: clear all */
+    pthread_mutex_lock(&g_slab_mu);
+    if (!mean) { __atomic_store_n(&g_nslab, 0, __ATOMIC_RELEASE); pthread_mutex_unlock(&g_slab_mu); return; }
+    int i = 0; while (i < g_nslab && g_slab[i].mean != mean) i++;
+    if (i < g_nslab) { if (ns > 0) g_slab[i] = {mean, zs, zo, ns, zhw}; else { g_slab[i] = g_slab[g_nslab - 1]; __atomic_store_n(&g_nslab, g_nslab - 1, __ATOMIC_RELEASE); } }
+    else if (ns > 0) {
+        if (g_nslab == GN_SLAB_MAX) { fprintf(stderr, "lp_gn_slab_reg: more than %d slab statistics arrays\n", GN_SLAB_MAX); abort(); }
+        g_slab[g_nslab] = {mean, zs, zo, ns, zhw}; __atomic_store_n(&g_nslab, g_nslab + 1, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&g_slab_mu);
 }
-extern "C" int lp_gn_slab_any(void) { return g_nslab > 0; }
+extern "C" int lp_gn_slab_any(void) { return __atomic_load_n(&g_nslab, __ATOMIC_ACQUIRE) > 0; }
 extern "C" gnp_t gnp_mk(const float *gamma, const float *beta, const float *mean, const float *rstd, int G) {
     gnp_t p = {gamma, beta, mean, rstd, G};
-    if (G) for (int i = 0; i < g_nslab; i++) if (g_slab[i].mean == mean) { p.zs = g_slab[i].zs; p.zo = g_slab[i].zo; p.ns = g_slab[i].ns; p.zhw = g_slab[i].zhw; break; }
+    if (G && __atomic_load_n(&g_nslab, __ATOMIC_ACQUIRE) > 0) {
+        pthread_mutex_lock(&g_slab_mu);
+        for (int i = 0; i < g_nslab; i++) if (g_slab[i].mean == mean) { p.zs = g_slab[i].zs; p.zo = g_slab[i].zo; p.ns = g_slab[i].ns; p.zhw = g_slab[i].zhw; break; }
+        pthread_mutex_unlock(&g_slab_mu);
+    }
     return p;
 }
 __global__ void prep_w16_k(const float *w, __half *wp, float *wsc, int Co, int Ci, int Cop, int Cip) {

@@ -154,12 +154,28 @@ template <int MODE> __global__ void __launch_bounds__(128) gemm_ns_tc_k(const mu
    hand-tiled fp32 kernels reach ~10% of the card's fp32 rate on the 92 M net (121 ms per step) and the wmma fp16 ones are slower still */
 #include <cublasLt.h>
 typedef struct { int dev, m, n, k, ta, tc, ok; cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; } nsplan;
-static nsplan g_nsp[512]; static int g_nnsp;
-static cublasLtHandle_t g_nslt[16]; static void *g_nsws[16]; static const size_t NSWS = 32u << 20;
-static nsplan *nsplan_get(int dev, int ta, int m, int n, int k, int tc) {
+#include <pthread.h>
+static nsplan g_nsp[512]; static int g_nnsp;   /* mgpu: guarded (g_nsp_mu; entries keyed by device; today the optimizer runs on the main thread only,
+                                                  the lock keeps the table safe if the update moves into the per-GPU threads) */
+static cublasLtHandle_t g_nslt[16]; static void *g_nsws[16]; static const size_t NSWS = 32u << 20;   /* mgpu: per-device (g_nsp_mu) */
+static pthread_mutex_t g_nsp_mu = PTHREAD_MUTEX_INITIALIZER;
+static nsplan *nsplan_get_locked(int dev, int ta, int m, int n, int k, int tc);
+static nsplan *nsplan_get(int dev, int ta, int m, int n, int k, int tc) { pthread_mutex_lock(&g_nsp_mu); nsplan *p = nsplan_get_locked(dev, ta, m, n, k, tc); pthread_mutex_unlock(&g_nsp_mu); return p; }
+/* the device's cuBLASLt handle and workspace now (nn.h nn_muon_tc_reserve: before the memory planner measures the free memory) */
+extern "C" int nn_muon_tc_reserve(void) {
+    int dev = 0; cudaGetDevice(&dev); if (dev < 0 || dev >= 16) return -1;
+    pthread_mutex_lock(&g_nsp_mu);
+    int rc = 0;
+    if (!g_nslt[dev]) { if (cublasLtCreate(&g_nslt[dev]) != CUBLAS_STATUS_SUCCESS) { g_nslt[dev] = nullptr; rc = -1; } }
+    if (!rc && !g_nsws[dev] && cudaMalloc(&g_nsws[dev], NSWS) != cudaSuccess) { cudaGetLastError(); g_nsws[dev] = nullptr; rc = -1; }
+    pthread_mutex_unlock(&g_nsp_mu);
+    return rc;
+}
+static nsplan *nsplan_get_locked(int dev, int ta, int m, int n, int k, int tc) {
     for (int i = 0; i < g_nnsp; i++) { nsplan *p = &g_nsp[i]; if (p->dev == dev && p->m == m && p->n == n && p->k == k && p->ta == ta && p->tc == tc) return p; }
     if (g_nnsp == 512 || dev < 0 || dev >= 16) return nullptr;
-    if (!g_nslt[dev]) { if (cublasLtCreate(&g_nslt[dev]) != CUBLAS_STATUS_SUCCESS || cudaMalloc(&g_nsws[dev], NSWS) != cudaSuccess) return nullptr; }
+    if (!g_nslt[dev]) { if (cublasLtCreate(&g_nslt[dev]) != CUBLAS_STATUS_SUCCESS) { g_nslt[dev] = nullptr; return nullptr; } }
+    if (!g_nsws[dev] && cudaMalloc(&g_nsws[dev], NSWS) != cudaSuccess) { cudaGetLastError(); g_nsws[dev] = nullptr; return nullptr; }
     nsplan *p = &g_nsp[g_nnsp++]; memset(p, 0, sizeof *p); p->dev = dev; p->m = m; p->n = n; p->k = k; p->ta = ta; p->tc = tc;
     cublasLtMatmulDescCreate(&p->op, CUBLAS_COMPUTE_32F_FAST_TF32, CUDA_R_32F);
     const cublasOperation_t oa = ta ? CUBLAS_OP_T : CUBLAS_OP_N;

@@ -1852,14 +1852,26 @@ static int echo_busy(void *p) {
     for (int i = 0; i < e->n; i++) if (nn_event_done(e->ev[i])) { if (e->t_open <= 0) e->t_open = now(); return 0; }
     return e->n > 0;
 }
+/* --gn-ema under data parallel: the replicas' running GroupNorm statistics averaged (host round trip, ~100 KB; DESIGN 2026-11-14 "DP
+   safety"). Before --gn-ema-warm the training forward does not read them, and their update is linear, so averaging at the validation /
+   checkpoint steps gives the same statistics as averaging every step; from the warm-up on every step (the forwards read them) */
+static void gn_ema_average(gpu_state *G, int ng) {
+    size_t n = 0; float *p0 = unet_gn_ema_state(G[0].u, &n); if (!p0 || !n) return;
+    double *acc = calloc(n, sizeof *acc); float *h = malloc(n * 4);
+    for (int g = 0; g < ng; g++) { size_t m = 0; float *p = unet_gn_ema_state(G[g].u, &m); if (!p || m != n) { free(acc); free(h); return; }
+                                   nn_init(G[g].dev); nn_d2h(h, p, n * 4); for (size_t i = 0; i < n; i++) acc[i] += h[i]; }
+    for (size_t i = 0; i < n; i++) h[i] = (float)(acc[i] / ng);
+    for (int g = 0; g < ng; g++) { size_t m = 0; float *p = unet_gn_ema_state(G[g].u, &m); nn_init(G[g].dev); nn_h2d(p, h, n * 4); }
+    free(acc); free(h);
+}
 static double g_echo_idle;   /* --echo-max: seconds a GPU waited for the next batch (from its step's end to the batch's handover), the "idle" share */
-static void gstep_job(void *p) { gstep_arg *a = p; gstep_fwd(a); if (!a->rc) gstep_bwd(a); nn_tls_capture(&a->out); }
+static void gstep_job(void *p) { gstep_arg *a = p; nn_sr_salt(a->d->side < 0 ? (unsigned)a->g : 0u); gstep_fwd(a); if (!a->rc) gstep_bwd(a); nn_tls_capture(&a->out); }
 /* the per-GPU host threads (persistent: thread-local device scratch lives as long as they do), started on first use */
 typedef struct { pthread_t th; int dev, started, has; void (*fn)(void *); void *arg; nn_tls tls; } gworker;
 static gworker g_gw[8]; static pthread_mutex_t g_gw_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_gw_cv = PTHREAD_COND_INITIALIZER, g_gw_dcv = PTHREAD_COND_INITIALIZER;
 static int g_gw_pending;
 static void *gworker_main(void *p) {
-    gworker *w = p; nn_init(w->dev);
+    gworker *w = p; nn_init(w->dev); nn_err_worker(1);
     pthread_mutex_lock(&g_gw_mu);
     for (;;) {
         while (!w->has) pthread_cond_wait(&g_gw_cv, &g_gw_mu);
@@ -3921,6 +3933,8 @@ int cmd_train(int argc, char **argv) {
             const int l3_off = getenv("UFSM_L0_3BUF") && !ufsm_env_on("UFSM_L0_3BUF");   /* (UFSM_L0_3BUF=0: never the three level-0 buffers) */
             const int fastest = !strcmp(mm, "fast");
             size_t fmin = (size_t)-1;
+            for (int g = 0; g < ng; g++) { nn_init(G[g].dev); unet_reserve(G[g].u, use_muon, muon_tc); if (g_lat && lp_f8w_mixed_reserve()) fprintf(stderr, "memory: the input conv's chunk copies (96 MB) failed\n"); }
+            /* (the lazily allocated optimizer / attention / kernel workspaces exist now, so the free memory below has them out: 2026-11-14 audit) */
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); size_t f = nn_mem_free(); if (f < fmin) fmin = f; }
             nn_init(G[0].dev);
             if (getenv("UFSM_MEM_FREE_GB") && atof(getenv("UFSM_MEM_FREE_GB")) > 0) {   /* plan for another card's free memory (UFSM_MEM_DRY sizing for a busy GPU) */
@@ -4931,6 +4945,9 @@ int cmd_train(int argc, char **argv) {
           if (fault == step) nn_h2d(G[0].x, nullptr, 16); }
         if ((seconds && now() - t0 >= seconds) || (schedule_seconds && schedule_elapsed+now()-t0>=schedule_seconds) ||
             (limit_seconds && now() - t0 >= limit_seconds) || (stop_at && step >= stop_at)) g_stop = 1;
+        if (ng > 1 && G[0].side < 0 && cfg.gn_ema && (unet_gn_ema_updates(G[0].u) >= unet_gn_ema_warm(G[0].u) || step % val_every == 0 || step % ckpt_every == 0 || step == steps || g_stop)) {
+            gn_ema_average(G, ng); nn_init(G[0].dev);
+        }
         const int step_ok = nskip == nskip_seen; nskip_seen = nskip; nacc++; if (!step_ok) nskl += 1;   /* a skipped (non-finite) step: no loss / label means (try3 step 504: its nan entered rv / normal / ink) */
         if (step_ok) { acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][g_aff || g_unwrap || g_heads || g_fibdir > 0 ? NCH : g_half ? g_cout : cfg.cout]; acc_g += gn;
         if (g_verso_on) { acc_vbce += G[0].vout[0]; acc_vdice += G[0].vout[1]; }

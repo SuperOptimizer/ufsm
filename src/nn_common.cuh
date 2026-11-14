@@ -96,10 +96,14 @@ extern "C" void nn_set_grad_bf16(int on);
 extern "C" int nn_get_grad_bf16(void);
 #define GBF (ABF && g_gradbf)
 
-extern cudaError_t g_err;
+/* the CUDA error latch, per host thread (one thread per GPU under data parallel: a process-wide latch let one GPU's thread consume and
+   report the other's error, 2026-11-14 audit); each first error is also posted process-wide (nn_err_post) so the trainer's main thread
+   sees the GPU threads' errors in its nn_check */
+extern thread_local cudaError_t g_err;
 extern "C" const char *lp_check(void);
-extern const char *g_err_file, *g_err_what; extern int g_err_line;   /* the call site of the latched g_err (nn_check_site) */
-#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess && g_err == cudaSuccess) { g_err = e_; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = #x; if (ufsm_env_on("UFSM_CUDA_TRACE")) fprintf(stderr,"CUDA at %s:%d (%s): %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e_)); } } while (0)
+extern thread_local const char *g_err_file, *g_err_what; extern thread_local int g_err_line;   /* the call site of the latched g_err (nn_check_site) */
+extern "C" void nn_err_post(int e, const char *file, int line, const char *what);
+#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess && g_err == cudaSuccess) { g_err = e_; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = #x; nn_err_post((int)e_, __FILE__, __LINE__, #x); if (ufsm_env_on("UFSM_CUDA_TRACE")) fprintf(stderr,"CUDA at %s:%d (%s): %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e_)); } } while (0)
 #define KCHECK() CK(cudaGetLastError())
 
 extern "C" int nn_init(int device);

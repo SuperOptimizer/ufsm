@@ -74,14 +74,25 @@ static int stem_gnfuse(const void *x, int xbf, shape5 xs, const void *gy, shape5
    re-encoded as MX-fp8 (exact) with a zero plane on either side and the input's planes with their halo copied (the weight gradient
    is a sum over output voxels; the zero halo rows add nothing, the input's halo planes are the taps of the chunk's border rows).
    <= ~96 MB of chunk copies. */
+static uint8_t *g_f8m_tb[8]; static size_t g_f8m_cap[8];   /* mgpu: per-device (the chunk copies; nn_lp_ws_reserve allocates them before the plan) */
+#define F8M_CAP ((size_t)96 << 20)
+/* the chunk copies at their cap now (the trainer, before its memory planner measures the free memory: they were ~96 MB allocated at the
+   first backward, outside the plan, 2026-11-14 audit). need = (CZ + 2) pb <= 96 MB while a plane pair is <= 24 MB */
+extern "C" int lp_f8w_mixed_reserve(void) {
+    const int dv = cur_dev_();
+    if (g_f8m_cap[dv] >= F8M_CAP) return 0;
+    if (g_f8m_tb[dv]) cudaFree(g_f8m_tb[dv]);
+    if (cudaMalloc(&g_f8m_tb[dv], F8M_CAP) != cudaSuccess) { cudaGetLastError(); g_f8m_tb[dv] = nullptr; g_f8m_cap[dv] = 0; return -1; }
+    g_f8m_cap[dv] = F8M_CAP; return 0;
+}
 static void bwd_w_f8_mixed(const void *x, shape5 xs, const void *gy, shape5 ys, float *gw, float *gb, gnp_t gp, split_t sp) {
     int a_, c_;
     if (xs.n != 1 || ys.n != 1 || sp.up || sp.x2 || gp.G != 0 || sp.gp2.G != 0 || zw_win(ys.d, &a_, &c_) || xs.d != ys.d) { fprintf(stderr, "lp_bwd_w_f8: MX-fp8 x (%d channels) with MX-fp4 gradients: only the plain network input conv (N 1, no GroupNorm of x, no z-window)\n", xs.c); abort(); }
     const size_t HW = (size_t)xs.h * xs.w, pb = HW * ((size_t)mx_nb(xs.c) * (mx_bw(xs.c) + 1) + (size_t)mx_nb(ys.c) * (mx_bw(ys.c) + 1));   /* bytes a plane of both copies */
-    int CZ = (int)(((size_t)96 << 20) / pb) - 2; CZ &= ~1; if (CZ < 2) CZ = 2;
+    int CZ = (int)(F8M_CAP / pb) - 2; CZ &= ~1; if (CZ < 2) CZ = 2;
     { static int cze = -1; if (cze < 0) cze = getenv("UFSM_F8W_MIXED_CZ") ? atoi(getenv("UFSM_F8W_MIXED_CZ")) : 0; if (cze > 0) CZ = cze; }   /* (tests: several chunks of a small tensor) */
     if (CZ > xs.d) CZ = xs.d;
-    static uint8_t *tb[8]; static size_t tcap[8];
+    uint8_t **tb = g_f8m_tb; size_t *tcap = g_f8m_cap;
     const int dv = cur_dev_(); const size_t need = (size_t)(CZ + 2) * pb;
     if (need > tcap[dv]) { if (tb[dv]) cudaFree(tb[dv]); if (cudaMalloc(&tb[dv], need) != cudaSuccess) { fprintf(stderr, "lp_bwd_w_f8: no device memory for %.0f MB of chunk copies\n", need / 1e6); abort(); } tcap[dv] = need; }
     const uint32_t sr0 = sp.sr;
