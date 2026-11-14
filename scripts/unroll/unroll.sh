@@ -197,11 +197,23 @@ occlv() {   # --occupancy L for the fields: the first of levels LV+3, LV+2, LV+4
                      *) [ -e $R/$K/$l/zarr.json ] && { echo "--occupancy $l"; return; };; esac
   done
 }
+# FBLEND=1 (OFF by default; audit 2026-11-14 #5, A/B pending): each part predicted on two tile grids (origin 0 and half the stride) and
+# blended with ufsm field-blend --tile (sin^2 weights: every cell leans on the window it sits deep inside), against the tile-border steps of
+# the single-grid fields (1667 u1 640/64: the normal plane t0 steps 4-5x its interior median at every 256-cell border). Lat fields only.
 fpred() {   # fpred GPU BOX OUT
+  if [ "${FBLEND:-0}" = 1 ] && [ "$FKIND" = lat ]; then
+    local st=$(( ${LWIN:-640} - 2 * ${LHALO:-64} )) gg
+    for gg in 0 $((st / 2)); do fpred1 $1 $2 $3.g$gg $gg || return 1; done
+    X $O/logs/fields.log $U field-blend $3 $3.g0 $3.g$((st / 2)) --tile $st,$st,$st --grids 0,0,0:$((st / 2)),$((st / 2)),$((st / 2)) --threads $TH || return 1
+    [ "$DRY" = 1 ] || { [ -e $3/fields.json ] && rm -rf $3.g0 $3.g$((st / 2)); }; return
+  fi
+  fpred1 $1 $2 $3 0
+}
+fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windows anchored at GRID (each axis)
   local win; if [ "$FKIND" = lat ]; then win="--window ${LWIN:-640} --halo ${LHALO:-64}"
   else win="$([ "${FWIN:-prod}" = auto ] && echo "--window auto" || echo "--window-z 384 --halo-z 64 --window 640") --halo 64"; fi
   X $O/logs/fields.log $U predict $CK $R $K $3.tmp --um $UM --level $LV --box $2 $win --shard 512 \
-    --grid-origin 0,0,0 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $(occlv) &&
+    --grid-origin $4,$4,$4 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
 # --- the ref's pass 1 streamed behind the fields predict (REFSTREAM; 6a, 11-12) ---
@@ -210,7 +222,7 @@ fpred() {   # fpred GPU BOX OUT
 # the box rows in OUT/rows.ready) and runs count-field --pool-only --follow on it: the chunks in the parts' order, each once its rows are
 # written. The pooled sums equal a whole-box pass 1 (per chunk, disjoint solve rows; the prior from the middle row's chunk; the chunk
 # rows fixed by refcz in both runs), so the ref (--pool-cache) is byte-identical to the stage-barrier ref with those chunk rows.
-refstream_on() { [ "${REFSTREAM:-1}" = 1 ] && [ "$FKIND" = lat ] && [ "${RECTOSP:-1}" = 0 ] && [ "${CTCAL:-0}" != 1 ] && [ -z "${REFCMD:-}" ] && [ "$DRY" != 1 ]; }
+refstream_on() { [ "${REFSTREAM:-1}" = 1 ] && [ "${FBLEND:-0}" != 1 ] && [ "$FKIND" = lat ] && [ "${RECTOSP:-1}" = 0 ] && [ "${CTCAL:-0}" != 1 ] && [ -z "${REFCMD:-}" ] && [ "$DRY" != 1 ]; }
 refstream() {   # refstream OUT PART..
   local S=$1; shift; local parts=("$@") k p pl z a b n=0 starts=() fs cz cfp=
   rm -rf $S $S.fin $O/ref.pool $O/ref.pool.ok; mkdir -p $S
