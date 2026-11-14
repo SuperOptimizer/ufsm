@@ -23,8 +23,8 @@ static float frand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return
 
 static void prec(int fp4) {
     nn_set_tf32(1); nn_set_f16(1); nn_set_sr(0);
-    if (fp4) { nn_set_prec(3); nn_set_prec_policy("all=fp4:fp4:fp4,enc0.c1=fp16"); unet_set_act_mx4(1); }
-    else { nn_set_prec(1); nn_set_prec_policy(""); unet_set_act_mx4(0); }
+    if (fp4) { nn_set_prec(3); nn_set_prec_policy("all=fp4:fp4:fp4,enc0.c1=fp16"); unet_set_act_mx4(1); unet_set_input_prec(4); }   /* (the trainer's runtime: MX-fp4 input) */
+    else { nn_set_prec(1); nn_set_prec_policy(""); unet_set_act_mx4(0); unet_set_input_prec(0); }
 }
 /* mean |a - b| / mean |a| */
 static double rel(const float *a, const float *b, size_t n) { double e = 0, m = 0; for (size_t i = 0; i < n; i++) { e += fabs((double)a[i] - b[i]); m += fabs(a[i]); } return e / (m > 0 ? m : 1); }
@@ -67,6 +67,7 @@ static unet *donor_of(const unet_cfg *c, const char *path) {
 }
 
 int main(void) {
+    setvbuf(stdout, nullptr, _IOLBF, 0);
     if (nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0)) { printf("no cuda\n"); return 1; }
     char path[256], wpath[256]; snprintf(path, sizeof path, "%s/test_widen.%d.ckpt", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid());
     snprintf(wpath, sizeof wpath, "%s.w", path);
@@ -99,6 +100,7 @@ int main(void) {
         unet_cfg dc, tc; int s1, s2;
         if (unet_peek(dp, &dc, &s1) || unet_peek(tp, &tc, &s2)) { printf("cannot read %s / %s\n", dp, tp); return 1; }
         tc.down_norm = dc.down_norm; tc.skip_thr = 0;
+        if (getenv("TW_WIDTHS")) { int k = 0; char *t = strdup(getenv("TW_WIDTHS")); for (char *q = strtok(t, ","); q && k < tc.nlev; q = strtok(nullptr, ",")) tc.widths[k++] = atoi(q); free(t); }   /* (another target width set) */
         prec(0); unet *w = unet_create(&tc); unet_init(w, 11);
         int rows[512]; for (int co = 0; co < tc.cout; co++) rows[co] = co < 11 ? co : co >= tc.cout - 128 ? dc.cout - 128 + co - (tc.cout - 128) : -1;
         rows[12] = 11; rows[13] = 12;   /* (u1's rv pair 11-12 -> 12-13; ink 11 and the fibre rows fresh) */

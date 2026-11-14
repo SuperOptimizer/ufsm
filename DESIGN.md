@@ -6,6 +6,65 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Widening warm start: u1 -> scratch2's architecture with the donor's function (2026-11-14, branch widen-20261114)
+
+From scratch, scratch2's architecture does not learn phase or wind4: try4 was at chance after 1866 steps, and every latent net that
+works was warm-started. But `--init-from` copies only exact-shape tensors, so u1 (10 M; widths 96,128,160,192; 4 levels) gave
+scratch2 (6 levels, 4 attention blocks, gfilm) nothing.
+
+`train --init-from u1.ckpt --init-widen 1` (`unet_init_widen`) builds the wider, deeper net so that it computes u1's function.
+
+**How.**
+- **Replicated channels.** Every channel space of the donor's levels 0..3 is replicated GroupNorm group by group. Both nets have
+  8 groups. Target channel j of group g is a copy of donor channel g·cpg_d + (j mod cpg_t) mod cpg_d. Each conv's input weights
+  are divided by the copy count, so every conv computes the donor's sums. The convs covered are the encoders, the down convs (with
+  down_norm), the decoders and the head.
+- **When this is exact.** A group's mean and variance stay the donor's only if every source channel has the same number of copies,
+  i.e. the target's channels per group are a whole multiple of the donor's.
+- **The extra levels.** They sit between the donor's bottom (enc3) and its first decoder (dec2). The path runs through dec[3]
+  (conv, GN, SiLU, conv, GN, SiLU, with no residual), which cannot be an identity. Instead it passes the raw bottom tensor `a` with
+  silu(z) − silu(−z) = z:
+  - enc3.c2 writes +a and −a in pairs. Each group is symmetric, so its mean is exactly 0 and its normalisation is a per-group scale r.
+  - dec3.c1 takes the pair difference (centre taps) into new pairs, and dec3.n1 scales again.
+  - dec3.c2 takes the difference: r·r'·a.
+  - GroupNorm is scale-invariant, so dec3.n2 (the donor's enc3.n2 parameters and FiLM) reproduces the donor's output exactly.
+- **New parts.** Levels 4-5 feed dec3.c1 through zero weights. gfilm (A/B zero) and the attention stage (zero out-projections) start
+  as identities, so the new parts are a no-op at step 0 but receive gradients.
+- **Head and stem.**
+  - Head rows are mapped by name: rows 0-10 kept, rv 12-13 from 11-12, and the sub-cell rows 32-159 from 16-143. The usual
+    lat-guide-3 sub-cell zeroing is skipped.
+  - Ink and fibre rows start fresh with their bias priors.
+  - The fine stem keeps W1 and b1; its W2 rows are mapped by channel, and its 10 new outputs start at 0.
+  - FiLM pairs are copied per channel; the new norms get none.
+- **Other state.** EMA weights get the same mapping. Optimiser state starts at 0, and the inherited ranges are recorded for
+  `--init-lr-mult`. gn_ema's running statistics start empty, so the warm-up forwards use the window's statistics, as u1 does.
+- **Requirements, otherwise it refuses:** the same group count and input count; down_norm as the donor (u1 has it, so try4 needs
+  `--down-norm 1`); the bottom width at least twice the donor's (for the pairs); no residual blocks or custom decoder widths.
+
+**test_widen**, on the perf pod RTX PRO 4000. Each figure is mean |d| / mean |logit| on the same random window, inference.
+- 3 → 4 levels with attention and gfilm, whole copies (32,64,96 → 64,128,192,96): 3.0e-4 at 16-bit.
+- u1-like uneven copies (96,128,160 → 256,320,384,96): 1.6e-2.
+- The real u1 → scratch2 config, rows 0-10:
+
+| target widths | per group | 16-bit | MX-fp4 (u1's own fp4 vs 16-bit gap 0.24) |
+|---|---|---|---|
+| 192,256,320,384 +288,288 (2x) | whole copies | 3.0e-4 | 0.23 |
+| 288,384,480,576 +288,288 (3x) | whole copies | 4.4e-4 | 0.25 |
+| 256,320,384,448 +288,288 (scratch2) | 12->32, 16->40, 20->48, 24->56 | 0.124 (max 1.0) | 0.30 |
+
+**Through the trainer** on the wind fixture: P 512, lr 0, `--det 1`, the same windows. Reference is u1 itself (an identity widen, so
+its sub-cell rows are kept). Widened is 2x widths, 6 levels, attention, gfilm, gn-ema.
+- Per step, phase bce reference / widened: 0.7088/0.7097, 0.5681/0.5577, 0.4483/0.4452, 0.5604/0.5524.
+- wind4 acc: 0.360/0.363, 0.539/0.537, 0.701/0.677, 0.543/0.550.
+- rv bce: 0.362/0.356, 0.191/0.181.
+- These agree within the fp4 noise.
+At scratch2's own widths (uneven copies), the same windows give:
+- phase 0.7122, 0.5402, 0.4491, 0.5414;
+- wind4 acc 0.376, 0.552, 0.686, 0.540.
+
+On real labelled windows these widths stay as close: the 12% logit deviation on random inputs does not show up as a loss gap.
+A real-data step-0 check, at lr 0 on the desk data path, is still to be run in a desk window.
+
 ## Adaptive data echoing: `--echo-max M` (2026-11-14, branch echo-20261114)
 
 scratch2 waits on the sampler for 20-35 % of a long run (the 30-step bench showed 0 %), and the user accepts data echoing in
