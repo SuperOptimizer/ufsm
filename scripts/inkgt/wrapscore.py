@@ -10,7 +10,8 @@ scaled to level 0 (x um_wrap / um_label). Each sample finds the nearest grid ver
 that cell's bilinear patch (Gauss-Newton, 6 steps). Its distance d is the surface-to-surface miss. With d <= tol the sample takes the
 value of our ink map at the foot point's canvas pixel (canvas = grid / scale; the map: --map DIR/<s>.tif or <s>_ink.jpg / <s>.jpg,
 grey, any size proportional to the canvas) and the CT map's (<s>_ct.tif / <s>_ct.jpg, the floor).
-Out per tolerance and split (all / validation / holdout / rest): labelled samples, coverage (share within tol), ink share, AUC and
+Out per tolerance and split (heldout = validation | holdout, the headline and the only split to gate on; validation / holdout
+apart; rest = the samples the ink nets train on, ~76 % of 1667's; all = everything, never a headline: audit 11-14 #4): labelled samples, coverage (share within tol), ink share, AUC and
 best F1 of the ink map, the same for the CT, the median miss. The maps can be stretched: AUC and best F1 are rank-based (any
 monotone stretch gives the same), F1 at a fixed threshold is not reported.
 Memory: the stripes' vertices within the labelled bboxes (+ 200 voxels) only; ~50 bytes a vertex for the tree.
@@ -27,6 +28,8 @@ ap.add_argument("--step", type=int, default=8); ap.add_argument("--tol", default
 ap.add_argument("--holdouts", default="/vesuvius/ufsm/inkgt/holdouts-ink.json"); ap.add_argument("--ct-key", default=None)
 ap.add_argument("--vertices", default=None, help="coverage only from a vertex dump (ufsm wrap-dump: float32 z, y, x, id, col records) instead of stripes")
 ap.add_argument("--vertex-um", type=float, default=9.596, help="the dump's voxel size")
+ap.add_argument("--gate-auc", type=float, default=0, help="exit 3 when the held-out (validation + holdout) ink AUC at the middle tolerance is below this")
+ap.add_argument("--min-heldout", type=float, default=0.05, help="warn when held-out samples are fewer than this share of all (the per-scroll holdout rule: ~8-10 %% of boxes)")
 ap.add_argument("--self-test", action="store_true", help="map onto the published meshes themselves (the labels as the map): AUC 1, miss 0")
 a = ap.parse_args()
 tols = [float(t) for t in a.tol.split(",")]
@@ -96,7 +99,7 @@ if a.vertices:
     miss_um = np.abs(np.einsum("ni,ni->n", P - c, nrm)) * umL; miss_um[dd[:, 0] * umL > 120] = np.inf
     print(f"vertices: {len(D)} near the labels; nearest vertex median {np.median(dd[:, 0]) * umL:.1f} um; normal miss median {np.median(miss_um[np.isfinite(miss_um)]):.1f} um", flush=True)
     rows = ["tol_um\tsplit\tlabelled\tcovered\tcoverage\tink_share\tmiss_med_um"]
-    splits = {"all": np.ones(len(P), bool), "validation": VAL, "holdout": HOLD, "rest": ~VAL & ~HOLD}
+    splits = {"heldout": VAL | HOLD, "validation": VAL, "holdout": HOLD, "rest": ~VAL & ~HOLD, "all": np.ones(len(P), bool)}
     for t in tols:
         for nm, sp in splits.items():
             s_ = sp & (miss_um <= t); fm = miss_um[sp & np.isfinite(miss_um)]
@@ -173,11 +176,18 @@ def auc_f1(v, y):
     return auc, f1.max()
 
 rows = ["tol_um\tsplit\tlabelled\tcovered\tcoverage\tink_share\tink_auc\tink_f1best\tct_auc\tct_f1best\tmiss_med_um"]
-splits = {"all": np.ones(len(P), bool), "validation": VAL, "holdout": HOLD, "rest": ~VAL & ~HOLD}
+splits = {"heldout": VAL | HOLD, "validation": VAL, "holdout": HOLD, "rest": ~VAL & ~HOLD, "all": np.ones(len(P), bool)}
+res = {}
 for t in tols:
     cov = miss_um <= t   # (the surface coverage needs no map: a run without renders gets it alone; the scores take the samples with a map value)
     for nm, sp in splits.items():
         s = sp & cov; si = s & (INK >= 0); sc_ = s & (CT >= 0)
-        ia, if1 = auc_f1(INK[si], LAB[si]); ca, cf1 = auc_f1(CT[sc_], LAB[sc_])
+        ia, if1 = auc_f1(INK[si], LAB[si]); ca, cf1 = auc_f1(CT[sc_], LAB[sc_]); res[(t, nm)] = (ia, ca, s.sum() / max(sp.sum(), 1))
         rows.append(f"{t:g}\t{nm}\t{sp.sum()}\t{s.sum()}\t{s.sum() / max(sp.sum(), 1):.3f}\t{LAB[s].mean() if s.any() else float('nan'):.3f}\t{ia:.4f}\t{if1:.4f}\t{ca:.4f}\t{cf1:.4f}\t{np.median(miss_um[sp]) if sp.any() else float('nan'):.1f}")
 open(a.out, "w").write("\n".join(rows) + "\n"); print("\n".join(rows))
+tm = tols[len(tols) // 2]; ia, ca, cv = res[(tm, "heldout")]; ra = res[(tm, "rest")][0]; nh = (VAL | HOLD).mean()
+print(f"HEADLINE held-out (validation + holdout, {nh:.3f} of the samples) at {tm:g} um: ink AUC {ia:.4f} (CT {ca:.4f}), coverage {cv:.3f}; "
+      f"training labels (rest) {ra:.4f}, not a quality number", flush=True)
+if nh < a.min_heldout: print(f"WARNING: held-out samples are {nh:.3f} of all (< {a.min_heldout}): too few to judge the ink", flush=True)
+if a.gate_auc > 0 and not (ia >= a.gate_auc):
+    print(f"GATE: held-out ink AUC {ia:.4f} < {a.gate_auc}", flush=True); sys.exit(3)

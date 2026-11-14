@@ -2044,11 +2044,15 @@ u1 unroll (ift3-24000 ink, out of sample on 1667), 40 um, all samples:
 |---|---|---|---|---|---|
 | centre, depth 1 + fill | 0.860 | 15.1 um | 0.646 (0.645 / 0.648) | 0.435 | 0.540 |
 | centre, thin +-2 | 0.860 | 15.1 um | 0.646 | 0.434 | 0.540 |
-| recto face (-1.5 voxels) fill / thin | 0.848 | 16.6 um | 0.648 / 0.647 | 0.437 | 0.535 |
-| verso face (+1.5 voxels) fill / thin | 0.795 | 22.4 um | 0.643 / 0.643 | 0.431 | 0.526 |
+| recto face (1.5 voxels toward the axis) fill / thin | 0.848 | 16.6 um | 0.648 / 0.647 | 0.437 | 0.535 |
+| verso face (1.5 voxels away from the axis) fill / thin | 0.795 | 22.4 um | 0.643 / 0.643 | 0.431 | 0.526 |
 
 - Coverage at 20 / 80 um (centre): 0.615 / 0.971.
 - The validation split runs 0.01-0.035 higher, the ink holdout boxes about 0.01 lower.
+- Sign (settled 11-14, audit #20): the recto is the face toward the scroll axis. `rvside.sh` moves wraps_snap by `tifxyz-scale --normal
+  +1.5 --toward AXIS` (+n oriented toward the axis), so its logs say +1.5 for wraps_in_recto and -1.5 for wraps_out_verso; this table
+  earlier wrote the same shifts as -1.5 / +1.5 along the outward radius. The pub1667 comparison agrees: the published (recto) surface
+  lies 4 um inward of our centre surface at the median.
 - The face shift and the thin band move the ink AUC by <= 0.005. The limit is the ink model, not the render. The published meshes lie
   slightly to the recto side of our centre surface.
 
