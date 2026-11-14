@@ -45,6 +45,22 @@ fi
 echo
 pd=$(v p05x paris4,paris4j 8); plo=$(v p05x paris4,paris4j 9); phi=$(v p05x paris4,paris4j 10); id=$(v ids paris4,paris4j 8); md=$(v p05x paris4,paris4j 12)
 ghi=$(v p05x 1667 10); gihi=$(v ids 1667 10); np=$(v p05x paris4,paris4j 3); ng=$(v p05x 1667 3)
+# every rule needs numbers and the full box set (audit eval#11, #12): wbench-stats prints "na" without rows, and "na" + 0 = 0 passed
+# R3; a box the candidate failed (fit died twice: na) left the paired set, so failing the hard boxes looked better. The expected n is
+# the baseline's own n on the same set (the clean set uses REF's ceilings for both sides), so any box missing on the candidate side
+# blocks the verdict.
+isnum() { [[ $1 =~ ^[-+]?[0-9]+(\.[0-9]+)?$ ]]; }
+en() { $ST wbench-stats $RR --metric $1 --scroll $2 --tsv 1 --n 1 | awk -F'\t' 'NR == 2 { print $3 }'; }
+ep=$(en p05x paris4,paris4j); eg=$(en p05x 1667); ok=1; why=""
+for x in "$pd" "$plo" "$phi" "$id" "$ghi" "$gihi"; do isnum "$x" || { ok=0; why="missing values"; }; done
+[ "$np" = "$ep" ] || { ok=0; why="${why:+$why; }primary $np of $ep boxes scored"; }
+[ "$ng" = "$eg" ] || { ok=0; why="${why:+$why; }guard $ng of $eg boxes scored"; }
+if [ $ok = 0 ]; then
+  echo "missing boxes (in $REF, not scored for $TAG):"
+  awk -F'\t' 'NR == FNR { if (FNR > 1 && $4 ~ /^[0-9.]+$/) s[$2] = 1; next } FNR > 1 && !($2 in s) { printf "  %s %s\n", $2, $3 }' $T/a.tsv $RR | sort -u
+  echo "VERDICT $TAG: INCOMPLETE: $why; failed or missing boxes count against the candidate, rerun them before a verdict"
+  exit 3
+fi
 r1=$(awk -v lo=$plo -v d=$id 'BEGIN { print (lo + 0 > 0 && d + 0 >= 0) ? "PASS" : "fail" }')
 r2=$(awk -v a=$sa -v b=$sb -v n=$sn -v k=$sk 'BEGIN { print (n >= 4 && b - a >= 0.03 && k >= 3) ? "PASS" : (n < 4 ? "incomplete" : "fail") }')
 r3=$(awk -v a=$ghi -v b=$gihi 'BEGIN { print (a + 0 >= 0 && b + 0 >= 0) ? "PASS" : "fail" }')

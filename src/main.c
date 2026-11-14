@@ -1409,8 +1409,13 @@ static int score_codes(z3 *z, double cf, const long long org[3], const int shp[3
     for (int k = 0; k < NF; k++) { double e = (k + 0.5) * 14.0 / NF - mode - mean; e -= 14 * round(e / 14); close += fabs(e) < 0.08 ? fine[k] : 0; if (fabs(e) < 0.5) ah[(int)(fabs(e) * 1024)] += fine[k]; }
     size_t na2 = 0; for (int k = 0; k <= NF / 28; k++) na2 += ah[k];
     double med = 0, p90 = 0; { size_t c = 0; int got = 0; for (int k = 0; k <= NF / 28; k++) { c += ah[k]; if (!got && c * 2 >= na2) { med = (k + 0.5) / 1024; got = 1; } if (c * 10 >= na2 * 9) { p90 = (k + 0.5) / 1024; break; } } }
-    printf("fit score: %zu labelled voxels, gauge %.3f, winding ids right %.4f, |error| < 0.08 turn %.4f, |error| median %.3f p90 %.3f turn\n", nd, mode + mean,
-           nd ? (double)right / nd : 0, nd ? (double)close / nd : 0, na2 ? med : 0, na2 ? p90 : 0);
+    /* "winding ids right" stays right / nd (comparable with the stored baselines); labelled voxels the fit never reached (no U) cost
+       nothing there, so the line also carries right / (nd + unreached) and the unreached share: a fit that leaves the hard parts
+       unreached no longer looks better unseen (audit eval#12) */
+    printf("fit score: %zu labelled voxels, gauge %.3f, winding ids right %.4f, |error| < 0.08 turn %.4f, |error| median %.3f p90 %.3f turn,"
+           " ids right of all labelled %.4f, unreached %.4f\n", nd, mode + mean,
+           nd ? (double)right / nd : 0, nd ? (double)close / nd : 0, na2 ? med : 0, na2 ? p90 : 0,
+           nd + nan ? (double)right / (double)(nd + nan) : 0, nd + nan ? (double)nan / (double)(nd + nan) : 0);
     if (nan) printf("  %zu labelled voxels without U (%.4f of those in the box), not scored\n", nan, (double)nan / (nan + nd));
     const int dpass2 = P && atomic_load(&P->dover);
     if (detail && (ndet || dpass2)) {

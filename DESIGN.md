@@ -6,6 +6,20 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Eval: no silent drop-outs in wgate, unreached voxels, saturated ink (2026-11-14, branch evalfix3-20261114, audit eval#11-13)
+
+Source only (no builds, user 11-14); the final sweep builds and tests.
+- wgate-table.sh (eval#11, #12): every rule needs numeric values and the full box set. The expected n per set is the baseline's own n
+  (`wbench-stats REF`, the same clean set since both sides use REF's ceilings); a candidate box that failed (na) or is missing now
+  lists the boxes and ends in `VERDICT TAG: INCOMPLETE` (exit 3) instead of dropping out of the paired stats. Before, "na" + 0 = 0 passed
+  R3 and failing the hard boxes made a candidate look better.
+- fit score (eval#12): "winding ids right" stays right / nd so stored baselines stay comparable; the line gains
+  `ids right of all labelled` = right / (nd + unreached) and the `unreached` share (labelled voxels without U), appended at the end so
+  the existing greps keep working.
+- ink-vscore (eval#13): a prediction's 255 was skipped as unknown, but the ink heads write round(255 sigmoid), where 255 = p >= 0.998.
+  `--pred-unknown auto` (default) skips 255 only for prob254 arrays (fill_value 255, as ink-splat writes); otherwise 255 is scored in
+  the top bin and the count is logged. Numbers of sharp models rise relative to earlier vscores (their most confident voxels now count).
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the
