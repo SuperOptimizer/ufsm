@@ -185,6 +185,22 @@ int main(void) {
               CHECK(!cmd_strip_mosaic((int)(sizeof av / sizeof *av), av), "strip-mosaic 1:1 overview --threads %s failed", t2[k]); }   /* (was 19 for 17 arguments: read past av, survived gcc's stack layout, not clang's) */
           snprintf(cmd, sizeof cmd, "cd %s && for x in $(ls m11); do cmp -s m11/$x m12/$x || { echo $x; exit 1; }; done && for x in $(ls m11p); do cmp -s m11p/$x m12p/$x || { echo $x; exit 1; }; done", root);
           CHECK(!system(cmd), "strip-mosaic 1:1 overview: --threads 5 --stripe-jobs 3 differs from 1 / 1"); }
+        /* a stripe without its renders: the mosaic is written with the gap, but the exit is 3 (audit 11-14 #11: it was 0); --allow-missing 1
+           accepts it; with --stretch (no pass 1) the stripe is unreadable in pass 2: exit 1 */
+        {
+            char rm_[400], a1[400], a3[400]; snprintf(rm_, sizeof rm_, "%s/rmiss", root); snprintf(a1, sizeof a1, "%s/strip/flat", root);
+            snprintf(cmd, sizeof cmd, "rm -rf %s && cp -r %s %s && rm -f $(ls %s/*_ct.tif | head -1)", rm_, rdir, rm_, rm_); CHECK(!system(cmd), "rmiss setup");
+            snprintf(a3, sizeof a3, "%s/mmiss", root);
+            char *av[] = {"ufsm", "strip-mosaic", a1, rm_, a3, "--threads", "2", "--rows", "2", "--overview-px", "600"};
+            const int rc = cmd_strip_mosaic((int)(sizeof av / sizeof *av), av); CHECK(rc == 3, "strip-mosaic with a missing stripe: exit %d, want 3", rc);
+            snprintf(cmd, sizeof cmd, "test -s %s/overview.jpg", a3); CHECK(!system(cmd), "strip-mosaic with a missing stripe wrote no overview");
+            char *av2[] = {"ufsm", "strip-mosaic", a1, rm_, a3, "--threads", "2", "--rows", "2", "--overview-px", "600", "--allow-missing", "1"};
+            CHECK(cmd_strip_mosaic((int)(sizeof av2 / sizeof *av2), av2) == 0, "strip-mosaic --allow-missing 1 with a missing stripe: not 0");
+            char *av3[] = {"ufsm", "strip-mosaic", a1, rm_, a3, "--threads", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv};
+            CHECK(cmd_strip_mosaic((int)(sizeof av3 / sizeof *av3), av3) != 0, "strip-mosaic --stretch with a missing stripe: exit 0");
+            char *av4[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "2", "--rows", "2", "--overview-px", "600"};
+            CHECK(cmd_strip_mosaic((int)(sizeof av4 / sizeof *av4), av4) == 0, "strip-mosaic with every stripe: not 0");
+        }
     }
     /* streamed strip (.sfc wraps, 64-row bands decoded while encoding) = the whole-decode path (UFSM_STRIP_FULL=1), byte for byte: 150
        rows (3 bands, the last partial), holes, --every 1 / 2, threads 1 / 5 */

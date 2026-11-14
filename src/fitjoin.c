@@ -395,13 +395,15 @@ static double fj_fcost(const fj_hist *F, double w, long d) { return F && F->tot 
 int cmd_fit_join(int argc, char **argv) {
     if (argc < 7) {
         fprintf(stderr, "usage: ufsm fit-join <out-set> <fields-dir> [--blend 16] [--min-conf 0.3] [--samples 4000000] [--ref MODEL [--ref-w 1] [--chain-w 1] [--ref-samples 200000] [--ref-rows 16]]\n"
-                        "       [--global 1 [--cap 3] [--min-cells 20000]] [--fibers F.fib --join-fib W [--join-fib-arc 0.6] [--join-fib-gap 0]] <slab-model> <z0> <z1> ...\n"
-                        "  slabs of one field box (same y / x crop), interiors [z0, z1) in box-local native z, in z order; --ref: the integer gauges from a global model\n");
+                        "       [--global 1 [--cap 3] [--min-cells 20000]] [--fibers F.fib --join-fib W [--join-fib-arc 0.6] [--join-fib-gap 0]] [--require-constrained 1] <slab-model> <z0> <z1> ...\n"
+                        "  slabs of one field box (same y / x crop), interiors [z0, z1) in box-local native z, in z order; --ref: the integer gauges from a global model\n"
+                        "  a slab with no ref cells and no overlap cells on either side has no evidence for its gauge (warned and counted;\n"
+                        "  --require-constrained 1: exit 3 then)\n");
         return 2;
     }
     const char *out = argv[2], *fdir = argv[3];
     double blend = 16, minc = 0.3, refw = 1, chainw = 1, cap = 3, mincells = 20000; long long nsamp = 4000000, nref = 200000; const char *refdir = nullptr;
-    int glob = 0, refrows = 16; const char *fibp = nullptr; double fibw = 1, fibarc = 0.6, fibgap = 0;
+    int glob = 0, refrows = 16, reqc = 0; const char *fibp = nullptr; double fibw = 1, fibarc = 0.6, fibgap = 0;
     int ai = 4;
     for (; ai + 1 < argc && !strncmp(argv[ai], "--", 2); ai += 2) {
         if (!strcmp(argv[ai], "--blend")) blend = atof(argv[ai + 1]);
@@ -419,6 +421,7 @@ int cmd_fit_join(int argc, char **argv) {
         else if (!strcmp(argv[ai], "--join-fib")) fibw = atof(argv[ai + 1]);
         else if (!strcmp(argv[ai], "--join-fib-arc")) fibarc = atof(argv[ai + 1]);
         else if (!strcmp(argv[ai], "--join-fib-gap")) fibgap = atof(argv[ai + 1]);
+        else if (!strcmp(argv[ai], "--require-constrained")) reqc = atoi(argv[ai + 1]);
         else { fprintf(stderr, "fit-join: unknown option %s\n", argv[ai]); return 2; }
     }
     const int ns = (argc - ai) / 3;
@@ -577,12 +580,15 @@ int cmd_fit_join(int argc, char **argv) {
         }
         int j = 0; for (int i = 1; i < NC; i++) if (cost[(size_t)(ns - 1) * NC + i] < cost[(size_t)(ns - 1) * NC + j]) j = i;
         for (int k = ns - 1; k >= 0; k--) { S[k] = cen[k] + j - RC; if (k) j = arg[(size_t)k * NC + j]; }
+        /* a slab with no ref cells and no overlap cells on either side: every candidate costs 0 and the tie-break picked cen - RC (12 turns off);
+           its gauge is the chain's prediction instead (its neighbours' costs do not depend on it: no overlap cells) */
+        for (int k = 0; k < ns; k++) if (!hr[k].tot && !(k && hb[k].tot) && !(k + 1 < ns && hb[k + 1].tot)) S[k] = cen[k];
         free(cost); free(arg); free(cen);
         if (glob) fj_global(ns, hb, hr, nx, xa, xb, hx, refw, chainw, cap, mincells, Sc, S);
         printf("  slab  ref-cells  share(ref-mode)  chosen-mode  share(chosen)  share(|d - chosen| < 0.25)\n");
         long long rt = 0, rs = 0;
         for (int k = 0; k < ns; k++) {
-            if (!hr[k].tot) { printf("  %4d  %9d  (no cells)\n", k, 0); continue; }
+            if (!hr[k].tot) { printf("  %4d  %9d  (no cells: %s)\n", k, 0, (k && hb[k].tot) || (k + 1 < ns && hb[k + 1].tot) ? "gauge from the overlap chain" : "UNCONSTRAINED, no overlap cells either"); continue; }
             long long nr = 0; const long md = fj_mode(&hr[k]); const long long cm = fj_count(&hr[k], md, nullptr), cc = fj_count(&hr[k], S[k], &nr);
             printf("  %4d  %9lld  %15.4f  %+11ld  %13.4f  %10.4f\n", k, hr[k].tot, (double)cm / hr[k].tot, S[k] - md, (double)cc / hr[k].tot, (double)nr / hr[k].tot);
             rt += hr[k].tot; rs += cc;
@@ -603,6 +609,17 @@ int cmd_fit_join(int argc, char **argv) {
     }
     if (ns > 1) printf("  mean share(mode) over the boundaries, overlap-cell weighted: %.4f\n", tot_n ? tot_share / tot_n : 0);
     if (ns > 1 && chosen) printf("  integer agreement on the overlaps at the chosen gauges, overlap-cell weighted: %.4f\n", tot_n ? (double)tot_c / tot_n : 0);
+    /* where each slab's gauge came from (audit 11-14 #18: a slab with no ref and no overlap cells got its gauge at zero cost, silently) */
+    int nref_g = 0, nchain_g = 0, nfree = 0;
+    for (int k = 0; k < ns; k++) {
+        const int ov = (k && hb[k].tot) || (k + 1 < ns && hb[k + 1].tot);
+        if (hr ? hr[k].tot > 0 : k == 0) nref_g++;   /* (without --ref the first slab is the gauge anchor) */
+        else if (ov || (hf && ((k && hf[k].tot) || (k + 1 < ns && hf[k + 1].tot)))) nchain_g++;
+        else { nfree++; fprintf(stderr, "fit-join: WARNING slab %d (z %g..%g): no %soverlap cells on either side: its gauge is unconstrained (%+ld, the chain's prediction)\n",
+                                k, s->z0[k], s->z1[k], hr ? "ref cells, no " : "", S[k]); }
+    }
+    printf("fit-join: gauges: %d slabs from %s, %d from the overlap chain only (no ref cells), %d unconstrained (no ref or overlap cells)\n", nref_g, hr ? "the ref" : "the anchor (the first slab)", nchain_g, nfree);
+    if (nfree && reqc) { fprintf(stderr, "fit-join: %d unconstrained slabs (--require-constrained 1)\n", nfree); return 3; }
     for (int k = 0; k < ns; k++) if (S[k]) for (int q = 0; q < s->slab[k]->nk; q++) s->slab[k]->offset[q] -= (float)S[k];
     if (hf) { int nch = 0; for (int k = 1; k < ns; k++) nch += S[k] - S[k - 1] != Sc[k] - Sc[k - 1]; printf("fit-join: the fibre term changed %d of %d boundary offsets against the overlap chain\n", nch, ns - 1); }
     for (int k = 0; k < ns; k++) { fj_hist_free(&hb[k]); if (hr) fj_hist_free(&hr[k]); if (hf) fj_hist_free(&hf[k]); }
