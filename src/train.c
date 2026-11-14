@@ -4949,7 +4949,8 @@ int cmd_train(int argc, char **argv) {
             (limit_seconds && now() - t0 >= limit_seconds) || (stop_at && step >= stop_at)) g_stop = 1;
         {   /* replica check (split audit #6): every card must hold the same master weights (the same optimizer on the same allreduced gradient;
                checkpoints come from G[0]). UFSM_REPLICA_CHECK=N: every N steps (default: the checkpoint steps and the last; 0 off); a mismatch stops the run */
-            static long rc_every = -2; if (rc_every == -2) rc_every = getenv("UFSM_REPLICA_CHECK") ? atol(getenv("UFSM_REPLICA_CHECK")) : -1;
+            static long rc_every = -2;   /* mgpu: main (the training loop) */
+            if (rc_every == -2) rc_every = getenv("UFSM_REPLICA_CHECK") ? atol(getenv("UFSM_REPLICA_CHECK")) : -1;
             const int due = ng > 1 && rc_every != 0 && (rc_every > 0 ? step % rc_every == 0 : step % ckpt_every == 0 || step == steps || g_stop);
             if (due) {
                 uint64_t h0 = 0; int bad = -1; const size_t nb = np * 4; uint8_t *hb = malloc(nb);
