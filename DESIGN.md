@@ -591,6 +591,43 @@ That is not acceptable as a silent default. It stays opt-in (`predict --skip-emp
 windows dominate. No training path: it would change what the net learns there, for at most ~6-9% of a step. Most of the skippable
 space is the zero-filled outside of the scan. Keeping training windows inside the scan would recover that compute exactly.
 
+## 2:4 sparsity mid-run: ramp, hard pruning under Muon, the scratch2 recipe (2026-11-14, branch sparse24b-20261114)
+
+The user approved 2:4 sparsity for scratch2. Switching a dense run sparse needs three things the 11-13 version lacked: no loss jolt, an
+optimizer that respects the mask, and checkpoints that resume at any point of the switch.
+- `--sparse24 S --sparse24-ramp N`: from step S, the forward copy holds the pruned weights x r, with r = 1 - (step - S + 1) / N. The mask
+  is the magnitude mask of the dense master, recomputed every ramp step. The ramp runs on the dense kernels.
+- Hard pruning (`--sparse24-hard`, the default for modes 2 / 3) after the ramp. Before the optimizer, the step's magnitude mask is taken
+  from the master and kept as one keep byte per (co, 8 ci, tap) (np / 8 bytes), and the pruned weights' gradient is zeroed, so Muon's
+  momentum stays masked. After the update, the master and its Muon momentum are pruned with that same mask. A pruned weight's
+  (orthogonalised, dense) update therefore can never swap it in: the mask stays fixed after the ramp, and between steps the master
+  itself holds it (pruned weights are exactly +0), so a checkpoint needs no mask array.
+- Checkpoint keys `sparse24_hard` and `sparse24_r` (mid-ramp; the trainer recomputes r from its flags) are written only when set.
+  `UFSM_SP24=0` runs the dense kernels on the same pruned weights (identical bytes); `UFSM_SP24_REPORT=1` prints the sparse call count;
+  `UFSM_SP24_CHECK=1` checks after every hard step that the master keeps all its energy under its own mask. When the mask first applies
+  fully, the trainer reports the kept |w|^2 per level.
+- predict loads the mode with the checkpoint, masks (idempotent on the pruned master) and runs the sparse kernel. tests/test_sp24_train.sh
+  checks that its output equals the dense kernels' on the same weights.
+
+**Pod A/B** (RTX PRO 4000 Blackwell, one card, P 512, the 92 M scratch2 widths and flags minus the split, synthetic wind fixture,
+--det 1; 150 steps from a dense checkpoint at step 511, the switch at 512):
+
+| arm | s/step (steps 580-658) | loss - dense, ramp | next 100 steps | kept |w|^2 |
+|---|---|---|---|---|
+| dense | 1.099 | | | |
+| mode 2, ramp 50 | 1.064 (-3.2 %) | +0.013 | +0.02 | 0.785 |
+| mode 3, ramp 50 | 1.053 (-4.2 %) | +0.022 | +0.02 | 0.674 |
+| mode 2, abrupt | | +0.27 at the switch | +0.025 | |
+
+(dense loss ~1.19). The ramp removes the jolt, and mode 3 costs no more loss than mode 2 here while also sparsifying the backward-data,
+so the recommendation is mode 3. On the real scratch2 step-508 weights the kept energy is 0.676 (mode 3), the same at every level: at 508
+steps the weights are still close to their random init.
+
+**Recipe for scratch2:** `--sparse24 S --sparse24-mode 3 --sparse24-ramp 500`, with S after the LR warmup (a step-0 mask is the random
+init, frozen forever by hard pruning). In a swap, S = the resume step + 1. If S lies more than N steps before the resume, the prune is
+abrupt. The two-card --split z path runs the same per-thread registry and masks, and the z-window and z-range of the split kernels are
+byte-tested on the sparse kernel (test_sp24_conv). A two-card split_finite with the flags is the swap window's check.
+
 ## 2:4 sparse fp4 convs: the hardware pattern, the kernel, the ceiling (2026-11-13, branch sparse24-20261113)
 
 Goal: halve the 3^3 conv MMAs of the 92 M scratch2 net with the sparse block-scaled tensor cores of the RTX 5060 Ti (sm_120a).
