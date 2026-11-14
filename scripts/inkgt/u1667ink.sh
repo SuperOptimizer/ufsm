@@ -59,7 +59,7 @@ if [ ! -e $INK/ink.done ]; then
   # seam step 16.9 -> 1.3 on a 1299 test box); BLEND=0 one pass
   rm -rf $INK; mkdir -p $INK
   # GATE=1: also the recto / verso probability channels (c12, c13: papyrus only, never supervised in air) for a papyrus-gated ink render
-  HEADS=ink; HL="ink"; [ "${GATE:-0}" = 1 ] && { HEADS=ink,c12,c13; HL="ink c12 c13"; }
+  HEADS=ink; HL="ink"; [ "${GATE:-1}" = 1 ] && { HEADS=ink,c12,c13; HL="ink c12 c13"; }
   # (--shard 256 on the shifted pass: its tiles align with the store shards; 1299 test box byte-identical, 63 s -> 5 s)
   # pbox SHIFT: the box moved down onto the pass's 512 tile grid (origin = SHIFT mod 512), as seamless.c pass_box (an off-grid box: one
   # window per shard, ~6-8x the windows); --axis: the radial input channels (predict refuses without it since 2026-11-14); --q 0 --levels 1:
@@ -92,7 +92,7 @@ for st in $SDIR/*/; do s=$(basename $st); [ -e $RD/$s.done ] && continue
     $U render $RD/in_$s $RD --volume $INK/ink $key --ct $R $K/$LV --depth 1 --scale 1 --threads $TH $FILLX > $RD/logs/render_$s.log 2>&1 ||
     { log "render $s failed ($RD/logs/render_$s.log)"; exit 1; }
   [ -e $RD/${s}_fill.tif ] && mv $RD/${s}_fill.tif $RD/fillmap/
-  if [ "${GATE:-0}" = 1 ]; then for h in c12 c13; do mkdir -p $RD/$h
+  if [ "${GATE:-1}" = 1 ]; then for h in c12 c13; do mkdir -p $RD/$h
     flock /tmp/gpu0-bench.lock env CUDA_VISIBLE_DEVICES=0 UFSM_RENDER_MEM=16 UFSM_RENDER_GPU_MEM=4 ~/bin/memcap -m ${MEMR:-48G} nice -n 10 \
       $U render $RD/in_$s $RD/$h --volume $INK/$h $key --ct $R $K/$LV --depth 1 --scale 1 --threads $TH $FILLX > $RD/logs/render_${s}_$h.log 2>&1 ||
       { log "render $s $h failed ($RD/logs/render_${s}_$h.log)"; exit 1; }
