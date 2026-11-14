@@ -6,6 +6,29 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The swap to microc: mcc is the default toolchain (2026-11-14, branch toolchain-mcc-20261114)
+
+The user asked for the full swap, not a staged one. On this branch:
+- `cmake --preset release` / `verify` / `arch86*` build with mcc: host C (`-mglibc -std=c23 -O2 -g`), every .cu unit, and
+  mcudahw as the CUDA runtime.
+- clang and nvcc remain only as `llvm-release` / `llvm-verify` (build-llvm*/), for bisecting and byte comparisons.
+- `scripts/toolchain/install_mcc.sh` fetches microc at `cmake/mcc.version`, builds stage 0 with the system cc (about 1 minute,
+  one core), builds the glibc support library and mcudahw, smoke-tests a threaded C23 program, and installs into ~/.local/mcc.
+- `scripts/pod/setup.sh` installs mcc before the build and then fills mcudahw's JIT cache on all CPUs (`MCUDA_PRECOMPILE`), so
+  the first training step does not compile 310 MB of PTX. Without /usr/bin/cc it uses the newest clang (`MCC_CC`).
+- `-g` emits DWARF 5 line tables and CFI (microc dwarf-20261114), so gdb, perf and `run_suite.sh -c` work as with clang.
+- The pin is b489496 (microc branch mcc-int-20261114: x64simd + dwarf). Its gate is green on the desk:
+  - stage 0 builds clean under gcc 15 -Werror;
+  - tests/c pass 145/145 with mcc's libc, with glibc, and with -g;
+  - tests/thr 50/50, the assembler test, and the ABI checks against gcc (13/13) pass;
+  - the self-bootstrap gives stage2 == stage3.
+- The nested-lambda fix lets the last two .cu units compile, so all 168 now do.
+- Still to measure in the mcc sweep: the CPU and GPU suites, predict byte-compared against the llvm build, training ms/step,
+  and the cold JIT time.
+- Known costs at this pin:
+  - host code is about 3.6x slower on the CPU tests (helpers are adding x86 vectorisation and fast intrinsics);
+  - kernel speed versus nvcc has not been measured on current master.
+
 ## The microc toolchain: `--preset mcc` and the mcc compile check (2026-11-14, branch mcc-20261114)
 
 The user wants the whole toolchain moved to microc (github.com/SuperOptimizer/microc, our own project). mcc is a C compiler for
