@@ -47,7 +47,7 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
    train checks once its setup is done (the options read only later in the loop are few); main() checks again when any command returns */
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
     opt_n(name);
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 static int train_unread_flags(int argc, char **argv) { return opt_unread("train", argc, argv); }
@@ -3643,7 +3643,7 @@ int cmd_train(int argc, char **argv) {
         nn_muon_tc(muon_tc);
         unet_set_muon_qkv_split(d->u, muon_qkv);
         nn_muon_scale_mode(muon_spec); unet_set_rest_sign(d->u, rest_sign, rest_mult);
-        unet_set_muon_ademamix(d->u, mix_a, mix_b3, mix_T > 0 ? mix_T : steps / (atoi(opt(argc, argv, "--accum", "1")) > 0 ? atoi(opt(argc, argv, "--accum", "1")) : 1));
+        unet_set_muon_ademamix(d->u, mix_a, mix_b3, mix_T > 0 ? mix_T : steps / ((int)strtol(opt(argc, argv, "--accum", "1"), nullptr, 10) > 0 ? (int)strtol(opt(argc, argv, "--accum", "1"), nullptr, 10) : 1)   /* (lenient: --accum auto is 1 here, validated below) */);
         unet_set_muon_kron(d->u, muon_kron, kron_b2, kron_eps, kron_every);
         if (trunk_lr != 1.f) unet_set_trunk_lr(d->u, trunk_lr);
         if (init_lr != 1.f) unet_set_init_lr(d->u, init_lr);
