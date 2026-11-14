@@ -60,6 +60,28 @@ Caveats. `--echo-max` replays windows; an echo inside one update correlates its 
 normalised per window (dice, MIL) make "per-window gradient" the unit, which is what B counts. Per-parameter-group B_noise (trunk /
 attention / heads) is not done: it needs per-tensor sumsq over the grad buffer's offsets; the whole-net number first.
 
+### --accum auto: the batch follows the noise scale (same branch, follow-up)
+
+`--accum auto --accum-min A --accum-max M --gns-k K` (A: the checkpoint's accumulation, else 1; M 64; K 1): the target batch is K x EMA
+B_noise windows, accum = round(target / windows per step) (windows per step = nl B, the GPU count on try6). Controller (`accum_ctl` in
+gns.h), once per update: nothing during the first `--accum-warm` 1000 updates of each (re)start (only the EMAs run); then a change only
+after the target stayed above `--accum-margin` 1.25 x the current batch for `--accum-hold` 200 consecutive updates (a NaN or <= 0 estimate
+restarts the count), at most one change per `--accum-gap` 500 updates, x2 at most, capped at M, never down. The lr is not touched: the WSD
+schedule counts windows, so a larger batch at the same lr is the "grow the batch instead of decaying the lr" regime. Each change is logged
+(`step N: --accum auto: accum a -> b (... B_noise, K; update u)`).
+
+Mechanics: the update condition is (step - anchor) % accum == 0 and the optimizer's step count upd_base + (step - anchor) / accum (anchor 0,
+upd_base 0 for a fixed --accum: the old steps % K and step / K exactly). A change at an update sets anchor = that step, upd_base = its update
+number. The gradient sum buffers are allocated at start when M > 1 (no allocation after the first steps). The checkpoint's extra gains
+`"gns":{"g2","s","w","n"}` (the EMAs, with --gns) and `"accum","anchor","upd"` (auto only), appended last; a resume restores the EMAs and,
+under auto, the accumulation (anchor = the resume step: a partial sum at the checkpoint is dropped, as before).
+
+Tests: test_gns's controller traces (2 windows per step, start accum 5): B_noise 11 never moves it (11 < 12.5); 40 -> accum 10 at update
+1200 (warm 1000 + hold 200, x2 cap), 20 at 1700 (gap), then held (40 < 1.25 x 40); 150-update excursions above the threshold never change
+it; 1e4 -> 10, 20, 40, 64 at 1200 / 1700 / 2200 / 2700; 60 then 2 -> up, never down; a NaN every 150 updates holds it. test_accum.sh (5):
+the trainer with K 1000, warm 2, hold 1, gap 1 goes accum 2 -> 4 at step 6, 4 -> 8 at step 10, the checkpoint holds accum 8 / anchor 10
+/ upd 4, and a resume continues at accum 8 with the EMAs (step 20 = update 5).
+
 ## Recompute and host offloads in scratch2: what the memory modes cost (2026-11-14, branch recomp-20261114)
 
 Goal: free device memory on the desk's 16 GB cards and spend it on less recompute / fewer host offloads (estimated 5-10 %).

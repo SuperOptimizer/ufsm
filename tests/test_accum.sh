@@ -5,7 +5,9 @@
 #      exactness of the sum: = batch 3), every update at steps 3 and 6;
 #  (3) --accum 4 --steps 8 logs "(update 2: 4 windows each)" and its loss is finite;
 #  (4) --gns (gns.h): --accum 4 logs the gradient noise scale (|g|^2 at 1 vs 4 windows) on the line and in log.csv's gns columns; one GPU
-#      without --accum and --gns 1 says there is no estimate and trains (the lr 0 run of (1)).
+#      without --accum and --gns 1 says there is no estimate and trains (the lr 0 run of (1));
+#  (5) --accum auto (controller pushed with --gns-k 1000, warm 2, hold 1, gap 1): accum 2 -> 4 at step 6, 4 -> 8 at step 10; the
+#      checkpoint's "gns" holds accum 8 and the EMAs, and a resume continues at accum 8 with the EMAs.
 # Usage: test_accum.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
@@ -26,6 +28,14 @@ grep -q -- '--gns: gradient noise scale from |g|^2 at 1 vs 4 windows' a4.log || 
 grep '^step      8' a4.log | grep -q ' gns ' || fail "accum 4: no gns on the step 8 line ($D/a4.log)"
 head -1 a4/log.csv | grep -q ',gns,gns_g2,gns_s$' || fail "log.csv header without the gns columns"
 awk -F, 'NR > 1 && $1 == 8 { exit !(NF == 15 && $14 != "") }' a4/log.csv || fail "log.csv step 8: no gns_g2 ($(tail -1 a4/log.csv))"
+"$U" train fx/sources.json --out au "${L[@]}" "${C[@]}" --steps 12 --accum auto --accum-min 2 --gns-k 1000 --accum-warm 2 --accum-hold 1 --accum-gap 1 > au.log 2>&1 || fail "accum auto ($D/au.log)"
+grep -q 'step 6: --accum auto: accum 2 -> 4' au.log || fail "accum auto: no 2 -> 4 at step 6 ($D/au.log)"
+grep -q 'step 10: --accum auto: accum 4 -> 8' au.log || fail "accum auto: no 4 -> 8 at step 10 ($D/au.log)"
+head -1 au/last.ckpt | grep -q '"gns":{"g2":[^}]*"accum":8,"anchor":10,"upd":4}' || fail "accum auto: checkpoint gns state ($(head -1 au/last.ckpt | grep -o '"gns":{[^}]*}'))"
+"$U" train fx/sources.json --out au "${L[@]}" "${C[@]}" --steps 20 --resume au/last.ckpt --accum auto --gns-k 1000 --accum-warm 100 > au2.log 2>&1 || fail "accum auto resume ($D/au2.log)"
+grep -q -- '--accum auto: 1 windows per step, accum 8 (resumed)' au2.log || fail "accum auto resume: not at accum 8 ($D/au2.log)"
+grep -q -- '--gns: resumed EMAs' au2.log || fail "accum auto resume: EMAs not resumed"
+grep '^step     20' au2.log | grep -q '(update 5: 8 windows each)' || fail "accum auto resume: step 20 is not update 5 ($(grep '^step     20' au2.log | grep -o '(update[^)]*)'))"
 python3 -I - z/last.ckpt a2/last.ckpt <<'PY'
 import sys, numpy as np
 def w(p):   # the live parameters: the first of the 5 float32 blocks after the header line (p, ema, m, v, the Muon momentum)

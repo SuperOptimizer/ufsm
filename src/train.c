@@ -2443,6 +2443,16 @@ static void split_job(int side, void *a) {
 }
 
 
+/* the checkpoint header's "gns" object (appended last, only with --gns): the EMAs, and with --accum auto the accumulation, the step it took
+   effect and the updates before it (train reads them back on resume). Replaces an earlier one in DST */
+static void gns_extra(char *dst, size_t n, const gns_ema *e, int acc_auto, int accum, int anchor, long upd) {
+    char *o = strstr(dst, ",\"gns\":{"); if (o) { *o = 0; strcat(dst, "}"); }
+    size_t k = strlen(dst); if (!k || dst[k - 1] != '}') return; dst[--k] = 0;
+    k += (size_t)snprintf(dst + k, n - k, ",\"gns\":{\"g2\":%.9g,\"s\":%.9g,\"w\":%.9g,\"n\":%ld", e->g2, e->s, e->w, e->n);
+    if (acc_auto && k < n) k += (size_t)snprintf(dst + k, n - k, ",\"accum\":%d,\"anchor\":%d,\"upd\":%ld", accum, anchor, upd);
+    if (k < n) snprintf(dst + k, n - k, "}}");
+}
+
 /* a CSV log's header gains columns (ADD appended) unless it already holds COL: a resumed run appends rows with more fields than its old
    header named. The file is rewritten through a temporary next to it (log.csv is small) */
 static void csv_extend_header(const char *path, const char *col, const char *add) {
@@ -4414,24 +4424,61 @@ int cmd_train(int argc, char **argv) {
        Muon / AdamW at optimizer step step / K, EMA) runs on the mean of the accumulated windows at steps that are multiples of K. A
        non-finite window is left out of the mean. --ckpt-every / SNAP should be multiples of K (a checkpoint between updates drops the
        partial sum). = batch K exactly (tests/test_accum.sh: lr 0 / --det) */
-    const int accum = atoi(opt(argc, argv, "--accum", "1"));
-    if (accum < 1 || accum > 64) { fprintf(stderr, "--accum K: 1..64\n"); return 2; }
+    const int acc_auto = !strcmp(opt(argc, argv, "--accum", "1"), "auto");
+    /* --accum auto (gns.h accum_ctl): K grows with K_gns x B_noise. The state a resume continues from (checkpoint "gns": the accumulation,
+       the step it took effect and the updates before it, the EMAs) */
+    int saved_acc = 0, acc_anchor = 0; long upd_base = 0; gns_ema gns_saved = {0}; int gns_have = 0;
+    if (resume && step0 > 0) {
+        char *h = checkpoint_header_line(resume); const char *q = h ? strstr(h, "\"gns\":{") : nullptr;
+        if (q) {
+            const char *v;
+            if ((v = strstr(q, "\"g2\":"))) { gns_saved.g2 = atof(v + 5); gns_have = 1; }
+            if ((v = strstr(q, "\"s\":"))) gns_saved.s = atof(v + 4);
+            if ((v = strstr(q, "\"w\":"))) gns_saved.w = atof(v + 4);
+            if ((v = strstr(q, "\"n\":"))) gns_saved.n = atol(v + 4);
+            if ((v = strstr(q, "\"accum\":"))) saved_acc = atoi(v + 8);
+            if (saved_acc > 0 && acc_auto) {   /* the updates so far: those before the saved anchor + the saved accumulation's since */
+                long ub = 0; int an = 0;
+                if ((v = strstr(q, "\"upd\":"))) ub = atol(v + 6);
+                if ((v = strstr(q, "\"anchor\":"))) an = atoi(v + 9);
+                upd_base = ub + (step0 - an) / saved_acc; acc_anchor = step0;
+            }
+        }
+        free(h);
+    }
+    char amin_def[16]; snprintf(amin_def, sizeof amin_def, "%d", saved_acc > 0 ? saved_acc : 1);
+    const int acc_amin = atoi(opt(argc, argv, "--accum-min", amin_def));
+    int accum = acc_auto ? acc_amin : atoi(opt(argc, argv, "--accum", "1"));
+    const int acc_amax = atoi(opt(argc, argv, "--accum-max", "64"));
+    if (acc_auto && saved_acc > accum) accum = saved_acc;   /* (resume: where the controller left it, at least --accum-min) */
+    if (accum > acc_amax && acc_auto) accum = acc_amax;
+    if (accum < 1 || accum > 64 || acc_amax < 1 || acc_amax > 64) { fprintf(stderr, "--accum K: 1..64 or auto (--accum-min / --accum-max 1..64)\n"); return 2; }
+    const accum_cfg acc_cfg = {.k = atof(opt(argc, argv, "--gns-k", "1")), .margin = atof(opt(argc, argv, "--accum-margin", "1.25")), .wps = nl * B,
+                               .warm = atoi(opt(argc, argv, "--accum-warm", "1000")), .hold = atoi(opt(argc, argv, "--accum-hold", "200")),
+                               .gap = atoi(opt(argc, argv, "--accum-gap", "500")), .amax = acc_amax};
+    if (!(acc_cfg.k > 0) || !(acc_cfg.margin >= 1) || acc_cfg.warm < 0 || acc_cfg.hold < 1 || acc_cfg.gap < 0) { fprintf(stderr, "--gns-k > 0, --accum-margin >= 1, --accum-warm >= 0, --accum-hold >= 1, --accum-gap >= 0\n"); return 2; }
+    accum_ctl actl = accum_ctl_make(accum, &acc_cfg);
+    if (acc_auto) fprintf(stderr, "--accum auto: %d windows per step, accum %d%s (max %d): target K %g x B_noise, up only, after %d updates, %d updates above %g x, a change per %d updates at most, x2 at most; lr unchanged\n",
+                          acc_cfg.wps, accum, saved_acc > 0 ? " (resumed)" : "", acc_amax, acc_cfg.k, acc_cfg.warm, acc_cfg.hold, acc_cfg.margin, acc_cfg.gap);
     float *gacc[64] = {nullptr}; int nacc_win = 0;
-    if (accum > 1) { for (int g = 0; g < ng; g++) { nn_init(G[g].dev); gacc[g] = nn_malloc(np * 4); }
+    if (accum > 1 || (acc_auto && acc_amax > 1)) { for (int g = 0; g < ng; g++) { nn_init(G[g].dev); gacc[g] = nn_malloc(np * 4); }
         fprintf(stderr, "--accum %d: %d windows per optimizer update (the schedule, --warmup and --steps count windows; updates at steps %% %d == 0)\n", accum, accum, accum); }
     /* --gns 1: the gradient noise scale B_noise (critical batch size, gns.h) from two squared norms of the raw gradient (before clipping,
        Muon, weight decay) at two batch sizes, both already at hand: with --accum K each step's all-reduced gradient (b = nl B windows; its
        norm is computed anyway) against the update's mean (B = K nl B; ditto): no extra work. Without --accum on several replicas (no
        --split): each replica's own gradient (b = B, the replicas' mean |g|^2; one more norm per GPU per step) against the all-reduced one.
        One GPU without --accum has no pair. Default on whenever there is a pair; --gns-beta: the EMAs' decay per update */
-    const int gns_pre = ng > 1 && !split && accum == 1, gns_can = accum > 1 || gns_pre;
+    const int gns_can = accum > 1 || acc_auto || (ng > 1 && !split);   /* (the pairing follows the current accumulation) */
     const int gns_ask = atoi(opt(argc, argv, "--gns", gns_can ? "1" : "0"));
     const double gns_beta = atof(opt(argc, argv, "--gns-beta", "0.99"));
     if (!(gns_beta >= 0 && gns_beta < 1)) { fprintf(stderr, "--gns-beta: 0 <= beta < 1\n"); return 2; }
     const int gns_on = gns_ask && gns_can;
     if (gns_ask && !gns_can) fprintf(stderr, "--gns: no estimate on one GPU without --accum (or --split without --accum): one batch size only\n");
     if (gns_on) fprintf(stderr, "--gns: gradient noise scale from |g|^2 at %d vs %d windows, EMA decay %g per update\n", accum > 1 ? nl * B : B, accum > 1 ? accum * nl * B : nl * B, gns_beta);
-    gns_ema gns = gns_make(gns_beta); double gns_small = 0;   /* (the small-batch |g|^2 sum since the last update) */
+    if (acc_auto && !gns_on) { fprintf(stderr, "--accum auto needs --gns 1\n"); return 2; }
+    gns_ema gns = gns_make(gns_beta); double gns_small = 0;
+    if (gns_on && gns_have) { gns.g2 = gns_saved.g2; gns.s = gns_saved.s; gns.w = gns_saved.w; gns.n = gns_saved.n;   /* (resume: the EMAs go on) */
+        fprintf(stderr, "--gns: resumed EMAs, B_noise %.0f windows (|G|^2 %.3g, S %.3g)\n", gns_bnoise(&gns), gns_g2(&gns), gns_s(&gns)); }   /* (the small-batch |g|^2 sum since the last update) */
 
     /* validation set: fixed batches from the held-out boxes (unaugmented), scored on GPU 0 */
     sample_cfg vc = sc; vc.gpu_aug = 0; vc.cover = nullptr; vc.cover_start = 0; vc.ct_augment = 0; vc.axis_jitter = 0; vc.geometry_augment=0; vc.label_morph=0; vc.scan.strength=0; vc.affine_p=0; vc.crush.p=0; vc.xscan_p=0; vc.tear_p=0; vc.delam_p=0; vc.curv_p=0; vc.incl_p=0; vc.density_p=0; { const char *vs = opt(argc, argv, "--val-seed", nullptr); vc.seed = (vs ? (uint64_t)atoll(vs) : seed) + 777; }   /* --val-seed: other training seeds on the same windows */ vc.augment = 0; vc.nworkers = 4; vc.nbuf = 2; vc.holdout = 1; vc.rung_shift_p = 0;
@@ -4728,7 +4775,7 @@ int cmd_train(int argc, char **argv) {
             int nxt = d->cur ^ 1; upload_async(d, nb, nxt, B, P); d->pending = nb; select_buf(d, nxt);
         }
         if (g_stop || training_failed) break;
-        if (gns_on && gns_pre) { gns_small = 0; for (int g = 0; g < ng; g++) { nn_init(G[g].dev); const double n = unet_grad_norm(G[g].u); gns_small += n * n / ng; } }   /* --gns: each replica's own */
+        if (gns_on && (ng > 1 && !split && accum == 1)) { gns_small = 0; for (int g = 0; g < ng; g++) { nn_init(G[g].dev); const double n = unet_grad_norm(G[g].u); gns_small += n * n / ng; } }   /* --gns: each replica's own */
         /* average gradients across GPUs: sum on GPU 0 (peer copies), scale, broadcast */
         if (ar2) {   /* the same bytes as the path below: each half summed as y + x on one card, then copied to the other */
             float *gg[2] = {unet_grad_ptr(G[0].u), unet_grad_ptr(G[1].u)}; const int dv[2] = {G[0].dev, G[1].dev};
@@ -4779,7 +4826,7 @@ int cmd_train(int argc, char **argv) {
             g_ds_frac = (float)fmax(0.0, 1.0 - pr);
         }
         if (soft_end != sc.soft) sampler_set_soft(sp, sc.soft + (soft_end - sc.soft) * (step < steps ? (float)step / (float)steps : 1.f));
-        double gn = 0;
+        double gn = 0; int upd_now = 0;   /* (upd_now: this step's optimizer update number, 0 when no update) */
         for (int g = 0; g < ng; g++) {
             gpu_state *d = &G[g];
             nn_init(d->dev);
@@ -4799,7 +4846,7 @@ int cmd_train(int argc, char **argv) {
                 }
                 continue;
             }
-            if (g == 0 && gns_on && gns_pre) gns_add(&gns, B, gns_small, nl * B, gn * gn);
+            if (g == 0 && gns_on && (ng > 1 && !split && accum == 1)) gns_add(&gns, B, gns_small, nl * B, gn * gn);
             if (accum > 1) {   /* --accum: this window's gradient into the sum; the update only at multiples of K, on the mean */
                 if (g == 0) { nacc_win++; gns_small += gn * gn; }
                 const int first = nacc_win == 1;
@@ -4808,7 +4855,7 @@ int cmd_train(int argc, char **argv) {
                               FILE *f_ = fopen(fn_, "wb"); if (f_) { fwrite(h_, 4, np, f_); fclose(f_); } free(h_); } } while (0)
                 ADUMP('w', unet_grad_ptr(d->u));
                 if (first) nn_d2d_async(gacc[g], unet_grad_ptr(d->u), np * 4); else nn_axpy(gacc[g], 1.f, unet_grad_ptr(d->u), np);
-                if (step % accum) continue;
+                if ((step - acc_anchor) % accum) continue;
                 const int nwin_upd = nacc_win;
                 nn_d2d_async(unet_grad_ptr(d->u), gacc[g], np * 4); nn_scale(unet_grad_ptr(d->u), 1.f / nacc_win, np);
                 if (g == ng - 1) nacc_win = 0;
@@ -4822,7 +4869,9 @@ int cmd_train(int argc, char **argv) {
             if (unet_get_sparse24_hard(d->u)) unet_sp24_grad_mask(d->u);   /* hard 2:4: the pruned weights' gradient 0 (Muon's momentum stays masked) */
             else unet_srste24(d->u, srste);                  /* no-op unless sparse */
             const float lrr = lr0 > 0.f ? lr / lr0 : 0.f;   /* (lr0 0: 0 / 0 was NaN -> NaN weights after step 1; CAL 11-01) */
-            const int ostep = accum > 1 ? (step + accum - 1) / accum : step;   /* (the optimizer's own step count: Adam's bias correction) */
+            const int ostep = accum > 1 || acc_auto ? (int)(upd_base + (step - acc_anchor + accum - 1) / accum) : step;   /* (the optimizer's own step count: Adam's bias
+                                                                    correction; --accum auto: the updates before the last change + since) */
+            if (g == 0) upd_now = ostep;
             if (use_anvil) unet_anvil(d->u, anvil_lr * lrr, anvil_wd, ostep, steps / accum, lr, 0.9f, 0.999f, 1e-8f, wd);
             else if (use_muon) unet_muon(d->u, muon_lr * lrr, muon_beta, lr, 0.9f, 0.999f, 1e-8f, wd, ostep);   /* Muon lr follows the same schedule shape */
             else unet_adamw(d->u, lr, 0.9f, 0.999f, 1e-8f, wd, ostep);
@@ -4841,6 +4890,13 @@ int cmd_train(int argc, char **argv) {
             unet_wquant(d->u, (unsigned)step);              /* no-op unless --wq */
             if (prof) nn_prof_end();
             nn_ptick("optimizer");
+        }
+        if (acc_auto && upd_now) {   /* --accum auto: the controller after each update; a change takes effect from the next step */
+            const int na = accum_ctl_update(&actl, &acc_cfg, gns_bnoise(&gns));
+            if (na != accum) {
+                fprintf(stderr, "step %d: --accum auto: accum %d -> %d (%d -> %d windows per update; B_noise %.0f, K %g; update %d)\n", step, accum, na, accum * acc_cfg.wps, na * acc_cfg.wps, gns_bnoise(&gns), acc_cfg.k, upd_now);
+                upd_base = upd_now; acc_anchor = step; accum = na; gns_small = 0; if (ng > 1) nn_init(G[0].dev);
+            }
         }
         for (int g = 0; g < ng; g++) if (G[g].tail_due) { nn_init(G[g].dev); upload_tail(&G[g], B, P); }   /* (upsplit: after the loss / gradient-norm
                                                                                                            fetches' small copies, during the optimiser) */
@@ -5045,7 +5101,7 @@ int cmd_train(int argc, char **argv) {
                     for (int h = 0; h < g_heads; h++) fprintf(stderr, " %d %.5f (%d)", h, vhn[h] ? vh[h] / vhn[h] : 0.0, vhn[h]);
                     fprintf(stderr, "\n");
                 }
-                if (nval && vcrit < best_val) { best_val = vcrit; char bp[1400]; snprintf(bp, sizeof bp, "%s/best.ckpt", out); if ((g_uw ? (uw_extra(checkpoint_extra, sizeof checkpoint_extra, runtime_extra), 0) : 0) || unet_save(G[0].u, bp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", bp); return 1; } }
+                if (nval && vcrit < best_val) { best_val = vcrit; char bp[1400]; snprintf(bp, sizeof bp, "%s/best.ckpt", out); if ((g_uw ? (uw_extra(checkpoint_extra, sizeof checkpoint_extra, runtime_extra), 0) : 0) || ((gns_on ? gns_extra(checkpoint_extra, sizeof checkpoint_extra, &gns, acc_auto, accum, acc_anchor, upd_base) : (void)0), 0) || unet_save(G[0].u, bp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", bp); return 1; } }
             }
             char affs[1024] = "";
             if (g_verso) snprintf(affs, 64, " verso bce %.4f dice %.4f", acc_vbce / nok, acc_vdice / nok);
@@ -5088,7 +5144,7 @@ int cmd_train(int argc, char **argv) {
                 g_echo_idle = 0;   /* (the trainer's "wait" also counts the probe's time while the GPUs still run the step: idle is what they lost) */
                 f0 = f1; e0 = e1;
             }
-            if (accum > 1) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " (update %d: %d windows each)", step / accum, accum); }   /* --accum: steps are windows */
+            if (accum > 1) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " (update %ld: %d windows each)", upd_base + (step - acc_anchor) / accum, accum); }   /* --accum: steps are windows */
             char gcsv[96] = ",,";   /* --gns: B_noise in windows, EMA |G|^2 and S (empty before the first pair) */
             if (gns_on && gns.n) {
                 const double bn = gns_bnoise(&gns); size_t na = strlen(affs);
@@ -5133,7 +5189,9 @@ int cmd_train(int argc, char **argv) {
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);
             char cp[1400]; snprintf(cp, sizeof cp, "%s/last.ckpt", out);
-            if ((g_uw ? (uw_extra(checkpoint_extra, sizeof checkpoint_extra, runtime_extra), 0) : 0) || unet_save(G[0].u, cp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", cp); return 1; }
+            if (g_uw) uw_extra(checkpoint_extra, sizeof checkpoint_extra, runtime_extra);
+            if (gns_on) gns_extra(checkpoint_extra, sizeof checkpoint_extra, &gns, acc_auto, accum, acc_anchor, upd_base); 
+            if (unet_save(G[0].u, cp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", cp); return 1; }
         }
         if (step == step0 + 1 || step == steps || g_stop) {
             char mp[1400], em[4096]; snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp);
@@ -5142,7 +5200,8 @@ int cmd_train(int argc, char **argv) {
     }
     /* Signals can arrive between log/checkpoint boundaries; save only completed optimizer updates. */
     nn_init(G[0].dev);
-    { char cp[1400]; snprintf(cp, sizeof cp, "%s/last.ckpt", out); if (g_uw) uw_extra(checkpoint_extra, sizeof checkpoint_extra, runtime_extra); if (unet_save(G[0].u, cp, committed_step, checkpoint_extra)) return 1; }
+    { char cp[1400]; snprintf(cp, sizeof cp, "%s/last.ckpt", out); if (g_uw) uw_extra(checkpoint_extra, sizeof checkpoint_extra, runtime_extra);
+      if (gns_on) gns_extra(checkpoint_extra, sizeof checkpoint_extra, &gns, acc_auto, accum, acc_anchor, upd_base); if (unet_save(G[0].u, cp, committed_step, checkpoint_extra)) return 1; }
     if (plan) fprintf(stderr, "cover progress %llu/%llu committed tiles\n", (unsigned long long)coverage.cursor, (unsigned long long)coverage.count);
     uint64_t prod, rej; sampler_stats(sp, &prod, &rej);
     uint64_t why[4]; sampler_reject_reasons(sp, why);

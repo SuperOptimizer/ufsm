@@ -3,7 +3,8 @@
      accum: K steps of W windows each (the step's averaged gradient: b = W) against the update's mean (B = K W), |G_b|^2 the mean over the K steps;
      DP, no accum: each replica's own window (b = 1, the replicas' mean of |g|^2) against the all-reduced mean (B = W).
    The EMA ratio must land within 8 % of the truth over many updates; the per-update estimates' means (unbiased) within 3 %; unusable pairs
-   (b >= B, NaN) leave the state alone and B_noise is NaN before the first pair. CPU only. */
+   (b >= B, NaN) leave the state alone and B_noise is NaN before the first pair. Then the --accum auto controller (accum_ctl) on synthetic
+   B_noise traces: no change in the warm-in, the hold (hysteresis), the gap between changes, x2 steps, the cap, never down. CPU only. */
 #include "../src/gns.h"
 #include <stdio.h>
 #include <stdint.h>
@@ -28,6 +29,46 @@ static void update(int K, int W, double *n2small, double *n2step, double *n2big)
         sst += sq(st);
     }
     *n2small = ssm / (K * W); *n2step = sst / K; *n2big = sq(big);
+}
+
+/* runs TRACE(u) (u = 1..U) through the controller from accum a0 at 2 windows per step; returns the final accum, the changes' update numbers in
+   at[] and their accums in to[] (n); fails on a decrease or a step above x2 */
+typedef double (*trace_fn)(long u);
+static int run_ctl(trace_fn tr, long U, int a0, int amax, long *at, int *to, int *n, int *bad) {
+    const accum_cfg f = {.k = 1, .margin = 1.25, .wps = 2, .warm = 1000, .hold = 200, .gap = 500, .amax = amax};
+    accum_ctl c = accum_ctl_make(a0, &f); *n = 0;
+    for (long u = 1; u <= U; u++) {
+        const int prev = c.accum, a = accum_ctl_update(&c, &f, tr(u));
+        if (a < prev || a > 2 * prev || a > amax) *bad = 1;
+        if (a != prev && *n < 32) { at[*n] = u; to[(*n)++] = a; }
+    }
+    return c.accum;
+}
+static double tr_const11(long u) { (void)u; return 11; }          /* below 1.25 x 10 windows: never */
+static double tr_const40(long u) { (void)u; return 40; }          /* 10 -> 20 at 1200 (x2 cap), -> 40 at 1700 (gap 500), then 40 !> 50 */
+static double tr_flip(long u) { return (u / 150) % 2 ? 40 : 5; }  /* above for 150 updates at a time: the hold never fills */
+static double tr_huge(long u) { (void)u; return 1e4; }            /* x2 per gap up to the cap */
+static double tr_updown(long u) { return u < 3000 ? 60 : 2; }     /* never down */
+static double tr_nan(long u) { return u % 150 == 0 ? NAN : 40; }  /* a NaN estimate restarts the hold */
+static int test_ctl(void) {
+    long at[32]; int to[32], n, bad = 0, fail = 0, a;
+    a = run_ctl(tr_const11, 5000, 5, 64, at, to, &n, &bad);
+    if (a != 5 || n) { printf("FAIL ctl: B_noise 11 at batch 10 changed accum (%d, %d changes)\n", a, n); fail = 1; }
+    a = run_ctl(tr_const40, 5000, 5, 64, at, to, &n, &bad);
+    if (n != 2 || at[0] != 1200 || to[0] != 10 || at[1] != 1700 || to[1] != 20 || a != 20) { printf("FAIL ctl: B_noise 40: %d changes (%ld -> %d, %ld -> %d), final %d\n", n, n > 0 ? at[0] : 0, n > 0 ? to[0] : 0, n > 1 ? at[1] : 0, n > 1 ? to[1] : 0, a); fail = 1; }
+    else printf("  ctl B_noise 40 from accum 5 x 2 windows: accum 10 at update %ld, 20 at %ld, then held ok\n", at[0], at[1]);
+    a = run_ctl(tr_flip, 20000, 5, 64, at, to, &n, &bad);
+    if (n) { printf("FAIL ctl: 150-update excursions changed accum (first at %ld)\n", at[0]); fail = 1; }
+    a = run_ctl(tr_huge, 10000, 5, 64, at, to, &n, &bad);
+    if (a != 64 || n != 4 || to[0] != 10 || to[1] != 20 || to[2] != 40 || to[3] != 64 || at[1] - at[0] != 500) { printf("FAIL ctl: B_noise 1e4: final %d after %d changes\n", a, n); fail = 1; }
+    else printf("  ctl B_noise 1e4: 10, 20, 40, 64 (cap) at updates %ld %ld %ld %ld ok\n", at[0], at[1], at[2], at[3]);
+    a = run_ctl(tr_updown, 10000, 1, 64, at, to, &n, &bad);
+    if (a != to[n - 1] || n < 1) { printf("FAIL ctl: up/down trace ended at %d\n", a); fail = 1; }
+    else printf("  ctl B_noise 60 then 2 from accum 1: up to %d, kept after the drop ok\n", a);
+    a = run_ctl(tr_nan, 10000, 5, 64, at, to, &n, &bad);
+    if (n) { printf("FAIL ctl: NaN estimates every 150 updates did not restart the hold\n"); fail = 1; }
+    if (bad) { printf("FAIL ctl: a decrease, a step above x2 or above the cap\n"); fail = 1; }
+    return fail;
 }
 
 int main(void) {
@@ -58,6 +99,7 @@ int main(void) {
                cs[c].name, bn, r, gns_g2(&e), gns_s(&e), mg, ms, ok ? "ok" : "FAIL");
         fail |= !ok;
     }
+    fail |= test_ctl();
     printf(fail ? "test_gns: FAIL\n" : "test_gns: ok\n");
     return fail;
 }

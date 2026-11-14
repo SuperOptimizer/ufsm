@@ -26,3 +26,26 @@ static inline double gns_g2(const gns_ema *e) { return e->w > 0 ? e->g2 / e->w :
 static inline double gns_s(const gns_ema *e) { return e->w > 0 ? e->s / e->w : NAN; }
 /* B_noise in windows; NAN before the first pair or while EMA(|G|^2) <= 0 (noise-dominated: the gradient's mean is not resolved yet) */
 static inline double gns_bnoise(const gns_ema *e) { const double g = gns_g2(e); return e->n && g > 0 ? gns_s(e) / g : NAN; }
+
+/* --accum auto: the batch (windows per update) follows K x B_noise, upward only. Called once per optimizer update with the current EMA
+   B_noise; returns the accumulation steps for the next update. No change during the first warm updates of a (re)start (the EMAs build
+   history), then a change only after the target K B_noise stayed above margin x the current batch for hold consecutive updates, at most
+   one per gap updates, at most x2 per change, capped at amax. Never down, never the lr (the WSD schedule counts windows: a larger batch is
+   the "grow the batch instead of decaying the lr" regime) */
+typedef struct { double k, margin; int wps, warm, hold, gap, amax; } accum_cfg;   /* wps: windows per step (accumulated step) */
+typedef struct { int accum; long upd, run, last; } accum_ctl;                        /* upd: updates since the (re)start; last: of the last change */
+
+static inline accum_ctl accum_ctl_make(int accum, const accum_cfg *f) { return (accum_ctl){.accum = accum, .last = -(long)f->gap}; }
+static inline int accum_ctl_update(accum_ctl *c, const accum_cfg *f, double bnoise) {
+    c->upd++;
+    if (c->upd <= f->warm || !isfinite(bnoise) || bnoise <= 0) { c->run = 0; return c->accum; }
+    const double target = f->k * bnoise;
+    c->run = target > f->margin * c->accum * f->wps ? c->run + 1 : 0;
+    if (c->run < f->hold || c->upd - c->last < f->gap || c->accum >= f->amax) return c->accum;
+    long want = lround(target / f->wps);
+    if (want > 2L * c->accum) want = 2L * c->accum;
+    if (want > f->amax) want = f->amax;
+    if (want <= c->accum) return c->accum;
+    c->accum = (int)want; c->last = c->upd; c->run = 0;
+    return c->accum;
+}
