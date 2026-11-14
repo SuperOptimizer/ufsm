@@ -16,6 +16,8 @@ cmake --preset release && cmake --build build -j 8      # build/ufsm. LLVM 22 (c
 cmake --preset verify && cmake --build build-verify --target test     # suite binaries + the fast tier (the merge gate)
 cmake --build build-verify --target test-slow           # the slow tier; test-all: both
 SUITE_FLAGS="-j 4 test_fit" cmake --build build-verify --target test # runner options (names matching a regex)
+SUITE_FLAGS="-t smoke" cmake --build build-verify --target test      # the smoke tier (~60 tests, under a minute): the edit loop
+SUITE_FLAGS="-c origin/master" cmake --build build-verify --target test   # only the tests your changes since master can affect
 cmake --build build-verify --target test_strip && build-verify/test_strip   # one test by hand
 cmake --preset arch86 && cmake --build build86          # Ampere (RTX 3090): software MX-fp4 / fp8 (bit-exact conversions, emulated
                                                         # block-scaled MMAs; UFSM_MX_EMU=0: fp8 / fp4 as bf16, 16-bit storage). The
@@ -49,11 +51,15 @@ The tests are listed in `tests/suite.txt` (`NAME | TAGS | EST_SECONDS | COMMAND`
 builds `build/ufsm`, the fixtures the Python CLI tests use (in the release directory next to the verify one, configured on first
 use) and every suite binary in `build-verify/`, then runs the fast tier in parallel: the runner sets the job count from the CPUs this
 process may use (cgroup-aware, `-j`, `SUITE_J`), caps the threads of each test (`UFSM_NCPU` / `UFSM_FIT_THREADS` /
-`UFSM_TIFF_THREADS` / `OMP_NUM_THREADS`, `-T`), gives each `gpu` test one of 2 slots per GPU (`-G`; machine-wide locks in
-`/tmp/ufsm-suite-locks`, shared by concurrent suites), the GPU with the most free memory first, runs the longest first, retries
+`UFSM_TIFF_THREADS` / `OMP_NUM_THREADS`, `-T`), gives each `gpu` test one of the GPU's slots (free memory / 2.5 GB, 2..8, `-G`;
+machine-wide locks in `/tmp/ufsm-suite-locks`, shared by concurrent suites), the GPU with the most free memory first, hides the GPUs
+from tests without the `gpu` tag, runs the longest first (the EST column; `tests/suite_est.py results.tsv` refreshes it), retries
 `flaky` tests once and prints each failing test's log tail plus a summary (`results.tsv` holds wall / CPU / max RSS per test). Runner
 options go through the `SUITE_FLAGS` environment variable; `-l` lists the tests, `-P` profiles (marks the tests that open the GPU,
-samples their GPU memory). A new test: one `ufsm_exe(test_x SUITE tests/test_x.c OBJS ... LIBS ...)` line in `tests/targets.cmake`
+samples their GPU memory). `-t smoke` runs the tests tagged `smoke`; `-c REF` only the tests that the files changed since git REF
+can affect (the sources in the DWARF line tables of the binaries a test runs, CUDA sources for those linking the GPU ops; a build or
+runner change selects all). A long test whose sections are independent runs as shards `NAME~partKofN` (`UFSM_TEST_PART=K/N`,
+`tests/test_part.h` / `tests/test_part.sh`): the same checks, side by side. A new test: one `ufsm_exe(test_x SUITE tests/test_x.c OBJS ... LIBS ...)` line in `tests/targets.cmake`
 and a line in `tests/suite.txt` (tag `gpu` if it touches the GPU, `slow` if it takes more than ~30 s); the `suite-check` target (run by
 `test`) fails when one of the two is missing. The pipeline stages below have their own tests: `test_countfield`, `test_fit_join`,
 `test_wraps_core`, `test_flatten`, `test_flatten_gpu`, `test_faces`, `test_faces_gpu`, `test_strip`, `test_render_stream`
