@@ -2,7 +2,9 @@
 # tests/run_suite.sh: the ufsm test suite runner (the CMake targets test / test-slow / test-all call it). Pure bash + flock.
 #
 #   tests/run_suite.sh [options] [REGEX...]     run the tests of the manifest tests/suite.txt (REGEX: only names matching one)
-#     -t TIER   fast (default: everything not tagged slow) | slow (only the slow tag) | all
+#     -t TIER   fast (default: everything not tagged slow; the merge gate) | slow (only the slow tag) | all |
+#               smoke (only the smoke tag: a cross-section of the fast tier for the edit loop, ~1 min)
+#     -c REF    only the tests that the files changed since git REF (and uncommitted / untracked ones) can affect (see srcdeps)
 #     -j N      tests in parallel (default: cgroup-aware CPUs / 3, 1..12; env SUITE_J)
 #     -T N      CPU threads per test, exported as UFSM_NCPU / UFSM_FIT_THREADS / UFSM_TIFF_THREADS / OMP_NUM_THREADS
 #               (default CPUs / j, at least 2; env SUITE_THREADS)
@@ -24,12 +26,12 @@
 set -u
 H=$(cd "$(dirname "$0")/.." && pwd); cd "$H" || exit 2
 MANIFEST=${SUITE_MANIFEST:-$H/tests/suite.txt}
-TIER=fast; J=${SUITE_J:-}; T=${SUITE_THREADS:-}; BDIR=build-verify; OUT=; GPUS=; GSLOTS=${SUITE_GPU_SLOTS:-2}; TO=1800; PROF=0; LIST=0
-while getopts "t:j:T:B:o:g:G:x:Plh" o; do case $o in
-  t) TIER=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; B) BDIR=$OPTARG;; o) OUT=$OPTARG;; g) GPUS=$OPTARG;; G) GSLOTS=$OPTARG;;
-  x) TO=$OPTARG;; P) PROF=1;; l) LIST=1;; *) sed -n '2,22p' "$0"; exit 2;; esac; done
+TIER=fast; CHANGED=; J=${SUITE_J:-}; T=${SUITE_THREADS:-}; BDIR=build-verify; OUT=; GPUS=; GSLOTS=${SUITE_GPU_SLOTS:-2}; TO=1800; PROF=0; LIST=0
+while getopts "t:c:j:T:B:o:g:G:x:Plh" o; do case $o in
+  t) TIER=$OPTARG;; c) CHANGED=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; B) BDIR=$OPTARG;; o) OUT=$OPTARG;; g) GPUS=$OPTARG;; G) GSLOTS=$OPTARG;;
+  x) TO=$OPTARG;; P) PROF=1;; l) LIST=1;; *) sed -n '2,24p' "$0"; exit 2;; esac; done
 shift $((OPTIND - 1)); FILTERS=("$@")
-case $TIER in fast|slow|all) ;; *) echo "run_suite: tier $TIER (fast|slow|all)" >&2; exit 2;; esac
+case $TIER in fast|slow|all|smoke) ;; *) echo "run_suite: tier $TIER (fast|slow|all|smoke)" >&2; exit 2;; esac
 
 # CPUs this process may use: UFSM_NCPU, else min(nproc (affinity), every cgroup v2 cpu.max quota on the path to the root)
 ncpu() {
@@ -66,12 +68,50 @@ while IFS= read -r line; do
   case ",$tg," in *,slow,*) s=1;; *) s=0;; esac
   [ $TIER = fast ] && [ $s = 1 ] && continue
   [ $TIER = slow ] && [ $s = 0 ] && continue
+  [ $TIER = smoke ] && { case ",$tg," in *,smoke,*) ;; *) continue;; esac; }
   if [ ${#FILTERS[@]} -gt 0 ]; then m=0; for f in "${FILTERS[@]}"; do [[ $n =~ $f ]] && m=1; done; [ $m = 0 ] && continue; fi
   [ -n "${TAGS[$n]+x}" ] && { echo "run_suite: duplicate test name $n" >&2; exit 2; }
   NAMES+=("$n"); TAGS[$n]=$tg; EST[$n]=${es:-10}; CMD[$n]=$cm
 done < "$MANIFEST"
-[ ${#NAMES[@]} = 0 ] && { echo "run_suite: no test selected" >&2; exit 2; }
 hastag() { case ",${TAGS[$1]}," in *,$2,*) return 0;; esac; return 1; }
+
+# -c REF: only the tests a change since REF (commits, the working tree and untracked files) can affect. A test depends on the files
+# its command and scripts name, and on the sources of the binaries it runs: the C sources and headers in their DWARF line tables
+# (build-system agnostic, cached per binary in $BDIR/.srcdeps), every CUDA source / header (nvcc objects carry no line tables) when
+# the binary links the GPU ops (nn_init). A build-system or runner change selects everything. For the edit loop; the merge gate stays -t fast.
+srcdeps() {   # a binary's dependency basenames (one per line), "@cuda" when it links nn.o
+  local b=$1 c; c=${SUITE_SRCDEPS:-$BDIR/.srcdeps}/${b##*/}; [ -x "$b" ] || return 0
+  if [ ! -f "$c" ] || [ "$c" -ot "$b" ]; then
+    mkdir -p "${c%/*}"
+    { readelf -wl "$b" 2> /dev/null | grep -oE '[A-Za-z0-9_.+-]+\.(h|cuh|c|cu|inc)$' | sort -u
+      nm "$b" 2> /dev/null | grep -qE ' T nn_init$' && echo @cuda; true; }  > "$c.$$" && mv "$c.$$" "$c"
+  fi
+  cat "$c"
+}
+if [ -n "$CHANGED" ]; then
+  mapfile -t CF < <({ git diff --name-only "$CHANGED" -- 2> /dev/null; git ls-files --others --exclude-standard 2> /dev/null; } | sort -u)
+  ALLC=0; for f in "${CF[@]}"; do case $f in Makefile|CMakeLists.txt|*.cmake|cmake/*|tests/run_suite.sh) ALLC=1;; esac; done
+  if [ $ALLC = 0 ]; then
+    KEEP=(); declare -A MLINE   # manifest lines added or changed since REF: those tests run
+    while IFS='|' read -r n _; do n=$(echo ${n#+}); [ -n "$n" ] && MLINE[$n]=1; done < <(git diff "$CHANGED" -- "$MANIFEST" 2> /dev/null | grep -E '^\+[^+#]')
+    for n in "${NAMES[@]}"; do
+      cm=${CMD[$n]}; bins=(); scripts=(); hit=0; [ -n "${MLINE[$n]+x}" ] && { KEEP+=("$n"); continue; }
+      for w in $cm; do w=${w#./}; case $w in \$B/*) bins+=("$BDIR/${w#\$B/}");; build*/*) bins+=("$w");; tests/*) scripts+=("$w");; esac; done
+      for s in "${scripts[@]}"; do [ -f "$s" ] && for w in $(grep -oE 'build[a-z0-9-]*/[A-Za-z0-9_]+' "$s" | sort -u); do bins+=("$BDIR/${w#*/}"); done; done
+      deps=" $(for b in "${bins[@]}"; do srcdeps "$b"; done | sort -u | tr '\n' ' ')"
+      for f in "${CF[@]}"; do
+        [[ " $cm " == *"$f"* ]] && { hit=1; break; }
+        for s in "${scripts[@]}"; do [ "$s" = "$f" ] && hit=1; done; [ $hit = 1 ] && break
+        case $f in src/*.cu|src/*.cuh) [[ $deps == *" @cuda "* ]] && { hit=1; break; };; esac
+        case $f in *.c|*.h|*.cu|*.cuh|*.inc) [[ $deps == *" ${f##*/} "* ]] && { hit=1; break; };; esac
+      done
+      [ $hit = 1 ] && KEEP+=("$n")
+    done
+    echo "run_suite: -c $CHANGED: ${#CF[@]} changed files select ${#KEEP[@]} of ${#NAMES[@]} tests"
+    NAMES=("${KEEP[@]}")
+  else echo "run_suite: -c $CHANGED: a build or runner file changed, every test selected"; fi
+fi
+[ ${#NAMES[@]} = 0 ] && { echo "run_suite: no test selected" >&2; exit 2; }
 isgpu() { hastag "$1" gpu || hastag "$1" gpu2; }
 # longest first
 mapfile -t QUEUE < <(for n in "${NAMES[@]}"; do echo "${EST[$n]} $n"; done | sort -k1,1nr -s | cut -d' ' -f2-)
