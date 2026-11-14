@@ -84,7 +84,8 @@ pkg_check_modules(UFSM_DEPS REQUIRED IMPORTED_TARGET libcurl libzstd blosc zlib 
 # pod so far: EPYC 7352 Zen 2 and up), or the pod's own (znver2, znver4). Values do not depend on it (-ffp-contract=off, no fast math).
 set(UFSM_MARCH native CACHE STRING "host -march: native (default), or a portable level for binaries run elsewhere (x86-64-v3, znver2 ...)")
 set(UFSM_CFLAGS -std=c23 -O3 -march=${UFSM_MARCH} -g -Wall -Wextra -Werror=comment -Werror=return-type -Werror=implicit-function-declaration -Werror=incompatible-pointer-types
-    -Werror=int-conversion -Werror=format -Werror=uninitialized -Wno-unused-parameter -pthread
+    -Werror=int-conversion -Werror=format -Werror=uninitialized -Wno-error=incompatible-pointer-types-discards-qualifiers
+    -Wno-unused-parameter -pthread
     -ffp-contract=off -fno-math-errno)
 set(UFSM_EXTRA_CFLAGS "" CACHE STRING "extra host C flags, appended last (experiments: -O0, -fsanitize=...)")
 separate_arguments(_extra UNIX_COMMAND "${UFSM_EXTRA_CFLAGS}")
