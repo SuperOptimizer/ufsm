@@ -34,8 +34,8 @@ The toolchain is LLVM only (`cmake/llvm.cmake`): the newest `clang` / `clang-N` 
 lld, llvm-ar / ranlib, compiler-rt builtins and crt files; the C++ library of the CUDA units' host side stays libstdc++ (CUDA's headers
 refuse libc++ on x86). CUDA: `UFSM_CUDA` (default /usr/local/cuda, else the newest /usr/local/cuda-*, else nvcc's prefix); only its
 device code goes through its nvcc by default (`UFSM_CUDA_COMPILER=nvcc`; `clang` compiles it with `clang -x cuda`, whose kernels ran
-1.35x slower on sm_120). nvcc's host compiler is probed at configure time: clang++ when that nvcc accepts it (CUDA 13.3+ takes clang
-22; 13.2 rejects it even with `-allow-unsupported-compiler`), else the newest g++ (`-- ufsm: nvcc host compiler ...` in the configure
+1.35x slower on sm_120). nvcc's host compiler is probed at configure time: clang++ when that nvcc accepts it (with `-allow-unsupported-compiler`:
+the desk's 13.3 and the pod's 13.2 both take clang 22 so), else the newest g++ (`-- ufsm: nvcc host compiler ...` in the configure
 output; `-DUFSM_CUDA_HOST_COMPILER=/usr/bin/g++` pins one). Every .c unit and the link stay clang / lld either way. Host C is `-std=c23 -O3 -march=native
 -ffp-contract=off -fno-math-errno` (contract off: what gcc's ISO mode did; the byte-exact CPU references depend on it). The CUDA units
 get nvcc's `-use_fast_math` on the device side (flush denormals, approximate division / sqrt / transcendentals, FMA contraction),

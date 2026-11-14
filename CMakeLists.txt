@@ -177,10 +177,10 @@ list(APPEND UFSM_CORE_OBJS obj_surfcomp)
 if(UFSM_CUDA_COMPILER STREQUAL "nvcc")
   # nvcc for the device code with clang++ as its host compiler (still no gcc): the old Makefile's flags. nvcc 13.x accepts clang
   # < 22 only, hence -allow-unsupported-compiler for clang 22 (the host side of the .cu files is plain C++ glue).
-  # The host compiler is probed: nvcc -ccbin clang++ on a one-kernel unit that includes a CUDA runtime header. CUDA 13.2's nvcc
-  # rejects clang 22 even with -allow-unsupported-compiler (its host headers fail to parse; the pods, 2026-11-13), 13.3 takes it (the
-  # desk). If clang++ fails, the newest g++ (g++-14 .. g++) is nvcc's host compiler instead; the host C / C++ units stay clang either
-  # way. UFSM_CUDA_HOST_COMPILER pins one.
+  # The host compiler is probed: nvcc -allow-unsupported-compiler -ccbin clang++ on a one-kernel unit that includes a CUDA runtime
+  # header (2026-11-13: the desk's 13.3 and the pod's 13.2 both take clang 22 so; a plain nvcc 13.2 refuses clang 22). If clang++
+  # fails, the newest g++ (g++-15 .. g++) is nvcc's host compiler instead; the host C / C++ units stay clang either way.
+  # UFSM_CUDA_HOST_COMPILER pins one.
   set(UFSM_CUDA_HOST_COMPILER "" CACHE FILEPATH "nvcc's host compiler (default: clang++ if nvcc accepts it, else the newest g++)")
   if(NOT UFSM_CUDA_HOST_COMPILER)
     set(_probe ${CMAKE_BINARY_DIR}/CMakeFiles/ufsm_nvcc_probe)
