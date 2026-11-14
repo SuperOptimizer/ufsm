@@ -6,6 +6,46 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Label-free sheet-identity gates: `ufsm unroll-qa` (2026-11-14, branch geogate-20261114)
+
+The unroll's gates measure self-consistency with the count-field reference: fit-join agreement 0.96-0.97, wrap-check 0.976 and slab
+coherence (Spearman 0.07 with identity) all pass Paris 4, whose GT sheet identity is 0.12-0.21 on PH1-3. `ufsm unroll-qa`
+(`src/unrollqa.c`) measures the fitted W against evidence the reference never integrated, per box (`--box`) or over 48 material tiles of
+128³ field cells (default, ~1 min CPU). Full audit: `/vesuvius/ufsm/audit-20261114/geo-gate.md`.
+
+**Validation.** 92 clean GT boxes, with ids from `fit --model --codes` per box: 54 1667 C boxes, held out, on ref-cf and on joined;
+Paris 4 PH1-3, HOLD and 34 July J boxes on ref-cf. Spearman with ids per box, within each scroll:
+
+| metric | 1667 ref | 1667 joined | Paris 4 |
+|---|---|---|---|
+| pw48: net phase unwrapped along an axis over 48 cells vs the model's ΔW, share > 0.5 turn apart | -0.66 | -0.79 | -0.56 |
+| conf_lo: material share with phase confidence < 0.3 | -0.63 | -0.46 | -0.79 |
+| w4: W vs the winding-mod-4 head (dz dy dx over 32 voxels), share within 0.5 turn | 0.53 | 0.72 | 0.74 |
+| fib_pers_h: fibre traces (H) through W, persistent sheet changes per m (12 / 12 / 32 boxes with fibres) | -0.62 | -0.77 | -0.70 |
+| lcoh_lo (16³ blocks with phase-vs-W coherence < 0.5) / tang_tpm (\|∇W\| along the sheet): reported | -0.69 / -0.63 | -0.80 / -0.62 | -0.57 / -0.78 |
+| tilt of ∇W vs the net normal; \|∇W\| × net spacing; mod-4 loop closure; zero-CT share in material | ~0 | ~0 | ~0 / -0.55 (ct0) |
+
+The fit stays parallel to the sheets at the right spacing even where its integer is wrong. The slips show up in sheet counting and in
+the evidence, not in local geometry. Inside 1667 C1 (ids 0.60), the wrong-integer cells sit where the phase confidence is low (AUC 0.73).
+
+**Gates** (warn-only; `--strict` exits 3; tiles: warn when more than 0.35 of them are over):
+- conf_lo > 0.40, pw48 > 0.10, w4 < 0.80, and fib_pers_h > 130 /m with `--fibres`.
+- Each flags PH1-3. Together the first three flag 30 / 33 Paris 4 boxes with ids < 0.5 and 8 / 9 1667 joined boxes with ids < 0.7,
+  against 1 / 79 good 1667 box fits (ids ≥ 0.8).
+- Whole runs, share of 48 tiles over conf_lo / pw48 / w4: 1667-u1 joined 0.10 / 0.29 / 0.21, all ok; Paris4-u1 0.75 / 0.46 / 0.65,
+  WARN on all three.
+- fiber-judge on the same fibres: Spearman -0.85 over 44 boxes, AUC 0.96. It needs fibre traces, and our fibhv traces put 3 / 5 good P4
+  boxes over 130 /m.
+
+**Pipeline.** unroll.sh check stage, after wrap-check: `unroll-qa` on `joined`, with ok / WARN lines in progress.log. `UQSTRICT=1` makes
+it fatal and `FIBRES=` adds the fibre gate.
+
+**Test.** `test_unroll_qa`, CPU: a synthetic spiral with its true model passes every gate. A model with 1.5 turns per 128 voxels along
+y fires the fibre and pw48 gates, exits 0 by default and 3 under --strict.
+
+**Not caught.** The ±1 slips of a mostly good fit, such as 1667's handedness ramp, need an along-the-wrap angular check. The masked-CT
+coverage loss is invisible here, because the material ends with the CT; that is audit-ugeom's wrap-snap share gate.
+
 ## Kernel numerics fixes, audit kernels.md #4-#7 (2026-11-14, branch kfix46-20261114)
 
 Source-only fixes, not built or tested (the audit's one final build-and-test sweep runs them). Each keeps the old bits wherever the old

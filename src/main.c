@@ -232,6 +232,7 @@ static int usage(void) {
         "  ufsm annot-export ANN.json [--fib F] [--pairs T] [--gate B --level L] [--points DIR --like R K --level L]   annotations -> fitter votes / gate boxes / sparse codes\n"
         "  ufsm annot-regions OUT.tsv [--judge T.tsv ..] [--wrapcheck W --wraps D --um0 U]   flagged regions (fibre judge, wrap check) for annotate-serve --regions\n"
         "  ufsm wrap-check <model> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY]   duplicate / merged wraps: CT peaks between adjacent wraps along radial rays\n"
+        "  ufsm unroll-qa --fields DIR --model SET [--ct ROOT KEY] [--fibres F.fib] [--box ..]... [--out DIR] [--strict]   label-free sheet-identity gates (phase confidence, phase-unwrap witness, wind4, fibres)\n"
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm wrap-snap <wraps-in> <wraps-out> --axis F --axis-um U0 --ct ROOT KEY --ct-um U   .sfc wraps moved along their rays onto the sheets (smooth, order-kept)\n"
         "  ufsm trace-prep --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A --out DIR [--field ridge|prob] [--seeds 64]   tracer box input: radial ridge as an OME zarr v2 pyramid + seeds\n"
@@ -4787,6 +4788,7 @@ int cmd_hires_phase(int argc, char **argv);   /* src/hiresphase.c */
 int cmd_phase_gate(int argc, char **argv);   /* src/phasegate.c */
 int cmd_ct_cal(int argc, char **argv);   /* src/ctcal.c */
 int cmd_w_at(int argc, char **argv);   /* src/phasegate.c */
+int cmd_unroll_qa(int argc, char **argv);   /* src/unrollqa.c */
 int cmd_patch_raster(int argc, char **argv);   /* src/patchraster.c */
 int cmd_ray_check(int argc, char **argv);   /* src/raycheck.c */
 int cmd_vwt_sample(int argc, char **argv);   /* src/vwt_sample.c */
@@ -4863,6 +4865,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "phase-gate")) return cmd_phase_gate(argc, argv);
     if (!strcmp(cmd, "ct-cal")) return cmd_ct_cal(argc, argv);
     if (!strcmp(cmd, "w-at")) return cmd_w_at(argc, argv);
+    if (!strcmp(cmd, "unroll-qa")) return cmd_unroll_qa(argc, argv);
     if (!strcmp(cmd, "patch-raster")) return cmd_patch_raster(argc, argv);
     if (!strcmp(cmd, "ray-check")) return cmd_ray_check(argc, argv);
     if (!strcmp(cmd, "vwt-sample")) return cmd_vwt_sample(argc, argv);

@@ -141,6 +141,7 @@ test_repair                                    |              |    90 | UFSM_TES
 test_repair~full                               | slow         |   475 | ./$B/test_repair
 test_afv                                       |              |     1 | ./$B/test_afv
 test_fiberjudge                                | smoke        |     2 | ./$B/test_fiberjudge
+test_unroll_qa                                 | smoke        |     3 | ./$B/test_unroll_qa
 test_fibertrace                                |              |     1 | ./$B/test_fibertrace
 test_fibertrace_dyad                           |              |     1 | ./$B/test_fibertrace_dyad
 test_fiberraster                               | gpu          |     2 | ./$B/test_fiberraster

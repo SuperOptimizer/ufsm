@@ -22,7 +22,8 @@
 #   ref     -> fields: count-field --model-only (REFCMD F REF [--ct-cal FILE] overrides; cf GPU, TH threads) REFX: extra count-field flags (e.g. --rho-scale S)
 #   slabs   -> ref: snapped slab fits, FITLANES lanes per GPU in FITGPUS ("0 1"; auto: by device memory, 1..3); the INKGPU lanes start once the ink is done; then the
 #           bad-slab check (fit.log: "illegal memory", "loss 0.00000", no final loss line): refit on 1 lane, up to 3 tries, else fail
-#   join    -> slabs: fit-join --ref (refuses bad slabs) ; check -> join: wrap-check (wrapcheck.tsv verdicts; 0 CT peaks = fail)
+#   join    -> slabs: fit-join --ref (refuses bad slabs) ; check -> join: wrap-check (wrapcheck.tsv verdicts; 0 CT peaks = fail) +
+#           unroll-qa (label-free identity gates, warn only; UQSTRICT=1 fatal; FIBRES=UFIB adds the fibre gate; qa/unroll-qa)
 #           check also runs cf-demod on the ref (DRIFT=1: the label-free z drift of the sheet identity, ALARM > DRIFTWARN 0.75 turn,
 #           DRIFTMAX fails) and, with GTBOXES + GTCODES, scores joined / ref-cf on GT boxes (scripts/spiralqa/ugeom/gtboxes.sh, CPU).
 #           DEMOD=1 (off): no slab fits; join = cf-demod --out of the ref (the ref's integers, the phase's sub-turn; DEMODR nodes)
@@ -497,12 +498,22 @@ join() {
 # in wrapcheck.tsv). --ct-um is the CT level's um ($LUM); 0 CT peaks per turn overall = a wrong level / um: the stage fails
 check() {
   X $O/logs/check.log $U wrap-check $O/joined $F --ct $R $K/$LV --ct-um $LUM --tsv $O/wrapcheck.tsv.tmp --threads $TH || return 1
-  [ "$DRY" = 1 ] && return 0
+  [ "$DRY" = 1 ] && { echo "    $U unroll-qa --fields $F --model $O/joined --ct $R $K/$LV --out $O/qa/unroll-qa --tiles ${UQTILES:-48}${FIBRES:+ --fibres $FIBRES}$([ "${UQSTRICT:-0}" = 1 ] && echo ' --strict')  > $O/logs/unrollqa.log"; return 0; }
   [ -s $O/wrapcheck.tsv.tmp ] && [ $(awk -F'\t' 'NR > 1 && $NF != ""' $O/wrapcheck.tsv.tmp | wc -l) -gt 0 ] || { log "check: wrap-check wrote no verdicts"; return 1; }
   awk -F'\t' 'NR > 1 { n++; e += $3 } END { exit !(n > 0 && e / n < 0.999) }' $O/wrapcheck.tsv.tmp ||
     { log "check: wrap-check found no CT peaks (empty share ~1 on every wrap): wrong --ct-um $LUM or CT level $K/$LV?"; return 1; }
   mv $O/wrapcheck.tsv.tmp $O/wrapcheck.tsv
   log "check: $(grep -E '^wrap-check: verdicts' $O/logs/check.log | tail -1)"
+  # unroll-qa: the label-free sheet-identity gates (wrap-check and the join agreement only measure self-consistency with the ref; DESIGN
+  # 2026-11-14): 48 tiles of 128^3 cells, phase confidence / phase-unwrap witness / winding-mod-4 agreement (+ fibre sheet changes with
+  # FIBRES=level-0 UFIB); its ok / WARN lines go to progress.log. Warn only; UQSTRICT=1 fails the stage on a gate. ~3-5 min CPU.
+  local uqs=(); [ "${UQSTRICT:-0}" = 1 ] && uqs=(--strict); [ -n "$FIBRES" ] && uqs+=(--fibres $FIBRES)
+  mkdir -p $O/qa/unroll-qa
+  if ! X $O/logs/unrollqa.log $U unroll-qa --fields $F --model $O/joined --ct $R $K/$LV --out $O/qa/unroll-qa --threads $TH --tiles ${UQTILES:-48} "${uqs[@]}"; then
+    [ "${UQSTRICT:-0}" = 1 ] && { log "check: unroll-qa failed or a gate failed (UQSTRICT=1; logs/unrollqa.log)"; return 1; }
+    log "check: unroll-qa did not finish (logs/unrollqa.log); warn only, continuing"
+  fi
+  [ "$DRY" = 1 ] || grep -E '^unroll-qa: (ok|WARN) gate' $O/logs/unrollqa.log | while read -r l; do log "check: $l"; done
   # the ref's z drift against the sheets (audit ugeom #5: P4's integers drifted 3 turns over ~5 cm of height and every gate passed):
   # ufsm cf-demod (label-free, CPU; DRIFT=0 off): ALARM above DRIFTWARN turns of along-sheet excursion; DRIFTMAX: fail above it
   if [ "${DRIFT:-1}" = 1 ]; then

@@ -113,6 +113,7 @@ ufsm_exe(test_fit_join SUITE tests/test_fit_join.c OBJS fitjoin afv phasegate fi
          LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fit_lat SUITE tests/test_fit_lat.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_fit_w4 SUITE tests/test_fit_w4.c OBJS fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_unroll_qa SUITE tests/test_unroll_qa.c OBJS unrollqa afv fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_flatten SUITE tests/test_flatten.c OBJS flatten imgops jpegpar tiffw tiff LIBS LDLIBS)
 ufsm_exe(test_flatten_gpu SUITE tests/test_flatten.c OBJS flatten imgops jpegpar tiffw tiff nn_flat LIBS LDLIBS CUDA DEFS FLAT_GPU)
 ufsm_exe(test_formats SUITE tests/test_formats.c OBJS CORE NN LP LIBS LDLIBS CUDA)
