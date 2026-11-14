@@ -4849,7 +4849,8 @@ void unet_debug_stats(const unet *u) {
         fprintf(stderr, " max|w| %.3g %.3g\n", w1, w2); free(h);
     }
 }
-/* debug: per block, the gradient norm of each 3^3 conv weight (c1, c2) and of the attention blocks' linears; the head */
+/* debug (also train UFSM_GRAD_LAYERS=N): per block the gradient norm of each 3^3 conv weight (c1, c2), the down convs, the residual blocks, the
+   attention blocks' linears (t<block>.<0 qkv, 1 out, 2 mlp in, 3 mlp out>), the head; all = the whole gradient's norm */
 void unet_debug_grads(const unet *u, const char *tag) {
     const int L = u->cfg.nlev; float *h = malloc(u->np * 4); nn_d2h(h, u->g, u->np * 4);
     #define GN_(off, n) ({ double a_ = 0; for (size_t k_ = 0; k_ < (size_t)(n); k_++) a_ += (double)h[(off) + k_] * h[(off) + k_]; sqrt(a_); })
@@ -4859,8 +4860,16 @@ void unet_debug_grads(const unet *u, const char *tag) {
         const size_t n1 = (size_t)b->c1.cout * b->c1.cin * 27, n2 = (size_t)b->c2.cout * b->c2.cin * 27;
         fprintf(stderr, " %s%d %.2e/%.2e", i < L ? "e" : "d", li, GN_(b->c1.w, n1), GN_(b->c2.w, n2));
     }
+    for (int i = 0; i < L - 1; i++) fprintf(stderr, " dn%d %.2e", i, GN_(u->down[i].w, (size_t)u->down[i].cout * u->down[i].cin * u->down[i].k * u->down[i].k * u->down[i].k));
+    for (int i = 0; i < L; i++) for (int k = 0; k < u->cfg.enc_blocks[i]; k++) { const block *b = &u->rb[i][k];
+        fprintf(stderr, " rb%d.%d %.2e/%.2e", i, k, GN_(b->c1.w, (size_t)b->c1.cout * b->c1.cin * 27), GN_(b->c2.w, (size_t)b->c2.cout * b->c2.cin * 27)); }
     for (int k = 0; k < u->tbn; k++) for (int m = 0; m < 4; m++) { const convp *c = &u->tbm[k][m]; fprintf(stderr, " t%d.%d %.2e", k, m, GN_(c->w, (size_t)c->cin * c->cout)); }
-    fprintf(stderr, " head %.2e\n", GN_(u->head.w, (size_t)u->head.cin * u->head.cout));
+    fprintf(stderr, " head %.2e (b %.2e) all %.2e\n", GN_(u->head.w, (size_t)u->head.cin * u->head.cout), GN_(u->head.b, (size_t)u->head.cout), GN_((size_t)0, u->np));   /* (all: the whole net, the logged gn's) */
+    if (u->tbn) {   /* the attention linears' weight norms (zero-initialised out projections grow from 0 under Muon's fixed-size steps) */
+        nn_d2h(h, u->p, u->np * 4); fprintf(stderr, "weights %s:", tag);
+        for (int k = 0; k < u->tbn; k++) for (int m = 0; m < 4; m++) { const convp *c = &u->tbm[k][m]; fprintf(stderr, " t%d.%d %.3e", k, m, GN_(c->w, (size_t)c->cin * c->cout)); }
+        fprintf(stderr, "\n");
+    }
     #undef GN_
     free(h);
 }

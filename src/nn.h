@@ -562,6 +562,11 @@ void nn_loss_pack(const void *logits, const uint8_t *t, const uint8_t *m, const 
 void nn_loss_stats_acc(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds);
 void nn_loss_stats_fin_light(double *ds, const uint8_t *w, shape5 s, float *scratch, double *keep);   /* after a light statistics pass: only the loss sums 1 .. 4 summed across split halves (keep: s.n s.c doubles) */
 void nn_loss_stats_fin(double *ds, const uint8_t *w, shape5 s, float *scratch);
+void nn_loss_stats_acc_e(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds, double *ent);   /* + ent[n c] += sum mw H(t / 255) */
+void nn_ent_acc(const uint8_t *t, const uint8_t *m, int C, size_t S, double *ent);   /* ent[c] += sum m H(t_c / 255) (the 7-channel unit channel as the losses) */
+void nn_ent_fin(double *ent, int n);   /* --split z: the halves' entropy sums added */
+void nn_pair_angerr(const void *la, const void *lb, const uint8_t *t, const uint8_t *m, size_t n, double *acc);   /* acc += sum |angle error| (deg), count */
+void nn_h16_zero_count(const void *g, const uint8_t *m, const uint8_t *comp, const uint8_t *code, size_t n, unsigned long long *cnt);   /* supervised, zero, subnormal fp16 gradients */
 void nn_loss_grad_only(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch);
 void nn_loss_grad_only_s(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch, float mul);   /* x mul in the kernel (no gscale pass) */
 /* Affinity loss on band labels (task band_affinity, src/nn_loss.cu): output channels c0 .. c0 + K - 1 are affinities for
@@ -741,7 +746,7 @@ void nn_pap_targets(const uint8_t *pl, const uint8_t *pm, size_t n, uint8_t *t, 
    nn_set_logits_h16), n voxels; w4 (W mod 4, 63 codes per turn, 255 unknown), comp (component 0..254, 255 none: one gauge each), m
    (mask weight). Per component the soft BCE against the target rotated by the best of the four quarter turns (the gauge); ds:
    nn_wind4_sums() bytes (zeroed by the caller, accumulated over slabs by nn_wind4_stats), fin: nn_wind4_scratch() bytes ([0] loss,
-   [1] turn accuracy, [2] voxels, [3] 1 / voxels, [4] components, [5] worst-gauge loss, [8 + c] the gauges). nn_wind4_grad writes
+   [1] turn accuracy, [2] voxels, [3] 1 / voxels, [4] components, [5] worst-gauge loss, [6] the targets' mean entropy, [8 + c] the gauges). nn_wind4_grad writes
    lambda x the gradient of fin[0] (zero where unsupervised; ga / gb may be la / lb) */
 size_t nn_wind4_scratch(void);
 size_t nn_wind4_sums(void);   /* bytes of the ds sums (doubles) */

@@ -33,10 +33,11 @@ static char *slurp(const char *path) {
     char *s = malloc((size_t)n + 1); if (!s) { fclose(f); return nullptr; }
     s[fread(s, 1, (size_t)n, f)] = 0; fclose(f); return s;
 }
-/* the window shares added 2026-11-13 after "phase / rv / side / normal bce X" and wind4's "acc X" (the means over the windows that carry
+/* (and the " (kl ...)" group added 2026-11-14 after the heads' bces.) The window shares added 2026-11-13 after "phase / rv / side / normal bce X" and wind4's "acc X" (the means over the windows that carry
    each label): removed before the comparison, so the reference (logged before them, every fixture window labelled) still applies and
    a 100 %-labelled run must reproduce its numbers unchanged. The ink / fib / fibn shares stay (they are in the reference). */
 static void strip_new_shares(char *ln) {
+    for (char *p; (p = strstr(ln, " (kl ")); ) { char *q = strchr(p, ')'); if (!q) break; memmove(p, q + 1, strlen(q + 1) + 1); }   /* the KL group (2026-11-14) */
     for (char *p = ln; (p = strstr(p, " (")); ) {
         char *q = p + 2; while (*q >= '0' && *q <= '9') q++;
         if (q == p + 2 || strncmp(q, "% of windows)", 13)) { p += 2; continue; }
