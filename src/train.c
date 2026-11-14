@@ -1416,6 +1416,31 @@ static void head_slab_pass(gpu_state *d, int pass) {
                     for (size_t j = 0; j < nb; j++) nd += cls ? ha[j] != (hb[j] == 255 ? 255 : hb[j] >= 127 ? 254 : 0) : ha[j] != hb[j];
                     tot += (long)nb; bad += (long)nd; free(ha); free(hb); }
                 if (z1 == D) fprintf(stderr, "lat stream check: pass %d, %ld of %ld slab bytes differ so far\n", pass, bad, tot);
+                /* diagnostic UFSM_DUMP_DEV=PREFIX (with UFSM_LAT_STREAM=check, whole windows: no --split): the window's mid-z plane AFTER the
+                   device warp, as the losses see it: PREFIX-NN.pgm, 4 panels side by side: the device CT channel (128 + 40 v) | phase byte |
+                   winding mod 4 byte | papyrus / first aux plane byte (255 = unknown); UFSM_DUMP_N (8) windows (launch2 2026-11-14) */
+                static int ndd = 0; const char *dpre = getenv("UFSM_DUMP_DEV"); const int zm = D / 2;
+                static int dwhy = 0; if (dpre && !dwhy++) fprintf(stderr, "dump dev: D %d H %d W %d z %d..%d hsplit %d xfmt %d xs %d lat %d\n", D, H, W, z0, z1, d->hsplit, g_xfmt, g_xs, g_lat);
+                if (dpre && !pass && ndd < (getenv("UFSM_DUMP_N") ? atoi(getenv("UFSM_DUMP_N")) : 8) && z0 <= zm && zm < z1) {   /* (hsplit only times the uploads; the planes are whole) */
+                    const size_t pl = (size_t)H * W, xb = xbytes(); uint8_t *hx = malloc(pl); uint8_t *hp[3] = {malloc(pl), malloc(pl), malloc(pl)};
+                    /* the device input d->x (--gpu-input: the warped CT channel only, g_xs 1, full resolution), plane zm, min / max scaled */
+                    char *cx = malloc(pl * xb); nn_d2h(cx, (const char *)d->x + (size_t)zm * pl * xb, pl * xb); float *cf = malloc(pl * sizeof(float)), lo = 1e30f, hi = -1e30f;
+                    for (size_t k = 0; k < pl; k++) { float v; if (!g_xfmt) memcpy(&v, cx + 4 * k, 4); else { uint16_t u16; memcpy(&u16, cx + 2 * k, 2);
+                            if (g_xfmt == 1) { _Float16 h; memcpy(&h, &u16, 2); v = (float)h; } else { uint32_t u = (uint32_t)u16 << 16; memcpy(&v, &u, 4); } }
+                        cf[k] = v; if (v == v) { lo = v < lo ? v : lo; hi = v > hi ? v : hi; } }
+                    for (size_t k = 0; k < pl; k++) { const int g = hi > lo ? (int)(255 * (cf[k] - lo) / (hi - lo)) : 128; hx[k] = (uint8_t)(g < 0 ? 0 : g > 255 ? 255 : g); }
+                    free(cx); free(cf);
+                    const uint8_t *src3[3] = {dv[0], g_unwrap2 ? dv[1] : nullptr, g_naux ? dv[3] : nullptr};
+                    for (int k = 0; k < 3; k++) { if (src3[k]) nn_d2h(hp[k], src3[k] + (size_t)zm * pl, pl); else memset(hp[k], 255, pl); }
+                    char path[1100]; snprintf(path, sizeof path, "%s-%02d.pgm", dpre, ndd); FILE *f = fopen(path, "wb");
+                    if (f) { fprintf(f, "P5\n%d %d\n255\n", 4 * W, H);
+                        for (int y = 0; y < H; y++) {
+                            fwrite(hx + (size_t)y * W, 1, W, f);
+                            for (int k = 0; k < 3; k++) fwrite(hp[k] + (size_t)y * W, 1, W, f);
+                        }
+                        fclose(f); fprintf(stderr, "dumped device window %d (source %d, mid plane z %d, input range %g..%g) to %s\n", ndd, d->srcb[d->cur], zm, lo, hi, path); }
+                    ndd++; free(hx); for (int k = 0; k < 3; k++) free(hp[k]);
+                }
             }
 #undef LZA
 #undef LZB
