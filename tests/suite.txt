@@ -246,6 +246,7 @@ test_rc                                        | gpu          |     1 | ./$B/tes
 test_muon                                      | gpu,smoke    |     1 | ./$B/test_muon
 test_muonc                                     | gpu          |     3 | ./$B/test_muonc
 test_muonx                                     | gpu          |     2 | ./$B/test_muonx
+test_admuon                                    | gpu          |     2 | ./$B/test_admuon
 test_qkclip                                    | gpu          |     1 | ./$B/test_qkclip
 test_unet~FUSED_UP=0,F16=1                     | gpu          |     3 | UFSM_FUSED_UP=0 UFSM_F16=1 ./$B/test_unet
 test_unet~RECOMPUTE=2,F16=1                    | gpu          |     3 | UFSM_RECOMPUTE=2 UFSM_F16=1 ./$B/test_unet

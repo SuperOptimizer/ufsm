@@ -140,6 +140,11 @@ struct unet {
     float mx_vr, *mx_vrbuf, **mx_vrp;           /* --muon-vr G (MARS): the previous gradient of every Muon matrix, its per-matrix pointers (device) */
     int rest_sign; float rest_sign_mult;           /* --opt-rest sign: the non-Muon parameters on sign momentum (lr x mult) */
     int mx_caut, mx_qkv;                         /* --muon-cautious 1, --muon-qkv-split 1 */
+    int ost_arm, ost_have, ost_ngrp, ost_nseg; double *ost_dev; float *ost_snap; size_t ost_snap_n;   /* --opt-stats: armed / collected, the device sums, the AdamW snapshot */
+    signed char ost_grp[UNET_MAXCONV]; size_t *ost_seg;                 /* each Muon descriptor's stats group; AdamW segments (off, n, group) */
+    int ad_lars, ad_dog; float ad_tgt, ad_b, ad_c, ad_dogmax, ad_lrpeak;   /* adaptive Muon (unet_set_muon_adapt): (b) per-layer control, (c) DoG */
+    float *ad_lrm, *ad_ema, *ad_dispbuf, **ad_dispp; double *ad_dogst, *ad_part;   /* their device state */
+    float ad_ema_load[UNET_MAXCONV]; int ad_ema_nload; double ad_dog_load[3]; int ad_dog_nload;   /* from a checkpoint, uploaded at the next step */
     float *qk_lmax, *qk_last;                    /* QK-clip: per attention block and head the step's max logit (device), and the max since unet_qk_lmax */
     float mx_mix_a, mx_mix_b3, *mx_mixbuf, **mx_mixp; int mx_mix_T, mx_mix_t;   /* --muon-ademamix A: the slow EMA per matrix, alpha 0 -> A over T steps */
     int mx_kr, mx_kr_every; float mx_kr_b2, mx_kr_eps; struct nn_kron *mx_kron;   /* --muon-kron 1: the Kronecker conv preconditioner (nn_kron.cu) */
@@ -521,6 +526,7 @@ void unet_free(unet *u) {
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
     nn_free(u->wm); nn_free(u->sp24_kb); if (u->muon_mom != u->v) nn_free(u->muon_mom); nn_free(u->muon_work);   /* (aliased into v: mom_alloc) */ nn_free(u->muon_descs); nn_free(u->stem_b);
     nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); nn_free(u->mx_nmrows); nn_free(u->mx_nmoff); nn_free(u->mx_vrbuf); nn_free(u->mx_vrp); nn_kron_free(u->mx_kron); nn_free(u->qk_lmax); nn_free(u->mx_mixbuf); nn_free(u->mx_mixp);
+    nn_free(u->ad_lrm); nn_free(u->ad_ema); nn_free(u->ad_dispbuf); nn_free(u->ad_dispp); nn_free(u->ad_dogst); nn_free(u->ad_part); nn_free(u->ost_dev); nn_free(u->ost_snap); free(u->ost_seg);
     free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_tw); nn_free(u->gf_g); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs); nn_free(u->ds_g16); nn_free(u->ds_tmp);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
@@ -4236,7 +4242,40 @@ void unet_qk_put(unet *u, const float *h) { if (u->qk_lmax) nn_h2d(u->qk_lmax, h
 float unet_qk_lmax(unet *u) { float v = -1.f; if (u->qk_last) { nn_d2h(&v, u->qk_last, 4); nn_zero(u->qk_last, 4); } return v; }
 void unet_set_rest_sign(unet *u, int on, float mult) { u->rest_sign = on; u->rest_sign_mult = mult; }
 void unet_set_muon_ademamix(unet *u, float alpha, float b3, int T) { u->mx_mix_a = alpha; u->mx_mix_b3 = b3; u->mx_mix_T = T > 0 ? T : 1; }
-static int mx_any(const unet *u) { return u->mx_c || u->mx_hb || u->mx_ns || u->mx_nm || u->mx_vr != 0.f || u->mx_caut || u->mx_mix_a != 0.f; }
+static int mx_any(const unet *u) { return u->mx_c || u->mx_hb || u->mx_ns || u->mx_nm || u->mx_vr != 0.f || u->mx_caut || u->mx_mix_a != 0.f || u->ad_lars || u->ad_dog; }
+/* adaptive Muon (2026-11-14, DESIGN.md "Fully adaptive Muon"; nn_muon_ext_adapt in nn_opt.cu): lars (b) the per-layer step control toward
+   update / weight ratio tgt at the peak lr (0: the matrices' geometric mean), EMA beta, multipliers clamped to [1 / clamp, clamp]; dog (c) the
+   DoG global step (first step = lr_peak, capped at dog_max x lr_peak). The (b) EMAs and the (c) scalars ride in checkpoints (adm_ema,
+   adm_dog, written only when on); the displacement restarts at a resume (rbar keeps the distance reached). */
+void unet_set_muon_adapt(unet *u, int lars, float tgt, float beta, float clamp, int dog, float dog_max, float lr_peak) {
+    u->ad_lars = lars; u->ad_tgt = tgt; u->ad_b = beta; u->ad_c = clamp; u->ad_dog = dog; u->ad_dogmax = dog_max; u->ad_lrpeak = lr_peak;
+}
+static void ad_setup(unet *u, const muon_build_t *b) {   /* nn_muon_ext_adapt for this step's ext batch (state allocated once) */
+    const int n = b->n;
+    if (!u->ad_lrm) {
+        if (u->mx_c || u->mx_hb) { fprintf(stderr, "adaptive Muon (--muon-lars / --muon-dog): not with --muon-c or --hyperball\n"); abort(); }
+        u->ad_lrm = nn_malloc((size_t)n * 4); u->ad_ema = nn_malloc((size_t)n * 4); nn_zero(u->ad_ema, (size_t)n * 4);
+        u->ad_dogst = nn_malloc(4 * sizeof(double)); nn_zero(u->ad_dogst, 4 * sizeof(double)); u->ad_part = nn_malloc((size_t)64 * n * sizeof(double));
+        if (u->ad_ema_nload) {
+            if (u->ad_ema_nload == n) nn_h2d(u->ad_ema, u->ad_ema_load, (size_t)n * 4);
+            else fprintf(stderr, "adaptive Muon: the checkpoint has %d ratio EMAs for %d matrices; restarted\n", u->ad_ema_nload, n);
+            u->ad_ema_nload = 0;
+        }
+        if (u->ad_dog_nload == 3) { double h[4] = {u->ad_dog_load[0], u->ad_dog_load[1], u->ad_dog_load[2], 0}; nn_h2d(u->ad_dogst, h, sizeof h); }
+        u->ad_dog_nload = 0;
+        if (u->ad_dog) {   /* the displacement since the anchor (this run's start), Co K floats per matrix */
+            size_t t = 0; for (int i = 0; i < n; i++) t += (size_t)b->h[i].Co * b->h[i].K;
+            u->ad_dispbuf = nn_malloc(t * 4); nn_zero(u->ad_dispbuf, t * 4); float *ptr[UNET_MAXCONV]; t = 0;
+            for (int i = 0; i < n; i++) { ptr[i] = u->ad_dispbuf + t; t += (size_t)b->h[i].Co * b->h[i].K; }
+            u->ad_dispp = nn_malloc((size_t)n * sizeof(float *)); nn_h2d(u->ad_dispp, ptr, (size_t)n * sizeof(float *));
+            fprintf(stderr, "muon-dog: %.1f MB of displacement\n", t * 4 / 1048576.0);
+        }
+    }
+    const nn_madapt a = {.lrm = u->ad_lrm, .ema = u->ad_ema, .dog = u->ad_dogst, .disp = u->ad_dispp, .part = u->ad_part, .lr_peak = u->ad_lrpeak,
+                         .lars_tgt = u->ad_tgt, .lars_b = u->ad_b, .lars_c = u->ad_c, .dog_eta0 = u->ad_lrpeak, .dog_max = u->ad_dogmax * u->ad_lrpeak,
+                         .on_lars = u->ad_lars, .on_dog = u->ad_dog};
+    nn_muon_ext_adapt(&a);
+}
 typedef struct { int i; int hb[UNET_MAXCONV]; int on; } hb_build_t;
 static void hb_collect(unet *u, const convp *c, void *arg) {
     hb_build_t *b = arg; int is_down = 0;
@@ -4316,12 +4355,15 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
         nn_muon_ext_batch(u->muon_descs, nconv3, u->muon_maxco, u->muon_maxk, u->mx_mcd, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
                           u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr, u->mx_ns, nr, u->mx_nmoff, u->mx_nmtot, b2, vp, vg);
         if (u->mx_mix_a != 0.f) nn_muon_ext_mix(u->mx_mixp + nconv3, u->mx_mix_b3, mixa);
+        if (u->ost_arm) nn_muon_stats(u->ost_dev, nconv3);
         nn_muon_ext_batch((const char *)u->muon_descs + sizeof(muon_desc_t) * (size_t)nconv3, nlin, u->muon_maxco, u->muon_maxk, nullptr, nullptr, 3, 0, 0,
                           nullptr, u->mx_R, 0, u->mx_part, lr, beta, wd, 0.f, u->mx_ns, nr, nr ? u->mx_nmoff + nconv3 : nullptr, u->mx_nmtot, b2, vp ? vp + nconv3 : nullptr, vg);
         return;
     }
+    if (u->ad_lars || u->ad_dog) ad_setup(u, b);
     nn_muon_ext_batch(u->muon_descs, n, u->muon_maxco, u->muon_maxk, u->mx_c ? u->mx_mcd : nullptr, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
                       u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr, u->mx_ns, nr, u->mx_nmoff, u->mx_nmtot, b2, vp, vg);
+    nn_muon_ext_adapt(nullptr);
 }
 /* Muon's momentum in the AdamW second-moment buffer v (2026-11-13: -np floats per GPU, 416 MB at the 104 M scratch2 net). AdamW reads v only
    outside the Muon matrices (plain_ranges), the momentum lives only inside them, so the two never meet. UFSM_MUON_MOM_ALIAS=0: a buffer of
@@ -4347,13 +4389,94 @@ static void mom_load(unet *u, const float *h) {
 static void muon_batch(unet *u, int i0, int n, float lr, float beta, float wd) {
     for (int g = 0; g < u->muon_ngrp; g++) {
         const int a = u->muon_grp[g] > i0 ? u->muon_grp[g] : i0, e = u->muon_grp[g + 1] < i0 + n ? u->muon_grp[g + 1] : i0 + n;
-        if (e > a) nn_muon_batch((const char *)u->muon_descs + sizeof(muon_desc_t) * (size_t)a, e - a, u->muon_maxco, u->muon_maxk, lr, beta, wd);
+        if (e > a) { if (u->ost_arm) nn_muon_stats(u->ost_dev, a);
+                     nn_muon_batch((const char *)u->muon_descs + sizeof(muon_desc_t) * (size_t)a, e - a, u->muon_maxco, u->muon_maxk, lr, beta, wd); }
     }
+}
+/* ---- --opt-stats (2026-11-14, DESIGN.md "Fully adaptive Muon"): per-matrix update / weight RMS ratios of one optimizer step, by group.
+   Muon matrices: nn_muon_stats inside the batches (the applied update recomputed before the apply). AdamW parameters: their ranges
+   copied before adamw_nonconv and differenced after (a few MB: biases, norms, the 1^3 heads). Groups: */
+enum { OST_L0, OST_DEEP, OST_ATTN, OST_HEAD, OST_REST, OST_NG };
+static const char *const ost_name[OST_NG] = {"L0", "deep", "attn", "head", "adamw"};
+typedef struct { size_t *seg; int n, cap; } ost_segs;
+static void ost_seg_add(ost_segs *s, size_t off, size_t n, int grp) {
+    if (!n) return;
+    if (s->n == s->cap) { s->cap = s->cap ? 2 * s->cap : 64; s->seg = realloc(s->seg, (size_t)s->cap * 3 * sizeof *s->seg); }
+    s->seg[3 * s->n] = off; s->seg[3 * s->n + 1] = n; s->seg[3 * s->n + 2] = (size_t)grp; s->n++;
+}
+static void ost_plain(unet *u, size_t off, size_t n, void *arg) {   /* split [off, off + n) at the 1^3 heads' weight and bias ranges */
+    size_t cut[2 * (UNET_MAXLEV + 2) * 2]; int nc = 0;
+    const convp *hc[UNET_MAXLEV + 2]; int nh = 0; hc[nh++] = &u->head; if (u->cfg.emb_lev) hc[nh++] = &u->eh;
+    for (int j = 1; j <= u->cfg.ds_levels && j < UNET_MAXLEV; j++) hc[nh++] = &u->ds[j];
+    for (int i = 0; i < nh; i++) { if (!hc[i]->cout) continue; const size_t nw = (size_t)hc[i]->cout * hc[i]->cin * hc[i]->k * hc[i]->k * hc[i]->k;
+        cut[nc++] = hc[i]->w; cut[nc++] = hc[i]->w + nw; cut[nc++] = hc[i]->b; cut[nc++] = hc[i]->b + (size_t)hc[i]->cout; }
+    for (size_t pos = off, end = off + n; pos < end;) {
+        size_t e = end; for (int k = 0; k < nc; k++) if (cut[k] > pos && cut[k] < e) e = cut[k];
+        int head = 0; for (int k = 0; k < nc; k += 2) head |= pos >= cut[k] && pos < cut[k + 1];
+        ost_seg_add(arg, pos, e - pos, head ? OST_HEAD : OST_REST); pos = e;
+    }
+}
+typedef struct { size_t o[UNET_MAXCONV], n[UNET_MAXCONV]; int g[UNET_MAXCONV], k; } ost_mats;
+static int conv_level(const unet *u, const convp *c);
+static void ost_mat(unet *u, const convp *c, void *arg) {
+    ost_mats *m = arg; if (m->k >= UNET_MAXCONV) return; int attn = 0;
+    for (int k = 0; k < u->tbn; k++) for (int j = 0; j < 4; j++) attn |= c == &u->tbm[k][j];
+    m->o[m->k] = c->w; m->n[m->k] = (size_t)c->cout * c->cin * c->k * c->k * c->k; m->g[m->k++] = attn ? OST_ATTN : conv_level(u, c) == 0 ? OST_L0 : OST_DEEP;
+}
+static void ost_groups(unet *u) {   /* each descriptor's group from its weight offset (the table may be reordered or split per head) */
+    ost_mats m = {0}; for_each_mat(u, ost_mat, &m);
+    muon_desc_t *h = malloc(sizeof *h * (size_t)u->muon_nconv); nn_d2h(h, u->muon_descs, sizeof *h * (size_t)u->muon_nconv);
+    for (int i = 0; i < u->muon_nconv; i++) {
+        const size_t off = (size_t)(h[i].p - u->p); u->ost_grp[i] = OST_DEEP;
+        for (int j = 0; j < m.k; j++) if (off >= m.o[j] && off < m.o[j] + m.n[j]) { u->ost_grp[i] = (signed char)m.g[j]; break; }
+    }
+    free(h);
+}
+void unet_opt_stats_arm(unet *u) { u->ost_arm = 1; }
+static void ost_begin(unet *u) {
+    if (!u->ost_dev) { u->ost_dev = nn_malloc((size_t)2 * (UNET_MAXCONV + OST_NG) * sizeof(double)); }
+    nn_zero(u->ost_dev, (size_t)2 * (UNET_MAXCONV + OST_NG) * sizeof(double));
+    nn_muon_stats(u->ost_dev, 0);
+}
+static void ost_adam_before(unet *u) {
+    if (!u->ost_seg) { ost_segs s = {0}; plain_ranges(u, ost_plain, &s); u->ost_seg = s.seg; u->ost_nseg = s.n; size_t t = 0; for (int i = 0; i < s.n; i++) t += s.seg[3 * i + 1];
+        u->ost_snap_n = t; u->ost_snap = t ? nn_malloc(t * 4) : nullptr; }
+    size_t t = 0; for (int i = 0; i < u->ost_nseg; i++) { nn_d2d_async(u->ost_snap + t, u->p + u->ost_seg[3 * i], u->ost_seg[3 * i + 1] * 4); t += u->ost_seg[3 * i + 1]; }
+}
+static void ost_adam_after(unet *u) {
+    size_t t = 0;
+    for (int i = 0; i < u->ost_nseg; i++) { const size_t n = u->ost_seg[3 * i + 1];
+        nn_diff_sumsq(u->p + u->ost_seg[3 * i], u->ost_snap + t, n, u->ost_dev + 2 * (UNET_MAXCONV + u->ost_seg[3 * i + 2])); t += n; }
+    nn_muon_stats(nullptr, 0); u->ost_arm = 0; u->ost_have = 1;
+}
+/* " upd/w L0 2.1e-03 [1.2e-03 3.4e-03] deep ...": per group the Frobenius-pooled ratio sqrt(sum |dW|^2 / sum |W|^2) and, for the Muon
+   groups, the range of the per-matrix ratios. 0 when nothing was collected since the last call. */
+int unet_opt_stats_str(unet *u, char *buf, size_t cap) {
+    if (!u->ost_have) return 0;
+    u->ost_have = 0; if (!u->ost_ngrp) { ost_groups(u); u->ost_ngrp = 1; }
+    double h[2 * (UNET_MAXCONV + OST_NG)]; nn_d2h(h, u->ost_dev, sizeof h);
+    double sd[OST_NG] = {0}, sw[OST_NG] = {0}, lo[OST_NG], hi[OST_NG]; int cnt[OST_NG] = {0};
+    for (int i = 0; i < u->muon_nconv; i++) { const int g = u->ost_grp[i]; sd[g] += h[2 * i]; sw[g] += h[2 * i + 1];
+        const double r = h[2 * i + 1] > 0 ? sqrt(h[2 * i] / h[2 * i + 1]) : 0; if (!cnt[g]++) lo[g] = hi[g] = r; else { lo[g] = fmin(lo[g], r); hi[g] = fmax(hi[g], r); } }
+    for (int g = OST_HEAD; g < OST_NG; g++) { sd[g] += h[2 * (UNET_MAXCONV + g)]; sw[g] += h[2 * (UNET_MAXCONV + g) + 1]; }
+    size_t k = (size_t)snprintf(buf, cap, " upd/w");
+    for (int g = 0; g < OST_NG && k < cap; g++) {
+        if (sw[g] <= 0) continue;
+        k += (size_t)snprintf(buf + k, cap - k, " %s %.2e", ost_name[g], sqrt(sd[g] / sw[g]));
+        if (cnt[g] > 1 && k < cap) k += (size_t)snprintf(buf + k, cap - k, " [%.1e %.1e]", lo[g], hi[g]);
+    }
+    if (u->ad_lrm && k < cap) {   /* adaptive Muon: the multipliers' range (x eta / lr_peak under DoG) and DoG's eta, rbar, |x - x0| */
+        float m[UNET_MAXCONV]; nn_d2h(m, u->ad_lrm, (size_t)u->muon_nconv * 4); float a = m[0], z = m[0]; for (int i = 1; i < u->muon_nconv; i++) { a = fminf(a, m[i]); z = fmaxf(z, m[i]); }
+        k += (size_t)snprintf(buf + k, cap - k, " lrm [%.3g %.3g]", a, z);
+        if (u->ad_dog && k < cap) { double d[4]; nn_d2h(d, u->ad_dogst, sizeof d); k += (size_t)snprintf(buf + k, cap - k, " dog eta %.3e rbar %.3e dist %.3e", d[2], d[0], d[3]); }
+    }
+    return 1;
 }
 void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step) {
     if (head_lr_mode(u)) lr_muon *= u->trunk_lr;   /* (the 3^3 convs: all trunk; the head is on AdamW) */
     if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd, step); return; }   /* packed weights: AdamW only */
     if (!u->muon_mom) u->muon_mom = mom_alloc(u);
+    if (u->ost_arm) ost_begin(u);
     if (u->mx_kr) {   /* the 3^3 convs' gradients preconditioned in place (Kronecker factors), then Muon on them as on any gradient */
         if (!u->mx_kron) { kron_build_t k = {0}; for_each_conv3(u, kron_collect, &k); u->mx_kron = nn_kron_create(k.n, k.g, k.Co, k.Ci);
             fprintf(stderr, "muon-kron: %d convs, %.1f MB of factors, roots and scratch\n", k.n, nn_kron_bytes(u->mx_kron) / 1048576.0); }
@@ -4379,7 +4502,9 @@ void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, floa
             muon_batch(u, nt, na, lr_muon, beta, wd);
         } else muon_batch(u, 0, u->muon_nconv, lr_muon, beta, wd);
     }
+    if (u->ost_arm) ost_adam_before(u);
     adamw_nonconv(u, lr_adam, b1, b2, eps, wd, step);
+    if (u->ost_arm) ost_adam_after(u);
 }
 /* ANVIL II on the 3^3 conv weights (see nn.cu); AdamW elsewhere. step counts from 1; rail schedule as in the nanogpt record. */
 typedef struct { float *p; const float *g; float *v0, *X, *Y, *A, *B, *v1, *E, *R; int Co, K; } anvil_desc_t;
@@ -4693,7 +4818,8 @@ void unet_wquant(unet *u, unsigned seed) { (void)u; (void)seed; }   /* kept for 
 /* ---- checkpoints ---- */
 static float g_loaded_sp24_r = 0.f;
 static int g_loaded_sparse = 0, g_loaded_sp24_lv = 0, g_loaded_sp24_hard = 0, g_loaded_wq = 0, g_loaded_muon = 0;   /* set by the header parser, applied by unet_load */
-static float g_loaded_hbR[UNET_MAXCONV]; static int g_loaded_hbR_n = 0;   /* Hyperball radii of the header */
+static float g_loaded_hbR[UNET_MAXCONV]; static int g_loaded_hbR_n = 0;
+static float g_loaded_adema[UNET_MAXCONV]; static int g_loaded_adema_n; static double g_loaded_addog[3]; static int g_loaded_addog_n;   /* adaptive Muon state */   /* Hyperball radii of the header */
 static size_t *g_loaded_inh; static int g_loaded_ninh;   /* init_inh of the header (pairs) */
 static void inh_add(unet *u, size_t off, size_t n);
 static int g_loaded_lat_c; static float g_loaded_lat_step, g_loaded_lat_gain[29], g_loaded_lat_bas[29 * 64];   /* the cell transform of the last header read */
@@ -4833,6 +4959,15 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
         if (u->mx_R_nload) memcpy(r, u->mx_R_load, (size_t)nr * 4); else nn_d2h(r, u->mx_R, (size_t)nr * 4);
         fputs(",\"hb_R\":[", f); for (int i = 0; i < nr; i++) fprintf(f, "%s%.9g", i ? "," : "", r[i]); fputc(']', f);
     }
+    if (u->ad_lars && (u->ad_ema || u->ad_ema_nload)) {   /* adaptive Muon (b): the ratio EMAs (Muon table order) */
+        float r[UNET_MAXCONV]; const int nr = u->ad_ema ? u->muon_nconv : u->ad_ema_nload;
+        if (u->ad_ema) nn_d2h(r, u->ad_ema, (size_t)nr * 4); else memcpy(r, u->ad_ema_load, (size_t)nr * 4);
+        fputs(",\"adm_ema\":[", f); for (int i = 0; i < nr; i++) fprintf(f, "%s%.9g", i ? "," : "", r[i]); fputc(']', f);
+    }
+    if (u->ad_dog && (u->ad_dogst || u->ad_dog_nload)) {   /* adaptive Muon (c): DoG's rbar, G, eta */
+        double d[4] = {0}; if (u->ad_dogst) nn_d2h(d, u->ad_dogst, sizeof d); else memcpy(d, u->ad_dog_load, 3 * sizeof(double));
+        fprintf(f, ",\"adm_dog\":[%.17g,%.17g,%.17g]", d[0], d[1], d[2]);
+    }
     if (u->ninh) {   /* the parameter ranges an --init-from copied (train --init-lr-mult on a resumed run) */
         fputs(",\"init_inh\":[", f); for (int i = 0; i < 2 * u->ninh; i++) fprintf(f, "%s%zu", i ? "," : "", u->inh[i]); fputc(']', f);
     }
@@ -4909,6 +5044,9 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
         }
     }
     if ((p = strstr(line, "\"hb_R\":["))) { p += 8; while (g_loaded_hbR_n < UNET_MAXCONV && *p && *p != ']') { g_loaded_hbR[g_loaded_hbR_n++] = strtof(p, (char **)&p); if (*p == ',') p++; } }
+    g_loaded_adema_n = 0; g_loaded_addog_n = 0;
+    if ((p = strstr(line, "\"adm_ema\":["))) { p += 11; while (g_loaded_adema_n < UNET_MAXCONV && *p && *p != ']') { g_loaded_adema[g_loaded_adema_n++] = strtof(p, (char **)&p); if (*p == ',') p++; } }
+    if ((p = strstr(line, "\"adm_dog\":["))) { p += 11; while (g_loaded_addog_n < 3 && *p && *p != ']') { g_loaded_addog[g_loaded_addog_n++] = strtod(p, (char **)&p); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"l0_norm\":"))) cfg->l0_norm = atoi(p + 10);
     if ((p = strstr(line, "\"l0_slab\":"))) cfg->l0_slab = atoi(p + 10);
     g_loaded_l0_cnt = 0;
@@ -4983,6 +5121,8 @@ int unet_load(unet *u, const char *path) {
     free(h); free(hc);
     fclose(f);
     u->mx_R_nload = g_loaded_hbR_n; memcpy(u->mx_R_load, g_loaded_hbR, (size_t)g_loaded_hbR_n * 4); u->mx_R_ok = 0;   /* none: from the weights */
+    u->ad_ema_nload = g_loaded_adema_n; memcpy(u->ad_ema_load, g_loaded_adema, (size_t)g_loaded_adema_n * 4);
+    u->ad_dog_nload = g_loaded_addog_n; memcpy(u->ad_dog_load, g_loaded_addog, (size_t)g_loaded_addog_n * sizeof(double));
     u->ninh = 0; for (int i = 0; i < g_loaded_ninh; i++) inh_add(u, g_loaded_inh[2 * i], g_loaded_inh[2 * i + 1]);   /* (none: all fresh) */
     if (g_loaded_lat_c && u->cfg.cin == g_loaded_lat_c + 3) unet_set_lat_basis(u, g_loaded_lat_bas, g_loaded_lat_gain, g_loaded_lat_c, g_loaded_lat_step);
     if (g_loaded_sparse) { unet_set_sparse24_levels(u, g_loaded_sp24_lv); unet_set_sparse24(u, g_loaded_sparse); unet_set_sparse24_ramp(u, g_loaded_sp24_r, g_loaded_sp24_hard); }   /* (the mode: 1 = the element-wise 2:4 of older checkpoints) */

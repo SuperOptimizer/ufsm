@@ -167,6 +167,7 @@ ufsm_exe(test_mesh_phase SUITE tests/test_mesh_phase.c OBJS CORE NN LP LIBS LDLI
 ufsm_exe(test_muon SUITE tests/test_muon.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_muonc SUITE tests/test_muonc.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_muonx SUITE tests/test_muonx.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_admuon SUITE tests/test_admuon.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_mx SUITE tests/test_mx.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_mx4 SUITE tests/test_mx4.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_mx_sw SUITE tests/test_mx_sw.c OBJS NN LP LIBS m CUDA)

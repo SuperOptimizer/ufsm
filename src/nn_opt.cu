@@ -220,6 +220,37 @@ static int ns5_batch(const muon_desc_t *d, int nconv, int maxco, int maxk, int m
     }
     return swap;
 }
+/* --opt-stats (2026-11-14, DESIGN.md "Fully adaptive Muon"): per matrix the step's |update|_F^2 and |W|_F^2 (W before the step), summed
+   into out[2 i], out[2 i + 1] by atomics (statistics only: the order does not matter). The update is recomputed exactly as the apply
+   kernel forms it (the same float expression; FMA contraction may differ in the last bit). lrm: per-matrix lr multipliers (nullptr: 1);
+   mc / po: Muon-C's rescale from |O|^2 (po: mopt_sumsq_k's partials); hb: Hyperball's trial step (its projection back onto the
+   sphere left out). */
+static double *g_mst; static int g_mst_base;
+extern "C" void nn_muon_stats(double *out, int base) { g_mst = out; g_mst_base = base; }
+__global__ void mstat_k(const muon_desc_t *d, int swap, float lr, float wd, const float *lrm, int mc, const double *po, const int *hb, const float *R, float hb_lr, double *out) {
+    const muon_desc_t D = d[blockIdx.y]; const float *O = swap ? D.Y : D.X; const size_t n = (size_t)D.Co * D.K;
+    const float l = lrm ? lr * lrm[blockIdx.y] : lr; float scale = muon_scale(D.Co, D.K), st = 0.f; const int h = hb && hb[blockIdx.y];
+    if (mc || h) { double so = 0; for (int j = 0; j < 32; j++) so += po[blockIdx.y * 32 + j];
+        if (h) st = (float)((double)hb_lr * R[blockIdx.y] / fmax(sqrt(so), 1e-30));
+        else { const double nk = (double)n, tgt = sqrt(fmax(1.0, (double)D.Co / D.K)) * sqrt(fmin((double)D.Co, (double)D.K) / nk); scale = (float)(tgt / (sqrt(so / nk) + 1e-8)); } }
+    __shared__ double r[2][256]; double a = 0, b = 0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        const float w = D.p[i], nw = h ? w - st * O[i] : w * (1.f - l * wd) - l * scale * O[i], dw = nw - w; a += (double)dw * dw; b += (double)w * w; }
+    r[0][threadIdx.x] = a; r[1][threadIdx.x] = b; __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) { r[0][threadIdx.x] += r[0][threadIdx.x + o]; r[1][threadIdx.x] += r[1][threadIdx.x + o]; } __syncthreads(); }
+    if (!threadIdx.x) { atomicAdd(&out[2 * blockIdx.y], r[0][0]); atomicAdd(&out[2 * blockIdx.y + 1], r[1][0]); }
+}
+__global__ void diff_sumsq_k(const float *a, const float *b, size_t n, double *out) {   /* out[0] += |a - b|^2, out[1] += |b|^2 */
+    __shared__ double r[2][256]; double x = 0, y = 0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) { const double d = (double)a[i] - b[i]; x += d * d; y += (double)b[i] * b[i]; }
+    r[0][threadIdx.x] = x; r[1][threadIdx.x] = y; __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) { r[0][threadIdx.x] += r[0][threadIdx.x + o]; r[1][threadIdx.x] += r[1][threadIdx.x + o]; } __syncthreads(); }
+    if (!threadIdx.x) { atomicAdd(&out[0], r[0][0]); atomicAdd(&out[1], r[1][0]); }
+}
+extern "C" void nn_diff_sumsq(const float *a, const float *b, size_t n, double *out2) {
+    if (!n) return; const int g = nblk(n, 256) > 128 ? 128 : nblk(n, 256);
+    diff_sumsq_k<<<g, 256>>>(a, b, n, out2); KCHECK();
+}
 extern "C" void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta, float wd) {
     const muon_desc_t *d = (const muon_desc_t *)descs;
     double *ss = gn_dsums((size_t)nconv); cudaMemsetAsync(ss, 0, (size_t)nconv * sizeof(double));
@@ -227,6 +258,7 @@ extern "C" void nn_muon_batch(const void *descs, int nconv, int maxco, int maxk,
     bmuon_mom_k<<<g1, 256>>>(d, beta, ss);
     bmuon_scale_k<<<g1, 256>>>(d, ss);
     const int swap = ns5_batch(d, nconv, maxco, maxk);
+    if (g_mst) mstat_k<<<dim3(32, nconv), 256>>>(d, swap, lr, wd, nullptr, 0, nullptr, nullptr, nullptr, 0.f, g_mst + 2 * (size_t)g_mst_base);
     bmuon_apply_k<<<g1, 256>>>(d, swap, lr, wd);
     KCHECK();
 }
@@ -396,10 +428,11 @@ __global__ void hb_rinit_k(const int *hb, float *R, const double *part) {   /* R
     R[c] = (float)sqrt(s);
 }
 __global__ void mopt_apply_k(const muon_desc_t *d, int swap, int mc, const int *hb, const float *R, const double *po, double *pw,
-                             float lr, float wd, float hb_lr) {
+                             float lr, float wd, float hb_lr, const float *lrm, float *const *disp, double *pd) {
     const muon_desc_t D = d[blockIdx.y]; const float *O = swap ? D.Y : D.X; const size_t n = (size_t)D.Co * D.K;
     const double so = mc_total(po);
-    double a = 0;
+    double a = 0, dd = 0;
+    if (lrm) lr *= lrm[blockIdx.y];   /* the adaptive per-matrix multiplier (nn_muon_ext_adapt; hyperball / Muon-C excluded by the caller) */
     if (hb && hb[blockIdx.y]) {   /* trial point W - eta R O / |O|; its norm for the projection */
         const float st = (float)((double)hb_lr * R[blockIdx.y] / fmax(sqrt(so), 1e-30));
         for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) { const float w = D.p[i] - st * O[i]; D.p[i] = w; a += (double)w * w; }
@@ -409,10 +442,53 @@ __global__ void mopt_apply_k(const muon_desc_t *d, int swap, int mc, const int *
             const double nk = (double)D.Co * D.K, tgt = sqrt(fmax(1.0, (double)D.Co / D.K)) * sqrt(fmin((double)D.Co, (double)D.K) / nk);
             scale = (float)(tgt / (sqrt(so / nk) + 1e-8));
         }
-        for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.p[i] = D.p[i] * (1.f - lr * wd) - lr * scale * O[i];
+        if (disp) { float *dp = disp[blockIdx.y];   /* DoG: the direction's displacement since the anchor (decay left out) */
+            for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+                const float u = lr * scale * O[i]; D.p[i] = D.p[i] * (1.f - lr * wd) - u; const float v = dp[i] - u; dp[i] = v; dd += (double)v * v; } }
+        else for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.p[i] = D.p[i] * (1.f - lr * wd) - lr * scale * O[i];
     }
     mc_part(a, pw);
+    if (pd) mc_part(dd, pd);
 }
+/* ---- Adaptive Muon (2026-11-14, DESIGN.md "Fully adaptive Muon"; train --muon-lars / --muon-dog, off by default) ----
+   After the direction O is final (NorMuon's rows included), one thread computes every matrix's lr multiplier lrm[i]:
+   (b) per-layer step control (LARS-like): rho_i = s_i |O_i|_F / |W_i|_F is matrix i's update / weight ratio per unit lr (s_i: Muon's
+       shape scale). Its EMA (beta, first value as is) is steered to a target: m_i = clamp(tgt / ema_i, 1 / C, C). tgt = T / lr_peak
+       (an absolute update / weight ratio T at the peak lr), or T = 0: the geometric mean of the ema_i over the matrices, so the
+       control only redistributes the step between layers and the global size stays Muon's.
+   (c) learning-rate-free global step (DoG, Ivgi, Hinder & Carmon 2023, arXiv 2302.12022, on Muon's normalised directions): the step
+       eta_t = rbar_t / sqrt(G_t), G_t = sum_s sched_s^2 |v_s|^2 over the per-unit-lr updates v_i = m_i s_i O_i (all matrices
+       pooled), rbar_t = max(rbar_0, max_s |x_s - x_0|) with the displacement x - x_0 accumulated from the direction's steps only
+       (weight decay is a regulariser, not progress). rbar_0 = eta0 |v_1| (eta0 = --muon-lr), so the first step is Muon's; eta is
+       capped at dog_max. Applied lr = sched x eta x m_i (sched = the scheduled lr / lr_peak: warmup and the WSD cooldown stay on top).
+       Consistent directions make the distance grow faster than sqrt(G): eta grows; a random walk keeps it; oscillation shrinks it.
+   dog: [rbar, G, eta, |x - x_0|]. All sums are fixed-order partials: every data-parallel replica computes the same multipliers. */
+static nn_madapt g_ad; static int g_ad_on;
+extern "C" void nn_muon_ext_adapt(const nn_madapt *a) { g_ad_on = a != nullptr; if (a) g_ad = *a; }
+__global__ void ad_ctl_k(const muon_desc_t *d, int n, const double *po, const double *pw, nn_madapt a, float lr) {
+    if (threadIdx.x) return;
+    double lsum = 0;
+    for (int i = 0; i < n; i++) {
+        double so = 0, sw = 0; for (int j = 0; j < 32; j++) { so += po[i * 32 + j]; sw += pw[i * 32 + j]; }
+        const double rho = muon_scale(d[i].Co, d[i].K) * sqrt(so) / fmax(sqrt(sw), 1e-30);
+        if (a.on_lars) { const float e = a.ema[i] > 0.f ? (float)(a.lars_b * a.ema[i] + (1.0 - a.lars_b) * rho) : (float)rho; a.ema[i] = e; lsum += log(fmax((double)e, 1e-30)); }
+        a.lrm[i] = (float)(muon_scale(d[i].Co, d[i].K) * sqrt(so));   /* |v_i| / m_i for now */
+    }
+    const double tgt = a.lars_tgt > 0.f ? (double)a.lars_tgt / a.lr_peak : exp(lsum / n);
+    double v2 = 0;
+    for (int i = 0; i < n; i++) {
+        const double m = a.on_lars ? fmin(fmax(tgt / fmax((double)a.ema[i], 1e-30), 1.0 / a.lars_c), (double)a.lars_c) : 1.0;
+        v2 += m * m * (double)a.lrm[i] * a.lrm[i]; a.lrm[i] = (float)m;
+    }
+    if (a.on_dog) {
+        double *D = a.dog; const double sched = (double)lr / a.lr_peak, gi = sched * sched * v2;
+        if (D[1] <= 0.0 && gi > 0.0) D[0] = fmax(D[0], (double)a.dog_eta0 * sqrt(gi));
+        D[1] += gi; D[0] = fmax(D[0], D[3]);
+        D[2] = D[1] > 0.0 ? fmin(D[0] / sqrt(D[1]), (double)a.dog_max) : (double)a.dog_eta0;
+        const float f = (float)(D[2] / a.lr_peak); for (int i = 0; i < n; i++) a.lrm[i] *= f;
+    }
+}
+__global__ void ad_dist_k(const double *pd, int n, double *dog) { if (threadIdx.x) return; double s = 0; for (int j = 0; j < 32 * n; j++) s += pd[j]; dog[3] = sqrt(s); }
 __global__ void hb_proj_k(const muon_desc_t *d, const int *hb, const float *R, const double *pw) {   /* back onto the sphere |W|_F = R */
     if (!hb[blockIdx.y]) return;
     const muon_desc_t D = d[blockIdx.y]; const size_t n = (size_t)D.Co * D.K;
@@ -527,7 +603,15 @@ extern "C" void nn_muon_ext_batch(const void *descs, int nconv, int maxco, int m
     }
     if (r_init) { mopt_sumsq_k<<<g2, 256>>>(d, -1, pb); hb_rinit_k<<<nconv, 32>>>(hb, R, pb); }
     mopt_sumsq_k<<<g2, 256>>>(d, swap, pa);
-    mopt_apply_k<<<g2, 256>>>(d, swap, mcd != nullptr, hb, R, pa, pb, lr, wd, hb_lr);
+    const float *lrm = nullptr; float *const *disp = nullptr; double *pd = nullptr;
+    if (g_ad_on) {   /* adaptive Muon: |W|^2 per matrix, then the multipliers (one thread) */
+        mopt_sumsq_k<<<g2, 256>>>(d, -1, g_ad.part);
+        ad_ctl_k<<<1, 32>>>(d, nconv, pa, g_ad.part, g_ad, lr);
+        lrm = g_ad.lrm; if (g_ad.on_dog) { disp = g_ad.disp; pd = g_ad.part + (size_t)32 * nconv; }
+    }
+    if (g_mst) mstat_k<<<g2, 256>>>(d, swap, lr, wd, lrm, mcd != nullptr, pa, hb, R, hb_lr, g_mst + 2 * (size_t)g_mst_base);
+    mopt_apply_k<<<g2, 256>>>(d, swap, mcd != nullptr, hb, R, pa, pb, lr, wd, hb_lr, lrm, disp, pd);
+    if (pd) ad_dist_k<<<1, 32>>>(pd, nconv, g_ad.dog);
     if (hb) hb_proj_k<<<g2, 256>>>(d, hb, R, pb);
     KCHECK();
 }

@@ -652,6 +652,15 @@ void nn_muon_ext_batch(const void *descs, int nconv, int maxco, int maxk, const 
    nn_kron_step preconditions them in place (G x1 P1 x2 P2 x3 P3, Pk = (Lk + eps |Lk| I)^(-1/6), Lk the EMA b2 of the mode Grams),
    refreshing the roots of conv i when i % every == step % every (all at the first step). */
 struct nn_kron;
+/* --opt-stats: the next nn_muon_batch / nn_muon_ext_batch calls add each matrix i's |update|_F^2 and |W|_F^2 (before the step) to
+   out[2 (base + i)], out[2 (base + i) + 1] (device doubles, zeroed by the caller); out nullptr: off */
+void nn_muon_stats(double *out, int base);
+void nn_diff_sumsq(const float *a, const float *b, size_t n, double *out2);   /* out2[0] += |a - b|^2, out2[1] += |b|^2 (device doubles) */
+/* adaptive Muon for the next nn_muon_ext_batch calls (train --muon-lars / --muon-dog; see nn_opt.cu): lrm (n floats, written) the
+   per-matrix lr multipliers; ema (n floats, 0 = unset) the (b) ratio EMA; dog (4 doubles) the (c) state [rbar, G, eta, |x - x0|];
+   disp (device array of per-matrix float buffers, Co K each) the displacement; part 64 n doubles of scratch. nullptr: off */
+typedef struct { float *lrm, *ema; double *dog; float *const *disp; double *part; float lr_peak, lars_tgt, lars_b, lars_c, dog_eta0, dog_max; int on_lars, on_dog; } nn_madapt;
+void nn_muon_ext_adapt(const nn_madapt *a);
 void nn_muon_scale_mode(int m);   /* 0: sqrt(max(1, Co / K)); 1: spectral sqrt(Co / K) (train --muon-scale spectral) */
 void nn_signm(float *p, const float *g, float *m, size_t n, float lr, float b, float wd);   /* sign-momentum (Scion ell-inf) step */
 void nn_muon_tc(int on);   /* Muon / Muon-ext Newton-Schulz products on fp16 tensor cores (fp32 accumulation; train --muon-tc 1) */

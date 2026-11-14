@@ -2522,6 +2522,9 @@ int cmd_train(int argc, char **argv) {
     if (warmup_seconds < 0) warmup_seconds = time_horizon * 0.05;
     if (time_horizon && warmup_seconds >= time_horizon) { fprintf(stderr, "warmup-seconds must be less than time horizon\n"); return 2; }
     int nval = atoi(opt(argc, argv, "--val-batches", "8")), log_every = atoi(opt(argc, argv, "--log-every", "20"));
+    /* --opt-stats N (default: every log line): every N steps, the next optimizer step's update / weight Frobenius ratios per group (GPU 0;
+       "  opt step S: upd/w L0 .. deep .. attn .. head .. adamw .."; 0 = off). One extra read of the weights on those steps. */
+    const int opt_stats = atoi(opt(argc, argv, "--opt-stats", "-1")) < 0 ? log_every : atoi(opt(argc, argv, "--opt-stats", "-1")); int ost_pending = 0, ost_armed = 0;
     int val_every = atoi(opt(argc, argv, "--val-every", "500")), ckpt_every = atoi(opt(argc, argv, "--ckpt-every", "1000"));
     const int val_live = atoi(opt(argc, argv, "--val-live", "0"));   /* validate the live weights instead of the EMA (e.g. resume a last.ckpt for one lr-0 step) */
     g_valP = atoi(opt(argc, argv, "--val-P", "0"));   /* (checked once the window and the task are known) */
@@ -2747,7 +2750,17 @@ int cmd_train(int argc, char **argv) {
     if (muon_c < 0 || muon_c > 1 || hyperball < 0 || hyperball > 1 || !(hb_mult > 0.f)) { fprintf(stderr, "--muon-c / --hyperball: 0 or 1; --hb-lr-mult > 0\n"); return 2; }
     /* --muon-ns fixed | polar (Newton-Schulz maps: Keller Jordan's fixed quintic, or the Polar Express schedule), --normuon 1 (NorMuon's
        per-row second-moment normalisation after the orthogonalisation, row EMA --normuon-beta2, default 0.95; Muon's update RMS kept) */
-    const char *muon_ns = opt(argc, argv, "--muon-ns", "fixed"); const int normuon = atoi(opt(argc, argv, "--normuon", "0"));
+    /* --muon-adaptive 1 = --normuon 1 --muon-lars 1 --muon-dog 1 ("fully adaptive Muon", DESIGN.md 2026-11-14). --muon-lars 1: per-layer lr
+       multipliers steering each matrix's update / weight ratio to --muon-lars-target (at the peak lr; 0 = their geometric mean: redistribution
+       only), EMA --muon-lars-beta, clamped to [1 / C, C] (--muon-lars-clamp). --muon-dog 1: the DoG global Muon step (first step = --muon-lr,
+       cap --muon-dog-max x --muon-lr), the schedule's warmup / cooldown multiplier on top. */
+    const int muon_adapt = atoi(opt(argc, argv, "--muon-adaptive", "0"));
+    const int muon_lars = muon_adapt ? 1 : atoi(opt(argc, argv, "--muon-lars", "0")), muon_dog = muon_adapt ? 1 : atoi(opt(argc, argv, "--muon-dog", "0"));
+    const float lars_tgt = (float)atof(opt(argc, argv, "--muon-lars-target", "0")), lars_b = (float)atof(opt(argc, argv, "--muon-lars-beta", "0.99"));
+    const float lars_c = (float)atof(opt(argc, argv, "--muon-lars-clamp", "2")), dog_max = (float)atof(opt(argc, argv, "--muon-dog-max", "2"));
+    if (muon_lars < 0 || muon_lars > 1 || muon_dog < 0 || muon_dog > 1 || !(lars_tgt >= 0.f) || !(lars_b >= 0.f && lars_b < 1.f) || !(lars_c >= 1.f) || !(dog_max > 0.f)) {
+        fprintf(stderr, "--muon-lars / --muon-dog 0 | 1, --muon-lars-target >= 0, --muon-lars-beta in [0, 1), --muon-lars-clamp >= 1, --muon-dog-max > 0\n"); return 2; }
+    const char *muon_ns = opt(argc, argv, "--muon-ns", "fixed"); const int normuon = muon_adapt ? 1 : atoi(opt(argc, argv, "--normuon", "0"));
     const float normuon_b2 = (float)atof(opt(argc, argv, "--normuon-beta2", "0.95"));
     const float muon_vr = (float)atof(opt(argc, argv, "--muon-vr", "0"));   /* MARS variance reduction gamma (0 = off; MARS uses 0.025) */
     /* --muon-kron 1: Kronecker (Co / Ci / 27 taps) Shampoo preconditioning of the 3^3 conv gradients, then Muon */
@@ -2765,12 +2778,14 @@ int cmd_train(int argc, char **argv) {
     const float kron_b2 = (float)atof(opt(argc, argv, "--muon-kron-b2", "0.99")), kron_eps = (float)atof(opt(argc, argv, "--muon-kron-eps", "1e-3"));
     const int ns_mode = !strcmp(muon_ns, "polar") ? 1 : !strcmp(muon_ns, "fixed") ? 0 : -1;
     if (ns_mode < 0 || normuon < 0 || normuon > 1 || !(normuon_b2 >= 0.f && normuon_b2 < 1.f)) { fprintf(stderr, "--muon-ns fixed | polar, --normuon 0 | 1, --normuon-beta2 in [0, 1)\n"); return 2; }
+    if ((muon_lars || muon_dog) && (!use_muon || muon_c || hyperball)) { fprintf(stderr, "--muon-lars / --muon-dog / --muon-adaptive need --opt muon, not with --muon-c / --hyperball\n"); return 2; }
     if ((ns_mode || normuon || muon_vr != 0.f || muon_kron || muon_caut || mix_a != 0.f) && !use_muon) { fprintf(stderr, "--muon-ns polar / --normuon / --muon-vr / --muon-kron / --muon-cautious / --muon-ademamix need --opt muon\n"); return 2; }
     if (muon_kron < 0 || muon_kron > 1 || kron_every < 1 || !(kron_b2 >= 0.f && kron_b2 < 1.f) || !(kron_eps > 0.f)) { fprintf(stderr, "--muon-kron 0 | 1, --muon-kron-every >= 1, --muon-kron-b2 in [0, 1), --muon-kron-eps > 0\n"); return 2; }
     if (!(muon_vr >= 0.f && muon_vr <= 1.f)) { fprintf(stderr, "--muon-vr: 0 .. 1\n"); return 2; }
     static char optlabel[16];   /* the manifest / checkpoint label (16 bytes, truncated): muon[-c][-hb][+pe][+nm][+vr][+kr][+ca] */
-    if (muon_c || hyperball || ns_mode || normuon || muon_vr != 0.f || muon_kron || muon_caut || mix_a != 0.f) {
-        snprintf(optlabel, sizeof optlabel, "muon%s%s%s%s%s%s%s%s", muon_c ? "-c" : "", hyperball ? "-hb" : "", ns_mode ? "+pe" : "", normuon ? "+nm" : "", muon_vr != 0.f ? "+vr" : "", muon_kron ? "+kr" : "", muon_caut ? "+ca" : "", mix_a != 0.f ? "+mx" : ""); optname = optlabel; }
+    if (muon_c || hyperball || ns_mode || normuon || muon_vr != 0.f || muon_kron || muon_caut || mix_a != 0.f || muon_lars || muon_dog) {
+        snprintf(optlabel, sizeof optlabel, "muon%s%s%s%s%s%s%s%s%s%s", muon_c ? "-c" : "", hyperball ? "-hb" : "", ns_mode ? "+pe" : "", normuon ? "+nm" : "", muon_vr != 0.f ? "+vr" : "", muon_kron ? "+kr" : "", muon_caut ? "+ca" : "", mix_a != 0.f ? "+mx" : "",
+                 muon_lars ? "+la" : "", muon_dog ? "+dg" : ""); optname = optlabel; }
     /* --trunk-lr-mult F: every parameter outside the attention stage (the conv trunk, heads, norms; Muon and AdamW) at F x the scheduled
        rates, the stage at the full rates (unet_set_trunk_lr; default 1) */
     const float trunk_lr = (float)atof(opt(argc, argv, "--trunk-lr-mult", "1"));
@@ -2783,7 +2798,7 @@ int cmd_train(int argc, char **argv) {
     const float init_lr = (float)atof(opt(argc, argv, "--init-lr-mult", "1"));
     const int init_lr_steps = atoi(opt(argc, argv, "--init-lr-steps", "0"));
     if (!(init_lr >= 0.f) || init_lr_steps < 0) { fprintf(stderr, "--init-lr-mult >= 0, --init-lr-steps >= 0\n"); return 2; }
-    if (init_lr != 1.f && (trunk_lr != 1.f || use_anvil || muon_c || hyperball || ns_mode || normuon || muon_vr != 0.f || muon_caut || muon_kron || mix_a != 0.f)) { fprintf(stderr, "--init-lr-mult: not with --trunk-lr-mult, --opt anvil, --muon-c, --hyperball, --muon-ns polar, --normuon or --muon-vr\n"); return 2; }
+    if (init_lr != 1.f && (trunk_lr != 1.f || use_anvil || muon_c || hyperball || ns_mode || normuon || muon_vr != 0.f || muon_caut || muon_kron || mix_a != 0.f || muon_lars || muon_dog)) { fprintf(stderr, "--init-lr-mult: not with --trunk-lr-mult, --opt anvil, --muon-c, --hyperball, --muon-ns polar, --normuon or --muon-vr\n"); return 2; }
     float anvil_lr = (float)atof(opt(argc, argv, "--anvil-lr", "0.023")), anvil_wd = (float)atof(opt(argc, argv, "--anvil-wd", "2.25"));
     const char *sched = opt(argc, argv, "--sched", "cos");   /* cos | wsd (warmup, constant, linear cooldown over the last --cooldown fraction; extendable runs) */
     int schedule_start = atoi(opt(argc, argv, "--schedule-start", "0"));
@@ -3611,6 +3626,7 @@ int cmd_train(int argc, char **argv) {
         unet_set_muon_variant(d->u, ns_mode, normuon, normuon_b2);
         unet_set_muon_vr(d->u, muon_vr);
         unet_set_muon_cautious(d->u, muon_caut);
+        unet_set_muon_adapt(d->u, muon_lars, lars_tgt, lars_b, lars_c, muon_dog, dog_max, muon_lr);
         nn_muon_tc(muon_tc);
         unet_set_muon_qkv_split(d->u, muon_qkv);
         nn_muon_scale_mode(muon_spec); unet_set_rest_sign(d->u, rest_sign, rest_mult);
@@ -4787,6 +4803,7 @@ int cmd_train(int argc, char **argv) {
             else unet_srste24(d->u, srste);                  /* no-op unless sparse */
             const float lrr = lr0 > 0.f ? lr / lr0 : 0.f;   /* (lr0 0: 0 / 0 was NaN -> NaN weights after step 1; CAL 11-01) */
             const int ostep = accum > 1 ? (step + accum - 1) / accum : step;   /* (the optimizer's own step count: Adam's bias correction) */
+            if (g == 0 && ost_pending && use_muon) { unet_opt_stats_arm(d->u); ost_pending = 0; ost_armed = 1; }
             if (use_anvil) unet_anvil(d->u, anvil_lr * lrr, anvil_wd, ostep, steps / accum, lr, 0.9f, 0.999f, 1e-8f, wd);
             else if (use_muon) unet_muon(d->u, muon_lr * lrr, muon_beta, lr, 0.9f, 0.999f, 1e-8f, wd, ostep);   /* Muon lr follows the same schedule shape */
             else unet_adamw(d->u, lr, 0.9f, 0.999f, 1e-8f, wd, ostep);
@@ -4809,6 +4826,8 @@ int cmd_train(int argc, char **argv) {
         for (int g = 0; g < ng; g++) if (G[g].tail_due) { nn_init(G[g].dev); upload_tail(&G[g], B, P); }   /* (upsplit: after the loss / gradient-norm
                                                                                                            fetches' small copies, during the optimiser) */
         if (training_failed) break;
+        if (ost_armed) { char ob[512]; ost_armed = 0; nn_init(G[0].dev); if (unet_opt_stats_str(G[0].u, ob, sizeof ob)) fprintf(stderr, "  opt step %d:%s\n", step, ob); }
+        if (opt_stats > 0 && step % opt_stats == 0) ost_pending = 1;   /* (the next update: with --accum, the next multiple of K) */
         committed_step = step;
         if (plan) { coverage.cursor = (uint64_t)(step - coverage.base_step); if (cover_checkpoint_extra(runtime_extra, &coverage, checkpoint_extra, sizeof checkpoint_extra)) return 2; }
         const char *e = nn_check();

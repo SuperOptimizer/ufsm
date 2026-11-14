@@ -180,6 +180,13 @@ void unet_set_muon_ext(unet *u, int muonc, int hyperball, float hb_mult);
 void unet_set_muon_variant(unet *u, int ns_mode, int normuon, float b2);
 /* --muon-vr G: MARS variance-reduced momentum input g + G beta / (1 - beta) (g - g_prev), clipped to unit norm per matrix (0 = Muon) */
 void unet_set_muon_vr(unet *u, float gamma);
+/* --opt-stats N: arm makes the next unet_muon collect each matrix's update / weight Frobenius ratio (and the AdamW parameters'); str
+   formats them per group (L0 convs, deeper convs, attention linears, the 1^3 heads, the other AdamW parameters); 0: nothing collected */
+/* adaptive Muon (train --muon-lars / --muon-dog; DESIGN.md 2026-11-14): (b) per-layer lr multipliers steering each matrix's update / weight
+   ratio to tgt at the peak lr (0: their geometric mean), EMA beta, clamp C; (c) the DoG global step, capped at dog_max x lr_peak */
+void unet_set_muon_adapt(unet *u, int lars, float tgt, float beta, float clamp, int dog, float dog_max, float lr_peak);
+void unet_opt_stats_arm(unet *u);
+int unet_opt_stats_str(unet *u, char *buf, size_t cap);
 void unet_set_muon_cautious(unet *u, int on);
 void unet_set_muon_qkv_split(unet *u, int on);
 /* QK-clip (attention nets): unet_qk_clip after each optimizer step scales the QK-norm gains of every head whose max logit in the step's
