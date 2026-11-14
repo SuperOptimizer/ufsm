@@ -11,7 +11,9 @@
 #   - memory: limits from the trainer's own cgroup (memory.max of its scope and of the slice above it, not constants): alert when the
 #     slice's unreclaimable memory (anon + shmem) passes 90 % of its max, and on every new oom_kill in the slice's memory.events;
 #   - disks: /, the run root and the derived cache ($UFSM_DERIVED_CACHE or ~/.cache/ufsm/derived) under 10 % free (or 50 GB), with
-#     the growth rate and hours to full when it is shrinking;
+#     the growth rate and hours to full when it is shrinking; the slow trend (ops audit #19): over the last 24 h (from 6 h of history
+#     on), a filesystem that would be full within 3 days at its daily growth gets a "disktrend" alert naming scripts/run/retain.py (the
+#     retention policy: prof dumps / bench binaries; checkpoints are the trainer's --ckpt-ring / --snap-keep-*);
 #   - a status line every 1000 steps.
 import os, re, sys, time, shutil, collections, statistics, argparse
 
@@ -25,7 +27,7 @@ HEADS = [('phase', r'phase bce ([0-9.naif]+)'), ('normal', r'normal bce ([0-9.na
          ('rv', r'rv bce ([0-9.naif]+)'), ('ink', r'ink bce ([0-9.naif]+)'), ('fib', r'fib bce ([0-9.naif]+)'),
          ('fibdir', r'fib bce [0-9.naif]+ dir ([0-9.naif]+)'), ('loss', r'loss ([0-9.naif]+)')]
 last_alert = {}; hist = collections.defaultdict(list); pos = {}; last_step = 0; last_step_t = time.time(); waits = []
-oomk = None; disk_hist = collections.defaultdict(list); quiet = True   # (the first pass replays the logs for the head history: no alerts)
+oomk = None; disk_hist = collections.defaultdict(list); disk_day = collections.defaultdict(list); quiet = True   # (the first pass replays the logs for the head history: no alerts)
 
 def alert(key, msg, force=False):
     if quiet and not force: return
@@ -87,7 +89,7 @@ def memory():
     return s
 
 def disks():
-    paths = ['/', A.root, os.environ.get('UFSM_DERIVED_CACHE') or os.path.expanduser('~/.cache/ufsm/derived')] + [p for p in A.disks.split(',') if p]
+    paths = ['/', '/vesuvius', A.root, os.environ.get('UFSM_DERIVED_CACHE') or os.path.expanduser('~/.cache/ufsm/derived')] + [p for p in A.disks.split(',') if p]
     seen = {}; out = []
     for p in paths:
         try: st = os.stat(p)
@@ -98,6 +100,13 @@ def disks():
         rate = (h[0][1] - u.free) / (now - h[0][0]) if now - h[0][0] > 600 else 0.   # bytes / s shrinking
         eta = u.free / rate / 3600 if rate > 0 else float('inf')
         out.append('%s %.0f GB free%s' % (p, u.free / 1e9, ' (%.1f GB/h, full in %.0f h)' % (rate * 3.6e3 / 1e9, eta) if rate > 0 else ''))
+        d = disk_day[st.st_dev]
+        if not d or now - d[-1][0] >= 600: d.append((now, u.free)); d[:] = [x for x in d if now - x[0] < 24 * 3600]   # (a sample per 10 min)
+        if now - d[0][0] >= 6 * 3600:
+            day = (d[0][1] - u.free) / (now - d[0][0]) * 86400   # bytes / day shrinking (net of deletions)
+            if day > 0 and u.free / day < 3:
+                alert('disktrend-' + p, 'disk trend: %s loses %.0f GB/day (last %.0f h), %.0f GB free: full in ~%.1f days; see scripts/run/retain.py '
+                      '(dry run lists what the retention policy drops)' % (p, day / 1e9, (now - d[0][0]) / 3600, u.free / 1e9, u.free / day))
         if u.free < 0.1 * u.total or u.free < 50e9 or eta < 12:
             alert('disk-' + p, force=True, msg= 'disk: %s has %.0f GB free of %.0f%s' % (p, u.free / 1e9, u.total / 1e9, '; shrinking %.1f GB/h, full in ~%.0f h' % (rate * 3.6e3 / 1e9, eta) if rate > 0 else ''))
     return '; '.join(out)

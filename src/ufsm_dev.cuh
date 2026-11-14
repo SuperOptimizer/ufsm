@@ -13,8 +13,8 @@
 
 /* the map lives here as C++17 inline variables (one definition across all units, whatever objects a test links: a definition in
    nn_core.cu left test binaries that link only some CUDA objects without it); nn_set_devmap (nn_core.cu) fills it. mgpu: process */
-inline int ufsm_devmap_[16];
-inline int ufsm_ndevmap_ = 0;
+inline int ufsm_devmap_[16];          /* mgpu: main */
+inline int ufsm_ndevmap_ = 0;         /* mgpu: main */
 inline thread_local int ufsm_t_ldev = -1;   /* this thread's logical device (-1: never set: the physical one is its logical one) */
 static inline int ufsm_dev_phys(int d) { return ufsm_ndevmap_ > 0 && d >= 0 && d < ufsm_ndevmap_ ? ufsm_devmap_[d] : d; }
 static inline int ufsm_dev_nlogical(void) { return ufsm_ndevmap_; }

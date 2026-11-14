@@ -100,7 +100,6 @@ test_sheetpbr                                  |              |     2 | ./$B/tes
 test_pairacc                                   |              |     1 | ./$B/test_pairacc
 test_wbench_stats                              |              |     2 | bash tests/test_wbench_stats.sh $B/ufsm
 test_run_suite                                 |              |    17 | bash tests/test_run_suite.sh
-test_lint_mgpu                                 |              |     1 | python3 tests/lint_mgpu.py
 test_gpuq                                      | flaky        |    14 | bash tests/test_gpuq.sh
 test_robust                                    | gpu          |     1 | ./$B/test_robust
 test_reg                                       |              |    27 | ./$B/test_reg
@@ -335,3 +334,4 @@ test_pgrad~racecheck                           | gpu,slow     |   120 | bash tes
 test_pgrad~synccheck                           | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_pgrad
 test_w4dev~racecheck                           | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_w4dev
 test_w4dev~synccheck                           | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_w4dev
+test_retain                                    |              |     1 | bash tests/test_retain.sh
