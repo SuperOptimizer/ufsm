@@ -136,6 +136,7 @@ struct unet {
     float *muon_mom, *muon_work; size_t muon_work_n;   /* Muon momentum (np) and Newton-Schulz scratch */
     void *muon_descs; int muon_nconv, muon_nconv3, muon_maxco, muon_maxk;   /* batched Muon descriptor table (device) */
     int muon_grp[UNET_MAXCONV + 1], muon_ngrp;   /* plain batched Muon: descriptor groups [grp[i], grp[i + 1]) sharing one scratch pool (muon_table) */
+    int muon_ntrunk; float muon_wd_dm; int mx_fro, mx_stem_adamw; float *mx_lrm; size_t ost_num[8];   /* audit muon: trunk descriptors in the table; --muon-wd-mult (stored as mult - 1: the struct is zeroed), --muon-fro, --muon-stem-adamw; per-matrix static lr multipliers (device); ost group sizes */
     int muon_ninh, muon_part;                /* --init-lr-mult: inherited convs at the table's front (muon_part: the table was built so) */
     int mx_c, mx_hb; float mx_hb_mult;       /* Muon variants: Muon-C, Hyperball (eta = mx_hb_mult x the Muon lr) */
     int mx_ns, mx_nm; float mx_nm_b2;         /* --muon-ns polar (Polar Express maps), --normuon 1 (row normalisation, EMA beta2) */
@@ -521,6 +522,7 @@ unet *unet_create(const unet_cfg *cfg) {
 static void free_acts(unet *u);
 /* the fp4 kernels memoise prepared weights per conv id, weight pointer and step counter (lp_f4fwd.cuh wmemo): every weight change
    outside a training step (init, load, free: another unet's weights may land at the same address under the same step) clears it */
+static void muon_forget_table(unet *u);
 void unet_free(unet *u) {
     nn_wmemo_clear();
     if (!u) return;
@@ -528,7 +530,7 @@ void unet_free(unet *u) {
     free_acts(u);
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema); nn_free(u->hf_w); nn_free(u->l0fg_mx); free(u->inh);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp); nn_free(u->nf_cnt);
-    nn_free(u->wm); nn_free(u->sp24_kb); if (u->muon_mom != u->v) nn_free(u->muon_mom); nn_free(u->muon_work);   /* (aliased into v: mom_alloc) */ nn_free(u->muon_descs); nn_free(u->stem_b);
+    nn_free(u->wm); nn_free(u->sp24_kb); if (u->muon_mom != u->v) nn_free(u->muon_mom); nn_free(u->muon_work);   /* (aliased into v: mom_alloc) */ muon_forget_table(u); nn_free(u->muon_descs); nn_free(u->mx_lrm); nn_free(u->stem_b);
     nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); nn_free(u->mx_nmrows); nn_free(u->mx_nmoff); nn_free(u->mx_vrbuf); nn_free(u->mx_vrp); nn_kron_free(u->mx_kron); nn_free(u->qk_lmax); nn_free(u->mx_mixbuf); nn_free(u->mx_mixp);
     nn_free(u->ad_lrm); nn_free(u->ad_ema); nn_free(u->ad_dispbuf); nn_free(u->ad_dispp); nn_free(u->ad_dogst); nn_free(u->ad_part); nn_free(u->ost_dev); nn_free(u->ost_snap); free(u->ost_seg);
     free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_tw); nn_free(u->gf_g); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
@@ -4189,14 +4191,21 @@ static void plain_ema(unet *u, size_t off, size_t n, void *arg) { nn_ema(u->ema 
 /* Muon for the 3^3 conv weights (viewed as [Co][Ci * 27]); biases, GroupNorm parameters and the head stay on AdamW.
    Exclude these weights from AdamW: zero gradients still allow decay and stale moments to change them. */
 typedef struct { float lr, beta, wd; } muon_arg;
+static int is_qkv(const unet *u, const convp *c);
 static void muon_conv(unet *u, const convp *c, void *arg) {
-    muon_arg *a = arg; int K = c->cin * c->k * c->k * c->k; size_t n = (size_t)c->cout * K;
+    muon_arg *a = arg;
+    if (u->mx_qkv && is_qkv(u, c) && u->tbd.H > 0 && c->cout % (3 * u->tbd.H) == 0) {   /* the reference path splits Q, K, V per head as the table does */
+        const int R = c->cout / (3 * u->tbd.H);
+        for (int h = 0; h < 3 * u->tbd.H; h++) { convp sl = *c; sl.cout = R; sl.w = c->w + (size_t)h * R * c->cin; u->mx_qkv = 0; muon_conv(u, &sl, arg); u->mx_qkv = 1; }
+        return;
+    } int K = c->cin * c->k * c->k * c->k; size_t n = (size_t)c->cout * K;
     size_t need = 2 * n + 2 * (size_t)c->cout * c->cout;
     if (u->muon_work_n < need) { if (u->muon_work) nn_free(u->muon_work); u->muon_work = nn_malloc(need * 4); u->muon_work_n = need; }
     const float lr = trunk_lr_on(u) && c->w < u->tb_p0 ? a->lr * u->trunk_lr : inh_on(u) && inh_has(u, c->w, n) ? a->lr * u->init_lr : a->lr;
     nn_muon(u->p + c->w, u->g + c->w, u->muon_mom + c->w, c->cout, K, lr, a->beta, a->wd, u->muon_work);
 }
 typedef struct { float *p; const float *g; float *mom, *X, *Y, *A, *B; int Co, K; } muon_desc_t;   /* mirrors nn.cu */
+static void muon_forget_table(unet *u) { if (u->muon_descs) nn_muon_forget(u->muon_descs, sizeof(muon_desc_t) * (size_t)u->muon_nconv); }   /* (the NS host copies keyed on this table) */
 typedef struct { muon_desc_t h[UNET_MAXCONV]; int n, n3; size_t pool; int maxco, maxk; } muon_build_t;
 static int is_qkv(const unet *u, const convp *c) { for (int k = 0; k < u->tbn; k++) if (c == &u->tbm[k][0]) return !u->tbd.dK; return 0; }
 static void muon_collect(unet *u, const convp *c, void *arg) {
@@ -4207,6 +4216,7 @@ static void muon_collect(unet *u, const convp *c, void *arg) {
     }
     muon_build_t *b = arg; int K = c->cin * c->k * c->k * c->k; size_t n = (size_t)c->cout * K;
     if (c->k == 3) b->n3++;
+    if (b->n >= UNET_MAXCONV) { fprintf(stderr, "muon: more than UNET_MAXCONV (%d) matrices (--muon-qkv-split makes 3 x heads per attention block)\n", UNET_MAXCONV); abort(); }
     muon_desc_t *d = &b->h[b->n++]; d->p = u->p + c->w; d->g = u->g + c->w; d->mom = u->muon_mom + c->w; d->Co = c->cout; d->K = K;
     d->X = (float *)(uintptr_t)b->pool; b->pool += n; d->Y = (float *)(uintptr_t)b->pool; b->pool += n;
     d->A = (float *)(uintptr_t)b->pool; b->pool += (size_t)c->cout * c->cout; d->B = (float *)(uintptr_t)b->pool; b->pool += (size_t)c->cout * c->cout;
@@ -4217,6 +4227,8 @@ static int mx_any(const unet *u);
 static void muon_table(unet *u, muon_build_t *b) {   /* the descriptor table and its scratch pool, built once (offsets first, then pointers) */
     for_each_mat(u, muon_collect, b);
     if (u->muon_descs) return;
+    u->muon_ntrunk = 0;   /* the table's trunk descriptors (weights below the attention stage): they come first (for_each_mat order); counted, not 4 x tbn: --muon-qkv-split makes more */
+    if (u->tbn) { int i = 0; while (i < b->n && (size_t)(b->h[i].p - u->p) < u->tb_p0) i++; u->muon_ntrunk = i; for (int j = i; j < b->n; j++) if ((size_t)(b->h[j].p - u->p) < u->tb_p0) { fprintf(stderr, "muon: a trunk matrix after the stage's in the table\n"); abort(); } }
     u->muon_ninh = 0; u->muon_part = inh_on(u);
     if (inh_on(u)) {   /* --init-lr-mult: the inherited convs first (a stable partition), so one batch per learning rate */
         muon_desc_t t[UNET_MAXCONV]; int k = 0;
@@ -4267,6 +4279,9 @@ static void kron_collect(unet *u, const convp *c, void *arg) {
     b->g[b->n] = u->g + c->w; b->Co[b->n] = c->cout; b->Ci[b->n] = c->cin; b->n++;
 }   /* (the previous gradients are not checkpointed: a resumed run's first step uses g_prev = 0) */
 void unet_set_muon_cautious(unet *u, int on) { u->mx_caut = on; }
+void unet_set_muon_wd_mult(unet *u, float mult) { u->muon_wd_dm = mult - 1.f; }
+void unet_set_muon_fro(unet *u, int on) { u->mx_fro = on; }
+void unet_set_muon_stem_adamw(unet *u, int on) { u->mx_stem_adamw = on; }
 void unet_set_muon_qkv_split(unet *u, int on) { u->mx_qkv = on; }
 void unet_qk_clip(unet *u, float tau) {   /* after the optimizer step: the live gains (u->p; a FiLM copy u->fw is rebuilt from them) */
     if (!u->qk_lmax) return;
@@ -4277,7 +4292,7 @@ void unet_qk_put(unet *u, const float *h) { if (u->qk_lmax) nn_h2d(u->qk_lmax, h
 float unet_qk_lmax(unet *u) { float v = -1.f; if (u->qk_last) { nn_d2h(&v, u->qk_last, 4); nn_zero(u->qk_last, 4); } return v; }
 void unet_set_rest_sign(unet *u, int on, float mult) { u->rest_sign = on; u->rest_sign_mult = mult; }
 void unet_set_muon_ademamix(unet *u, float alpha, float b3, int T) { u->mx_mix_a = alpha; u->mx_mix_b3 = b3; u->mx_mix_T = T > 0 ? T : 1; }
-static int mx_any(const unet *u) { return u->mx_c || u->mx_hb || u->mx_ns || u->mx_nm || u->mx_vr != 0.f || u->mx_caut || u->mx_mix_a != 0.f || u->ad_lars || u->ad_dog; }
+static int mx_any(const unet *u) { return u->mx_c || u->mx_hb || u->mx_ns || u->mx_nm || u->mx_vr != 0.f || u->mx_caut || u->mx_mix_a != 0.f || u->ad_lars || u->ad_dog || u->mx_fro; }
 /* adaptive Muon (2026-11-14, DESIGN.md "Fully adaptive Muon"; nn_muon_ext_adapt in nn_opt.cu): lars (b) the per-layer step control toward
    update / weight ratio tgt at the peak lr (0: the matrices' geometric mean), EMA beta, multipliers clamped to [1 / clamp, clamp]; dog (c) the
    DoG global step (first step = lr_peak, capped at dog_max x lr_peak). The (b) EMAs and the (c) scalars ride in checkpoints (adm_ema,
@@ -4378,6 +4393,12 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
     }
     float *const *vp = u->mx_vr != 0.f ? u->mx_vrp : nullptr; const float vg = u->mx_vr;
     nn_muon_ext_opts(u->mx_caut);
+    nn_muon_ext_fro(u->mx_fro);
+    if (trunk_lr_on(u)) {   /* --trunk-lr-mult: the trunk's matrices at trunk_lr x the rate, the stage's at 1 (as the plain path's two batches; audit muon #1) */
+        float hm[UNET_MAXCONV]; for (int i = 0; i < n; i++) hm[i] = (size_t)(b->h[i].p - u->p) < u->tb_p0 ? u->trunk_lr : 1.f;
+        if (!u->mx_lrm) u->mx_lrm = nn_malloc((size_t)n * 4);
+        nn_h2d(u->mx_lrm, hm, (size_t)n * 4);
+    }
     if (u->mx_mix_a != 0.f && !u->mx_mixbuf) {   /* AdEMAMix: m2 per matrix, zero at the start (not checkpointed) */
         size_t t = 0; for (int i = 0; i < n; i++) t += (size_t)b->h[i].Co * b->h[i].K;
         u->mx_mixbuf = nn_malloc(t * 4); nn_zero(u->mx_mixbuf, t * 4); float *ptr[UNET_MAXCONV]; t = 0;
@@ -4387,19 +4408,24 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
     const float mixa = u->mx_mix_a != 0.f ? u->mx_mix_a * fminf(1.f, (float)++u->mx_mix_t / (float)u->mx_mix_T) : 0.f;
     nn_muon_ext_mix(u->mx_mix_a != 0.f ? u->mx_mixp : nullptr, u->mx_mix_b3, mixa);
     float *nr = u->mx_nm ? u->mx_nmrows : nullptr; const float b2 = u->mx_nm_b2;
+    float *const lrm0 = trunk_lr_on(u) ? u->mx_lrm : nullptr;
     if (u->mx_c && nlin) {   /* Muon-C on the convs, the linears (Co x Ci, no kernel) on the plain direction; one row state, offsets sliced */
+        nn_muon_ext_lrmult(lrm0);
         nn_muon_ext_batch(u->muon_descs, nconv3, u->muon_maxco, u->muon_maxk, u->mx_mcd, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
                           u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr, u->mx_ns, nr, u->mx_nmoff, u->mx_nmtot, b2, vp, vg);
         if (u->mx_mix_a != 0.f) nn_muon_ext_mix(u->mx_mixp + nconv3, u->mx_mix_b3, mixa);
         if (u->ost_arm) nn_muon_stats(u->ost_dev, nconv3);
+        nn_muon_ext_lrmult(lrm0 ? lrm0 + nconv3 : nullptr);
         nn_muon_ext_batch((const char *)u->muon_descs + sizeof(muon_desc_t) * (size_t)nconv3, nlin, u->muon_maxco, u->muon_maxk, nullptr, nullptr, 3, 0, 0,
                           nullptr, u->mx_R, 0, u->mx_part, lr, beta, wd, 0.f, u->mx_ns, nr, nr ? u->mx_nmoff + nconv3 : nullptr, u->mx_nmtot, b2, vp ? vp + nconv3 : nullptr, vg);
+        nn_muon_ext_lrmult(nullptr);
         return;
     }
     if (u->ad_lars || u->ad_dog) ad_setup(u, b, beta);
+    nn_muon_ext_lrmult(lrm0);
     nn_muon_ext_batch(u->muon_descs, n, u->muon_maxco, u->muon_maxk, u->mx_c ? u->mx_mcd : nullptr, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
                       u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr, u->mx_ns, nr, u->mx_nmoff, u->mx_nmtot, b2, vp, vg);
-    nn_muon_ext_adapt(nullptr);
+    nn_muon_ext_adapt(nullptr); nn_muon_ext_lrmult(nullptr);
 }
 /* Muon's momentum in the AdamW second-moment buffer v (2026-11-13: -np floats per GPU, 416 MB at the 104 M scratch2 net). AdamW reads v only
    outside the Muon matrices (plain_ranges), the momentum lives only inside them, so the two never meet. UFSM_MUON_MOM_ALIAS=0: a buffer of
@@ -4471,7 +4497,9 @@ static void ost_groups(unet *u) {   /* each descriptor's group from its weight o
     for (int i = 0; i < u->muon_nconv; i++) {
         const size_t off = (size_t)(h[i].p - u->p); u->ost_grp[i] = OST_DEEP;
         for (int j = 0; j < m.k; j++) if (off >= m.o[j] && off < m.o[j] + m.n[j]) { u->ost_grp[i] = (signed char)m.g[j]; break; }
+        u->ost_num[u->ost_grp[i]] += (size_t)h[i].Co * h[i].K;   /* group sizes, for the RMS lines */
     }
+    for (int i = 0; i < u->ost_nseg; i++) u->ost_num[u->ost_seg[3 * i + 2]] += u->ost_seg[3 * i + 1];
     free(h);
 }
 void unet_opt_stats_arm(unet *u) { u->ost_arm = 1; }
@@ -4507,6 +4535,13 @@ int unet_opt_stats_str(unet *u, char *buf, size_t cap) {
         k += (size_t)snprintf(buf + k, cap - k, " %s %.2e", ost_name[g], sqrt(sd[g] / sw[g]));
         if (cnt[g] > 1 && k < cap) k += (size_t)snprintf(buf + k, cap - k, " [%.1e %.1e]", lo[g], hi[g]);
     }
+    /* audit muon #5 / #6: the mechanism behind a gn drift. |W| rms per group (weight decay vs the fixed-size Muon steps shrinks the scale-invariant
+       conv weights toward |W|_eq^2 = lr Co / (2 wd); the loss gradient grows as 1 / |W|) and the realised update rms per element (nominal lr / sqrt(K);
+       3-5x less for low-rank gradients) */
+    if (k < cap) k += (size_t)snprintf(buf + k, cap - k, " | W rms");
+    for (int g = 0; g < OST_NG && k < cap; g++) if (sw[g] > 0 && u->ost_num[g]) k += (size_t)snprintf(buf + k, cap - k, " %s %.3e", ost_name[g], sqrt(sw[g] / (double)u->ost_num[g]));
+    if (k < cap) k += (size_t)snprintf(buf + k, cap - k, " | upd rms");
+    for (int g = 0; g < OST_NG && k < cap; g++) if (sw[g] > 0 && u->ost_num[g]) k += (size_t)snprintf(buf + k, cap - k, " %s %.3e", ost_name[g], sqrt(sd[g] / (double)u->ost_num[g]));
     if (u->ad_lrm && k < cap) {   /* adaptive Muon: the multipliers' range (x eta / lr_peak under DoG) and DoG's eta, rbar, |x - x0| */
         float m[UNET_MAXCONV]; nn_d2h(m, u->ad_lrm, (size_t)u->muon_nconv * 4); float a = m[0], z = m[0]; for (int i = 1; i < u->muon_nconv; i++) { a = fminf(a, m[i]); z = fmaxf(z, m[i]); }
         k += (size_t)snprintf(buf + k, cap - k, " lrm [%.3g %.3g]", a, z);
@@ -4527,8 +4562,10 @@ void unet_reserve(unet *u, int muon, int muon_tc) {
     }
 }
 void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step) {
+    const float wd_adam = wd;
+    wd *= 1.f + u->muon_wd_dm;   /* --muon-wd-mult (default 1): the matrices' decay only */
     if (head_lr_mode(u)) lr_muon *= u->trunk_lr;   /* (the 3^3 convs: all trunk; the head is on AdamW) */
-    if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd, step); return; }   /* packed weights: AdamW only */
+    if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd_adam, step); return; }   /* packed weights: AdamW only */
     if (!u->muon_mom) u->muon_mom = mom_alloc(u);
     if (u->ost_arm) ost_begin(u);
     if (u->mx_kr) {   /* the 3^3 convs' gradients preconditioned in place (Kronecker factors), then Muon on them as on any gradient */
@@ -4551,13 +4588,13 @@ void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, floa
             if (ni) muon_batch(u, 0, ni, lr_muon * u->init_lr, beta, wd);
             if (nf) muon_batch(u, ni, nf, lr_muon, beta, wd);
         } else if (trunk_lr_on(u)) {   /* the table is the trunk's convs, then the stage's 4 x tbn linears (for_each_mat): two batches */
-            const int na = 4 * u->tbn, nt = u->muon_nconv - na;
+            const int nt = u->muon_ntrunk;
             muon_batch(u, 0, nt, lr_muon * u->trunk_lr, beta, wd);
-            muon_batch(u, nt, na, lr_muon, beta, wd);
+            muon_batch(u, nt, u->muon_nconv - nt, lr_muon, beta, wd);
         } else muon_batch(u, 0, u->muon_nconv, lr_muon, beta, wd);
     }
     if (u->ost_arm) ost_adam_before(u);
-    adamw_nonconv(u, lr_adam, b1, b2, eps, wd, step);
+    adamw_nonconv(u, lr_adam, b1, b2, eps, wd_adam, step);
     if (u->ost_arm) ost_adam_after(u);
 }
 /* ANVIL II on the 3^3 conv weights (see nn.cu); AdamW elsewhere. step counts from 1; rail schedule as in the nanogpt record. */
@@ -4697,8 +4734,11 @@ static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), v
     for (int i = 0; i < L - 1; i++) { fn(u, &u->down[i], arg); fn(u, &u->dec[i].c1, arg); if (!u->dec[i].single) fn(u, &u->dec[i].c2, arg); }
     for (int i = 0; i < L; i++) for (int k = 0; k < u->cfg.enc_blocks[i]; k++) { fn(u, &u->rb[i][k].c1, arg); fn(u, &u->rb[i][k].c2, arg); }
 }
+typedef struct { void (*fn)(unet *, const convp *, void *); void *arg; const convp *skip; } mat_skip;
+static void mat_skip_fn(unet *u, const convp *c, void *a) { mat_skip *m = a; if (c != m->skip) m->fn(u, c, m->arg); }
 static void for_each_mat(unet *u, void (*fn)(unet *, const convp *, void *), void *arg) {
-    for_each_conv3(u, fn, arg);
+    if (u->mx_stem_adamw) { mat_skip m = {fn, arg, &u->enc[0].c1}; for_each_conv3(u, mat_skip_fn, &m); }   /* --muon-stem-adamw 1: the first conv (Ci input channels x 27 taps) on AdamW */
+    else for_each_conv3(u, fn, arg);
     for (int k = 0; k < u->tbn; k++) for (int j = 0; j < 4; j++) fn(u, &u->tbm[k][j], arg);
 }
 static int conv_level(const unet *u, const convp *c) {   /* the U-Net level a 3^3 conv runs at (a down conv: its input's level) */

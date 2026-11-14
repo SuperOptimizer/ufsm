@@ -691,6 +691,9 @@ void nn_signm(float *p, const float *g, float *m, size_t n, float lr, float b, f
 int lp_f8w_mixed_reserve(void);   /* the latent input conv's MX-fp8 x / MX-fp4 gy weight-gradient chunk copies (96 MB) on the current device now */
 void nn_muon_tc(int on);   /* Muon / Muon-ext Newton-Schulz products on fp16 tensor cores (fp32 accumulation; train --muon-tc 1) */
 void nn_muon_ext_opts(int cautious);
+void nn_muon_ext_lrmult(const float *m);   /* per-matrix static lr multipliers of the next nn_muon_ext_batch calls (device, one per table entry of the call; nullptr: 1) */
+void nn_muon_ext_fro(int on);              /* --muon-fro 1: every matrix's direction rescaled to the nominal |O|_F = s sqrt(min(Co, K)) (Muon-C's rescale, on the plain NS direction) */
+void nn_muon_forget(const void *base, size_t bytes);   /* drop cached host copies of the descriptor tables inside [base, base + bytes) (before freeing a table) */
 void nn_muon_ext_mix(float *const *m2, float b3, float alpha);   /* AdEMAMix slow EMA (device array of per-matrix buffers; nullptr = off) */   /* nn_muon_ext_batch extras (process-wide): cautious masking (train --muon-cautious 1) */
 struct nn_kron *nn_kron_create(int n, float *const *g, const int *Co, const int *Ci);
 size_t nn_kron_bytes(const struct nn_kron *k);

@@ -7,7 +7,7 @@
 #include <stdint.h>
 
 #define UNET_MAXLEV 8
-#define UNET_MAXCONV 384   /* 3^3 convs (encoder, down, decoder, residual blocks) + the attention stage's linear layers */
+#define UNET_MAXCONV 1024   /* 3^3 convs (encoder, down, decoder, residual blocks) + the attention stage's linear layers */
 #define UNET_MAXTB 16      /* cfg.attn_blocks */
 #define UNET_MAXTA 64      /* cfg.attn_blocks x cfg.attn_repeat (block applications) */
 /* unet_set_attn_axis records: per sample UNET_AXR(np) floats: ad (the window dim of the scroll axis: 0 z, 1 y, 2 x), valid (0: no axis),
@@ -196,6 +196,9 @@ void unet_set_muon_adapt(unet *u, int lars, float tgt, float beta, float clamp, 
 void unet_opt_stats_arm(unet *u);
 int unet_opt_stats_str(unet *u, char *buf, size_t cap);
 void unet_set_muon_cautious(unet *u, int on);
+void unet_set_muon_wd_mult(unet *u, float mult);   /* --muon-wd-mult (default 1): multiplier of the weight decay on the Muon matrices only */
+void unet_set_muon_fro(unet *u, int on);           /* --muon-fro 1: every matrix's polarised direction rescaled to the nominal Frobenius norm */
+void unet_set_muon_stem_adamw(unet *u, int on);    /* --muon-stem-adamw 1: the first conv on AdamW (set before the first step; same flag on a resume) */
 void unet_set_muon_qkv_split(unet *u, int on);
 /* QK-clip (attention nets): unet_qk_clip after each optimizer step scales the QK-norm gains of every head whose max logit in the step's
    training forwards exceeded tau (tau 0: record only); unet_qk_lmax: the largest logit since its last call (-1: none recorded) */
