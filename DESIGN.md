@@ -6,6 +6,63 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Per-scroll holdouts for every label type, validation only inside them (2026-11-14, branch datafix-20261114)
+
+The user reversed "no holdouts" (11-12) on 11-14: every labelled scroll keeps ~8-10 % of its labels out of training, for every label
+type, and validation / scoring read only those boxes. Files: `/vesuvius/ufsm/univ/scratch1/holdouts-20261114.json` (118 boxes; copy and
+selector in `scripts/holdouts/`), `/vesuvius/ufsm/univ/scratch1/sources-scratch1-ph80-ho.json` (ph80 with `holdout_file` + `holdout_mode
+mask` on every source, `holdout_strict` 1, PHerc1218-b3 at weight 0, the re-rastered codes sets).
+
+**Boxes.** The existing definitions first: wbench (Paris 4 PH1-3 + HOLD, 1667 C1-C24, 0139 / 0814 / 0500P2 at 9.362 um and their xres
+maps into the 2.2-2.4 um scans), the 16 Paris 4 + 8 0139 / 1667 ink eval crops, 0841 / 0500P2 ink eval-ho crops, fibre 1447-HOLD. Then,
+per scan where a source stayed under ~8 %, one full-yx z slab chosen from `ufsm holdout-cover` (new: each source's draw cells inside the
+boxes, per box, and the uncovered labels per 256 z rows) so each source on that scan lands nearest 8-12 % (>= 4096 rows on 2.4 um scans,
+>= 2048 on 8-9 um: a P 512 validation window fits at 19.2 / 17.3 um). Trimmed: 0841 ink (the six eval crops held 49 %: the two smallest
+kept, 11 %), 1299's bottom-third band (26 %: replaced by a 4096-row slab). Second scans of one scroll: 0139 9.362 / 2.399 one joint slab
+through the xres affine (z nearly axis aligned, cz = 0.257 fz + 623, 300-row margin for the x / y tilt); the 2.399 / 2.215 um ink crops
+of 0139 / 0500P2 mapped back to the 9.362 um scans (`ufsm reg map --f2c --box`). **0009B has no registration** between 8.64 and 2.401 um:
+each scan has its own slab (z 7168 + 2048 of 9600; z 19456 + 4096 of 29120, similar fractions of the scan) - a cross-scan leak is
+possible there until a 0009B xres map exists.
+
+Held-out share of each source's draw cells (holdout-cover; cells of 32^3 .. 512^3 level-0 voxels, so an upper bound on the label voxels):
+
+| source | held | source | held | source | held |
+|---|---|---|---|---|---|
+| Paris4-june / -july | 0.082 / 0.134 | Paris4-june48 / -july48 | 0.077 / 0.113 | Paris4-u2ink / -fib / -spiral / -hf | 0.160 / 0.081 / 0.095 / 0.080 |
+| 1667-gt / A48 / B48 | 0.081 / 0.088 / 0.087 | 1667-u2ink | 0.139 | 0139-gt / -good | 0.092 / 0.133 |
+| 0139-u2ink / -hf | 0.115 / 0.174 | 0500P2-gt / -u2ink | 0.247 / 0.360 | 0172-gt | 0.084 |
+| 1218-b3 / 1299-b3 | 0.084 / 0.080 | 0009B-good / -u2ink | 0.102 / 0.110 | 0175A-good / -fib | 0.090 / 0.099 |
+| 0814 / MAN5 / 0841 u2ink | 0.110 / 0.089 / 0.112 | 1447 / 0125 fib | 0.086 / 0.092 | 1451 / 0332 hf | 0.084 / 0.082 |
+
+(0500P2 stays high: its sets are tiny and the wbench + eval crops are kept whole on both scans.)
+
+**Mechanism fixes (eval audit #2 / #7).** Validation drew box 0 only: it now picks a box uniformly among those a window fits at the
+level. `same_ct` compared store root + key, so a local copy and the http mirror of one scan never masked each other: now the CT basename
++ um. A malformed box was skipped silently: now an error, and a box outside the CT extent is fatal at the first CT open. A
+`holdout_file` with no box of the source's CT prints a warning (fatal under `holdout_strict`); an onfly ink target's own `holdout_file`
+held out only the ink: lifted to the source. The onfly ink derived array blanked the boxes (no ink labels to validate on): the boxes now
+only drop draw cells, the ink inside stays and the sampler's mask hides it from training. Validation averages divide by the windows
+holding each label; "val by source" / "val by scroll" lines; validation with no boxes is fatal unless `--val-train-ok 1`.
+
+**Leak check.** `UFSM_HOLD_AUDIT=1` in sampler-only mode counts, per training window, the known label voxels (phase, w4, ink, aux,
+papyrus, loss mask, packed mask, ink bits; source grid) inside the boxes of its CT without the guard. LEAKAUDIT
+
+**Scoring, holdout only.** `ink-vscore` / `ink-score --holdouts H --ct KEY` (the voxels / the label pixels whose surface point lies in a
+box), `wbench.sh BOXES=holdout HOLDOUTS=H` (45 boxes). There is no `surfcmp` tool in the tree.
+
+**PHerc1218-b3 (weight 0 in -ho): why its labels are not learned.** Direction is ruled out (outward 1.000). No offset: on a
+128 x 512 x 512 crop at z 10240 the label band's papyrus share (CT >= 64) is 0.854 unshifted and 0.856 at the best of every shift up to
++-4 z / +-6 y, x. Packing is 1299's (median band-to-band 14 vs 13.5 voxels), the CT contrast across the band is comparable. What differs
+is the gate: 1218's weight array is 255 on 97 % of the labelled voxels (1299's gate keeps 71 %, median 128), and the fibre judge rates
+1218's labels 3-5x worse than Paris 4's (section "Fibre gate of our spiral labels"), whose gate was never applied pending its 1447 /
+0175A control (GPU). Most likely ungated label noise; the fix is that gate, not a weight.
+
+**try6 contamination.** try6 (scratch2, from step 0 on 11-14) trained on every one of these boxes for ~2000 steps with no masking, and
+every eval set was in its data (eval audit). Validation numbers on these boxes are clean only for a run started from scratch on the -ho
+json (try7). Restart flags: `--val-batches 32` (or more), `--val-P 384` (<= the smallest box edge at the window's level: 512 cells
+at 19.2 um = 4096 level-0 rows on 2.4 um scans), `--holdout-guard 32` (level-l cells of label mask around each box, 614 um at 19.2 um; the net's
+receptive field, 439 cells, cannot be a guard: on a 2048-row box at level 3 it would mask ~30x the box), sources `/vesuvius/ufsm/univ/scratch1/sources-scratch1-ph80-ho.json`.
+
 ## Data / label fixes from the 2026-11-14 audit: outward check, codes grid, ink pooling, stored 19.2 phase, warp fill (2026-11-14, branch datafix-20261114)
 
 The read-only audit of the sampler / label path (/vesuvius/ufsm/audit-20261114/data.md) ranked ten findings; main took #1 (PHerc1218-b3's
