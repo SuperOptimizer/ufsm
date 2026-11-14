@@ -1799,7 +1799,7 @@ static int sync_check(gpu_state *d, int step, const char *what);
 static void diag_nonfinite(gpu_state *d, const char *what, const void *p, size_t n, int h16);
 static void restore_train_recipe(gpu_state *d, int step, int g);
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train);
-static uint64_t g_seed;
+static uint64_t g_seed, g_lat_js0 = 0x7f4a7c159e3779b9ull;   /* g_lat_js0: --lat-step-jitter's first state (train#11: from the seed and the resumed step) */
 static void gstep_fwd(gstep_arg *a) {
     gpu_state *d = a->d; const int g = a->g, step = a->step, B = a->B, P = a->P; const float dice_w = a->dice_w; const uint64_t seed = g_seed;
     const int sparse_at = a->sparse_at; const float srste = a->srste; (void)B;
@@ -2013,7 +2013,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     view_set(d, B);
     if (g_lat_c && g_lat_jit > 0.f) {
         const float *jb, *jg; float jst = 0.f; unet_lat_basis(d->u, &jb, &jg, &jst);   /* (the checkpoint's own step on a resume) */
-        uint64_t js = d->lat_js ? d->lat_js : 0x7f4a7c159e3779b9ull ^ (uint64_t)(d->side >= 0 ? 0 : GIDX(d)) * 0x9E3779B97F4A7C15ull;   /* (a split window: one draw for both halves) */ js ^= js << 13; js ^= js >> 7; js ^= js << 17; d->lat_js = js;   /* (per GPU: the host threads draw in any order; GPU 0's stream is the old one) */
+        uint64_t js = d->lat_js ? d->lat_js : g_lat_js0 ^ (uint64_t)(d->side >= 0 ? 0 : GIDX(d)) * 0x9E3779B97F4A7C15ull;   /* (a split window: one draw for both halves) */ js ^= js << 13; js ^= js >> 7; js ^= js << 17; d->lat_js = js;   /* (per GPU: the host threads draw in any order; GPU 0's stream is the old one) */
         unet_set_lat_step(d->u, train && jst > 0.f ? jst * exp2f(g_lat_jit * (float)((js >> 11) * (2.0 / 9007199254740992.0) - 1.0)) : 0.f);
     }
     if (g_lat_fit && train) {   /* the cell transform's fit on this window's device-built CT channel */
@@ -2442,6 +2442,38 @@ static void split_job(int side, void *a) {
     if (s->train) unet_backward_x(d->u, g_half && !g_pkf ? d->glh : d->gl, g_g16);
 }
 
+
+/* --replica-check N (train#9): data-parallel replicas apply the same averaged gradient but are not bit-identical (Muon's per-matrix norm
+   sums with double atomics in block order: ~1 ulp per update, a bounded random walk). Every N steps each GPU's fp32 weights are compared
+   with GPU 0's, exactly, in host chunks (2 x 4 B per weight over PCIe every N steps: ~0.1 s per 1000 steps on the 92 M net). Logged: the
+   weights that differ, max |w_g - w_0|, |w_g - w_0| / |w_0|; a warning above 1e-6 relative (more than ulp drift). --replica-sync 1: then
+   GPU 0's weights and EMA are copied to the others (their optimizer state is elementwise on identical gradients: already equal) */
+static void replica_check(gpu_state *G, int ng, size_t np, int step, int sync) {
+    const size_t CH = (size_t)4 << 20; float *a = malloc(CH * 4), *b = malloc(CH * 4);
+    if (!a || !b) { free(a); free(b); return; }
+    for (int g = 1; g < ng; g++) {
+        size_t nd = 0; double mx = 0, ssd = 0, ss0 = 0;
+        for (size_t o = 0; o < np; o += CH) {
+            const size_t k = np - o < CH ? np - o : CH;
+            nn_init(G[0].dev); nn_sync(); nn_d2h(a, unet_param_ptr(G[0].u) + o, k * 4);
+            nn_init(G[g].dev); nn_sync(); nn_d2h(b, unet_param_ptr(G[g].u) + o, k * 4);
+            for (size_t i = 0; i < k; i++) {
+                ss0 += (double)a[i] * a[i];
+                if (memcmp(&a[i], &b[i], 4)) { nd++; const double d = fabs((double)b[i] - a[i]); ssd += d * d; if (!(d <= mx)) mx = d; }
+            }
+        }
+        const double rel = ss0 > 0 ? sqrt(ssd / ss0) : (nd ? INFINITY : 0);
+        if (!nd) fprintf(stderr, "  replica check step %d: GPU %d weights bit-identical to GPU %d\n", step, G[g].dev, G[0].dev);
+        else fprintf(stderr, "  %sreplica check step %d: GPU %d vs GPU %d: %zu of %zu weights differ, max |dw| %.3g, |dw| / |w| %.3g%s%s\n", rel > 1e-6 || !isfinite(rel) ? "warning: " : "",
+                     step, G[g].dev, G[0].dev, nd, np, mx, rel, rel > 1e-6 || !isfinite(rel) ? " (more than ulp drift)" : " (ulp drift)", sync ? "; re-synced from GPU 0" : "");
+        if (sync && nd) {
+            nn_peer_copy(unet_param_ptr(G[g].u), G[g].dev, unet_param_ptr(G[0].u), G[0].dev, np * 4);
+            nn_peer_copy(unet_ema_ptr(G[g].u), G[g].dev, unet_ema_ptr(G[0].u), G[0].dev, np * 4);
+            nn_init(G[g].dev); nn_sync(); nn_wmemo_clear();
+        }
+    }
+    nn_init(G[0].dev); free(a); free(b);
+}
 
 /* the checkpoint header's "gns" object (appended last, only with --gns): the EMAs, and with --accum auto the accumulation, the step it took
    effect and the updates before it (train reads them back on resume). Replaces an earlier one in DST */
@@ -3807,6 +3839,9 @@ int cmd_train(int argc, char **argv) {
     int lean = getenv("UFSM_LEAN") ? atoi(getenv("UFSM_LEAN")) : 0;   /* lean: one device batch buffer (no upload overlap), the logit
                                                                      gradient in the model's gradient buffer, logits in A */
     if (resume) fprintf(stderr, "resumed %s at step %d\n", resume, step0);
+    g_lat_js0 = 0x7f4a7c159e3779b9ull ^ (seed + 0x9E3779B97F4A7C15ull * (uint64_t)step0);   /* train#11: --lat-step-jitter's generator from the seed and the
+                                                                   resumed step, as the sampler's (a restart no longer replays the run's first draws; seed 0 step 0: the old stream) */
+    if (!g_lat_js0) g_lat_js0 = 0x7f4a7c159e3779b9ull;
     if (plan) {
         if (!has_cover) coverage.base_step = step0;
         if ((uint64_t)coverage.base_step + coverage.count > INT_MAX || step0 != coverage.base_step + (int)coverage.cursor) { fprintf(stderr, "cover checkpoint step/cursor mismatch\n"); return 2; }
@@ -4476,6 +4511,10 @@ int cmd_train(int argc, char **argv) {
                                .gap = atoi(opt(argc, argv, "--accum-gap", "500")), .amax = acc_amax};
     if (!(acc_cfg.k > 0) || !(acc_cfg.margin >= 1) || acc_cfg.warm < 0 || acc_cfg.hold < 1 || acc_cfg.gap < 0) { fprintf(stderr, "--gns-k > 0, --accum-margin >= 1, --accum-warm >= 0, --accum-hold >= 1, --accum-gap >= 0\n"); return 2; }
     accum_ctl actl = accum_ctl_make(accum, &acc_cfg);
+    /* --replica-check N (default 1000 steps, 0 off; data parallel only), --replica-sync 1: replica_check */
+    const int rep_every = ng > 1 && !split ? atoi(opt(argc, argv, "--replica-check", "1000")) : (opt(argc, argv, "--replica-check", nullptr), 0);
+    const int rep_sync = atoi(opt(argc, argv, "--replica-sync", "0"));
+    if (rep_every < 0 || rep_sync < 0 || rep_sync > 1) { fprintf(stderr, "--replica-check N >= 0, --replica-sync 0|1\n"); return 2; }
     if (acc_auto) fprintf(stderr, "--accum auto: %d windows per step, accum %d%s (max %d): target K %g x B_noise, up only, after %d updates, %d updates above %g x, a change per %d updates at most, x2 at most; lr unchanged\n",
                           acc_cfg.wps, accum, saved_acc > 0 ? " (resumed)" : "", acc_amax, acc_cfg.k, acc_cfg.warm, acc_cfg.hold, acc_cfg.margin, acc_cfg.gap);
     float *gacc[64] = {nullptr}; int nacc_win = 0;
@@ -4910,6 +4949,7 @@ int cmd_train(int argc, char **argv) {
             if (prof) nn_prof_end();
             nn_ptick("optimizer");
         }
+        if (rep_every > 0 && step % rep_every == 0 && !g_stop && !training_failed) replica_check(G, ng, np, step, rep_sync);
         if (acc_auto && upd_now) {   /* --accum auto: the controller after each update; a change takes effect from the next step */
             const int na = accum_ctl_update(&actl, &acc_cfg, gns_bnoise(&gns));
             if (na != accum) {

@@ -6,6 +6,22 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Replica weight check, lat-step jitter seeding (2026-11-14, branch dpcheck-20261114; audit train#9, train#11)
+
+train#9. Data-parallel replicas apply the same averaged gradient, but Muon's per-matrix |X|^2 is a double atomicAdd in block order
+(nn_opt.cu), so their weights drift apart at ~1 ulp per update. Optimizer state is elementwise on identical inputs, so the drift is a
+bounded random walk, but nothing watched it, and only GPU 0 is checkpointed. `--replica-check N` (default 1000 steps, 0 off; data parallel
+without --split only) compares every GPU's fp32 weights (u->p) with GPU 0's, bit for bit, in 16 MB host chunks. A device sum / sumsq
+was considered and rejected: its own reduction order would flag identical weights, and it can't give the max difference. Cost: 2 x 4 B per
+weight over PCIe per check, ~0.1 s per 1000 steps on the 92 M net, one sync per check. The line gives the weights that differ, max |dw|,
+and |dw| / |w|. It is a warning above 1e-6 relative (more than ulp drift), else tagged "ulp drift". `--replica-sync 1` (default off) then
+copies GPU 0's weights and EMA to the others and clears the fp4 weight memo. test_univ2.sh: --replica-check 3 --replica-sync 1 on the
+2-GPU run (lines at steps 3 and 6, no drift warning).
+
+train#11. --lat-step-jitter's xorshift started from a constant at every process start, so a restart replayed the run's first jitter
+draws. Its first state is now 0x7f4a7c159e3779b9 ^ (seed + 0x9E3779B97F4A7C15 x step0), as the sampler's seed. With seed 0 and step 0 it
+is the old stream. The per-GPU term (GIDX) and the one-draw-per-window rule for split halves are unchanged.
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the

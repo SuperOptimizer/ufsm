@@ -167,6 +167,8 @@ void unet_backward_x(unet *u, const void *glogits, int g_h16);
 void unet_zero_grad(unet *u);
 /* Flat gradient exchange for data-parallel training (host buffer of unet_nparams floats). */
 float *unet_grad_ptr(unet *u);                        /* device pointer of the flat gradient */
+float *unet_param_ptr(unet *u);                       /* device pointers of the flat fp32 weights and their EMA */
+float *unet_ema_ptr(unet *u);
 void unet_grad_d2h(unet *u, float *host);
 void unet_grad_h2d(unet *u, const float *host);
 double unet_grad_norm(unet *u);

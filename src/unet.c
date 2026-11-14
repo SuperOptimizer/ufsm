@@ -4029,6 +4029,8 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
 
 void unet_zero_grad(unet *u) { nn_zero(u->g, u->np * 4); }
 float *unet_grad_ptr(unet *u) { return u->g; }
+float *unet_param_ptr(unet *u) { return u->p; }
+float *unet_ema_ptr(unet *u) { return u->ema; }
 void unet_grad_d2h(unet *u, float *host) { nn_d2h(host, u->g, u->np * 4); }
 void unet_grad_h2d(unet *u, const float *host) { nn_h2d(u->g, host, u->np * 4); }
 double unet_grad_norm(unet *u) { return sqrt(nn_sumsq(u->g, u->np, u->red_scratch)); }
