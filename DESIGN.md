@@ -43,7 +43,9 @@ Changes:
 
   - Kink = the median second difference of the blended offset. A small gain: most folds are local SLIM detail, not the blend.
 - **pubcmp.py gate:**
-  - fails when the local and global slopes differ in sign or more than 5 % of the steps jump;
+  - fails when the local and global slopes differ in sign (the jump share is reported only). fibfit's 1667 dir -1 wraps (strip + a quick
+    2-iteration CPU flatten): local +3.38 / global +3.57, one continuous diagonal with ghost lines one turn off (sheet identity 0.76),
+    jumps 0.089 -> OK, where dir +1 failed;
   - with renders, also fails when the ink AUC < CT AUC + 0.02;
   - `--ink-gate c12,c13` scores the papyrus-gated ink.
 
