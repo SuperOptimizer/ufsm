@@ -6,7 +6,7 @@
 # Outputs: $E/TAG-gnrun.matrix.txt, $E/TAG-gnlive.matrix.txt (eval.sh), $E/gnab-TAG/probe.txt (seam steps per arm, mean |d| between arms).
 # Env: everything eval.sh takes (GPU, E, WB, SITE, U, LKF, K ...); TASKS (default "wind rv fib ink", INKP heads: the ink rows take
 # --window-round 1, so 544 / 16 runs as 640 / 64 on a 6-level net), WIN / HALO (640 / 64: scratch2 needs multiples of 128),
-# PROBE_BOX (level-2 PHerc1667 box z,y,x,nz,ny,nx; default a 1024 x 2048^2 block on the axis), AXIS (1667 axis json for the probe).
+# PROBE_BOX (level-2 PHerc1667 box z,y,x,nz,ny,nx; default a 1024^3 block on the axis, ~1-2 GB of lossless outputs per arm), AXIS (1667 axis json for the probe).
 # Run after the MEGA test pass in a GPU window (one GPU, ~1-2 h for both arms at scratch2 size, est.).
 set -u
 CK=$(readlink -f "${1:?ckpt}"); T=${2:?tag}; H=$(cd "$(dirname "$0")/../.." && pwd); U=${U:-$H/build/ufsm}
@@ -24,7 +24,7 @@ for arm in run live; do
 done
 # the probe: one box, both arms, rv + ink + phase cos; seam steps at the window borders (ink-seam, period = the interior) and the arms' difference
 R=${CTROOT:-https://dl.ash2txt.org/community-uploads/forrest/volcomp}; K=${PROBE_KEY:-PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr}
-B=${PROBE_BOX:-4096,1024,1536,1024,2048,2048}; AX=${AXIS:-}; AXA=(--no-axis 1); [ -n "$AX" ] && AXA=(--axis $AX)
+B=${PROBE_BOX:-4096,1280,1664,1024,1024,1024}; AX=${AXIS:-}; AXA=(--no-axis 1); [ -n "$AX" ] && AXA=(--axis $AX)
 for arm in run live; do X=(); [ $arm = live ] && X=(--gn-live 1)
   [ -e $O/p_$arm/rv/zarr.json ] || $U predict $CK $R $K $O/p_$arm --um 2.399 --level 2 --box $B --heads rv,ink,c0 --window $WIN --halo $HALO --shard 512 --q 0 --levels 1 \
        --gpu ${GPU:-0} --threads 8 --cache ${WB:-/vesuvius/ufsm/wbench}/cache "${AXA[@]}" "${X[@]}" > $O/p_$arm.log 2>&1 || echo "gn_ab: probe predict $arm failed ($O/p_$arm.log)"
