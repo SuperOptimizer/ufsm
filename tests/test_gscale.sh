@@ -32,7 +32,17 @@ a, b = zr(1024), zr(65536)
 print(f"  (1) zero share at 1024 / 65536: phase {a[1]:.2f} / {b[1]:.2f} %, rv {a[4]:.2f} / {b[4]:.2f} %, wind4 {a[7]:.2f} / {b[7]:.2f} %")
 ok = a[0] > 0 and a[6] > 0 and b[1] <= a[1] + 0.05 and b[7] <= a[7] + 0.05   # (with the head planes' own scale, hgscale, both are ~0)
 g = {gs: np.fromfile(f'latg_{gs}.f16', np.float16).astype(np.float64) / gs for gs in (1024, 65536, 1048576)}
-ref = g[1048576]; n = np.linalg.norm(ref)
+# the head planes' own power-of-two scale s (hgscale, chosen per window from the gradient scale and the counts) multiplies the dumped
+# planes too: gscale x s is ~the same at every --gscale, so after / gs the runs differ by the power of two s_ref / s. Take it out
+# (the nearest power of two of the median ratio; it must be one: a non-power-of-two ratio is a scale bug and fails below)
+ref = g[1048576]
+for gs in (1024, 65536):
+    m = (g[gs] != 0) & (ref != 0)
+    r = float(np.median(np.abs(g[gs][m] / ref[m]))) if m.any() else 1.0
+    k = int(round(np.log2(r))) if r > 0 else 0
+    print(f"  (1) --gscale {gs}: the planes' scale ratio to the 2^20 run 2^{k} (median {r:.6g})")
+    g[gs] = g[gs] / 2.0 ** k
+n = np.linalg.norm(ref)
 e1, e2 = np.linalg.norm(g[1024] - ref) / n, np.linalg.norm(g[65536] - ref) / n
 z1, z2 = np.mean((g[1024] == 0) & (ref != 0)), np.mean((g[65536] == 0) & (ref != 0))
 print(f"  (1) cell gradients vs the 2^20 run: rel L2 {e1:.3e} at 1024, {e2:.3e} at 65536; cells zero where 2^20 is not: {100*z1:.2f} % / {100*z2:.2f} %")
