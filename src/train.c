@@ -4223,7 +4223,8 @@ int cmd_train(int argc, char **argv) {
             const int l3_off = getenv("UFSM_L0_3BUF") && !ufsm_env_on("UFSM_L0_3BUF");   /* (UFSM_L0_3BUF=0: never the three level-0 buffers) */
             const int fastest = !strcmp(mm, "fast");
             size_t fmin = (size_t)-1;
-            for (int g = 0; g < ng; g++) { nn_init(G[g].dev); unet_reserve(G[g].u, use_muon, muon_tc); if (g_lat && lp_f8w_mixed_reserve()) fprintf(stderr, "memory: the input conv's chunk copies (96 MB) failed\n"); }
+            for (int g = 0; g < ng; g++) { nn_init(G[g].dev); unet_reserve(G[g].u, use_muon, muon_tc); if (g_lat && lp_f8w_mixed_reserve()) fprintf(stderr, "memory: the input conv's chunk copies (96 MB) failed\n");
+                                           if (g_fstem && nn_fstem_reserve(g_fstem, g_fs_n)) fprintf(stderr, "memory: the fine stem's partial sums failed\n"); }   /* (5.3 MB at 16 -> 16) */
             /* (the lazily allocated optimizer / attention / kernel workspaces exist now, so the free memory below has them out: 2026-11-14 audit) */
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); size_t f = nn_mem_free(); if (f < fmin) fmin = f; }
             nn_init(G[0].dev);
@@ -4251,6 +4252,12 @@ int cmd_train(int argc, char **argv) {
                 unet_set_batch_bytes(G[0].u, 0, (((size_t)B * g_tc * p3 + a256) & ~a256) + (((size_t)B * p3 + a256) & ~a256));
             }
             const int pick0 = getenv("UFSM_MEM_PICK") ? atoi(getenv("UFSM_MEM_PICK")) : 0;   /* A/B of the modes: start the search at this candidate */
+            /* the fixed term: the CUDA context's lazy growth (module loading at first launch, cuBLAS / cuBLASLt internals, streams, events,
+               allocator granularity) + 0.2 GB for other processes. It was 550 MB with the kernels' workspaces inside it ("measured device
+               growth"); those are counted per mode now (unet_ws_plan), the optimizer / attention / input-conv ones are allocated before the
+               measure (unet_reserve). UFSM_WS_RESIDUAL_MB overrides */
+            const size_t ws_residual = (size_t)(getenv("UFSM_WS_RESIDUAL_MB") ? atoi(getenv("UFSM_WS_RESIDUAL_MB")) : 400) << 20;
+            size_t pick_grec = 0;
             _Static_assert(sizeof ord_small / sizeof ord_small[0] == sizeof cand / sizeof cand[0], "every mode in the search order");
             for (int pass = fastest ? 0 : 1; pass < 2 && pick < 0; pass++)   /* pass 0 (--mem fast): no host offloads */
             for (int oi = 0; oi < nc && pick < 0; oi++) {
@@ -4289,19 +4296,15 @@ int cmd_train(int argc, char **argv) {
                 const int gdef = (getenv("UFSM_GN_DEFER") ? atoi(getenv("UFSM_GN_DEFER")) : 1) && !split && !cand[c].l3 && cfg.widths[0] % 32 == 0;
                 const size_t grec = !split && unet_grad_mx4() && (cfg.widths[0] % 32 == 0 || lp_gyrec_narrow()) && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1)
                                     ? (gdef ? (size_t)100 << 20 : (size_t)B * cfg.widths[0] * (g_lat ? p3 / 64 : p3) * 136 / 256) : 0;   /* (--lat: level 0 is the 4^3-cell grid; the split's whole layer was counted per voxel: 77 GB at P 1024) */
-                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_fibdir > 0 ? (size_t)8 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) + ((size_t)2 * g_naux * B * p3 + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv))) * g_hs_z * P * P) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ((size_t)550 << 20) + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && (gin || g_lat) ? (g_lsplit ? nn_aug_device_bytes_z(P, g_gpu_aug_want >= 2 && !g_w4dev_want ? 2 * P : P, g_Pz, 16) : nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0)) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_fibdir > 0 ? (size_t)8 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)4 * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 ? (size_t)4 * B * p3 : 0) + ((size_t)2 * g_naux * B * p3 + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv))) * g_hs_z * P * P) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ws_residual + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && (gin || g_lat) ? (g_lsplit ? nn_aug_device_bytes_z(P, g_gpu_aug_want >= 2 && !g_w4dev_want ? 2 * P : P, g_Pz, 16) : nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0)) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (g_lat) need += (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) + (g_lat_hs ? ((size_t)LNC * (LGFC < LNC ? 6 : 4) + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) + (g_lat_fuse ? nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z) : 0) : ((size_t)LNC * 2 + (size_t)LGFC * 4) * (p3 / 64));   /* --lat: the full-resolution batch beside the cell-grid network, the coarse logit gradient (fp32 + 16-bit) */
                 if (g_ssl) need += (size_t)g_ssl * g_ssl_S * 5 + (size_t)g_ssl_npts * (g_ssl * 8 + 8) + 4096 + (size_t)g_sslh.nslot * (g_Pz / 4) * (P / 4) * (P / 4);   /* (+ --ssl-heads: a byte per head channel and cell) */
                   /* --ssl: int8 targets + the side head's fp32 gradient, the hinge's
                                                                                                          points (its fp32 outputs are the network's: in the dry build) */
-                /* the wide MX-fp4 stride-2 backward-data (lp_bwd_data_s2_mx, more than 64 channels: no direct tensor-core kernel) works
-                   through MX-fp8 chunks of ~96 MB (gx, the dilated gy, the accumulate temp), at least 3 fine planes each; the lp_buf
-                   slots keep them (measured 3 x 102 MB at a 96-wide P 512 latent net, outside tb / 14) */
-                if (unet_grad_mx4() && cfg.nlev > 1 && cfg.widths[0] > 64) {
-                    const size_t e0 = g_lat ? P / g_lat : P, wm = cfg.widths[1] > cfg.widths[0] ? cfg.widths[1] : cfg.widths[0], pb = (wm + 31) / 32 * e0 * e0 * 33;
-                    const size_t ch = ((size_t)96 << 20) + pb > 3 * pb ? ((size_t)96 << 20) + pb : 3 * pb, whole = (size_t)B * (g_lat ? p3 / ((size_t)g_lat * g_lat * g_lat) : p3) * ((wm + 31) / 32) * 33;
-                    need += 3 * (ch < whole ? ch : whole);
-                }
+                /* the kernels' device workspaces (2026-11-14 audit net#4; unet_ws_plan): the lp_buf slots (the wide MX-fp4 stride-2 backward-data's
+                   ~96 MB MX-fp8 chunks, the fp4 weight gradient's gy pre-pass slabs, GroupNorm partials, prepared weights), the fp4 weight memo,
+                   the tensor-core weight copies, the s2b gy copy. Before: the 3 x 96 MB chunks here, the rest inside the fixed 550 MB below or unplanned */
+                need += unet_ws_plan(G[0].u, xs, 0, 0, nullptr);
                 /* the label stream (g_lstream, decided below by the same conditions): the side / winding / component / ink planes stay on the host;
                    the device holds two slab sets of them instead of the window's (2 buffers each unless lean) */
                 if (g_lat && g_head_slab && B == 1 && (g_xs == 1 || g_gpu_want) && xbytes() == 2 && g_side && !(g_pg_lambda > 0) && !(g_count_lambda > 0) && (!getenv("UFSM_LAT_STREAM") || (ufsm_env_on("UFSM_LAT_STREAM") && strcmp(getenv("UFSM_LAT_STREAM"), "check")))   /* (g_xs settles after the planner: --gpu-input wanted = 1 channel) */
@@ -4325,9 +4328,9 @@ int cmd_train(int argc, char **argv) {
                 }
                 if (ufsm_env_on("UFSM_MEM_REPORT"))   /* the planner's terms of this mode */
                     fprintf(stderr, "memory plan: mode %d (%s%s): network %.2f + workspace %.2f + gy records %.2f + trainer %.2f + task %.2f (the rest of the need: UFSM_MEM_REPORT=2 splits it) + fixed %.2f = %.2f GB\n", c, cand[c].what,
-                            pass ? "" : ", no host offloads", tb / 1e9, tb / 14 / 1e9, grec / 1e9, trainer / 1e9, (need - grec - tb - tb / 14 - trainer - ((size_t)550 << 20)) / 1e9, (double)((size_t)550 << 20) / 1e9, need / 1e9);
+                            pass ? "" : ", no host offloads", tb / 1e9, tb / 14 / 1e9, grec / 1e9, trainer / 1e9, (need - grec - tb - tb / 14 - trainer - ws_residual) / 1e9, (double)ws_residual / 1e9, need / 1e9);
                 if (need < min_need) { min_need = need; minc = c; min_hoff = pass; }   /* (no fit: the smallest mode evaluated) */
-                if (need <= fmin) { pick = c; pick_hoff = pass; pick_off = unet_last_offload_bytes(); pick_need = need; }
+                if (need <= fmin) { pick = c; pick_hoff = pass; pick_off = unet_last_offload_bytes(); pick_need = need; pick_grec = grec; }
             }
             if (pick < 0 && ng > 1) {   /* multi-GPU: no try-anyway (the other cards' buffers eat the slack: P 640 on 2 x 16 GB aborted in gn_dsums, 11-03) */
                 fprintf(stderr, "memory: no mode fits %.2f GB free per GPU with the %d-GPU headroom (%.2f GB kept; smallest mode needs %.2f GB): refusing "
@@ -4348,6 +4351,21 @@ int cmd_train(int argc, char **argv) {
             unet_set_host_offloads(pick_hoff);
             unet_set_chunk_up(cand[pick].chunk); unet_set_recompute(cand[pick].rc); unet_set_grad_mx8(cand[pick].gmx); unet_set_lean(cand[pick].lean); unet_set_share_enc_a1(cand[pick].sea || (pick_hoff && sea_force));
             unet_set_l0_3buf(cand[pick].l3);
+            {   /* the kernels' workspaces of the picked mode allocated on every GPU now, at their bounds (no growth, no cudaFree in a step; a full
+                   card fails here), then sealed: a later growth prints "nn_ws: ... grew after the memory plan" (2026-11-14 audit net#4). The
+                   fp4 GroupNorm input copy (a whole layer) gets the largest layer within 3/4 of the plan's spare above 256 MB, the same on
+                   every GPU (before: whatever each card's free memory allowed at its first call, so the replicas could take different
+                   kernels); the gy records their planned bytes */
+                (void)unet_train_bytes(G[0].u, xs);   /* (the picked mode's levels) */
+                const size_t pre_budget = g_plan_spare > ((size_t)256 << 20) ? (g_plan_spare - ((size_t)256 << 20)) / 4 * 3 : 0;
+                size_t pre = 0;
+                for (int g = 0; g < ng; g++) { nn_init(G[g].dev); (void)unet_ws_plan(G[0].u, xs, pre_budget, 1, &pre); nn_ws_seal(1); }
+                nn_init(G[0].dev);
+                g_plan_spare = g_plan_spare > pre ? g_plan_spare - pre : 0;
+                lp_gyrec_set_cap(pick_grec);
+                fprintf(stderr, "memory: kernel workspaces %.2f GB in the plan, allocated and sealed on every GPU (+ %.2f GB fp4 GroupNorm input copy from the spare)\n",
+                        unet_ws_plan(G[0].u, xs, pre_budget, 0, nullptr) / 1e9 - pre / 1e9, pre / 1e9);
+            }
             if (unet_share_enc_a1()) fprintf(stderr, "memory: shared encoder a1, %s (default; UFSM_RC_ENC_A1=0 off)\n", unet_a1_offload() ? "offloaded to pinned host memory between its uses" : "conv1 re-run in the backward");
             if (unet_grad_mx4()) fprintf(stderr, "memory: MX gradients stored as MX-fp4 (default; UFSM_GRAD_MX4=0: MX-fp8)\n");
             lean = cand[pick].lean;

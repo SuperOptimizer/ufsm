@@ -703,6 +703,52 @@ extern "C" void nn_ptick_report(int steps) {
 }
 extern "C" size_t nn_mem_free(void) { size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); return f; }
 extern "C" size_t nn_mem_total(void) { size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); return t; }
+/* ---- kernel workspaces (2026-11-14 audit net#4): the grow-on-demand device scratch of the kernels (lp_buf slots, the fp4 GroupNorm
+   input copy, the fine stem's partial sums, the 16-bit tensor-core weight copies) in one per-device registry, so the trainer's memory
+   planner can size them for its window (unet_ws_plan), allocate them before the first step (nn_ws_reserve) and see any later growth:
+   after nn_ws_seal a grow prints one line (a planner miss: its bytes were not in the plan), and an id with a soft limit (nn_ws_limit)
+   refuses instead (its caller has a fallback with the same bits). Before, each site kept its own static pointer, grew with cudaFree +
+   cudaMalloc in the middle of a step (a device-wide synchronisation) and was outside the plan (the fixed 550 MB guess). Keyed by the
+   current device: one host thread per GPU (data parallel, --split sides), as the sites' own statics were. */
+static const char *const g_ws_name[NN_WS_N] = {
+    "lp_buf u8 slot 0", "lp_buf u8 slot 1", "lp_buf u8 slot 2", "lp_buf u8 slot 3", "lp_buf u8 slot 4", "lp_buf u8 slot 5",
+    "lp_buf f32 slot 0", "lp_buf f32 slot 1", "lp_buf f32 slot 2", "lp_buf f32 slot 3", "lp_buf f32 slot 4", "lp_buf f32 slot 5",
+    "lp_buf f16 slot 0", "lp_buf f16 slot 1", "lp_buf f16 slot 2", "lp_buf f16 slot 3", "lp_buf f16 slot 4", "lp_buf f16 slot 5",
+    "lp_buf bf16 slot 0", "lp_buf bf16 slot 1", "lp_buf bf16 slot 2", "lp_buf bf16 slot 3", "lp_buf bf16 slot 4", "lp_buf bf16 slot 5",
+    "fp4 GroupNorm input copy (prenorm)", "fine stem partial sums", "tc weight copy (16-bit)", "tc weight scales", "s2b gy overlap copy"};
+static void *g_ws[8][NN_WS_N]; static size_t g_ws_cap[8][NN_WS_N], g_ws_lim[8][NN_WS_N]; static int g_ws_sealed[8];   /* mgpu: per-device */
+static pthread_mutex_t g_ws_mu = PTHREAD_MUTEX_INITIALIZER;   /* (the late-grow report and the totals; the slots themselves are per device) */
+static int ws_dev(void) { int d = 0; cudaGetDevice(&d); return d & 7; }
+static int ws_grow(int d, int id, size_t bytes) {
+    if (g_ws[d][id]) cudaFree(g_ws[d][id]);
+    g_ws[d][id] = nullptr; g_ws_cap[d][id] = 0;
+    if (cudaMalloc(&g_ws[d][id], bytes) != cudaSuccess) { cudaGetLastError(); g_ws[d][id] = nullptr; return -1; }
+    g_ws_cap[d][id] = bytes;
+    if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) > 0) fprintf(stderr, "nn_ws: %s -> %.1f MB (GPU %d)\n", g_ws_name[id], bytes / 1e6, d);
+    return 0;
+}
+extern "C" void *nn_ws(int id, size_t bytes) {
+    if (id < 0 || id >= NN_WS_N) return nullptr;
+    const int d = ws_dev();
+    if (bytes <= g_ws_cap[d][id]) return g_ws[d][id];
+    if (g_ws_sealed[d]) {
+        if (g_ws_lim[d][id] && bytes > g_ws_lim[d][id]) return nullptr;   /* (a soft limit: the caller's fallback) */
+        pthread_mutex_lock(&g_ws_mu);
+        fprintf(stderr, "nn_ws: %s grew after the memory plan, %.1f -> %.1f MB on GPU %d (outside the plan; unet_ws_plan misses this shape)\n",
+                g_ws_name[id], g_ws_cap[d][id] / 1e6, bytes / 1e6, d);
+        pthread_mutex_unlock(&g_ws_mu);
+    }
+    return ws_grow(d, id, bytes) ? nullptr : g_ws[d][id];
+}
+extern "C" int nn_ws_reserve(int id, size_t bytes) {   /* the current device's workspace id at >= bytes now; -1 if that failed */
+    if (id < 0 || id >= NN_WS_N) return -1;
+    const int d = ws_dev();
+    return bytes <= g_ws_cap[d][id] ? 0 : ws_grow(d, id, bytes);
+}
+extern "C" void nn_ws_limit(int id, size_t bytes) { if (id >= 0 && id < NN_WS_N) g_ws_lim[ws_dev()][id] = bytes; }   /* 0: none */
+extern "C" void nn_ws_seal(int on) { g_ws_sealed[ws_dev()] = on; }
+extern "C" size_t nn_ws_bytes(int id) { const int d = ws_dev(); if (id >= 0) return id < NN_WS_N ? g_ws_cap[d][id] : 0; size_t t = 0; for (int i = 0; i < NN_WS_N; i++) t += g_ws_cap[d][i]; return t; }
+extern "C" const char *nn_ws_name(int id) { return id >= 0 && id < NN_WS_N ? g_ws_name[id] : "?"; }
 extern "C" void ufsm_no_verify_types(const char *fn) {
     fprintf(stderr, "%s: bf16 / fp32 tensor-core kernels are not in this build (rebuild with make VERIFY=1)\n", fn); abort();
 }

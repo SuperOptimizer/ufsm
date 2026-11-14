@@ -226,6 +226,7 @@ test_cover_training                            | gpu2,l2      |    16 | python3 
 test_univ2                                     | gpu2,l2      |    40 | tests/test_univ2.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/univ2
 test_dp_equiv                                  | gpu2,l2      |    20 | tests/test_dp_equiv.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/dpequiv
 test_serialize                                 | gpu2,l2      |    30 | tests/test_serialize.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/serialize
+test_memws                                     | gpu,slow     |    90 | tests/test_memws.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/memws
 test_checkpoint                                | gpu,smoke    |     2 | ./$B/test_checkpoint
 test_optimizer_owners                          | gpu          |     3 | ./$B/test_optimizer_owners
 test_wide_up_grad                              | gpu          |     5 | ./$B/test_wide_up_grad
