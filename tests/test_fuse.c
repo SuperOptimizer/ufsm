@@ -3,6 +3,7 @@
    different sheet is kept). CPU only. */
 #include "fuse.h"
 #include "band.h"
+#include "fm_tol.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,7 +68,10 @@ int main(void) {
                 for (int z = 0; z < d; z++) for (int y = (k * 9) % 30; y < d - (k * 7) % 25; y++) { const int x = x0 + ((z + y + k) % 7 == 0); if (x < d) ins[k][((size_t)z * d + y) * d + x] = 1; } } }
         size_t s1[3] = {0, 0, 0}, s2[3] = {0, 0, 0};
         fuse_recto((const uint8_t *const *)ins, 4, ctr, d, d, d, 16, 3, o1, s1, 3); recto_ref((const uint8_t *const *)ins, 4, ctr, d, 16, 3, o2, s2);
-        CHECK(!memcmp(o1, o2, len) && !memcmp(s1, s2, sizeof s1), "recto-fuse sparse vs dense: voxels %s, stats %zu/%zu/%zu vs %zu/%zu/%zu", memcmp(o1, o2, len) ? "differ" : "same", s1[0], s1[1], s1[2], s2[0], s2[1], s2[2]);
+        /* identical under UFSM_STRICT_MATH. Under fast math a tie between equal block means (sum / cnt, e.g. 300 / 3 vs 200 / 2) can break
+           the other way in one of the two (reciprocal division): <= 1e-4 of the voxels, and the stats by as many (tests/fm_tol.h) */
+        const size_t fa = fm_allow(len, 1e-4); int sok = 1; for (int k = 0; k < 3; k++) sok &= (s1[k] > s2[k] ? s1[k] - s2[k] : s2[k] - s1[k]) <= fa;
+        CHECK(!fm_cmp_u8c("recto-fuse sparse vs dense", o1, o2, len, 0, 0, 1e-4, 1e-4) && sok, "recto-fuse sparse vs dense: voxels %s, stats %zu/%zu/%zu vs %zu/%zu/%zu", memcmp(o1, o2, len) ? "differ" : "same", s1[0], s1[1], s1[2], s2[0], s2[1], s2[2]);
         printf("recto-fuse: sparse == dense reference on 4 random sheet sets (kept near another %zu, unique %zu, dropped %zu)\n", s1[0], s1[1], s1[2]);
         for (int k = 0; k < 4; k++) free(ins[k]);
         free(ctr); free(o1); free(o2);

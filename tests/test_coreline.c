@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "z3w.h"
 #include <math.h>
+#include "fm_tol.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,7 +41,7 @@ static double ref_poly_sdist(const double *Y, const double *X, int n, double py,
     return (s < 0 ? -1 : 1) * sqrt(best);
 }
 static void test_sdist_fast(void) {   /* the pruned scan: the same distance, point and normal, bit for bit */
-    srand(5); int bad = 0, tot = 0;
+    srand(5); int bad = 0, dbad = 0, tot = 0;
     for (int rep = 0; rep < 40; rep++) {
         const int n = 2 + rand() % 120; double Y[128], X[128], y = 3000, x = 2000;
         for (int i = 0; i < n; i++) {   /* a zigzag walk, repeated points and back-tracks included */
@@ -51,9 +52,16 @@ static void test_sdist_fast(void) {   /* the pruned scan: the same distance, poi
             const int v = rand() % n; const double qy0 = t % 3 ? py : Y[v] + (rand() % 3 - 1), qx0 = t % 3 ? px : X[v] + (rand() % 3 - 1);   /* also near vertices */
             double q[2], m[2], qr[2], mr[2];
             const double d = cl_poly_sdist(Y, X, n, qy0, qx0, q, m), dr = ref_poly_sdist(Y, X, n, qy0, qx0, qr, mr);
-            bad += memcmp(&d, &dr, 8) || memcmp(q, qr, 16) || memcmp(m, mr, 16); tot++;
+            /* bit for bit under UFSM_STRICT_MATH; fast math (two copies of the distance math): d rel 1e-12 at every point, point and
+               normal rel 1e-12 except on <= 1e-3 of the points (an equidistant segment, a repeated point, picked the other way) */
+            if (FM_STRICT) bad += memcmp(&d, &dr, 8) || memcmp(q, qr, 16) || memcmp(m, mr, 16);
+            else { dbad += !fm_close(d, dr, 1e-12, 1e-9); bad += !fm_close(q[0], qr[0], 1e-12, 1e-9) || !fm_close(q[1], qr[1], 1e-12, 1e-9) ||
+                                                              !fm_close(m[0], mr[0], 1e-12, 1e-9) || !fm_close(m[1], mr[1], 1e-12, 1e-9); }
+            tot++;
         }
     }
+    CHECK(dbad == 0, "the pruned cl_poly_sdist distance differs from the full scan at %d of %d points", dbad, tot);
+    if (!FM_STRICT && (size_t)bad <= fm_allow((size_t)tot, 1e-3)) bad = 0;
     CHECK(bad == 0, "the pruned cl_poly_sdist differs from the full scan at %d of %d points", bad, tot);
 }
 

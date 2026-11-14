@@ -2,6 +2,7 @@
    skips every other sheet in one quadrant (it rotates at half the rate there). W from the density must count every sheet there,
    the output phase (R 0) must follow frac(W) where the phase is right, and --model must reproduce W (fit_W). */
 #include "fit.h"
+#include "fm_tol.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,7 +70,10 @@ static void gpu_vs_cpu(const char *dir) {
                pdiff, npc[0] - 8, prel, dg, dt, ig, nd[0]);
         CHECK(prel < 1e-3, "pooled sums: %zu differ, max rel %.2e", pdiff, prel);   /* (the GPU's sheet normal is fp32: last-bit sums, rel ~1e-4 near zero) */
         CHECK(dg < 1e-3, "model delta GPU vs CPU max %.3e turn", dg);
-        CHECK(dl[3] && nd[3] == nd[2] && !memcmp(dl[2], dl[3], nd[2] * sizeof(float)) && pcache[3] && !memcmp(pcache[2] + 8, pcache[3] + 8, (npc[2] - 8) * sizeof(float)),
+        /* bit-identical under UFSM_STRICT_MATH; under fast math the two paths' kernels (k_cg1 / k_cg2, each inlining d_apply) contract
+           differently, so the GPU-vs-CPU bounds above apply: delta within 1e-3 turn, pooled sums rel 1e-3 (tests/fm_tol.h) */
+        CHECK(dl[3] && nd[3] == nd[2] && !fm_cmp_f32("low-memory delta", dl[2], dl[3], nd[2], 0, 1e-3) && pcache[3]
+              && !fm_cmp_f32("low-memory pooled sums", pcache[2] + 8, pcache[3] + 8, npc[2] - 8, 1e-3, 1e-6),
               "GPU low-memory paths (upload groups, CG without A p) not identical to the default GPU run");
     } else CHECK(0, "model / pool cache sizes differ");
     for (int r = 0; r < 4; r++) { free(dl[r]); free(pcache[r]); }

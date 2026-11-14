@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "fm_tol.h"
 
 int cmd_ink_compare(int argc, char **argv);
 int ink_compare_mem(int argc, char **argv);
@@ -34,6 +35,43 @@ static uint8_t *slurp(const char *p, size_t *n) {
 static int same_file(const char *a, const char *b) {
     size_t na, nb; uint8_t *x = slurp(a, &na), *y = slurp(b, &nb);
     const int r = x && y && na == nb && na > 0 && !memcmp(x, y, na); free(x); free(y); return r;
+}
+
+/* Fast math (the default build, DESIGN 2026-11-14): render_wrap(s)_chunked and the test's ref_render are two host implementations of
+   the same float sampling (and, under RENDER_GPU, nn_render plus gpudec decoding the q 2 volume on the device), so their u8 pixels
+   agree within 1 on 0.5 % (within 2 on 1 % when the CT is decoded on the GPU as well: the decoded voxels are +-1 themselves); the
+   ink-compare statistics of the streamed and in-memory paths agree per number within 1e-9 relative + 1.01e-4 (the %.4f lines may
+   round their last digit the other way) and their JPEGs, decoded, within 2. Under -DUFSM_STRICT_MATH=ON all bit for bit as before. */
+#ifdef RENDER_GPU
+enum { IMG_MAXD = 2 };
+static const double IMG_FRAC = 0.01;
+#else
+enum { IMG_MAXD = 1 };
+static const double IMG_FRAC = 0.005;
+#endif
+static int img_same(const char *what, const uint8_t *a, const uint8_t *b, size_t n) { return !fm_cmp_u8(what, a, b, n, IMG_MAXD, IMG_FRAC); }
+/* two ink-compare statistics files: the same words, numbers within the bound above (identical files under strict math) */
+static int stats_same(const char *a, const char *b) {
+    if (FM_STRICT) return same_file(a, b);
+    size_t na, nb; char *x = (char *)slurp(a, &na), *y = (char *)slurp(b, &nb); int ok = x && y && na > 0;
+    if (ok) { x[na] = 0; y[nb] = 0; }
+    char *sx = nullptr, *sy = nullptr;
+    for (char *p = ok ? strtok_r(x, " \t\n", &sx) : nullptr, *q = ok ? strtok_r(y, " \t\n", &sy) : nullptr; ok && (p || q);
+         p = strtok_r(nullptr, " \t\n", &sx), q = strtok_r(nullptr, " \t\n", &sy)) {
+        if (!p || !q) { ok = 0; break; }
+        char *ep, *eq; const double u = strtod(p, &ep), v = strtod(q, &eq);
+        if (ep != p && eq != q && !strcmp(ep, eq)) ok = fm_close(u, v, 1e-9, 1.01e-4);   /* a number (with the same unit / punctuation after it) */
+        else ok = !strcmp(p, q);
+        if (!ok) fprintf(stderr, "statistics differ: '%s' vs '%s'\n", p, q);
+    }
+    free(x); free(y); return ok;
+}
+/* two JPEGs: identical files under strict math, else the decoded pixels within 2 */
+static int jpeg_same(const char *a, const char *b) {
+    if (FM_STRICT) return same_file(a, b);
+    int wa = 0, ha = 0, wb = 0, hb = 0; uint8_t *x = jpeg_read_rgb(a, &wa, &ha), *y = jpeg_read_rgb(b, &wb, &hb);
+    const int ok = x && y && wa == wb && ha == hb && !fm_cmp_u8(a, x, y, (size_t)wa * ha * 3, 2, 1.0);
+    free(x); free(y); return ok;
 }
 
 /* main.c trilin / render_rows on a dense volume */
@@ -128,29 +166,29 @@ int main(void) {
             uint8_t *im[2] = {calloc(no, 1), calloc(no, 1)}; const int cr[4] = {37, 51, 60, 44};
             CHECK(!render_wrap_chunked(zz, 2, dp, X, Y, Z, w, h, gs, im, ow, oh, crop ? cr : nullptr, budgets[bi], 3, 2, 0), "render_wrap_chunked");
             for (int v = 0; v < 2; v++) {
-                size_t bad = 0;
+                size_t bad = 0, big = 0, nin = 0;
                 for (int y = 0; y < oh; y++) for (int x = 0; x < ow; x++) {
                     const size_t i = (size_t)y * ow + x;
                     if (crop && (x < cr[0] || x >= cr[0] + cr[2] || y < cr[1] || y >= cr[1] + cr[3])) continue;
-                    bad += im[v][i] != ref[v][i];
+                    nin++; bad += im[v][i] != ref[v][i]; big += abs((int)im[v][i] - ref[v][i]) > FM_TOL(IMG_MAXD);
                 }
-                CHECK(!bad, "budget %zu crop %d volume %d: %zu pixels differ", budgets[bi], crop, v, bad);
+                CHECK(!big && bad <= fm_allow(nin, IMG_FRAC), "budget %zu crop %d volume %d: %zu pixels differ (%zu beyond %d)", budgets[bi], crop, v, bad, big, FM_TOL(IMG_MAXD));
             }
             free(im[0]); free(im[1]);
         }
         /* one volume */
         { uint8_t *im[1] = {calloc(no, 1)}; z3 *z1[1] = {zz[1]}; const int d1[1] = {1}; uint8_t *r1 = calloc(no, 1);
           ref_render(X, Y, Z, w, h, gs, dense[1], shape, 1, r1, ow, oh);
-          CHECK(!render_wrap_chunked(z1, 1, d1, X, Y, Z, w, h, gs, im, ow, oh, nullptr, 1, 2, 4, 0) && !memcmp(im[0], r1, no), "one volume");
+          CHECK(!render_wrap_chunked(z1, 1, d1, X, Y, Z, w, h, gs, im, ow, oh, nullptr, 1, 2, 4, 0) && img_same("one volume", im[0], r1, no), "one volume");
           free(im[0]); free(r1); }
 #ifdef RENDER_GPU
         /* a device failure at the first launch: the CPU re-renders, same bytes */
         { setenv("UFSM_RENDER_GPU_FAIL", "1", 1); uint8_t *im[2] = {calloc(no, 1), calloc(no, 1)};
-          CHECK(!render_wrap_chunked(zz, 2, dp, X, Y, Z, w, h, gs, im, ow, oh, nullptr, (size_t)1 << 32, 3, 2, 0) && !memcmp(im[0], ref[0], no) && !memcmp(im[1], ref[1], no) && render_gpu_fallbacks() == 1, "GPU failure -> CPU render");
+          CHECK(!render_wrap_chunked(zz, 2, dp, X, Y, Z, w, h, gs, im, ow, oh, nullptr, (size_t)1 << 32, 3, 2, 0) && img_same("GPU failure v0", im[0], ref[0], no) && img_same("GPU failure v1", im[1], ref[1], no) && render_gpu_fallbacks() == 1, "GPU failure -> CPU render");
           unsetenv("UFSM_RENDER_GPU_FAIL"); free(im[0]); free(im[1]); }
         /* a device tier of 8 chunks (the rest in mapped pinned host slots), and none at all, at a tiny and a large budget */
         for (int t = 0; t < 4; t++) { setenv("UFSM_RENDER_GPU_DEVMB", t & 1 ? "0" : "16", 1); uint8_t *im[2] = {calloc(no, 1), calloc(no, 1)};
-          CHECK(!render_wrap_chunked(zz, 2, dp, X, Y, Z, w, h, gs, im, ow, oh, nullptr, t < 2 ? 1 : (size_t)1 << 32, 3, 2, 1) && !memcmp(im[0], ref[0], no) && !memcmp(im[1], ref[1], no), "GPU host-tier slots %d", t);
+          CHECK(!render_wrap_chunked(zz, 2, dp, X, Y, Z, w, h, gs, im, ow, oh, nullptr, t < 2 ? 1 : (size_t)1 << 32, 3, 2, 1) && img_same("host-tier v0", im[0], ref[0], no) && img_same("host-tier v1", im[1], ref[1], no), "GPU host-tier slots %d", t);
           free(im[0]); free(im[1]); }
         unsetenv("UFSM_RENDER_GPU_DEVMB");
 #endif
@@ -167,8 +205,8 @@ int main(void) {
             for (int bi = 0; bi < 3; bi += 2) {
                 uint8_t *im[4] = {calloc(no, 1), calloc(no, 1), calloc(no, 1), calloc(no, 1)};
                 CHECK(!render_wraps_chunked(zz, 2, dp, 2, XS, YS, ZS, w, h, gs, im, ow, oh, nullptr, budgets[bi], 3, 2, 0), "render_wraps_chunked");
-                CHECK(!memcmp(im[0], ref[0], no) && !memcmp(im[1], ref[1], no), "joint budget %zu: grid 0 differs", budgets[bi]);
-                CHECK(!memcmp(im[2], r2[0], no) && !memcmp(im[3], r2[1], no), "joint budget %zu: grid 1 differs", budgets[bi]);
+                CHECK(img_same("joint g0 v0", im[0], ref[0], no) && img_same("joint g0 v1", im[1], ref[1], no), "joint budget %zu: grid 0 differs", budgets[bi]);
+                CHECK(img_same("joint g1 v0", im[2], r2[0], no) && img_same("joint g1 v1", im[3], r2[1], no), "joint budget %zu: grid 1 differs", budgets[bi]);
                 for (int k = 0; k < 4; k++) free(im[k]);
             }
             free(r2[0]); free(r2[1]); free(X2); free(Y2); free(Z2);
@@ -207,11 +245,11 @@ int main(void) {
             const int rc = run(m ? ink_compare_mem : cmd_ink_compare, a, s[m]);
             CHECK(rc == (cs == 3 ? 3 : 0), "case %d mode %d rc %d", cs, m, rc);
         }
-        CHECK(same_file(s[0], s[1]), "case %d: statistics differ", cs);
-        if (cs == 0 || cs == 2) CHECK(same_file(o[0], o[1]), "case %d: JPEG differs", cs);
+        CHECK(stats_same(s[0], s[1]), "case %d: statistics differ", cs);
+        if (cs == 0 || cs == 2) CHECK(jpeg_same(o[0], o[1]), "case %d: JPEG differs", cs);
         if (cs == 1) for (int k = 0; k < 2; k++) {
             char x[800], y[800]; snprintf(x, sizeof x, "%s%s.jpg", e[0], k ? "gamb" : "ct"); snprintf(y, sizeof y, "%s%s.jpg", e[1], k ? "gamb" : "ct");
-            CHECK(same_file(x, y), "case 1: %s differs", x);
+            CHECK(jpeg_same(x, y), "case 1: %s differs", x);
         }
     }
     {   /* one call, several outputs (--then): the bytes of separate calls (rgb-agree full + fitted, panels without CT, --each fitted) */
@@ -317,7 +355,7 @@ int main(void) {
             char *a[] = {"ufsm", "ink-compare", o, "--ct", cp, "--ink", ia, "--ink", ib, "--px-um", "4.8", "--threads", "2", "--mask", mp, c ? "--crop" : nullptr, "350,280,640,500", nullptr};
             char *r[] = {"ufsm", "ink-compare", o, "--ct", cq, "--ink", iaa, "--ink", ibb, "--px-um", "4.8", "--threads", "2", c ? "--crop" : nullptr, "350,280,640,500", nullptr};
             CHECK(run(cmd_ink_compare, a, sm) == 0 && run(cmd_ink_compare, r, sr) == 0, "--mask rc (crop %d)", c);
-            size_t ns; uint8_t *sb = slurp(sm, &ns); CHECK(sb && ns > 40 && same_file(sm, sr), "--mask: statistics differ from the zeroed renders' (crop %d)", c); free(sb);
+            size_t ns; uint8_t *sb = slurp(sm, &ns); CHECK(sb && ns > 40 && stats_same(sm, sr), "--mask: statistics differ from the zeroed renders' (crop %d)", c); free(sb);
         }
         char *u[] = {"ufsm", "ink-compare", o, "--ct", cp, "--ink", ia, "--ink", ib, "--px-um", "4.8", "--threads", "2", nullptr};   /* and the mask matters */
         CHECK(run(cmd_ink_compare, u, sm) == 0 && !same_file(sm, sr), "--mask: the unmasked statistics are the same");

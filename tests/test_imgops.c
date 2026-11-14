@@ -4,6 +4,7 @@
 #include "imgops.h"
 #include "tiffw.h"
 #include "test_imgops_expected.h"
+#include "fm_tol.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,9 +19,11 @@ static void lcg(uint8_t *o, int n, int seed) { unsigned s = (unsigned)seed; for 
 static void test_resample(void) {
     uint8_t a[35], b[117], c[231], d[45];
     lcg(a, 35, 1); CHECK(!pil_resize(a, 7, 5, 1, b, 13, 9, PIL_BILINEAR, 2), "bilinear resize");
-    CHECK(!memcmp(b, exp_bilinear, sizeof b), "bilinear 7x5 -> 13x9 differs from Pillow");
+    /* Pillow's bytes exactly under UFSM_STRICT_MATH; fast math (the coefficient sums / normalisation reassociate before the fixed-point
+       rounding): every byte within +-1 (tests/fm_tol.h) */
+    CHECK(!fm_cmp_u8("bilinear", b, exp_bilinear, sizeof b, 1, 1.0), "bilinear 7x5 -> 13x9 differs from Pillow");
     lcg(c, 231, 2); CHECK(!pil_resize(c, 11, 7, 3, d, 5, 3, PIL_BOX, 3), "box resize");
-    CHECK(!memcmp(d, exp_box, sizeof d), "box RGB 11x7 -> 5x3 differs from Pillow");
+    CHECK(!fm_cmp_u8("box", d, exp_box, sizeof d, 1, 1.0), "box RGB 11x7 -> 5x3 differs from Pillow");
 }
 static void test_overlay(void) {
     enum { W = 61, H = 45, IW = 31, IH = 23 };
@@ -33,7 +36,7 @@ static void test_overlay(void) {
     CHECK(o && ow == EXP_OW && oh == EXP_OH, "overlay size %d x %d", ow, oh);
     if (o && ow == EXP_OW && oh == EXP_OH) {
         int mx = 0; for (size_t i = 0; i < sizeof exp_overlay; i++) { const int e = abs(o[i] - exp_overlay[i]); if (e > mx) mx = e; }
-        CHECK(mx == 0, "overlay differs from overlay_red.py by up to %d", mx);
+        CHECK(mx <= FM_TOL(1), "overlay differs from overlay_red.py by up to %d", mx);
     }
     free(o);
     CHECK(!overlay_red_skip(ct, W * H), "skip rule: a mostly filled CT kept");

@@ -1,9 +1,12 @@
 /* sources "phase": {"onfly": {"meshes": {dir, value, level}, rmax}}: the phase from codes rasterised on read from q-assigned meshes,
    behind the derived-array cache (tests/test_mesh_phase.sh makes the meshes and the stored rasters).
    test_mesh_phase MESH.json STORED.json STORED1.json: MESH.json's phase (level 0) == STORED.json's (the same rule on `ufsm raster`'s
-   level-0 codes), its next level (phase_pl[1], codes rasterised at level 1) == STORED1.json's (level-1 raster), over windows not
+   level-0 codes), its next level (phase_pl[1], codes rasterised at level 1) == STORED1.json's (level-1 raster) (== under
+   UFSM_STRICT_MATH; within cmp's bound under fast math), over windows not
    aligned to the cache cells; a second load of MESH.json reads them back from the disk cache (no recompute) with the same bytes. */
+#include "band.h"
 #include "dcache.h"
+#include "fm_tol.h"
 #include "sources.h"
 #include "zarr3.h"
 #include <stdio.h>
@@ -20,11 +23,16 @@ static int cmp(z3 *a, z3 *b, const char *what, size_t *known) {
         const size_t v = (size_t)n[0] * n[1] * n[2]; uint8_t *x = malloc(v), *y = malloc(v);
         if (z3_read(a, o, n, x, 4) || z3_read(b, o, n, y, 4)) { fprintf(stderr, "FAIL %s: read\n", what); bad = 1; }
         for (size_t k = 0; k < v; k++) { nd += x[k] != y[k]; nk += x[k] != 255; }
+        /* exact under UFSM_STRICT_MATH; under fast math the stamp (meshcodes.c / nn_mcodes.cu) and `ufsm raster` (ingest.c) are two
+           codes of the same double math contracted differently, so a voxel at a floor(p + 0.5) / llround(q * 18) boundary takes
+           another code and the pair-rule phase around it moves: <= 5e-3 of the voxels may differ, <= 2e-3 by more than one code
+           (cyclic) or known <-> unknown (tests/fm_tol.h) */
+        bad |= fm_cmp_u8c(what, x, y, v, 1, PHASE_PERIOD, 5e-3, 2e-3);
         free(x); free(y);
     }
     fprintf(stderr, "%s: %zu voxels differ, %zu known\n", what, nd, nk);
     if (known) *known = nk;
-    return bad || nd;
+    return bad;
 }
 int main(int argc, char **argv) {
     if (argc != 4) { fprintf(stderr, "usage: test_mesh_phase MESH.json STORED.json STORED1.json\n"); return 2; }

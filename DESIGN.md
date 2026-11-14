@@ -6,6 +6,55 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fast math everywhere; UFSM_STRICT_MATH=ON for the bit-exact build (2026-11-14, branch fastmath-20261114)
+
+The user: "enable fast math everything". Before: host C `-ffp-contract=off -fno-math-errno` (IEEE), the CUDA units nvcc
+`-use_fast_math` except the 11 `UFSM_STRICT_UNITS` (nn_gpudec nn_cf nn_ftrace nn_latvol nn_band nn_fibre nn_inkfly nn_gpuenc
+nn_mcodes nn_faces nn_render: `-fmad=false`, IEEE), so those matched their CPU versions byte for byte. Now:
+
+- Host C: `-ffast-math -fno-finite-math-only`. Reassociation (float reductions vectorise), contraction (fast, across statements),
+  reciprocal division, no signed zeros, `-fapprox-func`, no errno. `-fno-finite-math-only` is a correctness requirement, not a
+  trade-off: ~226 isnan / isfinite / NaN-fill uses (the loss's NaN guards, fwd_nan, zarr fill values, volcomp's typed-chunk checks)
+  are folded to false under finite-math-only, i.e. the guards silently deleted. Checked: no code relies on signed zeros (the
+  copysignf sites take the sign of nonzero data) or on libm errno (the errno reads follow strtod and I/O). No compensated sums or
+  magic-constant rounding tricks in src / third_party (grep: Kahan, TwoSum, 0x1.8p23 ...), which reassociation would break.
+  `-ffast-math` is a compile flag only, not on the link line, so crtfastmath.o (process-wide FTZ / DAZ) is not linked: host
+  denormals stay IEEE.
+- Every CUDA unit gets `UFSM_CU_FAST` (nvcc `-use_fast_math`), the former strict units included.
+- `-DUFSM_STRICT_MATH=ON` restores the old flags exactly (host and the strict units) and defines `UFSM_STRICT_MATH` for the tests;
+  CMake writes `$BUILD/strict_math` (0 / 1) for the shell tests.
+
+Data written under the old flags:
+- volcomp lossy (mode 0) stores: decode is open-loop (no state carried from reconstructed voxels into the entropy decode), so a
+  fast-math decode is the old decode within +-1 LSB on rare voxels whose IDCT output sits at a .5 rounding boundary. The codec
+  already allows exactly that between its own AVX2+FMA and C kernels ("Cross-build agreement", third_party/volcomp.h). The stores
+  carry no hashes of decoded voxels.
+- volcomp surface chunks (mode 6): their refinement contexts are read from the base's own reconstruction, so encoder and decoder
+  must agree to the bit. That reconstruction runs under `#pragma clang fp contract(off) reassociate(off)` (VF_STRICT_BEGIN) with
+  only + and * (no division, so -freciprocal-math has nothing to change; -fno-signed-zeros only changes the sign of zero results),
+  hence bit-exact under fast math: old surface stores decode identically. The GPU decoder (nn_gpudec) handles mode 0 only.
+- volcomp typed chunks: mode 7 is integer; mode 8 decodes k * q as one binary64 multiply then binary32 rounding (no expression
+  for fast math to change), and its encoder verifies the bound per element. Unchanged.
+- surfcomp (.sfc), embz int8 stores: decode is integer dequantisation times a scale; new encodes may differ in a few levels from
+  old ones (test_tfx's golden hash, kept under strict only), old files decode the same.
+- Runtime GPU / CPU mixing: paths that fall back per piece (faces when the device pool fills, gpudec's CPU retry of a failing
+  substream, render's host tier, count-field's GPU vs host) now agree within rounding (+-1 on u8 at boundaries) instead of to the
+  bit; outputs that mix pieces from both paths can show such +-1 seams.
+
+Tests: the checks that were exact only because both sides were IEEE now go through `tests/fm_tol.h` (C) / `tests/fm_tol.sh`
+(shell); every bound collapses to exact under UFSM_STRICT_MATH=ON, so the strict build still runs the old byte-identity checks. The
+bounds were set from the arithmetic (no GPU was available to measure, the 11-14 sweep had them): a u8 that is round(float)
+moves by at most 1 and only near .5 boundaries (+-1 on <= 1e-4 of voxels for volcomp decode); classes cut at a float threshold
+flip whole (count bounds, 1e-4 .. 5e-3 by test); floats rel 1e-6 (fp32 one-pass), 1e-5 (recursive filters, iterative fits 1e-4);
+fp16 +-1 ulp; golden hashes / coded bytes / det_cmp batch hashes are compared only under strict, otherwise decoded and compared
+within bounds (losses within 2 % for det runs). Tests touched: test_gpudec, test_volcomp_fast, test_ct_gpu_decode.sh,
+test_zarr.sh, test_vcgpu, test_predict_heads.sh, test_fit, test_tfx, test_render_stream, test_render_fill, test_band_pair,
+test_phase_onfly.sh, test_codes_onfly.sh, test_mesh_phase, test_fiberraster, test_fibre_onfly.sh, test_ink_splat, test_ftrace_gpu,
+test_faces, test_countfield, test_lldec, test_fuse, test_sample_ops, test_spatial_augment, test_wind_sampler, test_scan_augment,
+test_gpu_aug, test_gpu_input, test_heads, test_pyports, test_imgops, test_coreline, test_qkclip. The `ufsm --ref` compares
+(phase-onfly, codes-onfly, fibre-onfly) have no tolerance option: the wrappers accept their failure exit under fast math when the
+logged per-window differing-voxel counts sum within the bound. Measured bounds and speed: TODO after the first fast-math sweep.
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the

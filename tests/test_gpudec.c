@@ -22,8 +22,12 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <time.h>
+#include "fm_tol.h"
 
 #define CV VOLCOMP_CHUNK_VOXELS
+/* decoded bytes vs the reference: identical under UFSM_STRICT_MATH; under fast math (nn_gpudec and the host IDCT both contract /
+   reassociate) +-1 on at most 1e-4 of the voxels, the codec's own cross-build allowance (volcomp.h: AVX2 vs C kernels +-1 LSB) */
+#define DEC_NE(what, a, b) fm_cmp_u8(what, a, b, CV, 1, 1e-4)
 static uint64_t lcg(uint64_t *s) { *s = *s * 6364136223846793005ull + 1442695040888963407ull; return *s >> 17; }
 static int fails = 0;
 static void check(const char *what, int ok) { printf("gpudec: %-100s %s\n", what, ok ? "ok" : "FAIL"); fails += !ok; }
@@ -66,7 +70,7 @@ static void *mt_worker(void *a) {
         gd_chunk gc; to_gd(&p, &gc); ref_subs(&p, mask, r); memset(g, 0, CV);
         int rc = gpudec_decode(&gc, mask, g);
         if (rc == 0) atomic_fetch_add(&A->gpu, 1);
-        if (rc != 0 || memcmp(r, g, CV)) atomic_fetch_add(&A->bad, 1);
+        if (rc != 0 || DEC_NE("mt request", r, g)) atomic_fetch_add(&A->bad, 1);
     }
     free(r); free(g); return nullptr;
 }
@@ -85,7 +89,7 @@ static void part12(void) {
             for (int t = 0; t < 6; t++) {
                 uint32_t mask = t == 0 ? 0xffffffffu : t == 1 ? 1u << (lcg(&s) & 31) : (uint32_t)lcg(&s) ^ (uint32_t)(lcg(&s) << 15);
                 ref_subs(&p, mask, a); memset(b, 0, CV);
-                if (gpudec_decode(&gc, mask, b) != 0 || memcmp(a, b, CV)) all_ok = 0;
+                if (gpudec_decode(&gc, mask, b) != 0 || DEC_NE("synthetic request", a, b)) all_ok = 0;
                 nall++;
             }
         }
@@ -115,7 +119,7 @@ static void part12(void) {
             int rc = gpudec_decode(&gc, mask, b);
             ncor++; nref_ok += rs == VOLCOMP_OK; ngpu_ok += rc == 0;
             if (rs == VOLCOMP_OK) { for (size_t i = 0; i < CV; i++) if (!(mask >> ((i >> 18) * 4 + ((i >> 12) & 3)) & 1)) a[i] = 0x5a; }
-            if (rs == VOLCOMP_OK ? rc != 0 || memcmp(a, b, CV) : rc != 1) cor_ok = 0;
+            if (rs == VOLCOMP_OK ? rc != 0 || DEC_NE("corrupted stream", a, b) : rc != 1) cor_ok = 0;
             if (rs != VOLCOMP_OK) { int touched = 0; for (size_t i = 0; i < CV && !touched; i++) touched = b[i] != 0x5a; if (touched) cor_ok = 0; }
         }
     snprintf(msg, sizeof msg, "%d corrupted / truncated streams that parse: GPU ok exactly when the reference is (%d), same bytes, else 1",
@@ -147,7 +151,7 @@ static void part3(const char *dir) {
             const uint32_t mask = t == 0 ? 0xffffffffu : (uint32_t)lcg(&s) | 1u;
             ref_subs(&p, mask, ref); free(raw);
             const int64_t o[3] = {cz * 128, cy * 128, cx * 128}, nn[3] = {128, 128, 128};
-            if (z3_read_sub(z, o, nn, got, 2, mask) || memcmp(got, ref, CV)) ok = 0;
+            if (z3_read_sub(z, o, nn, got, 2, mask) || DEC_NE("z3_read_sub", got, ref)) ok = 0;
             n++;
         }
     uint64_t s1; gpudec_stats(&s1, nullptr, nullptr, nullptr);
@@ -170,7 +174,7 @@ static void part4(const char *dir) {
             cudaMemset(dch, 0, CV); cudaDeviceSynchronize();
             ref_subs(&p, mask, ref);
             const int rc = gpudec_decode_dev(&gc, mask, dch);
-            if (cudaMemcpy(got, dch, CV, cudaMemcpyDeviceToHost) != cudaSuccess || rc != 0 || memcmp(got, ref, CV)) ok = 0;
+            if (cudaMemcpy(got, dch, CV, cudaMemcpyDeviceToHost) != cudaSuccess || rc != 0 || DEC_NE("gpudec_decode_dev", got, ref)) ok = 0;
             n++; gpu += rc == 0;
         }
     }
@@ -190,7 +194,7 @@ static void part4(const char *dir) {
         if (z3_read_sub_dev(z, o, nn, host, 1, mask, dch, &dm) || dm != mask) { ok2 = 0; continue; }
         cudaMemcpy(got, dch, CV, cudaMemcpyDeviceToHost);
         for (size_t i = 0; i < CV; i++) if (host[i] != 0) { ok2 = 0; break; }   /* out: zeros (the substreams went to the device) */
-        if (memcmp(got, ref, CV)) ok2 = 0;
+        if (DEC_NE("z3_read_sub_dev", got, ref)) ok2 = 0;
         nd++;
     }
     check("z3_read_sub_dev: the substreams in device memory = reference, zeros in out", ok2 && nd == 3);
@@ -209,7 +213,7 @@ static void *real_worker(void *a) {
         if (J->mode == 2) memset(d, 0, CV);
         int rc = gpudec_decode(&gc, J->mask[k], d);
         if (rc == 0) atomic_fetch_add(&J->gpu, 1); else { atomic_fetch_add(&J->cpu, 1); vfx_decode_subs(&p, J->mask[k], d); }
-        if (J->mode == 2 && (ref_subs(&p, J->mask[k], r) != VOLCOMP_OK || memcmp(r, d, CV))) atomic_fetch_add(&J->bad, 1);
+        if (J->mode == 2 && (ref_subs(&p, J->mask[k], r) != VOLCOMP_OK || DEC_NE("real chunk", r, d))) atomic_fetch_add(&J->bad, 1);
     }
     free(d); free(r); return nullptr;
 }

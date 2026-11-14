@@ -9,6 +9,7 @@
 #include "make_wind_fixture.c"
 #include "../src/sample.c"
 #include "nn.h"
+#include "fm_tol.h"
 
 
 static int fails;
@@ -87,9 +88,12 @@ int main(int argc, char **argv) {
         ad /= (double)p3;
         double hmax = 0; for (size_t k = 0; k < p3; k++) { const double d = fabs(h2f_host(Hc[k]) - h2f_host(Hg[k])); if (d > hmax) hmax = d; }
         const char *nm = op >= 0 ? scan_aug_names[op] : op == -1 ? "mixture" : "none";
-        CHECK(!zbad, "%s s%d: %zu voxels with a different zero set", nm, sv, zbad);
+        /* the zero set: exact under UFSM_STRICT_MATH; fast math (host scan_aug_exec rounds at .5 differently): <= 1e-4 of the voxels */
+        CHECK(zbad <= fm_allow(p3, 1e-4), "%s s%d: %zu voxels with a different zero set", nm, sv, zbad);
         CHECK(ad < .15 && big < p3 / 200 && mx <= 8, "%s s%d (on %x): bytes mean |d| %.3f, %zu > 2, max %d", nm, sv, on, ad, big, mx);
-        if (!on) CHECK(warped ? hmax < 2e-3 : hmax == 0, "%s s%d: unaugmented CT channel max |d| %.2g (%s)", nm, sv, hmax, warped ? "warp" : "symmetry");
+        /* symmetry, unaugmented: bit-identical under UFSM_STRICT_MATH; fast math (the host mean / sd: sum / p3 is a reciprocal multiply)
+           +-1 fp16 ulp (tests/fm_tol.h) */
+        if (!on) CHECK(warped ? hmax < 2e-3 : FM_STRICT ? hmax == 0 : !fm_cmp_h16("unaugmented CT channel", Hc, Hg, p3, 1), "%s s%d: unaugmented CT channel max |d| %.2g (%s)", nm, sv, hmax, warped ? "warp" : "symmetry");
         else CHECK(hmax <= (mx + 1.01) / sd + 2e-3, "%s s%d: CT channel max |d| %.3g beyond the bytes' %d / sd %.1f", nm, sv, hmax, mx, sd);
         if (ad > worst_mean) worst_mean = ad;
         if (mx > worst_max) worst_max = mx;

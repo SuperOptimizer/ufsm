@@ -8,6 +8,7 @@
 #include "tiffw.h"
 #include "z3w.h"
 #include "zarr3.h"
+#include "fm_tol.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -180,7 +181,10 @@ int main(void) {
                 for (int64_t z = 0; z < bn[0]; z++) for (int64_t y = 0; y < bn[1]; y++) for (int64_t x = 0; x < bn[2]; x++) {
                     const uint8_t a = fb[(z * bn[1] + y) * bn[2] + x], b = rb[((z + bo[0]) * NV + y + bo[1]) * NV + x + bo[2]]; diff += a != b; kn += b != 255; }
                 fprintf(stderr, "onfly open %d pass %d: %ld of %ld voxels differ from the stored splat (%ld known)\n", open, pass, diff, (long)(bn[0] * bn[1] * bn[2]), kn);
-                CHECK(diff == 0 && kn > 10000, "onfly == stored, open %d pass %d: %ld differ, %ld known", open, pass, diff, kn);
+                /* exact under UFSM_STRICT_MATH. Under fast math the on-the-fly target (inkfly_chunk, a separate copy of the splat /
+                   face search; open 2: nn_inkfly.cu) and inksplat_run round their voxel picks (floor(x + 0.5)), face search and
+                   ceil(1 / hpx) apart at boundaries, and a whole voxel moves: <= 5e-3 of the known voxels may differ (tests/fm_tol.h) */
+                CHECK(diff <= (long)fm_allow((size_t)kn, 5e-3) && kn > 10000, "onfly == stored, open %d pass %d: %ld differ, %ld known", open, pass, diff, kn);
                 free(fb);
             }
             dcache_stats d1; dcache_get_stats(&d1);
@@ -227,7 +231,7 @@ int main(void) {
             z3 *fly = inkfly_open(z3_open(cs, "ct.zarr/1", nullptr), sj, &c9, 64, nullptr, nullptr); CHECK(fly && !z3_read(fly, z0, nn, fb, 4), "val onfly %d", mode);
             long diff = 0; for (size_t k = 0; k < (size_t)NV * NV * NV; k++) { diff += rb[k] != fb[k]; kn[mode - 1] += rb[k] != 255; }
             fprintf(stderr, "validation %s: %ld known, onfly vs stored: %ld differ\n", mode == 1 ? "exclude" : "only", kn[mode - 1], diff);
-            CHECK(diff == 0 && kn[mode - 1] > 1000, "validation %d: %ld differ, %ld known", mode, diff, kn[mode - 1]);
+            CHECK(diff <= (long)fm_allow((size_t)kn[mode - 1], 5e-3) && kn[mode - 1] > 1000, "validation %d: %ld differ, %ld known", mode, diff, kn[mode - 1]);   /* (the bound above) */
             if (fly) z3_close(fly);
             free(rb); free(fb); if (ref) z3_close(ref); store_close(sv); store_close(cs);
         }

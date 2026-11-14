@@ -15,6 +15,7 @@
 #include <string.h>
 #include <math.h>
 #include "../src/band.h"
+#include "fm_tol.h"
 
 static uint8_t val(int64_t z, int64_t y, int64_t x) {
     uint32_t h = (uint32_t)(z * 73856093u ^ y * 19349663u ^ x * 83492791u); h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
@@ -74,7 +75,10 @@ int main(int argc, char **argv) {
             const int r = phase_onfly_decode_gpu(p, o, n, g);
             size_t d = 0, nz = 0; if (!r) for (size_t i = 0; i < N; i++) { d += a[i] != g[i]; nz += a[i] != 0; }
             printf("pool %d box %d (%lld,%lld,%lld + %lldx%lldx%lld): GPU rc %d, %zu of %zu bytes differ (%zu non-empty)\n", k, b, (long long)o[0], (long long)o[1], (long long)o[2], (long long)n[0], (long long)n[1], (long long)n[2], r, d, N, nz);
-            if (r || d) fail = 1;
+            /* byte-identical under UFSM_STRICT_MATH. Under fast math the host codes_pool2_box sums its cos / sin table entries in float
+               (reassociated, tables built at fast math) while the device (codes_pool.h) keeps __fadd_rn: a near-tie bin may go the other
+               way, <= 1e-4 of the box's voxels (tests/fm_tol.h) */
+            if (r || (d && fm_cmp_u8c("pooled codes GPU vs host", a, g, N, 0, 0, 1e-4, 1e-4))) fail = 1;
             free(a); if (band_pair_gpu_host_free) band_pair_gpu_host_free(g); else free(g);
         }
         z3_close(p);
@@ -105,6 +109,6 @@ int main(int argc, char **argv) {
         if (off2) fail = 1;
         free(a); free(f); z3_close(c); z3_close(p);
     }
-    printf(fail ? "FAIL\n" : "PASS: the GPU lossless decode and the device codes pooling are byte-identical to z3_read / codes_pool2_box\n");
+    printf(fail ? "FAIL\n" : FM_STRICT ? "PASS: the GPU lossless decode and the device codes pooling are byte-identical to z3_read / codes_pool2_box\n" : "PASS: the GPU lossless decode and the device codes pooling match z3_read / codes_pool2_box (pooling within the fast-math bound)\n");
     return fail;
 }

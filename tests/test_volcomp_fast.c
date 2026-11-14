@@ -16,8 +16,12 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "fm_tol.h"
 
 #define CV VOLCOMP_CHUNK_VOXELS
+/* vfx (volcomp_fast.h) vs the reference decoder: two host IDCTs in different code. Identical under UFSM_STRICT_MATH; under the
+   default fast math (contraction / reassociation) +-1 on at most 1e-4 of the voxels, the codec's cross-build allowance. */
+#define DEC_NE(what, a, b) fm_cmp_u8(what, a, b, CV, 1, 1e-4)
 static uint64_t lcg(uint64_t *s) { *s = *s * 6364136223846793005ull + 1442695040888963407ull; return *s >> 17; }
 static int fails = 0;
 static void check(const char *what, int ok) { printf("volcomp_fast: %-96s %s\n", what, ok ? "ok" : "FAIL"); fails += !ok; }
@@ -46,14 +50,14 @@ static int part1(void) {
             size_t n = 0;
             if (volcomp_encode(c, qs[qi], enc, VOLCOMP_ENCODE_BOUND, &n) != VOLCOMP_OK) { full_ok = 0; continue; }
             volcomp_status s1 = volcomp_decode(enc, n, a, CV), s2 = vfx_decode(enc, n, b, CV);
-            if (s1 != VOLCOMP_OK || s2 != VOLCOMP_OK || memcmp(a, b, CV)) full_ok = 0;
+            if (s1 != VOLCOMP_OK || s2 != VOLCOMP_OK || DEC_NE("vfx_decode", a, b)) full_ok = 0;
             vf_parsed p;
             if (enc[5] == VLL_MODE_LOSSY && vf_parse(enc, n, &p) == VOLCOMP_OK)
                 for (int t = 0; t < 4; t++) {
                     uint32_t mask = (uint32_t)lcg(&s) ^ (uint32_t)(lcg(&s) << 15);
                     memset(a, 0, CV); memset(b, 0, CV);
                     for (uint32_t k = 0; k < VF_NSUB; k++) if (mask >> k & 1) vf_decode_sub(&p, k, a, -1, NULL);
-                    if (vfx_decode_subs(&p, mask, b) != VOLCOMP_OK || memcmp(a, b, CV)) sub_ok = 0;
+                    if (vfx_decode_subs(&p, mask, b) != VOLCOMP_OK || DEC_NE("vfx_decode_subs", a, b)) sub_ok = 0;
                 }
             for (int t = 0; t < 40; t++) {   /* corrupted copies: flipped bytes past the header, or truncated */
                 size_t m = n; memcpy(bad, enc, n);
@@ -62,7 +66,7 @@ static int part1(void) {
                 memset(a, 0x55, CV); memset(b, 0x55, CV);
                 s1 = volcomp_decode(bad, m, a, CV); s2 = vfx_decode(bad, m, b, CV);
                 ncor++;
-                if (s1 != s2 || (s1 == VOLCOMP_OK && memcmp(a, b, CV))) cor_ok = 0;
+                if (s1 != s2 || (s1 == VOLCOMP_OK && DEC_NE("corrupted stream", a, b))) cor_ok = 0;
                 if (s1 == VOLCOMP_OK) ncor_dec++;
             }
         }

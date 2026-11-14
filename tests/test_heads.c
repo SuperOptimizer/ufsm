@@ -8,6 +8,7 @@
    References are kept per GPU name (the losses differ between architectures); none for this GPU: (1) only checks that the runs work.
    UFSM_HEADS_REF_WRITE=1 appends this GPU's lines to the reference file instead (run with the pre-change binary).
    Usage: test_heads <ufsm binary> <make_wind_fixture binary> <tests/heads_ref.txt> */
+#include <ctype.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -15,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "fm_tol.h"
 #include "test_part.h"   /* UFSM_TEST_PART=K/3: three shards of ~10 s (each makes its own fixture) */
 
 static int fails = 0;
@@ -76,6 +78,18 @@ static void gpu_name(char *out, size_t n) {
     out[strcspn(out, "\n")] = 0; if (!out[0]) snprintf(out, n, "unknown");
 }
 
+/* got (NUL-terminated) vs want[0, wl): the same words, every number within rel 2e-2 + abs 2e-3 */
+[[maybe_unused]] static int loss_text_close(const char *got, const char *want, size_t wl) {
+    const char *g = got, *w = want, *we = want + wl;
+    while (*g && w < we) {
+        if ((isdigit((unsigned char)*g) || (*g == '-' && isdigit((unsigned char)g[1]))) && (isdigit((unsigned char)*w) || (*w == '-' && isdigit((unsigned char)w[1])))) {
+            char *ge, *wen; const double a = strtod(g, &ge), b = strtod(w, &wen);
+            if (wen > we || !fm_close(a, b, 2e-2, 2e-3)) return 0;
+            g = ge; w = wen;
+        } else if (*g++ != *w++) return 0;
+    }
+    return !*g && w == we;
+}
 int main(int argc, char **argv) {
     if (argc != 4) { fprintf(stderr, "usage: test_heads <ufsm binary> <make_wind_fixture binary> <heads_ref.txt>\n"); return 2; }
     const char *U = argv[1], *ref = argv[3]; const int wr = getenv("UFSM_HEADS_REF_WRITE") && atoi(getenv("UFSM_HEADS_REF_WRITE"));
@@ -109,7 +123,10 @@ int main(int argc, char **argv) {
             char key[400]; snprintf(key, sizeof key, "%s|%s|", gpu, old[k].name); const char *r = strstr(refs, key);
             if (r) {
                 have++; r += strlen(key); const size_t rl = strcspn(r, "\n");
-                const int same = strlen(t) == rl && !strncmp(t, r, rl); cmp += same;
+                /* the text exactly under UFSM_STRICT_MATH (the references were logged by the bit-exact build); under fast math the host
+                   fixture / sampler and the former strict units round differently, so every number within rel 2e-2 (+ 2e-3 for the
+                   4-decimal zeros), the words equal (tests/fm_tol.h) */
+                const int same = FM_STRICT ? strlen(t) == rl && !strncmp(t, r, rl) : loss_text_close(t, r, rl); cmp += same;
                 CHECK(same, "%s: the logged losses differ from the reference\n  got  %s\n  want %.*s", old[k].name, t, (int)rl, r);
             }
         }

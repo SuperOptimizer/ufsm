@@ -18,3 +18,16 @@ if nd: print(f"{'FAIL' if bad else 'ok'} {sys.argv[5]}: {nd} of {a.size} bytes d
 sys.exit(1 if bad else 0)
 EOF
 }
+# fm_det_cmp A.log B.log WHAT: det_cmp (tests/det_cmp.sh, source it first) under strict math; otherwise two --det runs whose label
+# planes come from GPU vs CPU code: the device inputs (dettrace, labels cut) equal, the per-step losses within 2 %, no batch hashes.
+fm_det_cmp() {
+  if fm_strict; then det_cmp "$@"; return; fi
+  local a=$1 b=$2 what=$3 xa xb la lb
+  xa=$(grep -E '^dettrace' "$a" | sed -E 's/ labels .*//'); xb=$(grep -E '^dettrace' "$b" | sed -E 's/ labels .*//')
+  [ -n "$xa" ] && [ "$xa" = "$xb" ] || { echo "FAIL: $what: no / differing device inputs"; return 1; }
+  la=$(grep -E '^step' "$a" | awk '{print $2, $6}'); lb=$(grep -E '^step' "$b" | awk '{print $2, $6}')
+  [ -n "$la" ] && [ "$(echo "$la" | wc -l)" = "$(echo "$lb" | wc -l)" ] || { echo "FAIL: $what: no / unequal step lines"; return 1; }
+  paste -d' ' <(echo "$la") <(echo "$lb") | awk '{d = $2 - $4; if (d < 0) d = -d; if ($1 != $3 || d > 0.02 * ($2 < 0 ? -$2 : $2) + 1e-6) bad = 1} END {exit bad}' \
+    || { echo "FAIL: $what: losses differ by more than 0.02"; return 1; }
+  DET_CMP_N="$(grep -c '^batchhash' "$a") (hashes not compared: fast math)"
+}

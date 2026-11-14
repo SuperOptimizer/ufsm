@@ -13,13 +13,21 @@ if [ -d "$LOCAL_ROOT/$LOCAL_KEY" ]; then
     [ "$(stat -c %s /tmp/ufsm-test-local.raw)" = "786432" ]
     # cross-check against the python zarr + volcomp_zarr reader when installed
     PY=${UFSM_PY:-$HOME/usrm2/.venv/bin/python}; export VOLCOMP_LIB=${VOLCOMP_LIB:-$HOME/volume-compressor/build/release/libvolcomp.so}
+    # strict-math build (-DUFSM_STRICT_MATH=ON, $BUILD/strict_math = 1): byte-identical; the default fast-math build decodes the lossy
+    # chunks with a contracted / reassociated IDCT: +-1 on at most 1e-4 of the voxels (the codec's cross-build allowance)
+    STRICT=$(cat "$(dirname "$B")/strict_math" 2>/dev/null || echo 0)
     if $PY -c "import zarr, volcomp_zarr" 2>/dev/null; then
         $PY - <<EOF
-import numpy as np, zarr, volcomp_zarr
+import math, numpy as np, zarr, volcomp_zarr
 z = zarr.open("$LOCAL_ROOT/$LOCAL_KEY", mode="r")
 ref = np.asarray(z[100:164, 200:296, 300:428]).ravel()
 got = np.fromfile("/tmp/ufsm-test-local.raw", np.uint8)
-assert got.shape == ref.shape and np.array_equal(got, ref), "mismatch vs python reader"
+assert got.shape == ref.shape, "shape mismatch vs python reader"
+if "$STRICT" == "1":
+    assert np.array_equal(got, ref), "mismatch vs python reader"
+else:
+    d = np.abs(got.astype(np.int16) - ref.astype(np.int16))
+    assert d.max() <= 1 and (d > 0).sum() <= math.ceil(1e-4 * d.size), f"mismatch vs python reader: {(d > 0).sum()} differ, worst {d.max()}"
 print("local read matches python reader")
 EOF
     fi

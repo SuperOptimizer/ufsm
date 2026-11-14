@@ -15,9 +15,33 @@ static double cyl_ct(const cyl *C, double r) { return 20 + 130 * (S(r - C->a0) -
 static double cyl_sample(void *ctx, double z, double y, double x) { const cyl *C = ctx; (void)z; return cyl_ct(C, hypot(y - C->cy, x - C->cx)); }
 
 #ifdef FACES_GPU
-/* 3. the GPU path (src/nn_faces.cu) against the CPU path on a chunked uint8 volume (noisy two-sheet cylinder): bit-identical outputs */
+/* 3. the GPU path (src/nn_faces.cu) against the CPU path on a chunked uint8 volume (noisy two-sheet cylinder): bit-identical outputs
+   under UFSM_STRICT_MATH, within tests/fm_tol.h bounds under the default fast math */
 #include "faces_core.h"
+#include "fm_tol.h"
 #include <string.h>
+/* GPU vs CPU faces_stats: identical under UFSM_STRICT_MATH; under fast math the counts within 0.1% (+1), the sums / histogram bins
+   within 0.1% of their value plus 1e-3 of the vertex count (a changed pick moves one vertex between bins / out of a sum) */
+static int stats_close(const faces_stats *a, const faces_stats *b) {
+    if (FM_STRICT) return !memcmp(a, b, sizeof *a);
+    const size_t ca[] = {a->nv, a->nband, a->npick0, a->npick, a->nfill, a->ct_n, a->ct_orig, a->ct_rect, a->ct_vers, a->in_band},
+                 cb[] = {b->nv, b->nband, b->npick0, b->npick, b->nfill, b->ct_n, b->ct_orig, b->ct_rect, b->ct_vers, b->in_band};
+    int ok = a->ct_thr == b->ct_thr;
+    for (int k = 0; k < (int)(sizeof ca / sizeof ca[0]); k++) ok &= fm_close((double)ca[k], (double)cb[k], 1e-3, 1);
+    const double av = 1e-3 * (double)a->nv;
+    for (int k = 0; k < 64; k++) ok &= fm_close(a->thick_hist[k], b->thick_hist[k], 1e-3, av) && fm_close(a->thick_all[k], b->thick_all[k], 1e-3, av);
+    ok &= fm_close(a->shift_r, b->shift_r, 1e-3, av) && fm_close(a->shift_v, b->shift_v, 1e-3, av);
+    for (int k = 0; k < 4; k++) ok &= fm_close(a->fib[k / 2][k % 2], b->fib[k / 2][k % 2], 1e-3, av);
+    return ok;
+}
+/* a float plane: under fast math every element within rel 1e-5 / abs 1e-4, except <= 1e-3 of them (vertices whose pick changed:
+   the face jumps to another band edge); bit-identical under UFSM_STRICT_MATH */
+static int plane_close(const float *a, const float *b, size_t n) {
+    if (FM_STRICT) return !memcmp(a, b, n * 4);
+    size_t bad = 0; for (size_t i = 0; i < n; i++) bad += !fm_close(a[i], b[i], 1e-5, 1e-4);
+    if (bad) fprintf(stderr, "plane: %zu of %zu beyond rel 1e-5 abs 1e-4 (allowed %zu)\n", bad, n, fm_allow(n, 1e-3));
+    return bad <= fm_allow(n, 1e-3);
+}
 enum { CS = 128 };
 typedef struct { int64_t shape[3]; int g[3]; uint8_t **ch; fgpu *G; uint32_t mk[9]; } tvol;
 static double tv_sample(void *ctx, double z, double y, double x) {   /* faces_cli fcc_sample */
@@ -68,8 +92,10 @@ static int gpu_vs_cpu(void) {
     }
     CHECK(!rc, "faces_wrap");
     CHECK(!fgpu_broken(T.G), "GPU path fell back to the CPU");
-    int diff = 0; for (int k = 0; k < 7; k++) diff += memcmp(out[0][k], out[1][k], n * 4) != 0;
-    diff += memcmp(cf[0], cf[1], n) != 0; diff += memcmp(&st[0], &st[1], sizeof st[0]) != 0;
+    /* bit-identical under UFSM_STRICT_MATH; within the fast-math bounds above otherwise (nn_faces.cu and the host faces_wrap both fast
+       math: profile sums contracted, band edges / picks at float thresholds; conf: <= 1e-3 of the vertices differ) */
+    int diff = 0; for (int k = 0; k < 7; k++) diff += !plane_close(out[0][k], out[1][k], n);
+    diff += fm_cmp_u8c("conf", cf[0], cf[1], n, 0, 0, 1e-3, 1e-3) != 0; diff += !stats_close(&st[0], &st[1]);
     printf("gpu vs cpu: %d of 9 outputs differ; band %zu picked %zu/%zu, filled %zu, ct_n %zu\n", diff, st[1].nband, st[1].npick, st[1].nv, st[1].nfill, st[1].ct_n);
     CHECK(diff == 0, "GPU and CPU outputs differ (%d)", diff);
     CHECK(st[0].npick > 0.5 * st[0].nv && st[0].ct_n > 100, "the comparison exercises picks (%zu/%zu) and kept profiles (%zu)", st[0].npick, st[0].nv, st[0].ct_n);

@@ -16,6 +16,7 @@
 #include "store.h"
 #include "z3w.h"
 #include "zarr3.h"
+#include "fm_tol.h"
 
 #include "fiberraster.h"
 static int fails = 0;
@@ -118,11 +119,15 @@ int main(void) {
                   const int in = gz >= 0 && gz < NZ && gy >= 0 && gy < NY && gx >= 0 && gx < NX;
                   if (in && gz >= C[c].zmax) continue;   /* (not written by the --zband raster) */
                   cnt++; dif += v != (in ? ref[k][((size_t)gz * NY + gy) * NX + gx] : 255); }
-              CHECK(!r && !dif, "onfly (%s) %d box %d plane %c: rc %d, %ld of %ld voxels differ from the stored raster", mode ? "GPU" : "CPU", c, b, "HV"[k], r, dif, cnt);
+              /* the CPU on the fly runs the stored raster's own host code: exact. The GPU (nn_fibre.cu) cuts the 254 / 0 / 255 classes at
+                 radius / guard / ring thresholds on sqrt of squared distances: exact under UFSM_STRICT_MATH, under fast math (approximate
+                 sqrt, contraction) a voxel on a threshold may flip class: <= 1e-4 of the box (tests/fm_tol.h) */
+              const long allow = mode ? (long)fm_allow((size_t)cnt, 1e-4) : 0;
+              CHECK(!r && dif <= allow, "onfly (%s) %d box %d plane %c: rc %d, %ld of %ld voxels differ from the stored raster (allowed %ld)", mode ? "GPU" : "CPU", c, b, "HV"[k], r, dif, cnt, allow);
               free(g); }
           free(ref[0]); free(ref[1]); z3_close(pl[0]); z3_close(pl[1]);
       } }
-      printf("test_fiberraster: the planes on the fly byte-identical to the stored rasters (CPU%s)\n", ngpu > 1 ? ", GPU" : ""); }
+      printf("test_fiberraster: the planes on the fly byte-identical to the stored rasters (CPU%s)\n", ngpu > 1 ? (FM_STRICT ? ", GPU" : ", GPU within the fast-math bound") : ""); }
     snprintf(p, sizeof p, "rm -rf %s", root); if (!fails && system(p)) fails++;
     printf(fails ? "test_fiberraster: %d FAILED\n" : "test_fiberraster: ok\n", fails);
     return fails ? 1 : 0;

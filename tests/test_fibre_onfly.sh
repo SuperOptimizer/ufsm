@@ -1,12 +1,27 @@
 #!/usr/bin/env bash
 # the fibre planes on the fly (sources "fibre" targets, src/fiberraster.c fiber_onfly_open): fibre polylines (a UFIB of H / V fibres,
 # straight and curved, crossing) over the wind fixture's CT; fiber-raster --ct writes the stored H / V planes (radius 2, guard 2, ring 2,
-# iso 100); the planes' extent (draw cells) only near the fibres; ufsm fiber-onfly over random windows is byte-identical to them (GPU and, UFSM_FIBRE_CPU=1, CPU); and --fib-head training
+# iso 100); the planes' extent (draw cells) only near the fibres; ufsm fiber-onfly over random windows is byte-identical to them (GPU and, UFSM_FIBRE_CPU=1, CPU;
+# the GPU within fibre_run's bound under the default fast math); and --fib-head training
 # runs on the stored planes, the onfly planes (GPU) and the onfly planes (CPU) log the same losses (--det)
 # Usage: test_fibre_onfly.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
 . "$(dirname "$(readlink -f "$0")")/det_cmp.sh"
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
+. "$(dirname "$(readlink -f "$0")")/fm_tol.sh"
+B=${B:-$(dirname "$U")}   # (fm_strict reads $B/strict_math; the suite exports B, by hand: the ufsm binary's dir)
+# fibre_run LOG WINDOWS P -- ARGS: fiber-onfly on the GPU vs the stored fiber-raster (host). Byte-identical under UFSM_STRICT_MATH; under the
+# default fast math nn_fibre.cu cuts the 254 / 0 / 255 classes at radius / guard / ring thresholds on approximate sqrt, so a voxel on a
+# threshold may flip: at most 1e-4 of the windows' voxels (both planes; summed "N bytes differ" of the window lines, fiber-onfly has
+# no tolerance knob). The CPU path (UFSM_FIBRE_CPU=1) runs fiber-raster's own code and stays exact.
+fibre_run() {
+  local log=$1 w=$2 p=$3; shift 4
+  if "$U" fiber-onfly "$@" > "$log" 2>&1; then grep -q 'byte-identical' "$log"; return; fi
+  fm_strict && return 1
+  grep -q 'DIFFERS from the stored raster' "$log" || return 1   # (any other failure)
+  sed -nE 's/.*, ([0-9]+) bytes differ$/\1/p' "$log" | awk -v n="$((2 * p * p * p * w))" '{d += $1} END {printf "fast math: %d of <= %d voxels differ (allowed 1e-4)\n", d, n; exit !(d <= 1e-4 * n)}' >> "$log"
+}
+# det_cmp under strict math; else the device inputs and losses only (the batch hash covers the fibre planes: stored vs GPU on the fly)
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 "$MF" fx 256 2 1 > fx.log 2>&1
 python3 - <<'PY'
@@ -23,11 +38,10 @@ with open('f.fib', 'wb') as f:
 PY
 "$U" fiber-raster f.fib lab --um 9.6 --ct fx ct/9.6 --iso 100 --level 0 --radius 2 --guard 2 --ring 2 --shard 128 --threads 4 > fr.log 2>&1 || { echo "FAIL: fiber-raster ($D/fr.log)"; exit 1; }
 O=(--ct fx ct/9.6 --level 0 --radius 2 --guard 2 --ring 2 --iso 100 --ref lab/H lab/V 9.6 --windows 6 --P 96)
-"$U" fiber-onfly f.fib "${O[@]}" > gpu.log 2>&1 || { echo "FAIL: onfly (default) differs from fiber-raster ($D/gpu.log)"; tail -2 gpu.log; exit 1; }
+fibre_run gpu.log 6 96 -- f.fib "${O[@]}" || { echo "FAIL: onfly (default) differs from fiber-raster ($D/gpu.log)"; tail -2 gpu.log; exit 1; }
 UFSM_FIBRE_CPU=1 "$U" fiber-onfly f.fib "${O[@]}" > cpu.log 2>&1 || { echo "FAIL: onfly (CPU) differs ($D/cpu.log)"; tail -2 cpu.log; exit 1; }
-UFSM_FIBRE_GPU_MVOX=0.05 "$U" fiber-onfly f.fib "${O[@]}" > slab.log 2>&1 || { echo "FAIL: onfly (GPU, 50k-voxel z slabs) differs ($D/slab.log)"; tail -2 slab.log; exit 1; }
-grep -q 'byte-identical' slab.log || { echo "FAIL: no byte-identical line (slabs)"; exit 1; }
-grep -q 'byte-identical' gpu.log && grep -q 'byte-identical' cpu.log || { echo "FAIL: no byte-identical line"; exit 1; }
+UFSM_FIBRE_GPU_MVOX=0.05 fibre_run slab.log 6 96 -- f.fib "${O[@]}" || { echo "FAIL: onfly (GPU, 50k-voxel z slabs) differs ($D/slab.log)"; tail -2 slab.log; exit 1; }
+grep -q 'byte-identical' cpu.log || { echo "FAIL: no byte-identical line"; exit 1; }
 # the extent (z3_derived_extent: the draw cells): one short fibre in a corner marks only the chunks within its reach
 python3 -c "
 import struct; p = [(20, 20, 20 + t) for t in range(10)]
@@ -51,6 +65,6 @@ UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 UFSM_FIBRE_CPU=1 "$U" train onfly.json --out 
 UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 UFSM_FIBRE_SETS=1 "$U" train onfly.json --out o1 "${C[@]}" --workers 4 > o1.log 2>&1 || { echo "FAIL: onfly run, one buffer set ($D/o1.log)"; exit 1; }
 for f in st og oc; do grep '^step' $f.log | sed -E 's/ [0-9.]+ samp\/s.*//' > $f.txt; done
 grep -q 'fib bce 0\.[0-9]*' st.txt || { echo "FAIL: no fibre loss in the stored run"; exit 1; }
-[ -s st.txt ] && det_cmp st.log og.log "stored vs onfly fibre planes (GPU)" && det_cmp st.log oc.log "stored vs onfly fibre planes (CPU)" || exit 1
-det_cmp st.log o1.log "stored vs onfly fibre planes (one shared buffer set, 4 workers)" || exit 1
+[ -s st.txt ] && fm_det_cmp st.log og.log "stored vs onfly fibre planes (GPU)" && det_cmp st.log oc.log "stored vs onfly fibre planes (CPU)" || exit 1
+fm_det_cmp st.log o1.log "stored vs onfly fibre planes (one shared buffer set, 4 workers)" || exit 1
 echo "PASS: the fibre planes on the fly byte-identical to fiber-raster (GPU, CPU), training on them the same batches and device inputs, losses within 2% ($(wc -l < st.txt) steps)"
