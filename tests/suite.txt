@@ -10,67 +10,73 @@
 # Helper binaries without a line of their own: test_sheet (test-sheet), test_http_reader / test_sampler_safety / test_formats (python).
 test_target_erode                              |              |     1 | ./$B/test_target_erode
 test_wind_sampler                              |              |    19 | ./$B/test_wind_sampler
-test_crush                                     |              |    19 | ./$B/test_crush
-test_vwt_aug                                   |              |     3 | ./$B/test_vwt_aug
-test_zcache                                    |              |    11 | ./$B/test_zcache
-test_scrollaug                                 |              |    12 | ./$B/test_scrollaug
-test_papyrus                                   |              |     2 | ./$B/test_papyrus
-test_cond                                      | smoke        |     2 | ./$B/test_cond
-test_scanprep                                  |              |     5 | ./$B/test_scanprep
+test_sampbias                                  |              |     5 | ./$B/test_sampbias
+test_crush                                     |              |    17 | ./$B/test_crush
+test_vwt_aug                                   |              |     2 | ./$B/test_vwt_aug
+test_zcache                                    |              |    10 | ./$B/test_zcache
+test_scrollaug                                 |              |    10 | ./$B/test_scrollaug
+test_papyrus                                   |              |     1 | ./$B/test_papyrus
+test_cond                                      | smoke        |     1 | ./$B/test_cond
+test_scanprep                                  |              |     6 | ./$B/test_scanprep
 test_sweep                                     | smoke        |     1 | ./$B/test_sweep
 test_gpu_input                                 | gpu          |    13 | ./$B/test_gpu_input
-test_pack_tm                                   | gpu          |     2 | ./$B/test_pack_tm
+test_pack_tm                                   | gpu          |     1 | ./$B/test_pack_tm
 test_wind4                                     | gpu          |     1 | ./$B/test_wind4
-test_fibn                                      | gpu          |     1 | ./$B/test_fibn
-test_w4dev                                     | gpu          |    37 | ./$B/test_w4dev
-test_lat_conv0                                 | gpu          |     2 | UFSM_F8W_MIXED_CZ=4 ./$B/test_lat_conv0
-test_lat_head                                  | gpu          |     8 | ./$B/test_lat_head
-test_lat_head~FP8                              | gpu          |     6 | TLH_FP8=1 ./$B/test_lat_head
-test_pgrad                                     | gpu          |     2 | ./$B/test_pgrad
-test_gyrec                                     | gpu2         |     2 | ./$B/test_gyrec
-test_unwrap2_sampler                           | gpu          |    11 | ./$B/test_unwrap2_sampler $TMPDIR/unwrap2_fixture
-test_phase_pool                                |              |     2 | UFSM_PHASE_POOL_SLAB=90000 ./$B/test_phase_pool $TMPDIR/phase_pool
-test_rungs                                     | gpu,smoke    |     1 | ./$B/test_rungs $TMPDIR/rungs_fixture
+test_fibn                                      | gpu          |     2 | ./$B/test_fibn
+test_w4dev                                     | gpu          |       10 | ./$B/test_w4dev
+test_lat_conv0                                 | gpu          |        3 | UFSM_F8W_MIXED_CZ=4 ./$B/test_lat_conv0
+test_lat_head                                  | gpu          |        5 | ./$B/test_lat_head
+test_lat_head~FP8                              | gpu          |        4 | TLH_FP8=1 ./$B/test_lat_head
+test_pgrad                                     | gpu          |     1 | ./$B/test_pgrad
+test_gyrec                                     | gpu          |     1 | ./$B/test_gyrec
+test_unwrap2_sampler                           | gpu          |     9 | ./$B/test_unwrap2_sampler $TMPDIR/unwrap2_fixture
+test_phase_pool                                |              |     3 | UFSM_PHASE_POOL_SLAB=90000 ./$B/test_phase_pool $TMPDIR/phase_pool
+test_rungs                                     | gpu,smoke    |     3 | ./$B/test_rungs $TMPDIR/rungs_fixture
 test_gram                                      | gpu          |     2 | ./$B/test_gram
-test_fibhead                                   | gpu,smoke    |     1 | ./$B/test_fibhead
-test_fibhead_train                             | gpu          |    21 | tests/test_fibhead_train.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibhead
-test_slot_planes                               | gpu          |    16 | tests/test_slot_planes.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/slotplanes
-test_idle_release                              |              |    14 | tests/test_idle_release.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/idlerel
-test_scan_norm                                 | gpu          |    16 | tests/test_scan_norm.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/scannorm
+test_fibhead                                   | gpu,smoke    |     2 | ./$B/test_fibhead
+test_fibhead_train                             | gpu          |    25 | tests/test_fibhead_train.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibhead
+test_slot_planes                               | gpu          |    30 | tests/test_slot_planes.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/slotplanes
+test_idle_release                              |              |     8 | tests/test_idle_release.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/idlerel
+test_scan_norm                                 | gpu          |    14 | tests/test_scan_norm.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/scannorm
+test_predict_guard                             | gpu          |    20 | tests/test_predict_guard.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predguard
 test_predict_heads~part0of3                   | gpu          |    25 | UFSM_TEST_PART=0/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
 test_predict_heads~part1of3                   | gpu          |    25 | UFSM_TEST_PART=1/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
 test_predict_heads~part2of3                   | gpu          |    25 | UFSM_TEST_PART=2/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
-test_predict_boxes                             | gpu          |    19 | tests/test_predict_boxes.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predboxes
-test_fstem                                     | gpu,smoke    |     4 | ./$B/test_fstem
-test_lathead                                     | gpu          |     1 | ./$B/test_lathead
-test_fit_lat                                     | gpu          |     2 | ./$B/test_fit_lat
+test_predict_gpus2                            | gpu2         |    30 | tests/test_predict_gpus2.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predgpus2
+test_predict_boxes                             | gpu          |    40 | tests/test_predict_boxes.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predboxes
+test_fstem                                     | gpu,smoke    |     3 | ./$B/test_fstem
+test_slab_tg                                   | gpu,smoke    |     2 | ./$B/test_slab_tg
+test_lathead                                     | gpu          |     3 | ./$B/test_lathead
+test_fit_lat                                     | gpu          |     3 | ./$B/test_fit_lat
 test_restore_task                              | gpu          |     7 | ./$B/test_restore_task
-test_phase_interp                              |              |    33 | ./$B/test_phase_interp
+test_phase_interp                              |              |    20 | ./$B/test_phase_interp
+test_phase_outward                             |              |     1 | ./$B/test_phase_outward
 test_spatial_augment~part0of3                 |              |     7 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=0/3 ./$B/test_spatial_augment
 test_spatial_augment~part1of3                 |              |     7 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=1/3 ./$B/test_spatial_augment
 test_spatial_augment~part2of3                 |              |     7 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=2/3 ./$B/test_spatial_augment
 test_spatial_augment~full                      | slow         |   148 | ./$B/test_spatial_augment
 test_wgrad_grid                                | gpu          |     2 | ./$B/test_wgrad_grid
-test_sheet_gpu                                 | gpu2,smoke   |     1 | ./$B/test_sheet_gpu
+test_sheet_gpu                                 | gpu2,l2,smoke|     1 | ./$B/test_sheet_gpu
 test_cover                                     |              |     1 | ./$B/test_cover
 test_ct_augment                                | smoke        |     1 | ./$B/test_ct_augment
 test_scan_augment                              |              |     2 | ./$B/test_scan_augment
 test_side                                      | smoke        |     1 | ./$B/test_side
 test_band_pair                                 | gpu          |     2 | ./$B/test_band_pair
-test_votes                                     |              |     3 | ./$B/test_votes
+test_phaselab                                  |              |     6 | ./$B/test_phaselab
+test_votes                                     |              |     2 | ./$B/test_votes
 test_wind                                      | smoke        |     1 | ./$B/test_wind
 test_phase_check                               |              |     1 | ./$B/test_phase_check
 test_fuse                                      |              |     1 | ./$B/test_fuse
 test_gn_frozen                                 | gpu          |     2 | ./$B/test_gn_frozen
-test_l0_norm                                   | gpu          |     2 | ./$B/test_l0_norm
-test_gn_ema                                    | gpu          |     2 | ./$B/test_gn_ema
-test_skip_empty                                | gpu          |     2 | ./$B/test_skip_empty
-test_gfilm                                     | gpu          |     2 | ./$B/test_gfilm
+test_l0_norm                                   | gpu          |     3 | ./$B/test_l0_norm
+test_gn_ema                                    | gpu          |     4 | ./$B/test_gn_ema
+test_skip_empty                                | gpu          |     4 | ./$B/test_skip_empty
+test_gfilm                                     | gpu          |     4 | ./$B/test_gfilm
 test_widen                                     | gpu          |     8 | ./$B/test_widen
 test_l0_slab                                   | gpu          |     2 | ./$B/test_l0_slab
 test_zwin                                      | gpu          |     2 | ./$B/test_zwin
-test_l0_stream                                 | gpu          |    12 | ./$B/test_l0_stream
-test_l0_stream~L0_STREAM_POISON=1              | gpu          |    12 | UFSM_L0_STREAM_POISON=1 ./$B/test_l0_stream
+test_l0_stream                                 | gpu          |    15 | ./$B/test_l0_stream
+test_l0_stream~L0_STREAM_POISON=1              | gpu          |    16 | UFSM_L0_STREAM_POISON=1 ./$B/test_l0_stream
 test_infer_mem~part0of6                       | gpu,smoke    |     9 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=0/6 ./$B/test_infer_mem
 test_infer_mem~part1of6                       | gpu          |    12 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=1/6 ./$B/test_infer_mem
 test_infer_mem~part2of6                       | gpu          |    15 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=2/6 ./$B/test_infer_mem
@@ -78,11 +84,11 @@ test_infer_mem~part3of6                       | gpu          |    20 | UFSM_TEST
 test_infer_mem~part4of6                       | gpu          |    16 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=4/6 ./$B/test_infer_mem
 test_infer_mem~part5of6                       | gpu          |    18 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=5/6 ./$B/test_infer_mem
 test_infer_mem~full                            | gpu2,slow    |   287 | ./$B/test_infer_mem
-test_half                                      | gpu,smoke    |     2 | ./$B/test_half
-test_unwrap_targets                            | gpu          |     2 | ./$B/test_unwrap_targets
-test_fib_dir                                   | gpu          |     2 | ./$B/test_fib_dir
-test_gpu_aug                                   | gpu          |     7 | ./$B/test_gpu_aug
-test_aug_z                                     | gpu          |    37 | ./$B/test_aug_z
+test_half                                      | gpu,smoke    |     1 | ./$B/test_half
+test_unwrap_targets                            | gpu          |     1 | ./$B/test_unwrap_targets
+test_fib_dir                                   | gpu          |     1 | ./$B/test_fib_dir
+test_gpu_aug                                   | gpu          |     6 | ./$B/test_gpu_aug
+test_aug_z                                     | gpu          |    10 | ./$B/test_aug_z
 test_fit~part0of9                             | gpu          |    10 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=0/9 ./$B/test_fit
 test_fit~part1of9                             | gpu,smoke    |    10 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=1/9 ./$B/test_fit
 test_fit~part2of9                             | gpu          |    10 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=2/9 ./$B/test_fit
@@ -95,129 +101,142 @@ test_fit~part8of9                             | gpu          |    10 | UFSM_TEST
 test_fit~full                                  | slow,gpu     |  1281 | ./$B/test_fit
 test_fit_join                                  | gpu          |     9 | ./$B/test_fit_join
 test_wrap_check                                | smoke        |     1 | ./$B/test_wrap_check
-test_geom_check                                |              |     4 | ./$B/test_geom_check
-test_sheetpbr                                  |              |     3 | ./$B/test_sheetpbr
+test_geom_check                                |              |     3 | ./$B/test_geom_check
+test_sheetpbr                                  |              |     2 | ./$B/test_sheetpbr
 test_pairacc                                   |              |     1 | ./$B/test_pairacc
 test_wbench_stats                              |              |     2 | bash tests/test_wbench_stats.sh $B/ufsm
-test_gpuq                                      | flaky        |    11 | bash tests/test_gpuq.sh
-test_robust                                    | gpu          |     2 | ./$B/test_robust
-test_reg                                       |              |    30 | ./$B/test_reg
-test_reg_render                                |              |     4 | ./$B/test_reg_render
+test_run_suite                                 |              |    17 | bash tests/test_run_suite.sh
+test_lint_mgpu                                 |              |     1 | python3 tests/lint_mgpu.py
+test_gpuq                                      | flaky        |    14 | bash tests/test_gpuq.sh
+test_robust                                    | gpu          |     1 | ./$B/test_robust
+test_reg                                       |              |    27 | ./$B/test_reg
+test_reg_render                                |              |     3 | ./$B/test_reg_render
 test_regz2                                     |              |     1 | ./$B/test_regz2
-test_surf                                      | smoke        |     2 | ./$B/test_surf
-test_wraps_core                                | smoke        |     5 | ./$B/test_wraps_core
+test_surf                                      | smoke        |     3 | ./$B/test_surf
+test_wraps_core                                | smoke        |     1 | ./$B/test_wraps_core
 test_stitch                                    |              |     3 | ./$B/test_stitch
 test_fblend                                    |              |     1 | ./$B/test_fblend
-test_fields_pack                               |              |     6 | ./$B/test_fields_pack
+test_fields_pack                               |              |     2 | ./$B/test_fields_pack
 test_fields_phase                              | smoke        |     2 | ./$B/test_fields_phase
 test_ink_gate                                  |              |     2 | ./$B/test_ink_gate
-test_countfield                                | gpu          |     4 | ./$B/test_countfield
+test_countfield                                | gpu          |     6 | ./$B/test_countfield
+test_fit_dir                                   |              |     2 | ./$B/test_fit_dir
 test_vwt_sample                                |              |     1 | ./$B/test_vwt_sample
-test_spiralfit                                 | gpu          |    41 | ./$B/test_spiralfit
+test_spiralfit                                 | gpu          |    32 | ./$B/test_spiralfit
 test_tta                                       | gpu,smoke    |     1 | ./$B/test_tta
-test_predict_unwrap2                           | gpu,smoke    |     4 | ./$B/test_predict_unwrap2 ./$B/ufsm
-test_predict_fitgrid                           | gpu          |     7 | ./$B/test_predict_fitgrid ./$B/ufsm
-test_unwrap2_ink                               | gpu          |    20 | ./$B/test_unwrap2_ink ./$B/ufsm ./$B/make_wind_fixture
-test_cuda_abort                                | gpu          |    10 | bash tests/test_cuda_abort.sh ./$B/ufsm ./$B/make_wind_fixture
-test_rv                                        | gpu          |    16 | ./$B/test_rv ./$B/ufsm ./$B/make_wind_fixture
+test_predict_unwrap2                           | gpu,smoke    |     5 | ./$B/test_predict_unwrap2 ./$B/ufsm
+test_predict_fitgrid                           | gpu          |     5 | ./$B/test_predict_fitgrid ./$B/ufsm
+test_unwrap2_ink                               | gpu          |    40 | ./$B/test_unwrap2_ink ./$B/ufsm ./$B/make_wind_fixture
+test_cuda_abort                                | gpu          |    25 | bash tests/test_cuda_abort.sh ./$B/ufsm ./$B/make_wind_fixture
+test_rv                                        | gpu          |    30 | ./$B/test_rv ./$B/ufsm ./$B/make_wind_fixture
 test_heads~part0of3                           | gpu          |    15 | UFSM_TEST_PART=0/3 ./$B/test_heads ./$B/ufsm ./$B/make_wind_fixture tests/heads_ref.txt
 test_heads~part1of3                           | gpu          |    15 | UFSM_TEST_PART=1/3 ./$B/test_heads ./$B/ufsm ./$B/make_wind_fixture tests/heads_ref.txt
 test_heads~part2of3                           | gpu          |    15 | UFSM_TEST_PART=2/3 ./$B/test_heads ./$B/ufsm ./$B/make_wind_fixture tests/heads_ref.txt
 test_uw_fixed_point                             | smoke        |     1 | UFSM_UW_SELFTEST=1 ./$B/ufsm train
-test_score_par                                 |              |    31 | ./$B/test_score_par ./$B/ufsm
-test_grid_sparse                               | gpu,smoke    |     1 | ./$B/test_grid_sparse
-test_density_lambda                            | gpu          |    17 | ./$B/test_density_lambda ./$B/ufsm ./$B/make_wind_fixture
+test_score_par                                 |              |     8 | ./$B/test_score_par ./$B/ufsm
+test_grid_sparse                               | gpu,smoke    |     2 | ./$B/test_grid_sparse
+test_density_lambda                            | gpu          |    40 | ./$B/test_density_lambda ./$B/ufsm ./$B/make_wind_fixture
 test_coreline                                  | smoke        |     2 | ./$B/test_coreline
-test_fit_w4                                    | gpu          |    12 | ./$B/test_fit_w4
-test_repair                                    |              |    55 | UFSM_TEST_QUICK=1 ./$B/test_repair
+test_fit_w4                                    | gpu          |    16 | ./$B/test_fit_w4
+test_repair                                    |              |    90 | UFSM_TEST_QUICK=1 ./$B/test_repair
 test_repair~full                               | slow         |   475 | ./$B/test_repair
 test_afv                                       |              |     1 | ./$B/test_afv
-test_fiberjudge                                | smoke        |     1 | ./$B/test_fiberjudge
+test_fiberjudge                                | smoke        |     2 | ./$B/test_fiberjudge
 test_fibertrace                                |              |     1 | ./$B/test_fibertrace
-test_fibertrace_dyad                           |              |     3 | ./$B/test_fibertrace_dyad
-test_fiberraster                               | gpu          |     5 | ./$B/test_fiberraster
+test_fibertrace_dyad                           |              |     1 | ./$B/test_fibertrace_dyad
+test_fiberraster                               | gpu          |     2 | ./$B/test_fiberraster
 test_fiber_link                                |              |     1 | ./$B/test_fiber_link
-test_ftrace_gpu                                | gpu          |     3 | ./$B/test_ftrace_gpu
-test_flatten                                   |              |    16 | ./$B/test_flatten
-test_flatten_gpu                               | gpu          |    50 | ./$B/test_flatten_gpu
-test_strip                                     |              |    12 | ./$B/test_strip
-test_wrapsnap                                  |              |    10 | ./$B/test_wrapsnap
-test_wraprepair                                |              |    10 | ./$B/test_wraprepair
-test_stripdistort                              | smoke        |     1 | ./$B/test_stripdistort
-test_surflabels                                |              |    53 | ./$B/test_surflabels
-test_sheetscore                                |              |     1 | ./$B/test_sheetscore
-test_patchsolve                                |              |     4 | ./$B/test_patchsolve
-test_patchid                                   |              |    11 | ./$B/test_patchid   
-test_recto                                     |              |     2 | ./$B/test_recto
+test_ftrace_gpu                                | gpu          |     2 | ./$B/test_ftrace_gpu
+test_flatten                                   |              |    11 | ./$B/test_flatten
+test_flatten_gpu                               | gpu          |    80 | ./$B/test_flatten_gpu
+test_strip                                     |              |     4 | ./$B/test_strip
+test_wrapsnap                                  |              |     3 | ./$B/test_wrapsnap
+test_wraprepair                                |              |     4 | ./$B/test_wraprepair
+test_stripdistort                              | smoke        |     2 | ./$B/test_stripdistort
+test_surflabels                                |              |     3 | ./$B/test_surflabels
+test_sheetscore                                |              |     3 | ./$B/test_sheetscore
+test_patchsolve                                |              |     3 | ./$B/test_patchsolve
+test_patchid                                   |              |     3 | ./$B/test_patchid   
+test_recto                                     |              |     3 | ./$B/test_recto
 test_faces                                     |              |     1 | ./$B/test_faces
-test_fit_emb                                   |              |    21 | ./$B/test_fit_emb
-test_distill                                   | gpu          |     2 | ./$B/test_distill
+test_fit_emb                                   |              |    60 | ./$B/test_fit_emb
+test_distill                                   | gpu          |     1 | ./$B/test_distill
 test_tiffw                                     | smoke        |     1 | ./$B/test_tiffw
-test_render_stream                             |              |    10 | ./$B/test_render_stream
+test_render_stream                             |              |     7 | ./$B/test_render_stream
 test_imgops                                    | smoke        |     1 | ./$B/test_imgops
 test_tfx                                       |              |     1 | ./$B/test_tfx
-test_annot                                     |              |     1 | ./$B/test_annot
+test_annot                                     |              |     2 | ./$B/test_annot
 test_sheetcut                                  |              |     1 | ./$B/test_sheetcut
-test_dino_loss                                 | gpu,smoke    |     2 | ./$B/test_dino_loss
-test_dino_loss~D=16                            | gpu          |     2 | UFSM_TEST_D=16 ./$B/test_dino_loss
-test_ssl                                       | gpu          |     2 | ./$B/test_ssl
+test_dino_loss                                 | gpu,smoke    |     1 | ./$B/test_dino_loss
+test_dino_loss~D=16                            | gpu          |     1 | UFSM_TEST_D=16 ./$B/test_dino_loss
+test_ssl                                       | gpu          |     1 | ./$B/test_ssl
 test_head32                                    | gpu          |     2 | ./$B/test_head32
 test_sslstat                                   |              |     1 | ./$B/test_sslstat
 test_attn                                      | gpu          |    25 | ./$B/test_attn
-test_vwt                                       | gpu,smoke    |     2 | ./$B/test_vwt
+test_vwt                                       | gpu,smoke    |     3 | ./$B/test_vwt
 test_vwt_mv                                    | gpu          |     1 | ./$B/test_vwt_mv
 test_vwt_fast                                  | gpu          |     2 | ./$B/test_vwt_fast
-test_attn_h16                                  | gpu,smoke    |     2 | ./$B/test_attn_h16
-test_vwi                                       | gpu          |     2 | ./$B/test_vwi
+test_attn_h16                                  | gpu,smoke    |     3 | ./$B/test_attn_h16
+test_vwi                                       | gpu          |     1 | ./$B/test_vwi
 # (test_wtrunk: the trained-net checks need ~/ufsm-data/wcomb/d/paris4/ckpt/wind96-wk1-best.ckpt or UFSM_WT_CKPT; without it PARTIAL)
-test_wtrunk                                    | gpu          |     1 | ./$B/test_wtrunk
-test_attn_ray                                  | gpu          |    26 | ./$B/test_attn_ray
-test_attn_dfm                                  | gpu          |    39 | ./$B/test_attn_dfm
-test_hybrid_identity                           | gpu          |     4 | ./$B/test_hybrid_identity
-test_init_lr                                   | gpu          |     1 | ./$B/test_init_lr
-test_dinor                                     | gpu          |    27 | UFSM_TEST_QUICK=1 ./$B/test_dinor
+test_wtrunk                                    | gpu          |    10 | ./$B/test_wtrunk
+test_attn_ray                                  | gpu          |    14 | ./$B/test_attn_ray
+test_attn_ray~try6                             | gpu          |     8 | UFSM_TEST_TRY6=1 ./$B/test_attn_ray
+test_attn_dfm                                  | gpu          |    26 | ./$B/test_attn_dfm
+test_hybrid_identity                           | gpu          |     6 | ./$B/test_hybrid_identity
+test_init_lr                                   | gpu          |     3 | ./$B/test_init_lr
+test_dinor                                     | gpu          |    60 | UFSM_TEST_QUICK=1 ./$B/test_dinor
 test_dinor~full                                | gpu,slow     |   104 | ./$B/test_dinor
 test_dino_pts                                  |              |     1 | ./$B/test_dino_pts
-test_ink_splat                                 | gpu          |     8 | ./$B/test_ink_splat
-test_ink_pool                                  |              |     2 | ./$B/test_ink_pool $TMPDIR/ink_pool
-test_ink_mil                                   | gpu          |     1 | ./$B/test_ink_mil
-test_grad_ar                                   | gpu          |     2 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
-test_dcache_batch                              |              |     1 | ./$B/test_dcache_batch
-test_ink_air                                   | gpu          |     1 | ./$B/test_ink_air
-test_ink_mil_train                             | gpu          |    14 | ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture
-test_accum                                     | gpu          |    14 | tests/test_accum.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/accum
-test_tcache                                    | gpu          |    25 | tests/test_tcache.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/tcache
-test_strict_sources                            | gpu          |    10 | tests/test_strict_sources.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/strictsrc
-test_init_heads                                | gpu          |    18 | tests/test_init_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/initheads
-test_ink_mil_check                             | gpu          |    20 | ./$B/test_ink_mil_check ./$B/ufsm ./$B/make_wind_fixture
+test_ink_splat                                 | gpu          |    10 | ./$B/test_ink_splat
+test_ink_pool                                  |              |     3 | ./$B/test_ink_pool $TMPDIR/ink_pool
+test_ink_mil                                   | gpu          |     2 | ./$B/test_ink_mil
+test_grad_ar                                   | gpu          |     8 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
+test_grad_ar~2gpu                              | gpu2         |     8 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
+test_sumsq                                     | gpu          |     4 | ./$B/test_sumsq
+test_dcache_batch                              |              |     2 | ./$B/test_dcache_batch
+test_dcache_cap                                |              |     2 | ./$B/test_dcache_cap $TMPDIR/dcache_cap
+test_dcache_phase                              |              |     5 | ./$B/test_dcache_phase $TMPDIR/dcache_phase
+test_label_versions                            |              |     3 | ./$B/test_label_versions $TMPDIR/label_versions
+test_ink_air                                   | gpu          |     2 | ./$B/test_ink_air
+test_ink_mil_train                             | gpu          |    40 | ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture
+test_accum                                     | gpu          |    20 | tests/test_accum.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/accum
+test_tcache                                    | gpu          |       40 | tests/test_tcache.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/tcache
+test_strict_sources                            | gpu          |    25 | tests/test_strict_sources.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/strictsrc
+test_init_heads                                | gpu          |    25 | tests/test_init_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/initheads
+test_ink_mil_check                             | gpu          |    90 | ./$B/test_ink_mil_check ./$B/ufsm ./$B/make_wind_fixture
 test_pyports                                   |              |     1 | ./$B/test_pyports
-test_edt                                       | smoke        |     1 | ./$B/test_edt
+test_edt                                       | smoke        |     2 | ./$B/test_edt
 test_volcomp                                   | smoke        |     1 | ./$B/test_volcomp
-test_typed_zarr                                | smoke        |     5 | ./$B/test_typed_zarr
+test_typed_zarr                                | smoke        |     7 | ./$B/test_typed_zarr
 test_http_reader                               |              |    29 | python3 tests/test_http_reader.py
 test_checkpoint_runtime                        | smoke        |     1 | ./$B/test_checkpoint_runtime
-test_infer_buffers                             | gpu          |     3 | ./$B/test_infer_buffers
-test_recompute_live                            | gpu          |     3 | ./$B/test_recompute_live
-test_share_enc_a1                              | gpu          |     2 | ./$B/test_share_enc_a1
-test_pipeline_cli                              | gpu2         |    58 | python3 tests/test_pipeline_cli.py
-test_ingest_lut                                |              |     2 | python3 tests/test_ingest_lut.py
-test_ink_blend                                 |              |     3 | python3 tests/test_ink_blend.py
-test_seamless                                  |              |     8 | python3 tests/test_seamless.py
-test_cover_training                            | gpu2         |     8 | python3 tests/test_cover_training.py
-test_univ2                                     | gpu2         |    40 | tests/test_univ2.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/univ2
-test_checkpoint                                | gpu,smoke    |     1 | ./$B/test_checkpoint
-test_optimizer_owners                          | gpu          |     2 | ./$B/test_optimizer_owners
-test_wide_up_grad                              | gpu          |     3 | ./$B/test_wide_up_grad
-test_wide_up_grad~SR=0                         | gpu          |     2 | UFSM_TEST_SR=0 ./$B/test_wide_up_grad
+test_ckring                                    |              |     1 | ./$B/test_ckring
+test_gt_gate                                   |              |     3 | ./$B/test_gt_gate
+test_infer_buffers                             | gpu          |     6 | ./$B/test_infer_buffers
+test_recompute_live                            | gpu          |     7 | ./$B/test_recompute_live
+test_share_enc_a1                              | gpu          |     5 | ./$B/test_share_enc_a1
+test_pipeline_cli                              | gpu2,l2      |    85 | python3 tests/test_pipeline_cli.py
+test_ingest_lut                                |              |     3 | python3 tests/test_ingest_lut.py
+test_ink_blend                                 |              |     4 | python3 tests/test_ink_blend.py
+test_seamless                                  |              |     6 | python3 tests/test_seamless.py
+test_cover_training                            | gpu2,l2      |    16 | python3 tests/test_cover_training.py
+test_univ2                                     | gpu2,l2      |    40 | tests/test_univ2.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/univ2
+test_dp_equiv                                  | gpu2,l2      |    20 | tests/test_dp_equiv.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/dpequiv
+test_serialize                                 | gpu2,l2      |    30 | tests/test_serialize.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/serialize
+test_checkpoint                                | gpu,smoke    |     2 | ./$B/test_checkpoint
+test_optimizer_owners                          | gpu          |     3 | ./$B/test_optimizer_owners
+test_wide_up_grad                              | gpu          |     5 | ./$B/test_wide_up_grad
+test_wide_up_grad~SR=0                         | gpu          |     4 | UFSM_TEST_SR=0 ./$B/test_wide_up_grad
 test_gn_contract                               | gpu,smoke    |     2 | ./$B/test_gn_contract
 test_gn_contract~FUSED_STORED_GN=0             | gpu          |     2 | UFSM_FUSED_STORED_GN=0 ./$B/test_gn_contract
-test_stem_precision                            | gpu          |     1 | ./$B/test_stem_precision
-test_wgrad_staging                             | gpu          |     6 | ./$B/test_wgrad_staging
-test_eval                                      | smoke        |     3 | ./$B/test_eval
+test_stem_precision                            | gpu          |     2 | ./$B/test_stem_precision
+test_wgrad_staging                             | gpu          |     9 | ./$B/test_wgrad_staging
+test_eval                                      | smoke        |     4 | ./$B/test_eval
 test_sample_ops                                | smoke        |     2 | ./$B/test_sample_ops
-test_aug_preset                                | smoke        |     1 | ./$B/test_aug_preset
-test_raster                                    |              |    30 | ./$B/test_raster
-test_sampler_safety                            | smoke        |     2 | python3 tests/test_sampler_safety.py
+test_aug_preset                                | smoke        |     2 | ./$B/test_aug_preset
+test_raster                                    |              |    27 | ./$B/test_raster
+test_sampler_safety                            | smoke        |     6 | python3 tests/test_sampler_safety.py
 test_ink_ext_v8in                              | gpu,slow     |   276 | python3 tests/test_ink_ext_v8in.py
 test_ink_ext_hecate                            | gpu,slow     |   421 | python3 tests/test_ink_ext_hecate.py
 test_ink_ext_reader3                           | gpu,slow     |   104 | python3 tests/test_ink_ext_reader3.py
@@ -230,87 +249,110 @@ test_hercuvit                                  | gpu,slow     |    77 | python3 
 test_surfrecto                                 | gpu,slow     |    40 | python3 tests/test_surfrecto.py
 test_villawind                                 | gpu,slow     |   129 | python3 tests/test_villawind.py
 test_ink3d_gambiarra                           | gpu,slow     |   102 | python3 tests/test_ink3d_gambiarra.py
-test_mx_sw                                     | gpu          |     1 | ./$B/test_mx_sw
-test_mx                                        | gpu,smoke    |     1 | ./$B/test_mx
-test_mx4                                       | gpu,smoke    |     4 | ./$B/test_mx4
-test_head_tc                                   | gpu,smoke    |     2 | UFSM_TEST_QUICK=1 ./$B/test_head_tc
-test_grad_mx4                                  | gpu,smoke    |     5 | ./$B/test_grad_mx4
-test_l3_sched                                  | gpu          |     5 | ./$B/test_l3_sched
-test_grad_mx4~L0_NORM=1                        | gpu          |     6 | UFSM_L0_NORM=1 ./$B/test_grad_mx4
-test_grad_mx4~L0_NORM=2                        | gpu          |     6 | UFSM_L0_NORM=2 ./$B/test_grad_mx4
-test_grad_mx4~L0_NORM=3                        | gpu          |     5 | UFSM_L0_NORM=3 ./$B/test_grad_mx4
-test_grad_mx4~L0_NORM=4,L0_SLAB=8,L0_SLAB_KERN=1 | gpu          |     6 | UFSM_L0_NORM=4 UFSM_L0_SLAB=8 UFSM_L0_SLAB_KERN=1 ./$B/test_grad_mx4
+test_mx_sw                                     | gpu          |     2 | ./$B/test_mx_sw
+test_mx                                        | gpu,smoke    |     3 | ./$B/test_mx
+test_mx4                                       | gpu,smoke    |     5 | ./$B/test_mx4
+test_mx4_wide                                  | gpu          |    12 | UFSM_TEST_QUICK=1 ./$B/test_mx4_wide
+test_mx4_wide~full                             | gpu,slow     |    40 | ./$B/test_mx4_wide
+test_mx4~wideall                               | gpu          |    10 | TMX4_WIDE_ALL=1 ./$B/test_mx4
+test_head_tc                                   | gpu,smoke    |     3 | UFSM_TEST_QUICK=1 ./$B/test_head_tc
+test_grad_mx4                                  | gpu,smoke    |    12 | ./$B/test_grad_mx4
+test_l3_sched                                  | gpu          |     9 | ./$B/test_l3_sched
+test_grad_mx4~L0_NORM=1                        | gpu          |    10 | UFSM_L0_NORM=1 ./$B/test_grad_mx4
+test_grad_mx4~L0_NORM=2                        | gpu          |    10 | UFSM_L0_NORM=2 ./$B/test_grad_mx4
+test_grad_mx4~L0_NORM=3                        | gpu          |    11 | UFSM_L0_NORM=3 ./$B/test_grad_mx4
+test_grad_mx4~L0_NORM=4,L0_SLAB=8,L0_SLAB_KERN=1 | gpu          |    11 | UFSM_L0_NORM=4 UFSM_L0_SLAB=8 UFSM_L0_SLAB_KERN=1 ./$B/test_grad_mx4
 test_mx4~F4W_LAYOUT=1                          | gpu          |     4 | UFSM_F4W_LAYOUT=1 ./$B/test_mx4
-test_sp24_mma                                  | gpu,smoke    |     2 | ./$B/test_sp24_mma
-test_sp24_conv                                 | gpu          |    25 | ./$B/test_sp24_conv
+test_sp24_mma                                  | gpu,smoke    |     4 | ./$B/test_sp24_mma
+test_sp24_conv                                 | gpu          |     6 | ./$B/test_sp24_conv
 test_sp24_train                                | gpu          |    40 | tests/test_sp24_train.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/sp24train
-test_rc                                        | gpu          |     2 | ./$B/test_rc
-test_muon                                      | gpu,smoke    |     2 | ./$B/test_muon
-test_muonc                                     | gpu          |     2 | ./$B/test_muonc
-test_muonx                                     | gpu          |     2 | ./$B/test_muonx
+test_rc                                        | gpu          |     1 | ./$B/test_rc
+test_muon                                      | gpu,smoke    |     1 | ./$B/test_muon
+test_muonc                                     | gpu          |     3 | ./$B/test_muonc
+test_muonx                                     | gpu          |     5 | ./$B/test_muonx
 test_admuon                                    | gpu          |     2 | ./$B/test_admuon
-test_qkclip                                    | gpu          |     2 | ./$B/test_qkclip
-test_unet~FUSED_UP=0,F16=1                     | gpu          |     2 | UFSM_FUSED_UP=0 UFSM_F16=1 ./$B/test_unet
-test_unet~RECOMPUTE=2,F16=1                    | gpu          |     2 | UFSM_RECOMPUTE=2 UFSM_F16=1 ./$B/test_unet
+test_qkclip                                    | gpu          |     1 | ./$B/test_qkclip
+test_unet~FUSED_UP=0,F16=1                     | gpu          |     3 | UFSM_FUSED_UP=0 UFSM_F16=1 ./$B/test_unet
+test_unet~RECOMPUTE=2,F16=1                    | gpu          |     3 | UFSM_RECOMPUTE=2 UFSM_F16=1 ./$B/test_unet
 test_json                                      | smoke        |     1 | ./$B/test_json
 test_gns                                       | smoke        |     2 | ./$B/test_gns
 test_phasepack                                 |              |     3 | ./$B/test_phasepack
-test_nn                                        | gpu,smoke    |     4 | ./$B/test_nn
-test_unet                                      | gpu,smoke    |     2 | ./$B/test_unet
-test_unet~narrow                               | gpu          |     2 | UFSM_P=32 UFSM_ACT_MX8=1 UFSM_GRAD_MX8=1 UFSM_LEAN=2 UFSM_CHUNK_UP=2 UFSM_BIG_WIDTHS=32,64,96,64 UFSM_GRAD_TOL=0.5 ./$B/test_unet
-test_unet~SCALE_COND=1                         | gpu          |     2 | UFSM_SCALE_COND=1 ./$B/test_unet
+test_nn                                        | gpu,smoke    |    15 | ./$B/test_nn
+test_unet                                      | gpu,smoke    |     3 | ./$B/test_unet
+test_unet~narrow                               | gpu          |     5 | UFSM_P=32 UFSM_ACT_MX8=1 UFSM_GRAD_MX8=1 UFSM_LEAN=2 UFSM_CHUNK_UP=2 UFSM_BIG_WIDTHS=32,64,96,64 UFSM_GRAD_TOL=0.5 ./$B/test_unet
+test_unet~SCALE_COND=1                         | gpu          |     3 | UFSM_SCALE_COND=1 ./$B/test_unet
 test_unet~FILM=2                               | gpu          |     3 | UFSM_FILM=2 ./$B/test_unet
-test_unet~DS=1                                 | gpu          |     2 | UFSM_DS=1 ./$B/test_unet
-test_unet~EMB=3                                | gpu          |     2 | UFSM_EMB=3 ./$B/test_unet
-test_unet~EMB=3,DS=1,RECOMPUTE=2               | gpu          |     2 | UFSM_EMB=3 UFSM_DS=1 UFSM_RECOMPUTE=2 ./$B/test_unet
-test_unet~enc_blocks                           | gpu          |     2 | UFSM_ENC_BLOCKS=0,1,2 UFSM_RB_NONZERO=1 UFSM_BIG_ENC_BLOCKS=0,1,2,2 UFSM_F16=1 ./$B/test_unet
+test_unet~DS=1                                 | gpu          |     4 | UFSM_DS=1 ./$B/test_unet
+test_unet~EMB=3                                | gpu          |     4 | UFSM_EMB=3 ./$B/test_unet
+test_unet~EMB=3,DS=1,RECOMPUTE=2               | gpu          |     5 | UFSM_EMB=3 UFSM_DS=1 UFSM_RECOMPUTE=2 ./$B/test_unet
+test_unet~enc_blocks                           | gpu          |     4 | UFSM_ENC_BLOCKS=0,1,2 UFSM_RB_NONZERO=1 UFSM_BIG_ENC_BLOCKS=0,1,2,2 UFSM_F16=1 ./$B/test_unet
 test_unet~L0_NORM=1                            | gpu          |     3 | UFSM_L0_NORM=1 ./$B/test_unet
 test_unet~L0_NORM=2                            | gpu          |     3 | UFSM_L0_NORM=2 ./$B/test_unet
 test_unet~GN_EMA=1                             | gpu          |     3 | UFSM_GN_EMA=1 UFSM_DOWN_NORM=1 ./$B/test_unet
 test_unet~L0_NORM=3                            | gpu          |     3 | UFSM_L0_NORM=3 ./$B/test_unet
-test_unet~L0_NORM=4                            | gpu          |     2 | UFSM_L0_NORM=4 ./$B/test_unet
-test_unet~P=48,B=1                             | gpu          |     2 | UFSM_P=48 UFSM_B=1 ./$B/test_unet
+test_unet~L0_NORM=4                            | gpu          |     3 | UFSM_L0_NORM=4 ./$B/test_unet
+test_unet~P=48,B=1                             | gpu          |     3 | UFSM_P=48 UFSM_B=1 ./$B/test_unet
 test_unet~F16=1                                | gpu,smoke    |     3 | UFSM_F16=1 ./$B/test_unet
-test_fused                                     | gpu,smoke    |     2 | ./$B/test_fused
-test_fused~F16=1                               | gpu          |     2 | UFSM_F16=1 ./$B/test_fused
+test_unet~ATTN_PE=3                            | gpu          |     4 | UFSM_TINY=4,6,96 UFSM_ATTN_BLOCKS=1 UFSM_ATTN_PE=3 ./$B/test_unet
+test_fused                                     | gpu,smoke    |     1 | ./$B/test_fused
+test_fused~F16=1                               | gpu          |     1 | UFSM_F16=1 ./$B/test_fused
 test_split                                     | gpu2,slow    |    68 | ./$B/test_split
 test_split~policy                              | gpu2,slow    |    35 | UFSM_TEST_POLICY=all=fp4:fp4:fp8,enc0.c1=fp16 ./$B/test_split
 test_split~gn_stored                           | gpu2,slow    |    78 | UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 ./$B/test_split
 test_split~gn_stored,keep_coarse               | gpu2,slow    |    79 | UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 UFSM_RC_KEEP_COARSE=1 ./$B/test_split
-test_split~gn_stored,policy                    | gpu          |    27 | UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 UFSM_TEST_POLICY=all=fp4:fp4:fp8,enc0.c1=fp16 ./$B/test_split
-test_split_lat                                 | gpu2         |    19 | ./$B/test_split_lat
+test_split~gn_stored,policy                    | gpu          |    47 | UFSM_TEST_GN_STORED=1 UFSM_TEST_INPUT_PREC=8 UFSM_TEST_POLICY=all=fp4:fp4:fp8,enc0.c1=fp16 ./$B/test_split
+test_split_lat                                 | gpu2,l2      |    20 | ./$B/test_split_lat
 test_split_lat~gnema                           | gpu          |    15 | UFSM_TEST_GN_EMA=1 UFSM_ONLY_NET=1 ./$B/test_split_lat
-test_split_gnbwd                               | gpu,smoke    |     1 | ./$B/test_split_gnbwd
-test_formats                                   | smoke        |     2 | ./tests/test_formats.sh
+test_split_gnbwd                               | gpu,smoke    |     2 | ./$B/test_split_gnbwd
+test_formats                                   | smoke        |     1 | ./tests/test_formats.sh
 test_zarr                                      | smoke        |     1 | ./tests/test_zarr.sh
-test_predict_feather                           | gpu          |    11 | ./$B/test_predict_feather ./$B/ufsm
-test_predict_det                               | gpu          |    13 | ./$B/test_predict_det ./$B/ufsm
-test_strip_gpu                                 | gpu          |    12 | ./$B/test_strip_gpu
-test_faces_gpu                                 | gpu          |     2 | ./$B/test_faces_gpu
-test_render_fill                               | smoke        |     1 | ./$B/test_render_fill
-test_render_known                              | smoke        |     2 | ./$B/test_render_known ./$B/ufsm
-test_render_stream_gpu                         | gpu          |    26 | ./$B/test_render_stream_gpu
-test_render_fill_gpu                           | gpu          |    11 | ./$B/test_render_fill_gpu
-test_jpegpar                                   | smoke        |     3 | ./$B/test_jpegpar
-test_sysinfo                                   |              |     1 | ./$B/test_sysinfo
+test_predict_feather                           | gpu          |    10 | ./$B/test_predict_feather ./$B/ufsm
+test_predict_det                               | gpu          |    11 | ./$B/test_predict_det ./$B/ufsm
+test_strip_gpu                                 | gpu          |    10 | ./$B/test_strip_gpu
+test_faces_gpu                                 | gpu          |    10 | ./$B/test_faces_gpu
+test_render_fill                               | smoke        |    10 | ./$B/test_render_fill
+test_render_absent                             | smoke        |     1 | ./$B/test_render_absent
+test_render_known                              | smoke        |     5 | ./$B/test_render_known ./$B/ufsm
+test_render_stream_gpu                         | gpu          |    10 | ./$B/test_render_stream_gpu
+test_render_fill_gpu                           | gpu          |    12 | ./$B/test_render_fill_gpu
+test_jpegpar                                   | smoke        |    10 | ./$B/test_jpegpar
+test_sysinfo                                   |              |     5 | ./$B/test_sysinfo
 test_winauto                                   |              |     1 | ./$B/test_winauto
-test_volcomp_fast                              |              |    20 | ./$B/test_volcomp_fast
-test_z3_autosub                                | smoke        |     2 | ./$B/test_z3_autosub
-test_z3_sink                                   |              |     4 | ./$B/test_z3_sink
-test_replay_lean                               |              |     6 | ./$B/test_replay_lean
-test_gpudec                                    | gpu,smoke    |    26 | ./$B/test_gpudec
-test_ct_gpu_decode                             | gpu          |    22 | bash tests/test_ct_gpu_decode.sh ./$B/ufsm ./$B/make_wind_fixture
-test_vcgpu                                     | gpu,smoke    |     2 | ./$B/test_vcgpu
-test_lat                                       | gpu,smoke    |     2 | ./$B/test_lat
-test_latents                                   | gpu          |    47 | bash tests/test_latents.sh ./$B/ufsm ./$B/make_wind_fixture
-test_latvol                                    | gpu          |    18 | ./$B/test_latvol
-test_latvol_sh                                 | gpu          |   101 | bash tests/test_latvol.sh ./$B/ufsm ./$B/make_wind_fixture ./$B/test_latvol_nolink
-test_lat_direct                                | gpu          |    30 | bash tests/test_lat_direct.sh ./$B/ufsm ./$B/make_wind_fixture
-test_lat_fuse                                  | gpu          |     1 | ./$B/test_lat_fuse
-test_phase_onfly                               | gpu          |    14 | tests/test_phase_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/onfly
-test_fibre_onfly                               | gpu          |    16 | tests/test_fibre_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibonfly
-test_codes_onfly                               | gpu,smoke    |     8 | tests/test_codes_onfly.sh ./$B/ufsm $TMPDIR/codesonfly
-test_mesh_phase                                | gpu          |    19 | tests/test_mesh_phase.sh ./$B/ufsm ./$B/test_mesh_phase $TMPDIR/meshphase
-test_lldec                                     | gpu,smoke    |     4 | ./$B/test_lldec $TMPDIR/lldec
+test_volcomp_fast                              |              |    25 | ./$B/test_volcomp_fast
+test_z3_autosub                                | smoke        |    10 | ./$B/test_z3_autosub
+test_z3_sink                                   |              |    10 | ./$B/test_z3_sink
+test_replay_lean                               |              |    15 | ./$B/test_replay_lean
+test_gpudec                                    | gpu,smoke    |    10 | ./$B/test_gpudec
+test_ct_gpu_decode                             | gpu          |    30 | bash tests/test_ct_gpu_decode.sh ./$B/ufsm ./$B/make_wind_fixture
+test_vcgpu                                     | gpu,smoke    |     5 | ./$B/test_vcgpu
+test_lat                                       | gpu,smoke    |     1 | ./$B/test_lat
+test_latents                                   | gpu          |    25 | bash tests/test_latents.sh ./$B/ufsm ./$B/make_wind_fixture
+test_latvol                                    | gpu          |     6 | ./$B/test_latvol
+test_latvol_sh                                 | gpu          |    60 | bash tests/test_latvol.sh ./$B/ufsm ./$B/make_wind_fixture ./$B/test_latvol_nolink
+test_lat_direct                                | gpu          |    60 | bash tests/test_lat_direct.sh ./$B/ufsm ./$B/make_wind_fixture
+test_lat_fuse                                  | gpu          |     2 | ./$B/test_lat_fuse
+test_phase_onfly                               | gpu          |    20 | tests/test_phase_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/onfly
+test_fibre_onfly                               | gpu          |    25 | tests/test_fibre_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibonfly
+test_codes_onfly                               | gpu,smoke    |    10 | tests/test_codes_onfly.sh ./$B/ufsm $TMPDIR/codesonfly
+test_codes_grid                                |              |     2 | ./$B/test_codes_grid $TMPDIR/codesgrid
+test_mesh_phase                                | gpu          |     8 | tests/test_mesh_phase.sh ./$B/ufsm ./$B/test_mesh_phase $TMPDIR/meshphase
+test_lldec                                     | gpu,smoke    |     3 | ./$B/test_lldec $TMPDIR/lldec
 test_echo                                      | gpu          |    40 | tests/test_echo.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/echo
 test_lab_early_split                           | gpu          |    40 | tests/test_lab_early_split.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/labearlysplit
+# the sanitize group (ops audit #9): compute-sanitizer racecheck (shared-memory hazards) / synccheck (barrier misuse) on small GPU tests
+test_ink_mil~racecheck                         | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_ink_mil
+test_ink_mil~synccheck                         | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_ink_mil
+test_skip_empty~racecheck                      | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_skip_empty
+test_skip_empty~synccheck                      | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_skip_empty
+test_lat_head~racecheck                        | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_lat_head
+test_lat_head~synccheck                        | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_lat_head
+test_fstem~racecheck                           | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_fstem
+test_fstem~synccheck                           | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_fstem
+test_gyrec~racecheck                           | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_gyrec
+test_gyrec~synccheck                           | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_gyrec
+test_gram~racecheck                            | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_gram
+test_gram~synccheck                            | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_gram
+test_pgrad~racecheck                           | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_pgrad
+test_pgrad~synccheck                           | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_pgrad
+test_w4dev~racecheck                           | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_w4dev
+test_w4dev~synccheck                           | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_w4dev
