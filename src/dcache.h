@@ -33,3 +33,7 @@ void dcache_get_stats(dcache_stats *st);   /* process-wide sums over every cache
 /* one eviction pass over a cache root (the background thread's; tests): LRU key dirs deleted while the root is over UFSM_DCACHE_GB or its
    filesystem under UFSM_DCACHE_FREE_GB, keys used within UFSM_DCACHE_PROTECT_MIN kept. 1: another process holds the root's lock */
 int dcache_evict_pass(const char *root);
+/* the near-lossless phase codec on a cached phase array (values 0..251 known, 255 unknown): cells stored as UDC2, every voxel within
+   delta (circular, period 252) of the computed phase, the unknown mask exact; the memory copy is the same reconstruction. delta 0:
+   exact (UDC1). Put delta in the array's key (lossy and exact cells never share a dir). Set before the first read. 0 ok */
+int dcache_set_phase(z3 *z, int delta);

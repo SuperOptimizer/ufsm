@@ -183,6 +183,7 @@ test_ink_mil                                   | gpu          |     2 | ./$B/tes
 test_grad_ar                                   | gpu          |     3 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
 test_dcache_batch                              |              |     2 | ./$B/test_dcache_batch
 test_dcache_cap                                |              |     2 | ./$B/test_dcache_cap $TMPDIR/dcache_cap
+test_dcache_phase                              |              |     5 | ./$B/test_dcache_phase $TMPDIR/dcache_phase
 test_ink_air                                   | gpu          |     2 | ./$B/test_ink_air
 test_ink_mil_train                             | gpu          |    40 | ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture
 test_accum                                     | gpu          |    20 | tests/test_accum.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/accum

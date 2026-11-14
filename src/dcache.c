@@ -16,6 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
+#include "volcomp.h"
 
 struct dc;
 typedef struct dent { int64_t key; uint8_t *data; uint8_t cval; int busy, failed, refs; struct dc *own; struct dent *prev, *next, *hnext; } dent;
@@ -23,7 +24,7 @@ typedef struct dent { int64_t key; uint8_t *data; uint8_t cval; int busy, failed
    source under one budget); the pool's mutex guards the LRU and every member array's hash */
 struct dcache_pool { pthread_mutex_t mu; pthread_cond_t cv; dent *head, *tail; size_t bytes, cap; int shared; };
 typedef struct dc {
-    unsigned magic; int batch;   /* batch: the edge (voxels) up to which a read's missed cells are computed as one box (dcache_set_batch) */
+    unsigned magic; int batch, pdelta;   /* pdelta: the near-lossless phase codec's bound (dcache_set_phase; 0 exact) */   /* batch: the edge (voxels) up to which a read's missed cells are computed as one box (dcache_set_batch) */
     z3 *in; int C, fill; int64_t shape[3], gc[3]; char *dir;   /* dir: ROOT/<hash> or nullptr (memory only) */
     dcache_pool *P; dent **hash; size_t nhash; _Atomic int disk_warned; _Atomic int64_t touched;   /* touched: the key dir's last-use stamp (s) */
 } dc;
@@ -57,29 +58,93 @@ static void evict(dcache_pool *P) {   /* (mu held) drop unreferenced tail entrie
         v = pv;
     }
 }
-/* the disk file of a cell: "UDC1", u32 C, u8 kind (0 constant, 1 zstd), u8 value, u16 0, u32 payload bytes, payload */
+/* ---- the near-lossless phase codec (2026-11-14, the user: store the cached phase lossily) ----
+   A phase cell (values 0..251 known, 255 unknown) as "UDC2": the unknown mask exact (volcomp's lossless mask, mode 5, per 128^3 chunk)
+   and the known voxels in raster order predicted from their already reconstructed neighbours (planar x + y - xy modulo 252 where all
+   three are known, else x, y, z, else 0), the circular residual quantised to steps of 2 delta + 1 (|error| <= delta per voxel, the
+   reconstruction fed back so nothing drifts), zigzagged, zstd 3. The memory LRU holds the reconstruction too, so a label never
+   depends on whether its cell came from disk. 25 real cells (try6's sources): exact zstd 3.0x; delta 1 5.2x, 2 5.8x, 3 6.4x. */
+enum { PH_P = 252, PH_U = 255 };
+static inline int ph_mod(int a) { a %= PH_P; return a < 0 ? a + PH_P : a; }
+static inline int ph_pred(const uint8_t *r, size_t i, int x, int y, int z, int C) {
+    const int a = x ? r[i - 1] : PH_U, b = y ? r[i - C] : PH_U, c = x && y ? r[i - C - 1] : PH_U, e = z ? r[i - (size_t)C * C] : PH_U;
+    return a != PH_U && b != PH_U && c != PH_U ? ph_mod(a + b - c) : a != PH_U ? a : b != PH_U ? b : e != PH_U ? e : 0;
+}
+/* data (C^3) -> its reconstruction in place, and the UDC2 payload (malloc'd) in *out; -1: not a phase cell (a value 252..254) or C % 128 */
+static int ph_encode(int C, int d, uint8_t *data, uint8_t **out, uint32_t *out_n) {
+    const size_t n = (size_t)C * C * C; if (C % 128 || d < 1 || d > 20) return -1;
+    for (size_t i = 0; i < n; i++) if (data[i] >= PH_P && data[i] != PH_U) return -1;
+    const int K = C / 128, st = 2 * d + 1; uint8_t *res = malloc(n), *mk = malloc(VOLCOMP_CHUNK_VOXELS), *mb = malloc((size_t)K * K * K * VOLCOMP_MASK_LL_BOUND + 4 * K * K * K);
+    if (!res || !mk || !mb) { free(res); free(mk); free(mb); return -1; }
+    size_t mn = 0;
+    for (int cz = 0; cz < K; cz++) for (int cy = 0; cy < K; cy++) for (int cx = 0; cx < K; cx++) {
+        for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) { const uint8_t *s = data + (((size_t)(cz * 128 + z) * C + cy * 128 + y) * C + cx * 128); uint8_t *m = mk + ((size_t)z * 128 + y) * 128; for (int x = 0; x < 128; x++) m[x] = s[x] != PH_U; }
+        size_t on = 0; if (volcomp_mask_encode_lossless(mk, mb + mn + 4, VOLCOMP_MASK_LL_BOUND, &on)) { free(res); free(mk); free(mb); return -1; }
+        const uint32_t o32 = (uint32_t)on; memcpy(mb + mn, &o32, 4); mn += 4 + on;
+    }
+    size_t nk = 0;
+    for (int z = 0; z < C; z++) for (int y = 0; y < C; y++) for (int x = 0; x < C; x++) {
+        const size_t i = ((size_t)z * C + y) * C + x; if (data[i] == PH_U) continue;
+        const int pr = ph_pred(data, i, x, y, z, C); int r = data[i] - pr; if (r > PH_P / 2) r -= PH_P; if (r < -(PH_P / 2)) r += PH_P;
+        const int q = r >= 0 ? (r + d) / st : -((-r + d) / st);
+        data[i] = (uint8_t)ph_mod(pr + q * st); res[nk++] = (uint8_t)(q >= 0 ? 2 * q : -2 * q - 1);
+    }
+    const size_t zc = ZSTD_compressBound(nk ? nk : 1); uint8_t *o = malloc(mn + 8 + zc); if (!o) { free(res); free(mk); free(mb); return -1; }
+    memcpy(o, mb, mn); const size_t zr = ZSTD_compress(o + mn + 8, zc, res, nk ? nk : 1, 3);
+    free(res); free(mk); free(mb); if (ZSTD_isError(zr)) { free(o); return -1; }
+    const uint32_t nk32 = (uint32_t)nk, zr32 = (uint32_t)zr; memcpy(o + mn, &nk32, 4); memcpy(o + mn + 4, &zr32, 4);
+    *out = o; *out_n = (uint32_t)(mn + 8 + zr); return 0;
+}
+static uint8_t *ph_decode(int C, int d, const uint8_t *p, size_t pn) {
+    const size_t n = (size_t)C * C * C; const int K = C / 128, st = 2 * d + 1; if (C % 128) return nullptr;
+    uint8_t *v = malloc(n), *mk = malloc(VOLCOMP_CHUNK_VOXELS), *res = nullptr; size_t at = 0; int ok = v && mk;
+    for (int cz = 0; ok && cz < K; cz++) for (int cy = 0; ok && cy < K; cy++) for (int cx = 0; ok && cx < K; cx++) {
+        uint32_t on; if (at + 4 > pn) { ok = 0; break; } memcpy(&on, p + at, 4); at += 4;
+        if (at + on > pn || volcomp_decode(p + at, on, mk, VOLCOMP_CHUNK_VOXELS)) { ok = 0; break; } at += on;
+        for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) { uint8_t *s = v + (((size_t)(cz * 128 + z) * C + cy * 128 + y) * C + cx * 128); const uint8_t *m = mk + ((size_t)z * 128 + y) * 128; for (int x = 0; x < 128; x++) s[x] = m[x] ? 0 : PH_U; }
+    }
+    uint32_t nk = 0, zr = 0;
+    if (ok && at + 8 <= pn) { memcpy(&nk, p + at, 4); memcpy(&zr, p + at + 4, 4); at += 8; } else ok = 0;
+    if (ok && (at + zr > pn || !(res = malloc(nk ? nk : 1)) || ZSTD_decompress(res, nk ? nk : 1, p + at, zr) != (nk ? nk : 1))) ok = 0;
+    size_t k = 0;
+    for (int z = 0; ok && z < C; z++) for (int y = 0; y < C; y++) for (int x = 0; x < C; x++) {
+        const size_t i = ((size_t)z * C + y) * C + x; if (v[i] == PH_U) continue;
+        if (k >= nk) { ok = 0; break; }
+        const int u = res[k++], q = u & 1 ? -((u + 1) >> 1) : u >> 1;
+        v[i] = (uint8_t)ph_mod(ph_pred(v, i, x, y, z, C) + q * st);
+    }
+    if (ok && k != nk) ok = 0;
+    free(mk); free(res); if (!ok) { free(v); return nullptr; } return v;
+}
+/* the disk file of a cell: "UDC1", u32 C, u8 kind (0 constant, 1 zstd), u8 value, u16 0, u32 payload bytes, payload; "UDC2": the same
+   header, kind 2, u8 delta, then per 128^3 chunk u32 bytes + its mode-5 mask, u32 known voxels, u32 bytes + the zstd residuals */
 static void cell_path(const dc *c, int64_t cz, int64_t cy, int64_t cx, char *p, size_t np) { snprintf(p, np, "%s/%lld/%lld.%lld", c->dir, (long long)cz, (long long)cy, (long long)cx); }
 static int disk_get(const dc *c, const char *p, uint8_t **data, uint8_t *cval) {
     FILE *f = fopen(p, "rb"); if (!f) return -1;
     uint8_t h[16]; int rc = -1; uint8_t *zb = nullptr, *d = nullptr;
-    if (fread(h, 1, 16, f) != 16 || memcmp(h, "UDC1", 4)) goto out;
+    if (fread(h, 1, 16, f) != 16 || (memcmp(h, "UDC1", 4) && memcmp(h, "UDC2", 4))) goto out;
     uint32_t C, nz; memcpy(&C, h + 4, 4); memcpy(&nz, h + 12, 4);
     if ((int)C != c->C) goto out;
     if (h[8] == 0) { *data = nullptr; *cval = h[9]; rc = 0; goto out; }
+    if (!memcmp(h, "UDC2", 4)) {   /* (a near-lossless phase cell: only for an array of the same delta) */
+        if (h[8] != 2 || h[9] != c->pdelta || !(zb = malloc(nz ? nz : 1)) || fread(zb, 1, nz, f) != nz || !(d = ph_decode(c->C, c->pdelta, zb, nz))) goto out;
+        *data = d; d = nullptr; rc = 0; goto out; }
+    if (c->pdelta) goto out;   /* (an exact cell under a lossy array: never mixed, the keys differ; a miss) */
     if (h[8] != 1 || !(zb = malloc(nz ? nz : 1)) || fread(zb, 1, nz, f) != nz || !(d = malloc(cbytes(c)))) goto out;
     if (ZSTD_decompress(d, cbytes(c), zb, nz) != cbytes(c)) goto out;
     *data = d; d = nullptr; rc = 0;
 out:
     fclose(f); free(zb); free(d); return rc;
 }
-static int disk_put(dc *c, int64_t cz, const char *p, const uint8_t *data, uint8_t cval) {
+static int disk_put(dc *c, int64_t cz, const char *p, const uint8_t *data, uint8_t cval, uint8_t *ph, uint32_t phn) {   /* ph: a UDC2 payload (owned) */
     char dd[1200], tmp[1300]; snprintf(dd, sizeof dd, "%s/%lld", c->dir, (long long)cz);
-    if (mkdirs(dd)) return -1;
+    if (mkdirs(dd)) { free(ph); return -1; }
     snprintf(tmp, sizeof tmp, "%s.%d.%lx.tmp", p, (int)getpid(), (unsigned long)pthread_self());
     uint8_t h[16] = {'U', 'D', 'C', '1'}; const uint32_t C = (uint32_t)c->C; memcpy(h + 4, &C, 4);
     uint8_t *zb = nullptr; uint32_t nz = 0;
-    if (data) {
-        const size_t cap = ZSTD_compressBound(cbytes(c)); zb = malloc(cap); if (!zb) return -1;
+    if (ph) { zb = ph; nz = phn; h[2] = 'C'; h[3] = '2'; h[8] = 2; h[9] = (uint8_t)c->pdelta; }
+    else if (data) {
+        const size_t cap = ZSTD_compressBound(cbytes(c)); zb = malloc(cap); if (!zb) return -1;   /* (ph is nullptr here) */
         const size_t r = ZSTD_compress(zb, cap, data, cbytes(c), 3); if (ZSTD_isError(r)) { free(zb); return -1; }
         nz = (uint32_t)r; h[8] = 1;
     } else { h[8] = 0; h[9] = cval; }
@@ -250,13 +315,16 @@ static void cell_computed(dc *c, dent *e, uint8_t *data) {
     size_t k = 1; const size_t nb = cbytes(c); uint8_t cval = 0;
     while (k < nb && data[k] == data[0]) k++;
     if (k == nb) { cval = data[0]; free(data); data = nullptr; atomic_fetch_add(&g_dc.fill, 1); }   /* constant cells (most: no labels in reach) */
+    uint8_t *ph = nullptr; uint32_t phn = 0;
+    if (data && c->pdelta > 0 && ph_encode(c->C, c->pdelta, data, &ph, &phn)) ph = nullptr;   /* (data is now the reconstruction: memory == disk) */
     atomic_fetch_add(&g_dc.comp, 1);
     char p[1300]; int64_t cz;
     if (c->dir && !disk_room(c->dir)) atomic_fetch_add(&g_cap.skipped, 1);
     else if (c->dir) { cell_path_k(c, e->key, p, sizeof p, &cz);
         if (atomic_load(&g_dc.evicted)) { pthread_mutex_lock(&g_ev.mu); if (ev_has(phash(p))) atomic_fetch_add(&g_dc.recomp, 1); pthread_mutex_unlock(&g_ev.mu); }   /* (a failed write is retried on the next cell: the state recovers once space returns) */
-        if (disk_put(c, cz, p, data, cval) && !atomic_exchange(&c->disk_warned, 1)) fprintf(stderr, "dcache: cannot write %s (%s): this cell in memory only (later cells retried; warned once)\n", p, strerror(errno)); }
-    e->data = data; e->cval = cval;
+        if (disk_put(c, cz, p, data, cval, ph, phn) && !atomic_exchange(&c->disk_warned, 1)) fprintf(stderr, "dcache: cannot write %s (%s): this cell in memory only (later cells retried; warned once)\n", p, strerror(errno));
+        ph = nullptr; }
+    free(ph); e->data = data; e->cval = cval;
 }
 /* a claimed cell done: ok -> ready (referenced), else failed (nullptr) */
 static dent *cell_finish(dc *c, dent *e, int ok) {
@@ -370,6 +438,11 @@ static int dc_read(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], 
     return 0;
 }
 #define DC_MAGIC 0x44434331u
+int dcache_set_phase(z3 *z, int delta) {
+    dc *c = z ? (dc *)z3_derived_ctx(z) : nullptr;
+    if (!c || c->magic != DC_MAGIC || delta < 0 || delta > 20) return -1;
+    c->pdelta = delta; return 0;
+}
 int dcache_set_batch(z3 *z, int edge) {
     dc *c = z ? (dc *)z3_derived_ctx(z) : nullptr;
     if (!c || c->magic != DC_MAGIC) return -1;

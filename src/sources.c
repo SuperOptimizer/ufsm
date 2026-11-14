@@ -13,6 +13,7 @@
 [[gnu::weak]] const char *dcache_default_dir(void);
 [[gnu::weak]] z3 *z3_open_cached(z3 *, const char *, const char *, int, size_t);
 [[gnu::weak]] int dcache_set_batch(z3 *, int);
+[[gnu::weak]] int dcache_set_phase(z3 *, int);
 [[gnu::weak]] z3 *z3_open_cached_pool(z3 *, const char *, const char *, int, dcache_pool *);
 [[gnu::weak]] dcache_pool *dcache_pool_shared(const char *, size_t);
 /* the computed cells of every onfly phase array share one memory LRU (dcache pool "phase", 2026-11-13): a private 1 GB LRU per spec
@@ -190,7 +191,10 @@ static z3 *onfly_phase_of(z3 *cz, float rm, const char *key, const json *of) {
        (10 workers made no P 1280 batch in 8 minutes on the pod); cells of >= 3 rmax (up to 512: 4.3x at rmax 160) */
     int cell = (int)json_num(json_get(of, "cache_cell"), 0);
     if (cell <= 0) { cell = 128; while (cell < 3 * rm && cell < 512) cell *= 2; }
+    /* UFSM_DCACHE_PHASE_DELTA (or "cache_delta"): the cells near-lossless within +-delta (dcache_set_phase; 0 exact, the old key) */
+    const char *pde = getenv("UFSM_DCACHE_PHASE_DELTA"); const int pdelta = (int)json_num(json_get(of, "cache_delta"), pde && *pde ? atoi(pde) : 0);
     char k2[1200]; snprintf(k2, sizeof k2, "phase-onfly-pair-v1 rmax %.9g codes %s cell %d", rm, key, cell);   /* (the cell size: the disk files' layout) */
+    if (pdelta > 0 && dcache_set_phase) { const size_t l = strlen(k2); snprintf(k2 + l, sizeof k2 - l, " near-lossless delta %d", pdelta); }
     dcache_pool *pp = json_get(of, "cache_mb") || !z3_open_cached_pool ? nullptr : phase_pool();   /* (an explicit "cache_mb": that spec's own LRU, as before) */
     z3 *zc = pp ? z3_open_cached_pool(z, dcd && *dcd ? dcd : nullptr, k2, cell, pp) : z3_open_cached(z, dcd && *dcd ? dcd : nullptr, k2, cell, (size_t)json_num(json_get(of, "cache_mb"), 1024));
     /* a read's missed cells computed together in boxes of up to "cache_batch" voxels (UFSM_DC_BATCH; default 384: 3^3 cells of 128, the halo
@@ -198,6 +202,7 @@ static z3 *onfly_phase_of(z3 *cz, float rm, const char *key, const json *of) {
     const char *eb = getenv("UFSM_DC_BATCH");
     const int be = (int)json_num(json_get(of, "cache_batch"), eb && *eb ? atof(eb) : 384);
     if (zc && be > 0 && dcache_set_batch) dcache_set_batch(zc, be);
+    if (zc && pdelta > 0 && dcache_set_phase && dcache_set_phase(zc, pdelta)) fprintf(stderr, "sources: phase onfly: the near-lossless cache (delta %d) is not available on this array\n", pdelta);
     return zc;
 }
 /* an "onfly" phase spec ({root, key, rmax[, pool2]}, {meshes, rmax}, or {"sets": [...], "tol"}) opened with `extra` more 2x levels of its
