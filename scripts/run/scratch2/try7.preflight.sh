@@ -21,10 +21,12 @@ if [ "${1:-}" != --after ]; then
   systemctl --user is-active ufsm-health@scratch2 > /dev/null 2>&1 && good "health service active" || bad "ufsm-health@scratch2 not active"
 else
   H=$R/s2ctl.log.dry-holdouts; F=$R/s2ctl.log.dry-last.log; [ -f $F ] || { echo "FAIL: no dry log $F"; exit 1; }
-  n=$(python3 -I -c "import json; print(sum(1 for x in json.load(open('$SRCJ'))['sources'] if x['weight'] > 0))")
-  h=$(grep -cE '[1-9][0-9]* held-out boxes from .*holdouts-20261114.json' $F); z=$(grep -cE '(^|[^0-9])0 held-out boxes from' $F)
-  [ "$h" -ge "$n" ] && [ "$z" = 0 ] && good "$h sources with held-out boxes (>= $n weighted sources), none with 0" || bad "held-out lines: $h with boxes, $z with 0, $n weighted sources"
-  grep -q "lies outside the CT" $F && bad "'lies outside the CT' in the dry log" || good "no box outside the CT"
-  grep -qE "val by (source|scroll)" $F && good "val by source / scroll lines" || bad "no 'val by source / scroll' line in the dry log"
+  # (audit-data's format: "sources: <name>: <N> held-out boxes from <path> (...)"; every source prints it, weight 0 included)
+  n=$(python3 -I -c "import json; print(len(json.load(open('$SRCJ'))['sources']))")
+  h=$(grep -E '^sources: .*: [1-9][0-9]* held-out boxes from .*holdouts-20261114.json' $F | sed -E 's/^sources: (.*): [0-9]+ held-out boxes.*/\1/' | sort -u | wc -l)
+  z=$(grep -cE '^sources: .*: 0 held-out boxes from' $F)
+  [ "$h" -ge "$n" ] && [ "$z" = 0 ] && good "$h of $n sources with held-out boxes, none with 0" || bad "held-out lines: $h of $n sources with boxes, $z with 0"
+  grep -qE "^sources: .*: held-out box .* lies outside the CT" $F && bad "'lies outside the CT' in the dry log" || good "no box outside the CT"
+  grep -qE "^val by source \(" $F && grep -qE "^val by scroll \(" $F && good "val by source / scroll lines" || bad "no 'val by source / scroll' line in the dry log"
 fi
 [ $ok = 1 ] && echo "PREFLIGHT OK" || echo "PREFLIGHT FAILED"; [ $ok = 1 ]
