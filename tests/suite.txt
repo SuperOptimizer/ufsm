@@ -233,6 +233,7 @@ test_mx                                        | gpu,smoke    |     3 | ./$B/tes
 test_mx4                                       | gpu,smoke    |     5 | ./$B/test_mx4
 test_head_tc                                   | gpu,smoke    |     3 | UFSM_TEST_QUICK=1 ./$B/test_head_tc
 test_hgscale                                   | gpu          |     3 | ./$B/test_hgscale
+test_hgsdev                                    | gpu          |     2 | ./$B/test_hgsdev
 test_grad_mx4                                  | gpu,smoke    |    12 | ./$B/test_grad_mx4
 test_l3_sched                                  | gpu          |     9 | ./$B/test_l3_sched
 test_grad_mx4~L0_NORM=1                        | gpu          |    10 | UFSM_L0_NORM=1 ./$B/test_grad_mx4

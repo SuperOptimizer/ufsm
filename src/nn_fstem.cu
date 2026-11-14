@@ -193,11 +193,12 @@ __global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, 
 }
 /* the blocks' partial rows added in block order (deterministic: float atomics made --det runs differ in the last bits, which a discrete
    choice later amplified -- the 2-GPU threads gate caught it) */
-__global__ void fstem_red_k(const float *__restrict__ part, int nb, int npar, float *__restrict__ gp, float inv) {
+__global__ void fstem_red_k(const float *__restrict__ part, int nb, int npar, float *__restrict__ gp, const float *__restrict__ hp) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= npar) return;
+    const float inv = hp ? hp[1] : 1.f;
     float s = 0.f; for (int b = 0; b < nb; b++) s += part[(size_t)b * npar + i];
-    gp[i] += inv * s;   /* inv: 1 / the head plane scale (g_hgs, a power of two: exact; 1 = the old sums' bits) */
+    gp[i] += inv * s;   /* inv: 1 / the head plane scale (GSHP's [1], a power of two: exact; 1 = the old sums' bits) */
 }
 static fs_chs fs_list(const int *chs, int nout) { fs_chs l; for (int o = 0; o < FS_MAXO; o++) l.c[o] = o < nout ? chs[o] : 0; return l; }
 static int fs_ok(int D, int H, int W, int z0, int nz, int C, int nout) {
@@ -218,6 +219,6 @@ extern "C" int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, 
     const size_t need = (size_t)nbk * npar;
     if (need > cap[dv]) { if (part[dv]) cudaFree(part[dv]); if (cudaMalloc(&part[dv], need * 4) != cudaSuccess) { fprintf(stderr, "nn_fstem_bwd: no device memory\n"); abort(); } cap[dv] = need; }
     fstem_bwd_k<<<nbk, FS_BT>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (const f16 *)g, ns, part[dv]); KCHECK();
-    fstem_red_k<<<(npar + 127) / 128, 128>>>(part[dv], (int)nbk, npar, gp, 1.f / g_hgs); KCHECK();   /* (g reads the head planes: their scale out) */
+    fstem_red_k<<<(npar + 127) / 128, 128>>>(part[dv], (int)nbk, npar, gp, GSHP); KCHECK();   /* (g reads the head planes: their scale out) */
     return 0;
 }

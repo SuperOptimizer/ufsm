@@ -6,6 +6,35 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Head-gradient plane scale chosen on the device: no host sync (2026-11-14, branch hgsdev-20261114)
+
+Follow-up to the section below (main, audit pass 2): hgs_choose cost one nn_sync and nine small readbacks per window between the
+statistics pass and the gradient pass, a full drain of the card's queue each step.
+- **Now:** hgs.h holds the bound and the exponent rule as inline functions; nn_hgs.cu (a UFSM_STRICT_UNITS unit: IEEE division, no FMA
+  contraction, no flush, like the host C at -ffp-contract=off) runs them in a 1-thread kernel on the loss scratches in place and writes
+  {s, 1 / s} into a 4-float device buffer per GPU (d->hgsd). No host sync.
+  - Host-known terms (lambdas x source weights, the gradient scale, the MIL term 8 |lambda| gs / nmil) go in as kernel arguments
+    (hgs_args); device terms are the scratch pointers and the wind4 fin.
+  - The producers take the device pointer (GSHP, a trailing `const float *hp = nullptr` on loss_grad_k, loss_grad_pk_k, aff_grad_k,
+    w4_grad_k, count_apply_k, sheet_scatter_k, lat_fuse_k; the MIL fin via ink_mil_set_scale_dev). Each kernel does `scale =
+    __fmul_rn(scale, hp[0])` on entry: the host used to pass lambda x (gscale x s), the kernel now forms (lambda x gscale) x s, which is
+    the same float because s is a power of two and nothing over- or underflows. __fmul_rn so the product is never contracted into an add.
+  - The consumers read 1 / s from the buffer: nn_head_bwd_z (weights x 1 / s, gw / gb x s before and x 1 / s after, now as small
+    kernels on the buffer instead of nn_scale with a host value), fstem_red_k.
+  - The MIL loss for the log: fin's scale carries s, so the fetch divides by a device copy of s taken at fin time (hgsd[2]: the next
+    window may choose again before the fetch).
+- **One deliberate change in the exponent rule:** k = floor(log2(512 / b)) is now taken from frexpf's exponent (exact) instead of
+  floorf(log2f()). log2f can round a quotient that lies within an ulp below 2^k up to exactly k, which made s b slightly exceed 2^9. Apart
+  from such quotients, the two rules agree; test_hgsdev counts how often the old one differed.
+- **Checks:**
+  - UFSM_HGS_CHECK=1 (train): after the device choice, sync, read the same scratches back, run the host function, and compare
+    {s, 1 / s} bit for bit (exit 1 on a mismatch).
+  - test_hgsdev: (1) 4000 random windows (1-8 scratches of 1 / 2 / 7 channels, mask sums partly below 1, fin scales 2^-40 .. 2^10,
+    signed lambdas, dice / recall, wind4 1 / N, MIL, gradient scales 2^0 .. 2^20): device == host bits. (2) b = 512 / 2^k and one ulp
+    either side for k 0 .. 31, and 0 / -1 / inf / NaN / 1e-40 / 1e30 / 1e-30: device == host, plus the exponent rule itself.
+  - test_hgscale unchanged: its nn_set_head_gscale(s) now fills a per-device {s, 1 / s} buffer and sets the same pointer, so its
+    producer / fstem / head byte-equality checks run the device-pointer path.
+
 ## Head-gradient plane scale: the latent head's loss gradients out of fp16's subnormals (2026-11-14, branch hgscale-20261114)
 
 Audit 2026-11-14 (kernels.md #1 / #2, net.md #1, train.md #1).

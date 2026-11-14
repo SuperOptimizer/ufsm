@@ -375,8 +375,11 @@ float nn_get_grad_scale(void);
 /* the head-gradient plane scale (power of two, default 1): the loss-gradient kernels write their fp16 planes at grad scale x s, the head
    backward (nn_head_bwd_z) and the fine stem's backward (nn_fstem_bwd) divide s out exactly; per host thread. train.c sets it around the
    head's gradient pass (head_slab_pass hgs_choose) */
-void nn_set_head_gscale(float s);
-float nn_get_head_gscale(void);
+void nn_set_head_gscale(float s);              /* tests: a host value (synchronous copy to a per-device buffer; 1: off) */
+void nn_set_head_gscale_dev(const float *p);   /* train.c: device {s, 1 / s} from nn_hgs_choose (nullptr: off) */
+const float *nn_get_head_gscale_dev(void);
+struct hgs_args;
+void nn_hgs_choose(const struct hgs_args *a, float *out);   /* hgs.h: the choice on the device into out {s, 1 / s}, no host sync */
 
 /* ---- conv3d: weight [cout][cin][k][k][k], bias [cout] or nullptr, pad k/2, stride 1 or 2 ---- */
 shape5 nn_conv3d_out_shape(shape5 xs, int cout, int k, int stride);

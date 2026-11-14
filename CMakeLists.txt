@@ -140,7 +140,7 @@ set(UFSM_CU_FAST -DUFSM_DEVICE_FAST_MATH -fgpu-flush-denormals-to-zero -fgpu-app
 # sqrt.rn.f32); the reflection is set explicitly (-mllvm reaches the host pass too, where it does nothing). Checked 2026-11-13: the
 # PTX of every strict unit uses the same float instruction kinds as nvcc -fmad=false (div.rn, sqrt.rn, no fma / approx / ftz).
 set(UFSM_CU_STRICT "SHELL:-Xarch_device -ffp-contract=off" "SHELL:-mllvm -nvvm-reflect-add=__CUDA_PREC_SQRT=1")
-set(UFSM_STRICT_UNITS nn_gpudec nn_cf nn_ftrace nn_latvol nn_band nn_fibre nn_inkfly nn_gpuenc nn_mcodes nn_faces nn_render)
+set(UFSM_STRICT_UNITS nn_gpudec nn_cf nn_ftrace nn_latvol nn_band nn_fibre nn_inkfly nn_gpuenc nn_mcodes nn_faces nn_render nn_hgs)
 set(UFSM_TYPEDEFS UFSM_ARCH=${UFSM_ARCH})
 if(UFSM_VERIFY)
   list(APPEND UFSM_TYPEDEFS UFSM_ALL_TYPES)
