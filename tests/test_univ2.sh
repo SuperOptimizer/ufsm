@@ -5,13 +5,14 @@
 # step / validation / grad-cos lines identical (timing stripped; a race in the thread-local op state shows as a changed line).
 # The first run also checks the replicas' weights (--replica-check 3 --replica-sync 1, train#9): a check line at steps 3 and 6, no
 # "more than ulp drift" warning, and after a re-sync at step 3 the replicas still train.
+# UFSM_TEST_GPUS=0,0 (the runner on a one-GPU machine, tag l2): two logical devices on one card (src/ufsm_dev.cuh); no skip then.
 # Usage: test_univ2.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
 # two GPUs or a skip (run_suite.sh gives a gpu2 test both GPUs when there are two, else one: CUDA_VISIBLE_DEVICES = that one; the runner
 # reports an exit 0 with a line starting SKIP as SKIP). CUDA_VISIBLE_DEVICES set: its entries; unset: nvidia-smi's GPUs
 ngpu() { if [ -n "${CUDA_VISIBLE_DEVICES+x}" ]; then local v=${CUDA_VISIBLE_DEVICES//[[:space:]]/} a; [ -z "$v" ] && { echo 0; return; }; IFS=, read -ra a <<< "$v"; echo ${#a[@]}
          else nvidia-smi -L 2> /dev/null | grep -c '^GPU' || true; fi; }
-NGV=$(ngpu); [ "${NGV:-0}" -ge 2 ] || { echo "SKIP: test_univ2 needs two GPUs (${NGV:-0} visible)"; exit 0; }
+NGV=$(ngpu); case "${UFSM_TEST_GPUS:-}" in *,*) NGV=2;; esac; [ "${NGV:-0}" -ge 2 ] || { echo "SKIP: test_univ2 needs two GPUs (${NGV:-0} visible)"; exit 0; }
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3   # (absolute: the runs cd into DIR)
 rm -rf "$D"; mkdir -p "$D"
 "$MF" "$D/fx" 256 2 1 > "$D/fx.log" 2>&1
@@ -21,7 +22,7 @@ d = sys.argv[1]
 a = json.load(open(f'{d}/fx/sources-l1.json'))['sources'][0]; b = json.load(open(f'{d}/fx/sources2.json'))['sources'][0]; b.pop('holdout', None)
 json.dump({'sources': [a, b]}, open(f'{d}/fx/sources-mix.json', 'w'))
 PY
-C=(--task unwrap2 --P 64 --B 1 --gpus 0,1 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 --ckpt-every 1000 --fp4 2
+C=(--task unwrap2 --P 64 --B 1 --gpus ${UFSM_TEST_GPUS:-0,1} --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 --ckpt-every 1000 --fp4 2
    --gpu-aug 3 --replay 3 --warmup 0 --seed 5 --widths 16,32,64 --rv 2 --rv-iso 100 --lat 4 --lat-guide 3 --um-rungs 19.2,38.4 --rung-shift-p 0.2
    --film 2 --fstem 16 --fstem-drop 0.25 --uw 1 --grad-cos 3 --packed-weight 8)
 cd "$D"

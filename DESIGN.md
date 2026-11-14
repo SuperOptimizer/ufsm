@@ -398,6 +398,83 @@ Desk check against the live trainer (`-W 20`): its three GPU tests went BUSY aft
   - test_countfield runs its golden cases strict, and runs an all-zero input without --dir in a child, which must stop with exit 3.
   - test_pipeline_cli fails on any DEFAULTED line in its CLI runs.
 
+**#8 two GPUs on one: logical devices.** Since 11-13 no machine could run the 2-GPU tests:
+- the desk's cards belong to scratch2;
+- the perf pod has one GPU;
+- test_univ2 failed "cannot select GPU 1" on every pod run.
+
+The fix is src/ufsm_dev.cuh, force-included into every CUDA unit (clang `-include`, nvcc `--pre-include`). It maps logical device d
+to the physical device ufsm_dev_phys(d).
+- It wraps cudaSetDevice / cudaGetDevice, so every per-device table in the GPU code is indexed by the LOGICAL device: streams, plans,
+  buffers, kernel attributes, `[cur_dev()]`, `[cudaGetDevice()]`.
+- Also wrapped:
+  - the device count, attributes and properties;
+  - cudaMemGetInfo (free memory split among the logical devices on a card);
+  - peer access (one card: always), cudaMemcpyPeer(Async) (one card: a device copy).
+- The map is the identity unless `train --gpus` names a card twice without `--split`, so ordinary runs are unchanged.
+  `train --gpus 0,0` then runs two data-parallel ranks with separate per-device state on one card. --split keeps its own one-device
+  path (`g_split_same`).
+- gpudec compares the pointer's physical device.
+
+The runner gives gpu2 tests tagged `l2` UFSM_TEST_GPUS=0,0 on one-GPU machines:
+- test_univ2 (its --det thread-mode comparison is the race detector for thread-local op state);
+- test_cover_training and test_sheet_gpu (their own one-GPU fallbacks);
+- the new test_dp_equiv. It checks that DP at B 1 on two ranks trains like `--accum 2` on one: each update's mean loss equal at the
+  first update, within DPDRIFT after.
+
+test_gyrec was tagged gpu2 although it runs on device 0 alone; it is now `gpu`.
+
+**The mgpu lint** (tests/lint_mgpu.py, CPU, < 1 s). Every file-scope mutable variable in src/ needs an mgpu class: `process`,
+`device`, `guarded`, `BUG`.
+- The class goes in an annotation `/* mgpu: ... */` on its line, or in tests/mgpu_baseline.txt.
+- The baseline holds the 548 variables of 11-14, classed from audit-net's appendix (net.md: SAFE-CFG / ENV / MAIN -> process,
+  SAFE-DEV -> device, SAFE-TLS / LOCK -> guarded, UNSAFE -> BUG). That way no source line of every open branch changes.
+- Thread-local ones count as guarded by themselves. train.c's option globals are process; 263 are `unknown`, mostly host code outside
+  the trainer's GPU threads.
+- The 11 BUG entries are audit-net's open findings: g_err*, g_lp_err, g_ring, g_pk, g_slab, g_pgtab, xnet, ink3dext.
+- A new unclassified variable fails the test with the line to annotate.
+
+**#9 races.**
+- `UFSM_SERIALIZE=1` (nn_init) sets CUDA_LAUNCH_BLOCKING=1, so every launch and copy completes in program order. The tests also set
+  CUDA_LAUNCH_BLOCKING=1 themselves, since the context may predate nn_init.
+- test_serialize compares a default `--det` run of the universal recipe, data parallel on two (logical) devices, with a serialised
+  one. The step lines must be identical; a stream-ordering race shows as a difference.
+- test_ink_mil_train does the same for the MIL path: 1bb0db8's rays under the backward were this class, found in production.
+- The slow tier's sanitize group runs compute-sanitizer racecheck and synccheck (tests/sanitize.sh, child processes included) over
+  small GPU tests: shared-memory hazards and barrier misuse, which the serialised comparison cannot see.
+
+**#4 the swap gate.** scripts/run/replay_ab.sh RUN OLD NEW [N] runs in the swap window, before a swap.
+- It replays N windows with both binaries:
+  - the run's own train command (the last start line of RUN.resume.log);
+  - one copy of last.ckpt;
+  - `--det 1 --lr 0 --muon-lr 0`, so both binaries see the same batches and the same weights at every step.
+- It compares the per-head mean losses, with a 1 % tolerance.
+- gswap.sh's live gate had ~0.026 noise against a 0.05 threshold, on 2 log lines.
+
+**#15 / #17.**
+- test_gyrec's free-memory check (cudaMemGetInfo of the whole card: other tests moved it, FAIL under -j 10) now runs only with
+  UFSM_TEST_GYREC_MEM=1. The leak shows anyway in its pointer checks: the same buffers come back after every switch, no apply
+  reallocates.
+- The scoring commands now have tests:
+  - ink-score in test_ink_splat: the labels as the map score F1 / AUC ~1, with or without the mask; inverted AUC ~0; constant
+    AUC 0.5;
+  - gt-gate in test_gt_gate (CPU): three GT cylinders with prob ridges on one half; with --cell 64 the four unsupported cells are
+    gated, the share matches the fixture and the mask is 255 exactly there;
+  - eval was already covered by test_pipeline_cli.
+
+**Cleanup.**
+- 68 worktrees removed with `git worktree remove` (no --force). Each one met all of these:
+  - its branch is merged into origin/master, or it is detached at an ancestor of it;
+  - no unpushed commits;
+  - clean, including untracked files;
+  - no process cwd or open file inside;
+  - no symlink into it;
+  - no file touched in 3 h;
+  - not an active agent's tree.
+- Kept: 40 with unmerged / dirty / in-use reasons, 8 with untracked files, 9 of active agents. The branches stay.
+- The main checkout was fast-forwarded to origin/master (it was 376 commits behind; its local evwatch.sh edit and untracked files kept).
+- CLAUDE.md is now tracked.
+
 **#3 the health watcher.** scratch2.health.py was not running on 11-14 (its files had moved with try5), and its limits were the old
 104 GB slice. scripts/run/health.py RUN is the same set of checks, generalised, run as the systemd --user service `ufsm-health@RUN`
 (scripts/run/install_health.sh; Restart=always, linger on). Changes:

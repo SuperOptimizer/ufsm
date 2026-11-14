@@ -2977,6 +2977,13 @@ int cmd_train(int argc, char **argv) {
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--fp32")) nn_set_tf32(0);
     int devs[8], ng = 0;
     { char *t = strdup(opt(argc, argv, "--gpus", opt(argc, argv, "--gpu", "0"))); for (char *q = strtok(t, ","); q && ng < 8; q = strtok(nullptr, ",")) devs[ng++] = atoi(q); free(t); }
+    {   /* --gpus with a device twice and no --split (which has its own one-device path): logical devices 0..ng-1 on the listed cards
+           (src/ufsm_dev.cuh), so data-parallel ranks keep separate per-device state; the 1-GPU pod runs the 2-GPU tests so (ops #8) */
+        int dup = 0; for (int a = 0; a < ng; a++) for (int b = a + 1; b < ng; b++) dup |= devs[a] == devs[b];
+        if (dup && strcmp(opt(argc, argv, "--split", "none"), "none") && strcmp(opt(argc, argv, "--split", "none"), "0")) dup = 0;
+        if (dup) { nn_set_devmap(ng, devs); fprintf(stderr, "--gpus %s: %d logical devices on", opt(argc, argv, "--gpus", ""), ng);
+                   for (int k = 0; k < ng; k++) { fprintf(stderr, " %d", devs[k]); devs[k] = k; } fprintf(stderr, " (data parallel on shared cards)\n"); }
+    }
     for (int k = 0; k < ng; k++) g_w4devs[k] = devs[k]; g_w4n = ng;
     nn_init(devs[0]);   /* env precision knobs are read here; the storage modes decide the batch formats */
     g_xfmt = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8") ? (nn_get_f16() ? 1 : 2) : 0;

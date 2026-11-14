@@ -210,7 +210,13 @@ static char g_err_site[512];
 static void *g_err_ra;   /* the caller of the copy / memset wrapper that latched g_err (CKR) */
 #define CKR(x) do { const int had_ = g_err != cudaSuccess; CK(x); if (!had_ && g_err != cudaSuccess) g_err_ra = __builtin_return_address(0); } while (0)
 extern "C" const char *nn_check_site(void) { return g_err_site; }
-extern "C" int nn_init(int device) { if (ufsm_env_on("UFSM_ACTF32")) g_actbf = 0; if (ufsm_env_on("UFSM_GRADF32")) g_gradbf = 0; if (ufsm_env_on("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } if (cudaSetDevice(device) != cudaSuccess) return -1; if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 3) { size_t fr = 0, tot = 0; cudaFree(0); cudaMemGetInfo(&fr, &tot); fprintf(stderr, "nn_init: device used %.1f MB after the context\n", (tot - fr) / 1e6); } return 0; }
+/* logical devices (src/ufsm_dev.cuh, ops audit #8): set once before the GPU threads start (mgpu: process) */
+extern "C" int nn_set_devmap(int n, const int *phys) {
+    if (n < 0 || n > 16) return -1;
+    for (int k = 0; k < n; k++) ufsm_devmap_[k] = phys[k];
+    ufsm_ndevmap_ = n; return 0;
+}
+extern "C" int nn_init(int device) { { static int ser = -1; if (ser < 0) { ser = ufsm_env_on("UFSM_SERIALIZE"); if (ser) { setenv("CUDA_LAUNCH_BLOCKING", "1", 1); fprintf(stderr, "UFSM_SERIALIZE=1: CUDA_LAUNCH_BLOCKING=1, every launch and copy completes in program order (tests/test_serialize.sh)\n"); } } } if (ufsm_env_on("UFSM_ACTF32")) g_actbf = 0; if (ufsm_env_on("UFSM_GRADF32")) g_gradbf = 0; if (ufsm_env_on("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } if (cudaSetDevice(device) != cudaSuccess) return -1; if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 3) { size_t fr = 0, tot = 0; cudaFree(0); cudaMemGetInfo(&fr, &tot); fprintf(stderr, "nn_init: device used %.1f MB after the context\n", (tot - fr) / 1e6); } return 0; }
 extern "C" const char *nn_check(void) {
     cudaError_t e = g_err;
     g_err = cudaSuccess;

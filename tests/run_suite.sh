@@ -29,7 +29,8 @@
 # card whatever the slot count (the old slot-only scheme leaked: a trainer held slots .0 / .1, a suite sized for free memory took .2+).
 # A card with a foreign compute process (>= 1 GB, not a suite test: /proc/<pid>/environ has no UFSM_SUITE_TEST) counts as held too.
 # Concurrent suites (several agents on one machine) share the GPUs one test at a time. Tests start longest-first (EST).
-# gpu2 tests on a machine with one GPU: the ones tagged l2 run there on two logical devices (UFSM_TEST_GPUS=0,0: train --gpus 0,0);
+# gpu2 tests on a machine with one GPU: the ones tagged l2 run there (UFSM_TEST_GPUS=0,0: train --gpus 0,0 = two logical devices on the
+# card, or the test's own one-GPU fallback);
 # the others are reported NEED2.
 # Statuses: PASS, FLAKY (passed on the retry), SKIP (the test printed a line starting "SKIP" and exited 0), FAIL, TIMEOUT, and the
 # not-run ones NOGPU (no GPU here / -g none), BUSY (its card stayed held -W seconds), NEED2 (a gpu2 test, one GPU, not l2).

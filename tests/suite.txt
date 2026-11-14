@@ -28,7 +28,7 @@ test_lat_conv0                                 | gpu          |        3 | UFSM_
 test_lat_head                                  | gpu          |        5 | ./$B/test_lat_head
 test_lat_head~FP8                              | gpu          |        4 | TLH_FP8=1 ./$B/test_lat_head
 test_pgrad                                     | gpu          |     1 | ./$B/test_pgrad
-test_gyrec                                     | gpu2         |     1 | ./$B/test_gyrec
+test_gyrec                                     | gpu          |     1 | ./$B/test_gyrec
 test_unwrap2_sampler                           | gpu          |     9 | ./$B/test_unwrap2_sampler $TMPDIR/unwrap2_fixture
 test_phase_pool                                |              |     3 | UFSM_PHASE_POOL_SLAB=90000 ./$B/test_phase_pool $TMPDIR/phase_pool
 test_rungs                                     | gpu,smoke    |     3 | ./$B/test_rungs $TMPDIR/rungs_fixture
@@ -55,7 +55,7 @@ test_spatial_augment~part1of3                 |              |     7 | UFSM_TEST
 test_spatial_augment~part2of3                 |              |     7 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=2/3 ./$B/test_spatial_augment
 test_spatial_augment~full                      | slow         |   148 | ./$B/test_spatial_augment
 test_wgrad_grid                                | gpu          |     2 | ./$B/test_wgrad_grid
-test_sheet_gpu                                 | gpu2,smoke   |     1 | ./$B/test_sheet_gpu
+test_sheet_gpu                                 | gpu2,l2,smoke|     1 | ./$B/test_sheet_gpu
 test_cover                                     |              |     1 | ./$B/test_cover
 test_ct_augment                                | smoke        |     1 | ./$B/test_ct_augment
 test_scan_augment                              |              |     2 | ./$B/test_scan_augment
@@ -105,6 +105,7 @@ test_sheetpbr                                  |              |     2 | ./$B/tes
 test_pairacc                                   |              |     1 | ./$B/test_pairacc
 test_wbench_stats                              |              |     2 | bash tests/test_wbench_stats.sh $B/ufsm
 test_run_suite                                 |              |    17 | bash tests/test_run_suite.sh
+test_lint_mgpu                                 |              |     1 | python3 tests/lint_mgpu.py
 test_gpuq                                      | flaky        |    14 | bash tests/test_gpuq.sh
 test_robust                                    | gpu          |     1 | ./$B/test_robust
 test_reg                                       |              |    27 | ./$B/test_reg
@@ -209,6 +210,7 @@ test_typed_zarr                                | smoke        |     7 | ./$B/tes
 test_http_reader                               |              |   166 | python3 tests/test_http_reader.py
 test_checkpoint_runtime                        | smoke        |     1 | ./$B/test_checkpoint_runtime
 test_ckring                                    |              |     1 | ./$B/test_ckring
+test_gt_gate                                   |              |     3 | ./$B/test_gt_gate
 test_infer_buffers                             | gpu          |     6 | ./$B/test_infer_buffers
 test_recompute_live                            | gpu          |     7 | ./$B/test_recompute_live
 test_share_enc_a1                              | gpu          |     5 | ./$B/test_share_enc_a1
@@ -216,8 +218,10 @@ test_pipeline_cli                              | gpu          |    85 | python3 
 test_ingest_lut                                |              |     3 | python3 tests/test_ingest_lut.py
 test_ink_blend                                 |              |     4 | python3 tests/test_ink_blend.py
 test_seamless                                  |              |     6 | python3 tests/test_seamless.py
-test_cover_training                            | gpu2         |    16 | python3 tests/test_cover_training.py
-test_univ2                                     | gpu2         |    40 | tests/test_univ2.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/univ2
+test_cover_training                            | gpu2,l2      |    16 | python3 tests/test_cover_training.py
+test_univ2                                     | gpu2,l2      |    40 | tests/test_univ2.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/univ2
+test_dp_equiv                                  | gpu2,l2      |    20 | tests/test_dp_equiv.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/dpequiv
+test_serialize                                 | gpu2,l2      |    30 | tests/test_serialize.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/serialize
 test_checkpoint                                | gpu,smoke    |     2 | ./$B/test_checkpoint
 test_optimizer_owners                          | gpu          |     3 | ./$B/test_optimizer_owners
 test_wide_up_grad                              | gpu          |     5 | ./$B/test_wide_up_grad
@@ -331,3 +335,20 @@ test_mesh_phase                                | gpu          |     8 | tests/te
 test_lldec                                     | gpu,smoke    |     3 | ./$B/test_lldec $TMPDIR/lldec
 test_echo                                      | gpu          |    40 | tests/test_echo.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/echo
 test_lab_early_split                           | gpu          |    40 | tests/test_lab_early_split.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/labearlysplit
+# the sanitize group (ops audit #9): compute-sanitizer racecheck (shared-memory hazards) / synccheck (barrier misuse) on small GPU tests
+test_ink_mil~racecheck                         | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_ink_mil
+test_ink_mil~synccheck                         | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_ink_mil
+test_skip_empty~racecheck                      | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_skip_empty
+test_skip_empty~synccheck                      | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_skip_empty
+test_lat_head~racecheck                        | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_lat_head
+test_lat_head~synccheck                        | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_lat_head
+test_fstem~racecheck                           | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_fstem
+test_fstem~synccheck                           | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_fstem
+test_gyrec~racecheck                           | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_gyrec
+test_gyrec~synccheck                           | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_gyrec
+test_gram~racecheck                            | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_gram
+test_gram~synccheck                            | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_gram
+test_pgrad~racecheck                           | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_pgrad
+test_pgrad~synccheck                           | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_pgrad
+test_w4dev~racecheck                           | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_w4dev
+test_w4dev~synccheck                           | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_w4dev
