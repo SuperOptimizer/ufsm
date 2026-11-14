@@ -6,6 +6,33 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## mcc: GPU A/B harness, strict units, JIT warm-up, PTX size (2026-11-14, branch toolchain-mcc-20261114, mcc-gpu)
+
+- `scripts/toolchain/mcc_gpu_ab.sh NVCC_BUILD MCC_BUILD OUT` (one GPU window, all six desk locks; builds nothing): cold JIT
+  (`MCUDA_PRECOMPILE` into an empty cache, per-kernel ptxas seconds), every GPU bench_* plus test_head_tc's timing section (REPS
+  rounds alternating the builds, min ms per kernel, output hash / checksum lines compared with timings masked), 200 steps of the
+  live scratch2 argv / env (scratch2.resume.log) at P 768 with `--det 1 --gpu-input 1 --init-from` a fixed checkpoint, predict
+  (fit-zarr + heads all) on a 384^3 unseen box byte-compared, and the kernels production loads (`MCUDA_VERBOSE`) against all.
+  Output: OUT/ab.tsv (bench, line, item, nvcc, mcc, ratio, SLOW > 1.03, check same / diff / nondet), OUT/summary.txt.
+- Strict units under mcc (`UFSM_STRICT_UNITS`: nn_gpudec nn_cf nn_ftrace nn_latvol nn_band nn_fibre nn_inkfly nn_gpuenc
+  nn_mcodes nn_faces nn_render; byte-exact tests: test_gpudec, test_vcgpu, test_lldec, test_latvol, test_ftrace_gpu,
+  test_fiberraster, test_band_pair, test_faces_gpu, test_render_fill_gpu; test_countfield uses tolerances). Read from microc's
+  src/ptx.c, ir.c and cuda/hw/dev: `-fmad=false` is per invocation (opt_fmad), skips the fusion pass and writes `.rn` on every
+  f16 / f32 / f64 add / sub / mul, so ptxas cannot contract either; without `--cuda-fast-math` there is no `.ftz` / `.approx`,
+  division is `div.rn`, sqrt `sqrt.rn`, casts `cvt.rzi` / `cvt.rn`, floor / ceil / rint / lrint single cvt instructions,
+  round / lround / lroundf exact (trunc + compare) in the device library; constant folding rounds f32 at f32. The PTX of all 11
+  units compiled with the build's flags: 0 contracted fma / mad, 0 add / sub / mul without `.rn` (nn_gpuenc's one fma is its
+  explicit `__fmaf_rn`). Library calls left: nn_cf atan2 / hypot / pow / sin / cos / sincos (mcc's libm, not libdevice; its test
+  has tolerances), lround / llround / lroundf (exact). No mcc fix needed; the suite on the mcc build is the proof.
+- JIT warm-up: `scripts/toolchain/jit_warm.sh BIN [N]` (a no-op for nvcc builds), used by `scripts/pod/setup.sh` on every run
+  (also NOBUILD=1: the cache key is PTX + GPU name + driver version) and by the mcc build's `jit-warm` target.
+- PTX size, release flags (no UFSM_ALL_TYPES), mcc 953a5f2-era: 334.6 MB, 4012 kernels in 123 units (11.7 s wall at -j 2);
+  the other 45 units (lp_f4fwd_i3-5/i7, most f4 / f8 wgrad and f8 fwd instantiations, nn_fwdi1/3/5, nn_s2) have device code only
+  under verify. Largest: lp_mx_gnbwd 25.2 MB (384 kernels), lp_f4fwd_i0p 19.6, lp_s2 17.5 (196),
+  lp_f8fwd_i5 15.6, lp_f8fwd_i0s 15.5, lp_f8fwd_i5s 15.4, lp_f4fwd_i0 13.7, lp_mx_conv1 9.5 (206). Trimming waits for the A/B's
+  used-kernel list (production loads N of 4012): the fp8 forward family (lp_f8fwd_*, 111 MB, 268 kernels) is off the fp4-everywhere path; f4 forward
+  79 MB, f4 / f8 wgrad 23 / 15 MB.
+
 ## The swap to microc: mcc is the default toolchain (2026-11-14, branch toolchain-mcc-20261114)
 
 The user asked for the full swap, not a staged one. On this branch:

@@ -459,6 +459,13 @@ endforeach()
 add_custom_target(suite-check
   COMMAND bash ${CMAKE_SOURCE_DIR}/cmake/suite_check.sh ${CMAKE_SOURCE_DIR} "${_suite}"
   USES_TERMINAL VERBATIM)
+# jit-warm (mcc): fill mcudahw's kernel cache for this build's ufsm on the first visible GPU (scripts/toolchain/jit_warm.sh: every kernel
+# the cache lacks through the driver's ptxas, cgroup CPUs at a time), so no kernel JIT-compiles inside a step. Needs a GPU
+if(UFSM_TOOLCHAIN STREQUAL "mcc")
+  add_custom_target(jit-warm
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/toolchain/jit_warm.sh $<TARGET_FILE:ufsm>
+    DEPENDS ufsm USES_TERMINAL VERBATIM)
+endif()
 # doctor: the toolchain picked, then the machine's real limits (cgroup CPUs / RAM, GPUs / MIG, CUDA, disk)
 add_custom_target(doctor
   COMMAND ${CMAKE_COMMAND} -E echo "cmake: toolchain ${UFSM_TOOLCHAIN}, CC=${CMAKE_C_COMPILER} (${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}), CUDA=${UFSM_CUDA} (${UFSM_CUDA_VERSION}), ARCH=${UFSM_ARCH}, VERIFY=${UFSM_VERIFY}, runtime=$<IF:$<BOOL:${UFSM_LLVM_RUNTIME}>,compiler-rt,libgcc>+libstdc++, ccache=${UFSM_CCACHE_EXE}, build dir ${CMAKE_BINARY_DIR}"

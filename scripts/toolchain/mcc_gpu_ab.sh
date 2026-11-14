@@ -184,7 +184,7 @@ if part train; then
     [ -s "$R.done" ] && continue
     case "$R" in "$O"/train_*) rm -rf -- "$R" ;; esac
     t0=$(date +%s.%N)
-    env "${TENV[@]}" timeout -k 30 $((TRAIN_STEPS * 60 + 1800)) "${MCAP[@]}" "$D/ufsm" train "${T[@]}" --out "$R" --steps "$TRAIN_STEPS" --P "$TRAIN_P" \
+    env "${TENV[@]}" MCUDA_VERBOSE=1 timeout -k 30 $((TRAIN_STEPS * 60 + 1800)) "${MCAP[@]}" "$D/ufsm" train "${T[@]}" --out "$R" --steps "$TRAIN_STEPS" --P "$TRAIN_P" \
         --init-from "$CK" --ckpt-every 1000000 --val-every 1000000 --log-every 10 --det 1 --gpu-input 1 > "$R.log" 2>&1; rc=$?
     t1=$(date +%s.%N); echo "rc $rc wall $(echo "$t1 - $t0" | bc)" > "$R.done"; log "train $t: $(cat "$R.done")"
   done
@@ -226,11 +226,11 @@ if part predict; then
     [ -s "$R.done" ] && continue
     case "$R" in "$O"/pred_*) rm -rf -- "$R" ;; esac; mkdir -p "$R"
     t0=$(date +%s.%N)
-    env CUDA_VISIBLE_DEVICES=$GPU "${MCAP[@]}" "$D/ufsm" predict "$CK" "$ur" "$uk" "$R/f.tmp" --box $bx --fit-zarr "$R/fields" --um "$uum" --level "$ulv" \
+    env CUDA_VISIBLE_DEVICES=$GPU MCUDA_VERBOSE=1 "${MCAP[@]}" "$D/ufsm" predict "$CK" "$ur" "$uk" "$R/f.tmp" --box $bx --fit-zarr "$R/fields" --um "$uum" --level "$ulv" \
         --window 640 --halo 64 --shard 512 --grid-origin 0,0,0 --ema 1 --q 8 --threads 12 --gpu 0 --axis "$uax" --levels 1 --fit-h 2 --fit-q 8 \
         --fit-q-phase 0 --no-out 1 > "$R/fields.log" 2>&1; r1=$?
     t1=$(date +%s.%N)
-    env CUDA_VISIBLE_DEVICES=$GPU "${MCAP[@]}" "$D/ufsm" predict "$CK" "$ur" "$uk" "$R/h" --um "$uum" --level "$ulv" --box $bx --full-grid 1 --levels 1 \
+    env CUDA_VISIBLE_DEVICES=$GPU MCUDA_VERBOSE=1 "${MCAP[@]}" "$D/ufsm" predict "$CK" "$ur" "$uk" "$R/h" --um "$uum" --level "$ulv" --box $bx --full-grid 1 --levels 1 \
         --heads all --gpu 0 --axis "$uax" --threads 6 > "$R/heads.log" 2>&1; r2=$?
     t2=$(date +%s.%N); rm -rf -- "$R/f.tmp"
     echo "rc $r1 $r2 wall $(echo "$t1 - $t0" | bc) $(echo "$t2 - $t1" | bc)" > "$R.done"; log "predict $t ($un $bx): $(cat "$R.done") (fields, heads)"
@@ -239,6 +239,15 @@ if part predict; then
   (cd "$O/pred_mcc" && find fields h -type f 2>/dev/null | sort | xargs -r sha1sum) > "$O/pred_mcc.sha1"
   join -j 2 -a 1 -a 2 -e MISSING -o 0,1.1,2.1 <(sort -k2 "$O/pred_nvcc.sha1") <(sort -k2 "$O/pred_mcc.sha1") > "$O/pred_cmp.txt"
   log "predict: $(awk '$2 == $3' "$O/pred_cmp.txt" | wc -l) files identical, $(awk '$2 != $3 && $2 != "MISSING" && $3 != "MISSING"' "$O/pred_cmp.txt" | wc -l) differ, $(grep -c MISSING "$O/pred_cmp.txt") only in one build (pred_cmp.txt; differing: $(awk '$2 != $3 {print $1}' "$O/pred_cmp.txt" | head -8 | tr '\n' ' '))"
+fi
+
+# ---- the kernels production runs load (MCUDA_VERBOSE: one line per kernel the mcc build loads, from the cache or compiled) against
+# all that MCUDA_PRECOMPILE compiles: the data for trimming dead instantiations / a hot-set precompile at pod start
+if [ -s "$O/jit_kernels.tsv" ]; then
+  cat "$O"/train_mcc.log "$O"/pred_mcc/*.log 2>/dev/null | sed -nE 's/^mcuda: (.*): (from|compiled in) .*/\1/p' | sort -u > "$O/jit_used.txt"
+  awk -F'\t' 'NR == FNR {u[$1] = 1; next} {n++; b += $2; if ($4 in u) {nu++; bu += $2; tu += $1}; t += $1} END {
+    printf "jit: production (train + predict) loads %d of %d kernels, %.1f of %.1f MB of PTX, %.0f of %.0f s of compile\n", nu, n, bu / 1e6, b / 1e6, tu, t}' \
+    "$O/jit_used.txt" "$O/jit_kernels.tsv" > "$O/jit_used_summary.txt"; log "$(cat "$O/jit_used_summary.txt")"
 fi
 
 { echo "mcc GPU A/B $(date '+%F %H:%M'): nvcc $NV vs mcc $MC"; grep -E '^[0-9-]+ [0-9:]+ (jit|predict|train (nvcc|mcc):)' "$O/ab.log" | cut -d' ' -f3-

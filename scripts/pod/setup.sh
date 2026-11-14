@@ -116,10 +116,12 @@ if [ "${NOBUILD:-0}" != 1 ]; then
 fi
 [ -x $U ] || die "no $U"
 $U sysinfo --disk $POD | tee $POD/sysinfo.txt
-# mcudahw JIT-compiles each kernel's PTX at its first launch (~/.cache/mcudahw): fill the cache now, on all CPUs, not inside step 1
-if [ "${NOBUILD:-0}" != 1 ] && [ "${NOPRECOMPILE:-0}" != 1 ]; then
-  say "mcudahw: precompiling the kernels (MCUDA_PRECOMPILE=$NCPU)"
-  MCUDA_PRECOMPILE=$NCPU $U sysinfo > $POD/precompile.log 2>&1 || say "precompile: rc $? (log $POD/precompile.log); kernels will JIT at first use"
+# mcudahw JIT-compiles each kernel's PTX at its first launch (~/.cache/mcudahw, keyed by PTX + GPU model + driver): fill the cache now,
+# on all CPUs, not inside step 1. Every run (also NOBUILD=1: a new driver or GPU model after a reboot starts cold; a warm cache is a scan)
+if [ "${NOPRECOMPILE:-0}" != 1 ]; then
+  say "mcudahw: precompiling the kernels ($NCPU threads)"
+  jm=$(JITLOG=$POD/precompile.log bash $POD/ufsm/scripts/toolchain/jit_warm.sh $U $NCPU); jrc=$?; say "$jm"
+  [ $jrc = 0 ] || say "precompile failed (rc $jrc, log $POD/precompile.log); kernels will JIT at first use"
 fi
 
 # --- 4. smoke test ---
