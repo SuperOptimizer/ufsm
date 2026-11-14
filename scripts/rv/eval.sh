@@ -19,6 +19,7 @@ E=${E:-/mnt/scratch/rv/eval}; TH=${TH:-16}; SH=${SH:-128}; CTR=${CTR:-/vesuvius/
 # off the desk (2026-11-11, scripts/univ): CTR=<volcomp mirror> VOLP=volumes/ (the mirror keeps scans under <scroll>/volumes/), CNT, RVGT (GT root), RU
 RVGT=${RVGT:-/vesuvius/ufsm/gt}; VOLP=${VOLP:-}
 mkdir -p $E/$T; echo "== $T $CK $(date)" >> $E/$T.txt
+nfail=0   # (exit 1 when any scroll failed: evwatch.sh then does not mark the snapshot done; audit eval#18)
 zlist() {   # zlist ZR0 ZR1 NZ: the ruler's --nz z levels (model-local native z)
   awk -v a=$1 -v b=$2 -v n=$3 'BEGIN { for (i = 0; i < n; i++) printf "%s%d", i ? "," : "", int(a + (i + 0.5) * (b - a) / n) }'; }
 for S in $SC; do
@@ -29,7 +30,7 @@ for S in $SC; do
            ZS=$(zlist 1000 12000 24); ZB="";;
     p4)    M=$C/p4w/pn2/ref; F=/vesuvius/ufsm/cfit/whole/refcrop; Q="$RVGT/paris4-q9p6/q-9p6.zarr 9.6"; CK_=PHercParis4/${VOLP}20260411134726-2.400um-0.2m-78keV-masked.zarr; LV=2; UM=9.6; U0=2.4
            ZS=8008,8040,8072,8104,9508,9540,9572,9604,11008,11040,11072,11104,12508,12540,12572,12604,14008,14040,14072,14104,15508,15540,15572,15604; ZB="--zblock 1500,1";;
-    *) echo "unknown $S"; continue;;
+    *) echo "unknown $S"; nfail=$((nfail + 1)); continue;;
   esac
   D=$E/$T/$S; mkdir -p $D
   read -r oz oy ox mz my mx h < <(jq -r '"\(.origin[0]) \(.origin[1]) \(.origin[2]) \(.shape[0]) \(.shape[1]) \(.shape[2]) \(.h)"' $M/model.json)
@@ -44,13 +45,16 @@ for S in $SC; do
       [ -n "${K:-}" ] && [ -d $K/gpu.shared ] && while [ -e $K/gpu.pause ] || [ $((10#$(date +%M))) -ge $([ -e $K/gpu.gate-waiting ] && echo 35 || echo 15) ]; do sleep 5; done   # shared pod GPU ($K/GPU.md): wait out exclusive timing slots
       CUDA_VISIBLE_DEVICES=$GPU UFSM_PRED_IO=1 "${L[@]}" nice -n 5 $U predict $CK $CTR $CK_ $D/pred --um $U0 --level $LV --box $((r * SH)),$oy,$ox,$SH,$((my * h)),$((mx * h)) \
         --full-grid 1 --resume 1 --shard $SH --window ${WINDOW:-640} --halo 64 ${WZ---window-z $((SH + 64)) --halo-z 32} --levels 1 --channel rv \
-        --threads $TH --gpu 0 --q 0 ${PX:-} "${LX[@]}" >> $D/pred.log 2>&1 || { echo "$S: predict row $r failed (see $D/pred.log)" | tee -a $E/$T.txt; continue 2; }
+        --threads $TH --gpu 0 --q 0 ${PX:-} "${LX[@]}" >> $D/pred.log 2>&1 || { echo "$S: predict row $r failed (see $D/pred.log)" | tee -a $E/$T.txt; nfail=$((nfail + 1)); continue 2; }
     done
     echo "$S: predicted $(echo $rows | wc -w) shard rows of $SH in $(( $(date +%s) - t0 )) s" | tee -a $E/$T.txt; touch $D/pred.done
   fi
   [ "${PREDONLY:-0}" = 1 ] && continue   # the GPU phase of a two-phase eval: the ruler follows in the second run
   key=$(ls $D/pred | grep -v json | head -1)
   nice $RU recto-ruler $M $F --codes $Q --src rv $D/pred $key $UM --zs $ZS $ZB --threads $TH > $D/ruler.log 2> $D/ruler.err
-  echo "$S $(grep -E '^ +all' $D/ruler.log | tail -1)" | tee -a $E/$T.txt
+  row=$(grep -E '^ +all' $D/ruler.log | tail -1)
+  if [ -z "$row" ]; then echo "$S: FAILED: the ruler gave no 'all' row (see $D/ruler.err)" | tee -a $E/$T.txt; nfail=$((nfail + 1)); continue; fi
+  echo "$S $row" | tee -a $E/$T.txt
   [ "${KEEP:-0}" = 1 ] || rm -rf $D/pred
 done
+[ $nfail = 0 ] || { echo "== $T: $nfail scroll(s) FAILED" >> $E/$T.txt; exit 1; }
