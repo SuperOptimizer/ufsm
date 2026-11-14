@@ -53,5 +53,10 @@ done
 paste -d' ' <(grep '^step' split_new.log | awk '{print $2, $6}') <(grep '^step' split_dev.log | awk '{print $2, $6}') | awk '{d = $2 - $4; if (d < 0) d = -d; n++; t = $1 == 1 ? 0.005 : 0.05; if ($1 != $3 || d > t * ($2 < 0 ? -$2 : $2) + 1e-6) bad = 1} END {exit bad || n < 8}' \
   || { echo "FAIL: split: device-warped losses differ (step 1 > 0.5% or later > 5%)"; paste <(grep '^step' split_new.log | awk '{print $2, $6}') <(grep '^step' split_dev.log | awk '{print $2, $6}'); exit 1; }
 echo "split: --gpu-aug 2 on the device: $(grep -o 'sampler: [0-9] label planes per slot for [0-9] label roles' split_dev.log), CT bytes exact, losses within 0.5% at step 1, 5% after"
+# the unread targets' planes left unwritten under slot_skip 4 too (tdead: no memset of target-less channels, no loss-mask write; ttmp and the
+# mask slice of a worker stay unbacked): every batch plane equal with it off
+run split_dev_tw UFSM_BANK_CHECK=1 UFSM_TDEAD_TMU=0 -- --gpus 0,0 --split z
+[ "$(grep '^batchhash' split_dev.log | sed 's/ slot [0-9]*//')" = "$(grep '^batchhash' split_dev_tw.log | sed 's/ slot [0-9]*//')" ] || { echo "FAIL: split: UFSM_TDEAD_TMU changed the batches"; exit 1; }
+echo "split: the unread targets left unwritten (tdead under slot_skip 4): batches identical"
 grep -q 'targets: packed' split_new.log && { echo "FAIL: split: packed targets (the case slot_skip 4 is for)"; exit 1; }
 echo "test_slot_planes: ok"
