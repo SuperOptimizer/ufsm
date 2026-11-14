@@ -1,6 +1,5 @@
 /* ufsm train: sampler -> pinned batches -> one or more GPUs (data parallel, gradients averaged through the
    host) -> UNet -> BCE+Dice -> AdamW/EMA, with held-out validation batches, CSV log and checkpoints. */
-#include <openssl/evp.h>
 #include "ckring.h"
 #include "gns.h"
 #include "optcheck.h"
@@ -530,14 +529,6 @@ static void axr_set(gpu_state *d, int i) { if (g_axr) unet_set_attn_axis(d->u, d
    side) are active when any of their cells is not empty, dilated by r tiles (Chebyshev); one line a threshold with the active shares */
 /* a host allocation that must succeed: a message and abort instead of a NULL write later (audit mini/alloc) */
 static void *ck_host(void *p, size_t n, const char *what) { if (!p && n) { fprintf(stderr, "out of host memory: %zu bytes for %s\n", n, what); abort(); } return p; }
-/* sha256 of a file as hex (out[65]; "" when unreadable): the checkpoint's provenance (audit eval#21) */
-static void prov_sha256(const char *path, char out[65]) {
-    out[0] = 0; FILE *f = path ? fopen(path, "rb") : nullptr; if (!f) return;
-    EVP_MD_CTX *c = EVP_MD_CTX_new(); unsigned char h[32], buf[1 << 16]; unsigned nh = 0; size_t n; int ok = c && EVP_DigestInit_ex(c, EVP_sha256(), nullptr);
-    while (ok && (n = fread(buf, 1, sizeof buf, f)) > 0) ok = EVP_DigestUpdate(c, buf, n);
-    if (ok && !ferror(f) && EVP_DigestFinal_ex(c, h, &nh) && nh == 32) for (int i = 0; i < 32; i++) snprintf(out + 2 * i, 3, "%02x", h[i]);
-    EVP_MD_CTX_free(c); fclose(f);
-}
 static int et_frac(const uint8_t *t8, int nz, int ny, int nx, int f, int r, double *out) {   /* t8: the 8^3-cell level-0 tiles; f: tiles of f x f x f of them */
     const int mz = (nz + f - 1) / f, my = (ny + f - 1) / f, mx = (nx + f - 1) / f; uint8_t *a = calloc((size_t)mz * my * mx, 1); size_t act = 0; if (!a) { *out = 0; return -1; }
     for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) if (t8[((size_t)z * ny + y) * nx + x]) a[((size_t)(z / f) * my + y / f) * mx + x / f] = 1;
@@ -4646,27 +4637,6 @@ int cmd_train(int argc, char **argv) {
     }
     char checkpoint_extra[8192], runtime_extra[8192];
     if (checkpoint_runtime_json(&runtime, runtime_extra, sizeof runtime_extra)) { fprintf(stderr, "invalid checkpoint settings\n"); return 2; }
-    {   /* provenance (audit eval#21): the binary's and the sources json's sha256, each holdout_file the sources name with its sha256, the rungs
-           (--levels: the level weights) and the git sha when the build defines UFSM_GIT; in the header's "extra", so evals can tie a number to a model */
-        char hb[65], hs[65], pj[3072]; prov_sha256("/proc/self/exe", hb); prov_sha256(src, hs);
-        size_t k = (size_t)snprintf(pj, sizeof pj, ",\"provenance\":{\"version\":1,\"bin_sha256\":\"%s\",\"sources\":\"%s\",\"sources_sha256\":\"%s\",\"levels\":\"%s\"", hb, src, hs, opt(argc, argv, "--levels", ""));
-#ifdef UFSM_GIT
-        k += (size_t)snprintf(pj + k, k < sizeof pj ? sizeof pj - k : 0, ",\"git\":\"" UFSM_GIT "\"");
-#endif
-        k += (size_t)snprintf(pj + k, k < sizeof pj ? sizeof pj - k : 0, ",\"holdout_files\":[");
-        FILE *sf = fopen(src, "rb"); int nh_ = 0;
-        if (sf) {   /* (the "holdout_file" strings of the sources json, in order; relative paths as the json gives them) */
-            fseek(sf, 0, SEEK_END); const long sz = ftell(sf); fseek(sf, 0, SEEK_SET); char *t = sz > 0 && sz < (64 << 20) ? malloc((size_t)sz + 1) : nullptr;
-            if (t && fread(t, 1, (size_t)sz, sf) == (size_t)sz) { t[sz] = 0;
-                for (const char *q = strstr(t, "\"holdout_file\""); q && nh_ < 8 && k < sizeof pj - 200; q = strstr(q + 14, "\"holdout_file\"")) {
-                    const char *a = strchr(q + 14, '"'); const char *b = a ? strchr(a + 1, '"') : nullptr; if (!a || !b || b - a > 400) continue;
-                    char fn[512]; snprintf(fn, sizeof fn, "%.*s", (int)(b - a - 1), a + 1); char hh[65]; prov_sha256(fn, hh);
-                    k += (size_t)snprintf(pj + k, sizeof pj - k, "%s{\"path\":\"%s\",\"sha256\":\"%s\"}", nh_++ ? "," : "", fn, hh); } }
-            free(t); fclose(sf);
-        }
-        if (k < sizeof pj - 4) { snprintf(pj + k, sizeof pj - k, "]}"); const size_t n = strlen(runtime_extra);
-            if (n > 1 && n + strlen(pj) + 2 < sizeof runtime_extra) { runtime_extra[n - 1] = 0; snprintf(runtime_extra + n - 1, sizeof runtime_extra - n + 1, "%s}", pj); } }
-    }
     {
         size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;
         snprintf(runtime_extra+n-1, sizeof runtime_extra-n+1,

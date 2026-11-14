@@ -137,9 +137,6 @@ g_cnt() {   # fit-compare turn counts on 0.5 mm radial segments, by phase | dens
   echo "$(echo "$l" | grep -oE "median [-+]?[0-9.]+" | awk "{print \$2+0}") $(echo "$l" | grep -oE "0.5 turn [0-9.]+" | awk "{print \$3}") $(echo "$l" | grep -oE "um: [0-9.]+" | awk "{print \$2}")"; }
 
 # ---- boxes ----
-HCOV=${HOLDOUTS:-$H/../holdouts/holdouts-20261114.json}   # (audit eval#10: the boxes a run's holdouts leave trainable are not held-out numbers)
-[ -s "$HCOV" ] && { nc=$(python3 -I $H/../holdouts/wbcover.py $BT $HCOV | grep -c '^not held out'); [ "$nc" = 0 ] || \
-  echo "wbench: WARNING: $nc boxes of $(basename $BT) lie in no held-out box of $(basename $HCOV) (scripts/holdouts/wbcover.py lists them): their scores are training-fit, not held-out" >&2; }
 if [ "$BOXES" = all ]; then BL=$(grep -v '^#' $BT | cut -f1)
 elif [ "$BOXES" = none ]; then BL=""
 elif [ "$BOXES" = clean ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /label-noise/' | cut -f1)

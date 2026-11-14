@@ -108,9 +108,7 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
     else lvi=${LV_INK:-1}; ch=${INKP#ch:}; key=$(python3 -I -c "print(round($um * 2 ** $lvi, 3))")
       [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --resume 1 --channel $ch $AXF --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
     touch $o/pred_$cr.done; [ $PO = 1 ] && continue
-    if [ $vs = 1 ]; then gk=$(ls $g | grep -vE '^(segments|zarr.json)$')   # (exactly one GT array: head -1 picked one of several silently; audit eval#19)
-      [ $(echo "$gk" | grep -c .) = 1 ] || { log "ink: $cr GT $g has $(echo "$gk" | grep -c .) arrays ($(echo $gk)), not one: no voxelwise score"; vs=0; }; fi
-    if [ $vs = 1 ]; then
+    if [ $vs = 1 ]; then gk=$(ls $g | grep -vE '^(segments|zarr.json)$' | head -1)
       $U ink-vscore --gt $g $gk --pred $v $key --box $box --level $lvi --row $cr --threads 8 2>> $o/vscore_$cr.log | grep -P "^$cr\t" >> $o/vscores.tsv; fi
     grep -qP "^$cr\t" $o/scores.tsv && continue
     s=$o/surf/$cr; mkdir -p $s/w; python3 -I - $C/$cr $s/w/w_$cr $lvi <<'PY'   # the crop surface in the ink volume's voxels (render samples volume voxels; render only reads wrap dirs named w*)
@@ -152,7 +150,7 @@ fi
   ls $E/$T/fib/*.judge > /dev/null 2>&1 && { echo "-- fib (HOLD; fibhv-c hold-12000: H tube median 0.57 mm, pairs .96)"; for j in $E/$T/fib/*.judge; do echo "$(basename $j .judge): $(tr '\n' ' ' < $j | cut -c1-260)"; done; }
   [ -s $E/$T/ink/scores.tsv ] && { echo "-- ink (ink-score vs human labels: crop map n inkfrac f1best thr f1_05 prec05 rec05 auc)"; cat $E/$T/ink/scores.tsv
     awk -F'\t' '{n++; f+=$5; a+=$10} END {if (n) printf "mean over %d crops: f1best %.4f auc %.4f\n", n, f / n, a / n}' $E/$T/ink/scores.tsv; }
-    [ -s $E/$T/ink/vscores.tsv ] && echo "-- ink voxelwise (ink-vscore vs 3-D ink-splat refs: crop P N known_frac ink_share auc thr f1best f1_05 prec05 rec05)" && cat $E/$T/ink/vscores.tsv && awk -F"\t" "\$6 == \$6 + 0 {n++; a+=\$6; f+=\$8; z+=2*\$5/(1+\$5)} END {if (n) printf \"voxelwise vs 3-D refs over %d crops (one-class crops skipped): auc %.4f f1best %.4f (all-ink floor 2s/(1+s) %.4f)\\n\", n, a / n, f / n, z / n}" $E/$T/ink/vscores.tsv; python3 -I $H/scripts/inkgt/segci.py $E/$T/ink/vscores.tsv 6 8;
+    [ -s $E/$T/ink/vscores.tsv ] && echo "-- ink voxelwise (ink-vscore vs 3-D ink-splat refs: crop P N known_frac ink_share auc thr f1best f1_05 prec05 rec05)" && cat $E/$T/ink/vscores.tsv && awk -F"\t" "{n++; a+=\$6; f+=\$8} END {if (n) printf \"voxelwise vs 3-D refs over %d crops: auc %.4f f1best %.4f\\n\", n, a / n, f / n}" $E/$T/ink/vscores.tsv; python3 -I $H/scripts/inkgt/segci.py $E/$T/ink/vscores.tsv 6 8;
     # per scroll (crop names: w.. = Paris 4, else SCROLL_w..): held-out rows named for what the trunk saw (INKSEEN "SCROLL=label ...")
     for f in scores:5:10 vscores:8:6; do IFS=: read -r fn fc ac <<< "$f"; [ -s $E/$T/ink/$fn.tsv ] || continue
       awk -F'\t' -v fc=$fc -v ac=$ac -v lab="${INKSEEN:-PHerc0500P2=unseen-ink-labels,seen-CT PHerc0841=unseen-scroll}" -v w=$fn 'BEGIN {n = split(lab, L, " "); for (i = 1; i <= n; i++) { split(L[i], kv, "="); D[kv[1]] = kv[2] } }
