@@ -320,7 +320,7 @@ __global__ void mask_sp_k(const float *w, float *out, float *g, float lambda, in
         if (e2) { const double v = (double)w[j] * w[j]; ea += v; if (kp) ek += v; }
         if (aux) { if (!kp) aux[j] = 0.f; }
         if (g) { if (!kp) g[j] += lambda * w[j]; }
-        else if (out) out[j] = kp ? w[j] : r * w[j];
+        else if (out) out[j] = kp ? w[j] : r != 0.f ? r * w[j] : 0.f;   /* (+0, not -0 for r 0: the masked copy bytes as before) */
     }
     if (e2) { atomicAdd(e2, ea); atomicAdd(e2 + 1, ek); }
 }
