@@ -2446,7 +2446,8 @@ static int cmd_wraps(int argc, char **argv) {
                                     "  --min-cm2 C: wraps under C cm2 (vertices x (step x um)^2) are not written (default 0.5: end-cap / air fragments; 0 keeps all)\n"
                                     "  with --fields: only wrap ids within ~1 turn of a data cell are computed, largest first (UFSM_WRAPS_NOPRUNE=1: every id)\n"
                                     "  --data-thr T --data-min M (with --fields): a vertex is kept where >= M/255 of its pooled cell's field cells hold material >= T/255\n"
-                                    "     (default 128 128: a majority at least half material; 1 1 = the earlier any-cell test)\n"); return 2; }
+                                    "     (default 128 128: a majority at least half material; 1 1 = the earlier any-cell test)\n"
+                                    "  --nodata-warn F (0.02) / --nodata-max F (0: off; exit 3 above): the share of roots dropped on weak data cells (masked-CT gate)\n"); return 2; }
     if (atof(opt(argc, argv, "--sfc", "0")) > 0) tifxyz_set_sfc(atof(opt(argc, argv, "--sfc", "0")));
     fit_set *fs = fit_set_load(argv[2]); if (!fs) { fprintf(stderr, "wraps: cannot load %s\n", argv[2]); return 1; }
     const fit_model *m = fs->global;   /* the box, the axis; rows dispatch to the slab model of their z */
@@ -2571,8 +2572,11 @@ static int cmd_wraps(int argc, char **argv) {
     if (A.fail) return 1;
     if (wf) {   /* the masked-CT gate's wraps line: the weak-edge roots (a zeroed CT next to the data, PHerc1667 u1: the outer dup wraps) */
         const long long nw = atomic_load(&g_wr_nweak), nk = atomic_load(&g_wr_nkept); const double sh = nw + nk ? (double)nw / (double)(nw + nk) : 0;
-        fprintf(stderr, "wraps: no-data: %lld roots on weak data cells (share >0 and < %d/255 of the cells with material >= %s/255) dropped, %.4f of the roots in the data%s\n",
-                nw, g_wr_dmin, opt(argc, argv, "--data-thr", "128"), sh, sh > 0.02 ? " (WARNING > 0.02: wide weak data edges, masked CT?)" : "");
+        const double nwarn = atof(opt(argc, argv, "--nodata-warn", "0.02")), nmax = atof(opt(argc, argv, "--nodata-max", "0"));   /* (the wrap-snap --masked-warn / --masked-max pattern) */
+        fprintf(stderr, "wraps: no-data: %lld roots on weak data cells (share >0 and < %d/255 of the cells with material >= %s/255) dropped, %.4f of the roots in the data\n",
+                nw, g_wr_dmin, opt(argc, argv, "--data-thr", "128"), sh);
+        if (sh > nwarn) fprintf(stderr, "wraps: WARNING: no-data share %.4f (> --nodata-warn %g): wide weak data edges, the CT masked next to papyrus? (fields on the unmasked / filled CT)\n", sh, nwarn);
+        if (nmax > 0 && sh > nmax) { fprintf(stderr, "wraps: no-data share %.4f > --nodata-max %g: stop\n", sh, nmax); return 3; }
     }
     const int nwr = A.nwr; const size_t nvalid_all = A.nvalid;
     fprintf(stderr, "wraps: %d wraps (%d..%d) with %zu vertices written to %s", nwr, k0, k1, nvalid_all, argv[3]);

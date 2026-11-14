@@ -40,8 +40,10 @@ the outer turns (16 % of the published area lies on zero CT). Two effects:
 
   - w044-w066 are gone. Near z 20000 the dropped vertices are 96.1 % on zero CT at level 1, with median depth 115 um. The other 338
     are all within 100 um of the mask. The 2-D simulation at pool 4 kept 99.5 % of the on-CT vertices and 4 % of the masked ones.
-  - It prints `wraps: no-data: N roots on weak data cells ... share` and a WARNING above 0.02 (1667-u1 band: 0.057).
-- **One gate.** unroll.sh logs both WARNING lines (ref, wraps) to progress.log. audit-ugeom removed its wrap-snap ALARM
+  - It prints `wraps: no-data: N roots on weak data cells ... share` (1667-u1 band: 0.057). The gate follows wrap-snap's pattern
+    (geo-gate): a WARNING above `--nodata-warn` 0.02, exit 3 above `--nodata-max` (off; NODATAMAX in unroll.sh), and unroll.sh logs
+    `wraps: ALARM ...` / `ref: ALARM ...` to progress.log.
+- **One gate.** unroll.sh logs both as ALARM lines (ref, wraps) to progress.log. audit-ugeom removed its wrap-snap ALARM
   (ugeomfix c6d9985). wrap-snap keeps its masked-share print as a cross-check, and `--masked-max` stays (off by default).
 - **Tests.**
   - test_wraps_core: fit_field_array_frac against a brute-force share at pools 4 / 8 / 3. A masked-fields case: w 255 inside the data

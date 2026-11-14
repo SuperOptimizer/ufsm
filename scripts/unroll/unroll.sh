@@ -258,7 +258,7 @@ ref() {
   X $O/logs/ref.log $U count-field $F $O/cf.unused $(refpool) --iters 1200 --model $REF \
     --threads $TH --mem-gb ${CFMEM:-24} $cal $pc; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; } || return 1
   [ "$DRY" != 1 ] && grep -q 'no ring vote on the direction' $O/logs/ref.log && log "ref: WARNING: $(grep -o 'no ring vote on the direction.*' $O/logs/ref.log | tail -1)"
-  [ "$DRY" != 1 ] && grep -q 'WARNING no-data pairs' $O/logs/ref.log && log "ref: WARNING: $(grep -o 'no-data: .*' $O/logs/ref.log | tail -1)"
+  [ "$DRY" != 1 ] && grep -q 'WARNING no-data pairs' $O/logs/ref.log && log "ref: ALARM $(grep -o 'no-data: .*' $O/logs/ref.log | tail -1)"
   return 0
 }
 
@@ -415,10 +415,11 @@ check() {
 wraps() {
   local zr=; [ -n "$ZR" ] && [ "$ZR" != - ] && zr="--zr $ZR"
   [ "$DRY" = 1 ] || rm -rf $O/wraps
-  X $O/logs/wraps.log $U wraps $O/joined $O/wraps --step 4 --out-um $LUM --sfc 0.25 --fields $F --threads $TH $zr --min-cm2 ${MINCM2W:-0.5} || return 1
-  # the masked-CT gate (geo-outer 2026-11-14): wraps drops roots on weak data cells (the fields' edge on a zeroed CT); a share > 0.02
-  # means wide weak data edges, i.e. a mask that clips papyrus: the fields want the unmasked / filled CT
-  [ "$DRY" = 1 ] || { grep -q 'wraps: no-data:.*WARNING' $O/logs/wraps.log && log "wraps: WARNING $(grep -o 'wraps: no-data:.*' $O/logs/wraps.log | tail -1)"; return 0; }
+  # the masked-CT gate (geo-outer 2026-11-14; the one no-data alarm): wraps drops roots on weak data cells (the fields' edge on a zeroed
+  # CT); a share > --nodata-warn 0.02 means a mask that clips papyrus (the fields want the unmasked / filled CT). NODATAMAX F: exit 3 above
+  local nm=; [ -n "${NODATAMAX:-}" ] && nm="--nodata-max $NODATAMAX"
+  X $O/logs/wraps.log $U wraps $O/joined $O/wraps --step 4 --out-um $LUM --sfc 0.25 --fields $F --threads $TH $zr --min-cm2 ${MINCM2W:-0.5} $nm || return 1
+  [ "$DRY" = 1 ] || { grep -q 'wraps: WARNING: no-data' $O/logs/wraps.log && log "wraps: ALARM $(grep -o 'no-data share.*' $O/logs/wraps.log | tail -1)"; return 0; }
 }
 # trim: the strip's outer end. Wrap ids increase OUTWARD and the strip walks outermost first (column 0 = the highest id), so the outer
 # end is the highest ids. (1) From the highest wrap-check verdict id walk down while the verdict is dup (the ref's outer over-count:
