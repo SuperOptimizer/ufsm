@@ -150,7 +150,7 @@ mstart() {
   if [ -n "${INKCMD:-}" ]; then mset inkcmd "$INKCMD"; mset ink_ck "${LATINK_CK:-the default of INKCMD}"; [ -n "${LATINK_CK:-}" ] && mset ink_ck_sha "$(fsha $LATINK_CK)"
   else mset ink_ck "$(readlink -f $INKCK)"; mset ink_ck_sha "$(fsha $INKCK)"; fi
   mset box "${BOX:-mask}"; mset zr "${ZR:--}"; mset stripargs_env "${STRIPARGS:-}"
-  mset env "$(for v in CK INKCK INKCMD LATINK_CK FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FBLEND ONEPASS OPWIN LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
+  mset env "$(for v in CK INKCK INKCMD LATINK_CK FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FBLEND ONEPASS OPWIN FCTR FCTK LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
 }
 mstage() {
   [ "$DRY" = 1 ] && return 0
@@ -197,6 +197,8 @@ occlv() {   # --occupancy L for the fields: the first of levels LV+3, LV+2, LV+4
                      *) [ -e $R/$K/$l/zarr.json ] && { echo "--occupancy $l"; return; };; esac
   done
 }
+# FCTR / FCTK (default the run's CT): another CT root / key for the fields predict only, e.g. an unmasked or dilated-mask scan (audit-ugeom
+# 2026-11-14: 16.2 % of the published 1667 surface lies on zero (masked) CT, the outer turns clipped at the mask edge)
 # FBLEND=1 (OFF by default; audit 2026-11-14 #5, A/B pending): each part predicted on two tile grids (origin 0 and half the stride) and
 # blended with ufsm field-blend --tile (sin^2 weights: every cell leans on the window it sits deep inside), against the tile-border steps of
 # the single-grid fields (1667 u1 640/64: the normal plane t0 steps 4-5x its interior median at every 256-cell border). Lat fields only.
@@ -222,7 +224,7 @@ fpred() {   # fpred GPU BOX OUT
 fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windows anchored at GRID (each axis)
   local win; if [ "$FKIND" = lat ]; then win="--window ${LWIN:-640} --halo ${LHALO:-64}"
   else win="$([ "${FWIN:-prod}" = auto ] && echo "--window auto" || echo "--window-z 384 --halo-z 64 --window 640") --halo 64"; fi
-  X $O/logs/fields.log $U predict $CK $R $K $3.tmp --um $UM --level $LV --box $2 $win --shard 512 \
+  X $O/logs/fields.log $U predict $CK ${FCTR:-$R} ${FCTK:-$K} $3.tmp --um $UM --level $LV --box $2 $win --shard 512 \
     --grid-origin $4,$4,$4 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }

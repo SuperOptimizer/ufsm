@@ -1144,6 +1144,20 @@ extern "C" void nn_pred_stats(const uint8_t *ct, size_t n, void *scratch, size_t
     cudaMemcpy(h, acc, sizeof h, cudaMemcpyDeviceToHost);
     *nz = (size_t)h[0]; *sum = (double)h[1]; *sq = (double)h[2];
 }
+static unsigned long long *g_ps_host[16]; static cudaEvent_t g_ps_ev[16];   /* nn_pred_stats_start / _finish, per device */
+extern "C" void nn_pred_stats_start(const uint8_t *ct, size_t n, void *scratch) {
+    int dev = 0; cudaGetDevice(&dev); dev &= 15;
+    if (!g_ps_host[dev]) { CK(cudaMallocHost((void **)&g_ps_host[dev], 3 * sizeof(unsigned long long))); CK(cudaEventCreateWithFlags(&g_ps_ev[dev], cudaEventDisableTiming)); }
+    unsigned long long *acc = (unsigned long long *)scratch;
+    cudaMemsetAsync(acc, 0, 3 * sizeof *acc);
+    pred_stats_k<<<256, 256>>>(ct, n, acc); KCHECK();
+    cudaMemcpyAsync(g_ps_host[dev], acc, 3 * sizeof *acc, cudaMemcpyDeviceToHost, 0); cudaEventRecord(g_ps_ev[dev], 0);
+}
+extern "C" void nn_pred_stats_finish(size_t *nz, double *sum, double *sq) {
+    int dev = 0; cudaGetDevice(&dev); dev &= 15;
+    CK(cudaEventSynchronize(g_ps_ev[dev]));
+    const unsigned long long *h = g_ps_host[dev]; *nz = (size_t)h[0]; *sum = (double)h[1]; *sq = (double)h[2];
+}
 extern "C" void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, float *y, int ctot, int c0) {
     const gnp_t gp = to_gnp(g);
     if (ISMX(x)) { if (!ISMX(y) || ctot != xs.c || c0) { fprintf(stderr, "up2: MX input needs a whole MX output tensor (y MX %d, ctot %d, c %d, c0 %d)\n", MXDT(y), ctot, xs.c, c0); abort(); } lp_up2_fwd_mx(x, MXDT(x), xs, y, MXDT(y), gp); KCHECK(); return; }

@@ -945,6 +945,16 @@ static int phead_writer(writer_t *W, z3w *w, size_t bytes, size_t abytes, int nt
     return 0;
 }
 
+/* a window's origin relative to the axis per z slice (double on the host, small in float): dyo / dxo [Wz] */
+static void axis_rows(const axis *ax, const int64_t o[3], int Wz, double scale, float *dyo, float *dxo) {
+    for (int z = 0; z < Wz; z++) {
+        double cy, cx;
+        axis_at(ax, (double)(o[0] + z) * scale, &cy, &cx);
+        cy /= scale; cx /= scale;
+        dyo[z] = (float)((double)o[1] - cy); dxo[z] = (float)((double)o[2] - cx);
+    }
+}
+
 /* --occupancy: any nonzero voxel of the coarse level (factor f, read over [o, o + n)) under the level region [g0, g1), one coarse voxel of margin */
 static int occ_any(const uint8_t *ob, const int64_t o[3], const int64_t n[3], int f, const int64_t g0[3], const int64_t g1[3]) {
     int64_t a[3], b[3];
@@ -2331,6 +2341,19 @@ static int predict_one(int argc, char **argv) {
         }
     }
     if (occt) fprintf(stderr, "predict: %ld windows to run, %ld more skipped (interior air on CT level %d, --occupancy)\n", rd.ntiles, nocct, occl);
+    /* windows over absent CT chunks only (fill 0): all zero, so the loop below would read, decode, upload and then skip them (nz == 0); the
+       shard indexes say so before any read (z3_box_any, the indexes the reads load anyway; 1299: 63 of 778 windows passed the coarse
+       occupancy test that way). Same conditions as the tile test; the plain CT path only (not --latents / latvol); UFSM_AIR_CHUNKS=0 off */
+    if (!lat_store && !lvc && !gn_save && !fea && !sheet_task && !split && z3_meta_of(ct)->fill == 0 && (!getenv("UFSM_AIR_CHUNKS") || ufsm_env_on("UFSM_AIR_CHUNKS"))) {
+        long kept = 0, nair = 0;
+        for (long i = 0; i < rd.ntiles; i++) {
+            const tile_t *t = &rd.tiles[i]; const int64_t o[3] = {bo[0] + t->tz, bo[1] + t->ty, bo[2] + t->tx}, n[3] = {Wz, W, W};
+            if (z3_box_any(ct, o, n) == 0) { nair++; continue; }   /* (-1, an index error: kept, the read reports it) */
+            rd.tiles[kept++] = *t;
+        }
+        if (nair) fprintf(stderr, "predict: %ld windows over absent CT chunks only skipped before reading (%ld to run)\n", nair, kept);
+        rd.ntiles = kept;
+    }
     static seam_t SM;
     if (seam2) {
         if (seam_init(&SM, nph, shard, ns, bo, rd.tiles, rd.ntiles)) { fprintf(stderr, "predict --seam-inproc: out of memory\n"); return 1; }
@@ -2500,7 +2523,7 @@ static int predict_one(int argc, char **argv) {
             scan_aug_apply(&dg, sd, (uint8_t *)rd.buf[k], nullptr, 0, g_ps.dsc, W, o, g_ps.dcy, g_ps.dcy + W, ax.n > 0, chk, 0, g_ps.dsc + w3);
         }
         {
-            size_t nz = rd.nz[k]; double sum = rd.sum[k], sq = rd.sq[k];
+            size_t nz = rd.nz[k]; double sum = rd.sum[k], sq = rd.sq[k]; int stats_pending = 0, rows_done = 0;
             if (gpath) {   /* upload (pinned), statistics on the device, then the slot is free for the reader */
                 nn_ptick("wait reader + host");
                 pt = now();
@@ -2521,10 +2544,14 @@ static int predict_one(int argc, char **argv) {
                 if (pre_i == i) {   /* prefetched: the copy stream's upload, then one device copy (the prefetch buffer free again after it) */
                     nn_stream_wait(0, ev_pre); nn_d2d_async(ctd, ctpre, w3); nn_event_record(ev_preu, 0);
                 } else if (rd.dbuf[0]) nn_d2d(ctd, rd.dbuf[k], w3); else nn_h2d(ctd, ctu, w3);
-                nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq);
-                if (lvc) sq += (double)lvc->drop_ms * (double)nz;   /* (a latvol CT decoded by z3_read: the rebuilt bytes' variance lacks the dropped axes, as below) */
+                nn_pred_stats_start(ctd, w3, stsc); stats_pending = 1;   /* (finished below, after the axis rows: no blocking copy here) */
                 }
                 pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu);
+                if (stats_pending) {
+                    axis_rows(&ax, o, Wz, scale, dyo, dxo); rows_done = 1;
+                    nn_pred_stats_finish(&nz, &sum, &sq); stats_pending = 0;
+                    if (lvc) sq += (double)lvc->drop_ms * (double)nz;   /* (a latvol CT decoded by z3_read: the rebuilt bytes' variance lacks the dropped axes, as below) */
+                }
                 p_h2d += now() - pt; nn_ptick("upload + CT stats");
             }
             if (nz == 0) { nskip++; pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu); continue; }
@@ -2536,12 +2563,7 @@ static int predict_one(int argc, char **argv) {
             /* G * ((CT - mean) / sd) + B in both explicit-input and fused-stem paths (predict --input-gain / --input-bias): the original CT
                bytes stay for masking, only the CT input channel changes */
             if (input_affine) { mean -= input_bias * sd / input_gain; sd /= input_gain; }
-            for (int z = 0; z < Wz; z++) {   /* window origin relative to the axis at this slice (double on the host, small in float) */
-                double cy, cx;
-                axis_at(&ax, (double)(o[0] + z) * scale, &cy, &cx);
-                cy /= scale; cx /= scale;
-                dyo[z] = (float)((double)o[1] - cy); dxo[z] = (float)((double)o[2] - cx);
-            }
+            if (!rows_done) axis_rows(&ax, o, Wz, scale, dyo, dxo);
             pt = now();
             if (!gpath) nn_h2d(ctd, ctu, w3);
             nn_h2d(dyd, dyo, 2 * (size_t)W * sizeof(float));
