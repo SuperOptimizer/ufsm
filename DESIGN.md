@@ -77,6 +77,20 @@ cell, no fp16 slab) was off for every --ink-head run by a blanket !g_ink2 in its
 fused normal / density group (2-8) and has its own targets and sums. Now on: the same dump byte-identical to the chain as well (the fp32
 re-association of the fused sums does not reach the fp16 planes on this window), step-1 loss equal, loss category 255 -> 219.5 ms.
 Together 279 -> 219.5 ms of ~2.72 s GPU time a step: -2.2 % at P 768 one card. UFSM_LAT_FUSE=0 turns the fused pass off as before.
+At P 512 (try6's per-card shape, the same config): loss 85.0 -> 68.4 ms of ~870 ms (UFSM_PROF sums), -1.9 %. What is left of the head /
+loss path at P 512 (nsys, share of kernel time): fstem_fwd_k 3.2 (both passes), conv1_to_mx_t_k 2.4 (perf2: the TC version), lat_fuse_k
+2.0, fstem_bwd_k 1.6, lat_adj_xy_k 1.5, w4_events_k + w4_runs_k 2.7, lat_up4_k 1.4, loss_grad_k + loss_stats_k 2.1, conv1_mx_tc_k 1.2,
+lab_unpack_k 1.0, ink_sym_k 0.9, the target builders (packed_mask, ink_tg, unwrap_tg, w4_stats / w4_grad) ~2.5.
+
+**The ink-MIL plane-bound overflow (try6, P 512 DP, step ~400).** "a slab's pairs exceeded its plane bound by 19064" was not the
+histogram (k_plane_hist and k_pairs run the same samp arithmetic, the same FFMA chain in the SASS) but the rays: in lean memory modes
+d->milr[1] aliased milr[0], and upload_async's mil_take copied the next window's rays on the copy stream before any of its stream
+waits, so they landed under the current step's backward slabs; the pairs came from other rays than fin's counts. With
+UFSM_MIL_ASYNC=0 (the readback) the run went on, with those steps' MIL gradient computed from the next window's rays. Now two ray
+buffers in every mode (+2.6 MB at 65536 rays), the copy waits for ev_done[i] (the step that last read buffer i), and an overflow
+reported by a later step switches every thread to the per-slab readback with a warning instead of exit(1). test_ink_mil: rays A for
+the passes and fin, rays B (6 planes away in z) copied over them before the backward slabs, then a step on B: the old code returned
+-1, now rc 0, one overflow counted, and the second step's gradient byte-equal to the readback's.
 
 ## Split peer copies off the copy engines (2026-11-14, branch peerk-20261114)
 
