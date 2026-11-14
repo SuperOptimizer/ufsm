@@ -2,7 +2,7 @@
 # scripts/univ/b1_pull_p4A.sh (desk): pulls the Paris 4 June 4.8 um phase shards from pod 2 (b1_pod_p4A.sh) as they are written, with
 # rsync --remove-source-files (shards are written whole by rename; temporary names excluded), and marks each finished part as pulled so
 # the pod starts the next. Ends when the pod log says done and nothing is left to pull.
-set -u; EP=${EP:-root@213.173.107.10}; EPP=${EPP:-27064}; P="ssh -p $EPP -i $HOME/.ssh/id_ed25519"
+set -u; EP=${EP:?EP: the pod, user@host (pods change daily)}; EPP=${EPP:?EPP: its ssh port}; P="ssh -p $EPP -i $HOME/.ssh/id_ed25519"
 R=${R:-/workspace/b1/gt/paris4/phaseA48}; L=${L:-/mnt/scratch/univ/b1/gt/paris4/phaseA48}; LOGF=${LOGF:-/workspace/b1/p4A.log}; mkdir -p $L
 while :; do
   done_parts=$($P $EP "ls $R.part-*.done 2>/dev/null" < /dev/null)

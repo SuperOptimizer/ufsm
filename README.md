@@ -85,7 +85,8 @@ $U predict $CK $R $K fields.tmp --um 2.4 --level 2 --box Z,Y,X,NZ,NY,NX --window
    --grid-origin 0,0,0 --ema 1 --q 8 --axis axis.json --levels 1 --fit-zarr fields --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 --occupancy 5
 for a in fields/*/; do $U repack $a ${a%/}.512 512 --threads 12 && rm -r $a && mv ${a%/}.512 $a; done
 #    (fields keep the production window 384 x 640^2 (main 10-31: the P4 crop wingate lost 0.018 GT ids at 640^3; opt-in --window auto /
-#     FWIN=auto in unroll.sh / corpus desk.sh until a full-scroll check passes). --window auto (default for --feather ink): the cheapest window
+#     FWIN=auto in unroll.sh / corpus desk.sh until a full-scroll check passes). --window auto (the inklib.sh default for --feather ink; predict itself needs an explicit
+#     --window auto or UFSM_PRED_WINDOW=auto, else W 288 / halo 8, and --feather > halo is refused): the cheapest window
 #     per interior voxel the GPU holds: fields 16 GB 384 x 640^2, 24-46 GB 640^3, ~96 GB 1152^3; ink 576 up to ~30 GB, 1088 from ~46 GB.
 #     Direct slab outputs when there is room (~73 B per window voxel, no plane copies). UFSM_PRED_WINDOW=prod: the old windows;
 #     UFSM_SLAB_DIRECT=0: the copy path.)
@@ -111,7 +112,8 @@ $U wrap-check joined fields --ct $R $K/2 --ct-um 9.6 [--codes Q 9.6]            
 $U wraps joined wraps --step 4 --out-um 9.6 --sfc 0.25 --fields fields --threads 16
 $U wraps joined core  --step 4 --out-um 9.6 --sfc 0.25 --fields fields --first 70 --last 105 --zr 384,18176 --col-r p90   # core wraps
 
-# 7. per wrap: flatten, render upright, panels (scripts: /vesuvius/ufsm/p4full/p4full3.sh on the desk)
+# 7. per wrap: flatten, render upright, panels (DESK ONLY: the driver /vesuvius/ufsm/p4full/p4full3.sh is not in the repo; the
+#    commands below are its steps, run them by hand elsewhere)
 $U tifxyz-scale wraps orig 1 --wraps w120
 $U flatten orig flat --wraps w120 --decim D --threads 4 --crop none --gpu 1          # D: finest SLIM mesh <= 1.5M vertices
 $U tifxyz-scale flat up 1 --wraps w120 --flip-rows 1
@@ -141,7 +143,7 @@ Drivers (resumable per stage; `STOP` files; MemAvailable gates):
   scrolls). Settings per scroll (box, wraps `--zr`, strip flags) come from `scripts/unroll/scrolls.tsv`, else `scripts/corpus/list.tsv`.
   `state/<stage>.done` holds the wall time, CPU seconds and max RSS. `DRY=1` prints the plan; `touch $O/STOP` stops between stages.
   The render, faces and ink-compare stages use the shared decoded-CT cache (`UFSM_ZCACHE_GB`, admit 0.6). Its size is `ZCACHE_GB`:
-  by default 1/4 of the available RAM, at most 30 GB (the desk 30; a 62 GB pod ~15), and off on the laptop. The run removes
+  by default 1/4 of the available RAM, at most 30 GB (the desk 30; a 62 GB pod ~15), and off without a GPU (and on WSL; scripts/unroll/unroll.sh). The run removes
   `/dev/shm/ufsm-zcache-<uid>` when it ends, also on STOP. strip-mosaic gets `UFSM_JPEG_THREADS` = cores / 2.
   Env: `U CK INKCK FIELDGPUS FITGPUS INKGPU BOX TH PTH ITH MINMEM CTROOT CTKEY TAG INKCMD REFCMD ZCACHE_GB ZCACHE_ADMIT`.
 - `scripts/corpus/`: the three-host pipelined corpus unroll (`common.sh` describes the split): `desk.sh` prep (mask box from

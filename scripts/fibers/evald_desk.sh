@@ -5,7 +5,7 @@
 # >= 1 mm and >= 2 mm) and, on Paris 4 HOLD, the GT judge (fiber-judge --phase against paris4-wind-20261019 phaseA, as fibhv-c's eval).
 # Output: /vesuvius/ufsm/fibers/runs/fibhv-d/eval/hold-STEP.desk.log (+ the copied hold-STEP/ dir).
 set -u
-EP=${EP:-root@213.173.107.10}; EPP=${EPP:-27064}; P="ssh -p $EPP -i $HOME/.ssh/id_ed25519"; D=$(dirname "$(readlink -f "$0")")
+EP=${EP:?EP: the eval pod, user@host (pods change daily)}; EPP=${EPP:?EPP: its ssh port}; P="ssh -p $EPP -i $HOME/.ssh/id_ed25519"; D=$(dirname "$(readlink -f "$0")")
 C=${C:-/vesuvius/ufsm/fibers/runs/fibhv-d}; U=${U:-/home/forrest/ufsm-fibd/build/ufsm}; mkdir -p $C/eval
 J="--um 2.4 --level 2 --slab 12288,512 --region 4096,4608,3584,4352 --tile 256 --d-mm 0.3,0.6,1.2,2.4"
 for s in "$@"; do

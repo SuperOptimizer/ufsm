@@ -9,5 +9,5 @@ CTL=/workspace/ct/volcomp CTM=https://dl.ash2txt.org/community-uploads/forrest/v
   META=/workspace/fibers/meta CACHE=/workspace/cache python3 -I scripts/fibers/mksources3.py /workspace/fibd/sources-fibhv-d.json
 R=/workspace/fibers/runs SRCJ=/workspace/fibd/sources-fibhv-d.json U=/workspace/ufsm-fibd/build/ufsm GPU=0 LOCK= MEMCAP= P=512 WORKERS=8 SLOTS=10 MINMEM=16 VALB=0 SNAP=3000 \
   EXTRA="--fib-dir 1 --init-from $INIT" \
-  nohup bash scripts/fibers/train_hv.sh fibhv-d ${STEPS:-30000} > /workspace/fibers/runs/fibhv-d.out 2>&1 < /dev/null &
+  setsid nohup bash scripts/fibers/train_hv.sh fibhv-d ${STEPS:-30000} > /workspace/fibers/runs/fibhv-d.out 2>&1 < /dev/null &
 echo launched
