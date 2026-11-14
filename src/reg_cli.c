@@ -43,7 +43,7 @@ static int get_aff(const json *a, raff *r) {   /* 3x4 or 4x4 rows */
     return 0;
 }
 static void put_aff(FILE *f, const raff *a) {
-    fprintf(f, "[[%.12g,%.12g,%.12g,%.12g],[%.12g,%.12g,%.12g,%.12g],[%.12g,%.12g,%.12g,%.12g]]", a->m[0][0], a->m[0][1], a->m[0][2], a->m[0][3],
+    json_fprintf(f, "[[%.12g,%.12g,%.12g,%.12g],[%.12g,%.12g,%.12g,%.12g],[%.12g,%.12g,%.12g,%.12g]]", a->m[0][0], a->m[0][1], a->m[0][2], a->m[0][3],
             a->m[1][0], a->m[1][1], a->m[1][2], a->m[1][3], a->m[2][0], a->m[2][1], a->m[2][2], a->m[2][3]);
 }
 static void dirname_of(const char *p, char *out, size_t n) {
@@ -148,9 +148,9 @@ static int cmd_pair(int argc, char **argv) {
       fprintf(stderr, "  fine bbox in coarse voxels: x %.0f..%.0f y %.0f..%.0f z %.0f..%.0f (coarse shape x %lld y %lld z %lld)\n", lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], (long long)c->shape[0][2], (long long)c->shape[0][1], (long long)c->shape[0][0]);
       rvol_close(c); rvol_close(f); }
     FILE *o = fopen(out, "w"); if (!o) { perror(out); return 1; }
-    fprintf(o, "{\"name\":\"%s\",\n \"coarse\":{\"root\":\"%s\",\"key\":\"%s\",\"um\":%.6g},\n \"fine\":{\"root\":\"%s\",\"key\":\"%s\",\"um\":%.6g},\n \"A\":", opt(argc, argv, "--name", "pair"), cr, ck, cu, fr, fk, fu);
+    json_fprintf(o, "{\"name\":\"%s\",\n \"coarse\":{\"root\":\"%s\",\"key\":\"%s\",\"um\":%.6g},\n \"fine\":{\"root\":\"%s\",\"key\":\"%s\",\"um\":%.6g},\n \"A\":", opt(argc, argv, "--name", "pair"), cr, ck, cu, fr, fk, fu);
     put_aff(o, &A);
-    fprintf(o, ",\n \"A_note\":\"fine level-0 voxel (x,y,z) -> coarse level-0 voxel (x,y,z); fine(c) = A^-1 (c + D(c))\"}\n");
+    json_fprintf(o, ",\n \"A_note\":\"fine level-0 voxel (x,y,z) -> coarse level-0 voxel (x,y,z); fine(c) = A^-1 (c + D(c))\"}\n");
     fclose(o);
     return 0;
 }
@@ -246,7 +246,7 @@ static int cmd_boxes(int argc, char **argv) {
     int cnt[7] = {0};
     for (int i = 0; i < n; i++) {
         const rbox *b = &j.bx[i]; cnt[b->status]++;
-        fprintf(o, "{\"i\":%d,\"c\":[%.2f,%.2f,%.2f],\"D0\":[%.4f,%.4f,%.4f],\"s\":[%.4f,%.4f,%.4f],\"ncc\":%.4f,\"ncc0\":%.4f,\"second\":%.4f,\"curv\":%.5f,\"cstd\":%.3f,\"gstd\":%.3f,\"cfrac\":%.3f,\"gfrac\":%.3f,\"status\":\"%s\",\"lc\":%d,\"um\":%.6g}\n",
+        json_fprintf(o, "{\"i\":%d,\"c\":[%.2f,%.2f,%.2f],\"D0\":[%.4f,%.4f,%.4f],\"s\":[%.4f,%.4f,%.4f],\"ncc\":%.4f,\"ncc0\":%.4f,\"second\":%.4f,\"curv\":%.5f,\"cstd\":%.3f,\"gstd\":%.3f,\"cfrac\":%.3f,\"gfrac\":%.3f,\"status\":\"%s\",\"lc\":%d,\"um\":%.6g}\n",
                 i, b->c[0], b->c[1], b->c[2], b->D0[0], b->D0[1], b->D0[2], b->s[0], b->s[1], b->s[2], b->ncc, b->ncc0, b->second, b->curv, b->cstd, b->gstd, b->cfrac, b->gfrac, reg_status_name[b->status], q.lc, x.cv->um);
     }
     fclose(o);
@@ -292,7 +292,7 @@ static void quant(double *v, int n, double q[5]) {   /* p10 p50 p90 p99 mean */
 }
 static void put_q(FILE *o, const char *name, double *v, int n, double um, int last) {
     double q[5]; quant(v, n, q);
-    if (o) fprintf(o, "\"%s\":{\"n\":%d,\"p10_vox\":%.4f,\"p50_vox\":%.4f,\"p90_vox\":%.4f,\"p99_vox\":%.4f,\"mean_vox\":%.4f,\"p50_um\":%.3f,\"p90_um\":%.3f}%s", name, n, q[0], q[1], q[2], q[3], q[4], q[1] * um, q[2] * um, last ? "" : ",");
+    if (o) json_fprintf(o, "\"%s\":{\"n\":%d,\"p10_vox\":%.4f,\"p50_vox\":%.4f,\"p90_vox\":%.4f,\"p99_vox\":%.4f,\"mean_vox\":%.4f,\"p50_um\":%.3f,\"p90_um\":%.3f}%s", name, n, q[0], q[1], q[2], q[3], q[4], q[1] * um, q[2] * um, last ? "" : ",");
     fprintf(stderr, "  %-26s n %5d  |d| p10 %.3f p50 %.3f p90 %.3f p99 %.3f mean %.3f vox  (p50 %.2f um, p90 %.2f um)\n", name, n, q[0], q[1], q[2], q[3], q[4], q[1] * um, q[2] * um);
 }
 
@@ -314,12 +314,12 @@ static int cmd_stats(int argc, char **argv) {
     fprintf(stderr, "reg stats %s: %d boxes:", argv[3], n); for (int s = 0; s < 7; s++) if (cnt[s]) fprintf(stderr, " %s %d", reg_status_name[s], cnt[s]);
     fprintf(stderr, "\n  papyrus boxes %d, confident %d (%.1f%%), |s| < 0.25 vox: %d (%.1f%% of papyrus)\n", pap, acc, 100.0 * acc / fmax(1, pap), good, 100.0 * good / fmax(1, pap));
     FILE *o = opt(argc, argv, "--json", nullptr) ? fopen(opt(argc, argv, "--json", nullptr), "w") : nullptr;
-    if (o) fprintf(o, "{\"boxes\":%d,\"papyrus\":%d,\"confident\":%d,\"under_quarter\":%d,\"coverage\":%.4f,\"um\":%.6g,", n, pap, acc, good, (double)good / fmax(1, pap), um);
+    if (o) json_fprintf(o, "{\"boxes\":%d,\"papyrus\":%d,\"confident\":%d,\"under_quarter\":%d,\"coverage\":%.4f,\"um\":%.6g,", n, pap, acc, good, (double)good / fmax(1, pap), um);
     double qn[5], q0[5]; double *t = malloc((k + 1) * sizeof *t);
     memcpy(t, nc, k * sizeof *t); quant(t, k, qn); memcpy(t, n0, k * sizeof *t); quant(t, k, q0);
     fprintf(stderr, "  NCC at the peak p50 %.3f (p10 %.3f); NCC at the prior map p50 %.3f (p10 %.3f)\n", qn[1], qn[0], q0[1], q0[0]);
     put_q(o, "shift", m, k, um, 1);
-    if (o) { fprintf(o, ",\"ncc_p50\":%.4f,\"ncc0_p50\":%.4f}\n", qn[1], q0[1]); fclose(o); }
+    if (o) { json_fprintf(o, ",\"ncc_p50\":%.4f,\"ncc0_p50\":%.4f}\n", qn[1], q0[1]); fclose(o); }
     free(t); free(m); free(nc); free(n0); free(b);
     return 0;
 }
@@ -383,30 +383,30 @@ static int cmd_fit(int argc, char **argv) {
     snprintf(fp, sizeof fp, "%s/reg.json", od);
     FILE *o = fopen(fp, "w");
     const json *cj = json_get(x.j, "coarse"), *fj = json_get(x.j, "fine");
-    fprintf(o, "{\"name\":\"%s\",\n \"coarse\":{\"root\":\"%s\",\"key\":\"%s\",\"um\":%.6g},\n \"fine\":{\"root\":\"%s\",\"key\":\"%s\",\"um\":%.6g},\n \"A\":", json_str(json_get(x.j, "name"), "pair"),
+    json_fprintf(o, "{\"name\":\"%s\",\n \"coarse\":{\"root\":\"%s\",\"key\":\"%s\",\"um\":%.6g},\n \"fine\":{\"root\":\"%s\",\"key\":\"%s\",\"um\":%.6g},\n \"A\":", json_str(json_get(x.j, "name"), "pair"),
             json_str(json_get(cj, "root"), ""), json_str(json_get(cj, "key"), ""), json_num(json_get(cj, "um"), 0), json_str(json_get(fj, "root"), ""), json_str(json_get(fj, "key"), ""), json_num(json_get(fj, "um"), 0));
-    put_aff(o, &An); fprintf(o, ",\n \"A_inv\":"); { raff t = raff_inv(An); put_aff(o, &t); }
-    fprintf(o, ",\n \"A_input\":"); put_aff(o, &x.m.A);
-    { const json *ap = json_get(x.j, "A_published"); raff P; if (ap && !get_aff(ap, &P)) { fprintf(o, ",\n \"A_published\":"); put_aff(o, &P); } else { fprintf(o, ",\n \"A_published\":"); put_aff(o, &x.m.A); } }
-    fprintf(o, ",\n \"A_note\":\"A: fine level-0 voxel (x,y,z) -> coarse level-0 voxel (x,y,z), refined affine; fine(c) = A^-1 (c + D(c)), D the field (coarse L0 voxels, trilinear, clamped outside the grid)\"");
-    if (NN) fprintf(o, ",\n \"field\":{\"file\":\"field.f32\",\"n\":[%d,%d,%d],\"o\":[%.4f,%.4f,%.4f],\"h\":%.4f,\"layout\":\"float32 [nz][ny][nx][3] x,y,z displacement in coarse L0 voxels; node (k,j,i) at o + h (i,j,k)\",\"max_abs\":%.4f}",
+    put_aff(o, &An); json_fprintf(o, ",\n \"A_inv\":"); { raff t = raff_inv(An); put_aff(o, &t); }
+    json_fprintf(o, ",\n \"A_input\":"); put_aff(o, &x.m.A);
+    { const json *ap = json_get(x.j, "A_published"); raff P; if (ap && !get_aff(ap, &P)) { json_fprintf(o, ",\n \"A_published\":"); put_aff(o, &P); } else { json_fprintf(o, ",\n \"A_published\":"); put_aff(o, &x.m.A); } }
+    json_fprintf(o, ",\n \"A_note\":\"A: fine level-0 voxel (x,y,z) -> coarse level-0 voxel (x,y,z), refined affine; fine(c) = A^-1 (c + D(c)), D the field (coarse L0 voxels, trilinear, clamped outside the grid)\"");
+    if (NN) json_fprintf(o, ",\n \"field\":{\"file\":\"field.f32\",\"n\":[%d,%d,%d],\"o\":[%.4f,%.4f,%.4f],\"h\":%.4f,\"layout\":\"float32 [nz][ny][nx][3] x,y,z displacement in coarse L0 voxels; node (k,j,i) at o + h (i,j,k)\",\"max_abs\":%.4f}",
                     F.n[0], F.n[1], F.n[2], F.o[0], F.o[1], F.o[2], F.h, umax);
-    fprintf(o, ",\n \"fit\":{\"boxes\":\"%s\",\"n\":%d,\"accepted\":%d,\"h\":%.4g,\"lam\":%.4g,\"huber\":%.4g,\"ncc_min\":%.3g,\"sec_max\":%.3g,\"curv_min\":%.4g,\"holdout\":%d,\"affine_only\":%d,\"coarse_um\":%.6g,\n  \"affine_correction\":",
+    json_fprintf(o, ",\n \"fit\":{\"boxes\":\"%s\",\"n\":%d,\"accepted\":%d,\"h\":%.4g,\"lam\":%.4g,\"huber\":%.4g,\"ncc_min\":%.3g,\"sec_max\":%.3g,\"curv_min\":%.4g,\"holdout\":%d,\"affine_only\":%d,\"coarse_um\":%.6g,\n  \"affine_correction\":",
             argv[4], n, na, h, lam, hub, a.ncc_min, a.sec_max, a.curv_min, hold, aff_only, um);
     { raff t; memcpy(t.m, M, sizeof M); put_aff(o, &t); }
-    fprintf(o, ",\n  ");
+    json_fprintf(o, ",\n  ");
     fprintf(stderr, "reg fit: residual |d| (coarse voxels, %.4g um each)\n", um);
-    put_q(o, "before", eb, nb, um, 0); fprintf(o, "\n  ");
-    put_q(o, "holdout_affine", eaff, naf, um, 0); fprintf(o, "\n  ");
-    put_q(o, "holdout_field", eho, nho, um, 0); fprintf(o, "\n  ");
+    put_q(o, "before", eb, nb, um, 0); json_fprintf(o, "\n  ");
+    put_q(o, "holdout_affine", eaff, naf, um, 0); json_fprintf(o, "\n  ");
+    put_q(o, "holdout_field", eho, nho, um, 0); json_fprintf(o, "\n  ");
     put_q(o, "insample_field", ein, nin, um, 1);
-    fprintf(o, "}}\n"); fclose(o);
+    json_fprintf(o, "}}\n"); fclose(o);
     fprintf(stderr, "reg fit: field %d x %d x %d nodes (h %.0f), max |D| %.3f vox; wrote %s\n", F.n[0], F.n[1], F.n[2], h, umax, fp);
     /* per-box residuals */
     snprintf(fp, sizeof fp, "%s/residuals.jsonl", od); o = fopen(fp, "w"); k = 0;
     for (int i = 0; i < n; i++) {
         const int ho = w[i] > 0 && hold > 1 && (k++ % hold) == hold / 2;
-        fprintf(o, "{\"i\":%d,\"c\":[%.2f,%.2f,%.2f],\"v\":[%.4f,%.4f,%.4f],\"pred\":[%.4f,%.4f,%.4f],\"used\":%d,\"holdout\":%d,\"ncc\":%.4f,\"status\":\"%s\"}\n", b[i].i, c[3 * i], c[3 * i + 1], c[3 * i + 2],
+        json_fprintf(o, "{\"i\":%d,\"c\":[%.2f,%.2f,%.2f],\"v\":[%.4f,%.4f,%.4f],\"pred\":[%.4f,%.4f,%.4f],\"used\":%d,\"holdout\":%d,\"ncc\":%.4f,\"status\":\"%s\"}\n", b[i].i, c[3 * i], c[3 * i + 1], c[3 * i + 2],
                 v[3 * i], v[3 * i + 1], v[3 * i + 2], pred[3 * i], pred[3 * i + 1], pred[3 * i + 2], w[i] > 0, ho, b[i].ncc, reg_status_name[b[i].status]);
     }
     fclose(o);

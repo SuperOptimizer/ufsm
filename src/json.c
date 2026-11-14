@@ -1,5 +1,7 @@
 #include "json.h"
 #include <ctype.h>
+#include <stdarg.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -192,3 +194,29 @@ const json *json_path(const json *j, const char *path) {
 
 double json_num(const json *j, double dflt) { return j && (j->type == J_NUM || j->type == J_BOOL) ? j->num : dflt; }
 const char *json_str(const json *j, const char *dflt) { return j && j->type == J_STR ? j->str : dflt; }
+
+int json_fprintf(FILE *f, const char *fmt, ...) {
+    va_list ap, aq; va_start(ap, fmt); va_copy(aq, ap);
+    char sb[1024], *b = sb; const int n = vsnprintf(sb, sizeof sb, fmt, ap); va_end(ap);
+    if (n < 0) { va_end(aq); return -1; }
+    if ((size_t)n >= sizeof sb) { b = malloc((size_t)n + 1); if (!b) { va_end(aq); return -1; } vsnprintf(b, (size_t)n + 1, fmt, aq); }
+    va_end(aq);
+    int out = 0, instr = 0;
+    for (int i = 0; i < n;) {
+        const char ch = b[i];
+        if (instr) { if (ch == '\\' && i + 1 < n) { fputc(ch, f); fputc(b[i + 1], f); i += 2; out += 2; continue; } if (ch == '"') instr = 0; fputc(ch, f); i++; out++; continue; }
+        if (ch == '"') { instr = 1; fputc(ch, f); i++; out++; continue; }
+        const int neg = ch == '-' && i + 1 < n && isalpha((unsigned char)b[i + 1]), w = i + neg;
+        if (isalpha((unsigned char)b[w]) && (i == 0 || !isalnum((unsigned char)b[i - 1]))) {   /* a bare word: true / false / null or a non-finite */
+            int e = w; while (e < n && isalnum((unsigned char)b[e])) e++;
+            const int len = e - w;
+            if ((len == 3 && (!strncasecmp(b + w, "nan", 3) || !strncasecmp(b + w, "inf", 3))) || (len == 8 && !strncasecmp(b + w, "infinity", 8))) {
+                fputs("null", f); out += 4; i = e; continue;   /* a leading '-' goes with it */
+            }
+            fwrite(b + i, 1, (size_t)(e - i), f); out += e - i; i = e; continue;
+        }
+        fputc(ch, f); i++; out++;
+    }
+    if (b != sb) free(b);
+    return out;
+}

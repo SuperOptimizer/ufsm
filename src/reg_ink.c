@@ -203,7 +203,7 @@ int cmd_reg_inkstat(int argc, char **argv) {
     const int d0 = G[0].d0, nl = G[0].nl, s0 = -2 - d0, s1 = 2 - d0;
     const char *vn[2] = {"native", "matched"};
     FILE *o = out ? fopen(out, "w") : nullptr;
-    if (o) fprintf(o, "{\"segments\":[");
+    if (o) json_fprintf(o, "{\"segments\":[");
     int *use = calloc(ng + 1, sizeof *use);
     printf("%s samples; ", g_all ? "all" : "certified");
     printf("model-free ink separability (AUC = P(ink > no-ink); d = Cohen's d ink - no-ink); sheet band = layers -2..2 (2.4 um layers along +N)\n");
@@ -211,7 +211,7 @@ int cmd_reg_inkstat(int argc, char **argv) {
         for (int q = 0; q < ng; q++) use[q] = k == ng || q == k;
         const char *nm = k < ng ? G[k].name : "POOLED";
         if (k == ng && ng < 2) break;
-        if (o) fprintf(o, "%s{\"segment\":\"%s\",\"channels\":[", k ? "," : "", nm);
+        if (o) json_fprintf(o, "%s{\"segment\":\"%s\",\"channels\":[", k ? "," : "", nm);
         printf("\n== %s\n%-8s %-34s %8s %7s %7s | %-14s %7s %7s | %s\n", nm, "variant", "channel", "n_ink", "AUC", "d", "best window", "AUC", "d", "depth profile AUC (every 5th layer from -10)");
         for (int v = 0; v < 2; v++) for (int c = 0; c < nc; c++) {
             double auc, d; size_t n1, n2; ch_metrics(G, ng, use, v, &C[c], s0, s1, &auc, &d, &n1, &n2);
@@ -225,18 +225,18 @@ int cmd_reg_inkstat(int argc, char **argv) {
             printf("%-8s %-34s %8zu %7.3f %+7.3f | %-14s %7.3f %+7.3f |", vn[v], C[c].name, n2, auc, d, win, ba, bd);
             for (int l = 0; l < nl; l += 5) printf(" %.2f", prof[l]);
             printf("\n");
-            if (o) { fprintf(o, "%s{\"variant\":\"%s\",\"channel\":\"%s\",\"n_ink\":%zu,\"n_noink\":%zu,\"sheet_auc\":%.4f,\"sheet_d\":%.4f,\"best_window\":[%d,%d],\"best_auc\":%.4f,\"best_d\":%.4f,\"profile_auc\":[",
+            if (o) { json_fprintf(o, "%s{\"variant\":\"%s\",\"channel\":\"%s\",\"n_ink\":%zu,\"n_noink\":%zu,\"sheet_auc\":%.4f,\"sheet_d\":%.4f,\"best_window\":[%d,%d],\"best_auc\":%.4f,\"best_d\":%.4f,\"profile_auc\":[",
                              v || c ? "," : "", vn[v], C[c].name, n2, n1, auc, d, bl0 + d0, bl1 + d0, ba, bd);
-                     for (int l = 0; l < nl; l++) fprintf(o, "%s%.4f", l ? "," : "", prof[l]);
-                     fprintf(o, "]}"); }
+                     for (int l = 0; l < nl; l++) json_fprintf(o, "%s%.4f", l ? "," : "", prof[l]);
+                     json_fprintf(o, "]}"); }
         }
-        if (o) fprintf(o, "]}");
+        if (o) json_fprintf(o, "]}");
     }
-    if (o) fprintf(o, "]");
+    if (o) json_fprintf(o, "]");
     /* leave-one-segment-out discriminants */
     if (ng >= 2) {
         printf("\n== leave-one-segment-out (train on the others, AUC on the held-out segment)\n%-8s %-28s %10s %10s %10s %s\n", "variant", "held out", "LDA 15", "LDA 3", "best 1", "(best single: chosen on train)");
-        if (o) fprintf(o, ",\"loso\":[");
+        if (o) json_fprintf(o, ",\"loso\":[");
         const int bins[5][2] = {{-10, -1}, {0, 9}, {10, 19}, {20, 29}, {30, 40}};
         int ne = 0, es[8]; for (int c = 0; c < nc; c++) if (!C[c].kind) es[ne++] = C[c].a;
         fset F15 = {0}, F3 = {0};
@@ -253,11 +253,11 @@ int cmd_reg_inkstat(int argc, char **argv) {
             double at = NAN;
             if (bc >= 0) { for (int q = 0; q < ng; q++) use[q] = q == k; double a2, d2; size_t m1, m2; ch_metrics(G, ng, use, v, &C[bc], bins[bb][0] - d0, bins[bb][1] - d0, &a2, &d2, &m1, &m2); at = best >= 0.5 ? a2 : 1 - a2; }
             printf("%-8s %-28s %10.3f %10.3f %10.3f (%s, layers %d..%d)\n", vn[v], G[k].name, a15, a3, at, bc >= 0 ? C[bc].name : "-", bc >= 0 ? bins[bb][0] : 0, bc >= 0 ? bins[bb][1] : 0);
-            if (o) fprintf(o, "%s{\"variant\":\"%s\",\"held_out\":\"%s\",\"lda15_auc\":%.4f,\"lda3_auc\":%.4f,\"best_single_auc\":%.4f,\"best_single\":\"%s\",\"best_single_layers\":[%d,%d]}", first ? "" : ",", vn[v], G[k].name, a15, a3, at,
+            if (o) json_fprintf(o, "%s{\"variant\":\"%s\",\"held_out\":\"%s\",\"lda15_auc\":%.4f,\"lda3_auc\":%.4f,\"best_single_auc\":%.4f,\"best_single\":\"%s\",\"best_single_layers\":[%d,%d]}", first ? "" : ",", vn[v], G[k].name, a15, a3, at,
                            bc >= 0 ? C[bc].name : "", bc >= 0 ? bins[bb][0] : 0, bc >= 0 ? bins[bb][1] : 0);
             first = 0;
         }
-        if (o) fprintf(o, "]");
+        if (o) json_fprintf(o, "]");
     }
     /* depth composites: every mode x channel x window x variant, per segment and pooled, ranked by |AUC - 0.5| */
     {
@@ -276,7 +276,7 @@ int cmd_reg_inkstat(int argc, char **argv) {
                 M[nm] = (mspec){op, pa[q], pb[q], l0, l1, v, ""}; snprintf(M[nm].name, 160, "%s %s%s - %s %s [%s]", vn[v], pk[q] == 2 ? "BASELINE " : "", G[0].scan[pa[q]], G[0].scan[pb[q]], mode_name[op], wn[w]); nm++;
             }
         }
-        if (o) fprintf(o, ",\"modes\":[");
+        if (o) json_fprintf(o, ",\"modes\":[");
         for (int k = 0; k <= ng; k++) {
             if (k == ng && ng < 2) break;
             for (int q = 0; q < ng; q++) use[q] = k == ng || q == k;
@@ -291,14 +291,14 @@ int cmd_reg_inkstat(int argc, char **argv) {
             for (int t2 = 0; t2 < 15 && t2 < nm; t2++) { const int m = r[t2].k; printf("%2d  AUC %.3f  d %+.3f  n_ink %7zu  %s\n", t2 + 1, A[m], Dd[m], N2[m], M[m].name); }
             /* the same-energy baseline: its best mode, for reference */
             for (int t2 = 0; t2 < nm; t2++) { const int m = r[t2].k; if (strstr(M[m].name, "BASELINE")) { printf("    best BASELINE mode (rank %d): AUC %.3f d %+.3f  %s\n", t2 + 1, A[m], Dd[m], M[m].name); break; } }
-            if (o) { fprintf(o, "%s{\"segment\":\"%s\",\"ranked\":[", k ? "," : "", nm2);
-                     for (int t2 = 0; t2 < nm; t2++) { const int m = r[t2].k; fprintf(o, "%s{\"mode\":\"%s\",\"auc\":%.4f,\"d\":%.4f,\"n_ink\":%zu}", t2 ? "," : "", M[m].name, A[m], Dd[m], N2[m]); }
-                     fprintf(o, "]}"); }
+            if (o) { json_fprintf(o, "%s{\"segment\":\"%s\",\"ranked\":[", k ? "," : "", nm2);
+                     for (int t2 = 0; t2 < nm; t2++) { const int m = r[t2].k; json_fprintf(o, "%s{\"mode\":\"%s\",\"auc\":%.4f,\"d\":%.4f,\"n_ink\":%zu}", t2 ? "," : "", M[m].name, A[m], Dd[m], N2[m]); }
+                     json_fprintf(o, "]}"); }
             free(r); free(A); free(Dd); free(N2);
         }
-        if (o) fprintf(o, "]");
+        if (o) json_fprintf(o, "]");
         free(M);
     }
-    if (o) { fprintf(o, "}\n"); fclose(o); }
+    if (o) { json_fprintf(o, "}\n"); fclose(o); }
     return 0;
 }

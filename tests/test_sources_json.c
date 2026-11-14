@@ -2,6 +2,7 @@
    fatal under sources_set_strict), duplicate keys, non-JSON numbers, an empty sources array; and the parser's number syntax. CPU only. */
 #include "json.h"
 #include "sources.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,15 @@ int main(void) {
       int a = 1; for (int i = 0; i < 4; i++) { json *j = json_parse(ok[i], strlen(ok[i])); a &= j != nullptr; json_free(j); }
       int b = 1; for (int i = 0; i < 8; i++) { json *j = json_parse(bad[i], strlen(bad[i])); b &= j == nullptr; json_free(j); }
       check("JSON numbers parse", a); check("nan / inf / hex / malformed numbers are errors", b);
+      {   /* json_fprintf: non-finite values become null, the same words inside strings stay (reg inkstat ink.json, sweep 11-14) */
+          char *mb = nullptr; size_t ml = 0; FILE *mf = open_memstream(&mb, &ml);
+          json_fprintf(mf, "{\"x\":%.4f,\"y\":[%g,%g,%.2f],\"s\":\"nan inf -nan \\\"inf\",\"e\":%g}", (double)NAN, -(double)NAN, (double)INFINITY, -(double)INFINITY,
+                       1e-5); fclose(mf);
+          json *w = json_parse(mb, ml); const json *y = json_get(w, "y");
+          check("json_fprintf writes non-finite numbers as null", w && json_get(w, "x") && json_get(w, "x")->type == J_NULL && y && y->n == 3 &&
+                json_at(y, 0)->type == J_NULL && json_at(y, 2)->type == J_NULL && !strcmp(json_str(json_get(w, "s"), ""), "nan inf -nan \"inf") &&
+                fabs(json_num(json_get(w, "e"), 0) - 1e-5) < 1e-12);
+          json_free(w); free(mb); }
       const char *d = "{\"a\":1,\"a\":2}"; json *j = json_parse(d, strlen(d)); check("duplicate keys are errors", !j); json_free(j); }
     check("a valid source loads", loads(dir, SRC("")));
     check("a missing root is fatal", !loads(dir, "{\"sources\":[{\"name\":\"a\",\"ct\":\"ct\",\"um\":1}]}"));
