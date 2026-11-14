@@ -552,6 +552,17 @@ static int level_on(sampler *sp, source *s, int si, int l, int region_ch) {
     for (int k = 0; k < sp->cfg.nrung; k++) if (sp->cfg.rung_w[k] > 0 && rung_level(sp, s, si, k, region_ch) == l) return 1;
     return 0;
 }
+/* the rung shares pick_level draws for source si (no region): the weights over the rungs it reaches, then --rung-shift-p's move */
+void sample_rung_marginals(sampler *sp, int si, double q[8]) {
+    const int nr = sp->cfg.nrung; source *s = &sp->S->src[si]; int lv[8]; double tot = 0, p0[8] = {0};
+    for (int k = 0; k < 8; k++) q[k] = 0;
+    for (int k = 0; k < nr; k++) { lv[k] = sp->cfg.rung_w[k] > 0 ? rung_level(sp, s, si, k, -1) : -1; if (lv[k] >= 0) tot += sp->cfg.rung_w[k]; }
+    if (tot <= 0) return;
+    for (int k = 0; k < nr; k++) p0[k] = lv[k] >= 0 ? sp->cfg.rung_w[k] / tot : 0;
+    const double p = sp->cfg.rung_shift_p;
+    for (int k = 0; k < nr; k++) { if (!(p0[k] > 0)) continue; q[k] += p0[k] * (1 - p);
+        for (int e = -1; e <= 1; e += 2) { const int k2 = k + e; const int ok = k2 >= 0 && k2 < nr && rung_level(sp, s, si, k2, -1) >= 0; q[ok ? k2 : k] += p0[k] * p / 2; } }
+}
 static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
     if (sp->cfg.nrung) {   /* --um-rungs: a rung by weight among those this source reaches, maybe moved one rung (--rung-shift-p), then its level */
         const int si = (int)(s - sp->S->src), nr = sp->cfg.nrung; int lv[8]; double tot = 0;
@@ -4201,6 +4212,18 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         acc += eligible ? s->weight : 0; sp->cum[i] = acc;
     }
     if (acc <= 0) { fprintf(stderr, "sampler: no eligible sources; check window, holdout boxes, regions and levels\n"); free(sp->cum); free(sp->lvl_ok); free(sp); return nullptr; }
+    if (cfg->nrung > 1 && cfg->rung_shift_p > 0 && !cfg->holdout) {   /* --rung-shift-p carries no state past the draw: it only reweights the rungs. The
+        effective rung shares of the weighted draw (pick_level), so the run's real mix is in the log: a list neighbour with p / 2 each way, a
+        draw whose neighbour the source does not reach stays (1:2:1 weights become ~29 / 42 / 29 % at p 0.3; audit 2026-11-14) */
+        double tot[8] = {0}, wsum = 0;
+        for (int i = 0; i < S->n; i++) { if (!(sp->cum[i] > (i ? sp->cum[i - 1] : 0))) continue; double q[8]; sample_rung_marginals(sp, i, q); const double w = S->src[i].weight;
+            for (int k = 0; k < cfg->nrung; k++) tot[k] += w * q[k]; wsum += w; }
+        char ln[512]; int o = snprintf(ln, sizeof ln, "sampler: --rung-shift-p %g: the drawn rung mix over the weighted sources", cfg->rung_shift_p);
+        for (int k = 0; k < cfg->nrung && wsum > 0; k++) o += snprintf(ln + o, sizeof ln - o > 0 ? sizeof ln - o : 0, " %g um %.1f%%", cfg->rung_um[k], 100 * tot[k] / wsum);
+        fprintf(stderr, "%s (weights", ln);
+        for (int k = 0; k < cfg->nrung; k++) fprintf(stderr, " %g", cfg->rung_w[k]);
+        fprintf(stderr, "; the shift is only a reweighting: equal mixes come from --um-rungs weights alone)\n");
+    }
     if (cfg->cover) for (uint64_t k = 0; k < cfg->cover->count; k++) {
         const int64_t *t = cfg->cover->tiles[k]; source *s = &S->src[t[0]];
         z3 *ct = source_ct(s, 0); const z3_meta *m = ct ? z3_meta_of(ct) : nullptr;
