@@ -1318,7 +1318,7 @@ static int hgs_choose(gpu_state *d, int nmil) {
 #undef HT
     if (nmil) a.milv = 8.f * fabsf(g_mil_lambda * inkw * src_head_w(si, SH_INK)) * gs / (float)nmil;   /* (the ray's weights sum to <= 1; <= 8 rays a voxel) */
     nn_hgs_choose(&a, d->hgsd);
-    static int chk = -1; if (chk < 0) chk = ufsm_env_on("UFSM_HGS_CHECK");
+    static int chk = -1; if (chk < 0) chk = ufsm_env_on("UFSM_HGS_CHECK");   /* mgpu: env */
     if (chk) {   /* the host function on copies of the same scratches */
         hgs_args h = a; float buf[HGS_NT][5 * 7 + 2 * 7 + 2], w4[8], dv[2];
         nn_sync();
@@ -1326,7 +1326,7 @@ static int hgs_choose(gpu_state *d, int nmil) {
         nn_d2h(w4, d->w4fin, sizeof w4); h.w4 = w4; nn_d2h(dv, d->hgsd, sizeof dv);
         const int k = hgs_exp(hgs_bound_all(&h)); const float hs = ldexpf(1.f, k), hi = ldexpf(1.f, -k);
         if (memcmp(&hs, &dv[0], 4) || memcmp(&hi, &dv[1], 4)) { fprintf(stderr, "hgs check: device {%a, %a} host {%a, %a} (bound %a)\n", dv[0], dv[1], hs, hi, hgs_bound_all(&h)); exit(1); }
-        static int nck; if (nck++ < 3) fprintf(stderr, "hgs check: s 2^%d (device = host)\n", k);
+        static int nck; /* mgpu: process (a log cap: a racy count only prints a line more) */ if (nck++ < 3) fprintf(stderr, "hgs check: s 2^%d (device = host)\n", k);
     }
     return 1;
 }
