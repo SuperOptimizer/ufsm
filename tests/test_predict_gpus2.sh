@@ -26,6 +26,18 @@ grep -Eq 'shard layers 1 \.\. 2 of 2' f2.log || fail "fields: worker 1 did not t
 [ -e f2z/fields.json ] && [ ! -e f2z/fields.json.w0 ] && [ ! -e f2z/fields.partial.json ] || fail "fields.json not finalised ($D/f2z)"
 cmp -s f1z/fields.json f2z/fields.json || fail "fields.json differs"
 for a in $(ls f1z); do [ -e f1z/$a/zarr.json ] || continue; cmpraw f1z/$a f2z/$a "" 256; done
+# --fit-zarr --resume (infer #6): an earlier run that stopped after field slab 0 (rows.done lists it; slab 1's shards gone) is completed,
+# slab 0 is not rewritten, and the result is the uninterrupted run's bytes; one GPU, then the z-layer workers
+for r in r1 r2; do
+  rm -rf ${r}z; cp -r f1z ${r}z; head -1 f1z/rows.done > ${r}z/rows.done; rm -rf ${r}z/*/c/1; rm -f ${r}z/fields.json; touch -d '2020-01-01' $(find ${r}z -path '*/c/0/*' -type f)
+  GA=(); [ $r = r2 ] && GA=(--gpus $GL)
+  "$U" predict s/last.ckpt fx ct $r "${P[@]}" --fit-zarr ${r}z --fit-h 1 --no-out 1 --resume 1 "${GA[@]}" > $r.log 2>&1 || fail "predict --fit-zarr --resume $r ($D/$r.log)"
+  grep -q '1 of 2 field slabs done' $r.log || fail "resume $r: slab 0 not taken as done ($D/$r.log)"
+  [ -z "$(find ${r}z -path '*/c/0/*' -type f -newermt '2021-01-01')" ] || fail "resume $r: slab 0 rewritten"
+  [ -e ${r}z/fields.json ] || fail "resume $r: no fields.json"
+  [ "$(wc -l < ${r}z/rows.done)" -ge 2 ] || fail "resume $r: rows.done not appended"
+  for a in $(ls f1z); do [ -e f1z/$a/zarr.json ] || continue; cmpraw f1z/$a ${r}z/$a "" 256; done
+done
 "$U" predict s/last.ckpt fx ct g2 "${P[@]}" --fit-zarr g2z --fit-h 1 --heads rv --gpus $GL > g2.log 2>&1 || fail "predict --fit-zarr --heads rv --gpus ($D/g2.log)"
 for a in pc ps w; do cmpraw f1z/$a g2z/$a "" 256; done
 cmpraw h1/rv g2/rv 9.6 256

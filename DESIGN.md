@@ -589,6 +589,16 @@ From the inference audit (/vesuvius/ufsm/audit-20261114/infer.md). No GPU number
   1e9 is not reached. This is for the A/B; the default stays the running statistics, and predict prints a note when they were never
   trained on.
 - **`--heads --resume 1`:** each head logs its shards to `<out>/<head>/predict-done-<lv>.txt`. A shard is skipped when every head lists it.
+- **`--fit-zarr --resume 1`:** rows.done (one `z0 z1` line per field slab, appended once all the slab's shards are written) is kept
+  instead of truncated. The slabs it lists are final: their windows write no fields, and the writer never flushes them again (their
+  fill would overwrite). A shard is computed when its slab is not done, or when another output (--heads, the main store) still needs it.
+  A line off this run's slab grid is ignored (that slab is recomputed). Refused with --split z. test_predict_gpus2: slab 0 kept
+  (mtime), slab 1 rebuilt, bytes equal to the uninterrupted run, one GPU and --gpus workers. A u1-size fields part was 703-753 s on the
+  desk (scratch2 est. 1.5-2 h); a crash now loses at most one slab.
+- **Early-snapshot EMA note:** below step 10000 with `--ema 1`, predict says that the EMA lags by ~1000 steps (scratch2 at 1000-2000:
+  |ema - p| / |p| 8-10 %) and to score `--ema 0` too.
+- **scripts/infer/seam_ab.sh:** window / halo / blend arms on one 1667 box (640/64 default, 768/128 = training's 216 tokens, 896/192,
+  1152/64 k 2, 1152/64 --seam-inproc): ink-seam per arm and z3-diff against 768/128. It decides the recipe (flags only).
 - **skip-empty on latvol:** a skip-trained net on a latvol CT whose basis is the checkpoint's took the stored-index input and built no
   masks, i.e. the dense net. It now takes the input from the rebuilt CT so the masks are built. With `--latents` there is a warning.
 - **Diagnostics:** the halo against the theoretical RF (cells), the bottleneck token count against the training window, and the level's
