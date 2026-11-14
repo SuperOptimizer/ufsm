@@ -90,6 +90,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     assert chunks(t / 'aligned-grid') == chunks(t / 'aligned-legacy')
     attrs = json.loads((t / 'aligned-grid/1/zarr.json').read_text())['attributes']['ufsm']
     assert attrs['grid_origin_zyx'] == [0, 0, 0]
+    assert attrs['axis'] == 'none' and attrs['radial_sign'] == 0, attrs   # (the axis each store was made with: --no-axis here)
     assert 'grid_origin_zyx' not in json.loads((t / 'aligned-legacy/1/zarr.json').read_text())['attributes']['ufsm']
 
     def read_bytes(path, origin, shape):
