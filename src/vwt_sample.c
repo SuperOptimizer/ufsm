@@ -42,6 +42,7 @@ typedef struct { vws_sample s; int state; } vws_slot;   /* 0 free, 1 being fille
 struct vws {
     vws_src *S; int ns; double wsum; int T, L; float tilt; int train; unsigned seed; int has_shell;
     vws_slot *slot; int nslot; pthread_t *th; int nth; _Atomic int stop; _Atomic long long next_id;
+    int nfail, failed;   /* (under mu) consecutive vws_fill failures across the workers; failed: vws_next returns -1 (threads audit #1) */
     zcache *zc; int burst, burst_r;   /* the shared decoded-chunk cache (UFSM_VWS_CACHE_GB, 4; 0 off); training draws in bursts of `burst` slabs near one
                                 anchor chunk (UFSM_VWS_BURST, 8; 1 off) so neighbouring slabs share decoded chunks */
     pthread_mutex_t mu; pthread_cond_t cv; int last;
@@ -403,8 +404,14 @@ static void *vws_worker(void *arg) {
         uint64_t r0 = V->train ? ((uint64_t)V->seed << 32) ^ (uint64_t)id * 0x9e3779b97f4a7c15ull ^ (uint64_t)A->t << 56 : ((uint64_t)V->seed << 32) ^ (uint64_t)id;   /* val: sample id i -> seed (seed, i) */
         uint64_t rs = vws_rng(&r0);   /* (mixed once: raw states differing by multiples of the splitmix step would share one stream: duplicate slabs) */
         int rc = vws_fill(V, &rs, &w, &V->slot[k].s);
-        pthread_mutex_lock(&V->mu); V->slot[k].state = rc ? 0 : 2; pthread_cond_broadcast(&V->cv); pthread_mutex_unlock(&V->mu);
-        if (rc) fprintf(stderr, "vws: no slab after 64 draws\n");
+        pthread_mutex_lock(&V->mu); V->slot[k].state = rc ? 0 : 2;
+        V->nfail = rc ? V->nfail + 1 : 0; const int gave_up = rc && V->nfail >= 64 * (V->nth > 0 ? V->nth : 1) && !V->failed;   /* (a persistent failure: no slab in 64 fills per worker in a row) */
+        if (gave_up) V->failed = 1;
+        const int quit = V->failed;
+        pthread_cond_broadcast(&V->cv); pthread_mutex_unlock(&V->mu);
+        if (gave_up) fprintf(stderr, "vws: no slab in %d fills in a row: giving up (vws_next returns -1)\n", 64 * (V->nth > 0 ? V->nth : 1));
+        else if (rc) fprintf(stderr, "vws: no slab after 64 draws\n");
+        if (quit) break;
     }
     free(w.raw); free(w.q); free(w.kinc); free(w.arena); free(w.ct); free(w.gt); free(w.shb); free(w.sidx); free(A); return nullptr;
 }
@@ -413,7 +420,9 @@ int vws_next(vws *V, vws_sample *out) {
     pthread_mutex_lock(&V->mu);
     if (V->last >= 0) { V->slot[V->last].state = 0; V->last = -1; pthread_cond_broadcast(&V->cv); }
     int k = -1;
-    for (;;) { for (int s = 0; s < V->nslot; s++) if (V->slot[s].state == 2) { k = s; break; } if (k >= 0) break; pthread_cond_wait(&V->cv, &V->mu); }
+    for (;;) { for (int s = 0; s < V->nslot; s++) if (V->slot[s].state == 2) { k = s; break; } if (k >= 0) break;
+               if (V->failed || V->stop) { pthread_mutex_unlock(&V->mu); return -1; }   /* (no worker will fill a slot: the caller handles -1) */
+               pthread_cond_wait(&V->cv, &V->mu); }
     V->slot[k].state = 3; V->last = k; *out = V->slot[k].s; pthread_mutex_unlock(&V->mu);
     return 0;
 }

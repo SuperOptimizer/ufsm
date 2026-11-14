@@ -250,7 +250,7 @@ struct sampler {
        order, or by the batch the split trainer still holds (TAKEN), while the trainer waits on that batch (hung test_slot_planes split,
        11-14). So a worker that waited UFSM_BANK_SPARE_WAIT_MS (default 50) grows the pool by its missing planes, up to spare_max =
        nslots * (plane_bank - 1), the old layout's count, at which every slot can hold its extra at once: the wait always ends */
-    uint8_t *spare[64]; int spare_own[64], nspare, bank_own, spare_max; pthread_cond_t cv_spare; _Atomic uint64_t spare_wait_ns, spare_takes, spare_grown;
+    uint8_t *spare[64]; int spare_own[64], nspare, bank_own, spare_max, thp; pthread_cond_t cv_spare; _Atomic uint64_t spare_wait_ns, spare_takes, spare_grown;
 };
 
 static int PZ(const sample_cfg *c) { return c->Pz > 0 ? c->Pz : c->P; }   /* window depth (z) */
@@ -258,7 +258,7 @@ static size_t P3(const sampler *sp) { return (size_t)PZ(&sp->cfg) * sp->cfg.P * 
 
 /* batch buffers: pinned (the trainer uploads asynchronously), or plain malloc with UFSM_SAMPLER_NOPIN=1 (CPU-only benchmarks) */
 static _Atomic size_t g_slot_bytes;   /* pinned (or malloc'd) batch slot bytes, every sampler (UFSM_HOSTMEM) */
-static int nopin(void) { static int v = -1; if (v < 0) { const char *e = getenv("UFSM_SAMPLER_NOPIN"); v = e && atoi(e); } return v; }
+static int nopin(void) { static _Atomic int v = -1; int r = atomic_load(&v); if (r < 0) { const char *e = getenv("UFSM_SAMPLER_NOPIN"); r = e && atoi(e); atomic_store(&v, r); } return r; }   /* (atomic: workers race on the first call; threads audit #6) */
 static void *halloc(size_t n) { atomic_fetch_add(&g_slot_bytes, n); if (nopin()) { void *p = malloc(n ? n : 1); if (!p) abort(); memset(p, 0, n); return p; } return nn_host_alloc(n); }   /* (memset: faulted in like the pinned slots, so CPU-only benchmarks see no first-touch faults) */
 static void hfree(void *p) { if (nopin()) free(p); else nn_host_free(p); }
 /* slot_skip 4: the unpacked targets t (NCH x P^3) and loss mask m (P^3) neither allocated nor written: train sets it where the trainer
@@ -333,8 +333,7 @@ static int bank_assign(sampler *sp, const source *s, batch *b) {
     for (int q = 0; q < ROLE_N; q++) if (*all[q]) *all[q] = role_real(&sp->cfg, s, q) && k < nb ? b->bank[k++] : sp->c255;
     return 0;
 }
-static int g_bank_own;   /* (sampler_start: the planes each slot owns under the shared spares; 0 all of plane_bank) */
-static batch alloc_batch(const sample_cfg *c, uint8_t *c255) {
+static batch alloc_batch(const sample_cfg *c, uint8_t *c255, int bank_own) {   /* bank_own: the planes each slot owns under the shared spares (0: all of plane_bank) */
 #define RHALLOC(n_) (c->plane_bank > 0 ? c255 : halloc(n_))   /* (a label role: under the bank only marked, pointing at c255) */
     size_t p3 = (size_t)PZ(c) * c->P * c->P;
     batch b;
@@ -373,7 +372,7 @@ static batch alloc_batch(const sample_cfg *c, uint8_t *c255) {
     if (c->plane_bank > 0) {   /* the label roles (side, w4, wcomp, ink, aux) point at c255 until a draw assigns them (bank_assign); plane_bank planes behind them */
         uint8_t **rl[ROLE_N]; const int nr = batch_roles(&b, rl);
         for (int q = 0; q < nr; q++) *rl[q] = c255;
-        for (int q = 0; q < (g_bank_own > 0 && g_bank_own < c->plane_bank ? g_bank_own : c->plane_bank) && q < 8; q++) b.bank[b.nbank++] = halloc((size_t)c->B * p3);
+        for (int q = 0; q < (bank_own > 0 && bank_own < c->plane_bank ? bank_own : c->plane_bank) && q < 8; q++) b.bank[b.nbank++] = halloc((size_t)c->B * p3);
     }
     b.inkb = c->ink_bits ? halloc((size_t)c->B * p3 / 8) : nullptr; b.ink_it = c->ink_bits ? calloc((size_t)c->B, sizeof *b.ink_it) : nullptr;
     b.mil = c->ink_mil ? calloc((size_t)c->B, sizeof *b.mil) : nullptr; b.nmil = c->ink_mil ? calloc((size_t)c->B, sizeof *b.nmil) : nullptr;
@@ -634,6 +633,7 @@ static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
 static int g_rt = 1;   /* UFSM_SAMPLER_RT=T: threads per window for its big reads (CT, phase, targets: z3_read decodes chunks in parallel) and the
                           winding-mod-4 tiles; the same bytes for any T. Fewer windows in flight (RAM) for the same loader rate */
 static int g_prof_cpu;   /* UFSM_SAMPLER_PROF=2: the stages in thread CPU time (else wall time: I/O waits and contention count) */
+static void sampler_env_once(void) { const char *e = getenv("UFSM_SAMPLER_PROF"); g_prof_cpu = e && atoi(e) == 2; e = getenv("UFSM_SAMPLER_RT"); g_rt = e && atoi(e) > 1 ? atoi(e) : 1; }
 static double tnow(void) { struct timespec t; clock_gettime(g_prof_cpu ? CLOCK_THREAD_CPUTIME_ID : CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 #define PROF_MARK(stage) do { if (sp->prof) { double t_ = tnow(); atomic_fetch_add(&sp->prof_ns[stage], (uint_fast64_t)((t_ - pt) * 1e9)); pt = t_; } } while (0)
 enum { PS_SRC, PS_LEVEL, PS_PICK, PS_PROBE, PS_READ, PS_STATS, PS_TARGETS, PS_DILATE, PS_SOFT, PS_TRUST, PS_ENCODE, PS_ZSCORE, PS_AUGMENT, PS_X16, PS_SCAN, PS_SYMPACK, PS_PHREAD, PS_WIND4, PS_PHOUT, PS_N };   /* (the last four: parts of the old "augment") */
@@ -1459,12 +1459,13 @@ static _Thread_local tp_pool tpool;
 #define WM_MAX 256
 static struct { tp_pool *pool; const uint8_t *big, *ttmp; size_t bign, ttn; _Atomic size_t tpv, tplent, tppeak; } g_wm[WM_MAX];
 static _Thread_local int tp_wid = -1;
-static size_t g_tp_p3 = 1;   /* (UFSM_TP_LOG: sizes in window voxels) */
+static _Atomic size_t g_tp_p3 = 1;   /* (UFSM_TP_LOG: sizes in window voxels; the last started sampler's, set by sampler_start before its workers) */
 static size_t tp_class(size_t n) { return n >= ((size_t)1 << 20) ? (n + ((size_t)1 << 20) - 1) & ~(((size_t)1 << 20) - 1) : n; }
 /* window-sized worker scratch (>= 4 MB): 2 MB aligned with transparent huge pages requested (the system's THP mode is often
    "madvise"): the warp writer's gathers and the volume passes otherwise walk 4 KB page tables over hundreds of MB per window. Pages
    are still only backed when touched. free() releases it as any malloc block. */
-static int g_thp_default = 1;   /* (sampler_start: 0 with --gpu-aug 2) */
+static _Atomic int g_thp_last = 1;   /* (sampler_start: the last started sampler's choice; threads that are not a sampler's workers) */
+static _Thread_local int t_thp = -1;   /* a worker's own sampler's choice (each sampler_start decides for its workers: threads audit #5) */
 static void *wbig_alloc(size_t n, int zero) {
     const size_t H = (size_t)2 << 20;
     if (n < ((size_t)4 << 20)) return zero ? calloc(n ? n : 1, 1) : malloc(n ? n : 1);
@@ -1475,7 +1476,7 @@ static void *wbig_alloc(size_t n, int zero) {
        of a huge page may compact memory synchronously, under memory pressure minutes of system time (2026-11-09: 493 s system vs 125 s
        user for 24 P512 windows); the --gpu-aug 2 recipe gains nothing from them (cycles equal within noise) */
     const char *e = getenv("UFSM_SAMPLER_THP");
-    if (e ? atoi(e) != 0 : g_thp_default) madvise(p, (n + H - 1) & ~(H - 1), MADV_HUGEPAGE);
+    if (e ? atoi(e) != 0 : t_thp >= 0 ? t_thp : atomic_load(&g_thp_last)) madvise(p, (n + H - 1) & ~(H - 1), MADV_HUGEPAGE);
 #endif
     if (zero) memset(p, 0, n);
     return p;
@@ -3516,7 +3517,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         } else {
             if (Pz != P) { fprintf(stderr, "sampler: slab windows take the phase from a stored raster (sources \"phase\" at this level or one coarser)\n"); return -1; }
             uint8_t *bw = tp_get(p3, 0), *sw = c->side ? tp_get(p3, 0) : nullptr;
-            if (!bw || (c->side && !sw) || band_window(s, o, P, bw, sw, c->side == 2, c->phase_dense, tile_index ^ c->seed)) { tp_put(bw, p3); tp_put(sw, p3); return -1; }
+            if (!bw || (c->side && !sw) || band_window(s, o, P, bw, sw, c->side == 2, c->phase_dense, tile_index ^ c->seed ^ r->s[1]))   /* (r->s[1]: a keep mask per draw, as phase_weight_drop; was fixed per slot for the run: rng audit #3) */ { tp_put(bw, p3); tp_put(sw, p3); return -1; }
             for (size_t k = 0; k < p3; k++) if (!ctu[k]) bw[k] = BAND_UNKNOWN;
             if (nhb) { hold_fill(bw, (const int32_t (*)[6])hb, nhb, P, BAND_UNKNOWN); if (sw) hold_fill(sw, (const int32_t (*)[6])hb, nhb, P, SIDE_UNKNOWN); }
             if (c->band) sym_u8(bw, b->band + (size_t)i * p3, Pz, P, y);
@@ -3718,7 +3719,7 @@ int sample_pack_tm(const uint8_t *t0, const uint8_t *t1, const uint8_t *m, size_
    back zero), so the batches do not change; the cost is the refault, ~1 s per P 1024 window, paid only by a worker that was idle.
    UFSM_IDLE_RELEASE=0: off. */
 static void worker_idle_release(uint8_t *big, size_t bign, uint8_t *ttmp, size_t ttn) {
-    static int on = -1; if (on < 0) on = !getenv("UFSM_IDLE_RELEASE") || ufsm_env_on("UFSM_IDLE_RELEASE");
+    static _Atomic int on_ = -1; int on = atomic_load(&on_); if (on < 0) { on = !getenv("UFSM_IDLE_RELEASE") || ufsm_env_on("UFSM_IDLE_RELEASE"); atomic_store(&on_, on); }
     if (!on) return;
     const size_t pg = 4096;
     if (big && bign >= ((size_t)4 << 20)) madvise(big, bign & ~(pg - 1), MADV_DONTNEED);   /* (wbig_alloc: page-aligned blocks of their own) */
@@ -3730,7 +3731,7 @@ static void worker_idle_release(uint8_t *big, size_t bign, uint8_t *ttmp, size_t
    held 7 GB free inside 16 GB of arenas: windows' transient buffers of varying sizes from six threads fragment them). malloc_trim walks
    the free chunks (a few ms against a ~40 s window); the batches do not change. UFSM_SAMPLER_TRIM=0: off */
 static void worker_trim(void) {
-    static int on = -1; if (on < 0) on = !getenv("UFSM_SAMPLER_TRIM") || ufsm_env_on("UFSM_SAMPLER_TRIM");
+    static _Atomic int on_ = -1; int on = atomic_load(&on_); if (on < 0) { on = !getenv("UFSM_SAMPLER_TRIM") || ufsm_env_on("UFSM_SAMPLER_TRIM"); atomic_store(&on_, on); }
     if (on) malloc_trim(0);
 }
 static int echo_reclaim(sampler *sp);
@@ -3740,11 +3741,11 @@ static void *worker(void *arg) {
     rng r;
     rseed(&r, sp->cfg.seed * 1000003ull + (uint64_t)wa->id);
     size_t p3 = P3(sp);
+    t_thp = sp->thp;   /* (before the first wbig_alloc) */
     float *xtmp = malloc(3 * (size_t)sp->cfg.P * sizeof(float));   /* per-z axis centres and a row of noise */
     uint8_t *ttmp = wbig_alloc(NCH * p3 + 4096, 0);   /* (+ 4 KB: the stored-phase block's two planes, P^3 + 64 and P^3, in it) */
     uint8_t *big = wbig_alloc(10 * p3, 0);   /* [0,P^3) CT (also the coarse probe), [P^3, 9P^3) (2P)^3 region scratch, [9P^3, 10P^3) mask */
     static atomic_int nwm; const int wid = atomic_fetch_add(&nwm, 1);
-    g_tp_p3 = p3;
     if (wid < WM_MAX) { tp_wid = wid; g_wm[tp_wid].pool = &tpool; g_wm[tp_wid].big = big; g_wm[tp_wid].bign = 10 * p3; g_wm[tp_wid].ttmp = ttmp; g_wm[tp_wid].ttn = NCH * p3 + 4096; }
     const int det = sp->cfg.deterministic;
     float *noise_state = sp->cfg.ct_augment ? malloc(((size_t)sp->cfg.P * sp->cfg.P + sp->cfg.P) * sizeof(float)) : nullptr;
@@ -3786,14 +3787,16 @@ static void *worker(void *arg) {
         int fail = 0, filled = 0; unsigned spin = 0;
         for (int i = 0; i < sp->cfg.B && !atomic_load(&sp->stop);) {
             if (det && (sp->cfg.cover || (spin == 0 && fail == 0))) rseed(&r, sp->cfg.seed * 0x9e3779b97f4a7c15ull + (sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i)) * 1000003ull + 1);   /* per-sample stream */
+            const rng r_before = r;   /* --det: a draw that failed to read is retried from the same state (rng audit #4: the batch no longer depends on the I/O error history) */
             int rc = draw(sp, b, i, &r, xtmp, ttmp, big, sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i), noise_state, chs ? chs + i : nullptr);
+            if (rc < 0 && det) r = r_before;
             if (tp_log()) { fprintf(stderr, "tplog draw rc %d big res by p3:", rc); for (int q = 0; q < 10; q++) fprintf(stderr, " %.2f", resident_bytes(big + q * p3, p3) / (double)p3); fprintf(stderr, " ttmp %.2f\n", resident_bytes(ttmp, 2 * p3) / (double)p3); }
             if (rc == 0) { i++; filled = i; fail = 0; spin = 0; }
             else if (rc > 0 && ++spin == (1u << 22)) { fprintf(stderr, "sampler: %u consecutive draws rejected or impossible (P=%d), stopping\n", spin, sp->cfg.P); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); }
             else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); if (++fail > 20) { fprintf(stderr, "sampler: 20 consecutive read failures, stopping\n"); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); } }
         }
         worker_trim();
-        { static int dly = -1; if (dly < 0) dly = getenv("UFSM_SAMPLER_DELAY_MS") ? atoi(getenv("UFSM_SAMPLER_DELAY_MS")) : 0;   /* (tests: a slow data path
+        { static _Atomic int dly_ = -1; int dly = atomic_load(&dly_); if (dly < 0) { dly = getenv("UFSM_SAMPLER_DELAY_MS") ? atoi(getenv("UFSM_SAMPLER_DELAY_MS")) : 0; atomic_store(&dly_, dly); }   /* (tests: a slow data path
                                                                                                                     whatever the GPU's speed, test_echo) */
           if (dly > 0) usleep((useconds_t)dly * 1000); }
         pthread_mutex_lock(&sp->mu);
@@ -4342,9 +4345,10 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         long mf = 0; FILE *mi = fopen("/proc/meminfo", "r"); char ln[128];
         while (mi && fgets(ln, sizeof ln, mi)) if (!strncmp(ln, "MemFree:", 8)) { mf = atol(ln + 8); break; }
         if (mi) fclose(mi);
-        g_thp_default = cfg->gpu_aug != 2 && mf > 16l << 20;
+        sp->thp = cfg->gpu_aug != 2 && mf > 16l << 20; atomic_store(&g_thp_last, sp->thp);
     }
-    sp->prof = ufsm_env_on("UFSM_SAMPLER_PROF"); { const char *e = getenv("UFSM_SAMPLER_PROF"); g_prof_cpu = e && atoi(e) == 2; e = getenv("UFSM_SAMPLER_RT"); g_rt = e && atoi(e) > 1 ? atoi(e) : 1; }
+    sp->prof = ufsm_env_on("UFSM_SAMPLER_PROF"); { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, sampler_env_once); }   /* (once: other samplers' workers read them) */
+    atomic_store(&g_tp_p3, P3(sp));
     sp->lvl_ok = calloc((size_t)S->n, sizeof *sp->lvl_ok);
     sources_open_all(S, 32);   /* every (source, level, channel) store opened up front in parallel: lazily they serialise on one lock (254 opens, 17 s) */
     sp->cum = malloc((size_t)S->n * sizeof(double));
@@ -4438,14 +4442,13 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         const char *e = getenv("UFSM_BANK_SPARE"); const int K = sp->cfg.plane_bank;
         int ns = e ? atoi(e) : (sp->nslots + 1) / 2; if (ns > 0 && ns < K - 1) ns = K - 1; if (ns > 64) ns = 64;
         sp->spare_max = sp->nslots * (K - 1); if (sp->spare_max > 64) sp->spare_max = 64; if (ns > sp->spare_max) ns = sp->spare_max;
-        g_bank_own = 0;
         if (K > 1 && ns > 0 && sp->cfg.B == 1) {
-            const size_t p3 = P3(sp); sp->bank_own = 1; g_bank_own = 1; sp->nspare = ns; pthread_cond_init(&sp->cv_spare, nullptr);
+            const size_t p3 = P3(sp); sp->bank_own = 1; sp->nspare = ns; pthread_cond_init(&sp->cv_spare, nullptr);
             for (int q = 0; q < ns; q++) { sp->spare[q] = halloc(p3); sp->spare_own[q] = -1; }
             fprintf(stderr, "sampler: the plane bank as 1 plane per slot + %d shared spares (UFSM_BANK_SPARE; %d planes before), %.2f GB less\n", ns, K * sp->nslots, (double)(K * sp->nslots - sp->nslots - ns) * p3 / 1e9);
         }
     }
-    for (int i = 0; i < sp->nslots; i++) sp->slots[i] = alloc_batch(&sp->cfg, sp->c255);
+    for (int i = 0; i < sp->nslots; i++) sp->slots[i] = alloc_batch(&sp->cfg, sp->c255, sp->bank_own);
     pthread_mutex_init(&sp->mu, nullptr);
     pthread_cond_init(&sp->cv_free, nullptr);
     pthread_cond_init(&sp->cv_ready, nullptr);
@@ -4559,7 +4562,12 @@ batch *sampler_next_gate(sampler *sp, int (*busy)(void *), void *arg) {
                 else if (sp->rq[j] && sp->state[j] == READY) { if (ec < 0 || sp->rseq[j] > sp->rseq[ec]) ec = j; }
             }
             if (nw >= 0) { k = nw; atomic_fetch_add(&sp->n_fresh, 1); break; }
-            const int gb = busy ? busy(arg) : 0;   /* (asked on every pass: the trainer times the GPU's idle from its first 0) */
+            int gb = 0;   /* (asked on every pass: the trainer times the GPU's idle from its first 0) */
+            if (busy) {   /* the callback runs without sp->mu (it may block or take locks of its own: threads audit #4); the slots are rechecked after */
+                pthread_mutex_unlock(&sp->mu); gb = busy(arg); pthread_mutex_lock(&sp->mu);
+                if (atomic_load(&sp->stop)) { pthread_mutex_unlock(&sp->mu); return nullptr; }
+                if (ec >= 0 && !(sp->rq[ec] && sp->state[ec] == READY)) ec = -1;   /* (handed out meanwhile) */
+            }
             if (ec >= 0 && !gb) { k = ec; sp->rq[ec] = 0; atomic_fetch_add(&sp->n_echo, 1); break; }
             if (busy) {   /* (the GPU still has work queued, or nothing to echo yet: look again in 0.5 ms) */
                 struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 500000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }

@@ -36,11 +36,13 @@ void dcache_get_stats(dcache_stats *st) {
     st->disk_bytes_written = g_dc.wbytes; st->s_compute = 1e-9 * (double)g_dc.ns_comp; st->s_disk = 1e-9 * (double)g_dc.ns_disk;
     st->cells_evicted = g_dc.evicted; st->cells_recomputed = g_dc.recomp; st->bytes_evicted = g_dc.evbytes;
 }
+static char g_dc_home[1024];   /* mgpu: guarded (pthread_once). (built once: concurrent callers no longer rewrite the returned buffer; threads audit #9) */
+static void dc_home_once(void) { const char *h = getenv("HOME"); if (h && *h) snprintf(g_dc_home, sizeof g_dc_home, "%s/.cache/ufsm/derived", h); }
 const char *dcache_default_dir(void) {
-    static char b[1024]; const char *e = getenv("UFSM_DERIVED_CACHE");
+    const char *e = getenv("UFSM_DERIVED_CACHE");
     if (e) return !*e || !strcmp(e, "off") || !strcmp(e, "0") ? nullptr : e;
-    const char *h = getenv("HOME"); if (!h || !*h) return nullptr;
-    snprintf(b, sizeof b, "%s/.cache/ufsm/derived", h); return b;
+    static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, dc_home_once);
+    return g_dc_home[0] ? g_dc_home : nullptr;
 }
 static int mkdirs(const char *p) {
     char b[1200]; snprintf(b, sizeof b, "%s", p);
@@ -372,7 +374,9 @@ static dent *cell_get(dc *c, int64_t cz, int64_t cy, int64_t cx, int nthreads) {
     else free(data);
     return cell_finish(c, e, ok);
 }
-static void cell_put(dc *c, dent *e) { dcache_pool *P = c->P; pthread_mutex_lock(&P->mu); if (!--e->refs && e->failed) free(e); else evict(P); pthread_mutex_unlock(&P->mu); }
+static void cell_put(dc *c, dent *e) { dcache_pool *P = c->P; pthread_mutex_lock(&P->mu); const int last = !--e->refs; if (last && e->failed) free(e); else evict(P);
+                                     if (last) pthread_cond_broadcast(&P->cv);   /* (dc_free waits for its array's last reference) */
+                                     pthread_mutex_unlock(&P->mu); }
 static void cell_copy(const dc *c, const dent *e, int64_t cz, int64_t cy, int64_t cx, const int64_t o[3], const int64_t n[3], uint8_t *out) {
     int64_t a[3], b[3]; const int64_t C = c->C, co[3] = {cz * C, cy * C, cx * C};   /* the overlap [a, b) in array coordinates */
     for (int d = 0; d < 3; d++) { a[d] = co[d] > o[d] ? co[d] : o[d]; b[d] = co[d] + C < o[d] + n[d] ? co[d] + C : o[d] + n[d]; if (b[d] > c->shape[d]) b[d] = c->shape[d]; }
@@ -478,6 +482,11 @@ static void dc_free(void *p) {
     dcache_pool *P = c->P;
     if (P) {   /* (a shared pool keeps the other arrays' entries: unlink this array's from its LRU) */
         pthread_mutex_lock(&P->mu);
+        for (;;) {   /* a reader still inside this array (a cell referenced or being computed) would use freed memory: wait for it (threads audit #8) */
+            int inuse = 0; for (size_t i = 0; i < c->nhash && !inuse; i++) for (dent *e = c->hash[i]; e && !inuse; e = e->hnext) inuse = e->busy || e->refs;
+            if (!inuse) break;
+            pthread_cond_wait(&P->cv, &P->mu);
+        }
         for (size_t i = 0; i < c->nhash; i++) for (dent *e = c->hash[i], *nx; e; e = nx) { nx = e->hnext; unlink_lru(P, e); P->bytes -= sizeof *e + (e->data ? cbytes(c) : 0); free(e->data); free(e); }
         pthread_mutex_unlock(&P->mu);
         if (!P->shared) { pthread_mutex_destroy(&P->mu); pthread_cond_destroy(&P->cv); free(P); }

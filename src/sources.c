@@ -801,26 +801,30 @@ static z3 *open_ct_level(source *s, int level) {
     if (!z && s->ct_ms) { z = open_level(s->ct_ms, s->ct_mkey, level, s->um); if (z) fprintf(stderr, "source %s: CT level %d from the mirror\n", s->name, level); }
     return z;
 }
+/* The lazily opened arrays are published under g_open_mu and read without it on the fast path: acquire loads / release stores (as
+   source_lat's lv_tried), so a reader that sees the pointer sees the opened array (threads audit #3) */
+#define OPEN_LD(x) __atomic_load_n(&(x), __ATOMIC_ACQUIRE)
+#define OPEN_ST(x, v) __atomic_store_n(&(x), (v), __ATOMIC_RELEASE)
 z3 *source_ct(source *s, int level) {
-    if (level < 0 || level >= MAXLEV || s->ct_present[level] == 0) return nullptr;
-    if (!s->ct[level]) {
-        z3 *z = open_ct_level(s, level);
-        pthread_mutex_lock(&g_open_mu);
-        if (!s->ct[level]) { s->ct[level] = z; z = nullptr; if (!s->ct[level]) { s->ct_present[level] = 0; open_failed(s, "ct", level); } }
-        const int chk = s->ct[level] && !s->hold_checked; if (chk) s->hold_checked = 1;
-        pthread_mutex_unlock(&g_open_mu);
-        if (chk) for (int k = 0; k < s->nhold; k++) { const int64_t *sh = z3_meta_of(s->ct[level])->shape;   /* eval audit #7: a held-out box outside the scan (another scan's coordinates, a level-l box) holds nothing out */
-            const int64_t *b = s->hold[k]; int out = 0;
-            for (int d = 0; d < 3; d++) out |= b[d] >= (sh[d] << level);
-            if (out) { fprintf(stderr, "sources: %s: held-out box %d [%lld %lld %lld +%lld %lld %lld] lies outside the CT (level %d shape %lld %lld %lld = level 0 ~%lld %lld %lld)\n",
-                               s->name, k, (long long)b[0], (long long)b[1], (long long)b[2], (long long)b[3], (long long)b[4], (long long)b[5], level,
-                               (long long)sh[0], (long long)sh[1], (long long)sh[2],
-                               (long long)(sh[0] << level), (long long)(sh[1] << level), (long long)(sh[2] << level));
-                       exit(1); }
-        }
-        if (z) z3_close(z);
+    if (level < 0 || level >= MAXLEV || OPEN_LD(s->ct_present[level]) == 0) return nullptr;
+    z3 *have = OPEN_LD(s->ct[level]); if (have) return have;
+    z3 *z = open_ct_level(s, level);
+    pthread_mutex_lock(&g_open_mu);
+    if (!s->ct[level]) { OPEN_ST(s->ct[level], z); z = nullptr; if (!s->ct[level]) { OPEN_ST(s->ct_present[level], 0); open_failed(s, "ct", level); } }
+    have = s->ct[level];
+    const int chk = have && !s->hold_checked; if (chk) s->hold_checked = 1;
+    pthread_mutex_unlock(&g_open_mu);
+    if (chk) for (int k = 0; k < s->nhold; k++) { const int64_t *sh = z3_meta_of(have)->shape;   /* eval audit #7: a held-out box outside the scan (another scan's coordinates, a level-l box) holds nothing out */
+        const int64_t *b = s->hold[k]; int out = 0;
+        for (int d = 0; d < 3; d++) out |= b[d] >= (sh[d] << level);
+        if (out) { fprintf(stderr, "sources: %s: held-out box %d [%lld %lld %lld +%lld %lld %lld] lies outside the CT (level %d shape %lld %lld %lld = level 0 ~%lld %lld %lld)\n",
+                           s->name, k, (long long)b[0], (long long)b[1], (long long)b[2], (long long)b[3], (long long)b[4], (long long)b[5], level,
+                           (long long)sh[0], (long long)sh[1], (long long)sh[2],
+                           (long long)(sh[0] << level), (long long)(sh[1] << level), (long long)(sh[2] << level));
+                   exit(1); }
     }
-    return s->ct[level];
+    if (z) z3_close(z);
+    return have;
 }
 
 z3 *source_lat(source *s, int level) {
@@ -830,7 +834,7 @@ z3 *source_lat(source *s, int level) {
         if (z && (!z3_latvol(z) || memcmp(z3_meta_of(z)->shape, z3_meta_of(ct)->shape, sizeof z3_meta_of(ct)->shape))) {
             fprintf(stderr, "source %s: latvol level %d is not a latvol array of the CT's shape: not used\n", s->name, level); z3_close(z); z = nullptr; }
         pthread_mutex_lock(&g_open_mu);
-        if (!s->lv_tried[level]) { s->lv[level] = z; z = nullptr; __atomic_store_n(&s->lv_tried[level], 1, __ATOMIC_RELEASE); }
+        if (!s->lv_tried[level]) { s->lv[level] = z; z = nullptr; __atomic_store_n(&s->lv_tried[level], 1, __ATOMIC_RELEASE); }   /* (lv[] before the flag's release) */
         pthread_mutex_unlock(&g_open_mu);
         if (z) z3_close(z);
     }
@@ -843,18 +847,19 @@ static int fib_same(const struct fib_spec *a, const struct fib_spec *b) {
 }
 /* a "fibre" target: both planes from one computation; the other plane goes to a channel with the same options and the other plane */
 static z3 *source_tgt_fibre(source *s, int ch, int level) {
-    if (s->tgt[ch][level]) return s->tgt[ch][level];
+    { z3 *have = OPEN_LD(s->tgt[ch][level]); if (have) return have; }
     const struct fib_spec *f = s->tgt_fib[ch]; z3 *pl[2];
     z3 *c0 = open_ct_level(s, level), *c1 = c0 ? open_ct_level(s, level) : nullptr, *c2 = c1 ? open_ct_level(s, level) : nullptr;
     const int bad = fiber_onfly_open(f->afv, f->extra, f->map, f->tr, f->rad, f->guard, f->ring, f->iso, f->piso, level, c0, c1, c2, pl);
     pthread_mutex_lock(&g_open_mu);
-    if (bad) { if (!s->tgt[ch][level]) s->tgt_present[ch][level] = 0; pthread_mutex_unlock(&g_open_mu); return s->tgt[ch][level]; }
-    if (!s->tgt[ch][level]) { s->tgt[ch][level] = pl[f->plane]; pl[f->plane] = nullptr; }
+    if (bad) { if (!s->tgt[ch][level]) OPEN_ST(s->tgt_present[ch][level], 0); z3 *r = s->tgt[ch][level]; pthread_mutex_unlock(&g_open_mu); return r; }
+    if (!s->tgt[ch][level]) { OPEN_ST(s->tgt[ch][level], pl[f->plane]); pl[f->plane] = nullptr; }
     for (int c = 0; c < NTG; c++) if (c != ch && s->tgt_fib[c] && s->tgt_fib[c]->plane != f->plane && fib_same(s->tgt_fib[c], f) && !s->tgt[c][level] && pl[!f->plane]) {
-        s->tgt[c][level] = pl[!f->plane]; pl[!f->plane] = nullptr; }
+        OPEN_ST(s->tgt[c][level], pl[!f->plane]); pl[!f->plane] = nullptr; }
+    z3 *r = s->tgt[ch][level];
     pthread_mutex_unlock(&g_open_mu);
     z3_close(pl[0]); z3_close(pl[1]);
-    return s->tgt[ch][level];
+    return r;
 }
 z3 *source_phase_at(source *s, int level, int ign) {
     z3 *b = ign ? s->phase_ign : s->phase;
@@ -863,7 +868,8 @@ z3 *source_phase_at(source *s, int level, int ign) {
     z3 **pl = ign ? s->phase_ign_pl : s->phase_pl;
     if (!pl[level] && !ign && s->phase_onfly > 0) return nullptr;   /* (an on-the-fly phase: its next level is made from the pooled codes at
                                                                        load, deeper none; pooling the derived phase would derive 8x the voxels) */
-    if (!pl[level]) {
+    z3 *have = OPEN_LD(pl[level]);
+    if (!have) {
         z3 *under = source_phase_at(s, level - 1, ign); if (!under) return nullptr;
         pthread_mutex_lock(&g_open_mu);
         if (!pl[level] && !ign && s->phase_store && s->phase_key_um > 0) {   /* the level stored once (ufsm downsample <root> <key> <root> <um> --mode phase):
@@ -873,25 +879,26 @@ z3 *source_phase_at(source *s, int level, int ign) {
             char key[32]; z3w_level_name(s->phase_key_um * ldexp(1.0, level - s->phase_level), key, sizeof key);
             z3 *st = z3_open(s->phase_store, key, nullptr); const z3_meta *um_ = z3_meta_of(under), *sm = st ? z3_meta_of(st) : nullptr; int ok = sm != nullptr;
             for (int d = 0; d < 3 && ok; d++) ok = sm->shape[d] == (um_->shape[d] + 1) / 2;
-            if (ok) { pl[level] = st; fprintf(stderr, "sources: %s: phase level %d from the stored array \"%s\" (not pooled per read)\n", s->name, level, key); }
+            if (ok) { OPEN_ST(pl[level], st); fprintf(stderr, "sources: %s: phase level %d from the stored array \"%s\" (not pooled per read)\n", s->name, level, key); }
             else if (st) { fprintf(stderr, "sources: %s: stored phase \"%s\" has the wrong shape for level %d: pooled per read instead\n", s->name, key, level); z3_close(st); }
         }
-        if (!pl[level]) pl[level] = phase_pool2_view(under, ign);   /* (cheap: no I/O; under the lock so one view per level) */
+        if (!pl[level]) OPEN_ST(pl[level], phase_pool2_view(under, ign));   /* (cheap: no I/O; under the lock so one view per level) */
+        have = pl[level];
         pthread_mutex_unlock(&g_open_mu);
     }
-    return pl[level];
+    return have;
 }
 z3 *source_tgt(source *s, int ch, int level) {
-    if (!s->tgt_key[ch] || level < s->tgt_min_level[ch] || level < 0 || level >= MAXLEV || s->tgt_present[ch][level] == 0) return nullptr;
+    if (!s->tgt_key[ch] || level < s->tgt_min_level[ch] || level < 0 || level >= MAXLEV || OPEN_LD(s->tgt_present[ch][level]) == 0) return nullptr;
     if (s->tgt_fib[ch]) return source_tgt_fibre(s, ch, level);
-    if (!s->tgt[ch][level]) {
-        z3 *z = open_level(s->tgt_store[ch] ? s->tgt_store[ch] : s->s, s->tgt_key[ch], level, s->um);
-        pthread_mutex_lock(&g_open_mu);
-        if (!s->tgt[ch][level]) { s->tgt[ch][level] = z; z = nullptr; if (!s->tgt[ch][level]) { s->tgt_present[ch][level] = 0; open_failed(s, "target", level); } }
-        pthread_mutex_unlock(&g_open_mu);
-        if (z) z3_close(z);
-    }
-    return s->tgt[ch][level];
+    z3 *have = OPEN_LD(s->tgt[ch][level]); if (have) return have;
+    z3 *z = open_level(s->tgt_store[ch] ? s->tgt_store[ch] : s->s, s->tgt_key[ch], level, s->um);
+    pthread_mutex_lock(&g_open_mu);
+    if (!s->tgt[ch][level]) { OPEN_ST(s->tgt[ch][level], z); z = nullptr; if (!s->tgt[ch][level]) { OPEN_ST(s->tgt_present[ch][level], 0); open_failed(s, "target", level); } }
+    have = s->tgt[ch][level];
+    pthread_mutex_unlock(&g_open_mu);
+    if (z) z3_close(z);
+    return have;
 }
 
 z3 *source_tgt_for_level(source *s, int ch, int level, int *stored_level) {

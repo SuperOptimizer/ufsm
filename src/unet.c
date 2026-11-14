@@ -392,20 +392,29 @@ static void gfilm_fwd(unet *u, long S) {
    dg / S into every token's gradient (tb_cs) */
 static void gfilm_bwd(unet *u, long S) {
     if (!u->cfg.gfilm) return;
-    const int K = u->gf_K, L = u->cfg.nlev; float *dgw = u->gf_dg + K;   /* (dgw: the decoder levels >= gf_top, whole-window on every card) */
+    /* --split with --split-top: the decoder levels >= sp_top run on the whole window on both cards, so their A / B gradients (and their
+       dg shares) are the window's on each card; side 1 drops its A / B copy here (sp_dedup does not cover the gfilm block; without
+       this the allreduce counted them twice: split audit 2026-11-14 #1). The split levels' dg shares are per half and summed by the
+       reduce hook (unet_set_gfilm_reduce; only needed by the token path) */
+    const int K = u->gf_K, L = u->cfg.nlev, top = sp_top_on(u) ? u->sp_top : 0; float *dgw = u->gf_dg + K;   /* (dgw: the whole levels) */
+    const int tok = ufsm_env_on("UFSM_GFILM_TOKGRAD") && !ufsm_env_on("UFSM_GFILM_NO_TOKGRAD");
     nn_zero(u->gf_dg, (size_t)2 * K * 4);
     size_t fo = u->gf_off, co = 0;
     for (int i = L - 2; i >= 0; i--) {
-        const gnp *n = &u->dec[i].n2; const int whole = u->gf_red && u->gf_top > 0 && i >= u->gf_top;
+        const gnp *n = &u->dec[i].n2; const int whole = top > 0 && i >= top;
         nn_gfilm_bwd(u->live, u->g, n->gamma, n->beta, fo, n->c, K, u->gf_g, u->gf_g1 + co, whole ? dgw : u->gf_dg);
-        if (whole && u->gf_dedup) nn_zero(u->g + fo, (size_t)2 * K * n->c * 4);   /* (the other card's identical A / B gradient counts) */
+        if (whole && u->split_side == 1) nn_zero(u->g + fo, (size_t)2 * K * n->c * 4);   /* (side 0's whole-window A / B gradient counts once) */
         fo += (size_t)2 * K * n->c; co += n->c;
     }
-    if (u->gf_red) { u->gf_red(u->gf_redc, u->gf_dg, K); nn_axpy(u->gf_dg, 1.f, dgw, (size_t)K); }   /* (--split: the split levels' shares summed, the whole-window levels' once) */
+    if (u->split_h0 > 0) {   /* the token path's dg: the split levels' shares summed over both halves, the whole levels' once */
+        if (tok && !u->gf_red) { fprintf(stderr, "unet: gfilm token gradient under --split needs unet_set_gfilm_reduce\n"); abort(); }
+        if (tok) u->gf_red(u->gf_redc, u->gf_dg, K);
+        nn_axpy(u->gf_dg, 1.f, dgw, (size_t)K);
+    }
     /* the token path (dg into the attention tokens) is off by default until its check passes (2026-11-13: analytic vs central
        differences 9% apart at the 16-bit noise floor, attention needs the tensor-core path): UFSM_GFILM_TOKGRAD=1 turns it on (no
        parameters change: a run can turn it on later) */
-    if (ufsm_env_on("UFSM_GFILM_TOKGRAD") && !ufsm_env_on("UFSM_GFILM_NO_TOKGRAD")) nn_gfilm_tok(u->tb_cs, K, S, u->gf_dg);
+    if (tok) nn_gfilm_tok(u->tb_cs, K, S, u->gf_dg);
 }
 size_t unet_fstem_off(const unet *u) { return u->fstem_off; }
 size_t unet_gfilm_off(const unet *u) { return u->gf_off; }
@@ -2965,7 +2974,8 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         l0_after(u, &u->dec[i]);
         if (!i) ge_after(u);   /* (gn_ema: every site's statistics are in by dec[0]'s) */
         if (train && u->train && u->eh_lg && i == u->cfg.emb_lev) {   /* the distillation head, from the level's output while it is live */
-            if (sp_on(u)) { fprintf(stderr, "unet: the distillation head with the spatial split is not supported\n"); abort(); }
+            if (u->split_h0 > 0) {   /* (not sp_on: off on the whole split-top levels, where the head would run on both cards and count twice) */
+                fprintf(stderr, "unet: the distillation head with the spatial split is not supported\n"); abort(); }
             const block *d = &u->dec[i]; const float *dw = P(u, u->eh.w), *db = P(u, u->eh.b);
             nn_set_head_out_h16(0);
             if (recompute()) { nn_gn_t g = gn_out(u, d); int r; PROF(0, r = nn_conv3d_fwd_x(d->a2, &g, nullptr, nullptr, 0, 0, d->ys, dw, db, u->cfg.emb_ch, 1, 1, u->eh_lg, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("distillation head"); }
@@ -2978,7 +2988,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         cur = u->dec[i].s2;
     }
     if (train && u->train && u->cfg.ds_levels) {   /* deep supervision: each supervised decoder level's own 1^3 head, from its output */
-        if (sp_on(u)) { fprintf(stderr, "unet: deep supervision with the spatial split is not supported\n"); abort(); }
+        if (u->split_h0 > 0) { fprintf(stderr, "unet: deep supervision with the spatial split is not supported\n"); abort(); }   /* (split_h0, not sp_on: split audit #4) */
         nn_set_head_out_h16(0);
         for (int j = 1; j <= u->cfg.ds_levels; j++) {
             const block *d = &u->dec[j]; const float *dw = P(u, u->ds[j].w), *db = P(u, u->ds[j].b);

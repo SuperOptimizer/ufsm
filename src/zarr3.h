@@ -101,5 +101,6 @@ int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx);   /* fetch one
 int z3_chunk_raw(z3 *z, int64_t cz, int64_t cy, int64_t cx, uint8_t **buf, size_t *n);   /* encoded inner chunk bytes (after zstd): 1 with *buf (malloc), 0 absent, -1 error; an HTTP root's chunk through the chunk cache */
 /* a latvol array's codec (the transform, step, tables: src/latvol.h), else nullptr */
 const void *z3_latvol(const z3 *z);   /* (const lv_codec *) */
+uint64_t z3_id(const z3 *z);   /* process-unique id of this open array (never reused, unlike its address): cache keys */
 uint64_t z3_sink_chunks(void);   /* chunks decoded straight into a request's output (the window sink), process-wide */
 

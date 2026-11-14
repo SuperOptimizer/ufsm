@@ -2011,6 +2011,15 @@ static void gn_ema_average(gpu_state *G, int ng) {
     for (int g = 0; g < ng; g++) { size_t m = 0; float *p = unet_gn_ema_state(G[g].u, &m); nn_init(G[g].dev); nn_h2d(p, h[g], n * 4); }
     free(hb);
 }
+/* --gfilm under --split (UFSM_GFILM_TOKGRAD=1 only): the split levels' dg shares (K device floats) summed over both halves, through the
+   f64 split sum (a collective: both sides call it once per backward) */
+static void gf_dg_reduce(void *ctx, float *dg, int K) {
+    (void)ctx; float *hf = malloc((size_t)K * 4); double *hd = malloc((size_t)K * 8); void *dd = nn_malloc((size_t)K * 8);
+    nn_d2h(hf, dg, (size_t)K * 4); for (int i = 0; i < K; i++) hd[i] = hf[i];
+    nn_h2d(dd, hd, (size_t)K * 8); split_sum(dd, K, 1, nullptr); nn_sync(); nn_d2h(hd, dd, (size_t)K * 8);
+    for (int i = 0; i < K; i++) hf[i] = (float)hd[i];
+    nn_h2d(dg, hf, (size_t)K * 4); nn_free(dd); free(hf); free(hd);
+}
 static double g_echo_idle;   /* --echo-max: seconds a GPU waited for the next batch (from its step's end to the batch's handover), the "idle" share */
 static void gstep_job(void *p) { gstep_arg *a = p; { static int rs = -1; if (rs < 0) rs = getenv("UFSM_SR_REPLICA_SALT") ? ufsm_env_on("UFSM_SR_REPLICA_SALT") : 1;   /* mgpu: env */
                                                   nn_sr_salt(rs && a->d->side < 0 ? (unsigned)a->g : 0u); } gstep_fwd(a); if (!a->rc) gstep_bwd(a); nn_tls_capture(&a->out); }
@@ -3926,12 +3935,15 @@ int cmd_train(int argc, char **argv) {
     size_t p3 = (size_t)g_Pz * P * P, p3l = split && !g_lsplit ? (size_t)P * P * g_Dl : p3;   /* per-GPU voxels of a window */
     if (cfg.skip_thr > 0) {   /* --skip-empty (or a checkpoint trained with it) */
         if (!g_lat || B != 1) { fprintf(stderr, "--skip-empty: a latent-grid net (--lat 4), B 1\n"); return 2; }
+        if (g_lsplit && (P / 8 - g_h0 / 4) % 8) {   /* side 1's tile grid starts at its local cell 0 = global cell P / 8 - h0 cells: on the window's 8-cell z grid
+                                                    only when that is a multiple of 8, else other tiles go inactive next to the seam (split audit #5) */
+            fprintf(stderr, "--skip-empty --split z: the second half's first cell (%d) is not on the 8-cell tile grid (P %d, --split-top %d)\n", P / 8 - g_h0 / 4, P, g_split_top); return 2; }
         g_skip_thr = cfg.skip_thr - 1; g_skip_margin = cfg.skip_margin; cfg.skip_nl = g_lsplit && g_split_top ? g_split_top : 0;   /* (as run_batch builds) */
         fprintf(stderr, "skip-empty: masked convs: 8x8x16-cell tiles with no CT byte > %d (within %d tiles a level) left at their bias; exact gradients of that net%s\n",
                 g_skip_thr, g_skip_margin, g_lsplit ? " (split: the levels below --split-top)" : "");
     }
     gpu_state G[8]; memset(G, 0, sizeof G); g_G0 = G;   /* (zeroed: fields added later rely on it) */
-    int step0 = 0;
+    int step0 = 0, step_loaded = 0;   /* step_loaded: the checkpoint's step (kept when --finetune restarts step0 at 0: the streams below reseed from it) */
     g_win_weight = opt_atoi("--win-weight", opt(argc, argv, "--win-weight", "0")) != 0;
     g_hs_tcache = getenv("UFSM_HS_TCACHE") ? atoi(getenv("UFSM_HS_TCACHE")) != 0 : opt_atoi("--hs-tcache", opt(argc, argv, "--hs-tcache", "0")) != 0;
     g_fstem = opt_atoi("--fstem", opt(argc, argv, "--fstem", "0")); g_fs_drop = (float)opt_atof("--fstem-drop", opt(argc, argv, "--fstem-drop", "0.25"));
@@ -3979,6 +3991,7 @@ int cmd_train(int argc, char **argv) {
             step0 = grow ? unet_load_grow(d->u, resume, 1, 1.f) : unet_load(d->u, resume);
             if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; }
             if (opt_reset) { unet_reset_opt(d->u); if (g == 0) fprintf(stderr, "--opt-reset 1: the optimizer state (AdamW m / v, Muon momentum) starts at zero\n"); }
+            step_loaded = step0;
             if (opt_atoi("--finetune", opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* loaded weights/state, fresh schedule */
             if (unet_cfg_of(d->u)->gn_ema) {   /* --gn-ema-warm / --gn-ema-mom given: they replace the checkpoint's (unet_load restored those; 2026-11-13
                                                   try2 / try3 blew up when the training forward switched to the running statistics at step 501: a
@@ -4106,7 +4119,8 @@ int cmd_train(int argc, char **argv) {
             } else nn_d2d(d->teacher, unet_live_params(d->u), np * 4);
         }
         if (split) { unet_set_split(d->u, g, g_lsplit ? g_h0 / 4 : g_h0, split_halo);   /* (--lat: the trunk's halo in cells) */ if (!getenv("UFSM_SPLIT_SYNC")) unet_set_split_async(d->u, split_halo_begin, split_halo_end);
-                    if (g_split_top) unet_set_split_top(d->u, g_split_top, split_gather); }
+                    if (g_split_top) unet_set_split_top(d->u, g_split_top, split_gather);
+                    if (cfg.gfilm) unet_set_gfilm_reduce(d->u, gf_dg_reduce, nullptr, 0, 0); }
         const char *e = nn_check(); if (e) { fprintf(stderr, "GPU %d: %s\n", d->dev, e); return 1; }
     }
     int lean = getenv("UFSM_LEAN") ? atoi(getenv("UFSM_LEAN")) : 0;   /* lean: one device batch buffer (no upload overlap), the logit
@@ -4455,7 +4469,8 @@ int cmd_train(int argc, char **argv) {
             d->sslt = nn_malloc(n); d->sslg = nn_malloc(n * 4); d->sslds = nn_malloc(2 * sizeof(double)); d->sslmu = nn_malloc((size_t)g_ssl * sizeof(double));
             if (g_sslh.nh > 0) { d->sslht = nn_malloc((size_t)g_sslh.nslot * (g_Pz / 4) * (P / 4) * (P / 4)); d->sslhc = nn_malloc(32 * sizeof(unsigned long long)); d->sslhs = nn_malloc(2 * SSLH_MAX * sizeof(double)); }
             d->sslidx = nn_malloc(np_ * sizeof(int)); d->ssle = nn_malloc(np_ * g_ssl * 4); d->sslge = nn_malloc(np_ * g_ssl * 4); d->sslnrm = nn_malloc(np_ * 4); d->sslvo = nn_malloc(8 * 4);
-            d->ssl_rs = 0x5D1C0FFEEull ^ (uint64_t)g * 0x9E3779B97F4A7C15ull ^ (uint64_t)opt_atoll("--seed", opt(argc, argv, "--seed", "0")) * 0xD1B54A32D192ED03ull;
+            d->ssl_rs = 0x5D1C0FFEEull ^ (uint64_t)g * 0x9E3779B97F4A7C15ull ^ (uint64_t)opt_atoll("--seed", opt(argc, argv, "--seed", "0")) * 0xD1B54A32D192ED03ull
+                        ^ (uint64_t)step0 * 0x94D049BB133111EBull ^ (step0 > 0 ? 0 : (uint64_t)step_loaded * 0xBF58476D1CE4E5B9ull);   /* (a resume / fine-tune: not the first steps' teacher draws again; rng audit #2) */
             if (g == 0) fprintf(stderr, "ssl: %.0f MB of device buffers per GPU\n", (n * 5 + np_ * g_ssl * 8 + np_ * 8 + (double)g_sslh.nslot * (g_Pz / 4) * (P / 4) * (P / 4)) / 1048576.0);
         }
         if (g_distill) {   /* --distill: int8 targets (double-buffered unless lean), the head's fp32 gradient, the loss sums */
@@ -4937,10 +4952,11 @@ int cmd_train(int argc, char **argv) {
     else fprintf(stderr, "0 validation batches\n");
     g_Pz = Pz_tr;
 
-    if (!sc.cover && step0 > 0) {   /* resumed: a fresh sample stream (the per-sample seeds count from batch 0 at every sampler start, so a
-                                       resume under --det replayed the windows and augmentations of steps 1, 2, ...); validation keeps its seed */
-        sc.seed = seed + 0x9E3779B97F4A7C15ull * (uint64_t)step0;
-        fprintf(stderr, "resumed at step %d: training sample stream reseeded\n", step0);
+    if (!sc.cover && (step0 > 0 || step_loaded > 0)) {   /* resumed: a fresh sample stream (the per-sample seeds count from batch 0 at every sampler start, so a
+                                       resume under --det replayed the windows and augmentations of steps 1, 2, ...); validation keeps its seed.
+                                       --finetune (step0 0): from the loaded checkpoint's step and a marker, else it replayed the base run's stream (rng audit #1) */
+        sc.seed = seed + 0x9E3779B97F4A7C15ull * (uint64_t)(step0 > 0 ? step0 : step_loaded) ^ (step0 > 0 ? 0 : 0xF17E7E57F17E7E57ull);
+        fprintf(stderr, "%s at step %d: training sample stream reseeded\n", step0 > 0 ? "resumed" : "fine-tune from a checkpoint", step0 > 0 ? step0 : step_loaded);
     }
     if (!opt_atoi("--sampler-slots", opt(argc, argv, "--sampler-slots", "0"))) {   /* the default slot count against the host memory available now */
         const size_t p3s = (size_t)g_Pz * P * P, slotb = (size_t)B * p3s * ((size_t)g_xs * xbytes() + (g_pack ? 1 : NCH + 1) + (g_aff != 0) + (g_side != 0)
@@ -5041,7 +5057,7 @@ int cmd_train(int argc, char **argv) {
         { uint64_t h = (uint64_t)step * 0x9E3779B97F4A7C15ull + (uint64_t)seed; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
           g_verso_flip = g_verso_on && g_verso_swap > 0 && (double)(h >> 11) * 0x1p-53 < g_verso_swap; }   /* same on every GPU */
         g_sheet_ramp=fminf(1.f,(float)(step-schedule_start)/500.f);
-        nn_set_sr_step((unsigned)step);
+        nn_set_sr_step((unsigned)step + (step0 > 0 ? 0u : (unsigned)step_loaded * 0x9E3779B1u));   /* (--finetune: not the base run's SR seeds of steps 1, 2, ...) */
         double loss = 0, active = 0; int want_next[64] = {0};   /* (per GPU: fetch its next batch after all launches) */
         /* forward + backward on every GPU; kernel launches are asynchronous so the GPUs overlap */
         if (split) {   /* one window on both GPUs: upload both slabs of a batch, then one job with the halo exchanges */
@@ -5191,7 +5207,7 @@ int cmd_train(int argc, char **argv) {
         if (getenv("UFSM_GRAD_DUMP") && step == 1) {   /* tests: the first step's summed parameter gradient (fp32) and loss to a file, then exit (split vs one GPU A/B) */
             nn_init(G[0].dev); float *hg = malloc(np * 4); nn_sync(); unet_grad_d2h(G[0].u, hg); FILE *f = fopen(getenv("UFSM_GRAD_DUMP"), "wb");
             if (f) { fwrite(&loss, sizeof loss, 1, f); fwrite(hg, 4, np, f); fclose(f); } free(hg);
-            fprintf(stderr, "UFSM_GRAD_DUMP: step 1 loss %.9g, %zu gradients to %s\n", loss, np, getenv("UFSM_GRAD_DUMP")); exit(0);
+            fprintf(stderr, "UFSM_GRAD_DUMP: step 1 loss %.9g, %zu gradients to %s (gfilm block from %zu)\n", loss, np, getenv("UFSM_GRAD_DUMP"), cfg.gfilm ? unet_gfilm_off(G[0].u) : np); exit(0);
         }
         if (G[0].gc_on) { nn_init(G[0].dev); gc_report(&G[0], step); G[0].gc_on = 0; }
         if (g_uw) { double L[SH_N]; uw_mean(G, nl, L); uw_step(L); }   /* the s_h step: the GPUs' mean unscaled head losses */
