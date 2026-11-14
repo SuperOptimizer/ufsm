@@ -101,17 +101,14 @@ list(APPEND UFSM_CFLAGS ${_extra})
 set(UFSM_DEFS _GNU_SOURCE)
 if(UFSM_TOOLCHAIN STREQUAL "mcc")
   # -mglibc: the machine's GNU C library (libcurl, zstd, blosc and the CUDA driver are its shared libraries). mcc takes and ignores
-  # -W and most -f. No immintrin.h in mcc yet: the
-  # AVX2 paths are #ifdef __AVX2__ (never defined by mcc) except volcomp.h's, which VOLCOMP_NO_AVX2 turns off.
-  # -O3: mcc's loop vectoriser. A fixed ISA, not -march=native: binaries move between the desk (znver4) and the pods. -msse4.1 is
-  # every x86-64 we run on (pmulld / pmovzx / roundps for the vectoriser; mcc's code is byte-identical to its -march=native build
-  # on the desk, 2026-11-14). Not -march=x86-64-v3 yet: that defines __AVX2__ / __F16C__ / __FMA__, which switch ufsm's
-  # intrinsic paths on, and mcc's <immintrin.h> is still element by element (exact, slower than the scalar paths) until its
-  # VEX / 256-bit lowering lands. -fno-math-errno: sqrt in line, as with clang. -g: DWARF 5 lines, variables, CFI.
-  set(UFSM_CFLAGS -mglibc -std=c23 -O3 -msse4.1 -fno-math-errno -g -pthread)
+  # -W and most -f. -march=native (user 11-14: every machine builds its own binary): mcc reads cpuid (+ XGETBV) and defines exactly
+  # what this CPU has; __AVX2__ / __FMA__ / __F16C__ / __BMI2__ switch ufsm's and volcomp's intrinsic paths on (mcc's <immintrin.h>
+  # is compiler builtins in VEX form since microc ebdc34c, 97 intrinsics byte-identical to clang). AVX-512 stays undefined until
+  # mcc's EVEX lands. A binary built here is for this machine only: pods build their own (scripts/pod/setup.sh).
+  # -O3: mcc's loop vectoriser. -fno-math-errno: sqrt in line, as with clang. -g: DWARF 5 lines, variables, CFI.
+  set(UFSM_CFLAGS -mglibc -std=c23 -O3 -march=native -fno-math-errno -g -pthread)
   separate_arguments(_extra UNIX_COMMAND "${UFSM_EXTRA_CFLAGS}")
   list(APPEND UFSM_CFLAGS ${_extra})
-  list(APPEND UFSM_DEFS VOLCOMP_NO_AVX2)
 endif()
 set(UFSM_INC ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party ${CMAKE_SOURCE_DIR}/third_party/surfcomp)
 # Runtime: compiler-rt (builtins, crtbegin / crtend) instead of libgcc.a and gcc's crt files. The C++ library stays libstdc++ (with

@@ -49,6 +49,10 @@ The user asked for the full swap, not a staged one. On this branch:
   - lane max/min from selects;
   - u8 / u16 / i32 / f32 loops widened to 4-byte lanes;
   - vectorised and scalar inline sqrt / floor / ceil / trunc / rint / lrint.
+  Superseded the same day (user: "native optimization"): host flags are `-O3 -march=native`. Every machine builds its own
+  binary; pods build theirs in setup.sh. mcc reads cpuid plus XGETBV and defines exactly what the CPU has. On the desk (9950X)
+  that is AVX2 / FMA / F16C / BMI2; AVX-512 is undefined until mcc's EVEX lands. VOLCOMP_NO_AVX2 is gone: microc ebdc34c
+  merged mcc-intrin (<immintrin.h> as VEX builtins). With these flags zarr3.o (volcomp) has 2521 ymm instructions, sample.o 663.
   Host flags are now `-O3 -msse4.1 -fno-math-errno -g`. That is a fixed ISA, because binaries move between the desk and the pods;
   mcc's output is byte-identical to its -march=native build on the desk. `-march=x86-64-v3` waits for fast intrinsics: it would
   define __AVX2__ and switch ufsm onto the element-by-element intrinsic paths. The earlier 3.6x was measured at -O2, without the
