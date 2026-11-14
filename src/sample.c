@@ -240,6 +240,11 @@ struct sampler {
     struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; } *occ;   /* per source: coarse label cells containing papyrus (guides the position draw) */
     uint8_t *c255;   /* --plane bank (cfg.plane_bank): one window plane of 255 (pinned like the slots) that every all-unknown label role of every slot points at */
     pthread_t sn_th[16]; int sn_nth; void *sn_q;   /* --scan-norm: the statistics' prefetch threads (sn_pre) */
+    /* the plane bank's shared spares (2026-11-14): each slot owns bank_own planes; a window whose source fills more (fibre H + V, a phase
+       source with an aux target) takes the rest from nspare planes shared by all slots, held until that slot is drawn again (or stolen
+       while it is FREE). Before: every slot owned the neediest source's count, a second plane per slot nearly constant in most windows
+       (zstd 0.0 % at P 512 on scratch2's sources), 1.07 GB per slot at P 1024 */
+    uint8_t *spare[16]; int spare_own[16], nspare, bank_own; pthread_cond_t cv_spare; _Atomic uint64_t spare_wait_ns, spare_takes;
 };
 
 static int PZ(const sample_cfg *c) { return c->Pz > 0 ? c->Pz : c->P; }   /* window depth (z) */
@@ -280,10 +285,31 @@ static int bank_need(const sample_cfg *c, const source *s, const batch *b) {   /
     for (int q = 0; q < ROLE_N; q++) n += all[q] && role_real(c, s, q);
     return n;
 }
-static void bank_assign(const sampler *sp, const source *s, batch *b) {
+static int bank_assign(sampler *sp, const source *s, batch *b) {
+    int nb = b->nbank;
+    if (sp->nspare) {   /* the slot's own planes, then this window's share of the spares (all or none: a holder never waits for more) */
+        const int me = (int)(b - sp->slots), need = bank_need(&sp->cfg, s, b), extra = need > sp->bank_own ? need - sp->bank_own : 0;
+        double t0 = 0; nb = sp->bank_own;
+        pthread_mutex_lock(&sp->mu);
+        int rel = 0; for (int q = 0; q < sp->nspare; q++) if (sp->spare_own[q] == me) { sp->spare_own[q] = -1; rel = 1; }
+        if (rel) pthread_cond_broadcast(&sp->cv_spare);
+        while (extra > 0) {
+            int got[16], ng = 0;
+            for (int q = 0; q < sp->nspare && ng < extra; q++) { const int o = sp->spare_own[q]; if (o < 0 || (o != me && sp->state[o] == FREE)) got[ng++] = q; }
+            if (ng >= extra) { for (int t = 0; t < ng; t++) { sp->spare_own[got[t]] = me; b->bank[nb++] = sp->spare[got[t]]; } atomic_fetch_add(&sp->spare_takes, 1); break; }
+            if (atomic_load(&sp->stop)) { pthread_mutex_unlock(&sp->mu); return -1; }
+            if (t0 == 0) { struct timespec m; clock_gettime(CLOCK_MONOTONIC, &m); t0 = m.tv_sec + m.tv_nsec * 1e-9; }
+            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 20000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+            pthread_cond_timedwait(&sp->cv_spare, &sp->mu, &ts);   /* (timed: a slot turning FREE frees its spares without a signal here) */
+        }
+        pthread_mutex_unlock(&sp->mu);
+        if (t0 > 0) { struct timespec m; clock_gettime(CLOCK_MONOTONIC, &m); atomic_fetch_add(&sp->spare_wait_ns, (uint64_t)((m.tv_sec + m.tv_nsec * 1e-9 - t0) * 1e9)); }
+    }
     uint8_t **all[ROLE_N] = {&b->side, &b->w4, &b->wcomp, &b->ink, &b->aux[0], &b->aux[1], &b->aux[2], &b->aux[3]}; int k = 0;
-    for (int q = 0; q < ROLE_N; q++) if (*all[q]) *all[q] = role_real(&sp->cfg, s, q) && k < b->nbank ? b->bank[k++] : sp->c255;
+    for (int q = 0; q < ROLE_N; q++) if (*all[q]) *all[q] = role_real(&sp->cfg, s, q) && k < nb ? b->bank[k++] : sp->c255;
+    return 0;
 }
+static int g_bank_own;   /* (sampler_start: the planes each slot owns under the shared spares; 0 all of plane_bank) */
 static batch alloc_batch(const sample_cfg *c, uint8_t *c255) {
 #define RHALLOC(n_) (c->plane_bank > 0 ? c255 : halloc(n_))   /* (a label role: under the bank only marked, pointing at c255) */
     size_t p3 = (size_t)PZ(c) * c->P * c->P;
@@ -323,7 +349,7 @@ static batch alloc_batch(const sample_cfg *c, uint8_t *c255) {
     if (c->plane_bank > 0) {   /* the label roles (side, w4, wcomp, ink, aux) point at c255 until a draw assigns them (bank_assign); plane_bank planes behind them */
         uint8_t **rl[ROLE_N]; const int nr = batch_roles(&b, rl);
         for (int q = 0; q < nr; q++) *rl[q] = c255;
-        for (int q = 0; q < c->plane_bank && q < 8; q++) b.bank[b.nbank++] = halloc((size_t)c->B * p3);
+        for (int q = 0; q < (g_bank_own > 0 && g_bank_own < c->plane_bank ? g_bank_own : c->plane_bank) && q < 8; q++) b.bank[b.nbank++] = halloc((size_t)c->B * p3);
     }
     b.inkb = c->ink_bits ? halloc((size_t)c->B * p3 / 8) : nullptr; b.ink_it = c->ink_bits ? calloc((size_t)c->B, sizeof *b.ink_it) : nullptr;
     b.mil = c->ink_mil ? calloc((size_t)c->B, sizeof *b.mil) : nullptr; b.nmil = c->ink_mil ? calloc((size_t)c->B, sizeof *b.nmil) : nullptr;
@@ -2583,7 +2609,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     else while (si < sp->S->n - 1 && sp->cum[si] < u) si++;
     source *s = &sp->S->src[si];
     if (c->holdout && !s->hold_n[0]) return 1;
-    if (b->nbank) bank_assign(sp, s, b);   /* (--plane bank, B 1: this window's label roles) */
+    if (b->nbank && bank_assign(sp, s, b)) return -1;   /* (--plane bank, B 1: this window's label roles) */
     /* regions target? pick one region, then a level in {0,1} */
     int region_ch = -1, ri = -1;
     for (int ch = 0; ch < NCH; ch++) if (s->reg[ch] && s->reg[ch]->n) region_ch = ch;
@@ -4146,6 +4172,17 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         for (int t = 0; t < nt; t++) if (!pthread_create(&sp->sn_th[sp->sn_nth], nullptr, sn_pre_thread, q)) sp->sn_nth++;
         if (q->nj) fprintf(stderr, "sampler: --scan-norm: %d (source, level) statistics on %d threads (each scan level once, cached in ~/.cache/ufsm/scannorm)\n", q->nj, sp->sn_nth);
     }
+    {   /* --plane bank with shared spares: UFSM_BANK_SPARE planes (default: half the slots, at least the neediest window's extra; 0: off,
+           every slot owns plane_bank) when plane_bank > 1 */
+        const char *e = getenv("UFSM_BANK_SPARE"); const int K = sp->cfg.plane_bank;
+        int ns = e ? atoi(e) : (sp->nslots + 1) / 2; if (ns > 0 && ns < K - 1) ns = K - 1; if (ns > 16) ns = 16;
+        g_bank_own = 0;
+        if (K > 1 && ns > 0 && sp->cfg.B == 1) {
+            const size_t p3 = P3(sp); sp->bank_own = 1; g_bank_own = 1; sp->nspare = ns; pthread_cond_init(&sp->cv_spare, nullptr);
+            for (int q = 0; q < ns; q++) { sp->spare[q] = halloc(p3); sp->spare_own[q] = -1; }
+            fprintf(stderr, "sampler: the plane bank as 1 plane per slot + %d shared spares (UFSM_BANK_SPARE; %d planes before), %.2f GB less\n", ns, K * sp->nslots, (double)(K * sp->nslots - sp->nslots - ns) * p3 / 1e9);
+        }
+    }
     for (int i = 0; i < sp->nslots; i++) sp->slots[i] = alloc_batch(&sp->cfg, sp->c255);
     pthread_mutex_init(&sp->mu, nullptr);
     pthread_cond_init(&sp->cv_free, nullptr);
@@ -4353,6 +4390,7 @@ void sampler_hostmem(const sampler *sp, FILE *f, size_t pinned) {
     struct mallinfo2 mi = mallinfo2();
     long rss = 0; FILE *st = fopen("/proc/self/status", "r"); char line[256];
     if (st) { while (fgets(line, sizeof line, st)) if (!strncmp(line, "VmRSS:", 6)) rss = atol(line + 6); fclose(st); }
+    if (sp->nspare) { int held = 0; for (int q = 0; q < sp->nspare; q++) held += sp->spare_own[q] >= 0; fprintf(f, "hostmem: bank spares %d (%d held), %llu takes, %.1f s waited for one\n", sp->nspare, held, (unsigned long long)sp->spare_takes, sp->spare_wait_ns / 1e9); }
     fprintf(f, "hostmem: rss %.2f GB | pinned %.2f GB (slots %.2f) | workers %d: big %.2f/%.2f GB res/virt, ttmp %.2f/%.2f, pool %.2f virt (peak %.2f, pooled res %.2f)"
                " | malloc arena %.2f GB in use %.2f free %.2f mmapped %.2f | p3 %.0f M; pool classes of a worker (x p3):%s | ink caches %.2f GB targets + %.2f GB CT\n",
             rss / 1048576.0, pinned / G, g_slot_bytes / G, nw, bigr / G, bigv / G, ttr / G, ttv / G, tpv / G, tpk / G, tpr / G,
@@ -4376,6 +4414,7 @@ void sampler_stop(sampler *sp) {
     if (sp->rth_on && atomic_load(&sp->replays)) fprintf(stderr, "sampler: %llu replays, %.0f ms per redraw\n", (unsigned long long)atomic_load(&sp->replays), atomic_load(&sp->rns) / 1e6 / atomic_load(&sp->replays));
     for (int i = 0; i < sp->nslots; i++) free_batch(&sp->slots[i], sp->cfg.B);
     if (sp->c255) hfree(sp->c255);
+    for (int q = 0; q < sp->nspare; q++) hfree(sp->spare[q]);
     for (int t = 0; t < sp->sn_nth; t++) pthread_join(sp->sn_th[t], nullptr);
     if (sp->sn_q) { free(((sn_pre *)sp->sn_q)->jobs); free(sp->sn_q); }
     free(sp->rleft); free(sp->rq); free(sp->rdue); free(sp->rseq);
