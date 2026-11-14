@@ -22,6 +22,7 @@ typedef struct {
     int dtype, esize;     /* element type (volcomp_dtype: 0 uint8, 1 uint16, 2 int16, 3 uint32, 4 int32, 5 float32) and bytes; z3_read
                              fills esize bytes per voxel (native byte order) */
     double fillv;         /* fill_value of a typed array */
+    int crc;              /* 1: the inner chain ends in crc32c (4 bytes after each chunk, verified on every read; z3w writes it with UFSM_Z3W_CRC=1) */
 } z3_meta;
 
 typedef struct z3 z3;

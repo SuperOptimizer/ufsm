@@ -41,6 +41,7 @@ struct z3w {
     int mask_lossless;
     int dtype, esize;   /* typed arrays (volcomp_dtype, element bytes); 0 / 1 = uint8 */
     double fillv;
+    int crc;   /* the inner chain ends in crc32c: 4 bytes after each encoded chunk (UFSM_Z3W_CRC=1; readers before 2026-11-14 refuse such stores) */
 };
 static const char *dtype_name(int dt) { static const char *n[6] = {"uint8", "uint16", "int16", "uint32", "int32", "float32"}; return dt >= 0 && dt < 6 ? n[dt] : "?"; }
 
@@ -51,6 +52,26 @@ static int mkdirs(const char *path) {
     return mkdir(tmp, 0755) && errno != EEXIST ? -1 : 0;
 }
 
+/* durable, atomic file writes (2026-11-14 audit mini/zarr 2, 3, 5): a unique temp name per writer (pid + thread: two writers of one path
+   never share an inode), every write and the close checked, fsync before the rename (UFSM_Z3W_FSYNC=0: no fsync), the temp unlinked on any
+   failure. Before, `<p>.tmp` was shared by every writer, fclose's flush error was ignored and the short file renamed into place, and
+   zarr.json was rewritten in place unchecked (a reader could see it half written; a full disk returned success) */
+/* per-chunk crc32c (zarr v3 codec, after volcomp): volcomp has no checksum, so a flipped bit in a payload decodes as wrong voxels
+   (audit mini/volcomp 1). Opt-in (UFSM_Z3W_CRC=1) because older ufsm binaries reject the codec; the reader checks it whenever present */
+static int crc_on(void) { const char *e = getenv("UFSM_Z3W_CRC"); return e && atoi(e) != 0; }
+#define CRC_CODEC (crc_on() ? ",{\"name\":\"crc32c\"}" : "")
+static int fsync_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("UFSM_Z3W_FSYNC"); on = e ? atoi(e) != 0 : 1; } return on; }
+static void tmp_name(char *tmp, size_t n, const char *p) { snprintf(tmp, n, "%s.%d.%lx.tmp", p, (int)getpid(), (unsigned long)pthread_self()); }
+static FILE *atomic_open(const char *p, char *tmp, size_t n) { tmp_name(tmp, n, p); FILE *f = fopen(tmp, "wb"); if (!f) fail("cannot write %s: %s", tmp, strerror(errno)); return f; }
+static int atomic_close(FILE *f, const char *tmp, const char *p, int rc) {   /* rc: the writes so far (0 ok); publishes p only if all of it held */
+    if (!rc && (ferror(f) || fflush(f))) rc = fail("write %s: %s", tmp, strerror(errno));
+    if (!rc && fsync_on() && fsync(fileno(f))) rc = fail("fsync %s: %s", tmp, strerror(errno));
+    if (fclose(f) && !rc) rc = fail("close %s: %s", tmp, strerror(errno));
+    if (!rc && rename(tmp, p)) rc = fail("rename %s -> %s: %s", tmp, p, strerror(errno));
+    if (rc) unlink(tmp);
+    return rc;
+}
+
 void z3w_level_name(double um, char *buf, int n) { snprintf(buf, (size_t)n, "%.10g", um); }
 
 z3w *z3w_create(const char *dir, const int64_t shape[3], int shard, float q, int fill, const char *attrs_json) {
@@ -58,18 +79,18 @@ z3w *z3w_create(const char *dir, const int64_t shape[3], int shard, float q, int
     if (mkdirs(dir)) { fail("mkdir %s: %s", dir, strerror(errno)); return nullptr; }
     char p[1400];
     snprintf(p, sizeof p, "%s/zarr.json", dir);
-    FILE *f = fopen(p, "w");
-    if (!f) { fail("cannot write %s", p); return nullptr; }
+    char tmp[1500]; FILE *f = atomic_open(p, tmp, sizeof tmp);
+    if (!f) return nullptr;
     fprintf(f,
         "{\"zarr_format\":3,\"node_type\":\"array\",\"shape\":[%lld,%lld,%lld],\"data_type\":\"uint8\","
         "\"chunk_grid\":{\"name\":\"regular\",\"configuration\":{\"chunk_shape\":[%d,%d,%d]}},"
         "\"chunk_key_encoding\":{\"name\":\"default\",\"configuration\":{\"separator\":\"/\"}},\"fill_value\":%d,"
         "\"codecs\":[{\"name\":\"sharding_indexed\",\"configuration\":{\"chunk_shape\":[128,128,128],"
-        "\"codecs\":[{\"name\":\"volcomp\",\"configuration\":{\"q\":%g}}],"
+        "\"codecs\":[{\"name\":\"volcomp\",\"configuration\":{\"q\":%g}}%s],"
         "\"index_codecs\":[{\"name\":\"bytes\",\"configuration\":{\"endian\":\"little\"}},{\"name\":\"crc32c\"}],\"index_location\":\"end\"}}],"
         "\"attributes\":%s,\"dimension_names\":[\"z\",\"y\",\"x\"]}\n",
-        (long long)shape[0], (long long)shape[1], (long long)shape[2], shard, shard, shard, fill, (double)q, attrs_json ? attrs_json : "{}");
-    fclose(f);
+        (long long)shape[0], (long long)shape[1], (long long)shape[2], shard, shard, shard, fill, (double)q, CRC_CODEC, attrs_json ? attrs_json : "{}");
+    if (atomic_close(f, tmp, p, 0)) return nullptr;
     z3w *w = calloc(1, sizeof *w);
     w->dir = strdup(dir);
     memcpy(w->shape, shape, sizeof w->shape);
@@ -77,6 +98,7 @@ z3w *z3w_create(const char *dir, const int64_t shape[3], int shard, float q, int
     w->cg = shard / 128;
     w->q = q;
     w->fill = fill;
+    w->crc = crc_on();
     return w;
 }
 
@@ -85,8 +107,8 @@ z3w *z3w_create_codec(const char *dir, const int64_t shape[3], int shard, const 
     if (mkdirs(dir)) { fail("mkdir %s: %s", dir, strerror(errno)); return nullptr; }
     char p[1400];
     snprintf(p, sizeof p, "%s/zarr.json", dir);
-    FILE *f = fopen(p, "w");
-    if (!f) { fail("cannot write %s", p); return nullptr; }
+    char tmp[1500]; FILE *f = atomic_open(p, tmp, sizeof tmp);
+    if (!f) return nullptr;
     fprintf(f,
         "{\"zarr_format\":3,\"node_type\":\"array\",\"shape\":[%lld,%lld,%lld],\"data_type\":\"uint8\","
         "\"chunk_grid\":{\"name\":\"regular\",\"configuration\":{\"chunk_shape\":[%d,%d,%d]}},"
@@ -96,7 +118,7 @@ z3w *z3w_create_codec(const char *dir, const int64_t shape[3], int shard, const 
         "\"index_codecs\":[{\"name\":\"bytes\",\"configuration\":{\"endian\":\"little\"}},{\"name\":\"crc32c\"}],\"index_location\":\"end\"}}],"
         "\"attributes\":%s,\"dimension_names\":[\"z\",\"y\",\"x\"]}\n",
         (long long)shape[0], (long long)shape[1], (long long)shape[2], shard, shard, shard, fill, codec_json, attrs_json ? attrs_json : "{}");
-    fclose(f);
+    if (atomic_close(f, tmp, p, 0)) return nullptr;
     z3w *w = calloc(1, sizeof *w);
     w->dir = strdup(dir); memcpy(w->shape, shape, sizeof w->shape);
     w->shard = shard; w->cg = shard / 128; w->q = -1; w->fill = fill;
@@ -109,21 +131,21 @@ z3w *z3w_create_typed(const char *dir, const int64_t shape[3], int shard, int dt
     if (mkdirs(dir)) { fail("mkdir %s: %s", dir, strerror(errno)); return nullptr; }
     char p[1400];
     snprintf(p, sizeof p, "%s/zarr.json", dir);
-    FILE *f = fopen(p, "w");
-    if (!f) { fail("cannot write %s", p); return nullptr; }
+    char tmp[1500]; FILE *f = atomic_open(p, tmp, sizeof tmp);
+    if (!f) return nullptr;
     fprintf(f,
         "{\"zarr_format\":3,\"node_type\":\"array\",\"shape\":[%lld,%lld,%lld],\"data_type\":\"%s\","
         "\"chunk_grid\":{\"name\":\"regular\",\"configuration\":{\"chunk_shape\":[%d,%d,%d]}},"
         "\"chunk_key_encoding\":{\"name\":\"default\",\"configuration\":{\"separator\":\"/\"}},\"fill_value\":%.17g,"
         "\"codecs\":[{\"name\":\"sharding_indexed\",\"configuration\":{\"chunk_shape\":[128,128,128],"
-        "\"codecs\":[{\"name\":\"volcomp\",\"configuration\":{\"q\":%.9g}}],"
+        "\"codecs\":[{\"name\":\"volcomp\",\"configuration\":{\"q\":%.9g}}%s],"
         "\"index_codecs\":[{\"name\":\"bytes\",\"configuration\":{\"endian\":\"little\"}},{\"name\":\"crc32c\"}],\"index_location\":\"end\"}}],"
         "\"attributes\":%s,\"dimension_names\":[\"z\",\"y\",\"x\"]}\n",
-        (long long)shape[0], (long long)shape[1], (long long)shape[2], dtype_name(dtype), shard, shard, shard, fill, (double)q, attrs_json ? attrs_json : "{}");
-    fclose(f);
+        (long long)shape[0], (long long)shape[1], (long long)shape[2], dtype_name(dtype), shard, shard, shard, fill, (double)q, CRC_CODEC, attrs_json ? attrs_json : "{}");
+    if (atomic_close(f, tmp, p, 0)) return nullptr;
     z3w *w = calloc(1, sizeof *w);
     w->dir = strdup(dir); memcpy(w->shape, shape, sizeof w->shape);
-    w->shard = shard; w->cg = shard / 128; w->q = q; w->dtype = dtype; w->esize = (int)volcomp_dtype_size((volcomp_dtype)dtype); w->fillv = fill;
+    w->shard = shard; w->cg = shard / 128; w->q = q; w->dtype = dtype; w->esize = (int)volcomp_dtype_size((volcomp_dtype)dtype); w->fillv = fill; w->crc = crc_on();
     return w;
 }
 
@@ -187,10 +209,10 @@ int z3w_write_shard(z3w *w, int64_t sz, int64_t sy, int64_t sx, const uint8_t *d
     if (nthreads <= 0) nthreads = (int)ufsm_ncpu();
     if (nthreads > nc) nthreads = nc;
     if (nthreads > 256) nthreads = 256;
-    pthread_t th[256];
-    for (int i = 1; i < nthreads; i++) pthread_create(&th[i], nullptr, worker, &jb);
+    pthread_t th[256]; int made = 1;   /* (only the threads that started are joined: a failed pthread_create left th[i] undefined) */
+    for (int i = 1; i < nthreads; i++) { if (pthread_create(&th[made], nullptr, worker, &jb)) break; made++; }
     worker(&jb);
-    for (int i = 1; i < nthreads; i++) pthread_join(th[i], nullptr);
+    for (int i = 1; i < made; i++) pthread_join(th[i], nullptr);
     int rc = atomic_load(&jb.failed) ? -1 : 0;
     if (!rc) rc = write_file(w, sz, sy, sx, jb.enc, jb.len, nc);
     for (int i = 0; i < nc; i++) free(jb.enc[i]);
@@ -217,37 +239,36 @@ int z3w_write_shard_enc(z3w *w, int64_t sz, int64_t sy, int64_t sx, uint8_t **en
 }
 /* the shard object from its encoded chunks (none: no object) */
 static int write_file(const z3w *w, int64_t sz, int64_t sy, int64_t sx, uint8_t **enc, size_t *len, int nc) {
-    int rc = 0;
-    {
-        int any = 0;
-        for (int i = 0; i < nc; i++) any |= len[i] > 0;
-        if (any) {
-            char p[1400], tmp[1500];
-            snprintf(p, sizeof p, "%s/c/%lld/%lld", w->dir, (long long)sz, (long long)sy);
-            mkdirs(p);
-            snprintf(p, sizeof p, "%s/c/%lld/%lld/%lld", w->dir, (long long)sz, (long long)sy, (long long)sx);
-            snprintf(tmp, sizeof tmp, "%s.tmp", p);
-            FILE *f = fopen(tmp, "wb");
-            if (!f) rc = fail("cannot write %s", tmp);
-            else {
-                uint8_t *idx = malloc((size_t)nc * 16 + 4);
-                uint64_t off = 0;
-                for (int i = 0; i < nc; i++) {
-                    uint64_t o = len[i] ? off : UINT64_MAX, l = len[i] ? len[i] : UINT64_MAX;
-                    memcpy(idx + (size_t)i * 16, &o, 8);
-                    memcpy(idx + (size_t)i * 16 + 8, &l, 8);
-                    if (len[i]) { if (fwrite(enc[i], 1, len[i], f) != len[i]) rc = fail("write %s", tmp); off += len[i]; }
-                }
-                uint32_t crc = crc32c(0, idx, (size_t)nc * 16);
-                memcpy(idx + (size_t)nc * 16, &crc, 4);
-                if (fwrite(idx, 1, (size_t)nc * 16 + 4, f) != (size_t)nc * 16 + 4) rc = fail("write %s", tmp);
-                free(idx);
-                fclose(f);
-                if (!rc && rename(tmp, p)) rc = fail("rename %s", p);
-            }
+    int rc = 0, any = 0;
+    for (int i = 0; i < nc; i++) any |= len[i] > 0;
+    char p[1400], tmp[1500];
+    snprintf(p, sizeof p, "%s/c/%lld/%lld/%lld", w->dir, (long long)sz, (long long)sy, (long long)sx);
+    if (!any) {   /* an all-fill shard is no object: an older one at this path (a rewrite into an existing store) goes, or it would be read as data */
+        if (unlink(p) && errno != ENOENT) return fail("unlink %s: %s", p, strerror(errno));
+        return 0;
+    }
+    { char d[1400]; snprintf(d, sizeof d, "%s/c/%lld/%lld", w->dir, (long long)sz, (long long)sy); if (mkdirs(d)) return fail("mkdir %s: %s", d, strerror(errno)); }
+    FILE *f = atomic_open(p, tmp, sizeof tmp);
+    if (!f) return -1;
+    uint8_t *idx = malloc((size_t)nc * 16 + 4);
+    if (!idx) { fclose(f); unlink(tmp); return fail("index allocation"); }
+    uint64_t off = 0;
+    for (int i = 0; i < nc; i++) {
+        const size_t cl = len[i] ? len[i] + (w->crc ? 4 : 0) : 0;   /* (crc32c: after each chunk, whoever encoded it: z3w or predict's GPU coder) */
+        uint64_t o = cl ? off : UINT64_MAX, l = cl ? cl : UINT64_MAX;
+        memcpy(idx + (size_t)i * 16, &o, 8);
+        memcpy(idx + (size_t)i * 16 + 8, &l, 8);
+        if (len[i] && !rc) {
+            if (fwrite(enc[i], 1, len[i], f) != len[i]) rc = fail("write %s: %s", tmp, strerror(errno));
+            if (w->crc && !rc) { const uint32_t c = crc32c(0, enc[i], len[i]); if (fwrite(&c, 1, 4, f) != 4) rc = fail("write %s: %s", tmp, strerror(errno)); }
+            off += cl;
         }
     }
-    return rc;
+    uint32_t crc = crc32c(0, idx, (size_t)nc * 16);
+    memcpy(idx + (size_t)nc * 16, &crc, 4);
+    if (!rc && fwrite(idx, 1, (size_t)nc * 16 + 4, f) != (size_t)nc * 16 + 4) rc = fail("write %s: %s", tmp, strerror(errno));
+    free(idx);
+    return atomic_close(f, tmp, p, rc);   /* (checks the final flush: the index tail sat in the stdio buffer, and its ENOSPC was lost) */
 }
 
 int z3w_close(z3w *w) { if (w) { free(w->dir); free(w); } return 0; }
@@ -256,8 +277,8 @@ int z3w_write_group(const char *dir, const double *um, int n, const char *name, 
     if (mkdirs(dir)) return fail("mkdir %s", dir);
     char p[1400];
     snprintf(p, sizeof p, "%s/zarr.json", dir);
-    FILE *f = fopen(p, "w");
-    if (!f) return fail("cannot write %s", p);
+    char tmp[1500]; FILE *f = atomic_open(p, tmp, sizeof tmp);
+    if (!f) return -1;
     fprintf(f, "{\"zarr_format\":3,\"node_type\":\"group\",\"attributes\":{\"ome\":{\"version\":\"0.5\",\"multiscales\":[{\"version\":\"0.5\",\"name\":\"%s\","
                "\"axes\":[{\"name\":\"z\",\"type\":\"space\",\"unit\":\"micrometer\"},{\"name\":\"y\",\"type\":\"space\",\"unit\":\"micrometer\"},{\"name\":\"x\",\"type\":\"space\",\"unit\":\"micrometer\"}],\"datasets\":[", name);
     for (int i = 0; i < n; i++) {
@@ -267,6 +288,5 @@ int z3w_write_group(const char *dir, const double *um, int n, const char *name, 
     fprintf(f, "]}]}");
     if (attrs_json && attrs_json[0] == '{' && attrs_json[1] != '}') fprintf(f, ",%s", attrs_json + 1); else fprintf(f, "}");
     fprintf(f, "}\n");
-    fclose(f);
-    return 0;
+    return atomic_close(f, tmp, p, 0);
 }

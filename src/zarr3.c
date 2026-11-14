@@ -74,6 +74,7 @@ static int parse_codecs(const json *codecs, z3_meta *m) {
         else if (!strcmp(name, "latvol")) m->latvol = 1;
         else if (!strcmp(name, "zstd")) m->zstd = 1;
         else if (!strcmp(name, "bytes")) m->raw = 1;
+        else if (!strcmp(name, "crc32c")) { if (i + 1 != codecs->n) return FAIL("crc32c must be the last inner codec"); m->crc = 1; }   /* (audit mini/volcomp 1: volcomp has no checksum of its own) */
         else if (!strcmp(name, "transpose")) return FAIL("unsupported codec %s", name);
         else return FAIL("unsupported codec %s", name);
     }
@@ -161,7 +162,7 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
         free(sb);
     }
     for (int i = 0; i < 3; i++) {
-        if (m->chunk[i] <= 0 || m->shard[i] % m->chunk[i]) { FAIL("%s: shard not a multiple of chunk", key); goto bad; }
+        if (m->chunk[i] <= 0 || m->shard[i] <= 0 || m->shard[i] % m->chunk[i]) { FAIL("%s: shard not a positive multiple of chunk", key); goto bad; }   /* (shard 0 passed and divided by zero in the reads: audit mini/zarr 1) */
         z->cgrid[i] = m->shard[i] / m->chunk[i];
     }
     z->nc = z->cgrid[0] * z->cgrid[1] * z->cgrid[2];
@@ -285,7 +286,7 @@ static int mkdirs(const char *path) {
     return mkdir(tmp, 0755) && errno != EEXIST ? -1 : 0;
 }
 
-/* cache file for (shard, item): item = "idx", "missing" or the inner chunk number */
+/* cache file for (shard, item): item = "idx" or the inner chunk number (a "missing" marker of older runs is ignored) */
 static void cache_path(const z3 *z, const char *skey, const char *item, char *buf, size_t n) {
     snprintf(buf, n, "%s/%s.%s", z->cache, skey, item);
 }
@@ -450,17 +451,26 @@ static int load_index(z3 *z, const char *skey, ientry *idx) {
     size_t ilen = (size_t)z->nc * 16 + 4, n = 0;
     int fetched = 0;
     uint64_t payload_size = UINT64_MAX;
+    /* the cached index carries the shard's payload size after it (8 bytes; an older cache entry without it: no range check, as before), so
+       entries read from the cache are range-checked too (audit mini/zarr 6). A missing shard (404) is no longer cached on disk: a shard that
+       was being re-uploaded read as fill for every later run sharing the cache dir; now each process asks again and logs it once (audit
+       mini/store 3, mini/zarr 7) */
     uint8_t *b = cache_get(z, skey, "idx", &n);
+    if (b && n == ilen + 8) { memcpy(&payload_size, b + ilen, 8); n = ilen; }
     if (!b) {
-        uint8_t *missing = cache_get(z, skey, "missing", &n);
-        if (missing) { free(missing); imem_put(z, skey, nullptr, 0); return 0; }
-        b = malloc(ilen);
+        b = malloc(ilen + 8);
         if (!b) return FAIL("index allocation for %s", skey);
         int64_t size = -1, got = store_read_tail(z->s, skey, (int64_t)ilen, b, &size);   /* one suffix-range GET */
-        if (got == -2) { free(b); cache_put(z, skey, "missing", (const uint8_t *)"", 0); imem_put(z, skey, nullptr, 0); return 0; }
+        if (got == -2) {
+            free(b); imem_put(z, skey, nullptr, 0);
+            if (!store_is_local(z->s)) fprintf(stderr, "zarr3: shard %s is missing (HTTP 404): read as fill value\n", skey);
+            return 0;
+        }
         if (size >= 0 && (uint64_t)size < ilen) { free(b); return FAIL("%s: shorter than its index", skey); }
         if (got != (int64_t)ilen) { free(b); return FAIL("read index of %s (HTTP %ld)", skey, store_last_status()); }
+        if (size < 0) { free(b); return FAIL("%s: index read without the object's size", skey); }
         payload_size = (uint64_t)size - ilen;
+        memcpy(b + ilen, &payload_size, 8);
         n = ilen; fetched = 1;
     }
     if (n != ilen) { free(b); return FAIL("%s: bad index size", skey); }
@@ -477,7 +487,7 @@ static int load_index(z3 *z, const char *skey, ientry *idx) {
             free(b); return FAIL("%s: chunk %d range outside shard payload", skey, i);
         }
     }
-    if (fetched) cache_put(z, skey, "idx", b, n);
+    if (fetched) cache_put(z, skey, "idx", b, n + 8);
     free(b);
     imem_put(z, skey, idx, 1);
     return 1;
@@ -590,6 +600,16 @@ static int make_sink(const job *jb, const work *w, vfx_sink *k) {
     k->off = (ptrdiff_t)(((c0[0] - jb->o[0]) * jb->n[1] + (c0[1] - jb->o[1])) * jb->n[2] + (c0[2] - jb->o[2]));
     return 1;
 }
+/* the inner chain's crc32c (zarr v3: 4 bytes, little endian, after the encoded chunk): checked and stripped; a bit flip inside a volcomp
+   payload otherwise decodes with status OK (audit mini/volcomp 1), and a block-level read never reaches volcomp's own end-of-stream
+   check (volcomp 2): the CRC covers the whole chunk before any of it is decoded */
+static int crc_strip(const z3 *z, const uint8_t *b, size_t *n, const char *what) {
+    if (!z->m.crc) return 0;
+    if (*n < 4) return FAIL("%s: chunk shorter than its crc32c", what);
+    uint32_t want; memcpy(&want, b + *n - 4, 4);
+    if (index_crc(b, *n - 4) != want) return FAIL("%s: chunk crc32c mismatch", what);
+    *n -= 4; return 0;
+}
 static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, ZSTD_DCtx *dctx, uint8_t *scratch, int *mask, uint32_t submask, uint8_t *dsink, _Atomic uint32_t *dmask, int lean, uint32_t *hsub,
                        const vfx_sink *k, int *sunk) {
     *hsub = 0xffffffffu;   /* the substreams dec holds (all but for a lean device-sink read) */
@@ -597,6 +617,7 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
     const z3_meta *m = &z->m;
     size_t cv = (size_t)m->chunk[0] * m->chunk[1] * m->chunk[2];
     if (mask) *mask = 0;
+    if (crc_strip(z, enc, &n, z->key)) return -1;
     if (m->zstd) {
         const size_t cap = m->esize > 1 ? (VOLCOMP_TYPED_ENCODE_BOUND > cv * m->esize ? VOLCOMP_TYPED_ENCODE_BOUND : cv * m->esize) : (VOLCOMP_ENCODE_BOUND > cv ? VOLCOMP_ENCODE_BOUND : cv);
         size_t r = ZSTD_decompressDCtx(dctx, scratch, cap, enc, n);
@@ -726,6 +747,7 @@ int z3_chunk_raw(z3 *z, int64_t cz, int64_t cy, int64_t cx, uint8_t **buf, size_
             atomic_fetch_add(&g_z3_store_reads, 1); cache_put(z, skey, item, b, len);
         }
     }
+    if (crc_strip(z, b, &len, skey)) { free(b); return -1; }
     if (z->m.zstd) {
         const size_t cap = VOLCOMP_TYPED_ENCODE_BOUND; uint8_t *d = malloc(cap);
         size_t r = d ? ZSTD_decompress(d, cap, b, len) : 0; free(b);
@@ -779,7 +801,7 @@ static int prefetch_indices(z3 *z, const int64_t *s0, const int64_t *s1, int nth
     if (!j.cold) return FAIL("index work allocation");
     for (int i = 0; i < count; i++) {
         char key[1200]; index_key(&j, i, key, sizeof key);
-        if (!imem_known(z, key) && !cache_has(z, key, "idx") && !cache_has(z, key, "missing")) j.cold[j.total++] = i;
+        if (!imem_known(z, key) && !cache_has(z, key, "idx")) j.cold[j.total++] = i;
     }
     if (!j.total) { free(j.cold); return 0; }
     int nt = nthreads > 0 ? nthreads : 16;
