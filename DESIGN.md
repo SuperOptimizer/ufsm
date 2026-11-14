@@ -32,12 +32,12 @@ published grid), `xsec.py` (CT slices with both surfaces). Ours = `wraps_snap` (
   core, mostly no papyrus in the CT slices. w012-w034 cover the published turns 0-23 one to one (cov100 0.85-0.97, median 14-23 um).
 - Wrap matching: w(12 + k) <-> published turn k for all k = 0..30, no skipped or merged wrap in the ordering.
 - Sheet identity is where it disagrees: per matched vertex, our wrap id against the published sheet index along the axis ray
-  (`off`): same sheet 0.48, our id +1 0.31, +2 0.12, -1 0.03 (d median 15 / 15 / 17 / 24 um: locally both are on papyrus). The
-  +1 / +2 areas are angular sectors (about -180..-50 deg about the axis) repeated in every turn over the whole z range. The local
-  gap to the next of our wraps is the same in both (median 159 vs 152 um), so it is not dense-bundle ambiguity; CT slices at the
-  sector boundaries show our wraps crossing the wide delamination voids diagonally (`example_void_crossing_z18160.png`, w020)
-  while the published surface stays on papyrus: our winding field puts the turn step inside the voids. Locally our surface is on
-  a papyrus sheet, but the strip switches to the neighbouring sheet twice per turn.
+  (`off`): same sheet 0.48, our id +1 0.31, +2 0.12, -1 0.03 (d median 15 / 15 / 17 / 24 um: locally both are on papyrus). Binned by
+  the published turn fraction (audit 11-14 #1, d < 50 um) the mode climbs 0, 0, 0, 0, +1, +1, +1, +2 over each turn and drops back at the
+  cut, in every z slab: our wraps gain about two sheets per revolution against the published spiral, the signature of an opposite-handed
+  level set (the fit's dir +1 default; fibfit's dir fix). An earlier reading of this section put the cause in our wraps crossing the
+  delamination voids (`example_void_crossing_z18160.png`); that crossing is real at the sector boundaries but is a consequence of the
+  handedness, not a separate cause. Locally our surface is on a papyrus sheet; along the strip it switches sheets twice per turn.
 
 ## Sampler GPU work vs the training stream; the pair rule on both cards (2026-11-14, branch w4stream-20261114)
 
