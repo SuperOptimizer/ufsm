@@ -111,8 +111,9 @@ int axis_load(axis *a, const char *path) {
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    char *txt = malloc((size_t)n + 1);
-    if (fread(txt, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(txt); return -1; }
+    char *txt = n >= 0 ? malloc((size_t)n + 1) : nullptr;
+    if (!txt || fread(txt, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(txt); return -1; }
+    txt[n] = 0;
     fclose(f);
     json *j = json_parse(txt, (size_t)n);
     free(txt);
@@ -268,19 +269,28 @@ static z3 *onfly_phase_open(const source *s, const json *of, int extra, int plev
     *rmx = rm;
     return z;
 }
+static int g_strict;
+void sources_set_strict(int on) { g_strict = on; }
+static void sources_unread_cb(const char *p, void *u) { (void)u; fprintf(stderr, "sources: WARNING: key \"%s\" is not one sources_load reads (a typo?)\n", p); }
 sources *sources_load(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "sources: cannot open %s\n", path); return nullptr; }
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    char *txt = malloc((size_t)n + 1);
-    if (fread(txt, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(txt); return nullptr; }
+    char *txt = n >= 0 ? malloc((size_t)n + 1) : nullptr;
+    if (!txt || fread(txt, 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "sources: cannot read %s\n", path); fclose(f); free(txt); return nullptr; }
+    txt[n] = 0;
     fclose(f);
     json *j = json_parse(txt, (size_t)n);
+    if (!j) {   /* (mini/json 8: a syntax error was reported as a missing "sources" array) */
+        const size_t off = json_error_offset(); size_t line = 1, col = 1; for (size_t q = 0; q < off && q < (size_t)n; q++) { if (txt[q] == '\n') { line++; col = 1; } else col++; }
+        fprintf(stderr, "sources: %s is not valid JSON (byte %zu, line %zu column %zu; duplicate keys and nan / inf numbers are errors)\n", path, off, line, col);
+        free(txt); return nullptr; }
     free(txt);
     const json *arr = json_get(j, "sources");
     if (!arr || arr->type != J_ARR) { fprintf(stderr, "sources: no \"sources\" array in %s\n", path); json_free(j); return nullptr; }
+    if (!arr->n) { fprintf(stderr, "sources: the \"sources\" array of %s is empty\n", path); json_free(j); return nullptr; }
     sources *S = calloc(1, sizeof *S);
     S->cache = sdup(json_str(json_get(j, "cache"), nullptr));
     { const char *hs = getenv("UFSM_HOLD_STRICT"); g_hold_strict = (hs && atoi(hs)) || json_num(json_get(j, "holdout_strict"), 0) != 0; }
@@ -290,9 +300,24 @@ sources *sources_load(const char *path) {
     for (size_t i = 0; i < arr->n; i++) {
         const json *e = json_at(arr, i);
         source *s = &S->src[i];
+        {   /* required: "name", "root", "ct" as strings (mini/json 3: a missing root opened the cwd, a missing ct an empty key) */
+            const char *rq[3] = {"name", "root", "ct"};
+            for (int q = 0; q < 3; q++) { const json *v = json_get(e, rq[q]);
+                if (!v || v->type != J_STR || !*v->str) { fprintf(stderr, "sources: %s: source %zu (%s): \"%s\" is required (a non-empty string)\n", path, i,
+                                                               json_str(json_get(e, "name"), "unnamed"), rq[q]); json_free(j); sources_free(S); return nullptr; } }
+        }
         s->name = sdup(json_str(json_get(e, "name"), "?"));
         s->s = store_open(json_str(json_get(e, "root"), "."));
         s->ct_key = sdup(json_str(json_get(e, "ct"), ""));
+        {   /* the per-source numbers: a present key of another type, or a non-finite value, is an error (mini/json 2 / 5b / 7: "weight": "2.0" trained at 1) */
+            const char *nk[] = {"um", "weight", "ink_weight", "trust_band", "iso", "papyrus", "head", "min_level", "max_level", "geometry", "crush_fine", "ct_only"};
+            for (size_t q = 0; q < sizeof nk / sizeof *nk; q++) { const json *v = json_get(e, nk[q]);
+                if (v && ((v->type != J_NUM && v->type != J_BOOL) || !isfinite(v->num))) {
+                    fprintf(stderr, "sources: %s: \"%s\" must be a finite number\n", s->name, nk[q]); json_free(j); sources_free(S); return nullptr; } }
+            const char *sk[] = {"scope", "axis", "holdout_file", "holdout_mode"};
+            for (size_t q = 0; q < sizeof sk / sizeof *sk; q++) { const json *v = json_get(e, sk[q]);
+                if (v && v->type != J_STR) { fprintf(stderr, "sources: %s: \"%s\" must be a string\n", s->name, sk[q]); json_free(j); sources_free(S); return nullptr; } }
+        }
         { const json *mj = json_get(e, "ct_mirror"); const char *mr = json_str(json_get(mj, "root"), nullptr);
           if (mr) { s->ct_ms = store_open(mr); s->ct_mkey = sdup(json_str(json_get(mj, "ct"), s->ct_key)); } }
         { const json *lj = json_get(e, "latvol"); const char *lr = json_str(json_get(lj, "root"), nullptr);
@@ -300,6 +325,7 @@ sources *sources_load(const char *path) {
         s->um = json_num(json_get(e, "um"), 0);
         s->weight = json_num(json_get(e, "weight"), 1.0);
         s->ink_weight = json_num(json_get(e, "ink_weight"), 1.0);
+        if (!(s->weight >= 0) || !(s->ink_weight >= 0) || !(s->um >= 0)) { fprintf(stderr, "sources: %s: weight, ink_weight and um must be >= 0\n", s->name); json_free(j); sources_free(S); return nullptr; }
         s->trust_band = (int)json_num(json_get(e, "trust_band"), 0);
         { const char *sc = json_str(json_get(e, "scope"), "global");
           if (!strcmp(sc, "local")) s->scope_local = 1;
@@ -309,7 +335,7 @@ sources *sources_load(const char *path) {
         s->pap_level = (int)json_num(json_get(e, "papyrus"), s->iso);
         {   /* "heads": per-head loss multipliers (a number, or {"on": 0|1, "lambda": x}); unknown names are refused (a typo would train a head silently) */
             for (int h = 0; h < SH_N; h++) s->head_w[h] = 1.f;
-            const json *hj = json_get(e, "heads");
+            const json *hj = json_get(e, "heads"); json_mark_read(hj);   /* (its keys are checked by name below) */
             if (hj && hj->type != J_OBJ) { fprintf(stderr, "sources: %s: \"heads\" must be an object {\"phase\": 1, \"rv\": 0, ...}\n", s->name); json_free(j); sources_free(S); return nullptr; }
             for (size_t k = 0; hj && k < hj->n; k++) {
                 const char *nm = hj->keys[k]; const json *v = hj->items[k]; int h = 0;
@@ -358,6 +384,11 @@ sources *sources_load(const char *path) {
                 z3 *z = ct ? inkfly_open(ct, sg, &ic, (size_t)json_num(json_get(of, "cache_mb"), 2048), dcd && *dcd && strcmp(dcd, "off") && strcmp(dcd, "0") ? dcd : nullptr, &s->ink_fly[c]) : nullptr;
                 if (!z) { if (ct1) z3_close(ct1); fprintf(stderr, "sources: %s/%s: cannot open the onfly ink target %s\n", s->name, CHNAME[c], sg); json_free(j); sources_free(S); return nullptr; }
                 s->tgt_prob[c] = s->tgt_prob254[c] = 1; s->tgt_min_level[c] = L; s->tgt_key[c] = strdup("onfly");
+                {   /* (the stored-set keys an onfly entry may carry: "encoding" must say what onfly makes, "min_level" its level) */
+                    const json *ej = json_get(t, "encoding"), *mj = json_get(t, "min_level");
+                    if ((ej && strcmp(json_str(ej, ""), "prob254")) || (mj && (int)json_num(mj, -1) != L)) {
+                        fprintf(stderr, "sources: %s/%s: an onfly ink target is \"encoding\": \"prob254\" at \"min_level\" %d (its \"level\")\n", s->name, CHNAME[c], L);
+                        json_free(j); sources_free(S); return nullptr; } }
                 for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = 0;
                 s->tgt[c][L] = z; s->tgt_present[c][L] = 1;
                 if (ct1) { s->tgt[c][L + 1] = inkfly_open_pooled(ct1, z, 0); s->tgt_present[c][L + 1] = s->tgt[c][L + 1] != nullptr; }   /* (closed before level L: sources_free goes up the levels? see below) */
@@ -377,6 +408,12 @@ sources *sources_load(const char *path) {
                 }
                 s->tgt_fib[c] = f; s->tgt_key[c] = strdup("#fibre"); s->tgt_prob[c] = s->tgt_prob254[c] = 1;
                 continue;
+            }
+            {   /* mini/json 4: an unknown encoding ("Binary", "prob_254") read the target as raw bytes */
+                const json *ej = json_get(t, "encoding"); const char *en = json_str(ej, "");
+                if ((ej && ej->type != J_STR) || (*en && strcmp(en, "binary") && strcmp(en, "prob254") && strcmp(en, "prob") && strcmp(en, "side-votes") && strcmp(en, "side"))) {
+                    fprintf(stderr, "sources: %s/%s: \"encoding\" is one of binary, prob254, prob, side, side-votes (absent: raw bytes), not \"%s\"\n", s->name, CHNAME[c], en);
+                    json_free(j); sources_free(S); return nullptr; }
             }
             s->tgt_binary[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "binary");
             s->tgt_prob254[c] = !strcmp(json_str(json_get(t, "encoding"), ""), "prob254");   /* p * 254, 255 = unknown: read as stored */
@@ -417,7 +454,10 @@ sources *sources_load(const char *path) {
             const char *grp = json_str(json_get(t, "group"), nullptr);
             if (grp) { s->tgt_key[c] = strdup(grp); continue; }
             const json *org = json_get(t, "origins");
-            if (!org) { fprintf(stderr, "sources: %s/%s: need a string, {root, group} or {regions|array, size, origins}\n", s->name, CHNAME[c]); continue; }
+            if (!org || org->type != J_ARR) { fprintf(stderr, "sources: %s/%s: need a string, {root, group} or {regions|array, size, origins}\n", s->name, CHNAME[c]); json_free(j); sources_free(S); return nullptr; }
+            for (size_t k = 0; k < org->n; k++) { const json *oe = json_at(org, k); int ok = oe && oe->type == J_ARR && (oe->n == 3 || oe->n == 4);
+                for (size_t d = 0; ok && d < oe->n; d++) ok = json_at(oe, d)->type == J_NUM;
+                if (!ok) { fprintf(stderr, "sources: %s/%s: origin %zu is not [z, y, x] or [z, y, x, size] numbers\n", s->name, CHNAME[c], k); json_free(j); sources_free(S); return nullptr; } }
             regions *r = calloc(1, sizeof *r);
             r->dir = sdup(json_str(json_get(t, "regions"), ""));
             r->array = sdup(json_str(json_get(t, "array"), nullptr));
@@ -600,7 +640,8 @@ sources *sources_load(const char *path) {
         const json *bx = json_get(e, "boxes");   /* task restore: level-0 boxes [z, y, x, nz, ny, nx] that hold local CT (training windows lie inside one) */
         if (bx && bx->type == J_ARR && bx->n) {
             s->box = calloc(bx->n, sizeof *s->box);
-            for (size_t k = 0; k < bx->n; k++) { const json *b = json_at(bx, k); if (!b || b->type != J_ARR || b->n != 6) continue;
+            for (size_t k = 0; k < bx->n; k++) { const json *b = json_at(bx, k);
+                if (!b || b->type != J_ARR || b->n != 6) { fprintf(stderr, "sources: %s: \"boxes\" entry %zu is not [z, y, x, nz, ny, nx]\n", s->name, k); json_free(j); sources_free(S); return nullptr; }
                 for (int d = 0; d < 6; d++) s->box[s->nbox][d] = (int64_t)json_num(json_at(b, (size_t)d), 0);
                 s->nbox++; }
         }
@@ -612,12 +653,19 @@ sources *sources_load(const char *path) {
             for (int c = 0; c < NTG; c++) for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = 0;
         }
         const char *ap = json_str(json_get(e, "axis"), nullptr);
-        if (ap && axis_load(&s->ax, ap)) fprintf(stderr, "sources: %s: cannot load axis %s\n", s->name, ap);
+        if (ap && axis_load(&s->ax, ap)) { fprintf(stderr, "sources: %s: cannot load axis %s\n", s->name, ap); json_free(j); sources_free(S); return nullptr; }   /* (mini/json 6: it trained without one) */
         if (s->um <= 0) {
             z3 *z0 = source_ct(s, 0);
             if (z0) s->um = z3_meta_of(z0)->scale_um;
         }
-        if (s->um <= 0) fprintf(stderr, "sources: %s: unknown voxel size (set \"um\")\n", s->name);
+        if (s->um <= 0 && !s->srp) { fprintf(stderr, "sources: %s: unknown voxel size (set \"um\")\n", s->name); json_free(j); sources_free(S); return nullptr; }
+    }
+    {   /* mini/json 1: keys nothing read (typos: "holdout_fil", "wieght", a target "rekto") trained at the defaults silently. A warning;
+           fatal under sources_set_strict (train --strict-sources 1) */
+        int u = 0;
+        const int nu = json_unread(j, "", sources_unread_cb, &u);
+        if (nu) fprintf(stderr, "sources: %s: %d unknown / unused key%s above%s\n", path, nu, nu > 1 ? "s" : "", g_strict ? ": fatal (--strict-sources 1)" : " (ignored; --strict-sources 1 makes this fatal)");
+        if (nu && g_strict) { json_free(j); sources_free(S); return nullptr; }
     }
     json_free(j);
     return S;

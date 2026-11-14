@@ -250,6 +250,9 @@ ufsm_exe(test_sample_ops SUITE tests/test_sample_ops.c OBJS scannorm edt band sh
 ufsm_exe(test_sampler_safety SUITE tests/test_sampler_safety.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush
          scrollaug cover json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb
          embz LIBS LDLIBS)
+ufsm_exe(test_sources_json SUITE tests/test_sources_json.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush
+         scrollaug cover json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb
+         embz LIBS LDLIBS)
 ufsm_exe(test_scan_augment SUITE tests/test_scan_augment.c OBJS ct_augment LIBS m)
 ufsm_exe(test_scanprep SUITE tests/test_scanprep.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush scrollaug
          cover json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb embz
