@@ -231,6 +231,9 @@ test_ink3d_gambiarra                           | gpu,slow     |   102 | python3 
 test_mx_sw                                     | gpu          |     2 | ./$B/test_mx_sw
 test_mx                                        | gpu,smoke    |     3 | ./$B/test_mx
 test_mx4                                       | gpu,smoke    |     5 | ./$B/test_mx4
+test_mx4_wide                                  | gpu          |    12 | UFSM_TEST_QUICK=1 ./$B/test_mx4_wide
+test_mx4_wide~full                             | gpu,slow     |    40 | ./$B/test_mx4_wide
+test_mx4~wideall                               | gpu          |    10 | TMX4_WIDE_ALL=1 ./$B/test_mx4
 test_head_tc                                   | gpu,smoke    |     3 | UFSM_TEST_QUICK=1 ./$B/test_head_tc
 test_grad_mx4                                  | gpu,smoke    |    12 | ./$B/test_grad_mx4
 test_l3_sched                                  | gpu          |     9 | ./$B/test_l3_sched
