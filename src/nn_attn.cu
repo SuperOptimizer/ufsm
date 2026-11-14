@@ -92,6 +92,11 @@ static int g_at_mx = -1;   /* the linear layers' GEMM precision: 0 fp32 (cuBLASL
                              other linear layers fp32); env UFSM_LINEAR_MX */
 static int g_at_core = -1;   /* the attention core: 0 fp32 CUDA cores, 1 fp16 tensor cores (src/nn_attn_tc.cu; the default), 2 MX-fp8 (src/lp_attn8.cu);
                                 env UFSM_ATTN_CORE */
+extern "C" int at_h16_reserve(void);
+extern "C" int at_get_mx(void);
+/* the current device's cuBLASLt handles and workspaces (32 MB each) now, not at the first attention GEMM: the trainer calls this before its
+   memory planner measures the free memory (2026-11-14 audit: they were allocated after the plan, outside it) */
+extern "C" int at_reserve(void) { return (alt_ready() < 0 ? -1 : 0) | (at_get_mx() == 16 ? at_h16_reserve() : 0); }
 extern "C" void at_set_core(int c) { g_at_core = c; }
 extern "C" int at_get_core(void) { if (g_at_core < 0) { const char *e = getenv("UFSM_ATTN_CORE"); g_at_core = e ? atoi(e) : 1; } return g_at_core; }
 extern "C" void at_set_mx(int bits) { g_at_mx = bits; }

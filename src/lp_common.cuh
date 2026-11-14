@@ -32,9 +32,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-extern cudaError_t g_lp_err;
+extern thread_local cudaError_t g_lp_err;   /* mgpu: per-thread (posted process-wide by LPCK: nn_err_post) */
+extern "C" void nn_err_post(int e, const char *file, int line, const char *what);
 extern "C" int lp_sw_build(void);   /* lp_mxsw.cu: 1 = the software MX paths (an ARCH=86 build) */
-#define LPCK() do { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess && g_lp_err == cudaSuccess) g_lp_err = e_; } while (0)
+#define LPCK() do { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess && g_lp_err == cudaSuccess) { g_lp_err = e_; nn_err_post((int)e_, __FILE__, __LINE__, "a low-precision kernel (LPCK)"); } } while (0)
 static inline unsigned nblk_(size_t n, unsigned b) { return (unsigned)((n + b - 1) / b); }
 /* the z tiles of TZ planes a launch covers: all of depth D, or those of the z-window sp.zw0 / zw1 (nn_set_zwin; its bounds on tile
    edges, or the window ends at D: a tile never writes planes outside the window) */

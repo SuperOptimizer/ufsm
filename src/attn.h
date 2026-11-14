@@ -193,6 +193,7 @@ int at_gemm_ex(int ta, int tb, int M, int N, int K, const float *A, const float 
    at_gemm_f32 always fp32 (Muon's Newton-Schulz, tests) */
 void at_set_mx(int bits);
 int at_get_mx(void);
+int at_reserve(void);   /* the current device's cuBLASLt handles + workspaces now (before a memory planner measures the free memory) */
 int at_gemm_f32(int ta, int tb, int M, int N, int K, const float *A, const float *B, float *Cm, float beta);
 
 /* the attention core (softmax(Q K^T) V and its backward): 0 fp32 CUDA cores, 1 fp16 tensor cores with fp32 accumulation (default)

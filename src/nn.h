@@ -24,6 +24,8 @@ static inline size_t shape_spatial(shape5 s) { return (size_t)s.d * s.h * s.w; }
 /* ---- device / memory ---- */
 int nn_init(int device);                 /* selects the device; returns 0 on success */
 const char *nn_check(void);              /* nullptr if no error since the last call, else the message */
+void nn_err_worker(int on);              /* this host thread is a per-GPU worker: its nn_check reports only its own errors (the latches are per thread;
+                                            every first error is also posted process-wide, and a non-worker thread's nn_check takes a posted one) */
 const char *nn_check_site(void);         /* the call site of the error the last nn_check returned ("" for none; low-precision kernels: their own latch) */
 void *nn_malloc(size_t bytes);
 void nn_free(void *p);
@@ -95,6 +97,7 @@ void nn_set_tf32(int on);
 void nn_set_prec(int p);
 void nn_set_sr(int on);              /* stochastic rounding of the fp8 gradient operands: backward-data input, weight-gradient gy (env UFSM_SR=1) */
 void nn_set_sr_step(unsigned step);
+void nn_sr_salt(unsigned s);       /* this host thread's stochastic-rounding salt (data-parallel replica index; 0: the one-GPU draws) */
 /* the per-host-thread op state (layer ids, the stochastic-rounding counter, the loss / logit formats, ...): one host thread per GPU starts
    from the main thread's (capture in the main thread, install in the worker) */
 typedef struct { int layer, sub, pass, block; unsigned sr_ctr; float posw; int logits_h16, head_h16, loss_g16, gn_const, actbf; } nn_tls;
@@ -685,6 +688,7 @@ typedef struct { float *lrm, *ema; double *dog; float *const *disp; double *part
 void nn_muon_ext_adapt(const nn_madapt *a);
 void nn_muon_scale_mode(int m);   /* 0: sqrt(max(1, Co / K)); 1: spectral sqrt(Co / K) (train --muon-scale spectral) */
 void nn_signm(float *p, const float *g, float *m, size_t n, float lr, float b, float wd);   /* sign-momentum (Scion ell-inf) step */
+int lp_f8w_mixed_reserve(void);   /* the latent input conv's MX-fp8 x / MX-fp4 gy weight-gradient chunk copies (96 MB) on the current device now */
 void nn_muon_tc(int on);   /* Muon / Muon-ext Newton-Schulz products on fp16 tensor cores (fp32 accumulation; train --muon-tc 1) */
 void nn_muon_ext_opts(int cautious);
 void nn_muon_ext_mix(float *const *m2, float b3, float alpha);   /* AdEMAMix slow EMA (device array of per-matrix buffers; nullptr = off) */   /* nn_muon_ext_batch extras (process-wide): cautious masking (train --muon-cautious 1) */
