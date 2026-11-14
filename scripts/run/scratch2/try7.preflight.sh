@@ -23,7 +23,9 @@ if [ "${1:-}" != --after ]; then
   python3 -I -c "import json,sys; d=json.load(open('$SRCJ')); s=d['sources']; w=[x for x in s if x['name']=='PHerc1218-b3']; sys.exit(0 if d.get('holdout_strict')==1 and all(x.get('holdout_file') for x in s) and w and w[0]['weight']==0 else 1)" \
     && good "sources: holdout_strict 1, holdout_file on every source, PHerc1218-b3 weight 0" || bad "sources json lacks holdout_strict / holdout_file / 1218 weight 0"
   [ -f /vesuvius/ufsm/univ/scratch1/holdouts-20261114.json ] && good "holdouts json" || bad "no holdouts-20261114.json"
-  for r in p4-codesA48 p4-codesB48; do [ -f /vesuvius/ufsm/datafix-20261114/raster/$r/done ] && good "raster $r done" || bad "raster $r not done"; done
+  for r in p4-codesA48 p4-codesB48 1667-codesA 1667-codesB; do d=/vesuvius/ufsm/datafix-20261114/raster/$r
+    [ -f $d/done ] && good "raster $r done" || bad "raster $r not done"
+    grep -qF "\"$d\"" "$SRCJ" && good "sources read $d" || bad "sources json does not reference $d (try7 must read the datafix re-rasters)"; done
   grep -q ALLDONE /vesuvius/ufsm/datafix-20261114/raster/run.log 2>/dev/null && good "raster run.log ALLDONE" || bad "raster run.log has no ALLDONE"
   if [ -f $R/scratch2.audit.ok ] && [ $R/scratch2.audit.ok -nt $E ] && [ $R/scratch2.audit.ok -nt "$U" ]; then good "leak audit: $(cat $R/scratch2.audit.ok)"
   else bad "no leak audit newer than the env and binary: S2CTL_OWNER=merger2 bash $R/s2ctl.sh audit $E 1000"; fi
