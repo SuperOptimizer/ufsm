@@ -3957,7 +3957,10 @@ static void replay_window(sampler *sp, batch *b, int i, int rep, uint8_t **scr) 
         if (c->augment == 3) while (y.perm[0] != 0 || y.flip[0]) y = sym_of((int)rint_below(&r, 48));
         if (c->symmetry_p < 1 && runif(&r) >= c->symmetry_p) y = sym_of(0);
         spatial_aug_make(&sa, rnext(&r), P, c->rotate_degrees, c->rotate_p, c->elastic, c->elastic_p);
-        if (!sa.active) spatial_aug_make(&sa, rnext(&r), P, c->rotate_degrees > 0 ? c->rotate_degrees : 5, 1.f, c->elastic, c->elastic_p);   /* (the labels need the device warp) */
+        /* the labels need the device warp (they are on the source grid): an identity warp record when nothing drew (R = I, no elastic,
+           scale 1: the pull is the identity). Before 11-14 (mini/augment #1) a fallback rotation of up to 5 deg (5 even under
+           --rotate-deg 0) was drawn here, so every replay rotated (rate 1, not rotate_p) and the CPU path's unwarped windows did not */
+        if (!sa.active) sa.active = 1;
         if (c->zoom_p > 0 && c->zoom_min > 0 && c->zoom_min < 1 && runif(&r) < c->zoom_p) spatial_aug_zoom(&sa, exp(runif(&r) * log(c->zoom_min)));
         if (c->affine_p > 0 && c->scan.strength > 0 && runif(&r) < c->affine_p) spatial_aug_affine(&sa, rnext(&r), c->affine_aniso * c->scan.strength, c->affine_shear * c->scan.strength);
     }

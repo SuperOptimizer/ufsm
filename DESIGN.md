@@ -6,6 +6,28 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Replay warp and sources-json validation (mini/augment, mini/json; 2026-11-14, branch augfix-20261114)
+
+**Replay warp (augment #1).** A replayed window whose redraw came up without rotation / elastic / zoom drew a fallback rotation of up
+to 5 deg (5 even under --rotate-deg 0), because its label planes sit on the source grid and need the device warp. Every replay was
+therefore rotated (rate 1, not rotate_p). It now gets an identity warp record (R = I, no elastic, scale 1: the pull is the identity).
+test_replay_lean (CPU) passes. **Augment #2** (reflections teach a chirality real scrolls never have) is a recipe question: `--augment 2`
+(rotations only) already exists; the default is unchanged pending a measured ablation (GPU).
+
+**sources json (json #1-#8).** The parser takes JSON numbers only (nan / inf / hex / "01" / ".5" were accepted by strtod, and a number
+at the end of an unterminated buffer could read past it), refuses duplicate keys (first-wins hid the second; objects under 4096 keys)
+and reports the byte offset of a syntax error (sources_load prints line / column instead of "no sources array"). sources_load:
+- `name`, `root`, `ct` are required non-empty strings (a missing root opened the cwd); an empty `sources` array is fatal;
+- the per-source numbers (um, weight, ink_weight, trust_band, iso, papyrus, head, min/max_level, geometry, crush_fine, ct_only) must be
+  finite numbers when present, weight / ink_weight / um >= 0; scope / axis / holdout_file / holdout_mode strings;
+- an unknown target `encoding` is fatal (it read the target as raw bytes); an onfly ink target's encoding / min_level must match it;
+- region origins must be [z, y, x(, size)] numbers, a missing `origins` is fatal; restore `boxes` of the wrong length are fatal; an
+  axis that does not load is fatal; an unknown voxel size is fatal (except sr_pair sources);
+- every key nothing read (json.c tracks json_get per key: typos such as "holdout_fil", "wieght", a target "rekto") is a warning, fatal
+  under `train --strict-sources 1` (sources_set_strict); keys "note" / "comment" / "_*" are free text.
+On the live jsons (scratch1, scratch1-ph80, rv) the check found 16 such keys: the onfly ink targets' "encoding" / "min_level", never
+read on the onfly path; now validated there. test_sources_json (CPU, 18 cases).
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the

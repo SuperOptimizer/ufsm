@@ -217,6 +217,7 @@ test_sample_ops                                | smoke        |     2 | ./$B/tes
 test_aug_preset                                | smoke        |     2 | ./$B/test_aug_preset
 test_raster                                    |              |    27 | ./$B/test_raster
 test_sampler_safety                            | smoke        |     6 | python3 tests/test_sampler_safety.py
+test_sources_json                              |              |     1 | ./$B/test_sources_json
 test_ink_ext_v8in                              | gpu,slow     |   276 | python3 tests/test_ink_ext_v8in.py
 test_ink_ext_hecate                            | gpu,slow     |   421 | python3 tests/test_ink_ext_hecate.py
 test_ink_ext_reader3                           | gpu,slow     |   104 | python3 tests/test_ink_ext_reader3.py
