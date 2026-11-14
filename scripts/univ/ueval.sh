@@ -140,7 +140,7 @@ fi
   fi
   blk fit && echo "== TRAINING-FIT block (every label below is in the net's training: convergence / head interference, not generalisation)"
   if has wind && [ -s $WB/res/$T.tsv ]; then echo "-- wind, training-fit: wbench core rows $(($(wc -l < $WB/res/$T.tsv) - 1))"
-    for r in $REFS; do [ -s $WB/res/$r.tsv ] && { echo "   vs $r"; $B wbench-stats $WB/res/$r.tsv $WB/res/$T.tsv --metric p05x,ids 2>&1 | grep -E '^(p05x|ids) '; }; done
+    for r in $REFS; do [ -s $WB/res/$r.tsv ] && { echo "   vs $r (A = $r, B = this run: A-B is ref - new, the opposite sign of the unseen pairs' B - A)"; $B wbench-stats $WB/res/$r.tsv $WB/res/$T.tsv --metric p05x,ids 2>&1 | grep -E '^(p05x|ids) '; }; done
     [ -z "$REFS" ] && $B wbench-stats $WB/res/$T.tsv --metric p05x,ids 2>&1 | grep -E '^(p05x|ids) '; fi
   has rv && { echo "-- rv, training-fit (turns per GT turn / share of intervals off >= 0.5 turn)"; for s in $RVSC; do echo "   $s $(grep -E '^ +all' $RVE/$T/$s/ruler.log 2>/dev/null | tail -1)"; done; }
   if has ink && [ -s $E/$T/ink/vscores.tsv ]; then echo "-- ink, training-fit (3-D AUC / best F1, $([ ${BLEND:-1} = 1 ] && echo 2-pass blend || echo single pass); every crop's labels are in training)"

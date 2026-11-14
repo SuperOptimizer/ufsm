@@ -13,6 +13,7 @@ def main():
         for r in rows:
             try: v = float(r[c - 1])
             except (ValueError, IndexError): continue
+            if v != v: continue   # (NaN: a one-class crop has no AUC)
             by.setdefault(r[0].rsplit('_', 1)[0], []).append(v)
         G = list(by.values()); n = sum(len(g) for g in G)
         if not n: print(f'column {c}: no values'); continue
