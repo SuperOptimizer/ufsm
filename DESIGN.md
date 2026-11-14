@@ -6,6 +6,47 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Split, thread and RNG audit fixes (2026-11-14, branch thrfix-20261114; source only, not yet built or run)
+
+Fixes for audit-20261114 targeted/split.md, mini/threads.md and mini/rng.md. They are source-only by the user's order; the final sweep
+builds and tests them.
+
+- **gfilm under --split (split #1).** Nothing installed `unet_set_gfilm_reduce`, so the gfilm A / B gradients of the whole (split-top)
+  decoder levels counted twice in the allreduce. Scratch2 has two such levels of five (dec 3, 4).
+  - Now `gfilm_bwd` zeroes side 1's copy by itself.
+  - The token path's dg (UFSM_GFILM_TOKGRAD=1) is summed through a split reduce that train installs. Without the reduce, that path
+    aborts under split.
+  - Check: `test_split_lat~gfilm` compares the A / B block on its own.
+- **Loss-path A/B in the suite (split #2).** `test_split_ab` (gpu2, slow) runs split_lat_ab.sh's first-step loss / gradient dump on the
+  wind fixture with the live feature set in small:
+  - 6 levels, --split-top 3, 4 attention blocks, --attn-pe scroll, --gfilm, --film 2, --fstem 16, --gn-ema, --skip-empty 1
+  - --lat 4 --lat-guide 3, --rv 2, ink head with MIL, fibre head
+  - Pass condition: split vs one GPU within 2x the one-GPU rerun plus a floor (loss 1e-7, gradients 1e-6), on the loss, the whole
+    gradient and the gfilm block.
+- **Smaller split items.**
+  - #4: the distillation and deep-supervision guards test split_h0 rather than sp_on, which is off on the whole levels.
+  - #5: --skip-empty --split refuses a seam off the 8-cell tile grid.
+  - #6: replica check. Every card's master weights are hashed at the checkpoint steps, and a mismatch stops the run.
+    UFSM_REPLICA_CHECK=N sets the interval; 0 turns it off.
+  - #3 (predict --split for latent / attention nets) is deferred: it is a feature, not a fix.
+- **Threads.**
+  - vws_next returns -1 after a persistent fill failure.
+  - zcache: an O(1) LRU list, and keys by z3_id rather than the array's address.
+  - sources: acquire / release on the lazily opened arrays.
+  - The echo gate's busy callback runs outside sp->mu.
+  - Per sampler: THP and bank_own. The env is read once.
+  - Atomic lazy env ints.
+  - dc_free waits for its readers.
+  - dcache_default_dir is built once.
+- **RNG.**
+  - --finetune reseeds the sample / SSL / SR streams from the loaded checkpoint's step.
+  - A resume reseeds the SSL teacher stream.
+  - --phase-dense draws its keep mask per draw.
+  - --det retries a failed read from the same RNG state.
+  - SR seeds keep all 32 bits (was h | 1).
+  - Deferred: 64-bit SR seeds (the kernels take uint32), and libc rand in inkseam / srpairs (replacing it would reshuffle existing
+    sr-pairs holdout splits).
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the
