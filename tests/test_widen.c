@@ -50,6 +50,11 @@ static double pair(const char *tag, const unet_cfg *dc, const char *dp, const un
     const double r = rel(a, b, n); *r4 = rel(a4, b4, n); *rd4 = rel(a, a4, n);
     double mx = 0; for (size_t i = 0; i < n; i++) { const double e = fabs((double)a[i] - b[i]); if (e > mx) mx = e; }
     printf("%s: 16-bit mean |d| / mean |logit| %.3g (max |d| %.3g); MX-fp4 %.3g (the donor's own fp4 vs 16-bit gap %.3g)\n", tag, r, mx, *r4, *rd4);
+    if (nc >= 11) {   /* per head of the unwrap2 layout: phase 0-1, normal 2-7, density 8, wind4 9-10 */
+        const int h0[4] = {0, 2, 8, 9}, h1[4] = {2, 8, 9, 11}; const char *hn[4] = {"phase", "normal", "density", "wind4"}; const size_t cs = na / dc->cout;
+        for (int k = 0; k < 4; k++) printf("    %-8s 16-bit %.3g, MX-fp4 %.3g (own fp4 gap %.3g)\n", hn[k], rel(a + h0[k] * cs, b + h0[k] * cs, (h1[k] - h0[k]) * cs),
+                                           rel(a4 + h0[k] * cs, b4 + h0[k] * cs, (h1[k] - h0[k]) * cs), rel(a + h0[k] * cs, a4 + h0[k] * cs, (h1[k] - h0[k]) * cs));
+    }
     free(x); free(a); free(b); free(a4); free(b4); nn_free(dx);
     return r;
 }
