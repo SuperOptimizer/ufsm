@@ -172,7 +172,7 @@ run_one() {
     local pre=(); [ $PROF = 1 ] && command -v strace > /dev/null && pre=(strace -f -qq --seccomp-bpf -e trace=openat -o "$OUT/tmp/$n.strace")
     command -v stdbuf > /dev/null && pre=(stdbuf -oL -eL "${pre[@]}")   # line-buffered stdout: logs interleave stdout and stderr in order
     local t0 t1; t0=$(date +%s.%N)
-    ( export B="$BDIR" TMPDIR="$tmp" UFSM_TEST_TMP="$tmp" UFSM_SUITE_TEST="$n" UFSM_NCPU=$T UFSM_FIT_THREADS=$T UFSM_TIFF_THREADS=$T \
+    ( export B="$BDIR" TMPDIR="$tmp" UFSM_TEST_TMP="$tmp" UFSM_SUITE_TEST="$n" UFSM_PRED_NO_AXIS=1 UFSM_NCPU=$T UFSM_FIT_THREADS=$T UFSM_TIFF_THREADS=$T \
              OMP_NUM_THREADS=$T OPENBLAS_NUM_THREADS=$T MKL_NUM_THREADS=$T
       # a test without the gpu tag sees no GPU: one that needs it fails or skips here instead of using a card without the lock (2026-11-13:
       # test_attn, test_attn_ray / _dfm, test_spiralfit, test_countfield, test_mesh_phase ran untagged on GPUs held by training runs)

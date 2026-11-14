@@ -66,7 +66,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     hm, _ = weights(t / "heads/last.ckpt")
     assert hm["extra"]["heads"] == {"version": 1, "recto_channels": [0, 2], "sources": [["fixture"], ["teacher2"]]}, hm["extra"]
     run("predict", t / "heads/last.ckpt", t, "ct", t / "heads-pred", "--channel", "2", "--um", "1", "--window", "24", "--halo", "4", "--shard", "128",
-        "--levels", "1", "--box", "0,0,0,16,16,16")
+        "--levels", "1", "--box", "0,0,0,16,16,16", "--no-axis", "1")
     run("train", cfg, "--out", t / "resume", "--resume", t / "first/last.ckpt", "--steps", "3", "--lr", "0", *opts[:-2], extra_env=train_env)
     new, wr = weights(t / "resume/last.ckpt")
     assert new["step"] == 3 and wp == wr, "normal resume reinitialized or changed zero-LR weights"
@@ -76,7 +76,9 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     # Only the model file is moved; prediction must not depend on precision.txt.
     shutil.copyfile(t / "first/last.ckpt", t / "moved.ckpt")
     pred = ["predict", t / "moved.ckpt", t, "ct"]
-    geometry = ["--um", "1", "--window", "24", "--halo", "4", "--shard", "128", "--levels", "1", "--box", "0,0,0,16,16,16"]
+    geometry = ["--um", "1", "--window", "24", "--halo", "4", "--shard", "128", "--levels", "1", "--box", "0,0,0,16,16,16", "--no-axis", "1"]
+    out = run(*pred, t / "noaxis", *geometry[:-2], ok=2, extra_env={"UFSM_PRED_NO_AXIS": "0"})   # no --axis and no --no-axis: refused (the radial channels would be zero)
+    assert "no --axis" in out and not (t / "noaxis").exists(), out
     out = run(*pred, t / "default", *geometry)
     assert "embedded checkpoint, prec=1 f16=1 act_mx4=1" in out, out
     run(*pred, t / "explicit", *geometry, "--prec", "1", "--f16", "1", "--fp4", "1", "--input-prec", "8", "--gn-stats", "stored", "--policy", "all=fp4:fp4:fp4,enc0.c1=fp16")
@@ -101,7 +103,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     # between tiles, includes CT boundaries, or changes output shards / workers.
     # Core 24 deliberately does not divide the 128-byte output shard dimension.
     grid_opts = ['--um', '1', '--window', '32', '--halo', '4', '--levels', '1',
-                 '--grid-origin', '3,5,7', '--q', '0', '--threads', '1']
+                 '--grid-origin', '3,5,7', '--q', '0', '--threads', '1', '--no-axis', '1']
     grid_shape = [144, 40, 40]
     run(*pred, t / 'grid-base', *grid_opts, '--shard', '128', '--box', '0,0,0,144,40,40')
     base = read_bytes(t / 'grid-base', [0, 0, 0], grid_shape)
@@ -121,7 +123,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     # --full-grid: one output on the CT's whole grid, a box selecting (shard-rounded) shards; --resume skips written shards
     # (predict-done-<level>.txt); --occupancy L skips shards that are all zero on CT level L. z < 128 of ctair is air.
     air = ['predict', t / 'moved.ckpt', t, 'ctair']
-    air_opts = ['--um', '1', '--window', '32', '--halo', '0', '--shard', '128', '--levels', '1', '--q', '0', '--threads', '1']
+    air_opts = ['--um', '1', '--window', '32', '--halo', '0', '--shard', '128', '--levels', '1', '--q', '0', '--threads', '1', '--no-axis', '1']
     run(*air, t / 'air-box', *air_opts, '--box', '128,0,0,128,128,128')
     out = run(*air, t / 'air-full', *air_opts, '--full-grid', '1', '--resume', '1', '--box', '130,5,5,10,10,10')
     assert 'box rounded to shards: origin 128,0,0 size 128,128,128' in out, out
@@ -144,7 +146,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
         assert sorted((t / 'air-gpus/predict-done-1.txt').read_text().splitlines()) == ['0 0 0', '1 0 0']
     # --occupancy also skips windows whose interior (in its shard) is air on the coarse level (one coarse voxel of margin): stride 4
     # windows over z 128..143, the first (interior z 128..131, coarse 63..66) skipped; the same bytes as without the tile test
-    tile_opts = ['--um', '1', '--window', '8', '--halo', '2', '--shard', '128', '--levels', '1', '--q', '0', '--threads', '1', '--box', '128,0,0,16,8,8']
+    tile_opts = ['--um', '1', '--window', '8', '--halo', '2', '--shard', '128', '--levels', '1', '--q', '0', '--threads', '1', '--box', '128,0,0,16,8,8', '--no-axis', '1']
     run(*air, t / 'occ-t0', *tile_opts, '--occupancy', '1', extra_env={'UFSM_OCC_TILES': '0'})
     out = run(*air, t / 'occ-t1', *tile_opts, '--occupancy', '1')
     assert '12 windows to run, 4 more skipped (interior air on CT level 1, --occupancy)' in out, out

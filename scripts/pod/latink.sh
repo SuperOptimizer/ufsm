@@ -11,10 +11,17 @@ row=$(tail -1 $O/bin/scrolls.tsv); R=$(echo "$row" | cut -f2); K=$(echo "$row" |
 LUM=$(awk -v u=$UM -v l=$LV 'BEGIN { printf "%.4g", u * 2 ^ l }'); BOX=$(cat $O/box.txt); T=$O/ink/lat.tmp; TH=${ITH:-12}
 echo "latink: ck $CK, $R $K level $LV ($LUM um), box $BOX"
 mkdir -p $T
+# pbox SHIFT: the run's box moved down onto the pass's 512-voxel tile grid (origin = SHIFT mod 512), as seamless.c pass_box: an off-grid box
+# (box.txt origins are multiples of 512, the grid-256 pass's tiles start at 256 mod 512) makes predict's planner run one window per 256
+# shard instead of one per 2^3 shards (predict.c kss; audit 2026-11-14: ~6-8x the windows)
+pbox() { awk -F, -v s=$1 '{ for (d = 1; d <= 3; d++) { l = $d - s; l = (l >= 0 ? int(l / 512) : -int((-l + 511) / 512)) * 512 + s; if (l < 0) l = s
+         o[d] = l; e = $d + $(d + 3); n[d] = e > l ? e - l : 1 } printf "%d,%d,%d,%d,%d,%d\n", o[1], o[2], o[3], n[1], n[2], n[3] }' <<< "$BOX"; }
+[ -s $O/axis.json ] || { echo "latink: no $O/axis.json (the net's radial input channels need the scroll axis)"; exit 1; }
 for g in 0 256; do
   [ -e $T/g$g.done ] && continue; rm -rf $T/g$g
-  $U predict $CK $R $K $T/g$g --um $UM --level $LV --box $BOX --full-grid 1 --occupancy $((LV + 3)) --heads ink,c12,c13 --gpu $G --threads $TH --shard $([ $g = 256 ] && echo 256 || echo 512) \
-    --window 544 --halo 16 --grid-origin $g,$g,$g || { echo "latink: predict grid $g failed"; exit 1; }
+  # (--q 0 --levels 1: the passes are blended into OUT by ink-blend, which reads level 0 only; their own pyramid / quantisation was thrown away)
+  $U predict $CK $R $K $T/g$g --um $UM --level $LV --box $(pbox $g) --full-grid 1 --occupancy $((LV + 3)) --heads ink,c12,c13 --gpu $G --threads $TH --shard $([ $g = 256 ] && echo 256 || echo 512) \
+    --window 544 --halo 16 --grid-origin $g,$g,$g --axis $O/axis.json --q 0 --levels 1 || { echo "latink: predict grid $g failed"; exit 1; }
   for h in ink c12 c13; do [ -e $T/g$g/$h/zarr.json ] || { echo "latink: no $h in $T/g$g"; exit 1; }; done
   touch $T/g$g.done
 done

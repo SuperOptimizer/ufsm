@@ -1339,7 +1339,7 @@ static int predict_one(int argc, char **argv) {
     if (devread) { setenv("UFSM_GPU_DECODE", "1", 0); if (!getenv("UFSM_GPU_DECODE_DEV")) setenv("UFSM_GPU_DECODE_DEV", opt(argc, argv, "--gpu", "0"), 1); }
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window W] [--act-mx8 1]\n"
-                        "       [--halo H] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
+                        "       [--halo H] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json | --no-axis 1] [--levels 4] [--q 8] [--threads 16]\n"
                         "       [--prec 0|1|2|3|4] [--policy enc0=1,...] [--f16 0|1] [--fp4 0|1] [--input-mx 0|1] [--input-prec 0|4|8] [--ema 1]   EMA or current weights (0)\n"
                         "       [--iso T]   probability outputs 0 where CT < T (the scan's void cutoff; the fit's material mask stays CT > 0)\n"
                         "       [--ema-blend A]   a x final weights + (1 - a) x EMA (tail-average blend, e.g. 0.35)\n"
@@ -1503,6 +1503,10 @@ static int predict_one(int argc, char **argv) {
     if (iso < 0 || iso > 255) { fprintf(stderr, "--iso: 0..255\n"); return 2; }
     nn_set_pred_iso(iso);
     const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
+    /* no --axis = the radial input channels (scroll-outward direction) are zero for the whole run: the nets are trained with the axis on
+       (almost) every source, so this silently degraded the latent ink / recto passes (audit 2026-11-14). An explicit --no-axis 1 runs anyway. */
+    if (!(axisf && *axisf) && !atoi(opt(argc, argv, "--no-axis", "0")) && !ufsm_env_on("UFSM_PRED_NO_AXIS")) {   /* (the env: the test suite's fixtures) */
+        fprintf(stderr, "predict: no --axis: the network's radial input channels would be zero; give --axis AXIS.json (the scroll's umbilicus), or --no-axis 1 to run without one\n"); return 2; }
     const char *grid = opt(argc, argv, "--grid-origin", nullptr);
     int64_t grid_origin[3] = {0, 0, 0}; char grid_attrs[128] = "";
     if (grid && parse_grid_origin(grid, grid_origin)) { fprintf(stderr, "--grid-origin needs three nonnegative integer coordinates\n"); return 2; }
