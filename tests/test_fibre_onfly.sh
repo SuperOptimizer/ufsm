@@ -47,7 +47,10 @@ C=(--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4
 UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 "$U" train stored.json --out st "${C[@]}" > st.log 2>&1 || { echo "FAIL: stored run ($D/st.log)"; exit 1; }
 UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 "$U" train onfly.json --out og "${C[@]}" > og.log 2>&1 || { echo "FAIL: onfly run ($D/og.log)"; exit 1; }
 UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 UFSM_FIBRE_CPU=1 "$U" train onfly.json --out oc "${C[@]}" > oc.log 2>&1 || { echo "FAIL: onfly CPU run ($D/oc.log)"; exit 1; }
+# the planes' buffer sets shared by the reading threads (fiberraster.c fr_set, 2026-11-14): one set for four workers, the same batches
+UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 UFSM_FIBRE_SETS=1 "$U" train onfly.json --out o1 "${C[@]}" --workers 4 > o1.log 2>&1 || { echo "FAIL: onfly run, one buffer set ($D/o1.log)"; exit 1; }
 for f in st og oc; do grep '^step' $f.log | sed -E 's/ [0-9.]+ samp\/s.*//' > $f.txt; done
 grep -q 'fib bce 0\.[0-9]*' st.txt || { echo "FAIL: no fibre loss in the stored run"; exit 1; }
 [ -s st.txt ] && det_cmp st.log og.log "stored vs onfly fibre planes (GPU)" && det_cmp st.log oc.log "stored vs onfly fibre planes (CPU)" || exit 1
+det_cmp st.log o1.log "stored vs onfly fibre planes (one shared buffer set, 4 workers)" || exit 1
 echo "PASS: the fibre planes on the fly byte-identical to fiber-raster (GPU, CPU), training on them the same batches and device inputs, losses within 2% ($(wc -l < st.txt) steps)"
