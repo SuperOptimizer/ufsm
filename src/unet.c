@@ -4850,6 +4850,27 @@ void unet_debug_stats(const unet *u) {
         fprintf(stderr, " max|w| %.3g %.3g\n", w1, w2); free(h);
     }
 }
+/* the gradient's squared norm per layer group (targeted/dpgrad #3: a per-group gradient noise scale; the whole-vector one is dominated by the heads
+   while Muon normalises every matrix): one group per U-Net block (both 3^3 convs), per attention block (its four linears), the head, and the
+   rest (biases, norms, FiLM, ... = total - listed, clamped at 0). ss[0..n) in that order, names[i] a short label; returns n (<= nmax, 0: none) */
+int unet_grad_groups(unet *u, double *ss, char (*names)[8], int nmax) {
+    const int L = u->cfg.nlev; int n = 0; double tot = nn_sumsq(u->g, u->np, u->red_scratch), lst = 0;
+    #define GG_(nm_, a_, b_, c_, d_) do { if (n < nmax - 1) { double v_ = 0; \
+        for (int q_ = 0; q_ < 2; q_++) { const size_t o_ = q_ ? (b_) : (a_), k_ = q_ ? (d_) : (c_); if (k_) v_ += nn_sumsq(u->g + o_, k_, u->red_scratch); } \
+        ss[n] = v_; lst += v_; snprintf(names[n], 8, "%s", nm_); n++; } } while (0)
+    for (int i = 0; i < 2 * L - 1; i++) {
+        const block *b = i < L ? &u->enc[i] : &u->dec[2 * L - 2 - i]; const int li = i < L ? i : 2 * L - 2 - i; char nm[8]; snprintf(nm, 8, "%s%d", i < L ? "e" : "d", li);
+        GG_(nm, b->c1.w, b->c2.w, (size_t)b->c1.cout * b->c1.cin * 27, (size_t)b->c2.cout * b->c2.cin * 27);
+    }
+    for (int k = 0; k < u->tbn; k++) {
+        double v = 0; for (int m = 0; m < 4; m++) { const convp *c = &u->tbm[k][m]; v += nn_sumsq(u->g + c->w, (size_t)c->cin * c->cout, u->red_scratch); }
+        if (n < nmax - 1) { ss[n] = v; lst += v; snprintf(names[n], 8, "t%d", k); n++; }
+    }
+    GG_("head", u->head.w, 0, (size_t)u->head.cin * u->head.cout, 0);
+    #undef GG_
+    if (n < nmax) { ss[n] = tot > lst ? tot - lst : 0; snprintf(names[n], 8, "rest"); n++; }
+    return n;
+}
 /* debug: per block, the gradient norm of each 3^3 conv weight (c1, c2) and of the attention blocks' linears; the head */
 void unet_debug_grads(const unet *u, const char *tag) {
     const int L = u->cfg.nlev; float *h = malloc(u->np * 4); nn_d2h(h, u->g, u->np * 4);

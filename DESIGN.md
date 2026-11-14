@@ -6,6 +6,21 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Data-parallel gradient audit fixes (2026-11-14, branch dpgfix-20261114; audit targeted/dpgrad.md)
+- The math of an update was verified correct (per-window weight 1 / (ng x accepted steps), fp32, clip after reduce + accum). Muon / AdamW steps are
+  batch-independent, so lr per window fell x0.8 at the P 512 / accum 4 -> P 768 / accum 5 switch (8 -> 10 windows per update); nothing to fix there.
+- Units: --steps, --warmup and the schedule count STEPS (nl windows each under DP), not windows: the startup lines now say so and print the warmup / run in
+  updates and windows (live: warmup 200 steps = 40 updates). New `--warmup-updates N` (warmup = N x accum steps at the starting accum; default off).
+- Optimizer step count: `ostep = upd_base + upd_cnt + 1` with upd_cnt the updates actually applied since the anchor (was the step position: a skipped
+  boundary step ran Adam's bias correction / the EMA warm-up one update ahead; identical when nothing is skipped; a resume starts upd_cnt at
+  (step0 - anchor) / accum, the old value).
+- Log: `gn_step` (mean of the per-step norms) and `gn_upd` (mean of the update norms) beside `gn` (their mix, kept for parsers).
+- `--gns-groups 1` (default with --gns and --accum): B_noise per layer group (U-Net block, attention block, head, rest; `unet_grad_groups`), the same
+  two batch sizes; a `gns groups` line per log with the median / max over the conv + attention groups. Muon normalises each matrix, so the median
+  conv-group value, not the head-dominated whole, is the number for batch decisions (audit: bulk 30 vs whole 2.4 in a two-group simulation). The group
+  EMAs are not checkpointed (they refill in ~100 updates). Cost: ~20 small norm reductions per step. Not run on a GPU here (no GPU rule): first use on
+  the next run; check that the whole-vector value lies between the groups'.
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the
