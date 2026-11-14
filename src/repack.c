@@ -127,8 +127,14 @@ int repack_array(const char *in, const char *out, int shard, int nth, int quiet)
     const char *lb = strchr(g, '['), *rb = e;   /* g..e: "chunk_grid" ... [a,b,c] */
     if (mkdirs(R.out)) { fprintf(stderr, "repack: mkdir %s: %s\n", R.out, strerror(errno)); return 1; }
     snprintf(p, sizeof p, "%s/zarr.json", R.out);
-    FILE *f = fopen(p, "w"); if (!f) { fprintf(stderr, "repack: cannot write %s\n", p); return 1; }
-    fwrite(js, 1, (size_t)(lb - js), f); fprintf(f, "[%d,%d,%d", R.sout, R.sout, R.sout); fputs(rb, f); fclose(f);
+    {   /* written whole to a temp name and renamed: every write and the close checked (audit mini/errpaths 4: unchecked, returned success) */
+        char tp[1600]; snprintf(tp, sizeof tp, "%s.%d.tmp", p, (int)getpid());
+        FILE *f = fopen(tp, "w"); if (!f) { fprintf(stderr, "repack: cannot write %s: %s\n", tp, strerror(errno)); return 1; }
+        int bad = fwrite(js, 1, (size_t)(lb - js), f) != (size_t)(lb - js);
+        bad |= fprintf(f, "[%d,%d,%d", R.sout, R.sout, R.sout) < 0; bad |= fputs(rb, f) < 0; bad |= fflush(f) != 0; bad |= fsync(fileno(f)) != 0;
+        bad |= fclose(f) != 0;
+        if (bad || rename(tp, p)) { fprintf(stderr, "repack: writing %s failed: %s\n", p, strerror(errno)); unlink(tp); return 1; }
+    }
     free(js);
     nth = nth < 1 ? 1 : nth > 256 ? 256 : nth;
     pthread_t th[256];

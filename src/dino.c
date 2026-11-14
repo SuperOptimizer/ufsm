@@ -2494,7 +2494,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             char lp[1200]; snprintf(lp, sizeof lp, "%s/last.ckpt", outd);
             { char prev[1300]; const ssize_t pl = readlink(lp, prev, sizeof prev - 1); const int keep = opt_atoi("--keep-every", opt(argc, argv, "--keep-every", "0"));   /* rotation: the previous checkpoint goes unless a milestone */
               if (pl > 0 && keep > 0) { prev[pl] = 0; int ps_ = 0; if (sscanf(prev, "step%d.ckpt", &ps_) == 1 && ps_ != step && ps_ % keep) { char a1[2600], a2[2600], a3[2600]; snprintf(a1, sizeof a1, "%s/%s", outd, prev); snprintf(a2, sizeof a2, "%s.heads", a1); snprintf(a3, sizeof a3, "%s.protos", a1); unlink(a1); unlink(a2); unlink(a3); snprintf(a3, sizeof a3, "%s.ssl", a1); unlink(a3); } } }
-            unlink(lp); if (symlink(cp + strlen(outd) + 1, lp)) {}
+            unlink(lp); if (symlink(cp + strlen(outd) + 1, lp)) fprintf(stderr, "dino: last.ckpt -> %s: %s (a resume would start elsewhere)\n", cp, strerror(errno));   /* (was ignored; audit mini/errpaths 8) */
             if (SB > 0) dn_ssl_io(&SS, cp, 1);
         }
         if (opt(argc, argv, "--eval", nullptr) && (step % eval_every == 0 || step == steps)) { dn_run_eval(u, argc, argv, step, P, ED, nthreads, 0, 0.f, outd, lf); t_last = dn_now(); }
@@ -2747,7 +2747,7 @@ int cmd_dino_train(int argc, char **argv) {
             if (unet_save(u, cp, step, ex)) fprintf(stderr, "dino-train: cannot save %s\n", cp);
             char pp[1300]; snprintf(pp, sizeof pp, "%s.protos", cp); float *h = malloc(kd * 4); nn_d2h(h, W, kd * 4);
             FILE *pf = fopen(pp, "wb"); if (pf) { fwrite(h, 4, kd, pf); fclose(pf); } free(h);
-            char lp[1200]; snprintf(lp, sizeof lp, "%s/last.ckpt", outd); unlink(lp); if (symlink(cp + strlen(outd) + 1, lp)) {}
+            char lp[1200]; snprintf(lp, sizeof lp, "%s/last.ckpt", outd); unlink(lp); if (symlink(cp + strlen(outd) + 1, lp)) fprintf(stderr, "dino: last.ckpt -> %s: %s (a resume would start elsewhere)\n", cp, strerror(errno));   /* (was ignored; audit mini/errpaths 8) */
         }
         if (opt(argc, argv, "--eval", nullptr) && (step % eval_every == 0 || step == steps)) {
             if (dn_run_eval(u, argc, argv, step, P, ED, nthreads, axis_in, ars, outd, lf)) { t_last = dn_now(); memset(sums, 0, sizeof sums); nsum = 0; }

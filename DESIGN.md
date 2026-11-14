@@ -6,6 +6,42 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## I/O error paths: atomic zarr writes, HTTP retry by time, chunk CRC, checked writers (2026-11-14, branch iofix-20261114)
+
+Fixes for the mini audit items store 1-10, zarr 1-8, errpaths 1-8 and volcomp 1-7 (/vesuvius/ufsm/audit-20261114/mini/). Source only,
+not built or run here (the user stopped compile testing 11-14 15:00); the final sweep builds and tests. Correctness fixes are on by
+default; the format change (crc32c) is opt-in.
+
+- z3w: every zarr.json and shard is written to `<path>.<pid>.<tid>.tmp`, then fflush + fsync (UFSM_Z3W_FSYNC=0 skips the fsync) +
+  fclose, all checked, then renamed; on any failure the tmp is unlinked and an error returned. Before, two writers of one shard shared
+  `<shard>.tmp`, a failed fclose published a short shard, and metadata writers reported success on a full disk. A shard that becomes
+  all-fill now unlinks the old object instead of leaving stale data. pthread_create failures are counted and only created threads joined.
+- crc32c inner codec: the reader accepts and verifies it (last codec, per chunk, sub and whole reads, also z3_chunk_raw); z3w writes it
+  only with UFSM_Z3W_CRC=1 (a format change: older readers refuse arrays with it). Volcomp itself has no checksum, so a bit flip in a
+  tANS / bypass payload decodes to wrong voxels with status OK; with the codec on it is a read error. A substream (z3_read_sub) read does
+  not check the chunk's stream tail; the codec covers that too.
+- zarr3 reader: shard size 0 refused (SIGFPE before); a 404 shard is no longer cached as "missing" for good (logged once, read as fill,
+  asked again on the next open); the cached shard index stores the payload size, so the entry range check also runs on cached indices,
+  and a failed size probe is an error rather than a disabled check. The chunk cache still assumes immutable published shards (documented
+  in zarr3.h).
+- store (HTTP): retries are bounded by time (UFSM_HTTP_RETRY_S, 600 s) and transport failures by count (12), not 12 attempts of any kind
+  (an outage over ~1-2 min failed the job); requests get a size-scaled timeout (60 s + len / 256 KB/s, whole objects
+  UFSM_HTTP_TIMEOUT_S 1800) and a low-speed abort at 16 KB/s, so a stalled stream frees its slot; non-429 4xx fail at once; whole
+  reads refuse text/html bodies (error pages served as 200); HEAD without Content-Length falls back to a 1-byte ranged GET; a suffix
+  range the server ignores falls back to a plain tail read; response buffers are capped (UFSM_HTTP_MAX_MB, 1024); the cache-dir claim is
+  a temp file linked into place (an empty claim is reclaimed); UFSM_HTTP_RPS also applies to HuggingFace roots.
+- Writers that reported success on failure now check fwrite / fprintf / fclose (and fsync where a file is renamed over a live one) and
+  unlink partial output: annot st_save / st_log (the HTTP handlers answer 500), repack zarr.json, wrap-anchor and patch-id anchors,
+  write_pgm, the PNG writer, villawind dumps (no .shape after a failed .f32), reg-render samples.bin, sheet-pbr diagnostics. Ignored
+  `mkdir -p` results in train and surf-eval are errors (train also fails when run-defaults.txt cannot be written, since a resume reads
+  it); dino logs a failed last.ckpt symlink.
+- CUDA copies that fed results unchecked now fail loudly: nn_skip_set / nn_skip_share, the Muon descriptor table (ns5_lt), nn_pred_stats
+  (CK, sticky error), the lp_mxsw self-test.
+- GPU volcomp decoder: a device failure (G.broken) prints a warning at exit as well as when it happens; UFSM_GPU_DECODE_ITEMS large
+  enough to overflow the 32-bit substream offsets (~87000) disables the GPU decoder instead of corrupting offsets. gbr_finished stays
+  stricter than the CPU check (documented: the CPU redo is the reference). Partial-read zero fill and the sink fall-through are
+  documented at the API.
+
 ## Kernel workspaces inside the memory plan (2026-11-14, branch memws-20261114, audit net#4)
 
 At P 768 data parallel GPU 0 ran 15.75 of 16.3 GB while the planner's fixed 550 MB term stood in for every grow-on-demand kernel

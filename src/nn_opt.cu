@@ -209,7 +209,7 @@ static const muon_desc_t *ns_host_table(int dev, const muon_desc_t *d, int nconv
     for (int i = 0; i < g_nscn; i++) if (g_nsc[i].dev == dev && g_nsc[i].d == d && g_nsc[i].n == nconv) return g_nsc[i].h;
     nscache e = {dev, nconv, d, (muon_desc_t *)malloc(sizeof(muon_desc_t) * (size_t)nconv)};
     if (!e.h) return nullptr;
-    cudaMemcpy(e.h, d, sizeof(muon_desc_t) * (size_t)nconv, cudaMemcpyDeviceToHost);
+    if (cudaMemcpy(e.h, d, sizeof(muon_desc_t) * (size_t)nconv, cudaMemcpyDeviceToHost) != cudaSuccess) { cudaGetLastError(); free(e.h); return nullptr; }   /* (unchecked: garbage descriptors; audit mini/errpaths 6) */
     if (g_nscn == 64) { const int v = g_nscrr++ % 64; free(g_nsc[v].h); g_nsc[v] = e; } else g_nsc[g_nscn++] = e;
     return e.h;
 }

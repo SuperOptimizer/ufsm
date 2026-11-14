@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 enum { VD = 192, VH = 6, VHD = 32, VMLP = 768, VDEC = 96, VNB = 6, VRMAX = 128 };
 static const float EPS = 1e-5f;
@@ -107,14 +108,19 @@ static void dump_xt(const char *dir, const char *name, xt t) {
         else if (e == 31) v = s | 0x7f800000u | m << 13; else v = s | (uint32_t)(e + 112) << 23 | m << 13;
         memcpy(&f[i], &v, 4); }
     char p[1400]; snprintf(p, sizeof p, "%s/%s.f32", dir, name); FILE *fo = fopen(p, "wb");
-    if (fo) { fwrite(f, 4, n, fo); fclose(fo); }
-    snprintf(p, sizeof p, "%s/%s.shape", dir, name); fo = fopen(p, "w"); if (fo) { fprintf(fo, "%d %d %d %d\n", t.d, t.h, t.w, t.c); fclose(fo); }
+    int ok = fo && fwrite(f, 4, n, fo) == n; if (fo) ok &= fclose(fo) == 0;   /* (unchecked: a truncated dump with a valid .shape; audit mini/errpaths 7) */
+    if (!ok) { fprintf(stderr, "villawind: dump %s failed\n", p); unlink(p); free(h); free(f); return; }
+    snprintf(p, sizeof p, "%s/%s.shape", dir, name); fo = fopen(p, "w");
+    ok = fo && fprintf(fo, "%d %d %d %d\n", t.d, t.h, t.w, t.c) >= 0; if (fo) ok &= fclose(fo) == 0;
+    if (!ok) fprintf(stderr, "villawind: dump %s failed\n", p);
     free(h); free(f);
 }
 static void dump_f32(const char *dir, const char *name, const float *dev, size_t n) {
     if (!dir) return;
     float *f = malloc(n * 4); xd2h(f, dev, n * 4);
-    char p[1400]; snprintf(p, sizeof p, "%s/%s.f32", dir, name); FILE *fo = fopen(p, "wb"); if (fo) { fwrite(f, 4, n, fo); fclose(fo); }
+    char p[1400]; snprintf(p, sizeof p, "%s/%s.f32", dir, name); FILE *fo = fopen(p, "wb");
+    int ok = fo && fwrite(f, 4, n, fo) == n; if (fo) ok &= fclose(fo) == 0;
+    if (!ok) { fprintf(stderr, "villawind: dump %s failed\n", p); unlink(p); }
     free(f);
 }
 

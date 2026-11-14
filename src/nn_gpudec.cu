@@ -45,7 +45,9 @@ __device__ __forceinline__ bool gbr_get(gbr &r, uint32_t n, uint32_t &v) {
     if (r.off >= 32u) { r.off -= 32u; r.lo = r.hi; r.hi = r.nxt; r.nxt = __ldg(r.w++); }
     return true;
 }
-/* all bytes consumed (fewer than 8 bits left) and the bits left are zero */
+/* all bytes consumed (fewer than 8 bits left) and the bits left are zero. Stricter than the CPU's vf_br_finished, which also accepts
+   trailing zero bytes: such a stream fails here (status 0) and gd_decode redoes it on the CPU (state 2), so the CPU stays the reference
+   and the divergence costs speed only (audit mini/volcomp 3). */
 __device__ __forceinline__ bool gbr_finished(const gbr &r) {
     return r.left < 8u && (__funnelshift_r(r.lo, r.hi, r.off) & ((1u << r.left) - 1u)) == 0;
 }
@@ -330,6 +332,10 @@ static void *completer(void *arg) {
     return nullptr;
 }
 
+static void gd_broken_atexit(void) {   /* the run's end summary: a device failure switched every later request to the CPU (audit mini/volcomp 6) */
+    if (G.broken) fprintf(stderr, "gpudec: WARNING the GPU decoder failed during this run; the requests after the failure were decoded on the CPU "
+                                  "(output correct, decode slower; %llu substreams were decoded on the GPU before)\n", (unsigned long long)G.n_subs);
+}
 static void gd_stats_atexit(void) {
     fprintf(stderr, "gpudec: %llu substreams on the GPU in %llu batches (%.0f / batch), %llu requests redone on the CPU, GPU round trips %.2f s\n",
             (unsigned long long)G.n_subs, (unsigned long long)G.n_batches, G.n_batches ? (double)G.n_subs / G.n_batches : 0.0, (unsigned long long)G.n_redo, G.gpu_s);
@@ -350,6 +356,8 @@ static void gd_init(void) {
     G.flight = fl && atoi(fl) > 0 ? (atoi(fl) < NSLOT - 1 ? atoi(fl) : NSLOT - 1) : 2;
     G.in_cap = (size_t)G.max_items * 40000 + ((size_t)16 << 20);   /* q 2 substreams are ~10-20 KB */
     G.rec_cap = (size_t)G.max_items * 49152 + ((size_t)16 << 20);   /* records (u32); a substream reserves its bound, 8 x its bypass bytes (q 2: ~5 KB) */
+    if (G.in_cap > UINT32_MAX || G.rec_cap > UINT32_MAX) {   /* tok_off / rec_off are uint32 (audit mini/volcomp 7): ~87000 items at most */
+        fprintf(stderr, "gpudec: UFSM_GPU_DECODE_ITEMS %u needs offsets over 32 bits, decoding on the CPU\n", G.max_items); return; }
     int nd = 0;
     if (cudaGetDeviceCount(&nd) != cudaSuccess || G.dev < 0 || G.dev >= nd) { cudaGetLastError(); fprintf(stderr, "gpudec: no CUDA device %d, decoding on the CPU\n", G.dev); return; }
     int prev = 0; cudaGetDevice(&prev);
@@ -376,6 +384,7 @@ static void gd_init(void) {
     cudaSetDevice(prev);
     G.open = take_free();
     G.ok = 1;
+    atexit(gd_broken_atexit);
     if (getenv("UFSM_GPU_DECODE_STATS") && strcmp(getenv("UFSM_GPU_DECODE_STATS"), "0")) atexit(gd_stats_atexit);
     return;
 fail:

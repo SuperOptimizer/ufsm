@@ -1,7 +1,10 @@
 /* zarr v3 reader for the published volcomp tree: uint8 arrays, `sharding_indexed` shards of 128^3
    inner chunks, inner codecs `volcomp(q)` optionally followed by `zstd`. Reads any (z,y,x) box; missing
    shards / chunks are the fill value (0). Inner chunks fetched from an HTTP store are cached on disk under
-   <cache>/<key>/<shard>.<i> so a region is only ever downloaded once. */
+   <cache>/<key>/<shard>.<i> so a region is only ever downloaded once. The cache is keyed by shard path only (no etag / generation):
+   it assumes published shards are immutable. A shard rewritten in place on the server keeps its old cached index and chunks until the
+   cache directory is cleared; use a fresh cache_dir (or delete <cache>/<key>) after a rewrite. A shard missing on the server (404) is
+   not cached: it reads as fill and is asked for again on the next open, so a shard published later is seen (audit mini/zarr 7). */
 #pragma once
 #include "store.h"
 #include <stdint.h>
@@ -24,6 +27,7 @@ typedef struct {
     int dtype, esize;     /* element type (volcomp_dtype: 0 uint8, 1 uint16, 2 int16, 3 uint32, 4 int32, 5 float32) and bytes; z3_read
                              fills esize bytes per voxel (native byte order) */
     double fillv;         /* fill_value of a typed array */
+    int crc;              /* 1: the inner chain ends in crc32c (4 bytes after each chunk, verified on every read; z3w writes it with UFSM_Z3W_CRC=1) */
 } z3_meta;
 
 typedef struct z3 z3;
@@ -63,7 +67,11 @@ int z3_box_any(z3 *z, const int64_t o[3], const int64_t n[3]);   /* any stored c
 /* z3_read decoding only the volcomp substreams in submask of each chunk (bit s = substream s: blocks 16 s .. 16 s + 15, i.e. the
    16 z x 32 y x 128 x slab z0 = 16 (s / 4), y0 = 32 (s % 4)); voxels of the other substreams read as 0. The decoded ones equal a full
    decode byte for byte (volcomp_decode_block's guarantee). submask 0 or all ones, or a chunk that is not a lossy / coded volcomp chunk
-   (mask, surface, raw, const, typed, other codecs): the whole chunk. */
+   (mask, surface, raw, const, typed, other codecs): the whole chunk.
+   The zeros of the other substreams are fill, not data: a caller must use only the voxels of submask (audit mini/volcomp 4). A substream
+   read verifies that substream's tokens but not the whole chunk's stream tail (volcomp_decode_block returns once its blocks are out), so
+   a bit flip elsewhere in the chunk is not seen; the volcomp format has no checksum of its own. Arrays written with the crc32c codec
+   (z3w with UFSM_Z3W_CRC=1) are checked per chunk on every read, sub or whole (audit mini/volcomp 1, 2). */
 int z3_read_sub(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads, uint32_t submask);
 /* z3_read_sub of one whole aligned 128^3 chunk with UFSM_GPU_DECODE on: the GPU decodes lossy substreams straight into the device chunk
    dchunk (128^3, chunk layout, on the decoder's device; out keeps zeros there); *dev_mask = those substreams (0: everything went to out) */

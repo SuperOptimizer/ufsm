@@ -27,6 +27,7 @@ struct store {
     double rate_obs, t_rate; int n_start;   /* observed request starts per second */
     double pause_until;   /* 429 / 503 back-off shared by every thread of this store */
     int strikes; double t_strike;
+    atomic_int notail;    /* the server ignored a suffix Range (a 200 with the whole object): HEAD + ranged GET from then on */
 };
 
 static double mono(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -284,7 +285,7 @@ store *store_open(const char *root) {
     s->burst = s->tokens = (double)env_long("UFSM_HTTP_BURST", 32);
     if (s->burst < 1) s->burst = s->tokens = 1;
     s->t_fill = s->t_rate = mono();
-    if (strstr(root, "huggingface.co")) { s->rps = 14; s->burst = s->tokens = 1; }
+    if (strstr(root, "huggingface.co")) { if (!getenv("UFSM_HTTP_RPS")) s->rps = 14; s->burst = s->tokens = 1; }   /* (an explicit UFSM_HTTP_RPS holds here too) */
     return s;
 }
 
@@ -323,11 +324,27 @@ char *store_cache_dir(const store *s, const char *cache_dir) {
         else { snprintf(cmd, sizeof cmd, "%s", cache_dir); for (char *c = cmd + 1; *c; c++) if (*c == '/') { *c = 0; mkdir(cmd, 0777); *c = '/'; } mkdir(cmd, 0777); }
         const char *lg = getenv("UFSM_CACHE_LEGACY_ROOT"); char claim[2048];
         root_norm(has ? (lg && *lg ? lg : "https://dl.ash2txt.org/community-uploads/forrest/volcomp") : root, claim, sizeof claim);
-        int fd = open(mp, O_WRONLY | O_CREAT | O_EXCL, 0666);   /* (two first users at once: one creates it, the other reads it below) */
-        if (fd >= 0) { if (write(fd, claim, strlen(claim)) < 0) { /* an unwritable cache: every root but the claim's takes its subdirectory */ } close(fd); snprintf(own, sizeof own, "%s", claim); }
-        else f = fopen(mp, "r");
+        /* the claim is written whole to a private temp file and link()ed into place: .root appears complete or not at all (two first users at
+           once: one link wins, the other reads it). Before (audit mini/store 6) .root was created empty with O_EXCL and then written: a failed
+           write or a crash in between left it empty for good, and every process, the owner included, took the @hash subdirectory */
+        char tp[4300]; snprintf(tp, sizeof tp, "%s.%d.%lx", mp, (int)getpid(), (unsigned long)pthread_self());
+        int fd = open(tp, O_WRONLY | O_CREAT | O_EXCL, 0666), won = 0;
+        if (fd >= 0) {
+            const ssize_t w = write(fd, claim, strlen(claim));
+            if (close(fd) == 0 && w == (ssize_t)strlen(claim) && link(tp, mp) == 0) won = 1;
+            unlink(tp);
+        }
+        if (won) snprintf(own, sizeof own, "%s", claim);
+        else f = fopen(mp, "r");   /* (another claim won, or an unwritable cache: then every root but the claim's takes its subdirectory) */
     }
-    if (f) { for (int t = 0; t < 50 && !fgets(own, sizeof own, f); t++) { usleep(2000); rewind(f); } fclose(f); root_trim(own); }
+    if (f) {
+        for (int t = 0; t < 50 && !fgets(own, sizeof own, f); t++) { usleep(2000); rewind(f); }
+        fclose(f); root_trim(own);
+        if (!own[0]) {   /* an empty .root left by a crashed claim of an older binary: reclaimed for this root (a racing reclaim: the link loser re-reads) */
+            struct stat sb;
+            if (!stat(mp, &sb) && sb.st_size == 0 && !unlink(mp)) return store_cache_dir(s, cache_dir);
+        }
+    }
     if (!strcmp(own, root)) return strdup(cache_dir);
     uint64_t h = 1469598103934665603ull; for (const char *c = root; *c; c++) { h ^= (unsigned char)*c; h *= 1099511628211ull; }   /* FNV-1a */
     size_t n = strlen(cache_dir) + 24; char *o = malloc(n); snprintf(o, n, "%s/@%016llx", cache_dir, (unsigned long long)h);
@@ -412,6 +429,9 @@ static size_t on_data(char *ptr, size_t sz, size_t nm, void *ud) {
     if (k->fixed) {
         if (n > k->cap - k->n) { k->overflow = 1; return 0; }
     } else if (k->n + n + 1 > k->cap) {
+        static size_t maxb = 0;   /* mgpu: env (a racy first read sets the same value). (a whole-object read is capped: a wrong URL serving a huge file grew the buffer until malloc failed; audit mini/store 9) */
+        if (!maxb) maxb = (size_t)env_long("UFSM_HTTP_MAX_MB", 1024) << 20;
+        if (k->n + n + 1 > maxb) { k->overflow = 1; return 0; }
         size_t cap = k->cap ? k->cap * 2 : 65536;
         while (cap < k->n + n + 1) cap *= 2;
         uint8_t *b = realloc(k->buf, cap);
@@ -449,7 +469,7 @@ static void base_opts(CURL *c, struct curl_slist *hdr) {
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 30L);
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);
-    curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 16384L);   /* (was 1 KB/s: a 1.1 KB/s trickle held an inflight slot for hours; audit mini/store 2) */
     curl_easy_setopt(c, CURLOPT_USERAGENT, "ufsm/0.1");
     curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
@@ -499,17 +519,35 @@ static CURL *fresh_handle(const store *s) {
 }
 
 static double backoff_s(int attempt) { return 0.2 * (1 << (attempt < 5 ? attempt : 5)); }
+/* retry budget (audit mini/store 1): 429 / 503 / other 5xx are retried until UFSM_HTTP_RETRY_S (600 s) after the first attempt, transport
+   errors (no HTTP status) at most 12 times within it. Before, every kind counted against 12 attempts, so an outage of more than ~1-2 min
+   failed the read and with it the window or the predict job */
+static double retry_s(void) { static double v = -1; /* mgpu: env */ if (v < 0) v = (double)env_long("UFSM_HTTP_RETRY_S", 600); return v; }
+static int retry_ok(double t0, int transport_attempts) { return mono() - t0 < retry_s() && transport_attempts < 12; }
+/* the whole-transfer timeout (audit mini/store 2): 60 s + the bytes at 256 KB/s for a known length, else UFSM_HTTP_TIMEOUT_S (1800) */
+static long timeout_ms(int64_t len) { static long whole = -1; /* mgpu: env */ if (whole < 0) whole = env_long("UFSM_HTTP_TIMEOUT_S", 1800) * 1000; return len >= 0 ? 60000 + (long)(len / 256) : whole; }
+/* a whole-object read answered with an HTML page (a captive portal, a proxy login, a maintenance page with status 200) is not the object
+   (audit mini/store 5) */
+static int html_body(CURL *c, const char *key) {
+    char *ct = nullptr; curl_easy_getinfo(c, CURLINFO_CONTENT_TYPE, &ct);
+    const size_t kl = key ? strlen(key) : 0;
+    if (!ct || strncasecmp(ct, "text/html", 9) || (kl > 5 && !strcasecmp(key + kl - 5, ".html"))) return 0;
+    fprintf(stderr, "store: %s answered with Content-Type %s: not taken as the object\n", key ? key : "?", ct);
+    return 1;
+}
 
 /* GET (len < 0: whole object; tail: the last len bytes) with retries. Returns HTTP status, or -1 on transport failure. */
 static long http_get(store *s, const char *key, int64_t off, int64_t len, int tail, sink *k) {
     char *url = join(s, key);
     if (!url) return -1;
     long code = -1;
-    for (int attempt = 0; attempt < 12; attempt++) {
+    const double t0 = mono();
+    for (int attempt = 0, ta = 0;; attempt++) {
         pace(s);
         CURL *c = fresh_handle(s);
         if (!c) break;
         curl_easy_setopt(c, CURLOPT_URL, url);
+        curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, timeout_ms(len));
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, on_data);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, k);
         curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, on_read_hdr);
@@ -529,10 +567,12 @@ static long http_get(store *s, const char *key, int64_t off, int64_t len, int ta
         code = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
         account(c, rc, code, k->rl);
-        if (rc == CURLE_OK) break;
+        if (rc == CURLE_OK) { if (len < 0 && !tail && html_body(c, key)) code = -1; break; }
         if (k->overflow || rc == CURLE_WRITE_ERROR) { code = -1; break; }
-        if (code == 429 || code == 503) { throttle(s, code, attempt, k->reset); continue; }
+        if (code == 429 || code == 503) { throttle(s, code, attempt, k->reset); if (!retry_ok(t0, ta)) break; continue; }
         if (code >= 400 && code < 500) break;
+        if (code < 500) { code = -1; ta++; }   /* (transport: no HTTP status) */
+        if (!retry_ok(t0, ta)) { code = -1; break; }
         code = -1;
         atomic_fetch_add(&st_retries, 1);
         usleep((useconds_t)(backoff_s(attempt) * 1e6));
@@ -546,11 +586,13 @@ static int64_t http_size(store *s, const char *key) {
     char *url = join(s, key);
     if (!url) return -1;
     int64_t out = -1;
-    for (int attempt = 0; attempt < 12; attempt++) {
+    const double t0 = mono();
+    for (int attempt = 0, ta = 0;; attempt++) {
         pace(s);
         CURL *c = fresh_handle(s);
         if (!c) break;
         curl_easy_setopt(c, CURLOPT_URL, url);
+        curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, 60000L);
         curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
         curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, on_ratelimit_hdr);
         curl_easy_setopt(c, CURLOPT_HEADERDATA, nullptr);
@@ -566,15 +608,24 @@ static int64_t http_size(store *s, const char *key) {
             curl_off_t cl = -1;
             curl_easy_getinfo(c, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
             out = cl;
+            if (out < 0) out = -3;   /* (a 2xx HEAD without Content-Length: the ranged-GET fallback below) */
             break;
         }
         if (code == 404) { out = -2; break; }
-        if (code == 429 || code == 503) { throttle(s, code, attempt, tl_reset); continue; }
+        if (code == 429 || code == 503) { throttle(s, code, attempt, tl_reset); if (!retry_ok(t0, ta)) break; continue; }
         if (code >= 400 && code < 500) break;
+        if (code < 500) ta++;
+        if (!retry_ok(t0, ta)) break;
         atomic_fetch_add(&st_retries, 1);
         usleep((useconds_t)(backoff_s(attempt) * 1e6));
     }
     free(url);
+    if (out == -3) {   /* HEAD gave no size (audit mini/store 7): a one-byte ranged GET, whose Content-Range names the total */
+        uint8_t one; sink k = {.buf = &one, .cap = 1, .fixed = 1};
+        const long code = http_get(s, key, 0, 1, 0, &k);
+        out = code == 404 ? -2 : code == 206 && k.has_range && k.range_total_known ? (int64_t)k.range_total : -1;
+        if (out == -1) fprintf(stderr, "store: %s: no size from HEAD (no Content-Length) nor from a ranged GET\n", key);
+    }
     return out;
 }
 
@@ -603,11 +654,13 @@ uint8_t *store_get_url(store *s, const char *url, size_t *len, char **link_next)
     sink k = {0};
     hdrs h = {0};
     long code = -1;
-    for (int attempt = 0; attempt < 12; attempt++) {
+    const double t0 = mono();
+    for (int attempt = 0, ta = 0;; attempt++) {
         pace(s);
         CURL *c = fresh_handle(s);
         if (!c) break;
         curl_easy_setopt(c, CURLOPT_URL, url);
+        curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, timeout_ms(-1));
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, on_data);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, &k);
         curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, on_hdr);
@@ -619,9 +672,12 @@ uint8_t *store_get_url(store *s, const char *url, size_t *len, char **link_next)
         code = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
         account(c, rc, code, tl_rl);
-        if (rc == CURLE_OK) break;
-        if (code == 404 || code == 403) break;
-        if (code == 429 || code == 503) { throttle(s, code, attempt, tl_reset); continue; }
+        if (rc == CURLE_OK) { if (html_body(c, nullptr)) code = -1; break; }
+        if (k.overflow || rc == CURLE_WRITE_ERROR) { code = -1; break; }
+        if (code == 429 || code == 503) { throttle(s, code, attempt, tl_reset); if (!retry_ok(t0, ta)) break; continue; }
+        if (code >= 400 && code < 500) break;   /* (was 404 / 403 only: an expired token's 401 was retried 12 times; audit mini/store 4) */
+        if (code < 500) ta++;
+        if (!retry_ok(t0, ta)) { code = -1; break; }
         code = -1;
         atomic_fetch_add(&st_retries, 1);
         usleep((useconds_t)(backoff_s(attempt) * 1e6));
@@ -660,7 +716,7 @@ int64_t store_read_tail(store *s, const char *key, int64_t len, uint8_t *out, in
     if (len <= 0) return -1;
     static int tail_on = -1;
     if (tail_on < 0) tail_on = env_long("UFSM_HTTP_TAIL", 1) != 0;
-    if (s->local || !tail_on) {
+    if (s->local || !tail_on || atomic_load(&s->notail)) {
         int64_t size = store_size(s, key);
         if (size < 0) return size;
         *total = size;
@@ -670,6 +726,10 @@ int64_t store_read_tail(store *s, const char *key, int64_t len, uint8_t *out, in
     sink k = {.buf = out, .cap = (size_t)len, .fixed = 1};
     long code = http_get(s, key, 0, len, 1, &k);
     if (code == 404) return -2;
+    if (k.overflow) {   /* (a 200 with the whole object: the server ignores suffix ranges; audit mini/store 8) */
+        if (!atomic_exchange(&s->notail, 1)) fprintf(stderr, "store: %s ignores suffix ranges: HEAD + ranged GET for index reads\n", s->root);
+        return store_read_tail(s, key, len, out, total);
+    }
     /* the suffix must come back as a 206 naming the object's last len bytes and its total size */
     if (code == 206 && k.has_range && k.range_total_known) *total = (int64_t)k.range_total;
     if (code != 206 || k.overflow || (int64_t)k.n != len || !k.has_range || !k.range_total_known ||
@@ -751,11 +811,11 @@ int store_read_batch(store *s, store_req *reqs, int n, int conc, void (*done)(vo
     if (!t->ne) return -1;
     if (conc > t->ne) conc = t->ne;
     /* queue: request ids waiting to start (retries go to the back with a not-before time) */
-    int *queue = malloc((size_t)n * sizeof *queue), *attempts = calloc((size_t)n, sizeof *attempts);
-    double *not_before = calloc((size_t)n, sizeof *not_before);
+    int *queue = malloc((size_t)n * sizeof *queue), *attempts = calloc((size_t)n, sizeof *attempts);   /* (attempts: transport failures; HTTP 429 / 5xx retry until the deadline) */
+    double *not_before = calloc((size_t)n, sizeof *not_before), *t_first = calloc((size_t)n, sizeof *t_first);
     batch_slot *slot = calloc((size_t)conc, sizeof *slot);
     char **urls = calloc((size_t)n, sizeof *urls);
-    if (!queue || !attempts || !not_before || !slot || !urls) { free(queue); free(attempts); free(not_before); free(slot); free(urls); return -1; }
+    if (!queue || !attempts || !not_before || !t_first || !slot || !urls) { free(queue); free(attempts); free(not_before); free(t_first); free(slot); free(urls); return -1; }
     int qh = 0, qn = n, inflight = 0, finished = 0;
     for (int i = 0; i < n; i++) queue[i] = i;
     for (int i = 0; i < conc; i++) { slot[i].req = -1; slot[i].e = t->e[i]; }
@@ -774,6 +834,7 @@ int store_read_batch(store *s, store_req *reqs, int n, int conc, void (*done)(vo
             if (!urls[r] && !(urls[r] = join(s, q->key))) { inflight_release(); q->result = -1; failed = 1; finished++; if (done) done(ud, r); continue; }
             batch_slot *b = &slot[si];
             b->req = r; b->attempt = attempts[r];
+            if (!t_first[r]) t_first[r] = mono();
             b->k = (sink){.buf = q->out, .cap = (size_t)q->len, .fixed = 1};
             CURL *e = b->e;
             curl_easy_reset(e);
@@ -788,6 +849,7 @@ int store_read_batch(store *s, store_req *reqs, int n, int conc, void (*done)(vo
             curl_easy_setopt(e, CURLOPT_PRIVATE, (void *)b);
             snprintf(b->range, sizeof b->range, "%lld-%lld", (long long)q->off, (long long)(q->off + q->len - 1));
             curl_easy_setopt(e, CURLOPT_RANGE, b->range);
+            curl_easy_setopt(e, CURLOPT_TIMEOUT_MS, timeout_ms(q->len));
             if (curl_multi_add_handle(t->m, e) != CURLM_OK) { inflight_release(); b->req = -1; q->result = -1; failed = 1; finished++; if (done) done(ud, r); continue; }
             inflight++;
         }
@@ -813,9 +875,10 @@ int store_read_batch(store *s, store_req *reqs, int n, int conc, void (*done)(vo
             else if (b->k.overflow || rc == CURLE_WRITE_ERROR) q->result = -1;
             else if (code == 429 || code == 503) { throttle(s, code, b->attempt, b->k.reset); retry = 1; }
             else if (code >= 400 && code < 500) q->result = -1;
-            else { retry = 1; atomic_fetch_add(&st_retries, 1); not_before[r] = mono() + backoff_s(b->attempt); }
-            if (retry && b->attempt + 1 < 12) {
-                attempts[r] = b->attempt + 1;
+            else { retry = code >= 500 ? 1 : 2; atomic_fetch_add(&st_retries, 1); const double el = mono() - t_first[r], bo = el * 0.25 < 0.2 ? 0.2 : el * 0.25 > 6.4 ? 6.4 : el * 0.25;
+                   not_before[r] = mono() + bo; }   /* (2: transport; the back-off grows with the time spent, 0.2 .. 6.4 s) */
+            if (retry && retry_ok(t_first[r], b->attempt + (retry == 2))) {
+                attempts[r] = b->attempt + (retry == 2);
                 queue[(qh + qn) % n] = r; qn++;
                 continue;
             }
@@ -830,7 +893,7 @@ int store_read_batch(store *s, store_req *reqs, int n, int conc, void (*done)(vo
         }
     }
     for (int i = 0; i < n; i++) free(urls[i]);
-    free(queue); free(attempts); free(not_before); free(slot); free(urls);
+    free(queue); free(attempts); free(not_before); free(t_first); free(slot); free(urls);
     tl_code = failed ? -1 : 206;
     return failed ? -1 : 0;
 }
