@@ -6,7 +6,8 @@
 #   env: U, CTR CTK (CT root / key at 9.6 um), INK INKK, DECIM, NT, RENDER_NT, MOS_NT, MAXR, CTL, FLATX; STOP file: OUT/STOP
 set -u
 OUT=$1
-U=${U:-/vesuvius/ufsm/scroll1/src/build/ufsm}
+U=${U:-$(cd "$(dirname "$0")/../.." && pwd)/build/ufsm}   # (the repo's build; the old /vesuvius/ufsm/scroll1 default is gone)
+[ -x "$U" ] || { echo "$0: no ufsm binary $U (set U)" >&2; exit 1; }
 CTR=${CTR:?CT root}; CTK=${CTK:?CT key}; INK=${INK:?ink zarr}; INKK=${INKK:-9.6}
 DECIM=${DECIM:-4}; NT=${NT:-12}; RENDER_NT=${RENDER_NT:-8}; MOS_NT=${MOS_NT:-6}; MAXR=${MAXR:-10}; CTL=${CTL:-80}; FLATX=${FLATX:-}
 mkdir -p $OUT/logs $OUT/render

@@ -950,7 +950,7 @@ typedef struct {
     int wmin, nwr; double *wv, *wp, vtot, ptot;
     int nout; ms_out out[2]; uint8_t sc[256], si[256];
     int wait, rm;   /* --wait-renders: a stripe is taken when <render-dir>/<stripe>.done exists; --rm-renders: its two TIFFs deleted after use */
-    pthread_mutex_t mu; _Atomic int next, fail;
+    pthread_mutex_t mu; _Atomic int next, fail, miss;   /* miss: stripes without their renders (a gap in the mosaic) */
 } ms_ctx;
 static char *ms_fillpath(const ms_ctx *C, const char *name, char *p, size_t n) { if (!C->fmd) return nullptr; snprintf(p, n, "%s/%s_fill.tif", C->fmd, name); return p; }
 /* pass 1: histograms of the valid pixels, row bands */
@@ -966,7 +966,7 @@ static void *ms_pass1(void *arg) {
         ms_stripe *S = &C->st[s];
         int w1, h1, w2, h2; snprintf(p, sizeof p, "%s/%s_ct.tif", C->rd, S->name); uint8_t *ct = ms_read(p, 0, C->nin, &w1, &h1);
         snprintf(p, sizeof p, "%s/%s.tif", C->rd, S->name); uint8_t *ink = ms_read(p, 0, C->nin, &w2, &h2);
-        if (!ct || !ink || w1 != w2 || h1 != h2) { fprintf(stderr, "strip-mosaic: missing renders for %s\n", S->name); free(ct); free(ink); S->ow = 0; continue; }
+        if (!ct || !ink || w1 != w2 || h1 != h2) { fprintf(stderr, "strip-mosaic: missing renders for %s\n", S->name); atomic_fetch_add(&C->miss, 1); free(ct); free(ink); S->ow = 0; continue; }
         snprintf(p, sizeof p, "%s/stripes/%s", C->fd, S->name); uint8_t *m = ms_mask(p, ms_fillpath(C, S->name, fp, sizeof fp), w1, h1, C->gs, C->nin);
         if (m) { ms_hj J = {C, ct, ink, m, (size_t)w1 * h1}; ms_parfor(C->nin, (int)((J.n + (1 << 22) - 1) >> 22), ms_hist_band, &J); }
         S->ow = w1; S->oh = h1; free(ct); free(ink); free(m);
@@ -1144,7 +1144,8 @@ static void ms_write_out(ms_ctx *C, ms_out *O, long long Ltot, int ns, int barh)
            ns, Ltot * C->pxum * 1e-4, C->vtot * C->pxum * C->pxum * 1e-8, C->ctl, C->vtot > 0 ? C->ptot / C->vtot : 0, O->od, ovw, oovh, rows, ds, C->lw, pap ? C->lh : 2 * C->lh, C->lds);
 }
 int cmd_strip_mosaic(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8] [--stripe-jobs 2] [--stretch CA,CB,IA,IB] [--stretch-only 1] [--wait-renders 1] [--rm-renders 1] [--papyrus GAIN [--papyrus-bg 128]] [--papyrus-dir DIR [--papyrus-gain 1] [--papyrus-overview-px PX]] [--fill-maps DIR]\n"
+    if (argc < 5) { fprintf(stderr, "usage: ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8] [--stripe-jobs 2] [--stretch CA,CB,IA,IB] [--stretch-only 1] [--wait-renders 1] [--rm-renders 1] [--papyrus GAIN [--papyrus-bg 128]] [--papyrus-dir DIR [--papyrus-gain 1] [--papyrus-overview-px PX]] [--fill-maps DIR] [--allow-missing 1]\n"
+                          "  exit 3: stripes without their renders (missing / unreadable TIFFs): the mosaic has gaps (--allow-missing 1: exit 0)\n"
                           "  --fill-maps DIR: <stripe>_fill.tif of render --fill: its rendered pixels (bridged grid holes, fills) join the stripe mask\n"
                           "  --papyrus GAIN: papyrus-look RGB stripe JPEGs (<stripe>_papyrus.jpg), overview and long strip (ink-compare --papyrus colours,\n"
                           "  the mosaic's stretch, ink x GAIN; CT 0 / no surface in grey --papyrus-bg)\n"
@@ -1189,7 +1190,7 @@ int cmd_strip_mosaic(int argc, char **argv) {
     ms_ctx *Cp = calloc(1, sizeof *Cp); ms_ctx *const C = Cp;
     C->st = st; C->ns = ns; C->rd = rd; C->fd = fd; C->gs = gs; C->nin = nthr; C->prof = getenv("UFSM_MOSAIC_PROF") != nullptr;
     C->fmd = sopt(argc, argv, "--fill-maps", nullptr);
-    pthread_mutex_init(&C->mu, nullptr); atomic_init(&C->next, 0); atomic_init(&C->fail, 0);
+    pthread_mutex_init(&C->mu, nullptr); atomic_init(&C->next, 0); atomic_init(&C->fail, 0); atomic_init(&C->miss, 0);
     /* pass 1: global contrast (CT and ink over valid pixels; integer counts: the sum is the same in any order) */
     int ca, cb, ia, ib; const char *fs = sopt(argc, argv, "--stretch", nullptr);
     if (fs) {   /* --stretch CA,CB,IA,IB: given (no pass 1: the renders need not exist yet; their sizes from the stripe grids) */
@@ -1247,8 +1248,11 @@ int cmd_strip_mosaic(int argc, char **argv) {
         free(O->ovs); free(O->ovn); free(O->lsum); free(O->lcnt); free(O->plut);
     }
     if (C->prof) fprintf(stderr, "strip-mosaic prof: overview / long strip / tables %.2f s\n", snow() - tw);
+    /* a stripe without its renders is a gap in the mosaic: written, but the exit says so (the run scripts stop on it; audit 11-14 #11) */
+    const int miss = atomic_load(&C->miss), allow = atoi(sopt(argc, argv, "--allow-missing", "0"));
+    if (miss) fprintf(stderr, "strip-mosaic: %d of %d stripes missing renders (a gap in the mosaic)%s\n", miss, ns, allow ? ", allowed (--allow-missing)" : "");
     free(st); free(tv); free(tp); free(tw0); free(tw1); free(wv); free(wp); free(segs); pthread_mutex_destroy(&C->mu); free(C);
-    return 0;
+    return miss && !allow ? 3 : 0;
 }
 
 /* ufsm strip-crop <in.tif> <out.jpg> x,y,w,h [--stretch 1]: a rectangle of a big uint8 render TIFF (stripes are 60000 px wide: past the

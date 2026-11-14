@@ -102,8 +102,9 @@ done
 if [ -n "$SEGS" ]; then
   log "score"
   CUDA_VISIBLE_DEVICES= ~/bin/lowprio ~/bin/memcap -m 24G python3 -I $PY $SDIR $SEGS $ST.tsv \
-    --map $RD --ct-key $K --step 8 --tol 20,40,80 > $ST.log 2>&1 || { log "score failed ($ST.log)"; exit 1; }
-  log "scored: $ST.tsv"
+    --map $RD --ct-key $K --step 8 --tol 20,40,80 --gate-auc ${GATE_AUC:-0} > $ST.log 2>&1; rc=$?
+  [ $rc = 0 ] || [ $rc = 3 ] || { log "score failed ($ST.log)"; exit 1; }
+  log "scored: $ST.tsv: $(grep '^HEADLINE' $ST.log | cut -c10-)"; [ $rc = 3 ] && { log "GATE: $(grep '^GATE' $ST.log)"; exit 3; }
 fi
 if [ -n "$STRIPES" ]; then   # (strip-mosaic needs every stripe) per stripe: CT and ink JPEGs at full res (1 / 99.5 % stretch) + a 1:4 CT | ink overview
   log "jpegs"
@@ -133,5 +134,9 @@ CUDA_VISIBLE_DEVICES= ~/bin/lowprio ~/bin/memcap -m 24G $U strip-mosaic $O/strip
 log "done: $RD/img/overview.jpg $(tail -1 $RD/logs/mosaic.log)"
 fi
 [ -n "$SEGS" ] || exit 0
-printf 'set\ttol\tcoverage\tink_auc\tink_f1best\tct_auc\n'
-for t in $SD/inkscore-u1 $ST; do awk -F'\t' -v t=$(basename $t) '$2 == "all" { printf "%s\t%s\t%s\t%s\t%s\t%s\n", (t == "inkscore-u1" ? "ift3-24000" : t), $1, $5, $7, $8, $9 }' $t.tsv; done
+# held out only (validation + holdout boxes); the training labels' AUC ("rest") beside it, never "all" (~76 % training samples, audit 11-14 #4)
+printf 'set\ttol\tcoverage(heldout)\tink_auc(heldout)\tink_f1best(heldout)\tct_auc(heldout)\tink_auc(rest=train)\n'
+for t in $SD/inkscore-u1 $ST; do [ -s $t.tsv ] || continue
+  awk -F'\t' -v t=$(basename $t) '$2 == "rest" { r[$1] = $7 } $2 == "validation" || $2 == "holdout" || $2 == "heldout" { h[$1, $2] = $0 }
+    END { for (k in h) { split(k, q, SUBSEP); if (q[2] != "heldout") continue; split(h[k], f, "\t")
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", (t == "inkscore-u1" ? "ift3-24000" : t), f[1], f[5], f[7], f[8], f[9], r[f[1]] } }' $t.tsv; done | sort -k1,1 -k2,2n
