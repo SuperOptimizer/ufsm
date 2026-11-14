@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# scratch2 (univA 2026-11-13; user: "nix scratch1 go straight to scratch2"): the ~92 M universal latent net FROM SCRATCH (no --init-from), all heads (phase / normal / density / wind4,
+# rv 2, ink + MIL (--ink-dice 0 --ink-air 8), fibre H / V + direction (--fib-head 1)), labels on the fly from GT where the sources allow
+# (sources-scratch1.json), B 1 P 1024, the unified flag set. WIDTHS: placeholder until latdino's planner sweep (13.3 GB with recompute).
+# LR: from scratch at the u1.train2.sh defaults (Muon 0.02, AdamW 1e-3; u1 / unified ran 0.002 / 1e-4 as fine-tunes), warmup 1000: to confirm with latdino.
+# GPU: GPU=1 (one card) or GPU=0,1 once univI's split-window path exists. Do not launch before the lead's go (the DINO A/B holds GPU 1).
+# Needs: univI S2 (--split z training on the latent path) + augz-20261112 merged into U; LR from latdino; sources-scratch1.json v3 (all labels, no holdouts).
+# --gn-ema 1 --scan-norm 1: latdino rfwide-20261113 6073d01 (needs a binary with it merged); the optimizer from latres Muon A/B still to land.
+set -euo pipefail
+unset UFSM_S2B_WIDE   # (perf2 11-13: setting it brings back the level-3 NaN)
+# (split3 11-13, the s2fix gate bench g1, scratch2.gates/bench: UFSM_HEAD_SLAB_Z 16 -> 8 and --onfly-mb ${ONFLYMB:-768} (device memory: whole-card peaks
+#  15.03 / 14.43 GB at P 1024 split); SLOTS 6 -> 1: each slot pins 11.8 GB at P 1024, 2 slots were memcg-killed at the 104 GB train slice
+#  (rss 90 GB + 40 GB pinned / shm), 1 slot rss 50-58 GB. More slots only with the sampler host-memory work (hostmem / pool2fast).)
+R=/vesuvius/ufsm/v2/lat/runs
+# (try2, 11-13 14:10: SLOTS / WORKERS / ONFLYMB / HEADSLABZ / XFLAGS come from scratch2.gates/settings via scratch2.arm.sh and scratch2/launch.env (relaunch: scratch2.resume.sh).)
+# (Muon A/B owner 11-13: + --gfilm 1, --split-top 3; GPU 0,1 = --gpus 0,1 in u1.train2.sh; WSD --cooldown 0.2, memcap -t and both flock files come from u1.train2.sh.)
+# From scratch: a fresh launch refuses an existing scratch2/last.ckpt; the eval watcher's relaunch (auto-resume) passes RESUME=1.
+[ -e $R/scratch2/last.ckpt ] && [ "${RESUME:-0}" != 1 ] && { echo "refusing: $R/scratch2/last.ckpt exists (from scratch = a new run dir; RESUME=1 to resume)"; exit 1; }
+WIDTHS=${WIDTHS:-256,320,384,448,288,288}   # (lead 11-13: the ~92 M net, user "the 60M model" raised; + 4 attention blocks, scroll RoPE)
+cd $R && R=$R U=${U:?the binary with univI S2 + augz} SRCJ=${SRCJ:-/vesuvius/ufsm/univ/scratch1/sources-scratch1.json} GPU=${GPU:-0,1} \
+  LOCK=${LOCK:-/vesuvius/ufsm/opt/gpu0.lock,/vesuvius/ufsm/opt/gpu1.lock,/tmp/ufsm-suite-locks/gpu0.0,/tmp/ufsm-suite-locks/gpu0.1,/tmp/ufsm-suite-locks/gpu1.0,/tmp/ufsm-suite-locks/gpu1.1,/tmp/ufsm-suite-locks/gpu0.excl,/tmp/ufsm-suite-locks/gpu1.excl} P=${P:-1024} ARCH="--widths $WIDTHS --attn-blocks 4 --attn-pe scroll --gn-ema 1 --scan-norm 1 --gfilm 1 --fibre-gpu 1 --ink-gpu 1" WORKERS=${WORKERS:-6} SLOTS=${SLOTS:-1} MEMMODE=auto \
+  ALR=${ALR:?latdino LR} MLR=${MLR:?latdino LR} WIND4L=0.25 ISO=64 WARM=${WARM:-1000} \
+  EXTRA=" --lat 4 --lat-basis /vesuvius/ufsm/v2/lat/codec/klt1.lcb --lat-c 29 --lat-step 0.25 --lat-step-jitter 0.3 --lat-guide 3 --um-rungs 4.8,9.6:2,19.2 --rung-shift-p 0.3 --film 2 --fstem 16 --fstem-drop 0.25 --uw ${UW:-1} --grad-cos 500 --ink-head 1 --ink-mil 1 --ink-dice 0 --ink-air 8 --fib-head 1 --ink-smooth 0.1 --ink-cache-mb 4096 --mix-every 250 --onfly-slots ${ONFLYSLOTS:-1} --onfly-mb ${ONFLYMB:-768} --strict-sources 1 ${SPLITF---split z --split-top 3} ${OPTX:-} ${XFLAGS:-} " SNAP=1000 UFSM_HOSTMEM=1 UFSM_HEAD_SLAB_Z=${HEADSLABZ:-8} \
+  nohup bash $R/scratch2.train.sh ${S2NAME:-scratch2} ${STEPS:-60000} >> $R/scratch2.nohup 2>&1 &
+echo "scratch2 launched (pid $!), log $R/scratch2.log"
