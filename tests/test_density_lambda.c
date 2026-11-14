@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
     char d[] = "/tmp/test_dlam_XXXXXX"; if (!mkdtemp(d)) return 1;
     if (nn_init(0)) { fprintf(stderr, "test_density_lambda: no GPU\n"); return 1; }
     CHECK(!sh("%s %s/fx 256 2 1 > %s/fx.log 2>&1", argv[2], d, d), "fixture");
-    const char *common = "--task unwrap2 --P 64 --B 1 --gpus 0 --workers 1 --sampler-slots 4 --val-batches 1 --val-every 1000 --log-every 1 "
+    const char *common = "--task unwrap2 --P 64 --B 1 --gpus 0 --workers 1 --sampler-slots 4 --val-batches 1 --val-train-ok 1 --val-every 1000 --log-every 1 "
                          "--ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --levels 1 --density-code 1 --wd 0";
     const char *W[2] = {"32,64,128", "16,32,64"};
     for (int k = 0; k < 2; k++) {

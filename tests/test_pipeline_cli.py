@@ -45,7 +45,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     cfg = t / "sources.json"
     cfg.write_text(json.dumps({"sources": [{"name": "fixture", "root": str(t), "ct": "ct", "um": 1,
                                           "targets": {"recto": "labels"}, "holdout": [96, 96, 96, 32, 32, 32]}]}))
-    opts = ["--P", "16", "--B", "1", "--levels", "1", "--gpus", "0", "--workers", "1", "--val-batches", "1",
+    opts = ["--P", "16", "--B", "1", "--levels", "1", "--gpus", "0", "--workers", "1", "--val-batches", "1", "--val-train-ok", "1",
             "--log-every", "1", "--val-every", "1", "--ckpt-every", "1", "--fp4", "2", "--down-norm", "1", "--input-prec", "8"]
     train_env = {"UFSM_GRAD_MX8": "1"}
     run("train", cfg, "--out", t / "first", "--steps", "2", "--warmup", "0", *opts, extra_env=train_env)

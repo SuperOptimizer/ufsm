@@ -22,7 +22,7 @@ d = sys.argv[1]
 a = json.load(open(f'{d}/fx/sources-l1.json'))['sources'][0]; b = json.load(open(f'{d}/fx/sources2.json'))['sources'][0]; b.pop('holdout', None)
 json.dump({'sources': [a, b]}, open(f'{d}/fx/sources-mix.json', 'w'))
 PY
-C=(--task unwrap2 --P 64 --B 1 --gpus ${UFSM_TEST_GPUS:-0,1} --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 --ckpt-every 1000 --fp4 2
+C=(--task unwrap2 --P 64 --B 1 --gpus ${UFSM_TEST_GPUS:-0,1} --workers 2 --sampler-slots 4 --val-batches 2 --val-train-ok 1 --val-every 1000 --log-every 1 --ckpt-every 1000 --fp4 2
    --gpu-aug 3 --replay 3 --warmup 0 --seed 5 --widths 16,32,64 --rv 2 --rv-iso 100 --lat 4 --lat-guide 3 --um-rungs 19.2,38.4 --rung-shift-p 0.2
    --film 2 --fstem 16 --fstem-drop 0.25 --uw 1 --grad-cos 3 --packed-weight 8)
 cd "$D"

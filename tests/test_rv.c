@@ -63,7 +63,7 @@ int main(int argc, char **argv) {
     }
     char d[] = "/tmp/test_rv_XXXXXX"; if (!mkdtemp(d)) return 1;
     CHECK(!sh("%s %s/fx 256 2 > %s/fx.log 2>&1", argv[2], d, d), "fixture");
-    const char *common = "--task unwrap2 --rv 1 --rv-iso 100 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 "
+    const char *common = "--task unwrap2 --rv 1 --rv-iso 100 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-train-ok 1 --val-every 1000 --log-every 1 "
                          "--ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --widths 16,32,64";
     /* (2) from scratch, then a resume */
     CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources.json --out %s/b --steps 6 %s > %s/b.log 2>&1", U, d, d, common, d), "rv net (%s/b.log)", d);
