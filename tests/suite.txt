@@ -250,6 +250,7 @@ test_qkclip                                    | gpu          |     1 | ./$B/tes
 test_unet~FUSED_UP=0,F16=1                     | gpu          |     3 | UFSM_FUSED_UP=0 UFSM_F16=1 ./$B/test_unet
 test_unet~RECOMPUTE=2,F16=1                    | gpu          |     3 | UFSM_RECOMPUTE=2 UFSM_F16=1 ./$B/test_unet
 test_json                                      | smoke        |     1 | ./$B/test_json
+test_gns                                       | smoke        |     2 | ./$B/test_gns
 test_phasepack                                 |              |     3 | ./$B/test_phasepack
 test_nn                                        | gpu,smoke    |    15 | ./$B/test_nn
 test_unet                                      | gpu,smoke    |     3 | ./$B/test_unet

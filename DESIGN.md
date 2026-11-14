@@ -6,6 +6,39 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Gradient noise scale in the trainer (2026-11-14, branch gns-20261114)
+
+`--gns 1` logs the gradient noise scale B_noise (McCandlish et al. 2018, "An Empirical Model of Large-Batch Training", app. A.1), the
+batch size in windows above which a larger batch stops buying proportionally fewer updates. E|G_b|^2 = |G|^2 + S / b for a b-window
+mean gradient (S = tr Sigma, the per-window gradient variance), so two squared norms at batch sizes b < B give unbiased |G|^2 =
+(B |G_B|^2 - b |G_b|^2) / (B - b) and S = (|G_b|^2 - |G_B|^2) / (1/b - 1/B); B_noise = EMA(S) / EMA(|G|^2) (`src/gns.h`, header-only,
+bias-corrected EMAs, `--gns-beta` 0.99 per update).
+
+Which pair. The brief was b = one GPU's accumulated gradient before the cross-GPU sum, B = after it. The trainer does not have that
+gradient: the all-reduce runs every step (window), and `--accum` accumulates the already averaged gradient. So the pairs are:
+- `--accum K` (try6: K 5 x 2 GPUs): b = one step's all-reduced gradient (nl B = 2 windows; |G_b|^2 the mean over the update's K steps),
+  B = the update's mean (2K = 10 windows). Both norms are computed anyway (the per-step non-finite check, the update's clip norm): zero
+  extra work, no extra sync. B / b = 5 conditions the estimate better than 2.
+- data parallel without `--accum` (no `--split`): b = each replica's own window (mean of |g|^2 over the replicas, one more fp32 sumsq per
+  GPU per step), B = the all-reduced mean.
+- one GPU without `--accum`, or `--split` without `--accum`: one batch size only, no estimate (a notice with `--gns 1`; trains as before).
+Default on whenever a pair exists. Norms are of the raw unscaled fp32 gradients (after the loss-scale division, before clipping, Muon,
+weight decay), reduced by `nn_sumsq`. A non-finite window is left out of both norms, as it is out of the update.
+
+Log: ` gns N W (|G|^2 a, S b)` on the log line; log.csv gains `gns,gns_g2,gns_s` (empty before the first pair; the header of a resumed
+run's older log.csv is extended in place at start, `csv_extend_header`). scripts/u0/watch.sh reads log.csv by position and now ignores the
+trailing columns.
+
+Test (tests/test_gns.c, CPU): synthetic per-window gradients with |G|^2 = 1 and uneven diagonal noise (true B_noise 20.05) replayed
+through both pairings, 20000 updates each: per-update means of |G|^2 and S within 0.5 %, EMA (beta 0.999) B_noise 20.18 (accum 5 x 2),
+19.88 (accum 4 x 1), 21.01 (b 1 vs B 2), 19.89 (b 1 vs B 8). With noise 108 windows (B_noise >> B) the same run's EMA ratio was off by
+up to 15 % at beta 0.9995: the |G|^2 estimate's spread is ~S / B per update, so a run far below its noise scale needs a long EMA before
+the ratio settles; read B_noise over hundreds of updates. test_accum.sh checks the line, the csv columns and the one-GPU notice.
+
+Caveats. `--echo-max` replays windows; an echo inside one update correlates its windows and pulls S down (B_noise reads low). Loss terms
+normalised per window (dice, MIL) make "per-window gradient" the unit, which is what B counts. Per-parameter-group B_noise (trunk /
+attention / heads) is not done: it needs per-tensor sumsq over the grad buffer's offsets; the whole-net number first.
+
 ## Recompute and host offloads in scratch2: what the memory modes cost (2026-11-14, branch recomp-20261114)
 
 Goal: free device memory on the desk's 16 GB cards and spend it on less recompute / fewer host offloads (estimated 5-10 %).
