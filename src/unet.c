@@ -91,7 +91,7 @@ struct unet {
     int gn_frz_train;                 /* unet_gn_freeze_train: training forwards use them too (diagnostics: no backward after such a forward) */
     float *gn_frz_d;                  /* their device copy (uploaded once; each forward replays it into the sites with async device copies) */
     double *gn_acc; long gn_acc_n;     /* unet_gn_accumulate: sums of the window statistics (mean, mean^2 per mean slot, variance per rstd slot) */
-    float *ge_run; size_t ge_ns, ge_twn; long ge_n; int ge_warm, ge_c, ge_nsite, ge_live; float ge_mom, *ge_tw;   /* cfg.gn_ema: [3][ge_ns] running
+    float *ge_run; int *ge_pv, ge_userun; size_t ge_ns, ge_twn; long ge_n; int ge_warm, ge_c, ge_nsite, ge_live; float ge_mom, *ge_tw;   /* cfg.gn_ema: [3][ge_ns] running
                                                  statistics (live weights, EMA weights, the last batch's; gn_sites layout, [mean g | var g]
                                                  per pair); ge_c: this forward's are the running ones (latched for the backward); ge_tw:
                                                  the convs' live statistics while constant ([n][g] per site at n * offset) */
@@ -533,7 +533,7 @@ void unet_free(unet *u) {
     nn_free(u->wm); nn_free(u->sp24_kb); if (u->muon_mom != u->v) nn_free(u->muon_mom); nn_free(u->muon_work);   /* (aliased into v: mom_alloc) */ muon_forget_table(u); nn_free(u->muon_descs); nn_free(u->mx_lrm); nn_free(u->stem_b);
     nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); nn_free(u->mx_nmrows); nn_free(u->mx_nmoff); nn_free(u->mx_vrbuf); nn_free(u->mx_vrp); nn_kron_free(u->mx_kron); nn_free(u->qk_lmax); nn_free(u->mx_mixbuf); nn_free(u->mx_mixp);
     nn_free(u->ad_lrm); nn_free(u->ad_ema); nn_free(u->ad_dispbuf); nn_free(u->ad_dispp); nn_free(u->ad_dogst); nn_free(u->ad_part); nn_free(u->ost_dev); nn_free(u->ost_snap); free(u->ost_seg);
-    free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_tw); nn_free(u->gf_g); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
+    free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_pv); nn_free(u->ge_tw); nn_free(u->gf_g); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs); nn_free(u->ds_g16); nn_free(u->ds_tmp);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
     nn_free(u->wq_r); nn_free(u->wq_rsc); nn_free(u->wq_re); nn_free(u->wq_rsce);
@@ -2172,11 +2172,20 @@ static void ge_begin(unet *u) {   /* forward start: latch ge_c, the running stat
     ge_alloc(u);
     u->ge_nsite = 0; gn_sites(u, ge_site1, nullptr);
     if (u->ge_nsite > 192 || (u->ge_nsite & 1)) { fprintf(stderr, "unet: gn_ema: %d GroupNorm sites (at most 192, in pairs)\n", u->ge_nsite); abort(); }
+    if (!u->ge_pv) {   /* the variance slots' mean partners (gn_sites: a site pair is [mean g | var g], adjacent) for nn_gn_pool */
+        int *h = malloc(u->ge_ns * sizeof *h); for (size_t i = 0; i < u->ge_ns; i++) h[i] = -1;
+        for (int i = 0; i + 1 < u->ge_nsite; i += 2) {
+            if (u->ge_so[i + 1] != u->ge_so[i] + (size_t)u->ge_sg[i]) { fprintf(stderr, "unet: gn_ema: sites %d / %d are not a [mean | var] pair\n", i, i + 1); abort(); }
+            for (int g = 0; g < u->ge_sg[i]; g++) h[u->ge_so[i + 1] + g] = (int)(u->ge_so[i] + g);
+        }
+        if (u->ge_ns > 4096) { fprintf(stderr, "unet: gn_ema: %zu statistics (at most 4096)\n", u->ge_ns); abort(); }
+        u->ge_pv = nn_malloc(u->ge_ns * sizeof *h); nn_h2d(u->ge_pv, h, u->ge_ns * sizeof *h); free(h);
+    }
     const int N = u->xs.n;
     u->ge_c = !gn_frozen(u) && u->ge_n > 0 && (!u->fwd_train || u->ge_n >= u->ge_warm) && !(u->ge_live && !u->fwd_train);   /* (ge_live: inference on the window's own statistics) */
     if (!u->ge_c) return;
     if (u->fwd_train && u->ge_twn < (size_t)N * u->ge_ns) { nn_free(u->ge_tw); u->ge_twn = (size_t)N * u->ge_ns; u->ge_tw = nn_malloc(u->ge_twn * 4); }
-    const float *run = u->ge_run + (u->using_ema ? u->ge_ns : 0);   /* (EMA weights: their own) */
+    const float *run = u->ge_run + (u->using_ema && !u->ge_userun ? u->ge_ns : 0);   /* (EMA weights: their own) */
     for (int i = 0; i < u->ge_nsite; i += 2) nn_gn_const_fill(u->ge_sp[i], u->ge_sp[i + 1], run + u->ge_so[i], N, u->ge_sg[i], 1e-5f);
 }
 static float *ge_dst(unet *u, float *p) {   /* where a conv writes site p's statistics: p, its twin (constant, training) or nowhere (inference) */
@@ -2194,11 +2203,31 @@ static void ge_after(unet *u) {   /* training forward, live weights: the batch's
     }
     /* a non-finite window's statistics are not pooled (nn_ema_finite; counted, unet_gn_ema_skips): they would make every later forward non-finite */
     unsigned *sk = (unsigned *)(bat + u->ge_ns);
-    if (!u->ge_n) { nn_ema_finite(run, bat, u->ge_ns, 0.f, sk); nn_ema_finite(rune, bat, u->ge_ns, 0.f, nullptr); }
-    else nn_ema_finite(run, bat, u->ge_ns, 1.f - u->ge_mom, sk);
+    if (!u->ge_n) { nn_gn_pool(run, bat, u->ge_ns, u->ge_pv, 0.f, sk); nn_gn_pool(rune, bat, u->ge_ns, u->ge_pv, 0.f, nullptr); }
+    else nn_gn_pool(run, bat, u->ge_ns, u->ge_pv, 1.f - u->ge_mom, sk);
     u->ge_n++;
 }
 void unet_gn_ema_live(unet *u, int on) { u->ge_live = on != 0; }
+/* the 3 x ge_ns statistics (run | rune | the last window's) to / from host: train averages the replicas' sets (targeted/gnorm.md #3) */
+size_t unet_gn_ema_count(unet *u) { if (!u->cfg.gn_ema) return 0; ge_alloc(u); return 3 * u->ge_ns; }
+void unet_gn_ema_get(unet *u, float *h) { ge_alloc(u); nn_d2h(h, u->ge_run, 3 * u->ge_ns * 4); }
+void unet_gn_ema_put(unet *u, const float *h) { ge_alloc(u); nn_h2d(u->ge_run, h, 3 * u->ge_ns * 4); }
+/* how far the EMA weights' statistics (rune) are from the live weights' (run): the largest per-site mean variance ratio, as max(r, 1 / r)
+   (scratch2 step 2357: 5.9). The EMA of a slowly drifting network lags it; predict --ema 1 refuses a net beyond 1.5 unless told (--gn-set) */
+double unet_gn_ema_stale(unet *u) {
+    if (!u->cfg.gn_ema || !u->ge_run || u->ge_n <= 0) return 1.0;
+    ge_alloc(u); float *h = malloc(2 * u->ge_ns * 4); nn_d2h(h, u->ge_run, 2 * u->ge_ns * 4);
+    u->ge_nsite = 0; gn_sites(u, ge_site1, nullptr);
+    double worst = 1.0;
+    for (int i = 0; i + 1 < u->ge_nsite; i += 2) {
+        double a = 0, b = 0; const float *v = h + u->ge_so[i + 1], *w = h + u->ge_ns + u->ge_so[i + 1];
+        for (int g = 0; g < u->ge_sg[i]; g++) { a += v[g]; b += w[g]; }
+        if (!(a > 0) || !(b > 0)) continue;
+        const double r = b / a, q = r > 1 ? r : 1 / r; if (q > worst) worst = q;
+    }
+    free(h); return worst;
+}
+void unet_gn_ema_use_run(unet *u, int on) { u->ge_userun = on; }   /* EMA weights, the live weights' running set */
 void unet_set_gn_ema(unet *u, float mom, int warm) { u->ge_mom = mom; u->ge_warm = warm; }
 /* after unet_load (which takes the checkpoint's): mom >= 0 / warm >= 0 replace them (train --gn-ema-mom / --gn-ema-warm on a resume; saved with
    the next checkpoint). A warm-up beyond the run's length keeps the training forward on batch statistics while the running ones still
@@ -4639,7 +4668,7 @@ void unet_anvil(unet *u, float lr, float wd, int step, int steps, float lr_adam,
 void unet_ema(unet *u, float decay) {
     if (u->wq) wq_ema(u, decay); else nn_ema(u->ema, u->p, u->np, decay);
     if (u->cfg.l0_norm == 2 && u->l0_n) { const size_t G = (size_t)G_of(u, u->cfg.widths[0]); nn_ema(u->l0run + 8 * G, u->l0run + 16 * G, 8 * G, decay); }   /* the EMA weights' statistics */
-    if (u->cfg.gn_ema && u->ge_n) nn_ema(u->ge_run + u->ge_ns, u->ge_run + 2 * u->ge_ns, u->ge_ns, decay);   /* gn_ema: the EMA weights' statistics */
+    if (u->cfg.gn_ema && u->ge_n && u->ge_pv) nn_gn_pool(u->ge_run + u->ge_ns, u->ge_run + 2 * u->ge_ns, u->ge_ns, u->ge_pv, decay, nullptr);   /* gn_ema: the EMA weights' statistics */
 }
 const float *unet_live_params(const unet *u) { return u->p; }
 const float *unet_active_params(const unet *u) { return u->live ? u->live : u->p; }   /* the weights the forward reads (EMA after unet_use_ema(u, 1)) */

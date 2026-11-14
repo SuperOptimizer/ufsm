@@ -1159,6 +1159,21 @@ process remembers the cells it evicted (path hashes) and counts a later compute 
 "N of them recomputes of evicted cells; M cells (G GB) evicted", the measure of whether 200 GB holds try6's revisit pattern. The root stays in ~:
 /vesuvius has 299 GB free of 1.9 TB (85 % used), less room than / after the 11-14 cleanup (235 GB free). test_dcache_cap (CPU).
 
+## GroupNorm running statistics: pooled variance, replica agreement, stale EMA set (2026-11-14, branch gnfix-20261114)
+
+From the targeted audit (/vesuvius/ufsm/audit-20261114/targeted/gnorm.md); correctness changes are on by default, they only touch `--gn-ema` nets.
+- **Pooled variance (#1).** The running variance was the EMA of the within-window variances; with one window per replica the between-window
+  variance of the group means never entered. `nn_gn_pool` (nn_opt.cu) now updates `[mean | var]` as the EMA of mean and second moment:
+  `v' = d v + (1 - d) v_w + d (1 - d) (m - m_w)^2` (the law of total variance; same layout, same checkpoints). It also replaces the rune update
+  (`unet_ema`, which blended the last window's statistics unguarded: a non-finite window now skips it). test_gn_ema (1) checks the new blend.
+- **Replicas (#3).** Under data parallel (`ng > 1`, `--gn-ema`) the main loop averages the finite entries of every replica's [run | rune | last
+  window] after each step's forwards, so all replicas hold the same set and the saved one has seen every window.
+- **Stale EMA-weights set (#2).** The measured rune lag (scratch2 step 2357: per-site variance ratio rune / run down to 0.15) is not fixed by code
+  alone. `predict --gn-set ema|run|auto` (default auto): with the EMA weights, auto refuses a checkpoint whose two sets differ by more than 1.5x at
+  a site (message names both ways out: `--gn-set ema`, `--gn-set run` = the live weights' set, or `--ema 0`). The recalibration pass (EMA weights,
+  live statistics over ~200-500 windows, pooled) and the scratch2 A/B (A: corrected stats via `--gn-set run`, B: `--gn-live 1` on inferfix) are
+  still to be measured on the GPU. Existing scratch2 checkpoints keep the old (non-pooled) variance in both sets until retrained.
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the

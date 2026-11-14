@@ -1400,7 +1400,8 @@ static int predict_one(int argc, char **argv) {
                         "       [--norm MEAN,SD]   fixed input normalization (uint8 CT units) instead of each window's own mean / sd\n"
                         "       [--radial-sign 1|-1]   -1 reverses the direction input (the CT is unchanged): a recto model then marks the verso face\n"
                         "       [--gn-save FILE]   pool the GroupNorm statistics of every window processed into FILE (calibration)\n"
-                        "       [--gn-frozen FILE]   use FILE's pooled GroupNorm statistics instead of each window's (no dependence on the window)\n"
+                        "       [--gn-set ema|run|auto]   a gn_ema net with EMA weights: the EMA set, the live weights' set, or ema unless the two disagree > 1.5x (default auto)\n"
+       "       [--gn-frozen FILE]   use FILE's pooled GroupNorm statistics instead of each window's (no dependence on the window)\n"
                         "       [--papyrus-cut T]   task papyrus nets conditioned on the cutoff: papyrus where the smoothed CT exceeds T (raw CT units)\n"
                         "       [--full-grid 1]   the output spans the CT level's whole grid; --box (rounded out to shards) selects the shards computed\n"
                         "       [--resume 1]   skip the shards listed in <out>/predict-done-<level>.txt (appended as shards are written; --heads: every head's log; --fit-zarr: the slabs in DIR/rows.done)\n"
@@ -1780,6 +1781,18 @@ static int predict_one(int argc, char **argv) {
             fprintf(stderr, "predict: note: GroupNorm on the running statistics (%ld updates), which the net never trained on (--gn-ema-warm %ld not reached); --gn-live 1 = the training-mode function\n", atol(nq + 7), atol(wq + 10));
         free(hh);
     }
+    /* --gn-set ema|run|auto (a gn_ema net, EMA weights): which running set normalises. ema: the EMA weights' own (rune, an EMA of the live weights' window
+       statistics, lagging them: scratch2 step 2357 had variance ratios down to 0.15); run: the live weights' set; auto (default): ema, but refused when the
+       two sets differ by more than 1.5x at a site (targeted/gnorm.md #2; the measured fix is a recalibration pass, scripts/infer/gn_ab.sh arms) */
+    const char *gn_set = opt(argc, argv, "--gn-set", getenv("UFSM_GN_SET") ? getenv("UFSM_GN_SET") : "auto"); int gn_use_run = 0;
+    if (!strcmp(gn_set, "run")) gn_use_run = 1;
+    else if (strcmp(gn_set, "ema") && strcmp(gn_set, "auto")) { fprintf(stderr, "predict: --gn-set ema | run | auto\n"); return 2; }
+    if (gn_use_run) unet_gn_ema_use_run(u, 1);
+    if (!strcmp(gn_set, "auto") && !gn_live && (use_ema || ema_blend >= 0.f) && !opt(argc, argv, "--gn-frozen", nullptr)) {
+        const double st = unet_gn_ema_stale(u);
+        if (st > 1.5) { fprintf(stderr, "predict: the checkpoint's EMA-weights GroupNorm statistics differ from the live weights' by %.2fx at a site (an EMA that lags the net): "
+                             "refusing the default. --gn-set ema (use them anyway; UFSM_GN_SET=ema in a script), --gn-set run (the live weights' set with the EMA weights), or --ema 0\n", st); return 1; }
+    }
     const char *gn_save = opt(argc, argv, "--gn-save", nullptr), *gn_frozen = opt(argc, argv, "--gn-frozen", nullptr);
     if (gn_save && (ngpu > 1 || split)) { fprintf(stderr, "predict: --gn-save needs one GPU\n"); return 2; }
     float *gnh = nullptr;
@@ -1803,6 +1816,7 @@ static int predict_one(int argc, char **argv) {
         unet_use_ema(u1, use_ema || ema_blend >= 0.f);
         if (infer_lean) unet_infer_release(u1, 0);
         if (gn_live) unet_gn_ema_live(u1, 1);
+        if (gn_use_run) unet_gn_ema_use_run(u1, 1);
         nn_init(gpu);
     }
     for (int k = 0; k < 1 + split; k++) {
