@@ -165,7 +165,9 @@ run_one() {
     local t0 t1; t0=$(date +%s.%N)
     ( export B="$BDIR" TMPDIR="$tmp" UFSM_TEST_TMP="$tmp" UFSM_SUITE_TEST="$n" UFSM_NCPU=$T UFSM_FIT_THREADS=$T UFSM_TIFF_THREADS=$T \
              OMP_NUM_THREADS=$T OPENBLAS_NUM_THREADS=$T MKL_NUM_THREADS=$T
-      if [ -n "$g" ]; then export CUDA_VISIBLE_DEVICES=$g; elif [ "$GPUS" = none ]; then export CUDA_VISIBLE_DEVICES=; fi
+      # a test without the gpu tag sees no GPU: one that needs it fails or skips here instead of using a card without the lock (2026-11-13:
+      # test_attn, test_attn_ray / _dfm, test_spiralfit, test_countfield, test_mesh_phase ran untagged on GPUs held by training runs)
+      if [ -n "$g" ]; then export CUDA_VISIBLE_DEVICES=$g; else export CUDA_VISIBLE_DEVICES=; fi
       echo $BASHPID > "$OUT/tmp/$n.pid"
       echo "# $n [${TAGS[$n]}] attempt $a gpu=${g:--} $(date '+%F %T') on $(hostname)"; echo "# $cm"
       if [ -n "$TIMEBIN" ]; then exec $TIMEBIN -f '%e %U %S %M' -o "$OUT/tmp/$n.time" timeout -k 20 "$TO" "${pre[@]}" bash -c "$cm"

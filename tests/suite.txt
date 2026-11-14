@@ -91,9 +91,9 @@ test_fblend                                    |              |     1 | ./$B/tes
 test_fields_pack                               |              |     2 | ./$B/test_fields_pack
 test_fields_phase                              |              |     2 | ./$B/test_fields_phase
 test_ink_gate                                  |              |     2 | ./$B/test_ink_gate
-test_countfield                                |              |     6 | ./$B/test_countfield
+test_countfield                                | gpu          |     6 | ./$B/test_countfield
 test_vwt_sample                                |              |     1 | ./$B/test_vwt_sample
-test_spiralfit                                 |              |    32 | ./$B/test_spiralfit
+test_spiralfit                                 | gpu          |    32 | ./$B/test_spiralfit
 test_tta                                       | gpu          |     1 | ./$B/test_tta
 test_predict_unwrap2                           | gpu          |     5 | ./$B/test_predict_unwrap2 ./$B/ufsm
 test_predict_fitgrid                           | gpu          |     5 | ./$B/test_predict_fitgrid ./$B/ufsm
@@ -141,15 +141,15 @@ test_dino_loss~D=16                            | gpu          |     1 | UFSM_TES
 test_ssl                                       | gpu          |     1 | ./$B/test_ssl
 test_head32                                    | gpu          |     2 | ./$B/test_head32
 test_sslstat                                   |              |     1 | ./$B/test_sslstat
-test_attn                                      |              |   110 | ./$B/test_attn
+test_attn                                      | gpu          |   110 | ./$B/test_attn
 test_vwt                                       | gpu          |     3 | ./$B/test_vwt
 test_vwt_mv                                    | gpu          |     1 | ./$B/test_vwt_mv
 test_vwt_fast                                  | gpu          |     2 | ./$B/test_vwt_fast
 test_attn_h16                                  | gpu          |     3 | ./$B/test_attn_h16
 test_vwi                                       | gpu          |     1 | ./$B/test_vwi
 test_wtrunk                                    | gpu          |    10 | ./$B/test_wtrunk
-test_attn_ray                                  |              |    14 | ./$B/test_attn_ray
-test_attn_dfm                                  |              |    26 | ./$B/test_attn_dfm
+test_attn_ray                                  | gpu          |    14 | ./$B/test_attn_ray
+test_attn_dfm                                  | gpu          |    26 | ./$B/test_attn_dfm
 test_hybrid_identity                           | gpu          |     6 | ./$B/test_hybrid_identity
 test_init_lr                                   | gpu          |     3 | ./$B/test_init_lr
 test_dinor                                     | gpu          |    60 | UFSM_TEST_QUICK=1 ./$B/test_dinor
@@ -283,5 +283,5 @@ test_lat_fuse                                  | gpu          |     2 | ./$B/tes
 test_phase_onfly                               | gpu          |    20 | tests/test_phase_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/onfly
 test_fibre_onfly                               | gpu          |    25 | tests/test_fibre_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibonfly
 test_codes_onfly                               | gpu          |    10 | tests/test_codes_onfly.sh ./$B/ufsm $TMPDIR/codesonfly
-test_mesh_phase                                |              |     8 | tests/test_mesh_phase.sh ./$B/ufsm ./$B/test_mesh_phase $TMPDIR/meshphase
+test_mesh_phase                                | gpu          |     8 | tests/test_mesh_phase.sh ./$B/ufsm ./$B/test_mesh_phase $TMPDIR/meshphase
 test_lldec                                     | gpu          |     3 | ./$B/test_lldec $TMPDIR/lldec
