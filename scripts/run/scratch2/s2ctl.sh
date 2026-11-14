@@ -8,6 +8,7 @@
 #   S2CTL_OWNER=<agent> bash s2ctl.sh hold   "<reason>" -- CMD ...  stop, run CMD with the GPUs free (A/Bs, checks), resume unchanged
 #   S2CTL_OWNER=<agent> bash s2ctl.sh fresh NEWENV ARCHIVE "<reason>" stop, dry-start NEWENV from scratch, archive runs/scratch2 to runs/ARCHIVE, launch fresh
 #   S2CTL_OWNER=<agent> bash s2ctl.sh replay OLDBIN NEWBIN [N]   stop; OLD, OLD, NEW at lr 0 --det 1 from last.ckpt for N windows; compare losses; resume
+#   S2CTL_OWNER=<agent> bash s2ctl.sh audit ENV [N]                 held-out leak audit (sampler only, no GPU) with ENV's exact args; gate 0 leaked voxels
 #   S2CTL_OWNER=<agent> bash s2ctl.sh drystart                    with the run stopped: the exact launch for 2 windows (also automatic in resume when launch.env changed)
 #   bash s2ctl.sh sync                                              regenerate scratch2.gates/settings from launch.env
 # Mutual exclusion: flock -n scratch2.ctl.lock; a second actor is refused with the holder's owner / command / time.
@@ -84,6 +85,16 @@ case "$CMD" in
   stop)   do_stop "${1:-}";;
   resume) do_resume "${1:-}" "${2:-}";;
   drystart) do_dry;;
+  audit)  # s2ctl.sh audit ENV [N]: datafix's held-out leak audit (sampler only, no GPU, no locks) with ENV's exact args, from scratch, N (1000) batches,
+          # in runs/scratch2.audit; may run while anything holds the GPUs. Gate: the last "hold audit:" line ends "ok" with H > 0, no "LEAK source" line.
+          AE=${1:?ENV}; AN=${2:-1000}; D=$R/scratch2.audit; case "$D" in $R/scratch2.audit) rm -rf -- "$D" "$D".log "$D".resume.log "$D".launcher.pid "$D".pid "$D".nohup;; esac
+          log "audit: $AN batches with $AE"
+          ( exec 8>&-; E=$AE; launchenv; cd $R && S2NAME=scratch2.audit DRY=1 FRESH=1 AUDIT=$AN DRYSTEPS=$AN RESUME=1 LOCK= bash $R/scratch2.launch ) >> $LOG 2>&1
+          sleep 5; LP=$(cat $D.launcher.pid 2>/dev/null); while kill -0 "$LP" 2>/dev/null; do sleep 15; done
+          last=$(grep -E '^hold audit: [0-9]+ training windows' $D.log | tail -1); nl=$(grep -c '^hold audit: LEAK source' $D.log)
+          H=$(echo "$last" | sed -E 's/.* ([0-9]+) overlap held-out boxes.*/\1/'); K=$(echo "$last" | sed -E 's/.* ([0-9]+) known label voxels inside.*/\1/')
+          if [[ "$last" == *": ok" ]] && [ "${K:-1}" = 0 ] && [ "${H:-0}" -gt 0 ] && [ "$nl" = 0 ]; then log "audit OK: $last"; echo "$last" > $R/scratch2.audit.ok
+          else log "audit FAILED: ${last:-no summary line} ($nl LEAK source lines; $D.log)"; rm -f $R/scratch2.audit.ok; exit 1; fi;;
   replay) # s2ctl.sh replay OLDBIN NEWBIN [N] (eval audit #6 (1)): stop, then from the same last.ckpt at lr 0 with --det 1 for N (10) windows:
           # OLD, OLD again (the noise floor) and NEW; compare the step lines' losses; resume unchanged. PASS: max rel(OLD, NEW) <= max(10 x noise, 1e-3).
           OB=${1:?OLDBIN}; NB2=${2:?NEWBIN}; NS=${3:-10}; [ -x "$OB" ] && [ -x "$NB2" ] || { log "replay: not executable"; exit 1; }

@@ -54,6 +54,11 @@ SNAPB=0; strings "$U" | grep -qF -- "--snap-every" && SNAPB=1
       st=$(head -c 200000 $o/snap/.tmp | head -1 | grep -o '"step":[0-9]*' | head -1 | cut -d: -f2)
       if [ -n "$st" ] && [ $((st % ${SNAP:-3000})) = 0 ] && [ "$st" -gt 0 ]; then mv $o/snap/.tmp $o/snap/$st.ckpt; echo "$(date) snapshot $st" >> $o.resume.log; fi
     fi; sleep 60; done ) &
+if [ "${AUDIT:-0}" -gt 0 ] 2>/dev/null; then   # (s2ctl.sh audit: datafix's held-out leak audit, sampler only, no GPU, the exact launch args)
+  echo "$(date) hold audit: $AUDIT batches, sampler only: $U train ${ARGS[*]}" >> $o.resume.log
+  UFSM_SAMPLER_ONLY=$AUDIT UFSM_HOLD_AUDIT=1 CUDA_VISIBLE_DEVICES= nice -n 10 /home/forrest/bin/memcap -t $U train "${ARGS[@]}" >> $o.log 2>&1; rc=$?
+  echo "$(date) hold audit exit rc=$rc" >> $o.resume.log; exit $rc
+fi
 for i in $(seq 0 ${RELAUNCH:-20}); do
   [ -f $o.stop ] && { m="$(date) STOP file $o.stop: $(tr '\n' ' ' < $o.stop)"; echo "$m" >> $o.resume.log; [ $i = 0 ] && echo "refusing to start: $m (s2ctl.sh resume removes it)" >&2; break; }
   # (ops audit #12: the binding limit is ufsm-train.slice, not the host: memory.max - (anon + shmem) of the slice, GB)

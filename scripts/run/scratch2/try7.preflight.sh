@@ -7,7 +7,7 @@ U=$(grep '^U=' $E | cut -d= -f2-); SRCJ=$(grep '^SRCJ=' $E | cut -d= -f2-)
 if [ "${1:-}" != --after ]; then
   [ -x "$U" ] && good "binary $U" || bad "binary not executable: $U"
   SHA=${U##*.}; if git -C /home/forrest/ufsm cat-file -e "$SHA^{commit}" 2>/dev/null; then
-    git -C /home/forrest/ufsm merge-base --is-ancestor cf4dcc8 $SHA 2>/dev/null && good "binary sha $SHA contains datafix cf4dcc8" || bad "binary sha $SHA lacks datafix cf4dcc8"
+    git -C /home/forrest/ufsm merge-base --is-ancestor 9a3ea4a $SHA 2>/dev/null && good "binary sha $SHA contains datafix 9a3ea4a (UFMC0002 packs, cf4dcc8)" || bad "binary sha $SHA lacks datafix 9a3ea4a"
     git -C /home/forrest/ufsm merge-base --is-ancestor $SHA origin/master 2>/dev/null && good "binary sha $SHA is on origin/master" || bad "binary sha $SHA is not on origin/master"
   else bad "cannot resolve the binary's sha '$SHA' (name it ufsm.scratch2.<sha>)"; fi
     for b in dcachecap-20261114 dckey-20261114; do git -C /home/forrest/ufsm merge-base --is-ancestor origin/$b $SHA 2>/dev/null && good "binary contains $b" || bad "binary lacks origin/$b (hostmem: derived-cache cap + new keys)"; done
@@ -19,6 +19,8 @@ if [ "${1:-}" != --after ]; then
   [ -f /vesuvius/ufsm/univ/scratch1/holdouts-20261114.json ] && good "holdouts json" || bad "no holdouts-20261114.json"
   for r in p4-codesA48 p4-codesB48; do [ -f /vesuvius/ufsm/datafix-20261114/raster/$r/done ] && good "raster $r done" || bad "raster $r not done"; done
   grep -q ALLDONE /vesuvius/ufsm/datafix-20261114/raster/run.log 2>/dev/null && good "raster run.log ALLDONE" || bad "raster run.log has no ALLDONE"
+  if [ -f $R/scratch2.audit.ok ] && [ $R/scratch2.audit.ok -nt $E ] && [ $R/scratch2.audit.ok -nt "$U" ]; then good "leak audit: $(cat $R/scratch2.audit.ok)"
+  else bad "no leak audit newer than the env and binary: S2CTL_OWNER=merger2 bash $R/s2ctl.sh audit $E 1000"; fi
   [ -f $R/scratch2.parked ] && good "try6 parked (fresh clears it)"
   systemctl --user is-active ufsm-health@scratch2 > /dev/null 2>&1 && good "health service active" || bad "ufsm-health@scratch2 not active"
 else
