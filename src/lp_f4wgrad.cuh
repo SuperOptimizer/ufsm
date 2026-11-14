@@ -1139,6 +1139,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
         const size_t cap_zt = (cap_kb << 10) / per_zt;
         const int szt = cached ? nzt : cap_zt < 1 ? 1 : cap_zt < (size_t)nzt ? (int)cap_zt : nzt;
         uint8_t *buf = cached ? (uint8_t *)rc.rec : lp_buf<uint8_t>(4, per_zt * szt);
+        const skipm_t skw = lp_skip_wgrad(ys);   /* --skip-empty: a masked conv's inactive gy tiles leave the weight gradient (after the bias sums) */
         if (cached && gb) gyrec_bias_k<<<nblk_((size_t)ys.c, 128), 128>>>(gb, rc.gb, ys.c);   /* the bias gradient: the apply's gy sums (N 1) */
         for (int zs0 = zt0; zs0 < zt1; zs0 += szt) {
             const int zs1 = zs0 + szt < zt1 ? zs0 + szt : zt1, Zs = (2 * zs1 < ys.d ? 2 * zs1 : ys.d) - 2 * zs0;
@@ -1151,6 +1152,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
             if (pend) lp_gnpend_slab(zs0, zs1, buf, gb, zs1 >= zt1);   /* the slab's gy (gx of the apply) and its records, the apply's bits */
             else if (!cached) { if (g_f4w_gy4) GP4(4); else GP4(8); }
 #undef GP4
+            if (skw.m) lp_skip_rec_zero(buf, ys, zs0, zs1, GP4_REC, skw);
             int zc_s = zs1 - zs0 < max_zc ? zs1 - zs0 : max_zc;
             while (zc_s > 1 && (size_t)base * nblk_(zs1 - zs0, zc_s) < 72) zc_s--;
             const dim3 g((unsigned)(nblk_(ys.w, 16) * nblk_(ys.h, 8) * nblk_(zs1 - zs0, zc_s) * ys.n), (xs.c + 8 * NT - 1) / (8 * NT), (ys.c + 16 * MT - 1) / (16 * MT));
@@ -1208,6 +1210,7 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
 #endif
         return;
     }
+    if (lp_skip_wgrad(ys).m) { fprintf(stderr, "skip-empty: the weight gradient of a masked conv needs the gy record path (MX-fp8 / fp4 gy, SR on, plain layout)\n"); abort(); }
     if (zw_trange(ys.d, 2).y) { fprintf(stderr, "lp_bwd_w_f4: the z-window needs the gy pre-pass path\n"); abort(); }
     int nzc = (nzt + ZC - 1) / ZC;
     dim3 grid((unsigned)(nblk_(ys.w, 16) * nblk_(ys.h, 8) * nzc * ys.n), (xs.c + 8 * NT - 1) / (8 * NT), (ys.c + 16 * MT - 1) / (16 * MT));

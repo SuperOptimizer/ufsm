@@ -4,17 +4,30 @@
        logits by z band. With fixed GroupNorm statistics (gn_ema) it stays within the convs' reach of the bias-filled tiles: material
        logits bit-identical at margin 3, within 2% at margin 2 (this net: 3 levels, no attention; scratch2's attention / gfilm couple
        further, measured separately);
-   (3) nn_skip_off: dense again, bit-identical. */
+   (3) nn_skip_off: dense again, bit-identical;
+   (4) training (DESIGN 2026-11-14 "skip-air training"): forward + backward with MX-fp4 gradients. Every tile active: the gradient
+       bit-identical to the dense one and the masked backward-data / wgrad kernels did run; masks from the CT: the gradient finite, the
+       masked backward counted, its cosine to the dense gradient reported; the checkpoint header round-trips skip_empty. */
 #include "unet.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int bad;
 #define CHECK(c, ...) do { if (!(c)) { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); bad++; } } while (0)
 static uint64_t rs = 777;
 static float frand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (float)((rs >> 11) * 0x1.0p-53); }
+
+static void all_active(int P) {   /* level masks of 8 x 8 x 16-cell tiles, every tile set */
+    for (int l = 0; l < 3; l++) { const int c = P >> l; const size_t m = (size_t)((c + 7) / 8) * ((c + 7) / 8) * ((c + 15) / 16);
+        uint8_t *h = malloc(m); memset(h, 1, m); nn_skip_set(l, h, c, c, c); free(h); }
+}
+static double cosine(const float *a, const float *b, size_t n, int *fin) {
+    double ab = 0, aa = 0, bb = 0; *fin = 1; for (size_t i = 0; i < n; i++) { if (!isfinite(a[i])) *fin = 0; ab += (double)a[i] * b[i]; aa += (double)a[i] * a[i]; bb += (double)b[i] * b[i]; }
+    return ab / sqrt(aa * bb + 1e-300);
+}
 
 int main(void) {
     if (nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0)) { printf("no cuda\n"); return 1; }
@@ -41,7 +54,7 @@ int main(void) {
     long nm, nc;
     nn_skip_counts(&nm, &nc);
     {   /* (1) every tile active */
-        for (int l = 0; l < 3; l++) { const int c = P >> l, m = (c + 7) / 8; uint8_t *h = malloc((size_t)m * m * m); memset(h, 1, (size_t)m * m * m); nn_skip_set(l, h, c, c, c); free(h); }
+        all_active(P);
         nn_d2h(lm, unet_forward(u, dx, xs, 0), no * 4); nn_skip_counts(&nm, &nc);
         CHECK(!memcmp(ld, lm, no * 4), "all tiles active: logits bit-identical to the dense forward");
         CHECK(nm > 0, "the masked kernel ran (%ld of %ld conv launches masked)", nm, nc);
@@ -88,6 +101,39 @@ int main(void) {
         nn_skip_off();
         nn_d2h(lm, unet_forward(u, dx, xs, 0), no * 4);
         CHECK(!memcmp(ld, lm, no * 4), "nn_skip_off: bit-identical to the dense forward again");
+    }
+    {   /* (4) training */
+        unet_set_grad_mx8(1); unet_set_grad_mx4(1);
+        const size_t np = unet_nparams(u); float *gd = malloc(np * 4), *gm = malloc(np * 4), *gy = malloc(no * 4);
+        for (size_t i = 0; i < no; i++) gy[i] = (frand() - 0.5f) * 1e-3f;
+        float *dgy = nn_malloc(no * 4); nn_h2d(dgy, gy, no * 4);
+        long nb, nw;
+        nn_skip_off(); nn_skip_counts_bwd(&nb, &nw);
+        unet_forward(u, dx, xs, 1); unet_zero_grad(u); unet_backward(u, dgy); unet_grad_d2h(u, gd);
+        all_active(P);
+        unet_forward(u, dx, xs, 1); unet_zero_grad(u); unet_backward(u, dgy); unet_grad_d2h(u, gm); nn_skip_counts_bwd(&nb, &nw);
+        int fin; double cs = cosine(gd, gm, np, &fin);
+        printf("(4) train, all active: gradient %s (cosine %.6f), masked backward-data %ld, wgrad %ld\n", memcmp(gd, gm, np * 4) ? "DIFFERENT" : "bit-identical", cs, nb, nw);
+        CHECK(!memcmp(gd, gm, np * 4), "train, all tiles active: gradient bit-identical to the dense one");
+        CHECK(nb > 0 && nw > 0, "masked backward-data (%ld) and wgrad (%ld) ran", nb, nw);
+        nn_skip_off(); CHECK(!nn_skip_build(dct, P, P, P, 1, 3, 0, 1), "nn_skip_build");
+        unet_forward(u, dx, xs, 1); unet_zero_grad(u); unet_backward(u, dgy); unet_grad_d2h(u, gm); nn_skip_counts_bwd(&nb, &nw);
+        cs = cosine(gd, gm, np, &fin);
+        printf("    train, CT masks (margin 1): gradient finite %d, cosine to dense %.4f, masked backward-data %ld, wgrad %ld\n", fin, cs, nb, nw);
+        CHECK(fin, "train, CT masks: gradient finite");
+        CHECK(nb > 0 && nw > 0, "train, CT masks: masked backward ran");
+        CHECK(cs > 0.5, "train, CT masks: gradient cosine to dense %.4f", cs);
+        nn_skip_off();
+        unet_forward(u, dx, xs, 1); unet_zero_grad(u); unet_backward(u, dgy); unet_grad_d2h(u, gm);
+        CHECK(!memcmp(gd, gm, np * 4), "train, nn_skip_off: gradient bit-identical to dense again");
+        /* the checkpoint header */
+        char path[256]; snprintf(path, sizeof path, "%s/test_skip_empty.%d.ckpt", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid());
+        unet_cfg *uc = (unet_cfg *)unet_cfg_of(u); uc->skip_thr = 1; uc->skip_margin = 2;   /* the header writer reads the live cfg */
+        unet_cfg pc = {}; int st = 0;
+        CHECK(!unet_save(u, path, 5, nullptr) && !unet_peek(path, &pc, &st), "checkpoint save / peek");
+        CHECK(pc.skip_thr == 1 && pc.skip_margin == 2, "checkpoint skip_empty round trip (%d %d)", pc.skip_thr, pc.skip_margin);
+        uc->skip_thr = 0; CHECK(!unet_save(u, path, 5, nullptr) && !unet_peek(path, &pc, &st) && pc.skip_thr == 0, "no skip_empty key when off");
+        remove(path); nn_free(dgy); free(gd); free(gm); free(gy);
     }
     if (bad) { printf("test_skip_empty: %d failed\n", bad); return 1; }
     printf("test_skip_empty: ok\n");

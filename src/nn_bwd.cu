@@ -93,6 +93,7 @@ int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *
     const int pr = eff_prec();
     const int mx = ISMX(x) || ISMX(y);
     exec_prec(g_pass, !ts && mx ? xs.c <= 8 ? 2 : MXDT(x) == 4 || pr == 3 ? 3 : 2 : !ts && !sp.up && (pr == 2 || pr == 3) ? xs.c <= 8 && pr == 3 ? 2 : pr : pr == 4 ? 4 : 1);
+    if (g_pass == 1 && !ts && !(ISMX(x) || ISMX(y)) && nn_skip_claim(xs)) { fprintf(stderr, "skip-empty: a masked conv's backward-data needs MX gradients\n"); abort(); }
     if (!ts && (ISMX(x) || ISMX(y))) {   /* MX activation storage (fp8 or fp4): staged from the stored rows; fp4 storage or a
                                             prec-3 policy runs the fp4 kernel, else fp8 compute (copy staging) */
         const int mdt = MXDT(x);
@@ -104,8 +105,10 @@ int conv_fwd_tc(const void *x, int xbf, shape5 xs, const float *w, const float *
         sp.wkey = conv_wkey();
         if ((mdt == 4 || pr == 3) && g_pass == 1 && sr_on()) sp.sr = sr_seed();   /* fp4 backward-data: stochastic rounding of the (MX-fp8) gy operand */
         if (mdt == 4 && g_pass == 1) { sp.sr = 0; sp.osr = sr_seed(); }   /* MX-fp4 gradients: gy already on the e2m1 grid (copy staging), gx stored with exact SR */
-        if (mdt == 4 && lp_sp24_conv_fwd(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp)) return 0;   /* sparse24 mode 2 / 3 weights (lp_sp24conv.cu) */
-        if (mdt == 4 || pr == 3) return lp_conv_fwd_f4(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
+        const int skc = nn_skip_claim(xs) || nn_skip_fwd_level(xs, sp);   /* --skip-empty: a masked conv (either direction) stays on the masked fp4 kernel */
+        if (!skc && mdt == 4 && lp_sp24_conv_fwd(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp)) return 0;   /* sparse24 mode 2 / 3 weights (lp_sp24conv.cu) */
+        if (mdt == 4 || pr == 3) { const int r = lp_conv_fwd_f4(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp); if (skc) nn_skip_bwd_check(); return r; }
+        if (skc) nn_skip_bwd_check();
         return lp_conv_fwd_f8(x, mdt, xs, w, b, cout, y, mdt, gp, osum, Go, sp);
     }
     if (!ts && (pr == 2 || pr == 3) && !sp.up && g_pass == 1) { if (sr_on()) sp.sr = sr_seed(); }   /* backward-data: gy is the staged operand (fp8 dither / exact e2m1 SR) */

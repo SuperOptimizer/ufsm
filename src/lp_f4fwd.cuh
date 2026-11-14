@@ -329,12 +329,14 @@ __global__ void prep_w4_k(const float *__restrict__ w, uint8_t *__restrict__ wq,
    alignment: plane-major / 16-bit on both, or MX segments on both). Warp per tile, lane = row; same layout as prep_w4_k. */
 extern int g_w2d;
 __global__ void prep_w4_2d_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip, int Cx = -1, int CxP = 0, int Ox = -1, int OxP = 0);   /* defined in lp_f4fwd.cu */
-/* --skip-empty: the output tile [oz0, oz0 + TZ) x [oy0, oy0 + 8) x [ox0, ox0 + 16) lies in one z / y tile of 8 cells (TZ <= 4 divides 8)
-   and at most two x tiles */
+/* --skip-empty: the output tile [oz0, oz0 + TZ) x [oy0, oy0 + 8) x [ox0, ox0 + 16) is inside one mask tile (8 x 8 x 16 cells; TZ <= 4
+   divides 8, zoff a multiple of 8). sk_in: a staged input position's tile counts (backward-data: gy outside the active tiles is zero) */
 __device__ __forceinline__ bool sk_active(const skipm_t &sk, int oz0, int oy0, int ox0) {
     if (!sk.m) return true;
-    const size_t r = ((size_t)((oz0 + sk.zoff) >> 3) * sk.my + (oy0 >> 3)) * sk.mx; const int a = ox0 >> 3, b = min((ox0 + 15) >> 3, sk.mx - 1);
-    return (sk.m[r + a] | sk.m[r + b]) != 0;
+    return sk.m[((size_t)((oz0 + sk.zoff) >> 3) * sk.my + (oy0 >> 3)) * sk.mx + (ox0 >> 4)] != 0;
+}
+__device__ __forceinline__ bool sk_in(const skipm_t &sk, int gz, int gy, int gx) {   /* (in-bounds positions; gz on the output's plane numbering) */
+    return !sk.mi || sk.mi[((size_t)((gz + sk.zoff) >> 3) * sk.my + (gy >> 3)) * sk.mx + (gx >> 4)] != 0;
 }
 template <int MT, int TZ, typename T, typename TO>
 __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
@@ -400,6 +402,7 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__rest
                 int ix = pos % 18, iy = (pos / 18) % 10, iz = pos / 180;
                 int gz = oz0 - 1 + iz, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
                 bool inb = c0.p && gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
+                if (inb && sk.mi) inb = sk_in(sk, gz, gy, gx);   /* (--skip-empty backward-data) */
                 uint4 h0 = make_uint4(0u, 0u, 0u, 0u);
                 unsigned sc = 1u;
                 if (inb) {
@@ -418,6 +421,7 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__rest
             int ix = pos % 18, iy = (pos / 18) % 10, iz = pos / 180;
             int gz = oz0 - 1 + iz, gy = oy0 - 1 + iy, gx = ox0 - 1 + ix;
             bool inb = gz + zi0 >= 0 && gz + zi0 < Di && gy >= 0 && gy < H && gx >= 0 && gx < W;
+            if (inb && sk.mi) inb = sk_in(sk, gz, gy, gx);   /* (--skip-empty backward-data) */
             size_t off = inb ? ((size_t)(gz + zi0) * H + gy) * W + gx : 0;
             float v[32];
             if (upc) {
@@ -470,7 +474,8 @@ template <int MT, int TZ, typename T, typename TO> void launch_f4(dim3 grid, con
     if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
-    const skipm_t sk = IS_MX(TO) ? lp_skip_get(xs, sp, 1) : skipm_t{nullptr, 0, 0, 0};   /* (--skip-empty: MX forwards only) */
+    const skipm_t sk = IS_MX(TO) ? lp_skip_get(xs, sp, 1) : skipm_t{nullptr, nullptr, 0, 0, 0};   /* (--skip-empty: MX tensors only) */
+    if (sk.mi && (gp.G || sp.gp2.G || sp.up)) { fprintf(stderr, "skip-empty: a masked backward-data with a GroupNorm / upsampled input\n"); abort(); }
     conv_fwd_f4_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, sk);
 }
 /* ---- one or two 32-channel input chunks (Cip == 32 NCH, no fused upsample): conv_fwd_f4_k with the input staged once per z

@@ -39,9 +39,13 @@ typedef struct { const void *x2; int c_split; void *y2; int o_split; int accum; 
    test_share_enc_a1 (MX-fp8) failed 8 of 12 runs, the same with the pre-S2 code and 8 padding bytes: the launches' timing
    moves the order of float atomic sums the run-to-run comparison is sensitive to (Phase B of the RAM / compute plan) */
 static_assert(sizeof(split_t) <= 128, "split_t grew past 128 bytes");
-/* --skip-empty (src/nn_skip.cu): the tile mask of a masked conv's output level (m nullptr: dense); tiles of 8^3 cells, my x mx a z row */
-typedef struct { const uint8_t *m; int my, mx, zoff; } skipm_t;   /* zoff: the output's first plane on its level grid */
+/* --skip-empty (src/nn_skip.cu): a masked conv's tile masks (tiles of 8 x 8 x 16 cells, z y x; my x mx tiles a z row): m the output tiles to
+   compute (nullptr: dense), mi (backward-data) the input tiles whose values count (others staged as zero); zoff: the output's first plane */
+typedef struct { const uint8_t *m, *mi; int my, mx, zoff; } skipm_t;
 skipm_t lp_skip_get(shape5 xs, split_t sp, int fwd);
+skipm_t lp_skip_wgrad(shape5 ys);
+int nn_skip_fwd_level(shape5 xs, split_t sp);
+void lp_skip_rec_zero(uint8_t *buf, shape5 ys, int zs0, int zs1, size_t rec, skipm_t sk);
 /* k=3 stride 1 forward / weight gradient with the same semantics as the BF16 tensor-core paths in nn.cu
    (conv_fwd_tc / launch_bwd_w_tc): xbf / ybf = activation (and x2 / y2) storage type, 0 fp32, 1 bf16, 2 fp16; the
    forward needs xbf == ybf. Weights, biases and GroupNorm parameters are fp32; the weight gradient accepts fp32 or (with xbf) bf16 gy. */

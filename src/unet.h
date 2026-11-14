@@ -106,6 +106,8 @@ typedef struct {
                               beta + sum_k c_k D_k, with c the window's K codes (unet_set_film: e.g. log2(um / 4.8) of the grid and of the data) and A / D
                               learned per channel (params appended last, zero-initialised: the net computes its donor's function until they move;
                               header key "film" only when on). B 1 (one code vector per forward) */
+    int skip_thr, skip_margin;   /* --skip-empty (nn.h nn_skip_build, DESIGN 2026-11-14): trained with masked convs, CT threshold + 1 (0: off) and the
+                              margin in tiles; predict masks the same unless told otherwise (header key "skip_empty" only when on; no parameters) */
     int fstem, fstem_out;  /* C > 0 (<= 16): the fine voxel stem of a latent-grid net (nn_fstem_fwd: 4^3 taps at stride 2 of the CT channel, C silu
                               features, a projection to fstem_out (<= 16) head outputs added on the logits by the trainer's head slabs). Params
                               appended last (W1 He-initialised, b1 and the projection zero: the donor's function), header key "fstem" only when on */
