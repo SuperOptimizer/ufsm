@@ -1324,7 +1324,7 @@ __global__ void conv_bwd_w3_k(const float *__restrict__ x, const float *__restri
 template <int NT, typename TI, typename TG, typename HT>
 __global__ void __launch_bounds__(W2_NTHR, 3) conv_bwd_w_tc2_k(const TI *__restrict__ x, const TG *__restrict__ gy, float *__restrict__ gw, float *__restrict__ gb,
                                  int N, int Ci, int D, int H, int W, int Co, gnp_t gp, split_t sp) {
-    extern __shared__ __align__(16) unsigned char smem_raw[];
+    extern __shared__ __align__(32) unsigned char smem_raw[];
     HT *sx = (HT *)smem_raw;                      /* [8 ci][W2_T] */
     HT *sg = sx + 8 * W2_T;                         /* [16 co][NVT vox]: vox = (z*8 + row)*16 + x */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;

@@ -5,7 +5,7 @@
 #   saves RUN/latest.vwt and exits 0; the trainer's own RUN/STOP file also stops it, the lane then exits as finished) or when the trainer finishes (exit 0). Log: RUNROOT/RUN.log (appended), lane events RUNROOT/RUN.lane.
 # Host presets (HOST=desk | forlindesk, default from hostname): binary U, sources SRC, run root RUNROOT, threads. Env overrides any of
 #   U, SRC, RUNROOT, STEPS (50000), LR (5e-4), BATCH (2), EMA (0.999), TILT (15), CKPT (2000), MAXRESTART (20), NICE (5), AUG (extra aug flags).
-# Build: desk `make -j16 build/ufsm`; forlindesk (2x RTX 3090, sm_86) `PATH=/usr/local/cuda-13.4/bin:$PATH make ARCH=86 CUDA=/usr/local/cuda-13.4 -j20 build86/ufsm`.
+# Build: desk `cmake --preset release && cmake --build build -j 8`; forlindesk (2x RTX 3090, sm_86) `cmake --preset arch86 -DUFSM_CUDA=/usr/local/cuda-13.4 && cmake --build build86 -j 20`.
 # forlindesk: keep the 225 W cap (sudo -n nvidia-smi -pl 225 after a reboot) and MemAvailable > 10 GB (the lane waits for it at each start).
 set -u
 [ $# -ge 2 ] || { sed -n '2,12p' "$0"; exit 2; }

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # scripts/test/desk_suite.sh: run the ufsm suite for a branch / commit on the desk (2x RTX 5060 Ti, 32 threads), from the laptop or
 # any clone. The commit is pushed over ssh into the desk's bare repo /vesuvius/ufsm/suite/repo.git (nothing has to be on GitHub),
-# exported to /vesuvius/ufsm/suite/<sha>, built (ccache, shared across the sha dirs) and tested at nice 10.
+# exported to /vesuvius/ufsm/suite/<sha>, built (CMake presets release + verify; ccache, shared across the sha dirs) and tested at nice 10.
 #
 #   scripts/test/desk_suite.sh [-t fast|slow|all] [-j N] [-T N] [-m GB] [-l LOAD] [-w MIN] [-b N] [-k] REF [REGEX...]
 #     REF     branch, tag or commit of the local repo (uncommitted changes are not sent)
-#     -t      tier (default fast = make test); -j / -T: runner jobs / threads per test (default 8 / 3)
+#     -t      tier (default fast = the test target); -j / -T: runner jobs / threads per test (default 8 / 3)
 #     -m GB -l LOAD: before the build and before the tests the desk must have MemAvailable >= GB (default 40) and a 1-min
 #             load average <= LOAD (default 32 = the thread count); -w MIN: wait that long for it (default 60), then give up (exit 3)
-#     -b N    build jobs (default 12); -k keeps the sha dir after a pass (failed runs are always kept)
+#     -b N    build jobs (default 8, the desk rule); -k keeps the sha dir after a pass (failed runs are always kept)
 #     REGEX   only tests whose name matches (runner filter)
 #     env SUITE_ARGS: more runner options (e.g. "-P" profile, "-x 600")
 # Only one desk suite runs at a time (flock /vesuvius/ufsm/suite/suite.lock; later callers wait and say so). GPUs: those with
@@ -17,7 +17,7 @@
 # /vesuvius/ufsm/suite/<sha>/out (the last 8 sha dirs are kept). Exit = the runner's (0 = all passed).
 set -u
 DESK=${DESK:-forrest@192.168.0.175}; ROOT=/vesuvius/ufsm/suite
-TIER=fast; J=8; T=3; MEMGB=40; LOADMAX=32; WAITMIN=60; BJ=12; KEEP=0
+TIER=fast; J=8; T=3; MEMGB=40; LOADMAX=32; WAITMIN=60; BJ=8; KEEP=0
 while getopts "t:j:T:m:l:w:b:kh" o; do case $o in
   t) TIER=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; m) MEMGB=$OPTARG;; l) LOADMAX=$OPTARG;; w) WAITMIN=$OPTARG;; b) BJ=$OPTARG;; k) KEEP=1;; *) sed -n '2,19p' "$0"; exit 2;; esac; done
 shift $((OPTIND - 1)); [ $# -ge 1 ] || { sed -n '2,19p' "$0"; exit 2; }
@@ -38,7 +38,6 @@ ssh -o ConnectTimeout=10 "$DESK" "cat > $RS" <<'REMOTE' || exit 2
 set -u
 SHA=$1 TIER=$2 J=$3 T=$4 MEMGB=$5 BJ=$6 KEEP=$7 FILT=$8 XARGS=$9 LOADMAX=${10} WAITMIN=${11}
 ROOT=/vesuvius/ufsm/suite; S=${SHA:0:12}; W=$ROOT/$S
-export PATH=/usr/local/cuda/bin:$PATH CCACHE_BASEDIR=$W CCACHE_NOHASHDIR=1
 deskok() {   # wait (<= WAITMIN) until MemAvailable >= MEMGB and the 1-min load <= LOADMAX: the desk's own jobs come first
   local i a l n=$(( WAITMIN * 2 ))
   for ((i = 0; i <= n; i++)); do
@@ -61,10 +60,11 @@ deskok || exit 3
 if [ ! -f $W/.built ]; then
   [ -d $W ] && rm -rf -- "$ROOT/$S"
   mkdir -p $W && git -C $ROOT/repo.git archive "$SHA" | tar -x -C $W || exit 2
-  echo "desk_suite: building in $W (make -j $BJ, nice 10)"; t0=$(date +%s)
+  echo "desk_suite: building in $W (cmake + ninja -j $BJ, nice 10)"; t0=$(date +%s)
   cd $W || exit 2
-  if ! inbg bash -c "nice -n 10 make -j $BJ VERIFY=0 build/ufsm build/test_sheet build/make_pipeline_fixture build/test_http_reader \
-          build/test_sampler_safety build/test_formats > build.log 2>&1 && nice -n 10 make -j $BJ VERIFY=1 suite-bins >> build.log 2>&1"; then
+  if ! inbg bash -c "{ cmake --preset release && cmake --preset verify; } > build.log 2>&1 &&
+          nice -n 10 cmake --build build -j $BJ --target ufsm test_sheet make_pipeline_fixture test_http_reader test_sampler_safety \
+          test_formats >> build.log 2>&1 && nice -n 10 cmake --build build-verify -j $BJ --target suite-bins >> build.log 2>&1"; then
     echo "desk_suite: BUILD FAILED ($W/build.log):"; grep -E 'error|Error' $W/build.log | head -30; tail -n 15 $W/build.log; exit 2; fi
   touch $W/.built; echo "desk_suite: built in $(( $(date +%s) - t0 )) s"
 fi

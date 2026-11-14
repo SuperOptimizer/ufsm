@@ -6,6 +6,52 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Build system: CMake + Ninja, the LLVM toolchain for everything, the Makefile removed (2026-11-13, branch buildsys-20261113)
+
+The GNU Makefile (gcc -std=c23 + nvcc, 846 lines, one hand-written rule per test) is replaced by CMakeLists.txt + CMakePresets.json
+and LLVM only: clang for C23, clang -x cuda for the device code (LLVM NVPTX; only ptxas / fatbinary / headers / libs come from CUDA),
+lld, llvm-ar, compiler-rt builtins and crt files. Configurations stay build directories (build/, build-verify/, build86/); tests are
+one ufsm_exe() line each in tests/targets.cmake (converted from the Makefile rules, the exact object lists kept: weak symbols and
+tfx.c's constructor make archive-style linking change behaviour).
+
+Profile of the old build (desk 9950X, lowprio -j8, the trainer running, no ccache): clean release 388 s wall, 2260 s CPU. nvcc 2077 s
+(cicc 990, ptxas 937, host g++ 106, cudafe 40), of which lp_* 1806 s; gcc 236 s; link 0.2 s. Wall set by single TUs of up to 155 s
+(lp_mx_gnbwd, lp_f4fwd_i0p: up to 8 conv_fwd_f4r_k instantiations of ~70 k SASS instructions each) scheduled last (make's order).
+
+| desk, lowprio -j8, no ccache                     | Makefile gcc + nvcc | CMake clang + clang-cuda |
+|--------------------------------------------------|--------------------:|-------------------------:|
+| clean release build, wall / CPU                  |      388 s / 2260 s |            177 s / 1259 s |
+| host C CPU / CUDA CPU                            |       236 / 2077 s  |              117 / 1172 s |
+| edit one .cu (nn_elem.cu)                        |              3.8 s  |                     2.6 s |
+| edit lp_f4fwd.cuh (~30 TUs)                      |              112 s  |                      54 s |
+| edit fit.c                                       |              6.3 s  |                     3.6 s |
+| edit a header (tiffw.h, 20 users)                |               26 s  |    5.6 s (exact deps; make rebuilt every object on any src/*.h) |
+| verify build after release, warm ccache          |                  -  |          71 s (78 % hits) |
+
+The verify build shares ccache with release: the ptxas wrapper is named relative to the build dir, so only the ~50 units whose
+preprocessed source depends on UFSM_ALL_TYPES recompile. Slowest clang TUs: lp_f4fwd_i0p 84 s, lp_f4fwd_i0 74 s, lp_f8fwd_i0s 59 s.
+
+What clang-cuda needed: LLVM 22 writes at most PTX ISA 9.0, the ue8m0 .scale_vec::4X mma needs 9.1 (cmake/ptxas.sh.in raises the
+.version line); nvcc's host min / max overloads (src/clang_cuda_compat.cuh, force-included); CCCL 13.3's cuda/std/string_view does
+not compile under clang 22 (nn_fibre's cub::DeviceScan -> an own 3-pass integer scan, identical results); device nanf is declared but
+not defined by clang 22 (nn_loss: the bits nvcc gives, 0x7fc00000); clang embeds no PTX unless --cuda-include-ptx. libc++ is not
+possible (CUDA's crt/host_defines.h refuses it on x86): the .cu host side keeps libstdc++.
+
+Numerics. gcc -std=c23 does not contract a*b+c (checked: no vfmadd at -O3 -march=native; gnu23 does); clang's default would, so host
+C is -ffp-contract=off. -fno-math-errno is value-neutral (replaces sample.c's gcc-only optimize attribute, which gcc had ignored
+anyway: "empty declaration", it sat on an enum). Device fast math = nvcc -use_fast_math on the device side only (flush, approx
+transcendentals, -fapprox-func for approx div / sqrt, contract fast; no finite-math). The byte-exact units: contract off, and
+__CUDA_PREC_SQRT=1, since clang leaves libdevice's reflection at 0 and sqrtf became sqrt.approx.f32 even without fast math. Their PTX
+then uses the same float instruction kinds as nvcc -fmad=false (div.rn / sqrt.rn, no fma / approx / ftz); the fast units match
+nvcc -use_fast_math's kinds (div.approx.ftz, sqrt.approx.ftz, ex2.approx.ftz, fma.rn.ftz).
+
+Caveat: clang's depfile and ccache see the host pass's includes only (checked: a header included under __CUDA_ARCH__ alone neither
+rebuilds nor misses the cache); no project header is device-only today (all 165 .cu checked), and none may become one.
+
+Suite (CPU tier on the desk, no GPU): 95 pass; test_strip segfaulted under clang: the test passed argc 19 for 17 arguments (gcc's stack
+layout hid it; fixed); test_sampler_safety fails the same 3 holdout checks with the gcc build of origin/master (pre-existing).
+GPU tier and the clang-cuda vs nvcc kernel timing: pending (pod B down since 19:35 pod time).
+
 ## scratch2 at P 1024 --split z: device memory outside the planner, and a per-step leak (2026-11-13, branch s2fix-20261113)
 
 The full scratch2 flag set (widths 256,320,384,448,288,288, attention 4 blocks with scroll PE, gn-ema, scan-norm, gfilm, ink head + MIL +

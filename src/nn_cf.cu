@@ -1,5 +1,5 @@
 /* ufsm count-field on the GPU (src/cfgpu.h): pass 1's pooling, the CG solves, the --model-only R 0 model pass. Mirrors
-   src/countfield.c element by element: built without fast math and with -fmad=false (Makefile), so every fp32 / fp64 operation
+   src/countfield.c element by element: built without fast math and with FMA contraction off (CMakeLists.txt UFSM_STRICT_UNITS), so every fp32 / fp64 operation
    rounds as the CPU's (gcc -std=c23 does not contract either); the libm calls (atan2, hypot, cos, sin) may differ from glibc in the
    last bit; the sheet normal (d_axis) is fp32 (see there). Each solve cell's sums run in one thread in the CPU's voxel order (z, y, x); the CG's dot products over a fixed grid of
    blocks (deterministic; the CPU threads sum in another order, so CG iterates differ in the last bits). */

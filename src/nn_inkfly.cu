@@ -6,7 +6,7 @@
       min(count, 255)).
    C: one thread per chunk voxel: the CPU's finalize (held-out boxes, CT >= iso, the ink share, prob254) merged by known max into the
       chunk; the accumulators are cleared for the next unit.
-   Built with -fmad=false (Makefile): every double expression rounds as gcc -std=c23's (no contraction), sqrt / division are IEEE, so the
+   Built with FMA contraction off (CMakeLists.txt UFSM_STRICT_UNITS): every double expression rounds as gcc -std=c23's (no contraction), sqrt / division are IEEE, so the
    bytes are the CPU's. One context behind a mutex (the sampler's workers take turns); buffers grow on demand. */
 #include <cuda_runtime.h>
 #include <pthread.h>

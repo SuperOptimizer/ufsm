@@ -9,7 +9,7 @@ Self-contained: the source is rsynced from the desk (no build dirs, no .git), th
 - Installed: gcc-14 (default gcc is 13; C23 needs 14), libsqlite3-0 (afv.c dlopens it), libblosc-dev, libxxhash-dev, pkg-config.
   Already there: libcurl4-openssl-dev, libzstd-dev, zlib1g-dev, libssl-dev, libjpeg-dev, zstd, jq, python3, curl, rsync.
 - Source: `rsync -az --exclude 'build*' --exclude .git ufsm-fib/ root@POD:/workspace/ufsm-fib/` (from the desk's branch fibers-20261110 worktree).
-- Build: `cd /workspace/ufsm-fib && make -j40 CC=gcc-14 HOSTCC=gcc-14 build/ufsm` (nvcc picks g++-14 itself).
+- Build: `cd /workspace/ufsm-fib && cmake --preset release && cmake --build build -j 40` (LLVM 22: clang, lld; cmake/llvm.cmake finds clang-22).
 - AFVs: /workspace/fibers/raw/{PHerc0175A_1mm_v2,0175A_SMALLMORE,PHerc1447_1mm_v2,PHerc1447_all_v2}.afv, from
   https://dl.ash2txt.org/community-uploads/qual/AutomatedFiberVolumes/ with their .sha256 (checked: *.check).
 - Meta from the desk: /workspace/fibers/meta/{axis-0175A.json,axis-1447.json,holdouts.json} (the wbench holdouts).

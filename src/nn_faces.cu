@@ -1,7 +1,7 @@
 /* ufsm faces on the GPU (src/faces.c faces_wrap, src/faces_cli.c chunk cache): the normal profiles sampled from a device mirror of the
    decoded CT chunks, cut into bands (faces_core.h fc_bands_core), the exact volcomp substreams those profiles read (the decode list),
    and the windowed medians of the consistency passes. The same arithmetic in the same order as the CPU path: this file is built
-   WITHOUT fast math and with -fmad=false (Makefile), so results are bit-identical. Called through weak symbols: a binary without this
+   WITHOUT fast math and with FMA contraction off (CMakeLists.txt UFSM_STRICT_UNITS), so results are bit-identical. Called through weak symbols: a binary without this
    object (test_faces) is CPU-only. */
 #include "faces_core.h"
 #include <cuda_runtime.h>

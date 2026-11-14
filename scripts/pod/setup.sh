@@ -4,11 +4,12 @@
 #   1. limits: the REAL cgroup CPU / RAM limits. nproc and free show the host: 256 CPUs and 1 TB on a pod whose cgroup allows
 #      13.6 CPUs and 62 GB. Also the GPU / MIG slice, CUDA and disk.
 #      -> $POD/limits.txt; then `ufsm sysinfo` once the binary exists.
-#   2. deps: apt packages (root only), skipped when they are all present (xxhash: zarr3.c since iospeed):
-#      gcc-14 (C23), libcurl / zstd / blosc / zlib / ssl / jpeg / xxhash dev, jq, curl, rsync, time.
+#   2. deps: apt packages (root only), skipped when they are all present (xxhash: zarr3.c since iospeed): LLVM 22 (clang, lld,
+#      llvm, compiler-rt; from apt.llvm.org when the distribution lacks it), cmake, ninja, ccache, libcurl / zstd / blosc / zlib /
+#      ssl / jpeg / xxhash dev, jq, curl, rsync, time. No gcc: the whole build is LLVM (cmake/llvm.cmake).
 #   3. clone or fast-forward ufsm ($BRANCH, default master) into $POD/ufsm, then build it.
-#      The Makefile finds gcc-14, /usr/local/cuda-*, -ccbin and -lstdc++ by itself.
-#      make -j <cgroup CPUs>. ARCH=86 is picked for sm_80/86/89 GPUs: software MX, since the fp4 / fp8 kernels need sm_120a.
+#      CMake (cmake/llvm.cmake) finds the newest clang and /usr/local/cuda-* by itself: cmake --preset release (arch86 for
+#      sm_80/86/89 GPUs: software MX, since the fp4 / fp8 kernels need sm_120a), cmake --build -j <cgroup CPUs>.
 #   4. smoke test: ufsm sysinfo, test_sysinfo (cgroup parsing), test_mx_sw (GPU kernels).
 #   5. checkpoints from the public mirror, resumable, size-checked: wind96-wk1-best (fit fields) and ift3-24000 (ink) -> $POD/ckpt.
 #   6. SCROLL given: its CT from the mirror. `ufsm mirror` copies shard files resumably, about 40 MB/s on a pod; desk -> pod
@@ -63,20 +64,27 @@ cat $POD/limits.txt
 say "pod $POD: $NCPU CPUs, $MEMGB GB (cgroup)"
 
 # --- 2. deps ---
-PKGS="build-essential gcc-14 g++-14 make git pkg-config ca-certificates curl jq rsync time libcurl4-openssl-dev libzstd-dev libblosc-dev zlib1g-dev libssl-dev libjpeg-dev libxxhash-dev"
+LLVMV=22
+PKGS="clang-$LLVMV lld-$LLVMV llvm-$LLVMV libclang-rt-$LLVMV-dev cmake ninja-build ccache git pkg-config ca-certificates curl wget gnupg jq rsync time libcurl4-openssl-dev libzstd-dev libblosc-dev zlib1g-dev libssl-dev libjpeg-dev libxxhash-dev"
+if [ "${NOAPT:-0}" != 1 ] && command -v apt-get > /dev/null && ! apt-cache policy clang-$LLVMV 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+  [ "$(id -u)" = 0 ] || die "clang-$LLVMV has no apt candidate and not root: add apt.llvm.org or NOAPT=1"
+  say "apt: adding apt.llvm.org for clang-$LLVMV"
+  export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq --no-install-recommends wget gnupg lsb-release software-properties-common > /dev/null
+  wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && bash /tmp/llvm.sh $LLVMV > /dev/null || die "apt.llvm.org clang-$LLVMV"
+fi
 if [ "${NOAPT:-0}" != 1 ] && command -v apt-get > /dev/null; then
   miss=$(for p in $PKGS; do dpkg -s $p > /dev/null 2>&1 || echo $p; done | tr '\n' ' ')
   if [ -n "${miss// /}" ]; then
     [ "$(id -u)" = 0 ] || die "missing packages ($miss) and not root: install them or NOAPT=1"
     say "apt: $miss"
     export DEBIAN_FRONTEND=noninteractive; apt-get update -qq || die "apt-get update"
-    # one failing package (gcc-14 missing on an older image) must not drop the rest: retry one by one, then check the ones the build needs
+    # one failing package must not drop the rest: retry one by one, then check the ones the build needs
     apt-get install -y -qq --no-install-recommends $miss > /dev/null || for p in $miss; do apt-get install -y -qq --no-install-recommends $p > /dev/null || say "apt: $p failed"; done
   else say "deps present"; fi
 fi
 # xxhash (zarr3.c) is the one fresh pod images lack: fail here, not halfway through the build
 [ -e /usr/include/xxhash.h ] || [ -e /usr/local/include/xxhash.h ] || die "xxhash.h missing: apt-get install libxxhash-dev"
-for t in git make curl jq pkg-config; do command -v $t > /dev/null || die "$t missing"; done
+for t in git cmake ninja curl jq pkg-config; do command -v $t > /dev/null || die "$t missing"; done
 
 # --- 3. clone + build ---
 U=$POD/ufsm/build/ufsm
@@ -88,17 +96,18 @@ if [ -z "${ARCH:-}" ]; then
   cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')
   case "$cc" in 8*) ARCH=86;; *) ARCH=120;; esac
 fi
-BD=build; [ "$ARCH" = 86 ] && BD=build86 && U=$POD/ufsm/build86/ufsm
+BD=build; PRESET=release; [ "$ARCH" = 86 ] && BD=build86 && PRESET=arch86 && U=$POD/ufsm/build86/ufsm
 if [ "${NOBUILD:-0}" != 1 ]; then
-  say "make -j$NCPU ARCH=$ARCH"
-  ( cd $POD/ufsm && nice -n 5 make -j$NCPU ARCH=$ARCH $BD/ufsm > $POD/build.log 2>&1 ) || { tail -30 $POD/build.log; die "build (log $POD/build.log)"; }
+  say "cmake --preset $PRESET, ninja -j$NCPU"
+  ( cd $POD/ufsm && cmake --preset $PRESET > $POD/build.log 2>&1 && nice -n 5 cmake --build $BD -j$NCPU --target ufsm >> $POD/build.log 2>&1 ) ||
+    { tail -30 $POD/build.log; die "build (log $POD/build.log)"; }
 fi
 [ -x $U ] || die "no $U"
 $U sysinfo --disk $POD | tee $POD/sysinfo.txt
 
 # --- 4. smoke test ---
 if [ "${NOSMOKE:-0}" != 1 ] && [ ! -e $POD/state/smoke.$(git -C $POD/ufsm rev-parse --short HEAD) ]; then
-  ( cd $POD/ufsm && make -j$NCPU ARCH=$ARCH VERIFY=0 $BD/test_sysinfo $BD/test_mx_sw >> $POD/build.log 2>&1 &&
+  ( cd $POD/ufsm && cmake --build $BD -j$NCPU --target test_sysinfo test_mx_sw >> $POD/build.log 2>&1 &&
     ./$BD/test_sysinfo && ./$BD/test_mx_sw > $POD/smoke.log 2>&1 ) || { tail -20 $POD/smoke.log 2>/dev/null; die "smoke test"; }
   touch $POD/state/smoke.$(git -C $POD/ufsm rev-parse --short HEAD); say "smoke test passed"
 fi

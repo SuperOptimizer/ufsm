@@ -3,7 +3,7 @@
 # pushed it with the fields), claimed against the laptop and the other card, CT over HTTP from the mirror. It fills the gaps of fd.sh's
 # slab fits: a predict starts only after no `ufsm fit --gpu GPU` has run on the card for IDLE (3) minutes, and is killed when one starts
 # (predict --resume continues it later). Output: <S>/inkbl.zarr + state/ink.fdready here; the desk's inkpull lane fetches it (forlindesk
-# cannot ssh to the desk), then deletes it here. Needs the sm_86 build (make ARCH=86) and ckpt/ift3-24000.ckpt under C.
+# cannot ssh to the desk), then deletes it here. Needs the sm_86 build (cmake --preset arch86 && cmake --build build86) and ckpt/ift3-24000.ckpt under C.
 # Start (from a copy): cp src/scripts/corpus/{common,inklib,fdink}.sh runink/; for g in 0 1; do
 #   STOPF=/vesuvius/ufsm/corpus/STOPINK setsid nohup bash runink/fdink.sh $g > fdink$g.out 2>&1 < /dev/null & done
 H=$(cd "$(dirname "$0")" && pwd); . $H/common.sh; . $H/inklib.sh

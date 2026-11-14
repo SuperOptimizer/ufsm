@@ -1,7 +1,7 @@
 /* ufsm render on the GPU (src/render.c render_wraps_chunked_fill with render_set_gpu(1)): a device pool of decoded chunk slots (the
    decoder threads write lossy substreams straight into a slot through gpudec_decode_dev, or upload a host-decoded chunk from a pinned
    staging buffer), a device table of chunk pointers per volume, and one kernel launch per run of ready blocks that evaluates
-   render_core.h rc_pixel for every pixel of every grid. Built WITHOUT fast math and with -fmad=false (Makefile): the renders and fill
+   render_core.h rc_pixel for every pixel of every grid. Built WITHOUT fast math and with FMA contraction off (CMakeLists.txt UFSM_STRICT_UNITS): the renders and fill
    flags are the CPU path's bytes. Any device error -> the caller re-renders on the CPU. Called through weak symbols (render.c): a
    binary without this object (test_render_stream / test_render_fill CPU builds) is CPU-only. */
 #include "render_core.h"
