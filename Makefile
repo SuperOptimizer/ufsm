@@ -254,6 +254,8 @@ $(B)/test_mx_sw: tests/test_mx_sw.c $(B)/nn.o $(B)/nn_fp8.o
 suite-bins: $(B)/test_mx_sw
 $(B)/test_mx4: tests/test_mx4.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
+$(B)/s2b_replay: tests/s2b_replay.c $(B)/nn.o $(B)/nn_fp8.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_head_tc: tests/test_head_tc.c $(B)/nn.o $(B)/nn_fp8.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(CUDALIBS) -lm
 $(B)/test_grad_mx4: tests/test_grad_mx4.c $(B)/unet.o $(B)/nn.o $(B)/nn_fp8.o

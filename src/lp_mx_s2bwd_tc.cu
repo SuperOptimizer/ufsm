@@ -548,10 +548,9 @@ static int s2b_f4(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx
     if (g_s2b_f4 < 0) g_s2b_f4 = getenv("UFSM_S2B_F4") ? atoi(getenv("UFSM_S2B_F4")) : 3;
     const int C = xs.c, NCH = C / 32;
     if (g_s2b_f4 && C == 16 && ys.c == 16 && gdt == 4 && xdt == 4 && xs.d == 2 * ys.d && xs.h == 2 * ys.h && xs.w == 2 * ys.w) return s2b_f4q(gy, ys, w, xs, gx, accum, osr);
-    /* the wide STREAM path (256..448 channels) is off by default (UFSM_S2B_WIDE=1 on): with it the scratch2 P 1024 split step's gradient was NaN
-       on exactly enc3.c2 + level 3's film (bisect: a054edf first bad), and in test_mx4 the 256 / 320 / 384 / 448 / 288 cases in sequence
-       leave the later fp4 SR-operand check NaN while each width alone passes: something outside gx is overwritten (perf2 2026-11-13, open) */
-    if (g_s2b_wide < 0) g_s2b_wide = getenv("UFSM_S2B_WIDE") && atoi(getenv("UFSM_S2B_WIDE")) > 0;
+    /* the wide STREAM path (256..448 channels; UFSM_S2B_WIDE=0 / lp_set_s2b_wide(0) off): off for a while on 11-13 after the scratch2
+       level-3 NaN, which was this kernel reading a gy that shares memory with its gx (the copy below); on again, +5.8 % at P 1024 split */
+    if (g_s2b_wide < 0) g_s2b_wide = !getenv("UFSM_S2B_WIDE") || atoi(getenv("UFSM_S2B_WIDE")) > 0;   /* (on again since the overlapping-gy copy below) */
     const bool wideC = g_s2b_wide > 0 && C >= 256 && C <= 448 && C % 32 == 0 && NCH != 11 && NCH != 13;   /* (STREAM instantiations: 8, 9, 10, 12, 14 blocks) */
     if (!g_s2b_f4 || (C != 32 && C != 64 && C != 96 && C != 128 && !wideC) || ys.c != C || gdt != 4 || (xdt != 4 && xdt != 8) || xs.d != 2 * ys.d || xs.h != 2 * ys.h || xs.w != 2 * ys.w || ys.w % 16 || ys.h % 4) return 0;
     if (C >= 64 && (g_s2b_f4 & 2) == 0) return 0;   /* UFSM_S2B_F4=1: 32 channels only (3, the default: also 64 / 96 / 128) */
@@ -606,8 +605,21 @@ static int s2b_f4(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx
     const size_t sm = (size_t)3 * 5 * 17 * 16 * NCHP + ((3 * 5 * 17 * NCHP + 127) & ~127) + (size_t)NUS * 32 * 32 + (size_t)NUS * 32 * 2 + 8 * 8 * 36 * 4;   /* (128 channels: 85 KB; 448 streamed: 77 KB) */
     static unsigned char at[8][16][2]; int dev = 0; cudaGetDevice(&dev);
     unsigned char *atp = &at[dev & 7][NCH & 15][xdt == 4];
+    /* gy and gx may share memory: the trainer's planner put level 4's gy (down3's output gradient) 626688 B below level 3's gx, its last
+       channel blocks and scales inside gx's first block (the P 1024 92 M split step). This kernel reads gy tiles while it writes gx (the
+       dilated path converts gy into scratch first), so it overwrote its own input from the fourth z tile on: the scratch2 level-3 NaN
+       (a054edf; perf2 2026-11-13). Overlapping ranges: gy copied first (1 MB at 448 channels). test_mx4 "s2b overlap" */
+    const void *gyk = gy;
+    {   const size_t nby = (size_t)ys.n * NCH * ((size_t)ys.d * ys.h * ys.w) * 17, nbx = (size_t)xs.n * NCH * ((size_t)xs.d * xs.h * xs.w) * (4 * xdt + 1);
+        const uintptr_t y0 = (uintptr_t)gy, x0 = (uintptr_t)gx;
+        if (y0 < x0 + nbx && x0 < y0 + nby && !getenv("UFSM_S2B_NOCOPY")) {   /* (UFSM_S2B_NOCOPY: the old behaviour, for the test) */
+            static void *cp[8]; static size_t cap[8]; const int dv = cur_dev_();
+            if (nby > cap[dv]) { if (cp[dv]) cudaFree(cp[dv]); if (cudaMalloc(&cp[dv], nby) != cudaSuccess) { fprintf(stderr, "s2b_f4: no memory for the %.1f MB gy copy\n", nby / 1e6); abort(); } cap[dv] = nby; }
+            cudaMemcpyAsync(cp[dv], gy, nby, cudaMemcpyDeviceToDevice, 0); gyk = cp[dv];
+        }
+    }
 #define S2BF(XB_, NCH_) do { if (!*atp) { *atp = 1; cudaFuncSetAttribute((const void *)bwd_data_s2_f4_k<XB_, NCH_>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
-                             bwd_data_s2_f4_k<XB_, NCH_><<<grid, 256, sm>>>((const uint8_t *)gy, wq, ws, (uint8_t *)gx, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum, osr, NCH_ == 1 ? PT : PT2, ZC, zw); } while (0)
+                             bwd_data_s2_f4_k<XB_, NCH_><<<grid, 256, sm>>>((const uint8_t *)gyk, wq, ws, (uint8_t *)gx, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum, osr, NCH_ == 1 ? PT : PT2, ZC, zw); } while (0)
     if (NCH == 1) { if (xdt == 4) S2BF(4, 1); else S2BF(8, 1); }
     else if (NCH == 2) { if (xdt == 4) S2BF(4, 2); else S2BF(8, 2); }
     else if (NCH == 3) { if (xdt == 4) S2BF(4, 3); else S2BF(8, 3); }
