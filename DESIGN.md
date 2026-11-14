@@ -51,6 +51,137 @@ sum |W|^2) and, for the Muon groups, the range of the per-matrix ratios.
 - Coordination with gns (gradient noise scale, `--accum auto`): the controllers here read only update / weight ratios and the weights'
   displacement, never the noise scale or the batch size. (c) and `--accum auto` both change the effective step, so they are not combined
   in an A/B.
+## Sampler GPU work vs the training stream; the pair rule on both cards (2026-11-14, branch w4stream-20261114)
+
+**The w4 context stream was blocking.** Training kernels launch on the legacy default stream (no stream argument, no per-thread
+default stream). nn_w4.cu's sampler contexts (--gpu-aug 3: the winding mod 4 runs on the device) created their stream with a plain
+cudaStreamCreate, which synchronises with the legacy stream both ways. So each w4 op of a worker waited for the queued training work
+on that card (try5: a worker spun 0.7 core inside cudaMemcpy2DAsync in ctx_run), and the next training kernel waited for the w4 op.
+Now cudaStreamNonBlocking; the context's buffers are its own. Perf pod, scratch2's net on one card, P 512, --det 1, 8 workers / 6
+slots, 30 steps after 10: 0.864 -> 0.908 samp/s (+5.1 %), sampler wait 11.2 -> 5.7 %; UFSM_BATCH_HASH identical (5 batches); the step
+losses differ at the level two runs of master differ. Audit of the other sampler-side GPU paths (nn_band pair rule / codes, nn_fibre,
+nn_inkfly, nn_mcodes, nn_gpudec, nn_ctdev): all on non-blocking streams; the legacy-stream calls left are one-time (constant tables,
+gpudec's position table) or buffer growth (cudaFree / cudaMalloc, a device sync but only when a box exceeds the reserve).
+
+**Host side of the step otherwise clean.** nsys on the same setup at P 768, gaps before the trainer thread's ops attributed to its
+previous API call: 26 ms of host-caused idle per 11.7 s busy (0.2 %), plus ~120 ms of cuBLASLt lazy loading in the first steps.
+
+**--onfly-gpu A,B.** try6 (P 768 data parallel, the pair rule's 3 slots on GPU 0, fibre and ink on GPU 1): GPU 0 100 % / 15.7 GB,
+GPU 1 74 % / 13.7 GB, the gradient all-reduce waiting for GPU 0. band_pair_gpu_devices puts --onfly-slots contexts on each listed
+device, taken round robin (bg_ctx.dev, cudaSetDevice per call); the planner's budget is the minimum free memory over the cards, so
+2 + 2 slots (1.54 GB each) instead of 3 on GPU 0 (2.3 GB) also raises it. test_phase_onfly: --onfly-gpu 0,0 --onfly-slots 2 gives
+the stored-phase batches.
+
+## Gradient noise scale in the trainer (2026-11-14, branch gns-20261114)
+
+`--gns 1` logs the gradient noise scale B_noise (McCandlish et al. 2018, "An Empirical Model of Large-Batch Training", app. A.1), the
+batch size in windows above which a larger batch stops buying proportionally fewer updates. E|G_b|^2 = |G|^2 + S / b for a b-window
+mean gradient (S = tr Sigma, the per-window gradient variance), so two squared norms at batch sizes b < B give unbiased |G|^2 =
+(B |G_B|^2 - b |G_b|^2) / (B - b) and S = (|G_b|^2 - |G_B|^2) / (1/b - 1/B); B_noise = EMA(S) / EMA(|G|^2) (`src/gns.h`, header-only,
+bias-corrected EMAs, `--gns-beta` 0.99 per update).
+
+Which pair. The brief was b = one GPU's accumulated gradient before the cross-GPU sum, B = after it. The trainer does not have that
+gradient: the all-reduce runs every step (window), and `--accum` accumulates the already averaged gradient. So the pairs are:
+- `--accum K` (try6: K 5 x 2 GPUs): b = one step's all-reduced gradient (nl B = 2 windows; |G_b|^2 the mean over the update's K steps),
+  B = the update's mean (2K = 10 windows). Both norms are computed anyway (the per-step non-finite check, the update's clip norm): zero
+  extra work, no extra sync. B / b = 5 conditions the estimate better than 2.
+- data parallel without `--accum` (no `--split`): b = each replica's own window (mean of |g|^2 over the replicas, one more fp32 sumsq per
+  GPU per step), B = the all-reduced mean.
+- one GPU without `--accum`, or `--split` without `--accum`: one batch size only, no estimate (a notice with `--gns 1`; trains as before).
+Default on whenever a pair exists. Norms are of the raw unscaled fp32 gradients (after the loss-scale division, before clipping, Muon,
+weight decay), reduced by `nn_sumsq`. A non-finite window is left out of both norms, as it is out of the update.
+
+Log: ` gns N W (|G|^2 a, S b)` on the log line; log.csv gains `gns,gns_g2,gns_s` (empty before the first pair; the header of a resumed
+run's older log.csv is extended in place at start, `csv_extend_header`). scripts/u0/watch.sh reads log.csv by position and now ignores the
+trailing columns.
+
+Test (tests/test_gns.c, CPU): synthetic per-window gradients with |G|^2 = 1 and uneven diagonal noise (true B_noise 20.05) replayed
+through both pairings, 20000 updates each: per-update means of |G|^2 and S within 0.5 %, EMA (beta 0.999) B_noise 20.18 (accum 5 x 2),
+19.88 (accum 4 x 1), 21.01 (b 1 vs B 2), 19.89 (b 1 vs B 8). With noise 108 windows (B_noise >> B) the same run's EMA ratio was off by
+up to 15 % at beta 0.9995: the |G|^2 estimate's spread is ~S / B per update, so a run far below its noise scale needs a long EMA before
+the ratio settles; read B_noise over hundreds of updates. test_accum.sh checks the line, the csv columns and the one-GPU notice.
+
+Caveats. `--echo-max` replays windows; an echo inside one update correlates its windows and pulls S down (B_noise reads low). Loss terms
+normalised per window (dice, MIL) make "per-window gradient" the unit, which is what B counts. Per-parameter-group B_noise (trunk /
+attention / heads) is not done: it needs per-tensor sumsq over the grad buffer's offsets; the whole-net number first.
+
+### --accum auto: the batch follows the noise scale (same branch, follow-up)
+
+`--accum auto --accum-min A --accum-max M --gns-k K` (A: the checkpoint's accumulation, else 1; M 64; K 1): the target batch is K x EMA
+B_noise windows, accum = round(target / windows per step) (windows per step = nl B, the GPU count on try6). Controller (`accum_ctl` in
+gns.h), once per update: nothing during the first `--accum-warm` 1000 updates of each (re)start (only the EMAs run); then a change only
+after the target stayed above `--accum-margin` 1.25 x the current batch for `--accum-hold` 200 consecutive updates (a NaN or <= 0 estimate
+restarts the count), at most one change per `--accum-gap` 500 updates, x2 at most, capped at M, never down. The lr is not touched: the WSD
+schedule counts windows, so a larger batch at the same lr is the "grow the batch instead of decaying the lr" regime. Each change is logged
+(`step N: --accum auto: accum a -> b (... B_noise, K; update u)`).
+
+Mechanics: the update condition is (step - anchor) % accum == 0 and the optimizer's step count upd_base + (step - anchor) / accum (anchor 0,
+upd_base 0 for a fixed --accum: the old steps % K and step / K exactly). A change at an update sets anchor = that step, upd_base = its update
+number. The gradient sum buffers are allocated at start when M > 1 (no allocation after the first steps). The checkpoint's extra gains
+`"gns":{"g2","s","w","n"}` (the EMAs, with --gns) and `"accum","anchor","upd"` (auto only), appended last; a resume restores the EMAs and,
+under auto, the accumulation (anchor = the resume step: a partial sum at the checkpoint is dropped, as before).
+
+Tests: test_gns's controller traces (2 windows per step, start accum 5): B_noise 11 never moves it (11 < 12.5); 40 -> accum 10 at update
+1200 (warm 1000 + hold 200, x2 cap), 20 at 1700 (gap), then held (40 < 1.25 x 40); 150-update excursions above the threshold never change
+it; 1e4 -> 10, 20, 40, 64 at 1200 / 1700 / 2200 / 2700; 60 then 2 -> up, never down; a NaN every 150 updates holds it. test_accum.sh (5):
+the trainer with K 1000, warm 2, hold 1, gap 1 goes accum 2 -> 4 at step 6, 4 -> 8 at step 10, the checkpoint holds accum 8 / anchor 10
+/ upd 4, and a resume continues at accum 8 with the EMAs (step 20 = update 5).
+
+## Recompute and host offloads in scratch2: what the memory modes cost (2026-11-14, branch recomp-20261114)
+
+Goal: free device memory on the desk's 16 GB cards and spend it on less recompute / fewer host offloads (estimated 5-10 %).
+
+**P 1024 --split z (try5), the per-card plan** (UFSM_MEM_DRY=1 UFSM_MEM_REPORT=2 on the perf pod, `--gpus 0,0` = one card twice,
+UFSM_MEM_FREE_GB 13.66 = the desk card's free memory at the planner; the plan line matches try5's log: 11.59 of 13.16 GB):
+
+| part | GB |
+|---|---|
+| network (dry build, 136 x 256^2 cells): encoder a1 / a2 / GN + down outputs 2.65, decoder 1.44, gout / gskip 1.21, rest 0.08 | 5.38 |
+| task: head slabs 0.67, gpu-aug staging 1.16 (uint8 CT / labels), full-resolution input 1.14, latent head slab 0.29, label stream slab sets, split halo planes 0.27, +1/14 margin | 5.26 |
+| workspace (tb / 14) + fixed (550 MB) | 0.96 |
+| mode 4 (lean 2, chunked, shared a1 offloaded; 3.21 GB host offloads each way) | **11.59** |
+| the same without host offloads (encoder a1 re-run instead) | 13.89 |
+| mode 0 (no lean, no chunking, no offloads) | 23.39 |
+
+Weights, optimizer state, the on-the-fly phase / fibre / ink buffers took 2.76 GB before the planner; the cards ran at ~15.4 of 16.3 GB,
+so ~0.9 GB of real headroom: no offload-free mode fits at P 1024.
+
+**P 512 data parallel (try6, from 08:32)**: the per-card plan is 4.27 of 12.90 GB (cards 8.6 / 8.1 GB), so the fastest mode fits.
+Perf pod, one RTX PRO 4000, try6's flags on the wind fixture, UFSM_MEM_FREE_GB 12.9, UFSM_BENCH_SAME=1 (GPU time, the same batch),
+--det 1, 24 steps, s/step over the second half:
+
+| setting | s/step | peak device |
+|---|---|---|
+| --mem auto (lean 2, chunked, shared a1, 0.75 GB offloads each way) | 1.019, 1.012 | 7.15 GB |
+| --mem fast (picks "MX gradients, no host offloads") | 1.002, 1.000 | 8.41 GB |
+| --mem fast + UFSM_HEAD_SLAB_Z 32 | 1.004 | 8.90 GB |
+| --mem fast + UFSM_HEAD_SLAB_Z 64 | 1.011 | 9.88 GB |
+
+--mem fast: **-1.4 %** step for +1.26 GB per card; losses within the run-to-run spread (auto vs auto 2e-3 at step 5, the same for fast).
+The recompute left in every mode is recompute 1: GN + SiLU applied in the conv's operand staging (fused) and the decoder's upsampled
+part rebuilt, both cheap; UFSM_RECOMPUTE=0 is not supported with MX storage (aborts "MX storage needs MX inputs and outputs of one
+format"). The step is 75-85 % convolutions (UFSM_PROF), so the memory modes cannot give 5-10 % here. Larger head slabs: no gain.
+
+**P 768 data parallel (try6 from 09:01: accum 5, --onfly-slots 3 x 768 MB on GPU 0)**: GPU 0 has 11.04 GB free at the planner
+(15.75 of 16.3 GB used live). Plan at that free memory (UFSM_MEM_FREE_GB 11.04): auto / fast both pick lean 2 + chunked + offloads,
+9.70 GB (2.54 GB offloads each way); the smallest mode without offloads needs 11.51 GB (lean 2 + shared a1 re-run), mode 0 19.06.
+So --mem fast changes nothing at P 768 (it falls back, no refusal). Upper bound if it fit (pod uncapped, UFSM_MEM_FREE_GB 14, same
+batch, 20 steps): auto 3.421 s/step, peak 12.35 GB; fast (lean 1, no offloads) 3.414 s/step, peak 15.76 GB: **-0.2 %**.
+split3's bench_s2 sweep at the P 1024 split card share (128 x 256^2 cells, network only) agrees: each of the six offload / share
+switches and lean 1 within +-0.5 % (3.41-3.45 s); the offloads overlap the kernels.
+
+Use: MEMMODE=fast only where the window leaves ~1.3 GB spare (P 512: -1.4 %); at P 768 / 1024 keep --mem auto. No memory mode
+gains more than 2 % on this net: the remaining host-side cost is PCIe contention in the trainer (perf2's ~180 ms exposed), not the
+activation offloads or recompute.
+tests/bench_s2: one desk card's share of the P 1024 split trunk on one GPU (synthetic input; the unet env switches, BS2_CAP_GB ballast).
+## Two fast-tier failures on master: test_lldec pool 3, test_wbench_stats without bc (2026-11-14, branch fixtests-20261114)
+
+- test_lldec: the pooled codes views 8x deep (pool 3) returned rc -2 from phase_onfly_decode_gpu since 2dd6744 (band gpu, 11-13),
+  which changed tile_gpu's size guard into `k > 2` (no device path at 8x) while the walk above it and bg_codes_run take k <= 3 and
+  the test checks pool 3. Now `k > 3`: an 8x tile goes to the device again, and a box that does not fit the reserved slab buffer
+  still returns -1 (the CPU path) without allocating, as at 2x / 4x.
+- test_wbench_stats: the script built its B table with `bc -l`, which the pods do not have (the paired difference came out empty);
+  awk instead.
 
 ## Kernel fusion for scratch2: what is left to fuse, the head slabs (2026-11-14, branch fuse-20261114)
 
@@ -86,6 +217,23 @@ cell, no fp16 slab) was off for every --ink-head run by a blanket !g_ink2 in its
 fused normal / density group (2-8) and has its own targets and sums. Now on: the same dump byte-identical to the chain as well (the fp32
 re-association of the fused sums does not reach the fp16 planes on this window), step-1 loss equal, loss category 255 -> 219.5 ms.
 Together 279 -> 219.5 ms of ~2.72 s GPU time a step: -2.2 % at P 768 one card. UFSM_LAT_FUSE=0 turns the fused pass off as before.
+At P 512 (try6's per-card shape, the same config): loss 85.0 -> 68.4 ms of ~870 ms (UFSM_PROF sums), -1.9 %. What is left of the head /
+loss path at P 512 (nsys, share of kernel time): fstem_fwd_k 3.2 (both passes), conv1_to_mx_t_k 2.4 (perf2: the TC version), lat_fuse_k
+2.0, fstem_bwd_k 1.6, lat_adj_xy_k 1.5, w4_events_k + w4_runs_k 2.7, lat_up4_k 1.4, loss_grad_k + loss_stats_k 2.1, conv1_mx_tc_k 1.2,
+lab_unpack_k 1.0, ink_sym_k 0.9, the target builders (packed_mask, ink_tg, unwrap_tg, w4_stats / w4_grad) ~2.5.
+
+**The ink-MIL plane-bound overflow (try6, P 512 DP, step ~400).** "a slab's pairs exceeded its plane bound by 19064" was not the
+histogram (k_plane_hist and k_pairs run the same samp arithmetic, the same FFMA chain in the SASS) but the rays: in lean memory modes
+d->milr[1] aliased milr[0], and upload_async's mil_take copied the next window's rays on the copy stream before any of its stream
+waits, so they landed under the current step's backward slabs; the pairs came from other rays than fin's counts. With
+UFSM_MIL_ASYNC=0 (the readback) the run went on, with those steps' MIL gradient computed from the next window's rays. try5 (--split z, P 1024)
+was exposed the same way: its plan was lean 2 too (one ray buffer), and upload_async's split branches (upsplit / hsplit) also called
+mil_take before their waits; its logs hold no overflow line (try5-20261114/), so either no overlap reached the bound or the excess
+stayed within it: its MIL gradients were not checked. Now two ray
+buffers in every mode (+2.6 MB at 65536 rays), the copy waits for ev_done[i] (the step that last read buffer i), and an overflow
+reported by a later step switches every thread to the per-slab readback with a warning instead of exit(1). test_ink_mil: rays A for
+the passes and fin, rays B (6 planes away in z) copied over them before the backward slabs, then a step on B: the old code returned
+-1, now rc 0, one overflow counted, and the second step's gradient byte-equal to the readback's.
 
 ## Split peer copies off the copy engines (2026-11-14, branch peerk-20261114)
 

@@ -17,7 +17,7 @@ while [ ! -e $A/STOP ]; do
   [ -e $A/copy.pid ] && ! kill -0 $(cat $A/copy.pid) 2>/dev/null && { echo "$(date '+%m-%d %H:%M') copy finished: exit"; exit 0; }
   slow=""; fresh=0
   for r in "$@"; do
-    IFS=, read -r step _ _ _ _ _ _ _ _ _ sps w < <(tail -n 1 "$r/log.csv")
+    IFS=, read -r step _ _ _ _ _ _ _ _ _ sps w _ < <(tail -n 1 "$r/log.csv")
     [ "$step" = "${last[$r]}" ] && continue
     last[$r]=$step; fresh=1
     awk -v s=$sps -v b=${base[$r]} -v w=$w 'BEGIN{exit !(s < 0.97 * b || w > 3)}' && slow="$slow $(basename $r)@$step $sps/${base[$r]} wait $w"

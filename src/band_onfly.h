@@ -30,6 +30,7 @@ z3 *phase_onfly_fuse_open(z3 **sets, int n, float tol);
 /* process-wide: the pair rule on CUDA device gpu (-1: CPU) with `slots` concurrent tiles of at most budget_mb device bytes each
    (the tile edge follows from it); reserve 1 allocates the slots' device buffers now (before the trainer's memory planner looks). */
 int phase_onfly_config(int gpu, int slots, int budget_mb, int reserve);
+void phase_onfly_second_gpu(int gpu);   /* before phase_onfly_config: slots contexts on this device too, alternating (train --onfly-gpu A,B) */
 /* the tile edge (codes voxels, halo included) for rmax under the configured budget */
 int phase_onfly_tile_edge(float rmax);
 /* counters since the start: derived reads, tiles computed / skipped (no codes), output voxels, tile voxels, seconds in the pair rule

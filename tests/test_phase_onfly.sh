@@ -61,4 +61,8 @@ UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 "$U" train onfly.json --out of "${C[@]}" > of
 grep -q 'on-the-fly phase on GPU 0' of.log || { echo "FAIL: no onfly config line ($D/of.log)"; exit 1; }
 for f in st of; do grep '^step' $f.log | sed -E 's/ [0-9.]+ samp\/s.*//' > $f.txt; done
 [ -s st.txt ] && det_cmp st.log of.log "stored vs onfly phase" || exit 1
+# --onfly-gpu A,B (2026-11-14): the pair-rule contexts spread over two devices, taken round robin (here both on GPU 0): the same batches
+UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 "$U" train onfly.json --out o2 "${C[@]}" --onfly-gpu 0,0 --onfly-slots 2 > o2.log 2>&1 || { echo "FAIL: two-device onfly run ($D/o2.log)"; exit 1; }
+grep -q 'on-the-fly phase on GPUs 0 and 0, 2 slots' o2.log || { echo "FAIL: no two-device onfly config line ($D/o2.log)"; exit 1; }
+det_cmp st.log o2.log "stored vs onfly phase on two device slots" || exit 1
 echo "PASS: onfly phase byte-identical to phase-raster (CPU$( [ -f gpu.log ] && echo ', GPU')), training on it the same batches ($DET_CMP_N) and device inputs, losses within 2% ($(wc -l < st.txt) steps)"

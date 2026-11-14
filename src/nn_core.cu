@@ -629,6 +629,7 @@ extern "C" void nn_ptick_report(int steps) {
     for (int k = 0; k < g_ptn; k++) { fprintf(stderr, "  %-22s %9.2f ms  %5.1f%%  (%ld calls)\n", g_ptname[k], g_ptms[k] / steps, 100 * g_ptms[k] / tot, g_ptcnt[k] / steps); g_ptms[k] = 0; g_ptcnt[k] = 0; }
 }
 extern "C" size_t nn_mem_free(void) { size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); return f; }
+extern "C" size_t nn_mem_total(void) { size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); return t; }
 extern "C" void ufsm_no_verify_types(const char *fn) {
     fprintf(stderr, "%s: bf16 / fp32 tensor-core kernels are not in this build (rebuild with make VERIFY=1)\n", fn); abort();
 }

@@ -26,12 +26,15 @@ int phase_onfly_tile_edge(float rmax) {
     while (tile_bytes(E + 8) <= (double)g_budget_mb * (1 << 20)) E += 8;
     return E;
 }
+static int g_gpu2 = -1;
+void phase_onfly_second_gpu(int gpu) { g_gpu2 = gpu; }
 int phase_onfly_config(int gpu, int slots, int budget_mb, int reserve) {
     g_cpu_decode = getenv("UFSM_ONFLY_CPU_DECODE") && atoi(getenv("UFSM_ONFLY_CPU_DECODE"));
     g_gpu = gpu; g_slots = slots < 1 ? 1 : slots; g_budget_mb = budget_mb < 64 ? 64 : budget_mb;
     if (gpu < 0) return 0;
     if (!band_pair_gpu) return -1;   /* (a binary without nn_band.o) */
-    band_pair_gpu_slots(g_slots, gpu);
+    if (g_gpu2 >= 0 && band_pair_gpu_devices) { const int d[2] = {gpu, g_gpu2}; band_pair_gpu_devices(d, 2, g_slots); }
+    else band_pair_gpu_slots(g_slots, gpu);
     if (reserve && band_pair_gpu_reserve && band_pair_gpu_reserve(phase_onfly_tile_edge(0))) return -1;
     return 0;
 }
@@ -108,7 +111,7 @@ static int tile_gpu(z3 *codes, const int64_t co_[3], const int64_t cn_[3], const
         const int64_t e = (ro_[d] + rn_[d]) * (1 << k) < m->shape[d] ? (ro_[d] + rn_[d]) * (1 << k) : m->shape[d]; rn[d] = e - ro[d];
         if (rn[d] <= 0) return 2;
     }
-    if (k > 2) return -2;   /* (the base box, 8^k the tile's voxels, decoded and pooled in z slabs of the reserved slab buffer: nn_band.cu bg_codes_run; before 2026-11-13 boxes above 2x --onfly-mb took the CPU) */
+    if (k > 3) return -2;   /* (k <= 3 as the walk above; 2dd6744 had k > 2, which sent every 8x tile to the CPU and failed test_lldec pool 3) (the base box, 8^k the tile's voxels, decoded and pooled in z slabs of the reserved slab buffer: nn_band.cu bg_codes_run; before 2026-11-13 boxes above 2x --onfly-mb took the CPU) */
     onfly_pack *K = &t_pk; K->n = 0; K->nch = 0;
     for (int64_t cz = ro[0] / 128; cz * 128 < ro[0] + rn[0]; cz++) for (int64_t cy = ro[1] / 128; cy * 128 < ro[1] + rn[1]; cy++) for (int64_t cx = ro[2] / 128; cx * 128 < ro[2] + rn[2]; cx++) {
         uint8_t *buf = nullptr; size_t len = 0; const int r = z3_chunk_raw(base, cz, cy, cx, &buf, &len);
