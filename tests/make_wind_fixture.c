@@ -21,6 +21,8 @@ static uint8_t fx_ct_at(int z, int y, int x) {
     double cy, cx; fx_axis_at(z, &cy, &cx);
     const double r = hypot(y - cy, x - cx);
     if (r > .47 * fx_N) return 0;
+    static double zcut = -1; if (zcut < 0) zcut = getenv("FX_CT_ZCUT") ? atof(getenv("FX_CT_ZCUT")) : 2;   /* FX_CT_ZCUT=f: CT 0 from plane f N up (air with labels: the skip-empty A/B, DESIGN 2026-11-14) */
+    if (z >= zcut * fx_N) return 0;
     const double w = fx_wind(z, y, x), f = w - floor(w);
     const uint32_t h = (uint32_t)(((uint64_t)z * 73856093u) ^ ((uint64_t)y * 19349663u) ^ ((uint64_t)x * 83492791u)) * 2654435761u;
     const int noise = (int)(h >> 27) - 16;
