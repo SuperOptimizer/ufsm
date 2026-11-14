@@ -6,6 +6,44 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Unroll geometry error budget: masked-CT gate, cf-demod (z drift, demod-only ref), GT boxes in the check stage (2026-11-14, branch ugeomfix-20261114)
+
+Audit `/vesuvius/ufsm/audit-20261114/ugeom.md` (1667 vs the published tifxyz, held-out GT boxes on 1667 / Paris 4). Its numbers, and what changed:
+- **Masked CT** (#1): 16.2 % of the published 1667 surface lies on zero CT of the fields' `-masked` store (cov50 there 0.19 vs 0.899),
+  13.1 of the 21.5 missing cov50 points; 80 % of it within 1 mm of the mask edge. `wrap-snap` already counted our vertices on masked CT
+  (1667-u1 0.182, w96 0.205, 1299 0.070, P4 0.057); now `--masked-warn 0.02` prints a WARNING above it and `--masked-max F` (off)
+  fails with exit 3 before writing; `unroll.sh` logs an ALARM above MASKWARN (0.02), MASKMAX passes `--masked-max`. The data fix (a
+  filled 1667 store) is pub1667's; `scripts/spiralqa/ugeom/after_mega.sh filled` measures it.
+- **Where the integers go wrong** (#2): `fit --model X --codes --cpu` on the 70 held-out 1667 C boxes (`scripts/spiralqa/ugeom/gtboxes.sh`).
+  Voxel-weighted over the 54 boxes without label noise:
+
+  | model | ids right | \|err\| < 0.08 | \|err\| median |
+  |---|---|---|---|
+  | ref-cf (count-field) | 0.840 | 0.214 | 0.170 |
+  | joined (slab fits + join) | 0.835 | 0.306 | 0.116 |
+  | cf-demod --L 16 --R 1 (ref + the phase's sub-turn) | 0.807 | 0.263 | 0.131 |
+  | cf-demod --L 8 --R 1 | 0.801 | 0.288 | 0.118 |
+  | cf-demod --L 8 --R 1 --cmax 0.3 | 0.827 | 0.225 | 0.162 |
+
+  The slabs change no integers net (0.840 -> 0.835) and give the sub-turn. The demod-only ref (`ufsm cf-demod --out`, 6 min CPU on 1667
+  vs 658 s of slab fits) reaches the slabs' sub-turn only by flipping ~3.4 % of the integers (the phase half a turn off the ref rounds
+  either way); clamped it keeps the integers and loses most of the sub-turn. So the slabs stay; `unroll.sh DEMOD=1` (DEMODR, DEMODL 8)
+  is an opt-in path, off. Paris 4 (PH1-3): ref 0.185 / 0.208 / 0.122 vs joined 0.184 / 0.197 / 0.125.
+- **z drift** (#5): P4's per-band integer gauge against the GT drifts 0 -> 3 turns over ~5 cm of height while wrap-check (0.976) and the
+  join (0.964) pass. `ufsm cf-demod MODEL FIELDS` prints, per z band, the confidence-weighted residual phasor of phi - W and the mean
+  derivative of W along the sheet's vertical tangent (n from the fields) summed along z; the excursion over the bands holding >= 1/4 of
+  the fullest band's weight is the drift. ref-cf: P4 2.06 turns, 1667 0.40 (step 8 / 2, bands of 128 rows; 6 min CPU each). The
+  residual phasor's band coherence is 0.01-0.5 and does not separate them. The along-sheet number ranks the two runs as the GT does but
+  its bands do not line up with the GT's gauge steps: an alarm, not a locator. `unroll.sh` check runs it on the ref (DRIFT=1), ALARM
+  above DRIFTWARN 0.75, DRIFTMAX fails; with GTBOXES + GTCODES it also scores joined / ref-cf on GT boxes (the only check that sees
+  identity). The packed-region count-field variants (`--rho-pow`, `--rho-scale`, `--phase-w`) on the P4 boxes: `after_mega.sh packed`.
+- **Diagnostics**: count-field's closing error is real, not a unit slip (0.003 turns on test_countfield's synthetic spiral; 1.2-3.1
+  turns mean on the four runs, uncorrelated with GT quality); "phase / W agreement" now says n/a under `--R 0` (it printed 0.000); the
+  join's ref-share and overlap agreement are labelled self-consistency. Slab coherence vs published identity: Spearman 0.07.
+- Tests: test_countfield (cf-demod: a 0.3-turn sub-turn error restored to 0.000 with 0 integer changes, also on a 2x refined lattice;
+  a W rising 0.1 turn per voxel of height trips `--drift-max`), test_wrapsnap (`--masked-max` 0.01 fails with nothing written, 0.2
+  passes). Analysis scripts: `scripts/spiralqa/ugeom/` (surfcmp.py by pub1667, pubcmp.sh, budget / bins tables, gtboxes.sh).
+
 ## Derived-cache keys carry the label code's version (2026-11-14, branch dckey-20261114)
 
 The dcache audit (/vesuvius/ufsm/audit-20261114/targeted/dcache.md) found every disk cache of labels keyed by its inputs only: a fix to

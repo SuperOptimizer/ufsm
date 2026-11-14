@@ -65,6 +65,17 @@ int main(void) {
                       "--sigma", "120,60,30", "--tau", "40,25,15", "--sfc", "0.01", "--band", "16", "--threads", t ? "4" : "1"};
         CHECK(!cmd_wrap_snap((int)(sizeof av / sizeof *av), av), "wrap-snap failed");
     }
+    {   /* --masked-max (audit ugeom #1): ~5 % of these vertices sit on masked CT: 0.01 fails (exit 3) before anything is written, 0.2 passes */
+        char in[300], out[300], ax[300], ct[300]; snprintf(in, sizeof in, "%s/in", root); snprintf(out, sizeof out, "%s/outm", root);
+        snprintf(ax, sizeof ax, "%s/axis.json", root); snprintf(ct, sizeof ct, "%s/ct", root);
+        for (int t = 0; t < 2; t++) {
+            char *av[] = {"ufsm", "wrap-snap", in, out, "--axis", ax, "--axis-um", "9.6", "--ct", ct, "0", "--ct-um", "9.6", "--range", "60",
+                          "--sigma", "120,60,30", "--tau", "40,25,15", "--sfc", "0.01", "--band", "16", "--threads", "2", "--masked-max", t ? "0.2" : "0.01"};
+            const int rc = cmd_wrap_snap((int)(sizeof av / sizeof *av), av);
+            snprintf(cmd, sizeof cmd, "[ $(ls %s 2>/dev/null | wc -l) = %d ]", out, t ? 6 : 0);
+            if (!(rc == (t ? 0 : 3) && !system(cmd))) { fprintf(stderr, "FAIL: --masked-max %s: rc %d (want %d) or wraps written\n", t ? "0.2" : "0.01", rc, t ? 0 : 3); fails++; }
+        }
+    }
     snprintf(cmd, sizeof cmd, "cd %s && for f in out0/*.sfc; do cmp -s $f out1/${f#out0/} || exit 1; done && [ $(ls out0 | wc -l) = 6 ]", root);
     CHECK(!system(cmd), "wrap-snap output differs between 1 and 4 threads (or wraps missing)");
     double sum0 = 0, sum1 = 0; long n = 0, nmask = 0, maskmoved = 0, order = 0, zmoved = 0, angmoved = 0;

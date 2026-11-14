@@ -257,6 +257,7 @@ static int usage(void) {
         "  ufsm fields-oracle <fields-dir> <phase-root> <phase-key> <out-dir>   fit fields with the phase planes from a label phase raster (oracle / swap)\n"
         "  ufsm count-field <in-fields> <out-fields> [--method ls|ray] [--R 3] [--model DIR]   winding from the density counts, the phase only sub-turn (src/countfield.c)\n"
         "  ufsm cf-compare <model-a> <model-b> [fields] [--step 4]   two count-field models: delta and snap-integer agreement (src/countfield.c)\n"
+        "  ufsm cf-demod <model> <fields> [--out DIR] [--R 1] [--band 64] [--drift-max D]   label-free z drift of a model vs the sheets; --out: the model + the phase's sub-turn\n"
         "  ufsm count-anat <dump5> <out-prefix> --gauge G --cy CY --cx CX [--ct ROOT KEY --ct-um U --org Z,Y,X]   GT integer-error anatomy of one z range (fit --score-dump with UFSM_SCORE_DUMP_U=1; src/countanat.c)\n"
         "  ufsm vwt-sample SOURCES OUT N   ray-model training slabs + targets (im / va / ph / comp / pw raw) and the sampler throughput\n"
         "  ufsm ray-check WINDINGS.json FIELDS   turn counts of a field set between human relative-winding ray points (phase / density)\n"
@@ -4771,6 +4772,7 @@ int cmd_vwt_sample(int argc, char **argv);   /* src/vwt_sample.c */
 int cmd_hires_count(int argc, char **argv);
 int cmd_spiral_fit(int argc, char **argv);    /* src/countfield.c */
 int cmd_cf_compare(int argc, char **argv);    /* src/countfield.c */
+int cmd_cf_demod(int argc, char **argv);      /* src/countfield.c */
 int cmd_count_anat(int argc, char **argv);    /* src/countanat.c */
 int cmd_phase_packing(int argc, char **argv);   /* src/packmap.c */
 int cmd_field_diag(int argc, char **argv);   /* src/fielddiag.c */
@@ -4846,6 +4848,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "hires-count")) return cmd_hires_count(argc, argv);
     if (!strcmp(cmd, "spiral-fit")) return cmd_spiral_fit(argc, argv);
     if (!strcmp(cmd, "cf-compare")) return cmd_cf_compare(argc, argv);
+    if (!strcmp(cmd, "cf-demod")) return cmd_cf_demod(argc, argv);
     if (!strcmp(cmd, "count-anat")) return cmd_count_anat(argc, argv);
     if (!strcmp(cmd, "phase-packing")) return cmd_phase_packing(argc, argv);
     if (!strcmp(cmd, "field-diag")) return cmd_field_diag(argc, argv);

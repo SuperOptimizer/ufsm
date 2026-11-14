@@ -23,6 +23,9 @@
 #   slabs   -> ref: snapped slab fits, FITLANES lanes per GPU in FITGPUS ("0 1"; auto: by device memory, 1..3); the INKGPU lanes start once the ink is done; then the
 #           bad-slab check (fit.log: "illegal memory", "loss 0.00000", no final loss line): refit on 1 lane, up to 3 tries, else fail
 #   join    -> slabs: fit-join --ref (refuses bad slabs) ; check -> join: wrap-check (wrapcheck.tsv verdicts; 0 CT peaks = fail)
+#           check also runs cf-demod on the ref (DRIFT=1: the label-free z drift of the sheet identity, ALARM > DRIFTWARN 0.75 turn,
+#           DRIFTMAX fails) and, with GTBOXES + GTCODES, scores joined / ref-cf on GT boxes (scripts/spiralqa/ugeom/gtboxes.sh, CPU).
+#           DEMOD=1 (off): no slab fits; join = cf-demod --out of the ref (the ref's integers, the phase's sub-turn; DEMODR nodes)
 #   wraps   -> check: ufsm wraps (.sfc, step 4, --zr from scrolls.tsv, --min-cm2, --col-r p90)
 #   trim    -> wraps: from both ends, wraps beyond the wrap-check table, with collapsed gaps (rnet_med < RNETMIN 0.6) or near-empty (on-papyrus
 #           <= PAPMIN 0.1; surf-stats) dropped: strip --first / --last = the first kept ids (state/strip.args; per-wrap inputs state/trim.tsv,
@@ -30,6 +33,7 @@
 #   snap    -> trim (SNAP=1 default; SNAP=0 off): ufsm wrap-snap wraps -> wraps_snap: each wrap moved along its rays onto the sheets
 #           (smooth per-wrap offsets, order kept: never past half the gap to its neighbours, never into masked CT; SNAPT target, SNAPX
 #           extra flags); the strip and its renders then use wraps_snap. CLEAN runs after it (the phase / mix targets read the fields)
+#           ALARM in progress.log when > MASKWARN (0.02) of the wrap vertices lie on masked CT (the scan mask clips sheets); MASKMAX fails
 #   strip   -> snap: ufsm strip ($STRIPARGS + --last) ; stripflat -> strip: strip-flatten (FLATX, default "--gpu 1"; FLATX= for the CPU) ;
 #   distort -> stripflat: strip-distort (the flattening's stretch / folds) as a gate: dist p95 <= DISTP95 (0.35), folded <= DISTFOLD (0.005), no
 #           skipped strip-flatten chunk, else the stage fails (DISTGATE=0: logged only); overlays in strip/distort
@@ -433,6 +437,9 @@ fitlanes() {
 }
 slabs() {
   local g pids=() ng lanes
+  # DEMOD=1 (off by default; audit ugeom #2: the slab fits change no integers on the 1667 / P4 GT boxes, only the sub-turn): no slab
+  # fits; join takes the ref's integers and the phase's sub-turn (ufsm cf-demod --out, DEMODR nodes)
+  [ "${DEMOD:-0}" = 1 ] && { log "slabs: skipped (DEMOD=1: join = cf-demod of the ref)"; return 0; }
   # fit threads per lane: the host's CPUs over the lanes (fits are thread-count independent: 0490B s020/s021 models equal at 10 / 20;
   # 1 lane 10 -> 20 threads: 8 slabs 163 -> 150 s; 2 lanes per 16 GB GPU with the GPU lock: 156 s, so 1 lane there; 96 GB: 3, fitlanes)
   lanes=$(fitlanes); [ "$DRY" = 1 ] && echo "    slab lanes (GPU per lane): $lanes"
@@ -469,6 +476,9 @@ badslabs() {
 }
 join() {
   local args=() d c0 c1 a b bad
+  if [ "${DEMOD:-0}" = 1 ]; then [ "$DRY" = 1 ] || rm -rf $O/joined
+    X $O/logs/join.log $U cf-demod $REF $F --out $O/joined --R ${DEMODR:-1} --L ${DEMODL:-8} --step ${DEMODSTEP:-2} --threads $TH || return 1
+    [ "$DRY" = 1 ] || log "join: DEMOD=1: $(grep '^cf-demod: demodulated' $O/logs/join.log | tail -1)"; return 0; fi
   if [ "$DRY" = 1 ]; then X $O/logs/join.log $U fit-join $O/joined $F --blend 16 --ref $REF "slabs/sNNN/fit 2c0 2c1 ..."; return; fi
   bad=$(badslabs); [ -z "$bad" ] || { log "join: REFUSED: bad slab fits $(for d in $bad; do basename $d; done | tr '\n' ' ')(rm state/slabs.done to refit)"; return 1; }
   for d in $(ls -d $O/slabs/s??? | sort); do [ -e $d/done ] || return 1; [ -e $d/empty ] && continue; read -r c0 c1 a b < $d/cells; args+=($d/fit $((2 * c0)) $((2 * c1))); done
@@ -484,6 +494,23 @@ check() {
     { log "check: wrap-check found no CT peaks (empty share ~1 on every wrap): wrong --ct-um $LUM or CT level $K/$LV?"; return 1; }
   mv $O/wrapcheck.tsv.tmp $O/wrapcheck.tsv
   log "check: $(grep -E '^wrap-check: verdicts' $O/logs/check.log | tail -1)"
+  # the ref's z drift against the sheets (audit ugeom #5: P4's integers drifted 3 turns over ~5 cm of height and every gate passed):
+  # ufsm cf-demod (label-free, CPU; DRIFT=0 off): ALARM above DRIFTWARN turns of along-sheet excursion; DRIFTMAX: fail above it
+  if [ "${DRIFT:-1}" = 1 ]; then
+    X $O/logs/drift.log $U cf-demod $REF $F --step ${DRIFTSTEP:-8} --band 128 --cz 16 --threads $TH ${DRIFTMAX:+--drift-max $DRIFTMAX}
+    local rc=$?; [ "$DRY" = 1 ] && return 0
+    local dl; dl=$(grep '^cf-demod: z drift' $O/logs/drift.log | tail -1); log "check: ${dl#cf-demod: }"
+    local ex; ex=$(echo "$dl" | sed -nE 's/.*along-sheet excursion ([0-9.]+) turns.*/\1/p')
+    [ -n "$ex" ] && awk -v e=$ex -v w=${DRIFTWARN:-0.75} 'BEGIN { exit !(e > w) }' && log "check: ALARM: the ref drifts $ex turns along the sheets over z (> DRIFTWARN ${DRIFTWARN:-0.75}): sheet identity changes with height"
+    [ $rc = 3 ] && { log "check: FAILED: z drift above DRIFTMAX $DRIFTMAX"; return 1; }
+  fi
+  # GT boxes (GTBOXES = a wbench-format tsv in fields-native voxels, GTCODES = "ROOT KEY"; off unless both are set): the joined model and
+  # the ref scored on them (CPU): the only check here that sees sheet identity (wrap-check and the join agreement pass P4 at GT ids 0.18)
+  if [ -n "${GTBOXES:-}" ] && [ -n "${GTCODES:-}" ] && [ "$DRY" != 1 ]; then
+    local gb=$REPO/scripts/spiralqa/ugeom/gtboxes.sh m
+    for m in joined ref-cf; do MKCROP=$MKCROP bash $gb $F $O/$m $GTBOXES $GTCODES $O/qa/gtboxes-$m $U > $O/logs/gtboxes-$m.log 2>&1 &&
+      log "check: GT boxes, $m: $(tail -1 $O/logs/gtboxes-$m.log)" || log "check: GT boxes, $m: failed (logs/gtboxes-$m.log)"; done
+  fi
 }
 wraps() {
   local zr=; [ -n "$ZR" ] && [ "$ZR" != - ] && zr="--zr $ZR"
@@ -579,8 +606,13 @@ snap() {
     # there (UFSM_GPU_DECODE, byte-identical to the CPU's; ~45% of wrap-snap's CPU time was the volcomp decode)
     local sg=${SNAPGPU-$(for g in $FITGPUS; do [ "$g" != "$INKGPU" ] && { echo $g; break; }; done)}
     X $O/logs/snap.log env ${sg:+UFSM_GPU_DECODE=1 UFSM_GPU_DECODE_DEV=$sg} $U wrap-snap $O/wraps $O/wraps_snap --target $t --axis $O/axis.json --axis-um $UM --ct $R $K/$LV --ct-um $LUM \
-      --fields $F --threads $TH $sel ${SNAPX:-} || return 1
+      --fields $F --threads $TH $sel ${MASKMAX:+--masked-max $MASKMAX} ${SNAPX:-} || return 1
     [ "$DRY" = 1 ] || log "snap: $(grep '^wrap-snap: solve' $O/logs/snap.log | tail -1)"
+    # the CT mask clipping the surface (audit ugeom #1: 1667's -masked store zeroed the outer sheets, 16 % of the published surface; 0.18
+    # of our wrap vertices sat on masked CT): ALARM above MASKWARN (0.02) in progress.log; MASKMAX (env, default off) makes wrap-snap fail
+    [ "$DRY" = 1 ] || { local ms; ms=$(sed -nE 's/.* ([0-9.]+) on masked CT.*/\1/p' $O/logs/snap.log | tail -1)
+      [ -n "$ms" ] && awk -v m=$ms -v w=${MASKWARN:-0.02} 'BEGIN { exit !(m > w) }' &&
+        log "snap: ALARM: $ms of the wrap vertices lie on masked CT (> MASKWARN ${MASKWARN:-0.02}): the scan mask clips the surface; the fields had no input there (unmasked / dilated CT store)"; }
   else log "snap: off (SNAP=0)"; fi
   [ "$DRY" = 1 ] || { [ "${CLEAN:-1}" = 1 ] && { find $F -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; [ $F = $O/fields/$FNAME ] || find $O/fields/$FNAME -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; rm -rf $O/slabs/s???/fit; }; }
   return 0
