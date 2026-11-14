@@ -4,6 +4,8 @@
 # grids (origin 0 and 256), each head blended with ufsm ink-blend (sin^2 tile weights, tile 512) -> OUT (ink, key = the level's um) and
 # O/ink/c12.zarr, O/ink/c13.zarr (p_recto, p_verso; strip_refill.sh gates the rendered ink by max of the two when INKGATE names them).
 # The grid-256 pass writes 256 shards (inkB 11-13: with 512 shards each shard overlapped 8 shifted windows, ~7x the windows of grid 0).
+# LATWROUND=1 (OFF by default; infer audit #8): predict --window-round 1, 544 / 16 -> 640 / 64 with the same 512 interior for nets whose
+# window must be a multiple of 128 (scratch2, nlev 6); a no-op for u1-class nets. Needs a predict with --window-round (inferfix).
 # Env: LATINK_CK (default /root/pod/ckpt/inkpod-9000.ckpt), ITH (threads).
 set -u
 O=${1:?}; G=${2:-0}; OUT=${3:?}; U=${U:-/root/pod/ufsm/build/ufsm}; CK=${LATINK_CK:-${POD:-/root/pod}/ckpt/inkpod-9000.ckpt}
@@ -26,7 +28,7 @@ for g in 0 256; do
   [ -e $T/g$g.done ] && continue; rm -rf $T/g$g
   # (--q 0 --levels 1: the passes are blended into OUT by ink-blend, which reads level 0 only; their own pyramid / quantisation was thrown away)
   $U predict $CK $R $K $T/g$g --um $UM --level $LV --box $(pbox $g) --full-grid 1 --occupancy $((LV + 3)) --heads ink,c12,c13 --gpu $G --threads $TH --shard $([ $g = 256 ] && echo 256 || echo 512) \
-    --window 544 --halo 16 --grid-origin $g,$g,$g --axis $O/axis.json --q 0 --levels 1 || { echo "latink: predict grid $g failed"; exit 1; }
+    --window 544 --halo 16 $([ "${LATWROUND:-0}" = 1 ] && echo --window-round 1) --grid-origin $g,$g,$g --axis $O/axis.json --q 0 --levels 1 || { echo "latink: predict grid $g failed"; exit 1; }
   for h in ink c12 c13; do [ -e $T/g$g/$h/zarr.json ] || { echo "latink: no $h in $T/g$g"; exit 1; }; done
   touch $T/g$g.done
 done

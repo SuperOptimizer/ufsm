@@ -796,6 +796,10 @@ void nn_pred_input_d(const uint8_t *ct, int D, int W, float mean, float isd, con
 void nn_pred_place_d(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 void nn_pred_place_m_d(const float *lg, const uint32_t *bits, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 void nn_pred_stats(const uint8_t *ct, size_t n, void *scratch, size_t *nz, double *sum, double *sq);   /* exact window stats (scratch: 24 B device) */
+/* the same split in two: _start enqueues the sums and their copy to pinned host memory (no wait), _finish waits for that copy only, so the
+   host prepares the window's axis rows meanwhile instead of stalling on a blocking copy (one pending start per process and device) */
+void nn_pred_stats_start(const uint8_t *ct, size_t n, void *scratch);
+void nn_pred_stats_finish(size_t *nz, double *sum, double *sq);
 void nn_pred_ctmask(const uint8_t *ct, size_t n, uint32_t *bits);   /* CT != 0 as bits ((n + 31) / 32 words) */
 void nn_pred_ctmask_t(const uint8_t *ct, size_t n, uint32_t *bits, int t);   /* predict --iso: bits of CT >= t */
 void nn_set_pred_iso(int t);

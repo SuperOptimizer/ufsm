@@ -150,7 +150,7 @@ mstart() {
   if [ -n "${INKCMD:-}" ]; then mset inkcmd "$INKCMD"; mset ink_ck "${LATINK_CK:-the default of INKCMD}"; [ -n "${LATINK_CK:-}" ] && mset ink_ck_sha "$(fsha $LATINK_CK)"
   else mset ink_ck "$(readlink -f $INKCK)"; mset ink_ck_sha "$(fsha $INKCK)"; fi
   mset box "${BOX:-mask}"; mset zr "${ZR:--}"; mset stripargs_env "${STRIPARGS:-}"
-  mset env "$(for v in CK INKCK INKCMD LATINK_CK FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
+  mset env "$(for v in CK INKCK INKCMD LATINK_CK FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FBLEND ONEPASS OPWIN FCTR FCTK LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
 }
 mstage() {
   [ "$DRY" = 1 ] && return 0
@@ -198,10 +198,22 @@ occlv() {   # --occupancy L for the fields: the first of levels LV+3, LV+2, LV+4
                      *) [ -e $R/$K/$l/zarr.json ] && { echo "--occupancy $l"; return; };; esac
   done
 }
+# FCTR / FCTK (default the run's CT): another CT root / key for the fields predict only, e.g. an unmasked or dilated-mask scan (audit-ugeom
+# 2026-11-14: 16.2 % of the published 1667 surface lies on zero (masked) CT, the outer turns clipped at the mask edge)
 # FBLEND=1 (OFF by default; audit 2026-11-14 #5, A/B pending): each part predicted on two tile grids (origin 0 and half the stride) and
 # blended with ufsm field-blend --tile (sin^2 weights: every cell leans on the window it sits deep inside), against the tile-border steps of
 # the single-grid fields (1667 u1 640/64: the normal plane t0 steps 4-5x its interior median at every 256-cell border). Lat fields only.
+# ONEPASS=1 (OFF by default; infer audit #8, A/B after the mega pass): the fit fields AND the ink heads (ink, c12, c13) from ONE predict
+# per z part: window 1152 / halo 64, --seam-inproc 1 (the heads blended over two tile grids on the GPU, the fields from grid 0),
+# heads full-grid into $O/ink/onepass (the parts' shards coexist); the ink stage then only links ink / c12 / c13. ~40 % less GPU time
+# (estimate: 2.85x computed voxels per occupied voxel against ~4.5-5.9x). Needs a predict with --seam-inproc + --fit-zarr (inferfix).
+onepass_on() { [ "${ONEPASS:-0}" = 1 ] && [ "$FKIND" = lat ] && [ "$INKMODE" = lat ]; }
 fpred() {   # fpred GPU BOX OUT
+  if onepass_on; then
+    X $O/logs/fields.log $U predict $CK $R $K $O/ink/onepass --um $UM --level $LV --box $2 --full-grid 1 --shard 512 --window ${OPWIN:-1152} --halo 64 \
+      --seam-inproc 1 --heads ink,c12,c13 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --axis $O/axis.json $(occlv) --q 8 --levels 4 \
+      --threads ${PTH:-14} --gpu $1 --ema 1 && { [ "$DRY" = 1 ] || [ -e $3/fields.json ]; }; return
+  fi
   if [ "${FBLEND:-0}" = 1 ] && [ "$FKIND" = lat ]; then
     local st=$(( ${LWIN:-640} - 2 * ${LHALO:-64} )) gg
     for gg in 0 $((st / 2)); do fpred1 $1 $2 $3.g$gg $gg || return 1; done
@@ -213,7 +225,7 @@ fpred() {   # fpred GPU BOX OUT
 fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windows anchored at GRID (each axis)
   local win; if [ "$FKIND" = lat ]; then win="--window ${LWIN:-640} --halo ${LHALO:-64}"
   else win="$([ "${FWIN:-prod}" = auto ] && echo "--window auto" || echo "--window-z 384 --halo-z 64 --window 640") --halo 64"; fi
-  X $O/logs/fields.log $U predict $CK $R $K $3.tmp --um $UM --level $LV --box $2 $win --shard 512 \
+  X $O/logs/fields.log $U predict $CK ${FCTR:-$R} ${FCTK:-$K} $3.tmp --um $UM --level $LV --box $2 $win --shard 512 \
     --grid-origin $4,$4,$4 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
@@ -223,7 +235,7 @@ fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windo
 # the box rows in OUT/rows.ready) and runs count-field --pool-only --follow on it: the chunks in the parts' order, each once its rows are
 # written. The pooled sums equal a whole-box pass 1 (per chunk, disjoint solve rows; the prior from the middle row's chunk; the chunk
 # rows fixed by refcz in both runs), so the ref (--pool-cache) is byte-identical to the stage-barrier ref with those chunk rows.
-refstream_on() { [ "${REFSTREAM:-1}" = 1 ] && [ "${FBLEND:-0}" != 1 ] && [ "$FKIND" = lat ] && [ "${RECTOSP:-1}" = 0 ] && [ "${CTCAL:-0}" != 1 ] && [ -z "${REFCMD:-}" ] && [ "$DRY" != 1 ]; }
+refstream_on() { [ "${REFSTREAM:-1}" = 1 ] && [ "${FBLEND:-0}" != 1 ] && ! onepass_on && [ "$FKIND" = lat ] && [ "${RECTOSP:-1}" = 0 ] && [ "${CTCAL:-0}" != 1 ] && [ -z "${REFCMD:-}" ] && [ "$DRY" != 1 ]; }
 refstream() {   # refstream OUT PART..
   local S=$1; shift; local parts=("$@") k p pl z a b n=0 starts=() fs cz cfp=
   rm -rf $S $S.fin $O/ref.pool $O/ref.pool.ok; mkdir -p $S
@@ -342,7 +354,7 @@ rectosp() {
 # run on GPU INKGPU beside the ref (INKAT=slabs) while the main pass waits for the slabs. INKCMD: nothing (the recipe does its own).
 # INKCALZ: the band's rows (2048; P4: 505 windows, 148 s)
 inkcal() {
-  [ -n "${INKCMD:-}" ] && return 0
+  { [ -n "${INKCMD:-}" ] || onepass_on; } && return 0
   [ "$DRY" = 1 ] || mkdir -p $O/ink
   local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
   cal=$(echo $box | awk -F, -v cz=${INKCALZ:-2048} '{ zc = $1 + int($4 / 2); z0 = zc - int(cz / 2); if (z0 < $1) z0 = $1; nz = cz; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
@@ -355,6 +367,11 @@ ink() {
   # INKCMD set but empty (a pod env with an unset path, "INKCMD=$X"): fail loudly instead of falling back to the default prediction;
   # any INKCMD must leave a readable zarr at $INK (a dangling link from a missing published ink fails here, not in the renders)
   if [ -n "${INKCMD+x}" ] && [ -z "${INKCMD// /}" ]; then log "ink: INKCMD is set but EMPTY: refusing (unset it for the default feathered ink)"; return 1; fi
+  if onepass_on; then   # (ONEPASS: the heads came with the fields) link them where the strip and its gate read them
+    [ "$DRY" = 1 ] && { echo "    (ONEPASS: link $O/ink/onepass/{ink,c12,c13})"; return 0; }
+    local h; for h in ink c12 c13; do [ -e $O/ink/onepass/$h/zarr.json ] || { log "ink: ONEPASS: no $h in $O/ink/onepass"; return 1; }; done
+    rm -rf $INK $O/ink/c12.zarr $O/ink/c13.zarr; ln -s onepass/ink $INK; ln -s onepass/c12 $O/ink/c12.zarr; ln -s onepass/c13 $O/ink/c13.zarr; return 0
+  fi
   if [ -n "${INKCMD:-}" ]; then UNROLL_CT="$R|$K|$UM|$LV" X $O/logs/ink.log $INKCMD $O $INKGPU $INK || { log "ink: INKCMD '$INKCMD' failed (logs/ink.log)"; return 1; }
     [ "$DRY" = 1 ] || [ -e $INK/zarr.json ] || { log "ink: INKCMD '$INKCMD' left no zarr at $INK (zarr.json missing; dangling link?)"; return 1; }
     return 0; fi
@@ -597,6 +614,9 @@ distort() {
 # (grey <s>_ct.jpg + <s>_ink.jpg per stripe) and img_pap (papyrus look, --papyrus-dir, same reads), renders removed after the mosaic. UFSM_RENDER_GPU_MEM 4 (GB):
 # the render's device chunk pool stays small enough for a slab fit sharing the GPU (pods, two scrolls); RGPU: CUDA device of the renders
 FILLX=${FILLX:---fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 0}
+# inkgate: the latent ink head's c12 / c13 (p_recto / p_verso) beside the ink, for strip_refill.sh's papyrus gate (the latent-ink policy:
+# blended + papyrus-gated); none (ift3, or a run without them): ungated. INKGATE=0 off
+inkgate() { [ "${INKGATE:-1}" = 0 ] && return 0; [ -e $O/ink/c12.zarr/zarr.json ] && [ -e $O/ink/c13.zarr/zarr.json ] && echo "$O/ink/c12.zarr $O/ink/c13.zarr"; return 0; }
 stripimg() {
   local ST=$O/strip RF=$O/strip/render_fill S N k s
   local E="UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_ZCACHE_ADMIT=${ZCACHE_ADMIT:-0.6} UFSM_JPEG_THREADS=$JPEGT UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} UFSM_RENDER_MEM=${UFSM_RENDER_MEM:-16} ${RGPU:+CUDA_VISIBLE_DEVICES=$RGPU}"
@@ -621,7 +641,7 @@ stripimg() {
   # RJOBS: 2 stripe renders at once when >= 64 GB is available (0490B: 394 -> 355 s, 6.7 -> 18.4 GB RSS, same images), else 1
   local rj=${RJOBS:-$([ $(availgb) -ge 64 ] && echo 2 || echo 1)}
   env $E U=$U CTR=$R CTK=$K/$LV INK=$INK INKK=$LUM RJOBS=$rj RENDER_NT=${RENDER_NT:-$TH} MOS_NT=${MOS_NT:-4} MAXR=${MAXR:-6} MEMGB=${RMEMGB:-0} \
-    PAPMOS=$ST/img_pap PGAIN=${PGAIN:-1} PAPPX=${PAPPX:-8000} FILLX="$FILLX" /usr/bin/time -v bash $REFILL $ST >> $O/logs/stripimg.log 2>&1 &&
+    PAPMOS=$ST/img_pap PGAIN=${PGAIN:-1} PAPPX=${PAPPX:-8000} FILLX="$FILLX" INKGATE="$(inkgate)" /usr/bin/time -v bash $REFILL $ST >> $O/logs/stripimg.log 2>&1 &&
     [ -e $ST/img_fill/overview.jpg ] && log "stripimg: $(grep '^strip-mosaic: .* overview' $ST/logs/mosaic_fill.log | head -1)"
 }
 # --- per-wrap renders (p4full3.sh) and faces ---
