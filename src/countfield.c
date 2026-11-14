@@ -1124,7 +1124,7 @@ int cmd_cf_compare(int argc, char **argv) {
     free(hl); fit_free(a); fit_free(b); return 0;
 }
 
-/* ufsm cf-demod MODEL FIELDS [--out DIR] [--R 1] [--band 64] [--step 2] [--cz 32] [--c0 0.1] [--drift-max 0] [--threads N]
+/* ufsm cf-demod MODEL FIELDS [--out DIR] [--R 1] [--L N (finer output lattice)] [--band 64] [--step 2] [--cz 32] [--c0 0.1] [--drift-max 0] [--threads N]
    Two label-free checks of a winding model (a count-field ref, ref-cf) against the network's fields, and one optional output.
    1. The z drift (audit ugeom #5: on Paris 4 the joined / ref integers drift 3 turns against the GT over ~5 cm of height while every
       gate passed). Per band of --band field rows: (a) the confidence-weighted phasor of the residual phi - W (phi the network phase,
@@ -1171,7 +1171,7 @@ static void cf_dm2_run(void *a_, long k0, long k1, int t) {
     }
 }
 int cmd_cf_demod(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm cf-demod <model> <fields> [--out DIR] [--R 1] [--band 64] [--step 2] [--cz 32] [--c0 0.1] [--drift-max 0] [--threads N]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm cf-demod <model> <fields> [--out DIR] [--R 1] [--L N] [--cmax 0.5] [--band 64] [--step 2] [--cz 32] [--c0 0.1] [--drift-max 0] [--threads N]\n"); return 2; }
     fit_model *m = fit_load(argv[2]); if (!m) { fprintf(stderr, "cf-demod: cannot load the model %s\n", argv[2]); return 1; }
     const char *out = cf_opt(argc, argv, "--out", ""); const int R = atoi(cf_opt(argc, argv, "--R", "1")), band = atoi(cf_opt(argc, argv, "--band", "64"));
     const int step = atoi(cf_opt(argc, argv, "--step", "2")), CZ = atoi(cf_opt(argc, argv, "--cz", "32")); const double c0 = atof(cf_opt(argc, argv, "--c0", "0.1")), dmax = atof(cf_opt(argc, argv, "--drift-max", "0"));
@@ -1180,6 +1180,23 @@ int cmd_cf_demod(int argc, char **argv) {
     fit_fields_skip_planes(1 | 2 | 8);
     fit_fields_buf g; if (fit_fields_load(argv[3], 0, 0, 0, &g)) { fprintf(stderr, "cf-demod: cannot load %s\n", argv[3]); return 1; }
     const int D = g.shape[0]; const double h = g.h; fit_fields_free(&g);
+    {   /* --L N: a finer output lattice (N native voxels, a divisor of the model's L): the model's delta resampled exactly (a trilinear
+           field sampled at a refinement of its own lattice is reproduced by trilinear interpolation of the samples) */
+        const int L2 = atoi(cf_opt(argc, argv, "--L", "0"));
+        if (L2 > 0 && L2 != m->L) {
+            if (m->L % L2) { fprintf(stderr, "cf-demod: --L %d must divide the model's lattice %d\n", L2, m->L); return 2; }
+            const int f = m->L / L2, lz = (m->lz - 1) * f + 1, ly = (m->ly - 1) * f + 1, lx = (m->lx - 1) * f + 1;
+            float *nd = malloc((size_t)lz * ly * lx * sizeof(float)); if (!nd) { fprintf(stderr, "cf-demod: out of memory (--L)\n"); return 1; }
+            for (int a = 0; a < lz; a++) for (int b = 0; b < ly; b++) for (int c = 0; c < lx; c++) {
+                const double qa = (double)a / f, qb = (double)b / f, qc = (double)c / f; const int a0 = a / f < m->lz - 1 ? a / f : m->lz - 2, b0 = b / f < m->ly - 1 ? b / f : m->ly - 2, c0 = c / f < m->lx - 1 ? c / f : m->lx - 2;
+                const double ta = qa - a0, tb = qb - b0, tc = qc - c0; double v = 0;
+                for (int k = 0; k < 8; k++) { const int da = k >> 2 & 1, db = k >> 1 & 1, dc = k & 1;
+                    v += (da ? ta : 1 - ta) * (db ? tb : 1 - tb) * (dc ? tc : 1 - tc) * m->delta[((size_t)(a0 + da) * m->ly + b0 + db) * m->lx + c0 + dc]; }
+                nd[((size_t)a * ly + b) * lx + c] = (float)v;
+            }
+            free(m->delta); m->delta = nd; m->L = L2; m->lz = lz; m->ly = ly; m->lx = lx;
+        }
+    }
     if (m->D != D || fabs(m->h - h) > 1e-9) fprintf(stderr, "cf-demod: WARNING: model box %d rows h %g vs fields %d rows h %g (a crop? positions are box-local)\n", m->D, m->h, D, h);
     const int nb = (D + band - 1) / band; double (*bacc)[5] = calloc((size_t)CF_MAXT * nb, sizeof *bacc);
     const size_t nl = (size_t)m->lz * m->ly * m->lx; float *lre = *out ? calloc(nl, 4) : nullptr, *lim = *out ? calloc(nl, 4) : nullptr;
@@ -1229,7 +1246,8 @@ int cmd_cf_demod(int argc, char **argv) {
             }
         }
         size_t nset = 0; double sabs = 0;
-        for (size_t j = 0; j < nl; j++) if (lre[j] != 0 || lim[j] != 0) { const double c = atan2(lim[j], lre[j]) / (2 * M_PI); m->delta[j] += (float)c; nset++; sabs += fabs(c); }
+        const double cmax = atof(cf_opt(argc, argv, "--cmax", "0.5"));   /* corrections above cmax turn (the phase half a turn off the ref: ambiguous) are left out */
+        for (size_t j = 0; j < nl; j++) if (lre[j] != 0 || lim[j] != 0) { const double c = atan2(lim[j], lre[j]) / (2 * M_PI); if (fabs(c) > cmax) continue; m->delta[j] += (float)c; nset++; sabs += fabs(c); }
         free(tmp);
         if (fit_save(m, out)) { fprintf(stderr, "cf-demod: cannot write %s\n", out); return 1; }
         printf("cf-demod: demodulated model (R %d nodes, lattice %d native) -> %s: %zu of %zu nodes corrected, mean |correction| %.3f turn\n", R, m->L, out, nset, nl, nset ? sabs / nset : 0);

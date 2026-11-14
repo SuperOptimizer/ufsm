@@ -395,7 +395,7 @@ badslabs() {
 join() {
   local args=() d c0 c1 a b bad
   if [ "${DEMOD:-0}" = 1 ]; then [ "$DRY" = 1 ] || rm -rf $O/joined
-    X $O/logs/join.log $U cf-demod $REF $F --out $O/joined --R ${DEMODR:-1} --step ${DEMODSTEP:-2} --threads $TH || return 1
+    X $O/logs/join.log $U cf-demod $REF $F --out $O/joined --R ${DEMODR:-1} --L ${DEMODL:-8} --step ${DEMODSTEP:-2} --threads $TH || return 1
     [ "$DRY" = 1 ] || log "join: DEMOD=1: $(grep '^cf-demod: demodulated' $O/logs/join.log | tail -1)"; return 0; fi
   if [ "$DRY" = 1 ]; then X $O/logs/join.log $U fit-join $O/joined $F --blend 16 --ref $REF "slabs/sNNN/fit 2c0 2c1 ..."; return; fi
   bad=$(badslabs); [ -z "$bad" ] || { log "join: REFUSED: bad slab fits $(for d in $bad; do basename $d; done | tr '\n' ' ')(rm state/slabs.done to refit)"; return 1; }

@@ -151,6 +151,19 @@ int main(void) {
             CHECK(nd > 100 && ed / nd < 0.08 && eo / nd > 0.2 && ei / nd < 0.05, "cf-demod: |frac error| %.3f -> %.3f, integer changes %.3f", eo / nd, ed / nd, ei / nd);
         }
         if (md) fit_free(md);
+        {   /* --L 1: the same on a lattice refined 2x (the model's delta resampled exactly) */
+            char m5[600]; snprintf(m5, sizeof m5, "%s/model_dm1", dir);
+            char *al[] = {"ufsm", "cf-demod", m2, in, "--out", m5, "--R", "2", "--L", "1", "--step", "1", "--threads", "2", nullptr};
+            CHECK(cmd_cf_demod(14, al) == 0, "cf-demod --L 1 failed");
+            fit_model *m1 = fit_load(m5); CHECK(m1 && m1->L == 1, "cf-demod --L 1: no model / lattice %d", m1 ? m1->L : -1);
+            if (m1 && mo) { double ed = 0; int nd = 0;
+                for (int y = 0; y < H; y += 3) for (int x = 0; x < W; x += 3) {
+                    const double py = (y + 0.5) * h, px = (x + 0.5) * h, r = hypot(py - cy0, px - cx0), th = atan2(py - cy0, px - cx0);
+                    if (r < 6 * p || r > 44 * h || th > -0.3) continue;
+                    double b = fit_W(m1, 3.5 * h, py, px) - trueW(py, px); b -= round(b); ed += fabs(b); nd++; }
+                CHECK(nd > 100 && ed / nd < 0.08, "cf-demod --L 1: |frac error| %.3f", ed / nd); }
+            if (m1) fit_free(m1);
+        }
         if (mo) fit_free(mo);
         for (int a = 0; a < m->lz; a++) for (size_t j = 0; j < (size_t)m->ly * m->lx; j++) m->delta[(size_t)a * m->ly * m->lx + j] += (float)(0.1 * a * m->L);
         CHECK(fit_save(m, m4) == 0, "cannot save the drift model");
