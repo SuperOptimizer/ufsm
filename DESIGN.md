@@ -6,6 +6,35 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Multi-head loss balance: effective weights, per-head gradient norms, the proposed try7 balance (2026-11-14, branch lossbal-20261114)
+
+Audit /vesuvius/ufsm/audit-20261114/targeted/lossbal.md (numbers from scratch2 try6, steps 350-2357, sources-scratch1-ph80-no1218.json).
+
+**How the heads combine.** Each head is a mean over its mask-weighted voxels of one window, divided by its active channels, times lambda x the
+source's head weight (nn_loss.cu loss_grad_k `1/active`; wind4 0.5 / N per logit; MIL / nmil). A window without the label gives gradient 0 and the
+accumulation divides by all windows (train.c `1 / nacc_win`), so a head's effective weight = lambda x channel norm x fraction of windows with its
+label. The sources are disjoint by head: geometry 79.3 % (phase, rv, normal, density; wind4 on 71 %), ink-only 17.1 %, fibre-only 3.6 %.
+Mass (L1 weight of the logit gradient): phase 26.4 %, rv 26.4 %, normal 22.6 %, density 3.8 % (1 channel of 7), wind4 5.9 %, ink bce 5.7 %,
+ink MIL 5.7 %, fibre 3.6 %. A fibre-only window weighs 3 (H, V, direction at lambda 1), on par with a geometry window (3.25); the starvation is
+frequency: P(an update of 5 / 10 windows has a fibre window) = 0.17 / 0.31. The heads are near orthogonal at the head input (|cos| <= 0.046, phase / rv
++0.13 .. +0.18), so this is about learning speed, not interference. A weak regression of the logged gn on the window mix says ink (MIL) windows carry a
+2-3x larger gradient norm than geometry windows (CI +0.3 .. +5.3), i.e. L2 shares differ from the L1 mass: the norm log below settles it.
+
+**Logging (default on).** `--grad-cos N` (every N steps) now also prints `grad-norm step S (head input): phase a normal b wind4 c rv d ink e fib f`, the
+square root of the Gram diagonal at the head input (the ink norm includes the MIL gradient); fibre is a sixth task (so its cosines appear in the
+`grad-cos` line too, appended after the existing pairs: the old regexes still match). `fib bce` in the step line is now H + V (the objective
+weights H, V and the direction each at lambda; it was the mean of H and V, so the loss column understated the fibre term). The scratch2 launch
+script defaults `--uw` to 0 (`${UW:-0}`): the Kendall weights are 1 / L at the fixed point, which boosts the easiest heads (ink 3.7, rv 3.3).
+
+**Proposed try7 balance (flags and sources only, defaults unchanged; judgement, not measured):** `--rv-lambda 0.5` (rv is a function of the
+phase, cos +0.15, bce 0.30), `--density-lambda 2` (density 0.143 -> 0.286 per geometry window; the fused path supports it, run `s2ctl.sh drystart`
+first), `--wind4-lambda 0.5` (accuracy flat at 0.57-0.64 over 2000 steps, no interference cost), fibre `--fib-head 1` unchanged but the fibre-only
+source share 0.035 -> 0.07 (undoes the ph80 halving; frequency lowers variance where a larger lambda would only make the rare update spikier:
+P(>= 1 fibre window in 10) 0.31 -> 0.52). Resulting mass: phase 26 %, rv 13 %, normal 22 %, density 7 %, wind4 12 %, ink + MIL 12 %, fibre 7 %.
+After ~2000 windows read the `grad-norm` lines and move lambdas by square-root-of-ratio steps, at most two at a time. Per-source `ink_weight`
+is unset (Paris4 supplies 63 % of the ink labels, 1667 23 %): a data decision, left alone.
+
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the

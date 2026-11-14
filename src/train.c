@@ -1885,10 +1885,10 @@ static void gc_report(gpu_state *d, int step) {   /* the tasks' cosines at the h
     const unet_cfg *uc = unet_cfg_of(d->u); const int K = uc->cout, C = uc->widths[0];
     double *S = malloc((size_t)K * K * sizeof *S); float *W = malloc((size_t)K * C * 4); size_t hw, hb; unet_head_offsets(d->u, &hw, &hb);
     nn_sync(); nn_d2h(S, d->gcS, (size_t)K * K * sizeof *S); nn_d2h(W, unet_live_params(d->u) + hw, (size_t)K * C * 4);
-    enum { T = 5 }; static const char *tn[T] = {"phase", "normal", "wind4", "rv", "ink"}; int8_t *ct = malloc((size_t)K);
+    enum { T = 6 }; static const char *tn[T] = {"phase", "normal", "wind4", "rv", "ink", "fib"}; int8_t *ct = malloc((size_t)K);
     for (int c = 0; c < K; c++) {   /* channel -> task (-1 none): the interpolated outputs by their head, the guided / sub-cell outputs the side pair's */
         int t = -1;
-        if (c < g_cout) t = c == g_side_ch || c == g_side_ch + 1 ? 0 : c >= g_norm_ch && c < g_norm_ch + 7 ? 1 : g_unwrap2 && (c == g_w4_ch || c == g_w4_ch + 1) ? 2 : g_rv == 2 && (c == g_rv_ch || c == g_rv_ch + 1) ? 3 : g_ink2 && c == g_ink2_ch ? 4 : -1;
+        if (c < g_cout) t = c == g_side_ch || c == g_side_ch + 1 ? 0 : c >= g_norm_ch && c < g_norm_ch + 7 ? 1 : g_unwrap2 && (c == g_w4_ch || c == g_w4_ch + 1) ? 2 : g_rv == 2 && (c == g_rv_ch || c == g_rv_ch + 1) ? 3 : g_ink2 && c == g_ink2_ch ? 4 : g_fibh && c >= g_fib_ch && c < g_fib_ch + 9 ? 5 : -1;
         else if (g_lat && g_lat_guide == 64 ? c >= LBASE : g_lat && g_lat_guide && g_lat_guide != 8) t = 0;
         ct[c] = (int8_t)t;
     }
@@ -1902,6 +1902,11 @@ static void gc_report(gpu_state *d, int step) {   /* the tasks' cosines at the h
     char ln[1024]; size_t n = (size_t)snprintf(ln, sizeof ln, "grad-cos step %d (head input):", step);
     for (int a = 0; a < T; a++) for (int b = a + 1; b < T; b++) if (dot[a][a] > 0 && dot[b][b] > 0 && n < sizeof ln)
         n += (size_t)snprintf(ln + n, sizeof ln - n, " %s/%s %+.3f", g_rv == 1 && !a ? "rv" : tn[a], tn[b], dot[a][b] / sqrt(dot[a][a] * dot[b][b]));
+    fprintf(stderr, "%s\n", ln);
+    /* the heads' gradient norms at the head input (sqrt of the Gram diagonal, in the loss's gradient scale; lossbal audit 11-14: only cosines were
+       logged, so nobody could see which head dominates the trunk; the ink norm includes the MIL gradient, fibre is task 5) */
+    n = (size_t)snprintf(ln, sizeof ln, "grad-norm step %d (head input):", step);
+    for (int a = 0; a < T; a++) if (dot[a][a] > 0 && n < sizeof ln) n += (size_t)snprintf(ln + n, sizeof ln - n, " %s %.4g", g_rv == 1 && !a ? "rv" : tn[a], sqrt(dot[a][a]));
     fprintf(stderr, "%s\n", ln);
     free(S); free(W); free(ct);
 }
@@ -2389,7 +2394,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
     d->fib_loss = d->fib_raw[0] = d->fib_raw[1] = 0;
     if (g_fibh) {   /* --fib-head: the mean bce of the known H / V voxels, the direction bce (7 channels); added at lambda */
         int nk = 0; for (int k = 0; k < 2; k++) { nn_loss_fetch(d->fhs[k], (shape5){1, 1, 1, 1, 1}, d->fhout[k]); if (d->fhout[k][2] > 0) { d->fib_raw[0] += d->fhout[k][0]; nk++; } }
-        if (nk) d->fib_raw[0] /= nk;
+        /* (H + V as summed: the gradient weights H, V and the direction each at lambda, so the logged loss is the objective; it was the mean of H and V, lossbal audit 11-14 #6) */
         nn_loss_fetch(d->fds, (shape5){1, 7, 1, 1, 1}, d->fdout); float nb = 0; for (int c = 0; c < 7; c++) nb += d->fdout[c]; d->fib_raw[1] = nb / 7;
         d->fib_loss = g_fibh_lambda * (d->fib_raw[0] + d->fib_raw[1]);
     }
