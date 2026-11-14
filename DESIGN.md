@@ -6,6 +6,64 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Test-suite speed: shards, the runner's defaults, a smoke tier, changed-file selection (2026-11-14, branch testspeed-20261113)
+
+The fast tier (the merge gate) was slow mostly because the runner was too conservative, not because the tests are big.
+- **Runner defaults.** It ran `-j CPUs/3` with 2 GPU slots per card. The tier averages ~1.1 CPUs per test and most GPU tests wait on
+  the card.
+- **Long tests.** A handful of single long tests set the tail: test_attn 204 s, test_fit 122 s, test_infer_mem 91 s quick (on the pod).
+- **Estimates.** The hand-written EST column was off by up to 10x (test_http_reader 166 s estimated, 30 s measured), so longest-first
+  packed badly.
+
+Measured on the rented pod (RTX PRO 4000 Blackwell, a cgroup quota of 10.2 CPUs although nproc says 48), master 15e66f0's tests:
+
+| run | -j | GPU slots | wall | CPU (user + sys) |
+|---|---|---|---|---|
+| master runner and tests (base1) | 3 | 2 | 546 s | 1781 s |
+| new -j / -G defaults only (r2) | 10 | 6 | 361 s | 1905 s |
+| this branch (r3) | 10 | 8 (free memory) | 196 s | 1850 s |
+
+- **Runner** (`tests/run_suite.sh`):
+  - `-j` defaults to the cgroup CPUs (2..16) and `-T` to 2 CPUs/j.
+  - GPU slots per card = the least free memory / 2.5 GB, 2..8. The largest fast-tier test peaks at ~2 GB (`-P`), and a card a
+    training run holds keeps 2 slots.
+  - Tests without the `gpu` tag get `CUDA_VISIBLE_DEVICES=` (empty). `-P` showed six tests using a GPU untagged, i.e. without a lock,
+    on cards that training runs held: test_attn, test_attn_ray, test_attn_dfm, test_spiralfit, test_countfield, test_mesh_phase. They
+    are tagged now.
+  - `-t smoke` is a 61-test cross-section of the fast tier for the edit loop.
+  - `-c REF` runs only the tests a change since REF can affect: the sources in the DWARF line tables of the binaries a test runs,
+    cached per binary, plus every CUDA source for binaries that link the GPU ops. A changed manifest line selects its test; a build or
+    runner file selects all. Example: a src/unet.c change selects 87 of 259 tests in 0.7 s.
+  - `tests/suite_est.py results.tsv` rewrites the EST column from measured wall times.
+- **Shards** (`UFSM_TEST_PART=K/N`, `tests/test_part.h` / `tests/test_part.sh`; lines `NAME~partKofN`). These are the same sections
+  and checks, run side by side, and each section sets the state it runs with:
+  - test_fit: 9 shards;
+  - test_infer_mem (quick): 6 shards, 10-30 s;
+  - test_spatial_augment (quick): 3 shards, 17 s whole -> ~6 s each;
+  - test_heads: 3 shards; lat_plain stays with the ssl section, which reads its log;
+  - test_predict_heads: 3 shards; each retrains its 3-step net, < 1 s.
+
+  The `~full` slow-tier lines are unchanged.
+- **test_attn** (204 -> 20 s on the pod). The central differences (180 of the 204 s) now run in UFSM_NCPU threads on private copies of
+  P and x, so each value is bit for bit the serial one. Core 1 replays core 0's random draws and reuses its reference values. The worst
+  core-1 block error is 1.6e-3 (it was 1.8e-3 on its own draws; the tolerance is 2e-3).
+- **test_http_reader** (30 -> 14 s on the desk). The 24 cache combinations, the 88 failure-mode reads and the four 429 back-off reads
+  run concurrently, each under its own URL tag, so the warm-cache request check sees only its own requests. The back-offs are real
+  sleeps: 15 s of the old 30.
+
+What did not get faster, and why:
+- **CUDA process start.** Every CUDA process costs ~0.42 s wall and ~0.2 s of system time for its context (pod, persistence on).
+  CUDA_MODULE_LOADING / CUDA_MODULE_DATA_LOADING and a keeper process change nothing; a live context elsewhere gives 0.34 s. The
+  shell tests start 40-200 ufsm processes each: test_predict_heads 206 calls, 48 s of its 55 s.
+- **Spin-waiting.** `cudaDeviceScheduleBlockingSync` (tried behind an env switch, reverted) left the CPU time unchanged: the tests'
+  CPU is real host work (references, the CPU fit backend: test_fit's CPU-backend shard alone takes 84 CPU-s).
+- **Fixture cache.** make_wind_fixture 256 takes 1.2 s and 3.7 MB. Twenty tests make one, so caching it would save ~25 CPU-s and was
+  left out.
+- **test_latvol.sh** (46 s uncontended). Its sections share the HTTP server and the nets of the first section, so it was left whole.
+- **On the pod, CPU is the floor.** The tier's 1850 CPU-s on 10.2 CPUs is >= 181 s, so 196 s is at it. A 24- or 32-core desk with
+  free GPUs ran master's fast tier in 154-266 s at -j 10 (desk results of 11-13). There the critical path, now cut to ~30 s, and the
+  GPU slots decide.
+
 ## Skip-air training: masked convs in forward, backward-data and weight gradient (2026-11-14, branch skipair2-20261113)
 
 The user approved the masked-conv approximation of 2026-11-13 ("Empty-space skipping", below) for the live scratch2 run. `train
