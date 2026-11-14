@@ -4,6 +4,7 @@
    a multiple of the shard and nz too unless the slab ends the array, so a long build can write slab by slab from separate processes
    (pub1667 7.91 um fill store, scripts/pub1667/fill791.py). Shards entirely zero are not written (z3w omits them). */
 #include "sysinfo.h"
+#include "optcheck.h"
 #include "z3w.h"
 #include <fcntl.h>
 #include <stdint.h>
@@ -23,12 +24,12 @@ int cmd_z3put(int argc, char **argv) {
     int shard = 128, nth = ufsm_threads(0, 32);
     double q = 2;
     for (int a = 4; a + 1 < argc; a++) {
-        if (!strcmp(argv[a], "--shape")) sscanf(argv[a + 1], "%lld,%lld,%lld", &Z, &Y, &X);
-        else if (!strcmp(argv[a], "--z0")) z0 = atoll(argv[a + 1]);
-        else if (!strcmp(argv[a], "--nz")) nz = atoll(argv[a + 1]);
-        else if (!strcmp(argv[a], "--shard")) shard = atoi(argv[a + 1]);
-        else if (!strcmp(argv[a], "--q")) q = atof(argv[a + 1]);
-        else if (!strcmp(argv[a], "--threads")) nth = atoi(argv[a + 1]);
+        if (!strcmp(argv[a], opt_n("--shape"))) sscanf(argv[a + 1], "%lld,%lld,%lld", &Z, &Y, &X);
+        else if (!strcmp(argv[a], opt_n("--z0"))) z0 = atoll(argv[a + 1]);
+        else if (!strcmp(argv[a], opt_n("--nz"))) nz = atoll(argv[a + 1]);
+        else if (!strcmp(argv[a], opt_n("--shard"))) shard = atoi(argv[a + 1]);
+        else if (!strcmp(argv[a], opt_n("--q"))) q = atof(argv[a + 1]);
+        else if (!strcmp(argv[a], opt_n("--threads"))) nth = atoi(argv[a + 1]);
     }
     if (Z <= 0 || Y <= 0 || X <= 0 || z0 < 0 || nz <= 0 || z0 + nz > Z || shard <= 0 || shard % 128 || z0 % shard ||
         (nz % shard && z0 + nz != Z)) {
