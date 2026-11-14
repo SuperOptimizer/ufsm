@@ -307,3 +307,4 @@ test_fibre_onfly                               | gpu          |    25 | tests/te
 test_codes_onfly                               | gpu,smoke    |    10 | tests/test_codes_onfly.sh ./$B/ufsm $TMPDIR/codesonfly
 test_mesh_phase                                | gpu          |     8 | tests/test_mesh_phase.sh ./$B/ufsm ./$B/test_mesh_phase $TMPDIR/meshphase
 test_lldec                                     | gpu,smoke    |     3 | ./$B/test_lldec $TMPDIR/lldec
+test_echo                                      | gpu          |    40 | tests/test_echo.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/echo
