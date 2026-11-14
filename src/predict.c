@@ -1339,7 +1339,7 @@ static int predict_one(int argc, char **argv) {
     if (devread) { setenv("UFSM_GPU_DECODE", "1", 0); if (!getenv("UFSM_GPU_DECODE_DEV")) setenv("UFSM_GPU_DECODE_DEV", opt(argc, argv, "--gpu", "0"), 1); }
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window W] [--act-mx8 1]\n"
-                        "       [--halo H] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
+                        "       [--halo H] [--align 128] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
                         "       [--prec 0|1|2|3|4] [--policy enc0=1,...] [--f16 0|1] [--fp4 0|1] [--input-mx 0|1] [--input-prec 0|4|8] [--ema 1]   EMA or current weights (0)\n"
                         "       [--iso T]   probability outputs 0 where CT < T (the scan's void cutoff; the fit's material mask stays CT > 0)\n"
                         "       [--ema-blend A]   a x final weights + (1 - a) x EMA (tail-average blend, e.g. 0.35)\n"
@@ -1833,6 +1833,22 @@ static int predict_one(int argc, char **argv) {
         fprintf(stderr, "predict: --window-z: at most --window (given), a multiple of %d, --halo-z under half of it; one GPU's plain path (no --split, "
                         "half-resolution, winding, --aux, --cond-sweep or UFSM_PRED_HOSTPATH)\n", 1 << (cfg.nlev - 1));
         return 2;
+    }
+    {   /* --align A (data audit #9, 2026-11-14; default 0 = off): every window origin on the A grid of the CT level, as training's snapped
+           windows (sample.c snap: the volcomp 128 block). Windows start at grid_origin + k stride - halo, so this anchors the grid at
+           the halo (--grid-origin = halo, halo-z on z) and needs strides that are multiples of A. Off, origins are box + k stride - halo:
+           the codec blocks fall elsewhere in the window than in training (convolutions are equivariant; the attention positions, the
+           window edges and --lat's cell grid may not be). scripts/predict/align_ab.sh measures it. */
+        const int A = atoi(opt(argc, argv, "--align", "0"));
+        if (A > 0) {
+            const int sz_ = Wz - 2 * hz, sy_ = W - 2 * halo;
+            if (sz_ % A || sy_ % A) { fprintf(stderr, "predict --align %d: window - 2 halo (%d, z %d) must be a multiple of %d\n", A, sy_, sz_, A); return 2; }
+            if (grid) { fprintf(stderr, "predict --align sets the window grid itself: drop --grid-origin\n"); return 2; }
+            if (atoi(opt(argc, argv, "--seam-inproc", "0"))) { fprintf(stderr, "predict --align: not with --seam-inproc (its two grids are fixed)\n"); return 2; }
+            grid = "align"; grid_origin[0] = hz; grid_origin[1] = grid_origin[2] = halo;
+            snprintf(grid_attrs, sizeof grid_attrs, ",\"grid_origin_zyx\":[%lld,%lld,%lld],\"align\":%d", (long long)grid_origin[0], (long long)grid_origin[1], (long long)grid_origin[2], A);
+            fprintf(stderr, "predict: --align %d: windows at k * %d - %d (z: k * %d - %d) on the level grid\n", A, sy_, halo, sz_, hz);
+        }
     }
     axis ax = {0};
     if (axisf && axis_load(&ax, axisf)) { fprintf(stderr, "cannot load axis %s\n", axisf); return 1; }
