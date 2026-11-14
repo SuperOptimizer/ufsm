@@ -486,6 +486,6 @@ extern "C" int gpudec_decode_dev(const gd_chunk *c, uint32_t mask, uint8_t *dchu
     if (!dchunk || !gpudec_enabled()) return -1;
     cudaPointerAttributes a;   /* device memory of the decoder's device only */
     if (cudaPointerGetAttributes(&a, dchunk) != cudaSuccess) { cudaGetLastError(); return -1; }
-    if (a.type != cudaMemoryTypeDevice || a.device != G.dev) return -1;
+    if (a.type != cudaMemoryTypeDevice || a.device != ufsm_dev_phys(G.dev)) return -1;   /* (attributes name the physical device) */
     return gd_decode(c, mask, nullptr, dchunk);
 }

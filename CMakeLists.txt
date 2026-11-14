@@ -115,7 +115,7 @@ configure_file(cmake/ptxas.sh.in ${CMAKE_BINARY_DIR}/ptxas @ONLY FILE_PERMISSION
                GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 set(UFSM_CU_FLAGS -x cuda --cuda-path=${UFSM_CUDA} --ptxas-path=./ptxas -Wno-unknown-cuda-version -Wno-cuda-compat -O3 -std=c++17
     -fno-threadsafe-statics ${UFSM_CXX_STDLIB} "SHELL:-Xcuda-fatbinary -compress-all" "SHELL:-isystem ${UFSM_CUDA}/include/cccl"
-    "SHELL:-include ${CMAKE_SOURCE_DIR}/src/clang_cuda_compat.cuh" -D_GNU_SOURCE -DUFSM_CUDA_VERSION=${UFSM_CUDA_VERSION}
+    "SHELL:-include ${CMAKE_SOURCE_DIR}/src/clang_cuda_compat.cuh" "SHELL:-include ${CMAKE_SOURCE_DIR}/src/ufsm_dev.cuh" -D_GNU_SOURCE -DUFSM_CUDA_VERSION=${UFSM_CUDA_VERSION}
     -DUFSM_PTX_ISA=${UFSM_PTX_ISA})
 # ptxas --split-compile=N: ptxas optimises the kernels of one unit on N threads. The big lp_* units hold up to 9 kernel
 # instantiations; lp_f4fwd_i0p.cu 41 s -> 22 s with 0 (all cores), 25 s with 4 (desk, 2026-11-13). It only shortens the tail of a
@@ -229,7 +229,8 @@ if(UFSM_CUDA_COMPILER STREQUAL "nvcc")
     set(UFSM_NN_ARCH "SHELL:-gencode arch=compute_${UFSM_ARCH},code=[sm_${UFSM_ARCH},compute_${UFSM_ARCH}]")
     set(UFSM_LP_ARCH ${UFSM_NN_ARCH})
   endif()
-  set(UFSM_CU_FLAGS -O3 -Xcompiler=-fno-threadsafe-statics -Xfatbin=-compress-all)
+  # (ufsm_dev.cuh: logical devices, force-included like clang's -include above; ops audit #8)
+  set(UFSM_CU_FLAGS -O3 -Xcompiler=-fno-threadsafe-statics -Xfatbin=-compress-all "SHELL:--pre-include ${CMAKE_SOURCE_DIR}/src/ufsm_dev.cuh")
   set(UFSM_CU_FAST -use_fast_math)
   set(UFSM_CU_STRICT -fmad=false)
   if(UFSM_PTXAS_SPLIT GREATER 1)

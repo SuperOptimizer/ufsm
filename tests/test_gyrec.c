@@ -37,7 +37,10 @@ int main(void) {
     const size_t f1 = nn_mem_free();
     const double lost = ((double)f0 - (double)f1) / 1e6;
     printf("200 device switches: records %p kept, device memory lost %.1f MB (record buffer %.2f MB)\n", (void *)g_gyrec.rec, lost, g_gyrec.cap / 1e6);
-    CHECK(lost < 2 + g_gyrec.cap / 1e6, "device memory lost %.1f MB over 200 switches", lost);   /* (the other process on a shared GPU may move it a little) */
+    /* (cudaMemGetInfo is the whole card's: other tests on it moved it by MBs and failed this under -j 10 / on the shared pod, 2026-11-14.
+       The leak this test is about shows in the pointers above: every switch back must restore the same record / gb buffers and no
+       apply may reallocate. The free-memory check only alone on the card: UFSM_TEST_GYREC_MEM=1.) */
+    if (getenv("UFSM_TEST_GYREC_MEM")) CHECK(lost < 2 + g_gyrec.cap / 1e6, "device memory lost %.1f MB over 200 switches", lost);
     /* the other device's slot holds its own buffers: park a marker as "GPU 1"'s, switch away and back */
     lp_gyrec_select(1);
     uint8_t *marker = (uint8_t *)0x1000; g_gyrec.rec = marker; g_gyrec.cap = 77;

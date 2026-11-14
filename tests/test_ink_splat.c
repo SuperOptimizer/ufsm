@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 enum { NV = 256, GW = 40, GH = 44 };
 static const double STEP = 4.0;   /* voxels per grid step (scale 0.25) */
@@ -32,6 +34,24 @@ static void normal_at(double u, double v, double N[3]) {   /* du x dv as ink-spl
 }
 static int ink_at(int r, int c) { const double dr = r - 80, dc = c - 70; return dr * dr + dc * dc < 30 * 30 || (c >= 110 && c < 122); }
 static int sup_at(int r, int c) { return !(r >= 120 && r < 140); }
+int cmd_ink_score(int argc, char **argv);
+/* ufsm ink-score in a child (it prints its --row on stdout): the row's F1 best and AUC (ops audit #17: the scoring commands had no test) */
+static int ink_score(const char *dir, const char *map, const char *mask, double *f1, double *auc) {
+    char out[512], sp[512], lp[512], mp[512], kp[512]; snprintf(out, sizeof out, "%s/score.tsv", dir); snprintf(sp, sizeof sp, "%s/seg.tifxyz", dir);
+    snprintf(lp, sizeof lp, "%s/inklabels.tif", dir); snprintf(mp, sizeof mp, "m=%s", map); snprintf(kp, sizeof kp, "%s", mask ? mask : "");
+    fflush(stdout); fflush(stderr);
+    const pid_t c = fork();
+    if (c == 0) {
+        const int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) _exit(9); dup2(fd, 1);
+        char *av[] = {"ufsm", "ink-score", "--surface", sp, "--labels", lp, "--map", mp, "--row", "t", "--threads", "2", mask ? "--mask" : nullptr, kp, nullptr};
+        _exit(cmd_ink_score(mask ? 14 : 12, av));
+    }
+    int st = 0; waitpid(c, &st, 0); if (!WIFEXITED(st) || WEXITSTATUS(st)) return -1;
+    FILE *f = fopen(out, "r"); if (!f) return -1;
+    char nm[64], tag[64]; unsigned long long n; double ink, thr, f05, p05, r05;
+    const int k = fscanf(f, "%63s %63s %llu %lf %lf %lf %lf %lf %lf %lf", tag, nm, &n, &ink, f1, &thr, &f05, &p05, &r05, auc); fclose(f);
+    return k == 10 ? 0 : -1;
+}
 static int hole_at(int64_t z, int64_t y, int64_t x) { return y >= 40 && y < 60 && x >= 120 && x < 150; }
 
 int main(void) {
@@ -278,6 +298,22 @@ int main(void) {
     }
     snprintf(p, sizeof p, "%s/out.zarr/segments/seg.tifxyz.json", dir);
     CHECK(access(p, R_OK) == 0, "summary %s", p);
+    {   /* ink-score on the canvas labels: the labels themselves as the map score F1 1 / AUC 1, the inverted labels AUC 0, a constant map
+           AUC 0.5; with the mask, the masked rows count for nothing (the same perfect score) */
+        const int CW = (int)(GW * STEP), CHh = (int)(GH * STEP); uint8_t *m = malloc((size_t)CW * CHh); double f1 = 0, auc = 0;
+        char mp[512], kp[512]; snprintf(mp, sizeof mp, "%s/map.tif", dir); snprintf(kp, sizeof kp, "%s/mask.tif", dir);
+        for (int r = 0; r < CHh; r++) for (int c = 0; c < CW; c++) m[r * CW + c] = ink_at(r, c) ? 230 : 20;
+        tiffw_write(mp, CW, CHh, 1, m, 1);
+        CHECK(!ink_score(dir, mp, nullptr, &f1, &auc) && f1 > 0.97 && auc > 0.98, "ink-score labels as the map: F1 %.4f AUC %.4f (want ~1)", f1, auc);
+        CHECK(!ink_score(dir, mp, kp, &f1, &auc) && f1 > 0.97 && auc > 0.98, "ink-score with the mask: F1 %.4f AUC %.4f", f1, auc);
+        for (size_t k = 0; k < (size_t)CW * CHh; k++) m[k] = 250 - m[k];
+        tiffw_write(mp, CW, CHh, 1, m, 1);
+        CHECK(!ink_score(dir, mp, nullptr, &f1, &auc) && auc < 0.03, "ink-score inverted map: AUC %.4f (want ~0)", auc);
+        memset(m, 128, (size_t)CW * CHh); tiffw_write(mp, CW, CHh, 1, m, 1);
+        CHECK(!ink_score(dir, mp, nullptr, &f1, &auc) && fabs(auc - 0.5) < 1e-6, "ink-score constant map: AUC %.6f (want 0.5)", auc);
+        fprintf(stderr, "ink-score: perfect / masked / inverted / constant maps scored as expected\n");
+        free(m);
+    }
     snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) {}
     if (fails) { fprintf(stderr, "test_ink_splat: %d failures\n", fails); return 1; }
     fprintf(stderr, "test_ink_splat: ok\n");
