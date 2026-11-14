@@ -1,16 +1,22 @@
 /* src/dcache.h: the derived-array chunk cache (memory LRU + disk, keyed by an inputs hash). */
 #include "dcache.h"
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <ftw.h>
 #include <openssl/evp.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
+#include "volcomp.h"
 
 struct dc;
 typedef struct dent { int64_t key; uint8_t *data; uint8_t cval; int busy, failed, refs; struct dc *own; struct dent *prev, *next, *hnext; } dent;
@@ -18,15 +24,16 @@ typedef struct dent { int64_t key; uint8_t *data; uint8_t cval; int busy, failed
    source under one budget); the pool's mutex guards the LRU and every member array's hash */
 struct dcache_pool { pthread_mutex_t mu; pthread_cond_t cv; dent *head, *tail; size_t bytes, cap; int shared; };
 typedef struct dc {
-    unsigned magic; int batch;   /* batch: the edge (voxels) up to which a read's missed cells are computed as one box (dcache_set_batch) */
+    unsigned magic; int batch, pdelta;   /* pdelta: the near-lossless phase codec's bound (dcache_set_phase; 0 exact) */   /* batch: the edge (voxels) up to which a read's missed cells are computed as one box (dcache_set_batch) */
     z3 *in; int C, fill; int64_t shape[3], gc[3]; char *dir;   /* dir: ROOT/<hash> or nullptr (memory only) */
-    dcache_pool *P; dent **hash; size_t nhash; _Atomic int disk_warned;
+    dcache_pool *P; dent **hash; size_t nhash; _Atomic int disk_warned; _Atomic int64_t touched;   /* touched: the key dir's last-use stamp (s) */
 } dc;
-static struct { _Atomic uint64_t reads, mem, disk, comp, fill, wbytes, ns_comp, ns_disk; } g_dc;
+static struct { _Atomic uint64_t reads, mem, disk, comp, fill, wbytes, ns_comp, ns_disk, evicted, recomp, evbytes; } g_dc;
 static double dnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 void dcache_get_stats(dcache_stats *st) {
     st->reads = g_dc.reads; st->cells_mem = g_dc.mem; st->cells_disk = g_dc.disk; st->cells_computed = g_dc.comp; st->cells_fill = g_dc.fill;
     st->disk_bytes_written = g_dc.wbytes; st->s_compute = 1e-9 * (double)g_dc.ns_comp; st->s_disk = 1e-9 * (double)g_dc.ns_disk;
+    st->cells_evicted = g_dc.evicted; st->cells_recomputed = g_dc.recomp; st->bytes_evicted = g_dc.evbytes;
 }
 const char *dcache_default_dir(void) {
     static char b[1024]; const char *e = getenv("UFSM_DERIVED_CACHE");
@@ -51,29 +58,93 @@ static void evict(dcache_pool *P) {   /* (mu held) drop unreferenced tail entrie
         v = pv;
     }
 }
-/* the disk file of a cell: "UDC1", u32 C, u8 kind (0 constant, 1 zstd), u8 value, u16 0, u32 payload bytes, payload */
+/* ---- the near-lossless phase codec (2026-11-14, the user: store the cached phase lossily) ----
+   A phase cell (values 0..251 known, 255 unknown) as "UDC2": the unknown mask exact (volcomp's lossless mask, mode 5, per 128^3 chunk)
+   and the known voxels in raster order predicted from their already reconstructed neighbours (planar x + y - xy modulo 252 where all
+   three are known, else x, y, z, else 0), the circular residual quantised to steps of 2 delta + 1 (|error| <= delta per voxel, the
+   reconstruction fed back so nothing drifts), zigzagged, zstd 3. The memory LRU holds the reconstruction too, so a label never
+   depends on whether its cell came from disk. 25 real cells (try6's sources): exact zstd 3.0x; delta 1 5.2x, 2 5.8x, 3 6.4x. */
+enum { PH_P = 252, PH_U = 255 };
+static inline int ph_mod(int a) { a %= PH_P; return a < 0 ? a + PH_P : a; }
+static inline int ph_pred(const uint8_t *r, size_t i, int x, int y, int z, int C) {
+    const int a = x ? r[i - 1] : PH_U, b = y ? r[i - C] : PH_U, c = x && y ? r[i - C - 1] : PH_U, e = z ? r[i - (size_t)C * C] : PH_U;
+    return a != PH_U && b != PH_U && c != PH_U ? ph_mod(a + b - c) : a != PH_U ? a : b != PH_U ? b : e != PH_U ? e : 0;
+}
+/* data (C^3) -> its reconstruction in place, and the UDC2 payload (malloc'd) in *out; -1: not a phase cell (a value 252..254) or C % 128 */
+static int ph_encode(int C, int d, uint8_t *data, uint8_t **out, uint32_t *out_n) {
+    const size_t n = (size_t)C * C * C; if (C % 128 || d < 1 || d > 20) return -1;
+    for (size_t i = 0; i < n; i++) if (data[i] >= PH_P && data[i] != PH_U) return -1;
+    const int K = C / 128, st = 2 * d + 1; uint8_t *res = malloc(n), *mk = malloc(VOLCOMP_CHUNK_VOXELS), *mb = malloc((size_t)K * K * K * VOLCOMP_MASK_LL_BOUND + 4 * K * K * K);
+    if (!res || !mk || !mb) { free(res); free(mk); free(mb); return -1; }
+    size_t mn = 0;
+    for (int cz = 0; cz < K; cz++) for (int cy = 0; cy < K; cy++) for (int cx = 0; cx < K; cx++) {
+        for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) { const uint8_t *s = data + (((size_t)(cz * 128 + z) * C + cy * 128 + y) * C + cx * 128); uint8_t *m = mk + ((size_t)z * 128 + y) * 128; for (int x = 0; x < 128; x++) m[x] = s[x] != PH_U; }
+        size_t on = 0; if (volcomp_mask_encode_lossless(mk, mb + mn + 4, VOLCOMP_MASK_LL_BOUND, &on)) { free(res); free(mk); free(mb); return -1; }
+        const uint32_t o32 = (uint32_t)on; memcpy(mb + mn, &o32, 4); mn += 4 + on;
+    }
+    size_t nk = 0;
+    for (int z = 0; z < C; z++) for (int y = 0; y < C; y++) for (int x = 0; x < C; x++) {
+        const size_t i = ((size_t)z * C + y) * C + x; if (data[i] == PH_U) continue;
+        const int pr = ph_pred(data, i, x, y, z, C); int r = data[i] - pr; if (r > PH_P / 2) r -= PH_P; if (r < -(PH_P / 2)) r += PH_P;
+        const int q = r >= 0 ? (r + d) / st : -((-r + d) / st);
+        data[i] = (uint8_t)ph_mod(pr + q * st); res[nk++] = (uint8_t)(q >= 0 ? 2 * q : -2 * q - 1);
+    }
+    const size_t zc = ZSTD_compressBound(nk ? nk : 1); uint8_t *o = malloc(mn + 8 + zc); if (!o) { free(res); free(mk); free(mb); return -1; }
+    memcpy(o, mb, mn); const size_t zr = ZSTD_compress(o + mn + 8, zc, res, nk ? nk : 1, 3);
+    free(res); free(mk); free(mb); if (ZSTD_isError(zr)) { free(o); return -1; }
+    const uint32_t nk32 = (uint32_t)nk, zr32 = (uint32_t)zr; memcpy(o + mn, &nk32, 4); memcpy(o + mn + 4, &zr32, 4);
+    *out = o; *out_n = (uint32_t)(mn + 8 + zr); return 0;
+}
+static uint8_t *ph_decode(int C, int d, const uint8_t *p, size_t pn) {
+    const size_t n = (size_t)C * C * C; const int K = C / 128, st = 2 * d + 1; if (C % 128) return nullptr;
+    uint8_t *v = malloc(n), *mk = malloc(VOLCOMP_CHUNK_VOXELS), *res = nullptr; size_t at = 0; int ok = v && mk;
+    for (int cz = 0; ok && cz < K; cz++) for (int cy = 0; ok && cy < K; cy++) for (int cx = 0; ok && cx < K; cx++) {
+        uint32_t on; if (at + 4 > pn) { ok = 0; break; } memcpy(&on, p + at, 4); at += 4;
+        if (at + on > pn || volcomp_decode(p + at, on, mk, VOLCOMP_CHUNK_VOXELS)) { ok = 0; break; } at += on;
+        for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) { uint8_t *s = v + (((size_t)(cz * 128 + z) * C + cy * 128 + y) * C + cx * 128); const uint8_t *m = mk + ((size_t)z * 128 + y) * 128; for (int x = 0; x < 128; x++) s[x] = m[x] ? 0 : PH_U; }
+    }
+    uint32_t nk = 0, zr = 0;
+    if (ok && at + 8 <= pn) { memcpy(&nk, p + at, 4); memcpy(&zr, p + at + 4, 4); at += 8; } else ok = 0;
+    if (ok && (at + zr > pn || !(res = malloc(nk ? nk : 1)) || ZSTD_decompress(res, nk ? nk : 1, p + at, zr) != (nk ? nk : 1))) ok = 0;
+    size_t k = 0;
+    for (int z = 0; ok && z < C; z++) for (int y = 0; y < C; y++) for (int x = 0; x < C; x++) {
+        const size_t i = ((size_t)z * C + y) * C + x; if (v[i] == PH_U) continue;
+        if (k >= nk) { ok = 0; break; }
+        const int u = res[k++], q = u & 1 ? -((u + 1) >> 1) : u >> 1;
+        v[i] = (uint8_t)ph_mod(ph_pred(v, i, x, y, z, C) + q * st);
+    }
+    if (ok && k != nk) ok = 0;
+    free(mk); free(res); if (!ok) { free(v); return nullptr; } return v;
+}
+/* the disk file of a cell: "UDC1", u32 C, u8 kind (0 constant, 1 zstd), u8 value, u16 0, u32 payload bytes, payload; "UDC2": the same
+   header, kind 2, u8 delta, then per 128^3 chunk u32 bytes + its mode-5 mask, u32 known voxels, u32 bytes + the zstd residuals */
 static void cell_path(const dc *c, int64_t cz, int64_t cy, int64_t cx, char *p, size_t np) { snprintf(p, np, "%s/%lld/%lld.%lld", c->dir, (long long)cz, (long long)cy, (long long)cx); }
 static int disk_get(const dc *c, const char *p, uint8_t **data, uint8_t *cval) {
     FILE *f = fopen(p, "rb"); if (!f) return -1;
     uint8_t h[16]; int rc = -1; uint8_t *zb = nullptr, *d = nullptr;
-    if (fread(h, 1, 16, f) != 16 || memcmp(h, "UDC1", 4)) goto out;
+    if (fread(h, 1, 16, f) != 16 || (memcmp(h, "UDC1", 4) && memcmp(h, "UDC2", 4))) goto out;
     uint32_t C, nz; memcpy(&C, h + 4, 4); memcpy(&nz, h + 12, 4);
     if ((int)C != c->C) goto out;
     if (h[8] == 0) { *data = nullptr; *cval = h[9]; rc = 0; goto out; }
+    if (!memcmp(h, "UDC2", 4)) {   /* (a near-lossless phase cell: only for an array of the same delta) */
+        if (h[8] != 2 || h[9] != c->pdelta || !(zb = malloc(nz ? nz : 1)) || fread(zb, 1, nz, f) != nz || !(d = ph_decode(c->C, c->pdelta, zb, nz))) goto out;
+        *data = d; d = nullptr; rc = 0; goto out; }
+    if (c->pdelta) goto out;   /* (an exact cell under a lossy array: never mixed, the keys differ; a miss) */
     if (h[8] != 1 || !(zb = malloc(nz ? nz : 1)) || fread(zb, 1, nz, f) != nz || !(d = malloc(cbytes(c)))) goto out;
     if (ZSTD_decompress(d, cbytes(c), zb, nz) != cbytes(c)) goto out;
     *data = d; d = nullptr; rc = 0;
 out:
     fclose(f); free(zb); free(d); return rc;
 }
-static int disk_put(dc *c, int64_t cz, const char *p, const uint8_t *data, uint8_t cval) {
+static int disk_put(dc *c, int64_t cz, const char *p, const uint8_t *data, uint8_t cval, uint8_t *ph, uint32_t phn) {   /* ph: a UDC2 payload (owned) */
     char dd[1200], tmp[1300]; snprintf(dd, sizeof dd, "%s/%lld", c->dir, (long long)cz);
-    if (mkdirs(dd)) return -1;
+    if (mkdirs(dd)) { free(ph); return -1; }
     snprintf(tmp, sizeof tmp, "%s.%d.%lx.tmp", p, (int)getpid(), (unsigned long)pthread_self());
     uint8_t h[16] = {'U', 'D', 'C', '1'}; const uint32_t C = (uint32_t)c->C; memcpy(h + 4, &C, 4);
     uint8_t *zb = nullptr; uint32_t nz = 0;
-    if (data) {
-        const size_t cap = ZSTD_compressBound(cbytes(c)); zb = malloc(cap); if (!zb) return -1;
+    if (ph) { zb = ph; nz = phn; h[2] = 'C'; h[3] = '2'; h[8] = 2; h[9] = (uint8_t)c->pdelta; }
+    else if (data) {
+        const size_t cap = ZSTD_compressBound(cbytes(c)); zb = malloc(cap); if (!zb) return -1;   /* (ph is nullptr here) */
         const size_t r = ZSTD_compress(zb, cap, data, cbytes(c), 3); if (ZSTD_isError(r)) { free(zb); return -1; }
         nz = (uint32_t)r; h[8] = 1;
     } else { h[8] = 0; h[9] = cval; }
@@ -102,6 +173,131 @@ static dent *cell_wait(dc *c, dent *e) {
     if (e->failed) { if (!--e->refs) free(e); pthread_mutex_unlock(&P->mu); return nullptr; }
     unlink_lru(P, e); push_lru(P, e); pthread_mutex_unlock(&P->mu); atomic_fetch_add(&g_dc.mem, 1); return e;
 }
+/* ---- the disk cap (2026-11-14): ~/.cache/ufsm/derived grew to 336 GB and filled the desk's root filesystem under try6 ----
+   Each key dir's inputs.txt mtime is its last use (touched at open and every 5 min of reads). A background thread per process (one at a
+   time per root: flock on ROOT/.evict.lock) checks every UFSM_DCACHE_CHECK_S (600) s and deletes whole key dirs, least recently used
+   first, while the root holds more than UFSM_DCACHE_GB (200; 0 no size cap) or its filesystem has less than UFSM_DCACHE_FREE_GB (50; 0
+   off) free; keys used in the last UFSM_DCACHE_PROTECT_MIN (60) minutes, or open in this process, are kept. If the kept (live) keys
+   are still over, single cells go, least recently used first (a cell file's mtime: its write, or its last disk read), down to
+   UFSM_DCACHE_CELL_FILL (0.9) x the cap. Deleting is safe (missing cells are recomputed, a writer recreates its dirs; recomputes of
+   cells this process evicted are counted). Below half the free floor no cell is written (memory only) until space returns. */
+static double env_num(const char *k, double d) { const char *e = getenv(k); return e && *e ? atof(e) : d; }
+static int64_t wsec(void) { return (int64_t)time(nullptr); }
+static void key_touch(dc *c) {
+    if (!c->dir) return;
+    const int64_t t = wsec(), last = atomic_load(&c->touched); if (t - last < 300 || !atomic_compare_exchange_strong(&c->touched, &(int64_t){last}, t)) return;
+    char ip[1300]; snprintf(ip, sizeof ip, "%s/inputs.txt", c->dir); utimensat(AT_FDCWD, ip, nullptr, 0);
+}
+static struct { pthread_mutex_t mu; char root[1024]; int started; char *open[512]; int nopen; _Atomic int64_t room_t; _Atomic int room_ok, room_warned; _Atomic uint64_t skipped; } g_cap = {.mu = PTHREAD_MUTEX_INITIALIZER, .room_ok = 1};
+static int disk_room(const char *dir) {   /* 0: the filesystem is below half the free floor (no writes); statvfs at most every 2 s */
+    const double fl = env_num("UFSM_DCACHE_FREE_GB", 50) * 0.5e9; if (fl <= 0) return 1;
+    const int64_t t = wsec();
+    if (t - atomic_load(&g_cap.room_t) >= 2) { atomic_store(&g_cap.room_t, t); struct statvfs v;
+        if (!statvfs(dir, &v)) { const int ok = (double)v.f_bavail * v.f_frsize >= fl, was = atomic_exchange(&g_cap.room_ok, ok);
+            if (!ok && was) fprintf(stderr, "dcache: less than %.0f GB free under %s: cells kept in memory only until space returns\n", fl / 1e9, dir);
+            if (ok && !was) fprintf(stderr, "dcache: %.0f GB free again under %s: disk writes resumed (%llu cells skipped)\n", (double)v.f_bavail * v.f_frsize / 1e9, dir, (unsigned long long)atomic_load(&g_cap.skipped)); } }
+    return atomic_load(&g_cap.room_ok);
+}
+static _Thread_local uint64_t t_du; static _Thread_local int64_t t_mt;   /* (the walk: bytes, and the newest directory mtime = the last cell written) */
+static int du_cb(const char *p, const struct stat *st, int fl, struct FTW *f) { (void)p; (void)f; t_du += (uint64_t)st->st_blocks * 512; if (fl == FTW_D && st->st_mtime > t_mt) t_mt = st->st_mtime; return 0; }
+static int rm_cb(const char *p, const struct stat *st, int fl, struct FTW *f) { (void)st; (void)f; return fl == FTW_DP ? rmdir(p) : unlink(p); }
+typedef struct { char name[64]; int64_t used; uint64_t bytes; } kent;
+/* the cells this process evicted (64-bit hashes of their paths, open addressing): a later compute of one counts as a recompute */
+static struct { pthread_mutex_t mu; uint64_t *h; size_t cap, n; } g_ev = {.mu = PTHREAD_MUTEX_INITIALIZER};
+static uint64_t phash(const char *p) { uint64_t h = 1469598103934665603ull; for (; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ull; return h | 1; }
+static void ev_add(uint64_t h) {
+    if (g_ev.n * 2 >= g_ev.cap) { const size_t nc = g_ev.cap ? 2 * g_ev.cap : 1 << 16; uint64_t *nh = calloc(nc, 8); if (!nh) return;
+        for (size_t i = 0; i < g_ev.cap; i++) if (g_ev.h[i]) { size_t j = g_ev.h[i] % nc; while (nh[j]) j = (j + 1) % nc; nh[j] = g_ev.h[i]; }
+        free(g_ev.h); g_ev.h = nh; g_ev.cap = nc; }
+    size_t j = h % g_ev.cap; while (g_ev.h[j] && g_ev.h[j] != h) j = (j + 1) % g_ev.cap; if (!g_ev.h[j]) { g_ev.h[j] = h; g_ev.n++; }
+}
+static int ev_has(uint64_t h) { if (!g_ev.cap) return 0; size_t j = h % g_ev.cap; while (g_ev.h[j]) { if (g_ev.h[j] == h) return 1; j = (j + 1) % g_ev.cap; } return 0; }
+/* the per-cell pass (2026-11-14: try6's live keys alone held 334 GB): every cell file of every key with its mtime (its last disk read
+   or write) and size; the oldest unlinked until the root is under UFSM_DCACHE_CELL_FILL (0.9) x the cap. Open keys too: an evicted
+   cell is recomputed on its next miss (counted: dcache_stats cells_recomputed) */
+typedef struct { int64_t t; uint32_t bytes; uint16_t key; char rel[26]; } centry;
+static _Thread_local centry *t_ce; static _Thread_local size_t t_nce, t_cce; static _Thread_local int t_key; static _Thread_local size_t t_kl;
+static int ce_cb(const char *p, const struct stat *st, int fl, struct FTW *f) {
+    if (fl != FTW_F || f->level != 2 || strlen(p) - t_kl >= sizeof t_ce->rel || !strchr(p + t_kl, '.') || strstr(p + t_kl, ".tmp")) return 0;
+    if (t_nce == t_cce) { const size_t nc = t_cce ? 2 * t_cce : 1 << 16; centry *n = realloc(t_ce, nc * sizeof *n); if (!n) return 1; t_ce = n; t_cce = nc; }
+    centry *e = &t_ce[t_nce++]; e->t = st->st_mtime; e->bytes = (uint32_t)((uint64_t)st->st_blocks * 512 > 0xffffffffu ? 0xffffffffu : (uint64_t)st->st_blocks * 512); e->key = (uint16_t)t_key;
+    snprintf(e->rel, sizeof e->rel, "%s", p + t_kl); return 0;
+}
+static int ce_cmp(const void *a, const void *b) { const int64_t x = ((const centry *)a)->t, y = ((const centry *)b)->t; return x < y ? -1 : x > y; }
+static int kent_cmp(const void *a, const void *b) { const int64_t x = ((const kent *)a)->used, y = ((const kent *)b)->used; return x < y ? -1 : x > y; }
+/* one pass: 0 nothing to do / done, 1 another process holds the lock */
+int dcache_evict_pass(const char *root) {
+    char lp[1100]; snprintf(lp, sizeof lp, "%s/.evict.lock", root);
+    const int fd = open(lp, O_RDWR | O_CREAT | O_CLOEXEC, 0664); if (fd < 0) return 0;
+    if (flock(fd, LOCK_EX | LOCK_NB)) { close(fd); return 1; }
+    const double cap = env_num("UFSM_DCACHE_GB", 200) * 1e9, floor_b = env_num("UFSM_DCACHE_FREE_GB", 50) * 1e9;
+    const int64_t prot = (int64_t)(env_num("UFSM_DCACHE_PROTECT_MIN", 60) * 60), now = wsec();
+    DIR *d = opendir(root); kent *k = nullptr; size_t nk = 0, ck = 0; uint64_t tot = 0;
+    for (struct dirent *de; d && (de = readdir(d));) {
+        if (de->d_name[0] == '.' || strlen(de->d_name) >= sizeof k->name) continue;
+        char kp[1200]; snprintf(kp, sizeof kp, "%s/%s", root, de->d_name); struct stat st; if (stat(kp, &st) || !S_ISDIR(st.st_mode)) continue;
+        char ip[1300]; snprintf(ip, sizeof ip, "%s/inputs.txt", kp); struct stat si;
+        t_du = 0; t_mt = 0; nftw(kp, du_cb, 16, FTW_PHYS);
+        const int64_t used = !stat(ip, &si) && (int64_t)si.st_mtime > t_mt ? (int64_t)si.st_mtime : t_mt;   /* (the last touch or the last write: binaries before the cap never touch) */
+        if (nk == ck) { ck = ck ? 2 * ck : 256; kent *nkp = realloc(k, ck * sizeof *k); if (!nkp) break; k = nkp; }
+        snprintf(k[nk].name, sizeof k->name, "%s", de->d_name); k[nk].used = used; k[nk].bytes = t_du; tot += t_du; nk++;
+    }
+    if (d) closedir(d);
+    struct statvfs v; double fr = !statvfs(root, &v) ? (double)v.f_bavail * v.f_frsize : 1e18;
+    int ev = 0; uint64_t evb = 0; const int over = (cap > 0 && tot > cap) || (floor_b > 0 && fr < floor_b);
+    if (over && nk) {
+        qsort(k, nk, sizeof *k, kent_cmp);
+        for (size_t i = 0; i < nk && ((cap > 0 && tot > cap) || (floor_b > 0 && fr < floor_b)); i++) {
+            if (now - k[i].used < prot) break;   /* (sorted: the rest are newer) */
+            char kp[1200]; snprintf(kp, sizeof kp, "%s/%s", root, k[i].name); int mine = 0;
+            pthread_mutex_lock(&g_cap.mu); for (int j = 0; j < g_cap.nopen && !mine; j++) mine = !strcmp(g_cap.open[j], kp); pthread_mutex_unlock(&g_cap.mu);
+            if (mine) continue;
+            nftw(kp, rm_cb, 16, FTW_DEPTH | FTW_PHYS); tot -= k[i].bytes; fr += (double)k[i].bytes; ev++; evb += k[i].bytes;
+        }
+        fprintf(stderr, "dcache: %s held %.1f GB in %zu keys (cap %.0f GB, %.0f GB free, floor %.0f): evicted %d least recently used (%.1f GB)%s\n", root,
+                (tot + evb) / 1e9, nk, cap / 1e9, (fr - evb) / 1e9, floor_b / 1e9, ev, evb / 1e9,
+                (cap > 0 && tot > cap) || (floor_b > 0 && fr < floor_b) ? "; still over: the rest are open here or used within the protect window" : "");
+    }
+    if (((cap > 0 && tot > cap) || (floor_b > 0 && fr < floor_b)) && nk && nk < 65536) {   /* the live keys themselves over the cap / under the floor: the least recently used cells */
+        t_nce = 0;
+        for (size_t i = 0; i < nk; i++) { char kp[1200]; snprintf(kp, sizeof kp, "%s/%s/", root, k[i].name); t_key = (int)i; t_kl = strlen(kp); nftw(kp, ce_cb, 16, FTW_PHYS); }
+        qsort(t_ce, t_nce, sizeof *t_ce, ce_cmp);
+        const double fill = env_num("UFSM_DCACHE_CELL_FILL", 0.9), target = cap * (fill > 0.1 && fill <= 1 ? fill : 0.9);
+        size_t ne = 0; uint64_t eb = 0; const int64_t newest_ev = t_nce ? t_ce[0].t : 0; int64_t last_t = 0;
+        pthread_mutex_lock(&g_ev.mu);
+        for (size_t i = 0; i < t_nce && ((cap > 0 && (double)tot > target) || (floor_b > 0 && fr < floor_b * 1.1)); i++) {
+            char cp[1300]; snprintf(cp, sizeof cp, "%s/%s/%s", root, k[t_ce[i].key].name, t_ce[i].rel);
+            if (unlink(cp)) continue;
+            ev_add(phash(cp)); tot -= t_ce[i].bytes; fr += t_ce[i].bytes; eb += t_ce[i].bytes; ne++; last_t = t_ce[i].t;
+        }
+        pthread_mutex_unlock(&g_ev.mu);
+        atomic_fetch_add(&g_dc.evicted, ne); atomic_fetch_add(&g_dc.evbytes, eb);
+        fprintf(stderr, "dcache: %s over the cap in live keys: evicted %zu least recently used cells (%.1f GB, last used %.1f to %.1f h ago) of %zu, now %.1f GB; "
+                "this process so far: %llu cells evicted, %llu of them recomputed\n", root, ne, eb / 1e9, ne ? (now - newest_ev) / 3600.0 : 0.0, ne ? (now - last_t) / 3600.0 : 0.0,
+                t_nce, tot / 1e9, (unsigned long long)atomic_load(&g_dc.evicted), (unsigned long long)atomic_load(&g_dc.recomp));
+        free(t_ce); t_ce = nullptr; t_nce = t_cce = 0;
+    }
+    free(k); flock(fd, LOCK_UN); close(fd); return 0;
+}
+static void *evict_thread(void *a) {
+    (void)a; const unsigned per = (unsigned)env_num("UFSM_DCACHE_CHECK_S", 600); sleep(10);
+    for (;;) { char r[1024]; pthread_mutex_lock(&g_cap.mu); snprintf(r, sizeof r, "%s", g_cap.root); pthread_mutex_unlock(&g_cap.mu); dcache_evict_pass(r); sleep(per > 10 ? per : 10); }
+    return nullptr;
+}
+static void cap_open(dc *c, const char *root) {   /* (an array with a disk dir opened: register it, start the evictor once) */
+    pthread_mutex_lock(&g_cap.mu);
+    if (g_cap.nopen < 512) g_cap.open[g_cap.nopen++] = strdup(c->dir);
+    if (!g_cap.started && (env_num("UFSM_DCACHE_GB", 200) > 0 || env_num("UFSM_DCACHE_FREE_GB", 50) > 0)) {
+        snprintf(g_cap.root, sizeof g_cap.root, "%s", root); pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        if (!pthread_create(&th, &at, evict_thread, nullptr)) g_cap.started = 1; pthread_attr_destroy(&at); }
+    pthread_mutex_unlock(&g_cap.mu);
+    atomic_store(&c->touched, 0); key_touch(c);
+}
+static void cap_close(dc *c) {
+    if (!c->dir) return; pthread_mutex_lock(&g_cap.mu);
+    for (int j = 0; j < g_cap.nopen; j++) if (!strcmp(g_cap.open[j], c->dir)) { free(g_cap.open[j]); g_cap.open[j] = g_cap.open[--g_cap.nopen]; break; }
+    pthread_mutex_unlock(&g_cap.mu);
+}
 static void cell_path_k(const dc *c, int64_t key, char *p, size_t np, int64_t *cz) {
     const int64_t z = key / (c->gc[1] * c->gc[2]), y = key / c->gc[2] % c->gc[1], x = key % c->gc[2]; *cz = z; cell_path(c, z, y, x, p, np);
 }
@@ -110,6 +306,7 @@ static int cell_disk(dc *c, dent *e) {   /* a claimed cell from disk: 1 found (d
     char p[1300]; int64_t cz; cell_path_k(c, e->key, p, sizeof p, &cz);
     const double t = dnow(); uint8_t *data = nullptr, cval = 0;
     if (disk_get(c, p, &data, &cval)) return 0;
+    utimensat(AT_FDCWD, p, nullptr, 0);   /* (the cell's last use: the per-cell LRU's order) */
     atomic_fetch_add(&g_dc.disk, 1); atomic_fetch_add(&g_dc.ns_disk, (uint64_t)((dnow() - t) * 1e9));
     e->data = data; e->cval = cval; return 1;
 }
@@ -118,11 +315,16 @@ static void cell_computed(dc *c, dent *e, uint8_t *data) {
     size_t k = 1; const size_t nb = cbytes(c); uint8_t cval = 0;
     while (k < nb && data[k] == data[0]) k++;
     if (k == nb) { cval = data[0]; free(data); data = nullptr; atomic_fetch_add(&g_dc.fill, 1); }   /* constant cells (most: no labels in reach) */
+    uint8_t *ph = nullptr; uint32_t phn = 0;
+    if (data && c->pdelta > 0 && ph_encode(c->C, c->pdelta, data, &ph, &phn)) ph = nullptr;   /* (data is now the reconstruction: memory == disk) */
     atomic_fetch_add(&g_dc.comp, 1);
     char p[1300]; int64_t cz;
-    if (c->dir) { cell_path_k(c, e->key, p, sizeof p, &cz);
-        if (disk_put(c, cz, p, data, cval) && !atomic_exchange(&c->disk_warned, 1)) fprintf(stderr, "dcache: cannot write %s (%s): memory only from here\n", p, strerror(errno)); }
-    e->data = data; e->cval = cval;
+    if (c->dir && !disk_room(c->dir)) atomic_fetch_add(&g_cap.skipped, 1);
+    else if (c->dir) { cell_path_k(c, e->key, p, sizeof p, &cz);
+        if (atomic_load(&g_dc.evicted)) { pthread_mutex_lock(&g_ev.mu); if (ev_has(phash(p))) atomic_fetch_add(&g_dc.recomp, 1); pthread_mutex_unlock(&g_ev.mu); }   /* (a failed write is retried on the next cell: the state recovers once space returns) */
+        if (disk_put(c, cz, p, data, cval, ph, phn) && !atomic_exchange(&c->disk_warned, 1)) fprintf(stderr, "dcache: cannot write %s (%s): this cell in memory only (later cells retried; warned once)\n", p, strerror(errno));
+        ph = nullptr; }
+    free(ph); e->data = data; e->cval = cval;
 }
 /* a claimed cell done: ok -> ready (referenced), else failed (nullptr) */
 static dent *cell_finish(dc *c, dent *e, int ok) {
@@ -213,7 +415,7 @@ static int dc_block(dc *c, const int64_t b0[3], const int64_t b1[3], const int64
     return rc;
 }
 static int dc_read(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
-    (void)base; dc *c = ctx; atomic_fetch_add(&g_dc.reads, 1);
+    (void)base; dc *c = ctx; atomic_fetch_add(&g_dc.reads, 1); key_touch(c);
     memset(out, c->fill, (size_t)n[0] * n[1] * n[2]);
     int64_t c0[3], c1[3];
     for (int d = 0; d < 3; d++) {
@@ -236,6 +438,11 @@ static int dc_read(void *ctx, z3 *base, const int64_t o[3], const int64_t n[3], 
     return 0;
 }
 #define DC_MAGIC 0x44434331u
+int dcache_set_phase(z3 *z, int delta) {
+    dc *c = z ? (dc *)z3_derived_ctx(z) : nullptr;
+    if (!c || c->magic != DC_MAGIC || delta < 0 || delta > 20) return -1;
+    c->pdelta = delta; return 0;
+}
 int dcache_set_batch(z3 *z, int edge) {
     dc *c = z ? (dc *)z3_derived_ctx(z) : nullptr;
     if (!c || c->magic != DC_MAGIC) return -1;
@@ -250,7 +457,7 @@ static void dc_free(void *p) {
         pthread_mutex_unlock(&P->mu);
         if (!P->shared) { pthread_mutex_destroy(&P->mu); pthread_cond_destroy(&P->cv); free(P); }
     }
-    free(c->hash); free(c->dir); free(c);
+    cap_close(c); free(c->hash); free(c->dir); free(c);
 }
 static dcache_pool *pool_new(size_t cap, int shared) {
     dcache_pool *P = calloc(1, sizeof *P); if (!P) return nullptr;
@@ -284,7 +491,7 @@ z3 *z3_open_cached_pool(z3 *inner, const char *dir, const char *key, int cell, d
     for (int d = 0; d < 3; d++) { c->shape[d] = m->shape[d]; c->gc[d] = (m->shape[d] + c->C - 1) / c->C; }
     c->nhash = 1 << 16; c->hash = calloc(c->nhash, sizeof *c->hash); c->P = pool;
     char d[1200];
-    if (dir && *dir && key && !dcache_key_dir(dir, key, d, sizeof d)) c->dir = strdup(d);
+    if (dir && *dir && key && !dcache_key_dir(dir, key, d, sizeof d)) { c->dir = strdup(d); cap_open(c, dir); }
     z3 *z = z3_open_derived(inner, c->fill, dc_read, c, dc_free);
     if (!z) { dc_free(c); z3_close(inner); }
     return z;

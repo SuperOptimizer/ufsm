@@ -6,6 +6,28 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The derived cache's disk cap (2026-11-14, branch dcachecap-20261114)
+
+~/.cache/ufsm/derived (src/dcache.c) had no bound: at 10:50 it held 336 GB in 274 keys and filled the desk's root filesystem under
+try6 (cells fell back to memory, an AFV query failed with "disk full"). By last write: 24 keys written within 6 h hold 334 GB (the
+on-the-fly pair-rule phase of try6's sources: Paris 4 codesA48 81 GB, gtjuly 60, codesB48 49, PHerc1218 39, ...), 250 older keys 3 GB.
+The phase cells compress 3.5x with zstd 3 (16.8 MB -> 4.2 MB per 256^3 cell); zstd 9 gives 4.8x, x or z deltas first <= 1.2x more: not
+worth a format change.
+
+Now: a key dir's inputs.txt mtime is its last use (touched at open and at most every 5 min of reads); a key's last use is that or its
+newest cell-dir mtime (the last write; binaries before this never touch). One background thread per process (one pass at a time per
+root: flock ROOT/.evict.lock) every UFSM_DCACHE_CHECK_S (600) s deletes whole key dirs, least recently used first, while the root
+holds more than UFSM_DCACHE_GB (150) or its filesystem has less than UFSM_DCACHE_FREE_GB (50) free; keys used within
+UFSM_DCACHE_PROTECT_MIN (60) minutes and keys open in the process are never deleted. Below half the free floor no cell is written
+(memory only, a line when it starts and when writes resume); a failed write no longer claims "memory only from here" (every later
+cell was always retried). So the cap removes stale keys and the floor keeps the filesystem from filling, but a live working set
+larger than the cap stays (try6's ~334 GB). Hence the per-cell LRU (same day, the user's plan): when the kept keys are still over
+the cap (default now 200 GB) or the filesystem under the floor, single cells go, least recently used first by the cell file's mtime
+(its write, or its last disk read: cell_disk touches it), down to UFSM_DCACHE_CELL_FILL (0.9) x the cap, open keys included. The
+process remembers the cells it evicted (path hashes) and counts a later compute of one as a recompute: the trainer's log line shows
+"N of them recomputes of evicted cells; M cells (G GB) evicted", the measure of whether 200 GB holds try6's revisit pattern. The root stays in ~:
+/vesuvius has 299 GB free of 1.9 TB (85 % used), less room than / after the 11-14 cleanup (235 GB free). test_dcache_cap (CPU).
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the
