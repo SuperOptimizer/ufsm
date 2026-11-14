@@ -6,6 +6,30 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Kernel numerics fixes, audit kernels.md #4-#7 (2026-11-14, branch kfix46-20261114)
+
+Source-only fixes, not built or tested (the audit's one final build-and-test sweep runs them). Each keeps the old bits wherever the old
+arithmetic stayed in range.
+- **#4: the fused-upsample half2 blend** (stage_up_smem_h2, f4ru_blend, stage_up_smem16_h2).
+  - Before: the fp16 tap weights carried the coarse block's scale, so the corner tap (1/64) went subnormal once a block's amax fell below
+    ~1.8, and large scales could overflow the half accumulator.
+  - Now: the weights are relative to the largest of the 8 blocks' scales (2^(e - e_max) <= 1), and 2^e_max is applied to the fp32 result.
+- **#5: the core-1 attention backward** (nn_attn_tc.cu).
+  - Before: dO went to fp16 with one per-tensor scale.
+  - Now: one scale per head (k_fa_amax_h: max |dO| and max |v| of head h into a per-device scratch, fa_amh), used by k_fa_bprep / k_fa_dkv
+    / k_fa_dq. Heads are independent, so each scale divides out within its head.
+  - lp_attn8 (core 2) keeps the tensor scale (at_fa_bprep without head scales).
+- **#6: SiLU / dSiLU through tanh.approx** (14 sites in lp_*).
+  - Before: 1 + tanh(h) cancelled for h < -1, so tanh.approx's ~2^-11 absolute error was most of silu(u) at u < -6.
+  - Now: tanh_silu takes h < -1 from exp (2^-24 absolute) and keeps tanh.approx elsewhere, so the bits are unchanged for u >= -2.
+- **#7: GN statistics of MX tensors** (gn_sums_mx2_k).
+  - Before: raw per-thread fp32 sums of x and x^2, then E[x^2] - m^2.
+  - Now: each thread accumulates x - c and (x - c)^2 with c its first row's value, recombined in double, and the reductions are in double
+    into the fixed-point slots.
+  - Variance error for mean / std 10 drops from ~1e-4 to ~1e-7.
+  - The block partition is unchanged, so slab-vs-whole and split statistics stay consistent with each other. Split-vs-one-GPU byte
+    tests may move by one ulp: the slots now receive doubles, where they received float partials before.
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the

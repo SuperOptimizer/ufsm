@@ -13,10 +13,13 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 
 #define HD AT_HD
 #define FT 64   /* tile rows */
+#define FA_HMAX 64   /* the per-head scale slots (fa_amh) */
 #define FS 56   /* shared-memory row stride (halfs) */
 
 __device__ __forceinline__ void cpa16(void *s, const void *g) {
@@ -196,26 +199,39 @@ __global__ void __launch_bounds__(128) k_fa_fwd(const __half *__restrict__ Qh, c
     }
 }
 
-/* ---- backward prologue: amx[0] = max |dO| ---- */
+/* ---- backward prologue: amx[0] = max |dO|; the core-1 path per head: amh[h] = max |dO| of head h, amh[FA_HMAX + h] max |v| of head h
+   (from the packed fp16 v; amh: a per-device scratch, fa_amh, filled and read within one backward call).
+   One fp16 scale per head instead of per tensor (audit 2026-11-14 kernels.md #5: a head whose |dO| sat 1e4 below the tensor's largest
+   went to fp16 subnormals); heads are independent in the backward, so each scale divides out within its own head. Bits unchanged
+   wherever the per-tensor scale kept the head's values normal (a power of two either way). lp_attn8 (core 2) keeps the tensor scale ---- */
 __global__ void k_fa_amax(const float *__restrict__ x, long long n, float *amx) {
     float m = 0.f;
     for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) m = fmaxf(m, fabsf(x[i]));
     for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
     if (!(threadIdx.x & 31)) atomicMax((unsigned *)amx, __float_as_uint(m));
 }
-__device__ __forceinline__ int fa_e(const float *amx) { const float a = amx[0]; return a > 0.f && a < INFINITY ? -ilogbf(a) - 1 : 0; }   /* |dO| 2^e < 1 */
-__device__ __forceinline__ int fa_ks(const float *amx) {   /* 48 |dO 2^e| max|v| 2^kS <= 2^14 */
-    const float b = 48.f * fmaxf(amx[1], 1e-30f); int k = 14 - ilogbf(b) - 1; return k < -30 ? -30 : k > 30 ? 30 : k;
+__global__ void k_fa_amax_h(const float *__restrict__ x, const __half *__restrict__ Vh, long long T, long long Tp, int C, float *amh) {   /* grid (blocks, H) */
+    const int h = blockIdx.y; float m = 0.f, mv = 0.f;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < T * HD; i += (long long)gridDim.x * blockDim.x) {
+        m = fmaxf(m, fabsf(x[(i / HD) * C + h * HD + i % HD])); mv = fmaxf(mv, fabsf(__half2float(Vh[(size_t)h * Tp * HD + i])));
+    }
+    for (int o = 16; o; o >>= 1) { m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o)); mv = fmaxf(mv, __shfl_xor_sync(0xffffffffu, mv, o)); }
+    if (!(threadIdx.x & 31)) { atomicMax((unsigned *)amh + h, __float_as_uint(m)); atomicMax((unsigned *)amh + FA_HMAX + h, __float_as_uint(mv)); }
+}
+/* h < 0: the tensor's scales (amx[0], amx[1]: lp_attn8); h >= 0: head h's (amh) */
+__device__ __forceinline__ int fa_e(const float *amx, const float *amh = nullptr, int h = -1) { const float a = h < 0 ? amx[0] : amh[h]; return a > 0.f && a < INFINITY ? -ilogbf(a) - 1 : 0; }   /* |dO| 2^e < 1 */
+__device__ __forceinline__ int fa_ks(const float *amx, const float *amh = nullptr, int h = -1) {   /* 48 |dO 2^e| max|v| 2^kS <= 2^14 */
+    const float b = 48.f * fmaxf(h < 0 ? amx[1] : amh[FA_HMAX + h], 1e-30f); int k = 14 - ilogbf(b) - 1; return k < -30 ? -30 : k > 30 ? 30 : k;
 }
 /* D = dO . O per (row, head), scaled by 2^e; dO scaled -> fp16 head-major (rows T..T+63 zero) */
 template <typename TO>
-__global__ void k_fa_bprep(const TO *__restrict__ o, const float *__restrict__ dO, const float *amx, __half *dOh, float *Dv, long long T, int S, int C) {
+__global__ void k_fa_bprep(const TO *__restrict__ o, const float *__restrict__ dO, const float *amx, const float *amh, __half *dOh, float *Dv, long long T, int S, int C) {
     const int H = C / HD; const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
     if (i >= (T + FT) * H) return;
     const int h = (int)(i % H); const long long t = i / H;
     __half *dst = dOh + ((size_t)h * (T + FT) + t) * HD;
     if (t >= T) { for (int d = 0; d < HD; d += 8) *(uint4 *)(dst + d) = make_uint4(0, 0, 0, 0); return; }
-    const float sc = exp2f((float)fa_e(amx)); const TO *orow = o + t * C + h * HD; const float *grow = dO + t * C + h * HD;
+    const float sc = exp2f((float)fa_e(amx, amh, amh ? h : -1)); const TO *orow = o + t * C + h * HD; const float *grow = dO + t * C + h * HD;
     float a = 0.f;
 #pragma unroll
     for (int d = 0; d < HD; d += 8) {
@@ -229,7 +245,7 @@ __global__ void k_fa_bprep(const TO *__restrict__ o, const float *__restrict__ d
 
 /* ---- dK, dV: grid (ceil(S / 64) key tiles, H, nseq); query tiles stream ---- */
 __global__ void __launch_bounds__(128) k_fa_dkv(const __half *__restrict__ Qh, const __half *__restrict__ Kh, const __half *__restrict__ Vh, const __half *__restrict__ dOh,
-                                                const float *__restrict__ lse, const float *__restrict__ Dv, const float *__restrict__ amx, float *__restrict__ dqkn,
+                                                const float *__restrict__ lse, const float *__restrict__ Dv, const float *__restrict__ amx, const float *__restrict__ amh, float *__restrict__ dqkn,
                                                 int S, int H, int C, long long Tp, float sl2, float scale, const int *lens) {
     const int seq = blockIdx.z, h = blockIdx.y, j0 = blockIdx.x * FT, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     __shared__ __align__(16) __half Qs[2][FT * FS], Gs[2][FT * FS];
@@ -237,7 +253,7 @@ __global__ void __launch_bounds__(128) k_fa_dkv(const __half *__restrict__ Qh, c
     const size_t base = (size_t)h * Tp + (size_t)seq * S;
     const __half *Q = Qh + base * HD, *K = Kh + base * HD, *V = Vh + base * HD, *G = dOh + base * HD;
     const float *L = lse + ((size_t)seq * H + h) * S, *Dr = Dv + ((size_t)seq * H + h) * S;
-    const int e = fa_e(amx), ks = fa_ks(amx); const float sks = exp2f((float)ks);
+    const int e = fa_e(amx, amh, h), ks = fa_ks(amx, amh, h); const float sks = exp2f((float)ks);   /* (per head: k_fa_amax_h) */
     const int nt = (S + FT - 1) / FT, SK = lens ? lens[seq] : S;
     /* (a masked key's row: P 0, not exp2(s - lse), which overflows once its score passes the valid keys' -> inf x 0 = NaN) */
     const float kv[2] = {j0 + warp * 16 + g < SK ? 1.f : 0.f, j0 + warp * 16 + g + 8 < SK ? 1.f : 0.f};
@@ -288,14 +304,14 @@ __global__ void __launch_bounds__(128) k_fa_dkv(const __half *__restrict__ Qh, c
 
 /* ---- dQ: grid (ceil(S / 64) query tiles, H, nseq); key tiles stream ---- */
 __global__ void __launch_bounds__(128) k_fa_dq(const __half *__restrict__ Qh, const __half *__restrict__ Kh, const __half *__restrict__ Vh, const __half *__restrict__ dOh,
-                                               const float *__restrict__ lse, const float *__restrict__ Dv, const float *__restrict__ amx, float *__restrict__ dqkn,
+                                               const float *__restrict__ lse, const float *__restrict__ Dv, const float *__restrict__ amx, const float *__restrict__ amh, float *__restrict__ dqkn,
                                                int S, int H, int C, long long Tp, float sl2, float scale, const int *lens) {
     const int seq = blockIdx.z, h = blockIdx.y, q0 = blockIdx.x * FT, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     __shared__ __align__(16) __half Ks[2][FT * FS], Vs[2][FT * FS];
     const size_t base = (size_t)h * Tp + (size_t)seq * S;
     const __half *Q = Qh + base * HD, *K = Kh + base * HD, *V = Vh + base * HD, *G = dOh + base * HD;
     const float *L = lse + ((size_t)seq * H + h) * S, *Dr = Dv + ((size_t)seq * H + h) * S;
-    const int e = fa_e(amx), ks = fa_ks(amx); const float sks = exp2f((float)ks);
+    const int e = fa_e(amx, amh, h), ks = fa_ks(amx, amh, h); const float sks = exp2f((float)ks);   /* (per head: k_fa_amax_h) */
     const int SK = lens ? lens[seq] : S, nt = (SK + FT - 1) / FT;
     stage(Ks[0], K, tid); stage(Vs[0], V, tid); cpa_commit();
     unsigned qa[3][4], ga[3][4]; const int i0 = q0 + warp * 16 + g; afrag(qa, Q, i0, t); afrag(ga, G, i0, t);
@@ -336,13 +352,21 @@ __global__ void __launch_bounds__(128) k_fa_dq(const __half *__restrict__ Qh, co
 
 static unsigned nbk(long long n, int t) { return (unsigned)((n + t - 1) / t); }
 /* the backward prologue: amx[0] = max |dO|, D = dO . O (x 2^e) per (row, head), dO x 2^e -> fp16 head-major doh */
-template <typename TO> static void fa_bprep(const TO *o, const float *dO, float *amx, void *doh, float *Dv, const at_geom *g, int C) {
+static float *g_fa_amh[32];   /* mgpu: per-device (the per-head scale scratch, 2 FA_HMAX floats, filled and read within one backward call on its device's stream) */
+static float *fa_amh(void) {
+    int dv = 0; cudaGetDevice(&dv); dv &= 31;
+    if (!g_fa_amh[dv] && cudaMalloc(&g_fa_amh[dv], 2 * FA_HMAX * sizeof(float)) != cudaSuccess) { fprintf(stderr, "attention: no device memory for the head scales\n"); abort(); }
+    return g_fa_amh[dv];
+}
+/* amh: per-head scales (core 1: amh filled here from dO and the packed v Vh); nullptr: the tensor's (lp_attn8) */
+template <typename TO> static void fa_bprep(const TO *o, const float *dO, float *amx, float *amh, const __half *Vh, void *doh, float *Dv, const at_geom *g, int C) {
     const long long T = (long long)g->nseq * g->S, Tp = T + FT; const int H = C / HD;
     cudaMemsetAsync(amx, 0, sizeof(float), 0);
     k_fa_amax<<<120, 256>>>(dO, T * C, amx);
-    k_fa_bprep<TO><<<nbk(Tp * H, 128), 128>>>(o, dO, amx, (__half *)doh, Dv, T, g->S, C);
+    if (amh) { cudaMemsetAsync(amh, 0, 2 * FA_HMAX * sizeof(float), 0); const unsigned nb = nbk(T * HD, 256); k_fa_amax_h<<<dim3(nb < 64 ? nb : 64, H), 256>>>(dO, Vh, T, Tp, C, amh); }
+    k_fa_bprep<TO><<<nbk(Tp * H, 128), 128>>>(o, dO, amx, amh, (__half *)doh, Dv, T, g->S, C);
 }
-extern "C" void at_fa_bprep(const float *o, const float *dO, float *amx, void *doh, float *Dv, const at_geom *g, int C) { fa_bprep(o, dO, amx, doh, Dv, g, C); }
+extern "C" void at_fa_bprep(const float *o, const float *dO, float *amx, void *doh, float *Dv, const at_geom *g, int C) { fa_bprep(o, dO, amx, (float *)nullptr, (const __half *)nullptr, doh, Dv, g, C); }   /* (lp_attn8: the tensor scale) */
 template <typename TI> static void fa_pack(const TI *qkv, const float *qg, const float *kg, void *qkvh, float *rq, float *rk, float *amx, const at_geom *g, int nreg, int C, int rope, float base) {
     const long long T = (long long)g->nseq * g->S, Tp = T + FT; const int H = C / HD;
     __half *Qh = (__half *)qkvh, *Kh = Qh + (size_t)H * Tp * HD, *Vh = Kh + (size_t)H * Tp * HD;
@@ -368,11 +392,13 @@ extern "C" void at_fa_fwd_bf(const void *qkvh, void *o, float *lse, const at_geo
 template <typename TO> static void fa_bwd(const void *qkvh, void *doh, const TO *o, const float *lse, const float *dO, float *Dv, float *amx, float *dqkn, const at_geom *g, int H, int C) {
     const long long T = (long long)g->nseq * g->S, Tp = T + FT;
     const __half *Qh = (const __half *)qkvh, *Kh = Qh + (size_t)H * Tp * HD, *Vh = Kh + (size_t)H * Tp * HD; __half *Gh = (__half *)doh;
-    fa_bprep(o, dO, amx, Gh, Dv, g, C);
+    if (C / HD > FA_HMAX) { fprintf(stderr, "attention: more than %d heads\n", FA_HMAX); abort(); }
+    float *amh = fa_amh();
+    fa_bprep(o, dO, amx, amh, Vh, Gh, Dv, g, C);
     const float scale = 1.f / sqrtf((float)HD), sl2 = scale * 1.4426950408889634f;
     dim3 gr(nbk(g->S, FT), H, g->nseq);
-    k_fa_dkv<<<gr, 128>>>(Qh, Kh, Vh, Gh, lse, Dv, amx, dqkn, g->S, H, C, Tp, sl2, scale, g->lens);
-    k_fa_dq<<<gr, 128>>>(Qh, Kh, Vh, Gh, lse, Dv, amx, dqkn, g->S, H, C, Tp, sl2, scale, g->lens);
+    k_fa_dkv<<<gr, 128>>>(Qh, Kh, Vh, Gh, lse, Dv, amx, amh, dqkn, g->S, H, C, Tp, sl2, scale, g->lens);
+    k_fa_dq<<<gr, 128>>>(Qh, Kh, Vh, Gh, lse, Dv, amx, amh, dqkn, g->S, H, C, Tp, sl2, scale, g->lens);
 }
 extern "C" void at_fa_bwd(const void *qkvh, void *doh, const float *o, const float *lse, const float *dO, float *Dv, float *amx, float *dqkn, const at_geom *g, int H, int C) {
     fa_bwd(qkvh, doh, o, lse, dO, Dv, amx, dqkn, g, H, C);

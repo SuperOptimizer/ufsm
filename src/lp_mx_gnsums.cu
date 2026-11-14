@@ -12,16 +12,19 @@ __global__ void __launch_bounds__(256) gn_sums_mx2_k(const uint8_t *x, int N, in
     size_t q0 = S * blockIdx.x / nsl, q1 = S * (blockIdx.x + 1) / nsl;
     if (q0 < v0) q0 = v0;
     if (q1 > v1) q1 = v1;
-    __shared__ float w1[8][32], w2[8][32];
-    w1[threadIdx.x >> 5][threadIdx.x & 31] = 0.f; w2[threadIdx.x >> 5][threadIdx.x & 31] = 0.f;
+    __shared__ double w1[8][32], w2[8][32];
+    w1[threadIdx.x >> 5][threadIdx.x & 31] = 0.; w2[threadIdx.x >> 5][threadIdx.x & 31] = 0.;
     __syncthreads();
     const int kmax = max(0, min(min(bw, C - blk * bw) - h0, 16));
     const size_t rbase = ((size_t)n * nb + blk) * S;
     const uint8_t *sx = mx_sc<B>(x, N, C, S);
     const int rbx = mx_rb(bw, B);
-    float s1[16], s2[16];
+    /* per thread, shifted by its first row's value c (audit 2026-11-14 kernels.md #7): the fp32 sums of x - c and (x - c)^2 (~the group's
+       spread, not its mean) and their double recombination below. Raw fp32 sums of x^2 lost the variance to E[x^2] - m^2 cancellation
+       for groups whose mean is large against their spread (mean / std 10: ~1e-4 relative); now ~1e-7 */
+    float s1[16], s2[16], c[16]; int cnt = 0;
 #pragma unroll
-    for (int k = 0; k < 16; k++) { s1[k] = 0.f; s2[k] = 0.f; }
+    for (int k = 0; k < 16; k++) { s1[k] = 0.f; s2[k] = 0.f; c[k] = 0.f; }
     uint4 xw = make_uint4(0u, 0u, 0u, 0u); unsigned xs = 0u;
     auto load = [&](size_t v) {
         const size_t ri = rbase + v;
@@ -50,23 +53,29 @@ __global__ void __launch_bounds__(256) gn_sums_mx2_k(const uint8_t *x, int N, in
                 r[4 * j] = a.x * fx; r[4 * j + 1] = a.y * fx; r[4 * j + 2] = b2.x * fx; r[4 * j + 3] = b2.y * fx;
             }
         }
+        if (!cnt) {
 #pragma unroll
-        for (int k = 0; k < 16; k++) if (k < kmax) { s1[k] += r[k]; s2[k] = fmaf(r[k], r[k], s2[k]); }
+            for (int k = 0; k < 16; k++) c[k] = r[k];
+        }
+        cnt++;
+#pragma unroll
+        for (int k = 0; k < 16; k++) if (k < kmax) { const float d = r[k] - c[k]; s1[k] += d; s2[k] = fmaf(d, d, s2[k]); }
     }
 #pragma unroll
     for (int k = 0; k < 16; k++) {
-        float a = s1[k], b2 = s2[k];
+        const double ck = (double)c[k], nk = (double)cnt;
+        double a = (double)s1[k] + nk * ck, b2 = (double)s2[k] + 2. * ck * (double)s1[k] + nk * ck * ck;   /* sum x, sum x^2 of the thread's rows */
         for (int o = 16; o >= HPB; o >>= 1) { a += __shfl_xor_sync(0xffffffff, a, o); b2 += __shfl_xor_sync(0xffffffff, b2, o); }
         if ((int)(threadIdx.x & 31) < HPB && k < kmax) { w1[threadIdx.x >> 5][h0 + k] = a; w2[threadIdx.x >> 5][h0 + k] = b2; }
     }
     __syncthreads();
     const int kb = min(bw, C - blk * bw);
     if ((int)threadIdx.x < kb) {
-        float a = 0.f, b2 = 0.f;
+        double a = 0., b2 = 0.;
 #pragma unroll
         for (int w = 0; w < 8; w++) { a += w1[w][threadIdx.x]; b2 += w2[w][threadIdx.x]; }
         const size_t o = 2 * ((size_t)n * G + (blk * bw + (int)threadIdx.x) / cpg);
-        gn_acc_add(sums, o, (double)a); gn_acc_add(sums, o + 1, (double)b2);   /* exact fixed point (src/gnacc.cuh) */
+        gn_acc_add(sums, o, a); gn_acc_add(sums, o + 1, b2);   /* exact fixed point (src/gnacc.cuh) */
     }
 }
 extern "C" int lp_gn_sums_mx(const void *x, int xdt, int N, int C, int G, size_t S, double *sums, size_t v0, size_t v1) { return lp_gn_sums_mx_n(x, xdt, N, C, G, S, sums, v0, v1, 0, N); }

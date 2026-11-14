@@ -268,7 +268,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                         const float g = (c & 1) ? gd.y : gd.x, r = ((c & 1) ? xd.y : xd.x) * mx_scale((as4 >> (8 * j)) & 0xffu);
                         const float fg = mx_scale((gs4 >> (8 * j)) & 0xffu);
                         const float p = fmaf(r, c4.x, c4.y);
-                        float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+                        float th = tanh_silu(p);
                         const float d2 = (1.f + th) * (fmaf(-p, th, p) + 1.f);
                         const float o = fmaf(g * d2 * c4.x, fg, fmaf(r, c4.z, c4.w));
                         v[i + j] = cok ? o : 0.f;
