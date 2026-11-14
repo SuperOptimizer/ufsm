@@ -150,7 +150,20 @@ int main(void) {
             float *dgz = nn_malloc(no * 4); nn_h2d(dgz, gz, no * 4);
             void *glz = nn_malloc(no * 2), *gl8 = nn_malloc(8 * S * 2); nn_f32_to_h16(dgz, no, glz, gs); nn_f32_to_h16(dgz + c0 * S, 8 * S, gl8, gs);
             uint16_t *l8 = malloc(8 * S * 2);
-            nn_set_sr_step(3000); unet_forward(u, x, xs, 1); unet_zero_grad(u); nn_set_sr_step(3100); unet_backward_x(u, glz, 1); unet_grad_d2h(u, g4);
+            /* the head's backward-data on the tensor cores (lp_conv1_to_mx_tc, default on) is not bit-identical to the 8-output net's FFMA kernel: its gx
+               moves by ~8e-3 and every MX-fp4 SR flip after it spreads through the trunk. So the exact comparison runs on the FFMA kernel, and the
+               tensor-core gradient must stay within the SR noise floor (the same net and kernel, another SR seed) */
+            const int btc = CO > 16 && lp_head_btc_on();
+            double e_tc = 0, e_fl = 0;
+            if (btc) {
+                float *gt = malloc(np * 4), *gn = malloc(np * 4);
+                nn_set_sr_step(3000); unet_forward(u, x, xs, 1); unet_zero_grad(u); nn_set_sr_step(3100); unet_backward_x(u, glz, 1); unet_grad_d2h(u, gt);
+                lp_set_head_btc(0);
+                nn_set_sr_step(3000); unet_forward(u, x, xs, 1); unet_zero_grad(u); nn_set_sr_step(3171); unet_backward_x(u, glz, 1); unet_grad_d2h(u, gn);
+                nn_set_sr_step(3000); unet_forward(u, x, xs, 1); unet_zero_grad(u); nn_set_sr_step(3100); unet_backward_x(u, glz, 1); unet_grad_d2h(u, g4);
+                e_tc = rel2(gt, g4, ow); e_fl = rel2(gn, g4, ow);
+                free(gt); free(gn);
+            } else { nn_set_sr_step(3000); unet_forward(u, x, xs, 1); unet_zero_grad(u); nn_set_sr_step(3100); unet_backward_x(u, glz, 1); unet_grad_d2h(u, g4); }
             nn_set_sr_step(3000); const float *lv = unet_forward(v, x, xs, 1); unet_zero_grad(v); nn_sync();
             const int v16 = unet_logits_h16(v);   /* (fp32 logits where the layout gives them no 16-bit buffer of their own: MX-fp8, 96 inputs, 8 outputs) */
             float *l8f = malloc(8 * S * 4); if (v16) nn_d2h(l8, lv, 8 * S * 2); else nn_d2h(l8f, lv, 8 * S * 4);
@@ -160,7 +173,9 @@ int main(void) {
                                                          (lp_mx_conv1.cu conv1_mx_tc_k, perf2 11-13) against the 8-output FFMA passes: fp16 activations and weights, max 3.9e-3 seen) */
             free(l8f);
             const double et = rel2(g4 + ne0, g8 + ne0, ow - ne0), ee = rel2(g4, g8, ne0), eh = rel2(g4 + ow + (size_t)c0 * C0, g8 + ow8, (size_t)8 * C0), ed = rel2(g4 + ob + CO, g8 + ob8 + 8, np8 - ob8 - 8);
-            const int ok = lay && !lneq && et < 1e-5 && ee < 1e-5 && eh < 1e-5 && ed < 1e-5;
+            if (btc) lp_set_head_btc(-1);
+            const int ok = lay && !lneq && et < 1e-5 && ee < 1e-5 && eh < 1e-5 && ed < 1e-5 && (!btc || e_tc < 1.5 * e_fl + 1e-3);
+            if (btc) printf("    tensor-core head bwd-data: trunk + head grads rel %.3g vs the FFMA kernel, SR noise floor (another seed) %.3g%s\n", e_tc, e_fl, e_tc < 1.5 * e_fl + 1e-3 ? "" : "  FAIL");
             printf("  %d -> %d head, gradient on outputs %d..%d vs the 8-output net: layout %d, logits differ %zu (max %.3g), trunk grads rel %.3g (enc[0] %.3g), head rows %.3g, down norms %.3g%s\n",
                    C0, CO, c0, c0 + 7, lay, lneq, lmax, et, ee, eh, ed, ok ? "" : "  FAIL");
             if (!ok) bad++;

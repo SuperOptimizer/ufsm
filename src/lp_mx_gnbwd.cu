@@ -1038,16 +1038,32 @@ template <typename TG, int YB> static void conv1_to_mx_t(const TG *x, int N, int
    split-half slab of 4 x 256^2 cells: ~3 ms). Here a block takes 64 cells x 256 outputs (a warp per 32-channel MX block), K in chunks of
    32 through shared memory (fp16 weights from a converted copy, the gradients transposed to [cell][k]), m16n8k16 MMAs with fp32
    accumulation, and each cell's 32 sums leave through mx_store_row_b (the same SR draw per element as the FFMA kernel; the sums differ by
-   the weights' fp16 rounding and the order). UFSM_HEAD_BTC=1: on (default off: test_head_tc passes, but test_lat_head's "second equal net" differs with it on, rel 0.4; open). */
+   the weights' fp16 rounding and the order). UFSM_HEAD_BTC=0: the FFMA kernel. Default on since 2026-11-14 (fuse): the weight rows scaled by powers of two before the fp16 conversion (c1b_wh_k,
+   perf2's patch; small latent-head weights were fp16 subnormals: rel 0.26 at |w| ~3e-7, now 8e-3 as at 0.1); test_lat_head's 144-vs-8-output
+   trunk check compares the FFMA path exactly and the tensor-core one against the SR noise floor (a different SR seed). */
 enum { C1B_N = 64 };
-__global__ void c1b_wh_k(const float *w, __half *wh, int Co, int Ci, int Kp) {   /* [Co][Ci] fp32 -> [Co][Kp] fp16, zero padded */
-    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= (size_t)Co * Kp) return;
-    const int co = (int)(i / Kp), k = (int)(i % Kp);
-    wh[i] = __float2half(k < Ci ? w[(size_t)co * Ci + k] : 0.f);
+/* [Co][Ci] fp32 -> [Co][Kp] fp16, zero padded, each row times a power of two 2^e that puts its largest |w| into [2^14, 2^15) (a block per
+   row; rs[co] = 2^-e undoes it exactly on the fp32 sums). Unscaled, the small weights of the latent heads (~1e-5) fell into fp16's
+   subnormals and lost most of their bits: test_lat_head's 144-output head differed by 0.3 from the 8-output FFMA path */
+__global__ void __launch_bounds__(256) c1b_wh_k(const float *w, __half *wh, float *rs, int Co, int Ci, int Kp) {
+    const int co = blockIdx.x;
+    __shared__ unsigned sm;
+    if (threadIdx.x == 0) sm = 0u;
+    __syncthreads();
+    unsigned m = 0u;
+    for (int k = threadIdx.x; k < Ci; k += blockDim.x) { const float v = fabsf(w[(size_t)co * Ci + k]); if (v == v && __float_as_uint(v) > m) m = __float_as_uint(v); }
+    atomicMax(&sm, m);
+    __syncthreads();
+    const unsigned am = sm;
+    int e = 0;   /* (zero / non-finite rows: unscaled) */
+    if (am > 0u && am < 0x7f800000u) { const int ex = (int)(am >> 23) - 127; e = min(max(14 - ex, -100), 100); }   /* (subnormal am: ex -127, e 100; |w| 2^e < 2^-26 there) */
+    const float sc = exp2f((float)e);
+    for (int k = threadIdx.x; k < Kp; k += blockDim.x) wh[(size_t)co * Kp + k] = __float2half(k < Ci ? w[(size_t)co * Ci + k] * sc : 0.f);
+    if (threadIdx.x == 0) rs[co] = exp2f((float)-e);
 }
 template <int YB>
 __global__ void __launch_bounds__(256) conv1_to_mx_tc_k(const __half *__restrict__ gy, const __half *__restrict__ wh, uint8_t *__restrict__ y, int N, int Co, size_t S,
-                                                        unsigned sr, int Ci, int Kp, size_t vbase, size_t vn) {
+                                                        const float *__restrict__ rs, unsigned sr, int Ci, int Kp, size_t vbase, size_t vn) {
     __shared__ __align__(16) unsigned char c1b_sm[8 * 32 * 33 * 4];   /* the staging (sA 256 x 40, sB 64 x 40 halves) or the epilogue patches */
     __half (*sA)[40] = (__half (*)[40])c1b_sm, (*sB)[40] = (__half (*)[40])(c1b_sm + 256 * 40 * 2);
     float (*pt)[32][33] = (float (*)[32][33])c1b_sm;
@@ -1110,7 +1126,7 @@ __global__ void __launch_bounds__(256) conv1_to_mx_tc_k(const __half *__restrict
         if (blk < nb && cl < vn) {
             float r[32];
 #pragma unroll
-            for (int k = 0; k < 32; k++) r[k] = pt[warp][k][lane];
+            for (int k = 0; k < 32; k++) r[k] = pt[warp][k][lane] * __ldg(rs + 32 * blk + k);   /* (exact: a power of two) */
             mx_store_row_b<YB>(y, ysc, ((size_t)n * nb + blk) * S + vbase + cl, 32, r, sr);
         }
         __syncwarp();
@@ -1118,16 +1134,18 @@ __global__ void __launch_bounds__(256) conv1_to_mx_tc_k(const __half *__restrict
 }
 static int g_head_btc = -1;
 template <int YB> static bool conv1_to_mx_tc(const __half *x, int N, int Ci, size_t S, const float *w, int Co, void *y, unsigned sr, size_t vb, size_t vn) {
-    if (g_head_btc < 0) g_head_btc = getenv("UFSM_HEAD_BTC") ? atoi(getenv("UFSM_HEAD_BTC")) : 0;   /* (default off again: test_lat_head's second equal net differs, open) */
+    if (g_head_btc < 0) g_head_btc = getenv("UFSM_HEAD_BTC") ? atoi(getenv("UFSM_HEAD_BTC")) : 1;   /* (default on since fuse 2026-11-14: the row scales; UFSM_HEAD_BTC=0 the FFMA kernel) */
     if (!g_head_btc || Ci <= 16 || Ci > 192 || Co % 32) return false;
     const int Kp = (Ci + 31) / 32 * 32;
-    __half *wh = lp_buf<__half>(0, (size_t)Co * Kp);   /* (the only fp16 lp_buf: per element type, slots 0..5) */
-    c1b_wh_k<<<nblk_((size_t)Co * Kp, 256), 256>>>(w, wh, Co, Ci, Kp);
+    __half *wh = lp_buf<__half>(0, (size_t)Co * Kp + 2 * (size_t)Co);   /* (the only fp16 lp_buf: per element type, slots 0..5); then the row scales */
+    float *rs = (float *)(wh + (size_t)Co * Kp);   /* (Co Kp even: Kp a multiple of 32) */
+    c1b_wh_k<<<Co, 256>>>(w, wh, rs, Co, Ci, Kp);
     const size_t nv = vn ? vn : S;
-    conv1_to_mx_tc_k<YB><<<dim3((unsigned)((nv + C1B_N - 1) / C1B_N), N, (unsigned)((Co + 255) / 256)), 256>>>(x, wh, (uint8_t *)y, N, Co, S, sr, Ci, Kp, vb, nv);
+    conv1_to_mx_tc_k<YB><<<dim3((unsigned)((nv + C1B_N - 1) / C1B_N), N, (unsigned)((Co + 255) / 256)), 256>>>(x, wh, (uint8_t *)y, N, Co, S, rs, sr, Ci, Kp, vb, nv);
     return true;
 }
-extern "C" void lp_set_head_btc(int on) { g_head_btc = on; }   /* tests: the tensor-core head backward-data on / off (-1: env UFSM_HEAD_TC) */
+extern "C" void lp_set_head_btc(int on) { g_head_btc = on; }
+extern "C" int lp_head_btc_on(void) { if (g_head_btc < 0) g_head_btc = getenv("UFSM_HEAD_BTC") ? atoi(getenv("UFSM_HEAD_BTC")) : 1; return g_head_btc != 0; }   /* tests: the tensor-core head backward-data on / off (-1: env UFSM_HEAD_TC) */
 /* the same over rows [vb, vb + vn) (x holding vn voxels per channel; the level-0 slab stream's head, stage S4): fp16 / bf16 / fp32 x */
 extern "C" void lp_conv1_to_mx_r(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr, size_t vb, size_t vn) {
     if (Ci > 192) { fprintf(stderr, "lp_conv1_to_mx_r: Ci %d > 192\n", Ci); abort(); }
