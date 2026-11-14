@@ -6,7 +6,7 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
-## Fast math everywhere; UFSM_STRICT_MATH=ON for the bit-exact build (2026-11-14, branch fastmath-20261114)
+## Fast math everywhere, native builds, LTO / PGO; UFSM_STRICT_MATH=ON for the bit-exact build (2026-11-14, branch fastmath-20261114)
 
 The user: "enable fast math everything". Before: host C `-ffp-contract=off -fno-math-errno` (IEEE), the CUDA units nvcc
 `-use_fast_math` except the 11 `UFSM_STRICT_UNITS` (nn_gpudec nn_cf nn_ftrace nn_latvol nn_band nn_fibre nn_inkfly nn_gpuenc
@@ -18,11 +18,36 @@ nn_mcodes nn_faces nn_render: `-fmad=false`, IEEE), so those matched their CPU v
   are folded to false under finite-math-only, i.e. the guards silently deleted. Checked: no code relies on signed zeros (the
   copysignf sites take the sign of nonzero data) or on libm errno (the errno reads follow strtod and I/O). No compensated sums or
   magic-constant rounding tricks in src / third_party (grep: Kahan, TwoSum, 0x1.8p23 ...), which reassociation would break.
-  `-ffast-math` is a compile flag only, not on the link line, so crtfastmath.o (process-wide FTZ / DAZ) is not linked: host
-  denormals stay IEEE.
+  (FTZ / DAZ: see the widening below.)
 - Every CUDA unit gets `UFSM_CU_FAST` (nvcc `-use_fast_math`), the former strict units included.
 - `-DUFSM_STRICT_MATH=ON` restores the old flags exactly (host and the strict units) and defines `UFSM_STRICT_MATH` for the tests;
   CMake writes `$BUILD/strict_math` (0 / 1) for the shell tests.
+
+Widened the same day (user: "all possible optimizations everywhere", "fast fp contract etc unsafe optimizations", "native
+optimization"):
+- Host: `-ffp-contract=fast` explicit, `-mtune=native`, `-fno-plt -fno-semantic-interposition -fomit-frame-pointer` (-g kept), and
+  FTZ / DAZ in MXCSR set by a constructor (`src/fpenv.c`, linked into every executable by `ufsm_exe`; crtfastmath.o is not used
+  because clang links it only from a gcc installation, not with compiler-rt). New threads inherit MXCSR from their creator
+  (POSIX), and the constructor runs before main. Under UFSM_STRICT_MATH the file is empty.
+- LTO: `UFSM_LTO=full` (default in release dirs; `off` under UFSM_VERIFY because the suite links ~250 executables against CORE and
+  each would be a whole-program LTO link; `thin` with `UFSM_LTO_JOBS`). Consequence: the suite tests the non-LTO host code, and
+  the shipped binary differs from it by cross-unit inlining (with fast math this can move roundings by an ulp).
+- PGO: `UFSM_PGO=gen|use`, `UFSM_PGO_DIR` (default <repo>/pgo). `scripts/toolchain/pgo_collect.sh WORKLOAD` builds an
+  instrumented `build-pgo/`, runs the workload lines with `$U`, and merges the profiles into `pgo/ufsm.profdata`. The default
+  workload (`scripts/toolchain/pgo_workload.txt`) is the pipeline-fixture CLI test. The production workloads (sampler-only
+  training, predict / fit / render on a real box) still need to be added there. Host only: device code has no PGO.
+- Device: clang -x cuda contraction `fast` (`on` under strict; test_half allows 1 ulp outside strict), `-Xcuda-ptxas -O3`; nvcc
+  `-Xptxas -O3`, `--extra-device-vectorization`, host side `-march=native -mtune=native`. No device LTO (`-dlto`): it needs
+  `-rdc` plus an nvcc device-link step, and the units are whole-program objects linked by clang / lld, so device LTO has nothing
+  to work on without restructuring the link.
+- Native device code: `UFSM_ARCH=auto` (release preset) and `UFSM_GPU_SM=auto` read the compute capability from nvidia-smi at
+  configure time. They produce SASS only for that GPU (`sm_120a` on the desk, nn_* included), with no PTX. `portable` (or no
+  visible GPU) gives the old sm_120 + PTX / sm_86 + PTX targets. `$BUILD/native_id` (cmake/native_id.sh: CPU model, flags hash,
+  GPU compute capabilities) is written at configure time; `scripts/pod/setup.sh NOBUILD=1` rebuilds when it does not match the
+  pod, and `FOREIGN_BINARY=1` is the explicit override for desk-compiled binaries or objects.
+
+Not taken, though fast math allows it: `-ffinite-math-only` (the guards, above). No measurement shows a speed reason to go
+further: the hot paths are on the GPU, and the host float loops that vectorise already do so under `-fno-finite-math-only`.
 
 Data written under the old flags:
 - volcomp lossy (mode 0) stores: decode is open-loop (no state carried from reconstructed voxels into the entropy decode), so a
@@ -51,7 +76,7 @@ within bounds (losses within 2 % for det runs). Tests touched: test_gpudec, test
 test_zarr.sh, test_vcgpu, test_predict_heads.sh, test_fit, test_tfx, test_render_stream, test_render_fill, test_band_pair,
 test_phase_onfly.sh, test_codes_onfly.sh, test_mesh_phase, test_fiberraster, test_fibre_onfly.sh, test_ink_splat, test_ftrace_gpu,
 test_faces, test_countfield, test_lldec, test_fuse, test_sample_ops, test_spatial_augment, test_wind_sampler, test_scan_augment,
-test_gpu_aug, test_gpu_input, test_heads, test_pyports, test_imgops, test_coreline, test_qkclip. The `ufsm --ref` compares
+test_gpu_aug, test_gpu_input, test_heads, test_pyports, test_imgops, test_coreline, test_qkclip, test_half (clang -x cuda path). The `ufsm --ref` compares
 (phase-onfly, codes-onfly, fibre-onfly) have no tolerance option: the wrappers accept their failure exit under fast math when the
 logged per-window differing-voxel counts sum within the bound. Measured bounds and speed: TODO after the first fast-math sweep.
 

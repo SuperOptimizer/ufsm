@@ -21,7 +21,7 @@ def gpu_count():
         return 0
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-BIN = ROOT / "build/ufsm"
+BIN = pathlib.Path(os.environ["UFSM_PGO_BIN"]) if os.environ.get("UFSM_PGO_BIN") else ROOT / "build/ufsm"   # (scripts/toolchain/pgo_collect.sh)
 
 
 def run(*args, ok=0, extra_env=None):

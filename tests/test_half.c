@@ -2,6 +2,7 @@
    pack input = block means + the CT's Haar details and mean absolute deviation; pool output = trilinear 2x against a host reference, pack output = the sub-voxel
    permutation; nn_half_grad is the adjoint of nn_half_output (<U l, g> = <l, U^T g>) in both modes; a half-resolution network
    checkpoint keeps half_res; the quarter-resolution chains (nn_lowres_*, div 4) are adjoint too. */
+#include "fm_tol.h"
 #include "unet.h"
 #include <math.h>
 #include <stdio.h>
@@ -129,7 +130,11 @@ int main(void) {
             nn_set_logits_h16(lh16); nn_loss_pack(lgp, t, m, wd, fs, 0.7f, inplace ? lgp : gb, sbp); nn_set_logits_h16(0);
             const size_t gbytes = nf * (g16 ? 2 : 4);
             nn_d2h(ha, ga, gbytes); nn_d2h(hb, gb, gbytes); nn_d2h(fa, sa, sb); nn_d2h(fb, sbp, sb);
-            const int okg = !memcmp(ha, hb, gbytes), oks = !memcmp(fa, fb, sb);
+            /* bit-identical under nvcc (fmad) and under UFSM_STRICT_MATH; clang -x cuda with -ffp-contract=fast fuses the two chains
+               differently (2026-11-13: 546 of 6144 gradients 1 ulp apart, the BCE sum too): 1 ulp / rel 1e-6 there (tests/fm_tol.h) */
+            const int okg = g16 ? !fm_cmp_h16("pack gradient fp16", (const uint16_t *)ha, (const uint16_t *)hb, nf, 1)
+                                : !fm_cmp_f32("pack gradient fp32", (const float *)ha, (const float *)hb, nf, FM_TOL(2.4e-7), FM_TOL(1e-30)),
+                      oks = !fm_cmp_f32("pack loss parts", fa, fb, sb / 4, FM_TOL(1e-6), FM_TOL(1e-12));
             CHECK(okg && oks, "pack loss logits fp%d gradient fp%d%s: gradient %s, loss parts %s", lh16 ? 16 : 32, g16 ? 16 : 32, inplace ? " in place" : "",
                   okg ? "equal" : "DIFFER", oks ? "equal" : "DIFFER");
             printf("pack loss (logits fp%d, gradient fp%d%s): gradient and loss parts %s\n", lh16 ? 16 : 32, g16 ? 16 : 32, inplace ? ", in place" : "", okg && oks ? "bit-identical" : "DIFFER");

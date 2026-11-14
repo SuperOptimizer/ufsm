@@ -13,7 +13,33 @@ endif()
 project(ufsm LANGUAGES C CXX)
 
 option(UFSM_VERIFY "bf16 / fp32 tensor-core instantiations as well (-DUFSM_ALL_TYPES; the suite build)" OFF)
-set(UFSM_ARCH 120 CACHE STRING "GPU target: 120 (GeForce / RTX PRO Blackwell, lp_* on sm_120a) or 86 (Ampere, software MX)")
+set(UFSM_ARCH auto CACHE STRING "GPU kernel family: auto (from the GPU present), 120 (Blackwell 12.x, lp_* on the block-scaled MMA) or 86 (software MX)")
+set(UFSM_GPU_SM auto CACHE STRING "SASS target: auto (compute capability of the GPU present, e.g. 120 / 86 / 89), a number, or portable (sm_120 + PTX / sm_86 + PTX)")
+# Native device code (2026-11-14): SASS for the GPU actually present, no PTX (nothing to JIT). The binary then runs only on that
+# compute capability (and newer minors of the same major for non-'a' targets): every machine, pods included, builds its own
+# (scripts/pod/setup.sh). Without a visible GPU (a build box, CUDA_VISIBLE_DEVICES=) auto falls back to the portable targets.
+if(UFSM_ARCH STREQUAL "auto" OR UFSM_GPU_SM STREQUAL "auto")
+  execute_process(COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader OUTPUT_VARIABLE _cc ERROR_QUIET)
+  string(REGEX MATCH "[0-9]+\\.[0-9]+" _cc "${_cc}")
+  string(REPLACE "." "" _cc "${_cc}")
+endif()
+if(UFSM_ARCH STREQUAL "auto")
+  if(_cc MATCHES "^12[0-9]$" OR NOT _cc)
+    set(UFSM_ARCH 120)
+  else()
+    set(UFSM_ARCH 86)
+  endif()
+endif()
+if(UFSM_GPU_SM STREQUAL "auto")
+  if(_cc)
+    set(UFSM_GPU_SM ${_cc})
+  else()
+    set(UFSM_GPU_SM portable)
+  endif()
+endif()
+message(STATUS "ufsm: GPU kernels ARCH=${UFSM_ARCH}, SASS ${UFSM_GPU_SM}")
+# $BUILD/native_id: the CPU / GPU this build is native to (scripts/pod/setup.sh refuses a foreign binary)
+execute_process(COMMAND sh ${CMAKE_SOURCE_DIR}/cmake/native_id.sh OUTPUT_FILE ${CMAKE_BINARY_DIR}/native_id)
 option(UFSM_LLVM_RUNTIME "compiler-rt builtins and crt files instead of libgcc.a / gcc crtbegin" ON)
 option(UFSM_CCACHE "compile through ccache when it is installed" ON)
 option(UFSM_STRICT_MATH "IEEE host C (no contraction) and IEEE / no-FMA UFSM_STRICT_UNITS: the bit-exact GPU-vs-CPU build (pre 2026-11-14 default)" OFF)
@@ -72,24 +98,60 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(UFSM_DEPS REQUIRED IMPORTED_TARGET libcurl libzstd blosc zlib libcrypto)
 
 # --- flags -----------------------------------------------------------------------------------------------------------------
-# Host C, default (2026-11-14, DESIGN "Fast math everywhere"): -ffast-math -fno-finite-math-only. Reassociation (vectorised float
-# reductions), FMA contraction (fast: across statements), reciprocal division, no signed zeros, approximate libm, no errno.
-# -fno-finite-math-only is required, not a tuning: ~226 isnan / isfinite / NaN-fill uses (the loss's NaN guards, fwd_nan, zarr fill
-# values, volcomp's typed-chunk checks) would be folded to false under finite-math-only and the guards silently deleted.
-# Nothing in src/ depends on signed zeros (the copysignf sites take the sign of nonzero data) or on errno from libm (the errno reads
-# follow strtod / I/O). -ffast-math is a compile flag only: the link does not get it, so crtfastmath.o (process-wide FTZ / DAZ in
-# MXCSR) is not linked and host denormals stay IEEE. volcomp's surface-chunk base (whose entropy contexts are read from its own
-# reconstruction, so encoder and decoder must agree to the bit) is fenced by its own `#pragma clang fp contract(off)
-# reassociate(off)` (third_party/volcomp.h VF_STRICT_BEGIN) and stays bit-exact under fast math.
-# UFSM_STRICT_MATH=ON: the old IEEE host flags. -ffp-contract=off: gcc -std=c23 (ISO mode) never contracted a*b+c into an FMA,
-# clang's default (on) would, and the byte-exact host references (volcomp, count-field, the GPU-vs-CPU tests) are written against
-# uncontracted arithmetic. -fno-math-errno: value-neutral, lets sqrtf / fabsf vectorise without the errno call-out.
+# Every optimisation, every unit (2026-11-14, DESIGN "Fast math everywhere ..."), unless UFSM_STRICT_MATH=ON.
+# Host C: -O3 -march=native -mtune=native (binaries are not portable: every machine, pods included, builds its own), -ffast-math
+# (-funsafe-math-optimizations: reassociation, reciprocal division, no signed zeros, no trapping math; approximate libm, no errno)
+# with -ffp-contract=fast (FMA across statements), and FTZ / DAZ in MXCSR at startup (src/fpenv.c, linked into every binary; the
+# GPU already flushes). -fno-plt, -fno-semantic-interposition, -fomit-frame-pointer; -g stays (line tables for perf / gdb).
+# The one exception: -fno-finite-math-only. Not a tuning: ~226 isnan / isfinite / NaN-fill uses (the loss's NaN guards, fwd_nan,
+# zarr fill values, volcomp's typed-chunk checks) are folded to false under finite-math-only, i.e. the guards silently deleted --
+# a correctness bug, not a speed gain. Nothing in src/ depends on signed zeros (the copysignf sites take the sign of nonzero
+# data) or on errno from libm (the errno reads follow strtod / I/O). volcomp's surface-chunk base (whose entropy contexts are read
+# from its own reconstruction, so encoder and decoder must agree to the bit) is fenced by its own `#pragma clang fp
+# contract(off) reassociate(off)` (third_party/volcomp.h VF_STRICT_BEGIN), only + and *, so it stays bit-exact.
+# UFSM_STRICT_MATH=ON: the old IEEE host flags, no FTZ / DAZ. -ffp-contract=off: gcc -std=c23 (ISO mode) never contracted a*b+c
+# into an FMA, clang's default (on) would, and the byte-exact host references (volcomp, count-field, the GPU-vs-CPU tests) are
+# written against uncontracted arithmetic. -fno-math-errno: value-neutral, lets sqrtf / fabsf vectorise without the errno call-out.
 if(UFSM_STRICT_MATH)
   set(UFSM_FP_CFLAGS -ffp-contract=off -fno-math-errno)
 else()
-  set(UFSM_FP_CFLAGS -ffast-math -fno-finite-math-only)
+  set(UFSM_FP_CFLAGS -ffast-math -fno-finite-math-only -ffp-contract=fast)
 endif()
-set(UFSM_CFLAGS -std=c23 -O3 -march=native -g -Wall -Wextra -Werror=comment -Wno-unused-parameter -pthread ${UFSM_FP_CFLAGS})
+set(UFSM_CFLAGS -std=c23 -O3 -march=native -mtune=native -g -Wall -Wextra -Werror=comment -Wno-unused-parameter -pthread
+    -fno-plt -fno-semantic-interposition -fomit-frame-pointer ${UFSM_FP_CFLAGS})
+# Link-time optimisation of the host C (lld): full LTO by default in the release configurations; off under UFSM_VERIFY (the suite
+# links ~250 test executables against CORE, each a whole-program LTO link) -- so the suite tests the non-LTO host code; thin is
+# the cheaper middle. The bitcode carries -march / fast-math per function; the link repeats -O3 -march=native for the codegen.
+if(UFSM_VERIFY)
+  set(UFSM_LTO off CACHE STRING "host LTO: full | thin | off")
+else()
+  set(UFSM_LTO full CACHE STRING "host LTO: full | thin | off")
+endif()
+set(UFSM_LTO_JOBS 8 CACHE STRING "ThinLTO backend threads per link (desk rule: 8)")
+if(NOT UFSM_LTO STREQUAL "off")
+  list(APPEND UFSM_CFLAGS -flto=${UFSM_LTO})
+  add_link_options(-flto=${UFSM_LTO} -O3 -march=native -mtune=native -Wl,--lto-O3)
+  if(UFSM_LTO STREQUAL "thin")
+    add_link_options(-Wl,--thinlto-jobs=${UFSM_LTO_JOBS})
+  endif()
+endif()
+# PGO (clang instrumentation): UFSM_PGO=gen builds an instrumented host (profiles to UFSM_PGO_DIR/%m-%p.profraw);
+# scripts/toolchain/pgo_collect.sh runs the workload and merges them into UFSM_PGO_DIR/ufsm.profdata, which UFSM_PGO=use reads.
+# Host C only (the device code has no PGO). A profile from older sources is used where it still matches (warnings off).
+set(UFSM_PGO "" CACHE STRING "profile-guided optimisation of the host C: '' | gen | use")
+set(UFSM_PGO_DIR ${CMAKE_SOURCE_DIR}/pgo CACHE PATH "PGO profile directory (gen writes *.profraw there, use reads ufsm.profdata)")
+if(UFSM_PGO STREQUAL "gen")
+  list(APPEND UFSM_CFLAGS -fprofile-generate=${UFSM_PGO_DIR})
+  add_link_options(-fprofile-generate=${UFSM_PGO_DIR})
+elseif(UFSM_PGO STREQUAL "use")
+  if(NOT EXISTS ${UFSM_PGO_DIR}/ufsm.profdata)
+    message(FATAL_ERROR "UFSM_PGO=use: no ${UFSM_PGO_DIR}/ufsm.profdata (scripts/toolchain/pgo_collect.sh makes it)")
+  endif()
+  list(APPEND UFSM_CFLAGS -fprofile-use=${UFSM_PGO_DIR}/ufsm.profdata -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date
+       -Wno-profile-instr-missing -Wno-backend-plugin)
+elseif(NOT UFSM_PGO STREQUAL "")
+  message(FATAL_ERROR "UFSM_PGO must be '', gen or use (got ${UFSM_PGO})")
+endif()
 set(UFSM_EXTRA_CFLAGS "" CACHE STRING "extra host C flags, appended last (experiments: -O0, -fsanitize=...)")
 separate_arguments(_extra UNIX_COMMAND "${UFSM_EXTRA_CFLAGS}")
 list(APPEND UFSM_CFLAGS ${_extra})
@@ -118,7 +180,15 @@ add_link_options(${UFSM_RT_LINK})
 # CUDA units: clang -x cuda (device: LLVM NVPTX -> ptxas from UFSM_CUDA). nn_* for sm_120 (SASS + compute_120 PTX, as nvcc
 # -arch=sm_120), lp_* for sm_120a (the block-scaled mma; SASS only, as nvcc -gencode code=sm_120a).
 # (clang embeds no PTX unless asked: --cuda-include-ptx)
-if(UFSM_ARCH STREQUAL "120")
+if(NOT UFSM_GPU_SM STREQUAL "portable")
+  # native: SASS only, the 'a' target on Blackwell 12.x (lp_* need it; nn_* lose nothing by it)
+  if(UFSM_ARCH STREQUAL "120")
+    set(UFSM_NN_ARCH --cuda-gpu-arch=sm_${UFSM_GPU_SM}a)
+  else()
+    set(UFSM_NN_ARCH --cuda-gpu-arch=sm_${UFSM_GPU_SM})
+  endif()
+  set(UFSM_LP_ARCH ${UFSM_NN_ARCH})
+elseif(UFSM_ARCH STREQUAL "120")
   set(UFSM_NN_ARCH --cuda-gpu-arch=sm_120 --cuda-include-ptx=sm_120)
   set(UFSM_LP_ARCH --cuda-gpu-arch=sm_120a)
 else()
@@ -147,16 +217,24 @@ set(UFSM_PTXAS_SPLIT 0 CACHE STRING "ptxas --split-compile threads per CUDA unit
 if(UFSM_PTXAS_SPLIT GREATER 1)
   list(APPEND UFSM_CU_FLAGS "SHELL:-Xcuda-ptxas --split-compile=${UFSM_PTXAS_SPLIT}")
 endif()
-# nvcc -use_fast_math on the device side only: flush denormals, approximate division / sqrt / transcendentals, FMA contraction.
-# Contraction "on" (a*b+c fused within one expression), not "fast" (across statements): with fast, LLVM fused differently in kernels
-# that must agree bit for bit (nn_loss_pack vs nn_loss_async_tol + nn_half_grad, tests/test_half.c: 546 of 6144 gradients 1 ulp
-# apart, the BCE sum too); with on they agree, as they did under nvcc (forlindesk sm_86, 2026-11-13).
-# NaN / inf stay honoured (no -ffinite-math-only: the NaN guards in the loss and fwd_nan paths must survive). Checked 2026-11-13:
-# the float instruction kinds in the PTX match nvcc -use_fast_math (div.approx.ftz, sqrt.approx.ftz, ex2.approx.ftz, fma.rn.ftz).
+# Device fast math (clang -x cuda; nvcc: -use_fast_math below), every unit: flush denormals, approximate division / sqrt /
+# transcendentals, FMA contraction "fast" (across statements, as nvcc's fmad). Under UFSM_STRICT_MATH contraction is "on" (within
+# one expression): with fast, LLVM fused nn_loss_pack and nn_loss_async_tol + nn_half_grad differently (tests/test_half.c: 546 of
+# 6144 gradients 1 ulp apart, the BCE sum too; with on they agree, as under nvcc; forlindesk sm_86, 2026-11-13); test_half
+# allows 1 ulp outside strict. NaN / inf stay honoured (no -ffinite-math-only: the NaN guards in the loss and fwd_nan paths must
+# survive). Checked 2026-11-13: the float instruction kinds in the PTX match nvcc -use_fast_math (div.approx.ftz,
+# sqrt.approx.ftz, ex2.approx.ftz, fma.rn.ftz). ptxas -O3 (its default, made explicit); no LTO of device code (each unit is
+# whole-program, no -rdc / device link step: nothing for device LTO to work on).
 # ("SHELL:" groups: CMake de-duplicates repeated options, which would drop the second -Xarch_device)
 # UFSM_DEVICE_FAST_MATH: the rest of nvcc's fast-math intrinsic mapping (expf -> __expf ..., src/clang_cuda_compat.cuh)
+if(UFSM_STRICT_MATH)
+  set(_contract on)
+else()
+  set(_contract fast)
+endif()
 set(UFSM_CU_FAST -DUFSM_DEVICE_FAST_MATH -fgpu-flush-denormals-to-zero -fgpu-approx-transcendentals "SHELL:-Xarch_device -fapprox-func"
-    "SHELL:-Xarch_device -ffp-contract=on")
+    "SHELL:-Xarch_device -ffp-contract=${_contract}")
+list(APPEND UFSM_CU_FLAGS "SHELL:-Xcuda-ptxas -O3" "SHELL:-Xarch_host -march=native" "SHELL:-Xarch_host -mtune=native")
 # UFSM_STRICT_UNITS: the units that, under UFSM_STRICT_MATH=ON, are byte-identical to their CPU versions: IEEE division / sqrt, no
 # FMA contraction, no flush (nvcc -fmad=false, no fast math). By default (2026-11-14) they get UFSM_CU_FAST like every other unit
 # and the host is fast math too, so GPU and CPU agree within tolerances (tests/fm_tol.h, DESIGN "Fast math everywhere") instead.
@@ -246,14 +324,24 @@ if(UFSM_CUDA_COMPILER STREQUAL "nvcc")
   endif()
   enable_language(CUDA)
   set(CMAKE_CUDA_FLAGS_RELEASE "")
-  if(UFSM_ARCH STREQUAL "120")
+  if(NOT UFSM_GPU_SM STREQUAL "portable")
+    if(UFSM_ARCH STREQUAL "120")
+      set(UFSM_NN_ARCH "SHELL:-gencode arch=compute_${UFSM_GPU_SM}a,code=sm_${UFSM_GPU_SM}a")
+    else()
+      set(UFSM_NN_ARCH "SHELL:-gencode arch=compute_${UFSM_GPU_SM},code=sm_${UFSM_GPU_SM}")
+    endif()
+    set(UFSM_LP_ARCH ${UFSM_NN_ARCH})
+  elseif(UFSM_ARCH STREQUAL "120")
     set(UFSM_NN_ARCH -arch=sm_120)
     set(UFSM_LP_ARCH "SHELL:-gencode arch=compute_120a,code=sm_120a")
   else()
     set(UFSM_NN_ARCH "SHELL:-gencode arch=compute_${UFSM_ARCH},code=[sm_${UFSM_ARCH},compute_${UFSM_ARCH}]")
     set(UFSM_LP_ARCH ${UFSM_NN_ARCH})
   endif()
-  set(UFSM_CU_FLAGS -O3 -Xcompiler=-fno-threadsafe-statics -Xfatbin=-compress-all)
+  # -Xptxas -O3 (ptxas' default, explicit), --extra-device-vectorization (nvvm's extra vectoriser), the host side native.
+  # No -dlto: device LTO needs -rdc and an nvcc device-link step; the units are whole-program and linked by clang / lld.
+  set(UFSM_CU_FLAGS -O3 -Xcompiler=-fno-threadsafe-statics,-march=native,-mtune=native -Xfatbin=-compress-all "SHELL:-Xptxas -O3"
+      --extra-device-vectorization)
   set(UFSM_CU_FAST -use_fast_math)
   set(UFSM_CU_STRICT -fmad=false)
   if(UFSM_PTXAS_SPLIT GREATER 1)
@@ -333,6 +421,7 @@ function(ufsm_exe name)
       endif()
     endif()
   endforeach()
+  list(APPEND objs obj_fpenv)   # FTZ / DAZ at startup in every executable (src/fpenv.c; empty under UFSM_STRICT_MATH)
   list(REMOVE_DUPLICATES objs)
   set(libs)
   foreach(l ${A_LIBS})
@@ -399,8 +488,8 @@ if(EXISTS /sys/fs/cgroup/cpu.max)
   endif()
 endif()
 set(UFSM_JOBS ${_jobs} CACHE STRING "parallel jobs of the nested release / verify build (test-prep)")
-set(_cfg_common -G Ninja -S ${CMAKE_SOURCE_DIR} -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE} -DUFSM_ARCH=${UFSM_ARCH}
-    -DUFSM_CUDA=${UFSM_CUDA} -DUFSM_LLVM_RUNTIME=${UFSM_LLVM_RUNTIME} -DUFSM_CCACHE=${UFSM_CCACHE})
+set(_cfg_common -G Ninja -S ${CMAKE_SOURCE_DIR} -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE} -DUFSM_ARCH=${UFSM_ARCH} -DUFSM_GPU_SM=${UFSM_GPU_SM}
+    -DUFSM_CUDA=${UFSM_CUDA} -DUFSM_LLVM_RUNTIME=${UFSM_LLVM_RUNTIME} -DUFSM_CCACHE=${UFSM_CCACHE} -DUFSM_STRICT_MATH=${UFSM_STRICT_MATH})
 if(UFSM_VERIFY)
   add_custom_target(test-prep
     COMMAND test -f ${UFSM_REL_DIR}/build.ninja || ${CMAKE_COMMAND} ${_cfg_common} -B ${UFSM_REL_DIR} -DUFSM_VERIFY=OFF

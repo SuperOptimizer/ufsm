@@ -7,3 +7,5 @@ build-verify/
 build-dev*/
 build86*/
 build-cm*/
+pgo/
+build-pgo*/

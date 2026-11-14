@@ -4,11 +4,11 @@
   "configurePresets": [
     {
       "name": "release",
-      "displayName": "release: build/ (fp16 / MX kernels; sm_120 + sm_120a)",
+      "displayName": "release: build/ (fp16 / MX kernels; native: -march=native, SASS for the GPU present, full LTO)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build",
       "toolchainFile": "${sourceDir}/cmake/llvm.cmake",
-      "cacheVariables": {"UFSM_VERIFY": "OFF", "UFSM_ARCH": "120"}
+      "cacheVariables": {"UFSM_VERIFY": "OFF", "UFSM_ARCH": "auto"}
     },
     {
       "name": "verify",
@@ -19,7 +19,7 @@
     },
     {
       "name": "arch86",
-      "displayName": "arch86: build86/ (Ampere, software MX; SASS + PTX, so newer GPUs run the sm_86 paths)",
+      "displayName": "arch86: build86/ (software MX kernels; SASS for the GPU present, UFSM_GPU_SM=portable: sm_86 SASS + PTX)",
       "inherits": "release",
       "binaryDir": "${sourceDir}/build86",
       "cacheVariables": {"UFSM_ARCH": "86"}

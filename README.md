@@ -21,7 +21,9 @@ SUITE_FLAGS="-c origin/master" cmake --build build-verify --target test   # only
 cmake --build build-verify --target test_strip && build-verify/test_strip   # one test by hand
 cmake --preset arch86 && cmake --build build86          # Ampere (RTX 3090): software MX-fp4 / fp8 (bit-exact conversions, emulated
                                                         # block-scaled MMAs; UFSM_MX_EMU=0: fp8 / fp4 as bf16, 16-bit storage). The
-                                                        # binary carries sm_86 SASS + PTX, so a newer GPU runs the sm_86 code (tests)
+                                                        # binary carries SASS for the GPU present (-DUFSM_GPU_SM=portable: sm_86
+                                                        # SASS + PTX, so a newer GPU runs the sm_86 code)
+scripts/toolchain/pgo_collect.sh scripts/toolchain/pgo_workload.txt   # PGO profile -> pgo/ufsm.profdata; then -DUFSM_PGO=use
 scripts/test/desk_suite.sh BRANCH   # the same on the desk (push over ssh, build, run, failing logs), one suite at a time
 cmake --build build --target doctor # the toolchain CMake picked + `ufsm sysinfo` (real cgroup CPUs / RAM, GPUs / MIG, CUDA, disk)
 ```
@@ -38,11 +40,18 @@ refuse libc++ on x86). CUDA: `UFSM_CUDA` (default /usr/local/cuda, else the newe
 device code goes through its nvcc by default (`UFSM_CUDA_COMPILER=nvcc`; `clang` compiles it with `clang -x cuda`, whose kernels ran
 1.35x slower on sm_120). nvcc's host compiler is probed at configure time: clang++ when that nvcc accepts it (with `-allow-unsupported-compiler`:
 the desk's 13.3 and the pod's 13.2 both take clang 22 so), else the newest g++ (`-- ufsm: nvcc host compiler ...` in the configure
-output; `-DUFSM_CUDA_HOST_COMPILER=/usr/bin/g++` pins one). Every .c unit and the link stay clang / lld either way. Host C is `-std=c23 -O3 -march=native
--ffast-math -fno-finite-math-only` (fast math with NaN / inf honoured: the NaN guards must survive), and every CUDA unit gets nvcc's
-`-use_fast_math` on the device side (flush denormals, approximate division / sqrt / transcendentals, FMA contraction), so GPU-vs-CPU
-tests compare within tolerances (`tests/fm_tol.h`). `-DUFSM_STRICT_MATH=ON` restores the bit-exact build: host `-ffp-contract=off
--fno-math-errno`, the `UFSM_STRICT_UNITS` (CMakeLists.txt) IEEE without contraction, and the tests' tolerances back to exact. Sources are globbed: a new `src/*.c`,
+output; `-DUFSM_CUDA_HOST_COMPILER=/usr/bin/g++` pins one). Every .c unit and the link stay clang / lld either way. Every build is native and
+fully optimised: host C `-std=c23 -O3 -march=native -mtune=native -ffast-math -fno-finite-math-only -ffp-contract=fast -fno-plt
+-fno-semantic-interposition -fomit-frame-pointer -g`, FTZ / DAZ set at startup (`src/fpenv.c`), full LTO through lld in the
+release dirs (`UFSM_LTO=full|thin|off`; off in the suite dirs), optional PGO (`UFSM_PGO=gen|use`, `UFSM_PGO_DIR`,
+`scripts/toolchain/pgo_collect.sh`). NaN / inf stay honoured (`-fno-finite-math-only`): ~226 isnan / isfinite guards would
+otherwise be compiled away. Every CUDA unit gets nvcc's `-use_fast_math` (flush denormals, approximate division / sqrt /
+transcendentals, FMA contraction), `-Xptxas -O3`, `--extra-device-vectorization`, and SASS only for the GPU present
+(`UFSM_ARCH` / `UFSM_GPU_SM` auto from nvidia-smi; `UFSM_GPU_SM=portable` for the old sm_120 + PTX targets). Binaries therefore run
+only on the machine type that built them: pods build their own (`scripts/pod/setup.sh`; `$BUILD/native_id` guards reuse,
+`FOREIGN_BINARY=1` overrides). GPU-vs-CPU tests compare within tolerances (`tests/fm_tol.h`, `fm_tol.sh`). `-DUFSM_STRICT_MATH=ON`
+restores the bit-exact build: host `-ffp-contract=off -fno-math-errno` without FTZ / DAZ, the `UFSM_STRICT_UNITS`
+(CMakeLists.txt) IEEE without contraction, and the tests' tolerances back to exact. Sources are globbed: a new `src/*.c`,
 `src/nn_*.cu` or `src/lp_*.cu` is picked up at the next build. ccache (when installed, `UFSM_CCACHE=OFF` disables it) is shared across
 worktrees (`CCACHE_BASEDIR` = the tree, `CCACHE_NOHASHDIR`), so a fresh worktree or desk suite dir rebuilds from the cache. Default
 thread counts follow the cgroup (`cpu.max` quota, affinity; `UFSM_NCPU` overrides), not nproc, and memory budgets (count-field

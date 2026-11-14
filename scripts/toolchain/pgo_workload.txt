@@ -1,0 +1,3 @@
+# pgo_collect.sh workload: one bash command per line, $U = the instrumented ufsm. Short (minutes each), host-heavy, representative.
+# The pipeline fixture CLI (sampler, predict, fit, render on a small local fixture):
+UFSM_PGO_BIN=$U python3 tests/test_pipeline_cli.py
