@@ -53,7 +53,8 @@ int cmd_holdout_cover(int argc, char **argv) {
         }
         printf("%-24s %3d boxes, %9zu cells (level %d, %lld^3 level-0), held out %.4f\n", s->name, nb, o.n, o.lev, (long long)c, in / tot);
         if (pb) { for (int b = 0; b < nb; b++) printf("   box %d [%lld %lld %lld %lld %lld %lld] alone %.4f\n", b, (long long)bx[b][0], (long long)bx[b][1], (long long)bx[b][2],
-                                                       (long long)bx[b][3], (long long)bx[b][4], (long long)bx[b][5], pb[b] / tot); free(pb); }
+                                                       (long long)bx[b][3], (long long)bx[b][4], (long long)bx[b][5], pb[b] / tot);
+                  free(pb); }
         if (zu) { fprintf(zf, "%s %s %d %.0f %.6f %lld", s->name, hc_base(s->ct_key), o.lev, tot, in / tot, (long long)ZB); for (int64_t q = 0; q < nzb; q++) fprintf(zf, " %.6g", zu[q] / tot); fprintf(zf, "\n"); free(zu); }
         if (hz) { printf("   z (level-0, %lld per bin):", (long long)(zext / nh)); for (int q = 0; q < nh; q++) printf(" %.3f", hz[q] / tot); printf("\n"); free(hz); }
         char sc_[64]; snprintf(sc_, sizeof sc_, "%s", s->name); char *dash = strchr(sc_, '-'); if (dash) *dash = 0;

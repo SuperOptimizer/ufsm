@@ -778,6 +778,20 @@ is the gate: 1218's weight array is 255 on 97 % of the labelled voxels (1299's g
 1218's labels 3-5x worse than Paris 4's (section "Fibre gate of our spiral labels"), whose gate was never applied pending its 1447 /
 0175A control (GPU). Most likely ungated label noise; the fix is that gate, not a weight.
 
+**Predict window alignment (data #9).** Training windows are snapped to the CT's 128 chunk grid; predict windows start at box + k stride
+- halo. `predict --align 128` (default off) anchors the window grid at the halo (--grid-origin = halo), so every origin lies on the
+128 grid when the stride is a multiple of 128 (checked; not with --seam-inproc). The A/B is a post-pass GPU job:
+`scripts/predict/align_ab.sh CKPT ROOT CT UM BOX OUT` (a box origin off the grid, e.g. +64) prints mean |diff|, the > 8 / > 32 shares
+and the correlation overall, near window edges and in interiors. Rule: mean |diff| < 1 and > 32 under 0.1 % keeps the default,
+else --align 128 becomes the default.
+
+**Data audit "lower" items (11-14, main: no deferrals).** Fibre positives in air: a fibre's own plane is unknown (255), not 254,
+where CT < `pos_iso` (default the source iso / 64; the iso -1 sources had no air test at all; CPU raster, the GPU kernel and
+`fiber-raster --pos-iso` alike). The radial input under warps is transported as a normal (A^T, R, 1 - e') instead of a tangent
+(A^-1, R, 1 / (1 - e')), CPU and device in the same float order. `--edge-spread 1` (off): face-clamped occupancy draws spread over the
+windows holding the drawn voxel. `--empty-keep` / `--min-fg` are now train flags (defaults 0.2 / 0.3 unchanged). The phase-weight skip,
+the scanner air op and the shift-1 grid went to hostmem (sampfix-20261114); band_window / sideface follow here (9a3ea4a).
+
 **try6 contamination.** try6 (scratch2, from step 0 on 11-14) trained on every one of these boxes for ~2000 steps with no masking, and
 every eval set was in its data (eval audit). Validation numbers on these boxes are clean only for a run started from scratch on the -ho
 json (try7). Restart flags: `--val-batches 32` (or more), `--val-P 384` (<= the smallest box edge at the window's level: 512 cells

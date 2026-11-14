@@ -46,6 +46,9 @@ typedef struct {
     float focus_w;           /* --focus-w W: overrides every "focus" source's w (packed-sheet draw weight, off at 0 / without a map) */
     int stick;               /* --stick-src N: a rejected draw is retried from the SAME source up to N times (the rejections took 35-46 % of 1299 / 0139-u2ink draws) */
     int snap;                /* align training windows to the CT chunk grid (3x fewer chunks decoded per window) */
+    int edge_spread;         /* train --edge-spread 1 (default 0): an occupancy draw whose centred window would cross the volume face takes a random
+                                origin among the windows that hold the drawn voxel, not the clamped one (cells within P / 2 of a face all gave the same
+                                window; data audit lower 11-14) */
     int scan_norm;           /* train --scan-norm 1: the CT input (v - center) / scale per scan and level (scannorm.h) instead of each window's
                                 own z-score (a source's "norm" wins) */
     int deterministic;       /* 1: batch j holds samples j*B .. j*B+B-1, each drawn with its own rng seeded by (seed, index), and

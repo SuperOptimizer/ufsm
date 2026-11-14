@@ -103,13 +103,13 @@ __device__ __forceinline__ void rad_full4(const TI *ct, const uint8_t *recs, siz
     for (int k = 0; k < 32; k++) r[k] = 0.f;
     r[0] = ldx(ct, i);
     if (h[6] & 1) {   /* a warped window: sample.c write_spatial's transported radial vector, the host's float expressions in order */
-        const float *tab = cxz + D, *R = tab + 6 * P, *A = R + 9, *Ai = A + 9; const float sc = R[27];   /* R[9], A[9], Ainv[9], scale */
+        const float *tab = cxz + D, *R = tab + 6 * P, *A = R + 9; const float sc = R[27];   /* R[9], A[9], Ainv[9], scale */
         const float c = __fmul_rn(.5f, (float)(P - 1)), fP1 = (float)(P - 1);
         float v[3], jac[3], u[3], src[3];
 #pragma unroll
         for (int d = 0; d < 3; d++) {
             v[d] = __fsub_rn(__fsub_rn((float)io[d], c), tab[d * P + io[d]]);
-            jac[d] = __fdiv_rn(1.f, __fsub_rn(1.f, tab[(3 + d) * P + io[d]]));
+            jac[d] = __fsub_rn(1.f, tab[(3 + d) * P + io[d]]);   /* (the radial vector is a normal: the factor 1 - e', with A^T below; data audit lower 11-14) */
         }
         if (h[6] & 2) {
             float w[3];
@@ -142,7 +142,7 @@ __device__ __forceinline__ void rad_full4(const TI *ct, const uint8_t *recs, siz
             if (h[6] & 2) {
                 float q[3];
 #pragma unroll
-                for (int d = 0; d < 3; d++) q[d] = __fadd_rn(__fadd_rn(__fmul_rn(Ai[3 * d], disc[0]), __fmul_rn(Ai[3 * d + 1], disc[1])), __fmul_rn(Ai[3 * d + 2], disc[2]));
+                for (int d = 0; d < 3; d++) q[d] = __fadd_rn(__fadd_rn(__fmul_rn(A[d], disc[0]), __fmul_rn(A[3 + d], disc[1])), __fmul_rn(A[6 + d], disc[2]));
 #pragma unroll
                 for (int d = 0; d < 3; d++) disc[d] = q[d];
             }

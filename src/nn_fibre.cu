@@ -66,7 +66,7 @@ static cudaError_t fsc_exclusive_sum(void *tmp, const int32_t *cnt, int32_t *off
 typedef struct { double p[3]; float q[3]; int16_t lo[3], hi[3]; int32_t fam; } fg_step;   /* q: p - the box origin in float (the fast class test) */   /* the device's step: the reach cube box-relative, as fr_stamp's ceil / floor */   /* voxel block edge; steps per shared-memory chunk */
 
 __global__ void k_fibre(const fg_step *st, const int32_t *boff, const int32_t *bidx, int3 nb, long long so0, long long so1, long long so2, int n0, int n1, int n2,
-                        double R, double Rx, int cr, int cg, int ring, const uint8_t *ct, int iso, uint8_t *o0, uint8_t *o1) {
+                        double R, double Rx, int cr, int cg, int ring, const uint8_t *ct, int iso, int piso, uint8_t *o0, uint8_t *o1) {
     __shared__ float sq[FCH][3]; __shared__ int sf[FCH], si[FCH]; __shared__ int16_t sb[FCH][6];
     const int b = blockIdx.x, bx = b % nb.x, by = b / nb.x % nb.y, bz = b / (nb.x * nb.y), t = threadIdx.x;
     const int lx = bx * FBX + (t & 7), ly = by * FBY + ((t >> 3) & 3), lz = bz * FBZ + (t >> 5), in = lx < n2 && ly < n1 && lz < n0;
@@ -106,11 +106,11 @@ __global__ void k_fibre(const fg_step *st, const int32_t *boff, const int32_t *b
     }
     if (!in) return;
     const size_t i = ((size_t)lz * n1 + ly) * n2 + lx;
-    const int h = L[0] == 0, v = L[1] == 0, air = ct && ct[i] < iso, o2 = L[2] >= 1;   /* (d2 > cr) */
+    const int h = L[0] == 0, v = L[1] == 0, air = ct && ct[i] < iso, pair = ct && ct[i] < piso, o2 = L[2] >= 1;   /* (d2 > cr; pair: a positive in air -> unknown) */
     const int lm = L[0] < L[1] ? (L[0] < L[2] ? L[0] : L[2]) : (L[1] < L[2] ? L[1] : L[2]);
     const int any = lm <= 1, neg = ring && lm == 2 && L[3] >= 2;
-    o0[i] = h && !v && o2 ? 254 : v && !h && o2 ? 0 : neg ? 0 : !any && air ? 0 : 255;
-    o1[i] = v && !h && o2 ? 254 : h && !v && o2 ? 0 : neg ? 0 : !any && air ? 0 : 255;
+    o0[i] = h && !v && o2 ? (pair ? 255 : 254) : v && !h && o2 ? 0 : neg ? 0 : !any && air ? 0 : 255;
+    o1[i] = v && !h && o2 ? (pair ? 255 : 254) : h && !v && o2 ? 0 : neg ? 0 : !any && air ? 0 : 255;
 }
 
 /* the bins on the device: per step the blocks its cube meets, counted, scanned (cub), then filled (atomic cursors: the order within a
@@ -153,7 +153,7 @@ extern "C" int fibre_gpu_reserve(int edge) {
     return rc;
 }
 extern "C" int fibre_gpu_box(const fr_step *st, long nst, const int64_t so[3], const int64_t n[3], double R, double Rx, int cr, int cg, int ring,
-                             const uint8_t *ct, int iso, uint8_t *o0, uint8_t *o1) {
+                             const uint8_t *ct, int iso, int piso, uint8_t *o0, uint8_t *o1) {
     if (n[0] > 4096 || n[1] > 4096 || n[2] > 4096 || nst > (1L << 28)) return -1;
     const int nb[3] = {(int)((n[0] + FBZ - 1) / FBZ), (int)((n[1] + FBY - 1) / FBY), (int)((n[2] + FBX - 1) / FBX)}; const long NB = (long)nb[0] * nb[1] * nb[2];
     const size_t nv = (size_t)n[0] * n[1] * n[2]; int rc = 0; long tot = 0, ns = 0;
@@ -187,7 +187,7 @@ extern "C" int fibre_gpu_box(const fr_step *st, long nst, const int64_t so[3], c
         cudaEvent_t e0 = nullptr, e1 = nullptr; const int tm = getenv("UFSM_FIBRE_TIMING") != nullptr; if (tm) { cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0, g_st); }
         k_fibre<<<(unsigned)NB, FBX * FBY * FBZ, 0, g_st>>>((const fg_step *)g_buf[0], g_off, (const int32_t *)g_buf[2], make_int3(nb[2], nb[1], nb[0]),
                                                          (long long)so[0], (long long)so[1], (long long)so[2], (int)n[0], (int)n[1], (int)n[2], R, Rx, cr, cg, ring,
-                                                         ct ? (const uint8_t *)g_buf[3] : nullptr, iso, d0, d1);
+                                                         ct ? (const uint8_t *)g_buf[3] : nullptr, iso, piso, d0, d1);
         FG_CK(cudaGetLastError());
         if (tm) { cudaEventRecord(e1, g_st); FG_CK(cudaStreamSynchronize(g_st)); float km = 0; cudaEventElapsedTime(&km, e0, e1); cudaEventDestroy(e0); cudaEventDestroy(e1);
             fprintf(stderr, "  fibre gpu: %ld steps in the box, %ld bin entries, %.0f ms bins, %.0f ms H2D + kernel (kernel %.1f ms)\n", ns, tot, (tb - t00) * 1e3, (fg_t() - tb) * 1e3, km); }
