@@ -31,6 +31,8 @@ if [ "${1:-}" != --after ]; then
     [ -f $d/done ] && good "raster $r done" || bad "raster $r not done"
     grep -qF "\"$d\"" "$SRCJ" && good "sources read $d" || bad "sources json does not reference $d (try7 must read the datafix re-rasters)"; done
   grep -q ALLDONE /vesuvius/ufsm/datafix-20261114/raster/run.log 2>/dev/null && good "raster run.log ALLDONE" || bad "raster run.log has no ALLDONE"
+  if [ -f $R/scratch2.parse.ok ] && [ $R/scratch2.parse.ok -nt $E ] && [ $R/scratch2.parse.ok -nt "$U" ]; then good "parse check (UFSM_MEM_DRY) passed"
+  else bad "no parse check newer than the env and binary: S2CTL_OWNER=merger2 bash $R/s2ctl.sh parse $E"; fi
   if [ -f $R/scratch2.audit.ok ] && [ $R/scratch2.audit.ok -nt $E ] && [ $R/scratch2.audit.ok -nt "$U" ]; then good "leak audit: $(cat $R/scratch2.audit.ok)"
   else bad "no leak audit newer than the env and binary: S2CTL_OWNER=merger2 bash $R/s2ctl.sh audit $E 1000"; fi
   [ -f $R/scratch2.parked ] && good "try6 parked (fresh clears it)"
