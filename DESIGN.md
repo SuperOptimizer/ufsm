@@ -47,7 +47,12 @@ only drop draw cells, the ink inside stays and the sampler's mask hides it from 
 holding each label; "val by source" / "val by scroll" lines; validation with no boxes is fatal unless `--val-train-ok 1`.
 
 **Leak check.** `UFSM_HOLD_AUDIT=1` in sampler-only mode counts, per training window, the known label voxels (phase, w4, ink, aux,
-papyrus, loss mask, packed mask, ink bits; source grid) inside the boxes of its CT without the guard. LEAKAUDIT
+papyrus, loss mask, packed mask, ink bits; source grid) inside the boxes of its CT without the guard. On the -ho json's winding sources (CPU paths, the scratch2 recipe at P 256):
+100 training windows, 20 overlapping held-out boxes (136.6 M voxels inside the boxes), **0 known label voxels inside**; the smoke runs
+of both ink subsets (5 windows each, 3 overlapping) also 0. The planned 4500-window run was OOM-killed three times by the saturated
+ufsm-dev slice (other jobs at 40 / 40 GB), so the larger count is still open: `/vesuvius/ufsm/datafix-20261114/ho/leak.sh`
+(N / NI / MEM env) reruns it, and the flag is in the binary for a dry start (UFSM_SAMPLER_ONLY=N UFSM_HOLD_AUDIT=1). test_sampler_safety
+covers the parsing / box-draw side (every box drawn by validation, malformed boxes refused, holdout_strict).
 
 **Scoring, holdout only.** `ink-vscore` / `ink-score --holdouts H --ct KEY` (the voxels / the label pixels whose surface point lies in a
 box), `wbench.sh BOXES=holdout HOLDOUTS=H` (45 boxes). There is no `surfcmp` tool in the tree.
