@@ -1339,7 +1339,7 @@ static int predict_one(int argc, char **argv) {
     if (devread) { setenv("UFSM_GPU_DECODE", "1", 0); if (!getenv("UFSM_GPU_DECODE_DEV")) setenv("UFSM_GPU_DECODE_DEV", opt(argc, argv, "--gpu", "0"), 1); }
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window W] [--act-mx8 1]\n"
-                        "       [--halo H] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json] [--levels 4] [--q 8] [--threads 16]\n"
+                        "       [--halo H] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json | --no-axis 1] [--levels 4] [--q 8] [--threads 16]\n"
                         "       [--prec 0|1|2|3|4] [--policy enc0=1,...] [--f16 0|1] [--fp4 0|1] [--input-mx 0|1] [--input-prec 0|4|8] [--ema 1]   EMA or current weights (0)\n"
                         "       [--iso T]   probability outputs 0 where CT < T (the scan's void cutoff; the fit's material mask stays CT > 0)\n"
                         "       [--ema-blend A]   a x final weights + (1 - a) x EMA (tail-average blend, e.g. 0.35)\n"
@@ -1503,10 +1503,17 @@ static int predict_one(int argc, char **argv) {
     if (iso < 0 || iso > 255) { fprintf(stderr, "--iso: 0..255\n"); return 2; }
     nn_set_pred_iso(iso);
     const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
+    /* no --axis = the radial input channels (scroll-outward direction) are zero for the whole run: the nets are trained with the axis on
+       (almost) every source, so this silently degraded the latent ink / recto passes (audit 2026-11-14). An explicit --no-axis 1 runs anyway. */
+    if (!(axisf && *axisf) && !atoi(opt(argc, argv, "--no-axis", "0")) && !ufsm_env_on("UFSM_PRED_NO_AXIS")) {   /* (the env: the test suite's fixtures) */
+        fprintf(stderr, "predict: no --axis: the network's radial input channels would be zero; give --axis AXIS.json (the scroll's umbilicus), or --no-axis 1 to run without one\n"); return 2; }
     const char *grid = opt(argc, argv, "--grid-origin", nullptr);
-    int64_t grid_origin[3] = {0, 0, 0}; char grid_attrs[128] = "";
+    int64_t grid_origin[3] = {0, 0, 0}; char grid_attrs[1400] = "";
     if (grid && parse_grid_origin(grid, grid_origin)) { fprintf(stderr, "--grid-origin needs three nonnegative integer coordinates\n"); return 2; }
     if (grid) snprintf(grid_attrs, sizeof grid_attrs, ",\"grid_origin_zyx\":[%lld,%lld,%lld]", (long long)grid_origin[0], (long long)grid_origin[1], (long long)grid_origin[2]);
+    {   /* the axis the radial input channels came from (none: --no-axis): every output store records it (audit 2026-11-14) */
+        const size_t l = strlen(grid_attrs);
+        snprintf(grid_attrs + l, sizeof grid_attrs - l, ",\"axis\":\"%s\",\"radial_sign\":%d", axisf && *axisf ? axisf : "none", axisf && *axisf ? (int)radial_sign : 0); }
     long long boxv[6]; const char *box = opt(argc, argv, "--box", nullptr); char tail;
     if (!isfinite(um) || um <= 0 || W <= 0 || halo < 0 || halo >= W / 2 || shard < 128 || shard % 128 ||
         level < 0 || level > 20 || nlev < 1 || nlev > 20 || nthreads < 1 || !isfinite(q) || q < 0 ||
@@ -1628,6 +1635,12 @@ static int predict_one(int argc, char **argv) {
         if (rvfuse) { if (phead_add(PH, &nph, &cfg, "rv", rv2c >= 0 ? rv2c : 0, rv2c >= 0 ? rv2c + 1 : 1, content)) return 2; }
         else if (phead_add(PH, &nph, &cfg, chs, out_ch, -1, content)) return 2;
     }
+    /* a fine-stem / guided-head latent checkpoint off the device path (--feather, --tta, --split, --gpus N, --window-z, UFSM_PRED_HOSTPATH):
+       the fallback skips the fine stem and the sub-cell shuffle, i.e. a different network's output, before 2026-11-14 without a word
+       (eval audit #14). --fstem-off 1 accepts that output explicitly */
+    if (nph == 0 && half == 3 && !lat_ok && (cfg.fstem || cfg.lat_guide == 64) && !atoi(opt(argc, argv, "--no-out", "0")) && !atoi(opt(argc, argv, "--fstem-off", "0"))) {
+        fprintf(stderr, "predict: %s has a %s; its outputs need the latent device path (no --feather, --tta, --split, --window-z, --gpus workers, "
+                        "UFSM_PRED_HOSTPATH); --fstem-off 1 runs without it\n", ckpt, cfg.fstem ? "fine stem" : "guided sub-cell head"); return 2; }
     const int lhm = nph > 0;   /* every output from the cell logits per shard (no full-resolution logits) */
     int ph_c0[PHEAD_MAX], ph_c1[PHEAD_MAX], ph_sb0[PHEAD_MAX], ph_sb1[PHEAD_MAX], ph_s0[PHEAD_MAX], ph_s1[PHEAD_MAX], phd = 0;   /* (nn_lat_heads_place; phd: the shard buffer in use) */
     for (int k = 0; k < nph; k++) { ph_c0[k] = PH[k].c0; ph_c1[k] = PH[k].c1; ph_sb0[k] = PH[k].sb0; ph_sb1[k] = PH[k].sb1; ph_s0[k] = PH[k].s0; ph_s1[k] = PH[k].s1; }

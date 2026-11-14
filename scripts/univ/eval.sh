@@ -64,11 +64,11 @@ if has fib && [ "${FIB:-1}" = 1 ] && { [ -n "$FIBCH" ] || [ "${FIBP:-}" = heads 
   o=$E/$T/fib; mkdir -p $o; BOX=12288,4096,3584,512,576,768; J="--um 2.4 --level 2 --slab 12288,512 --region 4096,4608,3584,4352 --tile 256 --d-mm 0.3,0.6,1.2,2.4"
   if [ "${FIBP:-}" = heads ]; then   # FIBP=heads (latent-grid checkpoints, 2026-11-12): predict --heads fib writes fib/H, fib/V, fib/dyad/c2..c7
     # from one trunk pass (the trained path: fine stem + sub-cell placement), linked where the --channel path puts them; FIBCH is unused
-    [ -e $o/fh/fib/H ] || lkg ${UP:-$U} predict $CK $M $P4K $o/fh --um 2.4 --level 2 --box $BOX --levels 1 --heads fib ${PXH:-} --gpu $GPU --threads 6 --cache $WB/cache > $o/predict_heads.log 2>&1 || log "fib: predict --heads fib failed"
+    [ -e $o/fh/fib/H ] || lkg ${UP:-$U} predict $CK $M $P4K $o/fh --um 2.4 --level 2 --box $BOX --levels 1 --heads fib ${PXH:-} $(bash $H/scripts/unroll/axis_for.sh PHercParis4) --gpu $GPU --threads 6 --cache $WB/cache > $o/predict_heads.log 2>&1 || log "fib: predict --heads fib failed"
     for n in H V dyad; do [ -e $o/fh/fib/$n ] && ln -sfn fh/fib/$n $o/$n; done; FIBCH=; fi
   for kv in $FIBCH; do n=${kv%%=*}; cs=${kv#*=}; a=${cs%-*}; b=${cs#*-}
     for ch in $(seq $a $b); do d=$o/$n; [ $n = dyad ] && d=$o/dyad/c$ch; [ -e $d/9.6/zarr.json ] && continue
-      lkg ${UP:-$U} predict $CK $M $P4K $d --um 2.4 --level 2 --box $BOX --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/predict_c$ch.log 2>&1 || log "fib: predict c$ch failed"; done; done
+      lkg ${UP:-$U} predict $CK $M $P4K $d --um 2.4 --level 2 --box $BOX --channel $ch $(bash $H/scripts/unroll/axis_for.sh PHercParis4) --gpu $GPU --threads 6 --cache $WB/cache > $o/predict_c$ch.log 2>&1 || log "fib: predict c$ch failed"; done; done
   for f in H V; do [ -e $o/$f/9.6/zarr.json ] || continue; for m in tube dyad; do x=""; [ $m = dyad ] && { [ -d $o/dyad ] || continue; x="--dyad $o/dyad"; }
     [ -s $o/$f-$m.judge ] && continue
     nice -n 10 $U fiber-trace - - $o/$f-$m.fib --mask $o/$f 9.6 --mask-origin 12288,4096,3584 --box $BOX --scaledown 2 --family $f --half 1024 --min-len 48 --threads 4 $x > $o/trace_$f-$m.log 2>&1
@@ -89,6 +89,7 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
     um=$(python3 -I -c "import json; print(json.load(open('$C/$cr/crop.json')).get('um', 2.4))")
     g=/nonexistent; for gd in ${INKGT:-}; do [ -d $gd/$cr.zarr ] && { g=$gd/$cr.zarr; break; }; done; vs=0; [ -d $g ] && ! grep -qP "^$cr\t" $o/vscores.tsv && vs=1   # INKGT: one or more dirs
     grep -qP "^$cr\t" $o/scores.tsv && [ $vs = 0 ] && continue
+    AXF=$(bash $H/scripts/unroll/axis_for.sh ${scr:-PHercParis4}) || { log "ink: $cr: no axis for ${scr:-PHercParis4} (predict needs one)"; continue; }
     v=$o/vol_${scr:-PHercParis4}; [ "$INKP" = heads ] && v=$o/vol_$cr   # (predict --heads has no --resume: a store per crop)
     if [ "$INKP" = ink3dext ]; then lvi=1; key=$(python3 -I -c "print(round($um * 2, 3))")
       [ -e $o/pred_$cr.done ] || lkg $U ink3d-ext --model dino3d --weights ${INKW:-/vesuvius/ufsm/teachers/dino3d/ckpt_78k_fullsup.pth} --ct $M $ctk/0 --ct-um $um --box $box --surface $C/$cr --out $v --out-um 4.8 --gpu $GPU --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
@@ -98,12 +99,12 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
       if [ "${BLEND:-0}" = 1 ]; then   # BLEND=1 (lead 2026-11-12): the latent ink head's level steps at window seams (inkB: 10-30 / 255, halo 16..256
         # alike), so two passes on tile grids offset by half the 512 core (--grid-origin, in level-LV voxels) blended with sin^2 weights, as
         # inkB's sched/inkwatch/u1667ink-v2.sh (ink-blend: seam step 16.9 -> 1.3 on a 1299 box); the passes are kept in $v.g0 / $v.g256
-        [ -e $o/pred_$cr.done ] || { for gg in 0 256; do [ -e $v.g$gg/ink/zarr.json ] || lkg ${UP:-$U} predict $CK $M $ctk $v.g$gg --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink --window 544 --halo 16 --grid-origin $gg,$gg,$gg ${PXH:-} --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_${cr}_g$gg.log 2>&1 || break; done
+        [ -e $o/pred_$cr.done ] || { for gg in 0 256; do [ -e $v.g$gg/ink/zarr.json ] || lkg ${UP:-$U} predict $CK $M $ctk $v.g$gg --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink --window 544 --halo 16 --grid-origin $gg,$gg,$gg ${PXH:-} $AXF --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_${cr}_g$gg.log 2>&1 || break; done
           [ -e $v.g0/ink/zarr.json ] && [ -e $v.g256/ink/zarr.json ] && mkdir -p $v.h && ${UP:-$U} ink-blend $v.h/ink --um $key --tile 512,512,512 --grids 0,0,0:256,256,256 $v.g0/ink $v.g256/ink --threads 8 > $o/blend_$cr.log 2>&1 && [ -e $v.h/ink/zarr.json ]; } || { log "ink: $cr blended predict failed"; continue; }
       else
-      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink ${PXH:-} --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
+      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink ${PXH:-} $AXF --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
     else lvi=${LV_INK:-1}; ch=${INKP#ch:}; key=$(python3 -I -c "print(round($um * 2 ** $lvi, 3))")
-      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --resume 1 --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
+      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --resume 1 --channel $ch $AXF --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
     touch $o/pred_$cr.done; [ $PO = 1 ] && continue
     if [ $vs = 1 ]; then gk=$(ls $g | grep -vE '^(segments|zarr.json)$' | head -1)
       $U ink-vscore --gt $g $gk --pred $v $key --box $box --level $lvi --row $cr --threads 8 2>> $o/vscore_$cr.log | grep -P "^$cr\t" >> $o/vscores.tsv; fi

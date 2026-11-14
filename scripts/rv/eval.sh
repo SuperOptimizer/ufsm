@@ -32,6 +32,7 @@ for S in $SC; do
     *) echo "unknown $S"; continue;;
   esac
   D=$E/$T/$S; mkdir -p $D
+  AXF=$(bash $(dirname $(readlink -f $0))/../unroll/axis_for.sh $S) || { echo "$S: no axis (predict needs one)" | tee -a $E/$T.txt; continue; }
   read -r oz oy ox mz my mx h < <(jq -r '"\(.origin[0]) \(.origin[1]) \(.origin[2]) \(.shape[0]) \(.shape[1]) \(.shape[2]) \(.h)"' $M/model.json)
   # shard rows to predict: those holding a sampled z (global native z = local + model origin); --zblock: only the kept blocks
   rows=$(echo $ZS | tr , '\n' | awk -v o=$oz -v sh=$SH -v zb="$ZB" '{ z = $1 + 0.5 + o; if (zb != "") { split(zb, a, "[ ,]"); b = a[2]; p = a[3]; if (int(z / b) % 2 != p) next }
@@ -43,7 +44,7 @@ for S in $SC; do
       L=(); [ -n "$LOCK" ] && L=(flock $LOCK)
       [ -n "${K:-}" ] && [ -d $K/gpu.shared ] && while [ -e $K/gpu.pause ] || [ $((10#$(date +%M))) -ge $([ -e $K/gpu.gate-waiting ] && echo 35 || echo 15) ]; do sleep 5; done   # shared pod GPU ($K/GPU.md): wait out exclusive timing slots
       CUDA_VISIBLE_DEVICES=$GPU UFSM_PRED_IO=1 "${L[@]}" nice -n 5 $U predict $CK $CTR $CK_ $D/pred --um $U0 --level $LV --box $((r * SH)),$oy,$ox,$SH,$((my * h)),$((mx * h)) \
-        --full-grid 1 --resume 1 --shard $SH --window ${WINDOW:-640} --halo 64 ${WZ---window-z $((SH + 64)) --halo-z 32} --levels 1 --channel rv \
+        --full-grid 1 --resume 1 $AXF --shard $SH --window ${WINDOW:-640} --halo 64 ${WZ---window-z $((SH + 64)) --halo-z 32} --levels 1 --channel rv \
         --threads $TH --gpu 0 --q 0 ${PX:-} "${LX[@]}" >> $D/pred.log 2>&1 || { echo "$S: predict row $r failed (see $D/pred.log)" | tee -a $E/$T.txt; continue 2; }
     done
     echo "$S: predicted $(echo $rows | wc -w) shard rows of $SH in $(( $(date +%s) - t0 )) s" | tee -a $E/$T.txt; touch $D/pred.done

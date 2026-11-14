@@ -22,7 +22,7 @@ O=/vesuvius/ufsm/unroll/$SCROLL-u1; SD=/vesuvius/ufsm/unroll/sched; U=${U:-/vesu
 R=/vesuvius/ufsm/v2/ct; PY=$(dirname $(readlink -f $0))/wrapscore.py; SEGS=/vesuvius/ufsm/inkgt/segs-$SCROLL.json; [ -s $SEGS ] || SEGS=
 # STRIPES="ws020 ws021": only these stripes (box from their bboxes, scored on them only, per-stripe JPEGs instead of the strip-mosaic)
 STRIPES=${STRIPES:-}; SDIR=$O/strip/strip/flat/stripes
-FILLX=${FILLX:---fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 1}
+FILLX=${FILLX:---fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 0}
 INK=$O/ink/$TAG.h; RD=$O/inkr/$TAG; mkdir -p $O/ink $RD/logs $RD/fillmap $RD/img
 if [ -n "$STRIPES" ]; then mkdir -p $RD/stripes; for s in $STRIPES; do [ -d $SDIR/$s ] || { echo "u1667ink: no stripe $s"; exit 1; }; ln -sfn $SDIR/$s $RD/stripes/$s; done; SDIR=$RD/stripes; fi
 ST=$SD/inkscore-u1-$TAG; [ $SCROLL = PHerc1667 ] || ST=$SD/inkscore-$SCROLL-u1-$TAG
@@ -61,10 +61,17 @@ if [ ! -e $INK/ink.done ]; then
   # GATE=1: also the recto / verso probability channels (c12, c13: papyrus only, never supervised in air) for a papyrus-gated ink render
   HEADS=ink; HL="ink"; [ "${GATE:-0}" = 1 ] && { HEADS=ink,c12,c13; HL="ink c12 c13"; }
   # (--shard 256 on the shifted pass: its tiles align with the store shards; 1299 test box byte-identical, 63 s -> 5 s)
+  # pbox SHIFT: the box moved down onto the pass's 512 tile grid (origin = SHIFT mod 512), as seamless.c pass_box (an off-grid box: one
+  # window per shard, ~6-8x the windows); --axis: the radial input channels (predict refuses without it since 2026-11-14); --q 0 --levels 1:
+  # the passes only feed ink-blend (level 0)
+  pbox() { awk -F, -v s=$1 '{ for (d = 1; d <= 3; d++) { l = $d - s; l = (l >= 0 ? int(l / 512) : -int((-l + 511) / 512)) * 512 + s; if (l < 0) l = s
+           o[d] = l; e = $d + $(d + 3); n[d] = e > l ? e - l : 1 } printf "%d,%d,%d,%d,%d,%d\n", o[1], o[2], o[3], n[1], n[2], n[3] }' <<< "$box"; }
+  AX=${AXIS:-$O/axis.json}; [ -s $AX ] || { log "no axis $AX"; exit 1; }
+  PQ="--q 0 --levels 1"; [ "${BLEND:-1}" = 1 ] || PQ=
   for g in 0 $([ "${BLEND:-1}" = 1 ] && echo 256); do
     log "predict grid $g (waiting for GPU 0)"; gpu0_wait
-    flock /tmp/gpu0-bench.lock env CUDA_VISIBLE_DEVICES=0 ~/bin/memcap -m 40G nice -n 10 $U predict $CK $R $K $INK/g$g --um $UMV --level $LV --box $box \
-      --full-grid 1 --occupancy 5 --heads $HEADS --gpu 0 --threads $TH --window 544 --halo 16 --grid-origin $g,$g,$g $([ $g = 0 ] || echo --shard 256) > $RD/logs/predict_g$g.log 2>&1 ||
+    flock /tmp/gpu0-bench.lock env CUDA_VISIBLE_DEVICES=0 ~/bin/memcap -m 40G nice -n 10 $U predict $CK $R $K $INK/g$g --um $UMV --level $LV --box $(pbox $g) \
+      --full-grid 1 --occupancy 5 --heads $HEADS --gpu 0 --threads $TH --window 544 --halo 16 --grid-origin $g,$g,$g $([ $g = 0 ] || echo --shard 256) --axis $AX $PQ > $RD/logs/predict_g$g.log 2>&1 ||
       { log "predict grid $g failed ($RD/logs/predict_g$g.log)"; exit 1; }
     [ -e $INK/g$g/ink/zarr.json ] || { log "no ink head output in $INK/g$g"; exit 1; }
   done

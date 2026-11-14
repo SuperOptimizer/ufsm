@@ -6,10 +6,10 @@
 #   faces/ (FACES=1) | state/<stage>.done (wall s, CPU s, max RSS) | logs/<stage>.log | progress.log
 # Stages and their order (critical path first; -> = waits for):
 #   prep    box (scrolls.tsv or the scanprep mask) + axis (scrolls.tsv file or ufsm axis)
-#   fields  wind96 fit fields (window 384 x 640^2 / 64; FWIN=auto: predict --window auto, opt-in): the box split in z at a 1024-voxel boundary, one predict per GPU (same global tile grid), joined by
+#   fields  wind96 fit fields (window 384 x 640^2 / 64; FWIN=auto: predict --window auto, opt-in): the box split in z at a 512-voxel boundary, one predict per GPU (same global tile grid), joined by
 #           fields_cat.sh (shard files moved: the result is the single-GPU run's); FIELDGPUS="0" = one predict. A latent-grid CK (FKIND auto: the
 #           checkpoint header has "lat_c"; FKIND=lat / vox forces it): fields/lat from cube windows LWIN / LHALO (640 / 64, the gate's U1
-#           settings: stride 512, so the 1024-voxel z parts keep one tile grid), the latent heads' fit planes (winding mod 4 too); --fit-h 2 runs
+#           settings: stride 512, so the 512-voxel z parts keep one tile grid), the latent heads' fit planes (winding mod 4 too); --fit-h 2 runs
 #           the slab plane path (the fused nn_fit_accum_lat kernel takes --fit-h 8 only)
 #   ink     -> prep only; GPU INKGPU (1): INKAT=slabs (default) its GroupNorm calibration (inkcal) beside the ref, the main pass from
 #           the end of the slabs (beside join .. stripflat, all CPU); INKAT=fields: all of it from when the fields are done: INKCMD (the ink agent's recipe; default: the feathered
@@ -24,12 +24,15 @@
 #           bad-slab check (fit.log: "illegal memory", "loss 0.00000", no final loss line): refit on 1 lane, up to 3 tries, else fail
 #   join    -> slabs: fit-join --ref (refuses bad slabs) ; check -> join: wrap-check (wrapcheck.tsv verdicts; 0 CT peaks = fail)
 #   wraps   -> check: ufsm wraps (.sfc, step 4, --zr from scrolls.tsv, --min-cm2, --col-r p90)
-#   trim    -> wraps: the outer-end dup run (wrap-check) + near-empty outer wraps (on-papyrus <= PAPMIN 0.1; surf-stats) dropped: strip --last
-#           = the first kept id (state/strip.args, the dropped ids in progress.log); TRIM=0 or a --last in STRIPARGS (env only; a tsv --last is ignored): off
+#   trim    -> wraps: from both ends, wraps beyond the wrap-check table, with collapsed gaps (rnet_med < RNETMIN 0.6) or near-empty (on-papyrus
+#           <= PAPMIN 0.1; surf-stats) dropped: strip --first / --last = the first kept ids (state/strip.args; per-wrap inputs state/trim.tsv,
+#           the dropped ids in progress.log); TRIM=0 off; a --last / --first in STRIPARGS keeps that end (a tsv --last is ignored)
 #   snap    -> trim (SNAP=1 default; SNAP=0 off): ufsm wrap-snap wraps -> wraps_snap: each wrap moved along its rays onto the sheets
 #           (smooth per-wrap offsets, order kept: never past half the gap to its neighbours, never into masked CT; SNAPT target, SNAPX
 #           extra flags); the strip and its renders then use wraps_snap. CLEAN runs after it (the phase / mix targets read the fields)
 #   strip   -> snap: ufsm strip ($STRIPARGS + --last) ; stripflat -> strip: strip-flatten (FLATX, default "--gpu 1"; FLATX= for the CPU) ;
+#   distort -> stripflat: strip-distort (the flattening's stretch / folds) as a gate: dist p95 <= DISTP95 (0.35), folded <= DISTFOLD (0.005), no
+#           skipped strip-flatten chunk, else the stage fails (DISTGATE=0: logged only); overlays in strip/distort
 #   stripimg -> stripflat + ink: stretch from the 3 middle stripes, filled stripe renders (FILLX) + strip-mosaic img_fill (rgb) and
 #           img_pap (papyrus look) via scripts/strip/strip_refill.sh; renders UFSM_RENDER_GPU_MEM=4 (a fit may share the GPU), RGPU
 #   perwrap -> wraps + ink (PERWRAP=1): flatten (GPU) + render + ink-compare per wrap, largest first (p4full3.sh recipe)
@@ -55,6 +58,13 @@ CK=${CK:-/vesuvius/ufsm/podready/pod/ckpt/wind96-wk1-best.ckpt}; INKCK=${INKCK:-
 ncpu() { local n; n=$($U sysinfo --ncpu 2> /dev/null) && [ "$n" -gt 0 ] 2> /dev/null && { echo $n; return; }; nproc; }
 availgb() { local g; g=$($U sysinfo --avail-gb 2> /dev/null) && [ "$g" -ge 0 ] 2> /dev/null && { echo $g; return; }
             awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo; }
+# the ink: INKMODE lat (default since 2026-11-14, the latent-ink-only policy): scripts/pod/latink.sh (two tile grids + ink-blend, ink / c12 /
+# c13 heads, --axis) with LATINK_CK (default the newest inkpod snap, 15000) as INKCMD; INKMODE ift3: the legacy feathered single pass of INKCK
+INKMODE=${INKMODE:-lat}
+if [ "$INKMODE" = lat ] && [ -z "${INKCMD+x}" ]; then
+  export LATINK_CK=${LATINK_CK:-/vesuvius/ufsm/v2/lat/runs/inkpod/snap/15000.ckpt} U; INKCMD="bash $([ -e $H/latink.sh ] && echo $H || echo $H/../pod)/latink.sh";   # (the run's copy in $O/bin, the repo's on DRY)
+  INKNAME=${INKNAME:-inkpod-$(basename $LATINK_CK .ckpt)}
+fi
 INKNAME=${INKNAME:-ift3-24000}; TH=${TH:-$(ncpu)}; [ "$TH" -gt 20 ] 2> /dev/null && [ -z "${TH_ALL:-}" ] && TH=20; MINMEM=${MINMEM:-40}; INKGPU=${INKGPU:-1}
 FIELDGPUS=${FIELDGPUS:-0 1}; FITGPUS=${FITGPUS:-0 1}; DRY=${DRY:-0}; I=${SLABI:-64}; OV=${SLABOV:-16}
 # SLABI / SLABOV: slab cells / overlap (default 64 / 16). A full-section Paris 3 slab (96 x 3680 x 4768 fields, 16.8 GB) does not fit a 16 GB GPU and
@@ -79,7 +89,7 @@ F=$O/fields/$FNAME; REF=$O/ref-cf; INK=$O/ink/$INKNAME.zarr
 
 # the run's own copy of the scripts (bash reads scripts incrementally: editing the repo must not change a running driver)
 if [ "$DRY" != 1 ] && [ "${UNROLL_COPY:-0}" != 1 ]; then
-  mkdir -p $O/bin && cp $H/unroll.sh $H/fields_cat.sh $H/scrolls.tsv $H/spiral_dir.tsv $REPO/scripts/wbench/mkcrop.sh $REPO/scripts/strip/strip_run.sh $REPO/scripts/strip/strip_refill.sh $O/bin/ || exit 1
+  mkdir -p $O/bin && cp $H/unroll.sh $H/fields_cat.sh $H/scrolls.tsv $H/spiral_dir.tsv $REPO/scripts/wbench/mkcrop.sh $REPO/scripts/strip/strip_run.sh $REPO/scripts/strip/strip_refill.sh $REPO/scripts/pod/latink.sh $O/bin/ || exit 1
   UNROLL_COPY=1 UNROLL_REPO=$REPO exec bash $O/bin/unroll.sh "$@"
 fi
 MKCROP=$H/mkcrop.sh; [ -e $MKCROP ] || MKCROP=$REPO/scripts/wbench/mkcrop.sh
@@ -121,9 +131,41 @@ stage() {
   log "$st start"; t0=$(date +%s); : >> $l; local m0=$(wc -l < $l)
   $fn; rc=$?
   local cpu rss; read -r cpu rss < <(tail -n +$((m0 + 1)) $l | awk -F': ' '/User time|System time/ {c += $2} /Maximum resident/ {if ($2 > r) r = $2} END {printf "%.0f %.1f\n", c, r / 1048576}')
-  if [ $rc = 0 ]; then echo "$(( $(date +%s) - t0 )) s wall, ${cpu:-0} CPU s, ${rss:-0} GB max RSS" > $O/state/$st.done; log "$st done: $(cat $O/state/$st.done)"
+  if [ $rc = 0 ]; then echo "$(( $(date +%s) - t0 )) s wall, ${cpu:-0} CPU s, ${rss:-0} GB max RSS" > $O/state/$st.done; log "$st done: $(cat $O/state/$st.done)"; mstage $st
   else log "$st FAILED rc $rc (logs/$st.log)"; fi
   return $rc
+}
+# state/manifest.json: what the run was made from and what it decided (audit 2026-11-14: 14 of 17 u1 runs kept only their images, no
+# checkpoint / axis hash, no direction or trim inputs, so the direction default could not be audited afterwards). String values; mset KEY
+# VALUE under a lock (the ink stage runs beside the critical path); mstage STAGE after each stage records that stage's decisions.
+mset() { [ "$DRY" = 1 ] && return 0; local f=$O/state/manifest.json
+  ( flock 8; [ -s $f ] || echo '{}' > $f; jq --arg k "$1" --arg v "$2" '.[$k] = $v' $f > $f.tmp && mv $f.tmp $f ) 8> $O/state/.manifest.lock; }
+fsha() { [ -e "$1" ] && sha256sum "$(readlink -f "$1")" | cut -c1-16 || echo missing; }   # (16 hex digits of the sha256; a 200 MB ckpt ~0.5 s)
+lastline() { grep -hE "$1" "${@:2}" 2> /dev/null | tail -1; }
+mstart() {
+  [ "$DRY" = 1 ] && return 0
+  mset run_start "$(date '+%F %T')"; mset host "$(hostname)"; mset ufsm "$(readlink -f $U)"; mset ufsm_sha "$(fsha $U)"
+  mset repo_commit "$(git -C $REPO rev-parse --short HEAD 2> /dev/null || cat $REPO/COMMIT 2> /dev/null || echo unknown)"
+  mset ct "$R $K level $LV ($LUM um)"; mset ck "$(readlink -f $CK)"; mset ck_sha "$(fsha $CK)"; mset fields_kind $FKIND
+  if [ -n "${INKCMD:-}" ]; then mset inkcmd "$INKCMD"; mset ink_ck "${LATINK_CK:-the default of INKCMD}"; [ -n "${LATINK_CK:-}" ] && mset ink_ck_sha "$(fsha $LATINK_CK)"
+  else mset ink_ck "$(readlink -f $INKCK)"; mset ink_ck_sha "$(fsha $INKCK)"; fi
+  mset box "${BOX:-mask}"; mset zr "${ZR:--}"; mset stripargs_env "${STRIPARGS:-}"
+  mset env "$(for v in CK INKCK INKCMD LATINK_CK FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
+}
+mstage() {
+  [ "$DRY" = 1 ] && return 0
+  case $1 in
+    prep)   mset axis_source "$AXS"; mset axis_sha "$(fsha $O/axis.json)"; mset box "$(cat $O/box.txt 2> /dev/null)";;
+    ref)    mset dir "$(jq -r .dir $REF/model.json 2> /dev/null)"; mset ref_line "$(lastline '^count-field: .*dir [+-]' $O/logs/ref.log)"
+            mset dir_vote_line "$(lastline 'dir.*(vote|rings|default)' $O/logs/ref.log)";;
+    slabs)  mset slab_ref_coherence "$(for d in $O/slabs/s???; do c=$(lastline 'U_ref - phase' $d/fit.log | grep -oE 'coherence [0-9.]+' | cut -d' ' -f2); printf '%s:%s ' ${d##*/} ${c:-na}; done)";;
+    join)   mset join_agreement "$(lastline 'integer agreement on the overlaps' $O/logs/join.log | sed 's/^ *//')";;
+    check)  mset wrapcheck "$(lastline '^wrap-check: verdicts' $O/logs/check.log)";;
+    trim)   mset strip_args "$(cat $O/state/strip.args)"; mset trim "$(grep -h '^[0-9-]* [0-9:]* trim: ' $O/progress.log | tail -3 | cut -d' ' -f3- | cut -c1-600 | tr '\n' '|')";;
+    stripflat) mset stripflat "$(lastline '^strip-flatten: flattened' $O/logs/stripflat.log)";;
+    distort) mset distort "$(lastline '^strip-distort: total' $O/logs/distort.log)";;
+    stripimg) mset strip "$(lastline '^strip-mosaic: .* length' $O/strip/logs/mosaic_fill.log)";;
+  esac
 }
 # upto STAGE: true when UPTO names STAGE (the schedule stops there: the background ink is waited for)
 upto() { [ "${UPTO:-}" = "$1" ] && { [ "$DRY" = 1 ] && echo "(UPTO=$1: stop here)" || log "unroll: UPTO=$1 reached: stopping (re-run without UPTO for the rest)"; wait; exit 0; }; return 0; }
@@ -148,18 +190,30 @@ prep() {
   [ "$DRY" = 1 ] || [ -s $O/box.txt ]
 }
 
-# --- fields: one predict per GPU on z parts (whole 1024-voxel multiples; the last part takes the rest) ---
+# --- fields: one predict per GPU on z parts (whole 512-voxel multiples; the last part takes the rest) ---
 occlv() {   # --occupancy L for the fields: the first of levels LV+3, LV+2, LV+4 the CT has (local root or mirror URL); none: no flag
   local l; for l in $((LV + 3)) $((LV + 2)) $((LV + 4)); do
     case $R in http://*|https://*) curl -sfI $R/$K/$l/zarr.json > /dev/null && { echo "--occupancy $l"; return; };;
                      *) [ -e $R/$K/$l/zarr.json ] && { echo "--occupancy $l"; return; };; esac
   done
 }
+# FBLEND=1 (OFF by default; audit 2026-11-14 #5, A/B pending): each part predicted on two tile grids (origin 0 and half the stride) and
+# blended with ufsm field-blend --tile (sin^2 weights: every cell leans on the window it sits deep inside), against the tile-border steps of
+# the single-grid fields (1667 u1 640/64: the normal plane t0 steps 4-5x its interior median at every 256-cell border). Lat fields only.
 fpred() {   # fpred GPU BOX OUT
+  if [ "${FBLEND:-0}" = 1 ] && [ "$FKIND" = lat ]; then
+    local st=$(( ${LWIN:-640} - 2 * ${LHALO:-64} )) gg
+    for gg in 0 $((st / 2)); do fpred1 $1 $2 $3.g$gg $gg || return 1; done
+    X $O/logs/fields.log $U field-blend $3 $3.g0 $3.g$((st / 2)) --tile $st,$st,$st --grids 0,0,0:$((st / 2)),$((st / 2)),$((st / 2)) --threads $TH || return 1
+    [ "$DRY" = 1 ] || { [ -e $3/fields.json ] && rm -rf $3.g0 $3.g$((st / 2)); }; return
+  fi
+  fpred1 $1 $2 $3 0
+}
+fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windows anchored at GRID (each axis)
   local win; if [ "$FKIND" = lat ]; then win="--window ${LWIN:-640} --halo ${LHALO:-64}"
   else win="$([ "${FWIN:-prod}" = auto ] && echo "--window auto" || echo "--window-z 384 --halo-z 64 --window 640") --halo 64"; fi
   X $O/logs/fields.log $U predict $CK $R $K $3.tmp --um $UM --level $LV --box $2 $win --shard 512 \
-    --grid-origin 0,0,0 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $(occlv) &&
+    --grid-origin $4,$4,$4 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
 # --- the ref's pass 1 streamed behind the fields predict (REFSTREAM; 6a, 11-12) ---
@@ -168,7 +222,7 @@ fpred() {   # fpred GPU BOX OUT
 # the box rows in OUT/rows.ready) and runs count-field --pool-only --follow on it: the chunks in the parts' order, each once its rows are
 # written. The pooled sums equal a whole-box pass 1 (per chunk, disjoint solve rows; the prior from the middle row's chunk; the chunk
 # rows fixed by refcz in both runs), so the ref (--pool-cache) is byte-identical to the stage-barrier ref with those chunk rows.
-refstream_on() { [ "${REFSTREAM:-1}" = 1 ] && [ "$FKIND" = lat ] && [ "${RECTOSP:-1}" = 0 ] && [ "${CTCAL:-0}" != 1 ] && [ -z "${REFCMD:-}" ] && [ "$DRY" != 1 ]; }
+refstream_on() { [ "${REFSTREAM:-1}" = 1 ] && [ "${FBLEND:-0}" != 1 ] && [ "$FKIND" = lat ] && [ "${RECTOSP:-1}" = 0 ] && [ "${CTCAL:-0}" != 1 ] && [ -z "${REFCMD:-}" ] && [ "$DRY" != 1 ]; }
 refstream() {   # refstream OUT PART..
   local S=$1; shift; local parts=("$@") k p pl z a b n=0 starts=() fs cz cfp=
   rm -rf $S $S.fin $O/ref.pool $O/ref.pool.ok; mkdir -p $S
@@ -202,11 +256,12 @@ fields() {
   [ "$DRY" = 1 ] || { rm -rf $F; mkdir -p $O/fields; rm -f $O/ref.pool $O/ref.pool.ok; }
   [ "$DRY" = 1 ] && [ "${REFSTREAM:-1}" = 1 ] && [ "$FKIND" = lat ] && [ "${RECTOSP:-1}" = 0 ] && echo "    (REFSTREAM: the ref's pass 1 behind the predicts: count-field --pool-only --follow on the parts' finished rows -> ref.pool)"
   local z0 dz y0 x0 dy dx k a b pids=() parts=(); IFS=, read -r z0 y0 x0 dz dy dx <<< "$box"
-  [ $(( (dz / n) / 1024 )) -lt 1 ] && n=1   # (parts of >= 1024 voxels each)
+  [ $(( (dz / n) / 512 )) -lt 1 ] && n=1   # (parts of >= 512 voxels each)
   if [ $n = 1 ]; then fpred ${g[0]} $box $F; return; fi
-  # z parts: equal shares rounded to 1024 voxels (= 512 field cells at h 2, a multiple of the 128-cell field shard and of the 256 z stride)
+  # z parts: equal shares rounded to the NEAREST 512 voxels (= 256 field cells at h 2, a multiple of the 128-cell field shard, of the 512
+  # latent stride and the 256 voxel z stride; box origins are multiples of 512). Was floor to 1024: 1667 split 4096 / 5173 (69 / 89 s)
   for k in $(seq 0 $((n - 1))); do
-    a=$(( z0 + (dz * k / n) / 1024 * 1024 )); b=$(( k == n - 1 ? z0 + dz : z0 + (dz * (k + 1) / n) / 1024 * 1024 ))
+    a=$(( z0 + (dz * k / n + 256) / 512 * 512 )); b=$(( k == n - 1 ? z0 + dz : z0 + (dz * (k + 1) / n + 256) / 512 * 512 ))
     parts+=($F.p$k); [ "$DRY" = 1 ] || rm -rf $F.p$k $F.p$k.tmp
     fpred ${g[$k]} $a,$y0,$x0,$((b - a)),$dy,$dx $F.p$k & pids+=($!)
   done
@@ -281,7 +336,8 @@ rectosp() {
 }
 
 # --- ink (another agent's recipe via INKCMD SCROLLDIR GPU OUT; default the feathered single pass of scripts/corpus/inklib.sh) ---
-# inkcal: the frozen GroupNorm statistics (gn.bin) from 640^3 windows of a 2048-row band at the box's middle; its own stage so it can
+# inkcal: the frozen GroupNorm statistics (gn.bin) from the main pass's windows (INKW / INKH: auto / 32; was 640 / 64 against the
+# main pass's auto = 576 / 32, audit 2026-11-14 #19) of a 2048-row band at the box's middle; its own stage so it can
 # run on GPU INKGPU beside the ref (INKAT=slabs) while the main pass waits for the slabs. INKCMD: nothing (the recipe does its own).
 # INKCALZ: the band's rows (2048; P4: 505 windows, 148 s)
 inkcal() {
@@ -289,8 +345,8 @@ inkcal() {
   [ "$DRY" = 1 ] || mkdir -p $O/ink
   local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
   cal=$(echo $box | awk -F, -v cz=${INKCALZ:-2048} '{ zc = $1 + int($4 / 2); z0 = zc - int(cz / 2); if (z0 < $1) z0 = $1; nz = cz; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
-  local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU $(occlv)"
-  [ -s $O/ink/gn.bin ] || { X $O/logs/inkcal.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P ${INKPX:-} --window 640 --halo 64 --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
+  local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU --axis $O/axis.json $(occlv)"
+  [ -s $O/ink/gn.bin ] || { X $O/logs/inkcal.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P ${INKPX:-} --window ${INKW:-auto} --halo ${INKH:-32} --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
                              { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || return 1; }
 }
 ink() {
@@ -298,12 +354,12 @@ ink() {
   # INKCMD set but empty (a pod env with an unset path, "INKCMD=$X"): fail loudly instead of falling back to the default prediction;
   # any INKCMD must leave a readable zarr at $INK (a dangling link from a missing published ink fails here, not in the renders)
   if [ -n "${INKCMD+x}" ] && [ -z "${INKCMD// /}" ]; then log "ink: INKCMD is set but EMPTY: refusing (unset it for the default feathered ink)"; return 1; fi
-  if [ -n "${INKCMD:-}" ]; then X $O/logs/ink.log $INKCMD $O $INKGPU $INK || { log "ink: INKCMD '$INKCMD' failed (logs/ink.log)"; return 1; }
+  if [ -n "${INKCMD:-}" ]; then UNROLL_CT="$R|$K|$UM|$LV" X $O/logs/ink.log $INKCMD $O $INKGPU $INK || { log "ink: INKCMD '$INKCMD' failed (logs/ink.log)"; return 1; }
     [ "$DRY" = 1 ] || [ -e $INK/zarr.json ] || { log "ink: INKCMD '$INKCMD' left no zarr at $INK (zarr.json missing; dangling link?)"; return 1; }
     return 0; fi
   local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
   cal=$(echo $box | awk -F, '{ zc = $1 + int($4 / 2); z0 = zc - 1024; if (z0 < $1) z0 = $1; nz = 2048; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
-  local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU $(occlv)"
+  local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU --axis $O/axis.json $(occlv)"
   inkcal || return 1
   # one feathered pass (inklib.sh): window auto (576/32 on 16 GB, 1088/32 from ~46 GB free), each border blended over 32 voxels; resumable
   X $O/logs/ink.log $U predict $INKCK $R $K $INK $P ${INKPX:-} --box $box --window ${INKW:-auto} --halo ${INKH:-32} --feather ${INKF:-32} --full-grid 1 --resume 1 --levels 4 \
@@ -416,50 +472,75 @@ wraps() {
   [ "$DRY" = 1 ] || rm -rf $O/wraps
   X $O/logs/wraps.log $U wraps $O/joined $O/wraps --step 4 --out-um $LUM --sfc 0.25 --fields $F --threads $TH $zr --min-cm2 ${MINCM2W:-0.5}
 }
-# trim: the strip's outer end. Wrap ids increase OUTWARD and the strip walks outermost first (column 0 = the highest id), so the outer
-# end is the highest ids. (1) From the highest wrap-check verdict id walk down while the verdict is dup (the ref's outer over-count:
-# duplicate turns). (2) With no dup run, start from the highest wrap written instead. (3) Keep walking down while the wrap is near-empty:
-# on-papyrus (surf-stats --ct-only, CT >= 80 within +-15 um) <= PAPMIN (0.1). The first kept id becomes strip --last (state/strip.args);
-# the dropped ids are logged. STRIPARGS (env) with its own --last (must name a wrap of this run), or TRIM=0, skips this. CLEAN=1 deletes the field planes + slab fits after the snap stage.
+# trim: both ends of the strip. Wrap ids increase OUTWARD (the strip walks outermost first). From each end, wraps are dropped while
+#   (1) they lie beyond the wrap-check table (ids above its highest / below its lowest row: too few radial intervals to judge), or
+#   (2) their gap to the next wrap outward is collapsed: wrap-check's rnet_med (the normal gap over the network's own sheet spacing sp) < RNETMIN
+#       (0.6): wraps packed closer than the sheets = the ref's over-count pile at the mask edge, or
+#   (3) they are near-empty: on-papyrus (surf-stats --ct-only, CT >= 80 within +-15 um) <= PAPMIN (0.1).
+# The first kept ids become strip --first / --last (state/strip.args); the inputs per examined wrap go to state/trim.tsv and the dropped
+# ids to progress.log. Before 2026-11-14 the outer end used wrap-check's "dup" verdict (empty share >= 0.5), whose precision against the
+# 1667 GT is 0.07: it dropped w040-w042 = published turns 29-31; rnet keeps them (rnet .88 / .79 / .66) and drops the pile above (w043 .56,
+# w044 .45, w045 .36), and the real outer gaps that shrink with the papyrus (gap 230 -> 94 um, rnet ~1) are no longer read as
+# duplicates. The inner core wraps of 1667 (w000-w011, inside the published unwrap's first turn) are on papyrus (0.16-0.56, as the middle
+# wraps) at rnet ~1: kept (the published unwrap starts at r 3.9 mm; they are not a fit error). STRIPARGS (env) with its own --last (must
+# name a wrap of this run) skips the outer end, a --first there (e.g. Paris 4's tsv --first 78) the inner end; TRIM=0 skips both.
+# CLEAN=1 deletes the field planes + slab fits after the snap stage.
 onpap() {   # onpap ID..: "id share" per wrap (surf-stats --per-wrap --ct-only on a link dir of those wraps)
   local d=$O/trim.tmp i; rm -rf $d; mkdir -p $d; for i in "$@"; do ln -s $O/wraps/$(printf 'w%03d' $i).sfc $d/; done
   nice -n 10 $U surf-stats $d --fields $F --ct $R $K/$LV --ct-um $LUM --ct-only 1 --per-wrap --threads $TH 2>> $O/logs/trim.log |
-    tee -a $O/logs/trim.log | awk '$1 ~ /^w[0-9]+$/ && NF >= 8 { print substr($1, 2) + 0, $NF }'
+    tee -a $O/logs/trim.log | awk '$1 ~ /^w-?[0-9]+$/ && NF >= 8 { print substr($1, 2) + 0, $NF }'
   rm -rf $d
 }
+# trimwalk END ID..: walk the ids from one end (given in walking order), drop while rule 1 / 2 / 3 holds; sets TW_KEPT (none: all dropped)
+# and TW_DROP (no subshell: the on-papyrus shares stay in P);
+# on-papyrus in batches of 1, 4, then 16 wraps (usually the first wrap past the pile decides). Reads V / RN / LO / HI, appends to state/trim.tsv
+trimwalk() {
+  local end=$1 k=0 i why nb=1 batch a b dropped=; shift; local ids=("$@")
+  while [ $k -lt ${#ids[@]} ]; do
+    i=${ids[$k]}; why=
+    if [ -z "${RN[$i]:-}" ] && { [ $i -gt $HI ] || [ $i -lt $LO ]; }; then why=unjudged
+    elif [ -n "${RN[$i]:-}" ] && awk -v r=${RN[$i]} -v m=${RNETMIN:-0.6} 'BEGIN { exit !(r < m) }'; then why=collapsed
+    else
+      if [ -z "${P[$i]:-}" ]; then batch=("${ids[@]:$k:$nb}"); nb=$(( nb < 16 ? nb * 4 : 16 ))
+        while read -r a b; do P[$a]=$b; echo "$a $b" >> $O/trim.pap; done < <(onpap "${batch[@]}"); [ -n "${P[$i]:-}" ] || P[$i]=0; fi
+      awk -v p=${P[$i]} -v m=${PAPMIN:-0.1} 'BEGIN { exit !(p <= m) }' && why=empty
+    fi
+    printf '%s\tw%03d\t%s\t%s\t%s\t%s\t%s\n' $end $i "${V[$i]:--}" "${RN[$i]:--}" "${GP[$i]:--}" "${P[$i]:--}" "${why:-kept}" >> $O/state/trim.tsv
+    [ -z "$why" ] && break
+    dropped+=" $(printf 'w%03d' $i)($why)"; k=$((k + 1))
+  done
+  TW_KEPT=none; [ $k -lt ${#ids[@]} ] && TW_KEPT=${ids[$k]}; TW_DROP=$dropped
+}
 trim() {
-  [ "$DRY" = 1 ] && { echo "    strip --last = first kept id walking down from the top: wrapcheck.tsv dup run, then wraps with on-papyrus <= ${PAPMIN:-0.1} (surf-stats --ct-only)"; return 0; }
-  local args=$STRIPARGS ids top last k i v p dropped= batch=() pap=$O/trim.pap; : > $O/state/strip.args
+  [ "$DRY" = 1 ] && { echo "    strip --first / --last = the first kept id from each end: beyond the wrap-check table, rnet_med < ${RNETMIN:-0.6} (collapsed gaps), on-papyrus <= ${PAPMIN:-0.1} (surf-stats --ct-only) dropped"; return 0; }
+  local args=$STRIPARGS ids w r first last o TW_KEPT TW_DROP; : > $O/state/strip.args; : > $O/trim.pap
+  printf 'end\twrap\tverdict\trnet_med\tgap_um_med\ton_papyrus\tdecision\n' > $O/state/trim.tsv
   if [[ " $STRIPARGS " == *" --last "* ]]; then   # an explicit STRIPARGS --last (env): must name a wrap of THIS run
-    last=$(echo " $STRIPARGS " | sed -nE 's/.* --last ([0-9]+) .*/\1/p')
+    last=$(echo " $STRIPARGS " | sed -nE 's/.* --last (-?[0-9]+) .*/\1/p')
     [ -e $O/wraps/$(printf 'w%03d' $((10#$last))).sfc ] || { log "trim: STRIPARGS --last $last names no wrap of this run ($(ls $O/wraps | head -1)..$(ls $O/wraps | tail -1)): a --last from another run's gauge? refusing"; return 1; }
   fi
-  if [ "${TRIM:-1}" != 1 ] || [[ " $STRIPARGS " == *" --last "* ]]; then log "trim: skipped (TRIM=${TRIM:-1}, STRIPARGS '$STRIPARGS')"
+  if [ "${TRIM:-1}" != 1 ]; then log "trim: skipped (TRIM=${TRIM:-1}, STRIPARGS '$STRIPARGS')"; echo "$args" > $O/state/strip.args; return 0; fi
+  ids=($(ls $O/wraps | sed -n 's/^w\(-\?[0-9]*\)\.sfc$/\1/p' | awk '{print $1 + 0}' | sort -n)); [ ${#ids[@]} -gt 0 ] || { log "trim: no wraps"; return 1; }
+  declare -A V RN GP P; LO=; HI=
+  while IFS=$'\t' read -r w _ _ _ _ _ r g _ _ _ _ _ v; do [[ $w =~ ^w-?[0-9]+$ ]] || continue; w=${w#w}; [[ $w == -* ]] && w=$(( -10#${w#-} )) || w=$((10#$w)); V[$w]=$v; RN[$w]=$r; GP[$w]=$g
+    { [ -z "$LO" ] || [ $w -lt $LO ]; } && LO=$w; { [ -z "$HI" ] || [ $w -gt $HI ]; } && HI=$w; done < $O/wrapcheck.tsv
+  [ -n "$HI" ] || { log "trim: wrapcheck.tsv has no wrap rows: refusing (TRIM=0 to skip)"; return 1; }
+  if [[ " $STRIPARGS " == *" --last "* ]]; then log "trim: outer end kept from STRIPARGS (--last $last)"
   else
-    ids=($(ls $O/wraps | sed -n 's/^w\([0-9]*\)\.sfc$/\1/p' | awk '{print $1 + 0}' | sort -rn)); [ ${#ids[@]} -gt 0 ] || { log "trim: no wraps"; return 1; }
-    declare -A V; while IFS=$'\t' read -r w _ _ _ _ _ _ _ _ _ _ _ _ v; do [[ $w =~ ^w[0-9]+$ ]] && V[$((10#${w#w}))]=$v; done < $O/wrapcheck.tsv
-    top=$(printf '%s\n' "${!V[@]}" | sort -rn | head -1); k=0
-    # (1) the dup run below the highest verdict id; (2) no dup run: from the highest wrap written
-    if [ -n "$top" ] && [ "${V[$top]}" = dup ]; then
-      while [ $k -lt ${#ids[@]} ] && { [ ${ids[$k]} -gt $top ] || [ "${V[${ids[$k]}]:-}" = dup ]; }; do dropped+=" ${ids[$k]}"; k=$((k + 1)); done
-      log "trim: outer-end dup run (wrap-check verdicts) + every wrap above it: $(echo $dropped | wc -w) wraps"
-    fi
-    # (3) the near-empty outer tail: on-papyrus <= PAPMIN, computed from the top in batches of 1, 4, then 16 wraps (usually the first
-    # wrap below the dup run decides: one surf-stats of one wrap, ~5 s instead of ~65 s for 16 outer wraps on 0490B)
-    declare -A P; : > $pap; local nb=1
-    while [ $k -lt ${#ids[@]} ]; do
-      i=${ids[$k]}
-      if [ -z "${P[$i]:-}" ]; then batch=("${ids[@]:$k:$nb}"); nb=$(( nb < 16 ? nb * 4 : 16 )); while read -r a b; do P[$a]=$b; echo "$a $b" >> $pap; done < <(onpap "${batch[@]}"); [ -n "${P[$i]:-}" ] || P[$i]=0; fi
-      awk -v p=${P[$i]} -v m=${PAPMIN:-0.1} 'BEGIN { exit !(p <= m) }' || break
-      dropped+=" $i"; k=$((k + 1))
-    done
-    [ $k -lt ${#ids[@]} ] || { log "trim: every wrap would be dropped: refusing (TRIM=0 to skip)"; return 1; }
-    last=${ids[$k]}
-    if [ -n "$dropped" ]; then args="$STRIPARGS --last $last"
-      log "trim: strip --last $last (first kept: verdict ${V[$last]:-none}, on-papyrus ${P[$last]:-?}); dropped $(echo $dropped | wc -w) outer wraps:$(for i in $dropped; do printf ' w%03d(%s,%s)' $i "${V[$i]:--}" "${P[$i]:--}"; done)"
-    else log "trim: nothing dropped (top w$(printf %03d ${ids[0]}): verdict ${V[${ids[0]}]:-none}, on-papyrus ${P[${ids[0]}]:-?})"; fi
+    trimwalk outer $(printf '%s\n' "${ids[@]}" | sort -rn); last=$TW_KEPT; o=$TW_DROP
+    [ "$last" = none ] && { log "trim: every wrap would be dropped from the outer end: refusing (TRIM=0 to skip)"; return 1; }
+    args="$args --last $last"; log "trim: strip --last $last (verdict ${V[$last]:--}, rnet ${RN[$last]:--}, on-papyrus ${P[$last]:--}); outer dropped $(echo $o | wc -w):${o:+ $o}"
   fi
-  echo "$args" > $O/state/strip.args
+  if [[ " $STRIPARGS " == *" --first "* ]]; then log "trim: inner end kept from STRIPARGS ($STRIPARGS)"
+  else
+    trimwalk inner "${ids[@]}"; first=$TW_KEPT; o=$TW_DROP
+    [ "$first" = none ] || [ $first -gt $last ] && { log "trim: the inner end passes the outer one ($first > $last): refusing (TRIM=0 to skip)"; return 1; }
+    log "trim: inner end: first kept w$(printf %03d $first) (rnet ${RN[$first]:--}, on-papyrus ${P[$first]:--}); inner dropped $(echo $o | wc -w):${o:+ $o}"
+    # (ufsm strip reads ids >= 0 only, src/strip.c: the kept negative ids are named here, not silently lost)
+    [ $first -lt 0 ] && { log "trim: NOTE: kept wraps w$(printf %03d $first)..w-01 are not in the strip (strip takes ids >= 0)"; first=0; }
+    args="$args --first $first"
+  fi
+  echo "$args" | sed 's/^ *//' > $O/state/strip.args
   return 0
 }
 # snap: the wraps onto the sheets (src/wrapsnap.c): along their rays (z and the ray angle kept: the strip's columns / rows unchanged), each
@@ -489,11 +570,32 @@ snap() {
 strip() { local a=$STRIPARGS; [ -e $O/state/strip.args ] && a=$(cat $O/state/strip.args)
           [ "$DRY" = 1 ] || rm -rf $O/strip/strip; X $O/logs/strip.log $U strip $(wrapsdir) $O/strip/strip --threads $TH $a; }
 stripflat() { X $O/logs/stripflat.log $U strip-flatten $O/strip/strip --decim ${DECIM:-4} --threads $TH --flip-rows 1 --cg 60 --tol 3e-4 ${FLATX---gpu 1}; }
+# distort: the flattening's distortion gate (src/stripdistort.c; audit 2026-11-14: measured in QA only, never checked; 1299's flatten energy
+# 5904 vs P4 5.4 went unnoticed). strip-distort -> strip/distort (per-stripe <s>_dist.jpg / <s>_area.jpg overlays, tiles / wraps / stripes
+# .tsv; 1667 9 s, P4 172 s, CPU); the totals and strip-flatten's own summary go to progress.log. FAILS the stage (the strip images wait)
+# when dist p95 > DISTP95 (0.35; 1667 .157, P4 .187) or the folded share > DISTFOLD (0.005; 1667 .0018, P4 .0006), or strip-flatten
+# skipped a chunk ("no mesh": a hole later filled as if real); DISTGATE=0: measured and logged only
+distort() {
+  local d=$O/strip/distort t
+  [ "$DRY" = 1 ] && { echo "    $U strip-distort $O/strip/strip/flat $d (gate: dist p95 <= ${DISTP95:-0.35}, folded <= ${DISTFOLD:-0.005}, no skipped chunk; DISTGATE=${DISTGATE:-1})"; return 0; }
+  rm -rf $d; X $O/logs/distort.log $U strip-distort $O/strip/strip/flat $d --threads $TH || return 1
+  t=$(grep -E '^strip-distort: total' $O/logs/distort.log | tail -1); [ -n "$t" ] || { log "distort: no totals (logs/distort.log)"; return 1; }
+  log "distort: ${t#strip-distort: }"
+  log "distort: strip-flatten: $(grep -E '^strip-flatten: flattened' $O/logs/stripflat.log | tail -1 | sed 's/^strip-flatten: //')"
+  local p95 fold nom bad=; p95=$(echo "$t" | sed -nE 's/.* p95 ([0-9.]+) .*/\1/p'); fold=$(echo "$t" | sed -nE 's/.*folded ([0-9.]+).*/\1/p')
+  nom=$(grep -c 'no mesh' $O/logs/stripflat.log)
+  awk -v v=$p95 -v m=${DISTP95:-0.35} 'BEGIN { exit !(v > m) }' && bad+=" dist p95 $p95 > ${DISTP95:-0.35};"
+  awk -v v=$fold -v m=${DISTFOLD:-0.005} 'BEGIN { exit !(v > m) }' && bad+=" folded $fold > ${DISTFOLD:-0.005};"
+  [ "$nom" -gt 0 ] && bad+=" strip-flatten skipped $nom chunk(s) (no mesh);"
+  [ -z "$bad" ] && return 0
+  if [ "${DISTGATE:-1}" = 1 ]; then log "distort: GATE FAILED:$bad see strip/distort/*_dist.jpg (DISTGATE=0 to go on)"; return 1; fi
+  log "distort: over the gate (DISTGATE=0, going on):$bad"; return 0
+}
 # stripimg: the filled stripe renders + two mosaics (the pods' strip.sh recipe): a contrast stretch from the 3 middle stripes (rendered
 # with fill into strip/render_fill, reused), then scripts/strip/strip_refill.sh: every stripe rendered with FILLX, strip-mosaic img_fill
 # (grey <s>_ct.jpg + <s>_ink.jpg per stripe) and img_pap (papyrus look, --papyrus-dir, same reads), renders removed after the mosaic. UFSM_RENDER_GPU_MEM 4 (GB):
 # the render's device chunk pool stays small enough for a slab fit sharing the GPU (pods, two scrolls); RGPU: CUDA device of the renders
-FILLX=${FILLX:---fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 1}
+FILLX=${FILLX:---fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 0}
 stripimg() {
   local ST=$O/strip RF=$O/strip/render_fill S N k s
   local E="UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_ZCACHE_ADMIT=${ZCACHE_ADMIT:-0.6} UFSM_JPEG_THREADS=$JPEGT UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} UFSM_RENDER_MEM=${UFSM_RENDER_MEM:-16} ${RGPU:+CUDA_VISIBLE_DEVICES=$RGPU}"
@@ -565,7 +667,7 @@ upload() {
 
 # --- the schedule ---
 [ "$DRY" = 1 ] && echo "unroll $S: O=$O U=$U ($R $K level $LV, $LUM um; box ${BOX:--}, zr ${ZR:--}, strip args '${STRIPARGS}'; CK $CK: $FKIND fields $F)"
-stage prep prep || exit 1; upto prep
+mstart; stage prep prep || exit 1; upto prep
 stage fields fields || exit 1; upto fields
 # the ink on GPU $INKGPU. INKAT=slabs (default): its GroupNorm calibration beside the ref, the main pass from the end of the slabs, beside
 # the CPU stages join .. stripflat (P4 11-12: ink 892 s; with the fast ref its GPU-1 slab lane would wait for it); INKAT=fields: the
@@ -581,7 +683,7 @@ inkmain() { [ "${NOINK:-0}" != 1 ] && [ "$INKAT" != fields ] && ! done_ ink && i
   stage wraps wraps && upto wraps && stage trim trim && stage snap snap && upto snap ||
   { log "unroll: stopped before the strip"; wait; exit 1; }
 if [ "${PERWRAP:-0}" = 1 ]; then ( waitfor ink && stage perwrap perwrap && { [ "${FACES:-0}" = 1 ] && stage faces faces; true; } ) & PWP=$!; [ "$DRY" = 1 ] && wait $PWP; fi
-stage strip strip && upto strip && stage stripflat stripflat && waitfor ink && stage stripimg stripimg || log "unroll: the strip stopped"
+stage strip strip && upto strip && stage stripflat stripflat && stage distort distort && waitfor ink && stage stripimg stripimg || log "unroll: the strip stopped"
 wait
 stage upload upload
 [ "$DRY" = 1 ] || log "unroll $S finished: $(for f in $O/state/*.done; do [ -e $f ] && printf '%s %s; ' $(basename $f .done) "$(cut -d, -f1 $f)"; done)"

@@ -4399,14 +4399,14 @@ static int cmd_render(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm render <wraps-dir> <out-dir> --volume ROOT KEY [--ct ROOT KEY] [--cache DIR] [--scale 1] [--depth 8] [--tile 512] [--threads 16] [--crop x,y,w,h] [--joint 1] [--gpu 1] [--known]\n"
 "  --gpu 1 (default): sample on the GPU (decoded chunks kept on the device, decoded there by gpudec); same bytes as --gpu 0 (CPU),\n"
 "    the CPU path on any device error or a full device (UFSM_RENDER_GPU_MEM GB caps the device chunk pool)\n"
-"         [--fill N] [--fill-ct 1] [--fill-prefer 0] [--fill-inpaint L] [--fill-pm 1] [--fill-grid V]\n"
+"         [--fill N] [--fill-ct 1] [--fill-prefer 0] [--fill-inpaint L] [--fill-pm 0] [--fill-grid V]\n"
 "  --joint 1: all wraps (one grid size) in one chunk-ordered pass, shared chunks decoded once\n"
 "  --fill N (needs --ct): a pixel whose CT on the surface is < --fill-ct (masked CT: 0 off the papyrus) takes the nearest papyrus\n"
 "    sample along the surface normal within +-N voxels for the volume AND the CT (same offset); ties: --fill-prefer 1 / -1 the\n"
 "    +- normal side, 0 the larger CT. Writes <wrap>_fill.tif: 0 on the surface, k filled from +k, 50 + k from -k, 250 inpainted,\n"
 "    254 no surface, 255 still empty; prints the shares. --fill 0: flags only. --fill-inpaint L: push-pull over L levels (holes up\n"
-"    to ~2^L pixels) of the still-empty pixels in both renders, then PatchMatch texture (--fill-pm 1, default; 0: push-pull only);\n"
-"    cosmetic, off by default; flag 250\n"
+"    to ~2^L pixels) of the still-empty pixels in both renders, push-pull only by default; --fill-pm 1 adds PatchMatch texture\n"
+"    (copied from elsewhere on the render: it can read as ink strokes, so off since 2026-11-14); cosmetic, off by default; flag 250\n"
 "  --fill-grid V (with --fill): enclosed holes of the grid (invalid vertices, at most V per hole) bridged by interpolated vertices\n"
 "    (push-pull + Laplace), rendered like the rest; their pixels' flags + 100\n"
 "  --known: nearest voxel, 255 (prob254 unknown) skipped, the max over the known values within +-depth (label zarrs: ink-splat output);\n"
@@ -4420,7 +4420,7 @@ static int cmd_render(int argc, char **argv) {
     const int tile = atoi(opt(argc, argv, "--tile", "512")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
     const char *cache = opt(argc, argv, "--cache", nullptr);
     const int fill_n = atoi(opt(argc, argv, "--fill", "-1")), fill_inp = atoi(opt(argc, argv, "--fill-inpaint", "0"));
-    const int fill_thr = atoi(opt(argc, argv, "--fill-ct", "1")), fill_pref = atoi(opt(argc, argv, "--fill-prefer", "0")), fill_pm = atoi(opt(argc, argv, "--fill-pm", "1"));
+    const int fill_thr = atoi(opt(argc, argv, "--fill-ct", "1")), fill_pref = atoi(opt(argc, argv, "--fill-prefer", "0")), fill_pm = atoi(opt(argc, argv, "--fill-pm", "0"));
     const long fill_grid = atol(opt(argc, argv, "--fill-grid", "0"));
     const int rgpu_on = atoi(opt(argc, argv, "--gpu", "1")) && render_gpu_available() && !getenv("UFSM_RENDER_TILED") && !known;   /* default on: same bytes, CPU on any device trouble */
     render_set_gpu(rgpu_on);
