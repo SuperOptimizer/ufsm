@@ -78,8 +78,10 @@ builders. A redraw costs 97-193 ms on a replay thread.
 
 At a 1.5 s step (the sampler keeps up at P 512): 10 % echo over 30 batches, the remaining batches new.
 
-GPU check: `/vesuvius/ufsm/perf2/echo_swap.sh` (desk swap window: the recipe with `--echo-max 4`, then with `--workers 1` to force
-starvation).
+GPU check, `tests/test_echo.sh` (fast tier, perf pod RTX PRO 4000): the wind fixture, P 64, one worker. Over 40 steps it echoes
+62 % on average. The cap of 3 echoes a window bounds that share at 75 %, so the step still waits 20-40 % (the det run without echo
+waits 18-55 %). Losses are finite. Under `--det 1` echo is off and the losses equal those of the run without the flag, line for line.
+`--split z` with echo is covered only by the sampler-only runs above: the pod has one GPU. The first two-card run is scratch2's swap.
 
 **Use.** Replace `--replay 2` with `--echo-max 4`: under `--replay 2` every window is trained twice whether data is short or not,
 while echo spends only the steps that would otherwise wait.
