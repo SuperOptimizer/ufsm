@@ -4253,7 +4253,8 @@ void unet_set_muon_adapt(unet *u, int lars, float tgt, float beta, float clamp, 
 }
 /* --attn-muon-lr F / --attn-muon-lr-out F2 (audit 2026-11-14 train #3): the attention stage's linears at F x the Muon lr, the out-projections
    wo / w2 (tbm[k][1], [3]; zero-initialised, so Muon's fixed-size step is a large relative step while |W| is small) at F x F2. Plain
-   batched Muon: one nn_muon_batch per run of equal multipliers; the ext path (--normuon etc.): nn_madapt.base. 0 or 1: off. */
+   batched Muon: one nn_muon_batch per run of equal multipliers; the ext path (--normuon etc.): nn_madapt.base. 0 or 1: off.
+   (UFSM_MUON_UNBATCHED's per-conv reference path, muon_conv, ignores the multipliers.) */
 void unet_set_attn_muon_lr(unet *u, float all, float out) { u->am_attn = all; u->am_out = out; u->am_n = 0; }
 static int am_on(const unet *u) { return u->tbn && ((u->am_attn > 0.f && u->am_attn != 1.f) || (u->am_out > 0.f && u->am_out != 1.f)); }
 static void am_build(unet *u) {   /* each descriptor's multiplier from its weight offset (a --muon-qkv-split slice lies inside its tbm[k][0]) */

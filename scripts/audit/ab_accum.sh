@@ -13,23 +13,26 @@ if [ "${1:-}" = --summary ]; then
   D=$2
   for a in A_accum5 B_accum2; do [ -f "$D/r_$a.log" ] || { echo "no $D/r_$a.log"; exit 1; }; done
   awk -v last=${3:-0} '
-    function grab(s, key,   i, m) { if (match(s, key " [0-9.]+")) { m = substr(s, RSTART, RLENGTH); sub(/.* /, "", m); return m + 0 } return "" }
+    function grab(s, key,   m) { if (match(s, key " -?[0-9.]+")) { m = substr(s, RSTART, RLENGTH); sub(/.* /, "", m); return m + 0 } return "" }
+    function klgrp(s,   g) { if (!match(s, /\(kl [^;)]*/)) return ""; g = substr(s, RSTART + 4, RLENGTH - 4); return " " g }   # (the "(kl phase X rv X normal X wind4 X ...;" group; values may be slightly negative)
     FNR == 1 { arm = (FILENAME ~ /A_accum5/) ? "A" : "B" }
     /^step +[0-9]+ lr/ { st = $2 + 0; if (st > mx) mx = st
-      split("loss|phase bce|wind4 bce| acc|kl phase|kl normal|kl wind4", K, "|")
-      for (k = 1; k <= 7; k++) { v = grab($0, K[k]); if (v != "") { V[arm, st, k] = v; have[k] = 1 } } S[st] = 1 }
+      split("loss|phase bce|wind4 bce| acc| phase| normal| wind4|phase error", K, "|"); kg = klgrp($0)
+      for (k = 1; k <= 8; k++) { v = (k >= 5 && k <= 7) ? (kg == "" ? "" : grab(kg, K[k])) : grab($0, K[k]); if (v != "") { V[arm, st, k] = v; have[k] = 1 } } S[st] = 1 }
     END {
-      split("loss|phase|wind4|acc|kl phase|kl normal|kl wind4", N, "|")
+      split("loss|phase|wind4|acc|kl phase|kl normal|kl wind4|phase err deg", N, "|")
       for (r = 1; r <= 2; r++) {
         lo = r == 1 ? int(mx * 0.8) + 1 : 1001; hi = r == 1 ? mx : 1400
         printf "windows %d-%d:", lo, hi
-        for (k = 1; k <= 7; k++) { if (!have[k]) continue; sa = sb = n = 0
+        for (k = 1; k <= 8; k++) { if (!have[k]) continue; sa = sb = n = 0
           for (st in S) if (st + 0 >= lo && st + 0 <= hi && ((("A", st, k) in V) && (("B", st, k) in V))) { sa += V["A", st, k]; sb += V["B", st, k]; n++ }
           if (n) printf "  %s A %.4f B %.4f (B-A %+.4f, n %d)", N[k], sa / n, sb / n, (sb - sa) / n, n }
         printf "\n" } }' "$D/r_A_accum5.log" "$D/r_B_accum2.log"
   exit 0
 fi
-BIN=$1 OUT=$2 WIN=${3:-2000} SEED=${4:-7} INIT=${5:-/root/admuon/run/try6.ckpt}
+BIN=${1:-} OUT=${2:-}
+[ -n "$BIN" ] && [ -n "$OUT" ] || { echo "usage: $0 BIN OUTDIR [WINDOWS] [SEED] [INIT]"; exit 2; }
+WIN=${3:-2000} SEED=${4:-7} INIT=${5:-/root/admuon/run/try6.ckpt}
 mkdir -p "$OUT"
 for arm in "A_accum5 5 0.003 0.0003" "B_accum2 2 0.00231 0.000231"; do
   read -r NAME ACC MLR ALR <<< "$arm"
@@ -45,6 +48,6 @@ for arm in "A_accum5 5 0.003 0.0003" "B_accum2 2 0.00231 0.000231"; do
     --gn-ema-warm 1000000000 --skip-empty 1 --skip-thr 0 --skip-margin 1 --accum $ACC \
     --ckpt-every 1000000 --seed "$SEED" --det 1 --init-from "$INIT" > "$R.log" 2>&1
   echo "arm $NAME accum $ACC lr $MLR / $ALR rc $?" >> "$R.log"
-  rm -rf -- "$R"   # (the 2 GB final checkpoint: the pod's disk is nearly full; the logs are the result)
+  case "$R" in "$OUT"/r_*) rm -rf -- "$R" ;; esac   # (the 2 GB final checkpoint: the pod's disk is nearly full; the logs are the result)
 done
 "$0" --summary "$OUT"
