@@ -23,6 +23,10 @@
 typedef struct { int w, h; float *xyz; uint8_t *valid; float *val; } mc_mesh;   /* xyz: level-0 x, y, z per vertex (after the map) */
 typedef struct { int mi, r0, r1, c0, c1; float lo[3], hi[3]; } mc_tile;        /* bounds in level-0 z, y, x */
 typedef struct { mc_mesh *m; int nm; mc_tile *t; size_t nt; double scale; void *pk; size_t pkn; char id[48]; } mc_ctx;   /* pk: the mmap'd pack (meshes + tiles point into it) */
+/* The grid convention (2026-11-14, branch datafix): level-l voxel j is centred on level-0 2^l j + (2^l - 1) / 2, the centre of its 2^l block,
+   as the CT pyramid (ingest pool2_mean), the ink and fibre rasters have it: a sample at level-0 x lands in floor(x 2^-l + 2^-l / 2). Before,
+   floor(x 2^-l + 1/2) centred it on 2^l j: the codes sat 0.25 (level 1) / 0.375 (level 2) level voxels off the CT, the sign flipped by the
+   symmetry augmentation (a blur). Level 0 is unchanged; the derived-cache id is v2 for level > 0 (v1 cells are stale there) */
 
 static double mc_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static inline uint8_t mc_code(double q) { long k = lround(q * 18.0) % 252; if (k < 0) k += 252; return (uint8_t)(1 + k); }
@@ -157,7 +161,7 @@ static void *mc_stamp(void *vp) {
                 int64_t g[3]; int in = 1;
                 for (int d = 0; d < 3; d++) {
                     const double q = (1 - u) * (1 - v) * p[0][d] + u * (1 - v) * p[1][d] + (1 - u) * v * p[2][d] + u * v * p[3][d];
-                    g[d] = (int64_t)floor(q + 0.5) - o[d];
+                    g[d] = (int64_t)floor(q + 0.5 * sc) - o[d];   /* (block centres: see the note at mc_ctx's id) */
                     if (g[d] < (d ? 0 : P->z0) || g[d] >= (d ? n[d] : P->z1)) in = 0;
                 }
                 if (!in) continue;
@@ -255,11 +259,11 @@ z3 *mesh_codes_open(const char *dir, const char *value, const char *mapp, int le
     mc_ctx *X = packed ? mc_pack_open(pack, key) : nullptr;
     const uint64_t kh = mc_hash(key);
     if (X) { for (int i = 0; i < nn; i++) free(names[i]);
-        free(names); free(key); X->scale = 1.0 / (1 << level); snprintf(X->id, sizeof X->id, "meshcodes-v1-%016llx-L%d", (unsigned long long)kh, level);
+        free(names); free(key); X->scale = 1.0 / (1 << level); snprintf(X->id, sizeof X->id, "meshcodes-v%d-%016llx-L%d", level ? 2 : 1, (unsigned long long)kh, level);
         z3 *zp = z3_open_derived(ct_level, 0, mc_read, X, mc_free);
         if (!zp) { mc_free(X); z3_close(ct_level); return nullptr; }
         z3_derived_extent(zp, mc_extent, X); return zp; }
-    X = calloc(1, sizeof *X); X->m = calloc((size_t)nn, sizeof *X->m); X->scale = 1.0 / (1 << level); snprintf(X->id, sizeof X->id, "meshcodes-v1-%016llx-L%d", (unsigned long long)kh, level);
+    X = calloc(1, sizeof *X); X->m = calloc((size_t)nn, sizeof *X->m); X->scale = 1.0 / (1 << level); snprintf(X->id, sizeof X->id, "meshcodes-v%d-%016llx-L%d", level ? 2 : 1, (unsigned long long)kh, level);
     int bad = 0; size_t tcap = 0;
     for (int i = 0; i < nn && !bad; i++) { char p[2200]; snprintf(p, sizeof p, "%s/%s", dir, names[i]); bad = mc_load(&X->m[i], p, value, map); X->nm = i + 1; }
     for (int i = 0; i < nn; i++) free(names[i]);

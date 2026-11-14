@@ -764,7 +764,7 @@ static void raster_shard(int si, int tid, void *ud) {
                 int vox[3], in = 1;
                 for (int dd = 0; dd < 3; dd++) {
                     double q = (1 - u) * (1 - v) * p[0][dd] + u * (1 - v) * p[1][dd] + (1 - u) * v * p[2][dd] + u * v * p[3][dd];
-                    vox[dd] = (int)floor(q - lo[dd] + 0.5);
+                    vox[dd] = (int)floor(q - lo[dd] + 0.5 * j->scale);   /* level l: voxel j's centre at level-0 2^l j + (2^l - 1) / 2, as pool2_mean's CT (was 2^l j: 2026-11-14 datafix) */
                     if (vox[dd] < 0 || vox[dd] >= N) in = 0;
                 }
                 if (!in) continue;
@@ -830,9 +830,9 @@ int cmd_raster(int argc, char **argv) {
     char lv[32], ldir[1400], attrs[512];
     z3w_level_name(um_l, lv, sizeof lv);
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
-    if (*value_name) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"winding\",\"source\":\"raster of %d meshes, value %s\",\"encoding\":\"winding_mod14\",\"code\":\"1 + (round(q*18) mod 252); 0 empty; 255 conflict (>1/4 turn)\"}}", nm, value_name);
-    else if (binary) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"encoding\":\"binary\",\"surface_band_chamfer\":%d,\"codec\":\"volcomp-mask-lossless\",\"background\":\"all non-surface voxels\"}}", nm, band);
-    else snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"T\":%d,\"encoding\":\"0=bg,254=surface,255=ignore\"}}", nm, T);
+    if (*value_name) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"grid\":\"block-centre\",\"content\":\"winding\",\"source\":\"raster of %d meshes, value %s\",\"encoding\":\"winding_mod14\",\"code\":\"1 + (round(q*18) mod 252); 0 empty; 255 conflict (>1/4 turn)\"}}", nm, value_name);
+    else if (binary) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"grid\":\"block-centre\",\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"encoding\":\"binary\",\"surface_band_chamfer\":%d,\"codec\":\"volcomp-mask-lossless\",\"background\":\"all non-surface voxels\"}}", nm, band);
+    else snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"grid\":\"block-centre\",\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"T\":%d,\"encoding\":\"0=bg,254=surface,255=ignore\"}}", nm, T);
     z3w *w = binary ? z3w_create_mask(ldir, shape, shard, attrs) : z3w_create(ldir, shape, shard, 0.f, *value_name ? 0 : 255, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     rjob j = {.meshes = meshes, .nm = nm, .scale = scale, .shard = shard, .margin = binary || *value_name ? 2 : T + 3, .T = T, .binary = binary, .band=band, .value = *value_name != 0,
