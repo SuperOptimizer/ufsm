@@ -4764,6 +4764,7 @@ int cmd_hires_phase(int argc, char **argv);   /* src/hiresphase.c */
 int cmd_phase_gate(int argc, char **argv);   /* src/phasegate.c */
 int cmd_ct_cal(int argc, char **argv);   /* src/ctcal.c */
 int cmd_w_at(int argc, char **argv);   /* src/phasegate.c */
+int cmd_unroll_qa(int argc, char **argv);   /* src/unrollqa.c */
 int cmd_patch_raster(int argc, char **argv);   /* src/patchraster.c */
 int cmd_ray_check(int argc, char **argv);   /* src/raycheck.c */
 int cmd_vwt_sample(int argc, char **argv);   /* src/vwt_sample.c */
@@ -4838,6 +4839,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "phase-gate")) return cmd_phase_gate(argc, argv);
     if (!strcmp(cmd, "ct-cal")) return cmd_ct_cal(argc, argv);
     if (!strcmp(cmd, "w-at")) return cmd_w_at(argc, argv);
+    if (!strcmp(cmd, "unroll-qa")) return cmd_unroll_qa(argc, argv);
     if (!strcmp(cmd, "patch-raster")) return cmd_patch_raster(argc, argv);
     if (!strcmp(cmd, "ray-check")) return cmd_ray_check(argc, argv);
     if (!strcmp(cmd, "vwt-sample")) return cmd_vwt_sample(argc, argv);
