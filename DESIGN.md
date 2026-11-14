@@ -51,8 +51,20 @@ the outer turns (16 % of the published area lies on zero CT). Two effects:
     15.9 k, and both keep the same 46.7 k inside.
   - test_countfield: a masked outer sector (material 0) with sheet arcs running into it. With the no-data pairs dropped, the data
     cells beside it keep their count.
-  - The synthetic arcs are exact, so keeping them does no harm either (0.000 / 0.000). The 1667 oracle rerun with dropped pairs is the
-    real check: `/vesuvius/ufsm/audit-20261114/geo-outer/cf/`, scored with `py/wloc.py` + `py/maskcorr.py`.
+  - The synthetic arcs are exact, so keeping them does no harm either (0.000 / 0.000). The real check is the 1667 rerun below.
+- **The 1667 oracle rerun** (ref-orclong recipe, `--cf-fib-nodata drop`, 0.229 of the pairs dropped):
+  - Identity on CT > 0:
+
+    | r (mm) | 9 | 10 | 11 | 12 |
+    |---|---|---|---|---|
+    | pairs kept | 0.841 | 0.700 | 0.561 | 0.415 |
+    | no-data pairs dropped | 0.901 | 0.796 | 0.643 | 0.556 |
+
+  - At r 3-7 mm it costs 0.5-2.5 points (0.97-0.98 before).
+  - On unmasked vertices of turns >= 18, the share with k < 0 within 0.8 mm of the mask falls from 0.65 to 0.29, and at 3-12 mm from
+    0.36 to 0.20.
+  - About half of the outer -1 is gone. The rest comes from the data-free shell through the smoothness (W flat across the zeroed turns)
+    and needs the filled CT.
 - **Not done.**
   - Fields on unmasked CT (pub1667's filled store, a GPU predict): the real fix for the missing outer data.
   - A fields-level weak-edge share inside count-field, which would stop a run before the slabs.
