@@ -6,6 +6,40 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## villa vc_wgraph on 1667: stopped before any run; what carries over to a ufsm reimplementation (2026-11-14, branch wgraph-20261114)
+
+Goal was to run villa's fibre winding graph (vc_wgraph: extract -> hvb -> sign -> winding -> uv) on PHerc1667 and score it against
+our wraps. Stopped the same day: the user wants the idea reimplemented in ufsm, not the upstream code run. Nothing was run; the villa
+build (334/384 native objects, Python bindings) and its venv / build dirs are deleted.
+
+**What exists.**
+- `scripts/wgraph/ufib2afv.py`: UFIB (fiber-trace / fiber-link output) -> AFV v1 SQLite (villa's fibre interchange: application_id
+  0x56434643, fibers table with exact bounds, float64 XYZ blocks of <= 256 segments sharing their end point, block_bounds rtree,
+  coordinate frame in metadata). Tested on 2 PHerc1218 tiles: 16857 fibres (8692 H / 8165 V), 1.13 M points.
+- `scripts/wgraph/pod_fibpred.sh`: fibhv-d (30000) H / V tube masks over a 1667 L2 z slab (4096..4608 = L0 16384..18432, contains
+  the z18160 void crossing), to trace on the desk with `fiber-trace --mask`. Never ran: the first launch failed because the pod has
+  no /usr/bin/time, and the fixed requeue was cancelled at the stop. The checkpoint is still on the pod at /root/wgraph.
+- Inputs for 1667: no AFV is published (AutomatedFiberVolumes covers P4, 0125, 0175A, 1447). The published 1667 lasagna normal
+  prediction (cos / grad_mag / nx / ny, base grid 37076 x 15229 x 15229 = L0 of the 2.399 um scan, our frame) is described by
+  /vesuvius/ufsm/wgraph/data/lasagna1667/*.lasagna.json.
+
+**The method, as far as the source was read (fiber_wgraph_stages.py, fiber_wgraph_geometry.py, fiber_normal_sign.py).** The pair
+extraction (constraint_extraction, native) and the winding objective were not read in detail before the stop.
+- Data model: one fibre graph (fibre ids + constraint "events" between fibres). Every stage writes result columns per fibre id
+  and refuses a run whose ids differ from its input.
+- hvb (classification): a 3-class labelling per fibre (H / V / broken) with probabilities. It is solved by IRLS on GPU
+  (wrapped_irls) from per-fibre axial evidence: the fibre direction vs the scroll axis, made by the native extractor. One broken
+  penalty (default 0.1), uniform costs, no entropy term. Fibres labelled broken are disabled downstream.
+- sign: a +-1 normal sign per enabled fibre with a sign probability. The classification mask stays fixed, and the solve is
+  anchored by a weak normal prior (prior_weight 1e-3), which the native constraint export builds from the orientation database
+  and the umbilicus.
+- winding: linear IRLS (15 iterations, prior weight 1e-6, CUDA) over the enabled H / V fibres with their signs and the pair
+  constraints. uv: parameterisation after the winding solve.
+- For ufsm: the same three steps map onto data we already have. Our fibre families are already H / V, so hvb collapses to a
+  broken-fibre gate. Our normals come from the winding field, so the sign follows from grad(phase) with no separate solve. The
+  part worth taking is the robust (IRLS / L1) per-fibre winding solve, with fibre-fibre constraints added to the fit as
+  same-sheet terms. fibfit is adding those to fit.
+
 ## Self-supervision for the latent net: what the 10-21..25 DINO work showed, the plan (2026-11-12, branch latdino-20261112)
 
 User (11-12): "revive the self supervised dino stuff for latent net". Plan only; no GPU run yet.
