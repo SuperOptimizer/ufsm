@@ -6,6 +6,52 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
+
+The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the
+flags off, the optimizer is unchanged (try6 runs plain batched Muon, `--muon-tc 2`).
+
+**Step 1: `--opt-stats N`** (default: every `--log-every` steps; 0 = off). On those steps, GPU 0 measures each matrix's applied update
+|dW|_F and its weights |W|_F before the step, then logs one line per log interval:
+`  opt step S: upd/w L0 a [min max] deep b [..] attn c [..] head d adamw e`. Each group shows the pooled ratio sqrt(sum |dW|^2 /
+sum |W|^2) and, for the Muon groups, the range of the per-matrix ratios.
+- Muon matrices: `mstat_k` (nn_opt.cu) recomputes the update with the same expression as the apply kernel, just before it, in plain
+  `nn_muon_batch` and in the ext path. The weights are unchanged (test_admuon: bit for bit against a run without stats; the sums match
+  the host's to 1e-9).
+- AdamW parameters: their ranges (biases, norms, the 1^3 heads; a few MB) are copied before the step and differenced after it.
+- Cost: one extra read of the Muon weights on a stats step, nothing on other steps.
+- First numbers (scratch2 net, P 512, wind fixture, from scratch, warmup 50): step 21 L0 1.6e-3, deep 1.5e-3, attn 2.5e-3 (one attention
+  linear at 0.14: its weights start near zero), heads 1.6e-3, AdamW 8.7e-4.
+
+**Step 2: the variants** (`--muon-adaptive 1` = all three):
+- (a) `--normuon 1`: NorMuon, already built (muonx, 2026-11-13). After the orthogonalisation it divides each row by sqrt(EMA of its
+  mean square), then rescales the whole matrix to Muon's Frobenius norm.
+- (b) `--muon-lars 1 [--muon-lars-target T] [--muon-lars-beta 0.99] [--muon-lars-clamp 2]`: per-layer step control.
+  - rho_i = s_i |O_i|_F / |W_i|_F is matrix i's update / weight ratio per unit lr; it keeps an EMA of it.
+  - Multiplier m_i = clamp(tgt / EMA_i, 1/C, C). The target is either an absolute ratio T at the peak lr, or (T = 0, the default) the
+    geometric mean of the EMAs. The default therefore only redistributes the step between layers.
+  - Because Muon's |O|_F is nearly fixed per shape, this is in effect LARS: layers with larger weights get larger steps.
+- (c) `--muon-dog 1 [--muon-dog-max 2]`: DoG (Ivgi, Hinder & Carmon 2023) on Muon's directions, one global step size for every Muon
+  matrix.
+  - eta_t = rbar_t / sqrt(sum_s sched_s^2 |v_s|^2), where v_i = m_i s_i O_i, and rbar is the largest |x - x_0| reached.
+  - The displacement counts only the direction's steps: weight decay is a regulariser, not progress.
+  - rbar_0 = --muon-lr x |v_1|, so the first step equals Muon's. eta is capped at dog-max x --muon-lr.
+  - Applied lr = sched x eta x m_i, so warmup and the WSD cooldown still apply on top.
+  - If the directions are consistent, eta grows; on a random walk it holds; if the weights oscillate, it shrinks.
+  - Memory: one fp32 displacement per Muon weight (393 MB at the 92 M net).
+- Every controller reduction uses fixed-order partials, and one thread computes the multipliers, so data-parallel replicas stay identical.
+- Checkpoints: the (b) EMAs (`adm_ema`) and the (c) scalars (`adm_dog`) are written only when the flag is on. A resume restarts the
+  displacement, but rbar keeps the distance already reached.
+- Muon-C and Hyperball are excluded (their apply has its own scale).
+- test_admuon: over 5 steps with a varying schedule and decay, the weights, EMAs and DoG state match a double reference that is fed the
+  GPU's own Muon direction (taken from a twin batch at lr 1, wd 0), for (b) with the auto target, (b) with an absolute target that hits
+  the clamp, (c) alone, and (a)+(b)+(c). Weight error is ~5e-5 of the step; state error is ~1e-7.
+- Smoke run from scratch (30 steps, 4x / 4 defaults, since tightened to 2x / 2): DoG reached its cap by step 21 (consistent early
+  directions), and m spanned the whole clamp range.
+- Coordination with gns (gradient noise scale, `--accum auto`): the controllers here read only update / weight ratios and the weights'
+  displacement, never the noise scale or the batch size. (c) and `--accum auto` both change the effective step, so they are not combined
+  in an A/B.
+
 ## Kernel fusion for scratch2: what is left to fuse, the head slabs (2026-11-14, branch fuse-20261114)
 
 Goal: fuse GroupNorm-apply + SiLU + MX-fp4 quantisation into the 3^3 convs (forward and backward) for the scratch2 step.
