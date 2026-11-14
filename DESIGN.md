@@ -958,6 +958,17 @@ Changes:
 - **strip-mosaic look flags** (default off; before / after in `urender/stretch_before_after.jpg`):
   - `--ct-stretch-papyrus 1`: the CT window from pixels >= --ct-level only. On 1667 that is 80..224 instead of 1..202, where air set the low end.
   - `--ink-fixed 1`: ink grey = probability, the same in every run and model, instead of the percentile stretch (9..232 on 1667).
+- **strip-flatten chunk blend (#7):** the default is now cos^2 windows instead of linear hats (`--blend hat` restores the old one).
+  - Both sum to 1. The hat's slope jumps at every chunk centre and edge, so the blended map kinked there wherever neighbouring chunk layouts
+    disagree. 1667 had 2.6x the folds within 0.5 cm of those columns.
+  - 1667 chunks 10..16 on the CPU (the same SLIM, only the blend differs):
+
+    | Blend | Flips | aniso p95 | aniso p99 | Energy | Kink at centres / elsewhere |
+    |---|---|---|---|---|---|
+    | hat | 51 | 1.095 | 1.162 | 4.0126 | 1.03 |
+    | cos^2 | 45 | 1.091 | 1.159 | 4.0123 | 0.97 |
+
+  - Kink = the median second difference of the blended offset. A small gain: most folds are local SLIM detail, not the blend.
 - **pubcmp.py gate:**
   - fails when the local and global slopes differ in sign or more than 5 % of the steps jump;
   - with renders, also fails when the ink AUC < CT AUC + 0.02;
