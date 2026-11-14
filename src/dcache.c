@@ -36,12 +36,17 @@ void dcache_get_stats(dcache_stats *st) {
     st->disk_bytes_written = g_dc.wbytes; st->s_compute = 1e-9 * (double)g_dc.ns_comp; st->s_disk = 1e-9 * (double)g_dc.ns_disk;
     st->cells_evicted = g_dc.evicted; st->cells_recomputed = g_dc.recomp; st->bytes_evicted = g_dc.evbytes;
 }
+<<<<<<< HEAD
 static char g_dc_home[1024];   /* mgpu: guarded (pthread_once). (built once: concurrent callers no longer rewrite the returned buffer; threads audit #9) */
+=======
+static char g_dc_home[1024];   /* mgpu: guarded (pthread_once) */   /* (built once: concurrent callers no longer rewrite the returned buffer; threads audit #9) */
+>>>>>>> origin/thrfix-20261114
 static void dc_home_once(void) { const char *h = getenv("HOME"); if (h && *h) snprintf(g_dc_home, sizeof g_dc_home, "%s/.cache/ufsm/derived", h); }
 const char *dcache_default_dir(void) {
     const char *e = getenv("UFSM_DERIVED_CACHE");
     if (e) return !*e || !strcmp(e, "off") || !strcmp(e, "0") ? nullptr : e;
-    static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, dc_home_once);
+    static pthread_once_t once = PTHREAD_ONCE_INIT;   /* mgpu: guarded */
+    pthread_once(&once, dc_home_once);
     return g_dc_home[0] ? g_dc_home : nullptr;
 }
 static int mkdirs(const char *p) {
