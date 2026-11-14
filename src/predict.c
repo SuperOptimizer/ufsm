@@ -2802,12 +2802,16 @@ static int predict_one(int argc, char **argv) {
                 } else if (rd.dbuf[0]) nn_d2d(ctd, rd.dbuf[k], w3); else nn_h2d(ctd, ctu, w3);
                 nn_pred_stats_start(ctd, w3, stsc); stats_pending = 1;   /* (finished below, after the axis rows: no blocking copy here) */
                 }
-                pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu);
                 if (stats_pending) {
                     axis_rows(&ax, o, Wz, scale, dyo, dxo); rows_done = 1;
                     nn_pred_stats_finish(&nz, &sum, &sq); stats_pending = 0;
                     if (lvc) sq += (double)lvc->drop_ms * (double)nz;   /* (a latvol CT decoded by z3_read: the rebuilt bytes' variance lacks the dropped axes, as below) */
                 }
+                /* the slot is free only now: nn_d2d (cudaMemcpy device to device) does not wait on the host, and since the statistics' copy is
+                   asynchronous (nn_pred_stats_start) nothing between the d2d and this point synchronised the stream; signalled before the
+                   finish, the reader refilled rd.dbuf[k] under the pending copy and the window ran on the next window's CT (test_predict_det
+                   11-14: 62 % of the voxels differed run to run, mean |d| 34). The finish's event follows the d2d on stream 0 */
+                pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu);
                 p_h2d += now() - pt; nn_ptick("upload + CT stats");
             }
             if (nz == 0) { nskip++; pthread_mutex_lock(&rd.mu); atomic_store(&rd.consumed, i + 1); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu); continue; }
