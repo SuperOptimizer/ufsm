@@ -1216,8 +1216,8 @@ template <typename LT> __global__ void fibn_k(const LT *lg, size_t ns, const uin
     const size_t hw = (size_t)H * W; const int z = z0 + (int)(li / hw), y = (int)((li / W) % H), x = (int)(li % W), R = r + 1;
     const size_t i = (size_t)z * hw + (size_t)y * W + x;
     const uint8_t b = fib[i]; if (b == 255 || b < thr || (nm && nm[li])) return;   /* (nm: --fib-normal-unsup, only where the normal BCE has no target) */
-    if (z - R < z0 || z + R >= z1 || y < R || y + R >= H || x < R || x + R >= W) return;
-    (void)D; float t[3]; if (!fibn_tangent(fib, i, H, W, r, t)) return;
+    if (z < R || z + R >= D || y < R || y + R >= H || x < R || x + R >= W) return;
+    float t[3]; if (!fibn_tangent(fib, i, H, W, r, t)) return;
     const float c6[6] = {t[0] * t[0], t[1] * t[1], t[2] * t[2], 2.f * t[0] * t[1], 2.f * t[0] * t[2], 2.f * t[1] * t[2]};
     float L = 0.f, p[6];
     for (int c = 0; c < 6; c++) { p[c] = 1.f / (1.f + __expf(-lgv(lg, (size_t)c * ns + li))); L += c6[c] * (c < 3 ? p[c] : p[c] - 0.5f); }
