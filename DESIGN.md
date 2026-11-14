@@ -92,7 +92,17 @@ The nsys of the kernel-copy arm has no gap before the all-reduce behind an a1 tr
 - The losses equal those of `UFSM_LAB_EARLY=0`, line for line.
 - The same holds with the planes in pinned host memory (`UFSM_LAT_LDEV=0`, the desk's case).
 
-**Desk A/B.** `/vesuvius/ufsm/perf2/lsplit_swap.sh`. Results pending.
+**Desk A/B** (try4's stop, 11-14 07:13, `lsplit_swap.sh`, P 1024, 10 steps each).
+
+| arm | Mvox/s, steps 2-10 |
+|---|---|
+| `UFSM_LAB_EARLY=0` (warp at the step boundary) | 80.2 |
+| default (warp under the forward) | 83.2 (+3.7 %, noisy) |
+
+Both arms' losses are finite.
+
+The two-GPU `UFSM_LAT_STREAM=check` run did not fit at P 1024: check mode keeps the device-built planes too, so the smallest mode
+needs 19.91 GB. `lsplit_check.sh` repeats it at P 768. The one-GPU emulation's check passes byte-equal.
 
 ## Widening warm start: u1 -> scratch2's architecture with the donor's function (2026-11-14, branch widen-20261114)
 
