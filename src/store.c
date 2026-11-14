@@ -403,6 +403,7 @@ typedef struct {
     uint8_t *buf; size_t n, cap; int fixed, overflow, has_range;
     uint64_t range_start, range_end, range_total; int range_total_known;
     int rl; double reset;   /* rate-limit header seen in this response, seconds until its window resets */
+    char etag[160], lastmod[80];   /* the response's validators (store_read_all_v) */
 } sink;
 
 static size_t on_data(char *ptr, size_t sz, size_t nm, void *ud) {
@@ -425,7 +426,9 @@ static size_t on_data(char *ptr, size_t sz, size_t nm, void *ud) {
 
 static size_t on_read_hdr(char *buf, size_t sz, size_t nm, void *ud) {
     sink *k = ud; size_t n = sz * nm;
-    if (n >= 5 && !strncmp(buf, "HTTP/", 5)) { k->n = 0; k->has_range = 0; k->overflow = 0; }
+    if (n >= 5 && !strncmp(buf, "HTTP/", 5)) { k->n = 0; k->has_range = 0; k->overflow = 0; k->etag[0] = k->lastmod[0] = 0; }
+    if (n > 5 && !strncasecmp(buf, "etag:", 5)) { snprintf(k->etag, sizeof k->etag, "%.*s", (int)(n - 5), buf + 5); for (size_t l = strlen(k->etag); l && (k->etag[l - 1] == '\r' || k->etag[l - 1] == '\n' || k->etag[l - 1] == ' '); ) k->etag[--l] = 0; }
+    if (n > 14 && !strncasecmp(buf, "last-modified:", 14)) { snprintf(k->lastmod, sizeof k->lastmod, "%.*s", (int)(n - 14), buf + 14); for (size_t l = strlen(k->lastmod); l && (k->lastmod[l - 1] == '\r' || k->lastmod[l - 1] == '\n' || k->lastmod[l - 1] == ' '); ) k->lastmod[--l] = 0; }
     if (n > 14 && !strncasecmp(buf, "content-range:", 14)) {
         char value[128], tail; unsigned long long a, b, total;
         snprintf(value, sizeof value, "%.*s", (int)(n - 14), buf + 14);
@@ -674,7 +677,9 @@ int64_t store_read_tail(store *s, const char *key, int64_t len, uint8_t *out, in
     return len;
 }
 
-uint8_t *store_read_all(store *s, const char *key, size_t *len) {
+uint8_t *store_read_all(store *s, const char *key, size_t *len) { return store_read_all_v(s, key, len, nullptr, 0); }
+uint8_t *store_read_all_v(store *s, const char *key, size_t *len, char *val, size_t nval) {
+    if (val && nval) val[0] = 0;
     if (s->local) {
         int64_t n = local_size(s, key);
         if (n < 0) return nullptr;
@@ -691,6 +696,7 @@ uint8_t *store_read_all(store *s, const char *key, size_t *len) {
     if (!k.buf) k.buf = calloc(1, 1);
     else k.buf[k.n] = 0;
     if (len) *len = k.n;
+    if (val && nval) snprintf(val, nval, "etag %s|last-modified %s|bytes %zu", k.etag, k.lastmod, k.n);
     return k.buf;
 }
 

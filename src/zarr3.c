@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 #include <zstd.h>
 #define VOLCOMP_IMPLEMENTATION
 #include "volcomp.h"
@@ -106,11 +107,30 @@ static void group_scale(store *s, const char *key, z3_meta *m) {
     json_free(j);
 }
 
+/* the HTTP chunk cache of one array is valid for one generation of it (the dcache audit 2026-11-14 #4): the zarr.json's validators
+   (ETag, Last-Modified, length) are kept in <cache>/<key>/.validators; when a re-upload changes them, the array's cached shard indexes,
+   chunks and "missing" markers are moved aside (<key>.stale-<time>-<pid>, delete at leisure) instead of being read at stale offsets.
+   A cache from before the file adopts the current validators. */
+static int mkdirs(const char *path);
+static void cache_validate(const char *cache, const char *key, const char *val) {
+    if (!cache || !val || !*val) return;
+    char d[1400], vp[1500], old[512] = ""; snprintf(d, sizeof d, "%s/%s", cache, key); snprintf(vp, sizeof vp, "%s/.validators", d);
+    FILE *f = fopen(vp, "r"); if (f) { if (!fgets(old, sizeof old, f)) old[0] = 0; fclose(f); size_t l = strlen(old); while (l && old[l - 1] == '\n') old[--l] = 0; }
+    if (f && !strcmp(old, val)) return;
+    if (f) {   /* a new generation of the array: its cached items are stale */
+        char st[1500]; snprintf(st, sizeof st, "%s.stale-%lld-%d", d, (long long)time(nullptr), (int)getpid());
+        if (!rename(d, st)) fprintf(stderr, "z3: %s changed upstream (%s -> %s): its chunk cache moved to %s\n", key, old, val, st);
+    }
+    char tmp[1600]; snprintf(tmp, sizeof tmp, "%s.%d", vp, (int)getpid());
+    if (mkdirs(d)) return;
+    FILE *w = fopen(tmp, "w"); if (!w) return;
+    fprintf(w, "%s\n", val); if (fclose(w) || rename(tmp, vp)) unlink(tmp);
+}
 static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int typed) {
-    char mk[1024];
+    char mk[1024], val[512];
     snprintf(mk, sizeof mk, "%s/zarr.json", key);
     size_t n;
-    uint8_t *txt = store_read_all(s, mk, &n);
+    uint8_t *txt = store_read_all_v(s, mk, &n, val, sizeof val);
     if (!txt) { FAIL("cannot read %s", mk); return nullptr; }
     json *j = json_parse((char *)txt, n);
     free(txt);
@@ -120,6 +140,7 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
     z->key = strdup(key);
     { static atomic_uint_fast64_t next_id = 1; z->id = atomic_fetch_add(&next_id, 1); }
     z->cache = store_cache_dir(s, cache_dir);   /* (per root: a cache directory is never shared by two roots) */
+    cache_validate(z->cache, key, val);
     pthread_mutex_init(&z->imu, nullptr);
     z3_meta *m = &z->m;
     m->sep = '/';
@@ -453,7 +474,12 @@ static int load_index(z3 *z, const char *skey, ientry *idx) {
     uint8_t *b = cache_get(z, skey, "idx", &n);
     if (!b) {
         uint8_t *missing = cache_get(z, skey, "missing", &n);
-        if (missing) { free(missing); imem_put(z, skey, nullptr, 0); return 0; }
+        if (missing) {   /* an absent shard is re-checked after UFSM_CACHE_MISSING_TTL_S (600) s: a later upload is seen (the dcache audit #4) */
+            free(missing); char mp[1400]; struct stat ms; cache_path(z, skey, "missing", mp, sizeof mp);
+            static double ttl = -1; if (ttl < 0) { const char *e = getenv("UFSM_CACHE_MISSING_TTL_S"); ttl = e && *e ? atof(e) : 600; }
+            if (stat(mp, &ms) || difftime(time(nullptr), ms.st_mtime) < ttl) { imem_put(z, skey, nullptr, 0); return 0; }
+            unlink(mp);
+        }
         b = malloc(ilen);
         if (!b) return FAIL("index allocation for %s", skey);
         int64_t size = -1, got = store_read_tail(z->s, skey, (int64_t)ilen, b, &size);   /* one suffix-range GET */
@@ -643,7 +669,7 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
             const int lean1 = lean && dsink;   /* z3_read_sub_dev_lean: only the host-decoded substreams are copied out, no zeroing */
             if (sub && !lean1) memset(dec, 0, cv);
             if (zshm_on()) {
-                hk = XXH3_128bits(enc, n);
+                hk = XXH3_128bits(enc, n); hk.low64 ^= zshm_decoder_tag(VOLCOMP_VERSION_STRING);   /* (the decoder's identity: zshm.h) */
                 for (uint32_t s = 0; s < VF_NSUB; s++) if (want >> s & 1 && zshm_get(hk.low64, hk.high64, s, dec)) need &= ~(1u << s);
             }
             st = VOLCOMP_OK;
