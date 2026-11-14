@@ -27,7 +27,9 @@ outside the plan (covered only by the fixed 550 MB "kernel workspaces" + the 0.5
 16.3 GB): the cuBLASLt handles + 32 MB workspaces of the attention linears and of --muon-tc 2 (per device since today's fixes, so new on
 GPU 1), the Muon descriptor table + scratch pool (<= UFSM_MUON_POOL_MB 128) and momentum (unless aliased into AdamW v), and the latent
 input conv's MX-fp8 / MX-fp4 weight-gradient chunk copies (96 MB). unet_reserve + lp_f8w_mixed_reserve now allocate them on every GPU
-before nn_mem_free. MEMRESULTS
+before nn_mem_free. The other grow-on-demand kernel workspaces (lp_buf slots, gy records, fstem partials, skip masks) are recomp's
+(memws-20261114). The P 768 UFSM_MEM_REPORT=4 measurement (base vs fix) was cut by the mega pass's queue kill and runs in the pass.
+Tests: test_dpsafe (gpu: the error latches across two threads, the slab registry from two threads, the replica salt, the VMM granularity).
 
 **Lint.** tests/test_mgpu_lint.py (fast tier, CPU): every mutable process-wide variable in src/ (file-scope globals, function-local
 statics, __device__ / __constant__) needs `mgpu: TAG` (per-thread, per-device, guarded, config, env, main, process, debug) on its line or
