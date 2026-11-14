@@ -4765,7 +4765,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
         fputc(']', f); free(r);
     }
     if (u->cfg.scan_norm) fputs(",\"scan_norm\":1", f);
-    if (u->cfg.skip_thr > 0) fprintf(f, ",\"skip_empty\":[%d,%d]", u->cfg.skip_thr - 1, u->cfg.skip_margin);
+    if (u->cfg.skip_thr > 0) fprintf(f, ",\"skip_empty\":[%d,%d,%d]", u->cfg.skip_thr - 1, u->cfg.skip_margin, u->cfg.skip_nl);
     if (u->cfg.gfilm) fputs(",\"gfilm\":1", f);
     if (u->cfg.gn_ema) {   /* the running statistics of every site (live weights, EMA weights; gn_sites layout) and their state */
         ge_alloc(u); const size_t n = 2 * u->ge_ns; float *r = malloc(n * 4); nn_d2h(r, u->ge_run, n * 4);
@@ -4871,7 +4871,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"l0_mom\":"))) g_loaded_l0_mom = strtof(p + 9, nullptr);
     if ((p = strstr(line, "\"gn_ema\":"))) cfg->gn_ema = atoi(p + 9);
     if ((p = strstr(line, "\"scan_norm\":"))) cfg->scan_norm = atoi(p + 12);
-    if ((p = strstr(line, "\"skip_empty\":["))) { int t = 0, m = 0; if (sscanf(p + 14, "%d,%d", &t, &m) == 2) { cfg->skip_thr = t + 1; cfg->skip_margin = m; } }
+    if ((p = strstr(line, "\"skip_empty\":["))) { int t = 0, m = 0, l = 0; if (sscanf(p + 14, "%d,%d,%d", &t, &m, &l) >= 2) { cfg->skip_thr = t + 1; cfg->skip_margin = m; cfg->skip_nl = l; } }
     if ((p = strstr(line, "\"gfilm\":"))) cfg->gfilm = atoi(p + 8);
     g_loaded_ge_cnt = 0;
     if (cfg->gn_ema) {

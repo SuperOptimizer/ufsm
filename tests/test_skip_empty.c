@@ -128,10 +128,10 @@ int main(void) {
         CHECK(!memcmp(gd, gm, np * 4), "train, nn_skip_off: gradient bit-identical to dense again");
         /* the checkpoint header */
         char path[256]; snprintf(path, sizeof path, "%s/test_skip_empty.%d.ckpt", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid());
-        unet_cfg *uc = (unet_cfg *)unet_cfg_of(u); uc->skip_thr = 1; uc->skip_margin = 2;   /* the header writer reads the live cfg */
+        unet_cfg *uc = (unet_cfg *)unet_cfg_of(u); uc->skip_thr = 1; uc->skip_margin = 2; uc->skip_nl = 3;   /* the header writer reads the live cfg */
         unet_cfg pc = {}; int st = 0;
         CHECK(!unet_save(u, path, 5, nullptr) && !unet_peek(path, &pc, &st), "checkpoint save / peek");
-        CHECK(pc.skip_thr == 1 && pc.skip_margin == 2, "checkpoint skip_empty round trip (%d %d)", pc.skip_thr, pc.skip_margin);
+        CHECK(pc.skip_thr == 1 && pc.skip_margin == 2 && pc.skip_nl == 3, "checkpoint skip_empty round trip (%d %d %d)", pc.skip_thr, pc.skip_margin, pc.skip_nl);
         uc->skip_thr = 0; CHECK(!unet_save(u, path, 5, nullptr) && !unet_peek(path, &pc, &st) && pc.skip_thr == 0, "no skip_empty key when off");
         remove(path); nn_free(dgy); free(gd); free(gm); free(gy);
     }

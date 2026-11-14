@@ -3501,7 +3501,7 @@ int cmd_train(int argc, char **argv) {
     size_t p3 = (size_t)g_Pz * P * P, p3l = split && !g_lsplit ? (size_t)P * P * g_Dl : p3;   /* per-GPU voxels of a window */
     if (cfg.skip_thr > 0) {   /* --skip-empty (or a checkpoint trained with it) */
         if (!g_lat || B != 1) { fprintf(stderr, "--skip-empty: a latent-grid net (--lat 4), B 1\n"); return 2; }
-        g_skip_thr = cfg.skip_thr - 1; g_skip_margin = cfg.skip_margin;
+        g_skip_thr = cfg.skip_thr - 1; g_skip_margin = cfg.skip_margin; cfg.skip_nl = g_lsplit && g_split_top ? g_split_top : 0;   /* (as run_batch builds) */
         fprintf(stderr, "skip-empty: masked convs: 8x8x16-cell tiles with no CT byte > %d (within %d tiles a level) left at their bias; exact gradients of that net%s\n",
                 g_skip_thr, g_skip_margin, g_lsplit ? " (split: the levels below --split-top)" : "");
     }
