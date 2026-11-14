@@ -960,6 +960,11 @@ void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], f
 int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint8_t *mask, int P, const int64_t o[3], float mean, float isd,
                               int hasax, const float *cyz, const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed,
                               uint64_t aug_seed, float zoom, int affine, int hard, uint16_t *H4, uint16_t *H1, void *rec, uint8_t *T, uint8_t *M);
+/* the CT value of a warped voxel pulled from outside the source cube (rotations reach ~P sin(theta) / 2 voxels past it: ~33 at 5 deg, P 768):
+   the z-scored raw 0, the value of a scan's masked outside (and of predict's windows past the volume), then the jitter as for any voxel. It
+   was 0 = the window's mean density, a texture-less slab of fake material with a sharp edge (audit 2026-11-14, datafix); its labels stay
+   unknown. nn_aug.cu aug_write_k fills the same. With --ct-aug's appearance (filter mode) 0 as before */
+static inline float warp_fill(const ct_aug_plan *ap, float mean, float isd) { return ap ? (ap->filter_mode ? 0.f : ap->lut[0]) : (0.f - mean) * isd; }
 /* Continuous geometry uses source coordinates for CT, labels, q0 and the axis.
    Only valid source voxels are supervised: rotated cube corners are ignored.
    The four input channels stay unchanged; a winding task uses q0 and the two
@@ -995,6 +1000,7 @@ int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint
             for (int d=0;d<3;d++) if (v[d]<0 || v[d]>P-1) inside=0;
             for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=0;
             M[k]=0;
+            if (!inside) out[0]=gain*warp_fill(ap,mean,isd)+offset+noise*nrow[x];   /* (the z-scored raw 0, jittered as any voxel: see warp_fill) */
             if (inside) {
                 int base[3]; float f[3];
                 for (int d=0;d<3;d++) { base[d]=(int)v[d]; if (base[d]>=P-1) base[d]=P-2; f[d]=v[d]-base[d]; }
@@ -1076,6 +1082,7 @@ static void write_spatial_tm(const uint8_t *ctu,const uint8_t *target,const uint
     }
     /* ((float)ctu - mean) * isd (or the plan's LUT) tabulated per value: the same floats */
     float lutv[256]; for (int i=0;i<256;i++) lutv[i]=ap?(ap->filter_mode?0:ap->lut[i]):((float)i-mean)*isd;
+    const float fillv=warp_fill(ap,mean,isd);   /* (outside the source cube) */
 #ifdef __AVX2__
     /* the trainer's case (hard targets, CT-only, P a multiple of 16): 8 voxels at a time with AVX2 gathers of the CT values (as floats in
        the appearance scratch), mask and target bytes (aligned 32-bit words, in bounds: P^3 % 4 == 0); the same float operations in the
@@ -1296,16 +1303,17 @@ static void write_spatial_tm(const uint8_t *ctu,const uint8_t *target,const uint
             int x=0;   /* (the row in place, then one store pass) */
 #ifdef __AVX2__
             {
-                const __m256 vg=_mm256_set1_ps(gain),vo=_mm256_set1_ps(offset),vn=_mm256_set1_ps(noise);
+                const __m256 vg=_mm256_set1_ps(gain),vo=_mm256_set1_ps(offset),vn=_mm256_set1_ps(noise),vfill=_mm256_set1_ps(fillv);
                 for (;x+8<=P;x+=8) {
                     uint64_t ib; memcpy(&ib,inb+kb0+x,8);
                     const __m256 keep=_mm256_castsi256_ps(_mm256_xor_si256(_mm256_cmpeq_epi32(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128((long long)ib)),_mm256_setzero_si256()),_mm256_set1_epi32(-1)));
-                    const __m256 o=_mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(vg,_mm256_loadu_ps(cvb+kb0+x)),vo),_mm256_mul_ps(vn,_mm256_loadu_ps(nrow+x)));
-                    _mm256_storeu_ps(nrow+x,_mm256_and_ps(o,keep));
+                    const __m256 cvx=_mm256_blendv_ps(vfill,_mm256_loadu_ps(cvb+kb0+x),keep);
+                    const __m256 o=_mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(vg,cvx),vo),_mm256_mul_ps(vn,_mm256_loadu_ps(nrow+x)));
+                    _mm256_storeu_ps(nrow+x,o);
                 }
             }
 #endif
-            for (;x<P;x++) nrow[x]=inb[kb0+x]?gain*cvb[kb0+x]+offset+noise*nrow[x]:0.f;
+            for (;x<P;x++) nrow[x]=gain*(inb[kb0+x]?cvb[kb0+x]:fillv)+offset+noise*nrow[x];
             if (xfmt==1) f16_row(nrow,H+k0,P);
             else if (xfmt==2) for (int x=0;x<P;x++) H[k0+x]=bf16_rn(nrow[x]);
             else memcpy(X+k0,nrow,(size_t)P*sizeof *X);
