@@ -492,7 +492,7 @@ struct fl_args {
     int d, h, w, D, H, W, hz, halo, tz, ty, tx, bz, by, bx, fz0, fy0, fx0, nfy, nfx, F1, F2;
     int fh, oz, oy, ox;                           /* field cell size 8, or 1 / 2 / 4: blocks of 8^3 box voxels from origin (oz, oy, ox) + 8 (z, y, x) */
     size_t nf;
-    int ch_recto, dcode, ch_w4, dd, sbase, C;
+    int ch_recto, dcode, ch_w4, dd, sbase, C, ws;   /* ws: nn_fstem_wscale (W1 row scales, fs_w1_exp) */
     float dscale, mean, isd;
     int nch, ndm, ch[FL_MAXCH], slot[FL_MAXCH];   /* region 0's channels (ndm of the cell sums, then the winding pair) and their stem slots (-1 none) */
     int nsl, so[FL_MAXS], wso[2];                 /* region 0's slots -> stem outputs; regions 1-3: slot u = the winding channel u's output wso[u] (-1 none) */
@@ -524,12 +524,15 @@ __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg
         }
     }
     /* the stem's outputs on the 4^3 2^3-blocks of each region (block q: (o >> 1) + (q >> 4, q >> 2 & 3, q & 3)), fstem_fwd_k's sequence */
-    if (C) {
+    if (C) {   /* (C: the same for the whole block) */
+        __shared__ float rsc[16], rinv[16];   /* W1's row scales, as fstem_fwd_k (fs_w1_exp: rows scaled by 2^e before fp16, the product by 2^-e) */
+        if (tid < 16) { const int e = tid < C ? fs_w1_exp(sp + tid * 64, A.ws) : 0; rsc[tid] = ldexpf(1.f, e); rinv[tid] = ldexpf(1.f, -e); }
+        __syncthreads();
         const int lane = tid & 31, wp = tid >> 5, g = lane >> 2, tq = lane & 3;
         unsigned af[4][4];
         for (int s_ = 0; s_ < 4; s_++) for (int r = 0; r < 4; r++) {
             const int row = g + (r & 1) * 8, col = 16 * s_ + 2 * tq + (r >> 1) * 8;
-            const float w0 = row < C ? sp[row * 64 + col] : 0.f, w1 = row < C ? sp[row * 64 + col + 1] : 0.f;
+            const float w0 = row < C ? sp[row * 64 + col] * rsc[row] : 0.f, w1 = row < C ? sp[row * 64 + col + 1] * rsc[row] : 0.f;
             const __half2 h2 = __floats2half2_rn(w0, w1); af[s_][r] = *(const unsigned *)&h2;
         }
         const float *b1 = sp + C * 64, *W2 = sp + C * 64 + C;
@@ -550,7 +553,7 @@ __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg
                 }
                 mma16816<f16>(c4, af[s_], bf);
             }
-            for (int r4 = 0; r4 < 4; r4++) { const int c = g + (r4 >> 1) * 8, b = 2 * tq + (r4 & 1); if (c < C) { const float v = c4[r4] + b1[c]; U.shw[wp][b][c] = v / (1.f + __expf(-v)); } }
+            for (int r4 = 0; r4 < 4; r4++) { const int c = g + (r4 >> 1) * 8, b = 2 * tq + (r4 & 1); if (c < C) { const float v = c4[r4] * rinv[c] + b1[c]; U.shw[wp][b][c] = v / (1.f + __expf(-v)); } }
             __syncwarp();
             const int b = lane & 7, j = j0 + b;
             for (int k = lane >> 3; k < nsl; k += 4) {
@@ -689,7 +692,7 @@ extern "C" int nn_fit_accum_lat(const void *lg, int lh16, int d, int h, int w, i
     if ((fh == 8 && ((tz & 3) || (ty & 3) || (tx & 3))) || (ch_w4 >= 0 && (dd & 3))) return 1;   /* (field cells and the partner regions on the cell grid; h < 8: below) */
     fl_args A = {};
     A.d = d; A.h = h; A.w = w; A.D = 4 * d; A.H = 4 * h; A.W = 4 * w; A.hz = hz; A.halo = halo; A.tz = tz; A.ty = ty; A.tx = tx; A.bz = box[0]; A.by = box[1]; A.bx = box[2];
-    A.ch_recto = ch_recto; A.dcode = dcode; A.dscale = dscale; A.ch_w4 = ch_w4; A.dd = dd; A.sbase = sbase; A.C = stem ? C : 0; A.mean = mean; A.isd = isd; A.dbg = g_fl_dbg;
+    A.ch_recto = ch_recto; A.dcode = dcode; A.dscale = dscale; A.ch_w4 = ch_w4; A.dd = dd; A.sbase = sbase; A.C = stem ? C : 0; A.ws = nn_fstem_wscale(); A.mean = mean; A.isd = isd; A.dbg = g_fl_dbg;
     if (ch_w4 >= 0 && (dd > halo || dd > hz || dd < 1)) { fprintf(stderr, "nn_fit_accum_lat: offset %d outside the halo (%d, z %d)\n", dd, halo, hz); abort(); }
     int n = 0;
     A.ch[n++] = ch_phase; A.ch[n++] = ch_phase + 1; for (int k = 0; k < 6; k++) A.ch[n++] = ch_normal + k; A.ch[n++] = ch_density; if (ch_recto >= 0) A.ch[n++] = ch_recto;
