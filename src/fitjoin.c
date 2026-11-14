@@ -587,7 +587,7 @@ int cmd_fit_join(int argc, char **argv) {
             printf("  %4d  %9lld  %15.4f  %+11ld  %13.4f  %10.4f\n", k, hr[k].tot, (double)cm / hr[k].tot, S[k] - md, (double)cc / hr[k].tot, (double)nr / hr[k].tot);
             rt += hr[k].tot; rs += cc;
         }
-        printf("  mean share of the ref's integer at the chosen gauges, cell weighted: %.4f (self-consistency with the ref, not a quality measure: P4 0.971 at GT ids 0.18)\n", rt ? (double)rs / rt : 0);
+        printf("  mean share of the ref's integer at the chosen gauges, cell weighted: %.4f\n", rt ? (double)rs / rt : 0);
         fit_set_free(ref);
     }
     const int chosen = refdir || glob || hf;
@@ -602,7 +602,7 @@ int cmd_fit_join(int argc, char **argv) {
         tot_n += used; tot_share += share * used;
     }
     if (ns > 1) printf("  mean share(mode) over the boundaries, overlap-cell weighted: %.4f\n", tot_n ? tot_share / tot_n : 0);
-    if (ns > 1 && chosen) printf("  integer agreement on the overlaps at the chosen gauges, overlap-cell weighted: %.4f (slab-to-slab self-consistency, not a quality measure)\n", tot_n ? (double)tot_c / tot_n : 0);
+    if (ns > 1 && chosen) printf("  integer agreement on the overlaps at the chosen gauges, overlap-cell weighted: %.4f\n", tot_n ? (double)tot_c / tot_n : 0);
     for (int k = 0; k < ns; k++) if (S[k]) for (int q = 0; q < s->slab[k]->nk; q++) s->slab[k]->offset[q] -= (float)S[k];
     if (hf) { int nch = 0; for (int k = 1; k < ns; k++) nch += S[k] - S[k - 1] != Sc[k] - Sc[k - 1]; printf("fit-join: the fibre term changed %d of %d boundary offsets against the overlap chain\n", nch, ns - 1); }
     for (int k = 0; k < ns; k++) { fj_hist_free(&hb[k]); if (hr) fj_hist_free(&hr[k]); if (hf) fj_hist_free(&hf[k]); }
