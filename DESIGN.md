@@ -21,8 +21,12 @@ the pair rule / pooling / stamping code was served stale from cells computed by 
 - `test_label_versions` (CPU, fast tier): FNV-1a digests of the CPU pair rule (rmax 8) and of the pair rule over 2x-pooled codes on a
   synthetic 160^3 spiral, recorded per version. A value change without a bump fails the suite with the digest to record; the device
   paths are byte-identical to the CPU (test_phase_onfly), so this covers them.
-- Not here: the meshcodes pack key (mesh dir, ns mtimes, LBL_MESHCODES_LOAD in mc_key, pack magic) is audit-data's meshcodes.c work;
-  the HTTP chunk cache validators (audit #4) and zshm's decoder version (#7) are open.
+- The ink key stats every file of its label rasters and the CT group's zarr.json (#5, data.md lower-b).
+- HTTP chunk cache (pods, #4): the array's zarr.json validators (ETag, Last-Modified, length) in <cache>/<key>/.validators; a change
+  moves that array's cached indexes / chunks / markers aside (<key>.stale-<t>-<pid>); "missing" shard markers are re-checked after
+  UFSM_CACHE_MISSING_TTL_S (600 s). A shard re-upload that leaves zarr.json untouched is still not seen (no per-shard validation).
+- zshm (#7): every key XORs ZSHM_DECODER_REV + the volcomp version, so a decoder fix misses the surviving /dev/shm file.
+- The meshcodes pack key (mesh dir, ns mtimes, LBL_MESHCODES_LOAD, magic UFMC0002) is on datafix-20261114 (audit-data).
 Old key dirs are never read again; the cap's LRU evicts them. try7: start on an empty UFSM_DERIVED_CACHE anyway (merger2's checklist).
 
 ## The derived cache's disk cap (2026-11-14, branch dcachecap-20261114)
