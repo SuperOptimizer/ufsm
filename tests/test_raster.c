@@ -4,6 +4,7 @@
 #include "sources.h"
 #include "volcomp.h"
 #include <unistd.h>
+#include <sys/stat.h>
 
 static int failures;
 static uint32_t state = 17;
@@ -140,10 +141,57 @@ static void binary_pool(void) {
     }
 }
 
+/* audit mini/coords #1: a mask pyramid (point-sampled base + pool2_mask levels) read finer than a pooled level. Level l (2^l above the base)
+   is the any-of over base blocks of 2^l, so a voxel q at read level r reads level l's cell exactly when it rounds into a base cell of that
+   block: expected = any over base block (round(q / 2^-r) >> l); read below the base, round then floor. The old rounding through the
+   pooled levels missed set voxels in the upper half of each block. */
+static void pooled_pyramid(const char *root) {
+    char gdir[1100], base[1200], lv[32]; snprintf(gdir, sizeof gdir, "%s/pyr", root);
+    const int64_t shape[3] = {128, 128, 128}; const size_t n = 128 * 128 * 128;
+    uint8_t *m = calloc(n, 1); for (size_t k = 0; k < n; k++) m[k] = random_u32() % 97 == 0 ? 255 : 0;
+    const char *attrs = "{\"ufsm\":{\"encoding\":\"binary\"}}";
+    mkdir(gdir, 0755); z3w_level_name(1.0, lv, sizeof lv); snprintf(base, sizeof base, "%s/%s", gdir, lv);
+    z3w *w = z3w_create_mask(base, shape, 128, attrs);
+    if (!w || z3w_write_shard(w, 0, 0, 0, m, 1)) { fprintf(stderr, "pooled pyramid: base write failed\n"); failures++; free(m); return; }
+    z3w_close(w);
+    for (int l = 1; l <= 2; l++) if (pyramid_build_level(gdir, 1.0, l, shape, 128, 0.f, 2, 1, attrs)) { failures++; free(m); return; }
+    if (pyramid_write_group(gdir, 1.0, 3, "pooled-test", attrs)) { failures++; free(m); return; }
+    store *s = store_open(gdir);
+    for (int l = 0; l <= 2; l++) {
+        z3w_level_name((double)(1 << l), lv, sizeof lv); z3 *z = z3_open(s, lv, nullptr);
+        if (!z || z3_meta_of(z)->label_pooled != l) { fprintf(stderr, "pooled pyramid: level %d label_pooled %d\n", l, z ? z3_meta_of(z)->label_pooled : -9); failures++; z3_close(z); continue; }
+        /* read levels: the base (shift l) and one finer than the base (shift l + 1), whole extent plus a margin */
+        for (int sub = 0; sub <= 1 && l > 0; sub++) {
+            const int shift = l + sub, f = 1 << sub;   /* f: read voxels per base voxel */
+            const int64_t o[3] = {-2, 5, 0}, nn[3] = {24, 20, 128 * f + 3};
+            uint8_t *got = malloc((size_t)nn[0] * nn[1] * nn[2]); int bad = 0, set = 0;
+            if (z3_read_label_grid(z, 1, shift, o, nn, got, 1)) { failures++; free(got); continue; }
+            for (int64_t zz = 0; zz < nn[0] && !bad; zz++) for (int64_t y = 0; y < nn[1] && !bad; y++) for (int64_t x = 0; x < nn[2]; x++) {
+                const int64_t g[3] = {o[0] + zz, o[1] + y, o[2] + x}; int64_t c[3]; int inside = 1;
+                for (int d = 0; d < 3; d++) {
+                    inside &= g[d] >= 0 && g[d] < (shape[d] >> l) * ((int64_t)1 << shift);
+                    int64_t j = sub ? (int64_t)floor((double)g[d] / f + 0.5) : g[d];   /* base cell */
+                    c[d] = j >> l; if (c[d] < 0) c[d] = 0; if (c[d] > (shape[d] >> l) - 1) c[d] = (shape[d] >> l) - 1;
+                }
+                int hit = 0;
+                for (int64_t bz = c[0] << l; bz < (c[0] + 1) << l; bz++) for (int64_t by = c[1] << l; by < (c[1] + 1) << l; by++)
+                    for (int64_t bx = c[2] << l; bx < (c[2] + 1) << l; bx++) hit |= m[((size_t)bz * 128 + by) * 128 + bx] != 0;
+                const uint8_t e = inside && hit ? 254 : 0, v = got[((size_t)zz * nn[1] + y) * nn[2] + x];
+                set += v != 0;
+                if (v != e) { fprintf(stderr, "pooled pyramid: level %d shift %d at %lld,%lld,%lld: %d, expected %d\n", l, shift, (long long)g[0], (long long)g[1], (long long)g[2], v, e); bad = 1; failures++; break; }
+            }
+            if (!bad) printf("pooled mask pyramid: level %d read %d finer: %d set voxels as the any-of blocks\n", l, shift, set);
+            free(got);
+        }
+        z3_close(z);
+    }
+    store_close(s); free(m);
+}
+
 int main(void) {
     char root[] = "/tmp/ufsm-raster-test-XXXXXX";
     if (!mkdtemp(root)) return 2;
-    distances(); binary_pool(); volumes(root);
+    distances(); binary_pool(); volumes(root); pooled_pyramid(root);
     printf("CPU raster tests: %s (%s)\n", failures ? "FAIL" : "PASS", root);
     return failures != 0;
 }

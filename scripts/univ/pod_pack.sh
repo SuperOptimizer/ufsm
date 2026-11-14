@@ -24,8 +24,8 @@ cpl /vesuvius/ufsm/wbench/holdouts.json $O/small/holdouts.json; cpl /vesuvius/uf
 cpl /vesuvius/ufsm/podready/pod/ckpt/wind96-wk1-best.ckpt $O/small/wind96-wk1-best.ckpt
 cpl /vesuvius/ufsm/v2/lat/runs/wz896/last.ckpt $O/ckpt/wz896.ckpt
 cpl /vesuvius/ufsm/univ/u1/sources-u1.json $O/small/sources-u1-desk.json
-G=/vesuvius/ufsm/gt/PHerc0139-wind-20261016; [ -d $O/gt/p0139-q/qA ] || { cp -al $G/qA $G/qB $O/gt/p0139-q/ 2>/dev/null || cp -a $G/qA $G/qB $O/gt/p0139-q/; }
-G=/vesuvius/ufsm/gt/PHerc1667-wind-20261016; for d in codesA codesB phase; do [ -d $O/gt/1667/$d ] || { cp -al $G/$d $O/gt/1667/ 2>/dev/null || cp -a $G/$d $O/gt/1667/; }; done
+G=${GTROOT:-/vesuvius/ufsm/gt}/PHerc0139-wind-20261016; [ -d $O/gt/p0139-q/qA ] || { cp -al $G/qA $G/qB $O/gt/p0139-q/ 2>/dev/null || cp -a $G/qA $G/qB $O/gt/p0139-q/; }
+G=${GTROOT:-/vesuvius/ufsm/gt}/PHerc1667-wind-20261016; for d in codesA codesB phase; do [ -d $O/gt/1667/$d ] || { cp -al $G/$d $O/gt/1667/ 2>/dev/null || cp -a $G/$d $O/gt/1667/; }; done
 # md5 samples of the label sets the pod rebuilds (8 shards each, fixed by sort order; shards without labels are absent on both sides)
 smp() { local n=$1 d=$2; (cd $d && find . -path '*/c/*' -type f | sort | awk 'NR % 97 == 1' | head -8 | xargs -r md5sum) > $O/md5/$n.md5; echo "$n: $(wc -l < $O/md5/$n.md5) shards"; }
 smp p4A /vesuvius/ufsm/v2/rv/gt/p4full/phaseA; smp p4B /vesuvius/ufsm/v2/rv/gt/p4full/phaseB; smp p0139 /vesuvius/ufsm/v2/rv/gt/p0139full/phase

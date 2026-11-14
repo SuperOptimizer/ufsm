@@ -127,7 +127,7 @@ static vwt_cfg default_cfg(int T, int L) { return (vwt_cfg){T, L, {32, 64, 96}, 
 int cmd_vwt_infer(int argc, char **argv) {
     const int bench = opt_atoi("--bench", opt(argc, argv, "--bench", "0"));
     if (!bench && argc < 6) {
-        fprintf(stderr, "usage: ufsm vwt-infer CKPT ROOT KEY OUT --umb JSON --box z,y,x,nz,ny,nx [--gpu 0] [--part i/n] [--threads 16] [--cache DIR]\n"
+        fprintf(stderr, "usage: ufsm vwt-infer CKPT ROOT KEY OUT --umb JSON [--umb-scale 1: JSON x scale = this volume's voxels] --box z,y,x,nz,ny,nx [--gpu 0] [--part i/n] [--threads 16] [--cache DIR]\n"
                         "       ufsm vwt-infer --bench N [--gpu 0]\n");
         return 2;
     }
@@ -163,7 +163,7 @@ int cmd_vwt_infer(int argc, char **argv) {
         const int64_t box[6] = {0, 0, 0, 240, 2048, 2048};
         char up[1200]; snprintf(up, sizeof up, "/tmp/vwt-infer-bench-umb-%d.json", (int)getpid());
         FILE *uf = fopen(up, "w"); if (!uf) return 1; fprintf(uf, "{\"control_points\": [{\"x\": 1024, \"y\": 1024, \"z\": 0}]}\n"); fclose(uf);
-        const int rc = vwt_tiling_build(up, box, T, L, 112, 320, 112, 16, &S); unlink(up);
+        const int rc = vwt_tiling_build(up, 1, box, T, L, 112, 320, 112, 16, &S); unlink(up);
         if (rc) { fprintf(stderr, "vwt-infer: tiling failed\n"); return 1; }
         if (S.n > bench) S.n = bench;
     } else {
@@ -175,7 +175,7 @@ int cmd_vwt_infer(int argc, char **argv) {
             long long bx[6]; int64_t box[6];
             if (sscanf(opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", &bx[0], &bx[1], &bx[2], &bx[3], &bx[4], &bx[5]) != 6) { fprintf(stderr, "vwt-infer: --tiling or --umb + --box\n"); return 2; }
             for (int e = 0; e < 6; e++) box[e] = bx[e];
-            if (vwt_tiling_build(opt(argc, argv, "--umb", ""), box, T, L, 112, 320, 112, 16, &S)) { fprintf(stderr, "vwt-infer: tiling failed\n"); return 1; }
+            if (vwt_tiling_build(opt(argc, argv, "--umb", ""), opt_atof("--umb-scale", opt(argc, argv, "--umb-scale", "1")), box, T, L, 112, 320, 112, 16, &S)) { fprintf(stderr, "vwt-infer: tiling failed\n"); return 1; }
         }
         if (S.T != T || S.L != L) { fprintf(stderr, "vwt-infer: tiling T %d L %d vs model %d %d\n", S.T, S.L, T, L); return 1; }
     }

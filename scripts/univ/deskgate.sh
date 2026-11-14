@@ -51,6 +51,7 @@ T0=$(date +%s); STOPAT=$((T0 + (WINMIN - 3) * 60)); export STOPAT
 while pgrep -f 'build-verify/test_|run_suite.sh' > /dev/null && [ $(( $(date +%s) - T0 )) -lt ${TESTWAIT:-360} ]; do sleep 10; done
 # GO: a file the coordinator touches when the window's GPU tests are done (w1 at 16000); the gate starts on it (or the tests ending, or TESTWAIT)
 [ -n "${GO:-}" ] && while [ ! -e $GO ] && pgrep -f 'build-verify/test_|run_suite.sh' > /dev/null && [ $(( $(date +%s) - T0 )) -lt ${TESTWAIT:-360} ]; do sleep 10; done
+trap 'rm -f $LB/gate.busy' EXIT   # (a kill / TaskStop left a stale gate.busy, audit mini/shell #9)
 echo "$T $PART pid $$ from $(date '+%H:%M') to $(date -d @$STOPAT '+%H:%M')" > $LB/gate.busy
 log "window: $(wc -l < $Q) jobs on GPUs [$GPUS], no new box after $(date -d @$STOPAT '+%H:%M')"
 eqtest() {   # the two-phase equality test: the same boxes one-phase (eq1) and predict-then-fit (eq2), the same GPU, rows equal but timings

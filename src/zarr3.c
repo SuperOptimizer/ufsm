@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -83,10 +84,9 @@ static int parse_codecs(const json *codecs, z3_meta *m) {
 }
 
 static void group_scale(store *s, const char *key, z3_meta *m) {
-    const char *slash = strrchr(key, '/');
-    if (!slash) return;
+    const char *slash = strrchr(key, '/'), *name = slash ? slash + 1 : key;   /* (no slash: the level directly under the store root, the group) */
     char gk[1024];
-    snprintf(gk, sizeof gk, "%.*s/zarr.json", (int)(slash - key), key);
+    if (slash) snprintf(gk, sizeof gk, "%.*s/zarr.json", (int)(slash - key), key); else snprintf(gk, sizeof gk, "zarr.json");
     size_t n;
     uint8_t *txt = store_read_all(s, gk, &n);
     if (!txt) return;
@@ -94,15 +94,17 @@ static void group_scale(store *s, const char *key, z3_meta *m) {
     free(txt);
     const json *ds = json_path(j, "attributes.ome.multiscales.0.datasets");
     if (!ds) ds = json_path(j, "attributes.multiscales.0.datasets");
+    double s0 = 0;   /* the group's finest scale (the smallest: the base level of a raster pyramid) */
     for (size_t i = 0; ds && i < ds->n; i++) {
-        const json *d = json_at(ds, i);
-        if (!strcmp(json_str(json_get(d, "path"), ""), slash + 1)) {
-            const json *ct = json_get(d, "coordinateTransformations");
-            for (size_t k = 0; ct && k < ct->n; k++)
-                if (!strcmp(json_str(json_get(json_at(ct, k), "type"), ""), "scale"))
-                    m->scale_um = json_num(json_path(json_at(ct, k), "scale.0"), 0);
-        }
+        const json *d = json_at(ds, i), *ct = json_get(d, "coordinateTransformations");
+        for (size_t k = 0; ct && k < ct->n; k++)
+            if (!strcmp(json_str(json_get(json_at(ct, k), "type"), ""), "scale")) {
+                const double sc = json_num(json_path(json_at(ct, k), "scale.0"), 0);
+                if (sc > 0 && (s0 <= 0 || sc < s0)) s0 = sc;
+                if (!strcmp(json_str(json_get(d, "path"), ""), name)) m->scale_um = sc;
+            }
     }
+    if (m->label_pooled < 0 && s0 > 0 && m->scale_um > s0) m->label_pooled = (int)lround(log2(m->scale_um / s0));
     json_free(j);
 }
 
@@ -132,6 +134,7 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
     for (int i = 0; i < 3; i++) m->shape[i] = (int64_t)json_num(json_at(shape, (size_t)i), 0);
     m->fill = (int)json_num(json_get(j, "fill_value"), 0); m->fillv = json_num(json_get(j, "fill_value"), 0);
     m->label_binary = !strcmp(json_str(json_path(j, "attributes.ufsm.encoding"), ""), "binary");
+    m->label_pooled = (int)json_num(json_path(j, "attributes.ufsm.pooled"), -1);   /* (-1: from the group scales in group_scale, else 0) */
     const json *cs = json_path(j, "chunk_grid.configuration.chunk_shape");
     if (!cs || cs->n != 3) { FAIL("%s: no chunk_shape", key); goto bad; }
     for (int i = 0; i < 3; i++) m->shard[i] = m->chunk[i] = (int)json_num(json_at(cs, (size_t)i), 0);
@@ -167,6 +170,7 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
     z->nc = z->cgrid[0] * z->cgrid[1] * z->cgrid[2];
     json_free(j);
     group_scale(s, key, m);
+    if (m->label_pooled < 0) m->label_pooled = 0;
     return z;
 bad:
     json_free(j);

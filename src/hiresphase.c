@@ -379,7 +379,7 @@ static void *hc_rows(void *arg) {
             const double py = h * (y + 0.5), px = h * (x + 0.5); double ry = py - cyv, rx = px - cxv; const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
             double ta = 0, la = 0, spsum = 0; int ok = 1;
             for (int k = 0; k <= ns && ok; k++) {   /* (exactly fit-compare's reference count) */
-                const double qy = py + ry * k * ds / um, qx = px + rx * k * ds / um; const int iy = (int)(qy / h), ix = (int)(qx / h);
+                const double qy = py + ry * k * ds / um, qx = px + rx * k * ds / um; const int iy = (int)floor(qy / h), ix = (int)floor(qx / h);   /* (floor, not truncation: audit mini/coords #2) */
                 if (iy < 0 || ix < 0 || iy >= H || ix >= W) { ok = 0; break; }
                 const size_t i = ((size_t)z * H + iy) * W + ix; const double ac = (f->pc[i] - 128) / 127.0, as = (f->ps[i] - 128) / 127.0;
                 if (!f->w[i] || hypot(ac, as) <= 0.3) { ok = 0; break; }

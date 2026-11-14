@@ -11,7 +11,7 @@
 # Peak host RAM: the three renders at once (~35 GB, hard cap 3 x RCAP); the snaps ~7 GB, test_fit_join's build / run <= 16 GB, one at a time.
 set -u
 U=${U:-$HOME/ufsm-postperf/build/ufsm}; P=${P:-/vesuvius/ufsm/unroll/PHercParis4-u1}; O=${1:-/vesuvius/ufsm/tmp-postperf/gpu}; GPU=${GPU:-0}; RMEM=${RMEM:-7}; RCAP=${RCAP:-13G}
-INK=$P/ink/ift3-24000.zarr; CTR=/vesuvius/ufsm/v2/ct; CTK=PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr/2; LUM=9.6
+INK=$P/ink/ift3-24000.zarr; CTR=${CTR:-/vesuvius/ufsm/v2/ct}; CTK=${CTK:-PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr/2}; LUM=9.6
 FILLX="--fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 1"; S=(ws010 ws011 ws012)
 [ -x "$U" ] || { echo "no $U (cmake --preset release && cmake --build build -j 8 in the branch)"; exit 1; }
 mkdir -p $O/seq $O/par $O/logs || exit 1

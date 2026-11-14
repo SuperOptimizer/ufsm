@@ -180,15 +180,18 @@ prep() {
   if [ -n "$BOX" ] && [ "$BOX" != - ]; then [ "$DRY" = 1 ] && echo "    box $BOX" || echo $BOX > $O/box.txt
   else
     local id=$(basename $K | cut -c1-14) m sh GZ GY GX cell
-    m=/vesuvius/ufsm/u0/prep/$S-$id.mask.raw; sh=$(jq -r '.shape | join(" ")' $R/$K/$LV/zarr.json)
+    m=${PREPDIR:-/vesuvius/ufsm/u0/prep}/$S-$id.mask.raw; sh=$(jq -r '.shape | join(" ")' $R/$K/$LV/zarr.json)
+    # (a missing mask, or one with no set voxel, fails the stage: od on a missing file fed awk nothing and its END printed a corner box near
+    # the origin, exit 0, the whole unroll then ran on it; audit mini/shell #1)
+    [ "$DRY" = 1 ] || { [ -s $m ] && [ -s $m.json ]; } || { log "prep: no mask $m (+ .json) and no BOX for $S: refusing"; return 1; }
     read -r GZ GY GX < <(jq -r '.grid | join(" ")' $m.json); cell=$(jq -r .cell $m.json)
     [ "$DRY" = 1 ] && { echo "    box from $m (corpus desk.sh prep)"; } || od -An -v -tu1 -w$((GY * GX)) $m | awk -v X=$GX -v c=$cell -v sh="$sh" '
       { for (i = 1; i <= NF; i++) if ($i > 0) { y = int((i - 1) / X); x = (i - 1) % X; z = NR - 1
           if (!n++) { z0 = z1 = z; y0 = y1 = y; x0 = x1 = x }
           if (z < z0) z0 = z; if (z > z1) z1 = z; if (y < y0) y0 = y; if (y > y1) y1 = y; if (x < x0) x0 = x; if (x > x1) x1 = x } }
-      END { split(sh, s, " "); a[1] = z0; a[2] = y0; a[3] = x0; b[1] = z1; b[2] = y1; b[3] = x1
+      END { if (!n) exit 1; split(sh, s, " "); a[1] = z0; a[2] = y0; a[3] = x0; b[1] = z1; b[2] = y1; b[3] = x1
         for (d = 1; d <= 3; d++) { lo = (a[d] - 1) * c; if (lo < 0) lo = 0; lo = int(lo / 512) * 512; hi = (b[d] + 2) * c; if (hi > s[d]) hi = s[d]; o[d] = lo; e[d] = hi - lo }
-        printf "%d,%d,%d,%d,%d,%d\n", o[1], o[2], o[3], e[1], e[2], e[3] }' > $O/box.txt
+        printf "%d,%d,%d,%d,%d,%d\n", o[1], o[2], o[3], e[1], e[2], e[3] }' > $O/box.txt || { log "prep: mask $m has no set voxel: refusing"; rm -f $O/box.txt; return 1; }
   fi
   if [ "$AXS" = auto ]; then X $O/logs/prep.log $U axis $R $K $O/axis.json || return 1
   else [ "$DRY" = 1 ] && echo "    axis $AXS" || cp $AXS $O/axis.json; fi
@@ -534,7 +537,7 @@ onpap() {   # onpap ID..: "id share" per wrap (surf-stats --per-wrap --ct-only o
   local d=$O/trim.tmp i; rm -rf $d; mkdir -p $d; for i in "$@"; do ln -s $O/wraps/$(printf 'w%03d' $i).sfc $d/; done
   nice -n 10 $U surf-stats $d --fields $F --ct $R $K/$LV --ct-um $LUM --ct-only 1 --per-wrap --threads $TH 2>> $O/logs/trim.log |
     tee -a $O/logs/trim.log | awk '$1 ~ /^w-?[0-9]+$/ && NF >= 8 { print substr($1, 2) + 0, $NF }'
-  rm -rf $d
+  local rc=${PIPESTATUS[0]}; rm -rf $d; return $rc
 }
 # trimwalk END ID..: walk the ids from one end (given in walking order), drop while rule 1 / 2 / 3 holds; sets TW_KEPT (none: all dropped)
 # and TW_DROP (no subshell: the on-papyrus shares stay in P);
@@ -547,7 +550,11 @@ trimwalk() {
     elif [ -n "${RN[$i]:-}" ] && awk -v r=${RN[$i]} -v m=${RNETMIN:-0.6} 'BEGIN { exit !(r < m) }'; then why=collapsed
     else
       if [ -z "${P[$i]:-}" ]; then batch=("${ids[@]:$k:$nb}"); nb=$(( nb < 16 ? nb * 4 : 16 ))
-        while read -r a b; do P[$a]=$b; echo "$a $b" >> $O/trim.pap; done < <(onpap "${batch[@]}"); [ -n "${P[$i]:-}" ] || P[$i]=0; fi
+        # (a failed surf-stats, or no row for this wrap, fails the trim: a missing share read as 0 dropped the wrap as near-empty, audit
+        # mini/shell #2)
+        onpap "${batch[@]}" > $O/trim.pap.part || { log "trim: surf-stats failed on w$(printf %03d $i) (+$((${#batch[@]} - 1))), $O/logs/trim.log: refusing"; return 1; }
+        while read -r a b; do P[$a]=$b; echo "$a $b" >> $O/trim.pap; done < $O/trim.pap.part; rm -f $O/trim.pap.part
+        [ -n "${P[$i]:-}" ] || { log "trim: surf-stats gave no row for w$(printf %03d $i) ($O/logs/trim.log): refusing"; return 1; }; fi
       awk -v p=${P[$i]} -v m=${PAPMIN:-0.1} 'BEGIN { exit !(p <= m) }' && why=empty
     fi
     printf '%s\tw%03d\t%s\t%s\t%s\t%s\t%s\n' $end $i "${V[$i]:--}" "${RN[$i]:--}" "${GP[$i]:--}" "${P[$i]:--}" "${why:-kept}" >> $O/state/trim.tsv
@@ -572,13 +579,13 @@ trim() {
   [ -n "$HI" ] || { log "trim: wrapcheck.tsv has no wrap rows: refusing (TRIM=0 to skip)"; return 1; }
   if [[ " $STRIPARGS " == *" --last "* ]]; then log "trim: outer end kept from STRIPARGS (--last $last)"
   else
-    trimwalk outer $(printf '%s\n' "${ids[@]}" | sort -rn); last=$TW_KEPT; o=$TW_DROP
+    trimwalk outer $(printf '%s\n' "${ids[@]}" | sort -rn) || return 1; last=$TW_KEPT; o=$TW_DROP
     [ "$last" = none ] && { log "trim: every wrap would be dropped from the outer end: refusing (TRIM=0 to skip)"; return 1; }
     args="$args --last $last"; log "trim: strip --last $last (verdict ${V[$last]:--}, rnet ${RN[$last]:--}, on-papyrus ${P[$last]:--}); outer dropped $(echo $o | wc -w):${o:+ $o}"
   fi
   if [[ " $STRIPARGS " == *" --first "* ]]; then log "trim: inner end kept from STRIPARGS ($STRIPARGS)"
   else
-    trimwalk inner "${ids[@]}"; first=$TW_KEPT; o=$TW_DROP
+    trimwalk inner "${ids[@]}" || return 1; first=$TW_KEPT; o=$TW_DROP
     [ "$first" = none ] || [ $first -gt $last ] && { log "trim: the inner end passes the outer one ($first > $last): refusing (TRIM=0 to skip)"; return 1; }
     log "trim: inner end: first kept w$(printf %03d $first) (rnet ${RN[$first]:--}, on-papyrus ${P[$first]:--}); inner dropped $(echo $o | wc -w):${o:+ $o}"
     # (ufsm strip reads ids >= 0 only, src/strip.c: the kept negative ids are named here, not silently lost)
@@ -689,7 +696,7 @@ pw_one() {   # pw_one WRAP GPU (a background subshell: the cache env stays in it
   mkdir -p $d/in; ln -sfn $O/up/$w $d/in/$w
   UFSM_RENDER_MEM=16 UFSM_RENDER_CHUNKED=1 UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} CUDA_VISIBLE_DEVICES=$gpu nice -n 10 $U render $d/in $d --volume $INK $LUM --ct $R $K/$LV --depth 1 --scale 1 --threads ${RTH:-8} > $d/render.log 2>&1 || return 1
   nice -n 10 $U ink-compare $O/img/${w}_full_side.jpg --ct $d/${w}_ct.tif --ink "$INKNAME=$d/$w.tif" --px-um $LUM --stretch --stretch-ct --max-px 65000 --threads ${RTH:-8} \
-    --then $O/prev/${w}_side.jpg --max-px 8000 > $d/stats.txt 2>&1
+    --then $O/prev/${w}_side.jpg --max-px 8000 > $d/stats.txt 2>&1 || return 1   # (its status is the job's: audit mini/shell #4)
   [ -e $O/img/${w}_full_side.jpg ] && rm -f $d/$w.tif $d/${w}_ct.tif
   echo "$(date '+%F %T') $w $(grep -E '^[^ ]+: input' $L.flat.log | head -1 | grep -oE '= [0-9.]+ cm2')" >> $O/logs/perwrap.list
 }
@@ -704,14 +711,16 @@ perwrap() {
   done
   for w in "${!pid[@]}"; do wait ${pid[$w]} || { nf=$((nf + 1)); echo "perwrap: $w FAILED (logs $O/logs/pw/$w.*, $O/r/$w/render.log)" >> $O/logs/perwrap.log; }; done   # (each job's rc, audit 11-14 #12)
   echo "perwrap: $(ls $O/img/*_full_side.jpg 2>/dev/null | wc -l) wraps rendered from $WD, $nf of $k failed" >> $O/logs/perwrap.log
-  [ $nf = 0 ]
+  [ $nf = 0 ] && ! stopped   # (a STOP leaves wraps unrendered: no perwrap.done, the rerun renders them)
 }
 faces() {
   [ "$DRY" = 1 ] && { echo "    ufsm faces per flattened wrap ($O/flat) -> $O/faces (faces_p4e.sh recipe)"; return 0; }
-  mkdir -p $O/faces; local w; zcon
-  for w in $(ls $O/flat); do [ -e $O/flat/$w/x.tif ] || continue; [ -e $O/faces/out/${w}_recto ] && continue; stopped && break; memok
-    X $O/logs/faces.log $U faces $O/flat $O/faces/out --wraps $w --ct $R $K/$LV --ct-um $LUM --threads ${RTH:-8} || echo "faces $w failed" >> $O/logs/faces.log
+  mkdir -p $O/faces; local w nf=0; zcon
+  for w in $(ls $O/flat); do [ -e $O/flat/$w/x.tif ] || continue; [ -e $O/faces/out/${w}_recto ] && continue; stopped && return 1; memok
+    X $O/logs/faces.log $U faces $O/flat $O/faces/out --wraps $w --ct $R $K/$LV --ct-um $LUM --threads ${RTH:-8} || { nf=$((nf + 1)); echo "faces $w failed" >> $O/logs/faces.log; }
   done
+  # (any failed wrap fails the stage, so faces.done is not written and a rerun retries them; audit mini/shell #4)
+  [ $nf = 0 ] || { log "faces: $nf wraps failed ($O/logs/faces.log)"; return 1; }
 }
 upload() {
   local cmd="ssh desk ~/reg-upload/upcorpus.sh $S   # + lftp mirror -R of wraps / strip img (scripts/corpus/upcorpus.sh)"
@@ -727,9 +736,11 @@ stage fields fields || exit 1; upto fields
 # the ink on GPU $INKGPU. INKAT=slabs (default): its GroupNorm calibration beside the ref, the main pass from the end of the slabs, beside
 # the CPU stages join .. stripflat (P4 11-12: ink 892 s; with the fast ref its GPU-1 slab lane would wait for it); INKAT=fields: the
 # whole ink from the end of the fields, the GPU-1 slab lane waiting for it (before 11-12). The per-wrap renders beside the strip
-INKAT=${INKAT:-slabs}; inkbg() { ( stage ink ink || touch $O/state/ink.failed ) & INKP=$!; [ "$DRY" = 1 ] && wait $INKP; return 0; }
+# (a rerun of the same O clears the last run's .failed markers first: waitfor / the GPU lane stopped at once on a stale one, audit mini/shell #3)
+[ "$DRY" = 1 ] || rm -f $O/state/ink.failed $O/state/inkcal.failed
+INKAT=${INKAT:-slabs}; inkbg() { rm -f $O/state/ink.failed; ( stage ink ink || touch $O/state/ink.failed ) & INKP=$!; [ "$DRY" = 1 ] && wait $INKP; return 0; }
 if [ "${NOINK:-0}" != 1 ]; then
-  if [ "$INKAT" = fields ]; then inkbg; else ( stage inkcal inkcal || touch $O/state/inkcal.failed ) & [ "$DRY" = 1 ] && wait; fi
+  if [ "$INKAT" = fields ]; then inkbg; else rm -f $O/state/inkcal.failed; ( stage inkcal inkcal || touch $O/state/inkcal.failed ) & [ "$DRY" = 1 ] && wait; fi
 fi
 inkmain() { [ "${NOINK:-0}" != 1 ] && [ "$INKAT" != fields ] && ! done_ ink && inkbg; return 0; }
 { [ "${RECTOSP:-1}" = 0 ] || stage rectosp rectosp; } || { log "unroll: rectosp failed"; wait; exit 1; }

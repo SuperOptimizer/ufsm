@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include "zarr3.h"
 #include "store.h"
+#include "json.h"
 #include <dirent.h>
 #include <math.h>
 #include <pthread.h>
@@ -853,13 +854,18 @@ typedef struct { int n; double *z, *y, *x; } wm_axis;
 static int wm_axis_load(const char *path, double sc, wm_axis *A) {
     FILE *f = fopen(path, "rb"); if (!f) return -1; fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET);
     char *b = malloc(n + 1); if (!b || fread(b, 1, n, f) != (size_t)n) { fclose(f); free(b); return -1; } b[n] = 0; fclose(f);
-    int cap = 64; A->n = 0; A->z = malloc(cap * 8); A->y = malloc(cap * 8); A->x = malloc(cap * 8);
-    for (const char *q = b; (q = strstr(q, "\"x\":"));) {
-        const char *qy = strstr(q, "\"y\":"), *qz = strstr(q, "\"z\":"); if (!qy || !qz) break;
-        if (A->n == cap) { cap *= 2; A->z = realloc(A->z, cap * 8); A->y = realloc(A->y, cap * 8); A->x = realloc(A->x, cap * 8); }
-        A->x[A->n] = atof(q + 4) * sc; A->y[A->n] = atof(qy + 4) * sc; A->z[A->n] = atof(qz + 4) * sc; A->n++; q = qz + 4;
+    /* json_get per point (any key order; the strstr scan took the next point's "y" / "z" when a point listed z before x, audit mini/coords
+       #3): {"control_points": [...]} or a bare array of points */
+    json *j = json_parse(b, (size_t)n); free(b); if (!j) return -1;
+    const json *cp = j->type == J_ARR ? j : json_get(j, "control_points");
+    const int m = cp && cp->type == J_ARR ? (int)cp->n : 0; A->n = 0;
+    A->z = malloc((m + 1) * 8); A->y = malloc((m + 1) * 8); A->x = malloc((m + 1) * 8);
+    for (int i = 0; i < m; i++) {
+        const json *q = json_at(cp, (size_t)i), *qx = json_get(q, "x"), *qy = json_get(q, "y"), *qz = json_get(q, "z");
+        if (!qx || !qy || !qz) continue;
+        A->x[A->n] = json_num(qx, 0) * sc; A->y[A->n] = json_num(qy, 0) * sc; A->z[A->n] = json_num(qz, 0) * sc; A->n++;
     }
-    free(b);
+    json_free(j);
     for (int i = 1; i < A->n; i++) for (int j = i; j > 0 && A->z[j] < A->z[j - 1]; j--) {   /* by z */
         double t; t = A->z[j]; A->z[j] = A->z[j - 1]; A->z[j - 1] = t; t = A->y[j]; A->y[j] = A->y[j - 1]; A->y[j - 1] = t; t = A->x[j]; A->x[j] = A->x[j - 1]; A->x[j - 1] = t; }
     return A->n >= 1 ? 0 : -1;

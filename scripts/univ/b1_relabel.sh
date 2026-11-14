@@ -21,8 +21,9 @@ case $SET in
          step raster June 4.8; [ -f $G/codesA48/done ] || { nice -n 5 $U raster $G/codesA48 --shape $SH --um $UM --level 1 --binary 0 --levels 1 --threads $T --shard 512 --value q.tif $G/qA/*.tifxyz > $G/rasterA48.log 2>&1 && touch $G/codesA48/done; tail -1 $G/rasterA48.log; }
          C=$G/codesA48; O=$G/phaseA48
        else
-         step raster June 9.6 + ref 19.2; [ -f $G/codesA/zarr.json ] || nice -n 5 $U raster $G/codesA --shape $SH --um $UM --level 2 --binary 0 --levels 1 --threads $T --shard 512 --value q.tif $G/qA/*.tifxyz 2>&1 | tail -1
-         [ -d $G/ref ] || nice -n 5 $U downsample $G/codesA 9.6 $G/ref 19.2 --mode max --threads $T 2>&1 | tail -1
+         step raster June 9.6 + ref 19.2; [ -f $G/codesA/done ] || { nice -n 5 $U raster $G/codesA --shape $SH --um $UM --level 2 --binary 0 --levels 1 --threads $T --shard 512 --value q.tif $G/qA/*.tifxyz 2>&1 | tail -1 && touch $G/codesA/done; } || exit 1
+         # (done markers, not zarr.json / the dir: a killed raster / downsample left them behind, audit mini/shell #7)
+         [ -e $G/ref.done ] || { rm -rf $G/ref; nice -n 5 $U downsample $G/codesA 9.6 $G/ref 19.2 --mode max --threads $T 2>&1 | tail -1 && touch $G/ref.done; } || exit 1
          step assign July; [ -s $G/qB/assign.jsonl ] || nice -n 5 $U wind-assign $G/ref 19.2 $G/qB $B --ref-um 19.2 --vol-um $UM --axis $AX --tol 2 --step 4 --threads $T > $G/assignB.log 2>&1 || { tail -3 $G/assignB.log; exit 1; }
          step raster July 4.8; [ -f $G/codesB48/done ] || { nice -n 5 $U raster $G/codesB48 --shape $SH --um $UM --level 1 --binary 0 --levels 1 --threads $T --shard 512 --value q.tif $G/qB/*.tifxyz > $G/rasterB48.log 2>&1 && touch $G/codesB48/done; tail -1 $G/rasterB48.log; }
          C=$G/codesB48; O=$G/phaseB48

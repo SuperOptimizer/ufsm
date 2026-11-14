@@ -185,12 +185,12 @@ static double point_phase(const float *ph, int T, int L, const vw_frame *f, cons
 }
 /* umbilicus (control points x y z, linear in z, clamped) */
 typedef struct { int n; double (*p)[3]; } umb_t;
-static int umb_load(const char *path, umb_t *u) {
+static int umb_load(const char *path, umb_t *u, double sc) {   /* sc: --umb-scale, JSON units -> KEY's voxels (audit mini/coords #4) */
     FILE *f = fopen(path, "rb"); if (!f) return -1; fseek(f, 0, SEEK_END); const long L = ftell(f); fseek(f, 0, SEEK_SET);
-    char *t = malloc(L + 1); if (fread(t, 1, L, f) != (size_t)L) { fclose(f); return -1; } fclose(f); t[L] = 0;
-    json *J = json_parse(t, L); free(t); const json *cp = J ? json_get(J, "control_points") : nullptr; if (!cp || !cp->n) return -1;
+    char *t = malloc(L + 1); if (fread(t, 1, L, f) != (size_t)L) { fclose(f); free(t); return -1; } fclose(f); t[L] = 0;
+    json *J = json_parse(t, L); free(t); const json *cp = J ? json_get(J, "control_points") : nullptr; if (!cp || !cp->n) { json_free(J); return -1; }
     u->n = (int)cp->n; u->p = malloc(cp->n * sizeof *u->p);
-    for (size_t i = 0; i < cp->n; i++) { const json *q = json_at(cp, i); u->p[i][0] = json_num(json_get(q, "x"), 0); u->p[i][1] = json_num(json_get(q, "y"), 0); u->p[i][2] = json_num(json_get(q, "z"), 0); }
+    for (size_t i = 0; i < cp->n; i++) { const json *q = json_at(cp, i); u->p[i][0] = json_num(json_get(q, "x"), 0) * sc; u->p[i][1] = json_num(json_get(q, "y"), 0) * sc; u->p[i][2] = json_num(json_get(q, "z"), 0) * sc; }
     for (int i = 1; i < u->n; i++) for (int j = i; j > 0 && u->p[j][2] < u->p[j - 1][2]; j--) { double tt[3]; memcpy(tt, u->p[j], 24); memcpy(u->p[j], u->p[j - 1], 24); memcpy(u->p[j - 1], tt, 24); }
     json_free(J); return 0;
 }
@@ -205,7 +205,7 @@ static void umb_at(const umb_t *u, double z, double *x, double *y) {
 static vwt *g_vwt = nullptr;   /* --vwt: our trained model instead of villa's */
 static wtrunk *g_wt = nullptr; static uint16_t *g_xf = nullptr; static int g_xld = 0; static double g_um = 9.6;   /* --trunk: the frozen feature trunk of a cx model */
 static int ray_check(vw_net *net, int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm villawind ray-check ROOT KEY WINDINGS.json --ckpt PTH [--tsv OUT] [--zr Z0,Z1] [--cache DIR] [--threads 8] [--prefetch 1] [--geom pair|umb --umb JSON --sz 112 --sr 192 --st 112 --r0 16]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm villawind ray-check ROOT KEY WINDINGS.json --ckpt PTH [--tsv OUT] [--zr Z0,Z1] [--cache DIR] [--threads 8] [--prefetch 1] [--geom pair|umb --umb JSON [--umb-scale 1: JSON x scale = KEY's voxels] --sz 112 --sr 192 --st 112 --r0 16]\n"); return 2; }
     const int T = opt_atoi("--T", opt(argc, argv, "--T", "128")), L = opt_atoi("--L", opt(argc, argv, "--L", "384")), nth = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8);
     double zr0 = -1e18, zr1 = 1e18; sscanf(opt(argc, argv, "--zr", ""), "%lf,%lf", &zr0, &zr1);
     const int prefetch = opt_atoi("--prefetch", opt(argc, argv, "--prefetch", "0"));   /* 1: read (and cache) the slabs' CT only, no forward */
@@ -214,7 +214,7 @@ static int ray_check(vw_net *net, int argc, char **argv) {
        pair's points wherever they fall in the slab (phase trilinear at the points; pairs not inside one ring's interior are skipped) */
     const int geom_umb = !strcmp(opt(argc, argv, "--geom", "pair"), "umb");
     const double sz = opt_atof("--sz", opt(argc, argv, "--sz", "112")), sr = opt_atof("--sr", opt(argc, argv, "--sr", "192")), stt = opt_atof("--st", opt(argc, argv, "--st", "112")), r00 = opt_atof("--r0", opt(argc, argv, "--r0", "16"));
-    umb_t umb = {0}; if ((geom_umb || g_wt) && umb_load(opt(argc, argv, "--umb", ""), &umb)) { fprintf(stderr, "villawind: --geom umb and --trunk need --umb umbilicus.json\n"); return 2; }
+    umb_t umb = {0}; if ((geom_umb || g_wt) && umb_load(opt(argc, argv, "--umb", ""), &umb, opt_atof("--umb-scale", opt(argc, argv, "--umb-scale", "1")))) { fprintf(stderr, "villawind: --geom umb and --trunk need --umb umbilicus.json\n"); return 2; }
     store *st = store_open(argv[2]); z3 *ct = st ? z3_open(st, argv[3], opt(argc, argv, "--cache", nullptr)) : nullptr;
     if (!ct) { fprintf(stderr, "villawind: %s %s: %s\n", argv[2], argv[3], z3_error()); return 1; }
     size_t np = 0; rpair *P = load_pairs(argv[4], &np); if (!P) return 1;

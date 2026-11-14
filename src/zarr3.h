@@ -19,6 +19,8 @@ typedef struct {
     double scale_um;      /* voxel size from the parent group's OME multiscales, 0 if unknown */
     int fill;             /* fill_value for missing chunks / shards */
     int label_binary;     /* ufsm.encoding=binary: 255 is positive, 0 is background */
+    int label_pooled;     /* mask reads (binary 1): how many levels this one sits above its point-sampled base (any-of pooled blocks above it, ingest.c
+                             pool2_mask): ufsm.pooled, else log2(scale / the group's first scale); sources.c label_cell */
     int dtype, esize;     /* element type (volcomp_dtype: 0 uint8, 1 uint16, 2 int16, 3 uint32, 4 int32, 5 float32) and bytes; z3_read
                              fills esize bytes per voxel (native byte order) */
     double fillv;         /* fill_value of a typed array */

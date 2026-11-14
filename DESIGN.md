@@ -6,6 +6,68 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Shell-script and coordinate-convention fixes from the mini audits (2026-11-14, branch shellfix-20261114)
+
+Audits: /vesuvius/ufsm/audit-20261114/mini/shell.md (1-10) and mini/coords.md (1-7). No GPU, no measurements; CPU tests added.
+
+Shell (scripts/unroll/unroll.sh, scripts/univ/):
+- prep: a missing mask (or .json) without a BOX fails the stage; the box awk exits 1 on an empty mask. Before, `od` on a missing file
+  fed awk nothing, its END printed a corner box (replay: `0,0,0,16,16,16`, exit 0) and the unroll ran on it. PREPDIR overrides the
+  mask directory.
+- trim: a failed surf-stats (onpap returns its PIPESTATUS) or a wrap without a row fails the stage. Before, the missing share read as
+  P = 0, so every such wrap was "near-empty" and dropped with a passing stage.
+- ink.failed / inkcal.failed are removed at the start of a run and before each ink / inkcal attempt. A stale marker stopped
+  `waitfor ink` (and the INKAT=fields GPU lane) at once on a rerun.
+- pw_one returns ink-compare's status. faces counts its failed wraps and returns 1 (no faces.done after a failure, so a rerun retries
+  them). perwrap (its per-job rc already on unrollfix-pub) also fails on STOP.
+- u2ink_pod.sh creates score/ (the score unit's redirect failed on a fresh arm). b1_p4B48.sh: pipefail, every step fatal, and an assign
+  that matches neither reference stops before the raster.
+- Skips test done markers, or write .tmp then mv, instead of testing the output (ueval wraps / ct.raw / head raws, b1_relabel codesA /
+  ref, b1_p4B48 ref19 / qB, xres_prep warps). A killed run left the dir / zarr.json / a truncated raw, which was then reused.
+  Existing outputs without a marker are redone once.
+- b1_pull_p4A.sh: EP / EPP are required (no stale pod default doing rsync --remove-source-files), and IDLE seconds (1800) with no
+  contact and no new shard exits 1. deskgate.sh: an EXIT trap removes gate.busy (bash runs it on SIGTERM, checked).
+- Env overrides: b1_p4B48 (J, G, AX, GT1019), pod_pack (GTROOT), postperf_gpu (CTR, CTK).
+
+Coordinates:
+- #1, mask reads finer than the stored level (sources.c `label_cell`). A mask's base level is point-sampled: the rasteriser rounds,
+  so base cell j is centred on fine j 2^s, and that is why the old rounding was right there (tools/label_grid.py). But its pyramid
+  levels above the base are any-of blocks (ingest.c pool2_mask). Reading such a level with rounding shifted the mask half a coarse
+  cell against its blocks.
+  - New field z3_meta.label_pooled: the levels above the base. Taken from `ufsm.pooled` if present, else log2(scale / the group's
+    finest scale).
+  - The reader rounds to the base, then floors through the pooled levels. Side labels (binary 2) still floor all the way.
+  - A source whose min_level is its base (every current raster store) reads exactly as before.
+  - test_raster `pooled_pyramid`: a random mask with two pool2 levels, read at the base and one level finer than the base. Every
+    voxel must equal the any-of over its block.
+- #2: countfield / hiresphase ray cells use floor, not (int) truncation. A step into (-cell, 0) no longer reads cell 0.
+- #3: surf.c wm_axis_load parses with json_get, so key order no longer matters (control_points or a bare array).
+- #4: vwt-tile / vwt-infer / villawind take --umb-scale (default 1, the old behaviour): JSON times the scale gives the volume's voxels.
+  vwt_tiling_build takes the scale.
+- #5, not changed: the radial input rows use the plane-start convention, axis at (o + z) 2^L, then / 2^L. Training uses the same
+  convention (sample.c:3104), and so does predict (axis_rows), so train and inference agree. Moving one side to the block centre
+  would create the mismatch the audit worries about. The other users (inksplat (V-1)/2, patchsolve / tracebox / dino raw) are each
+  internally consistent, and the gap is under half a coarse voxel.
+- #6: tifxyz-scale's help says the --offset is subtracted after the division, in output voxels.
+- #7: tifxyz_shift writes a vertex moved past z = 0 as invalid (-1, -1, -1), tifxyz_scaled's rule, instead of clamping it to a valid
+  z = 0. test_imgops checks it.
+
+Fused --fit-h 2 fit fields (audit unroll #9, the deferred item; main 11-14: write it behind a flag, profile post-pass).
+- nn_fit_accum_lat now takes field cells of 1, 2 or 4 voxels as well as 8. Production runs --fit-h 2 and used to take the plane path:
+  upsample, shuffle and stem into [11][nz][W][W] fp16 planes, then fit_accum_cell_k and fit_accum_w4_k.
+- How it works:
+  - Blocks of 8^3 box voxels, as at h 8. They start at og = tz mod 4 per axis, so their window coordinates sit on the 4-voxel latent
+    cell grid. og must be a multiple of h.
+  - Per block, the same staging, stem and upsampling as h 8.
+  - Then one thread per field cell sums the cell's voxels serially, in the plane kernels' voxel order. Voxels outside the box or the
+    window add +0, which changes no sum.
+  - So every accumulator should match the plane path bit for bit. test_fit_lat now runs h 8 / 4 / 2, plus a window origin off the
+    4-voxel grid for h 2.
+- Flag: UFSM_PRED_FIT_FUSED_SMALLH=1, default OFF. If the kernel refuses a configuration, predict falls back to the plane path and says
+  so.
+- Pending (post-pass GPU): scripts/unroll/fith2_prof.sh. It runs test_fit_lat plus its bench, then a 1024^3 1667 fields predict, plane
+  vs fused, with UFSM_PRED_PROF=1 and every field file byte-compared. Turn the default on only if it says IDENTICAL and is faster.
+
 ## DP safety: process-wide state under one host thread per GPU, workspaces before the plan, an mgpu lint (2026-11-14, branch netfix-20261114)
 
 From the network / kernel audit (/vesuvius/ufsm/audit-20261114/net.md; today's at_set_lmax and cuBLASLt bugs were of this kind). Under data
