@@ -1,6 +1,6 @@
 /* the derived cache's near-lossless phase codec (src/dcache.c UDC2, 2026-11-14). CPU only. A synthetic phase field (a 252-periodic ramp
    along a tilted axis with per-voxel noise, wrapping; unknown blobs; a few all-unknown and all-constant cells) cached at delta 0..3:
-   every known voxel within delta of the computed phase (circular, period 252), every unknown voxel exactly 255 and no known one
+   every known voxel within delta of the computed phase (circular, period 252), its quadrant (phase / 63) exact, every unknown voxel exactly 255 and no known one
    reported unknown; a cold reopen of the same disk cache (the cells read back, decoded) returns the very bytes the first read did
    (memory == disk); delta 0 is exact; the lossy cells are smaller than the exact ones; decoding a truncated cell is a miss. */
 #include "dcache.h"
@@ -45,13 +45,14 @@ int main(int argc, char **argv) {
     for (int d = 0; d <= 3; d++) {
         char root[600]; snprintf(root, sizeof root, "%s/c%d", T, d);
         z3 *c = open_ph(root, d); CHECK(c && !z3_read(c, o, n, a, 2), "delta %d: read", d); z3_close(c);
-        size_t bad = 0, unk = 0, maxe = 0;
+        size_t bad = 0, unk = 0, maxe = 0, qf = 0;
         for (int64_t z = 0; z < S; z++) for (int64_t y = 0; y < S; y++) for (int64_t x = 0; x < S; x++) {
             const uint8_t e = ph(z, y, x), g = a[((size_t)z * S + y) * S + x];
             if (e == 255 || g == 255) { unk += e != g; continue; }
-            int er = abs((int)e - (int)g); if (er > 126) er = 252 - er; if ((size_t)er > maxe) maxe = (size_t)er; bad += er > d || g >= 252;
+            int er = abs((int)e - (int)g); if (er > 126) er = 252 - er; if ((size_t)er > maxe) maxe = (size_t)er; bad += er > d || g >= 252; qf += e / 63 != g / 63;
         }
         CHECK(!unk, "delta %d: %zu voxels with the unknown mask wrong", d, unk); CHECK(!bad, "delta %d: %zu voxels beyond delta (max %zu)", d, bad, maxe);
+        CHECK(!qf, "delta %d: %zu voxels changed quadrant (side = phase < 126 and the 63 / 189 halves must stay exact)", d, qf);
         c = open_ph(root, d); CHECK(c && !z3_read(c, o, n, b, 2), "delta %d: cold read", d); z3_close(c);   /* (a new process's view: every cell from disk) */
         CHECK(!memcmp(a, b, N), "delta %d: the cold read (cells from disk) differs from the first (memory == disk)", d);
         const long sz = du(root); if (d == 0) sz0 = sz; else CHECK(sz < sz0, "delta %d: %ld bytes on disk, not below exact %ld", d, sz, sz0);
@@ -67,6 +68,6 @@ int main(int argc, char **argv) {
     }
     free(a); free(b);
     if (!fails) { snprintf(cmd, sizeof cmd, "rm -rf '%s'", T); if (system(cmd)) {} }
-    printf(fails ? "test_dcache_phase: %d FAILED\n" : "test_dcache_phase: ok (delta 0..3 bounds, exact mask, memory == disk, smaller, truncated cell a miss)\n", fails);
+    printf(fails ? "test_dcache_phase: %d FAILED\n" : "test_dcache_phase: ok (delta 0..3 bounds, quadrants and mask exact, memory == disk, smaller, truncated cell a miss)\n", fails);
     return fails ? 1 : 0;
 }
