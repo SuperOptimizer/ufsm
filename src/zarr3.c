@@ -479,13 +479,20 @@ static int load_index(z3 *z, const char *skey, ientry *idx) {
     size_t ilen = (size_t)z->nc * 16 + 4, n = 0;
     int fetched = 0;
     uint64_t payload_size = UINT64_MAX;
-    /* the cached index carries the shard's payload size after it (8 bytes; an older cache entry without it: no range check, as before), so
+    /* the cached index carries the shard's payload size after it (8 bytes + a CRC32C, below; an older entry without it: no range check), so
        entries read from the cache are range-checked too (audit mini/zarr 6). A missing shard (404) is cached on disk as a "missing" marker
        for UFSM_CACHE_MISSING_TTL_S (600 s) only: a shard being re-uploaded was read as fill for every later run sharing the cache dir
        (audit mini/store 3, mini/zarr 7, dcache #4), while not caching 404s at all made every warm read of a sparse array ask for each
        absent shard again (test_http_reader's warm-cache check, the mega sweep 11-14). Each process logs a missing shard once. */
     uint8_t *b = cache_get(z, skey, "idx", &n);
-    if (b && n == ilen + 8) { memcpy(&payload_size, b + ilen, 8); n = ilen; }
+    /* (the cached entry: the index, the payload size, a CRC32C over both (12 bytes after the index). The size has its own check: a
+       flipped bit in it widened the range check and the corrupt entry was used (test_http_reader's corrupt-cache case, mega sweep
+       11-14). An entry of the index + size alone (the mega branch before this fix) has no check: its size is ignored) */
+    if (b && n == ilen + 12) {
+        uint32_t sc; memcpy(&sc, b + ilen + 8, 4);
+        if (index_crc(b, ilen + 8) != sc) { free(b); return FAIL("%s: cached index CRC32C mismatch (its payload size)", skey); }
+        memcpy(&payload_size, b + ilen, 8); n = ilen;
+    } else if (b && n == ilen + 8) n = ilen;
     if (!b) {
         uint8_t *missing = cache_get(z, skey, "missing", &n);
         if (missing) {   /* an absent shard is re-checked after UFSM_CACHE_MISSING_TTL_S (600) s: a later upload is seen (the dcache audit #4) */
@@ -494,7 +501,7 @@ static int load_index(z3 *z, const char *skey, ientry *idx) {
             if (stat(mp, &ms) || difftime(time(nullptr), ms.st_mtime) < ttl) { imem_put(z, skey, nullptr, 0); return 0; }
             unlink(mp);
         }
-        b = malloc(ilen + 8);
+        b = malloc(ilen + 12);
         if (!b) return FAIL("index allocation for %s", skey);
         int64_t size = -1, got = store_read_tail(z->s, skey, (int64_t)ilen, b, &size);   /* one suffix-range GET */
         if (got == -2) {
@@ -507,6 +514,7 @@ static int load_index(z3 *z, const char *skey, ientry *idx) {
         if (size < 0) { free(b); return FAIL("%s: index read without the object's size", skey); }
         payload_size = (uint64_t)size - ilen;
         memcpy(b + ilen, &payload_size, 8);
+        { const uint32_t sc = index_crc(b, ilen + 8); memcpy(b + ilen + 8, &sc, 4); }
         n = ilen; fetched = 1;
     }
     if (n != ilen) { free(b); return FAIL("%s: bad index size", skey); }
@@ -523,7 +531,7 @@ static int load_index(z3 *z, const char *skey, ientry *idx) {
             free(b); return FAIL("%s: chunk %d range outside shard payload", skey, i);
         }
     }
-    if (fetched) cache_put(z, skey, "idx", b, n + 8);
+    if (fetched) cache_put(z, skey, "idx", b, n + 12);
     free(b);
     imem_put(z, skey, idx, 1);
     return 1;
