@@ -12,7 +12,7 @@ Audit `/vesuvius/ufsm/audit-20261114/ugeom.md` (1667 vs the published tifxyz, he
 - **Masked CT** (#1): 16.2 % of the published 1667 surface lies on zero CT of the fields' `-masked` store (cov50 there 0.19 vs 0.899),
   13.1 of the 21.5 missing cov50 points; 80 % of it within 1 mm of the mask edge. `wrap-snap` already counted our vertices on masked CT
   (1667-u1 0.182, w96 0.205, 1299 0.070, P4 0.057); now `--masked-warn 0.02` prints a WARNING above it and `--masked-max F` (off)
-  fails with exit 3 before writing; `unroll.sh` logs an ALARM above MASKWARN (0.02), MASKMAX passes `--masked-max`. The data fix (a
+  fails with exit 3 before writing; `unroll.sh` MASKMAX passes `--masked-max` (the progress.log alarm is geoouter-20261114's `wraps --fields` no-data line). The data fix (a
   filled 1667 store) is pub1667's; `scripts/spiralqa/ugeom/after_mega.sh filled` measures it.
 - **Where the integers go wrong** (#2): `fit --model X --codes --cpu` on the 70 held-out 1667 C boxes (`scripts/spiralqa/ugeom/gtboxes.sh`).
   Voxel-weighted over the 54 boxes without label noise:

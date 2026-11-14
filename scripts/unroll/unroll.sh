@@ -32,7 +32,7 @@
 #   snap    -> trim (SNAP=1 default; SNAP=0 off): ufsm wrap-snap wraps -> wraps_snap: each wrap moved along its rays onto the sheets
 #           (smooth per-wrap offsets, order kept: never past half the gap to its neighbours, never into masked CT; SNAPT target, SNAPX
 #           extra flags); the strip and its renders then use wraps_snap. CLEAN runs after it (the phase / mix targets read the fields)
-#           ALARM in progress.log when > MASKWARN (0.02) of the wrap vertices lie on masked CT (the scan mask clips sheets); MASKMAX fails
+#           MASKMAX (off): fail when more than that share of the wrap vertices lie on masked CT (wrap-snap --masked-max)
 #   strip   -> snap: ufsm strip ($STRIPARGS + --last) ; stripflat -> strip: strip-flatten (FLATX, default "--gpu 1"; FLATX= for the CPU) ;
 #   stripimg -> stripflat + ink: stretch from the 3 middle stripes, filled stripe renders (FILLX) + strip-mosaic img_fill (rgb) and
 #           img_pap (papyrus look) via scripts/strip/strip_refill.sh; renders UFSM_RENDER_GPU_MEM=4 (a fit may share the GPU), RGPU
@@ -501,11 +501,8 @@ snap() {
     X $O/logs/snap.log env ${sg:+UFSM_GPU_DECODE=1 UFSM_GPU_DECODE_DEV=$sg} $U wrap-snap $O/wraps $O/wraps_snap --target $t --axis $O/axis.json --axis-um $UM --ct $R $K/$LV --ct-um $LUM \
       --fields $F --threads $TH $sel ${MASKMAX:+--masked-max $MASKMAX} ${SNAPX:-} || return 1
     [ "$DRY" = 1 ] || log "snap: $(grep '^wrap-snap: solve' $O/logs/snap.log | tail -1)"
-    # the CT mask clipping the surface (audit ugeom #1: 1667's -masked store zeroed the outer sheets, 16 % of the published surface; 0.18
-    # of our wrap vertices sat on masked CT): ALARM above MASKWARN (0.02) in progress.log; MASKMAX (env, default off) makes wrap-snap fail
-    [ "$DRY" = 1 ] || { local ms; ms=$(sed -nE 's/.* ([0-9.]+) on masked CT.*/\1/p' $O/logs/snap.log | tail -1)
-      [ -n "$ms" ] && awk -v m=$ms -v w=${MASKWARN:-0.02} 'BEGIN { exit !(m > w) }' &&
-        log "snap: ALARM: $ms of the wrap vertices lie on masked CT (> MASKWARN ${MASKWARN:-0.02}): the scan mask clips the surface; the fields had no input there (unmasked / dilated CT store)"; }
+    # (the masked-CT / no-data alarm in progress.log is geoouter-20261114's wraps --fields line; wrap-snap keeps its WARNING print, MASKMAX
+    # passes --masked-max: fail above that share of the wrap vertices on masked CT, off by default)
   else log "snap: off (SNAP=0)"; fi
   [ "$DRY" = 1 ] || { [ "${CLEAN:-1}" = 1 ] && { find $F -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; [ $F = $O/fields/$FNAME ] || find $O/fields/$FNAME -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; rm -rf $O/slabs/s???/fit; }; }
   return 0
