@@ -5,14 +5,19 @@
    - the whole block with radial attention (gather, QK-norm, scroll RoPE on the ray positions, length-masked attention per ray,
      normalised scatter): input / parameter gradients of L = sum(y R) against central finite differences of a double CPU forward,
      cores 0 (fp32) and 1 (fp16 tensor cores); with an axis inside the grid, outside it, and none (grid rows);
-   - the block with full attention and scroll RoPE (at_scroll_pos positions) the same way, and those positions against a host formula.
-   Pass: max |gpu - ref| / rms(ref) < 2e-3 per tensor (the adjoint dot products: relative 1e-5). */
+   - the block with full attention and scroll RoPE (at_scroll_pos positions) the same way, and those positions against a host formula;
+   - try6's stage block (audit 2026-11-14 #15; UFSM_TEST_TRY6=1: only this): C 288 = 6 heads of 48, F 768, one sample of 6^3 = 216 tokens
+     (three full 64-row tiles + 24), full attention, scroll RoPE around an axis inside the grid, core 1 (fp16 tensor cores; train's default).
+   Pass: max |gpu - ref| / rms(ref) < 2e-3 per tensor (try6's fp16 core: 6e-3, test_attn's fp16 tolerance; the adjoint dot products:
+   relative 1e-5). The central differences run on UFSM_NCPU threads (each a copy of the parameters). */
 #include "attn.h"
 #include "nn.h"
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static uint64_t rs = 777;
 static double urand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (double)(rs >> 11) * 0x1.0p-53; }
@@ -200,9 +205,31 @@ static double ref_loss(const blk *B, const double *P, const double *x, const dou
     double L = 0; for (long i = 0; i < n; i++) L += y[i] * R[i];
     free(y); return L;
 }
-/* radial: 1 (rays, rope 0 / 2), 0 full attention with scroll RoPE (nreg registers) */
-static int test_block(int radial, int rope, int nreg, int D, int Hh, int W, float mult, int npts) {
-    const int n = 3, ads[3] = {0, 1, 2}, kinds[3] = {0, 1, 2}, C = 96, F = 128;
+/* central differences of ref_loss at nj points (tensor kind tk[i]: 0 the input x, else parameter offset off[i]; element j[i]) on worker threads,
+   each with its own copy of P and x (ref_loss reads only B and those) */
+typedef struct { const blk *B; const double *P0, *x0, *R; size_t np, nx; const int *tk; const size_t *off, *j; double *out; int n, next; pthread_mutex_t mu; } fdq_t;
+static void *fd_thr(void *a) {
+    fdq_t *J = a; double *P = malloc(J->np * 8), *x = malloc(J->nx * 8); memcpy(P, J->P0, J->np * 8); memcpy(x, J->x0, J->nx * 8);
+    for (;;) {
+        pthread_mutex_lock(&J->mu); const int i = J->next++; pthread_mutex_unlock(&J->mu);
+        if (i >= J->n) break;
+        double *v = J->tk[i] == 0 ? x + J->j[i] : P + J->off[i] + J->j[i]; const double v0 = *v, e = 1e-4 * (fabs(v0) > 1 ? fabs(v0) : 1);
+        *v = v0 + e; const double lp = ref_loss(J->B, P, x, J->R); *v = v0 - e; const double lm = ref_loss(J->B, P, x, J->R); *v = v0;
+        J->out[i] = (lp - lm) / (2 * e);
+    }
+    free(P); free(x); return nullptr;
+}
+static void fd_par(const blk *B, const double *P, size_t np, const double *x, size_t nx, const double *R, const int *tk, const size_t *off, const size_t *j, int n, double *out) {
+    const char *e = getenv("UFSM_NCPU"); long nt = e && atoi(e) > 0 ? atoi(e) : sysconf(_SC_NPROCESSORS_ONLN); nt = nt < 1 ? 1 : nt > 16 ? 16 : nt > n ? n : nt;
+    fdq_t J = {B, P, x, R, np, nx, tk, off, j, out, n, 0, PTHREAD_MUTEX_INITIALIZER};
+    pthread_t th[16]; for (long k = 0; k < nt; k++) pthread_create(&th[k], nullptr, fd_thr, &J);
+    for (long k = 0; k < nt; k++) pthread_join(th[k], nullptr);
+    pthread_mutex_destroy(&J.mu);
+}
+/* radial: 1 (rays, rope 0 / 2), 0 full attention with scroll RoPE (nreg registers); n samples (<= 3: the axis records below), width C (heads of
+   AT_HD), SwiGLU width F */
+static int test_block_g(int radial, int rope, int nreg, int D, int Hh, int W, float mult, int npts, int n, int C, int F) {
+    const int ads[3] = {0, 1, 2}, kinds[3] = {0, 1, 2};
     float *axr = make_axr(n, D, Hh, W, ads, kinds);
     rays_t t; rays_make(&t, n, D, Hh, W, mult, axr);
     blk B = {0}; B.d.C = C; B.d.H = C / AT_HD; B.d.F = F; B.d.rope = rope; B.d.nreg = radial ? 0 : nreg; B.d.rope_base = 100.f;
@@ -246,18 +273,27 @@ static int test_block(int radial, int rope, int nreg, int D, int Hh, int W, floa
     double *gx = host(gd, T * C), *gP = host(Gd, np);
     struct { const char *nm; size_t off, n; } ts[] = {{"x", 0, (size_t)T * C}, {"ln1g", bp->ln1g, C}, {"wqkv", bp->wqkv, (size_t)3 * C * C}, {"bqkv", bp->bqkv, (size_t)3 * C},
         {"qg", bp->qg, C}, {"kg", bp->kg, C}, {"wo", bp->wo, (size_t)C * C}, {"bo", bp->bo, C}, {"w1", bp->w1, (size_t)2 * F * C}, {"w2", bp->w2, (size_t)C * F}};
-    double *a = malloc(npts * 8), *r = malloc(npts * 8);
-    for (size_t k = 0; k < sizeof ts / sizeof ts[0]; k++) {
-        for (int i = 0; i < npts; i++) {
-            size_t j = (size_t)(urand() * ts[k].n); if (j >= ts[k].n) j = ts[k].n - 1;
-            double *v = k == 0 ? x + j : P + ts[k].off + j, v0 = *v, e = 1e-4 * (fabs(v0) > 1 ? fabs(v0) : 1);
-            *v = v0 + e; double lp = ref_loss(&B, P, x, R); *v = v0 - e; double lm = ref_loss(&B, P, x, R); *v = v0;
-            r[i] = (lp - lm) / (2 * e); a[i] = k == 0 ? gx[j] : gP[ts[k].off + j];
-        }
-        bad += report(ts[k].nm, a, r, npts);
+    enum { NT = sizeof ts / sizeof ts[0] };
+    double *a = malloc(NT * npts * 8), *r = malloc(NT * npts * 8); int *tk = malloc(NT * npts * sizeof *tk); size_t *jo = malloc(NT * npts * sizeof *jo), *js = malloc(NT * npts * sizeof *js);
+    for (int k = 0; k < NT; k++) for (int i = 0; i < npts; i++) {   /* (the draws in the order of the old serial loop: ref_loss draws nothing) */
+        size_t j = (size_t)(urand() * ts[k].n); if (j >= ts[k].n) j = ts[k].n - 1;
+        tk[k * npts + i] = k; jo[k * npts + i] = ts[k].off; js[k * npts + i] = j; a[k * npts + i] = k == 0 ? gx[j] : gP[ts[k].off + j];
     }
-    free(a); free(r); free(gx); free(gP); free(P); free(x); free(R); free(axr); free(rpos); free(gpos);
+    fd_par(&B, P, np, x, (size_t)T * C, R, tk, jo, js, NT * npts, r);
+    for (int k = 0; k < NT; k++) bad += report(ts[k].nm, a + k * npts, r + k * npts, npts);
+    free(a); free(r); free(tk); free(jo); free(js); free(gx); free(gP); free(P); free(x); free(R); free(axr); free(rpos); free(gpos);
     nn_free(Pd); nn_free(xd); nn_free(gd); nn_free(yd); nn_free(Gd); nn_free(wb); if (gpos_d) nn_free(gpos_d); rays_free(&t);
+    return bad;
+}
+
+static int test_block(int radial, int rope, int nreg, int D, int Hh, int W, float mult, int npts) { return test_block_g(radial, rope, nreg, D, Hh, W, mult, npts, 3, 96, 128); }
+/* try6's stage block (see the header): the forward on all 62208 outputs, 4 points of each of the 10 gradient tensors */
+static int test_block_try6(void) {
+    const int was = at_get_core(); const double tm = g_tmax;
+    at_set_core(1); g_tmax = 6e-3;
+    printf("== try6 attention block: C 288 (6 heads), F 768, 6^3 tokens, scroll RoPE, core 1\n");
+    const int bad = test_block_g(0, 2, 0, 6, 6, 6, 1.f, 4, 1, 288, 768);
+    at_set_core(was); g_tmax = tm;
     return bad;
 }
 
@@ -373,6 +409,11 @@ static int test_view(void) {
 int main(void) {
     if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
     int bad = 0;
+    if (getenv("UFSM_TEST_TRY6") && atoi(getenv("UFSM_TEST_TRY6"))) {   /* (suite line test_attn_ray~try6) */
+        bad += test_block_try6(); const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); bad++; }
+        printf(bad ? "test_attn_ray (try6 block): %d FAILED\n" : "test_attn_ray (try6 block): all passed\n", bad);
+        return bad != 0;
+    }
     bad += test_masked_keys();
     bad += test_mem();
     bad += test_maps(6, 7, 5, 2.f);
@@ -385,6 +426,7 @@ int main(void) {
     }
     at_set_core(0);
     bad += test_view();   /* (last: its draws leave the block tests' random inputs as they were) */
+    bad += test_block_try6();
     printf(bad ? "test_attn_ray: %d FAILED\n" : "test_attn_ray: all passed\n", bad);
     return bad != 0;
 }

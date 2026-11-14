@@ -171,6 +171,7 @@ test_attn_h16                                  | gpu,smoke    |     3 | ./$B/tes
 test_vwi                                       | gpu          |     1 | ./$B/test_vwi
 test_wtrunk                                    | gpu          |    10 | ./$B/test_wtrunk
 test_attn_ray                                  | gpu          |    14 | ./$B/test_attn_ray
+test_attn_ray~try6                             | gpu          |     8 | UFSM_TEST_TRY6=1 ./$B/test_attn_ray
 test_attn_dfm                                  | gpu          |    26 | ./$B/test_attn_dfm
 test_hybrid_identity                           | gpu          |     6 | ./$B/test_hybrid_identity
 test_init_lr                                   | gpu          |     3 | ./$B/test_init_lr
@@ -180,7 +181,9 @@ test_dino_pts                                  |              |     1 | ./$B/tes
 test_ink_splat                                 | gpu          |    10 | ./$B/test_ink_splat
 test_ink_pool                                  |              |     3 | ./$B/test_ink_pool $TMPDIR/ink_pool
 test_ink_mil                                   | gpu          |     2 | ./$B/test_ink_mil
-test_grad_ar                                   | gpu          |     3 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
+test_grad_ar                                   | gpu          |     8 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
+test_grad_ar~2gpu                              | gpu2         |     8 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
+test_sumsq                                     | gpu          |     4 | ./$B/test_sumsq
 test_dcache_batch                              |              |     2 | ./$B/test_dcache_batch
 test_ink_air                                   | gpu          |     2 | ./$B/test_ink_air
 test_ink_mil_train                             | gpu          |    40 | ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture
@@ -245,7 +248,7 @@ test_sp24_train                                | gpu          |    40 | tests/te
 test_rc                                        | gpu          |     1 | ./$B/test_rc
 test_muon                                      | gpu,smoke    |     1 | ./$B/test_muon
 test_muonc                                     | gpu          |     3 | ./$B/test_muonc
-test_muonx                                     | gpu          |     2 | ./$B/test_muonx
+test_muonx                                     | gpu          |     5 | ./$B/test_muonx
 test_admuon                                    | gpu          |     2 | ./$B/test_admuon
 test_qkclip                                    | gpu          |     1 | ./$B/test_qkclip
 test_unet~FUSED_UP=0,F16=1                     | gpu          |     3 | UFSM_FUSED_UP=0 UFSM_F16=1 ./$B/test_unet
@@ -269,6 +272,7 @@ test_unet~L0_NORM=3                            | gpu          |     3 | UFSM_L0_
 test_unet~L0_NORM=4                            | gpu          |     3 | UFSM_L0_NORM=4 ./$B/test_unet
 test_unet~P=48,B=1                             | gpu          |     3 | UFSM_P=48 UFSM_B=1 ./$B/test_unet
 test_unet~F16=1                                | gpu,smoke    |     3 | UFSM_F16=1 ./$B/test_unet
+test_unet~ATTN_PE=3                            | gpu          |     4 | UFSM_TINY=4,6,96 UFSM_ATTN_BLOCKS=1 UFSM_ATTN_PE=3 ./$B/test_unet
 test_fused                                     | gpu,smoke    |     1 | ./$B/test_fused
 test_fused~F16=1                               | gpu          |     1 | UFSM_F16=1 ./$B/test_fused
 test_split                                     | gpu2,slow    |    68 | ./$B/test_split

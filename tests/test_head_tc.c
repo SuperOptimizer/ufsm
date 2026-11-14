@@ -52,10 +52,11 @@ int main(void) {
         if (ns) lp_gn_slab_reg(mean, 0, 0, 0, 0);
         nn_free(x); nn_free(w); nn_free(b); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd);
     }
-    for (int oc = 0; oc < 7; oc++) {   /* the backward-data: K fp16 logit gradients -> C MX-fp4 channels (SR), a slab range or whole, against the FFMA kernel
+    for (int oc = 0; oc < 8; oc++) {   /* the backward-data: K fp16 logit gradients -> C MX-fp4 channels (SR), a slab range or whole, against the FFMA kernel
                                           (oc 3..5: test_lat_head's 32 / 96 channel trunks, 144 outputs, two samples; oc 6: weights ~3e-7, below fp16's
-                                          normal range: the row scales of c1b_wh_k, 2026-11-14) */
-        const int K = oc == 0 ? 160 : oc == 1 ? 35 : oc == 2 ? 17 : 144, C = oc < 3 ? 256 : oc == 3 ? 32 : 96, NS = oc < 3 ? 1 : 2, D = 12, H = 40, W = 40;
+                                          normal range: the row scales of c1b_wh_k, 2026-11-14; oc 7: the 256-channel trunk's 144-output head, one
+                                          sample, a slab range: audit 2026-11-14 #18e) */
+        const int K = oc == 0 ? 160 : oc == 1 ? 35 : oc == 2 ? 17 : 144, C = oc < 3 || oc == 7 ? 256 : oc == 3 ? 32 : 96, NS = oc < 3 || oc == 7 ? 1 : 2, D = 12, H = 40, W = 40;
         const size_t hw = (size_t)H * W, S = D * hw, vb = oc == 5 ? 0 : 3 * hw, nv = oc == 5 ? 0 : 5 * hw + 77, nvv = nv ? nv : S;
         shape5 xs = {NS, C, D, H, W};
         void *gy = nn_malloc((size_t)NS * K * nvv * 2); { float *f = dev_vals((size_t)NS * K * nvv, 2e-3f, 0.f); nn_f32_to_h16(f, (size_t)NS * K * nvv, gy, 1.f); nn_free(f); }

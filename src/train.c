@@ -4799,14 +4799,9 @@ int cmd_train(int argc, char **argv) {
             float *gg[2] = {unet_grad_ptr(G[0].u), unet_grad_ptr(G[1].u)}; const int dv[2] = {G[0].dev, G[1].dev};
             if (nn_grad_allreduce2(gg, dv, np)) { fprintf(stderr, "UFSM_GRAD_AR2: no staging buffers\n"); training_failed = 1; break; }
             if (!split) for (int g = 0; g < 2; g++) { nn_init(G[g].dev); nn_scale(unet_grad_ptr(G[g].u), 0.5f, np); }
-        } else if (ng > 1) {
-            nn_init(G[0].dev);
-            for (int g = 1; g < ng; g++) for (size_t o = 0; o < np; o += GPEER) {
-                const size_t k = np - o < GPEER ? np - o : GPEER;
-                nn_peer_copy(gpeer, G[0].dev, unet_grad_ptr(G[g].u) + o, G[g].dev, k * 4); nn_axpy(unet_grad_ptr(G[0].u) + o, 1.f, gpeer, k);
-            }
-            if (!split) nn_scale(unet_grad_ptr(G[0].u), 1.f / ng, np);   /* split: the halves' gradients add up to the window's */
-            for (int g = 1; g < ng; g++) nn_peer_copy(unet_grad_ptr(G[g].u), G[g].dev, unet_grad_ptr(G[0].u), G[0].dev, np * 4);
+        } else if (ng > 1) {   /* (split.c dp_grad_avg: chunked peer copy + axpy on GPU 0, scale, broadcast; tests/test_grad_ar checks it against the host mean) */
+            float *gg[8]; int dv[8]; for (int g = 0; g < ng; g++) { gg[g] = unet_grad_ptr(G[g].u); dv[g] = G[g].dev; }
+            dp_grad_avg(gg, dv, ng, np, gpeer, GPEER, !split);   /* split: no 1 / ng (the halves' gradients add up to the window's) */
         }
         for (int g = 0; g < nl; g++) { nn_init(G[g].dev); loss += fetch_loss(&G[g], B, P, dice_w, parts[g]); active += parts[g][2 * NCH]; }   /* split: both sides hold the window's loss */
         if (getenv("UFSM_GRAD_DUMP") && step == 1) {   /* tests: the first step's summed parameter gradient (fp32) and loss to a file, then exit (split vs one GPU A/B) */

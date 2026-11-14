@@ -6,6 +6,23 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## try6-shaped tests for the non-conv kernels (2026-11-14, branch kshape-20261114)
+
+The kernel audit (/vesuvius/ufsm/audit-20261114/kernels.md, #14-#18) found the try6 paths outside the conv kernels tested only at toy
+shapes or without an assertion. New cases (compiled and linked on the desk; not run there: no GPU time was taken):
+
+| item | test (suite line) | shapes / what | tags, est |
+|---|---|---|---|
+| #14 DP average | test_grad_ar (+ ~2gpu) | `dp_grad_avg` vs the host mean, byte for byte: 40 M + 12345 floats, 16 M-float chunks (2 + an odd tail) and 1000003-float chunks (41), 2 and 3 replicas (1 / 3), avg off (--split); every replica after the broadcast | gpu 8 s; gpu2 8 s |
+| #15 attention | test_attn_ray~try6 | block C 288, 6 heads, F 768, 216 tokens, scroll RoPE, core 1 vs the double reference (forward all, 10 gradient tensors by central differences, threaded) | gpu 8 s |
+| #15 unet stage | test_unet~ATTN_PE=3 | the attention stage in the tiny net's finite-difference check (UFSM_TINY=4,6,96, scroll axis records, fp32 core), 48 extra points in the stage | gpu 4 s |
+| #16 latent head | test_lat, test_lat_fuse | the streamed chunks and the fused gradient pass at 160 cells / base 32 / 23 upsampled / 32 fp32 rows, fused [2, 9) + chain [0, 2) + [9, 23), gscale 1024 at training-size gradients; the fp16 dead zone (zero where fp32 is not) printed, not asserted | gpu, +1 s |
+| #17 Muon tc 2 | test_muonx | 448 x 12096, 448 x 19872, 864 x 288, 1536 x 288, 288 x 768 (+ 288 x 288): TF32 vs fp32 over 3 steps, O O^T ~ I | gpu 5 s |
+| #18 | test_unwrap_targets, test_sumsq (new), test_ink_mil, test_head_tc, test_ink_splat, test_band_pair, test_univ2 | per-slab targets == whole; nn_sumsq at 100 M with inf / NaN (non-finite: train skips), nn_ema; MIL into a prefilled fp16 gradient at scale 1024; head bwd-data 256 -> 144; a visible GPU that does nothing fails; test_univ2 skips on one GPU | gpu |
+
+Production change: train.c's chunked peer all-reduce moved verbatim into `dp_grad_avg` (src/split.c): the same calls (nn_peer_copy into
+gpeer, nn_axpy, nn_scale by 1.f / ng unless split, peer copy back) in the same order on the same stream, so the bytes are unchanged.
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the

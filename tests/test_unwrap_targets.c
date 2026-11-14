@@ -97,6 +97,30 @@ int main(void) {
     CHECK(bad == 0, "radial: %zu voxels with an unknown stencil sample are in the mask", bad);
     CHECK(e < 0.04, "radial: max target error %.4f", e);
     printf("radial: %zu voxels, max target error %.4f\n", cnt, e);
+    {   /* nn_unwrap_targets2_z (train's head slabs: planes [z0, z1) into slab-sized planes, the stencil reading the whole phase) == the whole
+           window's call, byte for byte, targets and mask, slab heights 1 (40 slabs), 7 and 16 (tails of 5 and 8 planes); on the radial field
+           with its unknown slab, density code 1 and the packed weight on (every argument of the kernel live) */
+        g_code = 1; g_um = 0.5f; g_pum = 120.f; g_pw = 8.f;
+        uint8_t *dp = nn_malloc(n), *dt = nn_malloc(7 * n), *dm = nn_malloc(n), *ts = malloc(7 * n), *ms = malloc(n), *junk = malloc(7 * n); memset(junk, 0xa5, 7 * n);
+        nn_h2d(dp, ph, n); nn_unwrap_targets2(dp, D, H, W, s, g_ds, g_code, g_um, g_pum, g_pw, dt, dm); nn_sync(); nn_d2h(t, dt, 7 * n); nn_d2h(m, dm, n);
+        const size_t hw = (size_t)H * W; size_t nm = 0; for (size_t i = 0; i < n; i++) nm += m[i] != 0;
+        static const int Zs[3] = {1, 7, 16};
+        for (int zi = 0; zi < 3; zi++) {
+            size_t dt_ = 0, dm_ = 0; int ns_ = 0;
+            for (int z0 = 0; z0 < D; z0 += Zs[zi], ns_++) {
+                const int z1 = z0 + Zs[zi] < D ? z0 + Zs[zi] : D; const size_t sn = (size_t)(z1 - z0) * hw;
+                nn_h2d(dt, junk, 7 * n); nn_h2d(dm, junk, n);   /* (stale bytes: every slab plane must be written) */
+                nn_unwrap_targets2_z(dp, D, H, W, s, g_ds, g_code, g_um, g_pum, g_pw, dt, dm, z0, z1); nn_sync();
+                nn_d2h(ts, dt, 7 * sn); nn_d2h(ms, dm, sn);
+                for (int c = 0; c < 7; c++) for (size_t k = 0; k < sn; k++) dt_ += ts[c * sn + k] != t[c * n + (size_t)z0 * hw + k];
+                for (size_t k = 0; k < sn; k++) dm_ += ms[k] != m[(size_t)z0 * hw + k];
+            }
+            printf("unwrap_targets2_z: %d slabs of %d planes vs the whole window: %zu target bytes and %zu mask bytes differ (%zu masked voxels)\n", ns_, Zs[zi], dt_, dm_, nm);
+            CHECK(dt_ == 0 && dm_ == 0 && nm > 0, "unwrap_targets2_z, slabs of %d: %zu target / %zu mask bytes differ from the whole-window call", Zs[zi], dt_, dm_);
+        }
+        g_code = 0; g_pw = 0.f;
+        nn_free(dp); nn_free(dt); nn_free(dm); free(ts); free(ms); free(junk);
+    }
     free(ph); free(t); free(m);
     {   /* nn_count_loss (train --count-lambda) on a planar phase of 0.0436 turns per voxel (64^3), segments of 32 voxels: density logits
            log(c rho dscale) predict c rho (the x / (1 + x) code): c = 1 gives a turns ratio ~1 and loss ~0; c = 0.5 a ratio ~0.5,
