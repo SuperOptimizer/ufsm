@@ -721,6 +721,10 @@ void nn_packed_mask_z(const uint8_t *phase, int d, int h, int w, int s, float um
 void nn_fib_dir_targets(const uint8_t *t, const uint8_t *m, int d, int h, int w, int r, float cmin, uint8_t *o, uint8_t *om);
 /* train --fib-head: fib_dir targets of window planes [z0, z0 + nz) from the H / V tube planes (prob254, 255 unknown; window-indexed, +-r halo planes present) */
 void nn_fib_head_dir(const uint8_t *fh, const uint8_t *fv, int d, int h, int w, int z0, int nz, int r, float cmin, uint8_t *o, uint8_t *om);
+/* the head slab's phase-derived targets in one kernel, byte-identical to nn_phase_targets (t2, m2) + nn_rv_targets (rvt, rvm; rvt null: none) +
+   nn_packed_mask_z on rvm (packed_w > 1) + nn_rv_verso_w (vw != 1) + nn_packed_mask_z on m2 + nn_unwrap_targets2_z (t7, m7) for planes [z0, z1) */
+void nn_slab_targets(const uint8_t *phase, const uint8_t *pap, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, float vw,
+                     uint8_t *t2, uint8_t *m2, uint8_t *rvt, uint8_t *rvm, uint8_t *t7, uint8_t *m7, int z0, int z1);
 void nn_unwrap_targets2_z(const uint8_t *phase, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, uint8_t *t, uint8_t *m,
                           int z0, int z1);   /* planes [z0, z1) of the window into planes of (z1 - z0) h w */
 /* train --count-lambda: K segments of L voxels along the ground-truth phase gradient; loss |log((sum rho_pred + .05) / (true turns + .05))|

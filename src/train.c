@@ -1455,9 +1455,13 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (!fsd && g_fstem && !d->fs_drop && nn_fstem_fwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns)) { fprintf(stderr, "--fstem: slab shape\n"); abort(); }
         if (g_fstem) FT("  u fine stem fwd");
         const shape5 one = {1, 1, nz, H, W}, two = {1, 2, nz, H, W}, seven = {1, 7, nz, H, W};
-        if (!tskip) nn_phase_targets(sdb + vb, ns, d->sidet, d->sidem);
+        static int tgf_on = -1; if (tgf_on < 0) tgf_on = !getenv("UFSM_SLAB_TG") || ufsm_env_on("UFSM_SLAB_TG");   /* (UFSM_SLAB_TG=0: the five kernels) */
+        const int tgf = tgf_on && !tskip && !g_ptrunc_on && !pdir && (!g_rv || pap);   /* the phase-derived targets in one kernel (nn_slab_targets, byte-identical) */
+        if (tgf) nn_slab_targets(sdb, g_rv ? pap : nullptr, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, g_rv ? g_rv_vw : 1.f,
+                                 d->sidet, d->sidem, g_rv ? d->rvt : nullptr, d->rvm, d->nt, d->nm, z0, z1);
+        else if (!tskip) nn_phase_targets(sdb + vb, ns, d->sidet, d->sidem);
         FT("  t phase targets");
-        if (g_rv && !tskip) {   /* --rv: the side slot's targets (the phase targets above stay for the winding mod 4 / gradient terms) */
+        if (g_rv && !tskip && !tgf) {   /* --rv: the side slot's targets (the phase targets above stay for the winding mod 4 / gradient terms) */
             if (pdir) nn_rv_targets_p2(sdb + vb, d->ldev[pkk], vb, ns, d->rvt, d->rvm); else nn_rv_targets(sdb + vb, pap + vb, ns, d->rvt, d->rvm);
             FT("  t rv targets");
             if (g_packed_w > 1) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->rvm, z0, z1);   /* packed sheets weigh more */
@@ -1475,9 +1479,9 @@ static void head_slab_pass(gpu_state *d, int pass) {
             free(h); free(ph); free(pp);
         }
         if (g_ptrunc_on && !tskip) nn_phase_trunc(LGC(g_side_ch), LGC(g_side_ch + 1), d->sidet, d->sidem, ns, g_ptrunc_tau, g_ptrunc_kappa);   /* robust phase loss (both passes: the same mask) */
-        if (g_packed_w > 1 && !tskip) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem, z0, z1);   /* packed sheets weigh more */
+        if (g_packed_w > 1 && !tskip && !tgf) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem, z0, z1);   /* packed sheets weigh more */
         FT("  t packed mask (side)");
-        if (!tskip) nn_unwrap_targets2_z(sdb, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1); FT("  t normal targets");
+        if (!tskip && !tgf) nn_unwrap_targets2_z(sdb, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1); FT("  t normal targets");
         if (tchk) {   /* the planes just built in the one-slab buffers against the cache's, then on with the cache as a training step would */
             const size_t nb[6] = {(size_t)g_side_nc * ns, ns, g_rv ? 2 * ns : 0, g_rv ? ns : 0, 7 * ns, ns}; static const char *const nm6[6] = {"phase targets", "phase mask", "rv targets", "rv mask", "normal targets", "normal mask"};
             nn_sync();

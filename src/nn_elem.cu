@@ -890,6 +890,45 @@ extern "C" void nn_packed_mask_z(const uint8_t *phase, int d, int h, int w, int 
     const size_t hw = (size_t)h * w, n = (size_t)(z1 - z0) * hw;
     packed_mask_k<<<nblk(n, 256), 256>>>(phase, d, h, w, s, um, packed_um, packed_w, m, (size_t)z0 * hw, n); KCHECK();
 }
+/* the head slab's phase-derived targets in one pass (train head slabs, nn_slab_targets): per voxel nn_phase_targets (t2 / m2), with rvt
+   nn_rv_targets (+ nn_packed_mask_z on rvm, + nn_rv_verso_w when vw != 1), nn_packed_mask_z on m2, nn_unwrap_targets2_z (t7 / m7) from
+   one phase-gradient stencil (each of those kernels read it for itself: 3 stencils and 5 launches a slab, ~60 of 3592 ms a P 768 step);
+   the same functions, the same bytes. i0: the slab's first window voxel (ph / pap whole-window planes) */
+__global__ void slab_tg_k(const uint8_t *ph, const uint8_t *pap, int D, int H, int W, int s, float dscale, int code, float um, float packed_um, float packed_w,
+                          float vw, uint8_t *t2, uint8_t *m2, uint8_t *rvt, uint8_t *rvm, uint8_t *t7, uint8_t *m7, size_t i0, size_t n) {
+    const size_t li = blockIdx.x * (size_t)blockDim.x + threadIdx.x, i = i0 + li;
+    if (li >= n) return;
+    const uint8_t v = ph[i];
+    uint8_t pm;
+    if (v >= 252) { t2[li] = t2[n + li] = 0; pm = 0; }
+    else { float sn, cs; sincospif((float)v / 126.f, &sn, &cs); t2[li] = (uint8_t)__float2int_rn(127.5f + 127.5f * cs); t2[n + li] = (uint8_t)__float2int_rn(127.5f + 127.5f * sn); pm = 1; }
+    uint8_t rt0 = 0, rt1 = 0, rm = 0;
+    if (rvt) {
+        const uint8_t p = pap[i];
+        if (p == 255) rm = 0; else if (p < 127) rm = 1; else if (v >= 252) rm = 0; else { if (v < 126) rt0 = 255; else rt1 = 255; rm = 1; }
+    }
+    float g[3]; const int ok = phase_grad(ph, i, D, H, W, s, g);
+    const float rho = ok ? sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) : 0.f;
+    if (packed_w > 1.f && ok) { const uint8_t pw = packed_wt(rho, um, packed_um, packed_w); if (pm) pm = pw; if (rm) rm = pw; }
+    if (rvt) {
+        if (vw != 1.f && rm && rt1 == 255) rm = (uint8_t)fminf(255.f, rintf((float)rm * vw));
+        rvt[li] = rt0; rvt[n + li] = rt1; rvm[li] = rm;
+    }
+    m2[li] = pm;
+    uint8_t mm = 0; float c7[7] = {0, 0, 0, 0, 0, 0, 0};
+    if (ok && rho >= 1e-3f) {
+        const float nz = g[0] / rho, ny = g[1] / rho, nx = g[2] / rho, xd = dscale * rho;
+        c7[0] = nz * nz; c7[1] = ny * ny; c7[2] = nx * nx; c7[3] = 0.5f + nz * ny; c7[4] = 0.5f + nz * nx; c7[5] = 0.5f + ny * nx; c7[6] = code ? xd / (1.f + xd) : fminf(1.f, xd);
+        mm = packed_wt(rho, um, packed_um, packed_w);
+        for (int c = 0; c < 7; c++) t7[c * n + li] = (uint8_t)__float2int_rn(255.f * fminf(1.f, fmaxf(0.f, c7[c])));
+    } else for (int c = 0; c < 7; c++) t7[c * n + li] = 0;
+    m7[li] = mm;
+}
+extern "C" void nn_slab_targets(const uint8_t *phase, const uint8_t *pap, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, float vw,
+                                uint8_t *t2, uint8_t *m2, uint8_t *rvt, uint8_t *rvm, uint8_t *t7, uint8_t *m7, int z0, int z1) {
+    const size_t hw = (size_t)h * w, n = (size_t)(z1 - z0) * hw;
+    slab_tg_k<<<nblk(n, 256), 256>>>(phase, pap, d, h, w, s, dscale, code, um, packed_um, packed_w, vw, t2, m2, rvt, rvm, t7, m7, (size_t)z0 * hw, n); KCHECK();
+}
 extern "C" void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n) { fill_unl_k<<<nblk(n, 256), 256>>>(t, m, vm, src, n); KCHECK(); }
 /* diagnostics: non-finite elements of n fp32 / 16-bit values (h16 1 fp16, 2 bf16), added to *cnt (device) */
 __global__ void count_nonfinite_k(const void *p, size_t n, int h16, unsigned long long *cnt) {
