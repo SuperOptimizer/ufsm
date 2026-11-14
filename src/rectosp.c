@@ -9,6 +9,7 @@
    other planes linked to IN's; fields.json copied. --rsp-in DIR: reuse DIR/rsp (only the blend runs). --rows R0,R1: box rows computed (the
    others keep the net sp). The source is on the fields' scan (UM its voxel um; native = fields' um). Arrays: 512^3 shards, lossless. */
 #include "fit.h"
+#include "optcheck.h"
 #include "rectoruler.h"
 #include "sysinfo.h"
 #include "zarr3.h"
@@ -25,7 +26,7 @@
 #include <time.h>
 #include <stdatomic.h>
 
-static const char *rs_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *rs_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static double rs_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 static int rs_cmpf(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
 
@@ -148,7 +149,7 @@ static int rs_link(const char *in, const char *out, const char *name) {
 int cmd_recto_sp(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm recto-sp IN-FIELDS OUT-FIELDS --src ROOT KEY UM [--rows R0,R1] [--stride 4] [--half-um 400] [--prom 25] [--sigma 0.5] [--sep-um 20]\n"
                                     "       [--blend 1] [--gate 0.4,2.5] [--min-int 3] [--rsp-in DIR] [--threads N] [--cache DIR]\n"); return 2; }
-    const char *in = argv[2], *out = argv[3]; const int nt = ufsm_threads(atoi(rs_opt(argc, argv, "--threads", "0")), 16);
+    const char *in = argv[2], *out = argv[3]; const int nt = ufsm_threads(opt_atoi("--threads", rs_opt(argc, argv, "--threads", "0")), 16);
     fit_set_threads(nt);
     char path[4096]; snprintf(path, sizeof path, "%s/fields.json", in);
     FILE *fj = fopen(path, "rb"); if (!fj) { fprintf(stderr, "recto-sp: cannot read %s\n", path); return 1; }
@@ -163,15 +164,15 @@ int cmd_recto_sp(int argc, char **argv) {
     z3 *zsp = z3_open(store_open(in), "sp", nullptr); if (!zsp) { fprintf(stderr, "recto-sp: %s\n", z3_error()); return 1; }
     const int64_t *ash = z3_meta_of(zsp)->shape;
     int R0 = 0, R1 = shp[0]; { const char *r = rs_opt(argc, argv, "--rows", nullptr); if (r && sscanf(r, "%d,%d", &R0, &R1) != 2) { fprintf(stderr, "recto-sp: --rows R0,R1\n"); return 2; } if (R0 < 0) R0 = 0; if (R1 > shp[0]) R1 = shp[0]; }
-    double blend = atof(rs_opt(argc, argv, "--blend", "1")), glo = 0.4, ghi = 2.5; sscanf(rs_opt(argc, argv, "--gate", "0.4,2.5"), "%lf,%lf", &glo, &ghi);
-    const char *rspin = rs_opt(argc, argv, "--rsp-in", nullptr); const double minnet = atof(rs_opt(argc, argv, "--min-net-um", "0"));
+    double blend = opt_atof("--blend", rs_opt(argc, argv, "--blend", "1")), glo = 0.4, ghi = 2.5; sscanf(rs_opt(argc, argv, "--gate", "0.4,2.5"), "%lf,%lf", &glo, &ghi);
+    const char *rspin = rs_opt(argc, argv, "--rsp-in", nullptr); const double minnet = opt_atof("--min-net-um", rs_opt(argc, argv, "--min-net-um", "0"));
     double rlo = 0, rhi = 0, ra0 = 0, ra1 = 0; const int ramp = sscanf(rs_opt(argc, argv, "--blend-ramp", ""), "%lf,%lf,%lf,%lf", &rlo, &rhi, &ra0, &ra1) == 4 && rhi > rlo;
     z3 *zrin = nullptr; if (rspin && !(zrin = z3_open(store_open(rspin), "rsp", nullptr))) { fprintf(stderr, "recto-sp: --rsp-in: %s\n", z3_error()); return 1; }
     z3 *zs = nullptr; double sum = 0, F = 1; const char *cache = rs_opt(argc, argv, "--cache", nullptr);
-    if (!zrin) { for (int i = 4; i + 3 < argc; i++) if (!strcmp(argv[i], "--src")) { if (!(zs = z3_open(store_open(argv[i + 1]), argv[i + 2], cache))) { fprintf(stderr, "recto-sp: --src: %s\n", z3_error()); return 1; } sum = atof(argv[i + 3]); }
+    if (!zrin) { for (int i = 4; i + 3 < argc; i++) if (!strcmp(argv[i], opt_n("--src"))) { if (!(zs = z3_open(store_open(argv[i + 1]), argv[i + 2], cache))) { fprintf(stderr, "recto-sp: --src: %s\n", z3_error()); return 1; } sum = atof(argv[i + 3]); }
                  if (!zs || !(sum > 0)) { fprintf(stderr, "recto-sp: --src ROOT KEY UM (or --rsp-in DIR)\n"); return 2; } F = um / sum; }
     rr_cls *cls = nullptr; { const char *cp = rs_opt(argc, argv, "--cls", nullptr); if (cp && !(cls = rr_cls_load(cp))) { fprintf(stderr, "recto-sp: cannot load --cls %s\n", cp); return 1; } }
-    const int S = atoi(rs_opt(argc, argv, "--stride", "4")); const double half = atof(rs_opt(argc, argv, "--half-um", "400")), half2 = atof(rs_opt(argc, argv, "--half2-um", "0"));
+    const int S = opt_atoi("--stride", rs_opt(argc, argv, "--stride", "4")); const double half = opt_atof("--half-um", rs_opt(argc, argv, "--half-um", "400")), half2 = opt_atof("--half2-um", rs_opt(argc, argv, "--half2-um", "0"));
     const int SH = 512;
     char attrs[256]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"winding fitter fields (src/fit.h)\",\"h\":%d,\"recto_sp\":1}}", h);
     snprintf(path, sizeof path, "%s/sp", out); char sl[4096]; snprintf(sl, sizeof sl, "%s/sp", out); unlink(sl);
@@ -195,7 +196,7 @@ int cmd_recto_sp(int argc, char **argv) {
             fit_fields_buf fb; if (fit_fields_load(in, l0, l1, 1, &fb)) { fprintf(stderr, "recto-sp: cannot load field rows %d..%d\n", l0, l1); return 1; }
             /* source block: native z [org + a0 h - half, org + a1 h + half], the box's y / x +- half */
             const double hm = fmax(half, half2) / um + 2; rs_job J = {.b = &fb, .r0 = a0 - l0, .nr = a1 - a0, .F = F, .org = {org[0] + (long long)l0 * h, org[1], org[2]}, .cls = cls, .h = h, .S = S, .um = um, .half = fmax(half, half2), .half1 = half2 > half ? half : 0,
-                .prom = atof(rs_opt(argc, argv, "--prom", "25")), .sigma = atof(rs_opt(argc, argv, "--sigma", "0.5")), .sep = atof(rs_opt(argc, argv, "--sep-um", "20")), .minint = atoi(rs_opt(argc, argv, "--min-int", "3")), .H = H, .W = W};
+                .prom = opt_atof("--prom", rs_opt(argc, argv, "--prom", "25")), .sigma = opt_atof("--sigma", rs_opt(argc, argv, "--sigma", "0.5")), .sep = opt_atof("--sep-um", rs_opt(argc, argv, "--sep-um", "20")), .minint = opt_atoi("--min-int", rs_opt(argc, argv, "--min-int", "3")), .H = H, .W = W};
             const int64_t *ssh = z3_meta_of(zs)->shape; const double za0 = org[0] + (double)a0 * h; const double lo[3] = {za0 - hm, org[1] - hm, org[2] - hm}, hi[3] = {za0 + (a1 - a0) * h + hm, org[1] + (double)H * h + hm, org[2] + (double)W * h + hm};
             for (int d = 0; d < 3; d++) { int64_t s0 = (int64_t)floor(lo[d] * F) - 1, s1 = (int64_t)ceil(hi[d] * F) + 2; if (s0 < 0) s0 = 0; if (s1 > ssh[d]) s1 = ssh[d]; J.so[d] = s0; J.sn[d] = s1 - s0; }
             uint8_t *sb = malloc((size_t)J.sn[0] * J.sn[1] * J.sn[2]); if (!sb) { fprintf(stderr, "recto-sp: out of memory\n"); return 1; }

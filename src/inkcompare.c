@@ -10,6 +10,7 @@
      rings of horizontally resampled rows (pil_hrow, then the same fixed-point vertical sum as pil_vrow); the panels' contrast is a
      256-entry table per input (the CT's stretch maps 0 to 0, i.e. CT == 0 is the mask), the labels drawn per row with the same font. */
 #include "imgops.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "tiff.h"
 #include <math.h>
@@ -24,11 +25,11 @@
 int ink_compare_mem(int argc, char **argv);   /* render.c */
 
 static const char *icopt(int argc, char **argv, const char *name, const char *def) {
-    for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return def;
 }
-static int icflag(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], name)) return 1; return 0; }
-static int icarg(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], name)) return i; return -1; }
+static int icflag(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], opt_n(name))) return 1; return 0; }
+static int icarg(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], opt_n(name))) return i; return -1; }
 
 /* matplotlib viridis (256 entries, round(255 x the float table)) */
 static const uint8_t VIRIDIS[256][3] = {
@@ -401,9 +402,9 @@ int cmd_ink_compare(int argc, char **argv) {
     const int ci = icarg(argc, argv, "--ct");
     if (argc < 5 || ci < 0 || ci + 1 >= argc || icarg(argc, argv, "--ink") < 0 || icarg(argc, argv, "--best-crop") >= 0 || icarg(argc, argv, "--mask") >= 0 || getenv("UFSM_INKCMP_MEM"))
         return ink_compare_mem(argc, argv);
-    const double px = atof(icopt(argc, argv, "--px-um", "2.4")), rsu = atof(icopt(argc, argv, "--rs-um", "25")), rlu = atof(icopt(argc, argv, "--rl-um", "500"));
+    const double px = opt_atof("--px-um", icopt(argc, argv, "--px-um", "2.4")), rsu = opt_atof("--rs-um", icopt(argc, argv, "--rs-um", "25")), rlu = opt_atof("--rl-um", icopt(argc, argv, "--rl-um", "500"));
     if (!(px > 0) || !(rsu > 0) || !(rlu > rsu)) { fprintf(stderr, "ink-compare: need --px-um > 0 and 0 < --rs-um < --rl-um\n"); return 2; }
-    icx X; memset(&X, 0, sizeof X); X.nth = ufsm_threads(atoi(icopt(argc, argv, "--threads", "0")), 16);
+    icx X; memset(&X, 0, sizeof X); X.nth = ufsm_threads(opt_atoi("--threads", icopt(argc, argv, "--threads", "0")), 16);
     const char *lab[NIMG] = {"ct"}; int rc = 0;
     /* the inputs: strip TIFFs of one size and strip height, else the in-memory version */
     {
@@ -412,7 +413,7 @@ int cmd_ink_compare(int argc, char **argv) {
         if (!X.t[0] || tiff_page_info(X.t[0], 0, &pg) || pg.bits != 8 || pg.spp != 1 || tiff_strip_rows(X.t[0], 0, &rps, &ns)) { if (X.t[0]) tiff_close(X.t[0]); return ink_compare_mem(argc, argv); }
         X.IW = pg.w; X.IH = pg.h; X.rps = rps; X.ns = ns; X.n = 1;
         for (int a = 2; a + 1 < argc; a++) {
-            if (strcmp(argv[a], "--ink")) continue;
+            if (strcmp(argv[a], opt_n("--ink"))) continue;
             const char *eq = strchr(argv[a + 1], '=');
             if (!eq || X.n > MAXI) { fprintf(stderr, "ink-compare: --ink LABEL=PATH (at most %d)\n", MAXI); rc = 2; goto end; }
             tiff *t = tiff_open_lazy(eq + 1); tiff_page q;
@@ -508,7 +509,7 @@ int cmd_ink_compare(int argc, char **argv) {
        in memory (img_fit_rgb: the bytes of the streamed fit). */
     {
         int seg[64], nseg = 0; seg[nseg++] = 1;
-        for (int a = 2; a < argc && nseg < 64; a++) if (!strcmp(argv[a], "--then")) { if (a + 1 >= argc) { fprintf(stderr, "ink-compare: --then OUT [options]\n"); rc = 2; goto end; } seg[nseg++] = a; }
+        for (int a = 2; a < argc && nseg < 64; a++) if (!strcmp(argv[a], opt_n("--then"))) { if (a + 1 >= argc) { fprintf(stderr, "ink-compare: --then OUT [options]\n"); rc = 2; goto end; } seg[nseg++] = a; }
         char **sv = malloc((size_t)(argc + 2) * sizeof *sv); if (!sv) { rc = 1; goto end; }
         char ckey[512] = ""; uint8_t *cimg = nullptr; int cw = 0, chh = 0;   /* the last unfitted panel image and its key */
         for (int j = 0; j < nseg && !rc; j++) {
@@ -517,10 +518,10 @@ int cmd_ink_compare(int argc, char **argv) {
             sv[sc++] = argv[0]; sv[sc++] = argv[1]; for (int a = s0; a < s1; a++) sv[sc++] = argv[a]; sv[sc] = nullptr;
             const char *out = sv[2];
             const char *each = icopt(sc, sv, "--each", nullptr);
-            const int maxpx = atoi(icopt(sc, sv, "--max-px", "0")), jq = atoi(icopt(sc, sv, "--quality", "90")), half = !icflag(sc, sv, "--full");
+            const int maxpx = opt_atoi("--max-px", icopt(sc, sv, "--max-px", "0")), jq = opt_atoi("--quality", icopt(sc, sv, "--quality", "90")), half = !icflag(sc, sv, "--full");
             const char *cm = icopt(sc, sv, "--cmap", nullptr);
             if (cm && strcmp(cm, "viridis")) { fprintf(stderr, "ink-compare: --cmap viridis (the only map)\n"); rc = 2; break; }
-            g_cmap = cm != nullptr; g_cmap_ctmin = atoi(icopt(sc, sv, "--rgb-ct-min", "1"));
+            g_cmap = cm != nullptr; g_cmap_ctmin = opt_atoi("--rgb-ct-min", icopt(sc, sv, "--rgb-ct-min", "1"));
             const int f0 = icflag(sc, sv, "--no-ct") && n > 1 ? 1 : 0;   /* --no-ct: ink panels only */
             /* the jobs of this segment: (first panel, panels, rgb pair or none, title, output) */
             enum { MJ = NIMG }; int jfirst[MJ], jnp[MJ], jrgb[MJ][2], nj = 0, jct = 0; const char *const *jlab[MJ]; char jout[MJ][1400], title[300] = ""; const char *tl[1] = {title};
@@ -532,18 +533,18 @@ int cmd_ink_compare(int argc, char **argv) {
                 const char *li = icopt(sc, sv, "--papyrus", ""); int ix = -1;
                 for (int k = 1; k < n; k++) if (!strcmp(lab[k], li)) ix = k;
                 if (ix < 0) { fprintf(stderr, "ink-compare: --papyrus INK (an --ink label)\n"); rc = 2; break; }
-                g_pap = 1; g_pap_gain = (float)atof(icopt(sc, sv, "--papyrus-gain", "1"));
+                g_pap = 1; g_pap_gain = (float)opt_atof("--papyrus-gain", icopt(sc, sv, "--papyrus-gain", "1"));
                 const char *fl = icopt(sc, sv, "--papyrus-floor", "0");   /* median: CT below the median raised to it; else stretched CT units */
                 g_pap_floor = !strcmp(fl, "median") ? lut[0][g_ct_median] : atoi(fl);
                 const char *bg = icopt(sc, sv, "--papyrus-bg", "-1");   /* off-papyrus: neutral grey 0..255, "median": the ramp at the CT median, -1: the ramp at the floor */
                 if (!strcmp(bg, "median")) g_pap_bgv = lut[0][g_ct_median]; else g_pap_bg = atoi(bg);
                 title[0] = 0;
                 snprintf(jout[0], sizeof jout[0], "%s", out); jfirst[0] = 0; jnp[0] = 1; jrgb[0][0] = ix; jrgb[0][1] = ix; jlab[0] = nullptr; nj = 1;
-                jct = atoi(icopt(sc, sv, "--rgb-ct-min", "1"));
+                jct = opt_atoi("--rgb-ct-min", icopt(sc, sv, "--rgb-ct-min", "1"));
             } else if (icopt(sc, sv, "--rgb-agree", nullptr) || icopt(sc, sv, "--diff-agree", nullptr)) {   /* one panel: recto R + B (magenta), verso G, agreement white; --diff-agree: viridis |recto - verso| */
                 const char *pair = icopt(sc, sv, "--diff-agree", nullptr); g_diff = pair != nullptr;
                 if (!pair) pair = icopt(sc, sv, "--rgb-agree", "");
-                g_diff_gain = (float)atof(icopt(sc, sv, "--diff-gain", "1"));
+                g_diff_gain = (float)opt_atof("--diff-gain", icopt(sc, sv, "--diff-gain", "1"));
                 char la[128] = "", lb[128] = ""; int ix[2] = {-1, -1};
                 if (sscanf(pair, "%127[^,],%127s", la, lb) == 2)
                     for (int k = 1; k < n; k++) { if (!strcmp(lab[k], la)) ix[0] = k; if (!strcmp(lab[k], lb)) ix[1] = k; }
@@ -551,7 +552,7 @@ int cmd_ink_compare(int argc, char **argv) {
                 if (g_diff) snprintf(title, sizeof title, "|%s-%s| viridis 0=agree 255=disagree%s", la, lb, g_diff_gain != 1.f ? " (gain)" : "");
                 else snprintf(title, sizeof title, "%s=magenta %s=green both=white", la, lb);
                 snprintf(jout[0], sizeof jout[0], "%s", out); jfirst[0] = 0; jnp[0] = 1; jrgb[0][0] = ix[0]; jrgb[0][1] = ix[1]; jlab[0] = tl; nj = 1;
-                jct = atoi(icopt(sc, sv, "--rgb-ct-min", "1"));
+                jct = opt_atoi("--rgb-ct-min", icopt(sc, sv, "--rgb-ct-min", "1"));
             } else { snprintf(jout[0], sizeof jout[0], "%s", out); jfirst[0] = f0; jnp[0] = n - f0; jrgb[0][0] = -1; jlab[0] = lab + f0; nj = 1; }
             for (int q = 0; q < nj && !rc; q++) {
                 char key[512]; snprintf(key, sizeof key, "%d %d %d %d %d %d %d %d %.9g %d %.9g %d %d %d %s", jfirst[q], jnp[q], jrgb[q][0], jrgb[q][1], jct, g_cmap, g_cmap_ctmin, g_diff, (double)g_diff_gain, g_pap, (double)g_pap_gain, g_pap_floor, g_pap_bg * 1000 + g_pap_bgv, half, jlab[q] == tl ? title : jlab[q] ? "lab" : "-");
@@ -584,8 +585,8 @@ end:
    aspect kept) by D per side or to a longest side of N; OUT may be IN (written beside it, then renamed). Already small enough: copied. */
 int cmd_jpeg_fit(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm jpeg-fit IN.jpg OUT.jpg [--div 2 | --max-px N] [--quality 90] [--threads 16]\n"); return 2; }
-    const double div = atof(icopt(argc, argv, "--div", "0")); int maxpx = atoi(icopt(argc, argv, "--max-px", "0"));
-    const int q = atoi(icopt(argc, argv, "--quality", "90")), th = ufsm_threads(atoi(icopt(argc, argv, "--threads", "0")), 16);
+    const double div = opt_atof("--div", icopt(argc, argv, "--div", "0")); int maxpx = opt_atoi("--max-px", icopt(argc, argv, "--max-px", "0"));
+    const int q = opt_atoi("--quality", icopt(argc, argv, "--quality", "90")), th = ufsm_threads(opt_atoi("--threads", icopt(argc, argv, "--threads", "0")), 16);
     if ((div > 0) == (maxpx > 0)) { fprintf(stderr, "jpeg-fit: one of --div D (> 0) or --max-px N\n"); return 2; }
     int w, h; uint8_t *rgb = jpeg_read_rgb(argv[2], &w, &h);
     if (!rgb) { fprintf(stderr, "jpeg-fit: cannot read %s\n", argv[2]); return 1; }

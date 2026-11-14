@@ -8,6 +8,7 @@
    and leave-one-segment-out linear discriminants: LDA on the energies x 5 depth bins (15 features) and on the 3 energies at the sheet
    band, against the best single (channel, depth bin) feature chosen on the training segments, all scored by AUC on the held-out one. */
 #include "json.h"
+#include "optcheck.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <math.h>
@@ -186,8 +187,8 @@ static int rk_cmp(const void *x, const void *y) { const double a = ((const rk *)
 int cmd_reg_inkstat(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm reg inkstat <render-dir>... [-o out.json] [--all (uncertified samples too)]\n"); return 2; }
     const char *out = nullptr; int ng = 0; iseg *G = calloc(argc, sizeof *G);
-    for (int i = 3; i < argc; i++) if (!strcmp(argv[i], "--all")) g_all = 1;
-    for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], "--all")) continue; if (!strcmp(argv[i], "-o") && i + 1 < argc) { out = argv[++i]; continue; } if (!seg_load(&G[ng], argv[i])) ng++; }
+    for (int i = 3; i < argc; i++) if (!strcmp(argv[i], opt_n("--all"))) g_all = 1;
+    for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], opt_n("--all"))) continue; if (!strcmp(argv[i], "-o") && i + 1 < argc) { out = argv[++i]; continue; } if (!seg_load(&G[ng], argv[i])) ng++; }
     if (!ng) return 1;
     /* channels from the first dir's config */
     char p[1200]; snprintf(p, sizeof p, "%s/config.json", G[0].dir); size_t n; char *t = slurp(p, &n); json *cfg = t ? json_parse(t, n) : nullptr; free(t);

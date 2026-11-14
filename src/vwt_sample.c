@@ -14,6 +14,7 @@
    < 64 voxels dropped; negated on inward rays so ph rises along +k; comp ids from 1 (uint16, 0 none). pw = 1 on comp, 0 in the tubes.
    A slab with < 1% labelled voxels is redrawn (up to 16 times). */
 #include "vwt.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "vwt_aug.h"
 #include "zcache.h"
@@ -50,9 +51,9 @@ struct vws {
 static vwa_cfg g_vwa; static int g_vwa_ok;
 static double g_mv_p = 0, g_mv_cone = 30, g_mv_shift = 16;   /* multiview pairs (vwt.h vws_sample.has_pair) */
 void vws_set_args(int argc, char **argv) {
-    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], "--mv-p")) { g_mv_p = atof(argv[i + 1]); break; }
-    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], "--mv-cone")) { g_mv_cone = atof(argv[i + 1]); break; }
-    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], "--mv-shift")) { g_mv_shift = atof(argv[i + 1]); break; }
+    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], opt_n("--mv-p"))) { g_mv_p = opt_atof(argv[i], argv[i + 1]); break; }
+    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], opt_n("--mv-cone"))) { g_mv_cone = opt_atof(argv[i], argv[i + 1]); break; }
+    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], opt_n("--mv-shift"))) { g_mv_shift = opt_atof(argv[i], argv[i + 1]); break; }
     if (g_mv_p > 0) fprintf(stderr, "vws: multiview pairs p %.2f, cone %.0f deg, centre shift <= %.0f voxels\n", g_mv_p, g_mv_cone, g_mv_shift);
     g_vwa = vwa_cfg_default();
     if (vwa_cfg_parse(&g_vwa, argc, argv)) exit(2);
@@ -555,16 +556,16 @@ void vws_close(vws *V) {
 
 /* ufsm vwt-sample SOURCES OUT N [--T 128] [--L 384] [--tilt 15] [--threads 8] [--seed 1] [--val 0]: N slabs -> OUT/sNNN.{im,va,comp}.u8|u16 raw,
    .ph.f32, .pw.f32 + OUT/meta.tsv; prints the throughput (slabs / s) */
-static const char *vo(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *vo(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 #include <time.h>
 #include <sys/stat.h>
 int cmd_vwt_sample(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm vwt-sample SOURCES OUT N [--T 128] [--L 384] [--tilt 15] [--threads 8] [--seed 1] [--val 0] [--write 1] [--jpg 0]\n"
                                     "       [--vaug 1 ... (any vwt-train aug flag: the training augmentation, src/vwt_aug.h)]\n"); return 2; }
-    for (int i = 5; i < argc; i++) if (!strncmp(argv[i], "--vaug", 6) || !strncmp(argv[i], "--deform", 8) || !strncmp(argv[i], "--aug-crush", 11)) { vws_set_args(argc, argv); break; }
-    const int jpg = atoi(vo(argc, argv, "--jpg", "0"));
-    const int T = atoi(vo(argc, argv, "--T", "128")), L = atoi(vo(argc, argv, "--L", "384")), N = atoi(argv[4]), wr = atoi(vo(argc, argv, "--write", "1"));
-    vws *V = vws_open(argv[2], T, L, (float)atof(vo(argc, argv, "--tilt", "15")), ufsm_threads(atoi(vo(argc, argv, "--threads", "0")), 8), (unsigned)atoi(vo(argc, argv, "--seed", "1")), !atoi(vo(argc, argv, "--val", "0")));
+    for (int i = 5; i < argc; i++) if (!strncmp(argv[i], opt_p("--vaug"), 6) || !strncmp(argv[i], opt_p("--deform"), 8) || !strncmp(argv[i], opt_p("--aug-crush"), 11)) { vws_set_args(argc, argv); break; }
+    const int jpg = opt_atoi("--jpg", vo(argc, argv, "--jpg", "0"));
+    const int T = opt_atoi("--T", vo(argc, argv, "--T", "128")), L = opt_atoi("--L", vo(argc, argv, "--L", "384")), N = atoi(argv[4]), wr = opt_atoi("--write", vo(argc, argv, "--write", "1"));
+    vws *V = vws_open(argv[2], T, L, (float)opt_atof("--tilt", vo(argc, argv, "--tilt", "15")), ufsm_threads(opt_atoi("--threads", vo(argc, argv, "--threads", "0")), 8), (unsigned)opt_atoi("--seed", vo(argc, argv, "--seed", "1")), !opt_atoi("--val", vo(argc, argv, "--val", "0")));
     if (!V) return 1;
     mkdir(argv[3], 0775); char p[1400]; snprintf(p, sizeof p, "%s/meta.tsv", argv[3]); FILE *m = fopen(p, "w");
     if (m) fprintf(m, "i\tsrc\tinward\to_x\to_y\to_z\td_x\td_y\td_z\tlabelled\tweighted\tcomps\tph_rise\tshell\n");

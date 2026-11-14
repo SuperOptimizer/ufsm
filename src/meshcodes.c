@@ -3,6 +3,7 @@
    order, same sampling density (0.5 voxel along both quad edges at the target level, capped at 256). tests/test_codes_onfly.sh holds the
    two byte-identical. */
 #include "meshcodes.h"
+#include "optcheck.h"
 #include "meshcodesgpu.h"
 #include "reg.h"
 #include "store.h"
@@ -304,18 +305,18 @@ z3 *mesh_codes_open(const char *dir, const char *value, const char *mapp, int le
 
 const char *mesh_codes_key(const z3 *z) { const mc_ctx *X = z3_derived_ctx(z); return X ? X->id : nullptr; }
 
-static const char *mc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *mc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 /* ufsm codes-onfly <meshes-dir> --ct ROOT KEY [--level 0] [--value q.tif] [--map reg.json] [--ref ROOT KEY] [--windows 8] [--P 256] [--threads 8]:
    the derived codes over windows drawn on the meshes (random tiles), ms per window, and the byte differences from a stored codes raster
    (`ufsm raster --value` at that level). KEY is the CT array of the level (its meta gives the grid). Exit 1 when a byte differs. */
 int cmd_codes_onfly(int argc, char **argv) {
-    int ci = 0, ri = 0; for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], "--ct") && i + 2 < argc) ci = i; if (!strcmp(argv[i], "--ref") && i + 2 < argc) ri = i; }
+    int ci = 0, ri = 0; for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], opt_n("--ct")) && i + 2 < argc) ci = i; if (!strcmp(argv[i], opt_n("--ref")) && i + 2 < argc) ri = i; }
     if (argc < 3 || !ci) { fprintf(stderr, "usage: ufsm codes-onfly <meshes-dir> --ct ROOT KEY [--level 0] [--value q.tif] [--map reg.json] [--ref ROOT KEY] [--windows 8] [--P 256] [--threads 8] [--back COARSE_ROOT KEY0 [--slice OUT.pgm]]\n"); return 2; }
-    const int level = atoi(mc_opt(argc, argv, "--level", "0")), nw = atoi(mc_opt(argc, argv, "--windows", "8")), P = atoi(mc_opt(argc, argv, "--P", "256")), T = atoi(mc_opt(argc, argv, "--threads", "8"));
-    uint64_t seed = (uint64_t)atoll(mc_opt(argc, argv, "--seed", "1"));
+    const int level = opt_atoi("--level", mc_opt(argc, argv, "--level", "0")), nw = opt_atoi("--windows", mc_opt(argc, argv, "--windows", "8")), P = opt_atoi("--P", mc_opt(argc, argv, "--P", "256")), T = opt_atoi("--threads", mc_opt(argc, argv, "--threads", "8"));
+    uint64_t seed = (uint64_t)opt_atoll("--seed", mc_opt(argc, argv, "--seed", "1"));
     store *cs = store_open(argv[ci + 1]); z3 *c0 = cs ? z3_open(cs, argv[ci + 2], nullptr) : nullptr;
     if (!c0) { fprintf(stderr, "codes-onfly: cannot open the CT %s %s\n", argv[ci + 1], argv[ci + 2]); return 1; }
-    const double t0 = mc_now(); const int gd = atoi(mc_opt(argc, argv, "--gpu", "-1"));   /* --gpu D: the device stamp on GPU D (default -1: the CPU) */
+    const double t0 = mc_now(); const int gd = opt_atoi("--gpu", mc_opt(argc, argv, "--gpu", "-1"));   /* --gpu D: the device stamp on GPU D (default -1: the CPU) */
     z3 *z = mesh_codes_open(argv[2], mc_opt(argc, argv, "--value", "q.tif"), mc_opt(argc, argv, "--map", nullptr), level, c0, gd < 0 ? -1 : gd + 1); if (!z) return 1;
     const mc_ctx *X = z3_derived_ctx(z); const int64_t *sh = z3_meta_of(z)->shape;
     printf("codes-onfly: key %s\n", mesh_codes_key(z));
@@ -346,13 +347,13 @@ int cmd_codes_onfly(int argc, char **argv) {
        goes back through rmap_f2c and must meet the coarse scan's own (unmapped) codes: the share with the same code (within 1 step =
        1/18 turn) at the nearest coarse voxel and within 1 / 2 voxels. --slice OUT.pgm: the window's middle z slice of the fine CT
        with the coded voxels drawn white (eye check). */
-    int bi = 0; for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], "--back")) bi = i;
+    int bi = 0; for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--back"))) bi = i;
     const char *mapp = mc_opt(argc, argv, "--map", nullptr);
     if (bi && mapp && nw > 0) {
         const rmap *map = reg_map_load(mapp); store *bs = store_open(argv[bi + 1]); z3 *bc = bs ? z3_open(bs, argv[bi + 2], nullptr) : nullptr;
         z3 *zc = map && bc ? mesh_codes_open(argv[2], mc_opt(argc, argv, "--value", "q.tif"), nullptr, 0, bc, 0) : nullptr;
         if (!zc) { fprintf(stderr, "codes-onfly: --back: cannot open the map / the coarse CT\n"); return 1; }
-        seed = (uint64_t)atoll(mc_opt(argc, argv, "--seed", "1"));   /* the first window again */
+        seed = (uint64_t)opt_atoll("--seed", mc_opt(argc, argv, "--seed", "1"));   /* the first window again */
         seed = seed * 6364136223846793005ull + 1442695040888963407ull; const mc_tile *t = &X->t[(seed >> 33) % X->nt]; int64_t o[3], n[3] = {P, P, P};
         for (int d = 0; d < 3; d++) { seed = seed * 6364136223846793005ull + 1442695040888963407ull;
             o[d] = (int64_t)(0.5 * (t->lo[d] + t->hi[d]) * X->scale) - P / 2 + (int64_t)((seed >> 33) % 33) - 16;

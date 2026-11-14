@@ -1,5 +1,6 @@
 /* ufsm faces command: the CT through a chunk cache, the published-surface check, tifxyz in / out (core: src/faces.c). */
 #include "faces.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "imgops.h"
 #include "sources.h"
@@ -206,10 +207,10 @@ static void *gt_rows(void *arg) {
 }
 
 static const char *fopt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
-static int farg(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], name)) return i; return -1; }
+static int farg(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], opt_n(name))) return i; return -1; }
 static int cmp_flt(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
 
 static void meta_get(const char *dir, const char *name, double *um, double *scale, int *winding) {
@@ -230,35 +231,35 @@ static void meta_get(const char *dir, const char *name, double *um, double *scal
    the band's contrast) and thick.tif (float, um) in <w>_recto), and <out>/<w>_faces.txt. Lengths in um. Statistics on stdout. */
 int cmd_faces(int argc, char **argv) {
     const int ci = farg(argc, argv, "--ct");
-    if (argc < 4 || ci < 0 || ci + 2 >= argc || !(atof(fopt(argc, argv, "--ct-um", "0")) > 0)) {
+    if (argc < 4 || ci < 0 || ci + 2 >= argc || !(opt_atof("--ct-um", fopt(argc, argv, "--ct-um", "0")) > 0)) {
         fprintf(stderr, "usage: ufsm faces <wraps-dir> <out-dir> --ct ROOT KEY --ct-um U [--wraps a,b] [--umb JSON --umb-um U] [--range 150] [--thick 15,200]\n"
                         "       [--min-prom 8] [--rel 0.1] [--tol 25] [--inset 0] [--smooth 4] [--ct-thr 90] [--gt ROOT KEY --gt-um U [--gt-range 100]] [--threads 16] [--cache-mb 4096] [--gpu 1]\n"
                         "  recto (inner face) and verso (outer face) of the papyrus sheet under each wrap: <out>/<w>_recto, <out>/<w>_verso (+ conf.tif, thick.tif)\n");
         return 2;
     }
     mallopt(M_MMAP_THRESHOLD, 1 << 20);   /* decoded chunks (2 MB) go back to the system when evicted */
-    const double ctum = atof(fopt(argc, argv, "--ct-um", "0"));
+    const double ctum = opt_atof("--ct-um", fopt(argc, argv, "--ct-um", "0"));
     faces_opt o = {0};
-    o.range = atof(fopt(argc, argv, "--range", "150")) / ctum;
+    o.range = opt_atof("--range", fopt(argc, argv, "--range", "150")) / ctum;
     double t0 = 15, t1 = 200; if (sscanf(fopt(argc, argv, "--thick", "15,200"), "%lf,%lf", &t0, &t1) != 2 || !(t1 > t0)) { fprintf(stderr, "faces: --thick MIN,MAX (um)\n"); return 2; }
     o.tmin = t0 / ctum; o.tmax = t1 / ctum;
-    o.min_prom = atof(fopt(argc, argv, "--min-prom", "8")); o.rel = atof(fopt(argc, argv, "--rel", "0.1"));
-    o.tol = atof(fopt(argc, argv, "--tol", "25")) / ctum; o.inset = atof(fopt(argc, argv, "--inset", "0")) / ctum;
-    o.smooth = atoi(fopt(argc, argv, "--smooth", "4")); o.nthreads = ufsm_threads(atoi(fopt(argc, argv, "--threads", "0")), 16);
-    const double ct_thr = atof(fopt(argc, argv, "--ct-thr", "90")), cache_mb = atof(fopt(argc, argv, "--cache-mb", "4096"));
+    o.min_prom = opt_atof("--min-prom", fopt(argc, argv, "--min-prom", "8")); o.rel = opt_atof("--rel", fopt(argc, argv, "--rel", "0.1"));
+    o.tol = opt_atof("--tol", fopt(argc, argv, "--tol", "25")) / ctum; o.inset = opt_atof("--inset", fopt(argc, argv, "--inset", "0")) / ctum;
+    o.smooth = opt_atoi("--smooth", fopt(argc, argv, "--smooth", "4")); o.nthreads = ufsm_threads(opt_atoi("--threads", fopt(argc, argv, "--threads", "0")), 16);
+    const double ct_thr = opt_atof("--ct-thr", fopt(argc, argv, "--ct-thr", "90")), cache_mb = opt_atof("--cache-mb", fopt(argc, argv, "--cache-mb", "4096"));
     if (!(o.range > 2) || o.smooth > 20 || o.nthreads < 1) { fprintf(stderr, "faces: --range > 2 CT voxels, --smooth <= 20\n"); return 2; }
     const char *cache = fopt(argc, argv, "--cache", nullptr);
     z3 *cz = z3_open(store_open(argv[ci + 1]), argv[ci + 2], cache); if (!cz) { fprintf(stderr, "faces: %s\n", z3_error()); return 1; }
     fc_cache cc; if (fcc_init(&cc, cz, o.nthreads, cache_mb) || fcc_sub(&cc)) { fprintf(stderr, "faces: out of memory\n"); return 1; }
     faces_vol V = {&cc, fcc_sample, fcc_mark, fcc_fill, nullptr, fcc_mark_mask};
     /* --gpu 1 (default): profiles + medians on the GPU (bit-identical; 128^3 CT chunks); 0, no device, or a binary without it: the CPU */
-    if (atoi(fopt(argc, argv, "--gpu", "1")) && fgpu_open && cc.cs[0] == 128 && cc.cs[1] == 128 && cc.cs[2] == 128 && (cc.dev = fgpu_open(cc.shape))) V.gpu = cc.dev;
-    const int gi = farg(argc, argv, "--gt"); z3 *gz = nullptr; fc_cache gc; const double gum = atof(fopt(argc, argv, "--gt-um", "0"));
+    if (opt_atoi("--gpu", fopt(argc, argv, "--gpu", "1")) && fgpu_open && cc.cs[0] == 128 && cc.cs[1] == 128 && cc.cs[2] == 128 && (cc.dev = fgpu_open(cc.shape))) V.gpu = cc.dev;
+    const int gi = farg(argc, argv, "--gt"); z3 *gz = nullptr; fc_cache gc; const double gum = opt_atof("--gt-um", fopt(argc, argv, "--gt-um", "0"));
     if (gi > 0) {
         if (gi + 2 >= argc || !(gum > 0)) { fprintf(stderr, "faces: --gt ROOT KEY --gt-um U\n"); return 2; }
         gz = z3_open(store_open(argv[gi + 1]), argv[gi + 2], cache); if (!gz || fcc_init(&gc, gz, o.nthreads, cache_mb)) { fprintf(stderr, "faces: --gt %s\n", z3_error()); return 1; }
     }
-    axis ax; const char *umb = fopt(argc, argv, "--umb", nullptr); const double umbum = atof(fopt(argc, argv, "--umb-um", "0"));
+    axis ax; const char *umb = fopt(argc, argv, "--umb", nullptr); const double umbum = opt_atof("--umb-um", fopt(argc, argv, "--umb-um", "0"));
     if (umb && (axis_load(&ax, umb) || !(umbum > 0))) { fprintf(stderr, "faces: --umb JSON (control_points) --umb-um U\n"); return 2; }
     const char *wl = fopt(argc, argv, "--wraps", nullptr); char *want = nullptr; if (wl) { want = malloc(strlen(wl) + 3); sprintf(want, ",%s,", wl); }
     char cmd[1500]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", argv[3]); if (system(cmd)) return 1;
@@ -315,7 +316,7 @@ int cmd_faces(int argc, char **argv) {
             const int ws = (w + SUB - 1) / SUB, hs = (h + SUB - 1) / SUB; float *dist = malloc((size_t)ws * hs * 4 * sizeof(float));
             for (size_t k = 0; k < (size_t)ws * hs * 4; k++) dist[k] = NAN;
             for (int r0 = 0; r0 < h; r0 += 32) {
-                gt_job G = {X, Y, Z, RX, RY, RZ, VX, VY, VZ, w, h, r0, r0 + 32 < h ? r0 + 32 : h, wum / gum, atof(fopt(argc, argv, "--gt-range", "100")) / gum, 0.5, sign, &gc, 1, dist, 0};
+                gt_job G = {X, Y, Z, RX, RY, RZ, VX, VY, VZ, w, h, r0, r0 + 32 < h ? r0 + 32 : h, wum / gum, opt_atof("--gt-range", fopt(argc, argv, "--gt-range", "100")) / gum, 0.5, sign, &gc, 1, dist, 0};
                 fc_par(gt_rows, &G, o.nthreads); if (fcc_fill(&gc)) return 1;
                 G.mark = 0; atomic_store(&G.next, 0); fc_par(gt_rows, &G, o.nthreads);
             }

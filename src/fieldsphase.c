@@ -7,6 +7,7 @@
    written (shard 512); the rest stays the fill (255). Output: OUT_DIR is the array (point a source's band phase {root: dirname, key:
    basename} at it). */
 #include <math.h>
+#include "optcheck.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -18,7 +19,7 @@
 #include "zarr3.h"
 #include "z3w.h"
 
-static const char *fp_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *fp_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 
 /* the phase vector of field set b at native voxel (z, y, x) relative to its origin, trilinear over cell centres h (i + 0.5) */
 static int fp_sample(const fit_fields_buf *b, double z, double y, double x, double *c, double *s) {
@@ -78,13 +79,13 @@ int cmd_fields_phase(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm fields-phase OUT_DIR --like ROOT KEY [--ref ROOT KEY] [--conf 0.5] [--threads 16] FIELDS_DIR...\n"); return 2; }
     const char *out = argv[2], *lr = nullptr, *lk = nullptr, *rr = nullptr, *rk = nullptr; const char *dirs[256]; int nd = 0;
     for (int i = 3; i < argc; i++) {
-        if (!strcmp(argv[i], "--like") && i + 2 < argc) { lr = argv[i + 1]; lk = argv[i + 2]; i += 2; }
-        else if (!strcmp(argv[i], "--ref") && i + 2 < argc) { rr = argv[i + 1]; rk = argv[i + 2]; i += 2; }
-        else if ((!strcmp(argv[i], "--conf") || !strcmp(argv[i], "--threads")) && i + 1 < argc) i++;
+        if (!strcmp(argv[i], opt_n("--like")) && i + 2 < argc) { lr = argv[i + 1]; lk = argv[i + 2]; i += 2; }
+        else if (!strcmp(argv[i], opt_n("--ref")) && i + 2 < argc) { rr = argv[i + 1]; rk = argv[i + 2]; i += 2; }
+        else if ((!strcmp(argv[i], opt_n("--conf")) || !strcmp(argv[i], opt_n("--threads"))) && i + 1 < argc) i++;
         else if (argv[i][0] != '-' && nd < 256) dirs[nd++] = argv[i];
     }
     if (!lr || !nd) { fprintf(stderr, "fields-phase: --like ROOT KEY and at least one FIELDS_DIR\n"); return 2; }
-    const double cmin = atof(fp_opt(argc, argv, "--conf", "0.5")); const int nt = atoi(fp_opt(argc, argv, "--threads", "16"));
+    const double cmin = opt_atof("--conf", fp_opt(argc, argv, "--conf", "0.5")); const int nt = opt_atoi("--threads", fp_opt(argc, argv, "--threads", "16"));
     z3 *zl = z3_open(store_open(lr), lk, nullptr); if (!zl) { fprintf(stderr, "fields-phase: %s\n", z3_error()); return 1; }
     const int64_t *shape = z3_meta_of(zl)->shape;
     z3 *zr = nullptr; if (rr && !(zr = z3_open(store_open(rr), rk, nullptr))) { fprintf(stderr, "fields-phase: %s\n", z3_error()); return 1; }

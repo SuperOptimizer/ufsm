@@ -2,6 +2,7 @@
    (embedded runtime: precision, policy, fp16, MX-fp4 activations, input MX precision, stored GN statistics; EMA weights; fp16
    logits), plus ufsm wtrunk-bench */
 #include "wtrunk.h"
+#include "optcheck.h"
 #include "unet.h"
 #include "nn.h"
 #include "checkpoint.h"
@@ -217,13 +218,13 @@ int wt_save(wtrunk *w, const char *path) { return w->ut ? unet_save(w->ut, path,
 /* ufsm wtrunk-bench CKPT [--n 1] [--batch N] [--feat 1] [--iters 10] [--T 128] [--L 384] [--um 9.6]: synthetic sheets (concentric
    shells around an axis at the slab's side), forward time per slab, GPU memory, output statistics per channel */
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
-static const char *opt_(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *opt_(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 int cmd_wtrunk_bench(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: ufsm wtrunk-bench CKPT [--n 1] [--batch N] [--feat 1] [--iters 10] [--T 128] [--L 384] [--um 9.6] [--gpu 0]\n"); return 2; }
-    const int n = atoi(opt_(argc, argv, "--n", "1")), nb = atoi(opt_(argc, argv, "--batch", opt_(argc, argv, "--n", "1"))), feat = atoi(opt_(argc, argv, "--feat", "1"));
-    const int it = atoi(opt_(argc, argv, "--iters", "10")), T = atoi(opt_(argc, argv, "--T", "128")), L = atoi(opt_(argc, argv, "--L", "384"));
-    const double um = atof(opt_(argc, argv, "--um", "9.6"));
-    if (nn_init(atoi(opt_(argc, argv, "--gpu", "0")))) return 1;
+    const int n = opt_atoi("--n", opt_(argc, argv, "--n", "1")), nb = opt_atoi("--batch", opt_(argc, argv, "--batch", opt_(argc, argv, "--n", "1"))), feat = opt_atoi("--feat", opt_(argc, argv, "--feat", "1"));
+    const int it = opt_atoi("--iters", opt_(argc, argv, "--iters", "10")), T = opt_atoi("--T", opt_(argc, argv, "--T", "128")), L = opt_atoi("--L", opt_(argc, argv, "--L", "384"));
+    const double um = opt_atof("--um", opt_(argc, argv, "--um", "9.6"));
+    if (nn_init(opt_atoi("--gpu", opt_(argc, argv, "--gpu", "0")))) return 1;
     const double f0 = nn_mem_free() / 1e9;
     wtrunk *w = wt_open(argv[2], T, L, nb, feat);
     if (!w) return 1;

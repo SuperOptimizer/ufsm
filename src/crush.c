@@ -1,4 +1,5 @@
 #include "crush.h"
+#include "optcheck.h"
 #include "band.h"
 #include <math.h>
 #include <stdatomic.h>
@@ -15,7 +16,7 @@ crush_cfg crush_cfg_default(void) {
                         .loc_amp = 0, .loc_len = 48.f, .loc_jmax = 1.f};
 }
 
-static const char *cr_opt(int argc, char **argv, const char *f) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], f)) return argv[i + 1]; return nullptr; }
+static const char *cr_opt(int argc, char **argv, const char *f) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(f))) return argv[i + 1]; return nullptr; }
 int crush_cfg_parse(crush_cfg *c, int argc, char **argv) {
     const char *v;
 #define CR_F(flag, dst) if ((v = cr_opt(argc, argv, flag))) dst = (float)atof(v)

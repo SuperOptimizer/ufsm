@@ -16,6 +16,7 @@
    the phase only the sub-turn part: round(W - phi) + phi), its gauge from the phase smoothed over +-Rm solve cells. */
 #include "defaulted.h"
 #include <complex.h>
+#include "optcheck.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -37,7 +38,7 @@
 #include <unistd.h>
 #include <time.h>
 
-static const char *cf_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *cf_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 
 /* ---- a pthread parallel for over [0, n) in nt contiguous parts; fn(ctx, a, b, t) ---- */
 typedef void (*cf_fn)(void *, long, long, int);
@@ -578,26 +579,26 @@ int cmd_count_field(int argc, char **argv) {
         return 2;
     }
     const char *in = argv[2], *out = argv[3], *meth = cf_opt(argc, argv, "--method", "ls"), *cmode = cf_opt(argc, argv, "--conf", "mix"), *mdir = cf_opt(argc, argv, "--model", "");
-    cf_nt = ufsm_threads(atoi(cf_opt(argc, argv, "--threads", "0")), 8);
-    const int R = atoi(cf_opt(argc, argv, "--R", "10")), Rz = R > 0 ? atoi(cf_opt(argc, argv, "--Rz", cf_opt(argc, argv, "--R", "10"))) : 0;
-    const int iters = atoi(cf_opt(argc, argv, "--iters", "400")), Qf = atoi(cf_opt(argc, argv, "--loop", "8")), Rm = atoi(cf_opt(argc, argv, "--model-R", "8")), wwc = atoi(cf_opt(argc, argv, "--wc", "1"));
-    const double lamr = atof(cf_opt(argc, argv, "--lambda", "1e-7")), eps = atof(cf_opt(argc, argv, "--eps", "1e-3")), rmin_um = atof(cf_opt(argc, argv, "--rmin-um", "500"));
-    double memgb = atof(cf_opt(argc, argv, "--mem-gb", "6"));
+    cf_nt = ufsm_threads(opt_atoi("--threads", cf_opt(argc, argv, "--threads", "0")), 8);
+    const int R = opt_atoi("--R", cf_opt(argc, argv, "--R", "10")), Rz = R > 0 ? opt_atoi("--Rz", cf_opt(argc, argv, "--Rz", cf_opt(argc, argv, "--R", "10"))) : 0;
+    const int iters = opt_atoi("--iters", cf_opt(argc, argv, "--iters", "400")), Qf = opt_atoi("--loop", cf_opt(argc, argv, "--loop", "8")), Rm = opt_atoi("--model-R", cf_opt(argc, argv, "--model-R", "8")), wwc = opt_atoi("--wc", cf_opt(argc, argv, "--wc", "1"));
+    const double lamr = opt_atof("--lambda", cf_opt(argc, argv, "--lambda", "1e-7")), eps = opt_atof("--eps", cf_opt(argc, argv, "--eps", "1e-3")), rmin_um = opt_atof("--rmin-um", cf_opt(argc, argv, "--rmin-um", "500"));
+    double memgb = opt_atof("--mem-gb", cf_opt(argc, argv, "--mem-gb", "6"));
     {   /* the chunk budget never above 60% of what this process may still allocate (cgroup aware: pods, capped scopes) */
         const double av = (double)ufsm_mem_available() / (1u << 30);
         if (av > 0 && memgb > 0.6 * av) { fprintf(stderr, "count-field: --mem-gb %.1f lowered to %.1f (60%% of the %.1f GB available)\n", memgb, 0.6 * av, av); memgb = 0.6 * av; }
     }
     /* --model-only 1 (with --model): no output fields (the out directory is not written), only the model; --model-stride K: its phase
        gauge (and the R 0 global gauge) from every K-th field chunk (a whole scroll: the gauge is smoothed over +-model-R solve cells) */
-    const int mo = atoi(cf_opt(argc, argv, "--model-only", "0")), mstride = atoi(cf_opt(argc, argv, "--model-stride", "1"));
+    const int mo = opt_atoi("--model-only", cf_opt(argc, argv, "--model-only", "0")), mstride = opt_atoi("--model-stride", cf_opt(argc, argv, "--model-stride", "1"));
     if (mo && (!*mdir || mstride < 1 || *cf_opt(argc, argv, "--into-shape", ""))) { fprintf(stderr, "count-field: --model-only needs --model DIR, --model-stride >= 1, no --into-*\n"); return 2; }
     /* --cf-gpu 1 (default; the CPU when no CUDA device or nn_cf.o): pass 1's pooling, the CG solves and the --model-only R 0 model
        pass on the GPU (src/nn_cf.cu). --prefetch 1: the next field chunk loads on a thread meanwhile (two chunks in RAM;
        default: when two fit in half the available memory).
        --read-threads N: the zarr decode threads (default min(16, cores)) */
-    int gpu = atoi(cf_opt(argc, argv, "--cf-gpu", "1")) && cf_gpu_ok && cf_gpu_ok();
-    int pref = atoi(cf_opt(argc, argv, "--prefetch", "-1"));
-    if (atoi(cf_opt(argc, argv, "--read-threads", "0")) > 0) fit_set_threads(atoi(cf_opt(argc, argv, "--read-threads", "0")));
+    int gpu = opt_atoi("--cf-gpu", cf_opt(argc, argv, "--cf-gpu", "1")) && cf_gpu_ok && cf_gpu_ok();
+    int pref = opt_atoi("--prefetch", cf_opt(argc, argv, "--prefetch", "-1"));
+    if (opt_atoi("--read-threads", cf_opt(argc, argv, "--read-threads", "0")) > 0) fit_set_threads(opt_atoi("--read-threads", cf_opt(argc, argv, "--read-threads", "0")));
     const int spiral = !strcmp(meth, "spiral");
     if (strcmp(meth, "ls") && strcmp(meth, "ray") && !spiral) { fprintf(stderr, "count-field: --method ls, ray or spiral\n"); return 2; }
     fit_model *imod = nullptr; if (*cf_opt(argc, argv, "--init-model", "")) { if (!spiral || !(imod = fit_load(cf_opt(argc, argv, "--init-model", "")))) { fprintf(stderr, "count-field: --init-model needs --method spiral and a fit model\n"); return 2; } }
@@ -607,14 +608,14 @@ int cmd_count_field(int argc, char **argv) {
     fit_fields_buf g; if (fit_fields_load(in, 0, 0, 0, &g)) { fprintf(stderr, "count-field: cannot load %s\n", in); return 1; }   /* geometry + the axis table */
     const int D = g.shape[0], H = g.shape[1], W = g.shape[2], na = (int)(D * g.h) + 1; const size_t n = (size_t)D * H * W, HW = (size_t)H * W;
     const double h = g.h;
-    int P = atoi(cf_opt(argc, argv, "--pool", "0"));
+    int P = opt_atoi("--pool", cf_opt(argc, argv, "--pool", "0"));
     if (P <= 0) { P = 1; while ((size_t)((D + P - 1) / P) * ((H + P - 1) / P) * ((W + P - 1) / P) > 48000000ull) P *= 2; if (P < 2 && n > 4000000) P = 2; }
     /* field rows per chunk: ~22 B per cell held (input planes, output buffers) incl. the Rz halo rows */
     int CZ = (int)(memgb * 1e9 / ((mo ? 12.0 : 22.0) * HW)) - 2 * Rz; CZ = CZ / P * P; if (CZ < P) CZ = P; if (CZ > D) CZ = (D + P - 1) / P * P;   /* (--model-only: no output buffers) */
     if (CZ >= 128 && 128 % P == 0) CZ = CZ / 128 * 128;   /* whole 128-row zarr shards per chunk (a shard straddling two chunks is decoded twice) */
     /* --chunk-rows N: the chunk height fixed (a multiple of the pool; the strided model pass and the prior's chunk depend on it, so a
        pass 1 run apart from the solve (--pool-only, --follow) and the solve run pass the same N; default: from --mem-gb as above) */
-    if (atoi(cf_opt(argc, argv, "--chunk-rows", "0")) > 0) { CZ = atoi(cf_opt(argc, argv, "--chunk-rows", "0")) / P * P; if (CZ < P) CZ = P; if (CZ > D) CZ = (D + P - 1) / P * P; }
+    if (opt_atoi("--chunk-rows", cf_opt(argc, argv, "--chunk-rows", "0")) > 0) { CZ = opt_atoi("--chunk-rows", cf_opt(argc, argv, "--chunk-rows", "0")) / P * P; if (CZ < P) CZ = P; if (CZ > D) CZ = (D + P - 1) / P * P; }
     if (pref < 0) {   /* --prefetch default: two chunks of ~11 planes in half of what this process may still allocate (cgroup aware: the
                          host's MemAvailable let a 1667 ref inside a 40 GB memcap scope prefetch two 19.5 GB chunks and be OOM-killed, 11-12) */
         const double av = (double)ufsm_mem_available();
@@ -630,7 +631,7 @@ int cmd_count_field(int argc, char **argv) {
         if (!Sl[l] || !Gl[l][2]) { fprintf(stderr, "count-field: out of memory (solve grid)\n"); return 1; }
     }
     /* pass 1: the pooled sums chunk by chunk; the label-free prior (direction, pitch) from the chunk holding the middle row */
-    int dir = atoi(cf_opt(argc, argv, "--dir", "0")), recto = 0, w4d = 0; double pitch = 8.0 * h;
+    int dir = opt_atoi("--dir", cf_opt(argc, argv, "--dir", "0")), recto = 0, w4d = 0; double pitch = 8.0 * h;
     if (!dir && imod) dir = imod->dir;
     /* --pool-cache FILE: the level-0 pooled sums (+ dir, prior pitch, recto, w4d) saved after pass 1 / loaded instead of it (a rerun
        of a whole scroll skips the ~1 h pass; the file is tied to the pooling options, not checked) */
@@ -648,7 +649,7 @@ int cmd_count_field(int argc, char **argv) {
        alternately (each part's predict writes its rows bottom-up at about the same pace). The pooled sums are per chunk (disjoint solve
        rows) and the prior comes from the chunk holding the middle row, so the order changes nothing */
     const int nch = (D + CZ - 1) / CZ; int *ord = malloc(nch * sizeof(int));
-    {   const int fs = atoi(cf_opt(argc, argv, "--follow-split", "0")), ks = fs > 0 && fs % CZ == 0 && fs < D ? fs / CZ : 0; int n = 0;
+    {   const int fs = opt_atoi("--follow-split", cf_opt(argc, argv, "--follow-split", "0")), ks = fs > 0 && fs % CZ == 0 && fs < D ? fs / CZ : 0; int n = 0;
         if (*cf_opt(argc, argv, "--follow-split", "") && !ks) fprintf(stderr, "count-field: --follow-split %d is not a multiple of the %d-row chunks inside the box: chunks in z order\n", fs, CZ);
         if (ks) for (int i = 0; n < nch; i++) { if (i < ks) ord[n++] = i; if (ks + i < nch) ord[n++] = ks + i; }
         else for (int i = 0; i < nch; i++) ord[i] = i; }
@@ -662,12 +663,12 @@ int cmd_count_field(int argc, char **argv) {
            synchronous load of the next chunk ran here, next to this one: two chunks either way, 39 GB for a 1667 ref at 768 rows) */
         if (pref && ci + 1 < nch) { const int n0 = ord[ci + 1] * CZ; cf_pre_start(&pre, in, n0, n0 + CZ < D ? n0 + CZ : D, pref); }
         if (!z0) { recto = b.f.recto != nullptr; w4d = b.f.wd[0] ? b.f.w4_d : 0; }
-        cf_pool pp = {&b.f, z0, z1 - z0, H, W, P, lv[0].hh, lv[0].w, h, g.cy, g.cx, na, Sl[0], {Gl[0][0], Gl[0][1], Gl[0][2]}, atof(cf_opt(argc, argv, "--emin", "0.1")), atof(cf_opt(argc, argv, "--sheet0", "0.4")), atof(cf_opt(argc, argv, "--phase-w", "0")), atof(cf_opt(argc, argv, "--phase-c0", "0.4"))};
-        pp.rs = atof(cf_opt(argc, argv, "--rho-scale", "1")); if (!(pp.rs > 0)) pp.rs = 1;
+        cf_pool pp = {&b.f, z0, z1 - z0, H, W, P, lv[0].hh, lv[0].w, h, g.cy, g.cx, na, Sl[0], {Gl[0][0], Gl[0][1], Gl[0][2]}, opt_atof("--emin", cf_opt(argc, argv, "--emin", "0.1")), opt_atof("--sheet0", cf_opt(argc, argv, "--sheet0", "0.4")), opt_atof("--phase-w", cf_opt(argc, argv, "--phase-w", "0")), opt_atof("--phase-c0", cf_opt(argc, argv, "--phase-c0", "0.4"))};
+        pp.rs = opt_atof("--rho-scale", cf_opt(argc, argv, "--rho-scale", "1")); if (!(pp.rs > 0)) pp.rs = 1;
         { double A = 0, S0 = 0; if (*cf_opt(argc, argv, "--rho-pow", "") && sscanf(cf_opt(argc, argv, "--rho-pow", ""), "%lf,%lf", &A, &S0) == 2 && S0 > 0) { pp.ra = A; pp.rb = S0 * 8 / (h * g.um); } }
         {   /* --wide A,B (network spacing, um) --wide-dens D (0..1) --wide-phase K: the density weight x (1 - D s), the confident phase weight x (1 + K s), s = ramp(spacing, A, B) */
             double a = 0, bw = 0; if (*cf_opt(argc, argv, "--wide", "") && sscanf(cf_opt(argc, argv, "--wide", ""), "%lf,%lf", &a, &bw) == 2 && bw > a) { pp.wa = a * 8 / (h * g.um); pp.wb = bw * 8 / (h * g.um); }
-            if (pp.wb > 0) { pp.wd = atof(cf_opt(argc, argv, "--wide-dens", "0")); pp.wp = atof(cf_opt(argc, argv, "--wide-phase", "0")); }
+            if (pp.wb > 0) { pp.wd = opt_atof("--wide-dens", cf_opt(argc, argv, "--wide-dens", "0")); pp.wp = opt_atof("--wide-phase", cf_opt(argc, argv, "--wide-phase", "0")); }
         }
         const double tl1 = cf_now();
         if (getenv("UFSM_CF_READ_ONLY")) {   /* (bench: the field reads only; FNV-1a of the chunk's planes for byte-identity checks) */
@@ -689,7 +690,7 @@ int cmd_count_field(int argc, char **argv) {
           cf_par((long)nr * pp.nb, cf_pool_run, &pp); gpu = gpu0; npc++; }   /* (jobs own whole solve-row y bands: no shared cells; same sum order) */
         t_pool += cf_now() - tl1;
         if (z0 <= D / 2 && D / 2 < z1) {
-            fit_cfg pc = fit_cfg_default(); pc.dir = dir; pc.dir_loops = atoi(cf_opt(argc, argv, "--dir-loops", "0")); fit_model pm; memset(&pm, 0, sizeof pm);
+            fit_cfg pc = fit_cfg_default(); pc.dir = dir; pc.dir_loops = opt_atoi("--dir-loops", cf_opt(argc, argv, "--dir-loops", "0")); fit_model pm; memset(&pm, 0, sizeof pm);
             if (!fit_init_prior(&b.f, &pc, &pm)) {
                 if (!dir) dir = pm.dir;
                 float *pk = malloc(pm.nk * sizeof(float)); int np = 0; for (int k = 0; k < pm.nk; k++) if (pm.pitch[k] > 0) pk[np++] = pm.pitch[k];
@@ -709,7 +710,7 @@ int cmd_count_field(int argc, char **argv) {
         for (int k = 0; k < 3 && !bad; k++) bad = fwrite(Gl[0][k], sizeof(float), lv[0].n, pf) != lv[0].n;
         if (pf && fclose(pf)) bad = 1;
         fprintf(stderr, bad ? "count-field: cannot write the pool cache %s\n" : "count-field: pooled sums -> %s\n", pcache);
-        if (atoi(cf_opt(argc, argv, "--pool-only", "0"))) return bad; }   /* (--pool-only 1: pass 1 into --pool-cache, nothing else) */
+        if (opt_atoi("--pool-only", cf_opt(argc, argv, "--pool-only", "0"))) return bad; }   /* (--pool-only 1: pass 1 into --pool-cache, nothing else) */
     free(ord); g_follow = nullptr;
     if (getenv("UFSM_CF_ZTILT")) {   /* per solve row: the share of data cells whose target normal tilts >= 30 deg out of the y-x plane (z crush) */
         for (int z = 0; z < lv[0].d; z++) { double nc = 0, nt = 0, sz = 0;
@@ -720,7 +721,7 @@ int cmd_count_field(int argc, char **argv) {
     }
     if (*cf_opt(argc, argv, "--ct-cal", "")) {   /* --ct-cal FILE (ufsm ct-cal): the pooled count targets scaled by the CT's sheets per density turn */
         fit_ct_cal *cc = fit_ct_cal_load(cf_opt(argc, argv, "--ct-cal", "")); if (!cc) { fprintf(stderr, "count-field: cannot read --ct-cal %s\n", cf_opt(argc, argv, "--ct-cal", "")); return 1; }
-        double ks = 0, kw = 0; const double kmax = atof(cf_opt(argc, argv, "--ct-cal-max", "1")), kmin = atof(cf_opt(argc, argv, "--ct-cal-min", "0"));   /* (--ct-cal-min: a floor, e.g. for a phase calibration where the phase is dead) */   /* (one-sided by default: the CT only lowers counts; Paris 4's CT counts ~5% above its GT) */
+        double ks = 0, kw = 0; const double kmax = opt_atof("--ct-cal-max", cf_opt(argc, argv, "--ct-cal-max", "1")), kmin = opt_atof("--ct-cal-min", cf_opt(argc, argv, "--ct-cal-min", "0"));   /* (--ct-cal-min: a floor, e.g. for a phase calibration where the phase is dead) */   /* (one-sided by default: the CT only lowers counts; Paris 4's CT counts ~5% above its GT) */
         for (int z = 0; z < lv[0].d; z++) {
             const double pz = (z + 0.5) * P * h, ay = cf_axis_at(g.cy, na, pz), ax = cf_axis_at(g.cx, na, pz);
             for (int y = 0; y < lv[0].hh; y++) for (int x = 0; x < lv[0].w; x++) {
@@ -736,7 +737,7 @@ int cmd_count_field(int argc, char **argv) {
     if (*cf_opt(argc, argv, "--gz-scale", "")) {   /* --gz-scale F: the z component of the pooled count targets times F (0: dU/dz -> 0, the
                                                      winding of a sheet constant along z unless the radial counts force it; the network's n_z
                                                      integrated over the height drifted Paris 3's gauge by up to ~40 turns: geom-check, src/geomcheck.c) */
-        const float s = (float)atof(cf_opt(argc, argv, "--gz-scale", "1")); for (size_t i = 0; i < lv[0].n; i++) Gl[0][0][i] *= s;
+        const float s = (float)opt_atof("--gz-scale", cf_opt(argc, argv, "--gz-scale", "1")); for (size_t i = 0; i < lv[0].n; i++) Gl[0][0][i] *= s;
         fprintf(stderr, "count-field: --gz-scale %g: z component of the count targets scaled\n", s);
     }
     float kpitch[2] = {(float)pitch, (float)pitch}, koff[2] = {0, 0}; const int kdz = (int)fmax(1, D * h);   /* the prior: r / pitch */
@@ -752,9 +753,9 @@ int cmd_count_field(int argc, char **argv) {
        same-sheet pairs in the solve, weight --cf-fib W (0: off), Huber --cf-fib-huber D turns over --cf-fib-irls K reweighted level-0
        solves. A fibre: resampled at 1 native voxel, pairs every 4th sample at the spans --cf-fib-spans (native, default 16,32,64,128),
        dW = 0 (W is constant along a sheet away from the theta cut; the cut is in t through dir * dtheta / 2 pi) */
-    cf_pt *pts = nullptr; size_t npt = 0; const double wfib = atof(cf_opt(argc, argv, "--cf-fib", "0"));
+    cf_pt *pts = nullptr; size_t npt = 0; const double wfib = opt_atof("--cf-fib", cf_opt(argc, argv, "--cf-fib", "0"));
     if (wfib > 0) {
-        size_t cap = 0; const double zo = atof(cf_opt(argc, argv, "--fib-zoff", "0"));
+        size_t cap = 0; const double zo = opt_atof("--fib-zoff", cf_opt(argc, argv, "--fib-zoff", "0"));
         #define CF_PUSH(A, B, DW) do { if (npt == cap) { cap = cap ? 2 * cap : 1 << 16; pts = realloc(pts, cap * sizeof *pts); if (!pts) return 1; } \
             cf_pt *e_ = &pts[npt++]; for (int k_ = 0; k_ < 3; k_++) { e_->a[k_] = (float)(A)[k_]; e_->b[k_] = (float)(B)[k_]; } \
             double ta_ = atan2((A)[1] - cf_axis_at(g.cy, na, (A)[0]), (A)[2] - cf_axis_at(g.cx, na, (A)[0])), tb_ = atan2((B)[1] - cf_axis_at(g.cy, na, (B)[0]), (B)[2] - cf_axis_at(g.cx, na, (B)[0])); \
@@ -793,7 +794,7 @@ int cmd_count_field(int argc, char **argv) {
         #undef CF_PUSH
         if (!npt) fprintf(stderr, "count-field: --cf-fib %g but no pairs (--fibers / --pairs): off\n", wfib);
     }
-    const double fhub = atof(cf_opt(argc, argv, "--cf-fib-huber", "0.25")); const int firls = atoi(cf_opt(argc, argv, "--cf-fib-irls", "3"));
+    const double fhub = opt_atof("--cf-fib-huber", cf_opt(argc, argv, "--cf-fib-huber", "0.25")); const int firls = opt_atoi("--cf-fib-irls", cf_opt(argc, argv, "--cf-fib-irls", "3"));
     float *Sfine = Sl[0], *Gfine[3] = {Gl[0][0], Gl[0][1], Gl[0][2]}; const double tst1 = cf_now();
     for (int l = nl - 1; l >= 0; l--) {
         cf_lvl *L = &lv[l]; const int q = L->P; float *S = Sl[l], **G = Gl[l];
@@ -859,7 +860,7 @@ int cmd_count_field(int argc, char **argv) {
            self-inconsistent: the targets' closing error (cl >= 0.25 turn), the angle between the reference's grad W and the target
            normal (>= 30 deg), or its density along the target normal off by a factor >= 1.4; full (1) elsewhere */
         float *cl0 = malloc(L->n * sizeof(float)); { const int Qs = Qf / P < 2 ? 2 : Qf / P; cf_close CC = {L, Qs, cl0}; cf_par(L->d, cf_close_run, &CC); }
-        const int awon = atoi(cf_opt(argc, argv, "--sf-release", "1"));
+        const int awon = opt_atoi("--sf-release", cf_opt(argc, argv, "--sf-release", "1"));
         q[6] = malloc(nd * sizeof(float)); size_t nrel = 0; double arel = 0;
         for (size_t jj = 0; jj < j; jj++) {
             const int z = iz[jj], y = iy[jj], x = ix[jj]; const size_t i = ((size_t)z * L->hh + y) * L->w + x; const int c3[3] = {z, y, x}, dm[3] = {L->d, L->hh, L->w};
@@ -876,15 +877,15 @@ int cmd_count_field(int argc, char **argv) {
         fprintf(stderr, "count-field: spiral anchor released (> 0.5) on %.3f of %zu data cells, mean release %.3f\n", j ? (double)nrel / j : 0, j, j ? arel / j : 0);
         sc.nd = j; sc.cz = iz; sc.cy_ = iy; sc.cx_ = ix; sc.gz = q[0]; sc.gy = q[1]; sc.gx = q[2]; sc.lrho = q[3]; sc.c = q[4]; sc.u0 = q[5];
         sc.d = L->d; sc.hh = L->hh; sc.w = L->w; sc.cs = P * h; sc.ay = g.cy; sc.ax = g.cx; sc.na = na; sc.dir = dir; sc.pitch = pitch;
-        sc.nst = atoi(cf_opt(argc, argv, "--sf-stages", "2")); sc.nrk = atoi(cf_opt(argc, argv, "--sf-rk", "3")); sc.Lf = atoi(cf_opt(argc, argv, "--sf-lf", "48")); sc.sfac = atoi(cf_opt(argc, argv, "--sf-sfac", "6"));
-        sc.La = atof(cf_opt(argc, argv, "--sf-la", "96")); sc.Lz = atof(cf_opt(argc, argv, "--sf-lz", "96")); sc.K = atoi(cf_opt(argc, argv, "--sf-K", "0"));
-        sc.steps = atoi(cf_opt(argc, argv, "--sf-steps", "3000")); sc.nsamp = atoi(cf_opt(argc, argv, "--sf-samp", "65536")); sc.warm = atoi(cf_opt(argc, argv, "--sf-warm", "600")); sc.fwd = atoi(cf_opt(argc, argv, "--sf-fd-fwd", "1")); sc.lr_dr = atof(cf_opt(argc, argv, "--sf-lr-pitch", "0.002"));
-        sc.lr_c = atof(cf_opt(argc, argv, "--sf-lr-c", "0.5")); sc.lr_f = atof(cf_opt(argc, argv, "--sf-lr-f", "0.2")); sc.lr_g = atof(cf_opt(argc, argv, "--sf-lr-g", "0.02")); sc.lr_end = atof(cf_opt(argc, argv, "--sf-lr-end", "0.1"));
-        sc.w_n = atof(cf_opt(argc, argv, "--sf-wn", "1")); sc.w_d = atof(cf_opt(argc, argv, "--sf-wd", "1")); sc.w_sd = atof(cf_opt(argc, argv, "--sf-wsd", "0.1"));
-        sc.w_a0 = atof(cf_opt(argc, argv, "--sf-wa0", "1")); sc.w_a1 = atof(cf_opt(argc, argv, "--sf-wa1", "1")); sc.dfloor = atof(cf_opt(argc, argv, "--sf-dfloor", "0.1")); sc.huber = atof(cf_opt(argc, argv, "--sf-huber", "0.5"));
-        sc.eps = atof(cf_opt(argc, argv, "--sf-eps", "0")); if (sc.eps <= 0) sc.eps = 0.5 * P * h;
-        sc.gmin = log(atof(cf_opt(argc, argv, "--sf-gap-min", "0.35"))); sc.gmax = log(atof(cf_opt(argc, argv, "--sf-gap-max", "4")));
-        sc.seed = (unsigned)atoi(cf_opt(argc, argv, "--sf-seed", "1")); sc.gpu = atoi(cf_opt(argc, argv, "--gpu", "0")); sc.verbose = atoi(cf_opt(argc, argv, "--sf-verbose", "100"));
+        sc.nst = opt_atoi("--sf-stages", cf_opt(argc, argv, "--sf-stages", "2")); sc.nrk = opt_atoi("--sf-rk", cf_opt(argc, argv, "--sf-rk", "3")); sc.Lf = opt_atoi("--sf-lf", cf_opt(argc, argv, "--sf-lf", "48")); sc.sfac = opt_atoi("--sf-sfac", cf_opt(argc, argv, "--sf-sfac", "6"));
+        sc.La = opt_atof("--sf-la", cf_opt(argc, argv, "--sf-la", "96")); sc.Lz = opt_atof("--sf-lz", cf_opt(argc, argv, "--sf-lz", "96")); sc.K = opt_atoi("--sf-K", cf_opt(argc, argv, "--sf-K", "0"));
+        sc.steps = opt_atoi("--sf-steps", cf_opt(argc, argv, "--sf-steps", "3000")); sc.nsamp = opt_atoi("--sf-samp", cf_opt(argc, argv, "--sf-samp", "65536")); sc.warm = opt_atoi("--sf-warm", cf_opt(argc, argv, "--sf-warm", "600")); sc.fwd = opt_atoi("--sf-fd-fwd", cf_opt(argc, argv, "--sf-fd-fwd", "1")); sc.lr_dr = opt_atof("--sf-lr-pitch", cf_opt(argc, argv, "--sf-lr-pitch", "0.002"));
+        sc.lr_c = opt_atof("--sf-lr-c", cf_opt(argc, argv, "--sf-lr-c", "0.5")); sc.lr_f = opt_atof("--sf-lr-f", cf_opt(argc, argv, "--sf-lr-f", "0.2")); sc.lr_g = opt_atof("--sf-lr-g", cf_opt(argc, argv, "--sf-lr-g", "0.02")); sc.lr_end = opt_atof("--sf-lr-end", cf_opt(argc, argv, "--sf-lr-end", "0.1"));
+        sc.w_n = opt_atof("--sf-wn", cf_opt(argc, argv, "--sf-wn", "1")); sc.w_d = opt_atof("--sf-wd", cf_opt(argc, argv, "--sf-wd", "1")); sc.w_sd = opt_atof("--sf-wsd", cf_opt(argc, argv, "--sf-wsd", "0.1"));
+        sc.w_a0 = opt_atof("--sf-wa0", cf_opt(argc, argv, "--sf-wa0", "1")); sc.w_a1 = opt_atof("--sf-wa1", cf_opt(argc, argv, "--sf-wa1", "1")); sc.dfloor = opt_atof("--sf-dfloor", cf_opt(argc, argv, "--sf-dfloor", "0.1")); sc.huber = opt_atof("--sf-huber", cf_opt(argc, argv, "--sf-huber", "0.5"));
+        sc.eps = opt_atof("--sf-eps", cf_opt(argc, argv, "--sf-eps", "0")); if (sc.eps <= 0) sc.eps = 0.5 * P * h;
+        sc.gmin = log(opt_atof("--sf-gap-min", cf_opt(argc, argv, "--sf-gap-min", "0.35"))); sc.gmax = log(opt_atof("--sf-gap-max", cf_opt(argc, argv, "--sf-gap-max", "4")));
+        sc.seed = (unsigned)opt_atoi("--sf-seed", cf_opt(argc, argv, "--sf-seed", "1")); sc.gpu = opt_atoi("--gpu", cf_opt(argc, argv, "--gpu", "0")); sc.verbose = opt_atoi("--sf-verbose", cf_opt(argc, argv, "--sf-verbose", "100"));
         /* --sf-pin-codes ROOT --sf-pin-key KEY --sf-pin-rows A:B[,C:D...] (field rows of the box): ground-truth pins (dev experiments:
            villa's human pins stand-in). Labelled voxels of the band codes (winding mod 14, 18 steps a turn) in those rows, kept with
            probability --sf-pin-p, become points of known W: the mod-14 code lifted to the reference's labelling (one gauge = the mode of
@@ -893,7 +894,7 @@ int cmd_count_field(int argc, char **argv) {
         if (*cf_opt(argc, argv, "--sf-pin-codes", "") && imod) {
             z3 *zc = z3_open(store_open(cf_opt(argc, argv, "--sf-pin-codes", "")), cf_opt(argc, argv, "--sf-pin-key", "9.6"), nullptr);
             if (!zc) { fprintf(stderr, "count-field: %s\n", z3_error()); return 1; }
-            const double lcf = atof(cf_opt(argc, argv, "--sf-pin-key", "9.6")) / g.um, pp = atof(cf_opt(argc, argv, "--sf-pin-p", "0.001"));
+            const double lcf = opt_atof("--sf-pin-key", cf_opt(argc, argv, "--sf-pin-key", "9.6")) / g.um, pp = opt_atof("--sf-pin-p", cf_opt(argc, argv, "--sf-pin-p", "0.001"));
             const double oz = (double)(g.origin[0] - imod->origin[0]), oy = (double)(g.origin[1] - imod->origin[1]), ox = (double)(g.origin[2] - imod->origin[2]);
             char rows[512]; snprintf(rows, sizeof rows, "%s", cf_opt(argc, argv, "--sf-pin-rows", "")); unsigned rs = 12345;
             for (char *tok = strtok(rows, ","); tok; tok = strtok(nullptr, ",")) {
@@ -927,11 +928,11 @@ int cmd_count_field(int argc, char **argv) {
             }
             free(wr);
             fprintf(stderr, "count-field: %zu ground-truth pins (gauge %.3f), the reference off >= 0.5 turn at %.3f of them\n", npin, gauge, npin ? (double)off1 / npin : 0);
-            sc.npin = npin; sc.pz = pin[0]; sc.py = pin[1]; sc.px = pin[2]; sc.pu = pin[3]; sc.w_pin = atof(cf_opt(argc, argv, "--sf-pin-w", "5"));
+            sc.npin = npin; sc.pz = pin[0]; sc.py = pin[1]; sc.px = pin[2]; sc.pu = pin[3]; sc.w_pin = opt_atof("--sf-pin-w", cf_opt(argc, argv, "--sf-pin-w", "5"));
         }
         sc.uout = malloc(L->n * sizeof(float)); if (!sc.uout) { fprintf(stderr, "count-field: out of memory (spiral U)\n"); return 1; }
         if (nn_spiral_fit(&sc)) { fprintf(stderr, "count-field: the spiral fit failed\n"); return 1; }
-        const int blend = atoi(cf_opt(argc, argv, "--sf-blend", "1")), bR = atoi(cf_opt(argc, argv, "--sf-blend-R", "2"));
+        const int blend = opt_atoi("--sf-blend", cf_opt(argc, argv, "--sf-blend", "1")), bR = opt_atoi("--sf-blend-R", cf_opt(argc, argv, "--sf-blend-R", "2"));
         if (blend && q[6]) {   /* the output: the reference where it is trusted, the spiral where it was released (anchor confidence, box-smoothed) */
             float *a = malloc(L->n * sizeof(float)); for (size_t i = 0; i < L->n; i++) a[i] = 1;
             for (size_t jj = 0; jj < j; jj++) a[((size_t)iz[jj] * L->hh + iy[jj]) * L->w + ix[jj]] = q[6][jj];
@@ -963,7 +964,7 @@ int cmd_count_field(int argc, char **argv) {
        are taken against W without the global gauge g and rotated by e^{-2 pi i g} afterwards (the CPU's two passes: against W + g in
        fp32; the same sums up to fp32 rounding) */
     float *ggr = nullptr, *ggi = nullptr;
-    int gmo = gpu && mo && !R && strcmp(cf_opt(argc, argv, "--gauge", "demod"), "ls") && !atoi(cf_opt(argc, argv, "--sp-w", "0"));
+    int gmo = gpu && mo && !R && strcmp(cf_opt(argc, argv, "--gauge", "demod"), "ls") && !opt_atoi("--sp-w", cf_opt(argc, argv, "--sp-w", "0"));
     if (gmo) {
         ggr = calloc(L->n, sizeof(float)); ggi = calloc(L->n, sizeof(float)); if (!ggr || !ggi) { fprintf(stderr, "count-field: out of memory (gauge sums)\n"); return 1; }
         const cf_gpu_gscfg gc = {D, H, W, P, L->d, L->hh, L->w, na, dir, h, g.cy, g.cx, L->U};
@@ -1011,7 +1012,7 @@ int cmd_count_field(int argc, char **argv) {
             for (int z = z0; z < z1; z++) { M.z = z; cf_par(L->hh, cf_gsum_run, &GS); }
             fit_fields_free(&b);
         }
-        gls = cf_gauge_solve(L, gr2, gi2, atoi(cf_opt(argc, argv, "--gauge-R", "5")), iters); free(gr2); free(gi2);
+        gls = cf_gauge_solve(L, gr2, gi2, opt_atoi("--gauge-R", cf_opt(argc, argv, "--gauge-R", "5")), iters); free(gr2); free(gi2);
         if (!gls) { fprintf(stderr, "count-field: the gauge solve failed\n"); return 1; }
         M.gls = gls;
     }
@@ -1033,13 +1034,13 @@ int cmd_count_field(int argc, char **argv) {
         if (t) { char buf[4096]; const size_t r = fread(buf, 1, sizeof buf - 1, t); buf[r] = 0; off = strstr(buf, "zarr_offset") != nullptr; fclose(t); }
         zarr = into || !strcmp(fmt, "zarr") || (!strcmp(fmt, "auto") && inz && !off);
         if (zarr && (!inz || (off && !into))) { fprintf(stderr, "count-field: --format zarr needs zarr input arrays of the same box (no zarr_offset)\n"); return 2; }
-        if (zarr && wwc && !strcmp(cf_opt(argc, argv, "--wc", ""), "1")) fprintf(stderr, "count-field: zarr output: no wc.f32 (raw only)\n");
+        if (zarr && wwc) fprintf(stderr, "count-field: zarr output: no wc.f32 (raw only)\n");
         if (mo) zarr = 0;
     }
     const int doc = zarr || mo ? 0 : wwc;   /* wc.f32 with raw output only */
     const int BZ = zarr ? 128 : CZ; if (zarr && CZ > BZ) CZ = BZ;
     FILE *fp[15] = {0}, *fwc = nullptr, *fcl = nullptr; z3w *zw[4] = {0};
-    const int spw = atoi(cf_opt(argc, argv, "--sp-w", "0")), nzp = spw ? 4 : 3;   /* --sp-w 1: sp from |grad W| (the density term agrees with the phase) */
+    const int spw = opt_atoi("--sp-w", cf_opt(argc, argv, "--sp-w", "0")), nzp = spw ? 4 : 3;   /* --sp-w 1: sp from |grad W| (the density term agrees with the phase) */
     if (zarr) {
         for (int k = 2; k < 15; k++) {
             if ((k >= 10 && k < 14 && !w4d) || (k == 14 && !recto) || (k == 8 && spw)) continue;
@@ -1064,7 +1065,7 @@ int cmd_count_field(int argc, char **argv) {
     const int nring = 2 * Rz + 1; float *ring = malloc((size_t)nring * 3 * HW * sizeof(float)), *Wring = malloc((size_t)nring * HW * sizeof(float));
     float *gr = gmo ? ggr : *mdir ? calloc(L->n, sizeof(float)) : nullptr, *gi = gmo ? ggi : *mdir ? calloc(L->n, sizeof(float)) : nullptr;
     if (!opc || !ops || !ocl || (doc && !wc) || !ring || !Wring || (*mdir && (!gr || !gi))) { fprintf(stderr, "count-field: out of memory\n"); return 1; }
-    cf_out O = {nullptr, 0, 0, L, ring, nullptr, Sfine, cl, 0, D, H, W, Rz, P, !strcmp(cmode, "w") ? 0 : !strcmp(cmode, "phase") ? 1 : !strcmp(cmode, "pmax") ? 3 : 2, R > 0 ? (gls ? 2 : 1) : 0, atoi(cf_opt(argc, argv, "--fine", "0")), atoi(cf_opt(argc, argv, "--trust-f", "0")), atof(cf_opt(argc, argv, "--keep", "0")), atof(cf_opt(argc, argv, "--conf-w", "1")), tr0, tr1, opc, ops, ocl, osp, gW, wc, gr, gi, {{0}}};
+    cf_out O = {nullptr, 0, 0, L, ring, nullptr, Sfine, cl, 0, D, H, W, Rz, P, !strcmp(cmode, "w") ? 0 : !strcmp(cmode, "phase") ? 1 : !strcmp(cmode, "pmax") ? 3 : 2, R > 0 ? (gls ? 2 : 1) : 0, opt_atoi("--fine", cf_opt(argc, argv, "--fine", "0")), opt_atoi("--trust-f", cf_opt(argc, argv, "--trust-f", "0")), opt_atof("--keep", cf_opt(argc, argv, "--keep", "0")), opt_atof("--conf-w", cf_opt(argc, argv, "--conf-w", "1")), tr0, tr1, opc, ops, ocl, osp, gW, wc, gr, gi, {{0}}};
     double resid[2][2] = {{0, 0}, {0, 0}};   /* UFSM_CF_RESID: plaquettes, residues (input, output) */
     const int olo = into ? (int)(irow[0] - ioff[0]) : 0, ohi = into ? (int)(irow[1] - ioff[0]) : D;   /* the box rows written */
     for (int b0 = olo; b0 < ohi && !gmo; b0 += BZ) {   /* (gmo: done above) */
@@ -1211,7 +1212,7 @@ int cmd_cf_compare(int argc, char **argv) {
     printf("cf-compare: lattice %dx%dx%d (%zu nodes): |delta A - B| max %.3g, p99 %.3g, p99.9 %.3g, p99.99 %.3g turn; > 0.01 turn at %zu nodes, > 0.5 turn at %zu (%.2e)\n",
            a->lz, a->ly, a->lx, nl, mx, cf_hq(hl, nl, 0.99), cf_hq(hl, nl, 0.999), cf_hq(hl, nl, 0.9999), n01, ni, (double)ni / nl);
     if (argc > 4 && argv[4][0] != '-') {
-        cf_nt = ufsm_threads(atoi(cf_opt(argc, argv, "--threads", "0")), 8); const int step = atoi(cf_opt(argc, argv, "--step", "4"));
+        cf_nt = ufsm_threads(opt_atoi("--threads", cf_opt(argc, argv, "--threads", "0")), 8); const int step = opt_atoi("--step", cf_opt(argc, argv, "--step", "4"));
         fit_fields_buf g; if (fit_fields_load(argv[4], 0, 0, 0, &g)) { fprintf(stderr, "cf-compare: cannot load %s\n", argv[4]); return 1; }
         const int D = g.shape[0]; fit_fields_skip_planes(1 | 2 | 4);
         cf_cmp C = {.a = a, .b = b, .step = step, .h = g.h}; for (int t = 0; t < CF_MAXT; t++) C.hist[t] = calloc(CF_NH, sizeof(uint64_t));
@@ -1283,16 +1284,16 @@ static void cf_dm2_run(void *a_, long k0, long k1, int t) {
 int cmd_cf_demod(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm cf-demod <model> <fields> [--out DIR] [--R 1] [--L N] [--cmax 0.5] [--band 64] [--step 2] [--cz 32] [--c0 0.1] [--drift-max 0] [--threads N]\n"); return 2; }
     fit_model *m = fit_load(argv[2]); if (!m) { fprintf(stderr, "cf-demod: cannot load the model %s\n", argv[2]); return 1; }
-    const char *out = cf_opt(argc, argv, "--out", ""); const int R = atoi(cf_opt(argc, argv, "--R", "1")), band = atoi(cf_opt(argc, argv, "--band", "64"));
-    const int step = atoi(cf_opt(argc, argv, "--step", "2")), CZ = atoi(cf_opt(argc, argv, "--cz", "32")); const double c0 = atof(cf_opt(argc, argv, "--c0", "0.1")), dmax = atof(cf_opt(argc, argv, "--drift-max", "0"));
+    const char *out = cf_opt(argc, argv, "--out", ""); const int R = opt_atoi("--R", cf_opt(argc, argv, "--R", "1")), band = opt_atoi("--band", cf_opt(argc, argv, "--band", "64"));
+    const int step = opt_atoi("--step", cf_opt(argc, argv, "--step", "2")), CZ = opt_atoi("--cz", cf_opt(argc, argv, "--cz", "32")); const double c0 = opt_atof("--c0", cf_opt(argc, argv, "--c0", "0.1")), dmax = opt_atof("--drift-max", cf_opt(argc, argv, "--drift-max", "0"));
     if (R < 0 || band < 1 || step < 1 || CZ < 1) { fprintf(stderr, "cf-demod: --R >= 0, --band, --step, --cz >= 1\n"); return 2; }
-    cf_nt = ufsm_threads(atoi(cf_opt(argc, argv, "--threads", "0")), 8);
+    cf_nt = ufsm_threads(opt_atoi("--threads", cf_opt(argc, argv, "--threads", "0")), 8);
     fit_fields_skip_planes(1 | 2 | 8);
     fit_fields_buf g; if (fit_fields_load(argv[3], 0, 0, 0, &g)) { fprintf(stderr, "cf-demod: cannot load %s\n", argv[3]); return 1; }
     const int D = g.shape[0]; const double h = g.h; fit_fields_free(&g);
     {   /* --L N: a finer output lattice (N native voxels, a divisor of the model's L): the model's delta resampled exactly (a trilinear
            field sampled at a refinement of its own lattice is reproduced by trilinear interpolation of the samples) */
-        const int L2 = atoi(cf_opt(argc, argv, "--L", "0"));
+        const int L2 = opt_atoi("--L", cf_opt(argc, argv, "--L", "0"));
         if (L2 > 0 && L2 != m->L) {
             if (m->L % L2) { fprintf(stderr, "cf-demod: --L %d must divide the model's lattice %d\n", L2, m->L); return 2; }
             const int f = m->L / L2, lz = (m->lz - 1) * f + 1, ly = (m->ly - 1) * f + 1, lx = (m->lx - 1) * f + 1;
@@ -1356,7 +1357,7 @@ int cmd_cf_demod(int argc, char **argv) {
             }
         }
         size_t nset = 0; double sabs = 0;
-        const double cmax = atof(cf_opt(argc, argv, "--cmax", "0.5"));   /* corrections above cmax turn (the phase half a turn off the ref: ambiguous) are left out */
+        const double cmax = opt_atof("--cmax", cf_opt(argc, argv, "--cmax", "0.5"));   /* corrections above cmax turn (the phase half a turn off the ref: ambiguous) are left out */
         for (size_t j = 0; j < nl; j++) if (lre[j] != 0 || lim[j] != 0) { const double c = atan2(lim[j], lre[j]) / (2 * M_PI); if (fabs(c) > cmax) continue; m->delta[j] += (float)c; nset++; sabs += fabs(c); }
         free(tmp);
         if (fit_save(m, out)) { fprintf(stderr, "cf-demod: cannot write %s\n", out); return 1; }

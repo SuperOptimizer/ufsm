@@ -1,4 +1,5 @@
 #include "deform.h"
+#include "optcheck.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +14,7 @@ deform_cfg deform_cfg_default(void) {
     c.crush.bend_p = .7f; c.crush.bend_amp = .1f; c.crush.kink_p = .4f; c.crush.klo = 1.3f; c.crush.khi = 2.5f; c.crush.rotate_deg = 0;
     return c;
 }
-static const char *df_opt(int argc, char **argv, const char *f) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], f)) return argv[i + 1]; return nullptr; }
+static const char *df_opt(int argc, char **argv, const char *f) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(f))) return argv[i + 1]; return nullptr; }
 int deform_cfg_parse(deform_cfg *c, int argc, char **argv) {
     if (crush_cfg_parse(&c->crush, argc, argv)) return 1;
     c->crush.rotate_deg = 0;

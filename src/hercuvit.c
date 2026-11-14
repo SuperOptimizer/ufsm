@@ -12,6 +12,7 @@
    attribute ufsm.origin_zyx = box origin (ufsm overlay reads it). Work per output shard tile (windows overlapping two tiles run
    twice, as the reference's tile halo). */
 #include "hercuvit.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "store.h"
 #include "xnet.h"
@@ -27,7 +28,7 @@
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 static int write_file(const char *dir, const char *name, const void *p, size_t n) {
@@ -51,7 +52,7 @@ static int dump_half(const char *dir, const char *name, const void *dev, size_t 
 /* --raw-in: one window through the network (parity with the PyTorch reference) */
 static int raw_mode(hv_net *net, int argc, char **argv) {
     const char *in = opt(argc, argv, "--raw-in", nullptr), *out = opt(argc, argv, "--raw-out", nullptr);
-    const int T = atoi(opt(argc, argv, "--window", "128")), reps = atoi(opt(argc, argv, "--reps", "1"));
+    const int T = opt_atoi("--window", opt(argc, argv, "--window", "128")), reps = opt_atoi("--reps", opt(argc, argv, "--reps", "1"));
     if (!in || !out) { fprintf(stderr, "hercuvit --raw-in U8 --raw-out DIR [--window 128] [--skips 1]\n"); return 2; }
     const size_t nv = (size_t)T * T * T; uint8_t *u = malloc(nv);
     FILE *f = fopen(in, "rb"); if (!f || !u || fread(u, 1, nv, f) != nv) { fprintf(stderr, "hercuvit: %s is not %d^3 bytes\n", in, T); return 1; } fclose(f);
@@ -70,7 +71,7 @@ static int raw_mode(hv_net *net, int argc, char **argv) {
     { char cmd[1500]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", out); if (system(cmd)) return 1; }
     const int g = T / 8;
     if (dump_half(out, "tokens.f32", hv_tokens(net), (size_t)g * g * g * 288)) return 1;
-    if (atoi(opt(argc, argv, "--skips", "0"))) for (int k = 0; k < 3; k++) { int e, ch; const void *p = hv_skip(net, k, &e, &ch); char nm[32]; snprintf(nm, sizeof nm, "skip%d.f32", k);
+    if (opt_atoi("--skips", opt(argc, argv, "--skips", "0"))) for (int k = 0; k < 3; k++) { int e, ch; const void *p = hv_skip(net, k, &e, &ch); char nm[32]; snprintf(nm, sizeof nm, "skip%d.f32", k);
         if (dump_half(out, nm, p, (size_t)e * e * e * ch)) return 1; }
     float *m = malloc(nv * 4), *mb = xmalloc_dev(nv * 4), *mh = malloc(nv * 4); uint8_t *ow = xmalloc_dev(nv), *oh = malloc(nv);
     xd2h(m, hv_margin(net), nv * 4);
@@ -114,15 +115,15 @@ int cmd_hercuvit(int argc, char **argv) {
                         "  ufsm hercuvit --ckpt PTH --raw-in WINDOW.u8 --raw-out DIR [--window 128] [--skips 1]   one window (parity)\n");
         return 2;
     }
-    if (xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
-    if (opt(argc, argv, "--gpu-mem", nullptr)) xnet_set_budget((size_t)(atof(opt(argc, argv, "--gpu-mem", "8")) * 1e9));
+    if (xnet_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
+    if (opt(argc, argv, "--gpu-mem", nullptr)) xnet_set_budget((size_t)(opt_atof("--gpu-mem", opt(argc, argv, "--gpu-mem", "8")) * 1e9));
     hv_net *net = hv_load(ck); if (!net) return 1;
     if (opt(argc, argv, "--raw-in", nullptr)) { const int rc = raw_mode(net, argc, argv); hv_free(net); return rc; }
 
     const char *root = argv[2], *key = argv[3], *out = argv[4];
-    const int P = atoi(opt(argc, argv, "--window", "128")), inst = atoi(opt(argc, argv, "--instances", "1")), air = atoi(opt(argc, argv, "--air", "25"));
-    const int SH = atoi(opt(argc, argv, "--shard", "512")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
-    const double ov = atof(opt(argc, argv, "--overlap", "0.25")), thr = atof(opt(argc, argv, "--thresh", "0.4")), um = atof(opt(argc, argv, "--um", "9.6"));
+    const int P = opt_atoi("--window", opt(argc, argv, "--window", "128")), inst = opt_atoi("--instances", opt(argc, argv, "--instances", "1")), air = opt_atoi("--air", opt(argc, argv, "--air", "25"));
+    const int SH = opt_atoi("--shard", opt(argc, argv, "--shard", "512")), nth = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8);
+    const double ov = opt_atof("--overlap", opt(argc, argv, "--overlap", "0.25")), thr = opt_atof("--thresh", opt(argc, argv, "--thresh", "0.4")), um = opt_atof("--um", opt(argc, argv, "--um", "9.6"));
     const float lthr = (float)log(thr / (1.0 - thr));
     int S = 2 * (int)fmax(1.0, round(P * (1.0 - ov) / 2)); if (S > P) S = P; if (S < 2) S = 2;
     if (SH % 128 || SH < 128) { fprintf(stderr, "hercuvit: --shard must be a multiple of 128\n"); return 2; }

@@ -1,5 +1,6 @@
 /* vwt_tile (src/vwt_tile.h): slab tiling of a box, neighbour pairs and their overlap point sets, save / load. */
 #include "vwt_tile.h"
+#include "optcheck.h"
 #include "json.h"
 #include <math.h>
 #include <stdio.h>
@@ -133,15 +134,15 @@ int vwt_slab_pairs(const vwt_tiling *t, int k, int **pairs, int **side) {
 
 /* ufsm vwt-tile UMB.json OUT.bin --box z,y,x,nz,ny,nx [--T 128 --L 384 --sz 112 --sr 320 --st 112 --r0 16]: build + save a tiling */
 #include <time.h>
-static const char *topt(int argc, char **argv, const char *k, const char *d) { for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *topt(int argc, char **argv, const char *k, const char *d) { for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 int cmd_vwt_tile(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm vwt-tile UMB.json OUT.bin --box z,y,x,nz,ny,nx [--T 128 --L 384 --sz 112 --sr 320 --st 112 --r0 16]\n"); return 2; }
     int64_t box[6]; long long b[6];
     if (sscanf(topt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) { fprintf(stderr, "vwt-tile: --box z,y,x,nz,ny,nx\n"); return 2; }
     for (int i = 0; i < 6; i++) box[i] = b[i];
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
-    vwt_tiling t; if (vwt_tiling_build(argv[2], box, atoi(topt(argc, argv, "--T", "128")), atoi(topt(argc, argv, "--L", "384")), atof(topt(argc, argv, "--sz", "112")),
-                                       atof(topt(argc, argv, "--sr", "320")), atof(topt(argc, argv, "--st", "112")), atof(topt(argc, argv, "--r0", "16")), &t)) return 1;
+    vwt_tiling t; if (vwt_tiling_build(argv[2], box, opt_atoi("--T", topt(argc, argv, "--T", "128")), opt_atoi("--L", topt(argc, argv, "--L", "384")), opt_atof("--sz", topt(argc, argv, "--sz", "112")),
+                                       opt_atof("--sr", topt(argc, argv, "--sr", "320")), opt_atof("--st", topt(argc, argv, "--st", "112")), opt_atof("--r0", topt(argc, argv, "--r0", "16")), &t)) return 1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double mp = 0; for (int q = 0; q < t.np; q++) mp += t.p[q].npts;
     printf("vwt-tile: %d slabs, %d pairs (mean %.0f points), %.1f s\n", t.n, t.np, t.np ? mp / t.np : 0, (t1.tv_sec - t0.tv_sec) + 1e-9 * (t1.tv_nsec - t0.tv_nsec));

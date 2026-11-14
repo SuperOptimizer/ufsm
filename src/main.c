@@ -1,5 +1,6 @@
 /* ufsm CLI. */
 #include "afv.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "sample.h"
 #include "sources.h"
@@ -134,7 +135,7 @@ int cmd_ink_vscore(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_onfly(int argc, char **argv);   /* src/inksplat.c */
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
-static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
+static int arg_index(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], opt_n(k))) return i; return -1; }
 
 static int usage(void) {
     fprintf(stderr,
@@ -295,11 +296,11 @@ static int usage(void) {
 }
 
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 static int flag(int argc, char **argv, const char *name) {
-    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], name)) return 1;
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], opt_n(name))) return 1;
     return 0;
 }
 
@@ -559,27 +560,27 @@ static void *praster_shards(void *arg) {
 }
 static int cmd_phase_raster(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm phase-raster <codes-root> <key> <out-dir> [--axis A] [--radius 80] [--span 75] [--box z,y,x,nz,ny,nx] [--threads 4] [--block 256] [--pool 2] [--resume 1] [--winding 1] [--gs 4] [--codes-grid 1] [--mask-ref ROOT KEY] [--mask-tol 0.1] [--gpu D] [--gpu-slots 2]\n"); return 2; }
-    const int pool = atoi(opt(argc, argv, "--pool", "1")), resume = atoi(opt(argc, argv, "--resume", "0"));   /* --pool 2: write only the 9.6 um (2x circular-mean) phase; --resume: skip written shards */
-    const int winding = atoi(opt(argc, argv, "--winding", "0"));   /* the winding mod 14 turns (band_winding) instead of the 1-turn phase */
+    const int pool = opt_atoi("--pool", opt(argc, argv, "--pool", "1")), resume = opt_atoi("--resume", opt(argc, argv, "--resume", "0"));   /* --pool 2: write only the 9.6 um (2x circular-mean) phase; --resume: skip written shards */
+    const int winding = opt_atoi("--winding", opt(argc, argv, "--winding", "0"));   /* the winding mod 14 turns (band_winding) instead of the 1-turn phase */
     if (pool != 1 && pool != 2) { fprintf(stderr, "phase-raster: --pool 1|2\n"); return 2; }
-    const int codes_grid = atoi(opt(argc, argv, "--codes-grid", "0"));   /* 1: the codes are already on the output grid (raster --level 2 for --gs 4: no pooling) */
-    const int gs = atoi(opt(argc, argv, "--gs", "2")), pf = codes_grid ? 1 : gs / 2;   /* native voxels per output grid voxel: 2 the codes' own 4.8 um grid, 4 the codes pooled 2x (9.6 um) */
+    const int codes_grid = opt_atoi("--codes-grid", opt(argc, argv, "--codes-grid", "0"));   /* 1: the codes are already on the output grid (raster --level 2 for --gs 4: no pooling) */
+    const int gs = opt_atoi("--gs", opt(argc, argv, "--gs", "2")), pf = codes_grid ? 1 : gs / 2;   /* native voxels per output grid voxel: 2 the codes' own 4.8 um grid, 4 the codes pooled 2x (9.6 um) */
     if (gs != 2 && gs != 4) { fprintf(stderr, "phase-raster: --gs 2|4\n"); return 2; }
     if (gs == 4 && pool != 1) { fprintf(stderr, "phase-raster: --gs 4 writes the 9.6 um grid itself (no --pool)\n"); return 2; }
-    band_params bp = {(float)atof(opt(argc, argv, "--radius", "80")), (float)atof(opt(argc, argv, "--span", "75")), (float)gs};
+    band_params bp = {(float)opt_atof("--radius", opt(argc, argv, "--radius", "80")), (float)opt_atof("--span", opt(argc, argv, "--span", "75")), (float)gs};
     axis ax = {0};
     if (axis_load(&ax, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "phase-raster: cannot load axis\n"); return 1; }
     z3 *z = z3_open(store_open(argv[2]), argv[3], nullptr); if (!z) { fprintf(stderr, "%s\n", z3_error()); return 1; }
     const z3_meta *m = z3_meta_of(z); const int64_t fshape[3] = {m->shape[0], m->shape[1], m->shape[2]};
     const int64_t shape[3] = {(fshape[0] + pf - 1) / pf, (fshape[1] + pf - 1) / pf, (fshape[2] + pf - 1) / pf};   /* the output grid */
-    const int blk = atoi(opt(argc, argv, "--block", "256")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 4);
+    const int blk = opt_atoi("--block", opt(argc, argv, "--block", "256")), nth = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 4);
     if (512 % blk) { fprintf(stderr, "phase-raster: --block must divide 512\n"); return 2; }
     int64_t lo[3] = {0, 0, 0}, hi[3] = {shape[0], shape[1], shape[2]};
     const char *bx = opt(argc, argv, "--box", nullptr);
     if (bx) { long long v[6]; if (sscanf(bx, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return usage(); for (int d = 0; d < 3; d++) { lo[d] = v[d] / gs; hi[d] = (v[d] + v[3 + d] + gs - 1) / gs; } }
     const double um = 2.4 * gs * pool; char lv[32]; z3w_level_name(um, lv, sizeof lv);
     char dir[1400]; snprintf(dir, sizeof dir, "%s/%s", argv[4], lv);
-    const int pair_attr = atoi(opt(argc, argv, "--pair", "0"));
+    const int pair_attr = opt_atoi("--pair", opt(argc, argv, "--pair", "0"));
     if (pair_attr == 2 && (pool != 1 || winding)) { fprintf(stderr, "phase-raster: --pair 2 writes side labels on the computed grid (no --pool 2 / --winding)\n"); return 2; }
     char attrs[700]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s%s%s\",\"codes\":\"%s/%s\",\"radius\":%g,\"span\":%g}}",
                                    pair_attr == 2 ? "recto / verso side (src/band.h band_field_side_pair: 0 unknown, 1 verso, 2 recto; wrap k .. k + 0.5 recto, k + 0.5 .. k + 1 verso)"
@@ -592,7 +593,7 @@ static int cmd_phase_raster(int argc, char **argv) {
     if (z3w_write_group(argv[4], &um, 1, "ufsm-phase", attrs)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     /* the shards to compute (--resume skips written ones), --shards S of them at a time, each over --threads block threads: within one
        512^3 shard at most 8 blocks of 256 run, so one shard at a time left most cores idle (Paris4 at 9.6 um: 54 min on the desk) */
-    const int nsh = atoi(opt(argc, argv, "--shards", "1")) < 1 ? 1 : atoi(opt(argc, argv, "--shards", "1")) > 64 ? 64 : atoi(opt(argc, argv, "--shards", "1"));
+    const int nsh = opt_atoi("--shards", opt(argc, argv, "--shards", "1")) < 1 ? 1 : opt_atoi("--shards", opt(argc, argv, "--shards", "1")) > 64 ? 64 : opt_atoi("--shards", opt(argc, argv, "--shards", "1"));
     size_t skipped = 0, nlist = 0, cap = 0; int64_t (*list)[3] = nullptr;
     for (int64_t sz = lo[0] / 512; sz * 512 < hi[0]; sz++) for (int64_t sy = lo[1] / 512; sy * 512 < hi[1]; sy++) for (int64_t sx = lo[2] / 512; sx * 512 < hi[2]; sx++) {
         if (resume) { char sp[1600]; snprintf(sp, sizeof sp, "%s/c/%lld/%lld/%lld", dir, (long long)sz, (long long)sy, (long long)sx); if (access(sp, F_OK) == 0) { skipped++; continue; } }
@@ -600,9 +601,9 @@ static int cmd_phase_raster(int argc, char **argv) {
         list[nlist][0] = sz; list[nlist][1] = sy; list[nlist][2] = sx; nlist++;
     }
     /* --pair 1: band_field_phase_pair (the two nearest sheets of opposite winding parity; no radial inside / outside, no span) */
-    const int pair = atoi(opt(argc, argv, "--pair", "0"));
+    const int pair = opt_atoi("--pair", opt(argc, argv, "--pair", "0"));
     if (pair && winding) { fprintf(stderr, "phase-raster: --pair writes the 1-turn phase (no --winding)\n"); return 2; }
-    z3 *mref = nullptr; const double mtol = atof(opt(argc, argv, "--mask-tol", "0.1"));
+    z3 *mref = nullptr; const double mtol = opt_atof("--mask-tol", opt(argc, argv, "--mask-tol", "0.1"));
     { const int mi = arg_index(argc, argv, "--mask-ref");
       if (mi > 0) {
           if (mi + 2 >= argc || pool != 1) { fprintf(stderr, "phase-raster: --mask-ref ROOT KEY (a phase on the output grid; no --pool 2)\n"); return 2; }
@@ -611,8 +612,8 @@ static int cmd_phase_raster(int argc, char **argv) {
       } }
     /* --gpu D: the pair rule (--pair 1) on device D (-1: the CPU); --gpu-slots K: block threads on the GPU at once (~0.4 GB each at
        --block 256 / radius 160 / gs 4); the rest wait for a slot. Byte-identical either way (tests/test_band_pair.c). */
-    const int gpu = pair == 1 ? atoi(opt(argc, argv, "--gpu", "-1")) : -1;
-    if (gpu >= 0) { if (!band_pair_gpu) { fprintf(stderr, "phase-raster: this binary has no GPU pair rule (nn_band.o)\n"); return 2; } band_pair_gpu_slots(atoi(opt(argc, argv, "--gpu-slots", "2")), gpu); }
+    const int gpu = pair == 1 ? opt_atoi("--gpu", opt(argc, argv, "--gpu", "-1")) : -1;
+    if (gpu >= 0) { if (!band_pair_gpu) { fprintf(stderr, "phase-raster: this binary has no GPU pair rule (nn_band.o)\n"); return 2; } band_pair_gpu_slots(opt_atoi("--gpu-slots", opt(argc, argv, "--gpu-slots", "2")), gpu); }
     praster_run R = {.gpu = gpu, .mref = mref, .mtol = mtol, .z = z, .shape = shape, .ax = &ax, .bp = bp, .halo = (int)ceilf((pair == 2 ? 2 * bp.radius : (pair ? 0 : bp.span) + bp.radius) / (float)gs) + 2, .blk = blk, .winding = winding, .pf = pf, .pair = pair,
                      .fshape = fshape, .w = w, .pool = pool, .nt = nth < 1 ? 1 : nth > 64 ? 64 : nth, .list = list, .nlist = nlist, .t0 = now(), .mu = PTHREAD_MUTEX_INITIALIZER};
     pthread_t sth[64];
@@ -625,7 +626,7 @@ static int cmd_phase_raster(int argc, char **argv) {
     const size_t nonempty = R.nonempty, nshards = nlist;
     if (z3w_close(w)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     fprintf(stderr, "\nphase-raster: %zu shards (%zu already written), %zu blocks with codes, %.0fs -> %s\n", nshards, skipped, nonempty, now() - R.t0, dir);
-    if (pair_attr != 2) { const double vu = atof(opt(argc, argv, "--vol-um", "2.4")) * gs * pool;   /* (the key names the grid as if the scan were 2.4 um) */
+    if (pair_attr != 2) { const double vu = opt_atof("--vol-um", opt(argc, argv, "--vol-um", "2.4")) * gs * pool;   /* (the key names the grid as if the scan were 2.4 um) */
         fprintf(stderr, "phase-raster: known %zu voxels written (%.1f mm^3 at %g um voxels, --vol-um; this run's shards only)\n", R.known, (double)R.known * pow(vu * 1e-3, 3), vu); }
     if (mref) {
         const double b = R.mboth ? (double)R.mboth : 1;
@@ -652,7 +653,7 @@ static void *cpool_run(void *a) {
 static int cmd_codes_pool2(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm codes-pool2 <codes-root> <key> <out-dir> [--threads 8] [--resume 1]\n"); return 2; }
     z3 *z = z3_open(store_open(argv[2]), argv[3], nullptr); if (!z) { fprintf(stderr, "%s\n", z3_error()); return 1; }
-    const int nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8), resume = atoi(opt(argc, argv, "--resume", "1"));
+    const int nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8), resume = opt_atoi("--resume", opt(argc, argv, "--resume", "1"));
     const z3_meta *m = z3_meta_of(z); const int64_t fshape[3] = {m->shape[0], m->shape[1], m->shape[2]};
     const int64_t shape[3] = {(fshape[0] + 1) / 2, (fshape[1] + 1) / 2, (fshape[2] + 1) / 2};
     const double um = 9.6; char lv[32]; z3w_level_name(um, lv, sizeof lv); char dir[1400]; snprintf(dir, sizeof dir, "%s/%s", argv[4], lv);
@@ -694,18 +695,18 @@ static int cmd_codes_pool2(int argc, char **argv) {
    these codes). Prints per window ms, tiles, differing voxels; exit 1 on any difference. */
 static int cmd_phase_onfly(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm phase-onfly <codes-root> <key> --rmax R [--pool2 1] [--fuse ROOT2 KEY2 [--fuse-rmax R2] [--tol 0.1]] [--ref ROOT KEY] [--windows 8] [--P 896] [--gpu D] [--slots 1] [--budget-mb 1024] [--threads 8]\n"); return 2; }
-    const float rmax = (float)atof(opt(argc, argv, "--rmax", "0")); const int nw = atoi(opt(argc, argv, "--windows", "8")), P = atoi(opt(argc, argv, "--P", "896"));
-    const int gpu = atoi(opt(argc, argv, "--gpu", "-1")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
+    const float rmax = (float)opt_atof("--rmax", opt(argc, argv, "--rmax", "0")); const int nw = opt_atoi("--windows", opt(argc, argv, "--windows", "8")), P = opt_atoi("--P", opt(argc, argv, "--P", "896"));
+    const int gpu = opt_atoi("--gpu", opt(argc, argv, "--gpu", "-1")), nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8);
     if (!(rmax > 0) || nw < 1 || P < 8) { fprintf(stderr, "phase-onfly: --rmax > 0, --windows >= 1, --P >= 8\n"); return 2; }
-    if (phase_onfly_config(gpu, atoi(opt(argc, argv, "--slots", "1")), atoi(opt(argc, argv, "--budget-mb", "1024")), 1)) { fprintf(stderr, "phase-onfly: GPU %d unavailable\n", gpu); return 1; }
+    if (phase_onfly_config(gpu, opt_atoi("--slots", opt(argc, argv, "--slots", "1")), opt_atoi("--budget-mb", opt(argc, argv, "--budget-mb", "1024")), 1)) { fprintf(stderr, "phase-onfly: GPU %d unavailable\n", gpu); return 1; }
     z3 *c = z3_open(store_open(argv[2]), argv[3], nullptr); if (!c) { fprintf(stderr, "%s\n", z3_error()); return 1; }
-    const int pool2 = atoi(opt(argc, argv, "--pool2", "0"));   /* --pool2 1: the codes pooled 2x on read (codes_pool2_open; phase-raster --gs 4's codes) */
+    const int pool2 = opt_atoi("--pool2", opt(argc, argv, "--pool2", "0"));   /* --pool2 1: the codes pooled 2x on read (codes_pool2_open; phase-raster --gs 4's codes) */
     if (pool2) { z3 *p2 = codes_pool2_open(c); if (!p2) { fprintf(stderr, "phase-onfly: --pool2: cubic codes chunks only\n"); return 1; } c = p2; }
     z3 *ph = phase_onfly_open(c, rmax); z3 *ref = nullptr;
     const int fi = arg_index(argc, argv, "--fuse");   /* --fuse ROOT2 KEY2: the phase of these codes and ROOT2's fused (phase-fuse --tol, the onfly "sets") */
     if (fi > 0) { z3 *c2 = fi + 2 < argc ? z3_open(store_open(argv[fi + 1]), argv[fi + 2], nullptr) : nullptr; if (!c2) { fprintf(stderr, "phase-onfly: --fuse ROOT KEY: %s\n", z3_error()); return 1; }
         if (pool2) c2 = codes_pool2_open(c2);
-        z3 *sets[2] = {ph, phase_onfly_open(c2, (float)atof(opt(argc, argv, "--fuse-rmax", opt(argc, argv, "--rmax", "0"))))}; ph = phase_onfly_fuse_open(sets, 2, (float)atof(opt(argc, argv, "--tol", "0.1"))); if (!ph) return 1; }
+        z3 *sets[2] = {ph, phase_onfly_open(c2, (float)opt_atof("--fuse-rmax", opt(argc, argv, "--fuse-rmax", opt(argc, argv, "--rmax", "0"))))}; ph = phase_onfly_fuse_open(sets, 2, (float)opt_atof("--tol", opt(argc, argv, "--tol", "0.1"))); if (!ph) return 1; }
     const int ri = arg_index(argc, argv, "--ref");
     if (ri > 0) { if (ri + 2 >= argc || !(ref = z3_open(store_open(argv[ri + 1]), argv[ri + 2], nullptr))) { fprintf(stderr, "phase-onfly: --ref ROOT KEY: %s\n", z3_error()); return 1; }
         if (memcmp(z3_meta_of(ref)->shape, z3_meta_of(ph)->shape, sizeof z3_meta_of(ph)->shape)) { fprintf(stderr, "phase-onfly: --ref shape differs from the codes'\n"); return 1; } }
@@ -779,9 +780,9 @@ static void *pcheck_count(void *arg) {
 }
 static int cmd_phase_check(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm phase-check <phase-root> <key> --axis A --scan-um U [--phase-um K] [--boxes 48] [--min 0.9] [--count 1] [--threads 8] [--sign 1] [--min-known 0.05] [--box z,y,x,nz,ny,nx]\n"); return 2; }
-    const char *ap = opt(argc, argv, "--axis", nullptr); const double scan_um = atof(opt(argc, argv, "--scan-um", "0")), phase_um = atof(opt(argc, argv, "--phase-um", argv[3]));
-    const int nbox = atoi(opt(argc, argv, "--boxes", "48")), count = atoi(opt(argc, argv, "--count", "1")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8), sign = atoi(opt(argc, argv, "--sign", "1"));
-    const double minf = atof(opt(argc, argv, "--min", "0.9")), mink = atof(opt(argc, argv, "--min-known", "0.05"));
+    const char *ap = opt(argc, argv, "--axis", nullptr); const double scan_um = opt_atof("--scan-um", opt(argc, argv, "--scan-um", "0")), phase_um = opt_atof("--phase-um", opt(argc, argv, "--phase-um", argv[3]));
+    const int nbox = opt_atoi("--boxes", opt(argc, argv, "--boxes", "48")), count = opt_atoi("--count", opt(argc, argv, "--count", "1")), nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8), sign = opt_atoi("--sign", opt(argc, argv, "--sign", "1"));
+    const double minf = opt_atof("--min", opt(argc, argv, "--min", "0.9")), mink = opt_atof("--min-known", opt(argc, argv, "--min-known", "0.05"));
     if (!ap || !(scan_um > 0) || !(phase_um > 0) || nbox < 1 || (sign != 1 && sign != -1)) { fprintf(stderr, "phase-check: --axis, --scan-um > 0, a numeric key or --phase-um, --boxes >= 1, --sign +-1\n"); return 2; }
     axis ax = {0}; if (axis_load(&ax, ap)) { fprintf(stderr, "phase-check: cannot load the axis %s\n", ap); return 1; }
     z3 *z = z3_open(store_open(argv[2]), argv[3], nullptr); if (!z) { fprintf(stderr, "phase-check: %s %s: %s\n", argv[2], argv[3], z3_error()); return 1; }
@@ -814,7 +815,7 @@ static int cmd_phase_check(int argc, char **argv) {
     if (count && nc < (size_t)nbox) { nc = 0; for (size_t i = 0; i < nl; i++) if (cnt[i] >= 2000) cand[nc++] = list[i]; }   /* sparse labels: any chunk with some phase */
     uint8_t *b = malloc(c3); double *cy = malloc(m->chunk[0] * sizeof *cy), *cx = malloc(m->chunk[0] * sizeof *cx);
     size_t up = 0, tot = 0, aup = 0, atot = 0; int used = 0; double fmin = 1, fmax = 0;
-    const double acos_min = atof(opt(argc, argv, "--aligned-cos", "0.7")); const char *cellp = opt(argc, argv, "--cells", nullptr);
+    const double acos_min = opt_atof("--aligned-cos", opt(argc, argv, "--aligned-cos", "0.7")); const char *cellp = opt(argc, argv, "--cells", nullptr);
     FILE *cells = cellp ? fopen(cellp, "w") : nullptr; if (cellp && !cells) { fprintf(stderr, "phase-check: cannot write %s\n", cellp); return 1; }
     if (cells) fprintf(cells, "# chunk cz cy cx (x %d phase voxels), pairs, rising outward, aligned pairs (|cos| to the radius > %g), aligned rising outward\n", (int)m->chunk[0], acos_min);
     const size_t want = (size_t)nbox, stride = nc > want ? nc / want : 1;
@@ -830,7 +831,7 @@ static int cmd_phase_check(int argc, char **argv) {
         size_t au = 0, at = 0; phase_outward_aligned(b, ni, o[1], o[2], cy, cx, acos_min, &au, &at); aup += au; atot += at;
         if (cells) fprintf(cells, "%lld\t%lld\t%lld\t%zu\t%zu\t%zu\t%zu\n", (long long)c[0], (long long)c[1], (long long)c[2], t, u, at, au);
         up += u; tot += t; used++; const double fr = (double)u / (double)t; if (fr < fmin) fmin = fr; if (fr > fmax) fmax = fr;
-        if (atoi(opt(argc, argv, "--verbose", "0"))) fprintf(stderr, "phase-check: chunk %lld,%lld,%lld (scan z %.0f, r %.0f): outward %.3f of %zu\n", (long long)c[0], (long long)c[1], (long long)c[2],
+        if (opt_atoi("--verbose", opt(argc, argv, "--verbose", "0"))) fprintf(stderr, "phase-check: chunk %lld,%lld,%lld (scan z %.0f, r %.0f): outward %.3f of %zu\n", (long long)c[0], (long long)c[1], (long long)c[2],
                                                               (o[0] + m->chunk[0] / 2) * f, hypot((double)(o[1] + m->chunk[1] / 2) - cy[m->chunk[0] / 2], (double)(o[2] + m->chunk[2] / 2) - cx[m->chunk[0] / 2]) * f, fr, t);
     }
     long long dc[3] = {-1, -1, -1};   /* the densest stored chunk's centre, scan voxels (a holdout spot) */
@@ -857,7 +858,7 @@ static int cmd_band(int argc, char **argv) {
     long long b[6];
     if (sscanf(argv[4], "%lld,%lld,%lld,%lld,%lld,%lld", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return usage();
     for (int d = 0; d < 6; d++) if (b[d] % 2 || (d >= 3 && b[d] <= 0)) { fprintf(stderr, "band: box must be even and positive\n"); return 2; }
-    band_params bp = {(float)atof(opt(argc, argv, "--radius", "80")), (float)atof(opt(argc, argv, "--span", "75")), 0};
+    band_params bp = {(float)opt_atof("--radius", opt(argc, argv, "--radius", "80")), (float)opt_atof("--span", opt(argc, argv, "--span", "75")), 0};
     axis ax = {0};
     if (axis_load(&ax, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "band: cannot load axis\n"); return 1; }
     const int halo = (int)ceilf((bp.radius + bp.span) / 2.f) + 2;
@@ -873,7 +874,7 @@ static int cmd_band(int argc, char **argv) {
     const char *ff_dir = opt(argc, argv, "--fit-fields", nullptr);   /* and / or the winding fitter's input fields (oracle) */
     const int pri = arg_index(argc, argv, "--phase-raster");   /* with --fit-fields: read the phase from ufsm phase-raster ROOT KEY (large boxes) */
     if (ff_dir && pri > 0 && pri + 2 < argc) {
-        const int ffh2 = atoi(opt(argc, argv, "--fit-h", "8"));
+        const int ffh2 = opt_atoi("--fit-h", opt(argc, argv, "--fit-h", "8"));
         if (ffh2 < 2 || ffh2 % 2 || b[3] % ffh2 || b[4] % ffh2 || b[5] % ffh2) { fprintf(stderr, "band: --fit-h must be even and divide the box\n"); return 2; }
         z3 *pz = z3_open(store_open(argv[pri + 1]), argv[pri + 2], nullptr); if (!pz) { fprintf(stderr, "%s\n", z3_error()); return 1; }
         const int ph = 1; int pn[3]; int64_t po[3], pnn[3];   /* the label box with a one-voxel halo (central differences) */
@@ -901,7 +902,7 @@ static int cmd_band(int argc, char **argv) {
         free(phs);
         return 0;
     }
-    const int ffh = atoi(opt(argc, argv, "--fit-h", "8"));   /* field voxel edge, native voxels (even) */
+    const int ffh = opt_atoi("--fit-h", opt(argc, argv, "--fit-h", "8"));   /* field voxel edge, native voxels (even) */
     if (ff_dir && (ffh < 2 || ffh % 2 || b[3] % ffh || b[4] % ffh || b[5] % ffh)) { fprintf(stderr, "band: --fit-h must be even and divide the box\n"); return 2; }
     {   /* the whole haloed box in memory: ~24 bytes per label voxel (5 arrays + the band field's distance maps); refuse rather than
            drive the 24 GB WSL VM into swap and a restart (block B, 1.2e9 voxels: 27 GB). Big boxes: ufsm phase-raster (blockwise),
@@ -915,7 +916,7 @@ static int cmd_band(int argc, char **argv) {
     for (int d = 0; d < 3; d++) { ro[d] = o[d] < 0 ? 0 : o[d]; int64_t e = o[d] + n[d] < m->shape[d] ? o[d] + n[d] : m->shape[d]; rn[d] = e - ro[d]; }
     if (rn[0] > 0 && rn[1] > 0 && rn[2] > 0) {
         uint8_t *tmp = malloc((size_t)rn[0] * rn[1] * rn[2]);
-        if (z3_read(z, ro, rn, tmp, ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8))) { fprintf(stderr, "band: read failed: %s\n", z3_error()); return 1; }
+        if (z3_read(z, ro, rn, tmp, ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8))) { fprintf(stderr, "band: read failed: %s\n", z3_error()); return 1; }
         for (int64_t zz = 0; zz < rn[0]; zz++) for (int64_t yy = 0; yy < rn[1]; yy++)
             memcpy(codes + ((size_t)(zz + ro[0] - o[0]) * n[1] + (yy + ro[1] - o[1])) * n[2] + (ro[2] - o[2]), tmp + ((size_t)zz * rn[1] + yy) * rn[2], (size_t)rn[2]);
         free(tmp);
@@ -1523,7 +1524,7 @@ static int cmd_convert_unwrap2(int argc, char **argv) {
                           "\"wind4_lambda\":0,\"converted_from\":\"task unwrap rows 2-10; winding mod 4 untrained\"}}",
                           n > 1 ? "," : "", air, dc ? "x / (1 + x), x = density_scale rho" : "min(1, density_scale rho)", ds, dc, pw, pu, nl, nst);
     free(hdr);
-    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) { free(extra); return 1; }
+    if (nn_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) { free(extra); return 1; }
     cfg.cout = 11;
     unet *u = unet_create(&cfg); unet_init(u, 1);
     int rows[11]; for (int c = 0; c < 11; c++) rows[c] = c < 9 ? c + 2 : -1;
@@ -1564,7 +1565,7 @@ static int cmd_fit_sweep(int argc, char **argv, const char *file) {
         char *buf = strdup(lines[r]); char **av = malloc((argc + 256) * sizeof *av); int ac = 0;
         av[ac++] = argv[0]; av[ac++] = argv[1]; av[ac++] = argv[2];
         for (char *q = strtok(buf, " \t"); q && ac < argc + 250; q = strtok(nullptr, " \t")) av[ac++] = q;
-        for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], "--sweep") && i + 1 < argc) { i++; continue; } av[ac++] = argv[i]; }
+        for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], opt_n("--sweep")) && i + 1 < argc) { i++; continue; } av[ac++] = argv[i]; }
         av[ac] = nullptr;
         printf("fit sweep: run %d/%d: %s\n", r + 1, nl, lines[r]); fflush(stdout); fprintf(stderr, "fit sweep: run %d/%d: %s\n", r + 1, nl, lines[r]);
         const double tr = now(); const int rc = cmd_fit(ac, av); fflush(stdout);
@@ -1584,73 +1585,73 @@ static int cmd_fit(int argc, char **argv) {
     const char *dir = argv[2];
     fit_cfg c = fit_cfg_default();
     c.verbose = arg_index(argc, argv, "--quiet") < 0;
-    c.dir = atoi(opt(argc, argv, "--dir", "0")); c.dir_loops = atoi(opt(argc, argv, "--dir-loops", "0")); c.unwrap_voxels = atoi(opt(argc, argv, "--unwrap-voxels", "1"));
-    c.cpu = arg_index(argc, argv, "--cpu") > 0; c.threads = atoi(opt(argc, argv, "--threads", "0")); fit_set_threads(c.threads);
-    c.phase_robust = (float)atof(opt(argc, argv, "--phase-robust", "0")); c.conf_pow = (float)atof(opt(argc, argv, "--conf-pow", "1"));
-    c.bend = (float)atof(opt(argc, argv, "--bend", "0"));
-    c.w_pgrad = (float)atof(opt(argc, argv, "--w-pgrad", "0")); c.pgrad_delta = (float)atof(opt(argc, argv, "--pgrad-delta", "0.25"));
-    c.w_phase = (float)atof(opt(argc, argv, "--w-phase", "1")); c.w_normal = (float)atof(opt(argc, argv, "--w-normal", "3"));
-    c.w_density = (float)atof(opt(argc, argv, "--w-density", "1")); c.w_smooth = (float)atof(opt(argc, argv, "--w-smooth", "0.1"));
-    c.w_wind4 = (float)atof(opt(argc, argv, "--wind4-weight", "0"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off: weight 4 cost fit-val, 0.5-1 neutral) */
-    c.w_recto = (float)atof(opt(argc, argv, "--w-recto", "0"));        /* recto anchors (fields with an r plane; 0 off) */
+    c.dir = opt_atoi("--dir", opt(argc, argv, "--dir", "0")); c.dir_loops = opt_atoi("--dir-loops", opt(argc, argv, "--dir-loops", "0")); c.unwrap_voxels = opt_atoi("--unwrap-voxels", opt(argc, argv, "--unwrap-voxels", "1"));
+    c.cpu = arg_index(argc, argv, "--cpu") > 0; c.threads = opt_atoi("--threads", opt(argc, argv, "--threads", "0")); fit_set_threads(c.threads);
+    c.phase_robust = (float)opt_atof("--phase-robust", opt(argc, argv, "--phase-robust", "0")); c.conf_pow = (float)opt_atof("--conf-pow", opt(argc, argv, "--conf-pow", "1"));
+    c.bend = (float)opt_atof("--bend", opt(argc, argv, "--bend", "0"));
+    c.w_pgrad = (float)opt_atof("--w-pgrad", opt(argc, argv, "--w-pgrad", "0")); c.pgrad_delta = (float)opt_atof("--pgrad-delta", opt(argc, argv, "--pgrad-delta", "0.25"));
+    c.w_phase = (float)opt_atof("--w-phase", opt(argc, argv, "--w-phase", "1")); c.w_normal = (float)opt_atof("--w-normal", opt(argc, argv, "--w-normal", "3"));
+    c.w_density = (float)opt_atof("--w-density", opt(argc, argv, "--w-density", "1")); c.w_smooth = (float)opt_atof("--w-smooth", opt(argc, argv, "--w-smooth", "0.1"));
+    c.w_wind4 = (float)opt_atof("--wind4-weight", opt(argc, argv, "--wind4-weight", "0"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off: weight 4 cost fit-val, 0.5-1 neutral) */
+    c.w_recto = (float)opt_atof("--w-recto", opt(argc, argv, "--w-recto", "0"));        /* recto anchors (fields with an r plane; 0 off) */
     if (!(c.w_wind4 >= 0) || !(c.w_recto >= 0)) { fprintf(stderr, "fit: --wind4-weight and --w-recto must be >= 0\n"); return 2; }
     /* CT in the fitter (fields with ct / cs planes: ufsm ct-fields, predict --fit-ct): papyrus / void parity and the CT sheet spacing */
-    c.w_ct = (float)atof(opt(argc, argv, "--w-ct", "0")); c.ct_pow = (float)atof(opt(argc, argv, "--ct-pow", "1")); c.ct_phi = (float)atof(opt(argc, argv, "--ct-phi", "0"));
-    c.ct_floor = (float)atof(opt(argc, argv, "--ct-floor", "0")); c.ct_radius_um = atof(opt(argc, argv, "--ct-radius-um", "150")); c.ct_flood = atoi(opt(argc, argv, "--ct-flood", "0"));
-    c.w_cspacing = (float)atof(opt(argc, argv, "--w-cspacing", "0")); c.cs_tol = (float)atof(opt(argc, argv, "--cs-tol", "0.25"));
+    c.w_ct = (float)opt_atof("--w-ct", opt(argc, argv, "--w-ct", "0")); c.ct_pow = (float)opt_atof("--ct-pow", opt(argc, argv, "--ct-pow", "1")); c.ct_phi = (float)opt_atof("--ct-phi", opt(argc, argv, "--ct-phi", "0"));
+    c.ct_floor = (float)opt_atof("--ct-floor", opt(argc, argv, "--ct-floor", "0")); c.ct_radius_um = opt_atof("--ct-radius-um", opt(argc, argv, "--ct-radius-um", "150")); c.ct_flood = opt_atoi("--ct-flood", opt(argc, argv, "--ct-flood", "0"));
+    c.w_cspacing = (float)opt_atof("--w-cspacing", opt(argc, argv, "--w-cspacing", "0")); c.cs_tol = (float)opt_atof("--cs-tol", opt(argc, argv, "--cs-tol", "0.25"));
     fit_fields_ct_planes((c.w_ct > 0 ? 1 : 0) | (c.w_cspacing > 0 ? 2 : 0));   /* load only the CT planes the terms read */
     if (!(c.w_ct >= 0) || !(c.ct_pow >= 0) || !(c.ct_floor >= 0) || !(c.ct_radius_um > 0) || !(c.w_cspacing >= 0) || !(c.cs_tol > 0)) { fprintf(stderr, "fit: --w-ct, --ct-pow, --ct-floor, --w-cspacing >= 0, --ct-radius-um and --cs-tol > 0\n"); return 2; }
     if (!(c.w_pgrad >= 0) || !(c.pgrad_delta > 0) || c.unwrap_voxels < -1 || c.unwrap_voxels > 1 || !(c.phase_robust >= 0) || !(c.conf_pow > 0) || !(c.bend >= 0) || !(c.w_phase >= 0) || !(c.w_normal >= 0) || !(c.w_density >= 0) || !(c.w_smooth >= 0)) {
         fprintf(stderr, "fit: --phase-robust, --bend and the weights must be >= 0, --conf-pow and --pgrad-delta > 0, --unwrap-voxels -1, 0 or 1\n"); return 2;
     }
-    c.uw_split = atof(opt(argc, argv, "--uw-split", "0")); c.uw_tile = atoi(opt(argc, argv, "--uw-tile", "256")); c.uw_pdv = atof(opt(argc, argv, "--uw-pdv", "0")); c.uw_min_conf = atof(opt(argc, argv, "--uw-min-conf", "0.3"));
+    c.uw_split = opt_atof("--uw-split", opt(argc, argv, "--uw-split", "0")); c.uw_tile = opt_atoi("--uw-tile", opt(argc, argv, "--uw-tile", "256")); c.uw_pdv = opt_atof("--uw-pdv", opt(argc, argv, "--uw-pdv", "0")); c.uw_min_conf = opt_atof("--uw-min-conf", opt(argc, argv, "--uw-min-conf", "0.3"));
     { const char *uf = opt(argc, argv, "--uw-flood", "serial"); c.uw_msf = !strcmp(uf, "msf"); if (!c.uw_msf && strcmp(uf, "serial")) { fprintf(stderr, "fit: --uw-flood serial|msf\n"); return 2; } }   /* the voxel unwrapping: the serial flood or the parallel spanning forest (src/fit.c uw_msf) */
     /* local slip repair (fit_cfg uw_repair): pieces of uw_repair^3 tiles, least-cost integer shifts from their votes and the evidence */
-    c.uw_repair = atoi(opt(argc, argv, "--uw-repair", "0")); c.uw_rep_w4 = (float)atof(opt(argc, argv, "--uw-rep-w4", "0"));
-    c.uw_rep_geo = (float)atof(opt(argc, argv, "--uw-rep-geo", "0")); c.uw_rep_gd = atoi(opt(argc, argv, "--uw-rep-gd", "8"));
-    c.uw_rep_cs = (float)atof(opt(argc, argv, "--uw-rep-cs", "0")); c.uw_rep_dump = opt(argc, argv, "--uw-rep-dump", nullptr);
+    c.uw_repair = opt_atoi("--uw-repair", opt(argc, argv, "--uw-repair", "0")); c.uw_rep_w4 = (float)opt_atof("--uw-rep-w4", opt(argc, argv, "--uw-rep-w4", "0"));
+    c.uw_rep_geo = (float)opt_atof("--uw-rep-geo", opt(argc, argv, "--uw-rep-geo", "0")); c.uw_rep_gd = opt_atoi("--uw-rep-gd", opt(argc, argv, "--uw-rep-gd", "8"));
+    c.uw_rep_cs = (float)opt_atof("--uw-rep-cs", opt(argc, argv, "--uw-rep-cs", "0")); c.uw_rep_dump = opt(argc, argv, "--uw-rep-dump", nullptr);
     static fib_set fibs;   /* --fibers FILE (ufsm fiber-export for this fields dir) --w-fib W: same-fibre pair term in the fit stages */
-    c.w_fib = (float)atof(opt(argc, argv, "--w-fib", "0"));
-    c.uw_rep_fib = (float)atof(opt(argc, argv, "--uw-rep-fib", "0"));
-    c.fib_conf = (float)atof(opt(argc, argv, "--fib-conf", "0.2")); c.fib_gap = atoi(opt(argc, argv, "--fib-gap", "2")); c.fib_dmax = (float)atof(opt(argc, argv, "--fib-dmax", "0.5"));
-    c.uw_rep_fib_hop = (float)atof(opt(argc, argv, "--uw-rep-fib-hop", "1")); c.uw_rep_fib_min = atoi(opt(argc, argv, "--uw-rep-fib-min", "0"));
-    c.w_fib_cons = (float)atof(opt(argc, argv, "--w-fib-cons", "0")); c.fib_cons_len = atoi(opt(argc, argv, "--fib-cons-len", "256"));
+    c.w_fib = (float)opt_atof("--w-fib", opt(argc, argv, "--w-fib", "0"));
+    c.uw_rep_fib = (float)opt_atof("--uw-rep-fib", opt(argc, argv, "--uw-rep-fib", "0"));
+    c.fib_conf = (float)opt_atof("--fib-conf", opt(argc, argv, "--fib-conf", "0.2")); c.fib_gap = opt_atoi("--fib-gap", opt(argc, argv, "--fib-gap", "2")); c.fib_dmax = (float)opt_atof("--fib-dmax", opt(argc, argv, "--fib-dmax", "0.5"));
+    c.uw_rep_fib_hop = (float)opt_atof("--uw-rep-fib-hop", opt(argc, argv, "--uw-rep-fib-hop", "1")); c.uw_rep_fib_min = opt_atoi("--uw-rep-fib-min", opt(argc, argv, "--uw-rep-fib-min", "0"));
+    c.w_fib_cons = (float)opt_atof("--w-fib-cons", opt(argc, argv, "--w-fib-cons", "0")); c.fib_cons_len = opt_atoi("--fib-cons-len", opt(argc, argv, "--fib-cons-len", "256"));
     if (*opt(argc, argv, "--fib-spans", "")) { c.fib_nspan = 0; char *t = strdup(opt(argc, argv, "--fib-spans", "")); for (char *q = strtok(t, ","); q && c.fib_nspan < 8; q = strtok(nullptr, ",")) c.fib_span[c.fib_nspan++] = atoi(q); free(t); }
     if (!(c.w_fib_cons >= 0) || c.fib_cons_len < 8) { fprintf(stderr, "fit: --w-fib-cons >= 0, --fib-cons-len >= 8\n"); return 2; }
-    c.nondeg_floor = (float)atof(opt(argc, argv, "--nondeg-floor", "0"));   /* the anti-compression hinge |grad W| >= floor x rho (0: 0.4) */
-    if (*opt(argc, argv, "--w-nondeg", "")) c.w_nondeg = (float)atof(opt(argc, argv, "--w-nondeg", "1"));
+    c.nondeg_floor = (float)opt_atof("--nondeg-floor", opt(argc, argv, "--nondeg-floor", "0"));   /* the anti-compression hinge |grad W| >= floor x rho (0: 0.4) */
+    if (*opt(argc, argv, "--w-nondeg", "")) c.w_nondeg = (float)opt_atof("--w-nondeg", opt(argc, argv, "--w-nondeg", "1"));
     if (!(c.nondeg_floor >= 0) || !(c.w_nondeg >= 0)) { fprintf(stderr, "fit: --nondeg-floor and --w-nondeg must be >= 0\n"); return 2; }
     if (*opt(argc, argv, "--fibers", "")) {
         if (fib_load(opt(argc, argv, "--fibers", ""), &fibs)) { fprintf(stderr, "fit: cannot read --fibers %s\n", opt(argc, argv, "--fibers", "")); return 1; }
         c.fib = fibs.pts; c.fib_off = fibs.off; c.fib_n = fibs.n;
         if (!(c.w_fib > 0) && !(c.w_fib_cons > 0) && !(c.uw_rep_fib > 0)) fprintf(stderr, "fit: --fibers without --w-fib / --w-fib-cons / --uw-rep-fib W > 0 (unused)\n");
     }
-    c.uw_rep_qpow = (float)atof(opt(argc, argv, "--uw-rep-qpow", "3")); c.uw_rep_stretch = (float)atof(opt(argc, argv, "--uw-rep-stretch", "0.5"));
-    c.uw_rep_sr = atoi(opt(argc, argv, "--uw-rep-sr", "1")); c.uw_rep_seed = (float)atof(opt(argc, argv, "--uw-rep-seed", *opt(argc, argv, "--seed-model", "") ? "16" : "0"));   /* (fit --slab chaining: off unless given) */ c.uw_rep_geo_init = atoi(opt(argc, argv, "--uw-rep-geo-init", "0")); c.uw_rep_off = atoi(opt(argc, argv, "--uw-rep-off", "0")); c.uw_rep_cons = atoi(opt(argc, argv, "--uw-rep-cons", "1")); c.phase_stretch = (float)atof(opt(argc, argv, "--phase-stretch", "0")); c.phase_stretch_r = atoi(opt(argc, argv, "--phase-stretch-r", "1"));
+    c.uw_rep_qpow = (float)opt_atof("--uw-rep-qpow", opt(argc, argv, "--uw-rep-qpow", "3")); c.uw_rep_stretch = (float)opt_atof("--uw-rep-stretch", opt(argc, argv, "--uw-rep-stretch", "0.5"));
+    c.uw_rep_sr = opt_atoi("--uw-rep-sr", opt(argc, argv, "--uw-rep-sr", "1")); c.uw_rep_seed = (float)opt_atof("--uw-rep-seed", opt(argc, argv, "--uw-rep-seed", *opt(argc, argv, "--seed-model", "") ? "16" : "0"));   /* (fit --slab chaining: off unless given) */ c.uw_rep_geo_init = opt_atoi("--uw-rep-geo-init", opt(argc, argv, "--uw-rep-geo-init", "0")); c.uw_rep_off = opt_atoi("--uw-rep-off", opt(argc, argv, "--uw-rep-off", "0")); c.uw_rep_cons = opt_atoi("--uw-rep-cons", opt(argc, argv, "--uw-rep-cons", "1")); c.phase_stretch = (float)opt_atof("--phase-stretch", opt(argc, argv, "--phase-stretch", "0")); c.phase_stretch_r = opt_atoi("--phase-stretch-r", opt(argc, argv, "--phase-stretch-r", "1"));
     if (!(c.phase_stretch >= 0) || c.phase_stretch_r < 0 || c.phase_stretch_r > 4) { fprintf(stderr, "fit: --phase-stretch >= 0, --phase-stretch-r 0..4\n"); return 2; }
     /* embedding evidence for the slip repair (src/fit_emb.h): --emb GROUP (a dinovol-embed output group at the fields' scan level, or
        --emb-scale S embedding voxels per native voxel) [--emb-output tokens_unit] --uw-rep-emb W [--uw-rep-emb-d 16,48 native voxels]
        [--uw-rep-emb-m0 0.3 cosine margin for full weight] [--uw-rep-emb-rmax 2] [--uw-rep-emb-sub 2 field voxels] [--emb-phi 0]
        [--emb-ct ROOT KEY --emb-papyrus L [--cache DIR]]: the papyrus gate, sheet centres snapped onto CT >= L (CT at the fields' native
        level; no gain on the 10-25 emb-calib boxes, src/fit_emb.h) */
-    c.uw_rep_emb = (float)atof(opt(argc, argv, "--uw-rep-emb", "0")); c.uw_rep_emb_m0 = (float)atof(opt(argc, argv, "--uw-rep-emb-m0", "0.3"));
-    c.uw_rep_emb_rmax = atoi(opt(argc, argv, "--uw-rep-emb-rmax", "2")); c.uw_rep_emb_sub = atoi(opt(argc, argv, "--uw-rep-emb-sub", "2")); c.emb_phi = (float)atof(opt(argc, argv, "--emb-phi", "0"));
+    c.uw_rep_emb = (float)opt_atof("--uw-rep-emb", opt(argc, argv, "--uw-rep-emb", "0")); c.uw_rep_emb_m0 = (float)opt_atof("--uw-rep-emb-m0", opt(argc, argv, "--uw-rep-emb-m0", "0.3"));
+    c.uw_rep_emb_rmax = opt_atoi("--uw-rep-emb-rmax", opt(argc, argv, "--uw-rep-emb-rmax", "2")); c.uw_rep_emb_sub = opt_atoi("--uw-rep-emb-sub", opt(argc, argv, "--uw-rep-emb-sub", "2")); c.emb_phi = (float)opt_atof("--emb-phi", opt(argc, argv, "--emb-phi", "0"));
     if (*opt(argc, argv, "--uw-rep-emb-d", "")) { c.uw_rep_emb_nd = 0; char *t = strdup(opt(argc, argv, "--uw-rep-emb-d", "")); for (char *q = strtok(t, ","); q && c.uw_rep_emb_nd < 4; q = strtok(nullptr, ",")) c.uw_rep_emb_d[c.uw_rep_emb_nd++] = atoi(q); free(t); }
     if (!(c.uw_rep_emb >= 0) || !(c.uw_rep_emb_m0 > 0) || c.uw_rep_emb_rmax < 1 || c.uw_rep_emb_rmax > 8 || c.uw_rep_emb_sub < 1) { fprintf(stderr, "fit: --uw-rep-emb >= 0, --uw-rep-emb-m0 > 0, --uw-rep-emb-rmax 1..8, --uw-rep-emb-sub >= 1\n"); return 2; }
     if (c.uw_repair < 0 || !(c.uw_rep_w4 >= 0) || !(c.uw_rep_geo >= 0) || !(c.uw_rep_cs >= 0) || c.uw_rep_gd < 1 || !(c.uw_rep_qpow > 0) || !(c.uw_rep_stretch >= 0) || c.uw_rep_sr < 0 || c.uw_rep_sr > 4 || !(c.uw_rep_seed >= 0)) { fprintf(stderr, "fit: --uw-repair >= 0, --uw-rep-* weights >= 0, --uw-rep-gd >= 1\n"); return 2; }
-    c.core = (float)atof(opt(argc, argv, "--core", "3"));   /* no data terms within core x pitch of the axis */
-    c.w_wind4 = (float)atof(opt(argc, argv, "--wind4-weight", "0"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off: weight 4 cost fit-val, 0.5-1 neutral) */
-    c.analytic = atoi(opt(argc, argv, "--analytic", "1")); c.packed_um = atof(opt(argc, argv, "--packed-um", "0")); c.batch = atoi(opt(argc, argv, "--batch", "2000000")); c.knot_dz = atoi(opt(argc, argv, "--knot-dz", "1024")); c.phase_stage = atoi(opt(argc, argv, "--phase-stage", "4"));
+    c.core = (float)opt_atof("--core", opt(argc, argv, "--core", "3"));   /* no data terms within core x pitch of the axis */
+    c.w_wind4 = (float)opt_atof("--wind4-weight", opt(argc, argv, "--wind4-weight", "0"));   /* the winding mod 4 term of task unwrap2 fields (dz dy dx dq planes; 0 off: weight 4 cost fit-val, 0.5-1 neutral) */
+    c.analytic = opt_atoi("--analytic", opt(argc, argv, "--analytic", "1")); c.packed_um = opt_atof("--packed-um", opt(argc, argv, "--packed-um", "0")); c.batch = opt_atoi("--batch", opt(argc, argv, "--batch", "2000000")); c.knot_dz = opt_atoi("--knot-dz", opt(argc, argv, "--knot-dz", "1024")); c.phase_stage = opt_atoi("--phase-stage", opt(argc, argv, "--phase-stage", "4"));
     if (*opt(argc, argv, "--lattice", "")) { c.nstage = 0; char *t = strdup(opt(argc, argv, "--lattice", "")); for (char *q = strtok(t, ","); q && c.nstage < 8; q = strtok(nullptr, ",")) c.lattice[c.nstage++] = atoi(q); free(t); }
     if (*opt(argc, argv, "--steps", "")) { int k = 0; char *t = strdup(opt(argc, argv, "--steps", "")); for (char *q = strtok(t, ","); q && k < 8; q = strtok(nullptr, ",")) c.steps[k++] = atoi(q); for (; k < c.nstage; k++) c.steps[k] = c.steps[k - 1]; free(t); }
     fit_fields_skip_planes((c.w_recto > 0 ? 0 : 1) | (c.w_wind4 > 0 || c.uw_rep_w4 > 0 ? 0 : 2));   /* load only the optional planes the terms read */
     /* the GPU context (~2 s) comes up on a thread while the fields load; the main thread selects the device again after the join */
-    g_fit_gdev = atoi(opt(argc, argv, "--gpu", "0"));
+    g_fit_gdev = opt_atoi("--gpu", opt(argc, argv, "--gpu", "0"));
     if (!c.cpu) { g_fit_gthr = pthread_create(&g_fit_gth, nullptr, fit_gpu_init_thread, nullptr) == 0; if (!g_fit_gthr) nn_init(g_fit_gdev); }
     if (*opt(argc, argv, "--ref-model", "")) { if (g_fit_ref.on) { pthread_join(g_fit_ref.th, nullptr); g_fit_ref.on = 0; } g_fit_ref.dir = opt(argc, argv, "--ref-model", ""); g_fit_ref.s = nullptr; g_fit_ref.on = pthread_create(&g_fit_ref.th, nullptr, fit_ref_thread, nullptr) == 0; }
     const double t0 = now();
     const char *min = opt(argc, argv, "--model", nullptr);   /* score / export a saved model or set instead of fitting */
-    const int slab = atoi(opt(argc, argv, "--slab", "0")), overlap = atoi(opt(argc, argv, "--overlap", "256"));
+    const int slab = opt_atoi("--slab", opt(argc, argv, "--slab", "0")), overlap = opt_atoi("--overlap", opt(argc, argv, "--overlap", "256"));
     fit_fields_buf fb; memset(&fb, 0, sizeof fb);
     {   /* the native voxel size first: default lattices and knots are physical, given in 2.4 um voxels, scaled to the fields' native voxels */
         fit_fields_buf g0; if (fit_fields_load(dir, 0, 0, 0, &g0)) { fprintf(stderr, "fit: cannot load the fields in %s\n", dir); return 1; }
@@ -1665,7 +1666,7 @@ static int cmd_fit(int argc, char **argv) {
     /* --coarse-pool P (> 1): the coarse stage of a coarse-to-fine unwrap: the fields max / mean pooled by P per axis (pooled phase carries no
        information) and only the gradient terms (normal, density: the integrated turn count; no phase stage), e.g. a whole scroll in one fit
        whose model is the --ref-model of the blocks' fine fits */
-    const int cpool = atoi(opt(argc, argv, "--coarse-pool", "0"));
+    const int cpool = opt_atoi("--coarse-pool", opt(argc, argv, "--coarse-pool", "0"));
     if (cpool > 1) {
         if (min || slab > 0) { fprintf(stderr, "fit: --coarse-pool goes without --model / --slab\n"); return 2; }
         c.phase_stage = c.nstage; c.unwrap_voxels = -1;
@@ -1678,7 +1679,7 @@ static int cmd_fit(int argc, char **argv) {
        memory) and the CPU passes run over fewer cells. Everything else stays the box's: positions, the lattice, the model, the minibatch
        hash (fit_dev oy ox H0 W0), so the model is byte-identical to the uncropped fit (cells outside hold no material: no term reads them;
        the phase gate reads +-1 neighbours, hence M >= 1). Options whose code reads the box's arrays otherwise turn it off (logged). */
-    const int cropm = atoi(opt(argc, argv, "--crop-material", "0")); uint8_t *cropw = nullptr;
+    const int cropm = opt_atoi("--crop-material", opt(argc, argv, "--crop-material", "0")); uint8_t *cropw = nullptr;
     if (cropm > 0) {
         const char *ao[] = {"--seed-model", "--init-model", "--emb", "--axis-normal", "--fibers", "--winding", "--codes", "--zgauge", "--score-boxes", "--uw-rep-dump"}; const char *why = nullptr;
         for (size_t k = 0; k < sizeof ao / sizeof *ao && !why; k++) if (*opt(argc, argv, ao[k], "")) why = ao[k];
@@ -1735,10 +1736,10 @@ static int cmd_fit(int argc, char **argv) {
     if (opt(argc, argv, "--emb", nullptr) && c.uw_rep_emb > 0) {   /* the embedding over the fields' box (+ the farthest partner distance) */
         int pad = 0; for (int k = 0; k < c.uw_rep_emb_nd; k++) if (c.uw_rep_emb_d[k] > pad) pad = c.uw_rep_emb_d[k];
         const long long en[3] = {(long long)ceil(fb.shape[0] * fb.h), (long long)ceil(fb.shape[1] * fb.h), (long long)ceil(fb.shape[2] * fb.h)};
-        embv = emb_vol_open(opt(argc, argv, "--emb", ""), opt(argc, argv, "--emb-output", "tokens_unit"), fb.origin, en, atof(opt(argc, argv, "--emb-scale", "1")), pad + 32);
+        embv = emb_vol_open(opt(argc, argv, "--emb", ""), opt(argc, argv, "--emb-output", "tokens_unit"), fb.origin, en, opt_atof("--emb-scale", opt(argc, argv, "--emb-scale", "1")), pad + 32);
         if (!embv) return 1;
-        for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--emb-ct")) {   /* the papyrus gate on the votes (fit_emb.h): CT at the fields' native level */
-            const int lv = atoi(opt(argc, argv, "--emb-papyrus", "0")); store *cs = store_open(argv[i + 1]); z3 *cz = cs ? z3_open(cs, argv[i + 2], opt(argc, argv, "--cache", nullptr)) : nullptr;
+        for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--emb-ct"))) {   /* the papyrus gate on the votes (fit_emb.h): CT at the fields' native level */
+            const int lv = opt_atoi("--emb-papyrus", opt(argc, argv, "--emb-papyrus", "0")); store *cs = store_open(argv[i + 1]); z3 *cz = cs ? z3_open(cs, argv[i + 2], opt(argc, argv, "--cache", nullptr)) : nullptr;
             if (!cz || lv <= 0 || emb_vol_papyrus_zarr(embv, cz, fb.origin, en, pad + 32, lv)) { fprintf(stderr, "fit: --emb-ct ROOT KEY needs --emb-papyrus L > 0 and a readable CT\n"); return 1; }
             z3_close(cz);
         }
@@ -1747,7 +1748,7 @@ static int cmd_fit(int argc, char **argv) {
     if (*opt(argc, argv, "--axis-normal", "") && !min && !slab) {
         /* local boxes away from the scroll's axis (crushed scrolls): replace the axis by a vertical line D native voxels from the box centre
            along the box's mean sheet normal (top eigenvector of the material-weighted mean n n^T), so the spiral term is nearly flat */
-        const double D = atof(opt(argc, argv, "--axis-normal", "0")); const fit_fields *f = &fb.f; const size_t n = (size_t)f->D * f->H * f->W;
+        const double D = opt_atof("--axis-normal", opt(argc, argv, "--axis-normal", "0")); const fit_fields *f = &fb.f; const size_t n = (size_t)f->D * f->H * f->W;
         double T[6] = {0}, sw = 0;   /* zz yy xx zy zx yx */
         for (size_t i = 0; i < n; i++) if (f->w[i]) {
             const double w = f->w[i] / 255.0; sw += w;
@@ -1790,7 +1791,7 @@ static int cmd_fit(int argc, char **argv) {
         if (!refm) { fprintf(stderr, "fit: cannot load --ref-model %s\n", opt(argc, argv, "--ref-model", "")); return 1; }
         if (seedm || slab > 0) { fprintf(stderr, "fit: --ref-model goes without --seed-model / --slab\n"); return 2; }
         c.ref = refm; for (int d = 0; d < 3; d++) c.ref_off[d] = (double)(fb.origin[d] - refm->global->origin[d]);
-        c.ref_snap = atoi(opt(argc, argv, "--ref-snap", "0")); c.uw_rep_ref = (float)atof(opt(argc, argv, "--uw-rep-ref", "0"));
+        c.ref_snap = opt_atoi("--ref-snap", opt(argc, argv, "--ref-snap", "0")); c.uw_rep_ref = (float)opt_atof("--uw-rep-ref", opt(argc, argv, "--uw-rep-ref", "0"));
         if (!(c.uw_rep_ref >= 0)) { fprintf(stderr, "fit: --uw-rep-ref >= 0\n"); return 2; }
         if (c.dir == 0) c.dir = refm->global->dir;
         else if (c.dir != refm->global->dir) { fprintf(stderr, "fit: --dir %+d differs from the --ref-model's %+d\n", c.dir, refm->global->dir); return 2; }
@@ -1799,13 +1800,13 @@ static int cmd_fit(int argc, char **argv) {
     }
     /* --phase-gate 0|1|2 (with --ref-model; default 1 with --ref-snap 1; src/phasegate.c): the network phase replaced by the ref's where it does not rotate with the
        density's sheets (1: gated, --pg-lo 0.3 --pg-hi 0.6 --pg-R 6 --pg-conf 0.5; 2: the ref's phase everywhere). Crushed scrolls. */
-    const int pgm = atoi(opt(argc, argv, "--phase-gate", refm && c.ref_snap == 1 && !min ? "1" : "0"));   /* (default on for the c2f snap: --ref-model --ref-snap 1) */
+    const int pgm = opt_atoi("--phase-gate", opt(argc, argv, "--phase-gate", refm && c.ref_snap == 1 && !min ? "1" : "0"));   /* (default on for the c2f snap: --ref-model --ref-snap 1) */
     if (pgm > 0) {
         if (!refm || min) { fprintf(stderr, "fit: --phase-gate needs --ref-model (and no --model)\n"); return 2; }
         if (cached) { fprintf(stderr, "fit: --phase-gate goes without --sweep\n"); return 2; }
         struct timespec tg0, tg1; clock_gettime(CLOCK_MONOTONIC, &tg0);
-        const fit_pgate_cfg pg = {.mode = pgm == 2, .R = atoi(opt(argc, argv, "--pg-R", "6")), .lo = atof(opt(argc, argv, "--pg-lo", "0.3")), .hi = atof(opt(argc, argv, "--pg-hi", "0.6")),
-                                  .rc = atof(opt(argc, argv, "--pg-conf", "0.5"))};
+        const fit_pgate_cfg pg = {.mode = pgm == 2, .R = opt_atoi("--pg-R", opt(argc, argv, "--pg-R", "6")), .lo = opt_atof("--pg-lo", opt(argc, argv, "--pg-lo", "0.3")), .hi = opt_atof("--pg-hi", opt(argc, argv, "--pg-hi", "0.6")),
+                                  .rc = opt_atof("--pg-conf", opt(argc, argv, "--pg-conf", "0.5"))};
         const int D = fb.shape[0], H = fb.shape[1], W = fb.shape[2], na = (int)(D * fb.h) + 1; const size_t plane = (size_t)H * W, n = (size_t)D * plane;
         const int BZ = 32, dev = use_stream && !fb.f.t[1];
         uint8_t *tb = dev ? malloc((size_t)3 * BZ * plane) : nullptr; double st[4] = {0}; int bad = dev && !tb;
@@ -1879,11 +1880,11 @@ static int cmd_fit(int argc, char **argv) {
     if (wout) {   /* the per-voxel winding number W * 256 (uint16, exact volcomp typed chunks) on a grid of --winding-step native voxels;
                      --winding-mod14 1: instead uint8 round(18 U) mod 252 (U = W + dir theta / 2 pi, the codes' q; 255 unknown), the dense winding raster kind of
                      phase-raster --winding that wind-assign --kind winding reads (a fit as the reference for other surfaces: fit QA) */
-        const int ws = atoi(opt(argc, argv, "--winding-step", "4")); const double um = atof(opt(argc, argv, "--um", "0")) > 0 ? atof(opt(argc, argv, "--um", "0")) : fb.um;
-        const int m14 = atoi(opt(argc, argv, "--winding-mod14", "0"));   /* 2: band codes 1 + round(18 U) mod 252 (dino-train codes; 0 / 255 unlabelled);
+        const int ws = opt_atoi("--winding-step", opt(argc, argv, "--winding-step", "4")); const double um = opt_atof("--um", opt(argc, argv, "--um", "0")) > 0 ? opt_atof("--um", opt(argc, argv, "--um", "0")) : fb.um;
+        const int m14 = opt_atoi("--winding-mod14", opt(argc, argv, "--winding-mod14", "0"));   /* 2: band codes 1 + round(18 U) mod 252 (dino-train codes; 0 / 255 unlabelled);
                                                                             3: the stored-phase codes round(252 frac(W)) mod 252 (src/band.h PHASE_*: sheets at 0; 255 unknown),
                                                                                --phase-sign -1 negates W (train sources "phase" pseudo labels) */
-        const int psg = atoi(opt(argc, argv, "--phase-sign", "1")) < 0 ? -1 : 1;
+        const int psg = opt_atoi("--phase-sign", opt(argc, argv, "--phase-sign", "1")) < 0 ? -1 : 1;
         const int64_t gs[3] = {(int64_t)ceil(shp[0] * h / ws), (int64_t)ceil(shp[1] * h / ws), (int64_t)ceil(shp[2] * h / ws)};
         /* --winding-global Z,Y,X (uint8 kinds): write into an array of that shape on the global grid of --winding-step native voxels, 512^3
            shards (the box origin must sit on the shard grid: org % (512 step) == 0); several box fits fill one per-scan label zarr */
@@ -1928,7 +1929,7 @@ static int cmd_fit(int argc, char **argv) {
         /* --winding-skip ROOT KEY UM (up to 2, mod14 codes): voxels where that raster (a GT stored phase, PHASE_*) is known (!= 255) stay unknown:
            pseudo labels only where no GT label is */
         z3 *skz[2] = {nullptr, nullptr}; double skr[2] = {0, 0}; uint8_t *skb[2] = {nullptr, nullptr}; int64_t sk0[2][3], skn[2][3]; int nsk = 0;
-        for (int k = 1; k + 3 < argc && nsk < 2; k++) if (!strcmp(argv[k], "--winding-skip")) {
+        for (int k = 1; k + 3 < argc && nsk < 2; k++) if (!strcmp(argv[k], opt_n("--winding-skip"))) {
             skz[nsk] = z3_open(store_open(argv[k + 1]), argv[k + 2], nullptr); skr[nsk] = fb.um / atof(argv[k + 3]);
             if (!skz[nsk] || !(skr[nsk] > 0) || !m14) { fprintf(stderr, "fit: --winding-skip: cannot open %s %s (or no --winding-mod14)\n", argv[k + 1], argv[k + 2]); return 1; }
             nsk++;
@@ -2058,9 +2059,9 @@ static int cmd_fit(int argc, char **argv) {
            model's origin with the fields' shape: the wrong box), the model read at its own coordinates (fill offset fields - model origin) */
         long long so_[3] = {org[0], org[1], org[2]}; fit_fill_ctx fc = {gd, fs, {0, 0, 0}};
         if (min) for (int d = 0; d < 3; d++) { so_[d] = (long long)fb.origin[d]; fc.off[d] = (double)(so_[d] - org[d]); }
-        g_score_pairs = atoi(opt(argc, argv, "--score-pairs", "0"));
+        g_score_pairs = opt_atoi("--score-pairs", opt(argc, argv, "--score-pairs", "0"));
         { const int bi = arg_index(argc, argv, "--score-boxes"); if (bi > 0 && bi + 2 < argc && sc_boxes_load(argv[bi + 1], argv[bi + 2])) return 2; }
-        if (*opt(argc, argv, "--zgauge", "") && zg_load(opt(argc, argv, "--zgauge", ""), atof(opt(argc, argv, "--zgauge-scale", "1")), atof(opt(argc, argv, "--zgauge-f", "1")))) return 1;
+        if (*opt(argc, argv, "--zgauge", "") && zg_load(opt(argc, argv, "--zgauge", ""), opt_atof("--zgauge-scale", opt(argc, argv, "--zgauge-scale", "1")), opt_atof("--zgauge-f", opt(argc, argv, "--zgauge-f", "1")))) return 1;
         if (*opt(argc, argv, "--score-z", "") && sscanf(opt(argc, argv, "--score-z", ""), "%lf,%lf", &g_score_z0, &g_score_nz) != 2) { fprintf(stderr, "fit: --score-z Z0,NZ (box-local native z)\n"); return 2; }
         const int rc = score_codes(z, cf, so_, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, gd && !getenv("UFSM_SCORE_DENSE") ? &fit_sparse : nullptr, &fc);
         fit_set_dev_free(gd); z3_close(z); if (dump) fclose(dump);
@@ -2106,8 +2107,8 @@ static int cmd_wind_score(int argc, char **argv) {
     const double cf = atof(argv[4]) > 0 ? atof(argv[4]) / um : 2;
     FILE *dump = *opt(argc, argv, "--score-dump", "") ? fopen(opt(argc, argv, "--score-dump", ""), "wb") : nullptr;
     raster_fill_ctx rc = {Ur, {shp[0], shp[1], shp[2]}};
-    g_score_pairs = atoi(opt(argc, argv, "--score-pairs", "0")) > 0;
-    const int r = score_codes(zc, cf, org, shp, 1.0, um, cy, cx, atoi(opt(argc, argv, "--score-detail", "0")) > 0, dump, raster_fill, nullptr, &rc);
+    g_score_pairs = opt_atoi("--score-pairs", opt(argc, argv, "--score-pairs", "0")) > 0;
+    const int r = score_codes(zc, cf, org, shp, 1.0, um, cy, cx, opt_atoi("--score-detail", opt(argc, argv, "--score-detail", "0")) > 0, dump, raster_fill, nullptr, &rc);
     z3_close(zc); if (dump) fclose(dump); free(Ur); free(cy); free(cx);
     return r;
 }
@@ -2441,14 +2442,14 @@ static int cmd_wraps(int argc, char **argv) {
                                     "     per column at the wrap's median radius in each 1/256 turn (eccentric / core wraps sampled at their own arc), or a number\n"
                                     "  --min-cm2 C: wraps under C cm2 (vertices x (step x um)^2) are not written (default 0.5: end-cap / air fragments; 0 keeps all)\n"
                                     "  with --fields: only wrap ids within ~1 turn of a data cell are computed, largest first (UFSM_WRAPS_NOPRUNE=1: every id)\n"); return 2; }
-    if (atof(opt(argc, argv, "--sfc", "0")) > 0) tifxyz_set_sfc(atof(opt(argc, argv, "--sfc", "0")));
+    if (opt_atof("--sfc", opt(argc, argv, "--sfc", "0")) > 0) tifxyz_set_sfc(opt_atof("--sfc", opt(argc, argv, "--sfc", "0")));
     fit_set *fs = fit_set_load(argv[2]); if (!fs) { fprintf(stderr, "wraps: cannot load %s\n", argv[2]); return 1; }
     const fit_model *m = fs->global;   /* the box, the axis; rows dispatch to the slab model of their z */
-    const double step = atof(opt(argc, argv, "--step", "8")), um = atof(opt(argc, argv, "--um", "0")) > 0 ? atof(opt(argc, argv, "--um", "0")) : fs->global->um;
-    const int nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16); fit_set_threads(nthreads);   /* (the field loads' core masks) */
-    const double out_um = atof(opt(argc, argv, "--out-um", "0"));   /* e.g. 2.4: a 9.6 um fit's wraps on the 2.4 um grid (renders with 2.4 um ink) */
+    const double step = opt_atof("--step", opt(argc, argv, "--step", "8")), um = opt_atof("--um", opt(argc, argv, "--um", "0")) > 0 ? opt_atof("--um", opt(argc, argv, "--um", "0")) : fs->global->um;
+    const int nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16); fit_set_threads(nthreads);   /* (the field loads' core masks) */
+    const double out_um = opt_atof("--out-um", opt(argc, argv, "--out-um", "0"));   /* e.g. 2.4: a 9.6 um fit's wraps on the 2.4 um grid (renders with 2.4 um ink) */
     const int si = arg_index(argc, argv, "--snap");   /* --snap ROOT KEY: a recto probability array on the model's grid (predict output) */
-    z3 *snapz = nullptr; int64_t snapo[3] = {0, 0, 0}; const double snap_range = atof(opt(argc, argv, "--snap-range", "0.35")), snap_min = atof(opt(argc, argv, "--snap-min", "0.5"));
+    z3 *snapz = nullptr; int64_t snapo[3] = {0, 0, 0}; const double snap_range = opt_atof("--snap-range", opt(argc, argv, "--snap-range", "0.35")), snap_min = opt_atof("--snap-min", opt(argc, argv, "--snap-min", "0.5"));
     const int verbose_snap = arg_index(argc, argv, "--quiet") < 0;
     if (si > 0) {
         if (si + 2 >= argc) { fprintf(stderr, "wraps: --snap ROOT KEY\n"); return 2; }
@@ -2496,11 +2497,11 @@ static int cmd_wraps(int argc, char **argv) {
         const double w = fit_set_W(fs, zlo + (zhi - zlo) * a / 16, Y * b / 16, X * c / 16); if (w < wmin) wmin = w; if (w > wmax) wmax = w;
     }
     int k0 = (int)ceil(wmin), k1 = (int)floor(wmax);   /* (the samples can miss W near the axis: --first / --last are taken as given) */
-    if (*opt(argc, argv, "--first", "")) k0 = atoi(opt(argc, argv, "--first", ""));
-    if (*opt(argc, argv, "--last", "")) k1 = atoi(opt(argc, argv, "--last", ""));
+    if (*opt(argc, argv, "--first", "")) k0 = opt_atoi("--first", opt(argc, argv, "--first", ""));
+    if (*opt(argc, argv, "--last", "")) k1 = opt_atoi("--last", opt(argc, argv, "--last", ""));
     if (*opt(argc, argv, "--zgauge", "")) {   /* --zgauge FILE (ufsm geom-check --ct zgauge.tsv of these wraps: z, cum_smooth) [--zgauge-scale S]: wrap
                                                 k = the level set W = k - S drift(z), the drift the CT measured the wraps crossing sheets along z */
-        if (zg_load(opt(argc, argv, "--zgauge", ""), atof(opt(argc, argv, "--zgauge-scale", "1")), out_um > 0 ? um / out_um : 1)) return 1;
+        if (zg_load(opt(argc, argv, "--zgauge", ""), opt_atof("--zgauge-scale", opt(argc, argv, "--zgauge-scale", "1")), out_um > 0 ? um / out_um : 1)) return 1;
     }
     const char *cr = opt(argc, argv, "--col-r", "p90"); const double colr = !strcmp(cr, "centre") ? -1 : !strcmp(cr, "p90") ? 0 : !strcmp(cr, "arc") ? -2 : atof(cr);
     if (strcmp(cr, "centre") && strcmp(cr, "p90") && strcmp(cr, "arc") && !(colr > 0)) { fprintf(stderr, "wraps: --col-r centre|p90|arc|R (R > 0 native voxels)\n"); return 2; }
@@ -2545,7 +2546,7 @@ static int cmd_wraps(int argc, char **argv) {
         g_wr_cnt = (const long long *)cnt; g_wr_k0 = k0; qsort(ks, nk, sizeof(int), wr_cmp_cnt);
         fprintf(stderr, "wraps: %d of %d wrap ids (%d..%d) meet the data, largest first\n", nk, nall, k0, k1);
     } else for (int k = k0; k <= k1; k++) ks[nk++] = k;
-    A.ks = ks; A.nk = nk; A.min_cm2 = atof(opt(argc, argv, "--min-cm2", "0.5"));
+    A.ks = ks; A.nk = nk; A.min_cm2 = opt_atof("--min-cm2", opt(argc, argv, "--min-cm2", "0.5"));
     tfx_set_threads(nthreads);   /* (the .sfc encoders: shared out among the wraps being written at that moment) */
     const int par = !(snapz || sfa) && nthreads > 1;
     pthread_mutex_init(&A.mu, nullptr);
@@ -2675,7 +2676,7 @@ static int cmd_downsample(int argc, char **argv) {
     const char *mode = opt(argc, argv, "--mode", "max"); const int votes = !strcmp(mode, "votes"), phase = !strcmp(mode, "phase") ? 1 : votes ? 2 : !strcmp(mode, "codes") ? 3 : 0;
     if (!phase && strcmp(mode, "max")) { fprintf(stderr, "downsample: --mode max|phase|votes\n"); return 2; }
     if (votes) ds_vote_tables();
-    const int S = atoi(opt(argc, argv, "--shard", "512")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16); const double um = atof(argv[5]);
+    const int S = opt_atoi("--shard", opt(argc, argv, "--shard", "512")), nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16); const double um = atof(argv[5]);
     z3 *z = z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr));
     if (!z) { fprintf(stderr, "downsample: %s\n", z3_error()); return 1; }
     const z3_meta *m = z3_meta_of(z); const int fill = phase == 1 ? PHASE_UNKNOWN : m->fill;   /* votes: 0 = no votes */
@@ -2746,7 +2747,7 @@ static int cmd_downsample(int argc, char **argv) {
 static int cmd_side_votes(int argc, char **argv) {
     const int codes = !strcmp(argv[1], "codes-merge");
     if (argc < 6) { fprintf(stderr, "usage: ufsm %s <out-group> <out-um> <root> <key> [<root> <key> ...] [--shard 512] [--threads 16] [--cache DIR]\n", argv[1]); return 2; }
-    const int S = atoi(opt(argc, argv, "--shard", "512")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16); const double um = atof(argv[3]);
+    const int S = opt_atoi("--shard", opt(argc, argv, "--shard", "512")), nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16); const double um = atof(argv[3]);
     if (S < 128 || S % 128 || !(um > 0)) { fprintf(stderr, "side-votes: out-um > 0, --shard a multiple of 128\n"); return 2; }
     z3 *in[64]; const char *names[64]; char nb[64][1200]; int nin = 0;
     for (int a = 4; a + 1 < argc && nin < 64; a += 2) {
@@ -2835,14 +2836,14 @@ static float *wa_read_f32(const char *dir, const char *name, int *w, int *h) {
 }
 static int cmd_wind_assign(int argc, char **argv) {
     if (argc < 6) { fprintf(stderr, "usage: ufsm wind-assign <ref-root> <ref-key> <out-dir> <tifxyz>... [--ref-um 4.8] [--vol-um 2.4] [--kind codes|winding] [--tol 6] [--step 4] [--dir 0] [--axis JSON] [--axis-um U] [--drop-duplicates 0]\n"); return 2; }
-    const double ref_um = atof(opt(argc, argv, "--ref-um", "4.8")), vol_um = atof(opt(argc, argv, "--vol-um", "2.4")), axis_um = atof(opt(argc, argv, "--axis-um", opt(argc, argv, "--vol-um", "2.4")));
+    const double ref_um = opt_atof("--ref-um", opt(argc, argv, "--ref-um", "4.8")), vol_um = opt_atof("--vol-um", opt(argc, argv, "--vol-um", "2.4")), axis_um = opt_atof("--axis-um", opt(argc, argv, "--axis-um", opt(argc, argv, "--vol-um", "2.4")));
     const char *kind = opt(argc, argv, "--kind", "codes");
-    wind_params p = {vol_um / ref_um, (float)atof(opt(argc, argv, "--tol", "6")), atoi(opt(argc, argv, "--step", "4")), atoi(opt(argc, argv, "--dir", "0")),
-                     atoi(opt(argc, argv, "--drop-duplicates", "0")), !strcmp(kind, "winding")};
+    wind_params p = {vol_um / ref_um, (float)opt_atof("--tol", opt(argc, argv, "--tol", "6")), opt_atoi("--step", opt(argc, argv, "--step", "4")), opt_atoi("--dir", opt(argc, argv, "--dir", "0")),
+                     opt_atoi("--drop-duplicates", opt(argc, argv, "--drop-duplicates", "0")), !strcmp(kind, "winding")};
     if (!(ref_um > 0 && vol_um > 0 && axis_um > 0) || (strcmp(kind, "codes") && strcmp(kind, "winding")) || !(p.tol >= 0 && p.tol <= 32) || p.step < 1 || (p.dir != 0 && p.dir != 1 && p.dir != -1)) {
         fprintf(stderr, "wind-assign: --ref-um / --vol-um / --axis-um > 0, --kind codes|winding, --tol 0..32, --step >= 1, --dir -1|0|1\n"); return 2;
     }
-    wa_ref R = {z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr)), p.dense ? WIND_WINDING : WIND_CODES, ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 4)};
+    wa_ref R = {z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr)), p.dense ? WIND_WINDING : WIND_CODES, ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 4)};
     if (!R.z) { fprintf(stderr, "wind-assign: %s\n", z3_error()); return 1; }
     wa_axis A = {.f = axis_um / vol_um};
     if (axis_load(&A.ax, opt(argc, argv, "--axis", "/vesuvius/ufsm/umbilicus/PHercParis4/umbilicus-full-resolution.json"))) { fprintf(stderr, "wind-assign: cannot load the axis\n"); return 1; }
@@ -2863,7 +2864,7 @@ static int cmd_wind_assign(int argc, char **argv) {
         if (wind_assign(xyz, valid, w, h, wa_axis_fn, &A, wa_lookup, &R, p, &r)) { fprintf(stderr, "wind-assign: out of memory\n"); return 1; }
         const char *base = strrchr(argv[a], '/'); base = base && base[1] ? base + 1 : argv[a];
         char od[1400], qp[1500]; snprintf(od, sizeof od, "%s/%s", argv[4], base);
-        const double out_um = atof(opt(argc, argv, "--out-um", opt(argc, argv, "--vol-um", "2.4"))), f = vol_um / (out_um > 0 ? out_um : vol_um);   /* --out-um: coordinates in that voxel (e.g. the reference grid's, for raster --value) */
+        const double out_um = opt_atof("--out-um", opt(argc, argv, "--out-um", opt(argc, argv, "--vol-um", "2.4"))), f = vol_um / (out_um > 0 ? out_um : vol_um);   /* --out-um: coordinates in that voxel (e.g. the reference grid's, for raster --value) */
         if (f != 1.0) for (size_t i = 0; i < N; i++) if (valid[i]) { X[i] = (float)(X[i] * f); Y[i] = (float)(Y[i] * f); Z[i] = (float)(Z[i] * f); }
         if (tifxyz_write(od, w, h, X, Y, Z, 1.0, out_um > 0 ? out_um : vol_um, -1, "ufsm wind-assign (x / y / z of the input; q.tif: the winding in the reference's gauge)")) { fprintf(stderr, "wind-assign: cannot write %s\n", od); rc = 1; }
         snprintf(qp, sizeof qp, "%s/q.tif", od);
@@ -2934,12 +2935,12 @@ typedef struct { double K, rmean; int idx; } ws_kr;
 static int cmp_ws_kr(const void *a, const void *b) { const ws_kr *x = a, *y = b; return x->K < y->K ? -1 : x->K > y->K ? 1 : x->idx - y->idx; }
 static int cmd_wind_seed(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm wind-seed <out-dir> <tifxyz>... [--k K] [--axis JSON] [--axis-um U] [--vol-um 2.4] [--out-um U] [--sense set|surface|+1|-1] [--order auto|+1|-1] [--seam set|start] [--min-pairs 50] [--min-score 0.75]\n"); return 2; }
-    const double vol_um = atof(opt(argc, argv, "--vol-um", "2.4")), axis_um = atof(opt(argc, argv, "--axis-um", opt(argc, argv, "--vol-um", "2.4")));
-    const double out_um = atof(opt(argc, argv, "--out-um", opt(argc, argv, "--vol-um", "2.4")));
+    const double vol_um = opt_atof("--vol-um", opt(argc, argv, "--vol-um", "2.4")), axis_um = opt_atof("--axis-um", opt(argc, argv, "--axis-um", opt(argc, argv, "--vol-um", "2.4")));
+    const double out_um = opt_atof("--out-um", opt(argc, argv, "--out-um", opt(argc, argv, "--vol-um", "2.4")));
     const char *sense_o = opt(argc, argv, "--sense", "set"), *seam_o = opt(argc, argv, "--seam", "set"), *order_o = opt(argc, argv, "--order", "auto");
     const int sense_set = !strcmp(sense_o, "set"), sense_surf = !strcmp(sense_o, "surface"), seam_set = !strcmp(seam_o, "set");
-    const size_t min_pairs = (size_t)atol(opt(argc, argv, "--min-pairs", "50")), npts = (size_t)atol(opt(argc, argv, "--points", "400000"));
-    const double min_score = atof(opt(argc, argv, "--min-score", "0.75"));
+    const size_t min_pairs = (size_t)opt_atol("--min-pairs", opt(argc, argv, "--min-pairs", "50")), npts = (size_t)opt_atol("--points", opt(argc, argv, "--points", "400000"));
+    const double min_score = opt_atof("--min-score", opt(argc, argv, "--min-score", "0.75"));
     if (!(vol_um > 0 && axis_um > 0 && out_um > 0)) { fprintf(stderr, "wind-seed: --vol-um / --axis-um / --out-um > 0\n"); return 2; }
     if (!sense_set && !sense_surf && strcmp(sense_o, "+1") && strcmp(sense_o, "-1") && strcmp(sense_o, "1")) { fprintf(stderr, "wind-seed: --sense set|surface|+1|-1\n"); return 2; }
     if (!seam_set && strcmp(seam_o, "start")) { fprintf(stderr, "wind-seed: --seam set|start\n"); return 2; }
@@ -2980,8 +2981,8 @@ static int cmd_wind_seed(int argc, char **argv) {
         if (m) { wind_pt *t = realloc(pts, (np + m) * sizeof *pts); if (!t) { fprintf(stderr, "wind-seed: out of memory\n"); return 1; } pts = t; memcpy(pts + np, p, m * sizeof *p); np += m; }
         free(p); wind_result_free(&r[0]); wind_result_free(&r[1]); ws_free(&S);
     }
-    wind_min_surface_score = atof(opt(argc, argv, "--min-surface-score", "0.5"));
-    wind_pitch_lo = atof(opt(argc, argv, "--pitch-um-lo", "50")) / vol_um; wind_pitch_hi = atof(opt(argc, argv, "--pitch-um-hi", "1000")) / vol_um;   /* papyrus sheets: ~150-400 um apart */
+    wind_min_surface_score = opt_atof("--min-surface-score", opt(argc, argv, "--min-surface-score", "0.5"));
+    wind_pitch_lo = opt_atof("--pitch-um-lo", opt(argc, argv, "--pitch-um-lo", "50")) / vol_um; wind_pitch_hi = opt_atof("--pitch-um-hi", opt(argc, argv, "--pitch-um-hi", "1000")) / vol_um;   /* papyrus sheets: ~150-400 um apart */
     wind_choice ch; wind_surf_vote *pv = calloc(ns ? ns : 1, sizeof *pv);
     if (!pv || wind_seed_decide(pts, np, Ks, ns, !kopt, force_sense, force_order, vsense, min_pairs, &ch, pv)) { fprintf(stderr, "wind-seed: out of memory\n"); return 1; }
     free(pts);
@@ -2999,7 +3000,7 @@ static int cmd_wind_seed(int argc, char **argv) {
                        ch.pitch, ch.agree, ch.dis, ch.evidence, ch.ndropped, ns, isfinite(phi0) ? phi0 : -1.0, vote[0], vote[1]); fclose(f); } }
     double maxspan = 0; for (int k = 0; k < ns; k++) if (!pv[k].dropped && i1[k].span > maxspan) maxspan = i1[k].span;
     if (undetermined && maxspan < 1.2) fprintf(stderr, "wind-seed: the sense is undetermined but every surface spans under 1.2 turns (%.2f): it moves q only within each turn, not the phase\n", maxspan);
-    else if (undetermined && !atoi(opt(argc, argv, "--allow-undetermined", "0"))) {
+    else if (undetermined && !opt_atoi("--allow-undetermined", opt(argc, argv, "--allow-undetermined", "0"))) {
         fprintf(stderr, "wind-seed: FAILED: the geometry does not tell the spiral sense (margin %.3f) and a surface spans %.2f turns (its windings follow the sense): nothing written (--sense +1|-1 from elsewhere, or --allow-undetermined 1)\n", ch.sense_margin, maxspan);
         free(pv); free(idx); free(Ks); free(i1); return 4;
     }
@@ -3007,7 +3008,7 @@ static int cmd_wind_seed(int argc, char **argv) {
         fprintf(stderr, "wind-seed: FAILED: the best (sense, order) puts the higher q outward on only %.3f of %zu pairs (--min-score %.2f): nothing written\n", ch.score, ch.agree + ch.dis, min_score);
         free(pv); free(idx); free(Ks); free(i1); return 3;
     }
-    if (atoi(opt(argc, argv, "--dry", "0"))) {   /* --dry 1: the decision and every surface's votes, nothing written but set.json */
+    if (opt_atoi("--dry", opt(argc, argv, "--dry", "0"))) {   /* --dry 1: the decision and every surface's votes, nothing written but set.json */
         for (int k = 0; k < ns; k++) { const char *base = strrchr(argv[idx[k]], '/'); base = base && base[1] ? base + 1 : argv[idx[k]];
             printf("%s K %g%s span %.2f end-gap rule %+d own pairs + %zu - %zu (own %+d) votes agree %zu disagree %zu\n", base, Ks[k], pv[k].dropped ? " DROPPED" : "", i1[k].span, i1[k].radial_dir,
                    pv[k].own_pos, pv[k].own_neg, pv[k].own_dir, pv[k].agree, pv[k].dis); }
@@ -3070,8 +3071,8 @@ static int cmd_wind_seed(int argc, char **argv) {
 static int cmd_fuse(int argc, char **argv) {
     const int recto = !strcmp(argv[1], "recto-fuse"), first = recto ? 6 : 4;
     if (argc < first + 2) { fprintf(stderr, "usage: ufsm %s <out-group> <out-um> %s<root> <key> [<root> <key>]... %s\n", argv[1], recto ? "<ct-root> <ct-key> " : "", recto ? "[--block 32] [--dup 3]" : "[--tol 0.1]"); return 2; }
-    int S = atoi(opt(argc, argv, "--shard", "0")); const int nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8); const double um = atof(argv[3]);
-    const float tol = (float)atof(opt(argc, argv, "--tol", "0.1")); const int block = atoi(opt(argc, argv, "--block", "32")), dup = atoi(opt(argc, argv, "--dup", "3"));
+    int S = opt_atoi("--shard", opt(argc, argv, "--shard", "0")); const int nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8); const double um = atof(argv[3]);
+    const float tol = (float)opt_atof("--tol", opt(argc, argv, "--tol", "0.1")); const int block = opt_atoi("--block", opt(argc, argv, "--block", "32")), dup = opt_atoi("--dup", opt(argc, argv, "--dup", "3"));
     const char *cache = opt(argc, argv, "--cache", nullptr);
     z3 *in[FUSE_MAX]; int n = 0;
     for (int a = first; a + 1 < argc && n < FUSE_MAX; a += 2) {
@@ -3154,7 +3155,7 @@ static int cmd_fuse(int argc, char **argv) {
 static float *wd_read(const char *path, int *w, int *h);
 static int cmd_wrapdist(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm wrapdist <wraps-dir> <labels-root> <labels-key> [--max 32] [--chunk 128] [--threads 16] [--per-wrap] [--at T1,T2..] [--cache DIR]\n"); return 2; }
-    const int M = atoi(opt(argc, argv, "--max", "32")), C = atoi(opt(argc, argv, "--chunk", "128")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
+    const int M = opt_atoi("--max", opt(argc, argv, "--max", "32")), C = opt_atoi("--chunk", opt(argc, argv, "--chunk", "128")), nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16);
     const int per = arg_index(argc, argv, "--per-wrap") > 0; const double lum = atof(argv[4]);
     if (!(lum > 0) || M < 1 || C < 1) { fprintf(stderr, "wrapdist: the labels key must be its voxel size in um (e.g. 4.8); --max, --chunk >= 1\n"); return 2; }
     z3 *z = z3_open(store_open(argv[3]), argv[4], opt(argc, argv, "--cache", nullptr)); if (!z) { fprintf(stderr, "wrapdist: %s\n", z3_error()); return 1; }
@@ -3318,8 +3319,8 @@ static void ws_walk(const ws_wrap *w, int along_z, double um, double gap_um, dou
 }
 static int cmd_wrapswitch(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm wrapswitch <wraps-dir> <codes-root> <codes-key> [--range 30] [--gap 1] [--min-run 100] [--axis FILE [--dir 1]] [--chunk 64] [--threads 16] [--per-wrap] [--cache DIR]\n"); return 2; }
-    const double lum = atof(argv[4]), range_um = atof(opt(argc, argv, "--range", "30")), gap_mm = atof(opt(argc, argv, "--gap", "1")), min_um = atof(opt(argc, argv, "--min-run", "100"));
-    const int C = atoi(opt(argc, argv, "--chunk", "64")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16), per = arg_index(argc, argv, "--per-wrap") > 0;
+    const double lum = atof(argv[4]), range_um = opt_atof("--range", opt(argc, argv, "--range", "30")), gap_mm = opt_atof("--gap", opt(argc, argv, "--gap", "1")), min_um = opt_atof("--min-run", opt(argc, argv, "--min-run", "100"));
+    const int C = opt_atoi("--chunk", opt(argc, argv, "--chunk", "64")), nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16), per = arg_index(argc, argv, "--per-wrap") > 0;
     if (!(lum > 0) || !(range_um > 0) || !(gap_mm > 0) || C < 1 || nt < 1) { fprintf(stderr, "wrapswitch: the codes key is its voxel size in um (e.g. 4.8); --range, --gap, --chunk > 0\n"); return 2; }
     z3 *z = z3_open(store_open(argv[3]), argv[4], opt(argc, argv, "--cache", nullptr)); if (!z) { fprintf(stderr, "wrapswitch: %s\n", z3_error()); return 1; }
     const z3_meta *zm = z3_meta_of(z);
@@ -3347,7 +3348,7 @@ static int cmd_wrapswitch(int argc, char **argv) {
         const double v[3] = {Wr[k].Z[i] * sc, Wr[k].Y[i] * sc, Wr[k].X[i] * sc};
         for (int d = 0; d < 3; d++) { if (v[d] < lo[d]) lo[d] = v[d]; if (v[d] > hi[d]) hi[d] = v[d]; }
     }
-    axis ax = {0}; const char *axp = opt(argc, argv, "--axis", nullptr); const int dir = atoi(opt(argc, argv, "--dir", "1"));
+    axis ax = {0}; const char *axp = opt(argc, argv, "--axis", nullptr); const int dir = opt_atoi("--dir", opt(argc, argv, "--dir", "1"));
     if (axp && axis_load(&ax, axp)) { fprintf(stderr, "wrapswitch: cannot load the axis %s\n", axp); return 1; }
     const double s0 = wum / 2.4;   /* wrap voxels -> level-0 (axis) voxels */
     const int Ri = (int)ceil(R) + 1; int64_t bo[3], bn[3];
@@ -3457,15 +3458,15 @@ static void *ssn_rows(void *arg) {
 static int cmd_surfsnap(int argc, char **argv) {
     const int vi = arg_index(argc, argv, "--volume");
     if (argc < 4 || vi < 0 || vi + 2 >= argc) { fprintf(stderr, "usage: ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U [--range 40] [--min 100] [--median 2] [--threads 16] [--cache DIR]\n"); return 2; }
-    const double vum = atof(opt(argc, argv, "--vol-um", "0")), range_um = atof(opt(argc, argv, "--range", "40")), vmin = atof(opt(argc, argv, "--min", "100"));
-    const int nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16), MR = atoi(opt(argc, argv, "--median", "2"));
+    const double vum = opt_atof("--vol-um", opt(argc, argv, "--vol-um", "0")), range_um = opt_atof("--range", opt(argc, argv, "--range", "40")), vmin = opt_atof("--min", opt(argc, argv, "--min", "100"));
+    const int nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16), MR = opt_atoi("--median", opt(argc, argv, "--median", "2"));
     if (!(vum > 0) || !(range_um > 0) || MR < 0 || MR > 5 || nt < 1) { fprintf(stderr, "surf-snap: --vol-um U (the volume's voxel um) > 0, --range > 0, --median 0..5\n"); return 2; }
     z3 *vz = z3_open(store_open(argv[vi + 1]), argv[vi + 2], opt(argc, argv, "--cache", nullptr)); if (!vz) { fprintf(stderr, "surf-snap: %s\n", z3_error()); return 1; }
     const z3_meta *zm = z3_meta_of(vz);
-    char cmd[1400]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", argv[3]); if (atof(opt(argc, argv, "--measure", "0")) <= 0 && system(cmd)) return 1;
+    char cmd[1400]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", argv[3]); if (opt_atof("--measure", opt(argc, argv, "--measure", "0")) <= 0 && system(cmd)) return 1;
     DIR *dd = opendir(argv[2]); if (!dd) { fprintf(stderr, "surf-snap: cannot open %s\n", argv[2]); return 1; }
     struct dirent *de; int nw = 0; size_t nmoved = 0, nvert = 0, mlow = 0, mn = 0; double sabs = 0, msum = 0;
-    const double measure = atof(opt(argc, argv, "--measure", "0"));   /* > 0: report the share of vertices where the volume is below it */
+    const double measure = opt_atof("--measure", opt(argc, argv, "--measure", "0"));   /* > 0: report the share of vertices where the volume is below it */
     while ((de = readdir(dd))) {
         if (de->d_name[0] != 'w') continue;
         char p[1400]; int w, h, w2, h2, w3, h3; double wum = 0, scale = 0; int winding = 0;
@@ -3554,13 +3555,13 @@ static int cmd_surfsnap(int argc, char **argv) {
 static int cmd_field_blend(int argc, char **argv) {
     const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr, *tile = nullptr, *grids = nullptr, *conf = "resultant", *paste = nullptr, *box = nullptr; int nt = ufsm_threads(0, 8);
     for (int i = 2; i < argc; i++) {
-        if (!strcmp(argv[i], "--weights") && i + 1 < argc) { ws = argv[++i]; continue; }
-        if (!strcmp(argv[i], "--threads") && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
-        if (!strcmp(argv[i], "--tile") && i + 1 < argc) { tile = argv[++i]; continue; }
-        if (!strcmp(argv[i], "--grids") && i + 1 < argc) { grids = argv[++i]; continue; }
-        if (!strcmp(argv[i], "--conf") && i + 1 < argc) { conf = argv[++i]; continue; }
-        if (!strcmp(argv[i], "--paste") && i + 1 < argc) { paste = argv[++i]; continue; }
-        if (!strcmp(argv[i], "--box") && i + 1 < argc) { box = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--weights")) && i + 1 < argc) { ws = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--threads")) && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], opt_n("--tile")) && i + 1 < argc) { tile = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--grids")) && i + 1 < argc) { grids = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--conf")) && i + 1 < argc) { conf = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--paste")) && i + 1 < argc) { paste = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--box")) && i + 1 < argc) { box = argv[++i]; continue; }
         if (!strncmp(argv[i], "--", 2)) { fprintf(stderr, "field-blend: unknown option %s\n", argv[i]); return 2; }
         if (!out) out = argv[i]; else if (n < 32) in[n++] = argv[i]; else { fprintf(stderr, "field-blend: at most 32 inputs\n"); return 2; }
     }
@@ -3625,7 +3626,7 @@ static int cmd_l1_bench(int argc, char **argv) {
                (long long)dmax, nv ? v[imax].a : 0, nv ? v[imax].b : 0, nv ? (long long)v[imax].w : 0);
     }
     l1_stats st = {0};
-    if (l1_solve((uint32_t)n, v, nv, s, atoi(opt(argc, argv, "--iters", "256")), &st)) { fprintf(stderr, "l1-bench: solve failed\n"); return 1; }
+    if (l1_solve((uint32_t)n, v, nv, s, opt_atoi("--iters", opt(argc, argv, "--iters", "256")), &st)) { fprintf(stderr, "l1-bench: solve failed\n"); return 1; }
     uint64_t hsh = 1469598103934665603ull; size_t nz = 0;
     for (uint64_t k = 0; k < n; k++) { hsh = (hsh ^ (uint32_t)s[k]) * 1099511628211ull; nz += s[k] != 0; }
     printf("l1-bench: %llu nodes, %llu votes, %zu edges: E %lld -> %lld in %d moves (%d max flows), %zu nodes shifted, %.2f s, work %llu%s, hash %016llx\n",
@@ -3801,7 +3802,7 @@ static int cmd_fit_compare(int argc, char **argv) {
 static int fc_surf_counts(int argc, char **argv, const fit_fields_buf *A) {
     const int si = arg_index(argc, argv, "--surf");
     if (si + 2 >= argc) { fprintf(stderr, "fit-compare: --surf ROOT KEY\n"); return -1; }
-    const double hi = atof(opt(argc, argv, "--surf-hi", "0.5")) * 255, lo = atof(opt(argc, argv, "--surf-lo", "0.3")) * 255;
+    const double hi = opt_atof("--surf-hi", opt(argc, argv, "--surf-hi", "0.5")) * 255, lo = opt_atof("--surf-lo", opt(argc, argv, "--surf-lo", "0.3")) * 255;
     z3 *sz = z3_open(store_open(argv[si + 1]), argv[si + 2], nullptr); if (!sz) { fprintf(stderr, "fit-compare: --surf: %s\n", z3_error()); return -1; }
     long long so[3] = {0, 0, 0};
     {   char jp[1400]; snprintf(jp, sizeof jp, "%s/%s/zarr.json", argv[si + 1], argv[si + 2]); FILE *jf = fopen(jp, "rb"); char jb[8192] = {0};
@@ -3920,8 +3921,8 @@ static void *gap_rows(void *arg) {
 }
 static int cmd_gap_compare(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm gap-compare <array-root> <array-key> <reference-fields> [--net FIELDS] [--R-um 115] [--thr 128] [--min-run 2] [--origin z,y,x] [--um U] [--cache DIR] [--threads 16]\n"); return 2; }
-    const double aum = atof(opt(argc, argv, "--um", "0")) > 0 ? atof(opt(argc, argv, "--um", "0")) : atof(argv[3]), Rum = atof(opt(argc, argv, "--R-um", "115"));   /* --um: when the key is not the voxel size */
-    const int thr = atoi(opt(argc, argv, "--thr", "128")), minrun = atoi(opt(argc, argv, "--min-run", "2")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
+    const double aum = opt_atof("--um", opt(argc, argv, "--um", "0")) > 0 ? opt_atof("--um", opt(argc, argv, "--um", "0")) : atof(argv[3]), Rum = opt_atof("--R-um", opt(argc, argv, "--R-um", "115"));   /* --um: when the key is not the voxel size */
+    const int thr = opt_atoi("--thr", opt(argc, argv, "--thr", "128")), minrun = opt_atoi("--min-run", opt(argc, argv, "--min-run", "2")), nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16);
     if (!(aum > 0)) { fprintf(stderr, "gap-compare: the array key must be its voxel size in um (e.g. 2.4)\n"); return 2; }
     fit_fields_buf A, Bn; const char *net = opt(argc, argv, "--net", nullptr);
     if (fit_fields_load(argv[4], 0, 0, 1, &A) || (net && fit_fields_load(net, 0, 0, 1, &Bn))) { fprintf(stderr, "gap-compare: cannot load the fields\n"); return 1; }
@@ -3973,8 +3974,8 @@ static int cmd_gap_compare(int argc, char **argv) {
    layers and cracks: 1.4-2.2). Writes fields-out as raw fit fields. */
 static int cmd_gap_density(int argc, char **argv) {
     if (argc < 6) { fprintf(stderr, "usage: ufsm gap-density <papyrus-root> <papyrus-key> <fields-in> <fields-out> [--fuse-um 150] [--R-um 115] [--thr 128] [--min-run 2]\n"); return 2; }
-    const double fuse = atof(opt(argc, argv, "--fuse-um", "150")), Rum = atof(opt(argc, argv, "--R-um", "115")), ump = atof(argv[3]);
-    const int thr = atoi(opt(argc, argv, "--thr", "128")), minrun = atoi(opt(argc, argv, "--min-run", "2")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
+    const double fuse = opt_atof("--fuse-um", opt(argc, argv, "--fuse-um", "150")), Rum = opt_atof("--R-um", opt(argc, argv, "--R-um", "115")), ump = atof(argv[3]);
+    const int thr = opt_atoi("--thr", opt(argc, argv, "--thr", "128")), minrun = opt_atoi("--min-run", opt(argc, argv, "--min-run", "2")), nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16);
     if (!(ump > 0)) { fprintf(stderr, "gap-density: the papyrus key must be its voxel size in um\n"); return 2; }
     fit_fields_buf A; if (fit_fields_load(argv[4], 0, 0, 1, &A)) { fprintf(stderr, "gap-density: cannot load %s\n", argv[4]); return 1; }
     z3 *pz = z3_open(store_open(argv[2]), argv[3], nullptr); if (!pz) { fprintf(stderr, "gap-density: %s\n", z3_error()); return 1; }
@@ -4029,7 +4030,7 @@ static int cmd_gap_density(int argc, char **argv) {
    void fractions where a 9.6 um CT averages them away. */
 static int cmd_void_pool(int argc, char **argv) {
     if (argc < 6) { fprintf(stderr, "usage: ufsm void-pool <pred-root> <pred-key> <out-group> <out-um> --vol-shape z,y,x [--factor 4] [--thr 128] [--shard 512]\n"); return 2; }
-    const int F = atoi(opt(argc, argv, "--factor", "4")), thr = atoi(opt(argc, argv, "--thr", "128")), S = atoi(opt(argc, argv, "--shard", "512")), nt = 16;
+    const int F = opt_atoi("--factor", opt(argc, argv, "--factor", "4")), thr = opt_atoi("--thr", opt(argc, argv, "--thr", "128")), S = opt_atoi("--shard", opt(argc, argv, "--shard", "512")), nt = 16;
     long long vs[3]; if (sscanf(opt(argc, argv, "--vol-shape", ""), "%lld,%lld,%lld", vs, vs + 1, vs + 2) != 3 || F < 1 || S < 1) { fprintf(stderr, "void-pool: --vol-shape z,y,x (level 0)\n"); return 2; }
     z3 *pz = z3_open(store_open(argv[2]), argv[3], nullptr); if (!pz) { fprintf(stderr, "void-pool: %s\n", z3_error()); return 1; }
     long long po[3] = {0, 0, 0};
@@ -4109,17 +4110,17 @@ static int cmd_papyrus_labels(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm papyrus-labels <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx [--um 2.4] [--local 8] [--local-sigma 1.5] [--depth 30] [--margin 0.1] [--sigma 1] [--cut 50,128] [--band 0] [--cutoff T] [--threads 8] [--cache DIR]\n"); return 2; }
     long long bx[6]; papyrus_cfg c; memset(&c, 0, sizeof c);
     if (sscanf(opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", bx, bx + 1, bx + 2, bx + 3, bx + 4, bx + 5) != 6) { fprintf(stderr, "papyrus-labels: --box z,y,x,nz,ny,nx\n"); return 2; }
-    const float cutoff = (float)atof(opt(argc, argv, "--cutoff", "-1"));
-    c.local = cutoff >= 0 ? 0 : atoi(opt(argc, argv, "--local", "8")); c.local_sigma = (float)atof(opt(argc, argv, "--local-sigma", "1.5"));
-    c.local_depth = (float)atof(opt(argc, argv, "--depth", "30")); c.local_margin = (float)atof(opt(argc, argv, "--margin", "0.1"));
-    c.sigma = (float)atof(opt(argc, argv, "--sigma", "1")); c.band = (float)atof(opt(argc, argv, "--band", "0"));
+    const float cutoff = (float)opt_atof("--cutoff", opt(argc, argv, "--cutoff", "-1"));
+    c.local = cutoff >= 0 ? 0 : opt_atoi("--local", opt(argc, argv, "--local", "8")); c.local_sigma = (float)opt_atof("--local-sigma", opt(argc, argv, "--local-sigma", "1.5"));
+    c.local_depth = (float)opt_atof("--depth", opt(argc, argv, "--depth", "30")); c.local_margin = (float)opt_atof("--margin", opt(argc, argv, "--margin", "0.1"));
+    c.sigma = (float)opt_atof("--sigma", opt(argc, argv, "--sigma", "1")); c.band = (float)opt_atof("--band", opt(argc, argv, "--band", "0"));
     if (sscanf(opt(argc, argv, "--cut", "50,128"), "%f,%f", &c.t_lo, &c.t_hi) != 2 || !(c.sigma >= 0 && c.sigma <= PAPYRUS_RMAX / 3.f) ||
         !(c.local_sigma >= 0 && c.local_sigma <= PAPYRUS_RMAX / 3.f) || (cutoff < 0 && c.local < 1)) { fprintf(stderr, "papyrus-labels: bad label options\n"); return 2; }
-    const int nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8), S = 512, T = S / 2;
+    const int nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8), S = 512, T = S / 2;
     float w[2 * PAPYRUS_RMAX + 1]; const int rs = papyrus_taps(c.sigma, w), rl = papyrus_taps(c.local_sigma, w);
     const int H = cutoff >= 0 ? rs : (rs > 2 * c.local + rl ? rs : 2 * c.local + rl), P = T + 2 * H;   /* what a core voxel's label can see */
     z3 *cz = z3_open(store_open(argv[2]), argv[3], opt(argc, argv, "--cache", nullptr)); if (!cz) { fprintf(stderr, "papyrus-labels: %s\n", z3_error()); return 1; }
-    const z3_meta *cm = z3_meta_of(cz); const double um = atof(opt(argc, argv, "--um", "2.4"));
+    const z3_meta *cm = z3_meta_of(cz); const double um = opt_atof("--um", opt(argc, argv, "--um", "2.4"));
     const int64_t shp[3] = {bx[3], bx[4], bx[5]};
     char lv[32], od[1400]; z3w_level_name(um, lv, sizeof lv); snprintf(od, sizeof od, "%s/%s", argv[4], lv);
     char at[600];
@@ -4192,8 +4193,8 @@ static int cmd_overlay(int argc, char **argv) {
                                   "  over the CT (0 = none); each group's level is named by --um, its origin_zyx attribute places it. --axis y / x: the plane is\n"
                                   "  normal to y / x (h runs along z, w along x / y)\n"); return 2; }
     long long pz[5]; if (sscanf(opt(argc, argv, "--plane", ""), "%lld,%lld,%lld,%lld,%lld", pz, pz + 1, pz + 2, pz + 3, pz + 4) != 5 || pz[3] < 1 || pz[4] < 1) { fprintf(stderr, "overlay: --plane z,y,x,h,w\n"); return 2; }
-    const int H = (int)pz[3], W = (int)pz[4], Z = atoi(opt(argc, argv, "--zoom", "1")) < 1 ? 1 : atoi(opt(argc, argv, "--zoom", "1"));
-    char lv[32]; z3w_level_name(atof(opt(argc, argv, "--um", "2.4")), lv, sizeof lv);
+    const int H = (int)pz[3], W = (int)pz[4], Z = opt_atoi("--zoom", opt(argc, argv, "--zoom", "1")) < 1 ? 1 : opt_atoi("--zoom", opt(argc, argv, "--zoom", "1"));
+    char lv[32]; z3w_level_name(opt_atof("--um", opt(argc, argv, "--um", "2.4")), lv, sizeof lv);
     char lab[4096]; snprintf(lab, sizeof lab, "%s", opt(argc, argv, "--labels", "")); const char *names[16]; int nl = 0;
     for (char *s = lab, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
     char prb[4096]; snprintf(prb, sizeof prb, "%s", opt(argc, argv, "--prob", "")); const int nlab = nl;   /* panels [0, nlab) labels, then probabilities */
@@ -4205,7 +4206,7 @@ static int cmd_overlay(int argc, char **argv) {
     for (char *s = rvg, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
     char sdg[4096]; snprintf(sdg, sizeof sdg, "%s", opt(argc, argv, "--sides", "")); const int nrv = nl;
     for (char *s = sdg, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
-    const int iso = atoi(opt(argc, argv, "--iso", "64"));
+    const int iso = opt_atoi("--iso", opt(argc, argv, "--iso", "64"));
     char idg[4096]; snprintf(idg, sizeof idg, "%s", opt(argc, argv, "--ids", "")); const int nprob = nl;   /* then instance-id panels [nprob, nl) */
     for (char *s = idg, *tok; nl < 16 && (tok = strtok(s, ",")); s = nullptr) names[nl++] = tok;
     const size_t n2 = (size_t)H * W; uint8_t *ct = malloc(n2), *lb = malloc(n2 * (nl ? nl : 1)); uint32_t *idv = malloc(n2 * 4 * (nl - nprob ? nl - nprob : 1)); uint8_t *tb = malloc(n2 * 8);
@@ -4352,8 +4353,8 @@ static int cmd_blend(int argc, char **argv) {
     blend_job J; memset(&J, 0, sizeof J);
     long long s3[3]; if (sscanf(opt(argc, argv, "--shape", ""), "%lld,%lld,%lld", s3, s3 + 1, s3 + 2) != 3) { fprintf(stderr, "blend: --shape Z,Y,X\n"); return 2; }
     for (int d = 0; d < 3; d++) J.shape[d] = s3[d];
-    J.S = atoi(opt(argc, argv, "--interior", "0")); J.sh = 512; J.nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
-    const float q = (float)atof(opt(argc, argv, "--q", "8"));
+    J.S = opt_atoi("--interior", opt(argc, argv, "--interior", "0")); J.sh = 512; J.nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8);
+    const float q = (float)opt_atof("--q", opt(argc, argv, "--q", "8"));
     if (J.S <= 0) { fprintf(stderr, "blend: --interior S (window - 2 halo of the runs)\n"); return 2; }
     J.in = calloc(argc, sizeof *J.in); J.org = calloc(argc, sizeof *J.org); J.shp = calloc(argc, sizeof *J.shp);
     for (int i = 4; i + 2 < argc; i++) {
@@ -4418,17 +4419,17 @@ static int cmd_render(int argc, char **argv) {
     int crop[4] = {0, 0, 0, 0}; const char *crs = opt(argc, argv, "--crop", nullptr);
     if (crs && (sscanf(crs, "%d,%d,%d,%d", &crop[0], &crop[1], &crop[2], &crop[3]) != 4 || crop[0] < 0 || crop[1] < 0 || crop[2] < 1 || crop[3] < 1)) { fprintf(stderr, "render: --crop x,y,w,h\n"); return 2; }
     if (vi < 0 || vi + 2 >= argc) { fprintf(stderr, "render: --volume ROOT KEY\n"); return 2; }
-    const double scale = atof(opt(argc, argv, "--scale", "1")); const int depth = atoi(opt(argc, argv, "--depth", "8")), known = flag(argc, argv, "--known");
-    const int tile = atoi(opt(argc, argv, "--tile", "512")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
+    const double scale = opt_atof("--scale", opt(argc, argv, "--scale", "1")); const int depth = opt_atoi("--depth", opt(argc, argv, "--depth", "8")), known = flag(argc, argv, "--known");
+    const int tile = opt_atoi("--tile", opt(argc, argv, "--tile", "512")), nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16);
     const char *cache = opt(argc, argv, "--cache", nullptr);
-    const int fill_n = atoi(opt(argc, argv, "--fill", "-1")), fill_inp = atoi(opt(argc, argv, "--fill-inpaint", "0"));
-    const int fill_thr = atoi(opt(argc, argv, "--fill-ct", "80")), fill_pref = atoi(opt(argc, argv, "--fill-prefer", "0")), fill_pm = atoi(opt(argc, argv, "--fill-pm", "0"));
-    const long fill_grid = atol(opt(argc, argv, "--fill-grid", "0"));
-    const int rgpu_on = atoi(opt(argc, argv, "--gpu", "1")) && render_gpu_available() && !getenv("UFSM_RENDER_TILED") && !known;   /* default on: same bytes, CPU on any device trouble */
+    const int fill_n = opt_atoi("--fill", opt(argc, argv, "--fill", "-1")), fill_inp = opt_atoi("--fill-inpaint", opt(argc, argv, "--fill-inpaint", "0"));
+    const int fill_thr = opt_atoi("--fill-ct", opt(argc, argv, "--fill-ct", "80")), fill_pref = opt_atoi("--fill-prefer", opt(argc, argv, "--fill-prefer", "0")), fill_pm = opt_atoi("--fill-pm", opt(argc, argv, "--fill-pm", "0"));
+    const long fill_grid = opt_atol("--fill-grid", opt(argc, argv, "--fill-grid", "0"));
+    const int rgpu_on = opt_atoi("--gpu", opt(argc, argv, "--gpu", "1")) && render_gpu_available() && !getenv("UFSM_RENDER_TILED") && !known;   /* default on: same bytes, CPU on any device trouble */
     render_set_gpu(rgpu_on);
     if (fill_n > 49 || (fill_grid && fill_n < 0) || fill_inp < 0 || fill_inp > 8 || ((fill_n >= 0 || fill_inp) && (ci < 0 || ci + 2 >= argc)) || (fill_inp && fill_n < 0) || (fill_n >= 0 && getenv("UFSM_RENDER_TILED"))) {
         fprintf(stderr, "render: --fill N (0..49) needs --ct (and not UFSM_RENDER_TILED); --fill-inpaint L (1..8) needs --fill\n"); return 2; }
-    if (known && (fill_n >= 0 || atoi(opt(argc, argv, "--joint", "0")))) { fprintf(stderr, "render: --known is the CPU box / tile path: not with --fill or --joint\n"); return 2; }
+    if (known && (fill_n >= 0 || opt_atoi("--joint", opt(argc, argv, "--joint", "0")))) { fprintf(stderr, "render: --known is the CPU box / tile path: not with --fill or --joint\n"); return 2; }
     store *vs = store_open(argv[vi + 1]), *cs = ci > 0 && ci + 2 < argc ? store_open(argv[ci + 1]) : nullptr;
     const int remote = (vs && !store_is_local(vs)) || (cs && !store_is_local(cs));
     z3 *vz = vs ? z3_open(vs, argv[vi + 2], cache) : nullptr, *cz = cs ? z3_open(cs, argv[ci + 2], cache) : nullptr;
@@ -4473,7 +4474,7 @@ static int cmd_render(int argc, char **argv) {
     }
     /* --joint 1: every wrap of the directory (same grid size and step, e.g. one wrap's recto and verso faces on one flat uv) in one
        chunk-ordered pass, so the chunks they share are decoded once; the outputs are those of separate renders, byte for byte */
-    if (atoi(opt(argc, argv, "--joint", "0")) && !rvol && !getenv("UFSM_RENDER_TILED")) {
+    if (opt_atoi("--joint", opt(argc, argv, "--joint", "0")) && !rvol && !getenv("UFSM_RENDER_TILED")) {
         enum { JMAX = 8 }; char *nm[JMAX]; float *JX[JMAX], *JY[JMAX], *JZ[JMAX]; uint8_t *VG[JMAX] = {0}; int nj = 0, jw = 0, jh = 0, ok = 1; double jstep = 0;
         while ((de = readdir(dd)) && ok) {
             if (de->d_name[0] != 'w') continue;
@@ -4614,37 +4615,37 @@ static int cmd_render(int argc, char **argv) {
 static int cmd_sample(int argc, char **argv) {
     const char *path = argv[2];
     sample_cfg cfg = sample_cfg_default();
-    cfg.P = atoi(opt(argc, argv, "--P", "128"));
-    cfg.B = atoi(opt(argc, argv, "--B", "2"));
-    cfg.seed = (uint64_t)atoll(opt(argc, argv, "--seed", "0"));
-    cfg.nworkers = atoi(opt(argc, argv, "--workers", "4"));
+    cfg.P = opt_atoi("--P", opt(argc, argv, "--P", "128"));
+    cfg.B = opt_atoi("--B", opt(argc, argv, "--B", "2"));
+    cfg.seed = (uint64_t)opt_atoll("--seed", opt(argc, argv, "--seed", "0"));
+    cfg.nworkers = opt_atoi("--workers", opt(argc, argv, "--workers", "4"));
     cfg.augment = !flag(argc, argv, "--noaug");
-    cfg.shell = atoi(opt(argc, argv, "--shell", "0"));
-    cfg.iso = atoi(opt(argc, argv, "--iso", "0")); cfg.iso_void = atoi(opt(argc, argv, "--iso-void", "0")); cfg.iso_pap = atoi(opt(argc, argv, "--iso-pap", "2")); cfg.iso_lift = atoi(opt(argc, argv, "--iso-lift", "0"));
-    cfg.dist_sigma = (float)atof(opt(argc, argv, "--dist-head", "0"));
-    int nb = atoi(opt(argc, argv, "--n", "4"));
+    cfg.shell = opt_atoi("--shell", opt(argc, argv, "--shell", "0"));
+    cfg.iso = opt_atoi("--iso", opt(argc, argv, "--iso", "0")); cfg.iso_void = opt_atoi("--iso-void", opt(argc, argv, "--iso-void", "0")); cfg.iso_pap = opt_atoi("--iso-pap", opt(argc, argv, "--iso-pap", "2")); cfg.iso_lift = opt_atoi("--iso-lift", opt(argc, argv, "--iso-lift", "0"));
+    cfg.dist_sigma = (float)opt_atof("--dist-head", opt(argc, argv, "--dist-head", "0"));
+    int nb = opt_atoi("--n", opt(argc, argv, "--n", "4"));
     const char *out = opt(argc, argv, "--out", ".");
     /* --levels W0,W1,...: level weights as train; --side 2 --wind4 1: the unwrap2 phase / winding mod 4 targets; --dump 1: each
        window's phase (and w4 / comp) as raw P^3 bytes, <out>/phase_BB_I.raw (w4_BB_I.raw, wcomp_BB_I.raw): e.g. with UFSM_SAMPLE_AT
        the same corners from two sources files (a stored phase's sign, "phase_sign") */
     { const char *lv = opt(argc, argv, "--levels", nullptr); if (lv) { char *t = strdup(lv); int l = 0; memset(cfg.level_p, 0, sizeof cfg.level_p); for (char *q = strtok(t, ","); q && l < MAXLEV; q = strtok(nullptr, ",")) cfg.level_p[l++] = atof(q); free(t); } }
-    cfg.side = atoi(opt(argc, argv, "--side", "0")); cfg.wind4 = atoi(opt(argc, argv, "--wind4", "0"));
-    const int dump = atoi(opt(argc, argv, "--dump", "0"));
+    cfg.side = opt_atoi("--side", opt(argc, argv, "--side", "0")); cfg.wind4 = opt_atoi("--wind4", opt(argc, argv, "--wind4", "0"));
+    const int dump = opt_atoi("--dump", opt(argc, argv, "--dump", "0"));
     /* --bench N: the trainer's batch formats for a CPU-only loader throughput test (no images; with UFSM_SAMPLER_NOPIN=1 no CUDA at all):
        N batches after a warm-up of --warm W, samples/s, cpu time and peak RSS. Train-like knobs: --Pz, --zfix 1, --x16 1 (fp16 batches),
        --gpu-input 1, --pack 1, --slots, --det, --min-phase, --wind4-tile / -min / -step, --symmetry-p, --axis-jitter */
-    const int bench = atoi(opt(argc, argv, "--bench", "0"));
+    const int bench = opt_atoi("--bench", opt(argc, argv, "--bench", "0"));
     if (bench > 0) {
-        cfg.Pz = atoi(opt(argc, argv, "--Pz", "0")); if (cfg.Pz == cfg.P) cfg.Pz = 0;
-        if (atoi(opt(argc, argv, "--zfix", "0"))) cfg.augment = 3;
+        cfg.Pz = opt_atoi("--Pz", opt(argc, argv, "--Pz", "0")); if (cfg.Pz == cfg.P) cfg.Pz = 0;
+        if (opt_atoi("--zfix", opt(argc, argv, "--zfix", "0"))) cfg.augment = 3;
         if (sample_aug_preset(&cfg, "none")) return 2;
-        cfg.xfmt = atoi(opt(argc, argv, "--x16", "1")); cfg.gpu_input = atoi(opt(argc, argv, "--gpu-input", "1")); cfg.pack_tm = atoi(opt(argc, argv, "--pack", "1"));
-        cfg.nbuf = atoi(opt(argc, argv, "--slots", "0")) > 0 ? atoi(opt(argc, argv, "--slots", "0")) : cfg.nworkers + 2;
-        cfg.deterministic = atoi(opt(argc, argv, "--det", "1")); cfg.pmask = cfg.side == 2;
-        cfg.min_phase = atof(opt(argc, argv, "--min-phase", cfg.wind4 ? "0.001" : "0"));
-        cfg.wind4_step = atoi(opt(argc, argv, "--wind4-step", "80")); cfg.wind4_min = atoi(opt(argc, argv, "--wind4-min", "512"));
-        { const int t = atoi(opt(argc, argv, "--wind4-tile", "64")); cfg.wind4_tile = t > 0 ? t : -1; }
-        cfg.symmetry_p = (float)atof(opt(argc, argv, "--symmetry-p", "1")); cfg.axis_jitter = (float)atof(opt(argc, argv, "--axis-jitter", "0"));
+        cfg.xfmt = opt_atoi("--x16", opt(argc, argv, "--x16", "1")); cfg.gpu_input = opt_atoi("--gpu-input", opt(argc, argv, "--gpu-input", "1")); cfg.pack_tm = opt_atoi("--pack", opt(argc, argv, "--pack", "1"));
+        cfg.nbuf = opt_atoi("--slots", opt(argc, argv, "--slots", "0")) > 0 ? opt_atoi("--slots", opt(argc, argv, "--slots", "0")) : cfg.nworkers + 2;
+        cfg.deterministic = opt_atoi("--det", opt(argc, argv, "--det", "1")); cfg.pmask = cfg.side == 2;
+        cfg.min_phase = opt_atof("--min-phase", opt(argc, argv, "--min-phase", cfg.wind4 ? "0.001" : "0"));
+        cfg.wind4_step = opt_atoi("--wind4-step", opt(argc, argv, "--wind4-step", "80")); cfg.wind4_min = opt_atoi("--wind4-min", opt(argc, argv, "--wind4-min", "512"));
+        { const int t = opt_atoi("--wind4-tile", opt(argc, argv, "--wind4-tile", "64")); cfg.wind4_tile = t > 0 ? t : -1; }
+        cfg.symmetry_p = (float)opt_atof("--symmetry-p", opt(argc, argv, "--symmetry-p", "1")); cfg.axis_jitter = (float)opt_atof("--axis-jitter", opt(argc, argv, "--axis-jitter", "0"));
         if (cfg.gpu_input && !sample_gpu_input_ok(&cfg)) { fprintf(stderr, "sample --bench: --gpu-input not available with these settings\n"); return 2; }
     }
     sources *S = sources_load(path);
@@ -4654,7 +4655,7 @@ static int cmd_sample(int argc, char **argv) {
     sampler *sp = sampler_start(S, &cfg);
     if (!sp) return 1;
     if (bench > 0) {
-        const int warm = atoi(opt(argc, argv, "--warm", "4"));
+        const int warm = opt_atoi("--warm", opt(argc, argv, "--warm", "4"));
         struct rusage ru0, ru1; double ta = 0; size_t nv = (size_t)(cfg.Pz ? cfg.Pz : cfg.P) * cfg.P * cfg.P * cfg.B;
         for (int bi = 0; bi < warm + bench; bi++) {
             if (bi == warm) { ta = now(); getrusage(RUSAGE_SELF, &ru0); }
@@ -4782,7 +4783,7 @@ int cmd_ckpt_avg(int argc, char **argv);   /* src/wbench.c */
 int cmd_phase_conflict(int argc, char **argv);   /* src/packmap.c */
 int cmd_reg(int argc, char **argv);   /* src/reg_cli.c */
 int cmd_sr_pairs(int argc, char **argv);   /* src/srpairs.c */
-int main(int argc, char **argv) {
+static int ufsm_main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "sysinfo")) return cmd_sysinfo(argc, argv);
     if (argc == 2 && !strcmp(argv[1], "train")) return cmd_train(argc, argv);
     if (argc < 3) return usage();
@@ -4791,8 +4792,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "prefetch")) {   /* ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1.0] [--P 128] [--dry 0] */
         if (argc < 3) { fprintf(stderr, "usage: ufsm prefetch <sources.json> [--levels L] [--threads N] [--fraction F] [--P window] [--dry 1 (count only)]\n"); return 2; }
         sources *S = sources_load(argv[2]); if (!S) return 1;
-        return sources_prefetch(S, atoi(opt(argc, argv, "--levels", "1")), ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 32), atof(opt(argc, argv, "--fraction", "1.0")),
-                                atoi(opt(argc, argv, "--P", "128")), atoi(opt(argc, argv, "--dry", "0")));
+        return sources_prefetch(S, opt_atoi("--levels", opt(argc, argv, "--levels", "1")), ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 32), opt_atof("--fraction", opt(argc, argv, "--fraction", "1.0")),
+                                opt_atoi("--P", opt(argc, argv, "--P", "128")), opt_atoi("--dry", opt(argc, argv, "--dry", "0")));
     }
     if (!strcmp(cmd, "ingest-labels")) return cmd_ingest_labels(argc, argv);
     if (!strcmp(cmd, "z3-recode")) return cmd_z3_recode(argc, argv);
@@ -4974,7 +4975,7 @@ int main(int argc, char **argv) {
     if (argc < 4) return usage();
     const char *root = argv[2], *key = argv[3];
     const char *cache = opt(argc, argv, "--cache", nullptr);
-    int threads = atoi(opt(argc, argv, "--threads", "0"));
+    int threads = opt_atoi("--threads", opt(argc, argv, "--threads", "0"));
     store *s = store_open(root);
     if (!strcmp(cmd, "regions")) return cmd_regions(s, key);
     if (!strcmp(cmd, "axis")) { if (argc < 5) return usage(); return cmd_axis(s, key, argv[4], cache); }
@@ -5050,4 +5051,11 @@ int main(int argc, char **argv) {
         return rc ? 1 : 0;
     }
     return usage();
+}
+/* every command: the --flags it never looked up are named when it returns successfully (src/optcheck.h; train also checks after its
+   setup, before the long part). Not after a failure: a command that stops early has not read its options yet (false warnings) */
+int main(int argc, char **argv) {
+    const int rc = ufsm_main(argc, argv);
+    if (rc == 0 && argc >= 2) opt_unread(argv[1], argc, argv);
+    return rc;
 }

@@ -8,6 +8,7 @@
    Prints per method the signed error median / mean, the share |err| >= 0.5 turn, and both split by the annotated spacing per turn
    (packed: < 15 native voxels = 144 um at 9.6 um). Only pairs whose segment lies inside the fields box (and z in --zr) count. */
 #include <math.h>
+#include "optcheck.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,7 +16,7 @@
 #include "fit.h"
 #include "json.h"
 
-static const char *rc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *rc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 typedef struct { double a[3], b[3]; double dw, sp; } rc_pair;   /* a, b: z y x native voxels (global) */
 static int rc_cmpz(const void *x, const void *y) { const rc_pair *p = x, *q = y; const double a = fmin(p->a[0], p->b[0]), b = fmin(q->a[0], q->b[0]); return (a > b) - (a < b); }
 static int rc_cmpw(const void *x, const void *y) { const double a = ((const double *)x)[3], b = ((const double *)y)[3]; return (a > b) - (a < b); }
@@ -29,7 +30,7 @@ int cmd_ray_check(int argc, char **argv) {
     json *J = json_parse(txt, L); free(txt); const json *C = J ? json_get(J, "collections") : nullptr;
     if (!C || C->type != J_OBJ) { fprintf(stderr, "ray-check: no \"collections\" in %s\n", argv[2]); return 1; }
     double zr0 = -1e18, zr1 = 1e18; sscanf(rc_opt(argc, argv, "--zr", ""), "%lf,%lf", &zr0, &zr1);
-    const double step = atof(rc_opt(argc, argv, "--step", "0.25")), minc = atof(rc_opt(argc, argv, "--minconf", "0.05"));
+    const double step = opt_atof("--step", rc_opt(argc, argv, "--step", "0.25")), minc = opt_atof("--minconf", rc_opt(argc, argv, "--minconf", "0.05"));
     size_t np = 0, cap = 1024; rc_pair *P = malloc(cap * sizeof *P);
     for (size_t c = 0; c < C->n; c++) {
         const json *pts = json_get(C->items[c], "points"); if (!pts || pts->type != J_OBJ || pts->n < 2) continue;

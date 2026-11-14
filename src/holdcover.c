@@ -5,12 +5,13 @@
    (the name before its first '-'). --hist N: each source's cells along z in N bins of its level-0 extent (where to put a slab); --per-box: each box's share alone; --zhist-out F: per source a line "name ct lev cells held ZB" then
    its labels outside the boxes per ZB (256) level-0 z rows, as shares of all its cells (a full-yx z slab adds exactly the sum over its rows). */
 #include "sources.h"
+#include "optcheck.h"
 #include "sample.h"
 #include "json.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-static const char *hc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *hc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static const char *hc_base(const char *p) {   /* sources.c src_base: the last path component past trailing slashes / level digits */
     static char b[512]; snprintf(b, sizeof b, "%s", p ? p : "");
     for (;;) { size_t n = strlen(b); while (n && b[n - 1] == '/') b[--n] = 0;
@@ -20,7 +21,7 @@ static const char *hc_base(const char *p) {   /* sources.c src_base: the last pa
 int cmd_holdout_cover(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: ufsm holdout-cover SOURCES.json [--holdouts H.json] [--hist N]\n"); return 2; }
     sources *S = sources_load(argv[2]); if (!S) return 1;
-    const char *hp = hc_opt(argc, argv, "--holdouts", nullptr); const int nh = atoi(hc_opt(argc, argv, "--hist", "0")), perbox = atoi(hc_opt(argc, argv, "--per-box", "0"));
+    const char *hp = hc_opt(argc, argv, "--holdouts", nullptr); const int nh = opt_atoi("--hist", hc_opt(argc, argv, "--hist", "0")), perbox = opt_atoi("--per-box", hc_opt(argc, argv, "--per-box", "0"));
     const char *zo = hc_opt(argc, argv, "--zhist-out", nullptr); const int64_t ZB = 256; FILE *zf = zo ? fopen(zo, "w") : nullptr;
     if (zo && !zf) { fprintf(stderr, "cannot write %s\n", zo); return 1; }
     json *hj = nullptr;

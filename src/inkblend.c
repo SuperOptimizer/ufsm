@@ -1,5 +1,6 @@
 /* ufsm ink-blend (see cmd_ink_blend) */
 #include "sysinfo.h"
+#include "optcheck.h"
 #include "fblend.h"
 #include "fit.h"
 #include "inkblend.h"
@@ -40,14 +41,14 @@ int cmd_ink_blend(int argc, char **argv) {
     /* q 0 (lossless): the inputs are already q-coded by predict; a second lossy pass (the old default 32) stacked errors (urender audit 11-14) */
     double um = 0, q = 0; int nlev = 4, S = 512, nt = ufsm_threads(0, 16);
     for (int i = 2; i < argc; i++) {
-        if (!strcmp(argv[i], "--um") && i + 1 < argc) { um = atof(argv[++i]); continue; }
-        if (!strcmp(argv[i], "--tile") && i + 1 < argc) { tile = argv[++i]; continue; }
-        if (!strcmp(argv[i], "--grids") && i + 1 < argc) { grids = argv[++i]; continue; }
-        if (!strcmp(argv[i], "--origins") && i + 1 < argc) { origins = argv[++i]; continue; }
-        if (!strcmp(argv[i], "--levels") && i + 1 < argc) { nlev = atoi(argv[++i]); continue; }
-        if (!strcmp(argv[i], "--shard") && i + 1 < argc) { S = atoi(argv[++i]); continue; }
-        if (!strcmp(argv[i], "--q") && i + 1 < argc) { q = atof(argv[++i]); continue; }
-        if (!strcmp(argv[i], "--threads") && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], opt_n("--um")) && i + 1 < argc) { um = atof(argv[++i]); continue; }
+        if (!strcmp(argv[i], opt_n("--tile")) && i + 1 < argc) { tile = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--grids")) && i + 1 < argc) { grids = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--origins")) && i + 1 < argc) { origins = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--levels")) && i + 1 < argc) { nlev = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], opt_n("--shard")) && i + 1 < argc) { S = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], opt_n("--q")) && i + 1 < argc) { q = atof(argv[++i]); continue; }
+        if (!strcmp(argv[i], opt_n("--threads")) && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
         if (!strncmp(argv[i], "--", 2)) { fprintf(stderr, "ink-blend: unknown option %s\n", argv[i]); return 2; }
         if (!out) out = argv[i]; else if (n < 32) in[n++] = argv[i]; else { fprintf(stderr, "ink-blend: at most 32 inputs\n"); return 2; }
     }

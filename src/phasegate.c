@@ -11,6 +11,7 @@
    --mode ref: g = 0 everywhere (every cell with material takes the ref's phase: the snap then reproduces the ref).
    Output: raw fit fields (all planes copied, pc / ps replaced) + gate.u8 (g x 255 per cell) for inspection. */
 #include <math.h>
+#include "optcheck.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +19,7 @@
 #include <time.h>
 #include "fit.h"
 
-static const char *pg_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *pg_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static double pg_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 static double pg_smooth(double x, double a, double b) { if (x <= a) return 0; if (x >= b) return 1; const double t = (x - a) / (b - a); return t * t * (3 - 2 * t); }
 static double pg_axis(const float *v, int n, double z) { if (z <= 0) return v[0]; if (z >= n - 1) return v[n - 1]; const int i = (int)z; const double t = z - i; return v[i] + t * (v[i + 1] - v[i]); }
@@ -123,13 +124,13 @@ int cmd_phase_gate(int argc, char **argv) {
         return 2;
     }
     const double t0 = pg_now();
-    fit_set_threads(atoi(pg_opt(argc, argv, "--threads", "16")));
+    fit_set_threads(opt_atoi("--threads", pg_opt(argc, argv, "--threads", "16")));
     fit_set *ref = fit_set_load(pg_opt(argc, argv, "--ref", "")); if (!ref) { fprintf(stderr, "phase-gate: cannot load the ref\n"); return 1; }
     fit_fields_skip_planes(1 | 2); fit_fields_ct_planes(0);
     fit_fields_buf g; if (fit_fields_load(argv[2], 0, 0, 1, &g)) { fprintf(stderr, "phase-gate: cannot load %s\n", argv[2]); return 1; }
     const size_t n = (size_t)g.shape[0] * g.shape[1] * g.shape[2];
-    const fit_pgate_cfg pc = {.mode = !strcmp(pg_opt(argc, argv, "--mode", "gate"), "ref"), .R = atoi(pg_opt(argc, argv, "--R", "6")), .lo = atof(pg_opt(argc, argv, "--lo", "0.3")),
-                              .hi = atof(pg_opt(argc, argv, "--hi", "0.6")), .rc = atof(pg_opt(argc, argv, "--ref-conf", "0.5"))};
+    const fit_pgate_cfg pc = {.mode = !strcmp(pg_opt(argc, argv, "--mode", "gate"), "ref"), .R = opt_atoi("--R", pg_opt(argc, argv, "--R", "6")), .lo = opt_atof("--lo", pg_opt(argc, argv, "--lo", "0.3")),
+                              .hi = opt_atof("--hi", pg_opt(argc, argv, "--hi", "0.6")), .rc = opt_atof("--ref-conf", pg_opt(argc, argv, "--ref-conf", "0.5"))};
     const double ro[3] = {(double)(g.origin[0] - ref->global->origin[0]), (double)(g.origin[1] - ref->global->origin[1]), (double)(g.origin[2] - ref->global->origin[2])};
     uint8_t *gate = calloc(n, 1); double st[4] = {0};
     if (!gate || fit_phase_gate(&g.f, 0, g.cy, g.cx, (int)(g.shape[0] * g.h) + 1, ref, nullptr, ro, &pc, g.a[0], g.a[1], gate, st)) { fprintf(stderr, "phase-gate: out of memory / ref grid failed\n"); return 1; }

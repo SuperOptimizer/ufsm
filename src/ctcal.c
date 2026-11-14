@@ -15,6 +15,7 @@
    phase .95-1.02 at spacing >= 115 um).
    Prints k by radius and overall. CPU, the CT planes read like wrap-check (the rows covering each native z, averaged). */
 #include "fit.h"
+#include "optcheck.h"
 #include "zarr3.h"
 #include "store.h"
 #include <math.h>
@@ -24,8 +25,8 @@
 #include <string.h>
 #include <time.h>
 
-static const char *cc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
-static int cc_idx(int argc, char **argv, const char *k) { for (int i = 3; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
+static const char *cc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
+static int cc_idx(int argc, char **argv, const char *k) { for (int i = 3; i < argc; i++) if (!strcmp(argv[i], opt_n(k))) return i; return -1; }
 enum { CC_NSB = 40 }; static const double CC_SBW = 10;   /* --phase-src spacing bins: 10 um up to 400 um */
 static double cc_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
@@ -120,9 +121,9 @@ int cmd_ct_cal(int argc, char **argv) {
                         "  the density head's turn count vs the CT's papyrus peaks along radial rays: k = peaks / density turns per (z, angle, band), for count-field --ct-cal\n");
         return 2;
     }
-    const double t0 = cc_now(), ctum = atof(cc_opt(argc, argv, "--ct-um", "0"));
-    const int nz = atoi(cc_opt(argc, argv, "--nz", "32")), nth = atoi(cc_opt(argc, argv, "--nth", "32")), nt = atoi(cc_opt(argc, argv, "--threads", "16"));
-    const double sigma = atof(cc_opt(argc, argv, "--sigma", "1.2")), prom = atof(cc_opt(argc, argv, "--prom", "1")), bmm = atof(cc_opt(argc, argv, "--band-mm", "1"));
+    const double t0 = cc_now(), ctum = opt_atof("--ct-um", cc_opt(argc, argv, "--ct-um", "0"));
+    const int nz = opt_atoi("--nz", cc_opt(argc, argv, "--nz", "32")), nth = opt_atoi("--nth", cc_opt(argc, argv, "--nth", "32")), nt = opt_atoi("--threads", cc_opt(argc, argv, "--threads", "16"));
+    const double sigma = opt_atof("--sigma", cc_opt(argc, argv, "--sigma", "1.2")), prom = opt_atof("--prom", cc_opt(argc, argv, "--prom", "1")), bmm = opt_atof("--band-mm", cc_opt(argc, argv, "--band-mm", "1"));
     if ((ci > 0 && !(ctum > 0)) || nz < 1 || nth < 4 || !(bmm > 0)) { fprintf(stderr, "ct-cal: --ct-um, --nz, --nth, --band-mm\n"); return 2; }
     fit_set_threads(nt); fit_fields_skip_planes(1 | 2); fit_fields_ct_planes(0);
     fit_fields_buf g; if (fit_fields_load(argv[2], 0, 0, 0, &g)) { fprintf(stderr, "ct-cal: cannot read %s\n", argv[2]); return 1; }

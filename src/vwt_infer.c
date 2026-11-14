@@ -15,6 +15,7 @@
    band's slabs (one sync), then per kept slab extraction on the device (trilinear, src/nn_vwi.cu), the bf16 forward, the block means and
    pair points, async D2H into a pinned record slot, and a writer thread doing the pwrites. */
 #include "vwt.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "nn.h"
 #include "attn.h"
@@ -46,7 +47,7 @@ void vwi_h2d_async(void *dst, const void *src, size_t n);
 void vwi_event_record(void *e);
 int vwi_event_wait(void *e);
 
-static const char *opt(int argc, char **argv, const char *k, const char *d) { for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *opt(int argc, char **argv, const char *k, const char *d) { for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
 static void frame_bbox(const vwt_slab *f, int T, int L, double lo[3], double hi[3]) {   /* xyz */
@@ -124,27 +125,27 @@ static int open_rw(const char *dir, const char *name, size_t bytes) {   /* creat
 static vwt_cfg default_cfg(int T, int L) { return (vwt_cfg){T, L, {32, 64, 96}, 192, 2, 6, 4, 256, 96, 0.04f}; }
 
 int cmd_vwt_infer(int argc, char **argv) {
-    const int bench = atoi(opt(argc, argv, "--bench", "0"));
+    const int bench = opt_atoi("--bench", opt(argc, argv, "--bench", "0"));
     if (!bench && argc < 6) {
         fprintf(stderr, "usage: ufsm vwt-infer CKPT ROOT KEY OUT --umb JSON --box z,y,x,nz,ny,nx [--gpu 0] [--part i/n] [--threads 16] [--cache DIR]\n"
                         "       ufsm vwt-infer --bench N [--gpu 0]\n");
         return 2;
     }
-    const int T = atoi(opt(argc, argv, "--T", "128")), L = atoi(opt(argc, argv, "--L", "384")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
+    const int T = opt_atoi("--T", opt(argc, argv, "--T", "128")), L = opt_atoi("--L", opt(argc, argv, "--L", "384")), nth = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16);
     int pi = 0, pn = 1; sscanf(opt(argc, argv, "--part", "0/1"), "%d/%d", &pi, &pn); if (pn < 1 || pi < 0 || pi >= pn) { fprintf(stderr, "vwt-infer: bad --part\n"); return 2; }
-    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) { fprintf(stderr, "vwt-infer: no GPU\n"); return 1; }
+    if (nn_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) { fprintf(stderr, "vwt-infer: no GPU\n"); return 1; }
     if (!getenv("UFSM_LINEAR_MX")) at_set_mx(16);   /* the bf16 blocks */
     /* MX-fp8 conv forward (--mx8 1, the default; env UFSM_VTF_MX overrides): r0-2000 on a 96-slab P4 box vs bf16 convs: |d phase| median
        0.002, max 0.025 turns, pair offsets max 0.012 turns; 7.5 % faster */
-    if (!getenv("UFSM_VTF_MX")) vtf_set_mx(atoi(opt(argc, argv, "--mx8", "1")) ? 8 : 0);
+    if (!getenv("UFSM_VTF_MX")) vtf_set_mx(opt_atoi("--mx8", opt(argc, argv, "--mx8", "1")) ? 8 : 0);
     vwt *m; vwt_cfg c = default_cfg(T, L);
-    if (bench && (*opt(argc, argv, "--trunk", "") || *opt(argc, argv, "--trunk-ckpt", ""))) c.cx = atoi(opt(argc, argv, "--cx", "43"));   /* (bench: random weights) */
+    if (bench && (*opt(argc, argv, "--trunk", "") || *opt(argc, argv, "--trunk-ckpt", ""))) c.cx = opt_atoi("--cx", opt(argc, argv, "--cx", "43"));   /* (bench: random weights) */
     m = bench ? vwt_create(&c, 1) : vwt_load(argv[2], 1);
     if (!m) { fprintf(stderr, "vwt-infer: no model\n"); return 1; }
     /* --trunk CKPT (wind96; --trunk-ckpt WT: a fine-tuned trunk instead) --umb JSON --um UM: the frozen trunk in-slab before the model, as
        vwt-train runs it (axis point at the slab centre's z from the umbilicus, axis direction +z, the CT level's voxel size) */
     wtrunk *WT = nullptr; uint16_t *xfd = nullptr; int xld = 0; axis tax = {0};
-    const double tum = atof(opt(argc, argv, "--um", "9.6"));
+    const double tum = opt_atof("--um", opt(argc, argv, "--um", "9.6"));
     if (*opt(argc, argv, "--trunk", "") || *opt(argc, argv, "--trunk-ckpt", "")) {
         const char *tp = *opt(argc, argv, "--trunk-ckpt", "") ? opt(argc, argv, "--trunk-ckpt", "") : opt(argc, argv, "--trunk", "");
         if (bench) { static double bz[2] = {0, 1e6}, by[2] = {1024, 1024}, bxx[2] = {1024, 1024}; tax.n = 2; tax.z = bz; tax.y = by; tax.x = bxx; }   /* (the bench volume's axis) */
@@ -192,7 +193,7 @@ int cmd_vwt_infer(int argc, char **argv) {
       for (size_t i = 1; i <= (size_t)S.n; i++) if (i == (size_t)S.n || S.s[i].b != S.s[s0].b) { if (bi++ % pn == pi) band_box(&S, s0, i, T, L, V, &B[nbands++]); s0 = i; } }
     /* --resume 1: slabs whose centre is already written (any non-zero bits: a value or the NaN of a skip) are done; whole done bands drop */
     uint8_t *done = calloc((size_t)S.n + 1, 1);
-    if (!bench && atoi(opt(argc, argv, "--resume", "0"))) {
+    if (!bench && opt_atoi("--resume", opt(argc, argv, "--resume", "0"))) {
         char p[1200]; snprintf(p, sizeof p, "%s/centre.f32", argv[5]); FILE *f = fopen(p, "rb"); size_t nd0 = 0;
         if (f) { uint32_t *cv = calloc((size_t)S.n + 1, 4); const size_t got = fread(cv, 4, (size_t)S.n, f); fclose(f);
                  for (size_t k = 0; k < got; k++) { done[k] = cv[k] != 0; nd0 += done[k]; } free(cv); }

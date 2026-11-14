@@ -10,6 +10,7 @@
 
    Cases: a list file of lines "train|val IMAGE LABEL" (uint8 multi-page TIFF volumes, z pages; label 0 / 1 / 2). */
 #include "dinovol.h"
+#include "optcheck.h"
 #include "xnet.h"
 #include "nn.h"
 #include "attn.h"
@@ -40,7 +41,7 @@ void se_u8_norm(const uint8_t *u, float *x, int cin, long long V, float c, float
 void se_f2f_cl(const float *src, float *dst, long long S, int C);
 
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 static double se_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -399,7 +400,7 @@ static int se_gradcheck(void) {
     return bad > 3;
 }
 int cmd_surf_eval(int argc, char **argv) {
-    if (argc > 2 && !strcmp(argv[2], "--gradcheck")) { if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1; nn_set_act_bf16(0); nn_set_tf32(getenv("SE_TF32") != nullptr); return se_gradcheck(); }
+    if (argc > 2 && !strcmp(argv[2], opt_n("--gradcheck"))) { if (nn_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1; nn_set_act_bf16(0); nn_set_tf32(getenv("SE_TF32") != nullptr); return se_gradcheck(); }
     const char *list = opt(argc, argv, "--cases", nullptr), *ck = opt(argc, argv, "--ckpt", nullptr), *out = opt(argc, argv, "--out", nullptr);
     if (!list || !ck || !out) {
         fprintf(stderr, "usage: ufsm surf-eval --cases LIST --ckpt dinovol.pt --out RUN_DIR [--P 128] [--batch 2] [--steps 5000] [--val-every 500] [--val-crops 2]\n"
@@ -407,15 +408,15 @@ int cmd_surf_eval(int argc, char **argv) {
                         "  the upstream kaggle_surfaces frozen-encoder decoder evaluation (see src/surfeval.c); LIST lines: train|val IMAGE.tif LABEL.tif\n");
         return 2;
     }
-    const int P = atoi(opt(argc, argv, "--P", "128")), N = 1, NB = atoi(opt(argc, argv, "--batch", "2")), steps = atoi(opt(argc, argv, "--steps", "5000"));
-    const int vev = atoi(opt(argc, argv, "--val-every", "500")), vcr = atoi(opt(argc, argv, "--val-crops", "2")), vlim = atoi(opt(argc, argv, "--val-cases", "0"));
-    const float lr = (float)atof(opt(argc, argv, "--lr", "1e-4")), wd = (float)atof(opt(argc, argv, "--wd", "1e-4")), clip = (float)atof(opt(argc, argv, "--clip", "12"));
-    uint64_t rs = (uint64_t)atoll(opt(argc, argv, "--seed", "42")) * 0x9E3779B97F4A7C15ull + 7;
-    const int gpu = atoi(opt(argc, argv, "--gpu", "0"));
+    const int P = opt_atoi("--P", opt(argc, argv, "--P", "128")), N = 1, NB = opt_atoi("--batch", opt(argc, argv, "--batch", "2")), steps = opt_atoi("--steps", opt(argc, argv, "--steps", "5000"));
+    const int vev = opt_atoi("--val-every", opt(argc, argv, "--val-every", "500")), vcr = opt_atoi("--val-crops", opt(argc, argv, "--val-crops", "2")), vlim = opt_atoi("--val-cases", opt(argc, argv, "--val-cases", "0"));
+    const float lr = (float)opt_atof("--lr", opt(argc, argv, "--lr", "1e-4")), wd = (float)opt_atof("--wd", opt(argc, argv, "--wd", "1e-4")), clip = (float)opt_atof("--clip", opt(argc, argv, "--clip", "12"));
+    uint64_t rs = (uint64_t)opt_atoll("--seed", opt(argc, argv, "--seed", "42")) * 0x9E3779B97F4A7C15ull + 7;
+    const int gpu = opt_atoi("--gpu", opt(argc, argv, "--gpu", "0"));
     if (P % 16 || NB < 1) { fprintf(stderr, "surf-eval: P a multiple of 16\n"); return 2; }
     if (nn_init(gpu) || xnet_init(gpu)) return 1;
     nn_set_act_bf16(0); nn_set_tf32(getenv("SE_TF32") != nullptr);   /* (default: the plain fp32 conv kernels; the TF32 path reads 16-bit activations) */
-    xnet_set_budget((size_t)(atof(opt(argc, argv, "--gpu-mem", "6")) * 1e9));
+    xnet_set_budget((size_t)(opt_atof("--gpu-mem", opt(argc, argv, "--gpu-mem", "6")) * 1e9));
     /* cases */
     FILE *lf = fopen(list, "r"); if (!lf) { fprintf(stderr, "surf-eval: cannot read %s\n", list); return 1; }
     int nc = 0, cap = 1024; se_case *C = calloc(cap, sizeof *C); char line[4200];

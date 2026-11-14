@@ -21,6 +21,7 @@
    --no-snap 1: no walks, the output is the phase as read (with --phase-scale 2: --interp linear (circular trilinear) or nearest, the
    sampler's read of a one-level-coarser stored phase): with --agree, the side agreement of a coarse label copy with the fine one. */
 #include "band.h"
+#include "optcheck.h"
 #include "store.h"
 #include "sysinfo.h"
 #include "z3w.h"
@@ -36,7 +37,7 @@
 #include <unistd.h>
 
 static const char *sf_opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 
@@ -205,10 +206,10 @@ int cmd_side_face(int argc, char **argv) {
     const char *cache = sf_opt(argc, argv, "--cache", nullptr);
     J.ph = z3_open(store_open(argv[2]), argv[3], cache); J.ct = z3_open(store_open(argv[4]), argv[5], cache);
     if (!J.ph || !J.ct) { fprintf(stderr, "side-face: %s\n", z3_error()); return 1; }
-    J.pscale = atoi(sf_opt(argc, argv, "--phase-scale", "1")); J.iso = atoi(sf_opt(argc, argv, "--iso", "64")); J.reach = atof(sf_opt(argc, argv, "--reach", "3"));
-    J.cap = atoi(sf_opt(argc, argv, "--cap", "48")); J.cell = atoi(sf_opt(argc, argv, "--cell", "16")); J.mincell = atoi(sf_opt(argc, argv, "--min-cell", "8")); J.pervox = atoi(sf_opt(argc, argv, "--per-voxel", "0"));
-    J.nosnap = atoi(sf_opt(argc, argv, "--no-snap", "0")); J.nearest = !strcmp(sf_opt(argc, argv, "--interp", "linear"), "nearest");
-    J.B = atoi(sf_opt(argc, argv, "--block", "128")); J.S = atoi(sf_opt(argc, argv, "--shard", "512")); J.H = J.cap + 2;
+    J.pscale = opt_atoi("--phase-scale", sf_opt(argc, argv, "--phase-scale", "1")); J.iso = opt_atoi("--iso", sf_opt(argc, argv, "--iso", "64")); J.reach = opt_atof("--reach", sf_opt(argc, argv, "--reach", "3"));
+    J.cap = opt_atoi("--cap", sf_opt(argc, argv, "--cap", "48")); J.cell = opt_atoi("--cell", sf_opt(argc, argv, "--cell", "16")); J.mincell = opt_atoi("--min-cell", sf_opt(argc, argv, "--min-cell", "8")); J.pervox = opt_atoi("--per-voxel", sf_opt(argc, argv, "--per-voxel", "0"));
+    J.nosnap = opt_atoi("--no-snap", sf_opt(argc, argv, "--no-snap", "0")); J.nearest = !strcmp(sf_opt(argc, argv, "--interp", "linear"), "nearest");
+    J.B = opt_atoi("--block", sf_opt(argc, argv, "--block", "128")); J.S = opt_atoi("--shard", sf_opt(argc, argv, "--shard", "512")); J.H = J.cap + 2;
     if ((J.pscale != 1 && J.pscale != 2) || J.iso < 1 || J.cap < 2 || J.cell < 1 || J.B < 16 || J.S % J.B) { fprintf(stderr, "side-face: bad options (--phase-scale 1|2, --shard a multiple of --block)\n"); return 2; }
     const z3_meta *cm = z3_meta_of(J.ct), *pm = z3_meta_of(J.ph);
     for (int d = 0; d < 3; d++) { J.shape[d] = cm->shape[d]; J.bn[d] = cm->shape[d];
@@ -216,9 +217,9 @@ int cmd_side_face(int argc, char **argv) {
             fprintf(stderr, "side-face: phase shape %lld vs CT %lld on axis %d (--phase-scale %d)\n", (long long)pm->shape[d], (long long)cm->shape[d], d, J.pscale); return 1; } }
     if (*sf_opt(argc, argv, "--box", "")) { long long v[6]; if (sscanf(sf_opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", v, v + 1, v + 2, v + 3, v + 4, v + 5) != 6) { fprintf(stderr, "side-face: --box z,y,x,nz,ny,nx\n"); return 2; }
                                            for (int d = 0; d < 3; d++) { J.bo[d] = v[d]; J.bn[d] = v[3 + d]; } }
-    { const char *ar = nullptr, *ak = nullptr; for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], "--agree")) { ar = argv[i + 1]; ak = argv[i + 2]; }
+    { const char *ar = nullptr, *ak = nullptr; for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--agree"))) { ar = argv[i + 1]; ak = argv[i + 2]; }
       if (ar && !(J.ag = z3_open(store_open(ar), ak, cache))) { fprintf(stderr, "side-face: --agree: %s\n", z3_error()); return 1; } }
-    const int nt = ufsm_threads(atoi(sf_opt(argc, argv, "--threads", "0")), 16), noout = atoi(sf_opt(argc, argv, "--no-out", "0"));
+    const int nt = ufsm_threads(opt_atoi("--threads", sf_opt(argc, argv, "--threads", "0")), 16), noout = opt_atoi("--no-out", sf_opt(argc, argv, "--no-out", "0"));
     z3w *w = nullptr;
     if (!noout) {
         char lv[32], od[1400], at[600]; const double um = atof(argv[7]); z3w_level_name(um, lv, sizeof lv); snprintf(od, sizeof od, "%s/%s", argv[6], lv);

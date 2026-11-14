@@ -26,6 +26,7 @@
    default the wrap's step): it lines up with the wrap's renders. */
 #include "defaulted.h"
 #include "sources.h"
+#include "optcheck.h"
 #include "store.h"
 #include "surfcomp.h"
 #include "sysinfo.h"
@@ -46,9 +47,9 @@
 #define WSN_Q 8.0    /* offsets stored in 1/8 wrap voxel (int8: +-15.9 voxels) */
 #define WSN_NB 8192  /* angle bins of the radius tables */
 
-static const char *wsn_opt(int argc, char **argv, const char *name, const char *def) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1]; return def; }
-static int wsn_flag(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], name)) return 1; return 0; }
-static int wsn_idx(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], name)) return i; return -1; }
+static const char *wsn_opt(int argc, char **argv, const char *name, const char *def) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1]; return def; }
+static int wsn_flag(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], opt_n(name))) return 1; return 0; }
+static int wsn_idx(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], opt_n(name))) return i; return -1; }
 static double wsn_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
 /* ---- a decoded-chunk table over one uint8 array (CT or a fields plane), filled per band ---- */
@@ -504,19 +505,19 @@ int cmd_wrap_snap(int argc, char **argv) {
                                     "       [--range 60] [--margin 0.1] [--sigma 480,240,120] [--tau 40,25,15] [--iters 2] [--min-prom 6] [--first K] [--last K] [--band 64] [--sfc 0.25] [--threads N] [--dry] [--cache DIR] [--masked-warn 0.02] [--masked-max 0]\n"); return 2; }
     const char *in = argv[2], *out = argv[3], *tg = wsn_opt(argc, argv, "--target", "ct");
     const int target = !strcmp(tg, "ct") ? T_CT : !strcmp(tg, "phase") ? T_PHASE : !strcmp(tg, "recto") ? T_RECTO : !strcmp(tg, "mix") ? T_MIX : -1;
-    const int nt = ufsm_threads(atoi(wsn_opt(argc, argv, "--threads", "0")), 16), dry = wsn_flag(argc, argv, "--dry");
-    const double ctum = atof(wsn_opt(argc, argv, "--ct-um", "0")), axum = atof(wsn_opt(argc, argv, "--axis-um", "0")), range_um = atof(wsn_opt(argc, argv, "--range", "60"));
+    const int nt = ufsm_threads(opt_atoi("--threads", wsn_opt(argc, argv, "--threads", "0")), 16), dry = wsn_flag(argc, argv, "--dry");
+    const double ctum = opt_atof("--ct-um", wsn_opt(argc, argv, "--ct-um", "0")), axum = opt_atof("--axis-um", wsn_opt(argc, argv, "--axis-um", "0")), range_um = opt_atof("--range", wsn_opt(argc, argv, "--range", "60"));
     const char *axp = wsn_opt(argc, argv, "--axis", nullptr), *fd = wsn_opt(argc, argv, "--fields", nullptr), *cache = wsn_opt(argc, argv, "--cache", nullptr);
-    const int ci = wsn_idx(argc, argv, "--ct"), BR = atoi(wsn_opt(argc, argv, "--band", "64"));
+    const int ci = wsn_idx(argc, argv, "--ct"), BR = opt_atoi("--band", wsn_opt(argc, argv, "--band", "64"));
     if (target < 0 || !axp || !(axum > 0) || ci < 0 || ci + 2 >= argc || !(ctum > 0) || BR < 1 || !(range_um > 0)) { fprintf(stderr, "wrap-snap: --target ct|phase|recto|mix, --axis FILE --axis-um U0 (its level-0 um), --ct ROOT KEY --ct-um U, --band >= 1, --range > 0\n"); return 2; }
     if ((target == T_PHASE || target == T_RECTO || target == T_MIX) && !fd) { fprintf(stderr, "wrap-snap: --target %s needs --fields DIR\n", tg); return 2; }
     wsn_solve S; memset(&S, 0, sizeof S);
     S.nsig = wsn_list(wsn_opt(argc, argv, "--sigma", "480,240,120"), S.sig, 8); const int ntau = wsn_list(wsn_opt(argc, argv, "--tau", "40,25,15"), S.tau, 8);
     for (int s = ntau; s < S.nsig; s++) S.tau[s] = ntau ? S.tau[ntau - 1] : 2;
-    S.iters = atoi(wsn_opt(argc, argv, "--iters", "2")); S.lam = atof(wsn_opt(argc, argv, "--lambda", "0.02"));
+    S.iters = opt_atoi("--iters", wsn_opt(argc, argv, "--iters", "2")); S.lam = opt_atof("--lambda", wsn_opt(argc, argv, "--lambda", "0.02"));
     if (S.nsig < 1 || S.iters < 1) { fprintf(stderr, "wrap-snap: --sigma and --iters\n"); return 2; }
     axis ax = {0}; if (axis_load(&ax, axp)) { fprintf(stderr, "wrap-snap: cannot load the axis %s\n", axp); return 1; }
-    const int k0 = atoi(wsn_opt(argc, argv, "--first", "-1000000")), k1 = atoi(wsn_opt(argc, argv, "--last", "1000000"));
+    const int k0 = opt_atoi("--first", wsn_opt(argc, argv, "--first", "-1000000")), k1 = opt_atoi("--last", wsn_opt(argc, argv, "--last", "1000000"));
     /* the wraps: every wNNN.sfc (the selected ids and their neighbours are opened) */
     DIR *dd = opendir(in); if (!dd) { fprintf(stderr, "wrap-snap: cannot open %s\n", in); return 1; }
     int nw = 0, cap = 64; wsn_wrap *W = calloc(cap, sizeof *W); struct dirent *de;
@@ -564,11 +565,11 @@ int cmd_wrap_snap(int argc, char **argv) {
         if ((target == T_PHASE || target == T_MIX) && wsn_vol_open(&vpc, fd, "pc", cache, wum / fum, org, 128)) { fprintf(stderr, "wrap-snap: fields pc: %s\n", z3_error()); return 1; }
         if (target == T_RECTO && wsn_vol_open(&vr, fd, "r", cache, wum / fum, org, 0)) { fprintf(stderr, "wrap-snap: fields r: %s (no recto plane?)\n", z3_error()); return 1; }
     }
-    if (!dry) { char cmd[1500]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", out); if (system(cmd)) return 1; if (atof(wsn_opt(argc, argv, "--sfc", "0.25")) > 0) tifxyz_set_sfc(atof(wsn_opt(argc, argv, "--sfc", "0.25"))); }
+    if (!dry) { char cmd[1500]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", out); if (system(cmd)) return 1; if (opt_atof("--sfc", wsn_opt(argc, argv, "--sfc", "0.25")) > 0) tifxyz_set_sfc(opt_atof("--sfc", wsn_opt(argc, argv, "--sfc", "0.25"))); }
     tfx_set_threads(nt);
     double t0 = wsn_now(), tdec = 0; int nsel = 0; for (int k = 0; k < nw; k++) nsel += W[k].sel;
     fprintf(stderr, "wrap-snap: %d wraps (%d snapped), %d rows, %.4g um, target %s, range %.1f voxels, bands of %d rows, %d threads\n", nw, nsel, H, wum, tg, R, BR, nt);
-    wsn_job J = {W, nw, &ax, wum / axum, &vct, vpc.z ? &vpc : nullptr, vr.z ? &vr : nullptr, target, R, atof(wsn_opt(argc, argv, "--margin", "0.1")), atof(wsn_opt(argc, argv, "--min-prom", "6")), 0, 0, 0, 0, 0, getenv("UFSM_WSN_DEBUG") != nullptr};
+    wsn_job J = {W, nw, &ax, wum / axum, &vct, vpc.z ? &vpc : nullptr, vr.z ? &vr : nullptr, target, R, opt_atof("--margin", wsn_opt(argc, argv, "--margin", "0.1")), opt_atof("--min-prom", wsn_opt(argc, argv, "--min-prom", "6")), 0, 0, 0, 0, 0, getenv("UFSM_WSN_DEBUG") != nullptr};
     pthread_t th[64]; const int m = nt < 64 ? nt : 64;
     for (int b0 = 0; b0 < H; b0 += BR) {
         J.B0 = b0; J.BN = b0 + BR <= H ? BR : H - b0; J.njobs = (long)nw * J.BN;
@@ -596,13 +597,13 @@ int cmd_wrap_snap(int argc, char **argv) {
     {   /* the CT mask clipping the surface (audit ugeom #1: 1667's -masked store zeroes the outer sheets, 16 % of the published surface;
            0.182 of our wrap vertices sat on masked CT and nothing said so). --masked-warn F (default 0.02): a WARNING line above F;
            --masked-max F (default 0 = off): fail (exit 3) above F, after the warning and before anything is written */
-        const double ms = nval ? (double)nmask / nval : 0, mw = atof(wsn_opt(argc, argv, "--masked-warn", "0.02")), mm = atof(wsn_opt(argc, argv, "--masked-max", "0"));
+        const double ms = nval ? (double)nmask / nval : 0, mw = opt_atof("--masked-warn", wsn_opt(argc, argv, "--masked-warn", "0.02")), mm = opt_atof("--masked-max", wsn_opt(argc, argv, "--masked-max", "0"));
         if (mw > 0 && ms > mw)
             fprintf(stderr, "wrap-snap: WARNING: %.4f of the wrap vertices lie on masked CT (CT 0; > --masked-warn %.3g): the scan mask clips the surface, so the "
                             "fields had no input there (use an unmasked / dilated CT store)\n", ms, mw);
         if (mm > 0 && ms > mm) { fprintf(stderr, "wrap-snap: ERROR: masked-CT share %.4f > --masked-max %.3g\n", ms, mm); return 3; }
     }
-    S.s0 = wum / axum; S.ax = &ax; S.out = out; S.dry = dry; S.dmap = wsn_opt(argc, argv, "--dmap", nullptr); S.dmap_gs = atof(wsn_opt(argc, argv, "--dmap-gs", "0"));
+    S.s0 = wum / axum; S.ax = &ax; S.out = out; S.dry = dry; S.dmap = wsn_opt(argc, argv, "--dmap", nullptr); S.dmap_gs = opt_atof("--dmap-gs", wsn_opt(argc, argv, "--dmap-gs", "0"));
     if (S.dmap) { char cmd[1500]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", S.dmap); if (system(cmd)) return 1; } S.W = W; S.nw = nw;
     for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, wsn_solve_run, &S);
     for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);

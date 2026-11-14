@@ -8,6 +8,7 @@
    voxel sizes --ink-um / --phase-um). --seam: also unknown within WIDTH ink voxels of the planes OFFSET + k PERIOD of every axis
    (the window borders of a single-pass predict, whose seams ink-seam measures), so window seams are not taught. Only shards holding stored phase chunks are visited. Prints the gated / ink voxel counts. */
 #include <math.h>
+#include "optcheck.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -19,9 +20,9 @@
 #include "zarr3.h"
 #include "z3w.h"
 
-static const char *ig_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *ig_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static int ig_opt2(int argc, char **argv, const char *k, const char **a, const char **b) {
-    for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], k)) { *a = argv[i + 1]; *b = argv[i + 2]; return 1; }
+    for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n(k))) { *a = argv[i + 1]; *b = argv[i + 2]; return 1; }
     return 0;
 }
 
@@ -90,10 +91,10 @@ int cmd_ink_gate(int argc, char **argv) {
     }
     ig_opt2(argc, argv, "--ignore", &J.gr, &J.gk);
     const char *out = argv[2];
-    J.ium = atof(ig_opt(argc, argv, "--ink-um", "0")); J.pum = atof(ig_opt(argc, argv, "--phase-um", "0"));
-    J.lo = atoi(ig_opt(argc, argv, "--lo", "0")); J.hi = atoi(ig_opt(argc, argv, "--hi", "125")); J.imax = atoi(ig_opt(argc, argv, "--ink-max", "255"));
+    J.ium = opt_atof("--ink-um", ig_opt(argc, argv, "--ink-um", "0")); J.pum = opt_atof("--phase-um", ig_opt(argc, argv, "--phase-um", "0"));
+    J.lo = opt_atoi("--lo", ig_opt(argc, argv, "--lo", "0")); J.hi = opt_atoi("--hi", ig_opt(argc, argv, "--hi", "125")); J.imax = opt_atoi("--ink-max", ig_opt(argc, argv, "--ink-max", "255"));
     { const char *sm = ig_opt(argc, argv, "--seam", nullptr); if (sm && (sscanf(sm, "%d,%d,%d", &J.sp, &J.so, &J.sw) != 3 || J.sp <= 0 || J.sw < 0 || 2 * J.sw >= J.sp)) { fprintf(stderr, "ink-gate: --seam PERIOD,OFFSET,WIDTH\n"); return 2; } }
-    J.S = atoi(ig_opt(argc, argv, "--shard", "512")); int nth = atoi(ig_opt(argc, argv, "--threads", "0")); if (nth <= 0) nth = ufsm_ncpu();
+    J.S = opt_atoi("--shard", ig_opt(argc, argv, "--shard", "512")); int nth = opt_atoi("--threads", ig_opt(argc, argv, "--threads", "0")); if (nth <= 0) nth = ufsm_ncpu();
     if (!(J.ium > 0 && J.pum > 0) || J.lo < 0 || J.lo > 251 || J.hi < 0 || J.hi > 251 || J.imax < 1 || J.imax > 255 || J.S <= 0 || J.S % 128) { fprintf(stderr, "ink-gate: bad option value\n"); return 2; }
     for (int v = 0; v < 256; v++) { int q = (int)lround(254.0 * (v > J.imax ? J.imax : v) / J.imax); J.lut[v] = (uint8_t)q; }
     store *sp = store_open(J.pr), *si = store_open(J.ir); z3 *zp = sp ? z3_open(sp, J.pk, nullptr) : nullptr, *zi = si ? z3_open(si, J.ik, nullptr) : nullptr;

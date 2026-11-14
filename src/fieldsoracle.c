@@ -7,6 +7,7 @@
    network's (with --fill none the sp plane becomes the label spacing: the cells' mean wrapped label-phase gradient). Output: raw fields (fit_fields_save) of the same box: an oracle-phase / network-rest swap for ufsm fit and, with
    --fill none, the oracle phase for ufsm fit-compare. Prints the share of material cells with a label phase. */
 #include <complex.h>
+#include "optcheck.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,7 +17,7 @@
 #include "store.h"
 #include "zarr3.h"
 
-static const char *fo_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *fo_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 
 /* --noise-gross P [--noise-blob L] [--noise-sigma S] [--noise-seed N]: fitter tolerance tests. Corrupt the oracle (label) phase cells:
    a share P of the label-phase material cells, in spatially coherent blobs (white noise box-blurred 3x with radius L cells, its top-P
@@ -79,13 +80,13 @@ static void fo_rows(void *a, int y0, int y1, int t) {
 int cmd_fields_oracle(int argc, char **argv) {
     if (argc < 6) { fprintf(stderr, "usage: ufsm fields-oracle <fields-dir> <phase-root> <phase-key> <out-dir> [--sign 1] [--fill net|none] [--min-known 0.5] [--phase-scale F (native voxels per raster voxel, e.g. 4: 2.4 um fields, 9.6 um raster)] [--noise-gross P --noise-blob L --noise-sigma S --noise-seed N --noise-conf K]\n"); return 2; }
     const char *fd = argv[2], *out = argv[5];
-    const int sign = atoi(fo_opt(argc, argv, "--sign", "1")), fillnet = strcmp(fo_opt(argc, argv, "--fill", "net"), "none") != 0;
-    const double mk = atof(fo_opt(argc, argv, "--min-known", "0.5"));
+    const int sign = opt_atoi("--sign", fo_opt(argc, argv, "--sign", "1")), fillnet = strcmp(fo_opt(argc, argv, "--fill", "net"), "none") != 0;
+    const double mk = opt_atof("--min-known", fo_opt(argc, argv, "--min-known", "0.5"));
     if (sign != 1 && sign != -1) { fprintf(stderr, "fields-oracle: --sign 1 or -1\n"); return 2; }
     fit_fields_buf b; if (fit_fields_load(fd, 0, 0, 1, &b)) { fprintf(stderr, "fields-oracle: cannot load %s\n", fd); return 1; }
     z3 *pz = z3_open(store_open(argv[3]), argv[4], nullptr); if (!pz) { fprintf(stderr, "fields-oracle: %s\n", z3_error()); return 1; }
     const int D = b.shape[0], H = b.shape[1], W = b.shape[2]; const size_t HW = (size_t)H * W;
-    const int F = atoi(fo_opt(argc, argv, "--phase-scale", "1")), h = b.h / (F > 0 ? F : 1);   /* (raster voxels per field cell) */
+    const int F = opt_atoi("--phase-scale", fo_opt(argc, argv, "--phase-scale", "1")), h = b.h / (F > 0 ? F : 1);   /* (raster voxels per field cell) */
     if (F < 1 || b.h % F || b.origin[0] % F || b.origin[1] % F || b.origin[2] % F) { fprintf(stderr, "fields-oracle: --phase-scale must divide the cell (h %d) and the origin\n", b.h); return 2; }
     double ctab[252], stab[252]; for (int k = 0; k < 252; k++) { ctab[k] = cos(2 * M_PI * k / 252.0); stab[k] = sin(sign * 2 * M_PI * k / 252.0); }
     /* blocks of field rows read at once, ending on the raster's chunk rows (a chunk decoded once or a few times, not once per field
@@ -114,9 +115,9 @@ int cmd_fields_oracle(int argc, char **argv) {
         z += nr;
     }
     free(row); z3_close(pz);
-    const double ngp = atof(fo_opt(argc, argv, "--noise-gross", "0")), nsg = atof(fo_opt(argc, argv, "--noise-sigma", "0"));
+    const double ngp = opt_atof("--noise-gross", fo_opt(argc, argv, "--noise-gross", "0")), nsg = opt_atof("--noise-sigma", fo_opt(argc, argv, "--noise-sigma", "0"));
     if (ngp > 0 || nsg > 0) {   /* synthetic network errors on the label cells */
-        const int L = atoi(fo_opt(argc, argv, "--noise-blob", "4")); uint64_t rs = (uint64_t)atoll(fo_opt(argc, argv, "--noise-seed", "1")) * 0x2545F4914F6CDD1Dull + 7;
+        const int L = opt_atoi("--noise-blob", fo_opt(argc, argv, "--noise-blob", "4")); uint64_t rs = (uint64_t)opt_atoll("--noise-seed", fo_opt(argc, argv, "--noise-seed", "1")) * 0x2545F4914F6CDD1Dull + 7;
         const size_t nc = (size_t)D * HW; float *f1 = malloc(nc * sizeof *f1), *f2 = malloc(nc * sizeof *f2);
         for (size_t i = 0; i < nc; i++) { f1[i] = (float)fo_unif(&rs); f2[i] = (float)fo_unif(&rs); }
         fo_blur(f1, D, H, W, L); fo_blur(f2, D, H, W, L);
@@ -128,7 +129,7 @@ int cmd_fields_oracle(int argc, char **argv) {
             k = 0; for (size_t i = 0; i < nc; i++) if (lab[i] && b.f.w[i]) t[k++] = f2[i];
             qsort(t, nl, sizeof *t, fo_cmpf); f2hi = t[(size_t)(0.01 * nl)]; f2lo = t[(size_t)(0.99 * (nl - 1))]; free(t);
         }
-        size_t ng = 0; const double nck = atof(fo_opt(argc, argv, "--noise-conf", "1"));   /* (the shifted cells' confidence x K: calibrated vs confidently wrong) */
+        size_t ng = 0; const double nck = opt_atof("--noise-conf", fo_opt(argc, argv, "--noise-conf", "1"));   /* (the shifted cells' confidence x K: calibrated vs confidently wrong) */
         for (size_t i = 0; i < nc; i++) {
             if (!lab[i]) continue;
             const double c = (b.a[0][i] - 128) / 127.0, s = (b.a[1][i] - 128) / 127.0; double r = hypot(c, s), ph = atan2(s, c) / (2 * M_PI);

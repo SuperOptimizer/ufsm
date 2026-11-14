@@ -12,6 +12,7 @@
    sheet-change rate first) and wrap-check verdicts (non-"real" wraps at their bbox centre) -> REGIONS.tsv (name z y x size score note,
    level-0). */
 #include <math.h>
+#include "optcheck.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +24,7 @@
 #include "z3w.h"
 #include "zarr3.h"
 
-static const char *eopt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *eopt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static int v3(const json *a, double o[3]) {
     if (!a || a->type != J_ARR || a->n != 3) return 0;
     for (int k = 0; k < 3; k++) o[k] = json_num(a->items[k], NAN);
@@ -59,7 +60,7 @@ int cmd_annot_export(int argc, char **argv) {
     if (fread(t, 1, (size_t)n, f) != (size_t)n) n = 0; t[n] = 0; fclose(f);
     json *J = json_parse(t, (size_t)n); free(t);
     const json *it = J ? json_get(J, "items") : nullptr; if (!it) { fprintf(stderr, "annot-export: %s has no items\n", argv[2]); json_free(J); return 1; }
-    const int L = atoi(eopt(argc, argv, "--level", "0")); const double sc = ldexp(1.0, L), dmax = atof(eopt(argc, argv, "--dmax", "2000"));
+    const int L = opt_atoi("--level", eopt(argc, argv, "--level", "0")); const double sc = ldexp(1.0, L), dmax = opt_atof("--dmax", eopt(argc, argv, "--dmax", "2000"));
     ufib U = {0}; wpt *W = nullptr; int nw = 0; FILE *pf = nullptr, *gf = nullptr;
     const char *fibp = eopt(argc, argv, "--fib", nullptr), *pairp = eopt(argc, argv, "--pairs", nullptr), *gatep = eopt(argc, argv, "--gate", nullptr), *ptsp = eopt(argc, argv, "--points", nullptr);
     if (pairp && !(pf = fopen(pairp, "w"))) { fprintf(stderr, "annot-export: cannot write %s\n", pairp); return 1; }
@@ -112,11 +113,11 @@ int cmd_annot_export(int argc, char **argv) {
     if (gf) fclose(gf);
     if (fibp && uf_save(fibp, &U)) { fprintf(stderr, "annot-export: cannot write %s\n", fibp); rc = 1; }
     if (ptsp) {   /* sparse winding raster on the --like grid */
-        const char *lr = nullptr, *lk = nullptr; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--like")) { lr = argv[i + 1]; lk = argv[i + 2]; }
+        const char *lr = nullptr, *lk = nullptr; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--like"))) { lr = argv[i + 1]; lk = argv[i + 2]; }
         store *s = lr ? store_open(lr) : nullptr; z3 *z = s ? z3_open(s, lk, nullptr) : nullptr;
         if (!z) { fprintf(stderr, "annot-export: --points needs --like ROOT KEY (a uint8 array of level %d)\n", L); rc = 1; }
         else {
-            const z3_meta *m = z3_meta_of(z); const int64_t sh[3] = {m->shape[0], m->shape[1], m->shape[2]}; const int R = atoi(eopt(argc, argv, "--radius", "2")), SH = 128;
+            const z3_meta *m = z3_meta_of(z); const int64_t sh[3] = {m->shape[0], m->shape[1], m->shape[2]}; const int R = opt_atoi("--radius", eopt(argc, argv, "--radius", "2")), SH = 128;
             z3w *w = z3w_create(ptsp, sh, SH, 0.f, 255, "{\"ufsm\":{\"content\":\"manual winding annotations: w mod 254 at annotated points (dilated), 255 unknown\"}}");
             /* voxels to set: points and line segments sampled at 0.5 voxel steps, each dilated by R */
             typedef struct { int64_t v[3]; uint8_t c; } vox; vox *V = nullptr; size_t nv = 0, cv = 0;
@@ -174,10 +175,10 @@ int cmd_annot_regions(int argc, char **argv) {
                         "       non-'real' wrap-check verdicts (at the wrap's bbox centre) -> REGIONS.tsv for annotate-serve --regions\n");
         return 2;
     }
-    const int L = atoi(eopt(argc, argv, "--level", "2")); const double sc = ldexp(1.0, L), mina = atof(eopt(argc, argv, "--min-arc", "0.3"));
-    const int top = atoi(eopt(argc, argv, "--top", "200")); rrow *R = nullptr; int nr = 0;
+    const int L = opt_atoi("--level", eopt(argc, argv, "--level", "2")); const double sc = ldexp(1.0, L), mina = opt_atof("--min-arc", eopt(argc, argv, "--min-arc", "0.3"));
+    const int top = opt_atoi("--top", eopt(argc, argv, "--top", "200")); rrow *R = nullptr; int nr = 0;
     for (int i = 2; i + 1 < argc; i++) {
-        if (strcmp(argv[i], "--judge")) continue;
+        if (strcmp(argv[i], opt_n("--judge"))) continue;
         FILE *f = fopen(argv[i + 1], "r"); if (!f) { fprintf(stderr, "annot-regions: cannot read %s\n", argv[i + 1]); continue; }
         char line[4096]; int col[64], nc = 0, cH = -1, cV = -1, cHa = -1, cVa = -1, cbox = -1;
         while (fgets(line, sizeof line, f)) {
@@ -195,7 +196,7 @@ int cmd_annot_regions(int argc, char **argv) {
         }
         (void)col; fclose(f);
     }
-    const char *wc = eopt(argc, argv, "--wrapcheck", nullptr), *wd = eopt(argc, argv, "--wraps", nullptr); const double um0 = atof(eopt(argc, argv, "--um0", "0"));
+    const char *wc = eopt(argc, argv, "--wrapcheck", nullptr), *wd = eopt(argc, argv, "--wraps", nullptr); const double um0 = opt_atof("--um0", eopt(argc, argv, "--um0", "0"));
     if (wc && wd && um0 > 0) {
         FILE *f = fopen(wc, "r"); char line[2048];
         while (f && fgets(line, sizeof line, f)) {

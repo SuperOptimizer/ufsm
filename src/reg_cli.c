@@ -4,6 +4,7 @@
       "field": {"file", "n": [nz, ny, nx], "o": [x, y, z], "h"} (optional; float32 [nz][ny][nx][3] x y z displacement, coarse L0 voxels)}
    coarse c <-> fine A^-1 (c + D(c)). */
 #include "reg.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "json.h"
 #include "store.h"
@@ -20,10 +21,10 @@
 #include <time.h>
 
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
-static int has(int argc, char **argv, const char *name) { for (int i = 1; i < argc; i++) if (!strcmp(argv[i], name)) return 1; return 0; }
+static int has(int argc, char **argv, const char *name) { for (int i = 1; i < argc; i++) if (!strcmp(argv[i], opt_n(name))) return 1; return 0; }
 static char *slurp(const char *path, size_t *n) {
     FILE *f = fopen(path, "rb"); if (!f) return nullptr;
     fseek(f, 0, SEEK_END); const long L = ftell(f); fseek(f, 0, SEEK_SET);
@@ -123,7 +124,7 @@ static int cmd_pair(int argc, char **argv) {
         "  --tr files compose in order, each mapping the previous result onward (first one applied to fine points); :inv inverts one; the result must map fine L0 xyz -> coarse L0 xyz\n"); return 2; }
     raff A = raff_ident();
     for (int i = 2; i + 1 < argc; i++) {
-        if (strcmp(argv[i], "--tr")) continue;
+        if (strcmp(argv[i], opt_n("--tr"))) continue;
         char fn[1024]; snprintf(fn, sizeof fn, "%s", argv[i + 1]); int inv = 0; char *c = strrchr(fn, ':');
         if (c && !strcmp(c, ":inv")) { *c = 0; inv = 1; }
         json *t = load_json(fn); if (!t) return 1;
@@ -135,7 +136,7 @@ static int cmd_pair(int argc, char **argv) {
     }
     const char *as = opt(argc, argv, "--A", nullptr);
     if (as) { double v[12]; if (sscanf(as, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", v, v + 1, v + 2, v + 3, v + 4, v + 5, v + 6, v + 7, v + 8, v + 9, v + 10, v + 11) != 12) { fprintf(stderr, "reg pair: --A needs 12 numbers\n"); return 2; } for (int k = 0; k < 12; k++) A.m[k / 4][k % 4] = v[k]; }
-    double cu = atof(opt(argc, argv, "--coarse-um", "0")), fu = atof(opt(argc, argv, "--fine-um", "0"));
+    double cu = opt_atof("--coarse-um", opt(argc, argv, "--coarse-um", "0")), fu = opt_atof("--fine-um", opt(argc, argv, "--fine-um", "0"));
     { rvol *c = rvol_open(cr, ck, nullptr, cu), *f = rvol_open(fr, fk, nullptr, fu); if (!c || !f) return 1;
       cu = c->um; fu = f->um;
       fprintf(stderr, "  coarse %s %.4f um %lld x %lld x %lld (%d levels); fine %s %.4f um %lld x %lld x %lld (%d levels)\n", ck, cu, (long long)c->shape[0][0], (long long)c->shape[0][1], (long long)c->shape[0][2], c->nl,
@@ -172,17 +173,17 @@ static int cmd_boxes(int argc, char **argv) {
     rctx x; const char *cache = opt(argc, argv, "--cache", nullptr);
     if (ctx_open(&x, argv[3], cache, 1)) return 1;
     rmeas q = {0}; q.cv = x.cv; q.fv = x.fv; q.m = &x.m;
-    q.lc = atoi(opt(argc, argv, "--lc", "0")); q.B = atoi(opt(argc, argv, "--B", "128")); q.R = atoi(opt(argc, argv, "--R", "4"));
+    q.lc = opt_atoi("--lc", opt(argc, argv, "--lc", "0")); q.B = opt_atoi("--B", opt(argc, argv, "--B", "128")); q.R = opt_atoi("--R", opt(argc, argv, "--R", "4"));
     const char *mt = opt(argc, argv, "--metric", "dog"); q.metric = !strcmp(mt, "ncc") ? REG_NCC : !strcmp(mt, "grad") ? REG_GRAD : REG_DOG;
-    q.hp = atof(opt(argc, argv, "--hp", "4")); q.lp = atof(opt(argc, argv, "--lp", "0.7")); q.minfrac = atof(opt(argc, argv, "--minfrac", "0.95")); q.iters = atoi(opt(argc, argv, "--iters", "4")); q.maskfill = atoi(opt(argc, argv, "--maskfill", "0"));
+    q.hp = opt_atof("--hp", opt(argc, argv, "--hp", "4")); q.lp = opt_atof("--lp", opt(argc, argv, "--lp", "0.7")); q.minfrac = opt_atof("--minfrac", opt(argc, argv, "--minfrac", "0.95")); q.iters = opt_atoi("--iters", opt(argc, argv, "--iters", "4")); q.maskfill = opt_atoi("--maskfill", opt(argc, argv, "--maskfill", "0"));
     const double cum = x.cv->um * (1 << q.lc);
     q.lf = rvol_level_for(x.fv, cum);
     const double ratio = cum / (x.fv->um * (1 << q.lf));
     const char *ss = opt(argc, argv, "--ss", "auto"); q.ss = !strcmp(ss, "auto") ? (ratio > 1.3 ? 2 : 1) : atoi(ss);
     fprintf(stderr, "reg boxes: coarse level %d (%.3f um), fine level %d (%.3f um, ratio %.3f, ss %d), box %d, radius %d, metric %s hp %.2g lp %.2g\n", q.lc, cum, q.lf, x.fv->um * (1 << q.lf), ratio, q.ss, q.B, q.R, mt, q.hp, q.lp);
-    const int nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 12), mx = atoi(opt(argc, argv, "--max", "3000"));
+    const int nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 12), mx = opt_atoi("--max", opt(argc, argv, "--max", "3000"));
     const double box0 = q.B * (double)(1 << q.lc);   /* box size, coarse L0 voxels */
-    const double S = atof(opt(argc, argv, "--spacing", "0")) > 0 ? atof(opt(argc, argv, "--spacing", "0")) : 2 * box0, off = atof(opt(argc, argv, "--offset", "0"));
+    const double S = opt_atof("--spacing", opt(argc, argv, "--spacing", "0")) > 0 ? opt_atof("--spacing", opt(argc, argv, "--spacing", "0")) : 2 * box0, off = opt_atof("--offset", opt(argc, argv, "--offset", "0"));
     double *cen = nullptr; int nc = 0, cap = 0;
     const char *cf = opt(argc, argv, "--centers", nullptr);
     if (cf) {
@@ -213,7 +214,7 @@ static int cmd_boxes(int argc, char **argv) {
         uint8_t *co = malloc((size_t)on[0] * on[1] * on[2]), *fo = malloc((size_t)fl[0] * fl[1] * fl[2]);
         const int64_t z0[3] = {0, 0, 0};
         if (rvol_read_nt(x.cv, loc, oo, on, co, nt) || rvol_read_nt(x.fv, lof, z0, fl, fo, nt)) { fprintf(stderr, "reg boxes: occupancy read failed\n"); return 1; }
-        const double om = atof(opt(argc, argv, "--occ-min", "0.9")), fcl = (double)(1 << loc), ffl = (double)(1 << lof);
+        const double om = opt_atof("--occ-min", opt(argc, argv, "--occ-min", "0.9")), fcl = (double)(1 << loc), ffl = (double)(1 << lof);
         for (double cz = lo[2] + off + S / 2; cz <= hi[2]; cz += S) for (double cy = lo[1] + off + S / 2; cy <= hi[1]; cy += S) for (double cx = lo[0] + off + S / 2; cx <= hi[0]; cx += S) {
             int nco = 0, nfo = 0, tot = 0;
             for (int a = 0; a < 4; a++) for (int b = 0; b < 4; b++) for (int c = 0; c < 4; c++) {
@@ -299,7 +300,7 @@ static void put_q(FILE *o, const char *name, double *v, int n, double um, int la
 static int cmd_stats(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm reg stats <boxes.jsonl>[,more] [--ncc-min 0.3] [--sec-max 0.9] [--curv-min 0.002] [--json OUT]\n"); return 2; }
     brec *b; const int n = read_boxes(argv[3], &b);
-    accept_t a = {atof(opt(argc, argv, "--ncc-min", "0.3")), atof(opt(argc, argv, "--sec-max", "0.9")), atof(opt(argc, argv, "--curv-min", "0.002"))};
+    accept_t a = {opt_atof("--ncc-min", opt(argc, argv, "--ncc-min", "0.3")), opt_atof("--sec-max", opt(argc, argv, "--sec-max", "0.9")), opt_atof("--curv-min", opt(argc, argv, "--curv-min", "0.002"))};
     int cnt[7] = {0}, pap = 0, acc = 0, good = 0; double *m = malloc((n + 1) * sizeof *m), *nc = malloc((n + 1) * sizeof *nc), *n0 = malloc((n + 1) * sizeof *n0); int k = 0;
     const double um = n ? b[0].um * (1 << 0) : 1;
     for (int i = 0; i < n; i++) {
@@ -330,9 +331,9 @@ static int cmd_fit(int argc, char **argv) {
     rctx x; if (ctx_open(&x, argv[3], nullptr, 0)) return 1;
     brec *b; const int n = read_boxes(argv[4], &b);
     const char *od = argv[5]; mkdir(od, 0755);
-    accept_t a = {atof(opt(argc, argv, "--ncc-min", "0.3")), atof(opt(argc, argv, "--sec-max", "0.9")), atof(opt(argc, argv, "--curv-min", "0.002"))};
-    const double h = atof(opt(argc, argv, "--h", "256")), lam = atof(opt(argc, argv, "--lam", "1")), hub = atof(opt(argc, argv, "--huber", "0.5"));
-    const int hold = atoi(opt(argc, argv, "--holdout", "5")), aff_only = has(argc, argv, "--affine-only"), margin = atoi(opt(argc, argv, "--margin", "1"));
+    accept_t a = {opt_atof("--ncc-min", opt(argc, argv, "--ncc-min", "0.3")), opt_atof("--sec-max", opt(argc, argv, "--sec-max", "0.9")), opt_atof("--curv-min", opt(argc, argv, "--curv-min", "0.002"))};
+    const double h = opt_atof("--h", opt(argc, argv, "--h", "256")), lam = opt_atof("--lam", opt(argc, argv, "--lam", "1")), hub = opt_atof("--huber", opt(argc, argv, "--huber", "0.5"));
+    const int hold = opt_atoi("--holdout", opt(argc, argv, "--holdout", "5")), aff_only = has(argc, argv, "--affine-only"), margin = opt_atoi("--margin", opt(argc, argv, "--margin", "1"));
     double *c = malloc(n * 3 * sizeof *c), *v = malloc(n * 3 * sizeof *v), *w = malloc(n * sizeof *w), *wt = malloc(n * sizeof *wt);
     int na = 0; const double um = n ? b[0].um : 1;
     for (int i = 0; i < n; i++) {
@@ -435,7 +436,7 @@ static int cmd_map(int argc, char **argv) {
     for (int i = 3; i < argc; i++) {
         double p[3], q[3];
         if (sscanf(argv[i], "%lf,%lf,%lf", p, p + 1, p + 2) != 3 || argv[i][0] == '-') continue;
-        if (i > 3 && !strcmp(argv[i - 1], "--box")) continue;
+        if (i > 3 && !strcmp(argv[i - 1], opt_n("--box"))) continue;
         if (f2c) rmap_f2c(&x.m, p, q); else rmap_c2f(&x.m, p, q);
         printf("%.4f,%.4f,%.4f\n", q[0], q[1], q[2]);
     }
@@ -465,10 +466,10 @@ static int probe_ok(const double q[3], void *ud) {   /* the nearest probe box (c
 }
 static int cmd_warp(int argc, char **argv) {
     if (argc < 8) { fprintf(stderr, "usage: ufsm reg warp <reg.json> <label-root> <label-key> <label-um> <out-dir> --level L [--c2f] [--boxes eval_boxes.jsonl] [--box z,y,x,nz,ny,nx] [--fill 255] [--conf LO,HI [--iso I]] [--cache DIR] [--threads 8]\n"); return 2; }
-    const int L = atoi(opt(argc, argv, "--level", "-1")), fill = atoi(opt(argc, argv, "--fill", "255")), nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
+    const int L = opt_atoi("--level", opt(argc, argv, "--level", "-1")), fill = opt_atoi("--fill", opt(argc, argv, "--fill", "255")), nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8);
     const int c2f = has(argc, argv, "--c2f");
     const double lum = atof(argv[6]);
-    int clo = -1, chi = -1; const int iso = atoi(opt(argc, argv, "--iso", "0"));
+    int clo = -1, chi = -1; const int iso = opt_atoi("--iso", opt(argc, argv, "--iso", "0"));
     if (opt(argc, argv, "--conf", nullptr) && (sscanf(opt(argc, argv, "--conf", ""), "%d,%d", &clo, &chi) != 2 || clo < 0 || chi > 255 || clo >= chi)) { fprintf(stderr, "reg warp: --conf LO,HI with 0 <= LO < HI <= 255\n"); return 2; }
     if (iso && clo < 0) { fprintf(stderr, "reg warp: --iso goes with --conf\n"); return 2; }
     if (L < 0 || lum <= 0) { fprintf(stderr, "reg warp: --level L and label-um > 0\n"); return 2; }

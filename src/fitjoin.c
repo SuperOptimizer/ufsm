@@ -25,6 +25,7 @@
    bad overlap or ref histogram can cost, so the others outvote it. Prints the slabs whose gauges changed against the chain and
    against the default join. */
 #include <complex.h>
+#include "optcheck.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -406,22 +407,22 @@ int cmd_fit_join(int argc, char **argv) {
     int glob = 0, refrows = 16, reqc = 0; const char *fibp = nullptr; double fibw = 1, fibarc = 0.6, fibgap = 0;
     int ai = 4;
     for (; ai + 1 < argc && !strncmp(argv[ai], "--", 2); ai += 2) {
-        if (!strcmp(argv[ai], "--blend")) blend = atof(argv[ai + 1]);
-        else if (!strcmp(argv[ai], "--min-conf")) minc = atof(argv[ai + 1]);
-        else if (!strcmp(argv[ai], "--samples")) nsamp = atoll(argv[ai + 1]);
-        else if (!strcmp(argv[ai], "--ref")) refdir = argv[ai + 1];
-        else if (!strcmp(argv[ai], "--ref-w")) refw = atof(argv[ai + 1]);
-        else if (!strcmp(argv[ai], "--chain-w")) chainw = atof(argv[ai + 1]);
-        else if (!strcmp(argv[ai], "--ref-samples")) nref = atoll(argv[ai + 1]);
-        else if (!strcmp(argv[ai], "--ref-rows")) refrows = atoi(argv[ai + 1]);
-        else if (!strcmp(argv[ai], "--global")) glob = atoi(argv[ai + 1]);
-        else if (!strcmp(argv[ai], "--cap")) cap = atof(argv[ai + 1]);
-        else if (!strcmp(argv[ai], "--min-cells")) mincells = atof(argv[ai + 1]);
-        else if (!strcmp(argv[ai], "--fibers")) fibp = argv[ai + 1];
-        else if (!strcmp(argv[ai], "--join-fib")) fibw = atof(argv[ai + 1]);
-        else if (!strcmp(argv[ai], "--join-fib-arc")) fibarc = atof(argv[ai + 1]);
-        else if (!strcmp(argv[ai], "--join-fib-gap")) fibgap = atof(argv[ai + 1]);
-        else if (!strcmp(argv[ai], "--require-constrained")) reqc = atoi(argv[ai + 1]);
+        if (!strcmp(argv[ai], opt_n("--blend"))) blend = atof(argv[ai + 1]);
+        else if (!strcmp(argv[ai], opt_n("--min-conf"))) minc = atof(argv[ai + 1]);
+        else if (!strcmp(argv[ai], opt_n("--samples"))) nsamp = atoll(argv[ai + 1]);
+        else if (!strcmp(argv[ai], opt_n("--ref"))) refdir = argv[ai + 1];
+        else if (!strcmp(argv[ai], opt_n("--ref-w"))) refw = atof(argv[ai + 1]);
+        else if (!strcmp(argv[ai], opt_n("--chain-w"))) chainw = atof(argv[ai + 1]);
+        else if (!strcmp(argv[ai], opt_n("--ref-samples"))) nref = atoll(argv[ai + 1]);
+        else if (!strcmp(argv[ai], opt_n("--ref-rows"))) refrows = atoi(argv[ai + 1]);
+        else if (!strcmp(argv[ai], opt_n("--global"))) glob = atoi(argv[ai + 1]);
+        else if (!strcmp(argv[ai], opt_n("--cap"))) cap = atof(argv[ai + 1]);
+        else if (!strcmp(argv[ai], opt_n("--min-cells"))) mincells = atof(argv[ai + 1]);
+        else if (!strcmp(argv[ai], opt_n("--fibers"))) fibp = argv[ai + 1];
+        else if (!strcmp(argv[ai], opt_n("--join-fib"))) fibw = atof(argv[ai + 1]);
+        else if (!strcmp(argv[ai], opt_n("--join-fib-arc"))) fibarc = atof(argv[ai + 1]);
+        else if (!strcmp(argv[ai], opt_n("--join-fib-gap"))) fibgap = atof(argv[ai + 1]);
+        else if (!strcmp(argv[ai], opt_n("--require-constrained"))) reqc = atoi(argv[ai + 1]);
         else { fprintf(stderr, "fit-join: unknown option %s\n", argv[ai]); return 2; }
     }
     const int ns = (argc - ai) / 3;

@@ -10,6 +10,7 @@
    Planes copied byte for byte keep their chunks; re-encoded ones are decoded shard by shard (one worker per shard). Shards and
    chunks equal to the fill value are omitted as z3w does. Other files of IN (fields.json, ...) are copied. */
 #include "json.h"
+#include "optcheck.h"
 #include "store.h"
 #include "sysinfo.h"
 #include "z3w.h"
@@ -122,10 +123,10 @@ int cmd_fields_pack(int argc, char **argv) {
     J.in = argv[2]; J.out = argv[3]; J.shard = 512; J.qph = 4; J.q = -1; J.maskw = 0; int nth = ufsm_threads(0, 64);
     for (int a = 4; a + 1 < argc; a += 2) {
         const char *k = argv[a], *v = argv[a + 1];
-        if (!strcmp(k, "--q-phase")) J.qph = (float)atof(v); else if (!strcmp(k, "--q")) J.q = (float)atof(v);
-        else if (!strcmp(k, "--ang")) J.ang = atoi(v); else if (!strcmp(k, "--conf")) J.conf = atoi(v);
-        else if (!strcmp(k, "--mask-w")) J.maskw = atoi(v); else if (!strcmp(k, "--shard")) J.shard = atoi(v);
-        else if (!strcmp(k, "--threads")) nth = atoi(v);
+        if (!strcmp(k, opt_n("--q-phase"))) J.qph = (float)atof(v); else if (!strcmp(k, opt_n("--q"))) J.q = (float)atof(v);
+        else if (!strcmp(k, opt_n("--ang"))) J.ang = atoi(v); else if (!strcmp(k, opt_n("--conf"))) J.conf = atoi(v);
+        else if (!strcmp(k, opt_n("--mask-w"))) J.maskw = atoi(v); else if (!strcmp(k, opt_n("--shard"))) J.shard = atoi(v);
+        else if (!strcmp(k, opt_n("--threads"))) nth = atoi(v);
         else { fprintf(stderr, "fields-pack: unknown option %s\n", k); return 2; }
     }
     if (!(J.qph >= 0 && J.qph <= 255) || J.q > 255 || J.shard <= 0 || J.shard % 128 || nth < 1) { fprintf(stderr, "fields-pack: bad option value\n"); return 2; }
