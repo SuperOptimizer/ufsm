@@ -142,6 +142,8 @@ typedef struct {
                         for every source), any long-range / count loss must skip it. "global" (default) */
     z3 *phase_ign;   /* optional "phase": {..., "ignore": {"root", "key"}}: a uint8 array on the stored phase's grid, nonzero = the phase there is not trained on (ufsm phase-conflict) */
     z3 *phase_pl[MAXLEV], *phase_ign_pl[MAXLEV];   /* source_phase_at: the stored phase / ignore pooled to levels coarser than phase_level (lazy views) */
+    store *phase_store; double phase_key_um;   /* a stored (not onfly) phase: its store and its key's um; source_phase_at opens a coarser level stored in
+                                                  the same group (ufsm downsample --mode phase, key = that level's um) instead of pooling per read */
     uint8_t *focus; int64_t focus_grid[3]; float focus_w;   /* optional "focus": {"map": RAW, "w": K} (ufsm phase-packing --map: per coarse occupancy cell 0 none, else
                                                               1 + 254 x packed share): the position draw takes a cell 1 + K x share times as often */
     z3 *wind;    /* optional, with a stored phase: the winding mod 14 turns on the same grid (ufsm phase-raster --winding; band.h

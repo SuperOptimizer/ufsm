@@ -4,6 +4,7 @@
 #include "band_onfly.h"
 #include "inksplat.h"
 #include "dcache.h"
+#include "z3w.h"
 #include <stdlib.h>
 /* weak: the sampler test binaries link sources.o without inksplat.o / dcache.o (an onfly ink target then fails to open) */
 [[gnu::weak]] z3 *inkfly_open(z3 *, const char *, const inksplat_cfg *, size_t, const char *, void **);
@@ -409,6 +410,7 @@ sources *sources_load(const char *path) {
                 const char *proot = json_str(json_get(pt, "root"), nullptr), *pkey = json_str(json_get(pt, "key"), "4.8");
                 store *ps = proot ? store_open(proot) : nullptr;
                 s->phase = ps ? z3_open(ps, pkey, nullptr) : nullptr;
+                if (s->phase) { char *e = nullptr; const double ku = strtod(pkey, &e); if (e && !*e && ku > 0) { s->phase_store = ps; s->phase_key_um = ku; } }
                 const json *of = json_get(pt, "onfly");   /* {"root", "key", "rmax"}: the pair-rule phase computed from these codes on read
                                                              (band_onfly.h; byte-identical to phase-raster --pair 1 on the codes' grid) */
                 if (of && !s->phase) {
@@ -749,6 +751,16 @@ z3 *source_phase_at(source *s, int level, int ign) {
     if (!pl[level]) {
         z3 *under = source_phase_at(s, level - 1, ign); if (!under) return nullptr;
         pthread_mutex_lock(&g_open_mu);
+        if (!pl[level] && !ign && s->phase_store && s->phase_key_um > 0) {   /* the level stored once (ufsm downsample <root> <key> <root> <um> --mode phase):
+            the view's circular mean in double sums (phase_pool2_box: float sums): Paris4-july's 19.2 um array equals the view on all but 0.004 % of
+            the known voxels and within 1 code (2.8 % of them differ by 1), read instead of 8x the voxels decoded and pooled per window (1536^3
+            phase bytes and an atan2 per coarse voxel at P 768; datafix 2026-11-14) */
+            char key[32]; z3w_level_name(s->phase_key_um * ldexp(1.0, level - s->phase_level), key, sizeof key);
+            z3 *st = z3_open(s->phase_store, key, nullptr); const z3_meta *um_ = z3_meta_of(under), *sm = st ? z3_meta_of(st) : nullptr; int ok = sm != nullptr;
+            for (int d = 0; d < 3 && ok; d++) ok = sm->shape[d] == (um_->shape[d] + 1) / 2;
+            if (ok) { pl[level] = st; fprintf(stderr, "sources: %s: phase level %d from the stored array \"%s\" (not pooled per read)\n", s->name, level, key); }
+            else if (st) { fprintf(stderr, "sources: %s: stored phase \"%s\" has the wrong shape for level %d: pooled per read instead\n", s->name, key, level); z3_close(st); }
+        }
         if (!pl[level]) pl[level] = phase_pool2_view(under, ign);   /* (cheap: no I/O; under the lock so one view per level) */
         pthread_mutex_unlock(&g_open_mu);
     }
