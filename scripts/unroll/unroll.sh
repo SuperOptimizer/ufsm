@@ -257,6 +257,28 @@ ref() {
   local cal=; [ "${CTCAL:-0}" = 1 ] && cal="--ct-cal $O/ct.cal"
   # the pass-1 sums streamed behind the fields predict (fields(): REFSTREAM): the same sums, so only the solve and model pass run here
   local pc=; [ "$DRY" != 1 ] && [ -e $O/ref.pool.ok ] && pc="--pool-cache $O/ref.pool --chunk-rows $(cat $O/ref.pool.ok)"
+  # DIRCOH=1 (off by default, unmeasured; audit-unroll 3a): no env / tsv hand -> two LS solves, --dir +1 into REF.p and -1 into REF.m, each
+  # printing "count-field: model coherence C" (|sum z| / sum |z| of the phase-vs-model phasors before smoothing; the wrong hand turns them
+  # twice per revolution, so C ~ 0). The higher C wins by >= DIRCOH_MARGIN (0.05), else refuse. The pooled sums are dir-free (--pool-cache reused).
+  if [ -z "$sd" ] && [ "${DIRCOH:-0}" = 1 ] && [ -z "${REFCMD:-}" ]; then
+    local d c cp= cm=
+    for d in p m; do
+      [ "$DRY" = 1 ] || rm -rf $REF.$d
+      X $O/logs/ref.$d.log $U count-field $F $O/cf.unused $(refpool) --dir $([ $d = p ] && echo 1 || echo -1) --iters 1200 --model $REF.$d \
+        --threads $TH --mem-gb ${CFMEM:-24} $cal $pc || { log "ref: DIRCOH: the --dir $d solve failed (logs/ref.$d.log)"; return 1; }
+      [ "$DRY" = 1 ] && continue
+      c=$(grep -oE 'count-field: model coherence [0-9.]+' $O/logs/ref.$d.log | tail -1 | awk '{print $4}')
+      [ -n "$c" ] && [ -e $REF.$d/model.json ] || { log "ref: DIRCOH: no model coherence / model from the --dir $d solve"; return 1; }
+      [ $d = p ] && cp=$c || cm=$c
+    done
+    [ "$DRY" = 1 ] && return 0
+    local win; win=$(awk -v p=$cp -v m=$cm -v g=${DIRCOH_MARGIN:-0.05} 'BEGIN{print p - m >= g ? "p" : m - p >= g ? "m" : ""}')
+    log "ref: DIRCOH: model coherence +1 $cp, -1 $cm (margin ${DIRCOH_MARGIN:-0.05}) -> ${win:-REFUSED}"
+    [ -n "$win" ] || { log "ref: REFUSED: DIRCOH could not tell the hand; set SPIRALDIR or scripts/unroll/spiral_dir.tsv"; return 1; }
+    mv $REF.$win $REF && cp $O/logs/ref.$win.log $O/logs/ref.log && rm -rf $REF.p $REF.m
+    if type mset > /dev/null 2>&1; then mset spiral_dir "$(jq -r .dir $REF/model.json 2> /dev/null)"; mset spiral_dir_src "gate:coherence +1 $cp -1 $cm"; fi
+    return 0
+  fi
   if [ -n "${REFCMD:-}" ]; then X $O/logs/ref.log $REFCMD $F $REF $cal; else
   X $O/logs/ref.log $U count-field $F $O/cf.unused $(refpool) --iters 1200 --model $REF \
     --threads $TH --mem-gb ${CFMEM:-24} $cal $pc; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; } ||

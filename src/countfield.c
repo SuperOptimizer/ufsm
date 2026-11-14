@@ -1164,6 +1164,12 @@ int cmd_count_field(int argc, char **argv) {
     }
     if (*mdir) {   /* W as a fit model on the solve lattice: U + the phase gauge smoothed over +-Rm solve cells */
         const double tlat = cf_now();
+        {   /* the model coherence (audit-unroll 3a, the +-1 direction gate): |sum over solve cells of z| / sum |z|, z = sum c e^{2 pi i (phi - W)}
+               per cell, before the smoothing. With the right hand phi - W is the gauge plus count errors: one phasor; with the wrong one it rotates
+               twice per turn about the axis and the sum cancels. unroll.sh (DIRCOH=1) compares two refs, --dir +1 vs -1, on this line */
+            double complex zs = 0; double za = 0; for (size_t i = 0; i < L->n; i++) { zs += gr[i] + I * gi[i]; za += hypot(gr[i], gi[i]); }
+            fprintf(stderr, "count-field: model coherence %.4f (dir %+d; |sum z| / sum |z| over %zu solve cells)\n", za > 0 ? cabs(zs) / za : 0, dir, L->n);
+        }
         if (Rm > 0) cf_boxsmooth2_par(gr, gi, L->d, L->hh, L->w, Rm);
         fit_model m; memset(&m, 0, sizeof m);
         m.dir = dir; m.nk = 2; m.knot_dz = kdz; m.pitch = kpitch; m.offset = koff; m.D = D; m.H = H; m.W = W; m.h = h; m.um = g.um; m.cy = g.cy; m.cx = g.cx;
