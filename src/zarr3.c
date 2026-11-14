@@ -314,7 +314,7 @@ static int mkdirs(const char *path) {
     return mkdir(tmp, 0755) && errno != EEXIST ? -1 : 0;
 }
 
-/* cache file for (shard, item): item = "idx" or the inner chunk number (a "missing" marker of older runs is honoured for UFSM_CACHE_MISSING_TTL_S, then unlinked: load_index) */
+/* cache file for (shard, item): item = "idx", "missing" (a 404 shard, honoured for UFSM_CACHE_MISSING_TTL_S, then unlinked and asked again: load_index) or the inner chunk number */
 static void cache_path(const z3 *z, const char *skey, const char *item, char *buf, size_t n) {
     snprintf(buf, n, "%s/%s.%s", z->cache, skey, item);
 }
@@ -480,9 +480,10 @@ static int load_index(z3 *z, const char *skey, ientry *idx) {
     int fetched = 0;
     uint64_t payload_size = UINT64_MAX;
     /* the cached index carries the shard's payload size after it (8 bytes; an older cache entry without it: no range check, as before), so
-       entries read from the cache are range-checked too (audit mini/zarr 6). A missing shard (404) is no longer cached on disk: a shard that
-       was being re-uploaded read as fill for every later run sharing the cache dir; now each process asks again and logs it once (audit
-       mini/store 3, mini/zarr 7) */
+       entries read from the cache are range-checked too (audit mini/zarr 6). A missing shard (404) is cached on disk as a "missing" marker
+       for UFSM_CACHE_MISSING_TTL_S (600 s) only: a shard being re-uploaded was read as fill for every later run sharing the cache dir
+       (audit mini/store 3, mini/zarr 7, dcache #4), while not caching 404s at all made every warm read of a sparse array ask for each
+       absent shard again (test_http_reader's warm-cache check, the mega sweep 11-14). Each process logs a missing shard once. */
     uint8_t *b = cache_get(z, skey, "idx", &n);
     if (b && n == ilen + 8) { memcpy(&payload_size, b + ilen, 8); n = ilen; }
     if (!b) {
@@ -497,7 +498,7 @@ static int load_index(z3 *z, const char *skey, ientry *idx) {
         if (!b) return FAIL("index allocation for %s", skey);
         int64_t size = -1, got = store_read_tail(z->s, skey, (int64_t)ilen, b, &size);   /* one suffix-range GET */
         if (got == -2) {
-            free(b); imem_put(z, skey, nullptr, 0);
+            free(b); imem_put(z, skey, nullptr, 0); cache_put(z, skey, "missing", (const uint8_t *)"", 0);   /* (re-checked after the TTL above) */
             if (!store_is_local(z->s)) fprintf(stderr, "zarr3: shard %s is missing (HTTP 404): read as fill value\n", skey);
             return 0;
         }
