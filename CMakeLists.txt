@@ -101,9 +101,11 @@ list(APPEND UFSM_CFLAGS ${_extra})
 set(UFSM_DEFS _GNU_SOURCE)
 if(UFSM_TOOLCHAIN STREQUAL "mcc")
   # -mglibc: the machine's GNU C library (libcurl, zstd, blosc and the CUDA driver are its shared libraries). mcc takes and ignores
-  # -march=native / -W / -f; -O2 is its full pipeline on x86-64 (its vectoriser is arm64-only so far). No immintrin.h in mcc yet: the
+  # -W and most -f. No immintrin.h in mcc yet: the
   # AVX2 paths are #ifdef __AVX2__ (never defined by mcc) except volcomp.h's, which VOLCOMP_NO_AVX2 turns off.
-  set(UFSM_CFLAGS -mglibc -std=c23 -O2 -g -pthread)   # (-g: DWARF 5 lines + CFI; perf / gdb / run_suite -c read them)
+  # -O3: mcc's loop vectoriser (SSE2; SSE4.1 where -march=native finds it in /proc/cpuinfo, defining no macros); -fno-math-errno:
+  # sqrt in line, as with clang; -g: DWARF 5 lines + CFI (perf / gdb / run_suite -c read them)
+  set(UFSM_CFLAGS -mglibc -std=c23 -O3 -march=native -fno-math-errno -g -pthread)
   separate_arguments(_extra UNIX_COMMAND "${UFSM_EXTRA_CFLAGS}")
   list(APPEND UFSM_CFLAGS ${_extra})
   list(APPEND UFSM_DEFS VOLCOMP_NO_AVX2)

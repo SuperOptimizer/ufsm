@@ -17,9 +17,15 @@ The user asked for the full swap, not a staged one. On this branch:
 - `scripts/pod/setup.sh` installs mcc before the build and then fills mcudahw's JIT cache on all CPUs (`MCUDA_PRECOMPILE`), so
   the first training step does not compile 310 MB of PTX. Without /usr/bin/cc it uses the newest clang (`MCC_CC`).
 - `-g` emits DWARF 5 line tables and CFI (microc dwarf-20261114), so gdb, perf and `run_suite.sh -c` work as with clang.
-- The pin is b489496 (microc branch mcc-int-20261114: x64simd + dwarf). Its gate is green on the desk:
+- The pin is ae30511 (microc branch mcc-int-20261114: x64simd + dwarf + vec-20261114). vec-20261114 adds:
+  - x86-64 v128 lowering, with opt_vec on: SSE2 everywhere, SSE4.1 under -march=native;
+  - lane max/min from selects;
+  - u8 / u16 / i32 / f32 loops widened to 4-byte lanes;
+  - vectorised and scalar inline sqrt / floor / ceil / trunc / rint / lrint.
+  Host flags are now `-O3 -march=native -fno-math-errno`; the earlier 3.6x was measured at -O2, without the vectoriser. The gate
+  is green on the desk at both pins (b489496 for the -g step, ae30511 now):
   - stage 0 builds clean under gcc 15 -Werror;
-  - tests/c pass 145/145 with mcc's libc, with glibc, and with -g;
+  - tests/c pass 150/150 with mcc's libc, with glibc, and with -g; fuzz-x64 400 seeds without a failure (mcc-vec);
   - tests/thr 50/50, the assembler test, and the ABI checks against gcc (13/13) pass;
   - the self-bootstrap gives stage2 == stage3.
 - The nested-lambda fix lets the last two .cu units compile, so all 168 now do.
