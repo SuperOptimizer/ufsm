@@ -201,6 +201,15 @@ extern "C" int nn_get_f16(void) { return g_h16; }
 float g_gscale = 1.f;
 extern "C" void nn_set_grad_scale(float s) { g_gscale = s; }
 extern "C" float nn_get_grad_scale(void) { return g_gscale; }
+/* the head-gradient plane scale (2026-11-14, audit kernels.md #1 / #2, net.md #1, train.md #1): a power of two the loss-gradient producers
+   multiply into the gradient scale (GSH) and the head-plane consumers (nn_head_bwd_z, nn_fstem_bwd) divide out again, so the per-voxel
+   fp16 logit gradients and the coarse fp16 planes sit in fp16's normal range instead of its subnormals (P 768: 128 / N at N ~ 1e8 voxels
+   = 1.3e-6, a few bits and a dead zone below |residual| ~0.02). train.c sets it per window around the head's gradient pass from the
+   window's counts (hgs_choose) and back to 1 after; per host thread (each GPU's thread its own). A power of two scales fp16 / fp32
+   values exactly wherever they stay normal: with nothing subnormal before, every gradient is bit-identical */
+thread_local float g_hgs = 1.f;
+extern "C" void nn_set_head_gscale(float s) { g_hgs = s; }
+extern "C" float nn_get_head_gscale(void) { return g_hgs; }
 int g_gradbf = 1;
 extern "C" void nn_set_grad_bf16(int on) { g_gradbf = on; }
 extern "C" int nn_get_grad_bf16(void) { return g_gradbf; }

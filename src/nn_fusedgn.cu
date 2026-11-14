@@ -200,8 +200,28 @@ extern "C" int nn_head_fwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, co
     KCHECK();
     return 0;
 }
+static int head_bwd_z_impl(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx,
+                            size_t vb, size_t nv, int first);
+__global__ void hgs_wscale_k(const float *w, float *o, size_t n, float a) { const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) o[i] = a * w[i]; }
+/* gy16 at the head plane scale g_hgs (nn_set_head_gscale, a power of two): the weight / bias gradients accumulate at that scale onto gw / gb
+   pre-multiplied by it and are divided back after, gx goes through the weights x 1 / g_hgs. Every step is an exact power-of-two scaling of
+   normal fp32 values, so the results are the bits of the unscaled planes' wherever those were normal (g_hgs 1: the old path untouched) */
 extern "C" int nn_head_bwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx,
                              size_t vb, size_t nv, int first) {
+    const float hg = g_hgs;
+    if (hg == 1.f) return head_bwd_z_impl(x, gx_gn, xs, gy16, cout, w, gw, gb, gx, vb, nv, first);
+    static thread_local float *wsd[8]; static thread_local size_t wsn[8]; int dv = 0; cudaGetDevice(&dv); dv &= 7;
+    const size_t nw = (size_t)cout * xs.c;
+    if (wsn[dv] < nw) { if (wsd[dv]) cudaFree(wsd[dv]); CK(cudaMalloc(&wsd[dv], nw * 4)); wsn[dv] = nw; }
+    hgs_wscale_k<<<nblk(nw, 256), 256>>>(w, wsd[dv], nw, 1.f / hg);
+    nn_scale(gw, hg, nw); nn_scale(gb, hg, (size_t)cout);
+    const int r = head_bwd_z_impl(x, gx_gn, xs, gy16, cout, wsd[dv], gw, gb, gx, vb, nv, first);
+    nn_scale(gw, 1.f / hg, nw); nn_scale(gb, 1.f / hg, (size_t)cout);
+    KCHECK();
+    return r;
+}
+static int head_bwd_z_impl(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx,
+                            size_t vb, size_t nv, int first) {
     /* per device: data parallel drives every GPU from one host thread (a thread_local device buffer of GPU 0 used on GPU 1 = illegal
        address, 11-06); dv = the current device */
     static thread_local unsigned seedd[8]; int dv = 0; cudaGetDevice(&dv); dv &= 7; unsigned &seed = seedd[dv];
