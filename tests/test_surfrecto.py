@@ -3,7 +3,8 @@
 (tests/surfrecto_ref.py, fp32 CPU) on one real 2.4 um Paris 4 window: every encoder / decoder stage output (relative max |d|), the
 logit margin, and the surface probability p = sigmoid(margin) (max / mean |d|, F1 agreement at 0.5). Then a small box through
 the full predict path (window grid, z-score, Gaussian blend, sigmoid, shard writer) against a numpy re-implementation of villa's
-blend from reference margins. Skips (exit 0) when torch, the checkpoint, the villa sources, the CT, the GPU or build/ufsm are missing.
+blend from reference margins. Skips (exit 0) when torch, the checkpoint, the villa sources, the GPU or build/ufsm are missing;
+a failed CT read is a failure (the default CT is the network mirror: this test needs dl.ash2txt, named in tests/suite.txt).
 
 CT: UFSM_SURFRECTO_CT root (default the volcomp mirror), UFSM_SURFRECTO_KEY (Paris 4 2.4 um level 0), UFSM_SURFRECTO_AT z,y,x,
 UFSM_SURFRECTO_P window (default 128 in the suite; 256 = the model's patch, ~20 GB of CPU RAM for the reference).
@@ -33,7 +34,8 @@ def main():
     for p in [R.CKPT, R.SRC / "vesuvius/models/build/build_network_from_config.py", UFSM]:
         if not pathlib.Path(p).exists():
             skip(f"{p} missing")
-    if "GPU" not in subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout:
+    cv = os.environ.get("CUDA_VISIBLE_DEVICES")   # the runner's grant (empty: none); nvidia-smi -L ignores it
+    if (cv is not None and cv.strip() in ("", "-1")) or (cv is None and "GPU" not in subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout):
         skip("no GPU")
     torch.set_num_threads(int(os.environ.get("UFSM_TEST_TORCH_THREADS", "8")))
     CACHE.mkdir(parents=True, exist_ok=True)
@@ -44,7 +46,7 @@ def main():
         r = subprocess.run([str(UFSM), "read", CT_ROOT, CT_KEY, *map(str, AT), str(P), str(P), str(P), str(raw), "--cache", str(CACHE)],
                            capture_output=True, text=True)
         if r.returncode:
-            skip(f"CT read failed: {r.stderr[-300:]}")
+            sys.exit(f"FAIL: CT read failed (a read error, not missing data): {r.stderr[-300:]}")
         u = np.fromfile(raw, np.uint8).reshape(P, P, P)
         out = td / "out"
         r = subprocess.run([str(UFSM), "surfrecto-predict", "--ckpt", str(R.CKPT), "--raw-in", str(raw), "--raw-out", str(out),
@@ -123,6 +125,19 @@ def box_check(td, np):
     want = {f"win_{a}_{b}_{c}.f32" for a in G[0] for b in G[1] for c in G[2]}
     have = {p.name for p in dump.glob("win_*.f32")}
     fails = 0
+    # invariants of the dumped grid that a copied formula cannot satisfy by accident (mini audit pytests.md 6: grid() mirrors
+    # surfrecto.c grid_of line for line): per axis the origins lie in [0, V - P], step at most S, and their windows' inner parts
+    # (m = (P - S) / 2 trimmed, untrimmed at the volume edges) cover [b0, b1)
+    m = (Pw - S) // 2
+    for a in range(3):
+        org = sorted({int(p[4:-4].split("_")[a]) for p in have})
+        ok = org and all(0 <= o <= V[a] - Pw for o in org) and all(0 < q - o <= S for o, q in zip(org, org[1:]))
+        lo_c = min(o + (0 if o == 0 else m) for o in org) if org else 1 << 60
+        hi_c = max(o + Pw - (0 if o == V[a] - Pw else m) for o in org) if org else -1
+        ok = ok and lo_c <= box[a] and hi_c >= box[3 + a]
+        for o, q in zip(org, org[1:]): ok = ok and q + m <= o + Pw - m   # consecutive inner parts touch or overlap
+        if not ok:
+            print(f"FAIL: axis {a}: window origins {org} do not tile [{box[a]}, {box[3 + a]}) with P {Pw}, S {S}"); return 1
     if want != have:
         print(f"FAIL: window origins: {len(have)} dumped, {len(want)} expected, {len(want ^ have)} differ"); return 1
     lo = [box[a] - 8 for a in range(3)]; n = [box[3 + a] - box[a] + 16 for a in range(3)]

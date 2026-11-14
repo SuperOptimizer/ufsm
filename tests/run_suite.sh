@@ -348,7 +348,7 @@ NOGPU=$(awk -F'\t' 'NR > 1 && $2 == "SKIP" && $11 ~ /(^|,)gpu2?(,|$)/ {print $1}
 NI=$(echo -n "$NOGPU" | grep -c .)
 { S=$(awk -F'\t' 'NR > 1 && $2 == "SKIP" {print $1}' "$OUT/results.tsv")
   [ -n "$S" ] && { echo "  skipped:"; for n in $S; do echo "    $n: $(grep -m1 -E '^(SKIP|# no GPU)' "$OUT/logs/$n.log" 2> /dev/null | cut -c1-150)"; done; }
-  P=$(grep -l '^PARTIAL' "$OUT"/logs/*.log 2> /dev/null)
+  P=$(for n in "${NAMES[@]}"; do grep -l '^PARTIAL' "$OUT/logs/$n.log" 2> /dev/null; done)   # (this run's tests: -o may hold older logs)
   [ -n "$P" ] && { echo "  partial (passed, a part not run here):"; for f in $P; do grep -m3 '^PARTIAL' "$f" | sed "s|^|    $(basename "$f" .log): |" | cut -c1-170; done; }
   [ -z "$FAILS" ] && [ "$NI" -gt 0 ] && echo "INCOMPLETE: $NI GPU tests skipped for lack of a GPU (exit 3: not a gate result)"
 } | tee -a "$OUT/summary.txt"

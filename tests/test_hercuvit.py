@@ -35,7 +35,8 @@ def main():
     for p in [R.CKPT, R.DATA / "src/hercunet/hercuvit/netbuild.py", R.DV / "pylib/timm", UFSM, CT_ROOT / CT_KEY]:
         if not pathlib.Path(p).exists():
             skip(f"{p} missing")
-    if "GPU" not in subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout:
+    cv = os.environ.get("CUDA_VISIBLE_DEVICES")   # the runner's grant (empty: none); nvidia-smi -L ignores it
+    if (cv is not None and cv.strip() in ("", "-1")) or (cv is None and "GPU" not in subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout):
         skip("no GPU")
     torch.set_num_threads(int(os.environ.get("UFSM_TEST_TORCH_THREADS", "8")))
     T = 128
@@ -45,7 +46,7 @@ def main():
         raw = td / "win.u8"
         r = subprocess.run([str(UFSM), "read", str(CT_ROOT), CT_KEY, *map(str, AT), str(T), str(T), str(T), str(raw)], capture_output=True, text=True)
         if r.returncode:
-            skip(f"CT read failed: {r.stderr[-300:]}")
+            sys.exit(f"FAIL: CT read failed (a read error, not missing data): {r.stderr[-300:]}")
         u = np.fromfile(raw, np.uint8).reshape(T, T, T)
         out = td / "out"
         if os.environ.get("UFSM_HERCUVIT_OUT"):   # a --raw-out dir of this window computed earlier (only that step needs the GPU)

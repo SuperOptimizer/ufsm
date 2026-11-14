@@ -4,7 +4,7 @@
 # call site printed) and last.ckpt must stay step 1's. Usage: test_cuda_abort.sh <ufsm binary> <make_wind_fixture binary>
 set -u
 U=$1 F=$2
-D=$(mktemp -d /tmp/test_cuda_abort_XXXXXX)
+D=$(mktemp -d "${TMPDIR:-/tmp}/test_cuda_abort_XXXXXX")
 fail() { echo "FAIL: $*"; echo "kept $D"; exit 1; }
 "$F" "$D/fx" 256 2 1 > "$D/fx.log" 2>&1 || fail "fixture"
 C="--task unwrap2 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 0 --log-every 1 --ckpt-every 1 --fp4 2 --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --levels 1 --widths 16,32,64"

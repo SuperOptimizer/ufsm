@@ -1,10 +1,12 @@
 #!/bin/sh
 # Runs build/test_formats against references generated with tifffile/numcodecs when those are available.
 # Inputs: a Kaggle label+image pair and a tifxyz x.tif are fetched from the HF bucket if UFSM_NET=1 and
-# ~/huggingfacetoken exists; otherwise only the writer round-trip runs.
+# ~/huggingfacetoken exists; otherwise only the writer round-trip runs and the reader checks print PARTIAL (tests/run_suite.sh lists
+# them). The work dir is fresh per run ($TMPDIR, the suite's per-test dir), so no reference from an earlier run is compared against.
 set -e
-D=${UFSM_TEST_DIR:-/tmp/ufsm-test-formats}
+D=${UFSM_TEST_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/ufsm-test-formats.XXXXXX")}
 mkdir -p "$D"
+BIN=${B:-build}/test_formats; [ -x "$BIN" ] || BIN=build/test_formats   # the suite's $B (build-verify), else the release dir
 PY=${UFSM_PY:-$HOME/usrm2/.venv/bin/python}
 if [ "${UFSM_NET:-0}" = "1" ] && [ -f "$HOME/huggingfacetoken" ] && $PY -c "import tifffile, numcodecs" 2>/dev/null; then
   T=$(cat "$HOME/huggingfacetoken")
@@ -23,4 +25,4 @@ np.frombuffer(numcodecs.Blosc().decode(b), np.uint8).tofile(f"{d}/c_blosc.raw")
 PYEOF
 fi
 rm -rf "$D/z3w_test.zarr"
-UFSM_NET=${UFSM_NET:-0} ./build/test_formats "$D"
+UFSM_NET=${UFSM_NET:-0} "$BIN" "$D"

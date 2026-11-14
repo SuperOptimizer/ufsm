@@ -4,8 +4,9 @@ patch tokens (x_norm_patchtokens), the CNN skips, the FPN grid, and the dense / 
 torch, the checkpoint, the official sources, the CT, the GPU or build/ufsm are missing.
 
 CT: a 9.6 um Paris 4 crop (UFSM_DINOVOL_CT root, UFSM_DINOVOL_KEY, default the fitkit p4box level 2). Tiles 128 (and 192 with
-UFSM_DINOVOL_FULL=1). Bounds (fp16 vs fp32, measured 2026-10-21 + margin): token cosine >= 0.999 mean / 0.99 min, dense / ink cosine
->= 0.995 mean / 0.95 min."""
+UFSM_DINOVOL_FULL=1). Bounds (fp16 vs fp32; as the code checks them, 2026-11-14 doc fix: the 2026-10-21 text said 0.999 / 0.99 and
+0.995 / 0.95, the code has been tighter since): token cosine >= 0.99999 mean / 0.9999 min; CNN skips and the FPN grid >= 0.9999 mean;
+dense / ink cosine >= 0.9999 mean / 0.999 min."""
 import os, pathlib, subprocess, sys, tempfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import dinovol_ref as R
@@ -34,7 +35,8 @@ def main():
     for p in [R.CKPT, R.DATA / "src/dinovol_2/model/dinov2_eva.py", R.DATA / "pylib/timm", UFSM, CT_ROOT / CT_KEY]:
         if not pathlib.Path(p).exists():
             skip(f"{p} missing")
-    if "GPU" not in subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout:
+    cv = os.environ.get("CUDA_VISIBLE_DEVICES")   # the runner's grant (empty: none); nvidia-smi -L ignores it
+    if (cv is not None and cv.strip() in ("", "-1")) or (cv is None and "GPU" not in subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout):
         skip("no GPU")
     torch.set_num_threads(int(os.environ.get("UFSM_TEST_TORCH_THREADS", "8")))
     bb, head = R.build()
@@ -48,7 +50,7 @@ def main():
             raw = td / f"ct{T}.u8"
             r = subprocess.run([str(UFSM), "read", str(CT_ROOT), CT_KEY, "12400", "4300", "3900", str(T), str(T), str(T), str(raw)], capture_output=True, text=True)
             if r.returncode:
-                skip(f"CT read failed: {r.stderr[-300:]}")
+                sys.exit(f"FAIL: CT read failed (a read error, not missing data): {r.stderr[-300:]}")
             u = np.fromfile(raw, np.uint8).reshape(T, T, T)
             pts = np.concatenate([rng.uniform(-0.5, T - 0.5, size=(200, 3)), rng.integers(0, T, size=(200, 3)) + 0.0,
                                   np.array([[0, 0, 0], [T - 1, T - 1, T - 1], [3.5, 3.5, 3.5]])]).astype(np.float32)

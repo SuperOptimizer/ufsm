@@ -57,7 +57,14 @@ with tempfile.TemporaryDirectory(prefix="ufsm-seam-", delete=not os.environ.get(
         for z, y, x in ((0, 0, 0), (5, 77, 128), (128, 128, 128), (200, 31, 255), (64, 192, 100)):
             wa = wa1[z] * wa1[y] * wa1[x]; wb = wb1[z] * wb1[y] * wb1[x]; e = (100 * wa + 200 * wb) / (wa + wb)
             assert abs(v[z, y, x] - e) <= 1.0, (head, z, y, x, v[z, y, x], e)
-        assert (out / head / "19.2").exists() or any(p.name.startswith("19.2") for p in (out / head).iterdir()), list((out / head).iterdir())
+        # the 19.2 level read back: the 2x2x2 mean of the blended 9.6 level within one code (mini audit pytests.md 8: an existence
+        # check let any directory named 19.2* pass)
+        r2 = t / f"{head.replace('/', '_')}_19.raw"
+        rc, txt = run(env, BIN, "read", out / head, "19.2", 0, 0, 0, N // 2, N // 2, N // 2, r2, "--threads", "2"); assert rc == 0, (head, txt)
+        v2 = np.fromfile(r2, np.uint8).reshape(N // 2, N // 2, N // 2).astype(np.float64)
+        pooled = v.reshape(N // 2, 2, N // 2, 2, N // 2, 2).mean(axis=(1, 3, 5))
+        d2 = np.abs(v2 - pooled)
+        assert d2.max() <= 1.0 and np.count_nonzero(v2) == v2.size, (head, "19.2 level", d2.max(), np.count_nonzero(v2))
         meta = json.loads((out / head / "9.6" / "zarr.json").read_text())
         assert meta["attributes"]["ufsm"]["seamless"]["tile"] == S, meta["attributes"]
     # --split z --gpus 0,1 (one window over both GPUs): the passes keep --split / --gpus, get no --gpu, run one after the other
