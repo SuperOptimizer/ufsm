@@ -3640,7 +3640,7 @@ int cmd_train(int argc, char **argv) {
                 g_skip_thr, g_skip_margin, g_lsplit ? " (split: the levels below --split-top)" : "");
     }
     gpu_state G[8]; memset(G, 0, sizeof G); g_G0 = G;   /* (zeroed: fields added later rely on it) */
-    int step0 = 0;
+    int step0 = 0, step_loaded = 0;   /* step_loaded: the checkpoint's step (kept when --finetune restarts step0 at 0: the streams below reseed from it) */
     g_hs_tcache = getenv("UFSM_HS_TCACHE") ? atoi(getenv("UFSM_HS_TCACHE")) != 0 : atoi(opt(argc, argv, "--hs-tcache", "0")) != 0;
     g_fstem = atoi(opt(argc, argv, "--fstem", "0")); g_fs_drop = (float)atof(opt(argc, argv, "--fstem-drop", "0.25"));
     if (g_fstem) {
@@ -3685,6 +3685,7 @@ int cmd_train(int argc, char **argv) {
                                                               run at ssl std 0 with no targets; every loaded parameter is overwritten) */
             step0 = grow ? unet_load_grow(d->u, resume, 1, 1.f) : unet_load(d->u, resume);
             if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; }
+            step_loaded = step0;
             if (atoi(opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* loaded weights/state, fresh schedule */
             if (unet_cfg_of(d->u)->gn_ema) {   /* --gn-ema-warm / --gn-ema-mom given: they replace the checkpoint's (unet_load restored those; 2026-11-13
                                                   try2 / try3 blew up when the training forward switched to the running statistics at step 501: a
@@ -4135,7 +4136,8 @@ int cmd_train(int argc, char **argv) {
             d->sslt = nn_malloc(n); d->sslg = nn_malloc(n * 4); d->sslds = nn_malloc(2 * sizeof(double)); d->sslmu = nn_malloc((size_t)g_ssl * sizeof(double));
             if (g_sslh.nh > 0) { d->sslht = nn_malloc((size_t)g_sslh.nslot * (g_Pz / 4) * (P / 4) * (P / 4)); d->sslhc = nn_malloc(32 * sizeof(unsigned long long)); d->sslhs = nn_malloc(2 * SSLH_MAX * sizeof(double)); }
             d->sslidx = nn_malloc(np_ * sizeof(int)); d->ssle = nn_malloc(np_ * g_ssl * 4); d->sslge = nn_malloc(np_ * g_ssl * 4); d->sslnrm = nn_malloc(np_ * 4); d->sslvo = nn_malloc(8 * 4);
-            d->ssl_rs = 0x5D1C0FFEEull ^ (uint64_t)g * 0x9E3779B97F4A7C15ull ^ (uint64_t)atoll(opt(argc, argv, "--seed", "0")) * 0xD1B54A32D192ED03ull;
+            d->ssl_rs = 0x5D1C0FFEEull ^ (uint64_t)g * 0x9E3779B97F4A7C15ull ^ (uint64_t)atoll(opt(argc, argv, "--seed", "0")) * 0xD1B54A32D192ED03ull
+                        ^ (uint64_t)step0 * 0x94D049BB133111EBull ^ (step0 > 0 ? 0 : (uint64_t)step_loaded * 0xBF58476D1CE4E5B9ull);   /* (a resume / fine-tune: not the first steps' teacher draws again; rng audit #2) */
             if (g == 0) fprintf(stderr, "ssl: %.0f MB of device buffers per GPU\n", (n * 5 + np_ * g_ssl * 8 + np_ * 8 + (double)g_sslh.nslot * (g_Pz / 4) * (P / 4) * (P / 4)) / 1048576.0);
         }
         if (g_distill) {   /* --distill: int8 targets (double-buffered unless lean), the head's fp32 gradient, the loss sums */
@@ -4567,10 +4569,11 @@ int cmd_train(int argc, char **argv) {
     else fprintf(stderr, "0 validation batches\n");
     g_Pz = Pz_tr;
 
-    if (!sc.cover && step0 > 0) {   /* resumed: a fresh sample stream (the per-sample seeds count from batch 0 at every sampler start, so a
-                                       resume under --det replayed the windows and augmentations of steps 1, 2, ...); validation keeps its seed */
-        sc.seed = seed + 0x9E3779B97F4A7C15ull * (uint64_t)step0;
-        fprintf(stderr, "resumed at step %d: training sample stream reseeded\n", step0);
+    if (!sc.cover && (step0 > 0 || step_loaded > 0)) {   /* resumed: a fresh sample stream (the per-sample seeds count from batch 0 at every sampler start, so a
+                                       resume under --det replayed the windows and augmentations of steps 1, 2, ...); validation keeps its seed.
+                                       --finetune (step0 0): from the loaded checkpoint's step and a marker, else it replayed the base run's stream (rng audit #1) */
+        sc.seed = seed + 0x9E3779B97F4A7C15ull * (uint64_t)(step0 > 0 ? step0 : step_loaded) ^ (step0 > 0 ? 0 : 0xF17E7E57F17E7E57ull);
+        fprintf(stderr, "%s at step %d: training sample stream reseeded\n", step0 > 0 ? "resumed" : "fine-tune from a checkpoint", step0 > 0 ? step0 : step_loaded);
     }
     if (!atoi(opt(argc, argv, "--sampler-slots", "0"))) {   /* the default slot count against the host memory available now */
         const size_t p3s = (size_t)g_Pz * P * P, slotb = (size_t)B * p3s * ((size_t)g_xs * xbytes() + (g_pack ? 1 : NCH + 1) + (g_aff != 0) + (g_side != 0)
@@ -4670,7 +4673,7 @@ int cmd_train(int argc, char **argv) {
         { uint64_t h = (uint64_t)step * 0x9E3779B97F4A7C15ull + (uint64_t)seed; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
           g_verso_flip = g_verso_on && g_verso_swap > 0 && (double)(h >> 11) * 0x1p-53 < g_verso_swap; }   /* same on every GPU */
         g_sheet_ramp=fminf(1.f,(float)(step-schedule_start)/500.f);
-        nn_set_sr_step((unsigned)step);
+        nn_set_sr_step((unsigned)step + (step0 > 0 ? 0u : (unsigned)step_loaded * 0x9E3779B1u));   /* (--finetune: not the base run's SR seeds of steps 1, 2, ...) */
         double loss = 0, active = 0; int want_next[64] = {0};   /* (per GPU: fetch its next batch after all launches) */
         /* forward + backward on every GPU; kernel launches are asynchronous so the GPUs overlap */
         if (split) {   /* one window on both GPUs: upload both slabs of a batch, then one job with the halo exchanges */

@@ -49,7 +49,7 @@ int sr_on(void) { if (g_sr < 0) { const char *e = getenv("UFSM_SR"); g_sr = e ? 
 unsigned sr_seed(void) {
     unsigned h = g_sr_step * 0x9e3779b9u ^ (++g_sr_ctr) * 0x85ebca6bu;
     h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
-    return h | 1u;
+    return h ? h : 1u;   /* (0 means off; h | 1 paired every seed with its neighbour, 31 bits: rng audit #5. 64-bit kernel seeds left for later) */
 }
 extern "C" void nn_set_sr(int on) { g_sr = on; }
 /* UFSM_SR_SALT=K (A/B noise floors, perf2 2026-11-13): every step's stochastic-rounding seed shifted by K << 20, a run with other SR draws on

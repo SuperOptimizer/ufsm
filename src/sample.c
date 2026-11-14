@@ -3374,7 +3374,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         } else {
             if (Pz != P) { fprintf(stderr, "sampler: slab windows take the phase from a stored raster (sources \"phase\" at this level or one coarser)\n"); return -1; }
             uint8_t *bw = tp_get(p3, 0), *sw = c->side ? tp_get(p3, 0) : nullptr;
-            if (!bw || (c->side && !sw) || band_window(s, o, P, bw, sw, c->side == 2, c->phase_dense, tile_index ^ c->seed)) { tp_put(bw, p3); tp_put(sw, p3); return -1; }
+            if (!bw || (c->side && !sw) || band_window(s, o, P, bw, sw, c->side == 2, c->phase_dense, tile_index ^ c->seed ^ r->s[1]))   /* (r->s[1]: a keep mask per draw, as phase_weight_drop; was fixed per slot for the run: rng audit #3) */ { tp_put(bw, p3); tp_put(sw, p3); return -1; }
             for (size_t k = 0; k < p3; k++) if (!ctu[k]) bw[k] = BAND_UNKNOWN;
             if (nhb) { hold_fill(bw, (const int32_t (*)[6])hb, nhb, P, BAND_UNKNOWN); if (sw) hold_fill(sw, (const int32_t (*)[6])hb, nhb, P, SIDE_UNKNOWN); }
             if (c->band) sym_u8(bw, b->band + (size_t)i * p3, Pz, P, y);
@@ -3638,7 +3638,9 @@ static void *worker(void *arg) {
         int fail = 0, filled = 0; unsigned spin = 0;
         for (int i = 0; i < sp->cfg.B && !atomic_load(&sp->stop);) {
             if (det && (sp->cfg.cover || (spin == 0 && fail == 0))) rseed(&r, sp->cfg.seed * 0x9e3779b97f4a7c15ull + (sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i)) * 1000003ull + 1);   /* per-sample stream */
+            const rng r_before = r;   /* --det: a draw that failed to read is retried from the same state (rng audit #4: the batch no longer depends on the I/O error history) */
             int rc = draw(sp, b, i, &r, xtmp, ttmp, big, sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i), noise_state, chs ? chs + i : nullptr);
+            if (rc < 0 && det) r = r_before;
             if (tp_log()) { fprintf(stderr, "tplog draw rc %d big res by p3:", rc); for (int q = 0; q < 10; q++) fprintf(stderr, " %.2f", resident_bytes(big + q * p3, p3) / (double)p3); fprintf(stderr, " ttmp %.2f\n", resident_bytes(ttmp, 2 * p3) / (double)p3); }
             if (rc == 0) { i++; filled = i; fail = 0; spin = 0; }
             else if (rc > 0 && ++spin == (1u << 22)) { fprintf(stderr, "sampler: %u consecutive draws rejected or impossible (P=%d), stopping\n", spin, sp->cfg.P); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); }
