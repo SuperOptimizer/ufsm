@@ -268,7 +268,10 @@ int ctx_run(w4ctx *c, const uint8_t *phase, int D, int H, int W, int tile, int m
     uint32_t gbase = 0; if (ro_out) ro_out->noff = ro_out->nr = 0;
     if (w4_inj()) return -2;
     CK(cudaSetDevice(c->dev));
-    if (!c->ready) { CK(cudaStreamCreate(&c->st)); c->ready = 1; }
+    /* non-blocking (2026-11-14): a plain cudaStreamCreate stream synchronises with the legacy default stream, the trainer's, so every
+       op here waited for the queued training work to drain and the next training kernel waited for it (try5: a worker spun 0.7 core in
+       this cudaMemcpy2DAsync; the sampler's windows late at P 512 DP). The context's buffers are its own: no ordering with the trainer is needed */
+    if (!c->ready) { CK(cudaStreamCreateWithFlags(&c->st, cudaStreamNonBlocking)); c->ready = 1; }
     const int one = tile <= 0 || (tile >= D && tile >= H && tile >= W), T = one ? (D > H ? (D > W ? D : W) : (H > W ? H : W)) : tile, ntx = (W + T - 1) / T;
     const int mc = maxcomp > 15 ? 15 : maxcomp;
     int next = 0; band_wind4_stats acc = {0};
