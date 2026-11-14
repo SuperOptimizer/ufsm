@@ -321,6 +321,13 @@ sources *sources_load(const char *path) {
                 for (int l = 0; l < MAXLEV; l++) s->tgt_present[c][l] = 0;
                 s->tgt[c][L] = z; s->tgt_present[c][L] = 1;
                 if (ct1) { s->tgt[c][L + 1] = inkfly_open_pooled(ct1, z, 0); s->tgt_present[c][L + 1] = s->tgt[c][L + 1] != nullptr; }   /* (closed before level L: sources_free goes up the levels? see below) */
+                if (hf && ic.nexcl > 0 && json_num(json_get(of, "val_twin"), 1) != 0) {   /* the validation twin: the same labels with no held-out exclusions (a failure leaves the val ink unknown, as before) */
+                    inksplat_cfg iv = ic; iv.nexcl = 0;
+                    z3 *cv = pyramid_open_level(s->s, s->ct_key, L, s->um, g_cache), *cv1 = pyramid_open_level(s->s, s->ct_key, L + 1, s->um, g_cache), *zv = nullptr;
+                    void *hv = nullptr;
+                    if (cv) zv = inkfly_open(cv, sg, &iv, (size_t)json_num(json_get(of, "cache_mb"), 2048), dcd && *dcd && strcmp(dcd, "off") && strcmp(dcd, "0") ? dcd : nullptr, &hv);
+                    if (zv) { s->tgt_val[c][L] = zv; if (cv1) s->tgt_val[c][L + 1] = inkfly_open_pooled(cv1, zv, 0); }
+                    else { if (cv1) z3_close(cv1); fprintf(stderr, "sources: %s/%s: the validation twin of the ink target failed (val ink stays unknown in the holdouts)\n", s->name, CHNAME[c]); } }
                 continue;
             }
             if (t->type == J_STR) { s->tgt_key[c] = strdup(t->str); continue; }
@@ -583,6 +590,7 @@ void sources_free(sources *S) {
         if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->hold_rej); free(s->focus); free(s->mask); srpair_free(s->srp);
         for (int c = 0; c < NTG; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
+            for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt_val[c][l]);
             if (s->reg[c]) {
                 for (int k = 0; k < s->reg[c]->n; k++) z3_close(s->reg_z[c][k]);
                 free(s->reg_z[c]);
@@ -883,9 +891,12 @@ int z3_read_label_grid(z3 *z, int binary, int shift, const int64_t o[3], const i
     free(low); free(ixm); return 0;
 }
 
+static _Thread_local int tl_val_read;
+void source_set_val_read(int on) { tl_val_read = on; }
 int source_read_target(source *s, int ch, int level, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     int actual = level; z3 *z = source_tgt_for_level(s, ch, level, &actual);
     if (!z) return -1;
+    if (tl_val_read && actual >= 0 && actual < MAXLEV && s->tgt_val[ch][actual]) z = s->tgt_val[ch][actual];   /* (validation: the twin without the holdout exclusions) */
     int rc = z3_read_label_grid(z, s->tgt_side[ch] ? 2 : s->tgt_binary[ch] || (z && z3_meta_of(z)->label_binary), actual - level, o, n, out, nthreads);
     if (!rc && s->tgt_votes[ch] && !s->tgt_votes_soft[ch]) {   /* vote codes -> side codes (RV_*): the rest of the sampler sees a side array */
         const size_t nv = (size_t)n[0] * n[1] * n[2]; const uint8_t *lut = s->tgt_vote_lut[ch];

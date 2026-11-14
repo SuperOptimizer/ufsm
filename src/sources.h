@@ -84,6 +84,7 @@ typedef struct {
     store *tgt_store[NTG];
     char *tgt_key[NTG];
     z3 *tgt[NTG][MAXLEV];
+    z3 *tgt_val[NTG][MAXLEV];   /* an onfly ink target with a holdout_file: the twin without the held-out exclusions, read by the validation sampler only (audit eval#2: the val ink target was unknown inside every held-out box) */
     int tgt_present[NTG][MAXLEV];
     int tgt_binary[NTG];      /* target bytes are 0/background, 255/surface; no ignore class */
     int tgt_min_level[NTG];   /* finest stored CT rung; binary targets can upsample finer requests */
@@ -191,6 +192,7 @@ z3 *source_tgt_for_level(source *s, int ch, int level, int *stored_level);
    encoding. Binary masks are nearest-neighbour upsampled on their global voxel
    centres when shift>0; interior samples clamp to the last stored centre. */
 int z3_read_label_grid(z3 *z, int binary, int shift, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);
+void source_set_val_read(int on);   /* this thread reads the validation twins of the onfly ink targets (sample.c sets it per draw) */
 int source_read_target(source *s, int ch, int level, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);
 z3 *source_region(source *s, int ch, int i);           /* regions target only */
 int source_region_shared(const source *s, int ch);      /* 1 if region reads use absolute (array) coordinates */

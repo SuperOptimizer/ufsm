@@ -1836,6 +1836,8 @@ static int predict_one(int argc, char **argv) {
     }
     axis ax = {0};
     if (axisf && axis_load(&ax, axisf)) { fprintf(stderr, "cannot load axis %s\n", axisf); return 1; }
+    if (!axisf && (getenv("UFSM_PRED_AXIS_WARN") ? atoi(getenv("UFSM_PRED_AXIS_WARN")) : 1))   /* (audit inkmil #2 / eval#3: no refusal, the fixture and fit paths run axis-less on purpose) */
+        fprintf(stderr, "predict: WARNING no --axis: the radial input channels are zero (and scroll attention positions invalid). Nets trained with an axis (most ink / winding sources) see an input they were not trained on; UFSM_PRED_AXIS_WARN=0 silences this\n");
     double um_l = um * (1 << level), scale = (double)(1 << level);
     if (sweep_out) {   /* conditioned inference: its own window loop and outputs (src/sweep.c) */
         if (split || ngpu > 1 || !box || !ax.n) { fprintf(stderr, "predict: --cond-sweep runs on one GPU over a --box, with --axis\n"); return 2; }

@@ -87,6 +87,8 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
     [ -n "${INKONLY:-}" ] && [ "$cr" != "$INKONLY" ] && continue   # INKONLY=CROP: that crop alone (a caller yielding GPU 0 between crops)
     ctk=${ctk:-$P4K}; case $M in http*) ;; *) ctk=${ctk/\/volumes\//\/};; esac   # (a local CT tree, e.g. the desk's /vesuvius/ufsm/v2/ct: keys without volumes/)
     um=$(python3 -I -c "import json; print(json.load(open('$C/$cr/crop.json')).get('um', 2.4))")
+    # INK_AXIS (default 1; audit inkmil #2): the scroll's axis for the heads predict, as 97 % of the ink training weight carried one (0: none, the old behaviour)
+    AXI=; if [ "${INK_AXIS:-1}" = 1 ]; then ax=$(awk -F'\t' -v s="${scr:-PHercParis4}" '$1 == s {print $2}' ${INK_AXES:-$(dirname $(readlink -f $0))/ink_axes.tsv}); [ -n "$ax" ] && [ -s "$ax" ] && AXI="--axis $ax"; fi
     g=/nonexistent; for gd in ${INKGT:-}; do [ -d $gd/$cr.zarr ] && { g=$gd/$cr.zarr; break; }; done; vs=0; [ -d $g ] && ! grep -qP "^$cr\t" $o/vscores.tsv && vs=1   # INKGT: one or more dirs
     grep -qP "^$cr\t" $o/scores.tsv && [ $vs = 0 ] && continue
     v=$o/vol_${scr:-PHercParis4}; [ "$INKP" = heads ] && v=$o/vol_$cr   # (predict --heads has no --resume: a store per crop)
@@ -98,10 +100,10 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
       if [ "${BLEND:-0}" = 1 ]; then   # BLEND=1 (lead 2026-11-12): the latent ink head's level steps at window seams (inkB: 10-30 / 255, halo 16..256
         # alike), so two passes on tile grids offset by half the 512 core (--grid-origin, in level-LV voxels) blended with sin^2 weights, as
         # inkB's sched/inkwatch/u1667ink-v2.sh (ink-blend: seam step 16.9 -> 1.3 on a 1299 box); the passes are kept in $v.g0 / $v.g256
-        [ -e $o/pred_$cr.done ] || { for gg in 0 256; do [ -e $v.g$gg/ink/zarr.json ] || lkg ${UP:-$U} predict $CK $M $ctk $v.g$gg --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink --window 544 --halo 16 --grid-origin $gg,$gg,$gg ${PXH:-} --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_${cr}_g$gg.log 2>&1 || break; done
+        [ -e $o/pred_$cr.done ] || { for gg in 0 256; do [ -e $v.g$gg/ink/zarr.json ] || lkg ${UP:-$U} predict $CK $M $ctk $v.g$gg --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink --window 544 --halo 16 --grid-origin $gg,$gg,$gg ${PXH:-} $AXI --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_${cr}_g$gg.log 2>&1 || break; done
           [ -e $v.g0/ink/zarr.json ] && [ -e $v.g256/ink/zarr.json ] && mkdir -p $v.h && ${UP:-$U} ink-blend $v.h/ink --um $key --tile 512,512,512 --grids 0,0,0:256,256,256 $v.g0/ink $v.g256/ink --threads 8 > $o/blend_$cr.log 2>&1 && [ -e $v.h/ink/zarr.json ]; } || { log "ink: $cr blended predict failed"; continue; }
       else
-      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink ${PXH:-} --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
+      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink ${PXH:-} $AXI --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
     else lvi=${LV_INK:-1}; ch=${INKP#ch:}; key=$(python3 -I -c "print(round($um * 2 ** $lvi, 3))")
       [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --resume 1 --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
     touch $o/pred_$cr.done; [ $PO = 1 ] && continue

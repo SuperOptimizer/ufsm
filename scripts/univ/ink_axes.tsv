@@ -1,0 +1,5 @@
+# scroll	axis json of its ink source in sources-unified.json (eval.sh INK_AXIS=1 passes it to the ink predicts: those windows trained with it; scrolls without one stay axis-less)
+PHerc0139	/vesuvius/ufsm/wbench/xres/PHerc0139/axis.json
+PHerc0814	/vesuvius/ufsm/wbench/xres/PHerc0814/axis.json
+PHerc1667	/vesuvius/ufsm/umbilicus/PHerc1667/umbilicus-full-resolution.json
+PHercParis4	/vesuvius/ufsm/teacher/axis-0.json

@@ -52,6 +52,10 @@ a = [max(int(bx[d] * s), int(lo[d] / f) - 64) for d in range(3)]; e = [min(int((
 print(",".join(map(str, a + [e[d] - a[d] for d in range(3)])))
 PY
 ) || { log "box failed"; exit 1; }
+# INK_AXIS (default 1; audit inkmil #2): the unroll's axis file for the predict, as the ink windows trained with an axis (97 % of the ink weight); 0: none
+AXA=; [ "${INK_AXIS:-1}" = 1 ] && [ -s $O/axis.json ] && AXA="--axis $O/axis.json"
+[ "${INK_AXIS:-1}" = 1 ] && [ -z "$AXA" ] && log "WARNING: no $O/axis.json, predicting without --axis (radial channels zero)"
+# LV=1 (4.8 um, the crop evals' level) is the level the head's held-out numbers were measured at (audit inkmil #3); LV=2 (default, 9.6 um) has no crop number yet
 log "ckpt $CK, level $LV ($key um), box $box, labels ${SEGS:-none (render only)}"
 if [ ! -e $INK/ink.done ]; then
   # BLEND=1 (default): the latent ink head's level depends on its window (inkpod-9000: steps of 10-30 / 255 at the window seams, halo 16..256
@@ -64,7 +68,7 @@ if [ ! -e $INK/ink.done ]; then
   for g in 0 $([ "${BLEND:-1}" = 1 ] && echo 256); do
     log "predict grid $g (waiting for GPU 0)"; gpu0_wait
     flock /tmp/gpu0-bench.lock env CUDA_VISIBLE_DEVICES=0 ~/bin/memcap -m 40G nice -n 10 $U predict $CK $R $K $INK/g$g --um $UMV --level $LV --box $box \
-      --full-grid 1 --occupancy 5 --heads $HEADS --gpu 0 --threads $TH --window 544 --halo 16 --grid-origin $g,$g,$g $([ $g = 0 ] || echo --shard 256) > $RD/logs/predict_g$g.log 2>&1 ||
+      --full-grid 1 --occupancy 5 --heads $HEADS --gpu 0 --threads $TH --window 544 --halo 16 --grid-origin $g,$g,$g $([ $g = 0 ] || echo --shard 256) $AXA > $RD/logs/predict_g$g.log 2>&1 ||
       { log "predict grid $g failed ($RD/logs/predict_g$g.log)"; exit 1; }
     [ -e $INK/g$g/ink/zarr.json ] || { log "no ink head output in $INK/g$g"; exit 1; }
   done
