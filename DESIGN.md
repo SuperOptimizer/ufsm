@@ -66,6 +66,21 @@ any refusal to progress.log. Not done: the 2x2 closing error is no direction gat
 label-free gates audit-unroll proposed (phase coherence against W for +-1; the w4 planes' tangential sign) are not implemented. Every
 caller without --dir on a scroll with no ring vote now stops: scripts/cfit, corpus, pod/unroll.sh, cal/gate.sh.
 
+**Every unroll's hand from published segments (scripts/fibfit/seghand.py, segfetch.py).** Take a published segment that covers >= 0.8 turn
+per grid row. Over that turn its radius changes by one pitch, and the sign against the unwrapped angle is the hand. No axis model is
+needed (theta is taken about the row's ring centroid), and the non-circular shape cancels over the turn. Checked against the published
+1667 unwrap (-1, rows 253:1) and P4's documented +1. Results in scripts/unroll/spiral_dir.tsv:
+
+| scroll | dir | evidence | u1 unroll ran |
+|---|---|---|---|
+| PHerc1667 | -1 | full unwrap + 18 of 20 local wrap segments | +1: wrong, redo |
+| PHercParis4 | +1 | 3 segments on 20260411134726, rows 291-293 : 0-2 | +1: right |
+| PHerc0814 | -1 | 2 segments on 20250804134230, rows 24 / 27 : 1 / 2 | default +1 (no log kept): wrong, redo |
+| PHerc1451 / PHercMAN5 | +1? | one raw / flattened-product segment each, scan frame not checked | +1 |
+| 1299, 0009B, 0257, 0332, 0358, 0483B, 0490B, 0813, 0846B, 1203, 1545, MANB | ? | no segment covering a turn on our scan | default +1, unverified |
+
+Only exact +1 / -1 entries drive unroll.sh. The "?" ones refuse at the ref when count-field finds no ring vote.
+
 **Fibre (same-sheet) pairs in count-field.** The slabs snap their integers to the ref (`--ref-snap 1`), so a fibre term in the slab fit
 (`fit --w-fib`, 10-26) cannot move a turn step; the integer reference is count-field's LS solve. `count-field --fibers F.fib`
 (fiber-export frame) or `--pairs F.f32` (za ya xa zb yb xb dW) with `--cf-fib W`: rows c . U = t, c = trilinear(b) - trilinear(a)
