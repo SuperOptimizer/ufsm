@@ -92,9 +92,52 @@ static int field_array_case(const char *base) {
             CHECK(!memcmp(b, ref, (size_t)Dp * Hp * Wp), "pool %d: the block path differs from the pooled array", P);
         }
         printf("field array pool %d: %dx%dx%d, %zu non-zero cells, %d of 18 shards stored: chunk path = block path = reference\n", P, Dp, Hp, Wp, nz, nsh);
+        {   /* fit_field_array_frac (ufsm wraps' data test): 255 x the share of each pooled cell's cells >= 128, any cell at least 1 */
+            uint8_t *fr = calloc((size_t)Dp * Hp * Wp, 1); int *cn = calloc((size_t)Dp * Hp * Wp, sizeof(int)), s3[3];
+            for (int z = 0; z < FD; z++) for (int y = 0; y < FH; y++) for (int x = 0; x < FW; x++) cn[((size_t)(z / P) * Hp + y / P) * Wp + x / P] += all[((size_t)z * FH + y) * FW + x] >= 128;
+            for (size_t i = 0; i < (size_t)Dp * Hp * Wp; i++) fr[i] = cn[i] ? (uint8_t)fmax(1, fmin(255, floor(cn[i] * 255.0 / (P * P * P) + 0.5))) : 0;
+            uint8_t *c = fit_field_array_frac(fd, "w", P, 128, s3);
+            CHECK(c && s3[0] == Dp && s3[1] == Hp && s3[2] == Wp && !memcmp(c, fr, (size_t)Dp * Hp * Wp), "pool %d: fit_field_array_frac differs from the share of cells >= 128", P);
+            free(c); free(fr); free(cn);
+        }
         free(a); free(b); free(ref);
     }
     free(all);
+    return 0;
+}
+
+/* ufsm wraps --fields on a masked CT (geo-outer 2026-11-14): the fields' material w is 255 inside a radius RD (the CT the SAM mask kept),
+   a weak 20 in a band RD..RD + 12 native voxels (the network's edge response on the zeroed CT next to it), 0 beyond. The default data
+   test (a majority of the pooled cell's cells with material >= 128) keeps no wrap vertex beyond RD (+ a cell); the earlier test (any
+   cell > 0: --data-thr 1 --data-min 1) kept the band, where PHerc1667's u1 run wrote its duplicate outer wraps w040-w049 */
+static int masked_data_case(const char *bin, const char *base, const char *md) {
+    const double RD = 60, RB = 72;
+    char fd[700], p[800], cmd[2000]; snprintf(fd, sizeof fd, "%s/mfields", base); snprintf(p, sizeof p, "mkdir -p '%s'", fd); if (system(p)) return 1;
+    snprintf(p, sizeof p, "%s/fields.json", fd); FILE *f = fopen(p, "w"); if (!f) return 1;
+    fprintf(f, "{\"format\": \"zarr\", \"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": 9.6, \"axis\": [[%g, %g]]}\n", ORG[0], ORG[1], ORG[2], D, H, Wd, HH, CY, CX); fclose(f);
+    snprintf(p, sizeof p, "%s/w", fd); const int64_t shp[3] = {D, H, Wd};
+    z3w *w = z3w_create(p, shp, 128, 8, 0, nullptr); if (!w) { fprintf(stderr, "z3w: %s\n", z3w_error()); return 1; }
+    uint8_t *sh = calloc((size_t)128 * 128 * 128, 1);
+    for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < Wd; x++) {
+        const double r = hypot((y + 0.5) * HH - CY, (x + 0.5) * HH - CX); sh[((size_t)z * 128 + y) * 128 + x] = r < RD ? 255 : r < RB ? 20 : 0; }
+    if (z3w_write_shard(w, 0, 0, 0, sh, 4)) { fprintf(stderr, "z3w: %s\n", z3w_error()); return 1; }
+    free(sh); if (z3w_close(w)) return 1;
+    size_t nin[2] = {0, 0}, nout[2] = {0, 0};
+    for (int v = 0; v < 2; v++) {
+        char o[700]; snprintf(o, sizeof o, "%s/mw%d", base, v);
+        snprintf(cmd, sizeof cmd, "%s wraps %s %s --step 2 --first 2 --last 9 --min-cm2 0 --threads 4 --fields %s %s > /dev/null 2>&1", bin, md, o, fd, v ? "--data-thr 1 --data-min 1" : "");
+        CHECK(run(cmd) == 0, "wraps --fields (masked, %s)", v ? "any cell" : "majority");
+        for (int k = 2; k <= 9; k++) {
+            int ww, hh, w2, h2; snprintf(p, sizeof p, "%s/w%03d/x.tif", o, k); float *X = tif(p, &ww, &hh); snprintf(p, sizeof p, "%s/w%03d/y.tif", o, k); float *Y = tif(p, &w2, &h2);
+            if (!X || !Y) { free(X); free(Y); continue; }
+            for (size_t i = 0; i < (size_t)ww * hh; i++) { if (X[i] < 0) continue; const double r = hypot(Y[i] - ORG[1] - CY, X[i] - ORG[2] - CX); if (r < RD - 4) nin[v]++; else if (r > RD + 2 * HH) nout[v]++; }
+            free(X); free(Y);
+        }
+    }
+    printf("masked data: majority test %zu vertices inside, %zu beyond the data edge; any-cell test %zu / %zu\n", nin[0], nout[0], nin[1], nout[1]);
+    CHECK(nout[1] > 100, "the any-cell test should keep the weak band (%zu vertices beyond the edge): the case lost its point", nout[1]);
+    CHECK(nout[0] == 0, "the default data test kept %zu vertices beyond the data edge", nout[0]);
+    CHECK(nin[0] == nin[1] && nin[0] > 1000, "vertices inside the data: %zu (default) vs %zu (any cell)", nin[0], nin[1]);
     return 0;
 }
 
@@ -185,6 +228,7 @@ int main(int argc, char **argv) {
     CHECK(c.zmin >= ORG[0] + 16 - 1e-3 && c.zmax <= ORG[0] + 48 + 1e-3, "--zr z %.1f..%.1f outside [16, 48]", c.zmin - ORG[0], c.zmax - ORG[0]);
     CHECK(c.w == b.w || abs(c.w - b.w) < b.w / 3, "--zr columns %d vs %d", c.w, b.w);
     CHECK(!field_array_case(base), "the field array case");
+    CHECK(!masked_data_case(bin, base, md), "the masked data case");
     fit_set_free(fs); free(m.delta); free(cy); free(cx);
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", base); if (system(cmd)) {}
     if (fails) { fprintf(stderr, "test_wraps_core: %d failures\n", fails); return 1; }
