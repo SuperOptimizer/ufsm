@@ -134,7 +134,7 @@ typedef struct {
     uint8_t *w4b[2], *wcb[2], *w4, *wc; double *w4ds; float *w4fin, w4h[8]; double w4_loss;   /* --task unwrap2: winding mod 4 and its component per voxel (double-buffered), loss sums, scratch, host parts */
     double *fibacc; void *fiblist; unsigned *fibnl; size_t fibcap; double fib_h[2];   /* --fib-normal-lambda: valid voxels / sum t^T N t (device), the slab list, the fetched sums */
     uint8_t *auxb[AUX_N][2], *aux[AUX_N], *inkt, *inkm, *inkw;   /* the aux planes (double-buffered; plane j = role g_aux_role[j]); --ink-head: its slab target / mask, weight byte (loss parts: iscratch / iout / ink_loss) */
-    inkray *milr[2], *milh[2]; int miln[2]; float *milacc; double *milloss, mil_loss, mil_raw; float mil_gs, mil_den; int mil_k, mil_n;   /* --ink-mil: the window's rays per buffer, the samples' accumulator, the loss (device); logged / raw */
+    inkray *milr[2], *milh[2]; int miln[2]; float *milacc; double *milloss, mil_loss, mil_raw; float mil_gs, mil_den, hgs; int mil_k, mil_n;   /* --ink-mil: the window's rays per buffer, the samples' accumulator, the loss (device); logged / raw */
     uint8_t *tc; int tc_tried, tc_ok;   /* tc_ok: the cache holds this step's window (set by a training statistics pass, cleared by the gradient pass and by any other statistics pass) */   /* head_slab_pass: the window's derived targets / masks kept from the statistics pass for the gradient pass */
     uint8_t *rvt, *rvm; float *rvscratch, rvout[5]; double rv_loss; float rv_own;   /* rv_own: this GPU's window's rv bce (--mix-every) */
     float *milacc2;              /* g_lsplit --ink-mil: the other half's accumulator */
@@ -1281,11 +1281,52 @@ static int mil_clip(const gpu_state *d, int pass, int z0, int nz, size_t hw, int
     *gz0 = lo + mil_zoff(d); *gnz = hi - lo; *boff = (size_t)(lo - z0) * hw * 2;
     return 1;
 }
+/* the head-gradient plane scale of this window's gradient pass (nn_set_head_gscale; audit 2026-11-14 kernels.md #1 / #2, net.md #1,
+   train.md #1). The loss gradients go to fp16 planes at the gradient scale x lambda / (mask weight sum x active channels): at P 768,
+   ~1e-6 a voxel (wind4: 128 / N), fp16 subnormals with a few bits and exact zeros below |residual| ~0.02 - 0.1. A power of two s on
+   top, divided out again in the head's backward (weights, bias, gx) and the fine stem's, puts them in the normal range at no cost
+   in exactness. s from this window's counts (one small readback after the statistics pass): every producer's per-voxel bound
+   (mask weight <= hgs_mw, |residual| <= 1, the positive weight, dice / recall terms; MIL: <= 8 rays a voxel) times s <= 2^9, so a
+   coarse plane (the adjoint sums 64 fine voxels a cell) stays <= 2^15 < 65504. s in [1, 2^30]: never below the old scale. Only the
+   unwrap2 head-slab gradient pass with 16-bit gradients and its producers bounded here (pgrad / fibre-normal terms, the --ssl heads
+   and other tasks keep s 1); UFSM_HGSCALE=0: s 1 (the old bits) */
+static int g_hgs_on = -1;
+static float hgs_bound(const float *h, int C, float lam, float dice, float pw, float rw, float mw) {   /* h: a loss scratch ([C][5] sums, fin [2 C + 2]) */
+    const float fsc = h[5 * C + 2 * C + 1], gs = nn_get_grad_scale(); float b = 0.f;
+    for (int c = 0; c < C; c++) { const float nm = h[5 * c]; if (nm < 1.f) continue;
+        const float v = fabsf(lam) * gs * fsc * ((pw > 1.f ? pw : 1.f) * mw / nm + 1.25f * dice + 0.25f * rw); if (v > b) b = v; }
+    return b;
+}
+static float hgs_choose(gpu_state *d, int nmil) {
+    if (g_hgs_on < 0) g_hgs_on = !getenv("UFSM_HGSCALE") || ufsm_env_on("UFSM_HGSCALE");
+    if (!g_hgs_on || !d->hs_train || !nn_get_loss_grad_h16() || !g_unwrap2 || !g_side || (g_lat && !g_lat_hs) || g_pg_lambda > 0 || g_fibn) return 1.f;
+    const int si = d->srcb[d->cur];
+    float pw, rw; int u7; nn_loss_cfg_get(&pw, &rw, &u7);
+    const float mw = 2.f * (g_packed_w > 1.f ? g_packed_w : 1.f) * (g_rv_vw > 1.f ? g_rv_vw : 1.f);   /* hgs_mw: the largest mask weight (packed sheets, verso) x 2 */
+    const float lside = g_side_lambda * src_head_w(si, g_rv == 1 ? SH_RV : SH_PHASE), lnorm = g_norm_lambda * src_head_w(si, SH_NORMAL),
+                ldens = g_dens_lambda * src_head_w(si, SH_DENSITY), inkw = si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f;
+    float h[5 * 7 + 2 * 7 + 2], w4[8]; float b = 0.f, v;
+    nn_sync();
+#define HB(ptr, C, lam, dice, pw_) do { nn_d2h(h, (ptr), (size_t)(5 * (C) + 2 * (C) + 2) * 4); v = hgs_bound(h, (C), (lam), (dice), (pw_), rw, mw); if (v > b) b = v; } while (0)
+    HB(d->sscratch, 2, lside, 0.f, pw);
+    if (g_rv == 2) HB(d->rvscratch, 2, g_rv_lambda * src_head_w(si, SH_RV), 0.f, pw);
+    HB(d->nscratch, 7, fabsf(lnorm) > fabsf(ldens) ? lnorm : ldens, 0.f, pw);
+    if (g_ink2) HB(d->iscratch, 1, g_ink_lambda * inkw * src_head_w(si, SH_INK), g_ink_dice, pw);
+    if (g_fibh) { const float fw = g_fibh_lambda * src_head_w(si, SH_FIBRE); HB(d->fhs[0], 1, fw, 0.f, pw); HB(d->fhs[1], 1, fw, 0.f, pw); HB(d->fds, 7, fw, 0.f, 1.f); }
+#undef HB
+    nn_d2h(w4, d->w4fin, sizeof w4);   /* wind4: k = mask x 0.5 x (1 / N) x lambda x scale, |sigmoid - target| <= 1 */
+    v = 0.5f * mw * fabsf(g_w4_lambda * src_head_w(si, SH_WIND4)) * nn_get_grad_scale() * w4[3]; if (v > b) b = v;
+    if (nmil) { v = 8.f * fabsf(g_mil_lambda * inkw * src_head_w(si, SH_INK)) * nn_get_grad_scale() / (float)nmil; if (v > b) b = v; }   /* (the ray's weights sum to <= 1; <= 8 rays a voxel) */
+    if (!(b > 0.f) || !isfinite(b)) return 1.f;
+    int k = (int)floorf(log2f(512.f / b)); k = k < 0 ? 0 : k > 30 ? 30 : k;
+    return ldexpf(1.f, k);
+}
 static void head_slab_pass(gpu_state *d, int pass) {
     const int D = g_Pz, H = d->hs_P, W = d->hs_P, Z = d->hs_z;
     const size_t hw = (size_t)H * W, l3 = (size_t)D * hw;
     if (!pass && d->ev_lab[d->cur]) nn_stream_wait(0, d->ev_lab[d->cur]);   /* (lab_early: the label warp in hs_lg / lsc, the device-kept planes) */
     nn_set_logits_h16(1);
+    nn_set_head_gscale(pass && d->hgs > 0.f ? d->hgs : 1.f);   /* the gradient pass: the producers' planes at this window's head plane scale (hgs_choose), the head's backward divides it out */
     static int lchk = -1; if (lchk < 0) lchk = g_lat && ufsm_env_on("UFSM_LAT_CHECK");
     /* UFSM_PTICK: the slab phases by pass */
     static const char *const ptn[2][5] = {{"p0 label h2d", "p0 upsample", "p0 targets", "p0 loss stats", ""}, {"p1 label h2d", "p1 upsample", "p1 targets", "p1 loss grads", "p1 adjoint"}};
@@ -1705,9 +1746,14 @@ static void head_slab_pass(gpu_state *d, int pass) {
             nn_loss_stats_fin(d->hs_ds + 5, d->w + 1, w1, d->iscratch);
         } else nn_wind4_fin(d->w4ds, d->w4fin);
         if (g_ink2) nn_loss_stats_fin(d->hs_ds + 5, d->inkw, w1, d->iscratch);
+        if (g_fibh) { nn_loss_stats_fin(d->hs_ds + 74, d->fhw, w1, d->fhs[0]); nn_loss_stats_fin(d->hs_ds + 79, d->fhw, w1, d->fhs[1]); nn_loss_stats_fin(d->hs_ds + 84, d->nw, w7, d->fds); }
+        if (g_rv == 2) nn_loss_stats_fin(d->hs_ds + 64, d->sidew, w2, d->rvscratch);
+        nn_loss_stats_fin(d->hs_ds + 10, d->sidew, w2, d->sscratch);
+        nn_loss_stats_fin(d->hs_ds + 20, d->nw, w7, d->nscratch);
+        d->hgs = ssl_skip ? 1.f : hgs_choose(d, nmil);   /* (after every finalisation it reads; before the MIL fin, which bakes the scale into its accumulator) */
         if (nmil) {   /* the MIL loss: the mean over the window's rays x lambda x the source's ink weight; the gradient in the 16-bit storage's scale (training) */
             const float iw = g_mil_lambda * (si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f) * src_head_w(si, SH_INK) / nmil;
-            const float gs = d->hs_train && nn_get_loss_grad_h16() ? nn_get_grad_scale() : 1.f;
+            const float gs = d->hs_train && nn_get_loss_grad_h16() ? nn_get_grad_scale() * d->hgs : 1.f;   /* (x the head plane scale: ink_mil_bwd_slab adds into the planes) */
             if (g_lsplit && d->side >= 0) {   /* the two halves' accumulators summed (a + b on both GPUs: the same bits), the loss counted on side 0 */
                 const size_t nb = (size_t)nmil * d->mil_k * sizeof(float);
                 split_xchg(d->milacc, nb, d->milacc2, nb, nullptr); nn_axpy(d->milacc, 1.f, d->milacc2, (size_t)nmil * d->mil_k);
@@ -1728,10 +1774,6 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 fprintf(stderr, "mil check: rays %d, %d meet known ink within the reach, %d of those agree with the ray's label\n", nmil, hit, agree);
             }
         }
-        if (g_fibh) { nn_loss_stats_fin(d->hs_ds + 74, d->fhw, w1, d->fhs[0]); nn_loss_stats_fin(d->hs_ds + 79, d->fhw, w1, d->fhs[1]); nn_loss_stats_fin(d->hs_ds + 84, d->nw, w7, d->fds); }
-        if (g_rv == 2) nn_loss_stats_fin(d->hs_ds + 64, d->sidew, w2, d->rvscratch);
-        nn_loss_stats_fin(d->hs_ds + 10, d->sidew, w2, d->sscratch);
-        nn_loss_stats_fin(d->hs_ds + 20, d->nw, w7, d->nscratch);
         nn_ent_fin(d->hs_ent, HE_N);
     } else if (fuse && light) {   /* the logged losses: the same finalisation with the gradient pass's sums (the mask sums and the active count are unchanged) */
         const shape5 w2 = {1, 2, D, H, W}, w7 = {1, 7, D, H, W};
@@ -1749,6 +1791,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 h[12] - h[13], h[12], h[12] > h[13] ? 100.0 * h[14] / (h[12] - h[13]) : 0.0);
 #undef HZP
     }
+    nn_set_head_gscale(1.f);
 }
 static void head_slab_cb(void *ctx) {
     gpu_state *d = ctx;

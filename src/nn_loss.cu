@@ -124,12 +124,12 @@ extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const u
         if (g_logits_h16) {
             const f16 *l16 = (const f16 *)logits;
             if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
-            else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
-            else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
+            else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, GSH, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
+            else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, GSH, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
         } else
         if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
-        else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
-        else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
+        else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, GSH, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
+        else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, GSH, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
     }
     KCHECK();
 }
@@ -211,8 +211,8 @@ extern "C" void nn_loss_pack(const void *logits, const uint8_t *t, const uint8_t
     if (gl) {
         const size_t n = shape_numel(s);
 #define LGP(GT, LT, gs) loss_grad_pk_k<GT, LT><<<nblk(n, 256), 256>>>((const LT *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (GT *)gl, g_posw, gs, s.h, s.w, g_recall)
-        if (g_logits_h16) { if (!g_loss_g16) LGP(float, f16, 1.f); else if (g_h16) LGP(f16, f16, g_gscale); else LGP(bf16, f16, g_gscale); }
-        else { if (!g_loss_g16) LGP(float, float, 1.f); else if (g_h16) LGP(f16, float, g_gscale); else LGP(bf16, float, g_gscale); }
+        if (g_logits_h16) { if (!g_loss_g16) LGP(float, f16, 1.f); else if (g_h16) LGP(f16, f16, GSH); else LGP(bf16, f16, GSH); }
+        else { if (!g_loss_g16) LGP(float, float, 1.f); else if (g_h16) LGP(f16, float, GSH); else LGP(bf16, float, GSH); }
 #undef LGP
     }
     KCHECK();
@@ -311,7 +311,7 @@ extern "C" void nn_loss_stats_fin_light(double *ds, const uint8_t *w, shape5 s, 
    scales were a separate read-modify-write pass, gscale_k, ~90 ms a step per card at the P 1024 split half). The 16-bit value is rounded
    once from (g fin gscale) mul instead of twice (round, scale, round): at most one fp16 ulp apart */
 extern "C" void nn_loss_grad_only_s(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch, float mul) {
-    const size_t S = shape_spatial(s); const float gs1 = mul, gsh = g_gscale * mul;
+    const size_t S = shape_spatial(s); const float gs1 = mul, gsh = GSH * mul;
     const float *fin = scratch + (size_t)5 * s.n * s.c;
     if (g_logits_h16) {
         const f16 *l16 = (const f16 *)logits;
@@ -418,8 +418,8 @@ extern "C" void nn_count_loss(const void *dens_logits, const uint8_t *phase, int
     count_sum_k<<<1, 32>>>(seg, K, nvalid, out2);
     if (dens_grad) {
         if (!g_loss_g16) count_apply_k<float><<<nblk(n, 256), 256>>>((float *)dens_grad, acc, n, nvalid, lambda);
-        else if (g_h16) count_apply_k<f16><<<nblk(n, 256), 256>>>((f16 *)dens_grad, acc, n, nvalid, lambda * g_gscale);
-        else count_apply_k<bf16><<<nblk(n, 256), 256>>>((bf16 *)dens_grad, acc, n, nvalid, lambda * g_gscale);
+        else if (g_h16) count_apply_k<f16><<<nblk(n, 256), 256>>>((f16 *)dens_grad, acc, n, nvalid, lambda * GSH);
+        else count_apply_k<bf16><<<nblk(n, 256), 256>>>((bf16 *)dens_grad, acc, n, nvalid, lambda * GSH);
     } else cudaMemsetAsync(acc, 0, n * sizeof *acc);   /* validation: no gradient */
     KCHECK();
 }
@@ -460,8 +460,8 @@ extern "C" void nn_sheet_scatter(float *gl,const uint64_t *indices,const float *
     CK(cudaMalloc(&ix,n*sizeof(uint64_t))); CK(cudaMalloc(&v,n*sizeof(float)));
     CK(cudaMemcpy(ix,indices,n*sizeof(uint64_t),cudaMemcpyHostToDevice)); CK(cudaMemcpy(v,values,n*sizeof(float),cudaMemcpyHostToDevice));
     if (!h16) sheet_scatter_k<float><<<nblk(n,256),256>>>(gl,ix,v,n,1.f);
-    else if (g_h16) sheet_scatter_k<f16><<<nblk(n,256),256>>>((f16 *)gl,ix,v,n,g_gscale);
-    else sheet_scatter_k<bf16><<<nblk(n,256),256>>>((bf16 *)gl,ix,v,n,g_gscale);
+    else if (g_h16) sheet_scatter_k<f16><<<nblk(n,256),256>>>((f16 *)gl,ix,v,n,GSH);
+    else sheet_scatter_k<bf16><<<nblk(n,256),256>>>((bf16 *)gl,ix,v,n,GSH);
     CK(cudaFree(ix)); CK(cudaFree(v)); KCHECK();
 }
 extern "C" void nn_sheet_input(void *input,int W,const float *rows,float center,float scale,int h16) {
@@ -875,12 +875,12 @@ extern "C" void nn_aff_loss_async(const float *logits, shape5 s, int c0, const u
         if (g_logits_h16) {
             const f16 *l16 = (const f16 *)logits;
             if (!g_loss_g16) aff_grad_k<float, f16><<<grid, 128>>>(l16, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale, gl);
-            else if (g_h16) aff_grad_k<f16, f16><<<grid, 128>>>(l16, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * g_gscale, (f16 *)gl);
-            else VERIFY_ONLY(aff_grad_k<bf16, f16><<<grid, 128>>>(l16, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * g_gscale, (bf16 *)gl));
+            else if (g_h16) aff_grad_k<f16, f16><<<grid, 128>>>(l16, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * GSH, (f16 *)gl);
+            else VERIFY_ONLY(aff_grad_k<bf16, f16><<<grid, 128>>>(l16, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * GSH, (bf16 *)gl));
         } else
         if (!g_loss_g16) aff_grad_k<float><<<grid, 128>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale, gl);
-        else if (g_h16) aff_grad_k<f16><<<grid, 128>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * g_gscale, (f16 *)gl);
-        else VERIFY_ONLY(aff_grad_k<bf16><<<grid, 128>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * g_gscale, (bf16 *)gl));
+        else if (g_h16) aff_grad_k<f16><<<grid, 128>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * GSH, (f16 *)gl);
+        else VERIFY_ONLY(aff_grad_k<bf16><<<grid, 128>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * GSH, (bf16 *)gl));
     }
     KCHECK();
 }
@@ -1000,8 +1000,8 @@ extern "C" void nn_wind4_fin(double *ds, float *out) {
 extern "C" void nn_wind4_grad(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, const float *fin, float lambda, void *ga, void *gb) {
     const unsigned g = nblk(n, 256);
 #define W4G(GT, LT, s) w4_grad_k<GT, LT><<<g, 256>>>((const LT *)la, (const LT *)lb, w4, comp, m, n, fin, (s), (GT *)ga, (GT *)gb)
-    if (g_logits_h16) { if (!g_loss_g16) W4G(float, f16, lambda); else if (g_h16) W4G(f16, f16, lambda * g_gscale); else VERIFY_ONLY(W4G(bf16, f16, lambda * g_gscale)); }
-    else { if (!g_loss_g16) W4G(float, float, lambda); else if (g_h16) W4G(f16, float, lambda * g_gscale); else VERIFY_ONLY(W4G(bf16, float, lambda * g_gscale)); }
+    if (g_logits_h16) { if (!g_loss_g16) W4G(float, f16, lambda); else if (g_h16) W4G(f16, f16, lambda * GSH); else VERIFY_ONLY(W4G(bf16, f16, lambda * GSH)); }
+    else { if (!g_loss_g16) W4G(float, float, lambda); else if (g_h16) W4G(f16, float, lambda * GSH); else VERIFY_ONLY(W4G(bf16, float, lambda * GSH)); }
 #undef W4G
     KCHECK();
 }
@@ -1135,8 +1135,8 @@ extern "C" void nn_pgrad_slab(const void *lc, const void *ls, const uint8_t *pha
 }
 extern "C" void nn_pgrad_apply(void *gc, void *gs, float *acc, size_t ns, const double *sums, float lambda) {
     if (!g_loss_g16) { fprintf(stderr, "nn_pgrad_apply: needs 16-bit logit gradients (head slabs)\n"); abort(); }
-    if (g_h16) pgrad_apply_k<f16><<<nblk(ns, 256), 256>>>((f16 *)gc, (f16 *)gs, acc, ns, sums, lambda * g_gscale);
-    else pgrad_apply_k<bf16><<<nblk(ns, 256), 256>>>((bf16 *)gc, (bf16 *)gs, acc, ns, sums, lambda * g_gscale);
+    if (g_h16) pgrad_apply_k<f16><<<nblk(ns, 256), 256>>>((f16 *)gc, (f16 *)gs, acc, ns, sums, lambda * GSH);
+    else pgrad_apply_k<bf16><<<nblk(ns, 256), 256>>>((bf16 *)gc, (bf16 *)gs, acc, ns, sums, lambda * GSH);
     KCHECK();
 }
 /* ---- train --fib-normal-lambda: the normal head orthogonal to fibres ----
@@ -1201,7 +1201,7 @@ extern "C" void nn_fibn(const void *lg, size_t ns, const uint8_t *fib, int D, in
 extern "C" void nn_fibn_apply(const void *list, const unsigned *nl, size_t cap, const double *acc, float lambda, void *gl, size_t ns) {
     const unsigned nb = (unsigned)((cap + 255) / 256);
     if (!g_loss_g16) fibn_apply_k<float><<<nb, 256>>>((const fibn_ent *)list, nl, (unsigned)cap, acc, lambda, 1.f, (float *)gl, ns);
-    else if (g_h16) fibn_apply_k<f16><<<nb, 256>>>((const fibn_ent *)list, nl, (unsigned)cap, acc, lambda, g_gscale, (f16 *)gl, ns);
-    else fibn_apply_k<bf16><<<nb, 256>>>((const fibn_ent *)list, nl, (unsigned)cap, acc, lambda, g_gscale, (bf16 *)gl, ns);
+    else if (g_h16) fibn_apply_k<f16><<<nb, 256>>>((const fibn_ent *)list, nl, (unsigned)cap, acc, lambda, GSH, (f16 *)gl, ns);
+    else fibn_apply_k<bf16><<<nb, 256>>>((const fibn_ent *)list, nl, (unsigned)cap, acc, lambda, GSH, (bf16 *)gl, ns);
     KCHECK();
 }

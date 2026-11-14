@@ -376,6 +376,11 @@ void nn_set_logits_h16(int on);     /* the losses, nn_prob_u8, nn_pred_output / 
 void nn_set_head_out_h16(int on);   /* the MX head writes fp16 logits (set by unet around its head) */
 void nn_set_loss_grad_h16(int on);   /* nn_loss_async writes gl as the 16-bit storage type scaled by the gradient scale (unet_backward_x(.., 1)) */
 float nn_get_grad_scale(void);
+/* the head-gradient plane scale (power of two, default 1): the loss-gradient kernels write their fp16 planes at grad scale x s, the head
+   backward (nn_head_bwd_z) and the fine stem's backward (nn_fstem_bwd) divide s out exactly; per host thread. train.c sets it around the
+   head's gradient pass (head_slab_pass hgs_choose) */
+void nn_set_head_gscale(float s);
+float nn_get_head_gscale(void);
 
 /* ---- conv3d: weight [cout][cin][k][k][k], bias [cout] or nullptr, pad k/2, stride 1 or 2 ---- */
 shape5 nn_conv3d_out_shape(shape5 xs, int cout, int k, int stride);

@@ -6,6 +6,41 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Head-gradient plane scale: the latent head's loss gradients out of fp16's subnormals (2026-11-14, branch hgscale-20261114)
+
+Audit 2026-11-14 (kernels.md #1 / #2, net.md #1, train.md #1).
+- **The bug:** the head slabs' loss-gradient planes are fp16 at gradient scale x lambda / (mask weight sum x active channels). At P 768 that
+  is ~1e-6 a voxel, which is fp16 subnormal (step 6e-8).
+  - wind4 is the worst: 0.25 x 1024 x 0.5 / N = 128 / N, so 1.3e-6 at N 1e8. Residuals below ~0.02 (N 1e8) to ~0.1 (N 4.5e8) give exactly
+    0, and larger ones keep 2-6 bits.
+  - The BCE heads are 8x better, and the coarse planes (lat_gfin_k) are 64x larger, but still mostly subnormal.
+  - The fine stem's parameter gradient reads the same fp16 slab.
+- **The fix:** one power of two s per window (hgs_choose in train.c), multiplied into the producers' scale (GSH = gradient scale x
+  nn_set_head_gscale, every loss-gradient kernel of nn_loss.cu and the fused latent loss of nn_lat.cu; the MIL fin's scale x s). It is
+  divided out exactly where the planes are consumed:
+  - nn_head_bwd_z: gw / gb are pre-multiplied by s and divided after; gx uses the weights x 1 / s, where c1b_wh_k's power-of-two row scales
+    absorb the shift.
+  - nn_fstem_bwd: the reduction x 1 / s.
+  - Everything downstream (the trunk's gx, every parameter gradient) is at the old scale.
+  - Every step is an exact power-of-two scaling of normal values, so wherever nothing was subnormal the gradients are bit-identical.
+    UFSM_HGSCALE=0 gives s 1, the old path.
+- **How s is chosen:** after the statistics pass, one small readback (the loss scratches' mask sums and active counts, the wind4 N). From
+  them, each producer's worst per-voxel value:
+  - mask weight <= 2 x packed-weight x verso-weight, |residual| <= 1, the positive weight, dice 1.25 / recall 0.25 terms, MIL <= 8 rays a voxel.
+  - s = 2^floor(log2(2^9 / max)), clamped to [1, 2^30].
+  - The coarse planes (the adjoint sums 64 voxels a cell) then stay <= 2^15 < 65504.
+- **Limits:**
+  - s is 1 outside the unwrap2 head-slab gradient pass with 16-bit gradients, and with --pgrad-lambda / --fib-normal-lambda (unbounded
+    here), the --ssl heads and the whole-head --lat path.
+  - One sparse channel (a few hundred supervised voxels) caps s for the whole window; per-channel scales would lift that (later).
+  - A MIL voxel hit by more than 8 rays x the 2^6 headroom could overflow. The non-finite-gradient guard then skips the step.
+- **Tests:** test_hgscale.
+  - wind4 at N 1e8: the s 1 dead zone exists, and s 2^20 loses no gradient and stays within fp16 rounding of fp32.
+  - wind4 at N 1e3: exact x s.
+  - fstem bwd: s planes == s 1 bytes.
+  - nn_head_bwd_z 256 -> 160 (the latent head's path) and 32 -> 16 (fused): gw / gb / MX gx bytes equal.
+  - The zero-gradient fraction before / after from try6's snap (--det, lr 0) and the wind4-acc A/B are perf2's, in the mega test pass.
+
 ## Unroll audit fixes #7b, #13-#17: silent failures made loud (2026-11-14, branch unrollfix-wg-20261114)
 
 Items of /vesuvius/ufsm/audit-20261114/unroll.md. All default on. Tests: test_checkpoint_runtime, test_render_absent and test_strip

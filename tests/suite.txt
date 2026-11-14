@@ -255,6 +255,7 @@ test_mx4_wide                                  | gpu          |    12 | UFSM_TES
 test_mx4_wide~full                             | gpu,slow     |    40 | ./$B/test_mx4_wide
 test_mx4~wideall                               | gpu          |    10 | TMX4_WIDE_ALL=1 ./$B/test_mx4
 test_head_tc                                   | gpu,smoke    |     3 | UFSM_TEST_QUICK=1 ./$B/test_head_tc
+test_hgscale                                   | gpu          |     3 | ./$B/test_hgscale
 test_grad_mx4                                  | gpu,smoke    |    12 | ./$B/test_grad_mx4
 test_l3_sched                                  | gpu          |     9 | ./$B/test_l3_sched
 test_grad_mx4~L0_NORM=1                        | gpu          |    10 | UFSM_L0_NORM=1 ./$B/test_grad_mx4

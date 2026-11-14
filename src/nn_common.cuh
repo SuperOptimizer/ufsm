@@ -89,6 +89,8 @@ extern "C" int nn_exec_manifest(char *buf, size_t n);
 extern "C" int nn_get_f16(void);
 #define LPDT(flag) ((flag) ? (g_h16 ? 2 : 1) : 0)   /* storage code of the lp_* (nn_fp8.cu) entry points: 0 fp32, 1 bf16, 2 fp16 */
 extern float g_gscale;
+extern thread_local float g_hgs;   /* nn_set_head_gscale: the head-gradient plane scale (1 outside the head's gradient pass) */
+#define GSH (g_gscale * g_hgs)     /* the loss-gradient producers' scale: the gradient scale x the head plane scale */
 extern "C" void nn_set_grad_scale(float s);
 extern "C" float nn_get_grad_scale(void);
 extern int g_gradbf;

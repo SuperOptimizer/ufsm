@@ -1046,8 +1046,8 @@ extern "C" void nn_lat_fuse_grad(const void *lg, int lh16, int lq0, int lqd, int
     if (z0 % 4 || nz % 4 || n > 7 || (guide && n != 2)) { fprintf(stderr, "nn_lat_fuse_grad: whole coarse planes, at most 7 channels (a guided pair: 2)\n"); abort(); }
     fuse_lam L; for (int k = 0; k < 7; k++) L.v[k] = k < n ? lam[k] : 1.f;
     const int nk = guide ? 7 : n; const size_t ncs = (size_t)(nz / 4) * h * w;
-    if (lh16) lat_fuse_k<f16><<<nblk(ncs, 128), 128>>>((const f16 *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, st, pw, g_gscale, rec_w, unit_c, L, part, ds, g_fsum_lo, g_fsum_hi);
-    else lat_fuse_k<float><<<nblk(ncs, 128), 128>>>((const float *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, st, pw, g_gscale, rec_w, unit_c, L, part, ds, g_fsum_lo, g_fsum_hi);
+    if (lh16) lat_fuse_k<f16><<<nblk(ncs, 128), 128>>>((const f16 *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, st, pw, GSH, rec_w, unit_c, L, part, ds, g_fsum_lo, g_fsum_hi);
+    else lat_fuse_k<float><<<nblk(ncs, 128), 128>>>((const float *)lg, lqd, lq0, d, h, w, z0, nz, c0, n, guide, gb, (const f16 *)x, t, m, wch, st, pw, GSH, rec_w, unit_c, L, part, ds, g_fsum_lo, g_fsum_hi);
     const int a0 = max(z0 / 4 - 1, 0), a1 = min((z0 + nz) / 4 + 1, d);
     lat_fuse_fin_k<<<nblk((size_t)(a1 - a0) * h * w * nk, 256), 256>>>(part, nk, d, h, w, z0, nz, a0, a1, gc, gq0, gqd, c0, guide ? gb : -1);
     KCHECK();
