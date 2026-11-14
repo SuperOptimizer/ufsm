@@ -214,6 +214,29 @@ int main(void) {
         free(b1); free(b2); free(b3); nn_free(x); nn_free(y1); nn_free(y2); nn_free(y3);
         free(a); free(b); free(hw); free(hm); free(ht); free(hgy); nn_free(w); nn_free(wt); nn_free(gy); nn_free(gx1); nn_free(gx2);
     }
+    {   /* nn_mask24x (the mid-run switch): the ramp factor on the pruned weights, the keep bytes (written from w, then applied to another
+           array whose magnitudes would pick other pairs), aux zeroed where pruned, the kept-energy report; modes 2 and 3 */
+        const int Co = 64, Ci = 96; const size_t nw = (size_t)Co * Ci * 27, nk = nw / 8;
+        float *hw = malloc(nw * 4), *hm = malloc(nw * 4), *ho = malloc(nw * 4), *h2 = malloc(nw * 4);
+        for (size_t i = 0; i < nw; i++) { hw[i] = frand(); h2[i] = frand() + 3.f; }
+        float *w = nn_malloc(nw * 4), *o = nn_malloc(nw * 4), *w2 = nn_malloc(nw * 4); uint8_t *kb = nn_malloc(nk); double *e2 = nn_malloc(16);
+        nn_h2d(w, hw, nw * 4);
+        for (int mode = 2; mode <= 3; mode++) {
+            nn_mask24m(w, o, Co, Ci, 27, mode); nn_d2h(hm, o, nw * 4);
+            nn_mask24x(w, o, 0.25f, nullptr, nullptr, Co, Ci, 27, mode, nullptr, 0); nn_d2h(ho, o, nw * 4);
+            int okr = 1; for (size_t i = 0; i < nw; i++) if (ho[i] != (hm[i] != 0.f ? hw[i] : 0.25f * hw[i])) okr = 0;
+            nn_zero(e2, 16); nn_mask24x(w, nullptr, 0.f, nullptr, e2, Co, Ci, 27, mode, kb, 0);
+            double he[2] = {0, 0}, de[2]; for (size_t i = 0; i < nw; i++) { he[0] += (double)hw[i] * hw[i]; if (hm[i] != 0.f) he[1] += (double)hw[i] * hw[i]; }
+            nn_d2h(de, e2, 16);
+            nn_h2d(w2, h2, nw * 4); nn_mask24x(w2, nullptr, 0.f, w2, nullptr, Co, Ci, 27, mode, kb, 1); nn_d2h(ho, w2, nw * 4);
+            int okk = 1; for (size_t i = 0; i < nw; i++) if (ho[i] != (hm[i] != 0.f ? h2[i] : 0.f)) okk = 0;
+            char nm[128];
+            snprintf(nm, sizeof nm, "nn_mask24x mode %d: pruned x r (ramp)", mode); check(nm, okr);
+            snprintf(nm, sizeof nm, "nn_mask24x mode %d: kept energy %.4f (host %.4f)", mode, de[1] / de[0], he[1] / he[0]); check(nm, fabs(de[0] - he[0]) < 1e-6 * he[0] && fabs(de[1] - he[1]) < 1e-6 * he[0]);
+            snprintf(nm, sizeof nm, "nn_mask24x mode %d: keep bytes from w applied to another array (aux)", mode); check(nm, okk);
+        }
+        free(hw); free(hm); free(ho); free(h2); nn_free(w); nn_free(o); nn_free(w2); nn_free(kb); nn_free(e2);
+    }
     {   /* unmasked weights: the prep must count truncated groups */
         shape5 xs = {1, 128, 4, 8, 16}, ys = {1, 64, 4, 8, 16};
         const size_t nx = shape_numel(xs), nw = (size_t)64 * 128 * 27;
