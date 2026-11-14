@@ -110,18 +110,7 @@ ufsm_exe(test_fit_lat SUITE tests/test_fit_lat.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_fit_w4 SUITE tests/test_fit_w4.c OBJS fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_flatten SUITE tests/test_flatten.c OBJS flatten imgops jpegpar tiffw tiff LIBS LDLIBS)
 ufsm_exe(test_flatten_gpu SUITE tests/test_flatten.c OBJS flatten imgops jpegpar tiffw tiff nn_flat LIBS LDLIBS CUDA DEFS FLAT_GPU)
-ufsm_exe(test_formats SUITE tests/test_formats.c OBJS json checkpoint sheet store zarr3 sources sample scannorm band ct_augment scan_augment
-         spatial_augment crush scrollaug cover zarr2 tiff z3w hf ingest zipr train restore restore_cli unet split predict sweep eval fit
-         tiffw edt votes wind fuse phase_check band_onfly surf stitch coreline coreline_check fit_ct l1pot fblend sheetpbr regmap vcgpu
-         deform vwt_aug zcache dcache inkblend ftaxis inkseam render imgops jpegpar inkcompare repack fieldspack inkgate wload inkext
-         inkext_net dinovol dinovol_net dino surfeval villawind villawind_net vwt_net vwt_train vwt_tile vwt_infer wtrunk vwt_stitch
-         phasevis vwt_mv inksplat hercuvit hercuvit_net ink3dext ink3dext_net surfrecto surfrecto_net tfx annot annot_export embz fit_emb
-         embpca embcalib sample_emb vwt_sample raycheck patchraster hiresphase fitjoin wrapcheck phasegate ctcal fieldsoracle packmap
-         fielddiag fieldsphase scanprep pairacc wbench wrapsnap surflabels sheetscore phasecoh patchsolve tracebox sheettrace sideface
-         sidegate geomcheck patchid rectoruler rectocls rectosp view reg reg_cli reg_view reg_init reg_render reg_ink srpairs srpair
-         storebench phasepack meshcodes afv fibercheck fitphase wrapdump fiberjudge fibertrace fiberraster fiberlink fibregscore countfield
-         countanat flatten faces faces_cli sheetcut strip stripdistort wraprepair latfit lc_cli latvol latvol_cli latvol_read surfcomp NN LP
-         LIBS LDLIBS CUDA)
+ufsm_exe(test_formats SUITE tests/test_formats.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fstem SUITE tests/test_fstem.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_ftrace_gpu SUITE tests/test_ftrace_gpu.c OBJS ftaxis nn_ftrace LIBS m CUDA INC CUDA)
 ufsm_exe(test_fuse SUITE tests/test_fuse.c src/fuse.c LIBS m DEPS)
@@ -153,68 +142,13 @@ ufsm_exe(test_imgops SUITE tests/test_imgops.c OBJS imgops jpegpar tiffw tiff LI
 ufsm_exe(test_infer_buffers SUITE tests/test_infer_buffers.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_infer_mem SUITE tests/test_infer_mem.c OBJS unet split NN LP LIBS m CUDA)
 ufsm_exe(test_init_lr SUITE tests/test_init_lr.c OBJS unet NN LP LIBS LDLIBS CUDA)
-ufsm_exe(test_ink_air SUITE tests/test_ink_air.c OBJS json checkpoint sheet store zarr3 sources sample scannorm band ct_augment scan_augment
-         spatial_augment crush scrollaug cover zarr2 tiff z3w hf ingest zipr train restore restore_cli unet split predict sweep eval fit
-         tiffw edt votes wind fuse phase_check band_onfly surf stitch coreline coreline_check fit_ct l1pot fblend sheetpbr regmap vcgpu
-         deform vwt_aug zcache dcache inkblend ftaxis inkseam render imgops jpegpar inkcompare repack fieldspack inkgate wload inkext
-         inkext_net dinovol dinovol_net dino surfeval villawind villawind_net vwt_net vwt_train vwt_tile vwt_infer wtrunk vwt_stitch
-         phasevis vwt_mv inksplat hercuvit hercuvit_net ink3dext ink3dext_net surfrecto surfrecto_net tfx annot annot_export embz fit_emb
-         embpca embcalib sample_emb vwt_sample raycheck patchraster hiresphase fitjoin wrapcheck phasegate ctcal fieldsoracle packmap
-         fielddiag fieldsphase scanprep pairacc wbench wrapsnap surflabels sheetscore phasecoh patchsolve tracebox sheettrace sideface
-         sidegate geomcheck patchid rectoruler rectocls rectosp view reg reg_cli reg_view reg_init reg_render reg_ink srpairs srpair
-         storebench phasepack meshcodes afv fibercheck fitphase wrapdump fiberjudge fibertrace fiberraster fiberlink fibregscore countfield
-         countanat flatten faces faces_cli sheetcut strip stripdistort wraprepair latfit lc_cli latvol latvol_cli latvol_read surfcomp NN LP
-         LIBS LDLIBS CUDA)
+ufsm_exe(test_ink_air SUITE tests/test_ink_air.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_ink_gate SUITE tests/test_ink_gate.c OBJS inkgate json zarr3 store z3w LIBS LDLIBS)
-ufsm_exe(test_ink_mil SUITE tests/test_ink_mil.c OBJS json checkpoint sheet store zarr3 sources sample scannorm band ct_augment scan_augment
-         spatial_augment crush scrollaug cover zarr2 tiff z3w hf ingest zipr train restore restore_cli unet split predict sweep eval fit
-         tiffw edt votes wind fuse phase_check band_onfly surf stitch coreline coreline_check fit_ct l1pot fblend sheetpbr regmap vcgpu
-         deform vwt_aug zcache dcache inkblend ftaxis inkseam render imgops jpegpar inkcompare repack fieldspack inkgate wload inkext
-         inkext_net dinovol dinovol_net dino surfeval villawind villawind_net vwt_net vwt_train vwt_tile vwt_infer wtrunk vwt_stitch
-         phasevis vwt_mv inksplat hercuvit hercuvit_net ink3dext ink3dext_net surfrecto surfrecto_net tfx annot annot_export embz fit_emb
-         embpca embcalib sample_emb vwt_sample raycheck patchraster hiresphase fitjoin wrapcheck phasegate ctcal fieldsoracle packmap
-         fielddiag fieldsphase scanprep pairacc wbench wrapsnap surflabels sheetscore phasecoh patchsolve tracebox sheettrace sideface
-         sidegate geomcheck patchid rectoruler rectocls rectosp view reg reg_cli reg_view reg_init reg_render reg_ink srpairs srpair
-         storebench phasepack meshcodes afv fibercheck fitphase wrapdump fiberjudge fibertrace fiberraster fiberlink fibregscore countfield
-         countanat flatten faces faces_cli sheetcut strip stripdistort wraprepair latfit lc_cli latvol latvol_cli latvol_read surfcomp NN LP
-         LIBS LDLIBS CUDA)
+ufsm_exe(test_ink_mil SUITE tests/test_ink_mil.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_ink_mil_check SUITE tests/test_ink_mil_check.c OBJS z3w tiffw LIBS LDLIBS DEPS ufsm make_wind_fixture)
-ufsm_exe(test_ink_mil_train SUITE tests/test_ink_mil_train.c OBJS json checkpoint sheet store zarr3 sources sample scannorm band ct_augment
-         scan_augment spatial_augment crush scrollaug cover zarr2 tiff z3w hf ingest zipr train restore restore_cli unet split predict sweep
-         eval fit tiffw edt votes wind fuse phase_check band_onfly surf stitch coreline coreline_check fit_ct l1pot fblend sheetpbr regmap
-         vcgpu deform vwt_aug zcache dcache inkblend ftaxis inkseam render imgops jpegpar inkcompare repack fieldspack inkgate wload inkext
-         inkext_net dinovol dinovol_net dino surfeval villawind villawind_net vwt_net vwt_train vwt_tile vwt_infer wtrunk vwt_stitch
-         phasevis vwt_mv inksplat hercuvit hercuvit_net ink3dext ink3dext_net surfrecto surfrecto_net tfx annot annot_export embz fit_emb
-         embpca embcalib sample_emb vwt_sample raycheck patchraster hiresphase fitjoin wrapcheck phasegate ctcal fieldsoracle packmap
-         fielddiag fieldsphase scanprep pairacc wbench wrapsnap surflabels sheetscore phasecoh patchsolve tracebox sheettrace sideface
-         sidegate geomcheck patchid rectoruler rectocls rectosp view reg reg_cli reg_view reg_init reg_render reg_ink srpairs srpair
-         storebench phasepack meshcodes afv fibercheck fitphase wrapdump fiberjudge fibertrace fiberraster fiberlink fibregscore countfield
-         countanat flatten faces faces_cli sheetcut strip stripdistort wraprepair latfit lc_cli latvol latvol_cli latvol_read surfcomp NN LP
-         LIBS LDLIBS CUDA DEPS ufsm make_wind_fixture)
-ufsm_exe(test_ink_pool SUITE tests/test_ink_pool.c OBJS json checkpoint sheet store zarr3 sources sample scannorm band ct_augment
-         scan_augment spatial_augment crush scrollaug cover zarr2 tiff z3w hf ingest zipr train restore restore_cli unet split predict sweep
-         eval fit tiffw edt votes wind fuse phase_check band_onfly surf stitch coreline coreline_check fit_ct l1pot fblend sheetpbr regmap
-         vcgpu deform vwt_aug zcache dcache inkblend ftaxis inkseam render imgops jpegpar inkcompare repack fieldspack inkgate wload inkext
-         inkext_net dinovol dinovol_net dino surfeval villawind villawind_net vwt_net vwt_train vwt_tile vwt_infer wtrunk vwt_stitch
-         phasevis vwt_mv inksplat hercuvit hercuvit_net ink3dext ink3dext_net surfrecto surfrecto_net tfx annot annot_export embz fit_emb
-         embpca embcalib sample_emb vwt_sample raycheck patchraster hiresphase fitjoin wrapcheck phasegate ctcal fieldsoracle packmap
-         fielddiag fieldsphase scanprep pairacc wbench wrapsnap surflabels sheetscore phasecoh patchsolve tracebox sheettrace sideface
-         sidegate geomcheck patchid rectoruler rectocls rectosp view reg reg_cli reg_view reg_init reg_render reg_ink srpairs srpair
-         storebench phasepack meshcodes afv fibercheck fitphase wrapdump fiberjudge fibertrace fiberraster fiberlink fibregscore countfield
-         countanat flatten faces faces_cli sheetcut strip stripdistort wraprepair latfit lc_cli latvol latvol_cli latvol_read surfcomp NN LP
-         LIBS LDLIBS CUDA)
-ufsm_exe(test_ink_splat SUITE tests/test_ink_splat.c OBJS json checkpoint sheet store zarr3 sources sample scannorm band ct_augment
-         scan_augment spatial_augment crush scrollaug cover zarr2 tiff z3w hf ingest zipr train restore restore_cli unet split predict sweep
-         eval fit tiffw edt votes wind fuse phase_check band_onfly surf stitch coreline coreline_check fit_ct l1pot fblend sheetpbr regmap
-         vcgpu deform vwt_aug zcache dcache inkblend ftaxis inkseam render imgops jpegpar inkcompare repack fieldspack inkgate wload inkext
-         inkext_net dinovol dinovol_net dino surfeval villawind villawind_net vwt_net vwt_train vwt_tile vwt_infer wtrunk vwt_stitch
-         phasevis vwt_mv inksplat hercuvit hercuvit_net ink3dext ink3dext_net surfrecto surfrecto_net tfx annot annot_export embz fit_emb
-         embpca embcalib sample_emb vwt_sample raycheck patchraster hiresphase fitjoin wrapcheck phasegate ctcal fieldsoracle packmap
-         fielddiag fieldsphase scanprep pairacc wbench wrapsnap surflabels sheetscore phasecoh patchsolve tracebox sheettrace sideface
-         sidegate geomcheck patchid rectoruler rectocls rectosp view reg reg_cli reg_view reg_init reg_render reg_ink srpairs srpair
-         storebench phasepack meshcodes afv fibercheck fitphase wrapdump fiberjudge fibertrace fiberraster fiberlink fibregscore countfield
-         countanat flatten faces faces_cli sheetcut strip stripdistort wraprepair latfit lc_cli latvol latvol_cli latvol_read surfcomp NN LP
-         LIBS LDLIBS CUDA)
+ufsm_exe(test_ink_mil_train SUITE tests/test_ink_mil_train.c OBJS CORE NN LP LIBS LDLIBS CUDA DEPS ufsm make_wind_fixture)
+ufsm_exe(test_ink_pool SUITE tests/test_ink_pool.c OBJS CORE NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_ink_splat SUITE tests/test_ink_splat.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_jpegpar SUITE tests/test_jpegpar.c OBJS jpegpar imgops tiffw tiff LIBS LDLIBS)
 ufsm_exe(test_json SUITE tests/test_json.c OBJS json LIBS LDLIBS)
 ufsm_exe(test_l0_norm SUITE tests/test_l0_norm.c OBJS unet NN LP LIBS m CUDA)
@@ -229,18 +163,7 @@ ufsm_exe(test_lathead SUITE tests/test_lathead.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_latvol SUITE tests/test_latvol.c OBJS latvol nn_latvol LIBS LDLIBS CUDA INC CUDA)
 ufsm_exe(test_latvol_nolink SUITE tests/test_latvol_nolink.c OBJS store zarr3 json LIBS LDLIBS)
 ufsm_exe(test_lldec SUITE tests/test_lldec.c OBJS band_onfly fuse band edt nn_band z3w zarr3 store json LIBS LDLIBS CUDA)
-ufsm_exe(test_mesh_phase SUITE tests/test_mesh_phase.c OBJS json checkpoint sheet store zarr3 sources sample scannorm band ct_augment
-         scan_augment spatial_augment crush scrollaug cover zarr2 tiff z3w hf ingest zipr train restore restore_cli unet split predict sweep
-         eval fit tiffw edt votes wind fuse phase_check band_onfly surf stitch coreline coreline_check fit_ct l1pot fblend sheetpbr regmap
-         vcgpu deform vwt_aug zcache dcache inkblend ftaxis inkseam render imgops jpegpar inkcompare repack fieldspack inkgate wload inkext
-         inkext_net dinovol dinovol_net dino surfeval villawind villawind_net vwt_net vwt_train vwt_tile vwt_infer wtrunk vwt_stitch
-         phasevis vwt_mv inksplat hercuvit hercuvit_net ink3dext ink3dext_net surfrecto surfrecto_net tfx annot annot_export embz fit_emb
-         embpca embcalib sample_emb vwt_sample raycheck patchraster hiresphase fitjoin wrapcheck phasegate ctcal fieldsoracle packmap
-         fielddiag fieldsphase scanprep pairacc wbench wrapsnap surflabels sheetscore phasecoh patchsolve tracebox sheettrace sideface
-         sidegate geomcheck patchid rectoruler rectocls rectosp view reg reg_cli reg_view reg_init reg_render reg_ink srpairs srpair
-         storebench phasepack meshcodes afv fibercheck fitphase wrapdump fiberjudge fibertrace fiberraster fiberlink fibregscore countfield
-         countanat flatten faces faces_cli sheetcut strip stripdistort wraprepair latfit lc_cli latvol latvol_cli latvol_read surfcomp NN LP
-         LIBS LDLIBS CUDA DEPS ufsm)
+ufsm_exe(test_mesh_phase SUITE tests/test_mesh_phase.c OBJS CORE NN LP LIBS LDLIBS CUDA DEPS ufsm)
 ufsm_exe(test_muon SUITE tests/test_muon.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_muonc SUITE tests/test_muonc.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_muonx SUITE tests/test_muonx.c OBJS NN LP LIBS m CUDA)
@@ -285,18 +208,7 @@ ufsm_exe(test_recompute_live SUITE tests/test_recompute_live.c OBJS unet NN LP L
 ufsm_exe(test_recto SUITE tests/test_recto.c OBJS rectoruler rectocls rectosp reg fit fit_emb embz z3w fit_ct l1pot coreline json zarr3
          zarr2 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_reg SUITE tests/test_reg.c OBJS reg reg_init zarr3 zarr2 store json LIBS LDLIBS)
-ufsm_exe(test_reg_render SUITE tests/test_reg_render.c OBJS json checkpoint sheet store zarr3 sources sample scannorm band ct_augment
-         scan_augment spatial_augment crush scrollaug cover zarr2 tiff z3w hf ingest zipr train restore restore_cli unet split predict sweep
-         eval fit tiffw edt votes wind fuse phase_check band_onfly surf stitch coreline coreline_check fit_ct l1pot fblend sheetpbr regmap
-         vcgpu deform vwt_aug zcache dcache inkblend ftaxis inkseam render imgops jpegpar inkcompare repack fieldspack inkgate wload inkext
-         inkext_net dinovol dinovol_net dino surfeval villawind villawind_net vwt_net vwt_train vwt_tile vwt_infer wtrunk vwt_stitch
-         phasevis vwt_mv inksplat hercuvit hercuvit_net ink3dext ink3dext_net surfrecto surfrecto_net tfx annot annot_export embz fit_emb
-         embpca embcalib sample_emb vwt_sample raycheck patchraster hiresphase fitjoin wrapcheck phasegate ctcal fieldsoracle packmap
-         fielddiag fieldsphase scanprep pairacc wbench wrapsnap surflabels sheetscore phasecoh patchsolve tracebox sheettrace sideface
-         sidegate geomcheck patchid rectoruler rectocls rectosp view reg reg_cli reg_view reg_init reg_render reg_ink srpairs srpair
-         storebench phasepack meshcodes afv fibercheck fitphase wrapdump fiberjudge fibertrace fiberraster fiberlink fibregscore countfield
-         countanat flatten faces faces_cli sheetcut strip stripdistort wraprepair latfit lc_cli latvol latvol_cli latvol_read surfcomp NN LP
-         LIBS LDLIBS CUDA)
+ufsm_exe(test_reg_render SUITE tests/test_reg_render.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_regz2 SUITE tests/test_regz2.c OBJS reg zarr3 zarr2 store json LIBS LDLIBS)
 ufsm_exe(test_render_fill SUITE tests/test_render_fill.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json LIBS LDLIBS)
 ufsm_exe(test_render_fill_gpu SUITE tests/test_render_fill.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json nn_render
@@ -311,18 +223,7 @@ ufsm_exe(test_repair SUITE tests/test_repair.c OBJS fit fit_emb embz z3w fit_ct 
 ufsm_exe(test_replay_lean SUITE tests/test_replay_lean.c OBJS sample scannorm edt band sheet ct_augment scan_augment spatial_augment crush
          scrollaug cover json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb
          embz NN LP LIBS LDLIBS CUDA)
-ufsm_exe(test_restore_task SUITE tests/test_restore_task.c OBJS json checkpoint sheet store zarr3 sources sample scannorm band ct_augment
-         scan_augment spatial_augment crush scrollaug cover zarr2 tiff z3w hf ingest zipr train restore restore_cli unet split predict sweep
-         eval fit tiffw edt votes wind fuse phase_check band_onfly surf stitch coreline coreline_check fit_ct l1pot fblend sheetpbr regmap
-         vcgpu deform vwt_aug zcache dcache inkblend ftaxis inkseam render imgops jpegpar inkcompare repack fieldspack inkgate wload inkext
-         inkext_net dinovol dinovol_net dino surfeval villawind villawind_net vwt_net vwt_train vwt_tile vwt_infer wtrunk vwt_stitch
-         phasevis vwt_mv inksplat hercuvit hercuvit_net ink3dext ink3dext_net surfrecto surfrecto_net tfx annot annot_export embz fit_emb
-         embpca embcalib sample_emb vwt_sample raycheck patchraster hiresphase fitjoin wrapcheck phasegate ctcal fieldsoracle packmap
-         fielddiag fieldsphase scanprep pairacc wbench wrapsnap surflabels sheetscore phasecoh patchsolve tracebox sheettrace sideface
-         sidegate geomcheck patchid rectoruler rectocls rectosp view reg reg_cli reg_view reg_init reg_render reg_ink srpairs srpair
-         storebench phasepack meshcodes afv fibercheck fitphase wrapdump fiberjudge fibertrace fiberraster fiberlink fibregscore countfield
-         countanat flatten faces faces_cli sheetcut strip stripdistort wraprepair latfit lc_cli latvol latvol_cli latvol_read surfcomp NN LP
-         LIBS LDLIBS CUDA)
+ufsm_exe(test_restore_task SUITE tests/test_restore_task.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_robust SUITE tests/test_robust.c OBJS packmap z3w zarr3 store json NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_rungs SUITE tests/test_rungs.c OBJS sample scannorm sample_emb embz edt band sheet ct_augment scan_augment spatial_augment
          crush scrollaug cover sources band_onfly fuse fiberraster afv reg regmap zarr2 srpair view zarr3 store json z3w tiff zipr hf NN LP
@@ -374,18 +275,7 @@ ufsm_exe(test_surf SUITE tests/test_surf.c OBJS surf stitch z3w fit fit_emb embz
 ufsm_exe(test_surflabels SUITE tests/test_surflabels.c OBJS surflabels phasecoh pairacc tfx surfcomp tiffw scannorm edt band sheet
          ct_augment scan_augment spatial_augment crush scrollaug cover json store zarr3 sources band_onfly fuse fiberraster afv regmap
          srpair zarr2 tiff z3w hf zipr view reg sample_emb embz NN LP LIBS LDLIBS CUDA)
-ufsm_exe(test_sweep SUITE tests/test_sweep.c OBJS json checkpoint sheet store zarr3 sources sample scannorm band ct_augment scan_augment
-         spatial_augment crush scrollaug cover zarr2 tiff z3w hf ingest zipr train restore restore_cli unet split predict sweep eval fit
-         tiffw edt votes wind fuse phase_check band_onfly surf stitch coreline coreline_check fit_ct l1pot fblend sheetpbr regmap vcgpu
-         deform vwt_aug zcache dcache inkblend ftaxis inkseam render imgops jpegpar inkcompare repack fieldspack inkgate wload inkext
-         inkext_net dinovol dinovol_net dino surfeval villawind villawind_net vwt_net vwt_train vwt_tile vwt_infer wtrunk vwt_stitch
-         phasevis vwt_mv inksplat hercuvit hercuvit_net ink3dext ink3dext_net surfrecto surfrecto_net tfx annot annot_export embz fit_emb
-         embpca embcalib sample_emb vwt_sample raycheck patchraster hiresphase fitjoin wrapcheck phasegate ctcal fieldsoracle packmap
-         fielddiag fieldsphase scanprep pairacc wbench wrapsnap surflabels sheetscore phasecoh patchsolve tracebox sheettrace sideface
-         sidegate geomcheck patchid rectoruler rectocls rectosp view reg reg_cli reg_view reg_init reg_render reg_ink srpairs srpair
-         storebench phasepack meshcodes afv fibercheck fitphase wrapdump fiberjudge fibertrace fiberraster fiberlink fibregscore countfield
-         countanat flatten faces faces_cli sheetcut strip stripdistort wraprepair latfit lc_cli latvol latvol_cli latvol_read surfcomp NN LP
-         LIBS LDLIBS CUDA)
+ufsm_exe(test_sweep SUITE tests/test_sweep.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_sysinfo SUITE tests/test_sysinfo.c DEPS)
 ufsm_exe(test_target_erode SUITE tests/test_target_erode.c DEPS)
 ufsm_exe(test_tfx SUITE tests/test_tfx.c OBJS tfx imgops jpegpar tiffw tiff surfcomp LIBS LDLIBS)
