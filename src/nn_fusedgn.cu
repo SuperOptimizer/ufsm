@@ -1,5 +1,6 @@
 /* CUDA ops: fusedgn section of the former nn.cu */
 #include "nn_common.cuh"
+#include <mutex>
 
 int mx_up_w_ok(const float *x, const float *x2, int c_split, shape5 xs) {
     static int on = -1; if (on < 0) on = getenv("UFSM_MX_UP_W") ? atoi(getenv("UFSM_MX_UP_W")) : 1;
@@ -318,8 +319,10 @@ extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gam
         const int zsp = zs_on();
         const size_t Sw = gn_bwd_reduce(ds, scratch, NC, s.d, shape_spatial(s), ggamma, gbeta, s.n, s.c);
         if (getenv("UFSM_GNB_DUMP")) {   /* diagnostic: the finished per-channel backward sums (fp32, 2 per channel) of every MX GroupNorm backward, appended per split half (split A/Bs) */
+            static std::mutex mu; std::lock_guard<std::mutex> lk(mu);   /* mgpu: guarded (DP threads share slot -1 and its file) */
             const int sl = zsp ? zs_slot() : -1; char fn[1100]; snprintf(fn, sizeof fn, "%s.%d", getenv("UFSM_GNB_DUMP"), sl);
-            static int opened[16]; FILE *fo = fopen(fn, opened[sl + 1]++ ? "ab" : "wb");
+            static int opened[16];   /* mgpu: guarded (mu above) */
+            FILE *fo = fopen(fn, opened[sl + 1]++ ? "ab" : "wb");
             float *h = (float *)malloc((size_t)8 * NC); cudaDeviceSynchronize(); cudaMemcpy(h, scratch, (size_t)8 * NC, cudaMemcpyDeviceToHost);
             if (fo) { const int hd[2] = {NC, s.d}; fwrite(hd, 4, 2, fo); fwrite(h, 4, 2 * NC, fo); fclose(fo); } free(h);
             if (getenv("UFSM_GNB_TDUMP")) {   /* + x and gy as fp32 [c][d][h][w] (MX storage only) */

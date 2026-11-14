@@ -257,6 +257,11 @@ long unet_gn_ema_updates(const unet *u);
 /* data parallel: each replica pools only its own windows' statistics; the trainer averages these 2 ge_ns device floats over the replicas
    (exact: the running statistics are linear in the batch statistics, so the mean of the replicas' EMAs is the EMA of the mean) */
 float *unet_gn_ema_state(unet *u, size_t *n);
+/* --gn-ema under data parallel (train.c gn_ema_average): the replicas' host copies h[0..ng) of n floats averaged in place (double sums, so
+   every copy gets the same floats whatever the replica order); and whether a DP step averages: every step once the warm-up is reached (the
+   training forwards read the statistics), before it only at validation / checkpoint / last / stopping steps (the update is linear) */
+void unet_gn_ema_mean_host(float *const *h, int ng, size_t n);
+int unet_gn_ema_average_due(long updates, int warm, int step, int val_every, int ckpt_every, int steps, int stop);
 void unet_reserve(unet *u, int muon, int muon_tc);   /* the optimizer's / attention's lazily allocated device buffers now (before a memory plan) */
 size_t unet_ws_plan(unet *u, shape5 xs, size_t pre_budget, int reserve, size_t *pre_out);   /* the kernels' device workspaces for the last (dry) build's levels: bytes; reserve: allocate them on the current device now (2026-11-14 audit net#4) */
 void unet_set_l0_slab_kern(int on);   /* --l0-norm slab on the kernel path (readers apply per-slab statistics; 1) or D's prototype (0); -1: env UFSM_L0_SLAB_KERN */

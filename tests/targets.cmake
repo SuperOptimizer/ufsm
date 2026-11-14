@@ -127,6 +127,7 @@ ufsm_exe(test_geom_check SUITE tests/test_geom_check.c OBJS geomcheck sources ba
 ufsm_exe(test_gfilm SUITE tests/test_gfilm.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_gn_contract SUITE tests/test_gn_contract.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_gn_ema SUITE tests/test_gn_ema.c OBJS unet NN LP LIBS m CUDA)
+ufsm_exe(test_gn_ema_avg SUITE tests/test_gn_ema_avg.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_gn_frozen SUITE tests/test_gn_frozen.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_gpu_aug SUITE tests/test_gpu_aug.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush scrollaug cover
          json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb embz NN LP LIBS

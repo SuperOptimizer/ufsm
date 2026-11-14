@@ -15,28 +15,34 @@ static const float LOG2E = 1.4426950408889634f;
 /* ---- profiling (env UFSM_ATTN_PROF=1): cudaEvent time per phase of the blocks (synchronising: for measurement only), summed per
    label with the phase's FLOP / byte counts; at_prof_report prints the table (also at exit), at_prof_reset clears it ---- */
 typedef struct { const char *nm; double ms, fl, by; long n; } atpr;
-static atpr g_pr[64]; static int g_npr = 0; static cudaEvent_t g_pe[2];
+#include <mutex>
+static std::mutex g_pr_mu;   /* mgpu: guarded (the table: both GPU threads add to it) */
+static atpr g_pr[64]; static int g_npr = 0;   /* mgpu: guarded (g_pr_mu) */
+static thread_local cudaEvent_t t_pe[2]; static thread_local int t_pe_dev = -1;   /* (events of this thread's device: one host thread per GPU) */
 extern "C" void at_prof_report(FILE *f) {
+    std::lock_guard<std::mutex> l(g_pr_mu);
     double tot = 0; for (int i = 0; i < g_npr; i++) tot += g_pr[i].ms;
     if (!g_npr || tot <= 0) return;
     fprintf(f, "attention-stage profile (%.1f ms total)\n  %-14s %9s %6s %6s %8s %8s\n", tot, "phase", "ms", "%", "calls", "TFLOP/s", "GB/s");
     for (int i = 0; i < g_npr; i++) { const atpr *p = &g_pr[i];
         fprintf(f, "  %-14s %9.2f %6.1f %6ld %8.1f %8.0f\n", p->nm, p->ms, 100 * p->ms / tot, p->n, p->fl / (p->ms * 1e9), p->by / (p->ms * 1e6)); }
 }
-extern "C" void at_prof_reset(void) { g_npr = 0; }
+extern "C" void at_prof_reset(void) { std::lock_guard<std::mutex> l(g_pr_mu); g_npr = 0; }
 static void prof_exit(void) { at_prof_report(stderr); }
 static int prof_on(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("UFSM_ATTN_PROF"); v = e && atoi(e); if (v) { cudaEventCreate(&g_pe[0]); cudaEventCreate(&g_pe[1]); atexit(prof_exit); } }
+    static int v = -1;   /* mgpu: env */
+    if (v < 0) { const char *e = getenv("UFSM_ATTN_PROF"); v = e && atoi(e); if (v) atexit(prof_exit); }
+    if (v) { int d = 0; cudaGetDevice(&d); if (t_pe_dev != d) { if (t_pe_dev >= 0) { cudaEventDestroy(t_pe[0]); cudaEventDestroy(t_pe[1]); } cudaEventCreate(&t_pe[0]); cudaEventCreate(&t_pe[1]); t_pe_dev = d; } }
     return v;
 }
 static void pr_add(const char *nm, double ms, double fl, double by) {
+    std::lock_guard<std::mutex> l(g_pr_mu);
     int i = 0; while (i < g_npr && strcmp(g_pr[i].nm, nm)) i++;
     if (i == g_npr) { if (g_npr == 64) return; g_pr[g_npr++] = (atpr){nm, 0, 0, 0, 0}; }
     g_pr[i].ms += ms; g_pr[i].fl += fl; g_pr[i].by += by; g_pr[i].n++;
 }
-#define PR(nm, fl, by, ...) do { if (!prof_on()) { __VA_ARGS__; } else { cudaEventRecord(g_pe[0], 0); __VA_ARGS__; cudaEventRecord(g_pe[1], 0); cudaEventSynchronize(g_pe[1]); \
-    float ms_ = 0; cudaEventElapsedTime(&ms_, g_pe[0], g_pe[1]); pr_add(nm, ms_, (double)(fl), (double)(by)); } } while (0)
+#define PR(nm, fl, by, ...) do { if (!prof_on()) { __VA_ARGS__; } else { cudaEventRecord(t_pe[0], 0); __VA_ARGS__; cudaEventRecord(t_pe[1], 0); cudaEventSynchronize(t_pe[1]); \
+    float ms_ = 0; cudaEventElapsedTime(&ms_, t_pe[0], t_pe[1]); pr_add(nm, ms_, (double)(fl), (double)(by)); } } while (0)
 
 /* ---- GEMM: row-major C[M][N] = op(A) op(B) + beta C; A [M][K] (ta 0) or [K][M] (ta 1); B [K][N] (tb 0) or [N][K] (tb 1).
    cuBLASLt is column-major: C^T (N x M) = op(B)^T op(A)^T, so B is its first operand and A its second ---- */
