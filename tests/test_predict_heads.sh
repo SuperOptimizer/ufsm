@@ -111,6 +111,9 @@ for n in rv ink; do [ -s hr/$n/predict-done-9.6.txt ] || fail "no done log hr/$n
 grep -Eq 'shards in the box: [1-9][0-9]* already written \(--resume\)' hr2.log || fail "the --resume rerun skipped no shard ($D/hr2.log)"
 for n in rv ink; do cmpb h/$n hr/$n 0 || fail "$n: --resume rerun changed the store"; done
 "$U" predict s/last.ckpt fx ct gl "${P[@]}" --heads rv --gn-live 1 > gl.log 2>&1 && fail "--gn-live accepted on a net without --gn-ema"
+"$U" predict s/last.ckpt fx ct wr --um 9.6 --level 0 --shard 128 --levels 1 --threads 2 --q 0 --heads all --window 152 --halo 12 --window-round 1 > wr.log 2>&1 || fail "predict --window-round ($D/wr.log)"
+grep -q 'window 152 halo 12 -> 160 halo 16' wr.log || fail "--window-round: not 160 / 16 ($D/wr.log)"
+for n in rv ink; do cmpb h/$n wr/$n 0 || fail "$n: --window-round 152 / 12 differs from 160 / 16"; done
 # (2) plain latent net with the fibre head
 "$U" train fx/sources-fibhv.json --out fb "${C[@]}" --lat 4 --rv 2 --rv-iso 100 --fib-head 1 > fb.log 2>&1 || fail "train (2) ($D/fb.log)"
 "$U" predict fb/last.ckpt fx ct g "${P[@]}" --heads all > g.log 2>&1 || fail "predict --heads all, fibre ($D/g.log)"

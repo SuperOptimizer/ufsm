@@ -541,6 +541,7 @@ typedef struct {
     uint8_t *done;   /* the current slab's written field-shard rows [FZ / FS][ny] */
     char rowsf[1400];   /* <fit-zarr>/rows.done: "z0 z1" (field cells) appended per flushed slab: count-field --follow reads behind the predict */
     ffring rg;       /* the slab's layout (a ring of rows with row flushes) */
+    int64_t s0, s1;  /* --gpus workers (z layers): the slabs this process owns; the others' are never flushed here (their fill would overwrite) */
     /* row flushes on their own thread (half the CPUs), so the scatter of window chunks never waits for compression: a queue of
        kind-2 jobs; the slab flush (kind 1) waits for it to drain */
     pthread_t rth; ffw_job rq[FFW_Q]; int rqh, rqn, rbusy, rstop, rnt;
@@ -572,6 +573,7 @@ static void *ffw_main(void *arg) {
         const ffw_job j = W->q[W->qh]; W->qh = (W->qh + 1) % FFW_Q; W->qn--;
         pthread_cond_broadcast(&W->cv);
         pthread_mutex_unlock(&W->mu);
+        if (j.kind == 1 && (j.slab < W->s0 || j.slab >= W->s1)) continue;   /* (another worker's slab) */
         if (j.kind == 1) {   /* the slab is left: the row flusher drained, then the rows left (all CPUs) and the reset */
             const double t0 = now();
             pthread_mutex_lock(&W->mu); while (W->rqn || W->rbusy) pthread_cond_wait(&W->cv, &W->mu); pthread_mutex_unlock(&W->mu);
@@ -1344,6 +1346,7 @@ static int predict_one(int argc, char **argv) {
                         "       [--iso T]   probability outputs 0 where CT < T (the scan's void cutoff; the fit's material mask stays CT > 0)\n"
                         "       [--ema-blend A]   a x final weights + (1 - a) x EMA (tail-average blend, e.g. 0.35)\n"
                         "       [--gn-stats stored|legacy]   defaults to the checkpoint's normalization contract\n"
+                        "       [--window-round 1]   a --window the net's depth does not divide: widened to the next multiple, the halo grown to keep the interior\n"
                         "       [--gn-live 1]   gn_ema nets: each window's own GroupNorm statistics (the training-mode function) instead of the running ones\n"
                         "       [--reference reference.json]   required for a surface_winding checkpoint, native level 0\n"
                         "       [--grid-origin z,y,x]   anchor tile interiors in selected-level CT voxels, independent of the output box\n"
@@ -1549,8 +1552,8 @@ static int predict_one(int argc, char **argv) {
     const char *sweep_out = opt(argc, argv, "--cond-sweep", nullptr);   /* train --cond checkpoints: conditioned inference (src/sweep.h) */
     if (sweep_out && (cfg.cin != 7 || cfg.cout < 15 || half || sheet_task || ffd)) { fprintf(stderr, "predict: --cond-sweep needs a train --cond checkpoint (7 inputs, 15 outputs), no --fit-fields\n"); return 2; }
     { const char *gl = opt(argc, argv, "--gpus", nullptr);   /* --gpus a,b (workers, not --split): each would write (and fill) the whole field arrays */
-      if (ffd && gl && strchr(gl, ',') && !opt(argc, argv, "--split", nullptr)) {
-          fprintf(stderr, "predict: --gpus with --fit-zarr / --fit-fields is not supported (each worker writes the whole field set): run one predict per GPU on z-halves "
+      if (ffd && !ffz && gl && strchr(gl, ',') && !opt(argc, argv, "--split", nullptr)) {   /* (--fit-zarr: z-layer workers, below) */
+          fprintf(stderr, "predict: --gpus with --fit-fields is not supported (each worker would write the whole field set): --fit-zarr, or run one predict per GPU on z-halves "
                           "of the box (--grid-origin anchored) and join them with scripts/unroll/fields_cat.sh\n");
           return 2;
       } }
@@ -1575,7 +1578,14 @@ static int predict_one(int argc, char **argv) {
     const char *gn_stats = opt(argc, argv, "--gn-stats", embedded && runtime.gn_stored ? "stored" : "legacy");
     if (strcmp(gn_stats, "stored") && strcmp(gn_stats, "legacy")) { fprintf(stderr, "--gn-stats must be stored or legacy\n"); return 2; }
     nn_set_gn_stored(!strcmp(gn_stats, "stored"));
-    if (win_given && W % (hdiv << (cfg.nlev - 1))) { fprintf(stderr, "window must be divisible by %d\n", hdiv << (cfg.nlev - 1)); return 2; }   /* (the default is chosen below) */
+    /* --window-round 1 (audit 11-14 infer #8): a window the net's depth does not divide is widened to the next multiple and its halo grown by
+       half the difference, so the interior (the tile grid) stays: 544 / 16 -> 640 / 64 for a 6-level latent net (recipes written for u1) */
+    if (win_given && W % (hdiv << (cfg.nlev - 1)) && atoi(opt(argc, argv, "--window-round", "0")) && !*opt(argc, argv, "--window-z", "")) {
+        const int md_ = hdiv << (cfg.nlev - 1), W2 = (W + md_ - 1) / md_ * md_;
+        fprintf(stderr, "predict: --window-round: window %d halo %d -> %d halo %d (the net needs multiples of %d; interior %d kept)\n", W, halo, W2, halo + (W2 - W) / 2, md_, W - 2 * halo);
+        halo += (W2 - W) / 2; W = W2;
+    }
+    if (win_given && W % (hdiv << (cfg.nlev - 1))) { fprintf(stderr, "window must be divisible by %d (--window-round 1 widens it, keeping the interior)\n", hdiv << (cfg.nlev - 1)); return 2; }   /* (the default is chosen below) */
     const int override = *opt(argc, argv, "--prec", "") || *opt(argc, argv, "--fp4", "") || *opt(argc, argv, "--policy", "");
     int precision = *opt(argc, argv, "--prec", "") ? atoi(opt(argc, argv, "--prec", "1")) : embedded ? runtime.prec : 1;
     if (precision < 0 || precision > 4) { fprintf(stderr, "--prec must be 0..4\n"); return 2; }
@@ -1627,9 +1637,9 @@ static int predict_one(int argc, char **argv) {
        sub-cell term). UFSM_PRED_HEADS=0: the previous paths for the single output */
     const char *hspec = opt(argc, argv, "--heads", nullptr);
     phead_t PH[PHEAD_MAX]; int nph = 0;
-    const int lat_ok = half == 3 && hdiv == 4 && hmode == 1 && !ufsm_env_on("UFSM_PRED_HOSTPATH") && !fea && tta <= 1 && !split && !sheet_task && !slab && !sweep_out && nwork == 1 && cfg.cin != 5;
+    const int lat_ok = half == 3 && hdiv == 4 && hmode == 1 && !ufsm_env_on("UFSM_PRED_HOSTPATH") && !fea && tta <= 1 && !split && !sheet_task && !slab && !sweep_out && cfg.cin != 5;   /* (--gpus workers: z layers each, audit 11-14 infer #7) */
     if (hspec) {
-        if (!lat_ok) { fprintf(stderr, "predict --heads: latent-grid (train --lat 4) checkpoints on one GPU's device path (no --feather, --tta, --split, --window-z, --gpus workers)\n"); return 2; }
+        if (!lat_ok) { fprintf(stderr, "predict --heads: latent-grid (train --lat 4) checkpoints on one GPU's device path (no --feather, --tta, --split, --window-z)\n"); return 2; }
         char *h = checkpoint_header_line(ckpt); const int bad = phead_parse(hspec, h, &cfg, rv2c, PH, &nph); free(h);
         if (bad) return 2;
     } else if (lat_ok && (cfg.fstem || rv2c >= 0 || (cfg.lat_guide == 64 && !rvfuse && out_ch < 2)) && !atoi(opt(argc, argv, "--no-out", "0")) && (!getenv("UFSM_PRED_HEADS") || ufsm_env_on("UFSM_PRED_HEADS"))) {
@@ -1662,6 +1672,7 @@ static int predict_one(int argc, char **argv) {
     if (nwork > 1 && !box) { fprintf(stderr, "--gpus needs --box\n"); return 2; }
     if (sheet_task && ngpu>1) { fprintf(stderr,"winding export currently uses one GPU per output store\n"); return 2; }
     pid_t kids[8] = {0}; int is_child = 0;
+    if (nwork > 1 && ffz) { char rp[1400]; snprintf(rp, sizeof rp, "%s/rows.done", ffz); mkdir(ffz, 0755); FILE *rf = fopen(rp, "w"); if (rf) fclose(rf); }   /* (the workers append) */
     if (nwork > 1) {
         for (int i = 0; i < ngpu; i++) {
             pid_t c = fork();
@@ -1673,6 +1684,13 @@ static int predict_one(int argc, char **argv) {
             int bad = 0; for (int i = 0; i < ngpu; i++) { int st = 0; waitpid(kids[i], &st, 0); if (!WIFEXITED(st) || WEXITSTATUS(st)) bad = 1; }
             if (bad) { fprintf(stderr, "a predict worker failed\n"); return 1; }
             double um_l = um * (1 << level);
+            if (ffz) {   /* --fit-zarr: every worker wrote its z layers of the one field set and its own fields.json.w<k> (identical: the box's) */
+                char a[1400], b[1400]; snprintf(a, sizeof a, "%s/fields.json.w0", ffz); snprintf(b, sizeof b, "%s/fields.json", ffz);
+                if (rename(a, b)) { fprintf(stderr, "predict: %s: %s\n", a, strerror(errno)); return 1; }
+                for (int i = 1; i < ngpu; i++) { snprintf(a, sizeof a, "%s/fields.json.w%d", ffz, i); remove(a); }
+                snprintf(a, sizeof a, "%s/fields.partial.json", ffz); remove(a);
+                fprintf(stderr, "predict: fit fields written to %s (zarr, %d GPU workers)\n", ffz, ngpu);
+            }
             int64_t bn[3]; { long long v[6] = {0, 0, 0, 0, 0, 0}; const char *b = opt(argc, argv, "--box", nullptr); if (!b || sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) { fprintf(stderr, "--gpus needs --box\n"); return 1; } for (int d = 0; d < 3; d++) bn[d] = v[3 + d]; }
             if (atoi(opt(argc, argv, "--full-grid", "0"))) {   /* the pyramid of the whole grid */
                 store *ps = store_open(root); z3 *pz = ps ? pyramid_open_level(ps, key, level, um, opt(argc, argv, "--cache", nullptr)) : nullptr;
@@ -1681,6 +1699,19 @@ static int predict_one(int argc, char **argv) {
                 z3_close(pz); store_close(ps);
             }
             char attrs[4096]; snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"gpus\":%d,\"ema\":%d%s%s}}", content, ckpt, ngpu, use_ema, grid_attrs, input_attrs);
+            if (hspec) {   /* --heads: each head's store <out>/<name> (the main store holds nothing: removed) */
+                char lvn[32]; z3w_level_name(um_l, lvn, sizeof lvn);
+                for (int j = 0; j < nph; j++) {
+                    char hd[1400], ha[4096]; snprintf(hd, sizeof hd, "%s/%s", out, PH[j].name);
+                    snprintf(ha, sizeof ha, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"head\":\"%s\",\"channel\":%d,\"checkpoint\":\"%s\",\"gpus\":%d,\"ema\":%d%s%s}}",
+                             PH[j].content, PH[j].name, PH[j].c0, ckpt, ngpu, use_ema, grid_attrs, input_attrs);
+                    for (int l = 1; l < nlev; l++) if (pyramid_build_level(hd, um_l, l, bn, shard, q, 0, nthreads, ha)) return 1;
+                    if (pyramid_write_group(hd, um_l, nlev, "ufsm-recto", ha)) return 1;
+                }
+                char p0[1600]; snprintf(p0, sizeof p0, "%s/%s/zarr.json", out, lvn); unlink(p0); snprintf(p0, sizeof p0, "%s/%s", out, lvn); rmdir(p0);
+                fprintf(stderr, "predict: %d head stores under %s (%d GPUs)\n", nph, out, ngpu);
+                return 0;
+            }
             for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, bn, shard, q, 0, nthreads, attrs)) return 1;
             if (pyramid_write_group(out, um_l, nlev, "ufsm-recto", attrs)) return 1;
             fprintf(stderr, "wrote %s (%d GPUs)\n", out, ngpu);
@@ -1971,7 +2002,7 @@ static int predict_one(int argc, char **argv) {
     float *genc_rs = nullptr; uint16_t *genc_sc = nullptr; int genc_fma = 0;
     if (genc) { float rs[4096]; uint16_t sc[4096]; genc_fma = vcg_tables(q, rs, sc); genc_rs = nn_malloc(sizeof rs); genc_sc = nn_malloc(sizeof sc);
                 nn_h2d(genc_rs, rs, sizeof rs); nn_h2d(genc_sc, sc, sizeof sc); }
-    const int gpyr = lhm && nlev > 1 && !resume && (!fullg || seam2) && gpath && (!getenv("UFSM_PRED_GPU_PYR") || ufsm_env_on("UFSM_PRED_GPU_PYR")); size_t hab = WR.bytes;
+    const int gpyr = lhm && nlev > 1 && !resume && (!fullg || seam2) && gpath && nwork <= 1 && (!getenv("UFSM_PRED_GPU_PYR") || ufsm_env_on("UFSM_PRED_GPU_PYR")); size_t hab = WR.bytes;
     if (lhm) {   /* the heads' stores (--heads: <out>/<name>; one head: the main store), writers and device shards; the main writer writes nothing */
         /* --heads --resume (audit 11-14 infer #6): each head's writer logs its shards to <out>/<head>/predict-done-<lv>.txt; a shard is
            skipped when every requested head lists it (read below) */
@@ -2201,7 +2232,7 @@ static int predict_one(int argc, char **argv) {
     ffz_nb = ffz_np;
     if (ffct) { ffz_names[ffz_np++] = "ct"; ffz_names[ffz_np++] = "cs"; }
     z3w *ffzw[FFZ_MAXP] = {0}; uint8_t *ffsl[FFZ_MAXP] = {0}; const int FFS = 128; int FZ = FFS; int64_t ffslab = 0; uint8_t *ff8d = nullptr, *ff8h = nullptr; size_t ffwn = 0; int ffwc = 0, ffzc = 1;
-    static ffw_t ffw; ffw = (ffw_t){0}; pthread_t ffw_th; int ffw_on = 0, ffrow = 0, ffrk = 0; int64_t ffprow = -1;   /* row flushes: (super-)shard cells, the last row */
+    static ffw_t ffw; ffw = (ffw_t){0}; ffw.s0 = 0; ffw.s1 = INT64_MAX; pthread_t ffw_th; int ffw_on = 0, ffrow = 0, ffrk = 0; int64_t ffprow = -1;   /* row flushes: (super-)shard cells, the last row */
     if (ffd) {
         for (int d = 0; d < 3; d++) { ffbox[d] = (int)bn[d]; ffF[d] = (int)((bn[d] + ffh - 1) / ffh); }
         if (!ffzm) {   /* the whole box on the device */
@@ -2229,7 +2260,7 @@ static int predict_one(int argc, char **argv) {
                the whole last slab: 8 of 24 s for a 256 x 2048^2 box). One worker, a (super-)shard of whole field shards; UFSM_FIT_ROWFLUSH=0.
                With them the slab is a ring of 3 rows when a row is the slab's height (FZ = ffrk); UFSM_FIT_RING=0: the cross-section */
             ffrk = (kss > 1 ? kss * shard : shard) / ffh;
-            ffrow = nwork == 1 && !split && ffrk % FFS == 0 && !(getenv("UFSM_FIT_ROWFLUSH") && !atoi(getenv("UFSM_FIT_ROWFLUSH")));
+            ffrow = !split && ffrk % FFS == 0 && !(getenv("UFSM_FIT_ROWFLUSH") && !atoi(getenv("UFSM_FIT_ROWFLUSH")));
             const int ring = ffrow && FZ == ffrk && 3 * (int64_t)ffrk < ffF[1] && !(getenv("UFSM_FIT_RING") && !atoi(getenv("UFSM_FIT_RING")));
             ffw.rg = (ffring){.HZ = ffF[0] < FZ ? ffF[0] : FZ, .YR = ring ? ffrk : ffF[1], .NR = ring ? 3 : 1, .mu = &ffw.mu, .cv = &ffw.cv};
             ffw.rg.nRR = (ffF[1] + ffw.rg.YR - 1) / ffw.rg.YR; ffw.rg.own = malloc(sizeof(int64_t) * ffw.rg.NR);
@@ -2269,7 +2300,7 @@ static int predict_one(int argc, char **argv) {
                                                                                                                   two staging buffers (the fit writer thread) */
             if (!ffacc || !ff8d || !ff8h) { fprintf(stderr, "predict: no memory for the fit-field window accumulator\n"); return 1; }
             ffw.zw = ffzw; ffw.sl = ffsl; ffw.F = ffF; ffw.FS = FFS; ffw.FZ = FZ; ffw.gpu = gpu;
-            if (ffzm) { snprintf(ffw.rowsf, sizeof ffw.rowsf, "%s/rows.done", ffz); FILE *rf = fopen(ffw.rowsf, "w"); if (rf) fclose(rf);   /* (a resumed run starts over: no rows yet) */
+            if (ffzm) { snprintf(ffw.rowsf, sizeof ffw.rowsf, "%s/rows.done", ffz); FILE *rf = nwork > 1 ? nullptr : fopen(ffw.rowsf, "w"); if (rf) fclose(rf);   /* (a resumed run starts over: no rows yet) */
                         char p[1400]; snprintf(p, sizeof p, "%s/fields.partial.json", ffz); if (ffz_json(p, bo, bn, ffF, ffh, um * (1 << level), ffu2, ffw4d, &ax, level)) return 1; }
             ffw.done = calloc((size_t)(FZ / FFS) * ((ffF[1] + FFS - 1) / FFS), 1);
             if (!ffw.done) { fprintf(stderr, "predict: out of memory\n"); return 1; }
@@ -2305,6 +2336,29 @@ static int predict_one(int argc, char **argv) {
                 pthread_mutex_lock(&Wh->mu); Wh->nb = n2; pthread_mutex_unlock(&Wh->mu); }
             fprintf(stderr, "predict: %d head stores, %d shard buffers each (%.1f GB pinned)%s%s\n", nph, PH[0].wr->nb, nph * PH[0].wr->nb * (double)hab / 1e9, gpyr ? ", pyramids pooled on the GPU" : "", genc ? ", levels for the encoder from the GPU" : "");
         }
+    }
+    /* --gpus workers on the latent paths (--heads, --fit-zarr; audit 11-14 infer #7): data parallel over contiguous z layers of (super-)shards
+       instead of the round-robin deal, so every --fit-zarr field slab (FZ cells) belongs to one process; the layers are split by their
+       shards left to compute (air and --resume excluded), on units of the slab height (fields) or the window interior (heads) */
+    int64_t zl0 = 0, zl1 = ns[0];
+    const int zdeal = nwork > 1 && (lhm || ffzm) && !fea && !seam2;
+    if (zdeal) {
+        int64_t g = kss; if (ffzm) { const int64_t sv = (int64_t)FZ * ffh / shard; if (sv > g) g = sv; }
+        const int64_t nu = (ns[0] + g - 1) / g; double T = 0; double *wt = calloc((size_t)nu, sizeof *wt);
+        if (!wt) { fprintf(stderr, "predict: out of memory\n"); return 1; }
+        for (int64_t a = 0; a < ns[0]; a++) for (int64_t b = 0; b < ns[1] * ns[2]; b++) if (!sskip || !sskip[a * ns[1] * ns[2] + b]) { wt[a / g] += 1; T += 1; }
+        int64_t u0 = -1, u1 = nu; double c = 0;
+        for (int64_t k = 0; k < nu; k++) {   /* unit k goes to the worker whose share [w T / n, (w + 1) T / n) holds its midpoint */
+            const int w = T > 0 ? (int)fmin(ngpu - 1, floor((c + wt[k] / 2) * ngpu / T)) : (int)(k * ngpu / nu);
+            if (w == part && u0 < 0) u0 = k;
+            if (w > part) { u1 = k; break; }
+            c += wt[k];
+        }
+        free(wt);
+        if (u0 < 0) u0 = u1 = nu;   /* (nothing left for this worker) */
+        zl0 = u0 * g < ns[0] ? u0 * g : ns[0]; zl1 = u1 * g < ns[0] ? u1 * g : ns[0];
+        if (ffzm) { ffw.s0 = u0; ffw.s1 = u1; }
+        fprintf(stderr, "predict: gpu %d (worker %d of %d): shard layers %lld .. %lld of %lld\n", gpu, part, ngpu, (long long)zl0, (long long)zl1, (long long)ns[0]);
     }
     double t0 = now(); long ntiles = 0, nskip = 0;
     /* enumerate the tiles in shard order, then let the reader run ahead */
@@ -2370,7 +2424,7 @@ static int predict_one(int argc, char **argv) {
                 for (int64_t c = sx * kss; c < (sx + 1) * kss && c < ns[2]; c++) { const uint8_t e = sskip[(a * ns[1] + b) * ns[2] + c]; all &= e != 0; air &= e == 2; }
         } else all = air = 0;
         if (air) continue;
-        if (nwork > 1 && (nwq++ % ngpu) != part) continue;
+        if (zdeal ? sz * kss < zl0 || sz * kss >= zl1 : nwork > 1 && (nwq++ % ngpu) != part) continue;
         if (all) continue;
         if (rd.ntiles == cap) { cap = cap ? 2 * cap : 1024; rd.tiles = realloc(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
         rd.tiles[rd.ntiles++] = (tile_t){sz * stride - halo, sy * stride - halo, sx * stride - halo, (sz * nss[1] + sy) * nss[2] + sx, 0, 0};
@@ -2382,7 +2436,7 @@ static int predict_one(int argc, char **argv) {
         int64_t so[3] = {sz * shard, sy * shard, sx * shard}, se[3], first[3];
         const uint8_t sk = sskip ? sskip[(sz * ns[1] + sy) * ns[2] + sx] : 0;
         if (sk == 2) continue;   /* --occupancy: air */
-        if (nwork > 1 && (nwq++ % ngpu) != part) continue;   /* another worker's shard */
+        if (zdeal ? sz < zl0 || sz >= zl1 : nwork > 1 && (nwq++ % ngpu) != part) continue;   /* another worker's shard (z layers: zdeal) */
         if (sk) continue;   /* --resume: written (see nwq) */
         for (int d = 0; d < 3; d++) se[d] = so[d] + shard < bn[d] ? so[d] + shard : bn[d];
         for (int d = 0; d < 3; d++) {
@@ -3025,8 +3079,9 @@ static int predict_one(int argc, char **argv) {
         for (int k = 0; k < ffz_np; k++) { z3w_close(ffzw[k]); free(ffsl[k]); }
         free(ffw.done); free(ffw.rg.own);
         nn_free(ffacc); nn_free(ffacc4); nn_free(ff8d); nn_host_free(ff8h);
-        char p[1400]; snprintf(p, sizeof p, "%s/fields.json", ffz); if (ffz_json(p, bo, bn, ffF, ffh, um * (1 << level), ffu2, ffw4d, &ax, level)) return 1;
-        snprintf(p, sizeof p, "%s/fields.partial.json", ffz); remove(p);
+        char p[1400]; if (nwork > 1) snprintf(p, sizeof p, "%s/fields.json.w%d", ffz, part); else snprintf(p, sizeof p, "%s/fields.json", ffz);   /* (workers: the parent renames one) */
+        if (ffz_json(p, bo, bn, ffF, ffh, um * (1 << level), ffu2, ffw4d, &ax, level)) return 1;
+        if (nwork <= 1) { snprintf(p, sizeof p, "%s/fields.partial.json", ffz); remove(p); }
         fprintf(stderr, "predict: fit fields %dx%dx%d (h %d) written to %s (zarr)\n", ffF[0], ffF[1], ffF[2], ffh, ffz);
     } else if (ffd) {   /* the fit fields: means over material (CT > 0) of the pooled heads, material fraction, max recto */
         float *acc = malloc(ffna * ffn * 4); nn_sync(); nn_d2h(acc, ffacc, ffna * ffn * 4); nn_free(ffacc);

@@ -103,6 +103,16 @@ From the inference audit (/vesuvius/ufsm/audit-20261114/infer.md). No GPU number
   masks, i.e. the dense net. It now takes the input from the rebuilt CT so the masks are built. With `--latents` there is a warning.
 - **Diagnostics:** the halo against the theoretical RF (cells), the bottleneck token count against the training window, and the level's
   um against the new header key `um_rungs` (written by train --um-rungs only when given).
+- **`--gpus a,b` on the latent paths (`--heads`, `--fit-zarr`):** one worker process per GPU (fork, as the old --gpus workers;
+  processes rather than threads because of the process-wide nn state, net audit #7 / #9 / #10). The workers take contiguous z layers
+  of (super-)shards, split by the shards left to compute, on units of the field slab height (fields) or the window interior (heads).
+  So every field slab and every shard belongs to one process. The fit writer skips other workers' slabs (their fill would overwrite);
+  each worker writes `fields.json.w<k>` and the parent renames one; rows.done is truncated by the parent and appended by the workers.
+  The GPU pyramid is off in workers; the parent builds every head's pyramid and group. test_predict_gpus2 (gpu2): bytes equal to the
+  one-GPU run for --heads all, --fit-zarr --fit-h 1 and both together.
+- **`--window-round 1`:** a window the net's depth does not divide (latink's 544 / 16 on a 6-level net) becomes the next multiple, with
+  the halo grown to keep the interior (640 / 64).
+- **scripts/infer/gn_ab.sh:** running vs live GN through scripts/univ/eval.sh (held-out boxes) plus a seam / difference probe on 1667.
 - **Provenance:** a `"provenance"` object in every store's attributes: ckpt bytes / mtime / header FNV-1a, binary path, level um, gn
   mode, skip-empty, norm, fstem, ema.
 
