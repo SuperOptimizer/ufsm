@@ -4855,8 +4855,9 @@ int cmd_train(int argc, char **argv) {
                                .gap = opt_atoi("--accum-gap", opt(argc, argv, "--accum-gap", "500")), .amax = acc_amax};
     if (!(acc_cfg.k > 0) || !(acc_cfg.margin >= 1) || acc_cfg.warm < 0 || acc_cfg.hold < 1 || acc_cfg.gap < 0) { fprintf(stderr, "--gns-k > 0, --accum-margin >= 1, --accum-warm >= 0, --accum-hold >= 1, --accum-gap >= 0\n"); return 2; }
     accum_ctl actl = accum_ctl_make(accum, &acc_cfg);
-    /* --replica-check N (default 1000 steps, 0 off; data parallel only), --replica-sync 1: replica_check */
-    const int rep_every = ng > 1 && !split ? opt_atoi("--replica-check", opt(argc, argv, "--replica-check", "1000")) : (opt(argc, argv, "--replica-check", nullptr), 0);
+    /* --replica-check N (default 1000 steps, 0 off; data parallel and --split z: both cards hold the whole net and must stay equal, split audit #6),
+       --replica-sync 1: replica_check */
+    const int rep_every = ng > 1 ? opt_atoi("--replica-check", opt(argc, argv, "--replica-check", "1000")) : (opt(argc, argv, "--replica-check", nullptr), 0);
     const int rep_sync = opt_atoi("--replica-sync", opt(argc, argv, "--replica-sync", "0"));
     if (rep_every < 0 || rep_sync < 0 || rep_sync > 1) { fprintf(stderr, "--replica-check N >= 0, --replica-sync 0|1\n"); return 2; }
     if (acc_auto) fprintf(stderr, "--accum auto: %d windows per step, accum %d%s (max %d): target K %g x B_noise, up only, after %d updates, %d updates above %g x, a change per %d updates at most, x2 at most; lr unchanged\n",

@@ -28,7 +28,6 @@ countfield.c names unknown
 countfield.c zn unknown
 crush.c cr_cs unknown
 crush.c cr_sn unknown
-dcache.c b unknown
 dcache.c g_dc unknown
 dcache.c n unknown
 dcache.c tab unknown
@@ -308,7 +307,6 @@ nn_attn.cu g_at_mx process
 nn_attn.cu g_napd unknown
 nn_attn.cu g_nextd unknown
 nn_attn.cu g_npr unknown
-nn_attn.cu g_pe unknown
 nn_attn.cu g_pr process
 nn_attn.cu v unknown
 nn_attn_h16.cu g_hd device
@@ -484,10 +482,6 @@ nn_opt.cu g_nsp process
 nn_opt.cu hd unknown
 nn_opt.cu hk unknown
 nn_opt.cu hn unknown
-nn_pgate.cu g_pg_b4 unknown
-nn_pgate.cu g_pg_cnt unknown
-nn_pgate.cu g_pg_dax unknown
-nn_pgate.cu g_pg_dw unknown
 nn_pgate.cu g_pg_n unknown
 nn_pgate.cu g_pg_nz unknown
 nn_pgate.cu g_pg_o2 unknown
