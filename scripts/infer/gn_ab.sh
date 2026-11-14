@@ -4,22 +4,27 @@
 # arms through the held-out evaluation (scripts/univ/eval.sh; holdout / unseen boxes only) plus a direct seam / difference probe on one box:
 #   arm R (default, running statistics): TAG-gnrun          arm L (--gn-live 1): TAG-gnlive
 # Outputs: $E/TAG-gnrun.matrix.txt, $E/TAG-gnlive.matrix.txt (eval.sh), $E/gnab-TAG/probe.txt (seam steps per arm, mean |d| between arms).
-# Env: everything eval.sh takes (GPU, E, WB, SITE, U, LKF ...); TASKS (default "wind rv fib": eval.sh's ink rows still pass --window 544,
-# which a 6-level latent net refuses; add ink once that is a multiple of 128), WIN / HALO (640 / 64: scratch2 needs multiples of 128),
-# PROBE_BOX (level-2 PHerc1667 box z,y,x,nz,ny,nx; default a 1024 x 2048^2 block on the axis), AXIS (1667 axis json for the probe).
+# Env: everything eval.sh takes (GPU, E, WB, SITE, U, LKF, K ...); TASKS (default "wind rv fib ink", INKP heads: the ink rows take
+# --window-round 1, so 544 / 16 runs as 640 / 64 on a 6-level net), WIN / HALO (640 / 64: scratch2 needs multiples of 128),
+# PROBE_BOX (level-2 PHerc1667 box z,y,x,nz,ny,nx; default a 1024^3 block on the axis, ~1-2 GB of lossless outputs per arm), AXIS (1667 axis json for the probe).
 # Run after the MEGA test pass in a GPU window (one GPU, ~1-2 h for both arms at scratch2 size, est.).
 set -u
 CK=$(readlink -f "${1:?ckpt}"); T=${2:?tag}; H=$(cd "$(dirname "$0")/../.." && pwd); U=${U:-$H/build/ufsm}
-export TASKS=${TASKS:-wind rv fib} WIN=${WIN:-640} HALO=${HALO:-64} WZARGS=${WZARGS-}
+export TASKS=${TASKS:-wind rv fib ink} INKP=${INKP:-heads} WIN=${WIN:-640} HALO=${HALO:-64} WZARGS=${WZARGS-}
+# The labelled eval reads the wbench / GT / ink-crop labels: the desk's tree, or a pod data kit built ON the pod (scripts/pod/datakit.sh,
+# p4kit.sh: labels from dl.ash2txt). Copying desk labels to a pod (podkit_eval.sh) is against the pod rule, so on a pod without its own
+# kit (no $K/wbgt) only the probe runs: PROBE_ONLY=1, set automatically.
+if [ "${SITE:-desk}" = pod ] && [ ! -d "${K:-/nonexistent}/wbgt" ]; then PROBE_ONLY=1; echo "gn_ab: pod without a data kit: the probe only (seams, run vs live difference)"; fi
 E=${E:-/vesuvius/ufsm/wbench/univ}; O=$E/gnab-$T; mkdir -p $O
 grep -q '"gn_ema":1' <(head -c 200000 $CK | head -1) || { echo "gn_ab: $CK has no running GroupNorm statistics (train --gn-ema): nothing to compare"; exit 2; }
 for arm in run live; do
+  [ "${PROBE_ONLY:-0}" = 1 ] && break
   if [ $arm = live ]; then export PX="--gn-live 1" PXH="--gn-live 1"; else export PX="${PX0:-}" PXH="${PXH0:-}"; fi
   [ -e $O/$arm.done ] || { E=$E bash $H/scripts/univ/eval.sh $CK $T-gn$arm > $O/eval_$arm.out 2>&1 && touch $O/$arm.done; } || echo "gn_ab: eval arm $arm failed ($O/eval_$arm.out)"
 done
 # the probe: one box, both arms, rv + ink + phase cos; seam steps at the window borders (ink-seam, period = the interior) and the arms' difference
 R=${CTROOT:-https://dl.ash2txt.org/community-uploads/forrest/volcomp}; K=${PROBE_KEY:-PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr}
-B=${PROBE_BOX:-4096,1024,1536,1024,2048,2048}; AX=${AXIS:-}; AXA=(--no-axis 1); [ -n "$AX" ] && AXA=(--axis $AX)
+B=${PROBE_BOX:-4096,1280,1664,1024,1024,1024}; AX=${AXIS:-}; AXA=(--no-axis 1); [ -n "$AX" ] && AXA=(--axis $AX)
 for arm in run live; do X=(); [ $arm = live ] && X=(--gn-live 1)
   [ -e $O/p_$arm/rv/zarr.json ] || $U predict $CK $R $K $O/p_$arm --um 2.399 --level 2 --box $B --heads rv,ink,c0 --window $WIN --halo $HALO --shard 512 --q 0 --levels 1 \
        --gpu ${GPU:-0} --threads 8 --cache ${WB:-/vesuvius/ufsm/wbench}/cache "${AXA[@]}" "${X[@]}" > $O/p_$arm.log 2>&1 || echo "gn_ab: probe predict $arm failed ($O/p_$arm.log)"
