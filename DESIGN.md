@@ -798,7 +798,7 @@ The runner gives gpu2 tests tagged `l2` UFSM_TEST_GPUS=0,0 on one-GPU machines:
 
 test_gyrec was tagged gpu2 although it runs on device 0 alone; it is now `gpu`.
 
-**The mgpu lint** (tests/lint_mgpu.py, CPU, < 1 s). Every file-scope mutable variable in src/ needs an mgpu class: `process`,
+**The mgpu lint** (tests/lint_mgpu.py, CPU, < 1 s; since folded into tests/test_mgpu_lint.py, see "DP safety": one tool, one baseline tests/mgpu_baseline.txt, these tags accepted). Every file-scope mutable variable in src/ needs an mgpu class: `process`,
 `device`, `guarded`, `BUG`.
 - The class goes in an annotation `/* mgpu: ... */` on its line, or in tests/mgpu_baseline.txt.
 - The baseline holds the 548 variables of 11-14, classed from audit-net's appendix (net.md: SAFE-CFG / ENV / MAIN -> process,

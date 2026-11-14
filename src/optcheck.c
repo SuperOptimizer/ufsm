@@ -10,9 +10,9 @@
 /* the names asked for: an open-addressing set of copied strings (names can be built in stack buffers: train's --aug-%s-p), growable
    (train alone asks for ~320 names; the old fixed 512-slot list dropped names past the cap: mini audit opts 7) */
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
-static char **g_set; static size_t g_cap, g_n;
-static char *g_pre[64]; static int g_npre;
-static char **g_warned; static size_t g_nw, g_cw;
+static char **g_set; static size_t g_cap, g_n;   /* mgpu: main */
+static char *g_pre[64]; static int g_npre;   /* mgpu: main */
+static char **g_warned; static size_t g_nw, g_cw;   /* mgpu: main */
 
 static uint64_t h64(const char *s) { uint64_t h = 1469598103934665603ull; for (; *s; s++) h = (h ^ (uint8_t)*s) * 1099511628211ull; return h; }
 static int set_has(const char *s) {

@@ -360,7 +360,7 @@ extern "C" void at_set_lmax(float *lmax) { g_lmax = lmax; }
 /* at_set_lscale / UFSM_ATTN_LSCALE=n0 (audit attn 11-14 #2): the logits times max(1, ln S / ln n0) for sequences of S > n0 keys (S = registers + grid tokens), n0 = the
    token count the net was trained on (216 at P 768): the attention keeps its sharpness at larger predict windows (729 tokens at 1152). 0: off (the default). Forward and
    backward use the same factor; core 1 (this file) only, at_block_fwd / _bwd refuse the others while it is on. */
-static float g_ls_n0 = -1.f;
+static float g_ls_n0 = -1.f;   /* mgpu: config */
 extern "C" void at_set_lscale(float n0) { g_ls_n0 = n0 > 0.f ? n0 : 0.f; }
 extern "C" float at_get_lscale(void) { if (g_ls_n0 < 0.f) { const char *e = getenv("UFSM_ATTN_LSCALE"); g_ls_n0 = e && atof(e) > 1.0 ? (float)atof(e) : 0.f; } return g_ls_n0; }
 static float ls_factor(int S) { const float n0 = at_get_lscale(); return n0 > 1.f && S > n0 ? logf((float)S) / logf(n0) : 1.f; }

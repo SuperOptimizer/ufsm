@@ -1182,7 +1182,7 @@ extern "C" void nn_pred_stats(const uint8_t *ct, size_t n, void *scratch, size_t
     cudaMemcpy(h, acc, sizeof h, cudaMemcpyDeviceToHost);
     *nz = (size_t)h[0]; *sum = (double)h[1]; *sq = (double)h[2];
 }
-static unsigned long long *g_ps_host[16]; static cudaEvent_t g_ps_ev[16];   /* nn_pred_stats_start / _finish, per device */
+static unsigned long long *g_ps_host[16]; static cudaEvent_t g_ps_ev[16];   /* nn_pred_stats_start / _finish, per device */   /* mgpu: per-device */
 extern "C" void nn_pred_stats_start(const uint8_t *ct, size_t n, void *scratch) {
     int dev = 0; cudaGetDevice(&dev); dev &= 15;
     if (!g_ps_host[dev]) { CK(cudaMallocHost((void **)&g_ps_host[dev], 3 * sizeof(unsigned long long))); CK(cudaEventCreateWithFlags(&g_ps_ev[dev], cudaEventDisableTiming)); }

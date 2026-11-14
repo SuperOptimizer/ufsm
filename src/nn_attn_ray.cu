@@ -53,7 +53,7 @@ extern "C" void at_rays_plan(int n, int D, int Hh, int W, float mult, const floa
         /* UFSM_SCROLL_PE_V2=1 (audit attn 11-14 #4 / #5; a net must be trained with it: it changes the positions): ONE reference angle and ONE radius per sample for all
            planes, so a token at the same physical angle gets the same arc in every plane (v1: per-plane rc x absolute theta = up to ~1 voxel of spurious relative
            arc, and inside / outside planes use different angle origins: arc jumps of 2 pi rc between adjacent planes) */
-        static int v2 = -1; if (v2 < 0) { const char *e = getenv("UFSM_SCROLL_PE_V2"); v2 = e && atoi(e) > 0; }
+        static int v2 = -1; if (v2 < 0) { const char *e = getenv("UFSM_SCROLL_PE_V2"); v2 = e && atoi(e) > 0; }   /* mgpu: env */
         double rcr = 0, phir = 0;
         if (v2 && valid) {
             double sx = 0, sy = 0, sr = 0; int nk = 0;

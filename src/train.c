@@ -267,7 +267,7 @@ static int g_gc;
    the fused normal / density group); --fstem-drop P: a training window without it (level dropout: the net keeps working without the fine
    level, as for scans with no finer data; validation and predict always use it) */
 static int g_fstem, g_fs_n, g_fs_ch[32]; static float g_fs_drop = 0.25f;
-static sampler *g_vs_sp;   /* --vox-cap: the training sampler, for sampler_vox_scale */
+static sampler *g_vs_sp;   /* --vox-cap: the training sampler, for sampler_vox_scale */   /* mgpu: config */
 static float src_head_w(int si, int h) { return (si >= 0 && g_S && si < g_S->n ? g_S->src[si].head_w[h] : 1.f) * g_hmul[h] * (g_vs_sp && h != SH_INK && h != SH_FIBRE ? sampler_vox_scale(g_vs_sp, si) : 1.f); }   /* the source's "heads" multiplier x --uw */
 /* --init-from: does an unwrap2 donor keep its rv pair / ink row somewhere other than this net's channels (u1 rv 11-12 -> U2 ink 11, rv
    12-13)? Then the head is mapped by name; same places (a donor that only lacks appended heads, e.g. the fibre head) keep the positional
@@ -279,7 +279,7 @@ static int unwrap2_heads_moved(const char *init_from) {
     return (g_rv == 2 && drv >= 0 && drv != g_rv_ch) || (g_ink2 && dink >= 0 && dink != g_ink2_ch) || (g_ink2 && dink < 0 && drv == g_ink2_ch);
 }
 static double g_reject_warn = 100;
-static double g_outward_warn = 0.9;   /* --outward-warn S: warn when a source's aligned phase-gradient samples rise outward less often than S (0 off) */
+static double g_outward_warn = 0.9;   /* --outward-warn S: warn when a source's aligned phase-gradient samples rise outward less often than S (0 off) */   /* mgpu: config */
 static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static float g_mil_R = 10.f, g_mil_step = 1.f, g_mil_tau = 0.f, g_mil_lambda = 1.f;   /* --ink-mil L
    (--ink-head): the normal-pooled MIL ink loss on each window's rays (inkmil.h): per supervised label pixel (mode 1: only those without an open face, the
    voxel target's unknowns), BCE of the pooled ink logit along the normal over +-R window voxels at step (tau 0: max; > 0: tau log mean exp), the mean
@@ -287,7 +287,7 @@ static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static fl
 static int g_ink_air;   /* --ink-air S (--ink-head, needs the --rv papyrus plane): unlabelled air voxels on the S-voxel window lattice -> ink 0 targets (nn_ink_air) */
 static float g_ink_smooth;   /* --ink-smooth EPS (--ink-head): label smoothing of the ink BCE target, t (1 - eps) + eps / 2 (villa: 0.1) */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
-static int g_dens_code; static float g_packed_w, g_packed_um = 120.f, g_dens_um, g_sheet_lo, g_sheet_hi;   /* --density-um U: x = density_scale rho (U / window um) (physical); --sheet-mask LO,HI */   /* --density-code, --packed-weight, --packed-um (task unwrap) */
+static int g_dens_code; static float g_packed_w, g_packed_um = 120.f, g_dens_um, g_sheet_lo, g_sheet_hi;   /* --density-um U: x = density_scale rho (U / window um) (physical); --sheet-mask LO,HI */   /* --density-code, --packed-weight, --packed-um (task unwrap) */   /* mgpu: config */
 static inline float dens_scale_win(float um) { return g_dens_um > 0 && um > 0 ? g_dens_scale * g_dens_um / um : g_dens_scale; }   /* the window's density scale: physical with --density-um */
 static float g_ptrunc_tau, g_ptrunc_kappa = 0.5f; static int g_ptrunc_from = 5000, g_ptrunc_on;   /* --phase-trunc TAU [--phase-trunc-conf K] [--phase-trunc-from STEP]: the robust phase loss (nn_phase_trunc), on from STEP */
 static int g_gl_inplace;   /* the logit gradient over the fp16 logits (set before the memory planner) */
@@ -416,10 +416,10 @@ static int g_valP;   /* --val-P N (!= P): validation windows of N^3 (the same vo
 /* --win-weight 1 (audit 2026-11-14 train #4, default off): each head's gradient of a training window times min(1, nm / ref) -- nm its
    mask weight sum, ref the head's running median nm over earlier labelled windows (nn_loss_stats_fin_w / nn_wind4_fin_w on the
    device per GPU; the MIL head's ray count on the host). Slots below; the log line's "winw" part per GPU 0 */
-static int g_win_weight;
+static int g_win_weight;   /* mgpu: config */
 enum { WW_PHASE, WW_INK, WW_INK2, WW_FIBA, WW_FIBB, WW_FIBD, WW_RV, WW_SIDE, WW_NORM, WW_W4, WW_NDEV, WW_MIL = WW_NDEV, WW_N };
 static const char *const ww_name[WW_N] = {"phase", "ink", "ink2", "fibA", "fibB", "fibdir", "rv", "side", "normal", "wind4", "mil"};
-static double g_mil_ww[8][6];   /* per GPU (dev): the MIL slot as the device's ([0] log2 ref, [1] windows, [2] n, [3] sum w, [4] low, [5] min) */
+static double g_mil_ww[8][6];   /* per GPU (dev): the MIL slot as the device's ([0] log2 ref, [1] windows, [2] n, [3] sum w, [4] low, [5] min) */   /* mgpu: per-device */
 static float ww_mil(int dev, int nmil) {   /* the MIL head's weight for a window of nmil rays (the device slots' rule) */
     if (!g_win_weight || nmil < 1 || dev < 0 || dev >= 8) return 1.f;
     double *q = g_mil_ww[dev]; const double l = log2((double)nmil);
@@ -1291,7 +1291,7 @@ static int mil_clip(const gpu_state *d, int pass, int z0, int nz, size_t hw, int
    coarse plane (the adjoint sums 64 fine voxels a cell) stays <= 2^15 < 65504. s in [1, 2^30]: never below the old scale. Only the
    unwrap2 head-slab gradient pass with 16-bit gradients and its producers bounded here (pgrad / fibre-normal terms, the --ssl heads
    and other tasks keep s 1); UFSM_HGSCALE=0: s 1 (the old bits) */
-static int g_hgs_on = -1;
+static int g_hgs_on = -1;   /* mgpu: env */
 static float hgs_bound(const float *h, int C, float lam, float dice, float pw, float rw, float mw) {   /* h: a loss scratch ([C][5] sums, fin [2 C + 2]) */
     const float fsc = h[5 * C + 2 * C + 1], gs = nn_get_grad_scale(); float b = 0.f;
     for (int c = 0; c < C; c++) { const float nm = h[5 * c]; if (nm < 1.f) continue;
@@ -1337,7 +1337,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
     const int fr[2][2] = {{0, fside ? 0 : g_norm_ch}, {g_norm_ch + 7, fside ? g_cout : LUPN}};
     /* the slab's forward chain in one kernel (nn_fstem_up_fwd: upsample + sub-cell shuffle + fine stem, byte-identical; UFSM_FSUP=0: the three
        kernels) when the stem's outputs are exactly the channels the fused path upsamples (scratch2: 16 of them; 2026-11-14 P 768: see DESIGN) */
-    static int fsup = -1;
+    static int fsup = -1;   /* mgpu: env */
     if (fsup < 0) {
         fsup = g_lat_hs && g_fstem && g_lat_guide == 64 && !lchk && LUPN == (g_pad_ch >= 0 ? g_pad_ch : g_cout) && (!getenv("UFSM_FSUP") || ufsm_env_on("UFSM_FSUP"));
         for (int k = 0; fsup && k < g_fs_n; k++) fsup = g_fs_ch[k] == (k < g_norm_ch ? k : k + 7);   /* (the stem's list = [0, norm) + [norm + 7, LUPN)) */
@@ -1387,7 +1387,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
     /* UFSM_HSG_ZERO=N: every Nth gradient pass of a training step, how many of the supervised voxels' fp16 logit gradients (phase / side
        pair, rv pair, wind4 pair, ink) and of the finished cell gradients are 0 or subnormal (the gradient scale's dead zone, audit
        2026-11-14); one line per GPU */
-    static int hsg = -1; if (hsg < 0) hsg = getenv("UFSM_HSG_ZERO") ? atoi(getenv("UFSM_HSG_ZERO")) : 0;
+    static int hsg = -1; if (hsg < 0) hsg = getenv("UFSM_HSG_ZERO") ? atoi(getenv("UFSM_HSG_ZERO")) : 0;   /* mgpu: env */
     const int hz = hsg > 0 && pass && d->hs_train && g_lat_hs && (d->hsz_pass++ % hsg) == 0;
     if (hz) nn_zero(d->hsz, 15 * sizeof(unsigned long long));
     if (!pass && nmil) { nn_zero(d->milacc, (size_t)nmil * d->mil_k * sizeof(float)); nn_zero(d->milloss, sizeof(double)); }
@@ -1477,7 +1477,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                    device warp, as the losses see it: PREFIX-NN.pgm, 4 panels side by side: the device CT channel (128 + 40 v) | phase byte |
                    winding mod 4 byte | papyrus / first aux plane byte (255 = unknown); UFSM_DUMP_N (8) windows (launch2 2026-11-14) */
                 static int ndd = 0; const char *dpre = getenv("UFSM_DUMP_DEV"); const int zm = D / 2;
-                static int dwhy = 0; if (dpre && !dwhy++) fprintf(stderr, "dump dev: D %d H %d W %d z %d..%d hsplit %d xfmt %d xs %d lat %d\n", D, H, W, z0, z1, d->hsplit, g_xfmt, g_xs, g_lat);
+                static int dwhy = 0; if (dpre && !dwhy++) fprintf(stderr, "dump dev: D %d H %d W %d z %d..%d hsplit %d xfmt %d xs %d lat %d\n", D, H, W, z0, z1, d->hsplit, g_xfmt, g_xs, g_lat);   /* mgpu: debug */
                 if (dpre && !pass && ndd < (getenv("UFSM_DUMP_N") ? atoi(getenv("UFSM_DUMP_N")) : 8) && z0 <= zm && zm < z1) {   /* (hsplit only times the uploads; the planes are whole) */
                     const size_t pl = (size_t)H * W, xb = xbytes(); uint8_t *hx = malloc(pl); uint8_t *hp[3] = {malloc(pl), malloc(pl), malloc(pl)};
                     /* the device input d->x (--gpu-input: the warped CT channel only, g_xs 1, full resolution), plane zm, min / max scaled */
@@ -1537,7 +1537,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (!fsd && g_fstem && !d->fs_drop && nn_fstem_fwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns)) { fprintf(stderr, "--fstem: slab shape\n"); abort(); }
         if (g_fstem) FT("  u fine stem fwd");
         const shape5 one = {1, 1, nz, H, W}, two = {1, 2, nz, H, W}, seven = {1, 7, nz, H, W};
-        static int tgf_on = -1; if (tgf_on < 0) tgf_on = !getenv("UFSM_SLAB_TG") || ufsm_env_on("UFSM_SLAB_TG");   /* (UFSM_SLAB_TG=0: the five kernels) */
+        static int tgf_on = -1; if (tgf_on < 0) tgf_on = !getenv("UFSM_SLAB_TG") || ufsm_env_on("UFSM_SLAB_TG");   /* (UFSM_SLAB_TG=0: the five kernels) */   /* mgpu: env */
         const int tgf = tgf_on && !tskip && !g_ptrunc_on && !pdir && (!g_rv || pap);   /* the phase-derived targets in one kernel (nn_slab_targets, byte-identical) */
         if (tgf) nn_slab_targets(sdb, g_rv ? pap : nullptr, D, H, W, g_norm_s, dens_scale_win(d->um), g_dens_code, d->um, g_packed_um, g_packed_w, g_rv ? g_rv_vw : 1.f,
                                  d->sidet, d->sidem, g_rv ? d->rvt : nullptr, d->rvm, d->nt, d->nm, z0, z1);
@@ -1924,7 +1924,7 @@ static int sync_check(gpu_state *d, int step, const char *what);
 static void diag_nonfinite(gpu_state *d, const char *what, const void *p, size_t n, int h16);
 static void restore_train_recipe(gpu_state *d, int step, int g);
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train);
-static uint64_t g_seed, g_lat_js0 = 0x7f4a7c159e3779b9ull;   /* g_lat_js0: --lat-step-jitter's first state (train#11: from the seed and the resumed step) */
+static uint64_t g_seed, g_lat_js0 = 0x7f4a7c159e3779b9ull;   /* g_lat_js0: --lat-step-jitter's first state (train#11: from the seed and the resumed step) */   /* mgpu: config */
 static void gstep_fwd(gstep_arg *a) {
     gpu_state *d = a->d; const int g = a->g, step = a->step, B = a->B, P = a->P; const float dice_w = a->dice_w; const uint64_t seed = g_seed;
     const int sparse_at = a->sparse_at; const float srste = a->srste; (void)B;
@@ -3809,7 +3809,7 @@ int cmd_train(int argc, char **argv) {
                     }
                     cov[si][0] += 1; cov[si][1] += (double)mat / nv; cov[si][2] += (double)ph / nv; cov[si][3] += mat ? (double)phm / mat : 0; cov[si][4] += (double)w4 / nv;
                 }
-                static uint64_t ha_win, ha_hit, ha_vox, ha_known; static int ha_on = -1; if (ha_on < 0) ha_on = ufsm_env_on("UFSM_HOLD_AUDIT");
+                static uint64_t ha_win, ha_hit, ha_vox, ha_known; static int ha_on = -1; if (ha_on < 0) ha_on = ufsm_env_on("UFSM_HOLD_AUDIT");   /* mgpu: debug (UFSM_HOLD_AUDIT counters) */
                 if (ha_on && !b->use) for (int n = 0; n < B; n++) { uint64_t hv, hk; sample_hold_audit(sq, b, n, &hv, &hk); ha_win++; ha_hit += hv > 0; ha_vox += hv; ha_known += hk;
                     if (hk) fprintf(stderr, "hold audit: LEAK source %s level %d corner %lld %lld %lld: %llu known label voxels inside held-out boxes\n", S->src[b->src[n]].name, b->level[n],
                                     (long long)b->corner[n][0], (long long)b->corner[n][1], (long long)b->corner[n][2], (unsigned long long)hk); }
@@ -5190,7 +5190,7 @@ int cmd_train(int argc, char **argv) {
             if (g_head_only) unet_grad_head_only(d->u, g_head_only - 1);   /* --train-head-only N: head + last N-1 decoder blocks (frozen rest: --wd 0) */
             {   /* UFSM_GRAD_LAYERS=N: every Nth update, GPU 0's per-layer gradient norms (the update's mean gradient, before the clip) and the
                    attention linears' weight norms: where a rising gn comes from (audit 2026-11-14) */
-                static int gl_every = -1; if (gl_every < 0) gl_every = getenv("UFSM_GRAD_LAYERS") ? atoi(getenv("UFSM_GRAD_LAYERS")) : 0;
+                static int gl_every = -1; if (gl_every < 0) gl_every = getenv("UFSM_GRAD_LAYERS") ? atoi(getenv("UFSM_GRAD_LAYERS")) : 0;   /* mgpu: env */
                 const long upn = upd_base + (step - acc_anchor + accum - 1) / accum;
                 if (g == 0 && gl_every > 0 && upn % gl_every == 0) { char tg[64]; snprintf(tg, sizeof tg, "step %d update %ld gn %.3f", step, upn, gn); unet_debug_grads(d->u, tg); }
             }
@@ -5237,7 +5237,7 @@ int cmd_train(int argc, char **argv) {
         if (opt_stats > 0 && step % opt_stats == 0) ost_pending = 1;   /* (the next update: with --accum, the next multiple of K) */
         committed_step = step;
         if (f16 && gs_grow > 0) {   /* --gscale-grow: x2 after gs_grow clean steps (a skipped step restarts the count) */
-            static int gs_clean = 0, gs_nskip = 0;
+            static int gs_clean = 0, gs_nskip = 0;   /* mgpu: main */
             if (nskip != gs_nskip) { gs_nskip = nskip; gs_clean = 0; }
             else if (++gs_clean >= gs_grow && nn_get_grad_scale() * 2.f <= gs_max) { nn_set_grad_scale(nn_get_grad_scale() * 2.f); gs_clean = 0; fprintf(stderr, "step %d: grad scale -> %g (%d clean steps)\n", step, nn_get_grad_scale(), gs_grow); }
         }
@@ -5309,7 +5309,7 @@ int cmd_train(int argc, char **argv) {
                         o += snprintf(ln + (o < (int)sizeof ln ? o : (int)sizeof ln - 1), o < (int)sizeof ln ? sizeof ln - (size_t)o : 0, " (%.0f)", q[1] > q[3] ? q[1] : q[3]); }
                     fprintf(stderr, "%s\n", ln);
                     memset(mixh, 0, (size_t)S->n * 6 * sizeof *mixh);
-                    static uint64_t (*oprev)[2]; if (!oprev) oprev = calloc((size_t)S->n, sizeof *oprev);
+                    static uint64_t (*oprev)[2]; if (!oprev) oprev = calloc((size_t)S->n, sizeof *oprev);   /* mgpu: main */
                     o = snprintf(ln, sizeof ln, "phase outward by source steps %d-%d (share of radially aligned gradient samples rising outward, samples):", step - mix_every + 1, step);
                     int any = 0;
                     for (int si = 0; si < S->n; si++) { uint64_t c2[2]; sampler_outward_stats(sp, si, c2); const uint64_t po = c2[0] - oprev[si][0], pi = c2[1] - oprev[si][1];
@@ -5347,7 +5347,7 @@ int cmd_train(int argc, char **argv) {
         if (step % log_every == 0 || step == steps || g_stop) {
             double dt = now() - tlog; const double nok = nacc - nskl > 0 ? nacc - nskl : 1;   /* (the means: over the steps not skipped) */
             double vl = -1, vb = 0, vd = 0, vh[TCMAX] = {0}; int vhn[TCMAX] = {0}; double vw4[6] = {0}, vw4n[3] = {0};   /* unwrap2: wind4 bce, worst-gauge bce, right turns, voxels, phase, normal; vw4n: windows with wind4 / phase / normal labels */
-            static double *vsrc; if (!vsrc) vsrc = calloc((size_t)S->n * 8, sizeof *vsrc);   /* per source: phase, wind4, rv, ink bce sums + their window counts */
+            static double *vsrc; if (!vsrc) vsrc = calloc((size_t)S->n * 8, sizeof *vsrc);   /* per source: phase, wind4, rv, ink bce sums + their window counts */   /* mgpu: main */
             char vstr[128] = ",,";
             double rv_n[RF_N] = {0}, rv_e[RF_N] = {0}, rv_b[RF_N] = {0}, rv_l = 0;   /* restore validation: per family voxels, error^2, input error^2 */
             if (g_rpairs) { free(g_rpv); g_rpv = calloc((size_t)S->n * RP_NST, sizeof *g_rpv); }

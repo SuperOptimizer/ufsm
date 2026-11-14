@@ -74,7 +74,7 @@ __global__ void loss_d2f_k(const double *d, float *f, int n) { int i = blockIdx.
    interval's [2] labelled windows, [3] sum of weights, [4] windows below 0.1 ref, [5] smallest nm / ref (nn_win_weight_take resets) */
 #define WW_NS 16
 #define WW_F 8
-__device__ float g_ww[WW_NS][WW_F];
+__device__ float g_ww[WW_NS][WW_F];   /* mgpu: per-device (__device__ storage lives in each context) */
 __device__ __forceinline__ float ww_apply(int slot, float nm) {   /* the window's weight; updates the slot (one thread) */
     if (slot < 0 || slot >= WW_NS || !(nm >= 1.f)) return 1.f;
     float *q = g_ww[slot];

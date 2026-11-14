@@ -2997,7 +2997,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         every forward's first logit (the guard's test) */
         const size_t n = shape_numel(u->ls[0]) / u->ls[0].c * u->cfg.cout;
         if (!u->nf_cnt) { u->nf_cnt = nn_malloc(3 * sizeof *u->nf_cnt); nn_zero(u->nf_cnt, 3 * sizeof *u->nf_cnt); }
-        static int tn = -1; if (tn < 0) tn = ufsm_env_on("UFSM_TEST_NAN_LOGITS");
+        static int tn = -1; if (tn < 0) tn = ufsm_env_on("UFSM_TEST_NAN_LOGITS");   /* mgpu: env */
         if (tn) { const float nf = NAN; const uint16_t nh = 0x7e00; if (u->logits_h16) nn_h2d((void *)u->logits, &nh, 2); else nn_h2d((void *)u->logits, &nf, 4); }
         if (n) nn_nonfinite_acc(u->logits, n, u->logits_h16 ? 1 : 0, u->nf_cnt);
     }
@@ -4878,7 +4878,7 @@ static float g_loaded_adema[UNET_MAXCONV]; static int g_loaded_adema_n; static d
 static size_t *g_loaded_inh; static int g_loaded_ninh;   /* init_inh of the header (pairs) */
 static void inh_add(unet *u, size_t off, size_t n);
 static int g_loaded_lat_c; static float g_loaded_lat_step, g_loaded_lat_gain[29], g_loaded_lat_bas[29 * 64];   /* the cell transform of the last header read */
-static float g_um_rungs[8]; static int g_um_rungs_n;   /* train --um-rungs (header key um_rungs, only when set) */
+static float g_um_rungs[8]; static int g_um_rungs_n;   /* train --um-rungs (header key um_rungs, only when set) */   /* mgpu: main (checkpoint header parse) */
 void unet_set_um_rungs(const float *um, int n) { g_um_rungs_n = n < 0 ? 0 : n > 8 ? 8 : n; for (int i = 0; i < g_um_rungs_n; i++) g_um_rungs[i] = um[i]; }
 static long g_loaded_ge_n; static int g_loaded_ge_warm; static float g_loaded_ge_mom, *g_loaded_ge_run; static size_t g_loaded_ge_cnt;   /* cfg.gn_ema */
 static long g_loaded_l0_n; static int g_loaded_l0_warm, g_loaded_l0_cnt; static float g_loaded_l0_mom, g_loaded_l0_run[16 * 256];   /* cfg.l0_norm ema */
@@ -5232,7 +5232,7 @@ int unet_peek(const char *path, unet_cfg *cfg, int *step) {
 }
 
 /* inference loads (predict, audit 2026-11-14 infer #4): unet_load reads p and ema only, unet_infer_release frees the training state */
-static int g_load_infer;
+static int g_load_infer;   /* mgpu: config */
 void unet_set_load_infer(int on) { g_load_infer = on != 0; }
 void unet_infer_release(unet *u, int keep_p) {
     if (u->muon_mom && u->muon_mom != u->v) nn_free(u->muon_mom);
