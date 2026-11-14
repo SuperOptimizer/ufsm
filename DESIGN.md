@@ -147,7 +147,8 @@ the ~8e-3 of fp16 weights and another sum order, and each MX-fp4 SR flip behind 
 against the SR noise floor of the same net (the FFMA kernel, the backward's SR seed moved): tensor cores vs FFMA rel 0.33-0.39, the
 other seed 0.65-0.73. The check now runs its exact comparison with the FFMA kernel (1.4e-9) and requires the tensor-core gradient
 within 1.5x that floor + 0.15 (TLH_FP8, MX-fp8 gradients without SR: floor ~1e-7, tensor cores vs FFMA rel 0.063-0.074,
-the fp16 weights' rounding through e4m3 steps). Default on (UFSM_HEAD_BTC=0: the FFMA kernel); test_head_tc keeps the tiny-weight case.
+the fp16 weights' rounding through e4m3 steps). Default on (UFSM_HEAD_BTC=0: the FFMA kernel); test_head_tc keeps the tiny-weight case. Time (nsys, scratch2 net + heads, P 768 one card,
+the wind fixture): conv1_to_mx_t_k 111.1 ms a step -> conv1_to_mx_tc_k 20.4 + c1b_wh_k 0.1 ms, -91 ms (~2.5 % of the kernel time).
 
 ## Two fast-tier failures on master: test_lldec pool 3, test_wbench_stats without bc (2026-11-14, branch fixtests-20261114)
 
