@@ -1,4 +1,4 @@
-/* inkfly_open_pooled (the coarser level of an on-the-fly ink target: known-max 2x pooling of the level below) read in z-slabs of the
+/* inkfly_open_pooled (the coarser level of an on-the-fly ink target: 2x pooling of the level below, the known children's mean) read in z-slabs of the
    fine level == the pooling of one whole fine read, for boxes that start on odd planes, cross the slab cuts and leave the array.
    CPU only. usage: test_ink_pool DIR */
 #include "inksplat.h"
@@ -52,8 +52,8 @@ int main(int argc, char **argv) {
         for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++) {
             const uint8_t *q = f + ((size_t)(2 * z) * fn[1] + 2 * y) * fn[2] + 2 * x;
             const uint8_t v[8] = {q[0], q[1], q[fn[2]], q[fn[2] + 1], q[pl], q[pl + 1], q[pl + fn[2]], q[pl + fn[2] + 1]};
-            int m = -1; for (int i = 0; i < 8; i++) if (v[i] != 255 && v[i] > m) m = v[i];
-            const uint8_t want = m < 0 ? 255 : (uint8_t)m; bad += got[((size_t)z * n[1] + y) * n[2] + x] != want; known += want != 255;
+            unsigned sm = 0, kk = 0; for (int i = 0; i < 8; i++) if (v[i] != 255) { sm += v[i]; kk++; }   /* (the known mean, written out: ink_pool8) */
+            const uint8_t want = kk ? (uint8_t)((sm + kk / 2) / kk) : 255; bad += got[((size_t)z * n[1] + y) * n[2] + x] != want; known += want != 255;
         }
         CHECK(bad == 0, "box %d: %zu of %zu pooled voxels differ from the whole-box pooling", k, bad, nv);
         tot += nv; free(got); free(f);

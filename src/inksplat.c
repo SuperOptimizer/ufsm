@@ -1353,7 +1353,7 @@ static int inkfly_derive(void *ctx, z3 *base, const int64_t o[3], const int64_t 
     atomic_fetch_add(&g_ifs.us, (uint64_t)((snow() - t0) * 1e6));
     return 0;
 }
-/* the coarser level: known-max 2x pooling of the level below (an onfly array), as the stored pyramid */
+/* the coarser level: 2x pooling of the level below (an onfly array): the known children's mean (ink_pool8) */
 typedef struct { z3 *fine; int own; } ifpool;
 /* in z-slabs of the fine level, cut at multiples of the fine array's cell (IFC) so no cell is derived for two slabs: the whole (2n)^3 box
    at once was 8.6 GB of scratch per worker building a P 1024 window at the pooled level (2026-11-12; a slab of 128 planes is 0.54 GB).
@@ -1371,8 +1371,7 @@ static int inkfly_pool_derive(void *ctx, z3 *base, const int64_t o[3], const int
         for (int64_t zz = 0; zz < nf / 2; zz++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++) {
             const uint8_t *q = b + ((size_t)(2 * zz) * f1 + 2 * y) * f2 + 2 * x;
             const uint8_t v[8] = {q[0], q[1], q[f2], q[f2 + 1], q[pl], q[pl + 1], q[pl + f2], q[pl + f2 + 1]};
-            int m = -1; for (int i = 0; i < 8; i++) if (v[i] != 255 && v[i] > m) m = v[i];
-            out[((size_t)(z + zz) * n[1] + y) * n[2] + x] = m < 0 ? 255 : (uint8_t)m;
+            out[((size_t)(z + zz) * n[1] + y) * n[2] + x] = ink_pool8(v);
         }
         z += nf / 2;
     }

@@ -81,7 +81,15 @@ typedef struct { float p[3], n[3]; uint8_t y, pad[3]; float w; } inkray;
    target's unknowns); stride: every stride-th label row / col; pixels within R + 1 level voxels of a held-out box are left out.
    *out malloc'd. 0 ok. */
 int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout);
-z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine, int own_fine);   /* the next level: known-max 2x pooling of fine, on ct_coarse's grid (owned) */
+/* the onfly ink target's 2x pooling of one 2^3 block (prob254 bytes, 255 unknown): the rounded mean of the known children, unknown when none.
+   Until 2026-11-14 (datafix) the known max: any inked child made the whole coarse voxel ink, so the 9.6 um ink target of a layer a few 4.8 um
+   voxels thick was dilated by up to one 4.8 um voxel per face (2/3 of the human-ink windows train at 9.6 um). The stored pyramids of
+   ufsm ink-splat keep known-max: the sampler's occupancy index reads them */
+static inline uint8_t ink_pool8(const uint8_t v[8]) {
+    unsigned s = 0, k = 0; for (int i = 0; i < 8; i++) if (v[i] != 255) { s += v[i]; k++; }
+    return k ? (uint8_t)((s + k / 2) / k) : 255;
+}
+z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine, int own_fine);   /* the next level: 2x pooling of fine (ink_pool8: the known mean), on ct_coarse's grid (owned) */
 void inkfly_gpu_config(int dev);   /* the chunk compute on GPU dev (< 0: the CPU); default: $UFSM_INKFLY_GPU (0), $UFSM_INKFLY_CPU=1 the CPU */
 uint64_t inkfly_gpu_chunks(void);   /* chunks computed on the GPU so far (process) */
 void inkfly_stats(uint64_t *reads, uint64_t *chunks, uint64_t *empty, uint64_t *hits, uint64_t *px, double *sec);
