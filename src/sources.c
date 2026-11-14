@@ -31,6 +31,8 @@ static dcache_pool *phase_pool(void) {
 [[gnu::weak]] z3 *mesh_codes_open(const char *, const char *, const char *, int, z3 *, int);   /* (weak: binaries without meshcodes.o: "meshes" then fails to open) */
 [[gnu::weak]] const char *mesh_codes_key(const z3 *);
 #include "json.h"
+#include "label_versions.h"
+#include <dirent.h>
 #include "votes.h"
 #include "srpair.h"
 #include <sys/stat.h>
@@ -160,6 +162,20 @@ static char *sdup(const char *s) { return s ? strdup(s) : nullptr; }
    the codes rasterised on read from the q-assigned meshes (meshcodes.h mesh_codes_open) at level + extra directly (a stored level-L+1
    raster, not the pooled level L: 8x fewer voxels rasterised), then pool2 poolings. key: the dcache key of the phase derived from them
    (stored codes: their path, zarr.json size / mtime and poolings; "" over http: not cached). nullptr (reported) on failure */
+/* a stored array's generation for the derived-cache key: every file under dir (the zarr.json, the shards / chunks), their count, total
+   bytes and newest mtime in ns (the dcache audit 2026-11-14 #3: zarr.json is written when a raster starts, so a chunk-only rewrite, a
+   resumed raster or an mtime-keeping rsync kept the old key). ~8 k files of a codes array: tens of ms, once per source open. */
+static void arr_generation(const char *dir, int depth, long long *nf, long long *bytes, long long *mt) {
+    DIR *d = depth < 8 ? opendir(dir) : nullptr; if (!d) return;
+    for (struct dirent *e; (e = readdir(d));) {
+        if (e->d_name[0] == '.' && (!e->d_name[1] || (e->d_name[1] == '.' && !e->d_name[2]))) continue;
+        char p[2400]; struct stat st; snprintf(p, sizeof p, "%s/%s", dir, e->d_name); if (stat(p, &st)) continue;
+        if (S_ISDIR(st.st_mode)) { arr_generation(p, depth + 1, nf, bytes, mt); continue; }
+        const long long t = (long long)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec;
+        (*nf)++; *bytes += (long long)st.st_size; if (t > *mt) *mt = t;
+    }
+    closedir(d);
+}
 static z3 *onfly_codes_open(const source *s, const json *e, const json *of, int extra, int plev, char *key, size_t nkey) {
     key[0] = 0;
     const json *mj = json_get(e, "meshes"); if (!mj && e != of) mj = json_get(of, "meshes");
@@ -173,16 +189,22 @@ static z3 *onfly_codes_open(const source *s, const json *e, const json *of, int 
         cz = ct && mesh_codes_open ? mesh_codes_open(md, mv, mm, lv, ct, 0) : nullptr;
         if (ct && !mesh_codes_open) z3_close(ct);
         if (!cz) { fprintf(stderr, "sources: %s: phase onfly \"meshes\": cannot open %s (value %s, level %d of the CT)\n", s->name, md ? md : "?", mv, lv); return nullptr; }
-        const char *mk = mesh_codes_key ? mesh_codes_key(cz) : nullptr; if (mk) snprintf(key, nkey, "%s-pool%d%s", mk, npool + pool, npool + pool ? "b" : "");   /* ("b": the bin-search pooling, codes_pool.h, 2026-11-12) */
+        const char *mk = mesh_codes_key ? mesh_codes_key(cz) : nullptr;   /* ("b": the bin-search pooling, codes_pool.h, 2026-11-12; now LBL_CODES_POOL) */
+        if (mk && snprintf(key, nkey, "%s stamp-v%d pool-v%d-pool%d%s", mk, LBL_MESHCODES_STAMP, LBL_CODES_POOL, npool + pool, npool + pool ? "b" : "") >= (int)nkey) key[0] = 0;   /* (truncated: no cache) */
         for (int q2 = 0; cz && q2 < pool; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }
     } else {
         const char *cr = json_str(json_get(e, "root"), nullptr), *ck = json_str(json_get(e, "key"), "");
         store *cs = cr ? store_open(cr) : nullptr; cz = cs ? z3_open(cs, ck, nullptr) : nullptr;
         if (!cz) { fprintf(stderr, "sources: %s: phase onfly: cannot open the codes %s/%s\n", s->name, cr ? cr : "?", ck); return nullptr; }
         /* the dcache key of stored codes (2026-11-13, scratch1: the stored phase rasters replaced by their codes): the array's path, its
-           zarr.json's size and mtime (a rewritten array: a new key), the poolings */
-        { char zp[1100]; struct stat st; snprintf(zp, sizeof zp, "%s/%s/zarr.json", cr, ck);
-          if (!strstr(cr, "://") && !stat(zp, &st)) snprintf(key, nkey, "codes %s/%s size %lld mtime %lld pool%db", cr, ck, (long long)st.st_size, (long long)st.st_mtime, extra + npool); }
+           zarr.json's size and mtime (a rewritten array: a new key), the poolings; since 11-14 also every file of the array (count, bytes,
+           newest mtime in ns: a chunk rewritten in place is a new key) and the pooling code's version */
+        { char zp[1100], ad[1100]; struct stat st; snprintf(zp, sizeof zp, "%s/%s/zarr.json", cr, ck); snprintf(ad, sizeof ad, "%s/%s", cr, ck);
+          if (!strstr(cr, "://") && !stat(zp, &st)) {
+              long long nf = 0, nb = 0, mt = 0; arr_generation(ad, 0, &nf, &nb, &mt);
+              if (snprintf(key, nkey, "codes %s/%s size %lld mtime %lld files %lld bytes %lld newest %lld pool-v%d pool%db", cr, ck, (long long)st.st_size, (long long)st.st_mtime,
+                           nf, nb, mt, LBL_CODES_POOL, extra + npool) >= (int)nkey) key[0] = 0;   /* (truncated: no cache) */
+          } }
         for (int q2 = 0; cz && q2 < extra; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }
     }
     for (int q2 = 0; cz && q2 < npool; q2++) { z3 *q = codes_pool2_open(cz); if (!q) { z3_close(cz); cz = nullptr; } else cz = q; }
@@ -203,8 +225,9 @@ static z3 *onfly_phase_of(z3 *cz, float rm, const char *key, const json *of) {
     if (cell <= 0) { cell = 128; while (cell < 3 * rm && cell < 512) cell *= 2; }
     /* UFSM_DCACHE_PHASE_DELTA (or "cache_delta"): the cells near-lossless within +-delta (dcache_set_phase; 0 exact, the old key) */
     const char *pde = getenv("UFSM_DCACHE_PHASE_DELTA"); const int pdelta = (int)json_num(json_get(of, "cache_delta"), pde && *pde ? atoi(pde) : 0);
-    char k2[1200]; snprintf(k2, sizeof k2, "phase-onfly-pair-v1 rmax %.9g codes %s cell %d", rm, key, cell);   /* (the cell size: the disk files' layout) */
-    if (pdelta > 0 && dcache_set_phase) { const size_t l = strlen(k2); snprintf(k2 + l, sizeof k2 - l, " near-lossless delta %d", pdelta); }
+    char k2[1400];   /* (the cell size: the disk files' layout; the pair rule's version: label_versions.h, v1 until 11-14) */
+    if (snprintf(k2, sizeof k2, "phase-onfly-pair-v%d rmax %.9g codes %s cell %d", LBL_PHASE_PAIR, rm, key, cell) >= (int)sizeof k2) return z;   /* (truncated: no cache) */
+    if (pdelta > 0 && dcache_set_phase) { const size_t l = strlen(k2); snprintf(k2 + l, sizeof k2 - l, " near-lossless delta %d udc-v%d", pdelta, LBL_UDC_CODEC); }
     dcache_pool *pp = json_get(of, "cache_mb") || !z3_open_cached_pool ? nullptr : phase_pool();   /* (an explicit "cache_mb": that spec's own LRU, as before) */
     z3 *zc = pp ? z3_open_cached_pool(z, dcd && *dcd ? dcd : nullptr, k2, cell, pp) : z3_open_cached(z, dcd && *dcd ? dcd : nullptr, k2, cell, (size_t)json_num(json_get(of, "cache_mb"), 1024));
     /* a read's missed cells computed together in boxes of up to "cache_batch" voxels (UFSM_DC_BATCH; default 384: 3^3 cells of 128, the halo

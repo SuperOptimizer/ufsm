@@ -2,6 +2,7 @@
    prediction along the labelled surface. */
 #include "inksplat.h"
 #include "dcache.h"
+#include "label_versions.h"
 #include "inkflygpu.h"
 #include "inkmil.h"
 #include <stdarg.h>
@@ -1403,9 +1404,11 @@ z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine, int own_fine) {
     return z;
 }
 
-/* the dcache key: everything a chunk's bytes depend on. Bump INKFLY_CODE when the arithmetic changes. Local inputs add their size and
+/* the dcache key: everything a chunk's bytes depend on. Bump LBL_INKFLY (label_versions.h) when the arithmetic changes. Local inputs add their size and
    mtime (a tifxyz dir: its x / y / z.tif and meta.json; a zarr array dir: its zarr.json and the dir), so edited labels miss the cache. */
-#define INKFLY_CODE "inkfly 2 (ink-splat --face, validation folding, 2026-11-12)"
+#define INKFLY_STR_(x) #x
+#define INKFLY_STR(x) INKFLY_STR_(x)
+#define INKFLY_CODE "inkfly " INKFLY_STR(LBL_INKFLY)   /* (label_versions.h LBL_INKFLY; 2 was "ink-splat --face, validation folding, 2026-11-12") */
 static void key_stat(char **b, size_t *n, size_t *cap, const char *path, const char *sub) {
     char p[2100]; snprintf(p, sizeof p, "%s%s%s", path, sub ? "/" : "", sub ? sub : ""); struct stat st;
     char l[2400]; const int k = stat(p, &st) ? snprintf(l, sizeof l, " [%s: -]", sub ? sub : ".") :
