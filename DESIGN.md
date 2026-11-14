@@ -15,12 +15,12 @@ touched here.
 never passed one, and neither does the corpus inklib.sh, so every latent ink / c12 / c13 run and every ift3 corpus run went without.
 predict now exits 2 unless it gets `--axis`, `--no-axis 1`, or `UFSM_PRED_NO_AXIS=1`; tests/run_suite.sh sets the env for the fixtures,
 and test_pipeline_cli checks the refusal. latink.sh also took its CT from `tail -1` of the run's scrolls.tsv, which is the pods'
-one-row table; on the desk's table that row is PHerc0490B for every scroll. unroll.sh now passes `UNROLL_CT`. 1667 held-out AUC with
-the axis: AUC_PENDING.
+one-row table; on the desk's table that row is PHerc0490B for every scroll. unroll.sh now passes `UNROLL_CT`. The 1667 held-out AUC
+with the axis is measured after the mega pass.
 
 **Grid-256 ink pass.** The passes got the 512-aligned run box, which is off the shifted tile grid, so predict ran one 544^3 window per
 256 shard (u1667ink on 1667: grid 256 took 350 s against 71 s for grid 0). `pbox` moves the box down as seamless.c's `pass_box` does.
-The passes only feed ink-blend, so they now run with `--q 0 --levels 1`. TIME_PENDING.
+The passes only feed ink-blend, so they now run with `--q 0 --levels 1`. (Timing after the mega pass.)
 
 **Trim at both ends.** The outer trim used wrap-check's "dup" verdict. Against the 1667 GT its precision is 0.07 for dup and 0.014 for
 merged (spiral QA §1). On 1667 it dropped w040-w042, which are published turns 29-31. trim now walks in from each end and drops a wrap
@@ -59,8 +59,24 @@ ink defaults to INKMODE=lat (latink.sh, inkpod 15000); INKMODE=ift3 runs the old
 
 **Field seams (#5).** The existing u1 fields of 1667 (640/64 windows, no blend) step at every 256-cell tile border. Over the mean of a
 z 2048-2304 x 640^2 crop, the normal plane t0 changes by 5.4 / 6.1 across the y borders against an interior median of 1.34 (p99 3.6),
-and by 4.8 / 9.9 across the x borders against 2.0 (p99 4.8). The phase steps less: 0.24 against 0.18 in y, none in x. Sub-box A/B of
-640/64, 1152/64 and a two-grid field-blend: SEAM_PENDING.
+and by 4.8 / 9.9 across the x borders against 2.0 (p99 4.8). The phase steps less: 0.24 against 0.18 in y, none in x. `FBLEND=1` (default OFF)
+predicts each part on two tile grids (origin 0 and half the stride) and blends them with `field-blend --tile`; it turns off the streamed
+ref pass 1. The A/B against 640/64 and LWIN 1152 / LHALO 64 runs after the mega pass.
+
+**Also in this branch.**
+- predict records the axis (or "none") and the radial sign in every output's attrs.
+- predict refuses a fine-stem or guided-head latent checkpoint off the device path (eval audit #14). `--fstem-off 1` accepts that
+  output explicitly.
+- `scripts/unroll/axis_for.sh SCROLL` looks up each scroll's umbilicus. univ/eval.sh, inkgt/baseline.sh, rv/eval.sh and corpus
+  inklib.sh use it.
+- inkcal uses the main ink pass's window.
+
+**Deferred, with reasons.**
+- The per-window statistics sync in predict: the host needs the mean and sd to build the input, and it costs < 1 % of a ~0.3 s window.
+- Air windows are read and decoded before they are skipped: ~6 % of the windows, and only their I/O.
+- A fused `--fit-h 2` field kernel: a pod profile (`UFSM_PRED_PROF=1`) has to show the writer's share first.
+- #21 (ink at 4.8 um on the labelled 1667 boxes) and #8 (slab coherence vs per-z sheet identity, pub1667) are measurements that run
+  after the mega pass.
 
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
