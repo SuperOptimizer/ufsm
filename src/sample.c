@@ -244,7 +244,11 @@ struct sampler {
        source with an aux target) takes the rest from nspare planes shared by all slots, held until that slot is drawn again (or stolen
        while it is FREE). Before: every slot owned the neediest source's count, a second plane per slot nearly constant in most windows
        (zstd 0.0 % at P 512 on scratch2's sources), 1.07 GB per slot at P 1024 */
-    uint8_t *spare[16]; int spare_own[16], nspare, bank_own; pthread_cond_t cv_spare; _Atomic uint64_t spare_wait_ns, spare_takes;
+    /* Held spares can deadlock a fixed pool: under --det 1 the next batch's worker waits on spares held by READY slots later in batch
+       order, or by the batch the split trainer still holds (TAKEN), while the trainer waits on that batch (hung test_slot_planes split,
+       11-14). So a worker that waited UFSM_BANK_SPARE_WAIT_MS (default 50) grows the pool by its missing planes, up to spare_max =
+       nslots * (plane_bank - 1), the old layout's count, at which every slot can hold its extra at once: the wait always ends */
+    uint8_t *spare[64]; int spare_own[64], nspare, bank_own, spare_max; pthread_cond_t cv_spare; _Atomic uint64_t spare_wait_ns, spare_takes, spare_grown;
 };
 
 static int PZ(const sample_cfg *c) { return c->Pz > 0 ? c->Pz : c->P; }   /* window depth (z) */
@@ -299,6 +303,24 @@ static int bank_assign(sampler *sp, const source *s, batch *b) {
             if (ng >= extra) { for (int t = 0; t < ng; t++) { sp->spare_own[got[t]] = me; b->bank[nb++] = sp->spare[got[t]]; } atomic_fetch_add(&sp->spare_takes, 1); break; }
             if (atomic_load(&sp->stop)) { pthread_mutex_unlock(&sp->mu); return -1; }
             if (t0 == 0) { struct timespec m; clock_gettime(CLOCK_MONOTONIC, &m); t0 = m.tv_sec + m.tv_nsec * 1e-9; }
+            else {   /* (waited long enough: grow the pool by the planes missing, outside the lock; the new ones are this slot's at once) */
+                static int wms = -1; if (wms < 0) { const char *e = getenv("UFSM_BANK_SPARE_WAIT_MS"); wms = e ? atoi(e) : 50; }
+                struct timespec m; clock_gettime(CLOCK_MONOTONIC, &m);
+                const int add = extra - ng;
+                if ((m.tv_sec + m.tv_nsec * 1e-9 - t0) * 1e3 >= wms && sp->nspare + add <= sp->spare_max) {
+                    uint8_t *np[16]; pthread_mutex_unlock(&sp->mu);
+                    for (int t = 0; t < add; t++) np[t] = halloc(P3(sp));
+                    pthread_mutex_lock(&sp->mu);
+                    if (sp->nspare + add > sp->spare_max) { pthread_mutex_unlock(&sp->mu); for (int t = 0; t < add; t++) hfree(np[t]); pthread_mutex_lock(&sp->mu); continue; }   /* (another worker grew it first) */
+                    for (int t = 0; t < add; t++) { sp->spare[sp->nspare] = np[t]; sp->spare_own[sp->nspare++] = me; b->bank[nb++] = np[t]; }
+                    atomic_fetch_add(&sp->spare_grown, (uint64_t)add);
+                    fprintf(stderr, "sampler: bank spares grown to %d of %d (slot %d waited %d ms for %d)\n", sp->nspare, sp->spare_max, me, wms, add);
+                    int ng2 = 0; for (int q = 0; q < sp->nspare - add && ng2 < extra - add; q++) { const int o = sp->spare_own[q]; if (o < 0 || (o != me && sp->state[o] == FREE)) { sp->spare_own[q] = me; b->bank[nb++] = sp->spare[q]; ng2++; } }
+                    if (ng2 + add >= extra) { atomic_fetch_add(&sp->spare_takes, 1); break; }
+                    for (int q = 0; q < sp->nspare; q++) if (sp->spare_own[q] == me) sp->spare_own[q] = -1;   /* (lost the race for the rest: all or none, retry) */
+                    nb = sp->bank_own; pthread_cond_broadcast(&sp->cv_spare); continue;
+                }
+            }
             struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 20000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
             pthread_cond_timedwait(&sp->cv_spare, &sp->mu, &ts);   /* (timed: a slot turning FREE frees its spares without a signal here) */
         }
@@ -4175,7 +4197,8 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     {   /* --plane bank with shared spares: UFSM_BANK_SPARE planes (default: half the slots, at least the neediest window's extra; 0: off,
            every slot owns plane_bank) when plane_bank > 1 */
         const char *e = getenv("UFSM_BANK_SPARE"); const int K = sp->cfg.plane_bank;
-        int ns = e ? atoi(e) : (sp->nslots + 1) / 2; if (ns > 0 && ns < K - 1) ns = K - 1; if (ns > 16) ns = 16;
+        int ns = e ? atoi(e) : (sp->nslots + 1) / 2; if (ns > 0 && ns < K - 1) ns = K - 1; if (ns > 64) ns = 64;
+        sp->spare_max = sp->nslots * (K - 1); if (sp->spare_max > 64) sp->spare_max = 64; if (ns > sp->spare_max) ns = sp->spare_max;
         g_bank_own = 0;
         if (K > 1 && ns > 0 && sp->cfg.B == 1) {
             const size_t p3 = P3(sp); sp->bank_own = 1; g_bank_own = 1; sp->nspare = ns; pthread_cond_init(&sp->cv_spare, nullptr);
@@ -4390,7 +4413,7 @@ void sampler_hostmem(const sampler *sp, FILE *f, size_t pinned) {
     struct mallinfo2 mi = mallinfo2();
     long rss = 0; FILE *st = fopen("/proc/self/status", "r"); char line[256];
     if (st) { while (fgets(line, sizeof line, st)) if (!strncmp(line, "VmRSS:", 6)) rss = atol(line + 6); fclose(st); }
-    if (sp->nspare) { int held = 0; for (int q = 0; q < sp->nspare; q++) held += sp->spare_own[q] >= 0; fprintf(f, "hostmem: bank spares %d (%d held), %llu takes, %.1f s waited for one\n", sp->nspare, held, (unsigned long long)sp->spare_takes, sp->spare_wait_ns / 1e9); }
+    if (sp->nspare) { int held = 0; for (int q = 0; q < sp->nspare; q++) held += sp->spare_own[q] >= 0; fprintf(f, "hostmem: bank spares %d (%d held, %llu grown, max %d), %llu takes, %.1f s waited for one\n", sp->nspare, held, (unsigned long long)sp->spare_grown, sp->spare_max, (unsigned long long)sp->spare_takes, sp->spare_wait_ns / 1e9); }
     fprintf(f, "hostmem: rss %.2f GB | pinned %.2f GB (slots %.2f) | workers %d: big %.2f/%.2f GB res/virt, ttmp %.2f/%.2f, pool %.2f virt (peak %.2f, pooled res %.2f)"
                " | malloc arena %.2f GB in use %.2f free %.2f mmapped %.2f | p3 %.0f M; pool classes of a worker (x p3):%s | ink caches %.2f GB targets + %.2f GB CT\n",
             rss / 1048576.0, pinned / G, g_slot_bytes / G, nw, bigr / G, bigv / G, ttr / G, ttv / G, tpv / G, tpk / G, tpr / G,

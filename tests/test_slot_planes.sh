@@ -35,6 +35,10 @@ for mode in whole split; do
   else   # (the split steps print no dettrace lines: the batch planes exact, the losses within det_cmp's 2%)
     ha=$(grep '^batchhash' split_old.log); hb=$(grep '^batchhash' split_new.log)
     [ -n "$ha" ] && [ "$ha" = "$hb" ] || { echo "FAIL: split: the batches differ"; diff <(echo "$ha") <(echo "$hb") | head -4; exit 1; }
+    # (the shared spares at their minimum: a fixed pool deadlocked here, the next batch waiting on spares held by later READY slots /
+    # the batch the split trainer holds; the pool must grow instead and leave the batches identical)
+    run split_sp1 UFSM_BANK_CHECK=1 UFSM_SPLIT_LWARP=0 UFSM_BANK_SPARE=1 UFSM_BANK_SPARE_WAIT_MS=1 -- "${X[@]}"
+    [ "$ha" = "$(grep '^batchhash' split_sp1.log)" ] || { echo "FAIL: split: UFSM_BANK_SPARE=1 changed the batches"; exit 1; }
     paste -d' ' <(grep '^step' split_old.log | awk '{print $2, $6}') <(grep '^step' split_new.log | awk '{print $2, $6}') | awk '{d = $2 - $4; if (d < 0) d = -d; n++; if ($1 != $3 || d > 0.02 * ($2 < 0 ? -$2 : $2) + 1e-6) bad = 1} END {exit bad || n < 8}' \
       || { echo "FAIL: split: losses differ / missing steps"; exit 1; }
     DET_CMP_N=$(echo "$ha" | wc -l)
