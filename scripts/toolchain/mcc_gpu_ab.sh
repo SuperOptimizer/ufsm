@@ -15,15 +15,19 @@
 #            cards; per build: samples/s (median of log.csv rows past step 50), wall s; per logged step the loss of both and |diff|
 #   predict  the fixed checkpoint on the first unseen box (scripts/univ/unseen_boxes.tsv, PBOX^3 = 384^3 at its origin): --fit-zarr fields
 #            and --heads all, every output file sha1-compared (identical / differing / only in one); wall s per build
+#   nolatch  only with NOLATCH_BUILD (an mcc build dir made with MCC_NOLATCH=1 in the environment of the build: mcc's latch fold off): the
+#            stride-2 benches (bench_s2f / s2b / s2) of MCC_BUILD (fold) against NOLATCH_BUILD, same rounds and parser, into OUT/nolatch
+#            (its ab.tsv columns "nvcc" / "mcc" are fold / nolatch). Static count: conv_fwd_s2_f8_k<*,*,0> +~95 SASS in the hot loop
+#            with the fold (<1,bf16,0> 607 vs 513, nvcc 271) while lp_s2 as a whole drops 576386 -> 568327 (ptxperf2, 2026-11-14)
 # Fixed checkpoint: CKPT, else a copy of scratch2/last.ckpt taken once into OUT/fixed.ckpt (reruns reuse it).
 # Prerequisites in BOTH build dirs: ufsm, test_head_tc and the bench_* below (cmake --build DIR --target ufsm test_head_tc bench_f4conv ...;
-# missing ones are skipped and listed). Env: PARTS ("jit bench train predict"), REPS (3), GPU (0, the card the benches use), JITN (8),
+# missing ones are skipped and listed). Env: PARTS ("jit bench nolatch train predict"), NOLATCH_BUILD, AB_JITCACHE, REPS (3), GPU (0, the card the benches use), JITN (8),
 # BENCH_RE (a regex over the bench lines below), TRAIN_STEPS, TRAIN_P, CMDFILE, CKPT, PBOX, TMO (per bench s, 900), LOCKWAIT (s, 1800).
 # Only in a GPU window (the desk cards otherwise belong to scratch2; feedback-desk-gpu-scratch2-only); the merge3 queue line runs it.
 set -u
 NV=$(readlink -f "${1:?NVCC_BUILD}"); MC=$(readlink -f "${2:?MCC_BUILD}"); O=${3:?OUT}; mkdir -p "$O"; O=$(readlink -f "$O")
 H=$(cd "$(dirname "$0")/../.." && pwd)
-PARTS=${PARTS:-jit bench train predict}; REPS=${REPS:-3}; GPU=${GPU:-0}; JITN=${JITN:-8}; TMO=${TMO:-900}
+PARTS=${PARTS:-jit bench nolatch train predict}; REPS=${REPS:-3}; GPU=${GPU:-0}; JITN=${JITN:-8}; TMO=${TMO:-900}
 TRAIN_STEPS=${TRAIN_STEPS:-200}; TRAIN_P=${TRAIN_P:-768}; PBOX=${PBOX:-384}
 RUNS=/vesuvius/ufsm/v2/lat/runs
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a "$O/ab.log"; }
@@ -38,7 +42,7 @@ mkdir -p /tmp/ufsm-suite-locks
 fd=20; for lk in $LOCKS; do eval "exec $fd> $lk"; flock -w ${LOCKWAIT:-1800} $fd || { log "lock $lk busy"; exit 2; }; fd=$((fd + 1)); done
 log "mcc_gpu_ab: nvcc $NV ($(sha1sum "$NV/ufsm" | cut -c1-8)) vs mcc $MC ($(sha1sum "$MC/ufsm" | cut -c1-8)); parts [$PARTS], reps $REPS, GPU $GPU"
 nvidia-smi --query-gpu=index,name,driver_version,clocks.max.sm,temperature.gpu,memory.used --format=csv,noheader >> "$O/ab.log" 2>&1
-export MCUDA_CACHE=$O/jitcache; mkdir -p "$MCUDA_CACHE"   # (nvcc builds ignore it)
+export MCUDA_CACHE=${AB_JITCACHE:-$O/jitcache}; mkdir -p "$MCUDA_CACHE"   # (nvcc builds ignore it)
 
 # ---- jit: the cold first-run cost of mcc's PTX (PLAN.md gap 14)
 if part jit; then
@@ -159,6 +163,17 @@ PY
   log "bench: $(grep -c . "$O/ab.tsv") rows in ab.tsv; $(awk -F'\t' '$8 == "SLOW"' "$O/ab.tsv" | wc -l) timings > 3 % slower under mcc; $(awk -F'\t' '$9 == "diff"' "$O/ab.tsv" | wc -l) output checks differ"
 fi
 
+# ---- nolatch: mcc's latch fold on / off on the stride-2 family (a nested run of this script, bench only, under the locks held here)
+if part nolatch && [ -n "${NOLATCH_BUILD:-}" ]; then
+  NL=$(readlink -f "$NOLATCH_BUILD")
+  if [ -x "$NL/ufsm" ]; then
+    env CUDA_VISIBLE_DEVICES=$GPU MCUDA_PRECOMPILE=$JITN "${MCAP[@]}" "$NL/ufsm" sysinfo > "$O/jit_nolatch.log" 2>&1   # (only lp_s2's changed PTX compiles)
+    log "nolatch: fold $MC vs MCC_NOLATCH=1 $NL; $(grep -c 'compiled in' "$O/jit_nolatch.log") kernels compiled for it"
+    AB_LOCKS= AB_JITCACHE=$MCUDA_CACHE PARTS=bench BENCH_RE='^bench_s2' REPS=$REPS GPU=$GPU TMO=$TMO bash "$0" "$MC" "$NL" "$O/nolatch" > /dev/null 2>&1
+    log "nolatch: $(cat "$O/nolatch/bench_summary.txt" 2>/dev/null | sed 's/mcc\/nvcc/nolatch\/fold/g; s/rc nvcc/rc fold/g; s/ mcc \[/ nolatch [/g' | tr '\n' ' ')"
+  else log "nolatch: no $NL/ufsm"; fi
+fi
+
 # ---- the fixed checkpoint (train --init-from, predict)
 CK=${CKPT:-}
 if part train || part predict; then
@@ -250,7 +265,7 @@ if [ -s "$O/jit_kernels.tsv" ]; then
     "$O/jit_used.txt" "$O/jit_kernels.tsv" > "$O/jit_used_summary.txt"; log "$(cat "$O/jit_used_summary.txt")"
 fi
 
-{ echo "mcc GPU A/B $(date '+%F %H:%M'): nvcc $NV vs mcc $MC"; grep -E '^[0-9-]+ [0-9:]+ (jit|predict|train (nvcc|mcc):)' "$O/ab.log" | cut -d' ' -f3-
+{ echo "mcc GPU A/B $(date '+%F %H:%M'): nvcc $NV vs mcc $MC"; grep -E '^[0-9-]+ [0-9:]+ (jit|predict|nolatch|train (nvcc|mcc):)' "$O/ab.log" | cut -d' ' -f3-
   [ -s "$O/train_summary.txt" ] && cat "$O/train_summary.txt"; [ -s "$O/bench_summary.txt" ] && cat "$O/bench_summary.txt"
   [ -s "$O/ab.tsv" ] && { echo "-- timings > 3 % slower under mcc (ratio, nvcc ms, mcc ms, bench, line):"
     awk -F'\t' '$8 == "SLOW" {printf "%s\t%s\t%s\t%s\t%s\n", $7, $5, $6, $1, $10}' "$O/ab.tsv" | sort -rn | head -60; }
