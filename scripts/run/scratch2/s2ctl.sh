@@ -61,7 +61,7 @@ do_dry() {   # the exact launch (scratch2.launch -> scratch2.train.sh, DRY=1) fo
   kill -0 "$LP" 2>/dev/null && { kill -TERM "$(cat $D.pid 2>/dev/null)" 2>/dev/null; log "drystart: still running after 15 min, stopped"; return 1; }
   local n rc; n=$(grep -cE '^step +[0-9]+ ' $D.log 2>/dev/null); rc=$(grep -o 'exit rc=[0-9]*' $D.resume.log 2>/dev/null | tail -1)
   if [ "${n:-0}" -ge 1 ] && [ "$rc" = "exit rc=0" ] && ! grep -qiE ' nan |non-finite|cannot construct' $D.log; then
-    log "drystart OK: $n step lines, $rc ($(grep -E '^step' $D.log | tail -1 | cut -c1-50))"; grep -E 'held-out boxes|holdout|excluded' $D.log | head -40 > $LOG.dry-holdouts; cp $D.log $LOG.dry-last.log
+    log "drystart OK: $n step lines, $rc ($(grep -E '^step' $D.log | tail -1 | cut -c1-50))"; grep -E 'held-out boxes|holdout|excluded|lies outside|val by (source|scroll)' $D.log > $LOG.dry-holdouts; cp $D.log $LOG.dry-last.log
     [ "${DRYFRESH:-0}" = 1 ] || [ -n "${DRYU:-}${DRYLR0:-}" ] || cp $E $o/launch.env.good; [ "${DRYKEEP:-0}" = 1 ] || rm -rf -- "$D"; return 0; fi
   log "drystart FAILED: $n step lines, ${rc:-no exit line}; $D.log: $(grep -iE 'error|cannot|refus|fail|abort' $D.log | head -2 | tr '\n' ' ' | cut -c1-200)"; return 1
 }
@@ -119,7 +119,7 @@ PY
           U1=$(grep '^U=' $NE | cut -d= -f2-); [ -x "$U1" ] || { log "fresh: binary not executable: $U1"; exit 1; }
           do_stop "fresh: ${3:-}" || exit 1
           PREV=$o/launch.env.prev.$(date +%H%M%S); cp $E $PREV; cp $NE $E
-          if ! DRYFRESH=1 do_dry; then cp $PREV $E; log "fresh: the dry start failed: the old run resumes"; do_resume "" "fresh dry start failed"; exit 1; fi
+          if ! DRYFRESH=1 DRYVAL=1 do_dry; then cp $PREV $E; log "fresh: the dry start failed: the old run resumes"; do_resume "" "fresh dry start failed"; exit 1; fi
           [ -f $o.parked ] && mv $o.parked $AR.parked 2>/dev/null
           mkdir -p $AR && mv $o $AR/run && for f in scratch2.log scratch2.alerts scratch2.health.state scratch2.resume.log scratch2.nohup scratch2.snapwatch.log; do [ -e $R/$f ] && mv $R/$f $AR/; done
           cp -a $G $AR/gates; mkdir -p $o; cp $NE $E; cp $NE $o/launch.env.good; sync_settings

@@ -26,7 +26,7 @@ o=$R/$NAME; mkdir -p $o; cd $R || exit 1
 if [ "${DRY:-0}" = 1 ]; then   # (s2ctl.sh drystart: the exact launch for 2 windows from a copy of scratch2/last.ckpt, in <R>/<NAME> = scratch2.dry)
   if [ "${FRESH:-0}" = 1 ]; then rm -f $o/last.ckpt; st=0   # (s2ctl.sh fresh: a from-scratch start, 2 windows, no checkpoint)
   else cp $R/scratch2/last.ckpt $o/last.ckpt || exit 1; st=$(head -c 200000 $o/last.ckpt | head -1 | grep -o '"step":[0-9]*' | head -1 | cut -d: -f2); fi
-  STEPS=$((${st:-0} + ${DRYSTEPS:-2})); LOGE=1; CKPT=1000000; RELAUNCH=0; SNAP=1000000000
+  STEPS=$((${st:-0} + ${DRYSTEPS:-2})); VAL=${DRYVAL:-${VAL:-2000}}; LOGE=1; CKPT=1000000; RELAUNCH=0; SNAP=1000000000
 fi
 export MALLOC_ARENA_MAX=4
 [ -x "$U" ] || { echo "no binary $U"; exit 1; }
