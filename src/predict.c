@@ -542,6 +542,7 @@ typedef struct {
     char rowsf[1400];   /* <fit-zarr>/rows.done: "z0 z1" (field cells) appended per flushed slab: count-field --follow reads behind the predict */
     ffring rg;       /* the slab's layout (a ring of rows with row flushes) */
     int64_t s0, s1;  /* --gpus workers (z layers): the slabs this process owns; the others' are never flushed here (their fill would overwrite) */
+    uint8_t *sdone; int64_t nsd;   /* --resume: the slabs rows.done lists (written by an earlier run): never flushed again (their fill would overwrite) */
     /* row flushes on their own thread (half the CPUs), so the scatter of window chunks never waits for compression: a queue of
        kind-2 jobs; the slab flush (kind 1) waits for it to drain */
     pthread_t rth; ffw_job rq[FFW_Q]; int rqh, rqn, rbusy, rstop, rnt;
@@ -574,6 +575,7 @@ static void *ffw_main(void *arg) {
         pthread_cond_broadcast(&W->cv);
         pthread_mutex_unlock(&W->mu);
         if (j.kind == 1 && (j.slab < W->s0 || j.slab >= W->s1)) continue;   /* (another worker's slab) */
+        if ((j.kind == 1 || j.kind == 2) && W->sdone && j.slab >= 0 && j.slab < W->nsd && W->sdone[j.slab]) continue;   /* (--resume: written before) */
         if (j.kind == 1) {   /* the slab is left: the row flusher drained, then the rows left (all CPUs) and the reset */
             const double t0 = now();
             pthread_mutex_lock(&W->mu); while (W->rqn || W->rbusy) pthread_cond_wait(&W->cv, &W->mu); pthread_mutex_unlock(&W->mu);
@@ -1377,7 +1379,7 @@ static int predict_one(int argc, char **argv) {
                         "       [--gn-frozen FILE]   use FILE's pooled GroupNorm statistics instead of each window's (no dependence on the window)\n"
                         "       [--papyrus-cut T]   task papyrus nets conditioned on the cutoff: papyrus where the smoothed CT exceeds T (raw CT units)\n"
                         "       [--full-grid 1]   the output spans the CT level's whole grid; --box (rounded out to shards) selects the shards computed\n"
-                        "       [--resume 1]   skip the shards listed in <out>/predict-done-<level>.txt (appended as shards are written)\n"
+                        "       [--resume 1]   skip the shards listed in <out>/predict-done-<level>.txt (appended as shards are written; --heads: every head's log; --fit-zarr: the slabs in DIR/rows.done)\n"
                         "       [--occupancy L]   skip shards that are all zero (air) on the coarser CT level L, e.g. 5\n");
         fprintf(stderr, "  Default window: k shards + 2 halo (one window per k^3 shards) for the largest k <= 4 the box and the GPU hold, else one per shard,\n"
                         "  else 288 with halo 8; the halo is 16, or 32 when the window must be a multiple of 64 (7 levels). For exact shard tiling, window - 2*halo should\n"
@@ -1659,7 +1661,7 @@ static int predict_one(int argc, char **argv) {
     if (nwork > 1 && !box) { fprintf(stderr, "--gpus needs --box\n"); return 2; }
     if (sheet_task && ngpu>1) { fprintf(stderr,"winding export currently uses one GPU per output store\n"); return 2; }
     pid_t kids[8] = {0}; int is_child = 0;
-    if (nwork > 1 && ffz) { char rp[1400]; snprintf(rp, sizeof rp, "%s/rows.done", ffz); mkdir(ffz, 0755); FILE *rf = fopen(rp, "w"); if (rf) fclose(rf); }   /* (the workers append) */
+    if (nwork > 1 && ffz) { char rp[1400]; snprintf(rp, sizeof rp, "%s/rows.done", ffz); mkdir(ffz, 0755); FILE *rf = fopen(rp, atoi(opt(argc, argv, "--resume", "0")) ? "a" : "w"); if (rf) fclose(rf); }   /* (the workers append; --resume keeps the earlier rows) */
     if (nwork > 1) {
         for (int i = 0; i < ngpu; i++) {
             pid_t c = fork();
@@ -1724,6 +1726,9 @@ static int predict_one(int argc, char **argv) {
     if (ema_blend >= 0.f) unet_blend_ema(u, ema_blend);
     unet_use_ema(u, use_ema || ema_blend >= 0.f);
     if (infer_lean) unet_infer_release(u, 0);
+    if (use_ema && ema_blend < 0.f && step > 0 && step < 10000)   /* (audit 11-14 infer #11: decay 0.999 lags ~1000 steps; scratch2 at 1000-2000: |ema - p| / |p| 8-10 %) */
+        fprintf(stderr, "predict: note: step %d checkpoint with --ema 1: the EMA weights lag the live ones by ~1000 steps early in a run; "
+                        "for a snapshot comparison score --ema 0 (or --ema-blend) too\n", step);
     /* --gn-live 1 (gn_ema nets, audit 11-14 infer #2): normalise with each window's own GroupNorm statistics, the function the net trains
        with while --gn-ema-warm has not ended; the default is the running statistics */
     const int gn_live = atoi(opt(argc, argv, "--gn-live", "0")) != 0;
@@ -1810,6 +1815,7 @@ static int predict_one(int argc, char **argv) {
        <out>/predict-done-<level>.txt (one "z y x" line per shard, appended as each is written). --occupancy L skips shards whose
        window footprint is all zero on CT level L (> --level, e.g. 5: the scroll's air outside the mask) */
     const int fullg = atoi(opt(argc, argv, "--full-grid", "0")) != 0, resume = atoi(opt(argc, argv, "--resume", "0")) != 0;
+    if (resume && split && ffz) { fprintf(stderr, "predict: --fit-zarr --resume is not supported with --split z\n"); return 2; }
     const int occl = atoi(opt(argc, argv, "--occupancy", "-1"));
     int64_t ash[3] = {bn[0], bn[1], bn[2]}, soff[3] = {0, 0, 0};
     if (fullg) {
@@ -2287,13 +2293,33 @@ static int predict_one(int argc, char **argv) {
                                                                                                                   two staging buffers (the fit writer thread) */
             if (!ffacc || !ff8d || !ff8h) { fprintf(stderr, "predict: no memory for the fit-field window accumulator\n"); return 1; }
             ffw.zw = ffzw; ffw.sl = ffsl; ffw.F = ffF; ffw.FS = FFS; ffw.FZ = FZ; ffw.gpu = gpu;
-            if (ffzm) { snprintf(ffw.rowsf, sizeof ffw.rowsf, "%s/rows.done", ffz); FILE *rf = nwork > 1 ? nullptr : fopen(ffw.rowsf, "w"); if (rf) fclose(rf);   /* (a resumed run starts over: no rows yet) */
+            if (ffzm) { snprintf(ffw.rowsf, sizeof ffw.rowsf, "%s/rows.done", ffz); FILE *rf = nwork > 1 ? nullptr : fopen(ffw.rowsf, resume ? "a" : "w"); if (rf) fclose(rf);   /* (--resume keeps the rows written before) */
                         char p[1400]; snprintf(p, sizeof p, "%s/fields.partial.json", ffz); if (ffz_json(p, bo, bn, ffF, ffh, um * (1 << level), ffu2, ffw4d, &ax, level)) return 1; }
             ffw.done = calloc((size_t)(FZ / FFS) * ((ffF[1] + FFS - 1) / FFS), 1);
             if (!ffw.done) { fprintf(stderr, "predict: out of memory\n"); return 1; }
             for (int b = 0; b < ffw.nb; b++) { ffw.h[b] = ff8h + (size_t)b * FFZ_MAXP * ffwn; ffw.evs[b] = nn_event_create(); ffw.evd[b] = nn_event_create(); }
             pthread_mutex_init(&ffw.mu, nullptr); pthread_cond_init(&ffw.cv, nullptr); atomic_store(&ffw.fail, 0);
             { long nc = ufsm_ncpu(); ffw.rnt = nc > 2 ? (int)(nc / 2) : 1; }
+            if (resume) {   /* --fit-zarr --resume (audit 11-14 infer #6): the slabs rows.done lists are final in the store (a slab's line is appended
+                               after all its shards were written), so their windows write no fields and the slabs are never flushed again; a shard
+                               is computed when its slab is not done or another output (--heads, the main store) still needs it. Needs the same
+                               box / --fit-h / window as the earlier run: a line off this run's slab grid is ignored (that slab is recomputed) */
+                ffw.nsd = (ffF[0] + FZ - 1) / FZ; ffw.sdone = calloc((size_t)ffw.nsd, 1);
+                if (!ffw.sdone) { fprintf(stderr, "predict: out of memory\n"); return 1; }
+                FILE *rf = fopen(ffw.rowsf, "r"); long long ra, rb; int64_t nsd = 0;
+                while (rf && fscanf(rf, "%lld %lld", &ra, &rb) == 2)
+                    if (ra >= 0 && ra % FZ == 0 && ra / FZ < ffw.nsd && rb == (ra + FZ < ffF[0] ? ra + FZ : ffF[0]) && !ffw.sdone[ra / FZ]) { ffw.sdone[ra / FZ] = 1; nsd++; }
+                if (rf) fclose(rf);
+                const int oth = lhm || !atoi(opt(argc, argv, "--no-out", "0"));   /* (another output needs the shards its own log does not list) */
+                long nre = 0, nun = 0;
+                for (int64_t a = 0; a < ns[0]; a++) {
+                    const int64_t sl = a * shard / ffh / FZ; const int fd = sl < ffw.nsd && ffw.sdone[sl];
+                    for (int64_t b = 0; b < ns[1] * ns[2]; b++) { uint8_t *e = &sskip[a * ns[1] * ns[2] + b];
+                        if (*e == 1 && !fd) { *e = 0; nun++; } else if (*e == 0 && fd && !oth) { *e = 1; nre++; } }
+                }
+                fprintf(stderr, "predict: --fit-zarr --resume: %lld of %lld field slabs done (%s); %ld shards skipped for them, %ld written shards recomputed for the fields\n",
+                        (long long)nsd, (long long)ffw.nsd, ffw.rowsf, nre, nun);
+            }
             if (pthread_create(&ffw_th, nullptr, ffw_main, &ffw) || pthread_create(&ffw.rth, nullptr, ffw_rows, &ffw)) { fprintf(stderr, "predict: cannot start the fit writer\n"); return 1; }
             ffw_on = 1;
         }
@@ -2827,6 +2853,7 @@ static int predict_one(int argc, char **argv) {
                 if (ok && (c1[0] - 1) / FZ != c0[0] / FZ) {   /* (never with the clip above; a clean stop instead of a write past the slab) */
                     fprintf(stderr, "predict: --fit-zarr: a window's cells %d .. %d in z span two field slabs of %d (a box off the window grid?)\n", c0[0], c1[0], FZ); return 1;
                 }
+                if (ok && ffw.sdone && c0[0] / FZ < ffw.nsd && ffw.sdone[c0[0] / FZ]) ok = 0;   /* (--resume: the slab's fields are written) */
                 if (ok) {
                     const int64_t slab = c0[0] / FZ;
                     while (ffslab < slab) { ffw_push(&ffw, (ffw_job){.kind = 1, .slab = ffslab}); ffslab++; }   /* after the slab's chunk copies (FIFO) */
@@ -3064,7 +3091,7 @@ static int predict_one(int argc, char **argv) {
                                      ffw.t_slab, ffw.n_slab, ffw.t_ring, ffw.t_copy, ffw.t_scat, ffw.t_rows, ffw.n_rows, ffw.rnt);
         if (pprof) fprintf(stderr, "predict profile (s): fit writer tail (the last field slabs) %.2f\n", now() - tfin);
         for (int k = 0; k < ffz_np; k++) { z3w_close(ffzw[k]); free(ffsl[k]); }
-        free(ffw.done); free(ffw.rg.own);
+        free(ffw.done); free(ffw.rg.own); free(ffw.sdone);
         nn_free(ffacc); nn_free(ffacc4); nn_free(ff8d); nn_host_free(ff8h);
         char p[1400]; if (nwork > 1) snprintf(p, sizeof p, "%s/fields.json.w%d", ffz, part); else snprintf(p, sizeof p, "%s/fields.json", ffz);   /* (workers: the parent renames one) */
         if (ffz_json(p, bo, bn, ffF, ffh, um * (1 << level), ffu2, ffw4d, &ax, level)) return 1;
