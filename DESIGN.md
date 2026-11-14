@@ -62,7 +62,7 @@ At scratch2's own widths (uneven copies), the same windows give:
 - phase 0.7122, 0.5402, 0.4491, 0.5414;
 - wind4 acc 0.376, 0.552, 0.686, 0.540.
 
-On real labelled windows these widths stay as close: the 12% logit deviation on random inputs does not show up as a loss gap.
+On the fixture's labelled windows these widths stay as close as the exact 2x: the 12% logit deviation on random inputs does not show up as a loss gap there.
 A real-data step-0 check, at lr 0 on the desk data path, is still to be run in a desk window.
 
 ## Adaptive data echoing: `--echo-max M` (2026-11-14, branch echo-20261114)
