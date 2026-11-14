@@ -104,6 +104,7 @@ ufsm_exe(test_fields_pack SUITE tests/test_fields_pack.c OBJS fieldspack repack 
 ufsm_exe(test_fields_phase SUITE tests/test_fields_phase.c OBJS fieldsphase fit fit_emb embz fit_ct l1pot coreline json zarr3 store z3w NN
          LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fit SUITE tests/test_fit.c OBJS fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_fit_dir SUITE tests/test_fit_dir.c OBJS fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fit_emb SUITE tests/test_fit_emb.c OBJS fit_emb embz z3w fit fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fit_join SUITE tests/test_fit_join.c OBJS fitjoin afv phasegate fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN
          LP LIBS LDLIBS CUDA)

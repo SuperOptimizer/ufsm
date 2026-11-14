@@ -1583,7 +1583,7 @@ static int cmd_fit(int argc, char **argv) {
     const char *dir = argv[2];
     fit_cfg c = fit_cfg_default();
     c.verbose = arg_index(argc, argv, "--quiet") < 0;
-    c.dir = atoi(opt(argc, argv, "--dir", "0")); c.unwrap_voxels = atoi(opt(argc, argv, "--unwrap-voxels", "1"));
+    c.dir = atoi(opt(argc, argv, "--dir", "0")); c.dir_loops = atoi(opt(argc, argv, "--dir-loops", "0")); c.unwrap_voxels = atoi(opt(argc, argv, "--unwrap-voxels", "1"));
     c.cpu = arg_index(argc, argv, "--cpu") > 0; c.threads = atoi(opt(argc, argv, "--threads", "0")); fit_set_threads(c.threads);
     c.phase_robust = (float)atof(opt(argc, argv, "--phase-robust", "0")); c.conf_pow = (float)atof(opt(argc, argv, "--conf-pow", "1"));
     c.bend = (float)atof(opt(argc, argv, "--bend", "0"));

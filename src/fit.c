@@ -210,6 +210,38 @@ static inline int fit_cell(const fit_fields *f, int z, int y, int x, size_t *i) 
     y -= f->oy; x -= f->ox; if (y < 0 || x < 0 || y >= f->H || x >= f->W) return 0;
     *i = ((size_t)z * f->H + y) * f->W + x; return 1;
 }
+/* The direction when the rings give no vote (fit_init_prior: < 3 coherent rings). ring_winding demodulates by a fixed pitch r / p, so
+   on a scroll whose sheets are far from circles (PHerc1667: one turn's radius 3.7..5.4 mm) no sector of a ring is coherent and the
+   prior fell back to dir +1 silently: the whole 1667 unroll was fitted with the wrong hand (2026-11-14, its wraps hop two sheets per
+   turn in the voids). Here the network phase itself is walked around circles about the axis in the field grid (a step of 2/3 cell,
+   the confident cells only, |m| > 0.3 and material): the unwrapped total of one loop is the winding of e^{i 2 pi W} around the axis,
+   -dir (U is single-valued), with no pitch and no circular-sheet assumption. Loops with < 1/2 confident samples are skipped; one
+   loop per 3 cells of radius on 16 rows. Returns the loops written to totals (rounded windings). */
+static int loop_winding(const fit_fields *f, double *totals, int maxr) {
+    const double h = f->h; const int BH = fit_box_H(f), BW = fit_box_W(f), na = (int)(f->D * h) + 1; int nt = 0;
+    const int nz = f->D < 16 ? f->D : 16;
+    double *ph = malloc(sizeof(double) * (size_t)(8 * (BH + BW) + 64)); if (!ph) return 0;
+    for (int zi = 0; zi < nz && nt < maxr; zi++) {
+        const int z = (int)((zi + 0.5) * f->D / nz); const double pz = (z + 0.5) * h;
+        const double cy = axis_lerp(f->cy, na, pz) / h - 0.5, cx = axis_lerp(f->cx, na, pz) / h - 0.5;   /* axis in cell coordinates */
+        for (double r = 10; nt < maxr; r += 3) {
+            const int ns = (int)(2 * M_PI * r * 1.5); if (ns > 8 * (BH + BW)) break;
+            if (cy - r < 0 || cx - r < 0 || cy + r > BH - 1 || cx + r > BW - 1) break;   /* (the loop must stay in the box) */
+            int nok = 0;
+            for (int s = 0; s < ns; s++) {
+                const double t = -M_PI + 2 * M_PI * s / ns; const int y = (int)lround(cy + r * sin(t)), x = (int)lround(cx + r * cos(t)); size_t i;
+                if (!fit_cell(f, z, y, x, &i) || !f->w[i]) continue;
+                const double mc = (f->pc[i] - 128) / 127.0, ms = (f->ps[i] - 128) / 127.0;
+                if (mc * mc + ms * ms < 0.09) continue;
+                ph[nok++] = atan2(ms, mc) / (2 * M_PI);
+            }
+            if (nok < ns / 2) continue;
+            double tot = 0; for (int s = 0; s < nok; s++) { double d = ph[(s + 1) % nok] - ph[s]; d -= round(d); tot += d; }
+            totals[nt++] = round(tot);
+        }
+    }
+    free(ph); return nt;
+}
 int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m) {
     const double h = f->h; const int BH = fit_box_H(f), BW = fit_box_W(f); const size_t n = (size_t)f->D * BH * BW;   /* (box cells: a crop samples the same) */
     const int na = (int)(f->D * h) + 1;
@@ -245,6 +277,16 @@ int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m) {
         /* keep this knot's samples' offset for the chosen direction below: store per knot later */
     }
     if (ntot) { qsort(tots, ntot, sizeof(double), cmp_d); wind = tots[ntot / 2]; nwind = ntot; }
+    int nloop = 0, lpos = 0, lneg = 0;
+    if (nwind < 3 && !c->dir) {   /* no ring vote: the phase walked around circles (loop_winding); the sign count of the loops' windings */
+        double *lt = malloc(sizeof(double) * 4096);
+        if (lt) { nloop = loop_winding(f, lt, 4096); for (int k = 0; k < nloop; k++) { lpos += lt[k] > 0; lneg += lt[k] < 0; } free(lt); }
+        const int lv = lpos + lneg >= 8 ? (lpos > lneg ? -1 : lpos < lneg ? 1 : 0) : 0;   /* the loops' direction (0: undecided) */
+        if (c->dir_loops && lv) { wind = (double)(lpos - lneg) / (lpos + lneg); nwind = lpos + lneg; }   /* (the vote's share margin as |wind|) */
+        fprintf(stderr, "fit prior: WARNING: no ring vote on the direction; the phase walked around the axis: %d of %d loops wind +, %d wind -, "
+                "i.e. dir %s; %s\n", lpos, nloop, lneg, lv ? (lv < 0 ? "-1" : "+1") : "undecided",
+                c->dir_loops && lv ? "taken (--dir-loops 1)" : "dir +1 is the DEFAULT, not a measurement: pass --dir from a known surface (PHerc1667: -1) or --dir-loops 1");
+    }
     m->dir = c->dir ? c->dir : (wind > 0 ? -1 : 1);
     m->dir_vote = c->dir ? 1.0 : fabs(wind) * (nwind >= 3 ? 1 : 0);   /* |median winding per ring|, 0 when too few rings */
     for (int k = 0; k < m->nk; k++) {   /* offset per knot with the direction */
