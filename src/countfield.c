@@ -837,8 +837,8 @@ int cmd_count_field(int argc, char **argv) {
     const int Q = Qf / P < 2 ? 2 : Qf / P;   /* the closing loops: --loop field cells, >= 2 solve cells */
     float *cl = malloc(L->n * sizeof(float)); { cf_close CC = {L, Q, cl}; cf_par(L->d, cf_close_run, &CC); }
     { size_t nc = 0, nb = 0; double sc = 0; for (size_t i = 0; i < L->n; i++) if (Sfine[i] > 0) { nc++; sc += cl[i]; nb += cl[i] > 0.25; }
-      fprintf(stderr, "count-field: closing error over %dx%d-solve-cell loops: mean %.3f turns, > 0.25 turn on %.3f of %zu data cells (diagnostic of the targets only: "
-                     "not used by the solve, not a quality measure; P4 1.23 at GT ids 0.18, 1667 2.06 at 0.84)\n", Q, Q, nc ? sc / nc : 0, nc ? (double)nb / nc : 0, nc); }
+      fprintf(stderr, "count-field: closing error over %dx%d-solve-cell loops: mean %.3f turns, > 0.25 turn on %.3f of %zu data cells (the targets' non-integrability: "
+                     "not used by the solve; it only down-weights the phase gauge, exp(-cl^2 / 0.125); not a quality measure: P4 1.23 at GT ids 0.18, 1667 2.06 at 0.84)\n", Q, Q, nc ? sc / nc : 0, nc ? (double)nb / nc : 0, nc); }
     if (getenv("UFSM_CF_DEBUG")) {   /* closing error, density and |n . r| by radius (1 mm rings) */
         enum { NRB = 40 }; double cn[NRB] = {0}, cb[NRB] = {0}, cr[NRB] = {0}, cs[NRB] = {0}, cg[NRB] = {0};
         for (int z = 0; z < L->d; z++) { const double pz = cf_center(L, z), cy = cf_axis_at(g.cy, na, pz), cx = cf_axis_at(g.cx, na, pz);
