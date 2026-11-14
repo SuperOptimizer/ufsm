@@ -2,7 +2,9 @@
 # The universal-net recipe data parallel on two GPUs (train --gpus 0,1): latent grid, --rv 2, --um-rungs, --film 2, --fstem, --uw, --grad-cos,
 # --gpu-aug 3 --replay 3 on the wind fixture's two sources (phase at levels 1 and 2), 6 steps, then a resume to 9. Then --det 1 for 30 steps:
 # one host thread per GPU (the default) against one thread (UFSM_MGPU_THREADS=0, phased launches) and the per-GPU order (UFSM_MGPU_PHASED=0),
-# step / validation / grad-cos lines identical (timing stripped; a race in the thread-local op state shows as a changed line)
+# step / validation / grad-cos lines identical (timing stripped; a race in the thread-local op state shows as a changed line).
+# The first run also checks the replicas' weights (--replica-check 3 --replica-sync 1, train#9): a check line at steps 3 and 6, no
+# "more than ulp drift" warning, and after a re-sync at step 3 the replicas still train.
 # Usage: test_univ2.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
 # two GPUs or a skip (run_suite.sh gives a gpu2 test both GPUs when there are two, else one: CUDA_VISIBLE_DEVICES = that one; the runner
@@ -23,7 +25,9 @@ C=(--task unwrap2 --P 64 --B 1 --gpus 0,1 --workers 2 --sampler-slots 4 --val-ba
    --gpu-aug 3 --replay 3 --warmup 0 --seed 5 --widths 16,32,64 --rv 2 --rv-iso 100 --lat 4 --lat-guide 3 --um-rungs 19.2,38.4 --rung-shift-p 0.2
    --film 2 --fstem 16 --fstem-drop 0.25 --uw 1 --grad-cos 3 --packed-weight 8)
 cd "$D"
-"$U" train fx/sources-mix.json --out run --steps 6 "${C[@]}" > run.log 2>&1 || { echo "FAIL: 2-GPU run ($D/run.log)"; exit 1; }
+"$U" train fx/sources-mix.json --out run --steps 6 "${C[@]}" --replica-check 3 --replica-sync 1 > run.log 2>&1 || { echo "FAIL: 2-GPU run ($D/run.log)"; exit 1; }
+for s in 3 6; do grep -q "replica check step $s: GPU" run.log || { echo "FAIL: no replica check at step $s ($D/run.log)"; exit 1; }; done
+! grep -q 'more than ulp drift' run.log || { echo "FAIL: replicas drifted: $(grep 'replica check' run.log | head -2)"; exit 1; }
 grep -q 'x 2 GPU(s)' run.log || { echo "FAIL: not two GPUs"; exit 1; }
 grep -q '^grad-cos step 6 (head input): phase/normal' run.log || { echo "FAIL: no grad-cos line"; exit 1; }
 grep -q '^step      6 .* uw phase' run.log || { echo "FAIL: step 6 / uw"; exit 1; }
