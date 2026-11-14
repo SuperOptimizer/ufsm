@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_part.h"   /* UFSM_TEST_PART=K/6: phase 1 | phase 2 | 2b + offload / split | 16-wide input | speed paths 16-wide | 32-wide */
 
 static int fails;
 static int g_quick;   /* UFSM_TEST_QUICK (make test): fewer CT-stem cases (P 128, every path once) */
@@ -139,7 +140,7 @@ int main(void) {
     if (!nn_mx_ok()) { printf("test_infer_mem: skipped (the MX paths are off: no fp4 / fp8 tensor cores and UFSM_MX_EMU not 1)\n"); return 0; }   /* (MX-fp4 placement only) */
     unet_set_act_mx4(1); unet_set_act_mx8(0); unet_set_grad_mx8(0); unet_set_input_mx(1);
     if (unet_set_input_prec(8)) return 2;
-    for (int sc = 0; sc < 2; sc++) {
+    TEST_PART(0) for (int sc = 0; sc < 2; sc++) {
         unet_cfg cfg = {6, {32, 64, 96, 128, 160, 192}, 4, 7, 8, 1, sc};
         for (int P = 64; P <= 128; P += 64) for (int k = 0; k < 2; k++) {
             const int nc = k ? 0 : 1, co = nc ? nc : cfg.cout;
@@ -156,7 +157,7 @@ int main(void) {
         }
     }
     /* phase 2: in-place z-slab convs at level 0 (UFSM_INFER_SLAB): the same logits up to the GroupNorm summation order */
-    for (int sc = 0; sc < 2; sc++) {
+    TEST_PART(1) for (int sc = 0; sc < 2; sc++) {
         unet_cfg cfg = {6, {32, 64, 96, 128, 160, 192}, 4, 7, 8, 1, sc};
         for (int P = 64; P <= 128; P += 64) for (int si = 0; si < 3; si++) {
             static const int slabs[3] = {8, 12, 32};
@@ -175,7 +176,7 @@ int main(void) {
     }
     /* phase 2b: the stem input built per slab from the uint8 CT (unet_forward_ct, the CT at the end of X) == predict's 16-bit input
        + the full-window conversion */
-    for (int sc = 0; sc < 2; sc++) for (int P = 64; P <= 128; P += 64) for (int si = 0; si < 2; si++) {
+    TEST_PART(2) for (int sc = 0; sc < 2; sc++) for (int P = 64; P <= 128; P += 64) for (int si = 0; si < 2; si++) {
         static const int slabs[2] = {8, 32};
         unet_cfg cfg = {6, {32, 64, 96, 128, 160, 192}, 4, 7, 8, 1, sc};
         const size_t p3 = (size_t)P * P * P;
@@ -216,7 +217,7 @@ int main(void) {
     /* the coarse offload (UFSM_INFER_OFFLOAD: 1, 2 = dec[0]'s conv1 on its own temp, 0 off) and the spatial split (the window's two z
        halves, on two GPUs or both on one): CT-stem logits identical to the one-GPU phase-1 reference (split: on the planes each half
        owns) */
-    {
+    TEST_PART(8) {
         int dev1 = 1; if (nn_init(1)) { dev1 = 0; nn_check(); } nn_init(0);
         split_ctx *ctx = split_create(0, dev1);
         for (int sc = 0; sc < 2; sc++) for (int P = 128; P <= 192; P += 64) {
@@ -247,7 +248,7 @@ int main(void) {
     /* the 16-wide production net (7 levels 16, 16, 32, 64, 128, 192, 256; side head: 2 outputs, one written): in-place slabs at levels 0
        and 1 with 16-channel MX blocks, the coarse offload, the split, the CT stem with an MX-fp8 or an MX-fp4 input (train
        --gpu-input's UFSM_XIN_PREC=4): logits identical to the phase-1 reference of the same input precision */
-    {
+    TEST_PART(3) {
         int dev1 = 1; if (nn_init(1)) { dev1 = 0; nn_check(); } nn_init(0);
         split_ctx *ctx = split_create(0, dev1);
         const unet_cfg cfg = {7, {16, 16, 32, 64, 128, 192, 256}, 4, 2, 8, 0, 0};
@@ -290,6 +291,7 @@ int main(void) {
         if (unet_set_input_prec(8)) return 2;
         nn_init(0); for (int k = 0; k < 4 && nn_check(); k++) {}   /* (split_run_ct's probe of a second GPU leaves an invalid-device error on a one-GPU host: g_err, then CUDA's last error) */
         for (int ci = 0; ci < 2; ci++) for (int P = 128; P <= 256; P += 128) for (int frz = 0; frz < 2; frz++) {
+            if (!test_part(4 + ci)) continue;   /* (UFSM_TEST_PART: the 16-wide and the 32-wide net in parts 4 / 5) */
             const unet_cfg *cfg = &cfgs[ci]; const int nc = ci ? 0 : 1, co = nc ? nc : cfg->cout;
             const size_t p3 = (size_t)P * P * P, ob = (size_t)co * p3 * 2;
             uint8_t *hct = malloc(p3); float *hrow = malloc(2 * (size_t)P * 4);

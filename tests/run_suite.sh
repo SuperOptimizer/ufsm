@@ -2,15 +2,17 @@
 # tests/run_suite.sh: the ufsm test suite runner (the CMake targets test / test-slow / test-all call it). Pure bash + flock.
 #
 #   tests/run_suite.sh [options] [REGEX...]     run the tests of the manifest tests/suite.txt (REGEX: only names matching one)
-#     -t TIER   fast (default: everything not tagged slow) | slow (only the slow tag) | all
-#     -j N      tests in parallel (default: cgroup-aware CPUs / 3, 1..12; env SUITE_J)
+#     -t TIER   fast (default: everything not tagged slow; the merge gate) | slow (only the slow tag) | all |
+#               smoke (only the smoke tag: a cross-section of the fast tier for the edit loop, ~1 min)
+#     -c REF    only the tests that the files changed since git REF (and uncommitted / untracked ones) can affect (see srcdeps)
+#     -j N      tests in parallel (default: cgroup-aware CPUs, 2..16; env SUITE_J)
 #     -T N      CPU threads per test, exported as UFSM_NCPU / UFSM_FIT_THREADS / UFSM_TIFF_THREADS / OMP_NUM_THREADS
-#               (default CPUs / j, at least 2; env SUITE_THREADS)
+#               (default 2 CPUs / j, at least 2; env SUITE_THREADS)
 #     -B DIR    build dir holding the test binaries ($B in the manifest; default build-verify)
 #     -o DIR    output dir: logs/<name>.log, results.tsv, summary.txt (default $TMPDIR/ufsm-suite-<pid>)
 #     -g LIST   GPU indices to use, e.g. "0" or "0,1" (default: every GPU nvidia-smi lists, most free memory first);
 #               "none" runs no GPU test (they are reported SKIP)
-#     -G N      GPU tests at a time per GPU (default 2: the GPU tests are small, two overlap well; env SUITE_GPU_SLOTS)
+#     -G N      GPU tests at a time per GPU (default: free memory / 2.5 GB, 2..8; env SUITE_GPU_SLOTS)
 #     -x S      per-test timeout in seconds (default 1800)
 #     -P        profile: strace marks the tests that open /dev/nvidia* (gpu column "+nv"), nvidia-smi samples their GPU memory
 #     -l        list the selected tests and exit
@@ -24,12 +26,12 @@
 set -u
 H=$(cd "$(dirname "$0")/.." && pwd); cd "$H" || exit 2
 MANIFEST=${SUITE_MANIFEST:-$H/tests/suite.txt}
-TIER=fast; J=${SUITE_J:-}; T=${SUITE_THREADS:-}; BDIR=build-verify; OUT=; GPUS=; GSLOTS=${SUITE_GPU_SLOTS:-2}; TO=1800; PROF=0; LIST=0
-while getopts "t:j:T:B:o:g:G:x:Plh" o; do case $o in
-  t) TIER=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; B) BDIR=$OPTARG;; o) OUT=$OPTARG;; g) GPUS=$OPTARG;; G) GSLOTS=$OPTARG;;
-  x) TO=$OPTARG;; P) PROF=1;; l) LIST=1;; *) sed -n '2,22p' "$0"; exit 2;; esac; done
+TIER=fast; CHANGED=; J=${SUITE_J:-}; T=${SUITE_THREADS:-}; BDIR=build-verify; OUT=; GPUS=; GSLOTS=${SUITE_GPU_SLOTS:-}; TO=1800; PROF=0; LIST=0
+while getopts "t:c:j:T:B:o:g:G:x:Plh" o; do case $o in
+  t) TIER=$OPTARG;; c) CHANGED=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; B) BDIR=$OPTARG;; o) OUT=$OPTARG;; g) GPUS=$OPTARG;; G) GSLOTS=$OPTARG;;
+  x) TO=$OPTARG;; P) PROF=1;; l) LIST=1;; *) sed -n '2,24p' "$0"; exit 2;; esac; done
 shift $((OPTIND - 1)); FILTERS=("$@")
-case $TIER in fast|slow|all) ;; *) echo "run_suite: tier $TIER (fast|slow|all)" >&2; exit 2;; esac
+case $TIER in fast|slow|all|smoke) ;; *) echo "run_suite: tier $TIER (fast|slow|all|smoke)" >&2; exit 2;; esac
 
 # CPUs this process may use: UFSM_NCPU, else min(nproc (affinity), every cgroup v2 cpu.max quota on the path to the root)
 ncpu() {
@@ -44,15 +46,24 @@ ncpu() {
   echo "$n"
 }
 NC=$(ncpu)
-[ -z "$J" ] && { J=$((NC / 3)); [ $J -lt 1 ] && J=1; [ $J -gt 12 ] && J=12; }
-[ -z "$T" ] && { T=$((NC / J)); [ $T -lt 2 ] && T=2; }
+# (measured 2026-11-13: the fast tier averages ~1.1 CPUs a test, and the GPU tests wait on the card: -j CPUs instead of CPUs / 3 took the
+#  10-CPU pod from 546 to 361 s; T = 2 CPUs / j threads oversubscribes the few multi-threaded tests a little, which keeps their tail short)
+[ -z "$J" ] && { J=$NC; [ $J -lt 2 ] && J=2; [ $J -gt 16 ] && J=16; }
+[ -z "$T" ] && { T=$((2 * NC / J)); [ $T -lt 2 ] && T=2; }
 
 # GPUs, most free memory first
+GFREE=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2> /dev/null | tr -d ' ' | sort -t, -k2,2nr)
 if [ -z "$GPUS" ]; then
-  GPUS=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2> /dev/null | sort -t, -k2,2nr | cut -d, -f1 | tr -d ' ' | paste -sd, -)
+  GPUS=$(echo "$GFREE" | cut -d, -f1 | paste -sd, -)
   [ -z "$GPUS" ] && GPUS=none
 fi
 [ "$GPUS" = none ] && GL=() || IFS=, read -ra GL <<< "$GPUS"
+# GPU slots: by the least free memory of the GPUs used, 2.5 GB a slot (the largest fast-tier test peaks at ~2 GB), 2..8; a card a
+# training run holds keeps 2
+if [ -z "$GSLOTS" ]; then
+  mf=; for i in "${GL[@]}"; do f=$(echo "$GFREE" | awk -F, -v i="$i" '$1 == i {print $2}'); [ -n "$f" ] && { [ -z "$mf" ] || [ "$f" -lt "$mf" ]; } && mf=$f; done
+  GSLOTS=$(( ${mf:-0} / 2500 )); [ $GSLOTS -lt 2 ] && GSLOTS=2; [ $GSLOTS -gt 8 ] && GSLOTS=8
+fi
 NG=${#GL[@]}; GCAP=$((NG * GSLOTS))
 LOCKD=${SUITE_LOCK_DIR:-/tmp/ufsm-suite-locks}; mkdir -p "$LOCKD" 2> /dev/null; chmod 1777 "$LOCKD" 2> /dev/null
 
@@ -66,12 +77,50 @@ while IFS= read -r line; do
   case ",$tg," in *,slow,*) s=1;; *) s=0;; esac
   [ $TIER = fast ] && [ $s = 1 ] && continue
   [ $TIER = slow ] && [ $s = 0 ] && continue
+  [ $TIER = smoke ] && { case ",$tg," in *,smoke,*) ;; *) continue;; esac; }
   if [ ${#FILTERS[@]} -gt 0 ]; then m=0; for f in "${FILTERS[@]}"; do [[ $n =~ $f ]] && m=1; done; [ $m = 0 ] && continue; fi
   [ -n "${TAGS[$n]+x}" ] && { echo "run_suite: duplicate test name $n" >&2; exit 2; }
   NAMES+=("$n"); TAGS[$n]=$tg; EST[$n]=${es:-10}; CMD[$n]=$cm
 done < "$MANIFEST"
-[ ${#NAMES[@]} = 0 ] && { echo "run_suite: no test selected" >&2; exit 2; }
 hastag() { case ",${TAGS[$1]}," in *,$2,*) return 0;; esac; return 1; }
+
+# -c REF: only the tests a change since REF (commits, the working tree and untracked files) can affect. A test depends on the files
+# its command and scripts name, and on the sources of the binaries it runs: the C sources and headers in their DWARF line tables
+# (build-system agnostic, cached per binary in $BDIR/.srcdeps), every CUDA source / header (nvcc objects carry no line tables) when
+# the binary links the GPU ops (nn_init). A build-system or runner change selects everything. For the edit loop; the merge gate stays -t fast.
+srcdeps() {   # a binary's dependency basenames (one per line), "@cuda" when it links nn.o
+  local b=$1 c; c=${SUITE_SRCDEPS:-$BDIR/.srcdeps}/${b##*/}; [ -x "$b" ] || return 0
+  if [ ! -f "$c" ] || [ "$c" -ot "$b" ]; then
+    mkdir -p "${c%/*}"
+    { readelf -wl "$b" 2> /dev/null | grep -oE '[A-Za-z0-9_.+-]+\.(h|cuh|c|cu|inc)$' | sort -u
+      nm "$b" 2> /dev/null | grep -qE ' T nn_init$' && echo @cuda; true; }  > "$c.$$" && mv "$c.$$" "$c"
+  fi
+  cat "$c"
+}
+if [ -n "$CHANGED" ]; then
+  mapfile -t CF < <({ git diff --name-only "$CHANGED" -- 2> /dev/null; git ls-files --others --exclude-standard 2> /dev/null; } | sort -u)
+  ALLC=0; for f in "${CF[@]}"; do case $f in Makefile|CMakeLists.txt|CMakePresets.json|*.cmake|cmake/*|tests/run_suite.sh) ALLC=1;; esac; done
+  if [ $ALLC = 0 ]; then
+    KEEP=(); declare -A MLINE   # manifest lines added or changed since REF: those tests run
+    while IFS='|' read -r n _; do n=$(echo ${n#+}); [ -n "$n" ] && MLINE[$n]=1; done < <(git diff "$CHANGED" -- "$MANIFEST" 2> /dev/null | grep -E '^\+[^+#]')
+    for n in "${NAMES[@]}"; do
+      cm=${CMD[$n]}; bins=(); scripts=(); hit=0; [ -n "${MLINE[$n]+x}" ] && { KEEP+=("$n"); continue; }
+      for w in $cm; do w=${w#./}; case $w in \$B/*) bins+=("$BDIR/${w#\$B/}");; build*/*) bins+=("$w");; tests/*) scripts+=("$w");; esac; done
+      for s in "${scripts[@]}"; do [ -f "$s" ] && for w in $(grep -oE 'build[a-z0-9-]*/[A-Za-z0-9_]+' "$s" | sort -u); do bins+=("$BDIR/${w#*/}"); done; done
+      deps=" $(for b in "${bins[@]}"; do srcdeps "$b"; done | sort -u | tr '\n' ' ')"
+      for f in "${CF[@]}"; do
+        [[ " $cm " == *"$f"* ]] && { hit=1; break; }
+        for s in "${scripts[@]}"; do [ "$s" = "$f" ] && hit=1; done; [ $hit = 1 ] && break
+        case $f in src/*.cu|src/*.cuh) [[ $deps == *" @cuda "* ]] && { hit=1; break; };; esac
+        case $f in *.c|*.h|*.cu|*.cuh|*.inc) [[ $deps == *" ${f##*/} "* ]] && { hit=1; break; };; esac
+      done
+      [ $hit = 1 ] && KEEP+=("$n")
+    done
+    echo "run_suite: -c $CHANGED: ${#CF[@]} changed files select ${#KEEP[@]} of ${#NAMES[@]} tests"
+    NAMES=("${KEEP[@]}")
+  else echo "run_suite: -c $CHANGED: a build or runner file changed, every test selected"; fi
+fi
+[ ${#NAMES[@]} = 0 ] && { echo "run_suite: no test selected" >&2; exit 2; }
 isgpu() { hastag "$1" gpu || hastag "$1" gpu2; }
 # longest first
 mapfile -t QUEUE < <(for n in "${NAMES[@]}"; do echo "${EST[$n]} $n"; done | sort -k1,1nr -s | cut -d' ' -f2-)
@@ -125,7 +174,9 @@ run_one() {
     local t0 t1; t0=$(date +%s.%N)
     ( export B="$BDIR" TMPDIR="$tmp" UFSM_TEST_TMP="$tmp" UFSM_SUITE_TEST="$n" UFSM_NCPU=$T UFSM_FIT_THREADS=$T UFSM_TIFF_THREADS=$T \
              OMP_NUM_THREADS=$T OPENBLAS_NUM_THREADS=$T MKL_NUM_THREADS=$T
-      if [ -n "$g" ]; then export CUDA_VISIBLE_DEVICES=$g; elif [ "$GPUS" = none ]; then export CUDA_VISIBLE_DEVICES=; fi
+      # a test without the gpu tag sees no GPU: one that needs it fails or skips here instead of using a card without the lock (2026-11-13:
+      # test_attn, test_attn_ray / _dfm, test_spiralfit, test_countfield, test_mesh_phase ran untagged on GPUs held by training runs)
+      if [ -n "$g" ]; then export CUDA_VISIBLE_DEVICES=$g; else export CUDA_VISIBLE_DEVICES=; fi
       echo $BASHPID > "$OUT/tmp/$n.pid"
       echo "# $n [${TAGS[$n]}] attempt $a gpu=${g:--} $(date '+%F %T') on $(hostname)"; echo "# $cm"
       if [ -n "$TIMEBIN" ]; then exec $TIMEBIN -f '%e %U %S %M' -o "$OUT/tmp/$n.time" timeout -k 20 "$TO" "${pre[@]}" bash -c "$cm"
