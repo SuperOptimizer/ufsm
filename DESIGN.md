@@ -6,6 +6,41 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Kernel fusion for scratch2: what is left to fuse, the head slabs (2026-11-14, branch fuse-20261114)
+
+Goal: fuse GroupNorm-apply + SiLU + MX-fp4 quantisation into the 3^3 convs (forward and backward) for the scratch2 step.
+
+**Profile** (perf pod, RTX PRO 4000; scratch2's 92 M net and heads on one card, the wind fixture, P 768, `UFSM_MEM_FREE_GB=15.5` so the
+planner picks a 16 GB card's mode: MX gradients, chunked, lean 2, shared encoder a1; /vesuvius/ufsm/fuse/prof.sh). UFSM_PROF per step:
+conv fwd 737 ms (27 %), bwd_data 543 (20 %), wgrad 1075 (40 %), loss 275 (10 %), gn 30 (1.1 %), optimizer 38-57. Level 0 is ~75 % of
+the conv time (dec0.c1 fwd / bdata / wgrad 302 / 207 / 379 ms; enc0.c2 and dec0.c2 ~95 / 92 / 185 each). nsys kernel shares:
+conv_fwd_f4_k (fwd + bdata) 31 %, conv_bwd_w_f4ws_k 25.5 %, lat_up4_k 3.3, fstem_fwd_k 3.3, lat_adj_xy_k 3.0, conv1_to_mx_t_k 3.0,
+conv_bwd_w_s2_f8_k 2.5, conv_fwd_s2_f8_k 2.4, conv_bwd_w1_tc_k 2.4, loss_grad_k 2.2, w4_events_k 2.1.
+
+**The planned fusion is already there.** conv_fwd_f4_k applies GN + SiLU while it stages its input (gnp_t; or gn_prenorm_f4_k once per
+layer when the input is re-read by several output blocks) and writes MX-fp4 plus the next GroupNorm's sums in its epilogue; the
+backward's GN-SiLU apply is deferred into the weight gradient's gy pre-pass (lp_gnpend). Everything GroupNorm-shaped left is ~2.7 % of
+the kernel time (gn_silu_bwd_apply_rec_k 1.3, the stats 0.5, gy_pre4_k 0.4, gn_prenorm 0.2), so the 15-25 % is not available there.
+
+**Conv pipelining: no gain.** The earlier convfuse agent's ablation of conv_fwd_f4_k<4,2> (L0 32 x 256^2 x 256 slab, 25.8 ms): no MMA
+13.6 ms, no input staging 19.7, no weight staging 19.0 (the "no epilogue" arm lets the compiler drop the MMAs). Double-buffered weight
+stages by cp.async (the next stage in flight during the MMAs, two blocks per SM still fit): L0 fwd 26.79 -> 26.79 ms, bdata 30.6 ->
+30.4, L1 unchanged (bench_sp24, min of 7, twice). So staging is not exposed latency; it costs issue slots and shared-memory bandwidth
+next to the MMA loop's ldmatrix traffic (per tap pair and warp 2 KB of A + 1 KB of B for 16 MMAs). Not kept. A wider output tile per
+staged input is the remaining conv lever (sparse24's note too); ncu is not available on the pod (ERR_NVGPUCTRPERM).
+
+**Head slabs: the pad outputs skipped.** With --fib-head the head is padded from 23 to 32 outputs (g_pad_ch, no loss); the slabs still
+upsampled them (lat_up4_k, both passes), zeroed their gradient and adjoined it (lat_adj_xy_k / lat_adj_z_k): 9 of 32 channels of
+work for zero gradients. LUPN (train.c) leaves them out of the upsample, the zeroing and the adjoint (the coarse rows stay at the
+zero they start at). UFSM_LAT_PAD_UP=1: the old path. The first gradient pass's coarse gradient planes (UFSM_LATG_DUMP, 2.26 GB):
+byte-identical; loss category 279 -> 255 ms a step.
+
+**Head slabs: the fused gradient pass with --ink-head.** nn_lat_fuse_grad (upsample + BCE gradient + transposed upsample per coarse
+cell, no fp16 slab) was off for every --ink-head run by a blanket !g_ink2 in its condition; the ink channel (11) lies outside the
+fused normal / density group (2-8) and has its own targets and sums. Now on: the same dump byte-identical to the chain as well (the fp32
+re-association of the fused sums does not reach the fp16 planes on this window), step-1 loss equal, loss category 255 -> 219.5 ms.
+Together 279 -> 219.5 ms of ~2.72 s GPU time a step: -2.2 % at P 768 one card. UFSM_LAT_FUSE=0 turns the fused pass off as before.
+
 ## Split peer copies off the copy engines (2026-11-14, branch peerk-20261114)
 
 **What was exposed.** The desk nsys of the scratch2 split step (11-13, ny2) shows both cards kernel-idle for ~175 ms per step at

@@ -162,6 +162,10 @@ static int g_lat_guide;   /* --lat-guide 1: the guided head (5 coefficient plane
 #define LBASE (g_cout <= 16 ? 16 : (g_cout + 15) / 16 * 16)   /* --lat-guide 3: the interpolated base outputs (the task's, rounded up to 16; 16 up to 16 outputs: the old 144-output head) */
 #define LNC (g_lat_guide == 64 ? LBASE + 128 : g_lat_guide == 8 ? 32 : g_cout + g_lat_guide)
 #define LUPC (g_lat_guide == 64 ? g_cout : LNC)
+static int g_lat_padup;   /* UFSM_LAT_PAD_UP=1: the head slabs upsample / adjoin the --fib-head pad outputs too (their gradient is zero: no effect but time) */
+/* the outputs the head slabs upsample and adjoin: LUPC without the trailing pad outputs [g_pad_ch, g_cout) (no loss, no reader, zero gradient: 9 of 32 for
+   scratch2's heads, ~28 % of lat_up4_k / lat_adj_xy_k / lat_adj_z_k, ~1.9 % of the P 768 step; fuse-20261114) */
+#define LUPN (g_lat && g_pad_ch >= 0 && LUPC == g_cout && !g_lat_padup ? g_pad_ch : LUPC)
 #define LGFC (g_lat_guide == 64 ? LBASE : LNC)   /* the outputs whose gradient is summed in fp32 (the sub-cell outputs' goes straight into the 16-bit copy: -4 B per output and cell) */   /* the interpolated outputs (the sub-cell head's 128 others are read per voxel) */
 #define LGUIDE(dir) do { if (g_lat_guide == 8) nn_lat_guide4(d->x, D, H, W, z0, nz, d->hs_lg, 24, g_side_ch, 2, dir); else nn_lat_guide(d->x, D, H, W, z0, nz, d->hs_lg, g_cout, g_side_ch, dir); } while (0)   /* the latent-grid network's outputs */
 static float g_lat_dp;   /* --lat-direct-p (sample.h lat_direct_p): direct windows' trunk input from their stored latvol cells (lat_hook) */
@@ -1274,7 +1278,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
 #define PT(w) nn_ptick(ptn[pass][!strcmp(w, "label h2d") ? 0 : !strcmp(w, "upsample") ? 1 : !strcmp(w, "targets") ? 2 : !strcmp(w, "losses") ? 3 : 4])
     /* the gradient pass fused (g_lat_fuse): the slab chain keeps the channel ranges fr (the winding mod 4 pair; without the guided head also the side pair and the other heads' outputs) */
     const int fuse = g_lat_fuse && d->fpart && (!pass || (d->hs_train && nn_get_loss_grad_h16())), fside = fuse && g_lat_guide == 5;
-    const int fr[2][2] = {{0, fside ? 0 : g_norm_ch}, {g_norm_ch + 7, fside ? g_cout : LUPC}};
+    const int fr[2][2] = {{0, fside ? 0 : g_norm_ch}, {g_norm_ch + 7, fside ? g_cout : LUPN}};
     /* a training step's statistics pass only counts the fused groups' mask weights (all the gradient reads); their loss sums come from the gradient pass, finalised after it (UFSM_LAT_LIGHT0=0: both in the statistics pass) */
     static int light_on = -1; if (light_on < 0) light_on = !getenv("UFSM_LAT_LIGHT0") || ufsm_env_on("UFSM_LAT_LIGHT0");
     static int light_split = -1; if (light_split < 0) light_split = ufsm_env_on("UFSM_LAT_LIGHT_SPLIT");   /* (default off until a split run compared it with the full statistics pass) */
@@ -1414,12 +1418,12 @@ static void head_slab_pass(gpu_state *d, int pass) {
                     if (f) { const int32_t q2[2] = {qa, qb}; fwrite(q2, 4, 2, f); fwrite(hb, 1, nb, f); fclose(f); } free(hb); if (z1 == D) dn_[d->side + 1]++; }
             }
             if (fuse) for (int r = 0; r < 2; r++) { if (fr[r][1] > fr[r][0]) nn_lat_up_slab_c((const char *)d->lgc + (size_t)fr[r][0] * (qb - qa) * (H / 4) * (W / 4) * 2, 1, fr[r][1] - fr[r][0], D / 4, H / 4, W / 4, z0, nz, LGC(fr[r][0]), qa, qb - qa); }
-            else nn_lat_up_slab_c(d->lgc, 1, LUPC, D / 4, H / 4, W / 4, z0, nz, d->hs_lg, qa, qb - qa);
-        } else if (g_lat) nn_lat_up_slab(d->lg, unet_logits_h16(d->u), LUPC, D / 4, H / 4, W / 4, z0, nz, d->hs_lg);   /* --lat: the cell grid's logits on this slab */
+            else nn_lat_up_slab_c(d->lgc, 1, LUPN, D / 4, H / 4, W / 4, z0, nz, d->hs_lg, qa, qb - qa);
+        } else if (g_lat) nn_lat_up_slab(d->lg, unet_logits_h16(d->u), LUPN, D / 4, H / 4, W / 4, z0, nz, d->hs_lg);   /* --lat: the cell grid's logits on this slab */
         else if (unet_head_fwd_z(d->u, z0, z1, d->hs_lg)) { fprintf(stderr, "head slabs: the head is not covered (MX activations; UFSM_HEAD_SLAB=0)\n"); abort(); }
         if (lchk && !pass) {   /* UFSM_LAT_CHECK=1: the separable upsampling against the per-voxel kernel, every slab */
-            const size_t nb = (size_t)LUPC * ns * 2; void *d2 = nn_malloc(nb); uint16_t *ha = malloc(nb), *hb = malloc(nb);
-            const int was = nn_lat_set_slow(1); nn_lat_up_slab(d->lg, unet_logits_h16(d->u), LUPC, D / 4, H / 4, W / 4, z0, nz, d2); nn_lat_set_slow(was);
+            const size_t nb = (size_t)LUPN * ns * 2; void *d2 = nn_malloc(nb); uint16_t *ha = malloc(nb), *hb = malloc(nb);
+            const int was = nn_lat_set_slow(1); nn_lat_up_slab(d->lg, unet_logits_h16(d->u), LUPN, D / 4, H / 4, W / 4, z0, nz, d2); nn_lat_set_slow(was);
             nn_sync(); nn_d2h(ha, d->hs_lg, nb); nn_d2h(hb, d2, nb); nn_free(d2);
             static double mx, sq, sr; static size_t nd, nt_, n1;
             for (size_t k = 0; k < nb / 2; k++) { _Float16 x, y; memcpy(&x, ha + k, 2); memcpy(&y, hb + k, 2); const double e = fabs((double)x - (double)y); nd += ha[k] != hb[k]; n1 += abs((int)(int16_t)ha[k] - (int)(int16_t)hb[k]) > 1; if (e > mx) mx = e; sq += e * e; sr += (double)y * (double)y; }
@@ -1537,7 +1541,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             const float fw = g_fibh_lambda * src_head_w(si, SH_FIBRE);
             FIBH_TARGETS(); FIBH_LOSS_S(1, fw);   /* (x fw in the gradient kernels: no separate scale pass over the 9 channels) */
         }
-        if (g_pad_ch >= 0) nn_zero(LGC(g_pad_ch), (size_t)(g_cout - g_pad_ch) * ns * 2);   /* (the pad outputs: no gradient) */
+        if (g_pad_ch >= 0 && LUPN > g_pad_ch) nn_zero(LGC(g_pad_ch), (size_t)(g_cout - g_pad_ch) * ns * 2);   /* (the pad outputs: no gradient; LUPN: not upsampled or adjoined at all) */
         if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 58, d->pg_acc);   /* (before the BCE gradient overwrites the logits; its sums go to + 58: the logged loss of a training step) */
         const float lside = g_side_lambda * src_head_w(si, g_rv == 1 ? SH_RV : SH_PHASE);   /* (x 1: the same floats) */
         if (!fside) nn_loss_grad_only_s(LGC(g_side_ch), st, sm, d->sidew, two, 0.f, LGC(g_side_ch), d->sscratch, lside);   /* (x lside in the kernel) */
@@ -1579,7 +1583,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 nn_lat_fuse_grad(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_norm_ch, 7, 0, -1, nullptr, d->nt, d->nm, d->nw, d->nscratch, pw, rw, u7, ln, d->fpart, d->latg, q0, qc, light ? d->hs_ds + 20 : nullptr);
                 FT("  f fused normal");
                 for (int r = 0; r < 2; r++) if (fr[r][1] > fr[r][0]) nn_lat_up_adj_c(LGC(fr[r][0]), fr[r][1] - fr[r][0], D / 4, H / 4, W / 4, z0, nz, d->latg + (size_t)fr[r][0] * qc * pl, d->nt, q0, qc);
-            } else nn_lat_up_adj_c(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt, q0, qc);
+            } else nn_lat_up_adj_c(d->hs_lg, LUPN, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt, q0, qc);
             PT("adjoint");
             if (f1 > f0) {
                 nn_lat_grad_fin(d->latg, LGFC, d->latgl, LNC, pl, qc, f0 - q0, f1 - f0, d->latgc);
@@ -1600,14 +1604,14 @@ static void head_slab_pass(gpu_state *d, int pass) {
         }
         if (g_lat && g_lat_guide == 64) nn_lat_shuffle_adj((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, LBASE, 2, z0, nz, d->latgl);
         else if (g_lat && g_lat_guide) LGUIDE(1);   /* the coefficient planes' gradients */
-        if (g_lat) nn_lat_up_adj(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab; any channel count: groups of 28) */   /* --lat: the slab's gradient onto the cell grid */
+        if (g_lat) nn_lat_up_adj(d->hs_lg, LUPN, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab; any channel count: groups of 28) */   /* --lat: the slab's gradient onto the cell grid */
         else { if (d->gc_on) nn_gram16(d->hs_lg, !nn_get_f16(), g_cout, ns, ns, d->gcS);
                if (unet_head_bwd_z(d->u, z0, z1, d->hs_lg, z0 == 0)) { fprintf(stderr, "head slabs: the fused head backward is not covered (UFSM_HEAD_SLAB=0)\n"); abort(); } }
         if (lchk) {   /* UFSM_LAT_CHECK=1: the separable adjoint against the per-voxel gather (the slab's gradient is still in hs_lg) */
             static float *gc2; const size_t nc = (size_t)LNC * (D / 4) * (H / 4) * (W / 4);   /* (every cell channel: the guided heads have more than the task's) */
             if (!gc2) gc2 = nn_malloc(nc * 4);
             if (z0 == 0) nn_zero(gc2, nc * 4);
-            const int was = nn_lat_set_slow(1); nn_lat_up_adj(d->hs_lg, LUPC, D / 4, H / 4, W / 4, z0, nz, gc2, nullptr); nn_lat_set_slow(was);
+            const int was = nn_lat_set_slow(1); nn_lat_up_adj(d->hs_lg, LUPN, D / 4, H / 4, W / 4, z0, nz, gc2, nullptr); nn_lat_set_slow(was);
             if (z1 == D) {
                 float *ha = malloc(nc * 4), *hb = malloc(nc * 4); nn_sync(); nn_d2h(ha, d->latg, nc * 4); nn_d2h(hb, gc2, nc * 4);
                 double mx = 0, mb = 0, sq = 0, sr = 0; for (size_t k = 0; k < nc; k++) { const double e = fabs((double)ha[k] - hb[k]); if (e > mx) mx = e; if (fabs(hb[k]) > mb) mb = fabs(hb[k]); sq += e * e; sr += (double)hb[k] * hb[k]; }
@@ -2664,6 +2668,7 @@ int cmd_train(int argc, char **argv) {
         if (g_rv == 2) { g_rv_ch = g_cout; g_cout += 2; fprintf(stderr, "unwrap2 --rv 2: channels %d-%d recto / verso side papyrus (lambda %g; the phase stays in 0-1)\n", g_rv_ch, g_rv_ch + 1, g_rv_lambda); }
         if (g_fibh) { g_fib_ch = g_cout; g_cout += 9; fprintf(stderr, "unwrap2 --fib-head: channels %d-%d the fibre H / V masks (the sources' \"fibre_h\" / \"fibre_v\" prob254), %d-%d the fibre axis t t^T, %d its family (V), from the tubes' second moments over %d^3 voxels; lambda %g x the source's \"fibre\" head weight\n", g_fib_ch, g_fib_ch + 1, g_fib_ch + 2, g_fib_ch + 7, g_fib_ch + 8, 2 * g_fd_r + 1, g_fibh_lambda); }
         if (g_fibh && g_cout > 16 && g_cout % 16) { g_pad_ch = g_cout; g_cout = (g_cout + 15) / 16 * 16; fprintf(stderr, "unwrap2: outputs %d-%d pad the head to %d (no loss)\n", g_pad_ch, g_cout - 1, g_cout); }
+        g_lat_padup = ufsm_env_on("UFSM_LAT_PAD_UP");
         if (g_naux > 1) fprintf(stderr, "head registry: %d aux label planes:%s%s%s%s\n", g_naux, g_rv ? " papyrus (rv)" : "", g_ink2 ? " ink" : "", g_fibn ? " fibre tubes (the sources' \"fibre\" target)" : "", g_fibh ? " fibre H, fibre V" : "");
         if (g_unwrap2) fprintf(stderr, "unwrap2: channels %d-%d phase, %d-%d normal n n^T, %d density (lambda %g, step %d), %d-%d winding mod 4 (gauge-free, lambda %g)\n",
                                g_side_ch, g_side_ch + 1, g_norm_ch, g_norm_ch + 5, g_norm_ch + 6, g_dens_lambda, g_norm_s, g_w4_ch, g_w4_ch + 1, g_w4_lambda);
@@ -3790,7 +3795,7 @@ int cmd_train(int argc, char **argv) {
         if (g_hs_z > g_Pz) g_hs_z = g_Pz;
         g_lat_hs = g_lat && g_head_slab && g_hs_z % 4 == 0 && g_hs_z >= 8 && g_hs_z < g_Pz && !ufsm_env_on("UFSM_LAT_CHECK") && (!getenv("UFSM_LAT_HEAD_STREAM") || ufsm_env_on("UFSM_LAT_HEAD_STREAM"));
         if (g_lsplit && !g_lat_hs) { fprintf(stderr, "--lat 4 --split z: the streamed latent head (UFSM_LAT_HEAD_STREAM on, no UFSM_LAT_CHECK)\n"); return 2; }
-        g_lat_fuse = g_lat_hs && g_unwrap2 && g_side_ch == 0 && g_norm_ch == 2 && g_w4_ch == 9 && !(g_pg_lambda > 0) && !(g_ptrunc_tau > 0) && !g_ink2 && !g_fibn && nn_get_loss_grad_h16() && nn_get_f16()   /* (--fib-normal-lambda: the unfused chain) */
+        g_lat_fuse = g_lat_hs && g_unwrap2 && g_side_ch == 0 && g_norm_ch == 2 && g_w4_ch == 9 && !(g_pg_lambda > 0) && !(g_ptrunc_tau > 0) && !g_fibn && nn_get_loss_grad_h16() && nn_get_f16()   /* (--fib-normal-lambda: the unfused chain; --ink-head fused too since fuse-20261114: the ink channel is outside the group) */
                     
                      && (!getenv("UFSM_LAT_FUSE") || ufsm_env_on("UFSM_LAT_FUSE"));
         for (int g = 0; g < ng; g++) unet_set_head_ext(G[g].u, g_head_slab && (!g_lat || g_lat_hs));
