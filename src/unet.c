@@ -8,6 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static int g_prof = -1;
 static const char *g_names[8] = {"conv_fwd", "conv_bwd_data", "conv_bwd_w", "gn", "elementwise", "up/concat", "loss", "optimizer"};
@@ -4371,9 +4374,15 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
    its own. Checkpoints keep the separate layout (v zero on the matrices, the momentum zero elsewhere): mom_mask / mom_load. */
 static int mom_alias_on(const unet *u) { static int v = -1; if (v < 0) v = getenv("UFSM_MUON_MOM_ALIAS") ? ufsm_env_on("UFSM_MUON_MOM_ALIAS") : 1; return v && !u->wq; }
 static int mom_aliased(const unet *u) { return u->muon_mom && u->muon_mom == u->v; }
-static float *mom_alloc(unet *u) { if (mom_alias_on(u)) return u->v; float *m = nn_malloc(u->np * 4); nn_zero(m, u->np * 4); return m; }
+static float *mom_alloc(unet *u);
 typedef struct { size_t o[2 * UNET_MAXCONV]; int n; } mom_rng_t;
 static void mom_rng_add(unet *u, const convp *c, void *arg) { (void)u; mom_rng_t *r = arg; if (r->n < UNET_MAXCONV) { r->o[2 * r->n] = c->w; r->o[2 * r->n + 1] = (size_t)c->cout * c->cin * c->k * c->k * c->k; r->n++; } }
+/* a new Muon momentum buffer, zero. Aliased: the matrices' part of v, zeroed too (mini ckpt audit #4: after an AdamW checkpoint was
+   loaded, v's matrix slice held Adam's second moments, which the lazily allocated momentum then started from) */
+static float *mom_alloc(unet *u) {
+    if (mom_alias_on(u)) { mom_rng_t r = {0}; for_each_mat(u, mom_rng_add, &r); for (int i = 0; i < r.n; i++) nn_zero(u->v + r.o[2 * i], r.o[2 * i + 1] * 4); return u->v; }
+    float *m = nn_malloc(u->np * 4); nn_zero(m, u->np * 4); return m;
+}
 /* host array h (np floats) of the aliased buffer: keep 1 the matrices' part (the momentum), 0 the rest (v) */
 static void mom_mask(unet *u, float *h, int keep) {
     mom_rng_t r = {0}; for_each_mat(u, mom_rng_add, &r);
@@ -4895,15 +4904,52 @@ void unet_debug_acts(const unet *u) {
     }
     for (int i = L - 2; i >= 0; i--) { const block *b = &u->dec[i]; fprintf(stderr, "dec%d:", i); dbg_tensor("a1", b->a1, b->ys); dbg_tensor("a2", b->a2, b->ys); fprintf(stderr, "\n"); }
 }
+/* a header float: %.9g, non-finite as NaN / Infinity / -Infinity (mini ckpt audit #10: "nan" / "inf" are not JSON; Python's json and
+   strtof / json_parse's strtod all read these spellings, so old binaries load them unchanged) */
+static void wfl(FILE *f, const char *sep, double v, int dig) {
+    if (isnan(v)) fprintf(f, "%sNaN", sep); else if (isinf(v)) fprintf(f, "%s%sInfinity", sep, v < 0 ? "-" : ""); else fprintf(f, "%s%.*g", sep, dig, v);
+}
+/* one JSON object, structurally whole: braces / brackets balanced outside strings, nothing after the closing brace but a newline (a
+   truncated extra loses its closing braces). unet.c links without json.c (dozens of test targets), so a structural scan, not a parse */
+static int json_whole_object(const char *s, size_t n) {
+    while (n && (s[n - 1] == '\n' || s[n - 1] == ' ')) n--;
+    if (!n || s[0] != '{' || s[n - 1] != '}') return 0;
+    int depth = 0, str = 0;
+    for (size_t i = 0; i < n; i++) {
+        const char c = s[i];
+        if (str) { if (c == '\\') i++; else if (c == '"') str = 0; continue; }
+        if (c == '"') str = 1; else if (c == '{' || c == '[') depth++; else if (c == '}' || c == ']') { if (--depth < 0) return 0; if (!depth && i != n - 1) return 0; }
+        else if ((unsigned char)c < 32 && c != '\t') return 0;
+    }
+    return !depth && !str;
+}
+/* the written checkpoint read back before it replaces the previous one (mini ckpt audit #1): magic, a header line within
+   UFSM_CHECKPOINT_HEADER (what every reader allows), a whole JSON object, nparams, and the file size of exactly narr arrays */
+static const char *ckpt_verify(const char *tmp, size_t np, int narr) {
+    FILE *f = fopen(tmp, "rb"); if (!f) return "cannot reopen";
+    char *line = malloc(UFSM_CHECKPOINT_HEADER); char mg[4]; const char *why = nullptr;
+    if (!line || fread(mg, 1, 4, f) != 4 || memcmp(mg, "UFSM", 4)) why = "no magic";
+    else if (!fgets(line, UFSM_CHECKPOINT_HEADER, f) || !strchr(line, '\n')) why = "header line over the readers' limit (UFSM_CHECKPOINT_HEADER)";
+    else {
+        const long off = ftell(f); struct stat st; const char *q = strstr(line, "\"nparams\":");
+        if (!json_whole_object(line, strlen(line))) why = "header is not one whole JSON object (a truncated extra?)";
+        else if (!q || (size_t)strtoull(q + 10, nullptr, 10) != np) why = "nparams";
+        else if (fstat(fileno(f), &st) || (long long)st.st_size != (long long)off + 4ll * (long long)np * narr) why = "file size";
+    }
+    fclose(f); free(line); return why;
+}
 int unet_save(const unet *u, const char *path, int step, const char *extra) {
     {   /* a latched CUDA error: the device weights are not trustworthy (a failed copy / launch left them stale or zero): no checkpoint */
         nn_sync(); const char *e = nn_check();
         if (e) { fprintf(stderr, "unet_save: CUDA error %s at %s: %s not written\n", e, nn_check_site(), path); return -1; }
     }
+    if (extra) {   /* a truncated extra (snprintf chains into fixed buffers) would make the header unreadable: refuse before touching anything */
+        if (!json_whole_object(extra, strlen(extra))) { fprintf(stderr, "unet_save: the header's extra is not a JSON object (truncated?): %s not written, the previous one kept\n", path); return -1; }
+    }
     char tmp[1400];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "wb");
-    if (!f) return -1;
+    if (!f) { fprintf(stderr, "unet_save: cannot create %s\n", tmp); return -1; }
     fprintf(f, "UFSM{\"nlev\":%d,\"widths\":[", u->cfg.nlev);
     for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.widths[i]);
     fputc(']', f);
@@ -4914,9 +4960,9 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.half_res) fprintf(f, ",\"half_res\":%d", u->cfg.half_res);
     if (u->cfg.lat_guide) fprintf(f, ",\"lat_guide\":%d", u->cfg.lat_guide);
     if (u->lat_C) {   /* the cell transform: rows of 64 weights, the gains, the step */
-        fprintf(f, ",\"lat_c\":%d,\"lat_step\":%.9g,\"lat_gain\":[", u->lat_C, u->lat_step);
-        for (int i = 0; i < u->lat_C; i++) fprintf(f, "%s%.9g", i ? "," : "", u->lat_hg[i]);
-        fputs("],\"lat_basis\":[", f); for (int i = 0; i < u->lat_C * 64; i++) fprintf(f, "%s%.9g", i ? "," : "", u->lat_hb[i]); fputc(']', f);
+        fprintf(f, ",\"lat_c\":%d", u->lat_C); wfl(f, ",\"lat_step\":", u->lat_step, 9); fputs(",\"lat_gain\":[", f);
+        for (int i = 0; i < u->lat_C; i++) wfl(f, i ? "," : "", u->lat_hg[i], 9);
+        fputs("],\"lat_basis\":[", f); for (int i = 0; i < u->lat_C * 64; i++) wfl(f, i ? "," : "", u->lat_hb[i], 9); fputc(']', f);
     }
     if (u->cfg.w4_2d) fprintf(f, ",\"w4_2d\":%d", u->cfg.w4_2d);
     if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
@@ -4936,8 +4982,8 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.l0_norm == 4) fprintf(f, ",\"l0_slab\":%d", u->cfg.l0_slab);
     if (u->cfg.l0_norm == 2) {   /* the running statistics (live weights, EMA weights; l0_site order, [mean G | var G] each) and their state */
         const int n = 16 * G_of(u, u->cfg.widths[0]); float *r = malloc((size_t)n * 4); nn_d2h(r, u->l0run, (size_t)n * 4);
-        fprintf(f, ",\"l0_n\":%ld,\"l0_warm\":%d,\"l0_mom\":%.9g,\"l0_run\":[", u->l0_n, u->l0_warm, u->l0_mom);
-        for (int i = 0; i < n; i++) fprintf(f, "%s%.9g", i ? "," : "", r[i]);
+        fprintf(f, ",\"l0_n\":%ld,\"l0_warm\":%d", u->l0_n, u->l0_warm); wfl(f, ",\"l0_mom\":", u->l0_mom, 9); fputs(",\"l0_run\":[", f);
+        for (int i = 0; i < n; i++) wfl(f, i ? "," : "", r[i], 9);
         fputc(']', f); free(r);
     }
     if (u->cfg.scan_norm) fputs(",\"scan_norm\":1", f);
@@ -4945,8 +4991,8 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.gfilm) fputs(",\"gfilm\":1", f);
     if (u->cfg.gn_ema) {   /* the running statistics of every site (live weights, EMA weights; gn_sites layout) and their state */
         ge_alloc(u); const size_t n = 2 * u->ge_ns; float *r = malloc(n * 4); nn_d2h(r, u->ge_run, n * 4);
-        fprintf(f, ",\"gn_ema\":1,\"ge_n\":%ld,\"ge_warm\":%d,\"ge_mom\":%.9g,\"ge_run\":[", u->ge_n, u->ge_warm, u->ge_mom);
-        for (size_t i = 0; i < n; i++) fprintf(f, "%s%.9g", i ? "," : "", r[i]);
+        fprintf(f, ",\"gn_ema\":1,\"ge_n\":%ld,\"ge_warm\":%d", u->ge_n, u->ge_warm); wfl(f, ",\"ge_mom\":", u->ge_mom, 9); fputs(",\"ge_run\":[", f);
+        for (size_t i = 0; i < n; i++) wfl(f, i ? "," : "", r[i], 9);
         fputc(']', f); free(r);
     }
     { int any = 0; for (int i = 0; i < u->cfg.nlev; i++) any |= u->cfg.dec_convs[i] == 1;
@@ -4954,20 +5000,20 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     fprintf(f, ",\"cin\":%d,\"cout\":%d,\"G\":%d,\"down_norm\":%d,\"scale_cond\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"muon_mom\":%d", u->cfg.cin, u->cfg.cout, u->cfg.G, u->cfg.down_norm, u->cfg.scale_cond, u->np, step, u->sparse24, u->wq, u->muon_mom != nullptr);
     if (u->sp24_lv) fprintf(f, ",\"sparse24_lv\":%d", u->sp24_lv);   /* (written only when not all levels: old readers unchanged) */
     if (u->sp24_hard) fprintf(f, ",\"sparse24_hard\":1");
-    if (u->sp24_r > 0.f) fprintf(f, ",\"sparse24_r\":%.9g", u->sp24_r);   /* (mid-ramp; the trainer recomputes it from its flags) */
+    if (u->sp24_r > 0.f) wfl(f, ",\"sparse24_r\":", u->sp24_r, 9);   /* (mid-ramp; the trainer recomputes it from its flags) */
     if (u->mx_hb && (u->mx_R_nload || (u->mx_R && u->mx_R_ok))) {   /* Hyperball radii (Muon table order): a resumed run keeps its spheres */
         float r[UNET_MAXCONV]; const int nr = u->mx_R_nload ? u->mx_R_nload : u->muon_nconv;
         if (u->mx_R_nload) memcpy(r, u->mx_R_load, (size_t)nr * 4); else nn_d2h(r, u->mx_R, (size_t)nr * 4);
-        fputs(",\"hb_R\":[", f); for (int i = 0; i < nr; i++) fprintf(f, "%s%.9g", i ? "," : "", r[i]); fputc(']', f);
+        fputs(",\"hb_R\":[", f); for (int i = 0; i < nr; i++) wfl(f, i ? "," : "", r[i], 9); fputc(']', f);
     }
     if (u->ad_lars && (u->ad_ema || u->ad_ema_nload)) {   /* adaptive Muon (b): the ratio EMAs (Muon table order) */
         float r[UNET_MAXCONV]; const int nr = u->ad_ema ? u->muon_nconv : u->ad_ema_nload;
         if (u->ad_ema) nn_d2h(r, u->ad_ema, (size_t)nr * 4); else memcpy(r, u->ad_ema_load, (size_t)nr * 4);
-        fputs(",\"adm_ema\":[", f); for (int i = 0; i < nr; i++) fprintf(f, "%s%.9g", i ? "," : "", r[i]); fputc(']', f);
+        fputs(",\"adm_ema\":[", f); for (int i = 0; i < nr; i++) wfl(f, i ? "," : "", r[i], 9); fputc(']', f);
     }
     if (u->ad_dog && (u->ad_dogst || u->ad_dog_nload)) {   /* adaptive Muon (c): DoG's rbar, G, eta */
         double d[4] = {0}; if (u->ad_dogst) nn_d2h(d, u->ad_dogst, sizeof d); else memcpy(d, u->ad_dog_load, 3 * sizeof(double));
-        fprintf(f, ",\"adm_dog\":[%.17g,%.17g,%.17g]", d[0], d[1], d[2]);
+        wfl(f, ",\"adm_dog\":[", d[0], 17); wfl(f, ",", d[1], 17); wfl(f, ",", d[2], 17); fputc(']', f);
     }
     if (u->ninh) {   /* the parameter ranges an --init-from copied (train --init-lr-mult on a resumed run) */
         fputs(",\"init_inh\":[", f); for (int i = 0; i < 2 * u->ninh; i++) fprintf(f, "%s%zu", i ? "," : "", u->inh[i]); fputc(']', f);
@@ -4984,11 +5030,20 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
         size_t bad = 0, first = 0; for (size_t i = 0; i < u->np; i++) if (!isfinite(h[i])) { if (!bad++) first = i; }
         if (bad) { fprintf(stderr, "unet_save: %zu non-finite %s (first at parameter %zu): %s not written, the previous one kept\n", bad, an[a], first, path);
                    fclose(f); remove(tmp); free(h); return -2; }
-        if (fwrite(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; }
+        if (fwrite(h, 4, u->np, f) != u->np) { fprintf(stderr, "unet_save: write error on %s: %s not written, the previous one kept\n", tmp, path); fclose(f); remove(tmp); free(h); return -1; }
     }
     free(h);
-    if (fclose(f)) return -1;
-    return rename(tmp, path);
+    /* durability (mini ckpt audit #6): the stream's error state (the header's unchecked fprintfs: a full disk), the data on disk before
+       the rename, the rename itself on disk after; then the file read back (audit #1) so a bad one never replaces the last good one */
+    const int narr = 4 + (u->muon_mom != nullptr);
+    if (fflush(f) || ferror(f) || fsync(fileno(f))) { fprintf(stderr, "unet_save: write error on %s: %s not written, the previous one kept\n", tmp, path); fclose(f); remove(tmp); return -1; }
+    if (fclose(f)) { remove(tmp); return -1; }
+    const char *why = ckpt_verify(tmp, u->np, narr);
+    if (why) { fprintf(stderr, "unet_save: %s does not read back (%s): %s not written, the previous one kept\n", tmp, why, path); remove(tmp); return -1; }
+    if (rename(tmp, path)) { fprintf(stderr, "unet_save: cannot rename %s to %s\n", tmp, path); remove(tmp); return -1; }
+    {   char dir[1400]; snprintf(dir, sizeof dir, "%s", path); char *sl = strrchr(dir, '/'); if (sl) { if (sl == dir) sl[1] = 0; else *sl = 0; } else snprintf(dir, sizeof dir, ".");
+        const int fd = open(dir, O_RDONLY | O_DIRECTORY); if (fd >= 0) { fsync(fd); close(fd); } }
+    return 0;
 }
 
 static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
@@ -4996,6 +5051,11 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "UFSM", 4)) return -1;
     char line[UFSM_CHECKPOINT_HEADER];
     if (!fgets(line, sizeof line, f) || !strchr(line, '\n')) return -1;
+    {   /* the top-level keys only (mini ckpt audit #9): "extra" is written last and holds the trainer's free-form keys, which an absent
+           optional top-level key ("lat_c", "gfilm", "l0_run" ...) would otherwise match; no top-level value is a string, so the first
+           ',"extra":' is the top level's */
+        char *ex = strstr(line, ",\"extra\":"); if (ex) *ex = 0;
+    }
     memset(cfg, 0, sizeof *cfg);
     const char *p;
     if ((p = strstr(line, "\"nlev\":"))) cfg->nlev = atoi(p + 7);
@@ -5099,7 +5159,28 @@ int unet_load(unet *u, const char *path) {
     if (!f) return -1;
     unet_cfg cfg; int step = 0; size_t np = 0;
     g_loaded_sparse = 0; g_loaded_sp24_lv = 0; g_loaded_sp24_hard = 0; g_loaded_sp24_r = 0.f; g_loaded_wq = 0; g_loaded_muon = 0;
-    if (read_header(f, &cfg, &step, &np)) { fclose(f); return -1; }
+    if (read_header(f, &cfg, &step, &np)) { fprintf(stderr, "unet_load: %s: unreadable header\n", path); fclose(f); return -1; }
+    {   /* the file holds exactly 4 arrays (p, ema, m, v) + the Muon momentum when the header says so; anything else is truncated or foreign
+           (mini ckpt audit #5: a file cut inside m / v loaded as a success with zero moments). 2 arrays (weights only): loads, moments 0 */
+        const long off = ftell(f); struct stat st; const long long a = 4ll * (long long)np, have = fstat(fileno(f), &st) ? -1 : (long long)st.st_size - off;
+        const long long want = a * (4 + (g_loaded_muon != 0));
+        if (have != want && !(have == 2 * a && !g_loaded_muon)) {
+            fprintf(stderr, "unet_load: %s: %lld payload bytes, the header (nparams %zu%s) needs %lld: truncated or not a checkpoint of this format\n", path, have, np, g_loaded_muon ? ", Muon momentum" : "", want);
+            fclose(f); return -1;
+        }
+        if (have == 2 * a) fprintf(stderr, "unet_load: %s holds the weights only: the optimizer state starts at zero\n", path);
+    }
+    {   /* the architecture beyond the parameter count (mini ckpt audit #7): a same-count rearrangement must not load silently */
+        const unet_cfg *c = &u->cfg; const char *bad = nullptr;
+        if (cfg.nlev != c->nlev) bad = "nlev";
+        for (int i = 0; !bad && i < c->nlev; i++) if (cfg.widths[i] != c->widths[i]) bad = "widths";
+        if (!bad && cfg.cin != c->cin) bad = "cin";
+        if (!bad && cfg.cout != c->cout) bad = "cout";
+        for (int i = 0; !bad && i < c->nlev; i++) { if (cfg.dec_widths[i] && c->dec_widths[i] && cfg.dec_widths[i] != c->dec_widths[i]) bad = "dec_widths";
+                                                    if (cfg.enc_blocks[i] && c->enc_blocks[i] && cfg.enc_blocks[i] != c->enc_blocks[i]) bad = "enc_blocks"; }
+        if (!bad && cfg.attn_blocks != c->attn_blocks) bad = "attn_blocks";
+        if (bad) { fprintf(stderr, "unet_load: %s: \"%s\" differs from this network's\n", path, bad); fclose(f); return -1; }
+    }
     /* a checkpoint without the side head (cfg.emb_lev) this net has (train --ssl resumed from a run without it): the head's block
        [eh.w, eh.b + emb_ch) is inserted -- weights and EMA take this net's fresh weights, its optimizer state starts at zero;
        every other parameter (before and after the block: film, fstem, ...) and its state is the checkpoint's */
@@ -5112,7 +5193,8 @@ int unet_load(unet *u, const char *path) {
     float *h = malloc(u->np * 4), *hc = i1 ? malloc(u->np * 4) : nullptr;
     float *arrs[4] = {u->p, u->ema, u->m, u->v};
     for (int a = 0; a < 4; a++) {
-        if (fread(h, 4, np, f) != np) { if (a < 2) { fclose(f); free(h); free(hc); return -1; } break; }
+        if (fread(h, 4, np, f) != np) { if (a < 2) { fclose(f); free(h); free(hc); return -1; }
+                                         nn_zero(u->m, u->np * 4); nn_zero(u->v, u->np * 4); break; }   /* (weights only: checked above) */
         if (i1) {   /* old [0, i0) | the block (this net's init for p / ema, 0 for the moments) | old [i0, np) */
             if (a < 2) nn_d2h(hc, u->p, u->np * 4); else memset(hc, 0, u->np * 4);   /* (the EMA of the block: its fresh weights too) */
             memmove(h + i1, h + i0, (np - i0) * 4); memcpy(h + i0, hc + i0, (i1 - i0) * 4);
@@ -5168,8 +5250,8 @@ int unet_load_grow(unet *u, const char *path, int keep, float new_bias) {
     g_loaded_sparse = 0; g_loaded_wq = 0; g_loaded_muon = 0;
     if (read_header(f, &oc, &step, &onp)) { fclose(f); return -1; }
     const unet_cfg *c = &u->cfg;
-    int same = oc.nlev == c->nlev && oc.cin == c->cin && oc.G == c->G && oc.down_norm == c->down_norm && oc.cout <= c->cout && keep <= oc.cout;
-    for (int i = 0; same && i < c->nlev; i++) same = oc.widths[i] == c->widths[i];
+    int same = oc.nlev == c->nlev && oc.cin == c->cin && oc.G == c->G && oc.down_norm == c->down_norm && oc.cout <= c->cout && keep <= oc.cout && oc.attn_blocks == c->attn_blocks;
+    for (int i = 0; same && i < c->nlev; i++) same = oc.widths[i] == c->widths[i] && oc.enc_blocks[i] == c->enc_blocks[i] && oc.dec_widths[i] == c->dec_widths[i] && oc.dec_convs[i] == c->dec_convs[i];
     const size_t hw = u->head.w, ci = (size_t)u->head.cin, tail_new = u->head.b + (size_t)c->cout, tail = u->np - tail_new;
     if (!same || onp != hw + ci * oc.cout + oc.cout + tail || g_loaded_sparse || g_loaded_wq) {
         fprintf(stderr, "grow-head: %s is not the same network with <= %d outputs\n", path, c->cout); fclose(f); return -1;
@@ -5191,6 +5273,14 @@ int unet_load_grow(unet *u, const char *path, int keep, float new_bias) {
     if (!g_loaded_muon && u->muon_mom) mom_load(u, nullptr);
     u->mx_R_nload = 0; u->mx_R_ok = 0;   /* a grown head: Hyperball radii from the weights */
     free(h); free(n); fclose(f);
+    {   /* what this path does not carry over (mini ckpt audit #8): said, not silent */
+        char lost[512] = ""; size_t k = 0;
+#define LOST(c, w) if (c) k += (size_t)snprintf(lost + k, sizeof lost - k, "%s%s", k ? ", " : "", w)
+        LOST(g_loaded_hbR_n, "Hyperball radii"); LOST(g_loaded_adema_n || g_loaded_addog_n, "adaptive-Muon state"); LOST(g_loaded_ninh, "init_inh ranges");
+        LOST(g_loaded_lat_c, "latent cell transform"); LOST(g_loaded_l0_cnt, "level-0 running statistics"); LOST(oc.gn_ema && g_loaded_ge_cnt, "gn_ema running statistics");
+#undef LOST
+        if (k) fprintf(stderr, "grow-head: %s: not restored from the checkpoint (fresh): %s\n", path, lost);
+    }
     return step;
 }
 

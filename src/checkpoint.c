@@ -5,12 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-char *checkpoint_header_line(const char *path) {
+char *checkpoint_header_line(const char *path) {   /* (mini ckpt audit #2: was 64 KiB, silently cut; the writer and the other readers allow
+                                                       UFSM_CHECKPOINT_HEADER, and the keys read through here sit in "extra", written last) */
     FILE *f = fopen(path, "rb"); if (!f) return nullptr;
-    char *line = malloc(1 << 16); if (!line) { fclose(f); return nullptr; }
-    const size_t n = fread(line, 1, (1 << 16) - 1, f); fclose(f); line[n] = 0;
-    char *e = memchr(line, '\n', n); if (e) *e = 0;
-    return line;
+    char *line = malloc(UFSM_CHECKPOINT_HEADER); if (!line) { fclose(f); return nullptr; }
+    const size_t n = fread(line, 1, UFSM_CHECKPOINT_HEADER - 1, f); fclose(f); line[n] = 0;
+    char *e = memchr(line, '\n', n); if (!e) { fprintf(stderr, "checkpoint: %s: no header line within %d bytes\n", path, UFSM_CHECKPOINT_HEADER); free(line); return nullptr; }
+    *e = 0; return line;
 }
 int checkpoint_unwrap_version(const char *path) {
     char *h = checkpoint_header_line(path); if (!h) return 0;

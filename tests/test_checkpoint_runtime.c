@@ -1,6 +1,7 @@
 /* Checkpoint inference settings must survive a move without any sidecar files. */
 #include "checkpoint.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -32,5 +33,13 @@ int main(void) {
     a.input_prec = 0; CHECK(checkpoint_runtime_json(&a, text, sizeof text) < 0);
     a.input_prec = 8; a.gn_stored = 2; CHECK(checkpoint_runtime_json(&a, text, sizeof text) < 0);
     FILE *f = fopen(path, "wb"); fputs("UFSM{\"extra\":{", f); fclose(f); CHECK(checkpoint_runtime_read(path, &b) < 0);
+    {   /* checkpoint_header_line (mini ckpt audit #2): a key past 64 KiB is seen; no newline within the limit -> nullptr, not a cut line */
+        f = fopen(path, "wb"); fputs("UFSM{\"nlev\":4,\"pad\":\"", f); for (int i = 0; i < 80000; i++) fputc('x', f);
+        fputs("\",\"extra\":{\"unwrap\":{\"version\":2,\"ink\":11}}}\n", f); fclose(f);
+        CHECK(checkpoint_unwrap_version(path) == 2); CHECK(checkpoint_ink_channel(path) == 11);
+        char *h = checkpoint_header_line(path); CHECK(h && strlen(h) > 80000 && !strchr(h, '\n')); free(h);
+        f = fopen(path, "wb"); fputs("UFSM{\"nlev\":4,\"pad\":\"", f); for (int i = 0; i < UFSM_CHECKPOINT_HEADER; i++) fputc('x', f); fclose(f);
+        CHECK(checkpoint_header_line(path) == nullptr); CHECK(checkpoint_unwrap_version(path) == 0);
+    }
     unlink(path); printf("checkpoint runtime: %s\n", fails ? "FAIL" : "ok"); return fails != 0;
 }
