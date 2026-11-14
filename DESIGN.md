@@ -6,6 +6,55 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Masked CT: no coupling through data-free cells, a majority data test in wraps, one no-data gate (2026-11-14, branch geoouter-20261114)
+
+**Problem (geo-outer audit, /vesuvius/ufsm/audit-20261114/geo-outer.md).** PHerc1667's fields ran on the `-masked` CT, whose SAM mask clips
+the outer turns (16 % of the published area lies on zero CT). Two effects:
+- **Count field.** fibfit's oracle count-field (dir -1, the published surface's own same-sheet pairs) loses one sheet beyond r ~8 mm:
+  - against the published surface, identity is 0.97 at turns <= 17, then 0.90 / 0.58 / 0.41 / 0.08 at turns 18 / 23 / 24 / 29;
+  - the masked parts of the outer turns are off by 3 turns or more (W radially flat: a no-data edge carries only the theta term);
+  - on UNMASKED published vertices, the k < 0 share falls with the along-sheet distance to the nearest masked vertex: 0.65 (< 0.8 mm),
+    0.53, 0.36, 0.12 (12-50 mm), 0.05 (> 50 mm), the same within each turn band;
+  - the same fields without the pairs (ref-dm1) show no such drift, so the pairs into the data-free cells carry the deficit;
+  - 22.9 % of the 2.73 M pairs have an endpoint in a no-data solve cell.
+- **Wraps.** The u1 wraps put whole duplicate outer wraps on the zeroed CT. At z 20000, w043-w049 lie entirely on it, 100-400 um deep,
+  at 24-44 um pitch. The cause is `wraps --fields`' data test: the max-pooled material w > 0 (any cell). The network's weak response
+  (w 4-40) within ~100 um of the mask edge, pooled 4x, kept them.
+- **The 2023 7.91 um scan.** Range reads of 6 slices from dl.ash2txt, mapped with r2-transform. At the divergence the published sheets
+  sit on CT layers. Published gaps show no skipped-sheet signature. Under the masked zone, faint low-density layers lie beneath the
+  published turns 24-30.
+
+**Changes.**
+- **count-field: no-data pairs dropped** (default; `--cf-fib-nodata keep` keeps them). A pair or fibre sample pair is dropped when
+  either endpoint's level-0 solve cell has pooled weight S < `--cf-fib-smin` (0.1) x the median S of the data cells. It prints
+  `count-field: no-data: N of M pairs (share) ...` and a WARNING above 0.02.
+- **wraps: majority data test.** `fit_field_array_frac` pools 255 x the share of a pooled cell's field cells with material
+  >= `--data-thr` (128). A vertex is kept where that share is >= `--data-min` (128, a majority). `--data-thr 1 --data-min 1` restores
+  the earlier any-cell test. The radius bounds and the id pruning keep using "any strong cell", which is still a superset.
+  - 1667-u1 joined, z 19900-20100 (`--zr 4975,5025`), against the old test:
+
+    | | wraps | vertices | on zero CT (level 4) |
+    |---|---|---|---|
+    | old (any cell) | 65 | 663 k | 11.4 % |
+    | new (majority) | 42 | 547 k | 0.32 % |
+
+  - w044-w066 are gone. Near z 20000 the dropped vertices are 96.1 % on zero CT at level 1, with median depth 115 um. The other 338
+    are all within 100 um of the mask. The 2-D simulation at pool 4 kept 99.5 % of the on-CT vertices and 4 % of the masked ones.
+  - It prints `wraps: no-data: N roots on weak data cells ... share` and a WARNING above 0.02 (1667-u1 band: 0.057).
+- **One gate.** unroll.sh logs both WARNING lines (ref, wraps) to progress.log. audit-ugeom removed its wrap-snap ALARM
+  (ugeomfix c6d9985). wrap-snap keeps its masked-share print as a cross-check, and `--masked-max` stays (off by default).
+- **Tests.**
+  - test_wraps_core: fit_field_array_frac against a brute-force share at pools 4 / 8 / 3. A masked-fields case: w 255 inside the data
+    radius, a weak 20 band 12 native voxels wide, 0 beyond. The majority test keeps 0 vertices beyond the edge, the any-cell test
+    15.9 k, and both keep the same 46.7 k inside.
+  - test_countfield: a masked outer sector (material 0) with sheet arcs running into it. With the no-data pairs dropped, the data
+    cells beside it keep their count.
+  - The synthetic arcs are exact, so keeping them does no harm either (0.000 / 0.000). The 1667 oracle rerun with dropped pairs is the
+    real check: `/vesuvius/ufsm/audit-20261114/geo-outer/cf/`, scored with `py/wloc.py` + `py/maskcorr.py`.
+- **Not done.**
+  - Fields on unmasked CT (pub1667's filled store, a GPU predict): the real fix for the missing outer data.
+  - A fields-level weak-edge share inside count-field, which would stop a run before the slabs.
+
 ## Attention Muon-LR multiplier and the accum A/B prep (2026-11-14, branch attnlr2-20261114; admuon's code, committed by perf2)
 
 Audit 2026-11-14 train #3 and #8. Both default off; nothing changes without the flags.

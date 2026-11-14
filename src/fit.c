@@ -3335,9 +3335,30 @@ int fit_set_grid_cpu(const fit_set *s, const double o[3], const int64_t n[3], do
 }
 
 /* one field array (name: pc ps t0..t5 sp w) of a fit-field directory, max-pooled by pool per axis (raw or zarr; read in z-blocks) */
-typedef struct { const uint8_t *blk; uint8_t *out; int z0, nz, H, W, Hp, Wp, pool; } ffa_pool_job;
+typedef struct { const uint8_t *blk; uint8_t *out; int z0, nz, H, W, Hp, Wp, pool, thr; } ffa_pool_job;   /* thr > 0: the share of cells >= thr (fit_field_array_frac) */
+static void ffa_frac_rows(const ffa_pool_job *J, int yp0, int yp1) {   /* fit_field_array_frac: 255 x the share of a pooled cell's
+    cells >= thr (a pooled z row lies in one block: the blocks are whole pools; the share is of pool^3, edge cells counted short) */
+    const int P = J->pool, W = J->W; const double sc = 255.0 / ((double)P * P * P);
+    uint16_t *cnt = malloc((size_t)J->Wp * sizeof *cnt);
+    for (int a0 = 0; a0 < J->nz;) {
+        const int zp = (J->z0 + a0) / P; int a1 = a0; while (a1 < J->nz && (J->z0 + a1) / P == zp) a1++;
+        uint8_t *o = J->out + (size_t)zp * J->Hp * J->Wp;
+        for (int yp = yp0; yp < yp1; yp++) {
+            const int y1 = (yp + 1) * P < J->H ? (yp + 1) * P : J->H;
+            memset(cnt, 0, (size_t)J->Wp * sizeof *cnt);
+            for (int a = a0; a < a1; a++) for (int y = yp * P; y < y1; y++) {
+                const uint8_t *r = J->blk + ((size_t)a * J->H + y) * W;
+                for (int x = 0; x < W; x++) cnt[x / P] += r[x] >= J->thr;
+            }
+            for (int xp = 0; xp < J->Wp; xp++) o[(size_t)yp * J->Wp + xp] = cnt[xp] ? (uint8_t)fmax(1, fmin(255, floor(cnt[xp] * sc + 0.5))) : 0;   /* (any cell: >= 1) */
+        }
+        a0 = a1;
+    }
+    free(cnt);
+}
 static void ffa_pool_rows(void *ctx, int yp0, int yp1, int t) {   /* fit_field_array: the max over pool^3 into pooled rows [yp0, yp1) */
     const ffa_pool_job *J = ctx; const int P = J->pool, W = J->W, Wf = W / P * P; (void)t;
+    if (J->thr > 0) { ffa_frac_rows(J, yp0, yp1); return; }
     uint8_t *acc = malloc((size_t)W);   /* the element-wise max of the block's rows of one pooled (z, y) cell row, then reduced along x */
     for (int a0 = 0; a0 < J->nz;) {
         const int zp = (J->z0 + a0) / P; int a1 = a0; while (a1 < J->nz && (J->z0 + a1) / P == zp) a1++;
@@ -3419,7 +3440,7 @@ static int ffa_chunks(z3 *za, const long long zoff[3], int D, int H, int W, int 
     free(list);
     return atomic_load(&J.fail) ? -1 : 1;
 }
-uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[3]) {
+static uint8_t *ffa_read(const char *dir, const char *name, int pool, int thr, int shape[3]) {
     fit_fields_buf g; if (fit_fields_load(dir, 0, 0, 0, &g)) return nullptr;
     const int D = g.shape[0], H = g.shape[1], W = g.shape[2], Dp = (D + pool - 1) / pool, Hp = (H + pool - 1) / pool, Wp = (W + pool - 1) / pool;
     char p[1400]; snprintf(p, sizeof p, "%s/fields.json", dir); json *j = read_json_file(p);
@@ -3436,7 +3457,7 @@ uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[
        chunk by chunk instead (ffa_chunks: PHerc0490B's w at pool 8, 80 G cells: 190 s -> 6 s, the same bytes) */
     const int zb = pool >= 64 ? pool : 64 / pool * pool, nth = fit_nthreads(1 << 20);
     uint8_t *out = calloc((size_t)Dp * Hp * Wp, 1);
-    const int byc = out && za && !cside ? ffa_chunks(za, zoff, D, H, W, Hp, Wp, pool, nth, out) : 0;
+    const int byc = out && za && !cside && thr <= 0 ? ffa_chunks(za, zoff, D, H, W, Hp, Wp, pool, nth, out) : 0;   /* (frac: the block path) */
     if (byc < 0) { free(out); out = nullptr; }
     uint8_t *blk = out && !byc ? malloc((size_t)zb * H * W) : nullptr;
     if (out && !byc && !blk) { free(out); out = nullptr; }
@@ -3445,14 +3466,16 @@ uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[
         if (za) { const int64_t o[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n[3] = {nz, H, W}; if (z3_read_sub(za, o, n, blk, nth, fit_submask(za, o[0], n[0]))) { free(out); out = nullptr; break; } }
         else { const long long o[3] = {z0 + zoff[0], zoff[1], zoff[2]}; const int64_t n[3] = {nz, H, W}; if (raw_read_box(fr, rsh, o, n, blk)) { free(out); out = nullptr; break; } }
         if (cside) core_mask(dir, &core, cside, gorg, gh, gum, D, z0, nz, H, W, name[0] == 'p' ? blk : nullptr, nullptr, name[0] == 'w' ? blk : nullptr);
-        if (pool == 1) { memcpy(out + (size_t)z0 * H * W, blk, (size_t)nz * H * W); continue; }   /* (the max with the zeroed output) */
-        ffa_pool_job PJ = {blk, out, z0, nz, H, W, Hp, Wp, pool};   /* pooled rows on threads (each output row by one thread: the same maxima) */
+        if (pool == 1 && thr <= 0) { memcpy(out + (size_t)z0 * H * W, blk, (size_t)nz * H * W); continue; }   /* (the max with the zeroed output) */
+        ffa_pool_job PJ = {blk, out, z0, nz, H, W, Hp, Wp, pool, thr};   /* pooled rows on threads (each output row by one thread: the same maxima) */
         fit_zpar(Hp, nth, ffa_pool_rows, &PJ);
     }
     free(blk); if (za) z3_close(za); if (fr) fclose(fr); if (cside) cl_free(&core);
     if (out) { shape[0] = Dp; shape[1] = Hp; shape[2] = Wp; }
     return out;
 }
+uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[3]) { return ffa_read(dir, name, pool, 0, shape); }
+uint8_t *fit_field_array_frac(const char *dir, const char *name, int pool, int thr, int shape[3]) { return ffa_read(dir, name, pool, thr < 1 ? 1 : thr, shape); }
 
 /* device bytes a fit set will take (fit_set_upload: its delta lattices; the axis / knot arrays are small): the delta.f32 sizes in DIR
    and its subdirectories (a set: global/, slabNNN/) */

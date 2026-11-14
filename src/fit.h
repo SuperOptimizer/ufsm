@@ -397,6 +397,7 @@ int fit_fields_load_ex(const char *dir, int fz0, int fz1, int pool, fit_fields_b
 /* cl_mask_block (src/coreline.h) over rows [z0, z0 + nz) on fit_set_threads threads (one row per task; the same arrays) */
 void fit_core_mask(const coreline *C, int side, const long long org[3], double h, double um, int z0, int nz, int H, int W, uint8_t *pc, uint8_t *ps, uint8_t *w);
 uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[3]);   /* one field array, max-pooled (raw or zarr) */
+uint8_t *fit_field_array_frac(const char *dir, const char *name, int pool, int thr, int shape[3]);   /* 255 x the share of each pooled cell's cells >= thr */
 
 /* CT in the fitter (src/fit_ct.c). The papyrus / void parity of the mean CT per cell: m = tanh((ct - mu) / sd), mu and sd over a cube of
    half-edge r cells around the cell (cells with ct > 0), coded 128 + 127 m (128: no CT). Local, so no global CT cutoff. */

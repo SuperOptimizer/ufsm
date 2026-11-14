@@ -262,6 +262,55 @@ int main(void) {
         CHECK(err[0] > 0.3, "the band under-count should break the sector without pairs (%.3f off)", err[0]);
         CHECK(err[1] < 0.05, "the fibre pairs should restore the sector (%.3f off with --cf-fib 4)", err[1]);
     }
+    {   /* a masked outer sector (geo-outer 2026-11-14: a zeroed CT under a tight SAM mask): r > MR cells and th in (0.2, 1.4) carry no
+           data (material 0). Same-sheet arcs (every sheet, r 20..44 cells, th -0.6..2.2) run from the data into it. W has no data there
+           (its edges hold only the theta term: radially flat), so with the arcs kept (--cf-fib-nodata keep) the sheets' data parts beside
+           the sector are pulled; dropped (default), the pairs on data cells only, W there follows the density. Integer W errors in the
+           data cells beside the sector (r 30..44, th 1.5..2.2 and -0.6..0.1), the gauge from the lower half */
+        char in4[600], o5[700], o6[700], fibq[700]; snprintf(in4, sizeof in4, "%s/in_mask", dir); snprintf(o5, sizeof o5, "%s/out_mkeep", dir); snprintf(o6, sizeof o6, "%s/out_mdrop", dir); snprintf(fibq, sizeof fibq, "%s/arcs_m.fib", dir);
+        const double MR = 30;
+        uint8_t *sv[10]; for (int k = 0; k < 10; k++) { sv[k] = malloc(n); memcpy(sv[k], a[k], n); }
+        for (size_t i = 0; i < n; i++) {
+            const int y = (int)(i / W % H), x = (int)(i % W); const double ry = (y + 0.5) * h - cy0, rx = (x + 0.5) * h - cx0, r = hypot(ry, rx), th = atan2(ry, rx);
+            if (a[9][i]) { const double Wt = trueW((y + 0.5) * h, (x + 0.5) * h);   /* (the true phase: the count is what is tested) */
+                a[0][i] = (uint8_t)lrint(128 + 127 * 0.9 * cos(2 * M_PI * Wt)); a[1][i] = (uint8_t)lrint(128 + 127 * 0.9 * sin(2 * M_PI * Wt)); }
+            if (r > MR * h && th > 0.2 && th < 1.4) { for (int k = 0; k < 10; k++) a[k][i] = 0; a[0][i] = a[1][i] = 128; }
+        }
+        CHECK(!fit_fields_save(in4, org, shp, h, 9.6, a, cy, cx, na), "save the masked fields");
+        for (int k = 0; k < 10; k++) { memcpy(a[k], sv[k], n); free(sv[k]); }
+        fib_set fs = {0}; int cap = 4096; fs.off = malloc(1024 * sizeof(int)); fs.fam = calloc(1024, 1); fs.pts = malloc((size_t)cap * 3 * sizeof(float)); fs.off[0] = 0;
+        for (int k = 3; k < 12; k++) for (int zz = 1; zz < D * h; zz += 4) {
+            for (double th = -0.6; th <= 2.2; th += 0.02) {
+                const double r = p * (k + th / (2 * M_PI)); if (r < 20 * h || r > 44 * h) continue;
+                if (fs.npts == cap) { cap *= 2; fs.pts = realloc(fs.pts, (size_t)cap * 3 * sizeof(float)); }
+                fs.pts[3 * fs.npts] = (float)(zz + 0.5); fs.pts[3 * fs.npts + 1] = (float)(cy0 + r * sin(th)); fs.pts[3 * fs.npts + 2] = (float)(cx0 + r * cos(th)); fs.npts++;
+            }
+            if (fs.npts > fs.off[fs.n]) { fs.n++; fs.off[fs.n] = fs.npts; }
+        }
+        CHECK(!fib_save(fibq, &fs), "save the masked-test arcs"); free(fs.off); free(fs.fam); free(fs.pts);
+        double err[2] = {1, 1}, msk[2] = {0, 0};
+        for (int v = 0; v < 2; v++) {
+            char *av5[] = {"ufsm", "count-field", in4, v ? o6 : o5, "--R", "0", "--dir", "1", "--pool", "1", "--threads", "4", "--rmin-um", "0", "--cf-gpu", "0", "--fibers", fibq, "--cf-fib", "4",
+                           "--cf-fib-nodata", v ? "drop" : "keep", nullptr};
+            CHECK(cmd_count_field(22, av5) == 0, "count-field (masked sector, %s) failed", v ? "drop" : "keep");
+            snprintf(pth, sizeof pth, "%s/wc.f32", v ? o6 : o5); FILE *f5 = fopen(pth, "rb"); float *w5 = malloc(n * sizeof(float));
+            CHECK(f5 && fread(w5, sizeof(float), n, f5) == n, "no wc.f32 (masked)"); if (f5) fclose(f5);
+            double gs = 0, gc = 0; int ne = 0, nb = 0, nm = 0, nmb = 0;
+            for (int pass = 0; pass < 2; pass++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+                const size_t i = ((size_t)3 * H + y) * W + x; const double py = (y + 0.5) * h, px = (x + 0.5) * h, r = hypot(py - cy0, px - cx0), th = atan2(py - cy0, px - cx0);
+                if (!(w5[i] == w5[i]) || r < 8 * h || r > 44 * h) continue;
+                const double e = w5[i] - trueW(py, px);
+                if (!pass) { if (th < -0.9 && th > -2.7 && r < MR * h) { gs += e; gc++; } continue; }
+                const double g0 = gc ? gs / gc : 0;
+                if (r > MR * h && th > 0.2 && th < 1.4) { nm++; nmb += fabs(e - g0) > 0.5; continue; }
+                if (r < 31 * h || !((th > 1.5 && th < 2.2) || (th > -0.6 && th < 0.1))) continue;
+                ne++; nb += fabs(e - g0) > 0.5;
+            }
+            err[v] = ne ? (double)nb / ne : 1; msk[v] = nm ? (double)nmb / nm : 0; free(w5);
+            printf("masked sector, pairs %s: W off by > 0.5 turn on %.3f of %d data cells beside the sector (%.3f of %d masked cells)\n", v ? "dropped" : "kept", err[v], ne, msk[v], nm);
+        }
+        CHECK(err[1] < 0.05, "no-data pairs dropped: the data cells beside the masked sector should keep their count (%.3f off)", err[1]);
+    }
     gpu_vs_cpu(dir);
     defaulted_dir(dir);
     char cmd[700]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}

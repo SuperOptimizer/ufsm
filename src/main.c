@@ -2227,6 +2227,8 @@ static size_t wraps_snap(z3 *rz, const int64_t ro[3], const fit_model *m, int ro
    and its neighbours). A vertex outside it is dropped anyway, so ray roots outside are not searched for (fit_set_ray_root_b): on a
    2 cm half box ~93% of the rays found no kept vertex (in the masked half, in the void, or off the wrap) at ~30-180 W evaluations
    each. The kept vertices are the same. */
+static int g_wr_dmin = 128;   /* mgpu: process (set from the options before any thread); ufsm wraps --data-min: the pooled data share (x255) a kept vertex needs */
+static _Atomic long long g_wr_nweak, g_wr_nkept;   /* roots dropped by the data test on a weak (0 < share < --data-min) cell; vertices kept */
 typedef struct { int rows, nb; double t0, bw; float *rmin, *rmax; } wr_polar;
 typedef struct { wr_polar *P; const fit_model *m; const uint8_t *wf; int wsh[3]; double wh, step, Z; int na; _Atomic int next; double zlo; } wr_polar_job;
 static void *wr_polar_rows(void *arg) {
@@ -2296,7 +2298,10 @@ static void *wraps_rows(void *arg) {
             const double y = cy + rr * sin(th), x = cx + rr * cos(th);
             if (J->wf) {
                 const int fz = (int)fmin(z / J->wh, J->wsh[0] - 1), fy = (int)fmin(y / J->wh, J->wsh[1] - 1), fx = (int)fmin(x / J->wh, J->wsh[2] - 1);
-                if (fy < 0 || fx < 0 || !J->wf[((size_t)fz * J->wsh[1] + fy) * J->wsh[2] + fx]) continue;
+                if (fy < 0 || fx < 0) continue;
+                const uint8_t sv = J->wf[((size_t)fz * J->wsh[1] + fy) * J->wsh[2] + fx];
+                if (sv < g_wr_dmin) { if (sv) atomic_fetch_add(&g_wr_nweak, 1); continue; }
+                atomic_fetch_add(&g_wr_nkept, 1);
             }
             J->px[i] = (float)(x + m->origin[2]); J->py[i] = (float)(y + m->origin[1]); J->pz[i] = (float)(z + m->origin[0]); valid++; rprev = rr;
         }
@@ -2441,7 +2446,9 @@ static int cmd_wraps(int argc, char **argv) {
                                     "     p90 = the 90th percentile of its roots over the rows' z range (default; wraps that leave the axis, the core), arc = equal arc length\n"
                                     "     per column at the wrap's median radius in each 1/256 turn (eccentric / core wraps sampled at their own arc), or a number\n"
                                     "  --min-cm2 C: wraps under C cm2 (vertices x (step x um)^2) are not written (default 0.5: end-cap / air fragments; 0 keeps all)\n"
-                                    "  with --fields: only wrap ids within ~1 turn of a data cell are computed, largest first (UFSM_WRAPS_NOPRUNE=1: every id)\n"); return 2; }
+                                    "  with --fields: only wrap ids within ~1 turn of a data cell are computed, largest first (UFSM_WRAPS_NOPRUNE=1: every id)\n"
+                                    "  --data-thr T --data-min M (with --fields): a vertex is kept where >= M/255 of its pooled cell's field cells hold material >= T/255\n"
+                                    "     (default 128 128: a majority at least half material; 1 1 = the earlier any-cell test)\n"); return 2; }
     if (opt_atof("--sfc", opt(argc, argv, "--sfc", "0")) > 0) tifxyz_set_sfc(opt_atof("--sfc", opt(argc, argv, "--sfc", "0")));
     fit_set *fs = fit_set_load(argv[2]); if (!fs) { fprintf(stderr, "wraps: cannot load %s\n", argv[2]); return 1; }
     const fit_model *m = fs->global;   /* the box, the axis; rows dispatch to the slab model of their z */
@@ -2484,7 +2491,13 @@ static int cmd_wraps(int argc, char **argv) {
         fit_fields_buf g; if (fit_fields_load(fd, 0, 0, 0, &g)) { fprintf(stderr, "wraps: cannot read the fields in %s\n", fd); return 1; }
         int pool = 1; while ((double)g.shape[0] * g.shape[1] * g.shape[2] / ((double)pool * pool * pool) > 1e9) pool *= 2;
         wh = (double)g.h * pool; fit_fields_free(&g);
-        if (!(wf = fit_field_array(fd, "w", pool, wsh))) { fprintf(stderr, "wraps: cannot read the data weight in %s\n", fd); return 1; }
+        /* the pooled cell: 255 x the share of its field cells with material >= --data-thr (default 128 x 1/255: half material); a vertex
+           is kept where that share is >= --data-min / 255 (default 128: a majority). The max-pooled weight (the earlier test, any cell > 0)
+           kept the outer wraps that the fields' weak edge cells carry into a zeroed (masked) CT: PHerc1667 u1 z 20000, 98 % of the wrap
+           vertices on zero CT kept, w043-w049 entirely on it at 24-44 um pitch; majority of >= 128 at pool 4: 4.0 % kept, on-CT 99.5 %
+           (geo-outer, DESIGN 2026-11-14). --data-thr 1 --data-min 1: the earlier test */
+        const int dthr = opt_atoi("--data-thr", opt(argc, argv, "--data-thr", "128")); g_wr_dmin = opt_atoi("--data-min", opt(argc, argv, "--data-min", "128")); if (g_wr_dmin < 1) g_wr_dmin = 1;
+        if (!(wf = fit_field_array_frac(fd, "w", pool, dthr, wsh))) { fprintf(stderr, "wraps: cannot read the data weight in %s\n", fd); return 1; }
     }
     double zlo = 0, zhi = Z;   /* --zr: the rows' global native z range, box-local */
     if (*opt(argc, argv, "--zr", "")) {
@@ -2558,6 +2571,11 @@ static int cmd_wraps(int argc, char **argv) {
     } else for (int i = 0; i < nk; i++) if (wrap_one(&A, ks[i], nthreads)) A.fail = 1;
     free(P.rmin); free(P.rmax); free(ks); free(cnt); fit_lip_free(lip);
     if (A.fail) return 1;
+    if (wf) {   /* the masked-CT gate's wraps line: the weak-edge roots (a zeroed CT next to the data, PHerc1667 u1: the outer dup wraps) */
+        const long long nw = atomic_load(&g_wr_nweak), nk = atomic_load(&g_wr_nkept); const double sh = nw + nk ? (double)nw / (double)(nw + nk) : 0;
+        fprintf(stderr, "wraps: no-data: %lld roots on weak data cells (share >0 and < %d/255 of the cells with material >= %s/255) dropped, %.4f of the roots in the data%s\n",
+                nw, g_wr_dmin, opt(argc, argv, "--data-thr", "128"), sh, sh > 0.02 ? " (WARNING > 0.02: wide weak data edges, masked CT?)" : "");
+    }
     const int nwr = A.nwr; const size_t nvalid_all = A.nvalid;
     fprintf(stderr, "wraps: %d wraps (%d..%d) with %zu vertices written to %s", nwr, k0, k1, nvalid_all, argv[3]);
     if (A.nsmall) fprintf(stderr, " (%d under --min-cm2 %g not written)", (int)A.nsmall, A.min_cm2);

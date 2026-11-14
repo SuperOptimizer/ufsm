@@ -163,6 +163,7 @@ typedef struct cf_pairs {
     size_t np; uint32_t (*ix)[16]; float (*cw)[16]; float *t, *w0, *w, *q;   /* per pair: cells, coefficients, target, weights, c . v */
     size_t *rs; uint32_t *re;   /* cell i's entries re[rs[i] .. rs[i + 1]): pair * 16 + entry */
 } cf_pairs;
+static int cf_cmpf(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
 static double cf_center(const cf_lvl *L, int i) { return (i + 0.5) * L->P * L->h; }   /* native coordinate of a solve cell centre */
 /* the theta term dir grad theta / 2 pi (turns per solve cell) at a solve-cell point (native coordinates) */
 static void cf_theta(const cf_lvl *L, double pz, double py, double px, double g[3]) {
@@ -278,6 +279,10 @@ static double cf_tri(const float *U, int d, int hh, int w, double qz, double qy,
 
 /* ---- same-sheet pairs: the point list (box-local native z y x, target t in U), built per level ---- */
 typedef struct { float a[3], b[3], t; } cf_pt;
+static int cf_data_at(const cf_lvl *L, const float *S, double smin, const float p[3]) {   /* the solve cell of a native point holds data */
+    const double cs = (double)L->P * L->h; const int z = (int)floor(p[0] / cs), y = (int)floor(p[1] / cs), x = (int)floor(p[2] / cs);
+    return z >= 0 && y >= 0 && x >= 0 && z < L->d && y < L->hh && x < L->w && S[((size_t)z * L->hh + y) * L->w + x] >= smin;
+}
 static void cf_tri_w(const cf_lvl *L, const float p[3], uint32_t ix[8], float cw[8], float sg) {   /* cf_tri's corners / weights of a native point */
     const double cs = (double)L->P * L->h, q[3] = {p[0] / cs - 0.5, p[1] / cs - 0.5, p[2] / cs - 0.5}; const int dm[3] = {L->d, L->hh, L->w}; int c[3]; double t[3];
     for (int k = 0; k < 3; k++) { double a = q[k] < 0 ? 0 : q[k] > dm[k] - 1 ? dm[k] - 1 : q[k]; c[k] = (int)a; if (c[k] > dm[k] - 2) c[k] = dm[k] - 2 < 0 ? 0 : dm[k] - 2; t[k] = dm[k] > 1 ? a - c[k] : 0; }
@@ -793,6 +798,27 @@ int cmd_count_field(int argc, char **argv) {
         }
         #undef CF_PUSH
         if (!npt) fprintf(stderr, "count-field: --cf-fib %g but no pairs (--fibers / --pairs): off\n", wfib);
+        /* pairs with an endpoint in a no-data solve cell (pooled weight S < --cf-fib-smin x the median S of the data cells, default 0.1):
+           dropped (--cf-fib-nodata keep: kept). In a zeroed (masked) CT W has no data and stays near flat; a pair from there to the same
+           sheet's data part pulls that part's radial count down: PHerc1667's published-surface oracle pairs (19 % with an endpoint on
+           zero CT) left the unmasked turns 18-30 off by -1 on up to 65 % of their area within 0.8 mm of the mask, 5 % beyond 50 mm
+           (geo-outer, DESIGN 2026-11-14). The share is the masked-CT gate's count-field line (> 0.02: a warning) */
+        if (npt) {
+            const cf_lvl *L0 = &lv[0]; const float *S0 = Sl[0]; size_t nd = 0;
+            for (size_t i = 0; i < L0->n; i++) nd += S0[i] > 0;
+            float *sv = malloc((nd ? nd : 1) * sizeof(float)); size_t k = 0; for (size_t i = 0; i < L0->n; i++) if (S0[i] > 0) sv[k++] = S0[i];
+            qsort(sv, nd, sizeof(float), cf_cmpf); const double smed = nd ? sv[nd / 2] : 0;
+            free(sv);
+            const double smin = opt_atof("--cf-fib-smin", cf_opt(argc, argv, "--cf-fib-smin", "0.1")) * smed; const int keep = !strcmp(cf_opt(argc, argv, "--cf-fib-nodata", "drop"), "keep");
+            size_t nk = 0, nbad = 0;
+            for (size_t p = 0; p < npt; p++) { const int ok = cf_data_at(L0, S0, smin, pts[p].a) && cf_data_at(L0, S0, smin, pts[p].b); nbad += !ok; if (ok || keep) pts[nk++] = pts[p]; }
+            const double sh = (double)nbad / (double)npt;
+            fprintf(stderr, "count-field: no-data: %zu of %zu pairs (%.4f) have an endpoint in a no-data solve cell (S < %.3g, %.2f x the median); %s\n",
+                    nbad, npt, sh, smin, opt_atof("--cf-fib-smin", cf_opt(argc, argv, "--cf-fib-smin", "0.1")), keep ? "kept (--cf-fib-nodata keep)" : "dropped");
+            if (sh > 0.02) fprintf(stderr, "count-field: WARNING no-data pairs %.4f > 0.02: the pairs reach into masked / empty CT (W has no data there; fields on unmasked CT?)\n", sh);
+            npt = nk;
+            if (!npt) fprintf(stderr, "count-field: no pairs left on data cells: pairs off\n");
+        }
     }
     const double fhub = opt_atof("--cf-fib-huber", cf_opt(argc, argv, "--cf-fib-huber", "0.25")); const int firls = opt_atoi("--cf-fib-irls", cf_opt(argc, argv, "--cf-fib-irls", "3"));
     float *Sfine = Sl[0], *Gfine[3] = {Gl[0][0], Gl[0][1], Gl[0][2]}; const double tst1 = cf_now();
