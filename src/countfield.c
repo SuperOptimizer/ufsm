@@ -736,7 +736,7 @@ int cmd_count_field(int argc, char **argv) {
         decide only with --dir-loops 1, else they are printed beside the refusal */
         fit_fields_skip_planes(0); fit_fields_buf wb; const int zm = D / 2, z0 = zm - 16 < 0 ? 0 : zm - 16, z1 = zm + 16 > D ? D : zm + 16;
         if (!fit_fields_load(in, z0, z1, 1, &wb)) {
-            fit_cfg gc = fit_cfg_default(); gc.dir_loops = atoi(cf_opt(argc, argv, "--dir-loops", "0")); fit_model gm; memset(&gm, 0, sizeof gm);
+            fit_cfg gc = fit_cfg_default(); gc.dir_loops = opt_atoi("--dir-loops", cf_opt(argc, argv, "--dir-loops", "0")); fit_model gm; memset(&gm, 0, sizeof gm);
             if (!fit_init_prior(&wb.f, &gc, &gm) && gm.dir_src != FIT_DIR_DEFAULT) { dir = gm.dir; dsrc = gm.dir_src; }
             free(gm.pitch); free(gm.offset); fit_fields_free(&wb);
         }
