@@ -16,6 +16,10 @@ if [ "${1:-}" != --after ]; then
     git -C /home/forrest/ufsm merge-base --is-ancestor 472df19 $SHA 2>/dev/null && good "binary contains sampbias 472df19 (zboost: sources.c ignores unknown keys silently)" || bad "binary lacks sampbias 472df19"
     for b in dcachecap-20261114 dckey-20261114; do git -C /home/forrest/ufsm merge-base --is-ancestor origin/$b $SHA 2>/dev/null && good "binary contains $b" || bad "binary lacks origin/$b (hostmem: derived-cache cap + new keys)"; done
   [ -e /home/forrest/.cache/ufsm/derived ] && bad "~/.cache/ufsm/derived still in place: mv it to derived.try6 (no trainer / admuon arm reading it)" || good "old derived cache moved away"
+  # every --flag the env passes (XFLAGS, OPTX) must be known to the binary (train's opt() ignores nothing silently since 27fee1e, but check here)
+  for f in $(grep -E '^(XFLAGS|OPTX)=' $E | cut -d= -f2- | tr ' ' '\n' | grep -E '^--[a-z]' | sort -u); do strings "$U" | grep -qxF -- "$f" || strings "$U" | grep -qF -- "\"$f\"" || strings "$U" | grep -qF -- "$f" || bad "binary does not know $f"; done
+  grep -qE '^MLR=0.003$' $E && good "Muon lr 0.003" || bad "MLR is not 0.003"
+  grep -qE '^OPTX=.*--normuon 1' $E && good "optimizer: NorMuon + LARS candidate ACTIVE (needs admuon's seed-8 confirmation)" || good "optimizer: plain Muon --muon-tc 2 (candidate commented)"
   for f in --stop-at-update --gns-skip-echo; do strings "$U" | grep -qF -- "$f" && good "binary knows $f (trainlow 738e72f7)" || bad "binary lacks $f (trainlow-20261114 738e72f7)"; done
   grep -qE '^XFLAGS=.*--accum auto' $E && ! grep -qE '^XFLAGS=.*--gns-skip-echo 1' $E && grep -qE '^XFLAGS=.*--echo-max [1-9]' $E && bad "--accum auto with --echo-max needs --gns-skip-echo 1 (main)"
   strings "$U" | grep -qF -- "--holdout-guard" && good "binary knows --holdout-guard" || bad "binary lacks --holdout-guard"
