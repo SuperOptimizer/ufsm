@@ -390,6 +390,9 @@ void unet_set_lat_step(unet *u, float step);   /* the next forwards' quantiser s
 float unet_get_lat_step(const unet *u);   /* the step unet_set_lat_step set (0: the transform's own) */
 int unet_lat_basis(const unet *u, const float **bas, const float **gain, float *step);
 int unet_logits_h16(const unet *u);   /* the logits unet_forward returns are fp16 (lean 2 training: the logit gradient fits after them) */
+/* the inference guard: every non-training forward counts its non-finite logits on the device (no sync). The totals since the unet was
+   created: *values non-finite logits, *forwards forwards with any; returns 1 when there were any (syncs; call on the unet's GPU) */
+int unet_nonfinite(const unet *u, unsigned long long *values, unsigned long long *forwards);
 /* head slabs (training): the forward skips the 1^3 head and allocates no whole-window logits; the caller runs it per z-slab
    (unet_head_fwd_z after the forward), and the backward calls cb(ctx) at the head's step, which runs unet_head_fwd_z, the loss
    gradient and unet_head_bwd_z per slab (first: the first slab). Takes effect at the next build; MX activations and 16-bit gradients

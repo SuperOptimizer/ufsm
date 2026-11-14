@@ -29,6 +29,7 @@
 #include "winauto.h"
 #include "fblend.h"
 #include <errno.h>
+#include <openssl/evp.h>
 #include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
@@ -1236,6 +1237,16 @@ static size_t winauto_need(int k, int d, void *vc) {   /* the device bytes of au
            (size_t)c->shard * c->shard * c->shard + ((size_t)3 << 29);
 }
 
+/* sha256 of a file as 64 hex digits (0 ok): the checkpoint / axis identity of a --resume run (streamed: a 250 MB checkpoint ~0.2 s) */
+static int pred_file_sha256(const char *path, char hex[65]) {
+    FILE *f = fopen(path, "rb"); if (!f) return -1;
+    EVP_MD_CTX *c = EVP_MD_CTX_new(); unsigned char h[32]; unsigned nh = 0; int ok = c && EVP_DigestInit_ex(c, EVP_sha256(), nullptr);
+    static _Thread_local unsigned char buf[1 << 20];
+    for (size_t n; ok && (n = fread(buf, 1, sizeof buf, f)) > 0;) ok = EVP_DigestUpdate(c, buf, n);
+    ok = ok && !ferror(f) && EVP_DigestFinal_ex(c, h, &nh) && nh == 32; EVP_MD_CTX_free(c); fclose(f);
+    if (ok) for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", h[i]);
+    return ok ? 0 : -1;
+}
 /* scan_norm_stats' level opener over the predict store (the working level: the open handle) */
 typedef struct { store *s; const char *key; double um; const char *cache; int level; z3 *ct; z3 *z[16]; } pn_ctx;
 static z3 *pn_open(void *ctx, int l) {
@@ -1740,11 +1751,19 @@ static int predict_one(int argc, char **argv) {
     z3 *ct = pyramid_open_level(s, key, level, um, cache);
     lvc = ct ? z3_latvol(ct) : nullptr;
     if (!ct) { fprintf(stderr, "cannot open level %d of %s: %s\n", level, key, z3_error()); return 1; }
-    if (cfg.scan_norm && !(norm_sd > 0) && !lvc) {   /* a net trained with --scan-norm: this scan's per-level statistics (scannorm.h), as the sampler's */
-        pn_ctx pc = {s, key, um, cache, level, ct}; float c0, s0;
-        if (scan_norm_stats(pn_open, &pc, level, &c0, &s0, 8)) { fprintf(stderr, "predict: the net was trained with --scan-norm, but no statistics at level %d (give --norm MEAN,SD)\n", level); return 1; }
+    if (cfg.scan_norm && !(norm_sd > 0)) {   /* a net trained with --scan-norm: this scan's per-level statistics (scannorm.h), as the sampler's.
+        A latvol CT too: the sampler reads a latvol source through z3_read (the rebuilt CT) and computes its statistics there, so predict
+        does the same. Before, a latvol CT skipped this and silently fell back to each window's own z-score (unroll audit 11-14 #15;
+        scratch2 is scan_norm 1). The cached variant: the very bits the sampler stored for this scan and level. No statistics: refuse */
+        pn_ctx pc = {s, key, um, cache, level, ct}; float c0, s0; int hit = 0;
+        const int snr = scan_norm_stats_cached(pn_open, &pc, level, &c0, &s0, 8, &hit);
+        if (snr) { fprintf(stderr, "predict: the net was trained with --scan-norm, but no statistics at level %d of %s%s (scan_norm_stats %d: %s; "
+                                   "give --norm MEAN,SD)\n", level, key, lvc ? " (latvol)" : "", snr,
+                           snr == -3 ? "no coarse level L+2..L+9 in the group" : snr == -2 ? "no level" : snr == -5 || snr == -7 ? "too little material" : "a read failure");
+                   return 1; }
         norm_mean = c0; norm_sd = s0;
-        fprintf(stderr, "predict: --scan-norm net: level %d center %.1f scale %.2f (the input (v - center) / scale)\n", level, c0, s0);
+        fprintf(stderr, "predict: --scan-norm net: level %d center %.1f scale %.2f (the input (v - center) / scale; %s%s)\n", level, c0, s0,
+                lvc ? "latvol CT: the rebuilt CT, " : "", hit ? "cached" : "computed");
         for (int l = 0; l < 16; l++) if (pc.z[l] && pc.z[l] != ct) z3_close(pc.z[l]);
     }
     const z3_meta *m = z3_meta_of(ct);
@@ -1849,11 +1868,36 @@ static int predict_one(int argc, char **argv) {
         return cond_sweep(&sw);
     }
     /* output array covers the box, with origin recorded in attributes */
-    char lv[32], ldir[1400], attrs[1024];
+    char lv[32], ldir[1400], attrs[3072];
     z3w_level_name(um_l, lv, sizeof lv);
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
-    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"window_z\":%d,\"halo_z\":%d,\"ema\":%d%s%s}}",
-             content, ckpt, step, root, ak, (long long)(fullg ? 0 : bo[0]), (long long)(fullg ? 0 : bo[1]), (long long)(fullg ? 0 : bo[2]), W, halo, Wz, hz, use_ema, grid_attrs, input_attrs);
+    /* "run": what decides the shards' bytes (unroll audit 11-14 #17): the checkpoint and axis file by content, the resolved window / halo /
+       q / shard / level / normalisation / channel. --resume compares it with the store's and refuses a mismatch (it used to match the shard
+       coordinates only, so a resume with another checkpoint, window or q mixed two predictions in one array). Not in it: --box (a
+       --full-grid store is filled box by box), --threads / --gpu / --cache / --occupancy (no effect on the bytes) */
+    char ck_sha[65] = "", ax_sha[65] = "none", run[1024];
+    if (pred_file_sha256(ckpt, ck_sha)) { fprintf(stderr, "predict: cannot hash %s\n", ckpt); return 1; }
+    if (axisf && pred_file_sha256(axisf, ax_sha)) { fprintf(stderr, "predict: cannot hash %s\n", axisf); return 1; }
+    snprintf(run, sizeof run, "{\"checkpoint_sha256\":\"%s\",\"axis_sha256\":\"%s\",\"level\":%d,\"um\":%.9g,\"window\":%d,\"halo\":%d,\"window_z\":%d,"
+             "\"halo_z\":%d,\"q\":%.9g,\"shard\":%d,\"full_grid\":%d,\"ema\":%d,\"channel\":\"%s\",\"gn_stats\":\"%s\",\"norm\":[%.9g,%.9g],\"tta\":%d%s%s}",
+             ck_sha, ax_sha, level, um_l, W, halo, Wz, hz, (double)q, shard, fullg, use_ema, chs, gn_stats, norm_mean, norm_sd, tta, grid_attrs, input_attrs);
+    snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"window_z\":%d,\"halo_z\":%d,\"ema\":%d%s%s,\"run\":%s}}",
+             content, ckpt, step, root, ak, (long long)(fullg ? 0 : bo[0]), (long long)(fullg ? 0 : bo[1]), (long long)(fullg ? 0 : bo[2]), W, halo, Wz, hz, use_ema, grid_attrs, input_attrs, run);
+    if (resume && !atoi(opt(argc, argv, "--no-out", "0"))) {   /* an earlier run's shards listed: they must come from this same run */
+        char donep0[1500], zp[1500]; snprintf(donep0, sizeof donep0, "%s/predict-done-%s.txt", out, lv); snprintf(zp, sizeof zp, "%s/zarr.json", ldir);
+        struct stat dst; if (!stat(donep0, &dst) && dst.st_size > 0) {
+            FILE *zf = fopen(zp, "rb"); char *zt = nullptr; size_t zn = 0;
+            if (zf) { fseek(zf, 0, SEEK_END); const long n = ftell(zf); fseek(zf, 0, SEEK_SET); zt = malloc(n > 0 ? (size_t)n + 1 : 1); zn = n > 0 ? fread(zt, 1, (size_t)n, zf) : 0; zt[zn] = 0; fclose(zf); }
+            const char *r0 = zt ? strstr(zt, "\"run\":{") : nullptr; const char *r1 = r0 ? strchr(r0 + 7, '}') : nullptr;
+            const int same = r1 && (size_t)(r1 + 1 - (r0 + 6)) == strlen(run) && !memcmp(r0 + 6, run, strlen(run));
+            if (!same) {
+                fprintf(stderr, "predict --resume: %s lists shards of %s run than this one: refusing to mix them (delete %s to start over)\n  store: %.*s\n  now:   %s\n",
+                        donep0, r0 ? "another" : "an unrecorded (older binary)", donep0, r1 ? (int)(r1 + 1 - (r0 + 6)) : 4, r1 ? r0 + 6 : "none", run);
+                free(zt); return 2;
+            }
+            free(zt);
+        }
+    }
     const int seam2 = atoi(opt(argc, argv, "--seam-inproc", "0")) != 0;   /* (predict --seamless 2 in-process: the stores are replaced, as the two-process blend does) */
     if (seam2) seam_clear_store(out);
     z3w *w = z3w_create(ldir, ash, shard, q, 0, attrs);
@@ -2993,11 +3037,19 @@ static int predict_one(int argc, char **argv) {
         if (fwrite(h, 4, ns, f) != ns || fclose(f)) { fprintf(stderr, "predict: cannot write %s\n", gn_save); return 1; }
         fprintf(stderr, "GroupNorm statistics of %ld windows -> %s\n", nw, gn_save); free(h);
     }
+    int nf_bad = 0;   /* the inference guard (unet_nonfinite; unroll audit 11-14 #16): non-finite logits in any forward fail the run, as NaN
+                         became undefined bytes in the outputs (fit_finalize_k's lroundf, the probability casts) */
+    {   unsigned long long nv = 0, nfw = 0, v1 = 0, f1 = 0; unet_nonfinite(u, &nv, &nfw);
+        if (split) { nn_init(gpus[1]); unet_nonfinite(u1, &v1, &f1); nn_init(gpu); nv += v1; nfw += f1; }
+        if (nfw) { fprintf(stderr, "predict: FAILED: %llu forwards (windows x TTA) produced non-finite logits (%llu values); the outputs of those windows "
+                                   "are undefined\n", nfw, nv); nf_bad = 1; }
+        else fprintf(stderr, "predict: logits finite in every forward\n");
+    }
     if (split) {
         for (int k = 0; k < 2; k++) { pside_t *S = &J.s[k]; nn_init(gpus[k]); nn_free(S->ctm); nn_free(S->dsh); nn_free(S->stsc); nn_free(S->red); nn_free(S->dyd); free(S->rows); free(S->own); }
         nn_init(gpus[1]); unet_free(u1); nn_init(gpu); split_free(sctx);
     }
-    if (nwork > 1) { fprintf(stderr, "gpu %d: %ld tiles in %.0fs\n", gpu, ntiles, now() - t0); z3_close(ct); store_close(s); unet_free(u); return 0; }   /* worker: the parent builds the pyramid */
+    if (nwork > 1) { fprintf(stderr, "gpu %d: %ld tiles in %.0fs\n", gpu, ntiles, now() - t0); z3_close(ct); store_close(s); unet_free(u); return nf_bad; }   /* worker: the parent builds the pyramid */
     if (pp) {   /* level 1: the pipelined layers, then the rest */
         pthread_mutex_lock(&pp->mu); pp->stop = 1; pthread_cond_broadcast(&pp->cv); pthread_mutex_unlock(&pp->mu);
         const double tw = now(); pthread_join(pp->th, nullptr); const double wait = now() - tw;
@@ -3044,5 +3096,5 @@ static int predict_one(int argc, char **argv) {
     }
     z3_close(ct); store_close(s); unet_free(u);
     free(sheet_window); free(sheet_shard); free(sheet_rows); sheet_free(sheet);
-    return 0;
+    return nf_bad;
 }
