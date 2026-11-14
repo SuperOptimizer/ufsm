@@ -14,10 +14,15 @@ thread_local int g_logits_h16 = 0;   /* the logits the losses read are fp16 (une
 extern "C" void nn_set_logits_h16(int on) { g_logits_h16 = on; }
 thread_local int g_head_h16 = 0;
 extern "C" void nn_set_head_out_h16(int on) { g_head_h16 = on; }
+/* the binary entropy (nats) of a soft target byte p = t / 255: the soft BCE's floor, so bce - H is the KL the net can still remove */
+__device__ __forceinline__ float tgt_entropy(unsigned t) {
+    if (t == 0u || t >= 255u) return 0.f;
+    const float p = t * (1.f / 255.f); return -(p * logf(p) + (1.f - p) * logf(1.f - p));
+}
 template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw,
-                                                   int tol, uint8_t *code, int D, int H, int W, int unit_c = -1) {
+                                                   int tol, uint8_t *code, int D, int H, int W, int unit_c = -1, double *ent = nullptr) {
     int nc = blockIdx.x, slab = blockIdx.y, n = nc / C; const bool unit = nc % C == unit_c;
-    float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0;   /* per-thread fp32 partials, fp64 block reduction */
+    float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0;   /* per-thread fp32 partials, fp64 block reduction; a5: ent's sum mw H(p) */
     if (w[nc]) {
         const LT *l = lg + (size_t)nc * S; const uint8_t *tp = t + (size_t)nc * S, *mp = m + (size_t)n * S;
         uint8_t *cp = tol && nc % C == 0 ? code + (size_t)n * S : nullptr;
@@ -49,14 +54,16 @@ template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t 
                 }
                 float bce = pw * p * (spq - xq) + (1.f - p) * spp;          /* softplus(-x) = softplus(x) - x */
                 a0 += mw; a1 += mw * bce; a2 += sg * p; a3 += sg; a4 += p;
+                if (ent) a5 += mw * tgt_entropy(tb[k]);
             }
         }
     }
-    __shared__ double r[5][256];
-    r[0][threadIdx.x] = a0; r[1][threadIdx.x] = a1; r[2][threadIdx.x] = a2; r[3][threadIdx.x] = a3; r[4][threadIdx.x] = a4;
+    __shared__ double r[6][256];
+    const int nk = ent ? 6 : 5;
+    r[0][threadIdx.x] = a0; r[1][threadIdx.x] = a1; r[2][threadIdx.x] = a2; r[3][threadIdx.x] = a3; r[4][threadIdx.x] = a4; r[5][threadIdx.x] = a5;
     __syncthreads();
-    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 5; k++) r[k][threadIdx.x] += r[k][threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) for (int k = 0; k < 5; k++) atomicAdd(&ds[nc * 5 + k], r[k][0]);
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < nk; k++) r[k][threadIdx.x] += r[k][threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) { for (int k = 0; k < 5; k++) atomicAdd(&ds[nc * 5 + k], r[k][0]); if (ent) atomicAdd(&ent[nc], r[5][0]); }
 }
 __global__ void loss_d2f_k(const double *d, float *f, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) f[i] = (float)d[i]; }
 __global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, float *fin) {
@@ -219,6 +226,66 @@ extern "C" void nn_loss_stats_acc(const void *logits, const uint8_t *t, const ui
     if (g_logits_h16) loss_stats_k<f16><<<dim3(NC, slabs), 256>>>((const f16 *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c));
     else loss_stats_k<float><<<dim3(NC, slabs), 256>>>((const float *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c));
     KCHECK();
+}
+/* nn_loss_stats_acc + the targets' entropy: ent[n c] += sum mw H(t / 255) over the slab (ent: s.n s.c doubles, zeroed by the caller) */
+extern "C" void nn_loss_stats_acc_e(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds, double *ent) {
+    const size_t S = shape_spatial(s); const int NC = s.n * s.c, slabs = NC >= 16 ? KSLAB : 512 / NC;
+    if (g_logits_h16) loss_stats_k<f16><<<dim3(NC, slabs), 256>>>((const f16 *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c), ent);
+    else loss_stats_k<float><<<dim3(NC, slabs), 256>>>((const float *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c), ent);
+    KCHECK();
+}
+/* the entropy alone (a group whose statistics another kernel sums: the fused normal / density group), C channels of S voxels, one mask */
+__global__ void ent_acc_k(const uint8_t *t, const uint8_t *m, int C, size_t S, int unit_c, double *ent) {
+    const int c = blockIdx.y; const bool unit = c == unit_c; float a = 0.f;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < S; i += (size_t)gridDim.x * blockDim.x) {
+        const unsigned mb = m[i]; if (!mb) continue;
+        a += (unit ? 1.f : (float)mb) * tgt_entropy(t[(size_t)c * S + i]);
+    }
+    __shared__ double r[256]; r[threadIdx.x] = a; __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
+    if (!threadIdx.x) atomicAdd(&ent[c], r[0]);
+}
+extern "C" void nn_ent_acc(const uint8_t *t, const uint8_t *m, int C, size_t S, double *ent) {
+    const unsigned nb = (unsigned)(S / 4096 + 1 < 256 ? S / 4096 + 1 : 256);
+    ent_acc_k<<<dim3(nb, C), 256>>>(t, m, C, S, UNITC(C), ent); KCHECK();
+}
+extern "C" void nn_ent_fin(double *ent, int n) { zs_reduce(ent, n); KCHECK(); }   /* --split z: both halves' sums */
+/* the angle error of a cos / sin logit pair against its targets (0.5 + 0.5 cos, 0.5 + 0.5 sin, x 255): acc[0] += sum |dtheta| in degrees,
+   acc[1] += the count, over the voxels with m != 0 (unweighted) */
+template <typename LT> __global__ void pair_angerr_k(const LT *la, const LT *lb, const uint8_t *t, const uint8_t *m, size_t n, double *acc) {
+    float e = 0.f, c = 0.f;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        if (!m[i]) continue;
+        const float pa = 2.f / (1.f + __expf(-lgv(la, i))) - 1.f, pb = 2.f / (1.f + __expf(-lgv(lb, i))) - 1.f;
+        const float ta = t[i] * (2.f / 255.f) - 1.f, tb = t[n + i] * (2.f / 255.f) - 1.f;
+        e += fabsf(atan2f(pb * ta - pa * tb, pa * ta + pb * tb)) * 57.29577951f; c += 1.f;
+    }
+    __shared__ double r[2][256]; r[0][threadIdx.x] = e; r[1][threadIdx.x] = c; __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) { r[0][threadIdx.x] += r[0][threadIdx.x + o]; r[1][threadIdx.x] += r[1][threadIdx.x + o]; } __syncthreads(); }
+    if (!threadIdx.x) { atomicAdd(&acc[0], r[0][0]); atomicAdd(&acc[1], r[1][0]); }
+}
+extern "C" void nn_pair_angerr(const void *la, const void *lb, const uint8_t *t, const uint8_t *m, size_t n, double *acc) {
+    const unsigned nb = (unsigned)(n / 4096 + 1 < 512 ? n / 4096 + 1 : 512);
+    if (g_logits_h16) pair_angerr_k<f16><<<nb, 256>>>((const f16 *)la, (const f16 *)lb, t, m, n, acc);
+    else pair_angerr_k<float><<<nb, 256>>>((const float *)la, (const float *)lb, t, m, n, acc);
+    KCHECK();
+}
+/* UFSM_HSG_ZERO (train): how many 16-bit (fp16) gradients of the supervised voxels are 0 or subnormal. cnt[0] += voxels with m != 0
+   (m nullptr: every voxel) and comp[i] < 255 and code[i] < 252 where given, cnt[1] += those whose gradient is +-0, cnt[2] += those
+   subnormal (nonzero, exponent bits 0) */
+__global__ void h16_zero_k(const uint16_t *g, const uint8_t *m, const uint8_t *comp, const uint8_t *code, size_t n, unsigned long long *cnt) {
+    unsigned a = 0, z = 0, u = 0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        if ((m && !m[i]) || (comp && comp[i] >= 255) || (code && code[i] >= 252)) continue;
+        const unsigned b = g[i] & 0x7fffu; a++; z += b == 0; u += b != 0 && (b & 0x7c00u) == 0;
+    }
+    __shared__ unsigned r[3][256]; r[0][threadIdx.x] = a; r[1][threadIdx.x] = z; r[2][threadIdx.x] = u; __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 3; k++) r[k][threadIdx.x] += r[k][threadIdx.x + o]; __syncthreads(); }
+    if (!threadIdx.x) for (int k = 0; k < 3; k++) atomicAdd(&cnt[k], (unsigned long long)r[k][0]);
+}
+extern "C" void nn_h16_zero_count(const void *g, const uint8_t *m, const uint8_t *comp, const uint8_t *code, size_t n, unsigned long long *cnt) {
+    const unsigned nb = (unsigned)(n / 4096 + 1 < 512 ? n / 4096 + 1 : 512);
+    h16_zero_k<<<nb, 256>>>((const uint16_t *)g, m, comp, code, n, cnt); KCHECK();
 }
 extern "C" void nn_loss_stats_fin(double *ds, const uint8_t *w, shape5 s, float *scratch) {
     const int NC = s.n * s.c;
@@ -828,7 +895,7 @@ extern "C" void nn_aff_loss_fetch(const float *fin, int K, float *out) { CK(cuda
    (a + b), X = sum m 0.5 R_0, Y = sum m 0.5 R_1 and the accuracy counts A_k (the predicted angle within 1/8 turn mod 4 of theta + k
    pi / 2) are summed: W4_NS per component. */
 #define W4_NC 255   /* components (gauges) per window: comp 0..254, 255 none */
-#define W4_NS 9
+#define W4_NS 10   /* + [9] the targets' entropy sum (the pair's soft-BCE floor) */
 template <typename LT> __global__ void w4_stats_k(const LT *la, const LT *lb, const uint8_t *w4, const uint8_t *cp, const uint8_t *m, size_t n, double *ds) {
     __shared__ float sh[W4_NC * W4_NS];
     for (int k = threadIdx.x; k < W4_NC * W4_NS; k += blockDim.x) sh[k] = 0.f;
@@ -856,6 +923,8 @@ template <typename LT> __global__ void w4_stats_k(const LT *la, const LT *lb, co
                 const int k = ((int)lrintf(e * (2.f / 3.14159265358979f)) % 4 + 4) % 4;
 #pragma unroll
                 for (int q = 0; q < 4; q++) v[5 + q] = q == k ? w : 0.f;
+                const float ta = 0.5f + 0.5f * ct, tb = 0.5f + 0.5f * st;
+                v[9] = w * (ta > 0.f && ta < 1.f ? -(ta * logf(ta) + (1.f - ta) * logf(1.f - ta)) : 0.f) + w * (tb > 0.f && tb < 1.f ? -(tb * logf(tb) + (1.f - tb) * logf(1.f - tb)) : 0.f);
             }
         }
         const unsigned on = __ballot_sync(0xffffffffu, c < W4_NC);
@@ -887,18 +956,18 @@ template <typename LT> __global__ void w4_stats_k(const LT *la, const LT *lb, co
    [5] the same BCE at the worst gauge (a gauge-blind net has [0] == [5]), [8 + c] g* of component c */
 __global__ void w4_fin_k(const double *ds, float *out) {
     if (threadIdx.x || blockIdx.x) return;
-    double N = 0, L = 0, Lw = 0, A = 0; int nc = 0;
+    double N = 0, L = 0, Lw = 0, A = 0, E = 0; int nc = 0;
     for (int c = 0; c < W4_NC; c++) {
         const double *s = ds + c * W4_NS;
         out[8 + c] = 0.f;
         if (s[0] <= 0) continue;
         const double R[4] = {s[3], s[4], -s[3], -s[4]};
         int g = 0, gw = 0; for (int k = 1; k < 4; k++) { if (R[k] > R[g]) g = k; if (R[k] < R[gw]) gw = k; }
-        N += s[0]; L += s[1] - s[2] - R[g]; Lw += s[1] - s[2] - R[gw]; A += s[5 + g]; nc++;
+        N += s[0]; L += s[1] - s[2] - R[g]; Lw += s[1] - s[2] - R[gw]; A += s[5 + g]; E += s[9]; nc++;
         out[8 + c] = (float)g;
     }
     out[0] = N > 0 ? (float)(L / (2 * N)) : 0.f; out[1] = N > 0 ? (float)(A / N) : 0.f; out[2] = (float)N; out[3] = N > 0 ? (float)(1 / N) : 0.f;
-    out[4] = (float)nc; out[5] = N > 0 ? (float)(Lw / (2 * N)) : 0.f; out[6] = out[7] = 0.f;
+    out[4] = (float)nc; out[5] = N > 0 ? (float)(Lw / (2 * N)) : 0.f; out[6] = N > 0 ? (float)(E / (2 * N)) : 0.f; out[7] = 0.f;   /* [6]: the targets' mean entropy (loss - [6]: KL) */
 }
 template <typename GT, typename LT> __global__ void w4_grad_k(const LT *la, const LT *lb, const uint8_t *w4, const uint8_t *cp, const uint8_t *m, size_t n,
                                                              const float *fin, float scale, GT *ga, GT *gb) {
