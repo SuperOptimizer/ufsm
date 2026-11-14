@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { fails++; fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
@@ -28,7 +29,7 @@ static fit_model *mk(int seed, double z0, int D) {
     return m;
 }
 int main(void) {
-    if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_grid_sparse", "nn_init(0) failed");
     fit_set s = {0}; s.global = mk(0, 0, 192); s.n = 3; s.blend = 6;
     s.slab = calloc(3, sizeof *s.slab); s.z0 = calloc(3, 8); s.z1 = calloc(3, 8);
     for (int k = 0; k < 3; k++) { s.slab[k] = mk(k + 1, 64.0 * k, 64); s.z0[k] = 64.0 * k; s.z1[k] = 64.0 * (k + 1); }

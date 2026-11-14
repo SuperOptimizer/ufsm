@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 static int P, Pc, Dl, H0, TOP, LC = 29, DEV[2] = {0, 1};   /* P voxels (Pc = P / 4 cells); Dl, H0: this side's cells, the halo cells */
 static _Float16 *hct; static uint8_t *hrec; static _Float16 *hg; static float hbas[29 * 64], hgain[29];
@@ -187,8 +188,8 @@ static int run(unet_cfg cfg, int top, int Pv, split_ctx *ctx) {
 }
 int main(void) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    if (nn_init(0)) { printf("test_split_lat: no GPU, skipped\n"); return 0; }
-    if (ufsm_env_on("UFSM_SPLIT_ONE_GPU") || nn_init(1)) { DEV[1] = 0; nn_init(0); nn_check(); }
+    if (nn_init(0)) return test_no_gpu("test_split_lat", "nn_init(0) failed");
+    if (ufsm_env_on("UFSM_SPLIT_ONE_GPU") || nn_init(1)) { DEV[1] = 0; nn_init(0); nn_check(); test_partial("test_split_lat", "one GPU: both halves on device 0, the cross-device copies not exercised"); }
     nn_set_f16(1); nn_set_grad_scale(1024.f); nn_set_loss_grad_h16(1);
     g_gnema = ufsm_env_on("UFSM_TEST_GN_EMA");
     setenv("UFSM_F4_WGRAD", "1", 0);

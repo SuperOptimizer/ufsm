@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 static uint64_t rs = 777;
 static double urand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (double)(rs >> 11) * 0x1.0p-53; }
@@ -693,7 +694,7 @@ static int test_distill(void) {
     return bad;
 }
 int main(void) {
-    if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_dinor", "nn_init(0) failed");
     int bad = test_views() + test_head() + test_targets() + test_ce() + test_koleo() + test_koleo_q() + test_muon(64, 24) + test_muon(24, 64) + test_muon_ref(160, 24) + test_obj() + test_ink() + test_mlp2() + test_pool() + test_rownorm()
               + test_sharp() + test_toy_dino() + test_nce() + test_nce_p() + test_toy_nce() + test_rows() + test_axis_view() + test_head_async() + test_distill();   /* (the newer tests last: the older ones keep their random draws) */
     printf(bad ? "test_dinor: %d FAILED\n" : "test_dinor: all passed\n", bad);

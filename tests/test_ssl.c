@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 static uint64_t rs = 0x9E3779B97F4A7C15ull;
 static double ru(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (rs >> 11) * (1.0 / 9007199254740992.0); }
@@ -194,7 +195,7 @@ static void test_sslh(float ncf) {
 }
 
 int main(void) {
-    if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_ssl", "nn_init(0) failed");
     test_mask(2); test_mask(4); test_targets(); test_idx(); test_loss(); test_sslh(0.8f); test_sslh(1.2f);
     if (fails) { printf("%d FAILED\n", fails); return 1; }
     printf("PASS\n"); return 0;

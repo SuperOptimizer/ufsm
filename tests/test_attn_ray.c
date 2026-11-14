@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 static uint64_t rs = 777;
 static double urand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (double)(rs >> 11) * 0x1.0p-53; }
@@ -371,7 +372,7 @@ static int test_view(void) {
 }
 
 int main(void) {
-    if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_attn_ray", "nn_init(0) failed");
     int bad = 0;
     bad += test_masked_keys();
     bad += test_mem();

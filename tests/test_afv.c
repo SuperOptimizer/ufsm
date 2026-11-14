@@ -37,7 +37,7 @@ static void put_fiber(sqlite3 *db, int id, const char *fam, const double *p, int
 
 int main(void) {
     void *h = dlopen("libsqlite3.so.0", RTLD_NOW);
-    if (!h) { printf("test_afv: no libsqlite3 (skipped)\n"); return 0; }
+    if (!h) { printf("SKIP: test_afv: no libsqlite3\n"); return 0; }
     *(void **)&sq_open = dlsym(h, "sqlite3_open"); *(void **)&sq_exec = dlsym(h, "sqlite3_exec"); *(void **)&sq_prep = dlsym(h, "sqlite3_prepare_v2");
     *(void **)&sq_bind_int = dlsym(h, "sqlite3_bind_int64"); *(void **)&sq_bind_dbl = dlsym(h, "sqlite3_bind_double"); *(void **)&sq_bind_blob = dlsym(h, "sqlite3_bind_blob");
     *(void **)&sq_bind_text = dlsym(h, "sqlite3_bind_text"); *(void **)&sq_step = dlsym(h, "sqlite3_step"); *(void **)&sq_fin = dlsym(h, "sqlite3_finalize"); *(void **)&sq_close = dlsym(h, "sqlite3_close");

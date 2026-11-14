@@ -21,8 +21,9 @@
 #   flaky (a failure is retried once and reported FLAKY when the retry passes), solo (runs with nothing else in this suite).
 # GPU locks are machine-wide ($SUITE_LOCK_DIR, default /tmp/ufsm-suite-locks/gpu<i>.<slot>): concurrent suites (several agents
 # on one machine) share the GPUs one test at a time instead of piling up. Tests start longest-first (EST) so -j packs well.
-# Exit 0 when every selected test passed (FLAKY counts as passed), 1 otherwise. A test that prints a line starting "SKIP" and exits
-# 0 is reported SKIP.
+# Exit 0 when every selected test passed (FLAKY counts as passed), 1 when one failed, 3 (INCOMPLETE) when none failed but GPU tests
+# did not run for lack of a GPU. A test that prints a line starting "SKIP" and exits 0 (or exits 77) is reported SKIP; a gpu test the
+# runner granted a card that still prints "SKIP: no GPU" is FAIL. "PARTIAL: ..." lines (a part needing e.g. two GPUs) are listed.
 set -u
 H=$(cd "$(dirname "$0")/.." && pwd); cd "$H" || exit 2
 MANIFEST=${SUITE_MANIFEST:-$H/tests/suite.txt}
@@ -185,7 +186,10 @@ run_one() {
     rc=$?; t1=$(date +%s.%N)
     read -r wall us sy rss < <(tail -n1 "$OUT/tmp/$n.time" 2> /dev/null); [[ ${wall:-x} =~ ^[0-9.]+$ ]] || { wall=$(awk -v a="$t0" -v b="$t1" 'BEGIN {printf "%.2f", b - a}'); us=0; sy=0; rss=0; }
     rss=$(( ${rss:-0} / 1024 ))
-    if [ $rc = 0 ]; then st=PASS; grep -q '^SKIP' "$log.$a" && st=SKIP; [ $a = 2 ] && st=FLAKY
+    # rc 77 is the automake SKIP code (test_lldec documents it); "SKIP: no GPU" from a test the runner granted a card means the card
+    # was unusable (a dead context, no memory), so it is a failure, not a skip (tests/test_gpu.h, mini audit suite.md 1)
+    if [ $rc = 0 ] || [ $rc = 77 ]; then st=PASS; { [ $rc = 77 ] || grep -q '^SKIP' "$log.$a"; } && st=SKIP; [ $a = 2 ] && [ $st = PASS ] && st=FLAKY
+      if [ $st = SKIP ] && [ -n "$g" ] && grep -q '^SKIP: no GPU' "$log.$a"; then st=FAIL; echo "run_suite: FAIL: granted GPU $g but the test reports no GPU" >> "$log.$a"; fi
     elif [ $rc = 124 ] || [ $rc = 137 ]; then st=TIMEOUT; else st=FAIL; fi
     [ $a = 1 ] && mv "$log.1" "$log" || { echo; echo "######## retry (attempt 1 failed above)"; cat "$log.2"; } >> "$log"
     rm -f "$log.2"
@@ -252,4 +256,17 @@ FAILS=$(awk -F'\t' 'NR > 1 && ($2 == "FAIL" || $2 == "TIMEOUT") {print $1}' "$OU
   [ -n "$FAILS" ] && echo "  FAILED: $(echo $FAILS)" || echo "  ALL PASSED"
 } | tee "$OUT/summary.txt" | { [ -n "$FAILS" ] && cat || sed -n '/^==== summary/,$p'; }
 echo "results: $OUT/results.tsv"
-[ -z "$FAILS" ]
+# INCOMPLETE (exit 3): no failure, but GPU tests did not run for lack of a GPU (-g none, no nvidia-smi, or a test's "SKIP: no GPU"):
+# not a gate result (ops audit 2026-11-14: a GPU-less run must not read as a green merge gate)
+NOGPU=$(awk -F'\t' 'NR > 1 && $2 == "SKIP" && $11 ~ /(^|,)gpu2?(,|$)/ {print $1}' "$OUT/results.tsv" | while read -r n; do
+  grep -qE '^(SKIP: no GPU|# no GPU)' "$OUT/logs/$n.log" 2> /dev/null && echo "$n"; done)
+NI=$(echo -n "$NOGPU" | grep -c .)
+{ S=$(awk -F'\t' 'NR > 1 && $2 == "SKIP" {print $1}' "$OUT/results.tsv")
+  [ -n "$S" ] && { echo "  skipped:"; for n in $S; do echo "    $n: $(grep -m1 -E '^(SKIP|# no GPU)' "$OUT/logs/$n.log" 2> /dev/null | cut -c1-150)"; done; }
+  P=$(grep -l '^PARTIAL' "$OUT"/logs/*.log 2> /dev/null)
+  [ -n "$P" ] && { echo "  partial (passed, a part not run here):"; for f in $P; do grep -m3 '^PARTIAL' "$f" | sed "s|^|    $(basename "$f" .log): |" | cut -c1-170; done; }
+  [ -z "$FAILS" ] && [ "$NI" -gt 0 ] && echo "INCOMPLETE: $NI GPU tests not run (exit 3: not a gate result)"
+} | tee -a "$OUT/summary.txt"
+[ -n "$FAILS" ] && exit 1
+[ "$NI" -gt 0 ] && exit 3
+exit 0
