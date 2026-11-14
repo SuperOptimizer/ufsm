@@ -1284,6 +1284,15 @@ static void head_slab_pass(gpu_state *d, int pass) {
     /* the gradient pass fused (g_lat_fuse): the slab chain keeps the channel ranges fr (the winding mod 4 pair; without the guided head also the side pair and the other heads' outputs) */
     const int fuse = g_lat_fuse && d->fpart && (!pass || (d->hs_train && nn_get_loss_grad_h16())), fside = fuse && g_lat_guide == 5;
     const int fr[2][2] = {{0, fside ? 0 : g_norm_ch}, {g_norm_ch + 7, fside ? g_cout : LUPN}};
+    /* the slab's forward chain in one kernel (nn_fstem_up_fwd: upsample + sub-cell shuffle + fine stem, byte-identical; UFSM_FSUP=0: the three
+       kernels) when the stem's outputs are exactly the channels the fused path upsamples (scratch2: 16 of them; 2026-11-14 P 768: see DESIGN) */
+    static int fsup = -1;
+    if (fsup < 0) {
+        fsup = g_lat_hs && g_fstem && g_lat_guide == 64 && !lchk && LUPN == (g_pad_ch >= 0 ? g_pad_ch : g_cout) && (!getenv("UFSM_FSUP") || ufsm_env_on("UFSM_FSUP"));
+        for (int k = 0; fsup && k < g_fs_n; k++) fsup = g_fs_ch[k] == (k < g_norm_ch ? k : k + 7);   /* (the stem's list = [0, norm) + [norm + 7, LUPN)) */
+        if (fsup) fsup = g_fs_n == LUPN - 7 && g_side_ch >= 0 && g_side_ch + 1 < g_norm_ch;
+    }
+    const int fsu = fsup && fuse && !fside; int fsd = 0;
     /* a training step's statistics pass only counts the fused groups' mask weights (all the gradient reads); their loss sums come from the gradient pass, finalised after it (UFSM_LAT_LIGHT0=0: both in the statistics pass) */
     static int light_on = -1; if (light_on < 0) light_on = !getenv("UFSM_LAT_LIGHT0") || ufsm_env_on("UFSM_LAT_LIGHT0");
     static int light_split = -1; if (light_split < 0) light_split = ufsm_env_on("UFSM_LAT_LIGHT_SPLIT");   /* (default off until a split run compared it with the full statistics pass) */
@@ -1422,7 +1431,9 @@ static void head_slab_pass(gpu_state *d, int pass) {
                     char fn_[1100]; snprintf(fn_, sizeof fn_, "%s%s", getenv("UFSM_LGC_DUMP"), d->side == 0 ? ".s0" : d->side == 1 ? ".s1" : ""); FILE *f = fopen(fn_, z0 ? "ab" : "wb");
                     if (f) { const int32_t q2[2] = {qa, qb}; fwrite(q2, 4, 2, f); fwrite(hb, 1, nb, f); fclose(f); } free(hb); if (z1 == D) dn_[d->side + 1]++; }
             }
-            if (fuse) for (int r = 0; r < 2; r++) { if (fr[r][1] > fr[r][0]) nn_lat_up_slab_c((const char *)d->lgc + (size_t)fr[r][0] * (qb - qa) * (H / 4) * (W / 4) * 2, 1, fr[r][1] - fr[r][0], D / 4, H / 4, W / 4, z0, nz, LGC(fr[r][0]), qa, qb - qa); }
+            if (fsu) fsd = !nn_fstem_up_fwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), d->fs_drop ? 0 : g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns, d->lgc, qa, qb - qa, g_side_ch, LBASE);
+            if (fsd) {}
+            else if (fuse) for (int r = 0; r < 2; r++) { if (fr[r][1] > fr[r][0]) nn_lat_up_slab_c((const char *)d->lgc + (size_t)fr[r][0] * (qb - qa) * (H / 4) * (W / 4) * 2, 1, fr[r][1] - fr[r][0], D / 4, H / 4, W / 4, z0, nz, LGC(fr[r][0]), qa, qb - qa); }
             else nn_lat_up_slab_c(d->lgc, 1, LUPN, D / 4, H / 4, W / 4, z0, nz, d->hs_lg, qa, qb - qa);
         } else if (g_lat) nn_lat_up_slab(d->lg, unet_logits_h16(d->u), LUPN, D / 4, H / 4, W / 4, z0, nz, d->hs_lg);   /* --lat: the cell grid's logits on this slab */
         else if (unet_head_fwd_z(d->u, z0, z1, d->hs_lg)) { fprintf(stderr, "head slabs: the head is not covered (MX activations; UFSM_HEAD_SLAB=0)\n"); abort(); }
@@ -1436,16 +1447,21 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (z1 == D) { fprintf(stderr, "lat check: upsampling: %zu of %zu fp16 logits differ (%zu by more than one code), max |difference| %.3g, rms difference / rms %.3g\n", nd, nt_, n1, mx, sqrt(sq / (sr > 0 ? sr : 1))); mx = sq = sr = 0; nd = nt_ = n1 = 0; }
         }
         if (g_lat_hs) FT("  u head fwd + upsample"); else PT("upsample");
-        if (g_lat_hs && g_lat_guide == 64) nn_lat_shuffle_c(d->lgc, 1, D / 4, H / 4, W / 4, LBASE, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2, qa, qb - qa);
+        if (fsd) {}
+        else if (g_lat_hs && g_lat_guide == 64) nn_lat_shuffle_c(d->lgc, 1, D / 4, H / 4, W / 4, LBASE, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2, qa, qb - qa);
         else if (g_lat && g_lat_guide == 64) nn_lat_shuffle(d->lg, unet_logits_h16(d->u), D / 4, H / 4, W / 4, LBASE, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2);   /* the sub-cell head */
         else if (g_lat && g_lat_guide && !fside) LGUIDE(0);   /* --lat-guide: the side channels' sub-cell terms from the CT */
         if (g_lat_hs) { FT("  u guide / shuffle"); PT("upsample"); }
-        if (g_fstem && !d->fs_drop && nn_fstem_fwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns)) { fprintf(stderr, "--fstem: slab shape\n"); abort(); }
+        if (!fsd && g_fstem && !d->fs_drop && nn_fstem_fwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns)) { fprintf(stderr, "--fstem: slab shape\n"); abort(); }
         if (g_fstem) FT("  u fine stem fwd");
         const shape5 one = {1, 1, nz, H, W}, two = {1, 2, nz, H, W}, seven = {1, 7, nz, H, W};
-        if (!tskip) nn_phase_targets(sdb + vb, ns, d->sidet, d->sidem);
+        static int tgf_on = -1; if (tgf_on < 0) tgf_on = !getenv("UFSM_SLAB_TG") || ufsm_env_on("UFSM_SLAB_TG");   /* (UFSM_SLAB_TG=0: the five kernels) */
+        const int tgf = tgf_on && !tskip && !g_ptrunc_on && !pdir && (!g_rv || pap);   /* the phase-derived targets in one kernel (nn_slab_targets, byte-identical) */
+        if (tgf) nn_slab_targets(sdb, g_rv ? pap : nullptr, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, g_rv ? g_rv_vw : 1.f,
+                                 d->sidet, d->sidem, g_rv ? d->rvt : nullptr, d->rvm, d->nt, d->nm, z0, z1);
+        else if (!tskip) nn_phase_targets(sdb + vb, ns, d->sidet, d->sidem);
         FT("  t phase targets");
-        if (g_rv && !tskip) {   /* --rv: the side slot's targets (the phase targets above stay for the winding mod 4 / gradient terms) */
+        if (g_rv && !tskip && !tgf) {   /* --rv: the side slot's targets (the phase targets above stay for the winding mod 4 / gradient terms) */
             if (pdir) nn_rv_targets_p2(sdb + vb, d->ldev[pkk], vb, ns, d->rvt, d->rvm); else nn_rv_targets(sdb + vb, pap + vb, ns, d->rvt, d->rvm);
             FT("  t rv targets");
             if (g_packed_w > 1) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->rvm, z0, z1);   /* packed sheets weigh more */
@@ -1463,9 +1479,9 @@ static void head_slab_pass(gpu_state *d, int pass) {
             free(h); free(ph); free(pp);
         }
         if (g_ptrunc_on && !tskip) nn_phase_trunc(LGC(g_side_ch), LGC(g_side_ch + 1), d->sidet, d->sidem, ns, g_ptrunc_tau, g_ptrunc_kappa);   /* robust phase loss (both passes: the same mask) */
-        if (g_packed_w > 1 && !tskip) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem, z0, z1);   /* packed sheets weigh more */
+        if (g_packed_w > 1 && !tskip && !tgf) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem, z0, z1);   /* packed sheets weigh more */
         FT("  t packed mask (side)");
-        if (!tskip) nn_unwrap_targets2_z(sdb, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1); FT("  t normal targets");
+        if (!tskip && !tgf) nn_unwrap_targets2_z(sdb, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1); FT("  t normal targets");
         if (tchk) {   /* the planes just built in the one-slab buffers against the cache's, then on with the cache as a training step would */
             const size_t nb[6] = {(size_t)g_side_nc * ns, ns, g_rv ? 2 * ns : 0, g_rv ? ns : 0, 7 * ns, ns}; static const char *const nm6[6] = {"phase targets", "phase mask", "rv targets", "rv mask", "normal targets", "normal mask"};
             nn_sync();

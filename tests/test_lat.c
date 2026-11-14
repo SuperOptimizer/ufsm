@@ -353,6 +353,24 @@ int main(void) {
         free(lg); free(g); free(ya); free(yb); free(ra); free(rb);
         nn_free(d_lg); nn_free(d_ch); nn_free(d_ya); nn_free(d_yb); nn_free(d_g); nn_free(d_gw); nn_free(d_a); nn_free(d_scr); nn_free(d_glw); nn_free(d_sb); nn_free(d_gc); nn_free(d_out);
     }
+    {   /* the tiled y / x gather (lat_adj_xy_t_k) against the per-cell one (lat_adj_xy_k): the same fp32 sums, bit for bit; a grid row of 70
+           cells (two tiles), 30 channels (two groups of the scratch), both grid edges, slabs at the window's ends and inside */
+        const int d = 5, h = 3, w = 70, C = 30, H = 4 * h, W = 4 * w; const size_t nc = (size_t)d * h * w;
+        int td = 0;
+        for (int k = 0; k < 3; k++) {
+            const int z0 = k == 0 ? 0 : k == 1 ? 8 : 12, Z = k == 1 ? 4 : 8; const size_t ns = (size_t)Z * H * W;
+            uint16_t *g = malloc(C * ns * 2); for (size_t q = 0; q < C * ns; q++) g[q] = f2h(ru());
+            void *d_g = nn_malloc(C * ns * 2); float *d_s = nn_malloc(C * ns * 4), *ga = nn_malloc(C * nc * 4), *gb = nn_malloc(C * nc * 4);
+            nn_h2d(d_g, g, C * ns * 2); nn_zero(ga, C * nc * 4); nn_zero(gb, C * nc * 4);
+            const int was = nn_lat_set_adj_tile(0); nn_lat_up_adj_c(d_g, C, d, h, w, z0, Z, ga, d_s, 0, d);
+            nn_lat_set_adj_tile(1); nn_lat_up_adj_c(d_g, C, d, h, w, z0, Z, gb, d_s, 0, d); nn_lat_set_adj_tile(was);
+            uint32_t *ha = malloc(C * nc * 4), *hb = malloc(C * nc * 4); nn_d2h(ha, ga, C * nc * 4); nn_d2h(hb, gb, C * nc * 4);
+            size_t nd = 0, nz_ = 0; for (size_t q = 0; q < C * nc; q++) { nd += ha[q] != hb[q]; nz_ += ha[q] != 0; }
+            if (nd || !nz_) { fprintf(stderr, "FAIL: tiled adjoint gather, slab %d + %d: %zu of %zu differ (%zu non-zero)\n", z0, Z, nd, C * nc, nz_); td++; }
+            free(g); free(ha); free(hb); nn_free(d_g); nn_free(d_s); nn_free(ga); nn_free(gb);
+        }
+        cases++; fails += td > 0;
+    }
     const char *e = nn_check(); if (e) { fprintf(stderr, "FAIL: CUDA error %s\n", e); fails++; }
     if (fails) { printf("test_lat: %d of %d cases FAIL\n", fails, cases); return 1; }
     printf("test_lat: ok (%d cases: slab upsampling = the pool4 chain, adjoint = nn_lowres_grad, dot products; predict: direct input and rv bytes = the full-resolution chain)\n", cases);

@@ -113,6 +113,7 @@ ufsm_exe(test_flatten SUITE tests/test_flatten.c OBJS flatten imgops jpegpar tif
 ufsm_exe(test_flatten_gpu SUITE tests/test_flatten.c OBJS flatten imgops jpegpar tiffw tiff nn_flat LIBS LDLIBS CUDA DEFS FLAT_GPU)
 ufsm_exe(test_formats SUITE tests/test_formats.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fstem SUITE tests/test_fstem.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_slab_tg SUITE tests/test_slab_tg.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_ftrace_gpu SUITE tests/test_ftrace_gpu.c OBJS ftaxis nn_ftrace LIBS m CUDA INC CUDA)
 ufsm_exe(test_fuse SUITE tests/test_fuse.c src/fuse.c LIBS m DEPS)
 ufsm_exe(test_fused SUITE tests/test_fused.c OBJS NN LP LIBS m CUDA)

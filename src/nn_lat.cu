@@ -313,6 +313,33 @@ __global__ void lat_adj_xy_k(const f16 *g, int C, int h, int w, int nz, float *t
     }
     t[i] = s;
 }
+/* the same gather tiled (lat_adj_xy_k's sums in the same order, the same bytes): a block takes AXT coarse cells of one row (cy) of one fine
+   plane and channel, stages the 10 fine rows they read (4 cy - 3 .. 4 cy + 6) once in shared memory as fp32, de-interleaved by x mod 4 so the
+   threads' stride-4 reads hit distinct banks; each fine voxel is read from global ~2.5 times instead of through ~6 L1 loads per voxel
+   (P 768 scratch2: 60 ms a step in lat_adj_xy_k; UFSM_LAT_ADJ_TILE=0: that kernel) */
+enum { AXT = 64, AXQ = 4 * AXT + 9, AXS = (AXQ + 3) / 4 };
+__global__ void __launch_bounds__(AXT) lat_adj_xy_t_k(const f16 *g, int h, int w, int nz, float *t) {
+    __shared__ float sm[10][4 * AXS];
+    const int H = 4 * h, W = 4 * w, cx0 = blockIdx.x * AXT, cy = blockIdx.y, cs = blockIdx.z;   /* cs = c nz + sz */
+    const f16 *gs = g + (size_t)cs * H * W;
+    for (int k = threadIdx.x; k < 10 * AXQ; k += AXT) {
+        const int a = k / AXQ, q = k % AXQ, fy = 4 * cy - 3 + a, fx = 4 * cx0 - 3 + q;
+        sm[a][(q & 3) * AXS + (q >> 2)] = fy >= 0 && fy < H && fx >= 0 && fx < W ? __half2float(gs[(size_t)fy * W + fx]) : 0.f;
+    }
+    __syncthreads();
+    const int cx = cx0 + threadIdx.x; if (cx >= w) return;
+    float wy[10], wx[10]; int y0, y1, x0, x1;
+    lat_adj_w(cy, h, wy, &y0, &y1); lat_adj_w(cx, w, wx, &x0, &x1);
+    float s = 0.f;
+    for (int a = y0; a < y1; a++) {
+        float r = 0.f;
+        for (int b = x0; b < x1; b++) { const int q = 4 * threadIdx.x + b; r += wx[b] * sm[a][(q & 3) * AXS + (q >> 2)]; }
+        s += wy[a] * r;
+    }
+    t[((size_t)cs * h + cy) * w + cx] = s;
+}
+static int g_adj_tile = -1;
+extern "C" int nn_lat_set_adj_tile(int on) { if (g_adj_tile < 0) { const char *e = getenv("UFSM_LAT_ADJ_TILE"); g_adj_tile = !(e && *e == '0'); } const int was = g_adj_tile; if (on >= 0) g_adj_tile = on; return was; }
 /* stage 2 (z): coarse planes [cz0, cz1) add their fine planes of the slab */
 __global__ void lat_adj_z_k(const float *t, int C, int d, int h, int w, int z0, int nz, int cz0, int cz1, float *gc, int q0, int qd) {
     const size_t pl = (size_t)h * w, nc = (size_t)(cz1 - cz0) * pl, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -584,7 +611,8 @@ extern "C" void nn_lat_up_adj_c(const void *g, int C, int d, int h, int w, int z
         const int a0 = max(z0 / 4 - 1, 0), a1 = min((z0 + nz) / 4 + 1, d);
         for (int c0 = 0; c0 < C; c0 += 28) {
             const int c = min(28, C - c0); const size_t n1 = (size_t)c * nz * h * w;
-            lat_adj_xy_k<<<nblk(n1, 256), 256>>>((const f16 *)g + (size_t)c0 * nz * 16 * h * w, c, h, w, nz, (float *)scratch);
+            if (nn_lat_set_adj_tile(-1)) lat_adj_xy_t_k<<<dim3((unsigned)((w + AXT - 1) / AXT), (unsigned)h, (unsigned)(c * nz)), AXT>>>((const f16 *)g + (size_t)c0 * nz * 16 * h * w, h, w, nz, (float *)scratch);
+            else lat_adj_xy_k<<<nblk(n1, 256), 256>>>((const f16 *)g + (size_t)c0 * nz * 16 * h * w, c, h, w, nz, (float *)scratch);
             lat_adj_z_k<<<nblk((size_t)(a1 - a0) * h * w * c, 256), 256>>>((const float *)scratch, c, d, h, w, z0, nz, a0, a1, gc + (size_t)c0 * qd * h * w, q0, qd);
         }
         KCHECK(); return;

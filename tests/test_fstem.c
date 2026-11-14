@@ -1,5 +1,7 @@
 /* nn_fstem_fwd / nn_fstem_bwd (train --fstem) against a double host reference on a 10 x 12 x 14 window (two slabs, z 0..5 and 6..9),
-   C 16, nout 7 channels of 9; the reference's own gradient checked by central differences on a few parameters. Usage: test_fstem */
+   C 16, nout 7 channels of 9; the reference's own gradient checked by central differences on a few parameters. Then nn_fstem_up_fwd (the head
+   slab's upsample + sub-cell shuffle + stem in one kernel) byte for byte against nn_lat_up_slab_c + nn_lat_shuffle_c + nn_fstem_fwd on a
+   12 x 8 x 264 window (two row tiles, the clamped edges), slabs out of a rolling cell-plane buffer, with and without the stem. Usage: test_fstem */
 #include "nn.h"
 #include <math.h>
 #include <stdint.h>
@@ -24,6 +26,43 @@ static double ref(const uint16_t *x, const double *p, const uint16_t *G, double 
         }
     }
     return L;
+}
+static int up_check(void) {
+    enum { UD = 12, UH = 8, UW = 264, UC = 9, BASE = 9, LC = BASE + 128 };
+    const int d = UD / 4, h = UH / 4, w = UW / 4; const size_t V = (size_t)UD * UH * UW, cpl = (size_t)h * w, NP = C * T + C + NO * C;
+    uint64_t s = 11; int fails = 0;
+    uint16_t *x = malloc(V * 2), *lc = malloc((size_t)LC * d * cpl * 2); float *pf = malloc(NP * 4);
+    for (size_t i = 0; i < V; i++) x[i] = f2h((float)(2 * rnd(&s)));
+    for (size_t i = 0; i < (size_t)LC * d * cpl; i++) lc[i] = f2h((float)(4 * rnd(&s)));
+    for (size_t i = 0; i < NP; i++) pf[i] = (float)(0.4 * rnd(&s));
+    void *xd = nn_malloc(V * 2); float *pd = nn_malloc(NP * 4); nn_h2d(xd, x, V * 2); nn_h2d(pd, pf, NP * 4);
+    const int sl[3][2] = {{0, 4}, {4, 4}, {8, 4}};
+    for (int stem = 0; stem < 2; stem++) for (int k = 0; k < 3; k++) {
+        const int z0 = sl[k][0], nz = sl[k][1], qa = z0 / 4 - 1 > 0 ? z0 / 4 - 1 : 0, qb = (z0 + nz) / 4 + 1 < d ? (z0 + nz) / 4 + 1 : d, qd = qb - qa;
+        const size_t ns = (size_t)nz * UH * UW;
+        uint16_t *hc = malloc((size_t)LC * qd * cpl * 2), *ya = malloc(UC * ns * 2), *yb = malloc(UC * ns * 2);   /* the rolling buffer: planes [qa, qb) */
+        for (int c = 0; c < LC; c++) memcpy(hc + (size_t)c * qd * cpl, lc + ((size_t)c * d + qa) * cpl, qd * cpl * 2);
+        void *cd = nn_malloc((size_t)LC * qd * cpl * 2), *da = nn_malloc(UC * ns * 2), *db = nn_malloc(UC * ns * 2);
+        nn_h2d(cd, hc, (size_t)LC * qd * cpl * 2);
+        for (size_t i = 0; i < UC * ns; i++) ya[i] = 0x7e00;   /* (NaN: what the fused kernel must not touch, or must overwrite) */
+        nn_h2d(db, ya, UC * ns * 2);
+        nn_lat_up_slab_c(cd, 1, UC, d, h, w, z0, nz, da, qa, qd);
+        nn_lat_shuffle_c(cd, 1, d, h, w, BASE, 2, z0, nz, da, qa, qd);
+        if (stem && nn_fstem_fwd(xd, UD, UH, UW, z0, nz, pd, C, NO, chs, da, ns)) { fprintf(stderr, "FAIL: fstem shape\n"); return 1; }
+        if (nn_fstem_up_fwd(xd, UD, UH, UW, z0, nz, pd, stem ? C : 0, NO, chs, db, ns, cd, qa, qd, 0, BASE)) { fprintf(stderr, "FAIL: fused shape refused\n"); return 1; }
+        nn_sync(); nn_d2h(ya, da, UC * ns * 2); nn_d2h(yb, db, UC * ns * 2);
+        size_t nd = 0, nu = 0;
+        for (int c = 0; c < UC; c++) {
+            int o = -1; for (int q = 0; q < NO; q++) if (chs[q] == c) o = q;
+            for (size_t i = 0; i < ns; i++) { if (o >= 0) nd += ya[c * ns + i] != yb[c * ns + i]; else nu += yb[c * ns + i] != 0x7e00; }
+        }
+        printf("fstem up fwd (stem %d, slab z %d + %d, cell planes %d..%d): %zu of %zu logits differ from the 3-kernel chain, %zu other values touched\n", stem, z0, nz, qa, qb, nd, (size_t)NO * ns, nu);
+        if (nd || nu) { fprintf(stderr, "FAIL: fused up\n"); fails++; }
+        nn_free(cd); nn_free(da); nn_free(db); free(hc); free(ya); free(yb);
+    }
+    if (nn_fstem_up_fwd(xd, UD, UH, UW, 4, 4, pd, C, NO, chs, xd, 4 * UH * UW, xd, 1, 1, 0, BASE) != 1) { fprintf(stderr, "FAIL: a short cell buffer accepted\n"); fails++; }
+    nn_free(xd); nn_free(pd); free(x); free(lc); free(pf);
+    return fails;
 }
 int main(void) {
     nn_init(0); int fails = 0; uint64_t s = 5;
@@ -68,5 +107,6 @@ int main(void) {
     if (!(ge / gmax < 1e-3))   /* (the recompute's W1 in fp16, as the forward's tensor-core product: 1.8e-4 measured) */ { fprintf(stderr, "FAIL: bwd\n"); fails++; }
     if (nn_fstem_fwd(xd, D, H, W, 1, 4, pd, C, NO, chs, ld, 4 * H * W) != 1) { fprintf(stderr, "FAIL: odd z0 accepted\n"); fails++; }
     if (fails) return 1;
+    if (up_check()) return 1;
     printf("test_fstem: ok\n"); return 0;
 }

@@ -280,6 +280,7 @@ void nn_loss_cfg_get(float *pw, float *rec_w, int *unit7);   /* the BCE's positi
 void nn_lat_grad_carry(float *a, int nf, void *sb, int C, size_t pl, int cap, int from, int n);
 void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch);   /* scratch: C nz h w fp32 for the separable path (z0, nz multiples of 4), or nullptr */
 int nn_lat_set_slow(int on);   /* the per-voxel kernels for every slab (UFSM_LAT_SLOW=1; train's UFSM_LAT_CHECK compares against them); returns the previous setting */
+int nn_lat_set_adj_tile(int on);   /* the tiled y / x gather of the slab adjoint (default; UFSM_LAT_ADJ_TILE=0: the per-cell kernel); on < 0 only reads; returns the previous setting */
 /* predict on a latent-grid net: the network's 4-channel input on the cell grid ([4][D/4][W/4][W/4], 16-bit storage as nn_set_f16) straight
    from a D x W x W uint8 CT window = nn_pred_input_d then nn_lowres_input (div 4, mode 1), without the full-resolution input */
 void nn_lat_pred_input(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *y);
@@ -488,6 +489,11 @@ void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
    parameter gradients from fp16 gradient planes of that layout into gp. 1: a shape the kernels do not take (odd sizes, C or nout > 16) */
 int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns);
 int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, const void *g, size_t ns, float *gp);
+/* the head slab's forward chain in one pass: the logit planes chs[o] written (not added to) as nn_lat_up_slab_c (from the fp16 cell logits
+   lc [*][qd][D/4][H/4][W/4], planes from q0) + nn_lat_shuffle_c (the side pair: channels side, side + 1 when side >= 0; base) + nn_fstem_fwd
+   would leave them, byte for byte; C 0: no stem term (an --fstem-drop window). 1: a shape it does not take (multiples of 4) */
+int nn_fstem_up_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns,
+                    const void *lc, int q0, int qd, int side, int base);
 /* a latent-grid net's head straight from the cell logits lg [cout][d][h][w] into a device shard (src/nn_lathead.cu, predict --heads): the
    window interior ([hz, 4d - hz) x [halo, 4w - halo)^2) inside the shard [0, e) at offset o; channel c0 (a probability) or the recto / verso
    pair c0, c1 (nn_rv_fuse); sb0 / sb1 the sub-cell outputs' base of each (lat_guide 64: 16 + 64 j for the phase pair, else -1), s0 / s1 the
@@ -716,6 +722,10 @@ void nn_packed_mask_z(const uint8_t *phase, int d, int h, int w, int s, float um
 void nn_fib_dir_targets(const uint8_t *t, const uint8_t *m, int d, int h, int w, int r, float cmin, uint8_t *o, uint8_t *om);
 /* train --fib-head: fib_dir targets of window planes [z0, z0 + nz) from the H / V tube planes (prob254, 255 unknown; window-indexed, +-r halo planes present) */
 void nn_fib_head_dir(const uint8_t *fh, const uint8_t *fv, int d, int h, int w, int z0, int nz, int r, float cmin, uint8_t *o, uint8_t *om);
+/* the head slab's phase-derived targets in one kernel, byte-identical to nn_phase_targets (t2, m2) + nn_rv_targets (rvt, rvm; rvt null: none) +
+   nn_packed_mask_z on rvm (packed_w > 1) + nn_rv_verso_w (vw != 1) + nn_packed_mask_z on m2 + nn_unwrap_targets2_z (t7, m7) for planes [z0, z1) */
+void nn_slab_targets(const uint8_t *phase, const uint8_t *pap, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, float vw,
+                     uint8_t *t2, uint8_t *m2, uint8_t *rvt, uint8_t *rvm, uint8_t *t7, uint8_t *m7, int z0, int z1);
 void nn_unwrap_targets2_z(const uint8_t *phase, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, uint8_t *t, uint8_t *m,
                           int z0, int z1);   /* planes [z0, z1) of the window into planes of (z1 - z0) h w */
 /* train --count-lambda: K segments of L voxels along the ground-truth phase gradient; loss |log((sum rho_pred + .05) / (true turns + .05))|
