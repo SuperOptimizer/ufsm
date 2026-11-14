@@ -41,7 +41,8 @@ static void dc_home_once(void) { const char *h = getenv("HOME"); if (h && *h) sn
 const char *dcache_default_dir(void) {
     const char *e = getenv("UFSM_DERIVED_CACHE");
     if (e) return !*e || !strcmp(e, "off") || !strcmp(e, "0") ? nullptr : e;
-    static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, dc_home_once);
+    static pthread_once_t once = PTHREAD_ONCE_INIT;   /* mgpu: guarded */
+    pthread_once(&once, dc_home_once);
     return g_dc_home[0] ? g_dc_home : nullptr;
 }
 static int mkdirs(const char *p) {

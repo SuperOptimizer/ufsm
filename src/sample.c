@@ -258,7 +258,8 @@ static size_t P3(const sampler *sp) { return (size_t)PZ(&sp->cfg) * sp->cfg.P * 
 
 /* batch buffers: pinned (the trainer uploads asynchronously), or plain malloc with UFSM_SAMPLER_NOPIN=1 (CPU-only benchmarks) */
 static _Atomic size_t g_slot_bytes;   /* pinned (or malloc'd) batch slot bytes, every sampler (UFSM_HOSTMEM) */
-static int nopin(void) { static _Atomic int v = -1; int r = atomic_load(&v); if (r < 0) { const char *e = getenv("UFSM_SAMPLER_NOPIN"); r = e && atoi(e); atomic_store(&v, r); } return r; }   /* (atomic: workers race on the first call; threads audit #6) */
+static int nopin(void) { static _Atomic int v = -1;   /* mgpu: env */
+                          int r = atomic_load(&v); if (r < 0) { const char *e = getenv("UFSM_SAMPLER_NOPIN"); r = e && atoi(e); atomic_store(&v, r); } return r; }   /* (atomic: workers race on the first call; threads audit #6) */
 static void *halloc(size_t n) { atomic_fetch_add(&g_slot_bytes, n); if (nopin()) { void *p = malloc(n ? n : 1); if (!p) abort(); memset(p, 0, n); return p; } return nn_host_alloc(n); }   /* (memset: faulted in like the pinned slots, so CPU-only benchmarks see no first-touch faults) */
 static void hfree(void *p) { if (nopin()) free(p); else nn_host_free(p); }
 /* slot_skip 4: the unpacked targets t (NCH x P^3) and loss mask m (P^3) neither allocated nor written: train sets it where the trainer
@@ -630,9 +631,9 @@ static int pick_level(sampler *sp, source *s, rng *r, int region_ch) {
 }
 
 /* Fill patch i of batch b. Returns 0 on success, 1 if rejected (try again), -1 on I/O error. */
-static int g_rt = 1;   /* UFSM_SAMPLER_RT=T: threads per window for its big reads (CT, phase, targets: z3_read decodes chunks in parallel) and the
+static int g_rt = 1;   /* mgpu: env (set once, sampler_env_once) */   /* UFSM_SAMPLER_RT=T: threads per window for its big reads (CT, phase, targets: z3_read decodes chunks in parallel) and the
                           winding-mod-4 tiles; the same bytes for any T. Fewer windows in flight (RAM) for the same loader rate */
-static int g_prof_cpu;   /* UFSM_SAMPLER_PROF=2: the stages in thread CPU time (else wall time: I/O waits and contention count) */
+static int g_prof_cpu;   /* mgpu: env (set once, sampler_env_once) */   /* UFSM_SAMPLER_PROF=2: the stages in thread CPU time (else wall time: I/O waits and contention count) */
 static void sampler_env_once(void) { const char *e = getenv("UFSM_SAMPLER_PROF"); g_prof_cpu = e && atoi(e) == 2; e = getenv("UFSM_SAMPLER_RT"); g_rt = e && atoi(e) > 1 ? atoi(e) : 1; }
 static double tnow(void) { struct timespec t; clock_gettime(g_prof_cpu ? CLOCK_THREAD_CPUTIME_ID : CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 #define PROF_MARK(stage) do { if (sp->prof) { double t_ = tnow(); atomic_fetch_add(&sp->prof_ns[stage], (uint_fast64_t)((t_ - pt) * 1e9)); pt = t_; } } while (0)
@@ -1459,12 +1460,12 @@ static _Thread_local tp_pool tpool;
 #define WM_MAX 256
 static struct { tp_pool *pool; const uint8_t *big, *ttmp; size_t bign, ttn; _Atomic size_t tpv, tplent, tppeak; } g_wm[WM_MAX];
 static _Thread_local int tp_wid = -1;
-static _Atomic size_t g_tp_p3 = 1;   /* (UFSM_TP_LOG: sizes in window voxels; the last started sampler's, set by sampler_start before its workers) */
+static _Atomic size_t g_tp_p3 = 1;   /* mgpu: debug (atomic) */   /* (UFSM_TP_LOG: sizes in window voxels; the last started sampler's, set by sampler_start before its workers) */
 static size_t tp_class(size_t n) { return n >= ((size_t)1 << 20) ? (n + ((size_t)1 << 20) - 1) & ~(((size_t)1 << 20) - 1) : n; }
 /* window-sized worker scratch (>= 4 MB): 2 MB aligned with transparent huge pages requested (the system's THP mode is often
    "madvise"): the warp writer's gathers and the volume passes otherwise walk 4 KB page tables over hundreds of MB per window. Pages
    are still only backed when touched. free() releases it as any malloc block. */
-static _Atomic int g_thp_last = 1;   /* (sampler_start: the last started sampler's choice; threads that are not a sampler's workers) */
+static _Atomic int g_thp_last = 1;   /* mgpu: guarded (atomic) */   /* (sampler_start: the last started sampler's choice; threads that are not a sampler's workers) */
 static _Thread_local int t_thp = -1;   /* a worker's own sampler's choice (each sampler_start decides for its workers: threads audit #5) */
 static void *wbig_alloc(size_t n, int zero) {
     const size_t H = (size_t)2 << 20;
@@ -3719,7 +3720,8 @@ int sample_pack_tm(const uint8_t *t0, const uint8_t *t1, const uint8_t *m, size_
    back zero), so the batches do not change; the cost is the refault, ~1 s per P 1024 window, paid only by a worker that was idle.
    UFSM_IDLE_RELEASE=0: off. */
 static void worker_idle_release(uint8_t *big, size_t bign, uint8_t *ttmp, size_t ttn) {
-    static _Atomic int on_ = -1; int on = atomic_load(&on_); if (on < 0) { on = !getenv("UFSM_IDLE_RELEASE") || ufsm_env_on("UFSM_IDLE_RELEASE"); atomic_store(&on_, on); }
+    static _Atomic int on_ = -1;   /* mgpu: env */
+    int on = atomic_load(&on_); if (on < 0) { on = !getenv("UFSM_IDLE_RELEASE") || ufsm_env_on("UFSM_IDLE_RELEASE"); atomic_store(&on_, on); }
     if (!on) return;
     const size_t pg = 4096;
     if (big && bign >= ((size_t)4 << 20)) madvise(big, bign & ~(pg - 1), MADV_DONTNEED);   /* (wbig_alloc: page-aligned blocks of their own) */
@@ -3731,7 +3733,8 @@ static void worker_idle_release(uint8_t *big, size_t bign, uint8_t *ttmp, size_t
    held 7 GB free inside 16 GB of arenas: windows' transient buffers of varying sizes from six threads fragment them). malloc_trim walks
    the free chunks (a few ms against a ~40 s window); the batches do not change. UFSM_SAMPLER_TRIM=0: off */
 static void worker_trim(void) {
-    static _Atomic int on_ = -1; int on = atomic_load(&on_); if (on < 0) { on = !getenv("UFSM_SAMPLER_TRIM") || ufsm_env_on("UFSM_SAMPLER_TRIM"); atomic_store(&on_, on); }
+    static _Atomic int on_ = -1;   /* mgpu: env */
+    int on = atomic_load(&on_); if (on < 0) { on = !getenv("UFSM_SAMPLER_TRIM") || ufsm_env_on("UFSM_SAMPLER_TRIM"); atomic_store(&on_, on); }
     if (on) malloc_trim(0);
 }
 static int echo_reclaim(sampler *sp);
@@ -3796,7 +3799,8 @@ static void *worker(void *arg) {
             else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); if (++fail > 20) { fprintf(stderr, "sampler: 20 consecutive read failures, stopping\n"); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); } }
         }
         worker_trim();
-        { static _Atomic int dly_ = -1; int dly = atomic_load(&dly_); if (dly < 0) { dly = getenv("UFSM_SAMPLER_DELAY_MS") ? atoi(getenv("UFSM_SAMPLER_DELAY_MS")) : 0; atomic_store(&dly_, dly); }   /* (tests: a slow data path
+        { static _Atomic int dly_ = -1;   /* mgpu: env */
+          int dly = atomic_load(&dly_); if (dly < 0) { dly = getenv("UFSM_SAMPLER_DELAY_MS") ? atoi(getenv("UFSM_SAMPLER_DELAY_MS")) : 0; atomic_store(&dly_, dly); }   /* (tests: a slow data path
                                                                                                                     whatever the GPU's speed, test_echo) */
           if (dly > 0) usleep((useconds_t)dly * 1000); }
         pthread_mutex_lock(&sp->mu);
@@ -4347,7 +4351,8 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         if (mi) fclose(mi);
         sp->thp = cfg->gpu_aug != 2 && mf > 16l << 20; atomic_store(&g_thp_last, sp->thp);
     }
-    sp->prof = ufsm_env_on("UFSM_SAMPLER_PROF"); { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, sampler_env_once); }   /* (once: other samplers' workers read them) */
+    sp->prof = ufsm_env_on("UFSM_SAMPLER_PROF"); { static pthread_once_t once = PTHREAD_ONCE_INIT;   /* mgpu: guarded */
+                                                  pthread_once(&once, sampler_env_once); }   /* (once: other samplers' workers read them) */
     atomic_store(&g_tp_p3, P3(sp));
     sp->lvl_ok = calloc((size_t)S->n, sizeof *sp->lvl_ok);
     sources_open_all(S, 32);   /* every (source, level, channel) store opened up front in parallel: lazily they serialise on one lock (254 opens, 17 s) */
