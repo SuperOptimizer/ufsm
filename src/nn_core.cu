@@ -229,6 +229,7 @@ int g_gradbf = 1;
 extern "C" void nn_set_grad_bf16(int on) { g_gradbf = on; }
 extern "C" int nn_get_grad_bf16(void) { return g_gradbf; }
 #include <pthread.h>
+#include <atomic>
 thread_local cudaError_t g_err = cudaSuccess;   /* mgpu: per-thread (see nn_common.cuh CK) */
 thread_local const char *g_err_file, *g_err_what; thread_local int g_err_line;   /* mgpu: per-thread */
 static thread_local char g_err_site[512];   /* mgpu: per-thread */
@@ -236,11 +237,15 @@ static thread_local void *g_err_ra;   /* mgpu: per-thread. The caller of the cop
 static thread_local int g_err_worker;   /* mgpu: per-thread. nn_err_worker(1): a per-GPU thread, whose nn_check reports only its own errors */
 /* the first error of any thread not yet consumed (mgpu: guarded, g_errp_mu): the trainer's main thread takes its GPU threads' errors here */
 static pthread_mutex_t g_errp_mu = PTHREAD_MUTEX_INITIALIZER;
-static struct { cudaError_t e; const char *file, *what; int line, dev; pthread_t owner; } g_errp;   /* mgpu: guarded (g_errp_mu) */
+static struct { cudaError_t e; const char *file, *what; int line, dev; unsigned long owner; } g_errp;   /* mgpu: guarded (g_errp_mu) */
+/* the posting thread's identity: a process-unique serial, not pthread_self (a joined thread's pthread_t is reused by the next thread
+   created: test_dpsafe's quiet worker then took the exited worker's posted error as its own, and the main thread's nn_check missed it) */
+static unsigned long err_tid(void) { static std::atomic<unsigned long> next{1}; /* mgpu: guarded (atomic) */ static thread_local unsigned long id; /* mgpu: per-thread */
+                                     if (!id) id = next.fetch_add(1); return id; }
 extern "C" void nn_err_post(int e, const char *file, int line, const char *what) {
     int d = -1; cudaGetDevice(&d);
     pthread_mutex_lock(&g_errp_mu);
-    if (g_errp.e == cudaSuccess) { g_errp.e = (cudaError_t)e; g_errp.file = file; g_errp.line = line; g_errp.what = what; g_errp.dev = d; g_errp.owner = pthread_self(); }
+    if (g_errp.e == cudaSuccess) { g_errp.e = (cudaError_t)e; g_errp.file = file; g_errp.line = line; g_errp.what = what; g_errp.dev = d; g_errp.owner = err_tid(); }
     pthread_mutex_unlock(&g_errp_mu);
 }
 extern "C" void nn_err_worker(int on) { g_err_worker = on; }
@@ -259,7 +264,7 @@ extern "C" const char *nn_check(void) {
     cudaError_t e = g_err; const char *ef = g_err_file, *ew = g_err_what; int el = g_err_line, from = -2;
     g_err = cudaSuccess;
     pthread_mutex_lock(&g_errp_mu);
-    if (g_errp.e != cudaSuccess && pthread_equal(g_errp.owner, pthread_self())) g_errp.e = cudaSuccess;   /* (this thread's own: consumed here) */
+    if (g_errp.e != cudaSuccess && g_errp.owner == err_tid()) g_errp.e = cudaSuccess;   /* (this thread's own: consumed here) */
     else if (e == cudaSuccess && !g_err_worker && g_errp.e != cudaSuccess) {   /* another thread's (a GPU thread's, for the main thread) */
         e = g_errp.e; ef = g_errp.file; ew = g_errp.what; el = g_errp.line; from = g_errp.dev; g_errp.e = cudaSuccess;
     }
