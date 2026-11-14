@@ -6,6 +6,29 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Log line and log.csv semantics (2026-11-14, branch logfix-20261114; audit mini/logs.md)
+
+The 50-step line and log.csv now mean what they say:
+- `wait` is the time a GPU sat idle waiting for data. Under --echo-max, the probe's time while the GPUs still ran the step (it waits for a
+  fresh window first) used to count as wait, so a saturated echo run could show 40 %; it is now a separate `gate` share,
+  `(wait N%, gate M%)`, printed only with --echo-max. log.csv's wait_s has the same meaning, and a new gate_s column is appended.
+- `loss`, `bce`, `dice` (and CSV `active`) are means over all the step's windows (every DP GPU). bce and dice used to be GPU 0's only.
+  CSV `active` used to be one step's sum at the log line; it is now the interval mean per window, like the other columns.
+- The label shares "(N% of windows)" count GPU 0's batches with a label. At B > 1 the line now says "of batches" (a batch of 4 with one
+  labelled window counted 1).
+- `normal bce` is gated on the labels being present (raw loss > 0), for numerator and denominator alike. Under --norm-lambda 0 it used to
+  print 0.0000 (0 %) because the gate was the weighted loss.
+- samp/s and Mvox/s remain work rates: every window trained, echoes and skipped steps included, input voxels with the halo. The echo affix
+  now adds the fresh-window rate: `echo E% (GPU idle for data I%; fresh F samp/s)`.
+- `gns N W (EMA; ...)`: the noise scale is an EMA over updates, not an interval value like `gn`.
+- The memory plan's `task` is the rest of the need after the named terms. UFSM_MEM_REPORT=2 now prints `task = these + other`, with the
+  listed parts and the remainder (a term later added to the need without a print shows up as other).
+- predict: `wrote ... (N tiles in Ts end-to-end, the windows Ws)` and the `predict io` line give both the end-to-end clock (pyramids and
+  writes) and the window loop's.
+Parsers: log.csv columns are only appended (u0/watch.sh reads by position and ignores trailing columns; csv_extend_header extends a
+resumed run's older header when it is a prefix of the current one). tests/test_echo.sh and test_accum.sh follow the new fields;
+univ/eval.sh and muonx/absum.py read `samp/s` / `Mvox/s` by the token before them, unchanged.
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the
