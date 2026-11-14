@@ -1440,6 +1440,8 @@ static char *inkfly_key(const inkfly *f, const inksplat_cfg *c, const char *segs
     size_t n = 0, cap = 4096; char *b = malloc(cap); b[0] = 0;
     key_add(&b, &n, &cap, "%s\nct %s %s level %d shape %lld,%lld,%lld um %.6g\n", INKFLY_CODE, c->ct_root ? c->ct_root : "?", c->ct_key ? c->ct_key : "?", f->L,
             (long long)f->shape[0], (long long)f->shape[1], (long long)f->shape[2], c->ct_um);
+    if (c->ct_root && c->ct_key && !strstr(c->ct_root, "://")) {   /* a CT re-ingested at the same path (same shape): its group's zarr.json (the dcache audit #5) */
+        char cp[2100]; snprintf(cp, sizeof cp, "%s/%s", c->ct_root, c->ct_key); key_stat(&b, &n, &cap, cp, "zarr.json"); key_add(&b, &n, &cap, "\n"); }
     key_add(&b, &n, &cap, "cfg iso %d thr %.9g flip %d face %.9g,%.9g t %.9g,%.9g run %d gap %d label_scale %.9g off %.9g,%.9g val_mode %d\n", c->iso, c->thr, c->flip,
             c->face_a, c->face_b, c->face_lo, c->face_hi, c->face_run, c->face_gap, c->label_scale, c->label_off[0], c->label_off[1], c->val_mode);
     for (int e = 0; e < c->nexcl; e++) key_add(&b, &n, &cap, "exclude %lld,%lld,%lld,%lld,%lld,%lld\n", (long long)c->excl[e][0], (long long)c->excl[e][1],
