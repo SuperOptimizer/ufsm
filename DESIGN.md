@@ -820,6 +820,23 @@ Items handed out (MEGA pass, CPU only, recipe changes behind flags default off):
 - train#9 replica check and the lat-step jitter seed: gns, dpcheck-20261114;
 - train#6 validation (--val-batches / holdouts per scroll): launch config.
 
+The audit's lower items (branch trainlow-20261114, source only; the final sweep builds it):
+- SIGTERM inside an --accum update: `--stop-at-update 1` (default 0). The first SIGINT / SIGTERM sets a pending flag. The run goes on to
+  the update's last window (at most accum - 1 more window steps, ~1-2 s each at P 768), takes that update, then stops and saves at the
+  boundary; a second signal stops at once. Before: the 1742 checkpoint (accum 5) dropped the 2 accumulated windows and the resume's
+  first update (1745) had 3. With the trainstate anchor (#5) a resume then starts on a fresh update.
+- Echo in one update: `--gns-skip-echo 1` (default 0). An update holding an --echo-max echo (batch use > 0) gives no B_noise pair:
+  the same window twice correlates the small-batch gradients, so |g_small|^2 has less noise than gns.h assumes and B_noise comes out
+  low, which --accum auto reads as a smaller critical batch. The skipped count is on the gns log part. The echo's double weight in the
+  update itself is data echoing by design (a new device-side augmentation) and stays. try6 logged 0 % echo, so it changes nothing
+  there. --echo-max is forced off under --det 1, so A/B arms never echo.
+- Clip 5: the step line now shows " clip N x (gn > 5)" when a log interval clipped. try6's gn ran 1.5-4.3, so 5 never fired. Under
+  Muon the clip only rescales a window's share of the momentum, and the update norm is fixed. It is not a guard against
+  small-label windows; that is --win-weight (train#4). The threshold is unchanged.
+- Rollback replay: no change. A resume reseeds the sampler from seed + 0x9E37..15 x step0 (train.c: "training sample stream
+  reseeded"), so two resumes from one snapshot with the same --seed draw the same windows. The A/Bs (ab_accum, admuon) rely on this.
+  A different --seed gives an independent stream. Two rollbacks with one --seed are one data sample, not two.
+
 ## Build and option hygiene: mini audits cmake + opts (2026-11-14, branch cfgfix-20261114)
 
 CMake (mini/cmake.md 1-6): test-prep now reconfigures the sibling release / verify dir with all of this dir's settings every time

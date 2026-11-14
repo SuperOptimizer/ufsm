@@ -57,8 +57,11 @@ static int train_unread_flags(int argc, char **argv) { return opt_unread("train"
 static double optd(int argc, char **argv, const char *name, double dflt) { const char *v = opt(argc, argv, name, nullptr); return v ? opt_atof(name, v) : dflt; }
 static const char *g_aug_name = "none";   /* train --aug preset */
 
-static volatile sig_atomic_t g_stop;
-static void on_sig(int s) { (void)s; g_stop = 1; }
+static volatile sig_atomic_t g_stop, g_sig;
+static int g_stop_upd;   /* --stop-at-update 1 (audit 11-14 train #11 lower): a SIGINT / SIGTERM inside an --accum update ends the run at that
+                            update's last window (at most accum - 1 more windows), so the saved checkpoint drops no accumulated window; a second
+                            signal stops at once (the old behaviour: the partial sum is lost, the resume's first update has fewer windows) */
+static void on_sig(int s) { (void)s; if (g_stop_upd && !g_sig) g_sig = 1; else g_stop = 1; }
 
 /* the head registry's aux plane roles (below) and the label stream planes: phase, winding, component, then the aux planes */
 enum { AUX_PAP, AUX_INK, AUX_FIB, AUX_FIBH, AUX_FIBV, AUX_N };
@@ -2721,7 +2724,7 @@ int cmd_train(int argc, char **argv) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 512] [--B 1] [--steps 20000] [--lr 1e-3] [--warmup 500 (steps; one step = one window per GPU) | --warmup-updates N (optimizer updates: N x accum steps)] [--wd 0.01]\n"
                         "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12 (new runs with --gpu-aug 2: 3)] [--gpu-aug 0|1|2 (new runs: 2)] [--sampler-slots N] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
                         "       [--rv 1 [--rv-iso 64] [--rv-verso-w 1]]\n"
-                        "       [--val-batches 8] [--val-P N (validation windows of N^3 whatever P: the same voxels across window sizes)] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--gscale-grow 0 (N: x2 after N clean steps)] [--gscale-max 65536] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--sparse24-mode 1|2|3] [--sparse24-levels 0,1,...] [--sparse24-ramp N] [--sparse24-hard 0|1] [--srste 2e-4] [--pos-weight 1] [--tol 0..2] [--sr 1]\n"
+                        "       [--val-batches 8] [--val-P N (validation windows of N^3 whatever P: the same voxels across window sizes)] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--stop-at-update 1 (a signal inside an --accum update stops at its end)] [--gns-skip-echo 1] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--gscale-grow 0 (N: x2 after N clean steps)] [--gscale-max 65536] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--sparse24-mode 1|2|3] [--sparse24-levels 0,1,...] [--sparse24-ramp N] [--sparse24-hard 0|1] [--srste 2e-4] [--pos-weight 1] [--tol 0..2] [--sr 1]\n"
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
                         "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across finite-cover evaluation pauses\n"
                         "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--cover-next-pass 1] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
@@ -4890,7 +4893,8 @@ int cmd_train(int argc, char **argv) {
     if (rep_every < 0 || rep_sync < 0 || rep_sync > 1) { fprintf(stderr, "--replica-check N >= 0, --replica-sync 0|1\n"); return 2; }
     if (acc_auto) fprintf(stderr, "--accum auto: %d windows per step, accum %d%s (max %d): target K %g x B_noise, up only, after %d updates, %d updates above %g x, a change per %d updates at most, x2 at most; lr unchanged\n",
                           acc_cfg.wps, accum, saved_acc > 0 ? " (resumed)" : "", acc_amax, acc_cfg.k, acc_cfg.warm, acc_cfg.hold, acc_cfg.margin, acc_cfg.gap);
-    float *gacc[64] = {nullptr}; int nacc_win = 0;
+    float *gacc[64] = {nullptr}; int nacc_win = 0; long nclip_log = 0;   /* (nclip_log: --clip hits since the last log line; logged when > 0) */
+    g_stop_upd = opt_atoi("--stop-at-update", opt(argc, argv, "--stop-at-update", "0")) != 0;
     if (accum > 1 || (acc_auto && acc_amax > 1)) { for (int g = 0; g < ng; g++) { nn_init(G[g].dev); gacc[g] = nn_malloc(np * 4); }
         fprintf(stderr, "--accum %d: %d steps per optimizer update = %d windows (%d GPU(s) x B %d each); the schedule, --warmup and --steps count STEPS (%d windows each); updates at steps %% %d == 0\n",
                 accum, accum, accum * nl * B, nl, B, nl * B, accum); }
@@ -4907,6 +4911,10 @@ int cmd_train(int argc, char **argv) {
     const double gns_beta = opt_atof("--gns-beta", opt(argc, argv, "--gns-beta", "0.99"));
     if (!(gns_beta >= 0 && gns_beta < 1)) { fprintf(stderr, "--gns-beta: 0 <= beta < 1\n"); return 2; }
     const int gns_on = gns_ask && gns_can;
+    /* --gns-skip-echo 1 (audit 11-14 train #11 lower; default 0): an update holding an --echo-max echo (batch use > 0: the same window again,
+       a new augmentation) gives no B_noise pair -- an echo correlates the small-batch gradients and biases B_noise low (gns.h assumes
+       independent windows), which --accum auto then reads as a smaller critical batch. Logged: the updates skipped */
+    const int gns_skip_echo = opt_atoi("--gns-skip-echo", opt(argc, argv, "--gns-skip-echo", "0")) != 0; long gns_echo_skipped = 0; int upd_echo = 0;
     if (gns_ask && !gns_can) fprintf(stderr, "--gns: no estimate on one GPU without --accum (or --split without --accum): one batch size only\n");
     if (gns_on) fprintf(stderr, "--gns: gradient noise scale from |g|^2 at %d vs %d windows, EMA decay %g per update\n", accum > 1 ? nl * B : B, accum > 1 ? accum * nl * B : nl * B, gns_beta);
     if (acc_auto && !gns_on) { fprintf(stderr, "--accum auto needs --gns 1\n"); return 2; }
@@ -5087,7 +5095,7 @@ int cmd_train(int argc, char **argv) {
           g_verso_flip = g_verso_on && g_verso_swap > 0 && (double)(h >> 11) * 0x1p-53 < g_verso_swap; }   /* same on every GPU */
         g_sheet_ramp=fminf(1.f,(float)(step-schedule_start)/500.f);
         nn_set_sr_step((unsigned)step + (step0 > 0 ? 0u : (unsigned)step_loaded * 0x9E3779B1u));   /* (--finetune: not the base run's SR seeds of steps 1, 2, ...) */
-        double loss = 0, active = 0; int want_next[64] = {0};   /* (per GPU: fetch its next batch after all launches) */
+        double loss = 0, active = 0; int want_next[64] = {0}; int step_echo = 0;   /* (step_echo: a window of this step is an --echo-max echo) */   /* (per GPU: fetch its next batch after all launches) */
         /* forward + backward on every GPU; kernel launches are asynchronous so the GPUs overlap */
         if (split) {   /* one window on both GPUs: upload both slabs of a batch, then one job with the halo exchanges */
             if (!G[0].pending) {
@@ -5108,6 +5116,7 @@ int cmd_train(int argc, char **argv) {
                                d->fs_drop = (double)(h >> 11) * 0x1p-53 < g_fs_drop; }   /* (--fstem-drop: one draw for the window, both halves) */
             }
             split_arg sa = {G, B, P, 1, dice_w};
+            if (G[0].pending && G[0].pending->use > 0) step_echo = 1;
             split_run(sctx, split_job, &sa);
             for (int g = 0; g < 2; g++) { nn_init(G[g].dev); nn_event_record(G[g].ev_done[G[g].cur], 0); nn_event_sync(G[g].ev_up[G[g].cur]); nn_event_sync(G[g].ev_lab[G[g].cur]); G[g].fs_drop = 0; }   /* (lab_early: the label warp read the host batch) */
             sampler_release(sp, G[0].pending);
@@ -5189,6 +5198,7 @@ int cmd_train(int argc, char **argv) {
             norm[g] = 1;
         }
         if (!g_stop) {
+            if (!overfit) for (int g = 0; g < ng; g++) if (norm[g] && G[g].pending && G[g].pending->use > 0) step_echo = 1;
             static int thr = -1, phz = -1;
             if (thr < 0) { thr = !getenv("UFSM_MGPU_THREADS") || ufsm_env_on("UFSM_MGPU_THREADS"); phz = !getenv("UFSM_MGPU_PHASED") || ufsm_env_on("UFSM_MGPU_PHASED"); }
             gstep_arg ga[64];
@@ -5296,9 +5306,9 @@ int cmd_train(int argc, char **argv) {
                 }
                 continue;
             }
-            if (g == 0 && gns_on && (ng > 1 && !split && accum == 1)) gns_add(&gns, B, gns_small, nl * B, gn * gn);
+            if (g == 0 && gns_on && (ng > 1 && !split && accum == 1)) { if (gns_skip_echo && step_echo) gns_echo_skipped++; else gns_add(&gns, B, gns_small, nl * B, gn * gn); }
             if (accum > 1) {   /* --accum: this window's gradient into the sum; the update only at multiples of K, on the mean */
-                if (g == 0) { nacc_win++; gns_small += gn * gn; acc_gs += gn; n_gs++;
+                if (g == 0) { nacc_win++; gns_small += gn * gn; upd_echo |= step_echo; acc_gs += gn; n_gs++;
                     if (gg_on) { const int n = unet_grad_groups(d->u, ggs, ggname, GG_MAX); gg_n = n; for (int k = 0; k < n; k++) gg_small[k] += ggs[k]; } }
                 const int first = nacc_win == 1;
                 static const char *adump = (const char *)1; if (adump == (const char *)1) adump = getenv("UFSM_ACCUM_DUMP");   /* tests: each window's gradient and each update's */
@@ -5312,9 +5322,10 @@ int cmd_train(int argc, char **argv) {
                 if (g == ng - 1) nacc_win = 0;
                 if (g == 0) gn = unet_grad_norm(d->u);   /* (the update's gradient norm: the mean's) */
                 if (g == 0) { acc_gu += gn; n_gu++; }
-                if (g == 0 && gns_on) { gns_add(&gns, nl * B, gns_small / nwin_upd, (double)nwin_upd * nl * B, gn * gn); gns_small = 0; }
+                const int gskip = gns_skip_echo && upd_echo; if (g == 0) { if (gskip && gns_on) gns_echo_skipped++; upd_echo = 0; }
+                if (g == 0 && gns_on) { if (!gskip) gns_add(&gns, nl * B, gns_small / nwin_upd, (double)nwin_upd * nl * B, gn * gn); gns_small = 0; }
                 if (g == 0 && gg_on) { const int n = unet_grad_groups(d->u, ggs, ggname, GG_MAX);
-                    for (int k = 0; k < n && k < gg_n; k++) { gns_add(&ggn[k], nl * B, gg_small[k] / nwin_upd, (double)nwin_upd * nl * B, ggs[k]); } for (int k = 0; k < GG_MAX; k++) gg_small[k] = 0; }
+                    for (int k = 0; k < n && k < gg_n && !gskip; k++) { gns_add(&ggn[k], nl * B, gg_small[k] / nwin_upd, (double)nwin_upd * nl * B, ggs[k]); } for (int k = 0; k < GG_MAX; k++) gg_small[k] = 0; }
                 ADUMP('u', unet_grad_ptr(d->u));
 #undef ADUMP
             }
@@ -5325,7 +5336,7 @@ int cmd_train(int argc, char **argv) {
                 const long upn = upd_base + (step - acc_anchor + accum - 1) / accum;
                 if (g == 0 && gl_every > 0 && upn % gl_every == 0) { char tg[64]; snprintf(tg, sizeof tg, "step %d update %ld gn %.3f", step, upn, gn); unet_debug_grads(d->u, tg); }
             }
-            if (clip > 0 && gn > clip) unet_clip_grad(d->u, clip);
+            if (clip > 0 && gn > clip) { unet_clip_grad(d->u, clip); if (g == 0) nclip_log++; }
             if (unet_get_sparse24_hard(d->u)) unet_sp24_grad_mask(d->u);   /* hard 2:4: the pruned weights' gradient 0 (Muon's momentum stays masked) */
             else unet_srste24(d->u, srste);                  /* no-op unless sparse */
             const float lrr = lr0 > 0.f ? lr / lr0 : 0.f;   /* (lr0 0: 0 / 0 was NaN -> NaN weights after step 1; CAL 11-01) */
@@ -5380,6 +5391,9 @@ int cmd_train(int argc, char **argv) {
           if (fault == step) nn_h2d(G[0].x, nullptr, 16); }
         if ((seconds && now() - t0 >= seconds) || (schedule_seconds && schedule_elapsed+now()-t0>=schedule_seconds) ||
             (limit_seconds && now() - t0 >= limit_seconds) || (stop_at && step >= stop_at)) g_stop = 1;
+        if (g_sig && !g_stop && (accum <= 1 || (step - acc_anchor) % accum == 0)) {   /* --stop-at-update: the signal's stop at this update boundary */
+            fprintf(stderr, "step %d: signal: stopping at the update boundary (--stop-at-update)\n", step); g_stop = 1; }
+        else if (g_sig == 1 && !g_stop) { g_sig = 2; fprintf(stderr, "step %d: signal: finishing the update (%d more window steps; a second signal stops now)\n", step, accum - (step - acc_anchor) % accum); }
         if (ng > 1 && G[0].side < 0 && cfg.gn_ema && unet_gn_ema_average_due(unet_gn_ema_updates(G[0].u), unet_gn_ema_warm(G[0].u), step, val_every, ckpt_every, steps, g_stop)) {
             gn_ema_average(G, ng); nn_init(G[0].dev);
         }
@@ -5731,6 +5745,8 @@ int cmd_train(int argc, char **argv) {
                 }
             }
             if (accum > 1) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " (update %ld: %d windows each)", upd_base + (step - acc_anchor) / accum, accum); }   /* --accum: steps are windows */
+            if (nclip_log) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " clip %ld x (gn > %g)", nclip_log, clip); }   /* (audit 11-14 train #11: --clip hits, visible) */
+            nclip_log = 0;
             if (n_gs) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " gn_step %.2f", acc_gs / n_gs); }   /* (gn above: per-step norms and the updates' ten-window ones mixed) */
             if (n_gu) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " gn_upd %.2f", acc_gu / n_gu); }
             acc_gs = acc_gu = 0; n_gs = n_gu = 0;
@@ -5739,6 +5755,7 @@ int cmd_train(int argc, char **argv) {
                 const double bn = gns_bnoise(&gns); size_t na = strlen(affs);
                 if (isfinite(bn)) snprintf(affs + na, sizeof affs - na, " gns %.0f W (EMA; |G|^2 %.3g, S %.3g)", bn, gns_g2(&gns), gns_s(&gns));
                 else snprintf(affs + na, sizeof affs - na, " gns - (EMA; |G|^2 %.3g <= 0, S %.3g)", gns_g2(&gns), gns_s(&gns));
+                if (gns_echo_skipped) { na = strlen(affs); snprintf(affs + na, sizeof affs - na, " (gns: %ld echoed updates skipped)", gns_echo_skipped); }
                 char bs[32] = ""; if (isfinite(bn)) snprintf(bs, sizeof bs, "%.6g", bn);
                 snprintf(gcsv, sizeof gcsv, "%s,%.6g,%.6g", bs, gns_g2(&gns), gns_s(&gns));
             }
