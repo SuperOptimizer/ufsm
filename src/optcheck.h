@@ -5,7 +5,8 @@
    - opt_unread(who, argc, argv): warns once per command-line --flag that no lookup has asked for so far (a typo, or an env-var
      switch passed as a flag). main() runs it for every command when the command returns; train also runs it after its setup.
    - opt_atoi / opt_atol / opt_atoll / opt_atof: atoi / atof of an option value, but a value that is not entirely a number ("2e4" for
-     an integer, "288x", "abc") is an error (exit 2) instead of a silent prefix / 0. Empty or absent values stay 0. */
+     an integer, "288x", "abc") is an error (exit 2) instead of a silent prefix / 0. Empty or absent values stay 0. A list value
+     ("0,1") gives its first element, as atoi did: the list's own parser reads the rest. */
 #ifdef __cplusplus
 extern "C" {
 #endif
