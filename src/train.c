@@ -57,8 +57,8 @@ static int train_unread_flags(int argc, char **argv) { return opt_unread("train"
 static double optd(int argc, char **argv, const char *name, double dflt) { const char *v = opt(argc, argv, name, nullptr); return v ? opt_atof(name, v) : dflt; }
 static const char *g_aug_name = "none";   /* train --aug preset */
 
-static volatile sig_atomic_t g_stop, g_sig;
-static int g_stop_upd;   /* --stop-at-update 1 (audit 11-14 train #11 lower): a SIGINT / SIGTERM inside an --accum update ends the run at that
+static volatile sig_atomic_t g_stop, g_sig;   /* mgpu: process (signal flags: sig_atomic_t, read by the main loop) */
+static int g_stop_upd;   /* mgpu: config. --stop-at-update 1 (audit 11-14 train #11 lower): a SIGINT / SIGTERM inside an --accum update ends the run at that
                             update's last window (at most accum - 1 more windows), so the saved checkpoint drops no accumulated window; a second
                             signal stops at once (the old behaviour: the partial sum is lost, the resume's first update has fewer windows) */
 static void on_sig(int s) { (void)s; if (g_stop_upd && !g_sig) g_sig = 1; else g_stop = 1; }
