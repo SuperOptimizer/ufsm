@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "test_part.h"   /* UFSM_TEST_PART=K/3: three shards of ~10 s (each makes its own fixture) */
 
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { fails++; fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
@@ -97,7 +98,9 @@ int main(int argc, char **argv) {
     char *refs = slurp(ref); FILE *rw = wr ? fopen(ref, "a") : nullptr;
     if (wr && !rw) { fprintf(stderr, "cannot append to %s\n", ref); return 1; }
     int have = 0, cmp = 0;
+    static const int old_part[] = {0, 0, 0, 0, 2, 1, 1};   /* UFSM_TEST_PART=K/3: lat_plain (4) beside (8), which reads its log */
     for (size_t k = 0; k < sizeof old / sizeof *old; k++) {
+        if (!test_part(old_part[k])) continue;
         if (sh("UFSM_GRAD_MX8=1 %s train %s/fx/%s --out %s/%s %s %s > %s/%s.log 2>&1", U, d, old[k].src, d, old[k].name, common, old[k].flags, d, old[k].name)) { CHECK(0, "%s run (%s/%s.log)", old[k].name, d, old[k].name); continue; }
         char p[600]; snprintf(p, sizeof p, "%s/%s.log", d, old[k].name); char *lg = slurp(p), *t = lg ? loss_terms(lg) : nullptr;
         CHECK(t && strstr(t, "4:"), "%s: four logged steps", old[k].name);
@@ -122,6 +125,7 @@ int main(int argc, char **argv) {
         {"lat_all", "--rv 2 --rv-iso 100 --ink-head 1 --fib-normal-lambda 0.1 --lat 4 --lat-guide 3"},
     };
     for (size_t k = 0; !wr && k < sizeof comb / sizeof *comb; k++) {
+        if (!test_part((int)k)) continue;
         if (sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-fib.json --out %s/%s %s %s > %s/%s.log 2>&1", U, d, d, comb[k].name, common, comb[k].flags, d, comb[k].name)) { CHECK(0, "%s run (%s/%s.log)", comb[k].name, d, comb[k].name); continue; }
         char p[600]; snprintf(p, sizeof p, "%s/%s.log", d, comb[k].name); char *lg = slurp(p);
         const char *last = nullptr; for (const char *q = lg; q && (q = strstr(q, "\nstep ")); q++) last = q + 1;
@@ -154,7 +158,7 @@ int main(int argc, char **argv) {
         }
     }
     /* (4) the sources' "heads" key: every head at 0 trains nothing (gradient norm 0); an unknown head name is refused */
-    if (!wr) {
+    if (!wr && test_part(0)) {
         CHECK(!sh("sed 's|\"weight\": 1,|\"weight\": 1, \"heads\": {\"phase\": 0, \"normal\": 0, \"density\": 0, \"wind4\": 0, \"rv\": 0, \"ink\": {\"on\": 0}, \"fibre\": 0},|' %s/fx/sources-fib.json > %s/fx/sources-off.json"
                   " && grep -q heads %s/fx/sources-off.json && sed 's|\"rv\": 0|\"rvv\": 0|' %s/fx/sources-off.json > %s/fx/sources-typo.json", d, d, d, d, d), "sources with heads off");
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-off.json --out %s/off %s %s > %s/off.log 2>&1", U, d, d, common, comb[0].flags, d), "heads-off run (%s/off.log)", d);
@@ -166,7 +170,7 @@ int main(int argc, char **argv) {
     }
     /* (5) --um-rungs with --film 2 on two sources whose labels allow one level each (phase at level 1 / level 2): both rungs train, the
        checkpoint names "film":2 and resumes; --levels with --um-rungs is refused */
-    if (!wr) {
+    if (!wr && test_part(1)) {
         CHECK(!sh("{ printf '{\"sources\": ['; sed -n 's/^{\"sources\": \\[//p; /targets/p' %s/fx/sources-l1.json | tr -d '\\n' | sed 's/]}$//'; printf ',\\n'; "
                   "sed -n 's/^{\"sources\": \\[//p; /targets/p' %s/fx/sources2.json | grep -v holdout | tr -d '\\n'; printf '\\n'; } > %s/fx/sources-mix.json && grep -c phase2 %s/fx/sources-mix.json > /dev/null", d, d, d, d), "two-source fixture");
         const char *rf = "--lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --um-rungs 19.2,38.4 --rung-shift-p 0.3 --film 2";
@@ -183,7 +187,7 @@ int main(int argc, char **argv) {
     }
     /* (6) --uw 1 + --grad-cos 2 (latent, all heads): the cosine lines name every head pair, the weights move off 1, the header carries
        "uw" with t 4 and a resume continues from it (t 6) */
-    if (!wr) {
+    if (!wr && test_part(1)) {
         const char *uf = "--lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --ink-head 1 --uw 1 --uw-lr 0.05 --grad-cos 2";
         char cm[2048]; snprintf(cm, sizeof cm, "%s", common); { char *ls = strstr(cm, " --steps 4"); if (ls) memmove(ls, ls + 10, strlen(ls + 10) + 1); }
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/uw %s %s --steps 4 > %s/uw.log 2>&1", U, d, d, cm, uf, d), "uw + grad-cos run (%s/uw.log)", d);
@@ -193,7 +197,7 @@ int main(int argc, char **argv) {
     }
     /* (7) --fstem 16 (latent, all heads): the stem's projection starts at zero, so step 1 logs the stem-less run's losses; the header names
        "fstem":[16,7]; a resume continues; a resume without --fstem is refused; predict --channel rv runs on it */
-    if (!wr) {
+    if (!wr && test_part(2)) {
         const char *ff = "--lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --ink-head 1";
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/fs0 %s %s > %s/fs0.log 2>&1 && UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/fs1 %s %s --fstem 16 > %s/fs1.log 2>&1",
                   U, d, d, common, ff, d, U, d, d, common, ff, d), "fstem runs (%s/fs0.log, fs1.log)", d);
@@ -208,7 +212,7 @@ int main(int argc, char **argv) {
     /* (8) --ssl 8 (latent, src/ssl.h): (a) without an unlabelled source the side head gets no gradient and the run logs lat_plain's
        losses; (b) with a "ct_only" copy of the fixture source at --ssl-share 0.5 the step lines carry a finite ssl term over the
        unlabelled windows, the teacher targets about the mask share of the cells, the header names the side head, a resume continues */
-    if (!wr) {
+    if (!wr && test_part(2)) {
         CHECK(!sh("sed 's|}}}}]}|}}}}, {\"name\": \"wind-fixture-u\", \"root\": \"%s/fx\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/fx/axis.json\", \"weight\": 1, \"ct_only\": 1}]}|' %s/fx/sources.json > %s/fx/sources-ssl.json"
                   " && grep -q ct_only %s/fx/sources-ssl.json", d, d, d, d, d), "sources with an unlabelled copy");
         const char *sf = "--lat 4 --lat-guide 3 --ssl 8 --ssl-level 1 --ssl-block 16";

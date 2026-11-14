@@ -37,7 +37,9 @@ test_fibhead_train                             | gpu          |    25 | tests/te
 test_slot_planes                               | gpu          |    30 | tests/test_slot_planes.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/slotplanes
 test_idle_release                              |              |     8 | tests/test_idle_release.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/idlerel
 test_scan_norm                                 | gpu          |     8 | tests/test_scan_norm.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/scannorm
-test_predict_heads                             | gpu          |    70 | tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
+test_predict_heads~part0of3                   | gpu          |    25 | UFSM_TEST_PART=0/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
+test_predict_heads~part1of3                   | gpu          |    25 | UFSM_TEST_PART=1/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
+test_predict_heads~part2of3                   | gpu          |    25 | UFSM_TEST_PART=2/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
 test_predict_boxes                             | gpu          |    40 | tests/test_predict_boxes.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predboxes
 test_fstem                                     | gpu,smoke    |     3 | ./$B/test_fstem
 test_lathead                                     | gpu          |     3 | ./$B/test_lathead
@@ -117,7 +119,9 @@ test_predict_fitgrid                           | gpu          |     5 | ./$B/tes
 test_unwrap2_ink                               | gpu          |    40 | ./$B/test_unwrap2_ink ./$B/ufsm ./$B/make_wind_fixture
 test_cuda_abort                                | gpu          |    25 | bash tests/test_cuda_abort.sh ./$B/ufsm ./$B/make_wind_fixture
 test_rv                                        | gpu          |    30 | ./$B/test_rv ./$B/ufsm ./$B/make_wind_fixture
-test_heads                                     | gpu          |   120 | ./$B/test_heads ./$B/ufsm ./$B/make_wind_fixture tests/heads_ref.txt
+test_heads~part0of3                           | gpu          |    15 | UFSM_TEST_PART=0/3 ./$B/test_heads ./$B/ufsm ./$B/make_wind_fixture tests/heads_ref.txt
+test_heads~part1of3                           | gpu          |    15 | UFSM_TEST_PART=1/3 ./$B/test_heads ./$B/ufsm ./$B/make_wind_fixture tests/heads_ref.txt
+test_heads~part2of3                           | gpu          |    15 | UFSM_TEST_PART=2/3 ./$B/test_heads ./$B/ufsm ./$B/make_wind_fixture tests/heads_ref.txt
 test_uw_fixed_point                             | smoke        |     1 | UFSM_UW_SELFTEST=1 ./$B/ufsm train
 test_score_par                                 |              |     8 | ./$B/test_score_par ./$B/ufsm
 test_grid_sparse                               | gpu,smoke    |     2 | ./$B/test_grid_sparse
