@@ -17,7 +17,7 @@ OUT=$1
 U=${U:-/vesuvius/ufsm/scroll1/src/build/ufsm}
 CTR=${CTR:?CT root}; CTK=${CTK:?CT key}; INK=${INK:?ink zarr}; INKK=${INKK:-9.6}
 RENDER_NT=${RENDER_NT:-8}; MOS_NT=${MOS_NT:-6}; MAXR=${MAXR:-6}; [ $MAXR -ge 1 ] || MAXR=1; CTL=${CTL:-80}; PAP=${PAP:-}; MEMGB=${MEMGB:-80}; PAPMOS=${PAPMOS:-}; PGAIN=${PGAIN:-1}; PAPPX=${PAPPX:-8000}
-FILLX=${FILLX:---fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 1}
+FILLX=${FILLX:---fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 0}
 R=$OUT/render_fill; I=$OUT/img_fill; M=$OUT/fillmap
 mkdir -p $OUT/logs $R $M
 log() { echo "$(date '+%F %T') $*" | tee -a $OUT/progress_fill.log; }
