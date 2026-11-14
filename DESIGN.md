@@ -6,6 +6,43 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Recompute and host offloads in scratch2: what the memory modes cost (2026-11-14, branch recomp-20261114)
+
+Goal: free device memory on the desk's 16 GB cards and spend it on less recompute / fewer host offloads (estimated 5-10 %).
+
+**P 1024 --split z (try5), the per-card plan** (UFSM_MEM_DRY=1 UFSM_MEM_REPORT=2 on the perf pod, `--gpus 0,0` = one card twice,
+UFSM_MEM_FREE_GB 13.66 = the desk card's free memory at the planner; the plan line matches try5's log: 11.59 of 13.16 GB):
+
+| part | GB |
+|---|---|
+| network (dry build, 136 x 256^2 cells): encoder a1 / a2 / GN + down outputs 2.65, decoder 1.44, gout / gskip 1.21, rest 0.08 | 5.38 |
+| task: head slabs 0.67, gpu-aug staging 1.16 (uint8 CT / labels), full-resolution input 1.14, latent head slab 0.29, label stream slab sets, split halo planes 0.27, +1/14 margin | 5.26 |
+| workspace (tb / 14) + fixed (550 MB) | 0.96 |
+| mode 4 (lean 2, chunked, shared a1 offloaded; 3.21 GB host offloads each way) | **11.59** |
+| the same without host offloads (encoder a1 re-run instead) | 13.89 |
+| mode 0 (no lean, no chunking, no offloads) | 23.39 |
+
+Weights, optimizer state, the on-the-fly phase / fibre / ink buffers took 2.76 GB before the planner; the cards ran at ~15.4 of 16.3 GB,
+so ~0.9 GB of real headroom: no offload-free mode fits at P 1024.
+
+**P 512 data parallel (try6, from 08:32)**: the per-card plan is 4.27 of 12.90 GB (cards 8.6 / 8.1 GB), so the fastest mode fits.
+Perf pod, one RTX PRO 4000, try6's flags on the wind fixture, UFSM_MEM_FREE_GB 12.9, UFSM_BENCH_SAME=1 (GPU time, the same batch),
+--det 1, 24 steps, s/step over the second half:
+
+| setting | s/step | peak device |
+|---|---|---|
+| --mem auto (lean 2, chunked, shared a1, 0.75 GB offloads each way) | 1.019, 1.012 | 7.15 GB |
+| --mem fast (picks "MX gradients, no host offloads") | 1.002, 1.000 | 8.41 GB |
+| --mem fast + UFSM_HEAD_SLAB_Z 32 | 1.004 | 8.90 GB |
+| --mem fast + UFSM_HEAD_SLAB_Z 64 | 1.011 | 9.88 GB |
+
+--mem fast: **-1.4 %** step for +1.26 GB per card; losses within the run-to-run spread (auto vs auto 2e-3 at step 5, the same for fast).
+The recompute left in every mode is recompute 1: GN + SiLU applied in the conv's operand staging (fused) and the decoder's upsampled
+part rebuilt, both cheap; UFSM_RECOMPUTE=0 is not supported with MX storage (aborts "MX storage needs MX inputs and outputs of one
+format"). The step is 75-85 % convolutions (UFSM_PROF), so the memory modes cannot give 5-10 % here. Larger head slabs: no gain.
+
+Use: MEMMODE=fast in the launch env (u1.train2.sh passes --mem $MEMMODE) for P 512 runs; keep --mem auto at P 1024.
+tests/bench_s2: one desk card's share of the P 1024 split trunk on one GPU (synthetic input; the unet env switches, BS2_CAP_GB ballast).
 ## Kernel fusion for scratch2: what is left to fuse, the head slabs (2026-11-14, branch fuse-20261114)
 
 Goal: fuse GroupNorm-apply + SiLU + MX-fp4 quantisation into the 3^3 convs (forward and backward) for the scratch2 step.
