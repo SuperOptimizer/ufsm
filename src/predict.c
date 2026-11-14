@@ -1553,8 +1553,9 @@ static int predict_one(int argc, char **argv) {
     const int ff_rec = ffu2 ? -1 : 0, ff_ph = ffu2 ? 0 : 2, ff_nrm = ffu2 ? 2 : 4, ff_den = ffu2 ? 8 : 10, ff_w4 = ffu2 ? 9 : -1;
     int ffw4d = ffu2 ? atoi(opt(argc, argv, "--fit-w4-d", "32")) : 0;
     float ffds = 32.f; int ffdc = 0;   /* the checkpoint's density code: min(1, density_scale rho), or x / (1 + x) (density_code 1) */
-    if (ffd) { FILE *cf = fopen(ckpt, "rb"); char *hb = malloc(1 << 16); size_t nr = cf ? fread(hb, 1, (1 << 16) - 1, cf) : 0; if (cf) fclose(cf); hb[nr] = 0;
-               char *e = memchr(hb, '\n', nr); if (e) *e = 0; const char *q = strstr(hb, "\"density_scale\":"); if (q) ffds = (float)atof(q + 16);
+    if (ffd) { char *hb = checkpoint_header_line(ckpt);   /* the whole header line (it exits on a header without newline) */
+               if (!hb) { fprintf(stderr, "predict: cannot read %s\n", ckpt); return 2; }
+               const char *q = strstr(hb, "\"density_scale\":"); if (q) ffds = (float)atof(q + 16);
                q = strstr(hb, "\"density_code\":"); if (q) ffdc = atoi(q + 15); free(hb); }
     int pap_cond = 0; const int pap = papyrus_checkpoint(ckpt, &pap_cond) == 1;   /* task papyrus: the conditioned nets take the cutoff per window */
     const double pcut = pap && pap_cond ? atof(opt(argc, argv, "--papyrus-cut", "-1")) : -1;
