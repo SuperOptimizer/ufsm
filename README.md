@@ -10,7 +10,7 @@ Production models: `wind96` (task unwrap, 9.6 um: phase, normals, density, recto
 ## Build and test
 
 ```sh
-cmake --preset release && cmake --build build -j 8      # build/ufsm. LLVM 22 (clang C23 + clang -x cuda, lld, compiler-rt), CMake >= 3.28,
+cmake --preset release && cmake --build build -j 8      # build/ufsm. LLVM 22 (clang C23, nvcc with clang++ host for .cu, lld, compiler-rt), CMake >= 3.28,
                                                         # Ninja; needs libcurl, libzstd, libblosc, zlib, libjpeg, xxhash (header),
                                                         # OpenSSL libcrypto, CUDA 13.1+ (ptxas, cudart, cuBLASLt; sm_120 / sm_120a)
 cmake --preset verify && cmake --build build-verify --target test     # suite binaries + the fast tier (the merge gate)

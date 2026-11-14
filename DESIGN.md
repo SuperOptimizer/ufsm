@@ -86,8 +86,8 @@ release wait for ev_lab. Same bytes in a different order: --det losses must be i
 ## Build system: CMake + Ninja, the LLVM toolchain for everything, the Makefile removed (2026-11-13, branch buildsys-20261113)
 
 The GNU Makefile (gcc -std=c23 + nvcc, 846 lines, one hand-written rule per test) is replaced by CMakeLists.txt + CMakePresets.json
-and LLVM only: clang for C23, clang -x cuda for the device code (LLVM NVPTX; only ptxas / fatbinary / headers / libs come from CUDA),
-lld, llvm-ar, compiler-rt builtins and crt files. Configurations stay build directories (build/, build-verify/, build86/); tests are
+and LLVM: clang for C23, lld, llvm-ar, compiler-rt builtins and crt files; the device code goes through nvcc with clang++ as its host
+compiler (UFSM_CUDA_COMPILER=nvcc, the default: clang -x cuda works, see below, but its kernels ran 1.35x slower). Configurations stay build directories (build/, build-verify/, build86/); tests are
 one ufsm_exe() line each in tests/targets.cmake (converted from the Makefile rules, the exact object lists kept: weak symbols and
 tfx.c's constructor make archive-style linking change behaviour).
 
@@ -127,7 +127,25 @@ rebuilds nor misses the cache); no project header is device-only today (all 165 
 
 Suite (CPU tier on the desk, no GPU): 95 pass; test_strip segfaulted under clang: the test passed argc 19 for 17 arguments (gcc's stack
 layout hid it; fixed); test_sampler_safety fails the same 3 holdout checks with the gcc build of origin/master (pre-existing).
-GPU tier and the clang-cuda vs nvcc kernel timing: pending (pod B down since 19:35 pod time).
+GPU tier, clang -x cuda (desk sm_120, gpucheck-1113-1529): bench_f4conv 256 total 381.3 ms vs nvcc 281.9 ms (1.35x), single kernels
+up to 5.5x slower (bdata s2 down0 5.47x, up2 fwd 1.9x, s2 wgrad, stem), 4 output hashes differ. Hence nvcc for the device code, clang++
+host (needs -allow-unsupported-compiler for clang 22, and nn_common's extern __shared__ smem_raw aligned 32 everywhere: nvcc's
+clang-mode front end rejects differing redeclarations). Its SASS (cuobjdump -sass, instruction lines) is byte-identical to the gcc-host
+Makefile build in 164 of 165 units (nn_fibre differs: the own exact integer scan replaced CUB).
+
+nvcc + clang++ build, desk GPU check (gpucheck-1113-1551, under the suite locks): fast suite 240 pass, 6 fail: 4 missing release-dir
+helpers (the check built only ufsm into build/; the test target's test-prep builds them), test_sampler_safety (fails on gcc too),
+test_predict_feather: a test bug, its CT fixture converted out-of-range doubles to uint8_t (UB; gcc wrapped mod 256, clang's
+vectorised loop saturated, half the volume 0 / 255, the windows stopped disagreeing: 22 % < the 25 % gate). Through int64_t the gcc
+bytes are kept and both pass (1662645 voxels blended). Predict end to end (fixture checkpoint, gcc vs cmake binary): byte-identical;
+bench_f4conv output hashes identical. Fixture train (unwrap2 P 128 B 1, 40 steps): 1.74 vs 1.78 s; loss identical to step 4, then
+apart (step 8 1.94 vs 2.11); a gcc-vs-gcc repeat is still to run (2 sampler workers).
+
+Compile times with nvcc (forlindesk, -j24, no ccache), Makefile -> CMake: clean release 247 -> 245 s (UFSM_PTXAS_SPLIT=4: 242 s),
+clean arch86 329 -> 325 s, edit nn_elem.cu 3.9 -> 3.0 s, lp_f4fwd.cuh 89 -> 94 s, fit.c 5.7 -> 3.0 s, tiffw.h 16.5 -> 4.3 s. The clean
+build is the critical path of single nvcc units (lp_mx_gnbwd 183 s, lp_f4fwd_i0p 143 s, lp_mx_s2bwd_wide 133 s, lp_f8fwd_i0s 131 s;
+clang -x cuda built everything in 87 s); what nvcc keeps of the gain: exact header deps, ccache shared by release / verify, faster host C.
+Next lever: one instantiation per unit for those four.
 
 ## scratch2 at P 1024 --split z: device memory outside the planner, and a per-step leak (2026-11-13, branch s2fix-20261113)
 
