@@ -1,6 +1,6 @@
 /* ufsm wrap-snap <wraps-in> <wraps-out> --axis FILE --axis-um U0 --ct ROOT KEY --ct-um U [--fields DIR] [--target ct|phase|recto|mix]
                   [--range 60] [--margin 0.1] [--sigma 480,240,120] [--tau 40,25,15] [--iters 2] [--min-prom 6] [--first K] [--last K]
-                  [--band 64] [--sfc 0.25] [--threads N] [--dry] [--cache DIR] [--dmap DIR [--dmap-gs G]]
+                  [--band 64] [--sfc 0.25] [--threads N] [--dry] [--cache DIR] [--dmap DIR [--dmap-gs G]] [--masked-warn 0.02] [--masked-max 0]
    Wraps (ufsm wraps .sfc: rows = z, columns = rays at one angle around the axis, wrap k = the level set W = k) moved ONTO the sheets.
    A fitted W is smoother than the papyrus and its level sets cross the gaps between sheets (Paris 4 strips ~.75-.79 on papyrus).
    Design (ufsm surf-snap moved vertices to the nearest CT ridge one by one: sheet switches and seams, ~10 um off the GT surfaces):
@@ -500,7 +500,7 @@ static int wsn_list(const char *s, double *v, int max) { int n = 0; char *t = st
 
 int cmd_wrap_snap(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm wrap-snap <wraps-in> <wraps-out> --axis FILE --axis-um U0 --ct ROOT KEY --ct-um U [--fields DIR] [--target ct|phase|recto|mix]\n"
-                                    "       [--range 60] [--margin 0.1] [--sigma 480,240,120] [--tau 40,25,15] [--iters 2] [--min-prom 6] [--first K] [--last K] [--band 64] [--sfc 0.25] [--threads N] [--dry] [--cache DIR]\n"); return 2; }
+                                    "       [--range 60] [--margin 0.1] [--sigma 480,240,120] [--tau 40,25,15] [--iters 2] [--min-prom 6] [--first K] [--last K] [--band 64] [--sfc 0.25] [--threads N] [--dry] [--cache DIR] [--masked-warn 0.02] [--masked-max 0]\n"); return 2; }
     const char *in = argv[2], *out = argv[3], *tg = wsn_opt(argc, argv, "--target", "ct");
     const int target = !strcmp(tg, "ct") ? T_CT : !strcmp(tg, "phase") ? T_PHASE : !strcmp(tg, "recto") ? T_RECTO : !strcmp(tg, "mix") ? T_MIX : -1;
     const int nt = ufsm_threads(atoi(wsn_opt(argc, argv, "--threads", "0")), 16), dry = wsn_flag(argc, argv, "--dry");
@@ -592,6 +592,15 @@ int cmd_wrap_snap(int argc, char **argv) {
     const double t1 = wsn_now();
     fprintf(stderr, "wrap-snap: evidence %.1f s (volume decode %.1f s, %.3f of the %ld chunks' substreams): %ld vertices, %.3f with a candidate, %.4f on masked CT (not moved)\n", t1 - t0, tdec,
             g_wsn_chunks ? g_wsn_sub / (32.0 * g_wsn_chunks) : 0, g_wsn_chunks, nval, nval ? (double)ncand / nval : 0, nval ? (double)nmask / nval : 0);
+    {   /* the CT mask clipping the surface (audit ugeom #1: 1667's -masked store zeroes the outer sheets, 16 % of the published surface;
+           0.182 of our wrap vertices sat on masked CT and nothing said so). --masked-warn F (default 0.02): a WARNING line above F;
+           --masked-max F (default 0 = off): fail (exit 3) above F, after the warning and before anything is written */
+        const double ms = nval ? (double)nmask / nval : 0, mw = atof(wsn_opt(argc, argv, "--masked-warn", "0.02")), mm = atof(wsn_opt(argc, argv, "--masked-max", "0"));
+        if (mw > 0 && ms > mw)
+            fprintf(stderr, "wrap-snap: WARNING: %.4f of the wrap vertices lie on masked CT (CT 0; > --masked-warn %.3g): the scan mask clips the surface, so the "
+                            "fields had no input there (use an unmasked / dilated CT store)\n", ms, mw);
+        if (mm > 0 && ms > mm) { fprintf(stderr, "wrap-snap: ERROR: masked-CT share %.4f > --masked-max %.3g\n", ms, mm); return 3; }
+    }
     S.s0 = wum / axum; S.ax = &ax; S.out = out; S.dry = dry; S.dmap = wsn_opt(argc, argv, "--dmap", nullptr); S.dmap_gs = atof(wsn_opt(argc, argv, "--dmap-gs", "0"));
     if (S.dmap) { char cmd[1500]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", S.dmap); if (system(cmd)) return 1; } S.W = W; S.nw = nw;
     for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, wsn_solve_run, &S);

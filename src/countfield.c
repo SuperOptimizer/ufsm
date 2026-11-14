@@ -1014,7 +1014,8 @@ int cmd_count_field(int argc, char **argv) {
     }
     if (getenv("UFSM_CF_RESID")) fprintf(stderr, "count-field: phase residues per confident y-x plaquette: input %.5f (%.0f), output %.5f (%.0f)\n", resid[0][0] > 0 ? resid[0][1] / resid[0][0] : 0, resid[0][0], resid[1][0] > 0 ? resid[1][1] / resid[1][0] : 0, resid[1][0]);
     double agree_s = 0, agree_n = 0; for (int t = 0; t < CF_MAXT; t++) { agree_s += O.ag[t][0]; agree_n += O.ag[t][1]; }
-    fprintf(stderr, "count-field: gauge %.3f turn; phase / W agreement (phasor mean over +-%d cells, confidence-weighted) %.3f\n", M.gauge, R, agree_n > 0 ? agree_s / agree_n : 0);
+    if (agree_n > 0) fprintf(stderr, "count-field: gauge %.3f turn; phase / W agreement (phasor mean over +-%d cells, confidence-weighted) %.3f\n", M.gauge, R, agree_s / agree_n);
+    else fprintf(stderr, "count-field: gauge %.3f turn; phase / W agreement: n/a (not measured with --R %d; ufsm cf-demod MODEL FIELDS measures it per z band)\n", M.gauge, R);
     if (into) {   /* the whole volume's fields.json: the base field set's (the directory of the input's pc array), written once */
         struct stat sst; snprintf(p, sizeof p, "%s/fields.json", out);
         if (stat(p, &sst)) {
@@ -1121,4 +1122,119 @@ int cmd_cf_compare(int argc, char **argv) {
         free(hv); fit_fields_free(&g);
     }
     free(hl); fit_free(a); fit_free(b); return 0;
+}
+
+/* ufsm cf-demod MODEL FIELDS [--out DIR] [--R 1] [--band 64] [--step 2] [--cz 32] [--c0 0.1] [--drift-max 0] [--threads N]
+   Two label-free checks of a winding model (a count-field ref, ref-cf) against the network's fields, and one optional output.
+   1. The z drift (audit ugeom #5: on Paris 4 the joined / ref integers drift 3 turns against the GT over ~5 cm of height while every
+      gate passed). Per band of --band field rows: (a) the confidence-weighted phasor of the residual phi - W (phi the network phase,
+      W the model) and its angle, unwrapped along z; (b) the mean derivative of W along the sheet's vertical tangent
+      u = (e_z - n_z n) / |e_z - n_z n| (n the network normal: a sheet-following W has dW/du = 0), times the band height, summed along
+      z. Both are "turns gained against the sheets" from the bottom band up; the excursion (max - min) is the drift. --drift-max D:
+      exit 3 when the along-sheet excursion exceeds D turns (0: report only). Measured (ref-cf, --step 8 / 2, --band 128): P4 2.06 turns,
+      1667 0.40; the residual phasor's band coherence is low (0.01-0.5) and its excursion (0.93 / 0.73) does not separate them. The
+      along-sheet number ranks the two runs as the GT does, but its bands do not line up with the GT's per-band gauge steps: an alarm,
+      not a locator.
+   2. --out DIR: a demodulated model ("demod-only ref", audit ugeom #2): the model with its lattice delta + arg <c e^{2 pi i (phi - W)}>
+      / 2 pi, the phasors pooled per lattice node (nearest node) and box-averaged over +-R nodes: the sub-turn from the phase, the
+      integers from the model (the slab fits change no integers on the 1667 / P4 GT boxes, only the sub-turn). */
+typedef struct {
+    const fit_model *m; const fit_fields *f; int zoff, z0, z1, step, band, nb; double h, c0;
+    const int *rows; int nrows;                 /* task k: the field rows rows[k] .. rows[k + 1] - 1 (all nearest the same lattice z node) */
+    double (*bacc)[5];                          /* per thread x band: re, im, c, sum w s, sum w */
+    float *lre, *lim;                           /* lattice accumulators (nullptr: no --out) */
+} cf_dm2;
+static void cf_dm2_run(void *a_, long k0, long k1, int t) {
+    cf_dm2 *C = a_; const fit_fields *f = C->f; const fit_model *m = C->m; const size_t HW = (size_t)f->H * f->W; const double h = C->h, e = h;
+    for (long k = k0; k < k1; k++) for (int z = C->rows[k]; z < C->rows[k + 1]; z++) {
+        if ((z - C->z0) % C->step) continue;
+        const int b = z / C->band; if (b >= C->nb) continue; double *A = C->bacc[(size_t)t * C->nb + b];
+        for (int y = 0; y < f->H; y += C->step) for (int x = 0; x < f->W; x += C->step) {
+            const size_t i = (size_t)(z - C->zoff) * HW + (size_t)y * f->W + x; if (!f->w[i]) continue;
+            const double pc = (f->pc[i] - 128) / 127.0, ps = (f->ps[i] - 128) / 127.0, c = hypot(pc, ps); if (c < C->c0) continue;
+            const double pz = (z + 0.5) * h, py = (y + 0.5) * h, px = (x + 0.5) * h, W0 = fit_W(m, pz, py, px);
+            const double r = atan2(ps, pc) / (2 * M_PI) - W0, cr = c * cos(2 * M_PI * r), si = c * sin(2 * M_PI * r);
+            A[0] += cr; A[1] += si; A[2] += c;
+            double n[3]; const double l = cf_axis(f, i, n);
+            if (l > 0.5) {
+                const double g[3] = {(fit_W(m, pz + e, py, px) - fit_W(m, pz - e, py, px)) / (2 * e), (fit_W(m, pz, py + e, px) - fit_W(m, pz, py - e, px)) / (2 * e),
+                                     (fit_W(m, pz, py, px + e) - fit_W(m, pz, py, px - e)) / (2 * e)};
+                double u[3] = {-n[0] * n[0], -n[0] * n[1], -n[0] * n[2]}; u[0] += 1; const double ul = sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+                if (ul > 0.3) { const double uz = u[0] / ul, s = (g[0] * u[0] + g[1] * u[1] + g[2] * u[2]) / ul, w = c * l; A[3] += w * s * uz; A[4] += w * uz * uz; }
+                /* sum w uz s / sum w uz^2: the weighted mean of s / uz, the W gained per native voxel of height moving along the sheet */
+            }
+            if (C->lre) {
+                const long a = lround(pz / m->L), bb = lround(py / m->L), cc = lround(px / m->L);
+                if (a >= 0 && a < m->lz && bb >= 0 && bb < m->ly && cc >= 0 && cc < m->lx) { const size_t j = ((size_t)a * m->ly + bb) * m->lx + cc; C->lre[j] += (float)cr; C->lim[j] += (float)si; }
+            }
+        }
+    }
+}
+int cmd_cf_demod(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm cf-demod <model> <fields> [--out DIR] [--R 1] [--band 64] [--step 2] [--cz 32] [--c0 0.1] [--drift-max 0] [--threads N]\n"); return 2; }
+    fit_model *m = fit_load(argv[2]); if (!m) { fprintf(stderr, "cf-demod: cannot load the model %s\n", argv[2]); return 1; }
+    const char *out = cf_opt(argc, argv, "--out", ""); const int R = atoi(cf_opt(argc, argv, "--R", "1")), band = atoi(cf_opt(argc, argv, "--band", "64"));
+    const int step = atoi(cf_opt(argc, argv, "--step", "2")), CZ = atoi(cf_opt(argc, argv, "--cz", "32")); const double c0 = atof(cf_opt(argc, argv, "--c0", "0.1")), dmax = atof(cf_opt(argc, argv, "--drift-max", "0"));
+    if (R < 0 || band < 1 || step < 1 || CZ < 1) { fprintf(stderr, "cf-demod: --R >= 0, --band, --step, --cz >= 1\n"); return 2; }
+    cf_nt = ufsm_threads(atoi(cf_opt(argc, argv, "--threads", "0")), 8);
+    fit_fields_skip_planes(1 | 2 | 8);
+    fit_fields_buf g; if (fit_fields_load(argv[3], 0, 0, 0, &g)) { fprintf(stderr, "cf-demod: cannot load %s\n", argv[3]); return 1; }
+    const int D = g.shape[0]; const double h = g.h; fit_fields_free(&g);
+    if (m->D != D || fabs(m->h - h) > 1e-9) fprintf(stderr, "cf-demod: WARNING: model box %d rows h %g vs fields %d rows h %g (a crop? positions are box-local)\n", m->D, m->h, D, h);
+    const int nb = (D + band - 1) / band; double (*bacc)[5] = calloc((size_t)CF_MAXT * nb, sizeof *bacc);
+    const size_t nl = (size_t)m->lz * m->ly * m->lx; float *lre = *out ? calloc(nl, 4) : nullptr, *lim = *out ? calloc(nl, 4) : nullptr;
+    if (!bacc || (*out && (!lre || !lim))) { fprintf(stderr, "cf-demod: out of memory\n"); return 1; }
+    int *rows = malloc((size_t)(CZ + 2) * sizeof *rows); const double t0 = cf_now();
+    cf_pre pre = {0}; cf_pre_start(&pre, argv[3], 0, CZ < D ? CZ : D, 1);
+    for (int z0 = 0; z0 < D; z0 += CZ) {
+        const int z1 = z0 + CZ < D ? z0 + CZ : D; fit_fields_buf fb; if (cf_pre_take(&pre, &fb)) return 1;
+        if (z1 < D) cf_pre_start(&pre, argv[3], z1, z1 + CZ < D ? z1 + CZ : D, 1);
+        int nr = 0; long prev = LONG_MIN;   /* group the rows by their nearest lattice z node: tasks never share a node */
+        for (int z = z0; z < z1; z++) { const long a = lround((z + 0.5) * h / m->L); if (a != prev) { rows[nr++] = z; prev = a; } }
+        rows[nr] = z1;
+        cf_dm2 C = {m, &fb.f, z0, z0, z1, step, band, nb, h, c0, rows, nr, bacc, lre, lim};
+        cf_par(nr, cf_dm2_run, &C); cf_pre_give(&pre, &fb);
+    }
+    if (pre.has_nxt) fit_fields_free(&pre.nxt);
+    printf("cf-demod: %s on %s: %d rows in bands of %d, every %d cells, %.1f s\n", argv[2], argv[3], D, band, step, cf_now() - t0);
+    printf("cf-demod: band  z0(native)  cells  coherence  resid(turn)  resid_unwrapped  dW/dz_sheet(turn/band)  along_sheet_cum\n");
+    /* the excursions count only the bands with >= 1/4 of the fullest band's phase weight: the scroll's end bands (a few cells of a
+       cap) swing by turns (P4 band 1: -4.7, 1667 band 0: -1.0) and are no evidence of a drift */
+    double smax = 0; for (int b = 0; b < nb; b++) { double c = 0; for (int t = 0; t < CF_MAXT; t++) c += bacc[(size_t)t * nb + b][2]; smax = fmax(smax, c); }
+    double prevang = 0, unw = 0, cum = 0, umin = 1e30, umax = -1e30, cmin = 1e30, cmax = -1e30; int first = 1;
+    for (int b = 0; b < nb; b++) {
+        double s[5] = {0}; for (int t = 0; t < CF_MAXT; t++) for (int k = 0; k < 5; k++) s[k] += bacc[(size_t)t * nb + b][k];
+        if (s[2] <= 0) continue;
+        const int full = s[2] >= 0.25 * smax;
+        const double ang = atan2(s[1], s[0]) / (2 * M_PI), coh = hypot(s[0], s[1]) / s[2];
+        if (first) { unw = ang; first = 0; } else { double d = ang - prevang; d -= floor(d + 0.5); unw += d; }
+        prevang = ang; const double hb = (b + 1 < nb ? band : D - b * band) * h, dz = s[4] > 0 ? s[3] / s[4] * hb : 0; cum += dz;
+        if (full) { umin = fmin(umin, unw); umax = fmax(umax, unw); cmin = fmin(cmin, cum); cmax = fmax(cmax, cum); }
+        printf("cf-demod: %4d  %8.0f  %8.0f  %.3f  %+.3f  %+.3f  %+.4f  %+.3f%s\n", b, b * band * h, s[2], coh, ang, unw, dz, cum, full ? "" : "  (end band: not counted)");
+    }
+    const double drift = cmax > cmin ? cmax - cmin : 0; if (!(umax > umin)) umin = umax = 0;
+    printf("cf-demod: z drift: along-sheet excursion %.2f turns (end %+.2f), residual-phase excursion %.2f turns%s\n", drift, cum, umax - umin,
+           dmax > 0 && drift > dmax ? " -- ALARM: above --drift-max" : "");
+    int rc = dmax > 0 && drift > dmax ? 3 : 0;
+    if (*out) {   /* +-R box average of the node phasors (separable, clamped), then delta += arg / 2 pi */
+        float *tmp = malloc((size_t)(m->lz > m->ly ? (m->lz > m->lx ? m->lz : m->lx) : (m->ly > m->lx ? m->ly : m->lx)) * 4);
+        const int dm[3] = {m->lz, m->ly, m->lx}; const size_t st[3] = {(size_t)m->ly * m->lx, (size_t)m->lx, 1};
+        for (int ax = 0; ax < 3 && R > 0; ax++) for (float *v = lre; v; v = v == lre ? lim : nullptr) {
+            const int a1 = ax == 0 ? 1 : 0, a2 = ax == 2 ? 1 : 2;
+            for (int p = 0; p < dm[a1]; p++) for (int q = 0; q < dm[a2]; q++) {
+                float *b0 = v + p * st[a1] + q * st[a2]; double s = 0; const int n = dm[ax];
+                for (int k = 0; k <= R && k < n; k++) s += b0[k * st[ax]];
+                for (int k = 0; k < n; k++) { tmp[k] = (float)s; if (k + R + 1 < n) s += b0[(k + R + 1) * st[ax]]; if (k - R >= 0) s -= b0[(k - R) * st[ax]]; }
+                for (int k = 0; k < n; k++) b0[k * st[ax]] = tmp[k];
+            }
+        }
+        size_t nset = 0; double sabs = 0;
+        for (size_t j = 0; j < nl; j++) if (lre[j] != 0 || lim[j] != 0) { const double c = atan2(lim[j], lre[j]) / (2 * M_PI); m->delta[j] += (float)c; nset++; sabs += fabs(c); }
+        free(tmp);
+        if (fit_save(m, out)) { fprintf(stderr, "cf-demod: cannot write %s\n", out); return 1; }
+        printf("cf-demod: demodulated model (R %d nodes, lattice %d native) -> %s: %zu of %zu nodes corrected, mean |correction| %.3f turn\n", R, m->L, out, nset, nl, nset ? sabs / nset : 0);
+    }
+    free(bacc); free(lre); free(lim); free(rows); fit_free(m);
+    fit_fields_skip_planes(0);   /* (process-wide: a later load in this process, e.g. a test's count-field, needs sp again) */
+    return rc;
 }

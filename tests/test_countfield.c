@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 int cmd_count_field(int argc, char **argv);
+int cmd_cf_demod(int argc, char **argv);
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { fails++; fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
 
@@ -128,6 +129,33 @@ int main(void) {
             const double d = fit_W(m, 3.5 * h, (y + 0.5) * h, (x + 0.5) * h) - wc[i]; me += fabs(d - round(d)); nm++;
         }
         CHECK(nm > 100 && me / nm < 0.15, "model W vs wc: mean |frac error| %.3f (%d points)", nm ? me / nm : 1, nm);
+        /* ufsm cf-demod (audit ugeom #2 / #5): the model with a 0.3-turn sub-turn error -> --out restores the phase's sub-turn where the
+           phase is right (lower half), integers kept; no z drift on this z-invariant spiral; a model with W rising 0.1 turn per native
+           voxel of height (along the radial sheets) trips --drift-max */
+        char m2[600], m3[600], m4[600]; snprintf(m2, sizeof m2, "%s/model_off", dir); snprintf(m3, sizeof m3, "%s/model_dm", dir); snprintf(m4, sizeof m4, "%s/model_dz", dir);
+        const size_t nl = (size_t)m->lz * m->ly * m->lx;
+        for (size_t j = 0; j < nl; j++) m->delta[j] += 0.3f;
+        CHECK(fit_save(m, m2) == 0, "cannot save the offset model");
+        char *ad[] = {"ufsm", "cf-demod", m2, in, "--out", m3, "--R", "1", "--step", "1", "--band", "2", "--drift-max", "0.3", "--threads", "2", nullptr};
+        CHECK(cmd_cf_demod(16, ad) == 0, "cf-demod on the z-invariant spiral failed or saw a drift");
+        fit_model *md = fit_load(m3), *mo = fit_load(m2); CHECK(md && mo, "no cf-demod model");
+        if (md && mo) {
+            double eo = 0, ed = 0, ei = 0; int nd = 0;
+            for (int y = 0; y < H; y += 3) for (int x = 0; x < W; x += 3) {
+                const double py = (y + 0.5) * h, px = (x + 0.5) * h, r = hypot(py - cy0, px - cx0), th = atan2(py - cy0, px - cx0);
+                if (r < 6 * p || r > 44 * h || th > -0.3) continue;
+                double a = fit_W(mo, 3.5 * h, py, px) - trueW(py, px), b = fit_W(md, 3.5 * h, py, px) - trueW(py, px);
+                ei += fabs(round(b) - round(a - 0.3)); a -= round(a); b -= round(b); eo += fabs(a); ed += fabs(b); nd++;
+            }
+            printf("test_countfield: cf-demod: |frac error| %.3f -> %.3f turn over %d cells, integer changes %.3f\n", eo / nd, ed / nd, nd, ei / nd);
+            CHECK(nd > 100 && ed / nd < 0.08 && eo / nd > 0.2 && ei / nd < 0.05, "cf-demod: |frac error| %.3f -> %.3f, integer changes %.3f", eo / nd, ed / nd, ei / nd);
+        }
+        if (md) fit_free(md);
+        if (mo) fit_free(mo);
+        for (int a = 0; a < m->lz; a++) for (size_t j = 0; j < (size_t)m->ly * m->lx; j++) m->delta[(size_t)a * m->ly * m->lx + j] += (float)(0.1 * a * m->L);
+        CHECK(fit_save(m, m4) == 0, "cannot save the drift model");
+        char *az[] = {"ufsm", "cf-demod", m4, in, "--step", "1", "--band", "2", "--drift-max", "0.3", "--threads", "2", nullptr};
+        CHECK(cmd_cf_demod(12, az) == 3, "cf-demod: a W rising 0.1 turn per voxel of height did not trip --drift-max");
         fit_free(m);
     }
     fit_fields_free(&ob);
