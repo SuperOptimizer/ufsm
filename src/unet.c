@@ -146,6 +146,7 @@ struct unet {
     int mx_caut, mx_qkv;                         /* --muon-cautious 1, --muon-qkv-split 1 */
     int ost_arm, ost_have, ost_ngrp, ost_nseg; double *ost_dev; float *ost_snap; size_t ost_snap_n;   /* --opt-stats: armed / collected, the device sums, the AdamW snapshot */
     signed char ost_grp[UNET_MAXCONV]; size_t *ost_seg;                 /* each Muon descriptor's stats group; AdamW segments (off, n, group) */
+    float am_attn, am_out, *am_dev, am_h[UNET_MAXCONV]; unsigned char am_tr[UNET_MAXCONV]; int am_n;   /* --attn-muon-lr / --attn-muon-lr-out: per-descriptor Muon lr multipliers (host, device) */
     int ad_lars, ad_dog; float ad_tgt, ad_b, ad_c, ad_dogmax, ad_lrpeak;   /* adaptive Muon (unet_set_muon_adapt): (b) per-layer control, (c) DoG */
     float *ad_lrm, *ad_ema, *ad_dispbuf, **ad_dispp; double *ad_dogst, *ad_part;   /* their device state */
     float ad_ema_load[UNET_MAXCONV]; int ad_ema_nload; double ad_dog_load[3]; int ad_dog_nload;   /* from a checkpoint, uploaded at the next step */
@@ -532,7 +533,7 @@ void unet_free(unet *u) {
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp); nn_free(u->nf_cnt);
     nn_free(u->wm); nn_free(u->sp24_kb); if (u->muon_mom != u->v) nn_free(u->muon_mom); nn_free(u->muon_work);   /* (aliased into v: mom_alloc) */ muon_forget_table(u); nn_free(u->muon_descs); nn_free(u->mx_lrm); nn_free(u->stem_b);
     nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); nn_free(u->mx_nmrows); nn_free(u->mx_nmoff); nn_free(u->mx_vrbuf); nn_free(u->mx_vrp); nn_kron_free(u->mx_kron); nn_free(u->qk_lmax); nn_free(u->mx_mixbuf); nn_free(u->mx_mixp);
-    nn_free(u->ad_lrm); nn_free(u->ad_ema); nn_free(u->ad_dispbuf); nn_free(u->ad_dispp); nn_free(u->ad_dogst); nn_free(u->ad_part); nn_free(u->ost_dev); nn_free(u->ost_snap); free(u->ost_seg);
+    nn_free(u->am_dev); nn_free(u->ad_lrm); nn_free(u->ad_ema); nn_free(u->ad_dispbuf); nn_free(u->ad_dispp); nn_free(u->ad_dogst); nn_free(u->ad_part); nn_free(u->ost_dev); nn_free(u->ost_snap); free(u->ost_seg);
     free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_pv); nn_free(u->ge_tw); nn_free(u->gf_g); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs); nn_free(u->ds_g16); nn_free(u->ds_tmp);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
@@ -4329,6 +4330,34 @@ static int mx_any(const unet *u) { return u->mx_c || u->mx_hb || u->mx_ns || u->
 void unet_set_muon_adapt(unet *u, int lars, float tgt, float beta, float clamp, int dog, float dog_max, float lr_peak) {
     u->ad_lars = lars; u->ad_tgt = tgt; u->ad_b = beta; u->ad_c = clamp; u->ad_dog = dog; u->ad_dogmax = dog_max; u->ad_lrpeak = lr_peak;
 }
+/* --attn-muon-lr F / --attn-muon-lr-out F2 (audit 2026-11-14 train #3): the attention stage's linears at F x the Muon lr, the out-projections
+   wo / w2 (tbm[k][1], [3]; zero-initialised, so Muon's fixed-size step is a large relative step while |W| is small) at F x F2. Plain
+   batched Muon: one nn_muon_batch per run of equal multipliers; the ext path (--normuon etc.): nn_madapt.base. 0 or 1: off.
+   (UFSM_MUON_UNBATCHED's per-conv reference path, muon_conv, ignores the multipliers.) */
+void unet_set_attn_muon_lr(unet *u, float all, float out) { u->am_attn = all; u->am_out = out; u->am_n = 0; }
+static int am_on(const unet *u) { return u->tbn && ((u->am_attn > 0.f && u->am_attn != 1.f) || (u->am_out > 0.f && u->am_out != 1.f)); }
+static void am_build(unet *u) {   /* each descriptor's multiplier from its weight offset (a --muon-qkv-split slice lies inside its tbm[k][0]) */
+    if (u->am_n == u->muon_nconv) return;
+    muon_desc_t *h = malloc(sizeof *h * (size_t)u->muon_nconv); nn_d2h(h, u->muon_descs, sizeof *h * (size_t)u->muon_nconv);
+    const float fa = u->am_attn > 0.f ? u->am_attn : 1.f, fo = u->am_out > 0.f ? u->am_out : 1.f;
+    for (int i = 0; i < u->muon_nconv; i++) {
+        const size_t off = (size_t)(h[i].p - u->p); u->am_h[i] = 1.f; u->am_tr[i] = off < u->tb_p0;
+        for (int k = 0; k < u->tbn; k++) for (int j = 0; j < 4; j++) {
+            const convp *c = &u->tbm[k][j]; const size_t n = (size_t)c->cout * c->cin * c->k * c->k * c->k;
+            if (off >= c->w && off < c->w + n) u->am_h[i] = fa * (j == 1 || j == 3 ? fo : 1.f);
+        }
+    }
+    free(h);
+    if (!u->am_dev) u->am_dev = nn_malloc(sizeof(float) * UNET_MAXCONV);
+    nn_h2d(u->am_dev, u->am_h, sizeof(float) * (size_t)u->muon_nconv); u->am_n = u->muon_nconv;
+}
+static void muon_batch(unet *u, int i0, int n, float lr, float beta, float wd);
+static void am_muon(unet *u, float lr, float beta, float wd) {   /* plain batched Muon, one batch per run of equal multipliers (trunk_lr folded in) */
+    am_build(u);
+    float m[UNET_MAXCONV];
+    for (int i = 0; i < u->muon_nconv; i++) m[i] = u->am_h[i] * (trunk_lr_on(u) && u->am_tr[i] ? u->trunk_lr : 1.f);
+    for (int a = 0; a < u->muon_nconv;) { int e = a + 1; while (e < u->muon_nconv && m[e] == m[a]) e++; muon_batch(u, a, e - a, lr * m[a], beta, wd); a = e; }
+}
 static void ad_setup(unet *u, const muon_build_t *b, float beta) {   /* nn_muon_ext_adapt for this step's ext batch (state allocated once) */
     const int n = b->n;
     if (!u->ad_lrm) {
@@ -4353,7 +4382,7 @@ static void ad_setup(unet *u, const muon_build_t *b, float beta) {   /* nn_muon_
     const nn_madapt a = {.lrm = u->ad_lrm, .ema = u->ad_ema, .dog = u->ad_dogst, .disp = u->ad_dispp, .part = u->ad_part, .lr_peak = u->ad_lrpeak,
                          .lars_tgt = u->ad_tgt, .lars_b = u->ad_b, .lars_c = u->ad_c, .dog_eta0 = u->ad_lrpeak, .dog_max = u->ad_dogmax * u->ad_lrpeak,
                          .dog_kappa = (1.f + beta) / (1.f - beta),
-                         .on_lars = u->ad_lars, .on_dog = u->ad_dog};
+                         .on_lars = u->ad_lars, .on_dog = u->ad_dog, .base = am_on(u) ? (am_build(u), u->am_dev) : nullptr};
     nn_muon_ext_adapt(&a);
 }
 typedef struct { int i; int hb[UNET_MAXCONV]; int on; } hb_build_t;
@@ -4450,7 +4479,7 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
         nn_muon_ext_lrmult(nullptr);
         return;
     }
-    if (u->ad_lars || u->ad_dog) ad_setup(u, b, beta);
+    if (u->ad_lars || u->ad_dog || am_on(u)) ad_setup(u, b, beta);
     nn_muon_ext_lrmult(lrm0);
     nn_muon_ext_batch(u->muon_descs, n, u->muon_maxco, u->muon_maxk, u->mx_c ? u->mx_mcd : nullptr, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
                       u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr, u->mx_ns, nr, u->mx_nmoff, u->mx_nmtot, b2, vp, vg);
@@ -4612,7 +4641,10 @@ void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, floa
     } else {
         if (!u->muon_descs) { muon_build_t b = {0}; muon_table(u, &b); }
         if (inh_on(u) && !u->muon_part) { fprintf(stderr, "unet: --init-lr-mult set after the Muon table was built\n"); abort(); }
-        if (inh_on(u)) {   /* the inherited convs first (muon_table), then the fresh ones */
+        if (am_on(u)) {
+            if (inh_on(u)) { fprintf(stderr, "unet: --attn-muon-lr is not supported with --init-lr-mult\n"); abort(); }
+            am_muon(u, lr_muon, beta, wd);
+        } else if (inh_on(u)) {   /* the inherited convs first (muon_table), then the fresh ones */
             const int ni = u->muon_ninh, nf = u->muon_nconv - ni;
             if (ni) muon_batch(u, 0, ni, lr_muon * u->init_lr, beta, wd);
             if (nf) muon_batch(u, ni, nf, lr_muon, beta, wd);

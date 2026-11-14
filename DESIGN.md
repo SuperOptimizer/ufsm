@@ -6,6 +6,27 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Attention Muon-LR multiplier and the accum A/B prep (2026-11-14, branch attnlr2-20261114; admuon's code, committed by perf2)
+
+Audit 2026-11-14 train #3 and #8. Both default off; nothing changes without the flags.
+- **#3 `--attn-muon-lr F [--attn-muon-lr-out F2]`:** the attention stage's Muon linears step at F x the Muon lr. The zero-initialised
+  out-projections wo / w2 step at F x F2: Muon's update has a fixed size, so while |W| is small it is a large relative step.
+  - Each Muon descriptor gets a multiplier from its weight offset (a --muon-qkv-split slice lies inside its tbm[k][0]).
+  - Plain batched Muon: one nn_muon_batch per run of equal multipliers, with trunk_lr folded in. The ext path (--normuon etc.):
+    nn_madapt.base, multiplied into ad_ctl_k's per-matrix multiplier, so it composes with --muon-lars.
+  - Needs --opt muon. Not supported with --muon-c / --hyperball / --init-lr-mult.
+  - test_attnlr: one step of a small attention U-Net with F 0.5, F2 0.2 against one without, on the same weights and gradients. Every
+    parameter's change is identical (convs, AdamW), F x (q/k/v, w1), or F x F2 x (wo, w2) the reference's. Checked on plain and
+    ext (normuon) Muon.
+  - --opt-stats N logs the attention linears' update / weight ratios (its own group), which F / F2 are to be picked from. The values are not chosen yet (a GPU measurement).
+- **#8 scripts/audit/ab_accum.sh:** --accum 5 at try6's lr (Muon 0.003 / AdamW 3e-4) against --accum 2 at lr x 0.77 (0.00231 /
+  2.31e-4).
+  - Both arms start --init-from the same try6 checkpoint with --det 1 and one seed, so the window stream is the same and equal windows
+    mean the same data. The scratch2 net runs single-card at P 512 on the wind fixture, with WSD warmup 50 and cooldown 0.2.
+  - `--summary OUTDIR` pairs the arms' log lines at equal windows: loss / phase / wind4 / acc / kl, over the cooldown and windows
+    1000-1400.
+  - Prepared only. It runs on a pod under `flock /root/gpu.lock timeout -k 10`.
+
 ## Head-gradient plane scale chosen on the device: no host sync (2026-11-14, branch hgsdev-20261114)
 
 Follow-up to the section below (main, audit pass 2): hgs_choose cost one nn_sync and nine small readbacks per window between the
