@@ -35,6 +35,15 @@ for g in -1 0; do [ $g = 0 ] && ! nvidia-smi -L > /dev/null 2>&1 && continue
   # (GPU: the pooled view's tiles decoded and pooled on the device, codes_pool.h / k_codes_pool2; before 2026-11-12 on the CPU)
   [ $g = 0 ] && ! grep -qE ' ([1-9][0-9]*) of \1 tiles decoded on the GPU' p2$g.log && { echo "FAIL: pooled onfly tiles not all decoded on the GPU ($D/p2$g.log)"; exit 1; }
 done
+# the device decode in z slabs of the reserved buffers (nn_band.cu bg_codes_run, 2026-11-13): a 1 MB slab buffer and a 3 MB blob buffer (one raw chunk: 2 MB)
+# split every pooled and unpooled tile into several slabs (each slab's chunks and blob range uploaded alone); the same bytes, all on the GPU
+if nvidia-smi -L > /dev/null 2>&1; then
+  for k in ph:4.8:0:100 pg4:9.6:1:48; do IFS=: read r um p2 pp <<< "$k"
+    UFSM_BAND_SLAB_MB=1 UFSM_BAND_BLOB_MB=3 "$U" phase-onfly fx/band 1 --pool2 $p2 --rmax 12 --ref $r $um --windows 4 --P $pp --gpu 0 --budget-mb 64 --threads 4 > sl$p2.log 2>&1 \
+      || { echo "FAIL: slabbed device decode differs (pool2 $p2, $D/sl$p2.log)"; tail -2 sl$p2.log; exit 1; }
+    grep -qE ' ([1-9][0-9]*) of \1 tiles decoded on the GPU' sl$p2.log || { echo "FAIL: slabbed tiles not all on the GPU (pool2 $p2, $D/sl$p2.log)"; tail -1 sl$p2.log; exit 1; }
+  done
+fi
 F=$(readlink -f fx); P=$(readlink -f ph)
 python3 - "$F" "$P" <<'PY'
 import json, sys
