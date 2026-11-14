@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The fp16 gradient scale of the head slabs (DESIGN 2026-11-14 "fp16 dead zone"), on the wind fixture, --det:
 #  (1) one P 256 latent step at --gscale 1024, 65536 and 2^20 (lr 0, UFSM_HSG_ZERO=1, UFSM_LATG_DUMP): at 1024 a share of the supervised
-#      voxels' fp16 logit gradients is 0 / subnormal, at 65536 fewer; the finished cell gradients / the scale against the 2^20 run's:
-#      the 65536 run is closer than the 1024 run (the dead zone's error), and close (rel L2 < 1e-2);
+#      voxels' fp16 logit gradients is 0 / subnormal, at 65536 not more (the lines are the dead-zone measurement: before the head
+#      planes' own scale most of the phase / wind4 gradients sit there); the finished cell gradients / the scale against the 2^20 run's:
+#      the 65536 run no farther than the 1024 run, and close (rel L2 < 1e-2);
 #  (2) --gscale-grow 2 --gscale-max 4096: the scale doubles at steps 2 and 4 and stops; the checkpoint's "trainstate" holds 4096 and a
 #      resume starts from it;
 #  (3) the step lines carry the heads' KL group "(kl phase .. rv .. normal .. wind4 ..; phase error .. deg)": finite, >= 0 (to rounding),
@@ -29,13 +30,13 @@ def zr(gs):
     return [float(x) for x in m.groups()]
 a, b = zr(1024), zr(65536)
 print(f"  (1) zero share at 1024 / 65536: phase {a[1]:.2f} / {b[1]:.2f} %, rv {a[4]:.2f} / {b[4]:.2f} %, wind4 {a[7]:.2f} / {b[7]:.2f} %")
-ok = a[0] > 0 and a[6] > 0 and b[1] < a[1] and b[7] < a[7] and (a[1] > 0 or a[7] > 0)
+ok = a[0] > 0 and a[6] > 0 and b[1] <= a[1] + 0.05 and b[7] <= a[7] + 0.05   # (with the head planes' own scale, hgscale, both are ~0)
 g = {gs: np.fromfile(f'latg_{gs}.f16', np.float16).astype(np.float64) / gs for gs in (1024, 65536, 1048576)}
 ref = g[1048576]; n = np.linalg.norm(ref)
 e1, e2 = np.linalg.norm(g[1024] - ref) / n, np.linalg.norm(g[65536] - ref) / n
 z1, z2 = np.mean((g[1024] == 0) & (ref != 0)), np.mean((g[65536] == 0) & (ref != 0))
 print(f"  (1) cell gradients vs the 2^20 run: rel L2 {e1:.3e} at 1024, {e2:.3e} at 65536; cells zero where 2^20 is not: {100*z1:.2f} % / {100*z2:.2f} %")
-ok = ok and e2 < e1 and e2 < 1e-2 and np.isfinite(ref).all()
+ok = ok and e2 <= e1 * 1.01 + 1e-9 and e2 < 1e-2 and np.isfinite(ref).all()
 sys.exit(0 if ok else 1)
 PY
 [ $? -eq 0 ] || fail "(1) dead zone numbers"
