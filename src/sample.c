@@ -3596,6 +3596,9 @@ static void *worker(void *arg) {
             else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); if (++fail > 20) { fprintf(stderr, "sampler: 20 consecutive read failures, stopping\n"); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); } }
         }
         worker_trim();
+        { static int dly = -1; if (dly < 0) dly = getenv("UFSM_SAMPLER_DELAY_MS") ? atoi(getenv("UFSM_SAMPLER_DELAY_MS")) : 0;   /* (tests: a slow data path
+                                                                                                                    whatever the GPU's speed, test_echo) */
+          if (dly > 0) usleep((useconds_t)dly * 1000); }
         pthread_mutex_lock(&sp->mu);
         sp->state[k] = filled == sp->cfg.B && !atomic_load(&sp->stop) ? READY : FREE;
         if (sp->rleft) sp->rleft[k] = sp->cfg.echo_max > 0 ? sp->cfg.echo_max : sp->cfg.replay - 1;
