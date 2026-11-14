@@ -105,7 +105,8 @@ int cmd_wbench_stats(int argc, char **argv) {
         if (nx) printf("    label-noise  %3d boxes  A %.4f  (ceil %.4f; not in the mean)\n", nx, sx / nx, sxc / nx);
         for (int s = 0; s < ns; s++) {
             double a = 0, b = 0; for (int q = 0; q < cnt[s]; q++) { a += A.row[idx[mem[s][q]]].v[ia]; if (pb) b += B.row[jb[mem[s][q]]].v[ibb]; }
-            printf("    %-12s %3d boxes  A %.4f", sname[s], cnt[s], a / cnt[s]); if (pb) printf("  B %.4f  A-B %+.4f", b / cnt[s], (a - b) / cnt[s]); printf("\n");
+            printf("    %-12s %3d boxes  A %.4f", sname[s], cnt[s], a / cnt[s]); if (pb) printf("  B %.4f  A-B %+.4f", b / cnt[s], (a - b) / cnt[s]);
+            printf("%s\n", cnt[s] < 8 ? "  (under 8 boxes: a bootstrap inside this scroll under-covers, its share of the CI is too narrow)" : "");   /* (audit eval#20: paris4 n 4) */
         }
         if (pbox) for (int i = 0; i < n; i++) { printf("      %-10s %-12s A %.4f", A.row[idx[i]].box, A.row[idx[i]].scroll, A.row[idx[i]].v[ia]); if (pb) printf("  B %.4f  A-B %+.4f", B.row[jb[i]].v[ibb], A.row[idx[i]].v[ia] - B.row[jb[i]].v[ibb]); printf("\n"); }
         free(ba); free(bb); free(bd);
