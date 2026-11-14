@@ -6,6 +6,54 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Ops fixes from the 11-14 audit: the merge gate, GPU locks, the health watcher (2026-11-14, branch opsfix-20261114)
+
+Audit: /vesuvius/ufsm/audit-20261114/ops.md. Each piece below has its own commit; the numbered items are the audit's.
+
+**#2 the merge gate.** Every desk suite on 11-14 ran `-g none` (scratch2 holds the cards). They skipped 181-185 GPU tests and printed
+ALL PASSED. Meanwhile test_lldec (2dd6744) failed on every pod run until fixtests-20261114.
+- tests/run_suite.sh reports a GPU test it did not run as NOGPU (no GPU / `-g none`), BUSY (its card stayed held) or NEED2 (a gpu2
+  test on one GPU without the `l2` tag). It then exits 3 with `INCOMPLETE: N GPU tests not run`.
+- The exit codes: 0 all passed, 1 a FAIL / TIMEOUT, 3 incomplete, 2 usage. `-I` makes 3 into 0 for the edit loop.
+- scripts/test/pod_gate.sh REF is the GPU half of a merge. It runs `run_suite.sh -c <merge base>` on the perf pod:
+  - it pushes to /root/gate/repo.git and clones per sha, so `-c` can diff;
+  - it builds `-j 6` under /root/build.lock and /root/gpu.lock (never beside an A/B timing run);
+  - the run is under `timeout` inside the flock.
+
+**#7 GPU locks.** A test now also holds `gpu<i>.excl` shared (`flock -s`); a training run takes it exclusively. The old slot-only scheme
+leaked:
+- scratch2 held slots .0 / .1;
+- the runner sizes slots by free memory (up to 8);
+- a suite started while the cards read free took .2+ and later ran beside the restarted trainer.
+
+A card with a foreign compute process (>= 1 GB, no UFSM_SUITE_TEST in its environment) counts as held too, until the trainers take the
+lock (merger2's launch work). A held card is reported once: `test_x waits for GPU 1: held by <pid> <cmd>`.
+- After `-W` s (default 300) the test is BUSY.
+- Later tests give up on the same card at once.
+- Before, a GPU suite started beside scratch2 polled forever without a word.
+
+**#18.** The runner deletes this user's old default output dirs (more than 2 days old, runner gone; failed runs kept them on tmpfs).
+test_latvol.sh and test_ct_gpu_decode.sh make their scratch dirs under $TMPDIR.
+
+**test_run_suite** (CPU, 17 s) checks this contract on a mock manifest:
+- exit 3 and NOGPU under `-g none`;
+- `-I`;
+- exit 1 beats 3;
+- NEED2;
+- BUSY with the holder named, under a held exclusive lock.
+
+Desk check against the live trainer (`-W 20`): its three GPU tests went BUSY after 20 s, naming
+`ufsm.scratch2.5e8aab7 train ... (13654 MiB on GPU 1, not a suite test)`.
+
+**#3 the health watcher.** scratch2.health.py was not running on 11-14 (its files had moved with try5), and its limits were the old
+104 GB slice. scripts/run/health.py RUN is the same set of checks, generalised, run as the systemd --user service `ufsm-health@RUN`
+(scripts/run/install_health.sh; Restart=always, linger on). Changes:
+- the files are re-opened by name each check;
+- the first pass replays the log for the head history without alerting;
+- memory is read from the trainer's own cgroup: the slice's anon + shmem against its memory.max (alert at 90 %), and every new
+  `oom_kill` in memory.events;
+- disks: /, the run root and the derived cache. Alert below 10 % / 50 GB free, or under 12 h to full at the measured rate.
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the

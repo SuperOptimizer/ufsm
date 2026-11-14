@@ -99,6 +99,7 @@ test_geom_check                                |              |     3 | ./$B/tes
 test_sheetpbr                                  |              |     2 | ./$B/test_sheetpbr
 test_pairacc                                   |              |     1 | ./$B/test_pairacc
 test_wbench_stats                              |              |     2 | bash tests/test_wbench_stats.sh $B/ufsm
+test_run_suite                                 |              |    17 | bash tests/test_run_suite.sh
 test_gpuq                                      | flaky        |    14 | bash tests/test_gpuq.sh
 test_robust                                    | gpu          |     1 | ./$B/test_robust
 test_reg                                       |              |    27 | ./$B/test_reg
