@@ -702,6 +702,17 @@ int cmd_count_field(int argc, char **argv) {
         if (!pref && ci + 1 < nch) { const int n0 = ord[ci + 1] * CZ; cf_pre_start(&pre, in, n0, n0 + CZ < D ? n0 + CZ : D, 0); }
     }
     if (pre.has_nxt) { fit_fields_free(&pre.nxt); pre.has_nxt = 0; }
+    if (!dir || dsrc == FIT_DIR_DEFAULT || dsrc < 0) {   /* no evidence yet: the label-free gates on 32 middle rows with every plane (the w4 planes
+        included, which --model-only skips in pass 1): fit_init_prior's ring vote, phase loops and winding-mod-4 loops (fit_dir_w4); they
+        decide only with --dir-loops 1, else they are printed beside the refusal */
+        fit_fields_skip_planes(0); fit_fields_buf wb; const int zm = D / 2, z0 = zm - 16 < 0 ? 0 : zm - 16, z1 = zm + 16 > D ? D : zm + 16;
+        if (!fit_fields_load(in, z0, z1, 1, &wb)) {
+            fit_cfg gc = fit_cfg_default(); gc.dir_loops = atoi(cf_opt(argc, argv, "--dir-loops", "0")); fit_model gm; memset(&gm, 0, sizeof gm);
+            if (!fit_init_prior(&wb.f, &gc, &gm) && gm.dir_src != FIT_DIR_DEFAULT) { dir = gm.dir; dsrc = gm.dir_src; }
+            free(gm.pitch); free(gm.offset); fit_fields_free(&wb);
+        }
+        if (mo) fit_fields_skip_planes(1 | 2);
+    }
     if (!dir) { dir = 1; dsrc = FIT_DIR_DEFAULT; }
     if (dsrc < 0) dsrc = FIT_DIR_DEFAULT;
     fprintf(stderr, "count-field: dir %+d (%s)\n", dir, fit_dir_src_name(dsrc));
