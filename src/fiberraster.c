@@ -298,34 +298,64 @@ int cmd_fiber_raster(int argc, char **argv) {
    thread keeps its last box, so reading V right after H (the sampler reads the aux planes of a window in turn) costs nothing. ---- */
 typedef struct { fr_job J; int refs; pthread_mutex_t rmu; fib_set F, XF; } fr_ctx;
 typedef struct { fr_ctx *X; int plane; } fr_plane;
-static thread_local struct { const fr_ctx *X; int64_t o[3], n[3]; size_t cap; uint8_t *ct, *o2[2]; int ok, pin; } t_fr;
+/* the planes' buffer sets: a pool shared by the reading threads (2026-11-14; before: one set per thread, 3 window-size planes pinned per
+   sampler worker that ever drew a fibre source: 3.2 GB each at P 1024, 19 GB at 6 workers, the slow RSS growth of scratch2 try3 / try4,
+   untracked by the trainer's pinned report). A read takes the set that holds its box (the V plane read right after H costs nothing, as
+   before) or the least recently used free one; UFSM_FIBRE_SETS (2) sets; a reader waits when all are busy. The bytes do not change. */
+typedef struct { const fr_ctx *X; int64_t o[3], n[3]; size_t cap; uint8_t *ct, *o2[2]; int ok, pin, busy; uint64_t used; } fr_set;
+enum { FR_SETS_MAX = 16 };
+static fr_set g_frs[FR_SETS_MAX]; static int g_nfrs; static uint64_t g_frtick;
+static pthread_mutex_t g_frmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_frcv = PTHREAD_COND_INITIALIZER;
+static fr_set *frs_take(const fr_ctx *X, const int64_t o[3], const int64_t n[3]) {
+    pthread_mutex_lock(&g_frmu);
+    if (!g_nfrs) { const char *e = getenv("UFSM_FIBRE_SETS"); g_nfrs = e && atoi(e) > 0 ? atoi(e) : 2; if (g_nfrs > FR_SETS_MAX) g_nfrs = FR_SETS_MAX; }
+    fr_set *S = nullptr;
+    for (;;) {
+        int hit = -1, lru = -1;
+        for (int k = 0; k < g_nfrs; k++) { fr_set *q = &g_frs[k];
+            if (q->ok && q->X == X && !memcmp(q->o, o, sizeof q->o) && !memcmp(q->n, n, sizeof q->n)) { hit = k; break; }
+            if (!q->busy && (lru < 0 || q->used < g_frs[lru].used)) lru = k; }
+        if (hit >= 0 && !g_frs[hit].busy) { S = &g_frs[hit]; break; }
+        if (hit < 0 && lru >= 0) { S = &g_frs[lru]; S->ok = 0; break; }
+        pthread_cond_wait(&g_frcv, &g_frmu);   /* (the box's set is in use, or every set is) */
+    }
+    S->busy = 1; S->used = ++g_frtick;
+    pthread_mutex_unlock(&g_frmu);
+    return S;
+}
+static void frs_give(fr_set *S) { pthread_mutex_lock(&g_frmu); S->busy = 0; pthread_cond_broadcast(&g_frcv); pthread_mutex_unlock(&g_frmu); }
 static int fr_onfly_read(void *vp, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     (void)base; fr_plane *P = vp; fr_ctx *X = P->X; const size_t nv = (size_t)n[0] * n[1] * n[2];
-    if (!(t_fr.X == X && !memcmp(t_fr.o, o, sizeof t_fr.o) && !memcmp(t_fr.n, n, sizeof t_fr.n) && t_fr.ok)) {
-        if (nv > t_fr.cap) {   /* (the planes pinned when the GPU path is linked: its D2H lands in them directly) */
-            for (int k = 0; k < 2; k++) { if (t_fr.pin) fibre_gpu_host_free(t_fr.o2[k]); else free(t_fr.o2[k]); }
-            if (t_fr.pin) fibre_gpu_host_free(t_fr.ct); else free(t_fr.ct);
-            t_fr.pin = fibre_gpu_host_alloc && fibre_gpu_host_free; t_fr.cap = 0;
-            t_fr.ct = t_fr.pin ? fibre_gpu_host_alloc(nv) : malloc(nv); for (int k = 0; k < 2; k++) t_fr.o2[k] = t_fr.pin ? fibre_gpu_host_alloc(nv) : malloc(nv);
-            if (!t_fr.ct || !t_fr.o2[0] || !t_fr.o2[1]) return -1;
-            t_fr.cap = nv; }
-        t_fr.ok = 0;
+    fr_set *S = frs_take(X, o, n);
+    if (!S->ok) {
+        if (nv > S->cap) {   /* (the planes pinned when the GPU path is linked: its D2H lands in them directly) */
+            for (int k = 0; k < 2; k++) { if (S->pin) fibre_gpu_host_free(S->o2[k]); else free(S->o2[k]); S->o2[k] = nullptr; }
+            if (S->pin) fibre_gpu_host_free(S->ct); else free(S->ct);
+            S->ct = nullptr; S->pin = fibre_gpu_host_alloc && fibre_gpu_host_free; S->cap = 0;
+            S->ct = S->pin ? fibre_gpu_host_alloc(nv) : malloc(nv); for (int k = 0; k < 2; k++) S->o2[k] = S->pin ? fibre_gpu_host_alloc(nv) : malloc(nv);
+            if (!S->ct || !S->o2[0] || !S->o2[1]) {
+                for (int k = 0; k < 2; k++) { if (S->pin) fibre_gpu_host_free(S->o2[k]); else free(S->o2[k]); S->o2[k] = nullptr; }
+                if (S->pin) fibre_gpu_host_free(S->ct); else free(S->ct);
+                S->ct = nullptr; frs_give(S); return -1; }
+            S->cap = nv; }
         uint8_t *dn[4] = {nullptr, nullptr, nullptr, nullptr}; t_fr_nth = nthreads > 0 ? nthreads : 1;
-        const int r = fr_box(&X->J, o, n, dn, X->J.ct ? t_fr.ct : nullptr, t_fr.o2[0], t_fr.o2[1], nullptr);
-        if (r < 0) return -1;
-        if (!r) { memset(t_fr.o2[0], 255, nv); memset(t_fr.o2[1], 255, nv); }
+        const int r = fr_box(&X->J, o, n, dn, X->J.ct ? S->ct : nullptr, S->o2[0], S->o2[1], nullptr);
+        if (r < 0) { frs_give(S); return -1; }
+        if (!r) { memset(S->o2[0], 255, nv); memset(S->o2[1], 255, nv); }
         int outside = 0; for (int k = 0; k < 3; k++) outside |= o[k] < 0 || o[k] + n[k] > X->J.shape[k];
         for (int64_t z = 0; outside && z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++) {   /* outside the shape: the stored fill */
             if (o[0] + z >= 0 && o[0] + z < X->J.shape[0] && o[1] + y >= 0 && o[1] + y < X->J.shape[1] && o[2] + x >= 0 && o[2] + x < X->J.shape[2]) continue;
-            const size_t i = ((size_t)z * n[1] + y) * n[2] + x; t_fr.o2[0][i] = t_fr.o2[1][i] = 255; }
-        t_fr.X = X; memcpy(t_fr.o, o, sizeof t_fr.o); memcpy(t_fr.n, n, sizeof t_fr.n); t_fr.ok = 1;
+            const size_t i = ((size_t)z * n[1] + y) * n[2] + x; S->o2[0][i] = S->o2[1][i] = 255; }
+        S->X = X; memcpy(S->o, o, sizeof S->o); memcpy(S->n, n, sizeof S->n); S->ok = 1;
     }
-    memcpy(out, t_fr.o2[P->plane], nv);
+    memcpy(out, S->o2[P->plane], nv);
+    frs_give(S);
     return 0;
 }
 static void fr_ctx_unref(fr_ctx *X) {
     pthread_mutex_lock(&X->rmu); const int last = --X->refs == 0; pthread_mutex_unlock(&X->rmu);
     if (!last) return;
+    pthread_mutex_lock(&g_frmu); for (int k = 0; k < g_nfrs; k++) if (g_frs[k].X == X) g_frs[k].ok = 0; pthread_mutex_unlock(&g_frmu);   /* (a later context at this address must not hit the sets) */
     if (X->J.A) afv_close(X->J.A);
     for (int e = 0; e < X->J.nX; e++) afv_close(X->J.X[e]);
     fib_free(&X->F); fib_free(&X->XF); free(X->J.fbb); free(X->J.xbb); if (X->J.ct) z3_close(X->J.ct); free(X);   /* (ct: the context's own handle; each plane's base is closed with it) */
