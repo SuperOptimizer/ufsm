@@ -17,12 +17,20 @@ The user asked for the full swap, not a staged one. On this branch:
 - `scripts/pod/setup.sh` installs mcc before the build and then fills mcudahw's JIT cache on all CPUs (`MCUDA_PRECOMPILE`), so
   the first training step does not compile 310 MB of PTX. Without /usr/bin/cc it uses the newest clang (`MCC_CC`).
 - `-g` emits DWARF 5 line tables and CFI (microc dwarf-20261114), so gdb, perf and `run_suite.sh -c` work as with clang.
-- The pin is 321211e (microc branch mcc-int-20261114: x64simd + dwarf + vec-20261114 + dwarf2: locals, types, inlined calls in gdb). vec-20261114 adds:
+- The pin is f8e3588 (microc branch mcc-int-20261114: x64simd + dwarf + vec-20261114 (bc68e68: if-conversion of small arms, float -> u8) + dwarf2: locals, types, inlined calls in gdb). vec-20261114 adds:
   - x86-64 v128 lowering, with opt_vec on: SSE2 everywhere, SSE4.1 under -march=native;
   - lane max/min from selects;
   - u8 / u16 / i32 / f32 loops widened to 4-byte lanes;
   - vectorised and scalar inline sqrt / floor / ceil / trunc / rint / lrint.
-  Host flags are now `-O3 -march=native -fno-math-errno`; the earlier 3.6x was measured at -O2, without the vectoriser. The gate
+  Host flags are now `-O3 -msse4.1 -fno-math-errno -g`. That is a fixed ISA, because binaries move between the desk and the pods;
+  mcc's output is byte-identical to its -march=native build on the desk. `-march=x86-64-v3` waits for fast intrinsics: it would
+  define __AVX2__ and switch ufsm onto the element-by-element intrinsic paths. The earlier 3.6x was measured at -O2, without the
+  vectoriser. mcc-vec's micro-benchmarks of ufsm's loop shapes, in ns per element (mcc -O2 / mcc -O3 / clang -O3 -march=native):
+  - papyrus u8 max: 0.661 / 0.033 / 0.008
+  - u8 -> float: 2.52 / 0.113 / 0.038
+  - float -> u8 clamp: 2.23 / 0.441 / 0.038
+  - 1/sqrt normalisation: 2.76 / 0.525 / 0.129
+  So mcc -O3 is still 3-12x behind clang here: 128-bit vectors against AVX2 / AVX-512. The gate
   is green on the desk at both pins (b489496 for the -g step, ae30511 now):
   - stage 0 builds clean under gcc 15 -Werror;
   - tests/c pass 150/150 with mcc's libc, with glibc, and with -g; fuzz-x64 400 seeds without a failure (mcc-vec);

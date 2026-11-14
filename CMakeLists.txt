@@ -103,9 +103,12 @@ if(UFSM_TOOLCHAIN STREQUAL "mcc")
   # -mglibc: the machine's GNU C library (libcurl, zstd, blosc and the CUDA driver are its shared libraries). mcc takes and ignores
   # -W and most -f. No immintrin.h in mcc yet: the
   # AVX2 paths are #ifdef __AVX2__ (never defined by mcc) except volcomp.h's, which VOLCOMP_NO_AVX2 turns off.
-  # -O3: mcc's loop vectoriser (SSE2; SSE4.1 where -march=native finds it in /proc/cpuinfo, defining no macros); -fno-math-errno:
-  # sqrt in line, as with clang; -g: DWARF 5 lines + CFI (perf / gdb / run_suite -c read them)
-  set(UFSM_CFLAGS -mglibc -std=c23 -O3 -march=native -fno-math-errno -g -pthread)
+  # -O3: mcc's loop vectoriser. A fixed ISA, not -march=native: binaries move between the desk (znver4) and the pods. -msse4.1 is
+  # every x86-64 we run on (pmulld / pmovzx / roundps for the vectoriser; mcc's code is byte-identical to its -march=native build
+  # on the desk, 2026-11-14). Not -march=x86-64-v3 yet: that defines __AVX2__ / __F16C__ / __FMA__, which switch ufsm's
+  # intrinsic paths on, and mcc's <immintrin.h> is still element by element (exact, slower than the scalar paths) until its
+  # VEX / 256-bit lowering lands. -fno-math-errno: sqrt in line, as with clang. -g: DWARF 5 lines, variables, CFI.
+  set(UFSM_CFLAGS -mglibc -std=c23 -O3 -msse4.1 -fno-math-errno -g -pthread)
   separate_arguments(_extra UNIX_COMMAND "${UFSM_EXTRA_CFLAGS}")
   list(APPEND UFSM_CFLAGS ${_extra})
   list(APPEND UFSM_DEFS VOLCOMP_NO_AVX2)
