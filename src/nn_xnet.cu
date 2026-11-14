@@ -350,7 +350,9 @@ __global__ void k_tshuffle3(const __half *g, const float *bias, __half *y, size_
 /* tile shapes: UFSM_XNET_CFG selects (default 0); per variant the tile follows the output channels (64 / 128 / >= 256) */
 template <int BM, int BN, int WMn, int WNn, int BK, int NST> static void launch1(const ConvP &p, int co) {
     const size_t sm = (size_t)NST * (BM + BN) * BK * 2;
-    static int attr = 0; if (!attr) { cudaFuncSetAttribute(conv_igemm<BM, BN, WMn, WNn, BK, NST>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); attr = 1; }
+    static unsigned attr = 0u;   /* mgpu: per-device (a bit per device: the attribute is per context; set first, then the bit, atomically) */
+    int dv = 0; cudaGetDevice(&dv);
+    if (!(__atomic_load_n(&attr, __ATOMIC_ACQUIRE) >> (dv & 31) & 1u)) { cudaFuncSetAttribute(conv_igemm<BM, BN, WMn, WNn, BK, NST>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); __atomic_fetch_or(&attr, 1u << (dv & 31), __ATOMIC_RELEASE); }
     dim3 g((unsigned)((p.M + BM - 1) / BM), (unsigned)((co + BN - 1) / BN));
     conv_igemm<BM, BN, WMn, WNn, BK, NST><<<g, WMn * WNn * 32, sm, g_st>>>(p);
 }

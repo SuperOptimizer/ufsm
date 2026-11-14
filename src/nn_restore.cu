@@ -141,11 +141,11 @@ __global__ void __launch_bounds__(256) restore_codec_k(uint8_t *vol, codec_geo g
 }
 extern "C" void nn_codec_roundtrip(uint8_t *vol, int d, int h, int w, float q, const int phase[3]) {
     if (!(q > 0.f)) return;
-    static int init_dev = -1; int dev = 0; cudaGetDevice(&dev);
-    if (init_dev != dev) {   /* (per device: the constant table lives in each context) */
+    static unsigned init_dev = 0u; int dev = 0; cudaGetDevice(&dev);   /* mgpu: per-device (a bit per device: the constant table lives in each context; was one id, re-uploaded and racing across 2 threads) */
+    if (!(__atomic_load_n(&init_dev, __ATOMIC_ACQUIRE) >> (dev & 31) & 1u)) {
         float c[16][16];
         for (int k = 0; k < 16; k++) for (int n = 0; n < 16; n++) c[k][n] = (float)((k ? sqrt(2.0) / 4.0 : 0.25) * cos(M_PI * (2 * n + 1) * k / 32.0));
-        CK(cudaMemcpyToSymbol(c_dct16, c, sizeof c)); init_dev = dev;
+        CK(cudaMemcpyToSymbol(c_dct16, c, sizeof c)); __atomic_fetch_or(&init_dev, 1u << (dev & 31), __ATOMIC_RELEASE);
     }
     codec_geo g; g.d = d; g.h = h; g.w = w; g.pz = phase[0] & 15; g.py = phase[1] & 15; g.px = phase[2] & 15;
     const float qe = floorf(q * 256.f + 0.5f) / 256.f;   /* the step the decoder sees (vf_q_raw) */

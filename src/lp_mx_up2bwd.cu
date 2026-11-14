@@ -144,8 +144,8 @@ static void up2_bwd_tile(const void *gy, int nby, int yb0, shape5 xs, void *gx, 
     const int cy = 16 / (bw / 8);
     int za = 0, zb = 0; zw_win(xs.d, &za, &zb);   /* z-window: coarse planes [za, zb) (whole tensors: the fine gy planes around it are read) */
     const dim3 grid((unsigned)nblk_(xs.w, 16), (unsigned)nblk_(xs.h, cy), (unsigned)(nblk_(zb ? zb - za : xs.d, ZC) * xs.n * nob));
-#define U2BT(G, X, BWT) do { static unsigned at_ = 0; int dev_ = 0; cudaGetDevice(&dev_); const size_t sm_ = 2 * U2B_BUFB(BWT * G / 8, 2 * (16 / (BWT / 8)) + 2); \
-                        if (!(at_ >> dev_ & 1u)) { at_ |= 1u << dev_; cudaFuncSetAttribute((const void *)up2_bwd_mx_tile_k<G, X, BWT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_); } \
+#define U2BT(G, X, BWT) do { static unsigned at_ = 0; /* mgpu: per-device (bit per device, atomic, after the attribute) */ int dev_ = 0; cudaGetDevice(&dev_); const size_t sm_ = 2 * U2B_BUFB(BWT * G / 8, 2 * (16 / (BWT / 8)) + 2); \
+                        if (!(__atomic_load_n(&at_, __ATOMIC_ACQUIRE) >> dev_ & 1u)) { cudaFuncSetAttribute((const void *)up2_bwd_mx_tile_k<G, X, BWT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm_); __atomic_fetch_or(&at_, 1u << dev_, __ATOMIC_RELEASE); } \
                         up2_bwd_mx_tile_k<G, X, BWT><<<grid, 256, sm_>>>((const uint8_t *)gy, (uint8_t *)gx, xs.n, nby, nbx, yb0, ob0, nob, xs.d, xs.h, xs.w, ZC, osr, za, zb); } while (0)
     if ((gdt == 4) != (xdt == 4)) { fprintf(stderr, "up2_bwd: gy and gx must share the MX format\n"); abort(); }
     if (bw == 32) { if (gdt == 4) U2BT(4, 4, 32); else U2BT(8, 8, 32); }
