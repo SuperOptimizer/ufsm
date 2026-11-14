@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <zstd.h>
 #include "volcomp.h"
+#include "label_versions.h"
 
 struct dc;
 typedef struct dent { int64_t key; uint8_t *data; uint8_t cval; int busy, failed, refs; struct dc *own; struct dent *prev, *next, *hnext; } dent;
@@ -80,11 +81,15 @@ static int ph_encode(int C, int d, uint8_t *data, uint8_t **out, uint32_t *out_n
     const size_t n = (size_t)C * C * C; if (C % 128 || d < 1 || d > 20) return -1;
     for (size_t i = 0; i < n; i++) if (data[i] >= PH_P && data[i] != PH_U) return -1;
     const int K = C / 128, st = 2 * d + 1; uint8_t *res = malloc(n), *bits = calloc(n / 8 + 1, 1), *mk = malloc(VOLCOMP_CHUNK_VOXELS), *mb = malloc((size_t)K * K * K * VOLCOMP_MASK_LL_BOUND + 4 * K * K * K);
-    if (!res || !bits || !mk || !mb) { free(res); free(bits); free(mk); free(mb); return -1; }
+    /* (every allocation before the quantiser rewrites data: a failure after it would leave the reconstruction in memory under an exact
+       store; the dcache audit 2026-11-14 #6. ZSTD into compressBound-sized buffers cannot fail) */
+    const size_t zc = ZSTD_compressBound(n), zbc = ZSTD_compressBound(n / 8 + 1), mbn = (size_t)K * K * K * (VOLCOMP_MASK_LL_BOUND + 4);
+    uint8_t *o = malloc(mbn + 16 + zc + zbc);
+    if (!res || !bits || !mk || !mb || !o) { free(res); free(bits); free(mk); free(mb); free(o); return -1; }
     size_t mn = 0;
     for (int cz = 0; cz < K; cz++) for (int cy = 0; cy < K; cy++) for (int cx = 0; cx < K; cx++) {
         for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) { const uint8_t *s = data + (((size_t)(cz * 128 + z) * C + cy * 128 + y) * C + cx * 128); uint8_t *m = mk + ((size_t)z * 128 + y) * 128; for (int x = 0; x < 128; x++) m[x] = s[x] != PH_U; }
-        size_t on = 0; if (volcomp_mask_encode_lossless(mk, mb + mn + 4, VOLCOMP_MASK_LL_BOUND, &on)) { free(res); free(bits); free(mk); free(mb); return -1; }
+        size_t on = 0; if (volcomp_mask_encode_lossless(mk, mb + mn + 4, VOLCOMP_MASK_LL_BOUND, &on)) { free(res); free(bits); free(mk); free(mb); free(o); return -1; }
         const uint32_t o32 = (uint32_t)on; memcpy(mb + mn, &o32, 4); mn += 4 + on;
     }
     size_t nk = 0, nb = 0;
@@ -98,8 +103,7 @@ static int ph_encode(int C, int d, uint8_t *data, uint8_t **out, uint32_t *out_n
         bits[nb >> 3] |= (uint8_t)(hi << (nb & 7)); nb++;
         data[i] = (uint8_t)ph_mod(cc + (hi ? (t0 > 0 ? t0 : 0) : (t0 - 1 < 0 ? t0 - 1 : 0)));
     }
-    const size_t bb = (nb + 7) / 8, zc = ZSTD_compressBound(nk ? nk : 1), zbc = ZSTD_compressBound(bb ? bb : 1);
-    uint8_t *o = malloc(mn + 16 + zc + zbc); if (!o) { free(res); free(bits); free(mk); free(mb); return -1; }
+    const size_t bb = (nb + 7) / 8;
     memcpy(o, mb, mn); const size_t zr = ZSTD_compress(o + mn + 8, zc, res, nk ? nk : 1, 3);
     const size_t zb = ZSTD_isError(zr) ? zr : ZSTD_compress(o + mn + 16 + zr, zbc, bits, bb ? bb : 1, 3);
     free(res); free(bits); free(mk); free(mb); if (ZSTD_isError(zr) || ZSTD_isError(zb)) { free(o); return -1; }
@@ -137,7 +141,7 @@ static uint8_t *ph_decode(int C, int d, const uint8_t *p, size_t pn) {
     free(mk); free(res); free(bits); if (!ok) { free(v); return nullptr; } return v;
 }
 /* the disk file of a cell: "UDC1", u32 C, u8 kind (0 constant, 1 zstd), u8 value, u16 0, u32 payload bytes, payload; "UDC2": the same
-   header, kind 3 (2: the unclamped draft, never deployed, read as a miss), u8 delta, then per 128^3 chunk u32 bytes + its mode-5 mask,
+   header, kind 3 (2: the unclamped draft, never deployed, read as a miss), u8 delta, u8 LBL_UDC_CODEC (another: a miss), then per 128^3 chunk u32 bytes + its mode-5 mask,
    u32 known voxels, u32 bytes + the zstd residuals, u32 side bits, u32 bytes + the zstd packed side bits */
 static void cell_path(const dc *c, int64_t cz, int64_t cy, int64_t cx, char *p, size_t np) { snprintf(p, np, "%s/%lld/%lld.%lld", c->dir, (long long)cz, (long long)cy, (long long)cx); }
 static int disk_get(const dc *c, const char *p, uint8_t **data, uint8_t *cval) {
@@ -148,7 +152,7 @@ static int disk_get(const dc *c, const char *p, uint8_t **data, uint8_t *cval) {
     if ((int)C != c->C) goto out;
     if (h[8] == 0) { *data = nullptr; *cval = h[9]; rc = 0; goto out; }
     if (!memcmp(h, "UDC2", 4)) {   /* (a near-lossless phase cell: only for an array of the same delta) */
-        if (h[8] != 3 || h[9] != c->pdelta || !(zb = malloc(nz ? nz : 1)) || fread(zb, 1, nz, f) != nz || !(d = ph_decode(c->C, c->pdelta, zb, nz))) goto out;
+        if (h[8] != 3 || h[9] != c->pdelta || h[10] != LBL_UDC_CODEC || !(zb = malloc(nz ? nz : 1)) || fread(zb, 1, nz, f) != nz || !(d = ph_decode(c->C, c->pdelta, zb, nz))) goto out;
         *data = d; d = nullptr; rc = 0; goto out; }
     if (c->pdelta) goto out;   /* (an exact cell under a lossy array: never mixed, the keys differ; a miss) */
     if (h[8] != 1 || !(zb = malloc(nz ? nz : 1)) || fread(zb, 1, nz, f) != nz || !(d = malloc(cbytes(c)))) goto out;
@@ -163,7 +167,7 @@ static int disk_put(dc *c, int64_t cz, const char *p, const uint8_t *data, uint8
     snprintf(tmp, sizeof tmp, "%s.%d.%lx.tmp", p, (int)getpid(), (unsigned long)pthread_self());
     uint8_t h[16] = {'U', 'D', 'C', '1'}; const uint32_t C = (uint32_t)c->C; memcpy(h + 4, &C, 4);
     uint8_t *zb = nullptr; uint32_t nz = 0;
-    if (ph) { zb = ph; nz = phn; h[2] = 'C'; h[3] = '2'; h[8] = 3; h[9] = (uint8_t)c->pdelta; }
+    if (ph) { zb = ph; nz = phn; h[2] = 'C'; h[3] = '2'; h[8] = 3; h[9] = (uint8_t)c->pdelta; h[10] = LBL_UDC_CODEC; }
     else if (data) {
         const size_t cap = ZSTD_compressBound(cbytes(c)); zb = malloc(cap); if (!zb) return -1;   /* (ph is nullptr here) */
         const size_t r = ZSTD_compress(zb, cap, data, cbytes(c), 3); if (ZSTD_isError(r)) { free(zb); return -1; }

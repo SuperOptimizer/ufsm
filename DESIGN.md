@@ -6,6 +6,25 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Derived-cache keys carry the label code's version (2026-11-14, branch dckey-20261114)
+
+The dcache audit (/vesuvius/ufsm/audit-20261114/targeted/dcache.md) found every disk cache of labels keyed by its inputs only: a fix to
+the pair rule / pooling / stamping code was served stale from cells computed by the old code ("phase-onfly-pair-v1" never changed since
+11-11, 20+ value-relevant commits since). Now:
+- `src/label_versions.h`: LBL_PHASE_PAIR, LBL_CODES_POOL, LBL_MESHCODES_LOAD / _STAMP, LBL_INKFLY, LBL_UDC_CODEC (all bumped today, so
+  try7 reads no cell of before: 2 / 2 / 2 / 2 / 3 / 1). The phase key is `phase-onfly-pair-v<LBL_PHASE_PAIR> ...`, stored codes add
+  `pool-v<LBL_CODES_POOL>`, mesh codes `stamp-v<..> pool-v<..>`, the ink key `inkfly <LBL_INKFLY>`, lossy cells `udc-v<..>` and the
+  UDC2 header's byte 10 (another version: a miss).
+- Stored codes are keyed by every file of the array too (count, bytes, newest mtime in ns): zarr.json is written when a raster starts,
+  so a chunk-only rewrite / resumed raster / mtime-keeping rsync kept the old key (audit #3). ~8 k files: tens of ms per source open.
+- A truncated key (path > ~1 kB) now means no cache instead of a prefix collision.
+- `test_label_versions` (CPU, fast tier): FNV-1a digests of the CPU pair rule (rmax 8) and of the pair rule over 2x-pooled codes on a
+  synthetic 160^3 spiral, recorded per version. A value change without a bump fails the suite with the digest to record; the device
+  paths are byte-identical to the CPU (test_phase_onfly), so this covers them.
+- Not here: the meshcodes pack key (mesh dir, ns mtimes, LBL_MESHCODES_LOAD in mc_key, pack magic) is audit-data's meshcodes.c work;
+  the HTTP chunk cache validators (audit #4) and zshm's decoder version (#7) are open.
+Old key dirs are never read again; the cap's LRU evicts them. try7: start on an empty UFSM_DERIVED_CACHE anyway (merger2's checklist).
+
 ## The derived cache's disk cap (2026-11-14, branch dcachecap-20261114)
 
 ~/.cache/ufsm/derived (src/dcache.c) had no bound: at 10:50 it held 336 GB in 274 keys and filled the desk's root filesystem under
