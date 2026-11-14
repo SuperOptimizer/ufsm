@@ -48,9 +48,10 @@ device code goes through its nvcc by default (`UFSM_CUDA_COMPILER=nvcc`; `clang`
 1.35x slower on sm_120). nvcc's host compiler is probed at configure time: clang++ when that nvcc accepts it (with `-allow-unsupported-compiler`:
 the desk's 13.3 and the pod's 13.2 both take clang 22 so), else the newest g++ (`-- ufsm: nvcc host compiler ...` in the configure
 output; `-DUFSM_CUDA_HOST_COMPILER=/usr/bin/g++` pins one). Every .c unit and the link stay clang / lld either way. Host C is `-std=c23 -O3 -march=native
--ffp-contract=off -fno-math-errno` (contract off: what gcc's ISO mode did; the byte-exact CPU references depend on it). The CUDA units
-get nvcc's `-use_fast_math` on the device side (flush denormals, approximate division / sqrt / transcendentals, FMA contraction),
-except the byte-identical ones (`UFSM_STRICT_UNITS` in CMakeLists.txt: contraction off, IEEE). Sources are globbed: a new `src/*.c`,
+-ffast-math -fno-finite-math-only` (fast math with NaN / inf honoured: the NaN guards must survive), and every CUDA unit gets nvcc's
+`-use_fast_math` on the device side (flush denormals, approximate division / sqrt / transcendentals, FMA contraction), so GPU-vs-CPU
+tests compare within tolerances (`tests/fm_tol.h`). `-DUFSM_STRICT_MATH=ON` restores the bit-exact build: host `-ffp-contract=off
+-fno-math-errno`, the `UFSM_STRICT_UNITS` (CMakeLists.txt) IEEE without contraction, and the tests' tolerances back to exact. Sources are globbed: a new `src/*.c`,
 `src/nn_*.cu` or `src/lp_*.cu` is picked up at the next build. ccache (when installed, `UFSM_CCACHE=OFF` disables it) is shared across
 worktrees (`CCACHE_BASEDIR` = the tree, `CCACHE_NOHASHDIR`), so a fresh worktree or desk suite dir rebuilds from the cache. Default
 thread counts follow the cgroup (`cpu.max` quota, affinity; `UFSM_NCPU` overrides), not nproc, and memory budgets (count-field
@@ -473,17 +474,17 @@ line per wrap on stdout. Recto is the inner face by the published-label side rul
 Run it on the flat grid so both faces share one uv and render pixel-aligned; render faces with `--depth 0` (the sheet is
 ~4 voxels at 9.6 um). The CT cache decodes only the volcomp substreams under the samples (`UFSM_FACES_FULLDECODE=1`: whole
 chunks; same output). `--gpu 1` (default) samples the profiles, cuts the bands and runs the median windows on the GPU from a
-device mirror of the decoded chunks (decode list = the exact substreams the samples read; `src/nn_faces.cu`, no fast math,
-no FMA): byte-identical outputs, CPU fallback without a device or when the device pool fills. Paris 4 w178: sampling 35 -> 3 s,
+device mirror of the decoded chunks (decode list = the exact substreams the samples read; `src/nn_faces.cu`; byte-identical outputs
+under `UFSM_STRICT_MATH=ON`, within rounding of the CPU path under the default fast math), CPU fallback without a device or when the device pool fills. Paris 4 w178: sampling 35 -> 3 s,
 medians 15 -> 2.5 s; the CPU volcomp decode is then ~75% of the wall. `UFSM_FACES_PROF=1` prints per-stage times. With
 `UFSM_GPU_DECODE=1` (below) the CT substreams are decoded on the GPU straight into that device mirror (no host round trip;
 if the GPU path fails mid-run the substreams only the device had are decoded again on the host; with it faces marks + decodes
 128 rows per fill instead of 32 (`UFSM_FACES_FILL_ROWS`): bigger decode batches, w178 CT fill 79-82 -> 55-58 s on a loaded laptop).
 
 **GPU volcomp decoding** (`UFSM_GPU_DECODE=1`, opt-in; `src/nn_gpudec.cu`): every lossy (mode 0) volcomp substream that
-z3_read / z3_read_sub decodes goes to the GPU instead of volcomp_fast.h, byte-identical (one thread per substream for the tANS
-/ bypass decode, one CUDA block per 16^3 block for the dequantisation and the reference's inverse DCT network; no fast math,
-`-fmad=false`; corrupt or truncated streams are decoded again on the CPU, which gives the reference's status). A service
+z3_read / z3_read_sub decodes goes to the GPU instead of volcomp_fast.h (byte-identical under `UFSM_STRICT_MATH=ON`, else
++-1 LSB on rare voxels, as the codec's AVX2 and C kernels already differ; one thread per substream for the tANS
+/ bypass decode, one CUDA block per 16^3 block for the dequantisation and the reference's inverse DCT network; corrupt or truncated streams are decoded again on the CPU, which gives the reference's status). A service
 thread batches the requests of all decode threads (render and faces run `UFSM_GPU_DECODE_THREADS`, default 32, decoders
 when it is on); a substream is a ~3-5 ms serial chain on the GPU, so throughput comes from many substreams in flight.
 Requests under `UFSM_GPU_DECODE_MIN_BYTES` (2048) compressed bytes per substream (ink, air: flat blocks) stay on the CPU;
@@ -556,7 +557,7 @@ the chunk-ordered renderer on the GPU. Decoded chunks stay on the device. The de
 substreams straight into a device chunk pool (device-sink requests ignore `UFSM_GPU_DECODE_MIN_BYTES`). `--gpu 1` sets `UFSM_GPU_DECODE=1` (unless set) when the device has room for the GPU path,
 and runs 128 decoders (`UFSM_RENDER_GPU_DECODERS`). Anything decoded on the host is uploaded from pinned staging
 buffers. The kernel evaluates `src/render_core.h` `rc_pixel`, the per-pixel arithmetic shared with the CPU renderer (built
-with `-fmad=false`, no fast math). Its outputs go to mapped pinned memory, two launches in flight. The pool is sized from the
+with `-fmad=false`, no fast math, under `UFSM_STRICT_MATH=ON`; fast math by default). Its outputs go to mapped pinned memory, two launches in flight. The pool is sized from the
 device's free memory: at most min(50% of it, 8 GB) by default so a later slab fit on a shared GPU keeps room (`UFSM_RENDER_GPU_MEM` GB overrides, higher or lower). When a live chunk set exceeds the device (P3
 stripes peak ~29 GB), mapped pinned host slots hold the rest. Any device error, or a pool too full for the earliest chunk row,
 re-renders on the CPU. `UFSM_RENDER_PROF=1` prints decoder and driver times. Back to back, --gpu 0 -> 1: w178 per-wrap render on

@@ -14,17 +14,21 @@ H=${UFSM_MCC_CUDA:-$(dirname "$M")/cudahw}/include
 if [ ! -f "$H/mcuda_device.h" ]; then echo "mcc_compile: no mcudahw headers at $H (microc: sh mkcuda.sh MCC DIR hw; or UFSM_MCC_CUDA)"; exit 1; fi
 T=$(mktemp -d "${TMPDIR:-/tmp}/mcc_compile.XXXXXX") || exit 2
 case "$T" in "${TMPDIR:-/tmp}"/mcc_compile.*) trap 'rm -rf -- "$T"' EXIT;; *) echo "mcc_compile: odd temp dir $T"; exit 2;; esac
-# the strict units (no fast math, -fmad=false), as CMakeLists.txt lists them
+# the strict units (no fast math, -fmad=false), as CMakeLists.txt lists them: only under UFSM_STRICT_MATH=1 (the CMake option's
+# build); by default every unit is --cuda-fast-math and the host -ffast-math -fno-finite-math-only (DESIGN 2026-11-14 "Fast math
+# everywhere ..."; never -ffinite-math-only: it lets mcc fold the NaN guards)
 STRICT=$(sed -n 's/^set(UFSM_STRICT_UNITS \(.*\))$/\1/p' CMakeLists.txt)
 [ -n "$STRICT" ] || { echo "mcc_compile: UFSM_STRICT_UNITS not found in CMakeLists.txt"; exit 2; }
-export M H T STRICT
+SM=${UFSM_STRICT_MATH:-0}; case $SM in ON|on|1) SM=1;; *) SM=0;; esac
+if [ $SM = 1 ]; then HFP=; else HFP="-ffast-math -fno-finite-math-only"; fi
+export M H T STRICT SM HFP
 one() {   # one SOURCE: compile it, print "FAIL name: first error" on failure
   f=$1; b=$(basename "${f%.*}")
   case $f in
     *.cu) case $b in lp_*) a=--cuda-arch=1200a;; *) a=--cuda-arch=1200;; esac
-          fp=--cuda-fast-math; [[ " $STRICT " == *" $b "* ]] && fp=-fmad=false
+          fp=--cuda-fast-math; [ $SM = 1 ] && [[ " $STRICT " == *" $b "* ]] && fp=-fmad=false
           set -- "$M" -mglibc -O3 $a $fp -D_GNU_SOURCE -DUFSM_ARCH=120 -DUFSM_CUDA_VERSION=mcc -isystem "$H" -include "$H/mcuda_device.h" -Isrc;;
-    *)    set -- "$M" -mglibc -std=c23 -O3 -march=native -pthread -D_GNU_SOURCE -Isrc -Ithird_party -Ithird_party/surfcomp -isystem "$H";;
+    *)    set -- "$M" -mglibc -std=c23 -O3 -march=native $HFP -pthread -D_GNU_SOURCE -Isrc -Ithird_party -Ithird_party/surfcomp -isystem "$H";;
   esac
   if ! "$@" -c "$f" -o "$T/$b.o" > "$T/$b.log" 2>&1; then echo "FAIL $b: $(grep -m1 -E 'error|fatal' "$T/$b.log" || head -1 "$T/$b.log")"; fi
 }
