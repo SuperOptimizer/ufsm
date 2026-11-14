@@ -193,6 +193,7 @@ int main(int argc, char **argv) {
         char cm[2048]; snprintf(cm, sizeof cm, "%s", common); { char *ls = strstr(cm, " --steps 4"); if (ls) memmove(ls, ls + 10, strlen(ls + 10) + 1); }
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/uw %s %s --steps 4 > %s/uw.log 2>&1", U, d, d, cm, uf, d), "uw + grad-cos run (%s/uw.log)", d);
         CHECK(!sh("grep -q 'grad-cos step 4 (head input): phase/normal [-+]0[.][0-9]*.*rv/ink [-+]0[.]' %s/uw.log && grep -q 'uw phase [0-9.]* normal 0[.]' %s/uw.log", d, d), "uw + grad-cos: the cosine and weight lines");
+        CHECK(!sh("grep -q 'grad-norm step 4 (head input): phase [0-9.e+-]* normal [0-9.e+-]*.* ink [0-9.e+-]*' %s/uw.log", d), "grad-cos: the per-head gradient norm line");
         CHECK(!sh("head -1 %s/uw/last.ckpt | grep -q '\"uw\":{\"t\":4,'", d), "uw: header t 4");
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/uw --resume %s/uw/last.ckpt %s %s --steps 6 > %s/uw2.log 2>&1 && grep -q '(resumed)' %s/uw2.log && head -1 %s/uw/last.ckpt | grep -q '\"uw\":{\"t\":6,'", U, d, d, d, cm, uf, d, d, d), "uw resume (%s/uw2.log)", d);
     }
