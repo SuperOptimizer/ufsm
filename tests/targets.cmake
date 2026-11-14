@@ -443,3 +443,17 @@ ufsm_exe(train_lp tests/train_lp.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(xscan_render tests/xscan_render.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush scrollaug cover json
          store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb embz imgops jpegpar
          tiffw tfx surfcomp LIBS LDLIBS)
+
+# ported from the Makefile of master (7ee48e2 .. e478a9d) when the CMake build merged (2026-11-13)
+ufsm_exe(bench_s2b tests/bench_s2b.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(bench_s2f tests/bench_s2f.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_head_tc SUITE tests/test_head_tc.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_skip_empty SUITE tests/test_skip_empty.c OBJS unet NN LP LIBS m CUDA)
+ufsm_exe(test_grad_ar SUITE tests/test_grad_ar.c OBJS CORE NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_dcache_batch SUITE tests/test_dcache_batch.c OBJS dcache zarr3 store z3w json LIBS LDLIBS)
+ufsm_exe(bench_fstem tests/bench_fstem.c OBJS CORE NN LP LIBS LDLIBS CUDA)
+ufsm_exe(bench_wgl0 tests/bench_wgl0.c OBJS CORE NN LP LIBS LDLIBS CUDA)
+# 2:4 sparse MX-fp4 convolutions (src/lp_sp24*.cu, DESIGN.md 2026-11-13): instruction layout + throughput, conv kernels vs host
+ufsm_exe(test_sp24_mma SUITE tests/test_sp24_mma.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_sp24_conv SUITE tests/test_sp24_conv.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(bench_sp24 tests/bench_sp24.c OBJS NN LP LIBS m CUDA)
