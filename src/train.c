@@ -4414,7 +4414,7 @@ int cmd_train(int argc, char **argv) {
     if (seconds) fprintf(stderr, "training budget %.1fs, time-based warmup %.1fs\n", seconds, warmup_seconds);
     if (schedule_seconds) fprintf(stderr,"wall-time LR horizon %.1fs, elapsed %.1fs, warmup %.1fs; finite cover/ramp origin preserved\n",schedule_seconds,schedule_elapsed,warmup_seconds);
     int committed_step = step0, training_failed = 0;
-    double best_val = 1e30, vcrit = 0; int nskip = 0; (void)nskip;
+    double best_val = 1e30, vcrit = 0; int nskip = 0, nskip_seen = 0; double nskl = 0;   /* nskl: skipped steps in the log interval (their losses stay out of the logged means) */
     double acc_rn = 0, acc_re = 0, acc_rb = 0;   /* restore: training voxels, error^2, input error^2 since the last log line */
     float parts[8][2 * TCMAX + 1];
     double acc_fib = 0, acc_fibv = 0, acc_fibn = 0;   /* --fib-normal-lambda: mean t^T N t over the windows with fibre voxels, their mean count */
@@ -4700,10 +4700,11 @@ int cmd_train(int argc, char **argv) {
           if (fault == step) nn_h2d(G[0].x, nullptr, 16); }
         if ((seconds && now() - t0 >= seconds) || (schedule_seconds && schedule_elapsed+now()-t0>=schedule_seconds) ||
             (limit_seconds && now() - t0 >= limit_seconds) || (stop_at && step >= stop_at)) g_stop = 1;
-        acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][g_aff || g_unwrap || g_heads || g_fibdir > 0 ? NCH : g_half ? g_cout : cfg.cout]; acc_g += gn; nacc++;
+        const int step_ok = nskip == nskip_seen; nskip_seen = nskip; nacc++; if (!step_ok) nskl += 1;   /* a skipped (non-finite) step: no loss / label means (try3 step 504: its nan entered rv / normal / ink) */
+        if (step_ok) { acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][g_aff || g_unwrap || g_heads || g_fibdir > 0 ? NCH : g_half ? g_cout : cfg.cout]; acc_g += gn;
         if (g_verso_on) { acc_vbce += G[0].vout[0]; acc_vdice += G[0].vout[1]; }
         if (g_side && G[0].side_loss > 0) { acc_side += G[0].sout[0]; acc_siden += 1; }
-        if (g_rv == 2) acc_rv += G[0].rvout[0];
+        if (g_rv == 2) acc_rv += G[0].rvout[0]; }
         if (mix_every > 0) {   /* --mix-every N: the realised windows per source x level and (--rv 2) each source's rv bce, every N steps */
             if (!mixn) { mixn = calloc((size_t)S->n * MAXLEV, sizeof *mixn); mixrv = calloc((size_t)S->n, sizeof *mixrv); mixrvn = calloc((size_t)S->n, sizeof *mixrvn); }
             for (int g = 0; g < ng; g++) { const int bf = G[g].last & 1, si = G[g].srcb[bf], lv = G[g].lvlb[bf];
@@ -4745,6 +4746,7 @@ int cmd_train(int argc, char **argv) {
                 memset(mixn, 0, (size_t)S->n * MAXLEV * sizeof *mixn); memset(mixrv, 0, (size_t)S->n * sizeof *mixrv); memset(mixrvn, 0, (size_t)S->n * sizeof *mixrvn);
             }
         }
+        if (step_ok) {
         if (g_unwrap) { acc_ink += G[0].iout[0]; acc_norm += G[0].norm_raw; acc_normn += G[0].norm_loss > 0; }
         if (g_mil && G[0].mil_n) { acc_mil += G[0].mil_raw; acc_miln += 1; acc_milr += G[0].mil_n; }
         if (g_fibh && (G[0].fhout[0][2] > 0 || G[0].fhout[1][2] > 0)) { acc_fh[0] += G[0].fib_raw[0]; acc_fh[1] += G[0].fib_raw[1]; acc_fhn += 1; }
@@ -4760,8 +4762,9 @@ int cmd_train(int argc, char **argv) {
         if (g_pap_head) acc_pap += G[0].pout3[0];
         if (g_restore) { acc_rn += G[0].rst_h[0]; acc_re += G[0].rst_h[3]; acc_rb += G[0].rst_h[4]; }
         if (g_count_lambda > 0) { acc_cnt += G[0].cnt_h[0]; acc_cnr += G[0].cnt_h[2]; for (int b = 0; b < 18; b++) acc_cbin[b] += G[0].cnt_h[3 + b]; }
+        }
         if (step % log_every == 0 || step == steps || g_stop) {
-            double dt = now() - tlog;
+            double dt = now() - tlog; const double nok = nacc - nskl > 0 ? nacc - nskl : 1;   /* (the means: over the steps not skipped) */
             double vl = -1, vb = 0, vd = 0, vh[TCMAX] = {0}; int vhn[TCMAX] = {0}; double vw4[6] = {0};   /* unwrap2: wind4 bce, worst-gauge bce, right turns, voxels, phase, normal */
             char vstr[128] = ",,";
             double rv_n[RF_N] = {0}, rv_e[RF_N] = {0}, rv_b[RF_N] = {0}, rv_l = 0;   /* restore validation: per family voxels, error^2, input error^2 */
@@ -4891,32 +4894,32 @@ int cmd_train(int argc, char **argv) {
                 if (nval && vcrit < best_val) { best_val = vcrit; char bp[1400]; snprintf(bp, sizeof bp, "%s/best.ckpt", out); if ((g_uw ? (uw_extra(checkpoint_extra, sizeof checkpoint_extra, runtime_extra), 0) : 0) || unet_save(G[0].u, bp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", bp); return 1; } }
             }
             char affs[1024] = "";
-            if (g_verso) snprintf(affs, 64, " verso bce %.4f dice %.4f", acc_vbce / nacc, acc_vdice / nacc);
-            if (g_side) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " %s bce %.4f (%.0f%% of windows)", g_rv == 1 ? "rv" : g_side == 2 ? "phase" : "side", acc_siden > 0 ? acc_side / acc_siden : 0.0, 100.0 * acc_siden / nacc); }
-            if (g_rv == 2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " rv bce %.4f", acc_rv / nacc); }
+            if (g_verso) snprintf(affs, 64, " verso bce %.4f dice %.4f", acc_vbce / nok, acc_vdice / nok);
+            if (g_side) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " %s bce %.4f (%.0f%% of windows)", g_rv == 1 ? "rv" : g_side == 2 ? "phase" : "side", acc_siden > 0 ? acc_side / acc_siden : 0.0, 100.0 * acc_siden / nok); }
+            if (g_rv == 2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " rv bce %.4f", acc_rv / nok); }
             if (g_uw) { size_t na = strlen(affs); na += (size_t)snprintf(affs + na, sizeof affs - na, " uw phase %.3g normal %.3g wind4 %.3g", g_hmul[SH_PHASE], g_hmul[SH_NORMAL], g_hmul[SH_WIND4]);
                         if (g_rv && na < sizeof affs) na += (size_t)snprintf(affs + na, sizeof affs - na, " rv %.3g", g_hmul[SH_RV]);
                         if (g_ink2 && na < sizeof affs) snprintf(affs + na, sizeof affs - na, " ink %.3g", g_hmul[SH_INK]); }
-            if (g_unwrap2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " normal bce %.4f (%.0f%% of windows) wind4 bce %.4f (worst gauge %.4f) acc %.3f (%.0f%% of windows)", acc_normn > 0 ? acc_norm / acc_normn : 0.0, 100.0 * acc_normn / nacc,
-                                                acc_w4n > 0 ? acc_w4 / acc_w4n : 0.0, acc_w4n > 0 ? acc_w4w / acc_w4n : 0.0, acc_w4n > 0 ? acc_w4a / acc_w4n : 0.0, 100.0 * acc_w4n / nacc); if (g_pg_lambda > 0) { na = strlen(affs); snprintf(affs + na, sizeof affs - na, " pgrad %.4f", acc_pg / nacc); } }
-            if (g_fibn) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " fibn %.4f (%.0f%% of windows, %.0f vox)", acc_fibn > 0 ? acc_fib / acc_fibn : 0.0, 100.0 * acc_fibn / nacc, acc_fibn > 0 ? acc_fibv / acc_fibn : 0.0); }
-            if (g_ink2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f (%.0f%% of windows)", acc_inkn > 0 ? acc_ink / acc_inkn : 0.0, 100.0 * acc_inkn / nacc); }
-            if (g_mil) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink mil %.4f (%.0f%% of windows, %.0f rays)", acc_miln > 0 ? acc_mil / acc_miln : 0.0, 100.0 * acc_miln / nacc, acc_miln > 0 ? acc_milr / acc_miln : 0.0); acc_mil = acc_miln = acc_milr = 0; }
-            if (g_fibh) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " fib bce %.4f dir %.4f (%.0f%% of windows)", acc_fhn > 0 ? acc_fh[0] / acc_fhn : 0.0, acc_fhn > 0 ? acc_fh[1] / acc_fhn : 0.0, 100.0 * acc_fhn / nacc); }
+            if (g_unwrap2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " normal bce %.4f (%.0f%% of windows) wind4 bce %.4f (worst gauge %.4f) acc %.3f (%.0f%% of windows)", acc_normn > 0 ? acc_norm / acc_normn : 0.0, 100.0 * acc_normn / nok,
+                                                acc_w4n > 0 ? acc_w4 / acc_w4n : 0.0, acc_w4n > 0 ? acc_w4w / acc_w4n : 0.0, acc_w4n > 0 ? acc_w4a / acc_w4n : 0.0, 100.0 * acc_w4n / nok); if (g_pg_lambda > 0) { na = strlen(affs); snprintf(affs + na, sizeof affs - na, " pgrad %.4f", acc_pg / nok); } }
+            if (g_fibn) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " fibn %.4f (%.0f%% of windows, %.0f vox)", acc_fibn > 0 ? acc_fib / acc_fibn : 0.0, 100.0 * acc_fibn / nok, acc_fibn > 0 ? acc_fibv / acc_fibn : 0.0); }
+            if (g_ink2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f (%.0f%% of windows)", acc_inkn > 0 ? acc_ink / acc_inkn : 0.0, 100.0 * acc_inkn / nok); }
+            if (g_mil) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink mil %.4f (%.0f%% of windows, %.0f rays)", acc_miln > 0 ? acc_mil / acc_miln : 0.0, 100.0 * acc_miln / nok, acc_miln > 0 ? acc_milr / acc_miln : 0.0); acc_mil = acc_miln = acc_milr = 0; }
+            if (g_fibh) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " fib bce %.4f dir %.4f (%.0f%% of windows)", acc_fhn > 0 ? acc_fh[0] / acc_fhn : 0.0, acc_fhn > 0 ? acc_fh[1] / acc_fhn : 0.0, 100.0 * acc_fhn / nok); }
             if (g_ptrunc_tau > 0) { unsigned long long pc[2]; nn_phase_trunc_counts(pc); size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " trunc %.4f", pc[0] ? (double)pc[1] / pc[0] : 0.0); }
-            else if (g_unwrap && !g_unwrap2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f normal bce %.4f", acc_ink / nacc, acc_norm / nacc); }
-            if (g_fibdir > 0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " dir bce %.4f", acc_norm / nacc); }
-            if (g_ds) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ds %.4f", acc_ds / nacc); }
+            else if (g_unwrap && !g_unwrap2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f normal bce %.4f", acc_ink / nok, acc_norm / nok); }
+            if (g_fibdir > 0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " dir bce %.4f", acc_norm / nok); }
+            if (g_ds) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ds %.4f", acc_ds / nok); }
             if (g_ssl) { size_t na = strlen(affs); if (acc_ssln > 0) snprintf(affs + na, sizeof affs - na, " ssl %.4f var %.4f std %.3f (%.0f windows, %.1f%% cells)", acc_ssl / acc_ssln, acc_sslv / acc_ssln, acc_ssls / acc_ssln, acc_ssln, 100. * acc_sslc / acc_ssln / g_ssl_S); }   /* (nothing on lines without an unlabelled window: the labelled-only layout logs as before) */
             if (acc_ssln > 0) for (int h = 0; h < g_sslh.nh; h++) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ssl-%s %.4f (%.1f%% gated)", g_sslh_name[h], acc_sslh[h] / acc_ssln, 100. * acc_sslhg[h] / acc_ssln); }
-            if (g_distill) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " distill %.4f (%.1f%% cells)", acc_emb / nacc, 100. * acc_embc / nacc / ((double)g_distill_n / g_distill));
+            if (g_distill) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " distill %.4f (%.1f%% cells)", acc_emb / nok, 100. * acc_embc / nok / ((double)g_distill_n / g_distill));
                 if (g_distill_pap > 0) { static size_t pc0, pk0; const size_t pc = atomic_load(&g_emb_pap_cleared), pk = atomic_load(&g_emb_pap_kept); na = strlen(affs);
                     if (pc + pk > pc0 + pk0) snprintf(affs + na, sizeof affs - na, " (papyrus gate kept %.1f%% of the targeted)", 100. * (double)(pk - pk0) / (double)(pc + pk - pc0 - pk0)); pc0 = pc; pk0 = pk; } }
-            if (g_cond) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " cond bce %.4f acc %.3f", acc_cond / nacc, acc_ck > 0 ? acc_cr / acc_ck : -1.0); }
-            if (g_pap_head) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " papyrus bce %.4f", acc_pap / nacc); }
+            if (g_cond) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " cond bce %.4f acc %.3f", acc_cond / nok, acc_ck > 0 ? acc_cr / acc_ck : -1.0); }
+            if (g_pap_head) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " papyrus bce %.4f", acc_pap / nok); }
             if (g_restore) { size_t na = strlen(affs); const double p = psnr_of(acc_re, acc_rn), pb = psnr_of(acc_rb, acc_rn);
                              snprintf(affs + na, sizeof affs - na, " psnr %.2f input %.2f gain %+.3f (%.0f Mvox/s)", p, pb, p - pb, (double)nacc * g_Pz * P * P / 1e6 / dt); acc_rn = acc_re = acc_rb = 0; }
-            if (g_count_lambda > 0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " count %.4f (turns pred/true %.3f)", acc_cnt / nacc, acc_cnr / nacc);
+            if (g_count_lambda > 0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " count %.4f (turns pred/true %.3f)", acc_cnt / nok, acc_cnr / nok);
                 if (g_cnt_ns) { na = strlen(affs); snprintf(affs + na, sizeof affs - na, " bins"); for (int b = 0; b <= g_cnt_ns; b++) { na = strlen(affs); snprintf(affs + na, sizeof affs - na, " %.3f", acc_cbin[2 * b + 1] > 0 ? acc_cbin[2 * b] / acc_cbin[2 * b + 1] : 0.); } }
                 memset(acc_cbin, 0, sizeof acc_cbin); }
             if (g_aff) { const float *a = G[0].aff_out; size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " aff %.4f (d1 bce %.3f dice %.3f | d8 bce %.3f dice %.3f)", G[0].aff_loss,
@@ -4926,7 +4929,7 @@ int cmd_train(int argc, char **argv) {
                 const float q = unet_qk_lmax(G[0].u); if (q >= 0.f) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " qk %.1f", q); }
             }
             if (accum > 1) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " (update %d: %d windows each)", step / accum, accum); }   /* --accum: steps are windows */
-            fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s %.1f Mvox/s (wait %.0f%%)%s%s\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, affs, acc_g / nacc,
+            fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s %.1f Mvox/s (wait %.0f%%)%s%s\n", step, lr, acc_loss / nok, acc_bce / nok, acc_dice / nok, affs, acc_g / nok,
                     (double)nacc * B * nl / dt, (double)nacc * B * nl * g_Pz * P * P / 1e6 / dt, 100 * wait / dt, vl >= 0 ? " val " : "", vl >= 0 ? vstr : "");
             {   /* the on-the-fly phase since the last log line: reads, tiles (on the GPU), the pair rule's seconds per read (summed over threads) */
                 static phase_onfly_stats o0; phase_onfly_stats o1; phase_onfly_get_stats(&o1);
@@ -4954,10 +4957,10 @@ int cmd_train(int argc, char **argv) {
               if (memlog) { fprintf(stderr, "  device memory free:"); for (int g = 0; g < ng; g++) { nn_init(G[g].dev); fprintf(stderr, " GPU %d %.1f MB", G[g].dev, nn_mem_free() / 1e6); } fprintf(stderr, "\n"); nn_init(G[0].dev); } }
             { static int hm = -1, hmn = 0; if (hm < 0) hm = ufsm_env_on("UFSM_HOSTMEM");   /* host memory by owner at each log line (sampler_hostmem) */
               if (hm) { sampler_hostmem(sp, stderr, nn_host_bytes()); if (hmn++ == 1) nn_host_report(stderr); } }
-            if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f\n", step, lr, acc_loss / nacc, acc_bce / nacc, acc_dice / nacc, active, acc_g / nacc, vstr, (double)nacc * B * nl / dt, wait); fflush(log); }
+            if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f\n", step, lr, acc_loss / nok, acc_bce / nok, acc_dice / nok, active, acc_g / nok, vstr, (double)nacc * B * nl / dt, wait); fflush(log); }
             if (prof) { fprintf(stderr, "per-op GPU ms over the last %d steps (all GPUs):\n", log_every); unet_prof_report(); }
             nn_ptick_report(log_every);
-            acc_fh[0] = acc_fh[1] = acc_fhn = 0; acc_inkn = 0; acc_fib = acc_fibv = acc_fibn = 0; acc_emb = acc_embc = 0; acc_ssl = acc_sslv = acc_ssls = acc_sslc = acc_ssln = 0; for (int h = 0; h < SSLH_MAX; h++) acc_sslh[h] = acc_sslhg[h] = 0; acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = acc_w4 = acc_w4w = acc_w4a = acc_pg = acc_rv = 0; acc_siden = acc_normn = acc_w4n = 0; nacc = 0; tlog = now(); wait = 0;
+            acc_fh[0] = acc_fh[1] = acc_fhn = 0; acc_inkn = 0; acc_fib = acc_fibv = acc_fibn = 0; acc_emb = acc_embc = 0; acc_ssl = acc_sslv = acc_ssls = acc_sslc = acc_ssln = 0; for (int h = 0; h < SSLH_MAX; h++) acc_sslh[h] = acc_sslhg[h] = 0; acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = acc_w4 = acc_w4w = acc_w4a = acc_pg = acc_rv = 0; acc_siden = acc_normn = acc_w4n = 0; nacc = 0; nskl = 0; tlog = now(); wait = 0;
         }
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);
