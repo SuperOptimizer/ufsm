@@ -143,6 +143,11 @@ size_t unet_gfilm_off(const unet *u);
 void unet_set_gfilm_reduce(unet *u, void (*fn)(void *ctx, float *dg, int K), void *ctx, int top, int dedup);
 void unet_head_offsets(const unet *u, size_t *w, size_t *b);   /* the 1^3 head's weights (cout x its input channels) and biases (cout) in the flat parameters */
 const float *unet_live_params(const unet *u);   /* device weights the optimiser trains (p) */
+const float *unet_active_params(const unet *u);   /* the weights the forward reads: EMA after unet_use_ema(u, 1), else p (predict's fine stem, audit 11-14 infer #1) */
+void unet_set_load_infer(int on);   /* 1: unet_load reads weights + EMA only (no moments, no Muon state): inference processes */
+void unet_infer_release(unet *u, int keep_p);   /* free the training state (gradients, moments, Muon; p too when the EMA is in use and !keep_p) */
+void unet_gn_ema_live(unet *u, int on);   /* cfg.gn_ema: 1 = inference forwards normalise with the window's own statistics (the training-mode function) */
+void unet_set_um_rungs(const float *um, int n);   /* train --um-rungs: written to the header as "um_rungs" */
 const float *unet_ema_params(const unet *u);    /* the EMA weights (a shared-weights net reads them through unet_use_params: the teacher) */
 void unet_use_params(unet *u, const float *w);  /* forward with these device weights (unet_nparams floats); nullptr restores */
 void unet_grad_head_only(unet *u, int blocks);   /* zero all gradients but the output head's (and the last decoder blocks') */

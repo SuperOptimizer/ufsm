@@ -6,6 +6,26 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Inference fixes for the scratch2 net (2026-11-14, branch inferfix-20261114, audit infer.md)
+
+From the inference audit (/vesuvius/ufsm/audit-20261114/infer.md). No GPU numbers: the pod measurement was cancelled with the MEGA pass.
+- **Fine stem on the EMA weights:** predict passed `unet_live_params` (p) to the fine stem at all four sites, while the trunk ran on the
+  EMA (`--ema 1`, the default). scratch2 snap 2000: fstem W2 |ema - p| / |p| 0.23. `unet_active_params` gives the weights the forward
+  reads.
+- **Inference load:** `unet_set_load_infer(1)` reads p and ema only. `unet_infer_release` frees g, m and v (and p when the EMA is used
+  without a blend, no sparse24 / wq). For the 92 M net that is 1.25-1.7 GB of device memory back in the window budget and 2.1 -> 0.83 GB
+  read. `UFSM_PRED_TRAINSTATE=1` keeps the old behaviour (test_predict_heads compares the bytes).
+- **`--gn-live 1`:** gn_ema nets normalise with each window's own statistics, the function scratch2 trains with while --gn-ema-warm
+  1e9 is not reached. This is for the A/B; the default stays the running statistics, and predict prints a note when they were never
+  trained on.
+- **`--heads --resume 1`:** each head logs its shards to `<out>/<head>/predict-done-<lv>.txt`. A shard is skipped when every head lists it.
+- **skip-empty on latvol:** a skip-trained net on a latvol CT whose basis is the checkpoint's took the stored-index input and built no
+  masks, i.e. the dense net. It now takes the input from the rebuilt CT so the masks are built. With `--latents` there is a warning.
+- **Diagnostics:** the halo against the theoretical RF (cells), the bottleneck token count against the training window, and the level's
+  um against the new header key `um_rungs` (written by train --um-rungs only when given).
+- **Provenance:** a `"provenance"` object in every store's attributes: ckpt bytes / mtime / header FNV-1a, binary path, level um, gn
+  mode, skip-empty, norm, fstem, ema.
+
 ## Unroll fixes from the pipeline audit: axis refusal, two-ended trim, distortion gate, run manifest (2026-11-14, branch unrollfix-20261114)
 
 From the inference / unroll audit (`/vesuvius/ufsm/audit-20261114/unroll.md`). Direction (`dir`) handling belongs to fibfit and is not

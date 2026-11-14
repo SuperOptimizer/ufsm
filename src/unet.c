@@ -88,7 +88,7 @@ struct unet {
     int gn_frz_train;                 /* unet_gn_freeze_train: training forwards use them too (diagnostics: no backward after such a forward) */
     float *gn_frz_d;                  /* their device copy (uploaded once; each forward replays it into the sites with async device copies) */
     double *gn_acc; long gn_acc_n;     /* unet_gn_accumulate: sums of the window statistics (mean, mean^2 per mean slot, variance per rstd slot) */
-    float *ge_run; size_t ge_ns, ge_twn; long ge_n; int ge_warm, ge_c, ge_nsite; float ge_mom, *ge_tw;   /* cfg.gn_ema: [3][ge_ns] running
+    float *ge_run; size_t ge_ns, ge_twn; long ge_n; int ge_warm, ge_c, ge_nsite, ge_live; float ge_mom, *ge_tw;   /* cfg.gn_ema: [3][ge_ns] running
                                                  statistics (live weights, EMA weights, the last batch's; gn_sites layout, [mean g | var g]
                                                  per pair); ge_c: this forward's are the running ones (latched for the backward); ge_tw:
                                                  the convs' live statistics while constant ([n][g] per site at n * offset) */
@@ -2167,7 +2167,7 @@ static void ge_begin(unet *u) {   /* forward start: latch ge_c, the running stat
     u->ge_nsite = 0; gn_sites(u, ge_site1, nullptr);
     if (u->ge_nsite > 192 || (u->ge_nsite & 1)) { fprintf(stderr, "unet: gn_ema: %d GroupNorm sites (at most 192, in pairs)\n", u->ge_nsite); abort(); }
     const int N = u->xs.n;
-    u->ge_c = !gn_frozen(u) && u->ge_n > 0 && (!u->fwd_train || u->ge_n >= u->ge_warm);
+    u->ge_c = !gn_frozen(u) && u->ge_n > 0 && (!u->fwd_train || u->ge_n >= u->ge_warm) && !(u->ge_live && !u->fwd_train);   /* (ge_live: inference on the window's own statistics) */
     if (!u->ge_c) return;
     if (u->fwd_train && u->ge_twn < (size_t)N * u->ge_ns) { nn_free(u->ge_tw); u->ge_twn = (size_t)N * u->ge_ns; u->ge_tw = nn_malloc(u->ge_twn * 4); }
     const float *run = u->ge_run + (u->using_ema ? u->ge_ns : 0);   /* (EMA weights: their own) */
@@ -2192,6 +2192,7 @@ static void ge_after(unet *u) {   /* training forward, live weights: the batch's
     else nn_ema_finite(run, bat, u->ge_ns, 1.f - u->ge_mom, sk);
     u->ge_n++;
 }
+void unet_gn_ema_live(unet *u, int on) { u->ge_live = on != 0; }
 void unet_set_gn_ema(unet *u, float mom, int warm) { u->ge_mom = mom; u->ge_warm = warm; }
 /* after unet_load (which takes the checkpoint's): mom >= 0 / warm >= 0 replace them (train --gn-ema-mom / --gn-ema-warm on a resume; saved with
    the next checkpoint). A warm-up beyond the run's length keeps the training forward on batch statistics while the running ones still
@@ -4551,6 +4552,7 @@ void unet_ema(unet *u, float decay) {
     if (u->cfg.gn_ema && u->ge_n) nn_ema(u->ge_run + u->ge_ns, u->ge_run + 2 * u->ge_ns, u->ge_ns, decay);   /* gn_ema: the EMA weights' statistics */
 }
 const float *unet_live_params(const unet *u) { return u->p; }
+const float *unet_active_params(const unet *u) { return u->live ? u->live : u->p; }   /* the weights the forward reads (EMA after unet_use_ema(u, 1)) */
 /* zero every gradient but the output head's (weights and biases): train only the head on frozen features */
 void unet_grad_head_only(unet *u, int blocks) {   /* blocks: also train the last decoder blocks dec[blocks-1] .. dec[0] */
     const int k = blocks < 0 ? 0 : blocks > u->cfg.nlev - 1 ? u->cfg.nlev - 1 : blocks;
@@ -4823,6 +4825,8 @@ static float g_loaded_adema[UNET_MAXCONV]; static int g_loaded_adema_n; static d
 static size_t *g_loaded_inh; static int g_loaded_ninh;   /* init_inh of the header (pairs) */
 static void inh_add(unet *u, size_t off, size_t n);
 static int g_loaded_lat_c; static float g_loaded_lat_step, g_loaded_lat_gain[29], g_loaded_lat_bas[29 * 64];   /* the cell transform of the last header read */
+static float g_um_rungs[8]; static int g_um_rungs_n;   /* train --um-rungs (header key um_rungs, only when set) */
+void unet_set_um_rungs(const float *um, int n) { g_um_rungs_n = n < 0 ? 0 : n > 8 ? 8 : n; for (int i = 0; i < g_um_rungs_n; i++) g_um_rungs[i] = um[i]; }
 static long g_loaded_ge_n; static int g_loaded_ge_warm; static float g_loaded_ge_mom, *g_loaded_ge_run; static size_t g_loaded_ge_cnt;   /* cfg.gn_ema */
 static long g_loaded_l0_n; static int g_loaded_l0_warm, g_loaded_l0_cnt; static float g_loaded_l0_mom, g_loaded_l0_run[16 * 256];   /* cfg.l0_norm ema */
 /* debug: per block, the GroupNorm statistics of the last forward (mean / rstd of a1 and a2 per sample and group:
@@ -4941,6 +4945,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     }
     if (u->cfg.scan_norm) fputs(",\"scan_norm\":1", f);
     if (u->cfg.skip_thr > 0) fprintf(f, ",\"skip_empty\":[%d,%d,%d]", u->cfg.skip_thr - 1, u->cfg.skip_margin, u->cfg.skip_nl);
+    if (g_um_rungs_n > 0) { fputs(",\"um_rungs\":[", f); for (int i = 0; i < g_um_rungs_n; i++) fprintf(f, "%s%.6g", i ? "," : "", g_um_rungs[i]); fputc(']', f); }   /* (train --um-rungs: predict checks its level against them) */
     if (u->cfg.gfilm) fputs(",\"gfilm\":1", f);
     if (u->cfg.gn_ema) {   /* the running statistics of every site (live weights, EMA weights; gn_sites layout) and their state */
         ge_alloc(u); const size_t n = 2 * u->ge_ns; float *r = malloc(n * 4); nn_d2h(r, u->ge_run, n * 4);
@@ -5086,6 +5091,15 @@ int unet_peek(const char *path, unet_cfg *cfg, int *step) {
     return rc;
 }
 
+/* inference loads (predict, audit 2026-11-14 infer #4): unet_load reads p and ema only, unet_infer_release frees the training state */
+static int g_load_infer;
+void unet_set_load_infer(int on) { g_load_infer = on != 0; }
+void unet_infer_release(unet *u, int keep_p) {
+    if (u->muon_mom && u->muon_mom != u->v) nn_free(u->muon_mom);
+    u->muon_mom = nullptr;
+    nn_free(u->g); nn_free(u->m); nn_free(u->v); u->g = u->m = u->v = nullptr;
+    if (!keep_p && u->using_ema && u->live == u->ema && u->fw != u->p && !u->sparse24 && !u->wq) { nn_free(u->p); u->p = nullptr; }
+}
 int unet_load(unet *u, const char *path) {
     nn_wmemo_clear();
     FILE *f = fopen(path, "rb");
@@ -5105,6 +5119,7 @@ int unet_load(unet *u, const char *path) {
     float *h = malloc(u->np * 4), *hc = i1 ? malloc(u->np * 4) : nullptr;
     float *arrs[4] = {u->p, u->ema, u->m, u->v};
     for (int a = 0; a < 4; a++) {
+        if (a >= 2 && g_load_infer) break;   /* unet_set_load_infer: weights and EMA only (the moments and the Muon state: never read, released after) */
         if (fread(h, 4, np, f) != np) { if (a < 2) { fclose(f); free(h); free(hc); return -1; } break; }
         if (i1) {   /* old [0, i0) | the block (this net's init for p / ema, 0 for the moments) | old [i0, np) */
             if (a < 2) nn_d2h(hc, u->p, u->np * 4); else memset(hc, 0, u->np * 4);   /* (the EMA of the block: its fresh weights too) */
@@ -5112,7 +5127,8 @@ int unet_load(unet *u, const char *path) {
         }
         nn_h2d(arrs[a], h, u->np * 4);
     }
-    if (g_loaded_muon) {
+    if (g_loaded_muon && g_load_infer) { }   /* (inference: no Muon state) */
+    else if (g_loaded_muon) {
         if (fread(h, 4, np, f) != np) { fclose(f); free(h); free(hc); return -1; }
         if (i1) { memmove(h + i1, h + i0, (np - i0) * 4); memset(h + i0, 0, (i1 - i0) * 4); }
         if (!u->muon_mom) u->muon_mom = mom_alloc(u);
