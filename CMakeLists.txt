@@ -16,6 +16,7 @@ option(UFSM_VERIFY "bf16 / fp32 tensor-core instantiations as well (-DUFSM_ALL_T
 set(UFSM_ARCH 120 CACHE STRING "GPU target: 120 (GeForce / RTX PRO Blackwell, lp_* on sm_120a) or 86 (Ampere, software MX)")
 option(UFSM_LLVM_RUNTIME "compiler-rt builtins and crt files instead of libgcc.a / gcc crtbegin" ON)
 option(UFSM_CCACHE "compile through ccache when it is installed" ON)
+option(UFSM_STRICT_MATH "IEEE host C (no contraction) and IEEE / no-FMA UFSM_STRICT_UNITS: the bit-exact GPU-vs-CPU build (pre 2026-11-14 default)" OFF)
 set(UFSM_CUDA_COMPILER nvcc CACHE STRING "device compiler: nvcc (nvcc -ccbin clang++, the default: clang -x cuda kernels ran 1.35x slower on sm_120, DESIGN 2026-11-13) or clang (clang -x cuda)")
 set(UFSM_CUDA "" CACHE PATH "CUDA toolkit root (default: /usr/local/cuda, else the newest /usr/local/cuda-*, else nvcc's prefix)")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -71,16 +72,37 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(UFSM_DEPS REQUIRED IMPORTED_TARGET libcurl libzstd blosc zlib libcrypto)
 
 # --- flags -----------------------------------------------------------------------------------------------------------------
-# Host C. -ffp-contract=off: gcc -std=c23 (ISO mode) never contracted a*b+c into an FMA, clang's default (on) would, and the
-# byte-exact host references (volcomp, count-field, the GPU-vs-CPU tests) are written against uncontracted arithmetic.
-# -fno-math-errno: value-neutral (only errno), lets sqrtf / fabsf vectorise without the errno call-out (sample.c relied on a
-# gcc-only optimize("no-math-errno") attribute for that).
-set(UFSM_CFLAGS -std=c23 -O3 -march=native -g -Wall -Wextra -Werror=comment -Wno-unused-parameter -pthread
-    -ffp-contract=off -fno-math-errno)
+# Host C, default (2026-11-14, DESIGN "Fast math everywhere"): -ffast-math -fno-finite-math-only. Reassociation (vectorised float
+# reductions), FMA contraction (fast: across statements), reciprocal division, no signed zeros, approximate libm, no errno.
+# -fno-finite-math-only is required, not a tuning: ~226 isnan / isfinite / NaN-fill uses (the loss's NaN guards, fwd_nan, zarr fill
+# values, volcomp's typed-chunk checks) would be folded to false under finite-math-only and the guards silently deleted.
+# Nothing in src/ depends on signed zeros (the copysignf sites take the sign of nonzero data) or on errno from libm (the errno reads
+# follow strtod / I/O). -ffast-math is a compile flag only: the link does not get it, so crtfastmath.o (process-wide FTZ / DAZ in
+# MXCSR) is not linked and host denormals stay IEEE. volcomp's surface-chunk base (whose entropy contexts are read from its own
+# reconstruction, so encoder and decoder must agree to the bit) is fenced by its own `#pragma clang fp contract(off)
+# reassociate(off)` (third_party/volcomp.h VF_STRICT_BEGIN) and stays bit-exact under fast math.
+# UFSM_STRICT_MATH=ON: the old IEEE host flags. -ffp-contract=off: gcc -std=c23 (ISO mode) never contracted a*b+c into an FMA,
+# clang's default (on) would, and the byte-exact host references (volcomp, count-field, the GPU-vs-CPU tests) are written against
+# uncontracted arithmetic. -fno-math-errno: value-neutral, lets sqrtf / fabsf vectorise without the errno call-out.
+if(UFSM_STRICT_MATH)
+  set(UFSM_FP_CFLAGS -ffp-contract=off -fno-math-errno)
+else()
+  set(UFSM_FP_CFLAGS -ffast-math -fno-finite-math-only)
+endif()
+set(UFSM_CFLAGS -std=c23 -O3 -march=native -g -Wall -Wextra -Werror=comment -Wno-unused-parameter -pthread ${UFSM_FP_CFLAGS})
 set(UFSM_EXTRA_CFLAGS "" CACHE STRING "extra host C flags, appended last (experiments: -O0, -fsanitize=...)")
 separate_arguments(_extra UNIX_COMMAND "${UFSM_EXTRA_CFLAGS}")
 list(APPEND UFSM_CFLAGS ${_extra})
 set(UFSM_DEFS _GNU_SOURCE)
+if(UFSM_STRICT_MATH)
+  list(APPEND UFSM_DEFS UFSM_STRICT_MATH)   # tests/fm_tol.h: the GPU-vs-CPU / two-path tolerances collapse to exact
+endif()
+# for the shell tests (tests/fm_tol.sh reads $B/strict_math): 1 under UFSM_STRICT_MATH, else 0
+if(UFSM_STRICT_MATH)
+  file(WRITE ${CMAKE_BINARY_DIR}/strict_math "1\n")
+else()
+  file(WRITE ${CMAKE_BINARY_DIR}/strict_math "0\n")
+endif()
 set(UFSM_INC ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party ${CMAKE_SOURCE_DIR}/third_party/surfcomp)
 # Runtime: compiler-rt (builtins, crtbegin / crtend) instead of libgcc.a and gcc's crt files. The C++ library stays libstdc++ (with
 # libgcc_s for unwinding), shared as before: CUDA's headers refuse libc++ on x86 (crt/host_defines.h: "libc++ is not supported on
@@ -135,7 +157,9 @@ endif()
 # UFSM_DEVICE_FAST_MATH: the rest of nvcc's fast-math intrinsic mapping (expf -> __expf ..., src/clang_cuda_compat.cuh)
 set(UFSM_CU_FAST -DUFSM_DEVICE_FAST_MATH -fgpu-flush-denormals-to-zero -fgpu-approx-transcendentals "SHELL:-Xarch_device -fapprox-func"
     "SHELL:-Xarch_device -ffp-contract=on")
-# byte-identical to their CPU versions: IEEE division / sqrt, no FMA contraction, no flush (nvcc -fmad=false, no fast math).
+# UFSM_STRICT_UNITS: the units that, under UFSM_STRICT_MATH=ON, are byte-identical to their CPU versions: IEEE division / sqrt, no
+# FMA contraction, no flush (nvcc -fmad=false, no fast math). By default (2026-11-14) they get UFSM_CU_FAST like every other unit
+# and the host is fast math too, so GPU and CPU agree within tolerances (tests/fm_tol.h, DESIGN "Fast math everywhere") instead.
 # clang leaves libdevice's __CUDA_PREC_SQRT reflection at 0, so sqrtf would be sqrt.approx.f32 even without fast math (nvcc:
 # sqrt.rn.f32); the reflection is set explicitly (-mllvm reaches the host pass too, where it does nothing). Checked 2026-11-13: the
 # PTX of every strict unit uses the same float instruction kinds as nvcc -fmad=false (div.rn, sqrt.rn, no fma / approx / ftz).
@@ -241,7 +265,7 @@ function(ufsm_cuda_obj name src arch)
   if(NOT UFSM_CUDA_COMPILER STREQUAL "nvcc")
     set_source_files_properties(${src} PROPERTIES LANGUAGE CXX)
   endif()
-  if(name IN_LIST UFSM_STRICT_UNITS)
+  if(UFSM_STRICT_MATH AND name IN_LIST UFSM_STRICT_UNITS)
     set(fp ${UFSM_CU_STRICT})
   else()
     set(fp ${UFSM_CU_FAST})
