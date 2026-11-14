@@ -488,6 +488,47 @@ cudaEvent_t zs_hev(int dev, int side, int slot, int k) {   /* 0 packed, 1 arrive
     if (!init[q]) { int cur; cudaGetDevice(&cur); cudaSetDevice(dev); for (int i = 0; i < 6; i++) cudaEventCreateWithFlags(&ev[q][i / 3][i % 3], cudaEventDisableTiming); cudaSetDevice(cur); init[q] = 1; }
     return ev[q][slot & 1][k];
 }
+/* small peer copies by kernels through mapped pinned host memory (2026-11-14). Without P2P (the desk's 5060 Tis) cudaMemcpyPeerAsync is
+   staged through the host on the copy engines, and a copy engine runs its queue in order across streams: the split's GN-statistics
+   all-reduce, halos and sums (bytes to < 1 MB) waited behind the activation offloads' 606 / 1212 MB copies, both cards idle 50-88 ms at
+   a time, ~175 ms per step (desk nsys, scratch2, 11-13). A kernel writing to / reading from mapped host memory does not use the copy
+   engines: a 4 KB / 1 MB round trip took 0.04 / 0.35 ms beside a running 1212 MB D2H or H2D, the copy engine 39 ms (RTX PRO 4000,
+   kcopy bench). Copies up to UFSM_PEER_KCOPY_KB (default 4096; 0: off) from and to 16-byte aligned addresses take this path; dst on di, src on dj,
+   ordered on di's stream si as cudaMemcpyPeerAsync(dst, di, src, dj, n, si) is: dj's helper stream waits for si, a kernel there writes
+   the bytes to the staging buffer, si waits for that and a kernel copies them in; the staging buffer's next write waits for this read */
+__global__ void kc16_k(uint4 *d, const uint4 *s, size_t nb) {   /* nb bytes, 16-byte aligned ends; the tail below 16 bytewise */
+    const size_t n = nb / 16, t = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    for (size_t i = t; i < n; i += (size_t)gridDim.x * blockDim.x) d[i] = s[i];
+    if (t < nb - n * 16) ((char *)d)[n * 16 + t] = ((const char *)s)[n * 16 + t];
+    __threadfence_system();
+}
+static size_t kc_max(void) { static long v = -1; if (v < 0) { const char *e = getenv("UFSM_PEER_KCOPY_KB"); v = (e ? atol(e) : 4096) * 1024; } return (size_t)v; }
+struct kc_t { void *h; cudaStream_t sj; cudaEvent_t go, wrote, read; int init; };
+static kc_t g_kc[8][8];   /* [source device][destination device] */
+static void peer_copy(void *dst, int di, const void *src, int dj, size_t n, cudaStream_t si) {
+    if (!n) return;
+    static int same = -1; if (same < 0) same = getenv("UFSM_PEER_KCOPY_SAME") != nullptr;   /* (tests: the path on one GPU, the split's emulation) */
+    if ((di == dj && !same) || n > kc_max() || ((uintptr_t)dst | (uintptr_t)src) & 15) { CK(cudaMemcpyPeerAsync(dst, di, src, dj, n, si)); return; }
+    kc_t *k = &g_kc[dj & 7][di & 7];
+    if (!k->init) {
+        if (cudaHostAlloc(&k->h, kc_max(), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) { cudaGetLastError(); k->h = nullptr; }
+        CK(cudaSetDevice(dj)); CK(cudaStreamCreateWithFlags(&k->sj, cudaStreamNonBlocking)); CK(cudaEventCreateWithFlags(&k->wrote, cudaEventDisableTiming));
+        CK(cudaSetDevice(di)); CK(cudaEventCreateWithFlags(&k->go, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&k->read, cudaEventDisableTiming));
+        CK(cudaEventRecord(k->read, si));
+        k->init = 1;
+    }
+    if (!k->h) { CK(cudaMemcpyPeerAsync(dst, di, src, dj, n, si)); return; }
+    const size_t n16 = n / 16 + 1; const int nb = (int)((n16 + 255) / 256 < 128 ? (n16 + 255) / 256 : 128);
+    CK(cudaEventRecord(k->go, si));
+    CK(cudaSetDevice(dj));
+    CK(cudaStreamWaitEvent(k->sj, k->go, 0)); CK(cudaStreamWaitEvent(k->sj, k->read, 0));
+    kc16_k<<<nb, 256, 0, k->sj>>>((uint4 *)k->h, (const uint4 *)src, n);
+    CK(cudaEventRecord(k->wrote, k->sj));
+    CK(cudaSetDevice(di));
+    CK(cudaStreamWaitEvent(si, k->wrote, 0));
+    kc16_k<<<nb, 256, 0, si>>>((uint4 *)dst, (const uint4 *)k->h, n);
+    CK(cudaEventRecord(k->read, si));
+}
 extern "C" void nn_split_halo_begin(void *const *t, const int *dev, shape5 s, int esz, int h, void *const *sb, void *const *rb, int slot) {
     int cur; cudaGetDevice(&cur);
     g_zs_same = dev[0] == dev[1];
@@ -509,7 +550,7 @@ extern "C" void nn_split_halo_begin(void *const *t, const int *dev, shape5 s, in
         cudaStream_t cs = zs_comm(dev[i], i);
         CK(cudaStreamWaitEvent(cs, zs_hev(dev[1 - i], 1 - i, slot, 0), 0));
         CK(cudaStreamWaitEvent(cs, zs_hev(dev[i], i, slot, 2), 0));        /* the previous exchange has unpacked this receive buffer */
-        CK(cudaMemcpyPeerAsync(rb[i], dev[i], sb[1 - i], dev[1 - i], nbytes, cs));
+        peer_copy(rb[i], dev[i], sb[1 - i], dev[1 - i], nbytes, cs);
         CK(cudaEventRecord(zs_hev(dev[i], i, slot, 1), cs));
     }
     cudaSetDevice(cur);
@@ -532,7 +573,7 @@ extern "C" void nn_split_halo_k(void *const *t, const int *dev, shape5 s, int es
     const int D = s.d, zsend[2] = {D - h - k, h}, zrecv[2] = {D - h, h - k};
     for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); zsegs_copy(t[i], sg[i], ns, zsend[i], k, sb[i], 0); }
     zs_xbar(dev, 2);   /* (both send buffers packed) */
-    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaMemcpyPeerAsync(rb[i], dev[i], sb[1 - i], dev[1 - i], nbytes, 0)); zsegs_copy(t[i], sg[i], ns, zrecv[i], k, rb[i], 1); }
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); peer_copy(rb[i], dev[i], sb[1 - i], dev[1 - i], nbytes, 0); zsegs_copy(t[i], sg[i], ns, zrecv[i], k, rb[i], 1); }
     zs_xbar(dev, 3);   /* (both copies done before either send buffer is reused) */
     cudaSetDevice(cur);
     KCHECK();
@@ -551,7 +592,7 @@ extern "C" void nn_split_gather(void *const *t, const int *dev, shape5 s, int es
     zs_xbar(dev, 2);   /* (both packed) */
     for (int i = 0; i < 2; i++) {
         cudaSetDevice(dev[i]);
-        CK(cudaMemcpyPeerAsync(rb[i], dev[i], sb[1 - i], dev[1 - i], nbytes, 0));
+        peer_copy(rb[i], dev[i], sb[1 - i], dev[1 - i], nbytes, 0);
         zsegs_copy(t[i], sgf[i], ns, i ? no : 0, no, sb[i], 1); zsegs_copy(t[i], sgf[i], ns, i ? 0 : no, no, rb[i], 1);
     }
     zs_xbar(dev, 3);   /* (both copies done before either send buffer is reused) */
@@ -577,7 +618,7 @@ extern "C" void nn_split_xchg(const int *dev, const void *const *send, void *con
     for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaEventRecord(zs_gev(dev[i], i, 0), s[i])); }   /* each side's sends are ready */
     for (int i = 0; i < 2; i++) {
         cudaSetDevice(dev[i]); CK(cudaStreamWaitEvent(s[i], zs_gev(dev[1 - i], 1 - i, 0), 0));
-        if (nr[i]) CK(cudaMemcpyPeerAsync(recv[i], dev[i], send[1 - i], dev[1 - i], nr[i], s[i]));
+        if (nr[i]) peer_copy(recv[i], dev[i], send[1 - i], dev[1 - i], nr[i], s[i]);
         CK(cudaEventRecord(zs_gev(dev[i], i, 1), s[i]));
     }
     for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaStreamWaitEvent(s[i], zs_gev(dev[1 - i], 1 - i, 1), 0)); }   /* the peer has read my send buffer */
@@ -664,7 +705,7 @@ __global__ void zs_add_k(double *a, const double *b, int n) { int i = blockIdx.x
 extern "C" void nn_split_allreduce(double *const *b, const int *dev, int n, double *const *r) {
     int cur; cudaGetDevice(&cur);
     zs_xbar(dev, 2);
-    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); CK(cudaMemcpyPeerAsync(r[i], dev[i], b[1 - i], dev[1 - i], (size_t)n * sizeof(double), 0)); }
+    for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); peer_copy(r[i], dev[i], b[1 - i], dev[1 - i], (size_t)n * sizeof(double), 0); }
     zs_xbar(dev, 3);   /* both copies done before either sum overwrites its source */
     for (int i = 0; i < 2; i++) { cudaSetDevice(dev[i]); zs_add_k<<<nblk(n, 128), 128>>>(b[i], r[i], n); }
     cudaSetDevice(cur);

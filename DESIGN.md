@@ -6,6 +6,56 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Split peer copies off the copy engines (2026-11-14, branch peerk-20261114)
+
+**What was exposed.** The desk nsys of the scratch2 split step (11-13, ny2) shows both cards kernel-idle for ~175 ms per step at
+three points, each ending in `zs_add_k`, the split's GN-statistics all-reduce:
+
+| when | idle (ms) | big copy running |
+|---|---|---|
+| forward start | 81-88 | a 606 MB D2H, then a 1212 MB D2H (level-0 a1 out) |
+| backward | 50 | a 1212 MB H2D (a1 back) |
+| backward | 36 | a 1212 MB H2D (a1 back) |
+
+The all-reduce's peer copies are a few bytes to 0.84 MB. Without P2P on the 5060 Tis, `cudaMemcpyPeerAsync` is staged through the
+host on the copy engines. In the trace each tiny peer copy starts within 0.01 ms of the big copy's end: the copy engine runs its
+queue in order across streams. Every all-reduce issued during an a1 transfer therefore stalls both cards until the transfer ends.
+
+So the activation offloads themselves are overlapped as designed. What is exposed is the collective queued behind them on the copy
+engine.
+
+**Bench (RTX PRO 4000, kcopy.cu / cechunk.cu).**
+- A small D2H on another stream waited 39.4 ms behind a 1212 MB D2H. Splitting the big copy into chunks of 8-256 MB changed
+  nothing, because all chunks are queued ahead of it.
+- The same copy done by kernels through mapped pinned host memory (SM loads and stores over PCIe, no copy engine) took
+  0.04 ms (4 KB), 0.35 ms (1 MB) and 1.3 ms (4 MB), whether the copy engine was idle or busy.
+
+**Change.** `peer_copy` in nn_loss.cu replaces the five `cudaMemcpyPeerAsync` calls of the split: halo begin, halo k, gather, xchg
+and the GN all-reduce.
+- Copies up to `UFSM_PEER_KCOPY_KB` (default 4096; 0 off) between 16-byte aligned addresses take the kernel path.
+- Ordering: the source device's helper stream waits for the caller's stream. A kernel there writes the bytes to a per-direction
+  mapped staging buffer (with `__threadfence_system`). The caller's stream waits for that write, and a kernel copies the bytes in.
+- The staging buffer's next write waits for this read.
+- Larger or unaligned copies, and a one-GPU split, keep `cudaMemcpyPeerAsync`. `UFSM_PEER_KCOPY_SAME=1` forces the kernel path
+  on one GPU so the tests can cover it.
+
+**Tests.**
+- test_split_lat and test_split_gnbwd pass with and without `UFSM_PEER_KCOPY_SAME=1`. In test_split_lat that runs 5092 `kc16_k`
+  copies.
+- test_split (all its cases) passes with `UFSM_PEER_KCOPY_SAME=1`. The perf-pod fast tier passes apart from the pre-existing
+  test_wbench_stats, test_univ2 and test_lldec.
+
+**Desk A/B** (try4's stop 3, 11-14 06:22; `/vesuvius/ufsm/perf2/peerk_swap.sh`, the try4 recipe with `--echo-max 4`, 10 steps each).
+
+| arm | Mvox/s, steps 2-9 |
+|---|---|
+| `UFSM_PEER_KCOPY_KB=0` | 80.0 (74.9-83.7) |
+| kernel copies | 82.1 (78.4-86.1), +2.6 % |
+
+The nsys of the kernel-copy arm has no gap before the all-reduce behind an a1 transfer any more. What is left before a `kc16_k` is
+2-13 ms with no copy running: the two cards waiting on each other. The largest remaining idle is the step-boundary label warp:
+65 + 66 + 181 + 64 ms with 570 MB copies, which lsplit-20261114 moves under the forward.
+
 ## The early label warp under --split z (2026-11-14, branch lsplit-20261114)
 
 **Problem.** lab_early (2026-11-13, "The next batch's label warp under the forward", below) never engaged under `--split z`.
