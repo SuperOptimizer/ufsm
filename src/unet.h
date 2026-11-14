@@ -165,6 +165,7 @@ shape5 unet_out_shape(const unet *u, shape5 xs);
 /* Backward from d loss / d logits (device). Gradients ACCUMULATE into the flat grad array. */
 void unet_backward(unet *u, const float *glogits);
 void unet_debug_stats(const unet *u);
+int unet_grad_groups(unet *u, double *ss, char (*names)[8], int nmax);   /* per layer group squared gradient norms (e<i> / d<i> blocks, t<k> attention, head, rest); returns the count */
 void unet_debug_grads(const unet *u, const char *tag);   /* stderr: per-block conv / attention / head gradient norms */
 void unet_debug_acts(const unet *u);    /* stderr: per-block stored activations, non-finite counts and extremes per sample */   /* stderr: per-block GroupNorm statistics of the last forward and largest |weight| */
 /* g_h16: glogits already holds the 16-bit storage type scaled by the gradient scale (nn_set_loss_grad_h16) */
