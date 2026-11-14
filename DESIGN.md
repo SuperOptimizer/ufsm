@@ -6,6 +6,62 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Unroll fixes from the pipeline audit: axis refusal, two-ended trim, distortion gate, run manifest (2026-11-14, branch unrollfix-20261114)
+
+From the inference / unroll audit (`/vesuvius/ufsm/audit-20261114/unroll.md`). Direction (`dir`) handling belongs to fibfit and is not
+touched here.
+
+**predict without `--axis`.** A missing axis zeroed the radial input channels with no message (`ax.n == 0`). latink.sh and u1667ink.sh
+never passed one, and neither does the corpus inklib.sh, so every latent ink / c12 / c13 run and every ift3 corpus run went without.
+predict now exits 2 unless it gets `--axis`, `--no-axis 1`, or `UFSM_PRED_NO_AXIS=1`; tests/run_suite.sh sets the env for the fixtures,
+and test_pipeline_cli checks the refusal. latink.sh also took its CT from `tail -1` of the run's scrolls.tsv, which is the pods'
+one-row table; on the desk's table that row is PHerc0490B for every scroll. unroll.sh now passes `UNROLL_CT`. 1667 held-out AUC with
+the axis: AUC_PENDING.
+
+**Grid-256 ink pass.** The passes got the 512-aligned run box, which is off the shifted tile grid, so predict ran one 544^3 window per
+256 shard (u1667ink on 1667: grid 256 took 350 s against 71 s for grid 0). `pbox` moves the box down as seamless.c's `pass_box` does.
+The passes only feed ink-blend, so they now run with `--q 0 --levels 1`. TIME_PENDING.
+
+**Trim at both ends.** The outer trim used wrap-check's "dup" verdict. Against the 1667 GT its precision is 0.07 for dup and 0.014 for
+merged (spiral QA §1). On 1667 it dropped w040-w042, which are published turns 29-31. trim now walks in from each end and drops a wrap
+while any of these holds:
+- (1) it lies beyond the wrap-check table;
+- (2) its gap is collapsed: `rnet_med` < 0.6. rnet is the normal gap over the network's own sheet spacing; it stays ~1 where the papyrus
+  itself packs tighter (gap 230 -> 94 um), and drops where wraps pile up;
+- (3) it is near-empty: on-papyrus <= 0.1.
+
+On 1667 that gives --last 39 -> 42. w043 / w044 / w045 (rnet .56 / .45 / .36) are dropped; every wrap from w043 to w062 maps to
+published turn 29. Published area covered by the strip:
+
+| tolerance | old trim (w000-w039) | new trim (w000-w042) | no outer trim |
+|---|---|---|---|
+| 50 um | 0.749 | 0.772 | 0.778 |
+| 100 um | 0.818 | 0.843 | 0.851 |
+
+The inner core wraps w000-w011 sit inside the published first turn (r < 3.9 mm), but they are on papyrus (0.16-0.56, like the middle
+wraps) with rnet ~1, so they are kept. The published unwrap starts at r 3.9 mm; the 157.7 vs 140 cm length gap is not a fit error.
+`ufsm strip` reads ids >= 0 only, so trim names any kept negative ids instead of losing them silently. The per-wrap inputs go to
+state/trim.tsv.
+
+**distort stage.** strip-distort runs after stripflat (1667: 9 s). It fails when dist p95 > 0.35 (1667 .157, P4 .187), the folded
+share > 0.005 (1667 .0018, P4 .0006), or strip-flatten logged a "no mesh" chunk. DISTGATE=0 logs instead of failing.
+
+**render --fill-pm 0 by default.** PatchMatch copies texture from elsewhere on the render (1667 ws000: 10.6 % of pixels inpainted),
+and strip-mosaic counts those pixels as surface.
+
+**state/manifest.json.** It records the binary, ckpt, ink ckpt and axis sha256 (16 hex), the git commit and the env overrides, then per
+stage: dir and the count-field line, per-slab ref coherence, join agreement, wrap-check verdicts, trim, stripflat, distort and strip
+length. podpull.sh now also pulls logs/ and the ref / joined json. 14 of the 17 u1 runs kept only their images, so their direction can
+no longer be checked.
+
+**Smaller changes.** Field z parts are rounded to the nearest 512 voxels instead of floored to 1024 (1667 split 4096 / 5173). unroll's
+ink defaults to INKMODE=lat (latink.sh, inkpod 15000); INKMODE=ift3 runs the old pass.
+
+**Field seams (#5).** The existing u1 fields of 1667 (640/64 windows, no blend) step at every 256-cell tile border. Over the mean of a
+z 2048-2304 x 640^2 crop, the normal plane t0 changes by 5.4 / 6.1 across the y borders against an interior median of 1.34 (p99 3.6),
+and by 4.8 / 9.9 across the x borders against 2.0 (p99 4.8). The phase steps less: 0.24 against 0.18 in y, none in x. Sub-box A/B of
+640/64, 1152/64 and a two-grid field-blend: SEAM_PENDING.
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the
