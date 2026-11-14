@@ -55,6 +55,17 @@ on Paris 4: per z row the +-1 loops split 4:0 .. 16:71, and the middle row votes
 (PHerc1667 -1, with its evidence) and copies an empty-vote warning to progress.log. test_fit_dir (CPU): a non-circular spiral (radius x
 (1 + 0.35 cos 2 theta)) gives no ring vote for either hand (+1 by default); the loops get both hands right; circular: the rings do.
 
+**One direction rule, and a refusal (audit-unroll #1).** There were four no-evidence fallbacks: count-field +1 (silent), fit_init_prior
++1, the slab prior -1 (`vote > 0 ? 1 : -1`), and fit_load +1 when model.json has no "dir". Now all of them follow one rule (fit.h FIT_DIR_*):
+--dir given > ring vote (>= 3 rings, non-zero median) > phase loops (only with --dir-loops 1) > DEFAULT +1. fit_model.dir_src records the
+source. count-field logs `dir %+d (given | ring vote | phase loops | DEFAULT (no evidence))` and REFUSES DEFAULT (exit 2) unless
+`--dir-default-ok 1`. The exceptions are --pool-only, whose cache header now carries the source (an old cache counts as DEFAULT), and the
+UFSM_CF_READ_ONLY bench. The slab prior with no vote warns and takes +1; fit_load warns on a missing key. unroll.sh's ref passes `--dir`
+from SPIRALDIR or spiral_dir.tsv (columns scroll, dir, source GT | published | estimator | unknown, evidence) and logs the decision and
+any refusal to progress.log. Not done: the 2x2 closing error is no direction gate, since it is 2.061 at -1 vs 2.060 at +1 on 1667. The
+label-free gates audit-unroll proposed (phase coherence against W for +-1; the w4 planes' tangential sign) are not implemented. Every
+caller without --dir on a scroll with no ring vote now stops: scripts/cfit, corpus, pod/unroll.sh, cal/gate.sh.
+
 **Fibre (same-sheet) pairs in count-field.** The slabs snap their integers to the ref (`--ref-snap 1`), so a fibre term in the slab fit
 (`fit --w-fib`, 10-26) cannot move a turn step; the integer reference is count-field's LS solve. `count-field --fibers F.fib`
 (fiber-export frame) or `--pairs F.f32` (za ya xa zb yb xb dW) with `--cf-fib W`: rows c . U = t, c = trilinear(b) - trilinear(a)
@@ -65,7 +76,7 @@ the CPU (1667 level 0 with 3.7 M pairs: 291 s vs 54 s without). test_countfield:
 sector leaves W off by > 0.5 turn on 1.000 of the sector beyond it; arcs along the true sheets (`--cf-fib 4`) bring it to 0.000.
 
 **What fibres can do here (oracle).** Pairs sampled from the published surface itself are leaky (the score is against that surface):
-upper bounds. Short pairs, at about the length of our fibhv traces (0.6 mm median, 11-11), add +0.04. Long pairs, at the length
+upper bounds. Correction (audit-ugeom, geo-outer): the "outer radial miscount" below is not one. Against pub our radial count matches at r 5-12 mm. The one-sheet difference is in the core (r 3.5-5.5 mm). The long oracle pairs fix the core and drag the masked (zero-CT) outer turns along, so the outer -1 tracks the CT mask (geo-outer: k < 0 share 0.65 within 0.8 mm of masked CT, 0.05 beyond 50 mm). Short pairs, at about the length of our fibhv traces (0.6 mm median, 11-11), add +0.04. Long pairs, at the length
 of the AFV tracings (2 mm median), fix the inner turns (r 3-7 mm 0.42-0.83 -> 0.97-0.98) but not the outer ones. r >= 9 mm stays at
 -1 (0.16-0.29). That is a radial miscount around the whole circumference, one sheet missing beyond ~8 mm. It has no curl, so no
 along-sheet constraint can see it; it needs a count fix (CT peaks, wrap-check). 1667 has no AFV and no published fibre

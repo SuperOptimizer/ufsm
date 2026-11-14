@@ -328,7 +328,9 @@ refcz() { jq -r --argjson m ${CFMEM:-24} '(.shape[1] * .shape[2]) as $hw | (($m 
 # (measured against published surfaces), else count-field's own vote. Its ring vote can be empty (PHerc1667: sheets far from circles),
 # and then it fell back to +1 silently: the 11-12 1667 unroll had the wrong hand (sheet identity vs the published unwrap 0.48; the ref
 # with --dir -1: 0.73, DESIGN 2026-11-14). An empty vote is logged to progress.log.
-spiraldir() { [ -n "${SPIRALDIR:-}" ] && { echo $SPIRALDIR; return; }; awk -F'\t' -v s=$S '$1 == s { print $2 }' $H/spiral_dir.tsv 2> /dev/null | head -1; }
+# spiral_dir.tsv: scroll, dir (+1 / -1; anything else = unknown), source (GT | published | estimator | unknown), evidence. Without an
+# entry count-field decides itself and REFUSES when it has no evidence (no ring vote): set SPIRALDIR, add the scroll, or REFX="--dir-default-ok 1".
+spiraldir() { [ -n "${SPIRALDIR:-}" ] && { echo $SPIRALDIR; return; }; awk -F'\t' -v s=$S '$1 == s && ($2 == "1" || $2 == "+1" || $2 == "-1") { print $2 }' $H/spiral_dir.tsv 2> /dev/null | head -1; }
 ref() {
   [ "$DRY" = 1 ] || rm -rf $REF
   local sd; sd=$(spiraldir); [ -n "$sd" ] && REFX="${REFX:-} --dir $sd"
@@ -337,7 +339,9 @@ ref() {
   local pc=; [ "$DRY" != 1 ] && [ -e $O/ref.pool.ok ] && pc="--pool-cache $O/ref.pool --chunk-rows $(cat $O/ref.pool.ok)"
   if [ -n "${REFCMD:-}" ]; then X $O/logs/ref.log $REFCMD $F $REF $cal; else
   X $O/logs/ref.log $U count-field $F $O/cf.unused $(refpool) --iters 1200 --model $REF \
-    --threads $TH --mem-gb ${CFMEM:-24} $cal $pc; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; } || return 1
+    --threads $TH --mem-gb ${CFMEM:-24} $cal $pc; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; } ||
+    { grep -q 'REFUSED' $O/logs/ref.log 2> /dev/null && log "ref: $(grep -o 'REFUSED.*' $O/logs/ref.log | tail -1 | cut -c1-220)"; return 1; }
+  [ "$DRY" != 1 ] && log "ref: $(grep -oE 'count-field: dir [+-]1 \([^)]*\)' $O/logs/ref.log | tail -1)"
   [ "$DRY" != 1 ] && grep -q 'no ring vote on the direction' $O/logs/ref.log && log "ref: WARNING: $(grep -o 'no ring vote on the direction.*' $O/logs/ref.log | tail -1)"
   [ "$DRY" != 1 ] && grep -q 'WARNING no-data pairs' $O/logs/ref.log && log "ref: ALARM $(grep -o 'no-data: .*' $O/logs/ref.log | tail -1)"
   return 0
