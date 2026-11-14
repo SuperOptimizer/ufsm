@@ -150,7 +150,7 @@ mstart() {
   if [ -n "${INKCMD:-}" ]; then mset inkcmd "$INKCMD"; mset ink_ck "${LATINK_CK:-the default of INKCMD}"; [ -n "${LATINK_CK:-}" ] && mset ink_ck_sha "$(fsha $LATINK_CK)"
   else mset ink_ck "$(readlink -f $INKCK)"; mset ink_ck_sha "$(fsha $INKCK)"; fi
   mset box "${BOX:-mask}"; mset zr "${ZR:--}"; mset stripargs_env "${STRIPARGS:-}"
-  mset env "$(for v in CK INKCK INKCMD LATINK_CK FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FBLEND ONEPASS OPWIN FCTR FCTK LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
+  mset env "$(for v in CK INKCK INKCMD LATINK_CK FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
 }
 mstage() {
   [ "$DRY" = 1 ] && return 0
@@ -613,7 +613,10 @@ distort() {
 # with fill into strip/render_fill, reused), then scripts/strip/strip_refill.sh: every stripe rendered with FILLX, strip-mosaic img_fill
 # (grey <s>_ct.jpg + <s>_ink.jpg per stripe) and img_pap (papyrus look, --papyrus-dir, same reads), renders removed after the mosaic. UFSM_RENDER_GPU_MEM 4 (GB):
 # the render's device chunk pool stays small enough for a slab fit sharing the GPU (pods, two scrolls); RGPU: CUDA device of the renders
-FILLX=${FILLX:---fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 0}
+# FILLCT (80 by default since 2026-11-14, audit-urender #2; 1 = the old behaviour: only masked-zero CT is void): 80 recentres CT + ink on the nearest papyrus
+# within --fill voxels wherever the surface sample is below the mosaic's papyrus level (audit-urender 2026-11-14: 45-54 % of 1667's
+# on-surface render px have CT < 80 at the centre surface)
+FILLX=${FILLX:---fill 4 --fill-ct ${FILLCT:-80} --fill-grid 50000 --fill-inpaint 4 --fill-pm 0}
 # inkgate: the latent ink head's c12 / c13 (p_recto / p_verso) beside the ink, for strip_refill.sh's papyrus gate (the latent-ink policy:
 # blended + papyrus-gated); none (ift3, or a run without them): ungated. INKGATE=0 off
 inkgate() { [ "${INKGATE:-1}" = 0 ] && return 0; [ -e $O/ink/c12.zarr/zarr.json ] && [ -e $O/ink/c13.zarr/zarr.json ] && echo "$O/ink/c12.zarr $O/ink/c13.zarr"; return 0; }
