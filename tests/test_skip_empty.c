@@ -133,6 +133,13 @@ int main(void) {
         printf("    train, CT masks (margin 1): gradient finite %d, cosine to dense %.4f, masked backward-data %ld, wgrad %ld\n", fin, cs, nb, nw);
         CHECK(fin, "train, CT masks: gradient finite");
         CHECK(nb > 0 && nw > 0, "train, CT masks: masked backward ran");
+        {   /* the weight-gradient kernels skip the items whose gy records are all zeroed: the same gradient as visiting them */
+            float *gv = malloc(np * 4); setenv("UFSM_SKIP_WG_ITEMS", "0", 1);
+            nn_skip_off(); nn_skip_build(dct, P, P, P, 1, 3, 0, 1);
+            nn_set_sr_step(4242); unet_forward(u, dx, xs, 1); unet_zero_grad(u); unet_backward(u, dgy); unet_grad_d2h(u, gv); unsetenv("UFSM_SKIP_WG_ITEMS");
+            printf("    train, CT masks: |d| / |g| item skipping vs visiting the zeroed records %.3g\n", rel(gv, gm, np));
+            CHECK(rel(gv, gm, np) < 4 * r0 + 1e-5, "train, CT masks: the wgrad item skip changes the gradient (%.3g)", rel(gv, gm, np)); free(gv);
+        }
         CHECK(cs > 0.3, "train, CT masks: gradient cosine to dense %.4f (0.55 on the pod, 11-14: a different net, live statistics shift too)", cs);
         nn_skip_off();
         nn_set_sr_step(4242); unet_forward(u, dx, xs, 1); unet_zero_grad(u); unet_backward(u, dgy); unet_grad_d2h(u, gm);

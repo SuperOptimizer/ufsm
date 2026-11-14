@@ -1253,7 +1253,7 @@ static void skip_ab(unet *u, const void *x2, shape5 xn, int h16, uint8_t *ctd, i
     for (size_t c = 0; c < cv; c++) mat[c] = 0;
     for (int z = 0; z < Wz; z++) for (int y = 0; y < W; y++) for (int x = 0; x < W; x++) if (hct[((size_t)z * W + y) * W + x] >= 64) mat[((size_t)(z / 4) * Hc + y / 4) * Hc + x / 4] = 1;
     const int lh = unet_logits_h16(u) != 0; const size_t es = lh ? 2 : 4, nb = (size_t)C * cv * es;
-    uint8_t *A = malloc(nb), *Bm = malloc(nb); double t[2];
+    uint8_t *A = calloc(1, nb), *Bm = calloc(1, nb); double t[2];
     const int lay = getenv("UFSM_SKIP_AB") && atoi(getenv("UFSM_SKIP_AB")) >= 2;   /* UFSM_SKIP_AB=2: per-conv forward ms (UFSM_PROF layers) */
     static double (*pl)[UNET_NSLOT][3]; static double pc[2][8]; if (lay && !pl) pl = calloc(2, sizeof *pl);
     /* UFSM_SKIP_AB_FREEZE=1: the masked pass normalises with the dense pass's GroupNorm statistics (unet_gn_freeze): a live-GroupNorm net
@@ -1264,6 +1264,7 @@ static void skip_ab(unet *u, const void *x2, shape5 xn, int h16, uint8_t *ctd, i
         if (k && frz) { gst = malloc(unet_gn_nstats(u) * sizeof *gst); if (gst && !unet_gn_stats_get(u, gst)) unet_gn_freeze(u, gst); }
         if (lay) { unet_prof_layers_on(1); double junk[UNET_NSLOT][3]; nn_sync(); unet_prof_layers(junk); }
         nn_sync(); const double t0 = now(); const float *l = unet_forward_x(u, x2, xn, 0, h16); nn_sync(); t[k] = now() - t0;
+        if (!l) { fprintf(stderr, "skip A/B: the forward holds no cell logits (streamed heads): trunk %.3f s %s only\n", t[k], k ? "masked" : "dense"); continue; }
         if (lay) { unet_prof_layers(pl[k]); unet_prof_cats(pc[k]); unet_prof_layers_on(0); }
         nn_d2h(k ? Bm : A, l, nb);
     }
