@@ -8,6 +8,7 @@
 #include "tiffw.h"
 #include "z3w.h"
 #include "zarr3.h"
+#include <cuda_runtime_api.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -188,7 +189,12 @@ int main(void) {
                     (unsigned long long)(d1.cells_disk - d0.cells_disk), (unsigned long long)(d1.cells_mem - d0.cells_mem));
             if (!open) CHECK(d1.cells_computed > d0.cells_computed && d1.cells_mem > d0.cells_mem && d1.cells_disk == d0.cells_disk, "dcache: cold computes, warm from memory");
             else if (open == 1) CHECK(d1.cells_computed == d0.cells_computed && d1.cells_disk > d0.cells_disk, "dcache: a reopened array reads its cells from disk");
-            else fprintf(stderr, "onfly on the GPU: %llu chunks%s\n", (unsigned long long)(inkfly_gpu_chunks() - g0), inkfly_gpu_chunks() > g0 ? "" : " (no device: the CPU ran; not a failure)");
+            else {   /* a visible device that computed nothing is a failure; no device at all (a CPU run) a skip of this part */
+                int ndev = 0; if (cudaGetDeviceCount(&ndev) != cudaSuccess) ndev = 0;
+                const unsigned long long gc = (unsigned long long)(inkfly_gpu_chunks() - g0);
+                fprintf(stderr, "onfly on the GPU: %llu chunks%s\n", gc, gc ? "" : ndev ? " with a device visible (FAIL)" : " (no device: the CPU ran; skipped)");
+                CHECK(gc > 0 || ndev == 0, "onfly on the GPU: %d device(s) visible, no chunk computed on one", ndev);
+            }
             if (open == 0) {   /* the MIL rays (inkfly_rays) of the whole volume: every ray's point inside, mode 1 (no face) a subset of mode 0 */
                 void *hd = nullptr; z3 *f2 = inkfly_open(z3_open(cs, "ct.zarr/1", nullptr), sj, &c8, 64, nullptr, &hd);
                 const int64_t wo[3] = {0, 0, 0}, wn[3] = {NV, NV, NV}; inkray *r0 = nullptr, *r1 = nullptr; size_t n0 = 0, n1 = 0;

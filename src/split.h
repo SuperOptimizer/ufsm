@@ -23,3 +23,8 @@ void split_gather(const void *p, shape5 s, int esz, int h, int D);   /* nn_split
 void split_yield(void);   /* a no-op collective: hands the turn to the other side (both sides must call it equally often) */
 int split_side(void);   /* this job's side (0 / 1), -1 outside split_run */
 void split_reduce(double *b, int n);   /* registered as the nn reduce callback by split_create */
+/* data-parallel gradient average (train.c, not split-specific): the replicas' fp32 gradients g[k] (n floats on device dev[k], k < ng) summed
+   onto g[0] in chunks of `chunk` floats (each a peer copy into tmp, chunk floats on dev[0], then an axpy), times 1 / ng when avg (train
+   --split: 0, the halves' gradients add up to the window's), then g[0] copied back to every other replica. Selects dev[0] (nn_init) first
+   and leaves it current. dev[k] may repeat (tests: two buffers on one device) */
+void dp_grad_avg(float *const *g, const int *dev, int ng, size_t n, float *tmp, size_t chunk, int avg);

@@ -5,6 +5,11 @@
 # step / validation / grad-cos lines identical (timing stripped; a race in the thread-local op state shows as a changed line)
 # Usage: test_univ2.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
+# two GPUs or a skip (run_suite.sh gives a gpu2 test both GPUs when there are two, else one: CUDA_VISIBLE_DEVICES = that one; the runner
+# reports an exit 0 with a line starting SKIP as SKIP). CUDA_VISIBLE_DEVICES set: its entries; unset: nvidia-smi's GPUs
+ngpu() { if [ -n "${CUDA_VISIBLE_DEVICES+x}" ]; then local v=${CUDA_VISIBLE_DEVICES//[[:space:]]/} a; [ -z "$v" ] && { echo 0; return; }; IFS=, read -ra a <<< "$v"; echo ${#a[@]}
+         else nvidia-smi -L 2> /dev/null | grep -c '^GPU' || true; fi; }
+NGV=$(ngpu); [ "${NGV:-0}" -ge 2 ] || { echo "SKIP: test_univ2 needs two GPUs (${NGV:-0} visible)"; exit 0; }
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3   # (absolute: the runs cd into DIR)
 rm -rf "$D"; mkdir -p "$D"
 "$MF" "$D/fx" 256 2 1 > "$D/fx.log" 2>&1

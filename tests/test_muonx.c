@@ -230,6 +230,64 @@ static void tc(void) {   /* fp16 tensor-core Newton-Schulz vs the fp32 path: 3 M
         batch_free(&a); batch_free(&b);
     }
 }
+/* try6's Muon matrices under --muon-tc 2 (cuBLASLt TF32 Newton-Schulz, ns5_lt; audit 2026-11-14 #17): the conv matrices [Co][Ci 27] of
+   enc3 c2 448 x 448 27 = 448 x 12096 and dec3 c1 448 x (288 up + 448 skip) 27 = 448 x 19872 (unet.c muon_collect: Co = cout, K = cin k^3),
+   the bottleneck attention linears qkv 864 x 288, w1 1536 x 288 (SwiGLU 2F x C), w2 288 x 768 and wo 288 x 288 (C 288, F 768). 3 Muon steps
+   TF32 vs fp32: rel L2 of the parameters < 1e-2 (as tc()); then one step from p = 0, mom = 0, beta 0, lr 1, wd 0 on the TF32 path:
+   O = p / sqrt(max(1, Co / K)), O O^T (Co <= K) or O^T O ~ I as test_muon (max |diag - 1|, max |offdiag| < 0.35; the two wide convs on
+   every 4th row and column of the Gram, to bound the host time). wo, square, is reported only (a random square gradient is ill-conditioned).
+   6 matrices, not tc()'s 5: ns5_lt caches its host copy of the descriptor table by (pointer, count), and a freed table's address can come back */
+static void tc_try6(void) {
+    enum { NT = 6 };
+    static const int co[NT] = {448, 448, 864, 1536, 288, 288}, kk[NT] = {448 * 27, 736 * 27, 288, 288, 768, 288};
+    static const char *const nm[NT] = {"enc3 c2", "dec3 c1", "attn qkv", "attn w1", "attn w2", "attn wo"};
+    muon_desc_t h[2][NT]; int maxco = 0, maxk = 0;
+    for (int t = 0; t < 2; t++) for (int i = 0; i < NT; i++) {
+        const size_t nw = (size_t)co[i] * kk[i]; muon_desc_t *d = &h[t][i];
+        d->p = nn_malloc(nw * 4); d->g = nn_malloc(nw * 4); d->mom = nn_malloc(nw * 4); d->X = nn_malloc(nw * 4); d->Y = nn_malloc(nw * 4);
+        d->A = nn_malloc((size_t)co[i] * co[i] * 4); d->B = nn_malloc((size_t)co[i] * co[i] * 4); d->Co = co[i]; d->K = kk[i];
+        nn_zero(d->p, nw * 4); nn_zero(d->mom, nw * 4);
+        if (co[i] > maxco) maxco = co[i];
+        if (kk[i] > maxk) maxk = kk[i];
+    }
+    void *dt[2]; for (int t = 0; t < 2; t++) { dt[t] = nn_malloc(sizeof h[t]); nn_h2d(dt[t], h[t], sizeof h[t]); }   /* (0: fp32, 1: TF32; kept until the end) */
+    for (int s = 0; s < 4; s++) {
+        rs = 900 + s;
+        for (int i = 0; i < NT; i++) {
+            const size_t nw = (size_t)co[i] * kk[i]; float *g = malloc(nw * 4); for (size_t j = 0; j < nw; j++) g[j] = frand() * (1.f + (j % 7) * 0.3f) * (1.f + (j / kk[i]) % 3);
+            for (int t = 0; t < 2; t++) nn_h2d((float *)h[t][i].g, g, nw * 4);
+            free(g);
+        }
+        if (s < 3) { nn_muon_batch(dt[0], NT, maxco, maxk, 0.02f, 0.95f, 0.f); nn_muon_tc(2); nn_muon_batch(dt[1], NT, maxco, maxk, 0.02f, 0.95f, 0.f); nn_muon_tc(0); }
+        if (s == 2) for (int i = 0; i < NT; i++) {
+            const size_t nw = (size_t)co[i] * kk[i]; float *x = malloc(nw * 4), *y = malloc(nw * 4); double *r = malloc(nw * 8);
+            nn_d2h(x, h[0][i].p, nw * 4); nn_d2h(y, h[1][i].p, nw * 4); for (size_t j = 0; j < nw; j++) r[j] = x[j];
+            const double e = rel(y, r, nw); printf("  muon-tc 2 try6 %-8s %4d x %5d: cuBLASLt TF32 vs fp32, 3 steps: %.2e\n", nm[i], co[i], kk[i], e);
+            CHECK(e < 1e-2, "tc2 try6 %s", nm[i]); free(x); free(y); free(r);
+        }
+        if (s == 3) {   /* the orthogonality step on the TF32 table */
+            for (int i = 0; i < NT; i++) { const size_t nw = (size_t)co[i] * kk[i]; nn_zero(h[1][i].p, nw * 4); nn_zero(h[1][i].mom, nw * 4); }
+            nn_muon_tc(2); nn_muon_batch(dt[1], NT, maxco, maxk, 1.f, 0.f, 0.f); nn_muon_tc(0); nn_sync();
+            for (int i = 0; i < NT; i++) {
+                const int Co = co[i], K = kk[i], m = Co <= K ? Co : K, L = Co <= K ? K : Co; const size_t nw = (size_t)Co * K;
+                float *o = malloc(nw * 4), *R = malloc(nw * 4); nn_d2h(o, h[1][i].p, nw * 4);
+                for (int a = 0; a < m; a++) for (int q = 0; q < L; q++) R[(size_t)a * L + q] = Co <= K ? o[(size_t)a * K + q] : o[(size_t)q * K + a];   /* rows of the Gram's factor */
+                int st = 1; while ((double)(m / st) * (m / st) * L > 3e8) st *= 2;
+                const double sc2 = fmax(1.0, (double)Co / K); double wd = 0, wo = 0;
+                for (int a = 0; a < m; a += st) for (int b = a; b < m; b += st) {
+                    double dd = 0; const float *ra = R + (size_t)a * L, *rb = R + (size_t)b * L; for (int q = 0; q < L; q++) dd += (double)ra[q] * rb[q];
+                    dd /= sc2; if (a == b) wd = fmax(wd, fabs(dd - 1)); else wo = fmax(wo, fabs(dd));
+                }
+                const int sq = Co == K;
+                printf("  muon-tc 2 try6 %-8s %4d x %5d: %s ~ I (rows step %d): max |diag - 1| %.3f, max |offdiag| %.3f%s\n", nm[i], Co, K, Co <= K ? "O O^T" : "O^T O", st,
+                       wd, wo, sq ? " (square: reported only)" : "");
+                if (!sq) CHECK(wd < 0.35 && wo < 0.35, "tc2 try6 %s orthogonality: diag %.3f offdiag %.3f", nm[i], wd, wo);
+                free(o); free(R);
+            }
+        }
+    }
+    for (int t = 0; t < 2; t++) { for (int i = 0; i < NT; i++) { muon_desc_t *d = &h[t][i]; nn_free(d->p); nn_free((void *)d->g); nn_free(d->mom); nn_free(d->X); nn_free(d->Y); nn_free(d->A); nn_free(d->B); } nn_free(dt[t]); }
+}
 static void kron(void) {
     enum { NC = 2 }; const int Co[NC] = {12, 24}, Ci[NC] = {20, 8}; const float eps = 1e-3f, b2 = 0.9f;
     float *g[NC]; double *L[NC][3];
@@ -286,6 +344,7 @@ int main(void) {
     vr();
     cautious();
     tc();
+    tc_try6();
     kron();
     nn_sync(); const char *e = nn_check(); CHECK(!e, "cuda %s", e ? e : "");
     printf(fails ? "muon-ns polar / normuon / muon-vr / muon-kron / cautious FAIL (%d)\n" : "muon-ns polar / normuon / muon-vr / muon-kron / cautious ok\n", fails);

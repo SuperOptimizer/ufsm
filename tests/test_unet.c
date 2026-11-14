@@ -1,4 +1,9 @@
-/* Whole-network finite-difference check on a tiny U-Net, then a timing benchmark at 128^3. */
+/* Whole-network finite-difference check on a tiny U-Net, then a timing benchmark at 128^3.
+   UFSM_ATTN_BLOCKS=N UFSM_ATTN_PE=P (audit 2026-11-14 #15): the bottleneck attention stage (unet_cfg.attn_blocks / attn_pe; 3 = scroll RoPE
+   around per-sample axis records, unet_set_attn_axis) in the finite-difference check: its fp32 token conversion, the stage GroupNorm and the
+   axis records. Needs a last width that is a multiple of 48 (UFSM_TINY=4,6,96: 2 heads); not combined with UFSM_DS / UFSM_EMB / UFSM_FILM /
+   UFSM_SCALE_COND (their "parameters last" picks); the attention core defaults to 0 (fp32) here (UFSM_ATTN_CORE). The stage's out
+   projections start at zero (an identity stage), so its parameters get +-0.05 noise first, and 48 extra points are drawn inside the stage. */
 #include "unet.h"
 #include <math.h>
 #include <stdio.h>
@@ -76,8 +81,22 @@ int main(void) {
     if (getenv("UFSM_DEC_WIDTHS")) { char *t = strdup(getenv("UFSM_DEC_WIDTHS")); int l = 0; for (char *q = strtok(t, ","); q && l < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.dec_widths[l++] = atoi(q); free(t); }   /* narrower decoder levels */
     cfg.film = getenv("UFSM_FILM") ? atoi(getenv("UFSM_FILM")) : 0;   /* per-level scale FiLM: K codes, its A / D pairs random (last in the layout) */
     static const float film_c[4] = {1.f, -0.6f, 0.3f, 2.f};
+    cfg.attn_blocks = getenv("UFSM_ATTN_BLOCKS") ? atoi(getenv("UFSM_ATTN_BLOCKS")) : 0;
+    cfg.attn_pe = getenv("UFSM_ATTN_PE") ? atoi(getenv("UFSM_ATTN_PE")) : 0;
+    size_t a0 = 0;   /* the attention stage's parameters: [a0, np) */
+    if (cfg.attn_blocks) {
+        if (cfg.ds_levels || cfg.emb_lev || cfg.film || cfg.scale_cond) { printf("UFSM_ATTN_BLOCKS: not combined with UFSM_DS / UFSM_EMB / UFSM_FILM / UFSM_SCALE_COND\n"); return 2; }
+        if (!getenv("UFSM_ATTN_CORE")) setenv("UFSM_ATTN_CORE", "0", 1);   /* (read at the first attention call: the fp32 core for the finite differences) */
+        unet_cfg c0 = cfg; c0.attn_blocks = 0; unet *u0 = unet_create(&c0); a0 = unet_nparams(u0); unet_free(u0);
+    }
     unet *u = unet_create(&cfg);
     unet_init(u, 1);
+    if (cfg.attn_blocks) {
+        const size_t na = unet_nparams(u) - a0; float *ha = malloc(na * 4);
+        nn_d2h(ha, unet_live_params(u) + a0, na * 4); for (size_t i = 0; i < na; i++) ha[i] += 0.05f * frand();
+        nn_h2d((float *)unet_live_params(u) + a0, ha, na * 4); free(ha);
+        printf("attention stage: %d block(s), pe %d, %zu parameters at %zu\n", cfg.attn_blocks, cfg.attn_pe, na, a0);
+    }
     size_t nfilm = 0;
     if (cfg.film) {
         for (int i = 0; i < cfg.nlev; i++) nfilm += (size_t)2 * cfg.film * cfg.widths[i];
@@ -92,6 +111,16 @@ int main(void) {
     size_t np = unet_nparams(u);
     printf("tiny unet: %zu params\n", np);
     shape5 xs = {getenv("UFSM_TN") ? atoi(getenv("UFSM_TN")) : 2, 4, 8, 8, 16};
+    if (cfg.attn_blocks && (cfg.attn_pe == 3 || cfg.attn_axis == 1)) {   /* the scroll axis per sample: even samples along z inside the window
+                                                                           (8 planes, centres on (y, x) drifting), odd ones along x outside it */
+        const int st = UNET_AXR(16); float *rec = calloc((size_t)xs.n * st, sizeof *rec);
+        for (int b = 0; b < xs.n; b++) {
+            float *r = rec + (size_t)b * st; const int ad = b & 1 ? 2 : 0, npl = ad == 0 ? xs.d : xs.w;
+            r[0] = (float)ad; r[1] = 1.f; r[2] = (float)npl; r[3] = 1.f;
+            for (int k = 0; k < npl; k++) { r[4 + 2 * k] = ad == 0 ? 3.3f + 0.1f * k : -3.f - 0.1f * k; r[5 + 2 * k] = ad == 0 ? 7.1f - 0.2f * k : 4.f + 0.05f * k; }
+        }
+        unet_set_attn_axis(u, rec, xs.n, st); free(rec);
+    }
     size_t nx = shape_numel(xs);
     shape5 os = unet_out_shape(u, xs);
     size_t nl = shape_numel(os);
@@ -144,8 +173,9 @@ int main(void) {
     int K = getenv("UFSM_DS") || getenv("UFSM_EMB") ? 120 : 60, bad = 0, KS = cfg.scale_cond ? cfg.widths[0] : (int)nfilm;   /* (film: every FiLM parameter, last) */
     for (int j = 1; j <= cfg.ds_levels; j++) KS += (cfg.dec_widths[j] ? cfg.dec_widths[j] : cfg.widths[j]) * cfg.cout + cfg.cout;   /* and every deep-supervision head parameter (last) */   /* scale_cond: every entry of the conditioning vector (last in the layout) */
     if (cfg.emb_lev) KS += (cfg.dec_widths[cfg.emb_lev] ? cfg.dec_widths[cfg.emb_lev] : cfg.widths[cfg.emb_lev]) * cfg.emb_ch + cfg.emb_ch;   /* and the distillation head (last) */
-    for (int k = 0; k < K + KS; k++) {
-        size_t i = k < K ? (size_t)rand() % np : np - (size_t)KS + (size_t)(k - K);
+    const int KA = cfg.attn_blocks ? 48 : 0;   /* and points inside the attention stage */
+    for (int k = 0; k < K + KS + KA; k++) {
+        size_t i = k < K ? (size_t)rand() % np : k < K + KS ? np - (size_t)KS + (size_t)(k - K) : a0 + (size_t)rand() % (np - a0);
         float o = p[i], eps = 1e-2f;
         float *dp = nullptr; (void)dp;
         /* nudge parameter i on the device: rewrite the whole param array (small net) */
@@ -162,7 +192,7 @@ int main(void) {
     }
     { FILE *w = fopen(ckpt_path, "r+b"); fseek(w, 4, SEEK_SET); fgets(line, sizeof line, w); fwrite(p, 4, np, w); fclose(w); }
     unet_load(u, ckpt_path);
-    printf("param fd check: worst rel err %.3g over %d params (%d bad)\n", worst, K + KS, bad);
+    printf("param fd check: worst rel err %.3g over %d params (%d bad)\n", worst, K + KS + KA, bad);
     /* EMA/use_ema path sanity: ema == p right after init copy? we changed p via adamw(lr=0) so p unchanged: outputs equal */
     unet_use_ema(u, 1);
     double le = loss_of(u, dx, xs, dgy, nl, h);
