@@ -7,6 +7,7 @@
    two-sided 5 %). --set clean (default) keeps boxes with ceil >= --ceil-min (A's ceil; boxes without a ceil are kept; the others are summarised on a "label-noise" line); --boxes 1
    prints the per-box values. Several rows of one box (replicates) are averaged first. --scroll a,b keeps only the boxes of those
    scrolls (e.g. the wgate primary set paris4,paris4j); --tsv 1 prints one tab-separated line per metric instead (scripts/wbench/wgate.sh). */
+#include "checkpoint.h"
 #include <math.h>
 #include "optcheck.h"
 #include <stdint.h>
@@ -129,7 +130,7 @@ int cmd_ckpt_avg(int argc, char **argv) {
     for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], opt_n("--arrays"))) { i++; continue; } if (nin < 256) in[nin++] = argv[i]; }
     const char *ar = wb_opt(argc, argv, "--arrays", "both"); const int both = strcmp(ar, "ema") != 0;
     if (!out || nin < 1 || (strcmp(ar, "ema") && strcmp(ar, "both"))) { fprintf(stderr, "usage: ufsm ckpt-avg OUT.ckpt IN1.ckpt [IN2.ckpt ...] [--arrays ema|both]\n"); return 2; }
-    enum { HL = 16384 }; static char h0[HL], h1[HL]; FILE *f[256]; long off[256]; size_t np = 0; long long sz = -1;
+    enum { HL = UFSM_CHECKPOINT_HEADER }; static char h0[HL], h1[HL];   /* (mini ckpt audit #3: was 16 KiB, below every latent header) */ FILE *f[256]; long off[256]; size_t np = 0; long long sz = -1;
     for (int k = 0; k < nin; k++) {
         f[k] = fopen(in[k], "rb"); if (!f[k]) { fprintf(stderr, "ckpt-avg: cannot open %s\n", in[k]); return 1; }
         char *h = k ? h1 : h0; off[k] = wb_hdr(f[k], h, HL); if (off[k] < 0) { fprintf(stderr, "ckpt-avg: %s is not a ufsm checkpoint\n", in[k]); return 1; }

@@ -1,6 +1,7 @@
 /* Checkpoint inference settings must survive a move without any sidecar files. */
 #include "checkpoint.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdlib.h>
 #include <sys/wait.h>

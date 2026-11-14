@@ -6,6 +6,38 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Checkpoint save / load fixes from the mini audit (2026-11-14, branch ckptfix-20261114)
+
+Audit: /vesuvius/ufsm/audit-20261114/mini/ckpt.md (items numbered as there). Built on opsfix1 (unet_save refuses non-finite arrays,
+the checkpoint ring in src/ckring.c clones last.ckpt after each save): this branch changes what a save writes and what a load accepts,
+the ring is untouched.
+
+- Save (#1, #6): the extra is checked to be one whole JSON object before anything is written (a truncated snprintf chain loses its
+  closing braces); after the arrays, fflush + ferror + fsync; the tmp file is then read back (magic, a header line within
+  UFSM_CHECKPOINT_HEADER = what every reader allows, a whole object, nparams, a file size of exactly 4 or 5 arrays) and only then
+  renamed over last.ckpt; the directory is fsynced after the rename. Any failure: the previous checkpoint stays, the tmp is removed,
+  unet_save returns -1 (train stops with "cannot save"). unet.c does not link json.c (40 test targets), so the read-back is a
+  structural scan (braces / brackets balanced outside strings, nothing after the last brace), not a parse.
+- Header floats (#10): non-finite running statistics / radii are written NaN / Infinity / -Infinity (was nan / inf): Python's json
+  reads them, and strtof / json_parse read both spellings, so older binaries load new checkpoints unchanged.
+- Load (#5): the payload size must be exactly 4 arrays (+ the Muon momentum when the header says so); 2 arrays (weights only) loads
+  with zero moments and says so. A file cut inside m / v, or with trailing bytes, fails (it loaded silently with zero moments).
+- Load (#7): nlev, widths, cin, cout, attn_blocks (and dec_widths / enc_blocks where both sides set them) must match, not only the
+  parameter count. Train prints the precision settings that differ from the checkpoint's runtime block (prec, f16, act_mx4 / 8,
+  grad_mx8, input_prec, gn_stored, policy) on resume.
+- Optimizer (#4): --resume with a different --opt than the checkpoint's runtime.optimizer is refused; --opt-reset 1 allows it and
+  zeroes m, v and the Muon momentum after the load. mom_alloc zeroes the matrices' slice of v when the momentum is aliased into it
+  (an AdamW checkpoint under Muon started its momentum from Adam's v).
+- Header readers (#2, #3, #9): checkpoint_header_line reads UFSM_CHECKPOINT_HEADER (was 64 KiB, silently cut; no newline within the
+  limit is now an error); ckpt-avg's header buffer likewise (was 16 KiB: every latent checkpoint failed); read_header parses only the
+  top level (the text before ',"extra":'), so an extra key named like an absent optional key ("lat_c", "gn_ema" ...) is not read.
+- --grow-head (#8): the same-network check also compares enc_blocks / dec_widths / dec_convs / attn_blocks; the state this path does
+  not restore (Hyperball radii, adaptive-Muon state, init_inh, the latent transform, level-0 / gn_ema running statistics) is listed.
+- Real headers on 11-14: scratch2 last.ckpt 37 225 bytes, u1 26 219 (limit 131 072).
+- Tests: test_checkpoint_runtime (CPU: a key past 64 KiB is read, no newline within the limit fails), test_checkpoint (GPU: truncated
+  extra refused with the previous file intact, an extra "lat_c" ignored, a file cut in v / with trailing bytes fails, weights-only
+  loads, an AdamW checkpoint with v = 1 under Muon moves the Muon matrices as from zero state).
+
 ## Window weighting of the head losses by their label count, --win-weight (2026-11-14, branch winw-20261114, audit train #4)
 
 Each head's loss is a mean over its own window's masked voxels:

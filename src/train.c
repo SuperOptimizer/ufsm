@@ -2971,6 +2971,14 @@ int cmd_train(int argc, char **argv) {
     const char *optname = opt(argc, argv, "--opt", "adamw");   /* adamw | muon (3^3 conv weights: nesterov momentum + Newton-Schulz orthogonalisation; rest AdamW) */
     float muon_lr = (float)opt_atof("--muon-lr", opt(argc, argv, "--muon-lr", "0.02")), muon_beta = (float)opt_atof("--muon-beta", opt(argc, argv, "--muon-beta", "0.95"));
     int use_muon = !strcmp(optname, "muon"), use_anvil = !strcmp(optname, "anvil");
+    /* --resume across optimizers (mini ckpt audit #4): the checkpoint's optimizer state belongs to its optimizer (Muon's signed momentum
+       in AdamW's v gives sqrt of a negative -> NaN on the first step; Adam's v as Muon's momentum). Refused unless --opt-reset 1, which
+       starts this run's optimizer state at zero after the load */
+    const int opt_reset = opt_atoi("--opt-reset", opt(argc, argv, "--opt-reset", "0"));
+    if (has_runtime > 0 && strcmp(resumed_runtime.optimizer, optname) && !opt_reset) {
+        fprintf(stderr, "--resume %s: trained with --opt %s, this run --opt %s: the optimizer states do not carry over; --opt-reset 1 starts them at zero\n", resume, resumed_runtime.optimizer, optname);
+        return 2;
+    }
     /* Muon variants: --muon-c 1 (Muon-C, per-frequency polarisation of the conv kernels), --hyperball 1 (fixed weight and update
        norms; eta = --hb-lr-mult x the Muon lr, default 1/sqrt(2): Muon's first relative step; replaces the decay) */
     const int muon_c = opt_atoi("--muon-c", opt(argc, argv, "--muon-c", "0")), hyperball = opt_atoi("--hyperball", opt(argc, argv, "--hyperball", "0"));
@@ -3902,6 +3910,7 @@ int cmd_train(int argc, char **argv) {
                                                               run at ssl std 0 with no targets; every loaded parameter is overwritten) */
             step0 = grow ? unet_load_grow(d->u, resume, 1, 1.f) : unet_load(d->u, resume);
             if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; }
+            if (opt_reset) { unet_reset_opt(d->u); if (g == 0) fprintf(stderr, "--opt-reset 1: the optimizer state (AdamW m / v, Muon momentum) starts at zero\n"); }
             if (opt_atoi("--finetune", opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* loaded weights/state, fresh schedule */
             if (unet_cfg_of(d->u)->gn_ema) {   /* --gn-ema-warm / --gn-ema-mom given: they replace the checkpoint's (unet_load restored those; 2026-11-13
                                                   try2 / try3 blew up when the training forward switched to the running statistics at step 501: a
@@ -4510,6 +4519,14 @@ int cmd_train(int argc, char **argv) {
     if (!*saved_policy) saved_policy = fp4 >= 2 ? "all=fp4:fp4:fp4,enc0.c1=fp16" : fp4 ? "all=fp4:fp4:fp8,enc0.c1=fp16" : fp8 ? "all=fp8:fp8:fp8,enc0.c1=fp16" : "";
     if (strlen(saved_policy) >= sizeof runtime.policy || strlen(optname) >= sizeof runtime.optimizer) { fprintf(stderr, "checkpoint settings too long\n"); return 2; }
     strcpy(runtime.policy, saved_policy); strcpy(runtime.optimizer, optname);
+    if (has_runtime > 0) {   /* precision / storage settings changed on resume (mini ckpt audit #7): allowed, but said */
+        char ch[1024] = ""; size_t k = 0;
+#define RCH(f) if (resumed_runtime.f != runtime.f) k += (size_t)snprintf(ch + k, sizeof ch - k, " " #f " %d -> %d", resumed_runtime.f, runtime.f)
+        RCH(prec); RCH(f16); RCH(act_mx4); RCH(act_mx8); RCH(grad_mx8); RCH(input_prec); RCH(gn_stored);
+#undef RCH
+        if (strcmp(resumed_runtime.policy, runtime.policy) && k < sizeof ch) k += (size_t)snprintf(ch + k, sizeof ch - k, " policy \"%s\" -> \"%s\"", resumed_runtime.policy, runtime.policy);
+        if (k) fprintf(stderr, "resume: the precision settings differ from the checkpoint's:%s\n", ch);
+    }
     char checkpoint_extra[8192], runtime_extra[8192];
     if (checkpoint_runtime_json(&runtime, runtime_extra, sizeof runtime_extra)) { fprintf(stderr, "invalid checkpoint settings\n"); return 2; }
     {
