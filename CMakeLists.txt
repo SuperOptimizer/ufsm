@@ -1,4 +1,6 @@
-# ufsm: C23 host code + CUDA kernels, all compiled by LLVM (cmake/llvm.cmake: clang, clang -x cuda, lld, llvm-ar, compiler-rt,
+# ufsm: C23 host code + CUDA kernels, all compiled by mcc (microc, cmake/mcc.cmake: host C and the .cu units -> PTX, mcudahw runtime;
+# scripts/toolchain/install_mcc.sh). The previous toolchain stays as presets llvm-release / llvm-verify for bisecting:
+# (cmake/llvm.cmake: clang, clang -x cuda, lld, llvm-ar, compiler-rt,
 # libunwind, libc++). Ninja. Configurations are build directories (CMakePresets.json):
 #   build/            release: the fp16 / MX kernels training and inference use                (cmake --preset release)
 #   build-verify/     UFSM_VERIFY=ON: + the bf16 / fp32 tensor-core instantiations; the suite runs from here (--preset verify)
@@ -8,7 +10,7 @@
 # directory itself (build/ufsm, build-verify/test_lat), as with the old Makefile.
 cmake_minimum_required(VERSION 3.28)
 if(NOT CMAKE_TOOLCHAIN_FILE)
-  set(CMAKE_TOOLCHAIN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llvm.cmake)
+  set(CMAKE_TOOLCHAIN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/cmake/mcc.cmake)   # (since 2026-11-14; cmake/llvm.cmake: --preset llvm-release)
 endif()
 project(ufsm LANGUAGES C CXX)
 
@@ -454,7 +456,7 @@ add_custom_target(suite-check
   USES_TERMINAL VERBATIM)
 # doctor: the toolchain picked, then the machine's real limits (cgroup CPUs / RAM, GPUs / MIG, CUDA, disk)
 add_custom_target(doctor
-  COMMAND ${CMAKE_COMMAND} -E echo "cmake: CC=${CMAKE_C_COMPILER} (clang ${CMAKE_C_COMPILER_VERSION}), CUDA=${UFSM_CUDA} (${UFSM_CUDA_VERSION}), ARCH=${UFSM_ARCH}, VERIFY=${UFSM_VERIFY}, runtime=$<IF:$<BOOL:${UFSM_LLVM_RUNTIME}>,compiler-rt,libgcc>+libstdc++, ccache=${UFSM_CCACHE_EXE}, build dir ${CMAKE_BINARY_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E echo "cmake: toolchain ${UFSM_TOOLCHAIN}, CC=${CMAKE_C_COMPILER} (${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}), CUDA=${UFSM_CUDA} (${UFSM_CUDA_VERSION}), ARCH=${UFSM_ARCH}, VERIFY=${UFSM_VERIFY}, runtime=$<IF:$<BOOL:${UFSM_LLVM_RUNTIME}>,compiler-rt,libgcc>+libstdc++, ccache=${UFSM_CCACHE_EXE}, build dir ${CMAKE_BINARY_DIR}"
   COMMAND ${CMAKE_COMMAND} -E echo "cmake: libs: libcurl=${UFSM_DEPS_libcurl_VERSION} libzstd=${UFSM_DEPS_libzstd_VERSION} blosc=${UFSM_DEPS_blosc_VERSION} zlib=${UFSM_DEPS_zlib_VERSION} libcrypto=${UFSM_DEPS_libcrypto_VERSION}"
   COMMAND ${CMAKE_BINARY_DIR}/ufsm sysinfo --disk ${CMAKE_SOURCE_DIR} --disk /tmp
   DEPENDS ufsm USES_TERMINAL VERBATIM)

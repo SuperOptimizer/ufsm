@@ -4,10 +4,10 @@
   "configurePresets": [
     {
       "name": "release",
-      "displayName": "release: build/ (fp16 / MX kernels; sm_120 + sm_120a)",
+      "displayName": "release: build/ (mcc + mcudahw, cmake/mcc.cmake; fp16 / MX kernels; sm_120 + sm_120a)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build",
-      "toolchainFile": "${sourceDir}/cmake/llvm.cmake",
+      "toolchainFile": "${sourceDir}/cmake/mcc.cmake",
       "cacheVariables": {"UFSM_VERIFY": "OFF", "UFSM_ARCH": "120"}
     },
     {
@@ -32,17 +32,18 @@
       "cacheVariables": {"UFSM_VERIFY": "ON"}
     },
     {
-      "name": "mcc",
-      "displayName": "mcc: build-mcc/ (microc: mcc for host C + CUDA units, mcudahw runtime; no CUDA toolkit; UFSM_MCC / MCC_HOME)",
+      "name": "llvm-release",
+      "displayName": "llvm-release: build-llvm/ (the old clang + nvcc toolchain, cmake/llvm.cmake: for bisecting only)",
       "inherits": "release",
-      "binaryDir": "${sourceDir}/build-mcc",
-      "toolchainFile": "${sourceDir}/cmake/mcc.cmake"
+      "binaryDir": "${sourceDir}/build-llvm",
+      "toolchainFile": "${sourceDir}/cmake/llvm.cmake",
+      "cacheVariables": {"UFSM_TOOLCHAIN": "llvm"}
     },
     {
-      "name": "mcc-verify",
-      "displayName": "mcc-verify: build-mcc-verify/ (the suite binaries built by mcc)",
-      "inherits": "mcc",
-      "binaryDir": "${sourceDir}/build-mcc-verify",
+      "name": "llvm-verify",
+      "displayName": "llvm-verify: build-llvm-verify/ (the suite binaries with clang + nvcc, for bisecting / byte-comparing)",
+      "inherits": "llvm-release",
+      "binaryDir": "${sourceDir}/build-llvm-verify",
       "cacheVariables": {"UFSM_VERIFY": "ON"}
     }
   ],
@@ -58,7 +59,7 @@
     {"name": "pod-test", "displayName": "pod: build + fast suite tier", "configurePreset": "verify", "jobs": 6, "targets": ["test"]},
     {"name": "arch86", "configurePreset": "arch86"},
     {"name": "arch86-verify", "configurePreset": "arch86-verify", "targets": ["suite-bins"]},
-    {"name": "mcc", "configurePreset": "mcc", "jobs": 8},
-    {"name": "mcc-verify", "configurePreset": "mcc-verify", "jobs": 8, "targets": ["suite-bins"]}
+    {"name": "llvm-release", "configurePreset": "llvm-release", "jobs": 8},
+    {"name": "llvm-verify", "configurePreset": "llvm-verify", "jobs": 8, "targets": ["suite-bins"]}
   ]
 }

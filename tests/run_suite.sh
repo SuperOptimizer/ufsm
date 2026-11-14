@@ -92,7 +92,10 @@ srcdeps() {   # a binary's dependency basenames (one per line), "@cuda" when it 
   local b=$1 c; c=${SUITE_SRCDEPS:-$BDIR/.srcdeps}/${b##*/}; [ -x "$b" ] || return 0
   if [ ! -f "$c" ] || [ "$c" -ot "$b" ]; then
     mkdir -p "${c%/*}"
-    { readelf -wl "$b" 2> /dev/null | grep -oE '[A-Za-z0-9_.+-]+\.(h|cuh|c|cu|inc)$' | sort -u
+    { readelf -wl "$b" 2> /dev/null | grep -oE '[A-Za-z0-9_.+-]+\.(h|cuh|c|cu|inc)$' | sort -u > "$c.$$.l"
+      cat "$c.$$.l"
+      # no line tables (mcc before its DWARF support): any C / CUDA source may be in the binary
+      [ -s "$c.$$.l" ] || echo @nodebug; rm -f "$c.$$.l"
       nm "$b" 2> /dev/null | grep -qE ' T nn_init$' && echo @cuda; true; }  > "$c.$$" && mv "$c.$$" "$c"
   fi
   cat "$c"
@@ -112,6 +115,7 @@ if [ -n "$CHANGED" ]; then
         [[ " $cm " == *"$f"* ]] && { hit=1; break; }
         for s in "${scripts[@]}"; do [ "$s" = "$f" ] && hit=1; done; [ $hit = 1 ] && break
         case $f in src/*.cu|src/*.cuh) [[ $deps == *" @cuda "* ]] && { hit=1; break; };; esac
+        case $f in *.c|*.h|*.cu|*.cuh|*.inc) [[ $deps == *" @nodebug "* ]] && { hit=1; break; };; esac
         case $f in *.c|*.h|*.cu|*.cuh|*.inc) [[ $deps == *" ${f##*/} "* ]] && { hit=1; break; };; esac
       done
       [ $hit = 1 ] && KEEP+=("$n")
