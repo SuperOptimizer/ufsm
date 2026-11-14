@@ -5407,6 +5407,7 @@ int cmd_train(int argc, char **argv) {
             double dt = now() - tlog; const double nok = nacc - nskl > 0 ? nacc - nskl : 1;   /* (the means: over the steps not skipped) */
             double vl = -1, vb = 0, vd = 0, vh[TCMAX] = {0}; int vhn[TCMAX] = {0}; double vw4[6] = {0}, vw4n[3] = {0};   /* unwrap2: wind4 bce, worst-gauge bce, right turns, voxels, phase, normal; vw4n: windows with wind4 / phase / normal labels */
             static double *vsrc; if (!vsrc) vsrc = calloc((size_t)S->n * 8, sizeof *vsrc);   /* per source: phase, wind4, rv, ink bce sums + their window counts */   /* mgpu: main */
+            int vwn = 0; double *vw4w = nullptr, *vphw = nullptr; int *vw4s = nullptr;   /* unwrap2: per window with winding labels its wind4 / phase bce and source (the bootstrap CI, audit eval#9) */
             char vstr[128] = ",,";
             double rv_n[RF_N] = {0}, rv_e[RF_N] = {0}, rv_b[RF_N] = {0}, rv_l = 0;   /* restore validation: per family voxels, error^2, input error^2 */
             if (g_rpairs) { free(g_rpv); g_rpv = calloc((size_t)S->n * RP_NST, sizeof *g_rpv); }
@@ -5486,6 +5487,11 @@ int cmd_train(int argc, char **argv) {
                             if (q->w4_loss > 0) { vw4[0] += q->w4h[0]; vw4[1] += q->w4h[5]; vw4n[0] += 1; } vw4[2] += q->w4h[1] * q->w4h[2]; vw4[3] += q->w4h[2];
                             if (q->side_loss > 0) { vw4[4] += q->side_loss / (g_side_lambda ? g_side_lambda : 1.f); vw4n[1] += 1; }
                             if (q->norm_loss > 0) { vw4[5] += q->norm_raw; vw4n[2] += 1; } }
+                        if (g_unwrap2 && q->w4h[2] > 0) {   /* (a window with winding labels: its values for the bootstrap interval) */
+                            if (!vw4w) { vw4w = calloc((size_t)nval, sizeof *vw4w); vphw = calloc((size_t)nval, sizeof *vphw); vw4s = calloc((size_t)nval, sizeof *vw4s); }
+                            if (vw4w && vphw && vw4s && vwn < nval) { vw4w[vwn] = q->w4h[0]; vphw[vwn] = q->side_loss / (g_side_lambda ? g_side_lambda : 1.f); vw4s[vwn] = vbt->src ? vbt->src[0] : -1; }
+                            vwn++;
+                        }
                         if (g_ink2 && q->iout[2] > 0) { vik[0] += q->iout[0]; vik[1] += 1;
                             const int si_k = vbt->src ? vbt->src[0] : -1;   /* per source (= per scroll) ink val: 1667's memorisation shows as its val bce rising while the train bce falls */
                             if (si_k >= 0 && si_k < S->n) { if (!viks) viks = calloc((size_t)S->n * 2, sizeof *viks); if (viks) { viks[2 * si_k] += q->iout[0]; viks[2 * si_k + 1] += 1; } } }
@@ -5518,9 +5524,9 @@ int cmd_train(int argc, char **argv) {
                 for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_use_ema(G[g].u, 0); unet_gn_ema_live(G[g].u, 0); }
                 nn_init(G[0].dev);
                 if (nval) { vl /= nval; vb /= nval; vd /= nval; }
-                if (g_unwrap2 && nval) fprintf(stderr, "val unwrap2: phase bce %.5f normal bce %.5f wind4 bce %.5f (worst gauge %.5f) turn acc %.4f over %.0f voxels\n",
+                if (g_unwrap2 && nval) fprintf(stderr, "val unwrap2: phase bce %.5f normal bce %.5f wind4 bce %.5f (worst gauge %.5f) turn acc %.4f over %.0f voxels, %d of %d windows with winding labels\n",
                                                vw4n[1] > 0 ? vw4[4] / vw4n[1] : 0.0, vw4n[2] > 0 ? vw4[5] / vw4n[2] : 0.0, vw4n[0] > 0 ? vw4[0] / vw4n[0] : 0.0, vw4n[0] > 0 ? vw4[1] / vw4n[0] : 0.0,
-                                               vw4[3] > 0 ? vw4[2] / vw4[3] : 0.0, vw4[3]);
+                                               vw4[3] > 0 ? vw4[2] / vw4[3] : 0.0, vw4[3], vwn, nval);
                 if (nval) {   /* per source and per scroll (the name before its first '-'): the held-out boxes' losses, "-" where no window had the label */
                     char ln[8192]; int o = snprintf(ln, sizeof ln, "val by source (phase / wind4 / rv / ink bce, windows):");
                     for (int si = 0; si < S->n; si++) { const double *u = vsrc + (size_t)si * 8; if (u[1] + u[3] + u[5] + u[7] <= 0) continue;
@@ -5544,6 +5550,21 @@ int cmd_train(int argc, char **argv) {
                     fprintf(stderr, "%s\n", ln);
                     memset(vsrc, 0, (size_t)S->n * 8 * sizeof *vsrc);
                 }
+                if (g_unwrap2 && nval) {   /* the window bootstrap (audit eval#9) */
+                    const int nk = vwn < nval ? vwn : nval;
+                    if (vw4w && vphw && vw4s && nk >= 2) {   /* a 95 % bootstrap interval over windows (fixed generator: the same draws every pass), then per source */
+                        double bw[1000], bp[1000]; uint64_t h = 0x9E3779B97F4A7C15ull;
+                        for (int r = 0; r < 1000; r++) { double sw = 0, sp_ = 0; for (int k = 0; k < nk; k++) { h ^= h << 13; h ^= h >> 7; h ^= h << 17; const int j = (int)(h % (uint64_t)nk); sw += vw4w[j]; sp_ += vphw[j]; } bw[r] = sw / nk; bp[r] = sp_ / nk; }
+                        for (int a_ = 1; a_ < 1000; a_++) for (int b_ = a_; b_ > 0 && bw[b_ - 1] > bw[b_]; b_--) { const double t_ = bw[b_]; bw[b_] = bw[b_ - 1]; bw[b_ - 1] = t_; }
+                        for (int a_ = 1; a_ < 1000; a_++) for (int b_ = a_; b_ > 0 && bp[b_ - 1] > bp[b_]; b_--) { const double t_ = bp[b_]; bp[b_] = bp[b_ - 1]; bp[b_ - 1] = t_; }
+                        char ln_[4096]; int o_ = snprintf(ln_, sizeof ln_, "val ci: 95%% bootstrap over %d windows with winding labels: wind4 [%.5f, %.5f] phase [%.5f, %.5f]; per source (windows: wind4 / phase):", nk, bw[25], bw[974], bp[25], bp[974]);
+                        for (int si_ = -1; si_ < S->n && o_ < (int)sizeof ln_ - 64; si_++) { double a0 = 0, a1 = 0; int c_ = 0; for (int k = 0; k < nk; k++) if (vw4s[k] == si_) { a0 += vw4w[k]; a1 += vphw[k]; c_++; }
+                            if (c_) o_ += snprintf(ln_ + o_, sizeof ln_ - o_, " %s (%d: %.4f / %.4f)", si_ >= 0 ? S->src[si_].name : "?", c_, a0 / c_, a1 / c_); }
+                        fprintf(stderr, "%s\n", ln_);
+                    }
+                
+                }
+                free(vw4w); free(vphw); free(vw4s);
                 if (g_ink2 && nval) fprintf(stderr, "val ink: bce %.5f over %.0f of %d windows with known ink\n", vik[1] > 0 ? vik[0] / vik[1] : 0.0, vik[1], nval);
                 if (g_ink2 && nval && viks) for (int k = 0; k < S->n; k++) if (viks[2 * k + 1] > 0) fprintf(stderr, "val ink %s: bce %.5f over %.0f windows\n", S->src[k].name, viks[2 * k] / viks[2 * k + 1], viks[2 * k + 1]);
                 if (viks) memset(viks, 0, (size_t)S->n * 2 * sizeof *viks);

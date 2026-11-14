@@ -20,8 +20,13 @@ while :; do
       while [ -f $o.launcher.pid ] && kill -0 $(cat $o.launcher.pid) 2>/dev/null; do sleep 10; done
       rm -f $o.stop
     fi
-    GPU=${eg:-$(sed -nE 's/.* GPU=([0-9]+)[^ ]* .*/\1/p' $o.relaunch)} bash $H/eval.sh $c $n-$st >> $o.evwatch.log 2>&1
-    touch $o/snap/$st.evaldone
+    GPU=${eg:-$(sed -nE 's/.* GPU=([0-9]+)[^ ]* .*/\1/p' $o.relaunch)} bash $H/eval.sh $c $n-$st >> $o.evwatch.log 2>&1; rc=$?
+    if [ $rc = 0 ]; then touch $o/snap/$st.evaldone
+    else   # (a failed eval is retried next round, EVTRIES (2) times in all; then marked done with <step>.evalfail kept: audit eval#18)
+      k=$(( $(cat $o/snap/$st.evalfail 2>/dev/null || echo 0) + 1 )); echo $k > $o/snap/$st.evalfail
+      echo "$(date) eval $st FAILED (rc $rc, try $k of ${EVTRIES:-2})" >> $o.evwatch.log
+      [ $k -ge ${EVTRIES:-2} ] && touch $o/snap/$st.evaldone
+    fi
     if [ "$pause" = 1 ]; then bash $o.relaunch; echo "$(date) relaunched" >> $o.evwatch.log; sleep 120; fi
   done
   [ -f $o.evwatch.stop ] && break

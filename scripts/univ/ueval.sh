@@ -86,12 +86,14 @@ uqa() {   # uqa NAME: CPU only, after the box's GPU piece -> $d/row.tsv
   return 0; }
 
 # ---- one piece on GPU G ("0,1" in split mode: the scripts get GPU 0 and the split flags)
+# (the wind piece fits with the pinned fitter FITU, default $WB/bin/ufsm, and predicts with the run binary B: snapshot deltas then compare one fitter
+#  build, not whichever binary the run was swapped to; audit eval#15)
 run() {   # run PIECE G
   local k=${1%%:*} a=${1#*:} G=$2 g=$2; [ $SPLIT = 1 ] && g=0
   local IE=(env E=$E U=$B UP=$B GPU=$g THREADS=8 REFS= CTROOT=$CTROOT PXH="$PXH" INKC="$INKC" INKGT="$INKGT")
   case $k in
     u)    upiece $a $g;;
-    wind) env SITE=desk WB=$WB GPU=$g SLABS=0 REP=${REP:-0} THREADS=${THREADS:-12} PRIO=eval UP=$B U=$B WZARGS= WIN=${WIN:-640} HALO=${HALO:-64} \
+    wind) env SITE=desk WB=$WB GPU=$g SLABS=0 REP=${REP:-0} THREADS=${THREADS:-12} PRIO=eval UP=$B U=${FITU:-$WB/bin/ufsm} WZARGS= WIN=${WIN:-640} HALO=${HALO:-64} \
             LOCALCT=$CTROOT BOXES=$a PX= bash $H/scripts/wbench/wbench.sh $CK $T >> $E/$T/wbench.out 2>&1
           grep -qP "^$T\t$a\t" $WB/res/$T.tsv;;
     rv)   env E=$RVE GPU=$G U=$B LOCK= WZ= WINDOW=${WIN:-640} PX="$PX" bash $H/scripts/rv/eval.sh $CK $T $a >> $E/$T/rv_$a.out 2>&1
