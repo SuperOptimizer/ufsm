@@ -107,6 +107,15 @@ Use: MEMMODE=fast only where the window leaves ~1.3 GB spare (P 512: -1.4 %); at
 gains more than 2 % on this net: the remaining host-side cost is PCIe contention in the trainer (perf2's ~180 ms exposed), not the
 activation offloads or recompute.
 tests/bench_s2: one desk card's share of the P 1024 split trunk on one GPU (synthetic input; the unet env switches, BS2_CAP_GB ballast).
+## Two fast-tier failures on master: test_lldec pool 3, test_wbench_stats without bc (2026-11-14, branch fixtests-20261114)
+
+- test_lldec: the pooled codes views 8x deep (pool 3) returned rc -2 from phase_onfly_decode_gpu since 2dd6744 (band gpu, 11-13),
+  which changed tile_gpu's size guard into `k > 2` (no device path at 8x) while the walk above it and bg_codes_run take k <= 3 and
+  the test checks pool 3. Now `k > 3`: an 8x tile goes to the device again, and a box that does not fit the reserved slab buffer
+  still returns -1 (the CPU path) without allocating, as at 2x / 4x.
+- test_wbench_stats: the script built its B table with `bc -l`, which the pods do not have (the paired difference came out empty);
+  awk instead.
+
 ## Kernel fusion for scratch2: what is left to fuse, the head slabs (2026-11-14, branch fuse-20261114)
 
 Goal: fuse GroupNorm-apply + SiLU + MX-fp4 quantisation into the 3^3 convs (forward and backward) for the scratch2 step.
@@ -150,7 +159,10 @@ lab_unpack_k 1.0, ink_sym_k 0.9, the target builders (packed_mask, ink_tg, unwra
 histogram (k_plane_hist and k_pairs run the same samp arithmetic, the same FFMA chain in the SASS) but the rays: in lean memory modes
 d->milr[1] aliased milr[0], and upload_async's mil_take copied the next window's rays on the copy stream before any of its stream
 waits, so they landed under the current step's backward slabs; the pairs came from other rays than fin's counts. With
-UFSM_MIL_ASYNC=0 (the readback) the run went on, with those steps' MIL gradient computed from the next window's rays. Now two ray
+UFSM_MIL_ASYNC=0 (the readback) the run went on, with those steps' MIL gradient computed from the next window's rays. try5 (--split z, P 1024)
+was exposed the same way: its plan was lean 2 too (one ray buffer), and upload_async's split branches (upsplit / hsplit) also called
+mil_take before their waits; its logs hold no overflow line (try5-20261114/), so either no overlap reached the bound or the excess
+stayed within it: its MIL gradients were not checked. Now two ray
 buffers in every mode (+2.6 MB at 65536 rays), the copy waits for ev_done[i] (the step that last read buffer i), and an overflow
 reported by a later step switches every thread to the per-slab readback with a warning instead of exit(1). test_ink_mil: rays A for
 the passes and fin, rays B (6 planes away in z) copied over them before the backward slabs, then a step on B: the old code returned

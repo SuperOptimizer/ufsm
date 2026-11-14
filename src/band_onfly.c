@@ -111,7 +111,7 @@ static int tile_gpu(z3 *codes, const int64_t co_[3], const int64_t cn_[3], const
         const int64_t e = (ro_[d] + rn_[d]) * (1 << k) < m->shape[d] ? (ro_[d] + rn_[d]) * (1 << k) : m->shape[d]; rn[d] = e - ro[d];
         if (rn[d] <= 0) return 2;
     }
-    if (k > 2) return -2;   /* (the base box, 8^k the tile's voxels, decoded and pooled in z slabs of the reserved slab buffer: nn_band.cu bg_codes_run; before 2026-11-13 boxes above 2x --onfly-mb took the CPU) */
+    if (k > 3) return -2;   /* (k <= 3 as the walk above; 2dd6744 had k > 2, which sent every 8x tile to the CPU and failed test_lldec pool 3) (the base box, 8^k the tile's voxels, decoded and pooled in z slabs of the reserved slab buffer: nn_band.cu bg_codes_run; before 2026-11-13 boxes above 2x --onfly-mb took the CPU) */
     onfly_pack *K = &t_pk; K->n = 0; K->nch = 0;
     for (int64_t cz = ro[0] / 128; cz * 128 < ro[0] + rn[0]; cz++) for (int64_t cy = ro[1] / 128; cy * 128 < ro[1] + rn[1]; cy++) for (int64_t cx = ro[2] / 128; cx * 128 < ro[2] + rn[2]; cx++) {
         uint8_t *buf = nullptr; size_t len = 0; const int r = z3_chunk_raw(base, cz, cy, cx, &buf, &len);
