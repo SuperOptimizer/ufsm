@@ -2353,6 +2353,29 @@ static void stem_slab_run(unet *u, block *b, int G, float *om, float *orr) {
 /* conv 1 of an encoder block reads x (coarse offload: enc[1]'s conv1 over down0's output, which sits in Y plane for plane, see
    p3_down_off); dec[0]'s conv1 under the coarse offload takes its temp from R, then from Y's consumed coarse planes (dc1_next), and
    brings R back from the host between the two (waited before a slab reaches plane zr) */
+/* UFSM_GN_TRACE=N: the first N training forwards print, per block, the GroupNorm statistics it normalised with (m / r: the running ones
+   under gn_ema) and those it wrote (the twins), as max |value| and the non-finite count (a debugging hook: one sync per block) */
+static void gn_trace1(const char *what, const float *p, int n) {
+    if (!p || n <= 0) return;
+    float h[4096]; if (n > 4096) n = 4096; nn_sync(); nn_d2h(h, p, (size_t)n * 4);
+    int nf = 0; float mx = 0; for (int i = 0; i < n; i++) { if (!isfinite(h[i])) nf++; else if (fabsf(h[i]) > mx) mx = fabsf(h[i]); }
+    fprintf(stderr, " %s %.3g%s", what, mx, nf ? " NONFINITE" : "");
+    if (nf) fprintf(stderr, "(%d)", nf);
+}
+static void gn_trace(unet *u, block *b, int G, const float *om1, const float *or1, const float *om2, const float *or2) {
+    static int lim = -1, fwd = -1; static long last_n = -1; if (lim < 0) lim = getenv("UFSM_GN_TRACE") ? atoi(getenv("UFSM_GN_TRACE")) : 0;
+    if (!lim || !u->fwd_train) return;
+    if (u->ge_n != last_n) { last_n = u->ge_n; fwd++; }
+    if (fwd >= lim) return;
+    const int L = u->cfg.nlev; const char *k = "?"; int lv = -1;
+    for (int i = 0; i < L; i++) { if (b == &u->enc[i]) { k = "enc"; lv = i; } if (i < L - 1 && b == &u->dec[i]) { k = "dec"; lv = i; } }
+    const int n = b->ys.n * G;
+    fprintf(stderr, "gn-trace fwd %d (ge_n %ld ge_c %d side %d) %s%d:", fwd, u->ge_n, u->ge_c, u->split_side, k, lv);
+    gn_trace1("m1", b->m1, n); gn_trace1("r1", b->r1, n); gn_trace1("m2", b->m2, n); gn_trace1("r2", b->r2, n);
+    if (om1 != b->m1) { gn_trace1("tw.m1", om1, n); gn_trace1("tw.r1", or1, n); }
+    if (om2 != b->m2) { gn_trace1("tw.m2", om2, n); gn_trace1("tw.r2", or2, n); }
+    fprintf(stderr, "\n");
+}
 static void slab_run(unet *u, block *b, int level, int conv, const float *x, int G, float *om, float *orr) {
     float *X = b->a2;
     const shape5 ys = b->ys; const int D = ys.d, s = u->slab_s;
@@ -2488,6 +2511,7 @@ static void block_fwd(unet *u, block *b, int level, const float *x) {
         FQ(b->a2, b->ys); FQ_AFF(b->a2, b->ys, b->pm2, b->pr2, G);
         sp_halo(u, b->a2, b->ys, 0);
         if (b->s2) { PROF(3, nn_gn_silu_apply(b->a2, l0s_view(u, b, b->ys, b->a2, b->s2), G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, b->s2)); FQ(b->s2, b->ys); FQ_POST(b->s2, b->ys); }
+        gn_trace(u, b, G, om1, or1, om2, or2);
         return;
     }
     /* constant level-0 statistics (they sit in m / r): live ones into l0_live for the running update, then the affine + SiLU */
