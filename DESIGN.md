@@ -24,7 +24,7 @@ against a published unwrap.
 Changes:
 - **`render --fill-ct` threshold:** with the default 1, only masked-zero CT was void, so the fill never recentred off unmasked air. On the 1667
   renders 45-54 % of the flag-0 surface pixels have CT < 80 (31-42 % < 50), and the ink there is read in air (p95 98-133).
-  - The CLI default goes to 80 with unrollfix-20261114 (it owns the line), and FILLCT=80 in unroll.sh.
+  - The CLI default goes to 80 on unrollfix-20261114 (37dadf0, it owns the line); FILLCT=80 in unroll.sh (c9e4756); u1667ink GATE=1.
   - test_render_fill: a threshold case (thr 201: sheet A counts as void, the gap bands move to sheet B).
   - Post-pass GPU check: `scripts/unroll/urender_post.sh`.
 - **`ink-blend --q`** defaults to 0 (lossless). The inputs are already q-coded by predict; the old second lossy pass (32) stacked errors.
