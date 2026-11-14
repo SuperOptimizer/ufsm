@@ -153,6 +153,27 @@ At scratch2's own widths (uneven copies), the same windows give:
 On the fixture's labelled windows these widths stay as close as the exact 2x: the 12% logit deviation on random inputs does not show up as a loss gap there.
 A real-data step-0 check, at lr 0 on the desk data path, is still to be run in a desk window.
 
+## Echo in try4: slot-bound new windows, and a GPU-idle meter (2026-11-14, branch echofix-20261114)
+
+try4 (P 1024 `--split z`, accum 4, `--echo-max 4`, 4 slots, 10 workers) logged echo 48-78 % and "wait" 11-21 % at windows
+1900-2550, at 73-80 Mvox/s. The run with `--replay 2` before it ran at 69-77 Mvox/s.
+
+**Why so few new windows.**
+- The startup line says "at most 3 windows are built at once": 4 slots minus the trainer's one.
+- Echo held 2 more slots as candidates, and builders took one back only while a new window was ready, so one window was built at a
+  time.
+- A redraw costs 0.40-0.44 s there against a ~7 s step, so one candidate is enough.
+- `sampler_start` now holds 2 candidates per window only when slots - w >= workers + 2w (w: the windows a step takes), otherwise 1.
+  try4 and try5 (13 slots / 12 workers) get 1. `UFSM_ECHO_KEEP` overrides.
+
+**What "wait" counts.**
+- Under echo, the trainer is inside `sampler_next_gate` from the end of its launches until a card's `ev_done`, while the GPUs still
+  run the queued backward. The wait meter counts that time.
+- The step line now adds " (GPU idle for data N%)": from the first probe that finds a card done to the batch handover. The gate
+  polls every 0.5 ms whenever a probe is given, also with nothing to echo yet.
+
+**Test.** test_echo gains a `--split z` case: one GPU, a starved worker. It logs echo 100 % with GPU idle for data 0 %.
+
 ## Adaptive data echoing: `--echo-max M` (2026-11-14, branch echo-20261114)
 
 scratch2 waits on the sampler for 20-35 % of a long run (the 30-step bench showed 0 %), and the user accepts data echoing in
