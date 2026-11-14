@@ -38,6 +38,7 @@ enum { FIT_P_TOTAL, FIT_P_PHASE, FIT_P_NORMAL, FIT_P_DENSITY, FIT_P_NONDEG, FIT_
 
 typedef struct {
     int dir;                        /* +1 / -1, 0 = choose the more phase-coherent */
+    int dir_loops;                  /* 1: with no ring vote, the direction from the phase walked around circles (fit_init_prior; default 0: +1, warned) */
     int knot_dz;                    /* native voxels between pitch / offset knots */
     int nstage, lattice[8], steps[8];   /* delta lattice spacing (native voxels) and Adam steps per stage */
     float lr, lr_knot;              /* Adam learning rates for delta and the knots */

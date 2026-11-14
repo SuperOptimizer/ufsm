@@ -2,6 +2,7 @@
    skips every other sheet in one quadrant (it rotates at half the rate there). W from the density must count every sheet there,
    the output phase (R 0) must follow frac(W) where the phase is right, and --model must reproduce W (fit_W). */
 #include "fit.h"
+#include "afv.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -147,6 +148,55 @@ int main(void) {
         }
         CHECK(nr >= 4 && fabs(rs / nr - 0.75) < 0.05, "--rho-scale 0.75: radial count ratio %.3f (%d segments)", nr ? rs / nr : 0, nr);
         free(w2);
+    }
+    {   /* same-sheet pairs (--fibers --cf-fib): the density under-counts a band (r 16..28 cells) in one sector (sp x 4: 0.75 of its 3 sheets),
+           so W beyond it is off there; fibres along the true sheets (arcs across the sector, every 4th sheet, r 20..44 cells) tie the
+           sector to its neighbours. Integer W errors (wc - W true - gauge, rounded) beyond the band in the sector: without vs with */
+        char in3[600], o3[700], o4[700], fibp[700]; snprintf(in3, sizeof in3, "%s/in_band", dir); snprintf(o3, sizeof o3, "%s/out_nofib", dir); snprintf(o4, sizeof o4, "%s/out_fib", dir); snprintf(fibp, sizeof fibp, "%s/arcs.fib", dir);
+        uint8_t sp0[D * H * W]; memcpy(sp0, a[8], n);
+        for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            const size_t i = ((size_t)z * H + y) * W + x; const double ry = (y + 0.5) * h - cy0, rx = (x + 0.5) * h - cx0, r = hypot(ry, rx), th = atan2(ry, rx);
+            if (a[9][i] && r > 16 * h && r < 28 * h && th > 0.2 && th < 1.4) a[8][i] = (uint8_t)lrint(4 * 8 * p / h);
+        }
+        uint8_t *ph0 = malloc(2 * n); memcpy(ph0, a[0], n); memcpy(ph0 + n, a[1], n);
+        for (size_t i = 0; i < n; i++) if (a[9][i]) {   /* (the true phase everywhere here: the pairs' job is the count, not the phase skip) */
+            const int y = (int)(i / W % H), x = (int)(i % W); const double Wt = trueW((y + 0.5) * h, (x + 0.5) * h);
+            a[0][i] = (uint8_t)lrint(128 + 127 * 0.9 * cos(2 * M_PI * Wt)); a[1][i] = (uint8_t)lrint(128 + 127 * 0.9 * sin(2 * M_PI * Wt)); }
+        CHECK(!fit_fields_save(in3, org, shp, h, 9.6, a, cy, cx, na), "save the band fields");
+        memcpy(a[8], sp0, n); memcpy(a[0], ph0, n); memcpy(a[1], ph0 + n, n); free(ph0);
+        fib_set fs = {0}; int cap = 4096; fs.off = malloc(512 * sizeof(int)); fs.fam = calloc(512, 1); fs.pts = malloc((size_t)cap * 3 * sizeof(float)); fs.off[0] = 0;
+        for (int k = 3; k < 12; k += 1) for (int zz = 1; zz < D * h; zz += 4) {   /* sheet W = k: r = p (k + th / 2 pi), th -0.6 .. 2.2 */
+            for (double th = -0.6; th <= 2.2; th += 0.02) {
+                const double r = p * (k + th / (2 * M_PI)); if (r < 20 * h || r > 44 * h) continue;
+                if (fs.npts == cap) { cap *= 2; fs.pts = realloc(fs.pts, (size_t)cap * 3 * sizeof(float)); }
+                fs.pts[3 * fs.npts] = (float)(zz + 0.5); fs.pts[3 * fs.npts + 1] = (float)(cy0 + r * sin(th)); fs.pts[3 * fs.npts + 2] = (float)(cx0 + r * cos(th)); fs.npts++;
+            }
+            if (fs.npts > fs.off[fs.n]) { fs.n++; fs.off[fs.n] = fs.npts; }
+        }
+        CHECK(!fib_save(fibp, &fs), "save the arcs"); const int nfib = fs.n; free(fs.off); free(fs.fam); free(fs.pts);
+        double err[2] = {1, 1};
+        for (int v = 0; v < 2; v++) {
+            char *av3[] = {"ufsm", "count-field", in3, v ? o4 : o3, "--R", "0", "--dir", "1", "--pool", "1", "--threads", "4", "--rmin-um", "0", "--cf-gpu", "0", "--fibers", fibp, "--cf-fib", v ? "4" : "0", nullptr};
+            CHECK(cmd_count_field(20, av3) == 0, "count-field (band, --cf-fib %s) failed", v ? "4" : "0");
+            snprintf(pth, sizeof pth, "%s/wc.f32", v ? o4 : o3); FILE *f3 = fopen(pth, "rb"); float *w3 = malloc(n * sizeof(float));
+            CHECK(f3 && fread(w3, sizeof(float), n, f3) == n, "no wc.f32 (band)"); if (f3) fclose(f3);
+            double gs = 0, gc = 0; int ne = 0, nb = 0; double me = 0;   /* the gauge from the lower half (no band there), then the sector beyond the band */
+            for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+                const size_t i = ((size_t)3 * H + y) * W + x; const double py = (y + 0.5) * h, px = (x + 0.5) * h, r = hypot(py - cy0, px - cx0), th = atan2(py - cy0, px - cx0);
+                if (!(w3[i] == w3[i]) || r < 8 * h || r > 44 * h) continue;
+                if (th < -0.4 && th > -2.7) { gs += w3[i] - trueW(py, px); gc++; }
+            }
+            const double g0 = gc ? gs / gc : 0;
+            for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+                const size_t i = ((size_t)3 * H + y) * W + x; const double py = (y + 0.5) * h, px = (x + 0.5) * h, r = hypot(py - cy0, px - cx0), th = atan2(py - cy0, px - cx0);
+                if (!(w3[i] == w3[i]) || r < 30 * h || r > 44 * h || th < 0.4 || th > 1.2) continue;
+                ne++; nb += fabs(w3[i] - trueW(py, px) - g0) > 0.5; me += fabs(w3[i] - trueW(py, px) - g0);
+            }
+            err[v] = ne ? (double)nb / ne : 1; free(w3);
+            printf("band under-count, --cf-fib %s (%d arcs): W off by > 0.5 turn on %.3f of %d sector cells beyond the band, mean |error| %.3f\n", v ? "4" : "0", nfib, err[v], ne, ne ? me / ne : 0);
+        }
+        CHECK(err[0] > 0.3, "the band under-count should break the sector without pairs (%.3f off)", err[0]);
+        CHECK(err[1] < 0.05, "the fibre pairs should restore the sector (%.3f off with --cf-fib 4)", err[1]);
     }
     gpu_vs_cpu(dir);
     char cmd[700]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}

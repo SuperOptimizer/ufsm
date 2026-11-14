@@ -29,6 +29,7 @@
 #include "store.h"
 #define CFGPU_WEAK __attribute__((weak))   /* src/nn_cf.cu: a binary without it runs the CPU code */
 #include "cfgpu.h"
+#include "afv.h"
 #include <limits.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
@@ -151,7 +152,15 @@ typedef struct {
     size_t n; float *wt[3], *tg[3], *b, *diag, *U, *r, *p, *Ap; double lam; const float *cy, *cx; int na, dir;
     const float *pitch, *offset; int nk, knot_dz; double rmin;   /* rmin: no data within this radius (native) of the axis */
     double part[CF_MAXT][2];
+    struct cf_pairs *pr;   /* same-sheet pairs (--fibers / --pairs; nullptr: none) on this level's grid */
 } cf_lvl;
+/* Same-sheet pairs (fibres): rows c . U = t with c = tri(b) - tri(a) (the trilinear weights of the two points on the solve grid, 16
+   entries) and t = W(b) - W(a) + dir (theta_b - theta_a) / 2 pi (U = W + dir theta / 2 pi), weight w (Huber-reweighted at level 0). The
+   CG operator gathers them per cell through a cell -> (pair, entry) index, so the z-row threads never write a shared cell. */
+typedef struct cf_pairs {
+    size_t np; uint32_t (*ix)[16]; float (*cw)[16]; float *t, *w0, *w, *q;   /* per pair: cells, coefficients, target, weights, c . v */
+    size_t *rs; uint32_t *re;   /* cell i's entries re[rs[i] .. rs[i + 1]): pair * 16 + entry */
+} cf_pairs;
 static double cf_center(const cf_lvl *L, int i) { return (i + 0.5) * L->P * L->h; }   /* native coordinate of a solve cell centre */
 /* the theta term dir grad theta / 2 pi (turns per solve cell) at a solve-cell point (native coordinates) */
 static void cf_theta(const cf_lvl *L, double pz, double py, double px, double g[3]) {
@@ -193,6 +202,8 @@ static void cf_rhs_run(void *a, long z0, long z1, int t_) {   /* b = sum over ed
             b -= L->wt[ax][i] * L->tg[ax][i]; dg += L->wt[ax][i];
             if (c0[ax] > 0) { b += L->wt[ax][i - st[ax]] * L->tg[ax][i - st[ax]]; dg += L->wt[ax][i - st[ax]]; }
         }
+        if (L->pr) { const cf_pairs *R = L->pr;
+            for (size_t e = R->rs[i]; e < R->rs[i + 1]; e++) { const size_t pp = R->re[e] >> 4; const double c = R->cw[pp][R->re[e] & 15]; b += R->w[pp] * c * R->t[pp]; dg += R->w[pp] * c * c; } }
         L->b[i] = (float)b; L->diag[i] = (float)dg;
     }
 }
@@ -205,6 +216,8 @@ static void cf_apply(cf_lvl *L, const float *u, float *o, long z0, long z1) {
             if (c0[ax] + 1 < (ax == 0 ? L->d : ax == 1 ? L->hh : L->w)) s += L->wt[ax][i] * (ui - u[i + st[ax]]);
             if (c0[ax] > 0) s += L->wt[ax][i - st[ax]] * (ui - u[i - st[ax]]);
         }
+        if (L->pr) { const cf_pairs *R = L->pr;   /* (R->q = c . u of every pair, computed before this pass: cf_pairs_q) */
+            for (size_t e = R->rs[i]; e < R->rs[i + 1]; e++) { const size_t pp = R->re[e] >> 4; s += R->w[pp] * R->cw[pp][R->re[e] & 15] * R->q[pp]; } }
         o[i] = (float)s;
     }
 }
@@ -225,7 +238,14 @@ static void cf_cg_run(void *a, long z0, long z1, int t) {
     }
     L->part[t][0] = s0; L->part[t][1] = s1;
 }
+typedef struct { cf_pairs *R; const float *u; } cf_pq;
+static void cf_pairs_q_run(void *a, long p0, long p1, int t_) {
+    cf_pq *Q = a; cf_pairs *R = Q->R;
+    for (long p = p0; p < p1; p++) { double s = 0; for (int k = 0; k < 16; k++) s += R->cw[p][k] * Q->u[R->ix[p][k]]; R->q[p] = (float)s; }
+}
+static void cf_pairs_q(cf_pairs *R, const float *u) { cf_pq Q = {R, u}; cf_par((long)R->np, cf_pairs_q_run, &Q); }
 static void cf_cg_pass(cf_cg *C, double *s0, double *s1) {
+    if (C->L->pr && C->ph <= 1) cf_pairs_q(C->L->pr, C->ph == 0 ? C->L->U : C->L->p);
     for (int t = 0; t < CF_MAXT; t++) C->L->part[t][0] = C->L->part[t][1] = 0;
     cf_par(C->L->d, cf_cg_run, C); double a = 0, b = 0; for (int t = 0; t < CF_MAXT; t++) { a += C->L->part[t][0]; b += C->L->part[t][1]; }
     if (s0) *s0 = a;
@@ -252,6 +272,40 @@ static double cf_tri(const float *U, int d, int hh, int w, double qz, double qy,
         if (wv != 0) s += wv * U[((size_t)(a < d ? a : d - 1) * hh + (b < hh ? b : hh - 1)) * w + (x < w ? x : w - 1)];
     }
     return s;
+}
+
+/* ---- same-sheet pairs: the point list (box-local native z y x, target t in U), built per level ---- */
+typedef struct { float a[3], b[3], t; } cf_pt;
+static void cf_tri_w(const cf_lvl *L, const float p[3], uint32_t ix[8], float cw[8], float sg) {   /* cf_tri's corners / weights of a native point */
+    const double cs = (double)L->P * L->h, q[3] = {p[0] / cs - 0.5, p[1] / cs - 0.5, p[2] / cs - 0.5}; const int dm[3] = {L->d, L->hh, L->w}; int c[3]; double t[3];
+    for (int k = 0; k < 3; k++) { double a = q[k] < 0 ? 0 : q[k] > dm[k] - 1 ? dm[k] - 1 : q[k]; c[k] = (int)a; if (c[k] > dm[k] - 2) c[k] = dm[k] - 2 < 0 ? 0 : dm[k] - 2; t[k] = dm[k] > 1 ? a - c[k] : 0; }
+    for (int e = 0; e < 8; e++) {
+        const int a = c[0] + (e >> 2 & 1), b = c[1] + (e >> 1 & 1), x = c[2] + (e & 1);
+        ix[e] = (uint32_t)(((size_t)(a < L->d ? a : L->d - 1) * L->hh + (b < L->hh ? b : L->hh - 1)) * L->w + (x < L->w ? x : L->w - 1));
+        cw[e] = sg * (float)((e >> 2 & 1 ? t[0] : 1 - t[0]) * (e >> 1 & 1 ? t[1] : 1 - t[1]) * (e & 1 ? t[2] : 1 - t[2]));
+    }
+}
+static cf_pairs *cf_pairs_build(const cf_lvl *L, const cf_pt *P, size_t np, double w0) {
+    cf_pairs *R = calloc(1, sizeof *R); if (!R) return nullptr;
+    R->np = np; R->ix = malloc(np * sizeof *R->ix); R->cw = malloc(np * sizeof *R->cw); R->t = malloc(np * 4); R->w0 = malloc(np * 4); R->w = malloc(np * 4); R->q = malloc(np * 4);
+    R->rs = calloc(L->n + 1, sizeof(size_t)); R->re = malloc(np * 16 * sizeof(uint32_t));
+    if (!R->ix || !R->cw || !R->t || !R->w0 || !R->w || !R->q || !R->rs || !R->re) { fprintf(stderr, "count-field: out of memory (pairs)\n"); exit(1); }
+    for (size_t p = 0; p < np; p++) {
+        cf_tri_w(L, P[p].a, R->ix[p], R->cw[p], -1.f); cf_tri_w(L, P[p].b, R->ix[p] + 8, R->cw[p] + 8, 1.f);
+        R->t[p] = P[p].t; R->w0[p] = R->w[p] = (float)w0;
+        for (int k = 0; k < 16; k++) R->rs[R->ix[p][k] + 1]++;
+    }
+    for (size_t i = 0; i < L->n; i++) R->rs[i + 1] += R->rs[i];
+    size_t *fill = malloc(L->n * sizeof(size_t)); memcpy(fill, R->rs, L->n * sizeof(size_t));
+    for (size_t p = 0; p < np; p++) for (int k = 0; k < 16; k++) R->re[fill[R->ix[p][k]]++] = (uint32_t)(p * 16 + k);
+    free(fill); return R;
+}
+static void cf_pairs_free(cf_pairs *R) { if (!R) return; free(R->ix); free(R->cw); free(R->t); free(R->w0); free(R->w); free(R->q); free(R->rs); free(R->re); free(R); }
+/* the pairs' residuals c . U - t at U: Huber weights w0 min(1, delta / |r|); returns the share with |r| > 0.5 (turns) */
+static double cf_pairs_reweight(cf_pairs *R, const float *U, double delta, int set) {
+    cf_pairs_q(R, U); size_t nb = 0;
+    for (size_t p = 0; p < R->np; p++) { const double r = fabs(R->q[p] - R->t[p]); nb += r > 0.5; if (set) R->w[p] = (float)(R->w0[p] * (r > delta ? delta / r : 1)); }
+    return R->np ? (double)nb / R->np : 0;
 }
 
 /* ---- the ray variant: U(cell) = prior at the ray's exit (box edge / near the axis) + sum of target . r_hat along the ray ---- */
@@ -517,7 +571,7 @@ static void cf_lat_run(void *a_, long a0, long a1, int t_) {   /* model lattice 
 int cmd_count_field(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: ufsm count-field <in-fields> <out-fields> [--method ls|ray] [--pool P (solve cell in field cells, 0 auto)] [--R 10 (phase demod radius, field cells; 0: W only)] [--Rz R]\n"
-                        "       [--phase-w 0 (confident network phase gradients in the targets, weight)] [--phase-c0 0.4] [--gauge demod|ls (ls: a smooth LS-unwrapped gauge instead of the +-R demodulation; with --R 0)] [--gauge-R 5 (solve cells)] [--conf w|phase|mix|pmax] [--trust C0,C1 (phase confidence ramp: the network phase kept)] [--conf-w 1 (scale of the count confidence)] [--keep 0 (p: + A^p wrap(phi - W_out), A the local agreement)] [--sp-w 0 (1: sp from |grad W|)] [--dir 0] [--iters 400] [--lambda 1e-7] [--eps 1e-3] [--loop 8 (closing loop edge, field cells)] [--model DIR] [--model-R 8] [--rmin-um 500] [--emin 0.1] [--sheet0 0.4]\n"
+                        "       [--phase-w 0 (confident network phase gradients in the targets, weight)] [--phase-c0 0.4] [--gauge demod|ls (ls: a smooth LS-unwrapped gauge instead of the +-R demodulation; with --R 0)] [--gauge-R 5 (solve cells)] [--conf w|phase|mix|pmax] [--trust C0,C1 (phase confidence ramp: the network phase kept)] [--conf-w 1 (scale of the count confidence)] [--keep 0 (p: + A^p wrap(phi - W_out), A the local agreement)] [--sp-w 0 (1: sp from |grad W|)] [--dir 0] [--dir-loops 0 (1: no ring vote: the direction from phase loops, else +1 with a warning)] [--iters 400] [--lambda 1e-7] [--eps 1e-3] [--loop 8 (closing loop edge, field cells)] [--model DIR] [--model-R 8] [--rmin-um 500] [--emin 0.1] [--sheet0 0.4]\n"
                         "       [--wc 1 (0: no wc.f32)] [--mem-gb 6 (field chunk budget)] [--threads 8] [--cf-gpu 1 (pooling, CG, model pass on the GPU)] [--prefetch auto|0|1] [--read-threads N]\n"
                         "       [--pool-cache FILE] [--pool-only 1 (pass 1 into the cache, then exit)] [--follow ROWSFILE (pass 1 behind a running predict)] [--follow-split S] [--chunk-rows N]\n");
         return 2;
@@ -634,7 +688,7 @@ int cmd_count_field(int argc, char **argv) {
           cf_par((long)nr * pp.nb, cf_pool_run, &pp); gpu = gpu0; npc++; }   /* (jobs own whole solve-row y bands: no shared cells; same sum order) */
         t_pool += cf_now() - tl1;
         if (z0 <= D / 2 && D / 2 < z1) {
-            fit_cfg pc = fit_cfg_default(); pc.dir = dir; fit_model pm; memset(&pm, 0, sizeof pm);
+            fit_cfg pc = fit_cfg_default(); pc.dir = dir; pc.dir_loops = atoi(cf_opt(argc, argv, "--dir-loops", "0")); fit_model pm; memset(&pm, 0, sizeof pm);
             if (!fit_init_prior(&b.f, &pc, &pm)) {
                 if (!dir) dir = pm.dir;
                 float *pk = malloc(pm.nk * sizeof(float)); int np = 0; for (int k = 0; k < pm.nk; k++) if (pm.pitch[k] > 0) pk[np++] = pm.pitch[k];
@@ -693,6 +747,52 @@ int cmd_count_field(int argc, char **argv) {
             Sl[l][j] += Sl[l - 1][i]; for (int k = 0; k < 3; k++) Gl[l][k][j] += Gl[l - 1][k][i];
         }
     }
+    /* --fibers F.fib (ufsm fiber-export in this fields box's frame) / --pairs F.f32 (records za ya xa zb yb xb dW, box-local native):
+       same-sheet pairs in the solve, weight --cf-fib W (0: off), Huber --cf-fib-huber D turns over --cf-fib-irls K reweighted level-0
+       solves. A fibre: resampled at 1 native voxel, pairs every 4th sample at the spans --cf-fib-spans (native, default 16,32,64,128),
+       dW = 0 (W is constant along a sheet away from the theta cut; the cut is in t through dir * dtheta / 2 pi) */
+    cf_pt *pts = nullptr; size_t npt = 0; const double wfib = atof(cf_opt(argc, argv, "--cf-fib", "0"));
+    if (wfib > 0) {
+        size_t cap = 0; const double zo = atof(cf_opt(argc, argv, "--fib-zoff", "0"));
+        #define CF_PUSH(A, B, DW) do { if (npt == cap) { cap = cap ? 2 * cap : 1 << 16; pts = realloc(pts, cap * sizeof *pts); if (!pts) return 1; } \
+            cf_pt *e_ = &pts[npt++]; for (int k_ = 0; k_ < 3; k_++) { e_->a[k_] = (float)(A)[k_]; e_->b[k_] = (float)(B)[k_]; } \
+            double ta_ = atan2((A)[1] - cf_axis_at(g.cy, na, (A)[0]), (A)[2] - cf_axis_at(g.cx, na, (A)[0])), tb_ = atan2((B)[1] - cf_axis_at(g.cy, na, (B)[0]), (B)[2] - cf_axis_at(g.cx, na, (B)[0])); \
+            double dt_ = tb_ - ta_; dt_ -= 2 * M_PI * floor((dt_ + M_PI) / (2 * M_PI)); e_->t = (float)((DW) + dir * dt_ / (2 * M_PI)); } while (0)
+        if (*cf_opt(argc, argv, "--fibers", "")) {
+            fib_set fs; if (fib_load(cf_opt(argc, argv, "--fibers", ""), &fs)) { fprintf(stderr, "count-field: cannot read --fibers %s\n", cf_opt(argc, argv, "--fibers", "")); return 1; }
+            int sp[8] = {16, 32, 64, 128}, nsp = 4;
+            if (*cf_opt(argc, argv, "--cf-fib-spans", "")) { nsp = 0; char *t = strdup(cf_opt(argc, argv, "--cf-fib-spans", "")); for (char *q = strtok(t, ","); q && nsp < 8; q = strtok(nullptr, ",")) sp[nsp++] = atoi(q); free(t); }
+            double *rq = nullptr; size_t rcap = 0;
+            for (int r = 0; r < fs.n; r++) {
+                const float *pp = fs.pts + 3 * (size_t)fs.off[r]; const int n = fs.off[r + 1] - fs.off[r]; size_t ns = 0; double acc = 0, next = 0;
+                for (int k = 1; k < n; k++) {
+                    const double a[3] = {pp[3 * k - 3] - zo, pp[3 * k - 2], pp[3 * k - 1]}, d[3] = {pp[3 * k] - pp[3 * k - 3], pp[3 * k + 1] - pp[3 * k - 2], pp[3 * k + 2] - pp[3 * k - 1]};
+                    const double Ls = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                    for (; Ls > 0 && next <= acc + Ls; next += 1) {
+                        if (ns == rcap) { rcap = rcap ? 2 * rcap : 4096; rq = realloc(rq, 3 * rcap * sizeof *rq); if (!rq) return 1; }
+                        const double t = (next - acc) / Ls; for (int e = 0; e < 3; e++) rq[3 * ns + e] = a[e] + t * d[e]; ns++;
+                    }
+                    acc += Ls;
+                }
+                for (size_t b = 0; b < ns; b++) for (int di = 0; di < nsp; di++) {
+                    if (b < (size_t)sp[di] || (b - sp[di]) % 4) continue;
+                    const double *A = rq + 3 * (b - sp[di]), *B = rq + 3 * b;
+                    if (A[0] < 0 || B[0] < 0 || A[0] > D * h || B[0] > D * h) continue;   /* (inside the box's rows) */
+                    CF_PUSH(A, B, 0.0);
+                }
+            }
+            free(rq); fprintf(stderr, "count-field: %d fibres -> %zu same-sheet pairs (spans", fs.n, npt); for (int k = 0; k < nsp; k++) fprintf(stderr, " %d", sp[k]); fprintf(stderr, ")\n"); fib_free(&fs);
+        }
+        if (*cf_opt(argc, argv, "--pairs", "")) {
+            FILE *pf = fopen(cf_opt(argc, argv, "--pairs", ""), "rb"); float rec[7]; size_t n0 = npt;
+            if (!pf) { fprintf(stderr, "count-field: cannot read --pairs %s\n", cf_opt(argc, argv, "--pairs", "")); return 1; }
+            while (fread(rec, sizeof rec, 1, pf) == 1) { const double A[3] = {rec[0], rec[1], rec[2]}, B[3] = {rec[3], rec[4], rec[5]}; CF_PUSH(A, B, rec[6]); }
+            fclose(pf); fprintf(stderr, "count-field: %zu pairs from --pairs\n", npt - n0);
+        }
+        #undef CF_PUSH
+        if (!npt) fprintf(stderr, "count-field: --cf-fib %g but no pairs (--fibers / --pairs): off\n", wfib);
+    }
+    const double fhub = atof(cf_opt(argc, argv, "--cf-fib-huber", "0.25")); const int firls = atoi(cf_opt(argc, argv, "--cf-fib-irls", "3"));
     float *Sfine = Sl[0], *Gfine[3] = {Gl[0][0], Gl[0][1], Gl[0][2]}; const double tst1 = cf_now();
     for (int l = nl - 1; l >= 0; l--) {
         cf_lvl *L = &lv[l]; const int q = L->P; float *S = Sl[l], **G = Gl[l];
@@ -704,6 +804,7 @@ int cmd_count_field(int argc, char **argv) {
         L->b = malloc(L->n * sizeof(float)); L->diag = malloc(L->n * sizeof(float)); L->U = malloc(L->n * sizeof(float));
         L->r = malloc(L->n * sizeof(float)); L->p = malloc(L->n * sizeof(float)); L->Ap = malloc(L->n * sizeof(float));
         if (!L->b || !L->diag || !L->U || !L->r || !L->p || !L->Ap) { fprintf(stderr, "count-field: out of memory (level %d)\n", l); return 1; }
+        if (npt) L->pr = cf_pairs_build(L, pts, npt, wfib);
         cf_rhs RH = {L}; cf_par(L->d, cf_rhs_run, &RH);
         if (l) { free(S); for (int k = 0; k < 3; k++) free(G[k]); }
         if (spiral && imod) {   /* --method spiral --init-model: U from the reference model (no LS solve) */
@@ -721,12 +822,20 @@ int cmd_count_field(int argc, char **argv) {
             cf_prl Q = {L, &lv[l + 1]}; cf_par(L->d, cf_prl_run, &Q);
         }
         double rr; const double tcg = cf_now(); int it = -1;
-        if (gpu) { const float *wt3[3] = {L->wt[0], L->wt[1], L->wt[2]}; it = cf_gpu_cg(L->d, L->hh, L->w, L->lam, wt3, L->b, L->diag, L->U, l == nl - 1 ? 4 * iters : iters, 1e-5, &rr);
+        if (gpu && !L->pr) { const float *wt3[3] = {L->wt[0], L->wt[1], L->wt[2]}; it = cf_gpu_cg(L->d, L->hh, L->w, L->lam, wt3, L->b, L->diag, L->U, l == nl - 1 ? 4 * iters : iters, 1e-5, &rr);
                    if (it < 0) fprintf(stderr, "count-field: GPU CG failed: level %d on the CPU\n", l); }
         const int on_gpu = it >= 0;
         if (it < 0) it = cf_cg_solve(L, l == nl - 1 ? 4 * iters : iters, 1e-5, &rr);
         fprintf(stderr, "count-field: level %d (%d field cells): %dx%dx%d, %d CG iterations, relative residual %.2e (%s %.1f s)\n", l, q, L->d, L->hh, L->w, it, rr, on_gpu ? "GPU" : "CPU", cf_now() - tcg);
-        if (l + 1 < nl) { cf_lvl *C = &lv[l + 1]; free(C->b); free(C->diag); free(C->r); free(C->p); free(C->Ap); for (int k = 0; k < 3; k++) { free(C->wt[k]); free(C->tg[k]); } C->b = C->diag = C->r = C->p = C->Ap = nullptr; for (int k = 0; k < 3; k++) C->wt[k] = C->tg[k] = nullptr; }
+        if (L->pr && l == 0) {   /* Huber IRLS on the pairs (level 0 only; the coarse levels take them unweighted) */
+            fprintf(stderr, "count-field: pairs |c.U - t| > 0.5 turn: %.4f of %zu\n", cf_pairs_reweight(L->pr, L->U, fhub, 0), L->pr->np);
+            for (int k = 0; k < firls; k++) {
+                const double bad = cf_pairs_reweight(L->pr, L->U, fhub, 1); cf_par(L->d, cf_rhs_run, &RH);
+                const int it2 = cf_cg_solve(L, iters, 1e-5, &rr);
+                fprintf(stderr, "count-field: IRLS %d (Huber %.2f): before %.4f off by > 0.5; %d CG iterations, residual %.2e -> %.4f\n", k + 1, fhub, bad, it2, rr, cf_pairs_reweight(L->pr, L->U, fhub, 0));
+            }
+        }
+        if (l + 1 < nl) { cf_lvl *C = &lv[l + 1]; cf_pairs_free(C->pr); C->pr = nullptr; free(C->b); free(C->diag); free(C->r); free(C->p); free(C->Ap); for (int k = 0; k < 3; k++) { free(C->wt[k]); free(C->tg[k]); } C->b = C->diag = C->r = C->p = C->Ap = nullptr; for (int k = 0; k < 3; k++) C->wt[k] = C->tg[k] = nullptr; }
     }
     fprintf(stderr, "count-field: solve %.0f s\n", cf_now() - tst1);
     cf_lvl *L = &lv[0];
