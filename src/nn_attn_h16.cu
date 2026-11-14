@@ -28,12 +28,20 @@ static unsigned nbk(long long n, int t) { return (unsigned)((n + t - 1) / t); }
    in nn_attn.cu (D^T = op(B)^T op(A)^T) ---- */
 typedef struct { int M, N, K, ta, tb, dbf, bias, al; cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; int ok, tuned, nh;
                  cublasLtMatmulHeuristicResult_t h[8]; } hplan;
-static hplan g_hp[128]; static int g_nhp = 0;
-static cublasLtHandle_t g_h = nullptr; static void *g_hws = nullptr; static const size_t HWS = 32u << 20;
+/* plans, cuBLASLt handle, workspace and weight scratch per device (2026-11-14: one process-wide set; P 512 data parallel runs the
+   bottleneck attention on both GPUs, GPU 1 used GPU 0's handle / workspace / weights: illegal memory access at the first step).
+   By the current device, not per thread: --split-top drives both GPUs from one thread */
+static int h16_dev(void) { int d = 0; cudaGetDevice(&d); return d >= 0 && d < 16 ? d : 0; }
+static hplan g_hpd[16][128]; static int g_nhpd[16], g_nextd[16];
+static cublasLtHandle_t g_hd[16]; static void *g_hwsd[16]; static const size_t HWS = 32u << 20;
+#define g_hp g_hpd[h16_dev()]
+#define g_nhp g_nhpd[h16_dev()]
+#define g_h g_hd[h16_dev()]
+#define g_hws g_hwsd[h16_dev()]
 static hplan *hplan_get(int M, int N, int K, int ta, int tb, int dbf, int bias, int al) {
     for (int i = 0; i < g_nhp; i++) { hplan *p = &g_hp[i]; if (p->M == M && p->N == N && p->K == K && p->ta == ta && p->tb == tb && p->dbf == dbf && p->bias == bias && p->al == al) return p; }
     if (!g_h) { if (cublasLtCreate(&g_h) != CUBLAS_STATUS_SUCCESS) return nullptr; if (cudaMalloc(&g_hws, HWS) != cudaSuccess) return nullptr; }
-    static int next = 0; hplan *p;
+    int &next = g_nextd[h16_dev()]; hplan *p;
     if (g_nhp < 128) p = &g_hp[g_nhp++];
     else { p = &g_hp[next]; next = (next + 1) % 128; cublasLtMatmulDescDestroy(p->op); cublasLtMatrixLayoutDestroy(p->a); cublasLtMatrixLayoutDestroy(p->b); cublasLtMatrixLayoutDestroy(p->c); }
     memset(p, 0, sizeof *p);
@@ -104,7 +112,9 @@ __global__ void k_prep(prep_t q) {
     }
 }
 typedef struct { bf *wqkv, *wo, *w1, *w2, *bqkv, *b1; float *bo, *b2; } hw_t;   /* (the biases of bf16 outputs in bf16) */
-static void *g_wbuf = nullptr; static size_t g_wcap = 0;
+static void *g_wbufd[16]; static size_t g_wcapd[16];
+#define g_wbuf g_wbufd[h16_dev()]
+#define g_wcap g_wcapd[h16_dev()]
 static size_t al256(size_t b) { return (b + 255) & ~(size_t)255; }
 static int prep_weights(const at_dims *d, const float *P, const at_bp *bp, hw_t *hw) {
     const size_t C = d->C, F = d->F;
@@ -310,7 +320,8 @@ extern "C" int at_block_h16_ok(const at_dims *d, const at_geom *g, const at_ws *
     return d->dK <= 0 && !g->rays && !w->vr && at_get_core() == 1 && nc2_ok(d->C) && d->C % HD == 0 && d->F % 8 == 0 && d->C / HD <= 32;
 }
 #define CK(x) do { if (x) return -1; } while (0)
-static hw_t g_hw;
+static hw_t g_hwd[16];
+#define g_hw g_hwd[h16_dev()]
 /* recompute: the backward's forward (weights converted, everything but the last GEMM; y unused) */
 extern "C" int at_block_fwd_h16(const at_dims *d, const float *P, const at_bp *bp, const float *x, float *y, const at_geom *g, at_ws *w, int recompute) {
     const long long T = (long long)g->nseq * g->S; const int C = d->C, F = d->F, H = d->H;

@@ -295,7 +295,10 @@ __global__ void __launch_bounds__(128, 4) k_a8_dq(a8t A, const float *__restrict
 }
 
 /* ---- host: scratch (grown on demand), conversions, launches ---- */
-static uint8_t *g_a8 = nullptr; static size_t g_a8n = 0;
+static uint8_t *g_a8d[16]; static size_t g_a8nd[16];   /* (per device: P 512 data parallel runs attention on both GPUs, 2026-11-14) */
+static int a8_dev(void) { int d = 0; cudaGetDevice(&d); return d >= 0 && d < 16 ? d : 0; }
+#define g_a8 g_a8d[a8_dev()]
+#define g_a8n g_a8nd[a8_dev()]
 typedef struct { uint8_t *q, *k, *v, *g, *qs, *ks, *vs, *gs, *qt, *kt, *vt, *gt, *qts, *kts, *vts, *gts; } a8buf;
 static int a8_bufs(a8buf *b, int H, long long R) {
     const size_t rq = (size_t)H * R * 64, rqs = (size_t)H * R * 2, tq = (size_t)H * HD * R, tqs = (size_t)H * HD * (R / 32);

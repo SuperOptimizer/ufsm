@@ -355,7 +355,7 @@ extern "C" void at_fa_pack(const float *qkv, const float *qg, const float *kg, v
 extern "C" void at_fa_pack_bf(const void *qkv, const float *qg, const float *kg, void *qkvh, float *rq, float *rk, float *amx, const at_geom *g, int nreg, int C, int rope, float base) {
     fa_pack((const __nv_bfloat16 *)qkv, qg, kg, qkvh, rq, rk, amx, g, nreg, C, rope, base);
 }
-static float *g_lmax;   /* at_set_lmax: device [H] running max logit per head (nullptr: off) */
+static thread_local float *g_lmax;   /* at_set_lmax: device [H] running max logit per head (nullptr: off); per thread: each replica sets its own before its launch (process-wide, P 512 data parallel launched GPU 0 with GPU 1's pointer, 2026-11-14) */
 extern "C" void at_set_lmax(float *lmax) { g_lmax = lmax; }
 template <typename TO> static void fa_fwd(const void *qkvh, TO *o, float *lse, const at_geom *g, int H, int C) {
     const long long Tp = (long long)g->nseq * g->S + FT;

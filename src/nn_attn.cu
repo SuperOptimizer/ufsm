@@ -41,7 +41,10 @@ static void pr_add(const char *nm, double ms, double fl, double by) {
 /* ---- GEMM: row-major C[M][N] = op(A) op(B) + beta C; A [M][K] (ta 0) or [K][M] (ta 1); B [K][N] (tb 0) or [N][K] (tb 1).
    cuBLASLt is column-major: C^T (N x M) = op(B)^T op(A)^T, so B is its first operand and A its second ---- */
 typedef struct { int M, N, K, ta, tb; cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; int ok; } atplan;
-static atplan g_ap[256]; static int g_nap = 0;
+static atplan g_apd[16][256]; static int g_napd[16], g_nextd[16];   /* (plans per device too: P 512 data parallel builds them from both GPU threads at once, 2026-11-14) */
+static int ap_dev(void) { int d = 0; cudaGetDevice(&d); return d >= 0 && d < 16 ? d : 0; }
+#define g_ap g_apd[ap_dev()]
+#define g_nap g_napd[ap_dev()]
 /* the cuBLASLt handle and workspace per device (2026-11-13: one global pair, the workspace on the first GPU that ran an attention GEMM;
    --split-top runs the attention stage on both GPUs and GPU 1's matmuls failed with status 14). The plans (descriptors, the heuristic's
    algorithm) are shared: both cards are one model */
@@ -59,7 +62,7 @@ static int tf32_on(void) { static int v = -1; if (v < 0) { const char *e = geten
 static atplan *at_plan(int M, int N, int K, int ta, int tb) {
     for (int i = 0; i < g_nap; i++) { atplan *p = &g_ap[i]; if (p->M == M && p->N == N && p->K == K && p->ta == ta && p->tb == tb) return p; }
     if (alt_ready() < 0) return nullptr;
-    static int next = 0; atplan *p;
+    int &next = g_nextd[ap_dev()]; atplan *p;
     if (g_nap < 256) p = &g_ap[g_nap++];
     else {   /* full (row counts vary per step): recycle the slots round-robin */
         p = &g_ap[next]; next = (next + 1) % 256;
