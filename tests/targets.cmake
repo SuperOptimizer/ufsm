@@ -341,6 +341,7 @@ ufsm_exe(xscan_render tests/xscan_render.c OBJS scannorm edt band sheet ct_augme
 ufsm_exe(bench_s2b tests/bench_s2b.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_s2f tests/bench_s2f.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_head_tc SUITE tests/test_head_tc.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_win_weight SUITE tests/test_win_weight.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_skip_empty SUITE tests/test_skip_empty.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_grad_ar SUITE tests/test_grad_ar.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_dcache_batch SUITE tests/test_dcache_batch.c OBJS dcache zarr3 store z3w json LIBS LDLIBS)

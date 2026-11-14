@@ -562,6 +562,8 @@ void nn_loss_pack(const void *logits, const uint8_t *t, const uint8_t *m, const 
 void nn_loss_stats_acc(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds);
 void nn_loss_stats_fin_light(double *ds, const uint8_t *w, shape5 s, float *scratch, double *keep);   /* after a light statistics pass: only the loss sums 1 .. 4 summed across split halves (keep: s.n s.c doubles) */
 void nn_loss_stats_fin(double *ds, const uint8_t *w, shape5 s, float *scratch);
+void nn_loss_stats_fin_w(double *ds, const uint8_t *w, shape5 s, float *scratch, int wslot);   /* --win-weight: slot wslot >= 0 weights the gradient by min(1, nm / ref) (ref a running median per slot and GPU) */
+void nn_win_weight_take(float *out, int nslot);   /* per slot [windows, mean weight, windows below 0.1 ref, min nm / ref, ref] of the interval; resets it */
 void nn_loss_grad_only(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch);
 void nn_loss_grad_only_s(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch, float mul);   /* x mul in the kernel (no gscale pass) */
 /* Affinity loss on band labels (task band_affinity, src/nn_loss.cu): output channels c0 .. c0 + K - 1 are affinities for
@@ -747,6 +749,7 @@ size_t nn_wind4_scratch(void);
 size_t nn_wind4_sums(void);   /* bytes of the ds sums (doubles) */
 void nn_wind4_stats(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, double *ds);
 void nn_wind4_fin(double *ds, float *fin);
+void nn_wind4_fin_w(double *ds, float *fin, int wslot);   /* --win-weight slot as nn_loss_stats_fin_w */
 void nn_wind4_grad(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, const float *fin, float lambda, void *ga, void *gb);
 void nn_wind4_loss(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, double *ds, float *fin, float lambda, void *ga, void *gb);
 void nn_cond_gather(const uint8_t *c14, const uint8_t *done, const uint8_t *ct, int W, int oz, int oy, int ox, int bz, int by, int bx, size_t N, void *x, int h16);   /* predict --cond-sweep: condition inputs 4-6 of a window from the box canvas (src/sweep.c) */
