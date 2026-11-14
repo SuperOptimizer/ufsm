@@ -276,7 +276,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                     }
                 }
                 const unsigned u = __float_as_uint(__uint_as_float(am) * (1.f / 448.f));   /* mx_exp without its early return */
-                const int e = (u & 0x7fffffffu) > 0x7f800000u ? 128 : max(-126, min(126, (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0)));
+                const int e = (u & 0x7fffffffu) >= 0x7f800000u ? 128 : max(-126, min(126, (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0)));
                 const float m = exp2i(-e);
                 sgs[c * 8 + ks] = (uint8_t)(e + 127);
                 unsigned *dst = (unsigned *)(sg + c * G8_CS + ks * 32);
@@ -316,7 +316,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
             }
             if constexpr (NP == 2) am = max(am, __shfl_xor_sync(0xffffffffu, am, 16));   /* the block's other row */
             const unsigned u = __float_as_uint(__uint_as_float(am) * (1.f / 448.f));   /* mx_exp without its early return */
-            const int e = (u & 0x7fffffffu) > 0x7f800000u ? 128 : max(-126, min(126, (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0)));
+            const int e = (u & 0x7fffffffu) >= 0x7f800000u ? 128 : max(-126, min(126, (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0)));
             const float m = exp2i(-e);
             if (part == 0) sgs[c * 8 + ks] = (uint8_t)(e + 127);
             unsigned *dst = (unsigned *)(sg + c * G8_CS + ks * 32 + i0);
@@ -501,7 +501,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                     for (int c = 0; c < BMo; c++) {
                         const unsigned u = __float_as_uint(__uint_as_float(amc[c]) * (1.f / 448.f));   /* mx_exp without its early return */
                         const int e = max(-126, min(126, (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0)));
-                        ec[c] = (u & 0x7fffffffu) > 0x7f800000u ? 128 : e;
+                        ec[c] = (u & 0x7fffffffu) >= 0x7f800000u ? 128 : e;
                     }
                     if (sp.sr) {
 #pragma unroll
