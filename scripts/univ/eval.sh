@@ -71,8 +71,17 @@ if has fib && [ "${FIB:-1}" = 1 ] && { [ -n "$FIBCH" ] || [ "${FIBP:-}" = heads 
       lkg ${UP:-$U} predict $CK $M $P4K $d --um 2.4 --level 2 --box $BOX --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/predict_c$ch.log 2>&1 || log "fib: predict c$ch failed"; done; done
   for f in H V; do [ -e $o/$f/9.6/zarr.json ] || continue; for m in tube dyad; do x=""; [ $m = dyad ] && { [ -d $o/dyad ] || continue; x="--dyad $o/dyad"; }
     [ -s $o/$f-$m.judge ] && continue
-    nice -n 10 $U fiber-trace - - $o/$f-$m.fib --mask $o/$f 9.6 --mask-origin 12288,4096,3584 --box $BOX --scaledown 2 --family $f --half 1024 --min-len 48 --threads 4 $x > $o/trace_$f-$m.log 2>&1
-    { python3 -I $H/scripts/univ/fiblen.py $o/$f-$m.fib; nice -n 10 $U fiber-judge $o/$f-$m.fib --phase ${FIBPH:-/vesuvius/ufsm/gt/paris4-wind-20261019} phaseA/9.6 $J 2>&1 | grep "$f:"; } > $o/$f-$m.judge
+    # (eval audit 11-14 #5: the judge's GT phaseA was deleted on 11-12, and the old line wrote fiblen's output even when fiber-judge failed, so a
+    #  missing GT left a non-empty .judge that later runs skipped as done. The .judge file is now written only when the trace and the judge
+    #  both succeed and the judge printed its family line; the GT is phaseB (the july set, the only Paris 4 phase left; rows before 11-14
+    #  were judged against phaseA and are not comparable). FIBPH / FIBPHK override.)
+    ph=${FIBPH:-/vesuvius/ufsm/gt/paris4-wind-20261019}; phk=${FIBPHK:-phaseB/9.6}
+    [ -e $ph/$phk/zarr.json ] || { log "fib: FAILED, no GT phase $ph/$phk"; FIBFAIL=1; continue; }
+    nice -n 10 $U fiber-trace - - $o/$f-$m.fib --mask $o/$f 9.6 --mask-origin 12288,4096,3584 --box $BOX --scaledown 2 --family $f --half 1024 --min-len 48 --threads 4 $x > $o/trace_$f-$m.log 2>&1 ||
+      { log "fib: FAILED, fiber-trace $f-$m (see $o/trace_$f-$m.log)"; FIBFAIL=1; continue; }
+    jl=$(nice -n 10 $U fiber-judge $o/$f-$m.fib --phase $ph $phk $J 2>&1 | tee $o/judge_$f-$m.log | grep "$f:")
+    [ -n "$jl" ] || { log "fib: FAILED, fiber-judge $f-$m printed no $f: line (see $o/judge_$f-$m.log)"; FIBFAIL=1; continue; }
+    { python3 -I $H/scripts/univ/fiblen.py $o/$f-$m.fib; echo "$jl"; echo "gt $ph $phk"; } > $o/$f-$m.judge.tmp && mv $o/$f-$m.judge.tmp $o/$f-$m.judge
   done; done
 fi
 if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | heads (predict --heads ink: latent nets) | ch:N (channel N of CKPT, ink at 2.4 um level LV_INK (default 1 = 4.8 um))
@@ -121,7 +130,7 @@ PY
   done; done
 fi
 
-[ $PO = 1 ] && exit 0
+[ $PO = 1 ] && exit $([ "${FIBFAIL:-0}" = 0 ] && echo 0 || echo 1)
 # ---- matrix ----
 { echo "== univ eval $T  $CK  $(date)"
   ws() { $U wbench-stats $1 $2 --metric p05x,ids 2>&1 | grep -v label-noise | grep -E '^(p05x|ids) '; }
@@ -158,3 +167,4 @@ fi
       END { if (n) printf "-- resident trainer during the fits: %d step lines, %.3f samp/s (%.1f%% of 0.72), %.0f Mvox/s (%.1f%% of 776)\n", n, S / n, 100 * S / n / 0.72, V / n, 100 * V / n / 776 }'; fi
 } > $E/$T.matrix.txt
 log "matrix -> $E/$T.matrix.txt"
+[ "${FIBFAIL:-0}" = 0 ] || { log "fib: at least one judge FAILED (no .judge written for it)"; exit 1; }
