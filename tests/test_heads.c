@@ -32,13 +32,27 @@ static char *slurp(const char *path) {
     char *s = malloc((size_t)n + 1); if (!s) { fclose(f); return nullptr; }
     s[fread(s, 1, (size_t)n, f)] = 0; fclose(f); return s;
 }
+/* the window shares added 2026-11-13 after "phase / rv / side / normal bce X" and wind4's "acc X" (the means over the windows that carry
+   each label): removed before the comparison, so the reference (logged before them, every fixture window labelled) still applies and
+   a 100 %-labelled run must reproduce its numbers unchanged. The ink / fib / fibn shares stay (they are in the reference). */
+static void strip_new_shares(char *ln) {
+    for (char *p = ln; (p = strstr(p, " (")); ) {
+        char *q = p + 2; while (*q >= '0' && *q <= '9') q++;
+        if (q == p + 2 || strncmp(q, "% of windows)", 13)) { p += 2; continue; }
+        char *w[3] = {nullptr, nullptr, nullptr}; char *s = p;   /* the three tokens before " (" */
+        for (int k = 0; k < 3 && s > ln; k++) { char *t = s; while (t > ln && t[-1] != ' ') t--; w[k] = t; s = t > ln ? t - 1 : ln; }
+        const int bce = w[1] && !strncmp(w[1], "bce ", 4) && w[2] && (!strncmp(w[2], "phase ", 6) || !strncmp(w[2], "rv ", 3) || !strncmp(w[2], "side ", 5) || !strncmp(w[2], "normal ", 7));
+        const int acc = w[1] && !strncmp(w[1], "acc ", 4);
+        if (bce || acc) memmove(p, q + 13, strlen(q + 13) + 1); else p += 2;
+    }
+}
 /* the loss terms of a training log: per step line the text from " loss " through the gradient norm, then the validation tail */
 static char *loss_terms(const char *log) {
     size_t cap = 1 << 16, n = 0; char *o = malloc(cap); o[0] = 0;
     for (const char *l = log; l && *l; ) {
         const char *e = strchr(l, '\n'); const size_t len = e ? (size_t)(e - l) : strlen(l);
         if (len > 5 && !strncmp(l, "step ", 5)) {
-            char ln[4096]; snprintf(ln, sizeof ln, "%.*s", (int)(len < 4000 ? len : 4000), l);
+            char ln[4096]; snprintf(ln, sizeof ln, "%.*s", (int)(len < 4000 ? len : 4000), l); strip_new_shares(ln);
             char *a = strstr(ln, " loss "), *g = a ? strstr(a, " gn ") : nullptr;
             if (a && g) {
                 char *ge = g + 4; while (*ge && *ge != ' ') ge++;
