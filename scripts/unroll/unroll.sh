@@ -397,7 +397,7 @@ join() {
 # in wrapcheck.tsv). --ct-um is the CT level's um ($LUM); 0 CT peaks per turn overall = a wrong level / um: the stage fails
 check() {
   X $O/logs/check.log $U wrap-check $O/joined $F --ct $R $K/$LV --ct-um $LUM --tsv $O/wrapcheck.tsv.tmp --threads $TH || return 1
-  [ "$DRY" = 1 ] && return 0
+  [ "$DRY" = 1 ] && { echo "    $U unroll-qa --fields $F --model $O/joined --ct $R $K/$LV --out $O/qa/unroll-qa --tiles ${UQTILES:-48}${FIBRES:+ --fibres $FIBRES}$([ "${UQSTRICT:-0}" = 1 ] && echo ' --strict')  > $O/logs/unrollqa.log"; return 0; }
   [ -s $O/wrapcheck.tsv.tmp ] && [ $(awk -F'\t' 'NR > 1 && $NF != ""' $O/wrapcheck.tsv.tmp | wc -l) -gt 0 ] || { log "check: wrap-check wrote no verdicts"; return 1; }
   awk -F'\t' 'NR > 1 { n++; e += $3 } END { exit !(n > 0 && e / n < 0.999) }' $O/wrapcheck.tsv.tmp ||
     { log "check: wrap-check found no CT peaks (empty share ~1 on every wrap): wrong --ct-um $LUM or CT level $K/$LV?"; return 1; }
