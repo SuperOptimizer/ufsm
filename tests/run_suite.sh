@@ -5,14 +5,14 @@
 #     -t TIER   fast (default: everything not tagged slow; the merge gate) | slow (only the slow tag) | all |
 #               smoke (only the smoke tag: a cross-section of the fast tier for the edit loop, ~1 min)
 #     -c REF    only the tests that the files changed since git REF (and uncommitted / untracked ones) can affect (see srcdeps)
-#     -j N      tests in parallel (default: cgroup-aware CPUs / 3, 1..12; env SUITE_J)
+#     -j N      tests in parallel (default: cgroup-aware CPUs, 2..16; env SUITE_J)
 #     -T N      CPU threads per test, exported as UFSM_NCPU / UFSM_FIT_THREADS / UFSM_TIFF_THREADS / OMP_NUM_THREADS
-#               (default CPUs / j, at least 2; env SUITE_THREADS)
+#               (default 2 CPUs / j, at least 2; env SUITE_THREADS)
 #     -B DIR    build dir holding the test binaries ($B in the manifest; default build-verify)
 #     -o DIR    output dir: logs/<name>.log, results.tsv, summary.txt (default $TMPDIR/ufsm-suite-<pid>)
 #     -g LIST   GPU indices to use, e.g. "0" or "0,1" (default: every GPU nvidia-smi lists, most free memory first);
 #               "none" runs no GPU test (they are reported SKIP)
-#     -G N      GPU tests at a time per GPU (default 2: the GPU tests are small, two overlap well; env SUITE_GPU_SLOTS)
+#     -G N      GPU tests at a time per GPU (default: free memory / 2.5 GB, 2..8; env SUITE_GPU_SLOTS)
 #     -x S      per-test timeout in seconds (default 1800)
 #     -P        profile: strace marks the tests that open /dev/nvidia* (gpu column "+nv"), nvidia-smi samples their GPU memory
 #     -l        list the selected tests and exit
@@ -26,7 +26,7 @@
 set -u
 H=$(cd "$(dirname "$0")/.." && pwd); cd "$H" || exit 2
 MANIFEST=${SUITE_MANIFEST:-$H/tests/suite.txt}
-TIER=fast; CHANGED=; J=${SUITE_J:-}; T=${SUITE_THREADS:-}; BDIR=build-verify; OUT=; GPUS=; GSLOTS=${SUITE_GPU_SLOTS:-2}; TO=1800; PROF=0; LIST=0
+TIER=fast; CHANGED=; J=${SUITE_J:-}; T=${SUITE_THREADS:-}; BDIR=build-verify; OUT=; GPUS=; GSLOTS=${SUITE_GPU_SLOTS:-}; TO=1800; PROF=0; LIST=0
 while getopts "t:c:j:T:B:o:g:G:x:Plh" o; do case $o in
   t) TIER=$OPTARG;; c) CHANGED=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; B) BDIR=$OPTARG;; o) OUT=$OPTARG;; g) GPUS=$OPTARG;; G) GSLOTS=$OPTARG;;
   x) TO=$OPTARG;; P) PROF=1;; l) LIST=1;; *) sed -n '2,24p' "$0"; exit 2;; esac; done
@@ -46,15 +46,24 @@ ncpu() {
   echo "$n"
 }
 NC=$(ncpu)
-[ -z "$J" ] && { J=$((NC / 3)); [ $J -lt 1 ] && J=1; [ $J -gt 12 ] && J=12; }
-[ -z "$T" ] && { T=$((NC / J)); [ $T -lt 2 ] && T=2; }
+# (measured 2026-11-13: the fast tier averages ~1.1 CPUs a test, and the GPU tests wait on the card: -j CPUs instead of CPUs / 3 took the
+#  10-CPU pod from 546 to 361 s; T = 2 CPUs / j threads oversubscribes the few multi-threaded tests a little, which keeps their tail short)
+[ -z "$J" ] && { J=$NC; [ $J -lt 2 ] && J=2; [ $J -gt 16 ] && J=16; }
+[ -z "$T" ] && { T=$((2 * NC / J)); [ $T -lt 2 ] && T=2; }
 
 # GPUs, most free memory first
+GFREE=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2> /dev/null | tr -d ' ' | sort -t, -k2,2nr)
 if [ -z "$GPUS" ]; then
-  GPUS=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2> /dev/null | sort -t, -k2,2nr | cut -d, -f1 | tr -d ' ' | paste -sd, -)
+  GPUS=$(echo "$GFREE" | cut -d, -f1 | paste -sd, -)
   [ -z "$GPUS" ] && GPUS=none
 fi
 [ "$GPUS" = none ] && GL=() || IFS=, read -ra GL <<< "$GPUS"
+# GPU slots: by the least free memory of the GPUs used, 2.5 GB a slot (the largest fast-tier test peaks at ~2 GB), 2..8; a card a
+# training run holds keeps 2
+if [ -z "$GSLOTS" ]; then
+  mf=; for i in "${GL[@]}"; do f=$(echo "$GFREE" | awk -F, -v i="$i" '$1 == i {print $2}'); [ -n "$f" ] && { [ -z "$mf" ] || [ "$f" -lt "$mf" ]; } && mf=$f; done
+  GSLOTS=$(( ${mf:-0} / 2500 )); [ $GSLOTS -lt 2 ] && GSLOTS=2; [ $GSLOTS -gt 8 ] && GSLOTS=8
+fi
 NG=${#GL[@]}; GCAP=$((NG * GSLOTS))
 LOCKD=${SUITE_LOCK_DIR:-/tmp/ufsm-suite-locks}; mkdir -p "$LOCKD" 2> /dev/null; chmod 1777 "$LOCKD" 2> /dev/null
 

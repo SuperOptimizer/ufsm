@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "test_part.h"
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
@@ -481,8 +482,10 @@ int main(void) {
         printf("test_fit (CPU only): OK\n"); return 0;
     }
     nn_init(0);
-    zarr_substream_case();
-    {   /* fit_unhash inverts fit_hash on every 32-bit word (the GPU minibatch selection enumerates the hashes) */
+    /* UFSM_TEST_PART=K/9 (tests/test_part.h): the cases below in 9 shards of 4-9 s (67 s whole on the pod, UFSM_TEST_QUICK); each case
+       sets the globals it runs with, so a shard gives the same results as the whole sequence */
+    TEST_PART(0) zarr_substream_case();
+    TEST_PART(0) {   /* fit_unhash inverts fit_hash on every 32-bit word (the GPU minibatch selection enumerates the hashes) */
         const unsigned long long dx = g_quick ? 61 : 1;   /* (make test: every 61st word) */
         unsigned long long nbad = 0; for (unsigned long long x = 0; x < (1ull << 32); x += dx) nbad += fit_unhash(fit_hash((unsigned)x)) != (unsigned)x;
         CHECK(nbad == 0, "fit_unhash(fit_hash(x)) != x for %llu words", nbad);
@@ -490,19 +493,19 @@ int main(void) {
     if (getenv("FIT_BIAS")) g_bias = atof(getenv("FIT_BIAS"));
     if (getenv("FIT_SIMPLE")) { g_wob = atof(getenv("FIT_SIMPLE")); g_pack = 0; g_dpitch = 0; g_hole = 0; }
     if (!getenv("FIT_CTONLY")) {   /* (FIT_CTONLY: the CT cases alone) */
-    run_case(+1);
-    run_case(-1);
-    g_split = 0.5; g_tile = 32; run_case(+1);   /* 18 tiles: pieces stitched across tile faces, the hole and the edge by the serial pass */
-    g_split = 0; g_tile = 256;
-    g_cpu = 1; run_case(+1); if (!g_quick) run_case(-1);   /* the CPU backend (src/fit_terms.h: the same terms) */
-    g_robust = 0.1f; g_bend = 1.f; run_case(+1); /* the Cauchy phase residual and curvature-adaptive smoothness keep a clean fit */
-    g_cpu = 0; run_case(-1);                     /* ... on the GPU too */
-    g_robust = 0; g_bend = 0; g_pgrad = 1.f; run_case(+1); g_cpu = 1; run_case(-1);   /* phase-gradient matching, both backends */
+    TEST_PART(1) run_case(+1);
+    TEST_PART(2) run_case(-1);
+    TEST_PART(3) { g_split = 0.5; g_tile = 32; run_case(+1); g_split = 0; g_tile = 256; }   /* 18 tiles: pieces stitched across tile faces, the hole and the edge by the serial pass */
+    TEST_PART(4) { g_cpu = 1; run_case(+1); if (!g_quick) run_case(-1); g_cpu = 0; }   /* the CPU backend (src/fit_terms.h: the same terms) */
+    TEST_PART(5) { g_cpu = 1; g_robust = 0.1f; g_bend = 1.f; run_case(+1);   /* the Cauchy phase residual and curvature-adaptive smoothness keep a clean fit */
+                   g_cpu = 0; run_case(-1); g_robust = 0; g_bend = 0; }      /* ... on the GPU too */
+    TEST_PART(6) { g_pgrad = 1.f; run_case(+1); g_cpu = 1; run_case(-1); g_cpu = 0; g_pgrad = 0; }   /* phase-gradient matching, both backends */
     }
-    g_pgrad = 0; g_cpu = 0;
+    TEST_PART(0) {
     run_local_surface_case();   /* recto anchors on a corrupted phase (main checkout) */
     check_recto_fields();
-    {   /* the CT sheet spacing of a profile: papyrus peaks of period 12.5 samples (0.5 native voxels apart) with noise; 2 peaks at least */
+    }
+    TEST_PART(0) {   /* the CT sheet spacing of a profile: papyrus peaks of period 12.5 samples (0.5 native voxels apart) with noise; 2 peaks at least */
         float pr[160]; unsigned rs = 7u;
         for (int k = 0; k < 160; k++) { rs = rs * 1664525u + 1013904223u; pr[k] = (float)(90 + 40 * cos(2 * M_PI * (k - 3.3) / 12.5) + ((rs >> 8) / 16777216.0 - 0.5) * 20); }
         const double sp1 = fit_ct_profile_spacing(pr, 160, 0.5, 0.3), sp0 = fit_ct_profile_spacing(pr, 16, 0.5, 0.3);
@@ -518,15 +521,15 @@ int main(void) {
     }
     {   /* CT: a weak, wrong packed sector recovered by the CT parity and spacing, on both backends */
         double a0, p0, a1, p1, a2, p2;
-        const double s0 = run_ct_case(1, 0.f, 0.f, &a0, &p0);
-        const double s1 = run_ct_case(1, 2.f, 1.f, &a1, &p1);
-        const double s2 = run_ct_case(0, 2.f, 1.f, &a2, &p2);
-        CHECK(s0 < 0.95, "the weak sector should break the network-only fit (sector ids %.4f)", s0);
+        TEST_PART(7) { const double s0 = run_ct_case(1, 0.f, 0.f, &a0, &p0);
+            CHECK(s0 < 0.95, "the weak sector should break the network-only fit (sector ids %.4f)", s0); }
+        TEST_PART(8) { const double s1 = run_ct_case(1, 2.f, 1.f, &a1, &p1);
+            CHECK(s1 >= 0.98 && a1 >= 0.99 && p1 >= 0.9, "cpu: CT terms: sector ids %.4f, ids %.4f, |e| < 0.08 %.4f", s1, a1, p1); }
+        TEST_PART(7) { const double s2 = run_ct_case(0, 2.f, 1.f, &a2, &p2);
+            CHECK(s2 >= 0.98 && a2 >= 0.99 && p2 >= 0.9, "gpu: CT terms: sector ids %.4f, ids %.4f, |e| < 0.08 %.4f", s2, a2, p2); }
         if (getenv("FIT_CTONLY")) { run_ct_case(1, 2.f, 0.f, &a0, &p0); run_ct_case(1, 0.f, 1.f, &a0, &p0); run_ct_case(0, 0.5f, 0.f, &a0, &p0); }   /* the terms alone */
-        CHECK(s1 >= 0.98 && a1 >= 0.99 && p1 >= 0.9, "cpu: CT terms: sector ids %.4f, ids %.4f, |e| < 0.08 %.4f", s1, a1, p1);
-        CHECK(s2 >= 0.98 && a2 >= 0.99 && p2 >= 0.9, "gpu: CT terms: sector ids %.4f, ids %.4f, |e| < 0.08 %.4f", s2, a2, p2);
-        g_ctflood = 1; const double s3 = run_ct_case(1, 2.f, 0.f, &a1, &p1); g_ctflood = 0;   /* with the CT phase in the voxel unwrapping */
-        CHECK(s3 >= 0.98 && a1 >= 0.99 && p1 >= 0.9, "cpu, CT flood: sector ids %.4f, ids %.4f, |e| < 0.08 %.4f", s3, a1, p1);
+        TEST_PART(3) { g_ctflood = 1; const double s3 = run_ct_case(1, 2.f, 0.f, &a1, &p1); g_ctflood = 0;   /* with the CT phase in the voxel unwrapping */
+            CHECK(s3 >= 0.98 && a1 >= 0.99 && p1 >= 0.9, "cpu, CT flood: sector ids %.4f, ids %.4f, |e| < 0.08 %.4f", s3, a1, p1); }
     }
     if (fails) { fprintf(stderr, "test_fit: %d failure(s)\n", fails); return 1; }
     printf("test_fit: OK\n");

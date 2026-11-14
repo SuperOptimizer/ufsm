@@ -5,6 +5,8 @@
 # EST: seconds (laptop 10-30, -j 4 under load: relative sizes); the runner starts the longest first. A new test: add a line here and its
 # binary as ufsm_exe(test_x SUITE ...) in tests/targets.cmake; give it the gpu tag if it touches the GPU (tests/run_suite.sh -P tells).
 # UFSM_TEST_QUICK=1: the fast-tier variant of a long test (fewer steps / cases); the full run is NAME~full in the slow tier.
+# UFSM_TEST_PART=K/N (tests/test_part.h): shard K of N of a long test's independent sections, lines NAME~partKofN (the same checks, run
+#   side by side). smoke tag: the -t smoke cross-section (~1 min) for the edit loop.
 # Helper binaries without a line of their own: test_sheet (test-sheet), test_http_reader / test_sampler_safety / test_formats (python).
 test_target_erode                              |              |     1 | ./$B/test_target_erode
 test_wind_sampler                              |              |    19 | ./$B/test_wind_sampler
@@ -42,7 +44,9 @@ test_lathead                                     | gpu          |     3 | ./$B/t
 test_fit_lat                                     | gpu          |     3 | ./$B/test_fit_lat
 test_restore_task                              | gpu          |     7 | ./$B/test_restore_task
 test_phase_interp                              |              |    20 | ./$B/test_phase_interp
-test_spatial_augment                           |              |    60 | UFSM_TEST_QUICK=1 ./$B/test_spatial_augment
+test_spatial_augment~part0of3                 |              |     7 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=0/3 ./$B/test_spatial_augment
+test_spatial_augment~part1of3                 |              |     7 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=1/3 ./$B/test_spatial_augment
+test_spatial_augment~part2of3                 |              |     7 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=2/3 ./$B/test_spatial_augment
 test_spatial_augment~full                      | slow         |   148 | ./$B/test_spatial_augment
 test_wgrad_grid                                | gpu          |     2 | ./$B/test_wgrad_grid
 test_sheet_gpu                                 | gpu2         |     1 | ./$B/test_sheet_gpu
@@ -64,14 +68,27 @@ test_l0_slab                                   | gpu          |     2 | ./$B/tes
 test_zwin                                      | gpu          |     2 | ./$B/test_zwin
 test_l0_stream                                 | gpu          |    15 | ./$B/test_l0_stream
 test_l0_stream~L0_STREAM_POISON=1              | gpu          |    16 | UFSM_L0_STREAM_POISON=1 ./$B/test_l0_stream
-test_infer_mem                                 | gpu          |   200 | UFSM_TEST_QUICK=1 ./$B/test_infer_mem
+test_infer_mem~part0of6                       | gpu          |     9 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=0/6 ./$B/test_infer_mem
+test_infer_mem~part1of6                       | gpu          |    12 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=1/6 ./$B/test_infer_mem
+test_infer_mem~part2of6                       | gpu          |    15 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=2/6 ./$B/test_infer_mem
+test_infer_mem~part3of6                       | gpu          |    20 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=3/6 ./$B/test_infer_mem
+test_infer_mem~part4of6                       | gpu          |    16 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=4/6 ./$B/test_infer_mem
+test_infer_mem~part5of6                       | gpu          |    18 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=5/6 ./$B/test_infer_mem
 test_infer_mem~full                            | gpu2,slow    |   287 | ./$B/test_infer_mem
 test_half                                      | gpu          |     1 | ./$B/test_half
 test_unwrap_targets                            | gpu          |     1 | ./$B/test_unwrap_targets
 test_fib_dir                                   | gpu          |     1 | ./$B/test_fib_dir
 test_gpu_aug                                   | gpu          |     6 | ./$B/test_gpu_aug
 test_aug_z                                     | gpu          |    10 | ./$B/test_aug_z
-test_fit                                       | gpu          |   320 | UFSM_TEST_QUICK=1 ./$B/test_fit
+test_fit~part0of9                             | gpu          |    10 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=0/9 ./$B/test_fit
+test_fit~part1of9                             | gpu          |    10 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=1/9 ./$B/test_fit
+test_fit~part2of9                             | gpu          |    10 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=2/9 ./$B/test_fit
+test_fit~part3of9                             | gpu          |    10 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=3/9 ./$B/test_fit
+test_fit~part4of9                             | gpu          |    10 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=4/9 ./$B/test_fit
+test_fit~part5of9                             | gpu          |    10 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=5/9 ./$B/test_fit
+test_fit~part6of9                             | gpu          |    10 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=6/9 ./$B/test_fit
+test_fit~part7of9                             | gpu          |    10 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=7/9 ./$B/test_fit
+test_fit~part8of9                             | gpu          |    10 | UFSM_TEST_QUICK=1 UFSM_TEST_PART=8/9 ./$B/test_fit
 test_fit~full                                  | slow,gpu     |  1281 | ./$B/test_fit
 test_fit_join                                  | gpu          |     9 | ./$B/test_fit_join
 test_wrap_check                                |              |     1 | ./$B/test_wrap_check
