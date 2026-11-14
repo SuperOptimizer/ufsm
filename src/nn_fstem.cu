@@ -205,7 +205,7 @@ __global__ void fstem_red_k(const float *__restrict__ part, int nb, int npar, fl
     float s = 0.f; for (int b = 0; b < nb; b++) s += part[(size_t)b * npar + i];
     gp[i] += s;
 }
-static int g_fs_ws = -1;   /* UFSM_FSTEM_WSCALE=0: W1 straight to fp16 (before 2026-11-14) */
+static int g_fs_ws = -1;   /* mgpu: env (UFSM_FSTEM_WSCALE=0: W1 straight to fp16, before 2026-11-14) */
 extern "C" int nn_fstem_wscale(void) { if (g_fs_ws < 0) { const char *e = getenv("UFSM_FSTEM_WSCALE"); g_fs_ws = !(e && *e == '0'); } return g_fs_ws; }
 extern "C" void nn_fstem_set_wscale(int on) { g_fs_ws = on; }
 static fs_chs fs_list(const int *chs, int nout) { fs_chs l; for (int o = 0; o < FS_MAXO; o++) l.c[o] = o < nout ? chs[o] : 0; return l; }
