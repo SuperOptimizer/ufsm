@@ -6,6 +6,43 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Window weighting of the head losses by their label count, --win-weight (2026-11-14, branch winw-20261114, audit train #4)
+
+Each head's loss is a mean over its own window's masked voxels:
+- the 1 / fmaxf(nm, 1) of loss_grad_v and nn_lat_fuse_grad, through fin[2 C + 1];
+- w4_fin_k's 1 / N;
+- MIL's / nmil.
+
+So a window with a sliver of labels gives a head the same total gradient as a fully labelled one. The audit's log shows how much
+label presence varies: phase in 64-88 % of windows, fibre 0-12 %, MIL 12-32 %. Under Muon the momentum sum is normalised and clip
+5 is nearly a no-op, so one such window steers ~20 updates.
+
+`--win-weight 1` (default 0; the off path is bit-identical) multiplies a training window's gradient by min(1, nm / ref) per head:
+- **nm:** the window's mask weight sum, as a mean over the head's active channels. Wind4 uses its supervised voxel count N; MIL its
+  ray count.
+- **ref:** a running median of the head's nm over earlier labelled windows. It starts as the geometric mean of the first 16
+  windows; after that, each window moves log2 ref by +-0.05 towards log2 nm (a sign-step median tracker). Once a head's nm
+  distribution is stationary, a window at its median weighs 1 and a 1 % sliver weighs ~0.01.
+- **Where it applies:** the multiplier is computed and the tracker updated in the finalisation kernels (loss_fin_k, w4_fin_k).
+  Only fin[2 C + 1] / fin[3], the gradient's scale, changes; the logged loss values do not.
+- **No host sync:** the state lives in device memory, `__device__ g_ww`, one copy per GPU. Data-parallel replicas each track their
+  own windows. MIL's ray count is a host value already, so its tracker is on the host (train.c ww_mil).
+- **Slots:** phase, ink / ink2, fibre A / B / direction, rv, side, normal, wind4, MIL.
+- **Scope:** training windows only. Validation is neither weighted nor counted. Only the head-slab path (head_slab_pass's
+  statistics pass) is weighted, not the whole-window nn_loss_async path.
+- **Not checkpointed:** the tracker re-warms over 16 windows after a resume.
+- **Log:** with the flag, the step line gains `winw <head> <mean weight> (<windows below 0.1 ref>/<labelled windows> low, ref <nm>)`
+  per head, over the windows since the last line on GPU 0.
+
+Test: tests/test_win_weight (gpu tag). It runs 60 windows with a sliver (4 .. 40 of 2048 voxels) in every 7th and checks:
+- slot -1 gives the same bytes as nn_loss_stats_fin;
+- the logged losses are unchanged;
+- the multiplier equals 1 / active x the host fp64 reference tracker's weight (rel 1e-4);
+- the interval summary, and that nn_win_weight_take resets it.
+
+Status: built on the desk (CPU) only, per the MEGA rules. The test and an A/B (gn spikes against small-nm windows, wind4 / phase
+curves) wait for the mega GPU pass.
+
 ## Replay warp and sources-json validation (mini/augment, mini/json; 2026-11-14, branch augfix-20261114)
 
 **Replay warp (augment #1).** A replayed window whose redraw came up without rotation / elastic / zoom drew a fallback rotation of up

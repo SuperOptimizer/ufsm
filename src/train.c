@@ -413,6 +413,22 @@ static int g_Pz;   /* window depth: --Pz (a Pz x P x P slab), else P; g_lsplit: 
 static int split_z0(int side, int P) { return side == 1 ? P / 2 - g_h0 : 0; }   /* the first window plane of a split half */
 static int g_valP;   /* --val-P N (!= P): validation windows of N^3 (the same voxels for every run with this N and --val-seed), scored by an
                         inference-only copy of the network on GPU 0 that reads the training weights; 0: windows of the training size */
+/* --win-weight 1 (audit 2026-11-14 train #4, default off): each head's gradient of a training window times min(1, nm / ref) -- nm its
+   mask weight sum, ref the head's running median nm over earlier labelled windows (nn_loss_stats_fin_w / nn_wind4_fin_w on the
+   device per GPU; the MIL head's ray count on the host). Slots below; the log line's "winw" part per GPU 0 */
+static int g_win_weight;
+enum { WW_PHASE, WW_INK, WW_INK2, WW_FIBA, WW_FIBB, WW_FIBD, WW_RV, WW_SIDE, WW_NORM, WW_W4, WW_NDEV, WW_MIL = WW_NDEV, WW_N };
+static const char *const ww_name[WW_N] = {"phase", "ink", "ink2", "fibA", "fibB", "fibdir", "rv", "side", "normal", "wind4", "mil"};
+static double g_mil_ww[8][6];   /* per GPU (dev): the MIL slot as the device's ([0] log2 ref, [1] windows, [2] n, [3] sum w, [4] low, [5] min) */
+static float ww_mil(int dev, int nmil) {   /* the MIL head's weight for a window of nmil rays (the device slots' rule) */
+    if (!g_win_weight || nmil < 1 || dev < 0 || dev >= 8) return 1.f;
+    double *q = g_mil_ww[dev]; const double l = log2((double)nmil);
+    double w = q[1] > 0 ? fmin(1.0, exp2(l - q[0])) : 1.0;
+    if (q[1] < 16) q[0] = q[1] > 0 ? (q[0] * q[1] + l) / (q[1] + 1) : l; else q[0] += l > q[0] ? 0.05 : l < q[0] ? -0.05 : 0;
+    q[1] += 1; const double r = q[1] > 1 ? w : 1.0;
+    q[5] = q[2] > 0 ? fmin(q[5], r) : r; q[2] += 1; q[3] += w; if (r < 0.1) q[4] += 1;
+    return (float)w;
+}
 static int g_hs_tcache;   /* --hs-tcache 1 (UFSM_HS_TCACHE=0 / 1 overrides: tests): head_slab_pass keeps the slabs' derived targets for the gradient pass */
 static size_t g_val_reserve;   /* --val-P: device bytes the planner keeps free for that copy's inference build */
 static unet *g_val_u;          /* --val-P: that copy */
@@ -1726,18 +1742,22 @@ static void head_slab_pass(gpu_state *d, int pass) {
     }
     if (!pass) {
         const shape5 w1 = {1, 1, D, H, W}, w2 = {1, 2, D, H, W}, w7 = {1, 7, D, H, W};
+#define WWS(k) (g_win_weight && d->hs_train ? (k) : -1)   /* --win-weight: training windows only (validation neither weighted nor counted) */
         if (!g_unwrap2) {
-            nn_loss_stats_fin(d->hs_ds, d->w, w1, d->scratch);
-            nn_loss_stats_fin(d->hs_ds + 5, d->w + 1, w1, d->iscratch);
-        } else nn_wind4_fin(d->w4ds, d->w4fin);
-        if (g_ink2) nn_loss_stats_fin(d->hs_ds + 5, d->inkw, w1, d->iscratch);
-        if (g_fibh) { nn_loss_stats_fin(d->hs_ds + 74, d->fhw, w1, d->fhs[0]); nn_loss_stats_fin(d->hs_ds + 79, d->fhw, w1, d->fhs[1]); nn_loss_stats_fin(d->hs_ds + 84, d->nw, w7, d->fds); }
-        if (g_rv == 2) nn_loss_stats_fin(d->hs_ds + 64, d->sidew, w2, d->rvscratch);
-        nn_loss_stats_fin(d->hs_ds + 10, d->sidew, w2, d->sscratch);
-        nn_loss_stats_fin(d->hs_ds + 20, d->nw, w7, d->nscratch);
-        d->hgs = ssl_skip ? 1.f : hgs_choose(d, nmil);   /* (after every finalisation it reads; before the MIL fin, which bakes the scale into its accumulator) */
+            nn_loss_stats_fin_w(d->hs_ds, d->w, w1, d->scratch, WWS(WW_PHASE));
+            nn_loss_stats_fin_w(d->hs_ds + 5, d->w + 1, w1, d->iscratch, g_ink2 ? -1 : WWS(WW_INK));
+        } else nn_wind4_fin_w(d->w4ds, d->w4fin, WWS(WW_W4));
+        if (g_ink2) nn_loss_stats_fin_w(d->hs_ds + 5, d->inkw, w1, d->iscratch, WWS(WW_INK2));
+        if (g_fibh) { nn_loss_stats_fin_w(d->hs_ds + 74, d->fhw, w1, d->fhs[0], WWS(WW_FIBA)); nn_loss_stats_fin_w(d->hs_ds + 79, d->fhw, w1, d->fhs[1], WWS(WW_FIBB));
+                      nn_loss_stats_fin_w(d->hs_ds + 84, d->nw, w7, d->fds, WWS(WW_FIBD)); }
+        if (g_rv == 2) nn_loss_stats_fin_w(d->hs_ds + 64, d->sidew, w2, d->rvscratch, WWS(WW_RV));
+        nn_loss_stats_fin_w(d->hs_ds + 10, d->sidew, w2, d->sscratch, WWS(WW_SIDE));
+        nn_loss_stats_fin_w(d->hs_ds + 20, d->nw, w7, d->nscratch, WWS(WW_NORM));
+#undef WWS
+        d->hgs = ssl_skip ? 1.f : hgs_choose(d, nmil);   /* (after every finalisation it reads, the window weights included; before the MIL fin, which bakes the scale into its accumulator) */
         if (nmil) {   /* the MIL loss: the mean over the window's rays x lambda x the source's ink weight; the gradient in the 16-bit storage's scale (training) */
-            const float iw = g_mil_lambda * (si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f) * src_head_w(si, SH_INK) / nmil;
+            const float iw = g_mil_lambda * (si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f) * src_head_w(si, SH_INK) / nmil
+                             * (d->hs_train ? ww_mil(d->dev, nmil) : 1.f);   /* (--win-weight: the MIL head's window weight) */
             const float gs = d->hs_train && nn_get_loss_grad_h16() ? nn_get_grad_scale() * d->hgs : 1.f;   /* (x the head plane scale: ink_mil_bwd_slab adds into the planes) */
             if (g_lsplit && d->side >= 0) {   /* the two halves' accumulators summed (a + b on both GPUs: the same bits), the loss counted on side 0 */
                 const size_t nb = (size_t)nmil * d->mil_k * sizeof(float);
@@ -3837,6 +3857,7 @@ int cmd_train(int argc, char **argv) {
     }
     gpu_state G[8]; memset(G, 0, sizeof G); g_G0 = G;   /* (zeroed: fields added later rely on it) */
     int step0 = 0;
+    g_win_weight = opt_atoi("--win-weight", opt(argc, argv, "--win-weight", "0")) != 0;
     g_hs_tcache = getenv("UFSM_HS_TCACHE") ? atoi(getenv("UFSM_HS_TCACHE")) != 0 : opt_atoi("--hs-tcache", opt(argc, argv, "--hs-tcache", "0")) != 0;
     g_fstem = opt_atoi("--fstem", opt(argc, argv, "--fstem", "0")); g_fs_drop = (float)opt_atof("--fstem-drop", opt(argc, argv, "--fstem-drop", "0.25"));
     if (g_fstem) {
@@ -5503,6 +5524,19 @@ int cmd_train(int argc, char **argv) {
                 if (f1 + e1 > f0 + e0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " echo %.0f%% (GPU idle for data %.0f%%)", 100.0 * (double)(e1 - e0) / (double)(f1 + e1 - f0 - e0), 100.0 * g_echo_idle / dt); }
                 g_echo_idle = 0;   /* (the trainer's "wait" also counts the probe's time while the GPUs still run the step: idle is what they lost) */
                 f0 = f1; e0 = e1;
+            }
+            if (g_win_weight) {   /* --win-weight on GPU 0: per head with labelled windows since the last line, the mean weight, the windows below 0.1 ref / all, ref */
+                if (ng > 1) nn_init(G[0].dev);
+                float wv[5 * WW_NDEV]; nn_win_weight_take(wv, WW_NDEV);
+                size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " winw");
+                for (int k = 0; k < WW_N; k++) {
+                    double *mq = g_mil_ww[G[0].dev & 7];
+                    const float n = k < WW_NDEV ? wv[5 * k] : (float)mq[2], mw = k < WW_NDEV ? wv[5 * k + 1] : (float)(mq[2] > 0 ? mq[3] / mq[2] : 0), lo = k < WW_NDEV ? wv[5 * k + 2] : (float)mq[4],
+                                ref = k < WW_NDEV ? wv[5 * k + 4] : (float)exp2(mq[0]);
+                    if (k == WW_MIL) mq[2] = mq[3] = mq[4] = mq[5] = 0;
+                    if (n < 1.f) continue;
+                    na = strlen(affs); snprintf(affs + na, sizeof affs - na, " %s %.2f (%.0f/%.0f low, ref %.3g)", ww_name[k], mw, lo, n, ref);
+                }
             }
             if (accum > 1) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " (update %ld: %d windows each)", upd_base + (step - acc_anchor) / accum, accum); }   /* --accum: steps are windows */
             if (n_gs) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " gn_step %.2f", acc_gs / n_gs); }   /* (gn above: per-step norms and the updates' ten-window ones mixed) */

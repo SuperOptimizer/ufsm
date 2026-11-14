@@ -2192,7 +2192,7 @@ template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t 
 __global__ void loss_d2f_k(const double *d, float *f, int n);
 /* finalize on device: per-channel mean bce / dice, active count, and 1/active for the gradient kernel.
    layout of fin[]: [0..C) bce, [C..2C) dice, [2C] active, [2C+1] inv_active */
-__global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, float *fin);
+__global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, float *fin, int wslot = -1);   /* (nn_loss.cu; wslot: --win-weight, nn_loss_stats_fin_w) */
 /* the logit gradient of voxel v of (n, c) = nc, element i = nc S + v, logit x, target byte tb, mask byte mb (loss_grad_k's per-element
    arithmetic, unchanged) */
 template <typename GT, typename LT> __device__ __forceinline__ GT loss_grad_v(const uint8_t *t, int C, size_t S, const float *st, float dice_w, const float *fin,
