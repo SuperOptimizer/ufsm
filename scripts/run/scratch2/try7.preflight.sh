@@ -16,6 +16,8 @@ if [ "${1:-}" != --after ]; then
     git -C /home/forrest/ufsm merge-base --is-ancestor 472df19 $SHA 2>/dev/null && good "binary contains sampbias 472df19 (zboost: sources.c ignores unknown keys silently)" || bad "binary lacks sampbias 472df19"
     for b in dcachecap-20261114 dckey-20261114; do git -C /home/forrest/ufsm merge-base --is-ancestor origin/$b $SHA 2>/dev/null && good "binary contains $b" || bad "binary lacks origin/$b (hostmem: derived-cache cap + new keys)"; done
   [ -e /home/forrest/.cache/ufsm/derived ] && bad "~/.cache/ufsm/derived still in place: mv it to derived.try6 (no trainer / admuon arm reading it)" || good "old derived cache moved away"
+  for f in --stop-at-update --gns-skip-echo; do strings "$U" | grep -qF -- "$f" && good "binary knows $f (trainlow 738e72f7)" || bad "binary lacks $f (trainlow-20261114 738e72f7)"; done
+  grep -qE '^XFLAGS=.*--accum auto' $E && ! grep -qE '^XFLAGS=.*--gns-skip-echo 1' $E && grep -qE '^XFLAGS=.*--echo-max [1-9]' $E && bad "--accum auto with --echo-max needs --gns-skip-echo 1 (main)"
   strings "$U" | grep -qF -- "--holdout-guard" && good "binary knows --holdout-guard" || bad "binary lacks --holdout-guard"
   [ -f "$SRCJ" ] && good "sources $SRCJ" || bad "no sources $SRCJ"
   python3 -I -c "import json,sys; d=json.load(open('$SRCJ')); s=d['sources']; w=[x for x in s if x['name']=='PHerc1218-b3']; sys.exit(0 if d.get('holdout_strict')==1 and all(x.get('holdout_file') for x in s) and w and w[0]['weight']==0 else 1)" \
