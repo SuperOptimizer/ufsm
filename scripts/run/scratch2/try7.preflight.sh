@@ -10,6 +10,7 @@ if [ "${1:-}" != --after ]; then
     git -C /home/forrest/ufsm merge-base --is-ancestor 9a3ea4a $SHA 2>/dev/null && good "binary sha $SHA contains datafix 9a3ea4a (UFMC0002 packs, cf4dcc8)" || bad "binary sha $SHA lacks datafix 9a3ea4a"
     git -C /home/forrest/ufsm merge-base --is-ancestor $SHA origin/master 2>/dev/null && good "binary sha $SHA is on origin/master" || bad "binary sha $SHA is not on origin/master"
   else bad "cannot resolve the binary's sha '$SHA' (name it ufsm.scratch2.<sha>)"; fi
+    git -C /home/forrest/ufsm merge-base --is-ancestor 472df19 $SHA 2>/dev/null && good "binary contains sampbias 472df19 (zboost: sources.c ignores unknown keys silently)" || bad "binary lacks sampbias 472df19"
     for b in dcachecap-20261114 dckey-20261114; do git -C /home/forrest/ufsm merge-base --is-ancestor origin/$b $SHA 2>/dev/null && good "binary contains $b" || bad "binary lacks origin/$b (hostmem: derived-cache cap + new keys)"; done
   [ -e /home/forrest/.cache/ufsm/derived ] && bad "~/.cache/ufsm/derived still in place: mv it to derived.try6 (no trainer / admuon arm reading it)" || good "old derived cache moved away"
   strings "$U" | grep -qF -- "--holdout-guard" && good "binary knows --holdout-guard" || bad "binary lacks --holdout-guard"
