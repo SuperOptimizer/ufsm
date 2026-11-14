@@ -1,5 +1,6 @@
 /* ufsm mirror / ufsm scanprep: see src/scanprep.h. */
 #include "scanprep.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "edt.h"
 #include "sources.h"
@@ -20,7 +21,7 @@
 uint32_t crc32c(uint32_t crc, const void *buf, size_t len);   /* src/z3w.c */
 
 static const char *sopt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 static double snow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -104,8 +105,8 @@ int cmd_mirror(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm mirror <root> <array-key> <out-dir> [--threads 4] [--mbps 0] [--mbps-file F] [--link-from DIR] [--verify N] [--seed 1]\n"); return 2; }
     mir_t M = {0};
     M.key = argv[3]; M.out = argv[4]; M.link = sopt(argc, argv, "--link-from", nullptr);
-    const int nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 4), nver = atoi(sopt(argc, argv, "--verify", "0"));
-    M.rate = atof(sopt(argc, argv, "--mbps", "0")) * 1e6; M.rate_file = sopt(argc, argv, "--mbps-file", nullptr); M.t_file = -1e9; uint64_t seed = (uint64_t)atoll(sopt(argc, argv, "--seed", "1"));
+    const int nt = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 4), nver = opt_atoi("--verify", sopt(argc, argv, "--verify", "0"));
+    M.rate = opt_atof("--mbps", sopt(argc, argv, "--mbps", "0")) * 1e6; M.rate_file = sopt(argc, argv, "--mbps-file", nullptr); M.t_file = -1e9; uint64_t seed = (uint64_t)opt_atoll("--seed", sopt(argc, argv, "--seed", "1"));
     store_global_init();
     M.s = store_open(argv[2]);
     z3 *z = M.s ? z3_open(M.s, M.key, nullptr) : nullptr;
@@ -343,14 +344,14 @@ int cmd_scanprep(int argc, char **argv) {
         return 2;
     }
     const char *root = argv[2], *group = argv[3], *out = sopt(argc, argv, "--out", nullptr);
-    const int L = atoi(sopt(argc, argv, "--level", "0")), cell = atoi(sopt(argc, argv, "--cell", "16")), win = atoi(sopt(argc, argv, "--window", "128"));
-    const int fill2d = atoi(sopt(argc, argv, "--fill2d", "1")), nstat = atoi(sopt(argc, argv, "--stats-chunks", "256")), nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16);
-    const double close_mm = atof(sopt(argc, argv, "--close-mm", "2")), min_inside = atof(sopt(argc, argv, "--min-inside", "0.25"));
-    const double keep_frac = atof(sopt(argc, argv, "--keep-frac", "0.1"));
+    const int L = opt_atoi("--level", sopt(argc, argv, "--level", "0")), cell = opt_atoi("--cell", sopt(argc, argv, "--cell", "16")), win = opt_atoi("--window", sopt(argc, argv, "--window", "128"));
+    const int fill2d = opt_atoi("--fill2d", sopt(argc, argv, "--fill2d", "1")), nstat = opt_atoi("--stats-chunks", sopt(argc, argv, "--stats-chunks", "256")), nt = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 16);
+    const double close_mm = opt_atof("--close-mm", sopt(argc, argv, "--close-mm", "2")), min_inside = opt_atof("--min-inside", sopt(argc, argv, "--min-inside", "0.25"));
+    const double keep_frac = opt_atof("--keep-frac", sopt(argc, argv, "--keep-frac", "0.1"));
     double zr[2] = {-1e18, 1e18};
     if (sopt(argc, argv, "--zrange", nullptr) && sscanf(sopt(argc, argv, "--zrange", ""), "%lf,%lf", zr, zr + 1) != 2) { fprintf(stderr, "scanprep: --zrange z0,z1 (level-L voxels)\n"); return 2; }
-    uint64_t seed = (uint64_t)atoll(sopt(argc, argv, "--seed", "1"));
-    double um0 = atof(sopt(argc, argv, "--um", "0")); if (um0 <= 0) um0 = um_from_name(group);
+    uint64_t seed = (uint64_t)opt_atoll("--seed", sopt(argc, argv, "--seed", "1"));
+    double um0 = opt_atof("--um", sopt(argc, argv, "--um", "0")); if (um0 <= 0) um0 = um_from_name(group);
     if (um0 <= 0 || cell < 1 || (cell & (cell - 1)) || cell > 128 || L < 0 || L >= MAXLEV) { fprintf(stderr, "scanprep: need --um (not in the name), --cell a power of 2 <= 128, 0 <= --level < %d\n", MAXLEV); return 2; }
     const double t0 = snow();
     store_global_init();

@@ -1,6 +1,7 @@
 /* ufsm coreline check: the core-line sanity renders of the former core/check/check.py (see coreline.h cl_check), apart from
    coreline.c so the objects that link the core line need no image code. */
 #include "coreline.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "imgops.h"
 #include <limits.h>
@@ -12,7 +13,7 @@
 #include <string.h>
 
 static const char *chk_opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 
@@ -199,7 +200,7 @@ static uint8_t *chk_read(const char *path, size_t n) {   /* exactly n bytes */
    of N x N cells from z) -> <out-dir>/zZZZZ.jpg (cl_check) and one line on stdout as check.py printed it. */
 int cmd_coreline_check(int argc, char **argv) {
     if (argc < 7) { fprintf(stderr, "usage: ufsm coreline check <core.json> <scratch-dir> <out-dir> ZCELL... [--n 2573] [--threads 8] [--quality 85]\n"); return 2; }
-    const int N = atoi(chk_opt(argc, argv, "--n", "2573")), nt = ufsm_threads(atoi(chk_opt(argc, argv, "--threads", "0")), 8), qual = atoi(chk_opt(argc, argv, "--quality", "85"));
+    const int N = opt_atoi("--n", chk_opt(argc, argv, "--n", "2573")), nt = ufsm_threads(opt_atoi("--threads", chk_opt(argc, argv, "--threads", "0")), 8), qual = opt_atoi("--quality", chk_opt(argc, argv, "--quality", "85"));
     if (N < 2) { fprintf(stderr, "coreline check: --n >= 2\n"); return 2; }
     coreline C; if (cl_load(&C, argv[3])) { fprintf(stderr, "coreline: cannot load %s\n", argv[3]); return 1; }
     const char *S = argv[4], *od = argv[5]; int rc = 0;

@@ -33,6 +33,7 @@
      JPEG, and the on-papyrus share along the strip (CT >= ct-level within 3 x 3 px around the surface point) per 1 cm column and per
      wrap (strip_papyrus.tsv, papyrus_wraps.tsv): where the surface leaves the papyrus is reported, never cut. */
 #include "flatten.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "imgops.h"
 #include "tiff.h"
@@ -51,7 +52,7 @@
 #include <unistd.h>
 
 static double snow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
-static const char *sopt(int argc, char **argv, const char *name, const char *def) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1]; return def; }
+static const char *sopt(int argc, char **argv, const char *name, const char *def) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1]; return def; }
 static double meta_num(const char *m, const char *key, double def) { const char *q = m ? strstr(m, key) : nullptr; if (!q) return def; q += strlen(key); while (*q == ' ' || *q == ':' || *q == '[' || *q == '"') q++; return atof(q); }
 static int cmp_f32(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return x < y ? -1 : x > y; }
 static float median_f32(float *v, int n) { if (n <= 0) return NAN; qsort(v, (size_t)n, 4, cmp_f32); return v[n / 2]; }
@@ -257,8 +258,8 @@ static void st_fill(void *ctx, int bx, int by, float (*joint)[3], uint8_t *valid
 int cmd_strip(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm strip <wraps-dir> <out-dir> [--first K] [--last K] [--every E] [--err 0.25] [--threads 8]\n"); return 2; }
     const char *wd = argv[2], *od = argv[3];
-    const int first = atoi(sopt(argc, argv, "--first", "-1000000")), last = atoi(sopt(argc, argv, "--last", "1000000")), every = atoi(sopt(argc, argv, "--every", "1"));
-    const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8); const double err = atof(sopt(argc, argv, "--err", "0.25"));
+    const int first = opt_atoi("--first", sopt(argc, argv, "--first", "-1000000")), last = opt_atoi("--last", sopt(argc, argv, "--last", "1000000")), every = opt_atoi("--every", sopt(argc, argv, "--every", "1"));
+    const int nth = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 8); const double err = opt_atof("--err", sopt(argc, argv, "--err", "0.25"));
     if (every < 1 || !(err > 0)) { fprintf(stderr, "strip: --every >= 1, --err > 0\n"); return 2; }
     const double t0 = snow();
     DIR *d = opendir(wd); if (!d) { fprintf(stderr, "strip: cannot open %s\n", wd); return 1; }
@@ -722,13 +723,13 @@ int cmd_strip_flatten(int argc, char **argv) {
     const char *sd = argv[2]; char od[1400]; snprintf(od, sizeof od, "%s", sopt(argc, argv, "--out", "")); if (!*od) snprintf(od, sizeof od, "%s/flat", sd);
     sflat F; memset(&F, 0, sizeof F);
     if (st_open(sd, &F.S)) return 1;
-    F.w = F.S.w; F.h = F.S.h; F.step = F.S.step; F.D = atoi(sopt(argc, argv, "--decim", "1")); if (F.D < 1) F.D = 1;
-    F.max_edge = atof(sopt(argc, argv, "--max-edge", "3"));
-    const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16);
-    int S = atoi(sopt(argc, argv, "--stride", "0")); if (S <= 0) S = F.h / 2; S = S / F.D * F.D; if (S < 4 * F.D) S = 4 * F.D; F.Sst = S;
+    F.w = F.S.w; F.h = F.S.h; F.step = F.S.step; F.D = opt_atoi("--decim", sopt(argc, argv, "--decim", "1")); if (F.D < 1) F.D = 1;
+    F.max_edge = opt_atof("--max-edge", sopt(argc, argv, "--max-edge", "3"));
+    const int nth = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 16);
+    int S = opt_atoi("--stride", sopt(argc, argv, "--stride", "0")); if (S <= 0) S = F.h / 2; S = S / F.D * F.D; if (S < 4 * F.D) S = 4 * F.D; F.Sst = S;
     F.lw = (F.w - 1) / F.D + 1; F.lh = (F.h - 1) / F.D + 1;
-    const double um = F.S.um, ostep = atof(sopt(argc, argv, "--ostep", "0")) > 0 ? atof(sopt(argc, argv, "--ostep", "0")) : F.step;
-    const double pxs = atof(sopt(argc, argv, "--px-scale", "1")); const int stripe_px = atoi(sopt(argc, argv, "--stripe-px", "60000")), flip = atoi(sopt(argc, argv, "--flip-rows", "0"));
+    const double um = F.S.um, ostep = opt_atof("--ostep", sopt(argc, argv, "--ostep", "0")) > 0 ? opt_atof("--ostep", sopt(argc, argv, "--ostep", "0")) : F.step;
+    const double pxs = opt_atof("--px-scale", sopt(argc, argv, "--px-scale", "1")); const int stripe_px = opt_atoi("--stripe-px", sopt(argc, argv, "--stripe-px", "60000")), flip = opt_atoi("--flip-rows", sopt(argc, argv, "--flip-rows", "0"));
     char cmd[1500], p[1600]; snprintf(cmd, sizeof cmd, "mkdir -p '%s/stripes'", od); if (system(cmd)) return 1;
     st_seg *segs = nullptr; const int nseg = st_segs(sd, &segs);
     const double t0 = snow();
@@ -752,7 +753,7 @@ int cmd_strip_flatten(int argc, char **argv) {
     if (!F.du || !F.dv || !F.wt) { fprintf(stderr, "strip-flatten: out of memory for the lattice\n"); return 1; }
     char lp[1600]; snprintf(lp, sizeof lp, "%s/lattice.f32", od);
     int reused = 0;
-    if (atoi(sopt(argc, argv, "--reuse", "0"))) {   /* the chunks' blended lattice of an earlier run (output stage only) */
+    if (opt_atoi("--reuse", sopt(argc, argv, "--reuse", "0"))) {   /* the chunks' blended lattice of an earlier run (output stage only) */
         FILE *f = fopen(lp, "rb");
         if (f && fread(F.du, 4, ln, f) == ln && fread(F.dv, 4, ln, f) == ln && fread(F.wt, 4, ln, f) == ln) reused = 1;
         if (f) fclose(f);
@@ -768,15 +769,15 @@ int cmd_strip_flatten(int argc, char **argv) {
     if (!reused) {
         /* chunks on --jobs workers (each --threads / jobs CPU threads; with --gpu 1 the SLIM iterations on device worker % devices), blended
            into the lattice strictly in chunk order: the sums are the same whatever the job count */
-        const int ngpu = atoi(sopt(argc, argv, "--gpu", "1")) ? flat_gpu_devices() : 0;
-        int jobs = atoi(sopt(argc, argv, "--jobs", "0"));
+        const int ngpu = opt_atoi("--gpu", sopt(argc, argv, "--gpu", "1")) ? flat_gpu_devices() : 0;
+        int jobs = opt_atoi("--jobs", sopt(argc, argv, "--jobs", "0"));
         /* default with GPUs: 3 per GPU or one per 3 threads, the larger (a job's chunk prep and blend are CPU work: the GPU sat at
            11-13% with 3 jobs; 0490B desk 120 chunks at 20 threads: 3 jobs 151-158 s, 6 jobs 96-134 s, 12 jobs 113-121 s; same files) */
         if (jobs <= 0) jobs = ngpu > 0 ? (3 * ngpu > nth / 3 ? 3 * ngpu : nth / 3) : 1;
         if (jobs > 64) jobs = 64;
         if (jobs > j1 - j0 + 1) jobs = j1 - j0 + 1 > 0 ? j1 - j0 + 1 : 1;
-        sf_ctx X = {&F, nchunk, S, nth / jobs > 0 ? nth / jobs : 1, ngpu, atoi(sopt(argc, argv, "--iters", "30")), atoi(sopt(argc, argv, "--cg", "200")),
-                    atoi(sopt(argc, argv, "--verbose", "0")), atof(sopt(argc, argv, "--tol", "1e-5")), cf, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, j0, j0, 0, j1};
+        sf_ctx X = {&F, nchunk, S, nth / jobs > 0 ? nth / jobs : 1, ngpu, opt_atoi("--iters", sopt(argc, argv, "--iters", "30")), opt_atoi("--cg", sopt(argc, argv, "--cg", "200")),
+                    opt_atoi("--verbose", sopt(argc, argv, "--verbose", "0")), opt_atof("--tol", sopt(argc, argv, "--tol", "1e-5")), cf, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, j0, j0, 0, j1};
         atomic_store(&X.next, j0);
         fprintf(stderr, "strip-flatten: chunks %d..%d on %d jobs x %d threads, SLIM on %s\n", j0, j1, jobs, X.nth, ngpu ? "the GPU" : "the CPU");
         pthread_t th[64]; sf_warg wa[64];
@@ -837,7 +838,7 @@ int cmd_strip_flatten(int argc, char **argv) {
     if (sf) fprintf(sf, "stripe\tout_col0\tout_cols\tout_rows\tu0_cm\tlength_cm\tvalid_cm2\tsrc_col0\tsrc_col1\twrap0\twrap1\n");
     long long nval_all = 0;
     {   /* stripes on --stripe-jobs workers (each --threads / jobs threads), stripes.tsv rows in stripe order: the same files */
-        int sj = atoi(sopt(argc, argv, "--stripe-jobs", "3")); if (sj < 1) sj = 1;
+        int sj = opt_atoi("--stripe-jobs", sopt(argc, argv, "--stripe-jobs", "3")); if (sj < 1) sj = 1;
         if (sj > nstripe) sj = nstripe > 0 ? nstripe : 1;
         if (sj > 64) sj = 64;
         ss_ctx Q = {&F, od, sf, segs, nseg, SW, OW, OH, nstripe, nth / sj > 0 ? nth / sj : 1, flip, umin, vmin, ostep, um, cumin, cumax,
@@ -1152,12 +1153,12 @@ int cmd_strip_mosaic(int argc, char **argv) {
                           "  --papyrus-gain, --papyrus-bg, --overview-px --papyrus-overview-px)\n"
                           "  --threads: threads per stripe (TIFF decode, mask, pixels); --stripe-jobs: stripes in flight (memory capped)\n"); return 2; }
     const char *fd = argv[2], *rd = argv[3], *od = argv[4];
-    const int ctl = atoi(sopt(argc, argv, "--ct-level", "80")), ovpx = atoi(sopt(argc, argv, "--overview-px", "16000")), rows = atoi(sopt(argc, argv, "--rows", "10")), q = atoi(sopt(argc, argv, "--quality", "88"));
-    const double tilecm = atof(sopt(argc, argv, "--tile-cm", "1")); const int wstripes = atoi(sopt(argc, argv, "--stripes", "1"));
-    int nthr = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8); if (nthr < 1) nthr = 1; if (nthr > 64) nthr = 64;
-    int nsj = atoi(sopt(argc, argv, "--stripe-jobs", "2")); if (nsj < 1) nsj = 1; if (nsj > 64) nsj = 64;
+    const int ctl = opt_atoi("--ct-level", sopt(argc, argv, "--ct-level", "80")), ovpx = opt_atoi("--overview-px", sopt(argc, argv, "--overview-px", "16000")), rows = opt_atoi("--rows", sopt(argc, argv, "--rows", "10")), q = opt_atoi("--quality", sopt(argc, argv, "--quality", "88"));
+    const double tilecm = opt_atof("--tile-cm", sopt(argc, argv, "--tile-cm", "1")); const int wstripes = opt_atoi("--stripes", sopt(argc, argv, "--stripes", "1"));
+    int nthr = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 8); if (nthr < 1) nthr = 1; if (nthr > 64) nthr = 64;
+    int nsj = opt_atoi("--stripe-jobs", sopt(argc, argv, "--stripe-jobs", "2")); if (nsj < 1) nsj = 1; if (nsj > 64) nsj = 64;
     const char *pdir = sopt(argc, argv, "--papyrus-dir", nullptr);
-    if (pdir && atof(sopt(argc, argv, "--papyrus", "0")) > 0) { fprintf(stderr, "strip-mosaic: --papyrus-dir with a grey main mosaic only (no --papyrus)\n"); return 2; }
+    if (pdir && opt_atof("--papyrus", sopt(argc, argv, "--papyrus", "0")) > 0) { fprintf(stderr, "strip-mosaic: --papyrus-dir with a grey main mosaic only (no --papyrus)\n"); return 2; }
     char p[1600], cmd[3300]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'%s%s%s", od, pdir ? " '" : "", pdir ? pdir : "", pdir ? "'" : ""); if (system(cmd)) return 1;
     /* the strip's segments (wrap per source column): <flat-dir>/../strip.tsv or --strip */
     char sdir[1400]; snprintf(sdir, sizeof sdir, "%s", sopt(argc, argv, "--strip", "")); if (!*sdir) snprintf(sdir, sizeof sdir, "%s/..", fd);
@@ -1200,13 +1201,13 @@ int cmd_strip_mosaic(int argc, char **argv) {
         hist_q(C->hc, 0.005, 0.998, &ca, &cb); hist_q(C->hi, 0.01, 0.999, &ia, &ib);
     }
     fprintf(stderr, "strip-mosaic: stretch CT %d..%d, ink %d..%d\n", ca, cb, ia, ib);
-    if (atoi(sopt(argc, argv, "--stretch-only", "0"))) { printf("stretch %d,%d,%d,%d\n", ca, cb, ia, ib); return 0; }   /* (from the renders present) */
-    C->wait = atoi(sopt(argc, argv, "--wait-renders", "0")); C->rm = atoi(sopt(argc, argv, "--rm-renders", "0"));
+    if (opt_atoi("--stretch-only", sopt(argc, argv, "--stretch-only", "0"))) { printf("stretch %d,%d,%d,%d\n", ca, cb, ia, ib); return 0; }   /* (from the renders present) */
+    C->wait = opt_atoi("--wait-renders", sopt(argc, argv, "--wait-renders", "0")); C->rm = opt_atoi("--rm-renders", sopt(argc, argv, "--rm-renders", "0"));
     /* the mosaics: the main one (grey, or --papyrus) and --papyrus-dir */
     C->nout = pdir ? 2 : 1;
-    C->out[0] = (ms_out){.od = od, .pgain = (float)atof(sopt(argc, argv, "--papyrus", "0")), .pbg = atoi(sopt(argc, argv, "--papyrus-bg", "128")), .ovpx = ovpx};
-    if (pdir) C->out[1] = (ms_out){.od = pdir, .pgain = (float)atof(sopt(argc, argv, "--papyrus-gain", "1")), .pbg = atoi(sopt(argc, argv, "--papyrus-bg", "128")),
-                                   .ovpx = atoi(sopt(argc, argv, "--papyrus-overview-px", sopt(argc, argv, "--overview-px", "16000")))};
+    C->out[0] = (ms_out){.od = od, .pgain = (float)opt_atof("--papyrus", sopt(argc, argv, "--papyrus", "0")), .pbg = opt_atoi("--papyrus-bg", sopt(argc, argv, "--papyrus-bg", "128")), .ovpx = ovpx};
+    if (pdir) C->out[1] = (ms_out){.od = pdir, .pgain = (float)opt_atof("--papyrus-gain", sopt(argc, argv, "--papyrus-gain", "1")), .pbg = opt_atoi("--papyrus-bg", sopt(argc, argv, "--papyrus-bg", "128")),
+                                   .ovpx = opt_atoi("--papyrus-overview-px", sopt(argc, argv, "--papyrus-overview-px", sopt(argc, argv, "--overview-px", "16000")))};
     if (pdir && !(C->out[1].pgain > 0)) { fprintf(stderr, "strip-mosaic: --papyrus-gain > 0\n"); return 2; }
     for (int o = 0; o < C->nout; o++) { snprintf(p, sizeof p, "%s/stretch.txt", C->out[o].od); FILE *sf = fopen(p, "w"); if (sf) { fprintf(sf, "%d,%d,%d,%d\n", ca, cb, ia, ib); fclose(sf); } }   /* (for --stretch) */
     for (int v = 0; v < 256; v++) { C->sc[v] = stretch(v, ca, cb); C->si[v] = stretch(v, ia, ib); }
@@ -1264,7 +1265,7 @@ int cmd_strip_crop(int argc, char **argv) {
     if (c[2] < 1 || c[3] < 1) { fprintf(stderr, "strip-crop: empty rectangle\n"); free(im); return 2; }
     uint8_t *o = malloc((size_t)c[2] * c[3]), *m = malloc((size_t)c[2] * c[3]);
     for (int y = 0; y < c[3]; y++) for (int x = 0; x < c[2]; x++) { const uint8_t v = im[(size_t)(c[1] + y) * w + c[0] + x]; o[(size_t)y * c[2] + x] = v; m[(size_t)y * c[2] + x] = v > 0; }
-    if (atoi(sopt(argc, argv, "--stretch", "1"))) img_stretch(o, m, (size_t)c[2] * c[3], 0.01, 0.995);
+    if (opt_atoi("--stretch", sopt(argc, argv, "--stretch", "1"))) img_stretch(o, m, (size_t)c[2] * c[3], 0.01, 0.995);
     const int rc = jpeg_write_gray(argv[3], c[2], c[3], o, 90);
     free(im); free(o); free(m); return rc ? 1 : 0;
 }

@@ -1,6 +1,7 @@
 /* ufsm dinovol-embed: the scrollprize dinovol model (src/dinovol.h) over a CT box with embed_volume.py's lattice tiling, blending and
    volume-wide normalisation; ufsm dinovol-eval: the sheet-identity check of the dense embedding along published surfaces. */
 #include "dinovol.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "xnet.h"
 #include "store.h"
@@ -24,7 +25,7 @@
 
 static double dv_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 static int write_file(const char *dir, const char *name, const void *p, size_t n) {
@@ -57,7 +58,7 @@ static int dump_dev_half(const char *dir, const char *name, const void *dev, siz
 static int raw_mode(dv_net *net, int argc, char **argv) {
     const char *in = opt(argc, argv, "--raw-in", nullptr), *out = opt(argc, argv, "--raw-out", nullptr), *norm = opt(argc, argv, "--norm", nullptr);
     const char *pts = opt(argc, argv, "--points", nullptr);
-    const int T = atoi(opt(argc, argv, "--tile", "192")), reps = atoi(opt(argc, argv, "--reps", "1"));
+    const int T = opt_atoi("--tile", opt(argc, argv, "--tile", "192")), reps = opt_atoi("--reps", opt(argc, argv, "--reps", "1"));
     float c = 0, s = 1, hi = 255;
     if (!in || !out || !norm || sscanf(norm, "%f,%f,%f", &c, &s, &hi) != 3) { fprintf(stderr, "dinovol-embed --raw-in U8 --raw-out DIR --norm center,scale,hi [--tile T] [--points P.f32]\n"); return 2; }
     size_t nb = 0; uint8_t *u = read_file(in, &nb);
@@ -234,19 +235,19 @@ int cmd_dinovol_embed(int argc, char **argv) {
                         "  ufsm dinovol-embed --ckpt PT --raw-in TILE.u8 --raw-out DIR --norm c,s,hi [--tile T] [--points P.f32]   one tile (parity)\n");
         return 2;
     }
-    if (xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
-    xnet_set_budget((size_t)(atof(opt(argc, argv, "--gpu-mem", "9")) * 1e9));
+    if (xnet_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
+    xnet_set_budget((size_t)(opt_atof("--gpu-mem", opt(argc, argv, "--gpu-mem", "9")) * 1e9));
     if (opt(argc, argv, "--raw-in", nullptr)) {
         dv_net *net = dv_load(ck); if (!net) return 1;
         const int rc = raw_mode(net, argc, argv); dv_free(net); return rc;
     }
     const char *root = argv[2], *key = argv[3], *out = argv[4];
-    const int nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8); zw_nthreads = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads;
-    const int T = atoi(opt(argc, argv, "--tile", "192")), ds = atoi(opt(argc, argv, "--dense-stride", "1"));
+    const int nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8); zw_nthreads = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads;
+    const int T = opt_atoi("--tile", opt(argc, argv, "--tile", "192")), ds = opt_atoi("--dense-stride", opt(argc, argv, "--dense-stride", "1"));
     const int dtype = !strcmp(opt(argc, argv, "--dtype", "int8"), "float16") ? 1 : 0;
     const int overlap = 8 > T / 6 / 8 * 8 ? 8 : T / 6 / 8 * 8;
-    const int margin = atoi(opt(argc, argv, "--margin", "-1")) >= 0 ? atoi(opt(argc, argv, "--margin", "0")) : overlap;
-    const int ramp = atoi(opt(argc, argv, "--ramp", "-1")) > 0 ? atoi(opt(argc, argv, "--ramp", "0")) : overlap;
+    const int margin = opt_atoi("--margin", opt(argc, argv, "--margin", "-1")) >= 0 ? opt_atoi("--margin", opt(argc, argv, "--margin", "0")) : overlap;
+    const int ramp = opt_atoi("--ramp", opt(argc, argv, "--ramp", "-1")) > 0 ? opt_atoi("--ramp", opt(argc, argv, "--ramp", "0")) : overlap;
     const int stride = T - 2 * margin - ramp, support = stride + ramp;
     if (T % 16 || margin % 8 || ramp % 8 || ramp <= 0 || stride < ramp || ds < 1 || 8 % ds) { fprintf(stderr, "dinovol-embed: need tile %% 16, margin / ramp multiples of 8, tile - 2 margin >= 2 ramp, dense stride 1, 2, 4 or 8\n"); return 2; }
     int want[O_N] = {0};
@@ -274,7 +275,7 @@ int cmd_dinovol_embed(int argc, char **argv) {
         free(t);
     } else {
         const double t0 = dv_now();
-        if (sample_stats(ct, atoi(opt(argc, argv, "--stats-chunk-stride", "8")), nthreads, &S)) return 1;
+        if (sample_stats(ct, opt_atoi("--stats-chunk-stride", opt(argc, argv, "--stats-chunk-stride", "8")), nthreads, &S)) return 1;
         fprintf(stderr, "dinovol-embed: statistics of %lld nonzero voxels in %ld sampled chunks (%.1f s): median %.4f scale %.4f p01 %.4f p99 %.4f mean %.4f std %.4f\n",
                 (long long)S.count, S.sampled, dv_now() - t0, S.median, S.scale, S.p01, S.p99, S.mean, S.std);
     }
@@ -284,8 +285,8 @@ int cmd_dinovol_embed(int argc, char **argv) {
     int64_t c0[3], c1[3];
     for (int d = 0; d < 3; d++) { c0[d] = bv[d] / stride; c1[d] = (bv[d] + bv[3 + d] - 1) / stride + 1; }
     const int ncy = (int)(c1[1] - c0[1]), ncx = (int)(c1[2] - c0[2]);
-    int K = atoi(opt(argc, argv, "--shard-cells", "0")), Wx = atoi(opt(argc, argv, "--band-cells", "0"));
-    const double gbud = atof(opt(argc, argv, "--gpu-mem", "9")) * 1e9 - 5.2e9;   /* the forward (192^3 tile + head chunk + caches) takes ~5 GB */
+    int K = opt_atoi("--shard-cells", opt(argc, argv, "--shard-cells", "0")), Wx = opt_atoi("--band-cells", opt(argc, argv, "--band-cells", "0"));
+    const double gbud = opt_atof("--gpu-mem", opt(argc, argv, "--gpu-mem", "9")) * 1e9 - 5.2e9;   /* the forward (192^3 tile + head chunk + caches) takes ~5 GB */
     {   /* slab depth K (cells per shard edge) and x band width Wx (cells; bands recompute one tile column each) with the fewest tiles per
            cell, (K + 1) / K x (Wx + 1) / Wx, whose accumulators + fp16 strips fit the device budget */
         const int kmax = (512 + stride / 2) / stride > 0 ? (512 + stride / 2) / stride : 1;
@@ -368,7 +369,7 @@ int cmd_dinovol_embed(int argc, char **argv) {
     fprintf(stderr, "dinovol-embed: box %lld,%lld,%lld +%lld,%lld,%lld: cells z %lld..%lld y %lld..%lld x %lld..%lld (stride %d, tile %d, margin %d, ramp %d), %d cells per shard edge "
                     "(z slab), x bands of %d cells, dense stride %d, device %.2f GB in use\n", bv[0], bv[1], bv[2], bv[3], bv[4], bv[5], (long long)c0[0], (long long)c1[0], (long long)c0[1],
             (long long)c1[1], (long long)c0[2], (long long)c1[2], stride, T, margin, ramp, K, Wx, ds, xnet_mem_used() / 1e9);
-    aqueue AQ; aq_start(&AQ, (size_t)(atof(opt(argc, argv, "--write-buffer-gb", "1.5")) * 1e9));
+    aqueue AQ; aq_start(&AQ, (size_t)(opt_atof("--write-buffer-gb", opt(argc, argv, "--write-buffer-gb", "1.5")) * 1e9));
     const double t_start = dv_now(); double t_net = 0, t_head = 0, t_read = 0, t_fin = 0; long ntiles = 0, nskip = 0, ncells = 0, npoints = 0;
     int rc = 0;
     extern void dv_zero_dev(void *p, size_t bytes);
@@ -601,19 +602,19 @@ int cmd_dinovol_eval(int argc, char **argv) {
     }
     const char *group = argv[2], *oname = opt(argc, argv, "--output", "dense");
     if (opt(argc, argv, "--suggest-box", nullptr)) {   /* a cube of N voxels centred on the surface vertex nearest its grid centre (embedding voxels) */
-        const int N = atoi(opt(argc, argv, "--suggest-box", "384")); const double s0 = atof(opt(argc, argv, "--surf-scale", "0.25"));
+        const int N = opt_atoi("--suggest-box", opt(argc, argv, "--suggest-box", "384")); const double s0 = opt_atof("--surf-scale", opt(argc, argv, "--surf-scale", "0.25"));
         char q[1300]; int w, h, w2, h2, w3, h3; snprintf(q, sizeof q, "%s/x.tif", argv[2]); float *x = read_tif_f32(q, &w, &h);
         snprintf(q, sizeof q, "%s/y.tif", argv[2]); float *y = read_tif_f32(q, &w2, &h2); snprintf(q, sizeof q, "%s/z.tif", argv[2]); float *z = read_tif_f32(q, &w3, &h3);
         if (!x || !y || !z) { fprintf(stderr, "dinovol-eval: cannot read %s\n", argv[2]); return 1; }
-        const double fu = atof(opt(argc, argv, "--at-u", "0.5")), fv = atof(opt(argc, argv, "--at-v", "0.5"));
+        const double fu = opt_atof("--at-u", opt(argc, argv, "--at-u", "0.5")), fv = opt_atof("--at-v", opt(argc, argv, "--at-v", "0.5"));
         long best = -1; double bd = 1e300;
         for (long i = 0; i < (long)w * h; i++) if (z[i] >= 0) { const double du = (double)(i % w) - fu * w, dv = (double)(i / w) - fv * h, d = du * du + dv * dv; if (d < bd) { bd = d; best = i; } }
         if (best < 0) return 1;
         printf("%lld,%lld,%lld,%d,%d,%d\n", (long long)(z[best] * s0) - N / 2, (long long)(y[best] * s0) - N / 2, (long long)(x[best] * s0) - N / 2, N, N, N);
         free(x); free(y); free(z); return 0;
     }
-    const double sc = atof(opt(argc, argv, "--surf-scale", "0.25")); const int nref = atoi(opt(argc, argv, "--n-ref", "300")), ndir = atoi(opt(argc, argv, "--dirs", "8"));
-    const int R = atoi(opt(argc, argv, "--range", "24")), edge = atoi(opt(argc, argv, "--edge", "4"));
+    const double sc = opt_atof("--surf-scale", opt(argc, argv, "--surf-scale", "0.25")); const int nref = opt_atoi("--n-ref", opt(argc, argv, "--n-ref", "300")), ndir = opt_atoi("--dirs", opt(argc, argv, "--dirs", "8"));
+    const int R = opt_atoi("--range", opt(argc, argv, "--range", "24")), edge = opt_atoi("--edge", opt(argc, argv, "--edge", "4"));
     double dists[32]; int nd = 0; { char *s = strdup(opt(argc, argv, "--dists", "0,10,20,40,80,160")); for (char *t = strtok(s, ","); t && nd < 32; t = strtok(nullptr, ",")) dists[nd++] = atof(t); free(s); }
     int tols[8], nt = 0; { char *s = strdup(opt(argc, argv, "--tols", "2,6")); for (char *t = strtok(s, ","); t && nt < 8; t = strtok(nullptr, ",")) tols[nt++] = atoi(t); free(s); }
     uint64_t seed = strtoull(opt(argc, argv, "--seed", "1"), nullptr, 10) * 0x9E3779B97F4A7C15ull + 1;
@@ -630,18 +631,18 @@ int cmd_dinovol_eval(int argc, char **argv) {
     for (int d = 0; d < 3; d++) { lo[d] = box[d] / stride * stride; hi[d] = ((box[d] + box[3 + d] - 1) / stride + 1) * stride; }
     emb e; if (emb_open(&e, group, oname)) return 1;
     if (e.has_s) { fprintf(stderr, "dinovol-eval: %s has a per-vector scale array; use a unit output (dense, ink, tokens_unit)\n", oname); return 2; }
-    const int C = e.a.C; ccache cc = {.r = &e.a, .n = atoi(opt(argc, argv, "--cache-chunks", "512")), .cb = (size_t)e.a.chunk * e.a.chunk * e.a.chunk * C * e.a.esize};
+    const int C = e.a.C; ccache cc = {.r = &e.a, .n = opt_atoi("--cache-chunks", opt(argc, argv, "--cache-chunks", "512")), .cb = (size_t)e.a.chunk * e.a.chunk * e.a.chunk * C * e.a.esize};
     cc.s = calloc(cc.n, sizeof *cc.s); for (int i = 0; i < cc.n; i++) cc.s[i].key = -1;
     /* results [dist][tol] and |t*| histogram */
     long tot[32] = {0}, hit[32][8] = {{0}}; double sum_abs[32] = {0}; long nskip_ref = 0;
     /* --codes ROOT KEY: a winding code raster (1 + round(18 q) mod 252, 0 empty, 255 conflict; --codes-scale code voxels per embedding voxel, default 2)
        classifies every miss: same wrap but off the surface, the adjacent wrap (+-1 turn), farther wraps, or no label at the best match */
-    g_crad = atoi(opt(argc, argv, "--codes-radius", "2"));   /* code voxels searched around a point (the labels are thin sheets) */
-    const char *cr = opt(argc, argv, "--codes", nullptr); const double csc = atof(opt(argc, argv, "--codes-scale", "2"));
+    g_crad = opt_atoi("--codes-radius", opt(argc, argv, "--codes-radius", "2"));   /* code voxels searched around a point (the labels are thin sheets) */
+    const char *cr = opt(argc, argv, "--codes", nullptr); const double csc = opt_atof("--codes-scale", opt(argc, argv, "--codes-scale", "2"));
     uint8_t *cbuf = nullptr; int64_t corg[3] = {0, 0, 0}, cn[3] = {0, 0, 0};
     long cls[32][6] = {{0}};   /* 0 hit (<= first tol), 1 same wrap off, 2 adjacent, 3 farther, 4 unlabelled at the match, 5 no code at the surface point */
     if (cr) {
-        const char *ck = nullptr; for (int k = 3; k + 2 < argc; k++) if (!strcmp(argv[k], "--codes")) ck = argv[k + 2];
+        const char *ck = nullptr; for (int k = 3; k + 2 < argc; k++) if (!strcmp(argv[k], opt_n("--codes"))) ck = argv[k + 2];
         store *cs = store_open(cr); z3 *cz = cs && ck ? z3_open(cs, ck, nullptr) : nullptr;
         if (!cz) { fprintf(stderr, "dinovol-eval: cannot open the codes %s %s\n", cr, ck ? ck : "(key missing)"); return 1; }
         for (int d = 0; d < 3; d++) { corg[d] = (int64_t)floor(lo[d] * csc); cn[d] = (int64_t)ceil((hi[d] - lo[d]) * csc); }
@@ -661,7 +662,7 @@ int cmd_dinovol_eval(int argc, char **argv) {
 #define FIT_AT(p_) fit_set_W(fsm, (p_)[0] - fo[0], (p_)[1] - fo[1], (p_)[2] - fo[2])
     int nsurf = 0;
     for (int ai = 3; ai < argc; ai++) {
-        if (argv[ai][0] == '-' && argv[ai][1] == '-') { ai += strcmp(argv[ai], "--codes") ? 1 : 2; continue; }
+        if (argv[ai][0] == '-' && argv[ai][1] == '-') { ai += strcmp(argv[ai], opt_n("--codes")) ? 1 : 2; continue; }
         surf_t S = {.sc = sc}; int w2, h2, w3, h3;
         char q[1300];
         snprintf(q, sizeof q, "%s/x.tif", argv[ai]); S.x = read_tif_f32(q, &S.w, &S.h);
@@ -919,14 +920,14 @@ int cmd_dinovol_calib(int argc, char **argv) {
                         "  the upstream dinovol teacher's DINO (CLS) and iBOT (token) heads on crop pairs of our data: H(t), pmax, usage, A-B agreement\n");
         return 2;
     }
-    if (xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
-    xnet_set_budget((size_t)(atof(opt(argc, argv, "--gpu-mem", "9")) * 1e9));
-    const int N = atoi(opt(argc, argv, "--crops", "128")), T = atoi(opt(argc, argv, "--tile", "128")), NT = atoi(opt(argc, argv, "--tokens", "4"));
-    const int SH = atoi(opt(argc, argv, "--shift", "32")) / 8 * 8, iters = atoi(opt(argc, argv, "--sk-iters", "3")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
-    const int maxs = atoi(opt(argc, argv, "--max-sources", "0"));
+    if (xnet_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
+    xnet_set_budget((size_t)(opt_atof("--gpu-mem", opt(argc, argv, "--gpu-mem", "9")) * 1e9));
+    const int N = opt_atoi("--crops", opt(argc, argv, "--crops", "128")), T = opt_atoi("--tile", opt(argc, argv, "--tile", "128")), NT = opt_atoi("--tokens", opt(argc, argv, "--tokens", "4"));
+    const int SH = opt_atoi("--shift", opt(argc, argv, "--shift", "32")) / 8 * 8, iters = opt_atoi("--sk-iters", opt(argc, argv, "--sk-iters", "3")), nth = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8);
+    const int maxs = opt_atoi("--max-sources", opt(argc, argv, "--max-sources", "0"));
     double temps[8]; int nt = 0;
     { char *s = strdup(opt(argc, argv, "--temps", "0.04,0.07")); for (char *t = strtok(s, ","); t && nt < 8; t = strtok(nullptr, ",")) temps[nt++] = atof(t); free(s); }
-    uint64_t rs = (uint64_t)atoll(opt(argc, argv, "--seed", "1")) * 0x9E3779B97F4A7C15ull + 1;
+    uint64_t rs = (uint64_t)opt_atoll("--seed", opt(argc, argv, "--seed", "1")) * 0x9E3779B97F4A7C15ull + 1;
     if (T % 16 || N < 2 || NT < 1) { fprintf(stderr, "dinovol-calib: tile %% 16, crops >= 2, tokens >= 1\n"); return 2; }
     size_t jn = 0; char *jt = read_file(sj, &jn); json *J = jt ? json_parse(jt, jn) : nullptr; free(jt);
     const json *srcs = J ? json_get(J, "sources") : nullptr;
@@ -1041,12 +1042,12 @@ int cmd_dinovol_calib(int argc, char **argv) {
 int cmd_dino_headfit(int argc, char **argv) {
     const char *ck = opt(argc, argv, "--ckpt", nullptr), *tf = opt(argc, argv, "--tokens", nullptr);
     if (!ck || !tf) { fprintf(stderr, "usage: ufsm dino-headfit --ckpt PT --tokens ROWS.f32 [--rows 256] [--input random|proj] [--steps 300] [--lr 1e-3] [--wd 0.04] [--tt 0.04] [--ts 0.1] [--train-last 0] [--gpu 0]\n"); return 2; }
-    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
+    if (nn_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
     dr_head T; float *Th = nullptr; if (dv_head_host(ck, "ibot_head", &T, &Th)) return 1;
     size_t nb = 0; float *tok = read_file(tf, &nb); if (!tok) { fprintf(stderr, "cannot read %s\n", tf); return 1; }
-    const int E = T.Cin, Rall = (int)(nb / 4 / E), R = atoi(opt(argc, argv, "--rows", "256")) < Rall ? atoi(opt(argc, argv, "--rows", "256")) : Rall, K = T.K, B = T.B;
-    const int steps = atoi(opt(argc, argv, "--steps", "300")), every = atoi(opt(argc, argv, "--every", "20")), proj = !strcmp(opt(argc, argv, "--input", "proj"), "proj"), trl = atoi(opt(argc, argv, "--train-last", "0"));
-    const float lr = (float)atof(opt(argc, argv, "--lr", "1e-3")), wd = (float)atof(opt(argc, argv, "--wd", "0.04")), tt = (float)atof(opt(argc, argv, "--tt", "0.04")), ts = (float)atof(opt(argc, argv, "--ts", "0.1"));
+    const int E = T.Cin, Rall = (int)(nb / 4 / E), R = opt_atoi("--rows", opt(argc, argv, "--rows", "256")) < Rall ? opt_atoi("--rows", opt(argc, argv, "--rows", "256")) : Rall, K = T.K, B = T.B;
+    const int steps = opt_atoi("--steps", opt(argc, argv, "--steps", "300")), every = opt_atoi("--every", opt(argc, argv, "--every", "20")), proj = !strcmp(opt(argc, argv, "--input", "proj"), "proj"), trl = opt_atoi("--train-last", opt(argc, argv, "--train-last", "0"));
+    const float lr = (float)opt_atof("--lr", opt(argc, argv, "--lr", "1e-3")), wd = (float)opt_atof("--wd", opt(argc, argv, "--wd", "0.04")), tt = (float)opt_atof("--tt", opt(argc, argv, "--tt", "0.04")), ts = (float)opt_atof("--ts", opt(argc, argv, "--ts", "0.1"));
     /* teacher targets */
     float *TP = nn_malloc(T.n * 4); nn_h2d(TP, Th, T.n * 4);
     float *xt = nn_malloc((size_t)R * E * 4); nn_h2d(xt, tok, (size_t)R * E * 4);

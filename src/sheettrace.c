@@ -17,6 +17,7 @@
    trace peaks on 2-voxel cells claimed by earlier regions' tiles and links to them (rseam). frame.txt = the frame picked for the whole box.
    Coordinates are box voxels (as VC3D patches traced on the box): patch-solve / patch-score read them directly. */
 #include "patchsolve.h"
+#include "optcheck.h"
 #include "tiffw.h"
 #include "imgops.h"
 #include <errno.h>
@@ -30,7 +31,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static const char *st_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *st_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 
 typedef struct { float r; uint8_t p; } st_peak;
 typedef struct {
@@ -304,14 +305,14 @@ static int st_region(st_ctx *C, int64_t y0, int64_t x0, int64_t y1, int64_t x1, 
 int cmd_sheet_trace(int argc, char **argv) {
     long long b[6];
     const char *probp = st_opt(argc, argv, "--prob", nullptr), *axp = st_opt(argc, argv, "--axis", nullptr), *out = st_opt(argc, argv, "--out", nullptr);
-    const double axs = atof(st_opt(argc, argv, "--axis-scale", "1"));
-    int nt = atoi(st_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = (int)sysconf(_SC_NPROCESSORS_ONLN); if (nt > 64) nt = 64;
-    const int nreg = atoi(st_opt(argc, argv, "--regions", "1"));
+    const double axs = opt_atof("--axis-scale", st_opt(argc, argv, "--axis-scale", "1"));
+    int nt = opt_atoi("--threads", st_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = (int)sysconf(_SC_NPROCESSORS_ONLN); if (nt > 64) nt = 64;
+    const int nreg = opt_atoi("--regions", st_opt(argc, argv, "--regions", "1"));
     const char *bs = st_opt(argc, argv, "--box", nullptr);
-    st_ctx C = {.step = atoi(st_opt(argc, argv, "--step", "2")), .thr = atoi(st_opt(argc, argv, "--thr", "64")), .sthr = atoi(st_opt(argc, argv, "--seed-thr", "128")),
-                .minc = atoi(st_opt(argc, argv, "--min-cells", "100")), .tile = atoi(st_opt(argc, argv, "--tile", "0")), .mint = atoi(st_opt(argc, argv, "--min-tile", "32")), .nt = nt,
-                .tol = atof(st_opt(argc, argv, "--tol", "2")), .amb = atof(st_opt(argc, argv, "--amb", "0")), .vs = atof(st_opt(argc, argv, "--vs", "9.596")),
-                .dir = st_opt(argc, argv, "--dir", "auto"), .nms = atof(st_opt(argc, argv, "--nms", "5"))};
+    st_ctx C = {.step = opt_atoi("--step", st_opt(argc, argv, "--step", "2")), .thr = opt_atoi("--thr", st_opt(argc, argv, "--thr", "64")), .sthr = opt_atoi("--seed-thr", st_opt(argc, argv, "--seed-thr", "128")),
+                .minc = opt_atoi("--min-cells", st_opt(argc, argv, "--min-cells", "100")), .tile = opt_atoi("--tile", st_opt(argc, argv, "--tile", "0")), .mint = opt_atoi("--min-tile", st_opt(argc, argv, "--min-tile", "32")), .nt = nt,
+                .tol = opt_atof("--tol", st_opt(argc, argv, "--tol", "2")), .amb = opt_atof("--amb", st_opt(argc, argv, "--amb", "0")), .vs = opt_atof("--vs", st_opt(argc, argv, "--vs", "9.596")),
+                .dir = st_opt(argc, argv, "--dir", "auto"), .nms = opt_atof("--nms", st_opt(argc, argv, "--nms", "5"))};
     if (!probp || !axp || !out || !bs || sscanf(bs, "%lld,%lld,%lld,%lld,%lld,%lld", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6 || axs <= 0 || C.step < 1 || C.tol <= 0 || nreg < 1 || nreg > 16 ||
         (strcmp(C.dir, "auto") && strcmp(C.dir, "radial") && strcmp(C.dir, "par"))) {
         fprintf(stderr, "usage: ufsm sheet-trace --prob P [--prob-key K] --box Z0,Y0,X0,NZ,NY,NX --axis A [--axis-scale S] --out DIR [--vs UM]\n"
@@ -326,8 +327,8 @@ int cmd_sheet_trace(int argc, char **argv) {
     const char *exp_ = st_opt(argc, argv, "--extra", nullptr);   /* second sheet evidence: a code / mask box (sheet = 1..252), e.g. an old spiral raster */
     if (exp_) {
         C.extra = ps_box(exp_, st_opt(argc, argv, "--extra-key", nullptr), st_opt(argc, argv, "--cache", nullptr), o, n, nt); if (!C.extra) return 1;
-        C.extra_p = atoi(st_opt(argc, argv, "--extra-p", "128")); C.extra_sep = atof(st_opt(argc, argv, "--extra-sep", "3"));
-        C.extra_gap = atof(st_opt(argc, argv, "--extra-gap", "1.5"));
+        C.extra_p = opt_atoi("--extra-p", st_opt(argc, argv, "--extra-p", "128")); C.extra_sep = opt_atof("--extra-sep", st_opt(argc, argv, "--extra-sep", "3"));
+        C.extra_gap = opt_atof("--extra-gap", st_opt(argc, argv, "--extra-gap", "1.5"));
     }
     for (int d = 0; d < 3; d++) C.cn[d] = (n[d] + 1) / 2;
     const size_t NCELL = (size_t)(C.cn[0] * C.cn[1] * C.cn[2]); C.cell = malloc(NCELL * 4); if (!C.cell) return 1;

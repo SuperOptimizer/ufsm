@@ -6,6 +6,31 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Build and option hygiene: mini audits cmake + opts (2026-11-14, branch cfgfix-20261114)
+
+CMake (mini/cmake.md 1-6): test-prep now reconfigures the sibling release / verify dir with all of this dir's settings every time
+(UFSM_EXTRA_CFLAGS, UFSM_MARCH, the device / host compiler, PTX ISA, ptxas split; before, a dir configured once kept its settings,
+so a sanitizer verify build ran the python tests against an unsanitized build/ufsm). The host half of every .cu unit is built with
+-ffp-contract=off (nvcc -Xcompiler, clang -Xarch_host); measured: 0 vfmadd in the host code of the strict units before and after
+(nvcc's host pass gets no -march, so no FMA ISA), the flag keeps it so. UFSM_MARCH (native by default) and a `portable` preset
+(x86-64-v3) for binaries copied to other hosts. CFLAGS / CXXFLAGS / CUDAFLAGS from the environment are ignored. return-type,
+implicit-function-declaration, incompatible-pointer-types (not the const-discard subgroup: 5 sites), int-conversion, format and
+uninitialized are errors; the build had none (remaining warnings: 31 missing-field-initializers, 7 unused-but-set, 5 const-discard,
+5 unused). The cgroup CPU quota is rounded up (a 0.5-CPU share gave 0 and fell back to 8 jobs).
+
+Options (mini/opts.md 1-9): src/optcheck.{h,c}, linked into every binary. Every strcmp / strncmp of argv against a "--name" (the
+literal, or the name parameter of the ~90 per-file opt helpers, rewritten mechanically: 137 literal + 115 parameter + 3 prefix sites)
+records the name; main() names the --flags a command never looked up when it returns 0 (train also after its setup, as before, now
+after the sampler-only branch's --replay reads). The 512-name cap is gone (hash set). Numeric option values: 1999 atoi / atof /
+atoll(opt(.., "--n", ..)) calls became opt_atoi / opt_atof / opt_atoll, which exit 2 on a value that is not entirely a number
+("--steps 2e4" trained 2 steps; "--gpus 0,x", "--window 288x"); empty / absent stay 0. Checked: every literal default parses; every
+literal value given to those flags in scripts/, tests/ and README parses (hits were comments or same-named flags of other commands);
+the three flags that also take a word (predict --window auto, train --accum auto, surf-labels --dir auto) parse the number only
+otherwise. Also: train's fibre buffers used a second --P read with default 64 (128^3 boxes for the default 512^3 windows) and now use
+the run's P; --gn-ema-warm / --gn-ema-mom read via opt(); predict --gpus a,b with --fit-zarr is refused unless --split z (--split 0
+passed before); count-field's zarr note follows the wc value; the --gpu-aug / --gpu-input fallbacks print WARNING. tests/test_optcheck
+(smoke). CPU tier on forlindesk: 100 pass, no option warning in any of the 304 test logs; test_seamless fails there for a missing numpy.
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the

@@ -1,6 +1,7 @@
 /* ufsm predict: sliding-window inference of a checkpoint over a CT box, written as a volcomp zarr v3
    probability pyramid (uint8 p*255, q=8) in the published layout. */
 #include "scannorm.h"
+#include "optcheck.h"
 #include "nn.h"
 #include "sysinfo.h"
 #include "checkpoint.h"
@@ -637,7 +638,7 @@ static int writer_finish(writer_t *W) {
     return atomic_load(&W->failed);
 }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 
@@ -1303,7 +1304,7 @@ int cmd_predict(int argc, char **argv) {
         av[ac++] = tok[1];
         for (int i = 2; i < nt; i++) av[ac++] = tok[i];
         av[ac++] = "--box"; av[ac++] = tok[0];
-        for (int i = 6; i < argc; i++) if (strcmp(argv[i], "--boxes")) av[ac++] = argv[i]; else i++;
+        for (int i = 6; i < argc; i++) if (strcmp(argv[i], opt_n("--boxes"))) av[ac++] = argv[i]; else i++;
         av[ac] = nullptr;
         const double tb = now();
         fprintf(stderr, "predict --boxes: box %d: %s -> %s\n", nbox + 1, tok[0], tok[1]);
@@ -1387,12 +1388,12 @@ static int predict_one(int argc, char **argv) {
     const char *ckpt = argv[2], *root = argv[3], *key = argv[4], *out = argv[5];
     { int restore_checkpoint(const char *path, int *split, double *fine_um); int restore_predict(int argc, char **argv);   /* src/restore_cli.c */
       if (restore_checkpoint(ckpt, nullptr, nullptr)) return restore_predict(argc, argv); }   /* task restore: the SR path */
-    double um = atof(opt(argc, argv, "--um", "0"));
-    int level = atoi(opt(argc, argv, "--level", "0")), W = atoi(opt(argc, argv, "--window", "288")), halo = atoi(opt(argc, argv, "--halo", "8"));
+    double um = opt_atof("--um", opt(argc, argv, "--um", "0"));
+    int level = opt_atoi("--level", opt(argc, argv, "--level", "0")), W = strcmp(opt(argc, argv, "--window", "288"), "auto") ? opt_atoi("--window", opt(argc, argv, "--window", "288")) : 288, halo = opt_atoi("--halo", opt(argc, argv, "--halo", "8"));
     /* --um-target U (instead of --level): the pyramid level whose voxel size is nearest U um in octaves (a universal checkpoint at its 9.6 um
        rung over any scan: 2.4 um -> level 2, 7.91 -> 0, 4.8 -> 1); the scale FiLM codes follow the level read */
     if (*opt(argc, argv, "--um-target", "") && !*opt(argc, argv, "--level", "")) {
-        const double ut = atof(opt(argc, argv, "--um-target", "0")), u0 = atof(opt(argc, argv, "--um", "0"));
+        const double ut = opt_atof("--um-target", opt(argc, argv, "--um-target", "0")), u0 = opt_atof("--um", opt(argc, argv, "--um", "0"));
         if (!(ut > 0) || !(u0 > 0)) { fprintf(stderr, "predict: --um-target needs a positive target and --um\n"); return 2; }
         store *s0 = store_open(argv[3]); int best = -1; double bd = 1e30;
         for (int l = 0; s0 && l < 12; l++) { z3 *z = pyramid_open_level(s0, argv[4], l, u0, opt(argc, argv, "--cache", nullptr)); if (!z) continue;
@@ -1401,11 +1402,11 @@ static int predict_one(int argc, char **argv) {
         if (best < 0) { fprintf(stderr, "predict: --um-target: no level of %s opens\n", argv[4]); return 1; }
         level = best; fprintf(stderr, "predict: --um-target %g: level %d (%g um, %.2f octaves off)\n", ut, level, u0 * (1 << level), bd);
     }
-    int shard = atoi(opt(argc, argv, "--shard", "512")), gpu = atoi(opt(argc, argv, "--gpu", "0")), nlev = atoi(opt(argc, argv, "--levels", "4"));
+    int shard = opt_atoi("--shard", opt(argc, argv, "--shard", "512")), gpu = opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")), nlev = opt_atoi("--levels", opt(argc, argv, "--levels", "4"));
     double norm_mean = 0, norm_sd = 0;   /* --norm MEAN,SD: fixed input normalization (uint8 CT units) instead of each window's own mean / sd */
     { const char *nm = opt(argc, argv, "--norm", nullptr);
       if (nm && (sscanf(nm, "%lf,%lf", &norm_mean, &norm_sd) != 2 || !(norm_sd > 0))) { fprintf(stderr, "predict: --norm needs MEAN,SD with SD > 0\n"); return 2; } }
-    const double input_gain = atof(opt(argc, argv, "--input-gain", "1")), input_bias = atof(opt(argc, argv, "--input-bias", "0"));
+    const double input_gain = opt_atof("--input-gain", opt(argc, argv, "--input-gain", "1")), input_bias = opt_atof("--input-bias", opt(argc, argv, "--input-bias", "0"));
     if (!isfinite(input_gain) || input_gain <= 0 || !isfinite(input_bias)) { fprintf(stderr, "predict: --input-gain must be finite and positive; --input-bias finite\n"); return 2; }
     const int input_affine = input_gain != 1 || input_bias != 0;
     char input_attrs[128] = "";
@@ -1420,24 +1421,24 @@ static int predict_one(int argc, char **argv) {
     const int wprod = wauto && wenv && !strcmp(wenv, "prod");
     if (wauto) { W = 640; if (!*opt(argc, argv, "--halo", "")) halo = 64; }
     /* --window-z WZ [--halo-z HZ]: slab windows WZ x W x W (train --Pz nets; HZ default WZ / 4), the plain GPU path only */
-    int Wz = atoi(opt(argc, argv, "--window-z", "0")), hz = atoi(opt(argc, argv, "--halo-z", "-1"));
+    int Wz = opt_atoi("--window-z", opt(argc, argv, "--window-z", "0")), hz = opt_atoi("--halo-z", opt(argc, argv, "--halo-z", "-1"));
     int slab = Wz > 0 && Wz != W;
     if (Wz <= 0) Wz = W;
     if (hz < 0) hz = slab ? Wz / 4 : halo;
     /* --aug-OP-p P [--aug-p P] [--aug-strength S] [--aug-seed N]: degrade every CT window with train's scanner augmentation
        (src/scan_augment.h; seam off) before the network, seeded by the window's origin: robustness of a checkpoint to
        scanner-domain shifts (blur, noise, rings, quantisation, ...) on held-out boxes */
-    scan_aug_cfg dg = {.strength = (float)atof(opt(argc, argv, "--aug-strength", "1")), .drop_ignore = 1};
+    scan_aug_cfg dg = {.strength = (float)opt_atof("--aug-strength", opt(argc, argv, "--aug-strength", "1")), .drop_ignore = 1};
     for (int i = 0; i < SA_N; i++) { char f[48]; snprintf(f, sizeof f, "--aug-%s-p", scan_aug_names[i]); dg.p[i] = (float)atof(opt(argc, argv, f, opt(argc, argv, "--aug-p", "0"))); }
     for (int i = 0; i < SA_N; i++) { char f[48]; snprintf(f, sizeof f, "--aug-%s-s", scan_aug_names[i]); dg.s[i] = (float)atof(opt(argc, argv, f, "0")); }
     if (*opt(argc, argv, "--aug-hist", "") && scan_aug_load_hist(opt(argc, argv, "--aug-hist", ""), &dg)) { fprintf(stderr, "predict: --aug-hist: cannot read the file\n"); return 2; }
     const int degrade = scan_aug_enabled(&dg); const uint64_t dg_seed = strtoull(opt(argc, argv, "--aug-seed", "1"), nullptr, 10);
-    int nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
-    const int use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
+    int nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16);
+    const int use_ema = opt_atoi("--ema", opt(argc, argv, "--ema", "1")) != 0;
     const char *blend_s = opt(argc, argv, "--ema-blend", nullptr);   /* tail-average blend: a x final weights + (1 - a) x EMA (modded-nanogpt 0.35) */
     const float ema_blend = blend_s ? (float)atof(blend_s) : -1.f;
     if (blend_s && !(ema_blend >= 0.f && ema_blend <= 1.f)) { fprintf(stderr, "--ema-blend: 0..1\n"); return 2; }
-    const double radial_sign = atof(opt(argc, argv, "--radial-sign", "1"));   /* -1: reversed direction input (a recto model then marks the verso face) */
+    const double radial_sign = opt_atof("--radial-sign", opt(argc, argv, "--radial-sign", "1"));   /* -1: reversed direction input (a recto model then marks the verso face) */
     if (radial_sign != 1 && radial_sign != -1) { fprintf(stderr, "predict: --radial-sign must be 1 or -1\n"); return 2; }
     const char *chs = opt(argc, argv, "--channel", "0");   /* output channel to write (band_affinity: 1..6 = affinities; "ink": a task unwrap2 --ink-head checkpoint's ink channel) */
     /* --channel rv (train --task unwrap2 --rv checkpoints): both side channels in one pass, written as 1 + 254 (1 + p_recto - p_verso) / 2, 0 where CT 0 */
@@ -1452,10 +1453,10 @@ static int predict_one(int argc, char **argv) {
         if (!q1 || !q2 || !q3 || sscanf(q2 + 10, "%lld,%lld,%lld", lz_org, lz_org + 1, lz_org + 2) != 3 || zr_open(&lzr, lat_store)) { fprintf(stderr, "predict: --latents %s is not a latcomp store (ufsm lc-encode)\n", lat_store); return 2; }
         lz_sraw = atof(q1 + 11); lz_c = atoi(q3 + 8);
         { const char *q4 = strstr(zt, "\"drop_ms\":"); lz_drop = q4 ? atof(q4 + 10) : 0; }   /* (stores before the attribute: no correction) */
-        if (degrade || opt(argc, argv, "--aux", nullptr) || !strcmp(opt(argc, argv, "--split", "0"), "z") || atoi(opt(argc, argv, "--tta", "1")) > 1) {
+        if (degrade || opt(argc, argv, "--aux", nullptr) || !strcmp(opt(argc, argv, "--split", "0"), "z") || opt_atoi("--tta", opt(argc, argv, "--tta", "1")) > 1) {
             fprintf(stderr, "predict: --latents: no --aug-*, --aux, --split or --tta (they read the CT itself)\n"); return 2; }   /* (--fit-ct: the rebuilt CT) */
     }
-    const int fstem_off = atoi(opt(argc, argv, "--fstem-off", "0"));   /* --fstem-off 1: a train --fstem checkpoint without its fine stem (the ablation; the trunk's fast paths stay off) */
+    const int fstem_off = opt_atoi("--fstem-off", opt(argc, argv, "--fstem-off", "0"));   /* --fstem-off 1: a train --fstem checkpoint without its fine stem (the ablation; the trunk's fast paths stay off) */
     int rv2c = -1;   /* train --rv 2 checkpoints: the recto / verso pair on its own channels (rv2c, rv2c + 1), interpolated (never the guided / sub-cell pair) */
     { char *h = checkpoint_header_line(ckpt); const int isrv = h && strstr(h, "\"rv\":{\"version\":1"); const char *r2 = h ? strstr(h, "\"rv\":{\"version\":2,\"recto\":") : nullptr;
       if (r2) rv2c = atoi(r2 + strlen("\"rv\":{\"version\":2,\"recto\":"));
@@ -1467,13 +1468,13 @@ static int predict_one(int argc, char **argv) {
     /* --fit-fields DIR (task unwrap checkpoints: recto 0, ink 1, phase 2-3, normal 4-9, density 10): every head computed, each
        window's interior pooled on the device into the winding fitter's fields (h native voxels per field voxel, --fit-h 8) of the
        box, written to DIR at the end (src/fit.h fit_fields_save). One GPU, the CT window in its own buffer (no aliasing). */
-    const char *ffd = opt(argc, argv, "--fit-fields", nullptr); const int ffh = atoi(opt(argc, argv, "--fit-h", "8"));
+    const char *ffd = opt(argc, argv, "--fit-fields", nullptr); const int ffh = opt_atoi("--fit-h", opt(argc, argv, "--fit-h", "8"));
     const char *ffz = opt(argc, argv, "--fit-zarr", nullptr);   /* the same fields of a whole volume: 10-16 uint8 zarr arrays (ffz_names), flushed slab by slab */
     /* --fit-q Q: volcomp quantiser of the --fit-zarr arrays (0 lossless, 1..255 lossy DCT; default 8); --fit-q-phase: the phase planes
        pc / ps (default 4; was 0, lossless: ~90% of a 21-30 GB whole-scroll store; q 4 makes the phase 28-31x smaller, phase error
        median 0.007 turn; slab fits + fit-join + wrap-check unchanged on PHerc0490B / PHerc1299 / Paris 4 crops, Paris 4 GT ids .1666 vs
        .1668, pairs -0.1..-0.2 pt; ufsm-fieldq-2026-10-30). Old stores load unchanged. */
-    const float ffq = (float)atof(opt(argc, argv, "--fit-q", "8")), ffqp = (float)atof(opt(argc, argv, "--fit-q-phase", "4"));
+    const float ffq = (float)opt_atof("--fit-q", opt(argc, argv, "--fit-q", "8")), ffqp = (float)opt_atof("--fit-q-phase", opt(argc, argv, "--fit-q-phase", "4"));
     if (!(ffq >= 0 && ffq <= 255 && ffqp >= 0 && ffqp <= 255)) { fprintf(stderr, "predict: --fit-q / --fit-q-phase 0..255\n"); return 2; }
     if (ffd && ffz) { fprintf(stderr, "predict: --fit-fields or --fit-zarr\n"); return 2; }
     if ((ffd || ffz) && (ffh < 1 || ffh > 32)) { fprintf(stderr, "--fit-h 1..32\n"); return 2; }   /* (inference aliasing stays on: the fit pooling reads
@@ -1481,25 +1482,25 @@ static int predict_one(int argc, char **argv) {
     if (ffz) ffd = ffz;   /* the shared checks and settings below */
     /* --fit-ct 1: also the CT planes ct (mean CT per cell) and cs (CT sheet spacing: papyrus peaks along the network normal, src/fit_terms.h
        fit_ct_spacing) for fit --w-ct / --w-cspacing; the CT window is copied before the forward when the network aliases it */
-    const int ffct = atoi(opt(argc, argv, "--fit-ct", "0")) != 0;
+    const int ffct = opt_atoi("--fit-ct", opt(argc, argv, "--fit-ct", "0")) != 0;
     if (ffct && !ffd) { fprintf(stderr, "predict: --fit-ct needs --fit-fields or --fit-zarr\n"); return 2; }
     const int ffna = ffct ? 14 : 12;   /* accumulator planes */
     const int ffzm = ffz != nullptr;
     /* --tta K: the fit fields averaged over K window symmetries (src/tta.h; identity first; the probability output is then the last pass);
        without --fit-*: the probability output itself is the mean of the K passes' probabilities (fp16 accumulator, 2 B per window voxel) */
-    const int tta = atoi(opt(argc, argv, "--tta", "1"));
+    const int tta = opt_atoi("--tta", opt(argc, argv, "--tta", "1"));
     /* --skip-empty 1 (DESIGN 2026-11-13 "empty-space skipping", nn.h nn_skip_build): a latent-grid net's wide convs leave the 8^3-cell tiles
        with no CT voxel above --skip-thr (default 40, under the papyrus iso 64; air noise stays below it), dilated by --skip-margin tiles per
        level (default 1), at their bias. An approximation (the net's air outputs are not constant): measured against the dense path there.
        A net trained with --skip-empty (checkpoint key skip_empty, DESIGN 2026-11-14): on by default with the training's threshold, margin
        and levels, so predict / ueval see the net they trained (--skip-empty 0: dense) */
-    int skip_empty = atoi(opt(argc, argv, "--skip-empty", "-1")), skip_thr = atoi(opt(argc, argv, "--skip-thr", "-1")), skip_margin = atoi(opt(argc, argv, "--skip-margin", "-1")), skip_nl = 0;
+    int skip_empty = opt_atoi("--skip-empty", opt(argc, argv, "--skip-empty", "-1")), skip_thr = opt_atoi("--skip-thr", opt(argc, argv, "--skip-thr", "-1")), skip_margin = opt_atoi("--skip-margin", opt(argc, argv, "--skip-margin", "-1")), skip_nl = 0;
     long skip_wins = 0, skip_masked = 0, skip_calls = 0; double skip_share0 = 0;
-    const int fea = atoi(opt(argc, argv, "--feather", "0"));   /* --feather B (above) */
+    const int fea = opt_atoi("--feather", opt(argc, argv, "--feather", "0"));   /* --feather B (above) */
     if (tta < 1 || tta > TTA_MAX) { fprintf(stderr, "predict: --tta 1..%d\n", TTA_MAX); return 2; }
     if (tta > 1 && ffct) { fprintf(stderr, "predict: --tta with --fit-ct is not supported (the CT planes pool one pass); add them later with ufsm ct-fields\n"); return 2; }
-    float q = (float)atof(opt(argc, argv, "--q", "8"));
-    const int iso = atoi(opt(argc, argv, "--iso", "0"));   /* the void cutoff: probability outputs 0 where CT < iso (the fit keeps CT > 0) */
+    float q = (float)opt_atof("--q", opt(argc, argv, "--q", "8"));
+    const int iso = opt_atoi("--iso", opt(argc, argv, "--iso", "0"));   /* the void cutoff: probability outputs 0 where CT < iso (the fit keeps CT > 0) */
     if (iso < 0 || iso > 255) { fprintf(stderr, "--iso: 0..255\n"); return 2; }
     nn_set_pred_iso(iso);
     const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
@@ -1541,7 +1542,7 @@ static int predict_one(int argc, char **argv) {
     const char *sweep_out = opt(argc, argv, "--cond-sweep", nullptr);   /* train --cond checkpoints: conditioned inference (src/sweep.h) */
     if (sweep_out && (cfg.cin != 7 || cfg.cout < 15 || half || sheet_task || ffd)) { fprintf(stderr, "predict: --cond-sweep needs a train --cond checkpoint (7 inputs, 15 outputs), no --fit-fields\n"); return 2; }
     { const char *gl = opt(argc, argv, "--gpus", nullptr);   /* --gpus a,b (workers, not --split): each would write (and fill) the whole field arrays */
-      if (ffd && gl && strchr(gl, ',') && !opt(argc, argv, "--split", nullptr)) {
+      if (ffd && gl && strchr(gl, ',') && strcmp(opt(argc, argv, "--split", "0"), "z")) {   /* (--split 0 / none: not split either; mini audit opts 6) */
           fprintf(stderr, "predict: --gpus with --fit-zarr / --fit-fields is not supported (each worker writes the whole field set): run one predict per GPU on z-halves "
                           "of the box (--grid-origin anchored) and join them with scripts/unroll/fields_cat.sh\n");
           return 2;
@@ -1551,13 +1552,13 @@ static int predict_one(int argc, char **argv) {
        winding mod 4 9-10: no recto; the winding mod 4 pooled into the relative planes dz dy dx dq over --fit-w4-d voxels) */
     const int ffu2 = ffd && checkpoint_unwrap_version(ckpt) == 2;
     const int ff_rec = ffu2 ? -1 : 0, ff_ph = ffu2 ? 0 : 2, ff_nrm = ffu2 ? 2 : 4, ff_den = ffu2 ? 8 : 10, ff_w4 = ffu2 ? 9 : -1;
-    int ffw4d = ffu2 ? atoi(opt(argc, argv, "--fit-w4-d", "32")) : 0;
+    int ffw4d = ffu2 ? opt_atoi("--fit-w4-d", opt(argc, argv, "--fit-w4-d", "32")) : 0;
     float ffds = 32.f; int ffdc = 0;   /* the checkpoint's density code: min(1, density_scale rho), or x / (1 + x) (density_code 1) */
     if (ffd) { FILE *cf = fopen(ckpt, "rb"); char *hb = malloc(1 << 16); size_t nr = cf ? fread(hb, 1, (1 << 16) - 1, cf) : 0; if (cf) fclose(cf); hb[nr] = 0;
                char *e = memchr(hb, '\n', nr); if (e) *e = 0; const char *q = strstr(hb, "\"density_scale\":"); if (q) ffds = (float)atof(q + 16);
                q = strstr(hb, "\"density_code\":"); if (q) ffdc = atoi(q + 15); free(hb); }
     int pap_cond = 0; const int pap = papyrus_checkpoint(ckpt, &pap_cond) == 1;   /* task papyrus: the conditioned nets take the cutoff per window */
-    const double pcut = pap && pap_cond ? atof(opt(argc, argv, "--papyrus-cut", "-1")) : -1;
+    const double pcut = pap && pap_cond ? opt_atof("--papyrus-cut", opt(argc, argv, "--papyrus-cut", "-1")) : -1;
     if (pap && pap_cond && !(pcut >= 0 && pcut <= 255)) { fprintf(stderr, "predict: %s is conditioned on the papyrus cutoff: --papyrus-cut T (raw CT units 0..255, e.g. 80)\n", ckpt); return 2; }
     if (*opt(argc, argv, "--papyrus-cut", "") && !(pap && pap_cond)) { fprintf(stderr, "predict: --papyrus-cut needs a cutoff-conditioned papyrus checkpoint\n"); return 2; }
     char content[96]; if (pap && pcut >= 0) snprintf(content, sizeof content, "papyrus probability at cutoff %g", pcut); else snprintf(content, sizeof content, "%s probability", pap ? "papyrus" : "recto");
@@ -1569,12 +1570,12 @@ static int predict_one(int argc, char **argv) {
     nn_set_gn_stored(!strcmp(gn_stats, "stored"));
     if (win_given && W % (hdiv << (cfg.nlev - 1))) { fprintf(stderr, "window must be divisible by %d\n", hdiv << (cfg.nlev - 1)); return 2; }   /* (the default is chosen below) */
     const int override = *opt(argc, argv, "--prec", "") || *opt(argc, argv, "--fp4", "") || *opt(argc, argv, "--policy", "");
-    int precision = *opt(argc, argv, "--prec", "") ? atoi(opt(argc, argv, "--prec", "1")) : embedded ? runtime.prec : 1;
+    int precision = *opt(argc, argv, "--prec", "") ? opt_atoi("--prec", opt(argc, argv, "--prec", "1")) : embedded ? runtime.prec : 1;
     if (precision < 0 || precision > 4) { fprintf(stderr, "--prec must be 0..4\n"); return 2; }
     nn_set_prec(precision);
     if (nn_set_prec_policy(opt(argc, argv, "--policy", embedded && !override ? runtime.policy : ""))) return 2;
     if (embedded) nn_set_f16(runtime.f16);
-    if (*opt(argc, argv, "--f16", "")) nn_set_f16(atoi(opt(argc, argv, "--f16", "0")) != 0);
+    if (*opt(argc, argv, "--f16", "")) nn_set_f16(opt_atoi("--f16", opt(argc, argv, "--f16", "0")) != 0);
     /* default --fp4 follows how the checkpoint was trained: models trained with fp4 storage (precision.txt next to the
        checkpoint says act_mx4 1) are calibrated for it; 16-bit-trained models keep MX-fp8 storage (fp4 storage shifts
        their best cutoff) */
@@ -1583,20 +1584,20 @@ static int predict_one(int argc, char **argv) {
       strncat(mp, "precision.txt", sizeof mp - strlen(mp) - 1); FILE *mf = fopen(mp, "r");
       if (mf) { char ln[4096]; while (fgets(ln, sizeof ln, mf)) if (strstr(ln, "act_mx4 1")) ckfp4 = 1; fclose(mf); }
       if (ckfp4 && !*opt(argc, argv, "--fp4", "")) fprintf(stderr, "checkpoint trained with fp4 storage (%s): --fp4 1\n", mp); }
-    int mx4 = atoi(opt(argc, argv, "--fp4", ckfp4 ? "1" : "0")) != 0;
+    int mx4 = opt_atoi("--fp4", opt(argc, argv, "--fp4", ckfp4 ? "1" : "0")) != 0;
     int mx8 = embedded ? runtime.act_mx8 : 1;
     if (*opt(argc, argv, "--fp4", "")) { mx8 = !mx4; if (mx4 && !*opt(argc, argv, "--prec", "")) nn_set_prec(3); }
     else if (!embedded && mx4 && !*opt(argc, argv, "--prec", "")) nn_set_prec(3);
-    if (*opt(argc, argv, "--act-mx4", "")) mx4 = atoi(opt(argc, argv, "--act-mx4", "0")) != 0;
-    if (*opt(argc, argv, "--act-mx8", "")) { mx8 = atoi(opt(argc, argv, "--act-mx8", "0")) != 0; if (mx8 && !*opt(argc, argv, "--act-mx4", "")) mx4 = 0; }
+    if (*opt(argc, argv, "--act-mx4", "")) mx4 = opt_atoi("--act-mx4", opt(argc, argv, "--act-mx4", "0")) != 0;
+    if (*opt(argc, argv, "--act-mx8", "")) { mx8 = opt_atoi("--act-mx8", opt(argc, argv, "--act-mx8", "0")) != 0; if (mx8 && !*opt(argc, argv, "--act-mx4", "")) mx4 = 0; }
     unet_set_act_mx4(mx4); unet_set_act_mx8(mx8);
     unet_set_grad_mx8(0);   /* inference has no gradient buffers; restore input precision independently */
-    int input = *opt(argc, argv, "--input-mx", "") ? atoi(opt(argc, argv, "--input-mx", "0")) : embedded ? runtime.input_mx : ufsm_env_on("UFSM_XIN_MX");
+    int input = *opt(argc, argv, "--input-mx", "") ? opt_atoi("--input-mx", opt(argc, argv, "--input-mx", "0")) : embedded ? runtime.input_mx : ufsm_env_on("UFSM_XIN_MX");
     if (input < 0 || input > 1) { fprintf(stderr, "--input-mx must be 0 or 1\n"); return 2; }
-    int input_prec = *opt(argc, argv, "--input-prec", "") ? atoi(opt(argc, argv, "--input-prec", "0")) : embedded ? runtime.input_prec : 0;
+    int input_prec = *opt(argc, argv, "--input-prec", "") ? opt_atoi("--input-prec", opt(argc, argv, "--input-prec", "0")) : embedded ? runtime.input_prec : 0;
     if (input_prec != 0 && input_prec != 4 && input_prec != 8) { fprintf(stderr, "--input-prec must be 0, 4 or 8\n"); return 2; }
     if (*opt(argc, argv, "--input-prec", "") && input_prec) input = 1;
-    if (*opt(argc, argv, "--input-mx", "") && !atoi(opt(argc, argv, "--input-mx", "0"))) input = input_prec = 0;
+    if (*opt(argc, argv, "--input-mx", "") && !opt_atoi("--input-mx", opt(argc, argv, "--input-mx", "0"))) input = input_prec = 0;
     if (unet_set_input_prec(input_prec)) { fprintf(stderr, "--input-prec must be 0, 4 or 8\n"); return 2; }
     unet_set_input_mx(input);
     if (sheet_task) { unet_set_input_mx(0); unet_set_input_prec(0); }
@@ -1624,7 +1625,7 @@ static int predict_one(int argc, char **argv) {
         if (!lat_ok) { fprintf(stderr, "predict --heads: latent-grid (train --lat 4) checkpoints on one GPU's device path (no --feather, --tta, --split, --window-z, --gpus workers)\n"); return 2; }
         char *h = checkpoint_header_line(ckpt); const int bad = phead_parse(hspec, h, &cfg, rv2c, PH, &nph); free(h);
         if (bad) return 2;
-    } else if (lat_ok && (cfg.fstem || rv2c >= 0 || (cfg.lat_guide == 64 && !rvfuse && out_ch < 2)) && !atoi(opt(argc, argv, "--no-out", "0")) && (!getenv("UFSM_PRED_HEADS") || ufsm_env_on("UFSM_PRED_HEADS"))) {
+    } else if (lat_ok && (cfg.fstem || rv2c >= 0 || (cfg.lat_guide == 64 && !rvfuse && out_ch < 2)) && !opt_atoi("--no-out", opt(argc, argv, "--no-out", "0")) && (!getenv("UFSM_PRED_HEADS") || ufsm_env_on("UFSM_PRED_HEADS"))) {
         if (rvfuse) { if (phead_add(PH, &nph, &cfg, "rv", rv2c >= 0 ? rv2c : 0, rv2c >= 0 ? rv2c + 1 : 1, content)) return 2; }
         else if (phead_add(PH, &nph, &cfg, chs, out_ch, -1, content)) return 2;
     }
@@ -1637,7 +1638,7 @@ static int predict_one(int argc, char **argv) {
     if (ffd && out_ch && tta > 1) { fprintf(stderr, "predict: --channel N with --fit-* and --tta: not supported (the probability volume would come from the last symmetry pass)\n"); return 2; }
     if (ffd && (split || ngpu > 1)) { fprintf(stderr, "predict: --fit-fields runs on one GPU\n"); return 2; }   /* (--channel N: the probability volume of channel N beside the fields, e.g. --channel ink) */
     z3 *auxz = nullptr; uint8_t *auxd = nullptr, *auxh = nullptr;   /* --aux ROOT KEY: the fifth input of 5-input checkpoints (train --aux-input) */
-    {   int ai = -1; for (int k = 1; k + 2 < argc; k++) if (!strcmp(argv[k], "--aux")) ai = k;
+    {   int ai = -1; for (int k = 1; k + 2 < argc; k++) if (!strcmp(argv[k], opt_n("--aux"))) ai = k;
         if (cfg.cin == 5 && !half) {
             if (ai < 0) { fprintf(stderr, "predict: %s has a fifth (aux) input: --aux ROOT KEY (the volume on this level's grid)\n", ckpt); return 2; }
             if (split || ngpu > 1) { fprintf(stderr, "predict: --aux runs on one GPU without --split\n"); return 2; }
@@ -1660,7 +1661,7 @@ static int predict_one(int argc, char **argv) {
             if (bad) { fprintf(stderr, "a predict worker failed\n"); return 1; }
             double um_l = um * (1 << level);
             int64_t bn[3]; { long long v[6] = {0, 0, 0, 0, 0, 0}; const char *b = opt(argc, argv, "--box", nullptr); if (!b || sscanf(b, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) { fprintf(stderr, "--gpus needs --box\n"); return 1; } for (int d = 0; d < 3; d++) bn[d] = v[3 + d]; }
-            if (atoi(opt(argc, argv, "--full-grid", "0"))) {   /* the pyramid of the whole grid */
+            if (opt_atoi("--full-grid", opt(argc, argv, "--full-grid", "0"))) {   /* the pyramid of the whole grid */
                 store *ps = store_open(root); z3 *pz = ps ? pyramid_open_level(ps, key, level, um, opt(argc, argv, "--cache", nullptr)) : nullptr;
                 if (!pz) { fprintf(stderr, "cannot open level %d of %s: %s\n", level, key, z3_error()); return 1; }
                 for (int d = 0; d < 3; d++) bn[d] = z3_meta_of(pz)->shape[d];
@@ -1720,12 +1721,12 @@ static int predict_one(int argc, char **argv) {
         /* the network takes the uint8 CT window itself (with in-place slabs the stem builds its input per slab: no 16-bit window) */
         if (!sheet_task && !half && !ufsm_env_on("UFSM_PRED_HOSTPATH")) unet_set_ct_input(uk, 1);
         if (cfg.scale_cond && !(pcut >= 0 && pap_cond == 1)) {   /* voxel-size conditioning: the CT level's voxel size, or --scale-um to override */
-            const double sum_ = atof(opt(argc, argv, "--scale-um", "0"));
+            const double sum_ = opt_atof("--scale-um", opt(argc, argv, "--scale-um", "0"));
             unet_set_scale(uk, sum_ > 0 ? sum_ : um * (1 << level));
         }
         if (cfg.film) {   /* per-level scale FiLM (train --film): codes log2(um / 4.8) of the grid and of the data, both the CT level's voxel size (no zoom);
                              --scale-um / --film-data-um override them (e.g. an upsampled coarse scan: data um its native size) */
-            const double g_ = atof(opt(argc, argv, "--scale-um", "0")), d_ = atof(opt(argc, argv, "--film-data-um", "0")), lu = um * (1 << level);
+            const double g_ = opt_atof("--scale-um", opt(argc, argv, "--scale-um", "0")), d_ = opt_atof("--film-data-um", opt(argc, argv, "--film-data-um", "0")), lu = um * (1 << level);
             const float c[2] = {unet_scale_code(g_ > 0 ? g_ : lu), unet_scale_code(d_ > 0 ? d_ : g_ > 0 ? g_ : lu)};
             unet_set_film(uk, c, cfg.film);
             if (!k) fprintf(stderr, "predict: scale FiLM codes %.3f / %.3f (grid / data um %g / %g)\n", c[0], c[1], g_ > 0 ? g_ : lu, d_ > 0 ? d_ : g_ > 0 ? g_ : lu);
@@ -1754,8 +1755,8 @@ static int predict_one(int argc, char **argv) {
        out to the shard grid), so several boxes and a later whole-volume run fill one zarr. --resume 1 skips the shards listed in
        <out>/predict-done-<level>.txt (one "z y x" line per shard, appended as each is written). --occupancy L skips shards whose
        window footprint is all zero on CT level L (> --level, e.g. 5: the scroll's air outside the mask) */
-    const int fullg = atoi(opt(argc, argv, "--full-grid", "0")) != 0, resume = atoi(opt(argc, argv, "--resume", "0")) != 0;
-    const int occl = atoi(opt(argc, argv, "--occupancy", "-1"));
+    const int fullg = opt_atoi("--full-grid", opt(argc, argv, "--full-grid", "0")) != 0, resume = opt_atoi("--resume", opt(argc, argv, "--resume", "0")) != 0;
+    const int occl = opt_atoi("--occupancy", opt(argc, argv, "--occupancy", "-1"));
     int64_t ash[3] = {bn[0], bn[1], bn[2]}, soff[3] = {0, 0, 0};
     if (fullg) {
         if (sheet_task || ffd || ffz || sweep_out) { fprintf(stderr, "predict: --full-grid writes plain probability volumes only (no --fit-fields / --fit-zarr / sweeps / winding)\n"); return 2; }
@@ -1843,7 +1844,7 @@ static int predict_one(int argc, char **argv) {
         sweep_cfg sw = {.u = u, .ch14 = cfg.cout - 4, .ct = ct, .bo = {bo[0], bo[1], bo[2]}, .bn = {bn[0], bn[1], bn[2]}, .um = um_l, .scale = scale,
                         .ax = &ax, .axis_path = axisf, .axis_flag = (int)radial_sign, .W = W, .halo = halo,
                         .h16 = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8"), .nthreads = nthreads,
-                        .dir = atoi(opt(argc, argv, "--cond-dir", "1")), .reverse = atoi(opt(argc, argv, "--cond-reverse", "0")), .raw = atoi(opt(argc, argv, "--cond-raw", "0")), .out = sweep_out, .ckpt = ckpt};
+                        .dir = opt_atoi("--cond-dir", opt(argc, argv, "--cond-dir", "1")), .reverse = opt_atoi("--cond-reverse", opt(argc, argv, "--cond-reverse", "0")), .raw = opt_atoi("--cond-raw", opt(argc, argv, "--cond-raw", "0")), .out = sweep_out, .ckpt = ckpt};
         fprintf(stderr, "predict: conditioned sweep, window %d, halo %d%s -> %s\n", W, halo, sw.reverse ? ", reversed order" : "", sweep_out);
         return cond_sweep(&sw);
     }
@@ -1853,7 +1854,7 @@ static int predict_one(int argc, char **argv) {
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
     snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"window_z\":%d,\"halo_z\":%d,\"ema\":%d%s%s}}",
              content, ckpt, step, root, ak, (long long)(fullg ? 0 : bo[0]), (long long)(fullg ? 0 : bo[1]), (long long)(fullg ? 0 : bo[2]), W, halo, Wz, hz, use_ema, grid_attrs, input_attrs);
-    const int seam2 = atoi(opt(argc, argv, "--seam-inproc", "0")) != 0;   /* (predict --seamless 2 in-process: the stores are replaced, as the two-process blend does) */
+    const int seam2 = opt_atoi("--seam-inproc", opt(argc, argv, "--seam-inproc", "0")) != 0;   /* (predict --seamless 2 in-process: the stores are replaced, as the two-process blend does) */
     if (seam2) seam_clear_store(out);
     z3w *w = z3w_create(ldir, ash, shard, q, 0, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
@@ -1870,7 +1871,7 @@ static int predict_one(int argc, char **argv) {
         if (fclose(f)) return 1;
     }
     writer_t WR = {0}; WR.w = w; WR.nthreads = nthreads; WR.bytes = (size_t)shard * shard * shard;
-    WR.skip = atoi(opt(argc, argv, "--no-out", "0")) != 0;   /* --no-out 1: the prediction volume's shards are not written (only its metadata; e.g. with --fit-zarr) */
+    WR.skip = opt_atoi("--no-out", opt(argc, argv, "--no-out", "0")) != 0;   /* --no-out 1: the prediction volume's shards are not written (only its metadata; e.g. with --fit-zarr) */
     for (int d = 0; d < 3; d++) WR.off[d] = soff[d];
     WR.donefd = -1;
     char donep[1500]; snprintf(donep, sizeof donep, "%s/predict-done-%s.txt", out, lv);
@@ -2082,7 +2083,7 @@ static int predict_one(int argc, char **argv) {
        does (nn_seam_blend_u8) before the writer. sgo[g]: grid g's first tile in shards from the box origin (0 or 1 per axis) */
     int64_t sgo[2][3] = {{0}};
     if (seam2) {
-        if (!lhm || !gpath || stride != 2 * shard || !fullg || fea || nwork > 1 || resume || slab || sheet_task || (ffd && (!ffzm || tta > 1)) || atoi(opt(argc, argv, "--no-out", "0"))) {   /* (WR.skip is set by every --heads run: the main writer writes nothing) */
+        if (!lhm || !gpath || stride != 2 * shard || !fullg || fea || nwork > 1 || resume || slab || sheet_task || (ffd && (!ffzm || tta > 1)) || opt_atoi("--no-out", opt(argc, argv, "--no-out", "0"))) {   /* (WR.skip is set by every --heads run: the main writer writes nothing) */
             fprintf(stderr, "predict --seam-inproc: the --heads device path, window - 2 halo = 2 shards, --full-grid 1 (no --resume, --feather, --gpus workers, --fit-fields; --fit-zarr from grid 0's windows)\n"); return 2; }
         kss = 2;
         for (int g = 0; g < 2; g++) for (int d = 0; d < 3; d++) { int64_t r = (g * shard - bo[d]) % stride; if (r < 0) r += stride; sgo[g][d] = r / shard; }

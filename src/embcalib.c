@@ -9,6 +9,7 @@
    i.e. the turns by which the fit's b is too high relative to a, plus the planted offset. Output: per D and conf bin, n and P(r right),
    P(|r - right| = 1) (adjacent-sheet picks), plus the share of pairs where the fit itself is off (k != 0). */
 #include "fit.h"
+#include "optcheck.h"
 #include "fit_emb.h"
 #include "store.h"
 #include "zarr3.h"
@@ -17,20 +18,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *copt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *copt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static uint64_t crng;
 static double cu(void) { crng ^= crng << 13; crng ^= crng >> 7; crng ^= crng << 17; return (crng >> 11) / 9007199254740992.0; }
 typedef struct { int di; int r, r0; float conf; double dm, dg; } crec;
 
 int cmd_emb_calib(int argc, char **argv) {
     const char *dir = argc > 2 ? argv[2] : nullptr, *mdir = copt(argc, argv, "--model", nullptr), *eg = copt(argc, argv, "--emb", nullptr);
-    int ci = 0; for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], "--codes")) ci = i;
+    int ci = 0; for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--codes"))) ci = i;
     if (!dir || !mdir || !eg || !ci) {
         fprintf(stderr, "usage: ufsm emb-calib <fields-dir> --model FIT --codes ROOT KEY --emb GROUP [--emb-output tokens_unit] [--n 20000] [--d 16,48,128] [--rmax 2] [--phi 0] [--seed 1] [--out table.tsv] [--ct ROOT KEY --papyrus L [--cache DIR]]\n");
         return 2;
     }
-    const int N = atoi(copt(argc, argv, "--n", "20000")), rmax = atoi(copt(argc, argv, "--rmax", "2")); const double phi = atof(copt(argc, argv, "--phi", "0"));
-    crng = (uint64_t)atoll(copt(argc, argv, "--seed", "1")) * 0x9E3779B97F4A7C15ull + 1;
+    const int N = opt_atoi("--n", copt(argc, argv, "--n", "20000")), rmax = opt_atoi("--rmax", copt(argc, argv, "--rmax", "2")); const double phi = opt_atof("--phi", copt(argc, argv, "--phi", "0"));
+    crng = (uint64_t)opt_atoll("--seed", copt(argc, argv, "--seed", "1")) * 0x9E3779B97F4A7C15ull + 1;
     int D[16], nd = 0; { char *t = strdup(copt(argc, argv, "--d", "16,48,128")); for (char *q = strtok(t, ","); q && nd < 16; q = strtok(nullptr, ",")) D[nd++] = atoi(q); free(t); }
     fit_fields_buf fb; memset(&fb, 0, sizeof fb);
     if (fit_fields_load(dir, 0, 0, 0, &fb)) { fprintf(stderr, "emb-calib: cannot load %s\n", dir); return 1; }
@@ -49,10 +50,10 @@ int cmd_emb_calib(int argc, char **argv) {
     if (nlab < 100) return 1;
     int pad = 0; for (int k = 0; k < nd; k++) if (D[k] > pad) pad = D[k];
     const long long en[3] = {(long long)ceil(ext[0]), (long long)ceil(ext[1]), (long long)ceil(ext[2])};
-    emb_vol *E = emb_vol_open(eg, copt(argc, argv, "--emb-output", "tokens_unit"), fb.origin, en, atof(copt(argc, argv, "--emb-scale", "1")), pad + 32);
+    emb_vol *E = emb_vol_open(eg, copt(argc, argv, "--emb-output", "tokens_unit"), fb.origin, en, opt_atof("--emb-scale", copt(argc, argv, "--emb-scale", "1")), pad + 32);
     if (!E) return 1;
-    for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) {   /* the papyrus gate: votes compare papyrus samples only */
-        const int lv = atoi(copt(argc, argv, "--papyrus", "0")); store *cs = store_open(argv[i + 1]); z3 *cz = cs ? z3_open(cs, argv[i + 2], copt(argc, argv, "--cache", nullptr)) : nullptr;
+    for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--ct"))) {   /* the papyrus gate: votes compare papyrus samples only */
+        const int lv = opt_atoi("--papyrus", copt(argc, argv, "--papyrus", "0")); store *cs = store_open(argv[i + 1]); z3 *cz = cs ? z3_open(cs, argv[i + 2], copt(argc, argv, "--cache", nullptr)) : nullptr;
         if (!cz || lv <= 0 || emb_vol_papyrus_zarr(E, cz, fb.origin, en, pad + 32, lv)) { fprintf(stderr, "emb-calib: --ct ROOT KEY (native level) needs --papyrus L > 0\n"); return 1; }
         z3_close(cz);
     }

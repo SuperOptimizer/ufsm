@@ -7,6 +7,7 @@
          the CT sampled along the network normal (the top eigenvector of the cell's n n^T) over +-R, its papyrus peaks counted
          (fit_ct_profile_spacing), spacing = the distance between the first and last peak / (peaks - 1). It does not use the phase. */
 #include "fit.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "fit_terms.h"
 #include "zarr3.h"
@@ -142,7 +143,7 @@ double fit_ct_profile_spacing(const float *p, int n, double step, double prom) {
 
 /* ---- ufsm ct-fields ---- */
 static const char *copt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 typedef struct {
@@ -231,9 +232,9 @@ int cmd_ct_fields(int argc, char **argv) {
         return 2;
     }
     const char *root = argv[2], *key = argv[3], *dir = argv[4];
-    const double ctum = atof(copt(argc, argv, "--ct-um", "0")), rum = atof(copt(argc, argv, "--radius-um", "200")), prom = atof(copt(argc, argv, "--prom", "1"));
-    const int stride = atoi(copt(argc, argv, "--stride", "2")), nt0 = ufsm_threads(atoi(copt(argc, argv, "--threads", "0")), 8);
-    const double pum = atof(copt(argc, argv, "--parity-um", "150"));
+    const double ctum = opt_atof("--ct-um", copt(argc, argv, "--ct-um", "0")), rum = opt_atof("--radius-um", copt(argc, argv, "--radius-um", "200")), prom = opt_atof("--prom", copt(argc, argv, "--prom", "1"));
+    const int stride = opt_atoi("--stride", copt(argc, argv, "--stride", "2")), nt0 = ufsm_threads(opt_atoi("--threads", copt(argc, argv, "--threads", "0")), 8);
+    const double pum = opt_atof("--parity-um", copt(argc, argv, "--parity-um", "150"));
     if (!(ctum > 0) || stride < 1) { fprintf(stderr, "ct-fields: --ct-um > 0 and --stride >= 1 needed\n"); return 2; }
     z3 *cz = z3_open(store_open(root), key, copt(argc, argv, "--cache", nullptr));
     if (!cz) { fprintf(stderr, "ct-fields: %s\n", z3_error()); return 1; }

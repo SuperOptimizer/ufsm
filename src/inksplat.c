@@ -1,6 +1,7 @@
 /* ufsm ink-splat (inksplat.h): published 2D ink labels -> sparse 3D label zarr on the CT grid, and the depth profile of a 3D ink
    prediction along the labelled surface. */
 #include "inksplat.h"
+#include "optcheck.h"
 #include "dcache.h"
 #include "inkflygpu.h"
 #include "inkmil.h"
@@ -898,9 +899,9 @@ static int splat_points(const inksplat_cfg *c, const char *path, double radius_u
     return splat_pyramid(c, shape0) ? 1 : 0;
 }
 
-static const char *sopt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
-static int sflag(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return 1; return 0; }
-static int sidx(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
+static const char *sopt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
+static int sflag(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], opt_n(k))) return 1; return 0; }
+static int sidx(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], opt_n(k))) return i; return -1; }
 
 int cmd_ink_splat(int argc, char **argv) {
     inksplat_cfg c; inksplat_defaults(&c);
@@ -917,35 +918,35 @@ int cmd_ink_splat(int argc, char **argv) {
     c.out = strcmp(argv[2], "-") ? argv[2] : nullptr;
     c.surface = sopt(argc, argv, "--surface", nullptr); c.labels = sopt(argc, argv, "--labels", nullptr); c.mask = sopt(argc, argv, "--mask", nullptr);
     c.val = sopt(argc, argv, "--val", nullptr); { const char *vm = sopt(argc, argv, "--val-mode", "exclude"); c.val_mode = !c.val ? 0 : !strcmp(vm, "only") ? 2 : !strcmp(vm, "off") ? 0 : 1; }
-    c.ct_root = argv[ci + 1]; c.ct_key = argv[ci + 2]; c.ct_um = atof(sopt(argc, argv, "--ct-um", "0")); c.level = atoi(sopt(argc, argv, "--level", "0"));
-    c.iso = atoi(sopt(argc, argv, "--iso", "1"));
+    c.ct_root = argv[ci + 1]; c.ct_key = argv[ci + 2]; c.ct_um = opt_atof("--ct-um", sopt(argc, argv, "--ct-um", "0")); c.level = opt_atoi("--level", sopt(argc, argv, "--level", "0"));
+    c.iso = opt_atoi("--iso", sopt(argc, argv, "--iso", "1"));
     if (sscanf(sopt(argc, argv, "--band", "-4,4"), "%lf,%lf", &c.band_a, &c.band_b) != 2) { fprintf(stderr, "ink-splat: --band A,B\n"); return 2; }
-    c.layer_vox = atof(sopt(argc, argv, "--layer-vox", "1")); c.flip = sflag(argc, argv, "--flip"); c.thr = atof(sopt(argc, argv, "--thr", "0.5"));
-    c.label_z = atoi(sopt(argc, argv, "--label-z", "-1")); c.mask_z = atoi(sopt(argc, argv, "--mask-z", "-1")); c.label_scale = atof(sopt(argc, argv, "--label-scale", "0"));
+    c.layer_vox = opt_atof("--layer-vox", sopt(argc, argv, "--layer-vox", "1")); c.flip = sflag(argc, argv, "--flip"); c.thr = opt_atof("--thr", sopt(argc, argv, "--thr", "0.5"));
+    c.label_z = opt_atoi("--label-z", sopt(argc, argv, "--label-z", "-1")); c.mask_z = opt_atoi("--mask-z", sopt(argc, argv, "--mask-z", "-1")); c.label_scale = opt_atof("--label-scale", sopt(argc, argv, "--label-scale", "0"));
     if (sscanf(sopt(argc, argv, "--label-offset", "0,0"), "%lf,%lf", c.label_off, c.label_off + 1) != 2) { fprintf(stderr, "ink-splat: --label-offset r,c\n"); return 2; }
     const char *cr = sopt(argc, argv, "--crop", nullptr);
     if (cr && sscanf(cr, "%d,%d,%d,%d", c.crop, c.crop + 1, c.crop + 2, c.crop + 3) != 4) { fprintf(stderr, "ink-splat: --crop c0,r0,w,h\n"); return 2; }
-    c.merge = sflag(argc, argv, "--merge"); c.coarse = atoi(sopt(argc, argv, "--coarse", "-1")); c.name = sopt(argc, argv, "--name", nullptr); c.summary = sopt(argc, argv, "--summary", nullptr); c.preview = sopt(argc, argv, "--preview", nullptr);
-    c.threads = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 6); c.cache = sopt(argc, argv, "--cache", nullptr);
+    c.merge = sflag(argc, argv, "--merge"); c.coarse = opt_atoi("--coarse", sopt(argc, argv, "--coarse", "-1")); c.name = sopt(argc, argv, "--name", nullptr); c.summary = sopt(argc, argv, "--summary", nullptr); c.preview = sopt(argc, argv, "--preview", nullptr);
+    c.threads = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 6); c.cache = sopt(argc, argv, "--cache", nullptr);
     for (int i = 2; i + 1 < argc; i++) {
-        if (strcmp(argv[i], "--exclude")) continue;
+        if (strcmp(argv[i], opt_n("--exclude"))) continue;
         long long b[6];
         if (c.nexcl >= 64 || sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) { fprintf(stderr, "ink-splat: --exclude z,y,x,nz,ny,nx (at most 64)\n"); return 2; }
         for (int d = 0; d < 6; d++) c.excl[c.nexcl][d] = b[d];
         c.nexcl++;
     }
     if (pi >= 0) { if (pi + 2 >= argc) { fprintf(stderr, "ink-splat: --pred ROOT KEY\n"); return 2; } c.pred_root = argv[pi + 1]; c.pred_key = argv[pi + 2]; }
-    c.pred_level = atoi(sopt(argc, argv, "--pred-level", "-1")); c.pred_thr = atoi(sopt(argc, argv, "--pred-thr", "128")); c.pred_skip = atoi(sopt(argc, argv, "--pred-skip", "-1"));
+    c.pred_level = opt_atoi("--pred-level", sopt(argc, argv, "--pred-level", "-1")); c.pred_thr = opt_atoi("--pred-thr", sopt(argc, argv, "--pred-thr", "128")); c.pred_skip = opt_atoi("--pred-skip", sopt(argc, argv, "--pred-skip", "-1"));
     { const char *fa = sopt(argc, argv, "--face", nullptr), *fs = sopt(argc, argv, "--face-search", nullptr);
       if (fa && (sscanf(fa, "%lf,%lf", &c.face_a, &c.face_b) != 2 || c.face_b < c.face_a)) { fprintf(stderr, "ink-splat: --face A,B (A <= B)\n"); return 2; }
       if (fs && (sscanf(fs, "%lf,%lf", &c.face_lo, &c.face_hi) != 2 || c.face_lo > -4 || c.face_hi < 8 || c.face_hi - c.face_lo > 250)) { fprintf(stderr, "ink-splat: --face-search LO,HI (LO <= -4, HI >= 8)\n"); return 2; }
-      c.face = fa != nullptr; c.face_run = atoi(sopt(argc, argv, "--face-run", "3")); c.face_gap = atoi(sopt(argc, argv, "--face-gap", "2"));
+      c.face = fa != nullptr; c.face_run = opt_atoi("--face-run", sopt(argc, argv, "--face-run", "3")); c.face_gap = opt_atoi("--face-gap", sopt(argc, argv, "--face-gap", "2"));
       if (c.face && (c.face_run < 1 || c.face_gap < 1)) { fprintf(stderr, "ink-splat: --face-run / --face-gap >= 1\n"); return 2; } }
-    c.profile = atoi(sopt(argc, argv, "--profile", "0")); c.stride = atoi(sopt(argc, argv, "--stride", "4"));
+    c.profile = opt_atoi("--profile", sopt(argc, argv, "--profile", "0")); c.stride = opt_atoi("--stride", sopt(argc, argv, "--stride", "4"));
     store_global_init();
     if (sflag(argc, argv, "--pyramid-only")) return splat_pyramid_only(&c);
     const char *pts = sopt(argc, argv, "--points", nullptr);
-    if (pts) return splat_points(&c, pts, atof(sopt(argc, argv, "--radius-um", "5")));
+    if (pts) return splat_points(&c, pts, opt_atof("--radius-um", sopt(argc, argv, "--radius-um", "5")));
     if (!c.surface || !c.labels) { fprintf(stderr, "ink-splat: need --surface and --labels (or --points / --pyramid-only)\n"); return 2; }
     return inksplat_run(&c);
 }
@@ -966,19 +967,19 @@ int cmd_ink_score(int argc, char **argv) {
         fprintf(stderr, "usage: ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR] [--row TAG]\n"); return 2;
     }
     ssurf S; if (ssurf_load(&S, surf)) return 1;
-    { const double su = atof(sopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* the mesh voxel size when its meta has none */
-    lsrc LL, LM; const int lz = atoi(sopt(argc, argv, "--label-z", "-1"));
+    { const double su = opt_atof("--surf-um", sopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* the mesh voxel size when its meta has none */
+    lsrc LL, LM; const int lz = opt_atoi("--label-z", sopt(argc, argv, "--label-z", "-1"));
     if (lsrc_open(&LL, lab, lz, cache)) { ssurf_free(&S); return 1; }
     if (msk && lsrc_open(&LM, msk, lz, cache)) { lsrc_close(&LL); ssurf_free(&S); return 1; }
     if (msk && (LM.H != LL.H || LM.W != LL.W)) { fprintf(stderr, "ink-score: mask %lld x %lld != labels %lld x %lld\n", (long long)LM.W, (long long)LM.H, (long long)LL.W, (long long)LL.H); return 1; }
-    double F = atof(sopt(argc, argv, "--label-scale", "0"));
+    double F = opt_atof("--label-scale", sopt(argc, argv, "--label-scale", "0"));
     const double ew = S.w / S.scale, eh = S.h / S.scale;
     if (!(F > 0)) {
         F = 0.5 * (ew / (double)LL.W + eh / (double)LL.H);
         const double p2 = pow(2, round(log2(F))); if (fabs(F - p2) < 0.002 * p2) F = p2;
         if (LL.um > 0 && S.vox_um > 0) F = LL.um / S.vox_um;
     }
-    const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8);
+    const int nth = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 8);
     const size_t np = (size_t)LL.W * LL.H;
     uint8_t *L = malloc(np), *M = msk ? malloc(np) : nullptr;
     if (!L || (msk && !M) || lsrc_read(&LL, 0, 0, LL.H, LL.W, L, nth) || (msk && lsrc_read(&LM, 0, 0, LL.H, LL.W, M, nth))) { fprintf(stderr, "ink-score: label read failed\n"); return 1; }
@@ -987,7 +988,7 @@ int cmd_ink_score(int argc, char **argv) {
     fprintf(stderr, "ink-score: %s: labels %lld x %lld, %.4g canvas px per label px (canvas %.0f x %.0f)\n", S.name, (long long)LL.W, (long long)LL.H, F, ew, eh);
     int rc = 0;
     for (int a = 2; a + 1 < argc; a++) {
-        if (strcmp(argv[a], "--map")) continue;
+        if (strcmp(argv[a], opt_n("--map"))) continue;
         char nm[256]; const char *path = argv[a + 1], *eq = strchr(path, '=');
         if (eq && eq - path < (long)sizeof nm) { snprintf(nm, sizeof nm, "%.*s", (int)(eq - path), path); path = eq + 1; } else snprintf(nm, sizeof nm, "%s", path);
         int mw, mh; uint8_t *mp = img_read_u8(path, &mw, &mh);
@@ -1037,7 +1038,7 @@ int cmd_ink_score(int argc, char **argv) {
 int cmd_ink_vscore(int argc, char **argv) {
     const int gi = sidx(argc, argv, "--gt"), pi = sidx(argc, argv, "--pred");
     const char *bx = sopt(argc, argv, "--box", nullptr), *row = sopt(argc, argv, "--row", nullptr), *cache = sopt(argc, argv, "--cache", nullptr);
-    const int L = atoi(sopt(argc, argv, "--level", "1")), nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8);
+    const int L = opt_atoi("--level", sopt(argc, argv, "--level", "1")), nth = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 8);
     long long b[6];
     if (gi < 0 || pi < 0 || gi + 2 >= argc || pi + 2 >= argc || !bx || sscanf(bx, "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6 || L < 0 || L > 6) {
         fprintf(stderr, "usage: ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx (level-0) [--level 1] [--row TAG] [--threads 8] [--cache DIR]\n"
@@ -1606,18 +1607,18 @@ int cmd_ink_onfly(int argc, char **argv) {
                         "         the on-the-fly ink target over a box\n"); return 2;
     }
     inksplat_cfg c; inksplat_defaults(&c); c.face = 1;
-    c.ct_um = atof(sopt(argc, argv, "--ct-um", "0")); c.level = atoi(sopt(argc, argv, "--level", "1")); c.iso = atoi(sopt(argc, argv, "--iso", "64")); c.cache = sopt(argc, argv, "--cache", nullptr);
+    c.ct_um = opt_atof("--ct-um", sopt(argc, argv, "--ct-um", "0")); c.level = opt_atoi("--level", sopt(argc, argv, "--level", "1")); c.iso = opt_atoi("--iso", sopt(argc, argv, "--iso", "64")); c.cache = sopt(argc, argv, "--cache", nullptr);
     if (sscanf(sopt(argc, argv, "--face", "-6,0"), "%lf,%lf", &c.face_a, &c.face_b) != 2) return 2;
     { const char *vm = sopt(argc, argv, "--val-mode", "exclude"); c.val_mode = !strcmp(vm, "only") ? 2 : !strcmp(vm, "off") ? 0 : 1; }   /* the segments' "validation" rasters */
     const char *hf = sopt(argc, argv, "--holdout-file", nullptr);
     if (hf && inkfly_holdouts(hf, argv[ci + 2], &c)) return 1;
-    const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8);
+    const int nth = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 8);
     store *cs = store_open(argv[ci + 1]); z3 *ct = cs ? pyramid_open_level(cs, argv[ci + 2], c.level, c.ct_um, c.cache) : nullptr;
     if (!ct) { fprintf(stderr, "ink-onfly: CT level %d: %s\n", c.level, z3_error()); return 1; }
     c.ct_root = argv[ci + 1]; c.ct_key = argv[ci + 2];
     const char *dcd = sopt(argc, argv, "--dcache", dcache_default_dir());   /* --dcache DIR | off */
     if (dcd && !strcmp(dcd, "off")) dcd = nullptr;
-    inkfly_cache_budget((size_t)atol(sopt(argc, argv, "--cache-mb", "4096"))); void *hd = nullptr; z3 *z = inkfly_open(ct, argv[2], &c, 0, dcd, &hd);
+    inkfly_cache_budget((size_t)opt_atol("--cache-mb", sopt(argc, argv, "--cache-mb", "4096"))); void *hd = nullptr; z3 *z = inkfly_open(ct, argv[2], &c, 0, dcd, &hd);
     if (!z) return 1;
     if (sflag(argc, argv, "--rays")) {   /* the MIL rays of the box: every supervised pixel vs those without an open face */
         const int L0 = c.level; int64_t ro[3], rn[3]; for (int d = 0; d < 3; d++) { ro[d] = b[d] >> L0; rn[d] = ((b[d] + b[d + 3] + (1 << L0) - 1) >> L0) - ro[d]; }

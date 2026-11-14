@@ -1,6 +1,7 @@
 /* ufsm reg overlay: a coarse-scan plane next to the fine scan resampled onto it through a map (src/reg.h), as one JPEG:
    coarse | fine resampled / checkerboard | magenta-green composite (coarse magenta, fine green: grey where they agree). */
 #include "reg.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "json.h"
 #include "imgops.h"
@@ -12,7 +13,7 @@
 #include <string.h>
 
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 static char *slurp(const char *path, size_t *n) {
@@ -104,7 +105,7 @@ int cmd_reg_overlay(int argc, char **argv) {
         "  [--check 32] [--threads 8] [--cache DIR] [--quality 88]\n"); return 2; }
     rvol *cv, *fv; rmap m; rfield D;
     if (reg_load_map(argv[3], opt(argc, argv, "--cache", nullptr), &cv, &fv, &m, &D)) return 1;
-    ojob j = {0}; j.cv = cv; j.fv = fv; j.m = &m; j.L = atoi(opt(argc, argv, "--level", "1")); j.T = 128;
+    ojob j = {0}; j.cv = cv; j.fv = fv; j.m = &m; j.L = opt_atoi("--level", opt(argc, argv, "--level", "1")); j.T = 128;
     if (j.L >= cv->nl) j.L = cv->nl - 1;
     const char *ax = opt(argc, argv, "--axis", "z"); j.axis = ax[0] == 'z' ? 0 : ax[0] == 'y' ? 1 : 2;
     const double cum = cv->um * (1 << j.L); j.lf = rvol_level_for(fv, cum);
@@ -112,7 +113,7 @@ int cmd_reg_overlay(int argc, char **argv) {
     const int64_t *sh = cv->shape[j.L]; const double f = (double)(1 << j.L);
     /* default plane: the middle of the fine volume's extent along the axis */
     double mid[3]; { const double fm[3] = {fv->shape[0][2] / 2.0, fv->shape[0][1] / 2.0, fv->shape[0][0] / 2.0}; rmap_f2c(&m, fm, mid); }
-    const double at = atof(opt(argc, argv, "--at", "-1")) >= 0 ? atof(opt(argc, argv, "--at", "-1")) : mid[2 - j.axis];
+    const double at = opt_atof("--at", opt(argc, argv, "--at", "-1")) >= 0 ? opt_atof("--at", opt(argc, argv, "--at", "-1")) : mid[2 - j.axis];
     j.p = (int64_t)llround((at + 0.5) / f - 0.5);
     const int ra = j.axis == 0 ? 1 : 0, ca = j.axis == 2 ? 1 : 2;
     j.r0 = 0; j.c0 = 0; j.nr = sh[ra]; j.ncol = sh[ca];
@@ -124,17 +125,17 @@ int cmd_reg_overlay(int argc, char **argv) {
         const int64_t r0 = (int64_t)fmax(0, floor((lo[2 - ra] + 0.5) / f - 0.5)), r1 = (int64_t)fmin(sh[ra] - 1, ceil((hi[2 - ra] + 0.5) / f - 0.5));
         const int64_t c0 = (int64_t)fmax(0, floor((lo[2 - ca] + 0.5) / f - 0.5)), c1 = (int64_t)fmin(sh[ca] - 1, ceil((hi[2 - ca] + 0.5) / f - 0.5));
         j.r0 = r0; j.c0 = c0; j.nr = r1 - r0 + 1; j.ncol = c1 - c0 + 1;
-        const int64_t sz = atoll(opt(argc, argv, "--size", "0"));   /* a centred sz x sz crop of the footprint */
+        const int64_t sz = opt_atoll("--size", opt(argc, argv, "--size", "0"));   /* a centred sz x sz crop of the footprint */
         if (sz > 0) { if (j.nr > sz) { j.r0 += (j.nr - sz) / 2; j.nr = sz; } if (j.ncol > sz) { j.c0 += (j.ncol - sz) / 2; j.ncol = sz; } }
     }
     if (j.nr <= 0 || j.ncol <= 0 || j.nr * j.ncol > 64000000) { fprintf(stderr, "reg overlay: bad plane size %lld x %lld\n", (long long)j.nr, (long long)j.ncol); return 1; }
     const size_t N = (size_t)j.nr * j.ncol;
     j.img_c = calloc(N, sizeof *j.img_c); j.img_f = calloc(N, sizeof *j.img_f);
-    const int nt = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8); pthread_t th[64];
+    const int nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8); pthread_t th[64];
     for (int t = 0; t < nt && t < 64; t++) pthread_create(&th[t], nullptr, ov_worker, &j);
     for (int t = 0; t < nt && t < 64; t++) pthread_join(th[t], nullptr);
     float lc, hc, lf, hf; stretch(j.img_c, N, &lc, &hc); stretch(j.img_f, N, &lf, &hf);
-    const int chk = atoi(opt(argc, argv, "--check", "32")), gap = 8;
+    const int chk = opt_atoi("--check", opt(argc, argv, "--check", "32")), gap = 8;
     const int W = (int)(2 * j.ncol + gap), H = (int)(2 * j.nr + gap);
     uint8_t *rgb = malloc((size_t)W * H * 3); memset(rgb, 255, (size_t)W * H * 3);
     for (int64_t r = 0; r < j.nr; r++) for (int64_t c = 0; c < j.ncol; c++) {
@@ -146,7 +147,7 @@ int cmd_reg_overlay(int argc, char **argv) {
         p = rgb + ((size_t)(r + j.nr + gap) * W + c) * 3; p[0] = p[1] = p[2] = k;
         p = rgb + ((size_t)(r + j.nr + gap) * W + c + j.ncol + gap) * 3; p[0] = a; p[1] = b; p[2] = a;
     }
-    const int rc = jpeg_write_rgb(argv[4], W, H, rgb, atoi(opt(argc, argv, "--quality", "88")));
+    const int rc = jpeg_write_rgb(argv[4], W, H, rgb, opt_atoi("--quality", opt(argc, argv, "--quality", "88")));
     fprintf(stderr, "reg overlay: %s plane %c = %lld at level %d (%.3f um; fine level %d), %lld x %lld px, panels: coarse | fine / checker %d | magenta coarse + green fine\n",
             argv[4], "zyx"[j.axis], (long long)j.p, j.L, cum, j.lf, (long long)j.nr, (long long)j.ncol, chk);
     free(rgb); free(j.img_c); free(j.img_f); free(D.d); rvol_close(cv); rvol_close(fv);

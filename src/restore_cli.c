@@ -3,6 +3,7 @@
      ufsm restore-eval <ckpt> <clean.npy>...   PSNR of the net on clean crops degraded by a fixed recipe (comparison with older runs)
      ufsm restore-stats <root> <key> ...  calibration statistics of a CT box, as stored or after a scanner degradation */
 #include "nn.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "checkpoint.h"
 #include "pyramid.h"
@@ -21,7 +22,7 @@
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 
@@ -83,19 +84,19 @@ int restore_predict(int argc, char **argv) {
     const char *ckpt = argv[2], *root = argv[3], *key = argv[4], *out = argv[5];
     int split = 1; double fine_um = 2.4;
     restore_checkpoint(ckpt, &split, &fine_um);
-    const double um = atof(opt(argc, argv, "--um", "0"));
-    const int level = atoi(opt(argc, argv, "--level", "0")), S = atoi(opt(argc, argv, "--shard", "512")), H = atoi(opt(argc, argv, "--halo", "32"));
+    const double um = opt_atof("--um", opt(argc, argv, "--um", "0"));
+    const int level = opt_atoi("--level", opt(argc, argv, "--level", "0")), S = opt_atoi("--shard", opt(argc, argv, "--shard", "512")), H = opt_atoi("--halo", opt(argc, argv, "--halo", "32"));
     const double sr_scale = restore_checkpoint_scale(ckpt);   /* real-pair nets: x scale of whatever input voxel size */
-    const double out_um = atof(opt(argc, argv, "--out-um", "0")) > 0 ? atof(opt(argc, argv, "--out-um", "0")) : sr_scale > 0 ? um * (1 << level) / sr_scale : fine_um;
-    const float q = (float)atof(opt(argc, argv, "--q", "2"));
-    const int nlev = atoi(opt(argc, argv, "--levels", "1")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16), use_ema = atoi(opt(argc, argv, "--ema", "1")) != 0;
+    const double out_um = opt_atof("--out-um", opt(argc, argv, "--out-um", "0")) > 0 ? opt_atof("--out-um", opt(argc, argv, "--out-um", "0")) : sr_scale > 0 ? um * (1 << level) / sr_scale : fine_um;
+    const float q = (float)opt_atof("--q", opt(argc, argv, "--q", "2"));
+    const int nlev = opt_atoi("--levels", opt(argc, argv, "--levels", "1")), nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16), use_ema = opt_atoi("--ema", opt(argc, argv, "--ema", "1")) != 0;
     if (!(um > 0) || S < 128 || S % 128 || H < 0 || nlev < 1 || nlev > 10 || !(q >= 0)) {
         fprintf(stderr, "usage: ufsm predict <restore ckpt> <root> <ct-group> <out-dir> --um U (the CT's level-0 voxel) [--level L] [--out-um %g] [--box z,y,x,nz,ny,nx (output voxels)]\n"
                         "       [--shard 512] [--halo 32] [--q 2] [--levels 1] [--ema 1] [--gpu 0] [--cache DIR] [--shards FILE (\"sz sy sx\" lines: only these)]\n"
                         "  restores level L of the CT onto the --out-um grid (trilinear input, residual net), uint8 CT in 512^3 shards\n", fine_um);
         return 2;
     }
-    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) { fprintf(stderr, "restore: cannot select the GPU\n"); return 1; }
+    if (nn_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) { fprintf(stderr, "restore: cannot select the GPU\n"); return 1; }
     unet_cfg cfg; unet *u = restore_net(ckpt, use_ema, &cfg);
     if (!u) return 1;
     const int W = S + 2 * H;
@@ -198,8 +199,8 @@ int cmd_restore_eval(int argc, char **argv) {
     const char *fam = opt(argc, argv, "--family", "pyramid");
     int f = -1; for (int k = 0; k < RF_N; k++) if (!strcmp(fam, restore_family_names[k])) f = k;
     if (f < 0) { fprintf(stderr, "--family identity|pyramid|scanner\n"); return 2; }
-    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
-    unet_cfg cfg; unet *u = restore_net(argv[2], atoi(opt(argc, argv, "--ema", "1")) != 0, &cfg);
+    if (nn_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
+    unet_cfg cfg; unet *u = restore_net(argv[2], opt_atoi("--ema", opt(argc, argv, "--ema", "1")) != 0, &cfg);
     if (!u) return 1;
     restore_ranges g; restore_ranges_default(&g);
     double se = 0, sb = 0, sn = 0;
@@ -209,8 +210,8 @@ int cmd_restore_eval(int argc, char **argv) {
         if (!c) { fprintf(stderr, "restore-eval: cannot read %s (uint8 3-D .npy)\n", argv[i]); return 1; }
         const int D = (int)dm[0], Hh = (int)dm[1], Wd = (int)dm[2]; const size_t n = (size_t)D * Hh * Wd;
         if (D % (1 << (cfg.nlev - 1)) || Hh % (1 << (cfg.nlev - 1)) || Wd % (1 << (cfg.nlev - 1))) { fprintf(stderr, "restore-eval: %s: dims must divide by %d\n", argv[i], 1 << (cfg.nlev - 1)); return 2; }
-        restore_recipe r; restore_recipe_draw(&r, f, (uint64_t)atoll(opt(argc, argv, "--seed", "1")) * 7919 + (uint64_t)i, D, Hh, Wd, &g);
-        if (*opt(argc, argv, "--q", "")) r.q = (float)atof(opt(argc, argv, "--q", "0"));
+        restore_recipe r; restore_recipe_draw(&r, f, (uint64_t)opt_atoll("--seed", opt(argc, argv, "--seed", "1")) * 7919 + (uint64_t)i, D, Hh, Wd, &g);
+        if (*opt(argc, argv, "--q", "")) r.q = (float)opt_atof("--q", opt(argc, argv, "--q", "0"));
         const size_t sb_ = restore_scratch_bytes(D, Hh, Wd, 3.f);
         uint8_t *dclean = nn_malloc(n), *dlow = nn_malloc(n); void *dx = nn_malloc(n * 2 * cfg.cin), *scr = nn_malloc(sb_); double *dst = nn_malloc(8 * sizeof(double));
         nn_h2d(dclean, c, n);
@@ -268,7 +269,7 @@ int cmd_restore_stats(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm restore-stats <root> <key> --um U [--level 0] --box z,y,x,nz,ny,nx [--degrade scanner|pyramid --step 3.9 --psf 0.5 --noise 2 --sigvar 0 --corr 0 --edge 0 --q 8 --seed 1] [--out coarse.raw]\n"); return 2; }
     long long v[6]; if (sscanf(opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", v, v + 1, v + 2, v + 3, v + 4, v + 5) != 6) { fprintf(stderr, "--box z,y,x,nz,ny,nx\n"); return 2; }
     store *st = store_open(argv[2]);
-    z3 *ct = st ? pyramid_open_level(st, argv[3], atoi(opt(argc, argv, "--level", "0")), atof(opt(argc, argv, "--um", "1")), opt(argc, argv, "--cache", nullptr)) : nullptr;
+    z3 *ct = st ? pyramid_open_level(st, argv[3], opt_atoi("--level", opt(argc, argv, "--level", "0")), opt_atof("--um", opt(argc, argv, "--um", "1")), opt(argc, argv, "--cache", nullptr)) : nullptr;
     if (!ct) { fprintf(stderr, "restore-stats: cannot open %s/%s\n", argv[2], argv[3]); return 1; }
     const int64_t o[3] = {v[0], v[1], v[2]}, nn3[3] = {v[3], v[4], v[5]};
     const int D = (int)v[3], H = (int)v[4], W = (int)v[5]; const size_t n = (size_t)D * H * W;
@@ -286,22 +287,22 @@ int cmd_restore_stats(int argc, char **argv) {
     { char *t = strdup(opt(argc, argv, "--psf", "0.5")); for (char *q = strtok(t, ","); q && np < 32; q = strtok(nullptr, ",")) pl[np++] = (float)atof(q); free(t); }
     { char *t = strdup(opt(argc, argv, "--noise", "0")); for (char *q = strtok(t, ","); q && nq < 32; q = strtok(nullptr, ",")) nl[nq++] = (float)atof(q); free(t); }
     { char *t = strdup(opt(argc, argv, "--corr", "0")); for (char *q = strtok(t, ","); q && nc < 32; q = strtok(nullptr, ",")) cl[nc++] = (float)atof(q); free(t); }
-    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
-    const float step = (float)atof(opt(argc, argv, "--step", "4"));
+    if (nn_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
+    const float step = (float)opt_atof("--step", opt(argc, argv, "--step", "4"));
     uint8_t *dclean = nn_malloc(n), *dlow = nn_malloc(n);
     const size_t sb = restore_scratch_bytes(D, H, W, fminf(step, 4.f)); void *scr = nn_malloc(sb);
     nn_h2d(dclean, h, n);
     const char *op = opt(argc, argv, "--out", nullptr);
     for (int a1 = 0; a1 < np; a1++) for (int a2 = 0; a2 < nq; a2++) for (int a3 = 0; a3 < nc; a3++) {
         restore_recipe r; memset(&r, 0, sizeof r);
-        r.family = !strcmp(dg, "pyramid") ? RF_PYRAMID : RF_SCANNER; r.gain = r.gamma = 1.f; r.seed = (unsigned)atoi(opt(argc, argv, "--seed", "1"));
+        r.family = !strcmp(dg, "pyramid") ? RF_PYRAMID : RF_SCANNER; r.gain = r.gamma = 1.f; r.seed = (unsigned)opt_atoi("--seed", opt(argc, argv, "--seed", "1"));
         const int dim[3] = {D, H, W};
         for (int a = 0; a < 3; a++) {
             r.small[a] = r.family == RF_PYRAMID ? dim[a] / 4 : (int)lrintf(dim[a] / step); r.step[a] = (float)dim[a] / r.small[a];
             r.psf[a] = pl[a1] * r.step[a]; r.qphase[a] = (int)(r.seed * (a + 3)) & 15;
         }
-        r.box = r.family == RF_PYRAMID; r.q = (float)atof(opt(argc, argv, "--q", r.family == RF_PYRAMID ? "2" : "8"));
-        r.noise = nl[a2]; r.sig_var = (float)atof(opt(argc, argv, "--sigvar", "0")); r.corr = cl[a3]; r.edge = (float)atof(opt(argc, argv, "--edge", "0"));
+        r.box = r.family == RF_PYRAMID; r.q = (float)opt_atof("--q", opt(argc, argv, "--q", r.family == RF_PYRAMID ? "2" : "8"));
+        r.noise = nl[a2]; r.sig_var = (float)opt_atof("--sigvar", opt(argc, argv, "--sigvar", "0")); r.corr = cl[a3]; r.edge = (float)opt_atof("--edge", opt(argc, argv, "--edge", "0"));
         const int sd = r.small[0], sh = r.small[1], sw = r.small[2]; const size_t ns = (size_t)sd * sh * sw;
         uint8_t *dco = nn_malloc(ns), *res = malloc(ns);
         if (nn_restore_degrade(dclean, dlow, D, H, W, &r, scr, sb, dco)) { fprintf(stderr, "restore-stats: scratch\n"); return 1; }

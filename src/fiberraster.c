@@ -16,6 +16,7 @@
    --map's coarse frame (e.g. Paris 4: the 2023 all-lengths tracing through the reg map plus the native 2.4 um Paris4_v1 chains).
    Shards (--shard^3) are independent; --zband limits the z range written (level voxels, widened to whole shards). CPU. */
 #include <math.h>
+#include "optcheck.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -30,8 +31,8 @@
 #include "z3w.h"
 #include "zarr3.h"
 
-static const char *fr_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
-static int fr_opti(int argc, char **argv, const char *k) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return i; return 0; }
+static const char *fr_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
+static int fr_opti(int argc, char **argv, const char *k) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return i; return 0; }
 typedef struct {
     afv *A, *X[4]; int nX, xmap[4]; const fib_set *F, *XF; double (*fbb)[6], (*xbb)[6]; pthread_mutex_t mu; int has_tr; double M[3][4], Mi[3][3]; double sc; const rmap *map;   /* --map: a ufsm reg map (coarse = the AFV's scan) instead of --tr */
     int64_t shape[3]; int S, iso, resume; double rad, guard, ring; z3 *ct; z3w *w[2]; char dir[2][2200]; atomic_long skipped;
@@ -215,15 +216,15 @@ static void *fr_worker(void *arg) {
 }
 
 int cmd_fiber_raster(int argc, char **argv) {
-    fr_job J = {0}; const double um = atof(fr_opt(argc, argv, "--um", "0")); long long sh[3] = {0, 0, 0}; const int ci = fr_opti(argc, argv, "--ct");
+    fr_job J = {0}; const double um = opt_atof("--um", fr_opt(argc, argv, "--um", "0")); long long sh[3] = {0, 0, 0}; const int ci = fr_opti(argc, argv, "--ct");
     const int has_shape = sscanf(fr_opt(argc, argv, "--shape", ""), "%lld,%lld,%lld", &sh[0], &sh[1], &sh[2]) == 3;
     if (argc < 6 || !(um > 0) || (!has_shape && !ci)) {
         fprintf(stderr, "usage: ufsm fiber-raster <fibres.afv|.fib> OUT --um U (--shape Z,Y,X | --ct ROOT KEY [--iso 64]) [--level 0] [--tr T.json | --map reg.json] [--zband Z0,Z1]\n"
                         "       [--radius 2] [--guard 3] [--shard 512] [--threads 4]   H / V fibre mask labels (prob254: OUT/H/<U>, OUT/V/<U>)\n");
         return 2;
     }
-    const int level = atoi(fr_opt(argc, argv, "--level", "0")), nth = atoi(fr_opt(argc, argv, "--threads", "4")); J.S = atoi(fr_opt(argc, argv, "--shard", "512"));
-    J.sc = ldexp(1.0, level); J.rad = atof(fr_opt(argc, argv, "--radius", "2")); J.guard = atof(fr_opt(argc, argv, "--guard", "3")); J.ring = atof(fr_opt(argc, argv, "--ring", "0")); J.resume = atoi(fr_opt(argc, argv, "--resume", "0")); J.iso = atoi(fr_opt(argc, argv, "--iso", "64"));
+    const int level = opt_atoi("--level", fr_opt(argc, argv, "--level", "0")), nth = opt_atoi("--threads", fr_opt(argc, argv, "--threads", "4")); J.S = opt_atoi("--shard", fr_opt(argc, argv, "--shard", "512"));
+    J.sc = ldexp(1.0, level); J.rad = opt_atof("--radius", fr_opt(argc, argv, "--radius", "2")); J.guard = opt_atof("--guard", fr_opt(argc, argv, "--guard", "3")); J.ring = opt_atof("--ring", fr_opt(argc, argv, "--ring", "0")); J.resume = opt_atoi("--resume", fr_opt(argc, argv, "--resume", "0")); J.iso = opt_atoi("--iso", fr_opt(argc, argv, "--iso", "64"));
     if (J.S < 128 || J.S % 128 || !(J.rad > 0) || J.guard < 0 || J.ring < 0 || J.rad + J.guard + J.ring > 15 || nth < 1 || level < 0 || level > 8) { fprintf(stderr, "fiber-raster: bad options (--shard a multiple of 128, radius + guard + ring <= 15)\n"); return 2; }
     if (ci) {
         if (ci + 2 >= argc) { fprintf(stderr, "fiber-raster: --ct ROOT KEY\n"); return 2; }
@@ -446,15 +447,15 @@ int fiber_onfly_open(const char *afvp, const char *extra, const char *mapp, cons
    against stored fiber-raster planes (exit 1 on any). */
 static double fr_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 int cmd_fiber_onfly(int argc, char **argv) {
-    int ci = 0, ri = 0; for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], "--ct") && i + 2 < argc) ci = i; if (!strcmp(argv[i], "--ref") && i + 3 < argc) ri = i; }
+    int ci = 0, ri = 0; for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], opt_n("--ct")) && i + 2 < argc) ci = i; if (!strcmp(argv[i], opt_n("--ref")) && i + 3 < argc) ri = i; }
     if (argc < 3 || !ci) { fprintf(stderr, "usage: ufsm fiber-onfly <fibres.afv|.fib> --ct ROOT KEY [--level 0] [--radius 2 --guard 3 --ring 0 --iso 64 --extra L --map M] [--ref H_ROOT V_ROOT KEY] [--windows 8] [--P 512] [--zband Z0,Z1]\n"); return 2; }
 #define FO(k, d) fr_opt(argc, argv, k, d)
-    const int level = atoi(FO("--level", "0")), nw = atoi(FO("--windows", "8")), P = atoi(FO("--P", "512")); uint64_t seed = (uint64_t)atoll(FO("--seed", "1"));
+    const int level = opt_atoi("--level", FO("--level", "0")), nw = opt_atoi("--windows", FO("--windows", "8")), P = opt_atoi("--P", FO("--P", "512")); uint64_t seed = (uint64_t)opt_atoll("--seed", FO("--seed", "1"));
     store *cs = store_open(argv[ci + 1]); z3 *pl[2];
     z3 *c0 = cs ? z3_open(cs, argv[ci + 2], nullptr) : nullptr; if (!c0) { fprintf(stderr, "fiber-onfly: cannot open the CT %s %s\n", argv[ci + 1], argv[ci + 2]); return 1; }
     const int64_t *sh = z3_meta_of(c0)->shape; int64_t shp[3] = {sh[0], sh[1], sh[2]};
     const double t0 = fr_now();
-    if (fiber_onfly_open(argv[2], FO("--extra", ""), FO("--map", nullptr), FO("--tr", nullptr), atof(FO("--radius", "2")), atof(FO("--guard", "3")), atof(FO("--ring", "0")), atoi(FO("--iso", "64")), level,
+    if (fiber_onfly_open(argv[2], FO("--extra", ""), FO("--map", nullptr), FO("--tr", nullptr), opt_atof("--radius", FO("--radius", "2")), opt_atof("--guard", FO("--guard", "3")), opt_atof("--ring", FO("--ring", "0")), opt_atoi("--iso", FO("--iso", "64")), level,
                          c0, z3_open(cs, argv[ci + 2], nullptr), z3_open(cs, argv[ci + 2], nullptr), pl)) return 1;
     printf("fiber-onfly: opened in %.0f ms (shape %lld %lld %lld)\n", (fr_now() - t0) * 1e3, (long long)shp[0], (long long)shp[1], (long long)shp[2]);
     { const double t1 = fr_now(); int64_t g[3]; uint8_t *bits = nullptr; const int64_t nk = z3_chunk_map(pl[0], g, &bits); free(bits);

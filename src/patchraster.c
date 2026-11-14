@@ -8,6 +8,7 @@
    share within 1/8 and 1/4 turn of it (where the patches sit in the GT's phase convention). --check-only 1 writes nothing.
    LIST: one patch directory per line. */
 #include <dirent.h>
+#include "optcheck.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -23,7 +24,7 @@
 #include "zarr3.h"
 #include "z3w.h"
 
-static const char *pr_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *pr_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static float *pr_tif(const char *path, int *w, int *h) {
     if (tfx_axis_hook && access(path, F_OK)) return tfx_axis_hook(path, w, h);
     tiff *t = tiff_open_file(path); tiff_page pg;
@@ -95,9 +96,9 @@ int cmd_patch_raster(int argc, char **argv) {
     if (sscanf(pr_opt(argc, argv, "--shape", ""), "%lld,%lld,%lld", (long long *)&J.shp[0], (long long *)&J.shp[1], (long long *)&J.shp[2]) != 3) { fprintf(stderr, "patch-raster: --shape Z,Y,X needed\n"); return 2; }
     J.zr[0] = 0; J.zr[1] = J.shp[0];   /* --zrow Z0,Z1: only voxels with z in [Z0, Z1) (rows of shards per run: bounded memory) */
     if (*pr_opt(argc, argv, "--zrow", "") && sscanf(pr_opt(argc, argv, "--zrow", ""), "%lld,%lld", (long long *)&J.zr[0], (long long *)&J.zr[1]) != 2) { fprintf(stderr, "patch-raster: --zrow Z0,Z1\n"); return 2; }
-    for (int i = 1; i + 1 < argc && J.nsk < 16; i++) if (!strcmp(argv[i], "--skip-z") && sscanf(argv[i + 1], "%lld,%lld", (long long *)&J.sk[J.nsk][0], (long long *)&J.sk[J.nsk][1]) == 2) J.nsk++;
-    const double um = atof(pr_opt(argc, argv, "--um", "9.6")); const int code = atoi(pr_opt(argc, argv, "--code", "0")), nt0 = ufsm_threads(atoi(pr_opt(argc, argv, "--threads", "0")), 16);
-    const int conly = atoi(pr_opt(argc, argv, "--check-only", "0"));
+    for (int i = 1; i + 1 < argc && J.nsk < 16; i++) if (!strcmp(argv[i], opt_n("--skip-z")) && sscanf(argv[i + 1], "%lld,%lld", (long long *)&J.sk[J.nsk][0], (long long *)&J.sk[J.nsk][1]) == 2) J.nsk++;
+    const double um = opt_atof("--um", pr_opt(argc, argv, "--um", "9.6")); const int code = opt_atoi("--code", pr_opt(argc, argv, "--code", "0")), nt0 = ufsm_threads(opt_atoi("--threads", pr_opt(argc, argv, "--threads", "0")), 16);
+    const int conly = opt_atoi("--check-only", pr_opt(argc, argv, "--check-only", "0"));
     FILE *f = fopen(list, "r"); if (!f) { fprintf(stderr, "patch-raster: cannot read %s\n", list); return 1; }
     int cap = 1024; J.dirs = malloc(cap * sizeof *J.dirs); char line[1100];
     while (fgets(line, sizeof line, f)) {
@@ -118,7 +119,7 @@ int cmd_patch_raster(int argc, char **argv) {
     qsort(K, N, 8, pr_cmp); size_t M = 0; for (size_t k = 0; k < N; k++) if (!M || K[k] != K[M - 1]) K[M++] = K[k];
     fprintf(stderr, "patch-raster: %d patches (%lld unreadable), %lld quads, %zu shell voxels (%zu before patch overlaps)\n", J.n, (long long)J.nbad, (long long)J.nquad, M, N);
     z3 *ck = nullptr; long long hist[18] = {0}, nck = 0;
-    for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], "--check")) { ck = z3_open(store_open(argv[i + 1]), argv[i + 2], nullptr); if (!ck) { fprintf(stderr, "patch-raster: --check: %s\n", z3_error()); return 1; } }
+    for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--check"))) { ck = z3_open(store_open(argv[i + 1]), argv[i + 2], nullptr); if (!ck) { fprintf(stderr, "patch-raster: --check: %s\n", z3_error()); return 1; } }
     z3w *zw = nullptr;
     if (!conly) {
         char lv[32], ld[1400], at[300]; z3w_level_name(um, lv, sizeof lv); snprintf(ld, sizeof ld, "%s/%s", out, lv);

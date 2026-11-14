@@ -22,6 +22,7 @@
       horizon-based ambient occlusion (16 directions, 24 px); images: light_k.pgm, rti_max / rti_min / rti_range.pgm, ao.pgm,
       normals.ppm, pbr.pgm (light at 135 deg, flat albedo, x AO), pbr_density.pgm (albedo from the near-surface CT). */
 #include "imgops.h"
+#include "optcheck.h"
 #include "reg.h"
 #include "store.h"
 #include "zarr3.h"
@@ -35,7 +36,7 @@
 #include <sys/stat.h>
 
 static const char *popt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 
@@ -430,14 +431,14 @@ __attribute__((weak)) const rmap *reg_map_open(const char *path, const char *cac
 
 int cmd_sheet_pbr(int argc, char **argv) {
     const char *ctr = nullptr, *ctk = nullptr; long long cu = -1, cv = -1, cn = 0;
-    for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) { ctr = argv[i + 1]; ctk = argv[i + 2]; }
+    for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--ct"))) { ctr = argv[i + 1]; ctk = argv[i + 2]; }
     if (argc < 4 || (!ctr && !*popt(argc, argv, "--reg", "")) || sscanf(popt(argc, argv, "--crop", ""), "%lld,%lld,%lld", &cu, &cv, &cn) != 3 || cn < 16) {
         fprintf(stderr, "usage: ufsm sheet-pbr <tifxyz-dir> <out-dir> --ct ROOT KEY --crop U0,V0,N [--ss 1] [--depth 16] [--step 0.25] [--interp tri|cubic]\n"
                         "       [--reg MAP.json (profiles from the map's fine scan; --ct not needed)] [--outward 0|1|-1] [--lights 12] [--elev 15] [--relief 1] [--rough 0.35] [--threads 8] [--cache DIR]\n");
         return 2;
     }
     const char *src = argv[2], *out = argv[3]; mkdir(out, 0755);
-    job J = {0}; J.ss = atoi(popt(argc, argv, "--ss", "1")); J.depth = atof(popt(argc, argv, "--depth", "16")); J.step = atof(popt(argc, argv, "--step", "0.25"));
+    job J = {0}; J.ss = opt_atoi("--ss", popt(argc, argv, "--ss", "1")); J.depth = opt_atof("--depth", popt(argc, argv, "--depth", "16")); J.step = opt_atof("--step", popt(argc, argv, "--step", "0.25"));
     J.fs = 1;
     if (*popt(argc, argv, "--reg", "")) {   /* profiles from the map's fine scan (ufsm reg map JSON: coarse = the mesh's scan) */
         rvol *fv = nullptr; double cum = 0, fum = 0; J.map = reg_map_open ? reg_map_open(popt(argc, argv, "--reg", ""), popt(argc, argv, "--cache", nullptr), &fv, &cum, &fum) : nullptr;
@@ -446,9 +447,9 @@ int cmd_sheet_pbr(int argc, char **argv) {
         if (!*popt(argc, argv, "--depth", "")) J.depth *= J.fs;
         fprintf(stderr, "sheet-pbr: profiles from the fine scan of %s (%g um; %.4f fine voxels per mesh voxel); offsets in fine voxels\n", popt(argc, argv, "--reg", ""), fum, J.fs);
     }
-    J.cubic = !strcmp(popt(argc, argv, "--interp", "tri"), "cubic"); J.win1 = atof(popt(argc, argv, "--win", "6")); J.u0 = cu; J.v0 = cv; J.W = (int)(cn * J.ss); J.K = (int)(2 * J.depth / J.step) + 1;
-    const int nth = atoi(popt(argc, argv, "--threads", "8")); g_nth = nth > 0 ? nth : 1; const int nl = atoi(popt(argc, argv, "--lights", "12"));
-    const double elev = atof(popt(argc, argv, "--elev", "15")) * M_PI / 180, relief = atof(popt(argc, argv, "--relief", "1")), alpha = atof(popt(argc, argv, "--rough", "0.35"));
+    J.cubic = !strcmp(popt(argc, argv, "--interp", "tri"), "cubic"); J.win1 = opt_atof("--win", popt(argc, argv, "--win", "6")); J.u0 = cu; J.v0 = cv; J.W = (int)(cn * J.ss); J.K = (int)(2 * J.depth / J.step) + 1;
+    const int nth = opt_atoi("--threads", popt(argc, argv, "--threads", "8")); g_nth = nth > 0 ? nth : 1; const int nl = opt_atoi("--lights", popt(argc, argv, "--lights", "12"));
+    const double elev = opt_atof("--elev", popt(argc, argv, "--elev", "15")) * M_PI / 180, relief = opt_atof("--relief", popt(argc, argv, "--relief", "1")), alpha = opt_atof("--rough", popt(argc, argv, "--rough", "0.35"));
     if (J.ss < 1 || J.ss > 8 || !(J.step > 0) || J.K > 1024 || nl < 1 || nl > 64) { fprintf(stderr, "sheet-pbr: bad --ss / --step / --depth / --lights\n"); return 2; }
     /* the grid */
     char p[1400]; static const char *nm[3] = {"x", "y", "z"}; float *A[3]; int gw = 0, gh = 0;
@@ -458,7 +459,7 @@ int cmd_sheet_pbr(int argc, char **argv) {
     if (!(scale > 0)) { fprintf(stderr, "sheet-pbr: %s/meta.json has no scale\n", src); return 1; }
     J.G = (sgrid){{A[0], A[1], A[2]}, gw, gh, 1 / scale};
     /* outward sign: the crop's convexity (a turn is concave towards the axis: the chord midpoint lies inward) unless given */
-    J.sgn = 1; int og = atoi(popt(argc, argv, "--outward", "0"));
+    J.sgn = 1; int og = opt_atoi("--outward", popt(argc, argv, "--outward", "0"));
     { double C[3] = {0}, Pc[3], nc[3]; int m = 0;
       for (int y = 0; y < J.W; y += J.W / 16) for (int x = 0; x < J.W; x += J.W / 16) { double P[3], n[3]; if (frame(&J, x, y, P, n)) { for (int k = 0; k < 3; k++) C[k] += P[k]; m++; } }
       if (!m || !frame(&J, J.W / 2, J.W / 2, Pc, nc)) { fprintf(stderr, "sheet-pbr: the crop has no surface at its centre\n"); return 1; }
@@ -543,10 +544,10 @@ int cmd_sheet_pbr(int argc, char **argv) {
         double ra = -15, rb = 5; sscanf(popt(argc, argv, "--recto-range", "-15,5"), "%lf,%lf", &ra, &rb); ra *= J.fs; rb *= J.fs;
         float *lr = malloc((size_t)nc * nc * sizeof *lr), *lv = malloc((size_t)nc * nc * sizeof *lv);
         mlctx MC = {&J, lr, lv, nc, L8, ra, rb}; prows(nc, ml_row, &MC);
-        const double sg = atof(popt(argc, argv, "--face-sigma", "3")), tl = atof(popt(argc, argv, "--face-tol", "3")) * J.fs;
+        const double sg = opt_atof("--face-sigma", popt(argc, argv, "--face-sigma", "3")), tl = opt_atof("--face-tol", popt(argc, argv, "--face-tol", "3")) * J.fs;
         robust_smooth(lr, nc, sg, tl); robust_smooth(lv, nc, sg, tl);
         float *ur = lat_up(lr, nc, L8, J.W), *uv = lat_up(lv, nc, L8, J.W);
-        const double fw = atof(popt(argc, argv, "--face-win", "3")) * J.fs;
+        const double fw = opt_atof("--face-win", popt(argc, argv, "--face-win", "3")) * J.fs;
         for (size_t i = 0; i < NN; i++) { J.cr[i] = ur[i]; J.cvv[i] = uv[i]; J.tp0[i] = (float)fw; }
         free(lr); free(lv); free(ur); free(uv);
     }
@@ -560,12 +561,12 @@ int cmd_sheet_pbr(int argc, char **argv) {
     size_t namb = 0, nmov = 0, n2 = 0;   /* pass-2 (unconstrained) statistics */
     for (size_t i = 0; i < NN; i++) if (J.valid[i] > 0) { n2++; namb += J.amb[i] >= 0.7; }
     size_t ndisagree = 0, ndp = 0;
-    if (atoi(popt(argc, argv, "--dp", "1"))) {
-        const int KD = (int)(atof(popt(argc, argv, "--dp-range", "6")) * J.fs / J.step + 0.5), KE = 2 * KD + 1;
+    if (opt_atoi("--dp", popt(argc, argv, "--dp", "1"))) {
+        const int KD = (int)(opt_atof("--dp-range", popt(argc, argv, "--dp-range", "6")) * J.fs / J.step + 0.5), KE = 2 * KD + 1;
         float *E = malloc(NN * KE * sizeof *E), *rrow = malloc(NN * sizeof *rrow), *rdp = malloc(NN * sizeof *rdp);
         if (!E) { fprintf(stderr, "sheet-pbr: no memory for the DP evidence\n"); return 1; }
         dpectx EC = {&J, E, KD}; prows(J.W, dpe_row, &EC);
-        const double lam = atof(popt(argc, argv, "--dp-lambda", "0.5")), smax = atof(popt(argc, argv, "--dp-step", "1")), mu = atof(popt(argc, argv, "--dp-mu", "0.5"));
+        const double lam = opt_atof("--dp-lambda", popt(argc, argv, "--dp-lambda", "0.5")), smax = opt_atof("--dp-step", popt(argc, argv, "--dp-step", "1")), mu = opt_atof("--dp-mu", popt(argc, argv, "--dp-mu", "0.5"));
         dpctx R1 = {&J, E, KD, lam, smax, 0, nullptr, rrow, 0}; prows(J.W, dp_line, &R1);
         dpctx R2 = {&J, E, KD, lam, smax, mu, rrow, rdp, 1}; prows(J.W, dp_line, &R2);
         for (size_t i = 0; i < NN; i++) if (rdp[i] == rdp[i] && J.r[i] == J.r[i]) { ndp++; ndisagree += fabsf(rdp[i] - J.r[i]) > 1; }
@@ -581,8 +582,8 @@ int cmd_sheet_pbr(int argc, char **argv) {
     }
     /* pass 3, continuity: every sample re-finds its faces within +-cw voxels of the median of its neighbourhood (pass 2 faces), i.e. a
        face may deviate at most cw from its surroundings; samples that moved by more than cw were discontinuous in pass 2 */
-    const double cw = atof(popt(argc, argv, "--cont-win", "1.25")) * J.fs; const int cr2 = (int)(atof(popt(argc, argv, "--cont-r", "3")) * J.ss + 0.5);
-    if (cw > 0 && !atoi(popt(argc, argv, "--dp", "1"))) for (int it = 0; it < 2; it++) {
+    const double cw = opt_atof("--cont-win", popt(argc, argv, "--cont-win", "1.25")) * J.fs; const int cr2 = (int)(opt_atof("--cont-r", popt(argc, argv, "--cont-r", "3")) * J.ss + 0.5);
+    if (cw > 0 && !opt_atoi("--dp", popt(argc, argv, "--dp", "1"))) for (int it = 0; it < 2; it++) {
         float *mr = malloc(NN * sizeof *mr), *mv = malloc(NN * sizeof *mv), *r0 = malloc(NN * sizeof *r0);
         median2d(J.r, mr, J.W, cr2); median2d(J.v, mv, J.W, cr2); memcpy(r0, J.r, NN * sizeof *r0);
         for (size_t i = 0; i < NN; i++) { J.cr[i] = mr[i]; J.cvv[i] = mv[i]; J.tp0[i] = (float)cw; }
@@ -597,7 +598,7 @@ int cmd_sheet_pbr(int argc, char **argv) {
                     "pass-2 recto more than %.2f voxels from its neighbourhood median %.1f %%; found after the continuity passes %.1f %%\n",
             100.0 * n2 / NN, n2 ? 100.0 * namb / n2 : 0, cw, n2 ? 100.0 * nmov / n2 : 0, 100.0 * nv / NN);
     float *hlab = nullptr, *hoff = nullptr, *hdr = nullptr; size_t nlab = 0, nink = 0; double dsum = 0, dabs = 0;
-    for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], "--labels")) {
+    for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--labels"))) {
         lbctx LC = {&J, {0}, J.depth / J.fs, J.r, nullptr, nullptr};
         double lo[3] = {1e30, 1e30, 1e30}, hi[3] = {-1e30, -1e30, -1e30};
         for (int y = 0; y <= J.W; y += 8) for (int x = 0; x <= J.W; x += 8) { double P[3], Du[3], Dv[3];

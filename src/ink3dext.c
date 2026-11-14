@@ -15,6 +15,7 @@
    replaces the old one, unknown keeps it). Work: per 9.6 shard, y / x bands of --band 4.8 voxels, crop rows streamed in z through
    a ring of 128 output rows on the GPU; crops shared by two bands / shards are recomputed. */
 #include "ink3dext.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "store.h"
 #include "xnet.h"
@@ -32,7 +33,7 @@
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 static int write_file(const char *dir, const char *name, const void *p, size_t n) {
@@ -74,7 +75,7 @@ static void crop_copy(const uint8_t *base, size_t sy, size_t sx, uint8_t *dst) {
 /* --raw-in: N parents (u8 [N][256^3]) through the network (parity) */
 static int raw_mode(gb_net *net, int argc, char **argv) {
     const char *in = opt(argc, argv, "--raw-in", nullptr), *out = opt(argc, argv, "--raw-out", nullptr);
-    const int N = atoi(opt(argc, argv, "--raw-n", "1")), reps = atoi(opt(argc, argv, "--reps", "1"));
+    const int N = opt_atoi("--raw-n", opt(argc, argv, "--raw-n", "1")), reps = opt_atoi("--reps", opt(argc, argv, "--reps", "1"));
     if (!in || !out || N < 1) { fprintf(stderr, "ink3d-ext --raw-in PARENTS.u8 --raw-n N --raw-out DIR\n"); return 2; }
     const size_t pv = (size_t)G.parent * G.parent * G.parent, cv = (size_t)G.crop * G.crop * G.crop, ov = (size_t)G.out * G.out * G.out;
     uint8_t *u = malloc(pv * N), *crops = malloc(cv * N); float *lut = malloc(sizeof(float) * 256 * N), *lg = malloc(ov * 4 * N);
@@ -297,15 +298,15 @@ int cmd_ink3d_ext(int argc, char **argv) {
                         "  ufsm ink3d-ext --weights W --raw-in PARENTS.u8 --raw-n N --raw-out DIR   N 256^3 parents -> logits.f32 [N][64^3] (parity)\n");
         return 2;
     }
-    if (xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
-    if (opt(argc, argv, "--gpu-mem", nullptr)) xnet_set_budget((size_t)(atof(opt(argc, argv, "--gpu-mem", "8")) * 1e9));
+    if (xnet_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
+    if (opt(argc, argv, "--gpu-mem", nullptr)) xnet_set_budget((size_t)(opt_atof("--gpu-mem", opt(argc, argv, "--gpu-mem", "8")) * 1e9));
     gb_net *net = gb_load(wts, model, &G); if (!net) return 1;
     if (opt(argc, argv, "--raw-in", nullptr)) { const int rc = raw_mode(net, argc, argv); gb_free(net); return rc; }
 
     const char *root = nullptr, *key = nullptr, *out = opt(argc, argv, "--out", nullptr);
-    for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) { root = argv[i + 1]; key = argv[i + 2]; }
+    for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--ct"))) { root = argv[i + 1]; key = argv[i + 2]; }
     if (!root) { fprintf(stderr, "ink3d-ext: --ct ROOT KEY\n"); return 2; }
-    const double ctum = atof(opt(argc, argv, "--ct-um", "2.4"));
+    const double ctum = opt_atof("--ct-um", opt(argc, argv, "--ct-um", "2.4"));
     const char *ous = opt(argc, argv, "--out-um", nullptr);
     int want48 = 0, want96 = 0;
     if (!ous) want96 = 1;
@@ -316,17 +317,17 @@ int cmd_ink3d_ext(int argc, char **argv) {
         p = *e == ',' ? e + 1 : e;
     }
     run_ctx C = {0};
-    C.nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8); C.B = atoi(opt(argc, argv, "--batch", G.crop > 128 ? "1" : "16")); C.air = atoi(opt(argc, argv, "--air", "25"));
+    C.nth = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8); C.B = opt_atoi("--batch", opt(argc, argv, "--batch", G.crop > 128 ? "1" : "16")); C.air = opt_atoi("--air", opt(argc, argv, "--air", "25"));
     C.R = G.out > 128 ? G.out : 128; C.net = net;
     char sdef[16]; snprintf(sdef, sizeof sdef, "%d", G.out / 2);   /* half overlap (gambiarra 32, dino3d 64) */
-    const int SH = 512, band = atoi(opt(argc, argv, "--band", "1024")), stride = atoi(opt(argc, argv, "--stride", sdef));
-    const float oq = (float)atof(opt(argc, argv, "--q", "0"));   /* output volcomp q (0 = lossless; a rerun must keep the group's q) */
+    const int SH = 512, band = opt_atoi("--band", opt(argc, argv, "--band", "1024")), stride = opt_atoi("--stride", opt(argc, argv, "--stride", sdef));
+    const float oq = (float)opt_atof("--q", opt(argc, argv, "--q", "0"));   /* output volcomp q (0 = lossless; a rerun must keep the group's q) */
     if (stride < 1 || stride > G.out) { fprintf(stderr, "ink3d-ext: --stride in 1 .. %d\n", G.out); return 2; }
     if (C.nth < 1) C.nth = 1;
     if (C.B < 1 || band < 64 || band % 2 || band > 2 * SH) { fprintf(stderr, "ink3d-ext: --batch >= 1, --band even in 64 .. %d\n", 2 * SH); return 2; }
     store *st = store_open(root); C.ct = st ? z3_open(st, key, opt(argc, argv, "--cache", nullptr)) : nullptr;
     if (!C.ct) { fprintf(stderr, "ink3d-ext: %s %s: %s\n", root, key, z3_error()); return 1; }
-    C.l1 = atoi(opt(argc, argv, "--ct-l1", "0"));   /* KEY is level 1 (4.8 um: the network's own input scale); box still in level-0 voxels */
+    C.l1 = opt_atoi("--ct-l1", opt(argc, argv, "--ct-l1", "0"));   /* KEY is level 1 (4.8 um: the network's own input scale); box still in level-0 voxels */
     int64_t V[3];
     for (int a = 0; a < 3; a++) V[a] = (C.l1 ? 2 : 1) * z3_meta_of(C.ct)->shape[a];
     long long bv[6]; const char *box = opt(argc, argv, "--box", nullptr);
@@ -345,7 +346,7 @@ int cmd_ink3d_ext(int argc, char **argv) {
             (long long)r48[0][2], (long long)r48[1][2], C.nA[0], C.nA[1], C.nA[2], C.B, band, C.air);
 
     if (opt(argc, argv, "--surface", nullptr)) {   /* the 4.8 um blocks (mb^3) within --surf-margin of any surface vertex */
-        const int marg = atoi(opt(argc, argv, "--surf-margin", "16")); C.mb = 16;
+        const int marg = opt_atoi("--surf-margin", opt(argc, argv, "--surf-margin", "16")); C.mb = 16;
         for (int a = 0; a < 3; a++) { C.m0[a] = r48[0][a]; C.mn[a] = (r48[1][a] - r48[0][a] + C.mb - 1) / C.mb; }
         C.mask = calloc((size_t)C.mn[0] * C.mn[1] * C.mn[2], 1);
         char sl[4096]; snprintf(sl, sizeof sl, "%s", opt(argc, argv, "--surface", "")); size_t nb = 0, npt = 0;
@@ -469,8 +470,8 @@ int cmd_vol_cmp(int argc, char **argv) {
                         "         [--threads 8] [--cache DIR]   uint8 volumes (zarr v3 / v2): correlations + value mapping over the jointly known voxels\n");
         return 2;
     }
-    const int au = atoi(opt(argc, argv, "--a-unknown", "255")), bu = atoi(opt(argc, argv, "--b-unknown", "-1")), bf = atoi(opt(argc, argv, "--b-floor", "-1"));
-    const int nb = atoi(opt(argc, argv, "--bins", "16")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8); const char *cache = opt(argc, argv, "--cache", nullptr);
+    const int au = opt_atoi("--a-unknown", opt(argc, argv, "--a-unknown", "255")), bu = opt_atoi("--b-unknown", opt(argc, argv, "--b-unknown", "-1")), bf = opt_atoi("--b-floor", opt(argc, argv, "--b-floor", "-1"));
+    const int nb = opt_atoi("--bins", opt(argc, argv, "--bins", "16")), nth = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8); const char *cache = opt(argc, argv, "--cache", nullptr);
     vsrc A = {0}, Bv = {0};
     if (vsrc_open(&A, argv[2], argv[3], cache)) { fprintf(stderr, "vol-cmp: %s %s: %s %s\n", argv[2], argv[3], z3_error(), z2_error()); return 1; }
     if (vsrc_open(&Bv, argv[4], argv[5], cache)) { fprintf(stderr, "vol-cmp: %s %s: %s %s\n", argv[4], argv[5], z3_error(), z2_error()); return 1; }

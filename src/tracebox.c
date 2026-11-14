@@ -17,6 +17,7 @@
                   unwrapped about the patch's circular mean), matched-weighted over patches
      --tsv: patch, voxels, near (L1 <= 8), matched, purity, dominant sheet. */
 #include "patchsolve.h"
+#include "optcheck.h"
 #include "band_onfly.h"
 #include <errno.h>
 #include <math.h>
@@ -28,7 +29,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static const char *tb_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *tb_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static int tb_box(const char *s, int64_t o[3], int64_t n[3]) {
     long long b[6]; if (!s || sscanf(s, "%lld,%lld,%lld,%lld,%lld,%lld", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return -1;
     for (int d = 0; d < 3; d++) { o[d] = b[d]; n[d] = b[3 + d]; if (n[d] <= 0) return -1; }
@@ -68,11 +69,11 @@ int cmd_trace_prep(int argc, char **argv) {
     int64_t o[3], n[3];
     const char *probp = tb_opt(argc, argv, "--prob", nullptr), *axp = tb_opt(argc, argv, "--axis", nullptr), *out = tb_opt(argc, argv, "--out", nullptr);
     const char *field = tb_opt(argc, argv, "--field", "ridge");
-    const double axs = atof(tb_opt(argc, argv, "--axis-scale", "1")), vs = atof(tb_opt(argc, argv, "--vs", "9.596"));
-    const int levels = atoi(tb_opt(argc, argv, "--levels", "4")), nseed = atoi(tb_opt(argc, argv, "--seeds", "64")), margin = atoi(tb_opt(argc, argv, "--margin", "64")),
-              zstep = atoi(tb_opt(argc, argv, "--zstep", "32"));
+    const double axs = opt_atof("--axis-scale", tb_opt(argc, argv, "--axis-scale", "1")), vs = opt_atof("--vs", tb_opt(argc, argv, "--vs", "9.596"));
+    const int levels = opt_atoi("--levels", tb_opt(argc, argv, "--levels", "4")), nseed = opt_atoi("--seeds", tb_opt(argc, argv, "--seeds", "64")), margin = opt_atoi("--margin", tb_opt(argc, argv, "--margin", "64")),
+              zstep = opt_atoi("--zstep", tb_opt(argc, argv, "--zstep", "32"));
     uint64_t rs = strtoull(tb_opt(argc, argv, "--rng", "2"), nullptr, 10);
-    int nt = atoi(tb_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    int nt = opt_atoi("--threads", tb_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (!probp || !axp || !out || tb_box(tb_opt(argc, argv, "--box", nullptr), o, n) || axs <= 0 || levels < 1 || levels > 8 || zstep < 1 ||
         (strcmp(field, "ridge") && strcmp(field, "prob"))) {
         fprintf(stderr, "usage: ufsm trace-prep --prob P [--prob-key K] --box Z0,Y0,X0,NZ,NY,NX --axis A [--axis-scale S] --out DIR [--vs UM]\n"
@@ -161,8 +162,8 @@ static int tb_namecmp(const void *a, const void *b) { return strcmp((const char 
 int cmd_patch_score(int argc, char **argv) {
     int64_t o[3], n[3];
     const char *paths = tb_opt(argc, argv, "--paths", nullptr), *gtp = tb_opt(argc, argv, "--gt", nullptr), *axp = tb_opt(argc, argv, "--axis", nullptr), *tsv = tb_opt(argc, argv, "--tsv", nullptr);
-    const double axs = atof(tb_opt(argc, argv, "--axis-scale", "1")), sgn = atof(tb_opt(argc, argv, "--sgn", "1"));
-    int nt = atoi(tb_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    const double axs = opt_atof("--axis-scale", tb_opt(argc, argv, "--axis-scale", "1")), sgn = opt_atof("--sgn", tb_opt(argc, argv, "--sgn", "1"));
+    int nt = opt_atoi("--threads", tb_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = (int)sysconf(_SC_NPROCESSORS_ONLN);
     const char *mapname = tb_opt(argc, argv, "--map", nullptr);
     if (!paths || !gtp || !axp || tb_box(tb_opt(argc, argv, "--box", nullptr), o, n) || axs <= 0) {
         fprintf(stderr, "usage: ufsm patch-score --paths DIR --gt G [--gt-key K] --box Z0,Y0,X0,NZ,NY,NX --axis A [--axis-scale S] [--sgn +-1] [--tsv OUT]\n");
@@ -216,7 +217,7 @@ int cmd_patch_score(int argc, char **argv) {
         }
         #undef PUSH
         if (mapname && !strcmp(mapname, names[pi])) {   /* --map: GT sheet (mod 14, as a-n; . no GT within 1, ' ' invalid) per grid vertex, every --map-step */
-            const int ms = atoi(tb_opt(argc, argv, "--map-step", "2"));
+            const int ms = opt_atoi("--map-step", tb_opt(argc, argv, "--map-step", "2"));
             for (int r = 0; r < H; r += ms) {
                 for (int c = 0; c < W; c += ms) {
                     const size_t qq = (size_t)r * W + c; char ch = ' ';
@@ -296,12 +297,12 @@ int cmd_raw2jpg(int argc, char **argv) {
     if (argc < 6) { fprintf(stderr, "usage: ufsm raw2jpg IN.raw W H OUT.jpg [--rgb] [--mark Y,X]..\n"); return 2; }
     const int W = atoi(argv[3]), H = atoi(argv[4]); if (W <= 0 || H <= 0) return 2;
     uint8_t *g = malloc((size_t)W * H), *rgb = malloc((size_t)W * H * 3); if (!g || !rgb) return 1;
-    int rgbin = 0; for (int i = 6; i < argc; i++) rgbin |= !strcmp(argv[i], "--rgb");
+    int rgbin = 0; for (int i = 6; i < argc; i++) rgbin |= !strcmp(argv[i], opt_n("--rgb"));
     const size_t want = (size_t)W * H * (rgbin ? 3 : 1);
     FILE *f = fopen(argv[2], "rb"); const size_t got = f ? fread(rgbin ? rgb : g, 1, want, f) : 0; if (f) fclose(f);
     if (got != want) { fprintf(stderr, "raw2jpg: %s: expected %zu bytes\n", argv[2], want); return 1; }
     if (!rgbin) for (size_t i = 0; i < (size_t)W * H; i++) rgb[3 * i] = rgb[3 * i + 1] = rgb[3 * i + 2] = g[i];
-    for (int i = 6; i + 1 < argc; i++) if (!strcmp(argv[i], "--mark")) {
+    for (int i = 6; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n("--mark"))) {
         int y, x; if (sscanf(argv[i + 1], "%d,%d", &y, &x) != 2) continue;
         for (int d = -8; d <= 8; d++) {
             if (y >= 0 && y < H && x + d >= 0 && x + d < W) { uint8_t *p = rgb + 3 * ((size_t)y * W + x + d); p[0] = 255; p[1] = p[2] = 0; }
@@ -319,8 +320,8 @@ int cmd_raw2jpg(int argc, char **argv) {
 int cmd_gt_support(int argc, char **argv) {
     int64_t o[3], n[3];
     const char *gtp = tb_opt(argc, argv, "--gt", nullptr), *probp = tb_opt(argc, argv, "--prob", nullptr), *axp = tb_opt(argc, argv, "--axis", nullptr);
-    const double axs = atof(tb_opt(argc, argv, "--axis-scale", "1"));
-    int nt = atoi(tb_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    const double axs = opt_atof("--axis-scale", tb_opt(argc, argv, "--axis-scale", "1"));
+    int nt = opt_atoi("--threads", tb_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (!gtp || !probp || !axp || tb_box(tb_opt(argc, argv, "--box", nullptr), o, n) || axs <= 0) {
         fprintf(stderr, "usage: ufsm gt-support --gt G [--gt-key K] --prob P [--prob-key K] --box Z0,Y0,X0,NZ,NY,NX --axis A [--axis-scale S] [--frame F]\n"); return 2;
     }
@@ -531,9 +532,9 @@ static void *gg_work(void *arg) {
 int cmd_gt_gate(int argc, char **argv) {
     const char *gtr = tb_opt(argc, argv, "--gt", nullptr), *gtk = tb_opt(argc, argv, "--gt-key", nullptr), *pr = tb_opt(argc, argv, "--prob", nullptr),
                *pk = tb_opt(argc, argv, "--prob-key", nullptr), *axp = tb_opt(argc, argv, "--axis", nullptr), *out = tb_opt(argc, argv, "--out", nullptr), *cache = tb_opt(argc, argv, "--cache", nullptr);
-    gg_job J = {.axp = axp, .axs = atof(tb_opt(argc, argv, "--axis-scale", "1")), .cell = atoi(tb_opt(argc, argv, "--cell", "64")), .minn = atoi(tb_opt(argc, argv, "--min-n", "200")),
-                .mins = atof(tb_opt(argc, argv, "--min-support", "0.75")), .skip = atoi(tb_opt(argc, argv, "--skip-check", "0")), .supr = atoi(tb_opt(argc, argv, "--sup-r", "2")), .dir = tb_opt(argc, argv, "--dir", "auto"), .odeg = atof(tb_opt(argc, argv, "--orient-deg", "0")), .interval = atoi(tb_opt(argc, argv, "--interval", "0"))};
-    const int jobs = atoi(tb_opt(argc, argv, "--jobs", "8"));
+    gg_job J = {.axp = axp, .axs = opt_atof("--axis-scale", tb_opt(argc, argv, "--axis-scale", "1")), .cell = opt_atoi("--cell", tb_opt(argc, argv, "--cell", "64")), .minn = opt_atoi("--min-n", tb_opt(argc, argv, "--min-n", "200")),
+                .mins = opt_atof("--min-support", tb_opt(argc, argv, "--min-support", "0.75")), .skip = opt_atoi("--skip-check", tb_opt(argc, argv, "--skip-check", "0")), .supr = opt_atoi("--sup-r", tb_opt(argc, argv, "--sup-r", "2")), .dir = tb_opt(argc, argv, "--dir", "auto"), .odeg = opt_atof("--orient-deg", tb_opt(argc, argv, "--orient-deg", "0")), .interval = opt_atoi("--interval", tb_opt(argc, argv, "--interval", "0"))};
+    const int jobs = opt_atoi("--jobs", tb_opt(argc, argv, "--jobs", "8"));
     if (!gtr || !gtk || !pr || !pk || !axp || !out || J.axs <= 0 || J.cell < 8 || J.cell > 512 || 512 % J.cell || jobs < 1 || jobs > 64) {
         fprintf(stderr, "usage: ufsm gt-gate --gt ROOT --gt-key K --prob ROOT --prob-key K --axis A [--axis-scale S] --out DIR [--um U] [--cell 64 (divides 512)]\n"
                         "         [--min-support 0.75] [--min-n 200] [--box Z0,Y0,X0,NZ,NY,NX] [--jobs 8] [--cache C]\n"); return 2;
@@ -547,12 +548,12 @@ int cmd_gt_gate(int argc, char **argv) {
     if (bs) { if (tb_box(bs, J.b0, J.bn)) return 2; } else for (int d = 0; d < 3; d++) { J.b0[d] = 0; J.bn[d] = J.shape[d]; }
     for (int d = 0; d < 3; d++) J.ns[d] = (J.shape[d] + 511) / 512;
     J.nitems = J.ns[0] * J.ns[1] * J.ns[2];
-    const double um = atof(tb_opt(argc, argv, "--um", "0")) > 0 ? atof(tb_opt(argc, argv, "--um", "0")) : (gm->scale_um > 0 ? gm->scale_um : 1);
+    const double um = opt_atof("--um", tb_opt(argc, argv, "--um", "0")) > 0 ? opt_atof("--um", tb_opt(argc, argv, "--um", "0")) : (gm->scale_um > 0 ? gm->scale_um : 1);
     char key[64], dir[1200]; z3w_level_name(um, key, sizeof key); snprintf(dir, sizeof dir, "%s/%s", out, key);
     mkdir(out, 0755); J.w = z3w_create(dir, J.shape, 512, 0, 0, nullptr); if (!J.w) { fprintf(stderr, "gt-gate: cannot create %s: %s\n", dir, z3w_error()); return 1; }
     const char *phr = tb_opt(argc, argv, "--phase", nullptr), *phk = tb_opt(argc, argv, "--phase-key", nullptr), *pho = tb_opt(argc, argv, "--phase-out", nullptr);
-    J.shfrac = atof(tb_opt(argc, argv, "--shard-frac", "1")); J.minkeep = atof(tb_opt(argc, argv, "--min-keep", "0.3"));
-    const double prm = atof(tb_opt(argc, argv, "--phase-rmax", "0"));   /* > 0: --phase / --phase-key name winding_mod14 codes, the phase their pair rule at this radius
+    J.shfrac = opt_atof("--shard-frac", tb_opt(argc, argv, "--shard-frac", "1")); J.minkeep = opt_atof("--min-keep", tb_opt(argc, argv, "--min-keep", "0.3"));
+    const double prm = opt_atof("--phase-rmax", tb_opt(argc, argv, "--phase-rmax", "0"));   /* > 0: --phase / --phase-key name winding_mod14 codes, the phase their pair rule at this radius
                                                                            (surf-labels --radius, 20; label sets kept as codes only, 2026-11-13) */
     if (phr && phk) { store *qs = store_open(phr); J.ph = qs ? z3_open(qs, phk, nullptr) : nullptr; if (J.ph && prm > 0) J.ph = phase_onfly_open(J.ph, (float)prm);
         if (!J.ph || memcmp(z3_meta_of(J.ph)->shape, J.shape, sizeof J.shape)) { fprintf(stderr, "gt-gate: cannot open %s/%s or its shape differs\n", phr, phk); return 1; } }
@@ -581,14 +582,14 @@ int cmd_gt_gate(int argc, char **argv) {
    Histogram (20 bins over one turn, centred) of the phase difference A - B (PHASE_* codes 0..251, others unknown) where both are known
    (and CT >= iso with --ct): a constant offset (e.g. surfaces on different papyrus faces) vs a spread (noise / wrong turns). */
 int cmd_phase_diff(int argc, char **argv) {
-    int64_t o[3], n[3]; int nt = atoi(tb_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = 16;
+    int64_t o[3], n[3]; int nt = opt_atoi("--threads", tb_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = 16;
     if (argc < 7 || tb_box(tb_opt(argc, argv, "--box", nullptr), o, n)) { fprintf(stderr, "usage: ufsm phase-diff ROOT_A KEY_A ROOT_B KEY_B --box Z0,Y0,X0,NZ,NY,NX [--ct ROOT KEY --iso 64]\n"); return 2; }
     uint8_t *a = ps_box(argv[2], argv[3], nullptr, o, n, nt), *b = ps_box(argv[4], argv[5], nullptr, o, n, nt); if (!a || !b) return 1;
-    uint8_t *ct = nullptr; const int iso = atoi(tb_opt(argc, argv, "--iso", "64"));
+    uint8_t *ct = nullptr; const int iso = opt_atoi("--iso", tb_opt(argc, argv, "--iso", "64"));
     uint8_t *mk[4] = {nullptr}; int nmk = 0, mkeep[4] = {0};   /* --mask R K (skip where nonzero) / --keep R K (skip where zero) */
     for (int i = 6; i + 2 < argc; i++) {
-        if (!strcmp(argv[i], "--ct")) { ct = ps_box(argv[i + 1], argv[i + 2], nullptr, o, n, nt); if (!ct) return 1; }
-        if ((!strcmp(argv[i], "--mask") || !strcmp(argv[i], "--keep")) && nmk < 4) { mkeep[nmk] = !strcmp(argv[i], "--keep"); mk[nmk] = ps_box(argv[i + 1], argv[i + 2], nullptr, o, n, nt); if (!mk[nmk++]) return 1; }
+        if (!strcmp(argv[i], opt_n("--ct"))) { ct = ps_box(argv[i + 1], argv[i + 2], nullptr, o, n, nt); if (!ct) return 1; }
+        if ((!strcmp(argv[i], opt_n("--mask")) || !strcmp(argv[i], opt_n("--keep"))) && nmk < 4) { mkeep[nmk] = !strcmp(argv[i], opt_n("--keep")); mk[nmk] = ps_box(argv[i + 1], argv[i + 2], nullptr, o, n, nt); if (!mk[nmk++]) return 1; }
     }
     const size_t N = (size_t)(n[0] * n[1] * n[2]); long long h[20] = {0}, tot = 0, side = 0;
     for (size_t i = 0; i < N; i++) {

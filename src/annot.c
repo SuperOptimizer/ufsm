@@ -5,6 +5,7 @@
    and stepping through neighbouring slices reads nothing new. Wraps load in a background thread (the .sfc decoder is not
    thread-safe), so the page is usable at once and the wrap overlay fills in. */
 #include <errno.h>
+#include "optcheck.h"
 #include <math.h>
 #include <stdarg.h>
 #include <netinet/in.h>
@@ -485,7 +486,7 @@ void annot_serve_stop(void) {
     if (G.lab) z3_close(G.lab); if (G.ls) store_close(G.ls); store_close(G.ct); annot_close(G.st);
 }
 
-static const char *aopt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *aopt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 int cmd_annotate_serve(int argc, char **argv) {
     if (argc < 4 || !*aopt(argc, argv, "--store", "")) {
         fprintf(stderr, "usage: ufsm annotate-serve <ct-root> <ct-key> --um U0 --store ANN.json [--level L (finest shown, 2)] [--port 8765]\n"
@@ -494,13 +495,13 @@ int cmd_annotate_serve(int argc, char **argv) {
                         "  a local viewer (127.0.0.1 only) of CT slices with wraps / labels / fibres and a manual winding annotation store\n");
         return 2;
     }
-    annot_cfg c = {.ct_root = argv[2], .ct_key = argv[3], .um0 = atof(aopt(argc, argv, "--um", "0")), .base = atoi(aopt(argc, argv, "--level", "2")),
-                   .wraps = aopt(argc, argv, "--wraps", nullptr), .wrap_stride = atoi(aopt(argc, argv, "--wrap-stride", "2")), .fibers = aopt(argc, argv, "--fibers", nullptr),
+    annot_cfg c = {.ct_root = argv[2], .ct_key = argv[3], .um0 = opt_atof("--um", aopt(argc, argv, "--um", "0")), .base = opt_atoi("--level", aopt(argc, argv, "--level", "2")),
+                   .wraps = aopt(argc, argv, "--wraps", nullptr), .wrap_stride = opt_atoi("--wrap-stride", aopt(argc, argv, "--wrap-stride", "2")), .fibers = aopt(argc, argv, "--fibers", nullptr),
                    .store = aopt(argc, argv, "--store", ""), .regions = aopt(argc, argv, "--regions", nullptr), .scroll = aopt(argc, argv, "--scroll", nullptr),
                    .author = aopt(argc, argv, "--author", getenv("USER") ? getenv("USER") : "user"), .page = aopt(argc, argv, "--page", nullptr),
-                   .cache = aopt(argc, argv, "--cache", nullptr), .port = atoi(aopt(argc, argv, "--port", "8765")), .threads = atoi(aopt(argc, argv, "--threads", "4")),
-                   .cache_gb = atof(aopt(argc, argv, "--cache-gb", "2"))};
-    for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--labels")) { c.lab_root = argv[i + 1]; c.lab_key = argv[i + 2]; }
+                   .cache = aopt(argc, argv, "--cache", nullptr), .port = opt_atoi("--port", aopt(argc, argv, "--port", "8765")), .threads = opt_atoi("--threads", aopt(argc, argv, "--threads", "4")),
+                   .cache_gb = opt_atof("--cache-gb", aopt(argc, argv, "--cache-gb", "2"))};
+    for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--labels"))) { c.lab_root = argv[i + 1]; c.lab_key = argv[i + 2]; }
     if (!(c.um0 > 0) || c.base < 0 || c.base > 7) { fprintf(stderr, "annotate-serve: --um U0 (> 0) and --level 0..7\n"); return 2; }
     const int port = annot_serve_start(&c); if (port < 0) return 1;
     printf("annotate-serve: http://127.0.0.1:%d/  (store %s, %d items)\n", port, c.store, annot_count(G.st)); fflush(stdout);
