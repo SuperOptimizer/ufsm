@@ -479,6 +479,24 @@ static int holdout_window_boxes(const sampler *sp, const source *s, const int64_
     }
     return nb;
 }
+/* UFSM_HOLD_AUDIT (train's sampler-only mode): window i's known label voxels inside the held-out boxes of its CT (no guard), over every
+   source-grid label plane the batch holds (phase / side, w4, ink, aux, papyrus, loss mask, packed mask, ink known bits); the training
+   sampler masks the boxes + guard, so a nonzero count is a leak. Returns the voxels inside boxes (vox) and the known ones among them. */
+void sample_hold_audit(const sampler *sp, const batch *b, int i, uint64_t *vox, uint64_t *known) {
+    *vox = *known = 0; const int si = b->src ? b->src[i] : -1, l = b->level ? b->level[i] : 0; if (si < 0 || si >= sp->S->n || l < 0) return;
+    const source *s = &sp->S->src[si]; const int Pz = PZ(&sp->cfg), P = sp->cfg.P; const int64_t n[3] = {Pz, P, P}, o[3] = {b->corner[i][0] >> l, b->corner[i][1] >> l, b->corner[i][2] >> l};
+    int32_t hb[HB_MAX][6]; const int nb = holdout_window_boxes(sp, s, o, n, l, 0, hb, HB_MAX); if (nb <= 0) return;
+    const size_t nv = (size_t)Pz * P * P;
+    const uint8_t *pl[10] = {b->side, b->w4, b->ink, b->aux[0], b->aux[1], b->aux[2], b->aux[3], b->pap}; const uint8_t unk[10] = {255, 255, 255, 255, 255, 255, 255, 255};
+    for (int q = 0; q < nb; q++) for (int z = hb[q][0]; z < hb[q][3]; z++) for (int y = hb[q][1]; y < hb[q][4]; y++) for (int x = hb[q][2]; x < hb[q][5]; x++) {
+        const size_t k = ((size_t)z * P + y) * P + x; int kn = 0; (*vox)++;
+        for (int j = 0; j < 8; j++) kn |= pl[j] && (sp->cfg.plane_bank ? pl[j] != sp->c255 : 1) && pl[j][(size_t)i * nv + k] != unk[j];
+        if (b->m) kn |= b->m[(size_t)i * nv + k] != 0;
+        if (b->tm) kn |= (b->tm[(size_t)i * nv + k] & 4) != 0;
+        if (b->inkb) kn |= (b->inkb[((size_t)i * nv + k) >> 3] >> (k & 7)) & 1;
+        *known += kn != 0;
+    }
+}
 /* v in the boxes of a Pz x P x P source-grid plane (row runs: memset) */
 static void hold_fill(uint8_t *p, const int32_t (*hb)[6], int nb, int P, uint8_t v) {
     for (int b = 0; b < nb; b++) for (int z = hb[b][0]; z < hb[b][3]; z++) for (int y = hb[b][1]; y < hb[b][4]; y++)

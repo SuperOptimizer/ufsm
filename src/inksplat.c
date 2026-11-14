@@ -963,7 +963,7 @@ int cmd_ink_score(int argc, char **argv) {
     const char *surf = sopt(argc, argv, "--surface", nullptr), *lab = sopt(argc, argv, "--labels", nullptr), *msk = sopt(argc, argv, "--mask", nullptr);
     const char *cache = sopt(argc, argv, "--cache", nullptr), *row = sopt(argc, argv, "--row", nullptr);
     if (!surf || !lab || sidx(argc, argv, "--map") < 0) {
-        fprintf(stderr, "usage: ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR] [--row TAG]\n"); return 2;
+        fprintf(stderr, "usage: ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR] [--row TAG] [--holdouts H.json --ct KEY]\n"); return 2;
     }
     ssurf S; if (ssurf_load(&S, surf)) return 1;
     { const double su = atof(sopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* the mesh voxel size when its meta has none */
@@ -985,6 +985,11 @@ int cmd_ink_score(int argc, char **argv) {
     uint8_t *R[2] = {L, M};
     for (int k = 0; k < 2; k++) { if (!R[k]) continue; uint8_t mx = 0; for (size_t i = 0; i < np; i++) if (R[k][i] > mx) mx = R[k][i]; if (mx == 1) for (size_t i = 0; i < np; i++) R[k][i] *= 255; }
     fprintf(stderr, "ink-score: %s: labels %lld x %lld, %.4g canvas px per label px (canvas %.0f x %.0f)\n", S.name, (long long)LL.W, (long long)LL.H, F, ew, eh);
+    /* --holdouts H --ct KEY (holdout-only scoring, datafix 2026-11-14): only the label pixels whose surface point (the mesh's level-0
+       voxels, z y x as ssurf_pn) lies in one of H's boxes for that CT */
+    const char *hof = sopt(argc, argv, "--holdouts", nullptr), *hct = sopt(argc, argv, "--ct", nullptr); inksplat_cfg hc; memset(&hc, 0, sizeof hc);
+    if (hof && (!hct || inkfly_holdouts(hof, hct, &hc) || !hc.nexcl)) { fprintf(stderr, "ink-score: --holdouts needs --ct KEY and at least one box of that CT in %s\n", hof); return 1; }
+    if (hof) fprintf(stderr, "ink-score: holdout-only: the pixels inside the %d held-out boxes of %s\n", hc.nexcl, hct);
     int rc = 0;
     for (int a = 2; a + 1 < argc; a++) {
         if (strcmp(argv[a], "--map")) continue;
@@ -998,6 +1003,7 @@ int cmd_ink_score(int argc, char **argv) {
             const size_t i = (size_t)r * LL.W + c; if (M && M[i] < 128) continue;
             const double cx = (c + 0.5) * F - 0.5, cy = (r + 0.5) * F - 0.5;
             double P[3], N[3]; if (ssurf_pn(&S, cx * S.scale, cy * S.scale, P, N)) continue;
+            if (hof) { int in = 0; for (int e = 0; e < hc.nexcl && !in; e++) { in = 1; for (int d = 0; d < 3; d++) in &= P[d] >= hc.excl[e][d] && P[d] < hc.excl[e][d] + hc.excl[e][3 + d]; } if (!in) continue; }
             double v;
             if (foot) {   /* the label pixel's canvas footprint */
                 const int x0 = (int)floor(c * F), y0 = (int)floor(r * F); double s = 0; int n = 0;
@@ -1040,7 +1046,7 @@ int cmd_ink_vscore(int argc, char **argv) {
     const int L = atoi(sopt(argc, argv, "--level", "1")), nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8);
     long long b[6];
     if (gi < 0 || pi < 0 || gi + 2 >= argc || pi + 2 >= argc || !bx || sscanf(bx, "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6 || L < 0 || L > 6) {
-        fprintf(stderr, "usage: ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx (level-0) [--level 1] [--row TAG] [--threads 8] [--cache DIR]\n"
+        fprintf(stderr, "usage: ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx (level-0) [--level 1] [--row TAG] [--threads 8] [--cache DIR] [--holdouts H.json --ct KEY]\n"
                         "  voxelwise AUC / best F1 / F1 at 0.5 of a prob254 prediction vs a prob254 reference at the voxels known in both (the box on level L)\n"); return 2;
     }
     store *gs = store_open(argv[gi + 1]), *ps = store_open(argv[pi + 1]);
@@ -1054,6 +1060,17 @@ int cmd_ink_vscore(int argc, char **argv) {
     }
     uint8_t *A = malloc(nv), *B = malloc(nv);
     if (!A || !B || z3_read(g, o, n, A, nth) || z3_read(p, o, n, B, nth)) { fprintf(stderr, "ink-vscore: read failed: %s\n", z3_error()); return 1; }
+    /* --holdouts H --ct KEY (holdout-only scoring, datafix 2026-11-14): only the voxels whose level-0 centre lies in one of H's boxes
+       for that CT (basename match, as the sampler's holdout_file): a score on held-out labels, not on the training set */
+    const char *hof = sopt(argc, argv, "--holdouts", nullptr), *hct = sopt(argc, argv, "--ct", nullptr);
+    if (hof) { inksplat_cfg hc; memset(&hc, 0, sizeof hc);
+        if (!hct || inkfly_holdouts(hof, hct, &hc) || !hc.nexcl) { fprintf(stderr, "ink-vscore: --holdouts needs --ct KEY and at least one box of that CT in %s\n", hof); return 1; }
+        uint64_t kept = 0; const int64_t hf = (int64_t)1 << L;
+        for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++) {
+            const int64_t c0[3] = {((o[0] + z) * hf) + (hf - 1) / 2, ((o[1] + y) * hf) + (hf - 1) / 2, ((o[2] + x) * hf) + (hf - 1) / 2}; int in = 0;
+            for (int e = 0; e < hc.nexcl && !in; e++) { in = 1; for (int d = 0; d < 3; d++) in &= c0[d] >= hc.excl[e][d] && c0[d] < hc.excl[e][d] + hc.excl[e][3 + d]; }
+            const size_t k = ((size_t)z * n[1] + y) * n[2] + x; if (!in) A[k] = 255; else kept++; }
+        fprintf(stderr, "ink-vscore: holdout-only: %llu of %zu voxels inside the %d held-out boxes of %s\n", (unsigned long long)kept, nv, hc.nexcl, hct); }
     double h[2][255] = {{0}}; uint64_t ngt = 0;
     for (size_t k = 0; k < nv; k++) { if (A[k] == 255) continue; ngt++; if (B[k] == 255) continue; h[A[k] >= 127][B[k]]++; }
     double P = 0, N = 0; for (int v = 0; v < 255; v++) { P += h[1][v]; N += h[0][v]; }

@@ -3572,6 +3572,12 @@ int cmd_train(int argc, char **argv) {
                     }
                     cov[si][0] += 1; cov[si][1] += (double)mat / nv; cov[si][2] += (double)ph / nv; cov[si][3] += mat ? (double)phm / mat : 0; cov[si][4] += (double)w4 / nv;
                 }
+                static uint64_t ha_win, ha_hit, ha_vox, ha_known; static int ha_on = -1; if (ha_on < 0) ha_on = ufsm_env_on("UFSM_HOLD_AUDIT");
+                if (ha_on && !b->use) for (int n = 0; n < B; n++) { uint64_t hv, hk; sample_hold_audit(sq, b, n, &hv, &hk); ha_win++; ha_hit += hv > 0; ha_vox += hv; ha_known += hk;
+                    if (hk) fprintf(stderr, "hold audit: LEAK source %s level %d corner %lld %lld %lld: %llu known label voxels inside held-out boxes\n", S->src[b->src[n]].name, b->level[n],
+                                    (long long)b->corner[n][0], (long long)b->corner[n][1], (long long)b->corner[n][2], (unsigned long long)hk); }
+                if (ha_on && (i + 1 == nb)) fprintf(stderr, "hold audit: %llu training windows, %llu overlap held-out boxes (%llu voxels inside), %llu known label voxels inside: %s\n",
+                                                    (unsigned long long)ha_win, (unsigned long long)ha_hit, (unsigned long long)ha_vox, (unsigned long long)ha_known, ha_known ? "LEAK" : "ok");
                 if (ufsm_env_on("UFSM_SAMPLER_EMPTY") && b->ct8 && !b->use) empty_tiles_report(b, B, g_Pz, P, S);
                 if (step_ms > 0) usleep((useconds_t)step_ms * 1000);
                 sampler_release(sq, b);

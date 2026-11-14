@@ -275,6 +275,7 @@ void phase_weight_drop(uint8_t *ph, const uint8_t *w, int Pz, int P, uint64_t se
    differences); where it is radially aligned (|cos| >= 0.7 with the direction from the axis), out[0] counts it rising outward, out[1] inward.
    A label set whose windings are numbered inward (phase, rv, normals, wind4 reversed) shows out[1] > out[0]. Adds to out */
 void sample_phase_outward(const uint8_t *ph, int Pz, int P, const int64_t o[3], const float *cyz, const float *cxz, uint64_t out[2]);
+void sample_hold_audit(const sampler *sp, const batch *b, int i, uint64_t *vox, uint64_t *known);   /* UFSM_HOLD_AUDIT: window i's known labels inside held-out boxes (a leak) */
 void sampler_outward_stats(sampler *sp, int si, uint64_t out[2]);   /* the per-source totals of sample_phase_outward over the drawn windows */
 void sample_rung_marginals(sampler *sp, int si, double q[8]);   /* --um-rungs: the rung shares source si's draws get (weights, then --rung-shift-p's move) */
 void sample_phase_interp(const uint8_t *ph, const int64_t ln[3], const int64_t lo[3], const int64_t o[3], int D, int P, int shift, uint8_t *side);
