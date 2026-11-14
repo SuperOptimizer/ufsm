@@ -316,7 +316,8 @@ rectosp() {
 }
 
 # --- ink (another agent's recipe via INKCMD SCROLLDIR GPU OUT; default the feathered single pass of scripts/corpus/inklib.sh) ---
-# inkcal: the frozen GroupNorm statistics (gn.bin) from 640^3 windows of a 2048-row band at the box's middle; its own stage so it can
+# inkcal: the frozen GroupNorm statistics (gn.bin) from the main pass's windows (INKW / INKH: auto / 32; was 640 / 64 against the
+# main pass's auto = 576 / 32, audit 2026-11-14 #19) of a 2048-row band at the box's middle; its own stage so it can
 # run on GPU INKGPU beside the ref (INKAT=slabs) while the main pass waits for the slabs. INKCMD: nothing (the recipe does its own).
 # INKCALZ: the band's rows (2048; P4: 505 windows, 148 s)
 inkcal() {
@@ -325,7 +326,7 @@ inkcal() {
   local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
   cal=$(echo $box | awk -F, -v cz=${INKCALZ:-2048} '{ zc = $1 + int($4 / 2); z0 = zc - int(cz / 2); if (z0 < $1) z0 = $1; nz = cz; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
   local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU --axis $O/axis.json $(occlv)"
-  [ -s $O/ink/gn.bin ] || { X $O/logs/inkcal.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P ${INKPX:-} --window 640 --halo 64 --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
+  [ -s $O/ink/gn.bin ] || { X $O/logs/inkcal.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P ${INKPX:-} --window ${INKW:-auto} --halo ${INKH:-32} --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
                              { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || return 1; }
 }
 ink() {
