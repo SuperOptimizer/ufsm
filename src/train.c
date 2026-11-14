@@ -3551,6 +3551,15 @@ int cmd_train(int argc, char **argv) {
             step0 = grow ? unet_load_grow(d->u, resume, 1, 1.f) : unet_load(d->u, resume);
             if (step0 < 0) { fprintf(stderr, "cannot load %s\n", resume); return 1; }
             if (atoi(opt(argc, argv, "--finetune", "0"))) step0 = 0;   /* loaded weights/state, fresh schedule */
+            if (unet_cfg_of(d->u)->gn_ema) {   /* --gn-ema-warm / --gn-ema-mom given: they replace the checkpoint's (unet_load restored those; 2026-11-13
+                                                  try2 / try3 blew up when the training forward switched to the running statistics at step 501: a
+                                                  warm-up beyond the run keeps it on batch statistics, the running ones still updated for predict) */
+                const char *w = nullptr, *m = nullptr;
+                for (int i = 1; i + 1 < argc; i++) { if (!strcmp(argv[i], "--gn-ema-warm")) w = argv[i + 1]; if (!strcmp(argv[i], "--gn-ema-mom")) m = argv[i + 1]; }
+                if (w || m) { unet_gn_ema_override(d->u, m ? (float)atof(m) : -1.f, w ? atoi(w) : -1);
+                              if (g == 0) fprintf(stderr, "gn_ema: the command line's%s%s%s%s replace the checkpoint's (warm-up %d: the training forward %s)\n", w ? " --gn-ema-warm " : "", w ? w : "",
+                                                  m ? " --gn-ema-mom " : "", m ? m : "", unet_gn_ema_warm(d->u), step0 >= unet_gn_ema_warm(d->u) ? "on the running statistics" : "on batch statistics"); }
+            }
             {   /* --fstem-reset-at S (2026-11-11, the fstem forward fix): resuming from step S, the fine stem starts again neutral (unet_init's stem:
                    its weights had learnt under a forward that covered only part of each row); one-shot by step, so later relaunches keep it */
                 const long fr = atol(opt(argc, argv, "--fstem-reset-at", "-1"));
