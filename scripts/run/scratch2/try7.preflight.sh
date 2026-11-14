@@ -10,6 +10,8 @@ if [ "${1:-}" != --after ]; then
     git -C /home/forrest/ufsm merge-base --is-ancestor cf4dcc8 $SHA 2>/dev/null && good "binary sha $SHA contains datafix cf4dcc8" || bad "binary sha $SHA lacks datafix cf4dcc8"
     git -C /home/forrest/ufsm merge-base --is-ancestor $SHA origin/master 2>/dev/null && good "binary sha $SHA is on origin/master" || bad "binary sha $SHA is not on origin/master"
   else bad "cannot resolve the binary's sha '$SHA' (name it ufsm.scratch2.<sha>)"; fi
+    for b in dcachecap-20261114 dckey-20261114; do git -C /home/forrest/ufsm merge-base --is-ancestor origin/$b $SHA 2>/dev/null && good "binary contains $b" || bad "binary lacks origin/$b (hostmem: derived-cache cap + new keys)"; done
+  [ -e /home/forrest/.cache/ufsm/derived ] && bad "~/.cache/ufsm/derived still in place: mv it to derived.try6 (no trainer / admuon arm reading it)" || good "old derived cache moved away"
   strings "$U" | grep -qF -- "--holdout-guard" && good "binary knows --holdout-guard" || bad "binary lacks --holdout-guard"
   [ -f "$SRCJ" ] && good "sources $SRCJ" || bad "no sources $SRCJ"
   python3 -I -c "import json,sys; d=json.load(open('$SRCJ')); s=d['sources']; w=[x for x in s if x['name']=='PHerc1218-b3']; sys.exit(0 if d.get('holdout_strict')==1 and all(x.get('holdout_file') for x in s) and w and w[0]['weight']==0 else 1)" \
