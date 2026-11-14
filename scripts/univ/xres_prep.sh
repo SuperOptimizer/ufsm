@@ -39,8 +39,9 @@ PY
        END { printf "%d,%d,%d,%d,%d,%d", a - 32, b - 32, c - 32, d - a + 64, e - b + 64, f - c + 64 }' $X/boxes-xres.tsv)
   for k in codes phase; do
     src=$g/$k; [ -d $src/$ck ] || src=$g/${k}; key=$ck
-    [ -e $o/$k/$l3/zarr.json ] && continue; mkdir -p $o/$k
+    [ -e $o/$k/$l3.done ] && continue; rm -rf "${o:?}/$k/$l3"; mkdir -p $o/$k   # (a done marker: a killed warp left zarr.json, audit mini/shell #7)
     nice -n 5 $U reg warp $r $src $key $ck $o/$k/$l3 --level 3 --box $ub --fill 255 --cache $CACHE --threads $T > $o/warp_$k.log 2>&1 || { echo "$S warp $k failed: $o/warp_$k.log"; continue; }
+    touch $o/$k/$l3.done
   done
   # axis
   [ -s $o/axis.json ] || python3 -I - $GT/axis/${AXF[$S]} $r $U $o/axis.json <<'PY'

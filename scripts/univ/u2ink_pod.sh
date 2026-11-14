@@ -23,7 +23,7 @@ unit() {   # one GPU unit under the sharing protocol, with the host-memory guard
 }
 trap 'rm -f $G/gpu.shared/inkB' EXIT
 laststep() { awk '/^step +[0-9]+ / {s=$2} END {print s + 0}' $R/u2ink$1.log 2>/dev/null || echo 0; }
-for arm in $ARMS; do o=$R/u2ink$arm; mkdir -p $o/snap
+for arm in $ARMS; do o=$R/u2ink$arm; mkdir -p $o/snap $o/score   # (score/: the scoring unit redirects into it, audit mini/shell #5)
   for ((t = UNIT; t <= STEPS; t += UNIT)); do
     [ "$(laststep $arm)" -ge $t ] && continue
     say "arm $arm: train to $t"; UNITNAME="train $arm $t"; unit env STOPAT=$t SCORE=0 bash $D/u2ink_smoke.sh $arm || { say "arm $arm: training unit to $t failed"; exit 1; }

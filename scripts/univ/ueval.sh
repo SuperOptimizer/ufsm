@@ -49,7 +49,9 @@ upiece() {   # upiece NAME g
   [ -e $d/h.done ] || { rm -rf $d/h; $B predict $CK $ur $uk $d/h --um $uum --level $ulv --box $bx --full-grid 1 --levels 1 --heads all $PXH --gpu $2 --threads 6 \
       --cache $WB/cache > $d/heads.log 2>&1 && touch $d/h.done; } || return 1
   [ -e $d/fit/model.json ] || UFSM_FIT_THREADS=${THREADS:-12} $B fit $d/fields --gpu $2 --out $d/fit --dir 1 --uw-repair 8 > $d/fit.log 2>&1 || return 1
-  [ -d $d/wr ] || $B wraps $d/fit $d/wr --fields $d/fields --min-cm2 0.05 > $d/wraps.log 2>&1
+  # (done markers / .tmp + mv, not the output's existence: a killed wraps / read left a dir / a truncated raw that was never redone, audit
+  # mini/shell #7)
+  [ -e $d/wr.done ] || { rm -rf $d/wr; $B wraps $d/fit $d/wr --fields $d/fields --min-cm2 0.05 > $d/wraps.log 2>&1 && touch $d/wr.done; } || return 1
   local w; w=$(ls -S $d/wr/*/x.tif 2>/dev/null | head -1); [ -n "$w" ] || return 0; w=$(dirname $w); mkdir -p $d/rw/w; ln -sfn $w $d/rw/w/$(basename $w)
   local ik; ik=$(ls $d/h/ink 2>/dev/null | grep -v zarr.json | head -1)
   [ -n "$ik" ] && [ ! -s $d/rw/ink/$(basename $w).tif ] && $B render $d/rw/w $d/rw/ink --volume $d/h/ink $ik --depth 4 --threads 8 > $d/render_ink.log 2>&1
@@ -58,9 +60,9 @@ upiece() {   # upiece NAME g
 uqa() {   # uqa NAME: CPU only, after the box's GPU piece -> $d/row.tsv
   ubox $1 || return 1; local d=$E/$T/u/$1 hk f; [ -e $d/fit/model.json ] || return 1
   $B fit-phase-box $d/fit $uz $uy $ux $unz $uny $unx $d/ph.raw --level 0 --step 2 > $d/fpb.log 2>&1 || return 1   # (the model's native voxels = level ulv)
-  [ -s $d/ct.raw ] || $B read $ur $uk/$ulv $uz $uy $ux $unz $uny $unx $d/ct.raw --threads 8 > /dev/null 2>&1 || return 1
+  [ -s $d/ct.raw ] || { $B read $ur $uk/$ulv $uz $uy $ux $unz $uny $unx $d/ct.raw.tmp --threads 8 > /dev/null 2>&1 && mv $d/ct.raw.tmp $d/ct.raw; } || return 1
   local xa=(); for hk in rv ink; do f=$(ls $d/h/$hk 2>/dev/null | grep -v zarr.json | head -1); [ -n "$f" ] || continue
-    { [ -s $d/$hk.raw ] || $B read $d/h/$hk $f $uz $uy $ux $unz $uny $unx $d/$hk.raw --threads 8 > /dev/null 2>&1; } && xa+=(--$hk $d/$hk.raw); done
+    { [ -s $d/$hk.raw ] || { $B read $d/h/$hk $f $uz $uy $ux $unz $uny $unx $d/$hk.raw.tmp --threads 8 > /dev/null 2>&1 && mv $d/$hk.raw.tmp $d/$hk.raw; }; } && xa+=(--$hk $d/$hk.raw); done
   rm -f $d/uqa.tsv; python3 -I $H/scripts/univ/uqa.py $d $1 $uum $d/ph.raw $d/ct.raw $unz,$uny,$unx "${xa[@]}" --step 2 > $d/uqa.log 2>&1 || return 1
   # fibre judge: the fib head's H / V fibres (fiber-trace) against this box's own winding fit (a fibre should stay in one sheet)
   local fk pm=na; fk=$(ls $d/h/fib/H 2>/dev/null | grep -v zarr.json | head -1)
