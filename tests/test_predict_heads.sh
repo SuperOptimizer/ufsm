@@ -100,6 +100,17 @@ for n in rv ink; do cmpb h/$n dv/$n 0 || fail "$n: the device-read run differs f
 UFSM_GPU_DECODE_ITEMS=4 UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dvh "${P[@]}" --heads rv > dvh.log 2>&1 || fail "predict UFSM_PRED_DEVREAD, CPU fallbacks ($D/dvh.log)"
 grep -Eq 'device CT windows: 0 chunks all on the GPU, [1-9][0-9]* with host substreams' dvh.log || fail "device read: the host fallback not taken ($D/dvh.log)"
 cmpb h/rv dvh/rv 0 || fail "rv: the device-read run with CPU-decoded chunks differs"
+# audit 11-14 infer #4 / #6 / #2 / #9: the training state released (same bytes as keeping it), --heads --resume (per-head done logs; a rerun
+# computes nothing and leaves the stores unchanged), --gn-live refused on a net without running statistics, the provenance attributes
+UFSM_PRED_TRAINSTATE=1 "$U" predict s/last.ckpt fx ct ts "${P[@]}" --heads all > ts.log 2>&1 || fail "predict UFSM_PRED_TRAINSTATE=1 ($D/ts.log)"
+for n in rv ink; do cmpb h/$n ts/$n 0 || fail "$n: the released training state changed the output"; done
+grep -q '"provenance":{"ckpt_bytes":' h/rv/9.6/zarr.json || fail "no provenance in h/rv/9.6/zarr.json"
+"$U" predict s/last.ckpt fx ct hr "${P[@]}" --heads all --resume 1 > hr.log 2>&1 || fail "predict --heads --resume ($D/hr.log)"
+for n in rv ink; do [ -s hr/$n/predict-done-9.6.txt ] || fail "no done log hr/$n"; cmpb h/$n hr/$n 0 || fail "$n: --resume run differs"; done
+"$U" predict s/last.ckpt fx ct hr "${P[@]}" --heads all --resume 1 > hr2.log 2>&1 || fail "predict --heads --resume rerun ($D/hr2.log)"
+grep -Eq 'shards in the box: [1-9][0-9]* already written \(--resume\)' hr2.log || fail "the --resume rerun skipped no shard ($D/hr2.log)"
+for n in rv ink; do cmpb h/$n hr/$n 0 || fail "$n: --resume rerun changed the store"; done
+"$U" predict s/last.ckpt fx ct gl "${P[@]}" --heads rv --gn-live 1 > gl.log 2>&1 && fail "--gn-live accepted on a net without --gn-ema"
 # (2) plain latent net with the fibre head
 "$U" train fx/sources-fibhv.json --out fb "${C[@]}" --lat 4 --rv 2 --rv-iso 100 --fib-head 1 > fb.log 2>&1 || fail "train (2) ($D/fb.log)"
 "$U" predict fb/last.ckpt fx ct g "${P[@]}" --heads all > g.log 2>&1 || fail "predict --heads all, fibre ($D/g.log)"

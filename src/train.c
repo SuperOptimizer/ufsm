@@ -3508,6 +3508,7 @@ int cmd_train(int argc, char **argv) {
             free(t);
             for (int a = 1; a < sc.nrung; a++) for (int b = a; b > 0 && sc.rung_um[b] < sc.rung_um[b - 1]; b--) {   /* (sorted by um: --rung-shift-p moves to a list neighbour) */
                 float x = sc.rung_um[b]; sc.rung_um[b] = sc.rung_um[b - 1]; sc.rung_um[b - 1] = x; x = sc.rung_w[b]; sc.rung_w[b] = sc.rung_w[b - 1]; sc.rung_w[b - 1] = x; }
+            unet_set_um_rungs(sc.rung_um, sc.nrung);   /* (the checkpoint header records them: predict checks its level, audit 11-14 infer #10) */
             sc.rung_tol = (float)atof(opt(argc, argv, "--rung-tol", "0.5")); sc.rung_shift_p = (float)atof(opt(argc, argv, "--rung-shift-p", "0"));
             if (!sc.nrung || !(sc.rung_tol > 0 && sc.rung_tol <= 2) || !(sc.rung_shift_p >= 0 && sc.rung_shift_p <= 1)) { fprintf(stderr, "--um-rungs: >= 1 rung, --rung-tol 0..2 octaves, --rung-shift-p 0..1\n"); return 2; }
             fprintf(stderr, "levels by physical voxel size: rungs");
