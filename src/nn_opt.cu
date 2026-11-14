@@ -457,8 +457,10 @@ __global__ void mopt_apply_k(const muon_desc_t *d, int swap, int mc, const int *
        (an absolute update / weight ratio T at the peak lr), or T = 0: the geometric mean of the ema_i over the matrices, so the
        control only redistributes the step between layers and the global size stays Muon's.
    (c) learning-rate-free global step (DoG, Ivgi, Hinder & Carmon 2023, arXiv 2302.12022, on Muon's normalised directions): the step
-       eta_t = rbar_t / sqrt(G_t), G_t = sum_s sched_s^2 |v_s|^2 over the per-unit-lr updates v_i = m_i s_i O_i (all matrices
-       pooled), rbar_t = max(rbar_0, max_s |x_s - x_0|) with the displacement x - x_0 accumulated from the direction's steps only
+       eta_t = rbar_t / sqrt(G_t), G_t = kappa sum_s sched_s^2 |v_s|^2 over the per-unit-lr updates v_i = m_i s_i O_i (all matrices
+       pooled; kappa = (1 + beta) / (1 - beta), the random-walk variance factor of momentum-correlated steps: Muon's directions are
+       correlated over ~1 / (1 - beta) steps, so on pure noise |x - x_0| grows as sqrt(kappa G), not sqrt(G); without kappa (the first
+       A/B arm, 2026-11-14) eta sat at its cap from update ~10 on), rbar_t = max(rbar_0, max_s |x_s - x_0|) with the displacement x - x_0 accumulated from the direction's steps only
        (weight decay is a regulariser, not progress). rbar_0 = eta0 |v_1| (eta0 = --muon-lr), so the first step is Muon's; eta is
        capped at dog_max. Applied lr = sched x eta x m_i (sched = the scheduled lr / lr_peak: warmup and the WSD cooldown stay on top).
        Consistent directions make the distance grow faster than sqrt(G): eta grows; a random walk keeps it; oscillation shrinks it.
@@ -481,7 +483,7 @@ __global__ void ad_ctl_k(const muon_desc_t *d, int n, const double *po, const do
         v2 += m * m * (double)a.lrm[i] * a.lrm[i]; a.lrm[i] = (float)m;
     }
     if (a.on_dog) {
-        double *D = a.dog; const double sched = (double)lr / a.lr_peak, gi = sched * sched * v2;
+        double *D = a.dog; const double sched = (double)lr / a.lr_peak, gi = (double)a.dog_kappa * sched * sched * v2;
         if (D[1] <= 0.0 && gi > 0.0) D[0] = fmax(D[0], (double)a.dog_eta0 * sqrt(gi));
         D[1] += gi; D[0] = fmax(D[0], D[3]);
         D[2] = D[1] > 0.0 ? fmin(D[0] / sqrt(D[1]), (double)a.dog_max) : (double)a.dog_eta0;

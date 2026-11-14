@@ -12,8 +12,12 @@
 #  (2) fit (training-fit, labelled as such: convergence and head interference, not generalisation): the former held-out tasks, all now in
 #      training: wind (wbench core, a piece per box, 44), rv (scripts/rv/eval.sh, a piece per scroll of RVSC), ink (the 34 crops, 2-pass
 #      blend, a piece per crop), fib (the Paris 4 HOLD box via predict --heads fib, fiber-judge vs the phase GT).
-# BLOCKS ("unseen fit"), TASKS (the fit block's: wind rv ink fib). GPUS: "0" | "0 1" (a worker per GPU over one queue) | SPLIT=1 (one worker
-# on both GPUs: plain predicts with PX, default "--split z --gpus 0,1"; --heads predicts with PXH, empty until predict --heads takes --split).
+# BLOCKS ("unseen fit"), TASKS (the fit block's: wind rv ink fib). GPUS: "0" | "0 1" (a worker per GPU over one queue: the fast mode when
+# both cards are free) | SPLIT=1 (one worker holding both cards' locks; every piece runs on GPU 0). PX (default empty) goes only to the
+# rv predict: predict refuses --split / --gpus N with --fit-zarr (predict.c "--fit-fields runs on one GPU"), and a split plain predict
+# of a latent checkpoint drops the fine stem / sub-cell head (lat_ok, predict.c), so PX is never set by SPLIT (eval audit 11-14 #4:
+# SPLIT=1 used to add "--split z --gpus 0,1" to the fit-zarr predicts, and every unseen / wind piece failed).
+# Exit status: 0 only when every piece is done and (unseen block) every unseen box has its QA row; 1 otherwise, so callers can retry.
 # Locks: /tmp/gpuG-bench.lock per piece; a piece starts only while no other job holds or waits for that lock (inkB first; stopped waiters
 # ignored) and the GPU holds no other process above 200 MiB (BUSYOK: a pgrep pattern of allowed co-tenants). DRY=1: the queue only.
 # Reruns skip finished pieces ($E/TAG/q/*.done) and finished box QA. Env: B (the one binary; default build/ufsm), E ($WB/univ/ueval), REFS
@@ -23,7 +27,7 @@ CK=$(readlink -f "${1:?ckpt}"); T=${2:?tag}
 H=$(cd "$(dirname "$0")/../.." && pwd); B=${B:-$H/build/ufsm}; WB=${WB:-/vesuvius/ufsm/wbench}; E=${E:-$WB/univ/ueval}
 BLOCKS=${BLOCKS:-unseen fit}; TASKS=${TASKS:-wind rv ink fib}; UB=${UB:-$H/scripts/univ/unseen_boxes.tsv}
 RVSC=${RVSC:-p1667 p139 p4}; BOXES=${BOXES:-core}; REFS=${REFS:-}; GPUS=${GPUS:-0}; SPLIT=${SPLIT:-0}
-PX=${PX-}; [ $SPLIT = 1 ] && PX=${PX:---split z --gpus 0,1}; PXH=${PXH:-}; CTROOT=${CTROOT:-/vesuvius/ufsm/v2/ct}; RVE=${RVE:-/mnt/scratch/rv/eval}
+PX=${PX-}; PXH=${PXH:-}; CTROOT=${CTROOT:-/vesuvius/ufsm/v2/ct}; RVE=${RVE:-/mnt/scratch/rv/eval}
 INKC=${INKC:-/vesuvius/ufsm/inkgt/evcrops /vesuvius/ufsm/inkgt/evcrops-ho}; INKGT=${INKGT:-/vesuvius/ufsm/inkgt/evgt /vesuvius/ufsm/inkgt/evgt-ho}
 Q=$E/$T/q; LG=$E/$T.ueval.log; mkdir -p $Q
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $LG; }
@@ -44,9 +48,9 @@ ubox() { IFS=$'\t' read -r un sc ur uk uum ulv uz uy ux unz uny unx uax _ <<< "$
 upiece() {   # upiece NAME g
   ubox $1 || return 1; local d=$E/$T/u/$1 bx=$uz,$uy,$ux,$unz,$uny,$unx; mkdir -p $d
   [ -e $d/fields/fields.json ] || { rm -rf $d/fields $d/f.tmp; $B predict $CK $ur $uk $d/f.tmp --box $bx --fit-zarr $d/fields --um $uum --level $ulv --window ${WIN:-640} \
-      --halo ${HALO:-64} --shard 512 --grid-origin 0,0,0 --ema 1 --q 8 --threads ${THREADS:-12} --gpu $2 --axis $uax --levels 1 --fit-h 2 --fit-q 8 --fit-q-phase 0 $PX \
+      --halo ${HALO:-64} --shard 512 --grid-origin 0,0,0 --ema 1 --q 8 --threads ${THREADS:-12} --gpu $2 --axis $uax --levels 1 --fit-h 2 --fit-q 8 --fit-q-phase 0 \
       --no-out 1 --cache $WB/cache > $d/fields.log 2>&1; local rc=$?; rm -rf $d/f.tmp; [ $rc = 0 ]; } || return 1
-  [ -e $d/h.done ] || { rm -rf $d/h; $B predict $CK $ur $uk $d/h --um $uum --level $ulv --box $bx --full-grid 1 --levels 1 --heads all $PXH --gpu $2 --threads 6 \
+  [ -e $d/h.done ] || { rm -rf $d/h; $B predict $CK $ur $uk $d/h --um $uum --level $ulv --box $bx --full-grid 1 --levels 1 --heads all $PXH --gpu $2 --axis $uax --threads 6 \
       --cache $WB/cache > $d/heads.log 2>&1 && touch $d/h.done; } || return 1
   [ -e $d/fit/model.json ] || UFSM_FIT_THREADS=${THREADS:-12} $B fit $d/fields --gpu $2 --out $d/fit --dir 1 --uw-repair 8 > $d/fit.log 2>&1 || return 1
   [ -d $d/wr ] || $B wraps $d/fit $d/wr --fields $d/fields --min-cm2 0.05 > $d/wraps.log 2>&1
@@ -86,7 +90,7 @@ run() {   # run PIECE G
   case $k in
     u)    upiece $a $g;;
     wind) env SITE=desk WB=$WB GPU=$g SLABS=0 REP=${REP:-0} THREADS=${THREADS:-12} PRIO=eval UP=$B U=$B WZARGS= WIN=${WIN:-640} HALO=${HALO:-64} \
-            LOCALCT=$CTROOT BOXES=$a PX="$PX" bash $H/scripts/wbench/wbench.sh $CK $T >> $E/$T/wbench.out 2>&1
+            LOCALCT=$CTROOT BOXES=$a PX= bash $H/scripts/wbench/wbench.sh $CK $T >> $E/$T/wbench.out 2>&1
           grep -qP "^$T\t$a\t" $WB/res/$T.tsv;;
     rv)   env E=$RVE GPU=$G U=$B LOCK= WZ= WINDOW=${WIN:-640} PX="$PX" bash $H/scripts/rv/eval.sh $CK $T $a >> $E/$T/rv_$a.out 2>&1
           grep -qE '^ +all' $RVE/$T/$a/ruler.log;;
@@ -144,3 +148,7 @@ fi
 } > $E/$T.ueval.txt
 [ -s $E/$T/ink-row.txt ] && while IFS= read -r l; do grep -qxF "$l" $E/ink-rows.txt 2>/dev/null || echo "$l" >> $E/ink-rows.txt; done < $E/$T/ink-row.txt
 cat $E/$T.ueval.txt | tee -a $LG
+# exit status (callers mark a snapshot evaluated only on 0): pieces left, or unseen boxes without their QA row
+nu=0; blk unseen && nu=$(grep -v '^#' $UB | cut -f1 | while read -r n; do [ -s $E/$T/u/$n/row.tsv ] || echo $n; done | wc -l)
+[ "$left" = 0 ] && [ "$nu" = 0 ] || { log "ueval $T incomplete: $left pieces left, $nu unseen boxes without a QA row"; exit 1; }
+exit 0
