@@ -8,6 +8,7 @@
 #     -t     tier (default fast)   -j  build jobs (default 6: the pod's cgroup has ~10 CPUs and A/B runs share it)
 #     -x     the whole run's timeout in seconds (default 3600)   -a  every test of the tier (no -c selection)
 #     env POD (root@213.173.109.173), POD_PORT (20326), SUITE_ARGS (more runner options)
+# (gpu.lock before build.lock: a gate queued for the GPU must not hold the build lock meanwhile.)
 # The pod side: bare repo /root/gate/repo.git (REF and BASE pushed as refs/gate/*), a clone per sha in /root/gate/<sha12> (git, so the
 # runner's -c can diff), the build under flock /root/build.lock, the tests under flock /root/gpu.lock (the pod convention: GPU A/B
 # timing runs hold it, so a gate never builds or tests beside one: the build waits for the GPU lock too) and timeout -k inside it.
@@ -34,10 +35,10 @@ G=/root/gate; S=${SHA:0:12}; W=$G/$S
 if [ ! -f $W/.built ]; then
   case "$W" in /root/gate/[0-9a-f]*) rm -rf -- "$W";; esac
   git clone -q --shared $G/repo.git $W && git -C $W -c advice.detachedHead=false checkout -q "$SHA" || exit 2
-  echo "pod_gate: waiting for /root/build.lock and /root/gpu.lock (no build beside an A/B timing run)"
+  echo "pod_gate: waiting for /root/gpu.lock, then /root/build.lock (no build beside an A/B timing run)"
   cd $W || exit 2
   # (the GPU lock too: the A/B timing runs hold it, and a build next to one distorts it; CCACHE_BASEDIR: hits across the sha dirs)
-  if ! timeout -k 30 "$TO" flock -w "$TO" /root/build.lock flock -w "$TO" /root/gpu.lock bash -c "
+  if ! timeout -k 30 "$TO" flock -w "$TO" /root/gpu.lock flock -w "$TO" /root/build.lock bash -c "
         { cmake --preset release && cmake --preset verify; } > build.log 2>&1 &&
         nice -n 5 cmake --build build -j $BJ --target ufsm test_sheet make_pipeline_fixture test_http_reader test_sampler_safety test_formats >> build.log 2>&1 &&
         nice -n 5 cmake --build build-verify -j $BJ --target suite-bins >> build.log 2>&1"; then

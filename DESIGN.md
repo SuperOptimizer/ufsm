@@ -45,6 +45,38 @@ test_latvol.sh and test_ct_gpu_decode.sh make their scratch dirs under $TMPDIR.
 Desk check against the live trainer (`-W 20`): its three GPU tests went BUSY after 20 s, naming
 `ufsm.scratch2.5e8aab7 train ... (13654 MiB on GPU 1, not a suite test)`.
 
+**#10 checkpoints and silent defaults.**
+- **unet_save** now checks every array for non-finite values before the rename: weights, EMA, AdamW m / v, Muon momentum, after the
+  momentum masks.
+  - A NaN anywhere makes it refuse (-2) and print the array and the first index. The previous last.ckpt stays, and the .tmp is removed.
+  - The trainer then exits ("cannot save"), and the launcher resumes from the good file.
+  - Before, a NaN that the step-skip logic missed overwrote the only recent checkpoint.
+  - test_checkpoint covers it: a NaN gradient under AdamW, the save refused, the step-5 file intact.
+- **The checkpoint ring** (src/ckring.c, train `--ckpt-ring 4`, default on). After each save, last.ckpt is cloned with FICLONE into
+  ring/<step>.ckpt, and the newest N are kept.
+  - At --ckpt-every 250 that is 1000 steps of rollback, copied for free on btrfs (/vesuvius).
+  - On a filesystem without reflinks the ring turns itself off with one line, unless `--ckpt-ring-copy 1`.
+  - The deg1900 rollback of try6 went back to snap 1000: 900 steps, ~1.5 h.
+- **Snapshots in the trainer** (`--snap-every S`, default 0, so the launch script's loop stays in charge until merger2 switches):
+  - a reflink to snap/<step>.ckpt, or a copy where reflinks are missing;
+  - kept are every multiple of `--snap-keep-every` (5000) and the newest `--snap-keep-last` (5) others;
+  - only <digits>.ckpt files are deleted.
+
+  snap/ had no retention: 71 x 2.08 GB by step 71000. The script's loop also copied all 2.08 GB to snap/.tmp after every save.
+
+  test_ckring (CPU) checks:
+  - the ring's newest 3, byte-identical;
+  - the ring off without reflinks;
+  - the retention grid;
+  - foreign files in snap/ untouched;
+  - with UFSM_TEST_REFLINK_DIR, the reflink path (passes in /vesuvius).
+- **DEFAULTED lines** (src/defaulted.h). A fallback that changes a result prints `DEFAULTED: <what> = <value> (<why>)`, and
+  UFSM_STRICT_DEFAULTS=1 makes it exit 3.
+  - Sites: count-field's direction (+1 when the prior found no rings and there is no --dir: the 11-14 count-field bug), and
+    wrap-snap's channel 0 read as x.
+  - test_countfield runs its golden cases strict, and runs an all-zero input without --dir in a child, which must stop with exit 3.
+  - test_pipeline_cli fails on any DEFAULTED line in its CLI runs.
+
 **#3 the health watcher.** scratch2.health.py was not running on 11-14 (its files had moved with try5), and its limits were the old
 104 GB slice. scripts/run/health.py RUN is the same set of checks, generalised, run as the systemd --user service `ufsm-health@RUN`
 (scripts/run/install_health.sh; Restart=always, linger on). Changes:

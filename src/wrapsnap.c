@@ -24,6 +24,7 @@
    only those ids are snapped and written (their neighbours still bound them). --dry: the statistics only. --dmap DIR: per wrap the
    signed shift (um, + = outward) as DIR/wNNN.tif, uint8 128 + 4 x um, at ufsm render --scale 1 size (G = pixels per grid step,
    default the wrap's step): it lines up with the wrap's renders. */
+#include "defaulted.h"
 #include "sources.h"
 #include "store.h"
 #include "surfcomp.h"
@@ -532,7 +533,7 @@ int cmd_wrap_snap(int argc, char **argv) {
     for (int k = 0; k < nw; k++) {
         wsn_wrap *w = &W[k];
         if (sfc_open_file(w->path, &w->r)) { fprintf(stderr, "wrap-snap: cannot open %s\n", w->path); return 1; }
-        int c = sfc_find_channel(w->r, "x"); if (c < 0) c = 0; w->ch = (uint32_t)c;
+        int c = sfc_find_channel(w->r, "x"); if (c < 0) { c = 0; UFSM_DEFAULTED("wrap-snap: %s has no channel \"x\": channel 0 read as x", w->path); } w->ch = (uint32_t)c;
         const sfc_channel *ch = sfc_channel_info(w->r, w->ch); w->w = (int)ch->width; w->h = (int)ch->height;
         const uint64_t ml = sfc_metadata_size(w->r); w->meta = calloc(ml + 1, 1); if (ml && sfc_read_metadata(w->r, w->meta, ml)) { fprintf(stderr, "wrap-snap: no metadata in %s\n", w->path); return 1; }
         const char *q = strstr(w->meta, "\"voxel_size_um\":"); w->um = q ? atof(q + 16) : 0;

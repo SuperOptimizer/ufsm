@@ -4973,10 +4973,16 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     }
     fprintf(f, ",\"extra\":%s}\n", extra ? extra : "{}");
     float *h = malloc(u->np * 4);
-    const float *arrs[4] = {u->p, u->ema, u->m, u->v};
-    for (int a = 0; a < 4; a++) { nn_d2h(h, arrs[a], u->np * 4); if (a == 3 && mom_aliased(u)) mom_mask(u, h, 0); if (fwrite(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; } }
-    if (u->muon_mom) {
-        nn_d2h(h, u->muon_mom, u->np * 4); if (mom_aliased(u)) mom_mask(u, h, 1);
+    /* non-finite weights / EMA / moments: refuse, so last.ckpt keeps the last good state (ops audit #10: a NaN the step-skip logic
+       missed would otherwise overwrite the only recent checkpoint; the relaunch then resumes from the good one). ~0.1 s per array. */
+    static const char *const an[5] = {"weights", "EMA weights", "AdamW m", "AdamW v", "Muon momentum"};
+    const float *arrs[5] = {u->p, u->ema, u->m, u->v, u->muon_mom};
+    for (int a = 0; a < 5; a++) {
+        if (!arrs[a]) continue;
+        nn_d2h(h, arrs[a], u->np * 4); if (mom_aliased(u) && (a == 3 || a == 4)) mom_mask(u, h, a == 4);
+        size_t bad = 0, first = 0; for (size_t i = 0; i < u->np; i++) if (!isfinite(h[i])) { if (!bad++) first = i; }
+        if (bad) { fprintf(stderr, "unet_save: %zu non-finite %s (first at parameter %zu): %s not written, the previous one kept\n", bad, an[a], first, path);
+                   fclose(f); remove(tmp); free(h); return -2; }
         if (fwrite(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; }
     }
     free(h);

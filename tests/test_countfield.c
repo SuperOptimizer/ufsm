@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 int cmd_count_field(int argc, char **argv);
 static int fails = 0;
@@ -77,7 +78,29 @@ static void gpu_vs_cpu(const char *dir) {
     free(cyv); free(cxv);
 }
 
+/* DEFAULTED (2026-11-14): no rings for the prior (all-zero fields) and no --dir: count-field must say that it guessed the direction.
+   Under UFSM_STRICT_DEFAULTS=1 it exits 3 (in a child: exit() ends the process); the golden runs above ran strict, so they guessed nothing. */
+static void defaulted_dir(const char *dir) {
+    enum { D3 = 6, H3 = 48, W3 = 48 }; const size_t n = (size_t)D3 * H3 * W3; uint8_t *a[10]; for (int k = 0; k < 10; k++) a[k] = calloc(n, 1);
+    const int na = D3 * h + 1; float *cyv = calloc(na, sizeof(float)), *cxv = calloc(na, sizeof(float));
+    char in[600], out[600]; snprintf(in, sizeof in, "%s/in0", dir); snprintf(out, sizeof out, "%s/out0", dir);
+    const long long org[3] = {0, 0, 0}; const int shp[3] = {D3, H3, W3};
+    if (fit_fields_save(in, org, shp, h, 9.6, a, cyv, cxv, na)) { fails++; fprintf(stderr, "FAIL: cannot write the empty input\n"); return; }
+    fflush(stdout); fflush(stderr);
+    const pid_t c = fork();
+    if (c == 0) {
+        char *av[] = {"ufsm", "count-field", in, out, "--R", "0", "--pool", "1", "--threads", "1", "--rmin-um", "0", "--cf-gpu", "0", nullptr};
+        setenv("UFSM_STRICT_DEFAULTS", "1", 1); freopen("/dev/null", "w", stdout);
+        _exit(cmd_count_field(14, av) == 0 ? 0 : 1);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 3, "count-field without rings or --dir: want the DEFAULTED stop (exit 3), got status %d", st);
+    for (int k = 0; k < 10; k++) free(a[k]);
+    free(cyv); free(cxv);
+}
+
 int main(void) {
+    setenv("UFSM_STRICT_DEFAULTS", "1", 1);   /* the golden runs guess nothing */
     char tmpl[] = "/tmp/test_countfield_XXXXXX"; char *dir = mkdtemp(tmpl); if (!dir) return 1;
     char in[512], out[512], mdir[512]; snprintf(in, sizeof in, "%s/in", dir); snprintf(out, sizeof out, "%s/out", dir); snprintf(mdir, sizeof mdir, "%s/model", dir);
     const size_t n = (size_t)D * H * W; uint8_t *a[10]; for (int k = 0; k < 10; k++) a[k] = calloc(n, 1);
@@ -149,6 +172,7 @@ int main(void) {
         free(w2);
     }
     gpu_vs_cpu(dir);
+    defaulted_dir(dir);
     char cmd[700]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
     for (int k = 0; k < 10; k++) free(a[k]);
     free(cy); free(cx); free(wc);

@@ -1,5 +1,6 @@
 /* ufsm train: sampler -> pinned batches -> one or more GPUs (data parallel, gradients averaged through the
    host) -> UNet -> BCE+Dice -> AdamW/EMA, with held-out validation batches, CSV log and checkpoints. */
+#include "ckring.h"
 #include "gns.h"
 #include "nn.h"
 #include "sysinfo.h"
@@ -2550,6 +2551,9 @@ int cmd_train(int argc, char **argv) {
        "  opt step S: upd/w L0 .. deep .. attn .. head .. adamw .."; 0 = off). One extra read of the weights on those steps. */
     const int opt_stats = atoi(opt(argc, argv, "--opt-stats", "-1")) < 0 ? log_every : atoi(opt(argc, argv, "--opt-stats", "-1")); int ost_pending = 0, ost_armed = 0;
     int val_every = atoi(opt(argc, argv, "--val-every", "500")), ckpt_every = atoi(opt(argc, argv, "--ckpt-every", "1000"));
+    /* the checkpoint ring and snapshots (src/ckring.c, ops audit #10): reflinks of each last.ckpt, the newest --ckpt-ring kept */
+    ck_cfg ckc = {atoi(opt(argc, argv, "--ckpt-ring", "4")), atoi(opt(argc, argv, "--ckpt-ring-copy", "0")), atoi(opt(argc, argv, "--snap-every", "0")),
+                        atoi(opt(argc, argv, "--snap-keep-every", "5000")), atoi(opt(argc, argv, "--snap-keep-last", "5"))};
     const int val_live = atoi(opt(argc, argv, "--val-live", "0"));   /* validate the live weights instead of the EMA (e.g. resume a last.ckpt for one lr-0 step) */
     g_valP = atoi(opt(argc, argv, "--val-P", "0"));   /* (checked once the window and the task are known) */
     const int l0_recal = atoi(opt(argc, argv, "--l0-recal", "4"));   /* --l0-norm ema: windows recalibrating the EMA weights' level-0 statistics before each validation */
@@ -5213,6 +5217,7 @@ int cmd_train(int argc, char **argv) {
             if (g_uw) uw_extra(checkpoint_extra, sizeof checkpoint_extra, runtime_extra);
             if (gns_on) gns_extra(checkpoint_extra, sizeof checkpoint_extra, &gns, acc_auto, accum, acc_anchor, upd_base); 
             if (unet_save(G[0].u, cp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", cp); return 1; }
+            ck_after_save(&ckc, out, step);
         }
         if (step == step0 + 1 || step == steps || g_stop) {
             char mp[1400], em[4096]; snprintf(mp, sizeof mp, "%s/precision.txt", out); WRITE_MANIFEST(mp);
@@ -5222,7 +5227,8 @@ int cmd_train(int argc, char **argv) {
     /* Signals can arrive between log/checkpoint boundaries; save only completed optimizer updates. */
     nn_init(G[0].dev);
     { char cp[1400]; snprintf(cp, sizeof cp, "%s/last.ckpt", out); if (g_uw) uw_extra(checkpoint_extra, sizeof checkpoint_extra, runtime_extra);
-      if (gns_on) gns_extra(checkpoint_extra, sizeof checkpoint_extra, &gns, acc_auto, accum, acc_anchor, upd_base); if (unet_save(G[0].u, cp, committed_step, checkpoint_extra)) return 1; }
+      if (gns_on) gns_extra(checkpoint_extra, sizeof checkpoint_extra, &gns, acc_auto, accum, acc_anchor, upd_base); if (unet_save(G[0].u, cp, committed_step, checkpoint_extra)) return 1;
+      if (committed_step % ckpt_every) ck_after_save(&ckc, out, committed_step); }
     if (plan) fprintf(stderr, "cover progress %llu/%llu committed tiles\n", (unsigned long long)coverage.cursor, (unsigned long long)coverage.count);
     uint64_t prod, rej; sampler_stats(sp, &prod, &rej);
     uint64_t why[4]; sampler_reject_reasons(sp, why);

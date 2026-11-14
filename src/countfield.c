@@ -14,6 +14,7 @@
    NaN unknown; fields.json "wcount": true) and cl.raw (closing error x 255 turns, capped). --model DIR: W as a fit model (pitch /
    offset knots of the prior, delta on the solve lattice) for fit --seed-model DIR (the voxel unwrapping takes its integers from W,
    the phase only the sub-turn part: round(W - phi) + phi), its gauge from the phase smoothed over +-Rm solve cells. */
+#include "defaulted.h"
 #include <complex.h>
 #include <math.h>
 #include <pthread.h>
@@ -646,7 +647,7 @@ int cmd_count_field(int argc, char **argv) {
         if (!pref && ci + 1 < nch) { const int n0 = ord[ci + 1] * CZ; cf_pre_start(&pre, in, n0, n0 + CZ < D ? n0 + CZ : D, 0); }
     }
     if (pre.has_nxt) { fit_fields_free(&pre.nxt); pre.has_nxt = 0; }
-    if (!dir) dir = 1;
+    if (!dir) { dir = 1; UFSM_DEFAULTED("count-field direction = +1 (no --dir and the prior found no rings at the middle slab z %d: the sign of the count is a guess; pass --dir)", D / 2); }
     if (getenv("UFSM_CF_READ_ONLY")) { fprintf(stderr, "count-field: read only: waited for field reads %.0f s, wall %.0f s\n", pre.t, cf_now() - tst0); return 0; }
     if (!cached) fprintf(stderr, "count-field: pass 1: waited for field reads %.0f s, pooling %.0f s (%s, %d of %d chunks on the CPU; %d rows per chunk), wall %.0f s\n", pre.t, t_pool, gpu ? "GPU" : "CPU", gpu ? npc : (D + CZ - 1) / CZ, (D + CZ - 1) / CZ, CZ, cf_now() - tst0);
     if (*pcache && !cached) { FILE *pf = fopen(pcache, "wb"); const int hd[6] = {lv[0].d, lv[0].hh, lv[0].w, P, dir, recto | w4d << 1};
