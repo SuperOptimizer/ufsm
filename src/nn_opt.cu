@@ -498,7 +498,7 @@ __global__ void mopt_apply_k(const muon_desc_t *d, int swap, int mc, const int *
        Consistent directions make the distance grow faster than sqrt(G): eta grows; a random walk keeps it; oscillation shrinks it.
    dog: [rbar, G, eta, |x - x_0|]. All sums are fixed-order partials: every data-parallel replica computes the same multipliers. */
 static nn_madapt g_ad; static int g_ad_on;
-static const float *g_lrm0; static int g_fro;   /* static per-matrix lr multipliers (trunk / stage: audit muon #1); --muon-fro 1 */
+static const float *g_lrm0; static int g_fro;   /* mgpu: process (set once before training, like g_ad); static per-matrix lr multipliers (trunk / stage: audit muon #1); --muon-fro 1 */
 extern "C" void nn_muon_ext_lrmult(const float *m) { g_lrm0 = m; }
 extern "C" void nn_muon_ext_fro(int on) { g_fro = on; }
 extern "C" void nn_muon_ext_adapt(const nn_madapt *a) { g_ad_on = a != nullptr; if (a) g_ad = *a; }
