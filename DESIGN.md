@@ -6,6 +6,28 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Sampler label fixes from the data audit: phase weight on scroll augmentations, scanner air, one coarse-grid convention (2026-11-14, branch sampfix-20261114)
+
+Three findings of /vesuvius/ufsm/audit-20261114/data.md (items handed over by datafix). None is live in try6 (--aug none, no scanner
+"air" probability, no shift-1 / shift-2 phase windows: the startup's rung table puts every level-2 phase set at levels 2 / 3 and every
+level-1 set at 1..3), so try6's labels are unchanged; they matter as soon as those augmentations or rungs are switched on.
+
+- **Phase "weight" on crushed / torn / delaminated / re-bent windows.** The weight drop (8^3 blocks kept with probability w / 255) was
+  skipped on --aug-tear / --aug-delam windows (their labels are prepared on a padded box, `g_crush.pre`) and read at the unwarped window
+  for --aug-crush / --aug-curv. PHerc1299-b3's weight is its direction mask, so those windows would have trained cells reversed. Now
+  tear / delam apply `phase_weight_drop` on the padded box before the pull (as the ignore mask), and crush / curv pull the weight as a
+  nearest layer (fill 255 = keep) and drop on the pulled window. test_scrollaug: weight 0 leaves no known phase on any of the four
+  augmentations, weight 255 gives the unweighted batches bit for bit (tear / delam failed before the fix: 1.08 M / 1.11 M known voxels).
+- **Scanner "air" op.** It turns masked air (CT 0) into dim material, after which the label path's air test saw no air: phase / rv /
+  winding mod 4 were supervised in the air while the papyrus plane went unknown there. The window's zero set as read is now kept (one bit
+  per voxel, only when the op can fire and side 2) and its voxels set unknown in the side plane right after the phase read. test_scrollaug:
+  a fixture copy with CT 0 above z 128 and the phase known there: 1.93 M known air voxels with the op before the fix, 0 now (0 without the op).
+- **One coarse-grid convention.** The shift-1 nearest path of phase_window took fine x from coarse (x + 1) >> 1 (a grid centred on 2 j - 0.5),
+  the shift >= 2 interpolation used the block centre 2^s j + (2^s - 1) / 2, and crush_layer_phase (crush / curv / delam layers) put
+  coarse j at 2^s j - 0.5. All three now use band.h `grid_coarse_u` / `grid_coarse_j` (block centre; nearest = x >> s), the codes / CT
+  convention of datafix b1db77b. test_phase_interp checks the helper, nearest = x >> s, and that crush layers map identically. band_window's
+  binary labels (sample.c `(g + 1) >> 1`) and sideface.c keep their own grid (not phase sets; untouched).
+
 ## Unroll audit items #4 #8 #11 #12 #18 #20 (2026-11-14, branch unrollfix-pub-20261114)
 
 - **#8, slab vs ref coherence (diagnosed; recheck on fibfit's dir -1 refit post-mega).** The bimodal "U_ref - phase ... coherence" of the
