@@ -42,6 +42,7 @@ with tempfile.TemporaryDirectory(prefix='ufsm-cover-cli-') as tmp:
             '--opt', 'muon', '--input-prec', '8', '--gn-stats', 'stored']
     for mode, gpu in [('single', os.environ.get('UFSM_TEST_GPU', '0')), ('split', '0,1')]:
         if mode == 'split' and (os.environ.get('UFSM_TEST_SINGLE_ONLY') or gpu_count() < 2):
+            print('PARTIAL: test_cover_training: the --split z mode did not run (one GPU or UFSM_TEST_SINGLE_ONLY)', flush=True)
             continue
         command = base + ['--gpus', gpu] + (['--split', 'z'] if mode == 'split' else [])
         def train(name, extra=()):

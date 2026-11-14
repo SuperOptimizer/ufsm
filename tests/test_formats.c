@@ -26,7 +26,7 @@ static void test_tiff(const char *tif, const char *ref, int expect_pages) {
     size_t rn;
     uint8_t *r = slurp(ref, &rn);
     tiff *t = tiff_open_file(tif);
-    if (!t || !r) { printf("skip %s (%s)\n", tif, t ? "no ref" : tiff_error()); tiff_close(t); free(r); return; }
+    if (!t || !r) { printf("PARTIAL: test_formats: %s not checked (%s; references need UFSM_NET=1 and ~/huggingfacetoken)\n", tif, t ? "no ref" : tiff_error()); tiff_close(t); free(r); return; }
     tiff_page p;
     tiff_page_info(t, 0, &p);
     int np = tiff_npages(t);
@@ -91,7 +91,7 @@ static void test_zarr2_net(const char *ref) {
     size_t tn; uint8_t *tok;
     char tp[512]; snprintf(tp, sizeof tp, "%s/huggingfacetoken", getenv("HOME"));
     tok = slurp(tp, &tn);
-    if (!r || !tok) { printf("skip zarr2 net test\n"); free(r); free(tok); return; }
+    if (!r || !tok) { printf("PARTIAL: test_formats: the zarr2 net test did not run (no reference or token)\n"); free(r); free(tok); return; }
     while (tn && (tok[tn - 1] == '\n' || tok[tn - 1] == '\r' || tok[tn - 1] == ' ')) tn--;
     tok[tn] = 0;
     store *s = store_open("https://huggingface.co/buckets/scrollprize/datasets/resolve");

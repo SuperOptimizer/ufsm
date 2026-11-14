@@ -30,8 +30,9 @@ def need(paths):
             skip(f"{p} missing")
     if not UFSM.exists():
         skip("build/ufsm missing")
+    cv = os.environ.get("CUDA_VISIBLE_DEVICES")   # the runner's grant (empty: none); nvidia-smi -L ignores it
     try:
-        gpus = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout
+        gpus = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout if cv is None else ("GPU" if cv.strip() not in ("", "-1") else "")
     except OSError:
         gpus = ""
     if "GPU" not in gpus:
@@ -87,11 +88,19 @@ def random_tiles(n, D, T, seed):
     return np.stack(out)
 
 
+def partial(msg):
+    """a part of the check did not run here (tests/run_suite.sh lists PARTIAL lines; the status stays PASS)"""
+    print(f"PARTIAL: {msg}", flush=True)
+
+
 def real_tiles(n, D, T, level, origins):
-    """CT boxes (D x T x T) of the local PHerc1299 pyramid level as stand-in surface volumes; None when unavailable"""
+    """CT boxes (D x T x T) of the local PHerc1299 pyramid level as stand-in surface volumes; None (with a PARTIAL line) when the
+    pyramid is absent or the fixed boxes are mostly air. A failed `ufsm read` of a present pyramid is a failure, not a skip: it is
+    the reader regression this half would otherwise hide (mini audit pytests.md 3)."""
     import numpy as np
     arr = CT_ROOT / CT_KEY / str(level)
     if not arr.exists():
+        partial(f"no local CT ({arr}): the real-CT half did not run, random tiles only")
         return None
     out = []
     with tempfile.TemporaryDirectory(prefix="ufsm-inkext-") as d:
@@ -100,9 +109,10 @@ def real_tiles(n, D, T, level, origins):
             raw = pathlib.Path(d) / "t.raw"
             r = subprocess.run([UFSM, "read", CT_ROOT, f"{CT_KEY}/{level}", str(z), str(y), str(x), str(D), str(T), str(T), raw], capture_output=True, text=True)
             if r.returncode:
-                return None
+                sys.exit(f"FAIL: ufsm read of the present CT {arr} failed: {r.stderr[-300:]}")
             t = np.fromfile(raw, np.uint8).reshape(D, T, T)
             if (t > 0).mean() < 0.5:
+                partial(f"CT box {z},{y},{x} of {arr} is mostly air: the real-CT half did not run, random tiles only")
                 return None
             out.append(t)
     return np.stack(out)
@@ -121,7 +131,10 @@ def run_c(model, weights, tiles, batch=2):
 
 
 def compare(name, ref, got, atol, rtol=0.02, mean_tol=None):
-    """max |logit error| <= atol + rtol |ref| per pixel; returns the max abs error"""
+    """max |logit error| <= atol + rtol |ref| per pixel; returns the max abs error. The bound is fp16 tensor-core storage (ufsm) against
+    the fp32 CPU forward: atol in logit units at |logit| ~ 0, rtol 2 % of the logit for the tails. The call sites' atol (0.08 v8in, 0.1
+    hecate / reader3 / ink9um) predate a recorded measurement; each run prints its max |dlogit| beside the bound, so the margin is in the
+    log (mini audit pytests.md 9: the measured maxima belong next to the atol once a GPU run records them)."""
     import numpy as np
     ref = np.asarray(ref, np.float64); got = np.asarray(got, np.float64)
     assert ref.shape == got.shape, (ref.shape, got.shape)

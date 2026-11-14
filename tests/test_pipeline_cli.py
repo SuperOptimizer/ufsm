@@ -106,6 +106,8 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     run(*pred, t / 'grid-base', *grid_opts, '--shard', '128', '--box', '0,0,0,144,40,40')
     base = read_bytes(t / 'grid-base', [0, 0, 0], grid_shape)
     assert any(base), 'grid fixture has no nonzero predictions'
+    if gpu_count() < 2:
+        print('PARTIAL: test_pipeline_cli: one GPU: the --gpus 0,1 grid-workers and air-gpus checks did not run (gpu2 runs them)', flush=True)
     for name, placement in [('grid-shard256', ['--shard', '256']),
                             *([('grid-workers', ['--shard', '128', '--gpus', '0,1'])] if gpu_count() >= 2 else [])]:
         run(*pred, t / name, *grid_opts, *placement, '--box', '0,0,0,144,40,40')
