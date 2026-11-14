@@ -341,6 +341,11 @@ void nn_ink_bits(const uint8_t *ct8_h, const uint8_t *bits_h, int it, const void
    The whole-window calls above are z0 0, nz P, s0 0, s1 P. Staging: nn_label_warp_device_bytes_z(P, the most s1 - s0) */
 void nn_label_warp_z(int kind, const uint8_t *a_h, const uint8_t *b_h, const void *rad_d, int P, int z0, int nz, int s0, int s1, uint8_t *da, uint8_t *db,
                      const float *cs_h, const float *sn_h, int on_copy_stream);
+void nn_aug_set_slot(int slot);   /* the calling thread's label staging slot (two split sides on one device: the side; else 0) */
+typedef void (*nn_lw_flush_fn)(void *ctx, int plane, const uint8_t *chunk, size_t off, size_t n);
+void nn_lw_sink(uint8_t *ca, uint8_t *cb, size_t cn, nn_lw_flush_fn fn, void *ctx);   /* the _z label builders' output in cn-byte chunks through ca / cb (fn nullptr: off; nn_aug.cu) */
+int nn_lw_sink_on(void);
+void nn_lw_h2d(uint8_t *da, uint8_t *db, const uint8_t *ha, const uint8_t *hb, size_t n, int on_copy_stream);   /* pinned host bytes as label planes (db / hb optional; through the sink when set) */
 void nn_label_sym_z(const uint8_t *a_h, int symcode, int P, int z0, int nz, int s0, int s1, uint8_t *da, int on_copy_stream);
 void nn_w4runs_label_z(const uint8_t *side_h, const void *runs, const void *rad_d, int warped, int symcode, int P, int z0, int nz, int s0, int s1,
                        uint8_t *da, uint8_t *db, const float *cs_h, const float *sn_h, int on_copy_stream);

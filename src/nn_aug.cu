@@ -520,6 +520,11 @@ __global__ void aug_ntab_k(float *t) {   /* sample.c ntab_init: the normal quant
 static int g_lw_ref = 0;
 extern "C" void nn_label_warp_ref(int on) { g_lw_ref = on; }   /* tests: the reference kernels (double atan2 everywhere, the ink plane written first, no reuse) */
 extern "C" void nn_aug_stage_reset(void) { int dv = 0; cudaGetDevice(&dv); g_ad[(dv & 7) * 2].key = g_ad[(dv & 7) * 2 + 1].key = nullptr; }
+/* the label builders' staging slot (nn_aug_set_slot, per thread): the split's side when both sides share one device (as nn_zcomm.slot for
+   the CT), so one side's labels never restage the buffer the other side's CT is reading (2026-11-14: with the label warp after the CT,
+   test_lab_early_split read past side 0's CT stage under compute-sanitizer) */
+static thread_local int g_aug_tslot;
+extern "C" void nn_aug_set_slot(int slot) { g_aug_tslot = slot & 1; }
 static aug_dev *aug_get(int P, size_t sb, int slot = 0) {   /* sb: the staging buffer's bytes (P^3 the CT, 2 P^3 with the labels; z ranges: 2 (s1 - s0) P^2) */
     int dv = 0; cudaGetDevice(&dv); aug_dev *a = &g_ad[(dv & 7) * 2 + (slot & 1)];
     const size_t p2 = (size_t)P * P;
@@ -919,6 +924,30 @@ static void lw_tables(aug_dev *a, const float *cs_h, const float *sn_h) {
     CK(cudaStreamSynchronize(0));   /* (once: a pageable upload of <= 64 KB is only staged on return, its device write queued on the default stream; the kernels below may run on the copy stream) */
 }
 /* the source planes [s0, s1) of host plane h into the staging buffer at off (in planes), unless they are staged already (key) */
+/* the label warps' output in chunks (nn_lw_sink, 2026-11-14): with a sink set on the device, the _z label builders below write their
+   output planes cn bytes at a time into the sink's scratch (ca; cb for a second plane) and call fn(ctx, plane, scratch, offset, bytes)
+   after each chunk's kernel, on the same stream: the caller moves the chunk on (a D2H into the pinned host planes, or a pack into the
+   device-kept ones) before the next chunk's kernel overwrites it. So the label stream needs two chunks of scratch instead of two whole
+   planes (P 1024 --split z: 2 x 570 MB, which the desk cards do not have free under the forward) and can run under the next forward */
+struct lw_sink_t { uint8_t *ca, *cb; size_t cn; nn_lw_flush_fn fn; void *ctx; };
+static thread_local lw_sink_t g_lws;   /* (per thread: under --split z each side's upload runs on its own thread, both on one device in the emulation) */
+extern "C" void nn_lw_sink(uint8_t *ca, uint8_t *cb, size_t cn, nn_lw_flush_fn fn, void *ctx) { g_lws = lw_sink_t{ca, cb, cn, fn, ctx}; }
+extern "C" int nn_lw_sink_on(void) { return g_lws.fn != nullptr; }
+template <class F> static void lw_out(size_t k0, size_t n, uint8_t *da, uint8_t *db, F launch) {
+    const lw_sink_t q = g_lws;
+    if (!q.fn) { launch(k0, n, da, db); return; }
+    for (size_t o = 0; o < n; o += q.cn) {
+        const size_t m = n - o < q.cn ? n - o : q.cn;
+        launch(k0 + o, m, q.ca, db ? q.cb : nullptr);
+        q.fn(q.ctx, 0, q.ca, o, m); if (db) q.fn(q.ctx, 1, q.cb, o, m);
+    }
+}
+/* a plane taken as it is (the identity window) from pinned host bytes: through the sink's chunks when one is set */
+extern "C" void nn_lw_h2d(uint8_t *da, uint8_t *db, const uint8_t *ha, const uint8_t *hb, size_t n, int on_copy_stream) {   /* (db / hb: a second plane, or nullptr) */
+    cudaStream_t s = on_copy_stream ? copy_stream() : 0;
+    lw_out(0, n, da, db, [&](size_t k, size_t m, uint8_t *a, uint8_t *b) { CK(cudaMemcpyAsync(a, ha + k, m, cudaMemcpyHostToDevice, s)); if (b) CK(cudaMemcpyAsync(b, hb + k, m, cudaMemcpyHostToDevice, s)); });
+    if (!on_copy_stream) CK(cudaStreamSynchronize(s));
+}
 static void lw_stage(aug_dev *a, const uint8_t *h, int P, int s0, int s1, size_t off, cudaStream_t s) {
     const size_t p2 = (size_t)P * P;
     CK(cudaMemcpyAsync(a->stage + off * p2, h + (size_t)s0 * p2, (size_t)(s1 - s0) * p2, cudaMemcpyHostToDevice, s));
@@ -931,20 +960,21 @@ extern "C" void nn_label_warp_z(int kind, const uint8_t *a_h, const uint8_t *b_h
                                 const float *cs_h, const float *sn_h, int on_copy_stream) {
     lw_range_check("nn_label_warp_z", P, z0, nz, s0, s1);
     const size_t p2 = (size_t)P * P, ns = (size_t)(s1 - s0), n = (size_t)nz * p2, k0 = (size_t)z0 * p2, so = (size_t)s0 * p2;
-    aug_dev *a = aug_get(P, 2 * ns * p2);
+    aug_dev *a = aug_get(P, 2 * ns * p2, g_aug_tslot);
     cudaStream_t s = on_copy_stream ? copy_stream() : 0;
     lw_tables(a, cs_h, sn_h);
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
     lw_stage(a, a_h, P, s0, s1, 0, s);
     if (kind == 2) lw_stage(a, b_h, P, s0, s1, ns, s);
     nn_ptick_fine("      y label h2d");
-    const unsigned nb = nblk(n, 256); const float *rad = (const float *)rad_d;
+    const float *rad = (const float *)rad_d;
+    lw_out(k0, n, da, db, [&](size_t k0, size_t n, uint8_t *da, uint8_t *db) { const unsigned nb = nblk(n, 256);
     if (kind == 0) lw_tm_k<<<nb, 256, 0, s>>>(a->stage, da, db, P, rad, k0, n, so);   /* (db: the pmask plane, or nullptr) */
     else if (kind == 1 && g_lw_ref) lw_phase_k<1><<<nb, 256, 0, s>>>(a->stage, da, P, rad, a->cssn, a->cssn + 256, k0, n, so);
     else if (kind == 1) lw_phase_k<0><<<nb, 256, 0, s>>>(a->stage, da, P, rad, a->cssn, a->cssn + 256, k0, n, so);
     else if (kind == 3) lw_ink_k<<<nb, 256, 0, s>>>(a->stage, da, P, rad, k0, n, so);   /* (the ink plane) */
     else if (g_lw_ref) lw_w4_k<1><<<nb, 256, 0, s>>>(a->stage, a->stage + ns * p2, da, db, P, rad, a->cssn, a->cssn + 256, k0, n, so);
-    else lw_w4_k<0><<<nb, 256, 0, s>>>(a->stage, a->stage + ns * p2, da, db, P, rad, a->cssn, a->cssn + 256, k0, n, so);
+    else lw_w4_k<0><<<nb, 256, 0, s>>>(a->stage, a->stage + ns * p2, da, db, P, rad, a->cssn, a->cssn + 256, k0, n, so); });
     if (kind == 1 && !g_lw_ref) lw_setkey(a, a_h, s0, s1); else a->key = nullptr;   /* (the phase plane stays staged: nn_w4runs_label's source) */
     CK(cudaEventRecord(a->done, s)); a->used = 1;
     KCHECK();
@@ -965,12 +995,12 @@ __global__ void ink_bits_k(uint8_t *st, const uint8_t *bits, int it, size_t n) {
 extern "C" void nn_label_sym_z(const uint8_t *a_h, int symcode, int P, int z0, int nz, int s0, int s1, uint8_t *da, int on_copy_stream) {
     lw_range_check("nn_label_sym_z", P, z0, nz, s0, s1);
     const size_t p2 = (size_t)P * P, ns = (size_t)(s1 - s0), n = (size_t)nz * p2;
-    aug_dev *a = aug_get(P, 2 * ns * p2);
+    aug_dev *a = aug_get(P, 2 * ns * p2, g_aug_tslot);
     cudaStream_t s = on_copy_stream ? copy_stream() : 0;
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
     lw_stage(a, a_h, P, s0, s1, 0, s);
     nn_ptick_fine("      y label h2d");
-    ink_sym_k<<<nblk(n, 256), 256, 0, s>>>(a->stage, da, P, symcode, (size_t)z0 * p2, n, (size_t)s0 * p2);
+    lw_out((size_t)z0 * p2, n, da, nullptr, [&](size_t k0, size_t n, uint8_t *da, uint8_t *) { ink_sym_k<<<nblk(n, 256), 256, 0, s>>>(a->stage, da, P, symcode, k0, n, (size_t)s0 * p2); });
     if (g_lw_ref) a->key = nullptr; else lw_setkey(a, a_h, s0, s1);
     CK(cudaEventRecord(a->done, s)); a->used = 1;
     KCHECK();
@@ -985,8 +1015,8 @@ extern "C" void nn_w4runs_label_z(const uint8_t *side_h, const void *runs, const
     const w4runs *r = (const w4runs *)runs;
     cudaStream_t s = on_copy_stream ? copy_stream() : 0;
     const size_t p2 = (size_t)P * P, ns = (size_t)(s1 - s0), n = (size_t)nz * p2, k0 = (size_t)z0 * p2, so = (size_t)s0 * p2; const unsigned nb = nblk(n, 256);
-    if (!r->noff) { CK(cudaMemsetAsync(da, 255, n, s)); CK(cudaMemsetAsync(db, 255, n, s)); return; }   /* (no winding: unknown) */
-    aug_dev *a = aug_get(P, 2 * ns * p2);
+    if (!r->noff) { lw_out(k0, n, da, db, [&](size_t, size_t n, uint8_t *da, uint8_t *db) { CK(cudaMemsetAsync(da, 255, n, s)); CK(cudaMemsetAsync(db, 255, n, s)); }); return; }   /* (no winding: unknown) */
+    aug_dev *a = aug_get(P, 2 * ns * p2, g_aug_tslot);
     lw_tables(a, cs_h, sn_h);
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
     if (!lw_keyed(a, side_h, s0, s1)) lw_stage(a, side_h, P, s0, s1, 0, s);   /* (else: staged by the phase plane's call just before, the same range) */
@@ -1004,9 +1034,10 @@ extern "C" void nn_w4runs_label_z(const uint8_t *side_h, const void *runs, const
         CK(cudaStreamSynchronize(s)); free(h);
     }
     nn_ptick_fine("      y w4 runs apply");
+    lw_out(k0, n, da, db, [&](size_t k0, size_t n, uint8_t *da, uint8_t *db) { const unsigned nb = nblk(n, 256);
     if (warped && g_lw_ref) lw_w4_k<1><<<nb, 256, 0, s>>>(a->stage, a->stage + ns * p2, da, db, P, (const float *)rad_d, a->cssn, a->cssn + 256, k0, n, so);
     else if (warped) lw_w4_k<0><<<nb, 256, 0, s>>>(a->stage, a->stage + ns * p2, da, db, P, (const float *)rad_d, a->cssn, a->cssn + 256, k0, n, so);
-    else { ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode, k0, n, so); ink_sym_k<<<nb, 256, 0, s>>>(a->stage + ns * p2, db, P, symcode, k0, n, so); }
+    else { ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode, k0, n, so); ink_sym_k<<<nb, 256, 0, s>>>(a->stage + ns * p2, db, P, symcode, k0, n, so); } });
     CK(cudaEventRecord(a->done, s)); a->used = 1;
     KCHECK();
 }
@@ -1018,7 +1049,7 @@ extern "C" void nn_ink_bits_z(const uint8_t *ct8_h, const uint8_t *bits_h, int i
                               uint8_t *da, int on_copy_stream) {
     lw_range_check("nn_ink_bits_z", P, z0, nz, s0, s1);
     const size_t p2 = (size_t)P * P, ns = (size_t)(s1 - s0), n = (size_t)nz * p2, k0 = (size_t)z0 * p2, so = (size_t)s0 * p2; const unsigned nb = nblk(n, 256);
-    aug_dev *a = aug_get(P, 2 * ns * p2);
+    aug_dev *a = aug_get(P, 2 * ns * p2, g_aug_tslot);
     cudaStream_t s = on_copy_stream ? copy_stream() : 0;
     if (a->used) CK(cudaStreamWaitEvent(s, a->done, 0));
     lw_stage(a, ct8_h, P, s0, s1, 0, s);
@@ -1026,12 +1057,14 @@ extern "C" void nn_ink_bits_z(const uint8_t *ct8_h, const uint8_t *bits_h, int i
     nn_ptick_fine("      y label h2d");
     if (g_lw_ref) {   /* (tests: the plane written over the CT bytes first) */
         ink_bits_k<<<nblk(ns * p2, 256), 256, 0, s>>>(a->stage, a->stage + ns * p2, it, ns * p2);
+        lw_out(k0, n, da, nullptr, [&](size_t k0, size_t n, uint8_t *da, uint8_t *) { const unsigned nb = nblk(n, 256);
         if (warped) lw_ink_k<<<nb, 256, 0, s>>>(a->stage, da, P, (const float *)rad_d, k0, n, so);
-        else ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode, k0, n, so);
+        else ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode, k0, n, so); });
         a->key = nullptr;
     } else {   /* the plane's values taken at the kernels' reads: the CT bytes stay staged for nn_aug_ct, which follows in train's upload */
+        lw_out(k0, n, da, nullptr, [&](size_t k0, size_t n, uint8_t *da, uint8_t *) { const unsigned nb = nblk(n, 256);
         if (warped) lw_ink_k<<<nb, 256, 0, s>>>(a->stage, da, P, (const float *)rad_d, k0, n, so, a->stage + ns * p2, it);
-        else ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode, k0, n, so, a->stage + ns * p2, it);
+        else ink_sym_k<<<nb, 256, 0, s>>>(a->stage, da, P, symcode, k0, n, so, a->stage + ns * p2, it); });
         lw_setkey(a, ct8_h, s0, s1);
     }
     CK(cudaEventRecord(a->done, s)); a->used = 1;

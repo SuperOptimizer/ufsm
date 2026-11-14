@@ -6,6 +6,44 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The early label warp under --split z (2026-11-14, branch lsplit-20261114)
+
+**Problem.** lab_early (2026-11-13, "The next batch's label warp under the forward", below) never engaged under `--split z`.
+- It hangs off `hsplit`, which requires `!split`, and it allocates a second scratch plane.
+- try3 and try4 have no "label warp:" line, so the warp still ran at the step boundary into the input buffer, and the next forward waited
+  for it.
+- The 11-13 desk nsys shows ~350 ms per card per step there: `lw_phase` / `lw_ink` kernels with 570 MB D2H and 636 MB H2D copies,
+  both cards kernel-idle.
+- A second plane per card cannot be had: a split side's plane is ~570 MB, and the cards run with 63-553 MB free.
+
+**Change.**
+- Under `--split z`, `upload_async` uploads the input first and records `ev_up`. The label warp follows on the copy stream and records
+  `ev_lab`.
+- The forward starts on `ev_up`. Head pass 0 and the aux stream wait for `ev_lab` (already so since lwarp).
+- The host batch is released, and validation's buffer switch happens, only after `ev_lab`.
+- The scratch is hs_lg alone: idle from the gradient pass to the next statistics pass, 629 MB on the desk. `nn_lw_sink` (nn_aug.cu)
+  makes every `_z` label builder write its output in chunks of up to 64 planes through two chunk buffers in hs_lg. These are the
+  phase / ink warps, the symmetry, the w4 runs, the ink bits and the identity copies.
+- After each chunk's kernel, a callback on the same stream moves the chunk on: a D2H into the pinned host planes, or `nn_lab_pack`
+  into the device-kept packed planes.
+- The kernels already index their output relative to `k0`, and the source stays staged, so a chunk costs one kernel launch. Nothing
+  is restaged.
+- `UFSM_LAB_EARLY=0` turns it off.
+
+**Two fixes the test needed.**
+- The sink is per thread: each split side uploads on its own thread, and both sides share one device in the emulation.
+- In the one-GPU emulation, the label builders now take the side's staging slot, `nn_aug_set_slot`, as the CT already did
+  (`nn_zcomm.slot`). With the warp after the CT, side 1's labels had restaged the buffer side 0's CT was reading.
+  compute-sanitizer showed `aug_write_k` reading 12 KB past a 1 MB stage. Two real GPUs never shared a slot.
+
+**Test.** `tests/test_lab_early_split.sh` (gpu): `--gpus 0,0 --split z`, P 128, the wind fixture with ink and fibre targets, `--rv 2`,
+`--gpu-aug 3` (w4 runs), `--det 1`. Each side's plane is 96 planes, so it goes through 2 chunks.
+- With `UFSM_LAT_STREAM=check` every slab's streamed planes equal the device-built ones (0 of 47 M slab bytes differ).
+- The losses equal those of `UFSM_LAB_EARLY=0`, line for line.
+- The same holds with the planes in pinned host memory (`UFSM_LAT_LDEV=0`, the desk's case).
+
+**Desk A/B.** `/vesuvius/ufsm/perf2/lsplit_swap.sh`. Results pending.
+
 ## Widening warm start: u1 -> scratch2's architecture with the donor's function (2026-11-14, branch widen-20261114)
 
 From scratch, scratch2's architecture does not learn phase or wind4: try4 was at chance after 1866 steps, and every latent net that
