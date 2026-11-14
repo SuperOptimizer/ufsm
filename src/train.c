@@ -19,6 +19,7 @@
 #include "inksplat.h"
 #include "meshcodes.h"
 #include "inkmil.h"
+#include "hgs.h"
 #include "dcache.h"
 #include "band_onfly.h"
 #include "fiberraster.h"
@@ -119,7 +120,7 @@ typedef struct {
     uint8_t *w4b[2], *wcb[2], *w4, *wc; double *w4ds; float *w4fin, w4h[8]; double w4_loss;   /* --task unwrap2: winding mod 4 and its component per voxel (double-buffered), loss sums, scratch, host parts */
     double *fibacc; void *fiblist; unsigned *fibnl; size_t fibcap; double fib_h[2];   /* --fib-normal-lambda: valid voxels / sum t^T N t (device), the slab list, the fetched sums */
     uint8_t *auxb[AUX_N][2], *aux[AUX_N], *inkt, *inkm, *inkw;   /* the aux planes (double-buffered; plane j = role g_aux_role[j]); --ink-head: its slab target / mask, weight byte (loss parts: iscratch / iout / ink_loss) */
-    inkray *milr[2], *milh[2]; int miln[2]; float *milacc; double *milloss, mil_loss, mil_raw; float mil_gs, mil_den, hgs; int mil_k, mil_n;   /* --ink-mil: the window's rays per buffer, the samples' accumulator, the loss (device); logged / raw */
+    inkray *milr[2], *milh[2]; int miln[2]; float *milacc; double *milloss, mil_loss, mil_raw; float mil_gs, mil_den; int mil_k, mil_n, hgs_on, mil_hs; float *hgsd;   /* --ink-mil: the window's rays per buffer, the samples' accumulator, the loss (device); logged / raw */
     uint8_t *tc; int tc_tried, tc_ok;   /* tc_ok: the cache holds this step's window (set by a training statistics pass, cleared by the gradient pass and by any other statistics pass) */   /* head_slab_pass: the window's derived targets / masks kept from the statistics pass for the gradient pass */
     uint8_t *rvt, *rvm; float *rvscratch, rvout[5]; double rv_loss; float rv_own;   /* rv_own: this GPU's window's rv bce (--mix-every) */
     float *milacc2;              /* g_lsplit --ink-mil: the other half's accumulator */
@@ -1295,42 +1296,46 @@ static int mil_clip(const gpu_state *d, int pass, int z0, int nz, size_t hw, int
    unwrap2 head-slab gradient pass with 16-bit gradients and its producers bounded here (pgrad / fibre-normal terms, the --ssl heads
    and other tasks keep s 1); UFSM_HGSCALE=0: s 1 (the old bits) */
 static int g_hgs_on = -1;   /* mgpu: env */
-static float hgs_bound(const float *h, int C, float lam, float dice, float pw, float rw, float mw) {   /* h: a loss scratch ([C][5] sums, fin [2 C + 2]) */
-    const float fsc = h[5 * C + 2 * C + 1], gs = nn_get_grad_scale(); float b = 0.f;
-    for (int c = 0; c < C; c++) { const float nm = h[5 * c]; if (nm < 1.f) continue;
-        const float v = fabsf(lam) * gs * fsc * ((pw > 1.f ? pw : 1.f) * mw / nm + 1.25f * dice + 0.25f * rw); if (v > b) b = v; }
-    return b;
-}
-static float hgs_choose(gpu_state *d, int nmil) {
+/* the choice on the device (hgs.h, nn_hgs_choose; 11-14 hgsdev): the window's bound from the fins in place, {s, 1 / s} into d->hgsd on the
+   default stream, no nn_sync / readbacks. Returns 1 when the scale is on for this window (d->hgsd then holds it), 0: s 1.
+   UFSM_HGS_CHECK=1: the host function on read-back copies of the same scratches, compared bit for bit (a sync per window) */
+static int hgs_choose(gpu_state *d, int nmil) {
     if (g_hgs_on < 0) g_hgs_on = !getenv("UFSM_HGSCALE") || ufsm_env_on("UFSM_HGSCALE");
-    if (!g_hgs_on || !d->hs_train || !nn_get_loss_grad_h16() || !g_unwrap2 || !g_side || (g_lat && !g_lat_hs) || g_pg_lambda > 0 || g_fibn) return 1.f;
+    if (!g_hgs_on || !d->hs_train || !d->hgsd || !nn_get_loss_grad_h16() || !g_unwrap2 || !g_side || (g_lat && !g_lat_hs) || g_pg_lambda > 0 || g_fibn) return 0;
     const int si = d->srcb[d->cur];
     float pw, rw; int u7; nn_loss_cfg_get(&pw, &rw, &u7);
+    const float gs = nn_get_grad_scale();
     const float mw = 2.f * (g_packed_w > 1.f ? g_packed_w : 1.f) * (g_rv_vw > 1.f ? g_rv_vw : 1.f);   /* hgs_mw: the largest mask weight (packed sheets, verso) x 2 */
     const float lside = g_side_lambda * src_head_w(si, g_rv == 1 ? SH_RV : SH_PHASE), lnorm = g_norm_lambda * src_head_w(si, SH_NORMAL),
                 ldens = g_dens_lambda * src_head_w(si, SH_DENSITY), inkw = si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f;
-    float h[5 * 7 + 2 * 7 + 2], w4[8]; float b = 0.f, v;
-    nn_sync();
-#define HB(ptr, C, lam, dice, pw_) do { nn_d2h(h, (ptr), (size_t)(5 * (C) + 2 * (C) + 2) * 4); v = hgs_bound(h, (C), (lam), (dice), (pw_), rw, mw); if (v > b) b = v; } while (0)
-    HB(d->sscratch, 2, lside, 0.f, pw);
-    if (g_rv == 2) HB(d->rvscratch, 2, g_rv_lambda * src_head_w(si, SH_RV), 0.f, pw);
-    HB(d->nscratch, 7, fabsf(lnorm) > fabsf(ldens) ? lnorm : ldens, 0.f, pw);
-    if (g_ink2) HB(d->iscratch, 1, g_ink_lambda * inkw * src_head_w(si, SH_INK), g_ink_dice, pw);
-    if (g_fibh) { const float fw = g_fibh_lambda * src_head_w(si, SH_FIBRE); HB(d->fhs[0], 1, fw, 0.f, pw); HB(d->fhs[1], 1, fw, 0.f, pw); HB(d->fds, 7, fw, 0.f, 1.f); }
-#undef HB
-    nn_d2h(w4, d->w4fin, sizeof w4);   /* wind4: k = mask x 0.5 x (1 / N) x lambda x scale, |sigmoid - target| <= 1 */
-    v = 0.5f * mw * fabsf(g_w4_lambda * src_head_w(si, SH_WIND4)) * nn_get_grad_scale() * w4[3]; if (v > b) b = v;
-    if (nmil) { v = 8.f * fabsf(g_mil_lambda * inkw * src_head_w(si, SH_INK)) * nn_get_grad_scale() / (float)nmil; if (v > b) b = v; }   /* (the ray's weights sum to <= 1; <= 8 rays a voxel) */
-    if (!(b > 0.f) || !isfinite(b)) return 1.f;
-    int k = (int)floorf(log2f(512.f / b)); k = k < 0 ? 0 : k > 30 ? 30 : k;
-    return ldexpf(1.f, k);
+    hgs_args a = {.nt = 0, .w4 = d->w4fin, .w4lam = g_w4_lambda * src_head_w(si, SH_WIND4), .milv = 0.f, .gs = gs, .rw = rw, .mw = mw};
+#define HT(ptr, C_, lam_, dice_, pw_) (a.t[a.nt++] = (hgs_term){.p = (ptr), .C = (C_), .lam = (lam_), .dice = (dice_), .pw = (pw_)})
+    HT(d->sscratch, 2, lside, 0.f, pw);
+    if (g_rv == 2) HT(d->rvscratch, 2, g_rv_lambda * src_head_w(si, SH_RV), 0.f, pw);
+    HT(d->nscratch, 7, fabsf(lnorm) > fabsf(ldens) ? lnorm : ldens, 0.f, pw);
+    if (g_ink2) HT(d->iscratch, 1, g_ink_lambda * inkw * src_head_w(si, SH_INK), g_ink_dice, pw);
+    if (g_fibh) { const float fw = g_fibh_lambda * src_head_w(si, SH_FIBRE); HT(d->fhs[0], 1, fw, 0.f, pw); HT(d->fhs[1], 1, fw, 0.f, pw); HT(d->fds, 7, fw, 0.f, 1.f); }
+#undef HT
+    if (nmil) a.milv = 8.f * fabsf(g_mil_lambda * inkw * src_head_w(si, SH_INK)) * gs / (float)nmil;   /* (the ray's weights sum to <= 1; <= 8 rays a voxel) */
+    nn_hgs_choose(&a, d->hgsd);
+    static int chk = -1; if (chk < 0) chk = ufsm_env_on("UFSM_HGS_CHECK");
+    if (chk) {   /* the host function on copies of the same scratches */
+        hgs_args h = a; float buf[HGS_NT][5 * 7 + 2 * 7 + 2], w4[8], dv[2];
+        nn_sync();
+        for (int i = 0; i < a.nt; i++) { nn_d2h(buf[i], a.t[i].p, (size_t)(5 * a.t[i].C + 2 * a.t[i].C + 2) * 4); h.t[i].p = buf[i]; }
+        nn_d2h(w4, d->w4fin, sizeof w4); h.w4 = w4; nn_d2h(dv, d->hgsd, sizeof dv);
+        const int k = hgs_exp(hgs_bound_all(&h)); const float hs = ldexpf(1.f, k), hi = ldexpf(1.f, -k);
+        if (memcmp(&hs, &dv[0], 4) || memcmp(&hi, &dv[1], 4)) { fprintf(stderr, "hgs check: device {%a, %a} host {%a, %a} (bound %a)\n", dv[0], dv[1], hs, hi, hgs_bound_all(&h)); exit(1); }
+        static int nck; if (nck++ < 3) fprintf(stderr, "hgs check: s 2^%d (device = host)\n", k);
+    }
+    return 1;
 }
 static void head_slab_pass(gpu_state *d, int pass) {
     const int D = g_Pz, H = d->hs_P, W = d->hs_P, Z = d->hs_z;
     const size_t hw = (size_t)H * W, l3 = (size_t)D * hw;
     if (!pass && d->ev_lab[d->cur]) nn_stream_wait(0, d->ev_lab[d->cur]);   /* (lab_early: the label warp in hs_lg / lsc, the device-kept planes) */
     nn_set_logits_h16(1);
-    nn_set_head_gscale(pass && d->hgs > 0.f ? d->hgs : 1.f);   /* the gradient pass: the producers' planes at this window's head plane scale (hgs_choose), the head's backward divides it out */
+    nn_set_head_gscale_dev(pass && d->hgs_on ? d->hgsd : nullptr);   /* the gradient pass: the producers' planes at this window's head plane scale (hgs_choose, device {s, 1 / s}), the head's backward divides it out */
     static int lchk = -1; if (lchk < 0) lchk = g_lat && ufsm_env_on("UFSM_LAT_CHECK");
     /* UFSM_PTICK: the slab phases by pass */
     static const char *const ptn[2][5] = {{"p0 label h2d", "p0 upsample", "p0 targets", "p0 loss stats", ""}, {"p1 label h2d", "p1 upsample", "p1 targets", "p1 loss grads", "p1 adjoint"}};
@@ -1758,21 +1763,26 @@ static void head_slab_pass(gpu_state *d, int pass) {
         nn_loss_stats_fin_w(d->hs_ds + 10, d->sidew, w2, d->sscratch, WWS(WW_SIDE));
         nn_loss_stats_fin_w(d->hs_ds + 20, d->nw, w7, d->nscratch, WWS(WW_NORM));
 #undef WWS
-        d->hgs = ssl_skip ? 1.f : hgs_choose(d, nmil);   /* (after every finalisation it reads, the window weights included; before the MIL fin, which bakes the scale into its accumulator) */
+        d->hgs_on = ssl_skip ? 0 : hgs_choose(d, nmil);   /* (after every finalisation it reads, the window weights included: the bound reads the weighted fins; before the MIL fin, which bakes the scale into its accumulator) */
         if (nmil) {   /* the MIL loss: the mean over the window's rays x lambda x the source's ink weight; the gradient in the 16-bit storage's scale (training) */
             const float iw = g_mil_lambda * (si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f) * src_head_w(si, SH_INK) / nmil
                              * (d->hs_train ? ww_mil(d->dev, nmil) : 1.f);   /* (--win-weight: the MIL head's window weight) */
-            const float gs = d->hs_train && nn_get_loss_grad_h16() ? nn_get_grad_scale() * d->hgs : 1.f;   /* (x the head plane scale: ink_mil_bwd_slab adds into the planes) */
+            const float gs = d->hs_train && nn_get_loss_grad_h16() ? nn_get_grad_scale() : 1.f;   /* (x the head plane scale s on the device, ink_mil_set_scale_dev: ink_mil_bwd_slab adds into the planes) */
             if (g_lsplit && d->side >= 0) {   /* the two halves' accumulators summed (a + b on both GPUs: the same bits), the loss counted on side 0 */
                 const size_t nb = (size_t)nmil * d->mil_k * sizeof(float);
                 split_xchg(d->milacc, nb, d->milacc2, nb, nullptr); nn_axpy(d->milacc, 1.f, d->milacc2, (size_t)nmil * d->mil_k);
             }
-            if (ink_mil_fin(d->milacc, mrays, nmil, MD, H, W, g_mil_R, g_mil_step, g_mil_tau, g_ink_smooth, iw * gs, d->milloss, nullptr)) { fprintf(stderr, "ink mil: fin failed\n"); exit(1); }
+            const int mhs = d->hs_train && nn_get_loss_grad_h16() && d->hgs_on;
+            if (mhs) { ink_mil_set_scale_dev(d->hgsd); nn_d2d_async(d->hgsd + 2, d->hgsd, sizeof(float)); }   /* (the fetch's copy of s: the next window may choose again first) */
+            const int mrc = ink_mil_fin(d->milacc, mrays, nmil, MD, H, W, g_mil_R, g_mil_step, g_mil_tau, g_ink_smooth, iw * gs, d->milloss, nullptr);
+            if (mhs) ink_mil_set_scale_dev(nullptr);
+            if (mrc) { fprintf(stderr, "ink mil: fin failed\n"); exit(1); }
             if (g_lsplit && d->side == 1) nn_zero(d->milloss, sizeof(double));
-            d->mil_gs = gs; d->mil_den = iw * gs * nmil; d->mil_n = nmil;   /* (the fetch: / gs the weighted loss, / den the raw mean BCE) */
+            d->mil_gs = gs; d->mil_den = iw * gs * nmil; d->mil_n = nmil; d->mil_hs = mhs;   /* (the fetch: / gs the weighted loss, / den the raw mean BCE) */
             if (mck) {   /* the host loss and gradient on the same logits, the same scale */
                 free(mref); mref = calloc((size_t)D * hw, sizeof *mref); double ld = 0; nn_sync(); nn_d2h(&ld, d->milloss, sizeof ld);
-                const double lh = ink_mil_loss_host(mlg, mref, D, H, W, d->milh[d->cur], nmil, g_mil_R, g_mil_step, g_mil_tau, g_ink_smooth, iw * gs);
+                float mhsv = 1.f; if (mhs) nn_d2h(&mhsv, d->hgsd, sizeof mhsv);   /* (the device head plane scale in fin's scale) */
+                const double lh = ink_mil_loss_host(mlg, mref, D, H, W, d->milh[d->cur], nmil, g_mil_R, g_mil_step, g_mil_tau, g_ink_smooth, iw * gs * mhsv);
                 fprintf(stderr, "mil check: loss device %.9g host %.9g (relative %.3g, %d rays)\n", ld, lh, fabs(ld - lh) / (fabs(lh) > 0 ? fabs(lh) : 1), nmil);
                 int hit = 0, agree = 0; const inkray *hr = d->milh[d->cur];   /* the rays against the ink target plane (after every symmetry / warp, host or device, and replays) */
                 for (int k = 0; k < nmil; k++) { int mx = -1;
@@ -1800,7 +1810,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 h[12] - h[13], h[12], h[12] > h[13] ? 100.0 * h[14] / (h[12] - h[13]) : 0.0);
 #undef HZP
     }
-    nn_set_head_gscale(1.f);
+    nn_set_head_gscale_dev(nullptr);
 }
 static void head_slab_cb(void *ctx) {
     gpu_state *d = ctx;
@@ -2499,7 +2509,8 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
             d->iout[0] = d->iout[1] = d->iout[2] = 0; nn_d2h(d->w4h, d->w4fin, 8 * sizeof(float));
             if (g_ink2) { nn_loss_fetch(d->iscratch, (shape5){1, 1, 1, 1, 1}, d->iout); d->ink_loss = g_ink_lambda * (d->iout[0] + g_ink_dice * d->iout[1]); }
             d->mil_loss = d->mil_raw = 0;
-            if (d->mil_n) { double s = 0; nn_d2h(&s, d->milloss, sizeof s); d->mil_loss = s / d->mil_gs; d->mil_raw = s / d->mil_den; }   /* --ink-mil */   /* (--ink-head: the logged loss at lambda, not the source weight) */
+            if (d->mil_n) { double s = 0; nn_d2h(&s, d->milloss, sizeof s); float hs = 1.f; if (d->mil_hs) nn_d2h(&hs, d->hgsd + 2, sizeof hs);
+                d->mil_loss = s / (d->mil_gs * hs); d->mil_raw = s / (d->mil_den * hs); }   /* --ink-mil */   /* (--ink-head: the logged loss at lambda, not the source weight) */
         }
         nn_loss_fetch(d->nscratch, (shape5){1, 7, 1, 1, 1}, d->nout);
         if (g_fibn) nn_d2h(d->fib_h, d->fibacc, 2 * sizeof(double));   /* --fib-normal-lambda: valid fibre voxels, sum t^T N t (the statistics pass) */
@@ -4502,7 +4513,7 @@ int cmd_train(int argc, char **argv) {
             if (g_unwrap2) {
                 d->w4b[0] = nn_malloc(lp3); d->w4b[1] = lean ? d->w4b[0] : nn_malloc(lp3); d->w4 = d->w4b[d->cur];
                 d->wcb[0] = nn_malloc(lp3); d->wcb[1] = lean ? d->wcb[0] : nn_malloc(lp3); d->wc = d->wcb[d->cur];
-                d->w4ds = nn_malloc(nn_wind4_sums()); d->w4fin = nn_malloc(nn_wind4_scratch() + 64);
+                d->w4ds = nn_malloc(nn_wind4_sums()); d->w4fin = nn_malloc(nn_wind4_scratch() + 64); d->hgsd = nn_malloc(4 * sizeof(float));
             }
             for (int j = 0; j < g_naux; j++) { d->auxb[j][0] = nn_malloc(lp3); d->auxb[j][1] = lean ? d->auxb[j][0] : nn_malloc(lp3); d->aux[j] = d->auxb[j][d->cur]; }   /* the aux planes (double-buffered like w4) */
             if (g_rv) { d->rvt = nn_malloc(2 * tp3); d->rvm = nn_malloc(tp3); if (g_rv == 2) d->rvscratch = nn_malloc(nn_loss_scratch((shape5){1, 2, g_Pz, P, P}) + 64); }   /* --rv: the slab's 2 target planes and mask */

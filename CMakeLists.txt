@@ -153,7 +153,7 @@ set(UFSM_CU_STRICT "SHELL:-Xarch_device -ffp-contract=off" "SHELL:-mllvm -nvvm-r
 # the host half of every .cu unit: no contraction either, as the host C (the strict units hold CPU-side code too: nn_band, nn_render,
 # nn_gpudec ... host functions, compared bit for bit against the .c references; under nvcc + g++ -std=c++17 they never fused)
 list(APPEND UFSM_CU_FLAGS "SHELL:-Xarch_host -ffp-contract=off")
-set(UFSM_STRICT_UNITS nn_gpudec nn_cf nn_ftrace nn_latvol nn_band nn_fibre nn_inkfly nn_gpuenc nn_mcodes nn_faces nn_render)
+set(UFSM_STRICT_UNITS nn_gpudec nn_cf nn_ftrace nn_latvol nn_band nn_fibre nn_inkfly nn_gpuenc nn_mcodes nn_faces nn_render nn_hgs)
 set(UFSM_TYPEDEFS UFSM_ARCH=${UFSM_ARCH})
 if(UFSM_VERIFY)
   list(APPEND UFSM_TYPEDEFS UFSM_ALL_TYPES)

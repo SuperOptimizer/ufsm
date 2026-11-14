@@ -211,10 +211,20 @@ extern "C" float nn_get_grad_scale(void) { return g_gscale; }
    fp16 logit gradients and the coarse fp16 planes sit in fp16's normal range instead of its subnormals (P 768: 128 / N at N ~ 1e8 voxels
    = 1.3e-6, a few bits and a dead zone below |residual| ~0.02). train.c sets it per window around the head's gradient pass from the
    window's counts (hgs_choose) and back to 1 after; per host thread (each GPU's thread its own). A power of two scales fp16 / fp32
-   values exactly wherever they stay normal: with nothing subnormal before, every gradient is bit-identical */
-thread_local float g_hgs = 1.f;
-extern "C" void nn_set_head_gscale(float s) { g_hgs = s; }
-extern "C" float nn_get_head_gscale(void) { return g_hgs; }
+   values exactly wherever they stay normal: with nothing subnormal before, every gradient is bit-identical.
+   Device-side since 11-14 (hgsdev): g_hgsp points at a device {s, 1 / s} (train.c: nn_hgs_choose's output, chosen without a host sync);
+   the producers multiply their scale argument by s in the kernel (GSHP, __fmul_rn: the bits of the host product, s a power of two), the
+   consumers by 1 / s. nullptr = s 1, the old launches. nn_set_head_gscale(s): tests, a host value through a per-device buffer */
+thread_local const float *g_hgsp = nullptr;
+extern "C" void nn_set_head_gscale_dev(const float *p) { g_hgsp = p; }
+extern "C" const float *nn_get_head_gscale_dev(void) { return g_hgsp; }
+extern "C" void nn_set_head_gscale(float s) {
+    if (s == 1.f) { g_hgsp = nullptr; return; }
+    static thread_local float *buf[8]; int dv = 0; cudaGetDevice(&dv); dv &= 7;
+    if (!buf[dv]) CK(cudaMalloc(&buf[dv], 2 * sizeof(float)));
+    const float h[2] = {s, 1.f / s}; CK(cudaMemcpy(buf[dv], h, sizeof h, cudaMemcpyHostToDevice));   /* (tests: synchronous; s a power of two, 1 / s exact) */
+    g_hgsp = buf[dv];
+}
 int g_gradbf = 1;
 extern "C" void nn_set_grad_bf16(int on) { g_gradbf = on; }
 extern "C" int nn_get_grad_bf16(void) { return g_gradbf; }

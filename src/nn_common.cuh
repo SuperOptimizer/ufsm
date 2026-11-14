@@ -89,8 +89,11 @@ extern "C" int nn_exec_manifest(char *buf, size_t n);
 extern "C" int nn_get_f16(void);
 #define LPDT(flag) ((flag) ? (g_h16 ? 2 : 1) : 0)   /* storage code of the lp_* (nn_fp8.cu) entry points: 0 fp32, 1 bf16, 2 fp16 */
 extern float g_gscale;
-extern thread_local float g_hgs;   /* nn_set_head_gscale: the head-gradient plane scale (1 outside the head's gradient pass) */
-#define GSH (g_gscale * g_hgs)     /* the loss-gradient producers' scale: the gradient scale x the head plane scale */
+extern thread_local const float *g_hgsp;   /* nn_set_head_gscale(_dev): the head-gradient plane scale, device {s, 1 / s} (nullptr: 1, outside the head's gradient pass) */
+#define GSH g_gscale                           /* the loss-gradient producers' scale argument; x s in the kernel from GSHP */
+#define GSHP g_hgsp
+/* a producer kernel's scale x the head plane scale (hp: GSHP); __fmul_rn: never contracted into a following add */
+static __device__ __forceinline__ float hgs_mul(float v, const float *hp) { return hp ? __fmul_rn(v, hp[0]) : v; }
 extern "C" void nn_set_grad_scale(float s);
 extern "C" float nn_get_grad_scale(void);
 extern int g_gradbf;
@@ -2246,7 +2249,8 @@ template <typename GT, typename LT> __device__ __forceinline__ GT loss_grad_v(co
 static inline dim3 lg_grid(size_t S, int NC) { return dim3((unsigned)((S + 256 * LG_V - 1) / (256 * LG_V)), (unsigned)NC); }
 template <typename GT, typename LT = float> __global__ void __launch_bounds__(256) loss_grad_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N,
                             int C, size_t S, const float *st, float dice_w, const float *fin, GT *gl, float pw, float gscale, int tol, const uint8_t *code, int D, int H,
-                            int W, float rec_w = 0.f, int unit_c = -1) {   /* unit_c: the channel whose mask weight counts as 0 / 1 (nn_set_loss_unit_ch7) */
+                            int W, float rec_w = 0.f, int unit_c = -1, const float *hp = nullptr) {   /* unit_c: the channel whose mask weight counts as 0 / 1 (nn_set_loss_unit_ch7); hp: GSHP */
+    gscale = hgs_mul(gscale, hp);
     const int nc = blockIdx.y, n = nc / C; const bool unit = nc % C == unit_c;
     const size_t v0 = (size_t)blockIdx.x * (256 * LG_V) + threadIdx.x, b0 = (size_t)nc * S;
     const bool on = w[nc] != 0;
@@ -2277,8 +2281,8 @@ extern "C" void nn_loss(const float *logits, const uint8_t *t, const uint8_t *m,
 
 __global__ void sheet_gather_k(const float *lg,shape5 s,const float *xyz,size_t np,int z0,int lo,int hi,double *out);
 extern "C" void nn_sheet_gather(const float *lg,shape5 s,const float *coords,size_t np,int z0,int lo,int hi,double *values);
-template<typename T> __global__ void sheet_scatter_k(T *gl,const uint64_t *idx,const float *v,size_t n,float scale) {
-    size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x;
+template<typename T> __global__ void sheet_scatter_k(T *gl,const uint64_t *idx,const float *v,size_t n,float scale,const float *hp=nullptr) {
+    size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x; scale=hgs_mul(scale,hp);
     if (i<n) gl[idx[i]]=f2h<T>(h2f(gl[idx[i]])+v[i]*scale);
 }
 extern "C" void nn_sheet_scatter(float *gl,const uint64_t *indices,const float *values,size_t n,int h16);
