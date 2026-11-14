@@ -711,6 +711,7 @@ void nn_ink_targets_smooth(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m,
 void nn_ink_air(const uint8_t *pap, size_t n, int z0, int H, int W, int S, float eps, uint8_t *t, uint8_t *m);   /* train --ink-air S: unlabelled air voxels on the S-lattice -> ink 0 (the smoothed 0), mask 1 */
 void nn_phase_trunc(const void *lc, const void *ls, const uint8_t *t, uint8_t *m, size_t n, float tau, float kappa);   /* robust phase loss: confident (>= kappa) predictions off their label by > tau turns leave the mask (fp16 logits) */
 void nn_phase_trunc_counts(unsigned long long out[2]);   /* labelled voxels / dropped since the last call */
+void nn_sheet_mask_z(const uint8_t *phase, int d, int h, int w, int s, float lo, float hi, uint8_t *m, int z0, int z1);   /* train --sheet-mask: the phase mask of phase-0 (labelled sheet) voxels x ramp(local spacing LO..HI voxels), planes [z0, z1) of the window into m (planes of z1 - z0) */
 void nn_unwrap_targets(const uint8_t *phase, int d, int h, int w, int s, float dscale, uint8_t *t, uint8_t *m);   /* task unwrap: sign-free normal n n^T (6) and density min(1, dscale rho) (x255, 7 planes) from the phase gradient over +-s voxels; mask */
 /* the same with the density code (0: min(1, x), 1: x / (1 + x), x = dscale rho: never saturates) and the mask holding the packed-sheet
    loss weight (1 at a spacing um / rho of packed_um or more, up to packed_w at packed_um / 2; um: the batch's voxel size in um) */

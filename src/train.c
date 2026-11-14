@@ -295,7 +295,8 @@ static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static fl
 static int g_ink_air;   /* --ink-air S (--ink-head, needs the --rv papyrus plane): unlabelled air voxels on the S-voxel window lattice -> ink 0 targets (nn_ink_air) */
 static float g_ink_smooth;   /* --ink-smooth EPS (--ink-head): label smoothing of the ink BCE target, t (1 - eps) + eps / 2 (villa: 0.1) */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
-static int g_dens_code; static float g_packed_w, g_packed_um = 120.f;   /* --density-code, --packed-weight, --packed-um (task unwrap) */
+static int g_dens_code; static float g_packed_w, g_packed_um = 120.f, g_dens_um, g_sheet_lo, g_sheet_hi;   /* --density-um U: x = density_scale rho (U / window um) (physical); --sheet-mask LO,HI */   /* --density-code, --packed-weight, --packed-um (task unwrap) */
+static inline float dens_scale_win(float um) { return g_dens_um > 0 && um > 0 ? g_dens_scale * g_dens_um / um : g_dens_scale; }   /* the window's density scale: physical with --density-um */
 static float g_ptrunc_tau, g_ptrunc_kappa = 0.5f; static int g_ptrunc_from = 5000, g_ptrunc_on;   /* --phase-trunc TAU [--phase-trunc-conf K] [--phase-trunc-from STEP]: the robust phase loss (nn_phase_trunc), on from STEP */
 static int g_gl_inplace;   /* the logit gradient over the fp16 logits (set before the memory planner) */
 static int g_head_slab;    /* unwrap: head, losses and head backward per z-slab (no whole-window logits or derived targets; set before the planner) */
@@ -1483,7 +1484,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         const shape5 one = {1, 1, nz, H, W}, two = {1, 2, nz, H, W}, seven = {1, 7, nz, H, W};
         static int tgf_on = -1; if (tgf_on < 0) tgf_on = !getenv("UFSM_SLAB_TG") || ufsm_env_on("UFSM_SLAB_TG");   /* (UFSM_SLAB_TG=0: the five kernels) */
         const int tgf = tgf_on && !tskip && !g_ptrunc_on && !pdir && (!g_rv || pap);   /* the phase-derived targets in one kernel (nn_slab_targets, byte-identical) */
-        if (tgf) nn_slab_targets(sdb, g_rv ? pap : nullptr, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, g_rv ? g_rv_vw : 1.f,
+        if (tgf) nn_slab_targets(sdb, g_rv ? pap : nullptr, D, H, W, g_norm_s, dens_scale_win(d->um), g_dens_code, d->um, g_packed_um, g_packed_w, g_rv ? g_rv_vw : 1.f,
                                  d->sidet, d->sidem, g_rv ? d->rvt : nullptr, d->rvm, d->nt, d->nm, z0, z1);
         else if (!tskip) nn_phase_targets(sdb + vb, ns, d->sidet, d->sidem);
         FT("  t phase targets");
@@ -1506,8 +1507,9 @@ static void head_slab_pass(gpu_state *d, int pass) {
         }
         if (g_ptrunc_on && !tskip) nn_phase_trunc(LGC(g_side_ch), LGC(g_side_ch + 1), d->sidet, d->sidem, ns, g_ptrunc_tau, g_ptrunc_kappa);   /* robust phase loss (both passes: the same mask) */
         if (g_packed_w > 1 && !tskip && !tgf) nn_packed_mask_z(sdb, D, H, W, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem, z0, z1);   /* packed sheets weigh more */
+        if (g_sheet_hi > 0 && !tskip) nn_sheet_mask_z(sdb, D, H, W, g_norm_s, g_sheet_lo, g_sheet_hi, d->sidem, z0, z1);   /* labelled sheet voxels: weight by the spacing (after the fused targets too) */
         FT("  t packed mask (side)");
-        if (!tskip && !tgf) nn_unwrap_targets2_z(sdb, D, H, W, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1); FT("  t normal targets");
+        if (!tskip && !tgf) nn_unwrap_targets2_z(sdb, D, H, W, g_norm_s, dens_scale_win(d->um), g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm, z0, z1); FT("  t normal targets");
         if (tchk) {   /* the planes just built in the one-slab buffers against the cache's, then on with the cache as a training step would */
             const size_t nb[6] = {(size_t)g_side_nc * ns, ns, g_rv ? 2 * ns : 0, g_rv ? ns : 0, 7 * ns, ns}; static const char *const nm6[6] = {"phase targets", "phase mask", "rv targets", "rv mask", "normal targets", "normal mask"};
             nn_sync();
@@ -2222,6 +2224,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         if (g_ptrunc_on) { fprintf(stderr, "--phase-trunc needs the head-slab loss path (task unwrap / unwrap2, B 1, no --split; UFSM_HEAD_SLAB on)\n"); abort(); }
         if (g_side == 2) nn_phase_targets(d->sdb, l3, d->sidet, d->sidem); else nn_side_targets(d->sdb, l3, d->sidet, d->sidem);
         if (g_side == 2 && g_unwrap && g_packed_w > 1) nn_packed_mask(d->sdb, os.d, os.h, os.w, g_norm_s, d->um, g_packed_um, g_packed_w, d->sidem);   /* packed sheets weigh more */
+        if (g_side == 2 && g_unwrap && g_sheet_hi > 0) nn_sheet_mask_z(d->sdb, os.d, os.h, os.w, g_norm_s, g_sheet_lo, g_sheet_hi, d->sidem, 0, os.d);
         if (ufsm_env_on("UFSM_SIDE_CHECK")) {   /* what the side / phase loss reads: known labels and the mask */
             uint8_t *h = malloc(2 * l3); nn_sync(); nn_d2h(h, d->sdb, l3); nn_d2h(h + l3, d->sidem, l3);
             size_t kn = 0, mk = 0; for (size_t k = 0; k < l3; k++) { kn += h[k] != 255; mk += h[l3 + k] != 0; }
@@ -2248,7 +2251,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     }
     if (g_unwrap) {   /* normal n n^T and density from the phase gradient; split: halo planes are the other GPU's */
         const size_t l3 = (size_t)os.d * os.h * os.w, eb = g_g16 ? 2 : 4, le = unet_logits_h16(d->u) ? 2 : 4;
-        nn_unwrap_targets2(d->sdb, os.d, os.h, os.w, g_norm_s, g_dens_scale, g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm);
+        nn_unwrap_targets2(d->sdb, os.d, os.h, os.w, g_norm_s, dens_scale_win(d->um), g_dens_code, d->um, g_packed_um, g_packed_w, d->nt, d->nm);
         if (d->side == 0) nn_zero(d->nm + l3 - (size_t)g_h0 * P * P, (size_t)g_h0 * P * P);
         else if (d->side == 1) nn_zero(d->nm, (size_t)g_h0 * P * P);
         const shape5 seven = {1, 7, os.d, os.h, os.w};
@@ -2282,7 +2285,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         if (g_count_lambda > 0) {   /* turns along sheet-normal segments: the density integral against the true count */
             const size_t dch = (size_t)(g_norm_ch + 6);
             nn_count_strata(g_cnt_ns, g_cnt_edges, d->um);
-            nn_count_loss((const char *)lg + dch * l3 * le, d->sdb, os.d, os.h, os.w, g_norm_s, g_count_K, g_count_L, g_dens_scale,
+            nn_count_loss((const char *)lg + dch * l3 * le, d->sdb, os.d, os.h, os.w, g_norm_s, g_count_K, g_count_L, dens_scale_win(d->um),
                           ((uint64_t)d->dev << 48) ^ d->cnt_step++, g_count_lambda, train ? (char *)d->gl + dch * l3 * eb : nullptr, d->cnt_acc, d->cnt_seg, d->cnt_nv, d->cnt_out);
         }
         if (g_unwrap2)   /* the winding mod 4, gauge-free, over the phase mask (its halo planes zeroed above) */
@@ -2715,6 +2718,12 @@ int cmd_train(int argc, char **argv) {
            scale x voxel size, 77 um at the default codes); --packed-weight W (> 1): the phase and normal / density losses weigh a voxel
            1 at a sheet spacing of --packed-um (120) or more, rising to W at half of it (the nets under-count packed sheets) */
         g_dens_code = atoi(opt(argc,argv,"--density-code","0")); g_packed_w = (float)atof(opt(argc,argv,"--packed-weight","0")); g_packed_um = (float)atof(opt(argc,argv,"--packed-um","120"));
+        g_dens_um = (float)atof(opt(argc,argv,"--density-um","0"));
+        if (g_dens_um < 0) { fprintf(stderr,"--density-um >= 0\n"); return 2; }
+        if (sscanf(opt(argc,argv,"--sheet-mask","0,0"), "%f,%f", &g_sheet_lo, &g_sheet_hi) < 1) g_sheet_hi = g_sheet_lo = 0;
+        if (g_sheet_hi > 0 && !(g_sheet_hi > g_sheet_lo && g_sheet_lo >= 0)) { fprintf(stderr,"--sheet-mask LO,HI (voxels, 0 <= LO < HI)\n"); return 2; }
+        if (g_sheet_hi > 0) fprintf(stderr, "sheet mask: the phase weight of labelled sheet voxels ramps 0 at a local spacing of %g voxels to 1 at %g (--sheet-mask)\n", g_sheet_lo, g_sheet_hi);
+        if (g_dens_um > 0) fprintf(stderr, "density: physical code x = %g rho (%g um / window um) (--density-um)\n", g_dens_scale, g_dens_um);
         g_ptrunc_tau = (float)atof(opt(argc,argv,"--phase-trunc","0")); g_ptrunc_kappa = (float)atof(opt(argc,argv,"--phase-trunc-conf","0.5")); g_ptrunc_from = atoi(opt(argc,argv,"--phase-trunc-from","5000"));
         if (!(g_ptrunc_tau >= 0 && g_ptrunc_tau < 0.5f) || !(g_ptrunc_kappa >= 0 && g_ptrunc_kappa <= 1)) { fprintf(stderr,"--phase-trunc 0..0.5 turns, --phase-trunc-conf 0..1\n"); return 2; }
         if (g_ptrunc_tau > 0) fprintf(stderr, "robust phase loss: confident (|phasor| >= %g) predictions more than %g turn off their label drop out of the phase mask from step %d\n", g_ptrunc_kappa, g_ptrunc_tau, g_ptrunc_from);
@@ -4429,9 +4438,10 @@ int cmd_train(int argc, char **argv) {
     }
     if (g_unwrap2) {   /* channel layout of the unwrap2 heads (predict --fit-fields reads "version":2) */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
-        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"unwrap\":{\"version\":2,\"channels\":{\"phase\":[%d,%d],\"normal\":[%d,%d,%d,%d,%d,%d],\"density\":%d,\"wind4\":[%d,%d]},\"normal\":\"n_z^2, n_y^2, n_x^2, 0.5+n_z n_y, 0.5+n_z n_x, 0.5+n_y n_x\",\"density\":\"%s, rho = |grad phase| turns per voxel\",\"wind4\":\"0.5+0.5cos / sin(2pi W/4), W the stored phase unwrapped over the window, gauge-free\",\"density_scale\":%.9g,\"density_code\":%d,\"packed_weight\":%.9g,\"packed_um\":%.9g,\"normal_lambda\":%.9g,\"density_lambda\":%.9g,\"normal_step\":%d,\"wind4_lambda\":%.9g,\"wind4_step\":%d,\"wind4_min\":%d,\"wind4_tile\":%d}}",
+        char dum_s[48] = ""; if (g_dens_um > 0) snprintf(dum_s, sizeof dum_s, ",\"density_um\":%.9g", g_dens_um);
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"unwrap\":{\"version\":2,\"channels\":{\"phase\":[%d,%d],\"normal\":[%d,%d,%d,%d,%d,%d],\"density\":%d,\"wind4\":[%d,%d]},\"normal\":\"n_z^2, n_y^2, n_x^2, 0.5+n_z n_y, 0.5+n_z n_x, 0.5+n_y n_x\",\"density\":\"%s, rho = |grad phase| turns per voxel\",\"wind4\":\"0.5+0.5cos / sin(2pi W/4), W the stored phase unwrapped over the window, gauge-free\",\"density_scale\":%.9g%s,\"density_code\":%d,\"packed_weight\":%.9g,\"packed_um\":%.9g,\"normal_lambda\":%.9g,\"density_lambda\":%.9g,\"normal_step\":%d,\"wind4_lambda\":%.9g,\"wind4_step\":%d,\"wind4_min\":%d,\"wind4_tile\":%d}}",
                  g_side_ch,g_side_ch+1,g_norm_ch,g_norm_ch+1,g_norm_ch+2,g_norm_ch+3,g_norm_ch+4,g_norm_ch+5,g_norm_ch+6,g_w4_ch,g_w4_ch+1,
-                 g_dens_code ? "x / (1 + x), x = density_scale rho" : "min(1, density_scale rho)",g_dens_scale,g_dens_code,g_packed_w,g_packed_um,g_norm_lambda,g_dens_lambda,g_norm_s,g_w4_lambda,sc.wind4_step,sc.wind4_min,sc.wind4_tile);
+                 g_dens_code ? "x / (1 + x), x = density_scale rho" : "min(1, density_scale rho)",g_dens_scale,dum_s,g_dens_code,g_packed_w,g_packed_um,g_norm_lambda,g_dens_lambda,g_norm_s,g_w4_lambda,sc.wind4_step,sc.wind4_min,sc.wind4_tile);
         if (g_rv) {   /* --rv 1: channels 0-1 are recto / verso side papyrus, not the phase (predict --fit-fields refuses it); --rv 2: its own pair (version 2) */
             size_t n2=strlen(runtime_extra); runtime_extra[n2-2]=0;
             if (g_rv == 2) snprintf(runtime_extra+n2-2,sizeof runtime_extra-n2+2,",\"rv\":{\"version\":2,\"recto\":%d,\"verso\":%d,\"iso\":%d,\"lambda\":%.9g,\"rule\":\"recto side = phase < 1/2 turn (recto face k .. midway to k+1), verso the outer half; papyrus only, void 0\"}}}",g_rv_ch,g_rv_ch+1,sc.rv_iso,g_rv_lambda);
@@ -4443,9 +4453,10 @@ int cmd_train(int argc, char **argv) {
         }
     } else if (g_unwrap) {   /* channel layout of the unwrap heads */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
-        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"unwrap\":{\"version\":1,\"channels\":{\"recto\":0,\"ink\":1,\"phase\":[%d,%d],\"normal\":[%d,%d,%d,%d,%d,%d],\"density\":%d},\"normal\":\"n_z^2, n_y^2, n_x^2, 0.5+n_z n_y, 0.5+n_z n_x, 0.5+n_y n_x\",\"density\":\"%s, rho = |grad phase| turns per voxel\",\"density_scale\":%.9g,\"density_code\":%d,\"packed_weight\":%.9g,\"packed_um\":%.9g,\"ink_lambda\":%.9g,\"ink_dice\":%.9g,\"normal_lambda\":%.9g,\"density_lambda\":%.9g,\"normal_step\":%d}}",
+        char dum_s[48] = ""; if (g_dens_um > 0) snprintf(dum_s, sizeof dum_s, ",\"density_um\":%.9g", g_dens_um);
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"unwrap\":{\"version\":1,\"channels\":{\"recto\":0,\"ink\":1,\"phase\":[%d,%d],\"normal\":[%d,%d,%d,%d,%d,%d],\"density\":%d},\"normal\":\"n_z^2, n_y^2, n_x^2, 0.5+n_z n_y, 0.5+n_z n_x, 0.5+n_y n_x\",\"density\":\"%s, rho = |grad phase| turns per voxel\",\"density_scale\":%.9g%s,\"density_code\":%d,\"packed_weight\":%.9g,\"packed_um\":%.9g,\"ink_lambda\":%.9g,\"ink_dice\":%.9g,\"normal_lambda\":%.9g,\"density_lambda\":%.9g,\"normal_step\":%d}}",
                  g_side_ch,g_side_ch+1,g_norm_ch,g_norm_ch+1,g_norm_ch+2,g_norm_ch+3,g_norm_ch+4,g_norm_ch+5,g_norm_ch+6,
-                 g_dens_code ? "x / (1 + x), x = density_scale rho" : "min(1, density_scale rho)",g_dens_scale,g_dens_code,g_packed_w,g_packed_um,g_ink_lambda,g_ink_dice,g_norm_lambda,g_dens_lambda,g_norm_s);
+                 g_dens_code ? "x / (1 + x), x = density_scale rho" : "min(1, density_scale rho)",g_dens_scale,dum_s,g_dens_code,g_packed_w,g_packed_um,g_ink_lambda,g_ink_dice,g_norm_lambda,g_dens_lambda,g_norm_s);
         if (g_cond) {   /* conditioned inference (predict --cond-sweep): inside the unwrap object */
             n=strlen(runtime_extra); runtime_extra[n-2]=0;
             snprintf(runtime_extra+n-2,sizeof runtime_extra-n+2,",\"cond\":{\"version\":1,\"inputs\":[4,5,6],\"input\":\"cos, sin of 2 pi q / 14, mask\",\"channels\":[%d,%d,%d,%d],\"periods\":[14,2],\"lambda\":%.9g,\"loss\":\"%s\"}}}",

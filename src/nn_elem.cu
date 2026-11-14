@@ -1,5 +1,6 @@
 /* CUDA ops: elem section of the former nn.cu */
 #include "nn_common.cuh"
+#include "phase_grad.h"
 
 __global__ void gn_finalize_k(const double *sums, int NG, size_t len, float eps, float *mean, float *rstd) {
     int ng = blockIdx.x * blockDim.x + threadIdx.x;
@@ -745,22 +746,13 @@ extern "C" void nn_cond_place(const float *lg, const uint8_t *ct, int W, int hal
     const int I = W - 2 * halo; const size_t i3 = (size_t)I * I * I;
     cond_place_k<<<nblk(i3, 256), 256>>>(lg, ct, W, halo, oz, oy, ox, bz, by, bx, N, ch14, c14, p1, recto, done); KCHECK();
 }
-/* task unwrap: the winding-phase gradient by wrap-aware central differences over +-s voxels (all of v, v +- s e_d known):
+/* task unwrap: the winding-phase gradient over +-s voxels as the sum of wrapped unit steps (phase_grad.h; all of the chain known):
    g = dphase / dx in turns per voxel, rho = |g| (the sheet density, 1 / spacing), n = g / rho. Targets (x255) in 7 planes of n
    voxels: n_z^2, n_y^2, n_x^2, 0.5 + n_z n_y, 0.5 + n_z n_x, 0.5 + n_y n_x (sign-free n n^T), min(1, dscale rho); mask = all known
    and rho > 1/1000 (the density scale: 32 at 2.4 um, 32 x 2.4 / um at coarser voxels). The phase is a scalar transformed with the batch's symmetry, so the gradient is in output coordinates. */
-__device__ __forceinline__ int phase_diff(int a, int b) { int d = a - b; d -= 252 * (d > 126); d += 252 * (d <= -126); return d; }
-/* the phase gradient at voxel i over +-s voxels (turns per voxel), 0 when v or a neighbour is unknown or outside */
-__device__ __forceinline__ int phase_grad(const uint8_t *ph, size_t i, int D, int H, int W, int s, float g[3]) {
-    const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
-    if (ph[i] >= 252 || z < s || z >= D - s || y < s || y >= H - s || x < s || x >= W - s) return 0;
-    const size_t sz = (size_t)s * H * W, sy = (size_t)s * W;
-    const uint8_t a[6] = {ph[i + sz], ph[i - sz], ph[i + sy], ph[i - sy], ph[i + s], ph[i - s]};
-    for (int k = 0; k < 6; k++) if (a[k] >= 252) return 0;
-    const float sc = 1.f / (2.f * s * 252.f);
-    g[0] = phase_diff(a[0], a[1]) * sc; g[1] = phase_diff(a[2], a[3]) * sc; g[2] = phase_diff(a[4], a[5]) * sc;
-    return 1;
-}
+/* the phase gradient at voxel i over +-s voxels (turns per voxel; src/phase_grad.h: the sum of wrapped unit steps, no aliasing down to
+   2.5 voxels of spacing), 0 when v or a voxel on its chains is unknown or outside, or a step is unresolved */
+__device__ __forceinline__ int phase_grad(const uint8_t *ph, size_t i, int D, int H, int W, int s, float g[3]) { return pg_grad(ph, i, D, H, W, s, g) == 1; }
 /* the packed-sheet loss weight of a voxel whose phase gradient is rho turns per voxel of um microns: 1 at a sheet spacing (um / rho)
    of packed_um or more, rising linearly to packed_w at packed_um / 2 and below (packed_w <= 1: 1) */
 __device__ __forceinline__ uint8_t packed_wt(float rho, float um, float packed_um, float packed_w) {
@@ -1315,4 +1307,22 @@ extern "C" void nn_phase_trunc_counts(unsigned long long out[2]) {   /* every de
         CK(cudaMemcpy(c, g_ptrunc_cnt[dev], sizeof c, cudaMemcpyDeviceToHost)); CK(cudaMemset(g_ptrunc_cnt[dev], 0, sizeof c)); out[0] += c[0]; out[1] += c[1];
     }
     cudaSetDevice(cur);
+}
+
+/* train --sheet-mask LO,HI: the phase loss weight of the labelled sheet voxels (phase exactly 0: the pair rule writes 0 on every stamped
+   voxel, a gap voxel never reads 0) scaled by 0 at a local sheet spacing (1 / |grad phase|, voxels) of LO or less and 1 at HI or more.
+   A stamped voxel lies up to 0.87 voxel off its mesh, so its true phase is off by up to 0.87 / sp turn: rms 0.13-0.19 at sp 2-3, 0.10 at
+   4, 0.06 at 6, 0.05 at 8 (oblique sheets; tests/test_phaselab.c), and 33-65 % of the voxels at sp 2-3 are such voxels (DESIGN 2026-11-14).
+   The rate is pg_rate's (any known axis neighbours, not the full stencil); none known keeps the weight. */
+__global__ void sheet_mask_k(const uint8_t *ph, int D, int H, int W, int s, float lo, float hi, uint8_t *m, size_t i0, size_t n) {
+    const size_t li = blockIdx.x * (size_t)blockDim.x + threadIdx.x, i = i0 + li;
+    if (li >= n || !m[li] || ph[i] != 0) return;
+    const float rho = pg_rate(ph, i, D, H, W); if (rho == 0.f) return;
+    const float f = pg_sheet_f(rho, lo, hi);
+    m[li] = (uint8_t)rintf((float)m[li] * f);
+}
+extern "C" void nn_sheet_mask_z(const uint8_t *phase, int d, int h, int w, int s, float lo, float hi, uint8_t *m, int z0, int z1) {
+    if (!(hi > lo)) return;
+    const size_t hw = (size_t)h * w, n = (size_t)(z1 - z0) * hw;
+    sheet_mask_k<<<nblk(n, 256), 256>>>(phase, d, h, w, s, lo, hi, m, (size_t)z0 * hw, n); KCHECK();
 }

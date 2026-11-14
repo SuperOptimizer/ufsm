@@ -1576,7 +1576,9 @@ static int predict_one(int argc, char **argv) {
     float ffds = 32.f; int ffdc = 0;   /* the checkpoint's density code: min(1, density_scale rho), or x / (1 + x) (density_code 1) */
     if (ffd) { FILE *cf = fopen(ckpt, "rb"); char *hb = malloc(1 << 16); size_t nr = cf ? fread(hb, 1, (1 << 16) - 1, cf) : 0; if (cf) fclose(cf); hb[nr] = 0;
                char *e = memchr(hb, '\n', nr); if (e) *e = 0; const char *q = strstr(hb, "\"density_scale\":"); if (q) ffds = (float)atof(q + 16);
-               q = strstr(hb, "\"density_code\":"); if (q) ffdc = atoi(q + 15); free(hb); }
+               q = strstr(hb, "\"density_code\":"); if (q) ffdc = atoi(q + 15);
+               q = strstr(hb, "\"density_um\":"); if (q && um > 0) { const double ffdu = atof(q + 13); if (ffdu > 0) { ffds *= (float)(ffdu / (um * (1 << level))); fprintf(stderr, "predict: physical density code (density_um %g): density scale %g at this level's %g um\n", ffdu, ffds, um * (1 << level)); } }
+               free(hb); }
     int pap_cond = 0; const int pap = papyrus_checkpoint(ckpt, &pap_cond) == 1;   /* task papyrus: the conditioned nets take the cutoff per window */
     const double pcut = pap && pap_cond ? atof(opt(argc, argv, "--papyrus-cut", "-1")) : -1;
     if (pap && pap_cond && !(pcut >= 0 && pcut <= 255)) { fprintf(stderr, "predict: %s is conditioned on the papyrus cutoff: --papyrus-cut T (raw CT units 0..255, e.g. 80)\n", ckpt); return 2; }
