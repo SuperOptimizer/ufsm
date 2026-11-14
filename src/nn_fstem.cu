@@ -86,8 +86,9 @@ __device__ __forceinline__ void fsu_side(const fs_up &up, int ch, fs_tile t, int
         }
 }
 template <bool UP>
-__global__ void __launch_bounds__(FS_BT) fstem_fwd_k(const f16 *__restrict__ x, int D, int H, int W, int z0, int nz, const float *__restrict__ p, int C, int nout, fs_chs chs, f16 *__restrict__ lg, size_t ns, fs_up up) {
+__global__ void __launch_bounds__(FS_BT) fstem_fwd_k(const f16 *__restrict__ x, int D, int H, int W, int z0, int nz, const float *__restrict__ p, int C, int nout, fs_chs chs, f16 *__restrict__ lg, size_t ns, fs_up up, int ws) {
     __shared__ __align__(16) float sp[FS_MAXC + FS_MAXO * FS_MAXC];   /* b1, W2 */
+    __shared__ float rsc[FS_MAXC], rinv[FS_MAXC];   /* W1's row scales (fs_w1_exp) and their inverses */
     __shared__ __align__(16) __half sr[16][FS_RW];
     __shared__ float hs[FS_BT][FS_FS];
     __shared__ float qs[UP ? FS_MAXO * 4 * FSU_NC : 1];
@@ -125,10 +126,12 @@ __global__ void __launch_bounds__(FS_BT) fstem_fwd_k(const f16 *__restrict__ x, 
             return;
         }
     }
-    unsigned af[4][4];   /* W1's A fragments (rows c >= C zero) */
+    if (tid < FS_MAXC) { const int e = tid < C ? fs_w1_exp(p + tid * FS_T, ws) : 0; rsc[tid] = ldexpf(1.f, e); rinv[tid] = ldexpf(1.f, -e); }   /* (fstemw: per-row power-of-two W1 scale) */
+    __syncthreads();
+    unsigned af[4][4];   /* W1's A fragments (rows c >= C zero), each row scaled by rsc */
     for (int s_ = 0; s_ < 4; s_++) for (int r = 0; r < 4; r++) {
         const int row = g + (r & 1) * 8, col = 16 * s_ + 2 * tq + (r >> 1) * 8;
-        const float w0 = row < C ? p[row * FS_T + col] : 0.f, w1 = row < C ? p[row * FS_T + col + 1] : 0.f;
+        const float w0 = row < C ? p[row * FS_T + col] * rsc[row] : 0.f, w1 = row < C ? p[row * FS_T + col + 1] * rsc[row] : 0.f;
         const __half2 h2 = __floats2half2_rn(w0, w1); af[s_][r] = *(const unsigned *)&h2;
     }
     __syncthreads();
@@ -143,7 +146,7 @@ __global__ void __launch_bounds__(FS_BT) fstem_fwd_k(const f16 *__restrict__ x, 
             mma16816<f16>(c4, af[s_], bf);
         }
         /* c4: pre[c g, g + 8][blocks 2 tq, 2 tq + 1] */
-        for (int r = 0; r < 4; r++) { const int c = g + (r >> 1) * 8, b = 2 * tq + (r & 1); if (c < C && j0 + b < FS_BT) hs[j0 + b][c] = fs_silu(c4[r] + b1[c]); }
+        for (int r = 0; r < 4; r++) { const int c = g + (r >> 1) * 8, b = 2 * tq + (r & 1); if (c < C && j0 + b < FS_BT) hs[j0 + b][c] = fs_silu(c4[r] * rinv[c] + b1[c]); }
     }
     __syncthreads();
     const int j = tid;
@@ -177,8 +180,9 @@ __device__ __forceinline__ void fs_mma_tf32(float *c, const unsigned *a, const u
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 enum { FS_BH = FS_BT / 2 };   /* the backward's half tiles: 22 KB of shared memory, 4 blocks an SM (one tile at a time: 2, 16 % occupancy, 4.0 ms) */
-__global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, int D, int H, int W, int z0, int nz, const float *__restrict__ p, int C, int nout, fs_chs chs, const f16 *__restrict__ g, size_t ns, float *__restrict__ gp) {   /* gp: this block's partial gradient row (part + blockIdx.x * npar) */
+__global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, int D, int H, int W, int z0, int nz, const float *__restrict__ p, int C, int nout, fs_chs chs, const f16 *__restrict__ g, size_t ns, float *__restrict__ gp, int ws) {   /* gp: this block's partial gradient row (part + blockIdx.x * npar) */
     __shared__ float sp[FS_MAXC + FS_MAXO * FS_MAXC];   /* b1, W2 (W1 lives in the A fragments) */
+    __shared__ float rsc[FS_MAXC], rinv[FS_MAXC];
     __shared__ __align__(16) __half sr[16][FS_RW];
     __shared__ float sh[FS_BH][FS_FS], sgp[FS_BH][FS_FS], sgo[FS_BH][FS_OS];
     const int tid = threadIdx.x, n2 = C + nout * C;
@@ -186,10 +190,12 @@ __global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, 
     gp += (size_t)blockIdx.x * (C * FS_T + n2);
     const float *b1 = sp, *W2 = sp + C;
     const int c0 = 2 * (tid / 16), t0 = 4 * (tid % 16), lane = tid & 31, wp = tid >> 5, gq = lane >> 2, tq = lane & 3;
-    unsigned af[4][4];   /* W1's A fragments for the recompute (as the forward: the same fp16 weights) */
+    if (tid < FS_MAXC) { const int e = tid < C ? fs_w1_exp(p + tid * FS_T, ws) : 0; rsc[tid] = ldexpf(1.f, e); rinv[tid] = ldexpf(1.f, -e); }
+    __syncthreads();
+    unsigned af[4][4];   /* W1's A fragments for the recompute (as the forward: the same scaled fp16 weights) */
     for (int s_ = 0; s_ < 4; s_++) for (int r = 0; r < 4; r++) {
         const int row = gq + (r & 1) * 8, col = 16 * s_ + 2 * tq + (r >> 1) * 8;
-        const __half2 h2 = __floats2half2_rn(row < C ? p[row * FS_T + col] : 0.f, row < C ? p[row * FS_T + col + 1] : 0.f); af[s_][r] = *(const unsigned *)&h2;
+        const __half2 h2 = __floats2half2_rn(row < C ? p[row * FS_T + col] * rsc[row] : 0.f, row < C ? p[row * FS_T + col + 1] * rsc[row] : 0.f); af[s_][r] = *(const unsigned *)&h2;
     }
     float d1[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}}, d2[4] = {0.f, 0.f, 0.f, 0.f}, db = 0.f;   /* dW1 n-tiles 2 wp, 2 wp + 1 (taps); dW2 n-tile wp (warps 0-1); b1 (tid < C) */
     const int h2 = H / 2, w2 = W / 2; const size_t ntile = (size_t)(nz / 2) * h2 * ((w2 + FS_BT - 1) / FS_BT), hw = (size_t)H * W;
@@ -208,7 +214,7 @@ __global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, 
                     bf[1] = *(const unsigned *)&sr[4 * s_ + 2 + tq / 2][2 * jb + 2 * (tq & 1)];
                     mma16816<f16>(c4, af[s_], bf);
                 }
-                for (int r = 0; r < 4; r++) { const int c = gq + (r >> 1) * 8, b = wp * 8 + 2 * tq + (r & 1); if (c < C) sh[b][c] = c4[r] + b1[c]; }
+                for (int r = 0; r < 4; r++) { const int c = gq + (r >> 1) * 8, b = wp * 8 + 2 * tq + (r & 1); if (c < C) sh[b][c] = c4[r] * rinv[c] + b1[c]; }
             }
             if (FS_BH > 32) for (int w = wp + FS_BT / 32; w * 8 < nh && w * 8 < FS_BH; w += FS_BT / 32) {   /* (64-block halves: warps take two n-tiles) */
                 const int j0 = jlo + w * 8; float c4[4] = {0.f, 0.f, 0.f, 0.f}; const int jb = j0 + gq < jlo + nh ? j0 + gq : jlo + nh - 1;
@@ -218,7 +224,7 @@ __global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, 
                     bf[1] = *(const unsigned *)&sr[4 * s_ + 2 + tq / 2][2 * jb + 2 * (tq & 1)];
                     mma16816<f16>(c4, af[s_], bf);
                 }
-                for (int r = 0; r < 4; r++) { const int c = gq + (r >> 1) * 8, b = w * 8 + 2 * tq + (r & 1); if (c < C) sh[b][c] = c4[r] + b1[c]; }
+                for (int r = 0; r < 4; r++) { const int c = gq + (r >> 1) * 8, b = w * 8 + 2 * tq + (r & 1); if (c < C) sh[b][c] = c4[r] * rinv[c] + b1[c]; }
             }
             for (int k = tid; k < nout * FS_BH; k += FS_BT) {   /* the output gradients summed over each block's 8 voxels, all threads (coalesced along x) */
                 const int o = k / FS_BH, j = k % FS_BH; float v = 0.f;
@@ -276,6 +282,9 @@ __global__ void fstem_red_k(const float *__restrict__ part, int nb, int npar, fl
     float s = 0.f; for (int b = 0; b < nb; b++) s += part[(size_t)b * npar + i];
     gp[i] += inv * s;   /* inv: 1 / the head plane scale (g_hgs, a power of two: exact; 1 = the old sums' bits) */
 }
+static int g_fs_ws = -1;   /* mgpu: env (UFSM_FSTEM_WSCALE=0: W1 straight to fp16, before 2026-11-14) */
+extern "C" int nn_fstem_wscale(void) { if (g_fs_ws < 0) { const char *e = getenv("UFSM_FSTEM_WSCALE"); g_fs_ws = !(e && *e == '0'); } return g_fs_ws; }
+extern "C" void nn_fstem_set_wscale(int on) { g_fs_ws = on; }
 static fs_chs fs_list(const int *chs, int nout) { fs_chs l; for (int o = 0; o < FS_MAXO; o++) l.c[o] = o < nout ? chs[o] : 0; return l; }
 static int fs_ok(int D, int H, int W, int z0, int nz, int C, int nout) {
     return C >= 1 && C <= FS_MAXC && nout >= 1 && nout <= FS_MAXO && !(D & 1) && !(H & 1) && !(W & 1) && !(z0 & 1) && !(nz & 1);
@@ -283,7 +292,7 @@ static int fs_ok(int D, int H, int W, int z0, int nz, int C, int nout) {
 extern "C" int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns) {
     if (!fs_ok(D, H, W, z0, nz, C, nout)) return 1;
     const size_t nt = (size_t)(nz / 2) * (H / 2) * ((W / 2 + FS_BT - 1) / FS_BT); if (!nt) return 0;
-    fstem_fwd_k<false><<<(unsigned)nt, FS_BT>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns, fs_up{}); KCHECK();
+    fstem_fwd_k<false><<<(unsigned)nt, FS_BT>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns, fs_up{}, nn_fstem_wscale()); KCHECK();
     return 0;
 }
 extern "C" int nn_fstem_up_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns,
@@ -292,7 +301,7 @@ extern "C" int nn_fstem_up_fwd(const void *x, int D, int H, int W, int z0, int n
     const int d = D / 4, h = H / 4, w = W / 4;
     const int lo = max(z0 / 4 - 1, 0), hi = min((z0 + nz) / 4, d - 1); if (lo < q0 || hi >= q0 + qd) return 1;   /* (the cell planes the taps read lie in [q0, q0 + qd)) */
     const size_t nt = (size_t)(nz / 2) * (H / 2) * ((W / 2 + FS_BT - 1) / FS_BT); if (!nt) return 0;
-    fstem_fwd_k<true><<<(unsigned)nt, FS_BT>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns, fs_up{(const f16 *)lc, d, h, w, q0, qd, side, base}); KCHECK();
+    fstem_fwd_k<true><<<(unsigned)nt, FS_BT>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns, fs_up{(const f16 *)lc, d, h, w, q0, qd, side, base}, nn_fstem_wscale()); KCHECK();
     return 0;
 }
 extern "C" int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, const void *g, size_t ns, float *gp) {
@@ -303,7 +312,7 @@ extern "C" int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, 
     static float *part[8]; static size_t cap[8]; int dv = 0; cudaGetDevice(&dv); dv &= 7;   /* (per device: one host thread per GPU) */
     const size_t need = (size_t)nbk * npar;
     if (need > cap[dv]) { if (part[dv]) cudaFree(part[dv]); if (cudaMalloc(&part[dv], need * 4) != cudaSuccess) { fprintf(stderr, "nn_fstem_bwd: no device memory\n"); abort(); } cap[dv] = need; }
-    fstem_bwd_k<<<nbk, FS_BT>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (const f16 *)g, ns, part[dv]); KCHECK();
+    fstem_bwd_k<<<nbk, FS_BT>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (const f16 *)g, ns, part[dv], nn_fstem_wscale()); KCHECK();
     fstem_red_k<<<(npar + 127) / 128, 128>>>(part[dv], (int)nbk, npar, gp, 1.f / g_hgs); KCHECK();   /* (g reads the head planes: their scale out) */
     return 0;
 }

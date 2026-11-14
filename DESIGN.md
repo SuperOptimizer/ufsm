@@ -6,6 +6,32 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The fine stem's W1 to fp16 with a per-row power-of-two scale (2026-11-14, branch fstemw-20261114, audit net#11)
+
+The stem's tensor-core forward and backward recompute (`nn_fstem.cu`), and predict's FFMA mirror (`nn_lathead.cu`), used to round W1
+(C x 64, `--fstem 16`) straight to fp16. That is the pattern the head fix (1b0f7b9) removed: a weight below 6.1e-5 lands in fp16
+subnormals, and below ~3e-8 it flushes to 0. Now each row c is multiplied by 2^e before the conversion, so its max |w| lies in
+[2^14, 2^15). The fp32 product (`c4`) is multiplied by 2^-e before the bias. Both scalings are exact. In fp16's normal range the
+rounded value is the same as before, so trained weights give the same bytes except where a weight was subnormal. The mirror builds
+the same effective weights, ldexp(fp16(w 2^e), -e), from the same `fs_w1_exp` (`nn_common.cuh`). The scale is on by default;
+`UFSM_FSTEM_WSCALE=0` restores the old conversion.
+
+**Measured on the checkpoints** (CPU, read-only; W1 = the first 1024 floats at fstem_off = np - gfilm - 1296):
+
+| checkpoint | step | min \|W1\| | median \|W1\| | max \|W1\| | smallest row max | below 6.1e-5 (subnormal) | fp16 rel. error: median / max per weight / worst row norm |
+|---|---|---|---|---|---|---|---|
+| scratch2 (try6) last.ckpt | 2357 | 2.1e-6 | 0.132 | 0.586 | 0.373 | 0.10 % | 1.7e-4 / 1.3e-2 / 2.4e-4 |
+| scratch2.try5 last.ckpt | 342 | 1.1e-4 | 0.132 | 0.583 | 0.372 | 0 | 1.7e-4 / 4.7e-4 / 2.5e-4 |
+
+So the bug is not active in try6. The rows sit at O(0.1) and the only subnormal weights are isolated near-zero entries. The worst
+per-weight error is 1.3 %, on a 2e-6 weight that hardly contributes. The per-row error stays at fp16's 2.4e-4. The scale guards against
+Muon / weight decay shrinking whole rows later (b1's median is 0.09 and W2's 0.006, both fp32, so neither is affected).
+
+**Test** (test_fstem, tiny-weight case like test_head_tc's): W1 ~ 2e-7 (all of it fp16-subnormal), b1 0, W2 ~ 1e5. The forward and
+dW2 (which reads the backward's recomputed pre-activations) are checked against a double reference, with the scale and without it.
+The pass condition is error < 3e-3 with the scale, and at least 10x worse without it, so the case really exercises the scale.
+test_lathead (mirror vs trainer) is unchanged. The GPU numbers come from the mega pass (this branch was built CPU-only).
+
 ## Ink head: per-scroll gating, validation twin, radial dropout, MIL reach in um (2026-11-14, branch inkfix-20261114)
 
 From the inkmil audit (/vesuvius/ufsm/audit-20261114/targeted/inkmil.md). The head is not at chance: inkpod-10000 crop AUC Paris 4 0.795, 0500P2 0.729,
