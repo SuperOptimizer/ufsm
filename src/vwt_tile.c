@@ -7,12 +7,14 @@
 #include <string.h>
 
 typedef struct { int n; double (*p)[3]; } umbt;
-static int umb_load(const char *path, umbt *u) {
+/* sc (--umb-scale): JSON units -> the volume's own voxels (0.25 for a level-0 umbilicus on a level-2 volume; the raw numbers were taken as the
+   volume's voxels, audit mini/coords #4) */
+static int umb_load(const char *path, umbt *u, double sc) {
     FILE *f = fopen(path, "rb"); if (!f) return -1; fseek(f, 0, SEEK_END); const long L = ftell(f); fseek(f, 0, SEEK_SET);
     char *t = malloc(L + 1); if (fread(t, 1, L, f) != (size_t)L) { fclose(f); free(t); return -1; } fclose(f); t[L] = 0;
     json *J = json_parse(t, L); free(t); const json *cp = J ? json_get(J, "control_points") : nullptr; if (!cp || !cp->n) { json_free(J); return -1; }
     u->n = (int)cp->n; u->p = malloc(cp->n * sizeof *u->p);
-    for (size_t i = 0; i < cp->n; i++) { const json *q = json_at(cp, i); u->p[i][0] = json_num(json_get(q, "x"), 0); u->p[i][1] = json_num(json_get(q, "y"), 0); u->p[i][2] = json_num(json_get(q, "z"), 0); }
+    for (size_t i = 0; i < cp->n; i++) { const json *q = json_at(cp, i); u->p[i][0] = json_num(json_get(q, "x"), 0) * sc; u->p[i][1] = json_num(json_get(q, "y"), 0) * sc; u->p[i][2] = json_num(json_get(q, "z"), 0) * sc; }
     for (int i = 1; i < u->n; i++) for (int j = i; j > 0 && u->p[j][2] < u->p[j - 1][2]; j--) { double tt[3]; memcpy(tt, u->p[j], 24); memcpy(u->p[j], u->p[j - 1], 24); memcpy(u->p[j - 1], tt, 24); }
     json_free(J); return 0;
 }
@@ -45,8 +47,8 @@ static int inside(const vwt_slab *s, const double p[3], int T, int L, double mg)
     return u[0] >= mg && u[0] <= T - 1 - mg && u[1] >= mg && u[1] <= T - 1 - mg && u[2] >= mg && u[2] <= L - 1 - mg;
 }
 
-int vwt_tiling_build(const char *umb_json, const int64_t box[6], int T, int L, double sz, double sr, double st, double r00, vwt_tiling *t) {
-    memset(t, 0, sizeof *t); umbt u; if (umb_load(umb_json, &u)) { fprintf(stderr, "vwt_tile: cannot read %s\n", umb_json); return -1; }
+int vwt_tiling_build(const char *umb_json, double umb_scale, const int64_t box[6], int T, int L, double sz, double sr, double st, double r00, vwt_tiling *t) {
+    memset(t, 0, sizeof *t); umbt u; if (umb_load(umb_json, &u, umb_scale > 0 ? umb_scale : 1)) { fprintf(stderr, "vwt_tile: cannot read %s\n", umb_json); return -1; }
     t->T = T; t->L = L; t->sz = sz; t->sr = sr; t->st = st; t->r00 = r00; memcpy(t->box, box, sizeof t->box);
     const double bz0 = box[0], bz1 = box[0] + box[3], by0 = box[1], by1 = box[1] + box[4], bx0 = box[2], bx1 = box[2] + box[5];
     size_t cap = 4096; t->s = malloc(cap * sizeof *t->s);
@@ -135,12 +137,13 @@ int vwt_slab_pairs(const vwt_tiling *t, int k, int **pairs, int **side) {
 #include <time.h>
 static const char *topt(int argc, char **argv, const char *k, const char *d) { for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
 int cmd_vwt_tile(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm vwt-tile UMB.json OUT.bin --box z,y,x,nz,ny,nx [--T 128 --L 384 --sz 112 --sr 320 --st 112 --r0 16]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm vwt-tile UMB.json OUT.bin --box z,y,x,nz,ny,nx [--umb-scale 1] [--T 128 --L 384 --sz 112 --sr 320 --st 112 --r0 16]\n"
+                         "  UMB.json: control points; times --umb-scale = the box's voxels (0.25: a level-0 umbilicus on a level-2 volume)\n"); return 2; }
     int64_t box[6]; long long b[6];
     if (sscanf(topt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) { fprintf(stderr, "vwt-tile: --box z,y,x,nz,ny,nx\n"); return 2; }
     for (int i = 0; i < 6; i++) box[i] = b[i];
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
-    vwt_tiling t; if (vwt_tiling_build(argv[2], box, atoi(topt(argc, argv, "--T", "128")), atoi(topt(argc, argv, "--L", "384")), atof(topt(argc, argv, "--sz", "112")),
+    vwt_tiling t; if (vwt_tiling_build(argv[2], atof(topt(argc, argv, "--umb-scale", "1")), box, atoi(topt(argc, argv, "--T", "128")), atoi(topt(argc, argv, "--L", "384")), atof(topt(argc, argv, "--sz", "112")),
                                        atof(topt(argc, argv, "--sr", "320")), atof(topt(argc, argv, "--st", "112")), atof(topt(argc, argv, "--r0", "16")), &t)) return 1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double mp = 0; for (int q = 0; q < t.np; q++) mp += t.p[q].npts;

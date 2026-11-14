@@ -136,6 +136,13 @@ static void test_tifxyz_shift(void) {   /* a plane z = 10 (x = column, y = row):
     int bad = !Z || !X; for (int i = 0; !bad && i < W * H; i++) bad += i == 0 ? Z[i] != -1.f : fabsf(Z[i] - 12.5f) > 1e-5f || fabsf(X[i] - x[i]) > 1e-5f;
     CHECK(!bad, "tifxyz shift moves the plane along +z");
     free(Z); free(X); snprintf(p, sizeof p, "rm -rf %s %s", s, d); CHECK(!system(p), "cleanup");
+    /* moved past z = 0 (z 1 - 2.5): invalid (-1 in x, y, z), not clamped to a valid z = 0 (audit mini/coords #7) */
+    for (int i = 0; i < W * H; i++) z[i] = i == 0 ? -1.f : 1.f;
+    CHECK(!tifxyz_write(s, W, H, x, y, z, 1, 8.64, 1, "test") && !tifxyz_shift(s, d, -2.5, nullptr), "tifxyz shift past z 0");
+    snprintf(p, sizeof p, "%s/z.tif", d); Z = img_read_f32(p, &w, &h); snprintf(p, sizeof p, "%s/x.tif", d); X = img_read_f32(p, &w, &h);
+    bad = !Z || !X; for (int i = 0; !bad && i < W * H; i++) bad += Z[i] != -1.f || (i && X[i] != -1.f);   /* (vertex 0 was invalid on input: kept as read) */
+    CHECK(!bad, "tifxyz shift past z 0 gives invalid vertices");
+    free(Z); free(X); snprintf(p, sizeof p, "rm -rf %s %s", s, d); CHECK(!system(p), "cleanup");
     /* inward: a plane y = 5 (x = column, z = row) has +n = x-step x z-step = -y; toward an axis at y 0 it keeps +n (y 5 -> 3),
        toward an axis at y 10 it flips (y 5 -> 7) */
     for (int r = 0; r < H; r++) for (int c = 0; c < W; c++) { const int i = r * W + c; x[i] = c; y[i] = 5; z[i] = 20 + r; }

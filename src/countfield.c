@@ -266,7 +266,7 @@ static void cf_ray_run(void *a, long z0, long z1, int t_) {
             if (rl < 1) { L->U[i] = (float)cf_prior(L, pz, py, px); continue; }
             const double uy = (py - cy) / rl, ux = (px - cx) / rl; double s = 0, qy = py, qx = px; const double ds = 0.5;   /* solve cells */
             for (;;) {
-                const int iy = (int)(qy / cs), ix = (int)(qx / cs);
+                const int iy = (int)floor(qy / cs), ix = (int)floor(qx / cs);   /* (floor: (int) truncation took (-cs, 0) as cell 0, audit mini/coords #2) */
                 if (iy < 0 || ix < 0 || iy >= L->hh || ix >= L->w || hypot(qy - cy, qx - cx) < fmax(L->rmin, 1)) break;
                 const size_t j = ((size_t)z * L->hh + iy) * L->w + ix;
                 if (R->S[j] > 0) s += ds * L->P * (R->G[1][j] * uy + R->G[2][j] * ux) / R->S[j];
