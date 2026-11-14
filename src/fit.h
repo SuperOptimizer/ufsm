@@ -155,9 +155,15 @@ typedef struct {
     int verbose;
 } fit_cfg;
 
+/* The spiral's direction: ONE rule for every caller (count-field, fit, the slab prior). --dir given > the ring vote (>= 3 rings) > the
+   phase loops (only with --dir-loops 1) > DEFAULT +1 with a WARNING (no evidence). count-field refuses DEFAULT unless --dir-default-ok 1:
+   the 11-12 PHerc1667 unroll ran on a silent +1 and had the wrong hand (sheet identity vs the published unwrap 0.487; -1: 0.762). */
+enum { FIT_DIR_GIVEN = 0, FIT_DIR_RINGS = 1, FIT_DIR_LOOPS = 2, FIT_DIR_DEFAULT = 3 };
+static inline const char *fit_dir_src_name(int s) { return s == FIT_DIR_GIVEN ? "given" : s == FIT_DIR_RINGS ? "ring vote" : s == FIT_DIR_LOOPS ? "phase loops" : "DEFAULT (no evidence)"; }
 typedef struct fit_model {
     int dir, nk, knot_dz;
     double dir_vote;                /* |median winding per radial ring| of the prior (1 = clear; < 0.5 ambiguous) */
+    int dir_src;                    /* where dir came from (FIT_DIR_*): fit_init_prior sets it; fit_dir_src_name() names it */
     float *pitch, *offset;          /* per knot (knot k at box-local z = k * knot_dz) */
     int L, lz, ly, lx;              /* lattice spacing and dims (node (a, b, c) at box-local (a L, b L, c L)) */
     float *delta;                   /* lz * ly * lx */

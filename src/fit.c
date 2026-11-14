@@ -289,6 +289,8 @@ int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m) {
     }
     m->dir = c->dir ? c->dir : (wind > 0 ? -1 : 1);
     m->dir_vote = c->dir ? 1.0 : fabs(wind) * (nwind >= 3 ? 1 : 0);   /* |median winding per ring|, 0 when too few rings */
+    m->dir_src = c->dir ? FIT_DIR_GIVEN : nloop && c->dir_loops && nwind >= 3 ? FIT_DIR_LOOPS : nwind >= 3 ? FIT_DIR_RINGS : FIT_DIR_DEFAULT;
+    if (m->dir_src == FIT_DIR_DEFAULT || !(wind != 0)) { m->dir = c->dir ? c->dir : 1; if (!c->dir) { m->dir_vote = 0; m->dir_src = FIT_DIR_DEFAULT; } }   /* (wind 0: no sign either way) */
     for (int k = 0; k < m->nk; k++) {   /* offset per knot with the direction */
         if (pk[k] <= 0) continue;
         const double zc = (double)k * c->knot_dz, zlo = zc - c->knot_dz, zhi = zc + c->knot_dz;
@@ -313,7 +315,7 @@ int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m) {
         o += round(prev_o - o);   /* continuous across knots */
         m->pitch[k] = (float)p; m->offset[k] = (float)o; prev_o = o; prev_p = p;
     }
-    if (c->verbose) fprintf(stderr, "fit prior: dir %+d (median winding per ring %.3f over %d rings), pitch %.2f..%.2f over %d knots\n", m->dir, wind, nwind, m->pitch[0], m->pitch[m->nk - 1], m->nk);
+    if (c->verbose) fprintf(stderr, "fit prior: dir %+d (%s; median winding per ring %.3f over %d rings), pitch %.2f..%.2f over %d knots\n", m->dir, fit_dir_src_name(m->dir_src), wind, nwind, m->pitch[0], m->pitch[m->nk - 1], m->nk);
     free(pk); free(ok);
     return 0;
 }
@@ -2216,6 +2218,7 @@ fit_model *fit_load(const char *dir) {
     char *t = malloc(n + 1); if (fread(t, 1, n, f) != n) { fclose(f); free(t); return nullptr; } fclose(f); t[n] = 0;
     json *j = json_parse(t, n); free(t); if (!j) return nullptr;
     fit_model *m = calloc(1, sizeof *m);
+    if (!json_get(j, "dir")) fprintf(stderr, "fit: WARNING: %s/model.json has no \"dir\": +1 assumed\n", dir);
     m->dir = (int)json_num(json_get(j, "dir"), 1); m->knot_dz = (int)json_num(json_get(j, "knot_dz"), 1024); m->L = (int)json_num(json_get(j, "L"), 64);
     m->lz = (int)json_num(json_at(json_get(j, "lattice"), 0), 0); m->ly = (int)json_num(json_at(json_get(j, "lattice"), 1), 0); m->lx = (int)json_num(json_at(json_get(j, "lattice"), 2), 0);
     m->D = (int)json_num(json_at(json_get(j, "shape"), 0), 0); m->H = (int)json_num(json_at(json_get(j, "shape"), 1), 0); m->W = (int)json_num(json_at(json_get(j, "shape"), 2), 0);
@@ -3137,7 +3140,8 @@ fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap)
       double po = P.offset[first], pp = P.pitch[first];
       for (int k = 0; k < P.nk; k++) { if (!have[k]) { P.pitch[k] = (float)pp; P.offset[k] = (float)po; } P.offset[k] += (float)round(po - P.offset[k]); po = P.offset[k]; pp = P.pitch[k]; } }
     free(have);
-    P.dir = c->dir ? c->dir : (vote > 0 ? 1 : -1);   /* the prior's dir_vote sign convention: dir * |vote| */
+    P.dir = c->dir ? c->dir : (vote < 0 ? -1 : 1);   /* the prior's dir_vote sign convention: dir * |vote|; no vote: +1, the one default (fit.h FIT_DIR_*) */
+    if (!c->dir && vote == 0) fprintf(stderr, "fit slabs: WARNING: no direction vote in any slab: dir +1 is the DEFAULT, not a measurement (pass --dir)\n");
     P.L = 1 << 20; P.lz = P.ly = P.lx = 2; P.delta = calloc(8, sizeof(float));   /* delta 0 */
     P.D = all.shape[0]; P.H = all.shape[1]; P.W = all.shape[2]; P.h = all.h; P.cy = all.cy; P.cx = all.cx;
     if (c->verbose) fprintf(stderr, "fit slabs: prior dir %+d (vote %.2f), pitch %.1f..%.1f over %d knots\n", P.dir, vote, P.pitch[0], P.pitch[P.nk - 1], P.nk);

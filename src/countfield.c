@@ -571,7 +571,7 @@ static void cf_lat_run(void *a_, long a0, long a1, int t_) {   /* model lattice 
 int cmd_count_field(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: ufsm count-field <in-fields> <out-fields> [--method ls|ray] [--pool P (solve cell in field cells, 0 auto)] [--R 10 (phase demod radius, field cells; 0: W only)] [--Rz R]\n"
-                        "       [--phase-w 0 (confident network phase gradients in the targets, weight)] [--phase-c0 0.4] [--gauge demod|ls (ls: a smooth LS-unwrapped gauge instead of the +-R demodulation; with --R 0)] [--gauge-R 5 (solve cells)] [--conf w|phase|mix|pmax] [--trust C0,C1 (phase confidence ramp: the network phase kept)] [--conf-w 1 (scale of the count confidence)] [--keep 0 (p: + A^p wrap(phi - W_out), A the local agreement)] [--sp-w 0 (1: sp from |grad W|)] [--dir 0] [--dir-loops 0 (1: no ring vote: the direction from phase loops, else +1 with a warning)] [--iters 400] [--lambda 1e-7] [--eps 1e-3] [--loop 8 (closing loop edge, field cells)] [--model DIR] [--model-R 8] [--rmin-um 500] [--emin 0.1] [--sheet0 0.4]\n"
+                        "       [--phase-w 0 (confident network phase gradients in the targets, weight)] [--phase-c0 0.4] [--gauge demod|ls (ls: a smooth LS-unwrapped gauge instead of the +-R demodulation; with --R 0)] [--gauge-R 5 (solve cells)] [--conf w|phase|mix|pmax] [--trust C0,C1 (phase confidence ramp: the network phase kept)] [--conf-w 1 (scale of the count confidence)] [--keep 0 (p: + A^p wrap(phi - W_out), A the local agreement)] [--sp-w 0 (1: sp from |grad W|)] [--dir 0] [--dir-loops 0 (1: no ring vote: the direction from phase loops)] [--dir-default-ok 0 (1: accept dir +1 without evidence; else refused)] [--iters 400] [--lambda 1e-7] [--eps 1e-3] [--loop 8 (closing loop edge, field cells)] [--model DIR] [--model-R 8] [--rmin-um 500] [--emin 0.1] [--sheet0 0.4]\n"
                         "       [--wc 1 (0: no wc.f32)] [--mem-gb 6 (field chunk budget)] [--threads 8] [--cf-gpu 1 (pooling, CG, model pass on the GPU)] [--prefetch auto|0|1] [--read-threads N]\n"
                         "       [--pool-cache FILE] [--pool-only 1 (pass 1 into the cache, then exit)] [--follow ROWSFILE (pass 1 behind a running predict)] [--follow-split S] [--chunk-rows N]\n");
         return 2;
@@ -630,14 +630,16 @@ int cmd_count_field(int argc, char **argv) {
     }
     /* pass 1: the pooled sums chunk by chunk; the label-free prior (direction, pitch) from the chunk holding the middle row */
     int dir = atoi(cf_opt(argc, argv, "--dir", "0")), recto = 0, w4d = 0; double pitch = 8.0 * h;
-    if (!dir && imod) dir = imod->dir;
+    int dsrc = dir ? FIT_DIR_GIVEN : -1;   /* where dir came from (fit.h FIT_DIR_*; -1 not yet decided) */
+    if (!dir && imod) { dir = imod->dir; dsrc = FIT_DIR_GIVEN; }   /* (the --init-model's dir) */
     /* --pool-cache FILE: the level-0 pooled sums (+ dir, prior pitch, recto, w4d) saved after pass 1 / loaded instead of it (a rerun
        of a whole scroll skips the ~1 h pass; the file is tied to the pooling options, not checked) */
     const char *pcache = cf_opt(argc, argv, "--pool-cache", ""); int cached = 0;
     if (*pcache) { FILE *pf = fopen(pcache, "rb"); int hd[6]; double pv;
         if (pf && fread(hd, sizeof hd, 1, pf) == 1 && fread(&pv, sizeof pv, 1, pf) == 1 && hd[0] == lv[0].d && hd[1] == lv[0].hh && hd[2] == lv[0].w && hd[3] == P) {
             int ok = fread(Sl[0], sizeof(float), lv[0].n, pf) == lv[0].n; for (int k = 0; k < 3 && ok; k++) ok = fread(Gl[0][k], sizeof(float), lv[0].n, pf) == lv[0].n;
-            if (ok) { cached = 1; if (!dir) dir = hd[4]; pitch = pv; recto = hd[5] & 1; w4d = hd[5] >> 1; fprintf(stderr, "count-field: pooled sums from %s\n", pcache); }
+            if (ok) { cached = 1; if (!dir) { dir = hd[4]; dsrc = (hd[5] >> 16) - 1; if (dsrc < 0) dsrc = FIT_DIR_DEFAULT; }   /* (a cache without the source: unverified) */
+                      pitch = pv; recto = hd[5] & 1; w4d = (hd[5] >> 1) & 0x7fff; fprintf(stderr, "count-field: pooled sums from %s\n", pcache); }
             else memset(Sl[0], 0, lv[0].n * sizeof(float));
         }
         if (pf) fclose(pf); }
@@ -690,7 +692,7 @@ int cmd_count_field(int argc, char **argv) {
         if (z0 <= D / 2 && D / 2 < z1) {
             fit_cfg pc = fit_cfg_default(); pc.dir = dir; pc.dir_loops = atoi(cf_opt(argc, argv, "--dir-loops", "0")); fit_model pm; memset(&pm, 0, sizeof pm);
             if (!fit_init_prior(&b.f, &pc, &pm)) {
-                if (!dir) dir = pm.dir;
+                if (!dir) { dir = pm.dir; dsrc = pm.dir_src; }
                 float *pk = malloc(pm.nk * sizeof(float)); int np = 0; for (int k = 0; k < pm.nk; k++) if (pm.pitch[k] > 0) pk[np++] = pm.pitch[k];
                 if (np) { for (int a = 1; a < np; a++) for (int c = a; c > 0 && pk[c] < pk[c - 1]; c--) { const float t = pk[c]; pk[c] = pk[c - 1]; pk[c - 1] = t; } pitch = pk[np / 2]; }
                 free(pk); free(pm.pitch); free(pm.offset);
@@ -700,10 +702,19 @@ int cmd_count_field(int argc, char **argv) {
         if (!pref && ci + 1 < nch) { const int n0 = ord[ci + 1] * CZ; cf_pre_start(&pre, in, n0, n0 + CZ < D ? n0 + CZ : D, 0); }
     }
     if (pre.has_nxt) { fit_fields_free(&pre.nxt); pre.has_nxt = 0; }
-    if (!dir) dir = 1;
+    if (!dir) { dir = 1; dsrc = FIT_DIR_DEFAULT; }
+    if (dsrc < 0) dsrc = FIT_DIR_DEFAULT;
+    fprintf(stderr, "count-field: dir %+d (%s)\n", dir, fit_dir_src_name(dsrc));
+    if (dsrc == FIT_DIR_DEFAULT && !atoi(cf_opt(argc, argv, "--dir-default-ok", "0")) && !atoi(cf_opt(argc, argv, "--pool-only", "0")) && !getenv("UFSM_CF_READ_ONLY")) {   /* (--pool-only: the cache
+           keeps the source; the solve run decides) */
+        fprintf(stderr, "count-field: REFUSED: no evidence for the spiral's direction (no ring vote%s). Pass --dir +1 / -1 from a published surface or GT "
+                        "(unroll.sh: SPIRALDIR or scripts/unroll/spiral_dir.tsv), or --dir-loops 1 (phase loops), or --dir-default-ok 1 to accept +1. "
+                        "A wrong hand keeps distances but hops two sheets per turn (PHerc1667 11-12: sheet identity 0.487 vs 0.762)\n", cached ? ", or a pool cache without one" : "");
+        return 2;
+    }
     if (getenv("UFSM_CF_READ_ONLY")) { fprintf(stderr, "count-field: read only: waited for field reads %.0f s, wall %.0f s\n", pre.t, cf_now() - tst0); return 0; }
     if (!cached) fprintf(stderr, "count-field: pass 1: waited for field reads %.0f s, pooling %.0f s (%s, %d of %d chunks on the CPU; %d rows per chunk), wall %.0f s\n", pre.t, t_pool, gpu ? "GPU" : "CPU", gpu ? npc : (D + CZ - 1) / CZ, (D + CZ - 1) / CZ, CZ, cf_now() - tst0);
-    if (*pcache && !cached) { FILE *pf = fopen(pcache, "wb"); const int hd[6] = {lv[0].d, lv[0].hh, lv[0].w, P, dir, recto | w4d << 1};
+    if (*pcache && !cached) { FILE *pf = fopen(pcache, "wb"); const int hd[6] = {lv[0].d, lv[0].hh, lv[0].w, P, dir, recto | w4d << 1 | (dsrc + 1) << 16};
         int bad = !pf || fwrite(hd, sizeof hd, 1, pf) != 1 || fwrite(&pitch, sizeof pitch, 1, pf) != 1 || fwrite(Sl[0], sizeof(float), lv[0].n, pf) != lv[0].n;
         for (int k = 0; k < 3 && !bad; k++) bad = fwrite(Gl[0][k], sizeof(float), lv[0].n, pf) != lv[0].n;
         if (pf && fclose(pf)) bad = 1;
