@@ -297,7 +297,12 @@ static void pool_add(void *p, size_t n, int host) {
 static int pool_release(void *p) {   /* a pooled block freed: kept for reuse */
     if (!g_pool_on) return 0;
     std::lock_guard<std::mutex> l(g_pmu);
-    for (int i = 0; i < g_npool; i++) if (g_pool[i].p == p) { g_pool[i].live = 0; return 1; }
+    for (int i = 0; i < g_npool; i++) if (g_pool[i].p == p) {
+        if (g_pool[i].host) cudaDeviceSynchronize();   /* (a pinned block goes back for reuse: async copies still reading / writing it finish first, as
+                                                          cudaFreeHost would wait for them; audit mini/cudasync #3. Current device: the pool is per box,
+                                                          one device per process in predict's pool mode) */
+        g_pool[i].live = 0; return 1;
+    }
     return 0;
 }
 static void host_untrack(void *p);

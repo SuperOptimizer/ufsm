@@ -526,8 +526,10 @@ static void axr_set(gpu_state *d, int i) { if (g_axr) unet_set_attn_axis(d->u, d
    skipping"). Per window: each 4^3-voxel cell's CT maximum (the source-grid bytes, before the device augmentation); a cell is empty at
    threshold t when that maximum is <= t (t 0: all zero, the outside of the scan). Tiles of T^3 cells at level l (T 2^l level-0 cells a
    side) are active when any of their cells is not empty, dilated by r tiles (Chebyshev); one line a threshold with the active shares */
+/* a host allocation that must succeed: a message and abort instead of a NULL write later (audit mini/alloc) */
+static void *ck_host(void *p, size_t n, const char *what) { if (!p && n) { fprintf(stderr, "out of host memory: %zu bytes for %s\n", n, what); abort(); } return p; }
 static int et_frac(const uint8_t *t8, int nz, int ny, int nx, int f, int r, double *out) {   /* t8: the 8^3-cell level-0 tiles; f: tiles of f x f x f of them */
-    const int mz = (nz + f - 1) / f, my = (ny + f - 1) / f, mx = (nx + f - 1) / f; uint8_t *a = calloc((size_t)mz * my * mx, 1); size_t act = 0;
+    const int mz = (nz + f - 1) / f, my = (ny + f - 1) / f, mx = (nx + f - 1) / f; uint8_t *a = calloc((size_t)mz * my * mx, 1); size_t act = 0; if (!a) { *out = 0; return -1; }
     for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) if (t8[((size_t)z * ny + y) * nx + x]) a[((size_t)(z / f) * my + y / f) * mx + x / f] = 1;
     for (int z = 0; z < mz; z++) for (int y = 0; y < my; y++) for (int x = 0; x < mx; x++) { int on = 0;
         for (int dz = -r; dz <= r && !on; dz++) for (int dy = -r; dy <= r && !on; dy++) for (int dx = -r; dx <= r && !on; dx++) {
@@ -544,7 +546,7 @@ static void empty_tiles_report(const batch *b, int B, int Pz, int P, const sourc
         for (int z = 0; z < Pz; z++) for (int y = 0; y < P; y++) { const uint8_t *row = ct + ((size_t)z * P + y) * P; uint8_t *c = cm + ((size_t)(z / 4) * Hc + y / 4) * Hc;
             for (int x = 0; x < Hc; x++) { uint8_t m = c[x]; for (int k = 0; k < 4; k++) m = row[4 * x + k] > m ? row[4 * x + k] : m; c[x] = m; } }
         const int si = b->src ? b->src[n] : -1, lv = b->level ? b->level[n] : -1;
-        const int tz = (Dc + 7) / 8, ty = (Hc + 7) / 8; uint8_t *t8 = malloc((size_t)tz * ty * ty);
+        const int tz = (Dc + 7) / 8, ty = (Hc + 7) / 8; uint8_t *t8 = malloc((size_t)tz * ty * ty); if (!t8) { free(cm); return; }
         for (int k = 0; k < 4; k++) {
             size_t ne = 0; memset(t8, 0, (size_t)tz * ty * ty);
             for (int z = 0; z < Dc; z++) for (int y = 0; y < Hc; y++) for (int x = 0; x < Hc; x++) { const int e = cm[((size_t)z * Hc + y) * Hc + x] <= thr[k]; ne += e; if (!e) t8[((size_t)(z / 8) * ty + y / 8) * ty + x / 8] = 1; }
@@ -1121,14 +1123,14 @@ static int coo_cmp(const void *a,const void *b) { uint64_t x=((const sheet_coo *
 static void sheet_objective(gpu_state *d,shape5 os,int P,int train) {
     const sheet_batch *b=d->sheet; d->sheet_loss=0; memset(d->sheet_parts,0,sizeof d->sheet_parts);
     if (!g_sheet || !b || !b->np) return;
-    float *xyz=malloc(3*b->np*sizeof *xyz); double *v=malloc(2*b->np*sizeof *v),*grad=malloc(2*b->np*sizeof *grad);
+    float *xyz=ck_host(malloc(3*b->np*sizeof *xyz),3*b->np*sizeof *xyz,"sheet points"); double *v=ck_host(malloc(2*b->np*sizeof *v),2*b->np*sizeof *v,"sheet values"),*grad=ck_host(malloc(2*b->np*sizeof *grad),2*b->np*sizeof *grad,"sheet gradient");
     for (size_t p=0;p<b->np;p++) memcpy(xyz+3*p,b->points[p].xyz,3*sizeof(float));
     int z0=d->side==1?P/2-g_h0:0,lo=d->side==1?P/2:0,hi=d->side==0?P/2:P;
     nn_sheet_gather(d->lg,os,xyz,b->np,z0,lo,hi,v);
     for (size_t p=0;p<b->np;p++) v[2*p+1]+=b->points[p].q0;
     d->sheet_loss=sheet_loss(b,v,grad,d->sheet_parts,g_sheet_ramp,g_sheet_variant);
     if (train) {
-        sheet_coo *coo=malloc(16*b->np*sizeof *coo); size_t count=0,S=(size_t)os.d*P*P;
+        sheet_coo *coo=ck_host(malloc(16*b->np*sizeof *coo),16*b->np*sizeof *coo,"sheet scatter"); size_t count=0,S=(size_t)os.d*P*P;
         for (size_t p=0;p<b->np;p++) {
             int base[3]; double f[3]; for (int a=0;a<3;a++) { base[a]=(int)floor(xyz[3*p+a]); f[a]=xyz[3*p+a]-base[a]; }
             for (int dz=0;dz<2;dz++) for (int dy=0;dy<2;dy++) for (int dx=0;dx<2;dx++) {
@@ -1139,7 +1141,7 @@ static void sheet_objective(gpu_state *d,shape5 os,int P,int train) {
                 for (int c=0;c<2;c++) if (grad[2*p+c]!=0) coo[count++]=(sheet_coo){idx+c*S,w*grad[2*p+c]};
             }
         }
-        qsort(coo,count,sizeof *coo,coo_cmp); uint64_t *idx=malloc((count?count:1)*sizeof *idx); float *dg=malloc((count?count:1)*sizeof *dg); size_t n=0;
+        qsort(coo,count,sizeof *coo,coo_cmp); uint64_t *idx=ck_host(malloc((count?count:1)*sizeof *idx),(count?count:1)*sizeof *idx,"sheet scatter"); float *dg=ck_host(malloc((count?count:1)*sizeof *dg),(count?count:1)*sizeof *dg,"sheet scatter"); size_t n=0;
         for (size_t i=0;i<count;) { uint64_t k=coo[i].index; double value=0; do { value+=coo[i++].value; } while (i<count && coo[i].index==k); idx[n]=k; dg[n++]=(float)value; }
         nn_sheet_scatter(d->gl,idx,dg,n,g_g16); free(coo); free(idx); free(dg);
     }
@@ -3104,6 +3106,7 @@ int cmd_train(int argc, char **argv) {
     float srste = (float)opt_atof("--srste", opt(argc, argv, "--srste", "2e-4"));
     nn_set_pos_weight((float)opt_atof("--pos-weight", opt(argc, argv, "--pos-weight", "1")));   /* BCE weight of surface voxels */
     int overfit = opt_atoi("--overfit", opt(argc, argv, "--overfit", "0"));   /* diagnostic: train on the first batch forever */
+    if (overfit < 0 || overfit > 256) { fprintf(stderr, "--overfit: 0..256 batches (the fixed set is 256 slots)\n"); return 2; }   /* (audit mini/alloc #1: past 256 wrote out of bounds) */
     g_bench_same = ufsm_env_on("UFSM_BENCH_SAME");   /* benchmark: every step on the first batch (step time without the loader or the upload) */
     int noaug = opt_atoi("--noaug", opt(argc, argv, "--noaug", "0"));       /* diagnostic: no augmentation */
     /* --fp4 1: packed fp4 activations, fp4 stride-1 compute, fp8 weight gradients and stochastic rounding.
@@ -4861,7 +4864,7 @@ int cmd_train(int argc, char **argv) {
             for (int k = 0; k < nf; k++) if (!*fb[k]) { fprintf(stderr, "validation batch: field %d of %d not filled by the sampler\n", k, nf); return 1; }
             for (int k = 0; k < nf; k++) vhash = hash_bytes(vhash, *fb[k], sz[k]);
             for (int k = 0; k < nf; k++)
-                if (vmode == VAL_RAM) { *fv[k] = malloc(sz[k]); memcpy(*fv[k], *fb[k], sz[k]); }
+                if (vmode == VAL_RAM) { *fv[k] = ck_host(malloc(sz[k]), sz[k], "validation batch"); memcpy(*fv[k], *fb[k], sz[k]); }
                 else if (pwrite_all(vdk.fd, *fb[k], sz[k], vdk.bytes)) { fprintf(stderr, "cannot write the validation windows\n"); return 1; }
                 else vdk.bytes += sz[k];
             if (vmode == VAL_RAM) { val[i].sheet=calloc((size_t)B,sizeof *val[i].sheet); val[i].sheet[0]=sheet_clone(b->sheet?b->sheet[0]:nullptr); }
@@ -5305,8 +5308,8 @@ int cmd_train(int argc, char **argv) {
                     o += snprintf(ln + (o < (int)sizeof ln ? o : (int)sizeof ln - 1), o < (int)sizeof ln ? sizeof ln - (size_t)o : 0, " %s@%.3g %.1f%%", S->src[si].name, um, 100 * c / tot); }
                 fprintf(stderr, "%s; rungs <6.8 / 6.8-13.6 / >13.6 um: %.1f / %.1f / %.1f%%\n", ln, 100 * rung[0] / tot, 100 * rung[1] / tot, 100 * rung[2] / tot);
                 {   /* the sampler's own counts since the last line: new windows (no replays) and dropped draws per source, against its weight */
-                    static uint32_t (*prev)[SL_N]; if (!prev) prev = calloc((size_t)S->n, sizeof *prev);
-                    uint32_t (*cur)[SL_N] = calloc((size_t)S->n, sizeof *cur); double newt = 0, wt = 0;
+                    static uint32_t (*prev)[SL_N]; if (!prev) prev = ck_host(calloc((size_t)S->n, sizeof *prev), (size_t)S->n * sizeof *prev, "draw counts");
+                    uint32_t (*cur)[SL_N] = ck_host(calloc((size_t)S->n, sizeof *cur), (size_t)S->n * sizeof *cur, "draw counts"); double newt = 0, wt = 0;
                     for (int si = 0; si < S->n; si++) { for (int lv = 0; lv < MAXLEV; lv++) { uint32_t r[SL_N]; sampler_level_stats(sp, si, lv, r); for (int k = 0; k < SL_N; k++) cur[si][k] += r[k]; }
                         newt += cur[si][SL_PROD] - prev[si][SL_PROD]; wt += S->src[si].weight; }
                     o = snprintf(ln, sizeof ln, "draws steps %d-%d (%.0f new windows): new %% / weight %% (dropped hold/empty/probe/fg/other):", step - mix_every + 1, step, newt);

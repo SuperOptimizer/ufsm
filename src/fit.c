@@ -2078,7 +2078,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
         }
         const float ws = (float)(c->w_smooth / nl), wdec = (float)(c->w_decay / nl);
         const size_t nvox = fit_box_cells(&fd);   /* (the box's: a crop draws the same voxels) */
-        fd.stride = c->batch > 0 && nvox > (size_t)c->batch ? (int)(nvox / c->batch) : 1;
+        fd.stride = c->batch > 0 && nvox > (size_t)c->batch ? (int)(nvox / c->batch < (size_t)INT_MAX ? nvox / c->batch : (size_t)INT_MAX) : 1;   /* (clamped: fit.h stride is int; audit mini/overflow #4) */
         cpu_loss cl; if (cpu) cpu_loss_setup(&cl, &fd, fit_nthreads(1 << 30));
         for (int it = 0; it < c->steps[st]; it++) {
             const double ramp = st < c->phase_stage ? 0 : st == c->phase_stage ? c->phase_ramp + (1 - c->phase_ramp) * (double)it / (c->steps[st] > 1 ? c->steps[st] - 1 : 1) : 1;

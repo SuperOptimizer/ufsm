@@ -334,6 +334,10 @@ static int fr_onfly_read(void *vp, z3 *base, const int64_t o[3], const int64_t n
             if (S->pin) fibre_gpu_host_free(S->ct); else free(S->ct);
             S->ct = nullptr; S->pin = fibre_gpu_host_alloc && fibre_gpu_host_free; S->cap = 0;
             S->ct = S->pin ? fibre_gpu_host_alloc(nv) : malloc(nv); for (int k = 0; k < 2; k++) S->o2[k] = S->pin ? fibre_gpu_host_alloc(nv) : malloc(nv);
+            if (S->pin && (!S->ct || !S->o2[0] || !S->o2[1])) {   /* (no pinned memory: plain buffers, the GPU path's D2H stages through them; audit mini/cudasync #4) */
+                for (int k = 0; k < 2; k++) { fibre_gpu_host_free(S->o2[k]); S->o2[k] = malloc(nv); }
+                fibre_gpu_host_free(S->ct); S->ct = malloc(nv); S->pin = 0;
+            }
             if (!S->ct || !S->o2[0] || !S->o2[1]) {
                 for (int k = 0; k < 2; k++) { if (S->pin) fibre_gpu_host_free(S->o2[k]); else free(S->o2[k]); S->o2[k] = nullptr; }
                 if (S->pin) fibre_gpu_host_free(S->ct); else free(S->ct);

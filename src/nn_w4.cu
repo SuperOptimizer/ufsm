@@ -344,7 +344,10 @@ int ctx_run(w4ctx *c, const uint8_t *phase, int D, int H, int W, int tile, int m
     if (st) *st = acc;
     return next;
 }
-struct w4app { uint8_t *d_ph, *d_c; uint16_t *d_R; uint32_t *d_cnt; size_t vox, rows; uint32_t *d_off; size_t noff; uint8_t *d_lut; size_t nlut; };   /* (per device: the trainer uploads on one copy stream per device, so the scratch is reused in stream order) */
+struct w4app { uint8_t *d_ph, *d_c; uint16_t *d_R; uint32_t *d_cnt; size_t vox, rows; uint32_t *d_off; size_t noff; uint8_t *d_lut; size_t nlut; cudaEvent_t done; };
+/* (per device, shared by every stream: nn_w4runs_label_z runs on the copy stream or stream 0 per call, so a call's stream first waits for
+   the previous call's work on the scratch (done, recorded on its stream before the mutex is released); audit mini/cudasync #1: two calls
+   on different streams could overwrite d_off / d_lut / d_ph under kernels still reading them) */
 w4app g_app[MAXDEV]; pthread_mutex_t g_app_mu[MAXDEV] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
                                                            PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER};
 }   // namespace
@@ -395,6 +398,8 @@ extern "C" int nn_w4runs_apply_z(const uint8_t *phase_d, int D, int H, int W, in
     pthread_mutex_lock(&g_app_mu[dv]); w4app *a = &g_app[dv]; int rc = 0;
 #define AK(x) do { if ((x) != cudaSuccess) { rc = -1; goto out; } } while (0)
     if (w4_inj()) { rc = -1; goto out; }
+    if (!a->done) AK(cudaEventCreateWithFlags(&a->done, cudaEventDisableTiming));
+    else AK(cudaStreamWaitEvent(s, a->done, 0));   /* (the previous call's kernels / copies on the scratch, whatever stream they ran on) */
     if (sv > a->vox) { cudaFree(a->d_ph); cudaFree(a->d_c); cudaFree(a->d_R); a->vox = 0; AK(cudaMalloc(&a->d_ph, sv)); AK(cudaMalloc(&a->d_c, sv)); AK(cudaMalloc(&a->d_R, 2 * sv)); a->vox = sv; }
     { const size_t rmax = (size_t)(T < D ? T : D) * (T < H ? T : H) * ntx; if (rmax > a->rows) { cudaFree(a->d_cnt); a->rows = 0; AK(cudaMalloc(&a->d_cnt, rmax * 4)); a->rows = rmax; } }
     if (o->noff > a->noff) { cudaFree(a->d_off); a->noff = 0; AK(cudaMalloc(&a->d_off, (o->noff + o->noff / 4 + 1024) * 4)); a->noff = o->noff + o->noff / 4 + 1024; }
@@ -417,6 +422,7 @@ extern "C" int nn_w4runs_apply_z(const uint8_t *phase_d, int D, int H, int W, in
         }
     }
     AK(cudaGetLastError());
+    AK(cudaEventRecord(a->done, s));
 out:
 #undef AK
     if (rc) {   /* (no memory beside the trainer: the scratch freed, the next call allocates it again; the caller takes the host) */
