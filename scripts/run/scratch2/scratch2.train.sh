@@ -45,7 +45,10 @@ echo $$ > $o.launcher.pid
 printf 'S2CTL_OWNER=${S2CTL_OWNER:-relaunch-file} bash %q resume\n' "$R/s2ctl.sh" > $o.relaunch   # (evwatch.sh / u1.pause.sh: bash <run>.relaunch; s2ctl reads launch.env)
 # snapshots: every SNAP steps last.ckpt is copied to <run>/snap/<step>.ckpt (the eval checkpoints); the copy's own header names its step
 mkdir -p $o/snap
-[ "${DRY:-0}" = 1 ] || ( while kill -0 $$ 2>/dev/null; do
+# (ops audit #11: a binary with --snap-every keeps reflink snapshots + the --ckpt-ring itself; the shell copy loop only for older binaries)
+SNAPB=0; strings "$U" | grep -qF -- "--snap-every" && SNAPB=1
+[ $SNAPB = 1 ] && [ "${DRY:-0}" != 1 ] && ARGS+=(--snap-every ${SNAP:-1000} --snap-keep-every ${SNAPKEEP:-5000} --snap-keep-last ${SNAPLAST:-5})
+[ "${DRY:-0}" = 1 ] || [ $SNAPB = 1 ] || ( while kill -0 $$ 2>/dev/null; do
     if [ -f $o/last.ckpt ] && [ $o/last.ckpt -nt $o/snap/.seen ]; then
       sleep 20; cp $o/last.ckpt $o/snap/.tmp && touch $o/snap/.seen
       st=$(head -c 200000 $o/snap/.tmp | head -1 | grep -o '"step":[0-9]*' | head -1 | cut -d: -f2)
@@ -53,7 +56,11 @@ mkdir -p $o/snap
     fi; sleep 60; done ) &
 for i in $(seq 0 ${RELAUNCH:-20}); do
   [ -f $o.stop ] && { m="$(date) STOP file $o.stop: $(tr '\n' ' ' < $o.stop)"; echo "$m" >> $o.resume.log; [ $i = 0 ] && echo "refusing to start: $m (s2ctl.sh resume removes it)" >&2; break; }
-  avail=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo)
+  # (ops audit #12: the binding limit is ufsm-train.slice, not the host: memory.max - (anon + shmem) of the slice, GB)
+  SL=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/ufsm.slice/ufsm-train.slice
+  if [ -r $SL/memory.max ] && [ "$(cat $SL/memory.max)" != max ]; then
+    avail=$(awk -v m=$(cat $SL/memory.max) '/^anon |^shmem / {u += $2} END {print int((m - u) / 1073741824)}' $SL/memory.stat)
+  else avail=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo); fi
   if [ "$avail" -lt ${MINMEM:-40} ]; then echo "$(date) MemAvailable ${avail} GB < ${MINMEM:-40}: waiting" >> $o.resume.log; sleep 300; continue; fi
   RS=(); [ -f $o/last.ckpt ] && RS=(--resume $o/last.ckpt)
   echo "$(date) start $i (GPU $GPU, lock ${LOCK:-none}): $U train ${ARGS[*]} ${RS[*]}" >> $o.resume.log

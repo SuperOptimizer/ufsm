@@ -27,6 +27,7 @@ sync_settings() {
 }
 status() {
   echo "launcher: $(running && echo "pid $(cat $o.launcher.pid)" || echo none)  trainer: $(cat $o.pid 2>/dev/null || echo -)  stop file: $([ -f $S ] && tr '\n' ' ' < $S || echo none)"
+  [ -f $o.parked ] && echo "PARKED: $(tr '\n' ' ' < $o.parked)"
   echo "ctl lock: $(cat $K.owner 2>/dev/null || echo -)"; echo "last: $(lastline)"; grep -vE '^(SRCJ)=' $E | sed 's/^/  /'
 }
 [ "$CMD" = status ] && { status; exit 0; }
@@ -65,6 +66,7 @@ do_dry() {   # the exact launch (scratch2.launch -> scratch2.train.sh, DRY=1) fo
   log "drystart FAILED: $n step lines, ${rc:-no exit line}; $D.log: $(grep -iE 'error|cannot|refus|fail|abort' $D.log | head -2 | tr '\n' ' ' | cut -c1-200)"; return 1
 }
 do_resume() {
+  [ -f $o.parked ] && [ "${S2CTL_UNPARK:-0}" != 1 ] && { log "resume: REFUSED, the run is parked: $(tr '\n' ' ' < $o.parked) (S2CTL_UNPARK=1 to override)"; return 1; }
   running && { log "resume: the launcher already runs (pid $(cat $o.launcher.pid))"; return 1; }
   if [ -n "${1:-}" ]; then [ -x "$1" ] || { log "resume: not executable: $1"; return 1; }; sed -i "s|^U=.*|U=$1|" $E; fi
   if ! cmp -s $E $o/launch.env.good; then   # (11-14: a config error took try6 down twice: a changed launch.env is dry-started first)
@@ -118,6 +120,7 @@ PY
           do_stop "fresh: ${3:-}" || exit 1
           PREV=$o/launch.env.prev.$(date +%H%M%S); cp $E $PREV; cp $NE $E
           if ! DRYFRESH=1 do_dry; then cp $PREV $E; log "fresh: the dry start failed: the old run resumes"; do_resume "" "fresh dry start failed"; exit 1; fi
+          [ -f $o.parked ] && mv $o.parked $AR.parked 2>/dev/null
           mkdir -p $AR && mv $o $AR/run && for f in scratch2.log scratch2.alerts scratch2.health.state scratch2.resume.log scratch2.nohup scratch2.snapwatch.log; do [ -e $R/$f ] && mv $R/$f $AR/; done
           cp -a $G $AR/gates; mkdir -p $o; cp $NE $E; cp $NE $o/launch.env.good; sync_settings
           echo "$(date '+%F %T') $OWNER: FRESH run from $NE (${3:-}); previous run archived in $AR" >> $o/launch.flags
