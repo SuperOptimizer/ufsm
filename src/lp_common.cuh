@@ -1559,19 +1559,18 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
 #define F8_CI 32
 #define F8_T 720
 __device__ __forceinline__ int sw16(int row, int half) { return row * 32 + ((half ^ ((row >> 2) & 1)) << 4); }
+/* the kernels' grow-on-demand scratch: slot 0..5 of one table per element type, in the per-device workspace registry (nn_ws, nn_core.cu)
+   that the trainer's memory planner sizes and allocates before the first step (unet_ws_plan; 2026-11-14 audit net#4) */
+template <typename T> constexpr int lp_buf_tix(void) {
+    if constexpr (std::is_same<T, uint8_t>::value) return 0;
+    else if constexpr (std::is_same<T, float>::value) return 1;
+    else if constexpr (std::is_same<T, __half>::value) return 2;
+    else { static_assert(std::is_same<T, __nv_bfloat16>::value, "lp_buf: uint8_t, float, __half or __nv_bfloat16"); return 3; }
+}
 template <typename T> T *lp_buf(int slot, size_t n) {
-    static void *buf[8][6]; static size_t cap[8][6];
-    int d = cur_dev_();
-    if (n * sizeof(T) > cap[d][slot]) {
-        if (buf[d][slot]) cudaFree(buf[d][slot]);
-        if (cudaMalloc(&buf[d][slot], n * sizeof(T)) != cudaSuccess) {   /* (was unchecked: a full card then faulted in the kernel) */
-            fprintf(stderr, "lp_buf: no device memory for a %.1f MB kernel workspace (slot %d, GPU %d)\n", n * sizeof(T) / 1e6, slot, d); abort();
-        }
-        cap[d][slot] = n * sizeof(T);
-        static int rep = -1; if (rep < 0) rep = getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) > 0;
-        if (rep) fprintf(stderr, "lp_buf: %zu-byte elements, slot %d -> %.1f MB (GPU %d)\n", sizeof(T), slot, cap[d][slot] / 1e6, d);   /* kernel workspaces (outside the planner's dry build) */
-    }
-    return (T *)buf[d][slot];
+    T *p = (T *)nn_ws(NN_WS_LPBUF + 6 * lp_buf_tix<T>() + slot, n * sizeof(T));
+    if (!p && n) { fprintf(stderr, "lp_buf: no device memory for a %.1f MB kernel workspace (slot %d, GPU %d)\n", n * sizeof(T) / 1e6, slot, cur_dev_()); abort(); }
+    return p;
 }
 #define P16_KS 18
 __global__ void prep_w8p_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Ox, int OxP);   /* defined in lp_f8fwd.cu */

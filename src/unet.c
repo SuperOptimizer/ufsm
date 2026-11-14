@@ -4488,6 +4488,90 @@ void unet_reserve(unet *u, int muon, int muon_tc) {
         if (muon_tc >= 2 && nn_muon_tc_reserve()) fprintf(stderr, "unet_reserve: the Muon cuBLASLt handle / workspace failed\n");
     }
 }
+/* ---- the kernels' device workspaces for a training window (2026-11-14 audit net#4) ----
+   Every grow-on-demand scratch of the training kernels, sized from the net's convs at the levels of the last (dry) build, mirroring each
+   site's own formula: the lp_buf slots (lp_common.cuh) and the other nn_ws ids (nn_core.cu), plus the fp4 prepared-weight memo (lp_f4fwd.cuh
+   wmemo_get: one pair per conv and pass, allocated at its first call). The planner charges the total (the fixed 550 MB guess held them
+   before, plus whatever they grew to), and with reserve it allocates every nn_ws id at its bound on the current device now, so the step
+   never grows one (cudaFree + cudaMalloc: a device-wide synchronisation mid-step) and a full card fails at start-up instead of an hour
+   in. pre_budget: the fp4 GroupNorm input copy (lp_f4fwd.cuh f4_prenorm_buf, a whole layer) gets the largest layer that fits it (its
+   callers fall back to the in-kernel GroupNorm above that: nn_ws_limit); 0 none. *pre_out: the bytes given to it. */
+typedef struct { size_t id[NN_WS_N]; size_t wmemo, pre_best; size_t pre_budget; } ws_need_t;
+static size_t ws_nb(int c) { return c >= 32 ? (size_t)(c + 31) / 32 : 1; }   /* MX blocks of c channels (narrow levels: one block of c) */
+static size_t ws_r(size_t a, size_t m) { return (a + m - 1) / m * m; }
+static void ws_max(ws_need_t *w, int id, size_t b) { if (b > w->id[id]) w->id[id] = b; }
+static void ws_conv(unet *u, const convp *c, void *arg) {
+    ws_need_t *w = arg;
+    const int lv = conv_level(u, c); if (lv < 0) return;
+    const int L = u->cfg.nlev;
+    shape5 X = u->ls[lv], Y = c->stride == 2 && lv + 1 < L ? u->ls[lv + 1] : u->ls[lv];
+    X.c = c->cin; Y.c = c->cout;
+    const size_t Sx = (size_t)X.n * X.d * X.h * X.w, Sy = (size_t)Y.n * Y.d * Y.h * Y.w, HWx = (size_t)X.h * X.w, HWy = (size_t)Y.h * Y.w;
+    /* weight preparation (lp_s2.cu / lp_f8fwd.cuh / lp_mx_s2bwd_tc.cu: 27-28 taps x Cop x Cip bytes and its scales, either orientation),
+       the 16-bit tensor-core copies (nn_common.cuh tc_wbuf: 27 Cop Cip halves), the fp4 memo (two orientations x the forward, its
+       recompute and the backward-data passes: nq 28 Cop Cip / 2 + ns 28 Cop Cip / 32, Cop / Cip padded to 16 / 32) */
+    const size_t cm = ws_r((size_t)(c->cin > c->cout ? c->cin : c->cout), 32);
+    ws_max(w, NN_WS_LPBUF + 0, 28 * cm * cm); ws_max(w, NN_WS_LPBUF + 1, 28 * cm * (cm / 16 + 2));
+    ws_max(w, NN_WS_TCW, 28 * cm * cm * 2); ws_max(w, NN_WS_TCWSC, cm * 4);
+    { const size_t a = 28 * ws_r(c->cout, 16) * ws_r(c->cin, 32), b = 28 * ws_r(c->cin, 16) * ws_r(c->cout, 32); w->wmemo += 3 * ((a > b ? a : b) / 2 + (a > b ? a : b) / 32); }
+    /* the fp4 weight gradient's gy pre-pass (lp_f4wgrad.cuh, lp_buf u8 slot 4): z-step slabs of <= UFSM_F4W_GYPRE MiB (96) of records */
+    {
+        const int kb = lp_get_f4w_gypre_kb();
+        const size_t cap_kb = kb >= 0 ? (size_t)kb : (size_t)(getenv("UFSM_F4W_GYPRE") ? atoi(getenv("UFSM_F4W_GYPRE")) : 96) * 1024;
+        const size_t per_zt = (size_t)Y.n * Y.c * ((Y.h + 7) / 8) * ((Y.w + 15) / 16) * 136, nzt = (size_t)(Y.d + 1) / 2, czt = (cap_kb << 10) / per_zt;
+        const size_t szt = czt < 1 ? 1 : czt < nzt ? czt : nzt;
+        if (cap_kb) ws_max(w, NN_WS_LPBUF + 4, per_zt * szt);
+    }
+    /* GroupNorm backward partial sums (lp_mx_gnbwd.cu, lp_buf f32 slot 5): slabs x 2 N C floats */
+    {
+        const size_t S = (size_t)Y.d * Y.h * Y.w, ny = ws_nb(Y.c) * Y.n; size_t slabs = S / 4096, want = (160 + ny - 1) / ny, maxs = S / 512 > 0 ? S / 512 : 1;
+        if (slabs < want) slabs = want;
+        if (slabs > maxs) slabs = maxs;
+        if (slabs > 1024) slabs = 1024;
+        ws_max(w, NN_WS_LPBUF + 6 + 5, slabs * 2 * (size_t)Y.n * Y.c * 4);
+    }
+    /* the fp4 GroupNorm input copy of a conv over a normalised input (lp_f4fwd.cuh: 17 B per 32 channels and voxel): the largest layer
+       under the budget */
+    if (X.c % 32 == 0 && c->cout >= 64) { const size_t b = (size_t)X.n * (X.c / 32) * (Sx / X.n) * 17; if (b <= w->pre_budget && b > w->pre_best) w->pre_best = b; }
+    if (c->stride != 2) return;
+    /* stride-2 backward-data (lp_mx_s2bwd.cu): MX-fp4 gradients through fine-plane chunks of ~96 MB of MX-fp8 rows (gx u8 slot 4, gy slot 5;
+       the dilated fp8 conv inside: the dilated gy slot 2, the accumulate temp slot 3, the flipped weights f32 slot 4); 16-bit / fp8
+       gradients the whole layer. The direct kernels (16 / 32 / 64 channels, the fp4 weight-streaming one) need none of it: an upper bound */
+    const size_t pb = ws_nb(X.c > Y.c ? X.c : Y.c) * HWx * 33;
+    size_t cz = getenv("UFSM_S2B_CZ") ? (size_t)atoi(getenv("UFSM_S2B_CZ")) : (((size_t)96 << 20) / pb) & ~(size_t)1;
+    if (!getenv("UFSM_S2B_CZ") && cz < 2) cz = 2;
+    const int chunked = grad_mx4() && cz >= 2 && cz < (size_t)X.d && X.n == 1 && X.d % 2 == 0 && Y.d == X.d / 2;
+    const size_t nf = chunked ? cz + 1 : Sx / HWx, ncz = chunked ? cz / 2 + 1 : Sy / HWy;
+    ws_max(w, NN_WS_LPBUF + 4, ws_nb(X.c) * nf * HWx * 33); ws_max(w, NN_WS_LPBUF + 5, ws_nb(Y.c) * ncz * HWy * 33);
+    if (X.c >= 64 && Y.c >= 64) { ws_max(w, NN_WS_LPBUF + 2, ws_nb(Y.c) * nf * HWx * 33); ws_max(w, NN_WS_LPBUF + 3, ws_nb(X.c) * nf * HWx * 33); }
+    ws_max(w, NN_WS_LPBUF + 6 + 4, (size_t)X.c * Y.c * 27 * 4); ws_max(w, NN_WS_LPBUF + 6 + 2, (size_t)X.c * Y.c * 27 * 4);
+    if (X.c <= 64) ws_max(w, NN_WS_LPBUF + 18, (size_t)27 * X.c * (X.c + 8) * 2);   /* (lp_mx_s2bwd_tc.cu: bf16 weights, 16 - 64 channels) */
+    ws_max(w, NN_WS_S2BCP, ws_nb(Y.c) * Sy * 17);   /* (lp_mx_s2bwd_tc.cu: the gy copy when the planner's gy and gx overlap) */
+}
+size_t unet_ws_plan(unet *u, shape5 xs, size_t pre_budget, int reserve, size_t *pre_out) {
+    (void)xs;   /* (the levels of the last build: u->ls) */
+    ws_need_t w; memset(&w, 0, sizeof w); w.pre_budget = pre_budget;
+    for_each_conv3(u, ws_conv, &w);
+    {   /* the 1^3 head on the tensor cores (lp_mx_gnbwd.cu conv1_to_mx_tc: 17 - 192 inputs): its fp16 weights + row scales (f16 slot 0) */
+        const int ci = u->cfg.widths[0], co = u->cfg.cout;
+        if (ci > 16 && ci <= 192 && co % 32 == 0) ws_max(&w, NN_WS_LPBUF + 12, ((size_t)co * ws_r(ci, 32) + 2 * (size_t)co) * 2);
+    }
+    w.id[NN_WS_F4PRE] = w.pre_best;
+    size_t t = w.wmemo;
+    for (int i = 0; i < NN_WS_N; i++) t += (w.id[i] + 255) & ~(size_t)255;
+    if (pre_out) *pre_out = w.pre_best;
+    if (reserve) {
+        for (int i = 0; i < NN_WS_N; i++)
+            if (w.id[i] && nn_ws_reserve(i, w.id[i])) fprintf(stderr, "unet_ws_plan: cannot reserve %.1f MB for %s (it grows at first use)\n", w.id[i] / 1e6, nn_ws_name(i));
+        nn_ws_limit(NN_WS_F4PRE, w.pre_best ? w.pre_best : 1);   /* (larger layers: the in-kernel GroupNorm) */
+        if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) > 0) {
+            fprintf(stderr, "memory: kernel workspaces %.2f GB (fp4 weight memo %.2f GB, charged; reserved now:", t / 1e9, w.wmemo / 1e9);
+            for (int i = 0; i < NN_WS_N; i++) if (w.id[i]) fprintf(stderr, " %s %.1f MB;", nn_ws_name(i), w.id[i] / 1e6);
+            fprintf(stderr, ")\n");
+        }
+    }
+    return t;
+}
 void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step) {
     if (head_lr_mode(u)) lr_muon *= u->trunk_lr;   /* (the 3^3 convs: all trunk; the head is on AdamW) */
     if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd, step); return; }   /* packed weights: AdamW only */

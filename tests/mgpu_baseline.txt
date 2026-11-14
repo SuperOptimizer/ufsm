@@ -164,9 +164,6 @@ latvol_cli.c sb
 lc_cli.c zt
 lp_attn8.cu g_a8d
 lp_attn8.cu g_a8nd
-lp_common.cuh buf
-lp_common.cuh cap
-lp_common.cuh rep
 lp_common.cuh smsm
 lp_f4fwd.cu dbg
 lp_f4fwd.cu g_w2d
@@ -176,8 +173,6 @@ lp_f4fwd.cu g_wmemo_step
 lp_f4fwd.cu nf8
 lp_f4fwd.cuh attr
 lp_f4fwd.cuh attr1
-lp_f4fwd.cuh buf
-lp_f4fwd.cuh cap
 lp_f4fwd.cuh f4u
 lp_f4fwd.cuh g_f4r_prof
 lp_f4fwd.cuh on
@@ -243,8 +238,6 @@ lp_mx_s2bwd_tc.cu Q
 lp_mx_s2bwd_tc.cu at
 lp_mx_s2bwd_tc.cu built
 lp_mx_s2bwd_tc.cu built2
-lp_mx_s2bwd_tc.cu cap
-lp_mx_s2bwd_tc.cu cp
 lp_mx_s2bwd_tc.cu g_s2b_f4
 lp_mx_s2bwd_tc.cu g_s2b_wide
 lp_mx_s2bwd_tc.cu on
@@ -333,8 +326,6 @@ nn_band.cu g_dev
 nn_band.cu g_rr
 nn_band.cu g_slots
 nn_bwd.cu ac
-nn_bwd.cu buf
-nn_bwd.cu cap
 nn_bwd.cu e
 nn_bwd.cu g_zs
 nn_bwd.cu nofuse
@@ -431,8 +422,6 @@ nn_fit.cu g_sel_count
 nn_fit.cu g_sel_list
 nn_fit.cu ps
 nn_flat.cu flags_set
-nn_fstem.cu cap
-nn_fstem.cu part
 nn_fusedgn.cu lay
 nn_fusedgn.cu mxup
 nn_fusedgn.cu on

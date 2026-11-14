@@ -613,9 +613,9 @@ static int s2b_f4(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx
     {   const size_t nby = (size_t)ys.n * NCH * ((size_t)ys.d * ys.h * ys.w) * 17, nbx = (size_t)xs.n * NCH * ((size_t)xs.d * xs.h * xs.w) * (4 * xdt + 1);
         const uintptr_t y0 = (uintptr_t)gy, x0 = (uintptr_t)gx;
         if (y0 < x0 + nbx && x0 < y0 + nby && !getenv("UFSM_S2B_NOCOPY")) {   /* (UFSM_S2B_NOCOPY: the old behaviour, for the test) */
-            static void *cp[8]; static size_t cap[8]; const int dv = cur_dev_();
-            if (nby > cap[dv]) { if (cp[dv]) cudaFree(cp[dv]); if (cudaMalloc(&cp[dv], nby) != cudaSuccess) { fprintf(stderr, "s2b_f4: no memory for the %.1f MB gy copy\n", nby / 1e6); abort(); } cap[dv] = nby; }
-            cudaMemcpyAsync(cp[dv], gy, nby, cudaMemcpyDeviceToDevice, 0); gyk = cp[dv];
+            void *cp = nn_ws(NN_WS_S2BCP, nby);   /* (the workspace registry: unet_ws_plan sizes it for the largest down conv's gy) */
+            if (!cp) { fprintf(stderr, "s2b_f4: no memory for the %.1f MB gy copy\n", nby / 1e6); abort(); }
+            cudaMemcpyAsync(cp, gy, nby, cudaMemcpyDeviceToDevice, 0); gyk = cp;
         }
     }
 #define S2BF(XB_, NCH_) do { if (!*atp) { *atp = 1; cudaFuncSetAttribute((const void *)bwd_data_s2_f4_k<XB_, NCH_>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \

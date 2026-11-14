@@ -719,8 +719,10 @@ static int wmemo_get(unsigned key, const float *w, int Cop, int Cip, int Cx, int
     const int d = cur_dev_();
     wmemo_s *e = &g_wmemo[d][key % WMEMO_N];
     const bool hit = e->key == key && e->w == w && e->Cop == Cop && e->Cip == Cip && e->Cx == Cx && e->CxP == CxP && e->Ox == Ox && e->OxP == OxP && e->step == g_wmemo_step && e->gen == g_wmemo_gen && e->nq == nq && e->ns == ns;
-    if (e->nq < nq) { if (e->wq) cudaFree(e->wq); cudaMalloc(&e->wq, nq); e->nq = nq; }
-    if (e->ns < ns) { if (e->ws) cudaFree(e->ws); cudaMalloc(&e->ws, ns); e->ns = ns; }
+    /* (one allocation per conv and pass at its first call; the trainer's plan charges them all: unet_ws_plan, 2026-11-14 audit net#4.
+       Was unchecked: a full card then faulted in the prep kernel) */
+    if (e->nq < nq) { if (e->wq) cudaFree(e->wq); if (cudaMalloc(&e->wq, nq) != cudaSuccess) { fprintf(stderr, "wmemo: no device memory for %zu B of prepared weights (GPU %d)\n", nq, d); abort(); } e->nq = nq; }
+    if (e->ns < ns) { if (e->ws) cudaFree(e->ws); if (cudaMalloc(&e->ws, ns) != cudaSuccess) { fprintf(stderr, "wmemo: no device memory for %zu B of weight scales (GPU %d)\n", ns, d); abort(); } e->ns = ns; }
     *wq = e->wq; *ws = e->ws;
     if (hit) return 1;
     e->key = key; e->w = w; e->Cop = Cop; e->Cip = Cip; e->Cx = Cx; e->CxP = CxP; e->Ox = Ox; e->OxP = OxP; e->step = g_wmemo_step; e->gen = g_wmemo_gen;
@@ -1079,11 +1081,11 @@ __global__ void __launch_bounds__(256) gn_prenorm_f4_k(const T *__restrict__ x, 
     *(uint4 *)(y + ri * 16) = make_uint4(cvt_e2m1x8(val, m), cvt_e2m1x8(val + 8, m), cvt_e2m1x8(val + 16, m), cvt_e2m1x8(val + 24, m));
     y[(size_t)N * nb * S * 16 + ri] = (uint8_t)(e + 127);
 }
-static inline uint8_t *f4_prenorm_buf(size_t n) {   /* per device, grown on demand */
-    static uint8_t *buf[8]; static size_t cap[8]; const int d = cur_dev_();
-    if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); buf[d] = nullptr; cap[d] = 0; if (cudaMalloc(&buf[d], n) != cudaSuccess) { cudaGetLastError(); return nullptr; } cap[d] = n; }
-    return buf[d];
-}
+/* the GroupNorm input's MX-fp4 copy: a whole layer (17 B per 32 channels and voxel: ~1 GB at level 0 of a 256-wide P 768 latent net), so
+   the planner gives it a budget (unet_ws_plan: the largest layer that fits the plan's spare, nn_ws_limit); a larger layer, or a full
+   card, takes the in-kernel GroupNorm (nullptr). Before (2026-11-14 audit net#4) it grew to any layer that the free memory allowed,
+   outside the plan: which layers ran it depended on what else happened to be allocated */
+static inline uint8_t *f4_prenorm_buf(size_t n) { return (uint8_t *)nn_ws(NN_WS_F4PRE, n); }
 template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp) {
     static int uph2 = -1; if (uph2 < 0) uph2 = getenv("UFSM_UP_H2") ? atoi(getenv("UFSM_UP_H2")) : 1;
     if (sp.up && uph2) sp.up = 2;   /* the fused upsample blends in half2 (stage_up_smem_h2); UFSM_UP_H2=0: fp32 */

@@ -91,7 +91,9 @@ void lp_set_s2b_f4(int on);  /* the fp4 stride-2 backward-data (MX-fp4 gy): 3 fo
 void lp_set_s2b_wide(int on);   /* the fp4 stride-2 backward-data at 256..448 channels (weight streaming): on by default (UFSM_S2B_WIDE=0 off); -1 env UFSM_S2B_WIDE */
 void lp_set_s2_f4(int on);   /* the fp4 stride-2 forward (MX-fp4 32-channel input, widths % 16): 1 on, 0 fp8, -1 env UFSM_S2_F4 (default on) */
 void lp_set_f4w_gypre_kb(int kb);   /* gy pre-pass of the fp4 weight gradient: slab cap in KiB (0 off, -1 env UFSM_F4W_GYPRE MiB, default 96) */
+int lp_get_f4w_gypre_kb(void);
 void lp_set_f4w_ws(int m);          /* warp-specialised fp4 weight gradient: 0 off, 1 on (default), 3 only >= 32 outputs; -1 env UFSM_F4W_WS */
+void lp_gyrec_set_cap(size_t bytes);   /* the whole-layer gy records only up to these bytes (the trainer: its planned record bytes); larger layers take the plain apply */
 void lp_set_gyrec_narrow(int on);   /* the GN+SiLU backward's gy records also for whole 8 / 16-channel levels (-1: env UFSM_GYREC=2) */
 void lp_set_gyrec_off(int off);     /* test hook: 1 no gy records at all (the plain apply), -1 env */
 int lp_get_gyrec_off(void);

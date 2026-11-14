@@ -205,6 +205,7 @@ test_ink_blend                                 |              |     4 | python3 
 test_seamless                                  |              |     6 | python3 tests/test_seamless.py
 test_cover_training                            | gpu2         |    16 | python3 tests/test_cover_training.py
 test_univ2                                     | gpu2         |    40 | tests/test_univ2.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/univ2
+test_memws                                     | gpu,slow     |    90 | tests/test_memws.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/memws
 test_checkpoint                                | gpu,smoke    |     2 | ./$B/test_checkpoint
 test_optimizer_owners                          | gpu          |     3 | ./$B/test_optimizer_owners
 test_wide_up_grad                              | gpu          |     5 | ./$B/test_wide_up_grad

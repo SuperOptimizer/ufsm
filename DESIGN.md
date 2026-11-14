@@ -6,6 +6,37 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Kernel workspaces inside the memory plan (2026-11-14, branch memws-20261114, audit net#4)
+
+At P 768 data parallel GPU 0 ran 15.75 of 16.3 GB while the planner's fixed 550 MB term stood in for every grow-on-demand kernel
+workspace, allocated at first use after the plan, grown with cudaFree + cudaMalloc mid-step (a device-wide synchronisation), and either
+aborting (lp_buf, fstem, tc_wbuf, s2b copy) or silently falling back (prenorm, gy records) on a full card. netfix already allocates the
+optimizer / attention cuBLASLt workspaces, the Muon pool and the 96 MB input-conv chunk before the measure. This branch does the rest:
+
+- **One per-device registry** (nn_core.cu `nn_ws`): the 24 lp_buf slots (4 element types x 6), the fp4 GroupNorm input copy
+  (f4_prenorm_buf), the fine stem's partial sums, the 16-bit tensor-core weight copy / scales, the s2b gy overlap copy. `nn_ws_reserve`
+  grows an id now; after `nn_ws_seal` a growth prints `nn_ws: ... grew after the memory plan` (a planner miss), and an id with a soft
+  limit (`nn_ws_limit`) returns nullptr instead (its caller's fallback).
+- **unet_ws_plan** (unet.c): for every 3^3 conv at its level of the dry build, each site's own sizing formula: weight prep 28 Cop Cip,
+  the fp4 gy pre-pass slabs (per_zt x min(nzt, 96 MiB / per_zt)), GroupNorm backward partials, the stride-2 backward-data's MX-fp8
+  chunks (gx / gy / dilated gy / accumulate temp, or the whole layer with 8-bit gradients), the flipped weights, the bf16 tc weights,
+  the s2b gy copy, the head's fp16 weights; plus the fp4 prepared-weight memo (3 passes x both orientations of nq + ns per conv: one
+  cudaMalloc per conv and pass at its first call, now checked), charged but not pre-allocated (keyed per call site).
+- **Planner** (train.c): need += unet_ws_plan per mode, replacing the "3 x 96 MB" wide-s2 term; the fixed term is now 400 MB of CUDA
+  context growth + margin (UFSM_WS_RESIDUAL_MB) instead of 550 MB with the workspaces inside. After the pick, every id is allocated at
+  its bound on every GPU and sealed. The fine stem's partials (5.3 MB) are reserved before the measure.
+- **The fp4 GroupNorm input copy** (a whole layer, 17 B per 32 channels and voxel: ~0.96 GB at level 0 of the 256-wide P 768 net)
+  ran wherever the card's free memory allowed at first call: on try6 it could fit GPU 1 (2.5 GB free) but not GPU 0 (0.55 GB), so the
+  replicas could run different kernels. Now it gets the largest layer within 3/4 of the plan's spare above 256 MB, the same on every
+  GPU, and the label planes' device spare shrinks by it.
+- **The whole-layer gy records** (lp_gn_silu_bwd_apply_rec) are capped at the planned record bytes (lp_gyrec_set_cap); larger layers
+  take the plain apply and the weight gradient's own pre-pass (fail-soft path that existed).
+- gscr (the apply's bias scratch) is allocated at >= 1024 channels once; abk / cfb / skip masks / attn8 scratch are < 1 MB (skip:
+  one byte per 8x8x16-cell tile; attn8: tokens of the bottom level) and stay lazy.
+
+Check: tests/test_memws.sh (gpu, slow): try6's flags at P 256 on the wind fixture with UFSM_MEM_REPORT=4; FAIL on any "grew after the
+memory plan" line or any >= 1 MB device allocation after the first step line. Not run yet (mega pass: CPU only); no measured numbers.
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the

@@ -668,6 +668,16 @@ void nn_muon_ext_adapt(const nn_madapt *a);
 void nn_muon_scale_mode(int m);   /* 0: sqrt(max(1, Co / K)); 1: spectral sqrt(Co / K) (train --muon-scale spectral) */
 void nn_signm(float *p, const float *g, float *m, size_t n, float lr, float b, float wd);   /* sign-momentum (Scion ell-inf) step */
 int lp_f8w_mixed_reserve(void);   /* the latent input conv's MX-fp8 x / MX-fp4 gy weight-gradient chunk copies (96 MB) on the current device now */
+/* kernel workspaces (nn_core.cu): one per-device registry of the kernels' grow-on-demand scratch, sized by the trainer's memory planner */
+enum { NN_WS_LPBUF = 0,   /* + 6 x the element type (0 uint8, 1 float, 2 __half, 3 bf16) + slot (0..5): lp_buf<T>(slot) */
+       NN_WS_F4PRE = 24, NN_WS_FSTEM, NN_WS_TCW, NN_WS_TCWSC, NN_WS_S2BCP, NN_WS_N };
+void *nn_ws(int id, size_t bytes);       /* the current device's workspace id of >= bytes (grown if needed; nullptr: no memory, or over a soft limit after the seal) */
+int nn_ws_reserve(int id, size_t bytes); /* grow it to >= bytes now (before the first step); -1 if the device is full */
+void nn_ws_limit(int id, size_t bytes);  /* after the seal, larger requests return nullptr (callers with a fallback); 0: none */
+void nn_ws_seal(int on);                 /* on: later growth on this device is reported as outside the plan */
+size_t nn_ws_bytes(int id);              /* its bytes on the current device (id -1: all) */
+const char *nn_ws_name(int id);
+int nn_fstem_reserve(int C, int nout);   /* the fine stem backward's partial sums at their largest (1024 blocks) on the current device */
 void nn_muon_tc(int on);   /* Muon / Muon-ext Newton-Schulz products on fp16 tensor cores (fp32 accumulation; train --muon-tc 1) */
 void nn_muon_ext_opts(int cautious);
 void nn_muon_ext_mix(float *const *m2, float b3, float alpha);   /* AdEMAMix slow EMA (device array of per-matrix buffers; nullptr = off) */   /* nn_muon_ext_batch extras (process-wide): cautious masking (train --muon-cautious 1) */

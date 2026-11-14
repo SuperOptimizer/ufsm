@@ -5,6 +5,7 @@ extern "C" void lp_set_f4w_coop(int on) { g_f4w_coop = on != 0; }
 int g_f4w_coop = -1;
 int g_f4w_gypre_kb = -1;   /* gy pre-pass slab cap in KiB (0 off, -1 env UFSM_F4W_GYPRE in MiB, default 96) */
 extern "C" void lp_set_f4w_gypre_kb(int kb) { g_f4w_gypre_kb = kb; }
+extern "C" int lp_get_f4w_gypre_kb(void) { return g_f4w_gypre_kb; }
 int g_f4w_ws = -1;   /* warp-specialised weight gradient: 0 off, 1 on, 3 the old selection (>= 32 outputs only); -1 env UFSM_F4W_WS (default 1) */
 extern "C" void lp_set_f4w_ws(int m) { g_f4w_ws = m; }
 /* instantiated in lp_f4wgrad_i*.cu */

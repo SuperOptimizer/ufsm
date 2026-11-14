@@ -209,15 +209,17 @@ extern "C" int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, 
     fstem_fwd_k<<<(unsigned)nt, FS_BT>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns); KCHECK();
     return 0;
 }
+/* the backward's partial sums at their largest (1024 blocks x the parameters; 5.3 MB at 16 -> 16) on the current device, before the trainer's
+   memory planner measures the free memory (they were allocated at the first backward, outside the plan: 2026-11-14 audit net#4) */
+extern "C" int nn_fstem_reserve(int C, int nout) { return nn_ws_reserve(NN_WS_FSTEM, (size_t)1024 * (C * FS_T + C + nout * C) * 4); }
 extern "C" int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, const void *g, size_t ns, float *gp) {
     if (!fs_ok(D, H, W, z0, nz, C, nout)) return 1;
     const size_t ntile = (size_t)(nz / 2) * (H / 2) * ((W / 2 + FS_BT - 1) / FS_BT); if (!ntile) return 0;
     const unsigned nbk = (unsigned)(ntile < 1024 ? ntile : 1024);
     const int npar = C * FS_T + C + nout * C;
-    static float *part[8]; static size_t cap[8]; int dv = 0; cudaGetDevice(&dv); dv &= 7;   /* (per device: one host thread per GPU) */
-    const size_t need = (size_t)nbk * npar;
-    if (need > cap[dv]) { if (part[dv]) cudaFree(part[dv]); if (cudaMalloc(&part[dv], need * 4) != cudaSuccess) { fprintf(stderr, "nn_fstem_bwd: no device memory\n"); abort(); } cap[dv] = need; }
-    fstem_bwd_k<<<nbk, FS_BT>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (const f16 *)g, ns, part[dv]); KCHECK();
-    fstem_red_k<<<(npar + 127) / 128, 128>>>(part[dv], (int)nbk, npar, gp); KCHECK();
+    float *part = (float *)nn_ws(NN_WS_FSTEM, (size_t)nbk * npar * 4);   /* (the workspace registry: nn_fstem_reserve sizes it before the plan) */
+    if (!part) { fprintf(stderr, "nn_fstem_bwd: no device memory\n"); abort(); }
+    fstem_bwd_k<<<nbk, FS_BT>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (const f16 *)g, ns, part); KCHECK();
+    fstem_red_k<<<(npar + 127) / 128, 128>>>(part, (int)nbk, npar, gp); KCHECK();
     return 0;
 }
