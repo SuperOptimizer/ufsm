@@ -262,6 +262,16 @@ template <typename HT> __device__ __forceinline__ unsigned packh(float a, float 
 template <> __device__ __forceinline__ unsigned packh<bf16>(float a, float b) { __nv_bfloat162 r = __floats2bfloat162_rn(a, b); return *(unsigned *)&r; }
 template <> __device__ __forceinline__ unsigned packh<f16>(float a, float b) { __half2 r = __floats2half2_rn(a, b); return *(unsigned *)&r; }
 /* activation element type: float or bf16 (gradients are always float) */
+/* the fine stem's W1 rows (C x 64) to fp16 for the tensor cores (nn_fstem.cu) and predict's mirror (nn_lathead.cu): row c is scaled by 2^e
+   so its max |w| lies in [2^14, 2^15) before the fp16 conversion, and the fp32 product is scaled back by 2^-e (both exact), so a row of
+   tiny weights keeps fp16's 11 bits instead of flushing into subnormals (the head's fix, 1b0f7b9; audit net#11). Returns e (0: off, or an
+   all-zero / non-finite row). */
+__device__ __forceinline__ int fs_w1_exp(const float *row, int on) {
+    if (!on) return 0;
+    float m = 0.f; for (int k = 0; k < 64; k++) m = fmaxf(m, fabsf(row[k]));
+    if (!(m > 0.f) || !(m < 3e38f)) return 0;
+    int e; frexpf(m, &e); e = 15 - e; return e < -100 ? -100 : e > 100 ? 100 : e;
+}
 template <typename T> __device__ __forceinline__ float ldv(const T *p, size_t i);
 template <> __device__ __forceinline__ float ldv<float>(const float *p, size_t i) { return p[i]; }
 template <> __device__ __forceinline__ float ldv<bf16>(const bf16 *p, size_t i) { return __bfloat162float(p[i]); }

@@ -17,15 +17,18 @@ struct lh_args {
     int d, h, w, c0, c1, sb0, sb1, s0, s1, C, nout, iso;   /* c1 < 0: a probability of c0; sbN / sN < 0: no sub-cell / stem term */
     float mean, isd;
     int z0, y0, x0, z1, y1, x1, oz, oy, ox, shard;
+    int ws;   /* nn_fstem_wscale (set after the initialisers) */
 };
 __device__ inline float lh_h(float v) { return __half2float(__float2half_rn(v)); }
 
 template <typename T>
 __global__ void __launch_bounds__(LH_BT) lat_head_k(const T *lg, const uint8_t *ct, const float *sp_g, lh_args A, uint8_t *dsh) {
-    __shared__ float W1[LH_MAXC * 64], b1[LH_MAXC], W2[2][LH_MAXC];
+    __shared__ float W1[LH_MAXC * 64], b1[LH_MAXC], W2[2][LH_MAXC]; __shared__ int we[LH_MAXC];
     const int C = A.C;
     if (C) {   /* the stem's parameters: W1 as the tensor-core kernel takes it (fp16), b1, the projection rows of the head's channels */
-        for (int k = threadIdx.x; k < C * 64; k += blockDim.x) W1[k] = __half2float(__float2half_rn(sp_g[k]));
+        for (int k = threadIdx.x; k < LH_MAXC; k += blockDim.x) we[k] = k < C ? fs_w1_exp(sp_g + k * 64, A.ws) : 0;
+        __syncthreads();
+        for (int k = threadIdx.x; k < C * 64; k += blockDim.x) W1[k] = ldexpf(__half2float(__float2half_rn(sp_g[k] * ldexpf(1.f, we[k / 64]))), -we[k / 64]);   /* (nn_fstem.cu: the same scaled fp16 rows) */
         for (int k = threadIdx.x; k < C; k += blockDim.x) {
             b1[k] = sp_g[C * 64 + k];
             W2[0][k] = A.s0 >= 0 ? sp_g[C * 64 + C + A.s0 * C + k] : 0.f;
@@ -143,6 +146,7 @@ extern "C" void nn_lat_head_place(const void *lg, int lh16, int d, int h, int w,
     const int D = 4 * d, H = 4 * h, W = 4 * w; (void)H;
     lh_args A = {d, h, w, c0, c1, sb0, sb1, s0, s1, stem ? C : 0, nout, iso < 1 ? 1 : iso, mean, isd,
                  max(hz, -oz), max(halo, -oy), max(halo, -ox), min(D - hz, ez - oz), min(4 * h - halo, ey - oy), min(W - halo, ex - ox), oz, oy, ox, shard};
+    A.ws = nn_fstem_wscale();
     if (A.z1 <= A.z0 || A.y1 <= A.y0 || A.x1 <= A.x0) return;
     if (A.C > LH_MAXC || (A.C && (s0 >= nout || s1 >= nout))) { fprintf(stderr, "nn_lat_head_place: stem %d / %d outside the kernel's range\n", C, nout); abort(); }
     const size_t n = (size_t)(((A.z1 + 3) >> 2) - (A.z0 >> 2)) * (((A.y1 + 3) >> 2) - (A.y0 >> 2)) * (((A.x1 + 3) >> 2) - (A.x0 >> 2));
@@ -158,11 +162,13 @@ enum { LHS_BT = 64 };
 struct lhs_heads { int n, c0[LH_MAXH], c1[LH_MAXH], sb0[LH_MAXH], sb1[LH_MAXH], s0[LH_MAXH], s1[LH_MAXH]; uint8_t *dsh[LH_MAXH]; };
 template <typename T>
 __global__ void __launch_bounds__(LHS_BT) lat_heads_k(const T *lg, const uint8_t *ct, const float *sp_g, lh_args A, lhs_heads HS) {
-    __shared__ float W1[LH_MAXC * 64], b1[LH_MAXC], W2s[LH_MAXO * LH_MAXC];
+    __shared__ float W1[LH_MAXC * 64], b1[LH_MAXC], W2s[LH_MAXO * LH_MAXC]; __shared__ int we[LH_MAXC];
     __shared__ float shf[LHS_BT][8][LH_MAXC + 1];
     const int C = A.C, nout = A.nout;
     if (C) {
-        for (int k = threadIdx.x; k < C * 64; k += blockDim.x) W1[k] = __half2float(__float2half_rn(sp_g[k]));
+        for (int k = threadIdx.x; k < LH_MAXC; k += blockDim.x) we[k] = k < C ? fs_w1_exp(sp_g + k * 64, A.ws) : 0;
+        __syncthreads();
+        for (int k = threadIdx.x; k < C * 64; k += blockDim.x) W1[k] = ldexpf(__half2float(__float2half_rn(sp_g[k] * ldexpf(1.f, we[k / 64]))), -we[k / 64]);   /* (nn_fstem.cu: the same scaled fp16 rows) */
         for (int k = threadIdx.x; k < C; k += blockDim.x) b1[k] = sp_g[C * 64 + k];
         for (int k = threadIdx.x; k < nout * C; k += blockDim.x) W2s[k] = sp_g[C * 64 + C + k];
         __syncthreads();
@@ -278,6 +284,7 @@ extern "C" void nn_lat_heads_place(const void *lg, int lh16, int d, int h, int w
     const int D = 4 * d, W = 4 * w;
     lh_args A = {d, h, w, 0, -1, -1, -1, -1, -1, stem ? C : 0, nout, iso < 1 ? 1 : iso, mean, isd,
                  max(hz, -oz), max(halo, -oy), max(halo, -ox), min(D - hz, ez - oz), min(4 * h - halo, ey - oy), min(W - halo, ex - ox), oz, oy, ox, shard};
+    A.ws = nn_fstem_wscale();
     if (A.z1 <= A.z0 || A.y1 <= A.y0 || A.x1 <= A.x0 || nh < 1) return;
     if (nh > LH_MAXH || A.C > LH_MAXC || nout > LH_MAXO) { fprintf(stderr, "nn_lat_heads_place: %d heads, stem %d / %d outside the kernel's range\n", nh, C, nout); abort(); }
     lhs_heads HS; HS.n = nh;

@@ -487,6 +487,8 @@ void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
    to the fp16 logit planes chs[o] (slab planes [z0, z0 + nz) of a D x H x W window, ns voxels a plane) on each 2^3 block; bwd accumulates the
    parameter gradients from fp16 gradient planes of that layout into gp. 1: a shape the kernels do not take (odd sizes, C or nout > 16) */
 int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns);
+int nn_fstem_wscale(void);          /* W1's rows go to fp16 with a power-of-two scale (default; UFSM_FSTEM_WSCALE=0: unscaled); predict's mirror follows it */
+void nn_fstem_set_wscale(int on);
 int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, const void *g, size_t ns, float *gp);
 /* a latent-grid net's head straight from the cell logits lg [cout][d][h][w] into a device shard (src/nn_lathead.cu, predict --heads): the
    window interior ([hz, 4d - hz) x [halo, 4w - halo)^2) inside the shard [0, e) at offset o; channel c0 (a probability) or the recto / verso

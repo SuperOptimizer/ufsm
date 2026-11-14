@@ -1,5 +1,7 @@
 /* nn_fstem_fwd / nn_fstem_bwd (train --fstem) against a double host reference on a 10 x 12 x 14 window (two slabs, z 0..5 and 6..9),
-   C 16, nout 7 channels of 9; the reference's own gradient checked by central differences on a few parameters. Usage: test_fstem */
+   C 16, nout 7 channels of 9; the reference's own gradient checked by central differences on a few parameters. Then the tiny-weight case (audit net#11, as test_head_tc's): W1 ~ 1e-7 (fp16 subnormals unscaled), b1 0, W2 ~ 1e5, the
+   forward and dW2 (which reads the recomputed pre-activations) against the reference, with the per-row power-of-two scale (default) and
+   without it (UFSM_FSTEM_WSCALE=0: must be visibly worse, so the case tests something). Usage: test_fstem */
 #include "nn.h"
 #include <math.h>
 #include <stdint.h>
@@ -24,6 +26,37 @@ static double ref(const uint16_t *x, const double *p, const uint16_t *G, double 
         }
     }
     return L;
+}
+static int tiny_check(const uint16_t *x, void *xd) {
+    const size_t V = (size_t)D * H * W, NP = C * T + C + NO * C; uint64_t s = 77; int fails = 0; double e[2][2];
+    double *p = malloc(NP * 8), *out = malloc(NO * V * 8); float *pf = malloc(NP * 4), *gp = malloc(NP * 4);
+    uint16_t *G = malloc(NCH * V * 2), *lg = malloc(NCH * V * 2);
+    for (size_t i = 0; i < NP; i++) pf[i] = (float)(i < C * T ? 4e-7 * rnd(&s) : i < C * T + C ? 0.0 : 4e5 * rnd(&s));
+    for (size_t i = 0; i < NP; i++) p[i] = pf[i];
+    for (size_t i = 0; i < NCH * V; i++) G[i] = f2h((float)rnd(&s));
+    void *ld = nn_malloc(NCH * V * 2), *gd = nn_malloc(NCH * V * 2); float *pd = nn_malloc(NP * 4), *gpd = nn_malloc(NP * 4);
+    nn_h2d(pd, pf, NP * 4); nn_h2d(gd, G, NCH * V * 2);
+    ref(x, p, G, out);
+    double ga[NO * C], gmax = 0, omax = 0;
+    for (int k = 0; k < NO * C; k++) { double *q = p + C * T + C + k; const double q0 = *q; *q = q0 + 1; const double lp = ref(x, p, G, nullptr); *q = q0 - 1; const double lm = ref(x, p, G, nullptr); *q = q0; ga[k] = (lp - lm) / 2; gmax = fmax(gmax, fabs(ga[k])); }
+    for (size_t i = 0; i < NO * V; i++) omax = fmax(omax, fabs(out[i]));
+    const int was = nn_fstem_wscale();
+    for (int ws = 0; ws < 2; ws++) {
+        nn_fstem_set_wscale(1 - ws);   /* (ws 0: scaled, 1: unscaled) */
+        nn_zero(ld, NCH * V * 2); nn_zero(gpd, NP * 4);
+        if (nn_fstem_fwd(xd, D, H, W, 0, D, pd, C, NO, chs, ld, V) || nn_fstem_bwd(xd, D, H, W, 0, D, pd, C, NO, chs, gd, V, gpd)) { fprintf(stderr, "FAIL: shape\n"); return 1; }
+        nn_sync(); nn_d2h(lg, ld, NCH * V * 2); nn_d2h(gp, gpd, NP * 4);
+        double fe = 0, be = 0;
+        for (int o = 0; o < NO; o++) for (size_t i = 0; i < V; i++) fe = fmax(fe, fabs(h2f(lg[chs[o] * V + i]) - out[o * V + i]));
+        for (int k = 0; k < NO * C; k++) be = fmax(be, fabs(gp[C * T + C + k] - ga[k]));
+        e[ws][0] = fe / omax; e[ws][1] = be / gmax;
+        printf("fstem tiny W1 (|w| < 2e-7) %s: forward max error / max |out| %.2e, dW2 max error / max |dW2| %.2e\n", ws ? "unscaled" : "row-scaled", e[ws][0], e[ws][1]);
+    }
+    nn_fstem_set_wscale(was);
+    if (!(e[0][0] < 3e-3 && e[0][1] < 3e-3)) { fprintf(stderr, "FAIL: tiny W1 with the row scale\n"); fails++; }
+    if (!(e[1][0] > 10 * e[0][0] && e[1][1] > 10 * e[0][1])) { fprintf(stderr, "FAIL: the unscaled path is not worse: the tiny case does not exercise the scale\n"); fails++; }
+    nn_free(ld); nn_free(gd); nn_free(pd); nn_free(gpd); free(p); free(out); free(pf); free(gp); free(G); free(lg);
+    return fails;
 }
 int main(void) {
     nn_init(0); int fails = 0; uint64_t s = 5;
@@ -67,6 +100,7 @@ int main(void) {
     printf("fstem bwd: worst |error| %.2e over %zu parameters (max |gradient| %.3g): %.2e relative\n", ge, NP, gmax, ge / gmax);
     if (!(ge / gmax < 1e-3))   /* (the recompute's W1 in fp16, as the forward's tensor-core product: 1.8e-4 measured) */ { fprintf(stderr, "FAIL: bwd\n"); fails++; }
     if (nn_fstem_fwd(xd, D, H, W, 1, 4, pd, C, NO, chs, ld, 4 * H * W) != 1) { fprintf(stderr, "FAIL: odd z0 accepted\n"); fails++; }
+    fails += tiny_check(x, xd);
     if (fails) return 1;
     printf("test_fstem: ok\n"); return 0;
 }
