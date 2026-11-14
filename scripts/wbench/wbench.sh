@@ -144,7 +144,7 @@ elif [ "$BOXES" = core ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /label
 elif [ "$BOXES" = holdout ]; then   # holdout-only (datafix 2026-11-14): the boxes inside a box of HOLDOUTS (holdouts-20261114.json) on that scroll's training scan
   BL=$(python3 - "$BT" "${HOLDOUTS:?BOXES=holdout needs HOLDOUTS=holdouts.json}" <<'PY'
 import json, sys
-H = json.load(open(sys.argv[2]))['boxes']
+H = [h for h in json.load(open(sys.argv[2]))['boxes'] if h.get('score', 1) != 0]   # ("score": 0: masked, not scored)
 scan = {'paris4': '20260411134726-2.400um', '1667': '20251217075048-2.399um', 'PHerc0139': '20250728140407-9.362um', 'PHerc0500P2': '20250820143440-9.362um',
         'PHerc0814': '20250804134230-9.362um'}   # (paris4j: the 2023 scan, not a training scan: never held out there)
 for ln in open(sys.argv[1]):

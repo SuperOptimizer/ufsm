@@ -1,5 +1,5 @@
 {
- "note": "holdouts-20261114 selection (datafix-20261114): the existing boxes (wbench, ink eval crops, fibre HOLD, the 0139 / 0500P2 cross-res\nmaps) plus, per scan where a source stays under ~8 % of its labels, one full-yx z slab chosen from holdout-cover's z histograms so every\nsource on that scan lands nearest 8-12 %. Over-covered sets trimmed (0841 ink 49 %: its boxes greedily to ~10 %; 1299's bottom third\nreplaced by a slab). 0139: the slab is chosen jointly over the 9.362 and 2.399 um scans through the xres affine (z nearly axis aligned:\ncz = 0.257 fz + 623, x / y tilt < 60 coarse rows -> a 300-row fine margin); the 2.399 um ink eval crops mapped back to 9.362 um.",
+ "note": "holdouts-20261114 selection (datafix-20261114): the existing boxes (wbench, ink eval crops, fibre HOLD, the 0139 / 0500P2 cross-res\nmaps) plus, per scan where a source stays under ~8 % of its labels, one full-yx z slab chosen from holdout-cover's z histograms so every\nsource on that scan lands nearest 8-12 %. Over-covered sets trimmed (0841 ink 49 %: its boxes greedily to ~10 %; 1299's bottom third\nreplaced by a slab). 0139: the slab is chosen jointly over the 9.362 and 2.399 um scans through the xres affine (z nearly axis aligned:\ncz = 0.257 fz + 623, x / y tilt < 60 coarse rows -> a 300-row fine margin); the 2.399 um ink eval crops mapped back to 9.362 um. 0009B (8.64 / 2.401 um, no registration between the scans): its boxes are \"score\": 0 - masked from training on both scans, never validated or scored on (a cross-scan leak cannot be ruled out).",
  "boxes": [
   {
    "name": "PH1",
@@ -1513,7 +1513,8 @@
     7837,
     7837
    ],
-   "src": "slab for PHerc0009B-good"
+   "src": "slab for PHerc0009B-good",
+   "score": 0
   },
   {
    "name": "slab-PHerc0009B-z19456",
@@ -1526,7 +1527,8 @@
     14130,
     14130
    ],
-   "src": "slab for PHerc0009B-u2ink"
+   "src": "slab for PHerc0009B-u2ink",
+   "score": 0
   },
   {
    "name": "slab-PHerc0125-z11776",

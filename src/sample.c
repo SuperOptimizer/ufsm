@@ -410,6 +410,7 @@ static int patch_bounds(const source *s, const z3_meta *m, const int64_t wn[3], 
         }
         if (validation) {   /* (validation k + 1: held-out box k; 1 = box 0 = hold_o / hold_n) */
             const int k = validation - 1; if (k >= (s->hold_n[0] > 0 ? (s->nhold > 1 ? s->nhold : 1) : 0)) return 0;
+            if (s->hold_nos && k < s->nhold && s->hold_nos[k]) return 0;   /* ("score": 0: masked, never validated on) */
             const int64_t bo = k ? s->hold[k][d] : s->hold_o[d], bn = k ? s->hold[k][3 + d] : s->hold_n[d];
             if (bn <= 0) return 0;
             int64_t hl = (bo + f - 1) / f, hh = (bo + bn) / f - P;

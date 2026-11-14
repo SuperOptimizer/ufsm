@@ -987,7 +987,7 @@ int cmd_ink_score(int argc, char **argv) {
     fprintf(stderr, "ink-score: %s: labels %lld x %lld, %.4g canvas px per label px (canvas %.0f x %.0f)\n", S.name, (long long)LL.W, (long long)LL.H, F, ew, eh);
     /* --holdouts H --ct KEY (holdout-only scoring, datafix 2026-11-14): only the label pixels whose surface point (the mesh's level-0
        voxels, z y x as ssurf_pn) lies in one of H's boxes for that CT */
-    const char *hof = sopt(argc, argv, "--holdouts", nullptr), *hct = sopt(argc, argv, "--ct", nullptr); inksplat_cfg hc; memset(&hc, 0, sizeof hc);
+    const char *hof = sopt(argc, argv, "--holdouts", nullptr), *hct = sopt(argc, argv, "--ct", nullptr); inksplat_cfg hc; memset(&hc, 0, sizeof hc); hc.ho_score_only = 1;
     if (hof && (!hct || inkfly_holdouts(hof, hct, &hc) || !hc.nexcl)) { fprintf(stderr, "ink-score: --holdouts needs --ct KEY and at least one box of that CT in %s\n", hof); return 1; }
     if (hof) fprintf(stderr, "ink-score: holdout-only: the pixels inside the %d held-out boxes of %s\n", hc.nexcl, hct);
     int rc = 0;
@@ -1063,7 +1063,7 @@ int cmd_ink_vscore(int argc, char **argv) {
     /* --holdouts H --ct KEY (holdout-only scoring, datafix 2026-11-14): only the voxels whose level-0 centre lies in one of H's boxes
        for that CT (basename match, as the sampler's holdout_file): a score on held-out labels, not on the training set */
     const char *hof = sopt(argc, argv, "--holdouts", nullptr), *hct = sopt(argc, argv, "--ct", nullptr);
-    if (hof) { inksplat_cfg hc; memset(&hc, 0, sizeof hc);
+    if (hof) { inksplat_cfg hc; memset(&hc, 0, sizeof hc); hc.ho_score_only = 1;
         if (!hct || inkfly_holdouts(hof, hct, &hc) || !hc.nexcl) { fprintf(stderr, "ink-vscore: --holdouts needs --ct KEY and at least one box of that CT in %s\n", hof); return 1; }
         uint64_t kept = 0; const int64_t hf = (int64_t)1 << L;
         for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++) {
@@ -1601,6 +1601,7 @@ int inkfly_holdouts(const char *path, const char *ct_key, inksplat_cfg *cfg) {
     for (size_t i = 0; bx && i < bx->n; i++) {
         const json *e = json_at(bx, i); const char *ck = json_str(json_get(e, "ct"), ""); const json *l0 = json_get(e, "l0");
         if (strcmp(base_name(ck), want) || !l0 || l0->n != 6) continue;
+        if (cfg->ho_score_only && json_num(json_get(e, "score"), 1) == 0) continue;
         if (cfg->nexcl >= 64) { fprintf(stderr, "ink onfly: more than 64 held-out boxes for %s\n", want); json_free(j); return -1; }
         for (int d = 0; d < 6; d++) cfg->excl[cfg->nexcl][d] = (int64_t)json_num(json_at(l0, (size_t)d), 0);
         cfg->nexcl++;

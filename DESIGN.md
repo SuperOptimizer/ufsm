@@ -22,7 +22,9 @@ kept, 11 %), 1299's bottom-third band (26 %: replaced by a 4096-row slab). Secon
 through the xres affine (z nearly axis aligned, cz = 0.257 fz + 623, 300-row margin for the x / y tilt); the 2.399 / 2.215 um ink crops
 of 0139 / 0500P2 mapped back to the 9.362 um scans (`ufsm reg map --f2c --box`). **0009B has no registration** between 8.64 and 2.401 um:
 each scan has its own slab (z 7168 + 2048 of 9600; z 19456 + 4096 of 29120, similar fractions of the scan) - a cross-scan leak is
-possible there until a 0009B xres map exists.
+possible there until a 0009B xres map exists. Its two boxes are therefore `"score": 0` (main 11-14): masked from training on both scans, but never a
+validation box (patch_bounds skips them) and skipped by the scoring tools' `--holdouts` and wbench's BOXES=holdout, so no reported number
+rests on them.
 
 Held-out share of each source's draw cells (holdout-cover; cells of 32^3 .. 512^3 level-0 voxels, so an upper bound on the label voxels):
 
