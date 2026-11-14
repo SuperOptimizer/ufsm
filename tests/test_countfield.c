@@ -80,8 +80,9 @@ static void gpu_vs_cpu(const char *dir) {
     free(cyv); free(cxv);
 }
 
-/* DEFAULTED (2026-11-14): no rings for the prior (all-zero fields) and no --dir: count-field must say that it guessed the direction.
-   Under UFSM_STRICT_DEFAULTS=1 it exits 3 (in a child: exit() ends the process); the golden runs above ran strict, so they guessed nothing. */
+/* no direction evidence (2026-11-14): no rings for the prior (all-zero fields), no --dir, no phase / w4 loops: count-field REFUSES (returns 2)
+   instead of guessing +1 (fibfit: a wrong hand hops two sheets per turn), strict or not; --dir-default-ok 1 is the explicit opt-in. The child
+   passes the return value through (a strict-defaults exit(3) would show as 3, i.e. a guess that was not refused). */
 static void defaulted_dir(const char *dir) {
     enum { D3 = 6, H3 = 48, W3 = 48 }; const size_t n = (size_t)D3 * H3 * W3; uint8_t *a[10]; for (int k = 0; k < 10; k++) a[k] = calloc(n, 1);
     const int na = D3 * h + 1; float *cyv = calloc(na, sizeof(float)), *cxv = calloc(na, sizeof(float));
@@ -93,10 +94,10 @@ static void defaulted_dir(const char *dir) {
     if (c == 0) {
         char *av[] = {"ufsm", "count-field", in, out, "--R", "0", "--pool", "1", "--threads", "1", "--rmin-um", "0", "--cf-gpu", "0", nullptr};
         setenv("UFSM_STRICT_DEFAULTS", "1", 1); freopen("/dev/null", "w", stdout);
-        _exit(cmd_count_field(14, av) == 0 ? 0 : 1);
+        const int r = cmd_count_field(14, av); _exit(r < 0 ? 255 : r & 255);
     }
     int st = 0; waitpid(c, &st, 0);
-    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 3, "count-field without rings or --dir: want the DEFAULTED stop (exit 3), got status %d", st);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 2, "count-field without rings or --dir: want the direction REFUSED (2), got exit %d (raw status %d)", WIFEXITED(st) ? WEXITSTATUS(st) : -1, st);
     for (int k = 0; k < 10; k++) free(a[k]);
     free(cyv); free(cxv);
 }
