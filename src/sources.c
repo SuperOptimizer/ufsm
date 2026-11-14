@@ -752,8 +752,8 @@ z3 *source_phase_at(source *s, int level, int ign) {
         z3 *under = source_phase_at(s, level - 1, ign); if (!under) return nullptr;
         pthread_mutex_lock(&g_open_mu);
         if (!pl[level] && !ign && s->phase_store && s->phase_key_um > 0) {   /* the level stored once (ufsm downsample <root> <key> <root> <um> --mode phase):
-            the view's circular mean in double sums (phase_pool2_box: float sums): Paris4-july's 19.2 um array equals the view on all but 0.004 % of
-            the known voxels and within 1 code (2.8 % of them differ by 1), read instead of 8x the voxels decoded and pooled per window (1536^3
+            the view's circular mean in double sums (phase_pool2_box: float sums): Paris4-july's 19.2 um array equals the view on all but ~0.02 % of
+            the known voxels and within 1 code (3-4 % of them differ by 1), read instead of 8x the voxels decoded and pooled per window (1536^3
             phase bytes and an atan2 per coarse voxel at P 768; datafix 2026-11-14) */
             char key[32]; z3w_level_name(s->phase_key_um * ldexp(1.0, level - s->phase_level), key, sizeof key);
             z3 *st = z3_open(s->phase_store, key, nullptr); const z3_meta *um_ = z3_meta_of(under), *sm = st ? z3_meta_of(st) : nullptr; int ok = sm != nullptr;

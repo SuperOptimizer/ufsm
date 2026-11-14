@@ -6,6 +6,54 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Data / label fixes from the 2026-11-14 audit: outward check, codes grid, ink pooling, stored 19.2 phase, warp fill (2026-11-14, branch datafix-20261114)
+
+The read-only audit of the sampler / label path (/vesuvius/ufsm/audit-20261114/data.md) ranked ten findings; main took #1 (PHerc1218-b3's
+weight) and #3 (a 1667 holdout) as decisions. Implemented here, one commit each, with their label diffs:
+
+**Per-source losses and the outward check (#2).** The `--mix-every` lines gain "head bce by source" (phase / wind4 / normal per source,
+beside the rv line) and "phase outward by source": `sample_phase_outward` samples every 8th voxel of each drawn window's phase as trained
+(after `phase_sign`), takes its circular gradient where it is radially aligned with the unjittered axis (|cos| >= 0.7) and counts it
+rising outward or inward; below `--outward-warn` (0.9) with >= 2000 samples a WARNING names the source. The pair rule makes phase rise from
+the lower winding to the higher, so an inward-numbered GT set would reverse phase, rv, normals and wind4 silently, and no codes store
+records its direction. Sampler-only on the 15 live winding sources (P 256, 83 windows): every source rises outward, 0.977 (1667-B48),
+0.986 / 0.988 (1667-A48 / -gt), 0.988 (0172-gt), 0.996 (0139-gt), 0.999-1.000 the rest, **1218-b3 1.000**: its rv at chance (0.66-0.67
+over steps 1001-1500) is not a direction problem.
+
+**Codes rasters on the CT's grid (#4).** `ufsm raster` and the on-the-fly mesh codes (CPU and GPU stamp) put level-0 x into level-l voxel
+floor(x 2^-l + 1/2): voxel j centred on level-0 2^l j, while the CT pyramid (`pool2_mean`), ink and fibre rasters centre it on its block,
+2^l j + (2^l - 1) / 2. Codes sat 0.25 (level 1) / 0.375 (level 2) voxel off the CT, the sign flipped by the symmetry augmentation (a blur).
+Now floor(x 2^-l + 2^-l / 2); level 0 unchanged; meshcodes cache ids v2 at level > 0; raster attrs say `"grid": "block-centre"`.
+`test_codes_grid`: planes at x = 40..47, levels 0..3, land in column x >> l (12 of 32 cases off by one before). On the 1667 GT meshes
+vs the stored codesA (6 windows of 192^3 at level 1) the old binary is byte-identical, the new one differs in 497 k of 1.19 M coded
+voxels (thin sheets moving one voxel half the time). **Not yet re-rastered** (a label change mid-run): gtjuly codesA 9.6 (Paris4-june),
+p4full phaseB (Paris4-july), PHerc1667-wind-20261016 codesA / codesB 4.798 (1667-gt / A48 / B48), b1-paris4 codesA48 and
+univ/b1/gt/paris4 codesB48 (june48 / july48). Level-0 sets (0139-gt, 0500P2-gt, 0172-gt, the -good sets) are unaffected; 1218 / 1299
+come from surf-labels, whose wrap-to-grid scale has its own rule.
+
+**Ink at 9.6 um as the known mean (#5).** `inkfly_open_pooled` took the known max of each 2^3 block (any inked child inked the coarse
+voxel). Now `ink_pool8`, the rounded mean of the known children. Sampler-only `--det 1` at the 9.6 rung: ink voxels 0.00206 -> 0.00204
+(0139, same windows), 0.00332 -> 0.00314 (Paris 4): 1-5 % fewer, smaller than the audit's estimate because the face labels are a 7-voxel
+band at level 1, so only the band's edges grew; partial blocks are now soft targets.
+
+**Paris4-july's 19.2 um phase stored (#6).** Its 19.2 windows pooled the 9.6 um phaseB per read (8x the voxels decoded, an atan2 per
+coarse voxel, no cache). `source_phase_at` now reads a stored coarser level from the phase's group when present; phaseB/19.2 was written
+by `ufsm downsample --mode phase` (12 GB, 55 min). `test_phase_pool --compare` on 6 boxes of 384^3: 0.02 % of the known voxels known in
+one only, 4.1 % of the rest 1 code apart (double vs float sums), none more; read 0.90 s vs 15.34 s (17x).
+
+**Warp fill (#7).** Voxels a rotation pulls from outside the source cube were 0 after z-scoring (the window's mean density, fake material);
+now `warp_fill`, the z-scored raw 0 (air, as a masked scan's outside and predict's past-the-volume voxels), jittered like any voxel, on the
+host writers and the device (`aug_write_k`) alike. At `--rotate-deg 5`, P 768: 4.5 % of a rotated window's voxels (p90 6.1 %, max 7.3 %),
+~0.9 % of all input voxels at `--rotate-p 0.2`; every echo replay is rotated.
+
+**Rung shift (#8): a design choice, now visible.** `--rung-shift-p` moves the drawn rung to a list neighbour and nothing later depends on the
+original rung, so it is purely a reweighting: 1:2:1 at p 0.3 draws 28.75 / 42.5 / 28.75 % for a source reaching all three, 61.7 / 38.3 %
+(not 66.7 / 33.3) for one reaching 9.6 / 19.2. Unchanged; the sampler's start-up line prints the effective mix over the weighted sources.
+
+**Side finding.** The mesh-codes pack key (meshcodes.c `mc_key`) is the mesh names, sizes and mtimes, not the directory: two mesh dirs
+with same-named, same-sized meshes written in the same second share one pack under a common `UFSM_MESHCODES_CACHE` (seen in
+test_codes_grid with identical names; real sets have unique timestamped names).
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the
