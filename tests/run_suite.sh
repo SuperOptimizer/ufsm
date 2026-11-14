@@ -90,7 +90,7 @@ srcdeps() {   # a binary's dependency basenames (one per line), "@cuda" when it 
 }
 if [ -n "$CHANGED" ]; then
   mapfile -t CF < <({ git diff --name-only "$CHANGED" -- 2> /dev/null; git ls-files --others --exclude-standard 2> /dev/null; } | sort -u)
-  ALLC=0; for f in "${CF[@]}"; do case $f in Makefile|CMakeLists.txt|*.cmake|cmake/*|tests/run_suite.sh) ALLC=1;; esac; done
+  ALLC=0; for f in "${CF[@]}"; do case $f in Makefile|CMakeLists.txt|CMakePresets.json|*.cmake|cmake/*|tests/run_suite.sh) ALLC=1;; esac; done
   if [ $ALLC = 0 ]; then
     KEEP=(); declare -A MLINE   # manifest lines added or changed since REF: those tests run
     while IFS='|' read -r n _; do n=$(echo ${n#+}); [ -n "$n" ] && MLINE[$n]=1; done < <(git diff "$CHANGED" -- "$MANIFEST" 2> /dev/null | grep -E '^\+[^+#]')
