@@ -37,7 +37,7 @@ grep -q "echo-max off under --det 1" det1.log || fail "--det 1 did not switch ec
 echo "  --det 1: echo off, losses equal"
 # (4) --echo-max with validation batches under --gpu-aug 3 (try6, 2026-11-14: the validation sampler inherited --echo-max without cube
 #     batches and refused, "cannot construct validation sampler", so the run did not start): it starts, validates and trains
-run val --workers 2 --steps 8 --echo-max 3 --gpu-aug 3 --val-batches 2 --val-every 4
+run val --workers 2 --steps 8 --echo-max 3 --gpu-aug 3 --val-batches 2 --val-train-ok 1 --val-every 4
 [ "$(grep -c '^step' val.log)" = 4 ] || fail "echo + validation: not 4 step lines ($D/val.log)"
 ! grep -q "cannot construct validation sampler" val.log || fail "echo + validation: the validation sampler refused ($D/val.log)"
 echo "  --echo-max with --val-batches 2 under --gpu-aug 3: starts and trains"

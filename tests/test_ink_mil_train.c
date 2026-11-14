@@ -121,7 +121,7 @@ int main(int argc, char **argv) {
                "  \"targets\": {\"ink\": {\"onfly\": {\"segments\": \"%s/fx/segs.json\", \"level\": 0, \"cache_dir\": \"%s/dcache\"}},\n"
                "               \"band\": {\"root\": \"%s/fx/band\", \"key\": \"1\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/fx/phase0\", \"key\": \"0\", \"level\": 0}}}}]}\n", d, d, d, d, d, d);
     fclose(f);
-    const char *common = "--task unwrap2 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 "
+    const char *common = "--task unwrap2 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-train-ok 1 --val-every 1000 --log-every 1 "
                          "--ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --levels 1 --widths 16,32,64 --ink-head 1 --ink-dice 0.25";
     CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/a --steps 6 --ink-mil 1 --ink-mil-mode 0 %s > %s/a.log 2>&1", U, d, d, common, d), "train --ink-mil (%s/a.log)", d);
     snprintf(p, sizeof p, "%s/a.log", d); int fm = 0, fw = 0;

@@ -85,7 +85,7 @@ int main(int argc, char **argv) {
     CHECK(!sh("%s %s/fx 256 2 1 > %s/fx.log 2>&1", argv[2], d, d), "fixture");
     /* the fibre plane of the combined runs: the fixture's ink raster again, as the sources' "fibre" target next to "ink" */
     CHECK(!sh("sed 's|\"ink\": *{\\([^}]*\\)}|\"ink\": {\\1}, \"fibre\": {\\1}|' %s/fx/sources-ink.json > %s/fx/sources-fib.json && grep -q fibre %s/fx/sources-fib.json", d, d, d), "sources with a fibre target");
-    const char *common = "--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 "
+    const char *common = "--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-train-ok 1 --val-every 1000 --log-every 1 "
                          "--ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --widths 16,32,64 --det 1 --steps 4";
     static const struct { const char *name, *src, *flags; } old[] = {
         {"plain", "sources.json", ""},

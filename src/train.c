@@ -4933,7 +4933,10 @@ int cmd_train(int argc, char **argv) {
     vc.echo_max = 0; vc.replay = 1; vc.replay_gap = 0;   /* (2026-11-14 try6: validation draws each window once; echo / replay need --gpu-aug 2 cube batches,
                                                            which vc.gpu_aug = 0 is not, so --echo-max refused the validation sampler and the run did not start) */
     { int any = 0; for (int i = 0; i < S->n; i++) any |= S->src[i].hold_n[0] > 0 || (S->src[i].srp && S->src[i].srp->nte > 0); if (!any) { vc.holdout = 0;
-        if (nval > 0 && !opt_atoi("--val-train-ok", opt(argc, argv, "--val-train-ok", "0"))) {   /* (eval audit 11-14 #7: a warning let runs report training-set scores as validation) */
+        /* (eval audit 11-14 #7: a warning let runs report training-set scores as validation.) Refused when validation was asked for
+           (--val-batches given, as every launch script does: try7 passes 32); the implicit default only warns, so the test fixtures'
+           sources (no holdout_file) still train (sweep 11-14: ~20 GPU tests died on return 2) */
+        if (nval > 0 && opt(argc, argv, "--val-batches", nullptr) && !opt_atoi("--val-train-ok", opt(argc, argv, "--val-train-ok", "0"))) {
             fprintf(stderr, "no holdout boxes in the sources: validation would come from the training distribution; add \"holdout_file\" boxes, --val-batches 0, or --val-train-ok 1\n"); return 2; }
         fprintf(stderr, "no holdout boxes in the sources: validation batches come from the training distribution (--val-train-ok 1)\n"); } }
     /* the validation windows are the first nval batches of a deterministic sampler (each window from its own seeded rng: the same

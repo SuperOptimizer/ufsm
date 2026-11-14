@@ -16,7 +16,7 @@ set -eu
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 "$MF" fx 256 2 1 > fx.log 2>&1
-C=(--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 --ckpt-every 1000 --fp4 2
+C=(--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-train-ok 1 --val-every 1000 --log-every 1 --ckpt-every 1000 --fp4 2
    --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --widths 16,32,64 --det 1 --steps 3)
 P=(--um 9.6 --level 0 --window 160 --halo 16 --shard 128 --levels 1 --threads 2 --q 0)
 fail() { echo "FAIL: $*"; exit 1; }

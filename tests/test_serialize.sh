@@ -10,7 +10,7 @@ set -eu
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3; G2=${UFSM_TEST_GPUS:-0,1}
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 "$MF" fx 256 2 1 > fx.log 2>&1
-C=(fx/sources-l1.json --task unwrap2 --P 64 --B 1 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 4 --log-every 1 --ckpt-every 1000
+C=(fx/sources-l1.json --task unwrap2 --P 64 --B 1 --workers 2 --sampler-slots 4 --val-batches 2 --val-train-ok 1 --val-every 4 --log-every 1 --ckpt-every 1000
    --fp4 2 --gpu-aug 3 --replay 3 --warmup 0 --seed 5 --widths 16,32,64 --rv 2 --rv-iso 100 --lat 4 --lat-guide 3 --um-rungs 19.2,38.4
    --film 2 --fstem 16 --uw 1 --grad-cos 3 --det 1 --steps ${SERN:-8})
 fails=0
