@@ -4250,7 +4250,7 @@ static int mx_any(const unet *u) { return u->mx_c || u->mx_hb || u->mx_ns || u->
 void unet_set_muon_adapt(unet *u, int lars, float tgt, float beta, float clamp, int dog, float dog_max, float lr_peak) {
     u->ad_lars = lars; u->ad_tgt = tgt; u->ad_b = beta; u->ad_c = clamp; u->ad_dog = dog; u->ad_dogmax = dog_max; u->ad_lrpeak = lr_peak;
 }
-static void ad_setup(unet *u, const muon_build_t *b) {   /* nn_muon_ext_adapt for this step's ext batch (state allocated once) */
+static void ad_setup(unet *u, const muon_build_t *b, float beta) {   /* nn_muon_ext_adapt for this step's ext batch (state allocated once) */
     const int n = b->n;
     if (!u->ad_lrm) {
         if (u->mx_c || u->mx_hb) { fprintf(stderr, "adaptive Muon (--muon-lars / --muon-dog): not with --muon-c or --hyperball\n"); abort(); }
@@ -4273,6 +4273,7 @@ static void ad_setup(unet *u, const muon_build_t *b) {   /* nn_muon_ext_adapt fo
     }
     const nn_madapt a = {.lrm = u->ad_lrm, .ema = u->ad_ema, .dog = u->ad_dogst, .disp = u->ad_dispp, .part = u->ad_part, .lr_peak = u->ad_lrpeak,
                          .lars_tgt = u->ad_tgt, .lars_b = u->ad_b, .lars_c = u->ad_c, .dog_eta0 = u->ad_lrpeak, .dog_max = u->ad_dogmax * u->ad_lrpeak,
+                         .dog_kappa = (1.f + beta) / (1.f - beta),
                          .on_lars = u->ad_lars, .on_dog = u->ad_dog};
     nn_muon_ext_adapt(&a);
 }
@@ -4360,7 +4361,7 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
                           nullptr, u->mx_R, 0, u->mx_part, lr, beta, wd, 0.f, u->mx_ns, nr, nr ? u->mx_nmoff + nconv3 : nullptr, u->mx_nmtot, b2, vp ? vp + nconv3 : nullptr, vg);
         return;
     }
-    if (u->ad_lars || u->ad_dog) ad_setup(u, b);
+    if (u->ad_lars || u->ad_dog) ad_setup(u, b, beta);
     nn_muon_ext_batch(u->muon_descs, n, u->muon_maxco, u->muon_maxk, u->mx_c ? u->mx_mcd : nullptr, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
                       u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr, u->mx_ns, nr, u->mx_nmoff, u->mx_nmtot, b2, vp, vg);
     nn_muon_ext_adapt(nullptr);
