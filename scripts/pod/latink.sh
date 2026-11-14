@@ -7,7 +7,12 @@
 # Env: LATINK_CK (default /root/pod/ckpt/inkpod-9000.ckpt), ITH (threads).
 set -u
 O=${1:?}; G=${2:-0}; OUT=${3:?}; U=${U:-/root/pod/ufsm/build/ufsm}; CK=${LATINK_CK:-${POD:-/root/pod}/ckpt/inkpod-9000.ckpt}
-row=$(tail -1 $O/bin/scrolls.tsv); R=$(echo "$row" | cut -f2); K=$(echo "$row" | cut -f3); UM=$(echo "$row" | cut -f4); LV=$(echo "$row" | cut -f5)
+# the CT: UNROLL_CT="ROOT|KEY|UM|LEVEL" (unroll.sh exports it: CTROOT / CTKEY overrides included), else the scrolls.tsv row of this run's
+# scroll (O's basename, a TAG suffix allowed; was `tail -1`, the pods' one-row table: on the desk's full table that is another scroll)
+if [ -n "${UNROLL_CT:-}" ]; then IFS='|' read -r R K UM LV <<< "$UNROLL_CT"
+else row=$(awk -F'\t' -v o=$(basename $O) 'NR > 1 && index(o, $1) == 1 { if (length($1) > l) { l = length($1); r = $0 } } END { print r }' $O/bin/scrolls.tsv)
+  [ -n "$row" ] || { echo "latink: no scrolls.tsv row for $(basename $O) (set UNROLL_CT)"; exit 1; }
+  R=$(echo "$row" | cut -f2); K=$(echo "$row" | cut -f3); UM=$(echo "$row" | cut -f4); LV=$(echo "$row" | cut -f5); fi
 LUM=$(awk -v u=$UM -v l=$LV 'BEGIN { printf "%.4g", u * 2 ^ l }'); BOX=$(cat $O/box.txt); T=$O/ink/lat.tmp; TH=${ITH:-12}
 echo "latink: ck $CK, $R $K level $LV ($LUM um), box $BOX"
 mkdir -p $T

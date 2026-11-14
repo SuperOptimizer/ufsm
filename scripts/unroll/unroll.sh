@@ -58,6 +58,13 @@ CK=${CK:-/vesuvius/ufsm/podready/pod/ckpt/wind96-wk1-best.ckpt}; INKCK=${INKCK:-
 ncpu() { local n; n=$($U sysinfo --ncpu 2> /dev/null) && [ "$n" -gt 0 ] 2> /dev/null && { echo $n; return; }; nproc; }
 availgb() { local g; g=$($U sysinfo --avail-gb 2> /dev/null) && [ "$g" -ge 0 ] 2> /dev/null && { echo $g; return; }
             awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo; }
+# the ink: INKMODE lat (default since 2026-11-14, the latent-ink-only policy): scripts/pod/latink.sh (two tile grids + ink-blend, ink / c12 /
+# c13 heads, --axis) with LATINK_CK (default the newest inkpod snap, 15000) as INKCMD; INKMODE ift3: the legacy feathered single pass of INKCK
+INKMODE=${INKMODE:-lat}
+if [ "$INKMODE" = lat ] && [ -z "${INKCMD+x}" ]; then
+  export LATINK_CK=${LATINK_CK:-/vesuvius/ufsm/v2/lat/runs/inkpod/snap/15000.ckpt} U; INKCMD="bash $([ -e $H/latink.sh ] && echo $H || echo $H/../pod)/latink.sh";   # (the run's copy in $O/bin, the repo's on DRY)
+  INKNAME=${INKNAME:-inkpod-$(basename $LATINK_CK .ckpt)}
+fi
 INKNAME=${INKNAME:-ift3-24000}; TH=${TH:-$(ncpu)}; [ "$TH" -gt 20 ] 2> /dev/null && [ -z "${TH_ALL:-}" ] && TH=20; MINMEM=${MINMEM:-40}; INKGPU=${INKGPU:-1}
 FIELDGPUS=${FIELDGPUS:-0 1}; FITGPUS=${FITGPUS:-0 1}; DRY=${DRY:-0}; I=${SLABI:-64}; OV=${SLABOV:-16}
 # SLABI / SLABOV: slab cells / overlap (default 64 / 16). A full-section Paris 3 slab (96 x 3680 x 4768 fields, 16.8 GB) does not fit a 16 GB GPU and
@@ -82,7 +89,7 @@ F=$O/fields/$FNAME; REF=$O/ref-cf; INK=$O/ink/$INKNAME.zarr
 
 # the run's own copy of the scripts (bash reads scripts incrementally: editing the repo must not change a running driver)
 if [ "$DRY" != 1 ] && [ "${UNROLL_COPY:-0}" != 1 ]; then
-  mkdir -p $O/bin && cp $H/unroll.sh $H/fields_cat.sh $H/scrolls.tsv $REPO/scripts/wbench/mkcrop.sh $REPO/scripts/strip/strip_run.sh $REPO/scripts/strip/strip_refill.sh $O/bin/ || exit 1
+  mkdir -p $O/bin && cp $H/unroll.sh $H/fields_cat.sh $H/scrolls.tsv $REPO/scripts/wbench/mkcrop.sh $REPO/scripts/strip/strip_run.sh $REPO/scripts/strip/strip_refill.sh $REPO/scripts/pod/latink.sh $O/bin/ || exit 1
   UNROLL_COPY=1 UNROLL_REPO=$REPO exec bash $O/bin/unroll.sh "$@"
 fi
 MKCROP=$H/mkcrop.sh; [ -e $MKCROP ] || MKCROP=$REPO/scripts/wbench/mkcrop.sh
@@ -326,7 +333,7 @@ ink() {
   # INKCMD set but empty (a pod env with an unset path, "INKCMD=$X"): fail loudly instead of falling back to the default prediction;
   # any INKCMD must leave a readable zarr at $INK (a dangling link from a missing published ink fails here, not in the renders)
   if [ -n "${INKCMD+x}" ] && [ -z "${INKCMD// /}" ]; then log "ink: INKCMD is set but EMPTY: refusing (unset it for the default feathered ink)"; return 1; fi
-  if [ -n "${INKCMD:-}" ]; then X $O/logs/ink.log $INKCMD $O $INKGPU $INK || { log "ink: INKCMD '$INKCMD' failed (logs/ink.log)"; return 1; }
+  if [ -n "${INKCMD:-}" ]; then UNROLL_CT="$R|$K|$UM|$LV" X $O/logs/ink.log $INKCMD $O $INKGPU $INK || { log "ink: INKCMD '$INKCMD' failed (logs/ink.log)"; return 1; }
     [ "$DRY" = 1 ] || [ -e $INK/zarr.json ] || { log "ink: INKCMD '$INKCMD' left no zarr at $INK (zarr.json missing; dangling link?)"; return 1; }
     return 0; fi
   local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
