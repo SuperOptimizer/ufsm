@@ -9,7 +9,7 @@ CIs: read a metric that moves the same way on most boxes and across metrics befo
 """
 import random, sys
 
-BETTER = {'h1': 1, 'on_pap': 1, 'gap_void': 1, 'contrast': 1, 'sp_cv': 0, 'jumps': -1, 'nrm_deg': 0, 'nrm30': 0, 'rv_agree': 1, 'ink_air': -1,
+BETTER = {'h1': 1, 'on_pap': 1, 'gap_void': 1, 'contrast': 1, 'sp_cv': 0, 'jumps': -1, 'jumps_n': -1, 'nrm_deg': 0, 'nrm30': 0, 'rv_agree': 1, 'ink_air': -1,
           'ink_band': 1, 'fib_chg_m': -1, 'slip_l1': -1, 'seams': -1, 'fit_phase': -1, 'fit_normal': -1, 'fit_density': -1}
 # tiers from the validation against GT (scripts/univ/uqa_validate.py, 6 checkpoints x 44 wbench core boxes, 2026-11-12; DESIGN.md): the
 # share of same-box checkpoint pairs whose metric difference has the GT p05x difference's sign. jumps 0.77 (ids 0.60): primary. h1 /
