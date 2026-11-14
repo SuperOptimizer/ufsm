@@ -305,10 +305,10 @@ static int flag(int argc, char **argv, const char *name) {
 static int write_pgm(const char *path, const uint8_t *img, int64_t w, int64_t h) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
-    fprintf(f, "P5\n%lld %lld\n255\n", (long long)w, (long long)h);
-    fwrite(img, 1, (size_t)(w * h), f);
-    fclose(f);
-    return 0;
+    int bad = fprintf(f, "P5\n%lld %lld\n255\n", (long long)w, (long long)h) < 0;
+    bad |= fwrite(img, 1, (size_t)(w * h), f) != (size_t)(w * h);   /* (unchecked: a truncated image reported as written; audit mini/errpaths 7) */
+    bad |= fclose(f) != 0;
+    return bad ? -1 : 0;
 }
 
 /* ---- regions: list region_<z>_<y>_<x>.zarr under a directory (local readdir or nginx index html) ---- */
@@ -4159,24 +4159,30 @@ static int cmd_papyrus_labels(int argc, char **argv) {
 }
 
 /* An 8-bit RGB PNG (zlib deflate, filter 0 rows) */
-static void png_chunk(FILE *f, const char *type, const uint8_t *d, uint32_t n) {
-    const uint8_t be[4] = {(uint8_t)(n >> 24), (uint8_t)(n >> 16), (uint8_t)(n >> 8), (uint8_t)n}; fwrite(be, 1, 4, f); fwrite(type, 1, 4, f);
-    if (n) fwrite(d, 1, n, f);
+static int png_chunk(FILE *f, const char *type, const uint8_t *d, uint32_t n) {   /* 0 when every byte was written */
+    const uint8_t be[4] = {(uint8_t)(n >> 24), (uint8_t)(n >> 16), (uint8_t)(n >> 8), (uint8_t)n};
+    int bad = fwrite(be, 1, 4, f) != 4; bad |= fwrite(type, 1, 4, f) != 4;
+    if (n) bad |= fwrite(d, 1, n, f) != n;
     uLong c = crc32(0L, Z_NULL, 0); c = crc32(c, (const Bytef *)type, 4); if (n) c = crc32(c, d, n);
-    const uint8_t cb[4] = {(uint8_t)(c >> 24), (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c}; fwrite(cb, 1, 4, f);
+    const uint8_t cb[4] = {(uint8_t)(c >> 24), (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c}; bad |= fwrite(cb, 1, 4, f) != 4;
+    return bad;
 }
 static int png_write_rgb(const char *path, int w, int h, const uint8_t *rgb) {
     const size_t rs = (size_t)w * 3 + 1, raw = rs * (size_t)h; uint8_t *r = malloc(raw); uLongf zn = compressBound(raw); uint8_t *z = malloc(zn);
     if (!r || !z) { free(r); free(z); return 1; }
     for (int y = 0; y < h; y++) { r[(size_t)y * rs] = 0; memcpy(r + (size_t)y * rs + 1, rgb + (size_t)y * w * 3, (size_t)w * 3); }
     FILE *f = compress2(z, &zn, r, raw, 6) == Z_OK ? fopen(path, "wb") : nullptr;
+    int bad = 0;   /* (the chunk writes were unchecked: a full disk left a truncated PNG and exit 0; audit mini/errpaths 7) */
     if (f) {
-        static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10}; fwrite(sig, 1, 8, f);
+        static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10}; bad |= fwrite(sig, 1, 8, f) != 8;
         const uint8_t ih[13] = {(uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w, (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h, 8, 2, 0, 0, 0};
-        png_chunk(f, "IHDR", ih, 13); png_chunk(f, "IDAT", z, (uint32_t)zn); png_chunk(f, "IEND", nullptr, 0);
+        bad |= png_chunk(f, "IHDR", ih, 13); bad |= png_chunk(f, "IDAT", z, (uint32_t)zn); bad |= png_chunk(f, "IEND", nullptr, 0);
     }
     free(r); free(z);
-    return f ? fclose(f) != 0 : 1;
+    if (!f) return 1;
+    bad |= fclose(f) != 0;
+    if (bad) unlink(path);
+    return bad;
 }
 /* ufsm overlay <out.png> <ct-root> <ct-key> --plane z,y,x,h,w [--labels G1,G2,..] [--um 2.4] [--zoom 1] [--cache DIR]
    One CT plane (volume coordinates) beside the same plane of each label group (papyrus-labels output: key = --um level, placed by

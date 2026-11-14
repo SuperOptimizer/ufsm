@@ -35,6 +35,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -764,10 +766,10 @@ int cmd_patch_id(int argc, char **argv) {
           }
           FILE *f = fopen(ao, "wb"); if (!f) { fprintf(stderr, "patch-id: cannot write %s\n", ao); return 1; }
           const int32_t hd5[5] = {nw, J.CR, J.NS, (int32_t)dir, (int32_t)nc};
-          fwrite("UFSMANC2", 1, 8, f); fwrite(hd5, 4, 5, f);
-          for (int k = 0; k < nw; k++) { const int32_t a[2] = {W[k].id, W[k].h}; fwrite(a, 4, 2, f); }
-          fwrite(D, 4, nc, f); fwrite(dm, 4, nc, f); fwrite(st, 1, nc, f);
-          if (fclose(f)) return 1;
+          int bad = fwrite("UFSMANC2", 1, 8, f) != 8; bad |= fwrite(hd5, 4, 5, f) != 5;   /* (every count checked; audit mini/errpaths 5) */
+          for (int k = 0; k < nw; k++) { const int32_t a[2] = {W[k].id, W[k].h}; bad |= fwrite(a, 4, 2, f) != 2; }
+          bad |= fwrite(D, 4, nc, f) != nc; bad |= fwrite(dm, 4, nc, f) != nc; bad |= fwrite(st, 1, nc, f) != nc;
+          if (fclose(f) || bad) { fprintf(stderr, "patch-id: writing %s failed: %s\n", ao, strerror(errno)); unlink(ao); return 1; }
           printf("patch-id: anchor file %s: %u cells, %lld with own anchor votes, %lld from patches, %lld mixed\n", ao, nc, nk, np, nm);
           free(D); free(dm); free(st);
       } }

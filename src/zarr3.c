@@ -640,6 +640,9 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
         volcomp_status st;
         if (k && cv == VOLCOMP_CHUNK_VOXELS && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK && (mode == VLL_MODE_LOSSY || mode == VLL_MODE_CODED || mode == VLL_MODE_CONST)) {
             const uint32_t subs = vfx_sink_subs(k);   /* (an error: the reference path below, whose status and bytes then hold) */
+            /* a failing sink may have written some substreams into the caller's output already: with *sunk 0 the caller copies the
+               reference's dec over that span, and on a reference error FAIL is returned, after which the span is undefined (as any
+               failed read's output) (audit mini/volcomp 5) */
             if (mode == VLL_MODE_CONST) {
                 if (n == VF_HDR_BYTES + 1u) {
                     for (int zz = k->b0[0]; zz < k->b1[0]; zz++) for (int yy = k->b0[1]; yy < k->b1[1]; yy++)

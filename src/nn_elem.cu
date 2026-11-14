@@ -1141,7 +1141,8 @@ extern "C" void nn_pred_stats(const uint8_t *ct, size_t n, void *scratch, size_t
     unsigned long long *acc = (unsigned long long *)scratch, h[3];
     cudaMemsetAsync(acc, 0, 3 * sizeof *acc);
     pred_stats_k<<<256, 256>>>(ct, n, acc); KCHECK();
-    cudaMemcpy(h, acc, sizeof h, cudaMemcpyDeviceToHost);
+    h[0] = h[1] = h[2] = 0;
+    CK(cudaMemcpy(h, acc, sizeof h, cudaMemcpyDeviceToHost));   /* (a failed copy: the sticky error, not silent zeros; audit mini/errpaths 6) */
     *nz = (size_t)h[0]; *sum = (double)h[1]; *sq = (double)h[2];
 }
 extern "C" void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, float *y, int ctot, int c0) {

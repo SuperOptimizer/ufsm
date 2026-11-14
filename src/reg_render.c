@@ -28,6 +28,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <errno.h>
+#include <unistd.h>
 
 int reg_load_map(const char *path, const char *cache, rvol **cv, rvol **fv, rmap *m, rfield *D);   /* src/reg_view.c */
 
@@ -497,12 +499,13 @@ int cmd_reg_render(int argc, char **argv) {
         pthread_t th2[64]; const int T2 = j->threads < 1 ? 1 : j->threads > 64 ? 64 : j->threads;
         for (int t = 0; t < T2; t++) pthread_create(&th2[t], nullptr, sample_worker, &sj);
         for (int t = 0; t < T2; t++) pthread_join(th2[t], nullptr);
-        char sp2[2100]; snprintf(sp2, sizeof sp2, "%s/samples.bin", od); FILE *sf = fopen(sp2, "wb");
+        char sp2[2100]; snprintf(sp2, sizeof sp2, "%s/samples.bin", od); FILE *sf = fopen(sp2, "wb");   /* (a NULL fopen crashed in fwrite and short writes went unseen; audit mini/errpaths 8) */
         char hdr[4096]; int hl = snprintf(hdr, sizeof hdr, "{\"samples\":%zu,\"scans\":[", nsm);
         for (int s2 = 0; s2 < j->ns; s2++) hl += snprintf(hdr + hl, sizeof hdr - hl, "%s\"%s\"", s2 ? "," : "", j->sc[s2].name);
         hl += snprintf(hdr + hl, sizeof hdr - hl, "],\"variants\":[\"native\",\"matched\"],\"depth\":[%d,%d],\"record\":\"class u8 (1 no-ink, 2 ink), certified u8 per scan, then [variant][scan][layer] u8 raw (0 missing)\"}\n", d0, d1);
-        fwrite(hdr, 1, hl, sf); fwrite(sv, rec, nsm, sf); fclose(sf);
-        fprintf(stderr, "reg render: %zu depth samples (%d layers) -> %s\n", nsm, nl, sp2);
+        int sok = sf && fwrite(hdr, 1, hl, sf) == (size_t)hl && fwrite(sv, rec, nsm, sf) == nsm; if (sf) sok &= fclose(sf) == 0;
+        if (sok) fprintf(stderr, "reg render: %zu depth samples (%d layers) -> %s\n", nsm, nl, sp2);
+        else { fprintf(stderr, "reg render: writing %s failed: %s\n", sp2, strerror(errno)); unlink(sp2); }
         free(sv); free(sx);
     }
     for (int s2 = 0; s2 < j->ns; s2++) if (j->sc[s2].touch) {   /* touched shards: "sz sy sx" lines */

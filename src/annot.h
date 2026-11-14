@@ -17,9 +17,9 @@
 typedef struct annot_store annot_store;
 annot_store *annot_open(const char *path, const char *scroll, const char *scan);   /* loads the snapshot if present; nullptr on a bad file */
 void annot_close(annot_store *s);
-int annot_add(annot_store *s, const char *item_json, const char *author, char *err, size_t errn);   /* new id (> 0) or -1 */
-int annot_del(annot_store *s, int id);    /* 0 ok, -1 no such live item */
-int annot_undo(annot_store *s);           /* reverts the newest add / del of this session: 0 ok, -1 nothing to undo */
+int annot_add(annot_store *s, const char *item_json, const char *author, char *err, size_t errn);   /* new id (> 0), -1 invalid item, -2 kept in memory but not saved to disk */
+int annot_del(annot_store *s, int id);    /* 0 ok, -1 no such live item, -2 not saved to disk */
+int annot_undo(annot_store *s);           /* reverts the newest add / del of this session: 0 ok, -1 nothing to undo, -2 not saved to disk */
 char *annot_snapshot(annot_store *s);     /* the snapshot JSON text (malloc'd) */
 int annot_count(annot_store *s);          /* live items */
 

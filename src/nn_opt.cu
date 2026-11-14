@@ -183,7 +183,9 @@ static int ns5_lt(const muon_desc_t *d, int nconv, int mode) {
     static const void *hk[16]; static int hn[16]; static muon_desc_t *hd[16];   /* the table's host copy per device (built once, pointers stable) */
     int dev = 0; cudaGetDevice(&dev); if (dev < 0 || dev >= 16) return -1;
     if (hk[dev] != d || hn[dev] != nconv) { free(hd[dev]); hd[dev] = (muon_desc_t *)malloc(sizeof(muon_desc_t) * (size_t)nconv);
-        cudaMemcpy(hd[dev], d, sizeof(muon_desc_t) * (size_t)nconv, cudaMemcpyDeviceToHost); hk[dev] = d; hn[dev] = nconv; }
+        if (!hd[dev] || cudaMemcpy(hd[dev], d, sizeof(muon_desc_t) * (size_t)nconv, cudaMemcpyDeviceToHost) != cudaSuccess) {   /* (unchecked: garbage descriptors; audit mini/errpaths 6) */
+            cudaGetLastError(); free(hd[dev]); hd[dev] = nullptr; hk[dev] = nullptr; hn[dev] = 0; return -1; }
+        hk[dev] = d; hn[dev] = nconv; }
     int e = 0;
     for (int i = 0; i < nconv; i++) {
         const muon_desc_t D = hd[dev][i]; float *X = D.X, *Y = D.Y;

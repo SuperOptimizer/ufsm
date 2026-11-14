@@ -55,6 +55,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <unistd.h>
 #include <time.h>
 
 enum { SL_TR = 8, SL_TC = 32 };   /* tile = 8 rows x 32 columns of quads */
@@ -616,10 +618,10 @@ static int an_assign(sl_job *J, const char *out, int nmin, double smin, double r
     /* the file: header, per wrap id + h, then D (float) and status (uint8) per cell */
     FILE *f = fopen(out, "wb"); if (!f) { fprintf(stderr, "wrap-anchor: cannot write %s\n", out); return -1; }
     const int32_t hd[5] = {J->nw, J->an_cr, J->an_ns, (int32_t)J->dir, (int32_t)nc};
-    fwrite("UFSMANC2", 1, 8, f); fwrite(hd, 4, 5, f);
-    for (int k = 0; k < J->nw; k++) { const int32_t a[2] = {J->W[k].id, J->W[k].h}; fwrite(a, 4, 2, f); }
-    fwrite(D, 4, nc, f); fwrite(dm, 4, nc, f); fwrite(st, 1, nc, f);
-    if (fclose(f)) return -1;
+    int bad = fwrite("UFSMANC2", 1, 8, f) != 8; bad |= fwrite(hd, 4, 5, f) != 5;   /* (every count checked: a short write on ENOSPC with fclose 0 was reported written; audit mini/errpaths 5) */
+    for (int k = 0; k < J->nw; k++) { const int32_t a[2] = {J->W[k].id, J->W[k].h}; bad |= fwrite(a, 4, 2, f) != 2; }
+    bad |= fwrite(D, 4, nc, f) != nc; bad |= fwrite(dm, 4, nc, f) != nc; bad |= fwrite(st, 1, nc, f) != nc;
+    if (fclose(f) || bad) { fprintf(stderr, "wrap-anchor: writing %s failed: %s\n", out, strerror(errno)); unlink(out); return -1; }
     /* per-wrap stats (voxel-weighted: the cells' rasterised voxels) */
     char tp[1600]; snprintf(tp, sizeof tp, "%s.tsv", out); FILE *t = fopen(tp, "w"); if (!t) return -1;
     fprintf(t, "wrap\tcells\tvoxels\tknown\tpropagated\tmasked\tunreached\tanchored_share\tmasked_share\toffsets\n");

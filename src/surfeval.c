@@ -459,7 +459,7 @@ int cmd_surf_eval(int argc, char **argv) {
     double *dsum = nn_malloc((size_t)N * 8 * 8), *dsq = nn_malloc(8); unsigned long long *dvc = nn_malloc(5 * 8);
     fprintf(stderr, "surf-eval: %d train / %d val cases; encoder %s (%d levels: %d %d %d .. %d), decoder %zu parameters; %d^3 crops, batch %d (accumulated), %d steps\n",
             ntr, nva, ck, E.nl, E.ch[0], E.ch[1], E.ch[2], E.ch[E.nl - 1], D.np, P, NB, steps);
-    { char cmd[1100]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", out); if (system(cmd)) {} }
+    { char cmd[1100]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", out); if (system(cmd)) { fprintf(stderr, "surf-eval: cannot create %s\n", out); return 1; } }   /* (was ignored; audit mini/errpaths 8) */
     char mp[1200]; snprintf(mp, sizeof mp, "%s/metrics.tsv", out); FILE *mf = fopen(mp, "a");
     if (mf) fprintf(mf, "# step\tkind\tloss\tforeground_dice\tmedial_recall\n");
     double best = -1, t0 = se_now(), lsum = 0; int lcnt = 0;

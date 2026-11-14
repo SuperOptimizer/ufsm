@@ -488,7 +488,8 @@ int cmd_sheet_pbr(int argc, char **argv) {
       if (!J.B.v || z3_read(z, J.B.o, J.B.n, J.B.v, nth)) { fprintf(stderr, "sheet-pbr: CT read failed: %s\n", z3_error()); return 1; }
       z3_close(z); } }
     if (*popt(argc, argv, "--profiles", "")) {   /* diagnostics: raw profiles on a 16 x 16 lattice (float32 [256][K], t = -depth + k step) */
-        FILE *pf = fopen(popt(argc, argv, "--profiles", ""), "wb");
+        FILE *pf = fopen(popt(argc, argv, "--profiles", ""), "wb");   /* (NULL fopens crashed in fwrite; audit mini/errpaths 8) */
+        if (!pf) { fprintf(stderr, "sheet-pbr: cannot write %s\n", popt(argc, argv, "--profiles", "")); return 1; }
         for (int b = 0; b < 16; b++) for (int a = 0; a < 16; a++) { double P[3], n[3]; float f[1024] = {0};
             if (frame(&J, (a * J.W) / 16 + J.W / 32, (b * J.W) / 16 + J.W / 32, P, n)) for (int k = 0; k < J.K; k++) f[k] = (float)prof(&J, P, n, -J.depth + k * J.step);
             fwrite(f, sizeof(float), J.K, pf); }
@@ -496,6 +497,7 @@ int cmd_sheet_pbr(int argc, char **argv) {
     }
     if (*popt(argc, argv, "--xsec", "")) {   /* diagnostics: the cross-section along one output row (float32 [W][K]) and one column */
         char xp[1400]; for (int c = 0; c < 2; c++) { snprintf(xp, sizeof xp, "%s.%s.f32", popt(argc, argv, "--xsec", ""), c ? "col" : "row"); FILE *pf = fopen(xp, "wb");
+            if (!pf) { fprintf(stderr, "sheet-pbr: cannot write %s\n", xp); return 1; }
             for (int a = 0; a < J.W; a++) { double P[3], n[3]; float f[1024] = {0};
                 if (frame(&J, c ? J.W / 2 : a, c ? a : J.W / 2, P, n)) for (int k = 0; k < J.K; k++) f[k] = (float)prof(&J, P, n, -J.depth + k * J.step);
                 fwrite(f, sizeof(float), J.K, pf); }
@@ -506,7 +508,9 @@ int cmd_sheet_pbr(int argc, char **argv) {
         if (nL > 0 && nL <= 256) { uint8_t *Ls = calloc((size_t)nL * J.W * J.W, 1);
             for (int y = 0; y < J.W; y++) for (int x = 0; x < J.W; x++) { double P[3], n[3]; if (!frame(&J, x, y, P, n)) continue;
                 for (int l = 0; l < nL; l++) { const double q = prof(&J, P, n, la + l); Ls[((size_t)l * J.W + y) * J.W + x] = (uint8_t)(q < 0 ? 0 : q > 255 ? 255 : q + 0.5); } }
-            snprintf(p, sizeof p, "%s/layers_%d_%d.u8", out, la, lb); FILE *lf = fopen(p, "wb"); fwrite(Ls, 1, (size_t)nL * J.W * J.W, lf); fclose(lf); free(Ls); }
+            snprintf(p, sizeof p, "%s/layers_%d_%d.u8", out, la, lb); FILE *lf = fopen(p, "wb");
+            if (!lf || fwrite(Ls, 1, (size_t)nL * J.W * J.W, lf) != (size_t)nL * J.W * J.W) fprintf(stderr, "sheet-pbr: writing %s failed\n", p);
+            if (lf && fclose(lf)) fprintf(stderr, "sheet-pbr: writing %s failed\n", p); free(Ls); }
     }
     /* pass 1: the sheet near the mesh on an 8-pixel lattice, median-filtered, bilinear upsampled */
     const int L8 = 8 * J.ss, nc = J.W / L8 + 2; float *c1 = malloc((size_t)nc * nc * sizeof *c1), *c2 = malloc((size_t)nc * nc * sizeof *c2);
