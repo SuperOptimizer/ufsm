@@ -1070,9 +1070,12 @@ static inline float warp_fill(const ct_aug_plan *ap, float mean, float isd) { re
                 float radius=sqrtf(dy*dy+dx*dx)+1e-6f;
                 float radial[3]={0,hasax?dy/radius:0,hasax?dx/radius:0},discrete[3],transported[3];
                 for (int d=0;d<3;d++) discrete[d]=sign[d]*radial[sy.perm[d]];
-                if (a->affine) { float q[3]; for (int d=0;d<3;d++) q[d]=(float)a->Ainv[d][0]*discrete[0]+(float)a->Ainv[d][1]*discrete[1]+(float)a->Ainv[d][2]*discrete[2]; memcpy(discrete,q,sizeof q); }
-                float norm=1e-12f;
-                for (int d=0;d<3;d++) { transported[d]=jac[d]*((float)a->R[d][0]*discrete[0]+(float)a->R[d][1]*discrete[1]+(float)a->R[d][2]*discrete[2]); norm+=transported[d]*transported[d]; }
+                /* the radial unit vector is a normal (the gradient of the radius): through the pull's Jacobian J = A R^T diag(1 - e') it goes
+                   by J^T, i.e. A^T, then R, then (1 - e'), not as a tangent (A^-1, R, 1 / (1 - e'); data audit lower, 11-14) */
+                if (a->affine) { float q[3]; for (int d=0;d<3;d++) q[d]=(float)a->A[0][d]*discrete[0]+(float)a->A[1][d]*discrete[1]+(float)a->A[2][d]*discrete[2]; memcpy(discrete,q,sizeof q); }
+                float norm=1e-12f; (void)jac;
+                const int uz[3]={z,y,x};
+                for (int d=0;d<3;d++) { transported[d]=(1.f-table[(3+d)*P+uz[d]])*((float)a->R[d][0]*discrete[0]+(float)a->R[d][1]*discrete[1]+(float)a->R[d][2]*discrete[2]); norm+=transported[d]*transported[d]; }
                 norm=sqrtf(norm); for (int d=0;d<3;d++) out[1+d]=transported[d]/norm;
                 if (sheet) {
                     double q[4]; for (int d=0;d<4;d++) q[d]=params[base[0]][d]*(1-(double)frac)+params[base[0]+1][d]*frac;
@@ -1164,7 +1167,7 @@ static void write_spatial_tm(const uint8_t *ctu,const uint8_t *target,const uint
         for (int y0=0;y0<P;y0+=TB) for (int x0=0;x0<P;x0+=TB) {
             const int ny=P-y0<TB?P-y0:TB, nx=P-x0<TB?P-x0:TB;
             for (int z=z0;z<z0+nz;z++) for (int y=y0;y<y0+ny;y++) {
-                const float v0=vt[z],v1=vt[P+y],j0=vt[3*P+z],j1=vt[4*P+y];
+                const float v0=vt[z],v1=vt[P+y];
                 float t01[3];
                 for (int d=0;d<3;d++) t01[d]=Rf[0][d]*v0+Rf[1][d]*v1;   /* (the first two terms of the pull's sum) */
 #ifdef __AVX2__
@@ -1313,7 +1316,7 @@ static void write_spatial_tm(const uint8_t *ctu,const uint8_t *target,const uint
                     if (hard) { const size_t bj=b0+((size_t)(f[0]>.5f)*P+(f[1]>.5f))*P+(f[2]>.5f); for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=target[(size_t)ch*p3+bj]; }
                     else for (int ch=0;ch<NCH;ch++) T[(size_t)ch*p3+k]=(uint8_t)lroundf(tv[ch]);
                     if (ct_only) continue;
-                    const float jac[3]={j0,j1,vt[5*P+x]};
+                    const float jac[3]={1.f-table[3*P+z],1.f-table[4*P+y],1.f-table[5*P+x]};   /* (the normal's factor 1 - e'; j0 / j1 are 1 / (1 - e')) */
                     float out[4]={0};
                     float frac=f[0],ayy=cy[base[0]]*(1-frac)+cy[base[0]+1]*frac;
                     float axx=cx[base[0]]*(1-frac)+cx[base[0]+1]*frac;
@@ -1321,7 +1324,7 @@ static void write_spatial_tm(const uint8_t *ctu,const uint8_t *target,const uint
                     float radius=sqrtf(dy*dy+dx*dx)+1e-6f;
                     float radial[3]={0,hasax?dy/radius:0,hasax?dx/radius:0},discrete[3],transported[3];
                     for (int d=0;d<3;d++) discrete[d]=sign[d]*radial[sy.perm[d]];
-                    if (a->affine) { float q[3]; for (int d=0;d<3;d++) q[d]=Aif[d][0]*discrete[0]+Aif[d][1]*discrete[1]+Aif[d][2]*discrete[2]; memcpy(discrete,q,sizeof q); }
+                    if (a->affine) { float q[3]; for (int d=0;d<3;d++) q[d]=Af[0][d]*discrete[0]+Af[1][d]*discrete[1]+Af[2][d]*discrete[2]; memcpy(discrete,q,sizeof q); }   /* (A^T: a normal) */
                     float norm=1e-12f;
                     for (int d=0;d<3;d++) { transported[d]=jac[d]*(Rf[d][0]*discrete[0]+Rf[d][1]*discrete[1]+Rf[d][2]*discrete[2]); norm+=transported[d]*transported[d]; }
                     norm=sqrtf(norm); for (int d=0;d<3;d++) out[1+d]=transported[d]/norm;
