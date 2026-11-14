@@ -335,7 +335,8 @@ refcz() { jq -r --argjson m ${CFMEM:-24} '(.shape[1] * .shape[2]) as $hw | (($m 
 spiraldir() { [ -n "${SPIRALDIR:-}" ] && { echo $SPIRALDIR; return; }; awk -F'\t' -v s=$S '$1 == s && ($2 == "1" || $2 == "+1" || $2 == "-1") { print $2 }' $H/spiral_dir.tsv 2> /dev/null | head -1; }
 ref() {
   [ "$DRY" = 1 ] || rm -rf $REF
-  local sd; sd=$(spiraldir); [ -n "$sd" ] && REFX="${REFX:-} --dir $sd"
+  local sd sds; sd=$(spiraldir); [ -n "$sd" ] && REFX="${REFX:-} --dir $sd"
+  sds=$([ -n "${SPIRALDIR:-}" ] && echo env || { [ -n "$sd" ] && echo tsv || echo gate; })
   local cal=; [ "${CTCAL:-0}" = 1 ] && cal="--ct-cal $O/ct.cal"
   # the pass-1 sums streamed behind the fields predict (fields(): REFSTREAM): the same sums, so only the solve and model pass run here
   local pc=; [ "$DRY" != 1 ] && [ -e $O/ref.pool.ok ] && pc="--pool-cache $O/ref.pool --chunk-rows $(cat $O/ref.pool.ok)"
@@ -344,6 +345,9 @@ ref() {
     --threads $TH --mem-gb ${CFMEM:-24} $cal $pc; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; } ||
     { grep -q 'REFUSED' $O/logs/ref.log 2> /dev/null && log "ref: $(grep -o 'REFUSED.*' $O/logs/ref.log | tail -1 | cut -c1-220)"; return 1; }
   [ "$DRY" != 1 ] && log "ref: $(grep -oE 'count-field: dir [+-]1 \([^)]*\)' $O/logs/ref.log | tail -1)"
+  # the run manifest (audit-unroll): the direction the ref used and where it came from (env / tsv / gate = count-field's own evidence)
+  if [ "$DRY" != 1 ] && type mset > /dev/null 2>&1; then
+    mset spiral_dir "$(jq -r .dir $REF/model.json 2> /dev/null)"; mset spiral_dir_src "$sds$([ $sds = gate ] && grep -oE 'count-field: dir [+-]1 \(([^)]*)\)' $O/logs/ref.log | tail -1 | sed -E 's/.*\((.*)\)/: \1/')"; fi
   [ "$DRY" != 1 ] && grep -q 'no ring vote on the direction' $O/logs/ref.log && log "ref: WARNING: $(grep -o 'no ring vote on the direction.*' $O/logs/ref.log | tail -1)"
   [ "$DRY" != 1 ] && grep -q 'WARNING no-data pairs' $O/logs/ref.log && log "ref: ALARM $(grep -o 'no-data: .*' $O/logs/ref.log | tail -1)"
   return 0

@@ -242,6 +242,33 @@ static int loop_winding(const fit_fields *f, double *totals, int maxr) {
     }
     free(ph); return nt;
 }
+/* The second label-free direction gate (audit-unroll 3b): the winding-mod-4 planes (task unwrap2 / latent fields: dy dx = W(x + d e_a) - W(x)
+   in 1/64 turn mod 4, dq confidence) give grad W directly, without the phase's mod-1 slips in the voids. Around a circle about the axis the
+   tangential part integrates to -dir (U single-valued): per loop (the loop_winding circles) sum (cos t g_y - sin t g_x) ds over the cells
+   with dq >= 64 and material, divided by the covered fraction (>= 1/2), rounded; pos / neg count the loops at +1 / -1 winding (dir -1 /
+   +1). Returns the loops used, 0 when the fields carry no w4 planes. */
+int fit_dir_w4(const fit_fields *f, int *pos, int *neg) {
+    *pos = *neg = 0;
+    if (!f->wd[1] || !f->wd[2] || !f->wd[3] || !(f->w4_d > 0)) return 0;
+    const double h = f->h; const int BH = fit_box_H(f), BW = fit_box_W(f), na = (int)(f->D * h) + 1, nz = f->D < 16 ? f->D : 16; int nl = 0;
+    for (int zi = 0; zi < nz; zi++) {
+        const int z = (int)((zi + 0.5) * f->D / nz); const double pz = (z + 0.5) * h;
+        const double cy = axis_lerp(f->cy, na, pz) / h - 0.5, cx = axis_lerp(f->cx, na, pz) / h - 0.5;
+        for (double r = 10; ; r += 3) {
+            if (cy - r < 0 || cx - r < 0 || cy + r > BH - 1 || cx + r > BW - 1) break;
+            const int ns = (int)(2 * M_PI * r * 1.5); const double ds = 2 * M_PI * r * h / ns; int nok = 0; double tot = 0;
+            for (int k = 0; k < ns; k++) {
+                const double t = -M_PI + 2 * M_PI * k / ns; const int y = (int)lround(cy + r * sin(t)), x = (int)lround(cx + r * cos(t)); size_t i;
+                if (!fit_cell(f, z, y, x, &i) || !f->w[i] || f->wd[3][i] < 64) continue;
+                double gy = f->wd[1][i] / 64.0, gx = f->wd[2][i] / 64.0; if (gy > 2) gy -= 4; if (gx > 2) gx -= 4;   /* turns over w4_d native voxels, in (-2, 2] */
+                tot += (cos(t) * gy - sin(t) * gx) / f->w4_d * ds; nok++;
+            }
+            if (nok < ns / 2) continue;
+            const long e = lround(tot * ns / nok); nl++; *pos += e == 1; *neg += e == -1;
+        }
+    }
+    return nl;
+}
 int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m) {
     const double h = f->h; const int BH = fit_box_H(f), BW = fit_box_W(f); const size_t n = (size_t)f->D * BH * BW;   /* (box cells: a crop samples the same) */
     const int na = (int)(f->D * h) + 1;
@@ -277,19 +304,24 @@ int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m) {
         /* keep this knot's samples' offset for the chosen direction below: store per knot later */
     }
     if (ntot) { qsort(tots, ntot, sizeof(double), cmp_d); wind = tots[ntot / 2]; nwind = ntot; }
-    int nloop = 0, lpos = 0, lneg = 0;
+    int nloop = 0, lpos = 0, lneg = 0, took = 0;
     if (nwind < 3 && !c->dir) {   /* no ring vote: the phase walked around circles (loop_winding); the sign count of the loops' windings */
         double *lt = malloc(sizeof(double) * 4096);
         if (lt) { nloop = loop_winding(f, lt, 4096); for (int k = 0; k < nloop; k++) { lpos += lt[k] > 0; lneg += lt[k] < 0; } free(lt); }
-        const int lv = lpos + lneg >= 8 ? (lpos > lneg ? -1 : lpos < lneg ? 1 : 0) : 0;   /* the loops' direction (0: undecided) */
-        if (c->dir_loops && lv) { wind = (double)(lpos - lneg) / (lpos + lneg); nwind = lpos + lneg; }   /* (the vote's share margin as |wind|) */
-        fprintf(stderr, "fit prior: WARNING: no ring vote on the direction; the phase walked around the axis: %d of %d loops wind +, %d wind -, "
-                "i.e. dir %s; %s\n", lpos, nloop, lneg, lv ? (lv < 0 ? "-1" : "+1") : "undecided",
-                c->dir_loops && lv ? "taken (--dir-loops 1)" : "dir +1 is the DEFAULT, not a measurement: pass --dir from a known surface (PHerc1667: -1) or --dir-loops 1");
+        int lv = lpos + lneg >= 8 ? (lpos > lneg ? -1 : lpos < lneg ? 1 : 0) : 0;   /* the loops' direction (0: undecided) */
+        int wpos, wneg; const int nw4 = fit_dir_w4(f, &wpos, &wneg);   /* the w4 planes' vote (2:1 and >= 8 loops), preferred when decided */
+        const int wv = wpos + wneg >= 8 && (wpos >= 2 * wneg || wneg >= 2 * wpos) ? (wpos > wneg ? -1 : 1) : 0;
+        if (nw4) fprintf(stderr, "fit prior: the winding-mod-4 planes around the axis: %d of %d loops wind +, %d wind -, i.e. dir %s\n", wpos, nw4, wneg, wv ? (wv < 0 ? "-1" : "+1") : "undecided");
+        if (wv) { if (lv && lv != wv) fprintf(stderr, "fit prior: WARNING: the phase loops (dir %+d) and the w4 planes (dir %+d) disagree: the w4 vote is used with --dir-loops 1\n", lv, wv);
+                  lpos = wpos; lneg = wneg; lv = wv; }
+        if (c->dir_loops && lv) { wind = (double)(lpos - lneg) / (lpos + lneg); nwind = lpos + lneg; took = 1; }   /* (the vote's share margin as |wind|) */
+        fprintf(stderr, "fit prior: WARNING: no ring vote on the direction; the phase (or the w4 planes) walked around the axis: %d of %d loops wind +, %d wind -, "
+                "i.e. dir %s%s; %s\n", lpos, wv ? nw4 : nloop, lneg, lv ? (lv < 0 ? "-1" : "+1") : "undecided", wv ? " (w4 planes)" : "",
+                c->dir_loops && lv ? "taken (--dir-loops 1)" : "dir +1 is the DEFAULT, not a measurement: pass --dir from a known surface (scripts/unroll/spiral_dir.tsv) or --dir-loops 1");
     }
     m->dir = c->dir ? c->dir : (wind > 0 ? -1 : 1);
     m->dir_vote = c->dir ? 1.0 : fabs(wind) * (nwind >= 3 ? 1 : 0);   /* |median winding per ring|, 0 when too few rings */
-    m->dir_src = c->dir ? FIT_DIR_GIVEN : nloop && c->dir_loops && nwind >= 3 ? FIT_DIR_LOOPS : nwind >= 3 ? FIT_DIR_RINGS : FIT_DIR_DEFAULT;
+    m->dir_src = c->dir ? FIT_DIR_GIVEN : took ? FIT_DIR_LOOPS : nwind >= 3 ? FIT_DIR_RINGS : FIT_DIR_DEFAULT;
     if (m->dir_src == FIT_DIR_DEFAULT || !(wind != 0)) { m->dir = c->dir ? c->dir : 1; if (!c->dir) { m->dir_vote = 0; m->dir_src = FIT_DIR_DEFAULT; } }   /* (wind 0: no sign either way) */
     for (int k = 0; k < m->nk; k++) {   /* offset per knot with the direction */
         if (pk[k] <= 0) continue;

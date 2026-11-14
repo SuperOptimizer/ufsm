@@ -118,7 +118,7 @@ source. count-field logs `dir %+d (given | ring vote | phase loops | DEFAULT (no
 UFSM_CF_READ_ONLY bench. The slab prior with no vote warns and takes +1; fit_load warns on a missing key. unroll.sh's ref passes `--dir`
 from SPIRALDIR or spiral_dir.tsv (columns scroll, dir, source GT | published | estimator | unknown, evidence) and logs the decision and
 any refusal to progress.log. Not done: the 2x2 closing error is no direction gate, since it is 2.061 at -1 vs 2.060 at +1 on 1667. The
-label-free gates audit-unroll proposed (phase coherence against W for +-1; the w4 planes' tangential sign) are not implemented. Every
+label-free gate for phase coherence against W at +-1, which would need a second LS solve (left out). Added later, source-only and unmeasured: the w4 gate (`fit_dir_w4`). The winding-mod-4 planes' tangential grad W is summed around the loop_winding circles (dq >= 64, divided by the covered share), which gives -dir per loop with no mod-1 slips. Its vote (>= 8 loops, 2:1) is preferred over the phase loops when decided, and a disagreement is warned. count-field runs the gates on 32 middle rows loaded with every plane whenever pass 1 found no evidence (--model-only skips the w4 planes there). They decide only with --dir-loops 1; otherwise they print beside the refusal. unroll.sh records spiral_dir / spiral_dir_src (env | tsv | gate: SOURCE) in the run manifest when mset exists. Every
 caller without --dir on a scroll with no ring vote now stops: scripts/cfit, corpus, pod/unroll.sh, cal/gate.sh.
 
 **Every unroll's hand from published segments (scripts/fibfit/seghand.py, segfetch.py).** Take a published segment that covers >= 0.8 turn

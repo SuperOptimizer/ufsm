@@ -196,6 +196,8 @@ fit_model *fit_load(const char *dir);
 int fit_ray_root(const fit_model *m, double z, double theta, double k, double r_hint, double *r);
 /* initial pitch / offset per knot and the direction from the fields (no labels): exposed for tests */
 int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m);
+/* the winding-mod-4 planes' direction vote around the axis (fit.c; loops used, 0 without w4 planes): pos / neg = loops at winding +1 / -1 */
+int fit_dir_w4(const fit_fields *f, int *pos, int *neg);
 
 /* GPU side (src/nn_fit.cu) */
 typedef struct {
