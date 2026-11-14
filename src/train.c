@@ -1218,7 +1218,8 @@ static void verso_target(gpu_state *d, shape5 xs) {
 /* the label stream's planes: k 0 phase (--side), 1-2 winding / component (unwrap2), 3.. the aux planes; lhalo: the planes a slab streams
    each side of it (the phase: the normal stencil's g_norm_s; the fibre H / V tubes: the direction targets' g_fd_r) */
 static int lplane_on(int k) { return k == 0 ? g_side != 0 : k < 3 ? g_unwrap2 != 0 : k - 3 < g_naux; }
-static int lhalo(int k) { return k == 0 ? g_norm_s : k >= 3 && k - 3 < g_naux && (g_aux_role[k - 3] == AUX_FIBH || g_aux_role[k - 3] == AUX_FIBV) ? g_fd_r : 0; }
+static int lhalo(int k) { return k == 0 ? g_norm_s : k >= 3 && k - 3 < g_naux && (g_aux_role[k - 3] == AUX_FIBH || g_aux_role[k - 3] == AUX_FIBV) ? g_fd_r
+                                                    : k >= 3 && k - 3 < g_naux && g_aux_role[k - 3] == AUX_FIB ? g_fibn_r + 1 : 0; }   /* (the fibre-normal tangent's stencil: r + 1 planes, so no slab seam drops fibre voxels; hsfix 11-14) */
 /* head slabs (unwrap, B 1, no split; channels 0 recto, 1 ink, 2-3 phase, 4-10 normal / density): the 1^3 head, the targets derived
    from the phase (sidet / sidem / nt / nm, slab-sized) and the four losses over z-slabs of g_hs_z planes, so neither the window's
    11 fp16 logit planes (22 B per voxel) nor its derived targets (11 B) exist whole. pass 0 (after the forward): every loss's
@@ -1306,8 +1307,9 @@ static void head_slab_pass(gpu_state *d, int pass) {
         const size_t need = (size_t)((D + Z - 1) / Z) * tcB;
         nn_sync();
         const size_t fr = nn_mem_free();
-        if (g_hs_tcache) d->tc = nn_malloc_try(need);
-        if (g_hs_tcache) fprintf(stderr, "head slabs (GPU %d): the slabs' derived targets %s (%.2f GB, %.2f GB free before; --hs-tcache 1)\n", d->dev,
+        if (g_hs_tcache && g_lsplit) fprintf(stderr, "head slabs (GPU %d): --hs-tcache is off under --split z (the cache would keep the statistics pass's owned-plane masks and drop the gradient pass's 4-plane band)\n", d->dev);
+        if (g_hs_tcache && !g_lsplit) d->tc = nn_malloc_try(need);
+        if (g_hs_tcache && !g_lsplit) fprintf(stderr, "head slabs (GPU %d): the slabs' derived targets %s (%.2f GB, %.2f GB free before; --hs-tcache 1)\n", d->dev,
                 d->tc ? "kept from the statistics pass for the gradient pass" : g_hs_tcache ? "built in both passes: no room for the cache" : "built in both passes", need / 1e9, fr / 1e9);
     }
     /* UFSM_HS_TCACHE_CHECK=1 (tests): the gradient pass builds every slab's targets as without the cache and compares them with the
@@ -1667,8 +1669,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
         nn_loss_stats_fin(d->hs_ds + 20, d->nw, w7, d->nscratch);
     } else if (fuse && light) {   /* the logged losses: the same finalisation with the gradient pass's sums (the mask sums and the active count are unchanged) */
         const shape5 w2 = {1, 2, D, H, W}, w7 = {1, 7, D, H, W};
-        if (fside) nn_loss_stats_fin_light(d->hs_ds + 10, d->sidew, w2, d->sscratch, d->hs_ds + 100);   /* (hs_ds + 100 .. 106: the held mask weights) */
-        nn_loss_stats_fin_light(d->hs_ds + 20, d->nw, w7, d->nscratch, d->hs_ds + 100);
+        if (fside) nn_loss_stats_fin_light(d->hs_ds + 10, d->sidew, w2, d->sscratch, d->hs_ds + 120);   /* (hs_ds + 120 .. 126: the held mask weights; the fibre direction sums own 84 .. 118) */
+        nn_loss_stats_fin_light(d->hs_ds + 20, d->nw, w7, d->nscratch, d->hs_ds + 120);
     }
     d->sidet = tsv[0]; d->sidem = tsv[1]; d->rvt = tsv[2]; d->rvm = tsv[3]; d->nt = tsv[4]; d->nm = tsv[5];
     d->tc_ok = !pass && d->tc != nullptr && d->hs_train;
@@ -3841,6 +3843,10 @@ int cmd_train(int argc, char **argv) {
         g_hs_z = getenv("UFSM_HEAD_SLAB_Z") ? atoi(getenv("UFSM_HEAD_SLAB_Z")) : 32;
         if (g_hs_z < 1) g_hs_z = 1;
         if (g_hs_z > g_Pz) g_hs_z = g_Pz;
+        if (g_pg_lambda > 0 && g_head_slab) {   /* pgrad pairs need both ends in one slab (the partner's logits live in another slab's buffer): say how many it costs */
+            double dm = 0; for (int k = 0; k < g_pg_nd; k++) dm = g_pg_dist[k] > dm ? g_pg_dist[k] : dm;
+            fprintf(stderr, "--pgrad-lambda: pairs crossing a head-slab seam are dropped (<= ~%.1f%% of them at planes per slab %d, dist %.0f; the loss depends on UFSM_HEAD_SLAB_Z)\n", 100. * 0.5 * dm / g_hs_z, g_hs_z, dm);
+        }
         g_lat_hs = g_lat && g_head_slab && g_hs_z % 4 == 0 && g_hs_z >= 8 && g_hs_z < g_Pz && !ufsm_env_on("UFSM_LAT_CHECK") && (!getenv("UFSM_LAT_HEAD_STREAM") || ufsm_env_on("UFSM_LAT_HEAD_STREAM"));
         if (g_lsplit && !g_lat_hs) { fprintf(stderr, "--lat 4 --split z: the streamed latent head (UFSM_LAT_HEAD_STREAM on, no UFSM_LAT_CHECK)\n"); return 2; }
         g_lat_fuse = g_lat_hs && g_unwrap2 && g_side_ch == 0 && g_norm_ch == 2 && g_w4_ch == 9 && !(g_pg_lambda > 0) && !(g_ptrunc_tau > 0) && !g_fibn && nn_get_loss_grad_h16() && nn_get_f16()   /* (--fib-normal-lambda: the unfused chain; --ink-head fused too since fuse-20261114: the ink channel is outside the group) */

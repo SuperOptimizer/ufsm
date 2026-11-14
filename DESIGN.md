@@ -6,6 +6,18 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Head slabs: seam fixes from the targeted audit (2026-11-14, branch hsfix-20261114)
+
+Audit /vesuvius/ufsm/audit-20261114/targeted/headslab.md: BCE / dice / wind4 / MIL / the streamed latent head are exactly slabbed == unslabbed
+(a 1-D model of the rolling schedule matches U^T g to 4e-16). Fixed:
+- `--hs-tcache 1` under `--split z`: the cache kept the statistics pass's owned-plane masks, so the gradient pass lost its 4-plane band beside the
+  cut. The cache is now off under split (it says so at the first step).
+- `--fib-normal-lambda`: the fibre plane streamed without a halo, so the kernel skipped the 2 (r + 1) planes at each slab end (6 of 32 planes, 18.75 %
+  at Z 32, 37.5 % at Z 16). `lhalo(AUX_FIB) = r + 1`, and `fibn_k` tests the window bounds. test_fibn: 2 and 4 slabs add up to the whole window.
+- `--pgrad-lambda`: a pair whose partner is in the next slab is still dropped (the partner's logits are not resident; a halo head pass plus a
+  gradient hand-over to the neighbour slab is not worth the complexity). It now prints the bound (~0.5 dist / Z of the pairs) at startup.
+- `hs_ds`: the light-statistics keep area moved from 100..106 to 120..126, off the fibre direction sums (84..118).
+
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
 The user asked for "fully adaptive Muon" for the scratch2 trainer. Each piece below is behind its own flag and off by default; with the
