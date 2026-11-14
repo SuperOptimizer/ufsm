@@ -3632,6 +3632,9 @@ int cmd_train(int argc, char **argv) {
     size_t p3 = (size_t)g_Pz * P * P, p3l = split && !g_lsplit ? (size_t)P * P * g_Dl : p3;   /* per-GPU voxels of a window */
     if (cfg.skip_thr > 0) {   /* --skip-empty (or a checkpoint trained with it) */
         if (!g_lat || B != 1) { fprintf(stderr, "--skip-empty: a latent-grid net (--lat 4), B 1\n"); return 2; }
+        if (g_lsplit && (P / 8 - g_h0 / 4) % 8) {   /* side 1's tile grid starts at its local cell 0 = global cell P / 8 - h0 cells: on the window's 8-cell z grid
+                                                    only when that is a multiple of 8, else other tiles go inactive next to the seam (split audit #5) */
+            fprintf(stderr, "--skip-empty --split z: the second half's first cell (%d) is not on the 8-cell tile grid (P %d, --split-top %d)\n", P / 8 - g_h0 / 4, P, g_split_top); return 2; }
         g_skip_thr = cfg.skip_thr - 1; g_skip_margin = cfg.skip_margin; cfg.skip_nl = g_lsplit && g_split_top ? g_split_top : 0;   /* (as run_batch builds) */
         fprintf(stderr, "skip-empty: masked convs: 8x8x16-cell tiles with no CT byte > %d (within %d tiles a level) left at their bias; exact gradients of that net%s\n",
                 g_skip_thr, g_skip_margin, g_lsplit ? " (split: the levels below --split-top)" : "");
@@ -4941,6 +4944,21 @@ int cmd_train(int argc, char **argv) {
           if (fault == step) nn_h2d(G[0].x, nullptr, 16); }
         if ((seconds && now() - t0 >= seconds) || (schedule_seconds && schedule_elapsed+now()-t0>=schedule_seconds) ||
             (limit_seconds && now() - t0 >= limit_seconds) || (stop_at && step >= stop_at)) g_stop = 1;
+        {   /* replica check (split audit #6): every card must hold the same master weights (the same optimizer on the same allreduced gradient;
+               checkpoints come from G[0]). UFSM_REPLICA_CHECK=N: every N steps (default: the checkpoint steps and the last; 0 off); a mismatch stops the run */
+            static long rc_every = -2; if (rc_every == -2) rc_every = getenv("UFSM_REPLICA_CHECK") ? atol(getenv("UFSM_REPLICA_CHECK")) : -1;
+            const int due = ng > 1 && rc_every != 0 && (rc_every > 0 ? step % rc_every == 0 : step % ckpt_every == 0 || step == steps || g_stop);
+            if (due) {
+                uint64_t h0 = 0; int bad = -1; const size_t nb = np * 4; uint8_t *hb = malloc(nb);
+                for (int g = 0; g < ng && hb; g++) {
+                    nn_init(G[g].dev); nn_sync(); nn_d2h(hb, unet_live_params(G[g].u), nb);
+                    uint64_t x = 1469598103934665603ull; for (size_t q = 0; q + 8 <= nb; q += 8) { uint64_t w; memcpy(&w, hb + q, 8); x = (x ^ w) * 1099511628211ull; }
+                    if (!g) h0 = x; else if (x != h0 && bad < 0) bad = g;
+                }
+                free(hb); nn_init(G[0].dev);
+                if (bad >= 0) { fprintf(stderr, "replica check at step %d: GPU %d's weights differ from GPU %d's (the cards diverged): stopping, no checkpoint of this step\n", step, G[bad].dev, G[0].dev); return 1; }
+            }
+        }
         const int step_ok = nskip == nskip_seen; nskip_seen = nskip; nacc++; if (!step_ok) nskl += 1;   /* a skipped (non-finite) step: no loss / label means (try3 step 504: its nan entered rv / normal / ink) */
         if (step_ok) { acc_loss += loss / nl; acc_bce += parts[0][0]; acc_dice += parts[0][g_aff || g_unwrap || g_heads || g_fibdir > 0 ? NCH : g_half ? g_cout : cfg.cout]; acc_g += gn;
         if (g_verso_on) { acc_vbce += G[0].vout[0]; acc_vdice += G[0].vout[1]; }

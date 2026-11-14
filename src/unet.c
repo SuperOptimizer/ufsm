@@ -2909,7 +2909,8 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         l0_after(u, &u->dec[i]);
         if (!i) ge_after(u);   /* (gn_ema: every site's statistics are in by dec[0]'s) */
         if (train && u->train && u->eh_lg && i == u->cfg.emb_lev) {   /* the distillation head, from the level's output while it is live */
-            if (sp_on(u)) { fprintf(stderr, "unet: the distillation head with the spatial split is not supported\n"); abort(); }
+            if (u->split_h0 > 0) {   /* (not sp_on: off on the whole split-top levels, where the head would run on both cards and count twice) */
+                fprintf(stderr, "unet: the distillation head with the spatial split is not supported\n"); abort(); }
             const block *d = &u->dec[i]; const float *dw = P(u, u->eh.w), *db = P(u, u->eh.b);
             nn_set_head_out_h16(0);
             if (recompute()) { nn_gn_t g = gn_out(u, d); int r; PROF(0, r = nn_conv3d_fwd_x(d->a2, &g, nullptr, nullptr, 0, 0, d->ys, dw, db, u->cfg.emb_ch, 1, 1, u->eh_lg, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("distillation head"); }
@@ -2922,7 +2923,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         cur = u->dec[i].s2;
     }
     if (train && u->train && u->cfg.ds_levels) {   /* deep supervision: each supervised decoder level's own 1^3 head, from its output */
-        if (sp_on(u)) { fprintf(stderr, "unet: deep supervision with the spatial split is not supported\n"); abort(); }
+        if (u->split_h0 > 0) { fprintf(stderr, "unet: deep supervision with the spatial split is not supported\n"); abort(); }   /* (split_h0, not sp_on: split audit #4) */
         nn_set_head_out_h16(0);
         for (int j = 1; j <= u->cfg.ds_levels; j++) {
             const block *d = &u->dec[j]; const float *dw = P(u, u->ds[j].w), *db = P(u, u->ds[j].b);
