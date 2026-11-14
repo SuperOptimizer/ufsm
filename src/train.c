@@ -3275,6 +3275,7 @@ int cmd_train(int argc, char **argv) {
     sc.aux = g_xc == 5; sc.cond = g_cond; sc.cond_outside = g_cond_outside; sc.pap_head = g_pap_head ? &g_paph : nullptr;
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = atoi(opt(argc, argv, "--side-air", "0"));
     sc.strict_sources = atoi(opt(argc, argv, "--strict-sources", "0"));
+    sc.edge_spread = atoi(opt(argc, argv, "--edge-spread", "0"));   /* (data audit lower: edge windows spread instead of clamped; recipe, off by default) */
     g_outward_warn = atof(opt(argc, argv, "--outward-warn", "0.9"));
     g_reject_warn = atof(opt(argc, argv, "--reject-warn", "100"));   /* the draws line's per-source drops per new window above which it warns */   /* 1: a weighted source the sampler cannot draw is fatal (launchers: on) */
     sc.ink_mil = g_mil; sc.mil_mode = g_mil_mode; sc.mil_stride = g_mil_stride; sc.mil_max = g_mil_max; sc.mil_R = g_mil_R;   /* --ink-mil: the windows' rays (batch.mil) */

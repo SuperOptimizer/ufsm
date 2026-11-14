@@ -2757,7 +2757,12 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (m->shape[d] < n[d]) SL_OTHER_RET();
             int64_t f = dl >= 0 ? (int64_t)1 << dl : 1;
             int64_t v = dl >= 0 ? cc[d] * f + rint_below(r, f) : cc[d] >> (-dl);
-            o[d] = v - n[d] / 2; if (o[d] < 0) o[d] = 0; if (o[d] > m->shape[d] - n[d]) o[d] = m->shape[d] - n[d];
+            o[d] = v - n[d] / 2;
+            if (c->edge_spread && (o[d] < 0 || o[d] > m->shape[d] - n[d])) {   /* (the clamped case only: a window holding v, uniformly) */
+                const int64_t a = v - n[d] + 1 > 0 ? v - n[d] + 1 : 0, b = v < m->shape[d] - n[d] ? v : m->shape[d] - n[d];
+                o[d] = b >= a ? a + rint_below(r, b - a + 1) : (o[d] < 0 ? 0 : m->shape[d] - n[d]);
+            }
+            if (o[d] < 0) o[d] = 0; if (o[d] > m->shape[d] - n[d]) o[d] = m->shape[d] - n[d];
         }
     } else {
         for (int d = 0; d < 3; d++) { if (m->shape[d] < n[d]) SL_OTHER_RET(); o[d] = rint_below(r, m->shape[d] - n[d] + 1); }
