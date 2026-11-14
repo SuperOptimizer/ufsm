@@ -40,6 +40,7 @@ test_scan_norm                                 | gpu          |     8 | tests/te
 test_predict_heads~part0of3                   | gpu          |    25 | UFSM_TEST_PART=0/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
 test_predict_heads~part1of3                   | gpu          |    25 | UFSM_TEST_PART=1/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
 test_predict_heads~part2of3                   | gpu          |    25 | UFSM_TEST_PART=2/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
+test_predict_gpus2                            | gpu2         |    30 | tests/test_predict_gpus2.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predgpus2
 test_predict_boxes                             | gpu          |    40 | tests/test_predict_boxes.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predboxes
 test_fstem                                     | gpu,smoke    |     3 | ./$B/test_fstem
 test_lathead                                     | gpu          |     3 | ./$B/test_lathead
