@@ -3336,9 +3336,12 @@ static float *block_bwd_(unet *u, block *b, int level, const float *gy, float *g
         sp_zero(u, A, b->ys, 1);
         if (b != &u->enc[0]) sp_begin(u, A, b->ys, 1);   /* for conv1's backward-data (enc0 has none) */
     } else {
+    if (!pre) {   /* (pre: gy is already d/d a2 in B -- the attention stage's tb_bwd, which owns the level's output norm n2; sweep 11-14:
+                     applying it again here double-counted n2's gradients and bent every trunk gradient below the stage) */
     PROF(3, nn_gn_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, t1));            /* t1 = g2 */
     PROF(4, nn_silu_bwd(t1, gy, n, A));                                                                        /* A = d/d g2 */
     PROF(3, gn_bwd_b(u, b, 2, b->a2, b->ys, G, P(u, b->n2.gamma), b->m2, b->r2, A, B, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* B = d/d a2 */
+    }
     if (gid) nn_add_into(B, gid, b->ys, GBF);
     if (save) nn_d2d(save, B, gbytes);
     PROF(3, nn_gn_apply(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, t1));            /* t1 = g1 */
