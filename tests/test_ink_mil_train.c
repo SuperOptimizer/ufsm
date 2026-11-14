@@ -112,9 +112,10 @@ int main(int argc, char **argv) {
     if (argc != 3) { fprintf(stderr, "usage: test_ink_mil_train <ufsm binary> <make_wind_fixture binary>\n"); return 2; }
     const char *U = argv[1];
     char d[] = "/tmp/test_inkmil_XXXXXX"; if (!mkdtemp(d)) return 1;
-    CHECK(!sh("%s %s/fx 256 2 1 > %s/fx.log 2>&1", argv[2], d, d), "fixture");
+    const int FN = getenv("TIMT_N") ? atoi(getenv("TIMT_N")) : 256;   /* TIMT_N / TIMT_KEEP=1 (benches): a larger fixture, kept with its MIL source */
+    CHECK(!sh("%s %s/fx %d 2 1 > %s/fx.log 2>&1", argv[2], d, FN, d), "fixture");
     char p[700]; snprintf(p, sizeof p, "%s/fx", d);
-    CHECK(!write_segment(p, 256), "segment");
+    CHECK(!write_segment(p, FN), "segment");
     snprintf(p, sizeof p, "%s/fx/sources-mil.json", d); FILE *f = fopen(p, "w"); if (!f) return 1;
     fprintf(f, "{\"sources\": [{\"name\": \"wind-fixture-mil\", \"root\": \"%s/fx\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/fx/axis.json\", \"weight\": 1, \"ink_weight\": 1, \"iso\": 100,\n"
                "  \"targets\": {\"ink\": {\"onfly\": {\"segments\": \"%s/fx/segs.json\", \"level\": 0, \"cache_dir\": \"%s/dcache\"}},\n"
@@ -141,7 +142,8 @@ int main(int argc, char **argv) {
     const double l1 = log_first(p1, " loss "), l0 = log_first(p0, " loss "); int fb = 0; const double m1 = log_last(p1, " ink mil ", &fb);
     fprintf(stderr, "lr 0 step 1: loss %.5f with mil %.5f, %.5f without\n", l1, m1, l0);
     CHECK(fb && fabs(l1 - (l0 + m1)) < 2e-3 + 1e-3 * fabs(l1), "loss %g != %g + %g", l1, l0, m1);
-    if (!fails) sh("rm -rf %s", d);
+    if (getenv("TIMT_KEEP")) fprintf(stderr, "kept %s (sources %s/fx/sources-mil.json)\n", d, d);
+    else if (!fails) sh("rm -rf %s", d);
     fprintf(stderr, "%s\n", fails ? "test_ink_mil_train: FAILED" : "test_ink_mil_train: ok");
     return fails != 0;
 }
