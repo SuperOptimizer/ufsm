@@ -51,6 +51,37 @@ sum |W|^2) and, for the Muon groups, the range of the per-matrix ratios.
 - Coordination with gns (gradient noise scale, `--accum auto`): the controllers here read only update / weight ratios and the weights'
   displacement, never the noise scale or the batch size. (c) and `--accum auto` both change the effective step, so they are not combined
   in an A/B.
+
+**DoG and momentum (fixed 2026-11-14 evening).** In the first A/B arm, DoG reached its cap (2x --muon-lr) by update ~10 and stayed there,
+with |x - x_0| growing linearly. Plain DoG assumes uncorrelated steps. Muon's directions are momentum outputs, correlated over
+~1 / (1 - beta) updates, so even on pure noise the displacement grows as sqrt(kappa G) with kappa = (1 + beta) / (1 - beta) (39 at
+beta 0.95), and DoG mistakes that for signal. G is now scaled by kappa: noise holds eta, and only drift beyond the momentum's own
+correlation grows it. test_admuon covers kappa 1 (the max branch) and 19.
+
+**Optimizer cost** (bench_muonx, 103 M net, RTX PRO 4000, ms per update): `--muon-tc 2` 36.9; with a stats step 39.6; + NorMuon 39.2;
++ lars 37.7; + dog 39.4; + all three 42.1 (+5.1 ms, 14 % of the optimizer, < 0.2 % of a try6 update). dog adds 392 MB of displacement
+per GPU.
+
+**A/B** (perf pod, scripts/opt/admuon_ab.sh + admuon_queue.sh)
+- Setup: the scratch2 net single card, P 512, wind fixture (the only pod-legal data), --init-from try6's snap/1000.ckpt, --det 1 seed 7
+  (the same windows in every arm), --accum 5 (400 updates of 5 windows), Muon 0.006 / AdamW 6e-4, WSD warmup 50, cooldown 0.2, and
+  try6's XFLAGS.
+- A first control without `--gn-ema-warm 1e9` blew up after the GN-EMA switch at step 501 (gn 9 -> 98, loss 1.27 -> 5.6 by step 630).
+- Compared: per log line (10 windows) paired against the control on the same windows; block-bootstrap 95 % CI.
+
+| arm | loss | phase | rv | normal | wind4 | acc | ink | gn mean / max |
+|---|---|---|---|---|---|---|---|---|
+| muon (control), windows 1521-1920 | 1.2326 | 0.3969 | 0.0143 | 0.4328 | 0.4457 | 0.919 | 0.2772 | 2.8 / 9.5 |
+| adaptive, uncorrected DoG (pinned at 2x lr), paired diff | -0.0161 [-0.0176, -0.0153] | -0.0046 [-0.0058, -0.0036] | -0.0031 | -0.0022 | -0.0153 [-0.0184, -0.0126] | +0.008 | -0.0024 | 1.4 / 4.8 |
+
+- The adaptive arm was better on all 40 log lines of the window. The gap opens after window ~500 (-0.023 over 501-1000).
+- The arm was cut at window 1920 of 2000: main took the pod's GPU lock for a merge pass.
+- Its update / weight ratio was ~3x the control's: L0 6e-3 vs 1.7e-3, deeper convs 7e-3 vs 2.7e-3, attention 8e-3 vs 5e-3.
+- Control ratios at try6's LR: L0 1.7e-3, deeper convs 2.7e-3 (per matrix 1.2e-3 .. 4e-3), attention 5e-3, heads 1.5e-3, AdamW 5e-4.
+- The lower gn may come from the scale-invariant layers' weights growing faster (their gradients scale as 1 / |W|), not from extra
+  stability.
+- Still to run: control at 2x lr (muon2x), NorMuon alone, lars alone, the corrected DoG alone and in the adaptive set, and a seed-8
+  control.
 ## Sampler GPU work vs the training stream; the pair rule on both cards (2026-11-14, branch w4stream-20261114)
 
 **The w4 context stream was blocking.** Training kernels launch on the legacy default stream (no stream argument, no per-thread

@@ -660,7 +660,7 @@ void nn_diff_sumsq(const float *a, const float *b, size_t n, double *out2);   /*
 /* adaptive Muon for the next nn_muon_ext_batch calls (train --muon-lars / --muon-dog; see nn_opt.cu): lrm (n floats, written) the
    per-matrix lr multipliers; ema (n floats, 0 = unset) the (b) ratio EMA; dog (4 doubles) the (c) state [rbar, G, eta, |x - x0|];
    disp (device array of per-matrix float buffers, Co K each) the displacement; part 64 n doubles of scratch. nullptr: off */
-typedef struct { float *lrm, *ema; double *dog; float *const *disp; double *part; float lr_peak, lars_tgt, lars_b, lars_c, dog_eta0, dog_max; int on_lars, on_dog; } nn_madapt;
+typedef struct { float *lrm, *ema; double *dog; float *const *disp; double *part; float lr_peak, lars_tgt, lars_b, lars_c, dog_eta0, dog_max, dog_kappa; int on_lars, on_dog; } nn_madapt;
 void nn_muon_ext_adapt(const nn_madapt *a);
 void nn_muon_scale_mode(int m);   /* 0: sqrt(max(1, Co / K)); 1: spectral sqrt(Co / K) (train --muon-scale spectral) */
 void nn_signm(float *p, const float *g, float *m, size_t n, float lr, float b, float wd);   /* sign-momentum (Scion ell-inf) step */
