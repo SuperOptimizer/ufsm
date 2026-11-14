@@ -64,7 +64,9 @@ optimizer / attention cuBLASLt workspaces, the Muon pool and the 96 MB input-con
 - **The fp4 GroupNorm input copy** (a whole layer, 17 B per 32 channels and voxel: ~0.96 GB at level 0 of the 256-wide P 768 net)
   ran wherever the card's free memory allowed at first call: on try6 it could fit GPU 1 (2.5 GB free) but not GPU 0 (0.55 GB), so the
   replicas could run different kernels. Now it gets the largest layer within 3/4 of the plan's spare above 256 MB, the same on every
-  GPU, and the label planes' device spare shrinks by it.
+  GPU, and the label planes' device spare shrinks by it. Expected at try6 (P 768 DP): GPU 0's spare is ~1.34 GB, so the budget is
+  (1.34 - 0.256) x 0.75 = ~0.81 GB < 0.96 GB: level 0 takes the non-prenorm path on both GPUs. GPU 0 already ran that path (it had no
+  room); GPU 1 loses the prenorm it had, so a slower step on the pass's comparison is this rule, not a regression (audit-net review).
 - **The whole-layer gy records** (lp_gn_silu_bwd_apply_rec) are capped at the planned record bytes (lp_gyrec_set_cap); larger layers
   take the plain apply and the weight gradient's own pre-pass (fail-soft path that existed).
 - gscr (the apply's bias scratch) is allocated at >= 1024 channels once; abk / cfb / skip masks / attn8 scratch are < 1 MB (skip:
