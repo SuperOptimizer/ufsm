@@ -530,6 +530,7 @@ extern "C" void nn_h2d_stream(int k, void *d, const void *s, size_t n) { CK(cuda
 extern "C" void nn_event_record(void *e, int on_copy_stream) { CK(cudaEventRecord((cudaEvent_t)e, stream_of(on_copy_stream))); }
 extern "C" void nn_stream_wait(int copy_stream_waits, void *e) { CK(cudaStreamWaitEvent(stream_of(copy_stream_waits), (cudaEvent_t)e, 0)); }
 extern "C" void nn_event_sync(void *e) { CK(cudaEventSynchronize((cudaEvent_t)e)); }
+extern "C" int nn_event_done(void *e) { const cudaError_t r = cudaEventQuery((cudaEvent_t)e); if (r == cudaErrorNotReady) return 0; CK(r); return 1; }
 /* train --lat: label planes kept on the device in packed form (train.c d->ldev). bits 8: the bytes; 4: codes 0..14 and 255 (-> 15;
    unused: the winding component's ids pass 14 with tiles); 2: the --rv papyrus plane's classes (255 unknown -> 3, >= 127 papyrus -> 1 (254 back), void -> 0: all rv_tg_k reads).
    nn_lab_pack: n voxels of s into d; nn_lab_unpack: voxels [v0, v0 + n) of p into d[0..n). stream k: 0 compute, 1 copy, 2 aux */

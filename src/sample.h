@@ -147,6 +147,11 @@ typedef struct {
                                 intensity jitter): sampler_replay_ok lists the configurations (--gpu-aug 2 batches) */
     int replay_gap;          /* train --replay-gap G: a replay is handed out once G batches left since its window's previous use (FIFO over
                                 the released windows; earlier only when no new window is ready, never under --det 1); 0: (slots - workers) K / (K - 1), at least 2, at most the slot count */
+    int echo_max;            /* train --echo-max M (adaptive data echoing, 2026-11-14): when the trainer asks for a batch and no new window is ready, the
+                                most recently used window again (a new device-side augmentation, as --replay) instead of waiting, each window at most M
+                                more times; new windows are always preferred. 0 off; excludes --replay > 1; off under --det 1 (its decisions are timing-dependent) */
+    int echo_keep;           /* the released windows held as echo candidates (the trainer: the windows a step takes, 1 under --split z, the GPU count otherwise);
+                                a builder short of a free slot takes back the oldest candidate */
     int ink_bits;            /* --rv ink plane as batch.inkb (1 bit per voxel) + ct8 instead of batch.ink (host RAM: 7/8 B per voxel per slot);
                                 sampler_start drops it (0) unless --gpu-aug 2 cubes with the rv cutoff and no seam op / packed plane / sheet */
     int plane_bank;          /* train (B 1, no replays / chains / cover): 1 = a slot holds as many label planes as the neediest source fills, the label
@@ -273,6 +278,10 @@ batch *sampler_next(sampler *sp);
 int sampler_failed(const sampler *sp);   /* read failure or exhausted draw retries; stopped samplers never publish partial batches */
 void sampler_release(sampler *sp, batch *b);
 int sampler_replay_ok(const sample_cfg *c);   /* --replay is possible for this configuration */
+/* sampler_next with an echo gate (--echo-max): an echo is handed out only once busy(arg) returns 0 (the trainer: a GPU has run out of
+   queued work), until then a new window that becomes ready is still taken; busy nullptr: echo as soon as no new window is ready */
+batch *sampler_next_gate(sampler *sp, int (*busy)(void *), void *arg);
+void sampler_echo_stats(sampler *sp, uint64_t *fresh, uint64_t *echoed);   /* windows served new / as echoes so far */
 /* one hash per batch plane, the planes as the plain (byte-plane) path holds them: ink bits and w4 runs rebuilt on the host; names[q] /
    hs[q] for q < the return value (<= max). UFSM_BATCH_HASH=1 prints them per sampler_next */
 int sampler_batch_hash(const sampler *sp, const batch *b, const char **names, uint64_t *hs, int max);

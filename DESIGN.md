@@ -6,6 +6,84 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Adaptive data echoing: `--echo-max M` (2026-11-14, branch echo-20261114)
+
+scratch2 waits on the sampler for 20-35 % of a long run (the 30-step bench showed 0 %), and the user accepts data echoing in
+exchange for zero data wait. `--replay K` (2026-11-12) already trains every window K times with a new device-side augmentation,
+but it echoes at a fixed rate whether the data path is behind or not. `train --echo-max M` echoes only when a step would otherwise
+wait.
+
+**Rule.**
+- When the trainer asks for its next batch and a new window is ready, it gets the new window. New windows always come first.
+- When no new window is ready, it gets the most recently released window again. The replay thread has already redrawn that window
+  with a new device-side augmentation: a new cube symmetry and warp record, a new scanner plan, new intensity jitter. This is the
+  same `replay_window` as `--replay`, so the labels stay exact.
+- Each window is echoed at most M times.
+
+**The gate.** An echo is handed out only once the step really would wait, not merely when the host asks early.
+- The host takes the next batch right after launching a step. The step's gradient exchange and update are launched after that.
+- So the trainer passes `sampler_next_gate` an `echo_busy` probe: a non-blocking query of each GPU's `ev_done`, the event recorded at
+  the end of the backward.
+- While every GPU is still computing, a new window that becomes ready is still taken (0.5 ms timed waits).
+- Once one GPU has finished, it is waiting on the host, so the newest echo candidate goes out at once.
+- `--split z` uses both cards' events, and one-window-per-GPU runs use the events of the GPUs fetching.
+
+**Candidates.**
+- The trainer keeps `echo_keep` released windows as candidates: two per window a step takes, so one is ready while the replay
+  thread redraws the other. That is 2 under `--split z` (one shared window a step) and 2 x the GPU count otherwise (each GPU takes
+  its own window). `UFSM_ECHO_KEEP` overrides it.
+- On release, candidates beyond that go back to the builders.
+- A builder that finds no free slot reclaims the oldest candidate only while a new window is ready, which the trainer takes next.
+  Otherwise the candidates stay: letting builders take them down to one left the trainer a single candidate, often still being
+  redrawn (numbers below).
+- The replay state is now allocated before the workers start. Before this, a worker that finished its first window early left it
+  unreplayed under `--replay`, and echo's reclaim read a null `rq` (a segfault in the first sampler-only test).
+- `UFSM_ECHO_THREADS` sets the number of replay threads (default 2 in echo mode). Measured 1 / 2 / 3: no difference, since a redraw
+  takes 0.1-0.2 s at P 512.
+- B > 1 echoes the whole batch of B windows, each redrawn.
+
+**Losses.** An echo is a complete batch with its own label planes, built by the same transform as its input. The per-label means
+(phase, side, winding, ink, papyrus masks and their known-voxel counts) are computed per batch exactly as for a new window, and
+nothing is double-counted. The only change is that a window can be seen up to M + 1 times, so the data distribution over steps
+shifts toward the windows that were in the queue when the data path fell behind.
+
+**Reproducibility.**
+- Echo decisions depend on timing: whether a builder finished before a GPU did.
+- Under `--det 1` the sampler therefore switches echo off and says so, and a `--det` run stays bit-reproducible.
+- A non-det run with echo is not reproducible step for step. It was not reproducible without echo either, because the worker order
+  already depends on timing.
+- Mutually exclusive with `--replay K > 1`. Needs the `--replay` configurations (`sampler_replay_ok`: `--gpu-aug 2` cube batches).
+
+**Logging.**
+- The step line gains ` echo N%`, the share of the batches since the last line that were echoes.
+- `UFSM_SAMPLER_ONLY=N` takes `--echo-max` too. `UFSM_SAMPLER_STEP_MS=T` simulates a T ms GPU step per batch, so the echo share at
+  a given pace can be measured without a GPU.
+
+**Numbers.**
+
+CPU only: `UFSM_SAMPLER_ONLY=60`, the scratch2 recipe at P 512 with `--split z`, the GPU on-the-fly paths on the CPU, `UFSM_SAMPLER_COV=0`.
+`UFSM_SAMPLER_STEP_MS=300` simulates a GPU step faster than the 4 slots / 6 workers deliver; "waited" is the time spent in
+`sampler_next` after the first batch.
+
+| run | wall (s) | waited (s) | new windows | echoes |
+|---|---|---|---|---|
+| `--echo-max 0` | 39.4 | 20.7 (53 %) | 60 | 0 |
+| echo, keep 1 | 21.7 | 3.3 | 24 | 36 |
+| echo, keep 2, reclaim down to 1 | 23.6 | 5.1 | 26 | 34 |
+| echo, keep 2, reclaim only above keep (default) | 19.0-20.0 | 0.5-1.5 (3-8 %) | 21-22 | 38-39 |
+| same, no `--split` (2 GPUs: keep 4) | 20.2 | 1.8 | 20 | 40 |
+
+New windows arrive at the same rate in every arm, about 1.1 per second: echo fills the wait and does not take time away from the
+builders. A redraw costs 97-193 ms on a replay thread.
+
+At a 1.5 s step (the sampler keeps up at P 512): 10 % echo over 30 batches, the remaining batches new.
+
+GPU check: `/vesuvius/ufsm/perf2/echo_swap.sh` (desk swap window: the recipe with `--echo-max 4`, then with `--workers 1` to force
+starvation).
+
+**Use.** Replace `--replay 2` with `--echo-max 4`: under `--replay 2` every window is trained twice whether data is short or not,
+while echo spends only the steps that would otherwise wait.
+
 ## Test-suite speed: shards, the runner's defaults, a smoke tier, changed-file selection (2026-11-14, branch testspeed-20261113)
 
 The fast tier (the merge gate) was slow mostly because the runner was too conservative, not because the tests are big.

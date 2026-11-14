@@ -61,6 +61,7 @@ void nn_set_conv1_const(int on);   /* fp16 1^3 heads with constant-bank weights 
 void nn_d2d_aux(void *dst, const void *src, size_t bytes);   /* device copy on the per-device aux stream (ordered by events only:
                                                                 in-place slab plane copies overlapped with the next slab's conv) */
 void nn_event_sync(void *ev);
+int nn_event_done(void *ev);                             /* 1: the work before the record has finished (a query, no wait; train --echo-max) */
 /* activation offload: copy (pinned host <-> device) on an offload stream once the compute stream reaches this point (ev_start);
    ev_done completes with the copy (nn_stream_wait(0, ev_done) before the compute stream touches dst / src again) */
 void nn_offload_copy(void *dst, const void *src, size_t n, int to_host, void *ev_start, void *ev_done);

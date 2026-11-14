@@ -1806,6 +1806,11 @@ static void gstep_bwd(gstep_arg *a) {
             nn_event_record(d->ev_done[d->cur], 0);
             nn_event_sync(d->ev_up[d->cur]); nn_event_sync(d->ev_lab[d->cur]);   /* host buffer of this batch is free again (lab_early: its label warp read it) */
 }
+/* --echo-max's gate (sampler_next_gate): busy while every GPU still runs the step just launched (the backward's ev_done not reached);
+   once one has finished, it waits on the host (its gradient exchange and update are launched after the next batch is taken), so a
+   step that would wait for data takes an echo instead */
+typedef struct { void *ev[64]; int n; } echo_gate;
+static int echo_busy(void *p) { const echo_gate *e = p; for (int i = 0; i < e->n; i++) if (nn_event_done(e->ev[i])) return 0; return e->n > 0; }
 static void gstep_job(void *p) { gstep_arg *a = p; gstep_fwd(a); if (!a->rc) gstep_bwd(a); nn_tls_capture(&a->out); }
 /* the per-GPU host threads (persistent: thread-local device scratch lives as long as they do), started on first use */
 typedef struct { pthread_t th; int dev, started, has; void (*fn)(void *); void *arg; nn_tls tls; } gworker;
@@ -3146,6 +3151,9 @@ int cmd_train(int argc, char **argv) {
         meant a direct reclaim in a reading worker (pgscan_direct ~15k pages/s per run) */
     sample_cfg sc = sample_cfg_default();
     sc.P = P; sc.Pz = g_Pz != P ? g_Pz : 0; sc.B = B; sc.nworkers = workers; sc.nbuf = atoi(opt(argc, argv, "--sampler-slots", "0")) > 0 ? atoi(opt(argc, argv, "--sampler-slots", "0")) : 4 * ng + 2;   /* batches in flight (each worker fills one; pinned memory per slot) */ sc.seed = seed; sc.xfmt = g_xfmt;
+    sc.echo_max = atoi(opt(argc, argv, "--echo-max", "0"));   /* --echo-max M: adaptive echoing, a step that would wait for data redraws a recent window (sample.h) */
+    sc.echo_keep = getenv("UFSM_ECHO_KEEP") ? atoi(getenv("UFSM_ECHO_KEEP")) : 2 * (split ? 1 : ng);   /* (two per window a step takes, one shared window under --split z, one per
+                                                                                                       GPU otherwise: one is ready while the replay thread redraws the other) */
     const int ngh = split ? 1 : ng;   /* (batches the trainer holds: one per GPU; --split z: one window on both, 2026-11-14) */
     if (workers > sc.nbuf - ngh)   /* a worker fills a slot of its own and the trainer holds about one per GPU: workers beyond the free slots wait, and each
                                      holds its window scratch (5 bytes per voxel; P 640, 2026-11-09: 4 workers 3 slots 46% wait, 8 workers 3 slots 38%, 4 workers 5 slots 0%) */
@@ -3443,14 +3451,15 @@ int cmd_train(int argc, char **argv) {
             sc.ink_bits = g_rv && (!getenv("UFSM_INK_BITS") || ufsm_env_on("UFSM_INK_BITS"));
             sc.w4_runs = sc.w4_dev && (!getenv("UFSM_W4_RUNS") || ufsm_env_on("UFSM_W4_RUNS"));
             sc.replay = atoi(opt(argc, argv, "--replay", "1")); sc.replay_gap = atoi(opt(argc, argv, "--replay-gap", "0"));
+            const int step_ms = getenv("UFSM_SAMPLER_STEP_MS") ? atoi(getenv("UFSM_SAMPLER_STEP_MS")) : 0;   /* (a simulated GPU step per batch: the echo share at that pace) */
             sampler *sq = sampler_start(S, &sc); if (!sq) { fprintf(stderr, "cannot start the sampler\n"); return 1; }
-            const int nb = atoi(so); const double t0 = now(); double tf = 0;
+            const int nb = atoi(so); const double t0 = now(); double tf = 0, twait = 0;   /* (twait: in sampler_next after the first batch) */
             /* per source: windows, and per window the shares of material (CT > 0), known phase and known winding mod 4 (w4 per voxel only
                without --w4 runs: UFSM_W4_RUNS=0) over the window's voxels (source grid) */
             double (*cov)[5] = calloc((size_t)S->n, sizeof *cov); int (*lvc)[MAXLEV] = calloc((size_t)S->n, sizeof *lvc); double (*lvm)[MAXLEV][2] = calloc((size_t)S->n, sizeof *lvm);
             double (*ikc)[4] = calloc((size_t)S->n, sizeof *ikc);   /* per source: windows with the ink plane, its known / ink voxel shares, MIL rays */
             for (int i = 0; i < nb; i++) {
-                batch *b = sampler_next(sq); if (!b) { fprintf(stderr, "sampler stopped after %d batches\n", i); break; }
+                const double tn = now(); batch *b = sampler_next(sq); if (!b) { fprintf(stderr, "sampler stopped after %d batches\n", i); break; } if (i) twait += now() - tn;
                 if (i == 0) tf = now() - t0;
                 /* the shares once per window (not on its replays: the same source-grid planes), branch-free per 64k voxels: the loop with
                    a branch per voxel took 1.3 s of every P 1024 batch on the one consuming thread, so the mode reported 0.7 batches/s at
@@ -3477,9 +3486,13 @@ int cmd_train(int argc, char **argv) {
                     cov[si][0] += 1; cov[si][1] += (double)mat / nv; cov[si][2] += (double)ph / nv; cov[si][3] += mat ? (double)phm / mat : 0; cov[si][4] += (double)w4 / nv;
                 }
                 if (ufsm_env_on("UFSM_SAMPLER_EMPTY") && b->ct8 && !b->use) empty_tiles_report(b, B, g_Pz, P, S);
+                if (step_ms > 0) usleep((useconds_t)step_ms * 1000);
                 sampler_release(sq, b);
-                if ((i + 1) % 10 == 0 || i + 1 == nb) { const double dt = now() - t0 - tf;
-                    fprintf(stderr, "sampler-only: %d batches, %.1f s (first %.1f s), %.1f Mvox/s after the first\n", i + 1, now() - t0, tf, i > 0 ? (double)i * B * g_Pz * P * P / 1e6 / dt : 0.);
+                if ((i + 1) % 10 == 0 || i + 1 == nb) { const double dt = now() - t0 - tf; uint64_t fe, ee; sampler_echo_stats(sq, &fe, &ee);
+                    fprintf(stderr, "sampler-only: %d batches, %.1f s (first %.1f s), %.1f Mvox/s after the first", i + 1, now() - t0, tf, i > 0 ? (double)i * B * g_Pz * P * P / 1e6 / dt : 0.);
+                    if (fe + ee) fprintf(stderr, " (echo %.0f%%: %llu new, %llu echoes)", 100.0 * ee / (fe + ee), (unsigned long long)fe, (unsigned long long)ee);
+                    fprintf(stderr, ", waited %.1f s", twait);
+                    fprintf(stderr, "\n");
                     sampler_hostmem(sq, stderr, 0); }   /* (the host memory by owner every 10 batches: slow growth shows where) */
             }
             for (int s = 0; cov && s < S->n; s++) if (cov[s][0] > 0) { const double k = cov[s][0];
@@ -4506,7 +4519,8 @@ int cmd_train(int argc, char **argv) {
             sampler_release(sp, G[0].pending);
             G[0].pending = nullptr;
             if (step < steps && !g_stop) {
-                double tw = now(); batch *nb = sampler_next(sp); wait += now() - tw;
+                echo_gate eg = {{G[0].ev_done[G[0].cur], G[1].ev_done[G[1].cur]}, 2};
+                double tw = now(); batch *nb = sampler_next_gate(sp, echo_busy, &eg); wait += now() - tw;
                 if (!nb) { fprintf(stderr, "sampler stopped before final step\n"); training_failed = 1; break; }
                 split_upload(sctx, G, 0, nb, G[0].cur ^ 1, G[1].cur ^ 1, B, P);
                 for (int g = 0; g < 2; g++) { nn_init(G[g].dev); select_buf(&G[g], G[g].cur ^ 1); }
@@ -4605,10 +4619,11 @@ int cmd_train(int argc, char **argv) {
             }
         }
         }
+        echo_gate eg = {{0}, 0}; for (int g = 0; g < ng && g < 64; g++) if (want_next[g]) eg.ev[eg.n++] = G[g].ev_done[G[g].cur];   /* (before select_buf flips cur) */
         for (int g = 0; g < ng && !g_stop && !training_failed; g++) {
             if (!want_next[g]) continue;
             gpu_state *d = &G[g]; nn_init(d->dev);
-            double tw = now(); batch *nb = sampler_next(sp); wait += now() - tw;
+            double tw = now(); batch *nb = sampler_next_gate(sp, echo_busy, &eg); wait += now() - tw;
             if (!nb) { fprintf(stderr, "sampler stopped before final step\n"); training_failed = 1; break; }
             int nxt = d->cur ^ 1; upload_async(d, nb, nxt, B, P); d->pending = nb; select_buf(d, nxt);
         }
@@ -4962,6 +4977,11 @@ int cmd_train(int argc, char **argv) {
             if (cfg.attn_blocks > 0) {   /* the largest attention logit since the last line (QK-clip's quantity; held at --qk-clip when set) */
                 if (ng > 1) nn_init(G[0].dev);
                 const float q = unet_qk_lmax(G[0].u); if (q >= 0.f) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " qk %.1f", q); }
+            }
+            if (sp) {   /* --echo-max: the share of the batches since the last line that were echoes (fresh counts only in echo mode) */
+                static uint64_t f0, e0; uint64_t f1, e1; sampler_echo_stats(sp, &f1, &e1);
+                if (f1 + e1 > f0 + e0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " echo %.0f%%", 100.0 * (double)(e1 - e0) / (double)(f1 + e1 - f0 - e0)); }
+                f0 = f1; e0 = e1;
             }
             if (accum > 1) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " (update %d: %d windows each)", step / accum, accum); }   /* --accum: steps are windows */
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s %.1f Mvox/s (wait %.0f%%)%s%s\n", step, lr, acc_loss / nok, acc_bce / nok, acc_dice / nok, affs, acc_g / nok,

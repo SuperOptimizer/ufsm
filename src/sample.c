@@ -221,7 +221,8 @@ struct sampler {
     pthread_mutex_t mu;
     pthread_cond_t cv_free, cv_ready;
     pthread_t *th;
-    int *rleft; unsigned char *rq; pthread_t rth; int rth_on; _Atomic uint64_t replays;
+    int *rleft; unsigned char *rq; pthread_t rth[4]; int rth_on;   /* (rth_on: the replay threads running) */ _Atomic uint64_t replays;
+    _Atomic uint64_t n_fresh, n_echo, rns;   /* (rns: the replay threads' redraw nanoseconds) */   /* --echo-max: windows served new / as echoes */
     int64_t *rdue, *rseq, nserved, nrel; int rgap;   /* --replay interleave (under mu): a pending replay's due serve count / release order; batches handed out / released */   /* --replay: per slot replays left, in the replay pipeline (REPLAY or READY as one); its thread */
     atomic_int stop, failed;
     atomic_uint_fast64_t produced, rejected;
@@ -3535,6 +3536,7 @@ static void worker_trim(void) {
     static int on = -1; if (on < 0) on = !getenv("UFSM_SAMPLER_TRIM") || ufsm_env_on("UFSM_SAMPLER_TRIM");
     if (on) malloc_trim(0);
 }
+static int echo_reclaim(sampler *sp);
 static void *worker(void *arg) {
     warg *wa = arg;
     sampler *sp = wa->sp;
@@ -3575,6 +3577,7 @@ static void *worker(void *arg) {
         } else
         while (k < 0 && !atomic_load(&sp->stop)) {
             for (int j = 0; j < sp->nslots; j++) if (sp->state[j] == FREE) { k = j; break; }
+            if (k < 0 && sp->cfg.echo_max > 0) k = echo_reclaim(sp);   /* (--echo-max: a new window before an old one's echo) */
             if (k < 0 && !idle) { pthread_mutex_unlock(&sp->mu); worker_idle_release(big, 10 * p3, ttmp, NCH * p3 + 4096); idle = 1; pthread_mutex_lock(&sp->mu); continue; }
             if (k < 0) pthread_cond_wait(&sp->cv_free, &sp->mu);
         }
@@ -3595,7 +3598,7 @@ static void *worker(void *arg) {
         worker_trim();
         pthread_mutex_lock(&sp->mu);
         sp->state[k] = filled == sp->cfg.B && !atomic_load(&sp->stop) ? READY : FREE;
-        if (sp->rleft) sp->rleft[k] = sp->cfg.replay - 1;
+        if (sp->rleft) sp->rleft[k] = sp->cfg.echo_max > 0 ? sp->cfg.echo_max : sp->cfg.replay - 1;
         pthread_cond_broadcast(&sp->cv_ready);
         pthread_cond_broadcast(&sp->cv_free);
         pthread_mutex_unlock(&sp->mu);
@@ -3940,6 +3943,19 @@ static void replay_window(sampler *sp, batch *b, int i, int rep, uint8_t **scr) 
     }
     free(cyz);
 }
+/* --echo-max (under mu): a builder short of a free slot takes back the oldest echo candidate not being redrawn, only while a new window
+   is ready (the trainer takes that one next); -1 none. Taking candidates below echo_keep left the trainer one candidate, often still
+   being redrawn: P 512, 4 slots, 6 workers, a 0.3 s simulated step: 5.1 s of 23.6 s waited with a floor of 1, 0.5 s of 19.0 s with
+   the floor at echo_keep 2, at the same rate of new windows (1.13 / s; 2026-11-14) */
+static int echo_reclaim(sampler *sp) {
+    int old = -1, nc = 0, nw = 0;
+    for (int j = 0; j < sp->nslots; j++) { nc += sp->rq[j] != 0; nw |= sp->state[j] == READY && !sp->rq[j]; }
+    if (nc <= sp->cfg.echo_keep && !nw) return -1;
+    for (int j = 0; j < sp->nslots; j++) if (sp->rq[j] && sp->state[j] != FILLING && (old < 0 || sp->rseq[j] < sp->rseq[old])) old = j;
+    if (old >= 0) { sp->rq[old] = 0; sp->rleft[old] = 0; sp->state[old] = FREE; }
+    return old;
+}
+void sampler_echo_stats(sampler *sp, uint64_t *fresh, uint64_t *echoed) { *fresh = atomic_load(&sp->n_fresh); *echoed = atomic_load(&sp->n_echo); }
 static void *replay_thread(void *arg) {
     sampler *sp = arg; uint8_t *scr = nullptr;
     pthread_mutex_lock(&sp->mu);
@@ -3947,9 +3963,11 @@ static void *replay_thread(void *arg) {
         int k = -1;
         for (int j = 0; j < sp->nslots; j++) if (sp->state[j] == REPLAY) { k = j; break; }
         if (k < 0) { pthread_cond_wait(&sp->cv_free, &sp->mu); continue; }
-        sp->state[k] = FILLING; const int rep = sp->cfg.replay - sp->rleft[k];
+        sp->state[k] = FILLING; const int rep = (sp->cfg.echo_max > 0 ? sp->cfg.echo_max + 1 : sp->cfg.replay) - sp->rleft[k];
         pthread_mutex_unlock(&sp->mu);
+        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
         for (int i = 0; i < sp->cfg.B; i++) replay_window(sp, &sp->slots[k], i, rep, &scr);
+        clock_gettime(CLOCK_MONOTONIC, &t1); atomic_fetch_add(&sp->rns, (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec)));
         atomic_fetch_add(&sp->replays, 1);
         pthread_mutex_lock(&sp->mu);
         sp->rleft[k]--; sp->state[k] = READY;
@@ -3969,6 +3987,8 @@ static int replay_selftest(void) {   /* sym_inverse undoes every cube symmetry (
 }
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     if (rskip_selftest()) { fprintf(stderr, "sampler: rng jump-ahead self-test failed\n"); return nullptr; }
+    if (cfg->echo_max > 0 && cfg->replay > 1) { fprintf(stderr, "sampler: --echo-max and --replay K > 1 exclude each other\n"); return nullptr; }
+    if (cfg->echo_max > 0 && (!sampler_replay_ok(cfg) || replay_selftest())) { fprintf(stderr, "sampler: --echo-max needs --gpu-aug 2 cube batches (as --replay)\n"); return nullptr; }
     if (cfg->replay > 1 && (!sampler_replay_ok(cfg) || replay_selftest())) { fprintf(stderr, "sampler: --replay needs --gpu-aug 2 cube batches without sheet / band / gap / condition / distill / view / cover / chain / papyrus-mask planes\n"); return nullptr; }
     if (!S || S->n <= 0 || cfg->P <= 0 || cfg->B <= 0 || cfg->nworkers <= 0 || cfg->nbuf <= 0) { fprintf(stderr, "sampler: invalid sources, patch, batch, workers or buffer count\n"); return nullptr; }
     if (cfg->gpu_input && !sample_gpu_input_ok(cfg)) { fprintf(stderr, "sampler: --gpu-input needs 16-bit batches and no warps, sheet prior, slab appearance plan, aux or condition inputs\n"); return nullptr; }
@@ -4019,6 +4039,8 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     sampler *sp = calloc(1, sizeof *sp);
     sp->S = S;
     sp->cfg = *cfg;
+    if (sp->cfg.echo_max > 0 && sp->cfg.deterministic) { fprintf(stderr, "sampler: --echo-max off under --det 1 (echo decisions depend on timing; a --det run stays reproducible)\n"); sp->cfg.echo_max = 0; }
+    if (sp->cfg.echo_max > 0 && sp->cfg.echo_keep < 1) sp->cfg.echo_keep = 1;
     if (sp->cfg.w4_runs) {   /* the runs stand for the planes where the side plane is the winding input and every label is on the source grid */
         const sample_cfg *c = &sp->cfg;
         const int ok = w4runs_available() && c->wind4 && c->side == 2 && c->gpu_aug == 2 && (c->Pz <= 0 || c->Pz == c->P) && c->side_air == 0 && c->phase_near_um <= 0 &&
@@ -4152,23 +4174,30 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
             if (cfg->strict_sources) return nullptr;   /* (no workers started yet; the partial sampler is left to the exiting process) */
         }
     }
+    /* (the replay state before the workers: a worker that finished its first window before these existed left it unreplayed, and
+       --echo-max's reclaim read rq as a null pointer, 2026-11-14) */
+    if (sp->cfg.replay > 1 || sp->cfg.echo_max > 0) {
+        sp->rleft = calloc((size_t)sp->nslots, sizeof *sp->rleft); sp->rq = calloc((size_t)sp->nslots, 1);
+        sp->rdue = calloc((size_t)sp->nslots, sizeof *sp->rdue); sp->rseq = calloc((size_t)sp->nslots, sizeof *sp->rseq);
+        /* default gap: a window's slot is held ~(K-1) G / K batches per new window, so G = (slots - workers) K / (K-1) leaves every worker
+           a slot to build in (more interleave wants more slots: --sampler-slots workers + 2 + extra) */
+        sp->rgap = cfg->replay_gap > 0 ? cfg->replay_gap : sp->cfg.replay > 1 ? (sp->nslots - cfg->nworkers) * cfg->replay / (cfg->replay - 1) : 2;
+        sp->rgap = sp->rgap < 2 ? 2 : sp->rgap > sp->nslots ? sp->nslots : sp->rgap;
+        sp->rth_on = 0;   /* --echo-max: replay threads (UFSM_ECHO_THREADS, default 2): every released window is redrawn, ~0.35 s at P 512 on one
+                             thread, so one thread fell behind a 0.3 s step at a 60 % echo share (2026-11-14, sampler-only) */
+        int nrt = sp->cfg.echo_max > 0 ? (getenv("UFSM_ECHO_THREADS") ? atoi(getenv("UFSM_ECHO_THREADS")) : 2) : 1; nrt = nrt < 1 ? 1 : nrt > 4 ? 4 : nrt;
+        if (sp->rleft && sp->rq && sp->rdue && sp->rseq) while (sp->rth_on < nrt && !pthread_create(&sp->rth[sp->rth_on], nullptr, replay_thread, sp)) sp->rth_on++;
+        if (!sp->rth_on) { fprintf(stderr, "sampler: cannot start the replay thread\n"); free(sp->rleft); free(sp->rq); free(sp->rdue); free(sp->rseq); sp->rleft = nullptr; sp->rq = nullptr; sp->rdue = sp->rseq = nullptr; sp->cfg.echo_max = 0; }
+        else if (sp->cfg.echo_max > 0) fprintf(stderr, "sampler: adaptive echo: when no new window is ready, the most recent one again with a new device-side augmentation (at most %d echoes a window, %d candidate%s held; new windows first; train logs the echo share)\n",
+                          sp->cfg.echo_max, sp->cfg.echo_keep, sp->cfg.echo_keep > 1 ? "s" : "");
+        else fprintf(stderr, "sampler: window replay x%d, interleaved: a replay %d batches after its window's previous use%s (a new symmetry / warp / scanner plan / jitter per replay, on the device)\n",
+                     cfg->replay, sp->rgap, cfg->deterministic ? " or when its slot is next in batch order" : " or earlier when no new window is ready");
+    }
     sp->th = calloc((size_t)cfg->nworkers, sizeof(pthread_t));
     for (int i = 0; i < cfg->nworkers; i++) {
         warg *wa = malloc(sizeof *wa);
         wa->sp = sp; wa->id = i;
         pthread_create(&sp->th[i], nullptr, worker, wa);
-    }
-    if (cfg->replay > 1) {
-        sp->rleft = calloc((size_t)sp->nslots, sizeof *sp->rleft); sp->rq = calloc((size_t)sp->nslots, 1);
-        sp->rdue = calloc((size_t)sp->nslots, sizeof *sp->rdue); sp->rseq = calloc((size_t)sp->nslots, sizeof *sp->rseq);
-        /* default gap: a window's slot is held ~(K-1) G / K batches per new window, so G = (slots - workers) K / (K-1) leaves every worker
-           a slot to build in (more interleave wants more slots: --sampler-slots workers + 2 + extra) */
-        sp->rgap = cfg->replay_gap > 0 ? cfg->replay_gap : (sp->nslots - cfg->nworkers) * cfg->replay / (cfg->replay - 1);
-        sp->rgap = sp->rgap < 2 ? 2 : sp->rgap > sp->nslots ? sp->nslots : sp->rgap;
-        sp->rth_on = sp->rleft && sp->rq && sp->rdue && sp->rseq && !pthread_create(&sp->rth, nullptr, replay_thread, sp);
-        if (!sp->rth_on) { fprintf(stderr, "sampler: cannot start the replay thread\n"); free(sp->rleft); free(sp->rq); free(sp->rdue); free(sp->rseq); sp->rleft = nullptr; sp->rq = nullptr; sp->rdue = sp->rseq = nullptr; }
-        else fprintf(stderr, "sampler: window replay x%d, interleaved: a replay %d batches after its window's previous use%s (a new symmetry / warp / scanner plan / jitter per replay, on the device)\n",
-                     cfg->replay, sp->rgap, cfg->deterministic ? " or when its slot is next in batch order" : " or earlier when no new window is ready");
     }
     return sp;
 }
@@ -4214,11 +4243,26 @@ int sampler_batch_hash(const sampler *sp, const batch *b, const char **names, ui
     free(inkr); free(sdr); free(w4r); free(wcr);
     return n;
 }
-batch *sampler_next(sampler *sp) {
+batch *sampler_next(sampler *sp) { return sampler_next_gate(sp, nullptr, nullptr); }
+batch *sampler_next_gate(sampler *sp, int (*busy)(void *), void *arg) {
     pthread_mutex_lock(&sp->mu);
     int k = -1;
     while (k < 0) {
         if (atomic_load(&sp->stop)) { pthread_mutex_unlock(&sp->mu); return nullptr; }
+        if (sp->cfg.echo_max > 0) {   /* --echo-max: a new window if one is ready, else the most recent echo candidate redrawn; else wait */
+            int nw = -1, ec = -1;
+            for (int j = 0; j < sp->nslots; j++) {
+                if (sp->state[j] == READY && !sp->rq[j]) { if (nw < 0) nw = j; }
+                else if (sp->rq[j] && sp->state[j] == READY) { if (ec < 0 || sp->rseq[j] > sp->rseq[ec]) ec = j; }
+            }
+            if (nw >= 0) { k = nw; atomic_fetch_add(&sp->n_fresh, 1); break; }
+            if (ec >= 0 && (!busy || !busy(arg))) { k = ec; sp->rq[ec] = 0; atomic_fetch_add(&sp->n_echo, 1); break; }
+            if (ec >= 0) {   /* (the GPU still has work queued: a new window may yet come in time; look again in 0.5 ms) */
+                struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 500000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+                pthread_cond_timedwait(&sp->cv_ready, &sp->mu, &ts); continue;
+            }
+            pthread_cond_wait(&sp->cv_ready, &sp->mu); continue;
+        }
         int rk = -1;   /* --replay: the pending replay to hand out now, -1 none (it waits below while the replay thread redraws it) */
         if (sp->rq) {   /* interleaved: the earliest released window once due; under --det 1 also the one holding the next batch's slot
                            (decisions depend on the trainer's call order only); otherwise the earliest when no new window is ready */
@@ -4246,7 +4290,7 @@ batch *sampler_next(sampler *sp) {
             pthread_cond_wait(&sp->cv_ready, &sp->mu);
         }
     }
-    sp->slots[k].use = sp->rleft ? sp->cfg.replay - 1 - sp->rleft[k] : 0;
+    sp->slots[k].use = sp->rleft ? (sp->cfg.echo_max > 0 ? sp->cfg.echo_max : sp->cfg.replay - 1) - sp->rleft[k] : 0;
     sp->state[k] = TAKEN; if (sp->rdue) sp->rdue[k] = sp->nserved + sp->rgap;   /* (its next use: rgap batches after this one) */
     sp->nserved++;
     pthread_mutex_unlock(&sp->mu);
@@ -4265,6 +4309,14 @@ void sampler_release(sampler *sp, batch *b) {
     const int k = (int)(b - sp->slots);
     if (sp->rleft && sp->rleft[k] > 0 && !atomic_load(&sp->stop)) {
         sp->state[k] = REPLAY; sp->rq[k] = 1; sp->rseq[k] = sp->nrel++;
+        if (sp->cfg.echo_max > 0) {   /* --echo-max: the newest echo_keep candidates stay; older ones go back to the builders */
+            for (;;) {
+                int nc = 0, old = -1;
+                for (int j = 0; j < sp->nslots; j++) if (sp->rq[j]) { nc++; if (sp->state[j] != FILLING && (old < 0 || sp->rseq[j] < sp->rseq[old])) old = j; }
+                if (nc <= sp->cfg.echo_keep || old < 0) break;
+                sp->rq[old] = 0; sp->rleft[old] = 0; sp->state[old] = FREE;
+            }
+        }
         pthread_cond_broadcast(&sp->cv_free); pthread_mutex_unlock(&sp->mu); return;
     }
     sp->state[k] = FREE;
@@ -4317,7 +4369,8 @@ void sampler_stop(sampler *sp) {
     pthread_cond_broadcast(&sp->cv_ready);
     pthread_mutex_unlock(&sp->mu);
     for (int i = 0; i < sp->cfg.nworkers; i++) pthread_join(sp->th[i], nullptr);
-    if (sp->rth_on) pthread_join(sp->rth, nullptr);
+    for (int t = 0; t < sp->rth_on; t++) pthread_join(sp->rth[t], nullptr);
+    if (sp->rth_on && atomic_load(&sp->replays)) fprintf(stderr, "sampler: %llu replays, %.0f ms per redraw\n", (unsigned long long)atomic_load(&sp->replays), atomic_load(&sp->rns) / 1e6 / atomic_load(&sp->replays));
     for (int i = 0; i < sp->nslots; i++) free_batch(&sp->slots[i], sp->cfg.B);
     if (sp->c255) hfree(sp->c255);
     for (int t = 0; t < sp->sn_nth; t++) pthread_join(sp->sn_th[t], nullptr);
