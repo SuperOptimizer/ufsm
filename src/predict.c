@@ -2625,14 +2625,24 @@ static int predict_one(int argc, char **argv) {
        shard indexes say so before any read (z3_box_any, the indexes the reads load anyway; 1299: 63 of 778 windows passed the coarse
        occupancy test that way). Same conditions as the tile test; the plain CT path only (not --latents / latvol); UFSM_AIR_CHUNKS=0 off */
     if (!lat_store && !lvc && !gn_save && !fea && !sheet_task && !split && z3_meta_of(ct)->fill == 0 && (!getenv("UFSM_AIR_CHUNKS") || ufsm_env_on("UFSM_AIR_CHUNKS"))) {
-        long kept = 0, nair = 0;
+        long kept = 0, nair = 0; const size_t nsh_ = (size_t)(ns[0] * ns[1] * ns[2]);
+        uint8_t *shs = calloc(nsh_ ? nsh_ : 1, 1);   /* per shard: 1 an owned window dropped, 2 a window kept */
         for (long i = 0; i < rd.ntiles; i++) {
             const tile_t *t = &rd.tiles[i]; const int64_t o[3] = {bo[0] + t->tz, bo[1] + t->ty, bo[2] + t->tx}, n[3] = {Wz, W, W};
-            if (z3_box_any(ct, o, n) == 0) { nair++; continue; }   /* (-1, an index error: kept, the read reports it) */
+            if (z3_box_any(ct, o, n) == 0) { nair++; if (shs && !t->noout && t->shard >= 0 && (size_t)t->shard < nsh_ && !shs[t->shard]) shs[t->shard] = 1; continue; }   /* (-1, an index error: kept, the read reports it) */
+            if (shs && t->shard >= 0 && (size_t)t->shard < nsh_) shs[t->shard] = 2;
             rd.tiles[kept++] = *t;
         }
         if (nair) fprintf(stderr, "predict: %ld windows over absent CT chunks only skipped before reading (%ld to run)\n", nair, kept);
         rd.ntiles = kept;
+        /* --resume: a shard all of whose windows went is done (all air, nothing written: as the loop's "all air: done" rows), else a --gpus
+           worker owning only such shards logged nothing (test_pipeline_cli air-gpus: the '0 0 0' row missing) */
+        const int dfd_ = WR.donefd >= 0 ? WR.donefd : nph > 0 && !hspec ? PH[0].wr->donefd : -1;
+        if (shs && dfd_ >= 0) for (size_t k = 0; k < nsh_; k++) if (shs[k] == 1) {
+            const int64_t sz_ = (int64_t)(k / (size_t)(ns[1] * ns[2])), sy_ = (int64_t)(k / (size_t)ns[2] % (size_t)ns[1]), sx_ = (int64_t)(k % (size_t)ns[2]);
+            dprintf(dfd_, "%lld %lld %lld\n", (long long)(sz_ + soff[0]), (long long)(sy_ + soff[1]), (long long)(sx_ + soff[2]));
+        }
+        free(shs);
     }
     static seam_t SM;
     if (seam2) {
