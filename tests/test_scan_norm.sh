@@ -43,8 +43,12 @@ with open(sys.argv[1], 'wb') as f:
     for r in H: f.write(struct.pack('<64f', *[v / 8 for v in r]))
 PY
 mkdir -p lv lv1
-"$U" latvol lv.lcb fx ct lv/ct --levels 9.6,19.2,38.4,76.8,153.6 --c 64 --threads 2 --gpu -1 > lv.log 2>&1 || { echo "FAIL: latvol ($D/lv.log)"; exit 1; }
-"$U" latvol lv.lcb fx ct lv1/ct --levels 9.6 --c 64 --threads 2 --gpu -1 > lv1.log 2>&1 || { echo "FAIL: latvol one level ($D/lv1.log)"; exit 1; }
+# (latvol encodes a level from 256^3 material boxes: the 256^3 fixture has them at 9.6 um only. lv1 = level 9.6 latvol alone (the group
+#  json still lists the coarse levels: they do not open); lv = the same plus the plain coarse levels linked in, a mixed group)
+"$U" latvol lv.lcb fx ct lv1/ct --levels 9.6 --c 64 --threads 2 --gpu -1 > lv1.log 2>&1 || { echo "FAIL: latvol ($D/lv1.log)"; exit 1; }
+cp -r lv1/ct lv/
+for l in fx/ct/*/; do l=${l%/}; n=${l##*/}; [ -e "lv/ct/$n" ] || ln -s "$PWD/$l" "lv/ct/$n"; done
+[ "$(find -L lv/ct -maxdepth 1 -mindepth 1 -type d | wc -l)" -ge 4 ] || { echo "FAIL: lv/ct levels: $(ls lv/ct)"; exit 1; }
 UFSM_SCANNORM_CACHE=0 "$U" predict a/last.ckpt lv ct pl --um 9.6 --level 0 --box 64,64,64,128,128,128 --gpu 0 --threads 2 --window 128 --halo 16 > pl.log 2>&1 || { echo "FAIL: predict on latvol ($D/pl.log)"; exit 1; }
 ll=$(grep -m1 -o 'scan-norm net: level 0 center [0-9.]* scale [0-9.]*' pl.log || true)
 [ -n "$ll" ] && grep -q 'latvol CT: the rebuilt CT' pl.log || { echo "FAIL: no scan statistics on the latvol CT ($D/pl.log)"; exit 1; }
