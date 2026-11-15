@@ -47,7 +47,7 @@ the log kept. Arms:
 - `base` at LR=0.0015 (the pending LR pair);
 - `rms` at MLR=1.5e-4 (the norm-matched lr; it isolates the per-layer redistribution);
 - `wd10` vs `cwd10` (Muon decay x10, plain vs cautious).
-Report paired per-10-window differences with block-bootstrap CIs (pair.py), per head (phase, wind4 separately), gn, and the held-out val.
+Report paired per-10-window differences with block-bootstrap CIs (scripts/opt/pair_ab.py), per head (phase, wind4 separately), gn, and the held-out val.
 The noise floor is ~0.01. Batch 2 after that: tuned NS coefficients with fewer iterations (`--muon-ns polar` exists: measure
 orthogonality error, step time and fewer iterations), the conv reshape (out x in·27 vs per-tap vs in-major; Muon-C exists as the per-
 frequency variant), and a GNS-driven schedule.
