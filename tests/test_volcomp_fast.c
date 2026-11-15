@@ -91,23 +91,34 @@ static int part2(const char *path) {
     for (int k = 0; k < nproc; k++) {
         if ((pid[k] = fork()) == 0) {
             uint8_t *buf = malloc(CV); uint64_t s = 1234 + (uint64_t)k; int wrong = 0, hits = 0;
-            if (!zshm_on()) _exit(3);
+            if (!zshm_on()) { fprintf(stderr, "zshm child %d: zshm_on failed (init timeout / no cache)\n", k); _exit(3); }
             for (int t = 0; t < 3000; t++) {
                 uint64_t key = lcg(&s) % 200; uint32_t sub = (uint32_t)(lcg(&s) % 32);
                 memset(buf, 0, CV);
                 if (zshm_get(key * 0x9e3779b97f4a7c15ull, ~key, sub, buf)) { hits++; if (!check_sub(buf, key, sub)) wrong++; }
                 else { fill_sub(buf, key, sub); zshm_put(key * 0x9e3779b97f4a7c15ull, ~key, sub, buf); }
             }
+            if (wrong || !hits) fprintf(stderr, "zshm child %d: %d hits, %d with wrong bytes%s\n", k, hits, wrong, hits ? "" : " (no hits)");
             _exit(wrong ? 1 : hits ? 0 : 2);
         }
     }
     int ok = 1;
-    for (int k = 0; k < nproc; k++) { int st; waitpid(pid[k], &st, 0); if (!WIFEXITED(st) || WEXITSTATUS(st)) ok = 0; }
+    static const char *why[] = {"ok", "wrong bytes", "no hits", "init timeout (zshm_on failed)"};
+    for (int k = 0; k < nproc; k++) {
+        int st; if (waitpid(pid[k], &st, 0) != pid[k]) { fprintf(stderr, "zshm child %d: waitpid failed\n", k); ok = 0; continue; }
+        if (!WIFEXITED(st) || WEXITSTATUS(st)) {
+            ok = 0;
+            if (WIFSIGNALED(st)) fprintf(stderr, "zshm child %d: killed by signal %d\n", k, WTERMSIG(st));
+            else if (WIFEXITED(st)) fprintf(stderr, "zshm child %d: exit %d (%s)\n", k, WEXITSTATUS(st), WEXITSTATUS(st) <= 3 ? why[WEXITSTATUS(st)] : "?");
+            else fprintf(stderr, "zshm child %d: status 0x%x\n", k, st);
+        }
+    }
     check("zshm: 6 processes x 3000 random get / put on ~60 slots: every hit has its bytes, hits happen", ok);
     if ((pid[0] = fork()) == 0) {   /* a fresh process stores; the parent (which never opened the cache) reads it back */
         uint8_t *buf = malloc(CV); fill_sub(buf, 4242, 5); zshm_put(4242, 77, 5, buf); _exit(zshm_on() ? 0 : 1);
     }
     int st; waitpid(pid[0], &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st)) fprintf(stderr, "zshm store child: status 0x%x (exit 1: zshm_on failed)\n", st);
     uint8_t *buf = calloc(1, CV);
     check("zshm: an entry stored by another process is a hit with the same bytes", WIFEXITED(st) && !WEXITSTATUS(st) && zshm_get(4242, 77, 5, buf) && check_sub(buf, 4242, 5));
     free(buf);
