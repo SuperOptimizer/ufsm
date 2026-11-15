@@ -23,7 +23,7 @@ for gs in 1024 65536 1048576; do
   grep -q "^hsg zero (GPU 0, gscale $gs" r$gs.log || fail "gscale $gs: no hsg zero line ($D/r$gs.log)"
   grep '^hsg zero' r$gs.log | sed 's/^/  /'
 done
-python3 -I - <<'PY'
+rc=0; python3 -I - <<'PY' || rc=$?
 import re, sys, numpy as np
 def zr(gs):
     t = open(f'r{gs}.log').read(); m = re.search(r'phase (\d+) supervised: ([0-9.]+)% zero ([0-9.]+)% subnormal; rv (\d+): ([0-9.]+)% ([0-9.]+)%; wind4 (\d+): ([0-9.]+)% ([0-9.]+)%', t)
@@ -49,7 +49,7 @@ print(f"  (1) cell gradients vs the 2^20 run: rel L2 {e1:.3e} at 1024, {e2:.3e} 
 ok = ok and e2 <= e1 * 1.01 + 1e-9 and e2 < 1e-2 and np.isfinite(ref).all()
 sys.exit(0 if ok else 1)
 PY
-[ $? -eq 0 ] || fail "(1) dead zone numbers"
+[ $rc -eq 0 ] || fail "(1) dead zone numbers"
 "$U" train fx/sources-ink.json --out gr --muon-lr 0.002 --lr 0.001 "${C[@]}" --P 64 --steps 6 --gscale 1024 --gscale-grow 2 --gscale-max 4096 > gr.log 2>&1 || fail "grow ($D/gr.log)"
 grep -q '^step 2: grad scale -> 2048' gr.log && grep -q '^step 4: grad scale -> 4096' gr.log || fail "(2) no doubling at steps 2 / 4 ($D/gr.log)"
 grep -q '^step 6: grad scale' gr.log && fail "(2) grew beyond --gscale-max"
@@ -57,13 +57,13 @@ head -1 gr/last.ckpt | grep -q '"trainstate":{"accum":1,"anchor":0,"upd":0,"gsca
 "$U" train fx/sources-ink.json --out gr --muon-lr 0.002 --lr 0.001 "${C[@]}" --P 64 --steps 8 --resume gr/last.ckpt --gscale-grow 0 > gr2.log 2>&1 || fail "grow resume ($D/gr2.log)"
 grep -q 'gradient scale 4096 (the checkpoint' gr2.log || fail "(2) resume did not take the checkpoint's scale ($D/gr2.log)"
 echo "  (2) grew 1024 -> 2048 -> 4096 at steps 2 / 4, checkpoint and resume keep 4096"
-python3 -I - gr.log <<'PY'
+rc=0; python3 -I - gr.log <<'PY' || rc=$?   # (|| rc: under set -e a failing python ended the script with no FAIL line)
 import re, sys
 bad = 0; n = 0
 for ln in open(sys.argv[1]):
-    if not ln.startswith('step '): continue
+    if not re.match(r'step +\d+ lr ', ln): continue   # (the progress lines only: 'step 2: grad scale -> 2048' has no KL group)
     m = re.search(r'\(kl ([^)]*)\)', ln)
-    if not m: bad += 1; continue
+    if not m: bad += 1; print(f"  no kl group: {ln.strip()}"); continue
     kl = dict(re.findall(r'(phase|rv|normal|wind4|ink) ([-0-9.]+)', m.group(1).split(';')[0]))
     bce = {k: float(v) for k, v in re.findall(r'(phase|rv|normal|wind4|ink) bce ([0-9.]+)', ln)}
     ang = re.search(r'phase error ([0-9.]+) deg', m.group(1))
@@ -71,10 +71,10 @@ for ln in open(sys.argv[1]):
         v = float(v); n += 1
         # (<=: hard 0 / 1 targets (rv, unsmoothed ink) have entropy 0, so their kl equals their bce)
         if not (v > -1e-3 and (k not in bce or v <= bce[k] + 1e-4)): bad += 1; print(f"  bad kl {k} {v} (bce {bce.get(k)}): {ln.strip()}")
-    if not ang or not (0 <= float(ang.group(1)) <= 180): bad += 1
+    if not ang or not (0 <= float(ang.group(1)) <= 180): bad += 1; print(f"  bad phase error: {ln.strip()}")
     last = m.group(0)
 print(f"  (3) {n} KLs on the step lines, the last: {last}")
 sys.exit(0 if n >= 6 * 4 and not bad else 1)
 PY
-[ $? -eq 0 ] || fail "(3) KL group ($D/gr.log)"
+[ $rc -eq 0 ] || fail "(3) KL group ($D/gr.log)"
 echo "test_gscale: ok"
