@@ -14,7 +14,8 @@ release build/ beside build-verify, jit_warm first: 319 PASS, 2 NEED2 (one card)
 first mcc round (fc8e90e) pass. The one FAIL was test_predict_heads part 1: GPU vs CPU fit-field encoder, rv 9.6 plane, 1828 of
 16.7 M bytes differ, max 4. clang + nvcc stays within 2, so this is mcc's host float code (the u8 encoder), and an mcc strict build
 is byte for byte. Decision (lead, 11-15): the tolerance becomes FM_ENC_MAXD = 4 (tests/fm_tol.sh) for the rv / ink planes in
-fast-math builds; strict math stays exact. The host-math delta is a low-priority microc item.
+fast-math builds; strict math stays exact. The host-math delta is a low-priority microc item (mcc-host: most likely the lossy
+volcomp q 8 encode or the pyramid downsampling in third_party/volcomp.h, one coefficient across a rounding boundary, not predict.c).
 Disk: an mcc build-verify is ~65 GB (every binary embeds ~330 MB of uncompressed PTX vs nvcc's ~68 MB compressed SASS fatbins);
 PTX compression / one shared kernel object are in progress (mcc-gpu, testspeed).
 
