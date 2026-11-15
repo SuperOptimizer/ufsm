@@ -2025,8 +2025,15 @@ static void gf_dg_reduce(void *ctx, float *dg, int K) {
     nn_h2d(dg, hf, (size_t)K * 4); nn_free(dd); free(hf); free(hd);
 }
 static double g_echo_idle;   /* --echo-max: seconds a GPU waited for the next batch (from its step's end to the batch's handover), the "idle" share */
-static void gstep_job(void *p) { gstep_arg *a = p; { static int rs = -1; if (rs < 0) rs = getenv("UFSM_SR_REPLICA_SALT") ? ufsm_env_on("UFSM_SR_REPLICA_SALT") : 1;   /* mgpu: env */
-                                                  nn_sr_salt(rs && a->d->side < 0 ? (unsigned)a->g : 0u); } gstep_fwd(a); if (!a->rc) gstep_bwd(a); nn_tls_capture(&a->out); }
+/* the replica's stochastic-rounding salt around each of its passes (nn_sr_salt), in every schedule: the per-GPU threads (gstep_job) and the
+   main thread's phased / serial launches (UFSM_MGPU_THREADS=0, UFSM_MGPU_PHASED=0). Only the threads set it before, so under --det the
+   one-thread schedules drew GPU 1's rounding with salt 0 and their steps differed from the threaded ones from step 1 (test_univ2, sweep
+   9aa9ee0a). The main thread's own salt goes back to 0 after each pass (its other draws are the one-GPU ones) */
+static void sr_salt_of(const gstep_arg *a) { static int rs = -1; if (rs < 0) rs = getenv("UFSM_SR_REPLICA_SALT") ? ufsm_env_on("UFSM_SR_REPLICA_SALT") : 1;   /* mgpu: env */
+                                             nn_sr_salt(rs && a->d->side < 0 ? (unsigned)a->g : 0u); }
+static void gstep_fwd_s(gstep_arg *a) { sr_salt_of(a); gstep_fwd(a); nn_sr_salt(0); }
+static void gstep_bwd_s(gstep_arg *a) { sr_salt_of(a); gstep_bwd(a); nn_sr_salt(0); }
+static void gstep_job(void *p) { gstep_arg *a = p; gstep_fwd_s(a); if (!a->rc) gstep_bwd_s(a); nn_tls_capture(&a->out); }
 /* the per-GPU host threads (persistent: thread-local device scratch lives as long as they do), started on first use */
 typedef struct { pthread_t th; int dev, started, has; void (*fn)(void *); void *arg; nn_tls tls; } gworker;
 static gworker g_gw[8]; static pthread_mutex_t g_gw_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_gw_cv = PTHREAD_COND_INITIALIZER, g_gw_dcv = PTHREAD_COND_INITIALIZER;
@@ -5211,8 +5218,8 @@ int cmd_train(int argc, char **argv) {
                 gpool_wait();
                 for (int g = ng - 1; g >= 0; g--) if (norm[g]) { nn_tls_install(&ga[g].out); break; }   /* (the main thread goes on from the last GPU's op state, as one thread does: the uploads' replay draws, the optimizer) */
             }
-            else if (ng > 1 && phz) { for (int g = 0; g < ng; g++) if (norm[g]) gstep_fwd(&ga[g]); for (int g = 0; g < ng; g++) if (norm[g] && !ga[g].rc) gstep_bwd(&ga[g]); }
-            else for (int g = 0; g < ng; g++) if (norm[g]) { gstep_fwd(&ga[g]); if (!ga[g].rc) gstep_bwd(&ga[g]); }
+            else if (ng > 1 && phz) { for (int g = 0; g < ng; g++) if (norm[g]) gstep_fwd_s(&ga[g]); for (int g = 0; g < ng; g++) if (norm[g] && !ga[g].rc) gstep_bwd_s(&ga[g]); }
+            else for (int g = 0; g < ng; g++) if (norm[g]) { gstep_fwd_s(&ga[g]); if (!ga[g].rc) gstep_bwd_s(&ga[g]); }
             for (int g = 0; g < ng; g++) if (ga[g].rc) return 1;
             for (int g = 0; g < ng; g++) {
                 if (!norm[g]) continue;
