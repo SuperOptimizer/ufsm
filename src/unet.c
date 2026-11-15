@@ -2714,9 +2714,10 @@ static void tb_geom(unet *u) {
         if (ad < 0 || ad > 2) continue;
         int Np, Nu, Nv; at_ray_plane(ad, D, Hh, W, &Np, &Nu, &Nv);
         o[0] = (float)ad;
-        if (r[1] != 0.f && (np != Np * F || u->tb_axs < UNET_AXR(np))) {   /* (a valid axis whose plane count does not fit the grid used to be dropped silently) */
-            fprintf(stderr, "unet: scroll axis record of sample %d has %d planes (stride %d), the bottleneck grid needs %d x %d (planes x div %d x 2^(nlev-1)): "
-                            "the window depth must be a multiple of %d window voxels\n", b, np, u->tb_axs, Np, F, div, F); abort(); }
+        if (r[1] != 0.f && (np != Np * F || u->tb_axs < UNET_AXR(np))) {   /* the record does not describe this grid (a --split z slab or a sub-window net sees a part of the window): no axis for the sample, said once */
+            static int warned; if (!warned++) fprintf(stderr, "unet: WARNING scroll axis record of sample %d has %d planes (stride %d), the bottleneck grid needs %d x %d (planes x div %d x 2^(nlev-1)): "
+                            "the axis is NOT used for such samples (grid-index positions)\n", b, np, u->tb_axs, Np, F, div);
+            u->tb_noax++; continue; }
         if (r[1] == 0.f) { u->tb_noax++; continue; }
         o[1] = 1.f;
         for (int k = 0; k < Np; k++) {
