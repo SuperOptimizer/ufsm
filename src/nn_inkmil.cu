@@ -161,7 +161,7 @@ extern "C" int ink_mil_overflows(void) { return g_mil_ovf; }   /* tests: plane-b
 extern "C" void ink_mil_set_async(int on) { g_mil_async = on; }
 static __thread struct { unsigned *h, *d; cudaEvent_t ev; const float *dz; const inkray *rays; int D, nr, K, pend, cap; float R, step; } t_ph;
 static size_t mg_size(size_t n) { return n + n / 4 + 256; }
-static unsigned long long g_mil_peak;   /* the largest per-thread sum of the buffers (vs the planner's ink_mil_bytes) */
+static unsigned long long g_mil_peak;   /* mgpu: guarded (__atomic CAS max) the largest per-thread sum of the buffers (vs the planner's ink_mil_bytes) */
 static int mgrow(int i, size_t n) {
     if (t_ms.cap[i] >= n) return 0;
     if (t_ms.p[i]) cudaFree(t_ms.p[i]);
