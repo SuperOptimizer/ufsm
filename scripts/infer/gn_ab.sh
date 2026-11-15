@@ -11,6 +11,9 @@
 set -u
 CK=$(readlink -f "${1:?ckpt}"); T=${2:?tag}; H=$(cd "$(dirname "$0")/../.." && pwd); U=${U:-$H/build/ufsm}
 export TASKS=${TASKS:-wind rv fib ink} INKP=${INKP:-heads} WIN=${WIN:-640} HALO=${HALO:-64} WZARGS=${WZARGS-}
+# the arms' rv and fib through this binary: eval.sh's rv default (RVU, /vesuvius/ufsm/v2/rv/bin/ufsm.ev) predates train --rv 2 and refuses the
+# scratch2 checkpoint (and would not see --gn-live); fib on a latent checkpoint needs the heads path (FIBP=heads), else eval.sh skips it (try6 run 11-14)
+export RVU=${RVU:-$U} FIBP=${FIBP:-heads}
 # The labelled eval reads the wbench / GT / ink-crop labels: the desk's tree, or a pod data kit built ON the pod (scripts/pod/datakit.sh,
 # p4kit.sh: labels from dl.ash2txt). Copying desk labels to a pod (podkit_eval.sh) is against the pod rule, so on a pod without its own
 # kit (no $K/wbgt) only the probe runs: PROBE_ONLY=1, set automatically.
