@@ -251,6 +251,7 @@ run_one() {
     local pre=(); [ $PROF = 1 ] && command -v strace > /dev/null && pre=(strace -f -qq --seccomp-bpf -e trace=openat -o "$OUT/tmp/$n.strace")
     command -v stdbuf > /dev/null && pre=(stdbuf -oL -eL "${pre[@]}")   # line-buffered stdout: logs interleave stdout and stderr in order
     local t0 t1; t0=$(date +%s.%N)
+    local to=$TO es=${EST[$n]%.*}; [ "${es:-0}" -gt "$to" ] && to=$es   # a test whose EST exceeds -x gets EST as its timeout (the solo racecheck runs: measured x 1.5, sweep 11-14)
     ( export B="$BDIR" TMPDIR="$tmp" UFSM_TEST_TMP="$tmp" UFSM_SUITE_TEST="$n" UFSM_PRED_NO_AXIS=1 UFSM_NCPU=$T UFSM_FIT_THREADS=$T UFSM_TIFF_THREADS=$T \
              OMP_NUM_THREADS=$T OPENBLAS_NUM_THREADS=$T MKL_NUM_THREADS=$T
       # a test without the gpu tag sees no GPU: one that needs it fails or skips here instead of using a card without the lock (2026-11-13:
@@ -259,8 +260,8 @@ run_one() {
       [ -n "$lg" ] && export UFSM_TEST_GPUS=$lg      # (an l2 test on one card: two logical devices)
       echo $BASHPID > "$OUT/tmp/$n.pid"
       echo "# $n [${TAGS[$n]}] attempt $a gpu=${g:--} $(date '+%F %T') on $(hostname)"; echo "# $cm"
-      if [ -n "$TIMEBIN" ]; then exec $TIMEBIN -f '%e %U %S %M' -o "$OUT/tmp/$n.time" timeout -k 20 "$TO" "${pre[@]}" bash -c "$cm"
-      else TIMEFORMAT='%R %U %S 0'; { time timeout -k 20 "$TO" "${pre[@]}" bash -c "$cm" 2>&1; } 2> "$OUT/tmp/$n.time"; fi
+      if [ -n "$TIMEBIN" ]; then exec $TIMEBIN -f '%e %U %S %M' -o "$OUT/tmp/$n.time" timeout -k 20 "$to" "${pre[@]}" bash -c "$cm"
+      else TIMEFORMAT='%R %U %S 0'; { time timeout -k 20 "$to" "${pre[@]}" bash -c "$cm" 2>&1; } 2> "$OUT/tmp/$n.time"; fi
     ) > "$log.$a" 2>&1 < /dev/null
     rc=$?; t1=$(date +%s.%N)
     read -r wall us sy rss < <(tail -n1 "$OUT/tmp/$n.time" 2> /dev/null); [[ ${wall:-x} =~ ^[0-9.]+$ ]] || { wall=$(awk -v a="$t0" -v b="$t1" 'BEGIN {printf "%.2f", b - a}'); us=0; sy=0; rss=0; }
