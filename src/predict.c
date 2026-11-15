@@ -2750,6 +2750,10 @@ static int predict_one(int argc, char **argv) {
     int64_t cur_shard = -1, so[3] = {0, 0, 0}, se[3] = {0, 0, 0}, sz = 0, sy = 0, sx = 0;
     int any = 0;
     const int pprof = ufsm_env_on("UFSM_PRED_PROF");
+    FILE *ctdump = nullptr; uint8_t *ctdump_h = nullptr;   /* UFSM_PRED_CTDUMP (see the window loop) */
+    if (getenv("UFSM_PRED_CTDUMP") && *getenv("UFSM_PRED_CTDUMP") && gpath) {
+        if (!(ctdump = fopen(getenv("UFSM_PRED_CTDUMP"), "wb")) || !(ctdump_h = malloc(w3))) { fprintf(stderr, "predict: UFSM_PRED_CTDUMP: cannot open %s\n", getenv("UFSM_PRED_CTDUMP")); return 1; }
+    }
     double p_wait = 0, p_h2d = 0, p_gpu = 0, p_copy = 0, p_wr = 0, p_ffw = 0, pt, lv_up = 0; int lv_fb = 0; long lv_nfb = 0;   /* lv_fb: this window came as voxels (the reader's fallback) */
     /* the next window's CT uploaded on the copy stream during this window's forward (into ctpre, w3 bytes; at the window's start one
        device copy into ctd): the synchronous upload left the GPU idle ~9 ms per 384 x 640^2 window. Not with --aug-* (degrade rewrites
@@ -2845,6 +2849,10 @@ static int predict_one(int argc, char **argv) {
                     nn_pred_stats_finish(&nz, &sum, &sq); stats_pending = 0;
                     if (lvc) sq += (double)lvc->drop_ms * (double)nz;   /* (a latvol CT decoded by z3_read: the rebuilt bytes' variance lacks the dropped axes, as below) */
                 }
+                /* UFSM_PRED_CTDUMP=FILE (tests): every CT window as the net sees it, appended in window order (Wz x W x W bytes each), so the
+                   device-read windows can be compared with the host reader's at the CT, where a fast-math GPU decoder's +-1 is visible as
+                   such (at the output, per-window GroupNorm and fp4 activations spread one changed voxel over the window: test_predict_heads 1d) */
+                if (ctdump) { nn_d2h(ctdump_h, ctd, w3); if (fwrite(ctdump_h, 1, w3, ctdump) != w3) { fprintf(stderr, "\npredict: UFSM_PRED_CTDUMP write failed\n"); return 1; } }
                 /* the slot is free only now: nn_d2d (cudaMemcpy device to device) does not wait on the host, and since the statistics' copy is
                    asynchronous (nn_pred_stats_start) nothing between the d2d and this point synchronised the stream; signalled before the
                    finish, the reader refilled rd.dbuf[k] under the pending copy and the window ran on the next window's CT (test_predict_det
@@ -3316,6 +3324,7 @@ static int predict_one(int argc, char **argv) {
                  if (pprof) fprintf(stderr, "predict profile (s): prefetch: %ld chunks fetched ahead of the reader in %.2f s (%d windows ahead, %d threads)%s\n", PF.nfetch, PF.t_fetch, PF.ahead, PF.nt, atomic_load(&PF.bad) ? ", some failed (the reader fetched them)" : ""); }
     pthread_join(rth, nullptr);
     for (int k = 0; k < NSLOT; k++) { if (gpath) nn_host_free(rd.buf[k]); else free(rd.buf[k]); }
+    if (ctdump) { fclose(ctdump); free(ctdump_h); }
     for (int k = 0; k < NSLOT; k++) if (rd.dbuf[k]) nn_free(rd.dbuf[k]);
     for (int t = 0; t < rd.nctw; t++) nn_ctw_free(rd.ctw[t]);
     free(rd.ctw);
