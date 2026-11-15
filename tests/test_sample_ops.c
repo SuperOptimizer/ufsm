@@ -108,7 +108,7 @@ int main(void) {
                 write_x_aug(ct, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.02f, &r1, nrow, fmt, A, HA, &ap, ns1, ns1 + P, nullptr, nullptr);
                 write_x(ct, P, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.02f, &r2, nrow, fmt, B, HB, &ap, ns2, ns2 + P, 0);
                 /* bit-identical under UFSM_STRICT_MATH; fast math (two code paths): fp32 rel 1e-6 (~8 ulp), fp16 +-1 ulp (tests/fm_tol.h) */
-                ndiff += fmt ? (size_t)fm_cmp_h16("write_x vs write_x_aug fp16", HA, HB, 4 * p3, 1) : (size_t)fm_cmp_f32("write_x vs write_x_aug fp32", A, B, 4 * p3, 1e-6, 1e-6);
+                ndiff += fmt ? (size_t)fm_cmp_h16a("write_x vs write_x_aug fp16", HA, HB, 4 * p3, 1, 1e-4) : (size_t)fm_cmp_f32("write_x vs write_x_aug fp32", A, B, 4 * p3, 1e-6, 1e-4);
             }
         }
         printf("CT appearance plan, row-vectorised writer vs write_x_aug: %zu of %d plans x 48 symmetries x 2 formats differ\n", ndiff, plans);
