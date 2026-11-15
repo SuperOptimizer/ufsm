@@ -44,8 +44,17 @@ void i3_blend(float *acc, float *wsum, int R, int TY, int TX, const float *logit
 enum { I3_HBINS = 66 };
 void i3_emit(float *acc, float *wsum, int R, int TY, int TX, int z0, int z1, uint8_t *out48, uint8_t *out96, unsigned long long *hist);
 
+/* the fast path (--fast): level-1 slab [Z][Y][X] on the device (Z = T + 64, Y, X multiples of 16), block histograms [Z/16][Y/16][X/16][256];
+   crops of T^3 by their parent's (y, x) in the slab (multiples of 16; parent z = the slab): max of the crop region, and the fp16 network
+   input [n][T^3] after the parent's p1 / p99 lut (lohi: the limits, optional) */
+void i3f_bhist(const uint8_t *slab, int Z, int Y, int X, uint32_t *hist);
+void i3f_cmax(const uint8_t *slab, int Y, int X, int T, const int *pyx_dev, int n, int *cmax_dev);
+void i3f_crops(const uint8_t *slab, int Y, int X, int T, const uint32_t *hist, const int *pyx_dev, int n, void *out_half, float *lohi_dev);
 /* the network (src/ink3dext_net.c) */
 typedef struct gb_net gb_net;
+/* the network on a prepared fp16 input [B][net_in^3] (an xmalloc_dev buffer, consumed) */
+int gb_forward_x(gb_net *n, void *x_half_dev, int B, const float **logits_dev);
+void gb_set_tile(gb_net *n, int T);   /* --tile: the network input / output edge (the net is fully convolutional) */
 gb_net *gb_load(const char *weights, const char *model, i3_geom *g);   /* model gambiarra | dino3d; nullptr on failure (message printed); needs xnet_init first */
 void gb_free(gb_net *n);
 /* B crops (u8 [B][crop^3] and lut [B][256] on the device) -> logits fp32 [B][out^3] on the device (owned by the net, valid until the

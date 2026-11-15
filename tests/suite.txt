@@ -192,6 +192,7 @@ test_dino_pts                                  |              |     1 | ./$B/tes
 test_ink_splat                                 | gpu          |    10 | ./$B/test_ink_splat
 test_ink_pool                                  |              |     3 | ./$B/test_ink_pool $TMPDIR/ink_pool
 test_ink_mil                                   | gpu          |     2 | ./$B/test_ink_mil
+test_xmx                                       | gpu          |     3 | ./$B/test_xmx
 test_grad_ar                                   | gpu          |     8 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
 test_grad_ar~2gpu                              | gpu2         |     8 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
 test_sumsq                                     | gpu          |     4 | ./$B/test_sumsq

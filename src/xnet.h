@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-typedef struct { void *p; int n, d, h, w, c; } xt;            /* fp16 NDHWC; p == nullptr: empty */
+typedef struct { void *p; int n, d, h, w, c; void *q; } xt;   /* fp16 NDHWC; p == nullptr: empty. q: its MX-fp4 copy (UFSM_XNET_MX; conv_mx layout) or nullptr */
 static inline size_t xt_numel(xt t) { return (size_t)t.n * t.d * t.h * t.w * t.c; }
 
 int xnet_init(int gpu);                 /* select the device, create the stream; 0 on success */
@@ -26,6 +26,7 @@ void xnet_bind(void);                   /* make the xnet_init device current on 
 void *xnet_stream(void);                /* the cudaStream_t of every xnet call */
 void xnet_sync(void);
 int xnet_check(const char *where);      /* 0, or prints the pending CUDA error and returns -1 */
+void xnet_seq_reset(void);           /* a new forward: conv sequence numbers restart at 0 (UFSM_XNET_FQ_MASK) */
 double xnet_macs(void);                 /* multiply-adds issued by the convolutions so far (UFSM_XNET_VERBOSE=1: each conv's shape) */
 size_t xnet_mem_cached(void);           /* bytes held by the cache (free blocks) */
 size_t xnet_mem_used(void);             /* bytes handed out */
@@ -52,6 +53,9 @@ typedef struct {
     void *w; float *scale, *bias;                        /* device: fp16 [Cop][Kp]; fp32 [co] */
     int tconv;                                           /* ConvTranspose k2 s2: GEMM to 4 (2D; tconv 1) or 8 (3D; tconv 2) co channels, shuffled */
     float *tbias;                                        /* the transposed conv's bias [co] */
+    void *mxq, *mxs, *mxs2; float *mxgs; int mxsf, nch;         /* UFSM_XNET_MX (ci % 32 == 0): packed fp4 weights [Cop][Kp / 2], scales [Cop][Kp / 32][4] (two 16-K
+                                                            blocks per 32-K chunk, bytes 2..3 unused), the per-row fp32 scale (ue4m3 format), the scale format (6 ue8m0,
+                                                            5 ue4m3), nch = 32-K chunks of K (the GEMM runs on the MX-fp4 tensor cores, inputs quantised on the fly) */
 } xconv;
 
 /* w: PyTorch Conv weight [co][ci][kd][kh][kw] (fp32 host); scale / bias: per output channel (nullptr: 1 / 0). 0 on success. */
@@ -62,6 +66,22 @@ int xtconv_init(xconv *c, const float *w, int ci, int co, const float *bias);
 /* ConvTranspose3d(ci, co, 2, stride 2), w [ci][co][2][2][2], bias [co] or nullptr */
 int xtconv3_init(xconv *c, const float *w, int ci, int co, const float *bias);
 void xconv_free(xconv *c);
+void xnet_set_mx(int sf);
+int xnet_mx(void);                      /* the MX format of convs initialised now (0: fp16) */
+/* the fused MX inference path (ink3d-ext): a conv that also returns the InstanceNorm sums of its output (st: device doubles [n][co][2]:
+   sum, sum of squares; free with xfree_dev), the per-(sample, channel) affine of IN (coef [n][C][2]: a = gamma rstd, b = beta - mean a),
+   and the apply y = act(a x + b (+ a_r r + b_r | + r)) writing y over h's fp16 (want_half) and / or its MX copy (want_q). */
+xt xconv_fwd_st(const xconv *c, xt x, double **st);
+float *xin_coef(const double *st, int n, int C, long long S, const float *gamma, const float *beta, float eps);
+void xin_apply(xt *h, const float *coef, const xt *res, const float *rcoef, int act, int want_half, int want_q);
+int xq_ensure(xt *x);
+/* the fused one-channel stem: act(IN(conv3x3x3_{1->32}(x) + b)) (+ IN(1x1 conv wsk of x) when wsk_dev: gambiarra's first block without its
+   second conv's apply), never storing the conv output: two passes (sums, then apply). w_dev [32][27] fp32, x one channel. fp16 y and / or MX copy */
+xt xstem1(xt x, const float *w_dev, const float *b_dev, const float *gamma, const float *beta, float eps, const float *wsk_dev, const float *gsk, const float *bsk,
+          float **rcoef, int act, int want_half, int want_q);   /* rcoef (with wsk_dev): the residual IN(1x1 conv of x) as per-(n, c) affine of x, for xin_apply with the one-channel x */
+int xin_head(xt *h, const float *coef, int act, const float *hw_dev, float hb, float *out_dev);   /* the last apply fused with a 1x1 one-channel head (fp32 logits); -1: unsupported width */                   /* x->q from x->p (MX format of xnet_mx()); 0 on success */
+xt xconcat_q(xt a, xt b);
+xt xtconv_cat_q(const xconv *up, xt lo, xt skip);   /* the decoder input: ConvTranspose3d(lo) (MX GEMM, shuffled + quantised in its epilogue) ++ skip, MX only */              /* channel concat of the MX copies (a.q, b.q) only: the result has q and no fp16 p */               /* convs initialised from now on: 0 fp16, 6 / 5 MX-fp4 (ue8m0 / ue4m3 scales; default: env UFSM_XNET_MX) */
 /* y = act(conv(x) * scale + bias (+ res)); allocates y. res (optional) has y's shape. */
 xt xconv_fwd(const xconv *c, xt x, const xt *res, int act);
 /* y = act(LN_c(conv(x) scale + bias) lnw + lnb (+ res)) with the LayerNorm in the conv epilogue (co 32 or 64; the default tile config) */

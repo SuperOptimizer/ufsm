@@ -117,3 +117,76 @@ extern "C" void i3_emit(float *acc, float *wsum, int R, int TY, int TX, int z0, 
         z += n2;
     }
 }
+
+/* ---- the fast path (ink3d-ext --fast, gambiarra): level-1 input on a crop grid aligned to 16 level-1 voxels; a crop of T^3 (64: the
+   published geometry; 128: larger tiles) has the parent [a - 32, a + T + 32)^3, exactly ((T + 64) / 16)^3 blocks of 16^3, so its p1 / p99
+   histogram is a sum of block histograms computed once per slab; percentiles, the lut, the crop gather and the fp16 input on the GPU ---- */
+__global__ void k_i3f_bhist(const uint8_t *slab, int Y, int X, uint32_t *hist) {   /* grid (X / 16, Y / 16, Z / 16), 256 threads */
+    __shared__ uint32_t h[256];
+    h[threadIdx.x] = 0; __syncthreads();
+    const int bx = blockIdx.x, by = blockIdx.y, bz = blockIdx.z;
+    for (int i = threadIdx.x; i < 16 * 16 * 4; i += 256) {   /* 4-byte words */
+        const int xw = i & 3, y = (i >> 2) & 15, z = i >> 6;
+        const uint32_t w = *(const uint32_t *)(slab + ((size_t)(bz * 16 + z) * Y + by * 16 + y) * X + bx * 16 + xw * 4);
+        atomicAdd(&h[w & 255], 1u); atomicAdd(&h[(w >> 8) & 255], 1u); atomicAdd(&h[(w >> 16) & 255], 1u); atomicAdd(&h[w >> 24], 1u);
+    }
+    __syncthreads();
+    hist[(((size_t)bz * gridDim.y + by) * gridDim.x + bx) * 256 + threadIdx.x] = h[threadIdx.x];
+}
+extern "C" void i3f_bhist(const uint8_t *slab, int Z, int Y, int X, uint32_t *hist) {
+    k_i3f_bhist<<<dim3(X / 16, Y / 16, Z / 16), 256, 0, ST>>>(slab, Y, X, hist);
+}
+__global__ void k_i3f_cmax(const uint8_t *slab, int Y, int X, int T, const int *pyx, int *cmax) {   /* grid crops: max of the crop [32, 32 + T)^3 of its parent */
+    __shared__ int m; if (!threadIdx.x) m = 0; __syncthreads();
+    const int py = pyx[2 * blockIdx.x], px = pyx[2 * blockIdx.x + 1], TW = T / 4; uint32_t mx = 0;
+    for (int i = threadIdx.x; i < T * T * TW; i += 256) {
+        const int xw = i % TW, y = (i / TW) % T, z = i / (TW * T);
+        const uint32_t w = *(const uint32_t *)(slab + ((size_t)(32 + z) * Y + py + 32 + y) * X + px + 32 + xw * 4);
+        mx = max(mx, max(max(w & 255, (w >> 8) & 255), max((w >> 16) & 255, w >> 24)));
+    }
+    atomicMax(&m, (int)mx); __syncthreads();
+    if (!threadIdx.x) cmax[blockIdx.x] = m;
+}
+extern "C" void i3f_cmax(const uint8_t *slab, int Y, int X, int T, const int *pyx_dev, int n, int *cmax_dev) {
+    if (n > 0) k_i3f_cmax<<<n, 256, 0, ST>>>(slab, Y, X, T, pyx_dev, cmax_dev);
+}
+__global__ void k_i3f_crops(const uint8_t *slab, int Y, int X, int T, const uint32_t *hist, int NBY, int NBX, const int *pyx, __half *out, float *lohi) {
+    __shared__ uint32_t cum[256]; __shared__ float lut[256]; __shared__ double plo, phi;
+    const int py = pyx[2 * blockIdx.x], px = pyx[2 * blockIdx.x + 1], by0 = py / 16, bx0 = px / 16, t = threadIdx.x, NB = (T + 64) / 16;
+    uint32_t s = 0;
+    for (int bz = 0; bz < NB; bz++) for (int by = 0; by < NB; by++) for (int bx = 0; bx < NB; bx++) s += hist[(((size_t)bz * NBY + by0 + by) * NBX + bx0 + bx) * 256 + t];
+    cum[t] = s; __syncthreads();
+    for (int o = 1; o < 256; o <<= 1) { const uint32_t v = t >= o ? cum[t - o] : 0; __syncthreads(); cum[t] += v; __syncthreads(); }
+    if (t == 0) {   /* i3_percentiles: np.percentile (linear) of the n = (T + 64)^3 values */
+        const uint64_t n = (uint64_t)(T + 64) * (T + 64) * (T + 64); const double q[2] = {1.0 / 100.0, 99.0 / 100.0}; double r[2];
+        for (int k = 0; k < 2; k++) {
+            const double virt = (double)(n - 1) * q[k], below = floor(virt), tt = virt - below;
+            uint64_t ia = (uint64_t)below, ib = ia + 1; if (ib > n - 1) ib = n - 1;
+            int a = -1, b = -1;
+            for (int v = 0; v < 256 && b < 0; v++) { if (a < 0 && cum[v] > ia) a = v; if (cum[v] > ib) b = v; }
+            if (a < 0) a = 255; if (b < 0) b = 255;
+            const double fa = a, fb = b, diff = fb - fa;
+            r[k] = tt >= 0.5 ? fb - diff * (1.0 - tt) : fa + diff * tt;
+        }
+        plo = r[0]; phi = r[1];
+        if (lohi) { lohi[2 * blockIdx.x] = (float)r[0]; lohi[2 * blockIdx.x + 1] = (float)r[1]; }
+    }
+    __syncthreads();
+    {   /* i3_lut */
+        const double lo = plo, hi = phi; float x;
+        if (hi - lo < 1e-6) x = 0.f;
+        else { const double c = t < lo ? lo : t > hi ? hi : (double)t; x = (float)c; x = (float)((double)x - lo); x = (float)((double)x / (hi - lo)); }
+        lut[t] = x;
+    }
+    __syncthreads();
+    __half *o = out + (size_t)blockIdx.x * T * T * T; const int TW = T / 4;
+    for (int i = t; i < T * T * TW; i += 256) {
+        const int xw = i % TW, y = (i / TW) % T, z = i / (TW * T);
+        const uint32_t w = *(const uint32_t *)(slab + ((size_t)(32 + z) * Y + py + 32 + y) * X + px + 32 + xw * 4);
+        __align__(8) __half h4[4] = {__float2half_rn(lut[w & 255]), __float2half_rn(lut[(w >> 8) & 255]), __float2half_rn(lut[(w >> 16) & 255]), __float2half_rn(lut[w >> 24])};
+        *(uint2 *)(o + ((size_t)z * T + y) * T + xw * 4) = *(const uint2 *)h4;
+    }
+}
+extern "C" void i3f_crops(const uint8_t *slab, int Y, int X, int T, const uint32_t *hist, const int *pyx_dev, int n, void *out_half, float *lohi_dev) {
+    if (n > 0) k_i3f_crops<<<n, 256, 0, ST>>>(slab, Y, X, T, hist, Y / 16, X / 16, pyx_dev, (__half *)out_half, lohi_dev);
+}
