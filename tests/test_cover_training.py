@@ -9,7 +9,11 @@ import tempfile
 
 
 def gpu_count():
-    """GPUs nvidia-smi lists (the split-z half needs two)"""
+    """GPUs this process can use (the split-z half needs two): CUDA_VISIBLE_DEVICES when set (run_suite -g 1 sets it to one card while
+    nvidia-smi still lists both: the split ran --gpus 0,1 and died "cannot select GPU 1", 11-15), else what nvidia-smi lists"""
+    vis = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if vis is not None:
+        return len([d for d in vis.split(',') if d.strip()])
     try:
         lines = subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True).stdout.splitlines()
         return sum(line.startswith('GPU ') for line in lines)
@@ -40,8 +44,9 @@ with tempfile.TemporaryDirectory(prefix='ufsm-cover-cli-') as tmp:
             '--levels', '1', '--log-every', '1', '--ckpt-every', '1', '--val-every', '10',
             '--down-norm', '1', '--zfix', '1', '--symmetry-p', '.5', '--ct-aug', '1', '--soft', '3',
             '--opt', 'muon', '--input-prec', '8', '--gn-stats', 'stored']
-    for mode, gpu in [('single', os.environ.get('UFSM_TEST_GPU', '0')), ('split', '0,1')]:
-        if mode == 'split' and (os.environ.get('UFSM_TEST_SINGLE_ONLY') or gpu_count() < 2):
+    for mode, gpu in [('single', os.environ.get('UFSM_TEST_GPU', '0')), ('split', os.environ.get('UFSM_TEST_GPUS', '0,1'))]:
+        # (one card, l2: run_suite exports UFSM_TEST_GPUS=0,0, two logical devices on it)
+        if mode == 'split' and (os.environ.get('UFSM_TEST_SINGLE_ONLY') or (gpu_count() < 2 and gpu != '0,0')):
             print('PARTIAL: test_cover_training: the --split z mode did not run (one GPU or UFSM_TEST_SINGLE_ONLY)', flush=True)
             continue
         command = base + ['--gpus', gpu] + (['--split', 'z'] if mode == 'split' else [])
