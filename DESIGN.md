@@ -6,6 +6,36 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fast-math round: the last four fast-tier failures (2026-11-15, branch fmfix-20261115, off fastmath-20261114)
+
+The fm integration (mega-audit 087325a0 + fastmath 9561823b, desk) left four fast-tier failures. Each checked against the master
+fcfbb0b7 build and a `-DUFSM_STRICT_MATH=ON` build of the same tree:
+
+- **test_predict_heads (1d), device-read CT**: 16 % of the rv bytes differ (max 123), always the same two of the eight 160^3
+  windows. Not a race or an indexing bug: master 5 of 5 and strict 2 of 2 byte-identical, fm deterministic (3 runs equal), and
+  `UFSM_PRED_DEVREAD_GPU=0` (every chunk decoded on the CPU, then uploaded and gathered into the same device windows)
+  byte-identical to the host reader. The cause is the fast-math GPU decoder: its IDCT rounds apart from the host's by +-1 on 92 of
+  16.7 M voxels (`ufsm read` with UFSM_GPU_DECODE=1 against 0; 140 of 32.8 M in the dumped windows). In the 3-step fixture net,
+  per-window GroupNorm and fp4 activations spread one changed input voxel over its whole window (up to 52 codes), and which windows
+  are affected depends on the window's z-score: with `--norm 42,52` three other windows differ. A 2e-5 change of the z-score alone
+  changes nothing (`--norm 42,52.001`: 0 bytes), because the 8-bit input quantiser absorbs it. So the outputs of the GPU-decoded runs
+  cannot be compared under fast math. (1d) now compares the CT windows the net saw (`UFSM_PRED_CTDUMP=FILE`, every window in order:
+  within 1 on 1e-4 of the voxels) and the outputs of a `UFSM_PRED_DEVREAD_GPU=0` run byte for byte. Under strict, everything is
+  still compared byte for byte.
+- **test_heads part 0**: no NaN, no layout bug, and not fast math. `tests/heads_ref.txt` dated from 11-11. The strict build (which
+  repeats itself run to run) and the master build also log 0 of 4 layouts equal. fibn's 5768 against 5488 supervised voxels is the
+  same in the strict and fm builds (b93713bc's fibre-normal halo stopped dropping seam voxels), and gn at step 1 moved with
+  870900d2's head-gradient scale. The 7 reference lines were rewritten by the strict build: strict matches exactly
+  (4 + 2 + 1 layouts), and fm is within the per-step tolerances.
+- **test_spatial_augment parts 0 / 1**: real rounding, plus a test bug. The CT channel's fast-math error is absolute. Both writers
+  pull the source coordinate through the same float terms in a different order, so a coordinate can move by a couple of fp32 ulps
+  of P, and trilinear interpolation multiplies that by the steepest corner difference (up to the span of the CT value table). The
+  measured result is 2 fp16 ulps at |x| 0.06-0.12, |d| <= 1.2e-4 at P 128. The bound is now `warp_tol` =
+  6 x gain x span x P 2^-23 + 1e-5 (2 ulps of P per axis, 3 axes): 7.7e-4 to 8.3e-4 at P 128 (depending on the plan's span),
+  1.5e-3 to 1.6e-3 at P 256, 3.3e-3 at P 512. No element exceeds it in the full tier, and a wrong corner or LUT entry moves a value
+  by about 0.8. Part 1's failures were all bf16 (fmt 2) configurations: ws_cmp decoded
+  bf16 bits as fp16, so its absolute check was meaningless there. It now decodes each format as itself.
+
 ## Stride-2 fp4 forward (conv_fwd_s2_f4p_k): tap rows as kz x ky (2026-11-15, branch s2f4p-20261115)
 
 The tap-row loop ran "#pragma unroll 3" over tr = 0..8 with kz = tr / 3, ky = tr % 3 and the input slot ((2 oz0 + 2 wz + kz) % NP).

@@ -11,9 +11,12 @@
 #      fib/H equals the old single-channel path (the pool4 chain in fp32) within one code on 1 % (the heads path rounds the upsampled logit
 #      to fp16 as the slab path does: 0.64 % of the fixture's bytes land across a code boundary)
 #  Fast math (the default build, DESIGN 2026-11-14): (1c) compares the GPU and CPU encoders' stores by what they decode to (within 2 on
-#  1 % of the bytes: a quantised level near a .5 boundary can come out 1 apart), (1d) the device-read runs within one code on 0.2 % (the
-#  GPU and host IDCTs differ by +-1 on rare CT voxels). Under -DUFSM_STRICT_MATH=ON (strict_math = 1 beside the ufsm binary): byte for
-#  byte as before.
+#  1 % of the bytes: a quantised level near a .5 boundary can come out 1 apart). (1d) compares the CT windows the net saw
+#  (UFSM_PRED_CTDUMP), within 1 on 1e-4 of the voxels: the GPU and host IDCTs round apart by +-1 on rare voxels (the fixture: 92 of
+#  16.7 M). Not the outputs: per-window GroupNorm and fp4 activations spread one changed input voxel over its whole window (fm round
+#  11-15: 2 of 8 windows, 16 % of the bytes, up to 123 codes, deterministic). The device windows themselves are checked byte for byte at
+#  the output by a run whose chunks all decode on the CPU (UFSM_PRED_DEVREAD_GPU=0). Under -DUFSM_STRICT_MATH=ON (strict_math = 1
+#  beside the ufsm binary): every comparison byte for byte as before.
 # Usage: test_predict_heads.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
 . "$(dirname "$0")/test_part.sh"   # UFSM_TEST_PART=K/3: (1) | (1b) (1c) | (1d) (2) (3); each part trains net (1) and its --heads all run first
@@ -39,10 +42,21 @@ cmpenc() {
   if [ "$STRICT" = 1 ]; then [ "$(cd "$1" && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" = "$(cd "$2" && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" ]
   else for n in rv ink; do cmpb "$1/$n" "$2/$n" 0.01 2 || return 1; done; fi
 }
-DEVTOL=0.002; [ "$STRICT" = 1 ] && DEVTOL=0
+# ctcmp A B: two UFSM_PRED_CTDUMP files (the windows in order): equal under strict, else within 1 on 1e-4 of the voxels
+ctcmp() {
+  python3 -I - "$1" "$2" "$STRICT" <<'PY'
+import sys, numpy as np
+a = np.fromfile(sys.argv[1], np.uint8).astype(int); b = np.fromfile(sys.argv[2], np.uint8).astype(int)
+if a.size != b.size or a.size == 0: print(f"  CT windows {sys.argv[1]} vs {sys.argv[2]}: sizes {a.size} / {b.size}"); sys.exit(1)
+d = np.abs(a - b); n = np.count_nonzero(d)
+print(f"  CT windows {sys.argv[1]} vs {sys.argv[2]}: {n} of {d.size} voxels differ, max {d.max()}, {np.count_nonzero(a)} nonzero")
+sys.exit(0 if (n == 0 if sys.argv[3] == "1" else d.max() <= 1 and n <= 1e-4 * d.size) and np.count_nonzero(a) > d.size // 8 else 1)
+PY
+}
 # (1) sub-cell head, fine stem, rv 2, ink
 "$U" train fx/sources-ink.json --out s "${C[@]}" --lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --ink-head 1 --fstem 16 > s.log 2>&1 || fail "train (1) ($D/s.log)"
-"$U" predict s/last.ckpt fx ct h "${P[@]}" --heads all > h.log 2>&1 || fail "predict --heads all ($D/h.log)"
+HCT=; part 2 && HCT=h.ct   # (the host reader's CT windows for (1d))
+UFSM_PRED_CTDUMP=$HCT "$U" predict s/last.ckpt fx ct h "${P[@]}" --heads all > h.log 2>&1 || fail "predict --heads all ($D/h.log)"
 grep -q 'predict: 2 heads from one trunk pass: rv (ch 1[0-9]+1[0-9] stem) ink (ch 1[0-9] stem)' h.log || fail "heads line ($D/h.log)"
 for n in rv ink; do [ -e h/$n/9.6/zarr.json ] && [ -e h/$n/zarr.json ] || fail "store h/$n"; done
 if part 0; then   # the rest of (1)
@@ -104,13 +118,20 @@ fi
 if part 2; then   # (1d), (2), (3)
 # (1d) the CT windows decoded on the GPU into device memory (UFSM_PRED_DEVREAD): the same stores as the host reader's (windows over the
 #      array's edges: fill), and the chunks went through the GPU
-UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dv "${P[@]}" --heads rv,ink > dv.log 2>&1 || fail "predict UFSM_PRED_DEVREAD ($D/dv.log)"
+UFSM_PRED_CTDUMP=dv.ct UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dv "${P[@]}" --heads rv,ink > dv.log 2>&1 || fail "predict UFSM_PRED_DEVREAD ($D/dv.log)"
 if grep -q 'gpudec: out of memory' dv.log; then echo "SKIP devread: no device memory (gpudec out of memory on a shared GPU: the host path ran, the device-read check did not; the suite reports the test SKIP)"
 else grep -q 'CT windows decoded into device memory' dv.log && grep -Eq 'device CT windows: [1-9][0-9]* chunks all on the GPU' dv.log || fail "device read not used ($D/dv.log)"; fi
-for n in rv ink; do cmpb h/$n dv/$n $DEVTOL || fail "$n: the device-read run differs from the host reader's"; done
-UFSM_GPU_DECODE_ITEMS=4 UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dvh "${P[@]}" --heads rv > dvh.log 2>&1 || fail "predict UFSM_PRED_DEVREAD, CPU fallbacks ($D/dvh.log)"
+ctcmp h.ct dv.ct || fail "the device-read CT windows differ from the host reader's"
+if [ "$STRICT" = 1 ]; then for n in rv ink; do cmpb h/$n dv/$n 0 || fail "$n: the device-read run differs from the host reader's"; done
+else   # the device windows (assembly, edges, fill) byte for byte at the output: every chunk decoded on the CPU, uploaded, gathered
+  UFSM_PRED_DEVREAD_GPU=0 UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dc "${P[@]}" --heads rv,ink > dc.log 2>&1 || fail "predict UFSM_PRED_DEVREAD, CPU chunks ($D/dc.log)"
+  grep -Eq 'device CT windows: 0 chunks all on the GPU, [1-9][0-9]* with host substreams' dc.log || fail "device read with CPU chunks not used ($D/dc.log)"
+  for n in rv ink; do cmpb h/$n dc/$n 0 || fail "$n: the device-read run (CPU chunks) differs from the host reader's"; done
+fi
+UFSM_PRED_CTDUMP=dvh.ct UFSM_GPU_DECODE_ITEMS=4 UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dvh "${P[@]}" --heads rv > dvh.log 2>&1 || fail "predict UFSM_PRED_DEVREAD, CPU fallbacks ($D/dvh.log)"
 grep -Eq 'device CT windows: 0 chunks all on the GPU, [1-9][0-9]* with host substreams' dvh.log || fail "device read: the host fallback not taken ($D/dvh.log)"
-cmpb h/rv dvh/rv $DEVTOL || fail "rv: the device-read run with CPU-decoded chunks differs"
+ctcmp h.ct dvh.ct || fail "the device-read CT windows with CPU-decoded substreams differ"
+[ "$STRICT" = 1 ] && { cmpb h/rv dvh/rv 0 || fail "rv: the device-read run with CPU-decoded substreams differs"; }
 # audit 11-14 infer #4 / #6 / #2 / #9: the training state released (same bytes as keeping it), --heads --resume (per-head done logs; a rerun
 # computes nothing and leaves the stores unchanged), --gn-live refused on a net without running statistics, the provenance attributes
 UFSM_PRED_TRAINSTATE=1 "$U" predict s/last.ckpt fx ct ts "${P[@]}" --heads all > ts.log 2>&1 || fail "predict UFSM_PRED_TRAINSTATE=1 ($D/ts.log)"
