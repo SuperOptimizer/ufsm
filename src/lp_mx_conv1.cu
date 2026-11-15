@@ -267,6 +267,11 @@ extern "C" void nn_set_conv1_const(int on) { g_c1c = on; }
 static int conv1_const(const void *x, int xdt, shape5 xs, const float *w, const float *b, int nc, __half *y, gnp_t gp, size_t vb, size_t Sy, int cy) {
     if (g_c1c < 0) g_c1c = !getenv("UFSM_CONV1_CONST") || atoi(getenv("UFSM_CONV1_CONST"));
     if (!g_c1c || xdt != 4 || xs.n != 1 || gp.ns || (xs.c != 16 && xs.c != 32) || mx_nb(xs.c) != 1) return 0;
+    /* c1c_w is one constant bank per CUDA context, i.e. per PHYSICAL card: with logical devices sharing a card (train --gpus 0,0,
+       ufsm_dev.cuh) the replicas' threads overwrite each other's head weights between the copy and the kernel (a head of > 16 outputs
+       copies a different 16-row slice per pass): the threaded data-parallel step's loss differed from the one-thread schedules' and
+       from a serialised run from step 1 (test_univ2 / test_serialize on the pod, full4). Shared card: the weights-by-pointer path */
+    { int dv = 0; cudaGetDevice(&dv); if (ufsm_dev_share(dv) > 1) return 0; }
 #define C1C(CI) do { switch (nc) { case 1: conv1_mx_c<CI, 1>(x, xs, w, b, y, gp, vb, Sy, cy); return 1; case 2: conv1_mx_c<CI, 2>(x, xs, w, b, y, gp, vb, Sy, cy); return 1; \
                                    case 4: conv1_mx_c<CI, 4>(x, xs, w, b, y, gp, vb, Sy, cy); return 1; case 11: conv1_mx_c<CI, 11>(x, xs, w, b, y, gp, vb, Sy, cy); return 1; \
                                    case 16: conv1_mx_c<CI, 16>(x, xs, w, b, y, gp, vb, Sy, cy); return 1; default: return 0; } } while (0)
