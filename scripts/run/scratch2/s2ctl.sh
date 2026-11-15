@@ -8,7 +8,7 @@
 #   S2CTL_OWNER=<agent> bash s2ctl.sh hold   "<reason>" -- CMD ...  stop, run CMD with the GPUs free (A/Bs, checks), resume unchanged
 #   S2CTL_OWNER=<agent> bash s2ctl.sh fresh NEWENV ARCHIVE "<reason>" stop, dry-start NEWENV from scratch, archive runs/scratch2 to runs/ARCHIVE, launch fresh
 #   S2CTL_OWNER=<agent> bash s2ctl.sh replay OLDBIN NEWBIN [N]   stop; OLD, OLD, NEW at lr 0 --det 1 from last.ckpt for N windows; compare losses; resume
-#   S2CTL_OWNER=<agent> bash s2ctl.sh parse ENV                    every flag of ENV's launch argv parses (UFSM_MEM_DRY=1, no training)
+#   S2CTL_OWNER=<agent> bash s2ctl.sh parse ENV                    every flag of ENV's launch argv parses + the memory plan fits with PMARGIN (0.5) GB (UFSM_MEM_DRY=1)
 #   S2CTL_OWNER=<agent> bash s2ctl.sh audit ENV [N]                 held-out leak audit (sampler only, no GPU) with ENV's exact args; gate 0 leaked voxels
 #   S2CTL_OWNER=<agent> bash s2ctl.sh drystart                    with the run stopped: the exact launch for 2 windows (also automatic in resume when launch.env changed)
 #   bash s2ctl.sh sync                                              regenerate scratch2.gates/settings from launch.env
@@ -92,9 +92,21 @@ case "$CMD" in
           log "parse: $(grep '^U=' $PE | cut -d= -f2-) with $PE"
           ( exec 8>&-; E=$PE; launchenv; cd $R && S2NAME=scratch2.parse DRY=1 FRESH=1 PARSE=1 RESUME=1 LOCK= bash $R/scratch2.launch ) >> $LOG 2>&1
           sleep 5; LP=$(cat $D.launcher.pid 2>/dev/null); while kill -0 "$LP" 2>/dev/null; do sleep 5; done
-          bad=$(grep -E "is not one train reads|not an integer|not a number|unknown option|invalid value" $D.log | head -5)
-          if [ -z "$bad" ] && grep -qE "UFSM_MEM_DRY, exiting after the planner|no mode fits" $D.log; then log "parse OK ($(grep -E 'UFSM_MEM_DRY, exiting|no mode fits' $D.log | head -1 | cut -c1-80))"; touch $R/scratch2.parse.ok
-          else log "parse FAILED: ${bad:-no planner line, see $D.log}"; rm -f $R/scratch2.parse.ok; exit 1; fi;;
+          # (main.c's exit-time opt_unread also lists the flags train reads only after the planner (--val-store, --val-seed, --mix-every,
+          # --stop-at-update ...): after the "UFSM_MEM_DRY, exiting" line an unread flag fails only if the binary does not contain it)
+          bad=$(sed '/UFSM_MEM_DRY, exiting after the planner/q' $D.log | grep -E "is not one train reads|not an integer|not a number|unknown option|invalid value" | head -5)
+          for f in $(sed -n '/UFSM_MEM_DRY, exiting after the planner/,$p' $D.log | grep -oE "option --[a-z0-9-]+ is not one train reads" | awk '{print $2}'); do
+            strings "$(grep '^U=' $PE | cut -d= -f2-)" | grep -qxF -- "$f" || bad="${bad:+$bad; }$f unknown to the binary"; done
+          bad="${bad}$(sed -n '/UFSM_MEM_DRY, exiting after the planner/,$p' $D.log | grep -E "not an integer|not a number|invalid value" | head -2)"
+          # memory (main 11-15, memwsfix2: the film weight copy ~368 MB is now reserved before the planner): the picked mode must fit with
+          # PMARGIN GB (default 0.5) between the plan's need and the free memory per GPU; "no mode fits" (trying / refusing) fails
+          pl=$(grep -E "^memory: .*, [0-9.]+ of [0-9.]+ GB free per GPU" $D.log | tail -1)
+          mg=$(echo "$pl" | sed -nE 's/.*, ([0-9.]+) of ([0-9.]+) GB free per GPU.*/\1 \2/p' | awk '{printf "%.2f", $2-$1}')
+          grep -q "no mode fits" $D.log && bad="${bad:+$bad; }$(grep -m1 'no mode fits' $D.log | cut -c1-160)"
+          [ -n "$mg" ] && awk -v m=$mg -v t=${PMARGIN:-0.5} 'BEGIN{exit !(m < t)}' && bad="${bad:+$bad; }plan margin ${mg} GB < ${PMARGIN:-0.5} GB"
+          if [ -z "$bad" ] && [ -n "$mg" ] && grep -q "UFSM_MEM_DRY, exiting after the planner" $D.log; then
+            log "parse OK, plan margin $mg GB: $(echo "$pl" | cut -c9-130)"; echo "margin $mg GB: $(echo "$pl" | cut -c9-200)" > $R/scratch2.parse.ok
+          else log "parse FAILED: ${bad:-no plan / planner-exit line, see $D.log}"; rm -f $R/scratch2.parse.ok; exit 1; fi;;
   audit)  # s2ctl.sh audit ENV [N]: datafix's held-out leak audit (sampler only, no GPU, no locks) with ENV's exact args, from scratch, N (1000) batches,
           # in runs/scratch2.audit; may run while anything holds the GPUs. Gate: the last "hold audit:" line ends "ok" with H > 0, no "LEAK source" line.
           AE=${1:?ENV}; AN=${2:-1000}; D=$R/scratch2.audit; case "$D" in $R/scratch2.audit) rm -rf -- "$D" "$D".log "$D".resume.log "$D".launcher.pid "$D".pid "$D".nohup;; esac
