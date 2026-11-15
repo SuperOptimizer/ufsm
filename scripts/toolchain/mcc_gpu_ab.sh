@@ -251,11 +251,11 @@ if part predict; then
     case "$R" in "$O"/pred_*) rm -rf -- "$R" ;; esac; mkdir -p "$R"
     t0=$(date +%s.%N)
     env CUDA_VISIBLE_DEVICES=$GPU MCUDA_VERBOSE=1 "${MCAP[@]}" "$D/ufsm" predict "$CK" "$ur" "$uk" "$R/f.tmp" --box $bx --fit-zarr "$R/fields" --um "$uum" --level "$ulv" \
-        --window 640 --halo 64 --shard 512 --grid-origin 0,0,0 --ema 1 --q 8 --threads 12 --gpu 0 --axis "$uax" --levels 1 --fit-h 2 --fit-q 8 \
+        --window 640 --halo 64 --shard 512 --grid-origin 0,0,0 --ema 0 --q 8 --threads 12 --gpu 0 --axis "$uax" --levels 1 --fit-h 2 --fit-q 8 \
         --fit-q-phase 0 --no-out 1 > "$R/fields.log" 2>&1; r1=$?
     t1=$(date +%s.%N)
     env CUDA_VISIBLE_DEVICES=$GPU MCUDA_VERBOSE=1 "${MCAP[@]}" "$D/ufsm" predict "$CK" "$ur" "$uk" "$R/h" --um "$uum" --level "$ulv" --box $bx --full-grid 1 --levels 1 \
-        --heads all --gpu 0 --axis "$uax" --threads 6 > "$R/heads.log" 2>&1; r2=$?
+        --heads all --ema 0 --gpu 0 --axis "$uax" --threads 6 > "$R/heads.log" 2>&1; r2=$?
     t2=$(date +%s.%N); rm -rf -- "$R/f.tmp"
     echo "rc $r1 $r2 wall $(echo "$t1 - $t0" | bc) $(echo "$t2 - $t1" | bc)" > "$R.done"; log "predict $t ($un $bx): $(cat "$R.done") (fields, heads)"
   done
