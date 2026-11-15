@@ -14,6 +14,8 @@
 #include "srpair.h"
 #include "cover.h"
 #include <limits.h>
+#include <sys/statvfs.h>
+#include <errno.h>
 #include <openssl/evp.h>
 #include "sources.h"
 [[gnu::weak]] int inkfly_cache_budget(size_t);   /* (inksplat.o: the shared ink cache budget, --ink-cache-mb) */
@@ -645,7 +647,7 @@ static int val_fields(batch *b, int B, size_t p3, void **f[VAL_NF], size_t sz[VA
 }
 typedef struct { int fd; size_t bytes; batch buf; } valdisk;   /* --val-store disk: the windows back to back in an unlinked file */
 static int pwrite_all(int fd, const void *p, size_t n, size_t off) {
-    for (size_t k = 0; k < n;) { const ssize_t w = pwrite(fd, (const char *)p + k, n - k, (off_t)(off + k)); if (w <= 0) return -1; k += (size_t)w; }
+    for (size_t k = 0; k < n;) { const ssize_t w = pwrite(fd, (const char *)p + k, n - k, (off_t)(off + k)); if (w <= 0) { if (!w) errno = ENOSPC; return -1; } k += (size_t)w; }
     return 0;
 }
 static uint64_t hash_bytes(uint64_t h, const void *p, size_t n) {   /* 64-bit words, multiply-xorshift; the tail bytewise */
@@ -1650,7 +1652,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             nn_loss_grad_only_s(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, g_ink_dice, LGC(g_ink2_ch), d->iscratch, iw);   /* (--ink-dice: + w x the soft dice of the window's known voxels; x iw in the kernel) */
             uint16_t *mgb = mck && nn_get_loss_grad_h16() ? malloc(ns * 2) : nullptr; if (mgb) { nn_sync(); nn_d2h(mgb, LGC(g_ink2_ch), ns * 2); }
             int mz0, mnz; size_t mbo;
-            if (nmil && nn_get_loss_grad_h16() && mil_clip(d, 1, z0, nz, hw, &mz0, &mnz, &mbo) && ink_mil_bwd_slab(d->milacc, mz0, mnz, MD, H, W, mrays, nmil, g_mil_R, g_mil_step, LGC(g_ink2_ch) + mbo, !nn_get_f16(), nullptr)) { fprintf(stderr, "ink mil: bwd_slab failed\n"); exit(1); }   /* (adds the MIL gradient: fin scaled it to the storage's gradient scale) */
+            if (nmil && nn_get_loss_grad_h16() && mil_clip(d, 1, z0, nz, hw, &mz0, &mnz, &mbo) && ink_mil_bwd_slab(d->milacc, mz0, mnz, MD, H, W, mrays, nmil, g_mil_R, g_mil_step, LGC(g_ink2_ch) + mbo, !nn_get_f16(), nullptr)) { fprintf(stderr, "ink mil: bwd_slab failed (slab z %d + %d, %d rays; the cause above)\n", mz0, mnz, nmil); exit(1); }   /* (adds the MIL gradient: fin scaled it to the storage's gradient scale) */
             if (mgb) {   /* the slab's MIL gradient (after - before, 16-bit) against the host's */
                 const int gbf = !nn_get_f16(); uint16_t *ga = malloc(ns * 2); nn_sync(); nn_d2h(ga, LGC(g_ink2_ch), ns * 2);
                 if (!z0) merr = mmax = mref2 = mmaxd = mulp = 0;
@@ -4971,30 +4973,50 @@ int cmd_train(int argc, char **argv) {
         }
         sampler *vs = sampler_start(S, &vc);   /* --val-batches 0: no validation (e.g. windows wider than the holdout) */
         if (!vs) { fprintf(stderr, "cannot construct validation sampler\n"); return 1; }
+        int to_regen = 0;
         for (int i = 0; i < nval; i++) {
             batch *b = sampler_next(vs);
             if (!b) { nval = i; break; }
             void **fb[VAL_NF], **fv[VAL_NF]; size_t sz[VAL_NF];
             const int nf = val_fields(b, B, p3v, fb, sz); val_fields(&val[i], B, p3v, fv, sz);
             for (int k = 0; k < nf; k++) if (!*fb[k]) { fprintf(stderr, "validation batch: field %d of %d not filled by the sampler\n", k, nf); return 1; }
+            if (i == 0) {   /* the store's size: nval x the batch's fields (2026-11-15 try7, P 768: 32 x 5.0 GB = 159 GB filled /vesuvius, then the
+                               run died; the dirty pages also counted against the train slice's memory). Disk: refuse below the free space +
+                               20 GB, falling back to regen (the same windows drawn again at each pass); RAM: refuse above half the host memory */
+                size_t per = 0; for (int k = 0; k < nf; k++) per += sz[k];
+                const double tot = (double)per * nval; struct statvfs fs; double fr = vmode == VAL_DISK && !statvfs(out, &fs) ? (double)fs.f_bavail * fs.f_frsize : -1;
+                if (vmode == VAL_DISK && getenv("UFSM_VAL_DISK_FREE_GB")) fr = atof(getenv("UFSM_VAL_DISK_FREE_GB")) * 1e9;   /* (tests: a full disk) */
+                fprintf(stderr, "validation windows: %d x %.2f GB = %.1f GB (--val-store %s)\n", nval, per / 1e9, tot / 1e9, vmode_s);
+                if (vmode == VAL_DISK && fr >= 0 && tot + 20e9 > fr) {
+                    fprintf(stderr, "validation windows: %.1f GB would leave less than 20 GB of the %.1f GB free on %s: --val-store regen instead "
+                                    "(the same windows drawn again at each pass; --val-batches fewer or --val-P smaller to store them)\n", tot / 1e9, fr / 1e9, out);
+                    to_regen = 1; sampler_release(vs, b); break;
+                }
+                if (vmode == VAL_RAM && tot > 0.5 * (double)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE)) {
+                    fprintf(stderr, "validation windows: %.1f GB in RAM is more than half the host memory: use --val-store regen or fewer --val-batches\n", tot / 1e9); return 1; }
+            }
             for (int k = 0; k < nf; k++) vhash = hash_bytes(vhash, *fb[k], sz[k]);
             for (int k = 0; k < nf; k++)
                 if (vmode == VAL_RAM) { *fv[k] = ck_host(malloc(sz[k]), sz[k], "validation batch"); memcpy(*fv[k], *fb[k], sz[k]); }
-                else if (pwrite_all(vdk.fd, *fb[k], sz[k], vdk.bytes)) { fprintf(stderr, "cannot write the validation windows\n"); return 1; }
+                else if (pwrite_all(vdk.fd, *fb[k], sz[k], vdk.bytes)) {
+                    fprintf(stderr, "cannot write the validation windows (%s/.val-windows, unlinked, at %.1f GB): %s\n", out, vdk.bytes / 1e9, strerror(errno)); return 1; }
                 else vdk.bytes += sz[k];
+            if (vmode == VAL_DISK) { fdatasync(vdk.fd); posix_fadvise(vdk.fd, 0, 0, POSIX_FADV_DONTNEED); }   /* (written pages out of the page cache per batch: not charged to the slice) */
             if (vmode == VAL_RAM) { val[i].sheet=calloc((size_t)B,sizeof *val[i].sheet); val[i].sheet[0]=sheet_clone(b->sheet?b->sheet[0]:nullptr); }
             sampler_release(vs, b);
         }
         int validation_failed = sampler_failed(vs);
         sampler_stop(vs);
         if (validation_failed) { fprintf(stderr, "validation sampler failed\n"); return 1; }
-        if (vmode == VAL_DISK) {   /* one host batch to read them back into; the written pages leave the page cache */
+        if (to_regen) { close(vdk.fd); vdk.fd = -1; vdk.bytes = 0; vmode = VAL_REGEN; vmode_s = "regen"; }
+        if (vmode == VAL_REGEN) fprintf(stderr, "%d validation batches, drawn again at every validation pass (--val-store regen)\n", nval);
+        else if (vmode == VAL_DISK) {   /* one host batch to read them back into; the written pages leave the page cache */
             void **fv[VAL_NF]; size_t sz[VAL_NF];
             const int nf = val_fields(&vdk.buf, B, p3v, fv, sz);
             for (int k = 0; k < nf; k++) if (!(*fv[k] = malloc(sz[k]))) { fprintf(stderr, "out of host memory (validation batch)\n"); return 1; }
             fdatasync(vdk.fd); posix_fadvise(vdk.fd, 0, 0, POSIX_FADV_DONTNEED);
         }
-        fprintf(stderr, "%d validation batches of %d^3, %s (--val-store %s), windows hash %016llx\n", nval, vP, vmode == VAL_RAM ? "held in host RAM" : "in an unlinked file in the run directory, read back at each pass", vmode_s, (unsigned long long)vhash);
+        if (vmode != VAL_REGEN) fprintf(stderr, "%d validation batches of %d^3, %s (--val-store %s), windows hash %016llx\n", nval, vP, vmode == VAL_RAM ? "held in host RAM" : "in an unlinked file in the run directory, read back at each pass", vmode_s, (unsigned long long)vhash);
     } else if (nval > 0) fprintf(stderr, "%d validation batches, drawn again at every validation pass (--val-store regen)\n", nval);
     else fprintf(stderr, "0 validation batches\n");
     g_Pz = Pz_tr;

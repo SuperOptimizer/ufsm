@@ -164,7 +164,10 @@ static int mgrow(int i, size_t n) {
     if (t_ms.cap[i] >= n) return 0;
     if (t_ms.p[i]) cudaFree(t_ms.p[i]);
     t_ms.p[i] = nullptr; t_ms.cap[i] = 0; const size_t c = n + n / 4 + 256;
-    if (cudaMalloc(&t_ms.p[i], c) != cudaSuccess) return -1;
+    if (cudaMalloc(&t_ms.p[i], c) != cudaSuccess) {   /* (2026-11-15 try7 one card: "bwd_slab failed" with no cause; this is the usual one) */
+        size_t fr = 0, to = 0; const cudaError_t e = cudaGetLastError(); cudaMemGetInfo(&fr, &to);
+        fprintf(stderr, "ink mil: device buffer %d: cudaMalloc of %.1f MB failed (%s; %.2f GB free of %.2f): outside the memory plan\n", i, c / 1e6, cudaGetErrorString(e), fr / 1e9, to / 1e9);
+        return -1; }
     t_ms.cap[i] = c; return 0;
 }
 extern "C" int ink_mil_samples(float R, float step) { return (int)floorf(2 * R / step + 1e-4f) + 1; }
@@ -201,11 +204,12 @@ extern "C" int ink_mil_fin(float *acc, const inkray *rays, int nr, int D, int H,
 extern "C" int ink_mil_bwd_slab(const float *dz, int z0, int nz, int D, int H, int W, const inkray *rays, int nr, float R, float step, void *gl, int bf16, void *stream) {
     const int K = ink_mil_samples(R, step); if (K > KMAX || K < 1) return -2; if (nr <= 0) return 0;
     cudaStream_t st = (cudaStream_t)stream; const long long n = (long long)nr * K; const size_t cap = (size_t)(g_nrmax > nr ? (long long)g_nrmax * K : n) * 8;
-    if (cap > 0xffffffffull || mgrow(1, cap * 8) || mgrow(2, cap * 4) || mgrow(3, cap * 8) || mgrow(4, cap * 4) || mgrow(5, 64)) return -1;
+    if (cap > 0xffffffffull) { fprintf(stderr, "ink mil: bwd_slab: %zu pair slots exceed 2^32 (%d rays x %d samples)\n", cap, nr, K); return -1; }
+    if (mgrow(1, cap * 8) || mgrow(2, cap * 4) || mgrow(3, cap * 8) || mgrow(4, cap * 4) || mgrow(5, 64)) return -1;
     unsigned *dc = (unsigned *)t_ms.p[5]; unsigned hc = 0;
     int ph = t_ph.dz == dz && t_ph.rays == rays && t_ph.D == D && t_ph.nr == nr && t_ph.K == K && t_ph.R == R && t_ph.step == step;
     if (ph && t_ph.pend) {   /* fin's plane counts (waited for once per step) */
-        if (cudaEventSynchronize(t_ph.ev)) return -1;
+        if (cudaEventSynchronize(t_ph.ev)) { fprintf(stderr, "ink mil: bwd_slab: fin plane-count event: %s\n", cudaGetErrorString(cudaGetLastError())); return -1; }
         t_ph.pend = 0;
         if (t_ph.h[t_ph.cap + 1]) {   /* an earlier step's slab had more pairs than its bound (its MIL gradient lost the excess): the per-slab readback
                                          from now on, for every thread (try6 2026-11-14: the rays changed between fin and the backward, see train.c mil_take) */
@@ -218,14 +222,14 @@ extern "C" int ink_mil_bwd_slab(const float *dz, int z0, int nz, int D, int H, i
         if (!b) return 0;
         hc = (unsigned)(b < cap ? b : cap);
     }
-    if (cudaMemsetAsync(dc, 0, 4, st)) return -1;
+    if (cudaMemsetAsync(dc, 0, 4, st)) { fprintf(stderr, "ink mil: bwd_slab: pair counter memset: %s\n", cudaGetErrorString(cudaGetLastError())); return -1; }
     k_pairs<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(dz, z0, nz, D, H, W, rays, nr, K, R, step, (unsigned long long *)t_ms.p[1], (float *)t_ms.p[2], dc);
     int bits = 32; while (bits < 64 && ((unsigned long long)nz * H * W) >> (bits - 32)) bits++;   /* key = voxel << 32 | slot */
     if (ph) {   /* slots [count, bound): the largest key in the sorted bits (real keys are below it: slot < cap < 2^32 - 1) */
         const unsigned long long sent = bits >= 64 ? ~0ull : (1ull << bits) - 1;
         k_fill_tail<<<(hc + 255) / 256, 256, 0, st>>>((unsigned long long *)t_ms.p[1], (float *)t_ms.p[2], dc, hc, sent, t_ph.d + t_ph.cap);
     } else {
-        if (cudaMemcpyAsync(&hc, dc, 4, cudaMemcpyDeviceToHost, st) || cudaStreamSynchronize(st)) return -1;
+        if (cudaMemcpyAsync(&hc, dc, 4, cudaMemcpyDeviceToHost, st) || cudaStreamSynchronize(st)) { fprintf(stderr, "ink mil: bwd_slab: pair count readback: %s\n", cudaGetErrorString(cudaGetLastError())); return -1; }
         if (!hc) return 0;
     }
     size_t tb = 0; cub::DeviceRadixSort::SortPairs(nullptr, tb, (unsigned long long *)nullptr, (unsigned long long *)nullptr, (float *)nullptr, (float *)nullptr, (int)hc, 0, bits, st);
@@ -236,7 +240,8 @@ extern "C" int ink_mil_bwd_slab(const float *dz, int z0, int nz, int D, int H, i
     if (mgrow(6, tb + 16)) return -1; void *tmp = t_ms.p[6];
     cub::DeviceRadixSort::SortPairs(tmp, tb, (unsigned long long *)t_ms.p[1], (unsigned long long *)t_ms.p[3], (float *)t_ms.p[2], (float *)t_ms.p[4], (int)hc, 0, bits, st);
     k_runs<<<(hc + 255) / 256, 256, 0, st>>>((const unsigned long long *)t_ms.p[3], (const float *)t_ms.p[4], hc, gl, bf16, ph ? dc : nullptr);
-    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { fprintf(stderr, "ink mil: bwd_slab kernels: %s\n", cudaGetErrorString(e)); return -1; } }
+    return 0;
 }
 /* tests: the slab pipeline over host arrays (the logit rounded to fp16 / bf16, nslab equal z slabs; grad: the 16-bit gradient as float,
    starting from 0) */
