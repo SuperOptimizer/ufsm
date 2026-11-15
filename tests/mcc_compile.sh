@@ -27,7 +27,7 @@ one() {   # one SOURCE: compile it, print "FAIL name: first error" on failure
   case $f in
     *.cu) case $b in lp_*) a=--cuda-arch=1200a;; *) a=--cuda-arch=1200;; esac
           fp=--cuda-fast-math; [ $SM = 1 ] && [[ " $STRICT " == *" $b "* ]] && fp=-fmad=false
-          set -- "$M" -mglibc -O3 $a $fp -D_GNU_SOURCE -DUFSM_ARCH=120 -DUFSM_CUDA_VERSION=mcc -isystem "$H" -include "$H/mcuda_device.h" -Isrc;;
+          set -- "$M" -mglibc -O3 $a $fp -D_GNU_SOURCE -DUFSM_ARCH=120 -DUFSM_CUDA_VERSION=mcc -isystem "$H" -include "$H/mcuda_device.h" -include src/ufsm_dev.cuh -Isrc;;
     *)    set -- "$M" -mglibc -std=c23 -O3 -march=native $HFP -pthread -D_GNU_SOURCE -Isrc -Ithird_party -Ithird_party/surfcomp -isystem "$H";;
   esac
   if ! "$@" -c "$f" -o "$T/$b.o" > "$T/$b.log" 2>&1; then echo "FAIL $b: $(grep -m1 -E 'error|fatal' "$T/$b.log" || head -1 "$T/$b.log")"; fi

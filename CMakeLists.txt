@@ -442,7 +442,8 @@ elseif(UFSM_CUDA_COMPILER STREQUAL "mcc")
     set(UFSM_LP_ARCH --cuda-arch=${UFSM_ARCH}0)
   endif()
   set(UFSM_CU_FLAGS -mglibc -O3 -D_GNU_SOURCE -DUFSM_CUDA_VERSION=mcc "SHELL:-isystem ${UFSM_CUDA}/include"
-      "SHELL:-include ${UFSM_CUDA}/include/mcuda_device.h")
+      "SHELL:-include ${UFSM_CUDA}/include/mcuda_device.h"
+      "SHELL:-include ${CMAKE_SOURCE_DIR}/src/ufsm_dev.cuh")   # (the logical-device map, as the clang / nvcc paths: else cudaSetDevice is unwrapped and ufsm_dev_phys an implicit extern)
   set(UFSM_CU_FAST --cuda-fast-math)   # (nvcc's -use_fast_math)
   set(UFSM_CU_STRICT -fmad=false)
 endif()
