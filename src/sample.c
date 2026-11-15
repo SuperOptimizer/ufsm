@@ -484,6 +484,37 @@ static int holdout_window_boxes(const sampler *sp, const source *s, const int64_
     }
     return nb;
 }
+/* where sym_u8 puts the source-grid voxel s: out[i] = in[s] with s[perm[d]] = flip[d] ? n[d] - 1 - i[d] : i[d], solved for i */
+static void sym_point(sym y, const int64_t n[3], const int64_t s[3], int64_t o[3]) {
+    for (int d = 0; d < 3; d++) o[d] = y.flip[d] ? n[d] - 1 - s[y.perm[d]] : s[y.perm[d]];
+}
+/* test_hold_frame: for every cube symmetry, a source-grid plane with a masked box (255) and known labels elsewhere goes through sym_u8; the
+   box read back through sym_point must be all 255 (the audit's output-frame read: no leak) and, read on the source grid instead, must not be
+   (the false LEAK of the 2026-11-15 try7 audit) for the asymmetric symmetries; a known voxel planted in the box must be found. 0 = pass */
+int sample_hold_frame_selftest(void) {
+    enum { N = 7 }; uint8_t a[N * N * N], t[N * N * N]; const int64_t n[3] = {N, N, N}; const int lo[3] = {1, 0, 4}, hi[3] = {3, 5, 7};
+    int asym_flagged = 0;
+    for (int q = 0; q < 48; q++) {
+        const sym y = sym_of(q);
+        for (int pass = 0; pass < 2; pass++) {
+            for (int z = 0; z < N; z++) for (int v = 0; v < N; v++) for (int x = 0; x < N; x++) {
+                const int in = z >= lo[0] && z < hi[0] && v >= lo[1] && v < hi[1] && x >= lo[2] && x < hi[2];
+                a[(z * N + v) * N + x] = in ? 255 : (uint8_t)(1 + (z * 49 + v * 7 + x) % 200);
+            }
+            if (pass) a[(lo[0] * N + lo[1]) * N + lo[2]] = 7;   /* a leak: one known voxel in the box */
+            sym_u8(a, t, N, N, y);
+            int known_o = 0, known_s = 0;
+            for (int z = lo[0]; z < hi[0]; z++) for (int v = lo[1]; v < hi[1]; v++) for (int x = lo[2]; x < hi[2]; x++) {
+                const int64_t sv[3] = {z, v, x}; int64_t ov[3]; sym_point(y, n, sv, ov);
+                known_o += t[(ov[0] * N + ov[1]) * N + ov[2]] != 255; known_s += t[(z * N + v) * N + x] != 255;
+            }
+            if (known_o != pass) { fprintf(stderr, "hold frame selftest: sym %d pass %d: %d known in the mapped box\n", q, pass, known_o); return 1; }
+            if (!pass && known_s) asym_flagged++;
+        }
+    }
+    if (asym_flagged == 0) { fprintf(stderr, "hold frame selftest: the source-grid read flagged no symmetry (the test box is symmetric?)\n"); return 1; }
+    return 0;
+}
 /* UFSM_HOLD_AUDIT (train's sampler-only mode): window i's known label voxels inside the held-out boxes of its CT (no guard), over every
    source-grid label plane the batch holds (phase / side, w4, ink, aux, papyrus, loss mask, packed mask, ink known bits); the training
    sampler masks the boxes + guard, so a nonzero count is a leak. Returns the voxels inside boxes (vox) and the known ones among them. */
@@ -492,12 +523,25 @@ void sample_hold_audit(const sampler *sp, const batch *b, int i, uint64_t *vox, 
     const source *s = &sp->S->src[si]; const int Pz = PZ(&sp->cfg), P = sp->cfg.P; const int64_t n[3] = {Pz, P, P}, o[3] = {b->corner[i][0] >> l, b->corner[i][1] >> l, b->corner[i][2] >> l};
     int32_t hb[HB_MAX][6]; const int nb = holdout_window_boxes(sp, s, o, n, l, 0, hb, HB_MAX); if (nb <= 0) return;
     const size_t nv = (size_t)Pz * P * P;
-    const uint8_t *pl[10] = {b->side, b->w4, b->ink, b->aux[0], b->aux[1], b->aux[2], b->aux[3], b->pap}; const uint8_t unk[10] = {255, 255, 255, 255, 255, 255, 255, 255};
-    for (int q = 0; q < nb; q++) for (int z = hb[q][0]; z < hb[q][3]; z++) for (int y = hb[q][1]; y < hb[q][4]; y++) for (int x = hb[q][2]; x < hb[q][5]; x++) {
-        const size_t k = ((size_t)z * P + y) * P + x; int kn = 0; (*vox)++;
-        for (int j = 0; j < 8; j++) kn |= pl[j] && (sp->cfg.plane_bank ? pl[j] != sp->c255 : 1) && pl[j][(size_t)i * nv + k] != unk[j];
-        if (b->m) kn |= b->m[(size_t)i * nv + k] != 0;
-        if (b->tm) kn |= (b->tm[(size_t)i * nv + k] & 4) != 0;
+    /* the frame of each plane: a window the device does not warp (--gpu-input record: not warped) holds its side / w4 / ink / aux / pap /
+       mask / packed planes in the OUTPUT frame, the host's symmetry y already applied (replay_window takes them back to the source grid with
+       the inverse); the masked boxes went through y with them. The ink known bits, and the side plane under w4_runs, stay on the source grid
+       (the device applies y). Before 2026-11-15 the audit read every plane on the source grid and flagged symmetrised windows' ink outside
+       the boxes as a leak (try7 audit: PHercParis4-u2ink level 2, sym 021/000 and 012/010, aux0) */
+    sym y = sym_of(0);
+    if (b->rad) { int32_t h[8]; memcpy(h, (const char *)b->rad + (size_t)i * NN_RAD_REC(Pz), sizeof h);
+        if (!(h[6] & 1)) for (int d = 0; d < 3; d++) { y.perm[d] = h[5] >> (2 * d) & 3; y.flip[d] = h[5] >> (8 + d) & 1; } }
+    const int64_t nn[3] = {Pz, P, P};
+    const uint8_t *pl[8] = {sp->cfg.w4_runs ? nullptr : b->side, b->w4, b->ink, b->aux[0], b->aux[1], b->aux[2], b->aux[3], b->pap};
+    const uint8_t *side_src = sp->cfg.w4_runs ? b->side : nullptr;
+    for (int q = 0; q < nb; q++) for (int z = hb[q][0]; z < hb[q][3]; z++) for (int yy = hb[q][1]; yy < hb[q][4]; yy++) for (int x = hb[q][2]; x < hb[q][5]; x++) {
+        const size_t k = ((size_t)z * P + yy) * P + x; int kn = 0; (*vox)++;
+        const int64_t sv[3] = {z, yy, x}; int64_t ov[3]; sym_point(y, nn, sv, ov);
+        const size_t ko = ((size_t)ov[0] * P + (size_t)ov[1]) * P + (size_t)ov[2];
+        for (int j = 0; j < 8; j++) kn |= pl[j] && (sp->cfg.plane_bank ? pl[j] != sp->c255 : 1) && pl[j][(size_t)i * nv + ko] != 255;
+        if (side_src && (sp->cfg.plane_bank ? side_src != sp->c255 : 1)) kn |= side_src[(size_t)i * nv + k] != 255;
+        if (b->m) kn |= b->m[(size_t)i * nv + ko] != 0;
+        if (b->tm) kn |= (b->tm[(size_t)i * nv + ko] & 4) != 0;
         if (b->inkb) kn |= (b->inkb[((size_t)i * nv + k) >> 3] >> (k & 7)) & 1;
         *known += kn != 0;
     }
