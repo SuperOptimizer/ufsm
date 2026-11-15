@@ -22,8 +22,11 @@ if [ "${1:-}" != --after ]; then
     elif grep -qE '^XFLAGS=.*--gscale-grow 0( |$)' $E; then good "binary predates 2ff3118 but launch.env passes --gscale-grow 0"
     else bad "binary lacks 2ff3118 (pass-1 mega defaults --gscale-grow 200) and launch.env has no --gscale-grow 0"; fi
     git -C /home/forrest/ufsm merge-base --is-ancestor 472df19 $SHA 2>/dev/null && good "binary contains sampbias 472df19 (zboost: sources.c ignores unknown keys silently)" || bad "binary lacks sampbias 472df19"
-    for b in dcachecap-20261114 dckey-20261114; do git -C /home/forrest/ufsm merge-base --is-ancestor origin/$b $SHA 2>/dev/null && good "binary contains $b" || bad "binary lacks origin/$b (hostmem: derived-cache cap + new keys)"; done
-  [ -e /home/forrest/.cache/ufsm/derived ] && bad "~/.cache/ufsm/derived still in place: mv it to derived.try6 (no trainer / admuon arm reading it)" || good "old derived cache moved away"
+    for b in dcachecap-20261114 dckey-20261114; do { git -C /home/forrest/ufsm merge-base --is-ancestor origin/$b $SHA 2>/dev/null || git -C /home/forrest/ufsm log --format=%s $SHA | grep -qE "^Merge .*$b"; } && good "binary contains $b (ref or its merge commit; merged branches are deleted)" || bad "binary lacks origin/$b (hostmem: derived-cache cap + new keys)"; done
+  DV=/home/forrest/.cache/ufsm/derived   # (a cache born after the binary was installed was built by its keys (the audits): kept, it is warm)
+  if [ ! -e $DV ]; then good "old derived cache moved away"
+  elif [ -d $DV.try6 ] && [ "$(stat -c %W $DV)" -gt "$(stat -c %Y "$U")" ]; then good "derived cache born $(date -d @$(stat -c %W $DV) +%H:%M) after the binary ($(du -sh $DV | cut -f1), built by its keys); the try6 one in derived.try6"
+  else bad "~/.cache/ufsm/derived predates the binary: mv it to derived.try6 (no trainer / admuon arm reading it)"; fi
   # every --flag the env passes (XFLAGS, OPTX) must be known to the binary (train's opt() ignores nothing silently since 27fee1e, but check here)
   for f in $(grep -E '^(XFLAGS|OPTX)=' $E | cut -d= -f2- | tr ' ' '\n' | grep -E '^--[a-z]' | sort -u); do strings "$U" | grep -qxF -- "$f" || strings "$U" | grep -qF -- "\"$f\"" || strings "$U" | grep -qF -- "$f" || bad "binary does not know $f"; done
   grep -qE '^MLR=0.003$' $E && good "Muon lr 0.003" || bad "MLR is not 0.003"
@@ -42,7 +45,7 @@ if [ "${1:-}" != --after ]; then
     [ -f $d/done ] && good "raster $r done" || bad "raster $r not done"
     grep -qF "\"$d\"" "$SRCJ" && good "sources read $d" || bad "sources json does not reference $d (try7 must read the datafix re-rasters)"; done
   grep -q ALLDONE /vesuvius/ufsm/datafix-20261114/raster/run.log 2>/dev/null && good "raster run.log ALLDONE" || bad "raster run.log has no ALLDONE"
-  if [ -f $R/scratch2.parse.ok ] && [ $R/scratch2.parse.ok -nt $E ] && [ $R/scratch2.parse.ok -nt "$U" ]; then good "parse check (UFSM_MEM_DRY) passed"
+  if [ -f $R/scratch2.parse.ok ] && [ $R/scratch2.parse.ok -nt $E ] && [ $R/scratch2.parse.ok -nt "$U" ]; then good "parse + memory plan: $(cat $R/scratch2.parse.ok) (try6 P768 on the old binary: 9.82 of 11.04 GB, margin 1.22)"
   else bad "no parse check newer than the env and binary: S2CTL_OWNER=merger2 bash $R/s2ctl.sh parse $E"; fi
   if [ -f $R/scratch2.audit.ok ] && [ $R/scratch2.audit.ok -nt $E ] && [ $R/scratch2.audit.ok -nt "$U" ]; then good "leak audit: $(cat $R/scratch2.audit.ok)"
   else bad "no leak audit newer than the env and binary: S2CTL_OWNER=merger2 bash $R/s2ctl.sh audit $E 1000"; fi
@@ -56,6 +59,7 @@ else
   z=$(grep -cE '^sources: .*: 0 held-out boxes from' $F)
   [ "$h" -ge "$n" ] && [ "$z" = 0 ] && good "$h of $n sources with held-out boxes, none with 0" || bad "held-out lines: $h of $n sources with boxes, $z with 0"
   grep -qE "^sources: .*: held-out box .* lies outside the CT" $F && bad "'lies outside the CT' in the dry log" || good "no box outside the CT"
+  grep -qiE "out of memory|grew after the memory plan|no mode fits|cudaErrorMemoryAllocation" $F && bad "memory trouble in the dry log: $(grep -iE -m1 'out of memory|grew after the memory plan|no mode fits|cudaErrorMemoryAllocation' $F | cut -c1-140)" || good "no OOM / workspace growth in the dry log"
   grep -qE "^val by source \(" $F && grep -qE "^val by scroll \(" $F && good "val by source / scroll lines" || bad "no 'val by source / scroll' line in the dry log"
 fi
 [ $ok = 1 ] && echo "PREFLIGHT OK" || echo "PREFLIGHT FAILED"; [ $ok = 1 ]

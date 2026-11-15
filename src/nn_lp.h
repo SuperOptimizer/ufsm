@@ -45,6 +45,7 @@ typedef struct { const uint8_t *m, *mi; int my, mx, zoff; } skipm_t;
 skipm_t lp_skip_get(shape5 xs, split_t sp, int fwd);
 skipm_t lp_skip_wgrad(shape5 ys);
 int nn_skip_fwd_level(shape5 xs, split_t sp);
+int nn_skip_masks(shape5 xs, split_t sp);   /* launch_f4 would mask this conv (no side effects): fwd_f4_t keeps it off the ring kernels */
 void lp_skip_rec_zero(uint8_t *buf, shape5 ys, int zs0, int zs1, size_t rec, skipm_t sk);
 /* k=3 stride 1 forward / weight gradient with the same semantics as the BF16 tensor-core paths in nn.cu
    (conv_fwd_tc / launch_bwd_w_tc): xbf / ybf = activation (and x2 / y2) storage type, 0 fp32, 1 bf16, 2 fp16; the
