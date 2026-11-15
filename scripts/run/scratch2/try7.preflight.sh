@@ -1,9 +1,17 @@
 #!/bin/bash
 # try7.preflight.sh (merger2 11-14): the checks BEFORE `s2ctl.sh fresh try7.launch.env ...` (audit-data's preconditions + mine). rc 0 = go.
+# After the first checkpoint (step 250): --ckpt (adm_ema in the header).
 # After the fresh dry start, run it again with --after to check the dry log (s2ctl.log.dry-holdouts / .dry-last.log).
 set -u
 R=/vesuvius/ufsm/v2/lat/runs; E=$R/try7.launch.env; ok=1; bad() { echo "FAIL: $*"; ok=0; }; good() { echo "ok: $*"; }
 U=$(grep '^U=' $E | cut -d= -f2-); SRCJ=$(grep '^SRCJ=' $E | cut -d= -f2-)
+if [ "${1:-}" = --ckpt ]; then   # after try7's first checkpoint (--ckpt-every, 250 steps): LARS state must ride in the header (main 11-14)
+  grep -qE '^OPTX=.*--muon-lars 1' $E || { echo "ok: no --muon-lars in the env, no adm_ema expected (the NorMuon row EMA is not checkpointed)"; exit 0; }
+  C=$R/scratch2/last.ckpt; [ -f $C ] || { echo "FAIL: no $C yet (first checkpoint at step 250)"; exit 1; }
+  hd=$(head -c 400000 $C | head -1); st=$(echo "$hd" | grep -o '"step":[0-9]*' | head -1 | cut -d: -f2)
+  echo "$hd" | grep -q '"adm_ema":\[' && good "adm_ema in the step-$st checkpoint header ($(echo "$hd" | grep -o '"adm_ema":\[[^]]*' | tr ',' '\n' | wc -l) values)" || bad "no adm_ema in the step-$st checkpoint header: LARS is not on"
+  [ $ok = 1 ] && echo "PREFLIGHT OK" || echo "PREFLIGHT FAILED"; [ $ok = 1 ]; exit
+fi
 if [ "${1:-}" != --after ]; then
   [ -x "$U" ] && good "binary $U" || bad "binary not executable: $U"
   SHA=${U##*.}; if git -C /home/forrest/ufsm cat-file -e "$SHA^{commit}" 2>/dev/null; then
@@ -16,6 +24,13 @@ if [ "${1:-}" != --after ]; then
     git -C /home/forrest/ufsm merge-base --is-ancestor 472df19 $SHA 2>/dev/null && good "binary contains sampbias 472df19 (zboost: sources.c ignores unknown keys silently)" || bad "binary lacks sampbias 472df19"
     for b in dcachecap-20261114 dckey-20261114; do git -C /home/forrest/ufsm merge-base --is-ancestor origin/$b $SHA 2>/dev/null && good "binary contains $b" || bad "binary lacks origin/$b (hostmem: derived-cache cap + new keys)"; done
   [ -e /home/forrest/.cache/ufsm/derived ] && bad "~/.cache/ufsm/derived still in place: mv it to derived.try6 (no trainer / admuon arm reading it)" || good "old derived cache moved away"
+  # every --flag the env passes (XFLAGS, OPTX) must be known to the binary (train's opt() ignores nothing silently since 27fee1e, but check here)
+  for f in $(grep -E '^(XFLAGS|OPTX)=' $E | cut -d= -f2- | tr ' ' '\n' | grep -E '^--[a-z]' | sort -u); do strings "$U" | grep -qxF -- "$f" || strings "$U" | grep -qF -- "\"$f\"" || strings "$U" | grep -qF -- "$f" || bad "binary does not know $f"; done
+  grep -qE '^MLR=0.003$' $E && good "Muon lr 0.003" || bad "MLR is not 0.003"
+  LARS=0; grep -qE '^OPTX=.*--muon-lars 1' $E && LARS=1   # (adm_ema is written only with LARS on; admuon 11-15: NorMuon alone may suffice, main decides)
+  grep -qE '^OPTX=.*--normuon 1' $E && good "optimizer: NorMuon$([ $LARS = 1 ] && echo ' + LARS')" || bad "OPTX lacks --normuon 1 (main's try7 decision)"
+  for f in --normuon $([ $LARS = 1 ] && echo --muon-lars); do strings "$U" | grep -qF -- "$f" || bad "binary does not know $f"; done
+  [ $LARS = 1 ] && {   strings "$U" | grep -qF '"adm_ema\":[' || strings "$U" | grep -qF 'adm_ema' && good "binary writes adm_ema" || bad "binary has no adm_ema checkpoint key (older than 5e8aab7?)"; }
   for f in --stop-at-update --gns-skip-echo; do strings "$U" | grep -qF -- "$f" && good "binary knows $f (trainlow 738e72f7)" || bad "binary lacks $f (trainlow-20261114 738e72f7)"; done
   grep -qE '^XFLAGS=.*--accum auto' $E && ! grep -qE '^XFLAGS=.*--gns-skip-echo 1' $E && grep -qE '^XFLAGS=.*--echo-max [1-9]' $E && bad "--accum auto with --echo-max needs --gns-skip-echo 1 (main)"
   strings "$U" | grep -qF -- "--holdout-guard" && good "binary knows --holdout-guard" || bad "binary lacks --holdout-guard"
@@ -23,8 +38,12 @@ if [ "${1:-}" != --after ]; then
   python3 -I -c "import json,sys; d=json.load(open('$SRCJ')); s=d['sources']; w=[x for x in s if x['name']=='PHerc1218-b3']; sys.exit(0 if d.get('holdout_strict')==1 and all(x.get('holdout_file') for x in s) and w and w[0]['weight']==0 else 1)" \
     && good "sources: holdout_strict 1, holdout_file on every source, PHerc1218-b3 weight 0" || bad "sources json lacks holdout_strict / holdout_file / 1218 weight 0"
   [ -f /vesuvius/ufsm/univ/scratch1/holdouts-20261114.json ] && good "holdouts json" || bad "no holdouts-20261114.json"
-  for r in p4-codesA48 p4-codesB48; do [ -f /vesuvius/ufsm/datafix-20261114/raster/$r/done ] && good "raster $r done" || bad "raster $r not done"; done
+  for r in p4-codesA48 p4-codesB48 1667-codesA 1667-codesB; do d=/vesuvius/ufsm/datafix-20261114/raster/$r
+    [ -f $d/done ] && good "raster $r done" || bad "raster $r not done"
+    grep -qF "\"$d\"" "$SRCJ" && good "sources read $d" || bad "sources json does not reference $d (try7 must read the datafix re-rasters)"; done
   grep -q ALLDONE /vesuvius/ufsm/datafix-20261114/raster/run.log 2>/dev/null && good "raster run.log ALLDONE" || bad "raster run.log has no ALLDONE"
+  if [ -f $R/scratch2.parse.ok ] && [ $R/scratch2.parse.ok -nt $E ] && [ $R/scratch2.parse.ok -nt "$U" ]; then good "parse check (UFSM_MEM_DRY) passed"
+  else bad "no parse check newer than the env and binary: S2CTL_OWNER=merger2 bash $R/s2ctl.sh parse $E"; fi
   if [ -f $R/scratch2.audit.ok ] && [ $R/scratch2.audit.ok -nt $E ] && [ $R/scratch2.audit.ok -nt "$U" ]; then good "leak audit: $(cat $R/scratch2.audit.ok)"
   else bad "no leak audit newer than the env and binary: S2CTL_OWNER=merger2 bash $R/s2ctl.sh audit $E 1000"; fi
   [ -f $R/scratch2.parked ] && good "try6 parked (fresh clears it)"
