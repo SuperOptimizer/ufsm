@@ -7,4 +7,5 @@ set -u
 T=${1:?TOOL}; shift
 CS=${COMPUTE_SANITIZER:-$(command -v compute-sanitizer 2> /dev/null || echo /usr/local/cuda/bin/compute-sanitizer)}
 [ -x "$CS" ] || { echo "SKIP: no compute-sanitizer"; exit 0; }
+export UFSM_SANITIZE=$T   # (tests shrink what the tool cannot afford: test_skip_empty (5))
 exec "$CS" --tool "$T" --error-exitcode 86 --target-processes all --print-limit 20 "$@"
