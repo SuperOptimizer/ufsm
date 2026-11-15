@@ -1708,7 +1708,7 @@ static int predict_one(int argc, char **argv) {
                                      fprintf(stderr, " %s (ch %d%s%s%s)", PH[k].name, PH[k].c0, c1, PH[k].sb0 >= 0 ? " sub-cell" : "", PH[k].s0 >= 0 ? " stem" : ""); } fprintf(stderr, "\n"); }
     if (!ffd && tta > 1 && (split || half || sheet_task || rvfuse)) { fprintf(stderr, "predict: probability --tta: not with --split, half-resolution, sheet or recto/verso-fused outputs\n"); return 2; }
     if (ffd && out_ch && tta > 1) { fprintf(stderr, "predict: --channel N with --fit-* and --tta: not supported (the probability volume would come from the last symmetry pass)\n"); return 2; }
-    if (ffd && (split || ngpu > 1)) { fprintf(stderr, "predict: --fit-fields runs on one GPU\n"); return 2; }   /* (--channel N: the probability volume of channel N beside the fields, e.g. --channel ink) */
+    if (ffd && (split || (ngpu > 1 && !ffz))) { fprintf(stderr, "predict: --fit-fields runs on one GPU\n"); return 2; }   /* (--fit-zarr: z-layer workers with --gpus) */   /* (--channel N: the probability volume of channel N beside the fields, e.g. --channel ink) */
     z3 *auxz = nullptr; uint8_t *auxd = nullptr, *auxh = nullptr;   /* --aux ROOT KEY: the fifth input of 5-input checkpoints (train --aux-input) */
     {   int ai = -1; for (int k = 1; k + 2 < argc; k++) if (!strcmp(argv[k], opt_n("--aux"))) ai = k;
         if (cfg.cin == 5 && !half) {
@@ -2066,20 +2066,30 @@ static int predict_one(int argc, char **argv) {
              ck_sha, ax_sha, level, um_l, W, halo, Wz, hz, (double)q, shard, fullg, use_ema, chs, gn_stats, norm_mean, norm_sd, tta, grid_attrs, (int)ia_prov, input_attrs);
     snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s (uint8 = round(p*255))\",\"checkpoint\":\"%s\",\"step\":%d,\"source\":\"%s/%s\",\"origin_zyx\":[%lld,%lld,%lld],\"window\":%d,\"halo\":%d,\"window_z\":%d,\"halo_z\":%d,\"ema\":%d%s%s,\"run\":%s}}",
              content, ckpt, step, root, ak, (long long)(fullg ? 0 : bo[0]), (long long)(fullg ? 0 : bo[1]), (long long)(fullg ? 0 : bo[2]), W, halo, Wz, hz, use_ema, grid_attrs, input_attrs, run);
-    if (resume && !opt_atoi("--no-out", opt(argc, argv, "--no-out", "0"))) {   /* an earlier run's shards listed: they must come from this same run */
-        char donep0[1500], zp[1500]; snprintf(donep0, sizeof donep0, "%s/predict-done-%s.txt", out, lv); snprintf(zp, sizeof zp, "%s/zarr.json", ldir);
+    if (resume && !opt_atoi("--no-out", opt(argc, argv, "--no-out", "0"))) {   /* an earlier run's shards listed: they must come from this same run.
+        The record lives in <out>/predict-run-<level>.json (written atomically: tmp + rename, before any shard of this run), not only in
+        zarr.json: a single --heads writer rewrites zarr.json with its own attrs, and --gpus workers rewrite it concurrently (a reader
+        saw no record: false refusals in test_predict_heads / test_pipeline_cli). zarr.json's "run" is the fallback (stores of 6a9186a) */
+        char donep0[1500], zp[1500], rp[1500]; snprintf(donep0, sizeof donep0, "%s/predict-done-%s.txt", out, lv); snprintf(zp, sizeof zp, "%s/zarr.json", ldir);
+        snprintf(rp, sizeof rp, "%s/predict-run-%s.json", out, lv);
         struct stat dst; if (!stat(donep0, &dst) && dst.st_size > 0) {
-            FILE *zf = fopen(zp, "rb"); char *zt = nullptr; size_t zn = 0;
-            if (zf) { fseek(zf, 0, SEEK_END); const long n = ftell(zf); fseek(zf, 0, SEEK_SET); zt = malloc(n > 0 ? (size_t)n + 1 : 1); zn = n > 0 ? fread(zt, 1, (size_t)n, zf) : 0; zt[zn] = 0; fclose(zf); }
-            const char *r0 = zt ? strstr(zt, "\"run\":{") : nullptr; const char *r1 = r0 ? strchr(r0 + 7, '}') : nullptr;
+            char *zt = nullptr; const char *r0 = nullptr, *r1 = nullptr;
+            for (int src = 0; src < 2 && !r1; src++) {   /* the sidecar, then zarr.json */
+                free(zt); zt = nullptr; FILE *zf = fopen(src ? zp : rp, "rb"); size_t zn = 0;
+                if (zf) { fseek(zf, 0, SEEK_END); const long n = ftell(zf); fseek(zf, 0, SEEK_SET); zt = malloc(n > 0 ? (size_t)n + 1 : 1); zn = n > 0 ? fread(zt, 1, (size_t)n, zf) : 0; zt[zn] = 0; fclose(zf); }
+                r0 = zt ? strstr(zt, "\"run\":{") : nullptr; r1 = r0 ? strchr(r0 + 7, '}') : nullptr;
+            }
             const int same = r1 && (size_t)(r1 + 1 - (r0 + 6)) == strlen(run) && !memcmp(r0 + 6, run, strlen(run));
             if (!same) {
                 fprintf(stderr, "predict --resume: %s lists shards of %s run than this one: refusing to mix them (delete %s to start over)\n  store: %.*s\n  now:   %s\n",
-                        donep0, r0 ? "another" : "an unrecorded (older binary)", donep0, r1 ? (int)(r1 + 1 - (r0 + 6)) : 4, r1 ? r0 + 6 : "none", run);
+                        donep0, r1 ? "another" : "an unrecorded (older binary)", donep0, r1 ? (int)(r1 + 1 - (r0 + 6)) : 4, r1 ? r0 + 6 : "none", run);
                 free(zt); return 2;
             }
             free(zt);
         }
+        char tp[1600]; snprintf(tp, sizeof tp, "%s.tmp%d", rp, (int)getpid()); mkdir(out, 0755);
+        FILE *rf = fopen(tp, "w");
+        if (!rf || fprintf(rf, "{\"run\":%s}\n", run) < 0 || fclose(rf) || rename(tp, rp)) { fprintf(stderr, "predict: cannot write %s\n", rp); return 1; }
     }
     const int seam2 = opt_atoi("--seam-inproc", opt(argc, argv, "--seam-inproc", "0")) != 0;   /* (predict --seamless 2 in-process: the stores are replaced, as the two-process blend does) */
     if (seam2) seam_clear_store(out);
