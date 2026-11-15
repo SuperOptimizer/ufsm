@@ -4700,9 +4700,16 @@ size_t unet_ws_plan(unet *u, shape5 xs, size_t pre_budget, int reserve, size_t *
     (void)xs;   /* (the levels of the last build: u->ls) */
     ws_need_t w; memset(&w, 0, sizeof w); w.pre_budget = pre_budget;
     for_each_conv3(u, ws_conv, &w);
-    {   /* the 1^3 head on the tensor cores (lp_mx_gnbwd.cu conv1_to_mx_tc: 17 - 192 inputs): its fp16 weights + row scales (f16 slot 0) */
-        const int ci = u->cfg.widths[0], co = u->cfg.cout;
-        if (ci > 16 && ci <= 192 && co % 32 == 0) ws_max(&w, NN_WS_LPBUF + 12, ((size_t)co * ws_r(ci, 32) + 2 * (size_t)co) * 2);
+    /* the 1^3 heads' backward-data on the tensor cores (lp_mx_gnbwd.cu conv1_to_mx_tc, from nn_bwd.cu bwd_data_impl_ / nn_fusedgn.cu
+       nn_head_bwd_z): fp16 transposed weights + row scales (f16 slot 0). Its "input" is the logit gradient: Ci = the head's cout (17 - 192),
+       Co = the head's cin (a multiple of 32); halves Co * Kp + 2 Co with Kp = Ci rounded up to 32. (The first version had Ci / Co swapped:
+       test_memws, plan mode 4 / MX gradients, 0.0 -> 0.1 MB growth after the plan.) The main head, the deep-supervision and distillation heads */
+    {
+        const convp *hs[UNET_MAXLEV + 2]; int nh = 0; hs[nh++] = &u->head;
+        for (int j = 1; j <= u->cfg.ds_levels && j < UNET_MAXLEV; j++) hs[nh++] = &u->ds[j];
+        if (u->cfg.emb_lev) hs[nh++] = &u->eh;
+        for (int k = 0; k < nh; k++) { const int ci = hs[k]->cout, co = hs[k]->cin;
+            if (hs[k]->k == 1 && ci > 16 && ci <= 192 && co > 0 && co % 32 == 0) ws_max(&w, NN_WS_LPBUF + 12, ((size_t)co * ws_r(ci, 32) + 2 * (size_t)co) * 2); }
     }
     w.id[NN_WS_F4PRE] = w.pre_best;
     size_t t = w.wmemo;
