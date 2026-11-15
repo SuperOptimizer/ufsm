@@ -22,7 +22,7 @@ if [ "${1:-}" != --after ]; then
     elif grep -qE '^XFLAGS=.*--gscale-grow 0( |$)' $E; then good "binary predates 2ff3118 but launch.env passes --gscale-grow 0"
     else bad "binary lacks 2ff3118 (pass-1 mega defaults --gscale-grow 200) and launch.env has no --gscale-grow 0"; fi
     git -C /home/forrest/ufsm merge-base --is-ancestor 472df19 $SHA 2>/dev/null && good "binary contains sampbias 472df19 (zboost: sources.c ignores unknown keys silently)" || bad "binary lacks sampbias 472df19"
-    for b in dcachecap-20261114 dckey-20261114; do git -C /home/forrest/ufsm merge-base --is-ancestor origin/$b $SHA 2>/dev/null && good "binary contains $b" || bad "binary lacks origin/$b (hostmem: derived-cache cap + new keys)"; done
+    for b in dcachecap-20261114 dckey-20261114; do { git -C /home/forrest/ufsm merge-base --is-ancestor origin/$b $SHA 2>/dev/null || git -C /home/forrest/ufsm log --format=%s $SHA | grep -qE "^Merge .*$b"; } && good "binary contains $b (ref or its merge commit; merged branches are deleted)" || bad "binary lacks origin/$b (hostmem: derived-cache cap + new keys)"; done
   [ -e /home/forrest/.cache/ufsm/derived ] && bad "~/.cache/ufsm/derived still in place: mv it to derived.try6 (no trainer / admuon arm reading it)" || good "old derived cache moved away"
   # every --flag the env passes (XFLAGS, OPTX) must be known to the binary (train's opt() ignores nothing silently since 27fee1e, but check here)
   for f in $(grep -E '^(XFLAGS|OPTX)=' $E | cut -d= -f2- | tr ' ' '\n' | grep -E '^--[a-z]' | sort -u); do strings "$U" | grep -qxF -- "$f" || strings "$U" | grep -qF -- "\"$f\"" || strings "$U" | grep -qF -- "$f" || bad "binary does not know $f"; done

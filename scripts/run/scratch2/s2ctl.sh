@@ -92,7 +92,12 @@ case "$CMD" in
           log "parse: $(grep '^U=' $PE | cut -d= -f2-) with $PE"
           ( exec 8>&-; E=$PE; launchenv; cd $R && S2NAME=scratch2.parse DRY=1 FRESH=1 PARSE=1 RESUME=1 LOCK= bash $R/scratch2.launch ) >> $LOG 2>&1
           sleep 5; LP=$(cat $D.launcher.pid 2>/dev/null); while kill -0 "$LP" 2>/dev/null; do sleep 5; done
-          bad=$(grep -E "is not one train reads|not an integer|not a number|unknown option|invalid value" $D.log | head -5)
+          # (main.c's exit-time opt_unread also lists the flags train reads only after the planner (--val-store, --val-seed, --mix-every,
+          # --stop-at-update ...): after the "UFSM_MEM_DRY, exiting" line an unread flag fails only if the binary does not contain it)
+          bad=$(sed '/UFSM_MEM_DRY, exiting after the planner/q' $D.log | grep -E "is not one train reads|not an integer|not a number|unknown option|invalid value" | head -5)
+          for f in $(sed -n '/UFSM_MEM_DRY, exiting after the planner/,$p' $D.log | grep -oE "option --[a-z0-9-]+ is not one train reads" | awk '{print $2}'); do
+            strings "$(grep '^U=' $PE | cut -d= -f2-)" | grep -qxF -- "$f" || bad="${bad:+$bad; }$f unknown to the binary"; done
+          bad="${bad}$(sed -n '/UFSM_MEM_DRY, exiting after the planner/,$p' $D.log | grep -E "not an integer|not a number|invalid value" | head -2)"
           # memory (main 11-15, memwsfix2: the film weight copy ~368 MB is now reserved before the planner): the picked mode must fit with
           # PMARGIN GB (default 0.5) between the plan's need and the free memory per GPU; "no mode fits" (trying / refusing) fails
           pl=$(grep -E "^memory: .*, [0-9.]+ of [0-9.]+ GB free per GPU" $D.log | tail -1)
