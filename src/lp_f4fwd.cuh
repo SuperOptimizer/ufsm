@@ -1134,7 +1134,11 @@ template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const
     if (MT == 4) TZ = 2;
     static int ring_env = -1;
     if (ring_env < 0) ring_env = getenv("UFSM_F4R") ? atoi(getenv("UFSM_F4R")) : 1;
-    const bool skm = IS_MX(TO) && nn_skip_masks(xs, sp);   /* --skip-empty: a masked conv takes launch_f4 (the ring kernels ignore the mask) */
+    /* --skip-empty: a masked conv takes launch_f4 (the ring kernels ignore the mask). UFSM_SKIP_RING=1: the ring kernels anyway (the conv runs
+       dense and unmarked, its backward dense too: the pre-11-15 behaviour, for A/B benches) */
+    static int skring = -1; if (skring < 0) skring = getenv("UFSM_SKIP_RING") ? atoi(getenv("UFSM_SKIP_RING")) : 0;
+    const bool skm = !skring && IS_MX(TO) && nn_skip_masks(xs, sp);
+    if (skm && (Cip == 32 || Cip == 64) && getenv("UFSM_SKIP_DEBUG")) fprintf(stderr, "skip: masked %d->%d conv %dx%dx%d (Cip %d, up %d) bypasses the ring kernels\n", xs.c, cout, xs.d, xs.h, xs.w, Cip, sp.up);
     if (ring_env && (Cip == 32 || (Cip == 64 && ring_env >= 1)) && !sp.up && !tz_env && !skm) {   /* one or two input chunks: staged once per z tile for
                                                                                          every output tile, planes in a ring */
         if (Cip == 32) switch (MT * 10 + TZ) {
