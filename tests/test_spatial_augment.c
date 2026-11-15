@@ -6,7 +6,9 @@
 #include "fm_tol.h"
 /* two writers of the same window (tests/fm_tol.h): bit-identical under UFSM_STRICT_MATH. Fast math (the two paths round
    differently): targets u8 +-1 on <= 1e-3 of the bytes, mask and target flips (a coordinate on an in-bounds / rounding boundary) on
-   <= 1e-4, the input channels where both masks agree fp16 +-1 ulp / fp32 rel 1e-6. Returns nonzero when they differ beyond that. */
+   <= 1e-4, the input channels where both masks agree fp16 +-1 ulp or |d| <= 1e-4 / fp32 rel 1e-6 + abs 1e-4 (the CT is normalised
+   from 0..255-scale fp32 intermediates: its rounding error is absolute, a few fp32 ulps of 255 times the gain, so near 0 it spans
+   many fp16 ulps; desk fm round 11-15: worst |d| 5e-5). Returns nonzero when they differ beyond that. */
 static int ws_cmp(const uint8_t *Ta, const uint8_t *Tb, size_t nt, const uint8_t *Ma, const uint8_t *Mb, size_t nq, const uint16_t *Ha,
                   const uint16_t *Hb, const float *Xa, const float *Xb, size_t nch) {
     if (FM_STRICT) return memcmp(Ta, Tb, nt) || memcmp(Ma, Mb, nq) || (Ha ? memcmp(Ha, Hb, nch * nq * 2) : Xa ? memcmp(Xa, Xb, nch * nq * 4) : 0);
@@ -15,10 +17,10 @@ static int ws_cmp(const uint8_t *Ta, const uint8_t *Tb, size_t nt, const uint8_t
     for (size_t c = 0; c < nch && (Ha || Xa); c++) for (size_t k = 0; k < nq; k++) {
         if (Ma[k] != Mb[k]) continue;
         const size_t i = c * nq + k;
-        if (Ha) { int32_t d = fm_h16_ord(Ha[i]) - fm_h16_ord(Hb[i]); nv += d > 1 || d < -1; }
-        else nv += !fm_close(Xa[i], Xb[i], 1e-6, 1e-6);
+        if (Ha) { int32_t d = fm_h16_ord(Ha[i]) - fm_h16_ord(Hb[i]); nv += (d > 1 || d < -1) && !(fabs((double)fm_h16_f(Ha[i]) - fm_h16_f(Hb[i])) <= 1e-4); }
+        else nv += !fm_close(Xa[i], Xb[i], 1e-6, 1e-4);
     }
-    if (nv) fprintf(stderr, "FAIL writer inputs: %zu of %zu beyond %s\n", nv, nch * nq, Ha ? "1 fp16 ulp" : "fp32 rel 1e-6");
+    if (nv) fprintf(stderr, "FAIL writer inputs: %zu of %zu beyond %s\n", nv, nch * nq, Ha ? "1 fp16 ulp / 1e-4" : "fp32 rel 1e-6 + 1e-4");
     return bad || nv;
 }
 void *nn_host_alloc(size_t n) { return malloc(n); }
@@ -265,7 +267,7 @@ int main(void) {
                 memset(nrs, 0, Q * 4); memset(nps, 0, (size_t)Q * Q * 4); rseed(&r, 5 + plan);
                 write_spatial_tm(c2, t2, m2, nullptr, nullptr, Q, org, 85, .031f, 1, cyq, cxq, sy, &a, 1.05f, .01f, .03f, &r, nr, 1, nullptr, Hb, pp, nrs, nps, nullptr, nullptr, app, 1, 1, TMb);
                 /* bit-identical under UFSM_STRICT_MATH; fast math: packed code bytes flip on <= 1e-4 of the voxels, fp16 CT +-1 ulp */
-                const int d = fm_cmp_u8c("packed codes", TMa, TMb, nq, 0, 0, 1e-4, 1e-4) | fm_cmp_h16("trainer CT fp16", Ha, Hb, nq, 1);
+                const int d = fm_cmp_u8c("packed codes", TMa, TMb, nq, 0, 0, 1e-4, 1e-4) | fm_cmp_h16a("trainer CT fp16", Ha, Hb, nq, 1, 1e-4);
                 if (d) fprintf(stderr, "trainer CT writer differs: P %d plan %d\n", Q, plan);
                 diffs += d; runs++;
             }

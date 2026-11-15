@@ -52,7 +52,7 @@ int main(int argc, char **argv) {
         int32_t hd[8]; memcpy(hd, b[i].rad, sizeof hd); warped += hd[6] & 1;
         /* pack_tm 1 warps through the packed fast warp, 0 through the trilinear one: bit-identical under UFSM_STRICT_MATH; fast math
            (tests/fm_tol.h): x fp16 +-1 ulp, side phase +-1 (cyclic 252) on <= 1e-3, w4 / wc and packed target / mask flips on <= 1e-4 */
-        same &= !fm_cmp_h16("x", a[i].x, b[i].x, p3, 1) && !memcmp(a[i].rad, b[i].rad, NN_RAD_REC(PW)) &&
+        same &= !fm_cmp_h16a("x", a[i].x, b[i].x, p3, 1, 1e-4) && !memcmp(a[i].rad, b[i].rad, NN_RAD_REC(PW)) &&
                 !fm_cmp_u8c("side", a[i].side, b[i].side, p3, 1, PHASE_PERIOD, 1e-3, 1e-4) && !fm_cmp_u8c("w4", a[i].w4, b[i].w4, p3, 0, 0, 1e-4, 1e-4) &&
                 !fm_cmp_u8c("wc", a[i].wc, b[i].wc, p3, 0, 0, 1e-4, 1e-4) && !memcmp(a[i].corner, b[i].corner, sizeof a[i].corner);
         size_t tmd = 0;
