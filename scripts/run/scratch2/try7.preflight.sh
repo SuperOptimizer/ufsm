@@ -29,7 +29,7 @@ if [ "${1:-}" != --after ]; then
   grep -qE '^MLR=0.003$' $E && good "Muon lr 0.003" || bad "MLR is not 0.003"
   LARS=0; grep -qE '^OPTX=.*--muon-lars 1' $E && LARS=1   # (adm_ema is written only with LARS on; admuon 11-15: NorMuon alone may suffice, main decides)
   grep -qE '^OPTX=.*--normuon 1' $E && good "optimizer: NorMuon$([ $LARS = 1 ] && echo ' + LARS')" || bad "OPTX lacks --normuon 1 (main's try7 decision)"
-  for f in --normuon --muon-lars; do strings "$U" | grep -qF -- "$f" || bad "binary does not know $f"; done
+  for f in --normuon $([ $LARS = 1 ] && echo --muon-lars); do strings "$U" | grep -qF -- "$f" || bad "binary does not know $f"; done
   [ $LARS = 1 ] && {   strings "$U" | grep -qF '"adm_ema\":[' || strings "$U" | grep -qF 'adm_ema' && good "binary writes adm_ema" || bad "binary has no adm_ema checkpoint key (older than 5e8aab7?)"; }
   for f in --stop-at-update --gns-skip-echo; do strings "$U" | grep -qF -- "$f" && good "binary knows $f (trainlow 738e72f7)" || bad "binary lacks $f (trainlow-20261114 738e72f7)"; done
   grep -qE '^XFLAGS=.*--accum auto' $E && ! grep -qE '^XFLAGS=.*--gns-skip-echo 1' $E && grep -qE '^XFLAGS=.*--echo-max [1-9]' $E && bad "--accum auto with --echo-max needs --gns-skip-echo 1 (main)"
