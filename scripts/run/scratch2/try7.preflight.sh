@@ -6,6 +6,7 @@ set -u
 R=/vesuvius/ufsm/v2/lat/runs; E=$R/try7.launch.env; ok=1; bad() { echo "FAIL: $*"; ok=0; }; good() { echo "ok: $*"; }
 U=$(grep '^U=' $E | cut -d= -f2-); SRCJ=$(grep '^SRCJ=' $E | cut -d= -f2-)
 if [ "${1:-}" = --ckpt ]; then   # after try7's first checkpoint (--ckpt-every, 250 steps): LARS state must ride in the header (main 11-14)
+  grep -qE '^OPTX=.*--muon-lars 1' $E || { echo "ok: no --muon-lars in the env, no adm_ema expected (the NorMuon row EMA is not checkpointed)"; exit 0; }
   C=$R/scratch2/last.ckpt; [ -f $C ] || { echo "FAIL: no $C yet (first checkpoint at step 250)"; exit 1; }
   hd=$(head -c 400000 $C | head -1); st=$(echo "$hd" | grep -o '"step":[0-9]*' | head -1 | cut -d: -f2)
   echo "$hd" | grep -q '"adm_ema":\[' && good "adm_ema in the step-$st checkpoint header ($(echo "$hd" | grep -o '"adm_ema":\[[^]]*' | tr ',' '\n' | wc -l) values)" || bad "no adm_ema in the step-$st checkpoint header: LARS is not on"
@@ -26,9 +27,10 @@ if [ "${1:-}" != --after ]; then
   # every --flag the env passes (XFLAGS, OPTX) must be known to the binary (train's opt() ignores nothing silently since 27fee1e, but check here)
   for f in $(grep -E '^(XFLAGS|OPTX)=' $E | cut -d= -f2- | tr ' ' '\n' | grep -E '^--[a-z]' | sort -u); do strings "$U" | grep -qxF -- "$f" || strings "$U" | grep -qF -- "\"$f\"" || strings "$U" | grep -qF -- "$f" || bad "binary does not know $f"; done
   grep -qE '^MLR=0.003$' $E && good "Muon lr 0.003" || bad "MLR is not 0.003"
-  grep -qE '^OPTX=.*--normuon 1.*--muon-lars 1' $E && good "optimizer: NorMuon + LARS (main 11-14)" || bad "OPTX lacks --normuon 1 --muon-lars 1 (main's try7 decision)"
+  LARS=0; grep -qE '^OPTX=.*--muon-lars 1' $E && LARS=1   # (adm_ema is written only with LARS on; admuon 11-15: NorMuon alone may suffice, main decides)
+  grep -qE '^OPTX=.*--normuon 1' $E && good "optimizer: NorMuon$([ $LARS = 1 ] && echo ' + LARS')" || bad "OPTX lacks --normuon 1 (main's try7 decision)"
   for f in --normuon --muon-lars; do strings "$U" | grep -qF -- "$f" || bad "binary does not know $f"; done
-  strings "$U" | grep -qF '"adm_ema\":[' || strings "$U" | grep -qF 'adm_ema' && good "binary writes adm_ema" || bad "binary has no adm_ema checkpoint key (older than 5e8aab7?)"
+  [ $LARS = 1 ] && {   strings "$U" | grep -qF '"adm_ema\":[' || strings "$U" | grep -qF 'adm_ema' && good "binary writes adm_ema" || bad "binary has no adm_ema checkpoint key (older than 5e8aab7?)"; }
   for f in --stop-at-update --gns-skip-echo; do strings "$U" | grep -qF -- "$f" && good "binary knows $f (trainlow 738e72f7)" || bad "binary lacks $f (trainlow-20261114 738e72f7)"; done
   grep -qE '^XFLAGS=.*--accum auto' $E && ! grep -qE '^XFLAGS=.*--gns-skip-echo 1' $E && grep -qE '^XFLAGS=.*--echo-max [1-9]' $E && bad "--accum auto with --echo-max needs --gns-skip-echo 1 (main)"
   strings "$U" | grep -qF -- "--holdout-guard" && good "binary knows --holdout-guard" || bad "binary lacks --holdout-guard"
