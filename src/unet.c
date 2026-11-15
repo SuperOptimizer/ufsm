@@ -4578,14 +4578,21 @@ static void ost_groups(unet *u) {   /* each descriptor's group from its weight o
     free(h);
 }
 void unet_opt_stats_arm(unet *u) { u->ost_arm = 1; }
-static void ost_begin(unet *u) {
+static void ost_alloc(unet *u) {   /* the device sums and the AdamW snapshot (the plain ranges' bytes: 4.3 MB in test_memws) */
     if (!u->ost_dev) { u->ost_dev = nn_malloc((size_t)2 * (UNET_MAXCONV + OST_NG) * sizeof(double)); }
+    if (!u->ost_seg) { ost_segs s = {0}; plain_ranges(u, ost_plain, &s); u->ost_seg = s.seg; u->ost_nseg = s.n; size_t t = 0; for (int i = 0; i < s.n; i++) t += s.seg[3 * i + 1];
+        u->ost_snap_n = t; u->ost_snap = t ? nn_malloc(t * 4) : nullptr; }
+}
+/* train: --opt-stats on GPU 0, before the memory planner measures (they were allocated at the first armed update, after the plan:
+   test_memws "device allocations after step 1", caller unet_muon / ost_adam_before; 2026-11-15) */
+void unet_opt_stats_reserve(unet *u) { ost_alloc(u); }
+static void ost_begin(unet *u) {
+    ost_alloc(u);
     nn_zero(u->ost_dev, (size_t)2 * (UNET_MAXCONV + OST_NG) * sizeof(double));
     nn_muon_stats(u->ost_dev, 0);
 }
 static void ost_adam_before(unet *u) {
-    if (!u->ost_seg) { ost_segs s = {0}; plain_ranges(u, ost_plain, &s); u->ost_seg = s.seg; u->ost_nseg = s.n; size_t t = 0; for (int i = 0; i < s.n; i++) t += s.seg[3 * i + 1];
-        u->ost_snap_n = t; u->ost_snap = t ? nn_malloc(t * 4) : nullptr; }
+    ost_alloc(u);
     size_t t = 0; for (int i = 0; i < u->ost_nseg; i++) { nn_d2d_async(u->ost_snap + t, u->p + u->ost_seg[3 * i], u->ost_seg[3 * i + 1] * 4); t += u->ost_seg[3 * i + 1]; }
 }
 static void ost_adam_after(unet *u) {

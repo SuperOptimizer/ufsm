@@ -4258,7 +4258,7 @@ int cmd_train(int argc, char **argv) {
             const int l3_off = getenv("UFSM_L0_3BUF") && !ufsm_env_on("UFSM_L0_3BUF");   /* (UFSM_L0_3BUF=0: never the three level-0 buffers) */
             const int fastest = !strcmp(mm, "fast");
             size_t fmin = (size_t)-1;
-            for (int g = 0; g < ng; g++) { nn_init(G[g].dev); unet_reserve(G[g].u, use_muon, muon_tc); if (g_lat && lp_f8w_mixed_reserve()) fprintf(stderr, "memory: the input conv's chunk copies (96 MB) failed\n");
+            for (int g = 0; g < ng; g++) { nn_init(G[g].dev); unet_reserve(G[g].u, use_muon, muon_tc); if (g == 0 && use_muon && opt_stats > 0) unet_opt_stats_reserve(G[g].u); if (g_lat && lp_f8w_mixed_reserve()) fprintf(stderr, "memory: the input conv's chunk copies (96 MB) failed\n");
                                            if (g_fstem && nn_fstem_reserve(g_fstem, g_fs_n)) fprintf(stderr, "memory: the fine stem's partial sums failed\n"); }   /* (5.3 MB at 16 -> 16) */
             /* (the lazily allocated optimizer / attention / kernel workspaces exist now, so the free memory below has them out: 2026-11-14 audit) */
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); size_t f = nn_mem_free(); if (f < fmin) fmin = f; }
