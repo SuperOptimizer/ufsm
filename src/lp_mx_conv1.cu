@@ -493,7 +493,7 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const 
    weight and bias gradients as conv_bwd_w1_tc_k (two m16n8k16 column tiles: all outputs at once), and the input gradient
    gx[ci][v] = sum_co w[co][ci] gy[co][v] (the gradient of act(x), the head's input) on the CUDA cores into an MX row (YB bits,
    exact SR keyed by sr for fp4), as conv1_to_mx_t_k. The separate kernels read x twice (8 outputs per pass) and gy twice. */
-template <int B, int YB, int CO = 16>   /* CO: the output count when known at compile time (16: any Co <= 16 at run time) */
+template <int B, int YB, int CO = 16, bool GN = true>   /* CO: the output count when known at compile time (16: any Co <= 16 at run time); GN: gp.G != 0, chosen at the launch */
 __global__ void __launch_bounds__(256, 2) conv1_bwd_fused_k(const uint8_t *x, const __half *gy, const float *w, float *gw, float *gb, uint8_t *gx, int N, size_t S, gnp_t gp,
                                                       int nper, int Co, unsigned sr, size_t v00, size_t Sy) {   /* voxels [v00, v00 + Sy); gy planes of Sy voxels */
     constexpr int CI = 32;
@@ -527,7 +527,7 @@ __global__ void __launch_bounds__(256, 2) conv1_bwd_fused_k(const uint8_t *x, co
             const int bk = gp.ns && in ? gn_row_v(gp, n, v) - r0 : 0;
             const float *cav = ca[bk], *cbv = cb[bk];
 #pragma unroll
-            for (int k = 0; k < CI; k++) sA[warp][k][lane] = __float2half_rn(in ? (gp.G ? act_ab(r[k], cav[k], cbv[k], true) : r[k]) : 0.f);
+            for (int k = 0; k < CI; k++) sA[warp][k][lane] = __float2half_rn(in ? (GN ? act_ab(r[k], cav[k], cbv[k], true) : r[k]) : 0.f);
 #pragma unroll
             for (int co = 0; co < 16; co++) {
                 const __half h = in && co < (CO < 16 ? CO : Co) ? gy[((size_t)n * Co + co) * Sy + (v - v00)] : __float2half_rn(0.f);
@@ -603,8 +603,10 @@ extern "C" int lp_head_bwd_mx_r(const void *x, int xdt, shape5 xs, const void *g
     const size_t S = shape_spatial(xs), Sy = nv ? nv : S;
     const int nper = slab_nper(gp, 8192);
     const dim3 grid((unsigned)((Sy + nper - 1) / nper), xs.n);
-#define HBF(B, YB) do { if (ys.c == 11) conv1_bwd_fused_k<B, YB, 11><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, w, gw, gb, (uint8_t *)gx, xs.n, S, gp, nper, ys.c, sr, vb, Sy); \
-                       else conv1_bwd_fused_k<B, YB><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, w, gw, gb, (uint8_t *)gx, xs.n, S, gp, nper, ys.c, sr, vb, Sy); } while (0)
+#define HBF1(B, YB, CO, G) conv1_bwd_fused_k<B, YB, CO, G><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, w, gw, gb, (uint8_t *)gx, xs.n, S, gp, nper, ys.c, sr, vb, Sy)
+/* (GroupNorm chosen here, not per channel and voxel inside the unrolled k loop: mcc kept 32 branch regions of ex2 + div there, nvcc unswitched) */
+#define HBF(B, YB) do { if (ys.c == 11) { if (gp.G) HBF1(B, YB, 11, true); else HBF1(B, YB, 11, false); } \
+                       else { if (gp.G) HBF1(B, YB, 16, true); else HBF1(B, YB, 16, false); } } while (0)
     if (xdt == 4) { if (gxdt == 4) HBF(4, 4); else HBF(4, 8); }
     else { if (gxdt == 4) HBF(8, 4); else HBF(8, 8); }
 #undef HBF
