@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 static uint64_t rs = 777;
 static double urand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (double)(rs >> 11) * 0x1.0p-53; }
@@ -44,7 +45,7 @@ static void gpu_max(const float *dqkv, const float *dqg, const float *dkg, void 
 }
 
 int main(void) {
-    if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_qkclip", "nn_init(0) failed");
     at_set_core(1);
     float *qkv = malloc((size_t)T * 3 * C * 4), qg[C], kg[C], qg2[C], kg2[C];
     for (long i = 0; i < (long)T * 3 * C; i++) qkv[i] = (float)nrand();

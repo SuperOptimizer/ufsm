@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 static int fails = 0;
 static int g_gpu = 0;   /* test_flatten_gpu (-DFLAT_GPU, linked with nn_flat.o): the SLIM iterations on the GPU */
@@ -126,7 +127,7 @@ int main(void) {
 #ifdef FLAT_GPU
     {   /* a device? (one triangle) */
         const double g[6] = {-1, -1, 1, 0, 0, 1}, A[1] = {0.5}; const int tri[3] = {0, 1, 2}, vo[4] = {0, 1, 2, 3}, vl[3] = {0, 1, 2}; double x[6] = {0, 0, 1, 0, 0, 1}, E;
-        if (flat_slim_gpu(g, A, tri, 1, vo, vl, 3, x, 1, 5, 1e-9, 0, "probe", -1, &E)) { printf("test_flatten_gpu: no GPU, skipped\n"); return 0; }
+        if (flat_slim_gpu(g, A, tri, 1, vo, vl, 3, x, 1, 5, 1e-9, 0, "probe", -1, &E)) return test_no_gpu("test_flatten_gpu", "the device probe failed");
     }
     g_gpu = 1;
     cmp_gpu("cylinder", cyl, 0); cmp_gpu("cone-holes", cone, 1); cmp_gpu("sphere-cap", sph, 0);

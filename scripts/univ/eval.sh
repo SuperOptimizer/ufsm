@@ -64,15 +64,26 @@ if has fib && [ "${FIB:-1}" = 1 ] && { [ -n "$FIBCH" ] || [ "${FIBP:-}" = heads 
   o=$E/$T/fib; mkdir -p $o; BOX=12288,4096,3584,512,576,768; J="--um 2.4 --level 2 --slab 12288,512 --region 4096,4608,3584,4352 --tile 256 --d-mm 0.3,0.6,1.2,2.4"
   if [ "${FIBP:-}" = heads ]; then   # FIBP=heads (latent-grid checkpoints, 2026-11-12): predict --heads fib writes fib/H, fib/V, fib/dyad/c2..c7
     # from one trunk pass (the trained path: fine stem + sub-cell placement), linked where the --channel path puts them; FIBCH is unused
-    [ -e $o/fh/fib/H ] || lkg ${UP:-$U} predict $CK $M $P4K $o/fh --um 2.4 --level 2 --box $BOX --levels 1 --heads fib ${PXH:-} --gpu $GPU --threads 6 --cache $WB/cache > $o/predict_heads.log 2>&1 || log "fib: predict --heads fib failed"
+    [ -e $o/fh/fib/H ] || lkg ${UP:-$U} predict $CK $M $P4K $o/fh --um 2.4 --level 2 --box $BOX --levels 1 --heads fib ${PXH:-} $(bash $H/scripts/unroll/axis_for.sh PHercParis4) --gpu $GPU --threads 6 --cache $WB/cache > $o/predict_heads.log 2>&1 || log "fib: predict --heads fib failed"
     for n in H V dyad; do [ -e $o/fh/fib/$n ] && ln -sfn fh/fib/$n $o/$n; done; FIBCH=; fi
   for kv in $FIBCH; do n=${kv%%=*}; cs=${kv#*=}; a=${cs%-*}; b=${cs#*-}
     for ch in $(seq $a $b); do d=$o/$n; [ $n = dyad ] && d=$o/dyad/c$ch; [ -e $d/9.6/zarr.json ] && continue
-      lkg ${UP:-$U} predict $CK $M $P4K $d --um 2.4 --level 2 --box $BOX --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/predict_c$ch.log 2>&1 || log "fib: predict c$ch failed"; done; done
+      lkg ${UP:-$U} predict $CK $M $P4K $d --um 2.4 --level 2 --box $BOX --channel $ch $(bash $H/scripts/unroll/axis_for.sh PHercParis4) --gpu $GPU --threads 6 --cache $WB/cache > $o/predict_c$ch.log 2>&1 || log "fib: predict c$ch failed"; done; done
   for f in H V; do [ -e $o/$f/9.6/zarr.json ] || continue; for m in tube dyad; do x=""; [ $m = dyad ] && { [ -d $o/dyad ] || continue; x="--dyad $o/dyad"; }
     [ -s $o/$f-$m.judge ] && continue
-    nice -n 10 $U fiber-trace - - $o/$f-$m.fib --mask $o/$f 9.6 --mask-origin 12288,4096,3584 --box $BOX --scaledown 2 --family $f --half 1024 --min-len 48 --threads 4 $x > $o/trace_$f-$m.log 2>&1
-    { python3 -I $H/scripts/univ/fiblen.py $o/$f-$m.fib; nice -n 10 $U fiber-judge $o/$f-$m.fib --phase ${FIBPH:-/vesuvius/ufsm/gt/paris4-wind-20261019} phaseA/9.6 $J 2>&1 | grep "$f:"; } > $o/$f-$m.judge
+    # (eval audit 11-14 #5: the judge's GT phaseA was deleted on 11-12, and the old line wrote fiblen's output even when fiber-judge failed, so a
+    #  missing GT left a non-empty .judge that later runs skipped as done. The .judge file is now written only when the trace and the judge
+    #  both succeed and the judge printed its family line; the GT is phaseB (the july set, the only Paris 4 phase left; rows before 11-14
+    #  were judged against phaseA and are not comparable). FIBPH / FIBPHK override.)
+    # (11-14 later: phaseA rebuilt for the eval boxes only (HOLD, PH1-3, the 4 slab sites; p4kit.sh's recipe from the June qA surfaces) in
+    #  /vesuvius/ufsm/gt/paris4-phaseA-evalboxes-20261114: the judge is back on phaseA, comparable with the rows before 11-12. Outside those boxes it is unknown.)
+    ph=${FIBPH:-/vesuvius/ufsm/gt/paris4-phaseA-evalboxes-20261114}; phk=${FIBPHK:-phaseA/9.6}
+    [ -e $ph/$phk/zarr.json ] || { log "fib: FAILED, no GT phase $ph/$phk"; FIBFAIL=1; continue; }
+    nice -n 10 $U fiber-trace - - $o/$f-$m.fib --mask $o/$f 9.6 --mask-origin 12288,4096,3584 --box $BOX --scaledown 2 --family $f --half 1024 --min-len 48 --threads 4 $x > $o/trace_$f-$m.log 2>&1 ||
+      { log "fib: FAILED, fiber-trace $f-$m (see $o/trace_$f-$m.log)"; FIBFAIL=1; continue; }
+    jl=$(nice -n 10 $U fiber-judge $o/$f-$m.fib --phase $ph $phk $J 2>&1 | tee $o/judge_$f-$m.log | grep "$f:")
+    [ -n "$jl" ] || { log "fib: FAILED, fiber-judge $f-$m printed no $f: line (see $o/judge_$f-$m.log)"; FIBFAIL=1; continue; }
+    { python3 -I $H/scripts/univ/fiblen.py $o/$f-$m.fib; echo "$jl"; echo "gt $ph $phk"; } > $o/$f-$m.judge.tmp && mv $o/$f-$m.judge.tmp $o/$f-$m.judge
   done; done
 fi
 if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | heads (predict --heads ink: latent nets) | ch:N (channel N of CKPT, ink at 2.4 um level LV_INK (default 1 = 4.8 um))
@@ -87,8 +98,11 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
     [ -n "${INKONLY:-}" ] && [ "$cr" != "$INKONLY" ] && continue   # INKONLY=CROP: that crop alone (a caller yielding GPU 0 between crops)
     ctk=${ctk:-$P4K}; case $M in http*) ;; *) ctk=${ctk/\/volumes\//\/};; esac   # (a local CT tree, e.g. the desk's /vesuvius/ufsm/v2/ct: keys without volumes/)
     um=$(python3 -I -c "import json; print(json.load(open('$C/$cr/crop.json')).get('um', 2.4))")
+    # INK_AXIS (default 1; audit inkmil #2): the scroll's axis for the heads predict, as 97 % of the ink training weight carried one (0: none, the old behaviour)
+    AXI=; if [ "${INK_AXIS:-1}" = 1 ]; then ax=$(awk -F'\t' -v s="${scr:-PHercParis4}" '$1 == s {print $2}' ${INK_AXES:-$(dirname $(readlink -f $0))/ink_axes.tsv}); [ -n "$ax" ] && [ -s "$ax" ] && AXI="--axis $ax"; fi
     g=/nonexistent; for gd in ${INKGT:-}; do [ -d $gd/$cr.zarr ] && { g=$gd/$cr.zarr; break; }; done; vs=0; [ -d $g ] && ! grep -qP "^$cr\t" $o/vscores.tsv && vs=1   # INKGT: one or more dirs
     grep -qP "^$cr\t" $o/scores.tsv && [ $vs = 0 ] && continue
+    AXF=$(bash $H/scripts/unroll/axis_for.sh ${scr:-PHercParis4}) || { log "ink: $cr: no axis for ${scr:-PHercParis4} (predict needs one)"; continue; }
     v=$o/vol_${scr:-PHercParis4}; [ "$INKP" = heads ] && v=$o/vol_$cr   # (predict --heads has no --resume: a store per crop)
     if [ "$INKP" = ink3dext ]; then lvi=1; key=$(python3 -I -c "print(round($um * 2, 3))")
       [ -e $o/pred_$cr.done ] || lkg $U ink3d-ext --model dino3d --weights ${INKW:-/vesuvius/ufsm/teachers/dino3d/ckpt_78k_fullsup.pth} --ct $M $ctk/0 --ct-um $um --box $box --surface $C/$cr --out $v --out-um 4.8 --gpu $GPU --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }
@@ -98,12 +112,12 @@ if has ink && [ "${INK:-1}" = 1 ] && [ -n "$INKP" ]; then   # INKP = ink3dext | 
       if [ "${BLEND:-0}" = 1 ]; then   # BLEND=1 (lead 2026-11-12): the latent ink head's level steps at window seams (inkB: 10-30 / 255, halo 16..256
         # alike), so two passes on tile grids offset by half the 512 core (--grid-origin, in level-LV voxels) blended with sin^2 weights, as
         # inkB's sched/inkwatch/u1667ink-v2.sh (ink-blend: seam step 16.9 -> 1.3 on a 1299 box); the passes are kept in $v.g0 / $v.g256
-        [ -e $o/pred_$cr.done ] || { for gg in 0 256; do [ -e $v.g$gg/ink/zarr.json ] || lkg ${UP:-$U} predict $CK $M $ctk $v.g$gg --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink --window 544 --halo 16 --grid-origin $gg,$gg,$gg ${PXH:-} --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_${cr}_g$gg.log 2>&1 || break; done
+        [ -e $o/pred_$cr.done ] || { for gg in 0 256; do [ -e $v.g$gg/ink/zarr.json ] || lkg ${UP:-$U} predict $CK $M $ctk $v.g$gg --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink --window 544 --halo 16 --window-round 1 --grid-origin $gg,$gg,$gg ${PXH:-} $AXF --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_${cr}_g$gg.log 2>&1 || break; done
           [ -e $v.g0/ink/zarr.json ] && [ -e $v.g256/ink/zarr.json ] && mkdir -p $v.h && ${UP:-$U} ink-blend $v.h/ink --um $key --tile 512,512,512 --grids 0,0,0:256,256,256 $v.g0/ink $v.g256/ink --threads 8 > $o/blend_$cr.log 2>&1 && [ -e $v.h/ink/zarr.json ]; } || { log "ink: $cr blended predict failed"; continue; }
       else
-      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink ${PXH:-} --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
+      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v.h --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --heads ink ${PXH:-} $AXF --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
     else lvi=${LV_INK:-1}; ch=${INKP#ch:}; key=$(python3 -I -c "print(round($um * 2 ** $lvi, 3))")
-      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --resume 1 --channel $ch --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
+      [ -e $o/pred_$cr.done ] || lkg ${UP:-$U} predict $CK $M $ctk $v --um $um --level $lvi --box $(lbox $box $lvi) --full-grid 1 --levels 1 --resume 1 --channel $ch $AXF --gpu $GPU --threads 6 --cache $WB/cache > $o/ink_$cr.log 2>&1 || { log "ink: $cr predict failed"; continue; }; fi
     touch $o/pred_$cr.done; [ $PO = 1 ] && continue
     if [ $vs = 1 ]; then gk=$(ls $g | grep -vE '^(segments|zarr.json)$' | head -1)
       $U ink-vscore --gt $g $gk --pred $v $key --box $box --level $lvi --row $cr --threads 8 2>> $o/vscore_$cr.log | grep -P "^$cr\t" >> $o/vscores.tsv; fi
@@ -121,7 +135,7 @@ PY
   done; done
 fi
 
-[ $PO = 1 ] && exit 0
+[ $PO = 1 ] && exit $([ "${FIBFAIL:-0}" = 0 ] && echo 0 || echo 1)
 # ---- matrix ----
 { echo "== univ eval $T  $CK  $(date)"
   ws() { $U wbench-stats $1 $2 --metric p05x,ids 2>&1 | grep -v label-noise | grep -E '^(p05x|ids) '; }
@@ -148,9 +162,10 @@ fi
   [ -s $E/$T/ink/scores.tsv ] && { echo "-- ink (ink-score vs human labels: crop map n inkfrac f1best thr f1_05 prec05 rec05 auc)"; cat $E/$T/ink/scores.tsv
     awk -F'\t' '{n++; f+=$5; a+=$10} END {if (n) printf "mean over %d crops: f1best %.4f auc %.4f\n", n, f / n, a / n}' $E/$T/ink/scores.tsv; }
     [ -s $E/$T/ink/vscores.tsv ] && echo "-- ink voxelwise (ink-vscore vs 3-D ink-splat refs: crop P N known_frac ink_share auc thr f1best f1_05 prec05 rec05)" && cat $E/$T/ink/vscores.tsv && awk -F"\t" "{n++; a+=\$6; f+=\$8} END {if (n) printf \"voxelwise vs 3-D refs over %d crops: auc %.4f f1best %.4f\\n\", n, a / n, f / n}" $E/$T/ink/vscores.tsv;
-    # per scroll (crop names: w.. = Paris 4, else SCROLL_w..): held-out rows named for what the trunk saw (INKSEEN "SCROLL=label ...")
+    # per scroll (crop names: w.. = Paris 4, else SCROLL_w..): held-out rows named for what the trunk saw (INKSEEN "SCROLL=label ...") (no default since 11-14: 0500P2 / 0841 are training sources of scratch1, eval audit #1; set it per checkpoint)
+    [ -s $E/$T/ink/vscores.tsv ] && python3 -I $H/scripts/univ/inkci.py $E/$T/ink/vscores.tsv   # (bootstrap CIs over label segments, F1 above its all-ink floor)
     for f in scores:5:10 vscores:8:6; do IFS=: read -r fn fc ac <<< "$f"; [ -s $E/$T/ink/$fn.tsv ] || continue
-      awk -F'\t' -v fc=$fc -v ac=$ac -v lab="${INKSEEN:-PHerc0500P2=unseen-ink-labels,seen-CT PHerc0841=unseen-scroll}" -v w=$fn 'BEGIN {n = split(lab, L, " "); for (i = 1; i <= n; i++) { split(L[i], kv, "="); D[kv[1]] = kv[2] } }
+      awk -F'\t' -v fc=$fc -v ac=$ac -v lab="${INKSEEN:-}" -v w=$fn 'BEGIN {n = split(lab, L, " "); for (i = 1; i <= n; i++) { split(L[i], kv, "="); D[kv[1]] = kv[2] } }
         { s = ($1 ~ /^w[0-9]/) ? "PHercParis4" : substr($1, 1, index($1, "_w") - 1); c[s]++; F[s] += $fc; A[s] += $ac }
         END { for (s in c) printf "%s per scroll %-12s %-28s n %2d auc %.4f f1best %.4f\n", w, s, (s in D) ? D[s] : "", c[s], A[s] / c[s], F[s] / c[s] }' $E/$T/ink/$fn.tsv | sort; done
   if [ -s $E/$T/reslog.line ] && [ -s ${RESLOG:-/workspace/univA/u2.log} ]; then   # (step lines: '... X samp/s Y Mvox/s')
@@ -158,3 +173,4 @@ fi
       END { if (n) printf "-- resident trainer during the fits: %d step lines, %.3f samp/s (%.1f%% of 0.72), %.0f Mvox/s (%.1f%% of 776)\n", n, S / n, 100 * S / n / 0.72, V / n, 100 * V / n / 776 }'; fi
 } > $E/$T.matrix.txt
 log "matrix -> $E/$T.matrix.txt"
+[ "${FIBFAIL:-0}" = 0 ] || { log "fib: at least one judge FAILED (no .judge written for it)"; exit 1; }

@@ -29,7 +29,7 @@ typedef struct {
     int holdout_reject;      /* training windows that overlap a held-out box (any same-CT source's): 0 = keep the window, every label unknown
                                 inside the box grown by holdout_guard level-l voxels ("mask", the default); 1 = drop and redraw ("reject").
                                 A source's "holdout_mode" overrides it */
-    int ink_mil, mil_mode, mil_stride, mil_max; float mil_R;   /* --ink-mil: each window's normal-pooled MIL rays (inksplat.h inkfly_rays of the source's onfly ink target:
+    int ink_mil, mil_mode, mil_stride, mil_max; float mil_R, mil_r_um;   /* --ink-mil: each window's normal-pooled MIL rays (inksplat.h inkfly_rays of the source's onfly ink target:
                                 mode, stride, reach R in window voxels; at most mil_max, evenly subsampled) into batch.mil / nmil, on the source grid (train maps them through the symmetry) */
     int strict_sources;      /* train --strict-sources 1: a weighted source with no eligible level ("excluded: no ... patch fits") stops sampler_start (fatal) */
     int holdout_guard;       /* the mask's margin around each held-out box, in voxels of the window's level (default 16) */
@@ -37,7 +37,18 @@ typedef struct {
     int erode;               /* 0 or 1: native-grid face-neighbour erosion of binary targets before softening */
     float soft;              /* > 0: soft ridge target exp(-(d/soft)^2/2) around the surface (d = chamfer distance in level-0 voxels) */
     int soft_um;             /* 1: soft (and its annealed values) is in um, the same physical width for every source and level */
+    int snap_jitter;         /* --snap-jitter 1 (sampbias 11-14): after the snap each axis moves one chunk up with p 0.5 (the floor put the drawn cell at index 3 of 0-5, so the + faces
+                                of a labelled region got 3 of 6 window positions against 4 of 6 at the - faces; measured 0.50 vs 0.71 at the z edges) */
+    int edge_boost;          /* --edge-boost 1: phase-occupancy cells repeated 1/(labelled share of their window box) times, <= 4: the outer turns / region edges were covered
+                                0.58-0.85 (9.6 um) and 0.43-0.69 (19.2 um) of the interior */
+    float vox_cap;           /* --vox-cap K: a source's geometry-head loss scaled by min(1, K x its mean known-phase share / the weighted mean share): the loss is a per-window
+                                mean, so a source whose windows hold few labels got its voxels up to x8 (0500P2-gt) */
+    float focus_w;           /* --focus-w W: overrides every "focus" source's w (packed-sheet draw weight, off at 0 / without a map) */
+    int stick;               /* --stick-src N: a rejected draw is retried from the SAME source up to N times (the rejections took 35-46 % of 1299 / 0139-u2ink draws) */
     int snap;                /* align training windows to the CT chunk grid (3x fewer chunks decoded per window) */
+    int edge_spread;         /* train --edge-spread 1 (default 0): an occupancy draw whose centred window would cross the volume face takes a random
+                                origin among the windows that hold the drawn voxel, not the clamped one (cells within P / 2 of a face all gave the same
+                                window; data audit lower 11-14) */
     int scan_norm;           /* train --scan-norm 1: the CT input (v - center) / scale per scan and level (scannorm.h) instead of each window's
                                 own z-score (a source's "norm" wins) */
     int deterministic;       /* 1: batch j holds samples j*B .. j*B+B-1, each drawn with its own rng seeded by (seed, index), and
@@ -48,7 +59,7 @@ typedef struct {
     int ct_augment;         /* conservative reconstructed-CT appearance augmentation */
     float symmetry_p;       /* chance of drawing a symmetry when augment enables geometry */
     float axis_jitter;      /* max auxiliary axis error in native voxels, p=.1, angle capped at 2 degrees */
-    float axis_jitter_p, axis_jitter_deg;   /* its probability and angle cap (0: .1 and 2 degrees): an estimated umbilicus on other scrolls */
+    float ink_radial_drop; float axis_jitter_p, axis_jitter_deg;   /* its probability and angle cap (0: .1 and 2 degrees): an estimated umbilicus on other scrolls */
     int geometry_augment;  /* all 48 symmetries, including Z flips, with registered continuous warps */
     float rotate_degrees, rotate_p, elastic, elastic_p;
     float zoom_min, zoom_p;  /* zoom-in augmentation: with probability zoom_p the window shows a 1/z of the read cube, z uniform
@@ -270,6 +281,14 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
    first voxel lo, PHASE_UNKNOWN outside the array), o the window corner, D x P x P codes out. sample_phase_interp: separable, polynomial
    atan2 (the sampler's path); _ref: 8 neighbours per voxel, atan2f (codes agree but for +-1 at float ties; tests/test_phase_interp.c) */
 void phase_weight_drop(uint8_t *ph, const uint8_t *w, int Pz, int P, uint64_t seed);   /* sources "phase" "weight": 8^3 blocks kept with probability w / 255 */
+/* the outward test of a window's phase (Pz x P x P, source grid, the window corner o in level voxels; cyz / cxz: the scroll axis centre per window
+   z in the same voxels): every 8th voxel per axis with a known phase and known +z / +y / +x neighbours gives the phase gradient (circular
+   differences); where it is radially aligned (|cos| >= 0.7 with the direction from the axis), out[0] counts it rising outward, out[1] inward.
+   A label set whose windings are numbered inward (phase, rv, normals, wind4 reversed) shows out[1] > out[0]. Adds to out */
+void sample_phase_outward(const uint8_t *ph, int Pz, int P, const int64_t o[3], const float *cyz, const float *cxz, uint64_t out[2]);
+void sample_hold_audit(const sampler *sp, const batch *b, int i, uint64_t *vox, uint64_t *known);   /* UFSM_HOLD_AUDIT: window i's known labels inside held-out boxes (a leak) */
+void sampler_outward_stats(sampler *sp, int si, uint64_t out[2]);   /* the per-source totals of sample_phase_outward over the drawn windows */
+void sample_rung_marginals(sampler *sp, int si, double q[8]);   /* --um-rungs: the rung shares source si's draws get (weights, then --rung-shift-p's move) */
 void sample_phase_interp(const uint8_t *ph, const int64_t ln[3], const int64_t lo[3], const int64_t o[3], int D, int P, int shift, uint8_t *side);
 void sample_phase_interp_ref(const uint8_t *ph, const int64_t ln[3], const int64_t lo[3], const int64_t o[3], int D, int P, int shift, uint8_t *side);
 sampler *sampler_start(sources *S, const sample_cfg *cfg);
@@ -304,6 +323,7 @@ void sampler_prof_print(const sampler *sp);   /* env UFSM_SAMPLER_PROF=1: per-st
 void sampler_set_soft(sampler *sp, float sigma);   /* change the soft-target sigma while running (annealing); patches already drawn keep theirs */
 
 sample_cfg sample_cfg_default(void);
+float sampler_vox_scale(const sampler *sp, int si);   /* --vox-cap: the source's loss factor (1 without it) */
 /* augmentation presets for the dense-target tasks (train --aug): "none" (symmetries + intensity jitter only, the old default) or
    "all" (every scanner-domain op, continuous geometry, zoom in and out, axis jitter; sample.c sample_aug_preset). Sets the fields only
    (explicit flags override them afterwards); 0 on success, -1 for an unknown name. */

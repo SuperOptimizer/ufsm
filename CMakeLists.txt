@@ -52,6 +52,10 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 set(CMAKE_C_FLAGS_RELEASE "")
 set(CMAKE_CXX_FLAGS_RELEASE "")
+# CMake seeds CMAKE_<LANG>_FLAGS from the environment (CFLAGS, CXXFLAGS, CUDAFLAGS) at the first configure and appends them to every
+# compile: a shell with CFLAGS=-ffast-math exported would change every object silently. Extra flags go through UFSM_EXTRA_CFLAGS.
+set(CMAKE_C_FLAGS "")
+set(CMAKE_CXX_FLAGS "")
 
 # --- toolchain -------------------------------------------------------------------------------------------------------------
 if(NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
@@ -99,7 +103,8 @@ pkg_check_modules(UFSM_DEPS REQUIRED IMPORTED_TARGET libcurl libzstd blosc zlib 
 
 # --- flags -----------------------------------------------------------------------------------------------------------------
 # Every optimisation, every unit (2026-11-14, DESIGN "Fast math everywhere ..."), unless UFSM_STRICT_MATH=ON.
-# Host C: -O3 -march=native -mtune=native (binaries are not portable: every machine, pods included, builds its own), -ffast-math
+# Host C: -O3 -march=native -mtune=native (UFSM_MARCH; binaries are not portable: every machine, pods included, builds its own;
+# -DUFSM_MARCH=x86-64-v3 / znver2 ... is the explicit override for a binary run elsewhere, else SIGILL), -ffast-math
 # (-funsafe-math-optimizations: reassociation, reciprocal division, no signed zeros, no trapping math; approximate libm, no errno)
 # with -ffp-contract=fast (FMA across statements), and FTZ / DAZ in MXCSR at startup (src/fpenv.c, linked into every binary; the
 # GPU already flushes). -fno-plt, -fno-semantic-interposition, -fomit-frame-pointer; -g stays (line tables for perf / gdb).
@@ -117,7 +122,15 @@ if(UFSM_STRICT_MATH)
 else()
   set(UFSM_FP_CFLAGS -ffast-math -fno-finite-math-only -ffp-contract=fast)
 endif()
-set(UFSM_CFLAGS -std=c23 -O3 -march=native -mtune=native -g -Wall -Wextra -Werror=comment -Wno-unused-parameter -pthread
+set(UFSM_MARCH native CACHE STRING "host -march: native (default), or a portable level for binaries run elsewhere (x86-64-v3, znver2 ...)")
+if(UFSM_MARCH STREQUAL "native")
+  set(UFSM_MARCH_FLAGS -march=native -mtune=native)
+else()
+  set(UFSM_MARCH_FLAGS -march=${UFSM_MARCH})
+endif()
+set(UFSM_CFLAGS -std=c23 -O3 ${UFSM_MARCH_FLAGS} -g -Wall -Wextra -Werror=comment -Werror=return-type -Werror=implicit-function-declaration
+    -Werror=incompatible-pointer-types -Werror=int-conversion -Werror=format -Werror=uninitialized
+    -Wno-error=incompatible-pointer-types-discards-qualifiers -Wno-unused-parameter -pthread
     -fno-plt -fno-semantic-interposition -fomit-frame-pointer ${UFSM_FP_CFLAGS})
 # Link-time optimisation of the host C (lld): full LTO by default in the release configurations; off under UFSM_VERIFY (the suite
 # links ~250 test executables against CORE, each a whole-program LTO link) -- so the suite tests the non-LTO host code; thin is
@@ -135,7 +148,7 @@ if(UFSM_TOOLCHAIN STREQUAL "mcc")
 endif()
 if(NOT UFSM_LTO STREQUAL "off")
   list(APPEND UFSM_CFLAGS -flto=${UFSM_LTO})
-  add_link_options(-flto=${UFSM_LTO} -O3 -march=native -mtune=native -Wl,--lto-O3)
+  add_link_options(-flto=${UFSM_LTO} -O3 ${UFSM_MARCH_FLAGS} -Wl,--lto-O3)
   if(UFSM_LTO STREQUAL "thin")
     add_link_options(-Wl,--thinlto-jobs=${UFSM_LTO_JOBS})
   endif()
@@ -212,7 +225,7 @@ configure_file(cmake/ptxas.sh.in ${CMAKE_BINARY_DIR}/ptxas @ONLY FILE_PERMISSION
                GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 set(UFSM_CU_FLAGS -x cuda --cuda-path=${UFSM_CUDA} --ptxas-path=./ptxas -Wno-unknown-cuda-version -Wno-cuda-compat -O3 -std=c++17
     -fno-threadsafe-statics ${UFSM_CXX_STDLIB} "SHELL:-Xcuda-fatbinary -compress-all" "SHELL:-isystem ${UFSM_CUDA}/include/cccl"
-    "SHELL:-include ${CMAKE_SOURCE_DIR}/src/clang_cuda_compat.cuh" -D_GNU_SOURCE -DUFSM_CUDA_VERSION=${UFSM_CUDA_VERSION}
+    "SHELL:-include ${CMAKE_SOURCE_DIR}/src/clang_cuda_compat.cuh" "SHELL:-include ${CMAKE_SOURCE_DIR}/src/ufsm_dev.cuh" -D_GNU_SOURCE -DUFSM_CUDA_VERSION=${UFSM_CUDA_VERSION}
     -DUFSM_PTX_ISA=${UFSM_PTX_ISA})
 # ptxas --split-compile=N: ptxas optimises the kernels of one unit on N threads. The big lp_* units hold up to 9 kernel
 # instantiations; lp_f4fwd_i0p.cu 41 s -> 22 s with 0 (all cores), 25 s with 4 (desk, 2026-11-13). It only shortens the tail of a
@@ -239,7 +252,10 @@ else()
 endif()
 set(UFSM_CU_FAST -DUFSM_DEVICE_FAST_MATH -fgpu-flush-denormals-to-zero -fgpu-approx-transcendentals "SHELL:-Xarch_device -fapprox-func"
     "SHELL:-Xarch_device -ffp-contract=${_contract}")
-list(APPEND UFSM_CU_FLAGS "SHELL:-Xcuda-ptxas -O3" "SHELL:-Xarch_host -march=native" "SHELL:-Xarch_host -mtune=native")
+list(APPEND UFSM_CU_FLAGS "SHELL:-Xcuda-ptxas -O3")
+foreach(f ${UFSM_MARCH_FLAGS})
+  list(APPEND UFSM_CU_FLAGS "SHELL:-Xarch_host ${f}")
+endforeach()
 # UFSM_STRICT_UNITS: the units that, under UFSM_STRICT_MATH=ON, are byte-identical to their CPU versions: IEEE division / sqrt, no
 # FMA contraction, no flush (nvcc -fmad=false, no fast math). By default (2026-11-14) they get UFSM_CU_FAST like every other unit
 # and the host is fast math too, so GPU and CPU agree within tolerances (tests/fm_tol.h, DESIGN "Fast math everywhere") instead.
@@ -247,7 +263,15 @@ list(APPEND UFSM_CU_FLAGS "SHELL:-Xcuda-ptxas -O3" "SHELL:-Xarch_host -march=nat
 # sqrt.rn.f32); the reflection is set explicitly (-mllvm reaches the host pass too, where it does nothing). Checked 2026-11-13: the
 # PTX of every strict unit uses the same float instruction kinds as nvcc -fmad=false (div.rn, sqrt.rn, no fma / approx / ftz).
 set(UFSM_CU_STRICT "SHELL:-Xarch_device -ffp-contract=off" "SHELL:-mllvm -nvvm-reflect-add=__CUDA_PREC_SQRT=1")
-set(UFSM_STRICT_UNITS nn_gpudec nn_cf nn_ftrace nn_latvol nn_band nn_fibre nn_inkfly nn_gpuenc nn_mcodes nn_faces nn_render)
+# the host half of every .cu unit contracts as the host C does: fast by default, off under UFSM_STRICT_MATH (the strict units hold
+# CPU-side code too: nn_band, nn_render, nn_gpudec ... host functions, compared bit for bit against the .c references under strict;
+# under nvcc + g++ -std=c++17 they never fused)
+if(UFSM_STRICT_MATH)
+  list(APPEND UFSM_CU_FLAGS "SHELL:-Xarch_host -ffp-contract=off")
+else()
+  list(APPEND UFSM_CU_FLAGS "SHELL:-Xarch_host -ffp-contract=fast")
+endif()
+set(UFSM_STRICT_UNITS nn_gpudec nn_cf nn_ftrace nn_latvol nn_band nn_fibre nn_inkfly nn_gpuenc nn_mcodes nn_faces nn_render nn_hgs)
 set(UFSM_TYPEDEFS UFSM_ARCH=${UFSM_ARCH})
 if(UFSM_VERIFY)
   list(APPEND UFSM_TYPEDEFS UFSM_ALL_TYPES)
@@ -329,6 +353,7 @@ if(UFSM_CUDA_COMPILER STREQUAL "nvcc")
   endif()
   enable_language(CUDA)
   set(CMAKE_CUDA_FLAGS_RELEASE "")
+  set(CMAKE_CUDA_FLAGS "-allow-unsupported-compiler")   # (not the environment's CUDAFLAGS, see CMAKE_C_FLAGS)
   if(NOT UFSM_GPU_SM STREQUAL "portable")
     if(UFSM_ARCH STREQUAL "120")
       set(UFSM_NN_ARCH "SHELL:-gencode arch=compute_${UFSM_GPU_SM}a,code=sm_${UFSM_GPU_SM}a")
@@ -345,8 +370,17 @@ if(UFSM_CUDA_COMPILER STREQUAL "nvcc")
   endif()
   # -Xptxas -O3 (ptxas' default, explicit), --extra-device-vectorization (nvvm's extra vectoriser), the host side native.
   # No -dlto: device LTO needs -rdc and an nvcc device-link step; the units are whole-program and linked by clang / lld.
-  set(UFSM_CU_FLAGS -O3 -Xcompiler=-fno-threadsafe-statics,-march=native,-mtune=native -Xfatbin=-compress-all "SHELL:-Xptxas -O3"
-      --extra-device-vectorization)
+  # (ufsm_dev.cuh: logical devices, force-included like clang's -include above; ops audit #8)
+  # The host half of every unit as the host C: contraction fast, or off under UFSM_STRICT_MATH (clang++ contracts by default; the
+  # old g++ -std=c++17 host did not)
+  if(UFSM_STRICT_MATH)
+    set(_hcontract off)
+  else()
+    set(_hcontract fast)
+  endif()
+  string(REPLACE ";" "," _hmarch "${UFSM_MARCH_FLAGS}")
+  set(UFSM_CU_FLAGS -O3 -Xcompiler=-fno-threadsafe-statics,${_hmarch} -Xcompiler=-ffp-contract=${_hcontract} -Xfatbin=-compress-all
+      "SHELL:-Xptxas -O3" --extra-device-vectorization "SHELL:--pre-include ${CMAKE_SOURCE_DIR}/src/ufsm_dev.cuh")
   set(UFSM_CU_FAST -use_fast_math)
   set(UFSM_CU_STRICT -fmad=false)
   if(UFSM_PTXAS_SPLIT GREATER 1)
@@ -427,6 +461,7 @@ function(ufsm_exe name)
     endif()
   endforeach()
   list(APPEND objs obj_fpenv)   # FTZ / DAZ at startup in every executable (src/fpenv.c; empty under UFSM_STRICT_MATH)
+  list(APPEND objs obj_optcheck)   # (every binary: the src objects call its opt_n / opt_ato*, src/optcheck.h)
   list(REMOVE_DUPLICATES objs)
   set(libs)
   foreach(l ${A_LIBS})
@@ -486,23 +521,28 @@ endif()
 if(EXISTS /sys/fs/cgroup/cpu.max)
   file(READ /sys/fs/cgroup/cpu.max _cm)
   if(_cm MATCHES "^([0-9]+) ([0-9]+)")
-    math(EXPR _q "${CMAKE_MATCH_1} / ${CMAKE_MATCH_2}")
+    math(EXPR _q "(${CMAKE_MATCH_1} + ${CMAKE_MATCH_2} - 1) / ${CMAKE_MATCH_2}")   # (ceil: a 0.5-CPU share is 1 job, not 0)
     if(_q GREATER 0 AND _q LESS _jobs)
       set(_jobs ${_q})
     endif()
   endif()
 endif()
 set(UFSM_JOBS ${_jobs} CACHE STRING "parallel jobs of the nested release / verify build (test-prep)")
+# the sibling dir is (re)configured with this dir's settings every time (a configure of an existing dir is ~1 s), so the release
+# helpers the python tests run are built like the suite binaries (a sanitizer in UFSM_EXTRA_CFLAGS, the device compiler, -march)
 set(_cfg_common -G Ninja -S ${CMAKE_SOURCE_DIR} -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE} -DUFSM_ARCH=${UFSM_ARCH} -DUFSM_GPU_SM=${UFSM_GPU_SM}
-    -DUFSM_CUDA=${UFSM_CUDA} -DUFSM_LLVM_RUNTIME=${UFSM_LLVM_RUNTIME} -DUFSM_CCACHE=${UFSM_CCACHE} -DUFSM_STRICT_MATH=${UFSM_STRICT_MATH})
+    -DUFSM_CUDA=${UFSM_CUDA} -DUFSM_LLVM_RUNTIME=${UFSM_LLVM_RUNTIME} -DUFSM_CCACHE=${UFSM_CCACHE} -DUFSM_MARCH=${UFSM_MARCH}
+    -DUFSM_EXTRA_CFLAGS=${UFSM_EXTRA_CFLAGS} -DUFSM_CUDA_COMPILER=${UFSM_CUDA_COMPILER} -DUFSM_CUDA_HOST_COMPILER=${UFSM_CUDA_HOST_COMPILER}
+    -DUFSM_PTX_ISA=${UFSM_PTX_ISA} -DUFSM_PTXAS_SPLIT=${UFSM_PTXAS_SPLIT} -DUFSM_STRICT_MATH=${UFSM_STRICT_MATH}
+    -DUFSM_PGO=${UFSM_PGO} -DUFSM_PGO_DIR=${UFSM_PGO_DIR})
 if(UFSM_VERIFY)
   add_custom_target(test-prep
-    COMMAND test -f ${UFSM_REL_DIR}/build.ninja || ${CMAKE_COMMAND} ${_cfg_common} -B ${UFSM_REL_DIR} -DUFSM_VERIFY=OFF
+    COMMAND ${CMAKE_COMMAND} ${_cfg_common} -B ${UFSM_REL_DIR} -DUFSM_VERIFY=OFF
     COMMAND ${CMAKE_COMMAND} --build ${UFSM_REL_DIR} -j ${UFSM_JOBS} --target ${UFSM_TEST_PREP_REL}
     DEPENDS suite-check suite-bins USES_TERMINAL VERBATIM)
 else()
   add_custom_target(test-prep
-    COMMAND test -f ${UFSM_VERIFY_DIR}/build.ninja || ${CMAKE_COMMAND} ${_cfg_common} -B ${UFSM_VERIFY_DIR} -DUFSM_VERIFY=ON
+    COMMAND ${CMAKE_COMMAND} ${_cfg_common} -B ${UFSM_VERIFY_DIR} -DUFSM_VERIFY=ON
     COMMAND ${CMAKE_COMMAND} --build ${UFSM_VERIFY_DIR} -j ${UFSM_JOBS} --target suite-bins
     DEPENDS suite-check ${UFSM_TEST_PREP_REL} USES_TERMINAL VERBATIM)
 endif()

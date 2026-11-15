@@ -52,7 +52,10 @@ static void run(const char *name, unet_cfg cfg) {
        and as an rstd (blend of variances), take the better match per element (the two disagree by far more than the tolerance) */
     for (size_t i = 0; i < ns; i++) {
         const double m = 0.75 * s[0][i] + 0.25 * s[1][i];
-        const double v = 0.75 * var_of(s[0][i]) + 0.25 * var_of(s[1][i]), r = 1.0 / sqrt((v > 0 ? v : 0) + 1e-5);
+        /* (G = 8 at every site: a site pair is 8 means then 8 rstds; the running variance is the POOLED one: the mean of the variances plus the
+           variance of the means, 0.75 * 0.25 * (m0 - m1)^2 for two windows, targeted/gnorm.md #1) */
+        const double dm = i % 16 >= 8 ? (double)s[0][i - 8] - s[1][i - 8] : 0.0;
+        const double v = 0.75 * var_of(s[0][i]) + 0.25 * var_of(s[1][i]) + 0.75 * 0.25 * dm * dm, r = 1.0 / sqrt((v > 0 ? v : 0) + 1e-5);
         const double em = fabs(s[2][i] - m) / (fabs(m) + 1e-3), er = fabs(s[2][i] - r) / (fabs(r) + 1e-3);
         const double ee = em < er ? em : er; if (ee > e) e = ee;
         const double d = fabs(s[0][i] - s[1][i]) / (fabs(s[0][i]) + 1e-3); if (d > dd) dd = d;

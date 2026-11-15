@@ -9,7 +9,7 @@
 # from the earlier window's halo prediction) straight into inkbl.zarr. Paris 4 crops (10-30, ufsm ink-seam --block 16): border jump
 # 20.2 (halo 0) / 6.3 (halo 64) -> 0.0, the same as the old 2-pass A + B + ink-blend (0.0) at ~1/3 of its GPU time and no blend.
 # INKW / INKH / INKF override window / halo / feather (e.g. 1088 / 32 / 32 on 24 GB GPUs: interior 1024, 1.2x a halo-0 pass).
-# The predict --resumes, so a killed pass continues where it stopped (the done windows' spills are recomputed).
+# --axis $O/axis.json (predict refuses without an axis since 2026-11-14: missing = a loud failure). The predict --resumes, so a killed pass continues where it stopped (the done windows' spills are recomputed).
 ink_lock() {   # this host owns S's ink (taken now, or earlier by this host)
   local o; o=$(fdsh "d=$FDC/$S/state; mkdir -p \$d; mkdir \$d/ink.lock 2> /dev/null && echo $ME > \$d/ink.lock/owner; cat \$d/ink.lock/owner 2> /dev/null") || return 1
   [ "$o" = "$ME" ]
@@ -26,10 +26,10 @@ ink_compute() {   # ink_compute BOX -> $O/inkbl.zarr (+ blend.done); resumable a
   rm -rf $O/gncal.zarr
   if [ ! -s $O/gn.bin ]; then
     gpu_run $U predict $INKCK $ctr $ctk $O/gncal.zarr --um $UM --level $LV --box $cal --shard 512 --window 640 --halo 64 --ema 1 --q 32 --threads 12 \
-      --gpu $GPU --full-grid 1 --occupancy 5 --levels 1 --no-out 1 --gn-save $O/gn.tmp > $O/logs/ink-gn.log 2>&1 && mv $O/gn.tmp $O/gn.bin || return 1
+      --gpu $GPU $([ -s $O/axis.json ] && echo --axis $O/axis.json) --full-grid 1 --occupancy 5 --levels 1 --no-out 1 --gn-save $O/gn.tmp > $O/logs/ink-gn.log 2>&1 && mv $O/gn.tmp $O/gn.bin || return 1
   fi
   gpu_run $U predict $INKCK $ctr $ctk $O/inkbl.zarr --um $UM --level $LV --box $box --shard 512 --window ${INKW:-auto} --halo ${INKH:-32} --feather ${INKF:-32} \
-    --ema 1 --q 32 --threads 12 --gpu $GPU --full-grid 1 --resume 1 --occupancy 5 --levels 4 --gn-frozen $O/gn.bin >> $O/logs/ink.log 2>&1 || return 1
+    --ema 1 --q 32 --threads 12 --gpu $GPU $([ -s $O/axis.json ] && echo --axis $O/axis.json) --full-grid 1 --resume 1 --occupancy 5 --levels 4 --gn-frozen $O/gn.bin >> $O/logs/ink.log 2>&1 || return 1
   rm -rf $O/gncal.zarr
   touch $O/blend.done
 }

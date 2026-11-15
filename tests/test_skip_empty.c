@@ -7,8 +7,14 @@
    (3) nn_skip_off: dense again, bit-identical;
    (4) training (DESIGN 2026-11-14 "skip-air training"): forward + backward with MX-fp4 gradients. Every tile active: the gradient
        the dense one (within the dense run-to-run noise) and the masked backward-data / wgrad kernels did run; masks from the CT: the gradient finite, the
-       masked backward counted, its cosine to the dense gradient reported (bit identity does not hold: the weight gradients' atomics); the checkpoint header round-trips skip_empty. */
+       masked backward counted, its cosine to the dense gradient reported (bit identity does not hold: the weight gradients' atomics); the checkpoint header round-trips skip_empty.
+   (5) the masked backward kernels exactly, at the try6 level-0 width 256 (audit 2026-11-14 kernels.md #11): one masked conv (16 x 32 x 32,
+       2 of 16 tiles active, a tile row out of every active tile's reach): backward-data on gy == the dense backward-data on gy zeroed outside
+       the active tiles, bytes (the same SR seed; inactive tiles: the bias-0 epilogue); the weight gradient (the records of inactive tiles
+       zeroed) == the dense one on the zeroed gy within the atomics' order (rel 1e-6); the bias gradient (summed before the zeroing) == the
+       dense one on the whole gy. */
 #include "unet.h"
+#include "nn_lp.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +39,7 @@ static double cosine(const float *a, const float *b, size_t n, int *fin) {
 }
 
 int main(void) {
+    setvbuf(stdout, nullptr, _IOLBF, 0);   /* (line-buffered: a killed run under compute-sanitizer kept nothing past section (2)) */
     setenv("UFSM_F4_WGRAD", "1", 0);   /* (train --fp4 2; read once) */
     if (nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0)) { printf("no cuda\n"); return 1; }
     nn_set_tf32(1); nn_set_f16(1); nn_set_sr(0); nn_set_prec(3);
@@ -153,6 +160,65 @@ int main(void) {
         CHECK(pc.skip_thr == 1 && pc.skip_margin == 2 && pc.skip_nl == 3, "checkpoint skip_empty round trip (%d %d %d)", pc.skip_thr, pc.skip_margin, pc.skip_nl);
         uc->skip_thr = 0; CHECK(!unet_save(u, path, 5, nullptr) && !unet_peek(path, &pc, &st) && pc.skip_thr == 0, "no skip_empty key when off");
         remove(path); nn_free(dgy); free(gd); free(gm); free(gy);
+    }
+    {   /* (5) masked backward-data / weight gradient == dense on the zeroed gy, width 256 */
+        /* UFSM_SANITIZE=racecheck (tests/sanitize.sh): width 64. At 256 the run died without output ~30 min in (likely the wide kernels' shared-memory tracking past the
+           pod's 31 GB cgroup: its oom_kill counter rose; "Target application returned an error", 0 hazards, 11-15);
+           the masked-vs-dense logic is the same at 64 (two 32-channel blocks) */
+        const char *san = getenv("UFSM_SANITIZE"); const int C = san && !strcmp(san, "racecheck") ? 64 : 256, D = 16, H = 32, W = 32; const shape5 s5 = {1, C, D, H, W}; const size_t S = (size_t)D * H * W, n = (size_t)C * S, nw = (size_t)C * C * 27;
+        const int my = 4, mx = 2; uint8_t hm[2 * 4 * 2] = {};   /* 2 x 4 x 2 tiles */
+        hm[(0 * my + 0) * mx + 0] = 1; hm[(1 * my + 1) * mx + 1] = 1;   /* dilated by one tile: y tile 3 out of reach (gx there 0) */
+        float *hx = malloc(n * 4), *hg = malloc(n * 4), *hz = malloc(n * 4), *hw = malloc(nw * 4);
+        for (size_t i = 0; i < n; i++) { hx[i] = 2 * frand() - 1; hg[i] = (2 * frand() - 1) * 1e-3f; }
+        for (size_t i = 0; i < nw; i++) hw[i] = (2 * frand() - 1) * 0.03f;
+        size_t nact = 0;
+        for (int c = 0; c < C; c++) for (size_t v = 0; v < S; v++) {
+            const int z = (int)(v / (H * W)), y = (int)(v / W % H), x = (int)(v % W), a = hm[((z >> 3) * my + (y >> 3)) * mx + (x >> 4)];
+            hz[(size_t)c * S + v] = a ? hg[(size_t)c * S + v] : 0.f; nact += a && !c;
+        }
+        const size_t b4 = nn_mx4_bytes(s5);
+        void *x4 = nn_malloc(b4), *g4 = nn_malloc(b4), *z4 = nn_malloc(b4), *y4 = nn_malloc(b4), *gxm = nn_malloc(b4), *gxd = nn_malloc(b4);
+        void *mx4s[6] = {x4, g4, z4, y4, gxm, gxd}; for (int i = 0; i < 6; i++) { nn_zero(mx4s[i], b4); nn_set_storage(mx4s[i], b4, 4); }
+        float *t = nn_malloc(n * 4);
+        nn_h2d(t, hx, n * 4); lp_f32_to_mx4(t, 1, C, S, x4); nn_h2d(t, hg, n * 4); lp_f32_to_mx4(t, 1, C, S, g4); nn_h2d(t, hz, n * 4); lp_f32_to_mx4(t, 1, C, S, z4);
+        nn_free(t);
+        float *w = nn_malloc(nw * 4), *scr = nn_malloc(nn_conv3d_scratch(s5, C, 3) + 4096);
+        float *gwm = nn_malloc(nw * 4), *gbm = nn_malloc(C * 4), *gwd = nn_malloc(nw * 4), *gbd = nn_malloc(C * 4), *gbf = nn_malloc(C * 4);
+        nn_h2d(w, hw, nw * 4); nn_wmemo_clear();
+        long fm, fc, nb, nwg; nn_skip_counts(&fm, &fc); nn_skip_counts_bwd(&nb, &nwg);
+        nn_set_layer(7); nn_set_conv(1); nn_set_block(0);
+        CHECK(!nn_skip_set(0, hm, D, H, W), "(5) nn_skip_set");
+        const split_t s0 = {}; split_t sw = {}; sw.sr = 0x2545f491u;
+        lp_conv_fwd_f4(x4, 4, s5, w, nullptr, C, y4, 4, (gnp_t){}, nullptr, 0, s0);   /* the masked forward: marks the conv */
+        nn_set_sr_step(5151); nn_conv3d_bwd_data(g4, s5, w, s5, 3, 1, gxm, scr);
+        nn_skip_counts(&fm, &fc); nn_skip_counts_bwd(&nb, &nwg);
+        nn_skip_pause(1);
+        nn_set_sr_step(5151); nn_conv3d_bwd_data(z4, s5, w, s5, 3, 1, gxd, scr);
+        nn_zero(gwd, nw * 4); nn_zero(gbd, C * 4); nn_zero(gbf, C * 4); nn_zero(gwm, nw * 4); nn_zero(gbm, C * 4);
+        lp_bwd_w_f4(x4, 4, s5, z4, 4, s5, gwd, gbd, (gnp_t){}, sw, 0);
+        float *gwf = nn_malloc(nw * 4); nn_zero(gwf, nw * 4);
+        lp_bwd_w_f4(x4, 4, s5, g4, 4, s5, gwf, gbf, (gnp_t){}, sw, 0);   /* (the bias gradient of the whole gy) */
+        nn_skip_pause(0);   /* (clears the marks: forward again) */
+        lp_conv_fwd_f4(x4, 4, s5, w, nullptr, C, y4, 4, (gnp_t){}, nullptr, 0, s0);
+        nn_skip_wg_begin(); lp_bwd_w_f4(x4, 4, s5, g4, 4, s5, gwm, gbm, (gnp_t){}, sw, 0); nn_skip_wg_end();
+        long nb2, nw2; nn_skip_counts_bwd(&nb2, &nw2);
+        nn_sync(); const char *e = nn_check();
+        CHECK(!e, "(5) CUDA error %s", e ? e : "");
+        uint8_t *bm = malloc(b4), *bd = malloc(b4); nn_d2h(bm, gxm, b4); nn_d2h(bd, gxd, b4);
+        float *hwm = malloc(nw * 4), *hwd = malloc(nw * 4), *hbm = malloc(C * 4), *hbd = malloc(C * 4), *hbf = malloc(C * 4);
+        nn_d2h(hwm, gwm, nw * 4); nn_d2h(hwd, gwd, nw * 4); nn_d2h(hbm, gbm, C * 4); nn_d2h(hbd, gbd, C * 4); nn_d2h(hbf, gbf, C * 4);
+        size_t nzd = 0; for (size_t i = 0; i < nw; i++) nzd += hwd[i] != 0.f;
+        const double rw = rel(hwd, hwm, nw), rb = rel(hbf, hbm, C), rbz = rel(hbd, hbm, C);
+        printf("(5) masked backward, width %d, %dx%dx%d, %zu of %zu voxels active: masked forward %ld, backward-data %ld, wgrad %ld; gx bytes %s; wgrad rel %.3g; bias rel %.3g (vs the zeroed gy's %.3g)\n",
+               C, D, H, W, nact, S, fm, nb, nw2, memcmp(bm, bd, b4) ? "DIFFER" : "equal", rw, rb, rbz);
+        CHECK(fm > 0 && nb > 0 && nw2 > 0, "(5) the masked kernels ran (forward %ld, backward-data %ld, wgrad %ld)", fm, nb, nw2);
+        CHECK(!memcmp(bm, bd, b4), "(5) masked backward-data == dense backward-data on the zeroed gy, bytes");
+        CHECK(nzd > nw / 2 && rw < 1e-6, "(5) masked wgrad == dense wgrad on the zeroed gy (rel %.3g, %zu nonzero)", rw, nzd);
+        CHECK(rb < 1e-6 && rbz > 1e-3, "(5) masked bias gradient == dense on the whole gy (rel %.3g; the zeroed gy's differs: %.3g)", rb, rbz);
+        nn_skip_off(); nn_set_layer(-1); nn_set_conv(-1); nn_set_block(0); nn_wmemo_clear();
+        free(hx); free(hg); free(hz); free(hw); free(bm); free(bd); free(hwm); free(hwd); free(hbm); free(hbd); free(hbf);
+        for (int i = 0; i < 6; i++) nn_free(mx4s[i]);
+        nn_free(w); nn_free(scr); nn_free(gwm); nn_free(gbm); nn_free(gwd); nn_free(gbd); nn_free(gbf); nn_free(gwf);
     }
     if (bad) { printf("test_skip_empty: %d failed\n", bad); return 1; }
     printf("test_skip_empty: ok\n");

@@ -71,6 +71,30 @@ int main(void) {
     snprintf(p, sizeof p, "%s/strip/flat/stripes.tsv", root); f = fopen(p, "r"); double area = 0;
     if (f) { char line[1024]; if (fgets(line, sizeof line, f)) while (fgets(line, sizeof line, f)) { char nm[64]; int a, c, d; double u0, l, v; if (sscanf(line, "%63s %d %d %d %lf %lf %lf", nm, &a, &c, &d, &u0, &l, &v) == 7) area += v; } fclose(f); }
     { const double A = Lcm * (Hcm + step * um * 1e-4); CHECK(fabs(area - A) < 0.03 * A, "stripes valid area %.4f vs %.4f cm2", area, A); }
+    /* unroll audit 11-14 #7: the failure counts in flat.json (0 here), then a lattice whose end is folded back and moved off the sheet
+       (--reuse 1 over a copy): the raster leaves the flipped triangles out, counts them and the pixel holes only they would cover */
+    CHECK(num(b, "\"nomesh_chunks\": ") == 0 && num(b, "\"raster_flipped_tris\": ") == 0 && num(b, "\"flip_hole_px\": ") == 0, "clean strip: failure counts not 0: %s", b);
+    {   char od[400], lp[500]; snprintf(od, sizeof od, "%s/flatfold", root); snprintf(cmd, sizeof cmd, "mkdir -p %s && cp %s/strip/flat/lattice.f32 %s/", od, root, od); CHECK(!system(cmd), "copy lattice");
+        snprintf(lp, sizeof lp, "%s/lattice.f32", od); FILE *lf = fopen(lp, "r+b"); long sz = 0;
+        if (lf) { fseek(lf, 0, SEEK_END); sz = ftell(lf); }
+        const long ln = sz / 12; const int lh = h, lw = (int)(ln / lh);
+        if (lf && ln == (long)lw * lh && lw > 400) {
+            float *d = malloc((size_t)ln * 8); fseek(lf, 0, SEEK_SET); CHECK(fread(d, 4, 2 * ln, lf) == (size_t)(2 * ln), "read lattice");
+            /* (an interior vertex cannot leave a hole: the signed cover of its star stays 1, so unflipped triangles cover every flipped one.
+               A hole needs flipped triangles where nothing else lies: the strip's last 3 lattice columns folded back along u and moved 60
+               rows past the sheet's height) */
+            for (int r = 0; r < lh; r++) for (int c = lw - 3; c < lw; c++) { const size_t i = (size_t)r * lw + c; d[i] -= 2.f * (c - (lw - 4)); d[ln + i] += 60.f; }
+            fseek(lf, 0, SEEK_SET); CHECK(fwrite(d, 4, 2 * ln, lf) == (size_t)(2 * ln), "write lattice"); free(d);
+        } else CHECK(0, "lattice %ld floats, %d x %d", sz / 4, lw, lh);
+        if (lf) fclose(lf);
+        char a1[300]; snprintf(a1, sizeof a1, "%s/strip", root);
+        char *av[] = {"ufsm", "strip-flatten", a1, "--out", od, "--reuse", "1", "--stride", "96", "--threads", "4", "--stripe-px", "6000", "--ostep", "0.25"};   /* (8 px per lattice cell: pixel centres in the uncovered wedges) */
+        CHECK(!cmd_strip_flatten((int)(sizeof av / sizeof *av), av), "strip-flatten --reuse on the folded lattice failed");
+        snprintf(p, sizeof p, "%s/flat.json", od); char b2[4096] = ""; f = fopen(p, "r"); if (f) { size_t nr = fread(b2, 1, sizeof b2 - 1, f); (void)nr; fclose(f); }
+        const double nft = num(b2, "\"raster_flipped_tris\": "), nfh = num(b2, "\"flip_hole_px\": ");
+        printf("strip: folded lattice: %.0f flipped triangles left out, %.0f px holes\n", nft, nfh);
+        CHECK(nft >= 1 && nft < 1000 && nfh >= 1, "folded lattice: flipped triangles %.0f, holes %.0f", nft, nfh);
+    }
     /* --jobs / --stripe-jobs: chunks and stripes on concurrent workers, in order: --jobs 3 (1 thread each) writes the bytes of --jobs 1 --threads 1
        (CPU: the SLIM sums depend on the threads per chunk; GPU: on nothing); chunks.tsv equal but for its seconds column */
     {
@@ -149,7 +173,8 @@ int main(void) {
         { char fm[400]; snprintf(fm, sizeof fm, "%s/fm", root); snprintf(cmd, sizeof cmd, "mkdir -p %s", fm); CHECK(!system(cmd), "mkdir");
           snprintf(cmd, sizeof cmd, "cd %s && ls *_ct.tif", rdir); FILE *ls = popen(cmd, "r"); char nm[256];
           while (ls && fgets(nm, sizeof nm, ls)) { nm[strcspn(nm, "\n")] = 0; nm[strlen(nm) - 7] = 0; int w, h; snprintf(p, sizeof p, "%s/%s_ct.tif", rdir, nm); uint8_t *im = img_read_u8(p, &w, &h);
-              if (im) { memset(im, 100, (size_t)w * h); snprintf(p, sizeof p, "%s/%s_fill.tif", fm, nm); CHECK(!tiffw_write(p, w, h, 1, im, 1), "write fill map"); free(im); } }
+              if (im) { memset(im, 0, (size_t)w * h); for (int y = h / 4; y < h / 2; y++) memset(im + (size_t)y * w + w / 4, 100, (size_t)(w / 4));   /* flag 100: bridged */
+                        snprintf(p, sizeof p, "%s/%s_fill.tif", fm, nm); CHECK(!tiffw_write(p, w, h, 1, im, 1), "write fill map"); free(im); } }
           if (ls) pclose(ls);
           /* a copy of the flattened strip with a hole in every stripe grid (vertices -1): the plain mosaic loses it, --fill-maps keeps it */
           snprintf(cmd, sizeof cmd, "cp -r %s/strip/flat %s/flat2", root, root); CHECK(!system(cmd), "cp flat");
@@ -166,6 +191,10 @@ int main(void) {
           double v1 = 0, v7 = 0; for (int k = 0; k < 2; k++) { snprintf(p, sizeof p, "%s/%s/strip_papyrus.tsv", root, k ? "m7" : "m8"); FILE *t = fopen(p, "r"); char ln[256];
               if (t) { if (fgets(ln, sizeof ln, t)) {} while (fgets(ln, sizeof ln, t)) { double u, v; if (sscanf(ln, "%lf %lf", &u, &v) == 2) *(k ? &v7 : &v1) += v; } fclose(t); } }
           CHECK(v7 > v1 && v1 > 0, "--fill-maps valid area %g vs %g", v7, v1);
+          /* audit 11-14 #6 / #7: the filled (flag >= 100) share in filled.tsv: none without fill maps, > 0 with them */
+          double fs[2] = {-1, -1}; for (int k = 0; k < 2; k++) { snprintf(p, sizeof p, "%s/%s/filled.tsv", root, k ? "m7" : "m8"); FILE *t = fopen(p, "r"); char ln[256];
+              if (t) { if (fgets(ln, sizeof ln, t) && fgets(ln, sizeof ln, t)) { double a, sh; if (sscanf(ln, "%lf %lf", &a, &sh) == 2) fs[k] = sh; } fclose(t); } }
+          CHECK(fs[0] == 0 && fs[1] > 0.01 && fs[1] < 0.5, "filled share %g without / %g with the fill maps", fs[0], fs[1]);
           /* --papyrus-dir: the grey and the papyrus mosaic from one read write the files of the two separate runs */
           snprintf(a3, sizeof a3, "%s/m9", root); char a4[400]; snprintf(a4, sizeof a4, "%s/m9p", root);
           char *av9[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "3", "--stripe-jobs", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv, "--fill-maps", fm,
@@ -185,6 +214,22 @@ int main(void) {
               CHECK(!cmd_strip_mosaic((int)(sizeof av / sizeof *av), av), "strip-mosaic 1:1 overview --threads %s failed", t2[k]); }   /* (was 19 for 17 arguments: read past av, survived gcc's stack layout, not clang's) */
           snprintf(cmd, sizeof cmd, "cd %s && for x in $(ls m11); do cmp -s m11/$x m12/$x || { echo $x; exit 1; }; done && for x in $(ls m11p); do cmp -s m11p/$x m12p/$x || { echo $x; exit 1; }; done", root);
           CHECK(!system(cmd), "strip-mosaic 1:1 overview: --threads 5 --stripe-jobs 3 differs from 1 / 1"); }
+        /* a stripe without its renders: the mosaic is written with the gap, but the exit is 3 (audit 11-14 #11: it was 0); --allow-missing 1
+           accepts it; with --stretch (no pass 1) the stripe is unreadable in pass 2: exit 1 */
+        {
+            char rm_[400], a1[400], a3[400]; snprintf(rm_, sizeof rm_, "%s/rmiss", root); snprintf(a1, sizeof a1, "%s/strip/flat", root);
+            snprintf(cmd, sizeof cmd, "rm -rf %s && cp -r %s %s && rm -f $(ls %s/*_ct.tif | head -1)", rm_, rdir, rm_, rm_); CHECK(!system(cmd), "rmiss setup");
+            snprintf(a3, sizeof a3, "%s/mmiss", root);
+            char *av[] = {"ufsm", "strip-mosaic", a1, rm_, a3, "--threads", "2", "--rows", "2", "--overview-px", "600"};
+            const int rc = cmd_strip_mosaic((int)(sizeof av / sizeof *av), av); CHECK(rc == 3, "strip-mosaic with a missing stripe: exit %d, want 3", rc);
+            snprintf(cmd, sizeof cmd, "test -s %s/overview.jpg", a3); CHECK(!system(cmd), "strip-mosaic with a missing stripe wrote no overview");
+            char *av2[] = {"ufsm", "strip-mosaic", a1, rm_, a3, "--threads", "2", "--rows", "2", "--overview-px", "600", "--allow-missing", "1"};
+            CHECK(cmd_strip_mosaic((int)(sizeof av2 / sizeof *av2), av2) == 0, "strip-mosaic --allow-missing 1 with a missing stripe: not 0");
+            char *av3[] = {"ufsm", "strip-mosaic", a1, rm_, a3, "--threads", "2", "--rows", "2", "--overview-px", "600", "--stretch", sv};
+            CHECK(cmd_strip_mosaic((int)(sizeof av3 / sizeof *av3), av3) != 0, "strip-mosaic --stretch with a missing stripe: exit 0");
+            char *av4[] = {"ufsm", "strip-mosaic", a1, rdir, a3, "--threads", "2", "--rows", "2", "--overview-px", "600"};
+            CHECK(cmd_strip_mosaic((int)(sizeof av4 / sizeof *av4), av4) == 0, "strip-mosaic with every stripe: not 0");
+        }
     }
     /* streamed strip (.sfc wraps, 64-row bands decoded while encoding) = the whole-decode path (UFSM_STRIP_FULL=1), byte for byte: 150
        rows (3 bands, the last partial), holes, --every 1 / 2, threads 1 / 5 */

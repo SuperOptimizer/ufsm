@@ -13,6 +13,7 @@
    runs on the host per output shard (fp32 sum g m and sum g over the shard's part of the box), a shard is finalised and written as
    soon as the last window touching it is blended (blend + write on a second thread, overlapped with the GPU). */
 #include "surfrecto.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "store.h"
 #include "xnet.h"
@@ -28,7 +29,7 @@
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 static int write_file(const char *dir, const char *name, const void *p, size_t n) {
@@ -59,8 +60,8 @@ static const float *window_fwd(sr_net *net, const uint8_t *wd, uint8_t *fl, floa
 /* --raw-in: one window (parity with the PyTorch reference) */
 static int raw_mode(sr_net *net, int argc, char **argv) {
     const char *in = opt(argc, argv, "--raw-in", nullptr), *out = opt(argc, argv, "--raw-out", nullptr);
-    const int P = atoi(opt(argc, argv, "--window", "256")), reps = atoi(opt(argc, argv, "--reps", "1")), keep = atoi(opt(argc, argv, "--keep", "0"));
-    const int tta = atoi(opt(argc, argv, "--tta", "0"));
+    const int P = opt_atoi("--window", opt(argc, argv, "--window", "256")), reps = opt_atoi("--reps", opt(argc, argv, "--reps", "1")), keep = opt_atoi("--keep", opt(argc, argv, "--keep", "0"));
+    const int tta = opt_atoi("--tta", opt(argc, argv, "--tta", "0"));
     if (!in || !out) { fprintf(stderr, "surfrecto-predict --ckpt PTH --raw-in WINDOW.u8 --raw-out DIR [--window 256] [--keep 1] [--tta 1] [--reps N]\n"); return 2; }
     const size_t nv = (size_t)P * P * P; uint8_t *u = malloc(nv);
     FILE *f = fopen(in, "rb"); if (!f || !u || fread(u, 1, nv, f) != nv) { fprintf(stderr, "surfrecto: %s is not %d^3 bytes\n", in, P); return 1; } fclose(f);
@@ -283,17 +284,17 @@ int cmd_surfrecto_predict(int argc, char **argv) {
                         "  ufsm surfrecto-predict --ckpt PTH --raw-in WINDOW.u8 --raw-out DIR [--window 256] [--keep 1] [--tta 1]   one window (parity)\n");
         return 2;
     }
-    if (xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
-    if (opt(argc, argv, "--gpu-mem", nullptr)) xnet_set_budget((size_t)(atof(opt(argc, argv, "--gpu-mem", "8")) * 1e9));
+    if (xnet_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
+    if (opt(argc, argv, "--gpu-mem", nullptr)) xnet_set_budget((size_t)(opt_atof("--gpu-mem", opt(argc, argv, "--gpu-mem", "8")) * 1e9));
     const double tl = now_s();
     sr_net *net = sr_load(ck); if (!net) return 1;
     fprintf(stderr, "surfrecto: loaded %s in %.1f s\n", ck, now_s() - tl);
     if (raw) { const int rc = raw_mode(net, argc, argv); sr_free(net); return rc; }
 
     const char *root = argv[3], *key = argv[4], *out = argv[5];
-    const int P = atoi(opt(argc, argv, "--window", "256")), tta = atoi(opt(argc, argv, "--tta", "0")), air = atoi(opt(argc, argv, "--air", "0"));
-    const int SH = atoi(opt(argc, argv, "--shard", "512")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
-    const double ov = atof(opt(argc, argv, "--overlap", "0.5")), um = atof(opt(argc, argv, "--um", "2.4"));
+    const int P = opt_atoi("--window", opt(argc, argv, "--window", "256")), tta = opt_atoi("--tta", opt(argc, argv, "--tta", "0")), air = opt_atoi("--air", opt(argc, argv, "--air", "0"));
+    const int SH = opt_atoi("--shard", opt(argc, argv, "--shard", "512")), nth = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16);
+    const double ov = opt_atof("--overlap", opt(argc, argv, "--overlap", "0.5")), um = opt_atof("--um", opt(argc, argv, "--um", "2.4"));
     int S = (int)lround(P * (1.0 - ov)); if (S > P) S = P; if (S < 1) S = 1;
     if (P % 64 || P < 64) { fprintf(stderr, "surfrecto: --window must be a multiple of 64\n"); return 2; }
     if (SH % 128 || SH < 128) { fprintf(stderr, "surfrecto: --shard must be a multiple of 128\n"); return 2; }

@@ -1,4 +1,5 @@
 #include "vwt_aug.h"
+#include "optcheck.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,7 +13,7 @@ vwa_cfg vwa_cfg_default(void) {
     return (vwa_cfg){.on = 1, .geo_p = .5f, .df = deform_cfg_default(), .lattice = 2,
                      .gain_p = .5f, .gamma_p = .3f, .noise_p = .3f, .blur_p = .3f, .lowres_p = .1f, .quant_p = .1f, .strength = 1};
 }
-static const char *va_opt(int argc, char **argv, const char *f) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], f)) return argv[i + 1]; return nullptr; }
+static const char *va_opt(int argc, char **argv, const char *f) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(f))) return argv[i + 1]; return nullptr; }
 int vwa_cfg_parse(vwa_cfg *c, int argc, char **argv) {
     const char *v;
     if (deform_cfg_parse(&c->df, argc, argv)) return 1;

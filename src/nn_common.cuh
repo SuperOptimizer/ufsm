@@ -89,6 +89,11 @@ extern "C" int nn_exec_manifest(char *buf, size_t n);
 extern "C" int nn_get_f16(void);
 #define LPDT(flag) ((flag) ? (g_h16 ? 2 : 1) : 0)   /* storage code of the lp_* (nn_fp8.cu) entry points: 0 fp32, 1 bf16, 2 fp16 */
 extern float g_gscale;
+extern thread_local const float *g_hgsp;   /* nn_set_head_gscale(_dev): the head-gradient plane scale, device {s, 1 / s} (nullptr: 1, outside the head's gradient pass) */
+#define GSH g_gscale                           /* the loss-gradient producers' scale argument; x s in the kernel from GSHP */
+#define GSHP g_hgsp
+/* a producer kernel's scale x the head plane scale (hp: GSHP); __fmul_rn: never contracted into a following add */
+static __device__ __forceinline__ float hgs_mul(float v, const float *hp) { return hp ? __fmul_rn(v, hp[0]) : v; }
 extern "C" void nn_set_grad_scale(float s);
 extern "C" float nn_get_grad_scale(void);
 extern int g_gradbf;
@@ -96,10 +101,14 @@ extern "C" void nn_set_grad_bf16(int on);
 extern "C" int nn_get_grad_bf16(void);
 #define GBF (ABF && g_gradbf)
 
-extern cudaError_t g_err;
+/* the CUDA error latch, per host thread (one thread per GPU under data parallel: a process-wide latch let one GPU's thread consume and
+   report the other's error, 2026-11-14 audit); each first error is also posted process-wide (nn_err_post) so the trainer's main thread
+   sees the GPU threads' errors in its nn_check */
+extern thread_local cudaError_t g_err;
 extern "C" const char *lp_check(void);
-extern const char *g_err_file, *g_err_what; extern int g_err_line;   /* the call site of the latched g_err (nn_check_site) */
-#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess && g_err == cudaSuccess) { g_err = e_; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = #x; if (ufsm_env_on("UFSM_CUDA_TRACE")) fprintf(stderr,"CUDA at %s:%d (%s): %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e_)); } } while (0)
+extern thread_local const char *g_err_file, *g_err_what; extern thread_local int g_err_line;   /* the call site of the latched g_err (nn_check_site) */
+extern "C" void nn_err_post(int e, const char *file, int line, const char *what);
+#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess && g_err == cudaSuccess) { g_err = e_; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = #x; nn_err_post((int)e_, __FILE__, __LINE__, #x); if (ufsm_env_on("UFSM_CUDA_TRACE")) fprintf(stderr,"CUDA at %s:%d (%s): %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e_)); } } while (0)
 #define KCHECK() CK(cudaGetLastError())
 
 extern "C" int nn_init(int device);
@@ -262,6 +271,16 @@ template <typename HT> __device__ __forceinline__ unsigned packh(float a, float 
 template <> __device__ __forceinline__ unsigned packh<bf16>(float a, float b) { __nv_bfloat162 r = __floats2bfloat162_rn(a, b); return *(unsigned *)&r; }
 template <> __device__ __forceinline__ unsigned packh<f16>(float a, float b) { __half2 r = __floats2half2_rn(a, b); return *(unsigned *)&r; }
 /* activation element type: float or bf16 (gradients are always float) */
+/* the fine stem's W1 rows (C x 64) to fp16 for the tensor cores (nn_fstem.cu) and predict's mirror (nn_lathead.cu): row c is scaled by 2^e
+   so its max |w| lies in [2^14, 2^15) before the fp16 conversion, and the fp32 product is scaled back by 2^-e (both exact), so a row of
+   tiny weights keeps fp16's 11 bits instead of flushing into subnormals (the head's fix, 1b0f7b9; audit net#11). Returns e (0: off, or an
+   all-zero / non-finite row). */
+__device__ __forceinline__ int fs_w1_exp(const float *row, int on) {
+    if (!on) return 0;
+    float m = 0.f; for (int k = 0; k < 64; k++) m = fmaxf(m, fabsf(row[k]));
+    if (!(m > 0.f) || !(m < 3e38f)) return 0;
+    int e; frexpf(m, &e); e = 15 - e; return e < -100 ? -100 : e > 100 ? 100 : e;
+}
 template <typename T> __device__ __forceinline__ float ldv(const T *p, size_t i);
 template <> __device__ __forceinline__ float ldv<float>(const float *p, size_t i) { return p[i]; }
 template <> __device__ __forceinline__ float ldv<bf16>(const bf16 *p, size_t i) { return __bfloat162float(p[i]); }
@@ -2190,7 +2209,7 @@ template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t 
 __global__ void loss_d2f_k(const double *d, float *f, int n);
 /* finalize on device: per-channel mean bce / dice, active count, and 1/active for the gradient kernel.
    layout of fin[]: [0..C) bce, [C..2C) dice, [2C] active, [2C+1] inv_active */
-__global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, float *fin);
+__global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, float *fin, int wslot = -1);   /* (nn_loss.cu; wslot: --win-weight, nn_loss_stats_fin_w) */
 /* the logit gradient of voxel v of (n, c) = nc, element i = nc S + v, logit x, target byte tb, mask byte mb (loss_grad_k's per-element
    arithmetic, unchanged) */
 template <typename GT, typename LT> __device__ __forceinline__ GT loss_grad_v(const uint8_t *t, int C, size_t S, const float *st, float dice_w, const float *fin,
@@ -2230,7 +2249,8 @@ template <typename GT, typename LT> __device__ __forceinline__ GT loss_grad_v(co
 static inline dim3 lg_grid(size_t S, int NC) { return dim3((unsigned)((S + 256 * LG_V - 1) / (256 * LG_V)), (unsigned)NC); }
 template <typename GT, typename LT = float> __global__ void __launch_bounds__(256) loss_grad_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N,
                             int C, size_t S, const float *st, float dice_w, const float *fin, GT *gl, float pw, float gscale, int tol, const uint8_t *code, int D, int H,
-                            int W, float rec_w = 0.f, int unit_c = -1) {   /* unit_c: the channel whose mask weight counts as 0 / 1 (nn_set_loss_unit_ch7) */
+                            int W, float rec_w = 0.f, int unit_c = -1, const float *hp = nullptr) {   /* unit_c: the channel whose mask weight counts as 0 / 1 (nn_set_loss_unit_ch7); hp: GSHP */
+    gscale = hgs_mul(gscale, hp);
     const int nc = blockIdx.y, n = nc / C; const bool unit = nc % C == unit_c;
     const size_t v0 = (size_t)blockIdx.x * (256 * LG_V) + threadIdx.x, b0 = (size_t)nc * S;
     const bool on = w[nc] != 0;
@@ -2261,8 +2281,8 @@ extern "C" void nn_loss(const float *logits, const uint8_t *t, const uint8_t *m,
 
 __global__ void sheet_gather_k(const float *lg,shape5 s,const float *xyz,size_t np,int z0,int lo,int hi,double *out);
 extern "C" void nn_sheet_gather(const float *lg,shape5 s,const float *coords,size_t np,int z0,int lo,int hi,double *values);
-template<typename T> __global__ void sheet_scatter_k(T *gl,const uint64_t *idx,const float *v,size_t n,float scale) {
-    size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x;
+template<typename T> __global__ void sheet_scatter_k(T *gl,const uint64_t *idx,const float *v,size_t n,float scale,const float *hp=nullptr) {
+    size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x; scale=hgs_mul(scale,hp);
     if (i<n) gl[idx[i]]=f2h<T>(h2f(gl[idx[i]])+v[i]*scale);
 }
 extern "C" void nn_sheet_scatter(float *gl,const uint64_t *indices,const float *values,size_t n,int h16);

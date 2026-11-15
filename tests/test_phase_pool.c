@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
@@ -42,7 +43,32 @@ static int grad(const uint8_t *p, int D, int H, int W, int z, int y, int x, doub
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) { fprintf(stderr, "usage: test_phase_pool DIR\n"); return 2; }
+    if (argc == 7 && !strcmp(argv[1], "--compare")) {   /* --compare ROOT FINE_KEY COARSE_KEY N P: a stored coarser phase level (ufsm downsample --mode
+        phase; sources.c source_phase_at reads it when present) against phase_pool2_view of the fine level, over N P^3 boxes holding stored chunks */
+        store *st = store_open(argv[2]); z3 *f = st ? z3_open(st, argv[3], nullptr) : nullptr, *c = st ? z3_open(st, argv[4], nullptr) : nullptr;
+        if (!f || !c) { fprintf(stderr, "compare: cannot open %s %s / %s\n", argv[2], argv[3], argv[4]); return 1; }
+        z3 *v = phase_pool2_view(f, 0); const int N = atoi(argv[5]), P = atoi(argv[6]); const int64_t *sh = z3_meta_of(c)->shape;
+        uint8_t *a = malloc((size_t)P * P * P), *b = malloc((size_t)P * P * P); double ts = 0, tv = 0; uint64_t rs = 0x2545F4914F6CDD1Dull, kn = 0, kv = 0, ka = 0, d1 = 0, dk = 0; int mx = 0, nb = 0;
+        for (int t = 0; t < 400 * N && nb < N; t++) {
+            int64_t o[3]; const int64_t n[3] = {P, P, P};
+            for (int d = 0; d < 3; d++) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; o[d] = sh[d] > P ? (int64_t)(rs % (uint64_t)(sh[d] - P)) : 0; }
+            if (z3_box_any(c, o, n) <= 0) continue;
+            struct timespec t0, t1, t2; clock_gettime(CLOCK_MONOTONIC, &t0);
+            if (z3_read(c, o, n, a, 8)) { fprintf(stderr, "compare: read failed\n"); return 1; }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            if (z3_read(v, o, n, b, 8)) { fprintf(stderr, "compare: read failed\n"); return 1; }
+            clock_gettime(CLOCK_MONOTONIC, &t2); ts += t1.tv_sec - t0.tv_sec + 1e-9 * (t1.tv_nsec - t0.tv_nsec); tv += t2.tv_sec - t1.tv_sec + 1e-9 * (t2.tv_nsec - t1.tv_nsec);
+            uint64_t k0 = 0; for (size_t i = 0; i < (size_t)P * P * P; i++) k0 += a[i] < PHASE_PERIOD;
+            if (!k0) continue;
+            nb++;
+            for (size_t i = 0; i < (size_t)P * P * P; i++) { const int ak = a[i] < PHASE_PERIOD, bk = b[i] < PHASE_PERIOD; kn += ak; kv += bk; ka += ak && bk; dk += ak != bk;
+                if (ak && bk && a[i] != b[i]) { d1++; int e = abs((int)a[i] - (int)b[i]); if (e > PHASE_PERIOD / 2) e = PHASE_PERIOD - e; if (e > mx) mx = e; } }
+        }
+        printf("compare: %d boxes of %d^3: stored known %llu, view known %llu, known in one only %llu, both known %llu of which %llu differ (max %d codes); read %.2f s stored, %.2f s pooled view (8 threads)\n",
+               nb, P, (unsigned long long)kn, (unsigned long long)kv, (unsigned long long)dk, (unsigned long long)ka, (unsigned long long)d1, mx, ts, tv);
+        return 0;
+    }
+    if (argc != 2) { fprintf(stderr, "usage: test_phase_pool DIR | --compare ROOT FINE_KEY COARSE_KEY N P\n"); return 2; }
     char p[1400]; snprintf(p, sizeof p, "rm -rf '%s' && mkdir -p '%s'", argv[1], argv[1]); if (system(p)) return 1;
     snprintf(p, sizeof p, "%s/phase", argv[1]);
     const int64_t sh[3] = {NZ, NY, NX};

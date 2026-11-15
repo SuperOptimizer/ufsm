@@ -1,7 +1,10 @@
 /* Checkpoint inference settings must survive a move without any sidecar files. */
 #include "checkpoint.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int fails;
@@ -32,5 +35,18 @@ int main(void) {
     a.input_prec = 0; CHECK(checkpoint_runtime_json(&a, text, sizeof text) < 0);
     a.input_prec = 8; a.gn_stored = 2; CHECK(checkpoint_runtime_json(&a, text, sizeof text) < 0);
     FILE *f = fopen(path, "wb"); fputs("UFSM{\"extra\":{", f); fclose(f); CHECK(checkpoint_runtime_read(path, &b) < 0);
+    {   /* audit 11-14 #14: a header longer than the old 64 KB read window, with the unwrap block at its end */
+        f = fopen(path, "wb"); fputs("UFSM{\"nlev\":4,\"pad\":\"", f); for (int i = 0; i < 70000; i++) fputc('x', f);
+        fputs("\",\"unwrap\":{\"version\":2,\"ink\":11}}\nBINARY", f); fclose(f);
+        char *h = checkpoint_header_line(path); CHECK(h && strlen(h) > 70000 && !strchr(h, '\n'));
+        CHECK(h && strstr(h, "\"unwrap\":{\"version\":2")); free(h);
+        CHECK(checkpoint_unwrap_version(path) == 2); CHECK(checkpoint_ink_channel(path) == 11);
+        CHECK(checkpoint_header_line("/nonexistent/ufsm.ckpt") == nullptr);
+        /* no newline within the cap: the reader exits 2 (checked in a child) */
+        f = fopen(path, "wb"); fputs("UFSM{", f); for (int i = 0; i < UFSM_CHECKPOINT_HEADER + 10; i++) fputc('x', f); fclose(f);
+        fflush(nullptr); const pid_t pid = fork();
+        if (pid == 0) { freopen("/dev/null", "w", stderr); char *g = checkpoint_header_line(path); free(g); _exit(0); }
+        int st = 0; waitpid(pid, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 2);
+    }
     unlink(path); printf("checkpoint runtime: %s\n", fails ? "FAIL" : "ok"); return fails != 0;
 }

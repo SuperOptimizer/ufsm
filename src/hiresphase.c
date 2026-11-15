@@ -13,6 +13,7 @@
    --map MAP.json (ufsm reg map: fine L0 xyz -> coarse L0 xyz + field D): a finer scan registered to the fields' scan; without it the
    CT is the fields' scan at another level (voxel c at native (c + 0.5) / F - 0.5, F = fields um / ct um). */
 #include <complex.h>
+#include "optcheck.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -29,7 +30,7 @@
 #include "z3w.h"
 #include "wind.h"
 
-static const char *hp_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *hp_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static double hp_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 enum { HP_MAXN = 1024, HP_MAXM = 256 };
@@ -227,11 +228,11 @@ int cmd_hires_phase(int argc, char **argv) {
         return 2;
     }
     const char *root = argv[2], *key = argv[3], *dir = argv[4], *out = argv[5];
-    const double ctum = atof(hp_opt(argc, argv, "--ct-um", "0"));
+    const double ctum = opt_atof("--ct-um", hp_opt(argc, argv, "--ct-um", "0"));
     if (!(ctum > 0)) { fprintf(stderr, "hires-phase: --ct-um U needed\n"); return 2; }
-    const int nt0 = ufsm_threads(atoi(hp_opt(argc, argv, "--threads", "0")), 16), stride = atoi(hp_opt(argc, argv, "--stride", "1"));
+    const int nt0 = ufsm_threads(opt_atoi("--threads", hp_opt(argc, argv, "--threads", "0")), 16), stride = opt_atoi("--stride", hp_opt(argc, argv, "--stride", "1"));
     const int fillnet = strcmp(hp_opt(argc, argv, "--fill", "net"), "none") != 0, feature = !strcmp(hp_opt(argc, argv, "--feature", "valley"), "peak");
-    const double mincf = atof(hp_opt(argc, argv, "--min-conf", "0.05")), memgb = atof(hp_opt(argc, argv, "--mem-gb", "6"));
+    const double mincf = opt_atof("--min-conf", hp_opt(argc, argv, "--min-conf", "0.05")), memgb = opt_atof("--mem-gb", hp_opt(argc, argv, "--mem-gb", "6"));
     z3 *cz = z3_open(store_open(root), key, hp_opt(argc, argv, "--cache", nullptr)); if (!cz) { fprintf(stderr, "hires-phase: %s\n", z3_error()); return 1; }
     const z3_meta *zm = z3_meta_of(cz);
     fit_fields_buf g; if (fit_fields_load(dir, 0, 0, 1, &g)) { fprintf(stderr, "hires-phase: cannot load %s\n", dir); return 1; }
@@ -244,10 +245,10 @@ int cmd_hires_phase(int argc, char **argv) {
     const size_t n = (size_t)D * H * W;
     float *phi = malloc(n * sizeof *phi), *conf = calloc(n, sizeof *conf); for (size_t i = 0; i < n; i++) phi[i] = NAN;
     hp_job J0 = {.F = F, .um = um, .ctum = ctum, .org = {(double)g.origin[0], (double)g.origin[1], (double)g.origin[2]}, .map = map, .ms = mapS,
-                 .rt = atof(hp_opt(argc, argv, "--rt-um", "15")) / ctum, .sigma = atof(hp_opt(argc, argv, "--sigma-um", "2.4")) / ctum,
-                 .prom = atof(hp_opt(argc, argv, "--prom", "0.5")), .prom_abs = atof(hp_opt(argc, argv, "--prom-abs", "2")),
-                 .rmin = atof(hp_opt(argc, argv, "--rmin-um", "100")), .rmax = atof(hp_opt(argc, argv, "--rmax-um", "250")),
-                 .gabor = atof(hp_opt(argc, argv, "--gabor", "0")), .feature = feature, .stride = stride < 1 ? 1 : stride, .phi = phi, .conf = conf, .H = H, .W = W};
+                 .rt = opt_atof("--rt-um", hp_opt(argc, argv, "--rt-um", "15")) / ctum, .sigma = opt_atof("--sigma-um", hp_opt(argc, argv, "--sigma-um", "2.4")) / ctum,
+                 .prom = opt_atof("--prom", hp_opt(argc, argv, "--prom", "0.5")), .prom_abs = opt_atof("--prom-abs", hp_opt(argc, argv, "--prom-abs", "2")),
+                 .rmin = opt_atof("--rmin-um", hp_opt(argc, argv, "--rmin-um", "100")), .rmax = opt_atof("--rmax-um", hp_opt(argc, argv, "--rmax-um", "250")),
+                 .gabor = opt_atof("--gabor", hp_opt(argc, argv, "--gabor", "0")), .feature = feature, .stride = stride < 1 ? 1 : stride, .phi = phi, .conf = conf, .H = H, .W = W};
     const double reach = (J0.rmax / ctum + J0.rt + 3 * J0.sigma) * (map ? 1.05 : 1) + 3;   /* CT voxels */
     /* z slabs of field rows whose CT box fits --mem-gb (the CT box of a slab: the slab's cells mapped to the CT, plus the reach) */
     const double t0 = hp_now(); long long ncell = 0, nph = 0;
@@ -279,10 +280,10 @@ int cmd_hires_phase(int argc, char **argv) {
     }
     fprintf(stderr, "\n");
     /* the sign and gauge */
-    double cp, cm; const double gmin = atof(hp_opt(argc, argv, "--gauge-min", "0.4"));
+    double cp, cm; const double gmin = opt_atof("--gauge-min", hp_opt(argc, argv, "--gauge-min", "0.4"));
     const double gp = hp_gauge(&g, phi, conf, 1, gmin, &cp), gm = hp_gauge(&g, phi, conf, -1, gmin, &cm);
     printf("hires-phase: gauge vs the input fields (confidence > %.2f): sign +1 phi0 %.3f coherence %.3f; sign -1 phi0 %.3f coherence %.3f\n", gmin, gp, cp, gm, cm);
-    int sign = atoi(hp_opt(argc, argv, "--sign", "1")); double g0 = sign < 0 ? gm : gp;
+    int sign = opt_atoi("--sign", hp_opt(argc, argv, "--sign", "1")); double g0 = sign < 0 ? gm : gp;
     const char *gr = hp_opt(argc, argv, "--gauge-ref", nullptr);
     if (gr) {
         fit_fields_buf R; if (fit_fields_load(gr, 0, 0, 1, &R)) { fprintf(stderr, "hires-phase: cannot load %s\n", gr); return 1; }
@@ -293,7 +294,7 @@ int cmd_hires_phase(int argc, char **argv) {
         hp_gauge_bins(&R, phi, conf, sign);
         g0 = sign < 0 ? qm : qp; fit_fields_free(&R);
     } else if (!sign) { sign = cp >= cm ? 1 : -1; g0 = sign < 0 ? gm : gp; }
-    if (*hp_opt(argc, argv, "--gauge", "")) g0 = atof(hp_opt(argc, argv, "--gauge", "0"));
+    if (*hp_opt(argc, argv, "--gauge", "")) g0 = opt_atof("--gauge", hp_opt(argc, argv, "--gauge", "0"));
     size_t nmat = 0, nset = 0; double csum = 0;
     for (size_t i = 0; i < n; i++) {
         if (g.f.w[i]) nmat++;
@@ -315,7 +316,7 @@ int cmd_hires_phase(int argc, char **argv) {
     const char *lroot = hp_opt(argc, argv, "--labels", nullptr);
     if (lroot) {
         long long gv[3]; if (sscanf(hp_opt(argc, argv, "--labels-global", ""), "%lld,%lld,%lld", &gv[0], &gv[1], &gv[2]) != 3) { fprintf(stderr, "hires-phase: --labels needs --labels-global Z,Y,X\n"); return 2; }
-        const double lc = atof(hp_opt(argc, argv, "--labels-conf", "0.3")), lm = atof(hp_opt(argc, argv, "--labels-mat", "0.3")); const int BK = 512;
+        const double lc = opt_atof("--labels-conf", hp_opt(argc, argv, "--labels-conf", "0.3")), lm = opt_atof("--labels-mat", hp_opt(argc, argv, "--labels-mat", "0.3")); const int BK = 512;
         int64_t so[3]; const int64_t gsh[3] = {gv[0], gv[1], gv[2]};
         for (int d = 0; d < 3; d++) { if (org[d] < 0 || org[d] % ((long long)BK * h)) { fprintf(stderr, "hires-phase: --labels: box origin %lld not on the %d x h grid\n", org[d], BK); return 2; } so[d] = org[d] / ((long long)BK * h); }
         char lv[32], ld[1400], at[400]; z3w_level_name(um * h, lv, sizeof lv); snprintf(ld, sizeof ld, "%s/%s", lroot, lv);
@@ -378,7 +379,7 @@ static void *hc_rows(void *arg) {
             const double py = h * (y + 0.5), px = h * (x + 0.5); double ry = py - cyv, rx = px - cxv; const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
             double ta = 0, la = 0, spsum = 0; int ok = 1;
             for (int k = 0; k <= ns && ok; k++) {   /* (exactly fit-compare's reference count) */
-                const double qy = py + ry * k * ds / um, qx = px + rx * k * ds / um; const int iy = (int)(qy / h), ix = (int)(qx / h);
+                const double qy = py + ry * k * ds / um, qx = px + rx * k * ds / um; const int iy = (int)floor(qy / h), ix = (int)floor(qx / h);   /* (floor, not truncation: audit mini/coords #2) */
                 if (iy < 0 || ix < 0 || iy >= H || ix >= W) { ok = 0; break; }
                 const size_t i = ((size_t)z * H + iy) * W + ix; const double ac = (f->pc[i] - 128) / 127.0, as = (f->ps[i] - 128) / 127.0;
                 if (!f->w[i] || hypot(ac, as) <= 0.3) { ok = 0; break; }
@@ -444,8 +445,8 @@ static void *hc_rows(void *arg) {
 int cmd_hires_count(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm hires-count CTROOT KEY REF-FIELDS --ct-um U [--map MAP.json] [--rt-um 15] [--sigma-um 2.4] [--prom 0.5] [--prom-abs 2] [--feature valley|peak] [--margin-um 200] [--threads 16] [--cache DIR] [--mem-gb 6]\n"); return 2; }
     const char *root = argv[2], *key = argv[3], *dir = argv[4];
-    const double ctum = atof(hp_opt(argc, argv, "--ct-um", "0")); if (!(ctum > 0)) { fprintf(stderr, "hires-count: --ct-um U needed\n"); return 2; }
-    const int nt0 = ufsm_threads(atoi(hp_opt(argc, argv, "--threads", "0")), 16);
+    const double ctum = opt_atof("--ct-um", hp_opt(argc, argv, "--ct-um", "0")); if (!(ctum > 0)) { fprintf(stderr, "hires-count: --ct-um U needed\n"); return 2; }
+    const int nt0 = ufsm_threads(opt_atoi("--threads", hp_opt(argc, argv, "--threads", "0")), 16);
     z3 *cz = z3_open(store_open(root), key, hp_opt(argc, argv, "--cache", nullptr)); if (!cz) { fprintf(stderr, "hires-count: %s\n", z3_error()); return 1; }
     const z3_meta *zm = z3_meta_of(cz);
     fit_fields_buf A; if (fit_fields_load(dir, 0, 0, 1, &A)) { fprintf(stderr, "hires-count: cannot load %s\n", dir); return 1; }
@@ -454,13 +455,13 @@ int cmd_hires_count(int argc, char **argv) {
     if (mp) { rvol *fv; double cu, fu; if (!(map = reg_map_open(mp, hp_opt(argc, argv, "--cache", nullptr), &fv, &cu, &fu))) { fprintf(stderr, "hires-count: cannot open the map %s\n", mp); return 1; } mapS = exp2(lround(log2(um / cu)));
               if (fabs(um / cu - exp2(lround(log2(um / cu)))) > 0.01 * um / cu || fabs(fu - ctum) > 0.01 * ctum) { fprintf(stderr, "hires-count: map %.3f <- %.3f um vs fields %.3f / --ct-um %.3f\n", cu, fu, um, ctum); return 2; } }
     hp_job P = {.F = F, .um = um, .ctum = ctum, .org = {(double)A.origin[0], (double)A.origin[1], (double)A.origin[2]}, .map = map, .ms = mapS,
-                .rt = atof(hp_opt(argc, argv, "--rt-um", "15")) / ctum, .sigma = atof(hp_opt(argc, argv, "--sigma-um", "2.4")) / ctum,
-                .prom = atof(hp_opt(argc, argv, "--prom", "0.5")), .prom_abs = atof(hp_opt(argc, argv, "--prom-abs", "2")),
-                .rmax = atof(hp_opt(argc, argv, "--margin-um", "200")), .feature = !strcmp(hp_opt(argc, argv, "--feature", "valley"), "peak")};
+                .rt = opt_atof("--rt-um", hp_opt(argc, argv, "--rt-um", "15")) / ctum, .sigma = opt_atof("--sigma-um", hp_opt(argc, argv, "--sigma-um", "2.4")) / ctum,
+                .prom = opt_atof("--prom", hp_opt(argc, argv, "--prom", "0.5")), .prom_abs = opt_atof("--prom-abs", hp_opt(argc, argv, "--prom-abs", "2")),
+                .rmax = opt_atof("--margin-um", hp_opt(argc, argv, "--margin-um", "200")), .feature = !strcmp(hp_opt(argc, argv, "--feature", "valley"), "peak")};
     const size_t maxseg = (size_t)((D + 3) / 4) * ((H + 3) / 4) * ((W + 3) / 4);
     double *err = malloc(maxseg * sizeof *err); uint8_t *pk = calloc(maxseg, 1);
     const double reachxy = (500 + P.rmax) / ctum + P.rt + 3 * P.sigma + 3, reachz = (P.rt + 3 * P.sigma) * (map ? 1.1 : 1) + 3;
-    const double cpr = (H * h * F + 2 * reachxy) * (W * h * F + 2 * reachxy), memgb = atof(hp_opt(argc, argv, "--mem-gb", "6"));
+    const double cpr = (H * h * F + 2 * reachxy) * (W * h * F + 2 * reachxy), memgb = opt_atof("--mem-gb", hp_opt(argc, argv, "--mem-gb", "6"));
     int nzs = (int)((memgb * 1e9 / cpr - 2 * reachz) / (h * F)); nzs -= nzs % 4; if (nzs < 4) nzs = 4;
     hc_job C = {.A = &A, .P = &P, .err = err, .pk = pk}; atomic_init(&C.nseg, 0); atomic_init(&C.nnoct, 0);
     const double t0 = hp_now();

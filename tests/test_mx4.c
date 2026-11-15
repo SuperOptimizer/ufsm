@@ -143,19 +143,28 @@ int main(void) {
         check("cvt saturates +inf to +6 (0x7), -inf to -6 (0xf)", ho[1] == 0x7 && ho[2] == 0xf);
         shape5 s = {1, 32, 2, 2, 2};
         size_t n = shape_numel(s);
-        float *h = calloc(n, 4);
-        for (size_t i = 0; i < n; i++) h[i] = 0.5f * (float)(i % 7);
-        h[5 * 8 + 0] = NAN;   /* channel 5 of voxel 0 (index c * S + v) */
-        float *x = nn_malloc(n * 4); nn_h2d(x, h, n * 4);
-        float *d = deq4(mx4_from(x, s), s);
-        float *hd = malloc(n * 4), *ref = malloc(n * 4); nn_d2h(hd, d, n * 4);
-        h[5 * 8 + 0] = 0.f; host_mx4(h, s, ref);
-        int nonfin = 0, other_ok = 1;
-        for (int c = 0; c < 32; c++) { float v = hd[(size_t)c * 8]; if (!isfinite(v)) nonfin++; }
-        for (size_t i = 0; i < n; i++) if (i % 8) { if (hd[i] != ref[i]) other_ok = 0; }
-        check("NaN in a block: that voxel's block decodes non-finite", nonfin == 32 && !isfinite(hd[5 * 8]));
-        check("NaN in a block: other voxels == host quantiser", other_ok);
-        free(h); free(hd); free(ref);
+        /* NaN and +-inf (an overflowed activation): before 2026-11-14 an inf amax got the finite scale 2^126 and decoded as 6 * 2^126,
+           so overflows stayed finite until a later GN (kernels.md #3); now the whole block decodes non-finite, as NaN, in MX-fp4 and fp8 */
+        const float nfv[3] = {NAN, INFINITY, -INFINITY}; const char *bn[3] = {"NaN", "+inf", "-inf"};
+        for (int fmt = 4; fmt <= 8; fmt += 4) for (int b = 0; b < 3; b++) {
+            float *h = calloc(n, 4);
+            for (size_t i = 0; i < n; i++) h[i] = 0.5f * (float)(i % 7);
+            h[5 * 8 + 0] = nfv[b];   /* channel 5 of voxel 0 (index c * S + v) */
+            float *x = nn_malloc(n * 4); nn_h2d(x, h, n * 4);
+            float *d = fmt == 4 ? deq4(mx4_from(x, s), s) : deq8(mx8_from(x, s), s);
+            float *hd = malloc(n * 4), *ref = malloc(n * 4); nn_d2h(hd, d, n * 4);
+            h[5 * 8 + 0] = 0.f; if (fmt == 4) host_mx4(h, s, ref);
+            int nonfin = 0, other_ok = 1;
+            for (int c = 0; c < 32; c++) { float v = hd[(size_t)c * 8]; if (!isfinite(v)) nonfin++; }
+            if (fmt == 4) for (size_t i = 0; i < n; i++) if (i % 8) { if (hd[i] != ref[i]) other_ok = 0; }
+            if (fmt == 8) for (size_t i = 0; i < n; i++) if (i % 8) { if (!isfinite(hd[i])) other_ok = 0; }
+            char msg[96];
+            snprintf(msg, sizeof msg, "MX-fp%d, %s in a block: that voxel's block decodes non-finite", fmt, bn[b]);
+            check(msg, nonfin == 32 && !isfinite(hd[5 * 8]));
+            snprintf(msg, sizeof msg, "MX-fp%d, %s in a block: other voxels %s", fmt, bn[b], fmt == 4 ? "== host quantiser" : "finite");
+            check(msg, other_ok);
+            free(h); free(hd); free(ref);
+        }
     }
     {   /* fp4 conv forward on mx4 I/O: GN+SiLU input (32 ch, D = 16 -> TZ 4), output GN statistics from the unquantised accumulators */
         shape5 xs = {N, 32, 16, 12, 16}, ys = xs;

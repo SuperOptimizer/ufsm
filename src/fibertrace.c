@@ -19,6 +19,7 @@
    CPU; the reads are threaded, the tracing is one thread (the seed order makes it sequential). --gpu G computes the derived axis
    (--presence-only / --mask, ~97 % of the CPU time) on device G, byte-identical to the CPU (src/nn_ftrace.cu); the tracing stays here. */
 #include <math.h>
+#include "optcheck.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,7 +30,7 @@
 #include "zarr2.h"
 #include "zarr3.h"
 
-static const char *ft_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 5; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *ft_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 5; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 typedef struct { const uint8_t *pr, *nx, *ny; int64_t n[3]; } ft_vol;
 /* the presence-weighted dyad field at p (box voxels): T (zz, yy, xx, zy, zx, yx) and the support; 0 outside */
 static int ft_tensor(const ft_vol *V, const double p[3], double T[6], double *sup) {
@@ -58,7 +59,7 @@ static double ft_axis(const double T[6], const double d0[3], double d[3]) {
     for (int k = 0; k < 3; k++) d[k] = v[k];
     return lam / tr;
 }
-static int ft_flag(int argc, char **argv, const char *k) { for (int i = 5; i < argc; i++) if (!strcmp(argv[i], k)) return i; return 0; }
+static int ft_flag(int argc, char **argv, const char *k) { for (int i = 5; i < argc; i++) if (!strcmp(argv[i], opt_n(k))) return i; return 0; }
 /* --blur R (derived axes only): separable (2R+1)^3 box mean of the presence, in place (bridges short dips of a predicted tube) */
 static void ft_blur(uint8_t *v, const int64_t n[3], int R) {
     const size_t nv = (size_t)n[0] * n[1] * n[2]; float *a = malloc(nv * sizeof(float)), *b = malloc(nv * sizeof(float)); if (!a || !b) { free(a); free(b); return; }
@@ -93,17 +94,17 @@ int cmd_fiber_trace(int argc, char **argv) {
                         "       [--support 0.2] [--coh 0.65] [--turn 35] [--step 1] [--half 256] [--min-len 24] [--sep 1] [--threads 4] [--gpu G]\n");
         return 2;
     }
-    const int sd = atoi(ft_opt(argc, argv, "--scaledown", "3")), thr = atoi(ft_opt(argc, argv, "--thr", "64")), bin = atoi(ft_opt(argc, argv, "--bin", "8")), half = atoi(ft_opt(argc, argv, "--half", "256"));
-    const int nth = atoi(ft_opt(argc, argv, "--threads", "4")), sep = atoi(ft_opt(argc, argv, "--sep", "1")); const double minlen = atof(ft_opt(argc, argv, "--min-len", "24"));
-    ft_par P = {.sup = atof(ft_opt(argc, argv, "--support", "0.2")), .coh = atof(ft_opt(argc, argv, "--coh", "0.65")), .cturn = cos(atof(ft_opt(argc, argv, "--turn", "35")) * M_PI / 180), .h = atof(ft_opt(argc, argv, "--step", "1"))};
+    const int sd = opt_atoi("--scaledown", ft_opt(argc, argv, "--scaledown", "3")), thr = opt_atoi("--thr", ft_opt(argc, argv, "--thr", "64")), bin = opt_atoi("--bin", ft_opt(argc, argv, "--bin", "8")), half = opt_atoi("--half", ft_opt(argc, argv, "--half", "256"));
+    const int nth = opt_atoi("--threads", ft_opt(argc, argv, "--threads", "4")), sep = opt_atoi("--sep", ft_opt(argc, argv, "--sep", "1")); const double minlen = opt_atof("--min-len", ft_opt(argc, argv, "--min-len", "24"));
+    ft_par P = {.sup = opt_atof("--support", ft_opt(argc, argv, "--support", "0.2")), .coh = opt_atof("--coh", ft_opt(argc, argv, "--coh", "0.65")), .cturn = cos(opt_atof("--turn", ft_opt(argc, argv, "--turn", "35")) * M_PI / 180), .h = opt_atof("--step", ft_opt(argc, argv, "--step", "1"))};
     if (sd < 0 || sd > 8 || bin < 1 || half < 1 || sep < 0 || sep > 8 || !(P.h > 0)) { fprintf(stderr, "fiber-trace: bad options\n"); return 2; }
     const char *cache = ft_opt(argc, argv, "--cache", nullptr); uint8_t *vol[3] = {nullptr, nullptr, nullptr}; int64_t o[3], n[3];
-    const int str = atoi(ft_opt(argc, argv, "--st-r", "2")), blur = atoi(ft_opt(argc, argv, "--blur", "0"));
-    const int prior_on = atoi(ft_opt(argc, argv, "--axis-prior", "0"));
-    const int bridge = atoi(ft_opt(argc, argv, "--bridge", "0")); size_t nbridge = 0;   /* steps straight on through a support dip */   /* with --family H|V: the axis from the layer normal + the family direction */
+    const int str = opt_atoi("--st-r", ft_opt(argc, argv, "--st-r", "2")), blur = opt_atoi("--blur", ft_opt(argc, argv, "--blur", "0"));
+    const int prior_on = opt_atoi("--axis-prior", ft_opt(argc, argv, "--axis-prior", "0"));
+    const int bridge = opt_atoi("--bridge", ft_opt(argc, argv, "--bridge", "0")); size_t nbridge = 0;   /* steps straight on through a support dip */   /* with --family H|V: the axis from the layer normal + the family direction */
     if (str < 1 || str > 8 || blur < 0 || blur > 4) { fprintf(stderr, "fiber-trace: --st-r 1..8, --blur 0..4\n"); return 2; }
     long long mo_g[3] = {0, 0, 0};   /* --mask-origin (also the dyad channels' origin) */
-    const int mi = ft_flag(argc, argv, "--mask"), derive = mi || atoi(ft_opt(argc, argv, "--presence-only", "0")); const char famf = ft_opt(argc, argv, "--family", "?")[0];
+    const int mi = ft_flag(argc, argv, "--mask"), derive = mi || opt_atoi("--presence-only", ft_opt(argc, argv, "--presence-only", "0")); const char famf = ft_opt(argc, argv, "--family", "?")[0];
     static const char *const nm[3] = {"presence", "nx", "ny"};
     if (mi) {   /* a mask probability (zarr v3 uint8, prob254: 255 unknown read as 0) as the presence */
         if (mi + 2 >= argc) { fprintf(stderr, "fiber-trace: --mask ROOT KEY\n"); return 2; }
@@ -148,7 +149,7 @@ int cmd_fiber_trace(int argc, char **argv) {
             }
             for (int c = 0; c < 6; c++) free(dc[c]);
         } else {   /* --gpu G: the axis on the GPU (byte-identical, src/nn_ftrace.cu; ~97 % of a CPU --mask trace), the CPU on any failure */
-            const int gpu = atoi(ft_opt(argc, argv, "--gpu", "-1")); const char pri = prior_on && (famf == 'H' || famf == 'V') ? famf : 0;
+            const int gpu = opt_atoi("--gpu", ft_opt(argc, argv, "--gpu", "-1")); const char pri = prior_on && (famf == 'H' || famf == 'V') ? famf : 0;
             if (gpu < 0 || ft_ridge_axis_gpu(gpu, vol[0], n, vol[1], vol[2], str, pri)) { if (gpu >= 0) fprintf(stderr, "fiber-trace: the GPU axis failed; on the CPU\n");
                 ft_ridge_axis(vol[0], n, vol[1], vol[2], str, pri); } } }
     const ft_vol V = {vol[0], vol[1], vol[2], {n[0], n[1], n[2]}}; P.V = &V; const size_t nv = (size_t)n[0] * n[1] * n[2];

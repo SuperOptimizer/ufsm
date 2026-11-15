@@ -32,9 +32,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-extern cudaError_t g_lp_err;
+extern thread_local cudaError_t g_lp_err;   /* mgpu: per-thread (posted process-wide by LPCK: nn_err_post) */
+extern "C" void nn_err_post(int e, const char *file, int line, const char *what);
 extern "C" int lp_sw_build(void);   /* lp_mxsw.cu: 1 = the software MX paths (an ARCH=86 build) */
-#define LPCK() do { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess && g_lp_err == cudaSuccess) g_lp_err = e_; } while (0)
+#define LPCK() do { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess && g_lp_err == cudaSuccess) { g_lp_err = e_; nn_err_post((int)e_, __FILE__, __LINE__, "a low-precision kernel (LPCK)"); } } while (0)
 static inline unsigned nblk_(size_t n, unsigned b) { return (unsigned)((n + b - 1) / b); }
 /* the z tiles of TZ planes a launch covers: all of depth D, or those of the z-window sp.zw0 / zw1 (nn_set_zwin; its bounds on tile
    edges, or the window ends at D: a tile never writes planes outside the window) */
@@ -444,13 +445,21 @@ __device__ __forceinline__ void stage_up32(const chan_t &c0, int gz, int gy, int
 /* clamp to the fp16 range for a store that must not become inf; NaN stays NaN (fminf / fmaxf would turn it into
    +-65504 and hide a non-finite forward from the trainer's detection) */
 __device__ __forceinline__ float sat_h16(float v) { return fabsf(v) > 65504.f ? copysignf(65504.f, v) : v; }
+/* tanh(h) for the SiLU / dSiLU forms (u sigmoid(u) = h + h tanh(h), h = u / 2; their callers all form 1 + tanh(h)): tanh.approx (one MUFU op,
+   ~2^-11 absolute), but for h < -1 from exp, where 1 + tanh(h) cancels: tanh.approx's absolute error was then most of SiLU's value (u -8:
+   ~2e-3 against silu -0.0027; audit 2026-11-14 kernels.md #6); now ~2^-24 absolute there. Bits unchanged for h >= -1 */
+__device__ __forceinline__ float tanh_silu(float h) {
+    float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+    if (h < -1.f) { const float e = __expf(2.f * h); th = fmaf(2.f, __fdividef(e, 1.f + e), -1.f); }
+    return th;
+}
 __device__ __forceinline__ float act_ab(float v, float a, float b, bool G) {
     if (!G) return v;
     v = fmaf(v, a, b);
     /* SiLU through one MUFU op: u sigmoid(u) = h + h tanh(h), h = u / 2 (tanh.approx: ~2^-11 relative, far below the e2m1 /
        e4m3 rounding that follows in every caller; the staging was MUFU-bound with exp + reciprocal) */
     const float h = 0.5f * v;
-    float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+    float th = tanh_silu(h);
     return fmaf(h, th, h);
 }
 /* exponent e (scale 2^e) such that amax * 2^-e <= qmax; returned as the ue8m0 byte e + 127 */
@@ -464,7 +473,10 @@ __device__ __forceinline__ unsigned amax_u(unsigned a, float v) { return max(a, 
 __device__ __forceinline__ float amax_xs(float a, float v) { float r; asm("max.NaN.xorsign.abs.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(v)); return r; }
 __device__ __forceinline__ int mx_exp(float amax, float inv_qmax) {
     unsigned u = __float_as_uint(amax * inv_qmax);
-    if ((u & 0x7fffffffu) > 0x7f800000u) return 128;   /* NaN amax: scale byte 0xFF (decoded as inf) so the non-finite value survives storage */
+    if ((u & 0x7fffffffu) >= 0x7f800000u) return 128;   /* NaN or inf amax (or amax * inv_qmax overflowing): scale byte 0xFF (decoded as inf)
+                                                            so the non-finite value survives storage. inf used to fall through to e 128,
+                                                            clamped to 126: the inf element saturated to 6 * 2^126, a finite value that
+                                                            hid the overflow until a later GN sum overflowed (audit 2026-11-14 kernels.md #3) */
     int e = (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0);
     return max(-126, min(126, e));
 }
@@ -648,6 +660,12 @@ __device__ __forceinline__ void stage_up_smem_h2(const uint8_t *cu, const uint8_
     const int Dc = D >> 1, Hc = H >> 1, Wc = W >> 1;
     const int mz[2] = {gz >> 1, min(max((gz >> 1) + ((gz & 1) ? 1 : -1), 0), Dc - 1)}, my[2] = {gy >> 1, min(max((gy >> 1) + ((gy & 1) ? 1 : -1), 0), Hc - 1)},
               mx[2] = {gx >> 1, min(max((gx >> 1) + ((gx & 1) ? 1 : -1), 0), Wc - 1)};
+    /* the taps' fp16 weights relative to the largest of the 8 coarse blocks' scales (2^(e - e_max) <= 1), the 2^e_max on the fp32 result:
+       the block scale inside the fp16 weight made the corner tap (1/64) subnormal once a block's amax fell below ~1.8 and could overflow
+       the half accumulator for large scales (audit 2026-11-14 kernels.md #4). Bit-identical wherever the old weights and sums were normal */
+    int lis[8]; unsigned em = 0u;
+#pragma unroll
+    for (int t = 0; t < 8; t++) { const int a = t >> 2, b = (t >> 1) & 1, c = t & 1; lis[t] = ((mz[a] - cz0) * 8 + (my[b] - cy0)) * 12 + (mx[c] - cx0); em = max(em, (unsigned)cus[lis[t]]); }
     __half2 acc[16];
 #pragma unroll
     for (int j = 0; j < 16; j++) acc[j] = __float2half2_rn(0.f);
@@ -657,8 +675,9 @@ __device__ __forceinline__ void stage_up_smem_h2(const uint8_t *cu, const uint8_
         for (int b = 0; b < 2; b++)
 #pragma unroll
             for (int c = 0; c < 2; c++) {
-                const int li = ((mz[a] - cz0) * 8 + (my[b] - cy0)) * 12 + (mx[c] - cx0);
-                const __half2 w3 = __float2half2_rn((a ? 0.25f : 0.75f) * (b ? 0.25f : 0.75f) * (c ? 0.25f : 0.75f) * mx_scale(cus[li]));
+                const int li = lis[(a * 2 + b) * 2 + c];
+                const int de = (int)cus[li] - (int)em;   /* <= 0 */
+                const __half2 w3 = __float2half2_rn((a ? 0.25f : 0.75f) * (b ? 0.25f : 0.75f) * (c ? 0.25f : 0.75f) * (de >= -126 ? __uint_as_float((unsigned)(127 + de) << 23) : 0.f));
                 const uint4 h0 = *(const uint4 *)(cu + (size_t)li * 32), h1 = *(const uint4 *)(cu + (size_t)li * 32 + 16);
                 const unsigned w[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
 #pragma unroll
@@ -669,8 +688,9 @@ __device__ __forceinline__ void stage_up_smem_h2(const uint8_t *cu, const uint8_
                     acc[2 * j] = __hfma2(w3, *(const __half2 *)&lo, acc[2 * j]); acc[2 * j + 1] = __hfma2(w3, *(const __half2 *)&hi, acc[2 * j + 1]);
                 }
             }
+    const float sm = mx_scale(em);   /* (0xFF: inf, the non-finite block stays non-finite) */
 #pragma unroll
-    for (int j = 0; j < 16; j++) { const float2 f = __half22float2(acc[j]); v[2 * j] = f.x; v[2 * j + 1] = f.y; }
+    for (int j = 0; j < 16; j++) { const float2 f = __half22float2(acc[j]); v[2 * j] = f.x * sm; v[2 * j + 1] = f.y * sm; }
 }
 __device__ __forceinline__ unsigned smem_u32_(const void *p) { return (unsigned)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void ldsm_x4(unsigned *r, const void *row_ptr) {
@@ -1558,19 +1578,18 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
 #define F8_CI 32
 #define F8_T 720
 __device__ __forceinline__ int sw16(int row, int half) { return row * 32 + ((half ^ ((row >> 2) & 1)) << 4); }
+/* the kernels' grow-on-demand scratch: slot 0..5 of one table per element type, in the per-device workspace registry (nn_ws, nn_core.cu)
+   that the trainer's memory planner sizes and allocates before the first step (unet_ws_plan; 2026-11-14 audit net#4) */
+template <typename T> constexpr int lp_buf_tix(void) {
+    if constexpr (std::is_same<T, uint8_t>::value) return 0;
+    else if constexpr (std::is_same<T, float>::value) return 1;
+    else if constexpr (std::is_same<T, __half>::value) return 2;
+    else { static_assert(std::is_same<T, __nv_bfloat16>::value, "lp_buf: uint8_t, float, __half or __nv_bfloat16"); return 3; }
+}
 template <typename T> T *lp_buf(int slot, size_t n) {
-    static void *buf[8][6]; static size_t cap[8][6];
-    int d = cur_dev_();
-    if (n * sizeof(T) > cap[d][slot]) {
-        if (buf[d][slot]) cudaFree(buf[d][slot]);
-        if (cudaMalloc(&buf[d][slot], n * sizeof(T)) != cudaSuccess) {   /* (was unchecked: a full card then faulted in the kernel) */
-            fprintf(stderr, "lp_buf: no device memory for a %.1f MB kernel workspace (slot %d, GPU %d)\n", n * sizeof(T) / 1e6, slot, d); abort();
-        }
-        cap[d][slot] = n * sizeof(T);
-        static int rep = -1; if (rep < 0) rep = getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) > 0;
-        if (rep) fprintf(stderr, "lp_buf: %zu-byte elements, slot %d -> %.1f MB (GPU %d)\n", sizeof(T), slot, cap[d][slot] / 1e6, d);   /* kernel workspaces (outside the planner's dry build) */
-    }
-    return (T *)buf[d][slot];
+    T *p = (T *)nn_ws(NN_WS_LPBUF + 6 * lp_buf_tix<T>() + slot, n * sizeof(T));
+    if (!p && n) { fprintf(stderr, "lp_buf: no device memory for a %.1f MB kernel workspace (slot %d, GPU %d)\n", n * sizeof(T) / 1e6, slot, cur_dev_()); abort(); }
+    return p;
 }
 #define P16_KS 18
 __global__ void prep_w8p_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Ox, int OxP);   /* defined in lp_f8fwd.cu */

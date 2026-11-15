@@ -175,6 +175,12 @@ __device__ __forceinline__ void f4ru_blend(const uint8_t *cu, const uint8_t *cus
     const int Dc = D >> 1, Hc = H >> 1, Wc = W >> 1;
     const int mz[2] = {gz >> 1, min(max((gz >> 1) + ((gz & 1) ? 1 : -1), 0), Dc - 1)}, my[2] = {gy >> 1, min(max((gy >> 1) + ((gy & 1) ? 1 : -1), 0), Hc - 1)},
               mx[2] = {gx >> 1, min(max((gx >> 1) + ((gx & 1) ? 1 : -1), 0), Wc - 1)};
+    /* the taps' fp16 weights relative to the largest of the 8 coarse blocks' scales (2^(e - e_max) <= 1), the 2^e_max on the fp32 result:
+       the block scale inside the fp16 weight made the corner tap (1/64) subnormal once a block's amax fell below ~1.8 and could overflow
+       the half accumulator for large scales (audit 2026-11-14 kernels.md #4). Bit-identical wherever the old weights and sums were normal */
+    int lis[8]; unsigned em = 0u;
+#pragma unroll
+    for (int t = 0; t < 8; t++) { const int a = t >> 2, b = (t >> 1) & 1, c = t & 1; lis[t] = ((mz[a] - cz0) * F4RU_NY + (my[b] - cy0)) * F4RU_NX + (mx[c] - cx0); em = max(em, (unsigned)cus[lis[t]]); }
     __half2 acc[16];
 #pragma unroll
     for (int j = 0; j < 16; j++) acc[j] = __float2half2_rn(0.f);
@@ -184,8 +190,9 @@ __device__ __forceinline__ void f4ru_blend(const uint8_t *cu, const uint8_t *cus
         for (int b = 0; b < 2; b++)
 #pragma unroll
             for (int c = 0; c < 2; c++) {
-                const int li = ((mz[a] - cz0) * F4RU_NY + (my[b] - cy0)) * F4RU_NX + (mx[c] - cx0);
-                const __half2 w3 = __float2half2_rn((a ? 0.25f : 0.75f) * (b ? 0.25f : 0.75f) * (c ? 0.25f : 0.75f) * mx_scale(cus[li]));
+                const int li = lis[(a * 2 + b) * 2 + c];
+                const int de = (int)cus[li] - (int)em;   /* <= 0 */
+                const __half2 w3 = __float2half2_rn((a ? 0.25f : 0.75f) * (b ? 0.25f : 0.75f) * (c ? 0.25f : 0.75f) * (de >= -126 ? __uint_as_float((unsigned)(127 + de) << 23) : 0.f));
                 const uint4 h0 = *(const uint4 *)(cu + (size_t)li * 32), h1 = *(const uint4 *)(cu + (size_t)li * 32 + 16);
                 const unsigned w[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
 #pragma unroll
@@ -196,8 +203,9 @@ __device__ __forceinline__ void f4ru_blend(const uint8_t *cu, const uint8_t *cus
                     acc[2 * j] = __hfma2(w3, *(const __half2 *)&lo, acc[2 * j]); acc[2 * j + 1] = __hfma2(w3, *(const __half2 *)&hi, acc[2 * j + 1]);
                 }
             }
+    const float sm = mx_scale(em);   /* (0xFF: inf, the non-finite block stays non-finite) */
 #pragma unroll
-    for (int j = 0; j < 16; j++) { const float2 f = __half22float2(acc[j]); v[2 * j] = f.x; v[2 * j + 1] = f.y; }
+    for (int j = 0; j < 16; j++) { const float2 f = __half22float2(acc[j]); v[2 * j] = f.x * sm; v[2 * j + 1] = f.y * sm; }
 }
 /* the up chunk's new planes p0n .. NP - 1 of the z tile at oz0 into its ring (plane gz in slot (gz + 1) % NP); cu: >= F4RU_NR * 33 B */
 template <typename T, int NP>
@@ -284,7 +292,7 @@ __device__ __forceinline__ void f4r_stage_g_t(const chan_t &c0, const float2 *ca
 #pragma unroll
                 for (int j = 0; j < 32; j++) {
                     const float h = fmaf(v[j], hab[j].x, hab[j].y);
-                    float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+                    float th = tanh_silu(h);
                     v[j] = in[k] ? fmaf(h, th, h) : 0.f;
                 }
             } else {
@@ -719,8 +727,10 @@ static int wmemo_get(unsigned key, const float *w, int Cop, int Cip, int Cx, int
     const int d = cur_dev_();
     wmemo_s *e = &g_wmemo[d][key % WMEMO_N];
     const bool hit = e->key == key && e->w == w && e->Cop == Cop && e->Cip == Cip && e->Cx == Cx && e->CxP == CxP && e->Ox == Ox && e->OxP == OxP && e->step == g_wmemo_step && e->gen == g_wmemo_gen && e->nq == nq && e->ns == ns;
-    if (e->nq < nq) { if (e->wq) cudaFree(e->wq); cudaMalloc(&e->wq, nq); e->nq = nq; }
-    if (e->ns < ns) { if (e->ws) cudaFree(e->ws); cudaMalloc(&e->ws, ns); e->ns = ns; }
+    /* (one allocation per conv and pass at its first call; the trainer's plan charges them all: unet_ws_plan, 2026-11-14 audit net#4.
+       Was unchecked: a full card then faulted in the prep kernel) */
+    if (e->nq < nq) { if (e->wq) cudaFree(e->wq); if (cudaMalloc(&e->wq, nq) != cudaSuccess) { fprintf(stderr, "wmemo: no device memory for %zu B of prepared weights (GPU %d)\n", nq, d); abort(); } e->nq = nq; }
+    if (e->ns < ns) { if (e->ws) cudaFree(e->ws); if (cudaMalloc(&e->ws, ns) != cudaSuccess) { fprintf(stderr, "wmemo: no device memory for %zu B of weight scales (GPU %d)\n", ns, d); abort(); } e->ns = ns; }
     *wq = e->wq; *ws = e->ws;
     if (hit) return 1;
     e->key = key; e->w = w; e->Cop = Cop; e->Cip = Cip; e->Cx = Cx; e->CxP = CxP; e->Ox = Ox; e->OxP = OxP; e->step = g_wmemo_step; e->gen = g_wmemo_gen;
@@ -776,14 +786,14 @@ __device__ __forceinline__ void dec_row16_gnh(uint2 raw, unsigned rsc, bool in, 
 #pragma unroll
             for (int k = 0; k < 16; k++) {
                 const float h = fmaf(v[k], gh[k].x, gh[k].y);
-                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+                float th = tanh_silu(h);
                 v[k] = fmaf(h, th, h);
             }
         } else {
 #pragma unroll
             for (int k = 0; k < 16; k++) {
                 const float h = fmaf(v[k], gh[k].x, gh[k].y);
-                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(h));
+                float th = tanh_silu(h);
                 v[k] = k < Ci ? fmaf(h, th, h) : 0.f;
             }
         }
@@ -1079,11 +1089,11 @@ __global__ void __launch_bounds__(256) gn_prenorm_f4_k(const T *__restrict__ x, 
     *(uint4 *)(y + ri * 16) = make_uint4(cvt_e2m1x8(val, m), cvt_e2m1x8(val + 8, m), cvt_e2m1x8(val + 16, m), cvt_e2m1x8(val + 24, m));
     y[(size_t)N * nb * S * 16 + ri] = (uint8_t)(e + 127);
 }
-static inline uint8_t *f4_prenorm_buf(size_t n) {   /* per device, grown on demand */
-    static uint8_t *buf[8]; static size_t cap[8]; const int d = cur_dev_();
-    if (n > cap[d]) { if (buf[d]) cudaFree(buf[d]); buf[d] = nullptr; cap[d] = 0; if (cudaMalloc(&buf[d], n) != cudaSuccess) { cudaGetLastError(); return nullptr; } cap[d] = n; }
-    return buf[d];
-}
+/* the GroupNorm input's MX-fp4 copy: a whole layer (17 B per 32 channels and voxel: ~1 GB at level 0 of a 256-wide P 768 latent net), so
+   the planner gives it a budget (unet_ws_plan: the largest layer that fits the plan's spare, nn_ws_limit); a larger layer, or a full
+   card, takes the in-kernel GroupNorm (nullptr). Before (2026-11-14 audit net#4) it grew to any layer that the free memory allowed,
+   outside the plan: which layers ran it depended on what else happened to be allocated */
+static inline uint8_t *f4_prenorm_buf(size_t n) { return (uint8_t *)nn_ws(NN_WS_F4PRE, n); }
 template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp) {
     static int uph2 = -1; if (uph2 < 0) uph2 = getenv("UFSM_UP_H2") ? atoi(getenv("UFSM_UP_H2")) : 1;
     if (sp.up && uph2) sp.up = 2;   /* the fused upsample blends in half2 (stage_up_smem_h2); UFSM_UP_H2=0: fp32 */

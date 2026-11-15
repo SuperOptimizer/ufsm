@@ -1,5 +1,6 @@
 /* CUDA ops: elem section of the former nn.cu */
 #include "nn_common.cuh"
+#include "phase_grad.h"
 
 __global__ void gn_finalize_k(const double *sums, int NG, size_t len, float eps, float *mean, float *rstd) {
     int ng = blockIdx.x * blockDim.x + threadIdx.x;
@@ -745,22 +746,13 @@ extern "C" void nn_cond_place(const float *lg, const uint8_t *ct, int W, int hal
     const int I = W - 2 * halo; const size_t i3 = (size_t)I * I * I;
     cond_place_k<<<nblk(i3, 256), 256>>>(lg, ct, W, halo, oz, oy, ox, bz, by, bx, N, ch14, c14, p1, recto, done); KCHECK();
 }
-/* task unwrap: the winding-phase gradient by wrap-aware central differences over +-s voxels (all of v, v +- s e_d known):
+/* task unwrap: the winding-phase gradient over +-s voxels as the sum of wrapped unit steps (phase_grad.h; all of the chain known):
    g = dphase / dx in turns per voxel, rho = |g| (the sheet density, 1 / spacing), n = g / rho. Targets (x255) in 7 planes of n
    voxels: n_z^2, n_y^2, n_x^2, 0.5 + n_z n_y, 0.5 + n_z n_x, 0.5 + n_y n_x (sign-free n n^T), min(1, dscale rho); mask = all known
    and rho > 1/1000 (the density scale: 32 at 2.4 um, 32 x 2.4 / um at coarser voxels). The phase is a scalar transformed with the batch's symmetry, so the gradient is in output coordinates. */
-__device__ __forceinline__ int phase_diff(int a, int b) { int d = a - b; d -= 252 * (d > 126); d += 252 * (d <= -126); return d; }
-/* the phase gradient at voxel i over +-s voxels (turns per voxel), 0 when v or a neighbour is unknown or outside */
-__device__ __forceinline__ int phase_grad(const uint8_t *ph, size_t i, int D, int H, int W, int s, float g[3]) {
-    const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W);
-    if (ph[i] >= 252 || z < s || z >= D - s || y < s || y >= H - s || x < s || x >= W - s) return 0;
-    const size_t sz = (size_t)s * H * W, sy = (size_t)s * W;
-    const uint8_t a[6] = {ph[i + sz], ph[i - sz], ph[i + sy], ph[i - sy], ph[i + s], ph[i - s]};
-    for (int k = 0; k < 6; k++) if (a[k] >= 252) return 0;
-    const float sc = 1.f / (2.f * s * 252.f);
-    g[0] = phase_diff(a[0], a[1]) * sc; g[1] = phase_diff(a[2], a[3]) * sc; g[2] = phase_diff(a[4], a[5]) * sc;
-    return 1;
-}
+/* the phase gradient at voxel i over +-s voxels (turns per voxel; src/phase_grad.h: the sum of wrapped unit steps, no aliasing down to
+   2.5 voxels of spacing), 0 when v or a voxel on its chains is unknown or outside, or a step is unresolved */
+__device__ __forceinline__ int phase_grad(const uint8_t *ph, size_t i, int D, int H, int W, int s, float g[3]) { return pg_grad(ph, i, D, H, W, s, g) == 1; }
 /* the packed-sheet loss weight of a voxel whose phase gradient is rho turns per voxel of um microns: 1 at a sheet spacing (um / rho)
    of packed_um or more, rising linearly to packed_w at packed_um / 2 and below (packed_w <= 1: 1) */
 __device__ __forceinline__ uint8_t packed_wt(float rho, float um, float packed_um, float packed_w) {
@@ -890,6 +882,45 @@ extern "C" void nn_packed_mask_z(const uint8_t *phase, int d, int h, int w, int 
     const size_t hw = (size_t)h * w, n = (size_t)(z1 - z0) * hw;
     packed_mask_k<<<nblk(n, 256), 256>>>(phase, d, h, w, s, um, packed_um, packed_w, m, (size_t)z0 * hw, n); KCHECK();
 }
+/* the head slab's phase-derived targets in one pass (train head slabs, nn_slab_targets): per voxel nn_phase_targets (t2 / m2), with rvt
+   nn_rv_targets (+ nn_packed_mask_z on rvm, + nn_rv_verso_w when vw != 1), nn_packed_mask_z on m2, nn_unwrap_targets2_z (t7 / m7) from
+   one phase-gradient stencil (each of those kernels read it for itself: 3 stencils and 5 launches a slab, ~60 of 3592 ms a P 768 step);
+   the same functions, the same bytes. i0: the slab's first window voxel (ph / pap whole-window planes) */
+__global__ void slab_tg_k(const uint8_t *ph, const uint8_t *pap, int D, int H, int W, int s, float dscale, int code, float um, float packed_um, float packed_w,
+                          float vw, uint8_t *t2, uint8_t *m2, uint8_t *rvt, uint8_t *rvm, uint8_t *t7, uint8_t *m7, size_t i0, size_t n) {
+    const size_t li = blockIdx.x * (size_t)blockDim.x + threadIdx.x, i = i0 + li;
+    if (li >= n) return;
+    const uint8_t v = ph[i];
+    uint8_t pm;
+    if (v >= 252) { t2[li] = t2[n + li] = 0; pm = 0; }
+    else { float sn, cs; sincospif((float)v / 126.f, &sn, &cs); t2[li] = (uint8_t)__float2int_rn(127.5f + 127.5f * cs); t2[n + li] = (uint8_t)__float2int_rn(127.5f + 127.5f * sn); pm = 1; }
+    uint8_t rt0 = 0, rt1 = 0, rm = 0;
+    if (rvt) {
+        const uint8_t p = pap[i];
+        if (p == 255) rm = 0; else if (p < 127) rm = 1; else if (v >= 252) rm = 0; else { if (v < 126) rt0 = 255; else rt1 = 255; rm = 1; }
+    }
+    float g[3]; const int ok = phase_grad(ph, i, D, H, W, s, g);
+    const float rho = ok ? sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) : 0.f;
+    if (packed_w > 1.f && ok) { const uint8_t pw = packed_wt(rho, um, packed_um, packed_w); if (pm) pm = pw; if (rm) rm = pw; }
+    if (rvt) {
+        if (vw != 1.f && rm && rt1 == 255) rm = (uint8_t)fminf(255.f, rintf((float)rm * vw));
+        rvt[li] = rt0; rvt[n + li] = rt1; rvm[li] = rm;
+    }
+    m2[li] = pm;
+    uint8_t mm = 0; float c7[7] = {0, 0, 0, 0, 0, 0, 0};
+    if (ok && rho >= 1e-3f) {
+        const float nz = g[0] / rho, ny = g[1] / rho, nx = g[2] / rho, xd = dscale * rho;
+        c7[0] = nz * nz; c7[1] = ny * ny; c7[2] = nx * nx; c7[3] = 0.5f + nz * ny; c7[4] = 0.5f + nz * nx; c7[5] = 0.5f + ny * nx; c7[6] = code ? xd / (1.f + xd) : fminf(1.f, xd);
+        mm = packed_wt(rho, um, packed_um, packed_w);
+        for (int c = 0; c < 7; c++) t7[c * n + li] = (uint8_t)__float2int_rn(255.f * fminf(1.f, fmaxf(0.f, c7[c])));
+    } else for (int c = 0; c < 7; c++) t7[c * n + li] = 0;
+    m7[li] = mm;
+}
+extern "C" void nn_slab_targets(const uint8_t *phase, const uint8_t *pap, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, float vw,
+                                uint8_t *t2, uint8_t *m2, uint8_t *rvt, uint8_t *rvm, uint8_t *t7, uint8_t *m7, int z0, int z1) {
+    const size_t hw = (size_t)h * w, n = (size_t)(z1 - z0) * hw;
+    slab_tg_k<<<nblk(n, 256), 256>>>(phase, pap, d, h, w, s, dscale, code, um, packed_um, packed_w, vw, t2, m2, rvt, rvm, t7, m7, (size_t)z0 * hw, n); KCHECK();
+}
 extern "C" void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n) { fill_unl_k<<<nblk(n, 256), 256>>>(t, m, vm, src, n); KCHECK(); }
 /* diagnostics: non-finite elements of n fp32 / 16-bit values (h16 1 fp16, 2 bf16), added to *cnt (device) */
 __global__ void count_nonfinite_k(const void *p, size_t n, int h16, unsigned long long *cnt) {
@@ -907,6 +938,13 @@ extern "C" unsigned long long nn_count_nonfinite(const void *p, size_t n, int h1
     count_nonfinite_k<<<1024, 256>>>(p, n, h16, d[dev]); KCHECK();
     unsigned long long h = 0; CK(cudaMemcpy(&h, d[dev], sizeof h, cudaMemcpyDeviceToHost));
     return h;
+}
+/* inference guard (predict, unroll audit 11-14 #16): cnt[2] += the non-finite values of one forward's logits, then folded on the device
+   (same stream, no sync): cnt[0] += cnt[2], cnt[1] += (cnt[2] != 0), cnt[2] = 0. Read once at the end (nn_nonfinite_read) */
+__global__ void nonfinite_fold_k(unsigned long long *cnt) { if (cnt[2]) { cnt[0] += cnt[2]; cnt[1]++; cnt[2] = 0; } }
+extern "C" void nn_nonfinite_acc(const void *p, size_t n, int h16, unsigned long long *cnt) {
+    count_nonfinite_k<<<n < (size_t)1024 * 256 ? nblk(n, 256) : 1024, 256>>>(p, n, h16, cnt + 2); KCHECK();
+    nonfinite_fold_k<<<1, 1>>>(cnt); KCHECK();
 }
 extern "C" void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, int h, int w, int thr, uint8_t *out) {
     const size_t n = (size_t)d * h * w;
@@ -1141,8 +1179,23 @@ extern "C" void nn_pred_stats(const uint8_t *ct, size_t n, void *scratch, size_t
     unsigned long long *acc = (unsigned long long *)scratch, h[3];
     cudaMemsetAsync(acc, 0, 3 * sizeof *acc);
     pred_stats_k<<<256, 256>>>(ct, n, acc); KCHECK();
-    cudaMemcpy(h, acc, sizeof h, cudaMemcpyDeviceToHost);
+    h[0] = h[1] = h[2] = 0;
+    CK(cudaMemcpy(h, acc, sizeof h, cudaMemcpyDeviceToHost));   /* (a failed copy: the sticky error, not silent zeros; audit mini/errpaths 6) */
     *nz = (size_t)h[0]; *sum = (double)h[1]; *sq = (double)h[2];
+}
+static unsigned long long *g_ps_host[16]; static cudaEvent_t g_ps_ev[16];   /* nn_pred_stats_start / _finish, per device */   /* mgpu: per-device */
+extern "C" void nn_pred_stats_start(const uint8_t *ct, size_t n, void *scratch) {
+    int dev = 0; cudaGetDevice(&dev); dev &= 15;
+    if (!g_ps_host[dev]) { CK(cudaMallocHost((void **)&g_ps_host[dev], 3 * sizeof(unsigned long long))); CK(cudaEventCreateWithFlags(&g_ps_ev[dev], cudaEventDisableTiming)); }
+    unsigned long long *acc = (unsigned long long *)scratch;
+    cudaMemsetAsync(acc, 0, 3 * sizeof *acc);
+    pred_stats_k<<<256, 256>>>(ct, n, acc); KCHECK();
+    cudaMemcpyAsync(g_ps_host[dev], acc, 3 * sizeof *acc, cudaMemcpyDeviceToHost, 0); cudaEventRecord(g_ps_ev[dev], 0);
+}
+extern "C" void nn_pred_stats_finish(size_t *nz, double *sum, double *sq) {
+    int dev = 0; cudaGetDevice(&dev); dev &= 15;
+    CK(cudaEventSynchronize(g_ps_ev[dev]));
+    const unsigned long long *h = g_ps_host[dev]; *nz = (size_t)h[0]; *sum = (double)h[1]; *sq = (double)h[2];
 }
 extern "C" void nn_up2_fwd_gn_into(const float *x, shape5 xs, const nn_gn_t *g, float *y, int ctot, int c0) {
     const gnp_t gp = to_gnp(g);
@@ -1262,4 +1315,22 @@ extern "C" void nn_phase_trunc_counts(unsigned long long out[2]) {   /* every de
         CK(cudaMemcpy(c, g_ptrunc_cnt[dev], sizeof c, cudaMemcpyDeviceToHost)); CK(cudaMemset(g_ptrunc_cnt[dev], 0, sizeof c)); out[0] += c[0]; out[1] += c[1];
     }
     cudaSetDevice(cur);
+}
+
+/* train --sheet-mask LO,HI: the phase loss weight of the labelled sheet voxels (phase exactly 0: the pair rule writes 0 on every stamped
+   voxel, a gap voxel never reads 0) scaled by 0 at a local sheet spacing (1 / |grad phase|, voxels) of LO or less and 1 at HI or more.
+   A stamped voxel lies up to 0.87 voxel off its mesh, so its true phase is off by up to 0.87 / sp turn: rms 0.13-0.19 at sp 2-3, 0.10 at
+   4, 0.06 at 6, 0.05 at 8 (oblique sheets; tests/test_phaselab.c), and 33-65 % of the voxels at sp 2-3 are such voxels (DESIGN 2026-11-14).
+   The rate is pg_rate's (any known axis neighbours, not the full stencil); none known keeps the weight. */
+__global__ void sheet_mask_k(const uint8_t *ph, int D, int H, int W, int s, float lo, float hi, uint8_t *m, size_t i0, size_t n) {
+    const size_t li = blockIdx.x * (size_t)blockDim.x + threadIdx.x, i = i0 + li;
+    if (li >= n || !m[li] || ph[i] != 0) return;
+    const float rho = pg_rate(ph, i, D, H, W); if (rho == 0.f) return;
+    const float f = pg_sheet_f(rho, lo, hi);
+    m[li] = (uint8_t)rintf((float)m[li] * f);
+}
+extern "C" void nn_sheet_mask_z(const uint8_t *phase, int d, int h, int w, int s, float lo, float hi, uint8_t *m, int z0, int z1) {
+    if (!(hi > lo)) return;
+    const size_t hw = (size_t)h * w, n = (size_t)(z1 - z0) * hw;
+    sheet_mask_k<<<nblk(n, 256), 256>>>(phase, d, h, w, s, lo, hi, m, (size_t)z0 * hw, n); KCHECK();
 }

@@ -1,5 +1,6 @@
 /* ufsm ink-blend (see cmd_ink_blend) */
 #include "sysinfo.h"
+#include "optcheck.h"
 #include "fblend.h"
 #include "fit.h"
 #include "inkblend.h"
@@ -18,7 +19,7 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
    whole-volume predicts of one model (predict --grid-origin, window - 2 halo = the tile) blended voxel by voxel: weight of input i = the
    product over the axes of sin^2 of the voxel's place in its tile (fb_tile_w, as field-blend --tile), so two grids offset by half a tile
    on each axis sum to 1 and every tile border gets weight ~0. Inputs: uint8 probability groups on one grid (level named by U). Output:
-   uint8 probability (volcomp --q, default 32 as predict; 0 lossless) with OUT's coarse levels mean-pooled. Shards where every input is absent are skipped (fill 0). */
+   uint8 probability (volcomp --q, default 0 = lossless since 2026-11-14; was 32) with OUT's coarse levels mean-pooled. Shards where every input is absent are skipped (fill 0). */
 typedef struct { uint8_t **in; int n; const float *wz, *wy, *wx; int S; int64_t n3[3]; uint8_t *out; uint8_t *const *mk; } ib_job;   /* mk[i]: nullptr or 0 = absent */
 static void ib_rows(void *a, int z0, int z1, int t) {
     (void)t; const ib_job *J = a; const int64_t ny = J->n3[1], nx = J->n3[2];
@@ -37,22 +38,23 @@ static void ib_rows(void *a, int z0, int z1, int t) {
 }
 int cmd_ink_blend(int argc, char **argv) {
     const char *in[32]; int n = 0; const char *out = nullptr, *tile = nullptr, *grids = nullptr, *origins = nullptr;
-    double um = 0, q = 32; int nlev = 4, S = 512, nt = ufsm_threads(0, 16);
+    /* q 0 (lossless): the inputs are already q-coded by predict; a second lossy pass (the old default 32) stacked errors (urender audit 11-14) */
+    double um = 0, q = 0; int nlev = 4, S = 512, nt = ufsm_threads(0, 16);
     for (int i = 2; i < argc; i++) {
-        if (!strcmp(argv[i], "--um") && i + 1 < argc) { um = atof(argv[++i]); continue; }
-        if (!strcmp(argv[i], "--tile") && i + 1 < argc) { tile = argv[++i]; continue; }
-        if (!strcmp(argv[i], "--grids") && i + 1 < argc) { grids = argv[++i]; continue; }
-        if (!strcmp(argv[i], "--origins") && i + 1 < argc) { origins = argv[++i]; continue; }
-        if (!strcmp(argv[i], "--levels") && i + 1 < argc) { nlev = atoi(argv[++i]); continue; }
-        if (!strcmp(argv[i], "--shard") && i + 1 < argc) { S = atoi(argv[++i]); continue; }
-        if (!strcmp(argv[i], "--q") && i + 1 < argc) { q = atof(argv[++i]); continue; }
-        if (!strcmp(argv[i], "--threads") && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], opt_n("--um")) && i + 1 < argc) { um = atof(argv[++i]); continue; }
+        if (!strcmp(argv[i], opt_n("--tile")) && i + 1 < argc) { tile = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--grids")) && i + 1 < argc) { grids = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--origins")) && i + 1 < argc) { origins = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--levels")) && i + 1 < argc) { nlev = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], opt_n("--shard")) && i + 1 < argc) { S = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], opt_n("--q")) && i + 1 < argc) { q = atof(argv[++i]); continue; }
+        if (!strcmp(argv[i], opt_n("--threads")) && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
         if (!strncmp(argv[i], "--", 2)) { fprintf(stderr, "ink-blend: unknown option %s\n", argv[i]); return 2; }
         if (!out) out = argv[i]; else if (n < 32) in[n++] = argv[i]; else { fprintf(stderr, "ink-blend: at most 32 inputs\n"); return 2; }
     }
     double st[3], g[32][3];
     if (!out || n < 1 || um <= 0 || !tile || !grids || sscanf(tile, "%lf,%lf,%lf", &st[0], &st[1], &st[2]) != 3 || !(st[0] > 0 && st[1] > 0 && st[2] > 0) || S < 128 || S % 128) {
-        fprintf(stderr, "usage: ufsm ink-blend <out> --um U --tile SZ,SY,SX --grids z,y,x:z,y,x:... <in1> <in2> ... [--origins z,y,x:...] [--levels 4] [--shard 512] [--q 32] [--threads 16]\n"); return 2; }
+        fprintf(stderr, "usage: ufsm ink-blend <out> --um U --tile SZ,SY,SX --grids z,y,x:z,y,x:... <in1> <in2> ... [--origins z,y,x:...] [--levels 4] [--shard 512] [--q 0 (lossless; volcomp q)] [--threads 16]\n"); return 2; }
     { int k = 0; char *t = strdup(grids);
       for (char *q = strtok(t, ":"); q; q = strtok(nullptr, ":")) { if (k < 32 && sscanf(q, "%lf,%lf,%lf", &g[k][0], &g[k][1], &g[k][2]) != 3) { free(t); fprintf(stderr, "ink-blend: --grids z,y,x:...\n"); return 2; } k++; }
       free(t); if (k != n) { fprintf(stderr, "ink-blend: %d grids for %d inputs\n", k, n); return 2; } }

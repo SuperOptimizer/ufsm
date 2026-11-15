@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 enum { DW = 16, HH = 2, HW = 6, G = 8 };
 static int C, XB, GB;   /* channels, x MX bits, gradient bits (0 fp32, 8 MX-fp8) */
@@ -97,7 +98,7 @@ static int one_case(split_ctx *ctx) {
 }
 int main(void) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    if (nn_init(0)) { printf("test_split_gnbwd: no GPU, skipped\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_split_gnbwd", "nn_init(0) failed");
     nn_set_f16(1); nn_set_act_bf16(1); nn_set_sr(0); nn_set_prec_policy("");
     split_ctx *ctx = split_create(0, 0);
     printf("test_split_gnbwd: window %d planes, halves %d + %d halo planes, G %d\n", DW, DW / 2, HH, G);

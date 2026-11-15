@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 static const float xyz[9]={3.5f,2.25f,4.75f,1.1f,1.2f,1.3f,6.1f,4.2f,2.3f};
 typedef struct { float *lg[2]; double values[2][6]; } fixture;
@@ -35,7 +36,7 @@ int main(void) {
     fixture f={0};
     for (int side=0;side<2;side++) {
         if (nn_init(side)) {   /* the split half needs a second GPU */
-            assert(side == 1); printf("test_sheet_gpu: single-GPU checks passed; split check skipped (needs 2 GPUs)\n"); return 0;
+            assert(side == 1); test_partial("test_sheet_gpu", "single-GPU checks passed; the split check needs 2 GPUs (gpu2 tag, two cards)"); return 0;
         }
         float local[640];
         for (int z=0;z<5;z++) for (int y=0;y<8;y++) for (int x=0;x<8;x++) {

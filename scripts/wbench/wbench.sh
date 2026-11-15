@@ -6,7 +6,7 @@
 #   same fitter on label phase; cached per fitter config). Then (SLABS=1) Paris 4 full-cross-section slab sites: 2 overlapping
 #   96-cell slab fits per site, radius profile, fit-join overlap share, joined site score.
 #   Rows: $WB/res/TAG.tsv (boxes), $WB/res/TAG-slabs.tsv, $WB/res/TAG-radius.tsv; logs $WB/runs/TAG/. Compare with ufsm wbench-stats.
-# Env: SITE laptop|desk (default: laptop if ~/ufsm-data exists), GPU (0), BOXES ("clean" default: boxes not tagged label-noise in boxes.tsv | "core": the clean paris4 + paris4j boxes + 12 1667 boxes tagged core (routine snapshot evals) | "all" | "none" | names), REP (2: shifted fits per box, 0 off),
+# Env: SITE laptop|desk (default: laptop if ~/ufsm-data exists), GPU (0), BOXES ("clean" default: boxes not tagged label-noise in boxes.tsv | "core": the clean paris4 + paris4j boxes + 12 1667 boxes tagged core (routine snapshot evals) | "all" | "none" | "holdout": the boxes inside HOLDOUTS' held-out boxes (holdout-only scores) | names), REP (2: shifted fits per box, 0 off),
 #   SLABS (1), SLABORC (none|net: slab ceiling, label phase in the slab crops; BOXES=none skips the boxes), SITES (z cells of the slab sites), FIT (extra fit flags; changes the fitter config tag; "{box}" becomes the box name,
 #   e.g. FIT="--emb /vesuvius/ufsm/repr/emb/bench/{box} --uw-rep-emb 2"), JOIN (extra fit-join flags at the slab sites, "{box}" = site<s>, e.g.
 #   JOIN="--fibers /vesuvius/ufsm/fibers/wbsites/{box}.fib --join-fib 1"; changes the fitter config tag), FIELDS (TAG0: reuse fields),
@@ -47,7 +47,7 @@ echo "$CK" > $O/ckpt; echo "$BIN $FIT" > $O/fitter
 scroll() {   # scroll SCROLL: R V UM LV AX QR QK PR PK PF (PF: CT voxels per label-phase raster voxel)
   case $1 in
     paris4) R=$P4ROOT; V=${P4V:-PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr}; UM=2.4; LV=2; AX=$AXP4
-            QR=$GT/paris4-q9p6/q-9p6.zarr; QK=9.6; PR=$GT/paris4-wind-20261019; PK=phaseA/9.6; PF=1;;
+            QR=$GT/paris4-q9p6/q-9p6.zarr; QK=9.6; PR=${P4PHA:-$GT/paris4-wind-20261019}; PK=phaseA/9.6; PF=1;;   # (P4PHA: the desk's phaseA, rebuilt 11-14 for the eval boxes)
     paris4j) R=$P4ROOT; V=${P4V:-PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr}; UM=2.4; LV=2; AX=$AXP4   # July-only labels (codes rebuilt from the published July wraps)
             QR=$P4JQ; QK=9.6; PR=$GT/paris4-wind-20261019; PK=phaseB/9.6; PF=1;;
     1667)   R=$MIRROR; V=PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr; UM=2.399; LV=2; AX=$AX1667
@@ -141,6 +141,19 @@ if [ "$BOXES" = all ]; then BL=$(grep -v '^#' $BT | cut -f1)
 elif [ "$BOXES" = none ]; then BL=""
 elif [ "$BOXES" = clean ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /label-noise/' | cut -f1)
 elif [ "$BOXES" = core ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /label-noise/ && ($2 == "paris4" || $2 == "paris4j" || $10 ~ /core/)' | cut -f1)   # routine snapshot evals
+elif [ "$BOXES" = holdout ]; then   # holdout-only (datafix 2026-11-14): the boxes inside a box of HOLDOUTS (holdouts-20261114.json) on that scroll's training scan
+  BL=$(python3 - "$BT" "${HOLDOUTS:?BOXES=holdout needs HOLDOUTS=holdouts.json}" <<'PY'
+import json, sys
+H = [h for h in json.load(open(sys.argv[2]))['boxes'] if h.get('score', 1) != 0]   # ("score": 0: masked, not scored)
+scan = {'paris4': '20260411134726-2.400um', '1667': '20251217075048-2.399um', 'PHerc0139': '20250728140407-9.362um', 'PHerc0500P2': '20250820143440-9.362um',
+        'PHerc0814': '20250804134230-9.362um'}   # (paris4j: the 2023 scan, not a training scan: never held out there)
+for ln in open(sys.argv[1]):
+    t = ln.rstrip('\n').split('\t')
+    if ln.startswith('#') or len(t) < 9 or t[1] not in scan: continue
+    f = 1 << int(t[8]); b = [int(v) * f for v in t[2:8]]
+    if any(scan[t[1]] in h['ct'] and all(h['l0'][d] <= b[d] and b[d] + b[3 + d] <= h['l0'][d] + h['l0'][3 + d] for d in range(3)) for h in H): print(t[0])
+PY
+)
 else BL=$BOXES; fi
 pbatch
 for B in $BL; do

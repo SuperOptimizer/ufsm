@@ -17,6 +17,7 @@
    excursions (sum |k|), persistent (|sum k| per stretch: the net sheet change; excursions - persistent = there-and-back), and for each
    pair distance the pairs within half a turn / pairs (pairs every d / 4 samples). The totals are printed. Single thread, CPU. */
 #include <math.h>
+#include "optcheck.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,8 +29,8 @@
 #include "zarr3.h"
 
 enum { FJ_MAXD = 8, FJ_CELL = 8 };
-static const char *fj_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
-static int fj_opti(int argc, char **argv, const char *k) { for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return i; return 0; }
+static const char *fj_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
+static int fj_opti(int argc, char **argv, const char *k) { for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return i; return 0; }
 
 /* ---- nearest wrap vertex: a cell grid over one tile (+ margin), one per wrap-id parity ---- */
 typedef struct { int n[3]; double o[3]; uint32_t *start; uint32_t *idx; const float *v; size_t nv; } fj_grid;
@@ -111,13 +112,13 @@ static void fj_stretch(const double *phi, int n, double *u, double *um, const in
 
 int cmd_fiber_judge(int argc, char **argv) {
     const int wi = fj_opti(argc, argv, "--wraps"), pi = fj_opti(argc, argv, "--phase"), si = fj_opti(argc, argv, "--set");
-    double z0d, nzd; const double um = atof(fj_opt(argc, argv, "--um", "0"));
+    double z0d, nzd; const double um = opt_atof("--um", fj_opt(argc, argv, "--um", "0"));
     if (argc < 5 || !(wi || pi || si) || !(um > 0) || sscanf(fj_opt(argc, argv, "--slab", ""), "%lf,%lf", &z0d, &nzd) != 2) {
         fprintf(stderr, "usage: ufsm fiber-judge <fibres.afv|.fib> (--wraps DIR [--first K --last K --dir 1] | --phase ROOT KEY | --set FITSET) --um U [--level 0] [--tr T.json]\n"
                         "       --slab Z0,NZ [--region Y0,Y1,X0,X1] [--tile 512] [--d-mm 0.3,0.6,1.2,2.4 | --d-vox ..] [--hyst 0.75] [--out rows.tsv]\n");
         return 2;
     }
-    const int level = atoi(fj_opt(argc, argv, "--level", "0")), tile = atoi(fj_opt(argc, argv, "--tile", "512")); const double sc = ldexp(1.0, level), lum = um * sc, hyst = atof(fj_opt(argc, argv, "--hyst", "0.75"));
+    const int level = opt_atoi("--level", fj_opt(argc, argv, "--level", "0")), tile = opt_atoi("--tile", fj_opt(argc, argv, "--tile", "512")); const double sc = ldexp(1.0, level), lum = um * sc, hyst = opt_atof("--hyst", fj_opt(argc, argv, "--hyst", "0.75"));
     const int64_t z0 = (int64_t)z0d, nz = (int64_t)nzd; double reg[4] = {0, 0, 0, 0}; const int has_reg = sscanf(fj_opt(argc, argv, "--region", ""), "%lf,%lf,%lf,%lf", &reg[0], &reg[1], &reg[2], &reg[3]) == 4;
     if (tile < 16 || nz < 1 || level < 0 || level > 8) { fprintf(stderr, "fiber-judge: bad --tile / --slab / --level\n"); return 2; }
     int D[FJ_MAXD], nd = 0; double Dmm[FJ_MAXD];
@@ -138,10 +139,10 @@ int cmd_fiber_judge(int argc, char **argv) {
     /* the winding source */
     fj_src S = {0}; float *rec = nullptr; size_t nrec = 0; z3 *pz = nullptr; fit_set *set = nullptr; int64_t shp[3] = {0, 0, 0};
     const double Mg = 44;   /* vertex margin about a tile (> the search radius 40) */
-    S.R = 40; S.sc = sc; S.wdir = atoi(fj_opt(argc, argv, "--dir", "1")) < 0 ? -1 : 1;
+    S.R = 40; S.sc = sc; S.wdir = opt_atoi("--dir", fj_opt(argc, argv, "--dir", "1")) < 0 ? -1 : 1;
     if (wi) {
         const double yx[4] = {has_reg ? reg[0] - Mg : -1e30, has_reg ? reg[1] + Mg : 1e30, has_reg ? reg[2] - Mg : -1e30, has_reg ? reg[3] + Mg : 1e30};
-        const int nw = wraps_slab_load(argv[wi + 1], (double)z0 - Mg, (double)(z0 + nz) + Mg, yx, 1, lum, atoi(fj_opt(argc, argv, "--first", "-1000000000")), atoi(fj_opt(argc, argv, "--last", "1000000000")), &rec, &nrec);
+        const int nw = wraps_slab_load(argv[wi + 1], (double)z0 - Mg, (double)(z0 + nz) + Mg, yx, 1, lum, opt_atoi("--first", fj_opt(argc, argv, "--first", "-1000000000")), opt_atoi("--last", fj_opt(argc, argv, "--last", "1000000000")), &rec, &nrec);
         if (nw < 0) return 1;
         printf("fiber-judge: %d wraps, %zu vertices in the slab\n", nw, nrec); S.mode = 0; S.rec = rec;
         if (!has_reg) { reg[0] = reg[2] = 1e30; reg[1] = reg[3] = -1e30;

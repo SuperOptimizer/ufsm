@@ -115,7 +115,7 @@ $U sysinfo --disk $POD | tee $POD/sysinfo.txt
 # --- 4. smoke test ---
 if [ "${NOSMOKE:-0}" != 1 ] && [ ! -e $POD/state/smoke.$(git -C $POD/ufsm rev-parse --short HEAD) ]; then
   ( cd $POD/ufsm && cmake --build $BD -j$NCPU --target test_sysinfo test_mx_sw >> $POD/build.log 2>&1 &&
-    ./$BD/test_sysinfo && ./$BD/test_mx_sw > $POD/smoke.log 2>&1 ) || { tail -20 $POD/smoke.log 2>/dev/null; die "smoke test"; }
+    timeout -k 10 120 ./$BD/test_sysinfo && flock -w 1800 /root/gpu.lock timeout -k 10 600 ./$BD/test_mx_sw > $POD/smoke.log 2>&1 )   # (GPU lock + timeout: a hang no longer blocks setup forever; mini audit podscripts #2) || { tail -20 $POD/smoke.log 2>/dev/null; die "smoke test"; }
   touch $POD/state/smoke.$(git -C $POD/ufsm rev-parse --short HEAD); say "smoke test passed"
 fi
 

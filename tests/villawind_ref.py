@@ -17,7 +17,7 @@ def build():
     torch.set_float32_matmul_precision("highest")
     ck = torch.load(CKPT, map_location="cpu", weights_only=False)
     net = mod.WindingModel(ck["config"]["model"])
-    net.load_state_dict(ck["model"]); net.eval()
+    net.load_state_dict(ck["model"], strict=True); net.eval()   # strict: a renamed key must not leave a random submodule
     return net
 
 

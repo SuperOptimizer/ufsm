@@ -20,6 +20,10 @@
 #   CRS CRR CRK CRUM CRAX CRBOX    (crushed scroll: name, CT root, key, um, axis json, box)
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
+# (mini audit podscripts #9) off the desk (no /vesuvius) the desk path defaults cannot work: require them; on a pod (/root/gpu.lock) run the
+# whole gate under the pod's GPU lock with a timeout (WGTIMEOUT, default 12 h).
+if [ ! -d /vesuvius ]; then : "${CK:?CK}" "${P4R:?P4R}" "${P4AX:?P4AX}" "${P4GT:?P4GT}" "${CRR:?CRR}"; fi
+if [ -e /root/gpu.lock ] && [ -z "${WINGATE_LOCKED:-}" ]; then WINGATE_LOCKED=1 exec flock /root/gpu.lock timeout -k 60 ${WGTIMEOUT:-43200} bash "$0" "$@"; fi
 U=${U:-$H/../../build/ufsm}; MKCROP=${MKCROP:-$H/../wbench/mkcrop.sh}
 CK=${CK:-/vesuvius/ufsm/paris4/ckpt/wind96-wk1-best.ckpt}
 G=${G:-$PWD/wingate}; GPU=${GPU:-0}; TH=${TH:-8}; NS=${NS:-4}; I=64; OV=16

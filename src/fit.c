@@ -210,6 +210,65 @@ static inline int fit_cell(const fit_fields *f, int z, int y, int x, size_t *i) 
     y -= f->oy; x -= f->ox; if (y < 0 || x < 0 || y >= f->H || x >= f->W) return 0;
     *i = ((size_t)z * f->H + y) * f->W + x; return 1;
 }
+/* The direction when the rings give no vote (fit_init_prior: < 3 coherent rings). ring_winding demodulates by a fixed pitch r / p, so
+   on a scroll whose sheets are far from circles (PHerc1667: one turn's radius 3.7..5.4 mm) no sector of a ring is coherent and the
+   prior fell back to dir +1 silently: the whole 1667 unroll was fitted with the wrong hand (2026-11-14, its wraps hop two sheets per
+   turn in the voids). Here the network phase itself is walked around circles about the axis in the field grid (a step of 2/3 cell,
+   the confident cells only, |m| > 0.3 and material): the unwrapped total of one loop is the winding of e^{i 2 pi W} around the axis,
+   -dir (U is single-valued), with no pitch and no circular-sheet assumption. Loops with < 1/2 confident samples are skipped; one
+   loop per 3 cells of radius on 16 rows. Returns the loops written to totals (rounded windings). */
+static int loop_winding(const fit_fields *f, double *totals, int maxr) {
+    const double h = f->h; const int BH = fit_box_H(f), BW = fit_box_W(f), na = (int)(f->D * h) + 1; int nt = 0;
+    const int nz = f->D < 16 ? f->D : 16;
+    double *ph = malloc(sizeof(double) * (size_t)(8 * (BH + BW) + 64)); if (!ph) return 0;
+    for (int zi = 0; zi < nz && nt < maxr; zi++) {
+        const int z = (int)((zi + 0.5) * f->D / nz); const double pz = (z + 0.5) * h;
+        const double cy = axis_lerp(f->cy, na, pz) / h - 0.5, cx = axis_lerp(f->cx, na, pz) / h - 0.5;   /* axis in cell coordinates */
+        for (double r = 10; nt < maxr; r += 3) {
+            const int ns = (int)(2 * M_PI * r * 1.5); if (ns > 8 * (BH + BW)) break;
+            if (cy - r < 0 || cx - r < 0 || cy + r > BH - 1 || cx + r > BW - 1) break;   /* (the loop must stay in the box) */
+            int nok = 0;
+            for (int s = 0; s < ns; s++) {
+                const double t = -M_PI + 2 * M_PI * s / ns; const int y = (int)lround(cy + r * sin(t)), x = (int)lround(cx + r * cos(t)); size_t i;
+                if (!fit_cell(f, z, y, x, &i) || !f->w[i]) continue;
+                const double mc = (f->pc[i] - 128) / 127.0, ms = (f->ps[i] - 128) / 127.0;
+                if (mc * mc + ms * ms < 0.09) continue;
+                ph[nok++] = atan2(ms, mc) / (2 * M_PI);
+            }
+            if (nok < ns / 2) continue;
+            double tot = 0; for (int s = 0; s < nok; s++) { double d = ph[(s + 1) % nok] - ph[s]; d -= round(d); tot += d; }
+            totals[nt++] = round(tot);
+        }
+    }
+    free(ph); return nt;
+}
+/* The second label-free direction gate (audit-unroll 3b): the winding-mod-4 planes (task unwrap2 / latent fields: dy dx = W(x + d e_a) - W(x)
+   in 1/64 turn mod 4, dq confidence) give grad W directly, without the phase's mod-1 slips in the voids. Around a circle about the axis the
+   tangential part integrates to -dir (U single-valued): per loop (the loop_winding circles) sum (cos t g_y - sin t g_x) ds over the cells
+   with dq >= 64 and material, divided by the covered fraction (>= 1/2), rounded; pos / neg count the loops at +1 / -1 winding (dir -1 /
+   +1). Returns the loops used, 0 when the fields carry no w4 planes. */
+int fit_dir_w4(const fit_fields *f, int *pos, int *neg) {
+    *pos = *neg = 0;
+    if (!f->wd[1] || !f->wd[2] || !f->wd[3] || !(f->w4_d > 0)) return 0;
+    const double h = f->h; const int BH = fit_box_H(f), BW = fit_box_W(f), na = (int)(f->D * h) + 1, nz = f->D < 16 ? f->D : 16; int nl = 0;
+    for (int zi = 0; zi < nz; zi++) {
+        const int z = (int)((zi + 0.5) * f->D / nz); const double pz = (z + 0.5) * h;
+        const double cy = axis_lerp(f->cy, na, pz) / h - 0.5, cx = axis_lerp(f->cx, na, pz) / h - 0.5;
+        for (double r = 10; ; r += 3) {
+            if (cy - r < 0 || cx - r < 0 || cy + r > BH - 1 || cx + r > BW - 1) break;
+            const int ns = (int)(2 * M_PI * r * 1.5); const double ds = 2 * M_PI * r * h / ns; int nok = 0; double tot = 0;
+            for (int k = 0; k < ns; k++) {
+                const double t = -M_PI + 2 * M_PI * k / ns; const int y = (int)lround(cy + r * sin(t)), x = (int)lround(cx + r * cos(t)); size_t i;
+                if (!fit_cell(f, z, y, x, &i) || !f->w[i] || f->wd[3][i] < 64) continue;
+                double gy = f->wd[1][i] / 64.0, gx = f->wd[2][i] / 64.0; if (gy > 2) gy -= 4; if (gx > 2) gx -= 4;   /* turns over w4_d native voxels, in (-2, 2] */
+                tot += (cos(t) * gy - sin(t) * gx) / f->w4_d * ds; nok++;
+            }
+            if (nok < ns / 2) continue;
+            const long e = lround(tot * ns / nok); nl++; *pos += e == 1; *neg += e == -1;
+        }
+    }
+    return nl;
+}
 int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m) {
     const double h = f->h; const int BH = fit_box_H(f), BW = fit_box_W(f); const size_t n = (size_t)f->D * BH * BW;   /* (box cells: a crop samples the same) */
     const int na = (int)(f->D * h) + 1;
@@ -245,8 +304,25 @@ int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m) {
         /* keep this knot's samples' offset for the chosen direction below: store per knot later */
     }
     if (ntot) { qsort(tots, ntot, sizeof(double), cmp_d); wind = tots[ntot / 2]; nwind = ntot; }
+    int nloop = 0, lpos = 0, lneg = 0, took = 0;
+    if (nwind < 3 && !c->dir) {   /* no ring vote: the phase walked around circles (loop_winding); the sign count of the loops' windings */
+        double *lt = malloc(sizeof(double) * 4096);
+        if (lt) { nloop = loop_winding(f, lt, 4096); for (int k = 0; k < nloop; k++) { lpos += lt[k] > 0; lneg += lt[k] < 0; } free(lt); }
+        int lv = lpos + lneg >= 8 ? (lpos > lneg ? -1 : lpos < lneg ? 1 : 0) : 0;   /* the loops' direction (0: undecided) */
+        int wpos, wneg; const int nw4 = fit_dir_w4(f, &wpos, &wneg);   /* the w4 planes' vote (2:1 and >= 8 loops), preferred when decided */
+        const int wv = wpos + wneg >= 8 && (wpos >= 2 * wneg || wneg >= 2 * wpos) ? (wpos > wneg ? -1 : 1) : 0;
+        if (nw4) fprintf(stderr, "fit prior: the winding-mod-4 planes around the axis: %d of %d loops wind +, %d wind -, i.e. dir %s\n", wpos, nw4, wneg, wv ? (wv < 0 ? "-1" : "+1") : "undecided");
+        if (wv) { if (lv && lv != wv) fprintf(stderr, "fit prior: WARNING: the phase loops (dir %+d) and the w4 planes (dir %+d) disagree: the w4 vote is used with --dir-loops 1\n", lv, wv);
+                  lpos = wpos; lneg = wneg; lv = wv; }
+        if (c->dir_loops && lv) { wind = (double)(lpos - lneg) / (lpos + lneg); nwind = lpos + lneg; took = 1; }   /* (the vote's share margin as |wind|) */
+        fprintf(stderr, "fit prior: WARNING: no ring vote on the direction; the phase (or the w4 planes) walked around the axis: %d of %d loops wind +, %d wind -, "
+                "i.e. dir %s%s; %s\n", lpos, wv ? nw4 : nloop, lneg, lv ? (lv < 0 ? "-1" : "+1") : "undecided", wv ? " (w4 planes)" : "",
+                c->dir_loops && lv ? "taken (--dir-loops 1)" : "dir +1 is the DEFAULT, not a measurement: pass --dir from a known surface (scripts/unroll/spiral_dir.tsv) or --dir-loops 1");
+    }
     m->dir = c->dir ? c->dir : (wind > 0 ? -1 : 1);
     m->dir_vote = c->dir ? 1.0 : fabs(wind) * (nwind >= 3 ? 1 : 0);   /* |median winding per ring|, 0 when too few rings */
+    m->dir_src = c->dir ? FIT_DIR_GIVEN : took ? FIT_DIR_LOOPS : nwind >= 3 ? FIT_DIR_RINGS : FIT_DIR_DEFAULT;
+    if (m->dir_src == FIT_DIR_DEFAULT || !(wind != 0)) { m->dir = c->dir ? c->dir : 1; if (!c->dir) { m->dir_vote = 0; m->dir_src = FIT_DIR_DEFAULT; } }   /* (wind 0: no sign either way) */
     for (int k = 0; k < m->nk; k++) {   /* offset per knot with the direction */
         if (pk[k] <= 0) continue;
         const double zc = (double)k * c->knot_dz, zlo = zc - c->knot_dz, zhi = zc + c->knot_dz;
@@ -271,7 +347,7 @@ int fit_init_prior(const fit_fields *f, const fit_cfg *c, fit_model *m) {
         o += round(prev_o - o);   /* continuous across knots */
         m->pitch[k] = (float)p; m->offset[k] = (float)o; prev_o = o; prev_p = p;
     }
-    if (c->verbose) fprintf(stderr, "fit prior: dir %+d (median winding per ring %.3f over %d rings), pitch %.2f..%.2f over %d knots\n", m->dir, wind, nwind, m->pitch[0], m->pitch[m->nk - 1], m->nk);
+    if (c->verbose) fprintf(stderr, "fit prior: dir %+d (%s; median winding per ring %.3f over %d rings), pitch %.2f..%.2f over %d knots\n", m->dir, fit_dir_src_name(m->dir_src), wind, nwind, m->pitch[0], m->pitch[m->nk - 1], m->nk);
     free(pk); free(ok);
     return 0;
 }
@@ -2036,7 +2112,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
         }
         const float ws = (float)(c->w_smooth / nl), wdec = (float)(c->w_decay / nl);
         const size_t nvox = fit_box_cells(&fd);   /* (the box's: a crop draws the same voxels) */
-        fd.stride = c->batch > 0 && nvox > (size_t)c->batch ? (int)(nvox / c->batch) : 1;
+        fd.stride = c->batch > 0 && nvox > (size_t)c->batch ? (int)(nvox / c->batch < (size_t)INT_MAX ? nvox / c->batch : (size_t)INT_MAX) : 1;   /* (clamped: fit.h stride is int; audit mini/overflow #4) */
         cpu_loss cl; if (cpu) cpu_loss_setup(&cl, &fd, fit_nthreads(1 << 30));
         for (int it = 0; it < c->steps[st]; it++) {
             const double ramp = st < c->phase_stage ? 0 : st == c->phase_stage ? c->phase_ramp + (1 - c->phase_ramp) * (double)it / (c->steps[st] > 1 ? c->steps[st] - 1 : 1) : 1;
@@ -2174,6 +2250,7 @@ fit_model *fit_load(const char *dir) {
     char *t = malloc(n + 1); if (fread(t, 1, n, f) != n) { fclose(f); free(t); return nullptr; } fclose(f); t[n] = 0;
     json *j = json_parse(t, n); free(t); if (!j) return nullptr;
     fit_model *m = calloc(1, sizeof *m);
+    if (!json_get(j, "dir")) fprintf(stderr, "fit: WARNING: %s/model.json has no \"dir\": +1 assumed\n", dir);
     m->dir = (int)json_num(json_get(j, "dir"), 1); m->knot_dz = (int)json_num(json_get(j, "knot_dz"), 1024); m->L = (int)json_num(json_get(j, "L"), 64);
     m->lz = (int)json_num(json_at(json_get(j, "lattice"), 0), 0); m->ly = (int)json_num(json_at(json_get(j, "lattice"), 1), 0); m->lx = (int)json_num(json_at(json_get(j, "lattice"), 2), 0);
     m->D = (int)json_num(json_at(json_get(j, "shape"), 0), 0); m->H = (int)json_num(json_at(json_get(j, "shape"), 1), 0); m->W = (int)json_num(json_at(json_get(j, "shape"), 2), 0);
@@ -3095,7 +3172,8 @@ fit_set *fit_run_slabs(const char *dir, const fit_cfg *c, int slab, int overlap)
       double po = P.offset[first], pp = P.pitch[first];
       for (int k = 0; k < P.nk; k++) { if (!have[k]) { P.pitch[k] = (float)pp; P.offset[k] = (float)po; } P.offset[k] += (float)round(po - P.offset[k]); po = P.offset[k]; pp = P.pitch[k]; } }
     free(have);
-    P.dir = c->dir ? c->dir : (vote > 0 ? 1 : -1);   /* the prior's dir_vote sign convention: dir * |vote| */
+    P.dir = c->dir ? c->dir : (vote < 0 ? -1 : 1);   /* the prior's dir_vote sign convention: dir * |vote|; no vote: +1, the one default (fit.h FIT_DIR_*) */
+    if (!c->dir && vote == 0) fprintf(stderr, "fit slabs: WARNING: no direction vote in any slab: dir +1 is the DEFAULT, not a measurement (pass --dir)\n");
     P.L = 1 << 20; P.lz = P.ly = P.lx = 2; P.delta = calloc(8, sizeof(float));   /* delta 0 */
     P.D = all.shape[0]; P.H = all.shape[1]; P.W = all.shape[2]; P.h = all.h; P.cy = all.cy; P.cx = all.cx;
     if (c->verbose) fprintf(stderr, "fit slabs: prior dir %+d (vote %.2f), pitch %.1f..%.1f over %d knots\n", P.dir, vote, P.pitch[0], P.pitch[P.nk - 1], P.nk);
@@ -3293,9 +3371,30 @@ int fit_set_grid_cpu(const fit_set *s, const double o[3], const int64_t n[3], do
 }
 
 /* one field array (name: pc ps t0..t5 sp w) of a fit-field directory, max-pooled by pool per axis (raw or zarr; read in z-blocks) */
-typedef struct { const uint8_t *blk; uint8_t *out; int z0, nz, H, W, Hp, Wp, pool; } ffa_pool_job;
+typedef struct { const uint8_t *blk; uint8_t *out; int z0, nz, H, W, Hp, Wp, pool, thr; } ffa_pool_job;   /* thr > 0: the share of cells >= thr (fit_field_array_frac) */
+static void ffa_frac_rows(const ffa_pool_job *J, int yp0, int yp1) {   /* fit_field_array_frac: 255 x the share of a pooled cell's
+    cells >= thr (a pooled z row lies in one block: the blocks are whole pools; the share is of pool^3, edge cells counted short) */
+    const int P = J->pool, W = J->W; const double sc = 255.0 / ((double)P * P * P);
+    uint16_t *cnt = malloc((size_t)J->Wp * sizeof *cnt);
+    for (int a0 = 0; a0 < J->nz;) {
+        const int zp = (J->z0 + a0) / P; int a1 = a0; while (a1 < J->nz && (J->z0 + a1) / P == zp) a1++;
+        uint8_t *o = J->out + (size_t)zp * J->Hp * J->Wp;
+        for (int yp = yp0; yp < yp1; yp++) {
+            const int y1 = (yp + 1) * P < J->H ? (yp + 1) * P : J->H;
+            memset(cnt, 0, (size_t)J->Wp * sizeof *cnt);
+            for (int a = a0; a < a1; a++) for (int y = yp * P; y < y1; y++) {
+                const uint8_t *r = J->blk + ((size_t)a * J->H + y) * W;
+                for (int x = 0; x < W; x++) cnt[x / P] += r[x] >= J->thr;
+            }
+            for (int xp = 0; xp < J->Wp; xp++) o[(size_t)yp * J->Wp + xp] = cnt[xp] ? (uint8_t)fmax(1, fmin(255, floor(cnt[xp] * sc + 0.5))) : 0;   /* (any cell: >= 1) */
+        }
+        a0 = a1;
+    }
+    free(cnt);
+}
 static void ffa_pool_rows(void *ctx, int yp0, int yp1, int t) {   /* fit_field_array: the max over pool^3 into pooled rows [yp0, yp1) */
     const ffa_pool_job *J = ctx; const int P = J->pool, W = J->W, Wf = W / P * P; (void)t;
+    if (J->thr > 0) { ffa_frac_rows(J, yp0, yp1); return; }
     uint8_t *acc = malloc((size_t)W);   /* the element-wise max of the block's rows of one pooled (z, y) cell row, then reduced along x */
     for (int a0 = 0; a0 < J->nz;) {
         const int zp = (J->z0 + a0) / P; int a1 = a0; while (a1 < J->nz && (J->z0 + a1) / P == zp) a1++;
@@ -3377,7 +3476,7 @@ static int ffa_chunks(z3 *za, const long long zoff[3], int D, int H, int W, int 
     free(list);
     return atomic_load(&J.fail) ? -1 : 1;
 }
-uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[3]) {
+static uint8_t *ffa_read(const char *dir, const char *name, int pool, int thr, int shape[3]) {
     fit_fields_buf g; if (fit_fields_load(dir, 0, 0, 0, &g)) return nullptr;
     const int D = g.shape[0], H = g.shape[1], W = g.shape[2], Dp = (D + pool - 1) / pool, Hp = (H + pool - 1) / pool, Wp = (W + pool - 1) / pool;
     char p[1400]; snprintf(p, sizeof p, "%s/fields.json", dir); json *j = read_json_file(p);
@@ -3394,7 +3493,7 @@ uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[
        chunk by chunk instead (ffa_chunks: PHerc0490B's w at pool 8, 80 G cells: 190 s -> 6 s, the same bytes) */
     const int zb = pool >= 64 ? pool : 64 / pool * pool, nth = fit_nthreads(1 << 20);
     uint8_t *out = calloc((size_t)Dp * Hp * Wp, 1);
-    const int byc = out && za && !cside ? ffa_chunks(za, zoff, D, H, W, Hp, Wp, pool, nth, out) : 0;
+    const int byc = out && za && !cside && thr <= 0 ? ffa_chunks(za, zoff, D, H, W, Hp, Wp, pool, nth, out) : 0;   /* (frac: the block path) */
     if (byc < 0) { free(out); out = nullptr; }
     uint8_t *blk = out && !byc ? malloc((size_t)zb * H * W) : nullptr;
     if (out && !byc && !blk) { free(out); out = nullptr; }
@@ -3403,14 +3502,16 @@ uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[
         if (za) { const int64_t o[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n[3] = {nz, H, W}; if (z3_read_sub(za, o, n, blk, nth, fit_submask(za, o[0], n[0]))) { free(out); out = nullptr; break; } }
         else { const long long o[3] = {z0 + zoff[0], zoff[1], zoff[2]}; const int64_t n[3] = {nz, H, W}; if (raw_read_box(fr, rsh, o, n, blk)) { free(out); out = nullptr; break; } }
         if (cside) core_mask(dir, &core, cside, gorg, gh, gum, D, z0, nz, H, W, name[0] == 'p' ? blk : nullptr, nullptr, name[0] == 'w' ? blk : nullptr);
-        if (pool == 1) { memcpy(out + (size_t)z0 * H * W, blk, (size_t)nz * H * W); continue; }   /* (the max with the zeroed output) */
-        ffa_pool_job PJ = {blk, out, z0, nz, H, W, Hp, Wp, pool};   /* pooled rows on threads (each output row by one thread: the same maxima) */
+        if (pool == 1 && thr <= 0) { memcpy(out + (size_t)z0 * H * W, blk, (size_t)nz * H * W); continue; }   /* (the max with the zeroed output) */
+        ffa_pool_job PJ = {blk, out, z0, nz, H, W, Hp, Wp, pool, thr};   /* pooled rows on threads (each output row by one thread: the same maxima) */
         fit_zpar(Hp, nth, ffa_pool_rows, &PJ);
     }
     free(blk); if (za) z3_close(za); if (fr) fclose(fr); if (cside) cl_free(&core);
     if (out) { shape[0] = Dp; shape[1] = Hp; shape[2] = Wp; }
     return out;
 }
+uint8_t *fit_field_array(const char *dir, const char *name, int pool, int shape[3]) { return ffa_read(dir, name, pool, 0, shape); }
+uint8_t *fit_field_array_frac(const char *dir, const char *name, int pool, int thr, int shape[3]) { return ffa_read(dir, name, pool, thr < 1 ? 1 : thr, shape); }
 
 /* device bytes a fit set will take (fit_set_upload: its delta lattices; the axis / knot arrays are small): the delta.f32 sizes in DIR
    and its subdirectories (a set: global/, slabNNN/) */

@@ -1,0 +1,1638 @@
+{
+ "note": "holdouts-20261114 selection (datafix-20261114): the existing boxes (wbench, ink eval crops, fibre HOLD, the 0139 / 0500P2 cross-res\nmaps) plus, per scan where a source stays under ~8 % of its labels, one full-yx z slab chosen from holdout-cover's z histograms so every\nsource on that scan lands nearest 8-12 %. Over-covered sets trimmed (0841 ink 49 %: its boxes greedily to ~10 %; 1299's bottom third\nreplaced by a slab). 0139: the slab is chosen jointly over the 9.362 and 2.399 um scans through the xres affine (z nearly axis aligned:\ncz = 0.257 fz + 623, x / y tilt < 60 coarse rows -> a 300-row fine margin); the 2.399 um ink eval crops mapped back to 9.362 um. 0009B (8.64 / 2.401 um, no registration between the scans): its boxes are \"score\": 0 - masked from training on both scans, never validated or scored on (a cross-scan leak cannot be ruled out).",
+ "boxes": [
+  {
+   "name": "PH1",
+   "scroll": "paris4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    41984,
+    8192,
+    15360,
+    2048,
+    3072,
+    3072
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "PH2",
+   "scroll": "paris4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    37888,
+    16384,
+    20480,
+    2048,
+    3072,
+    3072
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "PH3",
+   "scroll": "paris4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    43008,
+    14336,
+    26624,
+    2048,
+    3072,
+    3072
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "HOLD",
+   "scroll": "paris4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    49152,
+    16384,
+    14336,
+    2048,
+    2304,
+    3072
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C1",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    28672,
+    4096,
+    3584,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C2",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    13312,
+    4608,
+    2048,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C3",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    20480,
+    4096,
+    3072,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C4",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    4096,
+    5120,
+    9216,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C5",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    24576,
+    2048,
+    7168,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C6",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    14336,
+    3072,
+    7168,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C7",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    15360,
+    9216,
+    4608,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C8",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    33792,
+    9728,
+    5632,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C9",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    5120,
+    4608,
+    3584,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C10",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    33792,
+    9728,
+    8192,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C11",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    19456,
+    3072,
+    5632,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C12",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    11776,
+    2560,
+    4608,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C13",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    19456,
+    3072,
+    8192,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C14",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    7168,
+    5120,
+    8192,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C15",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    9216,
+    3072,
+    5120,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C16",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    10240,
+    9216,
+    4096,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C17",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    1536,
+    7680,
+    7680,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C18",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    24576,
+    6144,
+    3072,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C19",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    1536,
+    5120,
+    9728,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C20",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    30720,
+    2048,
+    8192,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C21",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    31232,
+    10752,
+    5120,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C22",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    28160,
+    10752,
+    5120,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C23",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    22016,
+    2048,
+    9728,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "C24",
+   "scroll": "1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    12800,
+    7168,
+    3584,
+    2048,
+    2048,
+    2048
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "139-1",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    3472,
+    3472,
+    1424,
+    736,
+    736,
+    736
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "139-2",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    5376,
+    4096,
+    2560,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "139-3",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    5376,
+    4096,
+    3328,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "139-4",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    5120,
+    2304,
+    2560,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "139-5",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    5376,
+    3072,
+    3840,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "139-6",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    5376,
+    4096,
+    4096,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "139-7",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    5120,
+    2304,
+    3328,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "139-8",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    6144,
+    2560,
+    2304,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "814-1",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/volumes/20250804134230-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    2448,
+    2448,
+    2960,
+    736,
+    736,
+    736
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "814-2",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/volumes/20250804134230-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    2560,
+    3328,
+    3328,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "814-3",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/volumes/20250804134230-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    3840,
+    3840,
+    2304,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "814-4",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/volumes/20250804134230-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    2048,
+    3328,
+    2560,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "814-5",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/volumes/20250804134230-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    2560,
+    2560,
+    1536,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "814-6",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/volumes/20250804134230-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    1536,
+    2560,
+    1536,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "814-7",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/volumes/20250804134230-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    4608,
+    2560,
+    3584,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "814-8",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/volumes/20250804134230-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    3328,
+    1792,
+    2560,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "500P2-1",
+   "scroll": "PHerc0500P2",
+   "ct": "PHerc0500P2/volumes/20250820143440-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    5120,
+    1280,
+    1536,
+    512,
+    512,
+    512
+   ],
+   "src": "holdouts.json"
+  },
+  {
+   "name": "P4J-bot",
+   "scroll": "paris4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    26624,
+    0,
+    0,
+    1024,
+    32768,
+    32768
+   ],
+   "note": "July-only labels, level-2 z 6656..6912 (whole cross-section); bench boxes after codesB is built",
+   "src": "holdouts.json"
+  },
+  {
+   "name": "P4J-top",
+   "scroll": "paris4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    68096,
+    0,
+    0,
+    1536,
+    32768,
+    32768
+   ],
+   "note": "July-only labels, level-2 z 17024..17408 (whole cross-section)",
+   "src": "holdouts.json"
+  },
+  {
+   "name": "wbench 139-1 (9.362 um 3472,3472,1424,736,736,736 mapped by reg)",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    10917,
+    10254,
+    17205,
+    2904,
+    2981,
+    3012
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 139-2 (9.362 um 5376,4096,2560,512,512,512 mapped by reg)",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    18356,
+    8531,
+    13836,
+    2024,
+    2079,
+    2094
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 139-3 (9.362 um 5376,4096,3328,512,512,512 mapped by reg)",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    18388,
+    8416,
+    10852,
+    2024,
+    2079,
+    2092
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 139-4 (9.362 um 5120,2304,2560,512,512,512 mapped by reg)",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    17396,
+    15499,
+    13561,
+    2025,
+    2076,
+    2089
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 139-5 (9.362 um 5376,3072,3840,512,512,512 mapped by reg)",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    18429,
+    12319,
+    8713,
+    2026,
+    2077,
+    2089
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 139-6 (9.362 um 5376,4096,4096,512,512,512 mapped by reg)",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    18420,
+    8301,
+    7871,
+    2026,
+    2080,
+    2088
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 139-7 (9.362 um 5120,2304,3328,512,512,512 mapped by reg)",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    17428,
+    15384,
+    10578,
+    2025,
+    2076,
+    2089
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 139-8 (9.362 um 6144,2560,2304,512,512,512 mapped by reg)",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    21363,
+    14523,
+    14638,
+    2026,
+    2078,
+    2089
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 814-1 (9.362 um 2448,2448,2960,736,736,736 mapped by reg)",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/20260309142202-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    8704,
+    12135,
+    8864,
+    2932,
+    3078,
+    3085
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 814-2 (9.362 um 2560,3328,3328,512,512,512 mapped by reg)",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/20260309142202-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    9129,
+    9554,
+    8536,
+    2040,
+    2145,
+    2148
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 814-3 (9.362 um 3840,3840,2304,512,512,512 mapped by reg)",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/20260309142202-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    14038,
+    7782,
+    12707,
+    2040,
+    2145,
+    2148
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 814-4 (9.362 um 2048,3328,2560,512,512,512 mapped by reg)",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/20260309142202-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    7101,
+    9776,
+    11494,
+    2041,
+    2140,
+    2146
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 814-5 (9.362 um 2560,2560,1536,512,512,512 mapped by reg)",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/20260309142202-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    9079,
+    13004,
+    15294,
+    2040,
+    2141,
+    2148
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 814-6 (9.362 um 1536,2560,1536,512,512,512 mapped by reg)",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/20260309142202-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    5096,
+    13043,
+    15245,
+    2040,
+    2142,
+    2147
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 814-7 (9.362 um 4608,2560,3584,512,512,512 mapped by reg)",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/20260309142202-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    17142,
+    12388,
+    7445,
+    2039,
+    2144,
+    2148
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 814-8 (9.362 um 3328,1792,2560,512,512,512 mapped by reg)",
+   "scroll": "PHerc0814",
+   "ct": "PHerc0814/20260309142202-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    12148,
+    15688,
+    11159,
+    2040,
+    2142,
+    2147
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "wbench 500P2-1 (9.362 um 5120,1280,1536,512,512,512 mapped by reg)",
+   "scroll": "PHerc0500P2",
+   "ct": "PHerc0500P2/20250526151718-2.215um-0.4m-111keV-masked.zarr",
+   "l0": [
+    18565,
+    9460,
+    8567,
+    2758,
+    3147,
+    2718
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval-x PHerc0139_w040_0",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    9460,
+    14792,
+    15632,
+    2143,
+    1703,
+    1666
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval-x PHerc0139_w040_1",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    14628,
+    13592,
+    8428,
+    2331,
+    2121,
+    1099
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval-x PHerc0139_w044_0",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    22776,
+    8716,
+    9012,
+    2136,
+    1222,
+    1838
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval-x PHerc0139_w044_1",
+   "scroll": "PHerc0139",
+   "ct": "PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    23272,
+    8220,
+    10752,
+    2072,
+    738,
+    2075
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval-x PHerc1667_w029_0",
+   "scroll": "PHerc1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    19236,
+    6980,
+    9436,
+    1914,
+    2084,
+    1116
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval-x PHerc1667_w029_1",
+   "scroll": "PHerc1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    8960,
+    8800,
+    3356,
+    2037,
+    1676,
+    1789
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval-x PHerc1667_w013_0",
+   "scroll": "PHerc1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    10172,
+    6448,
+    7740,
+    2072,
+    2000,
+    1079
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval-x PHerc1667_w013_1",
+   "scroll": "PHerc1667",
+   "ct": "PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    2928,
+    8640,
+    8320,
+    2377,
+    745,
+    2757
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w00_0",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    61744,
+    17180,
+    16956,
+    2208,
+    1219,
+    1932
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w00_1",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    63628,
+    19836,
+    17244,
+    2024,
+    1400,
+    1889
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w01_0",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    67704,
+    19312,
+    18740,
+    2459,
+    2382,
+    881
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w01_1",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    69576,
+    19652,
+    18376,
+    2436,
+    2422,
+    917
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w02_0",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    30260,
+    13408,
+    19980,
+    2047,
+    1967,
+    1080
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w02_1",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    32536,
+    14856,
+    19440,
+    2178,
+    1235,
+    1546
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w03_0",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    44728,
+    14600,
+    15884,
+    1880,
+    1609,
+    2203
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w03_1",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    45044,
+    12776,
+    15772,
+    2303,
+    2674,
+    1152
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w05_0",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    31440,
+    12720,
+    15936,
+    1813,
+    2131,
+    1261
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w05_1",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    31428,
+    11056,
+    16104,
+    1876,
+    1380,
+    1519
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w06_0",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    47288,
+    16328,
+    14856,
+    2232,
+    2222,
+    1968
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w06_1",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    49160,
+    16724,
+    14484,
+    2403,
+    2104,
+    1593
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w07_0",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    41168,
+    13388,
+    16440,
+    2001,
+    1769,
+    1859
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w07_1",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    57292,
+    20072,
+    17164,
+    1940,
+    929,
+    2056
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w09_0",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    56124,
+    15152,
+    18572,
+    2134,
+    977,
+    2092
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval w09_1",
+   "scroll": "PHercParis4",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    58748,
+    19236,
+    19416,
+    2146,
+    1786,
+    1742
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval-ho PHerc0500P2_w01_0",
+   "scroll": "0500P2",
+   "ct": "PHerc0500P2/20250526151718-2.215um-0.4m-111keV-masked.zarr",
+   "l0": [
+    13408,
+    8064,
+    9700,
+    2064,
+    631,
+    2099
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval-ho PHerc0500P2_w01_1",
+   "scroll": "0500P2",
+   "ct": "PHerc0500P2/20250526151718-2.215um-0.4m-111keV-masked.zarr",
+   "l0": [
+    21104,
+    9252,
+    8992,
+    2008,
+    1114,
+    2229
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval-ho PHerc0500P2_w01_2",
+   "scroll": "0500P2",
+   "ct": "PHerc0500P2/20250526151718-2.215um-0.4m-111keV-masked.zarr",
+   "l0": [
+    19308,
+    8780,
+    9896,
+    1900,
+    1214,
+    2147
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval-ho PHerc0500P2_w01_3",
+   "scroll": "0500P2",
+   "ct": "PHerc0500P2/20250526151718-2.215um-0.4m-111keV-masked.zarr",
+   "l0": [
+    11380,
+    7828,
+    8620,
+    2066,
+    560,
+    2117
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval-ho PHerc0841_wa1_0",
+   "scroll": "0841",
+   "ct": "PHerc0841/20260319124803-2.403um-0.2m-77keV-masked.zarr",
+   "l0": [
+    4736,
+    12580,
+    14992,
+    2027,
+    1862,
+    1578
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "inkeval-ho PHerc0841_wa1_1",
+   "scroll": "0841",
+   "ct": "PHerc0841/20260319124803-2.403um-0.2m-77keV-masked.zarr",
+   "l0": [
+    2920,
+    12488,
+    15056,
+    2046,
+    1893,
+    1704
+   ],
+   "src": "holdouts-ink.json"
+  },
+  {
+   "name": "1447-HOLD",
+   "scroll": "PHerc1447",
+   "ct": "PHerc1447/volumes/20250521151220-8.640um-1.2m-116keV-masked.zarr",
+   "l0": [
+    5120,
+    3840,
+    3072,
+    512,
+    768,
+    768
+   ],
+   "src": "holdouts-fibre.json"
+  },
+  {
+   "name": "inkeval-x PHerc0139_w040_0 (mapped to 20250728140407)",
+   "ct": "PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    3078,
+    2589,
+    2099,
+    560,
+    459,
+    452
+   ],
+   "src": "xres f2c PHerc0139-20260102150214"
+  },
+  {
+   "name": "inkeval-x PHerc0139_w040_1 (mapped to 20250728140407)",
+   "ct": "PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    4387,
+    2712,
+    4118,
+    607,
+    561,
+    312
+   ],
+   "src": "xres f2c PHerc0139-20260102150214"
+  },
+  {
+   "name": "inkeval-x PHerc0139_w044_0 (mapped to 20250728140407)",
+   "ct": "PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    6491,
+    4192,
+    3857,
+    557,
+    336,
+    493
+   ],
+   "src": "xres f2c PHerc0139-20260102150214"
+  },
+  {
+   "name": "inkeval-x PHerc0139_w044_1 (mapped to 20250728140407)",
+   "ct": "PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    6624,
+    4460,
+    3360,
+    542,
+    214,
+    549
+   ],
+   "src": "xres f2c PHerc0139-20260102150214"
+  },
+  {
+   "name": "inkeval-ho PHerc0500P2_w01_0 (mapped to 20250820143440)",
+   "ct": "PHerc0500P2/volumes/20250820143440-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    3695,
+    1559,
+    1246,
+    517,
+    402,
+    559
+   ],
+   "src": "xres f2c PHerc0500P2"
+  },
+  {
+   "name": "inkeval-ho PHerc0500P2_w01_1 (mapped to 20250820143440)",
+   "ct": "PHerc0500P2/volumes/20250820143440-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    5538,
+    1654,
+    1317,
+    532,
+    515,
+    621
+   ],
+   "src": "xres f2c PHerc0500P2"
+  },
+  {
+   "name": "inkeval-ho PHerc0500P2_w01_2 (mapped to 20250820143440)",
+   "ct": "PHerc0500P2/volumes/20250820143440-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    5097,
+    1579,
+    1134,
+    512,
+    525,
+    607
+   ],
+   "src": "xres f2c PHerc0500P2"
+  },
+  {
+   "name": "inkeval-ho PHerc0500P2_w01_3 (mapped to 20250820143440)",
+   "ct": "PHerc0500P2/volumes/20250820143440-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    3217,
+    1591,
+    1508,
+    512,
+    388,
+    557
+   ],
+   "src": "xres f2c PHerc0500P2"
+  },
+  {
+   "name": "slab-PHerc0139-z7936",
+   "ct": "PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    7936,
+    0,
+    0,
+    2048,
+    6621,
+    6621
+   ],
+   "src": "joint 0139 slab (9.362 um)"
+  },
+  {
+   "name": "slab-PHerc0139-z28155",
+   "ct": "PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    28155,
+    0,
+    0,
+    8569,
+    13256,
+    13256
+   ],
+   "src": "joint 0139 slab mapped to 2.399 um (xres affine, 300-row margin)"
+  },
+  {
+   "name": "slab-PHercParis4-z25600",
+   "ct": "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+   "l0": [
+    25600,
+    0,
+    0,
+    5376,
+    16347,
+    16347
+   ],
+   "src": "slab for PHercParis4-june,PHercParis4-july,PHercParis4-june48,PHercParis4-july48,PHercParis4-fib,PHercParis4-hf,PHercParis4-spiral,PHercParis4-u2ink"
+  },
+  {
+   "name": "slab-PHerc1218-z1536",
+   "ct": "PHerc1218/20250521120456-8.640um-1.2m-116keV-masked.zarr",
+   "l0": [
+    1536,
+    0,
+    0,
+    2048,
+    7593,
+    7593
+   ],
+   "src": "slab for PHerc1218-b3"
+  },
+  {
+   "name": "slab-PHerc1299-z5888",
+   "ct": "PHerc1299/20260309130042-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    5888,
+    0,
+    0,
+    4096,
+    10290,
+    10290
+   ],
+   "src": "slab for PHerc1299-b3"
+  },
+  {
+   "name": "slab-PHerc0009B-z7168",
+   "ct": "PHerc0009B/20250521125136-8.640um-1.2m-116keV-masked.zarr",
+   "l0": [
+    7168,
+    0,
+    0,
+    2048,
+    7837,
+    7837
+   ],
+   "src": "slab for PHerc0009B-good",
+   "score": 0
+  },
+  {
+   "name": "slab-PHerc0009B-z19456",
+   "ct": "PHerc0009B/20250820154339-2.401um-0.3m-77keV-masked.zarr",
+   "l0": [
+    19456,
+    0,
+    0,
+    4096,
+    14130,
+    14130
+   ],
+   "src": "slab for PHerc0009B-u2ink",
+   "score": 0
+  },
+  {
+   "name": "slab-PHerc0125-z11776",
+   "ct": "PHerc0125/20250821151825-9.362um-1.2m-113keV-masked.zarr",
+   "l0": [
+    11776,
+    0,
+    0,
+    2048,
+    8387,
+    8387
+   ],
+   "src": "slab for PHerc0125-fib"
+  },
+  {
+   "name": "slab-PHerc0172-z512",
+   "ct": "PHerc0172/20241024131839-7.910um-53keV-masked.zarr",
+   "l0": [
+    512,
+    0,
+    0,
+    2048,
+    6700,
+    9100
+   ],
+   "src": "slab for PHerc0172-gt"
+  },
+  {
+   "name": "slab-PHerc0175A-z768",
+   "ct": "PHerc0175A/20250521115057-8.640um-1.2m-116keV-masked.zarr",
+   "l0": [
+    768,
+    0,
+    0,
+    2048,
+    9363,
+    9363
+   ],
+   "src": "slab for PHerc0175A-fib,PHerc0175A-good"
+  },
+  {
+   "name": "slab-PHerc0332-z2048",
+   "ct": "PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    2048,
+    0,
+    0,
+    4096,
+    15761,
+    15761
+   ],
+   "src": "slab for PHerc0332-hf"
+  },
+  {
+   "name": "slab-PHerc0814-z15616",
+   "ct": "PHerc0814/20260309142202-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    15616,
+    0,
+    0,
+    4096,
+    11946,
+    11946
+   ],
+   "src": "slab for PHerc0814-u2ink"
+  },
+  {
+   "name": "slab-PHerc1447-z1792",
+   "ct": "PHerc1447/20250521151220-8.640um-1.2m-116keV-masked.zarr",
+   "l0": [
+    1792,
+    0,
+    0,
+    2048,
+    8343,
+    8343
+   ],
+   "src": "slab for PHerc1447-fib"
+  },
+  {
+   "name": "slab-PHerc1451-z6656",
+   "ct": "PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    6656,
+    0,
+    0,
+    4096,
+    20811,
+    20811
+   ],
+   "src": "slab for PHerc1451-hf"
+  },
+  {
+   "name": "slab-PHercMAN5-z6144",
+   "ct": "PHercMAN5/20260311104824-2.399um-0.2m-78keV-masked.zarr",
+   "l0": [
+    6144,
+    0,
+    0,
+    4096,
+    8748,
+    8748
+   ],
+   "src": "slab for PHercMAN5-u2ink"
+  }
+ ]
+}

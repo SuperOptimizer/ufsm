@@ -15,6 +15,14 @@
 #include <stdint.h>
 
 #define ZSHM_SUB_BYTES 65536u   /* one substream of a 128^3 u8 chunk */
+/* the decoder's identity, mixed into every key (zarr3.c; the dcache audit 2026-11-14 #7): the file outlives processes, so after a
+   volcomp decoder fix a surviving cache would return pre-fix decodes for the same compressed bytes. Bump ZSHM_DECODER_REV with any
+   change to the decode arithmetic (VOLCOMP_VERSION_STRING is mixed in too); old entries then miss and age out of the LRU. */
+#define ZSHM_DECODER_REV 1u
+static inline uint64_t zshm_decoder_tag(const char *ver) {
+    uint64_t h = 1469598103934665603ull ^ ZSHM_DECODER_REV; for (; *ver; ver++) { h ^= (uint8_t)*ver; h *= 1099511628211ull; }
+    h ^= h >> 31; h *= 0x9e3779b97f4a7c15ull; return h ^ (h >> 29);
+}
 /* zshm_on(): the cache is mapped (opens it on first use).
    zshm_get(k0, k1, s, dst): copy substream s of the chunk with content hash (k0, k1) into the 128^3 chunk buffer dst; 1 hit, 0 miss.
    zshm_put(k0, k1, s, src): store substream s of the decoded chunk src (128^3) under (k0, k1).

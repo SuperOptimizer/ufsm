@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # scripts/univ/pod_univ.sh [STEP...]: make a fresh GPU pod ready for the universal-net runs (u1 resumed there, or U3), restartable step by
-# step (each skips finished work). K (default /workspace/univ) holds what scripts/univ/pod_pack.sh staged from the desk (small/, gt/p0139-q,
-# gt/1667/{codesA,codesB,phase}, md5/, ckpt/) plus everything built here. Steps (default: setup kit 1667 sources verify):
+# step (each skips finished work). K (default /workspace/univ) holds what scripts/univ/pod_pack.sh staged from the desk (small/, md5/,
+# ckpt/: no label data, CLAUDE.md) plus everything built here. Steps (default: setup kit 1667 sources verify):
 #   setup    limits, deps, clone + build master into K/ufsm (scripts/pod/setup.sh). If K/ckpt/u1-commit.txt exists, also that commit
 #            as a worktree K/ufsm-u1 (the resumed run keeps the binary it was trained with).
 #   kit      the public-data labels (scripts/pod/datakit.sh: segments, Paris 4 June / July phase, PHerc0500P2, PHerc0139).
-#   1667     PHerc1667 phase A48 / B48 at 4.8 um from the staged codes (scripts/univ/b1_relabel.sh, the GPU pair rule).
+#   1667     PHerc1667 phase A48 / B48 at 4.8 um (scripts/univ/b1_relabel.sh, the GPU pair rule) from the codes in G1667 (required:
+#            the code rasters fetched or rebuilt on the pod from the dl.ash2txt GT; never staged from the desk).
 #   sources  K/sources-u1-pod.json: the desk's sources-u1.json with the CT from the volcomp mirror (K/cache) and the pod's label paths.
 #   verify   the md5 samples of the desk's label shards against the rebuilt ones (pod_pack.sh md5/; a mismatch is reported, not fatal:
 #            DATAKIT.md lists the sets that rebuild byte-identical).
@@ -24,7 +25,9 @@ say() { echo "== $(date '+%F %T') pod_univ: $*"; }
 u1run() { (cd $K/runs && R=$K/runs U=$4 SRCJ=${SRCJ:-$K/sources-u1-pod.json} GPU=$GPUS LOCK= P=$3 ARCH="--widths 96,128,160,192" WORKERS=${WORKERS:-11} \
   SLOTS=${SLOTS:-13} MEMMODE=${MEMMODE:-auto} ALR=0.0001 MLR=0.002 WIND4L=0.25 ISO=64 MINMEM=${MINMEM:-16} SNAP=1000 \
   EXTRA="--lat 4 --lat-basis $K/small/klt1.lcb --lat-c 29 --lat-step 0.25 --lat-step-jitter 0.3 --lat-guide 3 --replay 3 --um-rungs 4.8,9.6:2,19.2 --rung-shift-p 0.2 --film 2 --fstem 16 --fstem-drop 0.25 --uw 1 --grad-cos 500 --init-from $K/ckpt/wz896.ckpt ${XEXTRA:-}" \
-  nohup bash $D/u1.train.sh $1 $2 >> $K/runs/$1.nohup 2>&1 < /dev/null); }
+  setsid nohup bash $D/u1.train.sh $1 $2 >> $K/runs/$1.nohup 2>&1 < /dev/null); }   # (setsid: stopping the calling shell does not take the trainer; podscripts #3)
+# ulock CMD...: a bounded GPU step (bench / dry runs) under the pod's GPU lock (podscripts #2): timeout -k inside flock /root/gpu.lock
+ulock() { flock -w ${LOCKWAIT:-3600} /root/gpu.lock timeout -k 30 ${BTIMEOUT:-5400} "$@"; }
 for s in $ST; do say $s; case $s in
   setup) POD=$K BRANCH=${BRANCH:-master} bash $D/../pod/setup.sh || exit 1
     if [ -f $K/ckpt/u1-commit.txt ] && [ ! -x $UR ]; then c=$(cat $K/ckpt/u1-commit.txt)
@@ -33,7 +36,8 @@ for s in $ST; do say $s; case $s in
       else make -C $K/ufsm-u1 -j $T build/ufsm > $K/ufsm-u1.build.log 2>&1; fi || { tail -5 $K/ufsm-u1.build.log; exit 1; }
       say "u1 binary from $c: $UR"; fi;;
   kit) U=$U T=$T bash $D/../pod/datakit.sh $K segs p4 0500 0139 || exit 1;;
-  1667) for S in 1667A 1667B; do K=$K G0=$K/gt/1667 AX=$K/small/axis/PHerc1667-unroll-axis.json U=$U GPU=${GPUS%%,*} T=$T bash $D/b1_relabel.sh $S || exit 1; done;;
+  1667) [ -n "${G1667:-}" ] && [ -d "$G1667/codesA" ] || { echo "1667: set G1667 to the pod's codesA / codesB (built from the dl.ash2txt GT); desk label data is not staged to pods (CLAUDE.md)"; exit 1; }
+    for S in 1667A 1667B; do K=$K G0=$G1667 AX=$K/small/axis/PHerc1667-unroll-axis.json U=$U GPU=${GPUS%%,*} T=$T bash $D/b1_relabel.sh $S || exit 1; done;;
   sources) python3 -I - $K <<'PY' || exit 1
 import json, sys
 K = sys.argv[1]; M = 'https://dl.ash2txt.org/community-uploads/forrest/volcomp'
@@ -61,8 +65,8 @@ PY
       case $n in p4A) d=gt/paris4/phaseA;; p4B) d=gt/paris4/phaseB;; p0139) d=gt/p0139full/phase;; p0500) d=gt/PHerc0500P2-wind/phase;; 1667A48) d=gt/1667/phaseA48;; 1667B48) d=gt/1667/phaseB48;; esac
       [ -d $K/$d ] || { echo "$n: $d not built"; continue; }
       echo "$n: $( (cd $K/$d && md5sum -c $f 2>/dev/null) | grep -c ': OK$') of $(wc -l < $f) sampled shards identical to the desk's"; done;;
-  bench) for P in ${DRYP:-896 1152 1280}; do UFSM_MEM_DRY=1 UFSM_MEM_REPORT=1 RELAUNCH=0 u1run dry$P 10 $P $U; echo "P $P: $(grep -m1 'GB free per GPU\|no mode fits' $K/runs/dry$P.log | cut -c1-200)"; done
-    BP=${BENCHP:-1152}; RELAUNCH=0 LOGE=25 u1run bench$BP 150 $BP $U
+  bench) export -f u1run; export K D GPUS U; for P in ${DRYP:-896 1152 1280}; do UFSM_MEM_DRY=1 UFSM_MEM_REPORT=1 RELAUNCH=0 ulock bash -c "u1run dry$P 10 $P $U"; echo "P $P: $(grep -m1 'GB free per GPU\|no mode fits' $K/runs/dry$P.log | cut -c1-200)"; done
+    BP=${BENCHP:-1152}; RELAUNCH=0 LOGE=25 ulock bash -c "u1run bench$BP 150 $BP $U"
     grep '^step' $K/runs/bench$BP.log | tail -3 | cut -c1-220; grep -iE 'wait|samp/s' $K/runs/bench$BP.log | tail -2 | cut -c1-220;;
   resume) [ -f $K/ckpt/u1-resume.ckpt ] || { echo "no staged checkpoint (pod_pack.sh OUT SNAP)"; exit 1; }
     mkdir -p $K/runs/u1; [ -f $K/runs/u1/last.ckpt ] || cp $K/ckpt/u1-resume.ckpt $K/runs/u1/last.ckpt

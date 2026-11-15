@@ -345,11 +345,8 @@
           1152
         ]
       ],
-      "weight": 1,
-      "phase": {
-        "root": "/vesuvius/ufsm/gt/paris4-wind-20261019/phaseA",
-        "key": "9.6"
-      },
+      "weight": 0,
+      "note": "off (11-14, audit eval#5): its phase store gt/paris4-wind-20261019/phaseA (whole scroll) was deleted 11-12; the 11-14 rebuild covers the eval boxes only and must not train. Restore weight 1 + a whole-scroll phaseA to use it",
       "um": 9.6,
       "axis": "/vesuvius/ufsm/teacher/axis-0.json",
       "axis_scale": 0.25

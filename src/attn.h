@@ -193,6 +193,7 @@ int at_gemm_ex(int ta, int tb, int M, int N, int K, const float *A, const float 
    at_gemm_f32 always fp32 (Muon's Newton-Schulz, tests) */
 void at_set_mx(int bits);
 int at_get_mx(void);
+int at_reserve(void);   /* the current device's cuBLASLt handles + workspaces now (before a memory planner measures the free memory) */
 int at_gemm_f32(int ta, int tb, int M, int N, int K, const float *A, const float *B, float *Cm, float beta);
 
 /* the attention core (softmax(Q K^T) V and its backward): 0 fp32 CUDA cores, 1 fp16 tensor cores with fp32 accumulation (default)
@@ -208,6 +209,9 @@ void at_fa_fwd(const void *qkvh, float *o, float *lse, const at_geom *g, int H, 
    H floats, the caller zeroes them) to the largest logit q.k / sqrt(48) of head h over its valid queries and keys (clamped at 0). Cores 0 / 2
    and the ray / deformable paths do not record. nullptr: off (the default) */
 void at_set_lmax(float *lmax);
+/* length-aware logit scale: x max(1, ln S / ln n0) for S > n0 tokens (n0 = the trained token count; 0: off; env UFSM_ATTN_LSCALE; fp16 core only) */
+void at_set_lscale(float n0);
+float at_get_lscale(void);
 /* QK-clip step (after the optimizer): heads with lmax[h] > tau (tau > 0) get their QK-norm gains qg / kg (device, H x 48 each) scaled by
    sqrt(tau / lmax[h]); last[0] = max(last[0], all lmax); lmax zeroed. tau 0: record and zero only */
 void at_qk_clip(float *qg, float *kg, float *lmax, int H, float tau, float *last);

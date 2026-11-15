@@ -29,6 +29,7 @@ def run(*args, ok=0, extra_env=None):
     env.update(extra_env or {})
     r = subprocess.run([str(BIN), *map(str, args)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60, env=env)
     assert r.returncode == ok, r.stdout
+    assert "DEFAULTED:" not in r.stdout, "a fallback changed a result (DEFAULTED line, src/defaulted.h):\n" + r.stdout   # (ops audit #10)
     return r.stdout
 
 
@@ -44,7 +45,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     cfg = t / "sources.json"
     cfg.write_text(json.dumps({"sources": [{"name": "fixture", "root": str(t), "ct": "ct", "um": 1,
                                           "targets": {"recto": "labels"}, "holdout": [96, 96, 96, 32, 32, 32]}]}))
-    opts = ["--P", "16", "--B", "1", "--levels", "1", "--gpus", "0", "--workers", "1", "--val-batches", "1",
+    opts = ["--P", "16", "--B", "1", "--levels", "1", "--gpus", "0", "--workers", "1", "--val-batches", "1", "--val-train-ok", "1",
             "--log-every", "1", "--val-every", "1", "--ckpt-every", "1", "--fp4", "2", "--down-norm", "1", "--input-prec", "8"]
     train_env = {"UFSM_GRAD_MX8": "1"}
     run("train", cfg, "--out", t / "first", "--steps", "2", "--warmup", "0", *opts, extra_env=train_env)
@@ -66,7 +67,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     hm, _ = weights(t / "heads/last.ckpt")
     assert hm["extra"]["heads"] == {"version": 1, "recto_channels": [0, 2], "sources": [["fixture"], ["teacher2"]]}, hm["extra"]
     run("predict", t / "heads/last.ckpt", t, "ct", t / "heads-pred", "--channel", "2", "--um", "1", "--window", "24", "--halo", "4", "--shard", "128",
-        "--levels", "1", "--box", "0,0,0,16,16,16")
+        "--levels", "1", "--box", "0,0,0,16,16,16", "--no-axis", "1")
     run("train", cfg, "--out", t / "resume", "--resume", t / "first/last.ckpt", "--steps", "3", "--lr", "0", *opts[:-2], extra_env=train_env)
     new, wr = weights(t / "resume/last.ckpt")
     assert new["step"] == 3 and wp == wr, "normal resume reinitialized or changed zero-LR weights"
@@ -76,7 +77,9 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     # Only the model file is moved; prediction must not depend on precision.txt.
     shutil.copyfile(t / "first/last.ckpt", t / "moved.ckpt")
     pred = ["predict", t / "moved.ckpt", t, "ct"]
-    geometry = ["--um", "1", "--window", "24", "--halo", "4", "--shard", "128", "--levels", "1", "--box", "0,0,0,16,16,16"]
+    geometry = ["--um", "1", "--window", "24", "--halo", "4", "--shard", "128", "--levels", "1", "--box", "0,0,0,16,16,16", "--no-axis", "1"]
+    out = run(*pred, t / "noaxis", *geometry[:-2], ok=2, extra_env={"UFSM_PRED_NO_AXIS": "0"})   # no --axis and no --no-axis: refused (the radial channels would be zero)
+    assert "no --axis" in out and not (t / "noaxis").exists(), out
     out = run(*pred, t / "default", *geometry)
     assert "embedded checkpoint, prec=1 f16=1 act_mx4=1" in out, out
     run(*pred, t / "explicit", *geometry, "--prec", "1", "--f16", "1", "--fp4", "1", "--input-prec", "8", "--gn-stats", "stored", "--policy", "all=fp4:fp4:fp4,enc0.c1=fp16")
@@ -88,6 +91,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     assert chunks(t / 'aligned-grid') == chunks(t / 'aligned-legacy')
     attrs = json.loads((t / 'aligned-grid/1/zarr.json').read_text())['attributes']['ufsm']
     assert attrs['grid_origin_zyx'] == [0, 0, 0]
+    assert attrs['axis'] == 'none' and attrs['radial_sign'] == 0, attrs   # (the axis each store was made with: --no-axis here)
     assert 'grid_origin_zyx' not in json.loads((t / 'aligned-legacy/1/zarr.json').read_text())['attributes']['ufsm']
 
     def read_bytes(path, origin, shape):
@@ -101,11 +105,13 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     # between tiles, includes CT boundaries, or changes output shards / workers.
     # Core 24 deliberately does not divide the 128-byte output shard dimension.
     grid_opts = ['--um', '1', '--window', '32', '--halo', '4', '--levels', '1',
-                 '--grid-origin', '3,5,7', '--q', '0', '--threads', '1']
+                 '--grid-origin', '3,5,7', '--q', '0', '--threads', '1', '--no-axis', '1']
     grid_shape = [144, 40, 40]
     run(*pred, t / 'grid-base', *grid_opts, '--shard', '128', '--box', '0,0,0,144,40,40')
     base = read_bytes(t / 'grid-base', [0, 0, 0], grid_shape)
     assert any(base), 'grid fixture has no nonzero predictions'
+    if gpu_count() < 2:
+        print('PARTIAL: test_pipeline_cli: one GPU: the --gpus 0,1 grid-workers and air-gpus checks did not run (gpu2 runs them)', flush=True)
     for name, placement in [('grid-shard256', ['--shard', '256']),
                             *([('grid-workers', ['--shard', '128', '--gpus', '0,1'])] if gpu_count() >= 2 else [])]:
         run(*pred, t / name, *grid_opts, *placement, '--box', '0,0,0,144,40,40')
@@ -121,7 +127,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     # --full-grid: one output on the CT's whole grid, a box selecting (shard-rounded) shards; --resume skips written shards
     # (predict-done-<level>.txt); --occupancy L skips shards that are all zero on CT level L. z < 128 of ctair is air.
     air = ['predict', t / 'moved.ckpt', t, 'ctair']
-    air_opts = ['--um', '1', '--window', '32', '--halo', '0', '--shard', '128', '--levels', '1', '--q', '0', '--threads', '1']
+    air_opts = ['--um', '1', '--window', '32', '--halo', '0', '--shard', '128', '--levels', '1', '--q', '0', '--threads', '1', '--no-axis', '1']
     run(*air, t / 'air-box', *air_opts, '--box', '128,0,0,128,128,128')
     out = run(*air, t / 'air-full', *air_opts, '--full-grid', '1', '--resume', '1', '--box', '130,5,5,10,10,10')
     assert 'box rounded to shards: origin 128,0,0 size 128,128,128' in out, out
@@ -144,16 +150,16 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
         assert sorted((t / 'air-gpus/predict-done-1.txt').read_text().splitlines()) == ['0 0 0', '1 0 0']
     # --occupancy also skips windows whose interior (in its shard) is air on the coarse level (one coarse voxel of margin): stride 4
     # windows over z 128..143, the first (interior z 128..131, coarse 63..66) skipped; the same bytes as without the tile test
-    tile_opts = ['--um', '1', '--window', '8', '--halo', '2', '--shard', '128', '--levels', '1', '--q', '0', '--threads', '1', '--box', '128,0,0,16,8,8']
+    tile_opts = ['--um', '1', '--window', '8', '--halo', '2', '--shard', '128', '--levels', '1', '--q', '0', '--threads', '1', '--box', '128,0,0,16,8,8', '--no-axis', '1']
     run(*air, t / 'occ-t0', *tile_opts, '--occupancy', '1', extra_env={'UFSM_OCC_TILES': '0'})
     out = run(*air, t / 'occ-t1', *tile_opts, '--occupancy', '1')
     assert '12 windows to run, 4 more skipped (interior air on CT level 1, --occupancy)' in out, out
     assert read_bytes(t / 'occ-t1', [0, 0, 0], [16, 8, 8]) == read_bytes(t / 'occ-t0', [0, 0, 0], [16, 8, 8])
     assert any(read_bytes(t / 'occ-t1', [0, 0, 0], [16, 8, 8]))
     run(*air, t / 'invalid', *air_opts, '--occupancy', '0', ok=2)
-    # --gpus with fit fields: every worker would write the whole field set -> rejected
-    out = run(*air, t / 'invalid', *air_opts, '--box', '0,0,0,128,128,128', '--gpus', '0,0', '--fit-zarr', t / 'ffz-gpus', '--no-out', '1', ok=2)
-    assert '--gpus with --fit-zarr / --fit-fields is not supported' in out, out
+    # --gpus with --fit-fields: every worker would write the whole field set -> rejected (--fit-zarr runs z-layer workers: legal)
+    out = run(*air, t / 'invalid', *air_opts, '--box', '0,0,0,128,128,128', '--gpus', '0,0', '--fit-fields', t / 'ffz-gpus', '--no-out', '1', ok=2)
+    assert '--gpus with --fit-fields is not supported' in out, out
     assert not (t / 'ffz-gpus').exists()
     run(*air, t / 'invalid', *air_opts, '--full-grid', '1', '--box', '512,0,0,8,8,8', ok=2)
     # Version-1 models without a normalization field keep the historical graph.

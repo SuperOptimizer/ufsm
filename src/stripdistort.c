@@ -15,6 +15,7 @@
    tiles.tsv (per --tile-cm square of each stripe: its wrap, valid cm2, dist p50 / p95, area p50, the trusted share dist <= --trust,
    folds), wraps.tsv (per wrap: the same over its pixels) and stripes.tsv (per stripe); prints the totals. CPU, rows on --threads. */
 #include "imgops.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "tiff.h"
 #include <math.h>
@@ -25,7 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *sd_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *sd_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static double sd_num(const char *b, const char *k, double d) { const char *q = strstr(b, k); if (!q) return d; q = strchr(q + strlen(k), ':'); return q ? atof(q + 1) : d; }
 
 /* one float page of a tif (w x h), nullptr on failure */
@@ -134,9 +135,9 @@ int cmd_strip_distort(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm strip-distort <flat-dir> <out-dir> [--div 8] [--span 4] [--tile-cm 1] [--trust 0.05] [--quality 88] [--threads N] [--stripes a,b,..]\n"
                                     "  per stripe of a strip-flatten run: the worst linear distortion, the area ratio and folds (<s>_dist.jpg, <s>_area.jpg, tiles / wraps / stripes .tsv)\n"); return 2; }
     const char *fd = argv[2], *od = argv[3], *only = sd_opt(argc, argv, "--stripes", nullptr);
-    const int div = atoi(sd_opt(argc, argv, "--div", "8")), q = atoi(sd_opt(argc, argv, "--quality", "88")), span = atoi(sd_opt(argc, argv, "--span", "4"));
-    const double tilecm = atof(sd_opt(argc, argv, "--tile-cm", "1")), trust = atof(sd_opt(argc, argv, "--trust", "0.05"));
-    int nt = ufsm_threads(atoi(sd_opt(argc, argv, "--threads", "0")), 12); if (nt > 64) nt = 64;
+    const int div = opt_atoi("--div", sd_opt(argc, argv, "--div", "8")), q = opt_atoi("--quality", sd_opt(argc, argv, "--quality", "88")), span = opt_atoi("--span", sd_opt(argc, argv, "--span", "4"));
+    const double tilecm = opt_atof("--tile-cm", sd_opt(argc, argv, "--tile-cm", "1")), trust = opt_atof("--trust", sd_opt(argc, argv, "--trust", "0.05"));
+    int nt = ufsm_threads(opt_atoi("--threads", sd_opt(argc, argv, "--threads", "0")), 12); if (nt > 64) nt = 64;
     if (div < 1 || span < 1 || !(tilecm > 0) || !(trust > 0)) { fprintf(stderr, "strip-distort: --div >= 1, --tile-cm > 0, --trust > 0\n"); return 2; }
     char p[1600]; snprintf(p, sizeof p, "%s/flat.json", fd); FILE *f = fopen(p, "r"); char jb[8192] = {0};
     if (!f) { fprintf(stderr, "strip-distort: no %s\n", p); return 1; }

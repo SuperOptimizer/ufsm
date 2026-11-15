@@ -21,6 +21,7 @@
    per-cell corrections, the patches' GT purity (the share of a patch's votes on its modal GT sheet: the ceiling of any patch-level
    relabelling), overall and per wrap. Bands of --band grid z rows (a multiple of --block); --zr limits the grid z range. */
 #include "pairacc.h"
+#include "optcheck.h"
 #include "sources.h"
 #include "store.h"
 #include "surfcomp.h"
@@ -35,6 +36,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -42,8 +45,8 @@
 #define PI_BAD 0xFFFF   /* lab value of a rejected atom */
 enum { PI_DKR = 8 };   /* corrections kept in [-PI_DKR, PI_DKR] */
 
-static const char *pi_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
-static int pi_idx(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
+static const char *pi_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
+static int pi_idx(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], opt_n(k))) return i; return -1; }
 static double pi_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 static inline double pi_ang(double a) { a = fmod(a + M_PI, 2 * M_PI); if (a <= 0) a += 2 * M_PI; return a - M_PI; }   /* -> (-pi, pi] */
 
@@ -475,14 +478,14 @@ int cmd_patch_id(int argc, char **argv) {
         return 2;
     }
     const char *in = argv[2], *out = argv[3], *axp = pi_opt(argc, argv, "--axis", nullptr);
-    const double axum = atof(pi_opt(argc, argv, "--axis-um", "0")), gum = atof(pi_opt(argc, argv, "--grid-um", "0")), dir = atof(pi_opt(argc, argv, "--dir", "0"));
+    const double axum = opt_atof("--axis-um", pi_opt(argc, argv, "--axis-um", "0")), gum = opt_atof("--grid-um", pi_opt(argc, argv, "--grid-um", "0")), dir = opt_atof("--dir", pi_opt(argc, argv, "--dir", "0"));
     pi_job J; memset(&J, 0, sizeof J);
-    J.nt = ufsm_threads(atoi(pi_opt(argc, argv, "--threads", "0")), 16); if (J.nt > 64) J.nt = 64;
-    J.B = atoi(pi_opt(argc, argv, "--block", "32")); J.BAND = atoi(pi_opt(argc, argv, "--band", "64"));
-    J.thr = (uint8_t)atoi(pi_opt(argc, argv, "--thr", "1")); J.min_comp = atoi(pi_opt(argc, argv, "--min-comp", "8"));
-    J.range = atoi(pi_opt(argc, argv, "--range", "3")); J.gt_range = atoi(pi_opt(argc, argv, "--gt-range", "4"));
-    J.min_link = atoi(pi_opt(argc, argv, "--min-link", "16")); J.bad_gap = atoi(pi_opt(argc, argv, "--bad-gap", "2")); J.ratio = atof(pi_opt(argc, argv, "--ratio", "0.3"));
-    const long long min_votes = atoll(pi_opt(argc, argv, "--min-votes", "500")); const double min_share = atof(pi_opt(argc, argv, "--min-share", "0.5"));
+    J.nt = ufsm_threads(opt_atoi("--threads", pi_opt(argc, argv, "--threads", "0")), 16); if (J.nt > 64) J.nt = 64;
+    J.B = opt_atoi("--block", pi_opt(argc, argv, "--block", "32")); J.BAND = opt_atoi("--band", pi_opt(argc, argv, "--band", "64"));
+    J.thr = (uint8_t)opt_atoi("--thr", pi_opt(argc, argv, "--thr", "1")); J.min_comp = opt_atoi("--min-comp", pi_opt(argc, argv, "--min-comp", "8"));
+    J.range = opt_atoi("--range", pi_opt(argc, argv, "--range", "3")); J.gt_range = opt_atoi("--gt-range", pi_opt(argc, argv, "--gt-range", "4"));
+    J.min_link = opt_atoi("--min-link", pi_opt(argc, argv, "--min-link", "16")); J.bad_gap = opt_atoi("--bad-gap", pi_opt(argc, argv, "--bad-gap", "2")); J.ratio = opt_atof("--ratio", pi_opt(argc, argv, "--ratio", "0.3"));
+    const long long min_votes = opt_atoll("--min-votes", pi_opt(argc, argv, "--min-votes", "500")); const double min_share = opt_atof("--min-share", pi_opt(argc, argv, "--min-share", "0.5"));
     if (sscanf(pi_opt(argc, argv, "--cells", "32,32"), "%d,%d", &J.CR, &J.NS) != 2 || J.CR < 1 || J.NS < 1) { fprintf(stderr, "patch-id: --cells R,S\n"); return 2; }
     J.dir = dir;
     const int si = pi_idx(argc, argv, "--sheet");
@@ -498,7 +501,7 @@ int cmd_patch_id(int argc, char **argv) {
     { const int gi = pi_idx(argc, argv, "--gt"); if (gi > 0) { if (gi + 2 >= argc) return 2; if (pi_vopen(&VG, argv[gi + 1], argv[gi + 2], cache)) return 1; zg = &VG;
         int ok = 0; for (gs = 1; gs <= 2 && !ok; gs++) { ok = 1; for (int d = 0; d < 3; d++) if (d == 0 ? llabs(VG.shape[d] * gs - shape[d]) > gs - 1 + (gs > 1) : VG.shape[d] * gs + gs < shape[d]) ok = 0;   /* (z extents match; y / x: the GT may extend further, the sheet array a crop at origin 0) */ if (ok) break; }
         if (!ok) { fprintf(stderr, "patch-id: --gt %s %s: not on the sheet grid or 2x coarser\n", argv[gi + 1], argv[gi + 2]); return 1; } } }
-    J.asplit = (int)lround(atof(pi_opt(argc, argv, "--anchor-split-mm", "0")) * 1000 / gum); if (J.asplit < 0) J.asplit = 0;
+    J.asplit = (int)lround(opt_atof("--anchor-split-mm", pi_opt(argc, argv, "--anchor-split-mm", "0")) * 1000 / gum); if (J.asplit < 0) J.asplit = 0;
     /* wraps */
     DIR *dd = opendir(in); if (!dd) { fprintf(stderr, "patch-id: cannot open %s\n", in); return 1; }
     int nw = 0, cap = 64; pi_wrap *W = calloc(cap, sizeof *W); struct dirent *de;
@@ -535,10 +538,10 @@ int cmd_patch_id(int argc, char **argv) {
     J.base = malloc(nbb * 4); J.ncomp = malloc(nbb * 2); J.phi = malloc(nbb * 4);
     J.prev = malloc(plane * 4); J.prev_phi = malloc((size_t)J.nby * J.nbx * 4);
     J.trec = calloc(J.nt, sizeof *J.trec); J.tsmp = calloc(J.nt, sizeof *J.tsmp); J.mm = gum * 1e-3;
-    J.smp_T = (uint32_t)(4294967295.0 * atof(pi_opt(argc, argv, "--pair-rate", "0.02"))); J.tlink = calloc(J.nt, sizeof *J.tlink); J.gre = calloc(J.nt, sizeof(double)); J.gim = calloc(J.nt, sizeof(double));
+    J.smp_T = (uint32_t)(4294967295.0 * opt_atof("--pair-rate", pi_opt(argc, argv, "--pair-rate", "0.02"))); J.tlink = calloc(J.nt, sizeof *J.tlink); J.gre = calloc(J.nt, sizeof(double)); J.gim = calloc(J.nt, sizeof(double));
     if (!J.sheet || !J.lab || (zg && !J.gt) || !J.base || !J.prev) { fprintf(stderr, "patch-id: no memory for the band buffers\n"); return 1; }
     pi_uf U = {0}; size_t natoms = 0; J.U = &U;
-    U.NA = atoi(pi_opt(argc, argv, "--hf-bins", "2048")); U.tol = (float)atof(pi_opt(argc, argv, "--hf-tol", "3")); pi_recs ALL = {0};
+    U.NA = opt_atoi("--hf-bins", pi_opt(argc, argv, "--hf-bins", "2048")); U.tol = (float)opt_atof("--hf-tol", pi_opt(argc, argv, "--hf-tol", "3")); pi_recs ALL = {0};
     double tread = 0, tcc = 0, tlink = 0, tvert = 0;
     for (int64_t z0 = zr0; z0 < zr1; z0 += J.BAND) {
         const int64_t z1 = z0 + J.BAND < zr1 ? z0 + J.BAND : zr1, nz = z1 - z0;
@@ -608,8 +611,8 @@ int cmd_patch_id(int argc, char **argv) {
     const double gfr = atan2(gim, gre) / (2 * M_PI);
     /* --oracle 1 / --anchor-out (GT or anchor codes as the vote): a patch is kept with >= --min-anchor GT votes (on the anchor half with
        --anchor-split-mm), >= --min-purity of them on one sheet */
-    const int oracle = atoi(pi_opt(argc, argv, "--oracle", "0")) || pi_opt(argc, argv, "--anchor-out", nullptr);
-    const long long min_anchor = atoll(pi_opt(argc, argv, "--min-anchor", "50")); const double min_purity = atof(pi_opt(argc, argv, "--min-purity", "0.6"));
+    const int oracle = opt_atoi("--oracle", pi_opt(argc, argv, "--oracle", "0")) || pi_opt(argc, argv, "--anchor-out", nullptr);
+    const long long min_anchor = opt_atoll("--min-anchor", pi_opt(argc, argv, "--min-anchor", "50")); const double min_purity = opt_atof("--min-purity", pi_opt(argc, argv, "--min-purity", "0.6"));
     if (oracle && !zg) { fprintf(stderr, "patch-id: --oracle / --anchor-out need --gt ROOT KEY (the anchor codes)\n"); return 2; }
     /* votes per root */
     size_t nvo = 0; pi_vote *VO = malloc((ALL.n + 1) * sizeof *VO); int *Tof = malloc((ALL.n + 1) * sizeof *Tof); uint32_t *Rof = malloc((ALL.n + 1) * sizeof *Rof);
@@ -764,10 +767,10 @@ int cmd_patch_id(int argc, char **argv) {
           }
           FILE *f = fopen(ao, "wb"); if (!f) { fprintf(stderr, "patch-id: cannot write %s\n", ao); return 1; }
           const int32_t hd5[5] = {nw, J.CR, J.NS, (int32_t)dir, (int32_t)nc};
-          fwrite("UFSMANC2", 1, 8, f); fwrite(hd5, 4, 5, f);
-          for (int k = 0; k < nw; k++) { const int32_t a[2] = {W[k].id, W[k].h}; fwrite(a, 4, 2, f); }
-          fwrite(D, 4, nc, f); fwrite(dm, 4, nc, f); fwrite(st, 1, nc, f);
-          if (fclose(f)) return 1;
+          int bad = fwrite("UFSMANC2", 1, 8, f) != 8; bad |= fwrite(hd5, 4, 5, f) != 5;   /* (every count checked; audit mini/errpaths 5) */
+          for (int k = 0; k < nw; k++) { const int32_t a[2] = {W[k].id, W[k].h}; bad |= fwrite(a, 4, 2, f) != 2; }
+          bad |= fwrite(D, 4, nc, f) != nc; bad |= fwrite(dm, 4, nc, f) != nc; bad |= fwrite(st, 1, nc, f) != nc;
+          if (fclose(f) || bad) { fprintf(stderr, "patch-id: writing %s failed: %s\n", ao, strerror(errno)); unlink(ao); return 1; }
           printf("patch-id: anchor file %s: %u cells, %lld with own anchor votes, %lld from patches, %lld mixed\n", ao, nc, nk, np, nm);
           free(D); free(dm); free(st);
       } }

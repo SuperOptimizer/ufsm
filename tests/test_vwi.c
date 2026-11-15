@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 void vwi_sample(const uint8_t *box, int bz, int by, int bx, const float *o, const float *a, const float *b, const float *d, const float *vlo, const float *vhi,
                 int T, int L, uint8_t *im, uint8_t *va, void *s);
@@ -25,7 +26,7 @@ static uint64_t rs = 99;
 static double ur(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (double)(rs >> 11) * 0x1.0p-53; }
 
 int main(void) {
-    if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_vwi", "nn_init(0) failed");
     const int T = 32, L = 64; int fail = 0;
     /* a CT box (zyx) inside a larger volume; smooth + noise content */
     const int bz = 60, by = 90, bx = 100; const int64_t bo[3] = {10, 20, 30}, V[3] = {66, 120, 128};

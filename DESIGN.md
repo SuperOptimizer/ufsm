@@ -82,6 +82,1704 @@ test_faces, test_countfield, test_lldec, test_fuse, test_sample_ops, test_spatia
 test_gpu_aug, test_gpu_input, test_heads, test_pyports, test_imgops, test_coreline, test_qkclip, test_half (clang -x cuda path). The `ufsm --ref` compares
 (phase-onfly, codes-onfly, fibre-onfly) have no tolerance option: the wrappers accept their failure exit under fast math when the
 logged per-window differing-voxel counts sum within the bound. Measured bounds and speed: TODO after the first fast-math sweep.
+## Eval: no silent drop-outs in wgate, unreached voxels, saturated ink (2026-11-14, branch evalfix3-20261114, audit eval#11-13)
+
+Source only (no builds, user 11-14); the final sweep builds and tests.
+- wgate-table.sh (eval#11, #12): every rule needs numeric values and the full box set. The expected n per set is the baseline's own n
+  (`wbench-stats REF`, the same clean set since both sides use REF's ceilings); a candidate box that failed (na) or is missing now
+  lists the boxes and ends in `VERDICT TAG: INCOMPLETE` (exit 3) instead of dropping out of the paired stats. Before, "na" + 0 = 0 passed
+  R3 and failing the hard boxes made a candidate look better.
+- fit score (eval#12): "winding ids right" stays right / nd so stored baselines stay comparable; the line gains
+  `ids right of all labelled` = right / (nd + unreached) and the `unreached` share (labelled voxels without U), appended at the end so
+  the existing greps keep working.
+- ink-vscore (eval#13): a prediction's 255 was skipped as unknown, but the ink heads write round(255 sigmoid), where 255 = p >= 0.998.
+  `--pred-unknown auto` (default) skips 255 only for prob254 arrays (fill_value 255, as ink-splat writes); otherwise 255 is scored in
+  the top bin and the count is logged. Numbers of sharp models rise relative to earlier vscores (their most confident voxels now count).
+
+## Split, thread and RNG audit fixes (2026-11-14, branch thrfix-20261114; source only, not yet built or run)
+
+Fixes for audit-20261114 targeted/split.md, mini/threads.md and mini/rng.md. They are source-only by the user's order; the final sweep
+builds and tests them.
+
+- **gfilm under --split (split #1).** Nothing installed `unet_set_gfilm_reduce`, so the gfilm A / B gradients of the whole (split-top)
+  decoder levels counted twice in the allreduce. Scratch2 has two such levels of five (dec 3, 4).
+  - Now `gfilm_bwd` zeroes side 1's copy by itself.
+  - The token path's dg (UFSM_GFILM_TOKGRAD=1) is summed through a split reduce that train installs. Without the reduce, that path
+    aborts under split.
+  - Check: `test_split_lat~gfilm` compares the A / B block on its own.
+- **Loss-path A/B in the suite (split #2).** `test_split_ab` (gpu2, slow) runs split_lat_ab.sh's first-step loss / gradient dump on the
+  wind fixture with the live feature set in small:
+  - 6 levels, --split-top 3, 4 attention blocks, --attn-pe scroll, --gfilm, --film 2, --fstem 16, --gn-ema, --skip-empty 1
+  - --lat 4 --lat-guide 3, --rv 2, ink head with MIL, fibre head
+  - Pass condition: split vs one GPU within 2x the one-GPU rerun plus a floor (loss 1e-7, gradients 1e-6), on the loss, the whole
+    gradient and the gfilm block.
+- **Smaller split items.**
+  - #4: the distillation and deep-supervision guards test split_h0 rather than sp_on, which is off on the whole levels.
+  - #5: --skip-empty --split refuses a seam off the 8-cell tile grid.
+  - #6: replica check. Every card's master weights are hashed at the checkpoint steps, and a mismatch stops the run.
+    UFSM_REPLICA_CHECK=N sets the interval; 0 turns it off.
+  - #3 (predict --split for latent / attention nets) is deferred: it is a feature, not a fix.
+- **Threads.**
+  - vws_next returns -1 after a persistent fill failure.
+  - zcache: an O(1) LRU list, and keys by z3_id rather than the array's address.
+  - sources: acquire / release on the lazily opened arrays.
+  - The echo gate's busy callback runs outside sp->mu.
+  - Per sampler: THP and bank_own. The env is read once.
+  - Atomic lazy env ints.
+  - dc_free waits for its readers.
+  - dcache_default_dir is built once.
+- **RNG.**
+  - --finetune reseeds the sample / SSL / SR streams from the loaded checkpoint's step.
+  - A resume reseeds the SSL teacher stream.
+  - --phase-dense draws its keep mask per draw.
+  - --det retries a failed read from the same RNG state.
+  - SR seeds keep all 32 bits (was h | 1).
+  - Deferred: 64-bit SR seeds (the kernels take uint32), and libc rand in inkseam / srpairs (replacing it would reshuffle existing
+    sr-pairs holdout splits).
+
+## PHerc1667: the spiral had the wrong hand; same-sheet (fibre) pairs in count-field (2026-11-14, branch fibfit-20261114)
+
+Task: fibre-continuity constraints in the winding fit, measured against the published PHerc1667 unwrap (section "The 1667 unroll
+against the published full unwrap" below: our wrap id matched the published sheet 48 % of the time, +1 / +2 in a sector "about
+-180..-50 deg"). Measuring first showed a different cause, the spiral's direction; the fibre term is in, opt-in, with an oracle bound.
+
+**The hand.** Per published vertex, the offset our id - published sheet is not a sector of voids. It ramps with the axis angle: 0 at
++60..+180 deg (same 0.80-0.87), +1 at -60..-140, +2 at -180 (0.67), then it resets at our theta cut. That is 2 sheets of drift per
+revolution: the wraps are a spiral of the OPPOSITE hand. They follow the right sheets where the phase is confident and hop where it is
+weak, i.e. in the voids, hence the void crossings. The published surface's turn grows as atan2(y - cy, x - cx) DEcreases
+(|mean e^{2 pi i T} e^{+i theta}| = 1.00), i.e. W = U - dir theta / 2 pi needs dir -1. The 11-12 run had dir +1, and following our
+field across the seam, wrap k's end continues into wrap k-1's start (radii at z 18000). The cause: count-field takes dir from
+fit_init_prior on its middle chunk, and the ring vote demodulates by a fixed pitch, so with sheets this far from circles (one turn's
+radius 3.7..5.4 mm) no ring was coherent ("median winding per ring 0.000 over 0 rings") and dir fell back to +1, silently; the slabs
+take --dir from the ref. Every unroll on disk has dir +1 (P4, 1299, 1667); P4 is +1 by measurement (fit.h).
+
+Sheet identity of a W field against the published surface (`wpub.py`: W at every 20th published vertex, minus T - u, the published
+turn and the angle fraction from theta = pi; the share of the modal integer; 1.95 M vertices). The ref decides it: the 11-12 ref
+gives 0.461, surfcmp on the final wraps 0.482.
+
+| ref (count-field, the run's flags) | same | +1 | -1 | r 3 / 5 / 7 / 9 / 11 mm |
+|---|---|---|---|---|
+| dir +1 (11-12 run) | 0.461 | 0.314 | 0.034 | - |
+| dir -1 | 0.731 | 0.088 | 0.103 | 0.42 / 0.77 / 0.83 / 0.76 / 0.53 |
+| dir -1 + oracle short pairs (0.2-0.4 mm, 2 % of vertices, 3.7 M, --cf-fib 1, 3 IRLS) | 0.768 | 0.086 | 0.094 | 0.49 / 0.80 / 0.86 / 0.79 / 0.58 |
+| dir -1 + oracle long pairs (0.8-3 mm, 1 %, 2.7 M, --cf-fib 4, 1 IRLS) | 0.844 | 0.017 | 0.096 | 0.98 / 0.98 / 0.97 / 0.78 / 0.48 |
+
+With dir -1 the per-angle share is flat (0.65-0.86 in every 30 deg sector; with +1 it was 0.01 at -180 and 0.85 at +90).
+
+The whole chain with dir -1 (ref-dm1 -> 73 slab fits with the run's flags, on CPUs: desk `fit --cpu` + 23 slabs on the perf pod's CPU,
+~50 s / slab uncontended -> fit-join -> wraps -> wrap-snap mix -> wrap-dump every 4th vertex), surfcmp.py on every 4th published
+vertex and every 4th of ours (`--sub 4 --rev-every 4`; the full run OOMs in the shared 40 GB dev slice), both runs measured the same way:
+
+| PHerc1667 wraps_snap | same sheet | +1 | -1 | +2 | pub cov 100 / 200 um | pub d med | ours cov 50 / 100 um | ours d med |
+|---|---|---|---|---|---|---|---|---|
+| 11-12 run (dir +1) | 0.487 | 0.309 | 0.030 | 0.115 | 0.792 / 0.883 | 70 um | 0.498 / 0.726 | 51 um |
+| dir -1 | **0.762** | 0.089 | 0.089 | 0.015 | 0.794 / 0.883 | 70 um | 0.503 / 0.730 | 49 um |
+
+(The distances are larger than the pub1667 section's 19 / 17 um because only every 4th vertex of ours is the nearest-vertex set.) Same
+geometry, a different sheet assignment: 0.762 against the 0.482 there. fit-join's overlap agreement is 0.9507.
+
+**Direction code.** `fit_init_prior` now walks the network phase around circles about the axis when the ring vote is empty
+(`loop_winding`: 16 rows, a loop per 3 cells of radius, 2/3-cell steps, confident cells only; the unwrapped total of a loop is -dir,
+no pitch assumed) and prints a WARNING with that vote. `--dir-loops 1` (fit, count-field) takes it; default off, because it is noisy
+on Paris 4: per z row the +-1 loops split 4:0 .. 16:71, and the middle row votes -1 (79 + / 6 - of all signs) against P4's measured +1.
+1667 middle rows: 44:28 .. 80:8 for -1. unroll.sh passes the ref `--dir` from SPIRALDIR or `scripts/unroll/spiral_dir.tsv`
+(PHerc1667 -1, with its evidence) and copies an empty-vote warning to progress.log. test_fit_dir (CPU): a non-circular spiral (radius x
+(1 + 0.35 cos 2 theta)) gives no ring vote for either hand (+1 by default); the loops get both hands right; circular: the rings do.
+
+**One direction rule, and a refusal (audit-unroll #1).** There were four no-evidence fallbacks: count-field +1 (silent), fit_init_prior
++1, the slab prior -1 (`vote > 0 ? 1 : -1`), and fit_load +1 when model.json has no "dir". Now all of them follow one rule (fit.h FIT_DIR_*):
+--dir given > ring vote (>= 3 rings, non-zero median) > phase loops (only with --dir-loops 1) > DEFAULT +1. fit_model.dir_src records the
+source. count-field logs `dir %+d (given | ring vote | phase loops | DEFAULT (no evidence))` and REFUSES DEFAULT (exit 2) unless
+`--dir-default-ok 1`. The exceptions are --pool-only, whose cache header now carries the source (an old cache counts as DEFAULT), and the
+UFSM_CF_READ_ONLY bench. The slab prior with no vote warns and takes +1; fit_load warns on a missing key. unroll.sh's ref passes `--dir`
+from SPIRALDIR or spiral_dir.tsv (columns scroll, dir, source GT | published | estimator | unknown, evidence) and logs the decision and
+any refusal to progress.log. Not done: the 2x2 closing error is no direction gate, since it is 2.061 at -1 vs 2.060 at +1 on 1667. The
+label-free gate for phase coherence against W at +-1, which needs a second LS solve (since added, see below). Added later, source-only and unmeasured: the w4 gate (`fit_dir_w4`). The winding-mod-4 planes' tangential grad W is summed around the loop_winding circles (dq >= 64, divided by the covered share), which gives -dir per loop with no mod-1 slips. Its vote (>= 8 loops, 2:1) is preferred over the phase loops when decided, and a disagreement is warned. count-field runs the gates on 32 middle rows loaded with every plane whenever pass 1 found no evidence (--model-only skips the w4 planes there). They decide only with --dir-loops 1; otherwise they print beside the refusal. unroll.sh records spiral_dir / spiral_dir_src (env | tsv | gate: SOURCE) in the run manifest when mset exists. The +-1 coherence gate (source-only, unmeasured, off by default): count-field prints `model coherence C` = |sum z| / sum |z| over the solve cells' phase-vs-model phasors (gr, gi before the smoothing). The right hand leaves one gauge phasor; the wrong one turns twice per revolution, so C should fall to ~0. With unroll.sh DIRCOH=1 and no env / tsv hand, ref() runs two solves from the same (dir-free) pooled sums, --dir +1 and -1. The higher C wins by >= DIRCOH_MARGIN (0.05); otherwise it refuses. The manifest gets `gate:coherence +1 Cp -1 Cm`. scripts/fibfit/dir_gates_measure.sh measures the w4 / loops / coherence votes on 1667, P4 and 1299 against spiral_dir.tsv (post-sweep, CPU). Every
+caller without --dir on a scroll with no ring vote now stops: scripts/cfit, corpus, pod/unroll.sh, cal/gate.sh.
+
+**Every unroll's hand from published segments (scripts/fibfit/seghand.py, segfetch.py).** Take a published segment that covers >= 0.8 turn
+per grid row. Over that turn its radius changes by one pitch, and the sign against the unwrapped angle is the hand. No axis model is
+needed (theta is taken about the row's ring centroid), and the non-circular shape cancels over the turn. Checked against the published
+1667 unwrap (-1, rows 253:1) and P4's documented +1. Results in scripts/unroll/spiral_dir.tsv:
+
+| scroll | dir | evidence | u1 unroll ran |
+|---|---|---|---|
+| PHerc1667 | -1 | full unwrap + 18 of 20 local wrap segments | +1: wrong, redo |
+| PHercParis4 | +1 | 3 segments on 20260411134726, rows 291-293 : 0-2 | +1: right |
+| PHerc0814 | -1 | 2 segments on 20250804134230, rows 24 / 27 : 1 / 2 | default +1 (no log kept): wrong, redo |
+| PHerc1451 / PHercMAN5 | +1? | one raw / flattened-product segment each, scan frame not checked | +1 |
+| 1299, 0009B, 0257, 0332, 0358, 0483B, 0490B, 0813, 0846B, 1203, 1545, MANB | ? | no segment covering a turn on our scan | default +1, unverified |
+
+Only exact +1 / -1 entries drive unroll.sh. The "?" ones refuse at the ref when count-field finds no ring vote.
+
+**Fibre (same-sheet) pairs in count-field.** The slabs snap their integers to the ref (`--ref-snap 1`), so a fibre term in the slab fit
+(`fit --w-fib`, 10-26) cannot move a turn step; the integer reference is count-field's LS solve. `count-field --fibers F.fib`
+(fiber-export frame) or `--pairs F.f32` (za ya xa zb yb xb dW) with `--cf-fib W`: rows c . U = t, c = trilinear(b) - trilinear(a)
+on the solve grid, t = dW + dir dtheta / 2 pi (U = W + dir theta / 2 pi; a fibre: dW = 0, pairs every 4th native-voxel sample at
+spans 16 / 32 / 64 / 128, `--cf-fib-spans`), on every level; Huber `--cf-fib-huber 0.25` over `--cf-fib-irls 3` reweighted level-0
+solves. The CG gathers the pairs per cell (cell -> pair-entry index), so the z-row threads stay race-free; with pairs the CG runs on
+the CPU (1667 level 0 with 3.7 M pairs: 291 s vs 54 s without). test_countfield: a band that counts 0.75 of its 3 sheets in one
+sector leaves W off by > 0.5 turn on 1.000 of the sector beyond it; arcs along the true sheets (`--cf-fib 4`) bring it to 0.000.
+
+**What fibres can do here (oracle).** Pairs sampled from the published surface itself are leaky (the score is against that surface):
+upper bounds. Correction (audit-ugeom, geo-outer): the "outer radial miscount" below is not one. Against pub our radial count matches at r 5-12 mm. The one-sheet difference is in the core (r 3.5-5.5 mm). The long oracle pairs fix the core and drag the masked (zero-CT) outer turns along, so the outer -1 tracks the CT mask (geo-outer: k < 0 share 0.65 within 0.8 mm of masked CT, 0.05 beyond 50 mm). Short pairs, at about the length of our fibhv traces (0.6 mm median, 11-11), add +0.04. Long pairs, at the length
+of the AFV tracings (2 mm median), fix the inner turns (r 3-7 mm 0.42-0.83 -> 0.97-0.98) but not the outer ones. r >= 9 mm stays at
+-1 (0.16-0.29). That is a radial miscount around the whole circumference, one sheet missing beyond ~8 mm. It has no curl, so no
+along-sheet constraint can see it; it needs a count fix (CT peaks, wrap-check). 1667 has no AFV and no published fibre
+prediction (open data: lasagna only). wgraph's fibhv-d predicts for one 1667 slab (pod) failed at the time of writing. So no real-fibre
+run yet: the term waits for mm-long fibres (AFV-like tracings or a longer-tracing fibre model).
+
+Files: /vesuvius/ufsm/fibfit/1667 (ref-dm1 = the dir -1 ref, pool.bin its pass-1 sums, ref-orc02 / ref-orclong the oracles,
+dm1/ the dir -1 chain: slabs, joined, wraps, wraps_snap; cmps-* the surfcmp outputs). Scripts: scripts/fibfit/ (offang.py, wpub.py,
+oracle.py, loops2.py; surfcmp.py is on pub1667-20261114, run here with a `--sub 4` vertex stride) and /vesuvius/ufsm/fibfit/deskpipe.sh.
+Next: re-run the 1667 unroll with SPIRALDIR -1 (or the tsv) on master; the outer-turn miscount; mm-long fibres for 1667.
+
+## I/O error paths: atomic zarr writes, HTTP retry by time, chunk CRC, checked writers (2026-11-14, branch iofix-20261114)
+
+Fixes for the mini audit items store 1-10, zarr 1-8, errpaths 1-8 and volcomp 1-7 (/vesuvius/ufsm/audit-20261114/mini/). Source only,
+not built or run here (the user stopped compile testing 11-14 15:00); the final sweep builds and tests. Correctness fixes are on by
+default; the format change (crc32c) is opt-in.
+
+- z3w: every zarr.json and shard is written to `<path>.<pid>.<tid>.tmp`, then fflush + fsync (UFSM_Z3W_FSYNC=0 skips the fsync) +
+  fclose, all checked, then renamed; on any failure the tmp is unlinked and an error returned. Before, two writers of one shard shared
+  `<shard>.tmp`, a failed fclose published a short shard, and metadata writers reported success on a full disk. A shard that becomes
+  all-fill now unlinks the old object instead of leaving stale data. pthread_create failures are counted and only created threads joined.
+- crc32c inner codec: the reader accepts and verifies it (last codec, per chunk, sub and whole reads, also z3_chunk_raw); z3w writes it
+  only with UFSM_Z3W_CRC=1 (a format change: older readers refuse arrays with it). Volcomp itself has no checksum, so a bit flip in a
+  tANS / bypass payload decodes to wrong voxels with status OK; with the codec on it is a read error. A substream (z3_read_sub) read does
+  not check the chunk's stream tail; the codec covers that too.
+- zarr3 reader: shard size 0 refused (SIGFPE before); a 404 shard is no longer cached as "missing" for good (logged once, read as fill,
+  asked again on the next open); the cached shard index stores the payload size, so the entry range check also runs on cached indices,
+  and a failed size probe is an error rather than a disabled check. The chunk cache still assumes immutable published shards (documented
+  in zarr3.h).
+- store (HTTP): retries are bounded by time (UFSM_HTTP_RETRY_S, 600 s) and transport failures by count (12), not 12 attempts of any kind
+  (an outage over ~1-2 min failed the job); requests get a size-scaled timeout (60 s + len / 256 KB/s, whole objects
+  UFSM_HTTP_TIMEOUT_S 1800) and a low-speed abort at 16 KB/s, so a stalled stream frees its slot; non-429 4xx fail at once; whole
+  reads refuse text/html bodies (error pages served as 200); HEAD without Content-Length falls back to a 1-byte ranged GET; a suffix
+  range the server ignores falls back to a plain tail read; response buffers are capped (UFSM_HTTP_MAX_MB, 1024); the cache-dir claim is
+  a temp file linked into place (an empty claim is reclaimed); UFSM_HTTP_RPS also applies to HuggingFace roots.
+- Writers that reported success on failure now check fwrite / fprintf / fclose (and fsync where a file is renamed over a live one) and
+  unlink partial output: annot st_save / st_log (the HTTP handlers answer 500), repack zarr.json, wrap-anchor and patch-id anchors,
+  write_pgm, the PNG writer, villawind dumps (no .shape after a failed .f32), reg-render samples.bin, sheet-pbr diagnostics. Ignored
+  `mkdir -p` results in train and surf-eval are errors (train also fails when run-defaults.txt cannot be written, since a resume reads
+  it); dino logs a failed last.ckpt symlink.
+- CUDA copies that fed results unchecked now fail loudly: nn_skip_set / nn_skip_share, the Muon descriptor table (ns5_lt), nn_pred_stats
+  (CK, sticky error), the lp_mxsw self-test.
+- GPU volcomp decoder: a device failure (G.broken) prints a warning at exit as well as when it happens; UFSM_GPU_DECODE_ITEMS large
+  enough to overflow the 32-bit substream offsets (~87000) disables the GPU decoder instead of corrupting offsets. gbr_finished stays
+  stricter than the CPU check (documented: the CPU redo is the reference). Partial-read zero fill and the sink fall-through are
+  documented at the API.
+
+## Kernel workspaces inside the memory plan (2026-11-14, branch memws-20261114, audit net#4)
+
+At P 768 data parallel GPU 0 ran 15.75 of 16.3 GB while the planner's fixed 550 MB term stood in for every grow-on-demand kernel
+workspace, allocated at first use after the plan, grown with cudaFree + cudaMalloc mid-step (a device-wide synchronisation), and either
+aborting (lp_buf, fstem, tc_wbuf, s2b copy) or silently falling back (prenorm, gy records) on a full card. netfix already allocates the
+optimizer / attention cuBLASLt workspaces, the Muon pool and the 96 MB input-conv chunk before the measure. This branch does the rest:
+
+- **One per-device registry** (nn_core.cu `nn_ws`): the 24 lp_buf slots (4 element types x 6), the fp4 GroupNorm input copy
+  (f4_prenorm_buf), the fine stem's partial sums, the 16-bit tensor-core weight copy / scales, the s2b gy overlap copy. `nn_ws_reserve`
+  grows an id now; after `nn_ws_seal` a growth prints `nn_ws: ... grew after the memory plan` (a planner miss), and an id with a soft
+  limit (`nn_ws_limit`) returns nullptr instead (its caller's fallback).
+- **unet_ws_plan** (unet.c): for every 3^3 conv at its level of the dry build, each site's own sizing formula: weight prep 28 Cop Cip,
+  the fp4 gy pre-pass slabs (per_zt x min(nzt, 96 MiB / per_zt)), GroupNorm backward partials, the stride-2 backward-data's MX-fp8
+  chunks (gx / gy / dilated gy / accumulate temp, or the whole layer with 8-bit gradients), the flipped weights, the bf16 tc weights,
+  the s2b gy copy, the head's fp16 weights; plus the fp4 prepared-weight memo (3 passes x both orientations of nq + ns per conv: one
+  cudaMalloc per conv and pass at its first call, now checked), charged but not pre-allocated (keyed per call site).
+- **Planner** (train.c): need += unet_ws_plan per mode, replacing the "3 x 96 MB" wide-s2 term; the fixed term is now 400 MB of CUDA
+  context growth + margin (UFSM_WS_RESIDUAL_MB) instead of 550 MB with the workspaces inside. After the pick, every id is allocated at
+  its bound on every GPU and sealed. The fine stem's partials (5.3 MB) are reserved before the measure.
+- **The fp4 GroupNorm input copy** (a whole layer, 17 B per 32 channels and voxel: ~0.96 GB at level 0 of the 256-wide P 768 net)
+  ran wherever the card's free memory allowed at first call: on try6 it could fit GPU 1 (2.5 GB free) but not GPU 0 (0.55 GB), so the
+  replicas could run different kernels. Now it gets the largest layer within 3/4 of the plan's spare above 256 MB, the same on every
+  GPU, and the label planes' device spare shrinks by it. Expected at try6 (P 768 DP): GPU 0's spare is ~1.34 GB, so the budget is
+  (1.34 - 0.256) x 0.75 = ~0.81 GB < 0.96 GB: level 0 takes the non-prenorm path on both GPUs. GPU 0 already ran that path (it had no
+  room); GPU 1 loses the prenorm it had, so a slower step on the pass's comparison is this rule, not a regression (audit-net review).
+- **The whole-layer gy records** (lp_gn_silu_bwd_apply_rec) are capped at the planned record bytes (lp_gyrec_set_cap); larger layers
+  take the plain apply and the weight gradient's own pre-pass (fail-soft path that existed).
+- gscr (the apply's bias scratch) is allocated at >= 1024 channels once; abk / cfb / skip masks / attn8 scratch are < 1 MB (skip:
+  one byte per 8x8x16-cell tile; attn8: tokens of the bottom level) and stay lazy.
+
+Check: tests/test_memws.sh (gpu, slow): try6's flags at P 256 on the wind fixture with UFSM_MEM_REPORT=4; FAIL on any "grew after the
+memory plan" line or any >= 1 MB device allocation after the first step line. Not run yet (mega pass: CPU only); no measured numbers.
+
+## Label-free sheet-identity gates: `ufsm unroll-qa` (2026-11-14, branch geogate-20261114)
+
+The unroll's gates measure self-consistency with the count-field reference: fit-join agreement 0.96-0.97, wrap-check 0.976 and slab
+coherence (Spearman 0.07 with identity) all pass Paris 4, whose GT sheet identity is 0.12-0.21 on PH1-3. `ufsm unroll-qa`
+(`src/unrollqa.c`) measures the fitted W against evidence the reference never integrated, per box (`--box`) or over 48 material tiles of
+128³ field cells (default, ~1 min CPU). Full audit: `/vesuvius/ufsm/audit-20261114/geo-gate.md`.
+
+**Validation.** 92 clean GT boxes, with ids from `fit --model --codes` per box: 54 1667 C boxes, held out, on ref-cf and on joined;
+Paris 4 PH1-3, HOLD and 34 July J boxes on ref-cf. Spearman with ids per box, within each scroll:
+
+| metric | 1667 ref | 1667 joined | Paris 4 |
+|---|---|---|---|
+| pw48: net phase unwrapped along an axis over 48 cells vs the model's ΔW, share > 0.5 turn apart | -0.66 | -0.79 | -0.56 |
+| conf_lo: material share with phase confidence < 0.3 | -0.63 | -0.46 | -0.79 |
+| w4: W vs the winding-mod-4 head (dz dy dx over 32 voxels), share within 0.5 turn | 0.53 | 0.72 | 0.74 |
+| fib_pers_h: fibre traces (H) through W, persistent sheet changes per m (12 / 12 / 32 boxes with fibres) | -0.62 | -0.77 | -0.70 |
+| lcoh_lo (16³ blocks with phase-vs-W coherence < 0.5) / tang_tpm (\|∇W\| along the sheet): reported | -0.69 / -0.63 | -0.80 / -0.62 | -0.57 / -0.78 |
+| tilt of ∇W vs the net normal; \|∇W\| × net spacing; mod-4 loop closure; zero-CT share in material | ~0 | ~0 | ~0 / -0.55 (ct0) |
+
+The fit stays parallel to the sheets at the right spacing even where its integer is wrong. The slips show up in sheet counting and in
+the evidence, not in local geometry. Inside 1667 C1 (ids 0.60), the wrong-integer cells sit where the phase confidence is low (AUC 0.73).
+
+**Gates** (warn-only; `--strict` exits 3; tiles: warn when more than 0.35 of them are over):
+- conf_lo > 0.40, pw48 > 0.10, w4 < 0.80, and fib_pers_h > 130 /m with `--fibres`.
+- Each flags PH1-3. Together the first three flag 30 / 33 Paris 4 boxes with ids < 0.5 and 8 / 9 1667 joined boxes with ids < 0.7,
+  against 1 / 79 good 1667 box fits (ids ≥ 0.8).
+- Whole runs, share of 48 tiles over conf_lo / pw48 / w4: 1667-u1 joined 0.10 / 0.29 / 0.21, all ok; Paris4-u1 0.75 / 0.46 / 0.65,
+  WARN on all three.
+- fiber-judge on the same fibres: Spearman -0.85 over 44 boxes, AUC 0.96. It needs fibre traces, and our fibhv traces put 3 / 5 good P4
+  boxes over 130 /m.
+
+**Pipeline.** unroll.sh check stage, after wrap-check: `unroll-qa` on `joined`, with ok / WARN lines in progress.log. `UQSTRICT=1` makes
+it fatal and `FIBRES=` adds the fibre gate.
+
+**Test.** `test_unroll_qa`, CPU: a synthetic spiral with its true model passes every gate. A model with 1.5 turns per 128 voxels along
+y fires the fibre and pw48 gates, exits 0 by default and 3 under --strict.
+
+**Not caught.** The ±1 slips of a mostly good fit, such as 1667's handedness ramp, need an along-the-wrap angular check. The masked-CT
+coverage loss is invisible here, because the material ends with the CT; that is audit-ugeom's wrap-snap share gate.
+
+## Kernel numerics fixes, audit kernels.md #4-#7 (2026-11-14, branch kfix46-20261114)
+
+Source-only fixes, not built or tested (the audit's one final build-and-test sweep runs them). Each keeps the old bits wherever the old
+arithmetic stayed in range.
+- **#4: the fused-upsample half2 blend** (stage_up_smem_h2, f4ru_blend, stage_up_smem16_h2).
+  - Before: the fp16 tap weights carried the coarse block's scale, so the corner tap (1/64) went subnormal once a block's amax fell below
+    ~1.8, and large scales could overflow the half accumulator.
+  - Now: the weights are relative to the largest of the 8 blocks' scales (2^(e - e_max) <= 1), and 2^e_max is applied to the fp32 result.
+- **#5: the core-1 attention backward** (nn_attn_tc.cu).
+  - Before: dO went to fp16 with one per-tensor scale.
+  - Now: one scale per head (k_fa_amax_h: max |dO| and max |v| of head h into a per-device scratch, fa_amh), used by k_fa_bprep / k_fa_dkv
+    / k_fa_dq. Heads are independent, so each scale divides out within its head.
+  - lp_attn8 (core 2) keeps the tensor scale (at_fa_bprep without head scales).
+- **#6: SiLU / dSiLU through tanh.approx** (14 sites in lp_*).
+  - Before: 1 + tanh(h) cancelled for h < -1, so tanh.approx's ~2^-11 absolute error was most of silu(u) at u < -6.
+  - Now: tanh_silu takes h < -1 from exp (2^-24 absolute) and keeps tanh.approx elsewhere, so the bits are unchanged for u >= -2.
+- **#7: GN statistics of MX tensors** (gn_sums_mx2_k).
+  - Before: raw per-thread fp32 sums of x and x^2, then E[x^2] - m^2.
+  - Now: each thread accumulates x - c and (x - c)^2 with c its first row's value, recombined in double, and the reductions are in double
+    into the fixed-point slots.
+  - Variance error for mean / std 10 drops from ~1e-4 to ~1e-7.
+  - The block partition is unchanged, so slab-vs-whole and split statistics stay consistent with each other. Split-vs-one-GPU byte
+    tests may move by one ulp: the slots now receive doubles, where they received float partials before.
+
+## Pod scripts and docs from the 11-14 mini audits (2026-11-14, branch opsfix2-20261114)
+
+Mini audits podscripts / docs (/vesuvius/ufsm/audit-20261114/mini/). Scripts only, plus three usage strings; no recipe change.
+- **Label staging removed** (podscripts #1, the hard rule). scripts/univ/pod_pack.sh no longer stages OUT/gt (PHerc0139 q-surfaces,
+  PHerc1667 codes A / B + phase, ~19 GB, ~75 min of desk uplink) or, with INK=1, the human ink GT (~2.7 GB). It refuses an OUT holding
+  any zarr store. pod_univ.sh `1667` needs G1667, the code rasters built on the pod from the dl.ash2txt GT, and stops with the rule
+  otherwise.
+- **Pod-to-pod labels** (#5): fibers/evald.sh scores 1447-HOLD against labels built on the eval pod (L2, mklabels2.sh in its pod mode)
+  instead of rsyncing them from the training pod.
+- **GPU lock + timeout** (#2, #9): setup.sh's smoke test runs `flock -w 1800 /root/gpu.lock timeout -k 10 600`. pod_univ.sh's
+  bench / dry runs go through `ulock` (flock + timeout, BTIMEOUT 5400 s). q.sh's lanes are bounded by QTIMEOUT (24 h; they share the
+  card by design). wingate.sh re-execs itself under the lock with WGTIMEOUT (12 h), and off the desk it requires its paths.
+- **setsid** (#3): pod_univ.sh u1run and fibhv-d.launch.sh, so stopping the caller does not take the trainer (try4, 11-14).
+- **Endpoints** (#4): evald.sh, evald_desk.sh and b1_pull_p4A.sh require TP / TPP and EP / EPP (no stale IP defaults). evald.sh
+  writes `done` only when every predict, trace and eval returned 0; otherwise it writes `failed` with the list and exits 1.
+- **Threads** (#6, #7, #10):
+  - q.sh, pod_bench.sh, pod_wb.sh and evald.sh take `ufsm sysinfo --ncpu` (the cgroup) instead of 13 / 40 / 16 / 8 / 12;
+  - unroll.sh and packfields.sh fall back to the cgroup's cpu.max / memory.max before nproc / MemAvailable.
+- **u2ink_smoke.sh** (#8) locks the trainers' shared /vesuvius/ufsm/opt/gpu$GPU.lock, not a private one.
+- **Docs**:
+  - README: `--window auto` is inklib.sh's default, not predict's;
+  - ZCACHE is off without a GPU or on WSL (not "on the laptop");
+  - recipe step 7's driver is desk-only;
+  - the usage strings now show `ink-compare --then`, `strip-flatten --tol` and `count-field --model-only / --model-stride`.
+  - CLAUDE.md is committed on opsfix-20261114.
+- tests/test_podscripts.sh (CPU, < 1 s) checks:
+  - no label staging;
+  - no hardcoded pod endpoint defaults (LAN hosts excepted);
+  - setsid on pod trainer launches;
+  - the locked smoke test;
+  - evald's done flag.
+  On the pre-fix scripts it reports 6 failures.
+
+## Masked CT: no coupling through data-free cells, a majority data test in wraps, one no-data gate (2026-11-14, branch geoouter-20261114)
+
+**Problem (geo-outer audit, /vesuvius/ufsm/audit-20261114/geo-outer.md).** PHerc1667's fields ran on the `-masked` CT, whose SAM mask clips
+the outer turns (16 % of the published area lies on zero CT). Two effects:
+- **Count field.** fibfit's oracle count-field (dir -1, the published surface's own same-sheet pairs) loses one sheet beyond r ~8 mm:
+  - against the published surface, identity is 0.97 at turns <= 17, then 0.90 / 0.58 / 0.41 / 0.08 at turns 18 / 23 / 24 / 29;
+  - the masked parts of the outer turns are off by 3 turns or more (W radially flat: a no-data edge carries only the theta term);
+  - on UNMASKED published vertices, the k < 0 share falls with the along-sheet distance to the nearest masked vertex: 0.65 (< 0.8 mm),
+    0.53, 0.36, 0.12 (12-50 mm), 0.05 (> 50 mm), the same within each turn band;
+  - the same fields without the pairs (ref-dm1) show no such drift, so the pairs into the data-free cells carry the deficit;
+  - 22.9 % of the 2.73 M pairs have an endpoint in a no-data solve cell.
+- **Wraps.** The u1 wraps put whole duplicate outer wraps on the zeroed CT. At z 20000, w043-w049 lie entirely on it, 100-400 um deep,
+  at 24-44 um pitch. The cause is `wraps --fields`' data test: the max-pooled material w > 0 (any cell). The network's weak response
+  (w 4-40) within ~100 um of the mask edge, pooled 4x, kept them.
+- **The 2023 7.91 um scan.** Range reads of 6 slices from dl.ash2txt, mapped with r2-transform. At the divergence the published sheets
+  sit on CT layers. Published gaps show no skipped-sheet signature. Under the masked zone, faint low-density layers lie beneath the
+  published turns 24-30.
+
+**Changes.**
+- **count-field: no-data pairs dropped** (default; `--cf-fib-nodata keep` keeps them). A pair or fibre sample pair is dropped when
+  either endpoint's level-0 solve cell has pooled weight S < `--cf-fib-smin` (0.1) x the median S of the data cells. It prints
+  `count-field: no-data: N of M pairs (share) ...` and a WARNING above 0.02.
+- **wraps: majority data test.** `fit_field_array_frac` pools 255 x the share of a pooled cell's field cells with material
+  >= `--data-thr` (128). A vertex is kept where that share is >= `--data-min` (128, a majority). `--data-thr 1 --data-min 1` restores
+  the earlier any-cell test. The radius bounds and the id pruning keep using "any strong cell", which is still a superset.
+  - 1667-u1 joined, z 19900-20100 (`--zr 4975,5025`), against the old test:
+
+    | | wraps | vertices | on zero CT (level 4) |
+    |---|---|---|---|
+    | old (any cell) | 65 | 663 k | 11.4 % |
+    | new (majority) | 42 | 547 k | 0.32 % |
+
+  - w044-w066 are gone. Near z 20000 the dropped vertices are 96.1 % on zero CT at level 1, with median depth 115 um. The other 338
+    are all within 100 um of the mask. The 2-D simulation at pool 4 kept 99.5 % of the on-CT vertices and 4 % of the masked ones.
+  - It prints `wraps: no-data: N roots on weak data cells ... share` (1667-u1 band: 0.057). The gate follows wrap-snap's pattern
+    (geo-gate): a WARNING above `--nodata-warn` 0.02, exit 3 above `--nodata-max` (off; NODATAMAX in unroll.sh), and unroll.sh logs
+    `wraps: ALARM ...` / `ref: ALARM ...` to progress.log.
+- **One gate.** unroll.sh logs both as ALARM lines (ref, wraps) to progress.log. audit-ugeom removed its wrap-snap ALARM
+  (ugeomfix c6d9985). wrap-snap keeps its masked-share print as a cross-check, and `--masked-max` stays (off by default).
+- **Tests.**
+  - test_wraps_core: fit_field_array_frac against a brute-force share at pools 4 / 8 / 3. A masked-fields case: w 255 inside the data
+    radius, a weak 20 band 12 native voxels wide, 0 beyond. The majority test keeps 0 vertices beyond the edge, the any-cell test
+    15.9 k, and both keep the same 46.7 k inside.
+  - test_countfield: a masked outer sector (material 0) with sheet arcs running into it. With the no-data pairs dropped, the data
+    cells beside it keep their count.
+  - The synthetic arcs are exact, so keeping them does no harm either (0.000 / 0.000). The real check is the 1667 rerun below.
+- **The 1667 oracle rerun** (ref-orclong recipe, `--cf-fib-nodata drop`, 0.229 of the pairs dropped):
+  - Identity on CT > 0:
+
+    | r (mm) | 9 | 10 | 11 | 12 |
+    |---|---|---|---|---|
+    | pairs kept | 0.841 | 0.700 | 0.561 | 0.415 |
+    | no-data pairs dropped | 0.901 | 0.796 | 0.643 | 0.556 |
+
+  - At r 3-7 mm it costs 0.5-2.5 points (0.97-0.98 before).
+  - On unmasked vertices of turns >= 18, the share with k < 0 within 0.8 mm of the mask falls from 0.65 to 0.29, and at 3-12 mm from
+    0.36 to 0.20.
+  - About half of the outer -1 is gone. The rest comes from the data-free shell through the smoothness (W flat across the zeroed turns)
+    and needs the filled CT.
+- **Not done.**
+  - Fields on unmasked CT (pub1667's filled store, a GPU predict): the real fix for the missing outer data.
+  - A fields-level weak-edge share inside count-field, which would stop a run before the slabs.
+
+## Attention Muon-LR multiplier and the accum A/B prep (2026-11-14, branch attnlr2-20261114; admuon's code, committed by perf2)
+
+Audit 2026-11-14 train #3 and #8. Both default off; nothing changes without the flags.
+- **#3 `--attn-muon-lr F [--attn-muon-lr-out F2]`:** the attention stage's Muon linears step at F x the Muon lr. The zero-initialised
+  out-projections wo / w2 step at F x F2: Muon's update has a fixed size, so while |W| is small it is a large relative step.
+  - Each Muon descriptor gets a multiplier from its weight offset (a --muon-qkv-split slice lies inside its tbm[k][0]).
+  - Plain batched Muon: one nn_muon_batch per run of equal multipliers, with trunk_lr folded in. The ext path (--normuon etc.):
+    nn_madapt.base, multiplied into ad_ctl_k's per-matrix multiplier, so it composes with --muon-lars.
+  - Needs --opt muon. Not supported with --muon-c / --hyperball / --init-lr-mult.
+  - test_attnlr: one step of a small attention U-Net with F 0.5, F2 0.2 against one without, on the same weights and gradients. Every
+    parameter's change is identical (convs, AdamW), F x (q/k/v, w1), or F x F2 x (wo, w2) the reference's. Checked on plain and
+    ext (normuon) Muon.
+  - --opt-stats N logs the attention linears' update / weight ratios (its own group), which F / F2 are to be picked from. The values are not chosen yet (a GPU measurement).
+- **#8 scripts/audit/ab_accum.sh:** --accum 5 at try6's lr (Muon 0.003 / AdamW 3e-4) against --accum 2 at lr x 0.77 (0.00231 /
+  2.31e-4).
+  - Both arms start --init-from the same try6 checkpoint with --det 1 and one seed, so the window stream is the same and equal windows
+    mean the same data. The scratch2 net runs single-card at P 512 on the wind fixture, with WSD warmup 50 and cooldown 0.2.
+  - `--summary OUTDIR` pairs the arms' log lines at equal windows: loss / phase / wind4 / acc / kl, over the cooldown and windows
+    1000-1400.
+  - Prepared only. It runs on a pod under `flock /root/gpu.lock timeout -k 10`.
+
+## Head-gradient plane scale chosen on the device: no host sync (2026-11-14, branch hgsdev-20261114)
+
+Follow-up to the section below (main, audit pass 2): hgs_choose cost one nn_sync and nine small readbacks per window between the
+statistics pass and the gradient pass, a full drain of the card's queue each step.
+- **Now:** hgs.h holds the bound and the exponent rule as inline functions; nn_hgs.cu (a UFSM_STRICT_UNITS unit: IEEE division, no FMA
+  contraction, no flush, like the host C at -ffp-contract=off) runs them in a 1-thread kernel on the loss scratches in place and writes
+  {s, 1 / s} into a 4-float device buffer per GPU (d->hgsd). No host sync.
+  - Host-known terms (lambdas x source weights, the gradient scale, the MIL term 8 |lambda| gs / nmil) go in as kernel arguments
+    (hgs_args); device terms are the scratch pointers and the wind4 fin.
+  - The producers take the device pointer (GSHP, a trailing `const float *hp = nullptr` on loss_grad_k, loss_grad_pk_k, aff_grad_k,
+    w4_grad_k, count_apply_k, sheet_scatter_k, lat_fuse_k; the MIL fin via ink_mil_set_scale_dev). Each kernel does `scale =
+    __fmul_rn(scale, hp[0])` on entry: the host used to pass lambda x (gscale x s), the kernel now forms (lambda x gscale) x s, which is
+    the same float because s is a power of two and nothing over- or underflows. __fmul_rn so the product is never contracted into an add.
+  - The consumers read 1 / s from the buffer: nn_head_bwd_z (weights x 1 / s, gw / gb x s before and x 1 / s after, now as small
+    kernels on the buffer instead of nn_scale with a host value), fstem_red_k.
+  - The MIL loss for the log: fin's scale carries s, so the fetch divides by a device copy of s taken at fin time (hgsd[2]: the next
+    window may choose again before the fetch).
+- **One deliberate change in the exponent rule:** k = floor(log2(512 / b)) is now taken from frexpf's exponent (exact) instead of
+  floorf(log2f()). log2f can round a quotient that lies within an ulp below 2^k up to exactly k, which made s b slightly exceed 2^9. Apart
+  from such quotients, the two rules agree; test_hgsdev counts how often the old one differed.
+- **Checks:**
+  - UFSM_HGS_CHECK=1 (train): after the device choice, sync, read the same scratches back, run the host function, and compare
+    {s, 1 / s} bit for bit (exit 1 on a mismatch).
+  - test_hgsdev: (1) 4000 random windows (1-8 scratches of 1 / 2 / 7 channels, mask sums partly below 1, fin scales 2^-40 .. 2^10,
+    signed lambdas, dice / recall, wind4 1 / N, MIL, gradient scales 2^0 .. 2^20): device == host bits. (2) b = 512 / 2^k and one ulp
+    either side for k 0 .. 31, and 0 / -1 / inf / NaN / 1e-40 / 1e30 / 1e-30: device == host, plus the exponent rule itself.
+  - test_hgscale unchanged: its nn_set_head_gscale(s) now fills a per-device {s, 1 / s} buffer and sets the same pointer, so its
+    producer / fstem / head byte-equality checks run the device-pointer path.
+
+## The fine stem's W1 to fp16 with a per-row power-of-two scale (2026-11-14, branch fstemw-20261114, audit net#11)
+
+The stem's tensor-core forward and backward recompute (`nn_fstem.cu`), and predict's FFMA mirror (`nn_lathead.cu`), used to round W1
+(C x 64, `--fstem 16`) straight to fp16. That is the pattern the head fix (1b0f7b9) removed: a weight below 6.1e-5 lands in fp16
+subnormals, and below ~3e-8 it flushes to 0. Now each row c is multiplied by 2^e before the conversion, so its max |w| lies in
+[2^14, 2^15). The fp32 product (`c4`) is multiplied by 2^-e before the bias. Both scalings are exact. In fp16's normal range the
+rounded value is the same as before, so trained weights give the same bytes except where a weight was subnormal. The mirror builds
+the same effective weights, ldexp(fp16(w 2^e), -e), from the same `fs_w1_exp` (`nn_common.cuh`). The scale is on by default;
+`UFSM_FSTEM_WSCALE=0` restores the old conversion.
+
+**Measured on the checkpoints** (CPU, read-only; W1 = the first 1024 floats at fstem_off = np - gfilm - 1296):
+
+| checkpoint | step | min \|W1\| | median \|W1\| | max \|W1\| | smallest row max | below 6.1e-5 (subnormal) | fp16 rel. error: median / max per weight / worst row norm |
+|---|---|---|---|---|---|---|---|
+| scratch2 (try6) last.ckpt | 2357 | 2.1e-6 | 0.132 | 0.586 | 0.373 | 0.10 % | 1.7e-4 / 1.3e-2 / 2.4e-4 |
+| scratch2.try5 last.ckpt | 342 | 1.1e-4 | 0.132 | 0.583 | 0.372 | 0 | 1.7e-4 / 4.7e-4 / 2.5e-4 |
+
+So the bug is not active in try6. The rows sit at O(0.1) and the only subnormal weights are isolated near-zero entries. The worst
+per-weight error is 1.3 %, on a 2e-6 weight that hardly contributes. The per-row error stays at fp16's 2.4e-4. The scale guards against
+Muon / weight decay shrinking whole rows later (b1's median is 0.09 and W2's 0.006, both fp32, so neither is affected).
+
+**Test** (test_fstem, tiny-weight case like test_head_tc's): W1 ~ 2e-7 (all of it fp16-subnormal), b1 0, W2 ~ 1e5. The forward and
+dW2 (which reads the backward's recomputed pre-activations) are checked against a double reference, with the scale and without it.
+The pass condition is error < 3e-3 with the scale, and at least 10x worse without it, so the case really exercises the scale.
+test_lathead (mirror vs trainer) is unchanged. The GPU numbers come from the mega pass (this branch was built CPU-only).
+
+## Ink head: per-scroll gating, validation twin, radial dropout, MIL reach in um (2026-11-14, branch inkfix-20261114)
+
+From the inkmil audit (/vesuvius/ufsm/audit-20261114/targeted/inkmil.md). The head is not at chance: inkpod-10000 crop AUC Paris 4 0.795, 0500P2 0.729,
+0841 (unseen scroll) 0.715, 0139 0.634, 1667 0.539; 1667 is the floor for every model (ink3d-ext 0.527 at 2.4 um). What this branch changes:
+- **Gate (`scripts/univ/ink_gate.py`)**: per-scroll crop AUC from eval.sh's vscores.tsv, headline = mean over Paris 4 / 0500P2 / 0841 / 0139, 1667
+  non-regression only (>= base - 0.03), no scroll may fall > 0.03 against a base. The 1667 banner AUC is not a gate (published model output).
+- **Validation twin (eval audit #2)**: an onfly ink target with a holdout_file opens a second inkfly without the held-out exclusions (`tgt_val`,
+  `val_twin: 0` in the onfly entry turns it off); `source_read_target` reads it when the validation sampler's draw set `source_set_val_read`. Train
+  keeps the exclusions (the sampler's window mask is the guard). The log prints `val ink <source>: bce .. over N windows` per source after the
+  aggregate line, so 1667 memorisation (train bce down, val bce up; 0.832 vs 0.53-0.56 in wrapscore) is visible in the run.
+- **`--ink-radial-drop P`**: ink-source windows take no radial channels with probability P (97 % of the ink weight had an axis; predicts without
+  --axis feed zeros). The draw happens only with the flag on (stream unchanged otherwise); replays keep the flag in the radial record.
+- **`--ink-mil-r-um U`**: the MIL reach in microns. `--ink-mil-r` / `--ink-mil-step` keep K = 21 samples, the ray normal is stretched by
+  U / (R x window voxel um) (`inkray.rs`, applied in `sample_mil_map`, also on replays), the held-out guard uses the same reach. Default 0 = the
+  old voxel reach (+-48 um at 4.8, +-96 um at 9.6). Suggested 50. Not in any recipe yet: changes the loss.
+- **Predict / scripts**: predict warns without --axis (UFSM_PRED_AXIS_WARN=0 silences); eval.sh passes the scroll's ink-source axis
+  (`scripts/univ/ink_axes.tsv`, INK_AXIS=0 for the old behaviour); u1667ink.sh passes `$O/axis.json` (INK_AXIS=0) and notes LV=1 as the crop level.
+- **GPU check, to run in a window**: `scripts/univ/ink_check_axis_level.sh CKPT TAG` = inkpod-10000 on the 34 crops at level 1 / 2 with / without
+  axis, gate table in `$OUT/TAG.gate.txt`. L1-noax must reproduce the 0.795 / 0.729 / 0.715 / 0.634 / 0.539 rows; (L1 ax - noax) is the axis effect,
+  (L1 - L2) the 9.6 um cost. Production ink at 4.8 um on the labelled boxes = `LV=1 scripts/inkgt/u1667ink.sh` (the shell-only predict is not built).
+- Not done: ink-specific fine stem / no stem dropout on ink windows (needs a training run), scroll-weight rebalancing.
+
+## Head slabs: seam fixes from the targeted audit (2026-11-14, branch hsfix-20261114)
+
+Audit /vesuvius/ufsm/audit-20261114/targeted/headslab.md: BCE / dice / wind4 / MIL / the streamed latent head are exactly slabbed == unslabbed
+(a 1-D model of the rolling schedule matches U^T g to 4e-16). Fixed:
+- `--hs-tcache 1` under `--split z`: the cache kept the statistics pass's owned-plane masks, so the gradient pass lost its 4-plane band beside the
+  cut. The cache is now off under split (it says so at the first step).
+- `--fib-normal-lambda`: the fibre plane streamed without a halo, so the kernel skipped the 2 (r + 1) planes at each slab end (6 of 32 planes, 18.75 %
+  at Z 32, 37.5 % at Z 16). `lhalo(AUX_FIB) = r + 1`, and `fibn_k` tests the window bounds. test_fibn: 2 and 4 slabs add up to the whole window.
+- `--pgrad-lambda`: a pair whose partner is in the next slab is still dropped (the partner's logits are not resident; a halo head pass plus a
+  gradient hand-over to the neighbour slab is not worth the complexity). It now prints the bound (~0.5 dist / Z of the pairs) at startup.
+- `hs_ds`: the light-statistics keep area moved from 100..106 to 120..126, off the fibre direction sums (84..118).
+
+## Multi-head loss balance: effective weights, per-head gradient norms, the proposed try7 balance (2026-11-14, branch lossbal-20261114)
+
+Audit /vesuvius/ufsm/audit-20261114/targeted/lossbal.md (numbers from scratch2 try6, steps 350-2357, sources-scratch1-ph80-no1218.json).
+
+**How the heads combine.** Each head is a mean over its mask-weighted voxels of one window, divided by its active channels, times lambda x the
+source's head weight (nn_loss.cu loss_grad_k `1/active`; wind4 0.5 / N per logit; MIL / nmil). A window without the label gives gradient 0 and the
+accumulation divides by all windows (train.c `1 / nacc_win`), so a head's effective weight = lambda x channel norm x fraction of windows with its
+label. The sources are disjoint by head: geometry 79.3 % (phase, rv, normal, density; wind4 on 71 %), ink-only 17.1 %, fibre-only 3.6 %.
+Mass (L1 weight of the logit gradient): phase 26.4 %, rv 26.4 %, normal 22.6 %, density 3.8 % (1 channel of 7), wind4 5.9 %, ink bce 5.7 %,
+ink MIL 5.7 %, fibre 3.6 %. A fibre-only window weighs 3 (H, V, direction at lambda 1), on par with a geometry window (3.25); the starvation is
+frequency: P(an update of 5 / 10 windows has a fibre window) = 0.17 / 0.31. The heads are near orthogonal at the head input (|cos| <= 0.046, phase / rv
++0.13 .. +0.18), so this is about learning speed, not interference. A weak regression of the logged gn on the window mix says ink (MIL) windows carry a
+2-3x larger gradient norm than geometry windows (CI +0.3 .. +5.3), i.e. L2 shares differ from the L1 mass: the norm log below settles it.
+
+**Logging (default on).** `--grad-cos N` (every N steps) now also prints `grad-norm step S (head input): phase a normal b wind4 c rv d ink e fib f`, the
+square root of the Gram diagonal at the head input (the ink norm includes the MIL gradient); fibre is a sixth task (so its cosines appear in the
+`grad-cos` line too, appended after the existing pairs: the old regexes still match). `fib bce` in the step line is now H + V (the objective
+weights H, V and the direction each at lambda; it was the mean of H and V, so the loss column understated the fibre term). The scratch2 launch
+script defaults `--uw` to 0 (`${UW:-0}`): the Kendall weights are 1 / L at the fixed point, which boosts the easiest heads (ink 3.7, rv 3.3).
+
+**Proposed try7 balance (flags and sources only, defaults unchanged; judgement, not measured):** `--rv-lambda 0.5` (rv is a function of the
+phase, cos +0.15, bce 0.30), `--density-lambda 2` (density 0.143 -> 0.286 per geometry window; the fused path supports it, run `s2ctl.sh drystart`
+first), `--wind4-lambda 0.5` (accuracy flat at 0.57-0.64 over 2000 steps, no interference cost), fibre `--fib-head 1` unchanged but the fibre-only
+source share 0.035 -> 0.07 (undoes the ph80 halving; frequency lowers variance where a larger lambda would only make the rare update spikier:
+P(>= 1 fibre window in 10) 0.31 -> 0.52). Resulting mass: phase 26 %, rv 13 %, normal 22 %, density 7 %, wind4 12 %, ink + MIL 12 %, fibre 7 %.
+After ~2000 windows read the `grad-norm` lines and move lambdas by square-root-of-ratio steps, at most two at a time. Per-source `ink_weight`
+is unset (Paris4 supplies 63 % of the ink labels, 1667 23 %): a data decision, left alone.
+
+## Log line and log.csv semantics (2026-11-14, branch logfix-20261114; audit mini/logs.md)
+
+The 50-step line and log.csv now mean what they say:
+- `wait` is the time a GPU sat idle waiting for data. Under --echo-max, the probe's time while the GPUs still ran the step (it waits for a
+  fresh window first) used to count as wait, so a saturated echo run could show 40 %; it is now a separate `gate` share,
+  `(wait N%, gate M%)`, printed only with --echo-max. log.csv's wait_s has the same meaning, and a new gate_s column is appended.
+- `loss`, `bce`, `dice` (and CSV `active`) are means over all the step's windows (every DP GPU). bce and dice used to be GPU 0's only.
+  CSV `active` used to be one step's sum at the log line; it is now the interval mean per window, like the other columns.
+- The label shares "(N% of windows)" count GPU 0's batches with a label. At B > 1 the line now says "of batches" (a batch of 4 with one
+  labelled window counted 1).
+- `normal bce` is gated on the labels being present (raw loss > 0), for numerator and denominator alike. Under --norm-lambda 0 it used to
+  print 0.0000 (0 %) because the gate was the weighted loss.
+- samp/s and Mvox/s remain work rates: every window trained, echoes and skipped steps included, input voxels with the halo. The echo affix
+  now adds the fresh-window rate: `echo E% (GPU idle for data I%; fresh F samp/s)`.
+- `gns N W (EMA; ...)`: the noise scale is an EMA over updates, not an interval value like `gn`.
+- The memory plan's `task` is the rest of the need after the named terms. UFSM_MEM_REPORT=2 now prints `task = these + other`, with the
+  listed parts and the remainder (a term later added to the need without a print shows up as other).
+- predict: `wrote ... (N tiles in Ts end-to-end, the windows Ws)` and the `predict io` line give both the end-to-end clock (pyramids and
+  writes) and the window loop's.
+Parsers: log.csv columns are only appended (u0/watch.sh reads by position and ignores trailing columns; csv_extend_header extends a
+resumed run's older header when it is a prefix of the current one). tests/test_echo.sh and test_accum.sh follow the new fields;
+univ/eval.sh and muonx/absum.py read `samp/s` / `Mvox/s` by the token before them, unchanged.
+
+## Shell-script and coordinate-convention fixes from the mini audits (2026-11-14, branch shellfix-20261114)
+
+Audits: /vesuvius/ufsm/audit-20261114/mini/shell.md (1-10) and mini/coords.md (1-7). No GPU, no measurements; CPU tests added.
+
+Shell (scripts/unroll/unroll.sh, scripts/univ/):
+- prep: a missing mask (or .json) without a BOX fails the stage; the box awk exits 1 on an empty mask. Before, `od` on a missing file
+  fed awk nothing, its END printed a corner box (replay: `0,0,0,16,16,16`, exit 0) and the unroll ran on it. PREPDIR overrides the
+  mask directory.
+- trim: a failed surf-stats (onpap returns its PIPESTATUS) or a wrap without a row fails the stage. Before, the missing share read as
+  P = 0, so every such wrap was "near-empty" and dropped with a passing stage.
+- ink.failed / inkcal.failed are removed at the start of a run and before each ink / inkcal attempt. A stale marker stopped
+  `waitfor ink` (and the INKAT=fields GPU lane) at once on a rerun.
+- pw_one returns ink-compare's status. faces counts its failed wraps and returns 1 (no faces.done after a failure, so a rerun retries
+  them). perwrap (its per-job rc already on unrollfix-pub) also fails on STOP.
+- u2ink_pod.sh creates score/ (the score unit's redirect failed on a fresh arm). b1_p4B48.sh: pipefail, every step fatal, and an assign
+  that matches neither reference stops before the raster.
+- Skips test done markers, or write .tmp then mv, instead of testing the output (ueval wraps / ct.raw / head raws, b1_relabel codesA /
+  ref, b1_p4B48 ref19 / qB, xres_prep warps). A killed run left the dir / zarr.json / a truncated raw, which was then reused.
+  Existing outputs without a marker are redone once.
+- b1_pull_p4A.sh: EP / EPP are required (no stale pod default doing rsync --remove-source-files), and IDLE seconds (1800) with no
+  contact and no new shard exits 1. deskgate.sh: an EXIT trap removes gate.busy (bash runs it on SIGTERM, checked).
+- Env overrides: b1_p4B48 (J, G, AX, GT1019), pod_pack (GTROOT), postperf_gpu (CTR, CTK).
+
+Coordinates:
+- #1, mask reads finer than the stored level (sources.c `label_cell`). A mask's base level is point-sampled: the rasteriser rounds,
+  so base cell j is centred on fine j 2^s, and that is why the old rounding was right there (tools/label_grid.py). But its pyramid
+  levels above the base are any-of blocks (ingest.c pool2_mask). Reading such a level with rounding shifted the mask half a coarse
+  cell against its blocks.
+  - New field z3_meta.label_pooled: the levels above the base. Taken from `ufsm.pooled` if present, else log2(scale / the group's
+    finest scale).
+  - The reader rounds to the base, then floors through the pooled levels. Side labels (binary 2) still floor all the way.
+  - A source whose min_level is its base (every current raster store) reads exactly as before.
+  - test_raster `pooled_pyramid`: a random mask with two pool2 levels, read at the base and one level finer than the base. Every
+    voxel must equal the any-of over its block.
+- #2: countfield / hiresphase ray cells use floor, not (int) truncation. A step into (-cell, 0) no longer reads cell 0.
+- #3: surf.c wm_axis_load parses with json_get, so key order no longer matters (control_points or a bare array).
+- #4: vwt-tile / vwt-infer / villawind take --umb-scale (default 1, the old behaviour): JSON times the scale gives the volume's voxels.
+  vwt_tiling_build takes the scale.
+- #5, not changed: the radial input rows use the plane-start convention, axis at (o + z) 2^L, then / 2^L. Training uses the same
+  convention (sample.c:3104), and so does predict (axis_rows), so train and inference agree. Moving one side to the block centre
+  would create the mismatch the audit worries about. The other users (inksplat (V-1)/2, patchsolve / tracebox / dino raw) are each
+  internally consistent, and the gap is under half a coarse voxel.
+- #6: tifxyz-scale's help says the --offset is subtracted after the division, in output voxels.
+- #7: tifxyz_shift writes a vertex moved past z = 0 as invalid (-1, -1, -1), tifxyz_scaled's rule, instead of clamping it to a valid
+  z = 0. test_imgops checks it.
+
+Ref model gauge under --model-stride (unroll #8 follow-up, 2026-11-14; source only, not built or run: user order).
+- The finding: pub1667's recheck on fibfit's dir -1 refit (ref-dm1) found coherence that alternates in z. About 256 field rows are high
+  (0.41-0.70), then about 256 low (0.03-0.34).
+- The cause: count-field --model-only --model-stride K sums the model's local phase gauge (gr / gi) only on the chunks with
+  chunk % K == 0. cf_lat_run then sets gg = 0 wherever the smoothed sums are empty. ref-dm1 used 128-row chunks and K 4, so its sums
+  exist on rows [512k, 512k + 128). The +-8 solve-cell smoothing (+-64 rows) widens that to roughly [512k - 64, 512k + 192), and the
+  measured switches fall at about 704 / 960 + 512k. The production 1667 ref (768-row chunks, K 4) had a local gauge on about 30 % of z.
+- The fix:
+  - cf_gauge_fill_z: solve rows with all-zero sums take the sums linearly in z from the nearest summed rows, per column, before the
+    smoothing. This is on whenever --model-only and K > 1.
+  - unroll.sh MSTRIDE now defaults to 1. On the GPU that is about 4x a 7 s model pass. corpus desk.sh / fd.sh keep K 4 (CPU time),
+    with the interpolation.
+- To verify (post-pass, CPU): rerun the ref-dm1 count-field with --model-stride 4, then 1, and repeat pub1667's per-plane coherence
+  scan. The alternation should be gone.
+
+Fused --fit-h 2 fit fields (audit unroll #9, the deferred item; main 11-14: write it behind a flag, profile post-pass).
+- nn_fit_accum_lat now takes field cells of 1, 2 or 4 voxels as well as 8. Production runs --fit-h 2 and used to take the plane path:
+  upsample, shuffle and stem into [11][nz][W][W] fp16 planes, then fit_accum_cell_k and fit_accum_w4_k.
+- How it works:
+  - Blocks of 8^3 box voxels, as at h 8. They start at og = tz mod 4 per axis, so their window coordinates sit on the 4-voxel latent
+    cell grid. og must be a multiple of h.
+  - Per block, the same staging, stem and upsampling as h 8.
+  - Then one thread per field cell sums the cell's voxels serially, in the plane kernels' voxel order. Voxels outside the box or the
+    window add +0, which changes no sum.
+  - So every accumulator should match the plane path bit for bit. test_fit_lat now runs h 8 / 4 / 2, plus a window origin off the
+    4-voxel grid for h 2.
+- Flag: UFSM_PRED_FIT_FUSED_SMALLH=1, default OFF. If the kernel refuses a configuration, predict falls back to the plane path and says
+  so.
+- Pending (post-pass GPU): scripts/unroll/fith2_prof.sh. It runs test_fit_lat plus its bench, then a 1024^3 1667 fields predict, plane
+  vs fused, with UFSM_PRED_PROF=1 and every field file byte-compared. Turn the default on only if it says IDENTICAL and is faster.
+
+## DP safety: process-wide state under one host thread per GPU, workspaces before the plan, an mgpu lint (2026-11-14, branch netfix-20261114)
+
+From the network / kernel audit (/vesuvius/ufsm/audit-20261114/net.md; today's at_set_lmax and cuBLASLt bugs were of this kind). Under data
+parallel the forward, losses and backward of each replica run on its own persistent host thread (train.c gworker); the gradient all-reduce,
+the optimizer and checkpoints run on the main thread. Fixed:
+
+| what | was | now |
+|---|---|---|
+| lp_mxgemm packed operands (UFSM_LINEAR_MX=4/8) | one buffer: GPU 1 packed into GPU 0's memory | per device |
+| VMM level-0 rings (UFSM_L0_RING=1) | device latched at the first call: GPU 1's rings backed by GPU 0's memory, table unlocked | device per call, granularity per device, table under a mutex |
+| GN slab registry (--l0-norm slab) | unlocked, 8 entries = exactly 2 replicas x 4 | mutex (lock-free "any" fast path), 32 entries |
+| Muon NS cuBLASLt plan table | unlocked append (safe only while the optimizer stays on the main thread) | mutex |
+| CUDA error latches g_err / g_lp_err | process-wide: one GPU thread could consume / report the other's error (UFSM_SYNC_CHECK) | per thread; every first error also posted process-wide; a non-worker thread's nn_check (the trainer's main thread) takes a posted one, a GPU thread only its own (nn_err_worker) |
+| stochastic-rounding seeds | identical on both replicas (the counter starts from the main thread's) | replica g's thread salts with g (salt 0 = the one-GPU draws; --split z halves keep 0: their halo planes must round alike). Signed data: no correlation either way; same-sign data had 0.39 |
+| --gn-ema running statistics | per replica, never combined: the checkpoint's (GPU 0's) saw half the windows | averaged over the replicas at validation / checkpoint steps, and every step once the forward reads them (from --gn-ema-warm); exact, the update is linear in the batch statistics |
+
+**Workspaces before the plan.** The planner measured the free memory before the first step, but these were allocated at the first step,
+outside the plan (covered only by the fixed 550 MB "kernel workspaces" + the 0.5 GB multi-GPU headroom; GPU 0 at P 768 DP runs 15.75 of
+16.3 GB): the cuBLASLt handles + 32 MB workspaces of the attention linears and of --muon-tc 2 (per device since today's fixes, so new on
+GPU 1), the Muon descriptor table + scratch pool (<= UFSM_MUON_POOL_MB 128) and momentum (unless aliased into AdamW v), and the latent
+input conv's MX-fp8 / MX-fp4 weight-gradient chunk copies (96 MB). unet_reserve + lp_f8w_mixed_reserve now allocate them on every GPU
+before nn_mem_free. The other grow-on-demand kernel workspaces (lp_buf slots, gy records, fstem partials, skip masks) are recomp's
+(memws-20261114). The P 768 UFSM_MEM_REPORT=4 measurement (base vs fix) was cut by the mega pass's queue kill and runs in the pass.
+Tests: test_dpsafe (gpu: the error latches across two threads, the slab registry from two threads, the replica salt, the VMM granularity).
+
+**Lint.** tests/test_mgpu_lint.py (fast tier, CPU): every mutable process-wide variable in src/ (file-scope globals, function-local
+statics, __device__ / __constant__) needs `mgpu: TAG` (per-thread, per-device, guarded, config, env, main, process, debug) on its line or
+the line above; thread_local, const objects and locks need nothing. The 1112 that predate it are in tests/mgpu_baseline.txt (file name),
+so only new ones fail. A self-test checks the scanner on a sample (a pointer to const is mutable, a const object is not).
+
+## Checkpoint save / load fixes from the mini audit (2026-11-14, branch ckptfix-20261114)
+
+Audit: /vesuvius/ufsm/audit-20261114/mini/ckpt.md (items numbered as there). Built on opsfix1 (unet_save refuses non-finite arrays,
+the checkpoint ring in src/ckring.c clones last.ckpt after each save): this branch changes what a save writes and what a load accepts,
+the ring is untouched.
+
+- Save (#1, #6): the extra is checked to be one whole JSON object before anything is written (a truncated snprintf chain loses its
+  closing braces); after the arrays, fflush + ferror + fsync; the tmp file is then read back (magic, a header line within
+  UFSM_CHECKPOINT_HEADER = what every reader allows, a whole object, nparams, a file size of exactly 4 or 5 arrays) and only then
+  renamed over last.ckpt; the directory is fsynced after the rename. Any failure: the previous checkpoint stays, the tmp is removed,
+  unet_save returns -1 (train stops with "cannot save"). unet.c does not link json.c (40 test targets), so the read-back is a
+  structural scan (braces / brackets balanced outside strings, nothing after the last brace), not a parse.
+- Header floats (#10): non-finite running statistics / radii are written NaN / Infinity / -Infinity (was nan / inf): Python's json
+  reads them, and strtof / json_parse read both spellings, so older binaries load new checkpoints unchanged.
+- Load (#5): the payload size must be exactly 4 arrays (+ the Muon momentum when the header says so); 2 arrays (weights only) loads
+  with zero moments and says so. A file cut inside m / v, or with trailing bytes, fails (it loaded silently with zero moments).
+- Load (#7): nlev, widths, cin, cout, attn_blocks (and dec_widths / enc_blocks where both sides set them) must match, not only the
+  parameter count. Train prints the precision settings that differ from the checkpoint's runtime block (prec, f16, act_mx4 / 8,
+  grad_mx8, input_prec, gn_stored, policy) on resume.
+- Optimizer (#4): --resume with a different --opt than the checkpoint's runtime.optimizer is refused; --opt-reset 1 allows it and
+  zeroes m, v and the Muon momentum after the load. mom_alloc zeroes the matrices' slice of v when the momentum is aliased into it
+  (an AdamW checkpoint under Muon started its momentum from Adam's v).
+- Header readers (#2, #3, #9): checkpoint_header_line reads UFSM_CHECKPOINT_HEADER (was 64 KiB, silently cut; no newline within the
+  limit is now an error); ckpt-avg's header buffer likewise (was 16 KiB: every latent checkpoint failed); read_header parses only the
+  top level (the text before ',"extra":'), so an extra key named like an absent optional key ("lat_c", "gn_ema" ...) is not read.
+- --grow-head (#8): the same-network check also compares enc_blocks / dec_widths / dec_convs / attn_blocks; the state this path does
+  not restore (Hyperball radii, adaptive-Muon state, init_inh, the latent transform, level-0 / gn_ema running statistics) is listed.
+- Real headers on 11-14: scratch2 last.ckpt 37 225 bytes, u1 26 219 (limit 131 072).
+- Tests: test_checkpoint_runtime (CPU: a key past 64 KiB is read, no newline within the limit fails), test_checkpoint (GPU: truncated
+  extra refused with the previous file intact, an extra "lat_c" ignored, a file cut in v / with trailing bytes fails, weights-only
+  loads, an AdamW checkpoint with v = 1 under Muon moves the Muon matrices as from zero state).
+
+## Window weighting of the head losses by their label count, --win-weight (2026-11-14, branch winw-20261114, audit train #4)
+
+Each head's loss is a mean over its own window's masked voxels:
+- the 1 / fmaxf(nm, 1) of loss_grad_v and nn_lat_fuse_grad, through fin[2 C + 1];
+- w4_fin_k's 1 / N;
+- MIL's / nmil.
+
+So a window with a sliver of labels gives a head the same total gradient as a fully labelled one. The audit's log shows how much
+label presence varies: phase in 64-88 % of windows, fibre 0-12 %, MIL 12-32 %. Under Muon the momentum sum is normalised and clip
+5 is nearly a no-op, so one such window steers ~20 updates.
+
+`--win-weight 1` (default 0; the off path is bit-identical) multiplies a training window's gradient by min(1, nm / ref) per head:
+- **nm:** the window's mask weight sum, as a mean over the head's active channels. Wind4 uses its supervised voxel count N; MIL its
+  ray count.
+- **ref:** a running median of the head's nm over earlier labelled windows. It starts as the geometric mean of the first 16
+  windows; after that, each window moves log2 ref by +-0.05 towards log2 nm (a sign-step median tracker). Once a head's nm
+  distribution is stationary, a window at its median weighs 1 and a 1 % sliver weighs ~0.01.
+- **Where it applies:** the multiplier is computed and the tracker updated in the finalisation kernels (loss_fin_k, w4_fin_k).
+  Only fin[2 C + 1] / fin[3], the gradient's scale, changes; the logged loss values do not.
+- **No host sync:** the state lives in device memory, `__device__ g_ww`, one copy per GPU. Data-parallel replicas each track their
+  own windows. MIL's ray count is a host value already, so its tracker is on the host (train.c ww_mil).
+- **Slots:** phase, ink / ink2, fibre A / B / direction, rv, side, normal, wind4, MIL.
+- **Scope:** training windows only. Validation is neither weighted nor counted. Only the head-slab path (head_slab_pass's
+  statistics pass) is weighted, not the whole-window nn_loss_async path.
+- **Not checkpointed:** the tracker re-warms over 16 windows after a resume.
+- **Log:** with the flag, the step line gains `winw <head> <mean weight> (<windows below 0.1 ref>/<labelled windows> low, ref <nm>)`
+  per head, over the windows since the last line on GPU 0.
+
+Test: tests/test_win_weight (gpu tag). It runs 60 windows with a sliver (4 .. 40 of 2048 voxels) in every 7th and checks:
+- slot -1 gives the same bytes as nn_loss_stats_fin;
+- the logged losses are unchanged;
+- the multiplier equals 1 / active x the host fp64 reference tracker's weight (rel 1e-4);
+- the interval summary, and that nn_win_weight_take resets it.
+
+Status: built on the desk (CPU) only, per the MEGA rules. The test and an A/B (gn spikes against small-nm windows, wind4 / phase
+curves) wait for the mega GPU pass.
+
+## Replay warp and sources-json validation (mini/augment, mini/json; 2026-11-14, branch augfix-20261114)
+
+**Replay warp (augment #1).** A replayed window whose redraw came up without rotation / elastic / zoom drew a fallback rotation of up
+to 5 deg (5 even under --rotate-deg 0), because its label planes sit on the source grid and need the device warp. Every replay was
+therefore rotated (rate 1, not rotate_p). It now gets an identity warp record (R = I, no elastic, scale 1: the pull is the identity).
+test_replay_lean (CPU) passes. **Augment #2** (reflections teach a chirality real scrolls never have) is a recipe question: `--augment 2`
+(rotations only) already exists; the default is unchanged pending a measured ablation (GPU).
+
+**sources json (json #1-#8).** The parser takes JSON numbers only (nan / inf / hex / "01" / ".5" were accepted by strtod, and a number
+at the end of an unterminated buffer could read past it), refuses duplicate keys (first-wins hid the second; objects under 4096 keys)
+and reports the byte offset of a syntax error (sources_load prints line / column instead of "no sources array"). sources_load:
+- `name`, `root`, `ct` are required non-empty strings (a missing root opened the cwd); an empty `sources` array is fatal;
+- the per-source numbers (um, weight, ink_weight, trust_band, iso, papyrus, head, min/max_level, geometry, crush_fine, ct_only) must be
+  finite numbers when present, weight / ink_weight / um >= 0; scope / axis / holdout_file / holdout_mode strings;
+- an unknown target `encoding` is fatal (it read the target as raw bytes); an onfly ink target's encoding / min_level must match it;
+- region origins must be [z, y, x(, size)] numbers, a missing `origins` is fatal; restore `boxes` of the wrong length are fatal; an
+  axis that does not load is fatal; an unknown voxel size is fatal (except sr_pair sources);
+- every key nothing read (json.c tracks json_get per key: typos such as "holdout_fil", "wieght", a target "rekto") is a warning, fatal
+  under `train --strict-sources 1` (sources_set_strict); keys "note" / "comment" / "_*" are free text.
+On the live jsons (scratch1, scratch1-ph80, rv) the check found 16 such keys: the onfly ink targets' "encoding" / "min_level", never
+read on the onfly path; now validated there. test_sources_json (CPU, 18 cases).
+
+## Training-loop audit fixes: the fp16 dead zone, the optimizer step on resume, KL logging, diagnostics (2026-11-14, branch trainfix-20261114)
+
+From the training-loop audit (/vesuvius/ufsm/audit-20261114/train.md).
+
+**The fp16 dead zone (train#1).** The streamed head writes each head's per-voxel logit gradient into fp16 before the upsampling adjoint
+sums it into the fp32 cell gradient. The stored value is `mask weight x residual / (window mask sum x active channels) x gscale x lambda`,
+with gscale fixed at 1024 (halved on overflow, never raised). At P 768 the window holds 4.5e8 voxels, so the values are ~1e-7..1e-6:
+inside fp16's subnormal range (step 6e-8, smallest normal 6.1e-5). Residuals below |s - p| < 3e-8 x nm x active / (mw x 1024 x lambda)
+round to 0, a dead zone rather than noise (the cell sums do not average it out). At 30 % unit-weight supervision that is 0.8 % for the
+phase pair and 3.3 % for wind4 (lambda 0.25). It scales with P^3: x2.4 at P 1024, /3.4 at P 512. CPU simulation of the rounding
+(residuals 60 % |r| ~ 0.03, 40 % ~ 0.25, packed weight 8 on 30 %), share of voxel gradients flushed / cell-sum relative L2 error:
+
+| P | supervised | 2-channel pair | 7-channel group (unfused) |
+|---|---|---|---|
+| 512 | 30 % | 9 % / 0.6 % | 29 % / 2.1 % |
+| 768 | 30 % | 28 % / 2.0 % | 55 % / 5.9 % |
+| 768 | 60 % | 45 % / 3.8 % | 66 % / 11 % |
+| 1024 | 30 % | 49 % / 4.4 % | 70 % / 12.5 % |
+
+audit-net's independent simulation (residuals 60 % N(0, .02), 40 % N(0, .3)) gives the same order: P 768 side pair 19 % zeroed / 2.4 %,
+normal group 53 % / 8 %, P 1024 67 % / 15 %, up to 93 % with lambda 0.25. The finished cell gradients (lat_gfin_k, fp16) are ~64x larger
+but at P 768 still partly subnormal. The fused normal / density path keeps fp32 sums but rounds each value through fp16 to match the
+slow path (nn_lat.cu fuse_grad_v). The fix as the default is the head planes' own power-of-two scale (branch hgscale-20261114, skipair).
+This branch adds:
+- `UFSM_HSG_ZERO=N`: every Nth gradient pass, per GPU, how many supervised voxels' fp16 gradients are 0 or subnormal (phase / side pair,
+  rv, wind4, ink) and how many of the finished cell gradients are subnormal. It runs on the device and costs one sync per counted pass,
+  so the live run can report its own numbers. The trainer's head-slab path has no measurement on real data yet: the pod pass was
+  dropped for the mega test pass, and tests/test_gscale.sh (1) prints the fixture's numbers at gscale 1024 / 65536 / 2^20 there.
+- `--gscale-grow N` / `--gscale-max M` (default 0: fixed): the AMP-style growable scale. It doubles after N steps without a
+  non-finite gradient and halves on one, as before. The scale now rides in the checkpoint (`"trainstate"`), and a resume takes it
+  unless `--gscale` is given.
+
+**The optimizer step on resume (train#5).** With a fixed --accum the optimizer's step count was step / accum. try6's switch from 4 to 5
+at step 1164 moved it back from update 287 to 250 (log), so AdamW's bias correction (beta2 0.999) grew v-hat by 21 % for a few hundred
+updates. Checkpoints now carry `"trainstate":{"accum","anchor","upd","gscale"}` (appended after "gns"). Resumed at the same --accum,
+the update count and the alignment go on unchanged. At another --accum the count continues from the updates done (anchor = the resume
+step; the partial sum is dropped, as under --accum auto), with a notice. An older checkpoint keeps step / accum. test_accum (6).
+
+**KL and the phase angle error in the log (train#7).** A soft-target BCE carries its targets' entropy: 0.386 nats per channel for a
+cos / sin pair over a uniform angle (phase, wind4), ~0.474 for n n^T with isotropic normals (diagonal 0.409, off-diagonal 0.540).
+try6's logged normal bce 0.50 is ~94 % floor (KL ~0.03), phase 0.64 is KL ~0.25, wind4 0.60 is KL ~0.21. The statistics pass now also
+sums mw H(t / 255):
+- loss_stats_k takes an optional entropy pointer (nn_loss_stats_acc_e). The value is free, because the target byte is already loaded.
+- nn_ent_acc covers the fused normal group, an extra read of 8 bytes a voxel.
+- w4_stats_k has a 10th sum, the pair's entropy.
+- nn_pair_angerr is the phase pair's mean |angle error| in degrees, an extra read of 2 logits + 3 bytes a voxel.
+- --split adds the halves' sums (nn_ent_fin).
+
+The step line gains `(kl phase .. rv .. normal .. wind4 .. ink .. fib .. dir ..; phase error .. deg)`, each a mean over the windows
+that carry the head's labels (the bce's windows). test_heads drops the group before its reference comparison.
+
+**Diagnostics for the gn drift (train#2 / #3).** `UFSM_GRAD_LAYERS=N`: every Nth update, GPU 0 logs:
+- per-layer gradient norms of the update's mean gradient before the clip: encoder / decoder convs, down convs, residual blocks, the
+  attention linears t<block>.<0 qkv, 1 out, 2 mlp in, 3 mlp out>, the head, the whole net;
+- the attention linears' weight norms.
+
+It costs one d2h of the gradient, plus one of the weights with attention. This is for localising try6's rise from gn 1.1 to 3 after
+the P 768 / accum 5 switch.
+
+**hs_ds layout (train#10).** The light finalisation's held mask weights moved from hs_ds + 100 (inside the fibre direction's sums,
+84..118) to + 120.
+
+**Weight-decay equilibrium (train#11, note).** Muon with decoupled decay wd 0.01 at lr 0.003 decays by lr x wd = 3e-5 per update, an
+e-folding time of 33k updates. try6's 71000 steps / accum 5 = 14.2k updates, so 3^3 conv weights (Kaiming |W|^2 = 2 Co = 512 at Co 256)
+drift toward the random-walk equilibrium |W|^2 ~ lr min(Co, K) / (2 wd) = 38. By the end of the constant phase that is a ~35 %
+shrink. On GroupNorm-scale-invariant convs the effective rotation per step grows by ~1.5x. That is slow next to try6's drift (~100
+updates); watch it with --opt-stats.
+
+Items handed out (MEGA pass, CPU only, recipe changes behind flags default off):
+- train#3 attention Muon lr multiplier and train#8 the accum A/B script: admuon, attnlr-20261114;
+- train#4 window weighting: perf2, winw-20261114;
+- train#9 replica check and the lat-step jitter seed: gns, dpcheck-20261114;
+- train#6 validation (--val-batches / holdouts per scroll): launch config.
+
+The audit's lower items (branch trainlow-20261114, source only; the final sweep builds it):
+- SIGTERM inside an --accum update: `--stop-at-update 1` (default 0). The first SIGINT / SIGTERM sets a pending flag. The run goes on to
+  the update's last window (at most accum - 1 more window steps, ~1-2 s each at P 768), takes that update, then stops and saves at the
+  boundary; a second signal stops at once. Before: the 1742 checkpoint (accum 5) dropped the 2 accumulated windows and the resume's
+  first update (1745) had 3. With the trainstate anchor (#5) a resume then starts on a fresh update.
+- Echo in one update: `--gns-skip-echo 1` (default 0). An update holding an --echo-max echo (batch use > 0) gives no B_noise pair:
+  the same window twice correlates the small-batch gradients, so |g_small|^2 has less noise than gns.h assumes and B_noise comes out
+  low, which --accum auto reads as a smaller critical batch. The skipped count is on the gns log part. The echo's double weight in the
+  update itself is data echoing by design (a new device-side augmentation) and stays. try6 logged 0 % echo, so it changes nothing
+  there. --echo-max is forced off under --det 1, so A/B arms never echo.
+- Clip 5: the step line now shows " clip N x (gn > 5)" when a log interval clipped. try6's gn ran 1.5-4.3, so 5 never fired. Under
+  Muon the clip only rescales a window's share of the momentum, and the update norm is fixed. It is not a guard against
+  small-label windows; that is --win-weight (train#4). The threshold is unchanged.
+- Rollback replay: no change. A resume reseeds the sampler from seed + 0x9E37..15 x step0 (train.c: "training sample stream
+  reseeded"), so two resumes from one snapshot with the same --seed draw the same windows. The A/Bs (ab_accum, admuon) rely on this.
+  A different --seed gives an independent stream. Two rollbacks with one --seed are one data sample, not two.
+
+## Build and option hygiene: mini audits cmake + opts (2026-11-14, branch cfgfix-20261114)
+
+CMake (mini/cmake.md 1-6): test-prep now reconfigures the sibling release / verify dir with all of this dir's settings every time
+(UFSM_EXTRA_CFLAGS, UFSM_MARCH, the device / host compiler, PTX ISA, ptxas split; before, a dir configured once kept its settings,
+so a sanitizer verify build ran the python tests against an unsanitized build/ufsm). The host half of every .cu unit is built with
+-ffp-contract=off (nvcc -Xcompiler, clang -Xarch_host); measured: 0 vfmadd in the host code of the strict units before and after
+(nvcc's host pass gets no -march, so no FMA ISA), the flag keeps it so. UFSM_MARCH (native by default) and a `portable` preset
+(x86-64-v3) for binaries copied to other hosts. CFLAGS / CXXFLAGS / CUDAFLAGS from the environment are ignored. return-type,
+implicit-function-declaration, incompatible-pointer-types (not the const-discard subgroup: 5 sites), int-conversion, format and
+uninitialized are errors; the build had none (remaining warnings: 31 missing-field-initializers, 7 unused-but-set, 5 const-discard,
+5 unused). The cgroup CPU quota is rounded up (a 0.5-CPU share gave 0 and fell back to 8 jobs).
+
+Options (mini/opts.md 1-9): src/optcheck.{h,c}, linked into every binary. Every strcmp / strncmp of argv against a "--name" (the
+literal, or the name parameter of the ~90 per-file opt helpers, rewritten mechanically: 137 literal + 115 parameter + 3 prefix sites)
+records the name; main() names the --flags a command never looked up when it returns 0 (train also after its setup, as before, now
+after the sampler-only branch's --replay reads). The 512-name cap is gone (hash set). Numeric option values: 1999 atoi / atof /
+atoll(opt(.., "--n", ..)) calls became opt_atoi / opt_atof / opt_atoll, which exit 2 on a value that is not entirely a number
+("--steps 2e4" trained 2 steps; "--window 288x"); empty / absent stay 0; a list value ("--onfly-gpu 0,1") gives its first element, as atoi did (the sweep refused test_phase_onfly's "0,0"; the list's own parser reads the rest). Checked: every literal default parses; every
+literal value given to those flags in scripts/, tests/ and README parses (hits were comments or same-named flags of other commands);
+the three flags that also take a word (predict --window auto, train --accum auto, surf-labels --dir auto) parse the number only
+otherwise. Also: train's fibre buffers used a second --P read with default 64 (128^3 boxes for the default 512^3 windows) and now use
+the run's P; --gn-ema-warm / --gn-ema-mom read via opt(); predict --gpus a,b with --fit-zarr is refused unless --split z (--split 0
+passed before); count-field's zarr note follows the wc value; the --gpu-aug / --gpu-input fallbacks print WARNING. tests/test_optcheck
+(smoke). CPU tier on forlindesk: 100 pass, no option warning in any of the 304 test logs; test_seamless fails there for a missing numpy.
+
+## Head-gradient plane scale: the latent head's loss gradients out of fp16's subnormals (2026-11-14, branch hgscale-20261114)
+
+Audit 2026-11-14 (kernels.md #1 / #2, net.md #1, train.md #1).
+- **The bug:** the head slabs' loss-gradient planes are fp16 at gradient scale x lambda / (mask weight sum x active channels). At P 768 that
+  is ~1e-6 a voxel, which is fp16 subnormal (step 6e-8).
+  - wind4 is the worst: 0.25 x 1024 x 0.5 / N = 128 / N, so 1.3e-6 at N 1e8. Residuals below ~0.02 (N 1e8) to ~0.1 (N 4.5e8) give exactly
+    0, and larger ones keep 2-6 bits.
+  - The BCE heads are 8x better, and the coarse planes (lat_gfin_k) are 64x larger, but still mostly subnormal.
+  - The fine stem's parameter gradient reads the same fp16 slab.
+- **The fix:** one power of two s per window (hgs_choose in train.c), multiplied into the producers' scale (GSH = gradient scale x
+  nn_set_head_gscale, every loss-gradient kernel of nn_loss.cu and the fused latent loss of nn_lat.cu; the MIL fin's scale x s). It is
+  divided out exactly where the planes are consumed:
+  - nn_head_bwd_z: gw / gb are pre-multiplied by s and divided after; gx uses the weights x 1 / s, where c1b_wh_k's power-of-two row scales
+    absorb the shift.
+  - nn_fstem_bwd: the reduction x 1 / s.
+  - Everything downstream (the trunk's gx, every parameter gradient) is at the old scale.
+  - Every step is an exact power-of-two scaling of normal values, so wherever nothing was subnormal the gradients are bit-identical.
+    UFSM_HGSCALE=0 gives s 1, the old path.
+- **How s is chosen:** after the statistics pass, one small readback (the loss scratches' mask sums and active counts, the wind4 N). From
+  them, each producer's worst per-voxel value:
+  - mask weight <= 2 x packed-weight x verso-weight, |residual| <= 1, the positive weight, dice 1.25 / recall 0.25 terms, MIL <= 8 rays a voxel.
+  - s = 2^floor(log2(2^9 / max)), clamped to [1, 2^30].
+  - The coarse planes (the adjoint sums 64 voxels a cell) then stay <= 2^15 < 65504.
+- **Limits:**
+  - s is 1 outside the unwrap2 head-slab gradient pass with 16-bit gradients, and with --pgrad-lambda / --fib-normal-lambda (unbounded
+    here), the --ssl heads and the whole-head --lat path.
+  - One sparse channel (a few hundred supervised voxels) caps s for the whole window; per-channel scales would lift that (later).
+  - A MIL voxel hit by more than 8 rays x the 2^6 headroom could overflow. The non-finite-gradient guard then skips the step.
+- **Tests:** test_hgscale.
+  - wind4 at N 1e8: the s 1 dead zone exists, and s 2^20 loses no gradient and stays within fp16 rounding of fp32.
+  - wind4 at N 1e3: exact x s.
+  - fstem bwd: s planes == s 1 bytes.
+  - nn_head_bwd_z 256 -> 160 (the latent head's path) and 32 -> 16 (fused): gw / gb / MX gx bytes equal.
+  - The zero-gradient fraction before / after from try6's snap (--det, lr 0) and the wind4-acc A/B are perf2's, in the mega test pass.
+
+## Unroll audit fixes #7b, #13-#17: silent failures made loud (2026-11-14, branch unrollfix-wg-20261114)
+
+Items of /vesuvius/ufsm/audit-20261114/unroll.md. All default on. Tests: test_checkpoint_runtime, test_render_absent and test_strip
+pass on the desk CPU. test_scan_norm (its latvol case) and test_predict_guard need a GPU and run in the mega test pass.
+- **#14 checkpoint header**: checkpoint_header_line reads the whole first line up to UFSM_CHECKPOINT_HEADER (128 KB, the loader's cap)
+  and exits 2 without a newline. It used to search the first 64 KB with strstr. scratch2's header is 37 KB with the unwrap / density
+  block at its end, so a larger net would silently have read as unwrap v0 / density_scale 32. predict's density keys now read through it.
+- **#15 scan_norm on a latvol CT**: predict now computes the scan statistics on the rebuilt CT (scan_norm_stats_cached, as the sampler
+  does for a latvol source) and refuses when they cannot be computed. Before, it silently fell back to the per-window z-score.
+- **#16 non-finite values**: predict counts the non-finite values in its fit-field accumulators (planes 0..10) on the device before
+  each finalize (pred_nf_check, no sync; host loop on the --fit-fields path), reports them at the end and exits 1, workers included.
+  NaN used to become undefined bytes in fit_finalize_k. The first version counted the logits at the end of unet_forward_x, sized
+  [cout][D H W]. Under in-place slab inference and head slabs that buffer is smaller or not whole: it read past it, giving illegal
+  accesses and false NaNs in ~13 GPU tests (the mega bisect named 6a9186a). The probability outputs (recto / ink / rv) are not covered.
+  UFSM_TEST_NAN_LOGITS=1 plants one NaN in the accumulators for the test.
+- **#17 --resume identity**: zarr.json attrs carry "run" (checkpoint and axis sha256, level, um, window / halo (z), q, shard, full_grid,
+  ema, channel, gn_stats, the resolved norm, tta, grid origin, input gain / bias). A resume over a non-empty done list must match it, else
+  exit 2 with the store untouched; a store without the record (older binary) is refused too. --box is left out (full-grid stores are
+  filled box by box). Hashing the checkpoint costs ~0.2 s per predict.
+- **#13 absent shards in render**: render_absent_count counts the surface vertices whose sample falls in a shard missing from the
+  store (or outside the array), per volume. The renderer prints it ("volume 0: N of M surface vertices (x %) in K absent shards (read
+  as 0: no ink there)"). It counts vertices, not CT papyrus samples: the surface is the sheet.
+- **#7b strip-flatten / mosaic**: a full-size chunk (2S+1 columns, >= 3 valid vertices) without a mesh fails the run. Narrow edge
+  chunks (1299's last one, 11 columns) are counted. The raster counts the flipped triangles it leaves out and the pixels only they would
+  cover (flatten.txt "failures:", flat.json nomesh_chunks / raster_flipped_tris / flip_hole_px). strip-mosaic marks --fill-maps pixels
+  with flag >= 100 (grid-bridged, inpainted 250) as filled: hatched in the stripe JPEGs, cells tinted magenta by their filled share in
+  the overview / long strip, the share in filled.tsv.
+  An interior fold leaves no hole. The signed cover of a vertex star stays 1, so unflipped triangles always cover the flipped ones;
+  the test had to move the strip's end off the sheet to get one (282 flipped triangles, 1970 px). So blend folds such as 1299's mostly
+  give mirrored, overlapping texture, not grid-filled holes, and the flip and fold maps of strip-distort are the measure for them.
+- **1299 flatten energy 5904** (1667: 476, P4: 5.4). The frame is not the cause: P4's frame is worse (aniso p95 3.3 vs 2.7). Every
+  per-chunk SLIM has 0 flips. The blend's 275k flips (0.126 % of the area; 1667 0.015-0.02 %, P4 0.006 %) sit in two bands of
+  segments.tsv: segments 81-88 (wraps 100-107, u 313-339 cm, ~165k) and 101-102 (wraps 82-85, ~30k). There the chunk SLIM itself stays
+  anisotropic (after aniso p95 1.2-1.8 vs ~1.05 elsewhere), so the surface does not develop and neighbouring chunks disagree.
+  The energy is a mean of a 1/s^2 term, so a few near-degenerate triangles probably dominate it (not checked per triangle). Gate on
+  the flipped area and p99 aniso, not on the energy.
+
+## Data-parallel gradient audit fixes (2026-11-14, branch dpgfix-20261114; audit targeted/dpgrad.md)
+- The math of an update was verified correct (per-window weight 1 / (ng x accepted steps), fp32, clip after reduce + accum). Muon / AdamW steps are
+  batch-independent, so lr per window fell x0.8 at the P 512 / accum 4 -> P 768 / accum 5 switch (8 -> 10 windows per update); nothing to fix there.
+- Units: --steps, --warmup and the schedule count STEPS (nl windows each under DP), not windows: the startup lines now say so and print the warmup / run in
+  updates and windows (live: warmup 200 steps = 40 updates). New `--warmup-updates N` (warmup = N x accum steps at the starting accum; default off).
+- Optimizer step count: `ostep = upd_base + upd_cnt + 1` with upd_cnt the updates actually applied since the anchor (was the step position: a skipped
+  boundary step ran Adam's bias correction / the EMA warm-up one update ahead; identical when nothing is skipped; a resume starts upd_cnt at
+  (step0 - anchor) / accum, the old value).
+- Log: `gn_step` (mean of the per-step norms) and `gn_upd` (mean of the update norms) beside `gn` (their mix, kept for parsers).
+- `--gns-groups 1` (default with --gns and --accum): B_noise per layer group (U-Net block, attention block, head, rest; `unet_grad_groups`), the same
+  two batch sizes; a `gns groups` line per log with the median / max over the conv + attention groups. Muon normalises each matrix, so the median
+  conv-group value, not the head-dominated whole, is the number for batch decisions (audit: bulk 30 vs whole 2.4 in a two-group simulation). The group
+  EMAs are not checkpointed (they refill in ~100 updates). Cost: ~20 small norm reductions per step. Not run on a GPU here (no GPU rule): first use on
+  the next run; check that the whole-vector value lies between the groups'.
+
+## Scroll PE / attention audit fixes (2026-11-14, branch attnfix-20261114)
+From /vesuvius/ufsm/audit-20261114/targeted/attn.md. On by default: `predict` refuses a scroll-axis checkpoint without `--axis` (`UFSM_PRED_NO_AXIS_OK=1` overrides, with a warning)
+and refuses `--cond-sweep` with one (it never set the axis); an axis record whose plane count does not fit the bottleneck grid aborts instead of being dropped; training warns
+loudly (first and every 1000th time) when samples of an attn_pe 3 net carry no axis (they get grid-index positions). Flags, default off (change the positions / logits, so a net
+must be trained or evaluated with them): `UFSM_SCROLL_PE_V2=1` (one reference angle and radius per sample for all planes: no inside/outside angle-origin jump, no per-plane rc x theta
+offset; the seam for an axis inside the window remains, a scalar angle cannot avoid it), `--attn-lscale N0` / `UFSM_ATTN_LSCALE=N0` (logits x max(1, ln S / ln N0), fp16 core only;
+N0 = 216 at P 768). Measure with scripts/eval/attn_window_compare.sh (window 768 vs 1152 vs 1152 + lscale, GPU window). Not run: no GPU; only the build was checked.
+
+## Sampler balance: snap jitter, edge boost, zboost, rejection-aware draws, loss cap, packed focus (2026-11-14, branch sampbias-20261114)
+
+From the targeted sampler audit (/vesuvius/ufsm/audit-20261114/targeted/sampler.md; chunk maps read from the shard indices). All options default off, one flag each:
+- `--stick-src N`: a rejected draw (probe, min_fg, empty) is retried from the SAME source, up to N times in a row. Before, 1299-b3 kept 0.65 and 0139-u2ink 0.54 of their weight (rejection 26 / 43 %).
+- `--snap-jitter 1`: after the chunk snap each axis moves one chunk up with p 0.5. The floor put the drawn cell at index 3 of 0-5: coverage of a labelled region's low-z edge 0.68, high-z edge 0.48; with jitter 0.61 / 0.56.
+- `--edge-boost 1`: cells of the phase-occupancy index repeated clamp(round(1 / labelled share of the window box), 1, 4) times (box = P >> (cell level - lowest level) cells). Replay over the june chunk map (coverage per labelled chunk, interior 1.0 before): radius 6-12 0.99 -> 0.87, 18-22 0.83 -> 0.84, 22-26 (outermost turns) 0.69 -> 0.77, z edges 0.68 / 0.48 -> 0.71 / 0.78 (with jitter). The mean repeat is 1.15.
+- source json `"zboost": {"below": N, "k": K}`: cells with z index < N (cells of the occupancy grid, the log's "level L cells") drawn K times as often. For Paris 4: the lower third (hull rows 5-51 at 9.6 um) has winding labels only in july48 (codesB48 rows 46-103 of its 4.8 um grid = 9.6 um rows 23-51; rows 5-22 have none anywhere; june / july / june48 start at row 52 / 52 / 54, ink segments at 57). `"zboost": {"below": 104, "k": 4}` on july48 takes the lower share of its draws from 23.7 % to 55 %: at weight .031 that is 0.8 % -> 1.7 % of all draws, at .06 3.3 % (vs 34 % of the hull volume).
+- `--vox-cap K`: the geometry heads' loss (phase, normal, density, wind4, rv) of a source is scaled by min(1, K x its mean known-phase share / the weight-averaged mean share), measured per source on every kept window (1 / 61 of the side plane; 1 until 8 windows). The loss is a per-window mean, so 0500P2-gt (0.056 known) weighed x8.3 per voxel against june. K 2 gives it x0.25.
+- `--focus-w W`: overrides the "focus" w of every source that has a packed map (`ufsm phase-packing --map`), off at 0. No live source has a map yet.
+- Not done: the zero-CT share of drawn windows (11-13 %) is a property of 6 / 12-cell windows centred on labelled cells; edge-boost is the only correction (windows near the hull rim are drawn more, not fewer).
+- test_sampbias: index repeats, zboost, the scale factor, and a sampler with all options on.
+
+## Unroll geometry error budget: masked-CT gate, cf-demod (z drift, demod-only ref), GT boxes in the check stage (2026-11-14, branch ugeomfix-20261114)
+
+Audit `/vesuvius/ufsm/audit-20261114/ugeom.md` (1667 vs the published tifxyz, held-out GT boxes on 1667 / Paris 4). Its numbers, and what changed:
+- **Masked CT** (#1): 16.2 % of the published 1667 surface lies on zero CT of the fields' `-masked` store (cov50 there 0.19 vs 0.899),
+  13.1 of the 21.5 missing cov50 points; 80 % of it within 1 mm of the mask edge. `wrap-snap` already counted our vertices on masked CT
+  (1667-u1 0.182, w96 0.205, 1299 0.070, P4 0.057); now `--masked-warn 0.02` prints a WARNING above it and `--masked-max F` (off)
+  fails with exit 3 before writing; `unroll.sh` MASKMAX passes `--masked-max` (the progress.log alarm is geoouter-20261114's `wraps --fields` no-data line). The data fix (a
+  filled 1667 store) is pub1667's; `scripts/spiralqa/ugeom/after_mega.sh filled` measures it.
+- **Where the integers go wrong** (#2): `fit --model X --codes --cpu` on the 70 held-out 1667 C boxes (`scripts/spiralqa/ugeom/gtboxes.sh`).
+  Voxel-weighted over the 54 boxes without label noise:
+
+  | model | ids right | \|err\| < 0.08 | \|err\| median |
+  |---|---|---|---|
+  | ref-cf (count-field) | 0.840 | 0.214 | 0.170 |
+  | joined (slab fits + join) | 0.835 | 0.306 | 0.116 |
+  | cf-demod --L 16 --R 1 (ref + the phase's sub-turn) | 0.807 | 0.263 | 0.131 |
+  | cf-demod --L 8 --R 1 | 0.801 | 0.288 | 0.118 |
+  | cf-demod --L 8 --R 1 --cmax 0.3 | 0.827 | 0.225 | 0.162 |
+
+  The slabs change no integers net (0.840 -> 0.835) and give the sub-turn. The demod-only ref (`ufsm cf-demod --out`, 6 min CPU on 1667
+  vs 658 s of slab fits) reaches the slabs' sub-turn only by flipping ~3.4 % of the integers (the phase half a turn off the ref rounds
+  either way); clamped it keeps the integers and loses most of the sub-turn. So the slabs stay; `unroll.sh DEMOD=1` (DEMODR, DEMODL 8)
+  is an opt-in path, off. Paris 4 (PH1-3): ref 0.185 / 0.208 / 0.122 vs joined 0.184 / 0.197 / 0.125.
+- **z drift** (#5): P4's per-band integer gauge against the GT drifts 0 -> 3 turns over ~5 cm of height while wrap-check (0.976) and the
+  join (0.964) pass. `ufsm cf-demod MODEL FIELDS` prints, per z band, the confidence-weighted residual phasor of phi - W and the mean
+  derivative of W along the sheet's vertical tangent (n from the fields) summed along z; the excursion over the bands holding >= 1/4 of
+  the fullest band's weight is the drift. ref-cf: P4 2.06 turns, 1667 0.40 (step 8 / 2, bands of 128 rows; 6 min CPU each). The
+  residual phasor's band coherence is 0.01-0.5 and does not separate them. The along-sheet number ranks the two runs as the GT does but
+  its bands do not line up with the GT's gauge steps: an alarm, not a locator. `unroll.sh` check runs it on the ref (DRIFT=1), ALARM
+  above DRIFTWARN 0.75, DRIFTMAX fails; with GTBOXES + GTCODES it also scores joined / ref-cf on GT boxes (the only check that sees
+  identity). The packed-region count-field variants (`--rho-pow`, `--rho-scale`, `--phase-w`) on the P4 boxes: `after_mega.sh packed`.
+- **Diagnostics**: count-field's closing error is real, not a unit slip (0.003 turns on test_countfield's synthetic spiral; 1.2-3.1
+  turns mean on the four runs, uncorrelated with GT quality); "phase / W agreement" now says n/a under `--R 0` (it printed 0.000); the
+  join's ref-share and overlap agreement are labelled self-consistency. Slab coherence vs published identity: Spearman 0.07.
+- Tests: test_countfield (cf-demod: a 0.3-turn sub-turn error restored to 0.000 with 0 integer changes, also on a 2x refined lattice;
+  a W rising 0.1 turn per voxel of height trips `--drift-max`), test_wrapsnap (`--masked-max` 0.01 fails with nothing written, 0.2
+  passes). Analysis scripts: `scripts/spiralqa/ugeom/` (surfcmp.py by pub1667, pubcmp.sh, budget / bins tables, gtboxes.sh).
+
+## Derived-cache keys carry the label code's version (2026-11-14, branch dckey-20261114)
+
+The dcache audit (/vesuvius/ufsm/audit-20261114/targeted/dcache.md) found every disk cache of labels keyed by its inputs only: a fix to
+the pair rule / pooling / stamping code was served stale from cells computed by the old code ("phase-onfly-pair-v1" never changed since
+11-11, 20+ value-relevant commits since). Now:
+- `src/label_versions.h`: LBL_PHASE_PAIR, LBL_CODES_POOL, LBL_MESHCODES_LOAD / _STAMP, LBL_INKFLY, LBL_UDC_CODEC (all bumped today, so
+  try7 reads no cell of before: 2 / 2 / 2 / 2 / 3 / 1). The phase key is `phase-onfly-pair-v<LBL_PHASE_PAIR> ...`, stored codes add
+  `pool-v<LBL_CODES_POOL>`, mesh codes `stamp-v<..> pool-v<..>`, the ink key `inkfly <LBL_INKFLY>`, lossy cells `udc-v<..>` and the
+  UDC2 header's byte 10 (another version: a miss).
+- Stored codes are keyed by every file of the array too (count, bytes, newest mtime in ns): zarr.json is written when a raster starts,
+  so a chunk-only rewrite / resumed raster / mtime-keeping rsync kept the old key (audit #3). ~8 k files: tens of ms per source open.
+- A truncated key (path > ~1 kB) now means no cache instead of a prefix collision.
+- `test_label_versions` (CPU, fast tier): FNV-1a digests of the CPU pair rule (rmax 8) and of the pair rule over 2x-pooled codes on a
+  synthetic 160^3 spiral, recorded per version. A value change without a bump fails the suite with the digest to record; the device
+  paths are byte-identical to the CPU (test_phase_onfly), so this covers them.
+- The ink key stats every file of its label rasters and the CT group's zarr.json (#5, data.md lower-b).
+- HTTP chunk cache (pods, #4): the array's zarr.json validators (ETag, Last-Modified, length) in <cache>/<key>/.validators; a change
+  moves that array's cached indexes / chunks / markers aside (<key>.stale-<t>-<pid>); "missing" shard markers are re-checked after
+  UFSM_CACHE_MISSING_TTL_S (600 s). A shard re-upload that leaves zarr.json untouched is still not seen (no per-shard validation).
+- zshm (#7): every key XORs ZSHM_DECODER_REV + the volcomp version, so a decoder fix misses the surviving /dev/shm file.
+- The meshcodes pack key (mesh dir, ns mtimes, LBL_MESHCODES_LOAD, magic UFMC0002) is on datafix-20261114 (audit-data).
+Old key dirs are never read again; the cap's LRU evicts them. try7: start on an empty UFSM_DERIVED_CACHE anyway (merger2's checklist).
+
+## Per-scroll holdouts for every label type, validation only inside them (2026-11-14, branch datafix-20261114)
+
+The user reversed "no holdouts" (11-12) on 11-14: every labelled scroll keeps ~8-10 % of its labels out of training, for every label
+type, and validation / scoring read only those boxes. Files: `/vesuvius/ufsm/univ/scratch1/holdouts-20261114.json` (118 boxes; copy and
+selector in `scripts/holdouts/`), `/vesuvius/ufsm/univ/scratch1/sources-scratch1-ph80-ho.json` (ph80 with `holdout_file` + `holdout_mode
+mask` on every source, `holdout_strict` 1, PHerc1218-b3 at weight 0, the re-rastered codes sets).
+
+**Boxes.** The existing definitions first: wbench (Paris 4 PH1-3 + HOLD, 1667 C1-C24, 0139 / 0814 / 0500P2 at 9.362 um and their xres
+maps into the 2.2-2.4 um scans), the 16 Paris 4 + 8 0139 / 1667 ink eval crops, 0841 / 0500P2 ink eval-ho crops, fibre 1447-HOLD. Then,
+per scan where a source stayed under ~8 %, one full-yx z slab chosen from `ufsm holdout-cover` (new: each source's draw cells inside the
+boxes, per box, and the uncovered labels per 256 z rows) so each source on that scan lands nearest 8-12 % (>= 4096 rows on 2.4 um scans,
+>= 2048 on 8-9 um: a P 512 validation window fits at 19.2 / 17.3 um). Trimmed: 0841 ink (the six eval crops held 49 %: the two smallest
+kept, 11 %), 1299's bottom-third band (26 %: replaced by a 4096-row slab). Second scans of one scroll: 0139 9.362 / 2.399 one joint slab
+through the xres affine (z nearly axis aligned, cz = 0.257 fz + 623, 300-row margin for the x / y tilt); the 2.399 / 2.215 um ink crops
+of 0139 / 0500P2 mapped back to the 9.362 um scans (`ufsm reg map --f2c --box`). **0009B has no registration** between 8.64 and 2.401 um:
+each scan has its own slab (z 7168 + 2048 of 9600; z 19456 + 4096 of 29120, similar fractions of the scan) - a cross-scan leak is
+possible there until a 0009B xres map exists. Its two boxes are therefore `"score": 0` (main 11-14): masked from training on both scans, but never a
+validation box (patch_bounds skips them) and skipped by the scoring tools' `--holdouts` and wbench's BOXES=holdout, so no reported number
+rests on them.
+
+Held-out share of each source's draw cells (holdout-cover; cells of 32^3 .. 512^3 level-0 voxels, so an upper bound on the label voxels):
+
+| source | held | source | held | source | held |
+|---|---|---|---|---|---|
+| Paris4-june / -july | 0.082 / 0.134 | Paris4-june48 / -july48 | 0.077 / 0.113 | Paris4-u2ink / -fib / -spiral / -hf | 0.160 / 0.081 / 0.095 / 0.080 |
+| 1667-gt / A48 / B48 | 0.081 / 0.088 / 0.087 | 1667-u2ink | 0.139 | 0139-gt / -good | 0.092 / 0.133 |
+| 0139-u2ink / -hf | 0.115 / 0.174 | 0500P2-gt / -u2ink | 0.247 / 0.360 | 0172-gt | 0.084 |
+| 1218-b3 / 1299-b3 | 0.084 / 0.080 | 0009B-good / -u2ink | 0.102 / 0.110 | 0175A-good / -fib | 0.090 / 0.099 |
+| 0814 / MAN5 / 0841 u2ink | 0.110 / 0.089 / 0.112 | 1447 / 0125 fib | 0.086 / 0.092 | 1451 / 0332 hf | 0.084 / 0.082 |
+
+(0500P2 stays high: its sets are tiny and the wbench + eval crops are kept whole on both scans.)
+
+**Mechanism fixes (eval audit #2 / #7).** Validation drew box 0 only: it now picks a box uniformly among those a window fits at the
+level. `same_ct` compared store root + key, so a local copy and the http mirror of one scan never masked each other: now the CT basename
++ um. A malformed box was skipped silently: now an error, and a box outside the CT extent is fatal at the first CT open. A
+`holdout_file` with no box of the source's CT prints a warning (fatal under `holdout_strict`); an onfly ink target's own `holdout_file`
+held out only the ink: lifted to the source. The onfly ink derived array blanked the boxes (no ink labels to validate on): the boxes now
+only drop draw cells, the ink inside stays and the sampler's mask hides it from training. Validation averages divide by the windows
+holding each label; "val by source" / "val by scroll" lines; validation with no boxes is fatal unless `--val-train-ok 1`.
+
+**Leak check.** `UFSM_HOLD_AUDIT=1` in sampler-only mode counts, per training window, the known label voxels (phase, w4, ink, aux,
+papyrus, loss mask, packed mask, ink bits; source grid) inside the boxes of its CT without the guard. On the -ho json's winding sources (CPU paths, the scratch2 recipe at P 256):
+100 training windows, 20 overlapping held-out boxes (136.6 M voxels inside the boxes), **0 known label voxels inside**; the smoke runs
+of both ink subsets (5 windows each, 3 overlapping) also 0. The planned 4500-window run was OOM-killed three times by the saturated
+ufsm-dev slice (other jobs at 40 / 40 GB), so the larger count is still open: `/vesuvius/ufsm/datafix-20261114/ho/leak.sh`
+(N / NI / MEM env) reruns it, and the flag is in the binary for a dry start (UFSM_SAMPLER_ONLY=N UFSM_HOLD_AUDIT=1). test_sampler_safety
+covers the parsing / box-draw side (every box drawn by validation, malformed boxes refused, holdout_strict).
+
+**Scoring, holdout only.** `ink-vscore` / `ink-score --holdouts H --ct KEY` (the voxels / the label pixels whose surface point lies in a
+box), `wbench.sh BOXES=holdout HOLDOUTS=H` (45 boxes). There is no `surfcmp` tool in the tree.
+
+**PHerc1218-b3 (weight 0 in -ho): why its labels are not learned.** Direction is ruled out (outward 1.000). No offset: on a
+128 x 512 x 512 crop at z 10240 the label band's papyrus share (CT >= 64) is 0.854 unshifted and 0.856 at the best of every shift up to
++-4 z / +-6 y, x. Packing is 1299's (median band-to-band 14 vs 13.5 voxels), the CT contrast across the band is comparable. What differs
+is the gate: 1218's weight array is 255 on 97 % of the labelled voxels (1299's gate keeps 71 %, median 128), and the fibre judge rates
+1218's labels 3-5x worse than Paris 4's (section "Fibre gate of our spiral labels"), whose gate was never applied pending its 1447 /
+0175A control (GPU). Most likely ungated label noise; the fix is that gate, not a weight.
+
+**Predict window alignment (data #9).** Training windows are snapped to the CT's 128 chunk grid; predict windows start at box + k stride
+- halo. `predict --align 128` (default off) anchors the window grid at the halo (--grid-origin = halo), so every origin lies on the
+128 grid when the stride is a multiple of 128 (checked; not with --seam-inproc). The A/B is a post-pass GPU job:
+`scripts/predict/align_ab.sh CKPT ROOT CT UM BOX OUT` (a box origin off the grid, e.g. +64) prints mean |diff|, the > 8 / > 32 shares
+and the correlation overall, near window edges and in interiors. Rule: mean |diff| < 1 and > 32 under 0.1 % keeps the default,
+else --align 128 becomes the default.
+
+**Data audit "lower" items (11-14, main: no deferrals).** Fibre positives in air: a fibre's own plane is unknown (255), not 254,
+where CT < `pos_iso` (default the source iso / 64; the iso -1 sources had no air test at all; CPU raster, the GPU kernel and
+`fiber-raster --pos-iso` alike). The radial input under warps is transported as a normal (A^T, R, 1 - e') instead of a tangent
+(A^-1, R, 1 / (1 - e')), CPU and device in the same float order. `--edge-spread 1` (off): face-clamped occupancy draws spread over the
+windows holding the drawn voxel. `--empty-keep` / `--min-fg` are now train flags (defaults 0.2 / 0.3 unchanged). The phase-weight skip,
+the scanner air op and the shift-1 grid went to hostmem (sampfix-20261114); band_window / sideface follow here (9a3ea4a).
+
+**try6 contamination.** try6 (scratch2, from step 0 on 11-14) trained on every one of these boxes for ~2000 steps with no masking, and
+every eval set was in its data (eval audit). Validation numbers on these boxes are clean only for a run started from scratch on the -ho
+json (try7). Restart flags: `--val-batches 32` (or more), `--val-P 384` (<= the smallest box edge at the window's level: 512 cells
+at 19.2 um = 4096 level-0 rows on 2.4 um scans), `--holdout-guard 32` (level-l cells of label mask around each box, 614 um at 19.2 um; the net's
+receptive field, 439 cells, cannot be a guard: on a 2048-row box at level 3 it would mask ~30x the box), sources `/vesuvius/ufsm/univ/scratch1/sources-scratch1-ph80-ho.json`.
+
+## Data / label fixes from the 2026-11-14 audit: outward check, codes grid, ink pooling, stored 19.2 phase, warp fill (2026-11-14, branch datafix-20261114)
+
+The read-only audit of the sampler / label path (/vesuvius/ufsm/audit-20261114/data.md) ranked ten findings; main took #1 (PHerc1218-b3's
+weight) and #3 (a 1667 holdout) as decisions. Implemented here, one commit each, with their label diffs:
+
+**Per-source losses and the outward check (#2).** The `--mix-every` lines gain "head bce by source" (phase / wind4 / normal per source,
+beside the rv line) and "phase outward by source": `sample_phase_outward` samples every 8th voxel of each drawn window's phase as trained
+(after `phase_sign`), takes its circular gradient where it is radially aligned with the unjittered axis (|cos| >= 0.7) and counts it
+rising outward or inward; below `--outward-warn` (0.9) with >= 2000 samples a WARNING names the source. The pair rule makes phase rise from
+the lower winding to the higher, so an inward-numbered GT set would reverse phase, rv, normals and wind4 silently, and no codes store
+records its direction. Sampler-only on the 15 live winding sources (P 256, 83 windows): every source rises outward, 0.977 (1667-B48),
+0.986 / 0.988 (1667-A48 / -gt), 0.988 (0172-gt), 0.996 (0139-gt), 0.999-1.000 the rest, **1218-b3 1.000**: its rv at chance (0.66-0.67
+over steps 1001-1500) is not a direction problem.
+
+**Codes rasters on the CT's grid (#4).** `ufsm raster` and the on-the-fly mesh codes (CPU and GPU stamp) put level-0 x into level-l voxel
+floor(x 2^-l + 1/2): voxel j centred on level-0 2^l j, while the CT pyramid (`pool2_mean`), ink and fibre rasters centre it on its block,
+2^l j + (2^l - 1) / 2. Codes sat 0.25 (level 1) / 0.375 (level 2) voxel off the CT, the sign flipped by the symmetry augmentation (a blur).
+Now floor(x 2^-l + 2^-l / 2); level 0 unchanged; meshcodes cache ids v2 at level > 0; raster attrs say `"grid": "block-centre"`.
+`test_codes_grid`: planes at x = 40..47, levels 0..3, land in column x >> l (12 of 32 cases off by one before). On the 1667 GT meshes
+vs the stored codesA (6 windows of 192^3 at level 1) the old binary is byte-identical, the new one differs in 497 k of 1.19 M coded
+voxels (thin sheets moving one voxel half the time). **Not yet re-rastered** (a label change mid-run): gtjuly codesA 9.6 (Paris4-june),
+p4full phaseB (Paris4-july), PHerc1667-wind-20261016 codesA / codesB 4.798 (1667-gt / A48 / B48), b1-paris4 codesA48 and
+univ/b1/gt/paris4 codesB48 (june48 / july48). Level-0 sets (0139-gt, 0500P2-gt, 0172-gt, the -good sets) are unaffected; 1218 / 1299
+come from surf-labels, whose wrap-to-grid scale has its own rule.
+
+**Ink at 9.6 um as the known mean (#5).** `inkfly_open_pooled` took the known max of each 2^3 block (any inked child inked the coarse
+voxel). Now `ink_pool8`, the rounded mean of the known children. Sampler-only `--det 1` at the 9.6 rung: ink voxels 0.00206 -> 0.00204
+(0139, same windows), 0.00332 -> 0.00314 (Paris 4): 1-5 % fewer, smaller than the audit's estimate because the face labels are a 7-voxel
+band at level 1, so only the band's edges grew; partial blocks are now soft targets.
+
+**Paris4-july's 19.2 um phase stored (#6).** Its 19.2 windows pooled the 9.6 um phaseB per read (8x the voxels decoded, an atan2 per
+coarse voxel, no cache). `source_phase_at` now reads a stored coarser level from the phase's group when present; phaseB/19.2 was written
+by `ufsm downsample --mode phase` (12 GB, 55 min). `test_phase_pool --compare` on 6 boxes of 384^3: 0.02 % of the known voxels known in
+one only, 4.1 % of the rest 1 code apart (double vs float sums), none more; read 0.90 s vs 15.34 s (17x). Sampler-only on Paris4-july alone at the 19.2 rung (P 256, CPU): the phase read stage 2218 -> 244 ms
+per window, 48 -> 147 Mvox/s; at P 768 the view's cost scales 27x.
+
+**Warp fill (#7).** Voxels a rotation pulls from outside the source cube were 0 after z-scoring (the window's mean density, fake material);
+now `warp_fill`, the z-scored raw 0 (air, as a masked scan's outside and predict's past-the-volume voxels), jittered like any voxel, on the
+host writers and the device (`aug_write_k`) alike. At `--rotate-deg 5`, P 768: 4.5 % of a rotated window's voxels (p90 6.1 %, max 7.3 %),
+~0.9 % of all input voxels at `--rotate-p 0.2`; every echo replay is rotated.
+
+**Rung shift (#8): a design choice, now visible.** `--rung-shift-p` moves the drawn rung to a list neighbour and nothing later depends on the
+original rung, so it is purely a reweighting: 1:2:1 at p 0.3 draws 28.75 / 42.5 / 28.75 % for a source reaching all three, 61.7 / 38.3 %
+(not 66.7 / 33.3) for one reaching 9.6 / 19.2. Unchanged; the sampler's start-up line prints the effective mix over the weighted sources.
+
+**Side finding.** The mesh-codes pack key (meshcodes.c `mc_key`) is the mesh names, sizes and mtimes, not the directory: two mesh dirs
+with same-named, same-sized meshes written in the same second share one pack under a common `UFSM_MESHCODES_CACHE` (seen in
+test_codes_grid with identical names; real sets have unique timestamped names).
+
+## Packed-sheet label targets: unit-step gradient, sheet-voxel weight, physical density code (2026-11-14, branch phaselab-20261114)
+
+Audit (/vesuvius/ufsm/audit-20261114/targeted/phaselab.md) of the on-the-fly winding labels. The normal / density / packed-weight targets
+are derived on the GPU from the phase codes (`nn_elem.cu` unwrap_tg_k), not from any spacing estimate, so phase defects feed them.
+- **Stencil aliasing (fixed).** The gradient was one wrapped difference of the two end voxels over +-s: valid only while the phase moves
+  < 0.5 turn over 2 s voxels (sp >= 4 s; live s = 1: sp >= 4). At the 19.2 um rung every sheet under 77 um is below that, and
+  `--packed-weight 8` sits at <= 60 um (3 voxels): the density target fell as packing tightened (rho x sp = 1.0 / 0.5 / 0.2 / 0 at sp 4 / 3 /
+  2.5 / 2), tilted sheets got wrong normals, and the weight was computed from the aliased rho. `src/phase_grad.h` `pg_grad` sums the 2 s
+  wrapped UNIT steps (alias-free down to sp 2; a step over 120 codes is unresolved: masked). Bit-identical to the old stencil where that
+  was valid. Used by `phase_grad` (targets, packed mask). tests/test_phaselab.c, simulated flat sheets (stamped like meshcodes.c, pair
+  rule on the CPU), median rho x sp and share of gradients off by > 25 %: axis sheets sp 3: 0.50 / 1.00 -> 1.00 / 0.00; sp 2.5: 0.42 -> 0.83
+  (half masked); sheet (0.1, 0.2, 1) sp 3: 0.51 / 0.83 -> 1.01 / 0.00 with |cos| to the true normal 0.92 -> 0.98; (0, 1, 1) sp 2.5: share
+  wrong 0.99 -> 0.45. sp >= 6 unchanged (asserted). Below sp 3 the labels stay poor: the phase noise (below) flips unit steps.
+- **Sheet-voxel phase (`--sheet-mask LO,HI`, new, off by default; on in scripts/v2/train-common.sh as 3,8).** The pair rule writes phase 0 on
+  every stamped voxel, which lies up to 0.87 voxel off its mesh: phase error rms 0.13-0.19 turn at sp 2-3, 0.10 at 4, 0.06 at 6, 0.04 at 10
+  (oblique), on 33-65 % of the voxels at sp 2-3. A true sub-voxel offset would need the stamp to carry it (a byte per voxel has no room), so the
+  phase loss weight of phase-0 voxels is scaled instead: 0 at a local spacing (`pg_rate`: the largest |step| to a non-sheet known neighbour; none
+  known = dense) <= LO voxels, 1 at >= HI. Test: mean weight 0.00 at sp <= 3, 0.2 at 4, 0.2-0.6 at 6, 0.75-0.94 at 10; the weighted error
+  of the labelled voxels stays at the plain value where kept.
+- **Density** `--density-packed 0` now in train-common.sh (the packed weight on the density channel pulled ambiguous gap voxels toward the
+  packed value: a 50 / 50 mix of (w 8, d .6) and (w 1, d .3) trains .567 instead of .45, x +60 %). `--density-um U` (new, off): physical code x =
+  density_scale x rho x U / (window um); the header gets `density_um` only when set and `predict --fit-fields` divides it out, so the fit sets
+  stay in turns per voxel of the predicted level. Not enabled: a net trained on the per-voxel code reads wrong with it.
+- **Not done / negative.** (#3) Tightening the pair rule's accept test (cos <= -0.5 -> -0.8 / -0.9) on clean flat sheets leaves the gap-phase
+  rms unchanged (0.04 at sp 4) and cuts the known share from 0.90 to 0.64 / 0.60 ((0, 1, 1)) and the full-stencil share to 0: the rejected voxels
+  are raster staircases, not lateral features, so the constant stays. A real fix for the wedge / touching-sheet errors (0.17-0.24 turn) needs
+  conflict dilation, which also changes the byte-identical GPU twin (nn_band.cu, test_band_pair): not attempted without a GPU. (#4) orientation
+  bias of the 7-voxel stencil is a property of the pair rule's holes; unchanged. Density centre-to-centre bias (+3..6 %) unchanged.
+- No stored label byte changes (phase codes are produced by the unchanged pair rule; targets are derived per batch), so no cache key bump.
+
+## Replica weight check, lat-step jitter seeding (2026-11-14, branch dpcheck-20261114; audit train#9, train#11)
+
+train#9. Data-parallel replicas apply the same averaged gradient, but Muon's per-matrix |X|^2 is a double atomicAdd in block order
+(nn_opt.cu), so their weights drift apart at ~1 ulp per update. Optimizer state is elementwise on identical inputs, so the drift is a
+bounded random walk, but nothing watched it, and only GPU 0 is checkpointed. `--replica-check N` (default 1000 steps, 0 off; data parallel
+without --split only) compares every GPU's fp32 weights (u->p) with GPU 0's, bit for bit, in 16 MB host chunks. A device sum / sumsq
+was considered and rejected: its own reduction order would flag identical weights, and it can't give the max difference. Cost: 2 x 4 B per
+weight over PCIe per check, ~0.1 s per 1000 steps on the 92 M net, one sync per check. The line gives the weights that differ, max |dw|,
+and |dw| / |w|. It is a warning above 1e-6 relative (more than ulp drift), else tagged "ulp drift". `--replica-sync 1` (default off) then
+copies GPU 0's weights and EMA to the others and clears the fp4 weight memo. test_univ2.sh: --replica-check 3 --replica-sync 1 on the
+2-GPU run (lines at steps 3 and 6, no drift warning).
+
+train#11. --lat-step-jitter's xorshift started from a constant at every process start, so a restart replayed the run's first jitter
+draws. Its first state is now 0x7f4a7c159e3779b9 ^ (seed + 0x9E3779B97F4A7C15 x step0), as the sampler's seed. With seed 0 and step 0 it
+is the old stream. The per-GPU term (GIDX) and the one-draw-per-window rule for split halves are unchanged.
+
+## Unroll output quality vs the published 1667 unwrap; render / ink fixes (2026-11-14, branch urenderfix-20261114)
+
+Audit `/vesuvius/ufsm/audit-20261114/urender.md` (images in `urender/`). Its method is now `scripts/unroll/pubcmp.py`, a CPU check of a strip
+against a published unwrap.
+- **Correspondence:** each banner pixel goes to the published flattened grid, through the inverse of the r2 affine (held-out rms 0.77 vx), to
+  the nearest vertex of our stripes.
+- **Banner registration:** one of the 4 flips, chosen by FFT cross-correlation of the papyrus mask with our CT, plus a linear column drift.
+- **1667 dir +1 strip, renders inkr/inkpod-9000** (7.5 min, 30 GB cap):
+  - our surface is within 50 um of 71.5 % of the published px (median 24.5 um);
+  - banner = grid rotated 180 deg, +1 / -467 px, drift -0.016 / px; P(published papyrus | ours) 0.908;
+  - **direction FAIL:** local slope +3.38, global -3.50 of our columns per published px; 9.5 % of the 8-px steps are sheet hops. Inside every
+    published turn our strip runs backwards (the image side of the opposite handedness, unroll audit #1);
+  - **AUC against the published ink:** ink 0.514, CT 0.511 (589 k ink px), flat under +-0.5 mm shifts. That is the model, not the registration.
+- **Scale:** our flattening matches the 3-D surface within about 1 %. The published flat grid is 8.1 % / 4.5 % shorter than 3-D (along / across).
+
+Changes:
+- **`render --fill-ct` threshold:** with the default 1, only masked-zero CT was void, so the fill never recentred off unmasked air. On the 1667
+  renders 45-54 % of the flag-0 surface pixels have CT < 80 (31-42 % < 50), and the ink there is read in air (p95 98-133).
+  - The CLI default goes to 80 on unrollfix-20261114 (37dadf0, it owns the line); FILLCT=80 in unroll.sh (c9e4756); u1667ink GATE=1.
+  - test_render_fill: a threshold case (thr 201: sheet A counts as void, the gap bands move to sheet B).
+  - Post-pass GPU check: `scripts/unroll/urender_post.sh`.
+- **`ink-blend --q`** defaults to 0 (lossless). The inputs are already q-coded by predict; the old second lossy pass (32) stacked errors.
+- **strip-mosaic look flags** (default off; before / after in `urender/stretch_before_after.jpg`):
+  - `--ct-stretch-papyrus 1`: the CT window from pixels >= --ct-level only. On 1667 that is 80..224 instead of 1..202, where air set the low end.
+  - `--ink-fixed 1`: ink grey = probability, the same in every run and model, instead of the percentile stretch (9..232 on 1667).
+- **strip-flatten chunk blend (#7):** the default is now cos^2 windows instead of linear hats (`--blend hat` restores the old one).
+  - Both sum to 1. The hat's slope jumps at every chunk centre and edge, so the blended map kinked there wherever neighbouring chunk layouts
+    disagree. 1667 had 2.6x the folds within 0.5 cm of those columns.
+  - 1667 chunks 10..16 on the CPU (the same SLIM, only the blend differs):
+
+    | Blend | Flips | aniso p95 | aniso p99 | Energy | Kink at centres / elsewhere |
+    |---|---|---|---|---|---|
+    | hat | 51 | 1.095 | 1.162 | 4.0126 | 1.03 |
+    | cos^2 | 45 | 1.091 | 1.159 | 4.0123 | 0.97 |
+
+  - Kink = the median second difference of the blended offset. A small gain: most folds are local SLIM detail, not the blend.
+- **pubcmp.py gate:**
+  - fails when the local and global slopes differ in sign (the jump share is reported only). fibfit's 1667 dir -1 wraps (strip + a quick
+    2-iteration CPU flatten): local +3.38 / global +3.57, one continuous diagonal with ghost lines one turn off (sheet identity 0.76),
+    jumps 0.089 -> OK, where dir +1 failed;
+  - with renders, also fails when the ink AUC < CT AUC + 0.02;
+  - `--ink-gate c12,c13` scores the papyrus-gated ink.
+
+## try6-shaped tests for the non-conv kernels (2026-11-14, branch kshape-20261114)
+
+The kernel audit (/vesuvius/ufsm/audit-20261114/kernels.md, #14-#18) found the try6 paths outside the conv kernels tested only at toy
+shapes or without an assertion. New cases (compiled and linked on the desk; not run there: no GPU time was taken):
+
+| item | test (suite line) | shapes / what | tags, est |
+|---|---|---|---|
+| #14 DP average | test_grad_ar (+ ~2gpu) | `dp_grad_avg` vs the host mean, byte for byte: 40 M + 12345 floats, 16 M-float chunks (2 + an odd tail) and 1000003-float chunks (41), 2 and 3 replicas (1 / 3), avg off (--split); every replica after the broadcast | gpu 8 s; gpu2 8 s |
+| #15 attention | test_attn_ray~try6 | block C 288, 6 heads, F 768, 216 tokens, scroll RoPE, core 1 vs the double reference (forward all, 10 gradient tensors by central differences, threaded) | gpu 8 s |
+| #15 unet stage | test_unet~ATTN_PE=3 | the attention stage in the tiny net's finite-difference check (UFSM_TINY=4,6,96, scroll axis records, fp32 core), 48 extra points in the stage | gpu 4 s |
+| #16 latent head | test_lat, test_lat_fuse | the streamed chunks and the fused gradient pass at 160 cells / base 32 / 23 upsampled / 32 fp32 rows, fused [2, 9) + chain [0, 2) + [9, 23), gscale 1024 at training-size gradients; the fp16 dead zone (zero where fp32 is not) printed, not asserted | gpu, +1 s |
+| #17 Muon tc 2 | test_muonx | 448 x 12096, 448 x 19872, 864 x 288, 1536 x 288, 288 x 768 (+ 288 x 288): TF32 vs fp32 over 3 steps, O O^T ~ I | gpu 5 s |
+| #18 | test_unwrap_targets, test_sumsq (new), test_ink_mil, test_head_tc, test_ink_splat, test_band_pair, test_univ2 | per-slab targets == whole; nn_sumsq at 100 M with inf / NaN (non-finite: train skips), nn_ema; MIL into a prefilled fp16 gradient at scale 1024; head bwd-data 256 -> 144; a visible GPU that does nothing fails; test_univ2 skips on one GPU | gpu |
+
+Production change: train.c's chunked peer all-reduce moved verbatim into `dp_grad_avg` (src/split.c): the same calls (nn_peer_copy into
+gpeer, nn_axpy, nn_scale by 1.f / ng unless split, peer copy back) in the same order on the same stream, so the bytes are unchanged.
+
+## Sampler label fixes from the data audit: phase weight on scroll augmentations, scanner air, one coarse-grid convention (2026-11-14, branch sampfix-20261114)
+
+Three findings of /vesuvius/ufsm/audit-20261114/data.md (items handed over by datafix). None is live in try6 (--aug none, no scanner
+"air" probability, no shift-1 / shift-2 phase windows: the startup's rung table puts every level-2 phase set at levels 2 / 3 and every
+level-1 set at 1..3), so try6's labels are unchanged; they matter as soon as those augmentations or rungs are switched on.
+
+- **Phase "weight" on crushed / torn / delaminated / re-bent windows.** The weight drop (8^3 blocks kept with probability w / 255) was
+  skipped on --aug-tear / --aug-delam windows (their labels are prepared on a padded box, `g_crush.pre`) and read at the unwarped window
+  for --aug-crush / --aug-curv. PHerc1299-b3's weight is its direction mask, so those windows would have trained cells reversed. Now
+  tear / delam apply `phase_weight_drop` on the padded box before the pull (as the ignore mask), and crush / curv pull the weight as a
+  nearest layer (fill 255 = keep) and drop on the pulled window. test_scrollaug: weight 0 leaves no known phase on any of the four
+  augmentations, weight 255 gives the unweighted batches bit for bit (tear / delam failed before the fix: 1.08 M / 1.11 M known voxels).
+- **Scanner "air" op.** It turns masked air (CT 0) into dim material, after which the label path's air test saw no air: phase / rv /
+  winding mod 4 were supervised in the air while the papyrus plane went unknown there. The window's zero set as read is now kept (one bit
+  per voxel, only when the op can fire and side 2) and its voxels set unknown in the side plane right after the phase read. test_scrollaug:
+  a fixture copy with CT 0 above z 128 and the phase known there: 1.93 M known air voxels with the op before the fix, 0 now (0 without the op).
+- **One coarse-grid convention.** The shift-1 nearest path of phase_window took fine x from coarse (x + 1) >> 1 (a grid centred on 2 j - 0.5),
+  the shift >= 2 interpolation used the block centre 2^s j + (2^s - 1) / 2, and crush_layer_phase (crush / curv / delam layers) put
+  coarse j at 2^s j - 0.5. All three now use band.h `grid_coarse_u` / `grid_coarse_j` (block centre; nearest = x >> s), the codes / CT
+  convention of datafix b1db77b. test_phase_interp checks the helper, nearest = x >> s, and that crush layers map identically. band_window's
+  binary labels (sample.c `(g + 1) >> 1`) and sideface.c keep their own grid (not phase sets; untouched).
+
+## Unroll audit items #4 #8 #11 #12 #18 #20 (2026-11-14, branch unrollfix-pub-20261114)
+
+- **#8, slab vs ref coherence (diagnosed; rechecked on fibfit's dir -1 refit, below).** The bimodal "U_ref - phase ... coherence" of the
+  1667 u1 slab fits is the count-field ref's sub-turn, not the network or the fit. Per field plane (`ufsm fit-phase-box` of ref-cf and
+  joined, `ufsm read` of fields/lat pc / ps / w, material w >= 0.3): ref vs net phase coherence 0.63-0.67 in s010 / s050, 0.08-0.15 in
+  s020 / s030 / s064; the joined model vs the net phase 0.76-0.84 in all five. Every 64 rows from 200 to 4552, the ref's coherence
+  switches within ~6 rows (one ref lattice cell) at rows 834-840, 3002-3008 and 3906-3912 (l0 z ~6690 / 24030 / 31270), with a bias
+  drifting 0.03-0.45 turn between them. Across each switch the ref W changes incoherently (12 rows: 0.06-0.11 vs the net phase 0.22-0.45).
+  Not the field-part seam (row 2048), not count-field's 768-row pooling chunks. Against the published unwrap (pub1667) nothing per slab
+  follows it: Spearman of coherence with coverage at 50 / 100 um, median distance, signed offset, angle-corrected sheet identity
+  |rho| <= 0.22 (p >= 0.07); the dir signature
+(our id 0 -> +2 per turn) is the same in high and low slabs. Data `/vesuvius/ufsm/gt/pub1667-cmp/{slabcoh.txt,coh/}`.
+  **Recheck on fibfit's dir -1 refit (11-14 evening; ref-dm1, slabs dm1/, same fields and slab flags).** The closing error is NOT a
+  direction indicator (2.061 turns at dir -1 vs 2.060 at +1: the theta term enters targets and loop sums alike), so the earlier
+  "the ref absorbs the wrong-dir curl" reading is withdrawn. Measured directly: slab "U_ref - phase" coherence mean 0.400 -> 0.515,
+  |bias| mean 0.082 -> 0.026 turn, slabs < 0.35: 45 -> 24 of 71, >= 0.5: 26 -> 36. The per-plane ref vs net coherence (rows 200..4552
+  step 64) now alternates on a regular grid: ~256 rows high (0.41-0.70), ~256 rows low (0.03-0.34), switches near rows 200 + 256 k
+  (712, 968, ..., 3002-3008, ..., 4296); the 834-840 and 3906-3912 switches of the dir +1 ref are gone (flat 0.09-0.10 / 0.18-0.19).
+  256 field rows = 512 level-2 planes = 32 ref lattice cells (L 16 native voxels). So dir -1 is right (sheet identity 0.487 -> 0.762,
+  fibfit) and removes the bias, and what is left is a z-periodic count-field artifact of that period (not the direction). Open: find
+  the 512-plane structure in count-field (solve-cell / lattice blocking). Data `/vesuvius/ufsm/gt/pub1667-cmp/{slabcoh_cmp.txt,coh_dm1/}`.
+- **#18:** fit-join with --ref gave a slab without ref cells and without overlap cells the first DP candidate, cen - 12 (every candidate
+  cost 0): 12 turns off. It now takes the chain's prediction, the summary says how many slabs came from the ref / the chain / nothing,
+  each unconstrained slab warns, `--require-constrained 1` exits 3 (test_fit_join cut-36 / cut-24 cases). 1667 / 1299 / P4 slab 0 have
+  no ref cells but overlap cells: chain, unaffected.
+- **#11:** strip-mosaic exits 3 when a stripe has no renders (the mosaic is still written; `--allow-missing 1`); test_strip.
+- **#12:** perwrap renders wrapsdir (wraps_snap), waits on every pw_one with its rc, fails on any; the ink is labelled INKNAME.
+- **#4:** wrapscore.py's first split is heldout = validation | holdout boxes (1667: 12.5 % + 13.6 % of 7.79 M samples, ~24 %), a
+  HEADLINE line, `--gate-auc` (exit 3); u1667ink.sh and scripts/inkgt/inkscore.sh report and gate on it. "all" stays in the table but
+  is ~76 % training labels. Held-out AUC numbers for inkpod-9000 / ift3 follow in a later commit.
+- **#20:** the strip scripts default U to the repo's build and require CTR / CTK / INK; recto = toward the axis (see the 1667 ink table).
+
+## Ops fixes from the 11-14 audit: the merge gate, GPU locks, the health watcher (2026-11-14, branch opsfix-20261114)
+
+Audit: /vesuvius/ufsm/audit-20261114/ops.md. Each piece below has its own commit; the numbered items are the audit's.
+
+**#2 the merge gate.** Every desk suite on 11-14 ran `-g none` (scratch2 holds the cards). They skipped 181-185 GPU tests and printed
+ALL PASSED. Meanwhile test_lldec (2dd6744) failed on every pod run until fixtests-20261114.
+- tests/run_suite.sh reports a GPU test it did not run as NOGPU (no GPU / `-g none`), BUSY (its card stayed held) or NEED2 (a gpu2
+  test on one GPU without the `l2` tag). It then exits 3 with `INCOMPLETE: N GPU tests not run`.
+- The exit codes: 0 all passed, 1 a FAIL / TIMEOUT, 3 incomplete, 2 usage. `-I` makes 3 into 0 for the edit loop.
+- scripts/test/pod_gate.sh REF is the GPU half of a merge. It runs `run_suite.sh -c <merge base>` on the perf pod:
+  - it pushes to /root/gate/repo.git and clones per sha, so `-c` can diff;
+  - it builds `-j 6` under /root/build.lock and /root/gpu.lock (never beside an A/B timing run);
+  - the run is under `timeout` inside the flock.
+
+**#7 GPU locks.** A test now also holds `gpu<i>.excl` shared (`flock -s`); a training run takes it exclusively. The old slot-only scheme
+leaked:
+- scratch2 held slots .0 / .1;
+- the runner sizes slots by free memory (up to 8);
+- a suite started while the cards read free took .2+ and later ran beside the restarted trainer.
+
+A card with a foreign compute process (>= 1 GB, no UFSM_SUITE_TEST in its environment) counts as held too, until the trainers take the
+lock (merger2's launch work). A held card is reported once: `test_x waits for GPU 1: held by <pid> <cmd>`.
+- After `-W` s (default 300) the test is BUSY.
+- Later tests give up on the same card at once.
+- Before, a GPU suite started beside scratch2 polled forever without a word.
+
+**#18.** The runner deletes this user's old default output dirs (more than 2 days old, runner gone; failed runs kept them on tmpfs).
+test_latvol.sh and test_ct_gpu_decode.sh make their scratch dirs under $TMPDIR.
+
+**test_run_suite** (CPU, 17 s) checks this contract on a mock manifest:
+- exit 3 and NOGPU under `-g none`;
+- `-I`;
+- exit 1 beats 3;
+- NEED2;
+- BUSY with the holder named, under a held exclusive lock.
+
+Desk check against the live trainer (`-W 20`): its three GPU tests went BUSY after 20 s, naming
+`ufsm.scratch2.5e8aab7 train ... (13654 MiB on GPU 1, not a suite test)`.
+
+**#10 checkpoints and silent defaults.**
+- **unet_save** now checks every array for non-finite values before the rename: weights, EMA, AdamW m / v, Muon momentum, after the
+  momentum masks.
+  - A NaN anywhere makes it refuse (-2) and print the array and the first index. The previous last.ckpt stays, and the .tmp is removed.
+  - The trainer then exits ("cannot save"), and the launcher resumes from the good file.
+  - Before, a NaN that the step-skip logic missed overwrote the only recent checkpoint.
+  - test_checkpoint covers it: a NaN gradient under AdamW, the save refused, the step-5 file intact.
+- **The checkpoint ring** (src/ckring.c, train `--ckpt-ring 4`, default on). After each save, last.ckpt is cloned with FICLONE into
+  ring/<step>.ckpt, and the newest N are kept.
+  - At --ckpt-every 250 that is 1000 steps of rollback, copied for free on btrfs (/vesuvius).
+  - On a filesystem without reflinks the ring turns itself off with one line, unless `--ckpt-ring-copy 1`.
+  - The deg1900 rollback of try6 went back to snap 1000: 900 steps, ~1.5 h.
+- **Snapshots in the trainer** (`--snap-every S`, default 0, so the launch script's loop stays in charge until merger2 switches):
+  - a reflink to snap/<step>.ckpt, or a copy where reflinks are missing;
+  - kept are every multiple of `--snap-keep-every` (5000) and the newest `--snap-keep-last` (5) others;
+  - only <digits>.ckpt files are deleted.
+
+  snap/ had no retention: 71 x 2.08 GB by step 71000. The script's loop also copied all 2.08 GB to snap/.tmp after every save.
+
+  test_ckring (CPU) checks:
+  - the ring's newest 3, byte-identical;
+  - the ring off without reflinks;
+  - the retention grid;
+  - foreign files in snap/ untouched;
+  - with UFSM_TEST_REFLINK_DIR, the reflink path (passes in /vesuvius).
+- **DEFAULTED lines** (src/defaulted.h). A fallback that changes a result prints `DEFAULTED: <what> = <value> (<why>)`, and
+  UFSM_STRICT_DEFAULTS=1 makes it exit 3.
+  - Sites: count-field's direction (+1 when the prior found no rings and there is no --dir: the 11-14 count-field bug), and
+    wrap-snap's channel 0 read as x.
+  - test_countfield runs its golden cases strict, and runs an all-zero input without --dir in a child, which must stop with exit 3.
+  - test_pipeline_cli fails on any DEFAULTED line in its CLI runs.
+
+**#8 two GPUs on one: logical devices.** Since 11-13 no machine could run the 2-GPU tests:
+- the desk's cards belong to scratch2;
+- the perf pod has one GPU;
+- test_univ2 failed "cannot select GPU 1" on every pod run.
+
+The fix is src/ufsm_dev.cuh, force-included into every CUDA unit (clang `-include`, nvcc `--pre-include`). It maps logical device d
+to the physical device ufsm_dev_phys(d).
+- It wraps cudaSetDevice / cudaGetDevice, so every per-device table in the GPU code is indexed by the LOGICAL device: streams, plans,
+  buffers, kernel attributes, `[cur_dev()]`, `[cudaGetDevice()]`.
+- Also wrapped:
+  - the device count, attributes and properties;
+  - cudaMemGetInfo (free memory split among the logical devices on a card);
+  - peer access (one card: always), cudaMemcpyPeer(Async) (one card: a device copy).
+- The map is the identity unless `train --gpus` names a card twice without `--split`, so ordinary runs are unchanged.
+  `train --gpus 0,0` then runs two data-parallel ranks with separate per-device state on one card. --split keeps its own one-device
+  path (`g_split_same`).
+- gpudec compares the pointer's physical device.
+
+The runner gives gpu2 tests tagged `l2` UFSM_TEST_GPUS=0,0 on one-GPU machines:
+- test_univ2 (its --det thread-mode comparison is the race detector for thread-local op state);
+- test_cover_training and test_sheet_gpu (their own one-GPU fallbacks);
+- the new test_dp_equiv. It checks that DP at B 1 on two ranks trains like `--accum 2` on one: each update's mean loss equal at the
+  first update, within DPDRIFT after.
+
+test_gyrec was tagged gpu2 although it runs on device 0 alone; it is now `gpu`.
+
+**The mgpu lint** is audit-net's tests/test_mgpu_lint.py (netfix-20261114), not a second one here (an earlier draft of this branch
+had tests/lint_mgpu.py; dropped for it). The logical-device map in src/ufsm_dev.cuh carries `mgpu: main` (set once by nn_set_devmap
+before the GPU threads start; the per-thread logical device is thread_local).
+
+**The mgpu lint** (tests/lint_mgpu.py, CPU, < 1 s; since folded into tests/test_mgpu_lint.py, see "DP safety": one tool, one baseline tests/mgpu_baseline.txt, these tags accepted). Every file-scope mutable variable in src/ needs an mgpu class: `process`,
+`device`, `guarded`, `BUG`.
+- The class goes in an annotation `/* mgpu: ... */` on its line, or in tests/mgpu_baseline.txt.
+- The baseline holds the 548 variables of 11-14, classed from audit-net's appendix (net.md: SAFE-CFG / ENV / MAIN -> process,
+  SAFE-DEV -> device, SAFE-TLS / LOCK -> guarded, UNSAFE -> BUG). That way no source line of every open branch changes.
+- Thread-local ones count as guarded by themselves. train.c's option globals are process; 263 are `unknown`, mostly host code outside
+  the trainer's GPU threads.
+- The 11 BUG entries are audit-net's open findings: g_err*, g_lp_err, g_ring, g_pk, g_slab, g_pgtab, xnet, ink3dext.
+- A new unclassified variable fails the test with the line to annotate.
+
+**#9 races.**
+- `UFSM_SERIALIZE=1` (nn_init) sets CUDA_LAUNCH_BLOCKING=1, so every launch and copy completes in program order. The tests also set
+  CUDA_LAUNCH_BLOCKING=1 themselves, since the context may predate nn_init.
+- test_serialize compares a default `--det` run of the universal recipe, data parallel on two (logical) devices, with a serialised
+  one. The step lines must be identical; a stream-ordering race shows as a difference.
+- test_ink_mil_train does the same for the MIL path: 1bb0db8's rays under the backward were this class, found in production.
+- The slow tier's sanitize group runs compute-sanitizer racecheck and synccheck (tests/sanitize.sh, child processes included) over
+  small GPU tests: shared-memory hazards and barrier misuse, which the serialised comparison cannot see.
+
+**#4 the swap gate.** scripts/run/replay_ab.sh RUN OLD NEW [N] runs in the swap window, before a swap.
+- It replays N windows with both binaries:
+  - the run's own train command (the last start line of RUN.resume.log);
+  - one copy of last.ckpt;
+  - `--det 1 --lr 0 --muon-lr 0`, so both binaries see the same batches and the same weights at every step.
+- It compares the per-head mean losses, with a 1 % tolerance.
+- gswap.sh's live gate had ~0.026 noise against a 0.05 threshold, on 2 log lines.
+
+**#15 / #17.**
+- test_gyrec's free-memory check (cudaMemGetInfo of the whole card: other tests moved it, FAIL under -j 10) now runs only with
+  UFSM_TEST_GYREC_MEM=1. The leak shows anyway in its pointer checks: the same buffers come back after every switch, no apply
+  reallocates.
+- The scoring commands now have tests:
+  - ink-score in test_ink_splat: the labels as the map score F1 / AUC ~1, with or without the mask; inverted AUC ~0; constant
+    AUC 0.5;
+  - gt-gate in test_gt_gate (CPU): three GT cylinders with prob ridges on one half; with --cell 64 the four unsupported cells are
+    gated, the share matches the fixture and the mask is 255 exactly there;
+  - eval was already covered by test_pipeline_cli.
+
+**Cleanup.**
+- 68 worktrees removed with `git worktree remove` (no --force). Each one met all of these:
+  - its branch is merged into origin/master, or it is detached at an ancestor of it;
+  - no unpushed commits;
+  - clean, including untracked files;
+  - no process cwd or open file inside;
+  - no symlink into it;
+  - no file touched in 3 h;
+  - not an active agent's tree.
+- Kept: 40 with unmerged / dirty / in-use reasons, 8 with untracked files, 9 of active agents. The branches stay.
+- The main checkout was fast-forwarded to origin/master (it was 376 commits behind; its local evwatch.sh edit and untracked files kept).
+- CLAUDE.md is now tracked.
+
+**#19 /vesuvius retention.** /vesuvius was 87 % used (254 GB free) and grew ~140 GB/day on 11-13/14: profile dumps (perf2/prof
+44 GB), per-arm bench binary copies (merge/bench 12 GB), try checkpoints, GT comparison renders. scripts/run/retain.py is the policy:
+- one rule per scratch tree (perf2/prof 3 days, merge/bench 3 days, gt/pub1667-cmp 7 days; `--rule DIR:DAYS` adds one); the unit is
+  each top-level entry, which goes when nothing inside it changed for that long. Checkpoints stay with the trainer's ring (#10 / #11).
+- kept, with the reason listed: an entry a symlink under /vesuvius/ufsm or /home/forrest points into, one a process has open (fd,
+  cwd or exe: a bench arm still running its binary copy), one holding a `KEEP` file.
+- a dry run by default; `--apply` deletes only paths strictly inside the rule's dir. The symlink walk takes ~3 min on the desk.
+- 11-14 14:40 dry run: 0 entries (everything in those trees is from the last 2 days), so it runs again from the health alarm.
+health.py adds the slow trend: from 6 h of history, a filesystem (now /vesuvius explicitly too) that would be full within 3 days at
+its 24 h rate gets a `disktrend` alert naming retain.py. tests/test_retain.sh checks the drop / keep rules and `--apply` (CPU, 1 s).
+
+**#3 the health watcher.** scratch2.health.py was not running on 11-14 (its files had moved with try5), and its limits were the old
+104 GB slice. scripts/run/health.py RUN is the same set of checks, generalised, run as the systemd --user service `ufsm-health@RUN`
+(scripts/run/install_health.sh; Restart=always, linger on). Changes:
+- the files are re-opened by name each check;
+- the first pass replays the log for the head history without alerting;
+- memory is read from the trainer's own cgroup: the slice's anon + shmem against its memory.max (alert at 90 %), and every new
+  `oom_kill` in memory.events;
+- disks: /, the run root and the derived cache. Alert below 10 % / 50 GB free, or under 12 h to full at the measured rate.
+
+## Inference fixes for the scratch2 net (2026-11-14, branch inferfix-20261114, audit infer.md)
+
+From the inference audit (/vesuvius/ufsm/audit-20261114/infer.md). No GPU numbers: the pod measurement was cancelled with the MEGA pass.
+- **Fine stem on the EMA weights:** predict passed `unet_live_params` (p) to the fine stem at all four sites, while the trunk ran on the
+  EMA (`--ema 1`, the default). scratch2 snap 2000: fstem W2 |ema - p| / |p| 0.23. `unet_active_params` gives the weights the forward
+  reads.
+- **Inference load:** `unet_set_load_infer(1)` reads p and ema only. `unet_infer_release` frees g, m and v (and p when the EMA is used
+  without a blend, no sparse24 / wq). For the 92 M net that is 1.25-1.7 GB of device memory back in the window budget and 2.1 -> 0.83 GB
+  read. `UFSM_PRED_TRAINSTATE=1` keeps the old behaviour (test_predict_heads compares the bytes).
+- **`--gn-live 1`:** gn_ema nets normalise with each window's own statistics, the function scratch2 trains with while --gn-ema-warm
+  1e9 is not reached. This is for the A/B; the default stays the running statistics, and predict prints a note when they were never
+  trained on.
+- **`--heads --resume 1`:** each head logs its shards to `<out>/<head>/predict-done-<lv>.txt`. A shard is skipped when every head lists it.
+- **`--fit-zarr --resume 1`:** rows.done (one `z0 z1` line per field slab, appended once all the slab's shards are written) is kept
+  instead of truncated. The slabs it lists are final: their windows write no fields, and the writer never flushes them again (their
+  fill would overwrite). A shard is computed when its slab is not done, or when another output (--heads, the main store) still needs it.
+  A line off this run's slab grid is ignored (that slab is recomputed). Refused with --split z. test_predict_gpus2: slab 0 kept
+  (mtime), slab 1 rebuilt, bytes equal to the uninterrupted run, one GPU and --gpus workers. A u1-size fields part was 703-753 s on the
+  desk (scratch2 est. 1.5-2 h); a crash now loses at most one slab.
+- **Early-snapshot EMA note:** below step 10000 with `--ema 1`, predict says that the EMA lags by ~1000 steps (scratch2 at 1000-2000:
+  |ema - p| / |p| 8-10 %) and to score `--ema 0` too.
+- **scripts/infer/seam_ab.sh:** window / halo / blend arms on one 1667 box (640/64 default, 768/128 = training's 216 tokens, 896/192,
+  1152/64 k 2, 1152/64 --seam-inproc): ink-seam per arm and z3-diff against 768/128. It decides the recipe (flags only).
+- **skip-empty on latvol:** a skip-trained net on a latvol CT whose basis is the checkpoint's took the stored-index input and built no
+  masks, i.e. the dense net. It now takes the input from the rebuilt CT so the masks are built. With `--latents` there is a warning.
+- **Diagnostics:** the halo against the theoretical RF (cells), the bottleneck token count against the training window, and the level's
+  um against the new header key `um_rungs` (written by train --um-rungs only when given).
+- **`--gpus a,b` on the latent paths (`--heads`, `--fit-zarr`):** one worker process per GPU (fork, as the old --gpus workers;
+  processes rather than threads because of the process-wide nn state, net audit #7 / #9 / #10). The workers take contiguous z layers
+  of (super-)shards, split by the shards left to compute, on units of the field slab height (fields) or the window interior (heads).
+  So every field slab and every shard belongs to one process. The fit writer skips other workers' slabs (their fill would overwrite);
+  each worker writes `fields.json.w<k>` and the parent renames one; rows.done is truncated by the parent and appended by the workers.
+  The GPU pyramid is off in workers; the parent builds every head's pyramid and group. test_predict_gpus2 (gpu2): bytes equal to the
+  one-GPU run for --heads all, --fit-zarr --fit-h 1 and both together.
+- **`--window-round 1`:** a window the net's depth does not divide (latink's 544 / 16 on a 6-level net) becomes the next multiple, with
+  the halo grown to keep the interior (640 / 64).
+- **scripts/infer/gn_ab.sh:** running vs live GN through scripts/univ/eval.sh (held-out boxes) plus a seam / difference probe on 1667.
+- **Provenance:** a `"provenance"` object in every store's attributes: ckpt bytes / mtime / header FNV-1a, binary path, level um, gn
+  mode, skip-empty, norm, fstem, ema.
+
+## Unroll fixes from the pipeline audit: axis refusal, two-ended trim, distortion gate, run manifest (2026-11-14, branch unrollfix-20261114)
+
+From the inference / unroll audit (`/vesuvius/ufsm/audit-20261114/unroll.md`). Direction (`dir`) handling belongs to fibfit and is not
+touched here.
+
+**predict without `--axis`.** A missing axis zeroed the radial input channels with no message (`ax.n == 0`). latink.sh and u1667ink.sh
+never passed one, and neither does the corpus inklib.sh, so every latent ink / c12 / c13 run and every ift3 corpus run went without.
+predict now exits 2 unless it gets `--axis`, `--no-axis 1`, or `UFSM_PRED_NO_AXIS=1`; tests/run_suite.sh sets the env for the fixtures,
+and test_pipeline_cli checks the refusal. latink.sh also took its CT from `tail -1` of the run's scrolls.tsv, which is the pods'
+one-row table; on the desk's table that row is PHerc0490B for every scroll. unroll.sh now passes `UNROLL_CT`. The 1667 held-out AUC
+with the axis is measured after the mega pass.
+
+**Grid-256 ink pass.** The passes got the 512-aligned run box, which is off the shifted tile grid, so predict ran one 544^3 window per
+256 shard (u1667ink on 1667: grid 256 took 350 s against 71 s for grid 0). `pbox` moves the box down as seamless.c's `pass_box` does.
+The passes only feed ink-blend, so they now run with `--q 0 --levels 1`. (Timing after the mega pass.)
+
+**Trim at both ends.** The outer trim used wrap-check's "dup" verdict. Against the 1667 GT its precision is 0.07 for dup and 0.014 for
+merged (spiral QA §1). On 1667 it dropped w040-w042, which are published turns 29-31. trim now walks in from each end and drops a wrap
+while any of these holds:
+- (1) it lies beyond the wrap-check table;
+- (2) its gap is collapsed: `rnet_med` < 0.6. rnet is the normal gap over the network's own sheet spacing; it stays ~1 where the papyrus
+  itself packs tighter (gap 230 -> 94 um), and drops where wraps pile up;
+- (3) it is near-empty: on-papyrus <= 0.1.
+
+On 1667 that gives --last 39 -> 42. w043 / w044 / w045 (rnet .56 / .45 / .36) are dropped; every wrap from w043 to w062 maps to
+published turn 29. Published area covered by the strip:
+
+| tolerance | old trim (w000-w039) | new trim (w000-w042) | no outer trim |
+|---|---|---|---|
+| 50 um | 0.749 | 0.772 | 0.778 |
+| 100 um | 0.818 | 0.843 | 0.851 |
+
+The inner core wraps w000-w011 sit inside the published first turn (r < 3.9 mm), but they are on papyrus (0.16-0.56, like the middle
+wraps) with rnet ~1, so they are kept. The published unwrap starts at r 3.9 mm; the 157.7 vs 140 cm length gap is not a fit error.
+`ufsm strip` reads ids >= 0 only, so trim names any kept negative ids instead of losing them silently. The per-wrap inputs go to
+state/trim.tsv.
+
+**distort stage.** strip-distort runs after stripflat (1667: 9 s). It fails when dist p95 > 0.35 (1667 .157, P4 .187), the folded
+share > 0.005 (1667 .0018, P4 .0006), or strip-flatten logged a "no mesh" chunk. DISTGATE=0 logs instead of failing.
+
+**render --fill-pm 0 by default.** PatchMatch copies texture from elsewhere on the render (1667 ws000: 10.6 % of pixels inpainted),
+and strip-mosaic counts those pixels as surface.
+
+**state/manifest.json.** It records the binary, ckpt, ink ckpt and axis sha256 (16 hex), the git commit and the env overrides, then per
+stage: dir and the count-field line, per-slab ref coherence, join agreement, wrap-check verdicts, trim, stripflat, distort and strip
+length. podpull.sh now also pulls logs/ and the ref / joined json. 14 of the 17 u1 runs kept only their images, so their direction can
+no longer be checked.
+
+**Smaller changes.** Field z parts are rounded to the nearest 512 voxels instead of floored to 1024 (1667 split 4096 / 5173). unroll's
+ink defaults to INKMODE=lat (latink.sh, inkpod 15000); INKMODE=ift3 runs the old pass.
+
+**Field seams (#5).** The existing u1 fields of 1667 (640/64 windows, no blend) step at every 256-cell tile border. Over the mean of a
+z 2048-2304 x 640^2 crop, the normal plane t0 changes by 5.4 / 6.1 across the y borders against an interior median of 1.34 (p99 3.6),
+and by 4.8 / 9.9 across the x borders against 2.0 (p99 4.8). The phase steps less: 0.24 against 0.18 in y, none in x. `FBLEND=1` (default OFF)
+predicts each part on two tile grids (origin 0 and half the stride) and blends them with `field-blend --tile`; it turns off the streamed
+ref pass 1. The A/B against 640/64 and LWIN 1152 / LHALO 64 runs after the mega pass.
+
+**Also in this branch.**
+- predict records the axis (or "none") and the radial sign in every output's attrs.
+- predict refuses a fine-stem or guided-head latent checkpoint off the device path (eval audit #14). `--fstem-off 1` accepts that
+  output explicitly.
+- `scripts/unroll/axis_for.sh SCROLL` looks up each scroll's umbilicus. univ/eval.sh, inkgt/baseline.sh, rv/eval.sh and corpus
+  inklib.sh use it.
+- inkcal uses the main ink pass's window.
+
+**Deferred, with reasons.**
+- The per-window statistics sync in predict: the host needs the mean and sd to build the input, and it costs < 1 % of a ~0.3 s window.
+- Air windows are read and decoded before they are skipped: ~6 % of the windows, and only their I/O.
+- A fused `--fit-h 2` field kernel: a pod profile (`UFSM_PRED_PROF=1`) has to show the writer's share first.
+- #21 (ink at 4.8 um on the labelled 1667 boxes) and #8 (slab coherence vs per-z sheet identity, pub1667) are measurements that run
+  after the mega pass.
+
+## villa vc_wgraph on 1667: stopped before any run; what carries over to a ufsm reimplementation (2026-11-14, branch wgraph-20261114)
+
+Goal was to run villa's fibre winding graph (vc_wgraph: extract -> hvb -> sign -> winding -> uv) on PHerc1667 and score it against
+our wraps. Stopped the same day: the user wants the idea reimplemented in ufsm, not the upstream code run. Nothing was run; the villa
+build (334/384 native objects, Python bindings) and its venv / build dirs are deleted.
+
+**What exists.**
+- `scripts/wgraph/ufib2afv.py`: UFIB (fiber-trace / fiber-link output) -> AFV v1 SQLite (villa's fibre interchange: application_id
+  0x56434643, fibers table with exact bounds, float64 XYZ blocks of <= 256 segments sharing their end point, block_bounds rtree,
+  coordinate frame in metadata). Tested on 2 PHerc1218 tiles: 16857 fibres (8692 H / 8165 V), 1.13 M points.
+- `scripts/wgraph/pod_fibpred.sh`: fibhv-d (30000) H / V tube masks over a 1667 L2 z slab (4096..4608 = L0 16384..18432, contains
+  the z18160 void crossing), to trace on the desk with `fiber-trace --mask`. Never ran: the first launch failed because the pod has
+  no /usr/bin/time, and the fixed requeue was cancelled at the stop. The checkpoint is still on the pod at /root/wgraph.
+- Inputs for 1667: no AFV is published (AutomatedFiberVolumes covers P4, 0125, 0175A, 1447). The published 1667 lasagna normal
+  prediction (cos / grad_mag / nx / ny, base grid 37076 x 15229 x 15229 = L0 of the 2.399 um scan, our frame) is described by
+  /vesuvius/ufsm/wgraph/data/lasagna1667/*.lasagna.json.
+
+**The method, as far as the source was read (fiber_wgraph_stages.py, fiber_wgraph_geometry.py, fiber_normal_sign.py).** The pair
+extraction (constraint_extraction, native) and the winding objective were not read in detail before the stop.
+- Data model: one fibre graph (fibre ids + constraint "events" between fibres). Every stage writes result columns per fibre id
+  and refuses a run whose ids differ from its input.
+- hvb (classification): a 3-class labelling per fibre (H / V / broken) with probabilities. It is solved by IRLS on GPU
+  (wrapped_irls) from per-fibre axial evidence: the fibre direction vs the scroll axis, made by the native extractor. One broken
+  penalty (default 0.1), uniform costs, no entropy term. Fibres labelled broken are disabled downstream.
+- sign: a +-1 normal sign per enabled fibre with a sign probability. The classification mask stays fixed, and the solve is
+  anchored by a weak normal prior (prior_weight 1e-3), which the native constraint export builds from the orientation database
+  and the umbilicus.
+- winding: linear IRLS (15 iterations, prior weight 1e-6, CUDA) over the enabled H / V fibres with their signs and the pair
+  constraints. uv: parameterisation after the winding solve.
+- For ufsm: the same three steps map onto data we already have. Our fibre families are already H / V, so hvb collapses to a
+  broken-fibre gate. Our normals come from the winding field, so the sign follows from grad(phase) with no separate solve. The
+  part worth taking is the robust (IRLS / L1) per-fibre winding solve, with fibre-fibre constraints added to the fit as
+  same-sheet terms. fibfit is adding those to fit.
+
+## The 1667 unroll against the published full unwrap (2026-11-14, branch pub1667-20261114)
+
+The Vesuvius Challenge published its full PHerc1667 unwrap (2026-06-25) as one continuous tifxyz,
+`s3://vesuvius-challenge-open-data/PHerc1667/segments/20260612121456-w011_20260108140509268_merged_v4_flatboi_straightened_v4/mesh/`,
+expressed on several scans; `...-on-20251217075048-2.399um.tifxyz` is on our scan's level-0 grid (2061 x 30097, 20 voxel = 48 um
+grid; `-t2` is the same surface at 66 voxels, t2 vs full nearest 21 um median = the grid spacing). Local copy
+`/vesuvius/ufsm/gt/pub1667-unwrap/`, comparison `/vesuvius/ufsm/gt/pub1667-cmp/full`, images `/vesuvius/ufsm/previews-20261114/pub1667/`.
+Tools (CPU, Python): `scripts/pub1667/surfcmp.py` (KD-tree point-to-plane distances both ways, per published turn / our wrap,
+sheet identity per vertex), `ctmask.py` (split by the masked CT under the surface), `viz_flat.py` (distance / sheet maps on the
+published grid), `xsec.py` (CT slices with both surfaces). Ours = `wraps_snap` (u1, level 2) via `ufsm wrap-dump --grid-um 2.399`.
+
+| | published | ours (strip w000-w039) |
+|---|---|---|
+| turns / wraps | 31.06 turns, r 3.9-11.3 mm | 40 strip wraps (80 in wraps_snap, w-17..w062) |
+| length / area | 140.0 cm / 1195 cm2 | 157.7 cm / 1218 cm2 valid |
+
+- Coverage of the published surface by any of our wraps: 0.785 / 0.860 / 0.893 at 50 / 100 / 200 um, distance median 19 um,
+  p90 272 um; signed (ours - published, along the outward normal, matched vertices) median +4 um, p10 / p90 -30 / +35 um: the same face.
+  On CT (89 % of the published area; 11 % = 131 cm2 lies where the masked CT is 0): 0.879 / 0.959 / 0.986, median 17 um.
+  Off CT: 0.05 at 100 um. The misses are the outer 6 turns (published turns 24-30, r 10.4-11.3 mm, 26-59 % of their area on
+  masked-out CT; our w040-w062 pile up at the mask edge, r 10.75-11.36 mm) and the inner end of each turn's top/bottom z edge.
+- The reverse: 0.70 / 0.79 / 0.85 of our strip vertices within 50 / 100 / 200 um of the published surface. Our w000-w011
+  (r 0.5-3.6 mm, ~13 cm of strip length) lie inside the published surface's first turn (median 0.2-2.3 mm away): the umbilicus
+  core, mostly no papyrus in the CT slices. w012-w034 cover the published turns 0-23 one to one (cov100 0.85-0.97, median 14-23 um).
+- Wrap matching: w(12 + k) <-> published turn k for all k = 0..30, no skipped or merged wrap in the ordering.
+- Sheet identity is where it disagrees: per matched vertex, our wrap id against the published sheet index along the axis ray
+  (`off`): same sheet 0.48, our id +1 0.31, +2 0.12, -1 0.03 (d median 15 / 15 / 17 / 24 um: locally both are on papyrus). Binned by
+  the published turn fraction (audit 11-14 #1, d < 50 um) the mode climbs 0, 0, 0, 0, +1, +1, +1, +2 over each turn and drops back at the
+  cut, in every z slab: our wraps gain about two sheets per revolution against the published spiral, the signature of an opposite-handed
+  level set (the fit's dir +1 default; fibfit's dir fix). An earlier reading of this section put the cause in our wraps crossing the
+  delamination voids (`example_void_crossing_z18160.png`); that crossing is real at the sector boundaries but is a consequence of the
+  handedness, not a separate cause. Locally our surface is on a papyrus sheet; along the strip it switches sheets twice per turn.
+
+## The derived cache's disk cap (2026-11-14, branch dcachecap-20261114)
+
+~/.cache/ufsm/derived (src/dcache.c) had no bound: at 10:50 it held 336 GB in 274 keys and filled the desk's root filesystem under
+try6 (cells fell back to memory, an AFV query failed with "disk full"). By last write: 24 keys written within 6 h hold 334 GB (the
+on-the-fly pair-rule phase of try6's sources: Paris 4 codesA48 81 GB, gtjuly 60, codesB48 49, PHerc1218 39, ...), 250 older keys 3 GB.
+The phase cells compress 3.5x with zstd 3 (16.8 MB -> 4.2 MB per 256^3 cell); zstd 9 gives 4.8x, x or z deltas first <= 1.2x more: not
+worth a format change.
+
+Now: a key dir's inputs.txt mtime is its last use (touched at open and at most every 5 min of reads); a key's last use is that or its
+newest cell-dir mtime (the last write; binaries before this never touch). One background thread per process (one pass at a time per
+root: flock ROOT/.evict.lock) every UFSM_DCACHE_CHECK_S (600) s deletes whole key dirs, least recently used first, while the root
+holds more than UFSM_DCACHE_GB (150) or its filesystem has less than UFSM_DCACHE_FREE_GB (50) free; keys used within
+UFSM_DCACHE_PROTECT_MIN (60) minutes and keys open in the process are never deleted. Below half the free floor no cell is written
+(memory only, a line when it starts and when writes resume); a failed write no longer claims "memory only from here" (every later
+cell was always retried). So the cap removes stale keys and the floor keeps the filesystem from filling, but a live working set
+larger than the cap stays (try6's ~334 GB). Hence the per-cell LRU (same day, the user's plan): when the kept keys are still over
+the cap (default now 200 GB) or the filesystem under the floor, single cells go, least recently used first by the cell file's mtime
+(its write, or its last disk read: cell_disk touches it), down to UFSM_DCACHE_CELL_FILL (0.9) x the cap, open keys included. The
+process remembers the cells it evicted (path hashes) and counts a later compute of one as a recompute: the trainer's log line shows
+"N of them recomputes of evicted cells; M cells (G GB) evicted", the measure of whether 200 GB holds try6's revisit pattern. The root stays in ~:
+/vesuvius has 299 GB free of 1.9 TB (85 % used), less room than / after the 11-14 cleanup (235 GB free). test_dcache_cap (CPU).
+
+## GroupNorm running statistics: pooled variance, replica agreement, stale EMA set (2026-11-14, branch gnfix-20261114)
+
+From the targeted audit (/vesuvius/ufsm/audit-20261114/targeted/gnorm.md); correctness changes are on by default, they only touch `--gn-ema` nets.
+- **Pooled variance (#1).** The running variance was the EMA of the within-window variances; with one window per replica the between-window
+  variance of the group means never entered. `nn_gn_pool` (nn_opt.cu) now updates `[mean | var]` as the EMA of mean and second moment:
+  `v' = d v + (1 - d) v_w + d (1 - d) (m - m_w)^2` (the law of total variance; same layout, same checkpoints). It also replaces the rune update
+  (`unet_ema`, which blended the last window's statistics unguarded: a non-finite window now skips it). test_gn_ema (1) checks the new blend.
+- **Replicas (#3).** Under data parallel (`ng > 1`, `--gn-ema`) the main loop averages the finite entries of every replica's [run | rune | last
+  window] after each step's forwards, so all replicas hold the same set and the saved one has seen every window.
+- **Stale EMA-weights set (#2).** The measured rune lag (scratch2 step 2357: per-site variance ratio rune / run down to 0.15) is not fixed by code
+  alone. `predict --gn-set ema|run|auto` (default auto): with the EMA weights, auto refuses a checkpoint whose two sets differ by more than 1.5x at
+  a site (message names both ways out: `--gn-set ema`, `--gn-set run` = the live weights' set, or `--ema 0`). The recalibration pass (EMA weights,
+  live statistics over ~200-500 windows, pooled) and the scratch2 A/B (A: corrected stats via `--gn-set run`, B: `--gn-live 1` on inferfix) are
+  still to be measured on the GPU. Existing scratch2 checkpoints keep the old (non-pooled) variance in both sets until retrained.
 
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 
@@ -2096,11 +3794,15 @@ u1 unroll (ift3-24000 ink, out of sample on 1667), 40 um, all samples:
 |---|---|---|---|---|---|
 | centre, depth 1 + fill | 0.860 | 15.1 um | 0.646 (0.645 / 0.648) | 0.435 | 0.540 |
 | centre, thin +-2 | 0.860 | 15.1 um | 0.646 | 0.434 | 0.540 |
-| recto face (-1.5 voxels) fill / thin | 0.848 | 16.6 um | 0.648 / 0.647 | 0.437 | 0.535 |
-| verso face (+1.5 voxels) fill / thin | 0.795 | 22.4 um | 0.643 / 0.643 | 0.431 | 0.526 |
+| recto face (1.5 voxels toward the axis) fill / thin | 0.848 | 16.6 um | 0.648 / 0.647 | 0.437 | 0.535 |
+| verso face (1.5 voxels away from the axis) fill / thin | 0.795 | 22.4 um | 0.643 / 0.643 | 0.431 | 0.526 |
 
 - Coverage at 20 / 80 um (centre): 0.615 / 0.971.
 - The validation split runs 0.01-0.035 higher, the ink holdout boxes about 0.01 lower.
+- Sign (settled 11-14, audit #20): the recto is the face toward the scroll axis. `rvside.sh` moves wraps_snap by `tifxyz-scale --normal
+  +1.5 --toward AXIS` (+n oriented toward the axis), so its logs say +1.5 for wraps_in_recto and -1.5 for wraps_out_verso; this table
+  earlier wrote the same shifts as -1.5 / +1.5 along the outward radius. The pub1667 comparison agrees: the published (recto) surface
+  lies 4 um inward of our centre surface at the median.
 - The face shift and the thin band move the ink AUC by <= 0.005. The limit is the ink model, not the render. The published meshes lie
   slightly to the recto side of our centre surface.
 

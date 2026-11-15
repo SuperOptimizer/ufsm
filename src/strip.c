@@ -21,7 +21,8 @@
         arc-length parametrisation shared by every row, so the strip stays one straight band of the scroll's height;
      2. chunks of 2 S columns centred every S columns (full height): each SLIM-flattened (src/flatten.h, every connected component,
         multilevel, flip-free) and every component rigidly aligned (rotation + translation, no scale) onto T;
-     3. partition of unity: each lattice vertex's uv = sum over chunks of hat(c) x that chunk's uv (hats of half-width S, summing to 1):
+     3. partition of unity: each lattice vertex's uv = sum over chunks of w(c) x that chunk's uv (cos^2 windows of half-width S, summing to 1,
+        zero slope at chunk centres and edges; --blend hat: the linear hats before 2026-11-14, whose slope jumps there):
         neighbouring chunks agree on their overlap, the residual bend of the true development is spread smoothly instead of torn. Holes
         and disconnected pieces cannot tear the layout: every piece is placed by T.
      4. distortion of T and of the result on the lattice mesh (area-weighted aniso p50 / p95, flips) overall and per stride segment;
@@ -31,8 +32,11 @@
    ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88]
      stripes (CT over ink, global contrast stretch) as JPEGs, the whole unrolled scroll as a folded overview JPEG and one long strip
      JPEG, and the on-papyrus share along the strip (CT >= ct-level within 3 x 3 px around the surface point) per 1 cm column and per
-     wrap (strip_papyrus.tsv, papyrus_wraps.tsv): where the surface leaves the papyrus is reported, never cut. */
+     wrap (strip_papyrus.tsv, papyrus_wraps.tsv): where the surface leaves the papyrus is reported, never cut.
+     Look flags (default off, 2026-11-14): --ct-stretch-papyrus 1: the CT window from pixels >= --ct-level only (air no longer sets its low end);
+     --ink-fixed 1: ink grey = probability (no percentile stretch: one p -> grey map across runs and models). */
 #include "flatten.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "imgops.h"
 #include "tiff.h"
@@ -51,7 +55,7 @@
 #include <unistd.h>
 
 static double snow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
-static const char *sopt(int argc, char **argv, const char *name, const char *def) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1]; return def; }
+static const char *sopt(int argc, char **argv, const char *name, const char *def) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1]; return def; }
 static double meta_num(const char *m, const char *key, double def) { const char *q = m ? strstr(m, key) : nullptr; if (!q) return def; q += strlen(key); while (*q == ' ' || *q == ':' || *q == '[' || *q == '"') q++; return atof(q); }
 static int cmp_f32(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return x < y ? -1 : x > y; }
 static float median_f32(float *v, int n) { if (n <= 0) return NAN; qsort(v, (size_t)n, 4, cmp_f32); return v[n / 2]; }
@@ -257,8 +261,8 @@ static void st_fill(void *ctx, int bx, int by, float (*joint)[3], uint8_t *valid
 int cmd_strip(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm strip <wraps-dir> <out-dir> [--first K] [--last K] [--every E] [--err 0.25] [--threads 8]\n"); return 2; }
     const char *wd = argv[2], *od = argv[3];
-    const int first = atoi(sopt(argc, argv, "--first", "-1000000")), last = atoi(sopt(argc, argv, "--last", "1000000")), every = atoi(sopt(argc, argv, "--every", "1"));
-    const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8); const double err = atof(sopt(argc, argv, "--err", "0.25"));
+    const int first = opt_atoi("--first", sopt(argc, argv, "--first", "-1000000")), last = opt_atoi("--last", sopt(argc, argv, "--last", "1000000")), every = opt_atoi("--every", sopt(argc, argv, "--every", "1"));
+    const int nth = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 8); const double err = opt_atof("--err", sopt(argc, argv, "--err", "0.25"));
     if (every < 1 || !(err > 0)) { fprintf(stderr, "strip: --every >= 1, --err > 0\n"); return 2; }
     const double t0 = snow();
     DIR *d = opendir(wd); if (!d) { fprintf(stderr, "strip: cannot open %s\n", wd); return 1; }
@@ -559,6 +563,7 @@ typedef struct {   /* stripe rasterisation */
     int la, lb;     /* lattice columns */
     double u0, v0, os; int ow, oh;
     float *gu, *gv, *ox, *oy, *oz;
+    uint8_t *fmask; _Atomic long long nflip;   /* pass 0: the pixels flipped triangles (det < 0) would cover, and their count (audit 11-14 #7) */
     uint32_t *own; int pass;   /* pass 0: own[pixel] = the highest ticket (quad q, triangle t: 2 q + t + 1) covering it; pass 1: only that one writes
                                   (the serial order's last writer: the same pixels on any thread count; before, threads raced on shared edges) */
 } rsj;
@@ -585,7 +590,21 @@ static void k_rast(void *ctx, long lo, long hi) {
             }
             for (int k = 0; k < 3 && !bad; k++) { const double *a = P[k], *b = P[(k + 1) % 3]; bad = (a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]) > lmax2; }
             if (bad) continue;
-            const double det = (U[1] - U[0]) * (V[2] - V[0]) - (V[1] - V[0]) * (U[2] - U[0]); if (!(det > 1e-12)) continue;   /* (flipped / degenerate: left out) */
+            const double det = (U[1] - U[0]) * (V[2] - V[0]) - (V[1] - V[0]) * (U[2] - U[0]);
+            if (!(det > 1e-12)) {   /* flipped / degenerate: left out of the raster. Pass 0 marks a flipped one's pixels: the holes it leaves
+                                       (no other triangle covers them) are counted per stripe, as render --fill-grid later bridges them */
+                if (R->pass == 0 && det < -1e-12) {
+                    atomic_fetch_add_explicit(&R->nflip, 1, memory_order_relaxed);
+                    const int x0 = (int)ceil(fmin(U[0], fmin(U[1], U[2])) - 1e-9), x1 = (int)floor(fmax(U[0], fmax(U[1], U[2])) + 1e-9);
+                    const int y0 = (int)ceil(fmin(V[0], fmin(V[1], V[2])) - 1e-9), y1 = (int)floor(fmax(V[0], fmax(V[1], V[2])) + 1e-9);
+                    for (int y = y0 < 0 ? 0 : y0; y <= y1 && y < R->oh; y++) for (int x = x0 < 0 ? 0 : x0; x <= x1 && x < R->ow; x++) {
+                        const double l1 = ((x - U[0]) * (V[2] - V[0]) - (y - V[0]) * (U[2] - U[0])) / det, l2 = ((U[1] - U[0]) * (y - V[0]) - (V[1] - V[0]) * (x - U[0])) / det;
+                        if (l1 < -1e-7 || l2 < -1e-7 || 1 - l1 - l2 < -1e-7) continue;
+                        __atomic_store_n(&R->fmask[(size_t)y * R->ow + x], 1, __ATOMIC_RELAXED);
+                    }
+                }
+                continue;
+            }
             const int x0 = (int)ceil(fmin(U[0], fmin(U[1], U[2])) - 1e-9), x1 = (int)floor(fmax(U[0], fmax(U[1], U[2])) + 1e-9);
             const int y0 = (int)ceil(fmin(V[0], fmin(V[1], V[2])) - 1e-9), y1 = (int)floor(fmax(V[0], fmax(V[1], V[2])) + 1e-9);
             for (int y = y0 < 0 ? 0 : y0; y <= y1 && y < R->oh; y++) for (int x = x0 < 0 ? 0 : x0; x <= x1 && x < R->ow; x++) {
@@ -622,6 +641,8 @@ static void k_rast(void *ctx, long lo, long hi) {
 typedef struct {
     sflat *F; int nchunk, S, nth, ngpu, iters, cg, verbose; double tol; FILE *cf;
     pthread_mutex_t mu; pthread_cond_t cv; int j0, commit; _Atomic int fail; int j1; _Atomic int next;
+    _Atomic int nomesh, nomesh_full;   /* chunks flat_grid gave no mesh: any (the narrow last chunk can be legitimate), full-size ones (fail) */
+    int hat;   /* --blend hat: the old partition of unity (linear hats); default cos^2 */
 } sf_ctx;
 typedef struct { sf_ctx *X; int w; } sf_warg;
 static void *sf_worker(void *arg) {
@@ -637,7 +658,14 @@ static void *sf_worker(void *arg) {
                 flat_opts o = flat_opts_default(); o.decim = F->D; o.iters = X->iters; o.cg_iters = X->cg; o.nthreads = X->nth; o.max_edge = F->max_edge;
                 o.all_components = 1; o.verbose = X->verbose; o.tol = X->tol; o.gpu = X->ngpu > 0; o.gpu_dev = X->ngpu > 0 ? A->w % X->ngpu : -1;
                 double *cu = malloc((size_t)nc * 8); for (int c = 0; c < nc; c++) cu[c] = T_u(F, a + c) - T_u(F, a); o.col_u = cu;   /* SLIM from the frame */
-                if (flat_grid(Xs, Ys, Zs, nc, F->h, F->step, &o, &m, &sb, &sa)) fprintf(stderr, "strip-flatten: chunk %d (columns %d..%d): no mesh\n", j, a, b);
+                if (flat_grid(Xs, Ys, Zs, nc, F->h, F->step, &o, &m, &sb, &sa)) {
+                    /* (audit 11-14 #7: this was skipped with exit 0. A full-size chunk (2 S + 1 columns) with surface in it that gives no mesh
+                       leaves its columns to the neighbours' hat tails alone: fail. A narrow edge chunk (1299: the last, 11 columns) is counted) */
+                    size_t nvalid = 0; for (size_t k = 0; k < n; k++) nvalid += Zs[k] >= 0;
+                    const int full = nc == 2 * S + 1 && nvalid >= 3;
+                    atomic_fetch_add(&X->nomesh, 1); if (full) { atomic_fetch_add(&X->nomesh_full, 1); atomic_store(&X->fail, 1); }
+                    fprintf(stderr, "strip-flatten: chunk %d (columns %d..%d, %zu valid vertices): no mesh%s\n", j, a, b, nvalid, full ? ": FAILED (a full-size chunk)" : " (narrow chunk: its columns from the neighbours)");
+                }
                 else { align_components(F, &m, a, nc); have = 1; }
                 free(cu);
             }
@@ -649,7 +677,11 @@ static void *sf_worker(void *arg) {
         if (have) {
             for (int v = 0; v < m.nv; v++) {
                 const int g = m.gi[v], c = g % nc, r = g / nc, gc = a + c; if (gc % F->D || r % F->D) continue;
-                const double wgt = fmax(0, 1 - fabs((double)gc - C) / S); if (!(wgt > 0)) continue;
+                /* the chunk weight: cos^2 (default) or the hat; both sum to 1 over neighbouring chunks, but the hat's slope jumps at every chunk
+                   centre and edge (multiples of S), so the blended map had a kink there wherever two chunks' layouts disagree: 1667 folded 2.6x
+                   more within 0.5 cm of those columns (urender audit 11-14 #7); cos^2 has zero slope at both */
+                const double x = fabs((double)gc - C) / S; if (!(x < 1)) continue;
+                const double wgt = X->hat ? 1 - x : cos(0.5 * M_PI * x) * cos(0.5 * M_PI * x); if (!(wgt > 0)) continue;
                 const size_t li = (size_t)(r / F->D) * F->lw + gc / F->D;
                 F->du[li] += (float)(wgt * (m.uv[2 * v] - T_u(F, gc))); F->dv[li] += (float)(wgt * (m.uv[2 * v + 1] - T_v(F, r))); F->wt[li] += (float)wgt;
             }
@@ -668,12 +700,12 @@ static void *sf_worker(void *arg) {
    as a tifxyz + gu / gv; stripes.tsv rows appended in stripe order */
 typedef struct {
     const sflat *F; const char *od; FILE *sf; const st_seg *segs; int nseg, SW, OW, OH, nstripe, nth, flip; double umin, vmin, ostep, um;
-    const float *cumin, *cumax; pthread_mutex_t mu; pthread_cond_t cv; int commit; long long nval; _Atomic int next, fail;
+    const float *cumin, *cumax; pthread_mutex_t mu; pthread_cond_t cv; int commit; long long nval, nflip, nfhole; _Atomic int next, fail;
 } ss_ctx;
 static void *ss_worker(void *arg) {
     ss_ctx *Q = arg; const sflat *F = Q->F; const int SW = Q->SW, OW = Q->OW, OH = Q->OH; const double ostep = Q->ostep, um = Q->um;
     for (int s; (s = atomic_fetch_add(&Q->next, 1)) < Q->nstripe;) {
-        const double ts = snow(); char row[512] = ""; long long nv = 0;
+        const double ts = snow(); char row[512] = ""; long long nv = 0, nfl = 0, nfh = 0;
         const int oc0 = s * (SW - 1), ow = oc0 + SW <= OW ? SW : OW - oc0; const double u0 = Q->umin + oc0 * ostep, u1 = u0 + (ow - 1) * ostep;
         int la = F->lw, lb = -1;
         for (int j = 0; j < F->lw; j++) if (Q->cumax[j] >= u0 - 4 * ostep && Q->cumin[j] <= u1 + 4 * ostep) { if (j < la) la = j; if (j > lb) lb = j; }
@@ -685,10 +717,11 @@ static void *ss_worker(void *arg) {
             if (!ok || st_read((st_strip *)&F->S, c0, nc, Q->nth, X, Y, Z)) ok = 0;
             if (ok) {
                 const long nq = (long)(lb - la) * (F->lh - 1);
-                rsj R = {F, X, Y, Z, c0, nc, la, lb, u0, Q->vmin, ostep, ow, OH, A[0], A[1], A[2], A[3], A[4], calloc(on, sizeof(uint32_t)), 0};
-                if (!R.own || 2 * nq + 2 > 0xffffffffL) ok = 0;
-                else { spfor(nq, Q->nth, k_rast, &R); R.pass = 1; spfor(nq, Q->nth, k_rast, &R); }
-                free(R.own);
+                rsj R = {F, X, Y, Z, c0, nc, la, lb, u0, Q->vmin, ostep, ow, OH, A[0], A[1], A[2], A[3], A[4], calloc(on, 1), 0, calloc(on, sizeof(uint32_t)), 0};
+                if (!R.own || !R.fmask || 2 * nq + 2 > 0xffffffffL) ok = 0;
+                else { spfor(nq, Q->nth, k_rast, &R); R.pass = 1; spfor(nq, Q->nth, k_rast, &R);
+                       nfl = atomic_load(&R.nflip); for (size_t i = 0; i < on; i++) nfh += R.fmask[i] && !R.own[i]; }
+                free(R.own); free(R.fmask);
             }
             free(X); free(Y); free(Z);
             if (ok) {
@@ -703,6 +736,7 @@ static void *ss_worker(void *arg) {
                 const double vcm2 = nv * ostep * ostep * um * um * 1e-8;
                 snprintf(row, sizeof row, "%s\t%d\t%d\t%d\t%.3f\t%.3f\t%.3f\t%.0f\t%.0f\t%d\t%d\n", sn, oc0, ow, OH, oc0 * ostep * um * 1e-4, (ow - 1) * ostep * um * 1e-4, vcm2, gmin, gmax,
                          Q->nseg > 0 && nv ? seg_wrap(Q->segs, Q->nseg, gmin) : -1, Q->nseg > 0 && nv ? seg_wrap(Q->segs, Q->nseg, gmax) : -1);
+                if (ok) fprintf(stderr, "strip-flatten: stripe %s: %lld flipped triangles left out, %lld holes they leave (px; render --fill-grid bridges them: flag >= 100)\n", sn, nfl, nfh);
                 if (ok) fprintf(stderr, "strip-flatten: stripe %s %d x %d (u %.1f..%.1f cm), %.2f cm2 valid, strip columns %.0f..%.0f, %.1fs\n", sn, ow, OH, oc0 * ostep * um * 1e-4, (oc0 + ow - 1) * ostep * um * 1e-4, vcm2, gmin, gmax, snow() - ts);
             }
             for (int k = 0; k < 5; k++) free(A[k]);
@@ -711,24 +745,24 @@ static void *ss_worker(void *arg) {
         pthread_mutex_lock(&Q->mu);
         while (Q->commit != s) pthread_cond_wait(&Q->cv, &Q->mu);
         if (*row && Q->sf) { fputs(row, Q->sf); fflush(Q->sf); }
-        Q->nval += nv; Q->commit = s + 1; pthread_cond_broadcast(&Q->cv);
+        Q->nval += nv; Q->nflip += nfl; Q->nfhole += nfh; Q->commit = s + 1; pthread_cond_broadcast(&Q->cv);
         pthread_mutex_unlock(&Q->mu);
     }
     return nullptr;
 }
 
 int cmd_strip_flatten(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: ufsm strip-flatten <strip-dir> [--out DIR] [--decim D] [--stride S] [--iters 30] [--cg 200] [--threads 16] [--ostep S] [--stripe-px 60000] [--px-scale 1] [--flip-rows 1] [--max-edge 3] [--reuse 1] [--gpu 1] [--jobs J] [--stripe-jobs 3] [--chunks J0,J1]\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: ufsm strip-flatten <strip-dir> [--out DIR] [--decim D] [--stride S] [--iters 30] [--cg 200] [--threads 16] [--ostep S] [--stripe-px 60000] [--px-scale 1] [--flip-rows 1] [--max-edge 3] [--blend cos2|hat] [--reuse 1] [--gpu 1] [--jobs J] [--stripe-jobs 3] [--chunks J0,J1] [--tol 1e-5 (CG relative tolerance)] [--verbose 0]\n"); return 2; }
     const char *sd = argv[2]; char od[1400]; snprintf(od, sizeof od, "%s", sopt(argc, argv, "--out", "")); if (!*od) snprintf(od, sizeof od, "%s/flat", sd);
     sflat F; memset(&F, 0, sizeof F);
     if (st_open(sd, &F.S)) return 1;
-    F.w = F.S.w; F.h = F.S.h; F.step = F.S.step; F.D = atoi(sopt(argc, argv, "--decim", "1")); if (F.D < 1) F.D = 1;
-    F.max_edge = atof(sopt(argc, argv, "--max-edge", "3"));
-    const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16);
-    int S = atoi(sopt(argc, argv, "--stride", "0")); if (S <= 0) S = F.h / 2; S = S / F.D * F.D; if (S < 4 * F.D) S = 4 * F.D; F.Sst = S;
+    F.w = F.S.w; F.h = F.S.h; F.step = F.S.step; F.D = opt_atoi("--decim", sopt(argc, argv, "--decim", "1")); if (F.D < 1) F.D = 1;
+    F.max_edge = opt_atof("--max-edge", sopt(argc, argv, "--max-edge", "3"));
+    const int nth = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 16);
+    int S = opt_atoi("--stride", sopt(argc, argv, "--stride", "0")); if (S <= 0) S = F.h / 2; S = S / F.D * F.D; if (S < 4 * F.D) S = 4 * F.D; F.Sst = S;
     F.lw = (F.w - 1) / F.D + 1; F.lh = (F.h - 1) / F.D + 1;
-    const double um = F.S.um, ostep = atof(sopt(argc, argv, "--ostep", "0")) > 0 ? atof(sopt(argc, argv, "--ostep", "0")) : F.step;
-    const double pxs = atof(sopt(argc, argv, "--px-scale", "1")); const int stripe_px = atoi(sopt(argc, argv, "--stripe-px", "60000")), flip = atoi(sopt(argc, argv, "--flip-rows", "0"));
+    const double um = F.S.um, ostep = opt_atof("--ostep", sopt(argc, argv, "--ostep", "0")) > 0 ? opt_atof("--ostep", sopt(argc, argv, "--ostep", "0")) : F.step;
+    const double pxs = opt_atof("--px-scale", sopt(argc, argv, "--px-scale", "1")); const int stripe_px = opt_atoi("--stripe-px", sopt(argc, argv, "--stripe-px", "60000")), flip = opt_atoi("--flip-rows", sopt(argc, argv, "--flip-rows", "0"));
     char cmd[1500], p[1600]; snprintf(cmd, sizeof cmd, "mkdir -p '%s/stripes'", od); if (system(cmd)) return 1;
     st_seg *segs = nullptr; const int nseg = st_segs(sd, &segs);
     const double t0 = snow();
@@ -747,12 +781,13 @@ int cmd_strip_flatten(int argc, char **argv) {
       fprintf(stderr, "strip-flatten: frame: length %.2f cm (%lld column pairs without data, 0.02 step each), %.1fs\n", F.U[F.w - 1] * um * 1e-4, nb, snow() - t0); }
     free(med);
     /* 2. chunks */
+    int nomesh_all = 0;   /* chunks without a mesh (a --reuse run: 0, not recomputed) */
     const size_t ln = (size_t)F.lw * F.lh;
     F.du = calloc(ln, 4); F.dv = calloc(ln, 4); F.wt = calloc(ln, 4);
     if (!F.du || !F.dv || !F.wt) { fprintf(stderr, "strip-flatten: out of memory for the lattice\n"); return 1; }
     char lp[1600]; snprintf(lp, sizeof lp, "%s/lattice.f32", od);
     int reused = 0;
-    if (atoi(sopt(argc, argv, "--reuse", "0"))) {   /* the chunks' blended lattice of an earlier run (output stage only) */
+    if (opt_atoi("--reuse", sopt(argc, argv, "--reuse", "0"))) {   /* the chunks' blended lattice of an earlier run (output stage only) */
         FILE *f = fopen(lp, "rb");
         if (f && fread(F.du, 4, ln, f) == ln && fread(F.dv, 4, ln, f) == ln && fread(F.wt, 4, ln, f) == ln) reused = 1;
         if (f) fclose(f);
@@ -768,21 +803,23 @@ int cmd_strip_flatten(int argc, char **argv) {
     if (!reused) {
         /* chunks on --jobs workers (each --threads / jobs CPU threads; with --gpu 1 the SLIM iterations on device worker % devices), blended
            into the lattice strictly in chunk order: the sums are the same whatever the job count */
-        const int ngpu = atoi(sopt(argc, argv, "--gpu", "1")) ? flat_gpu_devices() : 0;
-        int jobs = atoi(sopt(argc, argv, "--jobs", "0"));
+        const int ngpu = opt_atoi("--gpu", sopt(argc, argv, "--gpu", "1")) ? flat_gpu_devices() : 0;
+        int jobs = opt_atoi("--jobs", sopt(argc, argv, "--jobs", "0"));
         /* default with GPUs: 3 per GPU or one per 3 threads, the larger (a job's chunk prep and blend are CPU work: the GPU sat at
            11-13% with 3 jobs; 0490B desk 120 chunks at 20 threads: 3 jobs 151-158 s, 6 jobs 96-134 s, 12 jobs 113-121 s; same files) */
         if (jobs <= 0) jobs = ngpu > 0 ? (3 * ngpu > nth / 3 ? 3 * ngpu : nth / 3) : 1;
         if (jobs > 64) jobs = 64;
         if (jobs > j1 - j0 + 1) jobs = j1 - j0 + 1 > 0 ? j1 - j0 + 1 : 1;
-        sf_ctx X = {&F, nchunk, S, nth / jobs > 0 ? nth / jobs : 1, ngpu, atoi(sopt(argc, argv, "--iters", "30")), atoi(sopt(argc, argv, "--cg", "200")),
-                    atoi(sopt(argc, argv, "--verbose", "0")), atof(sopt(argc, argv, "--tol", "1e-5")), cf, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, j0, j0, 0, j1};
+        sf_ctx X = {&F, nchunk, S, nth / jobs > 0 ? nth / jobs : 1, ngpu, opt_atoi("--iters", sopt(argc, argv, "--iters", "30")), opt_atoi("--cg", sopt(argc, argv, "--cg", "200")),
+                    opt_atoi("--verbose", sopt(argc, argv, "--verbose", "0")), opt_atof("--tol", sopt(argc, argv, "--tol", "1e-5")), cf, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, j0, j0, 0, j1};
         atomic_store(&X.next, j0);
+        { const char *bl = sopt(argc, argv, "--blend", "cos2"); X.hat = !strcmp(bl, "hat"); if (!X.hat && strcmp(bl, "cos2")) { fprintf(stderr, "strip-flatten: --blend cos2 | hat\n"); return 2; } }
         fprintf(stderr, "strip-flatten: chunks %d..%d on %d jobs x %d threads, SLIM on %s\n", j0, j1, jobs, X.nth, ngpu ? "the GPU" : "the CPU");
         pthread_t th[64]; sf_warg wa[64];
         for (int k = 0; k < jobs; k++) { wa[k] = (sf_warg){&X, k}; pthread_create(&th[k], nullptr, sf_worker, &wa[k]); }
         for (int k = 0; k < jobs; k++) pthread_join(th[k], nullptr);
-        if (atomic_load(&X.fail)) { fprintf(stderr, "strip-flatten: read failed\n"); return 1; }
+        nomesh_all = atomic_load(&X.nomesh);
+        if (atomic_load(&X.fail)) { fprintf(stderr, "strip-flatten: FAILED: %s\n", atomic_load(&X.nomesh_full) ? "full-size chunks without a mesh (above)" : "read failed"); return 1; }
     }
     if (cf) fclose(cf);
     if (!reused) {
@@ -835,9 +872,9 @@ int cmd_strip_flatten(int argc, char **argv) {
     const int nstripe = OW <= SW ? 1 : (OW - 1 + SW - 2) / (SW - 1);
     snprintf(p, sizeof p, "%s/stripes.tsv", od); FILE *sf = fopen(p, "w");
     if (sf) fprintf(sf, "stripe\tout_col0\tout_cols\tout_rows\tu0_cm\tlength_cm\tvalid_cm2\tsrc_col0\tsrc_col1\twrap0\twrap1\n");
-    long long nval_all = 0;
+    long long nval_all = 0, nflip_all = 0, nfhole_all = 0;
     {   /* stripes on --stripe-jobs workers (each --threads / jobs threads), stripes.tsv rows in stripe order: the same files */
-        int sj = atoi(sopt(argc, argv, "--stripe-jobs", "3")); if (sj < 1) sj = 1;
+        int sj = opt_atoi("--stripe-jobs", sopt(argc, argv, "--stripe-jobs", "3")); if (sj < 1) sj = 1;
         if (sj > nstripe) sj = nstripe > 0 ? nstripe : 1;
         if (sj > 64) sj = 64;
         ss_ctx Q = {&F, od, sf, segs, nseg, SW, OW, OH, nstripe, nth / sj > 0 ? nth / sj : 1, flip, umin, vmin, ostep, um, cumin, cumax,
@@ -846,21 +883,26 @@ int cmd_strip_flatten(int argc, char **argv) {
         for (int k = 0; k < sj; k++) pthread_create(&th[k], nullptr, ss_worker, &Q);
         for (int k = 0; k < sj; k++) pthread_join(th[k], nullptr);
         if (atomic_load(&Q.fail)) { fprintf(stderr, "strip-flatten: stripe output failed\n"); return 1; }
-        nval_all = Q.nval;
+        nval_all = Q.nval; nflip_all = Q.nflip; nfhole_all = Q.nfhole;
     }
     if (sf) fclose(sf);
     printf("strip-flatten: %d stripes of <= %d columns (%d px at render --scale %g), output grid %d x %d step %g, valid area %.2f cm2, %.1fs\n",
            nstripe, SW, render_out_px(SW, gs), pxs, OW, OH, ostep, nval_all * ostep * ostep * um * um * 1e-8, snow() - t0);
+    printf("strip-flatten: holes from failures: %d chunks without a mesh; %lld flipped triangles left out of the raster, leaving %lld px holes (%.4f of the valid "
+           "area; render --fill-grid bridges them as flag >= 100, strip-mosaic hatches / tints them)\n", nomesh_all, nflip_all, nfhole_all, nval_all ? (double)nfhole_all / nval_all : 0.0);
     snprintf(p, sizeof p, "%s/flatten.txt", od); FILE *ff = fopen(p, "w");
     if (ff) {
         fprintf(ff, "strip %d x %d step %g um %g decim %d stride %d\nlength_cm %.3f height_cm %.3f mesh_area_cm2 %.3f output %d x %d step %g valid_cm2 %.3f stripes %d flip_rows %d px_scale %g\n",
                 F.w, F.h, F.step, um, F.D, S, L_cm, H_cm, A_cm2, OW, OH, ostep, nval_all * ostep * ostep * um * um * 1e-8, nstripe, flip, pxs);
-        dstat_print(ff, "frame T", before); dstat_print(ff, "flattened", after); fclose(ff);
+        dstat_print(ff, "frame T", before); dstat_print(ff, "flattened", after);
+        fprintf(ff, "failures: nomesh_chunks %d raster_flipped_tris %lld flip_hole_px %lld\n", nomesh_all, nflip_all, nfhole_all); fclose(ff);
     }
     snprintf(p, sizeof p, "%s/flat.json", od); ff = fopen(p, "w");   /* (ufsm strip-mosaic reads it) */
     if (ff) { fprintf(ff, "{\"um\": %.9g, \"ostep\": %.9g, \"px_scale\": %.9g, \"flip_rows\": %d, \"stripes\": %d, \"length_cm\": %.4f, \"height_cm\": %.4f, \"decim\": %d, \"stride\": %d, "
-                  "\"aniso_p50\": %.4f, \"aniso_p95\": %.4f, \"frame_aniso_p50\": %.4f, \"frame_aniso_p95\": %.4f, \"flips\": %lld}\n",
-                  um, ostep, pxs, flip, nstripe, L_cm, H_cm, F.D, S, dstat_q(after, 0.5), dstat_q(after, 0.95), dstat_q(before, 0.5), dstat_q(before, 0.95), after->flips); fclose(ff); }
+                  "\"aniso_p50\": %.4f, \"aniso_p95\": %.4f, \"frame_aniso_p50\": %.4f, \"frame_aniso_p95\": %.4f, \"flips\": %lld, \"nomesh_chunks\": %d, "
+                  "\"raster_flipped_tris\": %lld, \"flip_hole_px\": %lld}\n",
+                  um, ostep, pxs, flip, nstripe, L_cm, H_cm, F.D, S, dstat_q(after, 0.5), dstat_q(after, 0.95), dstat_q(before, 0.5), dstat_q(before, 0.95), after->flips,
+                  nomesh_all, nflip_all, nfhole_all); fclose(ff); }
     free(before); free(after); free(sg); free(cumin); free(cumax); free(F.U); free(F.du); free(F.dv); free(F.wt); free(segs); st_close(&F.S);
     return 0;
 }
@@ -910,7 +952,9 @@ static void *ms_read(const char *path, int f32, int nt, int *w, int *h) {
 }
 /* the stripe's valid mask at pixel resolution (a grid cell with 4 valid corners, as render) from the flat stripe's z grid; --fill-maps:
    pixels render --fill rendered (flag < RFILL_NONE: on the surface, filled along the normal, in a bridged grid hole, inpainted) join
-   it, so the bridged grid holes show in the mosaic */
+   it, so the bridged grid holes show in the mosaic. Mask 2: a filled pixel (flag >= RFILL_GRID: grid-bridged incl. the holes that
+   flipped flattening triangles leave, or inpainted RFILL_INPAINT) -- no real surface was seen there: the stripe images hatch it, the
+   overview / long strip tint cells magenta by their filled share (unroll audit 11-14 #6 / #7) */
 typedef struct { const float *Z; uint8_t *cv, *m; const uint8_t *fl; const int *cidx; int w, h, ow, oh, br; double gs; } ms_mk;
 static void ms_mk_cells(void *u, int r) {   /* grid row r: cell (r, c) valid */
     const ms_mk *K = u; const float *a = K->Z + (size_t)r * K->w, *b = a + K->w; uint8_t *o = K->cv + (size_t)r * (K->w - 1);
@@ -922,7 +966,8 @@ static void ms_mk_rows(void *u, int b) {
         int r = (int)(y / K->gs); if (r > K->h - 2) r = K->h - 2;
         const uint8_t *c = K->cv + (size_t)r * (K->w - 1); uint8_t *o = K->m + (size_t)y * K->ow;
         for (int x = 0; x < K->ow; x++) o[x] = c[K->cidx[x]];
-        if (K->fl) { const uint8_t *f = K->fl + (size_t)y * K->ow; for (int x = 0; x < K->ow; x++) o[x] |= f[x] < RFILL_NONE; }
+        if (K->fl) { const uint8_t *f = K->fl + (size_t)y * K->ow;   /* 2: filled, not seen (a bridged grid hole + RFILL_GRID, inpainted RFILL_INPAINT) */
+                     for (int x = 0; x < K->ow; x++) if (f[x] < RFILL_NONE) o[x] = f[x] >= RFILL_GRID ? 2 : 1; }
     }
 }
 static uint8_t *ms_mask(const char *dir, const char *fillp, int ow, int oh, double gs, int nt) {
@@ -940,17 +985,17 @@ static uint8_t *ms_mask(const char *dir, const char *fillp, int ow, int oh, doub
 /* one mosaic: the grey one (CT band over ink band) or, pgain > 0, the papyrus look (img_pap_rgb; CT 0 is off the papyrus) */
 typedef struct {
     const char *od; float pgain; int pbg, pbg_raw, ovpx;   /* pbg_raw: --papyrus-bg as given (the stripe JPEGs), pbg clamped (overview, long strip) */
-    int ds, ovw, bandh, rowh; double *ovs; float *ovn; double *lsum; float *lcnt;
+    int ds, ovw, bandh, rowh; double *ovs; float *ovn, *ovf; double *lsum; float *lcnt, *lfil;   /* ovf / lfil: filled pixels (mask 2) per cell */
     uint8_t *plut;   /* pgain > 0: (ct << 8 | ink) -> RGB of the stretched pair, bg where the CT is 0 */
 } ms_out;
 typedef struct {
     ms_stripe *st; int ns; const char *rd, *fd, *fmd; double gs; double hc[256], hi[256];   /* fmd: --fill-maps DIR or nullptr */
     int ca, cb, ia, ib, ctl, q, wstripes, nin, prof; double pxum; const st_seg *segs; int nseg;
     int rows; long long rowlen; int lds, lw, lh, tpx; long long ntile; double *tv, *tp; long long *tw0, *tw1;
-    int wmin, nwr; double *wv, *wp, vtot, ptot;
+    int wmin, nwr; double *wv, *wp, vtot, ptot, ftot;   /* ftot: filled pixels (mask 2) among the vtot valid */
     int nout; ms_out out[2]; uint8_t sc[256], si[256];
     int wait, rm;   /* --wait-renders: a stripe is taken when <render-dir>/<stripe>.done exists; --rm-renders: its two TIFFs deleted after use */
-    pthread_mutex_t mu; _Atomic int next, fail;
+    pthread_mutex_t mu; _Atomic int next, fail, miss;   /* miss: stripes without their renders (a gap in the mosaic) */
 } ms_ctx;
 static char *ms_fillpath(const ms_ctx *C, const char *name, char *p, size_t n) { if (!C->fmd) return nullptr; snprintf(p, n, "%s/%s_fill.tif", C->fmd, name); return p; }
 /* pass 1: histograms of the valid pixels, row bands */
@@ -966,7 +1011,7 @@ static void *ms_pass1(void *arg) {
         ms_stripe *S = &C->st[s];
         int w1, h1, w2, h2; snprintf(p, sizeof p, "%s/%s_ct.tif", C->rd, S->name); uint8_t *ct = ms_read(p, 0, C->nin, &w1, &h1);
         snprintf(p, sizeof p, "%s/%s.tif", C->rd, S->name); uint8_t *ink = ms_read(p, 0, C->nin, &w2, &h2);
-        if (!ct || !ink || w1 != w2 || h1 != h2) { fprintf(stderr, "strip-mosaic: missing renders for %s\n", S->name); free(ct); free(ink); S->ow = 0; continue; }
+        if (!ct || !ink || w1 != w2 || h1 != h2) { fprintf(stderr, "strip-mosaic: missing renders for %s\n", S->name); atomic_fetch_add(&C->miss, 1); free(ct); free(ink); S->ow = 0; continue; }
         snprintf(p, sizeof p, "%s/stripes/%s", C->fd, S->name); uint8_t *m = ms_mask(p, ms_fillpath(C, S->name, fp, sizeof fp), w1, h1, C->gs, C->nin);
         if (m) { ms_hj J = {C, ct, ink, m, (size_t)w1 * h1}; ms_parfor(C->nin, (int)((J.n + (1 << 22) - 1) >> 22), ms_hist_band, &J); }
         S->ow = w1; S->oh = h1; free(ct); free(ink); free(m);
@@ -981,14 +1026,14 @@ typedef struct {
 } ms_sj;
 static void ms_band(void *u, int b) {
     const ms_sj *J = u; ms_ctx *C = J->C; const int w = J->w, h = J->h, y0 = b * J->br, y1 = y0 + J->br < h ? y0 + J->br : h, no = C->nout;
-    int oy0[2], noy[2]; long long *os[2] = {0}, *ls[2] = {0}; int *on[2] = {0}, *lc[2] = {0};
+    int oy0[2], noy[2]; long long *os[2] = {0}, *ls[2] = {0}; int *on[2] = {0}, *lc[2] = {0}, *of[2] = {0}, *lf[2] = {0};
     const int ly0 = y0 / C->lds, nly = (y1 - 1) / C->lds - ly0 + 1;
     for (int o = 0; o < no; o++) {
         oy0[o] = y0 / C->out[o].ds; noy[o] = (y1 - 1) / C->out[o].ds - oy0[o] + 1;
-        os[o] = calloc((size_t)J->nk[o] * noy[o] * 2, 8); on[o] = calloc((size_t)J->nk[o] * noy[o], 4);
-        ls[o] = calloc((size_t)J->nl * nly * 2, 8); lc[o] = calloc((size_t)J->nl * nly, 4);
+        os[o] = calloc((size_t)J->nk[o] * noy[o] * 2, 8); on[o] = calloc((size_t)J->nk[o] * noy[o], 4); of[o] = calloc((size_t)J->nk[o] * noy[o], 4);
+        ls[o] = calloc((size_t)J->nl * nly * 2, 8); lc[o] = calloc((size_t)J->nl * nly, 4); lf[o] = calloc((size_t)J->nl * nly, 4);
     }
-    long long *tvc = calloc((size_t)J->nt * 2, 8), *tpc = tvc + J->nt, *tw = malloc((size_t)J->nt * 2 * 8), *wvc = calloc((size_t)C->nwr * 2 + 2, 8), *wpc = wvc + C->nwr + 1, vt = 0, pt = 0;
+    long long *tvc = calloc((size_t)J->nt * 2, 8), *tpc = tvc + J->nt, *tw = malloc((size_t)J->nt * 2 * 8), *wvc = calloc((size_t)C->nwr * 2 + 2, 8), *wpc = wvc + C->nwr + 1, vt = 0, pt = 0, ft = 0;
     for (int t = 0; t < J->nt; t++) { tw[2 * t] = 1 << 30; tw[2 * t + 1] = -(1 << 30); }
     uint8_t *vm = malloc((size_t)w + 2); int *wrow = malloc((size_t)J->uw * sizeof *wrow), cgr = -1;
     vm[0] = vm[w + 1] = 0;   /* (the 3x3 max: zero pads the row ends, as values are >= 0) */
@@ -1004,15 +1049,16 @@ static void ms_band(void *u, int b) {
         for (int x = J->xs; x < w; x++) {
             if (!mr[x]) continue;
             int mx = vm[x] > vm[x + 1] ? vm[x] : vm[x + 1]; if (vm[x + 2] > mx) mx = vm[x + 2];
-            const int pap = mx >= C->ctl, t = J->trel[x]; tvc[t]++; tpc[t] += pap; vt++; pt += pap;
+            const int pap = mx >= C->ctl, t = J->trel[x]; tvc[t]++; tpc[t] += pap; vt++; pt += pap; ft += mr[x] == 2;
             if (C->nseg > 0) { const int wr = wrow[J->gcol[x]];
                 if (wr != INT32_MIN) { if (wr < tw[2 * t]) tw[2 * t] = wr; if (wr > tw[2 * t + 1]) tw[2 * t + 1] = wr; wvc[wr - C->wmin]++; wpc[wr - C->wmin] += pap; } }
             const int c = cr[x], k = ir[x], sc = C->sc[c], si = C->si[k], lx = J->lrel[x];
             for (int o = 0; o < no; o++) {
                 if (C->out[o].pgain > 0 && !c) continue;   /* --papyrus: CT 0 stays out of the overview means (shown as bg) */
                 const int kk = J->kov[o][x];
-                if (kk >= 0) { const size_t a = (size_t)kk * noy[o] + oyr[o]; os[o][2 * a] += sc; os[o][2 * a + 1] += si; on[o][a]++; }
-                if (lx >= 0 && lok) { const size_t a = (size_t)lx * nly + lyr; ls[o][2 * a] += sc; ls[o][2 * a + 1] += si; lc[o][a]++; }
+                const int fil = mr[x] == 2;
+                if (kk >= 0) { const size_t a = (size_t)kk * noy[o] + oyr[o]; os[o][2 * a] += sc; os[o][2 * a + 1] += si; on[o][a]++; of[o][a] += fil; }
+                if (lx >= 0 && lok) { const size_t a = (size_t)lx * nly + lyr; ls[o][2 * a] += sc; ls[o][2 * a + 1] += si; lc[o][a]++; lf[o][a] += fil; }
             }
         }
     }
@@ -1022,23 +1068,25 @@ static void ms_band(void *u, int b) {
             const long long key = J->ka[o] + k, row = key / O->ovw, ox = key % O->ovw; if (row >= C->rows) continue;
             for (int r = 0; r < noy[o]; r++) { const size_t a = (size_t)k * noy[o] + r; if (!on[o][a]) continue;
                 const size_t g = (size_t)(row * O->rowh + oy0[o] + r) * O->ovw + ox, g2 = (size_t)(row * O->rowh + O->bandh + oy0[o] + r) * O->ovw + ox;
-                O->ovs[g] += (double)os[o][2 * a]; O->ovn[g] += (float)on[o][a]; O->ovs[g2] += (double)os[o][2 * a + 1]; O->ovn[g2] += (float)on[o][a]; }
+                O->ovs[g] += (double)os[o][2 * a]; O->ovn[g] += (float)on[o][a]; O->ovs[g2] += (double)os[o][2 * a + 1]; O->ovn[g2] += (float)on[o][a];
+                O->ovf[g] += (float)of[o][a]; O->ovf[g2] += (float)of[o][a]; }
         }
         for (int l = 0; l < J->nl; l++) for (int r = 0; r < nly; r++) { const size_t a = (size_t)l * nly + r; if (!lc[o][a]) continue;
-            const size_t g = (size_t)(ly0 + r) * C->lw + J->la + l; O->lsum[2 * g] += (double)ls[o][2 * a]; O->lsum[2 * g + 1] += (double)ls[o][2 * a + 1]; O->lcnt[g] += (float)lc[o][a]; }
+            const size_t g = (size_t)(ly0 + r) * C->lw + J->la + l; O->lsum[2 * g] += (double)ls[o][2 * a]; O->lsum[2 * g + 1] += (double)ls[o][2 * a + 1]; O->lcnt[g] += (float)lc[o][a];
+            O->lfil[g] += (float)lf[o][a]; }
     }
     for (int t = 0; t < J->nt; t++) { const long long g = J->ta + t; C->tv[g] += (double)tvc[t]; C->tp[g] += (double)tpc[t]; if (tw[2 * t] < C->tw0[g]) C->tw0[g] = tw[2 * t]; if (tw[2 * t + 1] > C->tw1[g]) C->tw1[g] = tw[2 * t + 1]; }
     for (int k = 0; k < C->nwr; k++) { C->wv[k] += (double)wvc[k]; C->wp[k] += (double)wpc[k]; }
-    C->vtot += (double)vt; C->ptot += (double)pt;
+    C->vtot += (double)vt; C->ptot += (double)pt; C->ftot += (double)ft;
     pthread_mutex_unlock(&C->mu);
-    for (int o = 0; o < no; o++) { free(os[o]); free(on[o]); free(ls[o]); free(lc[o]); }
+    for (int o = 0; o < no; o++) { free(os[o]); free(on[o]); free(ls[o]); free(lc[o]); free(of[o]); free(lf[o]); }
     free(tvc); free(tw); free(wvc); free(vm); free(wrow);
 }
 typedef struct { int w, h; const uint8_t *ct, *ink, *m, *sc, *si, *plut; int bg; } ms_rows;
 static void ms_grey_row(const ms_rows *R, int k, int y, int x0, int n, uint8_t *dst) {   /* k 0: CT, 1: ink; stretched, 0 off the surface */
     const size_t o = (size_t)y * R->w + x0;
     const uint8_t *src = (k ? R->ink : R->ct) + o, *L = k ? R->si : R->sc, *m = R->m + o;
-    for (int x = 0; x < n; x++) dst[x] = m[x] ? L[src[x]] : 0;
+    for (int x = 0; x < n; x++) dst[x] = m[x] == 2 && ((x0 + x + y) & 7) < 2 ? 255 : m[x] ? L[src[x]] : 0;   /* filled: white diagonal hatch */
 }
 static void ms_ct_row(void *u, int y, int x0, int n, uint8_t *dst) { ms_grey_row(u, 0, y, x0, n, dst); }    /* <stripe>_ct.jpg (encoder threads) */
 static void ms_ink_row(void *u, int y, int x0, int n, uint8_t *dst) { ms_grey_row(u, 1, y, x0, n, dst); }   /* <stripe>_ink.jpg */
@@ -1046,6 +1094,7 @@ static void ms_pap_row(void *u, int y, int x0, int n, uint8_t *dst) {   /* --pap
     const ms_rows *R = u; const size_t o = (size_t)y * R->w + x0; const uint8_t *c = R->ct + o, *k = R->ink + o, *m = R->m + o, bg = (uint8_t)R->bg;
     for (int x = 0; x < n; x++) { uint8_t *d = dst + 3 * x;
         if (!m[x]) { d[0] = d[1] = d[2] = bg; continue; }
+        if (m[x] == 2 && ((x0 + x + y) & 7) < 2) { d[0] = 255; d[1] = 0; d[2] = 255; continue; }   /* filled: magenta diagonal hatch */
         const uint8_t *l = R->plut + 3 * ((size_t)c[x] << 8 | k[x]); d[0] = l[0]; d[1] = l[1]; d[2] = l[2]; }
 }
 static void *ms_pass2(void *arg) {
@@ -1098,24 +1147,28 @@ static void *ms_pass2(void *arg) {
     }
     return nullptr;
 }
+/* a cell's colour toward magenta by its filled share f (0: unchanged; all filled: halfway) */
+static void ms_tint(uint8_t *o, float f) { if (!(f > 0)) return; const float a = 0.5f * (f > 1 ? 1 : f); o[0] = (uint8_t)lroundf(o[0] + a * (255 - o[0])); o[1] = (uint8_t)lroundf(o[1] * (1 - a)); o[2] = (uint8_t)lroundf(o[2] + a * (255 - o[2])); }
 /* the overview / long-strip images from the sums (rows of cells on threads; each cell computed as before) */
 typedef struct { const ms_ctx *C; const ms_out *O; uint8_t *ov, *ln; int orowh, ovh; } ms_img;
 static void ms_ov_row(void *u, int i) {   /* overview image row band r*rowh .. : grey mode the cell means, papyrus the ramp */
     const ms_img *I = u; const ms_out *O = I->O; const int x1 = O->ovw;
-    if (!(O->pgain > 0)) { const int y = i; for (int x = 0; x < x1; x++) { const size_t a = (size_t)y * x1 + x; if (O->ovn[a] > 0) { const uint8_t v = (uint8_t)lround(O->ovs[a] / O->ovn[a]); I->ov[3 * a] = I->ov[3 * a + 1] = I->ov[3 * a + 2] = v; } } return; }
+    if (!(O->pgain > 0)) { const int y = i; for (int x = 0; x < x1; x++) { const size_t a = (size_t)y * x1 + x; if (O->ovn[a] > 0) { const uint8_t v = (uint8_t)lround(O->ovs[a] / O->ovn[a]); I->ov[3 * a] = I->ov[3 * a + 1] = I->ov[3 * a + 2] = v; ms_tint(I->ov + 3 * a, O->ovf[a] / O->ovn[a]); } } return; }
     const int r = i / O->bandh, b = i % O->bandh;
     for (int x = 0; x < x1; x++) {
         const size_t a = (size_t)(r * O->rowh + b) * x1 + x, k = (size_t)(r * O->rowh + O->bandh + b) * x1 + x; if (!(O->ovn[a] > 0)) continue;
         img_pap_rgb((int)lround(O->ovs[a] / O->ovn[a]), img_pap_ink((int)lround(O->ovs[k] / O->ovn[k]), O->pgain), I->ov + 3 * ((size_t)(r * I->orowh + b) * x1 + x));
+        ms_tint(I->ov + 3 * ((size_t)(r * I->orowh + b) * x1 + x), O->ovf[a] / O->ovn[a]);
     }
 }
 static void ms_ln_row(void *u, int y) {
     const ms_img *I = u; const ms_out *O = I->O; const ms_ctx *C = I->C; const int lw = C->lw, lh = C->lh;
     if (O->pgain > 0) { for (int x = 0; x < lw; x++) { const size_t a = (size_t)y * lw + x; uint8_t *o = I->ln + 3 * a;
-        if (O->lcnt[a] > 0) img_pap_rgb((int)lround(O->lsum[2 * a] / O->lcnt[a]), img_pap_ink((int)lround(O->lsum[2 * a + 1] / O->lcnt[a]), O->pgain), o); else o[0] = o[1] = o[2] = (uint8_t)O->pbg; }
+        if (O->lcnt[a] > 0) { img_pap_rgb((int)lround(O->lsum[2 * a] / O->lcnt[a]), img_pap_ink((int)lround(O->lsum[2 * a + 1] / O->lcnt[a]), O->pgain), o); ms_tint(o, O->lfil[a] / O->lcnt[a]); } else o[0] = o[1] = o[2] = (uint8_t)O->pbg; }
         return; }
     for (int x = 0; x < lw; x++) { const size_t a = (size_t)y * lw + x; const uint8_t c = O->lcnt[a] > 0 ? (uint8_t)lround(O->lsum[2 * a] / O->lcnt[a]) : 24, k = O->lcnt[a] > 0 ? (uint8_t)lround(O->lsum[2 * a + 1] / O->lcnt[a]) : 24;
-        const size_t i0 = (size_t)y * lw + x, i1 = (size_t)(lh + y) * lw + x; I->ln[3 * i0] = I->ln[3 * i0 + 1] = I->ln[3 * i0 + 2] = c; I->ln[3 * i1] = I->ln[3 * i1 + 1] = I->ln[3 * i1 + 2] = k; }
+        const size_t i0 = (size_t)y * lw + x, i1 = (size_t)(lh + y) * lw + x; I->ln[3 * i0] = I->ln[3 * i0 + 1] = I->ln[3 * i0 + 2] = c; I->ln[3 * i1] = I->ln[3 * i1 + 1] = I->ln[3 * i1 + 2] = k;
+        if (O->lcnt[a] > 0) { ms_tint(I->ln + 3 * i0, O->lfil[a] / O->lcnt[a]); ms_tint(I->ln + 3 * i1, O->lfil[a] / O->lcnt[a]); } }
 }
 static void ms_write_out(ms_ctx *C, ms_out *O, long long Ltot, int ns, int barh) {
     char p[1600]; const int pap = O->pgain > 0, rows = C->rows, ovw = O->ovw, ds = O->ds, tpx = C->tpx; const long long rowlen = C->rowlen, ntile = C->ntile;
@@ -1142,9 +1195,14 @@ static void ms_write_out(ms_ctx *C, ms_out *O, long long Ltot, int ns, int barh)
     if (pf) { fprintf(pf, "wrap\tvalid_cm2\ton_papyrus\n"); for (int k = 0; k < C->nwr; k++) if (C->wv[k] > 0) fprintf(pf, "w%03d\t%.3f\t%.4f\n", C->wmin + k, C->wv[k] * C->pxum * C->pxum * 1e-8, C->wp[k] / C->wv[k]); fclose(pf); }
     printf("strip-mosaic: %d stripes, length %.2f cm, valid %.2f cm2, on papyrus (CT >= %d within 3x3 px) %.4f; overview %s/overview.jpg %dx%d (%d rows, 1:%d), long strip %dx%d (1:%d)\n",
            ns, Ltot * C->pxum * 1e-4, C->vtot * C->pxum * C->pxum * 1e-8, C->ctl, C->vtot > 0 ? C->ptot / C->vtot : 0, O->od, ovw, oovh, rows, ds, C->lw, pap ? C->lh : 2 * C->lh, C->lds);
+    snprintf(p, sizeof p, "%s/filled.tsv", O->od); FILE *flf = fopen(p, "w");
+    if (flf) { fprintf(flf, "filled_cm2\tfilled_share\n%.4f\t%.6f\n", C->ftot * C->pxum * C->pxum * 1e-8, C->vtot > 0 ? C->ftot / C->vtot : 0); fclose(flf); }
+    printf("strip-mosaic: filled, not seen (grid-bridged / inpainted, --fill-maps flag >= %d): %.2f cm2 = %.4f of the valid area (hatched in the stripe images, "
+           "tinted magenta in the overview / long strip)\n", RFILL_GRID, C->ftot * C->pxum * C->pxum * 1e-8, C->vtot > 0 ? C->ftot / C->vtot : 0);
 }
 int cmd_strip_mosaic(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8] [--stripe-jobs 2] [--stretch CA,CB,IA,IB] [--stretch-only 1] [--wait-renders 1] [--rm-renders 1] [--papyrus GAIN [--papyrus-bg 128]] [--papyrus-dir DIR [--papyrus-gain 1] [--papyrus-overview-px PX]] [--fill-maps DIR]\n"
+    if (argc < 5) { fprintf(stderr, "usage: ufsm strip-mosaic <flat-dir> <render-dir> <out-dir> [--strip DIR] [--ct-level 80] [--overview-px 16000] [--rows 10] [--tile-cm 1] [--quality 88] [--stripes 1] [--threads 8] [--stripe-jobs 2] [--stretch CA,CB,IA,IB] [--stretch-only 1] [--wait-renders 1] [--rm-renders 1] [--papyrus GAIN [--papyrus-bg 128]] [--papyrus-dir DIR [--papyrus-gain 1] [--papyrus-overview-px PX]] [--fill-maps DIR] [--allow-missing 1]\n"
+                          "  exit 3: stripes without their renders (missing / unreadable TIFFs): the mosaic has gaps (--allow-missing 1: exit 0)\n"
                           "  --fill-maps DIR: <stripe>_fill.tif of render --fill: its rendered pixels (bridged grid holes, fills) join the stripe mask\n"
                           "  --papyrus GAIN: papyrus-look RGB stripe JPEGs (<stripe>_papyrus.jpg), overview and long strip (ink-compare --papyrus colours,\n"
                           "  the mosaic's stretch, ink x GAIN; CT 0 / no surface in grey --papyrus-bg)\n"
@@ -1152,12 +1210,12 @@ int cmd_strip_mosaic(int argc, char **argv) {
                           "  --papyrus-gain, --papyrus-bg, --overview-px --papyrus-overview-px)\n"
                           "  --threads: threads per stripe (TIFF decode, mask, pixels); --stripe-jobs: stripes in flight (memory capped)\n"); return 2; }
     const char *fd = argv[2], *rd = argv[3], *od = argv[4];
-    const int ctl = atoi(sopt(argc, argv, "--ct-level", "80")), ovpx = atoi(sopt(argc, argv, "--overview-px", "16000")), rows = atoi(sopt(argc, argv, "--rows", "10")), q = atoi(sopt(argc, argv, "--quality", "88"));
-    const double tilecm = atof(sopt(argc, argv, "--tile-cm", "1")); const int wstripes = atoi(sopt(argc, argv, "--stripes", "1"));
-    int nthr = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8); if (nthr < 1) nthr = 1; if (nthr > 64) nthr = 64;
-    int nsj = atoi(sopt(argc, argv, "--stripe-jobs", "2")); if (nsj < 1) nsj = 1; if (nsj > 64) nsj = 64;
+    const int ctl = opt_atoi("--ct-level", sopt(argc, argv, "--ct-level", "80")), ovpx = opt_atoi("--overview-px", sopt(argc, argv, "--overview-px", "16000")), rows = opt_atoi("--rows", sopt(argc, argv, "--rows", "10")), q = opt_atoi("--quality", sopt(argc, argv, "--quality", "88"));
+    const double tilecm = opt_atof("--tile-cm", sopt(argc, argv, "--tile-cm", "1")); const int wstripes = opt_atoi("--stripes", sopt(argc, argv, "--stripes", "1"));
+    int nthr = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 8); if (nthr < 1) nthr = 1; if (nthr > 64) nthr = 64;
+    int nsj = opt_atoi("--stripe-jobs", sopt(argc, argv, "--stripe-jobs", "2")); if (nsj < 1) nsj = 1; if (nsj > 64) nsj = 64;
     const char *pdir = sopt(argc, argv, "--papyrus-dir", nullptr);
-    if (pdir && atof(sopt(argc, argv, "--papyrus", "0")) > 0) { fprintf(stderr, "strip-mosaic: --papyrus-dir with a grey main mosaic only (no --papyrus)\n"); return 2; }
+    if (pdir && opt_atof("--papyrus", sopt(argc, argv, "--papyrus", "0")) > 0) { fprintf(stderr, "strip-mosaic: --papyrus-dir with a grey main mosaic only (no --papyrus)\n"); return 2; }
     char p[1600], cmd[3300]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'%s%s%s", od, pdir ? " '" : "", pdir ? pdir : "", pdir ? "'" : ""); if (system(cmd)) return 1;
     /* the strip's segments (wrap per source column): <flat-dir>/../strip.tsv or --strip */
     char sdir[1400]; snprintf(sdir, sizeof sdir, "%s", sopt(argc, argv, "--strip", "")); if (!*sdir) snprintf(sdir, sizeof sdir, "%s/..", fd);
@@ -1189,7 +1247,7 @@ int cmd_strip_mosaic(int argc, char **argv) {
     ms_ctx *Cp = calloc(1, sizeof *Cp); ms_ctx *const C = Cp;
     C->st = st; C->ns = ns; C->rd = rd; C->fd = fd; C->gs = gs; C->nin = nthr; C->prof = getenv("UFSM_MOSAIC_PROF") != nullptr;
     C->fmd = sopt(argc, argv, "--fill-maps", nullptr);
-    pthread_mutex_init(&C->mu, nullptr); atomic_init(&C->next, 0); atomic_init(&C->fail, 0);
+    pthread_mutex_init(&C->mu, nullptr); atomic_init(&C->next, 0); atomic_init(&C->fail, 0); atomic_init(&C->miss, 0);
     /* pass 1: global contrast (CT and ink over valid pixels; integer counts: the sum is the same in any order) */
     int ca, cb, ia, ib; const char *fs = sopt(argc, argv, "--stretch", nullptr);
     if (fs) {   /* --stretch CA,CB,IA,IB: given (no pass 1: the renders need not exist yet; their sizes from the stripe grids) */
@@ -1197,16 +1255,23 @@ int cmd_strip_mosaic(int argc, char **argv) {
         for (int s = 0; s < ns; s++) { st[s].ow = render_out_px(st[s].gw, gs); st[s].oh = render_out_px(st[s].gh, gs); }
     } else {
         { pthread_t th[64]; for (int t = 0; t < nsj; t++) pthread_create(&th[t], nullptr, ms_pass1, C); for (int t = 0; t < nsj; t++) pthread_join(th[t], nullptr); }
-        hist_q(C->hc, 0.005, 0.998, &ca, &cb); hist_q(C->hi, 0.01, 0.999, &ia, &ib);
+        /* --ct-stretch-papyrus 1: the CT window from the papyrus pixels only (CT >= --ct-level): air on the surface (render --fill-ct 1 renders
+           sample it on ~half of 1667's surface, urender audit 11-14 #2) otherwise sets the low end (1667: 1..202, papyrus on 101..220) */
+        if (opt_atoi("--ct-stretch-papyrus", sopt(argc, argv, "--ct-stretch-papyrus", "0"))) { double h[256]; for (int k = 0; k < 256; k++) h[k] = k >= ctl ? C->hc[k] : 0; hist_q(h, 0.005, 0.998, &ca, &cb); }
+        else hist_q(C->hc, 0.005, 0.998, &ca, &cb);
+        hist_q(C->hi, 0.01, 0.999, &ia, &ib);
     }
+    /* --ink-fixed 1: ink grey = the probability (0..255 -> 0..255), the same p -> grey in every run and model (the percentile stretch makes a
+       grey mean a different probability per run); overrides the ink half of --stretch */
+    if (opt_atoi("--ink-fixed", sopt(argc, argv, "--ink-fixed", "0"))) { ia = 0; ib = 255; }
     fprintf(stderr, "strip-mosaic: stretch CT %d..%d, ink %d..%d\n", ca, cb, ia, ib);
-    if (atoi(sopt(argc, argv, "--stretch-only", "0"))) { printf("stretch %d,%d,%d,%d\n", ca, cb, ia, ib); return 0; }   /* (from the renders present) */
-    C->wait = atoi(sopt(argc, argv, "--wait-renders", "0")); C->rm = atoi(sopt(argc, argv, "--rm-renders", "0"));
+    if (opt_atoi("--stretch-only", sopt(argc, argv, "--stretch-only", "0"))) { printf("stretch %d,%d,%d,%d\n", ca, cb, ia, ib); return 0; }   /* (from the renders present) */
+    C->wait = opt_atoi("--wait-renders", sopt(argc, argv, "--wait-renders", "0")); C->rm = opt_atoi("--rm-renders", sopt(argc, argv, "--rm-renders", "0"));
     /* the mosaics: the main one (grey, or --papyrus) and --papyrus-dir */
     C->nout = pdir ? 2 : 1;
-    C->out[0] = (ms_out){.od = od, .pgain = (float)atof(sopt(argc, argv, "--papyrus", "0")), .pbg = atoi(sopt(argc, argv, "--papyrus-bg", "128")), .ovpx = ovpx};
-    if (pdir) C->out[1] = (ms_out){.od = pdir, .pgain = (float)atof(sopt(argc, argv, "--papyrus-gain", "1")), .pbg = atoi(sopt(argc, argv, "--papyrus-bg", "128")),
-                                   .ovpx = atoi(sopt(argc, argv, "--papyrus-overview-px", sopt(argc, argv, "--overview-px", "16000")))};
+    C->out[0] = (ms_out){.od = od, .pgain = (float)opt_atof("--papyrus", sopt(argc, argv, "--papyrus", "0")), .pbg = opt_atoi("--papyrus-bg", sopt(argc, argv, "--papyrus-bg", "128")), .ovpx = ovpx};
+    if (pdir) C->out[1] = (ms_out){.od = pdir, .pgain = (float)opt_atof("--papyrus-gain", sopt(argc, argv, "--papyrus-gain", "1")), .pbg = opt_atoi("--papyrus-bg", sopt(argc, argv, "--papyrus-bg", "128")),
+                                   .ovpx = opt_atoi("--papyrus-overview-px", sopt(argc, argv, "--papyrus-overview-px", sopt(argc, argv, "--overview-px", "16000")))};
     if (pdir && !(C->out[1].pgain > 0)) { fprintf(stderr, "strip-mosaic: --papyrus-gain > 0\n"); return 2; }
     for (int o = 0; o < C->nout; o++) { snprintf(p, sizeof p, "%s/stretch.txt", C->out[o].od); FILE *sf = fopen(p, "w"); if (sf) { fprintf(sf, "%d,%d,%d,%d\n", ca, cb, ia, ib); fclose(sf); } }   /* (for --stretch) */
     for (int v = 0; v < 256; v++) { C->sc[v] = stretch(v, ca, cb); C->si[v] = stretch(v, ia, ib); }
@@ -1217,7 +1282,7 @@ int cmd_strip_mosaic(int argc, char **argv) {
         int ds = (int)((rowlen + O->ovpx - 1) / O->ovpx); if (ds < 1) ds = 1;
         while ((long long)rows * (2 * ((Hpx + ds - 1) / ds) + 16) > 65000) ds++;   /* (the JPEG limit on the folded height) */
         O->ds = ds; O->ovw = (int)((rowlen + ds - 1) / ds); O->bandh = (Hpx + ds - 1) / ds; O->rowh = 2 * O->bandh + barh + 10;
-        O->ovs = calloc((size_t)O->ovw * rows * O->rowh, 8); O->ovn = calloc((size_t)O->ovw * rows * O->rowh, 4);
+        O->ovs = calloc((size_t)O->ovw * rows * O->rowh, 8); O->ovn = calloc((size_t)O->ovw * rows * O->rowh, 4); O->ovf = calloc((size_t)O->ovw * rows * O->rowh, 4);
         O->pbg_raw = O->pbg; O->pbg = O->pbg < 0 ? 0 : O->pbg > 255 ? 255 : O->pbg;
         if (O->pgain > 0) { O->plut = malloc(65536 * 3);
             for (int c = 0; c < 256; c++) for (int k = 0; k < 256; k++) { uint8_t *l = O->plut + 3 * (c << 8 | k);
@@ -1225,7 +1290,7 @@ int cmd_strip_mosaic(int argc, char **argv) {
     }
     const int lds = (int)((Ltot + 65000 - 1) / 65000) < 1 ? 1 : (int)((Ltot + 65000 - 1) / 65000);   /* the one-row strip */
     const int lw = (int)((Ltot + lds - 1) / lds), lh = (Hpx + lds - 1) / lds;
-    for (int o = 0; o < C->nout; o++) { C->out[o].lsum = calloc((size_t)lw * lh * 2, 8); C->out[o].lcnt = calloc((size_t)lw * lh, 4); }
+    for (int o = 0; o < C->nout; o++) { C->out[o].lsum = calloc((size_t)lw * lh * 2, 8); C->out[o].lcnt = calloc((size_t)lw * lh, 4); C->out[o].lfil = calloc((size_t)lw * lh, 4); }
     /* papyrus along the strip: per tile-cm column of the strip (all rows) and per wrap */
     const int tpx = (int)lround(tilecm * 1e4 / pxum); const long long ntile = Ltot / tpx + 1;
     double *tv = calloc((size_t)ntile, 8), *tp = calloc((size_t)ntile, 8); long long *tw0 = malloc((size_t)ntile * 8), *tw1 = malloc((size_t)ntile * 8);
@@ -1244,11 +1309,14 @@ int cmd_strip_mosaic(int argc, char **argv) {
         if (pf) { fprintf(pf, "u_cm\tvalid_cm2\ton_papyrus\twrap_lo\twrap_hi\n");
                   for (long long t = 0; t < ntile; t++) if (tv[t] > 0) fprintf(pf, "%.2f\t%.4f\t%.4f\t%lld\t%lld\n", t * tilecm, tv[t] * pxum * pxum * 1e-8, tp[t] / tv[t], tw0[t], tw1[t]);
                   fclose(pf); }
-        free(O->ovs); free(O->ovn); free(O->lsum); free(O->lcnt); free(O->plut);
+        free(O->ovs); free(O->ovn); free(O->ovf); free(O->lsum); free(O->lcnt); free(O->lfil); free(O->plut);
     }
     if (C->prof) fprintf(stderr, "strip-mosaic prof: overview / long strip / tables %.2f s\n", snow() - tw);
+    /* a stripe without its renders is a gap in the mosaic: written, but the exit says so (the run scripts stop on it; audit 11-14 #11) */
+    const int miss = atomic_load(&C->miss), allow = opt_atoi("--allow-missing", sopt(argc, argv, "--allow-missing", "0"));
+    if (miss) fprintf(stderr, "strip-mosaic: %d of %d stripes missing renders (a gap in the mosaic)%s\n", miss, ns, allow ? ", allowed (--allow-missing)" : "");
     free(st); free(tv); free(tp); free(tw0); free(tw1); free(wv); free(wp); free(segs); pthread_mutex_destroy(&C->mu); free(C);
-    return 0;
+    return miss && !allow ? 3 : 0;
 }
 
 /* ufsm strip-crop <in.tif> <out.jpg> x,y,w,h [--stretch 1]: a rectangle of a big uint8 render TIFF (stripes are 60000 px wide: past the
@@ -1264,7 +1332,7 @@ int cmd_strip_crop(int argc, char **argv) {
     if (c[2] < 1 || c[3] < 1) { fprintf(stderr, "strip-crop: empty rectangle\n"); free(im); return 2; }
     uint8_t *o = malloc((size_t)c[2] * c[3]), *m = malloc((size_t)c[2] * c[3]);
     for (int y = 0; y < c[3]; y++) for (int x = 0; x < c[2]; x++) { const uint8_t v = im[(size_t)(c[1] + y) * w + c[0] + x]; o[(size_t)y * c[2] + x] = v; m[(size_t)y * c[2] + x] = v > 0; }
-    if (atoi(sopt(argc, argv, "--stretch", "1"))) img_stretch(o, m, (size_t)c[2] * c[3], 0.01, 0.995);
+    if (opt_atoi("--stretch", sopt(argc, argv, "--stretch", "1"))) img_stretch(o, m, (size_t)c[2] * c[3], 0.01, 0.995);
     const int rc = jpeg_write_gray(argv[3], c[2], c[3], o, 90);
     free(im); free(o); free(m); return rc ? 1 : 0;
 }

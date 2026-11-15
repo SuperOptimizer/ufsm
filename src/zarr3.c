@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -12,6 +13,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 #include <zstd.h>
 #define VOLCOMP_IMPLEMENTATION
 #include "volcomp.h"
@@ -44,6 +46,7 @@ static int fail(const char *fmt, ...) {
 static int option_on(const char *name) { const char *v = getenv(name); return !v || (*v && strcmp(v, "0")); }
 
 typedef struct { uint64_t off, len; } ientry_t;
+static uint64_t z3_next_id(void) { static atomic_uint_fast64_t next_id = 1; return atomic_fetch_add(&next_id, 1); }   /* (every z3, derived ones too: zcache keys) */
 struct z3 {
     store *s;
     char *key;
@@ -74,6 +77,7 @@ static int parse_codecs(const json *codecs, z3_meta *m) {
         else if (!strcmp(name, "latvol")) m->latvol = 1;
         else if (!strcmp(name, "zstd")) m->zstd = 1;
         else if (!strcmp(name, "bytes")) m->raw = 1;
+        else if (!strcmp(name, "crc32c")) { if (i + 1 != codecs->n) return FAIL("crc32c must be the last inner codec"); m->crc = 1; }   /* (audit mini/volcomp 1: volcomp has no checksum of its own) */
         else if (!strcmp(name, "transpose")) return FAIL("unsupported codec %s", name);
         else return FAIL("unsupported codec %s", name);
     }
@@ -83,10 +87,9 @@ static int parse_codecs(const json *codecs, z3_meta *m) {
 }
 
 static void group_scale(store *s, const char *key, z3_meta *m) {
-    const char *slash = strrchr(key, '/');
-    if (!slash) return;
+    const char *slash = strrchr(key, '/'), *name = slash ? slash + 1 : key;   /* (no slash: the level directly under the store root, the group) */
     char gk[1024];
-    snprintf(gk, sizeof gk, "%.*s/zarr.json", (int)(slash - key), key);
+    if (slash) snprintf(gk, sizeof gk, "%.*s/zarr.json", (int)(slash - key), key); else snprintf(gk, sizeof gk, "zarr.json");
     size_t n;
     uint8_t *txt = store_read_all(s, gk, &n);
     if (!txt) return;
@@ -94,23 +97,44 @@ static void group_scale(store *s, const char *key, z3_meta *m) {
     free(txt);
     const json *ds = json_path(j, "attributes.ome.multiscales.0.datasets");
     if (!ds) ds = json_path(j, "attributes.multiscales.0.datasets");
+    double s0 = 0;   /* the group's finest scale (the smallest: the base level of a raster pyramid) */
     for (size_t i = 0; ds && i < ds->n; i++) {
-        const json *d = json_at(ds, i);
-        if (!strcmp(json_str(json_get(d, "path"), ""), slash + 1)) {
-            const json *ct = json_get(d, "coordinateTransformations");
-            for (size_t k = 0; ct && k < ct->n; k++)
-                if (!strcmp(json_str(json_get(json_at(ct, k), "type"), ""), "scale"))
-                    m->scale_um = json_num(json_path(json_at(ct, k), "scale.0"), 0);
-        }
+        const json *d = json_at(ds, i), *ct = json_get(d, "coordinateTransformations");
+        for (size_t k = 0; ct && k < ct->n; k++)
+            if (!strcmp(json_str(json_get(json_at(ct, k), "type"), ""), "scale")) {
+                const double sc = json_num(json_path(json_at(ct, k), "scale.0"), 0);
+                if (sc > 0 && (s0 <= 0 || sc < s0)) s0 = sc;
+                if (!strcmp(json_str(json_get(d, "path"), ""), name)) m->scale_um = sc;
+            }
     }
+    if (m->label_pooled < 0 && s0 > 0 && m->scale_um > s0) m->label_pooled = (int)lround(log2(m->scale_um / s0));
     json_free(j);
 }
 
+/* the HTTP chunk cache of one array is valid for one generation of it (the dcache audit 2026-11-14 #4): the zarr.json's validators
+   (ETag, Last-Modified, length) are kept in <cache>/<key>/.validators; when a re-upload changes them, the array's cached shard indexes,
+   chunks and "missing" markers are moved aside (<key>.stale-<time>-<pid>, delete at leisure) instead of being read at stale offsets.
+   A cache from before the file adopts the current validators. */
+static int mkdirs(const char *path);
+static void cache_validate(const char *cache, const char *key, const char *val) {
+    if (!cache || !val || !*val) return;
+    char d[1400], vp[1500], old[512] = ""; snprintf(d, sizeof d, "%s/%s", cache, key); snprintf(vp, sizeof vp, "%s/.validators", d);
+    FILE *f = fopen(vp, "r"); if (f) { if (!fgets(old, sizeof old, f)) old[0] = 0; fclose(f); size_t l = strlen(old); while (l && old[l - 1] == '\n') old[--l] = 0; }
+    if (f && !strcmp(old, val)) return;
+    if (f) {   /* a new generation of the array: its cached items are stale */
+        char st[1500]; snprintf(st, sizeof st, "%s.stale-%lld-%d", d, (long long)time(nullptr), (int)getpid());
+        if (!rename(d, st)) fprintf(stderr, "z3: %s changed upstream (%s -> %s): its chunk cache moved to %s\n", key, old, val, st);
+    }
+    char tmp[1600]; snprintf(tmp, sizeof tmp, "%s.%d", vp, (int)getpid());
+    if (mkdirs(d)) return;
+    FILE *w = fopen(tmp, "w"); if (!w) return;
+    fprintf(w, "%s\n", val); if (fclose(w) || rename(tmp, vp)) unlink(tmp);
+}
 static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int typed) {
-    char mk[1024];
+    char mk[1024], val[512];
     snprintf(mk, sizeof mk, "%s/zarr.json", key);
     size_t n;
-    uint8_t *txt = store_read_all(s, mk, &n);
+    uint8_t *txt = store_read_all_v(s, mk, &n, val, sizeof val);
     if (!txt) { FAIL("cannot read %s", mk); return nullptr; }
     json *j = json_parse((char *)txt, n);
     free(txt);
@@ -118,8 +142,9 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
     z3 *z = calloc(1, sizeof *z);
     z->s = s;
     z->key = strdup(key);
-    { static atomic_uint_fast64_t next_id = 1; z->id = atomic_fetch_add(&next_id, 1); }
+    z->id = z3_next_id();
     z->cache = store_cache_dir(s, cache_dir);   /* (per root: a cache directory is never shared by two roots) */
+    cache_validate(z->cache, key, val);
     pthread_mutex_init(&z->imu, nullptr);
     z3_meta *m = &z->m;
     m->sep = '/';
@@ -132,6 +157,7 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
     for (int i = 0; i < 3; i++) m->shape[i] = (int64_t)json_num(json_at(shape, (size_t)i), 0);
     m->fill = (int)json_num(json_get(j, "fill_value"), 0); m->fillv = json_num(json_get(j, "fill_value"), 0);
     m->label_binary = !strcmp(json_str(json_path(j, "attributes.ufsm.encoding"), ""), "binary");
+    m->label_pooled = (int)json_num(json_path(j, "attributes.ufsm.pooled"), -1);   /* (-1: from the group scales in group_scale, else 0) */
     const json *cs = json_path(j, "chunk_grid.configuration.chunk_shape");
     if (!cs || cs->n != 3) { FAIL("%s: no chunk_shape", key); goto bad; }
     for (int i = 0; i < 3; i++) m->shard[i] = m->chunk[i] = (int)json_num(json_at(cs, (size_t)i), 0);
@@ -161,12 +187,13 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
         free(sb);
     }
     for (int i = 0; i < 3; i++) {
-        if (m->chunk[i] <= 0 || m->shard[i] % m->chunk[i]) { FAIL("%s: shard not a multiple of chunk", key); goto bad; }
+        if (m->chunk[i] <= 0 || m->shard[i] <= 0 || m->shard[i] % m->chunk[i]) { FAIL("%s: shard not a positive multiple of chunk", key); goto bad; }   /* (shard 0 passed and divided by zero in the reads: audit mini/zarr 1) */
         z->cgrid[i] = m->shard[i] / m->chunk[i];
     }
     z->nc = z->cgrid[0] * z->cgrid[1] * z->cgrid[2];
     json_free(j);
     group_scale(s, key, m);
+    if (m->label_pooled < 0) m->label_pooled = 0;
     return z;
 bad:
     json_free(j);
@@ -180,6 +207,7 @@ z3 *z3_open_typed(store *s, const char *key, const char *cache_dir) { return z3_
 z3 *z3_open_derived(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*ctx_free)(void *)) {
     if (!base || !derive) return nullptr;
     z3 *z = calloc(1, sizeof *z); if (!z) return nullptr;
+    z->id = z3_next_id();
     z->m = base->m; z->m.fill = fill; z->m.label_binary = 0; z->nc = base->nc; memcpy(z->cgrid, base->cgrid, sizeof z->cgrid);
     char k[1200]; snprintf(k, sizeof k, "%s#derived", base->key ? base->key : "");
     z->key = strdup(k); z->base = base; z->derive = derive; z->dctx = ctx; z->dfree = ctx_free;
@@ -245,6 +273,7 @@ void z3_close(z3 *z) {
 }
 
 const z3_meta *z3_meta_of(const z3 *z) { return &z->m; }
+uint64_t z3_id(const z3 *z) { return z ? z->id : 0; }
 const void *z3_latvol(const z3 *z) { return z && !z->derive ? z->lv : nullptr; }
 const char *z3_key(const z3 *z) { return z->key; }
 const char *z3_root(const z3 *z) { while (z && !z->s && z3_base_of(z)) z = z3_base_of(z); return z && z->s ? store_root(z->s) : ""; }
@@ -285,7 +314,7 @@ static int mkdirs(const char *path) {
     return mkdir(tmp, 0755) && errno != EEXIST ? -1 : 0;
 }
 
-/* cache file for (shard, item): item = "idx", "missing" or the inner chunk number */
+/* cache file for (shard, item): item = "idx", "missing" (a 404 shard, honoured for UFSM_CACHE_MISSING_TTL_S, then unlinked and asked again: load_index) or the inner chunk number */
 static void cache_path(const z3 *z, const char *skey, const char *item, char *buf, size_t n) {
     snprintf(buf, n, "%s/%s.%s", z->cache, skey, item);
 }
@@ -450,17 +479,42 @@ static int load_index(z3 *z, const char *skey, ientry *idx) {
     size_t ilen = (size_t)z->nc * 16 + 4, n = 0;
     int fetched = 0;
     uint64_t payload_size = UINT64_MAX;
+    /* the cached index carries the shard's payload size after it (8 bytes + a CRC32C, below; an older entry without it: no range check), so
+       entries read from the cache are range-checked too (audit mini/zarr 6). A missing shard (404) is cached on disk as a "missing" marker
+       for UFSM_CACHE_MISSING_TTL_S (600 s) only: a shard being re-uploaded was read as fill for every later run sharing the cache dir
+       (audit mini/store 3, mini/zarr 7, dcache #4), while not caching 404s at all made every warm read of a sparse array ask for each
+       absent shard again (test_http_reader's warm-cache check, the mega sweep 11-14). Each process logs a missing shard once. */
     uint8_t *b = cache_get(z, skey, "idx", &n);
+    /* (the cached entry: the index, the payload size, a CRC32C over both (12 bytes after the index). The size has its own check: a
+       flipped bit in it widened the range check and the corrupt entry was used (test_http_reader's corrupt-cache case, mega sweep
+       11-14). An entry of the index + size alone (the mega branch before this fix) has no check: its size is ignored) */
+    if (b && n == ilen + 12) {
+        uint32_t sc; memcpy(&sc, b + ilen + 8, 4);
+        if (index_crc(b, ilen + 8) != sc) { free(b); return FAIL("%s: cached index CRC32C mismatch (its payload size)", skey); }
+        memcpy(&payload_size, b + ilen, 8); n = ilen;
+    } else if (b && n == ilen + 8) n = ilen;
     if (!b) {
         uint8_t *missing = cache_get(z, skey, "missing", &n);
-        if (missing) { free(missing); imem_put(z, skey, nullptr, 0); return 0; }
-        b = malloc(ilen);
+        if (missing) {   /* an absent shard is re-checked after UFSM_CACHE_MISSING_TTL_S (600) s: a later upload is seen (the dcache audit #4) */
+            free(missing); char mp[1400]; struct stat ms; cache_path(z, skey, "missing", mp, sizeof mp);
+            static double ttl = -1; /* mgpu: env (a racy first read sets the same value) */ if (ttl < 0) { const char *e = getenv("UFSM_CACHE_MISSING_TTL_S"); ttl = e && *e ? atof(e) : 600; }
+            if (stat(mp, &ms) || difftime(time(nullptr), ms.st_mtime) < ttl) { imem_put(z, skey, nullptr, 0); return 0; }
+            unlink(mp);
+        }
+        b = malloc(ilen + 12);
         if (!b) return FAIL("index allocation for %s", skey);
         int64_t size = -1, got = store_read_tail(z->s, skey, (int64_t)ilen, b, &size);   /* one suffix-range GET */
-        if (got == -2) { free(b); cache_put(z, skey, "missing", (const uint8_t *)"", 0); imem_put(z, skey, nullptr, 0); return 0; }
+        if (got == -2) {
+            free(b); imem_put(z, skey, nullptr, 0); cache_put(z, skey, "missing", (const uint8_t *)"", 0);   /* (re-checked after the TTL above) */
+            if (!store_is_local(z->s)) fprintf(stderr, "zarr3: shard %s is missing (HTTP 404): read as fill value\n", skey);
+            return 0;
+        }
         if (size >= 0 && (uint64_t)size < ilen) { free(b); return FAIL("%s: shorter than its index", skey); }
         if (got != (int64_t)ilen) { free(b); return FAIL("read index of %s (HTTP %ld)", skey, store_last_status()); }
+        if (size < 0) { free(b); return FAIL("%s: index read without the object's size", skey); }
         payload_size = (uint64_t)size - ilen;
+        memcpy(b + ilen, &payload_size, 8);
+        { const uint32_t sc = index_crc(b, ilen + 8); memcpy(b + ilen + 8, &sc, 4); }
         n = ilen; fetched = 1;
     }
     if (n != ilen) { free(b); return FAIL("%s: bad index size", skey); }
@@ -477,7 +531,7 @@ static int load_index(z3 *z, const char *skey, ientry *idx) {
             free(b); return FAIL("%s: chunk %d range outside shard payload", skey, i);
         }
     }
-    if (fetched) cache_put(z, skey, "idx", b, n);
+    if (fetched) cache_put(z, skey, "idx", b, n + 12);
     free(b);
     imem_put(z, skey, idx, 1);
     return 1;
@@ -590,6 +644,16 @@ static int make_sink(const job *jb, const work *w, vfx_sink *k) {
     k->off = (ptrdiff_t)(((c0[0] - jb->o[0]) * jb->n[1] + (c0[1] - jb->o[1])) * jb->n[2] + (c0[2] - jb->o[2]));
     return 1;
 }
+/* the inner chain's crc32c (zarr v3: 4 bytes, little endian, after the encoded chunk): checked and stripped; a bit flip inside a volcomp
+   payload otherwise decodes with status OK (audit mini/volcomp 1), and a block-level read never reaches volcomp's own end-of-stream
+   check (volcomp 2): the CRC covers the whole chunk before any of it is decoded */
+static int crc_strip(const z3 *z, const uint8_t *b, size_t *n, const char *what) {
+    if (!z->m.crc) return 0;
+    if (*n < 4) return FAIL("%s: chunk shorter than its crc32c", what);
+    uint32_t want; memcpy(&want, b + *n - 4, 4);
+    if (index_crc(b, *n - 4) != want) return FAIL("%s: chunk crc32c mismatch", what);
+    *n -= 4; return 0;
+}
 static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, ZSTD_DCtx *dctx, uint8_t *scratch, int *mask, uint32_t submask, uint8_t *dsink, _Atomic uint32_t *dmask, int lean, uint32_t *hsub,
                        const vfx_sink *k, int *sunk) {
     *hsub = 0xffffffffu;   /* the substreams dec holds (all but for a lean device-sink read) */
@@ -597,6 +661,7 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
     const z3_meta *m = &z->m;
     size_t cv = (size_t)m->chunk[0] * m->chunk[1] * m->chunk[2];
     if (mask) *mask = 0;
+    if (crc_strip(z, enc, &n, z->key)) return -1;
     if (m->zstd) {
         const size_t cap = m->esize > 1 ? (VOLCOMP_TYPED_ENCODE_BOUND > cv * m->esize ? VOLCOMP_TYPED_ENCODE_BOUND : cv * m->esize) : (VOLCOMP_ENCODE_BOUND > cv ? VOLCOMP_ENCODE_BOUND : cv);
         size_t r = ZSTD_decompressDCtx(dctx, scratch, cap, enc, n);
@@ -619,6 +684,9 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
         volcomp_status st;
         if (k && cv == VOLCOMP_CHUNK_VOXELS && vll_chunk_mode(enc, n, &mode) == VOLCOMP_OK && (mode == VLL_MODE_LOSSY || mode == VLL_MODE_CODED || mode == VLL_MODE_CONST)) {
             const uint32_t subs = vfx_sink_subs(k);   /* (an error: the reference path below, whose status and bytes then hold) */
+            /* a failing sink may have written some substreams into the caller's output already: with *sunk 0 the caller copies the
+               reference's dec over that span, and on a reference error FAIL is returned, after which the span is undefined (as any
+               failed read's output) (audit mini/volcomp 5) */
             if (mode == VLL_MODE_CONST) {
                 if (n == VF_HDR_BYTES + 1u) {
                     for (int zz = k->b0[0]; zz < k->b1[0]; zz++) for (int yy = k->b0[1]; yy < k->b1[1]; yy++)
@@ -643,7 +711,7 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
             const int lean1 = lean && dsink;   /* z3_read_sub_dev_lean: only the host-decoded substreams are copied out, no zeroing */
             if (sub && !lean1) memset(dec, 0, cv);
             if (zshm_on()) {
-                hk = XXH3_128bits(enc, n);
+                hk = XXH3_128bits(enc, n); hk.low64 ^= zshm_decoder_tag(VOLCOMP_VERSION_STRING);   /* (the decoder's identity: zshm.h) */
                 for (uint32_t s = 0; s < VF_NSUB; s++) if (want >> s & 1 && zshm_get(hk.low64, hk.high64, s, dec)) need &= ~(1u << s);
             }
             st = VOLCOMP_OK;
@@ -726,6 +794,7 @@ int z3_chunk_raw(z3 *z, int64_t cz, int64_t cy, int64_t cx, uint8_t **buf, size_
             atomic_fetch_add(&g_z3_store_reads, 1); cache_put(z, skey, item, b, len);
         }
     }
+    if (crc_strip(z, b, &len, skey)) { free(b); return -1; }
     if (z->m.zstd) {
         const size_t cap = VOLCOMP_TYPED_ENCODE_BOUND; uint8_t *d = malloc(cap);
         size_t r = d ? ZSTD_decompress(d, cap, b, len) : 0; free(b);
@@ -779,7 +848,7 @@ static int prefetch_indices(z3 *z, const int64_t *s0, const int64_t *s1, int nth
     if (!j.cold) return FAIL("index work allocation");
     for (int i = 0; i < count; i++) {
         char key[1200]; index_key(&j, i, key, sizeof key);
-        if (!imem_known(z, key) && !cache_has(z, key, "idx") && !cache_has(z, key, "missing")) j.cold[j.total++] = i;
+        if (!imem_known(z, key) && !cache_has(z, key, "idx")) j.cold[j.total++] = i;
     }
     if (!j.total) { free(j.cold); return 0; }
     int nt = nthreads > 0 ? nthreads : 16;

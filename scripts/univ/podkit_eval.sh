@@ -25,7 +25,7 @@ put $G/PHerc0139-wind-20261016/codes/18.72 $K/wbgt/PHerc0139-wind-20261016/codes
 put $G/PHerc0814-wind-20261019/codes/18.724 $K/wbgt/PHerc0814-wind-20261019/codes/18.724 0.5 $BT PHerc0814
 put $G/PHerc0500P2-wind-20261019/codes/18.724 $K/wbgt/PHerc0500P2-wind-20261019/codes/18.724 0.5 $BT PHerc0500P2
 printf '#\nHOLD\tparis4\t12288\t4096\t3584\t512\t576\t768\t2\tfibre hold\n' > $T/hold.tsv
-put $G/paris4-wind-20261019/phaseA/9.6 $K/wbgt/paris4-wind-20261019/phaseA/9.6 1 $T/hold.tsv paris4   # (HOLD: 9.6 um voxels, as in boxes.tsv)
+put /vesuvius/ufsm/gt/paris4-phaseA-evalboxes-20261114/phaseA/9.6 $K/wbgt/paris4-wind-20261019/phaseA/9.6 1 $T/hold.tsv paris4   # (HOLD: 9.6 um voxels, as in boxes.tsv; phaseA rebuilt 11-14 for the eval boxes, the original was deleted 11-12)
 $E $HOST "mkdir -p $K/small/axis $K/wbgt/axis $K/wb/bin $K/wb/ceil $K/wb/res $K/wb/xres $K/wb/inkeval $K/ckpt" < /dev/null
 rsync -a -e "$E" /vesuvius/ufsm/teacher/axis-0.json $HOST:$K/small/axis/paris4-axis-0.json < /dev/null
 rsync -a -e "$E" /vesuvius/ufsm/umbilicus/PHerc1667/umbilicus-full-resolution.json $HOST:$K/small/axis/PHerc1667-umbilicus.json < /dev/null

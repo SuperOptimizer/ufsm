@@ -3,6 +3,7 @@
    order, same sampling density (0.5 voxel along both quad edges at the target level, capped at 256). tests/test_codes_onfly.sh holds the
    two byte-identical. */
 #include "meshcodes.h"
+#include "optcheck.h"
 #include "meshcodesgpu.h"
 #include "reg.h"
 #include "store.h"
@@ -23,6 +24,10 @@
 typedef struct { int w, h; float *xyz; uint8_t *valid; float *val; } mc_mesh;   /* xyz: level-0 x, y, z per vertex (after the map) */
 typedef struct { int mi, r0, r1, c0, c1; float lo[3], hi[3]; } mc_tile;        /* bounds in level-0 z, y, x */
 typedef struct { mc_mesh *m; int nm; mc_tile *t; size_t nt; double scale; void *pk; size_t pkn; char id[48]; } mc_ctx;   /* pk: the mmap'd pack (meshes + tiles point into it) */
+/* The grid convention (2026-11-14, branch datafix): level-l voxel j is centred on level-0 2^l j + (2^l - 1) / 2, the centre of its 2^l block,
+   as the CT pyramid (ingest pool2_mean), the ink and fibre rasters have it: a sample at level-0 x lands in floor(x 2^-l + 2^-l / 2). Before,
+   floor(x 2^-l + 1/2) centred it on 2^l j: the codes sat 0.25 (level 1) / 0.375 (level 2) level voxels off the CT, the sign flipped by the
+   symmetry augmentation (a blur). Level 0 is unchanged; the derived-cache id is v2 for level > 0 (v1 cells are stale there) */
 
 static double mc_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static inline uint8_t mc_code(double q) { long k = lround(q * 18.0) % 252; if (k < 0) k += 252; return (uint8_t)(1 + k); }
@@ -68,22 +73,34 @@ static void mc_free(void *vp) {
    load and ~7 GB of heap per process). <dir>/.meshcodes-<16 hex>.pack, or under $UFSM_MESHCODES_CACHE when set (a read-only meshes dir);
    UFSM_MESHCODES_CACHE=off: none. The key names every input (each mesh's four TIFFs with size and mtime, the value name, the map file
    with size and mtime, this layout's version); a pack whose stored key differs is rebuilt. Written to a temporary name and renamed.
-   Layout (8-byte aligned): "UFMC0001", u64 key length, u64 meshes, u64 tiles, key, {i32 w, i32 h} per mesh, tiles, then per mesh xyz
+   Layout (8-byte aligned): "UFMC0002" (0001: the v1 key, rebuilt), u64 key length, u64 meshes, u64 tiles, key, {i32 w, i32 h} per mesh, tiles, then per mesh xyz
    (12 n bytes), val (4 n), valid (n). */
 #define MC_AL(x) (((x) + 7) & ~(size_t)7)
+#if __has_include("label_versions.h")
+#include "label_versions.h"
+#endif
+#ifndef LBL_MESHCODES_LOAD
+#define LBL_MESHCODES_LOAD 2   /* (label_versions.h, dckey-20261114: 2 = the pack key with the mesh dir and ns mtimes) */
+#endif
+/* the pack key: LBL_MESHCODES_LOAD, the mesh dir's realpath (two sets with the same mesh names / sizes / mtimes, copies or tests, shared one
+   pack before: the second read the first one's meshes), per mesh its tifxyz files' size + mtime in ns (st_mtim: a rewrite within the same
+   second changed nothing in the key), and the map's realpath / size / mtime with its field */
 static void mc_key(char *k, size_t nk, const char *dir, char **names, int nn, const char *value, const char *mapp) {
-    size_t u = (size_t)snprintf(k, nk, "meshcodes pack v1|value %s|", value); struct stat st;
+    char drp[4200]; if (!realpath(dir, drp)) snprintf(drp, sizeof drp, "%s", dir);
+    size_t u = (size_t)snprintf(k, nk, "meshcodes pack v%d|dir %s|value %s|", LBL_MESHCODES_LOAD, drp, value); struct stat st;
+#define MC_NS(s_) (long long)(s_).st_mtim.tv_sec, (long long)(s_).st_mtim.tv_nsec
     for (int i = 0; i < nn && u < nk; i++) { u += (size_t)snprintf(k + u, nk - u, "%s", names[i]);
         const char *f[4] = {"x.tif", "y.tif", "z.tif", value};
         for (int a = 0; a < 4 && u < nk; a++) { char p[2400]; snprintf(p, sizeof p, "%s/%s/%s", dir, names[i], f[a]);
             if (stat(p, &st)) memset(&st, 0, sizeof st);
-            u += (size_t)snprintf(k + u, nk - u, ":%lld.%lld", (long long)st.st_size, (long long)st.st_mtime); }
+            u += (size_t)snprintf(k + u, nk - u, ":%lld.%lld.%09lld", (long long)st.st_size, MC_NS(st)); }
         if (u < nk) u += (size_t)snprintf(k + u, nk - u, "|"); }
     if (mapp && *mapp && u < nk) { char rp[4200]; if (!realpath(mapp, rp)) snprintf(rp, sizeof rp, "%s", mapp);
         if (stat(rp, &st)) memset(&st, 0, sizeof st);
-        char fp[4300]; snprintf(fp, sizeof fp, "%s", rp); char *sl = strrchr(fp, '/'); struct stat sf; long long fs = 0, fm = 0;   /* (the field beside reg.json) */
-        if (sl) { snprintf(sl + 1, sizeof fp - (size_t)(sl + 1 - fp), "field.f32"); if (!stat(fp, &sf)) { fs = sf.st_size; fm = sf.st_mtime; } }
-        snprintf(k + u, nk - u, "map %s:%lld.%lld:field %lld.%lld", rp, (long long)st.st_size, (long long)st.st_mtime, fs, fm); }
+        char fp[4300]; snprintf(fp, sizeof fp, "%s", rp); char *sl = strrchr(fp, '/'); struct stat sf; memset(&sf, 0, sizeof sf);   /* (the field beside reg.json) */
+        if (sl) { snprintf(sl + 1, sizeof fp - (size_t)(sl + 1 - fp), "field.f32"); if (stat(fp, &sf)) memset(&sf, 0, sizeof sf); }
+        snprintf(k + u, nk - u, "map %s:%lld.%lld.%09lld:field %lld.%lld.%09lld", rp, (long long)st.st_size, MC_NS(st), (long long)sf.st_size, MC_NS(sf)); }
+#undef MC_NS
 }
 static uint64_t mc_hash(const char *s) { uint64_t h = 1469598103934665603ull; for (; *s; s++) { h ^= (uint8_t)*s; h *= 1099511628211ull; } return h; }
 static int mc_pack_path(char *out, size_t n, const char *dir, const char *key) {
@@ -95,7 +112,7 @@ static int mc_pack_write(const mc_ctx *X, const char *path, const char *key) {
     FILE *f = fopen(tmp, "wb"); if (!f) return -1;
     const uint64_t hd[3] = {strlen(key), (uint64_t)X->nm, X->nt}; const char z8[8] = {0}; int ok = 1;
 #define MC_W(p, n) do { const size_t n_ = (n); ok = ok && fwrite((p), 1, n_, f) == n_ && fwrite(z8, 1, MC_AL(n_) - n_, f) == MC_AL(n_) - n_; } while (0)
-    MC_W("UFMC0001", 8); MC_W(hd, sizeof hd); MC_W(key, hd[0]);
+    MC_W("UFMC0002", 8); MC_W(hd, sizeof hd); MC_W(key, hd[0]);
     for (int i = 0; i < X->nm; i++) { const int32_t wh[2] = {X->m[i].w, X->m[i].h}; MC_W(wh, 8); }
     MC_W(X->t, X->nt * sizeof *X->t);
     for (int i = 0; i < X->nm; i++) { const size_t n = (size_t)X->m[i].w * X->m[i].h; MC_W(X->m[i].xyz, n * 12); MC_W(X->m[i].val, n * 4); MC_W(X->m[i].valid, n); }
@@ -110,7 +127,7 @@ static mc_ctx *mc_pack_open(const char *path, const char *key) {
     uint8_t *b = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0); close(fd); if (b == MAP_FAILED) return nullptr;
     const size_t N = (size_t)st.st_size, kl = strlen(key); uint64_t hd[3]; memcpy(hd, b + 8, sizeof hd); size_t u = 32;
     mc_ctx *X = nullptr;
-    if (!memcmp(b, "UFMC0001", 8) && hd[0] == kl && u + MC_AL(kl) <= N && !memcmp(b + u, key, kl) && hd[1] > 0 && hd[1] < (1u << 20)) {
+    if (!memcmp(b, "UFMC0002", 8) && hd[0] == kl && u + MC_AL(kl) <= N && !memcmp(b + u, key, kl) && hd[1] > 0 && hd[1] < (1u << 20)) {
         u += MC_AL(kl); X = calloc(1, sizeof *X); X->nm = (int)hd[1]; X->nt = hd[2]; X->m = calloc(hd[1], sizeof *X->m); X->pk = b; X->pkn = N;
         int ok = u + 8 * hd[1] <= N;
         for (int i = 0; ok && i < X->nm; i++) { int32_t wh[2]; memcpy(wh, b + u + 8 * (size_t)i, 8); X->m[i].w = wh[0]; X->m[i].h = wh[1]; ok = wh[0] > 1 && wh[1] > 1; }
@@ -157,7 +174,7 @@ static void *mc_stamp(void *vp) {
                 int64_t g[3]; int in = 1;
                 for (int d = 0; d < 3; d++) {
                     const double q = (1 - u) * (1 - v) * p[0][d] + u * (1 - v) * p[1][d] + (1 - u) * v * p[2][d] + u * v * p[3][d];
-                    g[d] = (int64_t)floor(q + 0.5) - o[d];
+                    g[d] = (int64_t)floor(q + 0.5 * sc) - o[d];   /* (block centres: see the note at mc_ctx's id) */
                     if (g[d] < (d ? 0 : P->z0) || g[d] >= (d ? n[d] : P->z1)) in = 0;
                 }
                 if (!in) continue;
@@ -255,11 +272,11 @@ z3 *mesh_codes_open(const char *dir, const char *value, const char *mapp, int le
     mc_ctx *X = packed ? mc_pack_open(pack, key) : nullptr;
     const uint64_t kh = mc_hash(key);
     if (X) { for (int i = 0; i < nn; i++) free(names[i]);
-        free(names); free(key); X->scale = 1.0 / (1 << level); snprintf(X->id, sizeof X->id, "meshcodes-v1-%016llx-L%d", (unsigned long long)kh, level);
+        free(names); free(key); X->scale = 1.0 / (1 << level); snprintf(X->id, sizeof X->id, "meshcodes-v%d-%016llx-L%d", level ? 2 : 1, (unsigned long long)kh, level);
         z3 *zp = z3_open_derived(ct_level, 0, mc_read, X, mc_free);
         if (!zp) { mc_free(X); z3_close(ct_level); return nullptr; }
         z3_derived_extent(zp, mc_extent, X); return zp; }
-    X = calloc(1, sizeof *X); X->m = calloc((size_t)nn, sizeof *X->m); X->scale = 1.0 / (1 << level); snprintf(X->id, sizeof X->id, "meshcodes-v1-%016llx-L%d", (unsigned long long)kh, level);
+    X = calloc(1, sizeof *X); X->m = calloc((size_t)nn, sizeof *X->m); X->scale = 1.0 / (1 << level); snprintf(X->id, sizeof X->id, "meshcodes-v%d-%016llx-L%d", level ? 2 : 1, (unsigned long long)kh, level);
     int bad = 0; size_t tcap = 0;
     for (int i = 0; i < nn && !bad; i++) { char p[2200]; snprintf(p, sizeof p, "%s/%s", dir, names[i]); bad = mc_load(&X->m[i], p, value, map); X->nm = i + 1; }
     for (int i = 0; i < nn; i++) free(names[i]);
@@ -288,18 +305,18 @@ z3 *mesh_codes_open(const char *dir, const char *value, const char *mapp, int le
 
 const char *mesh_codes_key(const z3 *z) { const mc_ctx *X = z3_derived_ctx(z); return X ? X->id : nullptr; }
 
-static const char *mc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *mc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 /* ufsm codes-onfly <meshes-dir> --ct ROOT KEY [--level 0] [--value q.tif] [--map reg.json] [--ref ROOT KEY] [--windows 8] [--P 256] [--threads 8]:
    the derived codes over windows drawn on the meshes (random tiles), ms per window, and the byte differences from a stored codes raster
    (`ufsm raster --value` at that level). KEY is the CT array of the level (its meta gives the grid). Exit 1 when a byte differs. */
 int cmd_codes_onfly(int argc, char **argv) {
-    int ci = 0, ri = 0; for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], "--ct") && i + 2 < argc) ci = i; if (!strcmp(argv[i], "--ref") && i + 2 < argc) ri = i; }
+    int ci = 0, ri = 0; for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], opt_n("--ct")) && i + 2 < argc) ci = i; if (!strcmp(argv[i], opt_n("--ref")) && i + 2 < argc) ri = i; }
     if (argc < 3 || !ci) { fprintf(stderr, "usage: ufsm codes-onfly <meshes-dir> --ct ROOT KEY [--level 0] [--value q.tif] [--map reg.json] [--ref ROOT KEY] [--windows 8] [--P 256] [--threads 8] [--back COARSE_ROOT KEY0 [--slice OUT.pgm]]\n"); return 2; }
-    const int level = atoi(mc_opt(argc, argv, "--level", "0")), nw = atoi(mc_opt(argc, argv, "--windows", "8")), P = atoi(mc_opt(argc, argv, "--P", "256")), T = atoi(mc_opt(argc, argv, "--threads", "8"));
-    uint64_t seed = (uint64_t)atoll(mc_opt(argc, argv, "--seed", "1"));
+    const int level = opt_atoi("--level", mc_opt(argc, argv, "--level", "0")), nw = opt_atoi("--windows", mc_opt(argc, argv, "--windows", "8")), P = opt_atoi("--P", mc_opt(argc, argv, "--P", "256")), T = opt_atoi("--threads", mc_opt(argc, argv, "--threads", "8"));
+    uint64_t seed = (uint64_t)opt_atoll("--seed", mc_opt(argc, argv, "--seed", "1"));
     store *cs = store_open(argv[ci + 1]); z3 *c0 = cs ? z3_open(cs, argv[ci + 2], nullptr) : nullptr;
     if (!c0) { fprintf(stderr, "codes-onfly: cannot open the CT %s %s\n", argv[ci + 1], argv[ci + 2]); return 1; }
-    const double t0 = mc_now(); const int gd = atoi(mc_opt(argc, argv, "--gpu", "-1"));   /* --gpu D: the device stamp on GPU D (default -1: the CPU) */
+    const double t0 = mc_now(); const int gd = opt_atoi("--gpu", mc_opt(argc, argv, "--gpu", "-1"));   /* --gpu D: the device stamp on GPU D (default -1: the CPU) */
     z3 *z = mesh_codes_open(argv[2], mc_opt(argc, argv, "--value", "q.tif"), mc_opt(argc, argv, "--map", nullptr), level, c0, gd < 0 ? -1 : gd + 1); if (!z) return 1;
     const mc_ctx *X = z3_derived_ctx(z); const int64_t *sh = z3_meta_of(z)->shape;
     printf("codes-onfly: key %s\n", mesh_codes_key(z));
@@ -330,13 +347,13 @@ int cmd_codes_onfly(int argc, char **argv) {
        goes back through rmap_f2c and must meet the coarse scan's own (unmapped) codes: the share with the same code (within 1 step =
        1/18 turn) at the nearest coarse voxel and within 1 / 2 voxels. --slice OUT.pgm: the window's middle z slice of the fine CT
        with the coded voxels drawn white (eye check). */
-    int bi = 0; for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], "--back")) bi = i;
+    int bi = 0; for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--back"))) bi = i;
     const char *mapp = mc_opt(argc, argv, "--map", nullptr);
     if (bi && mapp && nw > 0) {
         const rmap *map = reg_map_load(mapp); store *bs = store_open(argv[bi + 1]); z3 *bc = bs ? z3_open(bs, argv[bi + 2], nullptr) : nullptr;
         z3 *zc = map && bc ? mesh_codes_open(argv[2], mc_opt(argc, argv, "--value", "q.tif"), nullptr, 0, bc, 0) : nullptr;
         if (!zc) { fprintf(stderr, "codes-onfly: --back: cannot open the map / the coarse CT\n"); return 1; }
-        seed = (uint64_t)atoll(mc_opt(argc, argv, "--seed", "1"));   /* the first window again */
+        seed = (uint64_t)opt_atoll("--seed", mc_opt(argc, argv, "--seed", "1"));   /* the first window again */
         seed = seed * 6364136223846793005ull + 1442695040888963407ull; const mc_tile *t = &X->t[(seed >> 33) % X->nt]; int64_t o[3], n[3] = {P, P, P};
         for (int d = 0; d < 3; d++) { seed = seed * 6364136223846793005ull + 1442695040888963407ull;
             o[d] = (int64_t)(0.5 * (t->lo[d] + t->hi[d]) * X->scale) - P / 2 + (int64_t)((seed >> 33) % 33) - 16;

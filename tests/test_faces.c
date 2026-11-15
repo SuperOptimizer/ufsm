@@ -20,6 +20,7 @@ static double cyl_sample(void *ctx, double z, double y, double x) { const cyl *C
 #include "faces_core.h"
 #include "fm_tol.h"
 #include <string.h>
+#include "test_gpu.h"
 /* GPU vs CPU faces_stats: identical under UFSM_STRICT_MATH; under fast math the counts within 0.1% (+1), the sums / histogram bins
    within 0.1% of their value plus 1e-3 of the vertex count (a changed pick moves one vertex between bins / out of a sum) */
 static int stats_close(const faces_stats *a, const faces_stats *b) {
@@ -81,7 +82,7 @@ static int gpu_vs_cpu(void) {
     for (int k = 0; k < 40; k++) { const size_t i = (size_t)(k * 7919) % n; X[i] = Y[i] = Z[i] = -1; }   /* holes */
     float *out[2][7]; uint8_t *cf[2]; faces_stats st[2]; int rc = 0;
     T.G = fgpu_open(T.shape);
-    if (!T.G) { printf("test_faces_gpu: no CUDA device, GPU comparison skipped\n"); return 0; }
+    if (!T.G) return test_no_gpu("test_faces_gpu", "fgpu_open failed: the GPU comparison");
     for (int g = 0; g < 2; g++) {
         for (int k = 0; k < 7; k++) out[g][k] = malloc(n * 4);
         cf[g] = malloc(n); memset(&st[g], 0, sizeof st[g]); st[g].ct_thr = 90;

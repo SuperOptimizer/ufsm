@@ -121,7 +121,7 @@ int main(int argc, char **argv) {
                "  \"targets\": {\"ink\": {\"onfly\": {\"segments\": \"%s/fx/segs.json\", \"level\": 0, \"cache_dir\": \"%s/dcache\"}},\n"
                "               \"band\": {\"root\": \"%s/fx/band\", \"key\": \"1\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/fx/phase0\", \"key\": \"0\", \"level\": 0}}}}]}\n", d, d, d, d, d, d);
     fclose(f);
-    const char *common = "--task unwrap2 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 "
+    const char *common = "--task unwrap2 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-train-ok 1 --val-every 1000 --log-every 1 "
                          "--ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --levels 1 --widths 16,32,64 --ink-head 1 --ink-dice 0.25";
     CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/a --steps 6 --ink-mil 1 --ink-mil-mode 0 %s > %s/a.log 2>&1", U, d, d, common, d), "train --ink-mil (%s/a.log)", d);
     snprintf(p, sizeof p, "%s/a.log", d); int fm = 0, fw = 0;
@@ -142,6 +142,15 @@ int main(int argc, char **argv) {
     const double l1 = log_first(p1, " loss "), l0 = log_first(p0, " loss "); int fb = 0; const double m1 = log_last(p1, " ink mil ", &fb);
     fprintf(stderr, "lr 0 step 1: loss %.5f with mil %.5f, %.5f without\n", l1, m1, l0);
     CHECK(fb && fabs(l1 - (l0 + m1)) < 2e-3 + 1e-3 * fabs(l1), "loss %g != %g + %g", l1, l0, m1);
+    /* serialised vs default (ops audit #9; 1bb0db8: the next window's rays landed under the current step's backward, a stream-ordering
+       race): under --det the MIL run's step lines must not change when every launch completes in program order (UFSM_SERIALIZE=1) */
+    if (!getenv("TIMT_NOSER")) {
+        CHECK(!sh("%s train %s/fx/sources-mil.json --out %s/s0 --steps 4 --det 1 --ink-mil 1 --ink-mil-mode 0 %s > %s/s0.log 2>&1", U, d, d, common, d), "--det MIL run (%s/s0.log)", d);
+        CHECK(!sh("UFSM_SERIALIZE=1 CUDA_LAUNCH_BLOCKING=1 %s train %s/fx/sources-mil.json --out %s/s1 --steps 4 --det 1 --ink-mil 1 --ink-mil-mode 0 %s > %s/s1.log 2>&1", U, d, d, common, d), "serialised MIL run (%s/s1.log)", d);
+        CHECK(!sh("for x in s0 s1; do grep -E '^step' %s/$x.log | sed -E 's/ [0-9.]+ samp\\/s.*//; s/ (wait|gn) [0-9.%%]+//g' > %s/$x.txt; done; "
+                  "[ $(grep -c '^step' %s/s0.txt) -ge 4 ] && cmp -s %s/s0.txt %s/s1.txt", d, d, d, d, d),
+              "MIL training: default and UFSM_SERIALIZE=1 step lines differ (a stream-ordering race?): diff %s/s0.txt %s/s1.txt", d, d);
+    }
     if (getenv("TIMT_KEEP")) fprintf(stderr, "kept %s (sources %s/fx/sources-mil.json)\n", d, d);
     else if (!fails) sh("rm -rf %s", d);
     fprintf(stderr, "%s\n", fails ? "test_ink_mil_train: FAILED" : "test_ink_mil_train: ok");

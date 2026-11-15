@@ -93,7 +93,8 @@ __global__ void k_fwd_slab(const void *lg, int bf, int z0, int nz, int D, int H,
         s += cw(f, q) * ld16(lg, ((size_t)(a - z0) * H + c[1] + (q >> 1 & 1)) * W + c[2] + (q & 1), bf); any = 1; }
     if (any) acc[id] += s;
 }
-__global__ void k_fin(float *acc, const inkray *rays, int nr, int K, int D, int H, int W, float R, float step, float tau, float eps, float scale, double *lray) {
+__global__ void k_fin(float *acc, const inkray *rays, int nr, int K, int D, int H, int W, float R, float step, float tau, float eps, float scale, double *lray, const float *hp = nullptr) {
+    if (hp) scale = __fmul_rn(scale, hp[0]);   /* (the head plane scale on the device: ink_mil_set_scale_dev) */
     const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= nr) return;
     const inkray r = rays[i]; float *z = acc + (size_t)i * K; int nv = 0, am = -1; float zm = -INFINITY; unsigned long long vm[4] = {0, 0, 0, 0};   /* (valid mask, K <= 256) */
     for (int k = 0; k < K; k++) { int c[3]; float f[3]; if (!samp(r, k, R, step, D, H, W, c, f)) continue; vm[k >> 6] |= 1ull << (k & 63); nv++; if (z[k] > zm) { zm = z[k]; am = k; } }
@@ -173,10 +174,12 @@ extern "C" int ink_mil_fwd_slab(const void *lg, int bf16, int z0, int nz, int D,
     k_fwd_slab<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(lg, bf16, z0, nz, D, H, W, rays, nr, K, R, step, acc);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
+static __thread const float *t_hsp;   /* ink_mil_set_scale_dev: fin's scale x *p (device; the head plane scale s, hgs.h), nullptr: x 1 */
+extern "C" void ink_mil_set_scale_dev(const float *p) { t_hsp = p; }
 extern "C" int ink_mil_fin(float *acc, const inkray *rays, int nr, int D, int H, int W, float R, float step, float tau, float eps, float scale, double *loss, void *stream) {
     const int K = ink_mil_samples(R, step); if (K > KMAX || K < 1) return -2; if (nr <= 0) return 0;
     if (mgrow(0, (size_t)nr * sizeof(double))) return -1;
-    k_fin<<<(nr + 127) / 128, 128, 0, (cudaStream_t)stream>>>(acc, rays, nr, K, D, H, W, R, step, tau, eps, scale, (double *)t_ms.p[0]);
+    k_fin<<<(nr + 127) / 128, 128, 0, (cudaStream_t)stream>>>(acc, rays, nr, K, D, H, W, R, step, tau, eps, scale, (double *)t_ms.p[0], t_hsp);
     k_sum_fixed<<<1, 256, 0, (cudaStream_t)stream>>>((const double *)t_ms.p[0], nr, loss);
     if (g_mil_async < 0) g_mil_async = !(getenv("UFSM_MIL_ASYNC") && !atoi(getenv("UFSM_MIL_ASYNC")));   /* UFSM_MIL_ASYNC=0: the per-slab readback (the plane bound is the default since test_ink_mil passed byte for byte on the pod) */
     t_ph.dz = nullptr;

@@ -2,7 +2,7 @@
    along x, a V fibre along z that passes 30 voxels from it, and an H fibre that crosses a second V fibre. Read back: every voxel
    within the radius of the lone H fibre is 254 in plane H and 0 in plane V (and the reverse on the V fibre), the guard ring and
    everything away from the fibres are 255, the crossing is 255 in both planes, and a second run with --zband writes only that band.
-   With --ct (a CT of 100 with an air block of 10): air away from fibres is 0 in both planes, papyrus stays 255.
+   With --ct (a CT of 100 with an air block of 10): air away from fibres is 0 in both planes, papyrus stays 255, a fibre's own positives in air are unknown (255).
    The planes on the fly (fiber_onfly_open, sources "fibre" targets, 2026-11-11): reads of whole and partial boxes, seams and boxes
    partly outside the array, byte-identical to the three stored rasters (plain, --ring --extra, --ct). */
 #include <math.h>
@@ -100,7 +100,8 @@ int main(void) {
     { const size_t air = ((size_t)100 * NY + 20) * NX + 20, pap = ((size_t)100 * NY + 20) * NX + 200, onh = ((size_t)40 * NY + 60) * NX + 60, onv = ((size_t)60 * NY + 90) * NX + 120;
       CHECK(H[air] == 0 && V[air] == 0, "air away from fibres: H %d V %d, want 0 0", H[air], V[air]);
       CHECK(H[pap] == 255 && V[pap] == 255, "papyrus away from fibres: H %d V %d, want 255 255", H[pap], V[pap]);
-      CHECK(H[onh] == 254 && V[onh] == 0 && V[onv] == 254 && H[onv] == 0, "fibres over air keep their labels (H %d %d, V %d %d)", H[onh], V[onh], V[onv], H[onv]); }
+      /* (data audit lower, 11-14: a fibre's positive voxels in air are unknown, --pos-iso 64; the other family's 0 stays) */
+      CHECK(H[onh] == 255 && V[onh] == 0 && V[onv] == 255 && H[onv] == 0, "fibres over air: positives unknown, the other plane 0 (H %d %d, V %d %d)", H[onh], V[onh], V[onv], H[onv]); }
     free(H); free(V);
     /* on the fly == stored: the plain raster (no air test), --ring 3 --extra (radius 2 guard 2), --ct --iso 64 (shard row 0: --zband 0,100) */
     { char xf[400], o3[400]; snprintf(xf, sizeof xf, "%s/x.fib", root); snprintf(o3, sizeof o3, "%s/lab3", root);
@@ -109,7 +110,7 @@ int main(void) {
       const int ngpu = fiber_onfly_gpu(1) ? 2 : 1;
       for (int mode = 0; mode < ngpu; mode++) { fiber_onfly_gpu(mode); for (int c = 0; c < 3; c++) {
           store *cs = store_open(ctd); z3 *pl[2];
-          CHECK(!fiber_onfly_open(fb, C[c].extra, nullptr, nullptr, 2, C[c].guard, C[c].ring, C[c].iso, 1, z3_open(cs, "9.6", nullptr), z3_open(cs, "9.6", nullptr), z3_open(cs, "9.6", nullptr), pl), "fiber_onfly_open %d", c);
+          CHECK(!fiber_onfly_open(fb, C[c].extra, nullptr, nullptr, 2, C[c].guard, C[c].ring, C[c].iso, C[c].iso, 1, z3_open(cs, "9.6", nullptr), z3_open(cs, "9.6", nullptr), z3_open(cs, "9.6", nullptr), pl), "fiber_onfly_open %d", c);
           uint8_t *ref[2] = {rd(C[c].dir, "H/9.6"), rd(C[c].dir, "V/9.6")}; CHECK(ref[0] && ref[1], "stored planes %d", c); if (!ref[0] || !ref[1]) return 1;
           for (int b = 0; b < (int)(sizeof bx / sizeof bx[0]); b++) for (int k = 0; k < 2; k++) {
               const int64_t o[3] = {bx[b][0], bx[b][1], bx[b][2]}, n[3] = {bx[b][3], bx[b][4], bx[b][5]}; const size_t nv = (size_t)n[0] * n[1] * n[2]; uint8_t *g = malloc(nv);

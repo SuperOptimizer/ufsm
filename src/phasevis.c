@@ -5,6 +5,7 @@
    each GT turn its own colour over the CT, so the turn boundaries are colour edges). Panels: CT | each --fields | GT, 6 white
    pixels apart; JPEG q90, the longest side <= --max-px. */
 #include "fit.h"
+#include "optcheck.h"
 #include "imgops.h"
 #include "json.h"
 #include "store.h"
@@ -14,12 +15,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *pv_opt(int argc, char **argv, const char *k, const char *d) { for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *pv_opt(int argc, char **argv, const char *k, const char *d) { for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 
 int cmd_phase_vis(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm phase-vis OUT.jpg CTROOT CTKEY --plane z,y,x,h,w [--axis z|y|x] [--fields LABEL=DIR,..] [--models LABEL=DIR,..] [--codes ROOT KEY] [--zoom 2] [--max-px 8000] [--cache DIR]\n"); return 2; }
     long long pz[5]; if (sscanf(pv_opt(argc, argv, "--plane", ""), "%lld,%lld,%lld,%lld,%lld", pz, pz + 1, pz + 2, pz + 3, pz + 4) != 5 || pz[3] < 1 || pz[4] < 1) { fprintf(stderr, "phase-vis: --plane z,y,x,h,w\n"); return 2; }
-    const int H = (int)pz[3], W = (int)pz[4], Z = atoi(pv_opt(argc, argv, "--zoom", "2")) < 1 ? 1 : atoi(pv_opt(argc, argv, "--zoom", "2"));
+    const int H = (int)pz[3], W = (int)pz[4], Z = opt_atoi("--zoom", pv_opt(argc, argv, "--zoom", "2")) < 1 ? 1 : opt_atoi("--zoom", pv_opt(argc, argv, "--zoom", "2"));
     const char ax = pv_opt(argc, argv, "--axis", "z")[0];
     /* plane pixel (r, c) -> volume (z, y, x): z axis: (pz0, py + r, px + c); y: (pz + r, py0, px + c); x: (pz + r, py + c, px0) */
     const int64_t o[3] = {pz[0], pz[1], pz[2]}, n[3] = {ax == 'z' ? 1 : H, ax == 'z' ? H : ax == 'y' ? 1 : W, ax == 'x' ? 1 : W};
@@ -30,7 +31,7 @@ int cmd_phase_vis(int argc, char **argv) {
     /* fields */
     char fl[4096]; snprintf(fl, sizeof fl, "%s", pv_opt(argc, argv, "--fields", "")); char *lab[8], *dir[8]; int nf = 0;
     for (char *s = fl, *tok; nf < 8 && (tok = strtok(s, ",")); s = nullptr) { char *e = strchr(tok, '='); if (!e) { fprintf(stderr, "phase-vis: --fields LABEL=DIR\n"); return 2; } *e = 0; lab[nf] = tok; dir[nf++] = e + 1; }
-    int ci = 0; for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], "--codes")) ci = i;
+    int ci = 0; for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--codes"))) ci = i;
     char ml[4096]; snprintf(ml, sizeof ml, "%s", pv_opt(argc, argv, "--models", "")); char *mlab[8], *mdir[8]; int nm = 0;   /* --models LABEL=DIR,..: fitted models / sets (CT voxels = native voxels) */
     for (char *s = ml, *tok; nm < 8 && (tok = strtok(s, ",")); s = nullptr) { char *e = strchr(tok, '='); if (!e) { fprintf(stderr, "phase-vis: --models LABEL=DIR\n"); return 2; } *e = 0; mlab[nm] = tok; mdir[nm++] = e + 1; }
     (void)mlab;
@@ -111,7 +112,7 @@ int cmd_phase_vis(int argc, char **argv) {
         }
         free(cd);
     }
-    int ow = OW, oh = OH; if (img_fit_rgb(&img, &ow, &oh, atoi(pv_opt(argc, argv, "--max-px", "8000")), 8)) return 1;
+    int ow = OW, oh = OH; if (img_fit_rgb(&img, &ow, &oh, opt_atoi("--max-px", pv_opt(argc, argv, "--max-px", "8000")), 8)) return 1;
     const int rc = jpeg_write_rgb(argv[2], ow, oh, img, 90);
     fprintf(stderr, "phase-vis: %s (%d x %d, %d panels)\n", argv[2], ow, oh, np);
     free(ct); free(img); free(ph);

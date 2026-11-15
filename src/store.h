@@ -24,6 +24,8 @@ int64_t store_size(store *s, const char *key);
 int64_t store_read(store *s, const char *key, int64_t off, int64_t len, uint8_t *out);
 /* Read a whole object into a malloc'd buffer (nul-terminated for convenience). nullptr if absent. */
 uint8_t *store_read_all(store *s, const char *key, size_t *len);
+/* the same; over HTTP val (if given) gets the response's validators ("etag ...|last-modified ...|bytes N"), "" for a local store */
+uint8_t *store_read_all_v(store *s, const char *key, size_t *len, char *val, size_t nval);
 
 /* GET an absolute URL (bearer of s applied). Returns malloc'd body (nul-terminated) or nullptr; if
    link_next is non-null it receives the malloc'd URL of the Link rel="next" header, or nullptr. */

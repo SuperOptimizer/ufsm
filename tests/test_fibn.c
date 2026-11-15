@@ -48,10 +48,10 @@ static int tangent(const uint8_t *fib, size_t i, int H, int W, int r, float t[3]
 static float sig(float x) { return 1.f / (1.f + expf(-x)); }
 /* host: valid voxels of slab [z0, z1) and the sum of t^T N t (logits lg: 6 planes of the slab's ns voxels) */
 static double host_sum_m(const uint8_t *fib, const float *lg, int D, int H, int W, int z0, int z1, int r, int thr, const uint8_t *nm, double *cnt) {
-    const size_t hw = (size_t)H * W, ns = (size_t)(z1 - z0) * hw; double s = 0; *cnt = 0; const int R = r + 1; (void)D;
+    const size_t hw = (size_t)H * W, ns = (size_t)(z1 - z0) * hw; double s = 0; *cnt = 0; const int R = r + 1;
     for (size_t li = 0; li < ns; li++) {
         const int z = z0 + (int)(li / hw), y = (int)((li / W) % H), x = (int)(li % W); const size_t i = (size_t)z * hw + (size_t)y * W + x;
-        if (fib[i] == 255 || fib[i] < thr || (nm && nm[li]) || z - R < z0 || z + R >= z1 || y < R || y + R >= H || x < R || x + R >= W) continue;
+        if (fib[i] == 255 || fib[i] < thr || (nm && nm[li]) || z < R || z + R >= D || y < R || y + R >= H || x < R || x + R >= W) continue;
         float t[3]; if (!tangent(fib, i, H, W, r, t)) continue;
         const float c6[6] = {t[0] * t[0], t[1] * t[1], t[2] * t[2], 2 * t[0] * t[1], 2 * t[0] * t[2], 2 * t[1] * t[2]};
         float L = 0; for (int c = 0; c < 6; c++) { const float p = sig(lg[(size_t)c * ns + li]); L += c6[c] * (c < 3 ? p : p - 0.5f); }
@@ -127,22 +127,32 @@ int main(void) {
             }
             CHECK(werr < 1e-3 * (gmax > 1e-6 ? gmax : 1e-6) + 1e-7 && nchk > 20, "gradient vs central differences: worst %.3e of %.3e (%d checked)", werr, gmax, nchk);
         }
-        if (sym == 9) {   /* two slabs: the sums add up to the host's per-slab sums; the planes outside a slab are never read */
-            for (int s = 0; s < 2; s++) {
-                const int z0 = s * 16, z1 = z0 + 16; const size_t ns = (size_t)16 * H * W;
-                uint8_t *pz = malloc(n); memcpy(pz, fib, n);
-                for (int z = 0; z < D; z++) if (z < z0 || z >= z1) memset(pz + (size_t)z * H * W, 254, (size_t)H * W);   /* poison: a read there breaks the tangent */
-                nn_h2d(dfib, pz, n);
-                float *ls = malloc(6 * ns * sizeof(float)); uint16_t *lh = malloc(6 * ns * 2);
-                for (int c = 0; c < 6; c++) for (size_t k = 0; k < ns; k++) { lh[(size_t)c * ns + k] = lgh[(size_t)c * n + (size_t)z0 * H * W + k]; ls[(size_t)c * ns + k] = lgf[(size_t)c * n + (size_t)z0 * H * W + k]; }
-                void *dls = nn_malloc(6 * ns * 2); nn_h2d(dls, lh, 6 * ns * 2);
-                nn_zero(dacc, 64); nn_fibn(dls, ns, dfib, D, H, W, z0, z1, r, thr, nullptr, dacc, nullptr, nullptr, 0, 0);
-                double a2[2]; nn_d2h(a2, dacc, sizeof a2); double c2; const double s2 = host_sum(fib, ls, D, H, W, z0, z1, r, thr, &c2);
-                printf("slab %d..%d: %g valid voxels (host %g), mean t^T N t %.5f (host %.5f)\n", z0, z1, a2[0], c2, a2[0] > 0 ? a2[1] / a2[0] : 0, c2 > 0 ? s2 / c2 : 0);
-                CHECK(fabs(a2[0] - c2) <= 0.01 * c2 + 2 && c2 > 0, "slab %d: valid voxels %g, host %g", s, a2[0], c2);
-                CHECK(c2 == 0 || fabs(a2[1] / a2[0] - s2 / c2) < 2e-3, "slab %d: mean %g, host %g", s, a2[1] / a2[0], s2 / c2);
-                nn_free(dls); free(ls); free(lh); free(pz);
+        if (sym == 9) {   /* slabs with the stencil halo (r + 1 planes, as head_slab_pass streams them): per-slab sums equal the host's, and add up to the whole window's (no seam drops voxels); planes beyond the halo are never read */
+            double a0[2]; nn_zero(dacc, 64); nn_fibn(dlg, n, dfib, D, H, W, 0, D, r, thr, nullptr, dacc, nullptr, nullptr, 0, 0); nn_d2h(a0, dacc, sizeof a0);
+            const int R = r + 1;
+            for (int nsl = 2; nsl <= 4; nsl *= 2) {
+                double tc = 0, ts = 0, hc = 0, hs = 0; const int Zs = D / nsl;
+                for (int s = 0; s < nsl; s++) {
+                    const int z0 = s * Zs, z1 = z0 + Zs; const size_t ns = (size_t)Zs * H * W;
+                    uint8_t *pz = malloc(n); memcpy(pz, fib, n);
+                    for (int z = 0; z < D; z++) if (z < z0 - R || z >= z1 + R) memset(pz + (size_t)z * H * W, 254, (size_t)H * W);   /* poison beyond the halo */
+                    nn_h2d(dfib, pz, n);
+                    float *ls = malloc(6 * ns * sizeof(float)); uint16_t *lh = malloc(6 * ns * 2);
+                    for (int c = 0; c < 6; c++) for (size_t k = 0; k < ns; k++) { lh[(size_t)c * ns + k] = lgh[(size_t)c * n + (size_t)z0 * H * W + k]; ls[(size_t)c * ns + k] = lgf[(size_t)c * n + (size_t)z0 * H * W + k]; }
+                    void *dls = nn_malloc(6 * ns * 2); nn_h2d(dls, lh, 6 * ns * 2);
+                    nn_zero(dacc, 64); nn_fibn(dls, ns, dfib, D, H, W, z0, z1, r, thr, nullptr, dacc, nullptr, nullptr, 0, 0);
+                    double a2[2]; nn_d2h(a2, dacc, sizeof a2); double c2; const double s2 = host_sum(fib, ls, D, H, W, z0, z1, r, thr, &c2);
+                    printf("%d slabs, slab %d..%d: %g valid voxels (host %g), sum t^T N t %.5f (host %.5f)\n", nsl, z0, z1, a2[0], c2, a2[1], s2);
+                    CHECK(fabs(a2[0] - c2) <= 0.01 * c2 + 2, "slab %d: valid voxels %g, host %g", s, a2[0], c2);   /* (a slab may hold none of the tube) */
+                    CHECK(c2 == 0 || fabs(a2[1] - s2) < 2e-3 * fabs(c2) + 1e-3, "slab %d: sum %g, host %g", s, a2[1], s2);
+                    tc += a2[0]; ts += a2[1]; hc += c2; hs += s2;
+                    nn_free(dls); free(ls); free(lh); free(pz);
+                }
+                printf("%d slabs: %g valid voxels in all, whole window %g\n", nsl, tc, a0[0]);
+                CHECK(fabs(tc - a0[0]) <= 0.001 * a0[0] + 1 && fabs(ts - a0[1]) < 2e-3 * fabs(a0[0]) + 1e-3, "%d slabs: %g voxels / sum %g against the whole window's %g / %g (seams must not drop voxels)", nsl, tc, ts, a0[0], a0[1]);
+                CHECK(hc > 0, "%d slabs: the host found no valid voxel at all", nsl);
             }
+            nn_h2d(dfib, fib, n);
         }
     }
     printf("tangent on the tube axis over the 48 symmetries: %ld voxels, mean |t . d| %.5f, worst %.5f\n", ndot, sum_dot / ndot, worst_dot);

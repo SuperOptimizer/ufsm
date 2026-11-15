@@ -1,5 +1,6 @@
 /* CUDA ops: fusedgn section of the former nn.cu */
 #include "nn_common.cuh"
+#include <mutex>
 
 int mx_up_w_ok(const float *x, const float *x2, int c_split, shape5 xs) {
     static int on = -1; if (on < 0) on = getenv("UFSM_MX_UP_W") ? atoi(getenv("UFSM_MX_UP_W")) : 1;
@@ -200,8 +201,33 @@ extern "C" int nn_head_fwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, co
     KCHECK();
     return 0;
 }
+static int head_bwd_z_impl(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx,
+                            size_t vb, size_t nv, int first);
+/* x[i] (o[i] = w[i] x, o nullptr: in place) x hp[k] (GSHP: k 0 s, 1 1 / s; a power of two, exact) */
+__global__ void hgs_wscale_k(const float *w, float *o, size_t n, const float *hp, int k) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= n) return;
+    const float a = hp[k]; if (o) o[i] = a * w[i]; else ((float *)w)[i] *= a;
+}
+/* gy16 at the head plane scale s (nn_set_head_gscale, a power of two): the weight / bias gradients accumulate at that scale onto gw / gb
+   pre-multiplied by it and are divided back after, gx goes through the weights x 1 / s. Every step is an exact power-of-two scaling of
+   normal fp32 values, so the results are the bits of the unscaled planes' wherever those were normal (no GSHP: the old path untouched; s 1:
+   the same bits through the scaled path). s is device-side (GSHP {s, 1 / s}): no host sync */
 extern "C" int nn_head_bwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx,
                              size_t vb, size_t nv, int first) {
+    const float *hp = GSHP;
+    if (!hp) return head_bwd_z_impl(x, gx_gn, xs, gy16, cout, w, gw, gb, gx, vb, nv, first);
+    static thread_local float *wsd[8]; static thread_local size_t wsn[8]; int dv = 0; cudaGetDevice(&dv); dv &= 7;
+    const size_t nw = (size_t)cout * xs.c;
+    if (wsn[dv] < nw) { if (wsd[dv]) cudaFree(wsd[dv]); CK(cudaMalloc(&wsd[dv], nw * 4)); wsn[dv] = nw; }
+    hgs_wscale_k<<<nblk(nw, 256), 256>>>(w, wsd[dv], nw, hp, 1);
+    hgs_wscale_k<<<nblk(nw, 256), 256>>>(gw, nullptr, nw, hp, 0); hgs_wscale_k<<<nblk(cout, 256), 256>>>(gb, nullptr, (size_t)cout, hp, 0);
+    const int r = head_bwd_z_impl(x, gx_gn, xs, gy16, cout, wsd[dv], gw, gb, gx, vb, nv, first);
+    hgs_wscale_k<<<nblk(nw, 256), 256>>>(gw, nullptr, nw, hp, 1); hgs_wscale_k<<<nblk(cout, 256), 256>>>(gb, nullptr, (size_t)cout, hp, 1);
+    KCHECK();
+    return r;
+}
+static int head_bwd_z_impl(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx,
+                            size_t vb, size_t nv, int first) {
     /* per device: data parallel drives every GPU from one host thread (a thread_local device buffer of GPU 0 used on GPU 1 = illegal
        address, 11-06); dv = the current device */
     static thread_local unsigned seedd[8]; int dv = 0; cudaGetDevice(&dv); dv &= 7; unsigned &seed = seedd[dv];
@@ -293,8 +319,10 @@ extern "C" void nn_gn_silu_bwd(const float *x, shape5 s, int G, const float *gam
         const int zsp = zs_on();
         const size_t Sw = gn_bwd_reduce(ds, scratch, NC, s.d, shape_spatial(s), ggamma, gbeta, s.n, s.c);
         if (getenv("UFSM_GNB_DUMP")) {   /* diagnostic: the finished per-channel backward sums (fp32, 2 per channel) of every MX GroupNorm backward, appended per split half (split A/Bs) */
+            static std::mutex mu; std::lock_guard<std::mutex> lk(mu);   /* mgpu: guarded (DP threads share slot -1 and its file) */
             const int sl = zsp ? zs_slot() : -1; char fn[1100]; snprintf(fn, sizeof fn, "%s.%d", getenv("UFSM_GNB_DUMP"), sl);
-            static int opened[16]; FILE *fo = fopen(fn, opened[sl + 1]++ ? "ab" : "wb");
+            static int opened[16];   /* mgpu: guarded (mu above) */
+            FILE *fo = fopen(fn, opened[sl + 1]++ ? "ab" : "wb");
             float *h = (float *)malloc((size_t)8 * NC); cudaDeviceSynchronize(); cudaMemcpy(h, scratch, (size_t)8 * NC, cudaMemcpyDeviceToHost);
             if (fo) { const int hd[2] = {NC, s.d}; fwrite(hd, 4, 2, fo); fwrite(h, 4, 2 * NC, fo); fclose(fo); } free(h);
             if (getenv("UFSM_GNB_TDUMP")) {   /* + x and gy as fp32 [c][d][h][w] (MX storage only) */

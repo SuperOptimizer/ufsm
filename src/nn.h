@@ -12,6 +12,9 @@ static inline int ufsm_env_on(const char *n) { const char *e = getenv(n); return
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* logical devices (src/ufsm_dev.cuh): device ids given to nn_* after this are logical, logical k running on physical phys[k]
+   (train --gpus 0,0: two data-parallel ranks on one card). Call once, before any GPU thread starts; n = 0 clears. */
+int nn_set_devmap(int n, const int *phys);
 
 typedef struct { int n, c, d, h, w; } shape5;
 
@@ -21,6 +24,8 @@ static inline size_t shape_spatial(shape5 s) { return (size_t)s.d * s.h * s.w; }
 /* ---- device / memory ---- */
 int nn_init(int device);                 /* selects the device; returns 0 on success */
 const char *nn_check(void);              /* nullptr if no error since the last call, else the message */
+void nn_err_worker(int on);              /* this host thread is a per-GPU worker: its nn_check reports only its own errors (the latches are per thread;
+                                            every first error is also posted process-wide, and a non-worker thread's nn_check takes a posted one) */
 const char *nn_check_site(void);         /* the call site of the error the last nn_check returned ("" for none; low-precision kernels: their own latch) */
 void *nn_malloc(size_t bytes);
 void nn_free(void *p);
@@ -92,6 +97,7 @@ void nn_set_tf32(int on);
 void nn_set_prec(int p);
 void nn_set_sr(int on);              /* stochastic rounding of the fp8 gradient operands: backward-data input, weight-gradient gy (env UFSM_SR=1) */
 void nn_set_sr_step(unsigned step);
+void nn_sr_salt(unsigned s);       /* this host thread's stochastic-rounding salt (data-parallel replica index; 0: the one-GPU draws) */
 /* the per-host-thread op state (layer ids, the stochastic-rounding counter, the loss / logit formats, ...): one host thread per GPU starts
    from the main thread's (capture in the main thread, install in the worker) */
 typedef struct { int layer, sub, pass, block; unsigned sr_ctr; float posw; int logits_h16, head_h16, loss_g16, gn_const, actbf; } nn_tls;
@@ -280,6 +286,7 @@ void nn_loss_cfg_get(float *pw, float *rec_w, int *unit7);   /* the BCE's positi
 void nn_lat_grad_carry(float *a, int nf, void *sb, int C, size_t pl, int cap, int from, int n);
 void nn_lat_up_adj(const void *g, int C, int d, int h, int w, int z0, int nz, float *gc, void *scratch);   /* scratch: C nz h w fp32 for the separable path (z0, nz multiples of 4), or nullptr */
 int nn_lat_set_slow(int on);   /* the per-voxel kernels for every slab (UFSM_LAT_SLOW=1; train's UFSM_LAT_CHECK compares against them); returns the previous setting */
+int nn_lat_set_adj_tile(int on);   /* the tiled y / x gather of the slab adjoint (default; UFSM_LAT_ADJ_TILE=0: the per-cell kernel); on < 0 only reads; returns the previous setting */
 /* predict on a latent-grid net: the network's 4-channel input on the cell grid ([4][D/4][W/4][W/4], 16-bit storage as nn_set_f16) straight
    from a D x W x W uint8 CT window = nn_pred_input_d then nn_lowres_input (div 4, mode 1), without the full-resolution input */
 void nn_lat_pred_input(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *y);
@@ -372,6 +379,14 @@ void nn_set_logits_h16(int on);     /* the losses, nn_prob_u8, nn_pred_output / 
 void nn_set_head_out_h16(int on);   /* the MX head writes fp16 logits (set by unet around its head) */
 void nn_set_loss_grad_h16(int on);   /* nn_loss_async writes gl as the 16-bit storage type scaled by the gradient scale (unet_backward_x(.., 1)) */
 float nn_get_grad_scale(void);
+/* the head-gradient plane scale (power of two, default 1): the loss-gradient kernels write their fp16 planes at grad scale x s, the head
+   backward (nn_head_bwd_z) and the fine stem's backward (nn_fstem_bwd) divide s out exactly; per host thread. train.c sets it around the
+   head's gradient pass (head_slab_pass hgs_choose) */
+void nn_set_head_gscale(float s);              /* tests: a host value (synchronous copy to a per-device buffer; 1: off) */
+void nn_set_head_gscale_dev(const float *p);   /* train.c: device {s, 1 / s} from nn_hgs_choose (nullptr: off) */
+const float *nn_get_head_gscale_dev(void);
+struct hgs_args;
+void nn_hgs_choose(const struct hgs_args *a, float *out);   /* hgs.h: the choice on the device into out {s, 1 / s}, no host sync */
 
 /* ---- conv3d: weight [cout][cin][k][k][k], bias [cout] or nullptr, pad k/2, stride 1 or 2 ---- */
 shape5 nn_conv3d_out_shape(shape5 xs, int cout, int k, int stride);
@@ -487,7 +502,14 @@ void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
    to the fp16 logit planes chs[o] (slab planes [z0, z0 + nz) of a D x H x W window, ns voxels a plane) on each 2^3 block; bwd accumulates the
    parameter gradients from fp16 gradient planes of that layout into gp. 1: a shape the kernels do not take (odd sizes, C or nout > 16) */
 int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns);
+int nn_fstem_wscale(void);          /* W1's rows go to fp16 with a power-of-two scale (default; UFSM_FSTEM_WSCALE=0: unscaled); predict's mirror follows it */
+void nn_fstem_set_wscale(int on);
 int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, const void *g, size_t ns, float *gp);
+/* the head slab's forward chain in one pass: the logit planes chs[o] written (not added to) as nn_lat_up_slab_c (from the fp16 cell logits
+   lc [*][qd][D/4][H/4][W/4], planes from q0) + nn_lat_shuffle_c (the side pair: channels side, side + 1 when side >= 0; base) + nn_fstem_fwd
+   would leave them, byte for byte; C 0: no stem term (an --fstem-drop window). 1: a shape it does not take (multiples of 4) */
+int nn_fstem_up_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns,
+                    const void *lc, int q0, int qd, int side, int base);
 /* a latent-grid net's head straight from the cell logits lg [cout][d][h][w] into a device shard (src/nn_lathead.cu, predict --heads): the
    window interior ([hz, 4d - hz) x [halo, 4w - halo)^2) inside the shard [0, e) at offset o; channel c0 (a probability) or the recto / verso
    pair c0, c1 (nn_rv_fuse); sb0 / sb1 the sub-cell outputs' base of each (lat_guide 64: 16 + 64 j for the phase pair, else -1), s0 / s1 the
@@ -562,6 +584,13 @@ void nn_loss_pack(const void *logits, const uint8_t *t, const uint8_t *m, const 
 void nn_loss_stats_acc(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds);
 void nn_loss_stats_fin_light(double *ds, const uint8_t *w, shape5 s, float *scratch, double *keep);   /* after a light statistics pass: only the loss sums 1 .. 4 summed across split halves (keep: s.n s.c doubles) */
 void nn_loss_stats_fin(double *ds, const uint8_t *w, shape5 s, float *scratch);
+void nn_loss_stats_acc_e(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds, double *ent);   /* + ent[n c] += sum mw H(t / 255) */
+void nn_ent_acc(const uint8_t *t, const uint8_t *m, int C, size_t S, double *ent);   /* ent[c] += sum m H(t_c / 255) (the 7-channel unit channel as the losses) */
+void nn_ent_fin(double *ent, int n);   /* --split z: the halves' entropy sums added */
+void nn_pair_angerr(const void *la, const void *lb, const uint8_t *t, const uint8_t *m, size_t n, double *acc);   /* acc += sum |angle error| (deg), count */
+void nn_h16_zero_count(const void *g, const uint8_t *m, const uint8_t *comp, const uint8_t *code, size_t n, unsigned long long *cnt);   /* supervised, zero, subnormal fp16 gradients */
+void nn_loss_stats_fin_w(double *ds, const uint8_t *w, shape5 s, float *scratch, int wslot);   /* --win-weight: slot wslot >= 0 weights the gradient by min(1, nm / ref) (ref a running median per slot and GPU) */
+void nn_win_weight_take(float *out, int nslot);   /* per slot [windows, mean weight, windows below 0.1 ref, min nm / ref, ref] of the interval; resets it */
 void nn_loss_grad_only(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch);
 void nn_loss_grad_only_s(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch, float mul);   /* x mul in the kernel (no gscale pass) */
 /* Affinity loss on band labels (task band_affinity, src/nn_loss.cu): output channels c0 .. c0 + K - 1 are affinities for
@@ -659,13 +688,28 @@ void nn_muon_stats(double *out, int base);
 void nn_diff_sumsq(const float *a, const float *b, size_t n, double *out2);   /* out2[0] += |a - b|^2, out2[1] += |b|^2 (device doubles) */
 /* adaptive Muon for the next nn_muon_ext_batch calls (train --muon-lars / --muon-dog; see nn_opt.cu): lrm (n floats, written) the
    per-matrix lr multipliers; ema (n floats, 0 = unset) the (b) ratio EMA; dog (4 doubles) the (c) state [rbar, G, eta, |x - x0|];
-   disp (device array of per-matrix float buffers, Co K each) the displacement; part 64 n doubles of scratch. nullptr: off */
-typedef struct { float *lrm, *ema; double *dog; float *const *disp; double *part; float lr_peak, lars_tgt, lars_b, lars_c, dog_eta0, dog_max, dog_kappa; int on_lars, on_dog; } nn_madapt;
+   disp (device array of per-matrix float buffers, Co K each) the displacement; part 64 n doubles of scratch; base (n floats or nullptr)
+   fixed per-matrix multipliers (train --attn-muon-lr) applied on top. nullptr: off */
+typedef struct { float *lrm, *ema; double *dog; float *const *disp; double *part; const float *base; float lr_peak, lars_tgt, lars_b, lars_c, dog_eta0, dog_max, dog_kappa; int on_lars, on_dog; } nn_madapt;
 void nn_muon_ext_adapt(const nn_madapt *a);
 void nn_muon_scale_mode(int m);   /* 0: sqrt(max(1, Co / K)); 1: spectral sqrt(Co / K) (train --muon-scale spectral) */
 void nn_signm(float *p, const float *g, float *m, size_t n, float lr, float b, float wd);   /* sign-momentum (Scion ell-inf) step */
+int lp_f8w_mixed_reserve(void);   /* the latent input conv's MX-fp8 x / MX-fp4 gy weight-gradient chunk copies (96 MB) on the current device now */
+/* kernel workspaces (nn_core.cu): one per-device registry of the kernels' grow-on-demand scratch, sized by the trainer's memory planner */
+enum { NN_WS_LPBUF = 0,   /* + 6 x the element type (0 uint8, 1 float, 2 __half, 3 bf16) + slot (0..5): lp_buf<T>(slot) */
+       NN_WS_F4PRE = 24, NN_WS_FSTEM, NN_WS_TCW, NN_WS_TCWSC, NN_WS_S2BCP, NN_WS_N };
+void *nn_ws(int id, size_t bytes);       /* the current device's workspace id of >= bytes (grown if needed; nullptr: no memory, or over a soft limit after the seal) */
+int nn_ws_reserve(int id, size_t bytes); /* grow it to >= bytes now (before the first step); -1 if the device is full */
+void nn_ws_limit(int id, size_t bytes);  /* after the seal, larger requests return nullptr (callers with a fallback); 0: none */
+void nn_ws_seal(int on);                 /* on: later growth on this device is reported as outside the plan */
+size_t nn_ws_bytes(int id);              /* its bytes on the current device (id -1: all) */
+const char *nn_ws_name(int id);
+int nn_fstem_reserve(int C, int nout);   /* the fine stem backward's partial sums at their largest (1024 blocks) on the current device */
 void nn_muon_tc(int on);   /* Muon / Muon-ext Newton-Schulz products on fp16 tensor cores (fp32 accumulation; train --muon-tc 1) */
 void nn_muon_ext_opts(int cautious);
+void nn_muon_ext_lrmult(const float *m);   /* per-matrix static lr multipliers of the next nn_muon_ext_batch calls (device, one per table entry of the call; nullptr: 1) */
+void nn_muon_ext_fro(int on);              /* --muon-fro 1: every matrix's direction rescaled to the nominal |O|_F = s sqrt(min(Co, K)) (Muon-C's rescale, on the plain NS direction) */
+void nn_muon_forget(const void *base, size_t bytes);   /* drop cached host copies of the descriptor tables inside [base, base + bytes) (before freeing a table) */
 void nn_muon_ext_mix(float *const *m2, float b3, float alpha);   /* AdEMAMix slow EMA (device array of per-matrix buffers; nullptr = off) */   /* nn_muon_ext_batch extras (process-wide): cautious masking (train --muon-cautious 1) */
 struct nn_kron *nn_kron_create(int n, float *const *g, const int *Co, const int *Ci);
 size_t nn_kron_bytes(const struct nn_kron *k);
@@ -677,6 +721,7 @@ void nn_kron_precond(float *G, int Co, int Ci, const float *P1, const float *P2,
 /* ANVIL II over nconv weights: descs {float *p; const float *g; float *v0, *X, *Y, *A, *B, *v1, *E, *R; int Co, K;} (E, R: Co floats) */
 void nn_anvil_batch(const void *descs, int nconv, int maxco, int maxk, float lr, float beta_fast, float beta_slow, float w_fast, float mu, float beta2, float wd);
 void nn_ema(float *ema, const float *p, size_t n, float decay);
+void nn_gn_pool(float *e, const float *p, size_t n, const int *pv, float decay, unsigned *skips);   /* gn_ema running [mean | var] per site: the EMA, variance slots pooled over windows (total variance); skipped when p is non-finite */
 void nn_ema_finite(float *ema, const float *p, size_t n, float decay, unsigned *skips);   /* nn_ema only if all of p is finite (else ++*skips; one block: small n) */
 double nn_sum(const float *x, size_t n, float *scratch);     /* scratch: >= 4096 floats */
 double nn_sumsq(const float *x, size_t n, float *scratch);
@@ -689,6 +734,8 @@ void nn_prob_u8(const float *logits, size_t n, uint8_t *out, float hard);   /* o
 void nn_ridge_u8(const uint8_t *p, const void *x, int xfmt, int d, int h, int w, int thr, uint8_t *out);
 void nn_fill_unlabelled(uint8_t *t, uint8_t *m, const uint8_t *vm, const uint8_t *src, size_t n);
 unsigned long long nn_count_nonfinite(const void *p, size_t n, int h16);   /* diagnostics (synchronous): non-finite values among n fp32 (h16 0) / fp16 (1) / bf16 (2) */
+void nn_nonfinite_acc(const void *p, size_t n, int h16, unsigned long long *cnt);   /* async: cnt (device, 3 u64) [0] += non-finite values,
+   [1] += 1 when this call saw any ([2] scratch); predict's guard on its fit-field accumulators */
 void nn_add_into(void *y, const void *x, shape5 s, int h16);   /* y += x in y's storage (MX by registration, else 16-bit or fp32) */
 void nn_fakeq_w4_2d(float *w, int Co, int Ci, int T, int B);   /* w[Co][Ci][T] in place to MX-fp4 values, a scale per B x B block and tap
                                                                    (unet_cfg.w4_2d: forward and backward-data then quantise it identically) */
@@ -705,6 +752,7 @@ void nn_ink_targets_smooth(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m,
 void nn_ink_air(const uint8_t *pap, size_t n, int z0, int H, int W, int S, float eps, uint8_t *t, uint8_t *m);   /* train --ink-air S: unlabelled air voxels on the S-lattice -> ink 0 (the smoothed 0), mask 1 */
 void nn_phase_trunc(const void *lc, const void *ls, const uint8_t *t, uint8_t *m, size_t n, float tau, float kappa);   /* robust phase loss: confident (>= kappa) predictions off their label by > tau turns leave the mask (fp16 logits) */
 void nn_phase_trunc_counts(unsigned long long out[2]);   /* labelled voxels / dropped since the last call */
+void nn_sheet_mask_z(const uint8_t *phase, int d, int h, int w, int s, float lo, float hi, uint8_t *m, int z0, int z1);   /* train --sheet-mask: the phase mask of phase-0 (labelled sheet) voxels x ramp(local spacing LO..HI voxels), planes [z0, z1) of the window into m (planes of z1 - z0) */
 void nn_unwrap_targets(const uint8_t *phase, int d, int h, int w, int s, float dscale, uint8_t *t, uint8_t *m);   /* task unwrap: sign-free normal n n^T (6) and density min(1, dscale rho) (x255, 7 planes) from the phase gradient over +-s voxels; mask */
 /* the same with the density code (0: min(1, x), 1: x / (1 + x), x = dscale rho: never saturates) and the mask holding the packed-sheet
    loss weight (1 at a spacing um / rho of packed_um or more, up to packed_w at packed_um / 2; um: the batch's voxel size in um) */
@@ -716,6 +764,10 @@ void nn_packed_mask_z(const uint8_t *phase, int d, int h, int w, int s, float um
 void nn_fib_dir_targets(const uint8_t *t, const uint8_t *m, int d, int h, int w, int r, float cmin, uint8_t *o, uint8_t *om);
 /* train --fib-head: fib_dir targets of window planes [z0, z0 + nz) from the H / V tube planes (prob254, 255 unknown; window-indexed, +-r halo planes present) */
 void nn_fib_head_dir(const uint8_t *fh, const uint8_t *fv, int d, int h, int w, int z0, int nz, int r, float cmin, uint8_t *o, uint8_t *om);
+/* the head slab's phase-derived targets in one kernel, byte-identical to nn_phase_targets (t2, m2) + nn_rv_targets (rvt, rvm; rvt null: none) +
+   nn_packed_mask_z on rvm (packed_w > 1) + nn_rv_verso_w (vw != 1) + nn_packed_mask_z on m2 + nn_unwrap_targets2_z (t7, m7) for planes [z0, z1) */
+void nn_slab_targets(const uint8_t *phase, const uint8_t *pap, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, float vw,
+                     uint8_t *t2, uint8_t *m2, uint8_t *rvt, uint8_t *rvm, uint8_t *t7, uint8_t *m7, int z0, int z1);
 void nn_unwrap_targets2_z(const uint8_t *phase, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, uint8_t *t, uint8_t *m,
                           int z0, int z1);   /* planes [z0, z1) of the window into planes of (z1 - z0) h w */
 /* train --count-lambda: K segments of L voxels along the ground-truth phase gradient; loss |log((sum rho_pred + .05) / (true turns + .05))|
@@ -741,12 +793,13 @@ void nn_pap_targets(const uint8_t *pl, const uint8_t *pm, size_t n, uint8_t *t, 
    nn_set_logits_h16), n voxels; w4 (W mod 4, 63 codes per turn, 255 unknown), comp (component 0..254, 255 none: one gauge each), m
    (mask weight). Per component the soft BCE against the target rotated by the best of the four quarter turns (the gauge); ds:
    nn_wind4_sums() bytes (zeroed by the caller, accumulated over slabs by nn_wind4_stats), fin: nn_wind4_scratch() bytes ([0] loss,
-   [1] turn accuracy, [2] voxels, [3] 1 / voxels, [4] components, [5] worst-gauge loss, [8 + c] the gauges). nn_wind4_grad writes
+   [1] turn accuracy, [2] voxels, [3] 1 / voxels, [4] components, [5] worst-gauge loss, [6] the targets' mean entropy, [8 + c] the gauges). nn_wind4_grad writes
    lambda x the gradient of fin[0] (zero where unsupervised; ga / gb may be la / lb) */
 size_t nn_wind4_scratch(void);
 size_t nn_wind4_sums(void);   /* bytes of the ds sums (doubles) */
 void nn_wind4_stats(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, double *ds);
 void nn_wind4_fin(double *ds, float *fin);
+void nn_wind4_fin_w(double *ds, float *fin, int wslot);   /* --win-weight slot as nn_loss_stats_fin_w */
 void nn_wind4_grad(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, const float *fin, float lambda, void *ga, void *gb);
 void nn_wind4_loss(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, double *ds, float *fin, float lambda, void *ga, void *gb);
 void nn_cond_gather(const uint8_t *c14, const uint8_t *done, const uint8_t *ct, int W, int oz, int oy, int ox, int bz, int by, int bx, size_t N, void *x, int h16);   /* predict --cond-sweep: condition inputs 4-6 of a window from the box canvas (src/sweep.c) */
@@ -786,6 +839,10 @@ void nn_pred_input_d(const uint8_t *ct, int D, int W, float mean, float isd, con
 void nn_pred_place_d(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 void nn_pred_place_m_d(const float *lg, const uint32_t *bits, int D, int W, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);
 void nn_pred_stats(const uint8_t *ct, size_t n, void *scratch, size_t *nz, double *sum, double *sq);   /* exact window stats (scratch: 24 B device) */
+/* the same split in two: _start enqueues the sums and their copy to pinned host memory (no wait), _finish waits for that copy only, so the
+   host prepares the window's axis rows meanwhile instead of stalling on a blocking copy (one pending start per process and device) */
+void nn_pred_stats_start(const uint8_t *ct, size_t n, void *scratch);
+void nn_pred_stats_finish(size_t *nz, double *sum, double *sq);
 void nn_pred_ctmask(const uint8_t *ct, size_t n, uint32_t *bits);   /* CT != 0 as bits ((n + 31) / 32 words) */
 void nn_pred_ctmask_t(const uint8_t *ct, size_t n, uint32_t *bits, int t);   /* predict --iso: bits of CT >= t */
 void nn_set_pred_iso(int t);

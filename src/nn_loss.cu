@@ -14,10 +14,15 @@ thread_local int g_logits_h16 = 0;   /* the logits the losses read are fp16 (une
 extern "C" void nn_set_logits_h16(int on) { g_logits_h16 = on; }
 thread_local int g_head_h16 = 0;
 extern "C" void nn_set_head_out_h16(int on) { g_head_h16 = on; }
+/* the binary entropy (nats) of a soft target byte p = t / 255: the soft BCE's floor, so bce - H is the KL the net can still remove */
+__device__ __forceinline__ float tgt_entropy(unsigned t) {
+    if (t == 0u || t >= 255u) return 0.f;
+    const float p = t * (1.f / 255.f); return -(p * logf(p) + (1.f - p) * logf(1.f - p));
+}
 template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw,
-                                                   int tol, uint8_t *code, int D, int H, int W, int unit_c = -1) {
+                                                   int tol, uint8_t *code, int D, int H, int W, int unit_c = -1, double *ent = nullptr) {
     int nc = blockIdx.x, slab = blockIdx.y, n = nc / C; const bool unit = nc % C == unit_c;
-    float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0;   /* per-thread fp32 partials, fp64 block reduction */
+    float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0;   /* per-thread fp32 partials, fp64 block reduction; a5: ent's sum mw H(p) */
     if (w[nc]) {
         const LT *l = lg + (size_t)nc * S; const uint8_t *tp = t + (size_t)nc * S, *mp = m + (size_t)n * S;
         uint8_t *cp = tol && nc % C == 0 ? code + (size_t)n * S : nullptr;
@@ -49,17 +54,51 @@ template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t 
                 }
                 float bce = pw * p * (spq - xq) + (1.f - p) * spp;          /* softplus(-x) = softplus(x) - x */
                 a0 += mw; a1 += mw * bce; a2 += sg * p; a3 += sg; a4 += p;
+                if (ent) a5 += mw * tgt_entropy(tb[k]);
             }
         }
     }
-    __shared__ double r[5][256];
-    r[0][threadIdx.x] = a0; r[1][threadIdx.x] = a1; r[2][threadIdx.x] = a2; r[3][threadIdx.x] = a3; r[4][threadIdx.x] = a4;
+    __shared__ double r[6][256];
+    const int nk = ent ? 6 : 5;
+    r[0][threadIdx.x] = a0; r[1][threadIdx.x] = a1; r[2][threadIdx.x] = a2; r[3][threadIdx.x] = a3; r[4][threadIdx.x] = a4; r[5][threadIdx.x] = a5;
     __syncthreads();
-    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 5; k++) r[k][threadIdx.x] += r[k][threadIdx.x + o]; __syncthreads(); }
-    if (threadIdx.x == 0) for (int k = 0; k < 5; k++) atomicAdd(&ds[nc * 5 + k], r[k][0]);
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < nk; k++) r[k][threadIdx.x] += r[k][threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) { for (int k = 0; k < 5; k++) atomicAdd(&ds[nc * 5 + k], r[k][0]); if (ent) atomicAdd(&ent[nc], r[5][0]); }
 }
 __global__ void loss_d2f_k(const double *d, float *f, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) f[i] = (float)d[i]; }
-__global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, float *fin) {
+/* --win-weight 1 (audit 2026-11-14 train #4): each head's gradient of a window times min(1, nm / ref), nm the window's mask weight sum
+   (the mean over its active channels), ref a running median of the head's nm over earlier labelled windows (per GPU, in device memory:
+   no host sync). Every head's loss is a mean over its own window's voxels, so a window with a sliver of labels got the full gradient of
+   one with 1e5 x more; under Muon's normalised momentum such a window steers ~20 updates. ref: the geometric mean of the first 16
+   labelled windows, then a sign step of 2^0.05 per window (the median tracker). Per slot: [0] log2 ref, [1] windows seen, then the log
+   interval's [2] labelled windows, [3] sum of weights, [4] windows below 0.1 ref, [5] smallest nm / ref (nn_win_weight_take resets) */
+#define WW_NS 16
+#define WW_F 8
+__device__ float g_ww[WW_NS][WW_F];   /* mgpu: per-device (__device__ storage lives in each context) */
+__device__ __forceinline__ float ww_apply(int slot, float nm) {   /* the window's weight; updates the slot (one thread) */
+    if (slot < 0 || slot >= WW_NS || !(nm >= 1.f)) return 1.f;
+    float *q = g_ww[slot];
+    const float l = log2f(nm);
+    float w = 1.f;
+    if (q[1] > 0.f) w = fminf(1.f, exp2f(l - q[0]));
+    if (q[1] < 16.f) q[0] = q[1] > 0.f ? (q[0] * q[1] + l) / (q[1] + 1.f) : l;
+    else q[0] += l > q[0] ? 0.05f : l < q[0] ? -0.05f : 0.f;
+    q[1] += 1.f;
+    const float r = q[1] > 1.f ? w : 1.f;
+    q[2] += 1.f; q[3] += w; if (r < 0.1f) q[4] += 1.f;
+    q[5] = q[2] > 1.f ? fminf(q[5], r) : r;
+    return w;
+}
+extern "C" void nn_win_weight_take(float *out, int nslot) {   /* the interval's [n, mean weight, n below 0.1 ref, min nm / ref, ref] per slot; resets the interval */
+    float h[WW_NS][WW_F];
+    cudaMemcpyFromSymbol(h, g_ww, sizeof h);
+    for (int k = 0; k < nslot && k < WW_NS; k++) {
+        out[5 * k] = h[k][2]; out[5 * k + 1] = h[k][2] > 0.f ? h[k][3] / h[k][2] : 0.f; out[5 * k + 2] = h[k][4]; out[5 * k + 3] = h[k][5]; out[5 * k + 4] = exp2f(h[k][0]);
+        h[k][2] = h[k][3] = h[k][4] = h[k][5] = 0.f;
+    }
+    cudaMemcpyToSymbol(g_ww, h, sizeof h);
+}
+__global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, float *fin, int wslot) {
     if (threadIdx.x || blockIdx.x) return;
     int active = 0, cnt[16] = {0};
     for (int c = 0; c < 2 * C + 2; c++) fin[c] = 0.f;
@@ -74,6 +113,11 @@ __global__ void loss_fin_k(const float *st, const uint8_t *w, int N, int C, floa
     for (int c = 0; c < C; c++) if (cnt[c]) { fin[c] /= cnt[c]; fin[C + c] /= cnt[c]; }
     fin[2 * C] = (float)active;
     fin[2 * C + 1] = active ? 1.f / active : 0.f;
+    if (wslot >= 0 && active) {   /* --win-weight: the gradient's scale only (the logged loss values fin[c] unchanged) */
+        float nm = 0.f;
+        for (int nc = 0; nc < N * C; nc++) if (w[nc] && st[nc * 5] >= 1.f) nm += st[nc * 5];
+        fin[2 * C + 1] *= ww_apply(wslot, nm / active);
+    }
 }
 thread_local int g_loss_g16 = 0;
 static float g_recall = 0.f;   /* --recall weight (recto channel): 1 - (sum s p + 1) / (sum p + 1), a skeleton-recall term for thin labels */
@@ -117,12 +161,12 @@ extern "C" void nn_loss_async_tol(const float *logits, const uint8_t *t, const u
         if (g_logits_h16) {
             const f16 *l16 = (const f16 *)logits;
             if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
-            else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
-            else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
+            else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, GSH, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
+            else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, GSH, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
         } else
         if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, gl, g_posw, 1.f, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
-        else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
-        else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, g_gscale, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c));
+        else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, GSH, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
+        else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>(logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, GSH, tol, code, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
     }
     KCHECK();
 }
@@ -167,7 +211,8 @@ template <typename LT> __global__ void loss_stats_pk_k(const LT *lg, const uint8
     if (threadIdx.x == 0) for (int k = 0; k < 5; k++) atomicAdd(&ds[nc * 5 + k], r[k][0]);
 }
 template <typename GT, typename LT> __global__ void loss_grad_pk_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N, int C, size_t S, const float *st,
-                                                                  float dice_w, const float *fin, GT *gl, float pw, float gscale, int H, int W, float rec_w) {
+                                                                  float dice_w, const float *fin, GT *gl, float pw, float gscale, int H, int W, float rec_w, const float *hp = nullptr) {
+    gscale = hgs_mul(gscale, hp);
     const size_t j = blockIdx.x * (size_t)blockDim.x + threadIdx.x, hv = S / 8;   /* one thread per packed logit element */
     if (j >= (size_t)N * C * S) return;
     const size_t ch = j / hv, hvi = j % hv;
@@ -203,9 +248,9 @@ extern "C" void nn_loss_pack(const void *logits, const uint8_t *t, const uint8_t
     loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, fin);
     if (gl) {
         const size_t n = shape_numel(s);
-#define LGP(GT, LT, gs) loss_grad_pk_k<GT, LT><<<nblk(n, 256), 256>>>((const LT *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (GT *)gl, g_posw, gs, s.h, s.w, g_recall)
-        if (g_logits_h16) { if (!g_loss_g16) LGP(float, f16, 1.f); else if (g_h16) LGP(f16, f16, g_gscale); else LGP(bf16, f16, g_gscale); }
-        else { if (!g_loss_g16) LGP(float, float, 1.f); else if (g_h16) LGP(f16, float, g_gscale); else LGP(bf16, float, g_gscale); }
+#define LGP(GT, LT, gs, hp) loss_grad_pk_k<GT, LT><<<nblk(n, 256), 256>>>((const LT *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (GT *)gl, g_posw, gs, s.h, s.w, g_recall, hp)
+        if (g_logits_h16) { if (!g_loss_g16) LGP(float, f16, 1.f, nullptr); else if (g_h16) LGP(f16, f16, GSH, GSHP); else LGP(bf16, f16, GSH, GSHP); }
+        else { if (!g_loss_g16) LGP(float, float, 1.f, nullptr); else if (g_h16) LGP(f16, float, GSH, GSHP); else LGP(bf16, float, GSH, GSHP); }
 #undef LGP
     }
     KCHECK();
@@ -220,13 +265,74 @@ extern "C" void nn_loss_stats_acc(const void *logits, const uint8_t *t, const ui
     else loss_stats_k<float><<<dim3(NC, slabs), 256>>>((const float *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c));
     KCHECK();
 }
-extern "C" void nn_loss_stats_fin(double *ds, const uint8_t *w, shape5 s, float *scratch) {
+/* nn_loss_stats_acc + the targets' entropy: ent[n c] += sum mw H(t / 255) over the slab (ent: s.n s.c doubles, zeroed by the caller) */
+extern "C" void nn_loss_stats_acc_e(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds, double *ent) {
+    const size_t S = shape_spatial(s); const int NC = s.n * s.c, slabs = NC >= 16 ? KSLAB : 512 / NC;
+    if (g_logits_h16) loss_stats_k<f16><<<dim3(NC, slabs), 256>>>((const f16 *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c), ent);
+    else loss_stats_k<float><<<dim3(NC, slabs), 256>>>((const float *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c), ent);
+    KCHECK();
+}
+/* the entropy alone (a group whose statistics another kernel sums: the fused normal / density group), C channels of S voxels, one mask */
+__global__ void ent_acc_k(const uint8_t *t, const uint8_t *m, int C, size_t S, int unit_c, double *ent) {
+    const int c = blockIdx.y; const bool unit = c == unit_c; float a = 0.f;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < S; i += (size_t)gridDim.x * blockDim.x) {
+        const unsigned mb = m[i]; if (!mb) continue;
+        a += (unit ? 1.f : (float)mb) * tgt_entropy(t[(size_t)c * S + i]);
+    }
+    __shared__ double r[256]; r[threadIdx.x] = a; __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) r[threadIdx.x] += r[threadIdx.x + o]; __syncthreads(); }
+    if (!threadIdx.x) atomicAdd(&ent[c], r[0]);
+}
+extern "C" void nn_ent_acc(const uint8_t *t, const uint8_t *m, int C, size_t S, double *ent) {
+    const unsigned nb = (unsigned)(S / 4096 + 1 < 256 ? S / 4096 + 1 : 256);
+    ent_acc_k<<<dim3(nb, C), 256>>>(t, m, C, S, UNITC(C), ent); KCHECK();
+}
+extern "C" void nn_ent_fin(double *ent, int n) { zs_reduce(ent, n); KCHECK(); }   /* --split z: both halves' sums */
+/* the angle error of a cos / sin logit pair against its targets (0.5 + 0.5 cos, 0.5 + 0.5 sin, x 255): acc[0] += sum |dtheta| in degrees,
+   acc[1] += the count, over the voxels with m != 0 (unweighted) */
+template <typename LT> __global__ void pair_angerr_k(const LT *la, const LT *lb, const uint8_t *t, const uint8_t *m, size_t n, double *acc) {
+    float e = 0.f, c = 0.f;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        if (!m[i]) continue;
+        const float pa = 2.f / (1.f + __expf(-lgv(la, i))) - 1.f, pb = 2.f / (1.f + __expf(-lgv(lb, i))) - 1.f;
+        const float ta = t[i] * (2.f / 255.f) - 1.f, tb = t[n + i] * (2.f / 255.f) - 1.f;
+        e += fabsf(atan2f(pb * ta - pa * tb, pa * ta + pb * tb)) * 57.29577951f; c += 1.f;
+    }
+    __shared__ double r[2][256]; r[0][threadIdx.x] = e; r[1][threadIdx.x] = c; __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) { r[0][threadIdx.x] += r[0][threadIdx.x + o]; r[1][threadIdx.x] += r[1][threadIdx.x + o]; } __syncthreads(); }
+    if (!threadIdx.x) { atomicAdd(&acc[0], r[0][0]); atomicAdd(&acc[1], r[1][0]); }
+}
+extern "C" void nn_pair_angerr(const void *la, const void *lb, const uint8_t *t, const uint8_t *m, size_t n, double *acc) {
+    const unsigned nb = (unsigned)(n / 4096 + 1 < 512 ? n / 4096 + 1 : 512);
+    if (g_logits_h16) pair_angerr_k<f16><<<nb, 256>>>((const f16 *)la, (const f16 *)lb, t, m, n, acc);
+    else pair_angerr_k<float><<<nb, 256>>>((const float *)la, (const float *)lb, t, m, n, acc);
+    KCHECK();
+}
+/* UFSM_HSG_ZERO (train): how many 16-bit (fp16) gradients of the supervised voxels are 0 or subnormal. cnt[0] += voxels with m != 0
+   (m nullptr: every voxel) and comp[i] < 255 and code[i] < 252 where given, cnt[1] += those whose gradient is +-0, cnt[2] += those
+   subnormal (nonzero, exponent bits 0) */
+__global__ void h16_zero_k(const uint16_t *g, const uint8_t *m, const uint8_t *comp, const uint8_t *code, size_t n, unsigned long long *cnt) {
+    unsigned a = 0, z = 0, u = 0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        if ((m && !m[i]) || (comp && comp[i] >= 255) || (code && code[i] >= 252)) continue;
+        const unsigned b = g[i] & 0x7fffu; a++; z += b == 0; u += b != 0 && (b & 0x7c00u) == 0;
+    }
+    __shared__ unsigned r[3][256]; r[0][threadIdx.x] = a; r[1][threadIdx.x] = z; r[2][threadIdx.x] = u; __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < 3; k++) r[k][threadIdx.x] += r[k][threadIdx.x + o]; __syncthreads(); }
+    if (!threadIdx.x) for (int k = 0; k < 3; k++) atomicAdd(&cnt[k], (unsigned long long)r[k][0]);
+}
+extern "C" void nn_h16_zero_count(const void *g, const uint8_t *m, const uint8_t *comp, const uint8_t *code, size_t n, unsigned long long *cnt) {
+    const unsigned nb = (unsigned)(n / 4096 + 1 < 512 ? n / 4096 + 1 : 512);
+    h16_zero_k<<<nb, 256>>>((const uint16_t *)g, m, comp, code, n, cnt); KCHECK();
+}
+extern "C" void nn_loss_stats_fin_w(double *ds, const uint8_t *w, shape5 s, float *scratch, int wslot) {   /* wslot >= 0: --win-weight's slot */
     const int NC = s.n * s.c;
     zs_reduce(ds, 5 * NC);
     loss_d2f_k<<<nblk(5 * NC, 128), 128>>>(ds, scratch, 5 * NC);
-    loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, scratch + (size_t)5 * NC);
+    loss_fin_k<<<1, 32>>>(scratch, w, s.n, s.c, scratch + (size_t)5 * NC, wslot);
     KCHECK();
 }
+extern "C" void nn_loss_stats_fin(double *ds, const uint8_t *w, shape5 s, float *scratch) { nn_loss_stats_fin_w(ds, w, s, scratch, -1); }
 /* the light statistics pass's finalisation after the gradient pass (perf2 2026-11-13): ds's mask weights (entry 0 of each channel's 5)
    were summed across the split halves by the statistics pass's finalisation already, the loss sums 1 .. 4 come from this half's gradient
    pass: only those are summed across the halves (entry 0 held out of zs_reduce), then finalised as nn_loss_stats_fin does */
@@ -244,16 +350,16 @@ extern "C" void nn_loss_stats_fin_light(double *ds, const uint8_t *w, shape5 s, 
    scales were a separate read-modify-write pass, gscale_k, ~90 ms a step per card at the P 1024 split half). The 16-bit value is rounded
    once from (g fin gscale) mul instead of twice (round, scale, round): at most one fp16 ulp apart */
 extern "C" void nn_loss_grad_only_s(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch, float mul) {
-    const size_t S = shape_spatial(s); const float gs1 = mul, gsh = g_gscale * mul;
+    const size_t S = shape_spatial(s); const float gs1 = mul, gsh = GSH * mul;
     const float *fin = scratch + (size_t)5 * s.n * s.c;
     if (g_logits_h16) {
         const f16 *l16 = (const f16 *)logits;
         if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, gs1, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-        else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-        else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+        else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
+        else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
     } else if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, gs1, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-    else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-    else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
+    else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
+    else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
     KCHECK();
 }
 extern "C" void nn_loss_grad_only(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch) {
@@ -335,7 +441,8 @@ __global__ void count_sum_k(const float *seg, int K, const unsigned *nvalid, flo
     const unsigned nv = *nvalid; out2[0] = nv ? (float)(l / nv) : 0.f; out2[1] = (float)nv; out2[2] = tg > 0 ? (float)(tp / tg) : 0.f;
     for (int b = 0; b < 9; b++) { out2[3 + 2 * b] = (float)bp[b]; out2[4 + 2 * b] = (float)bg[b]; }
 }
-template <typename GT> __global__ void count_apply_k(GT *gl, float *acc, size_t n, const unsigned *nvalid, float scale) {
+template <typename GT> __global__ void count_apply_k(GT *gl, float *acc, size_t n, const unsigned *nvalid, float scale, const float *hp = nullptr) {
+    scale = hgs_mul(scale, hp);
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= n) return;
     const float a = acc[i]; if (a == 0.f) return;
     acc[i] = 0.f;
@@ -351,8 +458,8 @@ extern "C" void nn_count_loss(const void *dens_logits, const uint8_t *phase, int
     count_sum_k<<<1, 32>>>(seg, K, nvalid, out2);
     if (dens_grad) {
         if (!g_loss_g16) count_apply_k<float><<<nblk(n, 256), 256>>>((float *)dens_grad, acc, n, nvalid, lambda);
-        else if (g_h16) count_apply_k<f16><<<nblk(n, 256), 256>>>((f16 *)dens_grad, acc, n, nvalid, lambda * g_gscale);
-        else count_apply_k<bf16><<<nblk(n, 256), 256>>>((bf16 *)dens_grad, acc, n, nvalid, lambda * g_gscale);
+        else if (g_h16) count_apply_k<f16><<<nblk(n, 256), 256>>>((f16 *)dens_grad, acc, n, nvalid, lambda * GSH, GSHP);
+        else count_apply_k<bf16><<<nblk(n, 256), 256>>>((bf16 *)dens_grad, acc, n, nvalid, lambda * GSH, GSHP);
     } else cudaMemsetAsync(acc, 0, n * sizeof *acc);   /* validation: no gradient */
     KCHECK();
 }
@@ -393,8 +500,8 @@ extern "C" void nn_sheet_scatter(float *gl,const uint64_t *indices,const float *
     CK(cudaMalloc(&ix,n*sizeof(uint64_t))); CK(cudaMalloc(&v,n*sizeof(float)));
     CK(cudaMemcpy(ix,indices,n*sizeof(uint64_t),cudaMemcpyHostToDevice)); CK(cudaMemcpy(v,values,n*sizeof(float),cudaMemcpyHostToDevice));
     if (!h16) sheet_scatter_k<float><<<nblk(n,256),256>>>(gl,ix,v,n,1.f);
-    else if (g_h16) sheet_scatter_k<f16><<<nblk(n,256),256>>>((f16 *)gl,ix,v,n,g_gscale);
-    else sheet_scatter_k<bf16><<<nblk(n,256),256>>>((bf16 *)gl,ix,v,n,g_gscale);
+    else if (g_h16) sheet_scatter_k<f16><<<nblk(n,256),256>>>((f16 *)gl,ix,v,n,GSH,GSHP);
+    else sheet_scatter_k<bf16><<<nblk(n,256),256>>>((bf16 *)gl,ix,v,n,GSH,GSHP);
     CK(cudaFree(ix)); CK(cudaFree(v)); KCHECK();
 }
 extern "C" void nn_sheet_input(void *input,int W,const float *rows,float center,float scale,int h16) {
@@ -767,7 +874,8 @@ __global__ void aff_fin_k(const double *ds, int K, float *fin) {
 }
 /* block per (z, y) row (blockIdx.x), threads along x; every voxel's channel is written (0 when it owns no pair) */
 template <typename GT, typename LT = float> __global__ void __launch_bounds__(128) aff_grad_k(const LT *lg, const uint8_t *band, aff_offsets_t off, int N, int C, int c0, int D, int H, int W,
-                                                  int zlo, int zhi, const float *fin, float dice_w, float scale, GT *gl) {
+                                                  int zlo, int zhi, const float *fin, float dice_w, float scale, GT *gl, const float *hp = nullptr) {
+    scale = hgs_mul(scale, hp);
     const size_t S = (size_t)D * H * W;
     const int nk = blockIdx.y, n = nk / off.K, k = nk % off.K;
     const int z = blockIdx.x / H, y = blockIdx.x % H;
@@ -808,12 +916,12 @@ extern "C" void nn_aff_loss_async(const float *logits, shape5 s, int c0, const u
         if (g_logits_h16) {
             const f16 *l16 = (const f16 *)logits;
             if (!g_loss_g16) aff_grad_k<float, f16><<<grid, 128>>>(l16, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale, gl);
-            else if (g_h16) aff_grad_k<f16, f16><<<grid, 128>>>(l16, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * g_gscale, (f16 *)gl);
-            else VERIFY_ONLY(aff_grad_k<bf16, f16><<<grid, 128>>>(l16, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * g_gscale, (bf16 *)gl));
+            else if (g_h16) aff_grad_k<f16, f16><<<grid, 128>>>(l16, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * GSH, (f16 *)gl, GSHP);
+            else VERIFY_ONLY(aff_grad_k<bf16, f16><<<grid, 128>>>(l16, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * GSH, (bf16 *)gl, GSHP));
         } else
         if (!g_loss_g16) aff_grad_k<float><<<grid, 128>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale, gl);
-        else if (g_h16) aff_grad_k<f16><<<grid, 128>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * g_gscale, (f16 *)gl);
-        else VERIFY_ONLY(aff_grad_k<bf16><<<grid, 128>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * g_gscale, (bf16 *)gl));
+        else if (g_h16) aff_grad_k<f16><<<grid, 128>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * GSH, (f16 *)gl, GSHP);
+        else VERIFY_ONLY(aff_grad_k<bf16><<<grid, 128>>>(logits, band, off, s.n, s.c, c0, s.d, s.h, s.w, zlo, zhi, fin, dice_w, scale * GSH, (bf16 *)gl, GSHP));
     }
     KCHECK();
 }
@@ -828,7 +936,7 @@ extern "C" void nn_aff_loss_fetch(const float *fin, int K, float *out) { CK(cuda
    (a + b), X = sum m 0.5 R_0, Y = sum m 0.5 R_1 and the accuracy counts A_k (the predicted angle within 1/8 turn mod 4 of theta + k
    pi / 2) are summed: W4_NS per component. */
 #define W4_NC 255   /* components (gauges) per window: comp 0..254, 255 none */
-#define W4_NS 9
+#define W4_NS 10   /* + [9] the targets' entropy sum (the pair's soft-BCE floor) */
 template <typename LT> __global__ void w4_stats_k(const LT *la, const LT *lb, const uint8_t *w4, const uint8_t *cp, const uint8_t *m, size_t n, double *ds) {
     __shared__ float sh[W4_NC * W4_NS];
     for (int k = threadIdx.x; k < W4_NC * W4_NS; k += blockDim.x) sh[k] = 0.f;
@@ -856,6 +964,8 @@ template <typename LT> __global__ void w4_stats_k(const LT *la, const LT *lb, co
                 const int k = ((int)lrintf(e * (2.f / 3.14159265358979f)) % 4 + 4) % 4;
 #pragma unroll
                 for (int q = 0; q < 4; q++) v[5 + q] = q == k ? w : 0.f;
+                const float ta = 0.5f + 0.5f * ct, tb = 0.5f + 0.5f * st;
+                v[9] = w * (ta > 0.f && ta < 1.f ? -(ta * logf(ta) + (1.f - ta) * logf(1.f - ta)) : 0.f) + w * (tb > 0.f && tb < 1.f ? -(tb * logf(tb) + (1.f - tb) * logf(1.f - tb)) : 0.f);
             }
         }
         const unsigned on = __ballot_sync(0xffffffffu, c < W4_NC);
@@ -885,23 +995,25 @@ template <typename LT> __global__ void w4_stats_k(const LT *la, const LT *lb, co
 /* per component the best gauge g* (largest of X, Y, -X, -Y); out: [0] loss (mean per channel of the best-gauge BCE over the
    supervised voxels), [1] accuracy (fraction with the predicted turn right at g*), [2] N, [3] 1 / N (0 when none), [4] components,
    [5] the same BCE at the worst gauge (a gauge-blind net has [0] == [5]), [8 + c] g* of component c */
-__global__ void w4_fin_k(const double *ds, float *out) {
+__global__ void w4_fin_k(const double *ds, float *out, int wslot = -1) {
     if (threadIdx.x || blockIdx.x) return;
-    double N = 0, L = 0, Lw = 0, A = 0; int nc = 0;
+    double N = 0, L = 0, Lw = 0, A = 0, E = 0; int nc = 0;
     for (int c = 0; c < W4_NC; c++) {
         const double *s = ds + c * W4_NS;
         out[8 + c] = 0.f;
         if (s[0] <= 0) continue;
         const double R[4] = {s[3], s[4], -s[3], -s[4]};
         int g = 0, gw = 0; for (int k = 1; k < 4; k++) { if (R[k] > R[g]) g = k; if (R[k] < R[gw]) gw = k; }
-        N += s[0]; L += s[1] - s[2] - R[g]; Lw += s[1] - s[2] - R[gw]; A += s[5 + g]; nc++;
+        N += s[0]; L += s[1] - s[2] - R[g]; Lw += s[1] - s[2] - R[gw]; A += s[5 + g]; E += s[9]; nc++;
         out[8 + c] = (float)g;
     }
     out[0] = N > 0 ? (float)(L / (2 * N)) : 0.f; out[1] = N > 0 ? (float)(A / N) : 0.f; out[2] = (float)N; out[3] = N > 0 ? (float)(1 / N) : 0.f;
-    out[4] = (float)nc; out[5] = N > 0 ? (float)(Lw / (2 * N)) : 0.f; out[6] = out[7] = 0.f;
+    out[4] = (float)nc; out[5] = N > 0 ? (float)(Lw / (2 * N)) : 0.f; out[6] = N > 0 ? (float)(E / (2 * N)) : 0.f; out[7] = 0.f;   /* [6]: the targets' mean entropy (loss - [6]: KL) */
+    if (wslot >= 0 && N > 0) out[3] *= ww_apply(wslot, (float)N);   /* --win-weight: the gradient's 1 / N only */
 }
 template <typename GT, typename LT> __global__ void w4_grad_k(const LT *la, const LT *lb, const uint8_t *w4, const uint8_t *cp, const uint8_t *m, size_t n,
-                                                             const float *fin, float scale, GT *ga, GT *gb) {
+                                                             const float *fin, float scale, GT *ga, GT *gb, const float *hp = nullptr) {
+    scale = hgs_mul(scale, hp);
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= n) return;
     const unsigned c = cp[i], t = w4[i], mw = m[i];
@@ -923,16 +1035,17 @@ extern "C" void nn_wind4_stats(const void *la, const void *lb, const uint8_t *w4
     else w4_stats_k<float><<<nb, 256>>>((const float *)la, (const float *)lb, w4, comp, m, n, ds);
     KCHECK();
 }
-extern "C" void nn_wind4_fin(double *ds, float *out) {
+extern "C" void nn_wind4_fin_w(double *ds, float *out, int wslot) {
     zs_reduce(ds, W4_NC * W4_NS);   /* spatial split: both halves' sums (halo planes masked by the caller), the same gauges */
-    w4_fin_k<<<1, 32>>>(ds, out);
+    w4_fin_k<<<1, 32>>>(ds, out, wslot);
     KCHECK();
 }
+extern "C" void nn_wind4_fin(double *ds, float *out) { nn_wind4_fin_w(ds, out, -1); }
 extern "C" void nn_wind4_grad(const void *la, const void *lb, const uint8_t *w4, const uint8_t *comp, const uint8_t *m, size_t n, const float *fin, float lambda, void *ga, void *gb) {
     const unsigned g = nblk(n, 256);
-#define W4G(GT, LT, s) w4_grad_k<GT, LT><<<g, 256>>>((const LT *)la, (const LT *)lb, w4, comp, m, n, fin, (s), (GT *)ga, (GT *)gb)
-    if (g_logits_h16) { if (!g_loss_g16) W4G(float, f16, lambda); else if (g_h16) W4G(f16, f16, lambda * g_gscale); else VERIFY_ONLY(W4G(bf16, f16, lambda * g_gscale)); }
-    else { if (!g_loss_g16) W4G(float, float, lambda); else if (g_h16) W4G(f16, float, lambda * g_gscale); else VERIFY_ONLY(W4G(bf16, float, lambda * g_gscale)); }
+#define W4G(GT, LT, s, hp) w4_grad_k<GT, LT><<<g, 256>>>((const LT *)la, (const LT *)lb, w4, comp, m, n, fin, (s), (GT *)ga, (GT *)gb, (hp))
+    if (g_logits_h16) { if (!g_loss_g16) W4G(float, f16, lambda, nullptr); else if (g_h16) W4G(f16, f16, lambda * GSH, GSHP); else VERIFY_ONLY(W4G(bf16, f16, lambda * GSH, GSHP)); }
+    else { if (!g_loss_g16) W4G(float, float, lambda, nullptr); else if (g_h16) W4G(f16, float, lambda * GSH, GSHP); else VERIFY_ONLY(W4G(bf16, float, lambda * GSH, GSHP)); }
 #undef W4G
     KCHECK();
 }
@@ -1066,8 +1179,8 @@ extern "C" void nn_pgrad_slab(const void *lc, const void *ls, const uint8_t *pha
 }
 extern "C" void nn_pgrad_apply(void *gc, void *gs, float *acc, size_t ns, const double *sums, float lambda) {
     if (!g_loss_g16) { fprintf(stderr, "nn_pgrad_apply: needs 16-bit logit gradients (head slabs)\n"); abort(); }
-    if (g_h16) pgrad_apply_k<f16><<<nblk(ns, 256), 256>>>((f16 *)gc, (f16 *)gs, acc, ns, sums, lambda * g_gscale);
-    else pgrad_apply_k<bf16><<<nblk(ns, 256), 256>>>((bf16 *)gc, (bf16 *)gs, acc, ns, sums, lambda * g_gscale);
+    if (g_h16) pgrad_apply_k<f16><<<nblk(ns, 256), 256>>>((f16 *)gc, (f16 *)gs, acc, ns, sums, lambda * GSH);   /* (hgs_choose keeps s 1 with pgrad on) */
+    else pgrad_apply_k<bf16><<<nblk(ns, 256), 256>>>((bf16 *)gc, (bf16 *)gs, acc, ns, sums, lambda * GSH);
     KCHECK();
 }
 /* ---- train --fib-normal-lambda: the normal head orthogonal to fibres ----
@@ -1107,8 +1220,8 @@ template <typename LT> __global__ void fibn_k(const LT *lg, size_t ns, const uin
     const size_t hw = (size_t)H * W; const int z = z0 + (int)(li / hw), y = (int)((li / W) % H), x = (int)(li % W), R = r + 1;
     const size_t i = (size_t)z * hw + (size_t)y * W + x;
     const uint8_t b = fib[i]; if (b == 255 || b < thr || (nm && nm[li])) return;   /* (nm: --fib-normal-unsup, only where the normal BCE has no target) */
-    if (z - R < z0 || z + R >= z1 || y < R || y + R >= H || x < R || x + R >= W) return;
-    (void)D; float t[3]; if (!fibn_tangent(fib, i, H, W, r, t)) return;
+    if (z < R || z + R >= D || y < R || y + R >= H || x < R || x + R >= W) return;
+    float t[3]; if (!fibn_tangent(fib, i, H, W, r, t)) return;
     const float c6[6] = {t[0] * t[0], t[1] * t[1], t[2] * t[2], 2.f * t[0] * t[1], 2.f * t[0] * t[2], 2.f * t[1] * t[2]};
     float L = 0.f, p[6];
     for (int c = 0; c < 6; c++) { p[c] = 1.f / (1.f + __expf(-lgv(lg, (size_t)c * ns + li))); L += c6[c] * (c < 3 ? p[c] : p[c] - 0.5f); }
@@ -1132,7 +1245,7 @@ extern "C" void nn_fibn(const void *lg, size_t ns, const uint8_t *fib, int D, in
 extern "C" void nn_fibn_apply(const void *list, const unsigned *nl, size_t cap, const double *acc, float lambda, void *gl, size_t ns) {
     const unsigned nb = (unsigned)((cap + 255) / 256);
     if (!g_loss_g16) fibn_apply_k<float><<<nb, 256>>>((const fibn_ent *)list, nl, (unsigned)cap, acc, lambda, 1.f, (float *)gl, ns);
-    else if (g_h16) fibn_apply_k<f16><<<nb, 256>>>((const fibn_ent *)list, nl, (unsigned)cap, acc, lambda, g_gscale, (f16 *)gl, ns);
-    else fibn_apply_k<bf16><<<nb, 256>>>((const fibn_ent *)list, nl, (unsigned)cap, acc, lambda, g_gscale, (bf16 *)gl, ns);
+    else if (g_h16) fibn_apply_k<f16><<<nb, 256>>>((const fibn_ent *)list, nl, (unsigned)cap, acc, lambda, GSH, (f16 *)gl, ns);
+    else fibn_apply_k<bf16><<<nb, 256>>>((const fibn_ent *)list, nl, (unsigned)cap, acc, lambda, GSH, (bf16 *)gl, ns);
     KCHECK();
 }

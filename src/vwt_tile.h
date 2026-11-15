@@ -35,7 +35,7 @@ typedef struct {
 
 /* the tiling of box (z, y, x, nz, ny, nx) with its neighbour pairs and their point sets (4-voxel lattice over the intersection of both slabs
    shrunk by 8 voxels, subsampled to <= VWT_PAIR_PTS); 0 on success */
-int vwt_tiling_build(const char *umb_json, const int64_t box[6], int T, int L, double sz, double sr, double st, double r00, vwt_tiling *t);
+int vwt_tiling_build(const char *umb_json, double umb_scale, const int64_t box[6], int T, int L, double sz, double sr, double st, double r00, vwt_tiling *t);
 void vwt_tiling_free(vwt_tiling *t);
 int vwt_tiling_save(const vwt_tiling *t, const char *path);
 int vwt_tiling_load(const char *path, vwt_tiling *t);

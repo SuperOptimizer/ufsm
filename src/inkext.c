@@ -13,6 +13,7 @@
    Output: the probability on the surface's 2.4 um render grid (ufsm render --scale 1: (w - 1) / scale + 1 pixels wide) as
    <out>/<surf>_<model>.tif (uint8, 255 = 1) and a half-resolution JPEG; --native also the model-grid map. */
 #include "inkext.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "imgops.h"
 #include "wload.h"
@@ -31,8 +32,8 @@
 #include <sys/stat.h>
 #include <time.h>
 
-static const char *iopt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
-static int iflag(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return 1; return 0; }
+static const char *iopt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
+static int iflag(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], opt_n(k))) return 1; return 0; }
 static double inow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 /* ---- surface ---- */
@@ -554,7 +555,7 @@ static int raw_mode(int argc, char **argv, ie_net *net, int kind) {
     if (sz <= 0 || sz % (long)per) { fclose(f); fprintf(stderr, "ink-ext: %s is not a multiple of %zu bytes (%d x %d x %d tiles)\n", in, per, sp->D, sp->T, sp->T); return 1; }
     const int n = (int)(sz / (long)per); uint8_t *t = malloc((size_t)sz); const size_t got = fread(t, 1, (size_t)sz, f); fclose(f);
     if (got != (size_t)sz) { free(t); return 1; }
-    const int B = atoi(iopt(argc, argv, "--batch", "2")); float *o = malloc((size_t)n * sp->T * sp->T * sizeof *o);
+    const int B = opt_atoi("--batch", iopt(argc, argv, "--batch", "2")); float *o = malloc((size_t)n * sp->T * sp->T * sizeof *o);
     const double t0 = inow();
     for (int i = 0; i < n; i += B) { const int b = n - i < B ? n - i : B; if (ie_forward(net, t + (size_t)i * per, b, o + (size_t)i * sp->T * sp->T, 1)) { free(t); free(o); return 1; } }
     xnet_sync(); const double dt = inow() - t0;
@@ -583,7 +584,7 @@ int cmd_ink_ext(int argc, char **argv) {
                         "  --native-only: only <name>_<model>_native.tif/.jpg on the model grid (px (i, j) = tifxyz grid (i, j) x du; invalid cells 0), no canvas TIF\n"); return 2;
     }
     const int kind = ie_model_kind(mname); if (kind < 0) { fprintf(stderr, "ink-ext: unknown model %s\n", mname); return 2; }
-    if (xnet_init(atoi(iopt(argc, argv, "--gpu", "0")))) return 1;
+    if (xnet_init(opt_atoi("--gpu", iopt(argc, argv, "--gpu", "0")))) return 1;
     enum { MAXE = 16 }; ie_net *nets[MAXE]; int nnet = 0;
     {   /* --weights W1,W2,..: each checkpoint loaded once */
         char wl[4096]; snprintf(wl, sizeof wl, "%s", weights);
@@ -602,7 +603,7 @@ int cmd_ink_ext(int argc, char **argv) {
         if (!nzw) zw[nzw++] = 0;
     }
     const int calib = iflag(argc, argv, "--calib");
-    int ci = -1; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) ci = i;
+    int ci = -1; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--ct"))) ci = i;
     const char *outdir = iopt(argc, argv, "--out", nullptr), *cache = iopt(argc, argv, "--cache", nullptr), *suffix = iopt(argc, argv, "--suffix", "");
     const char *ldir = iopt(argc, argv, "--layers", nullptr);   /* a published surface volume (NN.tif, ascending normal offsets) instead of our render */
     if ((ci < 0 && !ldir) || !outdir) { fprintf(stderr, "ink-ext: need --ct ROOT KEY (or --layers DIR) and --out DIR\n"); return 2; }
@@ -627,22 +628,22 @@ int cmd_ink_ext(int argc, char **argv) {
         }
         fprintf(stderr, "ink-ext: --layers %s: %d layers of %d x %d\n", ldir, X.stk_n, X.stk_w, X.stk_h);
     }
-    X.dump_req = iopt(argc, argv, "--dump-layers", nullptr) != nullptr; X.render_only = iflag(argc, argv, "--render-only"); X.kind = kind; X.net = net; X.sp = &ie_specs[kind]; X.stride = atoi(iopt(argc, argv, "--stride", "0")); X.reverse = iflag(argc, argv, "--reverse");
+    X.dump_req = iopt(argc, argv, "--dump-layers", nullptr) != nullptr; X.render_only = iflag(argc, argv, "--render-only"); X.kind = kind; X.net = net; X.sp = &ie_specs[kind]; X.stride = opt_atoi("--stride", iopt(argc, argv, "--stride", "0")); X.reverse = iflag(argc, argv, "--reverse");
     X.blend_norm = !strcmp(iopt(argc, argv, "--blend", "official"), "norm");   /* v8in: sum(p g) / sum(g) instead of inference.py sum(p g) / count (its stride grid) */
     X.no_overlap = iflag(argc, argv, "--no-overlap");   /* stride = the tile, uniform weights (no blending), empty tiles skipped, v8in without its coverage-mask rule */
     X.norm_sheet = !strcmp(iopt(argc, argv, "--norm", "tile"), "sheet");
-    X.tta = atoi(iopt(argc, argv, "--tta", "1")); X.tta_depth = atoi(iopt(argc, argv, "--tta-depth", "0")) != 0;
+    X.tta = opt_atoi("--tta", iopt(argc, argv, "--tta", "1")); X.tta_depth = opt_atoi("--tta-depth", iopt(argc, argv, "--tta-depth", "0")) != 0;
     if (X.tta < 1 || X.tta > 8) { fprintf(stderr, "ink-ext: --tta 1..8\n"); return 2; }   /* Reader / ink9um input normalisation: tile (official, per tile) or sheet */
-    X.nth = ufsm_threads(atoi(iopt(argc, argv, "--threads", "0")), 16); X.px_um = atof(iopt(argc, argv, "--px-um", "0")); if (!(X.px_um > 0)) X.px_um = X.sp->px_um;
-    X.ct_mem = (size_t)(atof(iopt(argc, argv, "--ct-mem", "3")) * (1 << 30));
-    X.batch = atoi(iopt(argc, argv, "--batch", "0"));
-    const double gmem = atof(iopt(argc, argv, "--gpu-mem", "0"));   /* GB of device memory for activations + cache (default: free - 1 GB) */
+    X.nth = ufsm_threads(opt_atoi("--threads", iopt(argc, argv, "--threads", "0")), 16); X.px_um = opt_atof("--px-um", iopt(argc, argv, "--px-um", "0")); if (!(X.px_um > 0)) X.px_um = X.sp->px_um;
+    X.ct_mem = (size_t)(opt_atof("--ct-mem", iopt(argc, argv, "--ct-mem", "3")) * (1 << 30));
+    X.batch = opt_atoi("--batch", iopt(argc, argv, "--batch", "0"));
+    const double gmem = opt_atof("--gpu-mem", iopt(argc, argv, "--gpu-mem", "0"));   /* GB of device memory for activations + cache (default: free - 1 GB) */
     if (gmem > 0) xnet_set_budget((size_t)(gmem * (1 << 30)));
     if (X.batch < 1) {   /* fit the batch to the free device memory (half of it) */
         size_t fr = 0, tot = 0; xnet_mem_info(&fr, &tot);
         X.batch = (int)(fr / 2 / ie_tile_bytes_gpu(kind)); if (X.batch < 1) X.batch = 1; if (X.batch > 32) X.batch = 32;
     }
-    const double ct_um = atof(iopt(argc, argv, "--ct-um", "2.399"));
+    const double ct_um = opt_atof("--ct-um", iopt(argc, argv, "--ct-um", "2.399"));
     if (ci < 0) { X.nlev = 1; X.lev_um[0] = ct_um; goto surfaces; }   /* --layers without CT */
     store *st = store_open(argv[ci + 1]); if (!st) { fprintf(stderr, "ink-ext: cannot open %s\n", argv[ci + 1]); return 1; }
     /* --ct-local ROOT --local-levels 1,2: those levels read from a complete local copy (missing chunks there would read as 0) */
@@ -665,14 +666,14 @@ int cmd_ink_ext(int argc, char **argv) {
 surfaces:;
     char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", outdir); if (system(p)) return 1;
     int rc = 0, ns = 0, nsurf = 0;
-    for (int a = 2; a + 1 < argc; a++) nsurf += !strcmp(argv[a], "--surface");
+    for (int a = 2; a + 1 < argc; a++) nsurf += !strcmp(argv[a], opt_n("--surface"));
     for (int a = 2; a < argc; a++) {
         const int lonly = X.stk && !nsurf && a == 2;   /* --layers without --surface: one pass named --name (default "layers") */
-        if (!lonly && (a + 1 >= argc || strcmp(argv[a], "--surface"))) continue;
+        if (!lonly && (a + 1 >= argc || strcmp(argv[a], opt_n("--surface")))) continue;
         isurf S;
         if (lonly) { memset(&S, 0, sizeof S); snprintf(S.name, sizeof S.name, "%s", iopt(argc, argv, "--name", "layers")); S.scale = 1; S.vox_um = X.px_um; S.w = S.h = 2; }
         else if (isurf_load(&S, argv[a + 1])) { fprintf(stderr, "ink-ext: cannot read tifxyz %s\n", argv[a + 1]); rc = 1; continue; }
-        { const double su = atof(iopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* tifxyz voxel size when its meta has none (default 2.399) */
+        { const double su = opt_atof("--surf-um", iopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* tifxyz voxel size when its meta has none (default 2.399) */
         if (!lonly && X.nlev) {   /* surface coordinates in other voxels than the CT's level 0 (e.g. 9.596 um level-2 wraps of a 2.399 um scan): rescaled into
                                      level-0 voxels; S.vox_um (the physical grid spacing, R.du) is kept */
             const double f = S.vox_um / X.lev_um[0];
@@ -699,7 +700,7 @@ surfaces:;
         const double t0 = inow(); int Wm, Hm; double du;
         float *ctl = nullptr; const int want_ct = iflag(argc, argv, "--ct-tif");
         /* the mean probability over the checkpoints (--weights a,b) x layer windows (--zwin); the first pass gives --ct-tif / --dump-layers */
-        const double shift0 = atof(iopt(argc, argv, "--shift", "0")); const int dreq = X.dump_req;
+        const double shift0 = opt_atof("--shift", iopt(argc, argv, "--shift", "0")); const int dreq = X.dump_req;
         float *pm = nullptr; uint8_t *dump0 = nullptr; int npass = 0, bad = 0;
         for (int k = 0; k < nnet && !bad; k++) for (int z = 0; z < nzw && !bad; z++) {
             X.net = nets[k]; X.shift = shift0 + zw[z]; X.dump_req = dreq && !npass;
@@ -774,10 +775,10 @@ surfaces:;
 int cmd_ink_ensemble(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm ink-ensemble <out.tif> --ink [W:]PATH.tif .. [--norm stretch|rank|none] [--lo-pct 50] [--hi-pct 99.5] [--jpeg OUT.jpg] [--peaks N [--peak-win 1024] [--peak-cover 0.5]]\n"
                               "  --peaks N: prints the N non-overlapping --peak-win windows of highest mean ensemble with at least --peak-cover of their pixels covered (peak x,y,w,h mean)\n"); return 2; }
-    const char *norm = iopt(argc, argv, "--norm", "stretch"); const double plo = atof(iopt(argc, argv, "--lo-pct", "50")), phi = atof(iopt(argc, argv, "--hi-pct", "99.5"));
+    const char *norm = iopt(argc, argv, "--norm", "stretch"); const double plo = opt_atof("--lo-pct", iopt(argc, argv, "--lo-pct", "50")), phi = opt_atof("--hi-pct", iopt(argc, argv, "--hi-pct", "99.5"));
     enum { MAXI = 16 }; uint8_t *im[MAXI]; double wt[MAXI]; int n = 0, W = 0, H = 0;
     for (int a = 2; a + 1 < argc; a++) {
-        if (strcmp(argv[a], "--ink")) continue;
+        if (strcmp(argv[a], opt_n("--ink"))) continue;
         const char *s = argv[a + 1], *c = strchr(s, ':'); double w = 1;
         if (c && c - s < 16) { char *e; const double v = strtod(s, &e); if (e == c) { w = v; s = c + 1; } }
         int w2, h2; uint8_t *g = img_read_u8(s, &w2, &h2);
@@ -803,8 +804,8 @@ int cmd_ink_ensemble(int argc, char **argv) {
         for (size_t i = 0; i < np; i++) if (mask[i]) acc[i] += (float)(wt[k] / wsum) * lut[im[k][i]];
     }
     uint8_t *o = malloc(np); for (size_t i = 0; i < np; i++) o[i] = mask[i] ? (uint8_t)lroundf(acc[i] * 255) : 0;
-    const int npk = atoi(iopt(argc, argv, "--peaks", "0")), pw = atoi(iopt(argc, argv, "--peak-win", "1024"));
-    const double pcov = atof(iopt(argc, argv, "--peak-cover", "0.5"));   /* least share of the window with data */
+    const int npk = opt_atoi("--peaks", iopt(argc, argv, "--peaks", "0")), pw = opt_atoi("--peak-win", iopt(argc, argv, "--peak-win", "1024"));
+    const double pcov = opt_atof("--peak-cover", iopt(argc, argv, "--peak-cover", "0.5"));   /* least share of the window with data */
     if (npk > 0 && pw > 0 && pw <= W && pw <= H) {   /* the npk non-overlapping pw x pw windows of highest mean ensemble (>= half covered) */
         double *I = calloc((size_t)(W + 1) * (H + 1), sizeof *I), *C = calloc((size_t)(W + 1) * (H + 1), sizeof *C);
         for (int y = 0; y < H; y++) { double r = 0, c = 0; for (int x = 0; x < W; x++) { r += o[(size_t)y * W + x]; c += mask[(size_t)y * W + x];
@@ -844,7 +845,7 @@ int cmd_tifxyz_map(int argc, char **argv) {
     if (argc < 6) { fprintf(stderr, "usage: ufsm tifxyz-map <src-tifxyz> <src-image.tif> <dst-tifxyz> <out.tif> [--max-dist 1.16] [--mask MASK.tif]\n"); return 2; }
     isurf A, Bs; if (isurf_load(&A, argv[2]) || isurf_load(&Bs, argv[4])) { fprintf(stderr, "tifxyz-map: cannot read the tifxyz\n"); return 1; }
     int iw, ih; uint8_t *img = img_read_u8(argv[3], &iw, &ih); if (!img) { fprintf(stderr, "tifxyz-map: cannot read %s\n", argv[3]); return 1; }
-    const double md = atof(iopt(argc, argv, "--max-dist", "1.16"));
+    const double md = opt_atof("--max-dist", iopt(argc, argv, "--max-dist", "1.16"));
     double sr = 0; for (size_t i = 0; i + 1 < (size_t)A.w * A.h; i++) if (A.Z[i] >= 0 && A.Z[i + 1] >= 0) { const double a0 = A.Z[i + 1] - A.Z[i], a1 = A.Y[i + 1] - A.Y[i], a2 = A.X[i + 1] - A.X[i]; sr = fmax(sr, 0); sr = sqrt(a0 * a0 + a1 * a1 + a2 * a2); break; }
     sr = fmax(sr * 0.75 + md, md);   /* vertex search radius: ~ the src grid spacing (in-plane) plus the normal tolerance */
     const double bs = sr;
@@ -898,7 +899,7 @@ int cmd_tifxyz_orient(int argc, char **argv) {
     double cx = 0, cy = 0; const char *c = iopt(argc, argv, "--center", nullptr);
     if (argc < 3 || !c || sscanf(c, "%lf,%lf", &cx, &cy) != 2) { fprintf(stderr, "usage: ufsm tifxyz-orient <tifxyz>.. --center x,y\n"); return 2; }
     for (int a = 2; a < argc; a++) {
-        if (!strcmp(argv[a], "--center")) { a++; continue; }
+        if (!strcmp(argv[a], opt_n("--center"))) { a++; continue; }
         isurf S; if (isurf_load(&S, argv[a])) { fprintf(stderr, "tifxyz-orient: cannot read %s\n", argv[a]); continue; }
         long n = 0, out = 0; double sum = 0;
         for (int r = 0; r + 1 < S.h; r += 2) for (int q = 0; q + 1 < S.w; q += 2) {
@@ -919,7 +920,7 @@ int cmd_tifxyz_orient(int argc, char **argv) {
 int cmd_tifxyz_shards(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: ufsm tifxyz-shards <tifxyz> --shard S [--div F] [--margin M]\n"); return 2; }
     isurf S; if (isurf_load(&S, argv[2])) { fprintf(stderr, "tifxyz-shards: cannot read %s\n", argv[2]); return 1; }
-    const double sh = atof(iopt(argc, argv, "--shard", "512")) * atof(iopt(argc, argv, "--div", "1")), mg = atof(iopt(argc, argv, "--margin", "32"));
+    const double sh = opt_atof("--shard", iopt(argc, argv, "--shard", "512")) * opt_atof("--div", iopt(argc, argv, "--div", "1")), mg = opt_atof("--margin", iopt(argc, argv, "--margin", "32"));
     if (!(sh > 0)) { fprintf(stderr, "tifxyz-shards: bad --shard / --div\n"); return 2; }
     int64_t *k = nullptr; size_t n = 0, cap = 0; int64_t lo[3] = {INT64_MAX, INT64_MAX, INT64_MAX}, hi[3] = {-1, -1, -1};
     const float *A[3] = {S.Z, S.Y, S.X};
@@ -939,7 +940,7 @@ int cmd_tifxyz_shards(int argc, char **argv) {
         for (int d = 0; d < 3; d++) { if (c[d] < lo[d]) lo[d] = c[d]; if (c[d] > hi[d]) hi[d] = c[d]; }
         printf("%lld %lld %lld\n", (long long)c[0], (long long)c[1], (long long)c[2]);
     }
-    const double s1 = atof(iopt(argc, argv, "--shard", "512"));
+    const double s1 = opt_atof("--shard", iopt(argc, argv, "--shard", "512"));
     if (u) fprintf(stderr, "tifxyz-shards: %zu shards, box %.0f,%.0f,%.0f,%.0f,%.0f,%.0f\n", u, lo[0] * s1, lo[1] * s1, lo[2] * s1, (hi[0] - lo[0] + 1) * s1, (hi[1] - lo[1] + 1) * s1, (hi[2] - lo[2] + 1) * s1);
     free(k); isurf_free(&S);
     return u ? 0 : 1;
@@ -951,7 +952,7 @@ int cmd_tifxyz_bbox(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm tifxyz-bbox <tifxyz> <image.tif> [--thresh 0] [--margin 0]\n"); return 2; }
     isurf S; if (isurf_load(&S, argv[2])) { fprintf(stderr, "tifxyz-bbox: cannot read %s\n", argv[2]); return 1; }
     int iw, ih; uint8_t *img = img_read_u8(argv[3], &iw, &ih); if (!img) { fprintf(stderr, "tifxyz-bbox: cannot read %s\n", argv[3]); return 1; }
-    const int th = atoi(iopt(argc, argv, "--thresh", "0")); const double mg = atof(iopt(argc, argv, "--margin", "0"));
+    const int th = opt_atoi("--thresh", iopt(argc, argv, "--thresh", "0")); const double mg = opt_atof("--margin", iopt(argc, argv, "--margin", "0"));
     double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300}; long n = 0;
     for (int y = 0; y < ih; y++) for (int x = 0; x < iw; x++) {
         if (img[(size_t)y * iw + x] <= th) continue;
@@ -973,7 +974,7 @@ int cmd_tifxyz_crop(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm tifxyz-crop <tifxyz|wNNN.sfc> <out-dir> c0,r0,cols,rows [--px 1]\n"); return 2; }
     isurf S; if (isurf_load(&S, argv[2])) { fprintf(stderr, "tifxyz-crop: cannot read %s\n", argv[2]); return 1; }
     double c[4]; if (sscanf(argv[4], "%lf,%lf,%lf,%lf", c, c + 1, c + 2, c + 3) != 4 || c[2] <= 0 || c[3] <= 0) { fprintf(stderr, "tifxyz-crop: window c0,r0,cols,rows\n"); return 2; }
-    if (atoi(iopt(argc, argv, "--px", "0"))) for (int k = 0; k < 4; k++) c[k] *= S.scale;   /* render px -> grid vertices */
+    if (opt_atoi("--px", iopt(argc, argv, "--px", "0"))) for (int k = 0; k < 4; k++) c[k] *= S.scale;   /* render px -> grid vertices */
     const int c0 = (int)floor(c[0]), r0 = (int)floor(c[1]), cw = (int)ceil(c[0] + c[2]) - c0 + 1, rh = (int)ceil(c[1] + c[3]) - r0 + 1;
     if (isurf_crop(&S, c0, r0, cw, rh)) { fprintf(stderr, "tifxyz-crop: window outside the %s grid\n", argv[2]); isurf_free(&S); return 1; }
     int wind = -1;

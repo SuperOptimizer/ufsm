@@ -94,6 +94,19 @@ int main(void) {
         CHECK(none > 0 && PX(fl, 2, oh - 1) == RFILL_NONE, "case %zu: invalid vertices -> RFILL_NONE (%zu)", k, none);
         CHECK(PX(fl, ca, rs) == RFILL_ON, "case %zu: sheet row on the surface", k);
     }
+    {   /* --fill-ct above sheet A's CT (200 < 201): sheet A counts as void like air (the render default 80 treats unmasked air between sheets
+           as void, urender audit 11-14 #2): both gap bands move to sheet B (CT 220, ink 40) 3 voxels away, and the rows on sheet A find
+           nothing >= 201 within 4 voxels (still empty) */
+        for (int v = 0; v < 2; v++) memset(im[v], 0, no);
+        memset(fl, RFILL_NONE, no);
+        const render_fill F = {4, 201, 0, fls, nullptr};
+        CHECK(!render_wraps_chunked_fill(zz, 2, dp, 1, Xs, Ys, Zs, w, h, gs, im, ow, oh, nullptr, (size_t)1 << 30, 2, 2, 0, &F), "fill render thr 201");
+        int ok = 1;
+        for (int r = 0; r < rg + 4; r++) for (int c = 0; c < ow; c++) if (c < 17 || c >= 21)
+            ok &= PX(fl, c, r) != RFILL_ON && PX(fl, c, r) != RFILL_EMPTY && PX(im[1], c, r) == 220 && PX(im[0], c, r) == 40;
+        CHECK(ok, "thr 201: gap bands not moved to sheet B (px %d,%d: flag %d ct %d ink %d)", ca, rg, PX(fl, ca, rg), PX(im[1], ca, rg), PX(im[0], ca, rg));
+        CHECK(PX(fl, ca, rs) == RFILL_EMPTY, "thr 201: a row on sheet A (CT 200) is void with nothing in reach: flag %d", PX(fl, ca, rs));
+    }
     {   /* n = 0: flags only, the images of the plain render */
         for (int v = 0; v < 2; v++) memset(im[v], 0, no);
         memset(fl, RFILL_NONE, no);

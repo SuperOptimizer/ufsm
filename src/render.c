@@ -10,6 +10,7 @@
    the per-wrap ufsm render's (render_rows / trilin in main.c) on the same float32 coordinates xform_wraps.py wrote, so the
    renders are bit-identical to it; the overlay is overlay_red.py's (imgops.c). */
 #include "imgops.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "store.h"
 #include "tiffw.h"
@@ -28,11 +29,11 @@
 #include <unistd.h>
 
 static const char *ropt(int argc, char **argv, const char *name, const char *def) {
-    for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return def;
 }
-static int rflag(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], name)) return 1; return 0; }
-static int rarg(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], name)) return i; return -1; }
+static int rflag(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], opt_n(name))) return 1; return 0; }
+static int rarg(int argc, char **argv, const char *name) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], opt_n(name))) return i; return -1; }
 static double rnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 /* ---- a sheet: its tifxyz grids (as written) and renders ---- */
@@ -541,6 +542,44 @@ int render_wraps_chunked(z3 *const *vz, int nv, const int *depth, int ns, const 
                          int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads, int verbose) {
     return render_wraps_chunked_fill(vz, nv, depth, ns, Xs, Ys, Zs, w, h, gs, img, ow, oh, crop, budget, nthreads, io_threads, verbose, nullptr);
 }
+/* unroll audit 11-14 #13: a sample in a shard (or unsharded chunk) that is not in the store reads as 0, which for the ink volume is "no
+   ink" -- the ink predict's occupancy skip or a failed shard turns papyrus into blank. Counted per volume over the surface vertices (in
+   the crop): absent[v] of *total vertices sit in such shards (or outside the array), nshards[v] distinct absent shards. Shard presence
+   is asked once per shard (an open-addressed set). 0 ok, -1 on a store error */
+int render_absent_count(struct z3 *const *vz, int nv, int ns, const float *const *Xs, const float *const *Ys, const float *const *Zs, int w, int h,
+                        double gs, const int *crop, size_t absent[2], size_t nshards[2], size_t *total) {
+    *total = 0; int rc = 0;
+    for (int v = 0; v < nv && v < 2; v++) {
+        absent[v] = nshards[v] = 0;
+        const z3_meta *m = z3_meta_of(vz[v]); size_t cap = 1 << 12, used = 0;
+        uint64_t *key = calloc(cap, sizeof *key); int8_t *st = calloc(cap, 1); if (!key || !st) { free(key); free(st); return -1; }
+        size_t tot = 0;
+        for (int si = 0; si < ns; si++) for (int r = 0; r < h; r++) for (int c = 0; c < w; c++) {
+            const size_t i = (size_t)r * w + c; const float Z = Zs[si][i], Y = Ys[si][i], X = Xs[si][i]; if (!(Z >= 0)) continue;
+            if (crop) { const double px = c * gs, py = r * gs; if (px < crop[0] || px >= crop[0] + crop[2] || py < crop[1] || py >= crop[1] + crop[3]) continue; }
+            tot++;
+            const int64_t p3[3] = {(int64_t)Z, (int64_t)Y, (int64_t)X};
+            if (p3[0] >= m->shape[0] || p3[1] >= m->shape[1] || p3[2] >= m->shape[2]) { absent[v]++; continue; }
+            const int64_t sz = p3[0] / m->shard[0], sy = p3[1] / m->shard[1], sx = p3[2] / m->shard[2];
+            const uint64_t k = ((uint64_t)sz << 42 | (uint64_t)sy << 21 | (uint64_t)sx) + 1;
+            size_t j = (size_t)(k * 0x9e3779b97f4a7c15ull) & (cap - 1);
+            while (key[j] && key[j] != k) j = (j + 1) & (cap - 1);
+            if (!key[j]) {
+                const int pr = z3_shard_present(vz[v], sz, sy, sx); if (pr < 0) { rc = -1; continue; }
+                key[j] = k; st[j] = (int8_t)(pr ? 1 : 2); if (!pr) nshards[v]++;
+                if (++used * 2 > cap) {   /* grow */
+                    const size_t nc = cap * 2; uint64_t *k2 = calloc(nc, sizeof *k2); int8_t *s2 = calloc(nc, 1); if (!k2 || !s2) { free(k2); free(s2); free(key); free(st); return -1; }
+                    for (size_t q = 0; q < cap; q++) if (key[q]) { size_t t = (size_t)(key[q] * 0x9e3779b97f4a7c15ull) & (nc - 1); while (k2[t]) t = (t + 1) & (nc - 1); k2[t] = key[q]; s2[t] = st[q]; }
+                    free(key); free(st); key = k2; st = s2; cap = nc;
+                    j = (size_t)(k * 0x9e3779b97f4a7c15ull) & (cap - 1); while (key[j] != k) j = (j + 1) & (cap - 1);
+                }
+            }
+            if (st[j] == 2) absent[v]++;
+        }
+        *total = tot; free(key); free(st);
+    }
+    return rc;
+}
 static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *const *Xs, const float *const *Ys, const float *const *Zs,
                   int w, int h, double gs, uint8_t *const *img, int ow, int oh, const int *crop, size_t budget, int nthreads, int io_threads,
                   int verbose, const render_fill *F, int gpu) {
@@ -558,6 +597,12 @@ static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *
         R->depth[v] = depth[v]; if (depth[v] > dm) dm = depth[v];
     }
     R->F = F; if (F) dm += F->n;   /* the search moves every volume's window up to n voxels along the normal */
+    {   size_t ab[2] = {0, 0}, nsh[2] = {0, 0}, tot = 0;   /* absent shards read as 0 (ink: "no ink"): their share of the surface, printed */
+        if (render_absent_count(vz, nv, ns, Xs, Ys, Zs, w, h, gs, crop, ab, nsh, &tot)) fprintf(stderr, "render: shard presence check failed: %s\n", z3_error());
+        for (int v = 0; v < nv; v++) if (ab[v] || verbose)
+            fprintf(stderr, "render: volume %d: %zu of %zu surface vertices (%.3f %%) in %zu absent shards (read as 0%s)\n", v, ab[v], tot,
+                    tot ? 100.0 * (double)ab[v] / (double)tot : 0.0, nsh[v], v == 0 && nv == 2 ? ": no ink there" : "");
+    }
     /* blocks with their chunk ranges per volume */
     size_t cap = 1 << 16, nb = 0; rblock *b = malloc(cap * sizeof *b); int32_t (*hi1)[3] = malloc(cap * sizeof *hi1), (*lo1)[3] = malloc(cap * sizeof *lo1);
     if (!b || !hi1 || !lo1) goto out0;
@@ -768,10 +813,10 @@ int cmd_render_sheets(int argc, char **argv) {
                         "         [--threads 12] [--mem 4] [--cache DIR]\n"); return 2;
     }
     const char *src = argv[2], *out = argv[3], *isrc = ropt(argc, argv, "--ink-tifxyz", src), *prefix = ropt(argc, argv, "--prefix", ""), *keep = ropt(argc, argv, "--keep-tif", nullptr);
-    const double cdiv = atof(ropt(argc, argv, "--ct-div", "2")), idiv = atof(ropt(argc, argv, "--ink-div", "4")), mem = atof(ropt(argc, argv, "--mem", "4"));
-    int cdepth = atoi(ropt(argc, argv, "--ct-depth", "3")), idepth[3]; const int nink = parse_ints(ropt(argc, argv, "--ink-depths", "5,3,1"), idepth, 3);
-    const int nthreads = ufsm_threads(atoi(ropt(argc, argv, "--threads", "0")), 12), top = atoi(ropt(argc, argv, "--top", "0")), strip_w = rflag(argc, argv, "--strip-w"), skip = rflag(argc, argv, "--skip-existing");
-    const double min_cm2 = atof(ropt(argc, argv, "--min-cm2", "0"));
+    const double cdiv = opt_atof("--ct-div", ropt(argc, argv, "--ct-div", "2")), idiv = opt_atof("--ink-div", ropt(argc, argv, "--ink-div", "4")), mem = opt_atof("--mem", ropt(argc, argv, "--mem", "4"));
+    int cdepth = opt_atoi("--ct-depth", ropt(argc, argv, "--ct-depth", "3")), idepth[3]; const int nink = parse_ints(ropt(argc, argv, "--ink-depths", "5,3,1"), idepth, 3);
+    const int nthreads = ufsm_threads(opt_atoi("--threads", ropt(argc, argv, "--threads", "0")), 12), top = opt_atoi("--top", ropt(argc, argv, "--top", "0")), strip_w = rflag(argc, argv, "--strip-w"), skip = rflag(argc, argv, "--skip-existing");
+    const double min_cm2 = opt_atof("--min-cm2", ropt(argc, argv, "--min-cm2", "0"));
     const int ci = rarg(argc, argv, "--ct"), ii = rarg(argc, argv, "--ink"); const char *cache = ropt(argc, argv, "--cache", nullptr);
     if (ci + 2 >= argc || ii + 2 >= argc || nink < 1 || cdiv <= 0 || idiv <= 0 || cdepth < 0) { fprintf(stderr, "render-sheets: bad options\n"); return 2; }
     z3 *cz = z3_open(store_open(argv[ci + 1]), argv[ci + 2], cache), *iz = z3_open(store_open(argv[ii + 1]), argv[ii + 2], cache);
@@ -841,8 +886,8 @@ int cmd_render_sheets(int argc, char **argv) {
 int cmd_overlay_red(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm overlay-red <ct-dir> <ink-dir> <out-dir> [<ink2-dir> [<ink3-dir>]] [--strip-w] [--skip-existing] [--threads 12]\n"); return 2; }
     const char *dirs[3] = {argv[3], nullptr, nullptr}; int nink = 1;
-    for (int a = 5; a < argc && nink < 3; a++) { if (argv[a][0] == '-') { if (!strcmp(argv[a], "--threads")) a++; continue; } dirs[nink++] = argv[a]; }
-    const int strip_w = rflag(argc, argv, "--strip-w"), skip = rflag(argc, argv, "--skip-existing"), nthreads = ufsm_threads(atoi(ropt(argc, argv, "--threads", "0")), 12);
+    for (int a = 5; a < argc && nink < 3; a++) { if (argv[a][0] == '-') { if (!strcmp(argv[a], opt_n("--threads"))) a++; continue; } dirs[nink++] = argv[a]; }
+    const int strip_w = rflag(argc, argv, "--strip-w"), skip = rflag(argc, argv, "--skip-existing"), nthreads = ufsm_threads(opt_atoi("--threads", ropt(argc, argv, "--threads", "0")), 12);
     char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", argv[4]); if (system(p)) return 1;
     DIR *dd = opendir(argv[2]); if (!dd) { fprintf(stderr, "overlay-red: cannot open %s\n", argv[2]); return 1; }
     int n = 0, cap = 64; char **names = malloc(cap * sizeof *names); struct dirent *de;
@@ -886,8 +931,8 @@ int cmd_overlay_red(int argc, char **argv) {
    --toward Y,X (the scroll axis at the sheet, native voxels): +n oriented inward first (D > 0 = the inward face). --flip-rows 1: the grid
    rows written in reverse order (Paris 4 wraps of ufsm wraps / flatten render mirrored in z; flipped they read upright). */
 int cmd_tifxyz_scale(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm tifxyz-scale <src-dir> <dst-dir> <div> [--offset z,y,x] [--wraps a,b,..] [--normal D [--toward Y,X]] [--flip-rows 1]\n"); return 2; }
-    tifxyz_flip_rows = atoi(ropt(argc, argv, "--flip-rows", "0")) != 0;
+    if (argc < 5) { fprintf(stderr, "usage: ufsm tifxyz-scale <src-dir> <dst-dir> <div> [--offset z,y,x: subtracted after the division, output voxels] [--wraps a,b,..] [--normal D [--toward Y,X]] [--flip-rows 1]\n"); return 2; }
+    tifxyz_flip_rows = opt_atoi("--flip-rows", ropt(argc, argv, "--flip-rows", "0")) != 0;
     const double div = atof(argv[4]); double off[3] = {0, 0, 0};
     if (!(div > 0) || sscanf(ropt(argc, argv, "--offset", "0,0,0"), "%lf,%lf,%lf", off, off + 1, off + 2) != 3) { fprintf(stderr, "tifxyz-scale: bad div / --offset\n"); return 2; }
     const char *wl = ropt(argc, argv, "--wraps", nullptr); char *want = nullptr; if (wl) { want = malloc(strlen(wl) + 3); sprintf(want, ",%s,", wl); }
@@ -916,7 +961,7 @@ int cmd_tifxyz_scale(int argc, char **argv) {
    grid directions (K 4 turns a scale-1 wrap into scale 0.25; meta rewritten: scale, area, bbox). Prints the bytes before / after. */
 int cmd_tifxyz_sfc(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K] [--wraps a,b,..]\n"); return 2; }
-    const double err = atof(ropt(argc, argv, "--error", "0.25")); const int K = atoi(ropt(argc, argv, "--every", "1"));
+    const double err = opt_atof("--error", ropt(argc, argv, "--error", "0.25")); const int K = opt_atoi("--every", ropt(argc, argv, "--every", "1"));
     if (!(err > 0) || K < 1 || !tfx_write_hook) { fprintf(stderr, "tifxyz-sfc: --error > 0, --every >= 1 (and a binary with src/tfx.c)\n"); return 2; }
     const char *wl = ropt(argc, argv, "--wraps", nullptr); char *want = nullptr; if (wl) { want = malloc(strlen(wl) + 3); sprintf(want, ",%s,", wl); }
     DIR *dd = opendir(argv[2]); if (!dd) { fprintf(stderr, "tifxyz-sfc: cannot open %s\n", argv[2]); return 1; }
@@ -973,7 +1018,7 @@ int cmd_png2jpg(int argc, char **argv) {
         if (!o || pil_resize(rgb, w, h, 3, o, nw, nh, PIL_BILINEAR, 8)) { free(o); free(rgb); return 1; }
         free(rgb); rgb = o; w = nw; h = nh;
     }
-    const int q = atoi(ropt(argc, argv, "--quality", "90"));
+    const int q = opt_atoi("--quality", ropt(argc, argv, "--quality", "90"));
     const size_t ol = strlen(argv[3]);
     if (ol > 4 && !strcmp(argv[3] + ol - 4, ".tif")) {   /* <out>.tif: the first channel as a uint8 TIFF (gray PNGs for ink-compare); --crop x,y,w,h */
         int c[4] = {0, 0, w, h}; const char *cr = ropt(argc, argv, "--crop", nullptr);
@@ -988,7 +1033,7 @@ int cmd_png2jpg(int argc, char **argv) {
         if (!o || pil_resize(rgb, w, h, 3, o, ow, oh, PIL_BOX, 8)) { free(o); free(rgb); return 1; }
         free(rgb); rgb = o; w = ow; h = oh;
     }
-    if (img_fit_rgb(&rgb, &w, &h, atoi(ropt(argc, argv, "--max-px", "0")), 8)) { free(rgb); fprintf(stderr, "png2jpg: out of memory\n"); return 1; }
+    if (img_fit_rgb(&rgb, &w, &h, opt_atoi("--max-px", ropt(argc, argv, "--max-px", "0")), 8)) { free(rgb); fprintf(stderr, "png2jpg: out of memory\n"); return 1; }
     const int rc = jpeg_write_rgb(argv[3], w, h, rgb, q); free(rgb);
     if (rc) fprintf(stderr, "png2jpg: cannot write %s\n", argv[3]);
     return rc ? 1 : 0;
@@ -1020,17 +1065,18 @@ int ink_compare_mem(int argc, char **argv) {   /* the in-memory version (inkcomp
     const int ci = rarg(argc, argv, "--ct");
     if (argc < 5 || ci < 0 || ci + 1 >= argc || rarg(argc, argv, "--ink") < 0) {
         fprintf(stderr, "usage: ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif [--ink LABEL=INK.tif ..] [--px-um 2.4] [--rs-um 25] [--rl-um 500] [--crop x,y,w,h | --crop-frac fx,fy,w,h | --best-crop N] [--stretch | --fixed LO,HI] [--stretch-ct] [--full] [--each PREFIX [--each-suffix S] [--each-ct]] [--rgb-agree RECTO,VERSO] [--diff-agree RECTO,VERSO [--diff-gain 1]] [--papyrus INK [--papyrus-gain 1] [--papyrus-floor median|V] [--papyrus-bg G|median]] [--cmap viridis] [--no-ct] [--rgb-ct-min 1] [--max-px N] [--quality 90] [--threads 16] [--mask M.tif]\n"
+                        "       [--then OUT2 [output options] ...] (more outputs from the same inputs / crop / statistics, computed once)\n"
                         "  --mask M.tif (the renders' size before --crop): statistics and panels only where M > 0 (inks zeroed elsewhere; the in-memory path)\n"); return 2;
     }
-    const double px = atof(ropt(argc, argv, "--px-um", "2.4")), rsu = atof(ropt(argc, argv, "--rs-um", "25")), rlu = atof(ropt(argc, argv, "--rl-um", "500"));
-    const int nthreads = ufsm_threads(atoi(ropt(argc, argv, "--threads", "0")), 16);
+    const double px = opt_atof("--px-um", ropt(argc, argv, "--px-um", "2.4")), rsu = opt_atof("--rs-um", ropt(argc, argv, "--rs-um", "25")), rlu = opt_atof("--rl-um", ropt(argc, argv, "--rl-um", "500"));
+    const int nthreads = ufsm_threads(opt_atoi("--threads", ropt(argc, argv, "--threads", "0")), 16);
     if (!(px > 0) || !(rsu > 0) || !(rlu > rsu)) { fprintf(stderr, "ink-compare: need --px-um > 0 and 0 < --rs-um < --rl-um\n"); return 2; }
     enum { MAXI = 8 }; const uint8_t *img[MAXI + 1] = {0}; int isct[MAXI + 1] = {1}; const char *lab[MAXI + 1] = {"ct"}; int n = 1, W, H, rc = 0;
     uint8_t *ct = img_read_u8(argv[ci + 1], &W, &H);
     if (!ct) { fprintf(stderr, "ink-compare: cannot read %s\n", argv[ci + 1]); return 1; }
     img[0] = ct;
     for (int a = 2; a + 1 < argc; a++) {
-        if (strcmp(argv[a], "--ink")) continue;
+        if (strcmp(argv[a], opt_n("--ink"))) continue;
         const char *eq = strchr(argv[a + 1], '=');
         if (!eq || n > MAXI) { fprintf(stderr, "ink-compare: --ink LABEL=PATH (at most %d)\n", MAXI); return 2; }
         int w, h; uint8_t *im = img_read_u8(eq + 1, &w, &h);
@@ -1044,7 +1090,7 @@ int ink_compare_mem(int argc, char **argv) {   /* the in-memory version (inkcomp
         if (sscanf(cf, "%lf,%lf,%d,%d", &fx, &fy, &cw0, &ch0) != 4) { fprintf(stderr, "ink-compare: --crop-frac fx,fy,w,h\n"); return 2; }
         snprintf(crb, sizeof crb, "%d,%d,%d,%d", (int)(fx * W), (int)(fy * H), cw0, ch0); cr = crb;
     }
-    const int bwin = atoi(ropt(argc, argv, "--best-crop", "0"));
+    const int bwin = opt_atoi("--best-crop", ropt(argc, argv, "--best-crop", "0"));
     if (!cr && bwin > 0 && n > 1) {   /* --best-crop N: the N x N window richest in the first ink (over CT > 0), as --crop */
         uint8_t *mk = malloc((size_t)W * H); if (!mk) return 1;
         for (size_t i = 0; i < (size_t)W * H; i++) mk[i] = ct[i] > 0;
@@ -1108,7 +1154,7 @@ int ink_compare_mem(int argc, char **argv) {   /* the in-memory version (inkcomp
     else {
         if (rflag(argc, argv, "--stretch-ct")) { img_stretch(ct, mask, np, 0.01, 0.99); isct[0] = 0; }   /* the CT panel p1 .. p99 too (scans brighter than the fixed CT contrast) */
         const char *each = ropt(argc, argv, "--each", nullptr);
-        const int maxpx = atoi(ropt(argc, argv, "--max-px", "0")), jq = atoi(ropt(argc, argv, "--quality", "90"));   /* JPEG longest side, quality */
+        const int maxpx = opt_atoi("--max-px", ropt(argc, argv, "--max-px", "0")), jq = opt_atoi("--quality", ropt(argc, argv, "--quality", "90"));   /* JPEG longest side, quality */
         if (each) {   /* --each PREFIX: every panel its own unlabelled JPEG PREFIX<label><--each-suffix>.jpg (the CT only with --each-ct) */
             const char *suf = ropt(argc, argv, "--each-suffix", ""); const int ect = rflag(argc, argv, "--each-ct");
             for (int k = ect ? 0 : 1; k < n; k++) {

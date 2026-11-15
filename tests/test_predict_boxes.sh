@@ -8,7 +8,7 @@ U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 fail() { echo "FAIL: $*"; exit 1; }
 "$MF" fx 256 2 1 > fx.log 2>&1
-"$U" train fx/sources-ink.json --out s --task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 \
+"$U" train fx/sources-ink.json --out s --task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-train-ok 1 --val-every 1000 \
      --log-every 1 --ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --widths 16,32,64 --det 1 --steps 3 \
      --lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --ink-head 1 --fstem 16 > s.log 2>&1 || fail "train ($D/s.log)"
 P=(--um 9.6 --level 0 --window 160 --halo 16 --shard 128 --levels 2 --threads 2 --heads all)

@@ -2,6 +2,7 @@
    a fresh reader per size so shard indices are fetched too) and reports decoded and network throughput, requests, bytes per
    request, 429 / 503 / 5xx counts, stalls and rate-limit headers (store_stats). Built into ufsm and as build/store_bench. */
 #include "zarr3.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include <pthread.h>
 #include <stdatomic.h>
@@ -12,7 +13,7 @@
 
 static double bnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static const char *bopt(int argc, char **argv, const char *name, const char *def) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return def;
 }
 static uint64_t splitmix(uint64_t *x) { uint64_t z = (*x += 0x9e3779b97f4a7c15ull); z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull; z = (z ^ (z >> 27)) * 0x94d049bb133111ebull; return z ^ (z >> 31); }
@@ -46,7 +47,7 @@ int cmd_store_bench(int argc, char **argv) {
         return 2;
     }
     const char *root = argv[2], *key = argv[3];
-    const int nbox = atoi(bopt(argc, argv, "--n", "8")), par = atoi(bopt(argc, argv, "--par", "1")), threads = ufsm_threads(atoi(bopt(argc, argv, "--threads", "0")), 16);
+    const int nbox = opt_atoi("--n", bopt(argc, argv, "--n", "8")), par = opt_atoi("--par", bopt(argc, argv, "--par", "1")), threads = ufsm_threads(opt_atoi("--threads", bopt(argc, argv, "--threads", "0")), 16);
     uint64_t seed = strtoull(bopt(argc, argv, "--seed", "1"), nullptr, 10);
     char boxes[256]; snprintf(boxes, sizeof boxes, "%s", bopt(argc, argv, "--box", "128,256,512"));
     store *s = store_open(root);
@@ -72,7 +73,7 @@ int cmd_store_bench(int argc, char **argv) {
             for (int d = 0; d < 3; d++) { int64_t span = hi[d] - lo[d] - box; o[i][d] = lo[d] + (span > 0 ? (int64_t)(splitmix(&rs) % (uint64_t)span) : 0); }
         z3 *z = z3_open(s, key, nullptr);   /* fresh reader: cold shard indices */
         store_stats_reset();
-        bjob j = {.z = z, .o = o, .box = box, .nbox = nbox, .threads = threads, .hash = atoi(bopt(argc, argv, "--hash", "0"))};
+        bjob j = {.z = z, .o = o, .box = box, .nbox = nbox, .threads = threads, .hash = opt_atoi("--hash", bopt(argc, argv, "--hash", "0"))};
         double t0 = bnow();
         pthread_t th[64]; int np = par < 1 ? 1 : par > 64 ? 64 : par, started = 0;
         for (int i = 1; i < np; i++) if (!pthread_create(&th[started], nullptr, breader, &j)) started++;
@@ -119,7 +120,7 @@ int cmd_z3_diff(int argc, char **argv) {
     int64_t o[3] = {0, 0, 0}, n[3] = {ma->shape[0], ma->shape[1], ma->shape[2]};
     const char *bx = bopt(argc, argv, "--box", nullptr);
     if (bx && sscanf(bx, "%ld,%ld,%ld,%ld,%ld,%ld", &o[0], &o[1], &o[2], &n[0], &n[1], &n[2]) != 6) { fprintf(stderr, "z3-diff: --box z,y,x,nz,ny,nx\n"); return 2; }
-    const int S = atoi(bopt(argc, argv, "--slab", "128")), nt = atoi(bopt(argc, argv, "--threads", "8"));
+    const int S = opt_atoi("--slab", bopt(argc, argv, "--slab", "128")), nt = opt_atoi("--threads", bopt(argc, argv, "--threads", "8"));
     const size_t plane = (size_t)n[1] * n[2]; uint8_t *pa = malloc(plane * S), *pb = malloc(plane * S);
     if (!pa || !pb) { fprintf(stderr, "z3-diff: out of memory\n"); return 1; }
     unsigned long long nv = 0, nd = 0, sum = 0, mx = 0, hist[5] = {0}, ha = 0, hb = 0, flip = 0;

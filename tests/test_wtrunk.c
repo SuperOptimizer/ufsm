@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "test_gpu.h"
 
 static float h2f(uint16_t h) {   /* IEEE half */
     const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023; float v;
@@ -83,7 +84,7 @@ int main(void) {
     }
     char ck[1024]; const char *e = getenv("UFSM_WT_CKPT");
     if (e) snprintf(ck, sizeof ck, "%s", e); else snprintf(ck, sizeof ck, "%s/ufsm-data/wcomb/d/paris4/ckpt/wind96-wk1-best.ckpt", getenv("HOME") ? getenv("HOME") : ".");
-    if (access(ck, R_OK)) { printf("no checkpoint %s: network checks skipped\n", ck); }
+    if (access(ck, R_OK)) { char m[1200]; snprintf(m, sizeof m, "no checkpoint %s (desk data; UFSM_WT_CKPT): the trained-net checks did not run", ck); test_partial("test_wtrunk", m); }
     else {
         wtrunk *w1 = wt_open(ck, T, L, 2, 1);
         CHECK(w1, "wt_open feat 1");

@@ -2,6 +2,7 @@
    cgroup CPUs vs nproc, cgroup memory vs /proc/meminfo, the CUDA devices (MIG slices), the build, free disk. The single-value
    flags print one integer for scripts (unroll.sh MemAvailable gate, thread counts). */
 #include "sysinfo.h"
+#include "optcheck.h"
 #include <stdint.h>
 #include <sys/statvfs.h>
 
@@ -14,9 +15,9 @@ static void disk_line(const char *p) {
 }
 int cmd_sysinfo(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
-        if (!strcmp(argv[i], "--ncpu")) { printf("%d\n", ufsm_ncpu()); return 0; }
-        if (!strcmp(argv[i], "--avail-gb")) { printf("%d\n", (int)(ufsm_mem_available() >> 30)); return 0; }
-        if (!strcmp(argv[i], "--limit-gb")) { printf("%d\n", (int)(ufsm_mem_limit() >> 30)); return 0; }
+        if (!strcmp(argv[i], opt_n("--ncpu"))) { printf("%d\n", ufsm_ncpu()); return 0; }
+        if (!strcmp(argv[i], opt_n("--avail-gb"))) { printf("%d\n", (int)(ufsm_mem_available() >> 30)); return 0; }
+        if (!strcmp(argv[i], opt_n("--limit-gb"))) { printf("%d\n", (int)(ufsm_mem_limit() >> 30)); return 0; }
     }
     const long on = sysconf(_SC_NPROCESSORS_ONLN); cpu_set_t cs; CPU_ZERO(&cs);
     const int aff = sched_getaffinity(0, sizeof cs, &cs) ? -1 : CPU_COUNT(&cs);
@@ -30,7 +31,7 @@ int cmd_sysinfo(int argc, char **argv) {
     printf("build: gcc %s, C %ld\n", __VERSION__, (long)__STDC_VERSION__);
     nn_sysinfo_gpus(stdout);
     int nd = 0;
-    for (int i = 2; i < argc; i++) if (!strcmp(argv[i], "--disk") && i + 1 < argc) { disk_line(argv[++i]); nd++; }
+    for (int i = 2; i < argc; i++) if (!strcmp(argv[i], opt_n("--disk")) && i + 1 < argc) { disk_line(argv[++i]); nd++; }
     if (!nd) disk_line(".");
     return 0;
 }

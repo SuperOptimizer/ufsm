@@ -7,7 +7,9 @@
    two-sided 5 %). --set clean (default) keeps boxes with ceil >= --ceil-min (A's ceil; boxes without a ceil are kept; the others are summarised on a "label-noise" line); --boxes 1
    prints the per-box values. Several rows of one box (replicates) are averaged first. --scroll a,b keeps only the boxes of those
    scrolls (e.g. the wgate primary set paris4,paris4j); --tsv 1 prints one tab-separated line per metric instead (scripts/wbench/wgate.sh). */
+#include "checkpoint.h"
 #include <math.h>
+#include "optcheck.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,7 +19,7 @@ enum { WB_MAXBOX = 1024, WB_MAXCOL = 128, WB_MAXSC = 32 };
 typedef struct { char box[64], scroll[64]; double v[WB_MAXCOL]; int nv[WB_MAXCOL]; } wb_row;
 typedef struct { int ncol; char col[WB_MAXCOL][48]; int nrow; wb_row *row; } wb_tab;
 
-static const char *wb_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *wb_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static int wb_colix(const wb_tab *t, const char *c) { for (int i = 0; i < t->ncol; i++) if (!strcmp(t->col[i], c)) return i; return -1; }
 static int wb_split(char *s, char **f, int max) {   /* tab or space separated */
     int n = 0; char *p = s;
@@ -59,9 +61,9 @@ int cmd_wbench_stats(int argc, char **argv) {
     const char *pa = argv[2], *pb = argc > 3 && argv[3][0] != '-' ? argv[3] : nullptr;
     static wb_tab A, B; if (wb_load(pa, &A) || (pb && wb_load(pb, &B))) return 1;
     char ml[1024]; snprintf(ml, sizeof ml, "%s", wb_opt(argc, argv, "--metric", "ids"));
-    const int clean = strcmp(wb_opt(argc, argv, "--set", "clean"), "all") != 0, nb = atoi(wb_opt(argc, argv, "--n", "10000")), pbox = atoi(wb_opt(argc, argv, "--boxes", "0"));
-    const double cmin = atof(wb_opt(argc, argv, "--ceil-min", "0.8")); wb_s = (uint64_t)atoll(wb_opt(argc, argv, "--seed", "1"));
-    const int ic = wb_colix(&A, "ceil"), tsv = atoi(wb_opt(argc, argv, "--tsv", "0"));
+    const int clean = strcmp(wb_opt(argc, argv, "--set", "clean"), "all") != 0, nb = opt_atoi("--n", wb_opt(argc, argv, "--n", "10000")), pbox = opt_atoi("--boxes", wb_opt(argc, argv, "--boxes", "0"));
+    const double cmin = opt_atof("--ceil-min", wb_opt(argc, argv, "--ceil-min", "0.8")); wb_s = (uint64_t)opt_atoll("--seed", wb_opt(argc, argv, "--seed", "1"));
+    const int ic = wb_colix(&A, "ceil"), tsv = opt_atoi("--tsv", wb_opt(argc, argv, "--tsv", "0"));
     const char *only = wb_opt(argc, argv, "--scroll", nullptr);   /* comma list: only boxes of these scrolls */
     if (tsv) printf("metric\tscrolls\tn\tA\tA_lo\tA_hi\tB\tdiff\tdiff_lo\tdiff_hi\tP_A_gt_B\tmde\n");
     else printf("wbench-stats A = %s%s%s, set %s%s%s%s%s\n", pa, pb ? ", B = " : "", pb ? pb : "", clean ? "clean (ceil >= " : "all", clean ? wb_opt(argc, argv, "--ceil-min", "0.8") : "", clean ? "; boxes without a ceil kept)" : "",
@@ -105,7 +107,8 @@ int cmd_wbench_stats(int argc, char **argv) {
         if (nx) printf("    label-noise  %3d boxes  A %.4f  (ceil %.4f; not in the mean)\n", nx, sx / nx, sxc / nx);
         for (int s = 0; s < ns; s++) {
             double a = 0, b = 0; for (int q = 0; q < cnt[s]; q++) { a += A.row[idx[mem[s][q]]].v[ia]; if (pb) b += B.row[jb[mem[s][q]]].v[ibb]; }
-            printf("    %-12s %3d boxes  A %.4f", sname[s], cnt[s], a / cnt[s]); if (pb) printf("  B %.4f  A-B %+.4f", b / cnt[s], (a - b) / cnt[s]); printf("\n");
+            printf("    %-12s %3d boxes  A %.4f", sname[s], cnt[s], a / cnt[s]); if (pb) printf("  B %.4f  A-B %+.4f", b / cnt[s], (a - b) / cnt[s]);
+            printf("%s\n", cnt[s] < 8 ? "  (under 8 boxes: a bootstrap inside this scroll under-covers, its share of the CI is too narrow)" : "");   /* (audit eval#20: paris4 n 4) */
         }
         if (pbox) for (int i = 0; i < n; i++) { printf("      %-10s %-12s A %.4f", A.row[idx[i]].box, A.row[idx[i]].scroll, A.row[idx[i]].v[ia]); if (pb) printf("  B %.4f  A-B %+.4f", B.row[jb[i]].v[ibb], A.row[idx[i]].v[ia] - B.row[jb[i]].v[ibb]); printf("\n"); }
         free(ba); free(bb); free(bd);
@@ -125,10 +128,10 @@ static long wb_hdr(FILE *f, char *line, size_t cap) {   /* reads "UFSM" + the he
 }
 int cmd_ckpt_avg(int argc, char **argv) {
     int nin = 0; const char *in[256]; const char *out = argc > 2 ? argv[2] : nullptr;
-    for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], "--arrays")) { i++; continue; } if (nin < 256) in[nin++] = argv[i]; }
+    for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], opt_n("--arrays"))) { i++; continue; } if (nin < 256) in[nin++] = argv[i]; }
     const char *ar = wb_opt(argc, argv, "--arrays", "both"); const int both = strcmp(ar, "ema") != 0;
     if (!out || nin < 1 || (strcmp(ar, "ema") && strcmp(ar, "both"))) { fprintf(stderr, "usage: ufsm ckpt-avg OUT.ckpt IN1.ckpt [IN2.ckpt ...] [--arrays ema|both]\n"); return 2; }
-    enum { HL = 16384 }; static char h0[HL], h1[HL]; FILE *f[256]; long off[256]; size_t np = 0; long long sz = -1;
+    enum { HL = UFSM_CHECKPOINT_HEADER }; static char h0[HL], h1[HL];   /* (mini ckpt audit #3: was 16 KiB, below every latent header) */ FILE *f[256]; long off[256]; size_t np = 0; long long sz = -1;
     for (int k = 0; k < nin; k++) {
         f[k] = fopen(in[k], "rb"); if (!f[k]) { fprintf(stderr, "ckpt-avg: cannot open %s\n", in[k]); return 1; }
         char *h = k ? h1 : h0; off[k] = wb_hdr(f[k], h, HL); if (off[k] < 0) { fprintf(stderr, "ckpt-avg: %s is not a ufsm checkpoint\n", in[k]); return 1; }

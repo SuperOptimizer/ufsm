@@ -4,8 +4,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* entries are keyed by z3_id (process-unique per open), not the z3 address: a closed array's chunks never alias a later open at the same
+   address (data audit lower, 11-14; zcache_drop before close is still how their memory goes). Every entry sits on one LRU list, so an
+   eviction walks from the cold end instead of scanning all 65536 buckets under the mutex. */
 typedef struct zc_ent {
-    const z3 *z; int64_t c[3]; int n[3];   /* chunk index, its clipped size */
+    uint64_t id; int64_t c[3]; int n[3];   /* the array's z3_id, chunk index, its clipped size */
+    unsigned h;                            /* its bucket */
+    struct zc_ent *lp, *ln;                /* LRU list (ln: toward the cold end) */
     uint8_t *buf; size_t bytes;
     int ref, state;                        /* state 0 loading, 1 ready, -1 failed */
     uint64_t used;
@@ -16,6 +21,7 @@ typedef struct zc_ent {
 struct zcache {
     pthread_mutex_t mu; pthread_cond_t cv;
     zc_ent *b[ZC_NB];
+    zc_ent *hot, *cold;                    /* the LRU list's ends */
     size_t budget, bytes; uint64_t clock;
     _Atomic uint64_t hits, misses;
 };
@@ -25,9 +31,16 @@ zcache *zcache_open(size_t budget) {
     pthread_mutex_init(&c->mu, nullptr); pthread_cond_init(&c->cv, nullptr); c->budget = budget;
     return c;
 }
+static void lru_unlink(zcache *c, zc_ent *e) {
+    if (e->lp) e->lp->ln = e->ln; else c->hot = e->ln;
+    if (e->ln) e->ln->lp = e->lp; else c->cold = e->lp;
+    e->lp = e->ln = nullptr;
+}
+static void lru_front(zcache *c, zc_ent *e) { e->lp = nullptr; e->ln = c->hot; if (c->hot) c->hot->lp = e; c->hot = e; if (!c->cold) c->cold = e; }
+static void bucket_unlink(zcache *c, zc_ent *e) { for (zc_ent **pp = &c->b[e->h]; *pp; pp = &(*pp)->next) if (*pp == e) { *pp = e->next; break; } e->next = nullptr; }
 void zcache_close(zcache *c) {
     if (!c) return;
-    for (int i = 0; i < ZC_NB; i++) for (zc_ent *e = c->b[i], *n; e; e = n) { n = e->next; free(e->buf); free(e); }
+    for (zc_ent *e = c->hot, *n; e; e = n) { n = e->ln; free(e->buf); free(e); }
     pthread_mutex_destroy(&c->mu); pthread_cond_destroy(&c->cv); free(c);
 }
 void zcache_stats(const zcache *c, uint64_t *hits, uint64_t *misses, size_t *bytes) {
@@ -37,44 +50,39 @@ void zcache_stats(const zcache *c, uint64_t *hits, uint64_t *misses, size_t *byt
 }
 void zcache_drop(zcache *c, const z3 *z) {
     if (!c) return;
+    const uint64_t id = z3_id(z);
     pthread_mutex_lock(&c->mu);
-    for (int i = 0; i < ZC_NB; i++) for (zc_ent **pp = &c->b[i]; *pp;) {
-        zc_ent *e = *pp; if (e->z != z || e->ref || e->state == 0) { pp = &e->next; continue; }
-        *pp = e->next; c->bytes -= e->bytes; free(e->buf); free(e);
-    }
+    for (zc_ent *e = c->hot, *n; e; e = n) { n = e->ln;
+        if (e->id != id || e->ref || e->state == 0) continue;
+        bucket_unlink(c, e); lru_unlink(c, e); c->bytes -= e->bytes; free(e->buf); free(e); }
     pthread_mutex_unlock(&c->mu);
 }
-static unsigned zc_hash(const z3 *z, const int64_t c[3]) {
-    uint64_t h = (uint64_t)(uintptr_t)z * 0x9e3779b97f4a7c15ull ^ (uint64_t)c[0] * 0xbf58476d1ce4e5b9ull ^ (uint64_t)c[1] * 0x94d049bb133111ebull ^ (uint64_t)c[2] * 0xd6e8feb86659fd93ull;
+static unsigned zc_hash(uint64_t id, const int64_t c[3]) {
+    uint64_t h = id * 0x9e3779b97f4a7c15ull ^ (uint64_t)c[0] * 0xbf58476d1ce4e5b9ull ^ (uint64_t)c[1] * 0x94d049bb133111ebull ^ (uint64_t)c[2] * 0xd6e8feb86659fd93ull;
     return (unsigned)((h ^ (h >> 29)) & (ZC_NB - 1));
 }
 /* evict unreferenced ready entries, least recently used first, until under budget (mu held) */
 static void zc_evict(zcache *c) {
-    while (c->bytes > c->budget) {
-        zc_ent *best = nullptr, **bp = nullptr;
-        for (int i = 0; i < ZC_NB; i++) for (zc_ent **pp = &c->b[i]; *pp; pp = &(*pp)->next) {
-            zc_ent *e = *pp; if (e->ref || e->state == 0) continue;
-            if (!best || e->used < best->used) { best = e; bp = pp; }
-        }
-        if (!best) return;
-        *bp = best->next; c->bytes -= best->bytes; free(best->buf); free(best);
+    for (zc_ent *e = c->cold, *p; e && c->bytes > c->budget; e = p) { p = e->lp;   /* (from the cold end: least recently used first) */
+        if (e->ref || e->state == 0) continue;
+        bucket_unlink(c, e); lru_unlink(c, e); c->bytes -= e->bytes; free(e->buf); free(e);
     }
 }
 /* the chunk, referenced (zc_put releases); nullptr on failure */
 static zc_ent *zc_get(zcache *c, z3 *z, const int64_t ci[3]) {
-    const unsigned h = zc_hash(z, ci);
+    const uint64_t id = z3_id(z); const unsigned h = zc_hash(id, ci);
     pthread_mutex_lock(&c->mu);
     for (;;) {
         zc_ent *e = c->b[h];
-        while (e && !(e->z == z && e->c[0] == ci[0] && e->c[1] == ci[1] && e->c[2] == ci[2])) e = e->next;
+        while (e && !(e->id == id && e->c[0] == ci[0] && e->c[1] == ci[1] && e->c[2] == ci[2])) e = e->next;
         if (!e) break;
         if (e->state == 0) { pthread_cond_wait(&c->cv, &c->mu); continue; }   /* another thread decodes it */
         if (e->state < 0) { pthread_mutex_unlock(&c->mu); return nullptr; }
-        e->ref++; e->used = ++c->clock; pthread_mutex_unlock(&c->mu); atomic_fetch_add(&c->hits, 1); return e;
+        e->ref++; e->used = ++c->clock; lru_unlink(c, e); lru_front(c, e); pthread_mutex_unlock(&c->mu); atomic_fetch_add(&c->hits, 1); return e;
     }
     const z3_meta *m = z3_meta_of(z);
     zc_ent *e = calloc(1, sizeof *e); if (!e) { pthread_mutex_unlock(&c->mu); return nullptr; }
-    e->z = z; memcpy(e->c, ci, sizeof e->c); e->ref = 1; e->state = 0; e->used = ++c->clock;
+    e->id = id; e->h = h; memcpy(e->c, ci, sizeof e->c); e->ref = 1; e->state = 0; e->used = ++c->clock; lru_front(c, e);
     int64_t o[3], nn[3];
     for (int d = 0; d < 3; d++) { o[d] = ci[d] * m->chunk[d]; nn[d] = m->shape[d] - o[d] < m->chunk[d] ? m->shape[d] - o[d] : m->chunk[d]; e->n[d] = (int)nn[d]; }
     e->bytes = (size_t)nn[0] * nn[1] * nn[2];
@@ -88,8 +96,7 @@ static zc_ent *zc_get(zcache *c, z3 *z, const int64_t ci[3]) {
     else { e->buf = buf; e->state = 1; c->bytes += e->bytes; }
     pthread_cond_broadcast(&c->cv);
     if (rc) {   /* unlink the failed entry once its waiters have seen it: drop it now (later reads retry) */
-        for (zc_ent **pp = &c->b[h]; *pp; pp = &(*pp)->next) if (*pp == e) { *pp = e->next; break; }
-        e->next = nullptr; e->ref--;
+        bucket_unlink(c, e); lru_unlink(c, e); e->ref--;
         if (!e->ref) free(e);   /* (a waiter that saw state -1 returned without a reference) */
         pthread_mutex_unlock(&c->mu); return nullptr;
     }

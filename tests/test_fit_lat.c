@@ -1,6 +1,6 @@
 /* nn_fit_accum_lat (predict --fit-zarr's fused fit kernel) against the plane path it replaces: nn_lat_up_slab + nn_lat_shuffle (the
    sub-cell pair 0-1) + nn_fstem_fwd on the z-scored CT (nn_lat_ct_x) into [11][W^3] fp16 planes, then nn_fit_accum_dm and nn_fit_accum_w4
-   (task unwrap2: phase 0-1, normal 2-7, density 8, winding mod 4 9-10, d 16), field cells of 8. A 96^3 window (24^3 cells, cout 144 =
+   (task unwrap2: phase 0-1, normal 2-7, density 8, winding mod 4 9-10, d 16), field cells of 8, 4 and 2 (--fit-h 2: audit unroll #9). A 96^3 window (24^3 cells, cout 144 =
    16 + 128 sub-cell outputs), halo 16, the box at window offsets on and off the cell grid; with and without the stem and the sub-cell
    term. Pass: the 12 + 9 accumulator planes bit for bit. Usage: test_fit_lat */
 #include "nn.h"
@@ -12,7 +12,8 @@
 #include <string.h>
 #include <time.h>
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
-enum { WW = 96, CW = 24, NB = 16, COUT = 144, HALO = 16, C = 16, NO = 6, FH = 8, DD = 16 };
+enum { WW = 96, CW = 24, NB = 16, COUT = 144, HALO = 16, C = 16, NO = 6, DD = 16 };
+static const int FHS[3] = {8, 4, 2};
 static double rnd(uint64_t *s) { *s = *s * 6364136223846793005ull + 1442695040888963407ull; return (double)(*s >> 11) * 0x1p-53 - 0.5; }
 static uint16_t f2h(float v) { _Float16 f = (_Float16)v; uint16_t h; memcpy(&h, &f, 2); return h; }
 int main(void) {
@@ -29,8 +30,10 @@ int main(void) {
     const int chs[NO] = {0, 1, 9, 10, -1, -1};   /* the stem's outputs: channels 0, 1, 9, 10, 11, 12 (predict FZ_STEM's map c < 11) */
     int so[16]; for (int c = 0; c < 16; c++) so[c] = -1;
     so[0] = 0; so[1] = 1; so[9] = 2; so[10] = 3; so[11] = 4; so[12] = 5;
-    static const int OFF[3][3] = {{0, 0, 0}, {-8, 8, 0}, {16, -24, 8}};   /* the window's origin in box coordinates (tz ty tx), box multiples of 8 */
-    for (int st = 0; st < 2; st++) for (int sb = 0; sb < 2; sb++) for (int o = 0; o < 3; o++) {
+    /* the window's origin in box coordinates (tz ty tx): box multiples of 8; the last off the 4-voxel grid (h 2 only: the cells on the latent grid) */
+    static const int OFF[4][3] = {{0, 0, 0}, {-8, 8, 0}, {16, -24, 8}, {6, -2, 10}};
+    for (int fi = 0; fi < 3; fi++) for (int st = 0; st < 2; st++) for (int sb = 0; sb < 2; sb++) for (int o = 0; o < 4; o++) {
+        const int FH = FHS[fi]; if (o == 3 && FH != 2) continue;
         const int tz = OFF[o][0], ty = OFF[o][1], tx = OFF[o][2], box[3] = {WW + 8, WW - 8, WW}, F[3] = {(box[0] + FH - 1) / FH, (box[1] + FH - 1) / FH, (box[2] + FH - 1) / FH};
         const size_t nf = (size_t)F[0] * F[1] * F[2];
         float *a0 = nn_malloc(12 * nf * 4), *a1 = nn_malloc(12 * nf * 4), *b0 = nn_malloc(9 * nf * 4), *b1 = nn_malloc(9 * nf * 4);
@@ -43,7 +46,7 @@ int main(void) {
         if (nn_fit_accum_lat(lgd, 1, CW, CW, CW, sb ? NB : -1, st ? pd : nullptr, C, so, ctd, ctd, nullptr, mean, isd, HALO, HALO, tz, ty, tx, box, FH, F,
                              -1, 0, 2, 8, dscale, 0, a1, 9, DD, b1)) { fprintf(stderr, "nn_fit_accum_lat refused the configuration\n"); return 1; }
         nn_sync();
-        if (o == 0 && sb == 0) {   /* (diagnosis: the per-voxel logits of the fused kernel against the planes) */
+        if (o == 0 && sb == 0 && FH == 8) {   /* (diagnosis: the per-voxel logits of the fused kernel against the planes) */
             float *dg = nn_malloc(11 * w3 * 4); nn_zero(dg, 11 * w3 * 4); nn_fit_accum_lat_debug(dg);
             float *sa = nn_malloc(12 * nf * 4), *sb4 = nn_malloc(9 * nf * 4); nn_zero(sa, 12 * nf * 4); nn_zero(sb4, 9 * nf * 4);   /* (scratch sums) */
             nn_fit_accum_lat(lgd, 1, CW, CW, CW, -1, st ? pd : nullptr, C, so, ctd, ctd, nullptr, mean, isd, HALO, HALO, tz, ty, tx, box, FH, F, -1, 0, 2, 8, dscale, 0, sa, 9, DD, sb4);
@@ -68,13 +71,14 @@ int main(void) {
         for (size_t i = 0; i < nf; i++) nset += h0[nf + i] != 0;
         size_t tot = 0; for (int k = 0; k < 21; k++) tot += nd[k];
         const int bad = tot != 0 || nset < nf / 4;
-        printf("%s stem %d sub-cell %d window at %3d %3d %3d: %zu of %zu cells with material, %zu accumulator values differ", bad ? "FAIL" : "ok  ", st, sb, tz, ty, tx, nset, nf, tot);
+        printf("%s h %d stem %d sub-cell %d window at %3d %3d %3d: %zu of %zu cells with material, %zu accumulator values differ", bad ? "FAIL" : "ok  ", FH, st, sb, tz, ty, tx, nset, nf, tot);
         if (tot) { printf(" (planes:"); for (int k = 0; k < 21; k++) if (nd[k]) printf(" %d:%zu", k, nd[k]); printf(")"); }
         printf("%s\n", bad ? "  <--" : "");
         fails += bad;
         free(h0); free(h1); free(g0); free(g1); nn_free(a0); nn_free(a1); nn_free(b0); nn_free(b1);
     }
-    if (getenv("UFSM_TEST_BENCH")) {   /* timing: a 256^3 window (the stem and the sub-cell term on), the plane path against the fused kernel */
+    if (getenv("UFSM_TEST_BENCH")) for (int fi = 0; fi < 3; fi += 2) {   /* timing: a 256^3 window (the stem and the sub-cell term on), the plane path against the fused kernel, h 8 and 2 */
+        const int FH = FHS[fi];
         enum { BW = 256, BC = 64 }; const size_t b3 = (size_t)BW * BW * BW, bcv = (size_t)BC * BC * BC;
         uint8_t *bct = malloc(b3); uint16_t *blg = malloc(COUT * bcv * 2);
         for (size_t i = 0; i < b3; i++) bct[i] = rnd(&s) < -0.3 ? 0 : (uint8_t)(128 + 250 * rnd(&s));
@@ -101,8 +105,9 @@ int main(void) {
             tn = fmin(tn, t1 - t0); tw = fmin(tw, t2 - t1);
         }
         printf("bench: fused without the stem %.1f ms, without the winding pass %.1f ms\n", 1e3 * tn, 1e3 * tw);
-        printf("bench %d^3 window: plane path %.1f ms (upsample + shuffle %.1f, stem %.1f, sums %.1f, winding %.1f), fused %.1f ms\n", BW, 1e3 * tp, 1e3 * tu, 1e3 * tst, 1e3 * tdm,
+        printf("bench h %d %d^3 window: plane path %.1f ms (upsample + shuffle %.1f, stem %.1f, sums %.1f, winding %.1f), fused %.1f ms\n", FH, BW, 1e3 * tp, 1e3 * tu, 1e3 * tst, 1e3 * tdm,
                1e3 * (tp - tu - tst - tdm), 1e3 * tf);
+        nn_free(a); nn_free(b); nn_free(bctd); nn_free(blgd); nn_free(bxd); nn_free(bpl); free(bct); free(blg);
     }
     printf("%s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

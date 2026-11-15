@@ -5,6 +5,7 @@
 #include "../src/band.h"
 #include "../src/bandgpu.h"
 #include "fm_tol.h"
+#include <cuda_runtime_api.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -191,6 +192,7 @@ int main(void) {
     const int dims[][3] = {{40, 64, 72}, {57, 50, 61}, {33, 33, 33}, {24, 90, 40}, {16, 16, 16}};
     const int ncase = sizeof dims / sizeof dims[0];
     int fails = 0, gpu = band_pair_gpu != nullptr, gpu_ran = 0;
+    int ndev = 0; if (cudaGetDeviceCount(&ndev) != cudaSuccess) ndev = 0;   /* a device that does not answer is a failure; no device at all (a CPU run) a skip */
     if (gpu) band_pair_gpu_slots(2, 0);
     for (int c = 0; c < ncase; c++) for (int rm = 0; rm < 2; rm++) {
         const int *n = dims[c]; const size_t N = (size_t)n[0] * n[1] * n[2]; const float rmax = rm ? 14.f : 6.5f;
@@ -205,7 +207,7 @@ int main(void) {
            "between the sheets" angle test (tests/fm_tol.h) */
         fails += fm_cmp_u8c("lean CPU vs reference phase", a, b, N, 1, PHASE_PERIOD, 1e-3, 1e-4);
         if (gpu) {
-            if (band_pair_gpu(codes, n, rmax, g)) printf(", GPU unavailable");
+            if (band_pair_gpu(codes, n, rmax, g)) { printf(", GPU unavailable%s", ndev ? " with a device visible: FAIL" : " (no device: skipped)"); fails += ndev > 0; }
             else { size_t e = 0; for (size_t i = 0; i < N; i++) e += a[i] != g[i]; printf(", GPU differs at %zu", e); fails += fm_cmp_u8c("GPU vs reference phase", a, g, N, 1, PHASE_PERIOD, 1e-3, 1e-4); gpu_ran = 1; }
         }
         const int margin = 2;
@@ -217,6 +219,6 @@ int main(void) {
         free(codes); free(a); free(b); free(g);
     }
     if (gpu) band_pair_gpu_free();
-    printf("%s (GPU %s)\n", fails ? "FAIL" : "PASS", gpu_ran ? "checked" : "not checked");
+    printf("%s (GPU %s)\n", fails ? "FAIL" : "PASS", gpu_ran ? "checked" : ndev ? "not checked" : "not checked: no device");
     return fails != 0;
 }

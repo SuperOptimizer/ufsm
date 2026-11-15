@@ -495,7 +495,8 @@ __global__ void aug_write_k(const uint8_t *in, int P, const float *rad, const sc
         else for (int d = 0; d < 3; d++) U[d] = c + sc * U[d];
         for (int d = 0; d < 3; d++) Vv[perm[d]] = flip[d] ? (P - 1) - U[d] : U[d];
         int inside = 1; for (int d = 0; d < 3; d++) inside &= Vv[d] >= 0 && Vv[d] <= P - 1;
-        if (!inside) { put16(H, k, 0.f, rec->xfmt); return; }
+        if (!inside) v = (0.f - mean) * isd;   /* (outside the source cube: the z-scored raw 0, jittered below; sample.c warp_fill) */
+        else {
         int B[3]; float Fr[3];
         for (int d = 0; d < 3; d++) { int b = (int)Vv[d]; if (b > P - 2) b = P - 2; B[d] = b; Fr[d] = Vv[d] - b; }
         float cv = 0;
@@ -506,6 +507,7 @@ __global__ void aug_write_k(const uint8_t *in, int P, const float *rad, const sc
             cv += w * (((float)in[((size_t)(B[0] + bz) * P + B[1] + by) * P + B[2] + bx] - mean) * isd);
         }
         v = cv;
+        }
     }
     if (rec->jitter) v = rec->ia * v + rec->ib + rec->isg * jit_noise(ntab, rec->nseed, k);
     put16(H, k, v, rec->xfmt);

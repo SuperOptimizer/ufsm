@@ -5,6 +5,7 @@
    omitted, as z3w does. E.g. predict --fit-zarr writes 128^3 shards (one chunk per file); 512^3 shards hold up to 64 chunks per file,
    ~64x fewer files to upload. */
 #include "sysinfo.h"
+#include "optcheck.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -126,8 +127,14 @@ int repack_array(const char *in, const char *out, int shard, int nth, int quiet)
     const char *lb = strchr(g, '['), *rb = e;   /* g..e: "chunk_grid" ... [a,b,c] */
     if (mkdirs(R.out)) { fprintf(stderr, "repack: mkdir %s: %s\n", R.out, strerror(errno)); return 1; }
     snprintf(p, sizeof p, "%s/zarr.json", R.out);
-    FILE *f = fopen(p, "w"); if (!f) { fprintf(stderr, "repack: cannot write %s\n", p); return 1; }
-    fwrite(js, 1, (size_t)(lb - js), f); fprintf(f, "[%d,%d,%d", R.sout, R.sout, R.sout); fputs(rb, f); fclose(f);
+    {   /* written whole to a temp name and renamed: every write and the close checked (audit mini/errpaths 4: unchecked, returned success) */
+        char tp[1600]; snprintf(tp, sizeof tp, "%s.%d.tmp", p, (int)getpid());
+        FILE *f = fopen(tp, "w"); if (!f) { fprintf(stderr, "repack: cannot write %s: %s\n", tp, strerror(errno)); return 1; }
+        int bad = fwrite(js, 1, (size_t)(lb - js), f) != (size_t)(lb - js);
+        bad |= fprintf(f, "[%d,%d,%d", R.sout, R.sout, R.sout) < 0; bad |= fputs(rb, f) < 0; bad |= fflush(f) != 0; bad |= fsync(fileno(f)) != 0;
+        bad |= fclose(f) != 0;
+        if (bad || rename(tp, p)) { fprintf(stderr, "repack: writing %s failed: %s\n", p, strerror(errno)); unlink(tp); return 1; }
+    }
     free(js);
     nth = nth < 1 ? 1 : nth > 256 ? 256 : nth;
     pthread_t th[256];
@@ -140,6 +147,6 @@ int repack_array(const char *in, const char *out, int shard, int nth, int quiet)
 }
 int cmd_repack(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm repack <in-array-dir> <out-array-dir> <shard> [--threads N]\n"); return 2; }
-    int nth = ufsm_threads(0, 32); for (int a = 5; a + 1 < argc; a++) if (!strcmp(argv[a], "--threads")) nth = atoi(argv[a + 1]);
+    int nth = ufsm_threads(0, 32); for (int a = 5; a + 1 < argc; a++) if (!strcmp(argv[a], opt_n("--threads"))) nth = atoi(argv[a + 1]);
     return repack_array(argv[2], argv[3], atoi(argv[4]), nth, 0);
 }

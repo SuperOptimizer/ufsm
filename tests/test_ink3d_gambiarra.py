@@ -28,7 +28,7 @@ def skip(msg):
 def read(z, y, x, n, out):
     r = subprocess.run([str(UFSM), "read", str(CT_ROOT), CT_KEY, str(z), str(y), str(x), str(n), str(n), str(n), str(out)], capture_output=True, text=True)
     if r.returncode:
-        skip(f"CT read failed: {r.stderr[-300:]}")
+        sys.exit(f"FAIL: CT read failed (a read error, not missing data): {r.stderr[-300:]}")
     import numpy as np
     return np.fromfile(out, np.uint8).reshape(n, n, n)
 
@@ -66,7 +66,8 @@ def main():
     for p in [W, UFSM, CT_ROOT / CT_KEY / "zarr.json"]:
         if not pathlib.Path(p).exists():
             skip(f"{p} missing")
-    if "GPU" not in subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout:
+    cv = os.environ.get("CUDA_VISIBLE_DEVICES")   # the runner's grant (empty: none); nvidia-smi -L ignores it
+    if (cv is not None and cv.strip() in ("", "-1")) or (cv is None and "GPU" not in subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout):
         skip("no GPU")
     torch.set_num_threads(int(os.environ.get("UFSM_TEST_TORCH_THREADS", "8")))
     fails = 0
@@ -107,7 +108,7 @@ def main():
         n = [hi_[a] - lo_[a] for a in range(3)]
         rr = subprocess.run([str(UFSM), "read", str(CT_ROOT), CT_KEY, *map(str, lo_), *map(str, n), str(td / "blk.u8")], capture_output=True, text=True)
         if rr.returncode:
-            skip(f"CT read failed: {rr.stderr[-300:]}")
+            sys.exit(f"FAIL: CT read failed (a read error, not missing data): {rr.stderr[-300:]}")
         blk = np.fromfile(td / "blk.u8", np.uint8).reshape(n)
         pars = [blk[2 * oz - 64 - lo_[0]:2 * oz + 192 - lo_[0], 2 * oy - 64 - lo_[1]:2 * oy + 192 - lo_[1], 2 * ox - 64 - lo_[2]:2 * ox + 192 - lo_[2]] for oz, oy, ox in crops]
         clg, _ = raw(pars, td, "boxcrops")

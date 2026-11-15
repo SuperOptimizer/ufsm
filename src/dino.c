@@ -1,6 +1,7 @@
 /* ufsm dino: our own DINO-style embedding training from scratch (ufsm dino-train), its inference (ufsm dino-embed) and the
    view-pair data tool (ufsm halves). See DESIGN.md "Own dense embedding net (dino-train)". */
 #include "dino.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "dinor.h"
 #include "sslstat.h"
@@ -24,7 +25,7 @@
 
 static double dn_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 
@@ -40,8 +41,8 @@ int cmd_dino_halves(int argc, char **argv) {
         return 2;
     }
     const char *root = argv[2], *key = argv[3], *out = argv[4];
-    const int nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8), slab = atoi(opt(argc, argv, "--slab", "16"));
-    store *st = store_open(root); const int v2 = atoi(opt(argc, argv, "--zarr2", "0"));   /* the raw upstream zarr v2 (uncompressed: the lossy volcomp levels are denoised) */
+    const int nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8), slab = opt_atoi("--slab", opt(argc, argv, "--slab", "16"));
+    store *st = store_open(root); const int v2 = opt_atoi("--zarr2", opt(argc, argv, "--zarr2", "0"));   /* the raw upstream zarr v2 (uncompressed: the lossy volcomp levels are denoised) */
     z3 *ct = st && !v2 ? z3_open(st, key, opt(argc, argv, "--cache", nullptr)) : nullptr; z2 *ct2 = st && v2 ? z2_open(st, key, nullptr) : nullptr;
     if (!ct && !ct2) { fprintf(stderr, "halves: cannot open %s %s: %s\n", root, key, v2 ? z2_error() : z3_error()); return 1; }
     if (ct2) z2_assume_present(ct2, 1);
@@ -753,7 +754,7 @@ static int dn_run_eval(unet *u, int argc, char **argv, int step, int P, int ED, 
                 else {
                     const int64_t box[6] = {eb[0], eb[1], eb[2], eb[3], eb[4], eb[5]};
                     float *eax = nullptr;
-                    if (axis_in) eax = load_axis(opt(argc, argv, "--eval-axis", ""), atof(opt(argc, argv, "--eval-axis-scale", "1")), z3_meta_of(ez)->shape[0]);
+                    if (axis_in) eax = load_axis(opt(argc, argv, "--eval-axis", ""), opt_atof("--eval-axis-scale", opt(argc, argv, "--eval-axis-scale", "1")), z3_meta_of(ez)->shape[0]);
                     int8_t *emb = (axis_in && !eax) ? nullptr : dn_embed_box(u, ez, box, P, 32, ec, es, nthreads, 1, eax, ars);
                     free(eax);
                     char gdir[1200]; snprintf(gdir, sizeof gdir, "%s/eval-emb", outd);
@@ -765,7 +766,7 @@ static int dn_run_eval(unet *u, int argc, char **argv, int step, int P, int ED, 
                         while (sl && nl < 32 && fgets(lines[nl], sizeof lines[nl], sl)) { lines[nl][strcspn(lines[nl], "\n")] = 0; if (lines[nl][0]) av[ac++] = lines[nl++]; }
                         if (sl) fclose(sl);
                         av[ac++] = "--n-ref"; av[ac++] = (char *)opt(argc, argv, "--eval-refs", "300");
-                        if (opt(argc, argv, "--eval-codes", nullptr)) { int ci = 0; for (int k = 2; k + 2 < argc; k++) if (!strcmp(argv[k], "--eval-codes")) ci = k;
+                        if (opt(argc, argv, "--eval-codes", nullptr)) { int ci = 0; for (int k = 2; k + 2 < argc; k++) if (!strcmp(argv[k], opt_n("--eval-codes"))) ci = k;
                             av[ac++] = "--codes"; av[ac++] = argv[ci + 1]; av[ac++] = argv[ci + 2]; av[ac++] = "--codes-radius"; av[ac++] = "4"; }
                         av[ac] = nullptr;
                         fflush(stdout); fprintf(stderr, "dino-train: eval at step %d (embed %.1f s)\n", step, te2 - te);
@@ -898,24 +899,24 @@ typedef struct {
 } dn_ssl;
 static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *Dd, int argc, char **argv, uint64_t seed, int C, int cls_reg, int cls_norm, float noise) {
     memset(Q, 0, sizeof *Q); Q->u = u; Q->C = C; Q->CC = cls_reg == 2 ? 2 * C : C; Q->cls_reg = cls_reg; Q->cls_norm = cls_norm; Q->noise = noise; Q->CIN = cfg->cin;
-    Q->N = atoi(opt(argc, argv, "--ssl-batch", "16")); Q->PG = atoi(opt(argc, argv, "--ssl-P", "128")); Q->PL = atoi(opt(argc, argv, "--ssl-local-P", "64"));
-    Q->NL = atoi(opt(argc, argv, "--ssl-locals", "4")); Q->Ps = atoi(opt(argc, argv, "--ssl-source-P", "192")); Q->K = atoi(opt(argc, argv, "--ssl-protos", "16384"));
-    Q->ts = 0.1f; Q->wdino = (float)atof(opt(argc, argv, "--ssl-dino", "1")); Q->wk = (float)atof(opt(argc, argv, "--ssl-koleo", "0.1"));
-    Q->hlr = (float)atof(opt(argc, argv, "--ssl-head-lr", "1.8e-4")); Q->hwarm = atoi(opt(argc, argv, "--ssl-head-warmup", "0")); Q->plr = (float)atof(opt(argc, argv, "--ssl-proto-lr", opt(argc, argv, "--ssl-head-lr", "1.8e-4")));
-    Q->wd = (float)atof(opt(argc, argv, "--ssl-wd", "0.04")); Q->freeze = atoi(opt(argc, argv, "--ssl-freeze-last", "1250")); Q->skit = atoi(opt(argc, argv, "--ssl-sk-iters", "3"));
-    Q->adrop = (float)atof(opt(argc, argv, "--axis-drop", "0.15")); Q->ure = atoi(opt(argc, argv, "--usage-window", "5000"));
+    Q->N = opt_atoi("--ssl-batch", opt(argc, argv, "--ssl-batch", "16")); Q->PG = opt_atoi("--ssl-P", opt(argc, argv, "--ssl-P", "128")); Q->PL = opt_atoi("--ssl-local-P", opt(argc, argv, "--ssl-local-P", "64"));
+    Q->NL = opt_atoi("--ssl-locals", opt(argc, argv, "--ssl-locals", "4")); Q->Ps = opt_atoi("--ssl-source-P", opt(argc, argv, "--ssl-source-P", "192")); Q->K = opt_atoi("--ssl-protos", opt(argc, argv, "--ssl-protos", "16384"));
+    Q->ts = 0.1f; Q->wdino = (float)opt_atof("--ssl-dino", opt(argc, argv, "--ssl-dino", "1")); Q->wk = (float)opt_atof("--ssl-koleo", opt(argc, argv, "--ssl-koleo", "0.1"));
+    Q->hlr = (float)opt_atof("--ssl-head-lr", opt(argc, argv, "--ssl-head-lr", "1.8e-4")); Q->hwarm = opt_atoi("--ssl-head-warmup", opt(argc, argv, "--ssl-head-warmup", "0")); Q->plr = (float)opt_atof("--ssl-proto-lr", opt(argc, argv, "--ssl-proto-lr", opt(argc, argv, "--ssl-head-lr", "1.8e-4")));
+    Q->wd = (float)opt_atof("--ssl-wd", opt(argc, argv, "--ssl-wd", "0.04")); Q->freeze = opt_atoi("--ssl-freeze-last", opt(argc, argv, "--ssl-freeze-last", "1250")); Q->skit = opt_atoi("--ssl-sk-iters", opt(argc, argv, "--ssl-sk-iters", "3"));
+    Q->adrop = (float)opt_atof("--axis-drop", opt(argc, argv, "--axis-drop", "0.15")); Q->ure = opt_atoi("--usage-window", opt(argc, argv, "--usage-window", "5000"));
     const int L = 1 << (cfg->nlev - 1);
     if (Q->N < 2 || Q->N > 1024 || Q->PG % L || Q->PL % L || Q->NL > 8) { fprintf(stderr, "dino-train --ssl-batch: 2..1024 samples, views multiples of %d, <= 8 locals\n", L); return 2; }
-    Q->exact = atoi(opt(argc, argv, "--ssl-exact-bank", "0")); Q->kg = Q->exact ? malloc((size_t)2 * Q->N * Q->CC * 4) : nullptr; Q->kgd = nn_malloc((size_t)Q->CC * 4); Q->hasaxv = malloc((size_t)Q->N * 4); Q->amd = nn_malloc((size_t)2 * Q->N * 4); Q->amh = malloc((size_t)2 * Q->N * 4);
+    Q->exact = opt_atoi("--ssl-exact-bank", opt(argc, argv, "--ssl-exact-bank", "0")); Q->kg = Q->exact ? malloc((size_t)2 * Q->N * Q->CC * 4) : nullptr; Q->kgd = nn_malloc((size_t)Q->CC * 4); Q->hasaxv = malloc((size_t)Q->N * 4); Q->amd = nn_malloc((size_t)2 * Q->N * 4); Q->amh = malloc((size_t)2 * Q->N * 4);
     float zlo = 0.84f, zhi = 1.15f, lzlo = 0.86f, lzhi = 1.16f;
     sscanf(opt(argc, argv, "--ssl-zoom", "0.84,1.15"), "%f,%f", &zlo, &zhi); sscanf(opt(argc, argv, "--ssl-local-zoom", "0.86,1.16"), "%f,%f", &lzlo, &lzhi);
     if ((int)ceilf(Q->PG * zhi) > Q->Ps || (int)ceilf(Q->PL * lzhi) > Q->Ps) { fprintf(stderr, "dino-train --ssl-batch: views must fit the source window\n"); return 2; }
     /* the SSL sampler: the sources at the SSL window, no labels drawn (views only) */
     dn_data *Ds = malloc(sizeof *Ds); *Ds = *Dd; Ds->P = Q->Ps; Ds->ngt = 64; Ds->nair = 0; Ds->nink = 0; Ds->uw = 0; Ds->ikp = 0; Ds->ident = 1;
     Ds->vP = Q->PG; Ds->vPL = Q->PL; Ds->vnloc = Q->NL; Ds->zlo = zlo; Ds->zhi = zhi; Ds->lzlo = lzlo; Ds->lzhi = lzhi;
-    Ds->share_u = atof(opt(argc, argv, "--ssl-unlabelled-share", "-1")); Ds->vovl = (float)atof(opt(argc, argv, "--ssl-overlap", "0.5")); Q->Ds = Ds; Ds->xprob = (float)atof(opt(argc, argv, "--ssl-xscan", "0"));
+    Ds->share_u = opt_atof("--ssl-unlabelled-share", opt(argc, argv, "--ssl-unlabelled-share", "-1")); Ds->vovl = (float)opt_atof("--ssl-overlap", opt(argc, argv, "--ssl-overlap", "0.5")); Q->Ds = Ds; Ds->xprob = (float)opt_atof("--ssl-xscan", opt(argc, argv, "--ssl-xscan", "0"));
     {   /* --ssl-weight-pow p: the SSL sampler draws sources by weight^p (1: by voxel weight; 0.5: flatter, the small scans seen more often) */
-        const double wp = atof(opt(argc, argv, "--ssl-weight-pow", "1"));
+        const double wp = opt_atof("--ssl-weight-pow", opt(argc, argv, "--ssl-weight-pow", "1"));
         if (wp != 1) { Ds->wsum = Ds->wsum_l = Ds->wsum_u = 0;
             for (int k = 0; k < Ds->nsrc; k++) { Ds->src[k].weight = pow(Ds->src[k].weight, wp); Ds->wsum += Ds->src[k].weight; if (Ds->src[k].ct_only) Ds->wsum_u += Ds->src[k].weight; else Ds->wsum_l += Ds->src[k].weight; }
             fprintf(stderr, "dino-train --ssl-weight-pow %g: SSL source weights flattened\n", wp); }
@@ -923,7 +924,7 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
     dn_ring *R = calloc(1, sizeof *R); R->D = Ds; R->seed = seed * 7 + 1234567; R->nthreads = 2; pthread_mutex_init(&R->mu, nullptr); pthread_cond_init(&R->cv, nullptr);
     R->nslots = 2 * Q->N + 4 < DN_SLOTS ? 2 * Q->N + 4 : DN_SLOTS; const size_t ps3 = (size_t)Q->Ps * Q->Ps * Q->Ps;
     for (int i = 0; i < R->nslots; i++) { dn_sample *S = &R->slot[i]; S->ca = malloc(ps3); S->cb = malloc(ps3); S->gidx = malloc(64 * 4); S->gcode = malloc(64 * 4); S->gxyz = malloc(64 * 12); S->sidx = malloc(4); S->ayx = malloc((size_t)Q->Ps * 8); S->ixyz = malloc(12); }
-    R->nworkers = atoi(opt(argc, argv, "--ssl-workers", "8")); if (R->nworkers > DN_MAXW) R->nworkers = DN_MAXW;
+    R->nworkers = opt_atoi("--ssl-workers", opt(argc, argv, "--ssl-workers", "8")); if (R->nworkers > DN_MAXW) R->nworkers = DN_MAXW;
     for (int i = 0; i < R->nworkers; i++) pthread_create(&R->th[i], nullptr, ring_worker, R);
     Q->R = R;
     /* nets: the globals' and the locals' sizes, the owner's weights (teacher: its EMA) */
@@ -936,31 +937,31 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
     Q->glzg = nn_malloc(g3 * CO * 4); nn_zero(Q->glzg, g3 * CO * 4); Q->glzl = nn_malloc(l3 * CO * 4); nn_zero(Q->glzl, l3 * CO * 4);
     Q->xfd = nn_malloc(sizeof(dr_xf) * NV); Q->itd = nn_malloc(sizeof(dr_int) * NV); Q->xfh = malloc(sizeof(dr_xf) * NV); Q->ith = malloc(sizeof(dr_int) * NV);
     Q->d_ayx = nn_malloc((size_t)N * Q->Ps * 8);
-    const int HH = atoi(opt(argc, argv, "--ssl-head-hidden", "2048")), HB = atoi(opt(argc, argv, "--ssl-head-bottleneck", "256"));
+    const int HH = opt_atoi("--ssl-head-hidden", opt(argc, argv, "--ssl-head-hidden", "2048")), HB = opt_atoi("--ssl-head-bottleneck", opt(argc, argv, "--ssl-head-bottleneck", "256"));
     dn_head_init(&Q->H, Q->CC, HH, HB, Q->K, 2 * N, seed * 59 + 3, 0); Q->H.train_g = 0;
     Q->tl = nn_malloc((size_t)2 * N * Q->K * 4); Q->tq = nn_malloc((size_t)2 * N * Q->K * 4); Q->sks = nn_malloc(dr_sk_scratch(2 * N, Q->K));
     Q->sl = nn_malloc((size_t)Q->K * 4); Q->dsl = nn_malloc((size_t)Q->K * 4); Q->ces = nn_malloc(dr_ce_scratch(1));
     Q->clsT = nn_malloc((size_t)2 * N * Q->CC * 4); Q->clsS = nn_malloc((size_t)Q->CC * 4); Q->dcls = nn_malloc((size_t)Q->CC * 4); Q->rsS = nn_malloc(16); Q->rsT = nn_malloc((size_t)2 * N * 4);
     Q->bank = nn_malloc((size_t)2 * N * Q->CC * 4); Q->bex = nn_malloc((size_t)N * Q->CC * 4); Q->outs = nn_malloc(16 * 4); Q->hout = malloc(16 * 4);
     Q->pS = nn_malloc(8); Q->pT = nn_malloc(8); Q->pW = nn_malloc(8); Q->use = calloc((size_t)Q->K, 1); Q->ar = seed * 977 + 31;
-    Q->easy = atoi(opt(argc, argv, "--ssl-easy-steps", "0")); Q->ccen = atoi(opt(argc, argv, "--ssl-cls-center", "0"));
-    Q->cmean = nn_malloc((size_t)Q->CC * 4); Q->hmean = malloc((size_t)Q->CC * 4); Q->cstd = atoi(opt(argc, argv, "--ssl-cls-std", "0"));
+    Q->easy = opt_atoi("--ssl-easy-steps", opt(argc, argv, "--ssl-easy-steps", "0")); Q->ccen = opt_atoi("--ssl-cls-center", opt(argc, argv, "--ssl-cls-center", "0"));
+    Q->cmean = nn_malloc((size_t)Q->CC * 4); Q->hmean = malloc((size_t)Q->CC * 4); Q->cstd = opt_atoi("--ssl-cls-std", opt(argc, argv, "--ssl-cls-std", "0"));
     Q->cistd = nn_malloc((size_t)Q->CC * 4); Q->histd = malloc((size_t)Q->CC * 4); Q->cpre = nn_malloc((size_t)Q->CC * 4);
-    Q->simg = (float)atof(opt(argc, argv, "--ssl-simdino", "0")); Q->sima = 256.f / (float)atof(opt(argc, argv, "--ssl-sim-eps2", "0.5"));
-    if (Q->simg > 0) { const int Bz = atoi(opt(argc, argv, "--ssl-head-bottleneck", "256")); Q->sima = (float)Bz / (float)atof(opt(argc, argv, "--ssl-sim-eps2", "0.5"));
+    Q->simg = (float)opt_atof("--ssl-simdino", opt(argc, argv, "--ssl-simdino", "0")); Q->sima = 256.f / (float)opt_atof("--ssl-sim-eps2", opt(argc, argv, "--ssl-sim-eps2", "0.5"));
+    if (Q->simg > 0) { const int Bz = opt_atoi("--ssl-head-bottleneck", opt(argc, argv, "--ssl-head-bottleneck", "256")); Q->sima = (float)Bz / (float)opt_atof("--ssl-sim-eps2", opt(argc, argv, "--ssl-sim-eps2", "0.5"));
         Q->zT = nn_malloc((size_t)2 * Q->N * Bz * 4); Q->zbank = malloc((size_t)2 * Q->N * Bz * 4); Q->dzh = malloc((size_t)Bz * 4); Q->zcur = malloc((size_t)Bz * 4); Q->zA = malloc((size_t)Bz * Bz * 8); }
-    Q->zv = (float)atof(opt(argc, argv, "--ssl-zvic-var", "0")); Q->zcv = (float)atof(opt(argc, argv, "--ssl-zvic-cov", "0"));
-    if (Q->zv > 0 || Q->zcv > 0) { const int Bz = atoi(opt(argc, argv, "--ssl-head-bottleneck", "256")); Q->zvb = malloc((size_t)2 * Q->N * Bz * 4); Q->zvh = malloc((size_t)Bz * 4); Q->zvd = nn_malloc((size_t)Bz * 4); Q->zcov = malloc((size_t)2 * Bz * Bz * 8);
+    Q->zv = (float)opt_atof("--ssl-zvic-var", opt(argc, argv, "--ssl-zvic-var", "0")); Q->zcv = (float)opt_atof("--ssl-zvic-cov", opt(argc, argv, "--ssl-zvic-cov", "0"));
+    if (Q->zv > 0 || Q->zcv > 0) { const int Bz = opt_atoi("--ssl-head-bottleneck", opt(argc, argv, "--ssl-head-bottleneck", "256")); Q->zvb = malloc((size_t)2 * Q->N * Bz * 4); Q->zvh = malloc((size_t)Bz * 4); Q->zvd = nn_malloc((size_t)Bz * 4); Q->zcov = malloc((size_t)2 * Bz * Bz * 8);
         Q->zmu = malloc((size_t)2 * Bz * 8); Q->zsd = malloc((size_t)2 * Bz * 8); }
-    Q->vramp = atoi(opt(argc, argv, "--ssl-vic-ramp", "0"));
-    Q->vv = (float)atof(opt(argc, argv, "--ssl-vic-var", "0")); Q->vc = (float)atof(opt(argc, argv, "--ssl-vic-cov", "0"));
+    Q->vramp = opt_atoi("--ssl-vic-ramp", opt(argc, argv, "--ssl-vic-ramp", "0"));
+    Q->vv = (float)opt_atof("--ssl-vic-var", opt(argc, argv, "--ssl-vic-var", "0")); Q->vc = (float)opt_atof("--ssl-vic-cov", opt(argc, argv, "--ssl-vic-cov", "0"));
     if (Q->vv > 0 || Q->vc > 0) { Q->vx = malloc((size_t)2 * Q->N * Q->CC * 4); Q->vg = malloc((size_t)Q->CC * 4); Q->vgd = nn_malloc((size_t)Q->CC * 4); Q->vcov = malloc((size_t)2 * Q->CC * Q->CC * 8);
         Q->vmu = malloc((size_t)2 * Q->CC * 8); Q->vsd = malloc((size_t)2 * Q->CC * 8); }
-    Q->cm = (float)atof(opt(argc, argv, "--ssl-center", "0")); Q->icm = (float)atof(opt(argc, argv, "--ssl-ibot-center", "0"));
+    Q->cm = (float)opt_atof("--ssl-center", opt(argc, argv, "--ssl-center", "0")); Q->icm = (float)opt_atof("--ssl-ibot-center", opt(argc, argv, "--ssl-ibot-center", "0"));
     Q->cen = nn_malloc((size_t)Q->K * 4); nn_zero(Q->cen, (size_t)Q->K * 4);
-    Q->wib = (float)atof(opt(argc, argv, "--ssl-ibot", "0")); Q->KI = atoi(opt(argc, argv, "--ssl-ibot-protos", "8192")); Q->IM = atoi(opt(argc, argv, "--ssl-ibot-max", "512"));
-    Q->ich = atoi(opt(argc, argv, "--ssl-ibot-ch", "0")); Q->TPS = 8; Q->GT_ = Q->PG / Q->TPS;
-    Q->itok = !strcmp(opt(argc, argv, "--ssl-ibot-src", "ch"), "tok"); Q->ICIN = 32; Q->ig = (float)atof(opt(argc, argv, "--ssl-ibot-g", "1"));
+    Q->wib = (float)opt_atof("--ssl-ibot", opt(argc, argv, "--ssl-ibot", "0")); Q->KI = opt_atoi("--ssl-ibot-protos", opt(argc, argv, "--ssl-ibot-protos", "8192")); Q->IM = opt_atoi("--ssl-ibot-max", opt(argc, argv, "--ssl-ibot-max", "512"));
+    Q->ich = opt_atoi("--ssl-ibot-ch", opt(argc, argv, "--ssl-ibot-ch", "0")); Q->TPS = 8; Q->GT_ = Q->PG / Q->TPS;
+    Q->itok = !strcmp(opt(argc, argv, "--ssl-ibot-src", "ch"), "tok"); Q->ICIN = 32; Q->ig = (float)opt_atof("--ssl-ibot-g", opt(argc, argv, "--ssl-ibot-g", "1"));
     if (Q->itok) {
         if (!cfg->attn_blocks) { fprintf(stderr, "dino-train --ssl-ibot-src tok: needs the attention stage\n"); return 2; }
         Q->TPS = 1 << (cfg->nlev - 1); Q->GT_ = Q->PG / Q->TPS; Q->ICIN = Q->C; Q->nregt = cfg->attn_reg;   /* one masked cell per bottleneck token; the head reads the C-wide token */
@@ -968,21 +969,21 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
     const char *dvck = opt(argc, argv, "--ssl-dv-teacher", nullptr); float *dvPh = nullptr;
     if (dvck) {
         if (Q->wib <= 0 || Q->PG % 16) { fprintf(stderr, "dino-train --ssl-dv-teacher: needs --ssl-ibot > 0 and --ssl-P a multiple of 16\n"); return 2; }
-        if (xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
-        xnet_set_budget((size_t)(atof(opt(argc, argv, "--ssl-dv-mem", "4")) * 1e9));
-        Q->dist = (float)atof(opt(argc, argv, "--ssl-distill", "0")); Q->dch = atoi(opt(argc, argv, "--ssl-distill-ch", "0"));
-        Q->drel = (float)atof(opt(argc, argv, "--ssl-distill-rel", "0")); Q->dabs = (float)atof(opt(argc, argv, "--ssl-distill-abs", "1"));
-        Q->dnce = (float)atof(opt(argc, argv, "--ssl-distill-nce", "0")); Q->dthr = (float)atof(opt(argc, argv, "--ssl-distill-thr", "0.5"));   /* (teacher-graph SupCon: positives = dinovol cos > thr) */
-        Q->dcc = (float)atof(opt(argc, argv, "--ssl-distill-cc", "0")); Q->dccmin = atoi(opt(argc, argv, "--ssl-distill-ccmin", "8"));
-        Q->dkm = atoi(opt(argc, argv, "--ssl-distill-kmeans", "0")); Q->dksplit = atoi(opt(argc, argv, "--ssl-distill-ksplit", "0"));   /* (labels = spherical k-means of the codes per view (K clusters), optionally split into spatial components) */   /* (pseudo sheet labels: connected components of the dinovol cosine graph -> GT SupCon) */
-        Q->dtau = (float)atof(opt(argc, argv, "--ssl-distill-tau", "0.1")); Q->dnm = atoi(opt(argc, argv, "--ssl-distill-m", "512"));
-        Q->dstr = atoi(opt(argc, argv, "--ssl-distill-stride", "0"));   /* 0: the iBOT rows (cross-view); S: dense, every S-th voxel per axis of each global (own crop) */   /* (relational: crop-local similarity matrices; abs: the per-point cosine) */
+        if (xnet_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
+        xnet_set_budget((size_t)(opt_atof("--ssl-dv-mem", opt(argc, argv, "--ssl-dv-mem", "4")) * 1e9));
+        Q->dist = (float)opt_atof("--ssl-distill", opt(argc, argv, "--ssl-distill", "0")); Q->dch = opt_atoi("--ssl-distill-ch", opt(argc, argv, "--ssl-distill-ch", "0"));
+        Q->drel = (float)opt_atof("--ssl-distill-rel", opt(argc, argv, "--ssl-distill-rel", "0")); Q->dabs = (float)opt_atof("--ssl-distill-abs", opt(argc, argv, "--ssl-distill-abs", "1"));
+        Q->dnce = (float)opt_atof("--ssl-distill-nce", opt(argc, argv, "--ssl-distill-nce", "0")); Q->dthr = (float)opt_atof("--ssl-distill-thr", opt(argc, argv, "--ssl-distill-thr", "0.5"));   /* (teacher-graph SupCon: positives = dinovol cos > thr) */
+        Q->dcc = (float)opt_atof("--ssl-distill-cc", opt(argc, argv, "--ssl-distill-cc", "0")); Q->dccmin = opt_atoi("--ssl-distill-ccmin", opt(argc, argv, "--ssl-distill-ccmin", "8"));
+        Q->dkm = opt_atoi("--ssl-distill-kmeans", opt(argc, argv, "--ssl-distill-kmeans", "0")); Q->dksplit = opt_atoi("--ssl-distill-ksplit", opt(argc, argv, "--ssl-distill-ksplit", "0"));   /* (labels = spherical k-means of the codes per view (K clusters), optionally split into spatial components) */   /* (pseudo sheet labels: connected components of the dinovol cosine graph -> GT SupCon) */
+        Q->dtau = (float)opt_atof("--ssl-distill-tau", opt(argc, argv, "--ssl-distill-tau", "0.1")); Q->dnm = opt_atoi("--ssl-distill-m", opt(argc, argv, "--ssl-distill-m", "512"));
+        Q->dstr = opt_atoi("--ssl-distill-stride", opt(argc, argv, "--ssl-distill-stride", "0"));   /* 0: the iBOT rows (cross-view); S: dense, every S-th voxel per axis of each global (own crop) */   /* (relational: crop-local similarity matrices; abs: the per-point cosine) */
         if (!(Q->dv = dv_load(dvck)) || (Q->dist <= 0 && dv_head_host(dvck, "ibot_head", &Q->DVH, &dvPh))) return 1;
         Q->icos = !strcmp(opt(argc, argv, "--ssl-ibot-loss", "ce"), "cos");   /* cos: regress dinovol's (unit) patch token directly, no prototypes */
         if (Q->dist > 0) { int ni; dv_dense_dims(Q->dv, &Q->dnd, &ni); Q->icos = 0;
             if (Q->dch + Q->dnd > CO) { fprintf(stderr, "dino-train --ssl-distill: head channels %d..%d of %d outputs (--dim %d)\n", Q->dch, Q->dch + Q->dnd - 1, CO, Q->dnd); return 2; } }
-        if (Q->dist <= 0 && !Q->icos && Q->DVH.B != atoi(opt(argc, argv, "--ssl-head-bottleneck", "256"))) { fprintf(stderr, "dino-train --ssl-dv-teacher: --ssl-head-bottleneck must be %d (dinovol's iBOT bottleneck)\n", Q->DVH.B); return 2; }
-        Q->dvuntil = atoi(opt(argc, argv, "--ssl-dv-until", "0"));
+        if (Q->dist <= 0 && !Q->icos && Q->DVH.B != opt_atoi("--ssl-head-bottleneck", opt(argc, argv, "--ssl-head-bottleneck", "256"))) { fprintf(stderr, "dino-train --ssl-dv-teacher: --ssl-head-bottleneck must be %d (dinovol's iBOT bottleneck)\n", Q->DVH.B); return 2; }
+        Q->dvuntil = opt_atoi("--ssl-dv-until", opt(argc, argv, "--ssl-dv-until", "0"));
         Q->dvm = calloc(Dd->nsrc, 8); Q->dvs = calloc(Dd->nsrc, 8); Q->dvh = calloc(Dd->nsrc, 8);
         Q->dvhist = calloc((size_t)Dd->nsrc * 256, sizeof *Q->dvhist);   /* dinovol's robust normalisation per source from the histogram of its windows so far */
     }
@@ -1000,14 +1001,14 @@ static int dn_ssl_init(dn_ssl *Q, unet *u, const unet_cfg *cfg, const dn_data *D
         Q->iid = nn_malloc((size_t)R * 4); { int *h = malloc((size_t)R * 4); for (int i = 0; i < R; i++) h[i] = i; nn_h2d(Q->iid, h, (size_t)R * 4); free(h); }
         Q->icen = nn_malloc((size_t)KI * 4); nn_zero(Q->icen, (size_t)KI * 4);
         Q->cellm = malloc((size_t)2 * N * Q->GT_ * Q->GT_ * Q->GT_); Q->d_mask = nn_malloc((size_t)Q->GT_ * Q->GT_ * Q->GT_);
-        Q->subps = atoi(opt(argc, argv, "--ssl-ibot-sub", "0"));   /* > 0: inside each masked cell only random sub-cells of this edge are masked */
+        Q->subps = opt_atoi("--ssl-ibot-sub", opt(argc, argv, "--ssl-ibot-sub", "0"));   /* > 0: inside each masked cell only random sub-cells of this edge are masked */
         sscanf(opt(argc, argv, "--ssl-ibot-sub-ratio", "0.3,0.5"), "%f,%f", &Q->subp0, &Q->subp1);
         if (Q->subps > 0) { if (Q->TPS % Q->subps || Q->PG % Q->subps) { fprintf(stderr, "dino-train --ssl-ibot-sub: a divisor of the cell edge %d\n", Q->TPS); return 2; }
             const size_t G2 = (size_t)Q->PG / Q->subps; Q->subm = malloc(G2 * G2 * G2); Q->d_subm = nn_malloc(G2 * G2 * G2); }
-        Q->pcen = atoi(opt(argc, argv, "--ssl-ibot-proto-center", "0"));   /* subtract the mean prototype after every prototype update (the shared-direction drift) */
-        Q->ilsc = atoi(opt(argc, argv, "--ssl-ibot-logit-scale", "0")); Q->lsc = 0.f;   /* a learnable student logit scale exp(lsc) (Adam, lr 1e-2) */
-        Q->sig = (float)atof(opt(argc, argv, "--ssl-sigreg", "0")); Q->sigS = atoi(opt(argc, argv, "--ssl-sigreg-slices", "256"));   /* SIGReg (LeJEPA) on the student's iBOT token bottleneck */
-        Q->izv = (float)atof(opt(argc, argv, "--ssl-ibot-zvar", "0"));   /* variance hinge on the student's unit token bottleneck: per-dim std over a view's rows >= 1 / sqrt(B) */
+        Q->pcen = opt_atoi("--ssl-ibot-proto-center", opt(argc, argv, "--ssl-ibot-proto-center", "0"));   /* subtract the mean prototype after every prototype update (the shared-direction drift) */
+        Q->ilsc = opt_atoi("--ssl-ibot-logit-scale", opt(argc, argv, "--ssl-ibot-logit-scale", "0")); Q->lsc = 0.f;   /* a learnable student logit scale exp(lsc) (Adam, lr 1e-2) */
+        Q->sig = (float)opt_atof("--ssl-sigreg", opt(argc, argv, "--ssl-sigreg", "0")); Q->sigS = opt_atoi("--ssl-sigreg-slices", opt(argc, argv, "--ssl-sigreg-slices", "256"));   /* SIGReg (LeJEPA) on the student's iBOT token bottleneck */
+        Q->izv = (float)opt_atof("--ssl-ibot-zvar", opt(argc, argv, "--ssl-ibot-zvar", "0"));   /* variance hinge on the student's unit token bottleneck: per-dim std over a view's rows >= 1 / sqrt(B) */
         Q->zvg = nn_malloc((size_t)IM * (HB > 1024 ? HB : 1024) * 4); Q->usei = calloc((size_t)KI, 1);
         if (Q->dv && Q->dist > 0) {   /* distillation buffers (our own EMA teacher keeps the iBOT targets) */
             int nd, ni; const int DC = dv_dense_dims(Q->dv, &nd, &ni);
@@ -1756,30 +1757,30 @@ static void dn_ssl_log(dn_ssl *Q, int step, char *line, size_t cap) {
 
 static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char **argv, int P, int steps0, double minutes, const char *outd, int nthreads, int nwork, uint64_t seed, int HZ) {
     if (!cfg->attn_blocks) { setenv("UFSM_VIRTUAL_TOKENS", "1", 1); fprintf(stderr, "dino-train --recipe: no attention stage (conv-only): zero CLS tokens (the CLS losses must be off)\n"); }
-    const int Ps = Dd->P, ED = atoi(opt(argc, argv, "--dim", "32")), CO = cfg->cout, nloc = atoi(opt(argc, argv, "--locals", "4")), PL = atoi(opt(argc, argv, "--local-P", "96"));
+    const int Ps = Dd->P, ED = opt_atoi("--dim", opt(argc, argv, "--dim", "32")), CO = cfg->cout, nloc = opt_atoi("--locals", opt(argc, argv, "--locals", "4")), PL = opt_atoi("--local-P", opt(argc, argv, "--local-P", "96"));
     float zlo = 0.7f, zhi = 1.4f, lzlo = 0.8f, lzhi = 1.25f;
     sscanf(opt(argc, argv, "--zoom", "0.7,1.4"), "%f,%f", &zlo, &zhi); sscanf(opt(argc, argv, "--local-zoom", "0.8,1.25"), "%f,%f", &lzlo, &lzhi);
     if ((int)ceilf(P * zhi) > Ps || (int)ceilf(PL * lzhi) > Ps || PL % (1 << (cfg->nlev - 1))) { fprintf(stderr, "dino-train --recipe: views (P %d x %.2f, local %d x %.2f) must fit the source %d; local P a multiple of %d\n", P, zhi, PL, lzhi, Ps, 1 << (cfg->nlev - 1)); return 2; }
-    const int K = atoi(opt(argc, argv, "--protos-k", "131072")), HH = atoi(opt(argc, argv, "--head-hidden", "2048")), HB = atoi(opt(argc, argv, "--head-bottleneck", "384"));
-    const int SQ = atoi(opt(argc, argv, "--sk-queue", "62")), KQ = atoi(opt(argc, argv, "--koleo-queue", "64")), sk_it = atoi(opt(argc, argv, "--sk-iters", "3"));
-    const float ts = (float)atof(opt(argc, argv, "--student-temp", "0.1")), tt0 = (float)atof(opt(argc, argv, "--teacher-temp0", "0.04")), tt1 = (float)atof(opt(argc, argv, "--teacher-temp", "0.07"));
-    const int tt_warm = atoi(opt(argc, argv, "--teacher-temp-warmup", "10000")), freeze = atoi(opt(argc, argv, "--freeze-last", "1250")), warm = atoi(opt(argc, argv, "--warmup", "500"));
-    const float wk = (float)atof(opt(argc, argv, "--koleo", "0.1")), wdino = (float)atof(opt(argc, argv, "--dino", "1")), wgt = (float)atof(opt(argc, argv, "--gt", "0.1"));
-    const float ema0 = (float)atof(opt(argc, argv, "--ema", "0.996")), ema1 = (float)atof(opt(argc, argv, "--ema-end", "0.999"));
-    const float lr0 = (float)atof(opt(argc, argv, "--lr", "1e-3")), mlr0 = (float)atof(opt(argc, argv, "--muon-lr", "0.02")), wd = (float)atof(opt(argc, argv, "--wd", "0.04")), clip = (float)atof(opt(argc, argv, "--clip", "3"));
-    const float hlr = (float)atof(opt(argc, argv, "--head-lr", "5e-4"));
+    const int K = opt_atoi("--protos-k", opt(argc, argv, "--protos-k", "131072")), HH = opt_atoi("--head-hidden", opt(argc, argv, "--head-hidden", "2048")), HB = opt_atoi("--head-bottleneck", opt(argc, argv, "--head-bottleneck", "384"));
+    const int SQ = opt_atoi("--sk-queue", opt(argc, argv, "--sk-queue", "62")), KQ = opt_atoi("--koleo-queue", opt(argc, argv, "--koleo-queue", "64")), sk_it = opt_atoi("--sk-iters", opt(argc, argv, "--sk-iters", "3"));
+    const float ts = (float)opt_atof("--student-temp", opt(argc, argv, "--student-temp", "0.1")), tt0 = (float)opt_atof("--teacher-temp0", opt(argc, argv, "--teacher-temp0", "0.04")), tt1 = (float)opt_atof("--teacher-temp", opt(argc, argv, "--teacher-temp", "0.07"));
+    const int tt_warm = opt_atoi("--teacher-temp-warmup", opt(argc, argv, "--teacher-temp-warmup", "10000")), freeze = opt_atoi("--freeze-last", opt(argc, argv, "--freeze-last", "1250")), warm = opt_atoi("--warmup", opt(argc, argv, "--warmup", "500"));
+    const float wk = (float)opt_atof("--koleo", opt(argc, argv, "--koleo", "0.1")), wdino = (float)opt_atof("--dino", opt(argc, argv, "--dino", "1")), wgt = (float)opt_atof("--gt", opt(argc, argv, "--gt", "0.1"));
+    const float ema0 = (float)opt_atof("--ema", opt(argc, argv, "--ema", "0.996")), ema1 = (float)opt_atof("--ema-end", opt(argc, argv, "--ema-end", "0.999"));
+    const float lr0 = (float)opt_atof("--lr", opt(argc, argv, "--lr", "1e-3")), mlr0 = (float)opt_atof("--muon-lr", opt(argc, argv, "--muon-lr", "0.02")), wd = (float)opt_atof("--wd", opt(argc, argv, "--wd", "0.04")), clip = (float)opt_atof("--clip", opt(argc, argv, "--clip", "3"));
+    const float hlr = (float)opt_atof("--head-lr", opt(argc, argv, "--head-lr", "5e-4"));
     /* the prototype layer's AdamW lr: upstream scales lr by batch / 256; at batch 1 (2 teacher rows) the head lr moved every prototype by a
        rank-1 sign step each step and the student logits collapsed (sd 0.05 -> 0.018 within 50 steps of the unfreeze): default head-lr / 128 */
-    const float plr = (float)atof(opt(argc, argv, "--proto-lr", "-1")) >= 0 ? (float)atof(opt(argc, argv, "--proto-lr", "-1")) : hlr / 128;
-    const float tau = (float)atof(opt(argc, argv, "--tau", "0.1")), hw = (float)atof(opt(argc, argv, "--hard-w", "4")), hr = (float)atof(opt(argc, argv, "--hard-r", "48"));
-    const float wvar = (float)atof(opt(argc, argv, "--var", "30")), vgam = 0.8f / sqrtf((float)ED);
-    const float noise = (float)atof(opt(argc, argv, "--noise", "0.15"));
+    const float plr = (float)opt_atof("--proto-lr", opt(argc, argv, "--proto-lr", "-1")) >= 0 ? (float)opt_atof("--proto-lr", opt(argc, argv, "--proto-lr", "-1")) : hlr / 128;
+    const float tau = (float)opt_atof("--tau", opt(argc, argv, "--tau", "0.1")), hw = (float)opt_atof("--hard-w", opt(argc, argv, "--hard-w", "4")), hr = (float)opt_atof("--hard-r", opt(argc, argv, "--hard-r", "48"));
+    const float wvar = (float)opt_atof("--var", opt(argc, argv, "--var", "30")), vgam = 0.8f / sqrtf((float)ED);
+    const float noise = (float)opt_atof("--noise", opt(argc, argv, "--noise", "0.15"));
     const int cls_reg = !strcmp(opt(argc, argv, "--cls", "pool"), "reg") ? 1 : !strcmp(opt(argc, argv, "--cls", "pool"), "both") ? 2 : 0;   /* (both: register | token mean, the SSL batch) */
     /* --cls-norm 1 (default): the CLS layer-normed (no affine) before the DINO head and KoLeo, as upstream's final LayerNorm. Raw, the pooled
        CLS grew from |4| to |400| and a shared direction dominated it (pairwise cosine 0.5-0.8 across samples): the head saw no differences */
-    const int cls_norm = atoi(opt(argc, argv, "--cls-norm", "1"));
+    const int cls_norm = opt_atoi("--cls-norm", opt(argc, argv, "--cls-norm", "1"));
     if (cls_reg && cfg->attn_reg < 1) { fprintf(stderr, "dino-train --recipe: --cls reg needs --attn-reg >= 1\n"); return 2; }
-    const int log_every = atoi(opt(argc, argv, "--log-every", "20")), save_every = atoi(opt(argc, argv, "--save-every", "2000")), eval_every = atoi(opt(argc, argv, "--eval-every", "2000"));
+    const int log_every = opt_atoi("--log-every", opt(argc, argv, "--log-every", "20")), save_every = opt_atoi("--save-every", opt(argc, argv, "--save-every", "2000")), eval_every = opt_atoi("--eval-every", opt(argc, argv, "--eval-every", "2000"));
     const int C = cfg->widths[cfg->nlev - 1];
     int steps = steps0;
     /* the locals' network: the same weights, its own buffers and gradient */
@@ -1788,36 +1789,36 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     /* iBOT (cross-view masked tokens): token cells of --ibot-patch voxels; a global view is masked with probability --mask-prob, ratio
        U(--mask-ratio); its masked tokens whose centre lies inside the other global view (at most --ibot-max) predict the teacher's iBOT
        targets at the same physical point in that view (dense embeddings sampled at the voxel, unit vectors -> iBOT head) */
-    const float wib = (float)atof(opt(argc, argv, "--ibot", "1")), pmask = (float)atof(opt(argc, argv, "--mask-prob", "0.5"));
+    const float wib = (float)opt_atof("--ibot", opt(argc, argv, "--ibot", "1")), pmask = (float)opt_atof("--mask-prob", opt(argc, argv, "--mask-prob", "0.5"));
     float mrlo = 0.1f, mrhi = 0.5f; sscanf(opt(argc, argv, "--mask-ratio", "0.1,0.5"), "%f,%f", &mrlo, &mrhi);
-    const int TPS = atoi(opt(argc, argv, "--ibot-patch", "8")), MI = atoi(opt(argc, argv, "--ibot-max", "1024")), KI = atoi(opt(argc, argv, "--ibot-k", opt(argc, argv, "--protos-k", "131072")));
-    const int IB = atoi(opt(argc, argv, "--ibot-bottleneck", "256")), GT = P / TPS;
+    const int TPS = opt_atoi("--ibot-patch", opt(argc, argv, "--ibot-patch", "8")), MI = opt_atoi("--ibot-max", opt(argc, argv, "--ibot-max", "1024")), KI = opt_atoi("--ibot-k", opt(argc, argv, "--ibot-k", opt(argc, argv, "--protos-k", "131072")));
+    const int IB = opt_atoi("--ibot-bottleneck", opt(argc, argv, "--ibot-bottleneck", "256")), GT = P / TPS;
     if (P % TPS) { fprintf(stderr, "dino-train --recipe: --ibot-patch must divide P\n"); return 2; }
     const int pmu = !strcmp(opt(argc, argv, "--proto-opt", "adamw"), "muon");
     /* teacher targets: Sinkhorn-Knopp needs rows >> prototypes; batch 1 has 2 CLS rows (+ the queue) against 8k-131k prototypes, where the
        equipartition flattens every row to ~uniform (H(t) = ln K in every Sinkhorn run). --dino-center M (default 0.9): DINOv1 centring for the
        CLS term (softmax((t - c) / tt), c an EMA of the teacher logits); 0: Sinkhorn over the queue. --ibot-center M: the same for iBOT (0: Sinkhorn) */
-    const float dcm = (float)atof(opt(argc, argv, "--dino-center", "0.9")), icm = (float)atof(opt(argc, argv, "--ibot-center", "0"));
-    at_set_mx(atoi(opt(argc, argv, "--linear-mx", "0")));   /* the attention stage's and the heads' linears: 0 fp32, 4 MX-fp4, 8 MX-fp8 */
+    const float dcm = (float)opt_atof("--dino-center", opt(argc, argv, "--dino-center", "0.9")), icm = (float)opt_atof("--ibot-center", opt(argc, argv, "--ibot-center", "0"));
+    at_set_mx(opt_atoi("--linear-mx", opt(argc, argv, "--linear-mx", "0")));   /* the attention stage's and the heads' linears: 0 fp32, 4 MX-fp4, 8 MX-fp8 */
     /* object / region terms (upstream ObjectLoss on our GT: winding codes = sheet objects): up to --objects codes present in both globals,
        --object-points points each; weights ramped over --object-ramp steps */
-    const float wobj = (float)atof(opt(argc, argv, "--object", "0.1")), wreg = (float)atof(opt(argc, argv, "--region", "0.1"));
-    const int NOB = atoi(opt(argc, argv, "--objects", "6")), NOP = atoi(opt(argc, argv, "--object-points", "48")), oramp = atoi(opt(argc, argv, "--object-ramp", "2000"));
+    const float wobj = (float)opt_atof("--object", opt(argc, argv, "--object", "0.1")), wreg = (float)opt_atof("--region", opt(argc, argv, "--region", "0.1"));
+    const int NOB = opt_atoi("--objects", opt(argc, argv, "--objects", "6")), NOP = opt_atoi("--object-points", opt(argc, argv, "--object-points", "48")), oramp = opt_atoi("--object-ramp", opt(argc, argv, "--object-ramp", "2000"));
     const int NOT0 = NOB * NOP;
     /* ink term (upstream: SupCon on a 32-d ink readout with two FIFO queues of 512): ink / no-ink labelled points (sources "ink") visible in both
        globals, at most 128 of each per step, through the ink head (Linear ED -> 384 -> GELU -> 32, unit) */
-    const float wink = (float)atof(opt(argc, argv, "--ink", "0.1")); const int NIK = wink > 0 ? 256 : 0, IQN = 512;
+    const float wink = (float)opt_atof("--ink", opt(argc, argv, "--ink", "0.1")); const int NIK = wink > 0 ? 256 : 0, IQN = 512;
     const int NOT = NOT0 + NIK;   /* (object points, then ink points: one gathered set) */
     /* dense supervised heads (channels ED..ED + 11; see dn_uw): --unwrap2 W (phase + normals / density x W, winding mod 4 x W x --wind4-lambda),
        --ink-prob W (BCE on the ink-splat probability); both ramp in linearly over --dense-ramp steps from --dense-from (default: the start /
        resume step) */
-    const float wuw = (float)atof(opt(argc, argv, "--unwrap2", "0")), wik = (float)atof(opt(argc, argv, "--ink-prob", "0")), w4l = (float)atof(opt(argc, argv, "--wind4-lambda", "0.5"));
-    const int dense_ramp = atoi(opt(argc, argv, "--dense-ramp", "1000"));
+    const float wuw = (float)opt_atof("--unwrap2", opt(argc, argv, "--unwrap2", "0")), wik = (float)opt_atof("--ink-prob", opt(argc, argv, "--ink-prob", "0")), w4l = (float)opt_atof("--wind4-lambda", opt(argc, argv, "--wind4-lambda", "0.5"));
+    const int dense_ramp = opt_atoi("--dense-ramp", opt(argc, argv, "--dense-ramp", "1000"));
     if ((wuw > 0 || wik > 0) && CO < ED + 12) { fprintf(stderr, "dino-train --recipe: --unwrap2 / --ink-prob need %d outputs (have %d)\n", ED + 12, CO); return 2; }
     dn_uw UW = {0};
-    UW.nstep = atoi(opt(argc, argv, "--normal-step", "1")); UW.dscale = (float)atof(opt(argc, argv, "--density-scale", "4")); UW.dcode = atoi(opt(argc, argv, "--density-code", "1"));
-    UW.pw = (float)atof(opt(argc, argv, "--packed-weight", "8")); UW.pum = (float)atof(opt(argc, argv, "--packed-um", "120"));
-    UW.ttau = (float)atof(opt(argc, argv, "--phase-trunc", "0")); UW.tkap = (float)atof(opt(argc, argv, "--phase-trunc-conf", "0.5")); const int trunc_from0 = atoi(opt(argc, argv, "--phase-trunc-from", "-1"));   /* (-1: 5000 steps after --dense-from, as train.c) */
+    UW.nstep = opt_atoi("--normal-step", opt(argc, argv, "--normal-step", "1")); UW.dscale = (float)opt_atof("--density-scale", opt(argc, argv, "--density-scale", "4")); UW.dcode = opt_atoi("--density-code", opt(argc, argv, "--density-code", "1"));
+    UW.pw = (float)opt_atof("--packed-weight", opt(argc, argv, "--packed-weight", "8")); UW.pum = (float)opt_atof("--packed-um", opt(argc, argv, "--packed-um", "120"));
+    UW.ttau = (float)opt_atof("--phase-trunc", opt(argc, argv, "--phase-trunc", "0")); UW.tkap = (float)opt_atof("--phase-trunc-conf", opt(argc, argv, "--phase-trunc-conf", "0.5")); const int trunc_from0 = opt_atoi("--phase-trunc-from", opt(argc, argv, "--phase-trunc-from", "-1"));   /* (-1: 5000 steps after --dense-from, as train.c) */
     uint8_t *d_pv = nullptr, *d_w4 = nullptr, *d_wc = nullptr, *d_ikt = nullptr, *d_ikm = nullptr;
     if (wuw > 0 || wik > 0) {
         const size_t sp = (size_t)HZ * P * P, gg = (size_t)P * P * P;
@@ -1834,15 +1835,15 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
        view a vs the EMA teacher's of view b, negatives a FIFO of --moco-queue teacher keys of earlier samples; locals vs both globals);
        --dnce W the dense cross-view term (DenseCL / PixPro style, iBOT's masking and correspondences: each masked student token's positive
        is the teacher feature at the same physical point of the other view, negatives the view's other points + a FIFO of --dnce-queue keys) */
-    const float wmo = (float)atof(opt(argc, argv, "--moco", "0")), wdn = (float)atof(opt(argc, argv, "--dnce", "0"));
-    const float mtau = (float)atof(opt(argc, argv, "--moco-tau", "0.2")), dtau = (float)atof(opt(argc, argv, "--dnce-tau", "0.2"));
-    const int MQN = atoi(opt(argc, argv, "--moco-queue", "16384")), DQN = atoi(opt(argc, argv, "--dnce-queue", "16384")), tokp = wib > 0 || wdn > 0;
+    const float wmo = (float)opt_atof("--moco", opt(argc, argv, "--moco", "0")), wdn = (float)opt_atof("--dnce", opt(argc, argv, "--dnce", "0"));
+    const float mtau = (float)opt_atof("--moco-tau", opt(argc, argv, "--moco-tau", "0.2")), dtau = (float)opt_atof("--dnce-tau", opt(argc, argv, "--dnce-tau", "0.2"));
+    const int MQN = opt_atoi("--moco-queue", opt(argc, argv, "--moco-queue", "16384")), DQN = opt_atoi("--dnce-queue", opt(argc, argv, "--dnce-queue", "16384")), tokp = wib > 0 || wdn > 0;
     dr_mlp2 MP, DP; dr_mlp2_layout(&MP, C, 2048, 256); dr_mlp2_layout(&DP, ED, 512, 128);
     /* --tnce W: dense cross-view InfoNCE on the trunk's attention-stage grid tokens (not the sheet-identity embedding, whose points are
        interchangeable across windows): up to --tnce-max student token cells of a global view, each positive the teacher token at the same
        physical point of the other global (nearest cell), negatives a FIFO of --tnce-queue teacher token keys of earlier samples */
-    const float wtn = (float)atof(opt(argc, argv, "--tnce", "0")), ttau = (float)atof(opt(argc, argv, "--tnce-tau", "0.2"));
-    const int TQN = atoi(opt(argc, argv, "--tnce-queue", "16384")), TNM = atoi(opt(argc, argv, "--tnce-max", "256"));
+    const float wtn = (float)opt_atof("--tnce", opt(argc, argv, "--tnce", "0")), ttau = (float)opt_atof("--tnce-tau", opt(argc, argv, "--tnce-tau", "0.2"));
+    const int TQN = opt_atoi("--tnce-queue", opt(argc, argv, "--tnce-queue", "16384")), TNM = opt_atoi("--tnce-max", opt(argc, argv, "--tnce-max", "256"));
     dr_mlp2 TPH; dr_mlp2_layout(&TPH, C, 512, 128);
     float *tp = nullptr, *tpt = nullptr, *tg_ = nullptr, *tm_ = nullptr, *tv_ = nullptr, *tmo = nullptr, *tkb = nullptr, *tqv = nullptr, *tgq = nullptr, *tA = nullptr, *tB = nullptr, *tdA = nullptr, *ttok[2] = {nullptr, nullptr};
     void *tws = nullptr, *twt = nullptr, *tsc = nullptr; int *tiS = nullptr, *tiT = nullptr, tqf = 0, tqp = 0; size_t ttokn = 0;
@@ -1914,14 +1915,14 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     /* batch-1 remedies for the DINO head: --head-accum N sums its gradient over N steps (one update per N: the large diverse batch upstream
        averages over; the teacher EMA every step); --zcenter M subtracts an EMA (momentum M, from the teacher rows) of the head output z
        before its normalisation and the prototypes (the shared direction that made the prototype updates coherent) */
-    const int hacc = atoi(opt(argc, argv, "--head-accum", "1")) > 0 ? atoi(opt(argc, argv, "--head-accum", "1")) : 1;
-    const float zcm = (float)atof(opt(argc, argv, "--zcenter", "0"));
+    const int hacc = opt_atoi("--head-accum", opt(argc, argv, "--head-accum", "1")) > 0 ? opt_atoi("--head-accum", opt(argc, argv, "--head-accum", "1")) : 1;
+    const float zcm = (float)opt_atof("--zcenter", opt(argc, argv, "--zcenter", "0"));
     float *zcen = nullptr; if (zcm > 0) { zcen = nn_malloc((size_t)HB * 4); nn_zero(zcen, (size_t)HB * 4); D.w.zc = zcen; }
     /* device buffers */
     const size_t ps3 = (size_t)Ps * Ps * Ps, g3 = (size_t)P * P * P, l3 = (size_t)PL * PL * PL;
     /* inputs per view: CT, then with --axis-input (cin 5) train's radial unit vector (3) and a validity channel (dr_axis_view); the axis
        is dropped (valid 0) for a view with probability --axis-drop, and missing for sources without "axis" */
-    const int CIN = cfg->cin; const float adrop = (float)atof(opt(argc, argv, "--axis-drop", "0.15"));
+    const int CIN = cfg->cin; const float adrop = (float)opt_atof("--axis-drop", opt(argc, argv, "--axis-drop", "0.15"));
     if (CIN != 1 && CIN != 2 && CIN != 5) { fprintf(stderr, "dino-train --recipe: inputs 1 (CT), 2 (--mask-input) or 5 (--axis-input: CT, radial, valid)\n"); return 2; }
     uint8_t *src = nn_malloc(ps3); float *xg = nn_malloc(2 * (size_t)CIN * g3 * 4), *xl = nn_malloc((size_t)(nloc > 0 ? nloc : 1) * CIN * l3 * 4), *d_ayx = nn_malloc((size_t)Ps * 8);
     dr_xf *xfd = nn_malloc(sizeof(dr_xf) * (2 + nloc)); dr_int *itd = nn_malloc(sizeof(dr_int) * (2 + nloc));
@@ -1995,7 +1996,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     unet_build(u, xsg, 1); unet_build(ul, xsl, 1);
     /* data ring (sources at the source window, identity geometry) */
     dn_ring *Rg = calloc(1, sizeof *Rg); Rg->D = Dd; Rg->seed = seed; Rg->nthreads = nthreads; pthread_mutex_init(&Rg->mu, nullptr); pthread_cond_init(&Rg->cv, nullptr);
-    Rg->nslots = atoi(opt(argc, argv, "--slots", "6")); if (Rg->nslots < 2) Rg->nslots = 2; if (Rg->nslots > DN_SLOTS) Rg->nslots = DN_SLOTS;
+    Rg->nslots = opt_atoi("--slots", opt(argc, argv, "--slots", "6")); if (Rg->nslots < 2) Rg->nslots = 2; if (Rg->nslots > DN_SLOTS) Rg->nslots = DN_SLOTS;
     for (int i = 0; i < Rg->nslots; i++) { dn_sample *S = &Rg->slot[i]; S->ca = malloc(ps3); S->cb = malloc(ps3); S->gidx = malloc((size_t)NG * 4); S->gcode = malloc((size_t)NG * 4); S->gxyz = malloc((size_t)NG * 12); S->sidx = malloc(4); S->ayx = malloc((size_t)Ps * 8); S->ixyz = malloc((size_t)(Dd->nink > 0 ? Dd->nink : 1) * 12);
         if (Dd->uw) { S->phw = malloc(ps3); for (int v = 0; v < 2; v++) { S->pv[v] = malloc(g3); S->w4[v] = malloc(g3); S->wc[v] = malloc(g3); } }
         if (Dd->ikp) { S->ikw = malloc(ps3); for (int v = 0; v < 2; v++) { S->iv[v] = malloc(g3); S->im[v] = malloc(g3); } }
@@ -2003,7 +2004,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     Dd->vP = P; Dd->vPL = PL; Dd->vnloc = nloc; Dd->zlo = zlo; Dd->zhi = zhi; Dd->lzlo = lzlo; Dd->lzhi = lzhi;   /* the views: drawn by the workers */
     Rg->nworkers = nwork > DN_MAXW ? DN_MAXW : nwork;
     for (int i = 0; i < Rg->nworkers; i++) pthread_create(&Rg->th[i], nullptr, ring_worker, Rg);
-    const int SB = atoi(opt(argc, argv, "--ssl-batch", "0")), sse = atoi(opt(argc, argv, "--ssl-every", "1")) > 0 ? atoi(opt(argc, argv, "--ssl-every", "1")) : 1;
+    const int SB = opt_atoi("--ssl-batch", opt(argc, argv, "--ssl-batch", "0")), sse = opt_atoi("--ssl-every", opt(argc, argv, "--ssl-every", "1")) > 0 ? opt_atoi("--ssl-every", opt(argc, argv, "--ssl-every", "1")) : 1;
     dn_ssl SS; if (SB > 0 && dn_ssl_init(&SS, u, cfg, Dd, argc, argv, seed, C, cls_reg, cls_norm, noise)) return 2;
     if (SB > 0 && opt(argc, argv, "--resume", nullptr)) { char rr[4096]; const char *rq = realpath(opt(argc, argv, "--resume", ""), rr) ? rr : opt(argc, argv, "--resume", ""); dn_ssl_io(&SS, rq, 0); }
     signal(SIGTERM, dn_sig); signal(SIGINT, dn_sig);
@@ -2015,7 +2016,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
     float *dcen = nn_malloc((size_t)K * 4), *icen = nn_malloc((size_t)KI * 4); nn_zero(dcen, (size_t)K * 4); nn_zero(icen, (size_t)KI * 4);   /* (centres: zero at start / resume) */
     double sums[20] = {0}; int nsum = 0; double t_last = dn_now(), t_loop = dn_now(), t_meas0 = 0;
     double dsum[5] = {0}; int dn_nuw = 0, dn_nik = 0;
-    double *dsrc = calloc((size_t)DN_MAXSRC * 4, sizeof(double));   /* per source: unwrap2 views, normals bce, winding mod 4 bce, its accuracy (the log's "by source") */ const int dense_from = atoi(opt(argc, argv, "--dense-from", "-1")) >= 0 ? atoi(opt(argc, argv, "--dense-from", "-1")) : step0;
+    double *dsrc = calloc((size_t)DN_MAXSRC * 4, sizeof(double));   /* per source: unwrap2 views, normals bce, winding mod 4 bce, its accuracy (the log's "by source") */ const int dense_from = opt_atoi("--dense-from", opt(argc, argv, "--dense-from", "-1")) >= 0 ? opt_atoi("--dense-from", opt(argc, argv, "--dense-from", "-1")) : step0;
     const int trunc_from = trunc_from0 >= 0 ? trunc_from0 : dense_from + 5000;
     char stopf[1200]; snprintf(stopf, sizeof stopf, "%s/STOP", outd);
     const float gs = nn_get_grad_scale();
@@ -2452,7 +2453,7 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
             const double now = dn_now(), dt = (now - t_last) / nsum;
             char line[6144];
             /* prototype usage: distinct teacher-argmax prototypes since the last reset (every --usage-window steps; DINO sees 2 rows per step) */
-            const int uwin = atoi(opt(argc, argv, "--usage-window", "5000")), rst = uwin > 0 && step % uwin < log_every;
+            const int uwin = opt_atoi("--usage-window", opt(argc, argv, "--usage-window", "5000")), rst = uwin > 0 && step % uwin < log_every;
             int ud = 0, ui = 0; for (int k = 0; k < K; k++) { ud += useb[k]; if (rst) useb[k] = 0; } for (int k = 0; k < KI && wib > 0; k++) { ui += useib[k]; if (rst) useib[k] = 0; }
             snprintf(line, sizeof line, "step %d dino %.4f ibot %.4f (%.0f tokens) obj %.4f region %.4f ink %.4f koleo %.4f gt %.4f var %.4f | H(t) %.2f H(mean) %.2f (max %.2f) H(ibot t) %.2f (max %.2f) | protos used %d / %d, ibot %d / %d | tt %.3f ema %.5f | gnorm %.3f | %.0f ms/step %.1f Mvox/s",
                      step, sums[0] / nsum, sums[5] / nsum, sums[6] / nsum, sums[7] / nsum, sums[8] / nsum, sums[9] / nsum, sums[1] / nsum, sums[2] / nsum, sums[3] / nsum, Hr, Hm, log((double)K), Hi, log((double)KI), ud, K, ui, KI, tt, mom, sums[4] / nsum, dt * 1e3, (double)(2 * g3 + nloc * l3) / dt / 1e6);
@@ -2491,9 +2492,9 @@ static int dn_recipe(unet *u, const unet_cfg *cfg, dn_data *Dd, int argc, char *
                       }
                       fclose(hf); }
             char lp[1200]; snprintf(lp, sizeof lp, "%s/last.ckpt", outd);
-            { char prev[1300]; const ssize_t pl = readlink(lp, prev, sizeof prev - 1); const int keep = atoi(opt(argc, argv, "--keep-every", "0"));   /* rotation: the previous checkpoint goes unless a milestone */
+            { char prev[1300]; const ssize_t pl = readlink(lp, prev, sizeof prev - 1); const int keep = opt_atoi("--keep-every", opt(argc, argv, "--keep-every", "0"));   /* rotation: the previous checkpoint goes unless a milestone */
               if (pl > 0 && keep > 0) { prev[pl] = 0; int ps_ = 0; if (sscanf(prev, "step%d.ckpt", &ps_) == 1 && ps_ != step && ps_ % keep) { char a1[2600], a2[2600], a3[2600]; snprintf(a1, sizeof a1, "%s/%s", outd, prev); snprintf(a2, sizeof a2, "%s.heads", a1); snprintf(a3, sizeof a3, "%s.protos", a1); unlink(a1); unlink(a2); unlink(a3); snprintf(a3, sizeof a3, "%s.ssl", a1); unlink(a3); } } }
-            unlink(lp); if (symlink(cp + strlen(outd) + 1, lp)) {}
+            unlink(lp); if (symlink(cp + strlen(outd) + 1, lp)) fprintf(stderr, "dino: last.ckpt -> %s: %s (a resume would start elsewhere)\n", cp, strerror(errno));   /* (was ignored; audit mini/errpaths 8) */
             if (SB > 0) dn_ssl_io(&SS, cp, 1);
         }
         if (opt(argc, argv, "--eval", nullptr) && (step % eval_every == 0 || step == steps)) { dn_run_eval(u, argc, argv, step, P, ED, nthreads, 0, 0.f, outd, lf); t_last = dn_now(); }
@@ -2521,52 +2522,52 @@ int cmd_dino_train(int argc, char **argv) {
                         "  labelled voxels (primary) + DINO prototype cross-view term on papyrus voxels (EMA teacher on the other view). STOP file in --out stops.\n");
         return 2;
     }
-    const int P = atoi(opt(argc, argv, "--P", "256")), fp32 = !atoi(opt(argc, argv, "--mx", "1")); int steps = atoi(opt(argc, argv, "--steps", "20000"));
-    const double minutes = atof(opt(argc, argv, "--minutes", "0"));   /* > 0: a wall-time budget; the step count follows from the speed of steps 21..200 */
-    const float lr0 = (float)atof(opt(argc, argv, "--lr", "1e-3")), mlr0 = (float)atof(opt(argc, argv, "--muon-lr", "0.02")), wd = (float)atof(opt(argc, argv, "--wd", "0.01"));
-    const float ema = (float)atof(opt(argc, argv, "--ema", "0.996")), clip = (float)atof(opt(argc, argv, "--clip", "5"));
-    const int warm = atoi(opt(argc, argv, "--warmup", "500"));
-    const float tau = (float)atof(opt(argc, argv, "--tau", "0.1")), hw = (float)atof(opt(argc, argv, "--hard-w", "4")), hr = (float)atof(opt(argc, argv, "--hard-r", "48"));
-    const float wssl = (float)atof(opt(argc, argv, "--ssl", "0.3")), ts = (float)atof(opt(argc, argv, "--ts", "0.1")), tt = (float)atof(opt(argc, argv, "--tt", "0.04"));
-    const float cm = (float)atof(opt(argc, argv, "--center-m", "0.9")), noise = (float)atof(opt(argc, argv, "--noise", "0.15")), gj = (float)atof(opt(argc, argv, "--gain-jit", "0.15"));
-    const float wgt = (float)atof(opt(argc, argv, "--gt", "1"));   /* the GT contrastive term's weight */
-    const int use_teacher = atoi(opt(argc, argv, "--teacher", "1"));   /* 0: no EMA teacher forward (debug; GT term over the student points only) */
-    const int ED = atoi(opt(argc, argv, "--dim", "32"));   /* embedding channels (16 or 32) */
-    if (ED != 16 && ED != 32 && !(ED == 64 && atof(opt(argc, argv, "--ssl-distill", "0")) > 0)) { fprintf(stderr, "dino-train: --dim 16 or 32 (64 with --ssl-distill)\n"); return 2; }
-    const float wvar = (float)atof(opt(argc, argv, "--var", "30")), vgam = (float)atof(opt(argc, argv, "--var-gamma", "0")) > 0 ? (float)atof(opt(argc, argv, "--var-gamma", "0")) : 0.8f / sqrtf((float)ED);
-    const float mfrac = (float)atof(opt(argc, argv, "--mask-frac", "0")); const int mcube = atoi(opt(argc, argv, "--mask-cube", "16"));
-    const int K = atoi(opt(argc, argv, "--protos", "1024")), log_every = atoi(opt(argc, argv, "--log-every", "20")), save_every = atoi(opt(argc, argv, "--save-every", "2000"));
-    const int eval_every = atoi(opt(argc, argv, "--eval-every", "2000")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 4), nwork = atoi(opt(argc, argv, "--workers", "4"));
+    const int P = opt_atoi("--P", opt(argc, argv, "--P", "256")), fp32 = !opt_atoi("--mx", opt(argc, argv, "--mx", "1")); int steps = opt_atoi("--steps", opt(argc, argv, "--steps", "20000"));
+    const double minutes = opt_atof("--minutes", opt(argc, argv, "--minutes", "0"));   /* > 0: a wall-time budget; the step count follows from the speed of steps 21..200 */
+    const float lr0 = (float)opt_atof("--lr", opt(argc, argv, "--lr", "1e-3")), mlr0 = (float)opt_atof("--muon-lr", opt(argc, argv, "--muon-lr", "0.02")), wd = (float)opt_atof("--wd", opt(argc, argv, "--wd", "0.01"));
+    const float ema = (float)opt_atof("--ema", opt(argc, argv, "--ema", "0.996")), clip = (float)opt_atof("--clip", opt(argc, argv, "--clip", "5"));
+    const int warm = opt_atoi("--warmup", opt(argc, argv, "--warmup", "500"));
+    const float tau = (float)opt_atof("--tau", opt(argc, argv, "--tau", "0.1")), hw = (float)opt_atof("--hard-w", opt(argc, argv, "--hard-w", "4")), hr = (float)opt_atof("--hard-r", opt(argc, argv, "--hard-r", "48"));
+    const float wssl = (float)opt_atof("--ssl", opt(argc, argv, "--ssl", "0.3")), ts = (float)opt_atof("--ts", opt(argc, argv, "--ts", "0.1")), tt = (float)opt_atof("--tt", opt(argc, argv, "--tt", "0.04"));
+    const float cm = (float)opt_atof("--center-m", opt(argc, argv, "--center-m", "0.9")), noise = (float)opt_atof("--noise", opt(argc, argv, "--noise", "0.15")), gj = (float)opt_atof("--gain-jit", opt(argc, argv, "--gain-jit", "0.15"));
+    const float wgt = (float)opt_atof("--gt", opt(argc, argv, "--gt", "1"));   /* the GT contrastive term's weight */
+    const int use_teacher = opt_atoi("--teacher", opt(argc, argv, "--teacher", "1"));   /* 0: no EMA teacher forward (debug; GT term over the student points only) */
+    const int ED = opt_atoi("--dim", opt(argc, argv, "--dim", "32"));   /* embedding channels (16 or 32) */
+    if (ED != 16 && ED != 32 && !(ED == 64 && opt_atof("--ssl-distill", opt(argc, argv, "--ssl-distill", "0")) > 0)) { fprintf(stderr, "dino-train: --dim 16 or 32 (64 with --ssl-distill)\n"); return 2; }
+    const float wvar = (float)opt_atof("--var", opt(argc, argv, "--var", "30")), vgam = (float)opt_atof("--var-gamma", opt(argc, argv, "--var-gamma", "0")) > 0 ? (float)opt_atof("--var-gamma", opt(argc, argv, "--var-gamma", "0")) : 0.8f / sqrtf((float)ED);
+    const float mfrac = (float)opt_atof("--mask-frac", opt(argc, argv, "--mask-frac", "0")); const int mcube = opt_atoi("--mask-cube", opt(argc, argv, "--mask-cube", "16"));
+    const int K = opt_atoi("--protos", opt(argc, argv, "--protos", "1024")), log_every = opt_atoi("--log-every", opt(argc, argv, "--log-every", "20")), save_every = opt_atoi("--save-every", opt(argc, argv, "--save-every", "2000"));
+    const int eval_every = opt_atoi("--eval-every", opt(argc, argv, "--eval-every", "2000")), nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 4), nwork = opt_atoi("--workers", opt(argc, argv, "--workers", "4"));
     const uint64_t seed = strtoull(opt(argc, argv, "--seed", "1"), nullptr, 10);
-    dn_data *Dd = calloc(1, sizeof *Dd); Dd->P = P; Dd->ngt = atoi(opt(argc, argv, "--gt-points", "2048")); Dd->nssl = atoi(opt(argc, argv, "--ssl-points", "2048")); Dd->margin = 8; Dd->nair = atoi(opt(argc, argv, "--air-points", "0")); Dd->gtpap = atoi(opt(argc, argv, "--gt-papyrus", "0"));   /* the sources' default "gt_papyrus" */
+    dn_data *Dd = calloc(1, sizeof *Dd); Dd->P = P; Dd->ngt = opt_atoi("--gt-points", opt(argc, argv, "--gt-points", "2048")); Dd->nssl = opt_atoi("--ssl-points", opt(argc, argv, "--ssl-points", "2048")); Dd->margin = 8; Dd->nair = opt_atoi("--air-points", opt(argc, argv, "--air-points", "0")); Dd->gtpap = opt_atoi("--gt-papyrus", opt(argc, argv, "--gt-papyrus", "0"));   /* the sources' default "gt_papyrus" */
     { char *t = strdup(opt(argc, argv, "--exclude-src", "")); for (char *q = strtok(t, ","); q && Dd->nexcl < 8; q = strtok(nullptr, ",")) snprintf(Dd->excl[Dd->nexcl++], 64, "%s", q); free(t); }
-    Dd->share_u = atof(opt(argc, argv, "--unlabelled-share", "-1"));   /* the ct_only sources' share of the draws (< 0: by weight over all; 0: none) */
-    const int recipe = atoi(opt(argc, argv, "--recipe", "0"));   /* the upstream dinovol recipe (dn_recipe): the sampler reads source windows */
-    if (recipe) { Dd->P = atoi(opt(argc, argv, "--source-P", "384")); Dd->ident = 1; Dd->nssl = 0; Dd->nink = atof(opt(argc, argv, "--ink", "0.1")) > 0 ? atoi(opt(argc, argv, "--ink-points", "512")) : 0; }
+    Dd->share_u = opt_atof("--unlabelled-share", opt(argc, argv, "--unlabelled-share", "-1"));   /* the ct_only sources' share of the draws (< 0: by weight over all; 0: none) */
+    const int recipe = opt_atoi("--recipe", opt(argc, argv, "--recipe", "0"));   /* the upstream dinovol recipe (dn_recipe): the sampler reads source windows */
+    if (recipe) { Dd->P = opt_atoi("--source-P", opt(argc, argv, "--source-P", "384")); Dd->ident = 1; Dd->nssl = 0; Dd->nink = opt_atof("--ink", opt(argc, argv, "--ink", "0.1")) > 0 ? opt_atoi("--ink-points", opt(argc, argv, "--ink-points", "512")) : 0; }
     if (mkdir(outd, 0755) && errno != EEXIST) { fprintf(stderr, "dino-train: cannot create %s\n", outd); return 1; }
     dn_precision(fp32);
-    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
+    if (nn_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
     dn_precision_after_init(fp32);
     /* the fp16 gradient scale (train's --gscale, default 1024): the backward keeps activation / logit gradients scaled by it and divides the
        parameter gradients back. Unset it was 1, and the dense heads' per-voxel loss gradients (~1e-9 on a densely labelled Paris 4 window)
        underflowed fp16 to exactly zero: those heads never learned there */
-    if (!fp32) nn_set_grad_scale((float)atof(opt(argc, argv, "--gscale", "1024")));
+    if (!fp32) nn_set_grad_scale((float)opt_atof("--gscale", opt(argc, argv, "--gscale", "1024")));
     if (load_sources(srcf, Dd, nthreads)) return 1;
-    const int axis_in = atoi(opt(argc, argv, "--axis-input", "0")); const float ars = (float)atof(opt(argc, argv, "--axis-rs", "0.001"));   /* the axis-distance channel and its scale */
+    const int axis_in = opt_atoi("--axis-input", opt(argc, argv, "--axis-input", "0")); const float ars = (float)opt_atof("--axis-rs", opt(argc, argv, "--axis-rs", "0.001"));   /* the axis-distance channel and its scale */
     if (axis_in && !recipe) for (int i = 0; i < Dd->nsrc; i++) if (!Dd->src[i].axz) { fprintf(stderr, "dino-train: --axis-input needs \"axis\" in every source (%s)\n", Dd->src[i].name); return 2; }
     unet_cfg cfg = {0}; cfg.cin = axis_in ? (recipe ? 5 : 2) : 1; cfg.cout = ED; cfg.G = 8;
-    if (recipe && atoi(opt(argc, argv, "--mask-input", "0"))) {   /* a mask channel (iBOT: masked cells CT 0 and mask 1; 0 elsewhere) */
+    if (recipe && opt_atoi("--mask-input", opt(argc, argv, "--mask-input", "0"))) {   /* a mask channel (iBOT: masked cells CT 0 and mask 1; 0 elsewhere) */
         if (axis_in) { fprintf(stderr, "dino-train: --mask-input with --axis-input is not supported\n"); return 2; }
         cfg.cin = 2;
     }   /* (the recipe: CT, train's radial (3), valid; else CT, axis distance) */
-    if (recipe && (atof(opt(argc, argv, "--unwrap2", "0")) > 0 || atof(opt(argc, argv, "--ink-prob", "0")) > 0)) {   /* dense heads after the embedding (dn_uw) */
+    if (recipe && (opt_atof("--unwrap2", opt(argc, argv, "--unwrap2", "0")) > 0 || opt_atof("--ink-prob", opt(argc, argv, "--ink-prob", "0")) > 0)) {   /* dense heads after the embedding (dn_uw) */
         if (ED != 32) { fprintf(stderr, "dino-train --recipe: the dense heads need --dim 32\n"); return 2; }
         cfg.cout = (ED + 12 + 15) / 16 * 16;
     } cfg.down_norm = fp32 ? 0 : 1;
     { char *t = strdup(opt(argc, argv, "--widths", "16,32,64,96,128,192")); for (char *q = strtok(t, ","); q && cfg.nlev < UNET_MAXLEV; q = strtok(nullptr, ",")) cfg.widths[cfg.nlev++] = atoi(q); free(t); }
     if (P % (1 << (cfg.nlev - 1))) { fprintf(stderr, "dino-train: P must be a multiple of %d\n", 1 << (cfg.nlev - 1)); return 2; }
     {   /* the bottleneck transformer stage (src/attn.h) */
-        cfg.attn_blocks = atoi(opt(argc, argv, "--attn-blocks", "0")); cfg.attn_reg = atoi(opt(argc, argv, "--attn-reg", "0")); cfg.attn_mlp = atoi(opt(argc, argv, "--attn-mlp", "0")); cfg.attn_vres = atoi(opt(argc, argv, "--attn-vres", "0"));
+        cfg.attn_blocks = opt_atoi("--attn-blocks", opt(argc, argv, "--attn-blocks", "0")); cfg.attn_reg = opt_atoi("--attn-reg", opt(argc, argv, "--attn-reg", "0")); cfg.attn_mlp = opt_atoi("--attn-mlp", opt(argc, argv, "--attn-mlp", "0")); cfg.attn_vres = opt_atoi("--attn-vres", opt(argc, argv, "--attn-vres", "0"));
         const char *pe = opt(argc, argv, "--attn-pe", "peg");
         cfg.attn_pe = !strcmp(pe, "peg") ? 0 : !strcmp(pe, "rope") ? 1 : !strcmp(pe, "none") ? 2 : -1;
         if (cfg.attn_pe < 0) { fprintf(stderr, "dino-train: --attn-pe peg|rope|none\n"); return 2; }
@@ -2575,15 +2576,15 @@ int cmd_dino_train(int argc, char **argv) {
     /* the attention stage's core: 0 fp32 CUDA cores, 1 fp16 tensor cores, 2 MX-fp8 tensor cores (absent: env UFSM_ATTN_CORE, else 1);
        --attn-keep 1: each block's training forward kept for its backward (no recompute: about 6% faster with 6 blocks at 4096 tokens, + the blocks' forward tensors, ~65 MB per block at
        C 288 x 4097 tokens; absent: env UFSM_ATTN_KEEP, else 0) */
-    if (opt(argc, argv, "--attn-core", nullptr)) at_set_core(atoi(opt(argc, argv, "--attn-core", "1")));
-    if (opt(argc, argv, "--attn-keep", nullptr)) unet_set_attn_keep(atoi(opt(argc, argv, "--attn-keep", "0")));
+    if (opt(argc, argv, "--attn-core", nullptr)) at_set_core(opt_atoi("--attn-core", opt(argc, argv, "--attn-core", "1")));
+    if (opt(argc, argv, "--attn-keep", nullptr)) unet_set_attn_keep(opt_atoi("--attn-keep", opt(argc, argv, "--attn-keep", "0")));
     unet *u = unet_create(&cfg); unet_init(u, seed); unet_head_bias_zero(u);
     {   /* --head-init S: the 1^3 head's initial weights x S (live and EMA): a small head lets a regression target (--ssl-distill) move the
            outputs in tens of steps instead of hundreds (Kaiming: |W| ~ 11 for 64 x 16, Muon / AdamW steps ~0.025 per step) */
-        const float his = (float)atof(opt(argc, argv, "--head-init", "1"));
+        const float his = (float)opt_atof("--head-init", opt(argc, argv, "--head-init", "1"));
         if (his != 1.f) { size_t hw_, hb_; unet_head_offsets(u, &hw_, &hb_); nn_scale((float *)unet_live_params(u) + hw_, his, hb_ - hw_); nn_scale((float *)unet_ema_params(u) + hw_, his, hb_ - hw_); }
     }   /* (no shared -2 bias direction in the embeddings) */
-    const int HZ = atoi(opt(argc, argv, "--head-slab", "0"));   /* head slabs of HZ planes: no whole-window logits / logit gradient (large windows) */
+    const int HZ = opt_atoi("--head-slab", opt(argc, argv, "--head-slab", "0"));   /* head slabs of HZ planes: no whole-window logits / logit gradient (large windows) */
     if (HZ && (fp32 || P % HZ)) { fprintf(stderr, "dino-train: --head-slab needs MX storage (--mx 1) and P a multiple of it\n"); return 2; }
     const char *mem = opt(argc, argv, "--mem", "default");   /* lean: train's smallest recompute-1 mode (chunked MX gradients, lean 2, shared encoder a1) */
     if (!strcmp(mem, "lean")) {
@@ -2598,7 +2599,7 @@ int cmd_dino_train(int argc, char **argv) {
                 P, mem, HZ, cfg.attn_blocks, tb / 1e9, (double)tb / p3d, tr / 1e9);
         return 0;
     }
-    if (!fp32 && ED <= 16 && atoi(opt(argc, argv, "--fp16-logits", "0"))) unet_set_fp16_logits(u, 1);   /* (the MX fp16-logit head takes <= 16 outputs) */
+    if (!fp32 && ED <= 16 && opt_atoi("--fp16-logits", opt(argc, argv, "--fp16-logits", "0"))) unet_set_fp16_logits(u, 1);   /* (the MX fp16-logit head takes <= 16 outputs) */
     int step0 = 0;
     const char *resume = opt(argc, argv, "--resume", nullptr);
     if (resume && !recipe) { step0 = unet_load(u, resume); if (step0 < 0) { fprintf(stderr, "dino-train: cannot resume %s\n", resume); return 1; } }   /* (the recipe loads its own) */
@@ -2746,7 +2747,7 @@ int cmd_dino_train(int argc, char **argv) {
             if (unet_save(u, cp, step, ex)) fprintf(stderr, "dino-train: cannot save %s\n", cp);
             char pp[1300]; snprintf(pp, sizeof pp, "%s.protos", cp); float *h = malloc(kd * 4); nn_d2h(h, W, kd * 4);
             FILE *pf = fopen(pp, "wb"); if (pf) { fwrite(h, 4, kd, pf); fclose(pf); } free(h);
-            char lp[1200]; snprintf(lp, sizeof lp, "%s/last.ckpt", outd); unlink(lp); if (symlink(cp + strlen(outd) + 1, lp)) {}
+            char lp[1200]; snprintf(lp, sizeof lp, "%s/last.ckpt", outd); unlink(lp); if (symlink(cp + strlen(outd) + 1, lp)) fprintf(stderr, "dino: last.ckpt -> %s: %s (a resume would start elsewhere)\n", cp, strerror(errno));   /* (was ignored; audit mini/errpaths 8) */
         }
         if (opt(argc, argv, "--eval", nullptr) && (step % eval_every == 0 || step == steps)) {
             if (dn_run_eval(u, argc, argv, step, P, ED, nthreads, axis_in, ars, outd, lf)) { t_last = dn_now(); memset(sums, 0, sizeof sums); nsum = 0; }
@@ -2766,15 +2767,15 @@ int cmd_dino_embed(int argc, char **argv) {
         fprintf(stderr, "usage: ufsm dino-embed <ckpt> <ct-root> <ct-key> <out-group> --box z,y,x,nz,ny,nx --norm center,scale|auto [--P 256] [--halo 32] [--ema 1] [--cache DIR] [--mx 0]\n"
                         "         [--head-slab 1 [--mem lean]] (large windows: the head per z-slab, no whole-window logits)\n"
                         "  --norm auto: dino-train's statistics of the box (median, IQR / 1.349 of nonzero voxels in 8 random 128^3 blocks)\n"); return 2; }
-    const int P = atoi(opt(argc, argv, "--P", "256")), fp32 = !atoi(opt(argc, argv, "--mx", "1"));
+    const int P = opt_atoi("--P", opt(argc, argv, "--P", "256")), fp32 = !opt_atoi("--mx", opt(argc, argv, "--mx", "1"));
     dn_precision(fp32);
-    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
+    if (nn_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
     dn_precision_after_init(fp32);
     unet_cfg cfg; int step = 0;
     if (unet_peek(argv[2], &cfg, &step)) { fprintf(stderr, "dino-embed: cannot read %s\n", argv[2]); return 1; }
     unet *u = unet_create(&cfg); if (unet_load(u, argv[2]) < 0) return 1;
     if (!fp32 && cfg.cout <= 16) unet_set_fp16_logits(u, 1);
-    if (atoi(opt(argc, argv, "--head-slab", "0"))) {   /* large windows: a training build with head slabs (no whole-window logits), optionally lean */
+    if (opt_atoi("--head-slab", opt(argc, argv, "--head-slab", "0"))) {   /* large windows: a training build with head slabs (no whole-window logits), optionally lean */
         if (fp32) { fprintf(stderr, "dino-embed: --head-slab needs MX storage\n"); return 2; }
         if (!strcmp(opt(argc, argv, "--mem", "default"), "lean")) { unet_set_chunk_up(2); unet_set_recompute(1); unet_set_grad_mx8(1); unet_set_lean(2); unet_set_share_enc_a1(1); }
         nn_set_logits_h16(1); unet_set_head_ext(u, 1); unet_build(u, (shape5){1, cfg.cin, P, P, P}, 1);
@@ -2785,10 +2786,10 @@ int cmd_dino_embed(int argc, char **argv) {
     if (norm_auto) { box_norm(ct, (const int64_t (*)[6])&box, 1, 12345, 8, &c, &s); fprintf(stderr, "dino-embed: box statistics: norm %.1f,%.2f\n", c, s); }
     const double t0 = dn_now();
     float *axz = nullptr;
-    if (cfg.cin == 5 && opt(argc, argv, "--axis", nullptr)) { axz = load_axis(opt(argc, argv, "--axis", ""), atof(opt(argc, argv, "--axis-scale", "1")), z3_meta_of(ct)->shape[0]); if (!axz) return 2; }   /* (optional: else valid 0) */
-    if (cfg.cin == 2 && opt(argc, argv, "--axis", nullptr)) { axz = load_axis(opt(argc, argv, "--axis", ""), atof(opt(argc, argv, "--axis-scale", "1")), z3_meta_of(ct)->shape[0]); if (!axz) return 2; }
+    if (cfg.cin == 5 && opt(argc, argv, "--axis", nullptr)) { axz = load_axis(opt(argc, argv, "--axis", ""), opt_atof("--axis-scale", opt(argc, argv, "--axis-scale", "1")), z3_meta_of(ct)->shape[0]); if (!axz) return 2; }   /* (optional: else valid 0) */
+    if (cfg.cin == 2 && opt(argc, argv, "--axis", nullptr)) { axz = load_axis(opt(argc, argv, "--axis", ""), opt_atof("--axis-scale", opt(argc, argv, "--axis-scale", "1")), z3_meta_of(ct)->shape[0]); if (!axz) return 2; }
     if (cfg.cin == 2 && !axz) fprintf(stderr, "dino-embed: 2-input net without --axis: the second channel is the --mask-input channel (all zero: nothing masked)\n");
-    int8_t *e = dn_embed_box(u, ct, box, P, atoi(opt(argc, argv, "--halo", "32")), c, s, 8, atoi(opt(argc, argv, "--ema", "1")), axz, (float)atof(opt(argc, argv, "--axis-rs", "0.001")));
+    int8_t *e = dn_embed_box(u, ct, box, P, opt_atoi("--halo", opt(argc, argv, "--halo", "32")), c, s, 8, opt_atoi("--ema", opt(argc, argv, "--ema", "1")), axz, (float)opt_atof("--axis-rs", opt(argc, argv, "--axis-rs", "0.001")));
     if (!e) return 1;
     const double t1 = dn_now();
     if (dv_write_dense_box(argv[5], z3_meta_of(ct)->shape, box, dn_embed_dim(&cfg), e)) return 1;
@@ -2809,7 +2810,7 @@ int cmd_dino_boxes(int argc, char **argv) {
         json *mj = json_parse(jb, jn); if (!mj) { fprintf(stderr, "dino-boxes: bad %s\n", jp); return 1; }
         int64_t g[3]; for (int d = 0; d < 3; d++) g[d] = (int64_t)json_num(json_at(json_get(mj, "grid"), d), 0);
         const double cs = json_num(json_get(mj, "cell"), 32) * (double)(1 << (int)json_num(json_get(mj, "level"), 0)); json_free(mj);
-        const int every = atoi(opt(argc, argv, "--every", "2")), mc = atoi(opt(argc, argv, "--min-cells", "20"));
+        const int every = opt_atoi("--every", opt(argc, argv, "--every", "2")), mc = opt_atoi("--min-cells", opt(argc, argv, "--min-cells", "20"));
         const size_t nv = (size_t)g[0] * g[1] * g[2]; uint8_t *v = malloc(nv); FILE *f = fopen(mp, "rb");
         if (!v || !f || fread(v, 1, nv, f) != nv) { fprintf(stderr, "dino-boxes: cannot read %s\n", mp); return 1; } fclose(f);
         int first = 1; printf("{\"control_points\":[");
@@ -2829,16 +2830,16 @@ int cmd_dino_boxes(int argc, char **argv) {
         char jb[4096]; const size_t jn = fread(jb, 1, sizeof jb - 1, jf); fclose(jf); jb[jn] = 0;
         json *mj = json_parse(jb, jn); if (!mj) { fprintf(stderr, "dino-boxes: bad %s\n", jp); return 1; }
         const json *gr = json_get(mj, "grid"); int64_t g[3]; for (int d = 0; d < 3; d++) g[d] = (int64_t)json_num(json_at(gr, d), 0);
-        const int ml = (int)json_num(json_get(mj, "level"), 0), ol = atoi(opt(argc, argv, "--out-level", "-1"));   /* (boxes in level ol voxels; -1: the mask's level) */
+        const int ml = (int)json_num(json_get(mj, "level"), 0), ol = opt_atoi("--out-level", opt(argc, argv, "--out-level", "-1"));   /* (boxes in level ol voxels; -1: the mask's level) */
         const double cf = json_num(json_get(mj, "cell"), 32) * (ol < 0 ? 1.0 : ldexp(1.0, ml - ol)); const int cs = (int)cf; json_free(mj);
         if (cs < 1 || fabs(cf - cs) > 1e-9) { fprintf(stderr, "dino-boxes --mask: cell edge %.3f voxels at level %d\n", cf, ol); return 1; }
-        const int B = atoi(opt(argc, argv, "--block", "512")), top = atoi(opt(argc, argv, "--top", "8")), b = B / cs; const double mf = atof(opt(argc, argv, "--min-frac", "0.6"));
-        uint64_t rs = (uint64_t)atoll(opt(argc, argv, "--seed", "1")) * 0x9E3779B97F4A7C15ull + 1;
+        const int B = opt_atoi("--block", opt(argc, argv, "--block", "512")), top = opt_atoi("--top", opt(argc, argv, "--top", "8")), b = B / cs; const double mf = opt_atof("--min-frac", opt(argc, argv, "--min-frac", "0.6"));
+        uint64_t rs = (uint64_t)opt_atoll("--seed", opt(argc, argv, "--seed", "1")) * 0x9E3779B97F4A7C15ull + 1;
         const size_t nv = (size_t)g[0] * g[1] * g[2]; uint8_t *v = malloc(nv); FILE *f = fopen(mp, "rb");
         if (!v || !f || fread(v, 1, nv, f) != nv) { fprintf(stderr, "dino-boxes: cannot read %s\n", mp); return 1; } fclose(f);
         typedef struct { int64_t o[3]; double fr; } cand; size_t cap = 1 << 16, nc = 0; cand *cd = malloc(cap * sizeof *cd);
-        int64_t zm = (int64_t)(g[0] * atof(opt(argc, argv, "--z-margin", "0.08")));   /* (the scan's z ends: mounts, partial slices) */
-        const int al = atoi(opt(argc, argv, "--align", "0"));   /* box origins on multiples of AL output voxels (a shard grid; AL divides B / 2 and is whole cells) */
+        int64_t zm = (int64_t)(g[0] * opt_atof("--z-margin", opt(argc, argv, "--z-margin", "0.08")));   /* (the scan's z ends: mounts, partial slices) */
+        const int al = opt_atoi("--align", opt(argc, argv, "--align", "0"));   /* box origins on multiples of AL output voxels (a shard grid; AL divides B / 2 and is whole cells) */
         if (al > 0) { if (al % cs || (B / 2) % al) { fprintf(stderr, "dino-boxes --mask: --align %d must be whole cells (%d) and divide B / 2\n", al, cs); return 2; } const int64_t ac = al / cs; zm = (zm + ac - 1) / ac * ac; }
         for (int64_t z = zm; z + b <= g[0] - zm; z += b / 2) for (int64_t y = 0; y + b <= g[1]; y += b / 2) for (int64_t x = 0; x + b <= g[2]; x += b / 2) {
             size_t cnt = 0; for (int64_t a = 0; a < b; a++) for (int64_t e = 0; e < b; e++) for (int64_t c = 0; c < b; c++) cnt += v[((size_t)(z + a) * g[1] + y + e) * g[2] + x + c] != 0;
@@ -2860,14 +2861,14 @@ int cmd_dino_boxes(int argc, char **argv) {
     if (opt(argc, argv, "--ct-coarse", nullptr)) {   /* papyrus-rich blocks of a CT (no labels): a coarse level read whole */
         store *cs = store_open(argv[2]); z3 *c = cs ? z3_open(cs, opt(argc, argv, "--ct-coarse", ""), opt(argc, argv, "--cache", nullptr)) : nullptr;
         if (!c) { fprintf(stderr, "dino-boxes: %s\n", z3_error()); return 1; }
-        const int f = atoi(opt(argc, argv, "--factor", "8")), B = atoi(opt(argc, argv, "--block", "512")), top = atoi(opt(argc, argv, "--top", "8")), b = B / f;
+        const int f = opt_atoi("--factor", opt(argc, argv, "--factor", "8")), B = opt_atoi("--block", opt(argc, argv, "--block", "512")), top = opt_atoi("--top", opt(argc, argv, "--top", "8")), b = B / f;
         const z3_meta *m = z3_meta_of(c); const size_t nv = (size_t)m->shape[0] * m->shape[1] * m->shape[2];
         uint8_t *v = malloc(nv); const int64_t o[3] = {0, 0, 0};
         if (!v || z3_read(c, o, m->shape, v, 8)) { fprintf(stderr, "dino-boxes: coarse read: %s\n", z3_error()); return 1; }
         int64_t h[256] = {0}, tot = 0; for (size_t i = 0; i < nv; i++) h[v[i]]++;
         h[0] = 0; for (int i = 1; i < 256; i++) tot += h[i];
         int med = 1; { int64_t a = 0; for (int i = 1; i < 256; i++) { a += h[i]; if (a >= tot / 2) { med = i; break; } } }
-        const int thr = atoi(opt(argc, argv, "--thresh", "0")) > 0 ? atoi(opt(argc, argv, "--thresh", "0")) : med;
+        const int thr = opt_atoi("--thresh", opt(argc, argv, "--thresh", "0")) > 0 ? opt_atoi("--thresh", opt(argc, argv, "--thresh", "0")) : med;
         typedef struct { double fr; int64_t o[3]; } cand; cand *cd = malloc(sizeof *cd * 100000); int nc = 0;
         uint64_t rs = 99;
         for (int64_t z = 0; z + b <= m->shape[0]; z += b / 2) for (int64_t y = 0; y + b <= m->shape[1]; y += b / 2) for (int64_t x = 0; x + b <= m->shape[2]; x += b / 2) {
@@ -2890,9 +2891,9 @@ int cmd_dino_boxes(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm dino-boxes <codes-root> <codes-key> [--block 512] [--min 200000] [--exclude z,y,x,nz,ny,nx]...\n"); return 2; }
     store *st = store_open(argv[2]); z3 *z = st ? z3_open(st, argv[3], nullptr) : nullptr;
     if (!z) { fprintf(stderr, "dino-boxes: %s\n", z3_error()); return 1; }
-    const int B = atoi(opt(argc, argv, "--block", "512")); const long mn = atol(opt(argc, argv, "--min", "200000"));
+    const int B = opt_atoi("--block", opt(argc, argv, "--block", "512")); const long mn = opt_atol("--min", opt(argc, argv, "--min", "200000"));
     int64_t ex[32][6]; int nex = 0;
-    for (int i = 2; i + 1 < argc && nex < 32; i++) if (!strcmp(argv[i], "--exclude")) { long long v[6]; if (sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) { for (int d = 0; d < 6; d++) ex[nex][d] = v[d]; nex++; } }
+    for (int i = 2; i + 1 < argc && nex < 32; i++) if (!strcmp(argv[i], opt_n("--exclude"))) { long long v[6]; if (sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) { for (int d = 0; d < 6; d++) ex[nex][d] = v[d]; nex++; } }
     const z3_meta *m = z3_meta_of(z); int64_t grid[3]; uint8_t *bits = nullptr;
     if (z3_chunk_map(z, grid, &bits) < 0) { fprintf(stderr, "dino-boxes: chunk map: %s\n", z3_error()); return 1; }
     const int cpb = B / m->chunk[0];   /* chunks per block edge */
@@ -2927,10 +2928,10 @@ int cmd_dino_boxes(int argc, char **argv) {
    (closed form, double) fit on the first 3/4 of the crops, R^2 on the rest. A random-init checkpoint is the baseline. */
 int cmd_dino_seamprobe(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm dino-seamprobe CKPT SOURCES.json [--crops 40] [--P 128] [--per-crop 512] [--seed 1] [--gpu 0]\n"); return 2; }
-    const int ncrop = atoi(opt(argc, argv, "--crops", "40")), P = atoi(opt(argc, argv, "--P", "128")), pc = atoi(opt(argc, argv, "--per-crop", "512"));
-    uint64_t rs = (uint64_t)atoll(opt(argc, argv, "--seed", "1")) * 0x9E3779B97F4A7C15ull + 3;
+    const int ncrop = opt_atoi("--crops", opt(argc, argv, "--crops", "40")), P = opt_atoi("--P", opt(argc, argv, "--P", "128")), pc = opt_atoi("--per-crop", opt(argc, argv, "--per-crop", "512"));
+    uint64_t rs = (uint64_t)opt_atoll("--seed", opt(argc, argv, "--seed", "1")) * 0x9E3779B97F4A7C15ull + 3;
     dn_precision(0);
-    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
+    if (nn_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
     dn_precision_after_init(0);
     unet_cfg cfg; int st = 0; if (unet_peek(argv[2], &cfg, &st)) { fprintf(stderr, "seamprobe: cannot read %s\n", argv[2]); return 1; }
     if (!cfg.attn_blocks) { fprintf(stderr, "seamprobe: the net has no attention stage\n"); return 2; }
@@ -2974,7 +2975,7 @@ int cmd_dino_seamprobe(int argc, char **argv) {
             else { memcpy(Fte + (size_t)nte * D, f, D * 8); memcpy(Yte + (size_t)nte * T, y, T * 8); nte++; }
         }
     }
-    const double lam = atof(opt(argc, argv, "--ridge", "1"));
+    const double lam = opt_atof("--ridge", opt(argc, argv, "--ridge", "1"));
     for (int a = 0; a < C; a++) XtX[(size_t)a * D + a] += lam;
     /* Cholesky solve XtX W = XtY */
     double *Lc = malloc((size_t)D * D * 8); memcpy(Lc, XtX, (size_t)D * D * 8);

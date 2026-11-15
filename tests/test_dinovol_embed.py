@@ -79,7 +79,8 @@ def main():
     for p in [R.CKPT, R.DATA / "src/dinovol_2/eval/embed_volume.py", R.DATA / "pylib/timm", UFSM, CT_ROOT / CT_KEY]:
         if not pathlib.Path(p).exists():
             skip(f"{p} missing")
-    if "GPU" not in subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout:
+    cv = os.environ.get("CUDA_VISIBLE_DEVICES")   # the runner's grant (empty: none); nvidia-smi -L ignores it
+    if (cv is not None and cv.strip() in ("", "-1")) or (cv is None and "GPU" not in subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout):
         skip("no GPU")
     torch.set_num_threads(int(os.environ.get("UFSM_TEST_TORCH_THREADS", "8")))
     bb, head = R.build()

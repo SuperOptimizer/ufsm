@@ -154,12 +154,30 @@ template <int MODE> __global__ void __launch_bounds__(128) gemm_ns_tc_k(const mu
    hand-tiled fp32 kernels reach ~10% of the card's fp32 rate on the 92 M net (121 ms per step) and the wmma fp16 ones are slower still */
 #include <cublasLt.h>
 typedef struct { int dev, m, n, k, ta, tc, ok; cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; } nsplan;
-static nsplan g_nsp[512]; static int g_nnsp;
-static cublasLtHandle_t g_nslt[16]; static void *g_nsws[16]; static const size_t NSWS = 32u << 20;
-static nsplan *nsplan_get(int dev, int ta, int m, int n, int k, int tc) {
+#include <pthread.h>
+static nsplan *g_nsp; static int g_nnsp, g_nspcap;   /* mgpu: guarded (g_nsp_mu). (growable: a fixed 512 aborted the step when a wide net or 4 GPUs filled it; audit muon #4;
+                                                  the realloc moves entries: callers hold the pointer only until their cublasLtMatmul returns) mgpu: guarded (g_nsp_mu; entries keyed by device; today the optimizer runs on the main thread only,
+                                                  the lock keeps the table safe if the update moves into the per-GPU threads) */
+static cublasLtHandle_t g_nslt[16]; static void *g_nsws[16]; static const size_t NSWS = 32u << 20;   /* mgpu: per-device (g_nsp_mu) */
+static pthread_mutex_t g_nsp_mu = PTHREAD_MUTEX_INITIALIZER;
+static nsplan *nsplan_get_locked(int dev, int ta, int m, int n, int k, int tc);
+static nsplan *nsplan_get(int dev, int ta, int m, int n, int k, int tc) { pthread_mutex_lock(&g_nsp_mu); nsplan *p = nsplan_get_locked(dev, ta, m, n, k, tc); pthread_mutex_unlock(&g_nsp_mu); return p; }
+/* the device's cuBLASLt handle and workspace now (nn.h nn_muon_tc_reserve: before the memory planner measures the free memory) */
+extern "C" int nn_muon_tc_reserve(void) {
+    int dev = 0; cudaGetDevice(&dev); if (dev < 0 || dev >= 16) return -1;
+    pthread_mutex_lock(&g_nsp_mu);
+    int rc = 0;
+    if (!g_nslt[dev]) { if (cublasLtCreate(&g_nslt[dev]) != CUBLAS_STATUS_SUCCESS) { g_nslt[dev] = nullptr; rc = -1; } }
+    if (!rc && !g_nsws[dev] && cudaMalloc(&g_nsws[dev], NSWS) != cudaSuccess) { cudaGetLastError(); g_nsws[dev] = nullptr; rc = -1; }
+    pthread_mutex_unlock(&g_nsp_mu);
+    return rc;
+}
+static nsplan *nsplan_get_locked(int dev, int ta, int m, int n, int k, int tc) {
     for (int i = 0; i < g_nnsp; i++) { nsplan *p = &g_nsp[i]; if (p->dev == dev && p->m == m && p->n == n && p->k == k && p->ta == ta && p->tc == tc) return p; }
-    if (g_nnsp == 512 || dev < 0 || dev >= 16) return nullptr;
-    if (!g_nslt[dev]) { if (cublasLtCreate(&g_nslt[dev]) != CUBLAS_STATUS_SUCCESS || cudaMalloc(&g_nsws[dev], NSWS) != cudaSuccess) return nullptr; }
+    if (dev < 0 || dev >= 16) return nullptr;
+    if (g_nnsp == g_nspcap) { g_nspcap = g_nspcap ? 2 * g_nspcap : 256; nsplan *np_ = (nsplan *)realloc(g_nsp, sizeof(nsplan) * (size_t)g_nspcap); if (!np_) return nullptr; g_nsp = np_; }
+    if (!g_nslt[dev]) { if (cublasLtCreate(&g_nslt[dev]) != CUBLAS_STATUS_SUCCESS) { g_nslt[dev] = nullptr; return nullptr; } }
+    if (!g_nsws[dev] && cudaMalloc(&g_nsws[dev], NSWS) != cudaSuccess) { cudaGetLastError(); g_nsws[dev] = nullptr; return nullptr; }
     nsplan *p = &g_nsp[g_nnsp++]; memset(p, 0, sizeof *p); p->dev = dev; p->m = m; p->n = n; p->k = k; p->ta = ta; p->tc = tc;
     cublasLtMatmulDescCreate(&p->op, CUBLAS_COMPUTE_32F_FAST_TF32, CUDA_R_32F);
     const cublasOperation_t oa = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
@@ -179,14 +197,28 @@ static int ns_gemm(int dev, int tc, int ta, int m, int n, int k, const float *A,
     nsplan *p = nsplan_get(dev, ta, m, n, k, tc); if (!p || !p->ok) return -1;
     return cublasLtMatmul(g_nslt[dev], p->op, &alpha, A, p->a, B, p->b, &beta, C, p->c, D, p->c, &p->algo, g_nsws[dev], NSWS, 0) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
 }
+/* host copies of the descriptor tables, keyed (device, table pointer, nconv): muon_batch calls once per scratch group (one base pointer
+   each), the Muon-C split twice, so a single slot re-copied (synchronously) on every call. nn_muon_forget drops the entries inside a freed
+   table (unet_free), so a later table at the same address with another layout cannot hit a stale copy (audit muon #4) */
+struct nscache { int dev, n; const void *d; muon_desc_t *h; };
+static nscache g_nsc[64]; static int g_nscn, g_nscrr;   /* mgpu: process (the optimizer step runs on the main thread only; entries keyed by device) */
+extern "C" void nn_muon_forget(const void *base, size_t bytes) {
+    for (int i = 0; i < g_nscn; i++) if ((const char *)g_nsc[i].d >= (const char *)base && (const char *)g_nsc[i].d < (const char *)base + bytes) { free(g_nsc[i].h); g_nsc[i] = g_nsc[--g_nscn]; i--; }
+}
+static const muon_desc_t *ns_host_table(int dev, const muon_desc_t *d, int nconv) {
+    for (int i = 0; i < g_nscn; i++) if (g_nsc[i].dev == dev && g_nsc[i].d == d && g_nsc[i].n == nconv) return g_nsc[i].h;
+    nscache e = {dev, nconv, d, (muon_desc_t *)malloc(sizeof(muon_desc_t) * (size_t)nconv)};
+    if (!e.h) return nullptr;
+    if (cudaMemcpy(e.h, d, sizeof(muon_desc_t) * (size_t)nconv, cudaMemcpyDeviceToHost) != cudaSuccess) { cudaGetLastError(); free(e.h); return nullptr; }   /* (unchecked: garbage descriptors; audit mini/errpaths 6) */
+    if (g_nscn == 64) { const int v = g_nscrr++ % 64; free(g_nsc[v].h); g_nsc[v] = e; } else g_nsc[g_nscn++] = e;
+    return e.h;
+}
 static int ns5_lt(const muon_desc_t *d, int nconv, int mode) {
-    static const void *hk[16]; static int hn[16]; static muon_desc_t *hd[16];   /* the table's host copy per device (built once, pointers stable) */
     int dev = 0; cudaGetDevice(&dev); if (dev < 0 || dev >= 16) return -1;
-    if (hk[dev] != d || hn[dev] != nconv) { free(hd[dev]); hd[dev] = (muon_desc_t *)malloc(sizeof(muon_desc_t) * (size_t)nconv);
-        cudaMemcpy(hd[dev], d, sizeof(muon_desc_t) * (size_t)nconv, cudaMemcpyDeviceToHost); hk[dev] = d; hn[dev] = nconv; }
+    const muon_desc_t *hd = ns_host_table(dev, d, nconv); if (!hd) return -1;
     int e = 0;
     for (int i = 0; i < nconv; i++) {
-        const muon_desc_t D = hd[dev][i]; float *X = D.X, *Y = D.Y;
+        const muon_desc_t D = hd[i]; float *X = D.X, *Y = D.Y;
         for (int it = 0; it < 5; it++) {
             const float a = g_ns_maps[mode][it][0], b = g_ns_maps[mode][it][1], c = g_ns_maps[mode][it][2];
             e |= ns_gemm(dev, g_ns_tc, 1, D.Co, D.Co, D.K, X, X, 1.f, 0.f, D.A, D.A);
@@ -229,7 +261,7 @@ static double *g_mst; static int g_mst_base;
 extern "C" void nn_muon_stats(double *out, int base) { g_mst = out; g_mst_base = base; }
 __global__ void mstat_k(const muon_desc_t *d, int swap, float lr, float wd, const float *lrm, int mc, const double *po, const int *hb, const float *R, float hb_lr, double *out) {
     const muon_desc_t D = d[blockIdx.y]; const float *O = swap ? D.Y : D.X; const size_t n = (size_t)D.Co * D.K;
-    const float l = lrm ? lr * lrm[blockIdx.y] : lr; float scale = muon_scale(D.Co, D.K), st = 0.f; const int h = hb && hb[blockIdx.y];
+    const float l = lrm ? lr * lrm[blockIdx.y] : lr; if (lrm) hb_lr *= lrm[blockIdx.y]; float scale = muon_scale(D.Co, D.K), st = 0.f; const int h = hb && hb[blockIdx.y];
     if (mc || h) { double so = 0; for (int j = 0; j < 32; j++) so += po[blockIdx.y * 32 + j];
         if (h) st = (float)((double)hb_lr * R[blockIdx.y] / fmax(sqrt(so), 1e-30));
         else { const double nk = (double)n, tgt = sqrt(fmax(1.0, (double)D.Co / D.K)) * sqrt(fmin((double)D.Co, (double)D.K) / nk); scale = (float)(tgt / (sqrt(so / nk) + 1e-8)); } }
@@ -432,7 +464,7 @@ __global__ void mopt_apply_k(const muon_desc_t *d, int swap, int mc, const int *
     const muon_desc_t D = d[blockIdx.y]; const float *O = swap ? D.Y : D.X; const size_t n = (size_t)D.Co * D.K;
     const double so = mc_total(po);
     double a = 0, dd = 0;
-    if (lrm) lr *= lrm[blockIdx.y];   /* the adaptive per-matrix multiplier (nn_muon_ext_adapt; hyperball / Muon-C excluded by the caller) */
+    if (lrm) { lr *= lrm[blockIdx.y]; hb_lr *= lrm[blockIdx.y]; }   /* the adaptive per-matrix multiplier (nn_muon_ext_adapt; hyperball / Muon-C excluded by the caller) */
     if (hb && hb[blockIdx.y]) {   /* trial point W - eta R O / |O|; its norm for the projection */
         const float st = (float)((double)hb_lr * R[blockIdx.y] / fmax(sqrt(so), 1e-30));
         for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) { const float w = D.p[i] - st * O[i]; D.p[i] = w; a += (double)w * w; }
@@ -466,8 +498,11 @@ __global__ void mopt_apply_k(const muon_desc_t *d, int swap, int mc, const int *
        Consistent directions make the distance grow faster than sqrt(G): eta grows; a random walk keeps it; oscillation shrinks it.
    dog: [rbar, G, eta, |x - x_0|]. All sums are fixed-order partials: every data-parallel replica computes the same multipliers. */
 static nn_madapt g_ad; static int g_ad_on;
+static const float *g_lrm0; static int g_fro;   /* mgpu: process (set once before training, like g_ad); static per-matrix lr multipliers (trunk / stage: audit muon #1); --muon-fro 1 */
+extern "C" void nn_muon_ext_lrmult(const float *m) { g_lrm0 = m; }
+extern "C" void nn_muon_ext_fro(int on) { g_fro = on; }
 extern "C" void nn_muon_ext_adapt(const nn_madapt *a) { g_ad_on = a != nullptr; if (a) g_ad = *a; }
-__global__ void ad_ctl_k(const muon_desc_t *d, int n, const double *po, const double *pw, nn_madapt a, float lr) {
+__global__ void ad_ctl_k(const muon_desc_t *d, int n, const double *po, const double *pw, nn_madapt a, float lr, const float *m0) {
     if (threadIdx.x) return;
     double lsum = 0;
     for (int i = 0; i < n; i++) {
@@ -479,7 +514,8 @@ __global__ void ad_ctl_k(const muon_desc_t *d, int n, const double *po, const do
     const double tgt = a.lars_tgt > 0.f ? (double)a.lars_tgt / a.lr_peak : exp(lsum / n);
     double v2 = 0;
     for (int i = 0; i < n; i++) {
-        const double m = a.on_lars ? fmin(fmax(tgt / fmax((double)a.ema[i], 1e-30), 1.0 / a.lars_c), (double)a.lars_c) : 1.0;
+        double m = a.on_lars ? fmin(fmax(tgt / fmax((double)a.ema[i], 1e-30), 1.0 / a.lars_c), (double)a.lars_c) : 1.0;
+        if (a.base) m *= a.base[i];   /* (--attn-muon-lr: the fixed multipliers) */
         v2 += m * m * (double)a.lrm[i] * a.lrm[i]; a.lrm[i] = (float)m;
     }
     if (a.on_dog) {
@@ -489,6 +525,7 @@ __global__ void ad_ctl_k(const muon_desc_t *d, int n, const double *po, const do
         D[2] = D[1] > 0.0 ? fmin(D[0] / sqrt(D[1]), (double)a.dog_max) : (double)a.dog_eta0;
         const float f = (float)(D[2] / a.lr_peak); for (int i = 0; i < n; i++) a.lrm[i] *= f;
     }
+    if (m0) for (int i = 0; i < n; i++) a.lrm[i] *= m0[i];   /* the static trunk / stage multipliers on top (not part of the control loop) */
 }
 __global__ void ad_dist_k(const double *pd, int n, double *dog) { if (threadIdx.x) return; double s = 0; for (int j = 0; j < 32 * n; j++) s += pd[j]; dog[3] = sqrt(s); }
 __global__ void hb_proj_k(const muon_desc_t *d, const int *hb, const float *R, const double *pw) {   /* back onto the sphere |W|_F = R */
@@ -605,14 +642,14 @@ extern "C" void nn_muon_ext_batch(const void *descs, int nconv, int maxco, int m
     }
     if (r_init) { mopt_sumsq_k<<<g2, 256>>>(d, -1, pb); hb_rinit_k<<<nconv, 32>>>(hb, R, pb); }
     mopt_sumsq_k<<<g2, 256>>>(d, swap, pa);
-    const float *lrm = nullptr; float *const *disp = nullptr; double *pd = nullptr;
+    const float *lrm = g_lrm0; const int mcf = mcd != nullptr || g_fro; float *const *disp = nullptr; double *pd = nullptr;
     if (g_ad_on) {   /* adaptive Muon: |W|^2 per matrix, then the multipliers (one thread) */
         mopt_sumsq_k<<<g2, 256>>>(d, -1, g_ad.part);
-        ad_ctl_k<<<1, 32>>>(d, nconv, pa, g_ad.part, g_ad, lr);
+        ad_ctl_k<<<1, 32>>>(d, nconv, pa, g_ad.part, g_ad, lr, g_lrm0);
         lrm = g_ad.lrm; if (g_ad.on_dog) { disp = g_ad.disp; pd = g_ad.part + (size_t)32 * nconv; }
     }
-    if (g_mst) mstat_k<<<g2, 256>>>(d, swap, lr, wd, lrm, mcd != nullptr, pa, hb, R, hb_lr, g_mst + 2 * (size_t)g_mst_base);
-    mopt_apply_k<<<g2, 256>>>(d, swap, mcd != nullptr, hb, R, pa, pb, lr, wd, hb_lr, lrm, disp, pd);
+    if (g_mst) mstat_k<<<g2, 256>>>(d, swap, lr, wd, lrm, mcf, pa, hb, R, hb_lr, g_mst + 2 * (size_t)g_mst_base);
+    mopt_apply_k<<<g2, 256>>>(d, swap, mcf, hb, R, pa, pb, lr, wd, hb_lr, lrm, disp, pd);
     if (pd) ad_dist_k<<<1, 32>>>(pd, nconv, g_ad.dog);
     if (hb) hb_proj_k<<<g2, 256>>>(d, hb, R, pb);
     KCHECK();
@@ -699,6 +736,25 @@ __global__ void ema_finite_k(float *e, const float *p, size_t n, float d, unsign
     if (__syncthreads_or(bad)) { if (!threadIdx.x && skips) atomicAdd(skips, 1u); return; }
     for (size_t i = threadIdx.x; i < n; i += blockDim.x) e[i] = d * e[i] + (1.f - d) * p[i];
 }
+/* gn_ema statistics, [mean G | var G] pairs per site (pv[i]: the index of i's mean when i is a variance slot, else -1): e <- d e + (1 - d) p,
+   and the variance slots additionally + d (1 - d) (e_mean - p_mean)^2: the EMA of the second moment minus the square of the EMA of the mean, i.e.
+   the variance of the POOLED windows (law of total variance), not the mean of the within-window variances (targeted/gnorm.md #1). Nothing
+   written when any p is non-finite (++*skips). One block, n <= 4096 */
+__global__ void gn_pool_k(float *e, const float *p, size_t n, const int *pv, float d, unsigned *skips) {
+    int bad = 0; float nv[4];
+    for (size_t i = threadIdx.x; i < n; i += blockDim.x) bad |= !isfinite(p[i]);
+    if (__syncthreads_or(bad)) { if (!threadIdx.x && skips) atomicAdd(skips, 1u); return; }
+    int k = 0;
+    for (size_t i = threadIdx.x; i < n && k < 4; i += blockDim.x, k++) {
+        float v = d * e[i] + (1.f - d) * p[i];
+        if (pv[i] >= 0) { const float dm = e[pv[i]] - p[pv[i]]; v += d * (1.f - d) * dm * dm; }
+        nv[k] = v;
+    }
+    __syncthreads();
+    k = 0;
+    for (size_t i = threadIdx.x; i < n && k < 4; i += blockDim.x, k++) e[i] = nv[k];
+}
+extern "C" void nn_gn_pool(float *e, const float *p, size_t n, const int *pv, float decay, unsigned *skips) { if (!n) return; gn_pool_k<<<1, 1024>>>(e, p, n, pv, decay, skips); KCHECK(); }
 extern "C" void nn_ema_finite(float *ema, const float *p, size_t n, float decay, unsigned *skips) { if (!n) return; ema_finite_k<<<1, 1024>>>(ema, p, n, decay, skips); KCHECK(); }
 __global__ void sum_k(const float *x, size_t n, float *out, int sq) {
     double s = 0;

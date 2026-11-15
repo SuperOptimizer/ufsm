@@ -323,7 +323,9 @@ int tifxyz_shift(const char *src, const char *dst, double d, const double *towar
     for (size_t i = 0; i < n; i++) {
         if (!(A[2][i] >= 0) || (Nv[0][i] == 0 && Nv[1][i] == 0 && Nv[2][i] == 0)) continue;
         for (int k = 0; k < 3; k++) O[k][i] = (float)(A[k][i] + sg * d * Nv[k][i]);
-        if (O[2][i] < 0) O[2][i] = 0;   /* (stays a valid vertex) */
+        /* moved past the top of the volume (z < 0): an invalid vertex (-1, -1, -1, tifxyz_scaled's rule), not a valid one clamped to z = 0
+           at the wrong place (audit mini/coords #7) */
+        if (O[2][i] < 0) for (int k = 0; k < 3; k++) O[k][i] = -1.f;
     }
     if (toward) fprintf(stderr, "tifxyz-scale --normal: %s: %s (vote %.0f)\n", src, sg > 0 ? "+n faces the axis" : "+n faced away from the axis: flipped", vote);
     snprintf(p, sizeof p, "mkdir -p '%s'", dst); if (system(p)) goto out;

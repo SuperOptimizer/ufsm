@@ -81,6 +81,12 @@ __device__ __forceinline__ void stage_up_smem16_h2(const uint8_t *cu, const uint
     const int Dc = D >> 1, Hc = H >> 1, Wc = W >> 1;
     const int mz[2] = {gz >> 1, min(max((gz >> 1) + ((gz & 1) ? 1 : -1), 0), Dc - 1)}, my[2] = {gy >> 1, min(max((gy >> 1) + ((gy & 1) ? 1 : -1), 0), Hc - 1)},
               mx[2] = {gx >> 1, min(max((gx >> 1) + ((gx & 1) ? 1 : -1), 0), Wc - 1)};
+    /* the taps' fp16 weights relative to the largest of the 8 coarse blocks' scales (2^(e - e_max) <= 1), the 2^e_max on the fp32 result:
+       the block scale inside the fp16 weight made the corner tap (1/64) subnormal once a block's amax fell below ~1.8 and could overflow
+       the half accumulator for large scales (audit 2026-11-14 kernels.md #4). Bit-identical wherever the old weights and sums were normal */
+    int lis[8]; unsigned em = 0u;
+#pragma unroll
+    for (int t = 0; t < 8; t++) { const int a = t >> 2, b = (t >> 1) & 1, c = t & 1; lis[t] = ((mz[a] - cz0) * 8 + (my[b] - cy0)) * 12 + (mx[c] - cx0); em = max(em, (unsigned)cus[lis[t]]); }
     __half2 acc[8];
 #pragma unroll
     for (int j = 0; j < 8; j++) acc[j] = __float2half2_rn(0.f);
@@ -90,8 +96,9 @@ __device__ __forceinline__ void stage_up_smem16_h2(const uint8_t *cu, const uint
         for (int b = 0; b < 2; b++)
 #pragma unroll
             for (int c = 0; c < 2; c++) {
-                const int li = ((mz[a] - cz0) * 8 + (my[b] - cy0)) * 12 + (mx[c] - cx0);
-                const __half2 w3 = __float2half2_rn((a ? 0.25f : 0.75f) * (b ? 0.25f : 0.75f) * (c ? 0.25f : 0.75f) * mx_scale(cus[li]));
+                const int li = lis[(a * 2 + b) * 2 + c];
+                const int de = (int)cus[li] - (int)em;   /* <= 0 */
+                const __half2 w3 = __float2half2_rn((a ? 0.25f : 0.75f) * (b ? 0.25f : 0.75f) * (c ? 0.25f : 0.75f) * (de >= -126 ? __uint_as_float((unsigned)(127 + de) << 23) : 0.f));
                 const uint4 h0 = *(const uint4 *)(cu + (size_t)li * 16);
                 const unsigned w[4] = {h0.x, h0.y, h0.z, h0.w};
 #pragma unroll
@@ -102,8 +109,9 @@ __device__ __forceinline__ void stage_up_smem16_h2(const uint8_t *cu, const uint
                     acc[2 * j] = __hfma2(w3, *(const __half2 *)&lo, acc[2 * j]); acc[2 * j + 1] = __hfma2(w3, *(const __half2 *)&hi, acc[2 * j + 1]);
                 }
             }
+    const float sm = mx_scale(em);   /* (0xFF: inf, the non-finite block stays non-finite) */
 #pragma unroll
-    for (int j = 0; j < 8; j++) { const float2 f = __half22float2(acc[j]); v[2 * j] = f.x; v[2 * j + 1] = f.y; }
+    for (int j = 0; j < 8; j++) { const float2 f = __half22float2(acc[j]); v[2 * j] = f.x * sm; v[2 * j + 1] = f.y * sm; }
 }
 /* weights: wq[tap 28][16 co][16 B] (channels [up 0..15 | skip 0..15]), ws[tap][co][2] (one scale per 16-channel group) */
 __global__ void prep_w4u_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cx) {

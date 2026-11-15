@@ -46,10 +46,15 @@ void exec_prec(int pass, int p) {
 int g_sr = -1;
 unsigned g_sr_step = 0; thread_local unsigned g_sr_ctr = 0;
 int sr_on(void) { if (g_sr < 0) { const char *e = getenv("UFSM_SR"); g_sr = e ? atoi(e) : 0; } return g_sr; }
+/* the replica's salt (data parallel: replica g's thread sets g; 0 = the one-GPU draws). Without it both GPU threads drew the same seed for
+   the same op (the counter starts from the main thread's), so the replicas' rounding errors were correlated (0.39 on same-sign data,
+   2026-11-14 audit). --split z halves keep salt 0: their shared halo planes must round alike */
+thread_local unsigned g_sr_salt = 0;   /* mgpu: per-thread */
+extern "C" void nn_sr_salt(unsigned s) { g_sr_salt = s; }
 unsigned sr_seed(void) {
-    unsigned h = g_sr_step * 0x9e3779b9u ^ (++g_sr_ctr) * 0x85ebca6bu;
+    unsigned h = (g_sr_step * 0x9e3779b9u ^ (++g_sr_ctr) * 0x85ebca6bu) + g_sr_salt * 0xc2b2ae35u;
     h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
-    return h | 1u;
+    return h ? h : 1u;   /* (0 means off; h | 1 paired every seed with its neighbour, 31 bits: rng audit #5. 64-bit kernel seeds left for later) */
 }
 extern "C" void nn_set_sr(int on) { g_sr = on; }
 /* UFSM_SR_SALT=K (A/B noise floors, perf2 2026-11-13): every step's stochastic-rounding seed shifted by K << 20, a run with other SR draws on
@@ -201,28 +206,79 @@ extern "C" int nn_get_f16(void) { return g_h16; }
 float g_gscale = 1.f;
 extern "C" void nn_set_grad_scale(float s) { g_gscale = s; }
 extern "C" float nn_get_grad_scale(void) { return g_gscale; }
+/* the head-gradient plane scale (2026-11-14, audit kernels.md #1 / #2, net.md #1, train.md #1): a power of two the loss-gradient producers
+   multiply into the gradient scale (GSH) and the head-plane consumers (nn_head_bwd_z, nn_fstem_bwd) divide out again, so the per-voxel
+   fp16 logit gradients and the coarse fp16 planes sit in fp16's normal range instead of its subnormals (P 768: 128 / N at N ~ 1e8 voxels
+   = 1.3e-6, a few bits and a dead zone below |residual| ~0.02). train.c sets it per window around the head's gradient pass from the
+   window's counts (hgs_choose) and back to 1 after; per host thread (each GPU's thread its own). A power of two scales fp16 / fp32
+   values exactly wherever they stay normal: with nothing subnormal before, every gradient is bit-identical.
+   Device-side since 11-14 (hgsdev): g_hgsp points at a device {s, 1 / s} (train.c: nn_hgs_choose's output, chosen without a host sync);
+   the producers multiply their scale argument by s in the kernel (GSHP, __fmul_rn: the bits of the host product, s a power of two), the
+   consumers by 1 / s. nullptr = s 1, the old launches. nn_set_head_gscale(s): tests, a host value through a per-device buffer */
+thread_local const float *g_hgsp = nullptr;
+extern "C" void nn_set_head_gscale_dev(const float *p) { g_hgsp = p; }
+extern "C" const float *nn_get_head_gscale_dev(void) { return g_hgsp; }
+extern "C" void nn_set_head_gscale(float s) {
+    if (s == 1.f) { g_hgsp = nullptr; return; }
+    static thread_local float *buf[8]; int dv = 0; cudaGetDevice(&dv); dv &= 7;
+    if (!buf[dv]) CK(cudaMalloc(&buf[dv], 2 * sizeof(float)));
+    const float h[2] = {s, 1.f / s}; CK(cudaMemcpy(buf[dv], h, sizeof h, cudaMemcpyHostToDevice));   /* (tests: synchronous; s a power of two, 1 / s exact) */
+    g_hgsp = buf[dv];
+}
 int g_gradbf = 1;
 extern "C" void nn_set_grad_bf16(int on) { g_gradbf = on; }
 extern "C" int nn_get_grad_bf16(void) { return g_gradbf; }
-cudaError_t g_err = cudaSuccess;
-const char *g_err_file, *g_err_what; int g_err_line;
-static char g_err_site[512];
-static void *g_err_ra;   /* the caller of the copy / memset wrapper that latched g_err (CKR) */
+#include <pthread.h>
+#include <atomic>
+thread_local cudaError_t g_err = cudaSuccess;   /* mgpu: per-thread (see nn_common.cuh CK) */
+thread_local const char *g_err_file, *g_err_what; thread_local int g_err_line;   /* mgpu: per-thread */
+static thread_local char g_err_site[512];   /* mgpu: per-thread */
+static thread_local void *g_err_ra;   /* mgpu: per-thread. The caller of the copy / memset wrapper that latched g_err (CKR) */
+static thread_local int g_err_worker;   /* mgpu: per-thread. nn_err_worker(1): a per-GPU thread, whose nn_check reports only its own errors */
+/* the first error of any thread not yet consumed (mgpu: guarded, g_errp_mu): the trainer's main thread takes its GPU threads' errors here */
+static pthread_mutex_t g_errp_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct { cudaError_t e; const char *file, *what; int line, dev; unsigned long owner; } g_errp;   /* mgpu: guarded (g_errp_mu) */
+/* the posting thread's identity: a process-unique serial, not pthread_self (a joined thread's pthread_t is reused by the next thread
+   created: test_dpsafe's quiet worker then took the exited worker's posted error as its own, and the main thread's nn_check missed it) */
+static unsigned long err_tid(void) { static std::atomic<unsigned long> next{1}; /* mgpu: guarded (atomic) */ static thread_local unsigned long id; /* mgpu: per-thread */
+                                     if (!id) id = next.fetch_add(1); return id; }
+extern "C" void nn_err_post(int e, const char *file, int line, const char *what) {
+    int d = -1; cudaGetDevice(&d);
+    pthread_mutex_lock(&g_errp_mu);
+    if (g_errp.e == cudaSuccess) { g_errp.e = (cudaError_t)e; g_errp.file = file; g_errp.line = line; g_errp.what = what; g_errp.dev = d; g_errp.owner = err_tid(); }
+    pthread_mutex_unlock(&g_errp_mu);
+}
+extern "C" void nn_err_worker(int on) { g_err_worker = on; }
 #define CKR(x) do { const int had_ = g_err != cudaSuccess; CK(x); if (!had_ && g_err != cudaSuccess) g_err_ra = __builtin_return_address(0); } while (0)
 extern "C" const char *nn_check_site(void) { return g_err_site; }
-extern "C" int nn_init(int device) { if (ufsm_env_on("UFSM_ACTF32")) g_actbf = 0; if (ufsm_env_on("UFSM_GRADF32")) g_gradbf = 0; if (ufsm_env_on("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } if (cudaSetDevice(device) != cudaSuccess) return -1; if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 3) { size_t fr = 0, tot = 0; cudaFree(0); cudaMemGetInfo(&fr, &tot); fprintf(stderr, "nn_init: device used %.1f MB after the context\n", (tot - fr) / 1e6); } return 0; }
+/* logical devices (src/ufsm_dev.cuh, ops audit #8): set once before the GPU threads start (mgpu: process) */
+extern "C" int nn_set_devmap(int n, const int *phys) {
+    if (n < 0 || n > 16) return -1;
+    for (int k = 0; k < n; k++) ufsm_devmap_[k] = phys[k];
+    ufsm_ndevmap_ = n; return 0;
+}
+extern "C" int nn_init(int device) { { static int ser_done = 0;   /* mgpu: env (once per process: the first nn_init of any GPU thread, atomically) */
+    if (!__atomic_exchange_n(&ser_done, 1, __ATOMIC_ACQ_REL) && ufsm_env_on("UFSM_SERIALIZE")) { setenv("CUDA_LAUNCH_BLOCKING", "1", 1); fprintf(stderr, "UFSM_SERIALIZE=1: CUDA_LAUNCH_BLOCKING=1, every launch and copy completes in program order (tests/test_serialize.sh)\n"); } }
+    if (ufsm_env_on("UFSM_ACTF32")) g_actbf = 0; if (ufsm_env_on("UFSM_GRADF32")) g_gradbf = 0; if (ufsm_env_on("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } if (cudaSetDevice(device) != cudaSuccess) return -1; if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 3) { size_t fr = 0, tot = 0; cudaFree(0); cudaMemGetInfo(&fr, &tot); fprintf(stderr, "nn_init: device used %.1f MB after the context\n", (tot - fr) / 1e6); } return 0; }
 extern "C" const char *nn_check(void) {
-    cudaError_t e = g_err;
+    cudaError_t e = g_err; const char *ef = g_err_file, *ew = g_err_what; int el = g_err_line, from = -2;
     g_err = cudaSuccess;
+    pthread_mutex_lock(&g_errp_mu);
+    if (g_errp.e != cudaSuccess && g_errp.owner == err_tid()) g_errp.e = cudaSuccess;   /* (this thread's own: consumed here) */
+    else if (e == cudaSuccess && !g_err_worker && g_errp.e != cudaSuccess) {   /* another thread's (a GPU thread's, for the main thread) */
+        e = g_errp.e; ef = g_errp.file; ew = g_errp.what; el = g_errp.line; from = g_errp.dev; g_errp.e = cudaSuccess;
+    }
+    pthread_mutex_unlock(&g_errp_mu);
     if (e != cudaSuccess) {
-        int k = snprintf(g_err_site, sizeof g_err_site, "%s:%d (%s)", g_err_file ? g_err_file : "?", g_err_line, g_err_what ? g_err_what : "?");
+        int k = snprintf(g_err_site, sizeof g_err_site, "%s:%d (%s)", ef ? ef : "?", el, ew ? ew : "?");
+        if (from > -2 && k > 0 && (size_t)k < sizeof g_err_site) k += snprintf(g_err_site + k, sizeof g_err_site - (size_t)k, " on GPU %d's thread", from);
         Dl_info di;   /* a copy wrapper's caller: addr2line -f -e <binary> OFFSET names it */
-        if (g_err_ra && k > 0 && (size_t)k < sizeof g_err_site && dladdr(g_err_ra, &di) && di.dli_fbase)
+        if (from == -2 && g_err_ra && k > 0 && (size_t)k < sizeof g_err_site && dladdr(g_err_ra, &di) && di.dli_fbase)
             snprintf(g_err_site + k, sizeof g_err_site - (size_t)k, " called from %s+0x%zx", di.dli_sname ? di.dli_sname : "binary", di.dli_sname ? (size_t)((char *)g_err_ra - (char *)di.dli_saddr) : (size_t)((char *)g_err_ra - (char *)di.dli_fbase));
         g_err_ra = nullptr;
     }
     else { e = cudaGetLastError(); snprintf(g_err_site, sizeof g_err_site, "%s", e == cudaSuccess ? "" : "cudaGetLastError at the check (an unchecked kernel launch or copy)"); }
-    const char *lp_error = lp_check();   /* low-precision kernels clear CUDA's last error into their own buffer */
+    const char *lp_error = lp_check();   /* low-precision kernels clear CUDA's last error into their own (per-thread) latch */
     if (e == cudaSuccess && lp_error) snprintf(g_err_site, sizeof g_err_site, "a low-precision kernel (lp_check's latch)");
     return e == cudaSuccess ? lp_error : cudaGetErrorString(e);
 }
@@ -256,7 +312,12 @@ static void pool_add(void *p, size_t n, int host) {
 static int pool_release(void *p) {   /* a pooled block freed: kept for reuse */
     if (!g_pool_on) return 0;
     std::lock_guard<std::mutex> l(g_pmu);
-    for (int i = 0; i < g_npool; i++) if (g_pool[i].p == p) { g_pool[i].live = 0; return 1; }
+    for (int i = 0; i < g_npool; i++) if (g_pool[i].p == p) {
+        if (g_pool[i].host) cudaDeviceSynchronize();   /* (a pinned block goes back for reuse: async copies still reading / writing it finish first, as
+                                                          cudaFreeHost would wait for them; audit mini/cudasync #3. Current device: the pool is per box,
+                                                          one device per process in predict's pool mode) */
+        g_pool[i].live = 0; return 1;
+    }
     return 0;
 }
 static void host_untrack(void *p);
@@ -285,7 +346,7 @@ extern "C" void *nn_malloc(size_t n) {
     if (e != cudaSuccess) {   /* say so (the sticky g_err alone surfaced as a segfault in the next copy to the null pointer) */
         size_t fr = 0, tot = 0; cudaGetLastError(); cudaMemGetInfo(&fr, &tot);
         fprintf(stderr, "nn_malloc: cudaMalloc of %.2f GB failed (%s; %.2f of %.2f GB free on the device)\n", n / 1e9, cudaGetErrorString(e), fr / 1e9, tot / 1e9);
-        if (g_err == cudaSuccess) { g_err = e; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = "cudaMalloc in nn_malloc"; }
+        if (g_err == cudaSuccess) { g_err = e; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = "cudaMalloc in nn_malloc"; nn_err_post((int)e, __FILE__, __LINE__, g_err_what); }
         /* no caller takes a null buffer (the optional ones use nn_malloc_try): returning it let the next kernels write through null, and
            the run ended many lines later in "an illegal memory access was encountered" from an unrelated allocation (fit-field predict
            beside a training run). End here, with the size and the caller. UFSM_MALLOC_NULL=1: the old return (debugging) */
@@ -339,8 +400,8 @@ extern "C" size_t nn_mx_bytes(shape5 s, int dt) { return dt == 4 ? nn_mx4_bytes(
    region is backed by physical chunk s mod R of that region, so a kernel addressing the whole tensor reads and writes a ring of R slabs
    (a slab is the schedule's: it must be dead when slab s + R is written). Probed under WSL2 by worker S2 (2 MB granularity). */
 #include <cuda.h>
-static struct {
-    int tried, ok; size_t gran; int dev;
+static struct {   /* mgpu: guarded (g_ring_mu; the entry points are process-wide, the granularity per device) */
+    int tried, ok; size_t gran[16];
     CUresult (*gran_f)(size_t *, const CUmemAllocationProp *, CUmemAllocationGranularity_flags);
     CUresult (*reserve)(CUdeviceptr *, size_t, size_t, CUdeviceptr, unsigned long long);
     CUresult (*afree)(CUdeviceptr, size_t);
@@ -350,28 +411,40 @@ static struct {
     CUresult (*unmap)(CUdeviceptr, size_t);
     CUresult (*access)(CUdeviceptr, size_t, const CUmemAccessDesc *, size_t);
 } g_vm;
-static int vm_init(void) {
-    if (g_vm.tried) return g_vm.ok;
-    g_vm.tried = 1;
-    cudaDriverEntryPointQueryResult q;
+/* (2026-11-14 audit: the device was latched at the first call, so under data parallel GPU 1's rings were backed by GPU 0's memory and
+   mapped for GPU 0's access only; the ring table was appended without a lock from both GPU threads) */
+static pthread_mutex_t g_ring_mu = PTHREAD_MUTEX_INITIALIZER;
+static int vm_init_locked(int *dev) {   /* the entry points once; the current device and its granularity (0: no VMM) */
+    if (!g_vm.tried) {
+        g_vm.tried = 1;
+        cudaDriverEntryPointQueryResult q;
 #define VMGET(f, name) if (cudaGetDriverEntryPointByVersion(name, (void **)&g_vm.f, 12000, cudaEnableDefault, &q) != cudaSuccess || q != cudaDriverEntryPointSuccess) { cudaGetLastError(); return 0; }
-    VMGET(gran_f, "cuMemGetAllocationGranularity") VMGET(reserve, "cuMemAddressReserve") VMGET(afree, "cuMemAddressFree") VMGET(create, "cuMemCreate")
-    VMGET(release, "cuMemRelease") VMGET(map, "cuMemMap") VMGET(unmap, "cuMemUnmap") VMGET(access, "cuMemSetAccess")
+        VMGET(gran_f, "cuMemGetAllocationGranularity") VMGET(reserve, "cuMemAddressReserve") VMGET(afree, "cuMemAddressFree") VMGET(create, "cuMemCreate")
+        VMGET(release, "cuMemRelease") VMGET(map, "cuMemMap") VMGET(unmap, "cuMemUnmap") VMGET(access, "cuMemSetAccess")
 #undef VMGET
-    if (cudaGetDevice(&g_vm.dev) != cudaSuccess) { cudaGetLastError(); return 0; }
-    CUmemAllocationProp pr; memset(&pr, 0, sizeof pr);
-    pr.type = CU_MEM_ALLOCATION_TYPE_PINNED; pr.location.type = CU_MEM_LOCATION_TYPE_DEVICE; pr.location.id = g_vm.dev;
-    if (g_vm.gran_f(&g_vm.gran, &pr, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS || !g_vm.gran) return 0;
-    g_vm.ok = 1;
-    return 1;
+        g_vm.ok = 1;
+    }
+    if (!g_vm.ok) return 0;
+    int d = 0; if (cudaGetDevice(&d) != cudaSuccess || d < 0 || d >= 16) { cudaGetLastError(); return 0; }
+    *dev = d;
+    if (!g_vm.gran[d]) {
+        CUmemAllocationProp pr; memset(&pr, 0, sizeof pr);
+        pr.type = CU_MEM_ALLOCATION_TYPE_PINNED; pr.location.type = CU_MEM_LOCATION_TYPE_DEVICE; pr.location.id = d;
+        if (g_vm.gran_f(&g_vm.gran[d], &pr, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS) g_vm.gran[d] = 0;
+    }
+    return g_vm.gran[d] != 0;
 }
 #define NN_MAXRING 64
 #define NN_RINGREG 16
 #define NN_RINGH 128   /* physical chunks per ring: cuMemMap maps whole allocations (offset 0), so one handle per slab slot */
-static struct { CUdeviceptr va; size_t vbytes, pbytes; int nh; CUmemGenericAllocationHandle h[NN_RINGH]; } g_ring[NN_MAXRING];
-static int g_nring;
-extern "C" size_t nn_ring_gran(void) { return vm_init() ? g_vm.gran : 0; }
-extern "C" size_t nn_ring_bytes(void) { size_t b = 0; for (int i = 0; i < g_nring; i++) b += g_ring[i].pbytes; return b; }   /* physical bytes of the live rings */
+static struct { CUdeviceptr va; size_t vbytes, pbytes; int nh, dev; CUmemGenericAllocationHandle h[NN_RINGH]; } g_ring[NN_MAXRING];   /* mgpu: guarded (g_ring_mu) */
+static int g_nring;   /* mgpu: guarded (g_ring_mu) */
+extern "C" size_t nn_ring_gran(void) { pthread_mutex_lock(&g_ring_mu); int d = 0; const size_t g = vm_init_locked(&d) ? g_vm.gran[d] : 0; pthread_mutex_unlock(&g_ring_mu); return g; }
+extern "C" size_t nn_ring_bytes(void) {   /* physical bytes of the current device's live rings */
+    int d = 0; cudaGetDevice(&d); size_t b = 0;
+    pthread_mutex_lock(&g_ring_mu); for (int i = 0; i < g_nring; i++) if (g_ring[i].dev == d) b += g_ring[i].pbytes; pthread_mutex_unlock(&g_ring_mu);
+    return b;
+}
 static void ring_drop(int i) {
     if (g_ring[i].vbytes) g_vm.unmap(g_ring[i].va, g_ring[i].vbytes);
     for (int k = 0; k < g_ring[i].nh; k++) g_vm.release(g_ring[i].h[k]);
@@ -380,22 +453,27 @@ static void ring_drop(int i) {
 }
 /* nreg regions of reg[r] bytes (consecutive), slabs of slab[r] bytes, R slabs backed per region (fewer if a region has fewer): the
    virtual address of the whole range, or nullptr (no VMM, sizes not on the mapping granularity, out of memory). *phys: bytes backed */
+static void *ring_alloc_locked(int nreg, const size_t *reg, const size_t *slab, int R, size_t *phys);
 extern "C" void *nn_ring_alloc(int nreg, const size_t *reg, const size_t *slab, int R, size_t *phys) {
+    pthread_mutex_lock(&g_ring_mu); void *p = ring_alloc_locked(nreg, reg, slab, R, phys); pthread_mutex_unlock(&g_ring_mu); return p;
+}
+static void *ring_alloc_locked(int nreg, const size_t *reg, const size_t *slab, int R, size_t *phys) {
     if (phys) *phys = 0;
-    if (!vm_init()) { fprintf(stderr, "nn_ring_alloc: no CUDA virtual memory management\n"); return nullptr; }
+    int dev = 0;
+    if (!vm_init_locked(&dev)) { fprintf(stderr, "nn_ring_alloc: no CUDA virtual memory management\n"); return nullptr; }
     if (nreg < 1 || nreg > NN_RINGREG || g_nring >= NN_MAXRING || R < 1) { fprintf(stderr, "nn_ring_alloc: %d regions, %d rings live, R %d\n", nreg, g_nring, R); return nullptr; }
-    const size_t G = g_vm.gran;
+    const size_t G = g_vm.gran[dev];
     size_t tot = 0;
     for (int r = 0; r < nreg; r++) {
         if (!reg[r] || !slab[r] || reg[r] % G || slab[r] % G || reg[r] % slab[r]) { fprintf(stderr, "nn_ring_alloc: region %d of %zu bytes, slabs of %zu: not on the %zu-byte granularity\n", r, reg[r], slab[r], G); return nullptr; }
         tot += reg[r];
     }
     const int i = g_nring++;
-    memset(&g_ring[i], 0, sizeof g_ring[i]);
+    memset(&g_ring[i], 0, sizeof g_ring[i]); g_ring[i].dev = dev;
     CUresult e = g_vm.reserve(&g_ring[i].va, tot, G, 0, 0);
     if (e != CUDA_SUCCESS) { fprintf(stderr, "nn_ring_alloc: cuMemAddressReserve(%zu) = %d\n", tot, (int)e); g_nring--; return nullptr; }
     CUmemAllocationProp pr; memset(&pr, 0, sizeof pr);
-    pr.type = CU_MEM_ALLOCATION_TYPE_PINNED; pr.location.type = CU_MEM_LOCATION_TYPE_DEVICE; pr.location.id = g_vm.dev;
+    pr.type = CU_MEM_ALLOCATION_TYPE_PINNED; pr.location.type = CU_MEM_LOCATION_TYPE_DEVICE; pr.location.id = dev;
     size_t off = 0, mapped = 0;
     int bad = 0;
     for (int r = 0; r < nreg && !bad; r++) {
@@ -413,7 +491,7 @@ extern "C" void *nn_ring_alloc(int nreg, const size_t *reg, const size_t *slab, 
         off += reg[r];
     }
     CUmemAccessDesc ad; memset(&ad, 0, sizeof ad);
-    ad.location.type = CU_MEM_LOCATION_TYPE_DEVICE; ad.location.id = g_vm.dev; ad.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    ad.location.type = CU_MEM_LOCATION_TYPE_DEVICE; ad.location.id = dev; ad.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     if (!bad && (e = g_vm.access(g_ring[i].va, tot, &ad, 1)) != CUDA_SUCCESS) { fprintf(stderr, "nn_ring_alloc: cuMemSetAccess(%zu) = %d\n", tot, (int)e); bad = 1; }
     if (bad) {   /* (the mapped prefix: whole mappings) */
         g_ring[i].vbytes = mapped; ring_drop(i);
@@ -428,8 +506,8 @@ static int ring_find(const void *p) { for (int i = 0; i < g_nring; i++) if (g_ri
 extern "C" void nn_free(void *p) {
     if (!p) return;
     if (g_nreg) nn_storage_forget(p);
-    const int i = ring_find(p);
-    if (i >= 0) { CK(cudaDeviceSynchronize()); ring_drop(i); return; }
+    pthread_mutex_lock(&g_ring_mu); const int ring = ring_find(p) >= 0; pthread_mutex_unlock(&g_ring_mu);
+    if (ring) { CK(cudaDeviceSynchronize()); pthread_mutex_lock(&g_ring_mu); const int i = ring_find(p); if (i >= 0) ring_drop(i); pthread_mutex_unlock(&g_ring_mu); return; }
     if (pool_release(p)) return;
     CK(cudaFree(p));
 }
@@ -630,6 +708,52 @@ extern "C" void nn_ptick_report(int steps) {
 }
 extern "C" size_t nn_mem_free(void) { size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); return f; }
 extern "C" size_t nn_mem_total(void) { size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); return t; }
+/* ---- kernel workspaces (2026-11-14 audit net#4): the grow-on-demand device scratch of the kernels (lp_buf slots, the fp4 GroupNorm
+   input copy, the fine stem's partial sums, the 16-bit tensor-core weight copies) in one per-device registry, so the trainer's memory
+   planner can size them for its window (unet_ws_plan), allocate them before the first step (nn_ws_reserve) and see any later growth:
+   after nn_ws_seal a grow prints one line (a planner miss: its bytes were not in the plan), and an id with a soft limit (nn_ws_limit)
+   refuses instead (its caller has a fallback with the same bits). Before, each site kept its own static pointer, grew with cudaFree +
+   cudaMalloc in the middle of a step (a device-wide synchronisation) and was outside the plan (the fixed 550 MB guess). Keyed by the
+   current device: one host thread per GPU (data parallel, --split sides), as the sites' own statics were. */
+static const char *const g_ws_name[NN_WS_N] = {
+    "lp_buf u8 slot 0", "lp_buf u8 slot 1", "lp_buf u8 slot 2", "lp_buf u8 slot 3", "lp_buf u8 slot 4", "lp_buf u8 slot 5",
+    "lp_buf f32 slot 0", "lp_buf f32 slot 1", "lp_buf f32 slot 2", "lp_buf f32 slot 3", "lp_buf f32 slot 4", "lp_buf f32 slot 5",
+    "lp_buf f16 slot 0", "lp_buf f16 slot 1", "lp_buf f16 slot 2", "lp_buf f16 slot 3", "lp_buf f16 slot 4", "lp_buf f16 slot 5",
+    "lp_buf bf16 slot 0", "lp_buf bf16 slot 1", "lp_buf bf16 slot 2", "lp_buf bf16 slot 3", "lp_buf bf16 slot 4", "lp_buf bf16 slot 5",
+    "fp4 GroupNorm input copy (prenorm)", "fine stem partial sums", "tc weight copy (16-bit)", "tc weight scales", "s2b gy overlap copy"};
+static void *g_ws[8][NN_WS_N]; static size_t g_ws_cap[8][NN_WS_N], g_ws_lim[8][NN_WS_N]; static int g_ws_sealed[8];   /* mgpu: per-device */
+static pthread_mutex_t g_ws_mu = PTHREAD_MUTEX_INITIALIZER;   /* (the late-grow report and the totals; the slots themselves are per device) */
+static int ws_dev(void) { int d = 0; cudaGetDevice(&d); return d & 7; }
+static int ws_grow(int d, int id, size_t bytes) {
+    if (g_ws[d][id]) cudaFree(g_ws[d][id]);
+    g_ws[d][id] = nullptr; g_ws_cap[d][id] = 0;
+    if (cudaMalloc(&g_ws[d][id], bytes) != cudaSuccess) { cudaGetLastError(); g_ws[d][id] = nullptr; return -1; }
+    g_ws_cap[d][id] = bytes;
+    if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) > 0) fprintf(stderr, "nn_ws: %s -> %.1f MB (GPU %d)\n", g_ws_name[id], bytes / 1e6, d);
+    return 0;
+}
+extern "C" void *nn_ws(int id, size_t bytes) {
+    if (id < 0 || id >= NN_WS_N) return nullptr;
+    const int d = ws_dev();
+    if (bytes <= g_ws_cap[d][id]) return g_ws[d][id];
+    if (g_ws_sealed[d]) {
+        if (g_ws_lim[d][id] && bytes > g_ws_lim[d][id]) return nullptr;   /* (a soft limit: the caller's fallback) */
+        pthread_mutex_lock(&g_ws_mu);
+        fprintf(stderr, "nn_ws: %s grew after the memory plan, %.1f -> %.1f MB on GPU %d (outside the plan; unet_ws_plan misses this shape)\n",
+                g_ws_name[id], g_ws_cap[d][id] / 1e6, bytes / 1e6, d);
+        pthread_mutex_unlock(&g_ws_mu);
+    }
+    return ws_grow(d, id, bytes) ? nullptr : g_ws[d][id];
+}
+extern "C" int nn_ws_reserve(int id, size_t bytes) {   /* the current device's workspace id at >= bytes now; -1 if that failed */
+    if (id < 0 || id >= NN_WS_N) return -1;
+    const int d = ws_dev();
+    return bytes <= g_ws_cap[d][id] ? 0 : ws_grow(d, id, bytes);
+}
+extern "C" void nn_ws_limit(int id, size_t bytes) { if (id >= 0 && id < NN_WS_N) g_ws_lim[ws_dev()][id] = bytes; }   /* 0: none */
+extern "C" void nn_ws_seal(int on) { g_ws_sealed[ws_dev()] = on; }
+extern "C" size_t nn_ws_bytes(int id) { const int d = ws_dev(); if (id >= 0) return id < NN_WS_N ? g_ws_cap[d][id] : 0; size_t t = 0; for (int i = 0; i < NN_WS_N; i++) t += g_ws_cap[d][i]; return t; }
+extern "C" const char *nn_ws_name(int id) { return id >= 0 && id < NN_WS_N ? g_ws_name[id] : "?"; }
 extern "C" void ufsm_no_verify_types(const char *fn) {
     fprintf(stderr, "%s: bf16 / fp32 tensor-core kernels are not in this build (rebuild with make VERIFY=1)\n", fn); abort();
 }

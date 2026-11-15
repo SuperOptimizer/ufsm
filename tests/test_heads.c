@@ -35,10 +35,11 @@ static char *slurp(const char *path) {
     char *s = malloc((size_t)n + 1); if (!s) { fclose(f); return nullptr; }
     s[fread(s, 1, (size_t)n, f)] = 0; fclose(f); return s;
 }
-/* the window shares added 2026-11-13 after "phase / rv / side / normal bce X" and wind4's "acc X" (the means over the windows that carry
+/* (and the " (kl ...)" group added 2026-11-14 after the heads' bces.) The window shares added 2026-11-13 after "phase / rv / side / normal bce X" and wind4's "acc X" (the means over the windows that carry
    each label): removed before the comparison, so the reference (logged before them, every fixture window labelled) still applies and
    a 100 %-labelled run must reproduce its numbers unchanged. The ink / fib / fibn shares stay (they are in the reference). */
 static void strip_new_shares(char *ln) {
+    for (char *p; (p = strstr(ln, " (kl ")); ) { char *q = strchr(p, ')'); if (!q) break; memmove(p, q + 1, strlen(q + 1) + 1); }   /* the KL group (2026-11-14) */
     for (char *p = ln; (p = strstr(p, " (")); ) {
         char *q = p + 2; while (*q >= '0' && *q <= '9') q++;
         if (q == p + 2 || strncmp(q, "% of windows)", 13)) { p += 2; continue; }
@@ -98,7 +99,7 @@ int main(int argc, char **argv) {
     CHECK(!sh("%s %s/fx 256 2 1 > %s/fx.log 2>&1", argv[2], d, d), "fixture");
     /* the fibre plane of the combined runs: the fixture's ink raster again, as the sources' "fibre" target next to "ink" */
     CHECK(!sh("sed 's|\"ink\": *{\\([^}]*\\)}|\"ink\": {\\1}, \"fibre\": {\\1}|' %s/fx/sources-ink.json > %s/fx/sources-fib.json && grep -q fibre %s/fx/sources-fib.json", d, d, d), "sources with a fibre target");
-    const char *common = "--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 "
+    const char *common = "--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-train-ok 1 --val-every 1000 --log-every 1 "
                          "--ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --widths 16,32,64 --det 1 --steps 4";
     static const struct { const char *name, *src, *flags; } old[] = {
         {"plain", "sources.json", ""},
@@ -209,6 +210,7 @@ int main(int argc, char **argv) {
         char cm[2048]; snprintf(cm, sizeof cm, "%s", common); { char *ls = strstr(cm, " --steps 4"); if (ls) memmove(ls, ls + 10, strlen(ls + 10) + 1); }
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/uw %s %s --steps 4 > %s/uw.log 2>&1", U, d, d, cm, uf, d), "uw + grad-cos run (%s/uw.log)", d);
         CHECK(!sh("grep -q 'grad-cos step 4 (head input): phase/normal [-+]0[.][0-9]*.*rv/ink [-+]0[.]' %s/uw.log && grep -q 'uw phase [0-9.]* normal 0[.]' %s/uw.log", d, d), "uw + grad-cos: the cosine and weight lines");
+        CHECK(!sh("grep -q 'grad-norm step 4 (head input): phase [0-9.e+-]* normal [0-9.e+-]*.* ink [0-9.e+-]*' %s/uw.log", d), "grad-cos: the per-head gradient norm line");
         CHECK(!sh("head -1 %s/uw/last.ckpt | grep -q '\"uw\":{\"t\":4,'", d), "uw: header t 4");
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/uw --resume %s/uw/last.ckpt %s %s --steps 6 > %s/uw2.log 2>&1 && grep -q '(resumed)' %s/uw2.log && head -1 %s/uw/last.ckpt | grep -q '\"uw\":{\"t\":6,'", U, d, d, d, cm, uf, d, d, d), "uw resume (%s/uw2.log)", d);
     }

@@ -23,6 +23,7 @@
    --cls MODEL (ufsm recto-cls train): the classifier's turns per hit interval of --dump-src summed along the ray; columns cls (argmax)
    and clsE (expectation), Q from linear interpolation between hits. CPU, rays on --threads threads. */
 #include "fit.h"
+#include "optcheck.h"
 #include "rectoruler.h"
 #include "sysinfo.h"
 #include "zarr2.h"
@@ -42,7 +43,7 @@ __attribute__((weak)) int jpeg_write_rgb(const char *path, int w, int h, const u
 
 enum { RR_MAXS = 8 };
 static const char *rr_opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 static double rr_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
@@ -440,13 +441,13 @@ int cmd_recto_ruler(int argc, char **argv) {
     fit_fields_buf g; if (fit_fields_load(argv[3], 0, 0, 0, &g)) { fprintf(stderr, "recto-ruler: cannot read the fields in %s\n", argv[3]); return 1; }
     const double h = g.h, um = g.um; long long forg[3]; int fsh[3]; for (int d = 0; d < 3; d++) { forg[d] = g.origin[d]; fsh[d] = g.shape[d]; } fit_fields_free(&g);
     if (m->h != h) { fprintf(stderr, "recto-ruler: the model's cell h %g differs from the fields' %g\n", m->h, h); return 1; }
-    const int nth = atoi(rr_opt(argc, argv, "--nth", "180")), nt = ufsm_threads(atoi(rr_opt(argc, argv, "--threads", "0")), 16);
+    const int nth = opt_atoi("--nth", rr_opt(argc, argv, "--nth", "180")), nt = ufsm_threads(opt_atoi("--threads", rr_opt(argc, argv, "--threads", "0")), 16);
     const char *cache = rr_opt(argc, argv, "--cache", nullptr);
     fit_set_threads(nt);
     rr_src S[RR_MAXS]; int ns = 0; memset(S, 0, sizeof S);
     double finest = um;
     for (int i = 3; i < argc; i++) {
-        if (!strcmp(argv[i], "--src")) {
+        if (!strcmp(argv[i], opt_n("--src"))) {
             if (i + 4 >= argc || ns == RR_MAXS) { fprintf(stderr, "recto-ruler: --src NAME ROOT KEY UM (at most %d)\n", RR_MAXS); return 2; }
             rr_src *s = &S[ns]; snprintf(s->name, sizeof s->name, "%s", argv[i + 1]); s->um = atof(argv[i + 4]);
             store *st = store_open(argv[i + 2]);
@@ -455,7 +456,7 @@ int cmd_recto_ruler(int argc, char **argv) {
             const int64_t *sh = s->z ? z3_meta_of(s->z)->shape : z2_meta_of(s->z2v)->shape; for (int d = 0; d < 3; d++) s->shape[d] = sh[d];
             if (!(s->um > 0)) { fprintf(stderr, "recto-ruler: --src %s: UM > 0\n", s->name); return 2; }
             ns++; i += 4;
-        } else if (!strcmp(argv[i], "--ens")) {
+        } else if (!strcmp(argv[i], opt_n("--ens"))) {
             if (i + 3 >= argc || ns == RR_MAXS) { fprintf(stderr, "recto-ruler: --ens NAME mean|max A,B\n"); return 2; }
             rr_src *s = &S[ns]; snprintf(s->name, sizeof s->name, "%s", argv[i + 1]); s->ens = !strcmp(argv[i + 2], "max") ? 2 : !strcmp(argv[i + 2], "gmean") ? 3 : !strcmp(argv[i + 2], "norm") ? 4 : 1; s->um = um;
             char buf[512]; snprintf(buf, sizeof buf, "%s", argv[i + 3]);
@@ -464,12 +465,12 @@ int cmd_recto_ruler(int argc, char **argv) {
             ns++; i += 3;
         }
     }
-    for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], "--src-box")) {
+    for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--src-box"))) {
         int f = -1; for (int k = 0; k < ns; k++) if (!strcmp(S[k].name, argv[i + 1])) f = k;
         if (f < 0 || sscanf(argv[i + 2], "%lf,%lf,%lf,%lf,%lf,%lf", &S[f].vb[0], &S[f].vb[1], &S[f].vb[2], &S[f].vb[3], &S[f].vb[4], &S[f].vb[5]) != 6) { fprintf(stderr, "recto-ruler: --src-box NAME Z0,Y0,X0,Z1,Y1,X1\n"); return 2; }
         S[f].hasbox = 1; i += 2;
     }
-    for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], "--map")) {   /* --map NAME REG.json: NAME's UM is its own voxel um (fine scan level) */
+    for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--map"))) {   /* --map NAME REG.json: NAME's UM is its own voxel um (fine scan level) */
         int f = -1; for (int k = 0; k < ns; k++) if (!strcmp(S[k].name, argv[i + 1])) f = k;
         if (f < 0) { fprintf(stderr, "recto-ruler: --map: no source %s\n", argv[i + 1]); return 2; }
         rvol *fv = nullptr; double fum = 0; if (!reg_map_open || !(S[f].map = reg_map_open(argv[i + 2], cache, &fv, &S[f].cum, &fum)) || !(fum > 0)) { fprintf(stderr, "recto-ruler: cannot open the map %s\n", argv[i + 2]); return 1; }
@@ -477,13 +478,13 @@ int cmd_recto_ruler(int argc, char **argv) {
         i += 2;
     }
     for (int s = 0; s < ns; s++) if (!S[s].ens && S[s].um < finest) finest = S[s].um;
-    const double step_um = atof(rr_opt(argc, argv, "--step-um", "0")) > 0 ? atof(rr_opt(argc, argv, "--step-um", "0")) : finest / 2, step = step_um / um;
-    const double sigma = atof(rr_opt(argc, argv, "--sigma", "0.5")), prom = atof(rr_opt(argc, argv, "--prom", "25")), sep = atof(rr_opt(argc, argv, "--sep-um", "20")), win = atof(rr_opt(argc, argv, "--win-um", "60")), thr = atof(rr_opt(argc, argv, "--thr", "128"));
+    const double step_um = opt_atof("--step-um", rr_opt(argc, argv, "--step-um", "0")) > 0 ? opt_atof("--step-um", rr_opt(argc, argv, "--step-um", "0")) : finest / 2, step = step_um / um;
+    const double sigma = opt_atof("--sigma", rr_opt(argc, argv, "--sigma", "0.5")), prom = opt_atof("--prom", rr_opt(argc, argv, "--prom", "25")), sep = opt_atof("--sep-um", rr_opt(argc, argv, "--sep-um", "20")), win = opt_atof("--win-um", rr_opt(argc, argv, "--win-um", "60")), thr = opt_atof("--thr", rr_opt(argc, argv, "--thr", "128"));
     z3 *cz = nullptr, *qz = nullptr; double ctum = 0, cf = 1;
     for (int i = 3; i + 2 < argc; i++) {
-        if (!strcmp(argv[i], "--ct")) { ctum = atof(rr_opt(argc, argv, "--ct-um", "0")); if (!(ctum > 0)) { fprintf(stderr, "recto-ruler: --ct needs --ct-um\n"); return 2; }
+        if (!strcmp(argv[i], opt_n("--ct"))) { ctum = opt_atof("--ct-um", rr_opt(argc, argv, "--ct-um", "0")); if (!(ctum > 0)) { fprintf(stderr, "recto-ruler: --ct needs --ct-um\n"); return 2; }
                                        if (!(cz = z3_open(store_open(argv[i + 1]), argv[i + 2], cache))) { fprintf(stderr, "recto-ruler: %s\n", z3_error()); return 1; } }
-        if (!strcmp(argv[i], "--codes")) { if (!(qz = z3_open(store_open(argv[i + 1]), argv[i + 2], nullptr))) { fprintf(stderr, "recto-ruler: %s\n", z3_error()); return 1; }
+        if (!strcmp(argv[i], opt_n("--codes"))) { if (!(qz = z3_open(store_open(argv[i + 1]), argv[i + 2], nullptr))) { fprintf(stderr, "recto-ruler: %s\n", z3_error()); return 1; }
                                           cf = atof(argv[i + 2]) > 0 ? atof(argv[i + 2]) / um : 1; }
     }
     if (!qz) { fprintf(stderr, "recto-ruler: --codes ROOT KEY needed\n"); return 2; }
@@ -502,7 +503,7 @@ int cmd_recto_ruler(int argc, char **argv) {
     double zs[4096]; int nzs = 0;
     { const char *zl = rr_opt(argc, argv, "--zs", nullptr);
       if (zl) { char buf[65536]; snprintf(buf, sizeof buf, "%s", zl); for (char *t = strtok(buf, ","); t && nzs < 4096; t = strtok(nullptr, ",")) zs[nzs++] = floor(atof(t)) + 0.5; }
-      else { const int nz = atoi(rr_opt(argc, argv, "--nz", "16")); for (int i = 0; i < nz && i < 4096; i++) zs[nzs++] = floor(zr0 + (i + 0.5) * (zr1 - zr0) / nz) + 0.5; } }
+      else { const int nz = opt_atoi("--nz", rr_opt(argc, argv, "--nz", "16")); for (int i = 0; i < nz && i < 4096; i++) zs[nzs++] = floor(zr0 + (i + 0.5) * (zr1 - zr0) / nz) + 0.5; } }
     const double morg[3] = {(double)m->origin[0], (double)m->origin[1], (double)m->origin[2]};
     const double Y = m->H * h, X = m->W * h, F = cz ? um / ctum : 1;
     printf("recto-ruler: %s: box %dx%dx%d cells h %g (%.3f um), %d z levels x %d rays, step %.2f um, sources", argv[2], m->D, m->H, m->W, h, um, nzs, nth, step_um);
@@ -550,7 +551,7 @@ int cmd_recto_ruler(int argc, char **argv) {
             double ib[3] = {0, 0, 0}; if (sscanf(rr_opt(argc, argv, "--img-box", ""), "%lf,%lf,%lf", &ib[0], &ib[1], &ib[2]) != 3) { fprintf(stderr, "recto-ruler: --img needs --img-box CY,CX,HALF\n"); return 2; }
             { const int iz = (int)fmin(zl, m->D * m->h); ib[0] += m->cy[iz]; ib[1] += m->cx[iz]; }   /* (CY, CX: offsets from the umbilicus) */
             if (rr_image(&J, rr_opt(argc, argv, "--img", nullptr), ib[0], ib[1], ib[2], finest / um)) fprintf(stderr, "recto-ruler: --img failed\n");
-            if (atoi(rr_opt(argc, argv, "--img-only", "0"))) return 0;
+            if (opt_atoi("--img-only", rr_opt(argc, argv, "--img-only", "0"))) return 0;
         }
         J.out = calloc(nth, sizeof(rr_iv *)); J.nout = calloc(nth, sizeof(int));
         if (df) { J.dump = calloc(nth, sizeof(float *)); J.ndump = calloc(nth, sizeof(int)); }

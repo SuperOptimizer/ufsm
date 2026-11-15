@@ -19,6 +19,7 @@
    --levels and --shard. A pass with <out>/.seam/<p>/.done is not rerun (resume after a blend failure); .seam is removed at the end
    (UFSM_SEAM_KEEP=1 keeps it). */
 #include "inkblend.h"
+#include "optcheck.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -34,7 +35,7 @@
 extern char **environ;
 
 static const char *sopt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 static int rm_cb(const char *p, const struct stat *sb, int fl, struct FTW *f) { (void)sb; (void)fl; (void)f; return remove(p); }
@@ -51,7 +52,7 @@ static const char *const own[] = {"--seamless", "--gpus", "--gpu", "--q", "--lev
                                   "--halo", "--resume", "--boxes", "--box", nullptr};
 static int g_split;   /* --split z --gpus A,B: every window split over both GPUs; the passes keep --split / --gpus and run one after the other */
 static int owned(const char *a) {
-    if (g_split && (!strcmp(a, "--gpus") || !strcmp(a, "--gpu"))) return 0;
+    if (g_split && (!strcmp(a, opt_n("--gpus")) || !strcmp(a, opt_n("--gpu")))) return 0;
     for (int k = 0; own[k]; k++) if (!strcmp(a, own[k])) return 1;
     return 0;
 }
@@ -153,7 +154,7 @@ static int seamless_inproc(int argc, char **argv, int W, int H, int S2, int gpu)
     snprintf(sw, sizeof sw, "%d", W); snprintf(sh, sizeof sh, "%d", H); snprintf(ss, sizeof ss, "%d", S2); snprintf(sg, sizeof sg, "%d", gpu);
     for (int i = 0; i < 6 && i < argc; i++) v[n++] = argv[i];
     for (int i = 6; i < argc; i++) {
-        if (!strcmp(argv[i], "--q") || !strcmp(argv[i], "--levels")) { v[n++] = argv[i]; if (i + 1 < argc) v[n++] = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--q")) || !strcmp(argv[i], opt_n("--levels"))) { v[n++] = argv[i]; if (i + 1 < argc) v[n++] = argv[++i]; continue; }
         if (owned(argv[i]) && i + 1 < argc) { i++; continue; }
         v[n++] = argv[i];
     }
@@ -167,7 +168,7 @@ static int seamless_inproc(int argc, char **argv, int W, int H, int S2, int gpu)
 }
 
 int predict_seamless(int argc, char **argv) {
-    const int mode = atoi(sopt(argc, argv, "--seamless", "0"));
+    const int mode = opt_atoi("--seamless", sopt(argc, argv, "--seamless", "0"));
     if (mode != 2) { fprintf(stderr, "predict --seamless: 2 (two passes on half-tile-shifted grids, sin^2 blend) is the one mode\n"); return 2; }
     if (argc < 6) { fprintf(stderr, "predict --seamless: needs the positional arguments (ufsm predict CKPT ROOT KEY OUT ...)\n"); return 2; }
     const int inproc = getenv("UFSM_SEAM_INPROC") && atoi(getenv("UFSM_SEAM_INPROC"));
@@ -181,12 +182,12 @@ int predict_seamless(int argc, char **argv) {
     const char *ws = sopt(argc, argv, "--window", ""), *hs = sopt(argc, argv, "--halo", "");
     const int W = *ws && strcmp(ws, "auto") ? atoi(ws) : 544, H = *hs ? atoi(hs) : 16, S = W - 2 * H, S2 = S / 2;
     if (H < 0 || S <= 0 || S % 256) { fprintf(stderr, "predict --seamless: window - 2 halo must be a positive multiple of 256 (window %d, halo %d)\n", W, H); return 2; }
-    int ga = atoi(sopt(argc, argv, "--gpu", "0")), gb = ga, par = 0;
+    int ga = opt_atoi("--gpu", sopt(argc, argv, "--gpu", "0")), gb = ga, par = 0;
     const char *gl = sopt(argc, argv, "--gpus", nullptr);
     if (gl && !g_split) { if (sscanf(gl, "%d,%d", &ga, &gb) == 2 && ga != gb) par = 1; else if (sscanf(gl, "%d", &ga) == 1) gb = ga; }
     if (inproc) return seamless_inproc(argc, argv, W, H, S2, ga);
-    const char *out = argv[5]; const double q = atof(sopt(argc, argv, "--q", "8")); const int nlev = atoi(sopt(argc, argv, "--levels", "4"));
-    const int shard = atoi(sopt(argc, argv, "--shard", "512")), nt = atoi(sopt(argc, argv, "--threads", "8"));
+    const char *out = argv[5]; const double q = opt_atof("--q", sopt(argc, argv, "--q", "8")); const int nlev = opt_atoi("--levels", sopt(argc, argv, "--levels", "4"));
+    const int shard = opt_atoi("--shard", sopt(argc, argv, "--shard", "512")), nt = opt_atoi("--threads", sopt(argc, argv, "--threads", "8"));
     if (shard < 128 || shard % 128 || nlev < 1 || q < 0) { fprintf(stderr, "predict --seamless: --shard a multiple of 128, --levels >= 1, --q >= 0\n"); return 2; }
     char tmp[1400], pa[1500], pb[1500], la[1600], lb[1600], da[1600], db[1600];
     snprintf(tmp, sizeof tmp, "%s/.seam", out); snprintf(pa, sizeof pa, "%s/a", tmp); snprintf(pb, sizeof pb, "%s/b", tmp);

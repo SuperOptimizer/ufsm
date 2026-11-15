@@ -4,6 +4,7 @@
    coarser levels hold round(254 * surface fraction) over the non-ignore children, or 255 when at least
    half of the children are ignore. */
 #include "hf.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "json.h"
 #include "store.h"
@@ -26,7 +27,7 @@
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 
@@ -218,15 +219,15 @@ int cmd_ingest_labels(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm ingest-labels <root> <zarr-key> <out-dir> --um U [--levels L] [--token FILE] [--cache DIR] [--threads N] [--raw] [--shard 1024] [--zmax Z]\n"
                     "       [--src-level K (read <zarr-key>/K, default 0)] [--lut FILE (256 output bytes, one per source value: a soft teacher map -> prob254, 255 = unknown; pyramid by known-max)]\n"); return 2; }
     const char *root = argv[2], *key = argv[3], *out = argv[4];
-    double um = atof(opt(argc, argv, "--um", "0"));
-    int nlev = atoi(opt(argc, argv, "--levels", "6"));
-    int nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
+    double um = opt_atof("--um", opt(argc, argv, "--um", "0"));
+    int nlev = opt_atoi("--levels", opt(argc, argv, "--levels", "6"));
+    int nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16);
     int labels = !strcmp(opt(argc, argv, "--raw", "0"), "0");
-    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--raw")) labels = 0;
-    int shard = atoi(opt(argc, argv, "--shard", "1024"));
-    int64_t zmax = atoll(opt(argc, argv, "--zmax", "0"));
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], opt_n("--raw"))) labels = 0;
+    int shard = opt_atoi("--shard", opt(argc, argv, "--shard", "1024"));
+    int64_t zmax = opt_atoll("--zmax", opt(argc, argv, "--zmax", "0"));
     if (um <= 0) { fprintf(stderr, "--um required\n"); return 2; }
-    int src_level = atoi(opt(argc, argv, "--src-level", "0"));
+    int src_level = opt_atoi("--src-level", opt(argc, argv, "--src-level", "0"));
     uint8_t lut[256], *lutp = nullptr;   /* --lut: whitespace-separated 0..255 values, entry v = the output byte for source value v */
     { const char *lf = opt(argc, argv, "--lut", nullptr);
       if (lf) { FILE *f = fopen(lf, "r"); if (!f) { perror(lf); return 2; }
@@ -335,8 +336,8 @@ static int read_cube(store *s, const char *key, uint8_t *cube, int Cmax) {
 int cmd_ingest_kaggle(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm ingest-kaggle <hf-root> <out-dir> [--key surfaces/kaggle] [--n N] [--token FILE] [--q 8] [--threads N]\n"); return 2; }
     const char *root = argv[2], *out = argv[3], *key = opt(argc, argv, "--key", "surfaces/kaggle");
-    int limit = atoi(opt(argc, argv, "--n", "0")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16);
-    float q = (float)atof(opt(argc, argv, "--q", "8"));
+    int limit = opt_atoi("--n", opt(argc, argv, "--n", "0")), nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16);
+    float q = (float)opt_atof("--q", opt(argc, argv, "--q", "8"));
     const int C = 320, SH = 640;   /* two cubes per shard along z */
     store *s = store_open(root);
     char *tok = hf_token(opt(argc, argv, "--token", nullptr));
@@ -425,7 +426,7 @@ static float *load_axis_tif(store *s, const char *key, int *w, int *h) {
 int cmd_ingest_mesh(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm ingest-mesh <root> <tifxyz-dir-key> <out.sfc> [--error 0.1]\n"); return 2; }
     const char *root = argv[2], *key = argv[3], *out = argv[4];
-    double err = atof(opt(argc, argv, "--error", "0.1"));
+    double err = opt_atof("--error", opt(argc, argv, "--error", "0.1"));
     store *s = store_open(root);
     char k[1400];
     float *ax[3]; int w = 0, h = 0;
@@ -519,11 +520,11 @@ static void zfill_chunk(int i, int tid, void *ud) {
 int cmd_ingest_zip(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm ingest-zip <labels.zip> <zarr-name> <out-dir> --um U [--levels L] [--threads N] [--shard 1024] [--zmax Z] [--raw]\n"); return 2; }
     const char *zpath = argv[2], *name = argv[3], *out = argv[4];
-    double um = atof(opt(argc, argv, "--um", "0"));
-    int nlev = atoi(opt(argc, argv, "--levels", "6")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 32), shard = atoi(opt(argc, argv, "--shard", "1024"));
-    int64_t zmax = atoll(opt(argc, argv, "--zmax", "0"));
+    double um = opt_atof("--um", opt(argc, argv, "--um", "0"));
+    int nlev = opt_atoi("--levels", opt(argc, argv, "--levels", "6")), nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 32), shard = opt_atoi("--shard", opt(argc, argv, "--shard", "1024"));
+    int64_t zmax = opt_atoll("--zmax", opt(argc, argv, "--zmax", "0"));
     int labels = 1;
-    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--raw")) labels = 0;
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], opt_n("--raw"))) labels = 0;
     if (um <= 0) { fprintf(stderr, "--um required\n"); return 2; }
     double t0 = now();
     zipr *zip = zipr_open(zpath);
@@ -764,7 +765,7 @@ static void raster_shard(int si, int tid, void *ud) {
                 int vox[3], in = 1;
                 for (int dd = 0; dd < 3; dd++) {
                     double q = (1 - u) * (1 - v) * p[0][dd] + u * (1 - v) * p[1][dd] + (1 - u) * v * p[2][dd] + u * v * p[3][dd];
-                    vox[dd] = (int)floor(q - lo[dd] + 0.5);
+                    vox[dd] = (int)floor(q - lo[dd] + 0.5 * j->scale);   /* level l: voxel j's centre at level-0 2^l j + (2^l - 1) / 2, as pool2_mean's CT (was 2^l j: 2026-11-14 datafix) */
                     if (vox[dd] < 0 || vox[dd] >= N) in = 0;
                 }
                 if (!in) continue;
@@ -804,11 +805,11 @@ int cmd_raster(int argc, char **argv) {
     const char *out = argv[2];
     long long Z = 0, Y = 0, X = 0;
     if (sscanf(opt(argc, argv, "--shape", "0,0,0"), "%lld,%lld,%lld", &Z, &Y, &X) != 3 || Z <= 0 || Y <= 0 || X <= 0) { fprintf(stderr, "--shape Z,Y,X (positive level-0 voxels) required\n"); return 2; }
-    double um = atof(opt(argc, argv, "--um", "0"));
-    int level = atoi(opt(argc, argv, "--level", "0")), T = atoi(opt(argc, argv, "--T", "3")), nlev = atoi(opt(argc, argv, "--levels", "6"));
-    int nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8), shard = atoi(opt(argc, argv, "--shard", "1024"));
-    int binary = atoi(opt(argc, argv, "--binary", "0"));
-    int band = atoi(opt(argc, argv, "--band-chamfer", "4"));
+    double um = opt_atof("--um", opt(argc, argv, "--um", "0"));
+    int level = opt_atoi("--level", opt(argc, argv, "--level", "0")), T = opt_atoi("--T", opt(argc, argv, "--T", "3")), nlev = opt_atoi("--levels", opt(argc, argv, "--levels", "6"));
+    int nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8), shard = opt_atoi("--shard", opt(argc, argv, "--shard", "1024"));
+    int binary = opt_atoi("--binary", opt(argc, argv, "--binary", "0"));
+    int band = opt_atoi("--band-chamfer", opt(argc, argv, "--band-chamfer", "4"));
     if (!isfinite(um) || um <= 0 || level < 0 || level > 20 || T < 1 || T > 84 ||
         nlev < 1 || nlev > MAXLEV_PYR || nthreads < 1 || nthreads > 256 || shard < 128 || shard % 128 || (binary != 0 && binary != 1) || (band!=0 && band!=4)) {
         fprintf(stderr, "raster: require positive um, level 0..20, T 1..84, levels 1..12, threads 1..256 and shard a positive multiple of 128\n"); return 2;
@@ -830,16 +831,16 @@ int cmd_raster(int argc, char **argv) {
     char lv[32], ldir[1400], attrs[512];
     z3w_level_name(um_l, lv, sizeof lv);
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
-    if (*value_name) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"winding\",\"source\":\"raster of %d meshes, value %s\",\"encoding\":\"winding_mod14\",\"code\":\"1 + (round(q*18) mod 252); 0 empty; 255 conflict (>1/4 turn)\"}}", nm, value_name);
-    else if (binary) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"encoding\":\"binary\",\"surface_band_chamfer\":%d,\"codec\":\"volcomp-mask-lossless\",\"background\":\"all non-surface voxels\"}}", nm, band);
-    else snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"T\":%d,\"encoding\":\"0=bg,254=surface,255=ignore\"}}", nm, T);
+    if (*value_name) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"grid\":\"block-centre\",\"content\":\"winding\",\"source\":\"raster of %d meshes, value %s\",\"encoding\":\"winding_mod14\",\"code\":\"1 + (round(q*18) mod 252); 0 empty; 255 conflict (>1/4 turn)\"}}", nm, value_name);
+    else if (binary) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"grid\":\"block-centre\",\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"encoding\":\"binary\",\"surface_band_chamfer\":%d,\"codec\":\"volcomp-mask-lossless\",\"background\":\"all non-surface voxels\"}}", nm, band);
+    else snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"grid\":\"block-centre\",\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"T\":%d,\"encoding\":\"0=bg,254=surface,255=ignore\"}}", nm, T);
     z3w *w = binary ? z3w_create_mask(ldir, shape, shard, attrs) : z3w_create(ldir, shape, shard, 0.f, *value_name ? 0 : 255, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
     rjob j = {.meshes = meshes, .nm = nm, .scale = scale, .shard = shard, .margin = binary || *value_name ? 2 : T + 3, .T = T, .binary = binary, .band=band, .value = *value_name != 0,
               .ns = {(shape[0] + shard - 1) / shard, (shape[1] + shard - 1) / shard, (shape[2] + shard - 1) / shard},
               .shape = {shape[0], shape[1], shape[2]}, .w = w, .nthreads = nthreads,
-              .indexed = atoi(opt(argc, argv, "--raster-index", "1")),
-              .reference_distance = atoi(opt(argc, argv, "--reference-distance", "0"))};
+              .indexed = opt_atoi("--raster-index", opt(argc, argv, "--raster-index", "1")),
+              .reference_distance = opt_atoi("--reference-distance", opt(argc, argv, "--reference-distance", "0"))};
     double t0 = now();
     int result = 0;
     long double nshards = (long double)j.ns[0] * j.ns[1] * j.ns[2];
@@ -863,8 +864,8 @@ int cmd_raster(int argc, char **argv) {
 int cmd_z3_recode(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm z3-recode <group-dir> <out-group> --um U [--lut FILE] [--levels 1] [--threads 16] [--hist 1]\n"); return 2; }
     const char *in = argv[2], *out = argv[3];
-    double um = atof(opt(argc, argv, "--um", "0"));
-    int nlev = atoi(opt(argc, argv, "--levels", "1")), nthreads = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 16), hist = atoi(opt(argc, argv, "--hist", "0"));
+    double um = opt_atof("--um", opt(argc, argv, "--um", "0"));
+    int nlev = opt_atoi("--levels", opt(argc, argv, "--levels", "1")), nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16), hist = opt_atoi("--hist", opt(argc, argv, "--hist", "0"));
     const char *lf = opt(argc, argv, "--lut", nullptr);
     if (um <= 0 || (!lf && !hist)) { fprintf(stderr, "z3-recode: --um and --lut (or --hist 1) required\n"); return 2; }
     uint8_t lut[256];

@@ -6,6 +6,7 @@
    Vertex coordinates are in the wraps' voxels (meta.json voxel_size_um); point p there is native ((p + 0.5) wum / um - 0.5) for
    fields of native voxel um (ufsm wraps --out-um maps voxel centres to voxel centres). */
 #include "fit.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "stitch.h"
 #include "tiff.h"
@@ -14,6 +15,7 @@
 #include <unistd.h>
 #include "zarr3.h"
 #include "store.h"
+#include "json.h"
 #include <dirent.h>
 #include <math.h>
 #include <pthread.h>
@@ -23,10 +25,10 @@
 #include <string.h>
 
 static const char *sopt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
-static int sflag(int argc, char **argv, const char *name) { for (int i = 1; i < argc; i++) if (!strcmp(argv[i], name)) return 1; return 0; }
+static int sflag(int argc, char **argv, const char *name) { for (int i = 1; i < argc; i++) if (!strcmp(argv[i], opt_n(name))) return 1; return 0; }
 static float *tif_f32(const char *path, int *w, int *h) {
     if (tfx_axis_hook && access(path, F_OK)) return tfx_axis_hook(path, w, h);   /* a .sfc-backed wrap (src/tfx.c) */
     tiff *t = tiff_open_file(path); tiff_page pg;
@@ -221,8 +223,8 @@ int cmd_refine(int argc, char **argv) {
     if (argc < 4 || !sopt(argc, argv, "--fields", nullptr)) {
         fprintf(stderr, "usage: ufsm refine <wraps-in> <wraps-out> --fields DIR [--model FIT] [--range 0.33] [--smooth-um 40] [--target 0] [--min-conf 0.2] [--iters 400] [--threads 16]\n"); return 2;
     }
-    const double range = atof(sopt(argc, argv, "--range", "0.33")), smooth_um = atof(sopt(argc, argv, "--smooth-um", "40")), target = atof(sopt(argc, argv, "--target", "0"));
-    const double minconf = atof(sopt(argc, argv, "--min-conf", "0.2")); const int iters = atoi(sopt(argc, argv, "--iters", "400")), nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16);
+    const double range = opt_atof("--range", sopt(argc, argv, "--range", "0.33")), smooth_um = opt_atof("--smooth-um", sopt(argc, argv, "--smooth-um", "40")), target = opt_atof("--target", sopt(argc, argv, "--target", "0"));
+    const double minconf = opt_atof("--min-conf", sopt(argc, argv, "--min-conf", "0.2")); const int iters = opt_atoi("--iters", sopt(argc, argv, "--iters", "400")), nt = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 16);
     if (!(range > 0) || range > 0.5 || !(smooth_um >= 0) || nt < 1) { fprintf(stderr, "refine: --range in (0, 0.5] sheet spacings, --smooth-um >= 0\n"); return 2; }
     sf_fields F; if (sff_load(sopt(argc, argv, "--fields", ""), &F)) { fprintf(stderr, "refine: cannot read the fields %s\n", sopt(argc, argv, "--fields", "")); return 1; }
     fit_set *ms = sopt(argc, argv, "--model", nullptr) ? fit_set_load(sopt(argc, argv, "--model", "")) : nullptr;   /* orients the normals */
@@ -520,11 +522,11 @@ int cmd_surf_stats(int argc, char **argv) {
                         "  --ct-only 1 (with --ct): only the fields' geometry is read (no phase / spacing planes: a whole scroll's are 100s of GB), so only the CT\n"
                         "  statistics (on-papyrus share per wrap, CT profile) and the normal angles are measured; the phase columns print 0\n"); return 2;
     }
-    const double cmin = atof(sopt(argc, argv, "--min-conf", "0.3")), gap_um = atof(sopt(argc, argv, "--gap", "1")) * 1000, min_um = atof(sopt(argc, argv, "--min-run", "100"));
-    const int nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16), per = sflag(argc, argv, "--per-wrap"), ctonly = atoi(sopt(argc, argv, "--ct-only", "0"));
+    const double cmin = opt_atof("--min-conf", sopt(argc, argv, "--min-conf", "0.3")), gap_um = opt_atof("--gap", sopt(argc, argv, "--gap", "1")) * 1000, min_um = opt_atof("--min-run", sopt(argc, argv, "--min-run", "100"));
+    const int nt = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 16), per = sflag(argc, argv, "--per-wrap"), ctonly = opt_atoi("--ct-only", sopt(argc, argv, "--ct-only", "0"));
     fit_set_threads(nt);   /* the field loads' core masks */
-    int ci = -1; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) ci = i;
-    const double ctum = atof(sopt(argc, argv, "--ct-um", "0")), ctlev = atof(sopt(argc, argv, "--ct-level", "80")), ctR = atof(sopt(argc, argv, "--ct-range", "15"));
+    int ci = -1; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--ct"))) ci = i;
+    const double ctum = opt_atof("--ct-um", sopt(argc, argv, "--ct-um", "0")), ctlev = opt_atof("--ct-level", sopt(argc, argv, "--ct-level", "80")), ctR = opt_atof("--ct-range", sopt(argc, argv, "--ct-range", "15"));
     if (ci > 0 && !(ctum > 0)) { fprintf(stderr, "surf-stats: --ct needs --ct-um (the CT array's voxel um)\n"); return 2; }
     z3 *cz = ci > 0 ? z3_open(store_open(argv[ci + 1]), argv[ci + 2], sopt(argc, argv, "--cache", nullptr)) : nullptr;
     if (ci > 0 && !cz) { fprintf(stderr, "surf-stats: %s\n", z3_error()); return 1; }
@@ -539,7 +541,7 @@ int cmd_surf_stats(int argc, char **argv) {
     if (ms && !ctonly) {
         int shp[3]; wfield = fit_field_array(sopt(argc, argv, "--fields", ""), "w", 1, shp);
         if (!wfield) { fprintf(stderr, "surf-stats: cannot read the material plane\n"); return 1; }
-        FJ.F = &F; FJ.w = wfield; FJ.ms = ms; FJ.st = atoi(sopt(argc, argv, "--fault-stride", "2")); FJ.ratio = atof(sopt(argc, argv, "--fault-ratio", "3"));
+        FJ.F = &F; FJ.w = wfield; FJ.ms = ms; FJ.st = opt_atoi("--fault-stride", sopt(argc, argv, "--fault-stride", "2")); FJ.ratio = opt_atof("--fault-ratio", sopt(argc, argv, "--fault-ratio", "3"));
         if (FJ.st < 1) FJ.st = 1;
         for (int d = 0; d < 3; d++) FJ.off[d] = (double)(F.org[d] - ms->global->origin[d]);
         FJ.n[0] = (F.D + FJ.st - 1) / FJ.st; FJ.n[1] = (F.H + FJ.st - 1) / FJ.st; FJ.n[2] = (F.W + FJ.st - 1) / FJ.st;
@@ -727,12 +729,12 @@ int cmd_self_gate(int argc, char **argv) {
                         "  the strict stretches of a box fit's wraps: on the network's sheet, on papyrus, no fault, not reversed, neighbours agreeing, outside\n"
                         "  excluded boxes -> tifxyz with q.tif = the winding id (training labels: ufsm raster --value q.tif)\n"); return 2;
     }
-    const double cmin = atof(sopt(argc, argv, "--min-conf", "0.3")), emax = atof(sopt(argc, argv, "--max-e", "0.15")), ratio = atof(sopt(argc, argv, "--fault-ratio", "3"));
-    const double minq = atof(sopt(argc, argv, "--min-q", "0.5")), nbtol = atof(sopt(argc, argv, "--nb-tol", "0.15")), nbmin = atof(sopt(argc, argv, "--nb-min", "0.6"));
-    const double minarea = atof(sopt(argc, argv, "--min-area", "0.02")); const int erode = atoi(sopt(argc, argv, "--erode", "1")), nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16), per = sflag(argc, argv, "--per-wrap");
+    const double cmin = opt_atof("--min-conf", sopt(argc, argv, "--min-conf", "0.3")), emax = opt_atof("--max-e", sopt(argc, argv, "--max-e", "0.15")), ratio = opt_atof("--fault-ratio", sopt(argc, argv, "--fault-ratio", "3"));
+    const double minq = opt_atof("--min-q", sopt(argc, argv, "--min-q", "0.5")), nbtol = opt_atof("--nb-tol", sopt(argc, argv, "--nb-tol", "0.15")), nbmin = opt_atof("--nb-min", sopt(argc, argv, "--nb-min", "0.6"));
+    const double minarea = opt_atof("--min-area", sopt(argc, argv, "--min-area", "0.02")); const int erode = opt_atoi("--erode", sopt(argc, argv, "--erode", "1")), nt = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 16), per = sflag(argc, argv, "--per-wrap");
     fit_set_threads(nt);
-    int ci = -1; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) ci = i;
-    const double ctum = atof(sopt(argc, argv, "--ct-um", "0")), ctlev = atof(sopt(argc, argv, "--ct-level", "80")), ctR = atof(sopt(argc, argv, "--ct-range", "15"));
+    int ci = -1; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--ct"))) ci = i;
+    const double ctum = opt_atof("--ct-um", sopt(argc, argv, "--ct-um", "0")), ctlev = opt_atof("--ct-level", sopt(argc, argv, "--ct-level", "80")), ctR = opt_atof("--ct-range", sopt(argc, argv, "--ct-range", "15"));
     if (ci > 0 && !(ctum > 0)) { fprintf(stderr, "self-gate: --ct needs --ct-um\n"); return 2; }
     z3 *cz = ci > 0 ? z3_open(store_open(argv[ci + 1]), argv[ci + 2], sopt(argc, argv, "--cache", nullptr)) : nullptr;
     if (ci > 0 && !cz) { fprintf(stderr, "self-gate: %s\n", z3_error()); return 1; }
@@ -746,8 +748,8 @@ int cmd_self_gate(int argc, char **argv) {
     }
     fit_set *nb[SG_MAXNB]; int nnb = 0; double ex[6 * 64]; int nex = 0;
     for (int i = 2; i + 1 < argc; i++) {
-        if (!strcmp(argv[i], "--nb")) { if (nnb == SG_MAXNB || !(nb[nnb] = fit_set_load(argv[i + 1]))) { fprintf(stderr, "self-gate: cannot load the neighbour %s (at most %d)\n", argv[i + 1], SG_MAXNB); return 1; } nnb++; }
-        if (!strcmp(argv[i], "--exclude")) { double *b = ex + 6 * nex;
+        if (!strcmp(argv[i], opt_n("--nb"))) { if (nnb == SG_MAXNB || !(nb[nnb] = fit_set_load(argv[i + 1]))) { fprintf(stderr, "self-gate: cannot load the neighbour %s (at most %d)\n", argv[i + 1], SG_MAXNB); return 1; } nnb++; }
+        if (!strcmp(argv[i], opt_n("--exclude"))) { double *b = ex + 6 * nex;
             if (nex == 64 || sscanf(argv[i + 1], "%lf,%lf,%lf,%lf,%lf,%lf", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) { fprintf(stderr, "self-gate: --exclude z0,y0,x0,z1,y1,x1 (at most 64)\n"); return 2; } nex++; }
     }
     char (*names)[256] = nullptr; const int nn = sf_names(argv[2], &names); if (nn <= 0) { fprintf(stderr, "self-gate: no wraps in %s\n", argv[2]); return 1; }
@@ -852,13 +854,18 @@ typedef struct { int n; double *z, *y, *x; } wm_axis;
 static int wm_axis_load(const char *path, double sc, wm_axis *A) {
     FILE *f = fopen(path, "rb"); if (!f) return -1; fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET);
     char *b = malloc(n + 1); if (!b || fread(b, 1, n, f) != (size_t)n) { fclose(f); free(b); return -1; } b[n] = 0; fclose(f);
-    int cap = 64; A->n = 0; A->z = malloc(cap * 8); A->y = malloc(cap * 8); A->x = malloc(cap * 8);
-    for (const char *q = b; (q = strstr(q, "\"x\":"));) {
-        const char *qy = strstr(q, "\"y\":"), *qz = strstr(q, "\"z\":"); if (!qy || !qz) break;
-        if (A->n == cap) { cap *= 2; A->z = realloc(A->z, cap * 8); A->y = realloc(A->y, cap * 8); A->x = realloc(A->x, cap * 8); }
-        A->x[A->n] = atof(q + 4) * sc; A->y[A->n] = atof(qy + 4) * sc; A->z[A->n] = atof(qz + 4) * sc; A->n++; q = qz + 4;
+    /* json_get per point (any key order; the strstr scan took the next point's "y" / "z" when a point listed z before x, audit mini/coords
+       #3): {"control_points": [...]} or a bare array of points */
+    json *j = json_parse(b, (size_t)n); free(b); if (!j) return -1;
+    const json *cp = j->type == J_ARR ? j : json_get(j, "control_points");
+    const int m = cp && cp->type == J_ARR ? (int)cp->n : 0; A->n = 0;
+    A->z = malloc((m + 1) * 8); A->y = malloc((m + 1) * 8); A->x = malloc((m + 1) * 8);
+    for (int i = 0; i < m; i++) {
+        const json *q = json_at(cp, (size_t)i), *qx = json_get(q, "x"), *qy = json_get(q, "y"), *qz = json_get(q, "z");
+        if (!qx || !qy || !qz) continue;
+        A->x[A->n] = json_num(qx, 0) * sc; A->y[A->n] = json_num(qy, 0) * sc; A->z[A->n] = json_num(qz, 0) * sc; A->n++;
     }
-    free(b);
+    json_free(j);
     for (int i = 1; i < A->n; i++) for (int j = i; j > 0 && A->z[j] < A->z[j - 1]; j--) {   /* by z */
         double t; t = A->z[j]; A->z[j] = A->z[j - 1]; A->z[j - 1] = t; t = A->y[j]; A->y[j] = A->y[j - 1]; A->y[j - 1] = t; t = A->x[j]; A->x[j] = A->x[j - 1]; A->x[j - 1] = t; }
     return A->n >= 1 ? 0 : -1;
@@ -893,9 +900,9 @@ static int wm_cmpf(const void *a, const void *b) { const float x = *(const float
 static float wm_med(float *v, int n) { if (!n) return NAN; qsort(v, n, 4, wm_cmpf); return v[n / 2]; }
 int cmd_wrap_match(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm wrap-match <wraps-A> <wraps-B> --axis AXIS.json [--axis-scale 0.25] [--dz 64] [--nth 720] [--sub 2] [--threads 16] [--tsv OUT]\n"); return 2; }
-    wm_axis ax; if (wm_axis_load(sopt(argc, argv, "--axis", ""), atof(sopt(argc, argv, "--axis-scale", "1")), &ax)) { fprintf(stderr, "wrap-match: cannot read --axis\n"); return 1; }
-    const double dz = atof(sopt(argc, argv, "--dz", "64")); const int nth = atoi(sopt(argc, argv, "--nth", "720")), sub = atoi(sopt(argc, argv, "--sub", "2"));
-    const int nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16);
+    wm_axis ax; if (wm_axis_load(sopt(argc, argv, "--axis", ""), opt_atof("--axis-scale", sopt(argc, argv, "--axis-scale", "1")), &ax)) { fprintf(stderr, "wrap-match: cannot read --axis\n"); return 1; }
+    const double dz = opt_atof("--dz", sopt(argc, argv, "--dz", "64")); const int nth = opt_atoi("--nth", sopt(argc, argv, "--nth", "720")), sub = opt_atoi("--sub", sopt(argc, argv, "--sub", "2"));
+    const int nt = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 16);
     const int nz = (int)(ax.z[ax.n - 1] / dz) + (int)(30000 / dz) + 2; const size_t nb = (size_t)nz * nth;
     wm_job W[2]; char (*names[2])[256];
     for (int s = 0; s < 2; s++) {
@@ -939,7 +946,7 @@ int cmd_wrap_match(int argc, char **argv) {
    papyrus pixels: sharp letter strokes high, smooth blotches / noise floor low) */
 int cmd_ink_cover(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: ufsm ink-cover <render-dir> [--t 128] [--ct-level 80] [--tsv OUT]\n"); return 2; }
-    const int T = atoi(sopt(argc, argv, "--t", "128")), CL = atoi(sopt(argc, argv, "--ct-level", "80"));
+    const int T = opt_atoi("--t", sopt(argc, argv, "--t", "128")), CL = opt_atoi("--ct-level", sopt(argc, argv, "--ct-level", "80"));
     DIR *d = opendir(argv[2]); if (!d) return 1; struct dirent *de; int n = 0, cap = 64; char (*nm)[256] = malloc(cap * 256);
     while ((de = readdir(d))) { const size_t l = strlen(de->d_name); if (de->d_name[0] != 'w' || l < 5 || strcmp(de->d_name + l - 4, ".tif") || strstr(de->d_name, "_ct.tif") || strstr(de->d_name, "_fill.tif")) continue;
         if (n == cap) { cap *= 2; nm = realloc(nm, cap * 256); } snprintf(nm[n], 256, "%.*s", (int)(l - 4), de->d_name); n++; }
