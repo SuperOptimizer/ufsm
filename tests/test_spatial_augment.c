@@ -4,23 +4,44 @@
 #include "test_part.h"   /* UFSM_TEST_PART=K/3: the cache-blocked writer (1), the fused warp (2), the rest (0); ~6 s each */
 #include <assert.h>
 #include "fm_tol.h"
+/* the CT channel's fast-math bound between two writers of one window (absolute, in output units). Both pull the source coordinate
+   through the same float terms in a different order / contraction (the per-voxel loop vs the row-blocked AVX2 one), so each axis'
+   coordinate can come out a couple of fp32 ulps of P apart; trilinear interpolation turns that into gain x (the steepest corner
+   difference: at most the span of the per-value CT table, the LUT or the filtered appearance) x the coordinate error, on three axes:
+   6 x gain x span x P 2^-23 (2 ulps of P per axis; ulp(x) <= x 2^-23), + 1e-5 for the sum's own rounding. The arithmetic, not a fit:
+   desk fm round 11-15 measured at most 1.2e-4 (P 128, plan 0: 2 fp16 ulps at |x| 0.06-0.12) against this bound's 7.6e-4, and P 32
+   bf16 at most 1e-5. A wrong corner, weight or LUT entry moves the value by ~span x 0.1 or more (~0.8 here), far beyond it. */
+static double warp_tol(int P, float gain, const ct_aug_plan *ap, float mean, float isd, const float *app, size_t n) {
+    double lo = 1e30, hi = -1e30;
+    if (!ap) { lo = (0.f - mean) * isd; hi = (255.f - mean) * isd; if (lo > hi) { const double t = lo; lo = hi; hi = t; } }
+    else if (!ap->filter_mode) for (int i = 0; i < 256; i++) { lo = fmin(lo, ap->lut[i]); hi = fmax(hi, ap->lut[i]); }
+    else for (size_t i = 0; i < n; i++) { lo = fmin(lo, app[i]); hi = fmax(hi, app[i]); }
+    return 6.0 * fabs((double)gain) * (hi - lo) * ldexp((double)P, -23) + 1e-5;
+}
+static inline float bf16_f(uint16_t h) { const uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f; }
 /* two writers of the same window (tests/fm_tol.h): bit-identical under UFSM_STRICT_MATH. Fast math (the two paths round
    differently): targets u8 +-1 on <= 1e-3 of the bytes, mask and target flips (a coordinate on an in-bounds / rounding boundary) on
-   <= 1e-4, the input channels where both masks agree fp16 +-1 ulp or |d| <= 1e-4 / fp32 rel 1e-6 + abs 1e-4 (the CT is normalised
-   from 0..255-scale fp32 intermediates: its rounding error is absolute, a few fp32 ulps of 255 times the gain, so near 0 it spans
-   many fp16 ulps; desk fm round 11-15: worst |d| 5e-5). Returns nonzero when they differ beyond that. */
+   <= 1e-4, the input channels where both masks agree within 1 ulp of their format (fp16 / bf16 by bf, or fp32 rel 1e-6) or within an
+   absolute tol: ct_tol (warp_tol) on the CT channel, whose rounding error is absolute (normalised from 0..255-scale fp32
+   intermediates: near 0 it spans many fp16 / bf16 ulps), 1e-4 on the radial / sheet channels (unit vectors and the prior: a few fp32
+   ulps of their size). Returns nonzero when they differ beyond that. */
 static int ws_cmp(const uint8_t *Ta, const uint8_t *Tb, size_t nt, const uint8_t *Ma, const uint8_t *Mb, size_t nq, const uint16_t *Ha,
-                  const uint16_t *Hb, const float *Xa, const float *Xb, size_t nch) {
+                  const uint16_t *Hb, const float *Xa, const float *Xb, size_t nch, int bf, double ct_tol) {
     if (FM_STRICT) return memcmp(Ta, Tb, nt) || memcmp(Ma, Mb, nq) || (Ha ? memcmp(Ha, Hb, nch * nq * 2) : Xa ? memcmp(Xa, Xb, nch * nq * 4) : 0);
     int bad = fm_cmp_u8c("writer targets", Ta, Tb, nt, 1, 0, 1e-3, 1e-4) | fm_cmp_u8c("writer mask", Ma, Mb, nq, 0, 0, 1e-4, 1e-4);
-    size_t nv = 0;
+    size_t nv = 0, wi = 0; double worst = 0;
     for (size_t c = 0; c < nch && (Ha || Xa); c++) for (size_t k = 0; k < nq; k++) {
         if (Ma[k] != Mb[k]) continue;
-        const size_t i = c * nq + k;
-        if (Ha) { int32_t d = fm_h16_ord(Ha[i]) - fm_h16_ord(Hb[i]); nv += (d > 1 || d < -1) && !(fabs((double)fm_h16_f(Ha[i]) - fm_h16_f(Hb[i])) <= 1e-4); }
-        else nv += !fm_close(Xa[i], Xb[i], 1e-6, 1e-4);
+        const size_t i = c * nq + k; const double tol = c ? 1e-4 : ct_tol;
+        double d; int ok;
+        if (Ha) {   /* (the sign-magnitude ordinal works for both 16-bit formats) */
+            int32_t du = fm_h16_ord(Ha[i]) - fm_h16_ord(Hb[i]); d = fabs(bf ? (double)bf16_f(Ha[i]) - bf16_f(Hb[i]) : (double)fm_h16_f(Ha[i]) - fm_h16_f(Hb[i]));
+            ok = (du <= 1 && du >= -1) || d <= tol;
+        } else { d = fabs((double)Xa[i] - Xb[i]); ok = fm_close(Xa[i], Xb[i], 1e-6, tol); }
+        if (!ok) { nv++; if (d > worst) worst = d, wi = i; }
     }
-    if (nv) fprintf(stderr, "FAIL writer inputs: %zu of %zu beyond %s\n", nv, nch * nq, Ha ? "1 fp16 ulp / 1e-4" : "fp32 rel 1e-6 + 1e-4");
+    if (nv) fprintf(stderr, "FAIL writer inputs: %zu of %zu beyond 1 %s ulp / abs %g (CT) 1e-4 (others); worst |d| %g at channel %zu voxel %zu\n", nv, nch * nq,
+                    Ha ? (bf ? "bf16" : "fp16") : "fp32 rel 1e-6 ~", ct_tol, worst, wi / nq, wi % nq);
     return bad || nv;
 }
 void *nn_host_alloc(size_t n) { return malloc(n); }
@@ -125,7 +146,7 @@ int main(void) {
                 sym sy=sym_of(si); rng r;
                 rseed(&r,9); write_spatial(ct,hard,mask,T,M,P,origin,80,.03f,1,cy,cx,sy,&a,1,0,.02f,&r,row,1,nullptr,H,nullptr,nullptr,nullptr,nullptr,nullptr,scratch,1,0);
                 rseed(&r,9); write_spatial(ct,hard,mask,T1,M1,P,origin,80,.03f,1,cy,cx,sy,&a,1,0,.02f,&r,row,1,nullptr,H1,nullptr,nullptr,nullptr,nullptr,nullptr,scratch,1,1);
-                ctdiff+=ws_cmp(T,T1,NCH*n,M,M1,n,H,H1,nullptr,nullptr,1)!=0;   /* channel 0 only: H1 is CT-only */
+                ctdiff+=ws_cmp(T,T1,NCH*n,M,M1,n,H,H1,nullptr,nullptr,1,0,warp_tol(P,1,nullptr,80,.03f,nullptr,0))!=0;   /* channel 0 only: H1 is CT-only */
                 for (int z=0;z<P;z++) for (int y=0;y<P;y++) for (int x=0;x<P;x++) {
                     size_t k=((size_t)z*P+y)*P+x; float pulled[3],jac[3]; spatial_aug_pull(&a,table,z,y,x,pulled,jac);
                     float v[3]; int inside=1,tie=0;
@@ -168,7 +189,7 @@ int main(void) {
                     memset(nrs,0,Q*4); memset(nps,0,nq*4); rseed(&r,77);
                     write_spatial(c2,t2,m2,Tb,Mb,Q,origin,85,.031f,1,cy2,cx2,sy,&a,1.05f,.01f,.03f,&r,nr,fmt,Xb,Hb,pp,nrs,nps,sh?&sheet:nullptr,par,app,hard,cto);
                     const size_t nch=cto?1:4;
-                    int d=ws_cmp(Ta,Tb,NCH*nq,Ma,Mb,nq,fmt?Ha:nullptr,fmt?Hb:nullptr,fmt?nullptr:Xa,fmt?nullptr:Xb,nch);
+                    int d=ws_cmp(Ta,Tb,NCH*nq,Ma,Mb,nq,fmt?Ha:nullptr,fmt?Hb:nullptr,fmt?nullptr:Xa,fmt?nullptr:Xb,nch,fmt==2,warp_tol(Q,1.05f,pp,85,.031f,app,nq));
                     if (d && diffs<4) fprintf(stderr,"blocked writer differs: P %d mode %d plan %d fmt %d sym %d hard %d ct-only %d\n",Q,mode,plan,fmt,si,hard,cto);
                     diffs+=d; runs++;
                 }
@@ -266,8 +287,9 @@ int main(void) {
                 size_t bad = 0; if (sample_pack_tm(Ta, Ta + nq, Ma, nq, TMa, &bad)) abort();
                 memset(nrs, 0, Q * 4); memset(nps, 0, (size_t)Q * Q * 4); rseed(&r, 5 + plan);
                 write_spatial_tm(c2, t2, m2, nullptr, nullptr, Q, org, 85, .031f, 1, cyq, cxq, sy, &a, 1.05f, .01f, .03f, &r, nr, 1, nullptr, Hb, pp, nrs, nps, nullptr, nullptr, app, 1, 1, TMb);
-                /* bit-identical under UFSM_STRICT_MATH; fast math: packed code bytes flip on <= 1e-4 of the voxels, fp16 CT +-1 ulp */
-                const int d = fm_cmp_u8c("packed codes", TMa, TMb, nq, 0, 0, 1e-4, 1e-4) | fm_cmp_h16a("trainer CT fp16", Ha, Hb, nq, 1, 1e-4);
+                /* bit-identical under UFSM_STRICT_MATH; fast math: packed code bytes flip on <= 1e-4 of the voxels, fp16 CT +-1 ulp or within
+                   warp_tol (the coordinate rounding times the steepest interpolation slope) */
+                const int d = fm_cmp_u8c("packed codes", TMa, TMb, nq, 0, 0, 1e-4, 1e-4) | fm_cmp_h16a("trainer CT fp16", Ha, Hb, nq, 1, warp_tol(Q, 1.05f, pp, 85, .031f, app, nq));
                 if (d) fprintf(stderr, "trainer CT writer differs: P %d plan %d\n", Q, plan);
                 diffs += d; runs++;
             }
