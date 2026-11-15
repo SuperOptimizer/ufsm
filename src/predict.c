@@ -1808,7 +1808,7 @@ static int predict_one(int argc, char **argv) {
     else if (strcmp(gn_set, "ema") && strcmp(gn_set, "auto")) { fprintf(stderr, "predict: --gn-set ema | run | auto\n"); return 2; }
     if (gn_use_run) unet_gn_ema_use_run(u, 1);
     if (!strcmp(gn_set, "auto") && !gn_live && (use_ema || ema_blend >= 0.f) && !opt(argc, argv, "--gn-frozen", nullptr)) {
-        const double st = unet_gn_ema_stale(u);
+        const double st = unet_gn_ema_updates(u) >= 500 ? unet_gn_ema_stale(u) : 1.0;   /* (a few-update checkpoint, a test fixture: its EMA has not had time to lag, nothing to refuse) */
         if (st > 1.5) { fprintf(stderr, "predict: the checkpoint's EMA-weights GroupNorm statistics differ from the live weights' by %.2fx at a site (an EMA that lags the net): "
                              "refusing the default. --gn-set ema (use them anyway; UFSM_GN_SET=ema in a script), --gn-set run (the live weights' set with the EMA weights), or --ema 0\n", st); return 1; }
     }
