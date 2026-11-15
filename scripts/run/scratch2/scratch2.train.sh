@@ -38,7 +38,7 @@ AUG="--zfix 1 --symmetry-p 0.5 --geometry-aug 1 --rotate-deg 5 --rotate-p 0.2 --
   --aug-sharpen-p 0.03 --aug-ring-p 0.1 --aug-slice-p 0.1 --aug-quant-p 0.1 --aug-bias-p 0.15 --aug-cupping-p 0.1 ${HISTAUG:-}"
 HEADS=${HEADS:-"--task unwrap2 --rv 2 --rv-iso ${ISO:-64} --wind4-lambda ${WIND4L:-0.25} --density-scale 4 --density-code 1 --packed-weight 8 --normal-step 1"}   # (u1: --rv 2, baked in: the relaunch line does not carry HEADS)   # (HEADS: another task on the same recipe, e.g. the winding heads without --rv)
 ARGS=($SRCJ --out $o --gpus $GPUS --P $P --B 1 $ARCH $HEADS --steps $STEPS --sched wsd --cooldown 0.2 --opt muon \
-  --fp4 2 --gpu-aug 3 --mem ${MEMMODE:-auto} --val-store disk --workers ${WORKERS:-12} --sampler-slots ${SLOTS:-16} \
+  --fp4 2 --gpu-aug 3 --mem ${MEMMODE:-auto} --val-store ${VALSTORE:-disk} --workers ${WORKERS:-12} --sampler-slots ${SLOTS:-16} \
   --log-every ${LOGE:-50} --val-every ${VAL:-2000} --val-batches ${VALB:-0} --ckpt-every ${CKPT:-250} --seed ${SEED:-3} --val-seed 1 \
   --warmup ${WARM:-300} --muon-lr ${MLR:-0.02} --lr ${ALR:-0.001} $AUG ${EXTRA:-})
 echo $$ > $o.launcher.pid

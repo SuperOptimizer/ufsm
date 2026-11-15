@@ -3,7 +3,7 @@
 # After the first checkpoint (step 250): --ckpt (adm_ema in the header).
 # After the fresh dry start, run it again with --after to check the dry log (s2ctl.log.dry-holdouts / .dry-last.log).
 set -u
-R=/vesuvius/ufsm/v2/lat/runs; E=$R/try7.launch.env; ok=1; bad() { echo "FAIL: $*"; ok=0; }; good() { echo "ok: $*"; }
+R=/vesuvius/ufsm/v2/lat/runs; E=${TRY7ENV:-$R/try7.launch.env}; ok=1; bad() { echo "FAIL: $*"; ok=0; }; good() { echo "ok: $*"; }
 U=$(grep '^U=' $E | cut -d= -f2-); SRCJ=$(grep '^SRCJ=' $E | cut -d= -f2-)
 if [ "${1:-}" = --ckpt ]; then   # after try7's first checkpoint (--ckpt-every, 250 steps): LARS state must ride in the header (main 11-14)
   grep -qE '^OPTX=.*--muon-lars 1' $E || { echo "ok: no --muon-lars in the env, no adm_ema expected (the NorMuon row EMA is not checkpointed)"; exit 0; }
@@ -25,7 +25,7 @@ if [ "${1:-}" != --after ]; then
     for b in dcachecap-20261114 dckey-20261114; do { git -C /home/forrest/ufsm merge-base --is-ancestor origin/$b $SHA 2>/dev/null || git -C /home/forrest/ufsm log --format=%s $SHA | grep -qE "^Merge .*$b"; } && good "binary contains $b (ref or its merge commit; merged branches are deleted)" || bad "binary lacks origin/$b (hostmem: derived-cache cap + new keys)"; done
   DV=/home/forrest/.cache/ufsm/derived   # (a cache born after the binary was installed was built by its keys (the audits): kept, it is warm)
   if [ ! -e $DV ]; then good "old derived cache moved away"
-  elif [ -d $DV.try6 ] && [ "$(stat -c %W $DV)" -gt "$(stat -c %Y "$U")" ]; then good "derived cache born $(date -d @$(stat -c %W $DV) +%H:%M) after the binary ($(du -sh $DV | cut -f1), built by its keys); the try6 one in derived.try6"
+  elif { [ -d $DV.try6 ] && [ "$(stat -c %W $DV)" -gt "$(stat -c %Z $DV.try6)" ]; } || { [ -f $DV.try6-moved ] && [ "$(stat -c %W $DV)" = "$(cut -d' ' -f1 $DV.try6-moved)" ]; }; then good "derived cache born $(date -d @$(stat -c %W $DV) +%H:%M) after the try6 one was moved away (11-15 binaries; no label-path change since) ($(du -sh $DV | cut -f1), built by its keys; derived.try6-moved records that birth, so derived.try6 itself may be deleted)"
   else bad "~/.cache/ufsm/derived predates the binary: mv it to derived.try6 (no trainer / admuon arm reading it)"; fi
   # every --flag the env passes (XFLAGS, OPTX) must be known to the binary (train's opt() ignores nothing silently since 27fee1e, but check here)
   for f in $(grep -E '^(XFLAGS|OPTX)=' $E | cut -d= -f2- | tr ' ' '\n' | grep -E '^--[a-z]' | sort -u); do strings "$U" | grep -qxF -- "$f" || strings "$U" | grep -qF -- "\"$f\"" || strings "$U" | grep -qF -- "$f" || bad "binary does not know $f"; done
