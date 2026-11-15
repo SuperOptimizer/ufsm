@@ -4661,7 +4661,8 @@ static void ws_conv(unet *u, const convp *c, void *arg) {
     const size_t cm = ws_r((size_t)(c->cin > c->cout ? c->cin : c->cout), 32);
     ws_max(w, NN_WS_LPBUF + 0, 28 * cm * cm); ws_max(w, NN_WS_LPBUF + 1, 28 * cm * (cm / 16 + 2));
     ws_max(w, NN_WS_TCW, 28 * cm * cm * 2); ws_max(w, NN_WS_TCWSC, cm * 4);
-    { const size_t a = 28 * ws_r(c->cout, 16) * ws_r(c->cin, 32), b = 28 * ws_r(c->cin, 16) * ws_r(c->cout, 32); w->wmemo += 3 * ((a > b ? a : b) / 2 + (a > b ? a : b) / 32); }
+    { const size_t a = 28 * ws_r(c->cout, 16) * ws_r(c->cin, 32), b = 28 * ws_r(c->cin, 16) * ws_r(c->cout, 32); w->wmemo += 3 * ((a > b ? a : b) / 2 + (a > b ? a : b) / 32);
+      if (getenv("UFSM_W4_MEMO") && !atoi(getenv("UFSM_W4_MEMO"))) { ws_max(w, NN_WS_LPBUF + 2, (a > b ? a : b) / 2); ws_max(w, NN_WS_LPBUF + 3, (a > b ? a : b) / 32); } }   /* (memo off: wmemo_get preps into u8 slots 2 / 3 instead) */
     /* the fp4 weight gradient's gy pre-pass (lp_f4wgrad.cuh, lp_buf u8 slot 4): z-step slabs of <= UFSM_F4W_GYPRE MiB (96) of records */
     {
         const int kb = lp_get_f4w_gypre_kb();
