@@ -573,13 +573,19 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4p_k(const mx4_t *__restr
 #pragma unroll
         for (int m = 0; m < MT; m++) for (int r = 0; r < 2; r++) for (int q = 0; q < 2; q++) for (int k = 0; k < 4; k++) acc[m][r][q][k] = 0.f;
         const int mat = lane >> 3, kb = mat & 1, vx = (mat >> 1) * 8 + (lane & 7);
-#pragma unroll 3
-        for (int tr = 0; tr < 9; tr++) {
-            const int kz = tr / 3, ky = tr % 3;
+        const int zs = (2 * oz0 + 2 * wz) % NP;   /* kz = 0's ring slot; kz's by one wrap-around add (conv_fwd_f4p_k's sl[]) */
+        /* the tap rows as kz (rolled) x ky (unrolled), what "#pragma unroll 3" over tr gave: kz then needs no tr / 3 and the slot no % NP
+           per unrolled copy (mcc computed both in each copy: the MMA loop 122 SASS against nvcc's 90) */
+#pragma unroll 1
+        for (int kz = 0; kz < 3; kz++) {
+          const int s0 = zs + kz, slot = s0 >= NP ? s0 - NP : s0;
+#pragma unroll
+          for (int ky = 0; ky < 3; ky++) {
+            const int tr = 3 * kz + ky;
             mx4b4 bf[2][2];
 #pragma unroll
             for (int r = 0; r < 2; r++) {
-                const int rowi = ((2 * oz0 + 2 * wz + kz) % NP) * 17 + 2 * (wr + r) + ky;   /* input plane 2 oz - 1 + kz's slot, row 2 oy - 1 + ky */
+                const int rowi = slot * 17 + 2 * (wr + r) + ky;   /* input plane 2 oz - 1 + kz's slot, row 2 oy - 1 + ky */
                 unsigned bfr[4];
                 ldsm_x4(bfr, sx + (rowi * 17 + vx + kb) * 16);   /* K 0..31: P(o), K 32..63: P(o + 1) */
 #pragma unroll
@@ -594,6 +600,7 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f4p_k(const mx4_t *__restr
 #pragma unroll
                 for (int r = 0; r < 2; r++) { mma4p4(acc[m][r][0], A, bf[r][0]); mma4p4(acc[m][r][1], A, bf[r][1]); }
             }
+          }
         }
         fwd_epilogue<MT, 2, TO, true, MT <= 2, true>(acc, scr, y, b, n, 0, Co, Do, Ho, Wo, oz0, oy0, ox0, wz, wr, nullptr, 0, nsp, N, s2p4_scr_off<MT>());
     }

@@ -6,6 +6,16 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Stride-2 fp4 forward (conv_fwd_s2_f4p_k): tap rows as kz x ky (2026-11-15, branch s2f4p-20261115)
+
+The tap-row loop ran "#pragma unroll 3" over tr = 0..8 with kz = tr / 3, ky = tr % 3 and the input slot ((2 oz0 + 2 wz + kz) % NP).
+In each of the three unrolled copies mcc computed tr / 3 and the % 5 again (it does not know tr is a multiple of 3 there), 31 SASS
+of lp_s2.cu:582 in the MMA loop where nvcc has 1. Now kz is a rolled loop (unroll 1) around a fully unrolled ky, and the slot is
+kz = 0's (one % NP before the loop) plus kz with one wrap, as conv_fwd_f4p_k's sl[] does. Same MMAs in the same order, so the same
+sums. MMA loop SASS (smallest loop holding the MMAs), MT 2 mx8 / mx4, MT 1 mx8 / mx4: mcc 122 / 122 / 104 / 104 -> 81 / 81 / 63 / 63,
+nvcc 83 / 87 / 65 / 65 -> 72 / 76 / 49 / 49. lp_s2 totals: nvcc 469784 -> 469736, mcc 598728 -> 598560. Tests: test_mx4 (s2 fwd
+gn+silu, fp4 kernel against the reference, deterministic), test_l0_slab "fp4 down (s2_f4p)".
+
 ## f8 weight gradient: slab-GroupNorm coefficients out of the channel loop (2026-11-14, branch wgradgn-20261114)
 
 conv_bwd_w_f8_k's x staging (lp_f8wgrad.cuh: the cooperative MX path and the xdecode lambda) computed each channel's GN+SiLU affine
