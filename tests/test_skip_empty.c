@@ -39,6 +39,7 @@ static double cosine(const float *a, const float *b, size_t n, int *fin) {
 }
 
 int main(void) {
+    setvbuf(stdout, nullptr, _IOLBF, 0);   /* (line-buffered: a killed run under compute-sanitizer kept nothing past section (2)) */
     setenv("UFSM_F4_WGRAD", "1", 0);   /* (train --fp4 2; read once) */
     if (nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0)) { printf("no cuda\n"); return 1; }
     nn_set_tf32(1); nn_set_f16(1); nn_set_sr(0); nn_set_prec(3);
@@ -161,7 +162,10 @@ int main(void) {
         remove(path); nn_free(dgy); free(gd); free(gm); free(gy);
     }
     {   /* (5) masked backward-data / weight gradient == dense on the zeroed gy, width 256 */
-        const int C = 256, D = 16, H = 32, W = 32; const shape5 s5 = {1, C, D, H, W}; const size_t S = (size_t)D * H * W, n = (size_t)C * S, nw = (size_t)C * C * 27;
+        /* UFSM_SANITIZE=racecheck (tests/sanitize.sh): width 64. At 256 the run died without output ~30 min in (likely the wide kernels' shared-memory tracking past the
+           pod's 31 GB cgroup: its oom_kill counter rose; "Target application returned an error", 0 hazards, 11-15);
+           the masked-vs-dense logic is the same at 64 (two 32-channel blocks) */
+        const char *san = getenv("UFSM_SANITIZE"); const int C = san && !strcmp(san, "racecheck") ? 64 : 256, D = 16, H = 32, W = 32; const shape5 s5 = {1, C, D, H, W}; const size_t S = (size_t)D * H * W, n = (size_t)C * S, nw = (size_t)C * C * 27;
         const int my = 4, mx = 2; uint8_t hm[2 * 4 * 2] = {};   /* 2 x 4 x 2 tiles */
         hm[(0 * my + 0) * mx + 0] = 1; hm[(1 * my + 1) * mx + 1] = 1;   /* dilated by one tile: y tile 3 out of reach (gx there 0) */
         float *hx = malloc(n * 4), *hg = malloc(n * 4), *hz = malloc(n * 4), *hw = malloc(nw * 4);

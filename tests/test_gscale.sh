@@ -69,7 +69,8 @@ for ln in open(sys.argv[1]):
     ang = re.search(r'phase error ([0-9.]+) deg', m.group(1))
     for k, v in kl.items():
         v = float(v); n += 1
-        if not (v > -1e-3 and (k not in bce or v < bce[k])): bad += 1; print(f"  bad kl {k} {v} (bce {bce.get(k)}): {ln.strip()}")
+        # (<=: hard 0 / 1 targets (rv, unsmoothed ink) have entropy 0, so their kl equals their bce)
+        if not (v > -1e-3 and (k not in bce or v <= bce[k] + 1e-4)): bad += 1; print(f"  bad kl {k} {v} (bce {bce.get(k)}): {ln.strip()}")
     if not ang or not (0 <= float(ang.group(1)) <= 180): bad += 1
     last = m.group(0)
 print(f"  (3) {n} KLs on the step lines, the last: {last}")
