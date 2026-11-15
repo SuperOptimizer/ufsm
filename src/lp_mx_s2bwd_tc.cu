@@ -264,9 +264,13 @@ __global__ void __launch_bounds__(256, 1) bwd_data_s2_f4_k(const uint8_t *__rest
                 }
                 __syncthreads();
               }
+              /* tap q's two staged-row bases, read once per tap (mcc: PT lives in local memory and the ldmatrix asm's memory clobber kept
+                 it from merging the per-j reads) */
+              const int gp0 = ((mzw + PT.da[q][0]) * GY + myw + PT.da[q][1]) * GX + PT.da[q][2], gp1 = ((mzw + PT.db[q][0]) * GY + myw + PT.db[q][1]) * GX + PT.db[q][2];
+#pragma unroll   /* (mcc: its own heuristic left this NP-trip loop rolled, 562 tokens x 4..7 over its limit; nvcc unrolls it unasked) */
               for (int j = 0; j < NP; j++) {
                 const int u = STREAM ? j : q * NP + j;
-                auto gpos = [&](int b_, int o) { const signed char *d = b_ ? PT.db[q] : PT.da[q]; return ((mzw + d[0]) * GY + myw + d[1]) * GX + d[2] + o; };
+                auto gpos = [&](int b_, int o) { return (b_ ? gp1 : gp0) + o; };
                 unsigned bfr[4], sb[2][2];   /* [half][column LPB0 / LPB1] */
                 if (NCH == 1) {   /* halves: taps A / B */
                     ldsm_x4(bfr, gyt + gpos(isB, 8 * qn + v8) * 16);
