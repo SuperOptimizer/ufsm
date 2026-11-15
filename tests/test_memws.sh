@@ -23,4 +23,8 @@ grep -q '^memory: kernel workspaces .* allocated and sealed' run.log || { echo "
 if grep -n 'grew after the memory plan' run.log; then echo "FAIL: a kernel workspace grew after the plan ($D/run.log)"; exit 1; fi
 late=$(awk '/^step / {s = 1} s && /^alloc / {print}' run.log)
 [ -z "$late" ] || { echo "FAIL: device allocations after step 1 ($D/run.log):"; echo "$late" | head -5; exit 1; }
+# (2026-11-15) the scroll axis fits the 4^3-cell grid under --lat 4 (the record's div was 1: every record missed the grid, the scroll PE fell
+# back to grid-index positions in training while predict used the axis)
+if grep -n 'the axis is NOT used' run.log; then echo "FAIL: the scroll axis record does not fit the --lat grid ($D/run.log)"; exit 1; fi
+grep -q 'have no scroll axis\|no scroll axis records' run.log && echo "  (note: fixture windows without an axis: $(grep -c 'have no scroll axis' run.log) lines)"
 echo "test_memws: ok"

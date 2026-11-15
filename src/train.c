@@ -3548,7 +3548,7 @@ int cmd_train(int argc, char **argv) {
     if (workers > sc.nbuf - ngh)   /* a worker fills a slot of its own and the trainer holds about one per GPU: workers beyond the free slots wait, and each
                                      holds its window scratch (5 bytes per voxel; P 640, 2026-11-09: 4 workers 3 slots 46% wait, 8 workers 3 slots 38%, 4 workers 5 slots 0%) */
         fprintf(stderr, "sampler: %d workers but %d slots: at most %d windows are built at once (--sampler-slots %d to use every worker)\n", workers, sc.nbuf, sc.nbuf - ngh > 1 ? sc.nbuf - ngh : 1, workers + 2 * ngh);
-    g_axr = unet_cfg_axis(&cfg); sc.axis_rec = g_axr ? g_hdiv : 0;   /* the scroll axis per window */
+    g_axr = unet_cfg_axis(&cfg); sc.axis_rec = g_axr ? g_hdiv * (g_lat ? g_lat : 1) : 0;   /* the scroll axis per window; div = window voxels per network voxel (2026-11-15: under --lat 4 it was 1, so every record (P planes) missed the 4^3-cell grid (P / 4) and the scroll PE fell back to grid-index positions in training (try6 silently, try7 with the warning) while predict used the axis) */
     if (g_axr && split && !g_split_top) { fprintf(stderr, "--attn-axis radial / --attn-pe scroll / --attn-deform-init normal: not with --split z (but --split-top: the attention stage sees the whole window)\n"); return 2; }
     if (g_axr && !cfg.attn_deform) fprintf(stderr, "attention: %s, %s positions around each window's scroll axis\n", cfg.attn_axis ? "radial (along the rays from the axis)" : "full", cfg.attn_pe == 3 ? "scroll RoPE" : "grid");
     if (g_axr && cfg.attn_deform) fprintf(stderr, "attention: deformable offsets in each token's normal / tangent / axis frame around the window's scroll axis\n");
