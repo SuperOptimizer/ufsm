@@ -270,6 +270,24 @@ __device__ __forceinline__ float2 chan_ab(int ci, int Ci, int Cx, int n, const s
     const int ng = gn_row(q, n, zg) * q.G + cc / (Cg / q.G); const float a = q.rstd[ng] * q.gamma[cc];
     return make_float2(a, q.beta[cc] - q.mean[ng] * a);
 }
+/* chan_ab split for a loop over channels at one plane: chan_ab_pl the per-plane part (the segments' statistics rows and channels per
+   group), chan_ab_q the per-channel rest (the same arithmetic, so the same (a, b)). Without it the invariant gn_row / split tests ran
+   in every unrolled channel copy (conv_bwd_w_f8_k: 48 copies) */
+struct cab_pl { int r0, r2, cpg0, cpg2; bool s2g; };
+__device__ __forceinline__ cab_pl chan_ab_pl(int Ci, int Cx, int n, const split_t &sp, const gnp_t &gp, int zg) {
+    cab_pl p; p.s2g = sp.x2 && sp.gp2.G;
+    p.r0 = gp.G ? gn_row(gp, n, zg) : 0; p.cpg0 = gp.G ? (p.s2g ? Cx : Ci) / gp.G : 1;
+    p.r2 = p.s2g ? gn_row(sp.gp2, n, zg) : 0; p.cpg2 = p.s2g ? (Ci - Cx) / sp.gp2.G : 1;
+    return p;
+}
+__device__ __forceinline__ float2 chan_ab_q(int ci, int Ci, int Cx, const split_t &sp, const gnp_t &gp, const cab_pl &p) {
+    if (ci < 0 || ci >= Ci) return make_float2(1.f, 0.f);
+    const bool s2 = p.s2g && ci >= Cx;
+    const gnp_t &q = s2 ? sp.gp2 : gp;
+    if (!q.G) return make_float2(1.f, 0.f);
+    const int cc = s2 ? ci - Cx : ci, ng = (s2 ? p.r2 : p.r0) * q.G + cc / (s2 ? p.cpg2 : p.cpg0); const float a = q.rstd[ng] * q.gamma[cc];
+    return make_float2(a, q.beta[cc] - q.mean[ng] * a);
+}
 /* voxel offset of (z, y, x) */
 __device__ __forceinline__ size_t cof(const chan_t &, int z, int y, int x, int H, int W) { return ((size_t)z * H + y) * W + x; }
 /* element (n, c, v) of an MX tensor (B bits) with N samples, C channels, S voxels */

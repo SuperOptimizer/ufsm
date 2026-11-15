@@ -6,6 +6,20 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## f8 weight gradient: slab-GroupNorm coefficients out of the channel loop (2026-11-14, branch wgradgn-20261114)
+
+conv_bwd_w_f8_k's x staging (lp_f8wgrad.cuh: the cooperative MX path and the xdecode lambda) computed each channel's GN+SiLU affine
+with chan_ab, which repeats the split / segment tests, gn_row's slab clamp and the integer division Cg / G in every unrolled channel
+copy (48 copies in <1,6,...>), and the uni path also tested `gp.ns || sp.gp2.ns` per channel. Now the test sits outside the loop and
+chan_ab_pl (lp_common.cuh) computes the per-plane part (both segments' statistics rows, channels per group) once; chan_ab_q does the
+per-channel rest with the same arithmetic, so (a, b) are unchanged bit for bit.
+
+Static SASS of all 54 lp_f8wgrad kernels (14 units), nvcc 13 sm_120a: 409984 -> 348176 instructions (-15 %), BRA 14330 -> 13254,
+MUFU 5342 -> 4334 (one integer-division reciprocal per channel fewer), spill bytes 11540 -> 10112, registers 4900 -> 4898; no kernel
+grows. conv_bwd_w_f8_k<1,6,mx4,mx8>: 17640 -> 14328. mcc (lp_f8wgrad_i0 + i4): 289720 -> 251840; the same kernel 29008 -> 24104.
+Covered by test_l0_slab (wgrad fp8 cases with 8-plane slabs, SR, the network-input tile), test_mx4 (f8 wgrad cooperative ==
+per-element with GN, bit for bit: the non-slab branch) and test_grad_mx4~L0_NORM=4,L0_SLAB=8,L0_SLAB_KERN=1.
+
 ## Fast math everywhere, native builds, LTO / PGO; UFSM_STRICT_MATH=ON for the bit-exact build (2026-11-14, branch fastmath-20261114)
 
 The user: "enable fast math everything". Before: host C `-ffp-contract=off -fno-math-errno` (IEEE), the CUDA units nvcc
