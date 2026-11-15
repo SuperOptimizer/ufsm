@@ -19,7 +19,7 @@
 #            build made with MCC_NAME=1 in the environment of the build: that optimisation off), the benches matching BENCH_RE of
 #            MCC_BUILD (on) against SW_NAME (off), same rounds and parser, into OUT/sw_name (its ab.tsv columns "nvcc" / "mcc" are
 #            on / off: a ratio above 1 means the optimisation pays). Default arms, on the kernels each changes most (static
-#            SASS, 2026-11-14): NOLATCH stride 2 (conv_fwd_s2_f8_k<*,*,0> hot loop 513 -> 607 with the fold, lp_s2 total 576386 ->
+#            SASS, 2026-11-14; SHSYM is opt-in, MCC_SHSYM=1 turns it on: in its arm a ratio above 1 means keep it off): NOLATCH stride 2 (conv_fwd_s2_f8_k<*,*,0> hot loop 513 -> 607 with the fold, lp_s2 total 576386 ->
 #            568327), NORANGE stride 2 (lp_s2 hot loops 16405 -> 15436), NOHOIST fp4 wgrad + stride 2 (lp_f4wgrad_i1 hot loop 30461
 #            -> 26578), NODIVCSE stride 2 (lp_s2 548193 -> 492637), NOFASTCALL wgrad / GN / level-0 misc (fmaf(1, x, 0) folds). NOLATCH_BUILD: the old name of SW_NOLATCH.
 # Fixed checkpoint: CKPT, else a copy of scratch2/last.ckpt taken once into OUT/fixed.ckpt (reruns reuse it).
