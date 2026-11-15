@@ -906,9 +906,12 @@ pass on the desk CPU. test_scan_norm (its latvol case) and test_predict_guard ne
   block at its end, so a larger net would silently have read as unwrap v0 / density_scale 32. predict's density keys now read through it.
 - **#15 scan_norm on a latvol CT**: predict now computes the scan statistics on the rebuilt CT (scan_norm_stats_cached, as the sampler
   does for a latvol source) and refuses when they cannot be computed. Before, it silently fell back to the per-window z-score.
-- **#16 non-finite logits**: every inference forward counts its non-finite logits on the device (nn_nonfinite_acc, same stream, no
-  sync). predict prints the totals at the end and exits 1, workers included. NaN used to become undefined bytes (fit_finalize_k's
-  lroundf, the probability casts). UFSM_TEST_NAN_LOGITS=1 plants one NaN for the test.
+- **#16 non-finite values**: predict counts the non-finite values in its fit-field accumulators (planes 0..10) on the device before
+  each finalize (pred_nf_check, no sync; host loop on the --fit-fields path), reports them at the end and exits 1, workers included.
+  NaN used to become undefined bytes in fit_finalize_k. The first version counted the logits at the end of unet_forward_x, sized
+  [cout][D H W]. Under in-place slab inference and head slabs that buffer is smaller or not whole: it read past it, giving illegal
+  accesses and false NaNs in ~13 GPU tests (the mega bisect named 6a9186a). The probability outputs (recto / ink / rv) are not covered.
+  UFSM_TEST_NAN_LOGITS=1 plants one NaN in the accumulators for the test.
 - **#17 --resume identity**: zarr.json attrs carry "run" (checkpoint and axis sha256, level, um, window / halo (z), q, shard, full_grid,
   ema, channel, gn_stats, the resolved norm, tta, grid origin, input gain / bias). A resume over a non-empty done list must match it, else
   exit 2 with the store untouched; a store without the record (older binary) is refused too. --box is left out (full-grid stores are

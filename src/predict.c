@@ -1253,6 +1253,22 @@ static size_t winauto_need(int k, int d, void *vc) {   /* the device bytes of au
            (size_t)c->shard * c->shard * c->shard + ((size_t)3 << 29);
 }
 
+/* The inference guard (unroll audit 11-14 #16) on the fit-field accumulators: planes 0..10 (floats over nl cells; plane 11 is an int
+   max) counted for non-finite values on the device before each finalize (no sync), read once at the end. Not on the logits inside
+   unet_forward_x: the logits buffer is not a whole [cout][D H W] window under in-place slab inference / head slabs (that first version
+   read past it: illegal accesses and false NaNs in ~13 GPU tests, mega bisect 6a9186a). UFSM_TEST_NAN_LOGITS=1 plants a NaN (the test) */
+static unsigned long long *g_pred_nf_dev, g_pred_nf_host[2];
+static void pred_nf_check(float *acc, size_t nl) {
+    if (!g_pred_nf_dev) { g_pred_nf_dev = nn_malloc(3 * sizeof *g_pred_nf_dev); nn_zero(g_pred_nf_dev, 3 * sizeof *g_pred_nf_dev); }
+    if (ufsm_env_on("UFSM_TEST_NAN_LOGITS")) { const float nf = NAN; nn_h2d(acc + 2 * nl, &nf, 4); }
+    if (nl) nn_nonfinite_acc(acc, 11 * nl, 0, g_pred_nf_dev);
+}
+static int pred_nf_report(void) {   /* 1 when any accumulator held a non-finite value (syncs) */
+    unsigned long long h[3] = {0, 0, 0}; if (g_pred_nf_dev) { nn_sync(); nn_d2h(h, g_pred_nf_dev, sizeof h); nn_free(g_pred_nf_dev); g_pred_nf_dev = nullptr; }
+    const unsigned long long nv = h[0] + g_pred_nf_host[0], ns = h[1] + g_pred_nf_host[1]; g_pred_nf_host[0] = g_pred_nf_host[1] = 0;
+    if (ns) fprintf(stderr, "predict: FAILED: %llu fit-field slabs held non-finite values (%llu accumulator values; NaN / Inf logits): the fields there are undefined\n", ns, nv);
+    return ns != 0;
+}
 /* sha256 of a file as 64 hex digits (0 ok): the checkpoint / axis identity of a --resume run (streamed: a 250 MB checkpoint ~0.2 s) */
 static int pred_file_sha256(const char *path, char hex[65]) {
     FILE *f = fopen(path, "rb"); if (!f) return -1;
@@ -3060,6 +3076,7 @@ static int predict_one(int argc, char **argv) {
                         const int fb = ffw_acquire(&ffw);
                         if (pprof) p_ffw += now() - tfa;
                         uint8_t *fd = ff8d + (size_t)fb * FFZ_MAXP * ffwn;
+                        pred_nf_check(ffacc, nl);   /* (audit #16: NaN would become undefined bytes in fit_finalize_k) */
                         nn_fit_finalize(ffacc, nl, ffh, fd);   /* pc .. w, then r (unwrap) or dz dy dx dq (unwrap2) */
                         if (!ffu2) nn_fit_finalize_recto(ffacc, nl, fd + 10 * nl); else if (ffw4d) nn_fit_finalize_w4(ffacc4, nl, fd + 10 * nl);
                         if (ffct) nn_fit_finalize_ct(ffacc, nl, ffh, fd + (size_t)ffz_nb * nl, fd + (size_t)(ffz_nb + 1) * nl);   /* then ct, cs */
@@ -3234,6 +3251,8 @@ static int predict_one(int argc, char **argv) {
         float *acc = malloc(ffna * ffn * 4); if (!acc) { fprintf(stderr, "predict: out of host memory (fit fields)\n"); abort(); }
         nn_sync(); nn_d2h(acc, ffacc, ffna * ffn * 4); nn_free(ffacc);
         uint8_t *a[10]; for (int k = 0; k < 10; k++) if (!(a[k] = calloc(ffn, 1))) { fprintf(stderr, "predict: out of host memory (fit fields)\n"); abort(); }   /* (audit mini/alloc #10) */
+        if (ufsm_env_on("UFSM_TEST_NAN_LOGITS")) acc[2 * ffn] = NAN;
+        { unsigned long long hv = 0; for (size_t i = 0; i < 11 * ffn; i++) hv += !isfinite(acc[i]); if (hv) { g_pred_nf_host[0] += hv; g_pred_nf_host[1]++; } }
         fit_finalize(acc, ffn, ffh, a);
         const int na = (int)bn[0] + 1; float *cyb = malloc(na * sizeof(float)), *cxb = malloc(na * sizeof(float));
         if (!cyb || !cxb) { fprintf(stderr, "predict: out of host memory (fit fields)\n"); abort(); }
@@ -3292,14 +3311,7 @@ static int predict_one(int argc, char **argv) {
         fprintf(stderr, "GroupNorm statistics of %ld windows -> %s\n", nw, gn_save); free(h);
     }
     const double t_win = now() - t0;   /* the window loop's seconds (the throughput lines below also show the end-to-end clock) */
-    int nf_bad = 0;   /* the inference guard (unet_nonfinite; unroll audit 11-14 #16): non-finite logits in any forward fail the run, as NaN
-                         became undefined bytes in the outputs (fit_finalize_k's lroundf, the probability casts) */
-    {   unsigned long long nv = 0, nfw = 0, v1 = 0, f1 = 0; unet_nonfinite(u, &nv, &nfw);
-        if (split) { nn_init(gpus[1]); unet_nonfinite(u1, &v1, &f1); nn_init(gpu); nv += v1; nfw += f1; }
-        if (nfw) { fprintf(stderr, "predict: FAILED: %llu forwards (windows x TTA) produced non-finite logits (%llu values); the outputs of those windows "
-                                   "are undefined\n", nfw, nv); nf_bad = 1; }
-        else fprintf(stderr, "predict: logits finite in every forward\n");
-    }
+    const int nf_bad = ffd ? pred_nf_report() : 0;   /* the inference guard (pred_nf_check; unroll audit 11-14 #16): exit 1 */
     if (split) {
         for (int k = 0; k < 2; k++) { pside_t *S = &J.s[k]; nn_init(gpus[k]); nn_free(S->ctm); nn_free(S->dsh); nn_free(S->stsc); nn_free(S->red); nn_free(S->dyd); free(S->rows); free(S->own); }
         nn_init(gpus[1]); unet_free(u1); nn_init(gpu); split_free(sctx);

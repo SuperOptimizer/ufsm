@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # predict's run guards (unroll audit 11-14):
-#  #16 the non-finite logits guard: a clean run reports "logits finite"; with a NaN planted in every forward's logits
-#      (UFSM_TEST_NAN_LOGITS=1) the run reports the forwards and fails (exit 1);
+#  #16 the non-finite guard on the fit-field accumulators: a clean --fit-zarr run reports nothing; with a NaN planted in them
+#      (UFSM_TEST_NAN_LOGITS=1) the run reports the slabs and fails (exit 1), also on the host --fit-fields path;
 #  #17 --resume: the store's attrs carry the run (checkpoint sha256, window, halo, q, ...); a resume of the same run goes on (and skips
 #      the listed shards), one with another q / window / checkpoint, or over a store written before the run record, is refused (exit 2).
 # Usage: test_predict_guard.sh UFSM MAKE_WIND_FIXTURE DIR
@@ -16,12 +16,15 @@ T=(--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4
 "$U" train fx/sources.json --out b "${T[@]}" --seed 6 > b.log 2>&1 || fail "train b ($D/b.log)"
 P=(--um 9.6 --level 0 --gpu 0 --threads 2 --shard 128 --levels 1 --full-grid 1)
 
-# ---- #16 ----
-"$U" predict a/last.ckpt fx ct p0 "${P[@]}" --box 0,0,0,128,128,128 --window 128 --halo 16 > p0.log 2>&1 || fail "predict ($D/p0.log)"
-grep -q 'logits finite in every forward' p0.log || fail "no guard line in a clean run ($D/p0.log)"
-set +e; UFSM_TEST_NAN_LOGITS=1 "$U" predict a/last.ckpt fx ct pn "${P[@]}" --box 0,0,0,128,128,128 --window 128 --halo 16 > pn.log 2>&1; rc=$?; set -e
+# ---- #16 ---- (the guard counts the fit-field accumulators: a NaN logit there would become undefined field bytes)
+F=(--um 9.6 --level 0 --gpu 0 --threads 2 --shard 128 --levels 1 --box 0,0,0,128,128,128 --window 128 --halo 16)
+"$U" predict a/last.ckpt fx ct p0 "${F[@]}" --fit-zarr p0/fz > p0.log 2>&1 || fail "predict --fit-zarr ($D/p0.log)"
+grep -q 'FAILED' p0.log && fail "a clean run reported non-finite values ($D/p0.log)"
+set +e; UFSM_TEST_NAN_LOGITS=1 "$U" predict a/last.ckpt fx ct pn "${F[@]}" --fit-zarr pn/fz > pn.log 2>&1; rc=$?; set -e
 [ "$rc" = 1 ] || fail "a NaN run exited $rc, not 1 ($D/pn.log)"
-grep -Eq 'FAILED: [1-9][0-9]* forwards .* non-finite logits' pn.log || fail "no guard report ($D/pn.log)"
+grep -Eq 'FAILED: [1-9][0-9]* fit-field slabs held non-finite values' pn.log || fail "no guard report ($D/pn.log)"
+set +e; UFSM_TEST_NAN_LOGITS=1 "$U" predict a/last.ckpt fx ct ph "${F[@]}" --fit-fields ph/ff > ph.log 2>&1; rc=$?; set -e
+[ "$rc" = 1 ] || fail "a NaN run (host --fit-fields) exited $rc, not 1 ($D/ph.log)"
 
 # ---- #17 ----
 R=(--resume 1 --window 128 --halo 16 --q 0)
