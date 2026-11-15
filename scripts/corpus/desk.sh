@@ -7,7 +7,7 @@
 #            forlindesk:<S>/state/fields.ready (fields kept here); forlindesk computes the count-field ref itself before its slabs
 #   ref      fallback only (one lane): when forlindesk holds more than one pushed scroll without wraps, the desk takes a queued scroll's
 #            ref (atomic lock forlindesk:<S>/state/ref.lock, owner desk), computes it here (TH 12 threads, nice 10), pushes ref/ and writes
-#            forlindesk:<S>/state/ref.ready; --model-stride MSTRIDE (4): Paris 4 at 4 vs 2 (forlindesk, 10 threads each): 1:36 vs 1:54 h,
+#            forlindesk:<S>/state/ref.ready; --model-stride MSTRIDE (1 since 11-15: at 4, 3/4 of z had no local gauge, unroll #8: 1667 low planes 38 -> 5 of 69 at 1; was 4: Paris 4 at 4 vs 2 (forlindesk, 10 threads each): 1:36 vs 1:54 h,
 #            ref-alone ids .1598 vs .1605, pairs .691/.295 vs .683/.296
 #   pull     once forlindesk:<S>/state/wraps.ready: its joined model + wraps -> here (byte-checked)
 #   surf     surf-stats --per-wrap --ct --ct-only 1 (the fields' geometry only: whole-scroll phase planes OOMed the desk at 137 GB): the on-papyrus share (max CT within +-15 um along the normal
@@ -65,7 +65,7 @@ ref() {
   local d=$FDC/$S a b
   ssh -n $FD "mkdir $d/state/ref.lock 2>/dev/null && echo desk > $d/state/ref.lock/owner" || { log "ref: forlindesk took it"; return 0; }
   rm -rf $REF
-  if ! /usr/bin/time -v nice -n 10 $U count-field $F $O/cf.unused --R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-4} \
+  if ! /usr/bin/time -v nice -n 10 $U count-field $F $O/cf.unused --R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --iters 1200 --model $REF --model-only 1 --model-stride ${MSTRIDE:-1} \
        --threads $TH --mem-gb ${CFMEM:-24} > $O/logs/ref.log 2>&1 || [ ! -e $REF/model.json ]; then ssh -n $FD "rm -rf $d/state/ref.lock"; return 1; fi   # (forlindesk may take it then)
   rsync -a $REF/ $FD:$d/ref/ || return 1; a=$(bytes $REF); b=$(ssh -n $FD "du -sb --apparent-size $d/ref" | awk '{print $1}')
   [ "$a" = "$b" ] || { log "ref push: $a bytes here, ${b:-?} on forlindesk"; return 1; }
