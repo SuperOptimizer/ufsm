@@ -6,6 +6,26 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Skip-empty: masked convs bypass the ring kernels; test_skip_empty racecheck QUICK (2026-11-15, branch skipmask-20261115)
+
+test_skip_empty~racecheck FAILed on the pod after 3289 s: section (5), at its racecheck width 64, reported masked forward 0, backward-data 0,
+wgrad 0 and gx bytes differing. This was neither a launch failure nor an OOM (the cgroup oom_kill counter stayed at 4). Only `launch_f4`
+(lp_f4fwd.cuh) applies the mask (`lp_skip_get`), and `fwd_f4_t` sends Cip 32 / 64 convs to the ring kernels (`launch_f4r`, and `f4ru` for
+dec0.c1) before it reaches `launch_f4`. So any 32 / 64-wide conv on a level grid ran dense silently in the forward and was never marked.
+For backward-data, a masked conv whose gy is 32 / 64 wide would land on the ring kernel and abort in `nn_skip_bwd_check`; that path was
+loud, not divergent.
+
+Fix: `nn_skip_masks(xs, sp)` (nn_skip.cu) gives `launch_f4`'s decision without `lp_skip_get`'s side effects: forward means the output grid
+is a level and there is no SR; backward-data means the conv was seen masked. When it is set, `fwd_f4_t` skips `launch_f4r` / `f4ru`.
+`p16_f4` (input <= 16 channels) and `f4u` (the fused upsample) still run dense. Their forward is consistent (the conv is not marked, so its
+backward runs dense too), and a masked conv whose backward-data reaches them aborts in `nn_skip_bwd_check` as before.
+
+test_skip_empty (5) now runs at widths 256 and 64. At 64 the masked bwd-data matches the dense one on the zeroed gy byte for byte, and the
+wgrad / bias rel is 0 (desk and pod). Under racecheck the test runs a QUICK size: P 32, material z < 6 (level 0: 2 of 4 tile planes active),
+no margin profile, and width 64 only in (5). At P 64 racecheck took ~110 s per forward on the pod's RTX PRO 4000 (setup + (1) 443 s,
+each margin forward 105-126 s). QUICK under racecheck: 505 s on the pod, 0 hazards, oom_kill unchanged (suite EST 760 s);
+synccheck (full size) 3 s, 0 errors. test_memws and test_split_ab (the skip-empty CLI paths) pass.
+
 ## Fast-math round: the last four fast-tier failures (2026-11-15, branch fmfix-20261115, off fastmath-20261114)
 
 The fm integration (mega-audit 087325a0 + fastmath 9561823b, desk) left four fast-tier failures. Each checked against the master
