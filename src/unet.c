@@ -4642,6 +4642,9 @@ void unet_reserve(unet *u, int muon, int muon_tc) {
         if (!u->muon_descs && !mx_any(u) && !ufsm_env_on("UFSM_MUON_UNBATCHED")) { muon_build_t *b = calloc(1, sizeof *b); muon_table(u, b); free(b); }
         if (muon_tc >= 2 && nn_muon_tc_reserve()) fprintf(stderr, "unet_reserve: the Muon cuBLASLt handle / workspace failed\n");
     }
+    /* --film / --gfilm: the forward copy of the weights (np floats: 368 MB at 92 M parameters), made at the first forward when nothing
+       else (sparse24 / w4_2d's wm) copies them; it was outside the plan (allocated in step 1, after the planner measured; 2026-11-15) */
+    if ((u->cfg.film || u->cfg.gfilm) && !u->wq && u->fw == u->live && !u->ffw) u->ffw = nn_malloc(u->np * 4);
 }
 /* ---- the kernels' device workspaces for a training window (2026-11-14 audit net#4) ----
    Every grow-on-demand scratch of the training kernels, sized from the net's convs at the levels of the last (dry) build, mirroring each
