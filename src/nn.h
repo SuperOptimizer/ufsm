@@ -694,6 +694,7 @@ typedef struct { float *lrm, *ema; double *dog; float *const *disp; double *part
 void nn_muon_ext_adapt(const nn_madapt *a);
 void nn_muon_scale_mode(int m);   /* 0: sqrt(max(1, Co / K)); 1: spectral sqrt(Co / K) (train --muon-scale spectral); 2: r sqrt(max(Co, K)) (rms) */
 void nn_muon_scale_rms(float r);   /* mode 2's r: the update's element RMS (Moonlight 0.2) */
+void nn_muon_cwd(int on);   /* train --muon-cwd 1: cautious weight decay on the Muon matrices (decay only where step and weight agree in sign) */
 void nn_signm(float *p, const float *g, float *m, size_t n, float lr, float b, float wd);   /* sign-momentum (Scion ell-inf) step */
 int lp_f8w_mixed_reserve(void);   /* the latent input conv's MX-fp8 x / MX-fp4 gy weight-gradient chunk copies (96 MB) on the current device now */
 /* kernel workspaces (nn_core.cu): one per-device registry of the kernels' grow-on-demand scratch, sized by the trainer's memory planner */
