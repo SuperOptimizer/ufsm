@@ -46,6 +46,10 @@ int main(void) {
     if (nn_set_prec_policy("all=fp4:fp4:fp4")) return 1;
     unet_set_act_mx4(1);
     const int P = 64, ZM = 20;   /* material planes [0, ZM) */
+    /* UFSM_SANITIZE=racecheck (tests/sanitize.sh): section (4) runs only the three passes that reach the masked backward kernels (dense, all
+       active, CT masks) and skips its numeric comparisons (the plain run checks those). The full section died under racecheck after section (2)
+       with the pod cgroup's oom_kill counter rising (merge3, 11-14/15: 1900 s, oom_kill 3 -> 4); the cause is inferred, not confirmed. */
+    const char *san = getenv("UFSM_SANITIZE"); const int race = san && !strcmp(san, "racecheck");
     unet_cfg cfg = {}; cfg.nlev = 3; cfg.widths[0] = 96; cfg.widths[1] = 128; cfg.widths[2] = 160; cfg.cin = 4; cfg.cout = 2; cfg.G = 8; cfg.gn_ema = 1;
     unet *u = unet_create(&cfg); unet_init(u, 11);
     const shape5 xs = {1, 4, P, P, P}; const size_t p3 = (size_t)P * P * P, nx = 4 * p3;
@@ -128,6 +132,17 @@ int main(void) {
         all_active(P);
         nn_set_sr_step(4242); unet_forward(u, dx, xs, 1); unet_zero_grad(u); unet_backward(u, dgy); unet_grad_d2h(u, gm); nn_skip_counts_bwd(&nb, &nw);
         int fin; double cs = cosine(gd, gm, np, &fin); const double ra = rel(gd, gm, np);
+        if (race) {
+            printf("(4) train, all active (racecheck: the masked passes only, no numeric checks): cosine %.6f, masked backward-data %ld, wgrad %ld\n", cs, nb, nw);
+            CHECK(nb > 0 && nw > 0, "masked backward-data (%ld) and wgrad (%ld) ran", nb, nw);
+            nn_skip_off(); CHECK(!nn_skip_build(dct, P, P, P, 1, 3, 0, 1), "nn_skip_build");
+            nn_set_sr_step(4242); unet_forward(u, dx, xs, 1); unet_zero_grad(u); unet_backward(u, dgy); unet_grad_d2h(u, gm); nn_skip_counts_bwd(&nb, &nw);
+            cs = cosine(gd, gm, np, &fin);
+            printf("    train, CT masks (margin 1): gradient finite %d, cosine to dense %.4f, masked backward-data %ld, wgrad %ld\n", fin, cs, nb, nw);
+            CHECK(nb > 0 && nw > 0, "train, CT masks: masked backward ran");
+            nn_skip_off(); nn_free(dgy); free(gd); free(gm); free(gy);
+            goto sec5;
+        }
         /* (the weight gradients sum with atomics: two dense passes differ in the last bits; the run-to-run noise is the yardstick) */
         float *g2 = malloc(np * 4); nn_skip_off(); nn_set_sr_step(4242); unet_forward(u, dx, xs, 1); unet_zero_grad(u); unet_backward(u, dgy); unet_grad_d2h(u, g2);
         const double r0 = rel(gd, g2, np); free(g2);
@@ -161,11 +176,12 @@ int main(void) {
         uc->skip_thr = 0; CHECK(!unet_save(u, path, 5, nullptr) && !unet_peek(path, &pc, &st) && pc.skip_thr == 0, "no skip_empty key when off");
         remove(path); nn_free(dgy); free(gd); free(gm); free(gy);
     }
+sec5:
     {   /* (5) masked backward-data / weight gradient == dense on the zeroed gy, width 256 */
         /* UFSM_SANITIZE=racecheck (tests/sanitize.sh): width 64. At 256 the run died without output ~30 min in (likely the wide kernels' shared-memory tracking past the
            pod's 31 GB cgroup: its oom_kill counter rose; "Target application returned an error", 0 hazards, 11-15);
            the masked-vs-dense logic is the same at 64 (two 32-channel blocks) */
-        const char *san = getenv("UFSM_SANITIZE"); const int C = san && !strcmp(san, "racecheck") ? 64 : 256, D = 16, H = 32, W = 32; const shape5 s5 = {1, C, D, H, W}; const size_t S = (size_t)D * H * W, n = (size_t)C * S, nw = (size_t)C * C * 27;
+        const int C = race ? 64 : 256, D = 16, H = 32, W = 32; const shape5 s5 = {1, C, D, H, W}; const size_t S = (size_t)D * H * W, n = (size_t)C * S, nw = (size_t)C * C * 27;
         const int my = 4, mx = 2; uint8_t hm[2 * 4 * 2] = {};   /* 2 x 4 x 2 tiles */
         hm[(0 * my + 0) * mx + 0] = 1; hm[(1 * my + 1) * mx + 1] = 1;   /* dilated by one tile: y tile 3 out of reach (gx there 0) */
         float *hx = malloc(n * 4), *hg = malloc(n * 4), *hz = malloc(n * 4), *hw = malloc(nw * 4);
