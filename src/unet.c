@@ -4271,6 +4271,7 @@ static void muon_collect(unet *u, const convp *c, void *arg) {
     if (K > b->maxk) b->maxk = K;
 }
 static int mx_any(const unet *u);
+static int mx_groupable(const unet *u);
 static void muon_table(unet *u, muon_build_t *b) {   /* the descriptor table and its scratch pool, built once (offsets first, then pointers) */
     for_each_mat(u, muon_collect, b);
     if (u->muon_descs) return;
@@ -4287,7 +4288,7 @@ static void muon_table(unet *u, muon_build_t *b) {   /* the descriptor table and
         memcpy(b->h, t, sizeof(muon_desc_t) * (size_t)b->n);
     }
     u->muon_ngrp = 1; u->muon_grp[0] = 0; u->muon_grp[1] = b->n;
-    if (!mx_any(u)) {   /* plain Muon: the scratch of groups of convs of at most UFSM_MUON_POOL_MB (default 128) each, the groups run one after another
+    if (!mx_any(u) || mx_groupable(u)) {   /* plain Muon: the scratch of groups of convs of at most UFSM_MUON_POOL_MB (default 128) each, the groups run one after another
                            over one pool (2026-11-13: one pool for every conv was 953 MB per GPU at the 104 M scratch2 net, outside the memory
                            plan; each conv's update is independent of the others in the batch, so the grouping keeps the bits) */
         const char *e = getenv("UFSM_MUON_POOL_MB"); const size_t cap = (size_t)((e ? atof(e) : 128.0) * 1048576.0 / 4.0);
@@ -4340,6 +4341,14 @@ float unet_qk_lmax(unet *u) { float v = -1.f; if (u->qk_last) { nn_d2h(&v, u->qk
 void unet_set_rest_sign(unet *u, int on, float mult) { u->rest_sign = on; u->rest_sign_mult = mult; }
 void unet_set_muon_ademamix(unet *u, float alpha, float b3, int T) { u->mx_mix_a = alpha; u->mx_mix_b3 = b3; u->mx_mix_T = T > 0 ? T : 1; }
 static int mx_any(const unet *u) { return u->mx_c || u->mx_hb || u->mx_ns || u->mx_nm || u->mx_vr != 0.f || u->mx_caut || u->mx_mix_a != 0.f || u->ad_lars || u->ad_dog || u->mx_fro; }
+/* the ext path (--normuon / --muon-ns polar) in groups over the plain path's shared scratch pool: its per-matrix state (NorMuon's rows by
+   their absolute offsets, the lr multipliers) slices by the group's first matrix, and each matrix's update is independent of the others.
+   2026-11-15 try7 one card: one pool for every matrix was 0.95 GB at the 104 M net, allocated at the first update outside the memory plan
+   (cudaMalloc failed). Muon-C, hyperball, the adaptive (lars / dog), attention lr, cautious, Frobenius, MARS and AdEMAMix keep one batch. */
+static int am_on(const unet *u);
+static int mx_groupable(const unet *u) {
+    return !u->mx_c && !u->mx_hb && !u->ad_lars && !u->ad_dog && !am_on(u) && !u->mx_caut && !u->mx_fro && u->mx_vr == 0.f && u->mx_mix_a == 0.f;
+}
 /* adaptive Muon (2026-11-14, DESIGN.md "Fully adaptive Muon"; nn_muon_ext_adapt in nn_opt.cu): lars (b) the per-layer step control toward
    update / weight ratio tgt at the peak lr (0: the matrices' geometric mean), EMA beta, multipliers clamped to [1 / clamp, clamp]; dog (c) the
    DoG global step (first step = lr_peak, capped at dog_max x lr_peak). The (b) EMAs and the (c) scalars ride in checkpoints (adm_ema,
@@ -4497,6 +4506,16 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
         return;
     }
     if (u->ad_lars || u->ad_dog || am_on(u)) ad_setup(u, b, beta);
+    if (u->muon_ngrp > 1) {   /* (mx_groupable: the table's groups share one pool, run one after another) */
+        for (int g = 0; g < u->muon_ngrp; g++) {
+            const int i0 = u->muon_grp[g], k = u->muon_grp[g + 1] - i0;
+            nn_muon_ext_lrmult(lrm0 ? lrm0 + i0 : nullptr);
+            nn_muon_ext_batch((const char *)u->muon_descs + sizeof(muon_desc_t) * (size_t)i0, k, u->muon_maxco, u->muon_maxk, nullptr, nullptr, 3, 0, 0,
+                              nullptr, u->mx_R, 0, u->mx_part, lr, beta, wd, 0.f, u->mx_ns, nr, nr ? u->mx_nmoff + i0 : nullptr, u->mx_nmtot, b2, nullptr, 0.f);
+        }
+        nn_muon_ext_lrmult(nullptr);
+        return;
+    }
     nn_muon_ext_lrmult(lrm0);
     nn_muon_ext_batch(u->muon_descs, n, u->muon_maxco, u->muon_maxk, u->mx_c ? u->mx_mcd : nullptr, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
                       u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr, u->mx_ns, nr, u->mx_nmoff, u->mx_nmtot, b2, vp, vg);
@@ -4639,7 +4658,7 @@ void unet_reserve(unet *u, int muon, int muon_tc) {
     if (u->tbn > 0 && at_reserve()) fprintf(stderr, "unet_reserve: the attention's cuBLASLt handle / workspace failed\n");
     if (muon && !u->wq) {
         if (!u->muon_mom) u->muon_mom = mom_alloc(u);
-        if (!u->muon_descs && !mx_any(u) && !ufsm_env_on("UFSM_MUON_UNBATCHED")) { muon_build_t *b = calloc(1, sizeof *b); muon_table(u, b); free(b); }
+        if (!u->muon_descs && !ufsm_env_on("UFSM_MUON_UNBATCHED")) { muon_build_t *b = calloc(1, sizeof *b); muon_table(u, b); free(b); }   /* (the ext path's too: 11-15 try7) */
         if (muon_tc >= 2 && nn_muon_tc_reserve()) fprintf(stderr, "unet_reserve: the Muon cuBLASLt handle / workspace failed\n");
     }
     /* --film / --gfilm: the forward copy of the weights (np floats: 368 MB at 92 M parameters), made at the first forward when nothing
