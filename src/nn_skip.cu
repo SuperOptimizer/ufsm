@@ -133,6 +133,16 @@ extern "C" int nn_skip_fwd_level(shape5 xs, split_t sp) {   /* forward: this con
     if (sp.accum || zoff % 8 || (sp.zw1 && zoff)) return 0;
     return sk_find(s, D, xs.h, xs.w) >= 0;
 }
+/* lp_f4fwd.cuh fwd_f4_t: whether launch_f4 would mask this conv (forward: its output grid is a level; backward-data: its forward was masked),
+   without lp_skip_get's side effects. The ring kernels (launch_f4r, Cip 32 / 64) do not take the mask, so a masked conv bypasses them: before,
+   a 32 / 64-wide conv ran dense silently in the forward (the masked counts stayed 0: test_skip_empty~racecheck at width 64, 11-15), and a
+   masked conv whose gy is 32 / 64 wide aborted in nn_skip_bwd_check */
+extern "C" int nn_skip_masks(shape5 xs, split_t sp) {
+    const skreg_t *s = &g_sk[skdev()]; if (!s->on || xs.n != 1) return 0;
+    const int cid = sk_cid(); if (cid < 0) return 0;
+    if (g_pass == 1) return s->seen[cid];
+    return !(sp.sr || sp.osr) && nn_skip_fwd_level(xs, sp);
+}
 extern "C" void nn_skip_bwd_check(void) {
     if (!g_sk_bwd_expect) return;
     g_sk_bwd_expect = 0;
