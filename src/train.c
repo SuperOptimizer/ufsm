@@ -2739,7 +2739,7 @@ int cmd_train(int argc, char **argv) {
                         "       [--schedule-seconds S --schedule-elapsed S]   wall-time LR horizon across finite-cover evaluation pauses\n"
                         "       [--cover PLAN.json] [--cover-extend-from OLD_PLAN.json] [--cover-next-pass 1] [--stop-at STEP] [--ct-aug 0|1] [--symmetry-p 1] [--axis-jitter 0] [--limit-seconds 0]\n"
                         "       [--lr-floor 0 (the schedule ends at this fraction of the peak; modded-nanogpt 0.3)] [--wd-nonconv 0 (decay multiplier for GroupNorm, biases, head under Muon / ANVIL)]\n"
-                        "       [--muon-c 1 (Muon-C: conv kernels polarised per Fourier frequency)] [--muon-ns fixed|polar (Newton-Schulz maps: fixed quintic | Polar Express)] [--normuon 1 (NorMuon row normalisation)] [--normuon-beta2 0.95] [--muon-vr G (MARS variance reduction, 0.025)] [--muon-scale kj|spectral] [--opt-rest adamw|sign --sign-lr-mult 1] [--muon-tc 2 (Newton-Schulz on cuBLASLt TF32: 2.1x faster step; 1: hand-written fp16 wmma, slower)] [--muon-qkv-split 1] [--muon-wd-mult 1 (x the decay of the Muon matrices)] [--muon-fro 1 (directions rescaled to the nominal Frobenius norm)] [--muon-stem-adamw 1] [--qk-clip TAU (attention: max logit per head held at TAU via the QK-norm gains)] [--muon-cautious 1] [--muon-ademamix A --ademamix-b3 0.999 --ademamix-t T] [--muon-kron 1 (Kronecker Co/Ci/taps preconditioner) --muon-kron-b2 0.99 --muon-kron-eps 1e-3 --muon-kron-every 10] [--hyperball 1 (fixed weight / update norms)] [--hb-lr-mult 0.707 (Hyperball lr / Muon lr)]\n"
+                        "       [--muon-c 1 (Muon-C: conv kernels polarised per Fourier frequency)] [--muon-ns fixed|polar (Newton-Schulz maps: fixed quintic | Polar Express)] [--normuon 1 (NorMuon row normalisation)] [--normuon-beta2 0.95] [--muon-vr G (MARS variance reduction, 0.025)] [--muon-scale kj|spectral|rms (rms: r sqrt(max(Co, K)), Moonlight; Muon then takes AdamW-sized lrs) --muon-rms 0.2] [--opt-rest adamw|sign --sign-lr-mult 1] [--muon-tc 2 (Newton-Schulz on cuBLASLt TF32: 2.1x faster step; 1: hand-written fp16 wmma, slower)] [--muon-qkv-split 1] [--muon-wd-mult 1 (x the decay of the Muon matrices)] [--muon-fro 1 (directions rescaled to the nominal Frobenius norm)] [--muon-stem-adamw 1] [--qk-clip TAU (attention: max logit per head held at TAU via the QK-norm gains)] [--muon-cautious 1] [--muon-ademamix A --ademamix-b3 0.999 --ademamix-t T] [--muon-kron 1 (Kronecker Co/Ci/taps preconditioner) --muon-kron-b2 0.99 --muon-kron-eps 1e-3 --muon-kron-every 10] [--hyperball 1 (fixed weight / update norms)] [--hb-lr-mult 0.707 (Hyperball lr / Muon lr)]\n"
                         "       [--trunk-lr-mult 1 (lr x F outside the attention stage; no stage: all but the head)] [--trunk-lr-steps N (x F only until step N)] [--ink-head 0|1 (task unwrap2: + the ink logit, channel 11; sources targets.ink prob254, sources ink_weight) --ink-lambda 1 --ink-bias -2 (warm start: the new row) --ink-smooth 0 (label smoothing eps)] [--attn-dcoarse 0|1 (deformable: + the 2x pooled level)] [--attn-deform-init grid|normal]\n"
                         "       [--recall W (recto: + W (1 - soft recall), gradient only)]\n"
                         "       [--dec-convs 2 (convs per decoder level, one value or a list; 1 = one conv, nnU-Net style)]\n"
@@ -3069,8 +3069,10 @@ int cmd_train(int argc, char **argv) {
     /* --muon-kron 1: Kronecker (Co / Ci / 27 taps) Shampoo preconditioning of the 3^3 conv gradients, then Muon */
     const char *muon_scale_s = opt(argc, argv, "--muon-scale", "kj"), *rest_s = opt(argc, argv, "--opt-rest", "adamw");
     const float rest_mult = (float)opt_atof("--sign-lr-mult", opt(argc, argv, "--sign-lr-mult", "1"));
-    if ((strcmp(muon_scale_s, "kj") && strcmp(muon_scale_s, "spectral")) || (strcmp(rest_s, "adamw") && strcmp(rest_s, "sign"))) { fprintf(stderr, "--muon-scale kj | spectral, --opt-rest adamw | sign\n"); return 2; }
-    const int muon_spec = !strcmp(muon_scale_s, "spectral"), rest_sign = !strcmp(rest_s, "sign");
+    if ((strcmp(muon_scale_s, "kj") && strcmp(muon_scale_s, "spectral") && strcmp(muon_scale_s, "rms")) || (strcmp(rest_s, "adamw") && strcmp(rest_s, "sign"))) { fprintf(stderr, "--muon-scale kj | spectral | rms, --opt-rest adamw | sign\n"); return 2; }
+    const int muon_spec = !strcmp(muon_scale_s, "spectral") ? 1 : !strcmp(muon_scale_s, "rms") ? 2 : 0, rest_sign = !strcmp(rest_s, "sign");
+    const float muon_rms = (float)opt_atof("--muon-rms", opt(argc, argv, "--muon-rms", "0.2"));   /* --muon-scale rms: every matrix's update element RMS (x lr) */
+    if (!(muon_rms > 0.f)) { fprintf(stderr, "--muon-rms > 0\n"); return 2; }
     /* audit muon (2026-11-14, targeted/muon.md #5-#7), all default off: --muon-wd-mult F (the Muon matrices' decay x F; the scale-invariant convs shrink toward
        |W|_eq^2 = lr Co / (2 wd) under fixed-size steps and the gradient norm grows as 1/|W|), --muon-fro 1 (every direction rescaled to the nominal
        |O|_F = s sqrt(min(Co, K)): the realised step is 3-5x smaller for low-rank gradients), --muon-stem-adamw 1 (the first conv on AdamW) */
@@ -3098,9 +3100,9 @@ int cmd_train(int argc, char **argv) {
     if (muon_kron < 0 || muon_kron > 1 || kron_every < 1 || !(kron_b2 >= 0.f && kron_b2 < 1.f) || !(kron_eps > 0.f)) { fprintf(stderr, "--muon-kron 0 | 1, --muon-kron-every >= 1, --muon-kron-b2 in [0, 1), --muon-kron-eps > 0\n"); return 2; }
     if (!(muon_vr >= 0.f && muon_vr <= 1.f)) { fprintf(stderr, "--muon-vr: 0 .. 1\n"); return 2; }
     static char optlabel[16];   /* the manifest / checkpoint label (16 bytes, truncated): muon[-c][-hb][+pe][+nm][+vr][+kr][+ca] */
-    if (muon_c || hyperball || ns_mode || normuon || muon_vr != 0.f || muon_kron || muon_caut || mix_a != 0.f || muon_lars || muon_dog || muon_fro) {
-        snprintf(optlabel, sizeof optlabel, "muon%s%s%s%s%s%s%s%s%s%s%s", muon_c ? "-c" : "", hyperball ? "-hb" : "", ns_mode ? "+pe" : "", normuon ? "+nm" : "", muon_vr != 0.f ? "+vr" : "", muon_kron ? "+kr" : "", muon_caut ? "+ca" : "", mix_a != 0.f ? "+mx" : "",
-                 muon_lars ? "+la" : "", muon_dog ? "+dg" : "", muon_fro ? "+fo" : ""); optname = optlabel; }
+    if (muon_c || hyperball || ns_mode || normuon || muon_vr != 0.f || muon_kron || muon_caut || mix_a != 0.f || muon_lars || muon_dog || muon_fro || muon_spec == 2) {
+        snprintf(optlabel, sizeof optlabel, "muon%s%s%s%s%s%s%s%s%s%s%s%s", muon_c ? "-c" : "", hyperball ? "-hb" : "", ns_mode ? "+pe" : "", normuon ? "+nm" : "", muon_vr != 0.f ? "+vr" : "", muon_kron ? "+kr" : "", muon_caut ? "+ca" : "", mix_a != 0.f ? "+mx" : "",
+                 muon_lars ? "+la" : "", muon_dog ? "+dg" : "", muon_fro ? "+fo" : "", muon_spec == 2 ? "+rm" : ""); optname = optlabel; }
     /* --trunk-lr-mult F: every parameter outside the attention stage (the conv trunk, heads, norms; Muon and AdamW) at F x the scheduled
        rates, the stage at the full rates (unet_set_trunk_lr; default 1) */
     const float trunk_lr = (float)opt_atof("--trunk-lr-mult", opt(argc, argv, "--trunk-lr-mult", "1"));
@@ -3988,7 +3990,7 @@ int cmd_train(int argc, char **argv) {
         unet_set_attn_muon_lr(d->u, attn_mlr, attn_mlr_out);
         nn_muon_tc(muon_tc);
         unet_set_muon_qkv_split(d->u, muon_qkv); unet_set_muon_wd_mult(d->u, muon_wd_mult); unet_set_muon_fro(d->u, muon_fro); unet_set_muon_stem_adamw(d->u, muon_stem_adamw);
-        nn_muon_scale_mode(muon_spec); unet_set_rest_sign(d->u, rest_sign, rest_mult);
+        nn_muon_scale_rms(muon_rms); nn_muon_scale_mode(muon_spec); unet_set_rest_sign(d->u, rest_sign, rest_mult);
         unet_set_muon_ademamix(d->u, mix_a, mix_b3, mix_T > 0 ? mix_T : steps / ((int)strtol(opt(argc, argv, "--accum", "1"), nullptr, 10) > 0 ? (int)strtol(opt(argc, argv, "--accum", "1"), nullptr, 10) : 1)   /* (lenient: --accum auto is 1 here, validated below) */);
         unet_set_muon_kron(d->u, muon_kron, kron_b2, kron_eps, kron_every);
         if (trunk_lr != 1.f) unet_set_trunk_lr(d->u, trunk_lr);

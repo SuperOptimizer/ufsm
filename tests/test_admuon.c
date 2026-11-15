@@ -4,7 +4,10 @@
    - adaptive Muon (nn_muon_ext_adapt): over 5 steps with a varying schedule and decay, the weights, the (b) ratio EMAs and the (c) DoG
      state equal a double-precision reference fed the GPU's own Muon direction (from a twin batch at lr 1, wd 0, weights reset each
      step: O = -dp / s): (b) with the geometric-mean target, (b) with an absolute target that hits the clamp, (c) alone, and NorMuon +
-     (b) + (c) together. */
+     (b) + (c) together;
+   - --muon-scale rms (DESIGN.md 2026-11-15 "Muon update scaling"): from the same state, the rms step equals the kj step times
+     r sqrt(max(Co, K)) / sqrt(max(1, Co / K)) per matrix (the same direction O), its element RMS is ~r / lr, and exactly r under
+     --muon-fro (O rescaled to the nominal RMS); plain and ext (+ NorMuon). */
 #include "nn.h"
 #include <math.h>
 #include <stdio.h>
@@ -145,6 +148,33 @@ static void test_adapt(int nm, int lars, float tgt, int dog, float kappa) {
     nn_free(lrm); nn_free(ema); nn_free(dst); nn_free(part); nn_free(ddisp); batch_free(&a); batch_free(&b);
 }
 
+/* A at kj, B at rms r from the same weights, momentum and gradient: dB = dA * s_rms / s_kj per matrix; RMS(dB) / lr ~ r (exactly r with fro) */
+static void test_scale(int ext, int nm, int fro) {
+    batch a, b; batch_new(&a, 9); batch_new(&b, 9);
+    const float lr = 0.01f, r = 0.2f; double worst = 0, lo = 1e30, hi = 0;
+    set_g(&a, &b, 300);
+    float *p0[N]; for (int i = 0; i < N; i++) p0[i] = get_p(&a, i);
+    nn_muon_ext_fro(fro);
+    nn_muon_scale_mode(0); step(&a, ext, nm, lr, 0.f);
+    nn_muon_scale_rms(r); nn_muon_scale_mode(2); step(&b, ext, nm, lr, 0.f); nn_muon_scale_mode(0); nn_muon_ext_fro(0);
+    for (int i = 0; i < N; i++) {
+        const size_t nw = (size_t)CO[i] * KK[i]; float *pa = get_p(&a, i), *pb = get_p(&b, i);
+        const double ratio = r * sqrt(fmax(CO[i], KK[i])) / sqrt(fmax(1.0, (double)CO[i] / KK[i]));
+        double mx = 0, err = 0, ss = 0;
+        for (size_t j = 0; j < nw; j++) { const double da = (double)pa[j] - p0[i][j], db = (double)pb[j] - p0[i][j];
+            mx = fmax(mx, fabs(db)); err = fmax(err, fabs(db - da * ratio)); ss += db * db; }
+        const double rel = err / mx, rmsr = sqrt(ss / nw) / lr / r;
+        if (rel > worst) worst = rel;
+        lo = fmin(lo, rmsr); hi = fmax(hi, rmsr);
+        free(pa); free(pb); free(p0[i]);
+    }
+    printf("scale rms %s%s%s: step vs kj x ratio worst rel %.2e, element RMS / (lr r) in [%.4f, %.4f]\n", ext ? "ext" : "plain", nm ? "+normuon" : "", fro ? "+fro" : "", worst, lo, hi);
+    CHECK(worst < 2e-3, "rms step is not the kj step rescaled: %.3e", worst);
+    if (fro) CHECK(lo > 0.999 && hi < 1.001, "fro: element RMS not r");
+    else CHECK(lo > 0.5 && hi < 1.25, "element RMS far from r");
+    batch_free(&a); batch_free(&b);
+}
+
 int main(void) {
     nn_init(0);
     test_stats(0, 0);
@@ -154,6 +184,10 @@ int main(void) {
     test_adapt(0, 1, 0.05f, 0, 1.f);
     test_adapt(0, 0, 0.f, 1, 1.f);    /* kappa 1: the distance overtakes rbar_0 within the 5 steps (the max branch) */
     test_adapt(1, 1, 0.f, 1, 19.f);   /* unet's kappa at beta 0.9 */
+    test_scale(0, 0, 0);
+    test_scale(1, 0, 0);
+    test_scale(1, 1, 0);
+    test_scale(1, 0, 1);
     if (fails) { printf("test_admuon: %d FAILED\n", fails); return 1; }
     printf("test_admuon: OK\n");
     return 0;
