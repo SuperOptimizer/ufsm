@@ -20,7 +20,8 @@ while :; do
   sed -i "s#CK=$POD/ckpt/wind96-wk1-best.ckpt#CK=$POD/ckpt/u1-13750.ckpt#; s#BOX=[0-9,]*;#BOX=$B;#" $POD/scrolls/$S.env
   [ -e $POD/unroll/$S/axis.json ] || sed -i "s#AXS=[^;]*;#AXS=$POD/scrolls/$S/axis.json;#" $POD/scrolls/$S.env   # (a resumed run keeps its axis)
   log "$S unroll start (fetch $(( $(date +%s) - t0 )) s; $(grep -o "BOX=[^;]*" $POD/scrolls/$S.env))"
-  cd $POD/ufsm && RECTOSP=0 FITLANES=2 TH=13 PTH=13 ITH=13 UFSM_NCPU=13 bash scripts/pod/unroll.sh $S > $POD/unroll-$S.out 2>&1; rc=$?
+  NC=$($POD/ufsm/build/ufsm sysinfo --ncpu 2>/dev/null || echo 13); NC=${QTH:-$NC}   # (the cgroup's CPUs, not a fixed 13; mini audit podscripts #6)
+  cd $POD/ufsm && RECTOSP=0 FITLANES=2 TH=$NC PTH=$NC ITH=$NC UFSM_NCPU=$NC timeout -k 60 ${QTIMEOUT:-86400} bash scripts/pod/unroll.sh $S > $POD/unroll-$S.out 2>&1; rc=$?   # (QTIMEOUT: a hung lane ends, rc 124)
   [ $rc = 0 ] && [ ! -e $POD/unroll/$S/state/stripimg.done ] && rc=9
   log "$S unroll rc=$rc ($(( $(date +%s) - t0 )) s)"; [ $rc = 0 ] && touch $QD/$S.ok || touch $QD/$S.fail
 done

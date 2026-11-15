@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "fm_tol.h"
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
 static char *slurp(FILE *f) { if (!f) return nullptr; char *b = calloc(1, 65536); const size_t n = fread(b, 1, 65535, f); b[n] = 0; fclose(f); return b; }
@@ -63,6 +64,28 @@ static unsigned char *slurpb(const char *p, long *n) {
 #define GOLD_1600 0x71af1c28473ee12bull   /* (master bf9a971: tests/test_tfx.c built on its src/tfx.c + third_party/surfcomp) */
 #define GOLD_70 0xd40944b24de5a7abull
 #endif
+/* Fast math (the default build, DESIGN 2026-11-14): surfcomp's transforms and quantiser are host float code, so its bytes are not
+   master bf9a971's any more; the gold hash is checked under -DUFSM_STRICT_MATH=ON only. Under fast math the serial .sfc is instead
+   decoded back: every valid vertex within the 0.25 voxel tolerance it was written with, every invalid one invalid. (The threaded and
+   serial writers run the same encoder code: still byte for byte in both builds.) Returns the number of failing vertices. */
+static long sfc_check_xyz(const char *path, int W, int H, const float *x, const float *y, const float *z, double tol, double *emax) {
+    sfc_reader *r = nullptr; if (sfc_open_file(path, &r) || !r) return -1;
+    const int ch = sfc_find_channel(r, "x"); if (ch < 0) { sfc_close(r); return -1; }
+    float (*J)[3] = malloc(4096 * 12); uint8_t *v = malloc(4096); long bad = 0; *emax = 0;
+    for (int by = 0; by < (H + 63) / 64; by++) for (int bx = 0; bx < (W + 63) / 64; bx++) {
+        memset(v, 0, 4096);
+        if (sfc_read_xyz(r, (uint32_t)ch, (uint64_t)bx, (uint64_t)by, J, 12, 768, v)) { bad++; continue; }
+        for (int q = 0; q < 4096; q++) {
+            const int c = bx * 64 + q % 64, rr = by * 64 + q / 64; if (c >= W || rr >= H) continue;
+            const size_t i = (size_t)rr * W + c; const int want = z[i] > 0;
+            if (!want || !v[q]) { bad += want != (v[q] != 0); continue; }
+            const double dx = J[q][0] - x[i], dy = J[q][1] - y[i], dz = J[q][2] - z[i], e = sqrt(dx * dx + dy * dy + dz * dz);   /* Euclidean (SFC_XYZ) */
+            if (e > *emax) *emax = e;
+            bad += e > tol * 1.0001;
+        }
+    }
+    free(J); free(v); sfc_close(r); return bad;
+}
 static uint64_t fnv64(const unsigned char *b, long n) { uint64_t h = 1469598103934665603ull; for (long i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull; return h; }
 /* gold: the FNV-1a hash of the file the original surfcomp / tfx code (master bf9a971) wrote: the vectorized transforms, the
    quantizer, the entropy selection and the pipelined writer must leave every byte as it was */
@@ -90,7 +113,13 @@ static void par_identical(int W, int H, uint64_t gold) {
     long na = 0, nb = 0, nc = 0; unsigned char *a = slurpb(ref, &na), *b = slurpb(p1, &nb), *c = slurpb(p6, &nc);
     CHECK(a && b && c && na == nb && na == nc && !memcmp(a, b, na) && !memcmp(a, c, na), "%dx%d: threaded .sfc differs from the serial writer (%ld / %ld / %ld bytes)", W, H, na, nb, nc);
     const uint64_t hv = a ? fnv64(a, na) : 0;
-    CHECK(hv == gold, "%dx%d: .sfc hash %016llx, the original encoder wrote %016llx", W, H, (unsigned long long)hv, (unsigned long long)gold);
+    if (FM_STRICT) CHECK(hv == gold, "%dx%d: .sfc hash %016llx, the original encoder wrote %016llx", W, H, (unsigned long long)hv, (unsigned long long)gold);
+    else {
+        double emax = 0; const long nb = sfc_check_xyz(ref, W, H, x, y, z, 0.25, &emax);
+        printf("tfx par %dx%d: fast math, hash %016llx (strict gold %016llx); decoded: max |xyz error| %.4f, %ld bad vertices\n", W, H,
+               (unsigned long long)hv, (unsigned long long)gold, emax, nb);
+        CHECK(nb == 0, "%dx%d: the decoded .sfc: %ld vertices beyond 0.25 or with the wrong validity", W, H, nb);
+    }
     printf("tfx par %dx%d: serial = 1 thread = 6 threads (%ld bytes)\n", W, H, na);
     free(a); free(b); free(c); free(J); free(v); free(x); free(y); free(z); unlink(ref); unlink(p1); unlink(p6);
 }

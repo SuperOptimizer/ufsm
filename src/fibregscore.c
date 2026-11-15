@@ -6,6 +6,7 @@
    map along x, y, z. Map: --map reg.json (ufsm reg: coarse = the AFV's scan, fine = the prediction's) or --tr T.json (an affine
    transformation_matrix fine L0 xyz -> coarse L0 xyz, the published scrollprize convention). */
 #include <math.h>
+#include "optcheck.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,7 +17,7 @@
 #include "store.h"
 #include "zarr2.h"
 
-static const char *rs_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *rs_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static uint64_t rs_s = 0x5eed;
 static double rs_u(void) { uint64_t z = (rs_s += 0x9E3779B97F4A7C15ull); z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= z >> 31; return (z >> 11) * 0x1.0p-53; }
 
@@ -50,20 +51,20 @@ int cmd_fiber_regscore(int argc, char **argv) {
                                     "  [--identity 1] [--afv-fine 1 (AFV in the fine scan, volume = the coarse scan)] [--place T.json (region placement)] [--um U (volume L0 voxel)] [--smax 12 (fine L0 voxels)] [--step 1] [--seed 1] [--extent 8096,7888,14258 (coarse L0 x,y,z)] [--cache DIR] [--threads 8] [--out regions.tsv]\n"
                                     "  KEY: the volume group (zarr v3 / volcomp or v2 pyramid; level L voxel = 2^L L0 voxels): a fibre presence prediction or the CT\n"); return 2; }
     const char *mp = rs_opt(argc, argv, "--map", nullptr), *tp = rs_opt(argc, argv, "--tr", nullptr), *cache = rs_opt(argc, argv, "--cache", nullptr);
-    int pi = 0; for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], "--pred")) pi = i;
+    int pi = 0; for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--pred"))) pi = i;
     const int ident = !!*rs_opt(argc, argv, "--identity", "");
-    rs_afv_fine = !!atoi(rs_opt(argc, argv, "--afv-fine", "0"));   /* --identity 1: no map; the volume is in the AFV's own frame (e.g. its CT) */
+    rs_afv_fine = !!opt_atoi("--afv-fine", rs_opt(argc, argv, "--afv-fine", "0"));   /* --identity 1: no map; the volume is in the AFV's own frame (e.g. its CT) */
     if ((!mp + !tp + !ident != 2) || !pi) { fprintf(stderr, "fiber-regscore: one of --map / --tr / --identity 1, and --pred ROOT KEY\n"); return 2; }
-    const int L = atoi(rs_opt(argc, argv, "--level", "2")), nreg = atoi(rs_opt(argc, argv, "--regions", "40")), B = atoi(rs_opt(argc, argv, "--box", "192")), nt = atoi(rs_opt(argc, argv, "--threads", "8"));
-    const double smax = atof(rs_opt(argc, argv, "--smax", "12")), step = atof(rs_opt(argc, argv, "--step", "1")), sc = ldexp(1.0, L);
-    rs_s = (uint64_t)atoll(rs_opt(argc, argv, "--seed", "1")) * 0x9E3779B97F4A7C15ull + 1;
+    const int L = opt_atoi("--level", rs_opt(argc, argv, "--level", "2")), nreg = opt_atoi("--regions", rs_opt(argc, argv, "--regions", "40")), B = opt_atoi("--box", rs_opt(argc, argv, "--box", "192")), nt = opt_atoi("--threads", rs_opt(argc, argv, "--threads", "8"));
+    const double smax = opt_atof("--smax", rs_opt(argc, argv, "--smax", "12")), step = opt_atof("--step", rs_opt(argc, argv, "--step", "1")), sc = ldexp(1.0, L);
+    rs_s = (uint64_t)opt_atoll("--seed", rs_opt(argc, argv, "--seed", "1")) * 0x9E3779B97F4A7C15ull + 1;
     rmap M0 = {0}; const rmap *M = &M0; double fum = 0, cum = 0;
     if (mp) { rvol *fv; M = reg_map_open(mp, cache, &fv, &cum, &fum); if (!M) return 1; }
     else if (tp) { if (load_affine(tp, &M0.A)) return 1; M0.Ainv = raff_inv(M0.A); M0.D = nullptr; }
     else { M0.A = raff_ident(); M0.Ainv = M0.A; M0.D = nullptr; }
     rmap P0 = {0}; const rmap *PL = nullptr;   /* --place T.json: regions placed with this affine, so different maps are scored on the same regions */
     if (*rs_opt(argc, argv, "--place", "")) { if (load_affine(rs_opt(argc, argv, "--place", ""), &P0.A)) return 1; P0.Ainv = raff_inv(P0.A); PL = &P0; }
-    if (*rs_opt(argc, argv, "--um", "")) fum = atof(rs_opt(argc, argv, "--um", ""));   /* the volume's L0 voxel (um), for the residuals */
+    if (*rs_opt(argc, argv, "--um", "")) fum = opt_atof("--um", rs_opt(argc, argv, "--um", ""));   /* the volume's L0 voxel (um), for the residuals */
     rvol *Z = rvol_open(argv[pi + 1], argv[pi + 2], cache, 1.0);   /* zarr v3 / volcomp or v2 pyramid; level L = 2^L L0 voxels */
     if (!Z || L >= Z->nl || (!Z->z[L] && !Z->z2[L])) { fprintf(stderr, "fiber-regscore: cannot open level %d of %s %s\n", L, argv[pi + 1], argv[pi + 2]); return 1; }
     const struct { int64_t shape[3]; } zm0 = {{Z->shape[L][0], Z->shape[L][1], Z->shape[L][2]}}, *zm = &zm0;
@@ -100,7 +101,7 @@ int cmd_fiber_regscore(int argc, char **argv) {
             pts[3 * np] = (float)lx; pts[3 * np + 1] = (float)ly; pts[3 * np + 2] = (float)lz; np++;
         }
         afv_runs_free(Rr, nr);
-        if (np < (size_t)atoi(rs_opt(argc, argv, "--min-pts", "800"))) { free(pts); continue; }
+        if (np < (size_t)opt_atoi("--min-pts", rs_opt(argc, argv, "--min-pts", "800"))) { free(pts); continue; }
         if (rvol_read_nt(Z, L, o, n, blk, nt)) { fprintf(stderr, "fiber-regscore: read failed\n"); free(pts); continue; }   /* read only regions with enough points */
         double best[3], bv = -1, p0 = 0;
         for (int a = 0; a < 3; a++) {   /* per axis (x, y, z): mean presence vs shift */

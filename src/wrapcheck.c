@@ -19,6 +19,7 @@
    Defaults --sigma 1.2 --prom 1: on Paris 4 (9.6 um CT) 1.05 CT peaks per fitted turn where the GT codes give 1.03. Coordinates: the model's box (native voxels, global origin in model.json);
    the fields may be any box holding it at the same native grid. CPU only, rays on --threads threads. */
 #include "fit.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "zarr2.h"
 #include "zarr3.h"
@@ -32,10 +33,10 @@
 #include <stdatomic.h>
 
 static const char *wc_opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
-static int wc_idx(int argc, char **argv, const char *name) { for (int i = 3; i < argc; i++) if (!strcmp(argv[i], name)) return i; return -1; }
+static int wc_idx(int argc, char **argv, const char *name) { for (int i = 3; i < argc; i++) if (!strcmp(argv[i], opt_n(name))) return i; return -1; }
 static double wc_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
 typedef struct { int k; float z, r, gapn, rct, rnet, gtq, tph, tdn, tref; uint8_t npk; int8_t gt; float tfit, trv, trf; } wc_int;   /* trv / trf (--gt-int): recto runs of the --recto volume / the fields' r plane over the interval (window shifted by half of it: the sheet at its end) */   /* tfit (--gt-int): the fit's turns over a GT interval */   /* tph / tdn / tref: the network phase turns, density turns (integral of |n.r| / sp) and --ref model turns between the two crossings (NAN: none) */   /* the interval from wrap k to k + 1 on a ray; gtq the GT turns, gt their class (< 0.5: 0, < 1.5: 1, 2; < -0.25: -1; -128 none) */
@@ -264,30 +265,30 @@ int cmd_wrap_check(int argc, char **argv) {
     }
     fit_set *fs = fit_set_load(argv[2]); if (!fs) { fprintf(stderr, "wrap-check: cannot load %s\n", argv[2]); return 1; }
     const fit_model *m = fs->global;
-    const int rplane = atoi(wc_opt(argc, argv, "--r-plane", "0"));   /* --r-plane 1: recto runs of the fields' r plane (--gt-int) */
+    const int rplane = opt_atoi("--r-plane", wc_opt(argc, argv, "--r-plane", "0"));   /* --r-plane 1: recto runs of the fields' r plane (--gt-int) */
     fit_fields_skip_planes(rplane ? 2 : 1 | 2); fit_fields_ct_planes(0);   /* (the normals are read: density turns) */
     fit_fields_buf g; if (fit_fields_load(argv[3], 0, 0, 0, &g)) { fprintf(stderr, "wrap-check: cannot read the fields in %s\n", argv[3]); return 1; }
     const double h = g.h, um = g.um; long long forg[3]; int fsh[3]; for (int d = 0; d < 3; d++) { forg[d] = g.origin[d]; fsh[d] = g.shape[d]; } fit_fields_free(&g);
     if (m->h != h) { fprintf(stderr, "wrap-check: the model's cell h %g differs from the fields' %g\n", m->h, h); return 1; }
-    const int nz = atoi(wc_opt(argc, argv, "--nz", "16")), nth = atoi(wc_opt(argc, argv, "--nth", "180")), nt = ufsm_threads(atoi(wc_opt(argc, argv, "--threads", "0")), 16);
-    const double sigma = atof(wc_opt(argc, argv, "--sigma", "1.2")), prom = atof(wc_opt(argc, argv, "--prom", "1")), wsc = atof(wc_opt(argc, argv, "--w-scale", "1")), dup = atof(wc_opt(argc, argv, "--dup", "0.5"));
-    const int gti = atoi(wc_opt(argc, argv, "--gt-int", "0"));
+    const int nz = opt_atoi("--nz", wc_opt(argc, argv, "--nz", "16")), nth = opt_atoi("--nth", wc_opt(argc, argv, "--nth", "180")), nt = ufsm_threads(opt_atoi("--threads", wc_opt(argc, argv, "--threads", "0")), 16);
+    const double sigma = opt_atof("--sigma", wc_opt(argc, argv, "--sigma", "1.2")), prom = opt_atof("--prom", wc_opt(argc, argv, "--prom", "1")), wsc = opt_atof("--w-scale", wc_opt(argc, argv, "--w-scale", "1")), dup = opt_atof("--dup", wc_opt(argc, argv, "--dup", "0.5"));
+    const int gti = opt_atoi("--gt-int", wc_opt(argc, argv, "--gt-int", "0"));
     const double Z = m->D * m->h; double zr0 = 0.05 * Z, zr1 = 0.95 * Z;
     const char *zr = wc_opt(argc, argv, "--zr", nullptr); if (zr && sscanf(zr, "%lf,%lf", &zr0, &zr1) != 2) { fprintf(stderr, "wrap-check: --zr Z0,Z1\n"); return 2; }
     if (nz < 1 || nth < 4 || !(sigma > 0) || !(zr1 > zr0)) { fprintf(stderr, "wrap-check: bad --nz / --nth / --sigma / --zr\n"); return 2; }
     fit_set_threads(nt);
     z3 *cz = nullptr, *qz = nullptr, *rz = nullptr; z2 *rz2 = nullptr;   /* (--recto: zarr v3, or v2 as the upstream predictions) */ double ctum = 0, cf = 1, rum = 0;
-    const double rthr = atof(wc_opt(argc, argv, "--recto-thr", "128")), rfthr = atof(wc_opt(argc, argv, "--r-thr", "128"));
+    const double rthr = opt_atof("--recto-thr", wc_opt(argc, argv, "--recto-thr", "128")), rfthr = opt_atof("--r-thr", wc_opt(argc, argv, "--r-thr", "128"));
     { const int ri = wc_idx(argc, argv, "--recto");   /* --recto ROOT KEY --recto-um U: a recto / surface volume (uint8; runs >= --recto-thr) */
       if (ri > 0) { if (ri + 2 >= argc) { fprintf(stderr, "wrap-check: --recto ROOT KEY\n"); return 2; }
-          rum = atof(wc_opt(argc, argv, "--recto-um", "0")); if (!(rum > 0)) { fprintf(stderr, "wrap-check: --recto needs --recto-um\n"); return 2; }
+          rum = opt_atof("--recto-um", wc_opt(argc, argv, "--recto-um", "0")); if (!(rum > 0)) { fprintf(stderr, "wrap-check: --recto needs --recto-um\n"); return 2; }
           if (!(rz = z3_open(store_open(argv[ri + 1]), argv[ri + 2], wc_opt(argc, argv, "--cache", nullptr))) &&
               !(rz2 = z2_open(store_open(argv[ri + 1]), argv[ri + 2], wc_opt(argc, argv, "--cache", nullptr)))) { fprintf(stderr, "wrap-check: --recto: %s / %s\n", z3_error(), z2_error()); return 1; }
           if (rz2) z2_assume_present(rz2, 1); } }
     const int ci = wc_idx(argc, argv, "--ct"), qi = wc_idx(argc, argv, "--codes");
     if (ci > 0) {
         if (ci + 2 >= argc) { fprintf(stderr, "wrap-check: --ct ROOT KEY\n"); return 2; }
-        ctum = atof(wc_opt(argc, argv, "--ct-um", "0")); if (!(ctum > 0)) { fprintf(stderr, "wrap-check: --ct needs --ct-um\n"); return 2; }
+        ctum = opt_atof("--ct-um", wc_opt(argc, argv, "--ct-um", "0")); if (!(ctum > 0)) { fprintf(stderr, "wrap-check: --ct needs --ct-um\n"); return 2; }
         if (!(cz = z3_open(store_open(argv[ci + 1]), argv[ci + 2], wc_opt(argc, argv, "--cache", nullptr)))) { fprintf(stderr, "wrap-check: %s\n", z3_error()); return 1; }
     }
     if (qi > 0) {

@@ -21,7 +21,7 @@ for name, w, D, T, level, origins in CASES:
     if real is not None:
         tiles = np.concatenate([tiles, real])
     else:
-        print(f"{name}: no local CT: random tiles only")
+        pass  # (real_tiles printed the PARTIAL line: random tiles only)
     refs = []
     with torch.inference_mode():
         for t in tiles:

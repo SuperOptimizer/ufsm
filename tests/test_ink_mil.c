@@ -99,6 +99,45 @@ int main(void) {
         free(l16); free(ga); free(gb);
     }
     free(lg); free(R);
+    if (ink_mil_fwd_slab && !getenv("UFSM_TEST_NO_GPU") && nn_init(0) == 0) {
+        /* try6's MIL backward (audit 2026-11-14 #18d): the slab API as train.c's head_slab_pass calls it (fwd_slab per slab, fin, bwd_slab per
+           slab into the slab's fp16 logit gradient, which already holds the other losses' gradient: k_runs adds in place), at train's scale
+           lambda / rays x gscale 1024, on a 48 x 40 x 44 window with 512 rays in 3 slabs of 16 planes. Against the host: every voxel's fp16
+           result = its prefilled value + the host's double gradient (2e-3 of it + 2e-3 of the max, as the slab form above: the one fp16
+           rounding of the sum is within that), untouched voxels keep their prefilled bits, the loss within 1e-3 */
+        enum { D2 = 48, H2 = 40, W2 = 44, NR2 = 512, NS2 = 3 }; const size_t n2 = (size_t)D2 * H2 * W2, hw2 = (size_t)H2 * W2; unsigned s2 = 11;
+        const float Rr = 5, step = 0.5f, eps = 0.1f, tau = 0.5f, sc2 = 1024.f / NR2;
+        float *l2 = malloc(n2 * 4); uint16_t *c16 = malloc(n2 * 2), *p16 = malloc(n2 * 2), *o16 = malloc(n2 * 2);
+        for (size_t k = 0; k < n2; k++) { const _Float16 v = (_Float16)(float)(3 * urand(&s2) - 1.5); l2[k] = (float)v; memcpy(&c16[k], &v, 2); }
+        inkray *R2 = calloc(NR2, sizeof *R2);
+        for (int i = 0; i < NR2; i++) {
+            R2[i].p[0] = (float)(2 + (D2 - 4) * urand(&s2)); R2[i].p[1] = (float)(2 + (H2 - 4) * urand(&s2)); R2[i].p[2] = (float)(2 + (W2 - 4) * urand(&s2));
+            double nv[3] = {urand(&s2) - .5, urand(&s2) - .5, urand(&s2) - .5}, l = sqrt(nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]);
+            for (int d = 0; d < 3; d++) R2[i].n[d] = (float)(nv[d] / l);
+            R2[i].y = urand(&s2) < 0.4; R2[i].w = (float)(0.5 + urand(&s2));
+        }
+        double *gh = calloc(n2, sizeof *gh); const double Lh = ink_mil_loss_host(l2, gh, D2, H2, W2, R2, NR2, Rr, step, tau, eps, sc2);
+        double gm = 0; for (size_t k = 0; k < n2; k++) if (fabs(gh[k]) > gm) gm = fabs(gh[k]);
+        for (size_t k = 0; k < n2; k++) { const _Float16 v = (_Float16)(float)(gm * (2 * urand(&s2) - 1)); memcpy(&p16[k], &v, 2); }   /* (the other losses' gradient, the same size) */
+        const int K = ink_mil_samples(Rr, step);
+        void *dl = nn_malloc(n2 * 2), *dg = nn_malloc(n2 * 2); inkray *dr = nn_malloc((size_t)NR2 * sizeof *dr); float *acc = nn_malloc((size_t)NR2 * K * 4); double *dL = nn_malloc(8), Lg = 0;
+        nn_h2d(dl, c16, n2 * 2); nn_h2d(dg, p16, n2 * 2); nn_h2d(dr, R2, (size_t)NR2 * sizeof *dr); nn_zero(acc, (size_t)NR2 * K * 4); nn_zero(dL, 8);
+        int rc = 0;
+        for (int sl = 0; sl < NS2; sl++) { const int z0 = D2 * sl / NS2, z1 = D2 * (sl + 1) / NS2; rc |= ink_mil_fwd_slab((const char *)dl + (size_t)z0 * hw2 * 2, 0, z0, z1 - z0, D2, H2, W2, dr, NR2, Rr, step, acc, nullptr); }
+        rc |= ink_mil_fin(acc, dr, NR2, D2, H2, W2, Rr, step, tau, eps, sc2, dL, nullptr);
+        for (int sl = 0; sl < NS2; sl++) { const int z0 = D2 * sl / NS2, z1 = D2 * (sl + 1) / NS2; rc |= ink_mil_bwd_slab(acc, z0, z1 - z0, D2, H2, W2, dr, NR2, Rr, step, (char *)dg + (size_t)z0 * hw2 * 2, 0, nullptr); }
+        nn_sync(); nn_d2h(o16, dg, n2 * 2); nn_d2h(&Lg, dL, 8);
+        long off = 0, kept = 0, touched = 0; double em = 0;
+        for (size_t k = 0; k < n2; k++) {
+            _Float16 a, b; memcpy(&a, &o16[k], 2); memcpy(&b, &p16[k], 2);
+            if (gh[k] == 0) { kept += o16[k] != p16[k]; continue; }
+            touched++; const double e = fabs(((double)a - (double)b) - gh[k]); if (e > em) em = e; off += e > 2e-3 * fabs(gh[k]) + 2e-3 * gm;
+        }
+        fprintf(stderr, "mil try6 scale (1024 / %d rays), prefilled fp16 gradient, %d slabs: loss %.6f (host %.6f), %ld voxels touched, max |added - host| %.2e of max %.2e, %ld off, %ld untouched changed\n",
+                NR2, NS2, Lg, Lh, touched, em, gm, off, kept);
+        CHECK(!rc && fabs(Lg - Lh) < 1e-3 * fabs(Lh) && touched > 1000 && !off && !kept, "MIL into a prefilled fp16 gradient at scale 1024 (rc %d): %ld off, %ld untouched changed", rc, off, kept);
+        nn_free(dl); nn_free(dg); nn_free(dr); nn_free(acc); nn_free(dL); free(l2); free(c16); free(p16); free(o16); free(R2); free(gh);
+    }
     if (!getenv("UFSM_TEST_NO_GPU") && nn_init(0) == 0) {   /* train --ink-smooth: nn_ink_targets_smooth == t (1 - eps) + eps / 2 (x255, rounded), eps 0 == nn_ink_targets */
         uint8_t in[256], t0[256], t1[256], m0[256], m1[256]; for (int i = 0; i < 256; i++) in[i] = (uint8_t)i;
         uint8_t *di = nn_malloc(256), *dt = nn_malloc(256), *dm = nn_malloc(256); nn_h2d(di, in, 256);

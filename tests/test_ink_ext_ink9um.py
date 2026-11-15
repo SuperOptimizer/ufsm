@@ -77,11 +77,11 @@ for f in sorted((D9 / "parity").glob("c_*.u8")):
         real.append(a.reshape(28, 128, 128)[6:23])   # center_crop_layer_indices(28 -> 17): 28 // 2 - 17 // 2 = 6
 real = np.stack(real) if real else None
 if real is None:
-    print("no real surface-volume tiles (parity/c_*.u8): random tiles only")
+    P.partial("no real surface-volume tiles (parity/c_*.u8): the real half did not run, random tiles only")
 allt = tiles if real is None else np.concatenate([tiles, real])
 for tag, w in [("seed42", W42), ("seed43", W43)]:
     if not w.exists():
-        print(f"{w} missing: {tag} skipped"); continue
+        P.partial(f"{w} missing: the {tag} teacher was not checked"); continue
     ref = forward(build(w), allt)
     got = P.run_c("ink9um", w, allt, batch=3)
     P.compare(f"ink9um {tag} random", ref[:3], got[:3], atol=0.1, mean_tol=0.02)
@@ -167,5 +167,5 @@ if len(chunks) >= 4:
             print(f"ink9um --layers {tag} (shifts {shifts}): {out.shape}, max |out - koine blend| {err.max()} / 255, mean {err.mean():.3f}")
             assert out.shape == ref.shape and err.max() <= 3, f"ink9um {tag}: blend differs from infer.py"
 else:
-    print("fewer than 4 surface-volume chunks: --layers blend check skipped")
+    P.partial("fewer than 4 surface-volume chunks: the --layers blend check did not run")
 print("test_ink_ext_ink9um: OK")

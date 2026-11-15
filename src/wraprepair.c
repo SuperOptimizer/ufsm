@@ -23,6 +23,7 @@
        not part of the numbered spiral.
    Deterministic for any thread count (per-ray results, sums in ray order). CPU only. */
 #include "sources.h"
+#include "optcheck.h"
 #include "store.h"
 #include "surfcomp.h"
 #include "sysinfo.h"
@@ -40,8 +41,8 @@
 
 #define WR_NB 2048   /* angle bins of the radius tables */
 
-static const char *wr_opt(int argc, char **argv, const char *name, const char *def) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1]; return def; }
-static int wr_idx(int argc, char **argv, const char *name) { for (int i = 4; i < argc; i++) if (!strcmp(argv[i], name)) return i; return -1; }
+static const char *wr_opt(int argc, char **argv, const char *name, const char *def) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1]; return def; }
+static int wr_idx(int argc, char **argv, const char *name) { for (int i = 4; i < argc; i++) if (!strcmp(argv[i], opt_n(name))) return i; return -1; }
 static double wr_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
 /* ---- a decoded-chunk table over one uint8 array, filled per band (wrap-snap's wsn_vol) ---- */
@@ -248,11 +249,11 @@ int cmd_wrap_repair(int argc, char **argv) {
                                     "       [--drop-dup-wraps 0] [--first K] [--last K] [--threads N] [--tsv OUT] [--cells OUT] [--sfc 0.25]\n"
                                     "  wrap-check of .sfc wraps along their rays (CT peaks per interval, GT turns with --codes, crossings) and the repair into wraps-out\n"); return 2; }
     const char *in = argv[2], *out = strcmp(argv[3], "-") ? argv[3] : nullptr, *axp = wr_opt(argc, argv, "--axis", nullptr);
-    const double axum = atof(wr_opt(argc, argv, "--axis-um", "0")), ctum = atof(wr_opt(argc, argv, "--ct-um", "0"));
-    const int ci = wr_idx(argc, argv, "--ct"), qi = wr_idx(argc, argv, "--codes"), nt0 = ufsm_threads(atoi(wr_opt(argc, argv, "--threads", "0")), 12), nt = nt0 > 64 ? 64 : nt0;
-    const int nray = atoi(wr_opt(argc, argv, "--nray", "720")), rstep = atoi(wr_opt(argc, argv, "--row-step", "8")), crow = atoi(wr_opt(argc, argv, "--cell-rows", "64")), mint = atoi(wr_opt(argc, argv, "--min-int", "20"));
-    const double cdeg = atof(wr_opt(argc, argv, "--cell-deg", "10")), dupsh = atof(wr_opt(argc, argv, "--dup-share", "0.6")), mrgsh = atof(wr_opt(argc, argv, "--merge-share", "2"));
-    const int k0 = atoi(wr_opt(argc, argv, "--first", "-1000000")), k1 = atoi(wr_opt(argc, argv, "--last", "1000000")), dropdw = atoi(wr_opt(argc, argv, "--drop-dup-wraps", "0"));
+    const double axum = opt_atof("--axis-um", wr_opt(argc, argv, "--axis-um", "0")), ctum = opt_atof("--ct-um", wr_opt(argc, argv, "--ct-um", "0"));
+    const int ci = wr_idx(argc, argv, "--ct"), qi = wr_idx(argc, argv, "--codes"), nt0 = ufsm_threads(opt_atoi("--threads", wr_opt(argc, argv, "--threads", "0")), 12), nt = nt0 > 64 ? 64 : nt0;
+    const int nray = opt_atoi("--nray", wr_opt(argc, argv, "--nray", "720")), rstep = opt_atoi("--row-step", wr_opt(argc, argv, "--row-step", "8")), crow = opt_atoi("--cell-rows", wr_opt(argc, argv, "--cell-rows", "64")), mint = opt_atoi("--min-int", wr_opt(argc, argv, "--min-int", "20"));
+    const double cdeg = opt_atof("--cell-deg", wr_opt(argc, argv, "--cell-deg", "10")), dupsh = opt_atof("--dup-share", wr_opt(argc, argv, "--dup-share", "0.6")), mrgsh = opt_atof("--merge-share", wr_opt(argc, argv, "--merge-share", "2"));
+    const int k0 = opt_atoi("--first", wr_opt(argc, argv, "--first", "-1000000")), k1 = opt_atoi("--last", wr_opt(argc, argv, "--last", "1000000")), dropdw = opt_atoi("--drop-dup-wraps", wr_opt(argc, argv, "--drop-dup-wraps", "0"));
     if (!axp || !(axum > 0) || ci < 0 || ci + 2 >= argc || !(ctum > 0) || nray < 8 || rstep < 1 || crow < 1 || !(cdeg > 0)) { fprintf(stderr, "wrap-repair: --axis FILE --axis-um U0 --ct ROOT KEY --ct-um U; --nray >= 8, --row-step / --cell-rows >= 1\n"); return 2; }
     axis ax = {0}; if (axis_load(&ax, axp)) { fprintf(stderr, "wrap-repair: cannot load the axis %s\n", axp); return 1; }
     DIR *dd = opendir(in); if (!dd) { fprintf(stderr, "wrap-repair: cannot open %s\n", in); return 1; }
@@ -317,8 +318,8 @@ int cmd_wrap_repair(int argc, char **argv) {
         for (int k = 0; k < nw; k++) { rt[k] = rtp + (size_t)k * ns * WR_NB; memcpy(rt[k], rtall + (size_t)k * 64 * WR_NB, (size_t)ns * WR_NB * sizeof(float)); }
         free(rtall);
         wr_iv *iv = malloc((size_t)ns * nray * nw * sizeof *iv);
-        wr_job J = {W, nw, &ax, s0, &vct, vcd.z ? &vcd : nullptr, nray, ns, rows, zrow, rt, atof(wr_opt(argc, argv, "--sigma", "1.2")), atof(wr_opt(argc, argv, "--prom", "1")),
-                    atof(wr_opt(argc, argv, "--shift", "0.5")), atof(wr_opt(argc, argv, "--min-gap", "0.05")), 1, iv, 0};
+        wr_job J = {W, nw, &ax, s0, &vct, vcd.z ? &vcd : nullptr, nray, ns, rows, zrow, rt, opt_atof("--sigma", wr_opt(argc, argv, "--sigma", "1.2")), opt_atof("--prom", wr_opt(argc, argv, "--prom", "1")),
+                    opt_atof("--shift", wr_opt(argc, argv, "--shift", "0.5")), opt_atof("--min-gap", wr_opt(argc, argv, "--min-gap", "0.05")), 1, iv, 0};
         pthread_t th[64];
         for (int q = 0; q < nt; q++) pthread_create(&th[q], nullptr, wr_rays, &J);
         for (int q = 0; q < nt; q++) pthread_join(th[q], nullptr);
@@ -375,9 +376,9 @@ int cmd_wrap_repair(int argc, char **argv) {
     printf("; merged cells %lld (2+ >= %.2f)", cm, mrgsh); if (hasgt) printf(" GT 0 / 1 / 2+ there %lld / %lld / %lld", cmg[0], cmg[1], cmg[2]); printf("\n");
     if (out) {
         char cmd[1700]; snprintf(cmd, sizeof cmd, "mkdir -p '%s/split'", out); if (system(cmd)) return 1;
-        if (atof(wr_opt(argc, argv, "--sfc", "0.25")) > 0) tifxyz_set_sfc(atof(wr_opt(argc, argv, "--sfc", "0.25")));
+        if (opt_atof("--sfc", wr_opt(argc, argv, "--sfc", "0.25")) > 0) tifxyz_set_sfc(opt_atof("--sfc", wr_opt(argc, argv, "--sfc", "0.25")));
         tfx_set_threads(1);
-        wr_rep S = {.W = W, .nw = nw, .ax = &ax, .s0 = s0, .mingap = atof(wr_opt(argc, argv, "--min-gap", "0.05")), .out = out, .cr = crow, .nsec = nsec, .ncr = ncr, .cells = cells,
+        wr_rep S = {.W = W, .nw = nw, .ax = &ax, .s0 = s0, .mingap = opt_atof("--min-gap", wr_opt(argc, argv, "--min-gap", "0.05")), .out = out, .cr = crow, .nsec = nsec, .ncr = ncr, .cells = cells,
                     .dupc = cd ? dupc : nullptr, .mrgc = cm ? mrgc : nullptr, .dropw = dropdw ? dropw : nullptr};
         pthread_t th[64]; const double t1 = wr_now();
         for (int q = 0; q < nt; q++) pthread_create(&th[q], nullptr, wr_rep_run, &S);

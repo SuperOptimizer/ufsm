@@ -2,6 +2,7 @@
    every op, exact operators on analytic volumes. */
 #include "../src/scan_augment.c"
 #include <stdio.h>
+#include "fm_tol.h"
 
 static int failures;
 #define CHECK(ok, name) do { if (!(ok)) { fprintf(stderr, "FAIL: %s (line %d)\n", name, __LINE__); failures++; } } while (0)
@@ -210,7 +211,8 @@ int main(void) {
                 const float a = (float)(.2 + .3 * ai);
                 memcpy(B, A, q3 * 4); exp_smooth(B, Q, axis, a, line, G2);   /* (G2: the plane scratch; Q 48 takes the transposing axis-2 path) */
                 float *R = G1; memcpy(R, A, q3 * 4); exp_smooth_ref(R, Q, axis, a, line);
-                bad += memcmp(B, R, q3 * 4) != 0;
+                /* bit for bit under UFSM_STRICT_MATH; fast math (tests/fm_tol.h): rel 1e-5 (a recursive filter, the error runs along the line) */
+                bad += fm_cmp_f32("exp_smooth vs exp_smooth_ref", B, R, q3, 1e-5, 1e-4);
             }
             for (int k = 1; k <= 3; k += 2) for (int C = 2; C <= 4; C++) {
                 float w1[4][27], b1[4], w2[4];
@@ -230,7 +232,10 @@ int main(void) {
                     const size_t i = z * Q2 + (size_t)y * Q + x; G2[i] = o;
                     if (!Zm[i]) { b1s += o; b2s += (double)o * o; bn++; }
                 }
-                bad += memcmp(G1, G2, q3 * 4) != 0 || a1 != b1s || a2 != b2s || an != bn;
+                /* bit for bit under UFSM_STRICT_MATH; fast math: G (|o| up to ~1e2, 27-term dot products that cancel) rel 1e-6 + abs 1e-4,
+                   the moment sums rel 1e-6 + abs 1e-4 per voxel summed; the count exact */
+                bad += fm_cmp_f32("gin_eval vs per-voxel", G1, G2, q3, 1e-6, 1e-4) || an != bn ||
+                       (FM_STRICT ? a1 != b1s || a2 != b2s : !fm_close(a1, b1s, 1e-6, 1e-4 * (double)bn) || !fm_close(a2, b2s, 1e-6, 1e-4 * (double)bn));
             }
             free(A); free(B); free(line); free(G1); free(G2); free(Zm);
         }

@@ -10,25 +10,36 @@
 #  (2) a plain latent net with the fibre head (--lat 4 --rv 2 --fib-head 1): --heads all writes rv, fib/H, fib/V, fib/dyad/c2..c7, fib/fam;
 #      fib/H equals the old single-channel path (the pool4 chain in fp32) within one code on 1 % (the heads path rounds the upsampled logit
 #      to fp16 as the slab path does: 0.64 % of the fixture's bytes land across a code boundary)
+#  Fast math (the default build, DESIGN 2026-11-14): (1c) compares the GPU and CPU encoders' stores by what they decode to (within 2 on
+#  1 % of the bytes: a quantised level near a .5 boundary can come out 1 apart), (1d) the device-read runs within one code on 0.2 % (the
+#  GPU and host IDCTs differ by +-1 on rare CT voxels). Under -DUFSM_STRICT_MATH=ON (strict_math = 1 beside the ufsm binary): byte for
+#  byte as before.
 # Usage: test_predict_heads.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
 . "$(dirname "$0")/test_part.sh"   # UFSM_TEST_PART=K/3: (1) | (1b) (1c) | (1d) (2) (3); each part trains net (1) and its --heads all run first
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
+STRICT=$(cat "$(dirname "$U")/strict_math" 2> /dev/null || echo 0)
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 "$MF" fx 256 2 1 > fx.log 2>&1
-C=(--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 --ckpt-every 1000 --fp4 2
+C=(--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-train-ok 1 --val-every 1000 --log-every 1 --ckpt-every 1000 --fp4 2
    --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --widths 16,32,64 --det 1 --steps 3)
 P=(--um 9.6 --level 0 --window 160 --halo 16 --shard 128 --levels 1 --threads 2 --q 0)
 fail() { echo "FAIL: $*"; exit 1; }
-cmpb() {   # cmpb A B MAXFRAC: two stores' 9.6 arrays over the fixture box: the fraction of bytes that differ, none by more than 1
+cmpb() {   # cmpb A B MAXFRAC [MAXD]: two stores' 9.6 arrays over the fixture box: the fraction of bytes that differ, none by more than MAXD (1)
   "$U" read "$1" 9.6 0 0 0 256 256 256 a.raw > /dev/null 2>&1 || fail "read $1"; "$U" read "$2" 9.6 0 0 0 256 256 256 b.raw > /dev/null 2>&1 || fail "read $2"
-  python3 -I - a.raw b.raw "$3" "$1 vs $2" <<'PY'
+  python3 -I - a.raw b.raw "$3" "$1 vs $2" "${4:-1}" <<'PY'
 import sys, numpy as np
 a = np.fromfile(sys.argv[1], np.uint8).astype(int); b = np.fromfile(sys.argv[2], np.uint8).astype(int); d = np.abs(a - b)
 print(f"  {sys.argv[4]}: {np.count_nonzero(d)} of {d.size} bytes differ, max {d.max()}, {np.count_nonzero(a)} set")
-sys.exit(0 if d.max() <= 1 and np.count_nonzero(d) <= float(sys.argv[3]) * d.size and np.count_nonzero(a) > d.size // 8 else 1)
+sys.exit(0 if d.max() <= int(sys.argv[5]) and np.count_nonzero(d) <= float(sys.argv[3]) * d.size and np.count_nonzero(a) > d.size // 8 else 1)
 PY
 }
+# the shard files of two stores byte for byte under strict math; else their 9.6 arrays (rv and ink) within 2 on 1 % of the bytes
+cmpenc() {
+  if [ "$STRICT" = 1 ]; then [ "$(cd "$1" && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" = "$(cd "$2" && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" ]
+  else for n in rv ink; do cmpb "$1/$n" "$2/$n" 0.01 2 || return 1; done; fi
+}
+DEVTOL=0.002; [ "$STRICT" = 1 ] && DEVTOL=0
 # (1) sub-cell head, fine stem, rv 2, ink
 "$U" train fx/sources-ink.json --out s "${C[@]}" --lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --ink-head 1 --fstem 16 > s.log 2>&1 || fail "train (1) ($D/s.log)"
 "$U" predict s/last.ckpt fx ct h "${P[@]}" --heads all > h.log 2>&1 || fail "predict --heads all ($D/h.log)"
@@ -83,11 +94,11 @@ done
 for sh in 128 256; do
   for g in 1 0; do UFSM_PRED_GPU_ENC=$g "$U" predict s/last.ckpt fx ct ge$sh$g --um 9.6 --level 0 --window 160 --halo 16 --threads 2 --q 8 --shard $sh --levels 3 --heads rv,ink > ge$sh$g.log 2>&1 || fail "predict --q 8 --shard $sh, GPU encoder $g ($D/ge$sh$g.log)"; done
   grep -q 'levels for the encoder from the GPU' ge${sh}1.log && ! grep -q 'levels for the encoder from the GPU' ge${sh}0.log || fail "GPU encoder switch (shard $sh)"
-  [ "$(cd ge${sh}1 && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" = "$(cd ge${sh}0 && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" ] || fail "shard $sh: the GPU encoder's shards differ from the CPU encoder's"
+  cmpenc ge${sh}1 ge${sh}0 || fail "shard $sh: the GPU encoder's shards differ from the CPU encoder's"
   [ "$(cd ge${sh}1 && find . -path '*/c/*' -type f | wc -l)" -ge 6 ] || fail "shard $sh: too few shard files"
   UFSM_PRED_VCAP=10 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct gv$sh --um 9.6 --level 0 --window 160 --halo 16 --threads 2 --q 8 --shard $sh --levels 3 --heads rv,ink > gv$sh.log 2>&1 || fail "predict, levels over capacity ($D/gv$sh.log)"
   grep -Eq 'head writers: .*, [1-9][0-9]* from their bytes' gv$sh.log || fail "shard $sh: the over-capacity fallback not taken ($D/gv$sh.log)"
-  [ "$(cd gv$sh && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" = "$(cd ge${sh}0 && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" ] || fail "shard $sh: the over-capacity shards differ from the CPU encoder's"
+  cmpenc gv$sh ge${sh}0 || fail "shard $sh: the over-capacity shards differ from the CPU encoder's"
 done
 fi
 if part 2; then   # (1d), (2), (3)
@@ -96,10 +107,24 @@ if part 2; then   # (1d), (2), (3)
 UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dv "${P[@]}" --heads rv,ink > dv.log 2>&1 || fail "predict UFSM_PRED_DEVREAD ($D/dv.log)"
 if grep -q 'gpudec: out of memory' dv.log; then echo "SKIP devread: no device memory (gpudec out of memory on a shared GPU: the host path ran, the device-read check did not; the suite reports the test SKIP)"
 else grep -q 'CT windows decoded into device memory' dv.log && grep -Eq 'device CT windows: [1-9][0-9]* chunks all on the GPU' dv.log || fail "device read not used ($D/dv.log)"; fi
-for n in rv ink; do cmpb h/$n dv/$n 0 || fail "$n: the device-read run differs from the host reader's"; done
+for n in rv ink; do cmpb h/$n dv/$n $DEVTOL || fail "$n: the device-read run differs from the host reader's"; done
 UFSM_GPU_DECODE_ITEMS=4 UFSM_PRED_DEVREAD=1 UFSM_PRED_PROF=1 "$U" predict s/last.ckpt fx ct dvh "${P[@]}" --heads rv > dvh.log 2>&1 || fail "predict UFSM_PRED_DEVREAD, CPU fallbacks ($D/dvh.log)"
 grep -Eq 'device CT windows: 0 chunks all on the GPU, [1-9][0-9]* with host substreams' dvh.log || fail "device read: the host fallback not taken ($D/dvh.log)"
-cmpb h/rv dvh/rv 0 || fail "rv: the device-read run with CPU-decoded chunks differs"
+cmpb h/rv dvh/rv $DEVTOL || fail "rv: the device-read run with CPU-decoded chunks differs"
+# audit 11-14 infer #4 / #6 / #2 / #9: the training state released (same bytes as keeping it), --heads --resume (per-head done logs; a rerun
+# computes nothing and leaves the stores unchanged), --gn-live refused on a net without running statistics, the provenance attributes
+UFSM_PRED_TRAINSTATE=1 "$U" predict s/last.ckpt fx ct ts "${P[@]}" --heads all > ts.log 2>&1 || fail "predict UFSM_PRED_TRAINSTATE=1 ($D/ts.log)"
+for n in rv ink; do cmpb h/$n ts/$n 0 || fail "$n: the released training state changed the output"; done
+grep -q '"provenance":{"ckpt_bytes":' h/rv/9.6/zarr.json || fail "no provenance in h/rv/9.6/zarr.json"
+"$U" predict s/last.ckpt fx ct hr "${P[@]}" --heads all --resume 1 > hr.log 2>&1 || fail "predict --heads --resume ($D/hr.log)"
+for n in rv ink; do [ -s hr/$n/predict-done-9.6.txt ] || fail "no done log hr/$n"; cmpb h/$n hr/$n 0 || fail "$n: --resume run differs"; done
+"$U" predict s/last.ckpt fx ct hr "${P[@]}" --heads all --resume 1 > hr2.log 2>&1 || fail "predict --heads --resume rerun ($D/hr2.log)"
+grep -Eq 'shards in the box: [1-9][0-9]* already written \(--resume\)' hr2.log || fail "the --resume rerun skipped no shard ($D/hr2.log)"
+for n in rv ink; do cmpb h/$n hr/$n 0 || fail "$n: --resume rerun changed the store"; done
+"$U" predict s/last.ckpt fx ct gl "${P[@]}" --heads rv --gn-live 1 > gl.log 2>&1 && fail "--gn-live accepted on a net without --gn-ema"
+"$U" predict s/last.ckpt fx ct wr --um 9.6 --level 0 --shard 128 --levels 1 --threads 2 --q 0 --heads all --window 152 --halo 12 --window-round 1 > wr.log 2>&1 || fail "predict --window-round ($D/wr.log)"
+grep -q 'window 152 halo 12 -> 160 halo 16' wr.log || fail "--window-round: not 160 / 16 ($D/wr.log)"
+for n in rv ink; do cmpb h/$n wr/$n 0 || fail "$n: --window-round 152 / 12 differs from 160 / 16"; done
 # (2) plain latent net with the fibre head
 "$U" train fx/sources-fibhv.json --out fb "${C[@]}" --lat 4 --rv 2 --rv-iso 100 --fib-head 1 > fb.log 2>&1 || fail "train (2) ($D/fb.log)"
 "$U" predict fb/last.ckpt fx ct g "${P[@]}" --heads all > g.log 2>&1 || fail "predict --heads all, fibre ($D/g.log)"

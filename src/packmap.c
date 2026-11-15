@@ -5,6 +5,7 @@
    stored chunk of the raster (the chunk grid, row-major uint8, 0 = no label, else 1 + round(254 x packed share)), the input of the
    sampler's "focus" weighting (src/sources.h); OUT.json beside it records the grid. */
 #include <math.h>
+#include "optcheck.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -16,7 +17,7 @@
 #include "zarr3.h"
 #include "z3w.h"
 
-static const char *pk_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *pk_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static inline double pk_wrap(int a, int b) { double d = (b - a) / 252.0; return d - round(d); }
 /* the voxels of a block (n[0] x n[1] x n[2], with one extra plane per axis for the +1 neighbours at n+1): counts known / packed, spacing histogram */
 static void pk_block(const uint8_t *p, const int64_t n1[3], const int64_t n[3], double gthr, long long *nk, long long *np, long long hist[64], double um) {
@@ -47,8 +48,8 @@ static void *pk_worker(void *a) {
 int cmd_phase_packing(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm phase-packing <phase-root> <phase-key> [--um 9.6] [--packed-um 100] [--box z,y,x,nz,ny,nx] [--map OUT.raw] [--threads 16]\n"); return 2; }
     z3 *z = z3_open(store_open(argv[2]), argv[3], nullptr); if (!z) { fprintf(stderr, "phase-packing: %s\n", z3_error()); return 1; }
-    const z3_meta *m = z3_meta_of(z); const double um = atof(pk_opt(argc, argv, "--um", "9.6")), pum = atof(pk_opt(argc, argv, "--packed-um", "100"));
-    const double gthr = um / pum; const int nt = ufsm_threads(atoi(pk_opt(argc, argv, "--threads", "0")), 16);
+    const z3_meta *m = z3_meta_of(z); const double um = opt_atof("--um", pk_opt(argc, argv, "--um", "9.6")), pum = opt_atof("--packed-um", pk_opt(argc, argv, "--packed-um", "100"));
+    const double gthr = um / pum; const int nt = ufsm_threads(opt_atoi("--threads", pk_opt(argc, argv, "--threads", "0")), 16);
     const char *bs = pk_opt(argc, argv, "--box", nullptr), *mp = pk_opt(argc, argv, "--map", nullptr);
     if (bs) {
         long long b[6]; if (sscanf(bs, "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) { fprintf(stderr, "phase-packing: --box z,y,x,nz,ny,nx\n"); return 2; }
@@ -93,7 +94,7 @@ int cmd_phase_conflict(int argc, char **argv) {
     if (!a || !b) { fprintf(stderr, "phase-conflict: %s\n", z3_error()); return 1; }
     const z3_meta *ma = z3_meta_of(a), *mb = z3_meta_of(b);
     if (memcmp(ma->shape, mb->shape, sizeof ma->shape)) { fprintf(stderr, "phase-conflict: the rasters differ in shape\n"); return 1; }
-    const double tol = atof(pk_opt(argc, argv, "--tol", "0.25")); const int nt = ufsm_threads(atoi(pk_opt(argc, argv, "--threads", "0")), 16), S = 512;
+    const double tol = opt_atof("--tol", pk_opt(argc, argv, "--tol", "0.25")); const int nt = ufsm_threads(opt_atoi("--threads", pk_opt(argc, argv, "--threads", "0")), 16), S = 512;
     if (!(tol > 0 && tol < 0.5)) { fprintf(stderr, "phase-conflict: --tol in (0, 0.5)\n"); return 2; }
     char at[256]; snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"1 where two label phase rasters are both known and differ by more than %g turn\"}}", tol);
     z3w *w = z3w_create(argv[6], ma->shape, S, 0.f, 0, at); if (!w) { fprintf(stderr, "phase-conflict: %s\n", z3w_error()); return 1; }

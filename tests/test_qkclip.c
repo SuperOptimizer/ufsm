@@ -8,9 +8,11 @@
 #include "attn.h"
 #include "nn.h"
 #include <math.h>
+#include "fm_tol.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 static uint64_t rs = 777;
 static double urand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (double)(rs >> 11) * 0x1.0p-53; }
@@ -43,7 +45,7 @@ static void gpu_max(const float *dqkv, const float *dqg, const float *dkg, void 
 }
 
 int main(void) {
-    if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_qkclip", "nn_init(0) failed");
     at_set_core(1);
     float *qkv = malloc((size_t)T * 3 * C * 4), qg[C], kg[C], qg2[C], kg2[C];
     for (long i = 0; i < (long)T * 3 * C; i++) qkv[i] = (float)nrand();
@@ -76,7 +78,9 @@ int main(void) {
     float hl0[H], lt; nn_d2h(qg2, dqg, C * 4); nn_d2h(kg2, dkg, C * 4); nn_d2h(hl0, dl, H * 4); nn_d2h(&lt, last, 4);
     for (int h = 0; h < H; h++) {
         const float s = hl[h] > tau ? sqrtf(tau / hl[h]) : 1.f; int e = 0;
-        for (int d = 0; d < AT_HD; d++) e += qg2[h * AT_HD + d] != qg[h * AT_HD + d] * s || kg2[h * AT_HD + d] != kg[h * AT_HD + d] * s;
+        /* the host's gains exactly under UFSM_STRICT_MATH; fast math (host tau / hl is tau * (1 / hl), two roundings): <= 2 ulp, rel 3e-7 */
+        for (int d = 0; d < AT_HD; d++) e += FM_STRICT ? qg2[h * AT_HD + d] != qg[h * AT_HD + d] * s || kg2[h * AT_HD + d] != kg[h * AT_HD + d] * s
+                                                       : !fm_close(qg2[h * AT_HD + d], qg[h * AT_HD + d] * s, 3e-7, 0) || !fm_close(kg2[h * AT_HD + d], kg[h * AT_HD + d] * s, 3e-7, 0);
         if (e || hl0[h] != 0.f) { printf("FAIL: head %d clip (%d gains off, lmax after %g)\n", h, e, hl0[h]); bad++; }
     }
     if (lt != fmaxf(fmaxf(hl[0], hl[1]), fmaxf(hl[2], hl[3]))) { printf("FAIL: last %g\n", lt); bad++; }

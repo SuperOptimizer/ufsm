@@ -6,17 +6,18 @@
    label-free fibre judge (tools/fibjudge.py; DESIGN.md 2026-11-10) unwraps it along fibre polylines exactly like a surf-labels phase.
    Prints the set's box, um and direction. CPU only (fit_set_grid_cpu; threads UFSM_FIT_THREADS). */
 #include <math.h>
+#include "optcheck.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "fit.h"
 
-static const char *fp_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 10; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *fp_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 10; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 
 int cmd_fit_phase_box(int argc, char **argv) {
     if (argc < 10) { fprintf(stderr, "usage: ufsm fit-phase-box <fit-set> z y x nz ny nx <out.raw> [--level 0] [--step 2] [--theta 0]\n"); return 2; }
-    const int level = atoi(fp_opt(argc, argv, "--level", "0")), S = atoi(fp_opt(argc, argv, "--step", "2")), th = atoi(fp_opt(argc, argv, "--theta", "0"));
+    const int level = opt_atoi("--level", fp_opt(argc, argv, "--level", "0")), S = opt_atoi("--step", fp_opt(argc, argv, "--step", "2")), th = opt_atoi("--theta", fp_opt(argc, argv, "--theta", "0"));
     if (S < 1 || level < 0 || level > 8) { fprintf(stderr, "fit-phase-box: bad --step / --level\n"); return 2; }
     fit_set *s = fit_set_load(argv[2]); if (!s) { fprintf(stderr, "fit-phase-box: cannot load the fit set %s\n", argv[2]); return 1; }
     const fit_model *g = s->global; const double sc = ldexp(1.0, level);

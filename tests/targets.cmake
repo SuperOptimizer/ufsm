@@ -63,12 +63,15 @@ ufsm_exe(test_aug_z SUITE tests/test_aug_z.c OBJS scannorm edt band sheet ct_aug
          store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb embz NN LP LIBS LDLIBS
          CUDA)
 ufsm_exe(test_band_pair SUITE tests/test_band_pair.c OBJS band nn_band LIBS LDLIBS CUDA INC CUDA)
+ufsm_exe(test_phaselab SUITE tests/test_phaselab.c OBJS band LIBS m)
 ufsm_exe(test_checkpoint SUITE tests/test_checkpoint.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_checkpoint_runtime SUITE tests/test_checkpoint_runtime.c OBJS checkpoint json LIBS m)
+ufsm_exe(test_ckring SUITE tests/test_ckring.c OBJS ckring LIBS m)
+ufsm_exe(test_gt_gate SUITE tests/test_gt_gate.c OBJS CORE NN LP LIBS LDLIBS CUDA m)
 ufsm_exe(test_cond SUITE tests/test_cond.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush scrollaug cover json
          store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb embz LIBS LDLIBS)
 ufsm_exe(test_coreline SUITE tests/test_coreline.c OBJS coreline z3w fit fit_emb embz fit_ct l1pot json zarr3 store NN LP LIBS LDLIBS CUDA)
-ufsm_exe(test_countfield SUITE tests/test_countfield.c OBJS countfield ctcal fit fit_emb embz fit_ct l1pot coreline json zarr3 store z3w NN
+ufsm_exe(test_countfield SUITE tests/test_countfield.c OBJS countfield afv ctcal fit fit_emb embz fit_ct l1pot coreline json zarr3 store z3w NN
          LP LIBS LDLIBS CUDA)
 ufsm_exe(test_cover SUITE tests/test_cover.c OBJS cover json LIBS crypto m)
 ufsm_exe(test_crush SUITE tests/test_crush.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush scrollaug cover json
@@ -104,15 +107,18 @@ ufsm_exe(test_fields_pack SUITE tests/test_fields_pack.c OBJS fieldspack repack 
 ufsm_exe(test_fields_phase SUITE tests/test_fields_phase.c OBJS fieldsphase fit fit_emb embz fit_ct l1pot coreline json zarr3 store z3w NN
          LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fit SUITE tests/test_fit.c OBJS fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_fit_dir SUITE tests/test_fit_dir.c OBJS fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fit_emb SUITE tests/test_fit_emb.c OBJS fit_emb embz z3w fit fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fit_join SUITE tests/test_fit_join.c OBJS fitjoin afv phasegate fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN
          LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fit_lat SUITE tests/test_fit_lat.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_fit_w4 SUITE tests/test_fit_w4.c OBJS fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_unroll_qa SUITE tests/test_unroll_qa.c OBJS unrollqa afv fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_flatten SUITE tests/test_flatten.c OBJS flatten imgops jpegpar tiffw tiff LIBS LDLIBS)
 ufsm_exe(test_flatten_gpu SUITE tests/test_flatten.c OBJS flatten imgops jpegpar tiffw tiff nn_flat LIBS LDLIBS CUDA DEFS FLAT_GPU)
 ufsm_exe(test_formats SUITE tests/test_formats.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fstem SUITE tests/test_fstem.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_slab_tg SUITE tests/test_slab_tg.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_ftrace_gpu SUITE tests/test_ftrace_gpu.c OBJS ftaxis nn_ftrace LIBS m CUDA INC CUDA)
 ufsm_exe(test_fuse SUITE tests/test_fuse.c src/fuse.c LIBS m DEPS)
 ufsm_exe(test_fused SUITE tests/test_fused.c OBJS NN LP LIBS m CUDA)
@@ -121,6 +127,7 @@ ufsm_exe(test_geom_check SUITE tests/test_geom_check.c OBJS geomcheck sources ba
 ufsm_exe(test_gfilm SUITE tests/test_gfilm.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_gn_contract SUITE tests/test_gn_contract.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_gn_ema SUITE tests/test_gn_ema.c OBJS unet NN LP LIBS m CUDA)
+ufsm_exe(test_gn_ema_avg SUITE tests/test_gn_ema_avg.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_gn_frozen SUITE tests/test_gn_frozen.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_gpu_aug SUITE tests/test_gpu_aug.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush scrollaug cover
          json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb embz NN LP LIBS
@@ -149,10 +156,11 @@ ufsm_exe(test_ink_mil SUITE tests/test_ink_mil.c OBJS CORE NN LP LIBS LDLIBS CUD
 ufsm_exe(test_ink_mil_check SUITE tests/test_ink_mil_check.c OBJS z3w tiffw LIBS LDLIBS DEPS ufsm make_wind_fixture)
 ufsm_exe(test_ink_mil_train SUITE tests/test_ink_mil_train.c OBJS CORE NN LP LIBS LDLIBS CUDA DEPS ufsm make_wind_fixture)
 ufsm_exe(test_ink_pool SUITE tests/test_ink_pool.c OBJS CORE NN LP LIBS LDLIBS CUDA)
-ufsm_exe(test_ink_splat SUITE tests/test_ink_splat.c OBJS CORE NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_ink_splat SUITE tests/test_ink_splat.c OBJS CORE NN LP LIBS LDLIBS CUDA INC CUDA)
 ufsm_exe(test_jpegpar SUITE tests/test_jpegpar.c OBJS jpegpar imgops tiffw tiff LIBS LDLIBS)
 ufsm_exe(test_gns SUITE tests/test_gns.c LIBS m)
 ufsm_exe(test_json SUITE tests/test_json.c OBJS json LIBS LDLIBS)
+ufsm_exe(test_optcheck SUITE tests/test_optcheck.c)
 ufsm_exe(test_l0_norm SUITE tests/test_l0_norm.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_l0_slab SUITE tests/test_l0_slab.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_l0_stream SUITE tests/test_l0_stream.c OBJS unet NN LP LIBS m CUDA)
@@ -165,13 +173,16 @@ ufsm_exe(test_lathead SUITE tests/test_lathead.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_latvol SUITE tests/test_latvol.c OBJS latvol nn_latvol LIBS LDLIBS CUDA INC CUDA)
 ufsm_exe(test_latvol_nolink SUITE tests/test_latvol_nolink.c OBJS store zarr3 json LIBS LDLIBS)
 ufsm_exe(test_lldec SUITE tests/test_lldec.c OBJS band_onfly fuse band edt nn_band z3w zarr3 store json LIBS LDLIBS CUDA)
+ufsm_exe(test_codes_grid SUITE tests/test_codes_grid.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_mesh_phase SUITE tests/test_mesh_phase.c OBJS CORE NN LP LIBS LDLIBS CUDA DEPS ufsm)
 ufsm_exe(test_muon SUITE tests/test_muon.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_muonc SUITE tests/test_muonc.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_muonx SUITE tests/test_muonx.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_admuon SUITE tests/test_admuon.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_attnlr SUITE tests/test_attnlr.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_mx SUITE tests/test_mx.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_mx4 SUITE tests/test_mx4.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_mx4_wide SUITE tests/test_mx4_wide.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_mx_sw SUITE tests/test_mx_sw.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_nn SUITE tests/test_nn.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_optimizer_owners SUITE tests/test_optimizer_owners.c OBJS NN LP LIBS m CUDA)
@@ -191,6 +202,9 @@ ufsm_exe(test_phase_check SUITE tests/test_phase_check.c OBJS phase_check LIBS m
 ufsm_exe(test_phase_interp SUITE tests/test_phase_interp.c OBJS sample scannorm sample_emb embz edt band sheet ct_augment scan_augment
          spatial_augment crush scrollaug cover sources band_onfly fuse fiberraster afv reg regmap zarr2 srpair view zarr3 store json z3w
          tiff zipr hf NN LP LIBS m curl zstd blosc z crypto CUDA)
+ufsm_exe(test_phase_outward SUITE tests/test_phase_outward.c OBJS sample scannorm sample_emb embz edt band sheet ct_augment scan_augment
+         spatial_augment crush scrollaug cover sources band_onfly fuse fiberraster afv reg regmap zarr2 srpair view zarr3 store json z3w
+         tiff zipr hf NN LP LIBS m curl zstd blosc z crypto CUDA)
 ufsm_exe(test_phase_pool SUITE tests/test_phase_pool.c OBJS band_onfly fuse band edt zarr3 zarr2 store json z3w hf NN LP LIBS m curl zstd
          blosc z crypto CUDA)
 ufsm_exe(test_phasepack SUITE tests/test_phasepack.c OBJS phasepack store zarr3 json z3w LIBS LDLIBS)
@@ -203,6 +217,7 @@ ufsm_exe(test_predict_unwrap2 SUITE tests/test_predict_unwrap2.c OBJS unet fit f
 ufsm_exe(test_pyports SUITE tests/test_pyports.c OBJS coreline_check coreline imgops jpegpar tiff tiffw fit fit_emb embz z3w fit_ct l1pot
          json zarr3 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_qkclip SUITE tests/test_qkclip.c OBJS NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_dpsafe SUITE tests/test_dpsafe.c OBJS NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_raster SUITE tests/test_raster.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush scrollaug cover
          json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb embz surfcomp
          LIBS LDLIBS)
@@ -214,6 +229,7 @@ ufsm_exe(test_reg SUITE tests/test_reg.c OBJS reg reg_init zarr3 zarr2 store jso
 ufsm_exe(test_reg_render SUITE tests/test_reg_render.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_regz2 SUITE tests/test_regz2.c OBJS reg zarr3 zarr2 store json LIBS LDLIBS)
 ufsm_exe(test_render_fill SUITE tests/test_render_fill.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json LIBS LDLIBS)
+ufsm_exe(test_render_absent SUITE tests/test_render_absent.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json LIBS LDLIBS)
 ufsm_exe(test_render_fill_gpu SUITE tests/test_render_fill.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json nn_render
          nn_gpudec LIBS LDLIBS CUDA DEFS RENDER_GPU)
 ufsm_exe(test_render_known SUITE tests/test_render_known.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json LIBS
@@ -238,6 +254,9 @@ ufsm_exe(test_sample_ops SUITE tests/test_sample_ops.c OBJS scannorm edt band sh
 ufsm_exe(test_sampler_safety SUITE tests/test_sampler_safety.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush
          scrollaug cover json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb
          embz LIBS LDLIBS)
+ufsm_exe(test_sources_json SUITE tests/test_sources_json.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush
+         scrollaug cover json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb
+         embz LIBS LDLIBS)
 ufsm_exe(test_scan_augment SUITE tests/test_scan_augment.c OBJS ct_augment LIBS m)
 ufsm_exe(test_scanprep SUITE tests/test_scanprep.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush scrollaug
          cover json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb embz
@@ -259,7 +278,7 @@ ufsm_exe(test_side SUITE tests/test_side.c OBJS band LIBS m)
 ufsm_exe(test_spatial_augment SUITE tests/test_spatial_augment.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush
          scrollaug cover json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb
          embz LIBS LDLIBS)
-ufsm_exe(test_spiralfit SUITE tests/test_spiralfit.c OBJS countfield ctcal fit fit_emb embz fit_ct l1pot coreline json zarr3 store z3w NN LP
+ufsm_exe(test_spiralfit SUITE tests/test_spiralfit.c OBJS countfield afv ctcal fit fit_emb embz fit_ct l1pot coreline json zarr3 store z3w NN LP
          LIBS LDLIBS CUDA)
 ufsm_exe(test_split SUITE tests/test_split.c OBJS unet split NN LP LIBS m CUDA)
 ufsm_exe(test_split_gnbwd SUITE tests/test_split_gnbwd.c OBJS split NN LP LIBS m CUDA)
@@ -341,9 +360,16 @@ ufsm_exe(xscan_render tests/xscan_render.c OBJS scannorm edt band sheet ct_augme
 ufsm_exe(bench_s2b tests/bench_s2b.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_s2f tests/bench_s2f.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_head_tc SUITE tests/test_head_tc.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_hgscale SUITE tests/test_hgscale.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_win_weight SUITE tests/test_win_weight.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_hgsdev SUITE tests/test_hgsdev.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_skip_empty SUITE tests/test_skip_empty.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_grad_ar SUITE tests/test_grad_ar.c OBJS CORE NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_sumsq SUITE tests/test_sumsq.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_dcache_batch SUITE tests/test_dcache_batch.c OBJS dcache zarr3 store z3w json LIBS LDLIBS)
+ufsm_exe(test_dcache_cap SUITE tests/test_dcache_cap.c OBJS dcache zarr3 store z3w json LIBS LDLIBS)
+ufsm_exe(test_dcache_phase SUITE tests/test_dcache_phase.c OBJS dcache zarr3 store z3w json LIBS LDLIBS)
+ufsm_exe(test_label_versions SUITE tests/test_label_versions.c OBJS band_onfly fuse band zarr3 store z3w json LIBS LDLIBS m)
 ufsm_exe(bench_fstem tests/bench_fstem.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(bench_wgl0 tests/bench_wgl0.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 # 2:4 sparse MX-fp4 convolutions (src/lp_sp24*.cu, DESIGN.md 2026-11-13): instruction layout + throughput, conv kernels vs host
@@ -352,3 +378,6 @@ ufsm_exe(test_sp24_conv SUITE tests/test_sp24_conv.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_sp24 tests/bench_sp24.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(s2b_replay tests/s2b_replay.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_widen SUITE tests/test_widen.c OBJS unet NN LP LIBS m CUDA)
+ufsm_exe(test_sampbias SUITE tests/test_sampbias.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush
+         scrollaug cover json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb
+         embz LIBS LDLIBS)

@@ -7,7 +7,7 @@
 #include <stdint.h>
 
 #define UNET_MAXLEV 8
-#define UNET_MAXCONV 384   /* 3^3 convs (encoder, down, decoder, residual blocks) + the attention stage's linear layers */
+#define UNET_MAXCONV 1024   /* 3^3 convs (encoder, down, decoder, residual blocks) + the attention stage's linear layers */
 #define UNET_MAXTB 16      /* cfg.attn_blocks */
 #define UNET_MAXTA 64      /* cfg.attn_blocks x cfg.attn_repeat (block applications) */
 /* unet_set_attn_axis records: per sample UNET_AXR(np) floats: ad (the window dim of the scroll axis: 0 z, 1 y, 2 x), valid (0: no axis),
@@ -137,12 +137,18 @@ const unet_cfg *unet_cfg_of(const unet *u);
 size_t unet_nparams(const unet *u);
 size_t unet_gfilm_off(const unet *u);
 /* cfg.gfilm under --split: fn(ctx, dg, K) sums the device vector dg (K floats) across the cards, in the attention stage's backward before
-   the tokens read it. dg there holds the share of the decoder levels < top (split: each card's half); the levels >= top (unet_set_split_top:
-   the whole window on every card) are added once after the sum, and with dedup (one card, e.g. side 1) their A / B gradients are zeroed
-   there (the other card's count). top 0: every level split */
+   the tokens read it (UFSM_GFILM_TOKGRAD=1 only; without the hook that path aborts under split). dg there holds the split levels' share
+   (each card's half); the whole levels (>= unet_set_split_top's top) are added once after the sum, and side 1 zeroes their A / B
+   gradients by itself (split audit 2026-11-14 #1: before, nothing installed this hook and the whole levels' A / B counted twice).
+   top / dedup: unused (kept for the callers) */
 void unet_set_gfilm_reduce(unet *u, void (*fn)(void *ctx, float *dg, int K), void *ctx, int top, int dedup);
 void unet_head_offsets(const unet *u, size_t *w, size_t *b);   /* the 1^3 head's weights (cout x its input channels) and biases (cout) in the flat parameters */
 const float *unet_live_params(const unet *u);   /* device weights the optimiser trains (p) */
+const float *unet_active_params(const unet *u);   /* the weights the forward reads: EMA after unet_use_ema(u, 1), else p (predict's fine stem, audit 11-14 infer #1) */
+void unet_set_load_infer(int on);   /* 1: unet_load reads weights + EMA only (no moments, no Muon state): inference processes */
+void unet_infer_release(unet *u, int keep_p);   /* free the training state (gradients, moments, Muon; p too when the EMA is in use and !keep_p) */
+void unet_gn_ema_live(unet *u, int on);   /* cfg.gn_ema: 1 = inference forwards normalise with the window's own statistics (the training-mode function) */
+void unet_set_um_rungs(const float *um, int n);   /* train --um-rungs: written to the header as "um_rungs" */
 const float *unet_ema_params(const unet *u);    /* the EMA weights (a shared-weights net reads them through unet_use_params: the teacher) */
 void unet_use_params(unet *u, const float *w);  /* forward with these device weights (unet_nparams floats); nullptr restores */
 void unet_grad_head_only(unet *u, int blocks);   /* zero all gradients but the output head's (and the last decoder blocks') */
@@ -160,6 +166,7 @@ shape5 unet_out_shape(const unet *u, shape5 xs);
 /* Backward from d loss / d logits (device). Gradients ACCUMULATE into the flat grad array. */
 void unet_backward(unet *u, const float *glogits);
 void unet_debug_stats(const unet *u);
+int unet_grad_groups(unet *u, double *ss, char (*names)[8], int nmax);   /* per layer group squared gradient norms (e<i> / d<i> blocks, t<k> attention, head, rest); returns the count */
 void unet_debug_grads(const unet *u, const char *tag);   /* stderr: per-block conv / attention / head gradient norms */
 void unet_debug_acts(const unet *u);    /* stderr: per-block stored activations, non-finite counts and extremes per sample */   /* stderr: per-block GroupNorm statistics of the last forward and largest |weight| */
 /* g_h16: glogits already holds the 16-bit storage type scaled by the gradient scale (nn_set_loss_grad_h16) */
@@ -167,6 +174,8 @@ void unet_backward_x(unet *u, const void *glogits, int g_h16);
 void unet_zero_grad(unet *u);
 /* Flat gradient exchange for data-parallel training (host buffer of unet_nparams floats). */
 float *unet_grad_ptr(unet *u);                        /* device pointer of the flat gradient */
+float *unet_param_ptr(unet *u);                       /* device pointers of the flat fp32 weights and their EMA */
+float *unet_ema_ptr(unet *u);
 void unet_grad_d2h(unet *u, float *host);
 void unet_grad_h2d(unet *u, const float *host);
 double unet_grad_norm(unet *u);
@@ -184,10 +193,16 @@ void unet_set_muon_vr(unet *u, float gamma);
    formats them per group (L0 convs, deeper convs, attention linears, the 1^3 heads, the other AdamW parameters); 0: nothing collected */
 /* adaptive Muon (train --muon-lars / --muon-dog; DESIGN.md 2026-11-14): (b) per-layer lr multipliers steering each matrix's update / weight
    ratio to tgt at the peak lr (0: their geometric mean), EMA beta, clamp C; (c) the DoG global step, capped at dog_max x lr_peak */
+/* --attn-muon-lr F / --attn-muon-lr-out F2 (audit train #3): the attention linears at F x the Muon lr, the zero-initialised out-projections
+   (wo, w2) at F x F2; 0 / 1 = off. Plain batched Muon and the ext path; not with --init-lr-mult */
+void unet_set_attn_muon_lr(unet *u, float all, float out);
 void unet_set_muon_adapt(unet *u, int lars, float tgt, float beta, float clamp, int dog, float dog_max, float lr_peak);
 void unet_opt_stats_arm(unet *u);
 int unet_opt_stats_str(unet *u, char *buf, size_t cap);
 void unet_set_muon_cautious(unet *u, int on);
+void unet_set_muon_wd_mult(unet *u, float mult);   /* --muon-wd-mult (default 1): multiplier of the weight decay on the Muon matrices only */
+void unet_set_muon_fro(unet *u, int on);           /* --muon-fro 1: every matrix's polarised direction rescaled to the nominal Frobenius norm */
+void unet_set_muon_stem_adamw(unet *u, int on);    /* --muon-stem-adamw 1: the first conv on AdamW (set before the first step; same flag on a resume) */
 void unet_set_muon_qkv_split(unet *u, int on);
 /* QK-clip (attention nets): unet_qk_clip after each optimizer step scales the QK-norm gains of every head whose max logit in the step's
    training forwards exceeded tau (tau 0: record only); unet_qk_lmax: the largest logit since its last call (-1: none recorded) */
@@ -232,12 +247,25 @@ void unet_set_l0_ema(unet *u, float mom, int warm);
    mom toward each training forward's batch statistics (the first replaces them; forwards with the EMA weights do not update); the first
    warm training forwards normalise with their own statistics, later ones and every inference forward (once there are statistics) with
    the running ones. Defaults 0.01, 500. unet_gn_ema_updates: training forwards so far (saved with the statistics) */
+size_t unet_gn_ema_count(unet *u); void unet_gn_ema_get(unet *u, float *h); void unet_gn_ema_put(unet *u, const float *h);   /* 3 x ns: run | rune | last window's */
+double unet_gn_ema_stale(unet *u); void unet_gn_ema_use_run(unet *u, int on);   /* worst per-site var ratio rune / run (max(r, 1 / r)); EMA weights with the live set */
 unsigned unet_gn_ema_skips(const unet *u);   /* gn_ema: training forwards whose non-finite batch statistics were not pooled */
 void unet_gn_ema_override(unet *u, float mom, int warm);   /* after unet_load: mom / warm >= 0 replace the checkpoint's (train --gn-ema-mom / -warm on a resume) */
 int unet_gn_ema_warm(const unet *u);
 int unet_gn_ema_const(const unet *u);   /* the last forward normalised with the running statistics */
 void unet_set_gn_ema(unet *u, float mom, int warm);
 long unet_gn_ema_updates(const unet *u);
+/* data parallel: each replica pools only its own windows' statistics; the trainer averages these 2 ge_ns device floats over the replicas
+   (exact: the running statistics are linear in the batch statistics, so the mean of the replicas' EMAs is the EMA of the mean) */
+float *unet_gn_ema_state(unet *u, size_t *n);
+/* --gn-ema under data parallel (train.c gn_ema_average): the replicas' host copies h[0..ng) of n floats averaged in place (double sums, so
+   every copy gets the same floats whatever the replica order); and whether a DP step averages: every step once the warm-up is reached (the
+   training forwards read the statistics), before it only at validation / checkpoint / last / stopping steps (the update is linear) */
+void unet_gn_ema_mean_host(float *const *h, int ng, size_t n);
+int unet_gn_ema_average_due(long updates, int warm, int step, int val_every, int ckpt_every, int steps, int stop);
+void unet_opt_stats_reserve(unet *u);   /* --opt-stats: its device sums and AdamW snapshot now (before a memory plan) */
+void unet_reserve(unet *u, int muon, int muon_tc);   /* the optimizer's / attention's lazily allocated device buffers now (before a memory plan) */
+size_t unet_ws_plan(unet *u, shape5 xs, size_t pre_budget, int reserve, size_t *pre_out);   /* the kernels' device workspaces for the last (dry) build's levels: bytes; reserve: allocate them on the current device now (2026-11-14 audit net#4) */
 void unet_set_l0_slab_kern(int on);   /* --l0-norm slab on the kernel path (readers apply per-slab statistics; 1) or D's prototype (0); -1: env UFSM_L0_SLAB_KERN */
 void unet_set_l0_stream(int on);      /* the level-0 slab stream (stage S3: level-0 ops per slab in a skewed schedule; 1); -1: env UFSM_L0_STREAM */
 /* stage S4: the stream runs the head per slab (no whole-window logits; with the rings dec[0].a2 and gout[0] are rings too): fwd(ctx, z0,

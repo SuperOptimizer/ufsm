@@ -10,6 +10,7 @@
    RUNDIR: latest.vwt (+ step_NNNNNN.vwt every --ckpt-every; the EMA weights and the optimiser state ride along), log.tsv; resumes
    from latest.vwt when present; a file RUNDIR/STOP saves and exits. */
 #include "vwt.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "attn.h"
 #include "nn.h"
@@ -38,7 +39,7 @@ static volatile sig_atomic_t g_term = 0;
 static void on_term(int sig) { (void)sig; g_term = 1; }
 
 /* the LAST occurrence wins (launch scripts put their defaults first) */
-static const char *opt(int argc, char **argv, const char *k, const char *d) { for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *opt(int argc, char **argv, const char *k, const char *d) { for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
 static vwt_cfg default_cfg(int T, int L) { return (vwt_cfg){T, L, {32, 64, 96}, 192, 2, 6, 4, 256, 96, 0.04f, 0}; }
@@ -47,11 +48,11 @@ int vwt_ckpt_header(FILE *f, vwt_cfg *cfg);   /* (vwt_net.c) */
 /* --bench N [--trunk CKPT] [--mv 1]: one training sample's step as vwt-train runs it, synchronised section times (ms): with --mv the
    pair slab B (trunk + eval forward), A's trunk, forward, loss, the multiview (d2h + host + h2d) and the backward; synthetic slabs */
 static int bench(int argc, char **argv) {
-    const int N = atoi(opt(argc, argv, "--bench", "3")), T = atoi(opt(argc, argv, "--T", "128")), L = atoi(opt(argc, argv, "--L", "384"));
-    const char *trunk = opt(argc, argv, "--trunk", nullptr); const int mv = atoi(opt(argc, argv, "--mv", "0")), mvh = atoi(opt(argc, argv, "--mv-host", "0"));
+    const int N = opt_atoi("--bench", opt(argc, argv, "--bench", "3")), T = opt_atoi("--T", opt(argc, argv, "--T", "128")), L = opt_atoi("--L", opt(argc, argv, "--L", "384"));
+    const char *trunk = opt(argc, argv, "--trunk", nullptr); const int mv = opt_atoi("--mv", opt(argc, argv, "--mv", "0")), mvh = opt_atoi("--mv-host", opt(argc, argv, "--mv-host", "0"));
     wtrunk *WT = nullptr; int cx = 0;
-    const int ttr = trunk && atoi(opt(argc, argv, "--trunk-train", "0"));
-    if (trunk) { WT = ttr ? wt_open_train(trunk, T, L, 0) : wt_open(trunk, T, L, 1, atoi(opt(argc, argv, "--trunk-feat", "1"))); if (!WT) return 1; cx = wt_channels(WT); }
+    const int ttr = trunk && opt_atoi("--trunk-train", opt(argc, argv, "--trunk-train", "0"));
+    if (trunk) { WT = ttr ? wt_open_train(trunk, T, L, 0) : wt_open(trunk, T, L, 1, opt_atoi("--trunk-feat", opt(argc, argv, "--trunk-feat", "1"))); if (!WT) return 1; cx = wt_channels(WT); }
     vwt_cfg c = default_cfg(T, L); c.cx = cx; vwt *m = vwt_create(&c, 1); if (!m) return 1;
     const size_t n = (size_t)T * T * L; uint8_t *im = malloc(n), *va = malloc(n); float *tgh = malloc(n * 4); uint16_t *ch = malloc(n * 2);
     for (size_t i = 0; i < n; i++) { im[i] = (uint8_t)(120 + 60 * sin((i % L) * 0.5) + (rand() & 15)); va[i] = 1; tgh[i] = 0.07f * (float)(i % L); ch[i] = 1; }
@@ -112,9 +113,9 @@ static void seg_miss(const float *ph, const float *tg, const uint16_t *cp, int T
     }
 }
 static int diag(int argc, char **argv) {
-    const char *ck = opt(argc, argv, "--diag", nullptr), *dir = opt(argc, argv, "--dump", nullptr); const int N = atoi(opt(argc, argv, "--n", "8"));
+    const char *ck = opt(argc, argv, "--diag", nullptr), *dir = opt(argc, argv, "--dump", nullptr); const int N = opt_atoi("--n", opt(argc, argv, "--n", "8"));
     if (!dir) { fprintf(stderr, "vwt-train --diag CKPT --dump DIR [--n 8] [--ema 1]\n"); return 2; }
-    vwt *m = vwt_load(ck, atoi(opt(argc, argv, "--ema", "1"))); if (!m) return 1;
+    vwt *m = vwt_load(ck, opt_atoi("--ema", opt(argc, argv, "--ema", "1"))); if (!m) return 1;
     const int T = 128, L = 384; const size_t n = (size_t)T * T * L;
     uint8_t *im = malloc(n), *va = malloc(n); uint16_t *cp = malloc(n * 2); float *tg = malloc(n * 4), *pw = malloc(n * 4), *ph = malloc(n * 4), *pc = malloc(n * 4), *ic = malloc(n * 4);
     uint8_t *imd = nn_malloc(n), *vad = nn_malloc(n); uint16_t *cd = nn_malloc(n * 2); float *tgd = nn_malloc(n * 4), *pwd = nn_malloc(n * 4), *phd = nn_malloc(n * 4), *incd = nn_malloc(n * 4);
@@ -148,48 +149,48 @@ static int diag(int argc, char **argv) {
 }
 
 int cmd_vwt_train(int argc, char **argv) {
-    if (nn_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
-    if (atoi(opt(argc, argv, "--tf32", "1"))) setenv("UFSM_ATTN_TF32", "1", 0);
-    at_set_core(atoi(opt(argc, argv, "--core", "1")));
-    at_set_mx(atoi(opt(argc, argv, "--mx", "16")));   /* attention-block linears / activations: 16 = bf16 (src/nn_attn_h16.cu), 0 fp32, 8 / 4 MX */
+    if (nn_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
+    if (opt_atoi("--tf32", opt(argc, argv, "--tf32", "1"))) setenv("UFSM_ATTN_TF32", "1", 0);
+    at_set_core(opt_atoi("--core", opt(argc, argv, "--core", "1")));
+    at_set_mx(opt_atoi("--mx", opt(argc, argv, "--mx", "16")));   /* attention-block linears / activations: 16 = bf16 (src/nn_attn_h16.cu), 0 fp32, 8 / 4 MX */
     if (opt(argc, argv, "--bench", nullptr)) return bench(argc, argv);
     if (opt(argc, argv, "--diag", nullptr)) return diag(argc, argv);
     if (argc < 4) { fprintf(stderr, "usage: ufsm vwt-train SOURCES RUNDIR [options]  |  ufsm vwt-train --bench N\n"); return 2; }
     const char *src = argv[2], *run = argv[3];
-    const int T = atoi(opt(argc, argv, "--T", "128")), L = atoi(opt(argc, argv, "--L", "384")), B = atoi(opt(argc, argv, "--batch", "2"));
-    const int steps = atoi(opt(argc, argv, "--steps", "50000")), warm = atoi(opt(argc, argv, "--warmup", "500")), logf = atoi(opt(argc, argv, "--log", "50"));
-    const int ckev = atoi(opt(argc, argv, "--ckpt-every", "2000"));
-    const float lr0 = (float)atof(opt(argc, argv, "--lr", "5e-4")), wd = (float)atof(opt(argc, argv, "--wd", "0.01")), emad = (float)atof(opt(argc, argv, "--ema", "0.999"));
-    const float clip = (float)atof(opt(argc, argv, "--clip", "1")), dp = (float)atof(opt(argc, argv, "--dp", "0.25")), dd = (float)atof(opt(argc, argv, "--dd", "0.05"));
-    const float lp = (float)atof(opt(argc, argv, "--lam-p", "1")), ld = (float)atof(opt(argc, argv, "--lam-d", "1"));
-    const int use_shell = atoi(opt(argc, argv, "--shell", "0"));   /* position-only shell loss (samples carrying shell masks) */
-    const float lsh = (float)atof(opt(argc, argv, "--lam-shell", "0.2")), gate = (float)atof(opt(argc, argv, "--snap-gate", "0.25"));
-    const float lmv = (float)atof(opt(argc, argv, "--lam-mv", "0.25")), mvd = (float)atof(opt(argc, argv, "--mv-delta", "0.5")); const int mvs = atoi(opt(argc, argv, "--mv-stride", "4"));
-    const int use_mv = atof(opt(argc, argv, "--mv-p", "0")) > 0 && lmv > 0;
+    const int T = opt_atoi("--T", opt(argc, argv, "--T", "128")), L = opt_atoi("--L", opt(argc, argv, "--L", "384")), B = opt_atoi("--batch", opt(argc, argv, "--batch", "2"));
+    const int steps = opt_atoi("--steps", opt(argc, argv, "--steps", "50000")), warm = opt_atoi("--warmup", opt(argc, argv, "--warmup", "500")), logf = opt_atoi("--log", opt(argc, argv, "--log", "50"));
+    const int ckev = opt_atoi("--ckpt-every", opt(argc, argv, "--ckpt-every", "2000"));
+    const float lr0 = (float)opt_atof("--lr", opt(argc, argv, "--lr", "5e-4")), wd = (float)opt_atof("--wd", opt(argc, argv, "--wd", "0.01")), emad = (float)opt_atof("--ema", opt(argc, argv, "--ema", "0.999"));
+    const float clip = (float)opt_atof("--clip", opt(argc, argv, "--clip", "1")), dp = (float)opt_atof("--dp", opt(argc, argv, "--dp", "0.25")), dd = (float)opt_atof("--dd", opt(argc, argv, "--dd", "0.05"));
+    const float lp = (float)opt_atof("--lam-p", opt(argc, argv, "--lam-p", "1")), ld = (float)opt_atof("--lam-d", opt(argc, argv, "--lam-d", "1"));
+    const int use_shell = opt_atoi("--shell", opt(argc, argv, "--shell", "0"));   /* position-only shell loss (samples carrying shell masks) */
+    const float lsh = (float)opt_atof("--lam-shell", opt(argc, argv, "--lam-shell", "0.2")), gate = (float)opt_atof("--snap-gate", opt(argc, argv, "--snap-gate", "0.25"));
+    const float lmv = (float)opt_atof("--lam-mv", opt(argc, argv, "--lam-mv", "0.25")), mvd = (float)opt_atof("--mv-delta", opt(argc, argv, "--mv-delta", "0.5")); const int mvs = opt_atoi("--mv-stride", opt(argc, argv, "--mv-stride", "4"));
+    const int use_mv = opt_atof("--mv-p", opt(argc, argv, "--mv-p", "0")) > 0 && lmv > 0;
     mkdir(run, 0755);
     char path[1200]; snprintf(path, sizeof path, "%s/latest.vwt", run);
     vwt_cfg c = default_cfg(T, L);
     /* --trunk CKPT: a frozen feature trunk (wind96 in-slab, src/wtrunk) feeding cfg.cx extra input channels; --cx-test N: N zero channels
        (no trunk; smoke tests of the wide input) */
-    const char *trunk = opt(argc, argv, "--trunk", nullptr); wtrunk *WT = nullptr; int cx = atoi(opt(argc, argv, "--cx-test", "0"));
+    const char *trunk = opt(argc, argv, "--trunk", nullptr); wtrunk *WT = nullptr; int cx = opt_atoi("--cx-test", opt(argc, argv, "--cx-test", "0"));
     /* --trunk-train 1 (stage 2): the trunk trains too (src/wtrunk.h wt_open_train): Muon at --trunk-muon-lr (default 0.002 = 0.1 x wind96's
        0.02) on its 3^3 convs, AdamW at --trunk-lr-mult (0.1) x the vwt lr elsewhere, both warmed up from 0 over --trunk-warmup (500) steps and
        then the vwt schedule's shape; its own EMA (--ema); RUN/latest.wt + step_N.wt (resumed from RUN/latest.wt before --trunk);
        --trunk-levels k: only the head + the last k decoder blocks; --trunk-wd (0) */
-    const int trunk_train = atoi(opt(argc, argv, "--trunk-train", "0")), trunk_warm = atoi(opt(argc, argv, "--trunk-warmup", "500"));
-    const float trunk_mlr = (float)atof(opt(argc, argv, "--trunk-muon-lr", "0.002")), trunk_lrm = (float)atof(opt(argc, argv, "--trunk-lr-mult", "0.1")), trunk_wd = (float)atof(opt(argc, argv, "--trunk-wd", "0"));
+    const int trunk_train = opt_atoi("--trunk-train", opt(argc, argv, "--trunk-train", "0")), trunk_warm = opt_atoi("--trunk-warmup", opt(argc, argv, "--trunk-warmup", "500"));
+    const float trunk_mlr = (float)opt_atof("--trunk-muon-lr", opt(argc, argv, "--trunk-muon-lr", "0.002")), trunk_lrm = (float)opt_atof("--trunk-lr-mult", opt(argc, argv, "--trunk-lr-mult", "0.1")), trunk_wd = (float)opt_atof("--trunk-wd", opt(argc, argv, "--trunk-wd", "0"));
     uint16_t *xgd = nullptr;
     char wtp[1200]; snprintf(wtp, sizeof wtp, "%s/latest.wt", run);
     if (trunk && trunk_train) {
         const char *src_ = access(wtp, F_OK) == 0 ? wtp : trunk;
-        WT = wt_open_train(src_, T, L, atoi(opt(argc, argv, "--trunk-levels", "0"))); if (!WT) { fprintf(stderr, "vwt-train: cannot open the trunk %s for training\n", src_); return 1; } cx = wt_channels(WT);
+        WT = wt_open_train(src_, T, L, opt_atoi("--trunk-levels", opt(argc, argv, "--trunk-levels", "0"))); if (!WT) { fprintf(stderr, "vwt-train: cannot open the trunk %s for training\n", src_); return 1; } cx = wt_channels(WT);
         xgd = (uint16_t *)1;   /* (set below: the features' gradient over their own input slots, written after the input conv's weight gradient read them) */
-    } else if (trunk) { WT = wt_open(trunk, T, L, 1, atoi(opt(argc, argv, "--trunk-feat", "1"))); if (!WT) { fprintf(stderr, "vwt-train: cannot open the trunk %s\n", trunk); return 1; } cx = wt_channels(WT);
+    } else if (trunk) { WT = wt_open(trunk, T, L, 1, opt_atoi("--trunk-feat", opt(argc, argv, "--trunk-feat", "1"))); if (!WT) { fprintf(stderr, "vwt-train: cannot open the trunk %s\n", trunk); return 1; } cx = wt_channels(WT);
                  fprintf(stderr, "vwt-train: frozen trunk %s, %d feature channels\n", trunk, cx); }
     c.cx = cx;
-    vwt *m = access(path, F_OK) == 0 ? vwt_load(path, 0) : vwt_create(&c, (unsigned)atoi(opt(argc, argv, "--seed", "1")));
+    vwt *m = access(path, F_OK) == 0 ? vwt_load(path, 0) : vwt_create(&c, (unsigned)opt_atoi("--seed", opt(argc, argv, "--seed", "1")));
     if (!m) return 1;
-    if (access(path, F_OK) != 0 && opt(argc, argv, "--init-from", nullptr) && vwt_init_from(m, opt(argc, argv, "--init-from", nullptr), atoi(opt(argc, argv, "--init-ema", "1")))) return 1;
+    if (access(path, F_OK) != 0 && opt(argc, argv, "--init-from", nullptr) && vwt_init_from(m, opt(argc, argv, "--init-from", nullptr), opt_atoi("--init-ema", opt(argc, argv, "--init-ema", "1")))) return 1;
     int xld = cx; uint16_t *xfd = nullptr;   /* the trunk writes its features straight into the network's padded bf16 input */
     if (WT) xfd = vwt_xfeat_buf(m, &xld);
     if (xgd) { xgd = xfd; vwt_set_xgrad(m, xgd, xld); }   /* (stage 2: d loss / d features for the trunk's backward) */
@@ -209,7 +210,7 @@ int cmd_vwt_train(int argc, char **argv) {
     signal(SIGTERM, on_term); signal(SIGINT, on_term);
     vws_set_args(argc, argv);
     /* --overfit DIR --n N: cycle over N dumped slabs instead of the sampler (correctness check: the loss must collapse) */
-    const char *ofd = opt(argc, argv, "--overfit", nullptr); const int ofn = atoi(opt(argc, argv, "--n", "4"));
+    const char *ofd = opt(argc, argv, "--overfit", nullptr); const int ofn = opt_atoi("--n", opt(argc, argv, "--n", "4"));
     vws_sample *OF = nullptr;
     if (ofd) {
         const size_t nn = (size_t)T * T * L; OF = calloc(ofn, sizeof *OF);
@@ -219,14 +220,14 @@ int cmd_vwt_train(int argc, char **argv) {
             for (size_t k = 0; k < nn; k++) if (!q->comp[k]) q->ph[k] = 0.f;
         }
     }
-    vws *S = ofd ? nullptr : vws_open(src, T, L, (float)atof(opt(argc, argv, "--tilt", "15")), ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 12), (unsigned)(atoi(opt(argc, argv, "--seed", "1")) * 7919 + step), 1);
+    vws *S = ofd ? nullptr : vws_open(src, T, L, (float)opt_atof("--tilt", opt(argc, argv, "--tilt", "15")), ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 12), (unsigned)(opt_atoi("--seed", opt(argc, argv, "--seed", "1")) * 7919 + step), 1);
     if (!S && !ofd) { fprintf(stderr, "vwt-train: cannot open sources %s\n", src); return 1; }
     const size_t n = (size_t)T * T * L;
     uint8_t *imd = nn_malloc(n), *vad = nn_malloc(n); float *tg = nn_malloc(n * 4), *pw = nn_malloc(n * 4), *gph = nn_malloc(n * 4), *ginc = nn_malloc(n * 4);
     float *phd = nn_malloc(n * 4), *incd = nn_malloc(n * 4); uint16_t *cd = nn_malloc(n * 2); float *ones = malloc(n * 4); uint8_t *shd = nn_malloc(n);
     double acc_h = 0, acc_hc = 0, acc_mv = 0, acc_mvn = 0;
     float *phb = use_mv ? nn_malloc(n * 4) : nullptr, *pha_h = use_mv ? malloc(n * 4) : nullptr, *phb_h = use_mv ? malloc(n * 4) : nullptr, *gmv = use_mv ? malloc(n * 4) : nullptr;
-    const int mvhost = atoi(opt(argc, argv, "--mv-host", "0"));
+    const int mvhost = opt_atoi("--mv-host", opt(argc, argv, "--mv-host", "0"));
     float *gmvd = use_mv && mvhost ? nn_malloc(n * 4) : nullptr; uint8_t *vbd = use_mv && !mvhost ? nn_malloc(n) : nullptr;
     for (size_t i = 0; i < n; i++) ones[i] = 1.f;
     snprintf(path, sizeof path, "%s/log.tsv", run); FILE *lf = fopen(path, step ? "a" : "w"); if (!lf) return 1;

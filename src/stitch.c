@@ -1,6 +1,7 @@
 /* Box stitching: gauge alignment of overlapping local winding fits, the global gauge, the blended global winding field and
    level-set sheets traced across the boxes (src/stitch.h). */
 #include "stitch.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "coreline.h"
 #include "json.h"
@@ -848,7 +849,7 @@ int st_seed(const st_box *b, int i, double zf, const st_sgauge *g, const st_trac
 
 /* ---- ufsm stitch ---- */
 static const char *sopt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 typedef struct { z3 *w, *pc, *ps; int nthreads; } zf_ctx;
@@ -922,8 +923,8 @@ static int cm_open(const char *dir, st_fields *F, cm_ctx *c) {
 static int stitch_align(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm stitch align <out.json> --fields ZARR [--stride 2] [--min-w 0.05] [--min-agree 0.5] [--min-wsum 50] [--mask HALFBOX_DIR] [--threads 8] BOXDIR...\n"); return 2; }
     const char *out = argv[3], *fz = sopt(argc, argv, "--fields", nullptr);
-    const int stride = atoi(sopt(argc, argv, "--stride", "2")), nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8);
-    const double min_w = atof(sopt(argc, argv, "--min-w", "0.05")), min_agree = atof(sopt(argc, argv, "--min-agree", "0.5")), min_wsum = atof(sopt(argc, argv, "--min-wsum", "50"));
+    const int stride = opt_atoi("--stride", sopt(argc, argv, "--stride", "2")), nt = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 8);
+    const double min_w = opt_atof("--min-w", sopt(argc, argv, "--min-w", "0.05")), min_agree = opt_atof("--min-agree", sopt(argc, argv, "--min-agree", "0.5")), min_wsum = opt_atof("--min-wsum", sopt(argc, argv, "--min-wsum", "50"));
     if (!fz) { fprintf(stderr, "stitch align: --fields ZARR (the fit-field zarr the boxes were cropped from)\n"); return 2; }
     st_box *b = calloc(argc, sizeof *b); int nb = 0;
     for (int i = 4; i < argc; i++) {
@@ -961,7 +962,7 @@ static int stitch_solve(int argc, char **argv) {
         const size_t l = strlen(b[i].name);
         for (const char *q = strstr(xl, b[i].name); q; q = strstr(q + 1, b[i].name)) if ((q == xl || q[-1] == ',') && (q[l] == ',' || !q[l])) ex[i] = 1;
     }
-    const int bad = st_solve(b, nb, e, ne, atof(sopt(argc, argv, "--min-agree", "0.5")), atof(sopt(argc, argv, "--min-wsum", "50")), ex);
+    const int bad = st_solve(b, nb, e, ne, opt_atof("--min-agree", sopt(argc, argv, "--min-agree", "0.5")), opt_atof("--min-wsum", sopt(argc, argv, "--min-wsum", "50")), ex);
     print_edges(b, e, ne); print_boxes(b, nb); report_solve(b, nb, e, ne, bad);
     return st_save(argv[4], b, nb, e, ne, um) ? 1 : 0;
 }
@@ -983,7 +984,7 @@ static int stitch_field(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm stitch field <gauge.json> <out-group> [--comp 0] [--step 8] [--q 0.004] [--threads 8]\n"); return 2; }
     st_box *b; st_edge *e; int nb, ne; double um;
     if (st_load(argv[3], &b, &nb, &e, &ne, &um)) { fprintf(stderr, "stitch: cannot read %s\n", argv[3]); return 1; }
-    const int comp = atoi(sopt(argc, argv, "--comp", "0")), nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8); const double step = atof(sopt(argc, argv, "--step", "8"));
+    const int comp = opt_atoi("--comp", sopt(argc, argv, "--comp", "0")), nt = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 8); const double step = opt_atof("--step", sopt(argc, argv, "--step", "8"));
     double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
     for (int i = 0; i < nb; i++) if (b[i].comp == comp) for (int d = 0; d < 3; d++) { lo[d] = fmin(lo[d], b[i].lo[d]); hi[d] = fmax(hi[d], b[i].hi[d]); }
     if (lo[0] > hi[0]) { fprintf(stderr, "stitch field: component %d has no boxes\n", comp); return 1; }
@@ -991,7 +992,7 @@ static int stitch_field(int argc, char **argv) {
     char lv[32], ld[1400], at[1600]; z3w_level_name(um * step, lv, sizeof lv); snprintf(ld, sizeof ld, "%s/%s", argv[4], lv);
     snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"stitched global winding G (float32, -1 = no box; sheets at integer G) of ufsm stitch\",\"gauge\":\"%s\",\"component\":%d,"
              "\"origin_zyx\":[%.3f,%.3f,%.3f],\"step\":%.6g,\"native_um\":%.9g}}", argv[3], comp, lo[0], lo[1], lo[2], step, um);
-    z3w *zw = z3w_create_typed(ld, gs, 512, 5, (float)atof(sopt(argc, argv, "--q", "0.004")), -1.0, at);
+    z3w *zw = z3w_create_typed(ld, gs, 512, 5, (float)opt_atof("--q", sopt(argc, argv, "--q", "0.004")), -1.0, at);
     if (!zw || z3w_write_group(argv[4], (const double[]){um * step}, 1, "ufsm-stitched-winding", at)) { fprintf(stderr, "stitch: %s\n", z3w_error()); return 1; }
     float *buf = malloc((size_t)512 * 512 * 512 * 4); const double t0 = now_s();
     for (int64_t sz = 0; sz * 512 < gs[0]; sz++) for (int64_t sy = 0; sy * 512 < gs[1]; sy++) for (int64_t sx = 0; sx * 512 < gs[2]; sx++) {
@@ -1219,18 +1220,18 @@ static int stitch_sheets(int argc, char **argv) {
     st_edge *e; int ne; if (st_load(argv[3], &J->b, &J->nb, &e, &ne, &J->um)) { fprintf(stderr, "stitch: cannot read %s\n", argv[3]); return 1; }
     free(e);
     J->follow = strcmp(sopt(argc, argv, "--mode", "follow"), "gauge") != 0;
-    J->comp = atoi(sopt(argc, argv, "--comp", J->follow ? "-1" : "0")); J->out = argv[4];
+    J->comp = opt_atoi("--comp", sopt(argc, argv, "--comp", J->follow ? "-1" : "0")); J->out = argv[4];
     if (J->follow && J->comp < 0) { for (int i = 0; i < J->nb; i++) J->b[i].comp = 0; J->comp = -1; st_tapers(J->b, J->nb, 0); }
-    J->cfg.tstep = atof(sopt(argc, argv, "--tstep", "2")); J->step = atof(sopt(argc, argv, "--step", "1")); J->out_um = atof(sopt(argc, argv, "--out-um", "2.399"));
-    J->cfg.max_cols = atoi(sopt(argc, argv, "--max-cols", "4000")); J->cfg.max_gap = atoi(sopt(argc, argv, "--max-gap", "50")); J->min_cm2 = atof(sopt(argc, argv, "--min-cm2", "0.5"));
-    J->cfg.bridge_max = atof(sopt(argc, argv, "--bridge", "150")); J->cfg.fault_ratio = atof(sopt(argc, argv, "--fault-ratio", "3"));
-    J->cfg.min_seed_q = atof(sopt(argc, argv, "--min-seed-q", "0.3"));   /* with quality maps: seeds where the seed box follows the network phase */
-    J->min_used = atoll(sopt(argc, argv, "--min-used", "2000"));   /* trace vertices of a box level that mark it as traced (no seed of its own) */
-    const int nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 4);
+    J->cfg.tstep = opt_atof("--tstep", sopt(argc, argv, "--tstep", "2")); J->step = opt_atof("--step", sopt(argc, argv, "--step", "1")); J->out_um = opt_atof("--out-um", sopt(argc, argv, "--out-um", "2.399"));
+    J->cfg.max_cols = opt_atoi("--max-cols", sopt(argc, argv, "--max-cols", "4000")); J->cfg.max_gap = opt_atoi("--max-gap", sopt(argc, argv, "--max-gap", "50")); J->min_cm2 = opt_atof("--min-cm2", sopt(argc, argv, "--min-cm2", "0.5"));
+    J->cfg.bridge_max = opt_atof("--bridge", sopt(argc, argv, "--bridge", "150")); J->cfg.fault_ratio = opt_atof("--fault-ratio", sopt(argc, argv, "--fault-ratio", "3"));
+    J->cfg.min_seed_q = opt_atof("--min-seed-q", sopt(argc, argv, "--min-seed-q", "0.3"));   /* with quality maps: seeds where the seed box follows the network phase */
+    J->min_used = opt_atoll("--min-used", sopt(argc, argv, "--min-used", "2000"));   /* trace vertices of a box level that mark it as traced (no seed of its own) */
+    const int nt = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 4);
     { char *t = strdup(sopt(argc, argv, "--seeds", "0.5,0.25,0.75")), *sv = nullptr; for (char *q = strtok_r(t, ",", &sv); q && J->nzf < 8; q = strtok_r(nullptr, ",", &sv)) J->zf[J->nzf++] = atof(q); free(t); }
-    J->rdir = sopt(argc, argv, "--render-dir", nullptr); J->rrows = atoi(sopt(argc, argv, "--render-rows", "1042"));
+    J->rdir = sopt(argc, argv, "--render-dir", nullptr); J->rrows = opt_atoi("--render-rows", sopt(argc, argv, "--render-rows", "1042"));
     { char *t = strdup(sopt(argc, argv, "--render-um", "4.798,9.596")), *sv = nullptr; for (char *q = strtok_r(t, ",", &sv); q && J->nrum < 4; q = strtok_r(nullptr, ",", &sv)) J->rum[J->nrum++] = atof(q); free(t); }
-    const int kf = *sopt(argc, argv, "--first", "") ? atoi(sopt(argc, argv, "--first", "")) : -1000000, kl = *sopt(argc, argv, "--last", "") ? atoi(sopt(argc, argv, "--last", "")) : 1000000;
+    const int kf = *sopt(argc, argv, "--first", "") ? opt_atoi("--first", sopt(argc, argv, "--first", "")) : -1000000, kl = *sopt(argc, argv, "--last", "") ? opt_atoi("--last", sopt(argc, argv, "--last", "")) : 1000000;
     const char *bl = sopt(argc, argv, "--boxes", nullptr);   /* follow: seed only in these boxes */
     double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300}, gmin = 1e300, gmax = -1e300;
     for (int i = 0; i < J->nb; i++) if (J->comp < 0 || J->b[i].comp == J->comp) {
@@ -1262,7 +1263,7 @@ static int stitch_sheets(int argc, char **argv) {
     char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", J->out); if (system(p)) return 1;
     const char *fz = sopt(argc, argv, "--fields", nullptr); uint8_t *mask = nullptr;
     if (fz) {
-        if (!(mask = load_mask(fz, J->out, lo, hi, atoi(sopt(argc, argv, "--mask-pool", "8")), 8, J->cfg.mn, J->cfg.mo, &J->cfg.mh))) return 1;
+        if (!(mask = load_mask(fz, J->out, lo, hi, opt_atoi("--mask-pool", sopt(argc, argv, "--mask-pool", "8")), 8, J->cfg.mn, J->cfg.mo, &J->cfg.mh))) return 1;
         J->cfg.mask = mask;
     }
     snprintf(p, sizeof p, "%s/sheets.tsv", J->out); J->tsv = fopen(p, "a"); if (!J->tsv) return 1;
@@ -1284,9 +1285,9 @@ static int stitch_quality(int argc, char **argv) {
     st_box *b; st_edge *e; int nb, ne; double um;
     if (st_load(argv[3], &b, &nb, &e, &ne, &um)) { fprintf(stderr, "stitch: cannot read %s\n", argv[3]); return 1; }
     const char *fz = sopt(argc, argv, "--fields", nullptr); if (!fz) { fprintf(stderr, "stitch quality: --fields ZARR\n"); return 2; }
-    const int nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 8); zf_ctx zc; st_fields F; if (zf_open(fz, nt, &zc, &F)) return 1;
+    const int nt = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 8); zf_ctx zc; st_fields F; if (zf_open(fz, nt, &zc, &F)) return 1;
     const char *md = sopt(argc, argv, "--mask", nullptr); cm_ctx cm = {0}; if (md && cm_open(md, &F, &cm)) return 1;
-    const double qb = atof(sopt(argc, argv, "--block", "64")), t0 = now_s(); const int stride = atoi(sopt(argc, argv, "--stride", "2"));
+    const double qb = opt_atof("--block", sopt(argc, argv, "--block", "64")), t0 = now_s(); const int stride = opt_atoi("--stride", sopt(argc, argv, "--stride", "2"));
     for (int i = 0; i < nb; i++) {
         if (st_quality(&b[i], &F, qb, stride, nt)) { fprintf(stderr, "stitch: cannot read the fields\n"); return 1; }
         size_t nq = (size_t)b[i].qn[0] * b[i].qn[1] * b[i].qn[2], good = 0, anti = 0, seen = 0;
@@ -1310,8 +1311,8 @@ static int stitch_coherence(int argc, char **argv) {
     st_box *b; st_edge *e; int nb, ne; double um;
     if (st_load(argv[3], &b, &nb, &e, &ne, &um)) { fprintf(stderr, "stitch: cannot read %s\n", argv[3]); return 1; }
     const char *fz = sopt(argc, argv, "--fields", nullptr); if (!fz) { fprintf(stderr, "stitch coherence: --fields ZARR\n"); return 2; }
-    const int nt = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 6), comp = atoi(sopt(argc, argv, "--comp", "0")), stride = atoi(sopt(argc, argv, "--stride", "4"));
-    const double qb = atof(sopt(argc, argv, "--block", "64"));
+    const int nt = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 6), comp = opt_atoi("--comp", sopt(argc, argv, "--comp", "0")), stride = opt_atoi("--stride", sopt(argc, argv, "--stride", "4"));
+    const double qb = opt_atof("--block", sopt(argc, argv, "--block", "64"));
     zf_ctx zc; st_fields F; if (zf_open(fz, nt, &zc, &F)) return 1;
     double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
     for (int i = 0; i < nb; i++) if (b[i].comp == comp) for (int d = 0; d < 3; d++) { lo[d] = fmin(lo[d], b[i].lo[d]); hi[d] = fmax(hi[d], b[i].hi[d]); }

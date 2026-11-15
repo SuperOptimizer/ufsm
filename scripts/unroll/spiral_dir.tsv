@@ -1,0 +1,18 @@
+scroll	dir	source	evidence
+PHerc1667	-1	published	full unwrap 20260612121456 (2026-11-14): its turn grows as atan2(y - cy, x - cx) decreases; ref sheet identity +1 0.461, -1 0.731; whole chain 0.487 -> 0.762; seghand.py on the 20 local wrap segments on 20251217075048: -1 on 18 (rows 148-262 vs 0-49), the two outermost partial turns undecided
+PHercParis4	1	published	seghand.py, 3 open-data segments on 20260411134726 (20260623164704 / 165230 / 165742): rows +1 291-293 vs -1 0-2 (also fit.h's documented +1)
+PHerc0814	-1	published	seghand.py, 2 open-data segments on 20250804134230 (20250926051122, 20250928235953): rows -1 24 / 27 vs +1 1 / 2; the 11-12 u1 unroll ran on a default +1 (no ref log kept): REDO
+PHerc1451	+1?	published, scan unverified	seghand.py, open-data segments/raw/z_dbg_gen_04971 (scan frame not checked against 20250521151225): rows +1 67 vs 0
+PHercMAN5	+1?	published, scan unverified	seghand.py, segments/20260321025901-MAN5_outer_3 tifxyz_flattened (a flattened-mesh product; frame not checked): rows +1 128 vs 9
+PHerc1299	?	unknown	no open-data segments on 20260309130042; phase loops: no loop with >= 1/2 confident cells (pitch ~5 field cells); u1 ref ran dir +1 (default)
+PHerc0009B	?	unknown	18 segments on 20250521125136, none covers >= 0.8 turn per row
+PHerc0257	?	unknown	no segments
+PHerc0332	?	unknown	2 old segments (other scans), < 0.8 turn
+PHerc0358	?	unknown	no segments
+PHerc0483B	?	unknown	no segments
+PHerc0490B	?	unknown	no segments
+PHerc0813	?	unknown	no segments
+PHerc0846B	?	unknown	no segments
+PHerc1203	?	unknown	raw auto-grown segments, < 0.8 turn
+PHerc1545	?	unknown	no segments
+PHercMANB	?	unknown	no segments

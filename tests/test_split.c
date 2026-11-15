@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 #define NCH 2
 static int P, B, Dl, H0, DEV[2] = {0, 1};   /* one GPU: both halves on it (emulated split) */
@@ -122,8 +123,8 @@ static double worst(const float *a, const float *b, const char **nm) {
 }
 
 int main(void) {
-    if (nn_init(0)) { printf("test_split: no GPU, skipped\n"); return 0; }
-    if (ufsm_env_on("UFSM_SPLIT_ONE_GPU") || nn_init(1)) { DEV[1] = 0; nn_init(0); nn_check(); }   /* (clears the failed probe's error) */
+    if (nn_init(0)) return test_no_gpu("test_split", "nn_init(0) failed");
+    if (ufsm_env_on("UFSM_SPLIT_ONE_GPU") || nn_init(1)) { DEV[1] = 0; nn_init(0); nn_check(); test_partial("test_split", "one GPU: both halves on device 0, the cross-device copies not exercised"); }   /* (clears the failed probe's error) */
     P = getenv("UFSM_P") ? atoi(getenv("UFSM_P")) : 96; B = getenv("UFSM_B") ? atoi(getenv("UFSM_B")) : 1;
     unet_cfg cfg = {4, {16, 32, 64, 80}, 4, NCH, 8, 1};
     H0 = 1 << (cfg.nlev - 1); Dl = P / 2 + H0;

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <math.h>
 #include "ftgpu.h"
+#include "fm_tol.h"
 
 static uint64_t rs = 0x9e3779b97f4a7c15ull;
 static double rnd(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (double)(rs >> 11) / 9007199254740992.0; }
@@ -32,10 +33,13 @@ int main(void) {
         ft_ridge_axis(pr, n, ax, ay, R, prior);
         if (ft_ridge_axis_gpu(0, pr, n, bx, by, R, prior)) { printf("test_ftrace_gpu: no GPU path (CUDA failure)\n"); return 1; }
         size_t dx = 0, dy = 0, nd = 0; for (size_t i = 0; i < nv; i++) { dx += ax[i] != bx[i]; dy += ay[i] != by[i]; nd += ax[i] != 128 || ay[i] != 128; }
-        runs++; if (dx || dy) fails++;
+        /* exact under UFSM_STRICT_MATH; under fast math (host ft_ridge_axis contracted / reassociated, nn_ftrace.cu approximate sqrt /
+           division) an axis code 128 + 127 n may move by 1 on <= 2e-3 of the voxels, and <= 1e-4 flip between an axis and 128 at the
+           ridge threshold (tests/fm_tol.h) */
+        runs++; if (fm_cmp_u8c("nx", ax, bx, nv, 1, 0, 2e-3, 1e-4) | fm_cmp_u8c("ny", ay, by, nv, 1, 0, 2e-3, 1e-4)) fails++;
         printf("R %d prior %c: %zu / %zu nx and %zu ny bytes differ (%zu voxels with an axis)\n", R, prior ? prior : '-', dx, nv, dy, nd);
     }
-    printf("test_ftrace_gpu: %s (%d of %d configurations byte-identical)\n", fails ? "FAIL" : "PASS", runs - fails, runs);
+    printf("test_ftrace_gpu: %s (%d of %d configurations byte-identical / within the fast-math bound)\n", fails ? "FAIL" : "PASS", runs - fails, runs);
     free(pr); free(ax); free(ay); free(bx); free(by);
     return fails != 0;
 }

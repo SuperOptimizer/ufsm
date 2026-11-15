@@ -5,9 +5,9 @@
 #        FLATX (extra strip-flatten flags), RENDER_NT, CTL (on-papyrus CT level), STOP file: $OUT/STOP
 set -u
 OUT=$1; WR=$2; shift 2
-U=${U:-/vesuvius/ufsm/scroll1/src/build/ufsm}
-CTR=${CTR:-/vesuvius/ufsm/volcomp}; CTK=${CTK:-PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr/2}
-INK=${INK:-/vesuvius/ufsm/paris4/ink/ift3-24000-ov8.zarr}; INKK=${INKK:-9.6}
+U=${U:-$(cd "$(dirname "$0")/../.." && pwd)/build/ufsm}   # (the repo's build; the old /vesuvius/ufsm/scroll1 default is gone)
+[ -x "$U" ] || { echo "$0: no ufsm binary $U (set U)" >&2; exit 1; }
+CTR=${CTR:?CT root}; CTK=${CTK:?CT key}; INK=${INK:?ink zarr}; INKK=${INKK:-9.6}   # (no scroll defaults: the old Paris 4 paths are gone)
 DECIM=${DECIM:-4}; NT=${NT:-12}; RENDER_NT=${RENDER_NT:-8}; CTL=${CTL:-80}; FLATX=${FLATX:-}
 mkdir -p $OUT/logs
 log() { echo "$(date '+%F %T') $*" | tee -a $OUT/progress.log; }

@@ -19,10 +19,17 @@
     },
     {
       "name": "arch86",
-      "displayName": "arch86: build86/ (Ampere, software MX; SASS + PTX, so newer GPUs run the sm_86 paths)",
+      "displayName": "arch86: build86/ (software MX kernels; SASS for the GPU present, UFSM_GPU_SM=portable: sm_86 SASS + PTX)",
       "inherits": "release",
       "binaryDir": "${sourceDir}/build86",
       "cacheVariables": {"UFSM_ARCH": "86"}
+    },
+    {
+      "name": "portable",
+      "displayName": "portable: build-portable/ (release with -march=x86-64-v3: binaries copied to pods / other hosts)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build-portable",
+      "cacheVariables": {"UFSM_MARCH": "x86-64-v3"}
     },
     {
       "name": "arch86-verify",
@@ -54,6 +61,7 @@
     {"name": "desk-test", "displayName": "desk: build + fast suite tier (SUITE_FLAGS env for runner options)", "configurePreset": "verify",
      "jobs": 8, "targets": ["test"]},
     {"name": "pod", "displayName": "pod: release, 6 jobs (cgroup cpu.max)", "configurePreset": "release", "jobs": 6},
+    {"name": "portable", "configurePreset": "portable"},
     {"name": "pod-verify", "displayName": "pod: the suite binaries, 6 jobs", "configurePreset": "verify", "jobs": 6,
      "targets": ["suite-bins"]},
     {"name": "pod-test", "displayName": "pod: build + fast suite tier", "configurePreset": "verify", "jobs": 6, "targets": ["test"]},

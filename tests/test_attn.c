@@ -14,6 +14,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include "test_gpu.h"
 
 static uint64_t rs = 12345;
 static double urand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (double)(rs >> 11) * 0x1.0p-53; }
@@ -423,7 +424,7 @@ static int test_block_mx(int bits, int core, double tol) {   /* bits: the linear
 }
 
 int main(void) {
-    if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_attn", "nn_init(0) failed");
     int bad = 0;
     uint64_t rs0 = rs;
     for (int core = 0; core < 2; core++) {   /* fp32 CUDA-core attention, fp16 tensor-core attention */

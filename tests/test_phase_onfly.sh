@@ -7,6 +7,22 @@
 # Usage: test_phase_onfly.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
 . "$(dirname "$(readlink -f "$0")")/det_cmp.sh"
+. "$(dirname "$(readlink -f "$0")")/fm_tol.sh"
+B=${B:-$(dirname "$(readlink -f "$1")")}   # (fm_strict reads $B/strict_math; the suite exports B, by hand: the ufsm binary's dir)
+# GPU pair rule vs phase-raster (host band.c): byte-identical under UFSM_STRICT_MATH; under the default fast math (nn_band.cu: FMA,
+# approximate sqrt / division in f = da / (da + db)) a voxel near a rounding or angle-test boundary may move by a code or flip
+# known / unknown. phase-onfly has no tolerance knob (exit 1 on any differing voxel), so the bound is applied here to its per-window
+# "N differing" counts: at most 1e-3 of the windows' voxels (P^3 each). onfly_run LOG P WINDOWS -- ARGS...
+onfly_run() {
+  local log=$1 p=$2 w=$3; shift 4
+  if "$U" phase-onfly "$@" > "$log" 2>&1; then return 0; fi
+  fm_strict && return 1
+  grep -q 'differing voxels: FAIL' "$log" || return 1   # (any other failure)
+  local nd; nd=$(sed -nE 's/.* ([0-9]+) differing voxels: FAIL.*/\1/p' "$log" | tail -1)
+  awk -v d="$nd" -v n="$((p * p * p * w))" 'BEGIN {printf "fast math: %d of <= %d voxels differ (allowed 1e-3)\n", d, n; exit !(d <= 1e-3 * n)}' >> "$log"
+}
+# det_cmp under strict math; else the device inputs and losses only (the batch hash covers the phase plane, stored on the CPU vs on
+# the fly on the GPU, which may differ on a few voxels, see above)
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 "$MF" fx 256 2 > fx.log 2>&1
@@ -16,9 +32,9 @@ R=24   # (phase-raster --radius native voxels; --gs 2: rmax 12 codes voxels)
 "$U" phase-onfly fx/band 1 --rmax 12 --ref ph 4.8 --windows 4 --P 100 --budget-mb 64 --threads 4 > cpus.log 2>&1 || { echo "FAIL: CPU onfly, small tiles ($D/cpus.log)"; exit 1; }
 grep -q 'byte-identical' cpu.log || { echo "FAIL: no byte-identical line"; exit 1; }
 if nvidia-smi -L > /dev/null 2>&1; then
-  "$U" phase-onfly fx/band 1 --rmax 12 --ref ph 4.8 --windows 4 --P 100 --gpu 0 --budget-mb 64 --threads 4 > gpu.log 2>&1 || { echo "FAIL: GPU onfly differs ($D/gpu.log)"; tail -3 gpu.log; exit 1; }
+  onfly_run gpu.log 100 4 -- fx/band 1 --rmax 12 --ref ph 4.8 --windows 4 --P 100 --gpu 0 --budget-mb 64 --threads 4 || { echo "FAIL: GPU onfly differs ($D/gpu.log)"; tail -3 gpu.log; exit 1; }
   grep -qE ' ([1-9][0-9]*) of \1 tiles decoded on the GPU' gpu.log || { echo "FAIL: not every tile's codes decoded on the GPU ($D/gpu.log)"; tail -1 gpu.log; exit 1; }
-  UFSM_ONFLY_CPU_DECODE=1 "$U" phase-onfly fx/band 1 --rmax 12 --ref ph 4.8 --windows 4 --P 100 --gpu 0 --budget-mb 64 --threads 4 > gpuc.log 2>&1 || { echo "FAIL: GPU pair rule on CPU-decoded codes differs ($D/gpuc.log)"; exit 1; }
+  UFSM_ONFLY_CPU_DECODE=1 onfly_run gpuc.log 100 4 -- fx/band 1 --rmax 12 --ref ph 4.8 --windows 4 --P 100 --gpu 0 --budget-mb 64 --threads 4 || { echo "FAIL: GPU pair rule on CPU-decoded codes differs ($D/gpuc.log)"; exit 1; }
 fi
 # fused sets (sources "onfly": {"sets": [...], "tol"}): two phases of the codes (radius 24 and 8: on this fixture they agree, so every
 # voxel takes the circular-mean path) fused by phase-fuse vs on the fly, CPU and GPU (the conflicts: PHerc0139 A + B in DESIGN.md)
@@ -26,12 +42,12 @@ fi
 "$U" phase-fuse fu 4.8 ph 4.8 ph8 4.8 --tol 0.05 --shard 128 > fu.log 2>&1 || { echo "FAIL: phase-fuse ($D/fu.log)"; exit 1; }
 grep -qE 'fused [1-9]' fu.log || { echo "FAIL: no fused voxels ($D/fu.log)"; exit 1; }
 for g in -1 0; do [ $g = 0 ] && ! nvidia-smi -L > /dev/null 2>&1 && continue
-  "$U" phase-onfly fx/band 1 --rmax 12 --fuse fx/band 1 --fuse-rmax 4 --tol 0.05 --ref fu 4.8 --windows 4 --P 100 --gpu $g --budget-mb 64 --threads 4 > fu$g.log 2>&1 || { echo "FAIL: fused onfly differs (GPU $g, $D/fu$g.log)"; tail -2 fu$g.log; exit 1; }
+  onfly_run fu$g.log 100 4 -- fx/band 1 --rmax 12 --fuse fx/band 1 --fuse-rmax 4 --tol 0.05 --ref fu 4.8 --windows 4 --P 100 --gpu $g --budget-mb 64 --threads 4 || { echo "FAIL: fused onfly differs (GPU $g, $D/fu$g.log)"; tail -2 fu$g.log; exit 1; }
 done
 # the codes pooled 2x on read ("pool2": 1, codes_pool2_open) == phase-raster --gs 4 (the pair rule on the 2x-pooled codes), CPU and GPU
 "$U" phase-raster fx/band 1 pg4 --axis fx/axis.json --gs 4 --pair 1 --radius 48 --threads 4 --block 64 > pg4.log 2>&1 || { echo "FAIL: phase-raster --gs 4 ($D/pg4.log)"; exit 1; }
 for g in -1 0; do [ $g = 0 ] && ! nvidia-smi -L > /dev/null 2>&1 && continue
-  "$U" phase-onfly fx/band 1 --pool2 1 --rmax 12 --ref pg4 9.6 --windows 4 --P 48 --gpu $g --budget-mb 64 --threads 4 > p2$g.log 2>&1 || { echo "FAIL: pooled onfly differs from --gs 4 (GPU $g, $D/p2$g.log)"; tail -2 p2$g.log; exit 1; }
+  onfly_run p2$g.log 48 4 -- fx/band 1 --pool2 1 --rmax 12 --ref pg4 9.6 --windows 4 --P 48 --gpu $g --budget-mb 64 --threads 4 || { echo "FAIL: pooled onfly differs from --gs 4 (GPU $g, $D/p2$g.log)"; tail -2 p2$g.log; exit 1; }
   # (GPU: the pooled view's tiles decoded and pooled on the device, codes_pool.h / k_codes_pool2; before 2026-11-12 on the CPU)
   [ $g = 0 ] && ! grep -qE ' ([1-9][0-9]*) of \1 tiles decoded on the GPU' p2$g.log && { echo "FAIL: pooled onfly tiles not all decoded on the GPU ($D/p2$g.log)"; exit 1; }
 done
@@ -39,7 +55,7 @@ done
 # split every pooled and unpooled tile into several slabs (each slab's chunks and blob range uploaded alone); the same bytes, all on the GPU
 if nvidia-smi -L > /dev/null 2>&1; then
   for k in ph:4.8:0:100 pg4:9.6:1:48; do IFS=: read r um p2 pp <<< "$k"
-    UFSM_BAND_SLAB_MB=1 UFSM_BAND_BLOB_MB=3 "$U" phase-onfly fx/band 1 --pool2 $p2 --rmax 12 --ref $r $um --windows 4 --P $pp --gpu 0 --budget-mb 64 --threads 4 > sl$p2.log 2>&1 \
+    UFSM_BAND_SLAB_MB=1 UFSM_BAND_BLOB_MB=3 onfly_run sl$p2.log $pp 4 -- fx/band 1 --pool2 $p2 --rmax 12 --ref $r $um --windows 4 --P $pp --gpu 0 --budget-mb 64 --threads 4 \
       || { echo "FAIL: slabbed device decode differs (pool2 $p2, $D/sl$p2.log)"; tail -2 sl$p2.log; exit 1; }
     grep -qE ' ([1-9][0-9]*) of \1 tiles decoded on the GPU' sl$p2.log || { echo "FAIL: slabbed tiles not all on the GPU (pool2 $p2, $D/sl$p2.log)"; tail -1 sl$p2.log; exit 1; }
   done
@@ -60,9 +76,9 @@ UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 "$U" train stored.json --out st "${C[@]}" > s
 UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 "$U" train onfly.json --out of "${C[@]}" > of.log 2>&1 || { echo "FAIL: onfly run ($D/of.log)"; exit 1; }
 grep -q 'on-the-fly phase on GPU 0' of.log || { echo "FAIL: no onfly config line ($D/of.log)"; exit 1; }
 for f in st of; do grep '^step' $f.log | sed -E 's/ [0-9.]+ samp\/s.*//' > $f.txt; done
-[ -s st.txt ] && det_cmp st.log of.log "stored vs onfly phase" || exit 1
+[ -s st.txt ] && fm_det_cmp st.log of.log "stored vs onfly phase" || exit 1
 # --onfly-gpu A,B (2026-11-14): the pair-rule contexts spread over two devices, taken round robin (here both on GPU 0): the same batches
 UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 "$U" train onfly.json --out o2 "${C[@]}" --onfly-gpu 0,0 --onfly-slots 2 > o2.log 2>&1 || { echo "FAIL: two-device onfly run ($D/o2.log)"; exit 1; }
 grep -q 'on-the-fly phase on GPUs 0 and 0, 2 slots' o2.log || { echo "FAIL: no two-device onfly config line ($D/o2.log)"; exit 1; }
-det_cmp st.log o2.log "stored vs onfly phase on two device slots" || exit 1
-echo "PASS: onfly phase byte-identical to phase-raster (CPU$( [ -f gpu.log ] && echo ', GPU')), training on it the same batches ($DET_CMP_N) and device inputs, losses within 2% ($(wc -l < st.txt) steps)"
+fm_det_cmp st.log o2.log "stored vs onfly phase on two device slots" || exit 1
+echo "PASS: onfly phase byte-identical to phase-raster (CPU$( [ -f gpu.log ] && echo ', GPU'); GPU within the fast-math bound unless strict), training on it the same batches ($DET_CMP_N) and device inputs, losses within 2% ($(wc -l < st.txt) steps)"

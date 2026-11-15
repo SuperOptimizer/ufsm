@@ -83,6 +83,11 @@ int render_wraps_chunked(struct z3 *const *vz, int nv, const int *depth, int ns,
    equal distance both sides papyrus: prefer > 0 the +normal side, < 0 the -normal side, 0 the larger CT. n = 0: no search, only the
    flags. The CT is volume 1 (nv must be 2). flag[s] (ow x oh, sheet s) gets the codes below; the caller sets it to RFILL_NONE.
    vgrid[s] (w x h, or vgrid nullptr): nonzero at vertices tifxyz_fill_holes interpolated; pixels with such a corner get + RFILL_GRID. */
+/* the surface vertices (grids s, inside crop) whose sample falls in a shard (or unsharded chunk) missing from volume v's store, or
+   outside the array: those read as 0 ("no ink" for the ink volume). absent[v] of *total, nshards[v] distinct absent shards; render_wraps_*
+   print it. 0 ok, -1 a store error (counts partial) */
+int render_absent_count(struct z3 *const *vz, int nv, int ns, const float *const *X, const float *const *Y, const float *const *Z, int w, int h,
+                        double gs, const int *crop, size_t absent[2], size_t nshards[2], size_t *total);
 enum { RFILL_ON = 0, RFILL_NEG = 50, RFILL_GRID = 100, RFILL_INPAINT = 250, RFILL_NONE = 254, RFILL_EMPTY = 255 };   /* +k: k (1..49); -k: 50 + k */
 typedef struct { int n, thr, prefer; uint8_t *const *flag; const uint8_t *const *vgrid; } render_fill;
 void render_set_gpu(int on);        /* the chunk-ordered renderer on the GPU (src/nn_render.cu; same bytes, CPU on any device error) */

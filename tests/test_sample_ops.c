@@ -1,6 +1,7 @@
 /* The sampler's fast kernels against the straightforward loops they replaced (chamfer distance, the input writer)
    and a moment check of the table-based Gaussian noise. Includes sample.c to reach its static functions. */
 #include "../src/sample.c"
+#include "fm_tol.h"
 void *nn_host_alloc(size_t n) { return malloc(n); }
 void nn_host_free(void *p) { free(p); }
 /* the raster-order 3-4-5 chamfer the row-wise passes replaced (master 51125cd) */
@@ -106,7 +107,8 @@ int main(void) {
                 sym y = sym_of(si); rng r1 = r, r2 = r;
                 write_x_aug(ct, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.02f, &r1, nrow, fmt, A, HA, &ap, ns1, ns1 + P, nullptr, nullptr);
                 write_x(ct, P, P, o, 101.5f, (float)(1.0 / 37.25), 1, cyf, cxf, y, 1, 1.1f, -0.05f, 0.02f, &r2, nrow, fmt, B, HB, &ap, ns2, ns2 + P, 0);
-                ndiff += fmt ? (size_t)(memcmp(HA, HB, 4 * p3 * 2) != 0) : (size_t)(memcmp(A, B, 4 * p3 * 4) != 0);
+                /* bit-identical under UFSM_STRICT_MATH; fast math (two code paths): fp32 rel 1e-6 (~8 ulp), fp16 +-1 ulp (tests/fm_tol.h) */
+                ndiff += fmt ? (size_t)fm_cmp_h16a("write_x vs write_x_aug fp16", HA, HB, 4 * p3, 1, 1e-4) : (size_t)fm_cmp_f32("write_x vs write_x_aug fp32", A, B, 4 * p3, 1e-6, 1e-4);
             }
         }
         printf("CT appearance plan, row-vectorised writer vs write_x_aug: %zu of %d plans x 48 symmetries x 2 formats differ\n", ndiff, plans);
@@ -130,7 +132,7 @@ int main(void) {
                 for (int d=0;d<3;d++) world[y.perm[d]]=o[y.perm[d]]+(y.flip[d]?P-1-out[d]:out[d]);
                 float expected=(sheet_reference(&sheet,world)-sheet.center)/sheet.scale;
                 size_t k=p3+((size_t)z*P+yy)*P+x; _Float16 h; memcpy(&h,half+k,2);
-                if (fabs(input[k]-expected)>1e-6 || fabs((float)h-expected)>2e-4) bad++;
+                if (fabs(input[k]-expected)>(FM_STRICT?1e-6:1e-5) || fabs((float)h-expected)>2e-4) bad++;   /* fast math: /scale is *(1/scale), 1e-5 */
             }
             checked++;
         }

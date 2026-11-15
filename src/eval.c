@@ -3,6 +3,7 @@
    recall, F1 and Dice at several thresholds, plus band-tolerant recall/precision (a predicted voxel within
    `tol` voxels of a labelled surface voxel counts, and vice versa) which forgives sub-voxel offsets. */
 #include "sources.h"
+#include "optcheck.h"
 #include "store.h"
 #include "zarr3.h"
 #include <math.h>
@@ -11,7 +12,7 @@
 #include <string.h>
 
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 
@@ -174,9 +175,9 @@ int cmd_eval(int argc, char **argv) {
         return 2;
     }
     const char *proot = argv[2], *pkey = argv[3], *lroot = argv[4], *lkey = argv[5];
-    double um = atof(opt(argc, argv, "--um", "0"));
-    int level = atoi(opt(argc, argv, "--level", "0")), tol = atoi(opt(argc, argv, "--tol", "2"));
-    int core = atoi(opt(argc, argv, "--seam-core", "0")), band = atoi(opt(argc, argv, "--seam-band", "16"));
+    double um = opt_atof("--um", opt(argc, argv, "--um", "0"));
+    int level = opt_atoi("--level", opt(argc, argv, "--level", "0")), tol = opt_atoi("--tol", opt(argc, argv, "--tol", "2"));
+    int core = opt_atoi("--seam-core", opt(argc, argv, "--seam-core", "0")), band = opt_atoi("--seam-band", opt(argc, argv, "--seam-band", "16"));
     if (core < 0 || (core && (band < 1 || band > core / 2)) || tol < 0 || tol > 32 || level < 0 || level > 20) { fprintf(stderr, "invalid evaluation levels, tolerance or seam geometry\n"); return 2; }
     if (um <= 0) { fprintf(stderr, "--um required\n"); return 2; }
     store *ps = store_open(proot), *ls = store_open(lroot);

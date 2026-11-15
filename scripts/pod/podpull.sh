@@ -1,7 +1,7 @@
 #!/bin/bash
 # podpull.sh (desk; env PODH=root@HOST PODPORT PODKEY): a pod's unroll queue (scripts/pod/q.sh) -> desk, as each scroll's stripimg lands (user: "send scroll renders as they land"): renders first
 # (overview.jpg, strip_long.jpg, one ct + ink stripe; temp name + rename), then the small rows (progress.log, wrapcheck.tsv, state, tsvs);
-# never wraps / fields. One line per event -> sched/podq.log
+# + logs/ and the ref / joined json; never wraps / fields. One line per event -> sched/podq.log
 H=${PODH:?PODH=root@HOST}; SSH="ssh -p ${PODPORT:-22} -i ${PODKEY:-$HOME/.ssh/id_ed25519} -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30"
 SD=/vesuvius/ufsm/unroll/sched; L=$SD/podq.log; RU=/root/pod/unroll
 get() { local src=$1 dst=$2; mkdir -p "$(dirname $dst)"; rsync -a -e "$SSH" "$H:$src" "$dst.part" 2>/dev/null && mv -f "$dst.part" "$dst"; }
@@ -17,6 +17,10 @@ while :; do
     get $R/overview.jpg $I/overview.jpg
     get $RU/$S/progress.log $D/progress.log; get $RU/$S/wrapcheck.tsv $D/wrapcheck.tsv; get $RU/$S/slabs.progress $D/slabs.progress
     get $RU/$S/box.txt $D/box.txt; get $RU/$S/axis.json $D/axis.json; rsync -a -e "$SSH" $H:$RU/$S/state/ $D/state/ 2>/dev/null
+    # the logs and the small models (audit 2026-11-14: without them a run's direction / trim / join decisions cannot be checked later):
+    # logs/ (text), the ref's and the joined set's json (dir, gauges; the arrays stay on the pod), trim.pap, slabs.txt
+    rsync -a -e "$SSH" --exclude='*.tmp' $H:$RU/$S/logs/ $D/logs/ 2>/dev/null
+    for f in ref-cf/model.json joined/set.json joined/global/model.json trim.pap slabs.txt; do get $RU/$S/$f $D/$f; done
     m=$(grep -h "strip-mosaic:" $D/progress.log | tail -1 | sed -E 's/.*strip-mosaic: ([0-9]+ stripes), length ([0-9.]+ cm), valid ([0-9.]+ cm2), on papyrus[^0-9]*\) ([0-9.]+).*/\1, \2, \3, pap \4/')
     w=$(grep -h "wrap-check: verdicts" $D/progress.log | tail -1 | sed 's/.*verdicts: //')
     t=$(grep -h "finished:" $D/progress.log | tail -1 | grep -oE "fields [0-9]+ s wall|slabs [0-9]+ s wall" | tr '\n' ' ')

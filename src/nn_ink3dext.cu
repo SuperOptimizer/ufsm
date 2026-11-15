@@ -47,12 +47,13 @@ extern "C" void i3_pool2(const float *in, int B, int N, float *out) {
    prod over axes exp(-(i - O / 2)^2 / (2 sigma^2)); O = 64 (gambiarra): sigma 8 */
 enum { I3_OMAX = 256 };
 __constant__ float c_g1[I3_OMAX];
-static int g_g1_O = 0;
+static int g_g1_O[32];   /* mgpu: per-device (c_g1 lives in each context: the O uploaded to device d; one host thread per device) */
 static void g1_init(int O) {
-    if (g_g1_O == O) return;
+    int dv = 0; cudaGetDevice(&dv); dv &= 31;
+    if (g_g1_O[dv] == O) return;
     float g[I3_OMAX]; const double sg = O / 8.0;
     for (int i = 0; i < O; i++) g[i] = (float)exp(-0.5 * (double)(i - O / 2) * (i - O / 2) / (sg * sg));
-    cudaMemcpyToSymbol(c_g1, g, sizeof(float) * O); g_g1_O = O;
+    cudaMemcpyToSymbol(c_g1, g, sizeof(float) * O); g_g1_O[dv] = O;
 }
 __global__ void k_i3_blend(float *acc, float *wsum, int R, int TY, int TX, const float *logits, const int *org, int B, int z0, int z1, int O) {
     const size_t total = (size_t)B * O * O * O;

@@ -10,7 +10,8 @@
 #      stage 0 / glibc link driver and the llvm-release fallback preset.
 #   3. clone or fast-forward ufsm ($BRANCH, default master) into $POD/ufsm, then build it.
 #      CMake (cmake/llvm.cmake) finds the newest clang and /usr/local/cuda-* by itself: cmake --preset release (arch86 for
-#      sm_80/86/89 GPUs: software MX, since the fp4 / fp8 kernels need sm_120a), cmake --build -j <cgroup CPUs>.
+#      non-12.x GPUs: software MX, since the fp4 / fp8 kernels need sm_120a), cmake --build -j <cgroup CPUs>. Always on the pod:
+#      builds are native (-march=native, SASS for the pod's GPU only), so a desk binary does not run there.
 #   4. smoke test: ufsm sysinfo, test_sysinfo (cgroup parsing), test_mx_sw (GPU kernels).
 #   5. checkpoints from the public mirror, resumable, size-checked: wind96-wk1-best (fit fields) and ift3-24000 (ink) -> $POD/ckpt.
 #   6. SCROLL given: its CT from the mirror. `ufsm mirror` copies shard files resumably, about 40 MB/s on a pod; desk -> pod
@@ -20,7 +21,7 @@
 #      otherwise made on the pod (scanprep --box-out), the axis by unroll (`ufsm axis`), the ink by unroll.
 #      Writes $POD/scrolls/<S>.env for scripts/pod/unroll.sh.
 # Env: POD (default /root/pod as root, else ~/pod), BRANCH (master), REPO (https://github.com/SuperOptimizer/ufsm), MIRROR,
-#   NOAPT=1 (skip apt), NOBUILD=1, NOSMOKE=1, LEVELS ("L ..." override), MTH (mirror threads, 12; the mirror answers 429 past 64
+#   NOAPT=1 (skip apt), NOBUILD=1 (reuse the binary if built on this machine), FOREIGN_BINARY=1 (reuse it anyway), NOSMOKE=1, LEVELS ("L ..." override), MTH (mirror threads, 12; the mirror answers 429 past 64
 #   requests in flight per IP), ARCH (auto). Log: $POD/setup.log.
 set -uo pipefail
 S=${1:-}
@@ -95,7 +96,7 @@ say "ufsm $(git -C $POD/ufsm log --oneline -1)"
 CUDAP=$(ls -d /usr/local/cuda/bin /usr/local/cuda-*/bin 2>/dev/null | sort -V | tail -1); [ -n "$CUDAP" ] && export PATH=$PATH:$CUDAP
 if [ -z "${ARCH:-}" ]; then
   cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')
-  case "$cc" in 8*) ARCH=86;; *) ARCH=120;; esac
+  case "$cc" in 12*|'') ARCH=120;; *) ARCH=86;; esac   # (lp_* need the 12.x block-scaled MMA; others: software MX)
 fi
 BD=build; PRESET=release; [ "$ARCH" = 86 ] && BD=build86 && PRESET=arch86 && U=$POD/ufsm/build86/ufsm
 # the toolchain: microc (mcc + mcudahw) at cmake/mcc.version into ~/.local/mcc (cmake/mcc.cmake finds it there). Stage 0 and mcc's
@@ -108,6 +109,12 @@ fi
 if [ "${NOBUILD:-0}" != 1 ]; then
   say "mcc $(cat $POD/ufsm/cmake/mcc.version)"
   bash $POD/ufsm/scripts/toolchain/install_mcc.sh > $POD/mcc.log 2>&1 || { tail -20 $POD/mcc.log; die "install_mcc (log $POD/mcc.log)"; }
+fi
+# Native builds (2026-11-14: -march=native, SASS for this GPU only): a binary runs only where it was built. NOBUILD=1 reuses one
+# only when its build dir's native_id (cmake/native_id.sh at configure) matches this machine; FOREIGN_BINARY=1 is the explicit
+# override for a binary or objects built elsewhere (e.g. compiled on the desk), at the user's risk (SIGILL / no kernel image).
+if [ "${NOBUILD:-0}" = 1 ] && [ "${FOREIGN_BINARY:-0}" != 1 ] && [ "$(cat $POD/ufsm/$BD/native_id 2>/dev/null)" != "$(sh $POD/ufsm/cmake/native_id.sh)" ]; then
+  say "NOBUILD=1 but $BD was not built on this machine (native_id differs): building (FOREIGN_BINARY=1 overrides)"; NOBUILD=0
 fi
 if [ "${NOBUILD:-0}" != 1 ]; then
   say "cmake --preset $PRESET, ninja -j$NCPU"
@@ -127,7 +134,7 @@ fi
 # --- 4. smoke test ---
 if [ "${NOSMOKE:-0}" != 1 ] && [ ! -e $POD/state/smoke.$(git -C $POD/ufsm rev-parse --short HEAD) ]; then
   ( cd $POD/ufsm && cmake --build $BD -j$NCPU --target test_sysinfo test_mx_sw >> $POD/build.log 2>&1 &&
-    ./$BD/test_sysinfo && ./$BD/test_mx_sw > $POD/smoke.log 2>&1 ) || { tail -20 $POD/smoke.log 2>/dev/null; die "smoke test"; }
+    timeout -k 10 120 ./$BD/test_sysinfo && flock -w 1800 /root/gpu.lock timeout -k 10 600 ./$BD/test_mx_sw > $POD/smoke.log 2>&1 )   # (GPU lock + timeout: a hang no longer blocks setup forever; mini audit podscripts #2) || { tail -20 $POD/smoke.log 2>/dev/null; die "smoke test"; }
   touch $POD/state/smoke.$(git -C $POD/ufsm rev-parse --short HEAD); say "smoke test passed"
 fi
 

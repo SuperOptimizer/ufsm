@@ -254,9 +254,13 @@ __global__ void k_v8_wprep(const float *__restrict__ w, int co, int T, int ci, i
 template <int MODE, int BN, int WM, int WN, bool F8> static void v8_go(const V8P &p, bool ts) {
     const dim3 g((unsigned)((p.M + 127) / 128), (unsigned)((p.N + BN - 1) / BN));
     constexpr int SM = v8_smem<F8, BN>();
-    static bool set = false;
-    if (!set) { cudaFuncSetAttribute(vtf8_igemm<MODE, BN, WM, WN, true, F8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM);
-                cudaFuncSetAttribute(vtf8_igemm<MODE, BN, WM, WN, false, F8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM); set = true; }
+    static unsigned set = 0u;   /* mgpu: per-device (a bit per device: the attribute is per context; set first, then the bit, atomically) */
+    int dv = 0; cudaGetDevice(&dv);
+    if (!(__atomic_load_n(&set, __ATOMIC_ACQUIRE) >> (dv & 31) & 1u)) {
+        cudaFuncSetAttribute(vtf8_igemm<MODE, BN, WM, WN, true, F8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM);
+        cudaFuncSetAttribute(vtf8_igemm<MODE, BN, WM, WN, false, F8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM);
+        __atomic_fetch_or(&set, 1u << (dv & 31), __ATOMIC_RELEASE);
+    }
     if (ts) vtf8_igemm<MODE, BN, WM, WN, true, F8><<<g, 256, SM>>>(p); else vtf8_igemm<MODE, BN, WM, WN, false, F8><<<g, 256, SM>>>(p);
 }
 template <int MODE, bool F8> static void v8_launch(const V8P &p, int bt, bool ts) {

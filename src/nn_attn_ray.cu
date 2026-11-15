@@ -50,6 +50,20 @@ extern "C" void at_rays_plan(int n, int D, int Hh, int W, float mult, const floa
         ad_h[b] = ad;
         float *rb = ray_h + (size_t)b * Q * AT_RAY_F; int *lb = lens_h + (size_t)b * Q; float *cb = cen_h + (size_t)b * P * 4;
         memset(cb, 0, (size_t)P * 4 * sizeof *cb);
+        /* UFSM_SCROLL_PE_V2=1 (audit attn 11-14 #4 / #5; a net must be trained with it: it changes the positions): ONE reference angle and ONE radius per sample for all
+           planes, so a token at the same physical angle gets the same arc in every plane (v1: per-plane rc x absolute theta = up to ~1 voxel of spurious relative
+           arc, and inside / outside planes use different angle origins: arc jumps of 2 pi rc between adjacent planes) */
+        static int v2 = -1; if (v2 < 0) { const char *e = getenv("UFSM_SCROLL_PE_V2"); v2 = e && atoi(e) > 0; }   /* mgpu: env */
+        double rcr = 0, phir = 0;
+        if (v2 && valid) {
+            double sx = 0, sy = 0, sr = 0; int nk = 0;
+            for (int k = 0; k < Np; k++) {
+                const double cu = a[2 + 2 * k], cv = a[3 + 2 * k], mu = 0.5 * (Nu - 1), mv = 0.5 * (Nv - 1);
+                sx += mu - cu; sy += mv - cv; sr += hypot(mu - cu, mv - cv); nk++;
+            }
+            rcr = sr / nk; if (rcr < 0.5 * (Nu > Nv ? Nu : Nv)) rcr = 0.5 * (Nu > Nv ? Nu : Nv);
+            phir = hypot(sx, sy) > 0.25 * nk ? atan2(sy, sx) : 0.0;
+        }
         for (int k = 0; k < P; k++) for (int j = 0; j < Nt; j++) {
             float *rr = rb + ((size_t)k * Nt + j) * AT_RAY_F;
             memset(rr, 0, AT_RAY_F * sizeof *rr); rr[7] = (float)k;
@@ -62,8 +76,10 @@ extern "C" void at_rays_plan(int n, int D, int Hh, int W, float mult, const floa
             const int inside = cu >= -0.5 && cu <= Nu - 0.5 && cv >= -0.5 && cv <= Nv - 0.5;
             double rc = hypot(mu - cu, mv - cv); if (rc < 0.5 * (Nu > Nv ? Nu : Nv)) rc = 0.5 * (Nu > Nv ? Nu : Nv);
             double phim = 0, th0 = -M_PI, th1 = M_PI;
+            if (v2) { rc = rcr; phim = phir; th0 = phir - M_PI; th1 = phir + M_PI; }
             if (!inside) {
-                phim = atan2(mv - cv, mu - cu); th0 = 1e300; th1 = -1e300;
+                if (!v2) phim = atan2(mv - cv, mu - cu);
+                th0 = 1e300; th1 = -1e300;
                 for (int q = 0; q < 4; q++) {
                     const double qu = q & 1 ? Nu - 0.5 : -0.5, qv = q & 2 ? Nv - 0.5 : -0.5;
                     const double dl = remainder(atan2(qv - cv, qu - cu) - phim, 2 * M_PI);
@@ -157,13 +173,13 @@ extern "C" void at_ray_scatter(const at_rays *R, const float *y, float *x, int C
     else k_ray_scatter<0><<<nbk(Tr * C4, 256), 256>>>(G, R->ray, R->ad, R->wsum, Tr, C4, y, x);
 }
 
-__global__ void k_scroll_pos(long long n, int S, int nreg, int D, int Hh, int W, int P, const int *ad, const float *cen, float *pos) {
+__global__ void k_scroll_pos(long long n, long long S, int nreg, int D, int Hh, int W, int P, const int *ad, const float *cen, float *pos) {
     const long long t = blockIdx.x * (long long)blockDim.x + threadIdx.x;
     if (t >= n) return;
-    const int b = (int)(t / S), ts = (int)(t % S) - nreg;
+    const int b = (int)(t / S); const long long ts = t % S - nreg;   /* (long long: a grid of 2^31 samples or more; audit mini/overflow #3) */
     float *p = pos + 3 * t;
     if (ts < 0) { p[0] = p[1] = p[2] = 0.f; return; }
-    const int z = ts / (Hh * W), y = (ts / W) % Hh, x = ts % W, a_ = ad[b];
+    const int z = (int)(ts / ((long long)Hh * W)), y = (int)(ts / W % Hh), x = (int)(ts % W), a_ = ad[b];
     const int k = a_ == 0 ? z : a_ == 1 ? y : x, ua = a_ == 0 ? y : z, vb = a_ == 2 ? y : x;
     const float *c = cen + ((size_t)b * P + k) * 4;
     if (c[2] < 0.f) { p[0] = (float)vb; p[1] = (float)ua; p[2] = (float)k; return; }
@@ -172,6 +188,6 @@ __global__ void k_scroll_pos(long long n, int S, int nreg, int D, int Hh, int W,
     p[0] = sqrtf(du * du + dv * dv); p[1] = th * c[2]; p[2] = (float)k;
 }
 extern "C" void at_scroll_pos(int n, int nreg, int D, int Hh, int W, const int *ad, const float *cen, float *pos) {
-    const int S = nreg + D * Hh * W; const long long N = (long long)n * S;
+    const long long S = nreg + (long long)D * Hh * W, N = (long long)n * S;
     k_scroll_pos<<<nbk(N, 256), 256>>>(N, S, nreg, D, Hh, W, imax3(D, Hh, W), ad, cen, pos);
 }

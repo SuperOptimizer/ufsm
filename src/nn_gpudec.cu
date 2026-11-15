@@ -1,6 +1,6 @@
 /* volcomp lossy substream decoding on the GPU (src/gpudec.h), byte-identical to vf_decode_sub / volcomp_fast.h.
  *
- * Built without fast math and with FMA contraction off (CMakeLists.txt UFSM_STRICT_UNITS): the dequantisation and the inverse DCT round every float operation as
+ * Built without fast math and with FMA contraction off (CMakeLists.txt UFSM_STRICT_UNITS, under UFSM_STRICT_MATH=ON; fast math by default): the dequantisation and the inverse DCT round every float operation as
  * the CPU does (gcc -std=c23 contracts nothing), in the reference's order. Two kernels per batch:
  *   k_entropy: one thread per substream. The two tANS lanes (DC and level tokens lane 0, run tokens and the EOB lane 1, as
  *     volcomp_fast.h) and the bypass bit stream, with every check of the reference; it writes per block the DC and the AC
@@ -45,7 +45,9 @@ __device__ __forceinline__ bool gbr_get(gbr &r, uint32_t n, uint32_t &v) {
     if (r.off >= 32u) { r.off -= 32u; r.lo = r.hi; r.hi = r.nxt; r.nxt = __ldg(r.w++); }
     return true;
 }
-/* all bytes consumed (fewer than 8 bits left) and the bits left are zero */
+/* all bytes consumed (fewer than 8 bits left) and the bits left are zero. Stricter than the CPU's vf_br_finished, which also accepts
+   trailing zero bytes: such a stream fails here (status 0) and gd_decode redoes it on the CPU (state 2), so the CPU stays the reference
+   and the divergence costs speed only (audit mini/volcomp 3). */
 __device__ __forceinline__ bool gbr_finished(const gbr &r) {
     return r.left < 8u && (__funnelshift_r(r.lo, r.hi, r.off) & ((1u << r.left) - 1u)) == 0;
 }
@@ -259,6 +261,7 @@ static int launch_batch(gd_slot *S) {
     GD_CK(cudaEventRecord(S->ev, S->st));
     return 0;
 fail:
+    cudaStreamSynchronize(S->st); cudaGetLastError();   /* (the copies queued before the failure still read / write h_in, h_out, h_status: done before the slot is released) */
     return -1;
 }
 
@@ -329,6 +332,10 @@ static void *completer(void *arg) {
     return nullptr;
 }
 
+static void gd_broken_atexit(void) {   /* the run's end summary: a device failure switched every later request to the CPU (audit mini/volcomp 6) */
+    if (G.broken) fprintf(stderr, "gpudec: WARNING the GPU decoder failed during this run; the requests after the failure were decoded on the CPU "
+                                  "(output correct, decode slower; %llu substreams were decoded on the GPU before)\n", (unsigned long long)G.n_subs);
+}
 static void gd_stats_atexit(void) {
     fprintf(stderr, "gpudec: %llu substreams on the GPU in %llu batches (%.0f / batch), %llu requests redone on the CPU, GPU round trips %.2f s\n",
             (unsigned long long)G.n_subs, (unsigned long long)G.n_batches, G.n_batches ? (double)G.n_subs / G.n_batches : 0.0, (unsigned long long)G.n_redo, G.gpu_s);
@@ -349,6 +356,8 @@ static void gd_init(void) {
     G.flight = fl && atoi(fl) > 0 ? (atoi(fl) < NSLOT - 1 ? atoi(fl) : NSLOT - 1) : 2;
     G.in_cap = (size_t)G.max_items * 40000 + ((size_t)16 << 20);   /* q 2 substreams are ~10-20 KB */
     G.rec_cap = (size_t)G.max_items * 49152 + ((size_t)16 << 20);   /* records (u32); a substream reserves its bound, 8 x its bypass bytes (q 2: ~5 KB) */
+    if (G.in_cap > UINT32_MAX || G.rec_cap > UINT32_MAX) {   /* tok_off / rec_off are uint32 (audit mini/volcomp 7): ~87000 items at most */
+        fprintf(stderr, "gpudec: UFSM_GPU_DECODE_ITEMS %u needs offsets over 32 bits, decoding on the CPU\n", G.max_items); return; }
     int nd = 0;
     if (cudaGetDeviceCount(&nd) != cudaSuccess || G.dev < 0 || G.dev >= nd) { cudaGetLastError(); fprintf(stderr, "gpudec: no CUDA device %d, decoding on the CPU\n", G.dev); return; }
     int prev = 0; cudaGetDevice(&prev);
@@ -375,6 +384,7 @@ static void gd_init(void) {
     cudaSetDevice(prev);
     G.open = take_free();
     G.ok = 1;
+    atexit(gd_broken_atexit);
     if (getenv("UFSM_GPU_DECODE_STATS") && strcmp(getenv("UFSM_GPU_DECODE_STATS"), "0")) atexit(gd_stats_atexit);
     return;
 fail:
@@ -486,6 +496,6 @@ extern "C" int gpudec_decode_dev(const gd_chunk *c, uint32_t mask, uint8_t *dchu
     if (!dchunk || !gpudec_enabled()) return -1;
     cudaPointerAttributes a;   /* device memory of the decoder's device only */
     if (cudaPointerGetAttributes(&a, dchunk) != cudaSuccess) { cudaGetLastError(); return -1; }
-    if (a.type != cudaMemoryTypeDevice || a.device != G.dev) return -1;
+    if (a.type != cudaMemoryTypeDevice || a.device != ufsm_dev_phys(G.dev)) return -1;   /* (attributes name the physical device) */
     return gd_decode(c, mask, nullptr, dchunk);
 }

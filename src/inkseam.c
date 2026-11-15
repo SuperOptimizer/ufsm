@@ -1,5 +1,6 @@
 /* ufsm ink-seam (see cmd_ink_seam) */
 #include "store.h"
+#include "optcheck.h"
 #include "z3w.h"
 #include "zarr3.h"
 #include <math.h>
@@ -14,7 +15,7 @@
    "jump" = border - interior (the ~30 / 9.4 / 6 numbers of the Paris 4 ink notes), "ratio" = border / interior. --block K: the interior
    planes only those at the border's phase mod K (16 = the volcomp codec block faces, whose own step is part of every 512 border). */
 static double ns_opt(int argc, char **argv, const char *k, double d) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return atof(argv[i + 1]);
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return opt_atof(k, argv[i + 1]);
     return d;
 }
 int cmd_ink_seam(int argc, char **argv) {
@@ -28,7 +29,7 @@ int cmd_ink_seam(int argc, char **argv) {
     unsigned seed = (unsigned)ns_opt(argc, argv, "--seed", 1);
     if (um <= 0 || P < 8 || P % 2) { fprintf(stderr, "ink-seam: --um > 0 and an even --period >= 8\n"); return 2; }
     char lv[256]; z3w_level_name(um, lv, sizeof lv);
-    for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], "--key")) snprintf(lv, sizeof lv, "%s", argv[i + 1]);   /* any uint8 array, e.g. a CT level "0" */
+    for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n("--key"))) snprintf(lv, sizeof lv, "%s", argv[i + 1]);   /* any uint8 array, e.g. a CT level "0" */
     store *s = store_open(in); z3 *z = s ? z3_open(s, lv, nullptr) : nullptr;
     if (!z) { fprintf(stderr, "ink-seam: cannot open %s/%s: %s\n", in, lv, z3_error()); return 1; }
     const z3_meta *m = z3_meta_of(z);

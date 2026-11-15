@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_gpu.h"
 
 static uint64_t rs = 777;
 static float frand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (float)((rs >> 11) * 0x1.0p-53 * 2 - 1); }
@@ -43,7 +44,7 @@ static void detail(const unet_cfg *cfg, const float *g4, const float *ga) {   /*
 }
 int main(void) {
     int bad = 0; const int K = getenv("TLH_K") ? atoi(getenv("TLH_K")) : 24, CO = 144;
-    if (nn_init(0)) { printf("test_lat_head: no GPU\n"); return 77; }
+    if (nn_init(0)) return test_no_gpu("test_lat_head", "nn_init(0) failed");
     nn_set_tf32(1); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1); nn_set_gn_stored(1);
     nn_set_prec(3); if (nn_set_prec_policy("all=fp4:fp4:fp4")) bad++;
     setenv("UFSM_F4_WGRAD", "1", 1);

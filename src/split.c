@@ -181,3 +181,12 @@ void split_run(split_ctx *c, void (*job)(int, void *), void *arg) {
     pthread_mutex_unlock(&c->mu);
     nn_tls_install(&c->tls);
 }
+void dp_grad_avg(float *const *g, const int *dev, int ng, size_t n, float *tmp, size_t chunk, int avg) {
+    nn_init(dev[0]);
+    for (int k = 1; k < ng; k++) for (size_t o = 0; o < n; o += chunk) {
+        const size_t c = n - o < chunk ? n - o : chunk;
+        nn_peer_copy(tmp, dev[0], g[k] + o, dev[k], c * 4); nn_axpy(g[0] + o, 1.f, tmp, c);
+    }
+    if (avg) nn_scale(g[0], 1.f / ng, n);
+    for (int k = 1; k < ng; k++) nn_peer_copy(g[k], dev[k], g[0], dev[0], n * 4);
+}

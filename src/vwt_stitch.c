@@ -11,6 +11,7 @@
    slab's half-extents) + its offset. Offsets: per neighbour pair the median over the shared points of phase_i - phase_j, robust
    (Huber 0.25 turn) least squares over the slab graph by IRLS + conjugate gradients, each component's mean offset 0. */
 #include "vwt_tile.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "json.h"
 #include "z3w.h"
@@ -24,7 +25,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static const char *sopt(int argc, char **argv, const char *k, const char *d) { for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *sopt(int argc, char **argv, const char *k, const char *d) { for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static float h2f(uint16_t u) {
     const uint32_t s = (u & 0x8000u) << 16; int e = (u >> 10) & 31; uint32_t m = u & 0x3ff, v;
     if (e == 0) { if (!m) v = s; else { e = 1; while (!(m & 0x400)) { m <<= 1; e--; } m &= 0x3ff; v = s | (uint32_t)(e + 112) << 23 | m << 13; } }
@@ -146,7 +147,7 @@ static void *map_file(const char *dir, const char *name, size_t need) {
 
 int cmd_vwt_stitch(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm vwt-stitch PASSA REF OUT [--threads 16] [--box z,y,x,nz,ny,nx]\n"); return 2; }
-    const char *pa = argv[2], *ref = argv[3], *out = argv[4]; const int nth = ufsm_threads(atoi(sopt(argc, argv, "--threads", "0")), 16);
+    const char *pa = argv[2], *ref = argv[3], *out = argv[4]; const int nth = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 16);
     char p[1400]; snprintf(p, sizeof p, "%s/tiling.bin", pa); vwt_tiling t; if (vwt_tiling_load(p, &t)) { fprintf(stderr, "vwt-stitch: cannot load %s\n", p); return 1; }
     const uint16_t *ph = map_file(pa, "phase.f16", (size_t)t.n * VWT_PH_N * 2); const float *cen = map_file(pa, "centre.f32", (size_t)t.n * 4);
     const float *pr = map_file(pa, "pairs.f32", (size_t)t.np * 2 * VWT_PAIR_PTS * 4);

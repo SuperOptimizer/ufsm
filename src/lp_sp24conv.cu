@@ -263,7 +263,7 @@ template <int MT, int TZ> static void launch_sp24(dim3 grid, const void *x, shap
     conv_fwd_sp24_k<MT, TZ, mx4_t, mx4_t><<<grid, 256, smem>>>((const mx4_t *)x, wq, ws, wm, b, (mx4_t *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp);
 }
 #endif
-static unsigned long g_sp24_calls;   /* sparse convs run (all threads; tests) */
+static unsigned long g_sp24_calls;   /* sparse convs run (all threads; tests) */   /* mgpu: guarded (__atomic add / load) */
 static int g_sp24_force = -1;   /* test hook: 1 the sparse kernel for every eligible call, 0 never, -1 by the registered weights */
 extern "C" void lp_sp24_force(int on) { g_sp24_force = on; }
 /* the convs whose forward weights carry the pattern (unet_apply_sparse24: per host thread, i.e. per GPU trainer), and the flipped copies a
@@ -282,10 +282,10 @@ static int sp24_mode_of(const float *w) {   /* the registered conv whose weights
 extern "C" void lp_sp24_note_flip(const float *w, const float *flipped, size_t n) {
     if (sp24_mode_of(w) == 3) { g_sp24_flo = flipped; g_sp24_fhi = flipped + n; } else g_sp24_flo = g_sp24_fhi = nullptr;
 }
-extern "C" unsigned long lp_sp24_calls(void) { return g_sp24_calls; }
+extern "C" unsigned long lp_sp24_calls(void) { return __atomic_load_n(&g_sp24_calls, __ATOMIC_RELAXED); }
 extern "C" unsigned lp_sp24_err(void) { unsigned h = 0; cudaMemcpyFromSymbol(&h, g_sp24_err, 4); return h; }
 extern "C" void lp_sp24_err_clear(void) { const unsigned z = 0; cudaMemcpyToSymbol(g_sp24_err, &z, 4); }
-static void sp24_report(void) { fprintf(stderr, "sparse24: %lu convs on the sparse fp4 kernel\n", g_sp24_calls); }
+static void sp24_report(void) { fprintf(stderr, "sparse24: %lu convs on the sparse fp4 kernel\n", __atomic_load_n(&g_sp24_calls, __ATOMIC_RELAXED)); }
 static int sp24_eligible(const float *w) {   /* (the flip note is one-shot: the conv_fwd_tc call right after the flip consumes it) */
     static int env = -2;   /* UFSM_SP24=0: never the sparse kernel (the dense kernels on the masked weights: the same results); UFSM_SP24_REPORT=1: the
                               count at exit */

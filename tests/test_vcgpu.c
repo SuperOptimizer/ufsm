@@ -1,6 +1,10 @@
 /* vcgpu (src/vcgpu.h): the GPU's levels (nn_vcg_shard) + vcg_encode_levels give volcomp_encode's stream byte for byte, every chunk of a
    256^3 shard (8 chunks: smooth fields with noise like a head's probabilities, sharp edges, constant blocks, a constant chunk, an all-zero
    chunk, a full-range random chunk), q 1, 2, 8, 30, 255; and a capacity below the total is flagged (the caller encodes from the bytes).
+   Fast math (the default build, DESIGN 2026-11-14): the host encoder and nn_gpuenc no longer round every quantiser product the same
+   way, so a level near a .5 boundary can come out 1 apart and the coded bytes differ. The streams are then compared by what they
+   decode to: both decode, sizes within 0.5 % + 64 B, at most 1 % of the voxels differ, and the GPU stream's mean abs error against
+   the source within 1 % (+ 0.01) of the CPU stream's. Under -DUFSM_STRICT_MATH=ON: byte for byte as before.
    Usage: test_vcgpu */
 #include "nn.h"
 #include "vcgpu.h"
@@ -9,13 +13,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "fm_tol.h"
 enum { N = 256 };
+/* the fast-math comparison above; d0 / d1 scratch chunks. 0 = agree */
+static int dec_differ(const uint8_t *src, const uint8_t *e0, size_t n0, const uint8_t *e1, size_t n1, uint8_t *d0, uint8_t *d1) {
+    const size_t cv = VOLCOMP_CHUNK_VOXELS;
+    if (volcomp_decode(e0, n0, d0, cv) != VOLCOMP_OK || volcomp_decode(e1, n1, d1, cv) != VOLCOMP_OK) return 1;
+    if ((n0 > n1 ? n0 - n1 : n1 - n0) > n0 / 200 + 64) return 1;
+    size_t nd = 0; double e0s = 0, e1s = 0;
+    for (size_t i = 0; i < cv; i++) { nd += d0[i] != d1[i]; e0s += abs((int)d0[i] - src[i]); e1s += abs((int)d1[i] - src[i]); }
+    e0s /= (double)cv; e1s /= (double)cv;
+    if (nd) printf("  decoded: %zu of %zu voxels differ, mean abs error %.4f (cpu) vs %.4f (gpu)\n", nd, cv, e0s, e1s);
+    return nd > cv / 100 || e1s > e0s * 1.01 + 0.01;
+}
 static uint64_t rs = 7;
 static double rnd(void) { rs = rs * 6364136223846793005ull + 1442695040888963407ull; return (double)(rs >> 11) * 0x1p-53; }
 int main(void) {
     nn_init(0);
     const size_t n3 = (size_t)N * N * N, cap_e = n3 / 2;   /* (q 1 on the random chunk: ~4000 levels a block) */
     uint8_t *v = malloc(n3), *ch = malloc((size_t)1 << 21), *e0 = malloc(VOLCOMP_ENCODE_BOUND), *e1 = malloc(VOLCOMP_ENCODE_BOUND);
+    uint8_t *d0 = malloc(VOLCOMP_CHUNK_VOXELS), *d1 = malloc(VOLCOMP_CHUNK_VOXELS);
     for (int z = 0; z < N; z++) for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
         const int c = (z / 128) * 4 + (y / 128) * 2 + x / 128; double f;
         switch (c) {
@@ -51,7 +68,7 @@ int main(void) {
             size_t n0, n1;
             if (volcomp_encode(ch, q, e0, VOLCOMP_ENCODE_BOUND, &n0) != VOLCOMP_OK) { printf("FAIL cpu encode\n"); return 1; }
             const int st = vcg_encode_levels(q, dc + c * 512, cnt + c * 512, off + c * 512, lv, pos, e1, VOLCOMP_ENCODE_BOUND, &n1);
-            if (st || n0 != n1 || memcmp(e0, e1, n0)) { nbad++; if (nbad < 3) printf("  q %g chunk %d: status %d, %zu vs %zu bytes\n", q, c, st, n0, n1); }
+            if (st || (FM_STRICT ? n0 != n1 || memcmp(e0, e1, n0) : (n0 != n1 || memcmp(e0, e1, n0)) && dec_differ(ch, e0, n0, e1, n1, d0, d1))) { nbad++; if (nbad < 3) printf("  q %g chunk %d: status %d, %zu vs %zu bytes\n", q, c, st, n0, n1); }
             for (int b = 0; b < 512; b++) ncv += cv[c * 512 + b] >= 0;
             bytes += n0;
         }

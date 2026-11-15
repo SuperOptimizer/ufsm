@@ -12,7 +12,7 @@ typedef struct { double p[3]; int32_t fam, pad; } fr_step;   /* a polyline step 
    ring > 0: the negative ring; ct: the box's CT (n voxels, 255 outside the CT) or nullptr (no air test), iso the cutoff. o0 / o1: the H / V
    planes (n voxels, host). 0 ok, nonzero on a CUDA failure (the caller runs the CPU code). */
 __attribute__((weak)) int fibre_gpu_box(const fr_step *st, long nst, const int64_t so[3], const int64_t n[3], double R, double Rx, int cr, int cg, int ring,
-                                        const uint8_t *ct, int iso, uint8_t *o0, uint8_t *o1);
+                                        const uint8_t *ct, int iso, int piso, uint8_t *o0, uint8_t *o1);
 __attribute__((weak)) void fibre_gpu_device(int dev);
 __attribute__((weak)) int fibre_gpu_reserve(int edge);   /* the device buffers for boxes up to edge^3 now (0 ok) */
 __attribute__((weak)) void *fibre_gpu_host_alloc(size_t n);   /* pinned (the planes' D2H at full rate), nullptr on failure */

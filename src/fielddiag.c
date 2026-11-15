@@ -10,6 +10,7 @@
      sperr  mean |log2(predicted spacing / label spacing)| over cells with a predicted spacing
    The point: is a gap between two nets concentrated in packed sheets (small spacing: resolution) or spread over all spacings. */
 #include <math.h>
+#include "optcheck.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +19,7 @@
 #include "store.h"
 #include "zarr3.h"
 
-static const char *fd_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *fd_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static inline double fd_wrap(double d) { return d - round(d); }
 enum { FD_NB = 8 };
 typedef struct { double n, nc, perr, p10, conf, nal, nsp, sperr; } fd_acc;
@@ -55,11 +56,11 @@ int cmd_field_diag(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: ufsm field-diag A_DIR [B_DIR] --phase ROOT KEY [--bins 60,100,150,250] [--tsv 1] [--label NAME]\n"); return 2; }
     const char *dirs[2] = {argv[2], (argc > 3 && argv[3][0] != '-') ? argv[3] : nullptr};
     const char *pr = nullptr, *pk = nullptr;
-    for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--phase")) { pr = argv[i + 1]; pk = argv[i + 2]; }
+    for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--phase"))) { pr = argv[i + 1]; pk = argv[i + 2]; }
     if (!pr) { fprintf(stderr, "field-diag: --phase ROOT KEY\n"); return 2; }
     double edges[FD_NB]; int nb = 0; char bs[256]; snprintf(bs, sizeof bs, "%s", fd_opt(argc, argv, "--bins", "60,100,150,250"));
     for (char *t = strtok(bs, ","); t && nb < FD_NB - 1; t = strtok(nullptr, ",")) edges[nb++] = atof(t);
-    const int tsv = atoi(fd_opt(argc, argv, "--tsv", "0")); const char *lbl = fd_opt(argc, argv, "--label", "-");
+    const int tsv = opt_atoi("--tsv", fd_opt(argc, argv, "--tsv", "0")); const char *lbl = fd_opt(argc, argv, "--label", "-");
     fit_fields_skip_planes(1 | 2);   /* no recto / wind4 planes */
     fit_fields_ct_planes(0);
     fit_fields_buf b[2]; int ns = 0;

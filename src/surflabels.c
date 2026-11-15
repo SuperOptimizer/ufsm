@@ -37,6 +37,7 @@
    voxels. --tsv: the per-wrap table. Streaming: z bands of one shard row (the wraps' rows meeting it are decoded per band, ~16 B per
    vertex), blocks on --threads threads; deterministic for any thread count. */
 #include "band.h"
+#include "optcheck.h"
 #include "json.h"
 #include "pairacc.h"
 #include "phase_check.h"
@@ -55,6 +56,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <unistd.h>
 #include <time.h>
 
 enum { SL_TR = 8, SL_TC = 32 };   /* tile = 8 rows x 32 columns of quads */
@@ -62,8 +65,8 @@ enum { IG_DROP = 1, IG_CONFLICT = 2, IG_CT = 3, IG_HOLD = 4, IG_COH = 5, IG_ANCH
 enum { AN_BINS = 84 };     /* anchor vote histogram: 3 codes (1/6 turn) per bin over the 14-turn code cycle */
 enum { COH_BINS = 40 };   /* coherence histogram bins over [-1, 1] */
 
-static const char *sl_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
-static int sl_idx(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
+static const char *sl_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
+static int sl_idx(int argc, char **argv, const char *k) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], opt_n(k))) return i; return -1; }
 static double sl_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 static inline uint8_t sl_code(double q) { long k = lround(q * 18.0) % 252; if (k < 0) k += 252; return (uint8_t)(1 + k); }   /* = ingest.c wind_code */
 static inline int sl_cdiff(int a, int b) { int d = (a - b) % 252; if (d < -126) d += 252; if (d >= 126) d -= 252; return d; }
@@ -616,10 +619,10 @@ static int an_assign(sl_job *J, const char *out, int nmin, double smin, double r
     /* the file: header, per wrap id + h, then D (float) and status (uint8) per cell */
     FILE *f = fopen(out, "wb"); if (!f) { fprintf(stderr, "wrap-anchor: cannot write %s\n", out); return -1; }
     const int32_t hd[5] = {J->nw, J->an_cr, J->an_ns, (int32_t)J->dir, (int32_t)nc};
-    fwrite("UFSMANC2", 1, 8, f); fwrite(hd, 4, 5, f);
-    for (int k = 0; k < J->nw; k++) { const int32_t a[2] = {J->W[k].id, J->W[k].h}; fwrite(a, 4, 2, f); }
-    fwrite(D, 4, nc, f); fwrite(dm, 4, nc, f); fwrite(st, 1, nc, f);
-    if (fclose(f)) return -1;
+    int bad = fwrite("UFSMANC2", 1, 8, f) != 8; bad |= fwrite(hd, 4, 5, f) != 5;   /* (every count checked: a short write on ENOSPC with fclose 0 was reported written; audit mini/errpaths 5) */
+    for (int k = 0; k < J->nw; k++) { const int32_t a[2] = {J->W[k].id, J->W[k].h}; bad |= fwrite(a, 4, 2, f) != 2; }
+    bad |= fwrite(D, 4, nc, f) != nc; bad |= fwrite(dm, 4, nc, f) != nc; bad |= fwrite(st, 1, nc, f) != nc;
+    if (fclose(f) || bad) { fprintf(stderr, "wrap-anchor: writing %s failed: %s\n", out, strerror(errno)); unlink(out); return -1; }
     /* per-wrap stats (voxel-weighted: the cells' rasterised voxels) */
     char tp[1600]; snprintf(tp, sizeof tp, "%s.tsv", out); FILE *t = fopen(tp, "w"); if (!t) return -1;
     fprintf(t, "wrap\tcells\tvoxels\tknown\tpropagated\tmasked\tunreached\tanchored_share\tmasked_share\toffsets\n");
@@ -678,10 +681,10 @@ int cmd_surf_labels(int argc, char **argv) {
     }
     const char *in = argv[2], *out = argv[3];
     const char *axp = sl_opt(argc, argv, "--axis", nullptr);
-    const double axum = atof(sl_opt(argc, argv, "--axis-um", "0")), gum = atof(sl_opt(argc, argv, "--grid-um", "0"));
-    const int dir_auto = !strcmp(sl_opt(argc, argv, "--dir", ""), "auto"); double dir = dir_auto ? 1 : atof(sl_opt(argc, argv, "--dir", "0"));
-    const int nt = ufsm_threads(atoi(sl_opt(argc, argv, "--threads", "0")), 16), S = atoi(sl_opt(argc, argv, "--shard", "512")), B = atoi(sl_opt(argc, argv, "--block", "256"));
-    const double rmax = atof(sl_opt(argc, argv, "--radius", "20"));
+    const double axum = opt_atof("--axis-um", sl_opt(argc, argv, "--axis-um", "0")), gum = opt_atof("--grid-um", sl_opt(argc, argv, "--grid-um", "0"));
+    const int dir_auto = !strcmp(sl_opt(argc, argv, "--dir", ""), "auto"); double dir = dir_auto ? 1 : opt_atof("--dir", sl_opt(argc, argv, "--dir", "0"));
+    const int nt = ufsm_threads(opt_atoi("--threads", sl_opt(argc, argv, "--threads", "0")), 16), S = opt_atoi("--shard", sl_opt(argc, argv, "--shard", "512")), B = opt_atoi("--block", sl_opt(argc, argv, "--block", "256"));
+    const double rmax = opt_atof("--radius", sl_opt(argc, argv, "--radius", "20"));
     if (!axp || !(axum > 0) || !(gum > 0) || (!dir_auto && dir != 1 && dir != -1) || S < 128 || S % 128 || B < 16 || S % B || !(rmax > 0) || rmax > 120) {
         fprintf(stderr, "surf-labels: need --axis F --axis-um U0 --grid-um U --dir 1|-1|auto; --shard a multiple of 128, --block dividing it, --radius in (0, 120]\n"); return 2;
     }
@@ -689,14 +692,14 @@ int cmd_surf_labels(int argc, char **argv) {
     J.an_mode = !strcmp(argv[1], "wrap-anchor") ? 1 : sl_opt(argc, argv, "--anchor", nullptr) ? 2 : 0;
     if (sscanf(sl_opt(argc, argv, "--anchor-cell", "32,32"), "%d,%d", &J.an_cr, &J.an_ns) != 2 || J.an_cr < 1 || J.an_ns < 4) { fprintf(stderr, "surf-labels: --anchor-cell ROWS,SECTORS\n"); return 2; }
     J.an_patches = sl_opt(argc, argv, "--patches", nullptr);
-    J.ag_s = atoi(sl_opt(argc, argv, "--agree-scale", "1")); J.ag_R = atoi(sl_opt(argc, argv, "--agree-range", "4")); J.ag_rmin = atoi(sl_opt(argc, argv, "--agree-rmin", "64"));
+    J.ag_s = opt_atoi("--agree-scale", sl_opt(argc, argv, "--agree-scale", "1")); J.ag_R = opt_atoi("--agree-range", sl_opt(argc, argv, "--agree-range", "4")); J.ag_rmin = opt_atoi("--agree-rmin", sl_opt(argc, argv, "--agree-rmin", "64"));
     if (J.ag_s < 1 || J.ag_R < 1 || J.ag_R > 32) { fprintf(stderr, "surf-labels: --agree-scale >= 1, --agree-range 1..32\n"); return 2; }
-    J.an_tol = atof(sl_opt(argc, argv, "--anchor-tol-um", "30")) / gum; if (J.an_tol < 1.5) J.an_tol = 1.5;
-    J.gsplit = atof(sl_opt(argc, argv, "--gt-split-mm", "0")) * 1000 / gum; J.ghalf = !strcmp(sl_opt(argc, argv, "--gt-half", "A"), "B");
-    J.side_iso = atoi(sl_opt(argc, argv, "--side-iso", "60"));   /* (with --gt and --ct: the side agreement's papyrus cutoff) */
-    J.coh_cell = atoi(sl_opt(argc, argv, "--coh-cell", "32")); J.min_coh = atof(sl_opt(argc, argv, "--min-coh", "-2"));
+    J.an_tol = opt_atof("--anchor-tol-um", sl_opt(argc, argv, "--anchor-tol-um", "30")) / gum; if (J.an_tol < 1.5) J.an_tol = 1.5;
+    J.gsplit = opt_atof("--gt-split-mm", sl_opt(argc, argv, "--gt-split-mm", "0")) * 1000 / gum; J.ghalf = !strcmp(sl_opt(argc, argv, "--gt-half", "A"), "B");
+    J.side_iso = opt_atoi("--side-iso", sl_opt(argc, argv, "--side-iso", "60"));   /* (with --gt and --ct: the side agreement's papyrus cutoff) */
+    J.coh_cell = opt_atoi("--coh-cell", sl_opt(argc, argv, "--coh-cell", "32")); J.min_coh = opt_atof("--min-coh", sl_opt(argc, argv, "--min-coh", "-2"));
     if (J.coh_cell < 0 || (J.coh_cell && B % J.coh_cell)) { fprintf(stderr, "surf-labels: --coh-cell must divide --block\n"); return 2; }
-    J.gum = gum; J.dir = dir; J.S = S; J.B = B; J.rmax = (float)rmax; J.Hh = (int)ceil(rmax) + 2; J.bake = atoi(sl_opt(argc, argv, "--bake", "1")); J.nt = nt;
+    J.gum = gum; J.dir = dir; J.S = S; J.B = B; J.rmax = (float)rmax; J.Hh = (int)ceil(rmax) + 2; J.bake = opt_atoi("--bake", sl_opt(argc, argv, "--bake", "1")); J.nt = nt;
     pthread_mutex_init(&J.mu, nullptr);
     axis ax = {0}; if (axis_load(&ax, axp)) { fprintf(stderr, "surf-labels: cannot load the axis %s\n", axp); return 1; }
     J.ax = &ax;
@@ -711,7 +714,7 @@ int cmd_surf_labels(int argc, char **argv) {
                J.shape[0] = a; J.shape[1] = b; J.shape[2] = c; } }
     for (int d = 0; d < 3; d++) J.ns[d] = (J.shape[d] + S - 1) / S;
     { const int ci = sl_idx(argc, argv, "--ct"); if (ci > 0) { if (ci + 2 >= argc) return 2; J.ct = z3_open(store_open(argv[ci + 1]), argv[ci + 2], sl_opt(argc, argv, "--cache", nullptr));
-        J.ct_scale = atoi(sl_opt(argc, argv, "--ct-scale", "1")); int64_t cs[3]; for (int d = 0; d < 3; d++) cs[d] = J.shape[d] * (J.ct_scale == 2 ? 2 : 1);
+        J.ct_scale = opt_atoi("--ct-scale", sl_opt(argc, argv, "--ct-scale", "1")); int64_t cs[3]; for (int d = 0; d < 3; d++) cs[d] = J.shape[d] * (J.ct_scale == 2 ? 2 : 1);
         if (J.ct_scale != 1 && J.ct_scale != 2) { fprintf(stderr, "surf-labels: --ct-scale 1|2\n"); return 2; }
         if (J.ct && J.ct_scale == 2) for (int d = 0; d < 3; d++) if (z3_meta_of(J.ct)->shape[d] == cs[d] - 1) cs[d]--;   /* (an odd finer extent) */
         if (!J.ct || memcmp(z3_meta_of(J.ct)->shape, cs, sizeof cs)) { fprintf(stderr, "surf-labels: --ct %s %s: cannot open or not on the grid\n", argv[ci + 1], argv[ci + 2]); return 1; } } }
@@ -755,7 +758,7 @@ int cmd_surf_labels(int argc, char **argv) {
     for (int k = 0; k < nw; k++) { if (sl_open(&W[k])) return 1; if (fabs(W[k].um - W[0].um) > 1e-9) { fprintf(stderr, "surf-labels: wraps at different voxel sizes\n"); return 1; } W[k].peaks = NAN; W[k].onpap = NAN; }
     J.W = W; J.nw = nw; J.s0 = W[0].um / axum; J.f = W[0].um / gum;
     /* per-wrap gates */
-    const int k0 = atoi(sl_opt(argc, argv, "--first", "-1000000")), k1 = atoi(sl_opt(argc, argv, "--last", "1000000"));
+    const int k0 = opt_atoi("--first", sl_opt(argc, argv, "--first", "-1000000")), k1 = opt_atoi("--last", sl_opt(argc, argv, "--last", "1000000"));
     for (int k = 0; k < nw; k++) if (W[k].id < k0 || W[k].id > k1) { W[k].keep = 0; snprintf(W[k].why, sizeof W[k].why, "trim"); }
     { const char *dl = sl_opt(argc, argv, "--drop", nullptr);
       if (dl) { char *t = strdup(dl), *sv = nullptr; for (char *q = strtok_r(t, ",", &sv); q; q = strtok_r(nullptr, ",", &sv)) { const int id = atoi(q[0] == 'w' ? q + 1 : q);
@@ -783,7 +786,7 @@ int cmd_surf_labels(int argc, char **argv) {
     /* holdouts */
     const char *hp = sl_opt(argc, argv, "--exclude", nullptr);
     if (hp) {
-        const char *hct = sl_opt(argc, argv, "--exclude-ct", nullptr); const double hmm = atof(sl_opt(argc, argv, "--exclude-mm", "0.5"));
+        const char *hct = sl_opt(argc, argv, "--exclude-ct", nullptr); const double hmm = opt_atof("--exclude-mm", sl_opt(argc, argv, "--exclude-mm", "0.5"));
         if (!hct) { fprintf(stderr, "surf-labels: --exclude needs --exclude-ct NAME (the CT path's tail in the holdouts' \"ct\")\n"); return 2; }
         char *buf = nullptr; const int n = sl_read_file(hp, &buf); json *j = n > 0 ? json_parse(buf, (size_t)n) : nullptr; free(buf);
         if (!j) { fprintf(stderr, "surf-labels: cannot parse %s\n", hp); return 1; }
@@ -833,7 +836,7 @@ int cmd_surf_labels(int argc, char **argv) {
             nw, nvt, W[0].um, (long long)J.shape[0], (long long)J.shape[1], (long long)J.shape[2], gum, dir, rmax, sl_now() - t0);
     if (J.an_mode == 2 && an_load(&J, sl_opt(argc, argv, "--anchor", ""))) return 1;
     /* pass 1 (--min-onpap): the wraps' on-papyrus shares */
-    const double minpap = atof(sl_opt(argc, argv, "--min-onpap", "0"));
+    const double minpap = opt_atof("--min-onpap", sl_opt(argc, argv, "--min-onpap", "0"));
     if (minpap > 0) {
         if (!J.ct || J.ct_scale != 1) { fprintf(stderr, "surf-labels: --min-onpap needs --ct on the grid (--ct-scale 1)\n"); return 2; }
         sl_ctc c = {.z = J.ct}; for (int d = 0; d < 3; d++) { c.sh[d] = J.shape[d]; c.g[d] = (J.shape[d] + 127) / 128; }
@@ -843,7 +846,7 @@ int cmd_surf_labels(int argc, char **argv) {
         for (int64_t b = 0; b < c.g[0]; b++) {
             J.sz = b;
             if (sl_load_all(&J, b * 128.0 - 2, (b + 1) * 128.0 + 1, nt)) { fprintf(stderr, "surf-labels: wrap read failed\n"); return 1; }
-            sl_pap P = {.J = &J, .c = &c, .R = atof(sl_opt(argc, argv, "--ct-range", "15")) / gum, .lev = atof(sl_opt(argc, argv, "--ct-level", "80"))};
+            sl_pap P = {.J = &J, .c = &c, .R = opt_atof("--ct-range", sl_opt(argc, argv, "--ct-range", "15")) / gum, .lev = opt_atof("--ct-level", sl_opt(argc, argv, "--ct-level", "80"))};
             pthread_t th[64]; const int m = nt < 64 ? nt : 64;
             P.mode = 1; for (int q = 0; q < m; q++) pthread_create(&th[q], nullptr, sl_pap_run, &P); for (int q = 0; q < m; q++) pthread_join(th[q], nullptr);
             size_t nn = 0; for (size_t k = 0; k < ng; k++) nn += c.need[k];
@@ -861,7 +864,7 @@ int cmd_surf_labels(int argc, char **argv) {
     }
     { const char *gd = sl_opt(argc, argv, "--geom", nullptr);   /* ufsm geom-check output: cells.tsv defect cells, slip.tsv + zbins.tsv slipping z bins */
       if (gd) {
-          const double smax = atof(sl_opt(argc, argv, "--slip-max", "0.5")), sd = atof(sl_opt(argc, argv, "--slip-d", "2")); char p[1600], line[1024]; long ncell = 0, nzb = 0;
+          const double smax = opt_atof("--slip-max", sl_opt(argc, argv, "--slip-max", "0.5")), sd = opt_atof("--slip-d", sl_opt(argc, argv, "--slip-d", "2")); char p[1600], line[1024]; long ncell = 0, nzb = 0;
           snprintf(p, sizeof p, "%s/cells.tsv", gd); FILE *f = fopen(p, "r");
           if (!f) { fprintf(stderr, "surf-labels: --geom: no %s\n", p); return 1; }
           while (fgets(line, sizeof line, f)) { int id, row0; double tf; if (sscanf(line, "w%d %d %lf", &id, &row0, &tf) != 3) continue;
@@ -919,7 +922,7 @@ int cmd_surf_labels(int argc, char **argv) {
     }
     }
     J.recs = calloc(nt, sizeof *J.recs);
-    J.pa_T = (uint32_t)(4294967295.0 * fmin(1.0, atof(sl_opt(argc, argv, "--pa-keep", "0.02"))));
+    J.pa_T = (uint32_t)(4294967295.0 * fmin(1.0, opt_atof("--pa-keep", sl_opt(argc, argv, "--pa-keep", "0.02"))));
     /* pass 2: z bands of one shard row */
     const double tl = sl_now(); J.nbs = (S / B) * (S / B) * (S / B);
     long long zb0 = 0, zb1 = -1; if (sscanf(sl_opt(argc, argv, "--zband", ""), "%lld,%lld", &zb0, &zb1) != 2) { zb0 = 0; zb1 = -1; }   /* calibration: only the shard rows meeting grid z [Z0, Z1) (the rest stays unwritten) */
@@ -983,7 +986,7 @@ int cmd_surf_labels(int argc, char **argv) {
     for (int h = 0; h < J.nhold; h++) {
         const long long nh = atomic_load(&J.holdn[h]);
         fprintf(stderr, "surf-labels: holdout box %s (grid %.0f,%.0f,%.0f + %.0f,%.0f,%.0f): %lld labelled voxels ignored\n", J.holdnm[h], J.hold[h][0], J.hold[h][1], J.hold[h][2], J.hold[h][3], J.hold[h][4], J.hold[h][5], nh);
-        if (!nh && !atoi(sl_opt(argc, argv, "--exclude-empty-ok", "0"))) {
+        if (!nh && !opt_atoi("--exclude-empty-ok", sl_opt(argc, argv, "--exclude-empty-ok", "0"))) {
             fprintf(stderr, "surf-labels: FAIL: holdout box %s covers no labelled voxel (wrong units? \"l0\" is level-0 voxels of the CT; --exclude-empty-ok 1 if it is meant)\n", J.holdnm[h]); hfail = 1; }
     }
     if (J.gt) {
@@ -1049,7 +1052,7 @@ int cmd_surf_labels(int argc, char **argv) {
         free(all.r);
     } else { for (int t = 0; t < nt; t++) free(J.recs[t].r); }
     free(J.recs);
-    if (J.an_mode == 1 && an_assign(&J, out, atoi(sl_opt(argc, argv, "--anchor-min", "20")), atof(sl_opt(argc, argv, "--anchor-share", "0.7")), atof(sl_opt(argc, argv, "--anchor-reach-mm", "1e9")))) return 1;
+    if (J.an_mode == 1 && an_assign(&J, out, opt_atoi("--anchor-min", sl_opt(argc, argv, "--anchor-min", "20")), opt_atof("--anchor-share", sl_opt(argc, argv, "--anchor-share", "0.7")), opt_atof("--anchor-reach-mm", sl_opt(argc, argv, "--anchor-reach-mm", "1e9")))) return 1;
     const char *tsv = sl_opt(argc, argv, "--tsv", nullptr);
     if (tsv) {
         FILE *f = fopen(tsv, "w"); if (!f) { fprintf(stderr, "surf-labels: cannot write %s\n", tsv); return 1; }

@@ -5,6 +5,7 @@
    a window's z-score (v - mean) / sd is linear, so a reader gets the trainer's normalised channels as (q step_raw - [mean channel] 8 mean) / sd
    with the window's mean / sd from the coefficients themselves. basis.lcb in the store is the transform. */
 #include "embz.h"
+#include "optcheck.h"
 #include "latfit.h"
 #include "store.h"
 #include "sysinfo.h"
@@ -17,7 +18,7 @@
 #include <sys/stat.h>
 
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 typedef struct { const uint8_t *ct; int8_t *out; int n[3], C, z0, z1; float step; const lat_basis *lb; double se, sv, sd; long hist[30][256]; } enc_job;
@@ -50,14 +51,14 @@ int cmd_lc_encode(int argc, char **argv) {
     lat_basis *lb = malloc(sizeof *lb); if (lat_basis_load(argv[2], lb)) { fprintf(stderr, "lc-encode: cannot read the transform %s\n", argv[2]); return 1; }
     store *st = store_open(argv[3]); z3 *z = st ? z3_open(st, argv[4], nullptr) : nullptr; if (!z) { fprintf(stderr, "lc-encode: cannot open %s %s: %s\n", argv[3], argv[4], z3_error()); return 1; }
     const z3_meta *m = z3_meta_of(z);
-    const int C = atoi(opt(argc, argv, "--c", "29")), SH = atoi(opt(argc, argv, "--shard", "64")), CH = atoi(opt(argc, argv, "--chunk", "32")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
-    const float step = (float)atof(opt(argc, argv, "--step", "0.25"));
+    const int C = opt_atoi("--c", opt(argc, argv, "--c", "29")), SH = opt_atoi("--shard", opt(argc, argv, "--shard", "64")), CH = opt_atoi("--chunk", opt(argc, argv, "--chunk", "32")), nth = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8);
+    const float step = (float)opt_atof("--step", opt(argc, argv, "--step", "0.25"));
     if (C < 1 || C > 29 || SH % CH || !(step > 0)) { fprintf(stderr, "lc-encode: --c 1..29, --shard a multiple of --chunk, --step > 0\n"); return 2; }
     const int V = 4 * SH; int64_t box[6] = {0, 0, 0, m->shape[0] / V * V, m->shape[1] / V * V, m->shape[2] / V * V};
     if (*opt(argc, argv, "--box", "")) { long long b[6]; if (sscanf(opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) { fprintf(stderr, "lc-encode: --box Z,Y,X,NZ,NY,NX\n"); return 2; } for (int i = 0; i < 6; i++) box[i] = b[i]; }
     for (int i = 0; i < 3; i++) if (box[i] % 4 || box[3 + i] % V || box[3 + i] <= 0 || box[i] < 0 || box[i] + box[3 + i] > m->shape[i] + V) { fprintf(stderr, "lc-encode: the box origin must be a multiple of 4 and its size of %d voxels\n", V); return 2; }
     uint8_t *ct = malloc((size_t)V * V * V); int8_t *out = malloc((size_t)SH * SH * SH * (C + 1));
-    double sd = atof(opt(argc, argv, "--sd", "0"));
+    double sd = opt_atof("--sd", opt(argc, argv, "--sd", "0"));
     if (!(sd > 0)) {   /* sd_ref: the sd (all voxels, as a window's z-score counts them) of up to 24 mostly-material shards of a 5^3 lattice over
                           the box, nearest its centre first (a plain stride over the shard index hit only air in masked scans: sd 1, step_raw 0.25) */
         double s1 = 0, s2 = 0, n = 0; int used = 0; const int64_t ns[3] = {box[3] / V, box[4] / V, box[5] / V};

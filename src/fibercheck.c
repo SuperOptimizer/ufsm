@@ -18,6 +18,7 @@
    With a fit: a GT-free score table (fibre drift by span = the fit's split share of path-one fibre pairs, with the random / straight
    pairs' split share as anti-collapse controls, after winding-field's evaluator) that needs no labels. */
 #include <math.h>
+#include "optcheck.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,8 +31,8 @@
 #include "store.h"
 #include "zarr3.h"
 
-static const char *fc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
-static int fc_opt2(int argc, char **argv, const char *k) { for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], k)) return i; return 0; }
+static const char *fc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
+static int fc_opt2(int argc, char **argv, const char *k) { for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return i; return 0; }
 static uint64_t fc_s;
 static double fc_u(void) { uint64_t z = (fc_s += 0x9E3779B97F4A7C15ull); z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= z >> 31; return (z >> 11) * 0x1.0p-53; }
 static double wrap1(double v) { return v - floor(v + 0.5); }   /* (-0.5, 0.5] */
@@ -100,13 +101,13 @@ int cmd_fiber_check(int argc, char **argv) {
     }
     const char *afp = argv[2], *trp = fc_opt(argc, argv, "--tr", nullptr), *btp = fc_opt(argc, argv, "--boxes", nullptr), *names = fc_opt(argc, argv, "--names", nullptr);
     const char *fdp = fc_opt(argc, argv, "--fields-pat", nullptr), *ftp = fc_opt(argc, argv, "--fit-pat", nullptr);
-    const int level = atoi(fc_opt(argc, argv, "--level", "2")), every = atoi(fc_opt(argc, argv, "--every", "2")), rad = atoi(fc_opt(argc, argv, "--rad", "3"));
-    const double step = atof(fc_opt(argc, argv, "--step", "1")), strict = atof(fc_opt(argc, argv, "--strict", "0.1")), margin = atof(fc_opt(argc, argv, "--margin", "8"));
-    fc_s = (uint64_t)atoll(fc_opt(argc, argv, "--seed", "1")) * 0x2545F4914F6CDD1Dull + 7;
+    const int level = opt_atoi("--level", fc_opt(argc, argv, "--level", "2")), every = opt_atoi("--every", fc_opt(argc, argv, "--every", "2")), rad = opt_atoi("--rad", fc_opt(argc, argv, "--rad", "3"));
+    const double step = opt_atof("--step", fc_opt(argc, argv, "--step", "1")), strict = opt_atof("--strict", fc_opt(argc, argv, "--strict", "0.1")), margin = opt_atof("--margin", fc_opt(argc, argv, "--margin", "8"));
+    fc_s = (uint64_t)opt_atoll("--seed", fc_opt(argc, argv, "--seed", "1")) * 0x2545F4914F6CDD1Dull + 7;
     int D[MAXD], nd = 0; { char *t = strdup(fc_opt(argc, argv, "--d", "4,8,16,32,64,128")); for (char *q = strtok(t, ","); q && nd < MAXD; q = strtok(nullptr, ",")) D[nd++] = atoi(q); free(t); }
     if (!trp || !btp || !names || !(step > 0) || every < 1) { fprintf(stderr, "fiber-check: --tr, --boxes, --names needed\n"); return 2; }
     const int ci = fc_opt2(argc, argv, "--codes"), pi = fc_opt2(argc, argv, "--phase");
-    const double lum = atof(argv[ci + 2]), packed = atof(fc_opt(argc, argv, "--packed-um", "100")) / (lum > 0 ? lum : 9.6);
+    const double lum = atof(argv[ci + 2]), packed = opt_atof("--packed-um", fc_opt(argc, argv, "--packed-um", "100")) / (lum > 0 ? lum : 9.6);
     /* the transform: label L0 xyz -> AFV xyz; inverted */
     double M[3][4], Mi[3][3];
     {
@@ -127,7 +128,7 @@ int cmd_fiber_check(int argc, char **argv) {
     afv *A = afv_open(afp); if (!A) return 1;
     const char *axp = fc_opt(argc, argv, "--axis", nullptr); axis axs = {0}; if (axp && axis_load(&axs, axp)) { fprintf(stderr, "fiber-check: cannot load the axis %s\n", axp); return 1; }
     long facing[3] = {0};
-    z3 *ctz = nullptr; const double alR = atof(fc_opt(argc, argv, "--align", "0")); const int alB = atoi(fc_opt(argc, argv, "--align-block", "0"));
+    z3 *ctz = nullptr; const double alR = opt_atof("--align", fc_opt(argc, argv, "--align", "0")); const int alB = opt_atoi("--align-block", fc_opt(argc, argv, "--align-block", "0"));
     { const int ti = fc_opt2(argc, argv, "--ct"); if (ti) { store *ts = store_open(argv[ti + 1]); ctz = ts ? z3_open(ts, argv[ti + 2], nullptr) : nullptr; if (!ctz) { fprintf(stderr, "fiber-check: cannot open the CT\n"); return 1; } } }
     store *cs = store_open(argv[ci + 1]), *ps = store_open(argv[pi + 1]);
     z3 *cz = cs ? z3_open(cs, argv[ci + 2], nullptr) : nullptr, *pz = ps ? z3_open(ps, argv[pi + 2], nullptr) : nullptr;
@@ -448,7 +449,7 @@ int cmd_fiber_export(int argc, char **argv) {
     const char *mapp = fc_opt(argc, argv, "--map", nullptr); const rmap *RM = nullptr;   /* ufsm reg map: coarse = the AFV's scan, fine = ours (affine + field) */
     if (mapp && !ufib) { rvol *fv; double cu, fu; RM = reg_map_open(mapp, fc_opt(argc, argv, "--cache", nullptr), &fv, &cu, &fu); if (!RM) return 1; }
     else if (!ufib && (!trp || fc_transform(trp, M, Mi))) { fprintf(stderr, "fiber-export: --tr needs a transform.json with a transformation_matrix (or --map reg.json)\n"); return 2; }
-    const int level = atoi(fc_opt(argc, argv, "--level", "2")), minp = atoi(fc_opt(argc, argv, "--min-pts", "4")); const double mg = atof(fc_opt(argc, argv, "--margin", "8")), sc = ldexp(1.0, level);
+    const int level = opt_atoi("--level", fc_opt(argc, argv, "--level", "2")), minp = opt_atoi("--min-pts", fc_opt(argc, argv, "--min-pts", "4")); const double mg = opt_atof("--margin", fc_opt(argc, argv, "--margin", "8")), sc = ldexp(1.0, level);
     double sh[3] = {0, 0, 0}; if (*fc_opt(argc, argv, "--shift", "") && sscanf(fc_opt(argc, argv, "--shift", ""), "%lf,%lf,%lf", &sh[0], &sh[1], &sh[2]) != 3) { fprintf(stderr, "fiber-export: --shift dz,dy,dx\n"); return 2; }
     char fp[1200]; snprintf(fp, sizeof fp, "%s/fields.json", argv[3]);
     FILE *jf = fopen(fp, "rb"); if (!jf) { fprintf(stderr, "fiber-export: cannot read %s\n", fp); return 1; }

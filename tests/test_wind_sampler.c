@@ -9,6 +9,7 @@
 #include "make_wind_fixture.c"
 #include "../src/sample.c"
 #include <assert.h>
+#include "fm_tol.h"
 
 void *nn_host_alloc(size_t n) { return malloc(n); }
 void nn_host_free(void *p) { free(p); }
@@ -49,13 +50,19 @@ int main(int argc, char **argv) {
     int same = 1, warped = 0, known = 0;
     for (int i = 0; i < NB; i++) {
         int32_t hd[8]; memcpy(hd, b[i].rad, sizeof hd); warped += hd[6] & 1;
-        same &= !memcmp(a[i].x, b[i].x, p3 * 2) && !memcmp(a[i].rad, b[i].rad, NN_RAD_REC(PW)) && !memcmp(a[i].side, b[i].side, p3) &&
-                !memcmp(a[i].w4, b[i].w4, p3) && !memcmp(a[i].wc, b[i].wc, p3) && !memcmp(a[i].corner, b[i].corner, sizeof a[i].corner);
+        /* pack_tm 1 warps through the packed fast warp, 0 through the trilinear one: bit-identical under UFSM_STRICT_MATH; fast math
+           (tests/fm_tol.h): x fp16 +-1 ulp, side phase +-1 (cyclic 252) on <= 1e-3, w4 / wc and packed target / mask flips on <= 1e-4 */
+        same &= !fm_cmp_h16a("x", a[i].x, b[i].x, p3, 1, 1e-4) && !memcmp(a[i].rad, b[i].rad, NN_RAD_REC(PW)) &&
+                !fm_cmp_u8c("side", a[i].side, b[i].side, p3, 1, PHASE_PERIOD, 1e-3, 1e-4) && !fm_cmp_u8c("w4", a[i].w4, b[i].w4, p3, 0, 0, 1e-4, 1e-4) &&
+                !fm_cmp_u8c("wc", a[i].wc, b[i].wc, p3, 0, 0, 1e-4, 1e-4) && !memcmp(a[i].corner, b[i].corner, sizeof a[i].corner);
+        size_t tmd = 0;
         for (size_t k = 0; k < p3; k++) {
             const uint8_t q = b[i].tm[k];
-            same &= a[i].t[k] == ((q & SAMPLE_TM_T0) ? 255 : 0) && a[i].t[p3 + k] == ((q & SAMPLE_TM_T1) ? 255 : 0) && a[i].m[k] == ((q & SAMPLE_TM_M) ? 1 : 0);
+            tmd += !(a[i].t[k] == ((q & SAMPLE_TM_T0) ? 255 : 0) && a[i].t[p3 + k] == ((q & SAMPLE_TM_T1) ? 255 : 0) && a[i].m[k] == ((q & SAMPLE_TM_M) ? 1 : 0));
             known += a[i].side[k] < PHASE_PERIOD;
         }
+        if (tmd) fprintf(stderr, "window %d: %zu packed target / mask voxels differ (allowed %zu)\n", i, tmd, fm_allow(p3, 1e-4));
+        same &= tmd <= fm_allow(p3, 1e-4);
     }
     printf("wind sampler: %d of %d windows warped, %.3f of the voxels with a known phase\n", warped, NB, known / (double)(NB * p3));
     check("packed targets decode to the unpacked batches (all other arrays equal)", same && warped > 0 && warped < NB && known > 0);

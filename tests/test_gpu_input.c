@@ -14,6 +14,24 @@ static uint64_t rs = 0x9e3779b97f4a7c15ull;
 static uint64_t rn(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; }
 static float ru(void) { return (float)((rn() >> 11) * (1.0 / 9007199254740992.0)); }
 #include <math.h>
+#include "fm_tol.h"
+/* MX bytes of a device input against a host-built reference: bit-identical under UFSM_STRICT_MATH; under fast math the host's radial /
+   latent float math rounds differently from the device's (__f*_rn) at quantiser ties, so <= 1e-3 of the bytes may differ (one level,
+   or a block scale one step) (tests/fm_tol.h) */
+#define MX_DIFF(what, a, b, n) fm_cmp_u8c(what, (const uint8_t *)(a), (const uint8_t *)(b), n, 0, 0, 1e-3, 1e-3)
+/* the latent input under fast math: the host reference's 64-term sum starts from +0 and -fno-signed-zeros folds 0 + x to x, so a cell
+   whose 64 inputs are all -0 (a symmetry's negated channel over zeros) sums to -0 where the device gets +0: e4m3 0x80 vs 0x00, e2m1
+   nibble 0x8 vs 0x0 (desk fm round 11-15: 1000 of 9000 bytes, worst 128, in exactly the sym 6-8 cases). Both are zero; the
+   comparison maps -0 codes to +0 on both sides (every byte for fp8, every nibble for fp4: a scale byte touched alike on both sides),
+   then MX_DIFF. Bit for bit under UFSM_STRICT_MATH. */
+static int mx_diff_pm0(const char *what, uint8_t *a, uint8_t *b, size_t n, int bits) {
+    if (!FM_STRICT)
+        for (size_t i = 0; i < n; i++) {
+            if (bits == 8) { if (a[i] == 0x80) a[i] = 0; if (b[i] == 0x80) b[i] = 0; }
+            else { if ((a[i] & 15) == 8) a[i] &= 0xf0; if ((a[i] >> 4) == 8) a[i] &= 0x0f; if ((b[i] & 15) == 8) b[i] &= 0xf0; if ((b[i] >> 4) == 8) b[i] &= 0x0f; }
+        }
+    return MX_DIFF(what, a, b, n);
+}
 static float h2f(uint16_t v) { const int e = (v >> 10) & 31, m = v & 1023; const float f = e == 0 ? ldexpf((float)m, -24) : ldexpf((float)(m | 1024), e - 25); return (v >> 15) ? -f : f; }
 /* the record's radial direction against the window's radial channels t4[1..3] (fp16): max abs difference over voxels 2+ voxels off the axis */
 static float axis_rec_err(const uint16_t *t4, int D, int P, const int64_t o[3], const float *cyz, const float *cxz, const int perm[3], const int flip[3]) {
@@ -50,7 +68,7 @@ static int lat_check(const uint16_t *h4, const void *d_h1, const void *d_rec, in
     nn_set_storage(d_a, mb, bits); nn_set_storage(d_b, mb, bits);
     nn_h2d(d_ref, ref, (size_t)N * 4 * cv * 2); nn_h16_to_mx(d_ref, cs, d_a); nn_input_lat(d_h1, cs, d_rec, d_b);
     uint8_t *a = malloc(mb), *b = malloc(mb); nn_d2h(a, d_a, mb); nn_d2h(b, d_b, mb);
-    const int bad = memcmp(a, b, mb) != 0;
+    const int bad = mx_diff_pm0("latent input", a, b, mb, bits) != 0;
     free(ref); free(a); free(b); nn_free(d_ref); nn_free(d_a); nn_free(d_b);
     return bad;
 }
@@ -130,7 +148,7 @@ int main(void) {
                         nn_input_rad(d_h1, xs, d_rec, d_yb);
                         nn_d2h(ya, d_ya, mxb); nn_d2h(yb, d_yb, mxb);
                         cases++;
-                        if (memcmp(ya, yb, mxb)) {
+                        if (MX_DIFF("device input", ya, yb, mxb)) {
                             size_t k = 0; while (k < mxb && ya[k] == yb[k]) k++;
                             if (fails < 5) fprintf(stderr, "FAIL: device input differs (xfmt %d MX-fp%d shape %d sym %d axis %d): first byte %zu of %zu (%02x vs %02x)\n",
                                                    xfmt, bits, shape, sym, ax, k, mxb, ya[k], yb[k]);
@@ -154,7 +172,7 @@ int main(void) {
                             uint8_t *pa = malloc(hb), *pb = malloc(hb);
                             nn_d2h(pa, d_pa, hb); nn_d2h(pb, d_pb, hb);
                             cases++;
-                            if (memcmp(pa, pb, hb)) {
+                            if (MX_DIFF("packed device input", pa, pb, hb)) {
                                 size_t k = 0; while (k < hb && pa[k] == pb[k]) k++;
                                 if (fails < 5) fprintf(stderr, "FAIL: packed device input differs (xfmt %d MX-fp%d shape %d sym %d axis %d): first byte %zu of %zu (%02x vs %02x)\n",
                                                        xfmt, bits, shape, sym, ax, k, hb, pa[k], pb[k]);
@@ -212,7 +230,7 @@ int main(void) {
                 if (lat_check(h4, d_h1, d_rec, N, P, P, xfmt, bits)) { if (fails < 5) fprintf(stderr, "FAIL: warped latent input (nn_input_lat) differs (xfmt %d MX-fp%d sym %d axis %d mode %d)\n", xfmt, bits, sym, ax, mode); fails++; }
                 wcases++;
                 wcases++;
-                if (memcmp(ya, yb, mxb)) {
+                if (MX_DIFF("device input", ya, yb, mxb)) {
                     size_t k = 0; while (k < mxb && ya[k] == yb[k]) k++;
                     if (fails < 5) fprintf(stderr, "FAIL: warped device input differs (xfmt %d MX-fp%d sym %d axis %d mode %d): first byte %zu of %zu (%02x vs %02x)\n",
                                            xfmt, bits, sym, ax, mode, k, mxb, ya[k], yb[k]);

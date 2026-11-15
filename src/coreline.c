@@ -1,5 +1,6 @@
 /* Core line of a crushed scroll: detection from the fit fields, signed distance, half-box masks (see coreline.h). */
 #include "coreline.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "json.h"
 #include "store.h"
@@ -268,7 +269,7 @@ size_t cl_mask_block(const coreline *c, int side, const long long org[3], double
 
 /* ---- commands ---- */
 static const char *copt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 static int fields_meta_o(const char *zarr, double *um, int *h, int64_t shp[3], int64_t org[3]) {
@@ -286,11 +287,11 @@ static int cl_cmd_detect(int argc, char **argv) {
     const char *zr = argv[3], *outp = argv[4];
     double um; int h; int64_t shp[3];
     if (fields_meta(zr, &um, &h, shp)) { fprintf(stderr, "coreline: cannot read %s/fields.json\n", zr); return 1; }
-    const int slab = atoi(copt(argc, argv, "--slab", "64")), bin = atoi(copt(argc, argv, "--bin", "4")), nt = ufsm_threads(atoi(copt(argc, argv, "--threads", "0")), 8);
-    const int zlo = atoi(copt(argc, argv, "--z0", "0")), zhi = atoi(copt(argc, argv, "--z1", "0")) > 0 ? atoi(copt(argc, argv, "--z1", "0")) : (int)shp[0];
-    const double oum = atof(copt(argc, argv, "--um", "2.399")), f = h * um / oum;   /* cells -> output voxels */
+    const int slab = opt_atoi("--slab", copt(argc, argv, "--slab", "64")), bin = opt_atoi("--bin", copt(argc, argv, "--bin", "4")), nt = ufsm_threads(opt_atoi("--threads", copt(argc, argv, "--threads", "0")), 8);
+    const int zlo = opt_atoi("--z0", copt(argc, argv, "--z0", "0")), zhi = opt_atoi("--z1", copt(argc, argv, "--z1", "0")) > 0 ? opt_atoi("--z1", copt(argc, argv, "--z1", "0")) : (int)shp[0];
+    const double oum = opt_atof("--um", copt(argc, argv, "--um", "2.399")), f = h * um / oum;   /* cells -> output voxels */
     cl_params P = cl_params_default();
-    P.sigma = atof(copt(argc, argv, "--sigma", "1.5")); P.min_side = atof(copt(argc, argv, "--min-side", "0.2")); P.min_contrast = atof(copt(argc, argv, "--min-contrast", "0.5")); P.max_along = atof(copt(argc, argv, "--max-along", "0.35"));
+    P.sigma = opt_atof("--sigma", copt(argc, argv, "--sigma", "1.5")); P.min_side = opt_atof("--min-side", copt(argc, argv, "--min-side", "0.2")); P.min_contrast = opt_atof("--min-contrast", copt(argc, argv, "--min-contrast", "0.5")); P.max_along = opt_atof("--max-along", copt(argc, argv, "--max-along", "0.35"));
     const char *nm[3] = {"pc", "ps", "w"}; z3 *za[3];
     for (int k = 0; k < 3; k++) if (!(za[k] = z3_open(store_open(zr), nm[k], nullptr))) { fprintf(stderr, "coreline: %s\n", z3_error()); return 1; }
     const int H = (int)shp[1], W = (int)shp[2], Hb = (H + bin - 1) / bin, Wb = (W + bin - 1) / bin, RB = 8;
@@ -361,11 +362,11 @@ void cl_box_frame(const coreline *C, const long long org[3], int na, double cyg,
    the material share of the box on that side. */
 static int cl_cmd_box(int argc, char **argv) {
     const char *cp = argv[3], *zr = copt(argc, argv, "--fields", nullptr), *od = copt(argc, argv, "--out", nullptr);
-    int bi = -1; for (int i = 3; i < argc; i++) if (!strcmp(argv[i], "--box")) bi = i;
+    int bi = -1; for (int i = 3; i < argc; i++) if (!strcmp(argv[i], opt_n("--box"))) bi = i;
     if (argc < 4 || !zr || !od || bi < 0 || bi + 6 >= argc) { fprintf(stderr, "usage: ufsm coreline box <core.json> --fields ZARR --box Z Y X NZ NY NX --side +1|-1 [--dist 2000] [--axis const|perz] [--frame-r 2400] --out DIR\n"); return 2; }
     long long bo[3]; int bn[3]; for (int d = 0; d < 3; d++) { bo[d] = atoll(argv[bi + 1 + d]); bn[d] = atoi(argv[bi + 4 + d]); }
-    const int side = atoi(copt(argc, argv, "--side", "1")) < 0 ? -1 : 1; const double D = atof(copt(argc, argv, "--dist", "2000"));
-    const int perz = !strcmp(copt(argc, argv, "--axis", "const"), "perz"); const double FR = atof(copt(argc, argv, "--frame-r", "2400"));
+    const int side = opt_atoi("--side", copt(argc, argv, "--side", "1")) < 0 ? -1 : 1; const double D = opt_atof("--dist", copt(argc, argv, "--dist", "2000"));
+    const int perz = !strcmp(copt(argc, argv, "--axis", "const"), "perz"); const double FR = opt_atof("--frame-r", copt(argc, argv, "--frame-r", "2400"));
     coreline C; if (cl_load(&C, cp)) { fprintf(stderr, "coreline: cannot load %s\n", cp); return 1; }
     double um; int h; int64_t shp[3], zo[3]; if (fields_meta_o(zr, &um, &h, shp, zo)) { fprintf(stderr, "coreline: cannot read %s/fields.json\n", zr); return 1; }
     const double f = um / C.um;   /* native -> core-line voxels */

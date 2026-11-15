@@ -8,8 +8,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-static int g_prof = -1;
+static int g_prof = -1;   /* mgpu: env (UFSM_PROF, or unet_prof_layers_on before the GPU threads run) */
 static const char *g_names[8] = {"conv_fwd", "conv_bwd_data", "conv_bwd_w", "gn", "elementwise", "up/concat", "loss", "optimizer"};
 /* UFSM_PROF=1: per-category event timing; UFSM_PROF=layers (or unet_prof_layers_on): also per conv, event category
    k + 8 * (slot + 1) with slot = 2 * layer + conv (layer ids as in nn_set_layer, conv 0 = c1 / single, 1 = c2) */
@@ -17,7 +20,9 @@ static const char *g_names[8] = {"conv_fwd", "conv_bwd_data", "conv_bwd_w", "gn"
 #define PROF_SLOT() (nn_get_layer() < 0 ? -1 : 2 * nn_get_layer() + (nn_get_conv() > 0 ? 1 : 0))
 #define PROF(k, call) do { PROF_INIT(); if (g_prof) { nn_prof_begin((k) + (g_prof == 2 ? 8 * (PROF_SLOT() + 1) : 0)); call; nn_prof_end(); } else { call; } } while (0)
 #define PROF_NK (8 * (UNET_NSLOT + 1))
-static double g_prof_slot[UNET_NSLOT][3];
+#include <pthread.h>
+static pthread_mutex_t g_prof_mu = PTHREAD_MUTEX_INITIALIZER;
+static double g_prof_slot[UNET_NSLOT][3];   /* mgpu: guarded (g_prof_mu: report / collect may run on either GPU's thread) */
 static void prof_collect(double *cat) {
     double ms[PROF_NK];
     nn_prof_collect(ms, PROF_NK);
@@ -26,6 +31,7 @@ static void prof_collect(double *cat) {
 }
 void unet_prof_report(void) {
     if (g_prof > 0) {
+        pthread_mutex_lock(&g_prof_mu);
         double ms[8]; prof_collect(ms); double tot = 0;
         for (int i = 0; i < 8; i++) tot += ms[i];
         for (int i = 0; i < 8; i++) if (ms[i] > 0) fprintf(stderr, "  %-14s %8.1f ms  %4.1f%%\n", g_names[i], ms[i], 100 * ms[i] / tot);
@@ -38,16 +44,19 @@ void unet_prof_report(void) {
             }
             for (int j = 0; j < 3; j++) g_prof_slot[i][j] = 0;
         }
+        pthread_mutex_unlock(&g_prof_mu);
     }
 }
 void unet_prof_layers_on(int on) { PROF_INIT(); g_prof = on ? 2 : 0; }
-static double g_prof_cat[8];
+static double g_prof_cat[8];   /* mgpu: guarded (g_prof_mu) */
 void unet_prof_layers(double out[][3]) {
+    pthread_mutex_lock(&g_prof_mu);
     for (int i = 0; i < UNET_NSLOT; i++) for (int j = 0; j < 3; j++) g_prof_slot[i][j] = 0;
     prof_collect(g_prof_cat);
     for (int i = 0; i < UNET_NSLOT; i++) for (int j = 0; j < 3; j++) out[i][j] = g_prof_slot[i][j];
+    pthread_mutex_unlock(&g_prof_mu);
 }
-void unet_prof_cats(double out[8]) { for (int i = 0; i < 8; i++) out[i] = g_prof_cat[i]; }   /* categories of the last unet_prof_layers call */
+void unet_prof_cats(double out[8]) { pthread_mutex_lock(&g_prof_mu); for (int i = 0; i < 8; i++) out[i] = g_prof_cat[i]; pthread_mutex_unlock(&g_prof_mu); }   /* categories of the last unet_prof_layers call */
 
 typedef struct { int cin, cout, k, stride; size_t w, b; } convp;      /* offsets into the flat param array */
 typedef struct { int c; size_t gamma, beta; } gnp;
@@ -88,7 +97,7 @@ struct unet {
     int gn_frz_train;                 /* unet_gn_freeze_train: training forwards use them too (diagnostics: no backward after such a forward) */
     float *gn_frz_d;                  /* their device copy (uploaded once; each forward replays it into the sites with async device copies) */
     double *gn_acc; long gn_acc_n;     /* unet_gn_accumulate: sums of the window statistics (mean, mean^2 per mean slot, variance per rstd slot) */
-    float *ge_run; size_t ge_ns, ge_twn; long ge_n; int ge_warm, ge_c, ge_nsite; float ge_mom, *ge_tw;   /* cfg.gn_ema: [3][ge_ns] running
+    float *ge_run; int *ge_pv, ge_userun; size_t ge_ns, ge_twn; long ge_n; int ge_warm, ge_c, ge_nsite, ge_live; float ge_mom, *ge_tw;   /* cfg.gn_ema: [3][ge_ns] running
                                                  statistics (live weights, EMA weights, the last batch's; gn_sites layout, [mean g | var g]
                                                  per pair); ge_c: this forward's are the running ones (latched for the backward); ge_tw:
                                                  the convs' live statistics while constant ([n][g] per site at n * offset) */
@@ -133,6 +142,7 @@ struct unet {
     float *muon_mom, *muon_work; size_t muon_work_n;   /* Muon momentum (np) and Newton-Schulz scratch */
     void *muon_descs; int muon_nconv, muon_nconv3, muon_maxco, muon_maxk;   /* batched Muon descriptor table (device) */
     int muon_grp[UNET_MAXCONV + 1], muon_ngrp;   /* plain batched Muon: descriptor groups [grp[i], grp[i + 1]) sharing one scratch pool (muon_table) */
+    int muon_ntrunk; float muon_wd_dm; int mx_fro, mx_stem_adamw; float *mx_lrm; size_t ost_num[8];   /* audit muon: trunk descriptors in the table; --muon-wd-mult (stored as mult - 1: the struct is zeroed), --muon-fro, --muon-stem-adamw; per-matrix static lr multipliers (device); ost group sizes */
     int muon_ninh, muon_part;                /* --init-lr-mult: inherited convs at the table's front (muon_part: the table was built so) */
     int mx_c, mx_hb; float mx_hb_mult;       /* Muon variants: Muon-C, Hyperball (eta = mx_hb_mult x the Muon lr) */
     int mx_ns, mx_nm; float mx_nm_b2;         /* --muon-ns polar (Polar Express maps), --normuon 1 (row normalisation, EMA beta2) */
@@ -142,6 +152,7 @@ struct unet {
     int mx_caut, mx_qkv;                         /* --muon-cautious 1, --muon-qkv-split 1 */
     int ost_arm, ost_have, ost_ngrp, ost_nseg; double *ost_dev; float *ost_snap; size_t ost_snap_n;   /* --opt-stats: armed / collected, the device sums, the AdamW snapshot */
     signed char ost_grp[UNET_MAXCONV]; size_t *ost_seg;                 /* each Muon descriptor's stats group; AdamW segments (off, n, group) */
+    float am_attn, am_out, *am_dev, am_h[UNET_MAXCONV]; unsigned char am_tr[UNET_MAXCONV]; int am_n;   /* --attn-muon-lr / --attn-muon-lr-out: per-descriptor Muon lr multipliers (host, device) */
     int ad_lars, ad_dog; float ad_tgt, ad_b, ad_c, ad_dogmax, ad_lrpeak;   /* adaptive Muon (unet_set_muon_adapt): (b) per-layer control, (c) DoG */
     float *ad_lrm, *ad_ema, *ad_dispbuf, **ad_dispp; double *ad_dogst, *ad_part;   /* their device state */
     float ad_ema_load[UNET_MAXCONV]; int ad_ema_nload; double ad_dog_load[3]; int ad_dog_nload;   /* from a checkpoint, uploaded at the next step */
@@ -260,7 +271,7 @@ struct unet {
     int tba;                                 /* block applications: tbn x cfg.attn_repeat (application a runs block a % tbn) */
     /* cfg.attn_axis 1 / attn_pe 3: the scroll geometry. tb_rb: one device buffer for the ray table, lengths, axis dims, ray positions, the
        stencil weight sums, the grid tokens' scroll positions and the axis frames (at_rays_plan); the host side of a plan; the axis records */
-    at_rays tbr; float *tb_rb, *tb_rayh, *tb_cenh, *tb_axb, *tb_axh; int *tb_lensh, *tb_adh; int tb_Q, tb_Nt, tb_Nr, tb_axn, tb_axs, tb_axdirty, tb_axwarn;
+    at_rays tbr; float *tb_rb, *tb_rayh, *tb_cenh, *tb_axb, *tb_axh; int *tb_lensh, *tb_adh; int tb_Q, tb_Nt, tb_Nr, tb_axn, tb_axs, tb_axdirty, tb_axwarn, tb_noax, tb_noax_warn; long tb_noax_tot;
     int nrg, tb_memn; size_t mem_gate, mem_woff; float *tb_memin, *tb_memf, *tb_memout, *tb_memfh; const float *tb_memsrc;   /* register rows (attn_reg + attn_mem); window memory */
     int tb_nv, tb_vn; size_t view_w, view_b; float *tb_vxp, *tb_ve; const uint8_t *tb_vsrc;   /* scan fusion: view rows per sample, the crops' count; patches, embeddings */
     float *tb_gpos; float *tb_cen; long tb_Tr;
@@ -380,20 +391,29 @@ static void gfilm_fwd(unet *u, long S) {
    dg / S into every token's gradient (tb_cs) */
 static void gfilm_bwd(unet *u, long S) {
     if (!u->cfg.gfilm) return;
-    const int K = u->gf_K, L = u->cfg.nlev; float *dgw = u->gf_dg + K;   /* (dgw: the decoder levels >= gf_top, whole-window on every card) */
+    /* --split with --split-top: the decoder levels >= sp_top run on the whole window on both cards, so their A / B gradients (and their
+       dg shares) are the window's on each card; side 1 drops its A / B copy here (sp_dedup does not cover the gfilm block; without
+       this the allreduce counted them twice: split audit 2026-11-14 #1). The split levels' dg shares are per half and summed by the
+       reduce hook (unet_set_gfilm_reduce; only needed by the token path) */
+    const int K = u->gf_K, L = u->cfg.nlev, top = sp_top_on(u) ? u->sp_top : 0; float *dgw = u->gf_dg + K;   /* (dgw: the whole levels) */
+    const int tok = ufsm_env_on("UFSM_GFILM_TOKGRAD") && !ufsm_env_on("UFSM_GFILM_NO_TOKGRAD");
     nn_zero(u->gf_dg, (size_t)2 * K * 4);
     size_t fo = u->gf_off, co = 0;
     for (int i = L - 2; i >= 0; i--) {
-        const gnp *n = &u->dec[i].n2; const int whole = u->gf_red && u->gf_top > 0 && i >= u->gf_top;
+        const gnp *n = &u->dec[i].n2; const int whole = top > 0 && i >= top;
         nn_gfilm_bwd(u->live, u->g, n->gamma, n->beta, fo, n->c, K, u->gf_g, u->gf_g1 + co, whole ? dgw : u->gf_dg);
-        if (whole && u->gf_dedup) nn_zero(u->g + fo, (size_t)2 * K * n->c * 4);   /* (the other card's identical A / B gradient counts) */
+        if (whole && u->split_side == 1) nn_zero(u->g + fo, (size_t)2 * K * n->c * 4);   /* (side 0's whole-window A / B gradient counts once) */
         fo += (size_t)2 * K * n->c; co += n->c;
     }
-    if (u->gf_red) { u->gf_red(u->gf_redc, u->gf_dg, K); nn_axpy(u->gf_dg, 1.f, dgw, (size_t)K); }   /* (--split: the split levels' shares summed, the whole-window levels' once) */
+    if (u->split_h0 > 0) {   /* the token path's dg: the split levels' shares summed over both halves, the whole levels' once */
+        if (tok && !u->gf_red) { fprintf(stderr, "unet: gfilm token gradient under --split needs unet_set_gfilm_reduce\n"); abort(); }
+        if (tok) u->gf_red(u->gf_redc, u->gf_dg, K);
+        nn_axpy(u->gf_dg, 1.f, dgw, (size_t)K);
+    }
     /* the token path (dg into the attention tokens) is off by default until its check passes (2026-11-13: analytic vs central
        differences 9% apart at the 16-bit noise floor, attention needs the tensor-core path): UFSM_GFILM_TOKGRAD=1 turns it on (no
        parameters change: a run can turn it on later) */
-    if (ufsm_env_on("UFSM_GFILM_TOKGRAD") && !ufsm_env_on("UFSM_GFILM_NO_TOKGRAD")) nn_gfilm_tok(u->tb_cs, K, S, u->gf_dg);
+    if (tok) nn_gfilm_tok(u->tb_cs, K, S, u->gf_dg);
 }
 size_t unet_fstem_off(const unet *u) { return u->fstem_off; }
 size_t unet_gfilm_off(const unet *u) { return u->gf_off; }
@@ -517,6 +537,7 @@ unet *unet_create(const unet_cfg *cfg) {
 static void free_acts(unet *u);
 /* the fp4 kernels memoise prepared weights per conv id, weight pointer and step counter (lp_f4fwd.cuh wmemo): every weight change
    outside a training step (init, load, free: another unet's weights may land at the same address under the same step) clears it */
+static void muon_forget_table(unet *u);
 void unet_free(unet *u) {
     nn_wmemo_clear();
     if (!u) return;
@@ -524,10 +545,10 @@ void unet_free(unet *u) {
     free_acts(u);
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema); nn_free(u->hf_w); nn_free(u->l0fg_mx); free(u->inh);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
-    nn_free(u->wm); nn_free(u->sp24_kb); if (u->muon_mom != u->v) nn_free(u->muon_mom); nn_free(u->muon_work);   /* (aliased into v: mom_alloc) */ nn_free(u->muon_descs); nn_free(u->stem_b);
+    nn_free(u->wm); nn_free(u->sp24_kb); if (u->muon_mom != u->v) nn_free(u->muon_mom); nn_free(u->muon_work);   /* (aliased into v: mom_alloc) */ muon_forget_table(u); nn_free(u->muon_descs); nn_free(u->mx_lrm); nn_free(u->stem_b);
     nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); nn_free(u->mx_nmrows); nn_free(u->mx_nmoff); nn_free(u->mx_vrbuf); nn_free(u->mx_vrp); nn_kron_free(u->mx_kron); nn_free(u->qk_lmax); nn_free(u->mx_mixbuf); nn_free(u->mx_mixp);
-    nn_free(u->ad_lrm); nn_free(u->ad_ema); nn_free(u->ad_dispbuf); nn_free(u->ad_dispp); nn_free(u->ad_dogst); nn_free(u->ad_part); nn_free(u->ost_dev); nn_free(u->ost_snap); free(u->ost_seg);
-    free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_tw); nn_free(u->gf_g); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
+    nn_free(u->am_dev); nn_free(u->ad_lrm); nn_free(u->ad_ema); nn_free(u->ad_dispbuf); nn_free(u->ad_dispp); nn_free(u->ad_dogst); nn_free(u->ad_part); nn_free(u->ost_dev); nn_free(u->ost_snap); free(u->ost_seg);
+    free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_pv); nn_free(u->ge_tw); nn_free(u->gf_g); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs); nn_free(u->ds_g16); nn_free(u->ds_tmp);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
     nn_free(u->wq_r); nn_free(u->wq_rsc); nn_free(u->wq_re); nn_free(u->wq_rsce);
@@ -618,12 +639,15 @@ void unet_init(unet *u, uint64_t seed) {
 
 /* ---- activation buffers ---- */
 /* dry run (unet_train_bytes): the activation allocators only count bytes and hand out a dummy pointer */
-static int g_dry = 0;
-static size_t g_hoff;   /* the last build's (dry or real) pinned host offload bytes; each is copied out and back once per step */
+/* Build state, per thread (mgpu): a build (dry_bytes or a real build_acts) runs start to end on one thread and its caller reads the
+   results (unet_last_offload_bytes, unet_last_dry_l3b, the report) on that thread; DP builds each GPU's net on its own thread, so a
+   process-wide g_dry let one card's dry plan turn another card's real dmalloc into a fake pointer. */
+static thread_local int g_dry = 0;
+static thread_local size_t g_hoff;   /* the last build's (dry or real) pinned host offload bytes; each is copied out and back once per step */
 /* UFSM_MEM_REPORT=1: unet_train_bytes prints the dry build's bytes per buffer group (g_mlab, set in build_acts) */
-static const char *g_mlab = "other";
-static struct { const char *lab; size_t b; int n; } g_mrep[64]; static int g_nmrep = 0;
-static double g_mrep_nv;   /* UFSM_MEM_REPORT=2: every allocation of the dry build, in bytes per input voxel */
+static thread_local const char *g_mlab = "other";
+static thread_local struct { const char *lab; size_t b; int n; } g_mrep[64]; static thread_local int g_nmrep = 0;
+static thread_local double g_mrep_nv;   /* UFSM_MEM_REPORT=2: every allocation of the dry build, in bytes per input voxel */
 static void mrep_add(size_t b) {
     if (g_mrep_nv > 0 && b >= 0.05 * g_mrep_nv) fprintf(stderr, "    alloc %-40s %7.2f B/voxel\n", g_mlab, b / g_mrep_nv);
     int i = 0; while (i < g_nmrep && strcmp(g_mrep[i].lab, g_mlab)) i++;
@@ -1287,7 +1311,10 @@ static void build_acts(unet *u, shape5 xs, int train) {
     }
     if (u->tbn) {   /* attention stage: its output block, fp32 token rows (one set per block input), one block's scratch, gradients */
         g_mlab = "attention stage";
-        if (!nn_get_tf32() || (sp_on(u) && !sp_top_on(u))) { fprintf(stderr, "unet: attention blocks need the tensor-core path and no spatial split (but split_top)\n"); abort(); }
+        /* (the fp32 path: never used in training; test_unet's finite-difference check opts in with UFSM_ATTN_FP32_PATH=1, sweep 11-14:
+           the stage itself is fp32 throughout, tb_fwd / tb_bwd convert through fp32 token rows, and the level output's silu(gn(.)) is
+           materialised in s2 as for every fp32-path block) */
+        if ((!nn_get_tf32() && !getenv("UFSM_ATTN_FP32_PATH")) || (sp_on(u) && !sp_top_on(u))) { fprintf(stderr, "unet: attention blocks need the tensor-core path (UFSM_ATTN_FP32_PATH=1: the fp32 path, tests) and no spatial split (but split_top)\n"); abort(); }
         shape5 y = u->ls[L - 1]; y.c = w[L - 1];
         build_block_acts(u, &u->tb, y, train, 1, nullptr, nullptr, nullptr);
         const long Sg = (long)shape_spatial(y), T = (long)y.n * (Sg + u->nrg); const int C = w[L - 1];
@@ -1844,7 +1871,7 @@ void *unet_l0_3buf_head_free(unet *u) {   /* (created here so a copy stream can 
     if (!u->ev_head) u->ev_head = nn_event_create();
     return u->ev_head;
 }
-static int g_last_dry_l3b;
+static thread_local int g_last_dry_l3b;   /* (per thread: the build state above) */
 int unet_last_dry_l3b(void) { return g_last_dry_l3b; }   /* the last dry build (unet_train_bytes) used the three level-0 buffers */
 /* device bytes of the training activations / gradients at input shape xs under the current storage modes, without allocating
    (dry build); the model is left unbuilt */
@@ -2166,11 +2193,20 @@ static void ge_begin(unet *u) {   /* forward start: latch ge_c, the running stat
     ge_alloc(u);
     u->ge_nsite = 0; gn_sites(u, ge_site1, nullptr);
     if (u->ge_nsite > 192 || (u->ge_nsite & 1)) { fprintf(stderr, "unet: gn_ema: %d GroupNorm sites (at most 192, in pairs)\n", u->ge_nsite); abort(); }
+    if (!u->ge_pv) {   /* the variance slots' mean partners (gn_sites: a site pair is [mean g | var g], adjacent) for nn_gn_pool */
+        int *h = malloc(u->ge_ns * sizeof *h); for (size_t i = 0; i < u->ge_ns; i++) h[i] = -1;
+        for (int i = 0; i + 1 < u->ge_nsite; i += 2) {
+            if (u->ge_so[i + 1] != u->ge_so[i] + (size_t)u->ge_sg[i]) { fprintf(stderr, "unet: gn_ema: sites %d / %d are not a [mean | var] pair\n", i, i + 1); abort(); }
+            for (int g = 0; g < u->ge_sg[i]; g++) h[u->ge_so[i + 1] + g] = (int)(u->ge_so[i] + g);
+        }
+        if (u->ge_ns > 4096) { fprintf(stderr, "unet: gn_ema: %zu statistics (at most 4096)\n", u->ge_ns); abort(); }
+        u->ge_pv = nn_malloc(u->ge_ns * sizeof *h); nn_h2d(u->ge_pv, h, u->ge_ns * sizeof *h); free(h);
+    }
     const int N = u->xs.n;
-    u->ge_c = !gn_frozen(u) && u->ge_n > 0 && (!u->fwd_train || u->ge_n >= u->ge_warm);
+    u->ge_c = !gn_frozen(u) && u->ge_n > 0 && (!u->fwd_train || u->ge_n >= u->ge_warm) && !(u->ge_live && !u->fwd_train);   /* (ge_live: inference on the window's own statistics) */
     if (!u->ge_c) return;
     if (u->fwd_train && u->ge_twn < (size_t)N * u->ge_ns) { nn_free(u->ge_tw); u->ge_twn = (size_t)N * u->ge_ns; u->ge_tw = nn_malloc(u->ge_twn * 4); }
-    const float *run = u->ge_run + (u->using_ema ? u->ge_ns : 0);   /* (EMA weights: their own) */
+    const float *run = u->ge_run + (u->using_ema && !u->ge_userun ? u->ge_ns : 0);   /* (EMA weights: their own) */
     for (int i = 0; i < u->ge_nsite; i += 2) nn_gn_const_fill(u->ge_sp[i], u->ge_sp[i + 1], run + u->ge_so[i], N, u->ge_sg[i], 1e-5f);
 }
 static float *ge_dst(unet *u, float *p) {   /* where a conv writes site p's statistics: p, its twin (constant, training) or nowhere (inference) */
@@ -2188,10 +2224,31 @@ static void ge_after(unet *u) {   /* training forward, live weights: the batch's
     }
     /* a non-finite window's statistics are not pooled (nn_ema_finite; counted, unet_gn_ema_skips): they would make every later forward non-finite */
     unsigned *sk = (unsigned *)(bat + u->ge_ns);
-    if (!u->ge_n) { nn_ema_finite(run, bat, u->ge_ns, 0.f, sk); nn_ema_finite(rune, bat, u->ge_ns, 0.f, nullptr); }
-    else nn_ema_finite(run, bat, u->ge_ns, 1.f - u->ge_mom, sk);
+    if (!u->ge_n) { nn_gn_pool(run, bat, u->ge_ns, u->ge_pv, 0.f, sk); nn_gn_pool(rune, bat, u->ge_ns, u->ge_pv, 0.f, nullptr); }
+    else nn_gn_pool(run, bat, u->ge_ns, u->ge_pv, 1.f - u->ge_mom, sk);
     u->ge_n++;
 }
+void unet_gn_ema_live(unet *u, int on) { u->ge_live = on != 0; }
+/* the 3 x ge_ns statistics (run | rune | the last window's) to / from host: train averages the replicas' sets (targeted/gnorm.md #3) */
+size_t unet_gn_ema_count(unet *u) { if (!u->cfg.gn_ema) return 0; ge_alloc(u); return 3 * u->ge_ns; }
+void unet_gn_ema_get(unet *u, float *h) { ge_alloc(u); nn_d2h(h, u->ge_run, 3 * u->ge_ns * 4); }
+void unet_gn_ema_put(unet *u, const float *h) { ge_alloc(u); nn_h2d(u->ge_run, h, 3 * u->ge_ns * 4); }
+/* how far the EMA weights' statistics (rune) are from the live weights' (run): the largest per-site mean variance ratio, as max(r, 1 / r)
+   (scratch2 step 2357: 5.9). The EMA of a slowly drifting network lags it; predict --ema 1 refuses a net beyond 1.5 unless told (--gn-set) */
+double unet_gn_ema_stale(unet *u) {
+    if (!u->cfg.gn_ema || !u->ge_run || u->ge_n <= 0) return 1.0;
+    ge_alloc(u); float *h = malloc(2 * u->ge_ns * 4); nn_d2h(h, u->ge_run, 2 * u->ge_ns * 4);
+    u->ge_nsite = 0; gn_sites(u, ge_site1, nullptr);
+    double worst = 1.0;
+    for (int i = 0; i + 1 < u->ge_nsite; i += 2) {
+        double a = 0, b = 0; const float *v = h + u->ge_so[i + 1], *w = h + u->ge_ns + u->ge_so[i + 1];
+        for (int g = 0; g < u->ge_sg[i]; g++) { a += v[g]; b += w[g]; }
+        if (!(a > 0) || !(b > 0)) continue;
+        const double r = b / a, q = r > 1 ? r : 1 / r; if (q > worst) worst = q;
+    }
+    free(h); return worst;
+}
+void unet_gn_ema_use_run(unet *u, int on) { u->ge_userun = on; }   /* EMA weights, the live weights' running set */
 void unet_set_gn_ema(unet *u, float mom, int warm) { u->ge_mom = mom; u->ge_warm = warm; }
 /* after unet_load (which takes the checkpoint's): mom >= 0 / warm >= 0 replace them (train --gn-ema-mom / --gn-ema-warm on a resume; saved with
    the next checkpoint). A warm-up beyond the run's length keeps the training forward on batch statistics while the running ones still
@@ -2200,6 +2257,17 @@ void unet_gn_ema_override(unet *u, float mom, int warm) { if (mom >= 0.f) u->ge_
 int unet_gn_ema_warm(const unet *u) { return u->ge_warm; }
 int unet_gn_ema_const(const unet *u) { return u->ge_c; }
 long unet_gn_ema_updates(const unet *u) { return u->ge_n; }
+float *unet_gn_ema_state(unet *u, size_t *n) {   /* the running statistics (live weights', EMA weights') on the device: 2 ge_ns floats, or nullptr */
+    *n = 0; if (!u->cfg.gn_ema || !u->ge_run) return nullptr;
+    *n = 2 * u->ge_ns; return u->ge_run;
+}
+void unet_gn_ema_mean_host(float *const *h, int ng, size_t n) {
+    if (ng < 2) return;
+    for (size_t i = 0; i < n; i++) { double a = 0; for (int g = 0; g < ng; g++) a += h[g][i]; const float m = (float)(a / ng); for (int g = 0; g < ng; g++) h[g][i] = m; }
+}
+int unet_gn_ema_average_due(long updates, int warm, int step, int val_every, int ckpt_every, int steps, int stop) {
+    return updates >= warm || (val_every > 0 && step % val_every == 0) || (ckpt_every > 0 && step % ckpt_every == 0) || step == steps || stop;
+}
 unsigned unet_gn_ema_skips(const unet *u) { unsigned k = 0; if (u->cfg.gn_ema && u->ge_run) nn_d2h(&k, u->ge_run + 3 * u->ge_ns, 4); return k; }
 static void l0_begin(unet *u) {   /* forward start: latch l0_c, the constant statistics into the sites */
     const int md = u->cfg.l0_norm, G = l0_G(u), N = u->xs.n;
@@ -2635,6 +2703,7 @@ static void tb_geom(unet *u) {
     if (!u->tb_rb || !u->tb_axdirty) return;
     const shape5 ys = u->tb.ys; const int n = ys.n, D = ys.d, Hh = ys.h, W = ys.w, Pm = D > Hh ? (D > W ? D : W) : (Hh > W ? Hh : W);
     const int fp = 1 << (u->cfg.nlev - 1), have = u->tb_axh && u->tb_axn == n;
+    u->tb_noax = 0;
     if (!have && !u->tb_axwarn) { fprintf(stderr, "unet: the attention stage has no scroll axis records for %d samples (unet_set_attn_axis): rays along the grid rows\n", n); u->tb_axwarn = 1; }
     for (int b = 0; b < n; b++) {
         float *o = u->tb_axb + (size_t)b * AT_AXR(Pm);
@@ -2645,7 +2714,12 @@ static void tb_geom(unet *u) {
         if (ad < 0 || ad > 2) continue;
         int Np, Nu, Nv; at_ray_plane(ad, D, Hh, W, &Np, &Nu, &Nv);
         o[0] = (float)ad;
-        if (r[1] == 0.f || np != Np * F || u->tb_axs < UNET_AXR(np)) continue;
+        if (r[1] != 0.f && (np != Np * F || u->tb_axs < UNET_AXR(np))) {   /* the record does not describe this grid (a --split z slab or a sub-window net sees a part of the window): no axis for the sample, said once */
+            static int warned;   /* mgpu: debug (warn-once message; a racy double print is harmless) */
+            if (!warned++) fprintf(stderr, "unet: WARNING scroll axis record of sample %d has %d planes (stride %d), the bottleneck grid needs %d x %d (planes x div %d x 2^(nlev-1)): "
+                            "the axis is NOT used for such samples (grid-index positions)\n", b, np, u->tb_axs, Np, F, div);
+            u->tb_noax++; continue; }
+        if (r[1] == 0.f) { u->tb_noax++; continue; }
         o[1] = 1.f;
         for (int k = 0; k < Np; k++) {
             double su = 0, sv = 0;
@@ -2653,6 +2727,10 @@ static void tb_geom(unet *u) {
             o[2 + 2 * k] = (float)((su / F + 0.5) / F - 0.5); o[3 + 2 * k] = (float)((sv / F + 0.5) / F - 0.5);
         }
     }
+    if (have && u->tb_noax && u->cfg.attn_pe == 3) u->tb_noax_tot += u->tb_noax;
+    if (have && u->tb_noax && u->cfg.attn_pe == 3 && (u->tb_noax_warn++ % 1000) == 0)
+        fprintf(stderr, "unet: WARNING %d of %d samples have no scroll axis (--axis / the source's axis missing): the scroll PE falls back to GRID-INDEX positions "
+                        "for them, a different meaning than the trained (r, arc, z) (%ld such samples so far; this message repeats every 1000th)\n", u->tb_noax, n, u->tb_noax_tot);
     at_rays_plan(n, D, Hh, W, attn_ray_mult(), u->tb_axb, u->tb_rayh, u->tb_lensh, u->tb_adh, u->tb_cenh);
     nn_h2d((void *)u->tbr.ray, u->tb_rayh, (size_t)n * u->tb_Q * AT_RAY_F * sizeof(float));
     nn_h2d((void *)u->tbr.lens, u->tb_lensh, (size_t)n * u->tb_Q * sizeof(int));
@@ -2900,7 +2978,8 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         l0_after(u, &u->dec[i]);
         if (!i) ge_after(u);   /* (gn_ema: every site's statistics are in by dec[0]'s) */
         if (train && u->train && u->eh_lg && i == u->cfg.emb_lev) {   /* the distillation head, from the level's output while it is live */
-            if (sp_on(u)) { fprintf(stderr, "unet: the distillation head with the spatial split is not supported\n"); abort(); }
+            if (u->split_h0 > 0) {   /* (not sp_on: off on the whole split-top levels, where the head would run on both cards and count twice) */
+                fprintf(stderr, "unet: the distillation head with the spatial split is not supported\n"); abort(); }
             const block *d = &u->dec[i]; const float *dw = P(u, u->eh.w), *db = P(u, u->eh.b);
             nn_set_head_out_h16(0);
             if (recompute()) { nn_gn_t g = gn_out(u, d); int r; PROF(0, r = nn_conv3d_fwd_x(d->a2, &g, nullptr, nullptr, 0, 0, d->ys, dw, db, u->cfg.emb_ch, 1, 1, u->eh_lg, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("distillation head"); }
@@ -2913,7 +2992,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         cur = u->dec[i].s2;
     }
     if (train && u->train && u->cfg.ds_levels) {   /* deep supervision: each supervised decoder level's own 1^3 head, from its output */
-        if (sp_on(u)) { fprintf(stderr, "unet: deep supervision with the spatial split is not supported\n"); abort(); }
+        if (u->split_h0 > 0) { fprintf(stderr, "unet: deep supervision with the spatial split is not supported\n"); abort(); }   /* (split_h0, not sp_on: split audit #4) */
         nn_set_head_out_h16(0);
         for (int j = 1; j <= u->cfg.ds_levels; j++) {
             const block *d = &u->dec[j]; const float *dw = P(u, u->ds[j].w), *db = P(u, u->ds[j].b);
@@ -3242,9 +3321,12 @@ static float *block_bwd_(unet *u, block *b, int level, const float *gy, float *g
         sp_zero(u, A, b->ys, 1);
         if (b != &u->enc[0]) sp_begin(u, A, b->ys, 1);   /* for conv1's backward-data (enc0 has none) */
     } else {
+    if (!pre) {   /* (pre: gy is already d/d a2 in B -- the attention stage's tb_bwd, which owns the level's output norm n2; sweep 11-14:
+                     applying it again here double-counted n2's gradients and bent every trunk gradient below the stage) */
     PROF(3, nn_gn_apply(b->a2, b->ys, G, P(u, b->n2.gamma), P(u, b->n2.beta), b->m2, b->r2, t1));            /* t1 = g2 */
     PROF(4, nn_silu_bwd(t1, gy, n, A));                                                                        /* A = d/d g2 */
     PROF(3, gn_bwd_b(u, b, 2, b->a2, b->ys, G, P(u, b->n2.gamma), b->m2, b->r2, A, B, g + b->n2.gamma, g + b->n2.beta, u->gn_scratch));   /* B = d/d a2 */
+    }
     if (gid) nn_add_into(B, gid, b->ys, GBF);
     if (save) nn_d2d(save, B, gbytes);
     PROF(3, nn_gn_apply(b->a1, b->ys, G, P(u, b->n1.gamma), P(u, b->n1.beta), b->m1, b->r1, t1));            /* t1 = g1 */
@@ -4029,6 +4111,8 @@ void unet_backward_x(unet *u, const void *gv, int g_h16) {
 
 void unet_zero_grad(unet *u) { nn_zero(u->g, u->np * 4); }
 float *unet_grad_ptr(unet *u) { return u->g; }
+float *unet_param_ptr(unet *u) { return u->p; }
+float *unet_ema_ptr(unet *u) { return u->ema; }
 void unet_grad_d2h(unet *u, float *host) { nn_d2h(host, u->g, u->np * 4); }
 void unet_grad_h2d(unet *u, const float *host) { nn_h2d(u->g, host, u->np * 4); }
 double unet_grad_norm(unet *u) { return sqrt(nn_sumsq(u->g, u->np, u->red_scratch)); }
@@ -4154,14 +4238,21 @@ static void plain_ema(unet *u, size_t off, size_t n, void *arg) { nn_ema(u->ema 
 /* Muon for the 3^3 conv weights (viewed as [Co][Ci * 27]); biases, GroupNorm parameters and the head stay on AdamW.
    Exclude these weights from AdamW: zero gradients still allow decay and stale moments to change them. */
 typedef struct { float lr, beta, wd; } muon_arg;
+static int is_qkv(const unet *u, const convp *c);
 static void muon_conv(unet *u, const convp *c, void *arg) {
-    muon_arg *a = arg; int K = c->cin * c->k * c->k * c->k; size_t n = (size_t)c->cout * K;
+    muon_arg *a = arg;
+    if (u->mx_qkv && is_qkv(u, c) && u->tbd.H > 0 && c->cout % (3 * u->tbd.H) == 0) {   /* the reference path splits Q, K, V per head as the table does */
+        const int R = c->cout / (3 * u->tbd.H);
+        for (int h = 0; h < 3 * u->tbd.H; h++) { convp sl = *c; sl.cout = R; sl.w = c->w + (size_t)h * R * c->cin; u->mx_qkv = 0; muon_conv(u, &sl, arg); u->mx_qkv = 1; }
+        return;
+    } int K = c->cin * c->k * c->k * c->k; size_t n = (size_t)c->cout * K;
     size_t need = 2 * n + 2 * (size_t)c->cout * c->cout;
     if (u->muon_work_n < need) { if (u->muon_work) nn_free(u->muon_work); u->muon_work = nn_malloc(need * 4); u->muon_work_n = need; }
     const float lr = trunk_lr_on(u) && c->w < u->tb_p0 ? a->lr * u->trunk_lr : inh_on(u) && inh_has(u, c->w, n) ? a->lr * u->init_lr : a->lr;
     nn_muon(u->p + c->w, u->g + c->w, u->muon_mom + c->w, c->cout, K, lr, a->beta, a->wd, u->muon_work);
 }
 typedef struct { float *p; const float *g; float *mom, *X, *Y, *A, *B; int Co, K; } muon_desc_t;   /* mirrors nn.cu */
+static void muon_forget_table(unet *u) { if (u->muon_descs) nn_muon_forget(u->muon_descs, sizeof(muon_desc_t) * (size_t)u->muon_nconv); }   /* (the NS host copies keyed on this table) */
 typedef struct { muon_desc_t h[UNET_MAXCONV]; int n, n3; size_t pool; int maxco, maxk; } muon_build_t;
 static int is_qkv(const unet *u, const convp *c) { for (int k = 0; k < u->tbn; k++) if (c == &u->tbm[k][0]) return !u->tbd.dK; return 0; }
 static void muon_collect(unet *u, const convp *c, void *arg) {
@@ -4172,6 +4263,7 @@ static void muon_collect(unet *u, const convp *c, void *arg) {
     }
     muon_build_t *b = arg; int K = c->cin * c->k * c->k * c->k; size_t n = (size_t)c->cout * K;
     if (c->k == 3) b->n3++;
+    if (b->n >= UNET_MAXCONV) { fprintf(stderr, "muon: more than UNET_MAXCONV (%d) matrices (--muon-qkv-split makes 3 x heads per attention block)\n", UNET_MAXCONV); abort(); }
     muon_desc_t *d = &b->h[b->n++]; d->p = u->p + c->w; d->g = u->g + c->w; d->mom = u->muon_mom + c->w; d->Co = c->cout; d->K = K;
     d->X = (float *)(uintptr_t)b->pool; b->pool += n; d->Y = (float *)(uintptr_t)b->pool; b->pool += n;
     d->A = (float *)(uintptr_t)b->pool; b->pool += (size_t)c->cout * c->cout; d->B = (float *)(uintptr_t)b->pool; b->pool += (size_t)c->cout * c->cout;
@@ -4182,6 +4274,8 @@ static int mx_any(const unet *u);
 static void muon_table(unet *u, muon_build_t *b) {   /* the descriptor table and its scratch pool, built once (offsets first, then pointers) */
     for_each_mat(u, muon_collect, b);
     if (u->muon_descs) return;
+    u->muon_ntrunk = 0;   /* the table's trunk descriptors (weights below the attention stage): they come first (for_each_mat order); counted, not 4 x tbn: --muon-qkv-split makes more */
+    if (u->tbn) { int i = 0; while (i < b->n && (size_t)(b->h[i].p - u->p) < u->tb_p0) i++; u->muon_ntrunk = i; for (int j = i; j < b->n; j++) if ((size_t)(b->h[j].p - u->p) < u->tb_p0) { fprintf(stderr, "muon: a trunk matrix after the stage's in the table\n"); abort(); } }
     u->muon_ninh = 0; u->muon_part = inh_on(u);
     if (inh_on(u)) {   /* --init-lr-mult: the inherited convs first (a stable partition), so one batch per learning rate */
         muon_desc_t t[UNET_MAXCONV]; int k = 0;
@@ -4232,6 +4326,9 @@ static void kron_collect(unet *u, const convp *c, void *arg) {
     b->g[b->n] = u->g + c->w; b->Co[b->n] = c->cout; b->Ci[b->n] = c->cin; b->n++;
 }   /* (the previous gradients are not checkpointed: a resumed run's first step uses g_prev = 0) */
 void unet_set_muon_cautious(unet *u, int on) { u->mx_caut = on; }
+void unet_set_muon_wd_mult(unet *u, float mult) { u->muon_wd_dm = mult - 1.f; }
+void unet_set_muon_fro(unet *u, int on) { u->mx_fro = on; }
+void unet_set_muon_stem_adamw(unet *u, int on) { u->mx_stem_adamw = on; }
 void unet_set_muon_qkv_split(unet *u, int on) { u->mx_qkv = on; }
 void unet_qk_clip(unet *u, float tau) {   /* after the optimizer step: the live gains (u->p; a FiLM copy u->fw is rebuilt from them) */
     if (!u->qk_lmax) return;
@@ -4242,13 +4339,41 @@ void unet_qk_put(unet *u, const float *h) { if (u->qk_lmax) nn_h2d(u->qk_lmax, h
 float unet_qk_lmax(unet *u) { float v = -1.f; if (u->qk_last) { nn_d2h(&v, u->qk_last, 4); nn_zero(u->qk_last, 4); } return v; }
 void unet_set_rest_sign(unet *u, int on, float mult) { u->rest_sign = on; u->rest_sign_mult = mult; }
 void unet_set_muon_ademamix(unet *u, float alpha, float b3, int T) { u->mx_mix_a = alpha; u->mx_mix_b3 = b3; u->mx_mix_T = T > 0 ? T : 1; }
-static int mx_any(const unet *u) { return u->mx_c || u->mx_hb || u->mx_ns || u->mx_nm || u->mx_vr != 0.f || u->mx_caut || u->mx_mix_a != 0.f || u->ad_lars || u->ad_dog; }
+static int mx_any(const unet *u) { return u->mx_c || u->mx_hb || u->mx_ns || u->mx_nm || u->mx_vr != 0.f || u->mx_caut || u->mx_mix_a != 0.f || u->ad_lars || u->ad_dog || u->mx_fro; }
 /* adaptive Muon (2026-11-14, DESIGN.md "Fully adaptive Muon"; nn_muon_ext_adapt in nn_opt.cu): lars (b) the per-layer step control toward
    update / weight ratio tgt at the peak lr (0: the matrices' geometric mean), EMA beta, multipliers clamped to [1 / clamp, clamp]; dog (c) the
    DoG global step (first step = lr_peak, capped at dog_max x lr_peak). The (b) EMAs and the (c) scalars ride in checkpoints (adm_ema,
    adm_dog, written only when on); the displacement restarts at a resume (rbar keeps the distance reached). */
 void unet_set_muon_adapt(unet *u, int lars, float tgt, float beta, float clamp, int dog, float dog_max, float lr_peak) {
     u->ad_lars = lars; u->ad_tgt = tgt; u->ad_b = beta; u->ad_c = clamp; u->ad_dog = dog; u->ad_dogmax = dog_max; u->ad_lrpeak = lr_peak;
+}
+/* --attn-muon-lr F / --attn-muon-lr-out F2 (audit 2026-11-14 train #3): the attention stage's linears at F x the Muon lr, the out-projections
+   wo / w2 (tbm[k][1], [3]; zero-initialised, so Muon's fixed-size step is a large relative step while |W| is small) at F x F2. Plain
+   batched Muon: one nn_muon_batch per run of equal multipliers; the ext path (--normuon etc.): nn_madapt.base. 0 or 1: off.
+   (UFSM_MUON_UNBATCHED's per-conv reference path, muon_conv, ignores the multipliers.) */
+void unet_set_attn_muon_lr(unet *u, float all, float out) { u->am_attn = all; u->am_out = out; u->am_n = 0; }
+static int am_on(const unet *u) { return u->tbn && ((u->am_attn > 0.f && u->am_attn != 1.f) || (u->am_out > 0.f && u->am_out != 1.f)); }
+static void am_build(unet *u) {   /* each descriptor's multiplier from its weight offset (a --muon-qkv-split slice lies inside its tbm[k][0]) */
+    if (u->am_n == u->muon_nconv) return;
+    muon_desc_t *h = malloc(sizeof *h * (size_t)u->muon_nconv); nn_d2h(h, u->muon_descs, sizeof *h * (size_t)u->muon_nconv);
+    const float fa = u->am_attn > 0.f ? u->am_attn : 1.f, fo = u->am_out > 0.f ? u->am_out : 1.f;
+    for (int i = 0; i < u->muon_nconv; i++) {
+        const size_t off = (size_t)(h[i].p - u->p); u->am_h[i] = 1.f; u->am_tr[i] = off < u->tb_p0;
+        for (int k = 0; k < u->tbn; k++) for (int j = 0; j < 4; j++) {
+            const convp *c = &u->tbm[k][j]; const size_t n = (size_t)c->cout * c->cin * c->k * c->k * c->k;
+            if (off >= c->w && off < c->w + n) u->am_h[i] = fa * (j == 1 || j == 3 ? fo : 1.f);
+        }
+    }
+    free(h);
+    if (!u->am_dev) u->am_dev = nn_malloc(sizeof(float) * UNET_MAXCONV);
+    nn_h2d(u->am_dev, u->am_h, sizeof(float) * (size_t)u->muon_nconv); u->am_n = u->muon_nconv;
+}
+static void muon_batch(unet *u, int i0, int n, float lr, float beta, float wd);
+static void am_muon(unet *u, float lr, float beta, float wd) {   /* plain batched Muon, one batch per run of equal multipliers (trunk_lr folded in) */
+    am_build(u);
+    float m[UNET_MAXCONV];
+    for (int i = 0; i < u->muon_nconv; i++) m[i] = u->am_h[i] * (trunk_lr_on(u) && u->am_tr[i] ? u->trunk_lr : 1.f);
+    for (int a = 0; a < u->muon_nconv;) { int e = a + 1; while (e < u->muon_nconv && m[e] == m[a]) e++; muon_batch(u, a, e - a, lr * m[a], beta, wd); a = e; }
 }
 static void ad_setup(unet *u, const muon_build_t *b, float beta) {   /* nn_muon_ext_adapt for this step's ext batch (state allocated once) */
     const int n = b->n;
@@ -4274,7 +4399,7 @@ static void ad_setup(unet *u, const muon_build_t *b, float beta) {   /* nn_muon_
     const nn_madapt a = {.lrm = u->ad_lrm, .ema = u->ad_ema, .dog = u->ad_dogst, .disp = u->ad_dispp, .part = u->ad_part, .lr_peak = u->ad_lrpeak,
                          .lars_tgt = u->ad_tgt, .lars_b = u->ad_b, .lars_c = u->ad_c, .dog_eta0 = u->ad_lrpeak, .dog_max = u->ad_dogmax * u->ad_lrpeak,
                          .dog_kappa = (1.f + beta) / (1.f - beta),
-                         .on_lars = u->ad_lars, .on_dog = u->ad_dog};
+                         .on_lars = u->ad_lars, .on_dog = u->ad_dog, .base = am_on(u) ? (am_build(u), u->am_dev) : nullptr};
     nn_muon_ext_adapt(&a);
 }
 typedef struct { int i; int hb[UNET_MAXCONV]; int on; } hb_build_t;
@@ -4343,6 +4468,12 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
     }
     float *const *vp = u->mx_vr != 0.f ? u->mx_vrp : nullptr; const float vg = u->mx_vr;
     nn_muon_ext_opts(u->mx_caut);
+    nn_muon_ext_fro(u->mx_fro);
+    if (trunk_lr_on(u)) {   /* --trunk-lr-mult: the trunk's matrices at trunk_lr x the rate, the stage's at 1 (as the plain path's two batches; audit muon #1) */
+        float hm[UNET_MAXCONV]; for (int i = 0; i < n; i++) hm[i] = (size_t)(b->h[i].p - u->p) < u->tb_p0 ? u->trunk_lr : 1.f;
+        if (!u->mx_lrm) u->mx_lrm = nn_malloc((size_t)n * 4);
+        nn_h2d(u->mx_lrm, hm, (size_t)n * 4);
+    }
     if (u->mx_mix_a != 0.f && !u->mx_mixbuf) {   /* AdEMAMix: m2 per matrix, zero at the start (not checkpointed) */
         size_t t = 0; for (int i = 0; i < n; i++) t += (size_t)b->h[i].Co * b->h[i].K;
         u->mx_mixbuf = nn_malloc(t * 4); nn_zero(u->mx_mixbuf, t * 4); float *ptr[UNET_MAXCONV]; t = 0;
@@ -4352,28 +4483,39 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
     const float mixa = u->mx_mix_a != 0.f ? u->mx_mix_a * fminf(1.f, (float)++u->mx_mix_t / (float)u->mx_mix_T) : 0.f;
     nn_muon_ext_mix(u->mx_mix_a != 0.f ? u->mx_mixp : nullptr, u->mx_mix_b3, mixa);
     float *nr = u->mx_nm ? u->mx_nmrows : nullptr; const float b2 = u->mx_nm_b2;
+    float *const lrm0 = trunk_lr_on(u) ? u->mx_lrm : nullptr;
     if (u->mx_c && nlin) {   /* Muon-C on the convs, the linears (Co x Ci, no kernel) on the plain direction; one row state, offsets sliced */
+        nn_muon_ext_lrmult(lrm0);
         nn_muon_ext_batch(u->muon_descs, nconv3, u->muon_maxco, u->muon_maxk, u->mx_mcd, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
                           u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr, u->mx_ns, nr, u->mx_nmoff, u->mx_nmtot, b2, vp, vg);
         if (u->mx_mix_a != 0.f) nn_muon_ext_mix(u->mx_mixp + nconv3, u->mx_mix_b3, mixa);
         if (u->ost_arm) nn_muon_stats(u->ost_dev, nconv3);
+        nn_muon_ext_lrmult(lrm0 ? lrm0 + nconv3 : nullptr);
         nn_muon_ext_batch((const char *)u->muon_descs + sizeof(muon_desc_t) * (size_t)nconv3, nlin, u->muon_maxco, u->muon_maxk, nullptr, nullptr, 3, 0, 0,
                           nullptr, u->mx_R, 0, u->mx_part, lr, beta, wd, 0.f, u->mx_ns, nr, nr ? u->mx_nmoff + nconv3 : nullptr, u->mx_nmtot, b2, vp ? vp + nconv3 : nullptr, vg);
+        nn_muon_ext_lrmult(nullptr);
         return;
     }
-    if (u->ad_lars || u->ad_dog) ad_setup(u, b, beta);
+    if (u->ad_lars || u->ad_dog || am_on(u)) ad_setup(u, b, beta);
+    nn_muon_ext_lrmult(lrm0);
     nn_muon_ext_batch(u->muon_descs, n, u->muon_maxco, u->muon_maxk, u->mx_c ? u->mx_mcd : nullptr, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
                       u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr, u->mx_ns, nr, u->mx_nmoff, u->mx_nmtot, b2, vp, vg);
-    nn_muon_ext_adapt(nullptr);
+    nn_muon_ext_adapt(nullptr); nn_muon_ext_lrmult(nullptr);
 }
 /* Muon's momentum in the AdamW second-moment buffer v (2026-11-13: -np floats per GPU, 416 MB at the 104 M scratch2 net). AdamW reads v only
    outside the Muon matrices (plain_ranges), the momentum lives only inside them, so the two never meet. UFSM_MUON_MOM_ALIAS=0: a buffer of
    its own. Checkpoints keep the separate layout (v zero on the matrices, the momentum zero elsewhere): mom_mask / mom_load. */
 static int mom_alias_on(const unet *u) { static int v = -1; if (v < 0) v = getenv("UFSM_MUON_MOM_ALIAS") ? ufsm_env_on("UFSM_MUON_MOM_ALIAS") : 1; return v && !u->wq; }
 static int mom_aliased(const unet *u) { return u->muon_mom && u->muon_mom == u->v; }
-static float *mom_alloc(unet *u) { if (mom_alias_on(u)) return u->v; float *m = nn_malloc(u->np * 4); nn_zero(m, u->np * 4); return m; }
+static float *mom_alloc(unet *u);
 typedef struct { size_t o[2 * UNET_MAXCONV]; int n; } mom_rng_t;
 static void mom_rng_add(unet *u, const convp *c, void *arg) { (void)u; mom_rng_t *r = arg; if (r->n < UNET_MAXCONV) { r->o[2 * r->n] = c->w; r->o[2 * r->n + 1] = (size_t)c->cout * c->cin * c->k * c->k * c->k; r->n++; } }
+/* a new Muon momentum buffer, zero. Aliased: the matrices' part of v, zeroed too (mini ckpt audit #4: after an AdamW checkpoint was
+   loaded, v's matrix slice held Adam's second moments, which the lazily allocated momentum then started from) */
+static float *mom_alloc(unet *u) {
+    if (mom_alias_on(u)) { mom_rng_t r = {0}; for_each_mat(u, mom_rng_add, &r); for (int i = 0; i < r.n; i++) nn_zero(u->v + r.o[2 * i], r.o[2 * i + 1] * 4); return u->v; }
+    float *m = nn_malloc(u->np * 4); nn_zero(m, u->np * 4); return m;
+}
 /* host array h (np floats) of the aliased buffer: keep 1 the matrices' part (the momentum), 0 the rest (v) */
 static void mom_mask(unet *u, float *h, int keep) {
     mom_rng_t r = {0}; for_each_mat(u, mom_rng_add, &r);
@@ -4430,18 +4572,27 @@ static void ost_groups(unet *u) {   /* each descriptor's group from its weight o
     for (int i = 0; i < u->muon_nconv; i++) {
         const size_t off = (size_t)(h[i].p - u->p); u->ost_grp[i] = OST_DEEP;
         for (int j = 0; j < m.k; j++) if (off >= m.o[j] && off < m.o[j] + m.n[j]) { u->ost_grp[i] = (signed char)m.g[j]; break; }
+        u->ost_num[u->ost_grp[i]] += (size_t)h[i].Co * h[i].K;   /* group sizes, for the RMS lines */
     }
+    for (int i = 0; i < u->ost_nseg; i++) u->ost_num[u->ost_seg[3 * i + 2]] += u->ost_seg[3 * i + 1];
     free(h);
 }
 void unet_opt_stats_arm(unet *u) { u->ost_arm = 1; }
-static void ost_begin(unet *u) {
+static void ost_alloc(unet *u) {   /* the device sums and the AdamW snapshot (the plain ranges' bytes: 4.3 MB in test_memws) */
     if (!u->ost_dev) { u->ost_dev = nn_malloc((size_t)2 * (UNET_MAXCONV + OST_NG) * sizeof(double)); }
+    if (!u->ost_seg) { ost_segs s = {0}; plain_ranges(u, ost_plain, &s); u->ost_seg = s.seg; u->ost_nseg = s.n; size_t t = 0; for (int i = 0; i < s.n; i++) t += s.seg[3 * i + 1];
+        u->ost_snap_n = t; u->ost_snap = t ? nn_malloc(t * 4) : nullptr; }
+}
+/* train: --opt-stats on GPU 0, before the memory planner measures (they were allocated at the first armed update, after the plan:
+   test_memws "device allocations after step 1", caller unet_muon / ost_adam_before; 2026-11-15) */
+void unet_opt_stats_reserve(unet *u) { ost_alloc(u); }
+static void ost_begin(unet *u) {
+    ost_alloc(u);
     nn_zero(u->ost_dev, (size_t)2 * (UNET_MAXCONV + OST_NG) * sizeof(double));
     nn_muon_stats(u->ost_dev, 0);
 }
 static void ost_adam_before(unet *u) {
-    if (!u->ost_seg) { ost_segs s = {0}; plain_ranges(u, ost_plain, &s); u->ost_seg = s.seg; u->ost_nseg = s.n; size_t t = 0; for (int i = 0; i < s.n; i++) t += s.seg[3 * i + 1];
-        u->ost_snap_n = t; u->ost_snap = t ? nn_malloc(t * 4) : nullptr; }
+    ost_alloc(u);
     size_t t = 0; for (int i = 0; i < u->ost_nseg; i++) { nn_d2d_async(u->ost_snap + t, u->p + u->ost_seg[3 * i], u->ost_seg[3 * i + 1] * 4); t += u->ost_seg[3 * i + 1]; }
 }
 static void ost_adam_after(unet *u) {
@@ -4466,6 +4617,13 @@ int unet_opt_stats_str(unet *u, char *buf, size_t cap) {
         k += (size_t)snprintf(buf + k, cap - k, " %s %.2e", ost_name[g], sqrt(sd[g] / sw[g]));
         if (cnt[g] > 1 && k < cap) k += (size_t)snprintf(buf + k, cap - k, " [%.1e %.1e]", lo[g], hi[g]);
     }
+    /* audit muon #5 / #6: the mechanism behind a gn drift. |W| rms per group (weight decay vs the fixed-size Muon steps shrinks the scale-invariant
+       conv weights toward |W|_eq^2 = lr Co / (2 wd); the loss gradient grows as 1 / |W|) and the realised update rms per element (nominal lr / sqrt(K);
+       3-5x less for low-rank gradients) */
+    if (k < cap) k += (size_t)snprintf(buf + k, cap - k, " | W rms");
+    for (int g = 0; g < OST_NG && k < cap; g++) if (sw[g] > 0 && u->ost_num[g]) k += (size_t)snprintf(buf + k, cap - k, " %s %.3e", ost_name[g], sqrt(sw[g] / (double)u->ost_num[g]));
+    if (k < cap) k += (size_t)snprintf(buf + k, cap - k, " | upd rms");
+    for (int g = 0; g < OST_NG && k < cap; g++) if (sw[g] > 0 && u->ost_num[g]) k += (size_t)snprintf(buf + k, cap - k, " %s %.3e", ost_name[g], sqrt(sd[g] / (double)u->ost_num[g]));
     if (u->ad_lrm && k < cap) {   /* adaptive Muon: the multipliers' range (x eta / lr_peak under DoG) and DoG's eta, rbar, |x - x0| */
         float m[UNET_MAXCONV]; nn_d2h(m, u->ad_lrm, (size_t)u->muon_nconv * 4); float a = m[0], z = m[0]; for (int i = 1; i < u->muon_nconv; i++) { a = fminf(a, m[i]); z = fmaxf(z, m[i]); }
         k += (size_t)snprintf(buf + k, cap - k, " lrm [%.3g %.3g]", a, z);
@@ -4473,9 +4631,118 @@ int unet_opt_stats_str(unet *u, char *buf, size_t cap) {
     }
     return 1;
 }
+/* the optimizer's and the attention's device buffers now, on the current device (train: before the memory planner measures the free memory;
+   2026-11-14 audit: the Muon descriptor table + scratch pool (<= UFSM_MUON_POOL_MB, 128), its momentum (unless aliased into AdamW v) and the
+   cuBLASLt handles / 32 MB workspaces (attention linears, --muon-tc 2 Newton-Schulz) were allocated at the first step, after the plan) */
+int nn_muon_tc_reserve(void);
+void unet_reserve(unet *u, int muon, int muon_tc) {
+    if (u->tbn > 0 && at_reserve()) fprintf(stderr, "unet_reserve: the attention's cuBLASLt handle / workspace failed\n");
+    if (muon && !u->wq) {
+        if (!u->muon_mom) u->muon_mom = mom_alloc(u);
+        if (!u->muon_descs && !mx_any(u) && !ufsm_env_on("UFSM_MUON_UNBATCHED")) { muon_build_t *b = calloc(1, sizeof *b); muon_table(u, b); free(b); }
+        if (muon_tc >= 2 && nn_muon_tc_reserve()) fprintf(stderr, "unet_reserve: the Muon cuBLASLt handle / workspace failed\n");
+    }
+    /* --film / --gfilm: the forward copy of the weights (np floats: 368 MB at 92 M parameters), made at the first forward when nothing
+       else (sparse24 / w4_2d's wm) copies them; it was outside the plan (allocated in step 1, after the planner measured; 2026-11-15) */
+    if ((u->cfg.film || u->cfg.gfilm) && !u->wq && u->fw == u->live && !u->ffw) u->ffw = nn_malloc(u->np * 4);
+}
+/* ---- the kernels' device workspaces for a training window (2026-11-14 audit net#4) ----
+   Every grow-on-demand scratch of the training kernels, sized from the net's convs at the levels of the last (dry) build, mirroring each
+   site's own formula: the lp_buf slots (lp_common.cuh) and the other nn_ws ids (nn_core.cu), plus the fp4 prepared-weight memo (lp_f4fwd.cuh
+   wmemo_get: one pair per conv and pass, allocated at its first call). The planner charges the total (the fixed 550 MB guess held them
+   before, plus whatever they grew to), and with reserve it allocates every nn_ws id at its bound on the current device now, so the step
+   never grows one (cudaFree + cudaMalloc: a device-wide synchronisation mid-step) and a full card fails at start-up instead of an hour
+   in. pre_budget: the fp4 GroupNorm input copy (lp_f4fwd.cuh f4_prenorm_buf, a whole layer) gets the largest layer that fits it (its
+   callers fall back to the in-kernel GroupNorm above that: nn_ws_limit); 0 none. *pre_out: the bytes given to it. */
+typedef struct { size_t id[NN_WS_N]; size_t wmemo, pre_best; size_t pre_budget; } ws_need_t;
+static size_t ws_nb(int c) { return c >= 32 ? (size_t)(c + 31) / 32 : 1; }   /* MX blocks of c channels (narrow levels: one block of c) */
+static size_t ws_r(size_t a, size_t m) { return (a + m - 1) / m * m; }
+static void ws_max(ws_need_t *w, int id, size_t b) { if (b > w->id[id]) w->id[id] = b; }
+static void ws_conv(unet *u, const convp *c, void *arg) {
+    ws_need_t *w = arg;
+    const int lv = conv_level(u, c); if (lv < 0) return;
+    const int L = u->cfg.nlev;
+    shape5 X = u->ls[lv], Y = c->stride == 2 && lv + 1 < L ? u->ls[lv + 1] : u->ls[lv];
+    X.c = c->cin; Y.c = c->cout;
+    const size_t Sx = (size_t)X.n * X.d * X.h * X.w, Sy = (size_t)Y.n * Y.d * Y.h * Y.w, HWx = (size_t)X.h * X.w, HWy = (size_t)Y.h * Y.w;
+    /* weight preparation (lp_s2.cu / lp_f8fwd.cuh / lp_mx_s2bwd_tc.cu: 27-28 taps x Cop x Cip bytes and its scales, either orientation),
+       the 16-bit tensor-core copies (nn_common.cuh tc_wbuf: 27 Cop Cip halves), the fp4 memo (two orientations x the forward, its
+       recompute and the backward-data passes: nq 28 Cop Cip / 2 + ns 28 Cop Cip / 32, Cop / Cip padded to 16 / 32) */
+    const size_t cm = ws_r((size_t)(c->cin > c->cout ? c->cin : c->cout), 32);
+    ws_max(w, NN_WS_LPBUF + 0, 28 * cm * cm); ws_max(w, NN_WS_LPBUF + 1, 28 * cm * (cm / 16 + 2));
+    ws_max(w, NN_WS_TCW, 28 * cm * cm * 2); ws_max(w, NN_WS_TCWSC, cm * 4);
+    { const size_t a = 28 * ws_r(c->cout, 16) * ws_r(c->cin, 32), b = 28 * ws_r(c->cin, 16) * ws_r(c->cout, 32); w->wmemo += 3 * ((a > b ? a : b) / 2 + (a > b ? a : b) / 32);
+      if (getenv("UFSM_W4_MEMO") && !atoi(getenv("UFSM_W4_MEMO"))) { ws_max(w, NN_WS_LPBUF + 2, (a > b ? a : b) / 2); ws_max(w, NN_WS_LPBUF + 3, (a > b ? a : b) / 32); } }   /* (memo off: wmemo_get preps into u8 slots 2 / 3 instead) */
+    /* the fp4 weight gradient's gy pre-pass (lp_f4wgrad.cuh, lp_buf u8 slot 4): z-step slabs of <= UFSM_F4W_GYPRE MiB (96) of records */
+    {
+        const int kb = lp_get_f4w_gypre_kb();
+        const size_t cap_kb = kb >= 0 ? (size_t)kb : (size_t)(getenv("UFSM_F4W_GYPRE") ? atoi(getenv("UFSM_F4W_GYPRE")) : 96) * 1024;
+        const size_t per_zt = (size_t)Y.n * Y.c * ((Y.h + 7) / 8) * ((Y.w + 15) / 16) * 136, nzt = (size_t)(Y.d + 1) / 2, czt = (cap_kb << 10) / per_zt;
+        const size_t szt = czt < 1 ? 1 : czt < nzt ? czt : nzt;
+        if (cap_kb) ws_max(w, NN_WS_LPBUF + 4, per_zt * szt);
+    }
+    /* GroupNorm backward partial sums (lp_mx_gnbwd.cu, lp_buf f32 slot 5): slabs x 2 N C floats */
+    {
+        const size_t S = (size_t)Y.d * Y.h * Y.w, ny = ws_nb(Y.c) * Y.n; size_t slabs = S / 4096, want = (160 + ny - 1) / ny, maxs = S / 512 > 0 ? S / 512 : 1;
+        if (slabs < want) slabs = want;
+        if (slabs > maxs) slabs = maxs;
+        if (slabs > 1024) slabs = 1024;
+        ws_max(w, NN_WS_LPBUF + 6 + 5, slabs * 2 * (size_t)Y.n * Y.c * 4);
+    }
+    /* the fp4 GroupNorm input copy of a conv over a normalised input (lp_f4fwd.cuh: 17 B per 32 channels and voxel): the largest layer
+       under the budget */
+    if (X.c % 32 == 0 && c->cout >= 64) { const size_t b = (size_t)X.n * (X.c / 32) * (Sx / X.n) * 17; if (b <= w->pre_budget && b > w->pre_best) w->pre_best = b; }
+    if (c->stride != 2) return;
+    /* stride-2 backward-data (lp_mx_s2bwd.cu): MX-fp4 gradients through fine-plane chunks of ~96 MB of MX-fp8 rows (gx u8 slot 4, gy slot 5;
+       the dilated fp8 conv inside: the dilated gy slot 2, the accumulate temp slot 3, the flipped weights f32 slot 4); 16-bit / fp8
+       gradients the whole layer. The direct kernels (16 / 32 / 64 channels, the fp4 weight-streaming one) need none of it: an upper bound */
+    const size_t pb = ws_nb(X.c > Y.c ? X.c : Y.c) * HWx * 33;
+    size_t cz = getenv("UFSM_S2B_CZ") ? (size_t)atoi(getenv("UFSM_S2B_CZ")) : (((size_t)96 << 20) / pb) & ~(size_t)1;
+    if (!getenv("UFSM_S2B_CZ") && cz < 2) cz = 2;
+    const int chunked = grad_mx4() && cz >= 2 && cz < (size_t)X.d && X.n == 1 && X.d % 2 == 0 && Y.d == X.d / 2;
+    const size_t nf = chunked ? cz + 1 : Sx / HWx, ncz = chunked ? cz / 2 + 1 : Sy / HWy;
+    ws_max(w, NN_WS_LPBUF + 4, ws_nb(X.c) * nf * HWx * 33); ws_max(w, NN_WS_LPBUF + 5, ws_nb(Y.c) * ncz * HWy * 33);
+    if (X.c >= 64 && Y.c >= 64) { ws_max(w, NN_WS_LPBUF + 2, ws_nb(Y.c) * nf * HWx * 33); ws_max(w, NN_WS_LPBUF + 3, ws_nb(X.c) * nf * HWx * 33); }
+    ws_max(w, NN_WS_LPBUF + 6 + 4, (size_t)X.c * Y.c * 27 * 4); ws_max(w, NN_WS_LPBUF + 6 + 2, (size_t)X.c * Y.c * 27 * 4);
+    if (X.c <= 64) ws_max(w, NN_WS_LPBUF + 18, (size_t)27 * X.c * (X.c + 8) * 2);   /* (lp_mx_s2bwd_tc.cu: bf16 weights, 16 - 64 channels) */
+    ws_max(w, NN_WS_S2BCP, ws_nb(Y.c) * Sy * 17);   /* (lp_mx_s2bwd_tc.cu: the gy copy when the planner's gy and gx overlap) */
+}
+size_t unet_ws_plan(unet *u, shape5 xs, size_t pre_budget, int reserve, size_t *pre_out) {
+    (void)xs;   /* (the levels of the last build: u->ls) */
+    ws_need_t w; memset(&w, 0, sizeof w); w.pre_budget = pre_budget;
+    for_each_conv3(u, ws_conv, &w);
+    /* the 1^3 heads' backward-data on the tensor cores (lp_mx_gnbwd.cu conv1_to_mx_tc, from nn_bwd.cu bwd_data_impl_ / nn_fusedgn.cu
+       nn_head_bwd_z): fp16 transposed weights + row scales (f16 slot 0). Its "input" is the logit gradient: Ci = the head's cout (17 - 192),
+       Co = the head's cin (a multiple of 32); halves Co * Kp + 2 Co with Kp = Ci rounded up to 32. (The first version had Ci / Co swapped:
+       test_memws, plan mode 4 / MX gradients, 0.0 -> 0.1 MB growth after the plan.) The main head, the deep-supervision and distillation heads */
+    {
+        const convp *hs[UNET_MAXLEV + 2]; int nh = 0; hs[nh++] = &u->head;
+        for (int j = 1; j <= u->cfg.ds_levels && j < UNET_MAXLEV; j++) hs[nh++] = &u->ds[j];
+        if (u->cfg.emb_lev) hs[nh++] = &u->eh;
+        for (int k = 0; k < nh; k++) { const int ci = hs[k]->cout, co = hs[k]->cin;
+            if (hs[k]->k == 1 && ci > 16 && ci <= 192 && co > 0 && co % 32 == 0) ws_max(&w, NN_WS_LPBUF + 12, ((size_t)co * ws_r(ci, 32) + 2 * (size_t)co) * 2); }
+    }
+    w.id[NN_WS_F4PRE] = w.pre_best;
+    size_t t = w.wmemo;
+    for (int i = 0; i < NN_WS_N; i++) t += (w.id[i] + 255) & ~(size_t)255;
+    if (pre_out) *pre_out = w.pre_best;
+    if (reserve) {
+        for (int i = 0; i < NN_WS_N; i++)
+            if (w.id[i] && nn_ws_reserve(i, w.id[i])) fprintf(stderr, "unet_ws_plan: cannot reserve %.1f MB for %s (it grows at first use)\n", w.id[i] / 1e6, nn_ws_name(i));
+        nn_ws_limit(NN_WS_F4PRE, w.pre_best ? w.pre_best : 1);   /* (larger layers: the in-kernel GroupNorm) */
+        if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) > 0) {
+            fprintf(stderr, "memory: kernel workspaces %.2f GB (fp4 weight memo %.2f GB, charged; reserved now:", t / 1e9, w.wmemo / 1e9);
+            for (int i = 0; i < NN_WS_N; i++) if (w.id[i]) fprintf(stderr, " %s %.1f MB;", nn_ws_name(i), w.id[i] / 1e6);
+            fprintf(stderr, ")\n");
+        }
+    }
+    return t;
+}
 void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, float b2, float eps, float wd, int step) {
+    const float wd_adam = wd;
+    wd *= 1.f + u->muon_wd_dm;   /* --muon-wd-mult (default 1): the matrices' decay only */
     if (head_lr_mode(u)) lr_muon *= u->trunk_lr;   /* (the 3^3 convs: all trunk; the head is on AdamW) */
-    if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd, step); return; }   /* packed weights: AdamW only */
+    if (u->wq) { unet_adamw(u, lr_adam, b1, b2, eps, wd_adam, step); return; }   /* packed weights: AdamW only */
     if (!u->muon_mom) u->muon_mom = mom_alloc(u);
     if (u->ost_arm) ost_begin(u);
     if (u->mx_kr) {   /* the 3^3 convs' gradients preconditioned in place (Kronecker factors), then Muon on them as on any gradient */
@@ -4493,18 +4760,21 @@ void unet_muon(unet *u, float lr_muon, float beta, float lr_adam, float b1, floa
     } else {
         if (!u->muon_descs) { muon_build_t b = {0}; muon_table(u, &b); }
         if (inh_on(u) && !u->muon_part) { fprintf(stderr, "unet: --init-lr-mult set after the Muon table was built\n"); abort(); }
-        if (inh_on(u)) {   /* the inherited convs first (muon_table), then the fresh ones */
+        if (am_on(u)) {
+            if (inh_on(u)) { fprintf(stderr, "unet: --attn-muon-lr is not supported with --init-lr-mult\n"); abort(); }
+            am_muon(u, lr_muon, beta, wd);
+        } else if (inh_on(u)) {   /* the inherited convs first (muon_table), then the fresh ones */
             const int ni = u->muon_ninh, nf = u->muon_nconv - ni;
             if (ni) muon_batch(u, 0, ni, lr_muon * u->init_lr, beta, wd);
             if (nf) muon_batch(u, ni, nf, lr_muon, beta, wd);
         } else if (trunk_lr_on(u)) {   /* the table is the trunk's convs, then the stage's 4 x tbn linears (for_each_mat): two batches */
-            const int na = 4 * u->tbn, nt = u->muon_nconv - na;
+            const int nt = u->muon_ntrunk;
             muon_batch(u, 0, nt, lr_muon * u->trunk_lr, beta, wd);
-            muon_batch(u, nt, na, lr_muon, beta, wd);
+            muon_batch(u, nt, u->muon_nconv - nt, lr_muon, beta, wd);
         } else muon_batch(u, 0, u->muon_nconv, lr_muon, beta, wd);
     }
     if (u->ost_arm) ost_adam_before(u);
-    adamw_nonconv(u, lr_adam, b1, b2, eps, wd, step);
+    adamw_nonconv(u, lr_adam, b1, b2, eps, wd_adam, step);
     if (u->ost_arm) ost_adam_after(u);
 }
 /* ANVIL II on the 3^3 conv weights (see nn.cu); AdamW elsewhere. step counts from 1; rail schedule as in the nanogpt record. */
@@ -4549,9 +4819,10 @@ void unet_anvil(unet *u, float lr, float wd, int step, int steps, float lr_adam,
 void unet_ema(unet *u, float decay) {
     if (u->wq) wq_ema(u, decay); else nn_ema(u->ema, u->p, u->np, decay);
     if (u->cfg.l0_norm == 2 && u->l0_n) { const size_t G = (size_t)G_of(u, u->cfg.widths[0]); nn_ema(u->l0run + 8 * G, u->l0run + 16 * G, 8 * G, decay); }   /* the EMA weights' statistics */
-    if (u->cfg.gn_ema && u->ge_n) nn_ema(u->ge_run + u->ge_ns, u->ge_run + 2 * u->ge_ns, u->ge_ns, decay);   /* gn_ema: the EMA weights' statistics */
+    if (u->cfg.gn_ema && u->ge_n && u->ge_pv) nn_gn_pool(u->ge_run + u->ge_ns, u->ge_run + 2 * u->ge_ns, u->ge_ns, u->ge_pv, decay, nullptr);   /* gn_ema: the EMA weights' statistics */
 }
 const float *unet_live_params(const unet *u) { return u->p; }
+const float *unet_active_params(const unet *u) { return u->live ? u->live : u->p; }   /* the weights the forward reads (EMA after unet_use_ema(u, 1)) */
 /* zero every gradient but the output head's (weights and biases): train only the head on frozen features */
 void unet_grad_head_only(unet *u, int blocks) {   /* blocks: also train the last decoder blocks dec[blocks-1] .. dec[0] */
     const int k = blocks < 0 ? 0 : blocks > u->cfg.nlev - 1 ? u->cfg.nlev - 1 : blocks;
@@ -4643,8 +4914,11 @@ static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), v
     for (int i = 0; i < L - 1; i++) { fn(u, &u->down[i], arg); fn(u, &u->dec[i].c1, arg); if (!u->dec[i].single) fn(u, &u->dec[i].c2, arg); }
     for (int i = 0; i < L; i++) for (int k = 0; k < u->cfg.enc_blocks[i]; k++) { fn(u, &u->rb[i][k].c1, arg); fn(u, &u->rb[i][k].c2, arg); }
 }
+typedef struct { void (*fn)(unet *, const convp *, void *); void *arg; const convp *skip; } mat_skip;
+static void mat_skip_fn(unet *u, const convp *c, void *a) { mat_skip *m = a; if (c != m->skip) m->fn(u, c, m->arg); }
 static void for_each_mat(unet *u, void (*fn)(unet *, const convp *, void *), void *arg) {
-    for_each_conv3(u, fn, arg);
+    if (u->mx_stem_adamw) { mat_skip m = {fn, arg, &u->enc[0].c1}; for_each_conv3(u, mat_skip_fn, &m); }   /* --muon-stem-adamw 1: the first conv (Ci input channels x 27 taps) on AdamW */
+    else for_each_conv3(u, fn, arg);
     for (int k = 0; k < u->tbn; k++) for (int j = 0; j < 4; j++) fn(u, &u->tbm[k][j], arg);
 }
 static int conv_level(const unet *u, const convp *c) {   /* the U-Net level a 3^3 conv runs at (a down conv: its input's level) */
@@ -4817,15 +5091,19 @@ static void wq_ema(unet *u, float decay) {
 void unet_wquant(unet *u, unsigned seed) { (void)u; (void)seed; }   /* kept for API compatibility: packed storage makes it unnecessary */
 
 /* ---- checkpoints ---- */
-static float g_loaded_sp24_r = 0.f;
-static int g_loaded_sparse = 0, g_loaded_sp24_lv = 0, g_loaded_sp24_hard = 0, g_loaded_wq = 0, g_loaded_muon = 0;   /* set by the header parser, applied by unet_load */
-static float g_loaded_hbR[UNET_MAXCONV]; static int g_loaded_hbR_n = 0;
-static float g_loaded_adema[UNET_MAXCONV]; static int g_loaded_adema_n; static double g_loaded_addog[3]; static int g_loaded_addog_n;   /* adaptive Muon state */   /* Hyperball radii of the header */
-static size_t *g_loaded_inh; static int g_loaded_ninh;   /* init_inh of the header (pairs) */
+/* The header parser's results, per thread (mgpu): read_header fills them and unet_load / unet_load_grow apply them on the same thread;
+   a unet_peek or a load on another thread (DP loads per GPU thread) no longer overwrites a load in progress. */
+static thread_local float g_loaded_sp24_r = 0.f;
+static thread_local int g_loaded_sparse = 0, g_loaded_sp24_lv = 0, g_loaded_sp24_hard = 0, g_loaded_wq = 0, g_loaded_muon = 0;   /* set by the header parser, applied by unet_load */
+static thread_local float g_loaded_hbR[UNET_MAXCONV]; static thread_local int g_loaded_hbR_n = 0;
+static thread_local float g_loaded_adema[UNET_MAXCONV]; static thread_local int g_loaded_adema_n; static thread_local double g_loaded_addog[3]; static thread_local int g_loaded_addog_n;   /* adaptive Muon state */   /* Hyperball radii of the header */
+static thread_local size_t *g_loaded_inh; static thread_local int g_loaded_ninh;   /* init_inh of the header (pairs) */
 static void inh_add(unet *u, size_t off, size_t n);
-static int g_loaded_lat_c; static float g_loaded_lat_step, g_loaded_lat_gain[29], g_loaded_lat_bas[29 * 64];   /* the cell transform of the last header read */
-static long g_loaded_ge_n; static int g_loaded_ge_warm; static float g_loaded_ge_mom, *g_loaded_ge_run; static size_t g_loaded_ge_cnt;   /* cfg.gn_ema */
-static long g_loaded_l0_n; static int g_loaded_l0_warm, g_loaded_l0_cnt; static float g_loaded_l0_mom, g_loaded_l0_run[16 * 256];   /* cfg.l0_norm ema */
+static thread_local int g_loaded_lat_c; static thread_local float g_loaded_lat_step, g_loaded_lat_gain[29], g_loaded_lat_bas[29 * 64];   /* the cell transform of the last header read */
+static float g_um_rungs[8]; static int g_um_rungs_n;   /* train --um-rungs (header key um_rungs, only when set) */   /* mgpu: main (checkpoint header parse) */
+void unet_set_um_rungs(const float *um, int n) { g_um_rungs_n = n < 0 ? 0 : n > 8 ? 8 : n; for (int i = 0; i < g_um_rungs_n; i++) g_um_rungs[i] = um[i]; }
+static thread_local long g_loaded_ge_n; static thread_local int g_loaded_ge_warm; static thread_local float g_loaded_ge_mom, *g_loaded_ge_run; static thread_local size_t g_loaded_ge_cnt;   /* cfg.gn_ema */
+static thread_local long g_loaded_l0_n; static thread_local int g_loaded_l0_warm, g_loaded_l0_cnt; static thread_local float g_loaded_l0_mom, g_loaded_l0_run[16 * 256];   /* cfg.l0_norm ema */
 /* debug: per block, the GroupNorm statistics of the last forward (mean / rstd of a1 and a2 per sample and group:
    non-finite counts and extremes) and the largest |weight| of each conv. Localises a non-finite forward. */
 void unet_debug_stats(const unet *u) {
@@ -4850,7 +5128,29 @@ void unet_debug_stats(const unet *u) {
         fprintf(stderr, " max|w| %.3g %.3g\n", w1, w2); free(h);
     }
 }
-/* debug: per block, the gradient norm of each 3^3 conv weight (c1, c2) and of the attention blocks' linears; the head */
+/* the gradient's squared norm per layer group (targeted/dpgrad #3: a per-group gradient noise scale; the whole-vector one is dominated by the heads
+   while Muon normalises every matrix): one group per U-Net block (both 3^3 convs), per attention block (its four linears), the head, and the
+   rest (biases, norms, FiLM, ... = total - listed, clamped at 0). ss[0..n) in that order, names[i] a short label; returns n (<= nmax, 0: none) */
+int unet_grad_groups(unet *u, double *ss, char (*names)[8], int nmax) {
+    const int L = u->cfg.nlev; int n = 0; double tot = nn_sumsq(u->g, u->np, u->red_scratch), lst = 0;
+    #define GG_(nm_, a_, b_, c_, d_) do { if (n < nmax - 1) { double v_ = 0; \
+        for (int q_ = 0; q_ < 2; q_++) { const size_t o_ = q_ ? (b_) : (a_), k_ = q_ ? (d_) : (c_); if (k_) v_ += nn_sumsq(u->g + o_, k_, u->red_scratch); } \
+        ss[n] = v_; lst += v_; snprintf(names[n], 8, "%s", nm_); n++; } } while (0)
+    for (int i = 0; i < 2 * L - 1; i++) {
+        const block *b = i < L ? &u->enc[i] : &u->dec[2 * L - 2 - i]; const int li = i < L ? i : 2 * L - 2 - i; char nm[8]; snprintf(nm, 8, "%s%d", i < L ? "e" : "d", li);
+        GG_(nm, b->c1.w, b->c2.w, (size_t)b->c1.cout * b->c1.cin * 27, (size_t)b->c2.cout * b->c2.cin * 27);
+    }
+    for (int k = 0; k < u->tbn; k++) {
+        double v = 0; for (int m = 0; m < 4; m++) { const convp *c = &u->tbm[k][m]; v += nn_sumsq(u->g + c->w, (size_t)c->cin * c->cout, u->red_scratch); }
+        if (n < nmax - 1) { ss[n] = v; lst += v; snprintf(names[n], 8, "t%d", k); n++; }
+    }
+    GG_("head", u->head.w, 0, (size_t)u->head.cin * u->head.cout, 0);
+    #undef GG_
+    if (n < nmax) { ss[n] = tot > lst ? tot - lst : 0; snprintf(names[n], 8, "rest"); n++; }
+    return n;
+}
+/* debug (also train UFSM_GRAD_LAYERS=N): per block the gradient norm of each 3^3 conv weight (c1, c2), the down convs, the residual blocks, the
+   attention blocks' linears (t<block>.<0 qkv, 1 out, 2 mlp in, 3 mlp out>), the head; all = the whole gradient's norm */
 void unet_debug_grads(const unet *u, const char *tag) {
     const int L = u->cfg.nlev; float *h = malloc(u->np * 4); nn_d2h(h, u->g, u->np * 4);
     #define GN_(off, n) ({ double a_ = 0; for (size_t k_ = 0; k_ < (size_t)(n); k_++) a_ += (double)h[(off) + k_] * h[(off) + k_]; sqrt(a_); })
@@ -4860,8 +5160,16 @@ void unet_debug_grads(const unet *u, const char *tag) {
         const size_t n1 = (size_t)b->c1.cout * b->c1.cin * 27, n2 = (size_t)b->c2.cout * b->c2.cin * 27;
         fprintf(stderr, " %s%d %.2e/%.2e", i < L ? "e" : "d", li, GN_(b->c1.w, n1), GN_(b->c2.w, n2));
     }
+    for (int i = 0; i < L - 1; i++) fprintf(stderr, " dn%d %.2e", i, GN_(u->down[i].w, (size_t)u->down[i].cout * u->down[i].cin * u->down[i].k * u->down[i].k * u->down[i].k));
+    for (int i = 0; i < L; i++) for (int k = 0; k < u->cfg.enc_blocks[i]; k++) { const block *b = &u->rb[i][k];
+        fprintf(stderr, " rb%d.%d %.2e/%.2e", i, k, GN_(b->c1.w, (size_t)b->c1.cout * b->c1.cin * 27), GN_(b->c2.w, (size_t)b->c2.cout * b->c2.cin * 27)); }
     for (int k = 0; k < u->tbn; k++) for (int m = 0; m < 4; m++) { const convp *c = &u->tbm[k][m]; fprintf(stderr, " t%d.%d %.2e", k, m, GN_(c->w, (size_t)c->cin * c->cout)); }
-    fprintf(stderr, " head %.2e\n", GN_(u->head.w, (size_t)u->head.cin * u->head.cout));
+    fprintf(stderr, " head %.2e (b %.2e) all %.2e\n", GN_(u->head.w, (size_t)u->head.cin * u->head.cout), GN_(u->head.b, (size_t)u->head.cout), GN_((size_t)0, u->np));   /* (all: the whole net, the logged gn's) */
+    if (u->tbn) {   /* the attention linears' weight norms (zero-initialised out projections grow from 0 under Muon's fixed-size steps) */
+        nn_d2h(h, u->p, u->np * 4); fprintf(stderr, "weights %s:", tag);
+        for (int k = 0; k < u->tbn; k++) for (int m = 0; m < 4; m++) { const convp *c = &u->tbm[k][m]; fprintf(stderr, " t%d.%d %.3e", k, m, GN_(c->w, (size_t)c->cin * c->cout)); }
+        fprintf(stderr, "\n");
+    }
     #undef GN_
     free(h);
 }
@@ -4895,15 +5203,52 @@ void unet_debug_acts(const unet *u) {
     }
     for (int i = L - 2; i >= 0; i--) { const block *b = &u->dec[i]; fprintf(stderr, "dec%d:", i); dbg_tensor("a1", b->a1, b->ys); dbg_tensor("a2", b->a2, b->ys); fprintf(stderr, "\n"); }
 }
+/* a header float: %.9g, non-finite as NaN / Infinity / -Infinity (mini ckpt audit #10: "nan" / "inf" are not JSON; Python's json and
+   strtof / json_parse's strtod all read these spellings, so old binaries load them unchanged) */
+static void wfl(FILE *f, const char *sep, double v, int dig) {
+    if (isnan(v)) fprintf(f, "%sNaN", sep); else if (isinf(v)) fprintf(f, "%s%sInfinity", sep, v < 0 ? "-" : ""); else fprintf(f, "%s%.*g", sep, dig, v);
+}
+/* one JSON object, structurally whole: braces / brackets balanced outside strings, nothing after the closing brace but a newline (a
+   truncated extra loses its closing braces). unet.c links without json.c (dozens of test targets), so a structural scan, not a parse */
+static int json_whole_object(const char *s, size_t n) {
+    while (n && (s[n - 1] == '\n' || s[n - 1] == ' ')) n--;
+    if (!n || s[0] != '{' || s[n - 1] != '}') return 0;
+    int depth = 0, str = 0;
+    for (size_t i = 0; i < n; i++) {
+        const char c = s[i];
+        if (str) { if (c == '\\') i++; else if (c == '"') str = 0; continue; }
+        if (c == '"') str = 1; else if (c == '{' || c == '[') depth++; else if (c == '}' || c == ']') { if (--depth < 0) return 0; if (!depth && i != n - 1) return 0; }
+        else if ((unsigned char)c < 32 && c != '\t') return 0;
+    }
+    return !depth && !str;
+}
+/* the written checkpoint read back before it replaces the previous one (mini ckpt audit #1): magic, a header line within
+   UFSM_CHECKPOINT_HEADER (what every reader allows), a whole JSON object, nparams, and the file size of exactly narr arrays */
+static const char *ckpt_verify(const char *tmp, size_t np, int narr) {
+    FILE *f = fopen(tmp, "rb"); if (!f) return "cannot reopen";
+    char *line = malloc(UFSM_CHECKPOINT_HEADER); char mg[4]; const char *why = nullptr;
+    if (!line || fread(mg, 1, 4, f) != 4 || memcmp(mg, "UFSM", 4)) why = "no magic";
+    else if (!fgets(line, UFSM_CHECKPOINT_HEADER, f) || !strchr(line, '\n')) why = "header line over the readers' limit (UFSM_CHECKPOINT_HEADER)";
+    else {
+        const long off = ftell(f); struct stat st; const char *q = strstr(line, "\"nparams\":");
+        if (!json_whole_object(line, strlen(line))) why = "header is not one whole JSON object (a truncated extra?)";
+        else if (!q || (size_t)strtoull(q + 10, nullptr, 10) != np) why = "nparams";
+        else if (fstat(fileno(f), &st) || (long long)st.st_size != (long long)off + 4ll * (long long)np * narr) why = "file size";
+    }
+    fclose(f); free(line); return why;
+}
 int unet_save(const unet *u, const char *path, int step, const char *extra) {
     {   /* a latched CUDA error: the device weights are not trustworthy (a failed copy / launch left them stale or zero): no checkpoint */
         nn_sync(); const char *e = nn_check();
         if (e) { fprintf(stderr, "unet_save: CUDA error %s at %s: %s not written\n", e, nn_check_site(), path); return -1; }
     }
+    if (extra) {   /* a truncated extra (snprintf chains into fixed buffers) would make the header unreadable: refuse before touching anything */
+        if (!json_whole_object(extra, strlen(extra))) { fprintf(stderr, "unet_save: the header's extra is not a JSON object (truncated?): %s not written, the previous one kept\n", path); return -1; }
+    }
     char tmp[1400];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "wb");
-    if (!f) return -1;
+    if (!f) { fprintf(stderr, "unet_save: cannot create %s\n", tmp); return -1; }
     fprintf(f, "UFSM{\"nlev\":%d,\"widths\":[", u->cfg.nlev);
     for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.widths[i]);
     fputc(']', f);
@@ -4914,9 +5259,9 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.half_res) fprintf(f, ",\"half_res\":%d", u->cfg.half_res);
     if (u->cfg.lat_guide) fprintf(f, ",\"lat_guide\":%d", u->cfg.lat_guide);
     if (u->lat_C) {   /* the cell transform: rows of 64 weights, the gains, the step */
-        fprintf(f, ",\"lat_c\":%d,\"lat_step\":%.9g,\"lat_gain\":[", u->lat_C, u->lat_step);
-        for (int i = 0; i < u->lat_C; i++) fprintf(f, "%s%.9g", i ? "," : "", u->lat_hg[i]);
-        fputs("],\"lat_basis\":[", f); for (int i = 0; i < u->lat_C * 64; i++) fprintf(f, "%s%.9g", i ? "," : "", u->lat_hb[i]); fputc(']', f);
+        fprintf(f, ",\"lat_c\":%d", u->lat_C); wfl(f, ",\"lat_step\":", u->lat_step, 9); fputs(",\"lat_gain\":[", f);
+        for (int i = 0; i < u->lat_C; i++) wfl(f, i ? "," : "", u->lat_hg[i], 9);
+        fputs("],\"lat_basis\":[", f); for (int i = 0; i < u->lat_C * 64; i++) wfl(f, i ? "," : "", u->lat_hb[i], 9); fputc(']', f);
     }
     if (u->cfg.w4_2d) fprintf(f, ",\"w4_2d\":%d", u->cfg.w4_2d);
     if (u->cfg.ds_levels) fprintf(f, ",\"ds_levels\":%d", u->cfg.ds_levels);
@@ -4936,17 +5281,18 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.l0_norm == 4) fprintf(f, ",\"l0_slab\":%d", u->cfg.l0_slab);
     if (u->cfg.l0_norm == 2) {   /* the running statistics (live weights, EMA weights; l0_site order, [mean G | var G] each) and their state */
         const int n = 16 * G_of(u, u->cfg.widths[0]); float *r = malloc((size_t)n * 4); nn_d2h(r, u->l0run, (size_t)n * 4);
-        fprintf(f, ",\"l0_n\":%ld,\"l0_warm\":%d,\"l0_mom\":%.9g,\"l0_run\":[", u->l0_n, u->l0_warm, u->l0_mom);
-        for (int i = 0; i < n; i++) fprintf(f, "%s%.9g", i ? "," : "", r[i]);
+        fprintf(f, ",\"l0_n\":%ld,\"l0_warm\":%d", u->l0_n, u->l0_warm); wfl(f, ",\"l0_mom\":", u->l0_mom, 9); fputs(",\"l0_run\":[", f);
+        for (int i = 0; i < n; i++) wfl(f, i ? "," : "", r[i], 9);
         fputc(']', f); free(r);
     }
     if (u->cfg.scan_norm) fputs(",\"scan_norm\":1", f);
     if (u->cfg.skip_thr > 0) fprintf(f, ",\"skip_empty\":[%d,%d,%d]", u->cfg.skip_thr - 1, u->cfg.skip_margin, u->cfg.skip_nl);
+    if (g_um_rungs_n > 0) { fputs(",\"um_rungs\":[", f); for (int i = 0; i < g_um_rungs_n; i++) fprintf(f, "%s%.6g", i ? "," : "", g_um_rungs[i]); fputc(']', f); }   /* (train --um-rungs: predict checks its level against them) */
     if (u->cfg.gfilm) fputs(",\"gfilm\":1", f);
     if (u->cfg.gn_ema) {   /* the running statistics of every site (live weights, EMA weights; gn_sites layout) and their state */
         ge_alloc(u); const size_t n = 2 * u->ge_ns; float *r = malloc(n * 4); nn_d2h(r, u->ge_run, n * 4);
-        fprintf(f, ",\"gn_ema\":1,\"ge_n\":%ld,\"ge_warm\":%d,\"ge_mom\":%.9g,\"ge_run\":[", u->ge_n, u->ge_warm, u->ge_mom);
-        for (size_t i = 0; i < n; i++) fprintf(f, "%s%.9g", i ? "," : "", r[i]);
+        fprintf(f, ",\"gn_ema\":1,\"ge_n\":%ld,\"ge_warm\":%d", u->ge_n, u->ge_warm); wfl(f, ",\"ge_mom\":", u->ge_mom, 9); fputs(",\"ge_run\":[", f);
+        for (size_t i = 0; i < n; i++) wfl(f, i ? "," : "", r[i], 9);
         fputc(']', f); free(r);
     }
     { int any = 0; for (int i = 0; i < u->cfg.nlev; i++) any |= u->cfg.dec_convs[i] == 1;
@@ -4954,35 +5300,50 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     fprintf(f, ",\"cin\":%d,\"cout\":%d,\"G\":%d,\"down_norm\":%d,\"scale_cond\":%d,\"nparams\":%zu,\"step\":%d,\"sparse24\":%d,\"wq\":%d,\"muon_mom\":%d", u->cfg.cin, u->cfg.cout, u->cfg.G, u->cfg.down_norm, u->cfg.scale_cond, u->np, step, u->sparse24, u->wq, u->muon_mom != nullptr);
     if (u->sp24_lv) fprintf(f, ",\"sparse24_lv\":%d", u->sp24_lv);   /* (written only when not all levels: old readers unchanged) */
     if (u->sp24_hard) fprintf(f, ",\"sparse24_hard\":1");
-    if (u->sp24_r > 0.f) fprintf(f, ",\"sparse24_r\":%.9g", u->sp24_r);   /* (mid-ramp; the trainer recomputes it from its flags) */
+    if (u->sp24_r > 0.f) wfl(f, ",\"sparse24_r\":", u->sp24_r, 9);   /* (mid-ramp; the trainer recomputes it from its flags) */
     if (u->mx_hb && (u->mx_R_nload || (u->mx_R && u->mx_R_ok))) {   /* Hyperball radii (Muon table order): a resumed run keeps its spheres */
         float r[UNET_MAXCONV]; const int nr = u->mx_R_nload ? u->mx_R_nload : u->muon_nconv;
         if (u->mx_R_nload) memcpy(r, u->mx_R_load, (size_t)nr * 4); else nn_d2h(r, u->mx_R, (size_t)nr * 4);
-        fputs(",\"hb_R\":[", f); for (int i = 0; i < nr; i++) fprintf(f, "%s%.9g", i ? "," : "", r[i]); fputc(']', f);
+        fputs(",\"hb_R\":[", f); for (int i = 0; i < nr; i++) wfl(f, i ? "," : "", r[i], 9); fputc(']', f);
     }
     if (u->ad_lars && (u->ad_ema || u->ad_ema_nload)) {   /* adaptive Muon (b): the ratio EMAs (Muon table order) */
         float r[UNET_MAXCONV]; const int nr = u->ad_ema ? u->muon_nconv : u->ad_ema_nload;
         if (u->ad_ema) nn_d2h(r, u->ad_ema, (size_t)nr * 4); else memcpy(r, u->ad_ema_load, (size_t)nr * 4);
-        fputs(",\"adm_ema\":[", f); for (int i = 0; i < nr; i++) fprintf(f, "%s%.9g", i ? "," : "", r[i]); fputc(']', f);
+        fputs(",\"adm_ema\":[", f); for (int i = 0; i < nr; i++) wfl(f, i ? "," : "", r[i], 9); fputc(']', f);
     }
     if (u->ad_dog && (u->ad_dogst || u->ad_dog_nload)) {   /* adaptive Muon (c): DoG's rbar, G, eta */
         double d[4] = {0}; if (u->ad_dogst) nn_d2h(d, u->ad_dogst, sizeof d); else memcpy(d, u->ad_dog_load, 3 * sizeof(double));
-        fprintf(f, ",\"adm_dog\":[%.17g,%.17g,%.17g]", d[0], d[1], d[2]);
+        wfl(f, ",\"adm_dog\":[", d[0], 17); wfl(f, ",", d[1], 17); wfl(f, ",", d[2], 17); fputc(']', f);
     }
     if (u->ninh) {   /* the parameter ranges an --init-from copied (train --init-lr-mult on a resumed run) */
         fputs(",\"init_inh\":[", f); for (int i = 0; i < 2 * u->ninh; i++) fprintf(f, "%s%zu", i ? "," : "", u->inh[i]); fputc(']', f);
     }
     fprintf(f, ",\"extra\":%s}\n", extra ? extra : "{}");
     float *h = malloc(u->np * 4);
-    const float *arrs[4] = {u->p, u->ema, u->m, u->v};
-    for (int a = 0; a < 4; a++) { nn_d2h(h, arrs[a], u->np * 4); if (a == 3 && mom_aliased(u)) mom_mask(u, h, 0); if (fwrite(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; } }
-    if (u->muon_mom) {
-        nn_d2h(h, u->muon_mom, u->np * 4); if (mom_aliased(u)) mom_mask(u, h, 1);
-        if (fwrite(h, 4, u->np, f) != u->np) { fclose(f); free(h); return -1; }
+    /* non-finite weights / EMA / moments: refuse, so last.ckpt keeps the last good state (ops audit #10: a NaN the step-skip logic
+       missed would otherwise overwrite the only recent checkpoint; the relaunch then resumes from the good one). ~0.1 s per array. */
+    static const char *const an[5] = {"weights", "EMA weights", "AdamW m", "AdamW v", "Muon momentum"};
+    const float *arrs[5] = {u->p, u->ema, u->m, u->v, u->muon_mom};
+    for (int a = 0; a < 5; a++) {
+        if (!arrs[a]) continue;
+        nn_d2h(h, arrs[a], u->np * 4); if (mom_aliased(u) && (a == 3 || a == 4)) mom_mask(u, h, a == 4);
+        size_t bad = 0, first = 0; for (size_t i = 0; i < u->np; i++) if (!isfinite(h[i])) { if (!bad++) first = i; }
+        if (bad) { fprintf(stderr, "unet_save: %zu non-finite %s (first at parameter %zu): %s not written, the previous one kept\n", bad, an[a], first, path);
+                   fclose(f); remove(tmp); free(h); return -2; }
+        if (fwrite(h, 4, u->np, f) != u->np) { fprintf(stderr, "unet_save: write error on %s: %s not written, the previous one kept\n", tmp, path); fclose(f); remove(tmp); free(h); return -1; }
     }
     free(h);
-    if (fclose(f)) return -1;
-    return rename(tmp, path);
+    /* durability (mini ckpt audit #6): the stream's error state (the header's unchecked fprintfs: a full disk), the data on disk before
+       the rename, the rename itself on disk after; then the file read back (audit #1) so a bad one never replaces the last good one */
+    const int narr = 4 + (u->muon_mom != nullptr);
+    if (fflush(f) || ferror(f) || fsync(fileno(f))) { fprintf(stderr, "unet_save: write error on %s: %s not written, the previous one kept\n", tmp, path); fclose(f); remove(tmp); return -1; }
+    if (fclose(f)) { remove(tmp); return -1; }
+    const char *why = ckpt_verify(tmp, u->np, narr);
+    if (why) { fprintf(stderr, "unet_save: %s does not read back (%s): %s not written, the previous one kept\n", tmp, why, path); remove(tmp); return -1; }
+    if (rename(tmp, path)) { fprintf(stderr, "unet_save: cannot rename %s to %s\n", tmp, path); remove(tmp); return -1; }
+    {   char dir[1400]; snprintf(dir, sizeof dir, "%s", path); char *sl = strrchr(dir, '/'); if (sl) { if (sl == dir) sl[1] = 0; else *sl = 0; } else snprintf(dir, sizeof dir, ".");
+        const int fd = open(dir, O_RDONLY | O_DIRECTORY); if (fd >= 0) { fsync(fd); close(fd); } }
+    return 0;
 }
 
 static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
@@ -4990,6 +5351,11 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "UFSM", 4)) return -1;
     char line[UFSM_CHECKPOINT_HEADER];
     if (!fgets(line, sizeof line, f) || !strchr(line, '\n')) return -1;
+    {   /* the top-level keys only (mini ckpt audit #9): "extra" is written last and holds the trainer's free-form keys, which an absent
+           optional top-level key ("lat_c", "gfilm", "l0_run" ...) would otherwise match; no top-level value is a string, so the first
+           ',"extra":' is the top level's */
+        char *ex = strstr(line, ",\"extra\":"); if (ex) *ex = 0;
+    }
     memset(cfg, 0, sizeof *cfg);
     const char *p;
     if ((p = strstr(line, "\"nlev\":"))) cfg->nlev = atoi(p + 7);
@@ -5087,13 +5453,43 @@ int unet_peek(const char *path, unet_cfg *cfg, int *step) {
     return rc;
 }
 
+/* inference loads (predict, audit 2026-11-14 infer #4): unet_load reads p and ema only, unet_infer_release frees the training state */
+static int g_load_infer;   /* mgpu: config */
+void unet_set_load_infer(int on) { g_load_infer = on != 0; }
+void unet_infer_release(unet *u, int keep_p) {
+    if (u->muon_mom && u->muon_mom != u->v) nn_free(u->muon_mom);
+    u->muon_mom = nullptr;
+    nn_free(u->g); nn_free(u->m); nn_free(u->v); u->g = u->m = u->v = nullptr;
+    if (!keep_p && u->using_ema && u->live == u->ema && u->fw != u->p && !u->sparse24 && !u->wq) { nn_free(u->p); u->p = nullptr; }
+}
 int unet_load(unet *u, const char *path) {
     nn_wmemo_clear();
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     unet_cfg cfg; int step = 0; size_t np = 0;
     g_loaded_sparse = 0; g_loaded_sp24_lv = 0; g_loaded_sp24_hard = 0; g_loaded_sp24_r = 0.f; g_loaded_wq = 0; g_loaded_muon = 0;
-    if (read_header(f, &cfg, &step, &np)) { fclose(f); return -1; }
+    if (read_header(f, &cfg, &step, &np)) { fprintf(stderr, "unet_load: %s: unreadable header\n", path); fclose(f); return -1; }
+    {   /* the file holds exactly 4 arrays (p, ema, m, v) + the Muon momentum when the header says so; anything else is truncated or foreign
+           (mini ckpt audit #5: a file cut inside m / v loaded as a success with zero moments). 2 arrays (weights only): loads, moments 0 */
+        const long off = ftell(f); struct stat st; const long long a = 4ll * (long long)np, have = fstat(fileno(f), &st) ? -1 : (long long)st.st_size - off;
+        const long long want = a * (4 + (g_loaded_muon != 0));
+        if (have != want && !(have == 2 * a && !g_loaded_muon)) {
+            fprintf(stderr, "unet_load: %s: %lld payload bytes, the header (nparams %zu%s) needs %lld: truncated or not a checkpoint of this format\n", path, have, np, g_loaded_muon ? ", Muon momentum" : "", want);
+            fclose(f); return -1;
+        }
+        if (have == 2 * a) fprintf(stderr, "unet_load: %s holds the weights only: the optimizer state starts at zero\n", path);
+    }
+    {   /* the architecture beyond the parameter count (mini ckpt audit #7): a same-count rearrangement must not load silently */
+        const unet_cfg *c = &u->cfg; const char *bad = nullptr;
+        if (cfg.nlev != c->nlev) bad = "nlev";
+        for (int i = 0; !bad && i < c->nlev; i++) if (cfg.widths[i] != c->widths[i]) bad = "widths";
+        if (!bad && cfg.cin != c->cin) bad = "cin";
+        if (!bad && cfg.cout != c->cout) bad = "cout";
+        for (int i = 0; !bad && i < c->nlev; i++) { if (cfg.dec_widths[i] && c->dec_widths[i] && cfg.dec_widths[i] != c->dec_widths[i]) bad = "dec_widths";
+                                                    if (cfg.enc_blocks[i] && c->enc_blocks[i] && cfg.enc_blocks[i] != c->enc_blocks[i]) bad = "enc_blocks"; }
+        if (!bad && cfg.attn_blocks != c->attn_blocks) bad = "attn_blocks";
+        if (bad) { fprintf(stderr, "unet_load: %s: \"%s\" differs from this network's\n", path, bad); fclose(f); return -1; }
+    }
     /* a checkpoint without the side head (cfg.emb_lev) this net has (train --ssl resumed from a run without it): the head's block
        [eh.w, eh.b + emb_ch) is inserted -- weights and EMA take this net's fresh weights, its optimizer state starts at zero;
        every other parameter (before and after the block: film, fstem, ...) and its state is the checkpoint's */
@@ -5106,14 +5502,17 @@ int unet_load(unet *u, const char *path) {
     float *h = malloc(u->np * 4), *hc = i1 ? malloc(u->np * 4) : nullptr;
     float *arrs[4] = {u->p, u->ema, u->m, u->v};
     for (int a = 0; a < 4; a++) {
-        if (fread(h, 4, np, f) != np) { if (a < 2) { fclose(f); free(h); free(hc); return -1; } break; }
+        if (a >= 2 && g_load_infer) break;   /* unet_set_load_infer: weights and EMA only (the moments and the Muon state: never read, released after) */
+        if (fread(h, 4, np, f) != np) { if (a < 2) { fclose(f); free(h); free(hc); return -1; }
+                                         nn_zero(u->m, u->np * 4); nn_zero(u->v, u->np * 4); break; }   /* (weights only: checked above) */
         if (i1) {   /* old [0, i0) | the block (this net's init for p / ema, 0 for the moments) | old [i0, np) */
             if (a < 2) nn_d2h(hc, u->p, u->np * 4); else memset(hc, 0, u->np * 4);   /* (the EMA of the block: its fresh weights too) */
             memmove(h + i1, h + i0, (np - i0) * 4); memcpy(h + i0, hc + i0, (i1 - i0) * 4);
         }
         nn_h2d(arrs[a], h, u->np * 4);
     }
-    if (g_loaded_muon) {
+    if (g_loaded_muon && g_load_infer) { }   /* (inference: no Muon state) */
+    else if (g_loaded_muon) {
         if (fread(h, 4, np, f) != np) { fclose(f); free(h); free(hc); return -1; }
         if (i1) { memmove(h + i1, h + i0, (np - i0) * 4); memset(h + i0, 0, (i1 - i0) * 4); }
         if (!u->muon_mom) u->muon_mom = mom_alloc(u);
@@ -5162,8 +5561,8 @@ int unet_load_grow(unet *u, const char *path, int keep, float new_bias) {
     g_loaded_sparse = 0; g_loaded_wq = 0; g_loaded_muon = 0;
     if (read_header(f, &oc, &step, &onp)) { fclose(f); return -1; }
     const unet_cfg *c = &u->cfg;
-    int same = oc.nlev == c->nlev && oc.cin == c->cin && oc.G == c->G && oc.down_norm == c->down_norm && oc.cout <= c->cout && keep <= oc.cout;
-    for (int i = 0; same && i < c->nlev; i++) same = oc.widths[i] == c->widths[i];
+    int same = oc.nlev == c->nlev && oc.cin == c->cin && oc.G == c->G && oc.down_norm == c->down_norm && oc.cout <= c->cout && keep <= oc.cout && oc.attn_blocks == c->attn_blocks;
+    for (int i = 0; same && i < c->nlev; i++) same = oc.widths[i] == c->widths[i] && oc.enc_blocks[i] == c->enc_blocks[i] && oc.dec_widths[i] == c->dec_widths[i] && oc.dec_convs[i] == c->dec_convs[i];
     const size_t hw = u->head.w, ci = (size_t)u->head.cin, tail_new = u->head.b + (size_t)c->cout, tail = u->np - tail_new;
     if (!same || onp != hw + ci * oc.cout + oc.cout + tail || g_loaded_sparse || g_loaded_wq) {
         fprintf(stderr, "grow-head: %s is not the same network with <= %d outputs\n", path, c->cout); fclose(f); return -1;
@@ -5185,6 +5584,14 @@ int unet_load_grow(unet *u, const char *path, int keep, float new_bias) {
     if (!g_loaded_muon && u->muon_mom) mom_load(u, nullptr);
     u->mx_R_nload = 0; u->mx_R_ok = 0;   /* a grown head: Hyperball radii from the weights */
     free(h); free(n); fclose(f);
+    {   /* what this path does not carry over (mini ckpt audit #8): said, not silent */
+        char lost[512] = ""; size_t k = 0;
+#define LOST(c, w) if (c) k += (size_t)snprintf(lost + k, sizeof lost - k, "%s%s", k ? ", " : "", w)
+        LOST(g_loaded_hbR_n, "Hyperball radii"); LOST(g_loaded_adema_n || g_loaded_addog_n, "adaptive-Muon state"); LOST(g_loaded_ninh, "init_inh ranges");
+        LOST(g_loaded_lat_c, "latent cell transform"); LOST(g_loaded_l0_cnt, "level-0 running statistics"); LOST(oc.gn_ema && g_loaded_ge_cnt, "gn_ema running statistics");
+#undef LOST
+        if (k) fprintf(stderr, "grow-head: %s: not restored from the checkpoint (fresh): %s\n", path, lost);
+    }
     return step;
 }
 

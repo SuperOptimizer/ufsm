@@ -12,6 +12,7 @@
    axis_a = normalise(ref x d), axis_b = d x axis_a, voxel (i, j, k) at origin + i axis_a + j axis_b + k d with
    origin = ray_origin - (T - 1) / 2 (axis_a + axis_b); trilinear sampling (rounded to uint8), valid = inside the volume. */
 #include "villawind.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "vwt.h"
 #include "wtrunk.h"
@@ -29,7 +30,7 @@
 #include <time.h>
 
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -106,7 +107,7 @@ static int write_file(const char *dir, const char *name, const void *p, size_t n
 
 static int raw_mode(vw_net *net, int argc, char **argv) {
     const char *in = opt(argc, argv, "--raw-in", nullptr), *out = opt(argc, argv, "--raw-out", nullptr);
-    const int T = atoi(opt(argc, argv, "--T", "128")), L = atoi(opt(argc, argv, "--L", "384")), reps = atoi(opt(argc, argv, "--reps", "1"));
+    const int T = opt_atoi("--T", opt(argc, argv, "--T", "128")), L = opt_atoi("--L", opt(argc, argv, "--L", "384")), reps = opt_atoi("--reps", opt(argc, argv, "--reps", "1"));
     if (!in || !out) { fprintf(stderr, "villawind --raw-in DIR --raw-out DIR [--T 128 --L 384]\n"); return 2; }
     const size_t nv = (size_t)T * T * L; uint8_t *im = malloc(nv), *va = malloc(nv); char p[1400];
     for (int k = 0; k < 2; k++) {
@@ -184,12 +185,12 @@ static double point_phase(const float *ph, int T, int L, const vw_frame *f, cons
 }
 /* umbilicus (control points x y z, linear in z, clamped) */
 typedef struct { int n; double (*p)[3]; } umb_t;
-static int umb_load(const char *path, umb_t *u) {
+static int umb_load(const char *path, umb_t *u, double sc) {   /* sc: --umb-scale, JSON units -> KEY's voxels (audit mini/coords #4) */
     FILE *f = fopen(path, "rb"); if (!f) return -1; fseek(f, 0, SEEK_END); const long L = ftell(f); fseek(f, 0, SEEK_SET);
-    char *t = malloc(L + 1); if (fread(t, 1, L, f) != (size_t)L) { fclose(f); return -1; } fclose(f); t[L] = 0;
-    json *J = json_parse(t, L); free(t); const json *cp = J ? json_get(J, "control_points") : nullptr; if (!cp || !cp->n) return -1;
+    char *t = malloc(L + 1); if (fread(t, 1, L, f) != (size_t)L) { fclose(f); free(t); return -1; } fclose(f); t[L] = 0;
+    json *J = json_parse(t, L); free(t); const json *cp = J ? json_get(J, "control_points") : nullptr; if (!cp || !cp->n) { json_free(J); return -1; }
     u->n = (int)cp->n; u->p = malloc(cp->n * sizeof *u->p);
-    for (size_t i = 0; i < cp->n; i++) { const json *q = json_at(cp, i); u->p[i][0] = json_num(json_get(q, "x"), 0); u->p[i][1] = json_num(json_get(q, "y"), 0); u->p[i][2] = json_num(json_get(q, "z"), 0); }
+    for (size_t i = 0; i < cp->n; i++) { const json *q = json_at(cp, i); u->p[i][0] = json_num(json_get(q, "x"), 0) * sc; u->p[i][1] = json_num(json_get(q, "y"), 0) * sc; u->p[i][2] = json_num(json_get(q, "z"), 0) * sc; }
     for (int i = 1; i < u->n; i++) for (int j = i; j > 0 && u->p[j][2] < u->p[j - 1][2]; j--) { double tt[3]; memcpy(tt, u->p[j], 24); memcpy(u->p[j], u->p[j - 1], 24); memcpy(u->p[j - 1], tt, 24); }
     json_free(J); return 0;
 }
@@ -204,16 +205,16 @@ static void umb_at(const umb_t *u, double z, double *x, double *y) {
 static vwt *g_vwt = nullptr;   /* --vwt: our trained model instead of villa's */
 static wtrunk *g_wt = nullptr; static uint16_t *g_xf = nullptr; static int g_xld = 0; static double g_um = 9.6;   /* --trunk: the frozen feature trunk of a cx model */
 static int ray_check(vw_net *net, int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm villawind ray-check ROOT KEY WINDINGS.json --ckpt PTH [--tsv OUT] [--zr Z0,Z1] [--cache DIR] [--threads 8] [--prefetch 1] [--geom pair|umb --umb JSON --sz 112 --sr 192 --st 112 --r0 16]\n"); return 2; }
-    const int T = atoi(opt(argc, argv, "--T", "128")), L = atoi(opt(argc, argv, "--L", "384")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8);
+    if (argc < 5) { fprintf(stderr, "usage: ufsm villawind ray-check ROOT KEY WINDINGS.json --ckpt PTH [--tsv OUT] [--zr Z0,Z1] [--cache DIR] [--threads 8] [--prefetch 1] [--geom pair|umb --umb JSON [--umb-scale 1: JSON x scale = KEY's voxels] --sz 112 --sr 192 --st 112 --r0 16]\n"); return 2; }
+    const int T = opt_atoi("--T", opt(argc, argv, "--T", "128")), L = opt_atoi("--L", opt(argc, argv, "--L", "384")), nth = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8);
     double zr0 = -1e18, zr1 = 1e18; sscanf(opt(argc, argv, "--zr", ""), "%lf,%lf", &zr0, &zr1);
-    const int prefetch = atoi(opt(argc, argv, "--prefetch", "0"));   /* 1: read (and cache) the slabs' CT only, no forward */
+    const int prefetch = opt_atoi("--prefetch", opt(argc, argv, "--prefetch", "0"));   /* 1: read (and cache) the slabs' CT only, no forward */
     /* --geom pair (default): the slab centred on the pair, ray a -> b (oracle geometry). --geom umb --umb JSON: production tiling, radial
        horizontal rays from the umbilicus on a fixed grid (z bands of --sz, rings r0 = --r0 + m --sr, angle steps --st / r_mid), the
        pair's points wherever they fall in the slab (phase trilinear at the points; pairs not inside one ring's interior are skipped) */
     const int geom_umb = !strcmp(opt(argc, argv, "--geom", "pair"), "umb");
-    const double sz = atof(opt(argc, argv, "--sz", "112")), sr = atof(opt(argc, argv, "--sr", "192")), stt = atof(opt(argc, argv, "--st", "112")), r00 = atof(opt(argc, argv, "--r0", "16"));
-    umb_t umb = {0}; if ((geom_umb || g_wt) && umb_load(opt(argc, argv, "--umb", ""), &umb)) { fprintf(stderr, "villawind: --geom umb and --trunk need --umb umbilicus.json\n"); return 2; }
+    const double sz = opt_atof("--sz", opt(argc, argv, "--sz", "112")), sr = opt_atof("--sr", opt(argc, argv, "--sr", "192")), stt = opt_atof("--st", opt(argc, argv, "--st", "112")), r00 = opt_atof("--r0", opt(argc, argv, "--r0", "16"));
+    umb_t umb = {0}; if ((geom_umb || g_wt) && umb_load(opt(argc, argv, "--umb", ""), &umb, opt_atof("--umb-scale", opt(argc, argv, "--umb-scale", "1")))) { fprintf(stderr, "villawind: --geom umb and --trunk need --umb umbilicus.json\n"); return 2; }
     store *st = store_open(argv[2]); z3 *ct = st ? z3_open(st, argv[3], opt(argc, argv, "--cache", nullptr)) : nullptr;
     if (!ct) { fprintf(stderr, "villawind: %s %s: %s\n", argv[2], argv[3], z3_error()); return 1; }
     size_t np = 0; rpair *P = load_pairs(argv[4], &np); if (!P) return 1;
@@ -282,14 +283,14 @@ static int ray_check(vw_net *net, int argc, char **argv) {
 int cmd_villawind(int argc, char **argv) {
     const char *ck = opt(argc, argv, "--ckpt", nullptr), *vk = opt(argc, argv, "--vwt", nullptr);
     if (vk) {   /* ufsm villawind ray-check ... --vwt RUN/step_N.vwt [--ema 1]: the same benchmark for our model (src/vwt.h) */
-        if (nn_init(atoi(opt(argc, argv, "--gpu", "0"))) || xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
-        at_set_core(1); setenv("UFSM_ATTN_TF32", "1", 0); at_set_mx(atoi(opt(argc, argv, "--mx", "16")));
-        g_vwt = vwt_load(vk, atoi(opt(argc, argv, "--ema", "1"))); if (!g_vwt) return 1;
+        if (nn_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0"))) || xnet_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
+        at_set_core(1); setenv("UFSM_ATTN_TF32", "1", 0); at_set_mx(opt_atoi("--mx", opt(argc, argv, "--mx", "16")));
+        g_vwt = vwt_load(vk, opt_atoi("--ema", opt(argc, argv, "--ema", "1"))); if (!g_vwt) return 1;
         g_xf = vwt_xfeat_buf(g_vwt, &g_xld);
         if (g_xf) {   /* a trunk model (cfg.cx > 0): --trunk CKPT [--trunk-feat 1] [--um 9.6] */
-            const char *tk = opt(argc, argv, "--trunk", nullptr); g_um = atof(opt(argc, argv, "--um", "9.6"));
+            const char *tk = opt(argc, argv, "--trunk", nullptr); g_um = opt_atof("--um", opt(argc, argv, "--um", "9.6"));
             if (!tk) { fprintf(stderr, "villawind: %s takes trunk features: --trunk CKPT (wind96-wk1-best.ckpt) and --umb\n", vk); return 2; }
-            g_wt = wt_open(tk, atoi(opt(argc, argv, "--T", "128")), atoi(opt(argc, argv, "--L", "384")), 1, atoi(opt(argc, argv, "--trunk-feat", "1")));
+            g_wt = wt_open(tk, opt_atoi("--T", opt(argc, argv, "--T", "128")), opt_atoi("--L", opt(argc, argv, "--L", "384")), 1, opt_atoi("--trunk-feat", opt(argc, argv, "--trunk-feat", "1")));
             if (!g_wt) { fprintf(stderr, "villawind: cannot open the trunk %s\n", tk); return 1; }
         }
         if (argc > 2 && !strcmp(argv[2], "ray-check")) return ray_check(nullptr, argc - 1, argv + 1);
@@ -302,8 +303,8 @@ int cmd_villawind(int argc, char **argv) {
                         "  villa winding model (HF scrollprize/winding_model_9um) on ray-aligned slabs of a 9.6 um CT\n");
         return 2;
     }
-    if (xnet_init(atoi(opt(argc, argv, "--gpu", "0")))) return 1;
-    if (opt(argc, argv, "--gpu-mem", nullptr)) xnet_set_budget((size_t)(atof(opt(argc, argv, "--gpu-mem", "8")) * 1e9));
+    if (xnet_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
+    if (opt(argc, argv, "--gpu-mem", nullptr)) xnet_set_budget((size_t)(opt_atof("--gpu-mem", opt(argc, argv, "--gpu-mem", "8")) * 1e9));
     vw_net *net = vw_load(ck); if (!net) return 1;
     int rc;
     if (opt(argc, argv, "--raw-in", nullptr)) rc = raw_mode(net, argc, argv);

@@ -26,6 +26,10 @@ PHercParis4-july $CTR PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr 
 PHerc0139-gt $CTR PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr 9.362 0 /mnt/scratch/pods/PHerc0139/unroll/axis.json /vesuvius/ufsm/v2/rv/gt/p0139full/phase 9.362 0 0.6
 G
 [ -n "${GTX:-}" ] && grep -v '^#' $GTX >> $T/gt.txt
+# rows whose phase store is gone are dropped, loudly (11-14, audit eval#5: p4full/phaseA was deleted 11-12; the 11-14 phaseA rebuild,
+# gt/paris4-phaseA-evalboxes-20261114, covers the eval boxes only and must never train)
+awk '{print $7}' $T/gt.txt | while read -r pr; do [ -e $pr/zarr.json ] || echo "mksources: phase store $pr is missing: its row is left out" >&2; done
+awk '{ if (system("test -e " $7 "/zarr.json") == 0) print }' $T/gt.txt > $T/gt.ok && mv $T/gt.ok $T/gt.txt
 GW=$(awk '{s += $10} END {print s}' $T/gt.txt)
 src() {   # name root key um level axis proot pkey plevel weight scope
   jq -nc --arg n $1 --arg r $2 --arg c $3 --argjson um $4 --argjson lv $5 --arg ax $6 --arg pr $7 --arg pk $8 --argjson pl $9 --argjson w ${10} \

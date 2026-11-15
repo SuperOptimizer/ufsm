@@ -8,11 +8,18 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <mutex>
 
 #define PG_CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "phase gate gpu: %s (%s:%d)\n", cudaGetErrorString(e_), __FILE__, __LINE__); rc = -1; goto done; } } while (0)
 
-static float *g_pgtab;   /* angle (turns) [65536], length x 127 [65536] at pc << 8 | ps */
-static int pg_tab(void) {
+/* Per device: the tables and the scratch live on the card that runs the pass (a fit per GPU thread); a per-device mutex covers the
+   scratch for the length of one pg_run (callers of one card serialise; different cards run concurrently). */
+#define PG_MAXDEV 16
+static float *g_pgtab_d[PG_MAXDEV];   /* mgpu: per-device (pg_mu[dev]) */
+static std::mutex pg_mu[PG_MAXDEV];   /* mgpu: per-device */
+static int pg_dev_id(void) { int d = 0; if (cudaGetDevice(&d) != cudaSuccess || d < 0 || d >= PG_MAXDEV) { fprintf(stderr, "phase gate gpu: device %d out of range\n", d); abort(); } return d; }
+#define g_pgtab g_pgtab_d[dev]
+static int pg_tab(int dev) {
     if (g_pgtab) return 0;
     float *h = (float *)malloc(2 * 65536 * sizeof(float)); if (!h) return -1;
     for (int a = 0; a < 256; a++) for (int b = 0; b < 256; b++) { h[a << 8 | b] = (float)(atan2(b - 128.0, a - 128.0) / (2 * M_PI)); h[65536 + (a << 8 | b)] = (float)hypot(a - 128.0, b - 128.0); }
@@ -84,20 +91,31 @@ __global__ void k_pg_gate(pg_dev P, const float *a2, const float *b2, const floa
 /* one block of nz field rows: device planes (pc ps t1 t2 t5 sp w at the block's first row; pc / ps rewritten in place), W_ref (nz x H x W:
    host, or the device with wdev: fit_phase_gate_gpu_dw), the axis per row (host, box-local native). st += {material, gated, sum q, n q}.
    keep: the scratch stays for the next block (fit_phase_gate_gpu_done). Returns 0 / -1. */
-static float *g_pg_b4, *g_pg_dw, *g_pg_dax; static uint8_t *g_pg_o2; static unsigned long long *g_pg_cnt; static double *g_pg_qs; static size_t g_pg_n; static int g_pg_nz;
-extern "C" void fit_phase_gate_gpu_done(void) {
+struct pg_scr { float *b4, *dw, *dax; uint8_t *o2; unsigned long long *cnt; double *qs; size_t n; int nz; };
+static pg_scr g_pg_d[PG_MAXDEV];   /* mgpu: per-device (pg_mu[dev]) */
+#define g_pg_b4 g_pg_d[dev].b4
+#define g_pg_dw g_pg_d[dev].dw
+#define g_pg_dax g_pg_d[dev].dax
+#define g_pg_o2 g_pg_d[dev].o2
+#define g_pg_cnt g_pg_d[dev].cnt
+#define g_pg_qs g_pg_d[dev].qs
+#define g_pg_n g_pg_d[dev].n
+#define g_pg_nz g_pg_d[dev].nz
+static void pg_done(int dev) {
     cudaFree(g_pg_b4); cudaFree(g_pg_dw); cudaFree(g_pg_o2); cudaFree(g_pg_dax); cudaFree(g_pg_cnt); cudaFree(g_pg_qs);
     g_pg_b4 = g_pg_dw = g_pg_dax = nullptr; g_pg_o2 = nullptr; g_pg_cnt = nullptr; g_pg_qs = nullptr; g_pg_n = 0; g_pg_nz = 0;
 }
+extern "C" void fit_phase_gate_gpu_done(void) { const int dev = pg_dev_id(); std::lock_guard<std::mutex> lk(pg_mu[dev]); pg_done(dev); }
 static int pg_run(uint8_t *pc, uint8_t *ps, const uint8_t *t1, const uint8_t *t2, const uint8_t *t5, const uint8_t *sp, const uint8_t *w,
                   int nz, int H, int W, double h, const float *ay, const float *ax, const float *wref, int wdev, int mode, int R, double lo, double hi, double rconf, double st[4],
                   int oy, int ox, int keep) {
+    const int dev = pg_dev_id(); std::lock_guard<std::mutex> lk(pg_mu[dev]);
     int rc = 0;
     const size_t n = (size_t)nz * H * W;
     unsigned long long hc[3] = {0, 0, 0}; double hq = 0;
     pg_dev P = {pc, ps, t1, t2, t5, sp, w, nz, H, W, R, mode, (float)h, nullptr, nullptr, nullptr, oy, ox};
     const int TB = 256; int nb = (int)((n + TB - 1) / TB); if (nb > 65535 * 8) nb = 65535 * 8;
-    if (pg_tab()) return -1;
+    if (pg_tab(dev)) return -1;
     P.tab = g_pgtab;
     if (g_pg_n < n || (!wdev && !g_pg_dw)) {   /* (grow-only scratch) */
         const size_t m = n > g_pg_n ? n : g_pg_n;
@@ -125,7 +143,7 @@ static int pg_run(uint8_t *pc, uint8_t *ps, const uint8_t *t1, const uint8_t *t2
     }
 done:
     if (rc) cudaGetLastError();
-    if (rc || !keep) fit_phase_gate_gpu_done();
+    if (rc || !keep) pg_done(dev);
     return rc;
 }
 extern "C" int fit_phase_gate_gpu(uint8_t *pc, uint8_t *ps, const uint8_t *t1, const uint8_t *t2, const uint8_t *t5, const uint8_t *sp, const uint8_t *w,

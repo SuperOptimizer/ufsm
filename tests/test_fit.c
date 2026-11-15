@@ -12,6 +12,27 @@
 #include <string.h>
 #include <unistd.h>
 #include "test_part.h"
+#include "fm_tol.h"
+/* Fast math (the default build, DESIGN 2026-11-14): fit_stream_verify's pooled planes (nn_fit_pool, __d*_rn, vs the host fit_pool, now
+   with reciprocal division and contraction) can round a few cells 1 apart, so only the raw device planes are held byte for byte there
+   (stream_raw_ne) and the pooled sets are judged by the streamed fit's accuracy; the crop fits (same code, other array extents:
+   vectorised reductions sum in another order) agree within rel / abs 1e-4; the substream and whole-chunk decodes within +-1 on 1e-4.
+   Under -DUFSM_STRICT_MATH=ON every one of these is bit for bit as before. */
+/* the device planes of a stream against host fields: mismatching planes (0: identical) */
+static int stream_raw_ne(const fit_stream *s, const fit_fields *f) {
+    const size_t n = (size_t)f->D * f->H * f->W; if (n != s->n) return 1;
+    const uint8_t *pl[10] = {f->pc, f->ps, f->t[0], f->t[1], f->t[2], f->t[3], f->t[4], f->t[5], f->sp, f->w}; uint8_t *h = malloc(n); int bad = 0;
+    for (int k = 0; k < 10 && h; k++) { nn_d2h(h, s->dfield + (size_t)k * n, n); bad += memcmp(h, pl[k], n) != 0; }
+    free(h); return h ? bad : 1;
+}
+static int stream_ne(const fit_stream *s, const fit_fields *f) { return FM_STRICT ? fit_stream_verify(s, f) : stream_raw_ne(s, f); }
+/* two fit models' knots and deltas (and losses when both given) within the fast-math bound, bit for bit under strict */
+static int models_close(const fit_model *a, const fit_model *b, int with_loss) {
+    const size_t nd = (size_t)a->lz * a->ly * a->lx;
+    return !fm_cmp_f32("crop delta", a->delta, b->delta, nd, 1e-4, 1e-4) && !fm_cmp_f32("crop pitch", a->pitch, b->pitch, a->nk, 1e-4, 1e-4) &&
+           !fm_cmp_f32("crop offset", a->offset, b->offset, a->nk, 1e-4, 1e-4) &&
+           (!with_loss || !fm_cmp_f64("crop loss", a->loss, b->loss, sizeof a->loss / sizeof a->loss[0], 1e-4, 1e-9));
+}
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
@@ -109,7 +130,7 @@ static int run_case(int dir) {
         fit_fields_buf sb, hb; fit_stream st;
         CHECK(fit_fields_load_stream(td, &sb, &st, fps, nfp, nullptr) == 0 && fit_fields_load(td, 0, 0, 1, &hb) == 0, "stream / host loads");
         CHECK(sb.a[2] == nullptr && sb.a[0] && sb.a[9], "streamed host buffer: no normal planes, phase and material kept");
-        const int bad = fit_stream_verify(&st, &hb.f);
+        const int bad = stream_ne(&st, &hb.f);
         printf("stream: %d pooling factors, device / pooled planes vs the host load: %s\n", st.nfp, bad ? "MISMATCH" : "identical");
         CHECK(nfp >= 2 && bad == 0, "streamed fields differ from the host path (%d)", bad);
         fit_cfg cs = c; cs.stream = &st; cs.verbose = 0; st.drop_pooled = 1; cs.dir = dir;
@@ -142,8 +163,7 @@ static int run_case(int dir) {
         fit_fields fc = {D, Hc, Wc, H8, cp[0], cp[1], {cp[2], cp[3], cp[4], cp[5], cp[6], cp[7]}, cp[8], cp[9], cy, cx, {0}, 0, nullptr, nullptr, nullptr, oy, ox, H, W};
         fit_model *mc = fit_run(&fc, &c3);
         const int same = mf && mc && mf->L == mc->L && mf->lz == mc->lz && mf->ly == mc->ly && mf->lx == mc->lx && mf->nk == mc->nk && mf->H == mc->H && mf->W == mc->W &&
-                         !memcmp(mf->delta, mc->delta, (size_t)mf->lz * mf->ly * mf->lx * 4) && !memcmp(mf->pitch, mc->pitch, mf->nk * 4) && !memcmp(mf->offset, mc->offset, mf->nk * 4) &&
-                         !memcmp(mf->loss, mc->loss, sizeof mf->loss);
+                         models_close(mf, mc, 1);
         printf("crop%s: arrays %dx%d of %dx%d at (%d, %d): model %s the whole box's (loss %.6f / %.6f)\n", g_cpu ? " cpu" : "", Hc, Wc, H, W, oy, ox, same ? "identical to" : "DIFFERS from",
                mf ? mf->loss[0] : -1, mc ? mc->loss[0] : -1);
         CHECK(same, "crop%s: the cropped fit differs from the whole box's", g_cpu ? " cpu" : "");
@@ -161,11 +181,10 @@ static int run_case(int dir) {
             CHECK(fit_fields_load_stream(td, &sb, &st, fps, nfp, nullptr) == 0 && fit_fields_load(td, 0, 0, 1, &hb) == 0, "cropped stream / host loads");
             fit_fields_crop(0, 0, 0, 0, 0, nullptr); free(wb);
             CHECK(sb.f.H == crop[2] && sb.f.W == crop[3] && sb.f.oy == crop[0] && sb.f.H0 == H && hb.f.H == crop[2], "cropped load geometry");
-            CHECK(fit_stream_verify(&st, &hb.f) == 0, "cropped stream: device / pooled planes differ from the cropped host load");
+            CHECK(stream_ne(&st, &hb.f) == 0, "cropped stream: device / pooled planes differ from the cropped host load");
             fit_cfg cs = c3; cs.stream = &us; us.drop_pooled = 1; fit_model *mu = fit_run(&ub.f, &cs);
             cs.stream = &st; st.drop_pooled = 1; fit_model *ms = fit_run(&sb.f, &cs);
-            const int s2 = mu && ms && mu->lz == ms->lz && mu->ly == ms->ly && mu->lx == ms->lx && !memcmp(mu->delta, ms->delta, (size_t)mu->lz * mu->ly * mu->lx * 4) &&
-                           !memcmp(mu->pitch, ms->pitch, mu->nk * 4) && !memcmp(mu->offset, ms->offset, mu->nk * 4);
+            const int s2 = mu && ms && mu->lz == ms->lz && mu->ly == ms->ly && mu->lx == ms->lx && mu->nk == ms->nk && models_close(mu, ms, 0);
             printf("crop stream: model %s the uncropped stream's\n", s2 ? "identical to" : "DIFFERS from");
             CHECK(s2, "crop stream: the cropped streamed fit differs");
             fit_free(mu); fit_free(ms); fit_stream_free(&us); fit_stream_free(&st); fit_fields_free(&ub); fit_fields_free(&sb); fit_fields_free(&hb);
@@ -467,7 +486,7 @@ static void zarr_substream_case(void) {
         CHECK(ra == 0 && rb == 0, "zarr loads of rows %d..%d", rows[r][0], rows[r][1]);
         if (ra || rb) continue;
         const size_t n = (size_t)(rows[r][1] - rows[r][0]) * 128 * 128; int same = 1, nonc = 0;
-        for (int k = 0; k < 10; k++) { same &= !memcmp(a.a[k], b.a[k], n); for (size_t i = 0; i < n; i += 4099) nonc |= a.a[k][i] != 128; }
+        for (int k = 0; k < 10; k++) { same &= !fm_cmp_u8("substream vs whole-chunk decode", a.a[k], b.a[k], n, 1, 1e-4); for (size_t i = 0; i < n; i += 4099) nonc |= a.a[k][i] != 128; }
         printf("zarr rows %d..%d: substream decode vs whole chunks: %s\n", rows[r][0], rows[r][1], same ? "identical" : "DIFFER");
         CHECK(same && nonc, "zarr rows %d..%d: the substream decode differs from the whole-chunk decode (or reads nothing)", rows[r][0], rows[r][1]);
         fit_fields_free(&a); fit_fields_free(&b);

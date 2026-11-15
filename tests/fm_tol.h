@@ -106,4 +106,27 @@ static inline int fm_cmp_h16(const char *what, const uint16_t *a, const uint16_t
                 nd, n, nbad, ulps, (int)worst, wi, a[wi], b[wi], FM_STRICT ? " [strict]" : "");
     return nbad != 0;
 }
+/* binary16 within `ulps` OR within abs_tol absolutely: for values computed in fp32 from unit-scale (or 0..255-scale) data and then
+   normalised, whose rounding error is absolute (a few fp32 ulps of the large intermediates, times the normalisation gain), so near 0
+   it is many fp16 ulps (desk fm round 11-15: CT channels 0x8816 vs 0x854a, |d| 5e-5; x 0x0423 vs 0x04b1, |d| 9e-6). */
+static inline float fm_h16_f(uint16_t h) {
+    const int e = (h >> 10) & 31, m = h & 1023; const float f = e == 0 ? ldexpf((float)m, -24) : e == 31 ? (m ? NAN : INFINITY) : ldexpf((float)(m | 1024), e - 25);
+    return (h >> 15) ? -f : f;
+}
+static inline int fm_cmp_h16a(const char *what, const uint16_t *a, const uint16_t *b, size_t n, int ulps, double abs_tol) {
+    if (FM_STRICT) return fm_cmp_h16(what, a, b, n, 0);
+    size_t nbad = 0, nd = 0, wi = 0; double worst = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] == b[i]) continue;
+        nd++;
+        const double fa = fm_h16_f(a[i]), fb = fm_h16_f(b[i]), d = fabs(fa - fb);
+        int32_t du = fm_h16_ord(a[i]) - fm_h16_ord(b[i]); du = du < 0 ? -du : du;
+        const int ok = (isnan(fa) || isnan(fb)) ? (isnan(fa) && isnan(fb)) : (du <= ulps || d <= abs_tol);
+        if (!ok) nbad++;
+        if (!(d <= worst)) worst = d, wi = i;
+    }
+    if (nd) fprintf(stderr, "%s %s: %zu of %zu differ, %zu beyond %d ulp and |d| %g; worst |d| %g at %zu (0x%04x vs 0x%04x)\n", nbad ? "FAIL" : "ok", what, nd, n,
+                    nbad, ulps, abs_tol, worst, wi, a[wi], b[wi]);
+    return nbad != 0;
+}
 #endif

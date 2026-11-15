@@ -1,7 +1,7 @@
 /* FP8 (e4m3, MX) 3^3 stride-1 forward kernels; owns the shared error state. */
 #include "lp_f8fwd.cuh"
 
-cudaError_t g_lp_err = cudaSuccess;
+thread_local cudaError_t g_lp_err = cudaSuccess;   /* mgpu: per-thread */
 /* instantiated in lp_f8fwd_i*.cu */
 extern template void fwd_f8_t<mx4_t, mx4_t>(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp);
 extern template void fwd_f8_t<mx8_t, mx8_t>(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp);

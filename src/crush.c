@@ -1,4 +1,5 @@
 #include "crush.h"
+#include "optcheck.h"
 #include "band.h"
 #include <math.h>
 #include <stdatomic.h>
@@ -15,7 +16,7 @@ crush_cfg crush_cfg_default(void) {
                         .loc_amp = 0, .loc_len = 48.f, .loc_jmax = 1.f};
 }
 
-static const char *cr_opt(int argc, char **argv, const char *f) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], f)) return argv[i + 1]; return nullptr; }
+static const char *cr_opt(int argc, char **argv, const char *f) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(f))) return argv[i + 1]; return nullptr; }
 int crush_cfg_parse(crush_cfg *c, int argc, char **argv) {
     const char *v;
 #define CR_F(flag, dst) if ((v = cr_opt(argc, argv, flag))) dst = (float)atof(v)
@@ -502,9 +503,8 @@ void crush_layer_level(crush_layer *L, int finer) {
     for (int d = 0; d < 3; d++) L->b[d] = .5 * L->a - .5;
 }
 void crush_layer_phase(crush_layer *L, int shift) {
-    const double f = ldexp(1, shift);
-    L->a = 1 / f;
-    for (int d = 0; d < 3; d++) L->b[d] = (shift - (f - 1) / 2) / f;
+    L->a = grid_coarse_u(1, shift) - grid_coarse_u(0, shift);   /* (block-centred, as phase_window: band.h grid_coarse_u) */
+    for (int d = 0; d < 3; d++) L->b[d] = grid_coarse_u(0, shift);
 }
 
 int crush_phase_normal(crush_cache *cc, const crush_layer *ph, const int64_t o[3], int P, const double *hint, double n[3]) {

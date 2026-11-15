@@ -3,6 +3,26 @@
 #include "../src/sample.c"
 #include "test_part.h"   /* UFSM_TEST_PART=K/3: the cache-blocked writer (1), the fused warp (2), the rest (0); ~6 s each */
 #include <assert.h>
+#include "fm_tol.h"
+/* two writers of the same window (tests/fm_tol.h): bit-identical under UFSM_STRICT_MATH. Fast math (the two paths round
+   differently): targets u8 +-1 on <= 1e-3 of the bytes, mask and target flips (a coordinate on an in-bounds / rounding boundary) on
+   <= 1e-4, the input channels where both masks agree fp16 +-1 ulp or |d| <= 1e-4 / fp32 rel 1e-6 + abs 1e-4 (the CT is normalised
+   from 0..255-scale fp32 intermediates: its rounding error is absolute, a few fp32 ulps of 255 times the gain, so near 0 it spans
+   many fp16 ulps; desk fm round 11-15: worst |d| 5e-5). Returns nonzero when they differ beyond that. */
+static int ws_cmp(const uint8_t *Ta, const uint8_t *Tb, size_t nt, const uint8_t *Ma, const uint8_t *Mb, size_t nq, const uint16_t *Ha,
+                  const uint16_t *Hb, const float *Xa, const float *Xb, size_t nch) {
+    if (FM_STRICT) return memcmp(Ta, Tb, nt) || memcmp(Ma, Mb, nq) || (Ha ? memcmp(Ha, Hb, nch * nq * 2) : Xa ? memcmp(Xa, Xb, nch * nq * 4) : 0);
+    int bad = fm_cmp_u8c("writer targets", Ta, Tb, nt, 1, 0, 1e-3, 1e-4) | fm_cmp_u8c("writer mask", Ma, Mb, nq, 0, 0, 1e-4, 1e-4);
+    size_t nv = 0;
+    for (size_t c = 0; c < nch && (Ha || Xa); c++) for (size_t k = 0; k < nq; k++) {
+        if (Ma[k] != Mb[k]) continue;
+        const size_t i = c * nq + k;
+        if (Ha) { int32_t d = fm_h16_ord(Ha[i]) - fm_h16_ord(Hb[i]); nv += (d > 1 || d < -1) && !(fabs((double)fm_h16_f(Ha[i]) - fm_h16_f(Hb[i])) <= 1e-4); }
+        else nv += !fm_close(Xa[i], Xb[i], 1e-6, 1e-4);
+    }
+    if (nv) fprintf(stderr, "FAIL writer inputs: %zu of %zu beyond %s\n", nv, nch * nq, Ha ? "1 fp16 ulp / 1e-4" : "fp32 rel 1e-6 + 1e-4");
+    return bad || nv;
+}
 void *nn_host_alloc(size_t n) { return malloc(n); }
 void nn_host_free(void *p) { free(p); }
 
@@ -38,9 +58,9 @@ int main(void) {
                 for (int d=0;d<3;d++) inside &= world[d]>=0 && world[d]<=P-1;
                 if (!inside) { assert(!M[k] && X[k]==0 && T[k]==0); cropped++; continue; }
                 double ramp=world[0]+2*world[1]+3*world[2];
-                assert(fabs(X[k]-(60+ramp))<6e-5 && fabs(T[k]-ramp)<.501);
+                assert(fabs(X[k]-(60+ramp))<(FM_STRICT?6e-5:2e-4) &&   /* fast math: ~4 ulp at 246 is too tight, 2e-4 */ fabs(T[k]-ramp)<.501);
                 float prior=(sheet_reference(&sheet,world)-sheet.center)/sheet.scale;
-                assert(fabs(X[n+k]-prior)<1e-6);
+                assert(fabs(X[n+k]-prior)<(FM_STRICT?1e-6:1e-5));   /* fast math: /scale is *(1/scale) */
                 _Float16 h; memcpy(&h,H+n+k,2); assert(fabs((float)h-prior)<2e-4);
                 /* A source location contributes to all labels and the q0 scalar
                    at the same dense voxel; float loss prior has no sign flip. */
@@ -58,7 +78,7 @@ int main(void) {
         sheet_batch batch={.np=4,.nt=2,.points=points,.terms=terms}; memset(M,1,n);
         warp_sheet_batch(&batch,&a,M);
         assert(batch.nt==1 && batch.np==2 && batch.points[0].q==3 && batch.points[0].q0==.5);
-        for (int d=0;d<3;d++) assert(fabs(batch.points[0].xyz[d]-out[d])<2e-6);
+        for (int d=0;d<3;d++) assert(fabs(batch.points[0].xyz[d]-out[d])<(FM_STRICT?2e-6:1e-5));
         assert(batch.terms[0].target==.2f && batch.points[1].q==3.2f);
         printf("spatial mode %d: %d registered voxels, %d ignored corners, 48 symmetries, sparse round trip: ok\n",mode,checked,cropped);
     }
@@ -105,7 +125,7 @@ int main(void) {
                 sym sy=sym_of(si); rng r;
                 rseed(&r,9); write_spatial(ct,hard,mask,T,M,P,origin,80,.03f,1,cy,cx,sy,&a,1,0,.02f,&r,row,1,nullptr,H,nullptr,nullptr,nullptr,nullptr,nullptr,scratch,1,0);
                 rseed(&r,9); write_spatial(ct,hard,mask,T1,M1,P,origin,80,.03f,1,cy,cx,sy,&a,1,0,.02f,&r,row,1,nullptr,H1,nullptr,nullptr,nullptr,nullptr,nullptr,scratch,1,1);
-                ctdiff+=memcmp(H,H1,n*2)!=0 || memcmp(T,T1,NCH*n)!=0 || memcmp(M,M1,n)!=0;
+                ctdiff+=ws_cmp(T,T1,NCH*n,M,M1,n,H,H1,nullptr,nullptr,1)!=0;   /* channel 0 only: H1 is CT-only */
                 for (int z=0;z<P;z++) for (int y=0;y<P;y++) for (int x=0;x<P;x++) {
                     size_t k=((size_t)z*P+y)*P+x; float pulled[3],jac[3]; spatial_aug_pull(&a,table,z,y,x,pulled,jac);
                     float v[3]; int inside=1,tie=0;
@@ -148,7 +168,7 @@ int main(void) {
                     memset(nrs,0,Q*4); memset(nps,0,nq*4); rseed(&r,77);
                     write_spatial(c2,t2,m2,Tb,Mb,Q,origin,85,.031f,1,cy2,cx2,sy,&a,1.05f,.01f,.03f,&r,nr,fmt,Xb,Hb,pp,nrs,nps,sh?&sheet:nullptr,par,app,hard,cto);
                     const size_t nch=cto?1:4;
-                    int d=memcmp(Ta,Tb,NCH*nq)||memcmp(Ma,Mb,nq)||(fmt?memcmp(Ha,Hb,nch*nq*2):memcmp(Xa,Xb,nch*nq*4));
+                    int d=ws_cmp(Ta,Tb,NCH*nq,Ma,Mb,nq,fmt?Ha:nullptr,fmt?Hb:nullptr,fmt?nullptr:Xa,fmt?nullptr:Xb,nch);
                     if (d && diffs<4) fprintf(stderr,"blocked writer differs: P %d mode %d plan %d fmt %d sym %d hard %d ct-only %d\n",Q,mode,plan,fmt,si,hard,cto);
                     diffs+=d; runs++;
                 }
@@ -206,10 +226,14 @@ int main(void) {
                 sym sy = sym_of(si);
                 warp_phase_ref(pq, o[0], Q, sy, &a); warp_w4_ref(w4, wc, o[1], o[2], Q, sy, &a);
                 warp_phase_w4(pq, wq, o[3], o[4], o[5], Q, sy, &a);
-                int d = memcmp(o[0], o[3], nq) || memcmp(o[1], o[4], nq) || memcmp(o[2], o[5], nq);
+                /* bit-identical under UFSM_STRICT_MATH; fast math (vector vs scalar float order): phase +-1 (cyclic 252) on <= 1e-3, known /
+                   unknown flips and winding / component flips at the wk < .5 threshold on <= 1e-4 of the voxels (tests/fm_tol.h) */
+#define PW_CMP() (fm_cmp_u8c("warped phase", o[0], o[3], nq, 1, PHASE_PERIOD, 1e-3, 1e-4) | fm_cmp_u8c("warped w4", o[1], o[4], nq, 0, 0, 1e-4, 1e-4) | \
+                  fm_cmp_u8c("warped comp", o[2], o[5], nq, 0, 0, 1e-4, 1e-4))
+                int d = PW_CMP();
                 if (Q < 256) {   /* the single-field forms (draw() without --task unwrap2; the tests' warp_phase) */
                     warp_phase(pq, o[3], Q, sy, &a); warp_w4(w4, wc, o[4], o[5], Q, sy, &a);
-                    d |= memcmp(o[0], o[3], nq) || memcmp(o[1], o[4], nq) || memcmp(o[2], o[5], nq);
+                    d |= PW_CMP();
                 }
                 size_t known = 0; for (size_t k = 0; k < nq; k++) known += o[1][k] < PHASE_PERIOD;
                 if (d && diffs < 4) fprintf(stderr, "phase / w4 warp differs: P %d mode %d sym %d\n", Q, mode, si);
@@ -242,7 +266,8 @@ int main(void) {
                 size_t bad = 0; if (sample_pack_tm(Ta, Ta + nq, Ma, nq, TMa, &bad)) abort();
                 memset(nrs, 0, Q * 4); memset(nps, 0, (size_t)Q * Q * 4); rseed(&r, 5 + plan);
                 write_spatial_tm(c2, t2, m2, nullptr, nullptr, Q, org, 85, .031f, 1, cyq, cxq, sy, &a, 1.05f, .01f, .03f, &r, nr, 1, nullptr, Hb, pp, nrs, nps, nullptr, nullptr, app, 1, 1, TMb);
-                const int d = memcmp(TMa, TMb, nq) || memcmp(Ha, Hb, nq * 2);
+                /* bit-identical under UFSM_STRICT_MATH; fast math: packed code bytes flip on <= 1e-4 of the voxels, fp16 CT +-1 ulp */
+                const int d = fm_cmp_u8c("packed codes", TMa, TMb, nq, 0, 0, 1e-4, 1e-4) | fm_cmp_h16a("trainer CT fp16", Ha, Hb, nq, 1, 1e-4);
                 if (d) fprintf(stderr, "trainer CT writer differs: P %d plan %d\n", Q, plan);
                 diffs += d; runs++;
             }

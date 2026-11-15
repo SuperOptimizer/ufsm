@@ -4,6 +4,7 @@
 #include "imgops.h"
 #include "tiffw.h"
 #include "test_imgops_expected.h"
+#include "fm_tol.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,9 +19,11 @@ static void lcg(uint8_t *o, int n, int seed) { unsigned s = (unsigned)seed; for 
 static void test_resample(void) {
     uint8_t a[35], b[117], c[231], d[45];
     lcg(a, 35, 1); CHECK(!pil_resize(a, 7, 5, 1, b, 13, 9, PIL_BILINEAR, 2), "bilinear resize");
-    CHECK(!memcmp(b, exp_bilinear, sizeof b), "bilinear 7x5 -> 13x9 differs from Pillow");
+    /* Pillow's bytes exactly under UFSM_STRICT_MATH; fast math (the coefficient sums / normalisation reassociate before the fixed-point
+       rounding): every byte within +-1 (tests/fm_tol.h) */
+    CHECK(!fm_cmp_u8("bilinear", b, exp_bilinear, sizeof b, 1, 1.0), "bilinear 7x5 -> 13x9 differs from Pillow");
     lcg(c, 231, 2); CHECK(!pil_resize(c, 11, 7, 3, d, 5, 3, PIL_BOX, 3), "box resize");
-    CHECK(!memcmp(d, exp_box, sizeof d), "box RGB 11x7 -> 5x3 differs from Pillow");
+    CHECK(!fm_cmp_u8("box", d, exp_box, sizeof d, 1, 1.0), "box RGB 11x7 -> 5x3 differs from Pillow");
 }
 static void test_overlay(void) {
     enum { W = 61, H = 45, IW = 31, IH = 23 };
@@ -33,7 +36,7 @@ static void test_overlay(void) {
     CHECK(o && ow == EXP_OW && oh == EXP_OH, "overlay size %d x %d", ow, oh);
     if (o && ow == EXP_OW && oh == EXP_OH) {
         int mx = 0; for (size_t i = 0; i < sizeof exp_overlay; i++) { const int e = abs(o[i] - exp_overlay[i]); if (e > mx) mx = e; }
-        CHECK(mx == 0, "overlay differs from overlay_red.py by up to %d", mx);
+        CHECK(mx <= FM_TOL(1), "overlay differs from overlay_red.py by up to %d", mx);
     }
     free(o);
     CHECK(!overlay_red_skip(ct, W * H), "skip rule: a mostly filled CT kept");
@@ -135,6 +138,13 @@ static void test_tifxyz_shift(void) {   /* a plane z = 10 (x = column, y = row):
     int w, h; snprintf(p, sizeof p, "%s/z.tif", d); float *Z = img_read_f32(p, &w, &h); snprintf(p, sizeof p, "%s/x.tif", d); float *X = img_read_f32(p, &w, &h);
     int bad = !Z || !X; for (int i = 0; !bad && i < W * H; i++) bad += i == 0 ? Z[i] != -1.f : fabsf(Z[i] - 12.5f) > 1e-5f || fabsf(X[i] - x[i]) > 1e-5f;
     CHECK(!bad, "tifxyz shift moves the plane along +z");
+    free(Z); free(X); snprintf(p, sizeof p, "rm -rf %s %s", s, d); CHECK(!system(p), "cleanup");
+    /* moved past z = 0 (z 1 - 2.5): invalid (-1 in x, y, z), not clamped to a valid z = 0 (audit mini/coords #7) */
+    for (int i = 0; i < W * H; i++) z[i] = i == 0 ? -1.f : 1.f;
+    CHECK(!tifxyz_write(s, W, H, x, y, z, 1, 8.64, 1, "test") && !tifxyz_shift(s, d, -2.5, nullptr), "tifxyz shift past z 0");
+    snprintf(p, sizeof p, "%s/z.tif", d); Z = img_read_f32(p, &w, &h); snprintf(p, sizeof p, "%s/x.tif", d); X = img_read_f32(p, &w, &h);
+    bad = !Z || !X; for (int i = 0; !bad && i < W * H; i++) bad += Z[i] != -1.f || (i && X[i] != -1.f);   /* (vertex 0 was invalid on input: kept as read) */
+    CHECK(!bad, "tifxyz shift past z 0 gives invalid vertices");
     free(Z); free(X); snprintf(p, sizeof p, "rm -rf %s %s", s, d); CHECK(!system(p), "cleanup");
     /* inward: a plane y = 5 (x = column, z = row) has +n = x-step x z-step = -y; toward an axis at y 0 it keeps +n (y 5 -> 3),
        toward an axis at y 10 it flips (y 5 -> 7) */

@@ -22,7 +22,7 @@ O=/vesuvius/ufsm/unroll/$SCROLL-u1; SD=/vesuvius/ufsm/unroll/sched; U=${U:-/vesu
 R=/vesuvius/ufsm/v2/ct; PY=$(dirname $(readlink -f $0))/wrapscore.py; SEGS=/vesuvius/ufsm/inkgt/segs-$SCROLL.json; [ -s $SEGS ] || SEGS=
 # STRIPES="ws020 ws021": only these stripes (box from their bboxes, scored on them only, per-stripe JPEGs instead of the strip-mosaic)
 STRIPES=${STRIPES:-}; SDIR=$O/strip/strip/flat/stripes
-FILLX=${FILLX:---fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 1}
+FILLX=${FILLX:---fill 4 --fill-grid 50000 --fill-inpaint 4 --fill-pm 0}
 INK=$O/ink/$TAG.h; RD=$O/inkr/$TAG; mkdir -p $O/ink $RD/logs $RD/fillmap $RD/img
 if [ -n "$STRIPES" ]; then mkdir -p $RD/stripes; for s in $STRIPES; do [ -d $SDIR/$s ] || { echo "u1667ink: no stripe $s"; exit 1; }; ln -sfn $SDIR/$s $RD/stripes/$s; done; SDIR=$RD/stripes; fi
 ST=$SD/inkscore-u1-$TAG; [ $SCROLL = PHerc1667 ] || ST=$SD/inkscore-$SCROLL-u1-$TAG
@@ -52,6 +52,10 @@ a = [max(int(bx[d] * s), int(lo[d] / f) - 64) for d in range(3)]; e = [min(int((
 print(",".join(map(str, a + [e[d] - a[d] for d in range(3)])))
 PY
 ) || { log "box failed"; exit 1; }
+# INK_AXIS (default 1; audit inkmil #2): the unroll's axis file for the predict, as the ink windows trained with an axis (97 % of the ink weight); 0: none
+AXA=; [ "${INK_AXIS:-1}" = 1 ] && [ -s $O/axis.json ] && AXA="--axis $O/axis.json"
+[ "${INK_AXIS:-1}" = 1 ] && [ -z "$AXA" ] && log "WARNING: no $O/axis.json, predicting without --axis (radial channels zero)"
+# LV=1 (4.8 um, the crop evals' level) is the level the head's held-out numbers were measured at (audit inkmil #3); LV=2 (default, 9.6 um) has no crop number yet
 log "ckpt $CK, level $LV ($key um), box $box, labels ${SEGS:-none (render only)}"
 if [ ! -e $INK/ink.done ]; then
   # BLEND=1 (default): the latent ink head's level depends on its window (inkpod-9000: steps of 10-30 / 255 at the window seams, halo 16..256
@@ -59,12 +63,19 @@ if [ ! -e $INK/ink.done ]; then
   # seam step 16.9 -> 1.3 on a 1299 test box); BLEND=0 one pass
   rm -rf $INK; mkdir -p $INK
   # GATE=1: also the recto / verso probability channels (c12, c13: papyrus only, never supervised in air) for a papyrus-gated ink render
-  HEADS=ink; HL="ink"; [ "${GATE:-0}" = 1 ] && { HEADS=ink,c12,c13; HL="ink c12 c13"; }
+  HEADS=ink; HL="ink"; [ "${GATE:-1}" = 1 ] && { HEADS=ink,c12,c13; HL="ink c12 c13"; }
   # (--shard 256 on the shifted pass: its tiles align with the store shards; 1299 test box byte-identical, 63 s -> 5 s)
+  # pbox SHIFT: the box moved down onto the pass's 512 tile grid (origin = SHIFT mod 512), as seamless.c pass_box (an off-grid box: one
+  # window per shard, ~6-8x the windows); --axis: the radial input channels (predict refuses without it since 2026-11-14); --q 0 --levels 1:
+  # the passes only feed ink-blend (level 0)
+  pbox() { awk -F, -v s=$1 '{ for (d = 1; d <= 3; d++) { l = $d - s; l = (l >= 0 ? int(l / 512) : -int((-l + 511) / 512)) * 512 + s; if (l < 0) l = s
+           o[d] = l; e = $d + $(d + 3); n[d] = e > l ? e - l : 1 } printf "%d,%d,%d,%d,%d,%d\n", o[1], o[2], o[3], n[1], n[2], n[3] }' <<< "$box"; }
+  AX=${AXIS:-$O/axis.json}; [ -s $AX ] || { log "no axis $AX"; exit 1; }
+  PQ="--q 0 --levels 1"; [ "${BLEND:-1}" = 1 ] || PQ=
   for g in 0 $([ "${BLEND:-1}" = 1 ] && echo 256); do
     log "predict grid $g (waiting for GPU 0)"; gpu0_wait
-    flock /tmp/gpu0-bench.lock env CUDA_VISIBLE_DEVICES=0 ~/bin/memcap -m 40G nice -n 10 $U predict $CK $R $K $INK/g$g --um $UMV --level $LV --box $box \
-      --full-grid 1 --occupancy 5 --heads $HEADS --gpu 0 --threads $TH --window 544 --halo 16 --grid-origin $g,$g,$g $([ $g = 0 ] || echo --shard 256) > $RD/logs/predict_g$g.log 2>&1 ||
+    flock /tmp/gpu0-bench.lock env CUDA_VISIBLE_DEVICES=0 ~/bin/memcap -m 40G nice -n 10 $U predict $CK $R $K $INK/g$g --um $UMV --level $LV --box $(pbox $g) \
+      --full-grid 1 --occupancy 5 --heads $HEADS --gpu 0 --threads $TH --window 544 --halo 16 --grid-origin $g,$g,$g $([ $g = 0 ] || echo --shard 256) --axis $AX $PQ > $RD/logs/predict_g$g.log 2>&1 ||
       { log "predict grid $g failed ($RD/logs/predict_g$g.log)"; exit 1; }
     [ -e $INK/g$g/ink/zarr.json ] || { log "no ink head output in $INK/g$g"; exit 1; }
   done
@@ -85,7 +96,7 @@ for st in $SDIR/*/; do s=$(basename $st); [ -e $RD/$s.done ] && continue
     $U render $RD/in_$s $RD --volume $INK/ink $key --ct $R $K/$LV --depth 1 --scale 1 --threads $TH $FILLX > $RD/logs/render_$s.log 2>&1 ||
     { log "render $s failed ($RD/logs/render_$s.log)"; exit 1; }
   [ -e $RD/${s}_fill.tif ] && mv $RD/${s}_fill.tif $RD/fillmap/
-  if [ "${GATE:-0}" = 1 ]; then for h in c12 c13; do mkdir -p $RD/$h
+  if [ "${GATE:-1}" = 1 ]; then for h in c12 c13; do mkdir -p $RD/$h
     flock /tmp/gpu0-bench.lock env CUDA_VISIBLE_DEVICES=0 UFSM_RENDER_MEM=16 UFSM_RENDER_GPU_MEM=4 ~/bin/memcap -m ${MEMR:-48G} nice -n 10 \
       $U render $RD/in_$s $RD/$h --volume $INK/$h $key --ct $R $K/$LV --depth 1 --scale 1 --threads $TH $FILLX > $RD/logs/render_${s}_$h.log 2>&1 ||
       { log "render $s $h failed ($RD/logs/render_${s}_$h.log)"; exit 1; }
@@ -95,8 +106,9 @@ done
 if [ -n "$SEGS" ]; then
   log "score"
   CUDA_VISIBLE_DEVICES= ~/bin/lowprio ~/bin/memcap -m 24G python3 -I $PY $SDIR $SEGS $ST.tsv \
-    --map $RD --ct-key $K --step 8 --tol 20,40,80 > $ST.log 2>&1 || { log "score failed ($ST.log)"; exit 1; }
-  log "scored: $ST.tsv"
+    --map $RD --ct-key $K --step 8 --tol 20,40,80 --gate-auc ${GATE_AUC:-0} > $ST.log 2>&1; rc=$?
+  [ $rc = 0 ] || [ $rc = 3 ] || { log "score failed ($ST.log)"; exit 1; }
+  log "scored: $ST.tsv: $(grep '^HEADLINE' $ST.log | cut -c10-)"; [ $rc = 3 ] && { log "GATE: $(grep '^GATE' $ST.log)"; exit 3; }
 fi
 if [ -n "$STRIPES" ]; then   # (strip-mosaic needs every stripe) per stripe: CT and ink JPEGs at full res (1 / 99.5 % stretch) + a 1:4 CT | ink overview
   log "jpegs"
@@ -126,5 +138,9 @@ CUDA_VISIBLE_DEVICES= ~/bin/lowprio ~/bin/memcap -m 24G $U strip-mosaic $O/strip
 log "done: $RD/img/overview.jpg $(tail -1 $RD/logs/mosaic.log)"
 fi
 [ -n "$SEGS" ] || exit 0
-printf 'set\ttol\tcoverage\tink_auc\tink_f1best\tct_auc\n'
-for t in $SD/inkscore-u1 $ST; do awk -F'\t' -v t=$(basename $t) '$2 == "all" { printf "%s\t%s\t%s\t%s\t%s\t%s\n", (t == "inkscore-u1" ? "ift3-24000" : t), $1, $5, $7, $8, $9 }' $t.tsv; done
+# held out only (validation + holdout boxes); the training labels' AUC ("rest") beside it, never "all" (~76 % training samples, audit 11-14 #4)
+printf 'set\ttol\tcoverage(heldout)\tink_auc(heldout)\tink_f1best(heldout)\tct_auc(heldout)\tink_auc(rest=train)\n'
+for t in $SD/inkscore-u1 $ST; do [ -s $t.tsv ] || continue
+  awk -F'\t' -v t=$(basename $t) '$2 == "rest" { r[$1] = $7 } $2 == "validation" || $2 == "holdout" || $2 == "heldout" { h[$1, $2] = $0 }
+    END { for (k in h) { split(k, q, SUBSEP); if (q[2] != "heldout") continue; split(h[k], f, "\t")
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", (t == "inkscore-u1" ? "ift3-24000" : t), f[1], f[5], f[7], f[8], f[9], r[f[1]] } }' $t.tsv; done | sort -k1,1 -k2,2n

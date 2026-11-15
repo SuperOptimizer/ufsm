@@ -14,6 +14,7 @@
    < 64 voxels dropped; negated on inward rays so ph rises along +k; comp ids from 1 (uint16, 0 none). pw = 1 on comp, 0 in the tubes.
    A slab with < 1% labelled voxels is redrawn (up to 16 times). */
 #include "vwt.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "vwt_aug.h"
 #include "zcache.h"
@@ -41,6 +42,7 @@ typedef struct { vws_sample s; int state; } vws_slot;   /* 0 free, 1 being fille
 struct vws {
     vws_src *S; int ns; double wsum; int T, L; float tilt; int train; unsigned seed; int has_shell;
     vws_slot *slot; int nslot; pthread_t *th; int nth; _Atomic int stop; _Atomic long long next_id;
+    int nfail, failed;   /* (under mu) consecutive vws_fill failures across the workers; failed: vws_next returns -1 (threads audit #1) */
     zcache *zc; int burst, burst_r;   /* the shared decoded-chunk cache (UFSM_VWS_CACHE_GB, 4; 0 off); training draws in bursts of `burst` slabs near one
                                 anchor chunk (UFSM_VWS_BURST, 8; 1 off) so neighbouring slabs share decoded chunks */
     pthread_mutex_t mu; pthread_cond_t cv; int last;
@@ -50,9 +52,9 @@ struct vws {
 static vwa_cfg g_vwa; static int g_vwa_ok;
 static double g_mv_p = 0, g_mv_cone = 30, g_mv_shift = 16;   /* multiview pairs (vwt.h vws_sample.has_pair) */
 void vws_set_args(int argc, char **argv) {
-    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], "--mv-p")) { g_mv_p = atof(argv[i + 1]); break; }
-    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], "--mv-cone")) { g_mv_cone = atof(argv[i + 1]); break; }
-    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], "--mv-shift")) { g_mv_shift = atof(argv[i + 1]); break; }
+    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], opt_n("--mv-p"))) { g_mv_p = opt_atof(argv[i], argv[i + 1]); break; }
+    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], opt_n("--mv-cone"))) { g_mv_cone = opt_atof(argv[i], argv[i + 1]); break; }
+    for (int i = argc - 2; i >= 1; i--) if (!strcmp(argv[i], opt_n("--mv-shift"))) { g_mv_shift = opt_atof(argv[i], argv[i + 1]); break; }
     if (g_mv_p > 0) fprintf(stderr, "vws: multiview pairs p %.2f, cone %.0f deg, centre shift <= %.0f voxels\n", g_mv_p, g_mv_cone, g_mv_shift);
     g_vwa = vwa_cfg_default();
     if (vwa_cfg_parse(&g_vwa, argc, argv)) exit(2);
@@ -402,8 +404,14 @@ static void *vws_worker(void *arg) {
         uint64_t r0 = V->train ? ((uint64_t)V->seed << 32) ^ (uint64_t)id * 0x9e3779b97f4a7c15ull ^ (uint64_t)A->t << 56 : ((uint64_t)V->seed << 32) ^ (uint64_t)id;   /* val: sample id i -> seed (seed, i) */
         uint64_t rs = vws_rng(&r0);   /* (mixed once: raw states differing by multiples of the splitmix step would share one stream: duplicate slabs) */
         int rc = vws_fill(V, &rs, &w, &V->slot[k].s);
-        pthread_mutex_lock(&V->mu); V->slot[k].state = rc ? 0 : 2; pthread_cond_broadcast(&V->cv); pthread_mutex_unlock(&V->mu);
-        if (rc) fprintf(stderr, "vws: no slab after 64 draws\n");
+        pthread_mutex_lock(&V->mu); V->slot[k].state = rc ? 0 : 2;
+        V->nfail = rc ? V->nfail + 1 : 0; const int gave_up = rc && V->nfail >= 64 * (V->nth > 0 ? V->nth : 1) && !V->failed;   /* (a persistent failure: no slab in 64 fills per worker in a row) */
+        if (gave_up) V->failed = 1;
+        const int quit = V->failed;
+        pthread_cond_broadcast(&V->cv); pthread_mutex_unlock(&V->mu);
+        if (gave_up) fprintf(stderr, "vws: no slab in %d fills in a row: giving up (vws_next returns -1)\n", 64 * (V->nth > 0 ? V->nth : 1));
+        else if (rc) fprintf(stderr, "vws: no slab after 64 draws\n");
+        if (quit) break;
     }
     free(w.raw); free(w.q); free(w.kinc); free(w.arena); free(w.ct); free(w.gt); free(w.shb); free(w.sidx); free(A); return nullptr;
 }
@@ -412,7 +420,9 @@ int vws_next(vws *V, vws_sample *out) {
     pthread_mutex_lock(&V->mu);
     if (V->last >= 0) { V->slot[V->last].state = 0; V->last = -1; pthread_cond_broadcast(&V->cv); }
     int k = -1;
-    for (;;) { for (int s = 0; s < V->nslot; s++) if (V->slot[s].state == 2) { k = s; break; } if (k >= 0) break; pthread_cond_wait(&V->cv, &V->mu); }
+    for (;;) { for (int s = 0; s < V->nslot; s++) if (V->slot[s].state == 2) { k = s; break; } if (k >= 0) break;
+               if (V->failed || V->stop) { pthread_mutex_unlock(&V->mu); return -1; }   /* (no worker will fill a slot: the caller handles -1) */
+               pthread_cond_wait(&V->cv, &V->mu); }
     V->slot[k].state = 3; V->last = k; *out = V->slot[k].s; pthread_mutex_unlock(&V->mu);
     return 0;
 }
@@ -555,16 +565,16 @@ void vws_close(vws *V) {
 
 /* ufsm vwt-sample SOURCES OUT N [--T 128] [--L 384] [--tilt 15] [--threads 8] [--seed 1] [--val 0]: N slabs -> OUT/sNNN.{im,va,comp}.u8|u16 raw,
    .ph.f32, .pw.f32 + OUT/meta.tsv; prints the throughput (slabs / s) */
-static const char *vo(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *vo(int argc, char **argv, const char *k, const char *d) { for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 #include <time.h>
 #include <sys/stat.h>
 int cmd_vwt_sample(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm vwt-sample SOURCES OUT N [--T 128] [--L 384] [--tilt 15] [--threads 8] [--seed 1] [--val 0] [--write 1] [--jpg 0]\n"
                                     "       [--vaug 1 ... (any vwt-train aug flag: the training augmentation, src/vwt_aug.h)]\n"); return 2; }
-    for (int i = 5; i < argc; i++) if (!strncmp(argv[i], "--vaug", 6) || !strncmp(argv[i], "--deform", 8) || !strncmp(argv[i], "--aug-crush", 11)) { vws_set_args(argc, argv); break; }
-    const int jpg = atoi(vo(argc, argv, "--jpg", "0"));
-    const int T = atoi(vo(argc, argv, "--T", "128")), L = atoi(vo(argc, argv, "--L", "384")), N = atoi(argv[4]), wr = atoi(vo(argc, argv, "--write", "1"));
-    vws *V = vws_open(argv[2], T, L, (float)atof(vo(argc, argv, "--tilt", "15")), ufsm_threads(atoi(vo(argc, argv, "--threads", "0")), 8), (unsigned)atoi(vo(argc, argv, "--seed", "1")), !atoi(vo(argc, argv, "--val", "0")));
+    for (int i = 5; i < argc; i++) if (!strncmp(argv[i], opt_p("--vaug"), 6) || !strncmp(argv[i], opt_p("--deform"), 8) || !strncmp(argv[i], opt_p("--aug-crush"), 11)) { vws_set_args(argc, argv); break; }
+    const int jpg = opt_atoi("--jpg", vo(argc, argv, "--jpg", "0"));
+    const int T = opt_atoi("--T", vo(argc, argv, "--T", "128")), L = opt_atoi("--L", vo(argc, argv, "--L", "384")), N = atoi(argv[4]), wr = opt_atoi("--write", vo(argc, argv, "--write", "1"));
+    vws *V = vws_open(argv[2], T, L, (float)opt_atof("--tilt", vo(argc, argv, "--tilt", "15")), ufsm_threads(opt_atoi("--threads", vo(argc, argv, "--threads", "0")), 8), (unsigned)opt_atoi("--seed", vo(argc, argv, "--seed", "1")), !opt_atoi("--val", vo(argc, argv, "--val", "0")));
     if (!V) return 1;
     mkdir(argv[3], 0775); char p[1400]; snprintf(p, sizeof p, "%s/meta.tsv", argv[3]); FILE *m = fopen(p, "w");
     if (m) fprintf(m, "i\tsrc\tinward\to_x\to_y\to_z\td_x\td_y\td_z\tlabelled\tweighted\tcomps\tph_rise\tshell\n");

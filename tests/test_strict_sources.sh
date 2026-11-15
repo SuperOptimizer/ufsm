@@ -35,7 +35,7 @@ os.makedirs('nocoarse', exist_ok=True); m = json.load(open('fx/ct/zarr.json')); 
 for d in ms['datasets'][:3]: os.symlink(os.path.abspath('fx/ct/' + d['path']), 'nocoarse/' + d['path'])
 ms['datasets'] = ms['datasets'][:3]; json.dump(m, open('nocoarse/zarr.json', 'w'))
 r = copy.deepcopy(s0); r['name'] = 'nocoarse'; r['root'] = '.'; r['ct'] = 'nocoarse'; r['targets']['band']['root'] = 'fx/band'
-r['targets']['band']['phase']['root'] = 'fx/phase0'; r['targets']['band']['axis'] = r['axis'] = 'fx/axis.json'
+r['targets']['band']['phase']['root'] = 'fx/phase0'; r['axis'] = 'fx/axis.json'   # (the source-level axis; targets.band.axis is no key sources_load reads: the unread-key check made it fatal first)
 json.dump({'sources': [r]}, open('nocoarse.json', 'w'))
 PY
 "$U" train two.json --out a --levels 1 "${C[@]}" > a.log 2>&1 || fail "without --strict-sources ($D/a.log)"

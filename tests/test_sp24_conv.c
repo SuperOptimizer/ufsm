@@ -133,7 +133,7 @@ static void run_case(const char *name, int Ci, int Co, int D, int H, int W, int 
 
 int main(void) {
     if (nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0)) { printf("no GPU\nFAIL\n"); return 1; }
-    if (lp_sw_build()) { printf("software MX build: no sparse MMA, skipped\nok\n"); return 0; }
+    if (lp_sw_build()) { printf("SKIP: test_sp24_conv: software MX build, no sparse MMA\n"); return 0; }
     run_case("MT4 exact", 128, 128, 6, 20, 36, 1, 0, 0, 0);
     run_case("MT2 TZ4 exact", 96, 96, 16, 12, 20, 1, 0, 0, 0);
     run_case("MT2 TZ2 exact", 96, 160, 6, 9, 17, 1, 0, 0, 0);

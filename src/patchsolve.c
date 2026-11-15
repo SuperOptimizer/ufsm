@@ -22,6 +22,7 @@
    Output: per-round summary on stdout (with --gt: share of GT-matched area on the right sheet and turn, overall and in the largest graph
    component, mod 14 like the prototype); --tsv: one row per node (patch, comp, vertices, active, graph comp, turn, GT sheet / pure / n). */
 #include "l1pot.h"
+#include "optcheck.h"
 #include "patchsolve.h"
 #include "sources.h"
 #include "store.h"
@@ -38,7 +39,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static const char *ps_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *ps_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 
 float *ps_tif(const char *path, int *w, int *h) {
     tiff *t = tiff_open_file(path); tiff_page pg;
@@ -221,13 +222,13 @@ int cmd_patch_solve(int argc, char **argv) {
     const char *paths = ps_opt(argc, argv, "--paths", nullptr), *probp = ps_opt(argc, argv, "--prob", nullptr), *boxs = ps_opt(argc, argv, "--box", nullptr);
     const char *axp = ps_opt(argc, argv, "--axis", nullptr), *gtp = ps_opt(argc, argv, "--gt", nullptr), *tsv = ps_opt(argc, argv, "--tsv", nullptr);
     const char *cache = ps_opt(argc, argv, "--cache", nullptr), *vmode = ps_opt(argc, argv, "--votes", "pair"), *cmode = ps_opt(argc, argv, "--counter", "both");
-    const double axs = atof(ps_opt(argc, argv, "--axis-scale", "1")), sgn = atof(ps_opt(argc, argv, "--sgn", "1"));
-    const int minv = atoi(ps_opt(argc, argv, "--minv", "100")), minvotes = atoi(ps_opt(argc, argv, "--min-votes", "3")), rounds = atoi(ps_opt(argc, argv, "--rounds", "6"));
-    const double pfrac = atof(ps_opt(argc, argv, "--prune-frac", "0.05")), pthr = atof(ps_opt(argc, argv, "--prune-thr", "0.25"));
-    int nt = atoi(ps_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = (int)sysconf(_SC_NPROCESSORS_ONLN); if (nt < 1) nt = 1;
-    const int oracle = atoi(ps_opt(argc, argv, "--oracle", "0")), cut = atoi(ps_opt(argc, argv, "--cut", "1"));
-    const char *linksp = ps_opt(argc, argv, "--links", nullptr); const double linkw = atof(ps_opt(argc, argv, "--link-w", "1"));
-    const double dupf = atof(ps_opt(argc, argv, "--dup-frac", "0"));   /* > 0: crossings closer than dupf x pitch with no sheet between vote d = 0 */
+    const double axs = opt_atof("--axis-scale", ps_opt(argc, argv, "--axis-scale", "1")), sgn = opt_atof("--sgn", ps_opt(argc, argv, "--sgn", "1"));
+    const int minv = opt_atoi("--minv", ps_opt(argc, argv, "--minv", "100")), minvotes = opt_atoi("--min-votes", ps_opt(argc, argv, "--min-votes", "3")), rounds = opt_atoi("--rounds", ps_opt(argc, argv, "--rounds", "6"));
+    const double pfrac = opt_atof("--prune-frac", ps_opt(argc, argv, "--prune-frac", "0.05")), pthr = opt_atof("--prune-thr", ps_opt(argc, argv, "--prune-thr", "0.25"));
+    int nt = opt_atoi("--threads", ps_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = (int)sysconf(_SC_NPROCESSORS_ONLN); if (nt < 1) nt = 1;
+    const int oracle = opt_atoi("--oracle", ps_opt(argc, argv, "--oracle", "0")), cut = opt_atoi("--cut", ps_opt(argc, argv, "--cut", "1"));
+    const char *linksp = ps_opt(argc, argv, "--links", nullptr); const double linkw = opt_atof("--link-w", ps_opt(argc, argv, "--link-w", "1"));
+    const double dupf = opt_atof("--dup-frac", ps_opt(argc, argv, "--dup-frac", "0"));   /* > 0: crossings closer than dupf x pitch with no sheet between vote d = 0 */
     const char *lkinds = ps_opt(argc, argv, "--link-kinds", "seam,rseam");   /* sheet-trace link kinds used (contacts are unreliable: 11-06 C3 58% wrong) */   /* diagnostic: GT turn differences as the edge values */
     const int ray = !strcmp(vmode, "ray");
     /* --counter: a comma list of ridge (ridge runs), prob (prob peaks), pitch (round(dr / pitch), pitch = the box median dr of crossings
@@ -542,7 +543,7 @@ int cmd_patch_solve(int argc, char **argv) {
             }
             char d[1600]; snprintf(d, sizeof d, "%s/%s_c%d", outp, nd->name, nd->comp);
             char src[64]; snprintf(src, sizeof src, "patch-solve gc %u", lab[i]);
-            if (tifxyz_write(d, w, h, X, Y, Z, nd->step, atof(ps_opt(argc, argv, "--vs", "9.596")), x[i], src)) { fprintf(stderr, "patch-solve: cannot write %s\n", d); return 1; }
+            if (tifxyz_write(d, w, h, X, Y, Z, nd->step, opt_atof("--vs", ps_opt(argc, argv, "--vs", "9.596")), x[i], src)) { fprintf(stderr, "patch-solve: cannot write %s\n", d); return 1; }
             free(X); free(Y); free(Z); nw++;
         }
         printf("wrote %ld patches -> %s\n", nw, outp);

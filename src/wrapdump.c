@@ -4,6 +4,7 @@
    pipeline (tools/fibwrap.py: the label-free fibre judge against the final snapped wraps of a slab, without a whole-scroll surf-labels
    render; DESIGN.md 2026-11-10). Single thread; rows are read 64 at a time and filtered per vertex. */
 #include <dirent.h>
+#include "optcheck.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,7 +13,7 @@
 #include "surfcomp.h"
 #include "wrapdump.h"
 
-static const char *wd_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *wd_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 
 int wraps_slab_load(const char *dir, double z0, double z1, const double yx[4], int ev, double gum, int first, int last, float **out, size_t *n) {
     *out = nullptr; *n = 0;
@@ -54,7 +55,7 @@ int cmd_wrap_dump(int argc, char **argv) {
     double z0, z1, yx[4] = {-1e30, 1e30, -1e30, 1e30};
     if (argc < 6 || sscanf(wd_opt(argc, argv, "--z", ""), "%lf,%lf", &z0, &z1) != 2) { fprintf(stderr, "usage: ufsm wrap-dump <wraps-dir> <out.f32> --z z0,z1 [--yx y0,y1,x0,x1] [--every 2] [--grid-um U]\n"); return 2; }
     if (*wd_opt(argc, argv, "--yx", "") && sscanf(wd_opt(argc, argv, "--yx", ""), "%lf,%lf,%lf,%lf", &yx[0], &yx[1], &yx[2], &yx[3]) != 4) { fprintf(stderr, "wrap-dump: --yx y0,y1,x0,x1\n"); return 2; }
-    const int ev = atoi(wd_opt(argc, argv, "--every", "2")); const double gum = atof(wd_opt(argc, argv, "--grid-um", "0"));
+    const int ev = opt_atoi("--every", wd_opt(argc, argv, "--every", "2")); const double gum = opt_atof("--grid-um", wd_opt(argc, argv, "--grid-um", "0"));
     if (ev < 1) { fprintf(stderr, "wrap-dump: --every >= 1\n"); return 2; }
     float *rec; size_t n; const int nw = wraps_slab_load(argv[2], z0, z1, yx, ev, gum, -(1 << 30), 1 << 30, &rec, &n); if (nw < 0) return 1;
     FILE *o = fopen(argv[3], "wb"); if (!o || (n && fwrite(rec, 20, n, o) != n) || fclose(o)) { fprintf(stderr, "wrap-dump: cannot write %s\n", argv[3]); return 1; }

@@ -17,6 +17,7 @@
    --coh 0: no coherence factor (weight 1 on every known voxel before the boxes and the papyrus mask; cells without a coherence are
    not zeroed): the output is the box scale and the papyrus mask alone (the PHerc1299 direction / fibre mask, 2026-11-12). */
 #include "band.h"
+#include "optcheck.h"
 #include "store.h"
 #include "sysinfo.h"
 #include "z3w.h"
@@ -29,7 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *pc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *pc_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 
 enum { PC_S = 512, PC_WB = 10 };
 typedef struct {
@@ -134,12 +135,12 @@ int cmd_phase_coh(int argc, char **argv) {
     if (argc < 7) { fprintf(stderr, "usage: ufsm phase-coh PHASE_ROOT PHASE_KEY CT_ROOT CT_KEY OUT --weight T0,T1 [--weight2 T0,T1] [--cell 32] [--zband Z0,Z1] [--box-scale FILE [--box-default D]] [--papyrus T [--pap-dilate R] [--phase-out 1]] [--threads N]\n"); return 2; }
     pc_job J = {0};
     if (sscanf(pc_opt(argc, argv, "--weight", ""), "%lf,%lf", &J.t0, &J.t1) != 2 || !(J.t1 > J.t0)) { fprintf(stderr, "phase-coh: --weight T0,T1 with T1 > T0\n"); return 2; }
-    J.cell = atoi(pc_opt(argc, argv, "--cell", "32")); if (J.cell < 4 || PC_S % J.cell) { fprintf(stderr, "phase-coh: --cell must divide %d\n", PC_S); return 2; }
+    J.cell = opt_atoi("--cell", pc_opt(argc, argv, "--cell", "32")); if (J.cell < 4 || PC_S % J.cell) { fprintf(stderr, "phase-coh: --cell must divide %d\n", PC_S); return 2; }
     if (sscanf(pc_opt(argc, argv, "--zband", ""), "%lld,%lld", &J.zb0, &J.zb1) != 2) { J.zb0 = 0; J.zb1 = -1; }
-    J.bdef = atof(pc_opt(argc, argv, "--box-default", "1")); J.nocoh = !atoi(pc_opt(argc, argv, "--coh", "1"));
-    J.pap_t = atoi(pc_opt(argc, argv, "--papyrus", "0")); J.pap_r = atoi(pc_opt(argc, argv, "--pap-dilate", "2"));
+    J.bdef = opt_atof("--box-default", pc_opt(argc, argv, "--box-default", "1")); J.nocoh = !opt_atoi("--coh", pc_opt(argc, argv, "--coh", "1"));
+    J.pap_t = opt_atoi("--papyrus", pc_opt(argc, argv, "--papyrus", "0")); J.pap_r = opt_atoi("--pap-dilate", pc_opt(argc, argv, "--pap-dilate", "2"));
     if (J.pap_t < 0 || J.pap_t > 255 || J.pap_r < 0 || J.pap_r > 16) { fprintf(stderr, "phase-coh: --papyrus 1..255, --pap-dilate 0..16\n"); return 2; }
-    const int phase_out = atoi(pc_opt(argc, argv, "--phase-out", "0"));
+    const int phase_out = opt_atoi("--phase-out", pc_opt(argc, argv, "--phase-out", "0"));
     if (phase_out && !J.pap_t) { fprintf(stderr, "phase-coh: --phase-out needs --papyrus\n"); return 2; }
     if (pc_opt(argc, argv, "--box-scale", nullptr)) {
         FILE *f = fopen(pc_opt(argc, argv, "--box-scale", ""), "r"); if (!f) { fprintf(stderr, "phase-coh: cannot read --box-scale %s\n", pc_opt(argc, argv, "--box-scale", "")); return 1; }
@@ -149,7 +150,7 @@ int cmd_phase_coh(int argc, char **argv) {
             for (int d = 0; d < 6; d++) { J.box[J.nbox][d] = v[d]; }
             J.bs[J.nbox++] = s < 0 ? 0 : s > 1 ? 1 : s; }
         fclose(f); if (!J.nbox) { fprintf(stderr, "phase-coh: --box-scale: no boxes read\n"); return 2; } }
-    const int nt = ufsm_threads(atoi(pc_opt(argc, argv, "--threads", "0")), 8);
+    const int nt = ufsm_threads(opt_atoi("--threads", pc_opt(argc, argv, "--threads", "0")), 8);
     J.ph = z3_open(store_open(argv[2]), argv[3], nullptr); J.ct = z3_open(store_open(argv[4]), argv[5], nullptr);
     if (!J.ph || !J.ct) { fprintf(stderr, "phase-coh: cannot open %s: %s\n", !J.ph ? argv[2] : argv[4], z3_error()); return 1; }
     const int64_t *ps = z3_meta_of(J.ph)->shape, *cs = z3_meta_of(J.ct)->shape;

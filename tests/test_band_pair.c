@@ -4,6 +4,8 @@
    holes, conflicts, a missing wrap, non-cubic boxes and an empty one. */
 #include "../src/band.h"
 #include "../src/bandgpu.h"
+#include "fm_tol.h"
+#include <cuda_runtime_api.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -190,6 +192,7 @@ int main(void) {
     const int dims[][3] = {{40, 64, 72}, {57, 50, 61}, {33, 33, 33}, {24, 90, 40}, {16, 16, 16}};
     const int ncase = sizeof dims / sizeof dims[0];
     int fails = 0, gpu = band_pair_gpu != nullptr, gpu_ran = 0;
+    int ndev = 0; if (cudaGetDeviceCount(&ndev) != cudaSuccess) ndev = 0;   /* a device that does not answer is a failure; no device at all (a CPU run) a skip */
     if (gpu) band_pair_gpu_slots(2, 0);
     for (int c = 0; c < ncase; c++) for (int rm = 0; rm < 2; rm++) {
         const int *n = dims[c]; const size_t N = (size_t)n[0] * n[1] * n[2]; const float rmax = rm ? 14.f : 6.5f;
@@ -199,19 +202,23 @@ int main(void) {
         if (ref_pair_ex(codes, n, rmax, a, nullptr, nullptr, nullptr) || band_field_phase_pair(codes, n, rmax, b, nullptr)) { printf("FAIL alloc\n"); return 1; }
         size_t known = 0, d = 0; for (size_t i = 0; i < N; i++) { known += a[i] < PHASE_PERIOD; d += a[i] != b[i]; }
         printf("case %d (%dx%dx%d, rmax %.1f): %zu labelled, %zu phase known, lean CPU differs at %zu", c, n[0], n[1], n[2], rmax, lab, known, d);
-        fails += d != 0;
+        /* exact under UFSM_STRICT_MATH; under fast math (host sqrtf / f = da / (da + db) contracted, reciprocal; nn_band.cu approximate
+           sqrt / division) a phase code may move by 1 (cyclic) on <= 1e-3 of the voxels, and <= 1e-4 flip known / unknown at the
+           "between the sheets" angle test (tests/fm_tol.h) */
+        fails += fm_cmp_u8c("lean CPU vs reference phase", a, b, N, 1, PHASE_PERIOD, 1e-3, 1e-4);
         if (gpu) {
-            if (band_pair_gpu(codes, n, rmax, g)) printf(", GPU unavailable");
-            else { size_t e = 0; for (size_t i = 0; i < N; i++) e += a[i] != g[i]; printf(", GPU differs at %zu", e); fails += e != 0; gpu_ran = 1; }
+            if (band_pair_gpu(codes, n, rmax, g)) { printf(", GPU unavailable%s", ndev ? " with a device visible: FAIL" : " (no device: skipped)"); fails += ndev > 0; }
+            else { size_t e = 0; for (size_t i = 0; i < N; i++) e += a[i] != g[i]; printf(", GPU differs at %zu", e); fails += fm_cmp_u8c("GPU vs reference phase", a, g, N, 1, PHASE_PERIOD, 1e-3, 1e-4); gpu_ran = 1; }
         }
         const int margin = 2;
         if (ref_side_pair(codes, n, rmax, margin, a) || band_field_side_pair(codes, n, rmax, margin, b)) { printf("FAIL alloc\n"); return 1; }
         size_t ds = 0, ks = 0; for (size_t i = 0; i < N; i++) { ds += a[i] != b[i]; ks += a[i] != RV_UNKNOWN; }
-        printf(", side known %zu differs at %zu\n", ks, ds); fails += ds != 0;
+        printf(", side known %zu differs at %zu\n", ks, ds);
+        fails += fm_cmp_u8c("lean CPU vs reference side", a, b, N, 0, 0, 1e-4, 1e-4);   /* side classes: no order, any difference is a flip */
         if (c < ncase - 1 && (known == 0 || ks == 0)) { printf("FAIL: a case without known output\n"); fails++; }
         free(codes); free(a); free(b); free(g);
     }
     if (gpu) band_pair_gpu_free();
-    printf("%s (GPU %s)\n", fails ? "FAIL" : "PASS", gpu_ran ? "checked" : "not checked");
+    printf("%s (GPU %s)\n", fails ? "FAIL" : "PASS", gpu_ran ? "checked" : ndev ? "not checked" : "not checked: no device");
     return fails != 0;
 }

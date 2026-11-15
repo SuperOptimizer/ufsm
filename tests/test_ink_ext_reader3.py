@@ -53,7 +53,7 @@ real = P.real_tiles(2, 17, 384, 2, [(5000, 2000, 2000), (5800, 1900, 2400)])
 if real is not None:
     tiles = np.concatenate([tiles, real])
 else:
-    print("no local CT: random tiles only")
+    pass  # (real_tiles printed the PARTIAL line: random tiles only)
 refs = []
 with torch.inference_mode():
     for t in tiles:

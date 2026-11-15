@@ -178,9 +178,10 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                         }
                     }
                     if (gp.ns || sp.gp2.ns) {   /* slab-local GroupNorm: plane xgz0 + pl's slab */
+                        const cab_pl pz = chan_ab_pl(Ci, Cx, n, sp, gp, max(xgz0 + pl, 0));
 #pragma unroll
                         for (int q = 0; q < XC; q++) {
-                            const chan_t &cq = ctab8[q]; const float2 ab = chan_ab(ci0 + q < Ci ? ci0 + q : Ci, Ci, Cx, n, sp, gp, max(xgz0 + pl, 0));
+                            const chan_t &cq = ctab8[q]; const float2 ab = chan_ab_q(ci0 + q < Ci ? ci0 + q : Ci, Ci, Cx, sp, gp, pz);
                             v[pl][q] = cq.p ? act_ab(v[pl][q], ab.x, ab.y, Gany && cq.g) : 0.f;
                         }
                     } else if (!xplain) {   /* (xplain: every channel present, no GN (the network input): v as decoded) */
@@ -268,7 +269,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                         const float g = (c & 1) ? gd.y : gd.x, r = ((c & 1) ? xd.y : xd.x) * mx_scale((as4 >> (8 * j)) & 0xffu);
                         const float fg = mx_scale((gs4 >> (8 * j)) & 0xffu);
                         const float p = fmaf(r, c4.x, c4.y);
-                        float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+                        float th = tanh_silu(p);
                         const float d2 = (1.f + th) * (fmaf(-p, th, p) + 1.f);
                         const float o = fmaf(g * d2 * c4.x, fg, fmaf(r, c4.z, c4.w));
                         v[i + j] = cok ? o : 0.f;
@@ -276,7 +277,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                     }
                 }
                 const unsigned u = __float_as_uint(__uint_as_float(am) * (1.f / 448.f));   /* mx_exp without its early return */
-                const int e = (u & 0x7fffffffu) > 0x7f800000u ? 128 : max(-126, min(126, (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0)));
+                const int e = (u & 0x7fffffffu) >= 0x7f800000u ? 128 : max(-126, min(126, (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0)));
                 const float m = exp2i(-e);
                 sgs[c * 8 + ks] = (uint8_t)(e + 127);
                 unsigned *dst = (unsigned *)(sg + c * G8_CS + ks * 32);
@@ -316,7 +317,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
             }
             if constexpr (NP == 2) am = max(am, __shfl_xor_sync(0xffffffffu, am, 16));   /* the block's other row */
             const unsigned u = __float_as_uint(__uint_as_float(am) * (1.f / 448.f));   /* mx_exp without its early return */
-            const int e = (u & 0x7fffffffu) > 0x7f800000u ? 128 : max(-126, min(126, (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0)));
+            const int e = (u & 0x7fffffffu) >= 0x7f800000u ? 128 : max(-126, min(126, (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0)));
             const float m = exp2i(-e);
             if (part == 0) sgs[c * 8 + ks] = (uint8_t)(e + 127);
             unsigned *dst = (unsigned *)(sg + c * G8_CS + ks * 32 + i0);
@@ -387,11 +388,16 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                 for (int q = 0; q < CH; q++) v[q] = 0.f;
                 if (inb) {
                     mx_rowch<T, CH>(c0, upt, gz, gyy, gx, D, H, W, v);   /* upt: the tile is the half-resolution x segment of a decoder conv */
+                    if (gp.ns || sp.gp2.ns) {   /* slab-local GroupNorm: plane gz's slab (the test and the per-plane part out of the channel loop) */
+                        const cab_pl pz = chan_ab_pl(Ci, Cx, n, sp, gp, gz);
 #pragma unroll
-                    for (int q = 0; q < CH; q++) {   /* (slab-local GroupNorm: plane gz's slab) */
-                        const chan_t &cq = ctab8[q];
-                        const float2 ab = gp.ns || sp.gp2.ns ? chan_ab(ci0 + q < Ci ? ci0 + q : Ci, Ci, Cx, n, sp, gp, gz) : make_float2(cq.a, cq.b);
-                        v[q] = cq.p ? act_ab(v[q], ab.x, ab.y, Gany && cq.g) : 0.f;
+                        for (int q = 0; q < CH; q++) {
+                            const chan_t &cq = ctab8[q]; const float2 ab = chan_ab_q(ci0 + q < Ci ? ci0 + q : Ci, Ci, Cx, sp, gp, pz);
+                            v[q] = cq.p ? act_ab(v[q], ab.x, ab.y, Gany && cq.g) : 0.f;
+                        }
+                    } else {
+#pragma unroll
+                        for (int q = 0; q < CH; q++) { const chan_t &cq = ctab8[q]; v[q] = cq.p ? act_ab(v[q], cq.a, cq.b, Gany && cq.g) : 0.f; }
                     }
                 }
                 unsigned ra[CH];   /* the channels' warp amaxes first (independent reductions), then lane 0's shared maxima */
@@ -501,7 +507,7 @@ __global__ void __launch_bounds__(288, FAST ? BW8F_MINB : BW8_MINB) conv_bwd_w_f
                     for (int c = 0; c < BMo; c++) {
                         const unsigned u = __float_as_uint(__uint_as_float(amc[c]) * (1.f / 448.f));   /* mx_exp without its early return */
                         const int e = max(-126, min(126, (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0)));
-                        ec[c] = (u & 0x7fffffffu) > 0x7f800000u ? 128 : e;
+                        ec[c] = (u & 0x7fffffffu) >= 0x7f800000u ? 128 : e;
                     }
                     if (sp.sr) {
 #pragma unroll

@@ -5,6 +5,7 @@
    and stepping through neighbouring slices reads nothing new. Wraps load in a background thread (the .sfc decoder is not
    thread-safe), so the page is usable at once and the wrap overlay fills in. */
 #include <errno.h>
+#include "optcheck.h"
 #include <math.h>
 #include <stdarg.h>
 #include <netinet/in.h>
@@ -103,10 +104,12 @@ static void st_push(annot_store *s, int id, char *text) {
     if (s->n == s->cap) { s->cap = s->cap ? 2 * s->cap : 64; s->it = realloc(s->it, (size_t)s->cap * sizeof *s->it); }
     s->it[s->n++] = (aitem){id, 0, text};
 }
-static void st_log(annot_store *s, const char *line) {
+static int st_log(annot_store *s, const char *line) {   /* 0, or -1 (reported) when the journal line did not reach the disk */
     char p[4200]; snprintf(p, sizeof p, "%s.log", s->path); FILE *f = fopen(p, "a");
-    if (!f) { fprintf(stderr, "annot: cannot append to %s: %s\n", p, strerror(errno)); return; }
-    fprintf(f, "%s\n", line); fflush(f); fsync(fileno(f)); fclose(f);
+    if (!f) { fprintf(stderr, "annot: cannot append to %s: %s\n", p, strerror(errno)); return -1; }
+    int bad = fprintf(f, "%s\n", line) < 0; bad |= fflush(f) != 0; bad |= fsync(fileno(f)) != 0; bad |= fclose(f) != 0;
+    if (bad) fprintf(stderr, "annot: append to %s failed: %s\n", p, strerror(errno));
+    return bad ? -1 : 0;
 }
 static char *st_snapshot_locked(annot_store *s) {
     sb b = {0}; sb_str(&b, "{\"version\":1,\"scroll\":"); sb_jstr(&b, s->scroll ? s->scroll : ""); sb_str(&b, ",\"scan\":");
@@ -114,11 +117,17 @@ static char *st_snapshot_locked(annot_store *s) {
     for (int i = 0; i < s->n; i++) if (!s->it[i].dead) { if (!first) sb_str(&b, ","); first = 0; sb_str(&b, s->it[i].text); }
     sb_str(&b, "]}\n"); return b.s;
 }
-static void st_save(annot_store *s) {   /* snapshot to <path>.tmp, renamed over <path> */
+/* snapshot to <path>.tmp, renamed over <path> only when every write, the flush, the fsync and the close succeeded (audit mini/errpaths 1:
+   all were ignored and the rename ran anyway, so ENOSPC replaced the good store with a truncated one while the client was told "saved").
+   0, or -1 (reported; the old store is kept, the temp removed) */
+static int st_save(annot_store *s) {
     char *t = st_snapshot_locked(s); char p[4200]; snprintf(p, sizeof p, "%s.tmp", s->path); FILE *f = fopen(p, "w");
-    if (f) { fputs(t, f); fflush(f); fsync(fileno(f)); fclose(f); if (rename(p, s->path)) fprintf(stderr, "annot: rename %s: %s\n", p, strerror(errno)); }
-    else fprintf(stderr, "annot: cannot write %s: %s\n", p, strerror(errno));
+    int bad = !f;
+    if (f) { bad |= fputs(t, f) < 0; bad |= fflush(f) != 0; bad |= fsync(fileno(f)) != 0; bad |= fclose(f) != 0; }
+    if (!bad && rename(p, s->path)) bad = 1;
+    if (bad) { fprintf(stderr, "annot: saving %s failed: %s (the previous store is kept)\n", s->path, strerror(errno)); if (f) unlink(p); }
     free(t);
+    return bad ? -1 : 0;
 }
 annot_store *annot_open(const char *path, const char *scroll, const char *scan) {
     annot_store *s = calloc(1, sizeof *s); s->path = strdup(path); s->scroll = scroll ? strdup(scroll) : nullptr; s->scan = scan ? strdup(scan) : nullptr;
@@ -156,8 +165,10 @@ int annot_add(annot_store *s, const char *item, const char *author, char *err, s
     free(t.s); st_push(s, id, b.s);
     if (s->nu == s->ucap) { s->ucap = s->ucap ? 2 * s->ucap : 64; s->u = realloc(s->u, (size_t)s->ucap * sizeof *s->u); }
     s->u[s->nu++] = (aundo){0, id};
-    sb l = {0}; sb_str(&l, "{\"op\":\"add\",\"item\":"); sb_str(&l, b.s); sb_str(&l, "}"); st_log(s, l.s); free(l.s);
-    st_save(s); pthread_mutex_unlock(&s->mu); return id;
+    sb l = {0}; sb_str(&l, "{\"op\":\"add\",\"item\":"); sb_str(&l, b.s); sb_str(&l, "}"); int bad = st_log(s, l.s); free(l.s);
+    bad |= st_save(s); pthread_mutex_unlock(&s->mu);
+    if (bad) { snprintf(err, errn, "annotation %d not saved to disk (see the server log)", id); return -2; }
+    return id;
 }
 static aitem *st_find(annot_store *s, int id) { for (int i = 0; i < s->n; i++) if (s->it[i].id == id) return &s->it[i]; return nullptr; }
 int annot_del(annot_store *s, int id) {
@@ -166,15 +177,15 @@ int annot_del(annot_store *s, int id) {
     a->dead = 1;
     if (s->nu == s->ucap) { s->ucap = s->ucap ? 2 * s->ucap : 64; s->u = realloc(s->u, (size_t)s->ucap * sizeof *s->u); }
     s->u[s->nu++] = (aundo){1, id};
-    char l[96]; snprintf(l, sizeof l, "{\"op\":\"del\",\"id\":%d}", id); st_log(s, l); st_save(s); pthread_mutex_unlock(&s->mu); return 0;
+    char l[96]; snprintf(l, sizeof l, "{\"op\":\"del\",\"id\":%d}", id); int bad = st_log(s, l); bad |= st_save(s); pthread_mutex_unlock(&s->mu); return bad ? -2 : 0;
 }
 int annot_undo(annot_store *s) {
     pthread_mutex_lock(&s->mu);
     if (!s->nu) { pthread_mutex_unlock(&s->mu); return -1; }
     const aundo u = s->u[--s->nu]; aitem *a = st_find(s, u.id);
     if (a) a->dead = u.op == 0;   /* undo an add: dead; undo a del: alive again */
-    char l[128]; snprintf(l, sizeof l, "{\"op\":\"undo\",\"of\":\"%s\",\"id\":%d}", u.op ? "del" : "add", u.id); st_log(s, l);
-    st_save(s); pthread_mutex_unlock(&s->mu); return 0;
+    char l[128]; snprintf(l, sizeof l, "{\"op\":\"undo\",\"of\":\"%s\",\"id\":%d}", u.op ? "del" : "add", u.id); int bad = st_log(s, l);
+    bad |= st_save(s); pthread_mutex_unlock(&s->mu); return bad ? -2 : 0;
 }
 char *annot_snapshot(annot_store *s) { pthread_mutex_lock(&s->mu); char *t = st_snapshot_locked(s); pthread_mutex_unlock(&s->mu); return t; }
 int annot_count(annot_store *s) { pthread_mutex_lock(&s->mu); int c = 0; for (int i = 0; i < s->n; i++) c += !s->it[i].dead; pthread_mutex_unlock(&s->mu); return c; }
@@ -424,10 +435,10 @@ static void handle(int fd) {
     } else if (!strcmp(url, "/ann") && !post) { char *t = annot_snapshot(G.st); reply_json(fd, 200, t); free(t); }
     else if (!strcmp(url, "/ann/add") && post) {
         char err[256] = ""; const int id = annot_add(G.st, body, G.c.author, err, sizeof err);
-        if (id < 0) { sb b = {0}; sb_str(&b, "{\"error\":"); sb_jstr(&b, err); sb_str(&b, "}"); reply_json(fd, 400, b.s); free(b.s); }
+        if (id < 0) { sb b = {0}; sb_str(&b, "{\"error\":"); sb_jstr(&b, err); sb_str(&b, "}"); reply_json(fd, id == -2 ? 500 : 400, b.s); free(b.s); }
         else { char t[64]; snprintf(t, sizeof t, "{\"id\":%d}", id); reply_json(fd, 200, t); }
-    } else if (!strcmp(url, "/ann/del") && post) reply_json(fd, annot_del(G.st, (int)qnum(Q, "id", 0)) ? 404 : 200, "{}");
-    else if (!strcmp(url, "/ann/undo") && post) reply_json(fd, annot_undo(G.st) ? 404 : 200, "{}");
+    } else if (!strcmp(url, "/ann/del") && post) { const int r = annot_del(G.st, (int)qnum(Q, "id", 0)); reply_json(fd, r == -2 ? 500 : r ? 404 : 200, r == -2 ? "{\"error\":\"not saved to disk\"}" : "{}"); }
+    else if (!strcmp(url, "/ann/undo") && post) { const int r = annot_undo(G.st); reply_json(fd, r == -2 ? 500 : r ? 404 : 200, r == -2 ? "{\"error\":\"not saved to disk\"}" : "{}"); }
     else if (!strcmp(url, "/regions")) {
         sb b = {0}; sb_str(&b, "[");
         for (int i = 0; i < G.nrg; i++) { const region_t *r = &G.rg[i]; sb_fmt(&b, "%s{\"name\":", i ? "," : ""); sb_jstr(&b, r->name);
@@ -485,7 +496,7 @@ void annot_serve_stop(void) {
     if (G.lab) z3_close(G.lab); if (G.ls) store_close(G.ls); store_close(G.ct); annot_close(G.st);
 }
 
-static const char *aopt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *aopt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 int cmd_annotate_serve(int argc, char **argv) {
     if (argc < 4 || !*aopt(argc, argv, "--store", "")) {
         fprintf(stderr, "usage: ufsm annotate-serve <ct-root> <ct-key> --um U0 --store ANN.json [--level L (finest shown, 2)] [--port 8765]\n"
@@ -494,13 +505,13 @@ int cmd_annotate_serve(int argc, char **argv) {
                         "  a local viewer (127.0.0.1 only) of CT slices with wraps / labels / fibres and a manual winding annotation store\n");
         return 2;
     }
-    annot_cfg c = {.ct_root = argv[2], .ct_key = argv[3], .um0 = atof(aopt(argc, argv, "--um", "0")), .base = atoi(aopt(argc, argv, "--level", "2")),
-                   .wraps = aopt(argc, argv, "--wraps", nullptr), .wrap_stride = atoi(aopt(argc, argv, "--wrap-stride", "2")), .fibers = aopt(argc, argv, "--fibers", nullptr),
+    annot_cfg c = {.ct_root = argv[2], .ct_key = argv[3], .um0 = opt_atof("--um", aopt(argc, argv, "--um", "0")), .base = opt_atoi("--level", aopt(argc, argv, "--level", "2")),
+                   .wraps = aopt(argc, argv, "--wraps", nullptr), .wrap_stride = opt_atoi("--wrap-stride", aopt(argc, argv, "--wrap-stride", "2")), .fibers = aopt(argc, argv, "--fibers", nullptr),
                    .store = aopt(argc, argv, "--store", ""), .regions = aopt(argc, argv, "--regions", nullptr), .scroll = aopt(argc, argv, "--scroll", nullptr),
                    .author = aopt(argc, argv, "--author", getenv("USER") ? getenv("USER") : "user"), .page = aopt(argc, argv, "--page", nullptr),
-                   .cache = aopt(argc, argv, "--cache", nullptr), .port = atoi(aopt(argc, argv, "--port", "8765")), .threads = atoi(aopt(argc, argv, "--threads", "4")),
-                   .cache_gb = atof(aopt(argc, argv, "--cache-gb", "2"))};
-    for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--labels")) { c.lab_root = argv[i + 1]; c.lab_key = argv[i + 2]; }
+                   .cache = aopt(argc, argv, "--cache", nullptr), .port = opt_atoi("--port", aopt(argc, argv, "--port", "8765")), .threads = opt_atoi("--threads", aopt(argc, argv, "--threads", "4")),
+                   .cache_gb = opt_atof("--cache-gb", aopt(argc, argv, "--cache-gb", "2"))};
+    for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--labels"))) { c.lab_root = argv[i + 1]; c.lab_key = argv[i + 2]; }
     if (!(c.um0 > 0) || c.base < 0 || c.base > 7) { fprintf(stderr, "annotate-serve: --um U0 (> 0) and --level 0..7\n"); return 2; }
     const int port = annot_serve_start(&c); if (port < 0) return 1;
     printf("annotate-serve: http://127.0.0.1:%d/  (store %s, %d items)\n", port, c.store, annot_count(G.st)); fflush(stdout);

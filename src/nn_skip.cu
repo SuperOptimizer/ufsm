@@ -98,7 +98,7 @@ extern "C" int nn_skip_set(int lev, const uint8_t *hmask, int Dc, int Hc, int Wc
     skreg_t *s = &g_sk[skdev()]; if (lev < 0 || lev >= SK_LEV) return 1;
     if (sk_level(s, lev, Dc, Hc, Wc)) return 1;
     const size_t n = (size_t)s->mz[lev] * s->my[lev] * s->mx[lev];
-    cudaMemcpy(s->m[lev], hmask, n, cudaMemcpyHostToDevice);
+    if (cudaMemcpy(s->m[lev], hmask, n, cudaMemcpyHostToDevice) != cudaSuccess) { cudaGetLastError(); return 1; }   /* (unchecked: a stale mask; audit mini/errpaths 6) */
     sk_dilate_k<<<nblk(n, 128), 128>>>(s->m[lev], s->mz[lev], s->my[lev], s->mx[lev], s->md[lev]); KCHECK();
     if (!s->on) memset(s->seen, 0, sizeof s->seen);
     s->on = 1;
@@ -110,7 +110,8 @@ extern "C" int nn_skip_on(void) { return g_sk[skdev()].on; }
 extern "C" double nn_skip_share(int lev) {   /* the active share of level lev's tiles (-1: none) */
     skreg_t *s = &g_sk[skdev()]; if (lev < 0 || lev >= s->nl || !s->D[lev]) return -1;
     const size_t n = (size_t)s->mz[lev] * s->my[lev] * s->mx[lev]; uint8_t *h = (uint8_t *)malloc(n); if (!h) return -1;
-    cudaMemcpy(h, s->m[lev], n, cudaMemcpyDeviceToHost); size_t a = 0; for (size_t i = 0; i < n; i++) a += h[i] != 0; free(h);
+    if (cudaMemcpy(h, s->m[lev], n, cudaMemcpyDeviceToHost) != cudaSuccess) { cudaGetLastError(); free(h); return -1; }
+    size_t a = 0; for (size_t i = 0; i < n; i++) a += h[i] != 0; free(h);
     return (double)a / n;
 }
 extern "C" void nn_skip_counts(long *masked, long *calls) { skreg_t *s = &g_sk[skdev()]; *masked = s->used; *calls = s->calls; s->used = s->calls = 0; }

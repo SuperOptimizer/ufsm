@@ -13,7 +13,7 @@ pred() {   # pred NAME CTKEY UM LEVEL BOX OCC
 ev() {   # ev NAME CODES KEY
   local D=$O/$1_$T F=$O/$1_$T/fields P=$O/$1_$T/pn2; mkdir -p $P
   [ -e $P/ref/model.json ] || /usr/bin/time -v nice -n 5 $U count-field $F $P/cf.unused --phase-w 0.5 --wide 100,140 --wide-phase 15 --R 0 --pool 8 --phase-w 4 --iters 1200 \
-    --model $P/ref --model-only 1 --model-stride 4 --threads $TH --mem-gb 16 > $P/cf.log 2>&1 || { echo "$1 cf failed"; return 1; }
+    --model $P/ref --model-only 1 --model-stride 1 --threads $TH --mem-gb 16 > $P/cf.log 2>&1 || { echo "$1 cf failed"; return 1; }
   nice $U wrap-check $P/ref $F --codes $2 $3 --threads $TH --gt-int 1 --tsv $P/gti.tsv > $P/gti.log 2>&1
   local NZ=$(( $(jq -r ".shape[0]" $F/fields.json) * 2 )); local S=$(( NZ / 5 ))
   for i in 0 1 2 3 4; do nice $U fit $F --model $P/ref --gpu 0 --codes $2 $3 --score-z $((i * S)),$S --score-pairs 1 > $P/z$i.log 2>&1; done

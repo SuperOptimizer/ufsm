@@ -2,6 +2,7 @@
    level names, shapes and shard grid), so the result is a drop-in CT source: z3_read gives the rebuilt CT, predict takes the cells.
    ufsm latvol-check: a latvol level against its source (bytes per voxel, rebuilt-CT error on sampled boxes). */
 #include "latfit.h"
+#include "optcheck.h"
 #include "latvol.h"
 #include "nn.h"
 #include "nn_latvol.h"
@@ -20,7 +21,7 @@
 #include <time.h>
 
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)t.tv_sec + 1e-9 * (double)t.tv_nsec; }
@@ -237,8 +238,8 @@ int cmd_latvol(int argc, char **argv) {
     store *st = store_open(argv[3]); if (!st) { fprintf(stderr, "latvol: cannot open %s\n", argv[3]); return 1; }
     const char *group = argv[4], *outg = argv[5], *levels = opt(argc, argv, "--levels", nullptr), *cache = opt(argc, argv, "--cache", nullptr);
     if (!levels) { fprintf(stderr, "latvol: --levels L[,L..]\n"); return 2; }
-    const int C = atoi(opt(argc, argv, "--c", "29")), nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8), gpu = atoi(opt(argc, argv, "--gpu", "0")), resume = atoi(opt(argc, argv, "--resume", "0"));
-    const float step = (float)atof(opt(argc, argv, "--step", "0.25")); const double sd = atof(opt(argc, argv, "--sd", "0"));
+    const int C = opt_atoi("--c", opt(argc, argv, "--c", "29")), nth = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8), gpu = opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")), resume = opt_atoi("--resume", opt(argc, argv, "--resume", "0"));
+    const float step = (float)opt_atof("--step", opt(argc, argv, "--step", "0.25")); const double sd = opt_atof("--sd", opt(argc, argv, "--sd", "0"));
     if (C < 1 || C > LV_MAXC || !(step > 0)) { fprintf(stderr, "latvol: --c 1..64, --step > 0\n"); return 2; }
     enum { MAXBOX = 4096 }; long long (*bx)[6] = malloc(MAXBOX * sizeof *bx), (*b2)[6] = malloc(MAXBOX * sizeof *b2); int nbox = 0;
     if (*opt(argc, argv, "--box", "")) { if (sscanf(opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", bx[0], bx[0] + 1, bx[0] + 2, bx[0] + 3, bx[0] + 4, bx[0] + 5) != 6) { fprintf(stderr, "latvol: --box Z,Y,X,NZ,NY,NX\n"); return 2; } nbox = 1; }
@@ -248,7 +249,7 @@ int cmd_latvol(int argc, char **argv) {
             if (sscanf(ln, "%lld %lld %lld %lld %lld %lld", bx[nbox], bx[nbox] + 1, bx[nbox] + 2, bx[nbox] + 3, bx[nbox] + 4, bx[nbox] + 5) == 6) nbox++; }
         fclose(bf); if (!nbox) { fprintf(stderr, "latvol: --boxes: no box read\n"); return 2; }
     }
-    const int v2 = atoi(opt(argc, argv, "--zarr2", "0")), shard_opt = atoi(opt(argc, argv, "--shard", "1024")); const double vq = atof(opt(argc, argv, "--volcomp", "-1"));
+    const int v2 = opt_atoi("--zarr2", opt(argc, argv, "--zarr2", "0")), shard_opt = opt_atoi("--shard", opt(argc, argv, "--shard", "1024")); const double vq = opt_atof("--volcomp", opt(argc, argv, "--volcomp", "-1"));
     if (shard_opt < 128 || shard_opt % 128) { fprintf(stderr, "latvol: --shard: a multiple of 128\n"); return 2; }
     {   /* the group's metadata as it is (level names, voxel sizes) */
         const char *gf = opt(argc, argv, "--group-from", nullptr); store *gs_ = gf ? store_open(gf) : st; if (!gs_) { fprintf(stderr, "latvol: cannot open %s\n", gf); return 1; }
@@ -279,7 +280,7 @@ int cmd_latvol_check(int argc, char **argv) {
     z3 *za = sa ? z3_open(sa, argv[3], cache) : nullptr, *zb = sb ? z3_open(sb, argv[5], cache) : nullptr;
     if (!za || !zb) { fprintf(stderr, "latvol-check: cannot open the arrays: %s\n", z3_error()); return 1; }
     const lv_codec *lc = z3_latvol(za); if (!lc) { fprintf(stderr, "latvol-check: %s is not a latvol array\n", argv[3]); return 2; }
-    const int nth = ufsm_threads(atoi(opt(argc, argv, "--threads", "0")), 8), nb = atoi(opt(argc, argv, "--n", "8"));
+    const int nth = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8), nb = opt_atoi("--n", opt(argc, argv, "--n", "8"));
     int64_t grid[3]; uint8_t *bits = nullptr; const int64_t npres = z3_chunk_map(za, grid, &bits); if (npres < 0) { fprintf(stderr, "latvol-check: no chunk map: %s\n", z3_error()); return 1; }
     printf("latvol-check: %s: C %d, step_raw %.3f (step %.3g x sd_ref %.2f), %d tables, %lld of %lld chunks stored\n", argv[3], lc->C, lc->step_raw, lc->step, lc->sd_ref, lc->ntab, (long long)npres, (long long)(grid[0] * grid[1] * grid[2]));
     enum { E = 128 };   /* (one stored chunk: a partial store has no more) */ uint8_t *a = malloc((size_t)E * E * E), *b = malloc((size_t)E * E * E); uint64_t rs = 88172645463325252ull; double se = 0, sn = 0, ta = 0, tb = 0; long air = 0; int done = 0;

@@ -64,6 +64,81 @@ static int bench(int P) {
     }
     return 0;
 }
+/* try6's head layout (audit 2026-11-14 #16): 160 cell channels (the sub-cell head: base 32 + 128), 23 upsampled (LUPN), 32 fp32 gradient
+   rows (LGFC), the fused normal / density group at [2, 9) and the slab chain for [0, 2) + [9, 23) (train.c head_slab_pass fr: norm_ch 2,
+   no guided side), gscale 1024, slabs of 16 planes with an 8-plane tail. The fused pass (nn_lat_fuse_grad + nn_lat_up_adj_c of the two
+   ranges) against the chain (nn_lat_up_slab_c, nn_loss_grad_only + nn_loss_grad_scale, nn_lat_up_adj_c of all 23) at the per-voxel size
+   of training: lambda = window voxels / the ~2.3e8 masked voxels of a P 768 window puts the BCE gradient at gscale x 1 / 2.3e8 (~4.5e-6,
+   fp16 subnormal), the other channels' gradients the same size. Pass as the other cases (fp32 rounding of the adjoint's order).
+   Soft report (printed, not a failure; hgscale-20261114 rescales the head gradient): the chain again with every gradient x 65536 (fp16
+   normal: the reference), divided back; coarse gradient elements that are 0 while the reference is not, and the rel L2 error. */
+static int try6_case(int *cases) {
+    const int d = 6, h = 5, w = 7, Z = 16, D = 4 * d, H = 4 * h, W = 4 * w, C = 160, UPC = 23, NF = 32, fr[2][2] = {{0, 2}, {9, 23}};
+    const size_t pl = (size_t)h * w, cv = (size_t)d * pl, hw = (size_t)H * W, fv = (size_t)D * hw, nsm = (size_t)Z * hw;
+    const float gs = 1024.f, nprod = 768.f * 768.f * 768.f * 0.5f, lam = (float)fv / nprod, amp = gs / nprod, up = 65536.f;
+    nn_set_grad_scale(gs);
+    uint16_t *hl = malloc(C * cv * 2); for (size_t k = 0; k < C * cv; k++) hl[k] = f2h(2.f * ru());
+    uint8_t *htn = malloc(7 * fv), *hmn = malloc(fv);
+    for (size_t k = 0; k < 7 * fv; k++) htn[k] = (uint8_t)(rn() % 256);
+    for (size_t k = 0; k < fv; k++) { const unsigned q = (unsigned)(rn() % 10); hmn[k] = q < 2 ? 0 : q < 8 ? 1 : 8; }
+    float *hgo = calloc((size_t)UPC * fv, 4);   /* the other heads' slab gradients (fp32 before the fp16 rounding) on the chain channels */
+    for (int r = 0; r < 2; r++) for (int c = fr[r][0]; c < fr[r][1]; c++) for (size_t k = 0; k < fv; k++) hgo[(size_t)c * fv + k] = amp * ru();
+    uint16_t *ho = malloc(nsm * 2);
+    const uint8_t hwn[7] = {1, 1, 1, 1, 1, 1, 1}; const float lam7[7] = {lam, lam, lam, lam, lam, lam, lam};
+    void *dl = nn_malloc(C * cv * 2), *slab = nn_malloc(UPC * nsm * 2), *slab2 = nn_malloc(UPC * nsm * 2);
+    uint8_t *dtn = nn_malloc(7 * nsm), *dmn = nn_malloc(nsm), *dwn = nn_malloc(8);
+    nn_h2d(dl, hl, C * cv * 2); nn_h2d(dwn, hwn, 7);
+    const shape5 w7 = {1, 7, D, H, W};
+    double *ds = nn_malloc(64 * sizeof(double)); nn_zero(ds, 64 * sizeof(double));
+    float *sn = nn_malloc(nn_loss_scratch(w7) + 64), *ga = nn_malloc(NF * cv * 4), *gb = nn_malloc(NF * cv * 4), *gr = nn_malloc(NF * cv * 4), *scr = nn_malloc((size_t)UPC * Z * pl * 4);
+    float *part = nn_malloc(nn_lat_fuse_part(7, h, w, Z));
+    nn_zero(ga, NF * cv * 4); nn_zero(gb, NF * cv * 4); nn_zero(gr, NF * cv * 4);
+    float pw, rw; int u7; nn_loss_cfg_get(&pw, &rw, &u7);
+#define LG(p, c) ((char *)(p) + (size_t)(c) * ns * 2)
+    for (int pass = 0; pass < 2; pass++) {
+        for (int z0 = 0; z0 < D; z0 += Z) {
+            const int nz = z0 + Z < D ? Z : D - z0; const size_t ns = (size_t)nz * hw, vb = (size_t)z0 * hw;
+            const shape5 seven = {1, 7, nz, H, W};
+            for (int c = 0; c < 7; c++) nn_h2d(dtn + c * ns, htn + c * fv + vb, ns);
+            nn_h2d(dmn, hmn + vb, ns); nn_sync();
+            if (!pass) { nn_lat_up_slab_c(dl, 1, UPC, d, h, w, z0, nz, slab, 0, d); nn_loss_stats_acc(LG(slab, 2), dtn, dmn, dwn, seven, ds + 20); continue; }
+            for (int ref = 0; ref < 2; ref++) {   /* 0: the chain at training size (ga) and the fused pass (gb); 1: the chain x 65536 (gr) */
+                const float m = ref ? up : 1.f;
+                nn_lat_up_slab_c(dl, 1, UPC, d, h, w, z0, nz, slab, 0, d);
+                nn_loss_grad_only(LG(slab, 2), dtn, dmn, dwn, seven, 0.f, LG(slab, 2), sn); nn_loss_grad_scale(LG(slab, 2), 7 * ns, lam * m);
+                for (int r = 0; r < 2; r++) for (int c = fr[r][0]; c < fr[r][1]; c++) {
+                    for (size_t k = 0; k < ns; k++) ho[k] = f2h(m * hgo[(size_t)c * fv + vb + k]);
+                    nn_h2d(LG(slab, c), ho, ns * 2); if (!ref) nn_h2d(LG(slab2, c), ho, ns * 2);
+                }
+                nn_lat_up_adj_c(slab, UPC, d, h, w, z0, nz, ref ? gr : ga, scr, 0, d);
+                if (ref) continue;
+                nn_lat_fuse_grad(dl, 1, 0, d, d, h, w, z0, nz, 2, 7, 0, -1, nullptr, dtn, dmn, dwn, sn, pw, rw, u7, lam7, part, gb, 0, d, nullptr);
+                for (int r = 0; r < 2; r++) nn_lat_up_adj_c(LG(slab2, fr[r][0]), fr[r][1] - fr[r][0], d, h, w, z0, nz, gb + (size_t)fr[r][0] * cv, scr, 0, d);
+            }
+        }
+        if (!pass) nn_loss_stats_fin(ds + 20, dwn, w7, sn);
+    }
+#undef LG
+    float *ra = malloc(NF * cv * 4), *rb = malloc(NF * cv * 4), *rr = malloc(NF * cv * 4);
+    nn_sync(); nn_d2h(ra, ga, NF * cv * 4); nn_d2h(rb, gb, NF * cv * 4); nn_d2h(rr, gr, NF * cv * 4);
+    double mx = 0, mg = 0, sq = 0, sr = 0, e2 = 0, r2 = 0; size_t nzr = 0, zc = 0, zn = 0;
+    for (size_t k = 0; k < NF * cv; k++) {
+        const double e = fabs((double)ra[k] - rb[k]); if (e > mx) mx = e; if (fabs(ra[k]) > mg) mg = fabs(ra[k]); sq += e * e; sr += (double)ra[k] * ra[k]; nzr += ra[k] != 0;
+        const double rf = rr[k] / (double)up; e2 += (rb[k] - rf) * (rb[k] - rf); r2 += rf * rf;
+        if (rf != 0) { zn++; zc += rb[k] == 0.f; }
+    }
+    const double rel = mx / (mg > 0 ? mg : 1), rms = sqrt(sq / (sr > 0 ? sr : 1));
+    const int bad = !(rel < 2e-5) || !(rms < 5e-6) || nzr < (size_t)UPC * cv / 2;
+    printf("  try6 head (160 cells, 23 upsampled, 32 fp32 rows, fused [2, 9), chain [0, 2) + [9, 23), gscale 1024): max |fused - chain| %.3g of max %.3g (%.2g), rms ratio %.2g, %zu nonzero%s\n",
+           mx, mg, rel, rms, nzr, bad ? "  FAIL" : "");
+    printf("  try6 head, fp16 dead zone (soft report, not a failure: hgscale-20261114 rescales the head gradient): %zu of %zu coarse gradient elements 0 where the x 65536 "
+           "reference is not, rel L2 vs it %.2e\n", zc, zn, sqrt(e2 / (r2 > 0 ? r2 : 1)));
+    (*cases)++;
+    free(hl); free(htn); free(hmn); free(hgo); free(ho); free(ra); free(rb); free(rr);
+    nn_free(dl); nn_free(slab); nn_free(slab2); nn_free(dtn); nn_free(dmn); nn_free(dwn); nn_free(ds); nn_free(sn); nn_free(ga); nn_free(gb); nn_free(gr); nn_free(scr); nn_free(part);
+    nn_set_grad_scale(1.f);
+    return bad;
+}
 int main(void) {
     nn_init(0); nn_set_f16(1); nn_set_logits_h16(1); nn_set_loss_grad_h16(1); nn_set_loss_unit_ch7(6);
     if (getenv("TLF_BENCH")) return bench(atoi(getenv("TLF_BENCH")));
@@ -162,6 +237,7 @@ int main(void) {
         nn_free(ga); nn_free(gb); nn_free(gb2); nn_free(scr); nn_free(part);
     }
     nn_set_grad_scale(1.f);
+    fails += try6_case(&cases);
     if (fails) { printf("test_lat_fuse: %d of %d FAILED\n", fails, cases); return 1; }
     printf("test_lat_fuse: ok (%d cases)\n", cases);
     return 0;

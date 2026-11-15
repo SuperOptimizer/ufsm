@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "test_gpu.h"
 static uint64_t rs = 777;
 static float frand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (float)((rs >> 11) * 0x1.0p-53 * 2 - 1); }
 static int in_ranges(const size_t *r, int n, size_t i) { for (int k = 0; k < n; k++) if (i >= r[2 * k] && i < r[2 * k] + r[2 * k + 1]) return 1; return 0; }
@@ -34,7 +35,7 @@ static int check(unet *u, const float *x, shape5 xs, size_t nl, int muon, float 
     free(a); free(b); return !ok;
 }
 int main(void) {
-    if (nn_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    if (nn_init(0)) return test_no_gpu("test_init_lr", "nn_init(0) failed");
     nn_set_tf32(1);
     unet_cfg cd = {0}; cd.nlev = 3; cd.widths[0] = 8; cd.widths[1] = 16; cd.widths[2] = 32; cd.cin = 1; cd.cout = 4; cd.G = 4; cd.down_norm = 1;
     unet *d = unet_create(&cd); unet_init(d, 3);

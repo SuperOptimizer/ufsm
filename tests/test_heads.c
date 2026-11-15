@@ -8,6 +8,7 @@
    References are kept per GPU name (the losses differ between architectures); none for this GPU: (1) only checks that the runs work.
    UFSM_HEADS_REF_WRITE=1 appends this GPU's lines to the reference file instead (run with the pre-change binary).
    Usage: test_heads <ufsm binary> <make_wind_fixture binary> <tests/heads_ref.txt> */
+#include <ctype.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -15,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "fm_tol.h"
 #include "test_part.h"   /* UFSM_TEST_PART=K/3: three shards of ~10 s (each makes its own fixture) */
 
 static int fails = 0;
@@ -33,10 +35,11 @@ static char *slurp(const char *path) {
     char *s = malloc((size_t)n + 1); if (!s) { fclose(f); return nullptr; }
     s[fread(s, 1, (size_t)n, f)] = 0; fclose(f); return s;
 }
-/* the window shares added 2026-11-13 after "phase / rv / side / normal bce X" and wind4's "acc X" (the means over the windows that carry
+/* (and the " (kl ...)" group added 2026-11-14 after the heads' bces.) The window shares added 2026-11-13 after "phase / rv / side / normal bce X" and wind4's "acc X" (the means over the windows that carry
    each label): removed before the comparison, so the reference (logged before them, every fixture window labelled) still applies and
    a 100 %-labelled run must reproduce its numbers unchanged. The ink / fib / fibn shares stay (they are in the reference). */
 static void strip_new_shares(char *ln) {
+    for (char *p; (p = strstr(ln, " (kl ")); ) { char *q = strchr(p, ')'); if (!q) break; memmove(p, q + 1, strlen(q + 1) + 1); }   /* the KL group (2026-11-14) */
     for (char *p = ln; (p = strstr(p, " (")); ) {
         char *q = p + 2; while (*q >= '0' && *q <= '9') q++;
         if (q == p + 2 || strncmp(q, "% of windows)", 13)) { p += 2; continue; }
@@ -76,6 +79,24 @@ static void gpu_name(char *out, size_t n) {
     out[strcspn(out, "\n")] = 0; if (!out[0]) snprintf(out, n, "unknown");
 }
 
+/* got (NUL-terminated) vs want[0, wl): the same words, every number close (fast math only; exact text under UFSM_STRICT_MATH).
+   Step 1 ("1: ..."): rel 6e-2 + abs 5e-3. The first step sees the same weights, so only the inputs / labels differ, and on this
+   synthetic fixture the label rasters sit on lattice ties: fast math flips whole voxels across radius / threshold cuts (the
+   desk's fm round 11-15: fibn's supervised voxels 5768 vs 5488, its bce 0.1833 vs 0.1787; plain / rv / lat runs equal to 4
+   decimals). Later steps: rel 0.1 + abs 0.02. --det 1 makes a run repeat itself, but every optimizer step feeds that first difference
+   forward (11-15: losses 0.1 .. 0.7 %, acc 0.389 vs 0.396, gn 3.47 vs 3.44 by step 2 .. 4). A layout or loss bug moves these by
+   far more (a wrong head, a lost term: x2, or zeros / NaN, which fm_close never accepts). */
+[[maybe_unused]] static int loss_text_close(const char *got, const char *want, size_t wl) {
+    const char *g = got, *w = want, *we = want + wl; int step = 0;
+    while (*g && w < we) {
+        if ((isdigit((unsigned char)*g) || (*g == '-' && isdigit((unsigned char)g[1]))) && (isdigit((unsigned char)*w) || (*w == '-' && isdigit((unsigned char)w[1])))) {
+            char *ge, *wen; const double a = strtod(g, &ge), b = strtod(w, &wen);
+            if (wen > we || !(step == 0 ? fm_close(a, b, 6e-2, 5e-3) : fm_close(a, b, 0.1, 0.02))) return 0;
+            g = ge; w = wen;
+        } else { if (*g == ';') step++; if (*g++ != *w++) return 0; }
+    }
+    return !*g && w == we;
+}
 int main(int argc, char **argv) {
     if (argc != 4) { fprintf(stderr, "usage: test_heads <ufsm binary> <make_wind_fixture binary> <heads_ref.txt>\n"); return 2; }
     const char *U = argv[1], *ref = argv[3]; const int wr = getenv("UFSM_HEADS_REF_WRITE") && atoi(getenv("UFSM_HEADS_REF_WRITE"));
@@ -84,7 +105,7 @@ int main(int argc, char **argv) {
     CHECK(!sh("%s %s/fx 256 2 1 > %s/fx.log 2>&1", argv[2], d, d), "fixture");
     /* the fibre plane of the combined runs: the fixture's ink raster again, as the sources' "fibre" target next to "ink" */
     CHECK(!sh("sed 's|\"ink\": *{\\([^}]*\\)}|\"ink\": {\\1}, \"fibre\": {\\1}|' %s/fx/sources-ink.json > %s/fx/sources-fib.json && grep -q fibre %s/fx/sources-fib.json", d, d, d), "sources with a fibre target");
-    const char *common = "--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 "
+    const char *common = "--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-train-ok 1 --val-every 1000 --log-every 1 "
                          "--ckpt-every 1000 --fp4 2 --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --widths 16,32,64 --det 1 --steps 4";
     static const struct { const char *name, *src, *flags; } old[] = {
         {"plain", "sources.json", ""},
@@ -109,7 +130,10 @@ int main(int argc, char **argv) {
             char key[400]; snprintf(key, sizeof key, "%s|%s|", gpu, old[k].name); const char *r = strstr(refs, key);
             if (r) {
                 have++; r += strlen(key); const size_t rl = strcspn(r, "\n");
-                const int same = strlen(t) == rl && !strncmp(t, r, rl); cmp += same;
+                /* the text exactly under UFSM_STRICT_MATH (the references were logged by the bit-exact build); under fast math the host
+                   fixture / sampler and the former strict units round differently, so every number within rel 2e-2 (+ 2e-3 for the
+                   4-decimal zeros), the words equal (tests/fm_tol.h) */
+                const int same = FM_STRICT ? strlen(t) == rl && !strncmp(t, r, rl) : loss_text_close(t, r, rl); cmp += same;
                 CHECK(same, "%s: the logged losses differ from the reference\n  got  %s\n  want %.*s", old[k].name, t, (int)rl, r);
             }
         }
@@ -192,6 +216,7 @@ int main(int argc, char **argv) {
         char cm[2048]; snprintf(cm, sizeof cm, "%s", common); { char *ls = strstr(cm, " --steps 4"); if (ls) memmove(ls, ls + 10, strlen(ls + 10) + 1); }
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/uw %s %s --steps 4 > %s/uw.log 2>&1", U, d, d, cm, uf, d), "uw + grad-cos run (%s/uw.log)", d);
         CHECK(!sh("grep -q 'grad-cos step 4 (head input): phase/normal [-+]0[.][0-9]*.*rv/ink [-+]0[.]' %s/uw.log && grep -q 'uw phase [0-9.]* normal 0[.]' %s/uw.log", d, d), "uw + grad-cos: the cosine and weight lines");
+        CHECK(!sh("grep -q 'grad-norm step 4 (head input): phase [0-9.e+-]* normal [0-9.e+-]*.* ink [0-9.e+-]*' %s/uw.log", d), "grad-cos: the per-head gradient norm line");
         CHECK(!sh("head -1 %s/uw/last.ckpt | grep -q '\"uw\":{\"t\":4,'", d), "uw: header t 4");
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/uw --resume %s/uw/last.ckpt %s %s --steps 6 > %s/uw2.log 2>&1 && grep -q '(resumed)' %s/uw2.log && head -1 %s/uw/last.ckpt | grep -q '\"uw\":{\"t\":6,'", U, d, d, d, cm, uf, d, d, d), "uw resume (%s/uw2.log)", d);
     }

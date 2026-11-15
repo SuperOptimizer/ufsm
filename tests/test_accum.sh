@@ -7,13 +7,14 @@
 #  (4) --gns (gns.h): --accum 4 logs the gradient noise scale (|g|^2 at 1 vs 4 windows) on the line and in log.csv's gns columns; one GPU
 #      without --accum and --gns 1 says there is no estimate and trains (the lr 0 run of (1));
 #  (5) --accum auto (controller pushed with --gns-k 1000, warm 2, hold 1, gap 1): accum 2 -> 4 at step 6, 4 -> 8 at step 10; the
-#      checkpoint's "gns" holds accum 8 and the EMAs, and a resume continues at accum 8 with the EMAs.
+#      checkpoint's "gns" holds accum 8 and the EMAs, and a resume continues at accum 8 with the EMAs;
+#  (6) a fixed --accum resumed: the "trainstate" continues the update count (same accum: same alignment; another accum: from the updates done).
 # Usage: test_accum.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 "$MF" fx 256 2 1 > fx.log 2>&1
-C=(--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-every 1000 --log-every 1 --ckpt-every 1000 --fp4 2
+C=(--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --val-batches 2 --val-train-ok 1 --val-every 1000 --log-every 1 --ckpt-every 1000 --fp4 2
    --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --widths 16,32,64 --det 1 --lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --sched wsd --cooldown 0 --opt muon)
 L=(--muon-lr 0.002 --lr 0.001)   # (opt: the first occurrence wins, so the lr pair goes before C)
 fail() { echo "FAIL: $*"; exit 1; }
@@ -26,8 +27,8 @@ grep '^step      8' a4.log | grep -qv nan || fail "accum 4: step 8 not finite"
 grep -q -- '--gns: no estimate on one GPU' z.log || fail "--gns 1 on one GPU without --accum: no notice ($D/z.log)"
 grep -q -- '--gns: gradient noise scale from |g|^2 at 1 vs 4 windows' a4.log || fail "accum 4: --gns not on by default ($D/a4.log)"
 grep '^step      8' a4.log | grep -q ' gns ' || fail "accum 4: no gns on the step 8 line ($D/a4.log)"
-head -1 a4/log.csv | grep -q ',gns,gns_g2,gns_s$' || fail "log.csv header without the gns columns"
-awk -F, 'NR > 1 && $1 == 8 { exit !(NF == 15 && $14 != "") }' a4/log.csv || fail "log.csv step 8: no gns_g2 ($(tail -1 a4/log.csv))"
+head -1 a4/log.csv | grep -q ',gns,gns_g2,gns_s,gate_s$' || fail "log.csv header without the gns columns"
+awk -F, 'NR > 1 && $1 == 8 { exit !(NF == 16 && $14 != "") }' a4/log.csv || fail "log.csv step 8: no gns_g2 ($(tail -1 a4/log.csv))"
 "$U" train fx/sources.json --out au "${L[@]}" "${C[@]}" --steps 12 --accum auto --accum-min 2 --gns-k 1000 --accum-warm 2 --accum-hold 1 --accum-gap 1 > au.log 2>&1 || fail "accum auto ($D/au.log)"
 grep -q 'step 6: --accum auto: accum 2 -> 4' au.log || fail "accum auto: no 2 -> 4 at step 6 ($D/au.log)"
 grep -q 'step 10: --accum auto: accum 4 -> 8' au.log || fail "accum auto: no 4 -> 8 at step 10 ($D/au.log)"
@@ -36,6 +37,16 @@ head -1 au/last.ckpt | grep -q '"gns":{"g2":[^}]*"accum":8,"anchor":10,"upd":4}'
 grep -q -- '--accum auto: 1 windows per step, accum 8 (resumed)' au2.log || fail "accum auto resume: not at accum 8 ($D/au2.log)"
 grep -q -- '--gns: resumed EMAs' au2.log || fail "accum auto resume: EMAs not resumed"
 grep '^step     20' au2.log | grep -q '(update 5: 8 windows each)' || fail "accum auto resume: step 20 is not update 5 ($(grep '^step     20' au2.log | grep -o '(update[^)]*)'))"
+# (6) a fixed --accum resumed (the checkpoint's "trainstate", 2026-11-14): at the same accum the update count and alignment go on, at another
+#     accum the count continues from the updates done (an older checkpoint restarted it at step / accum: 287 -> 250 at 4 -> 5 in try6)
+"$U" train fx/sources.json --out f2 "${L[@]}" "${C[@]}" --steps 6 --accum 2 > f2.log 2>&1 || fail "accum 2, 6 steps ($D/f2.log)"
+head -1 f2/last.ckpt | grep -q '"trainstate":{"accum":2,"anchor":0,"upd":0,' || fail "(6) checkpoint trainstate ($(head -1 f2/last.ckpt | grep -o '"trainstate":{[^}]*}'))"
+cp -r f2 f3
+"$U" train fx/sources.json --out f2 "${L[@]}" "${C[@]}" --steps 10 --accum 2 --resume f2/last.ckpt > f2r.log 2>&1 || fail "(6) same accum resume ($D/f2r.log)"
+grep '^step     10' f2r.log | grep -q '(update 5: 2 windows each)' || fail "(6) same accum: step 10 is not update 5 ($(grep '^step     10' f2r.log | grep -o '(update[^)]*)'))"
+"$U" train fx/sources.json --out f3 "${L[@]}" "${C[@]}" --steps 12 --accum 3 --resume f3/last.ckpt > f3r.log 2>&1 || fail "(6) accum 2 -> 3 resume ($D/f3r.log)"
+grep -q -- '--accum 3 (the checkpoint.s: 2): the optimizer step continues at update 3' f3r.log || fail "(6) accum 2 -> 3: no continuation notice ($D/f3r.log)"
+grep '^step     12' f3r.log | grep -q '(update 5: 3 windows each)' || fail "(6) accum 2 -> 3: step 12 is not update 5 ($(grep '^step     12' f3r.log | grep -o '(update[^)]*)'))"
 python3 -I - z/last.ckpt a2/last.ckpt <<'PY'
 import sys, numpy as np
 def w(p):   # the live parameters: the first of the 5 float32 blocks after the header line (p, ema, m, v, the Muon momentum)

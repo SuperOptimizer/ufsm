@@ -36,12 +36,13 @@ with tempfile.TemporaryDirectory(prefix='ufsm-cover-cli-') as tmp:
         'source_names': ['fixture'], 'tiles': [[0, 0, 0, 0], [0, 32, 0, 0], [0, 64, 0, 0]]}))
     env = {k: v for k, v in os.environ.items() if not k.startswith('UFSM_')}
     base = [BINARY, 'train', source, '--P', '32', '--B', '1', '--cover', cover,
-            '--steps', '3', '--warmup', '10', '--seed', '2', '--workers', '2', '--val-batches', '1',
+            '--steps', '3', '--warmup', '10', '--seed', '2', '--workers', '2', '--val-batches', '1', '--val-train-ok', '1',
             '--levels', '1', '--log-every', '1', '--ckpt-every', '1', '--val-every', '10',
             '--down-norm', '1', '--zfix', '1', '--symmetry-p', '.5', '--ct-aug', '1', '--soft', '3',
             '--opt', 'muon', '--input-prec', '8', '--gn-stats', 'stored']
     for mode, gpu in [('single', os.environ.get('UFSM_TEST_GPU', '0')), ('split', '0,1')]:
         if mode == 'split' and (os.environ.get('UFSM_TEST_SINGLE_ONLY') or gpu_count() < 2):
+            print('PARTIAL: test_cover_training: the --split z mode did not run (one GPU or UFSM_TEST_SINGLE_ONLY)', flush=True)
             continue
         command = base + ['--gpus', gpu] + (['--split', 'z'] if mode == 'split' else [])
         def train(name, extra=()):

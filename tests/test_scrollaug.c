@@ -7,6 +7,7 @@
    --aug-tear: the sheet normal / spacing, the cut kernel bit for bit, default off, p 1 deterministic, w4 follows the pulled phase and jumps at the cut
    --aug-delam: t 0 identity; a peel's gap is void at the split phase and its remapped phase unwraps without conflicts; holes only darken
      the CT, labels unchanged; default off, p 1 deterministic, w4 smooth inside components
+   phase "weight" on crushed / torn / delaminated / re-bent windows; the scanner air op keeps the phase unsupervised in the air as read
    test_scrollaug [DIR] */
 #define WIND_FIXTURE_NO_MAIN
 #include "make_wind_fixture.c"
@@ -416,6 +417,94 @@ static void incl_tests(const char *dir) {
     drop(a); drop(d); drop(e); sources_free(S);
 }
 
+/* "phase": {"weight"} on scroll-augmented windows (audit 2026-11-14 data #1): the weight must reach crushed / torn / delaminated /
+   re-bent windows (it was skipped there: a direction-mask weight would have trained those cells reversed). A constant weight 0 leaves
+   no known phase on any of them; weight 255 gives the batches of the source without a weight, bit for bit. */
+static uint8_t *fx_const(int64_t z0, int64_t y0, int64_t x0, int S, void *p) { (void)z0; (void)y0; (void)x0; uint8_t *d = malloc((size_t)S * S * S); memset(d, *(const uint8_t *)p, (size_t)S * S * S); return d; }
+static void weight_tests(const char *dir) {
+    char p[1400]; const int64_t hs[3] = {fx_N / 2, fx_N / 2, fx_N / 2};
+    static const uint8_t w0 = 0, w255 = 255;
+    snprintf(p, sizeof p, "%s/wt0/1", dir); assert(!fx_write_arr(p, hs, 0.f, 255, fx_const, (void *)&w0));
+    snprintf(p, sizeof p, "%s/wt255/1", dir); assert(!fx_write_arr(p, hs, 0.f, 255, fx_const, (void *)&w255));
+    sources *S[3];   /* none, weight 255, weight 0 */
+    for (int k = 0; k < 3; k++) {
+        char w[512] = ""; if (k) snprintf(w, sizeof w, ", \"weight\": {\"root\": \"%s/wt%s\", \"key\": \"1\"}", dir, k == 1 ? "255" : "0");
+        snprintf(p, sizeof p, "%s/sources-wt%d.json", dir, k); FILE *f = fopen(p, "w"); assert(f);
+        fprintf(f, "{\"sources\": [{\"name\": \"wind-fixture\", \"root\": \"%s\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/axis.json\", \"weight\": 1,\n"
+                   "  \"targets\": {\"band\": {\"root\": \"%s/band\", \"key\": \"1\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase\", \"key\": \"1\", \"level\": 1%s}}}}]}\n", dir, dir, dir, dir, w);
+        fclose(f); S[k] = sources_load(p); assert(S[k]);
+    }
+    static const char *nm[4] = {"crush", "tear", "delam", "curv"};
+    for (int a = 0; a < 4; a++) {
+        const int PW = a == 3 ? 32 : 64; const size_t p3 = (size_t)PW * PW * PW;   /* (--aug-curv: P 32, as curv_tests) */
+        sample_cfg c = base_cfg(PW); c.snap = 0; c.symmetry_p = 0; c.rotate_p = 0; c.elastic_p = 0; c.zoom_p = 0; c.affine_p = 0; if (a == 3) c.wind4_min = 100;
+        if (a == 0) c.crush.p = 1; else if (a == 1) c.tear_p = 1; else if (a == 2) c.delam_p = 1; else c.curv_p = 1;
+        snap r[3][NB]; uint64_t n[3];
+        for (int k = 0; k < 3; k++) {
+            sampler *sp = sampler_start(S[k], &c); assert(sp); take(sp, r[k], p3);
+            n[k] = a == 0 ? atomic_load(&sp->crushed) : sampler_aug_count(sp, a == 1 ? AUGN_TEAR : a == 2 ? AUGN_DELAM : AUGN_CURV); sampler_stop(sp);
+        }
+        size_t kn0 = 0, kn = 0; for (int i = 0; i < NB; i++) for (size_t q = 0; q < p3; q++) { kn0 += r[0][i].side[q] < PHASE_PERIOD; kn += r[2][i].side[q] < PHASE_PERIOD; }
+        printf("scrollaug: weight on --aug-%s: %llu / %llu / %llu windows augmented (none / 255 / 0); known phase %zu without a weight, %zu with weight 0\n",
+               nm[a], (unsigned long long)n[0], (unsigned long long)n[1], (unsigned long long)n[2], kn0, kn);
+        char t[200]; snprintf(t, sizeof t, "phase weight on --aug-%s windows: weight 0 drops every phase, weight 255 = no weight (bit for bit)", nm[a]);
+        const int sm = same(r[0], r[1], p3); if (!sm) printf("scrollaug: weight on --aug-%s: weight 255 differs from no weight\n", nm[a]);
+        check(t, n[0] > 0 && n[1] > 0 && n[2] > 0 && kn0 > 0 && kn == 0 && sm);   /* (counts include prefetched windows: > 0 only) */
+        for (int k = 0; k < 3; k++) drop(r[k]);
+    }
+    for (int k = 0; k < 3; k++) sources_free(S[k]);
+}
+
+/* the scanner "air" op (masked air becomes dim material) must not supervise the phase in the air as read (audit 2026-11-14 data #2):
+   a copy of the fixture with CT 0 from level-0 z 128 up while the stored phase (phase0, level 0) is known there; level-0 windows with
+   only the air op on: no known phase at z >= 128, as without the op, and known phase below */
+static void scanair_tests(const char *dir) {
+    char p[1400]; const size_t n = (size_t)fx_N, h = n / 2; uint8_t *lv = malloc(n * n * n), *l1 = malloc(h * h * h); assert(lv && l1);
+    for (int z = 0; z < fx_N; z++) for (int y = 0; y < fx_N; y++) for (int x = 0; x < fx_N; x++) lv[((size_t)z * n + y) * n + x] = z >= 128 ? 0 : fx_ct_at(z, y, x);
+    for (size_t z = 0; z < h; z++) for (size_t y = 0; y < h; y++) for (size_t x = 0; x < h; x++) {
+        int s = 0; for (int k = 0; k < 8; k++) s += lv[((2 * z + (k >> 2)) * n + 2 * y + (k >> 1 & 1)) * n + 2 * x + (k & 1)];
+        l1[(z * h + y) * h + x] = (uint8_t)((s + 4) / 8);
+    }
+    const double um[2] = {9.6, 19.2};
+    for (int l = 0; l < 2; l++) {
+        char nmv[64]; z3w_level_name(um[l], nmv, sizeof nmv); snprintf(p, sizeof p, "%s/sa/ct/%s", dir, nmv);
+        const int64_t sh[3] = {(int64_t)(l ? h : n), (int64_t)(l ? h : n), (int64_t)(l ? h : n)}; fx_volctx c = {l ? l1 : lv, l ? (int64_t)h : (int64_t)n};
+        assert(!fx_write_arr(p, sh, 0.f, 0, fx_cut, &c));
+    }
+    free(lv); free(l1);
+    snprintf(p, sizeof p, "%s/sa/ct", dir); assert(!z3w_write_group(p, um, 2, "ct", nullptr));
+    snprintf(p, sizeof p, "%s/sa/sources.json", dir); FILE *f = fopen(p, "w"); assert(f);
+    fprintf(f, "{\"sources\": [{\"name\": \"wind-fixture-air\", \"root\": \"%s/sa\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/axis.json\", \"weight\": 1,\n"
+               "  \"targets\": {\"band\": {\"root\": \"%s/band\", \"key\": \"1\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/phase0\", \"key\": \"0\", \"level\": 0}}}}]}\n", dir, dir, dir, dir);
+    fclose(f);
+    sources *S = sources_load(p); assert(S);
+    const int PW = 64; const size_t p3 = (size_t)PW * PW * PW;
+    size_t air_known[2] = {0, 0}, mat_known[2] = {0, 0}, air_vox[2] = {0, 0};
+    for (int on = 0; on < 2; on++) {
+        sample_cfg c = base_cfg(PW); c.snap = 0; c.symmetry_p = 0; c.rotate_p = 0; c.elastic_p = 0; c.zoom_p = 0; c.affine_p = 0;
+        memset(c.level_p, 0, sizeof c.level_p); c.level_p[0] = 1;
+        c.tear_p = c.delam_p = c.curv_p = c.crush.p = 0; c.density_p = c.incl_p = c.xscan_p = 0;
+        for (int i = 0; i < SA_N; i++) c.scan.p[i] = 0;
+        c.scan.p[SA_AIR] = on ? 1.f : 0.f; if (!on) c.scan.p[SA_BIAS] = 1.f;   /* (off: another op, so the draws match) */
+        c.scan.strength = 1;
+        sampler *sp = sampler_start(S, &c); assert(sp);
+        for (int i = 0; i < 4 * NB; i++) {
+            batch *b = sampler_next(sp); assert(b);
+            const int64_t z0 = b->corner[0][0];
+            for (int z = 0; z < PW; z++) for (size_t q = 0; q < (size_t)PW * PW; q++) {
+                const uint8_t v = b->side[(size_t)z * PW * PW + q];
+                if (z0 + z >= 128) { air_vox[on]++; air_known[on] += v < PHASE_PERIOD; } else mat_known[on] += v < PHASE_PERIOD;
+            }
+            sampler_release(sp, b);
+        }
+        sampler_stop(sp);
+    }
+    printf("scrollaug: scanner air: known phase in the air as read %zu (op off) / %zu (op on) of %zu / %zu air voxels; in the scan %zu / %zu\n",
+           air_known[0], air_known[1], air_vox[0], air_vox[1], mat_known[0], mat_known[1]);
+    check("scanner air op: no phase supervised in the air as read (as without the op), the scan's phase kept", air_vox[1] > 0 && air_known[0] == 0 && air_known[1] == 0 && mat_known[1] > 0);
+    sources_free(S);
+}
+
 int main(int argc, char **argv) {
     char tmpd[] = "/tmp/ufsm-scrollaug-XXXXXX"; const char *dir = argc > 1 ? argv[1] : mkdtemp(tmpd);
     if (!dir || make_wind_fixture(dir, 256, 2.f)) { fprintf(stderr, "fixture failed\n"); return 1; }
@@ -425,6 +514,8 @@ int main(int argc, char **argv) {
     density_tests(dir);
     curv_tests(dir);
     incl_tests(dir);
+    weight_tests(dir);
+    scanair_tests(dir);
     if (argc < 2) { char cmd[1500]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {} }
     printf(failed ? "scrollaug: %d FAILED\n" : "scrollaug: all passed\n", failed);
     return failed != 0;

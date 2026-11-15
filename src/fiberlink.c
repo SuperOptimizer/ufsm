@@ -11,13 +11,14 @@
    Output: each chain as one run (pieces reversed as needed, the gap bridged by the straight segment), family of its pieces.
    --links: one row per link (piece a, end a, piece b, end b, gap mm, angle deg, lateral mm, confidence). CPU, one thread. */
 #include <math.h>
+#include "optcheck.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "afv.h"
 
-static const char *fl_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *fl_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 typedef struct { double p[3], t[3]; int run, end; } fl_end;   /* end 0 = the first point, 1 = the last */
 typedef struct { int a, b; double cost, g, ang, lat; } fl_link;   /* a, b: end indices (2 run + end) */
 static int fl_cmp(const void *x, const void *y) { const double a = ((const fl_link *)x)->cost, b = ((const fl_link *)y)->cost; return (a > b) - (a < b); }
@@ -26,8 +27,8 @@ static double dot3(const double *a, const double *b) { return a[0] * b[0] + a[1]
 
 int cmd_fiber_link(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm fiber-link <in.fib> <out.fib> [--gap-mm 0.3] [--um 2.4] [--angle 30] [--lat-mm 0.03] [--tan-mm 0.05] [--links rows.tsv]\n"); return 2; }
-    const double um = atof(fl_opt(argc, argv, "--um", "2.4")), gap = atof(fl_opt(argc, argv, "--gap-mm", "0.3")) * 1000 / um, lat = atof(fl_opt(argc, argv, "--lat-mm", "0.03")) * 1000 / um;
-    const double tanl = atof(fl_opt(argc, argv, "--tan-mm", "0.05")) * 1000 / um, ca = cos(atof(fl_opt(argc, argv, "--angle", "30")) * M_PI / 180);
+    const double um = opt_atof("--um", fl_opt(argc, argv, "--um", "2.4")), gap = opt_atof("--gap-mm", fl_opt(argc, argv, "--gap-mm", "0.3")) * 1000 / um, lat = opt_atof("--lat-mm", fl_opt(argc, argv, "--lat-mm", "0.03")) * 1000 / um;
+    const double tanl = opt_atof("--tan-mm", fl_opt(argc, argv, "--tan-mm", "0.05")) * 1000 / um, ca = cos(opt_atof("--angle", fl_opt(argc, argv, "--angle", "30")) * M_PI / 180);
     if (!(um > 0) || !(gap > 0) || !(lat > 0) || !(tanl > 0) || !(ca < 1)) { fprintf(stderr, "fiber-link: bad options\n"); return 2; }
     fib_set F = {0}; if (fib_load(argv[2], &F)) { fprintf(stderr, "fiber-link: cannot read %s\n", argv[2]); return 1; }
     const int n = F.n > 0 ? F.n : 0; fl_end *E = malloc((size_t)2 * (n ? n : 1) * sizeof *E);

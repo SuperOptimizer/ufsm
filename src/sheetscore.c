@@ -13,6 +13,7 @@
    --tsv: per cell z y x n_matched dominant_share k. --mask ROOT KEY (uint8 on the same grid, e.g. surf-labels ignore.zarr or a gt-gate
    mask): our voxels where it is nonzero are dropped first, so a gate is scored by what it keeps. Deterministic for any thread count. */
 #include "sources.h"
+#include "optcheck.h"
 #include "store.h"
 #include "zarr3.h"
 #include <math.h>
@@ -23,7 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *ss_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
+static const char *ss_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
 static inline int ss_sheet(uint8_t c) { return c >= 1 && c <= 252; }
 
 typedef struct {
@@ -155,21 +156,21 @@ int cmd_sheet_score(int argc, char **argv) {
                 (long long)so[0], (long long)so[1], (long long)so[2], (long long)sg[0], (long long)sg[1], (long long)sg[2]);
         return 1;
     }
-    J.tol = atoi(ss_opt(argc, argv, "--tol", "1")); J.pr = atoi(ss_opt(argc, argv, "--prec-r", "8")); J.cell = atoi(ss_opt(argc, argv, "--cell", "64"));
-    J.B = atoi(ss_opt(argc, argv, "--block", "128")); J.nt = atoi(ss_opt(argc, argv, "--threads", "8"));
+    J.tol = opt_atoi("--tol", ss_opt(argc, argv, "--tol", "1")); J.pr = opt_atoi("--prec-r", ss_opt(argc, argv, "--prec-r", "8")); J.cell = opt_atoi("--cell", ss_opt(argc, argv, "--cell", "64"));
+    J.B = opt_atoi("--block", ss_opt(argc, argv, "--block", "128")); J.nt = opt_atoi("--threads", ss_opt(argc, argv, "--threads", "8"));
     if (J.tol < 0 || J.tol > 8 || J.pr < J.tol || J.pr > 64 || J.cell < 8 || J.B < J.cell || J.B % J.cell || J.nt < 1) {
         fprintf(stderr, "sheet-score: --tol 0..8, --prec-r tol..64, --cell >= 8 dividing --block, --threads >= 1\n"); return 2;
     }
     for (int d = 0; d < 3; d++) { J.b0[d] = 0; J.bn[d] = so[d]; }
-    for (int i = 6; i + 2 < argc + 1; i++) if (!strcmp(argv[i], "--mask")) {
+    for (int i = 6; i + 2 < argc + 1; i++) if (!strcmp(argv[i], opt_n("--mask"))) {
         if (i + 2 >= argc) { fprintf(stderr, "sheet-score: --mask ROOT KEY\n"); return 2; }
         J.mask = z3_open(store_open(argv[i + 1]), argv[i + 2], nullptr);
         if (!J.mask || memcmp(z3_meta_of(J.mask)->shape, so, 3 * sizeof *so)) { fprintf(stderr, "sheet-score: --mask %s %s: cannot open or not on the codes' grid\n", argv[i + 1], argv[i + 2]); return 1; }
         break; }
     { const char *ap = ss_opt(argc, argv, "--axis", nullptr);
-      if (ap) { const double au = atof(ss_opt(argc, argv, "--axis-um", "0")), gu = atof(ss_opt(argc, argv, "--grid-um", "0"));
+      if (ap) { const double au = opt_atof("--axis-um", ss_opt(argc, argv, "--axis-um", "0")), gu = opt_atof("--grid-um", ss_opt(argc, argv, "--grid-um", "0"));
                 if (!(au > 0) || !(gu > 0) || axis_load(&J.ax, ap)) { fprintf(stderr, "sheet-score: --axis F needs --axis-um U --grid-um G and a readable axis\n"); return 2; }
-                J.has_ax = 1; J.ax_s = gu / au; J.sfix = atof(ss_opt(argc, argv, "--sense-fix", "0")); } }
+                J.has_ax = 1; J.ax_s = gu / au; J.sfix = opt_atof("--sense-fix", ss_opt(argc, argv, "--sense-fix", "0")); } }
     const char *bx = ss_opt(argc, argv, "--box", nullptr);
     if (bx) { long long v[6]; if (sscanf(bx, "%lld,%lld,%lld,%lld,%lld,%lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) { fprintf(stderr, "sheet-score: --box z,y,x,nz,ny,nx\n"); return 2; }
         for (int d = 0; d < 3; d++) { J.b0[d] = v[d] < 0 ? 0 : v[d]; J.bn[d] = v[d] + v[3 + d] > so[d] ? so[d] - J.b0[d] : v[3 + d] - (J.b0[d] - v[d]);

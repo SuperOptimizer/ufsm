@@ -3,7 +3,7 @@
 /* d silu(u) / du = sg (1 + u (1 - sg)), sg = sigmoid(u) = 1/2 + tanh(u / 2) / 2: one MUFU op (exp + reciprocal took two;
    tanh.approx ~2^-11 relative, far below the e4m3 rounding of the stored gradient) */
 __device__ __forceinline__ float dsilu(float u) {
-    float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(0.5f * u));
+    float th = tanh_silu(0.5f * u);
     const float sg = fmaf(0.5f, th, 0.5f);
     return sg * (1.f + u * (1.f - sg));
 }
@@ -166,7 +166,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_k(const uint8_t *x,
             if (FULL ? k < NK : k < kmax) {
                 const float4 c4 = cf[h0 + k];
                 const float p = fmaf(r[k], c4.x, c4.y);
-                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+                float th = tanh_silu(p);
                 const float t = g[k] * ((1.f + th) * (fmaf(-p, th, p) + 1.f)) * fg;   /* gy 2 dsilu(u) */
                 s1[k] += t; s2[k] = fmaf(t, r[k] - c4.z, s2[k]);
             }
@@ -316,7 +316,7 @@ __global__ void __launch_bounds__(256, 5) gn_silu_bwd_apply_mx2_k(const uint8_t 
             if (FULL ? k < NK : k < kmax) {
                 const float4 c4 = cf[h0 + k];
                 const float p = fmaf(r[k], c4.x, c4.y);
-                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+                float th = tanh_silu(p);
                 const float d2 = (1.f + th) * (fmaf(-p, th, p) + 1.f);   /* 2 dsilu(2p) */
                 out[k] = fmaf(g[k] * d2 * c4.x, fg, fmaf(r[k], c4.z, c4.w));
                 am = amax_u(am, out[k]);
@@ -437,7 +437,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_stats_mx2_hg_k(const uint8_t 
             if (FULL || k < kmax) {
                 const float4 c4 = cf[h0 + k];
                 const float p = fmaf(r[k], c4.x, c4.y);
-                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+                float th = tanh_silu(p);
                 const float t = g[k] * ((1.f + th) * (fmaf(-p, th, p) + 1.f)) * fg;   /* gy 2 dsilu(u) */
                 s1[k] += t; s2[k] = fmaf(t, r[k] - c4.z, s2[k]);
             }
@@ -498,7 +498,7 @@ __global__ void __launch_bounds__(256) gn_silu_bwd_apply_mx2_hg_k(uint8_t *x, co
         if (FULL || k < kmax) {
             const float4 c4 = cf[h0 + k];
             const float p = fmaf(r[k], c4.x, c4.y);
-            float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+            float th = tanh_silu(p);
             const float d2 = (1.f + th) * (fmaf(-p, th, p) + 1.f);   /* 2 dsilu(2p) */
             out[k] = fmaf(g[k] * d2 * c4.x, fg, fmaf(r[k], c4.z, c4.w));
             am = amax_u(am, out[k]);
@@ -602,7 +602,7 @@ __global__ void __launch_bounds__(256, 3) gn_silu_bwd_apply_rec_k(const uint8_t 
             for (int k = 0; k < BW; k++) {
                 const float4 c4 = cf[k];
                 const float p = fmaf(r[k], c4.x, c4.y);
-                float th; asm("tanh.approx.f32 %0, %1;" : "=f"(th) : "f"(p));
+                float th = tanh_silu(p);
                 const float d2 = (1.f + th) * (fmaf(-p, th, p) + 1.f);
                 o[k] = fmaf(g[k] * d2 * c4.x, fg, fmaf(r[k], c4.z, c4.w));
                 am = amax_u(am, o[k]);
@@ -674,7 +674,12 @@ static void apply_rec_launch(const void *x, int xdt, shape5 s, int G, const floa
     static thread_local float *gscr[16]; static thread_local int gscn[16];
     const int bw = mx_bw(s.c), Wb = (s.w + 15) / 16, TY = (s.h + 7) / 8, nb = s.c / bw, d = cur_dev_();
     if (!gbsum) {
-        if (gscn[d] < s.n * s.c) { if (gscr[d]) cudaFree(gscr[d]); if (cudaMalloc((void **)&gscr[d], (size_t)s.n * s.c * 4) != cudaSuccess) { fprintf(stderr, "gn apply: no memory for the bias scratch\n"); abort(); } gscn[d] = s.n * s.c; }
+        if (gscn[d] < s.n * s.c) {   /* (at least 1024 channels at once: one 4 KB allocation, no regrowth in later steps) */
+            const int want = s.n * s.c > 1024 ? s.n * s.c : 1024;
+            if (gscr[d]) cudaFree(gscr[d]);
+            if (cudaMalloc((void **)&gscr[d], (size_t)want * 4) != cudaSuccess) { fprintf(stderr, "gn apply: no memory for the bias scratch\n"); abort(); }
+            gscn[d] = want;
+        }
         gbsum = gscr[d];
     }
     const unsigned ngrp = (unsigned)ZTs * TY * Wb;
@@ -697,6 +702,8 @@ extern "C" void lp_gyrec_select(int d) {   /* (tests call it to switch devices b
     R->rec = g_gyrec_park[d].rec; R->cap = g_gyrec_park[d].cap; R->gb = g_gyrec_park[d].gb; R->gbc = g_gyrec_park[d].gbc;
     R->dev = d; R->valid = 0;
 }
+static size_t g_gyrec_cap = (size_t)-1;   /* mgpu: config. The whole-layer records' budget (lp_gyrec_set_cap: the trainer's planned gy record bytes) */
+extern "C" void lp_gyrec_set_cap(size_t bytes) { g_gyrec_cap = bytes; }
 static int g_gyrec_narrow = -1;   /* records also for whole 8- / 16-channel levels (-1: env UFSM_GYREC=2) */
 extern "C" void lp_set_gyrec_narrow(int on) { g_gyrec_narrow = on; }
 static thread_local int g_gyrec_off = -1;   /* test hook: 1 no records at all (the plain apply), -1 env UFSM_GYREC; per thread: unet_backward_x sets it around decoder blocks (one host thread per GPU) */
@@ -715,6 +722,8 @@ extern "C" int lp_gn_silu_bwd_apply_rec(const void *x, int xdt, shape5 s, int G,
     if (R->dev != d) lp_gyrec_select(d);   /* (a thread that changed GPU: its buffers parked, not dropped) */
     const int Wb = (s.w + 15) / 16, ZT = (s.d + 1) / 2, TY = (s.h + 7) / 8, nb = s.c / bw;
     const size_t nrec = (size_t)s.n * s.c * ZT * TY * Wb * GREC;
+    if (nrec > g_gyrec_cap) return 0;   /* (over the planned bytes: the plain apply, and the weight gradient's own pre-pass; 2026-11-14 audit net#4:
+                                           the records grew to any layer outside the plan) */
     if (R->cap < nrec) {   /* this thread's own buffer (the pre-pass's lp_buf slot could be rewritten before the records are read) */
         if (R->rec) cudaFree(R->rec);
         if (cudaMalloc((void **)&R->rec, nrec) != cudaSuccess) { R->rec = nullptr; R->cap = 0; cudaGetLastError(); return 0; }

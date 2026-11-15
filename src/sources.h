@@ -84,6 +84,7 @@ typedef struct {
     store *tgt_store[NTG];
     char *tgt_key[NTG];
     z3 *tgt[NTG][MAXLEV];
+    z3 *tgt_val[NTG][MAXLEV];   /* an onfly ink target with a holdout_file: the twin without the held-out exclusions, read by the validation sampler only (audit eval#2: the val ink target was unknown inside every held-out box) */
     int tgt_present[NTG][MAXLEV];
     int tgt_binary[NTG];      /* target bytes are 0/background, 255/surface; no ignore class */
     int tgt_min_level[NTG];   /* finest stored CT rung; binary targets can upsample finer requests */
@@ -100,7 +101,7 @@ typedef struct {
                                  round(p * 254) and passed through without erode / dilate / soft / trust band */
     int tgt_prob254[NTG];     /* "encoding": "prob254" (tgt_prob set too): bytes already p * 254 with 255 = unknown (ufsm ink-splat), read as
                                  stored, so unknown stays ignored */
-    struct fib_spec { char *afv, *extra, *map, *tr; double rad, guard, ring; int iso, plane; } *tgt_fib[NTG];   /* {"fibre": {afv, extra, map | tr,
+    struct fib_spec { char *afv, *extra, *map, *tr; double rad, guard, ring; int iso, piso, plane; } *tgt_fib[NTG];   /* {"fibre": {afv, extra, map | tr,
                                  radius, guard, ring, iso, plane "H" | "V"}}: the fibre planes computed per read from the polylines on the CT level's
                                  grid (src/fiberraster.c fiber_onfly_open; prob254; the stored fiber-raster output byte for byte, at every level) */
     regions *reg[NTG];
@@ -109,6 +110,9 @@ typedef struct {
     axis ax;                /* n == 0 when unknown */
     int64_t hold_o[3], hold_n[3];   /* optional held-out box (level-0 voxels); hold_n[0] == 0 when absent (= hold[0]: the validation box) */
     int64_t (*hold)[6]; int nhold;  /* all held-out boxes (z y x nz ny nx, level 0): no training label inside them */
+    int hold_checked;       /* the boxes were checked against the CT extent (source_ct, first open) */
+    uint8_t *hold_nos;      /* per held-out box: 1 = "score": 0 in the holdout_file (masked from training, never a validation box: e.g. a second scan
+                               without a registration, where a cross-scan leak cannot be ruled out) */
     uint8_t *hold_rej;      /* per held-out box (parallel to hold): 1 = rejected even in mask mode ("holdout_reject": the box names) */
     int hold_mode;          /* "holdout_mode": 0 the sampler's (train --holdout-mode), 1 "mask", 2 "reject": this source's training windows
                                that overlap a held-out box */
@@ -142,8 +146,11 @@ typedef struct {
                         for every source), any long-range / count loss must skip it. "global" (default) */
     z3 *phase_ign;   /* optional "phase": {..., "ignore": {"root", "key"}}: a uint8 array on the stored phase's grid, nonzero = the phase there is not trained on (ufsm phase-conflict) */
     z3 *phase_pl[MAXLEV], *phase_ign_pl[MAXLEV];   /* source_phase_at: the stored phase / ignore pooled to levels coarser than phase_level (lazy views) */
+    store *phase_store; double phase_key_um;   /* a stored (not onfly) phase: its store and its key's um; source_phase_at opens a coarser level stored in
+                                                  the same group (ufsm downsample --mode phase, key = that level's um) instead of pooling per read */
     uint8_t *focus; int64_t focus_grid[3]; float focus_w;   /* optional "focus": {"map": RAW, "w": K} (ufsm phase-packing --map: per coarse occupancy cell 0 none, else
                                                               1 + 254 x packed share): the position draw takes a cell 1 + K x share times as often */
+    int64_t zb_below; float zb_k;   /* optional "zboost": {"below": N, "k": K}: occupancy cells with z index < N (cells of the occupancy grid, see the log line) are drawn K times as often */
     z3 *wind;    /* optional, with a stored phase: the winding mod 14 turns on the same grid (ufsm phase-raster --winding; band.h
                     band_winding), {"band": {..., "phase": {...}, "winding": {"root": ..., "key": ...}}}: the --cond targets / condition */
     /* unlabelled scans (Phase U0, ufsm scanprep): */
@@ -176,6 +183,7 @@ typedef struct {
 
 sources *sources_load(const char *json_path);
 void sources_set_onfly_cache_mb(size_t mb);   /* the shared memory LRU of every onfly phase array (--onfly-cache-mb); call before sources_load */
+void sources_set_strict(int on);   /* unknown / unread sources-json keys: fatal (train --strict-sources 1) instead of a warning; call before sources_load */
 void sources_set_cache(const char *dir);   /* overrides the file's "cache"; call before sources_load */
 void sources_free(sources *S);
 
@@ -191,6 +199,7 @@ z3 *source_tgt_for_level(source *s, int ch, int level, int *stored_level);
    encoding. Binary masks are nearest-neighbour upsampled on their global voxel
    centres when shift>0; interior samples clamp to the last stored centre. */
 int z3_read_label_grid(z3 *z, int binary, int shift, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);
+void source_set_val_read(int on);   /* this thread reads the validation twins of the onfly ink targets (sample.c sets it per draw) */
 int source_read_target(source *s, int ch, int level, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);
 z3 *source_region(source *s, int ch, int i);           /* regions target only */
 int source_region_shared(const source *s, int ch);      /* 1 if region reads use absolute (array) coordinates */

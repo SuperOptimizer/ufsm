@@ -490,6 +490,57 @@ int main(int argc, char **argv) {
         printf("%-32s @%d %8.3f ms  out %016llx\n", "up2 bwd 32 ch (mx8)", P, b1, (unsigned long long)fnv(gc, lp_mx8_bytes(1, C, Sc)));
         nn_free(xc); nn_free(yf); nn_free(gf); nn_free(gc); nn_free(ug); nn_free(ub);
     }
+    if (want("wide")) {   /* scratch2's 3^3 convs per card (widths 256,320,384,448 + deep 288,288 on 256^3 latent cells, --split z: level l is
+                             128 >> l x 256 >> l x 256 >> l): forward (MX-fp4 in -> out, GN+SiLU staging, statistics) and the weight gradient with
+                             MX-fp4 gy (the trainer's), TFLOP/s = 2 * 27 * Ci * Co * voxels / t. BENCH_WZ: the depth divisor (default 4, a quarter
+                             of the z extent); BENCH_WH / BENCH_WD: the level-0 extents (256 / 128: one split half of P 1024); BENCH_WIDE: one case index; BENCH_WOP: fwd or wgrad only */
+        struct { int ci, co, lv; } WC[] = {{256, 256, 0}, {416, 256, 0}, {160, 256, 0}, {320, 320, 1}, {512, 320, 1}, {384, 384, 2}, {608, 384, 2},
+                                            {448, 448, 3}, {288, 288, 4}, {288, 288, 5}};
+        const int wz = getenv("BENCH_WZ") ? atoi(getenv("BENCH_WZ")) : 4;
+        const int wh = getenv("BENCH_WH") ? atoi(getenv("BENCH_WH")) : 256, wd = getenv("BENCH_WD") ? atoi(getenv("BENCH_WD")) : 128;   /* level-0 cells (H = W, D): try6's P 512 = 128, 128 with BENCH_WZ=1 */
+        const char *wop = getenv("BENCH_WOP");
+        float *wg = rnd(1024, 1.f, 70), *wb = rnd(1024, 0.5f, 71);
+        for (int l = 0; l < (int)(sizeof WC / sizeof WC[0]); l++) {
+            if (getenv("BENCH_WIDE") && l != atoi(getenv("BENCH_WIDE"))) continue;
+            const int ci = WC[l].ci, co = WC[l].co, Hh = wh >> WC[l].lv, Dd = (wd >> WC[l].lv) / wz > 2 ? (wd >> WC[l].lv) / wz : 2;
+            shape5 xs = {1, ci, Dd, Hh, Hh}, ys = xs; ys.c = co;
+            const size_t Sl = (size_t)Dd * Hh * Hh, nw = (size_t)co * ci * 27;
+            const double fl = 2.0 * 27 * ci * co * (double)Sl;
+            void *x = mx(4, ci, Sl, 2.f, 81 + l);
+            const gnp_t gp = {wg, wb, mean, rstd, G};
+            if (!wop || !strcmp(wop, "fwd")) {
+                void *y = nn_malloc(lp_mx4_bytes(1, co, Sl));
+                float *w = rnd(nw, 0.1f, 72), *b = rnd(co, 0.1f, 73);
+                double best = 1e9;
+                for (int it = 0; it < 8; it++) {
+                    nn_zero(osum, 2 * 64 * sizeof(double));
+                    nn_sync(); double t0 = now(); lp_conv_fwd_f4(x, 4, xs, w, b, co, y, 4, gp, osum, G, (split_t){0}); nn_sync();
+                    if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3;
+                }
+                double hs[2] = {0, 0}; gn2(osum, hs);
+                printf("wide fwd   %3d -> %3d L%d %3dx%3dx%3d %8.3f ms %6.1f TFLOP/s  out %016llx  stats %.9g %.9g\n", ci, co, WC[l].lv, Dd, Hh, Hh, best,
+                       fl / best * 1e-9, (unsigned long long)fnv(y, lp_mx4_bytes(1, co, Sl)), hs[0], hs[1]);
+                nn_free(y); nn_free(w); nn_free(b);
+            }
+            if (!wop || !strcmp(wop, "wgrad")) {
+                void *gy = mx(4, co, Sl, 1e-3f, 91 + l);
+                float *gw = nn_malloc(nw * 4), *gb = nn_malloc(co * 4), *h = malloc(nw * 4);
+                double best = 1e9, a = 0, s = 0;
+                for (unsigned it = 0; it < 8; it++) {
+                    split_t sp = {0}; sp.sr = 0x51ed270bu;
+                    nn_zero(gw, nw * 4); nn_zero(gb, co * 4);
+                    nn_sync(); double t0 = now(); lp_bwd_w_f4(x, 4, xs, gy, 4, ys, gw, gb, gp, sp, 0); nn_sync(); double t = (now() - t0) * 1e3;
+                    if (it >= 2 && t < best) best = t;
+                }
+                nn_d2h(h, gw, nw * 4); for (size_t i = 0; i < nw; i++) { a += fabs(h[i]); s += h[i] * (double)((i * 2654435761u) % 1000); }
+                printf("wide wgrad %3d -> %3d L%d %3dx%3dx%3d %8.3f ms %6.1f TFLOP/s  |gw| %.9g  w-sum %.9g\n", ci, co, WC[l].lv, Dd, Hh, Hh, best, fl / best * 1e-9, a, s);
+                if (getenv("BENCH_WDUMP")) { char fn[512]; snprintf(fn, sizeof fn, "%s.%d", getenv("BENCH_WDUMP"), l); FILE *f = fopen(fn, "wb"); if (f) { fwrite(h, 4, nw, f); fclose(f); } }
+                nn_free(gy); nn_free(gw); nn_free(gb); free(h);
+            }
+            nn_free(x);
+        }
+        nn_free(wg); nn_free(wb);
+    }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); return 1; }
     return 0;
 }

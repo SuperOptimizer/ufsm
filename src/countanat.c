@@ -7,6 +7,7 @@
    -1 blue, +2 orange, -2 cyan, other magenta), and prints per 1 mm radius band the shares of k = -2..+2 and the integer-error change rates per mm along radial and
    tangential neighbours (pixels of the image grid: a change between two labelled neighbour pixels = a wrong-count boundary). */
 #include <math.h>
+#include "optcheck.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,8 +15,8 @@
 #include "store.h"
 #include "zarr3.h"
 
-static const char *ca_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1]; return d; }
-static int ca_idx(int argc, char **argv, const char *k) { for (int i = 4; i < argc; i++) if (!strcmp(argv[i], k)) return i; return -1; }
+static const char *ca_opt(int argc, char **argv, const char *k, const char *d) { for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1]; return d; }
+static int ca_idx(int argc, char **argv, const char *k) { for (int i = 4; i < argc; i++) if (!strcmp(argv[i], opt_n(k))) return i; return -1; }
 static double ca_w14(double e) { return e - 14 * round(e / 14); }
 static int ca_ppm(const char *p, const uint8_t *rgb, int w, int h) {
     FILE *f = fopen(p, "wb"); if (!f) return 1; fprintf(f, "P6\n%d %d\n255\n", w, h);
@@ -23,8 +24,8 @@ static int ca_ppm(const char *p, const uint8_t *rgb, int w, int h) {
 }
 int cmd_count_anat(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm count-anat <dump5> <out-prefix> --gauge G --cy CY --cx CX [--down 2] [--ct ROOT KEY --ct-um U --um U0 --org Z,Y,X]\n"); return 2; }
-    const double G = atof(ca_opt(argc, argv, "--gauge", "0")), cy = atof(ca_opt(argc, argv, "--cy", "0")), cx = atof(ca_opt(argc, argv, "--cx", "0")), um = atof(ca_opt(argc, argv, "--um", "9.6"));
-    const int D = atoi(ca_opt(argc, argv, "--down", "2"));
+    const double G = opt_atof("--gauge", ca_opt(argc, argv, "--gauge", "0")), cy = opt_atof("--cy", ca_opt(argc, argv, "--cy", "0")), cx = opt_atof("--cx", ca_opt(argc, argv, "--cx", "0")), um = opt_atof("--um", ca_opt(argc, argv, "--um", "9.6"));
+    const int D = opt_atoi("--down", ca_opt(argc, argv, "--down", "2"));
     FILE *f = fopen(argv[2], "rb"); if (!f) { fprintf(stderr, "count-anat: cannot open %s\n", argv[2]); return 1; }
     fseek(f, 0, SEEK_END); const size_t n = (size_t)ftell(f) / 20; fseek(f, 0, SEEK_SET);
     float *r = malloc(n * 20); if (!r || fread(r, 20, n, f) != n) { fprintf(stderr, "count-anat: read failed\n"); return 1; } fclose(f);
@@ -71,7 +72,7 @@ int cmd_count_anat(int argc, char **argv) {
                ch[b][0] ? ch[b][1] / ch[b][0] * pxmm : 0, ch[b][2] ? ch[b][3] / ch[b][2] * pxmm : 0); }
     const int ci = ca_idx(argc, argv, "--ct");
     if (ci > 0 && ci + 2 < argc) {   /* the overlay: CT row (mean over the dump's z range) + GT / fitted sheets */
-        const double ctum = atof(ca_opt(argc, argv, "--ct-um", "0")), F = um / ctum; long long org[3] = {0, 0, 0};
+        const double ctum = opt_atof("--ct-um", ca_opt(argc, argv, "--ct-um", "0")), F = um / ctum; long long org[3] = {0, 0, 0};
         if (sscanf(ca_opt(argc, argv, "--org", "0,0,0"), "%lld,%lld,%lld", &org[0], &org[1], &org[2]) != 3 || !(ctum > 0)) { fprintf(stderr, "count-anat: --ct needs --ct-um and --org Z,Y,X\n"); return 2; }
         z3 *z = z3_open(store_open(argv[ci + 1]), argv[ci + 2], nullptr); if (!z) { fprintf(stderr, "count-anat: %s\n", z3_error()); return 1; }
         const z3_meta *zm = z3_meta_of(z);

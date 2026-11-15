@@ -9,6 +9,7 @@
    area = GOOD quads x row spacing x column spacing (um from meta voxel_size_um, or --um). Table on stdout:
    wrap rect r0 c0 rows cols cm2 good-share-of-wrap stretch-row stretch-col; summary line: total cm2, wraps with a sheet. */
 #include "imgops.h"
+#include "optcheck.h"
 #include "tiffw.h"
 #include <dirent.h>
 #include <math.h>
@@ -19,7 +20,7 @@
 #include <sys/stat.h>
 
 static const char *sc_opt(int argc, char **argv, const char *k, const char *d) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], k)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return argv[i + 1];
     return d;
 }
 static int cmpf(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
@@ -44,8 +45,8 @@ static long long largest_rect(const uint8_t *m, int h, int w, int *r0, int *c0, 
 
 int cmd_sheet_cut(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm sheet-cut <wraps-dir> <out-dir> [--tol 0.3] [--cos 0.35] [--min-cm2 0.25] [--max 8] [--margin 2] [--wraps a,b,..] [--um U]\n"); return 2; }
-    const double tol = atof(sc_opt(argc, argv, "--tol", "0.3")), cmax = atof(sc_opt(argc, argv, "--cos", "0.35")), mincm2 = atof(sc_opt(argc, argv, "--min-cm2", "0.25"));
-    const int maxr = atoi(sc_opt(argc, argv, "--max", "8")), margin = atoi(sc_opt(argc, argv, "--margin", "2")); const double um_opt = atof(sc_opt(argc, argv, "--um", "0"));
+    const double tol = opt_atof("--tol", sc_opt(argc, argv, "--tol", "0.3")), cmax = opt_atof("--cos", sc_opt(argc, argv, "--cos", "0.35")), mincm2 = opt_atof("--min-cm2", sc_opt(argc, argv, "--min-cm2", "0.25"));
+    const int maxr = opt_atoi("--max", sc_opt(argc, argv, "--max", "8")), margin = opt_atoi("--margin", sc_opt(argc, argv, "--margin", "2")); const double um_opt = opt_atof("--um", sc_opt(argc, argv, "--um", "0"));
     const char *wl = sc_opt(argc, argv, "--wraps", nullptr); char *want = nullptr; if (wl) { want = malloc(strlen(wl) + 3); sprintf(want, ",%s,", wl); }
     DIR *dd = opendir(argv[2]); if (!dd) { fprintf(stderr, "sheet-cut: cannot open %s\n", argv[2]); return 1; }
     { char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", argv[3]); if (system(p)) { fprintf(stderr, "sheet-cut: cannot create %s\n", argv[3]); return 1; } }

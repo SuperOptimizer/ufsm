@@ -159,7 +159,7 @@ extern "C" int lp_mxsw_selftest(int *hw) {
     int fails = 0;
     cudaError_t e = cudaDeviceSynchronize();
     if (e != cudaSuccess) { printf("  launch failed: %s\n", cudaGetErrorString(e)); return 99; }
-    cudaMemcpy(&h, d, sizeof h, cudaMemcpyDeviceToHost);
+    if ((e = cudaMemcpy(&h, d, sizeof h, cudaMemcpyDeviceToHost)) != cudaSuccess) { printf("  result copy failed: %s\n", cudaGetErrorString(e)); return 99; }
     for (int k = 0; k < 6; k++) {
         printf("  %-40s %s", cn[k], h.n[k] ? "FAIL" : "ok");
         if (h.n[k]) { printf(" (%llu, e.g.", h.n[k]); for (int i = 0; i < 4 && i < (int)h.n[k]; i++) printf(" %08x", h.ex[k][i]); printf(")"); fails++; }
@@ -169,7 +169,7 @@ extern "C" int lp_mxsw_selftest(int *hw) {
         cudaMemset(d, 0, sizeof(mxsw_res));
         mxsw_mma_k<<<4096, 32>>>(d, kind, 0x1234567u + kind);
         if ((e = cudaDeviceSynchronize()) != cudaSuccess) { printf("  launch failed: %s\n", cudaGetErrorString(e)); return 99; }
-        cudaMemcpy(&h, d, sizeof h, cudaMemcpyDeviceToHost);
+        if ((e = cudaMemcpy(&h, d, sizeof h, cudaMemcpyDeviceToHost)) != cudaSuccess) { printf("  result copy failed: %s\n", cudaGetErrorString(e)); return 99; }
         for (int k = 6; k < 8; k++) {
             if (k == 7 && !*hw) continue;
             printf("  %-24s %-32s %s (worst rel %.2g)", kn[kind], cn[k], h.n[k] ? "FAIL" : "ok", h.worst[k - 6]);

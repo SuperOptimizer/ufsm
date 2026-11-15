@@ -18,6 +18,7 @@
    Guard: --max-steep / --max-jump / --max-merge / --max-skip F (shares of the valid vertices of a wrap): wraps over any are listed
    as "bad" in wraps.tsv and the exit code is 3 when the whole set's shares exceed them (a pipeline stage stops there). */
 #include "sources.h"
+#include "optcheck.h"
 #include "store.h"
 #include "zarr3.h"
 #include "surfcomp.h"
@@ -32,7 +33,7 @@
 #include <string.h>
 #include <time.h>
 
-static const char *gc_opt(int argc, char **argv, const char *name, const char *def) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1]; return def; }
+static const char *gc_opt(int argc, char **argv, const char *name, const char *def) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1]; return def; }
 static double gc_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
 #define GC_NH 64          /* log2 histogram bins of spacing ratios: 1/16 .. 16 */
@@ -226,12 +227,12 @@ int cmd_geom_check(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: ufsm geom-check <wraps-dir> --axis FILE --axis-um U [--out DIR] [--first K] [--last K] [--every 2] [--nb 2048] [--zbins 32] [--jump 0.5]\n"
                                     "       [--threads N] [--max-steep F] [--max-jump F] [--max-merge F] [--max-skip F] [--ct ROOT KEY --ct-um U [--slip-every 128] [--slip-d 2] [--slip-sb 8]]   (src/geomcheck.c)\n"); return 2; }
     const char *in = argv[2], *axp = gc_opt(argc, argv, "--axis", nullptr), *out = gc_opt(argc, argv, "--out", nullptr);
-    const double axum = atof(gc_opt(argc, argv, "--axis-um", "0"));
-    const int k0 = atoi(gc_opt(argc, argv, "--first", "-1000000")), k1 = atoi(gc_opt(argc, argv, "--last", "1000000"));
-    const int nt = ufsm_threads(atoi(gc_opt(argc, argv, "--threads", "0")), 16);
+    const double axum = opt_atof("--axis-um", gc_opt(argc, argv, "--axis-um", "0"));
+    const int k0 = opt_atoi("--first", gc_opt(argc, argv, "--first", "-1000000")), k1 = opt_atoi("--last", gc_opt(argc, argv, "--last", "1000000"));
+    const int nt = ufsm_threads(opt_atoi("--threads", gc_opt(argc, argv, "--threads", "0")), 16);
     gc_job J; memset(&J, 0, sizeof J);
-    J.every = atoi(gc_opt(argc, argv, "--every", "2")); J.nb = atoi(gc_opt(argc, argv, "--nb", "2048")); J.zbins = atoi(gc_opt(argc, argv, "--zbins", "32")); J.jump_t = atof(gc_opt(argc, argv, "--jump", "0.5"));
-    const double mx[4] = {atof(gc_opt(argc, argv, "--max-steep", "0")), atof(gc_opt(argc, argv, "--max-jump", "0")), atof(gc_opt(argc, argv, "--max-merge", "0")), atof(gc_opt(argc, argv, "--max-skip", "0"))};
+    J.every = opt_atoi("--every", gc_opt(argc, argv, "--every", "2")); J.nb = opt_atoi("--nb", gc_opt(argc, argv, "--nb", "2048")); J.zbins = opt_atoi("--zbins", gc_opt(argc, argv, "--zbins", "32")); J.jump_t = opt_atof("--jump", gc_opt(argc, argv, "--jump", "0.5"));
+    const double mx[4] = {opt_atof("--max-steep", gc_opt(argc, argv, "--max-steep", "0")), opt_atof("--max-jump", gc_opt(argc, argv, "--max-jump", "0")), opt_atof("--max-merge", gc_opt(argc, argv, "--max-merge", "0")), opt_atof("--max-skip", gc_opt(argc, argv, "--max-skip", "0"))};
     if (!axp || !(axum > 0) || J.every < 1 || J.nb < 64 || J.zbins < 1 || !(J.jump_t > 0)) { fprintf(stderr, "geom-check: --axis FILE --axis-um U (its level-0 um), --every >= 1, --nb >= 64, --zbins >= 1\n"); return 2; }
     axis ax = {0}; if (axis_load(&ax, axp)) { fprintf(stderr, "geom-check: cannot load the axis %s\n", axp); return 1; }
     DIR *dd = opendir(in); if (!dd) { fprintf(stderr, "geom-check: cannot open %s\n", in); return 1; }
@@ -283,9 +284,9 @@ int cmd_geom_check(int argc, char **argv) {
     /* --ct: z slip of the wraps against the CT's sheets */
     double *slip = nullptr, *sabs = nullptr; long long *sn = nullptr, *hs = nullptr; int ci = -1;
     int nzg = 0; int *zg_r = nullptr; double *zg_z = nullptr, *zg_m = nullptr; long long *zg_n = nullptr;   /* per sampled row pair: its row, z, mean slip x rows per sample (turns), samples */
-    for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], "--ct")) ci = i;
+    for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--ct"))) ci = i;
     if (ci > 0) {
-        const double ctum = atof(gc_opt(argc, argv, "--ct-um", "0")); const int se = atoi(gc_opt(argc, argv, "--slip-every", "128")), D = atoi(gc_opt(argc, argv, "--slip-d", "2")), sb = atoi(gc_opt(argc, argv, "--slip-sb", "8"));
+        const double ctum = opt_atof("--ct-um", gc_opt(argc, argv, "--ct-um", "0")); const int se = opt_atoi("--slip-every", gc_opt(argc, argv, "--slip-every", "128")), D = opt_atoi("--slip-d", gc_opt(argc, argv, "--slip-d", "2")), sb = opt_atoi("--slip-sb", gc_opt(argc, argv, "--slip-sb", "8"));
         if (!(ctum > 0) || se < 1 || D < 1 || D % J.every || sb < 1) { fprintf(stderr, "geom-check: --ct ROOT KEY --ct-um U, --slip-every >= 1, --slip-d a multiple of --every, --slip-sb >= 1\n"); return 2; }
         z3 *cz = z3_open(store_open(argv[ci + 1]), argv[ci + 2], gc_opt(argc, argv, "--cache", nullptr)); if (!cz) { fprintf(stderr, "geom-check: CT: %s\n", z3_error()); return 1; }
         const z3_meta *cm = z3_meta_of(cz); const double f = um / ctum;

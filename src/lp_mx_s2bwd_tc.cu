@@ -1,4 +1,5 @@
 /* MX stride-2 backward-data of the narrow down convs (16 or 32 channels, Ci == Co) on the tensor cores */
+#include <mutex>
 #include "lp_mxops.cuh"
 /* gx[ci][u] (+)= sum over the taps k with (u + 1 - k) even, o = (u + 1 - k) / 2 in range, of sum_co w[co][ci][k] gy[co][o]
    (k = 3, pad 1). The fine voxels split into 8 parity classes p (u = 2 m + p per axis); within a class every voxel uses
@@ -501,28 +502,32 @@ __global__ void __launch_bounds__(256, S2Q4_MINB) bwd_data_s2_f4q_k(const uint8_
         pass(0, olda, osca, oldb, oscb); pass(1, oldb, oscb, olda, osca); pass(2, olda, osca, oldb, oscb); pass(3, oldb, oscb, olda, osca);
     }
 }
-static int s2b_f4q(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, unsigned osr) {
-    static s2q4_quads Q; static int built = 0;
-    if (!built) {   /* class p's taps in (z, y, x) order, x fastest (a load's two slots then differ in dx, or in dy / dz alone), in quads */
-        int q = 0;
-        for (int p = 0; p < 8; p++) {
-            Q.first[p] = (signed char)q;
-            const int pa[3] = {p >> 2, (p >> 1) & 1, p & 1};
-            int tk[8], rl[8], nt = 0;
-            for (int a = 0; a < (pa[0] ? 2 : 1); a++) for (int bb = 0; bb < (pa[1] ? 2 : 1); bb++) for (int c = 0; c < (pa[2] ? 2 : 1); c++) {
-                const int sel[3] = {a, bb, c}; int k3[3], d3[3];
-                for (int ax = 0; ax < 3; ax++) { if (!pa[ax]) { k3[ax] = 1; d3[ax] = 0; } else if (!sel[ax]) { k3[ax] = 0; d3[ax] = 1; } else { k3[ax] = 2; d3[ax] = 0; } }
-                tk[nt] = (k3[0] * 3 + k3[1]) * 3 + k3[2]; rl[nt] = (d3[0] * 9 + d3[1]) * S2Q4_GX + d3[2]; nt++;
-            }
-            for (int i = 0; i < nt; i += 4, q++)
-                for (int s = 0; s < 4; s++) {
-                    const bool real = i + s < nt;
-                    Q.tap[q][s] = (signed char)(real ? tk[i + s] : -1); Q.rel[q][s] = (unsigned char)(real ? rl[i + s] : rl[i]);
-                }
+/* class p's taps in (z, y, x) order, x fastest (a load's two slots then differ in dx, or in dy / dz alone), in quads */
+static s2q4_quads s2q4_build(void) {
+    s2q4_quads Q;
+    int q = 0;
+    for (int p = 0; p < 8; p++) {
+        Q.first[p] = (signed char)q;
+        const int pa[3] = {p >> 2, (p >> 1) & 1, p & 1};
+        int tk[8], rl[8], nt = 0;
+        for (int a = 0; a < (pa[0] ? 2 : 1); a++) for (int bb = 0; bb < (pa[1] ? 2 : 1); bb++) for (int c = 0; c < (pa[2] ? 2 : 1); c++) {
+            const int sel[3] = {a, bb, c}; int k3[3], d3[3];
+            for (int ax = 0; ax < 3; ax++) { if (!pa[ax]) { k3[ax] = 1; d3[ax] = 0; } else if (!sel[ax]) { k3[ax] = 0; d3[ax] = 1; } else { k3[ax] = 2; d3[ax] = 0; } }
+            tk[nt] = (k3[0] * 3 + k3[1]) * 3 + k3[2]; rl[nt] = (d3[0] * 9 + d3[1]) * S2Q4_GX + d3[2]; nt++;
         }
-        if (q != 9) { fprintf(stderr, "s2b_f4q: %d quads\n", q); abort(); }
-        built = 1;
+        for (int i = 0; i < nt; i += 4, q++)
+            for (int s = 0; s < 4; s++) {
+                const bool real = i + s < nt;
+                Q.tap[q][s] = (signed char)(real ? tk[i + s] : -1); Q.rel[q][s] = (unsigned char)(real ? rl[i + s] : rl[i]);
+            }
     }
+    if (q != 9) { fprintf(stderr, "s2b_f4q: %d quads\n", q); abort(); }
+    return Q;
+}
+static int s2b_f4q(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, unsigned osr) {
+    static s2q4_quads Q; static std::once_flag qonce;   /* mgpu: guarded (std::call_once; a function-local static initialiser would not do: the
+                                                          CUDA units build with -fno-threadsafe-statics; was a racy lazy build) */
+    std::call_once(qonce, [] { Q = s2q4_build(); });
     uint8_t *wq = lp_buf<uint8_t>(0, (size_t)9 * 16 * 32), *ws = lp_buf<uint8_t>(1, (size_t)9 * 16 * 4);
     prep_w4q_k<<<nblk_(9 * 16 * 4, 128), 128>>>(w, wq, ws, Q);
     const int2 zw = zw_trange(xs.d, 4);   /* z-window: gx planes in tiles of 4 (2 gy planes) */
@@ -534,8 +539,8 @@ static int s2b_f4q(const void *gy, shape5 ys, const float *w, shape5 xs, void *g
     if (zc_env > 0) ZC = zc_env < nzt ? zc_env : nzt;
     const dim3 grid((unsigned)((ys.w + 15) / 16), (unsigned)((ys.h + 7) / 8), (unsigned)(((nzt + ZC - 1) / ZC) * xs.n));
     const size_t sm = (size_t)S2Q4_NG * 8 + ((S2Q4_NG + 127) & ~127) + 9 * 16 * 32 + 9 * 16 * 4 + 32 * 4 + 8 * 32 * 20 * 4;
-    static unsigned at = 0; int dev = 0; cudaGetDevice(&dev);
-    if (!(at >> dev & 1u)) { at |= 1u << dev; cudaFuncSetAttribute((const void *)bwd_data_s2_f4q_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
+    static unsigned at = 0; int dev = 0; cudaGetDevice(&dev);   /* mgpu: per-device (a bit per device, set atomically after the attribute) */
+    if (!(__atomic_load_n(&at, __ATOMIC_ACQUIRE) >> dev & 1u)) { cudaFuncSetAttribute((const void *)bwd_data_s2_f4q_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); __atomic_fetch_or(&at, 1u << dev, __ATOMIC_RELEASE); }
     bwd_data_s2_f4q_k<<<grid, 256, sm>>>((const uint8_t *)gy, wq, ws, (uint8_t *)gx, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum, osr, Q, ZC, zw);
     LPCK();
     return 1;
@@ -613,9 +618,9 @@ static int s2b_f4(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx
     {   const size_t nby = (size_t)ys.n * NCH * ((size_t)ys.d * ys.h * ys.w) * 17, nbx = (size_t)xs.n * NCH * ((size_t)xs.d * xs.h * xs.w) * (4 * xdt + 1);
         const uintptr_t y0 = (uintptr_t)gy, x0 = (uintptr_t)gx;
         if (y0 < x0 + nbx && x0 < y0 + nby && !getenv("UFSM_S2B_NOCOPY")) {   /* (UFSM_S2B_NOCOPY: the old behaviour, for the test) */
-            static void *cp[8]; static size_t cap[8]; const int dv = cur_dev_();
-            if (nby > cap[dv]) { if (cp[dv]) cudaFree(cp[dv]); if (cudaMalloc(&cp[dv], nby) != cudaSuccess) { fprintf(stderr, "s2b_f4: no memory for the %.1f MB gy copy\n", nby / 1e6); abort(); } cap[dv] = nby; }
-            cudaMemcpyAsync(cp[dv], gy, nby, cudaMemcpyDeviceToDevice, 0); gyk = cp[dv];
+            void *cp = nn_ws(NN_WS_S2BCP, nby);   /* (the workspace registry: unet_ws_plan sizes it for the largest down conv's gy) */
+            if (!cp) { fprintf(stderr, "s2b_f4: no memory for the %.1f MB gy copy\n", nby / 1e6); abort(); }
+            cudaMemcpyAsync(cp, gy, nby, cudaMemcpyDeviceToDevice, 0); gyk = cp;
         }
     }
 #define S2BF(XB_, NCH_) do { if (!*atp) { *atp = 1; cudaFuncSetAttribute((const void *)bwd_data_s2_f4_k<XB_, NCH_>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
@@ -647,7 +652,8 @@ extern "C" int lp_bwd_data_s2_mx_tc(const void *gy, shape5 ys, const float *w, s
     const dim3 grid(nb, (unsigned)(C / CB));
     __nv_bfloat16 *wtg = lp_buf<__nv_bfloat16>(0, (size_t)27 * C * (C + 8));
     const uint8_t *gq = (const uint8_t *)gy; uint8_t *xq = (uint8_t *)gx;
-#define S2TC(CC, G, X) do { static unsigned at_ = 0; int dev_ = 0; cudaGetDevice(&dev_); if (!(at_ >> dev_ & 1u)) { at_ |= 1u << dev_; cudaFuncSetAttribute((const void *)bwd_data_s2_tc_k<CC, G, X>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); } \
+#define S2TC(CC, G, X) do { static unsigned at_ = 0; /* mgpu: per-device (bit per device, atomic, after the attribute) */ int dev_ = 0; cudaGetDevice(&dev_); \
+                            if (!(__atomic_load_n(&at_, __ATOMIC_ACQUIRE) >> dev_ & 1u)) { cudaFuncSetAttribute((const void *)bwd_data_s2_tc_k<CC, G, X>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); __atomic_fetch_or(&at_, 1u << dev_, __ATOMIC_RELEASE); } \
                             s2tc_prep_w_k<CC><<<nblk_(27 * CC * (CC + 8), 256), 256>>>(w, wtg); \
                             bwd_data_s2_tc_k<CC, G, X><<<grid, 256, sm>>>(gq, wtg, xq, xs.n, xs.d, xs.h, xs.w, ys.d, ys.h, ys.w, accum, osr); } while (0)
     if (C == 16) { if (GB == 8 && XB == 8) S2TC(16, 8, 8); else if (GB == 4 && XB == 4) S2TC(16, 4, 4); else return 0; }

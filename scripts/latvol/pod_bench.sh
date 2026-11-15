@@ -4,7 +4,8 @@
 # Run under pod_claim.sh. Env: U (binary), CK (checkpoint), LV (latvol root), CACHE (volcomp chunk cache), TH (40), O (output dir), EXTRA.
 U=${U:-/workspace/latstore/ufsm/build/ufsm}; CK=${CK:-/workspace/univI/u1b.ckpt}; LV=${LV:-/workspace/latstore/lv}; CACHE=${CACHE:-/workspace/univI/cache}
 M=https://dl.ash2txt.org/community-uploads/forrest/volcomp; K=PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr
-B=${B:-9216,2560,2560,2048,3072,3072}; O=${O:-/workspace/latstore/out}; TH=${TH:-40}; mkdir -p $O
+B=${B:-9216,2560,2560,2048,3072,3072}; O=${O:-/workspace/latstore/out}; TH=${TH:-$($U sysinfo --ncpu 2>/dev/null || echo 8)};   # (the cgroup's CPUs; podscripts #6)
+ mkdir -p $O
 one() {   # TAG ROOT [--cache DIR]
   local t=$1 r=$2; shift 2; rm -rf $O/$t
   env UFSM_PRED_PROF=1 UFSM_PRED_IO=1 $EXTRA $U predict $CK $r $K $O/$t --um 2.4 --level 2 --gpu 0 --threads $TH --box $B --channel rv "$@" > $O/$t.log 2>&1

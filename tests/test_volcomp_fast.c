@@ -16,8 +16,12 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "fm_tol.h"
 
 #define CV VOLCOMP_CHUNK_VOXELS
+/* vfx (volcomp_fast.h) vs the reference decoder: two host IDCTs in different code. Identical under UFSM_STRICT_MATH; under the
+   default fast math (contraction / reassociation) +-1 on at most 1e-4 of the voxels, the codec's cross-build allowance. */
+#define DEC_NE(what, a, b) fm_cmp_u8(what, a, b, CV, 1, 1e-4)
 static uint64_t lcg(uint64_t *s) { *s = *s * 6364136223846793005ull + 1442695040888963407ull; return *s >> 17; }
 static int fails = 0;
 static void check(const char *what, int ok) { printf("volcomp_fast: %-96s %s\n", what, ok ? "ok" : "FAIL"); fails += !ok; }
@@ -46,14 +50,14 @@ static int part1(void) {
             size_t n = 0;
             if (volcomp_encode(c, qs[qi], enc, VOLCOMP_ENCODE_BOUND, &n) != VOLCOMP_OK) { full_ok = 0; continue; }
             volcomp_status s1 = volcomp_decode(enc, n, a, CV), s2 = vfx_decode(enc, n, b, CV);
-            if (s1 != VOLCOMP_OK || s2 != VOLCOMP_OK || memcmp(a, b, CV)) full_ok = 0;
+            if (s1 != VOLCOMP_OK || s2 != VOLCOMP_OK || DEC_NE("vfx_decode", a, b)) full_ok = 0;
             vf_parsed p;
             if (enc[5] == VLL_MODE_LOSSY && vf_parse(enc, n, &p) == VOLCOMP_OK)
                 for (int t = 0; t < 4; t++) {
                     uint32_t mask = (uint32_t)lcg(&s) ^ (uint32_t)(lcg(&s) << 15);
                     memset(a, 0, CV); memset(b, 0, CV);
                     for (uint32_t k = 0; k < VF_NSUB; k++) if (mask >> k & 1) vf_decode_sub(&p, k, a, -1, NULL);
-                    if (vfx_decode_subs(&p, mask, b) != VOLCOMP_OK || memcmp(a, b, CV)) sub_ok = 0;
+                    if (vfx_decode_subs(&p, mask, b) != VOLCOMP_OK || DEC_NE("vfx_decode_subs", a, b)) sub_ok = 0;
                 }
             for (int t = 0; t < 40; t++) {   /* corrupted copies: flipped bytes past the header, or truncated */
                 size_t m = n; memcpy(bad, enc, n);
@@ -62,7 +66,7 @@ static int part1(void) {
                 memset(a, 0x55, CV); memset(b, 0x55, CV);
                 s1 = volcomp_decode(bad, m, a, CV); s2 = vfx_decode(bad, m, b, CV);
                 ncor++;
-                if (s1 != s2 || (s1 == VOLCOMP_OK && memcmp(a, b, CV))) cor_ok = 0;
+                if (s1 != s2 || (s1 == VOLCOMP_OK && DEC_NE("corrupted stream", a, b))) cor_ok = 0;
                 if (s1 == VOLCOMP_OK) ncor_dec++;
             }
         }
@@ -91,23 +95,34 @@ static int part2(const char *path) {
     for (int k = 0; k < nproc; k++) {
         if ((pid[k] = fork()) == 0) {
             uint8_t *buf = malloc(CV); uint64_t s = 1234 + (uint64_t)k; int wrong = 0, hits = 0;
-            if (!zshm_on()) _exit(3);
+            if (!zshm_on()) { fprintf(stderr, "zshm child %d: zshm_on failed (init timeout / no cache)\n", k); _exit(3); }
             for (int t = 0; t < 3000; t++) {
                 uint64_t key = lcg(&s) % 200; uint32_t sub = (uint32_t)(lcg(&s) % 32);
                 memset(buf, 0, CV);
                 if (zshm_get(key * 0x9e3779b97f4a7c15ull, ~key, sub, buf)) { hits++; if (!check_sub(buf, key, sub)) wrong++; }
                 else { fill_sub(buf, key, sub); zshm_put(key * 0x9e3779b97f4a7c15ull, ~key, sub, buf); }
             }
+            if (wrong || !hits) fprintf(stderr, "zshm child %d: %d hits, %d with wrong bytes%s\n", k, hits, wrong, hits ? "" : " (no hits)");
             _exit(wrong ? 1 : hits ? 0 : 2);
         }
     }
     int ok = 1;
-    for (int k = 0; k < nproc; k++) { int st; waitpid(pid[k], &st, 0); if (!WIFEXITED(st) || WEXITSTATUS(st)) ok = 0; }
+    static const char *why[] = {"ok", "wrong bytes", "no hits", "init timeout (zshm_on failed)"};
+    for (int k = 0; k < nproc; k++) {
+        int st; if (waitpid(pid[k], &st, 0) != pid[k]) { fprintf(stderr, "zshm child %d: waitpid failed\n", k); ok = 0; continue; }
+        if (!WIFEXITED(st) || WEXITSTATUS(st)) {
+            ok = 0;
+            if (WIFSIGNALED(st)) fprintf(stderr, "zshm child %d: killed by signal %d\n", k, WTERMSIG(st));
+            else if (WIFEXITED(st)) fprintf(stderr, "zshm child %d: exit %d (%s)\n", k, WEXITSTATUS(st), WEXITSTATUS(st) <= 3 ? why[WEXITSTATUS(st)] : "?");
+            else fprintf(stderr, "zshm child %d: status 0x%x\n", k, st);
+        }
+    }
     check("zshm: 6 processes x 3000 random get / put on ~60 slots: every hit has its bytes, hits happen", ok);
     if ((pid[0] = fork()) == 0) {   /* a fresh process stores; the parent (which never opened the cache) reads it back */
         uint8_t *buf = malloc(CV); fill_sub(buf, 4242, 5); zshm_put(4242, 77, 5, buf); _exit(zshm_on() ? 0 : 1);
     }
     int st; waitpid(pid[0], &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st)) fprintf(stderr, "zshm store child: status 0x%x (exit 1: zshm_on failed)\n", st);
     uint8_t *buf = calloc(1, CV);
     check("zshm: an entry stored by another process is a hit with the same bytes", WIFEXITED(st) && !WEXITSTATUS(st) && zshm_get(4242, 77, 5, buf) && check_sub(buf, 4242, 5));
     free(buf);

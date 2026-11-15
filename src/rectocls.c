@@ -8,6 +8,7 @@
    off by >= 0.5 turn for the classifier (argmax and expectation) and the baselines (every interval 1 turn; rounded density; rounded
    width / median neighbour width), the feature gains. Model file: text (header RRCLS1). */
 #include "rectoruler.h"
+#include "optcheck.h"
 #include "fit.h"
 #include <math.h>
 #include <stdio.h>
@@ -116,15 +117,15 @@ int cmd_recto_cls(int argc, char **argv) {
                                     "       ufsm recto-cls eval MODEL DUMP[,..]\n"); return 2; }
     const char *opt_test = nullptr; double ZB = 0, lr = 0.1, lam = 1; int ntree = 200, depth = 4, minleaf = 40, nbins = 64; int use[RR_NF]; for (int f = 0; f < RR_NF; f++) use[f] = 1;
     for (int i = 4; i + 1 < argc; i++) {
-        if (!strcmp(argv[i], "--test")) opt_test = argv[++i];
-        else if (!strcmp(argv[i], "--holdout-z")) ZB = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--trees")) ntree = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--depth")) depth = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--lr")) lr = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--lambda")) lam = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--min-leaf")) minleaf = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--bins")) nbins = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--drop")) { char b[512]; snprintf(b, sizeof b, "%s", argv[++i]); for (char *p = strtok(b, ","); p; p = strtok(nullptr, ",")) { const int f = atoi(p); if (f >= 0 && f < RR_NF) use[f] = 0; } }
+        if (!strcmp(argv[i], opt_n("--test"))) opt_test = argv[++i];
+        else if (!strcmp(argv[i], opt_n("--holdout-z"))) ZB = atof(argv[++i]);
+        else if (!strcmp(argv[i], opt_n("--trees"))) ntree = atoi(argv[++i]);
+        else if (!strcmp(argv[i], opt_n("--depth"))) depth = atoi(argv[++i]);
+        else if (!strcmp(argv[i], opt_n("--lr"))) lr = atof(argv[++i]);
+        else if (!strcmp(argv[i], opt_n("--lambda"))) lam = atof(argv[++i]);
+        else if (!strcmp(argv[i], opt_n("--min-leaf"))) minleaf = atoi(argv[++i]);
+        else if (!strcmp(argv[i], opt_n("--bins"))) nbins = atoi(argv[++i]);
+        else if (!strcmp(argv[i], opt_n("--drop"))) { char b[512]; snprintf(b, sizeof b, "%s", argv[++i]); for (char *p = strtok(b, ","); p; p = strtok(nullptr, ",")) { const int f = atoi(p); if (f >= 0 && f < RR_NF) use[f] = 0; } }
     }
     if (nbins > 255) nbins = 255;
     if (nbins < 4) nbins = 4;

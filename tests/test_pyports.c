@@ -9,6 +9,7 @@
 #include "imgops.h"
 #include "tiffw.h"
 #include "test_pyports_expected.h"
+#include "fm_tol.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,12 +75,15 @@ static void test_numerics(void) {
     for (int k = 0; k < 4; k++) {
         double t[11]; float tf[11]; memcpy(t, v, sizeof t); memcpy(tf, u, sizeof tf);
         const double a = np_percentile_f64(t, 11, q[k]); const float b = np_percentile_f32(tf, 11, (float)q[k]);
-        CHECK(a == exp_pct64[k], "percentile64 %g: %.17g, numpy %.17g", q[k], a, exp_pct64[k]);
-        CHECK(b == exp_pct32[k], "percentile32 %g: %.9g, numpy %.9g", q[k], b, exp_pct32[k]);
+        /* numpy's values exactly under UFSM_STRICT_MATH; fast math (contracted interpolation): ~2 ulp, rel 1e-15 / 2.4e-7 (tests/fm_tol.h) */
+        CHECK(FM_STRICT ? a == exp_pct64[k] : fm_close(a, exp_pct64[k], 1e-15, 0), "percentile64 %g: %.17g, numpy %.17g", q[k], a, exp_pct64[k]);
+        CHECK(FM_STRICT ? b == exp_pct32[k] : fm_close(b, exp_pct32[k], 2.4e-7, 0), "percentile32 %g: %.9g, numpy %.9g", q[k], b, exp_pct32[k]);
     }
     float g[6 * 9]; lcg_s = 3; for (int i = 0; i < 6 * 9; i++) g[i] = (float)(lcg() % 1000) / 37.f;
     scipy_gaussian_f32(g, 6, 9, 1.5);
-    int bad = 0; for (int i = 0; i < 6 * 9; i++) bad += g[i] != exp_gauss[i];
+    /* scipy's values exactly under UFSM_STRICT_MATH; fast math (the input's / 37.f is a reciprocal multiply, the filter sums
+       reassociate): rel 1e-6 */
+    int bad = 0; for (int i = 0; i < 6 * 9; i++) bad += FM_STRICT ? g[i] != exp_gauss[i] : !fm_close(g[i], exp_gauss[i], 1e-6, 1e-6);
     CHECK(!bad, "gaussian_filter: %d of 54 values differ from scipy", bad);
 }
 

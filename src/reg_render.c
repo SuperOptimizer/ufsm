@@ -28,6 +28,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <errno.h>
+#include <unistd.h>
 
 int reg_load_map(const char *path, const char *cache, rvol **cv, rvol **fv, rmap *m, rfield *D);   /* src/reg_view.c */
 
@@ -497,12 +499,13 @@ int cmd_reg_render(int argc, char **argv) {
         pthread_t th2[64]; const int T2 = j->threads < 1 ? 1 : j->threads > 64 ? 64 : j->threads;
         for (int t = 0; t < T2; t++) pthread_create(&th2[t], nullptr, sample_worker, &sj);
         for (int t = 0; t < T2; t++) pthread_join(th2[t], nullptr);
-        char sp2[2100]; snprintf(sp2, sizeof sp2, "%s/samples.bin", od); FILE *sf = fopen(sp2, "wb");
+        char sp2[2100]; snprintf(sp2, sizeof sp2, "%s/samples.bin", od); FILE *sf = fopen(sp2, "wb");   /* (a NULL fopen crashed in fwrite and short writes went unseen; audit mini/errpaths 8) */
         char hdr[4096]; int hl = snprintf(hdr, sizeof hdr, "{\"samples\":%zu,\"scans\":[", nsm);
         for (int s2 = 0; s2 < j->ns; s2++) hl += snprintf(hdr + hl, sizeof hdr - hl, "%s\"%s\"", s2 ? "," : "", j->sc[s2].name);
         hl += snprintf(hdr + hl, sizeof hdr - hl, "],\"variants\":[\"native\",\"matched\"],\"depth\":[%d,%d],\"record\":\"class u8 (1 no-ink, 2 ink), certified u8 per scan, then [variant][scan][layer] u8 raw (0 missing)\"}\n", d0, d1);
-        fwrite(hdr, 1, hl, sf); fwrite(sv, rec, nsm, sf); fclose(sf);
-        fprintf(stderr, "reg render: %zu depth samples (%d layers) -> %s\n", nsm, nl, sp2);
+        int sok = sf && fwrite(hdr, 1, hl, sf) == (size_t)hl && fwrite(sv, rec, nsm, sf) == nsm; if (sf) sok &= fclose(sf) == 0;
+        if (sok) fprintf(stderr, "reg render: %zu depth samples (%d layers) -> %s\n", nsm, nl, sp2);
+        else { fprintf(stderr, "reg render: writing %s failed: %s\n", sp2, strerror(errno)); unlink(sp2); }
         free(sv); free(sx);
     }
     for (int s2 = 0; s2 < j->ns; s2++) if (j->sc[s2].touch) {   /* touched shards: "sz sy sx" lines */
@@ -515,20 +518,20 @@ int cmd_reg_render(int argc, char **argv) {
     }
     /* normalisation, products */
     char p[2300]; FILE *st; snprintf(p, sizeof p, "%s/stats.json", od); st = fopen(p, "w");
-    fprintf(st, "{\"tifxyz\":\"%s\",\"half_res\":[%d,%d],\"crop\":[%d,%d],\"layers\":%d,\"composite\":[%d,%d,%d],\"base_voxel_um\":%.4g,\"pixel_um\":%.4g,\"cover_mm\":%.3g,\"tol_um\":%.3g,\"variants\":{", td, j->W, j->H, j->x0, j->y0, j->L, j->cop, j->cl0, j->cl1, base_um, j->px * base_um, cover_mm, tol_um);
+    json_fprintf(st, "{\"tifxyz\":\"%s\",\"half_res\":[%d,%d],\"crop\":[%d,%d],\"layers\":%d,\"composite\":[%d,%d,%d],\"base_voxel_um\":%.4g,\"pixel_um\":%.4g,\"cover_mm\":%.3g,\"tol_um\":%.3g,\"variants\":{", td, j->W, j->H, j->x0, j->y0, j->L, j->cop, j->cl0, j->cl1, base_um, j->px * base_um, cover_mm, tol_um);
     const char *vn[2] = {"native", "matched"};
     const json *rgb = json_get(cfg, "rgb"), *dif = json_get(cfg, "diff"), *bl = json_get(cfg, "baseline");
     uint8_t *img = malloc(NP * 3);
     for (int v = 0; v < 2; v++) {
-        float lut[MAXS][256]; fprintf(st, "%s\"%s\":{\"scans\":{", v ? "," : "", vn[v]);
+        float lut[MAXS][256]; json_fprintf(st, "%s\"%s\":{\"scans\":{", v ? "," : "", vn[v]);
         for (int s = 0; s < j->ns; s++) {
             double a, b; size_t cnt; pct(j->raw[v][s], NP, 0.01, 0.99, &a, &b, &cnt);
             for (int i = 0; i < 256; i++) lut[s][i] = i ? (float)fmin(1, fmax(0, (i - a) / (b - a))) : -1.f;
-            fprintf(st, "%s\"%s\":{\"coverage\":%.4f,\"p1\":%g,\"p99\":%g}", s ? "," : "", j->sc[s].name, (double)cnt / NP, a, b);
+            json_fprintf(st, "%s\"%s\":{\"coverage\":%.4f,\"p1\":%g,\"p99\":%g}", s ? "," : "", j->sc[s].name, (double)cnt / NP, a, b);
             for (size_t i = 0; i < NP; i++) { const float x = lut[s][j->raw[v][s][i]]; img[3 * i] = img[3 * i + 1] = img[3 * i + 2] = x < 0 ? 0 : (uint8_t)(x * 254 + 1); }
             snprintf(p, sizeof p, "%s/%s_%s.jpg", od, vn[v], j->sc[s].name); write_jpg(p, j->W, j->H, img, 90);
         }
-        fprintf(st, "}");
+        json_fprintf(st, "}");
         /* differences: the common symmetric gain = 127 / max over the diff pairs and the baseline of the 99th percentile |a - b| */
         int dp[4][2]; int nd = 0;
         for (size_t k = 0; dif && k < dif->n && k < 3; k++) { dp[nd][0] = find_scan(j, json_str(json_at(json_at(dif, k), 0), "")); dp[nd][1] = find_scan(j, json_str(json_at(json_at(dif, k), 1), "")); nd++; }
@@ -544,9 +547,9 @@ int cmd_reg_render(int argc, char **argv) {
         }
         double gmax = 1e-3; for (int k = 0; k < nd; k++) gmax = fmax(gmax, p99[k]);
         const double gain = 127 / gmax;
-        fprintf(st, ",\"diff_gain\":%.4f,\"diffs\":[", gain);
-        for (int k = 0; k < nd; k++) fprintf(st, "%s{\"a\":\"%s\",\"b\":\"%s\",\"baseline\":%d,\"pixels\":%zu,\"mean\":%.4f,\"p50_abs\":%.4f,\"p99_abs\":%.4f}", k ? "," : "", dp[k][0] >= 0 ? j->sc[dp[k][0]].name : "?", dp[k][1] >= 0 ? j->sc[dp[k][1]].name : "?", k >= nb3, dn[k], mean[k], p50[k], p99[k]);
-        fprintf(st, "]}");
+        json_fprintf(st, ",\"diff_gain\":%.4f,\"diffs\":[", gain);
+        for (int k = 0; k < nd; k++) json_fprintf(st, "%s{\"a\":\"%s\",\"b\":\"%s\",\"baseline\":%d,\"pixels\":%zu,\"mean\":%.4f,\"p50_abs\":%.4f,\"p99_abs\":%.4f}", k ? "," : "", dp[k][0] >= 0 ? j->sc[dp[k][0]].name : "?", dp[k][1] >= 0 ? j->sc[dp[k][1]].name : "?", k >= nb3, dn[k], mean[k], p50[k], p99[k]);
+        json_fprintf(st, "]}");
         /* RGB of the energies */
         int rg[3] = {-1, -1, -1}; for (int c = 0; c < 3 && rgb; c++) rg[c] = find_scan(j, json_str(json_at(rgb, c), ""));
         if (rg[0] >= 0 && rg[1] >= 0 && rg[2] >= 0) {
@@ -565,7 +568,7 @@ int cmd_reg_render(int argc, char **argv) {
             snprintf(p, sizeof p, "%s/%s_baseline.jpg", od, vn[v]); write_jpg(p, j->W, j->H, img, 90);
         }
     }
-    fprintf(st, "}}\n"); fclose(st);
+    json_fprintf(st, "}}\n"); fclose(st);
     /* coverage: R G B = the rgb scans present (native) */
     { int rg[3] = {-1, -1, -1}; for (int c = 0; c < 3 && rgb; c++) rg[c] = find_scan(j, json_str(json_at(rgb, c), ""));
       for (size_t i = 0; i < NP; i++) for (int c = 0; c < 3; c++) img[3 * i + c] = rg[c] >= 0 && j->raw[0][rg[c]][i] ? 200 : 0;

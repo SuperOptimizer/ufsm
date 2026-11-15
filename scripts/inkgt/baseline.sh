@@ -20,7 +20,8 @@ for c in $CR/w*_? $D/evcrops/PHerc*; do
   elif [ "$P" = ink3dext ]; then v=$o/vol/$n; pr=$v; pk=$gk
     [ -s $v/$gk/zarr.json ] || mc -m 24G $U ink3d-ext --weights /vesuvius/ufsm/teachers/dino3d/ckpt_78k_fullsup.pth --ct $M $key --ct-um $um --box $box --out $v --out-um $gk --gpu $GPU --cache $CACHE > $o/ink_$n.log 2>&1 || { echo "FAIL predict $n"; continue; }
   else ck=$(echo $P | cut -d: -f2); ch=$(echo $P | cut -d: -f3); v=$o/vol/$n; pr=$v; pk=$gk
-    [ -s $v/$pk/zarr.json ] || mc -m 40G $U predict $ck $M $key $v --um $um --level 1 --box $box1 --full-grid 1 --channel $ch --gpu $GPU --threads 6 --cache $CACHE > $o/ink_$n.log 2>&1 || { echo "FAIL predict $n"; continue; }
+    sc=PHercParis4; case $n in PHerc*) sc=${n%%_*};; esac; AXF=$(bash $(dirname $(readlink -f $0))/../unroll/axis_for.sh $sc) || { echo "FAIL axis $n"; continue; }
+    [ -s $v/$pk/zarr.json ] || mc -m 40G $U predict $ck $M $key $v --um $um --level 1 --box $box1 --full-grid 1 --channel $ch $AXF --gpu $GPU --threads 6 --cache $CACHE > $o/ink_$n.log 2>&1 || { echo "FAIL predict $n"; continue; }
   fi
   $U ink-vscore --gt $D/evgt/$n.zarr $gk --pred $pr $pk --box $box --row $n --cache $CACHE 2>> $o/vscore.log >> $o/vscores.tsv
   if [ "$P" != ct ]; then

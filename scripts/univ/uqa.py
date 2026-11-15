@@ -14,6 +14,7 @@ Metrics (one tab row, header first, -> OUTDIR/uqa.tsv; a PNG of the mid-z slice 
   contrast   (CT mean on the band - CT mean mid-gap) / CT sd                                                     higher
   sp_um      median sheet spacing 1 / |grad W| (um);  sp_cv  its robust spread (IQR / median) on papyrus      lower = regular spacing
   jumps      share of grid steps where W jumps by > 0.25 turn (the fit's tears / slips)                          lower
+  jumps_n    share of grid steps whose W step differs from the next by > 0.25 turn (tears; packed sheets pass)  lower (unvalidated)
   nrm_deg    median angle between the sheet normals (grad W) of neighbouring grid points;  nrm30  share > 30 deg   lower = smooth
   rv_agree   (RV) share of confident rv voxels (|rv - 128| > 32) in the band whose side agrees with the phase: recto on the inner face
              (frac W just below phi: W grows outward), 0.5 = no relation, < 0.5 = the convention inverted          higher
@@ -69,6 +70,14 @@ def main():
         return x, ok[tuple(hi)] & ok[tuple(lo)]
     dz, mz = dif(0); dy, my = dif(1); dx, mx = dif(2)
     jumps = np.concatenate([np.abs(dz[mz]), np.abs(dy[my]), np.abs(dx[mx])]); r['jumps'] = float((jumps > 0.25).mean()) if jumps.size else np.nan
+    # jumps_n (audit eval#17, unvalidated): tears as discontinuities of the gradient, not its size. jumps counts every step over 0.25 turn,
+    # so packed sheets closer than ~70-75 um score as tears once a fit resolves them; here a step counts when it differs from the next step
+    # along the same axis by over 0.25 turn (a smooth dense gradient passes, a slip spikes). Info only until uqa_validate.py has packed boxes.
+    def dd(x, m, ax):
+        n_ = x.shape[ax]; a_ = np.take(x, range(1, n_), axis=ax); b_ = np.take(x, range(0, n_ - 1), axis=ax)
+        ma = np.take(m, range(1, n_), axis=ax) & np.take(m, range(0, n_ - 1), axis=ax); y = (a_ - b_ + 0.5) % 1.0 - 0.5
+        return np.abs(y[ma])
+    jn = np.concatenate([dd(dz, mz, 0), dd(dy, my, 1), dd(dx, mx, 2)]); r['jumps_n'] = float((jn > 0.25).mean()) if jn.size else np.nan
     G = np.stack([dz[:, :-1, :-1], dy[:-1, :, :-1], dx[:-1, :-1, :]]); M = mz[:, :-1, :-1] & my[:-1, :, :-1] & mx[:-1, :-1, :]
     M &= (np.abs(G) < 0.25).all(0)   # (no tears inside the cell)
     gn = np.sqrt((G ** 2).sum(0)); M &= gn > 1e-6
@@ -91,8 +100,9 @@ def main():
     if '--ink' in kv:
         ink = pool(cube(kv['--ink'], n), S, g); ik = ok & (ink > 127) & (ink < 255)
         if ik.any(): r['ink_air'] = float((~pap[ik]).mean()); r['ink_band'] = float((d0[ik] < 0.15).mean())
-    keys = ['box', 'ok', 'thr', 'h1', 'phi', 'on_pap', 'gap_void', 'contrast', 'sp_um', 'sp_cv', 'jumps', 'nrm_deg', 'nrm30', 'rv_agree', 'ink_air', 'ink_band']
+    keys = ['box', 'ok', 'thr', 'h1', 'phi', 'on_pap', 'gap_void', 'contrast', 'sp_um', 'sp_cv', 'jumps', 'nrm_deg', 'nrm30', 'rv_agree', 'ink_air', 'ink_band', 'jumps_n']
     fn = os.path.join(out, 'uqa.tsv'); new = not os.path.exists(fn)
+    if not new and 'jumps_n' not in open(fn).readline().split('\t'): keys = keys[:-1]   # (an older uqa.tsv: its columns kept)
     with open(fn, 'a') as fo:
         if new: fo.write('\t'.join(keys) + '\n')
         fo.write('\t'.join(str(r[k]) if isinstance(r[k], (str, int)) else ('na' if np.isnan(r[k]) else f'{r[k]:.4f}') for k in keys) + '\n')

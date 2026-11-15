@@ -1,5 +1,6 @@
 /* SLIM flattening of tifxyz wraps: see src/flatten.h. CLI: ufsm flatten, ufsm flatten-warp (end of file). */
 #include "flatten.h"
+#include "optcheck.h"
 #include "sysinfo.h"
 #include "imgops.h"
 #include "tiffw.h"
@@ -627,7 +628,7 @@ long flat_fill_holes(float *a[5], int w, int h, long maxv, uint8_t *filled) {
 }
 
 /* ---- CLI ---- */
-static const char *fopt(int argc, char **argv, const char *name, const char *def) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1]; return def; }
+static const char *fopt(int argc, char **argv, const char *name, const char *def) { for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1]; return def; }
 static double meta_num(const char *m, const char *key, double def) { const char *q = m ? strstr(m, key) : nullptr; if (!q) return def; q += strlen(key); while (*q == ' ' || *q == ':' || *q == '[') q++; return atof(q); }
 
 /* ufsm flatten <wraps-dir> <out-dir> [--wraps a,b,..] [--decim 1] [--iters 30] [--cg 200] [--min-verts 20000] [--out-step S]
@@ -647,14 +648,14 @@ static double meta_num(const char *m, const char *key, double def) { const char 
 int cmd_flatten(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm flatten <wraps-dir> <out-dir> [--wraps a,b,..] [--decim 1] [--iters 30] [--cg 200] [--min-verts 20000] [--out-step S] [--crop rect|none] [--max-aspect A] [--rects N] [--min-cm2 5] [--fill-holes 5000] [--max-edge 3] [--threads 16] [--gpu 1] [--sfc ERR] [--quiet 1]\n"); return 2; }
     flat_opts o = flat_opts_default();
-    o.decim = atoi(fopt(argc, argv, "--decim", "1")); o.iters = atoi(fopt(argc, argv, "--iters", "30")); o.cg_iters = atoi(fopt(argc, argv, "--cg", "200"));
-    o.min_verts = atoi(fopt(argc, argv, "--min-verts", "20000")); o.max_edge = atof(fopt(argc, argv, "--max-edge", "3")); o.nthreads = ufsm_threads(atoi(fopt(argc, argv, "--threads", "0")), 16);
-    o.verbose = !atoi(fopt(argc, argv, "--quiet", "0")); o.gpu = atoi(fopt(argc, argv, "--gpu", "1"));
-    const double ostep_opt = atof(fopt(argc, argv, "--out-step", "0")); const int crop = strcmp(fopt(argc, argv, "--crop", "rect"), "none") != 0;
+    o.decim = opt_atoi("--decim", fopt(argc, argv, "--decim", "1")); o.iters = opt_atoi("--iters", fopt(argc, argv, "--iters", "30")); o.cg_iters = opt_atoi("--cg", fopt(argc, argv, "--cg", "200"));
+    o.min_verts = opt_atoi("--min-verts", fopt(argc, argv, "--min-verts", "20000")); o.max_edge = opt_atof("--max-edge", fopt(argc, argv, "--max-edge", "3")); o.nthreads = ufsm_threads(opt_atoi("--threads", fopt(argc, argv, "--threads", "0")), 16);
+    o.verbose = !opt_atoi("--quiet", fopt(argc, argv, "--quiet", "0")); o.gpu = opt_atoi("--gpu", fopt(argc, argv, "--gpu", "1"));
+    const double ostep_opt = opt_atof("--out-step", fopt(argc, argv, "--out-step", "0")); const int crop = strcmp(fopt(argc, argv, "--crop", "rect"), "none") != 0;
     const char *wl = fopt(argc, argv, "--wraps", nullptr); char *want = nullptr; if (wl) { want = malloc(strlen(wl) + 3); sprintf(want, ",%s,", wl); }
-    const double sfc = atof(fopt(argc, argv, "--sfc", "0")); const long maxhole = atol(fopt(argc, argv, "--fill-holes", "5000"));
-    const double maxasp = atof(fopt(argc, argv, "--max-aspect", "0")), mincm2 = atof(fopt(argc, argv, "--min-cm2", "5"));
-    int nrect = atoi(fopt(argc, argv, "--rects", "1")); if (nrect < 1) nrect = 1; if (nrect > 16) nrect = 16;
+    const double sfc = opt_atof("--sfc", fopt(argc, argv, "--sfc", "0")); const long maxhole = opt_atol("--fill-holes", fopt(argc, argv, "--fill-holes", "5000"));
+    const double maxasp = opt_atof("--max-aspect", fopt(argc, argv, "--max-aspect", "0")), mincm2 = opt_atof("--min-cm2", fopt(argc, argv, "--min-cm2", "5"));
+    int nrect = opt_atoi("--rects", fopt(argc, argv, "--rects", "1")); if (nrect < 1) nrect = 1; if (nrect > 16) nrect = 16;
     DIR *dd = opendir(argv[2]); if (!dd) { fprintf(stderr, "flatten: cannot open %s\n", argv[2]); return 1; }
     char cmd[1500]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", argv[3]); if (system(cmd)) return 1;
     struct dirent *de; int nw = 0, rc = 0;
@@ -766,7 +767,7 @@ int cmd_flatten(int argc, char **argv) {
    --scale S gives that flat tifxyz), bilinear; 0 outside. For renders whose volume is no longer available (published ink). */
 int cmd_flatten_warp(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: ufsm flatten-warp <in.jpg|in.tif> <flat-wrap-dir> <out.jpg|out.tif> --src-px P [--scale S] [--quality 90]\n"); return 2; }
-    const double P = atof(fopt(argc, argv, "--src-px", "0")), S = atof(fopt(argc, argv, "--scale", "1"));
+    const double P = opt_atof("--src-px", fopt(argc, argv, "--src-px", "0")), S = opt_atof("--scale", fopt(argc, argv, "--scale", "1"));
     if (!(P > 0) || !(S > 0)) { fprintf(stderr, "flatten-warp: --src-px P > 0, --scale S > 0\n"); return 2; }
     const char *in = argv[2]; const size_t il = strlen(in); int iw, ih; uint8_t *im = nullptr;
     if (il > 4 && (!strcmp(in + il - 4, ".jpg") || !strcmp(in + il - 5, ".jpeg"))) {
@@ -794,7 +795,7 @@ int cmd_flatten_warp(int argc, char **argv) {
     const char *o = argv[4]; const size_t ol = strlen(o); int rc = 0;
     if (ol > 4 && !strcmp(o + ol - 4, ".tif")) rc = tiffw_write(o, ow, oh, 1, out, 1);
     else { uint8_t *rgb = malloc((size_t)ow * oh * 3); for (size_t i = 0; i < (size_t)ow * oh; i++) rgb[3 * i] = rgb[3 * i + 1] = rgb[3 * i + 2] = out[i];
-           rc = jpeg_write_rgb(o, ow, oh, rgb, atoi(fopt(argc, argv, "--quality", "90"))); free(rgb); }
+           rc = jpeg_write_rgb(o, ow, oh, rgb, opt_atoi("--quality", fopt(argc, argv, "--quality", "90"))); free(rgb); }
     if (rc) fprintf(stderr, "flatten-warp: cannot write %s\n", o); else fprintf(stderr, "flatten-warp: %s %dx%d\n", o, ow, oh);
     free(im); free(gu); free(gv); free(out);
     return rc ? 1 : 0;

@@ -17,8 +17,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "fm_tol.h"
 
 static int fails;
+/* Fast math (the default build, DESIGN 2026-11-14): the expected CT / ink values are interpolations at exact .5 positions, and the
+   z 22.5 band is an exact tie between the two sheets (both 2.5 voxels away). The fast-math sampling (and nn_render's approximate
+   sqrt / division under RENDER_GPU) may land a hair off: a value within 1, and the tie either way (sheet A: flag 2, CT 100, ink 100;
+   sheet B: RFILL_NEG + 2, CT 110, ink 40). Exact under -DUFSM_STRICT_MATH=ON. */
+static int near1(int a, int b) { return a == b || (!FM_STRICT && abs(a - b) <= 1); }
+static int tie_ok(int f, int ct, int ink, int ef, int ect, int eink) {
+    if (f == ef && near1(ct, ect) && near1(ink, eink)) return 1;
+    if (FM_STRICT || ef == RFILL_EMPTY) return 0;
+    return (f == 2 && near1(ct, 100) && near1(ink, 100)) || (f == RFILL_NEG + 2 && near1(ct, 110) && near1(ink, 40));
+}
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
 
 int main(void) {
@@ -69,10 +80,10 @@ int main(void) {
         const render_fill F = {cs[k].n, 1, cs[k].prefer, fls, nullptr};
         CHECK(!render_wraps_chunked_fill(zz, 2, dp, 1, Xs, Ys, Zs, w, h, gs, im, ow, oh, nullptr, (size_t)1 << 30, 2, 2, 0, &F), "fill render %zu", k);
         for (int r = 0; r < rg + 4; r++) for (int c = 0; c < 17; c++) {   /* the z 22 band (columns 0..16 avoid the transition) */
-            CHECK(PX(fl, c, r) == cs[k].fa && PX(im[1], c, r) == cs[k].cta && PX(im[0], c, r) == cs[k].inka, "case %zu z 22 px %d,%d: flag %d ct %d ink %d", k, c, r, PX(fl, c, r), PX(im[1], c, r), PX(im[0], c, r));
+            CHECK(PX(fl, c, r) == cs[k].fa && near1(PX(im[1], c, r), cs[k].cta) && near1(PX(im[0], c, r), cs[k].inka), "case %zu z 22 px %d,%d: flag %d ct %d ink %d", k, c, r, PX(fl, c, r), PX(im[1], c, r), PX(im[0], c, r));
         }
         for (int r = 0; r < rg + 4; r++) for (int c = 21; c < ow; c++) {   /* the z 22.5 band */
-            CHECK(PX(fl, c, r) == cs[k].fb && PX(im[1], c, r) == cs[k].ctb && PX(im[0], c, r) == cs[k].inkb, "case %zu z 22.5 px %d,%d: flag %d ct %d ink %d", k, c, r, PX(fl, c, r), PX(im[1], c, r), PX(im[0], c, r));
+            CHECK(tie_ok(PX(fl, c, r), PX(im[1], c, r), PX(im[0], c, r), cs[k].fb, cs[k].ctb, cs[k].inkb), "case %zu z 22.5 px %d,%d: flag %d ct %d ink %d", k, c, r, PX(fl, c, r), PX(im[1], c, r), PX(im[0], c, r));
         }
         size_t on = 0, none = 0, sameon = 1;
         for (size_t i = 0; i < no; i++) {
@@ -82,6 +93,19 @@ int main(void) {
         CHECK(on > 100 && sameon, "case %zu: %zu on-surface pixels, equal to the plain render: %d", k, on, (int)sameon);
         CHECK(none > 0 && PX(fl, 2, oh - 1) == RFILL_NONE, "case %zu: invalid vertices -> RFILL_NONE (%zu)", k, none);
         CHECK(PX(fl, ca, rs) == RFILL_ON, "case %zu: sheet row on the surface", k);
+    }
+    {   /* --fill-ct above sheet A's CT (200 < 201): sheet A counts as void like air (the render default 80 treats unmasked air between sheets
+           as void, urender audit 11-14 #2): both gap bands move to sheet B (CT 220, ink 40) 3 voxels away, and the rows on sheet A find
+           nothing >= 201 within 4 voxels (still empty) */
+        for (int v = 0; v < 2; v++) memset(im[v], 0, no);
+        memset(fl, RFILL_NONE, no);
+        const render_fill F = {4, 201, 0, fls, nullptr};
+        CHECK(!render_wraps_chunked_fill(zz, 2, dp, 1, Xs, Ys, Zs, w, h, gs, im, ow, oh, nullptr, (size_t)1 << 30, 2, 2, 0, &F), "fill render thr 201");
+        int ok = 1;
+        for (int r = 0; r < rg + 4; r++) for (int c = 0; c < ow; c++) if (c < 17 || c >= 21)
+            ok &= PX(fl, c, r) != RFILL_ON && PX(fl, c, r) != RFILL_EMPTY && PX(im[1], c, r) == 220 && PX(im[0], c, r) == 40;
+        CHECK(ok, "thr 201: gap bands not moved to sheet B (px %d,%d: flag %d ct %d ink %d)", ca, rg, PX(fl, ca, rg), PX(im[1], ca, rg), PX(im[0], ca, rg));
+        CHECK(PX(fl, ca, rs) == RFILL_EMPTY, "thr 201: a row on sheet A (CT 200) is void with nothing in reach: flag %d", PX(fl, ca, rs));
     }
     {   /* n = 0: flags only, the images of the plain render */
         for (int v = 0; v < 2; v++) memset(im[v], 0, no);

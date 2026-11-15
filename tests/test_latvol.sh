@@ -14,7 +14,7 @@
 # Usage: test_latvol.sh <ufsm binary> <make_wind_fixture binary> [<test_latvol_nolink binary>]
 set -u
 U=$1 F=$2
-D=$(mktemp -d /tmp/test_latvol_XXXXXX)
+D=$(mktemp -d "${TMPDIR:-/tmp}/test_latvol_XXXXXX")
 SRV=
 fail() { echo "FAIL: $*"; echo "kept $D"; [ -n "$SRV" ] && kill "$SRV" 2> /dev/null; exit 1; }
 "$F" "$D/fx" 256 2 1 > "$D/fx.log" 2>&1 || fail "fixture"

@@ -125,6 +125,46 @@ int main(void) {
         check("grown net computes the donor's mapped outputs", emax < 1e-3);
         free(h); free(od); free(og); nn_free(dx); unet_free(donor); unet_free(grown);
     }
+    {   /* non-finite weights (ops audit #10): unet_save refuses (-2) and leaves the previous file whole, no .tmp behind */
+        unet *u = unet_create(&cfg); unet_init(u, 3);
+        check("save a good state", unet_save(u, a, 5, nullptr) == 0);
+        const size_t n = unet_nparams(u); float *g = calloc(n, 4); g[n / 2] = NAN; unet_grad_h2d(u, g); free(g);
+        update(u, 0, 6);
+        char tp[120]; snprintf(tp, sizeof tp, "%s.tmp", a);
+        check("non-finite weights: save refused", unet_save(u, a, 6, nullptr) == -2);
+        unet *r = unet_create(&cfg);
+        check("the previous checkpoint is intact", unet_load(r, a) == 5 && access(tp, F_OK) != 0);
+        unet_free(r); unet_free(u);
+    }
+    {   /* mini ckpt audit: the file read back before it replaces the old one, size checks on load, top-level keys only, optimizer state */
+        unet *u = unet_create(&cfg), *r = unet_create(&cfg); unet_init(u, 3); gradient(u, 5); update(u, 0, 1);
+        check("save a good state", unet_save(u, a, 7, "{\"runtime_note\":1}") == 0);
+        char tp[120]; snprintf(tp, sizeof tp, "%s.tmp", a);
+        check("truncated extra: save refused, previous kept", unet_save(u, a, 8, "{\"uw\":{\"t\":3,\"s\":[1,2") < 0 && unet_load(r, a) == 7 && access(tp, F_OK) != 0);
+        check("extra key named like an optional top-level key is ignored", unet_save(u, b, 9, "{\"lat_c\":5,\"gn_ema\":1,\"nparams\":3}") == 0 && unet_load(r, b) == 9);
+        FILE *f = fopen(a, "rb"); char *line = malloc(1 << 17); const int got = f && fgets(line, 1 << 17, f) != nullptr; const long off = f ? ftell(f) : 0;
+        const size_t n = unet_nparams(u), bytes = 4 * n * 4; char *pay = malloc(bytes); const int gotp = got && fread(pay, 1, bytes, f) == bytes; if (f) fclose(f);
+        check("read the saved file", got && gotp && off > 0);
+        FILE *t = fopen(cut, "wb"); fputs(line, t); fwrite(pay, 1, bytes - 4 * n / 2, t); fclose(t);   /* cut halfway through v */
+        check("file cut inside the AdamW moments: load fails", unet_load(r, cut) < 0);
+        t = fopen(cut, "wb"); fputs(line, t); fwrite(pay, 1, bytes + 4, t); fclose(t);
+        check("file with trailing bytes: load fails", unet_load(r, cut) < 0);
+        t = fopen(cut, "wb"); fputs(line, t); fwrite(pay, 1, 2 * 4 * n, t); fclose(t);
+        check("weights-only file loads", unet_load(r, cut) == 7);
+        /* an AdamW checkpoint resumed under Muon (audit #4 case B): the momentum (aliased into v's matrix slice) starts at zero, not at
+           Adam's v. A file with v = 1 everywhere against the weights-only file (m = v = 0): the Muon matrices must move identically;
+           only the AdamW-handled rest (biases, norms, the 1^3 head) may differ */
+        t = fopen(cut, "wb"); fputs(line, t); fwrite(pay, 1, 3 * 4 * n, t); { float one = 1.f; for (size_t i = 0; i < n; i++) fwrite(&one, 4, 1, t); } fclose(t);
+        FILE *t2 = fopen(old, "wb"); fputs(line, t2); fwrite(pay, 1, 2 * 4 * n, t2); fclose(t2);
+        unet *m1 = unet_create(&cfg), *m2 = unet_create(&cfg);
+        check("AdamW state with v = 1 loads", unet_load(m1, cut) == 7); check("weights-only loads", unet_load(m2, old) == 7);
+        gradient(m1, 11); gradient(m2, 11); update(m1, 1, 8); update(m2, 1, 8);
+        float *w1 = malloc(4 * n), *w2 = malloc(4 * n); nn_sync(); nn_d2h(w1, unet_live_params(m1), 4 * n); nn_d2h(w2, unet_live_params(m2), 4 * n);
+        size_t ndiff = 0; for (size_t i = 0; i < n; i++) ndiff += w1[i] != w2[i];
+        printf("  AdamW checkpoint (v = 1) under Muon: %zu of %zu weights differ from the zero-state run\n", ndiff, n);
+        check("AdamW checkpoint under Muon: momentum starts at zero", ndiff < n / 4);
+        free(line); free(pay); free(w1); free(w2); unet_free(m1); unet_free(m2); unet_free(u); unet_free(r);
+    }
     const char *e = nn_check(); check("CUDA checks", !e); if (e) printf("%s\n", e);
     unlink(base); unlink(a); unlink(b); unlink(old); unlink(cut);
     return failures != 0;

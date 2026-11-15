@@ -240,6 +240,43 @@ int main(void) {
             }
             fit_fields_free(&sb);
         }
+        {   /* where the gauges come from (audit 11-14 #18): the same two slabs on fields whose material ends early. Material below row 36:
+               slab 1 has no ref cells (its ref rows 40..56 are empty) but overlap cells (rows 24..36): its gauge comes from the chain, right,
+               and --require-constrained 1 passes. Material below row 24: slab 1 has neither, so its gauge is unconstrained: the join warns,
+               --require-constrained 1 exits 3, and without it slab 1 keeps the chain's prediction (its own +3 gauge, not the old tie-break of
+               12 turns off) */
+            static const int cut[2] = {36, 24};
+            for (int c = 0; c < 2; c++) {
+                char fd2[340], o5[340]; snprintf(fd2, sizeof fd2, "%s/f%d", dir, cut[c]); snprintf(o5, sizeof o5, "%s/set5_%d", dir, cut[c]);
+                uint8_t *w9 = a[9], *wc = malloc(n); for (size_t i = 0; i < n; i++) wc[i] = (int)(i / ((size_t)H * W)) < cut[c] ? a[9][i] : 0;
+                a[9] = wc; CHECK(!fit_fields_save(fd2, org, shape, (int)H8, 2.4, a, cy, cx, na), "save fields cut %d", cut[c]); a[9] = w9;
+                char *av5[] = {"ufsm", "fit-join", o5, fd2, "--ref", ref, "--require-constrained", "1", m0, "0", "256", m1, "256", "512"};
+                const int rc = cmd_fit_join(14, av5);
+                if (c == 0) {
+                    CHECK(rc == 0, "fit-join on material < row 36 (slab 1 from the chain): exit %d", rc);
+                    fit_set *S5 = fit_set_load(o5); CHECK(S5 != nullptr, "load the cut-36 join");
+                    if (S5) { const double acc = ids_true(S5, wc, H, W, n, H8, W_true); printf("fit-join, slab 1 gauge from the chain only: ids right %.4f\n", acc);
+                              CHECK(acc >= 0.99, "fit-join slab 1 from the chain: ids right %.4f < 0.99", acc); fit_set_free(S5); }
+                } else {
+                    CHECK(rc == 3, "fit-join --require-constrained 1 with an unconstrained slab: exit %d, want 3", rc);
+                    char *av6[] = {"ufsm", "fit-join", o5, fd2, "--ref", ref, m0, "0", "256", m1, "256", "512"};
+                    CHECK(cmd_fit_join(12, av6) == 0, "fit-join with an unconstrained slab (warn only)");
+                    fit_set *S6 = fit_set_load(o5); CHECK(S6 != nullptr, "load the cut-24 join");
+                    if (S6) {   /* slab 1 (z >= 256 + blend) relative to slab 0 (z < 192): the injected +3, as the chain predicts it */
+                        double d0 = 0, d1 = 0; int n0 = 0, n1 = 0;
+                        for (size_t i = 0; i < n; i += 7) { if (!a[9][i]) continue;
+                            const int z = (int)(i / ((size_t)H * W)), y = (int)((i / W) % H), x = (int)(i % W); const double pz = (z + 0.5) * H8, py = (y + 0.5) * H8, px = (x + 0.5) * H8;
+                            const double d = fit_set_W(S6, pz, py, px) - W_true(pz, py, px);
+                            if (pz < 192) { d0 += d; n0++; } else if (pz >= 300) { d1 += d; n1++; } }
+                        const double g = n0 && n1 ? d1 / n1 - d0 / n0 : 99;
+                        printf("fit-join, unconstrained slab 1: its gauge %+.2f turns from slab 0's (the chain prediction keeps its own +3)\n", g);
+                        CHECK(fabs(g - 3) < 0.5, "unconstrained slab 1: gauge %+.2f from slab 0's, want +3 (the chain prediction)", g);
+                        fit_set_free(S6);
+                    }
+                }
+                free(wc);
+            }
+        }
         fit_set_free(S2); fit_set_free(R);
     }
     {   /* fit_join_solve (fit-join --global): 30 slabs, true gauges T; consecutive overlaps say T_k - T_k-1 except boundary 10, which says

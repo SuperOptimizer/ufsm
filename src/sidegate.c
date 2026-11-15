@@ -8,6 +8,7 @@
    --gt ROOT KEY (a published-GT phase on the same grid): the papyrus side agreement (both phases on the same half turn) of every
    (R, L bin) cell and of the kept set: the calibration table for choosing --runs / --len-um. */
 #include "band.h"
+#include "optcheck.h"
 #include "store.h"
 #include "sysinfo.h"
 #include "z3w.h"
@@ -21,7 +22,7 @@
 #include <string.h>
 
 static const char *sg_opt(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], name)) return argv[i + 1];
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }
 enum { SG_R = 6, SG_L = 8 };   /* runs 0..4, 5+ ; length bins */
@@ -116,16 +117,16 @@ int cmd_side_gate(int argc, char **argv) {
     sg_job J; memset(&J, 0, sizeof J); const char *cache = sg_opt(argc, argv, "--cache", nullptr);
     J.ph = z3_open(store_open(argv[2]), argv[3], cache); J.ct = z3_open(store_open(argv[4]), argv[5], cache);
     if (!J.ph || !J.ct) { fprintf(stderr, "side-gate: %s\n", z3_error()); return 1; }
-    J.iso = atoi(sg_opt(argc, argv, "--iso", "64")); J.cap = atoi(sg_opt(argc, argv, "--cap", "64")); J.B = atoi(sg_opt(argc, argv, "--block", "128"));
-    J.S = atoi(sg_opt(argc, argv, "--shard", "512")); J.H = J.cap + 2; J.um = atof(argv[7]); J.r0 = 1; J.r1 = 1; J.l0 = 0; J.l1 = 1e9;
+    J.iso = opt_atoi("--iso", sg_opt(argc, argv, "--iso", "64")); J.cap = opt_atoi("--cap", sg_opt(argc, argv, "--cap", "64")); J.B = opt_atoi("--block", sg_opt(argc, argv, "--block", "128"));
+    J.S = opt_atoi("--shard", sg_opt(argc, argv, "--shard", "512")); J.H = J.cap + 2; J.um = atof(argv[7]); J.r0 = 1; J.r1 = 1; J.l0 = 0; J.l1 = 1e9;
     if (*sg_opt(argc, argv, "--runs", "") && sscanf(sg_opt(argc, argv, "--runs", ""), "%d,%d", &J.r0, &J.r1) != 2) { fprintf(stderr, "side-gate: --runs A,B\n"); return 2; }
     if (*sg_opt(argc, argv, "--len-um", "") && sscanf(sg_opt(argc, argv, "--len-um", ""), "%lf,%lf", &J.l0, &J.l1) != 2) { fprintf(stderr, "side-gate: --len-um LO,HI\n"); return 2; }
     if (J.S % J.B || J.cap < 4 || !(J.um > 0)) { fprintf(stderr, "side-gate: bad options\n"); return 2; }
     const z3_meta *cm = z3_meta_of(J.ct), *pm = z3_meta_of(J.ph);
     for (int d = 0; d < 3; d++) { J.shape[d] = cm->shape[d]; J.bn[d] = cm->shape[d]; if (pm->shape[d] != cm->shape[d]) { fprintf(stderr, "side-gate: phase and CT shapes differ\n"); return 1; } }
     if (*sg_opt(argc, argv, "--box", "")) { long long v[6]; if (sscanf(sg_opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", v, v + 1, v + 2, v + 3, v + 4, v + 5) != 6) return 2; for (int d = 0; d < 3; d++) { J.bo[d] = v[d]; J.bn[d] = v[3 + d]; } }
-    for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], "--gt") && !(J.gt = z3_open(store_open(argv[i + 1]), argv[i + 2], cache))) { fprintf(stderr, "side-gate: --gt: %s\n", z3_error()); return 1; }
-    const int nt = ufsm_threads(atoi(sg_opt(argc, argv, "--threads", "0")), 16), noout = atoi(sg_opt(argc, argv, "--no-out", "0"));
+    for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--gt")) && !(J.gt = z3_open(store_open(argv[i + 1]), argv[i + 2], cache))) { fprintf(stderr, "side-gate: --gt: %s\n", z3_error()); return 1; }
+    const int nt = ufsm_threads(opt_atoi("--threads", sg_opt(argc, argv, "--threads", "0")), 16), noout = opt_atoi("--no-out", sg_opt(argc, argv, "--no-out", "0"));
     z3w *w = nullptr;
     if (!noout) {
         char lv[32], od[1400], at[600]; z3w_level_name(J.um, lv, sizeof lv); snprintf(od, sizeof od, "%s/%s", argv[6], lv);
