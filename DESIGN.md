@@ -1828,6 +1828,13 @@ From the targeted audit (/vesuvius/ufsm/audit-20261114/targeted/gnorm.md); corre
   units compiled with the build's flags: 0 contracted fma / mad, 0 add / sub / mul without `.rn` (nn_gpuenc's one fma is its
   explicit `__fmaf_rn`). Library calls left: nn_cf atan2 / hypot / pow / sin / cos / sincos (mcc's libm, not libdevice; its test
   has tolerances), lround / llround / lroundf (exact). No mcc fix needed; the suite on the mcc build is the proof.
+- LTO / PGO under mcc (2026-11-15, microc lto-20261114 in main 87d9c98: -flto through the system link, sys_lto; .mcc.ir
+  SHF_EXCLUDE; -fprofile-generate run time in glibc libmcc.a): ufsm builds, links and passes the CPU suite with `-flto`,
+  `-fprofile-generate` and `-fprofile-use` (UFSM_EXTRA_CFLAGS). 78 single-thread CPU suite lines, cycles:u, min of 2, profile
+  from one suite pass: plain 1016.9 G, -flto 1062.6 (+4.5 %: test_zcache +22 %, test_phase_interp +17 %, test_volcomp_fast
+  +12 %; test_spatial_augment part1 -28 %), -fprofile-use 1014.3 (-0.25 %; surflabels -6 %, score_par +8 %), both 1034.4
+  (+1.7 %); the instrumented build ran ~32x slower. Decision: UFSM_LTO / PGO stay off under UFSM_TOOLCHAIN=mcc; the train
+  step is GPU-bound, so the kernels come first.
 - JIT warm-up: `scripts/toolchain/jit_warm.sh BIN [N]` (a no-op for nvcc builds), used by `scripts/pod/setup.sh` on every run
   (also NOBUILD=1: the cache key is PTX + GPU name + driver version) and by the mcc build's `jit-warm` target.
 - PTX size, release flags (no UFSM_ALL_TYPES), mcc 953a5f2-era: 334.6 MB, 4012 kernels in 123 units (11.7 s wall at -j 2);
