@@ -21,7 +21,7 @@
 #            on / off: a ratio above 1 means the optimisation pays). Default arms, on the kernels each changes most (static
 #            SASS, 2026-11-14; SHSYM is opt-in, MCC_SHSYM=1 turns it on: in its arm a ratio above 1 means keep it off): NOLATCH stride 2 (conv_fwd_s2_f8_k<*,*,0> hot loop 513 -> 607 with the fold, lp_s2 total 576386 ->
 #            568327), NORANGE stride 2 (lp_s2 hot loops 16405 -> 15436), NOHOIST fp4 wgrad + stride 2 (lp_f4wgrad_i1 hot loop 30461
-#            -> 26578), NODIVCSE stride 2 (lp_s2 548193 -> 492637), NOCONDREC stride 2 (lp_s2.cu:166 10836 -> 6393 SASS), NOLDGV stride 2 + wgrad + fp4 conv (vector __ldg; ptxas tap-loop unroll flips), NOIFASM stride-2 + f8 / f4 wgrad (act_ab tanh.approx if-converted: 7 units ALL 1077851 -> 1071895, BRA 48183 -> 46794, spill +684 B), NOFASTCALL wgrad / GN / level-0 misc (fmaf(1, x, 0) folds). NOLATCH_BUILD: the old name of SW_NOLATCH.
+#            -> 26578), NODIVCSE stride 2 (lp_s2 548193 -> 492637), NOCONDREC stride 2 (lp_s2.cu:166 10836 -> 6393 SASS), NOLDGV stride 2 + wgrad + fp4 conv (vector __ldg; ptxas tap-loop unroll flips), NOIFASM stride-2 + f8 / f4 wgrad (act_ab tanh.approx if-converted: 7 units ALL 1077851 -> 1071895, BRA 48183 -> 46794, spill +684 B), NOFASTEXP GN / SiLU staging (expf / logf as ex2 / lg2.approx under fast math: lp_mx_gnbwd SASS 440944 -> 410264, lp_s2 364856 -> 352584), NOFASTCALL wgrad / GN / level-0 misc (fmaf(1, x, 0) folds). NOLATCH_BUILD: the old name of SW_NOLATCH.
 # Fixed checkpoint: CKPT, else a copy of scratch2/last.ckpt taken once into OUT/fixed.ckpt (reruns reuse it).
 # Prerequisites in BOTH build dirs: ufsm, test_head_tc and the bench_* below (cmake --build DIR --target ufsm test_head_tc bench_f4conv ...;
 # missing ones are skipped and listed). Env: PARTS ("jit bench switch train predict"), SW_ARMS, SW_NOLATCH / SW_NORANGE / SW_NODIVCSE / SW_NOHOIST /
@@ -168,7 +168,7 @@ PY
 fi
 
 # ---- switch: one mcc optimisation off per arm (a nested run of this script, bench only, under the locks held here)
-SW_ARMS=${SW_ARMS:-"NOLATCH:^bench_s2 NORANGE:^bench_s2 NODIVCSE:^bench_s2 NOCONDREC:^bench_s2 NOLDGV:^(bench_s2|bench_wgrad4|bench_wgl0|GY8=1|bench_f4conv) SHSYM:^(bench_s2|bench_wgrad4|bench_wgl0|GY8=1) NOHOIST:^(bench_wgrad4|bench_wgl0|GY8=1|bench_s2b|bench_s2$) NOIFASM:^(bench_s2|bench_wgrad4|bench_wgl0|GY8=1) NOFASTCALL:^(bench_wgrad4|bench_wgl0|GY8=1|bench_gn|UFSM_GN_X|bench_l0misc)"}
+SW_ARMS=${SW_ARMS:-"NOLATCH:^bench_s2 NORANGE:^bench_s2 NODIVCSE:^bench_s2 NOCONDREC:^bench_s2 NOLDGV:^(bench_s2|bench_wgrad4|bench_wgl0|GY8=1|bench_f4conv) SHSYM:^(bench_s2|bench_wgrad4|bench_wgl0|GY8=1) NOHOIST:^(bench_wgrad4|bench_wgl0|GY8=1|bench_s2b|bench_s2$) NOIFASM:^(bench_s2|bench_wgrad4|bench_wgl0|GY8=1) NOFASTEXP:^(bench_gn|UFSM_GN_X|bench_l0misc|bench_s2|bench_f4conv|bench_wgrad4) NOFASTCALL:^(bench_wgrad4|bench_wgl0|GY8=1|bench_gn|UFSM_GN_X|bench_l0misc)"}
 [ -n "${NOLATCH_BUILD:-}" ] && [ -z "${SW_NOLATCH:-}" ] && SW_NOLATCH=$NOLATCH_BUILD
 if part switch; then
   for arm in $SW_ARMS; do
