@@ -157,9 +157,9 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     assert read_bytes(t / 'occ-t1', [0, 0, 0], [16, 8, 8]) == read_bytes(t / 'occ-t0', [0, 0, 0], [16, 8, 8])
     assert any(read_bytes(t / 'occ-t1', [0, 0, 0], [16, 8, 8]))
     run(*air, t / 'invalid', *air_opts, '--occupancy', '0', ok=2)
-    # --gpus with fit fields: every worker would write the whole field set -> rejected
-    out = run(*air, t / 'invalid', *air_opts, '--box', '0,0,0,128,128,128', '--gpus', '0,0', '--fit-zarr', t / 'ffz-gpus', '--no-out', '1', ok=2)
-    assert '--gpus with --fit-zarr / --fit-fields is not supported' in out, out
+    # --gpus with --fit-fields: every worker would write the whole field set -> rejected (--fit-zarr runs z-layer workers: legal)
+    out = run(*air, t / 'invalid', *air_opts, '--box', '0,0,0,128,128,128', '--gpus', '0,0', '--fit-fields', t / 'ffz-gpus', '--no-out', '1', ok=2)
+    assert '--gpus with --fit-fields is not supported' in out, out
     assert not (t / 'ffz-gpus').exists()
     run(*air, t / 'invalid', *air_opts, '--full-grid', '1', '--box', '512,0,0,8,8,8', ok=2)
     # Version-1 models without a normalization field keep the historical graph.
