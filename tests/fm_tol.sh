@@ -2,6 +2,10 @@
 # everywhere"). CMake writes $BUILD/strict_math (1: -DUFSM_STRICT_MATH=ON, 0: the default fast-math build); B is the suite's build
 # dir (run_suite.sh exports it; build-verify by hand).
 fm_strict() { [ "$(cat "${B:-build-verify}/strict_math" 2> /dev/null)" = 1 ]; }
+# FM_ENC_MAXD: the largest u8 difference between the GPU and the CPU fit-field encoder (predict's rv / ink 9.6 planes) in a fast-math
+# build. clang + nvcc host code stays within 2; mcc's host float code within 4 (1828 of 16.7 M bytes, max 4: test_predict_heads part 1,
+# microc 441a1a1, DESIGN 2026-11-15 "mcc round"). Strict math stays byte for byte.
+FM_ENC_MAXD=4
 # fm_cmp_u8 A B MAXD FRAC [WHAT]: two files of u8 voxels (same length) agree exactly under strict math; else every byte within
 # +-MAXD and at most ceil(FRAC * n) bytes differ. Prints the counts; returns 0 on pass.
 fm_cmp_u8() {

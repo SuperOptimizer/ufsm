@@ -15,7 +15,7 @@ cmake --preset release && cmake --build build -j 8      # build/ufsm by mcc: hos
                                                         # as the CUDA runtime; CMake >= 3.28, Ninja; needs libcurl, libzstd, libblosc,
                                                         # zlib, libjpeg, xxhash (header), OpenSSL libcrypto, an NVIDIA driver (its JIT
                                                         # compiles the PTX; libcublasLt.so). No CUDA toolkit, no clang / nvcc
-cmake --preset llvm-release && cmake --build build-llvm # the previous toolchain (clang + nvcc, cmake/llvm.cmake), for bisecting only
+cmake --preset llvm-release && cmake --build build-llvm # clang + nvcc (cmake/llvm.cmake): kept building, for comparison
 cmake --preset verify && cmake --build build-verify --target test     # suite binaries + the fast tier (the merge gate)
 cmake --build build-verify --target test-slow           # the slow tier; test-all: both
 SUITE_FLAGS="-j 4 test_fit" cmake --build build-verify --target test # runner options (names matching a regex)

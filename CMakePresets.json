@@ -40,7 +40,7 @@
     },
     {
       "name": "llvm-release",
-      "displayName": "llvm-release: build-llvm/ (the old clang + nvcc toolchain, cmake/llvm.cmake: for bisecting only)",
+      "displayName": "llvm-release: build-llvm/ (clang + nvcc, cmake/llvm.cmake: kept for comparison; mcc is the supported toolchain)",
       "inherits": "release",
       "binaryDir": "${sourceDir}/build-llvm",
       "toolchainFile": "${sourceDir}/cmake/llvm.cmake",

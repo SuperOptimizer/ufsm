@@ -6,6 +6,18 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## mcc round: microc main 441a1a1 is ufsm's compiler; the encoder u8 tolerance 4 (2026-11-15, branch mccround-20261115)
+
+The user made mcc the only supported compiler. The clang + nvcc presets (llvm-release / llvm-verify) keep building for comparison.
+The fast tier at microc main 441a1a1 (475ac78 + mainvfma 626fa40: vsearch / vector FMA / ptx setp.ftz + strip 688b3c6), desk card 1,
+release build/ beside build-verify, jit_warm first: 319 PASS, 2 NEED2 (one card), 2 SKIP (data), 1 FAIL. All 32 failures of the
+first mcc round (fc8e90e) pass. The one FAIL was test_predict_heads part 1: GPU vs CPU fit-field encoder, rv 9.6 plane, 1828 of
+16.7 M bytes differ, max 4. clang + nvcc stays within 2, so this is mcc's host float code (the u8 encoder), and an mcc strict build
+is byte for byte. Decision (lead, 11-15): the tolerance becomes FM_ENC_MAXD = 4 (tests/fm_tol.sh) for the rv / ink planes in
+fast-math builds; strict math stays exact. The host-math delta is a low-priority microc item.
+Disk: an mcc build-verify is ~65 GB (every binary embeds ~330 MB of uncompressed PTX vs nvcc's ~68 MB compressed SASS fatbins);
+PTX compression / one shared kernel object are in progress (mcc-gpu, testspeed).
+
 ## Skip-empty: masked convs bypass the ring kernels; test_skip_empty racecheck QUICK (2026-11-15, branch skipmask-20261115)
 
 test_skip_empty~racecheck FAILed on the pod after 3289 s: section (5), at its racecheck width 64, reported masked forward 0, backward-data 0,

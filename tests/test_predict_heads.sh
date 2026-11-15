@@ -19,6 +19,7 @@
 #  beside the ufsm binary): every comparison byte for byte as before.
 # Usage: test_predict_heads.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
+. "$(dirname "$0")/fm_tol.sh"    # FM_ENC_MAXD (the encoders' u8 tolerance outside strict math)
 . "$(dirname "$0")/test_part.sh"   # UFSM_TEST_PART=K/3: (1) | (1b) (1c) | (1d) (2) (3); each part trains net (1) and its --heads all run first
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
 STRICT=$(cat "$(dirname "$U")/strict_math" 2> /dev/null || echo 0)
@@ -37,10 +38,10 @@ print(f"  {sys.argv[4]}: {np.count_nonzero(d)} of {d.size} bytes differ, max {d.
 sys.exit(0 if d.max() <= int(sys.argv[5]) and np.count_nonzero(d) <= float(sys.argv[3]) * d.size and np.count_nonzero(a) > d.size // 8 else 1)
 PY
 }
-# the shard files of two stores byte for byte under strict math; else their 9.6 arrays (rv and ink) within 2 on 1 % of the bytes
+# the shard files of two stores byte for byte under strict math; else their 9.6 arrays (rv and ink) within FM_ENC_MAXD on 1 % of the bytes
 cmpenc() {
   if [ "$STRICT" = 1 ]; then [ "$(cd "$1" && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" = "$(cd "$2" && find . -path '*/c/*' -type f | sort | xargs cat | md5sum)" ]
-  else for n in rv ink; do cmpb "$1/$n" "$2/$n" 0.01 2 || return 1; done; fi
+  else for n in rv ink; do cmpb "$1/$n" "$2/$n" 0.01 "$FM_ENC_MAXD" || return 1; done; fi
 }
 # ctcmp A B: two UFSM_PRED_CTDUMP files (the windows in order): equal under strict, else within 1 on 1e-4 of the voxels
 ctcmp() {
