@@ -2715,7 +2715,8 @@ static void tb_geom(unet *u) {
         int Np, Nu, Nv; at_ray_plane(ad, D, Hh, W, &Np, &Nu, &Nv);
         o[0] = (float)ad;
         if (r[1] != 0.f && (np != Np * F || u->tb_axs < UNET_AXR(np))) {   /* the record does not describe this grid (a --split z slab or a sub-window net sees a part of the window): no axis for the sample, said once */
-            static int warned; if (!warned++) fprintf(stderr, "unet: WARNING scroll axis record of sample %d has %d planes (stride %d), the bottleneck grid needs %d x %d (planes x div %d x 2^(nlev-1)): "
+            static int warned;   /* mgpu: debug (warn-once message; a racy double print is harmless) */
+            if (!warned++) fprintf(stderr, "unet: WARNING scroll axis record of sample %d has %d planes (stride %d), the bottleneck grid needs %d x %d (planes x div %d x 2^(nlev-1)): "
                             "the axis is NOT used for such samples (grid-index positions)\n", b, np, u->tb_axs, Np, F, div);
             u->tb_noax++; continue; }
         if (r[1] == 0.f) { u->tb_noax++; continue; }
