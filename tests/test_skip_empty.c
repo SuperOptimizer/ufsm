@@ -46,11 +46,13 @@ int main(void) {
     nn_set_tf32(1); nn_set_f16(1); nn_set_sr(0); nn_set_prec(3);
     if (nn_set_prec_policy("all=fp4:fp4:fp4")) return 1;
     unet_set_act_mx4(1);
-    const int P = 64, ZM = 20;   /* material planes [0, ZM) */
-    /* UFSM_SANITIZE=racecheck (tests/sanitize.sh): section (4) runs only the three passes that reach the masked backward kernels (dense, all
-       active, CT masks) and skips its numeric comparisons (the plain run checks those). The full section died under racecheck after section (2)
-       with the pod cgroup's oom_kill counter rising (merge3, 11-14/15: 1900 s, oom_kill 3 -> 4); the cause is inferred, not confirmed. */
+    /* UFSM_SANITIZE=racecheck (tests/sanitize.sh), the QUICK size: a 32^3 window with material in z < 6 (level 0: 2 of 4 tile planes active
+       at margin 1, as 3-4 of 8 at P 64), no margin profile (the plain run checks it), and section (4) runs only the three passes that reach
+       the masked backward kernels (dense, all active, CT masks) without its numeric comparisons. At P 64 racecheck took ~110 s a forward on
+       the pod's RTX PRO 4000 and 3289 s in all (11-15), past the 30-min budget. (The full section (4) died under racecheck after section (2)
+       with the pod cgroup's oom_kill counter rising, 11-14/15: 1900 s, oom_kill 3 -> 4; the cause is inferred, not confirmed.) */
     const char *san = getenv("UFSM_SANITIZE"); const int race = san && !strcmp(san, "racecheck");
+    const int P = race ? 32 : 64, ZM = race ? 6 : 20;   /* material planes [0, ZM) */
     unet_cfg cfg = {}; cfg.nlev = 3; cfg.widths[0] = 96; cfg.widths[1] = 128; cfg.widths[2] = 160; cfg.cin = 4; cfg.cout = 2; cfg.G = 8; cfg.gn_ema = 1;
     unet *u = unet_create(&cfg); unet_init(u, 11);
     const shape5 xs = {1, 4, P, P, P}; const size_t p3 = (size_t)P * P * P, nx = 4 * p3;
@@ -94,7 +96,7 @@ int main(void) {
         CHECK(nm > 0, "masked launches");
     }
     {   /* the deviation profile by margin: mean |dlogit| per 4-plane band (z from the material top), over the mean |logit| */
-        for (int mg = 1; mg <= 3; mg++) {
+        for (int mg = 1; mg <= (race ? 0 : 3); mg++) {
             nn_skip_off(); nn_skip_build(dct, P, P, P, 1, 3, 0, mg);
             const double a0 = nn_skip_share(0);
             nn_d2h(lm, unet_forward(u, dx, xs, 0), no * 4);
