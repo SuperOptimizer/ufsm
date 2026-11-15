@@ -23,7 +23,10 @@ if [ "${1:-}" != --after ]; then
     else bad "binary lacks 2ff3118 (pass-1 mega defaults --gscale-grow 200) and launch.env has no --gscale-grow 0"; fi
     git -C /home/forrest/ufsm merge-base --is-ancestor 472df19 $SHA 2>/dev/null && good "binary contains sampbias 472df19 (zboost: sources.c ignores unknown keys silently)" || bad "binary lacks sampbias 472df19"
     for b in dcachecap-20261114 dckey-20261114; do { git -C /home/forrest/ufsm merge-base --is-ancestor origin/$b $SHA 2>/dev/null || git -C /home/forrest/ufsm log --format=%s $SHA | grep -qE "^Merge .*$b"; } && good "binary contains $b (ref or its merge commit; merged branches are deleted)" || bad "binary lacks origin/$b (hostmem: derived-cache cap + new keys)"; done
-  [ -e /home/forrest/.cache/ufsm/derived ] && bad "~/.cache/ufsm/derived still in place: mv it to derived.try6 (no trainer / admuon arm reading it)" || good "old derived cache moved away"
+  DV=/home/forrest/.cache/ufsm/derived   # (a cache born after the binary was installed was built by its keys (the audits): kept, it is warm)
+  if [ ! -e $DV ]; then good "old derived cache moved away"
+  elif [ -d $DV.try6 ] && [ "$(stat -c %W $DV)" -gt "$(stat -c %Y "$U")" ]; then good "derived cache born $(date -d @$(stat -c %W $DV) +%H:%M) after the binary ($(du -sh $DV | cut -f1), built by its keys); the try6 one in derived.try6"
+  else bad "~/.cache/ufsm/derived predates the binary: mv it to derived.try6 (no trainer / admuon arm reading it)"; fi
   # every --flag the env passes (XFLAGS, OPTX) must be known to the binary (train's opt() ignores nothing silently since 27fee1e, but check here)
   for f in $(grep -E '^(XFLAGS|OPTX)=' $E | cut -d= -f2- | tr ' ' '\n' | grep -E '^--[a-z]' | sort -u); do strings "$U" | grep -qxF -- "$f" || strings "$U" | grep -qF -- "\"$f\"" || strings "$U" | grep -qF -- "$f" || bad "binary does not know $f"; done
   grep -qE '^MLR=0.003$' $E && good "Muon lr 0.003" || bad "MLR is not 0.003"
