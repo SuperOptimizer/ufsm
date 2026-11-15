@@ -1257,15 +1257,17 @@ static size_t winauto_need(int k, int d, void *vc) {   /* the device bytes of au
    max) counted for non-finite values on the device before each finalize (no sync), read once at the end. Not on the logits inside
    unet_forward_x: the logits buffer is not a whole [cout][D H W] window under in-place slab inference / head slabs (that first version
    read past it: illegal accesses and false NaNs in ~13 GPU tests, mega bisect 6a9186a). UFSM_TEST_NAN_LOGITS=1 plants a NaN (the test) */
-static unsigned long long *g_pred_nf_dev, g_pred_nf_host[2];
-static void pred_nf_check(float *acc, size_t nl) {
-    if (!g_pred_nf_dev) { g_pred_nf_dev = nn_malloc(3 * sizeof *g_pred_nf_dev); nn_zero(g_pred_nf_dev, 3 * sizeof *g_pred_nf_dev); }
+/* The counters are the caller's locals beside ffacc (no process-wide state): allocated by the thread that owns ffacc, on its device, on
+   first use; one per predict run (a --gpus worker is its own process; --boxes runs the path once per box) */
+typedef struct { unsigned long long *dev; unsigned long long host[2]; } pred_nf;
+static void pred_nf_check(pred_nf *g, float *acc, size_t nl) {
+    if (!g->dev) { g->dev = nn_malloc(3 * sizeof *g->dev); nn_zero(g->dev, 3 * sizeof *g->dev); }
     if (ufsm_env_on("UFSM_TEST_NAN_LOGITS")) { const float nf = NAN; nn_h2d(acc + 2 * nl, &nf, 4); }
-    if (nl) nn_nonfinite_acc(acc, 11 * nl, 0, g_pred_nf_dev);
+    if (nl) nn_nonfinite_acc(acc, 11 * nl, 0, g->dev);
 }
-static int pred_nf_report(void) {   /* 1 when any accumulator held a non-finite value (syncs) */
-    unsigned long long h[3] = {0, 0, 0}; if (g_pred_nf_dev) { nn_sync(); nn_d2h(h, g_pred_nf_dev, sizeof h); nn_free(g_pred_nf_dev); g_pred_nf_dev = nullptr; }
-    const unsigned long long nv = h[0] + g_pred_nf_host[0], ns = h[1] + g_pred_nf_host[1]; g_pred_nf_host[0] = g_pred_nf_host[1] = 0;
+static int pred_nf_report(pred_nf *g) {   /* 1 when any accumulator held a non-finite value (syncs; frees the device counter) */
+    unsigned long long h[3] = {0, 0, 0}; if (g->dev) { nn_sync(); nn_d2h(h, g->dev, sizeof h); nn_free(g->dev); g->dev = nullptr; }
+    const unsigned long long nv = h[0] + g->host[0], ns = h[1] + g->host[1];
     if (ns) fprintf(stderr, "predict: FAILED: %llu fit-field slabs held non-finite values (%llu accumulator values; NaN / Inf logits): the fields there are undefined\n", ns, nv);
     return ns != 0;
 }
@@ -2344,7 +2346,7 @@ static int predict_one(int argc, char **argv) {
     }
     const int sup = kss > 1 || fea > 0;   /* one window per k^3 shards (k = 1 with --feather), placed and written per window */
     int64_t nss[3]; for (int d = 0; d < 3; d++) nss[d] = (ns[d] + kss - 1) / kss;
-    float *ffacc = nullptr, *ffacc4 = nullptr; int ffbox[3], ffF[3]; size_t ffn = 0;
+    float *ffacc = nullptr, *ffacc4 = nullptr; int ffbox[3], ffF[3]; size_t ffn = 0; pred_nf ffnf = {0};   /* ffnf: the #16 guard's counters */
     if (ffu2) {   /* the relative planes need the far voxel inside the window: offset <= the halos */
         if (ffw4d > halo) ffw4d = halo;
         if (ffw4d > hz) ffw4d = hz;
@@ -3076,7 +3078,7 @@ static int predict_one(int argc, char **argv) {
                         const int fb = ffw_acquire(&ffw);
                         if (pprof) p_ffw += now() - tfa;
                         uint8_t *fd = ff8d + (size_t)fb * FFZ_MAXP * ffwn;
-                        pred_nf_check(ffacc, nl);   /* (audit #16: NaN would become undefined bytes in fit_finalize_k) */
+                        pred_nf_check(&ffnf, ffacc, nl);   /* (audit #16: NaN would become undefined bytes in fit_finalize_k) */
                         nn_fit_finalize(ffacc, nl, ffh, fd);   /* pc .. w, then r (unwrap) or dz dy dx dq (unwrap2) */
                         if (!ffu2) nn_fit_finalize_recto(ffacc, nl, fd + 10 * nl); else if (ffw4d) nn_fit_finalize_w4(ffacc4, nl, fd + 10 * nl);
                         if (ffct) nn_fit_finalize_ct(ffacc, nl, ffh, fd + (size_t)ffz_nb * nl, fd + (size_t)(ffz_nb + 1) * nl);   /* then ct, cs */
@@ -3252,7 +3254,7 @@ static int predict_one(int argc, char **argv) {
         nn_sync(); nn_d2h(acc, ffacc, ffna * ffn * 4); nn_free(ffacc);
         uint8_t *a[10]; for (int k = 0; k < 10; k++) if (!(a[k] = calloc(ffn, 1))) { fprintf(stderr, "predict: out of host memory (fit fields)\n"); abort(); }   /* (audit mini/alloc #10) */
         if (ufsm_env_on("UFSM_TEST_NAN_LOGITS")) acc[2 * ffn] = NAN;
-        { unsigned long long hv = 0; for (size_t i = 0; i < 11 * ffn; i++) hv += !isfinite(acc[i]); if (hv) { g_pred_nf_host[0] += hv; g_pred_nf_host[1]++; } }
+        { unsigned long long hv = 0; for (size_t i = 0; i < 11 * ffn; i++) hv += !isfinite(acc[i]); if (hv) { ffnf.host[0] += hv; ffnf.host[1]++; } }
         fit_finalize(acc, ffn, ffh, a);
         const int na = (int)bn[0] + 1; float *cyb = malloc(na * sizeof(float)), *cxb = malloc(na * sizeof(float));
         if (!cyb || !cxb) { fprintf(stderr, "predict: out of host memory (fit fields)\n"); abort(); }
@@ -3311,7 +3313,7 @@ static int predict_one(int argc, char **argv) {
         fprintf(stderr, "GroupNorm statistics of %ld windows -> %s\n", nw, gn_save); free(h);
     }
     const double t_win = now() - t0;   /* the window loop's seconds (the throughput lines below also show the end-to-end clock) */
-    const int nf_bad = ffd ? pred_nf_report() : 0;   /* the inference guard (pred_nf_check; unroll audit 11-14 #16): exit 1 */
+    const int nf_bad = ffd ? pred_nf_report(&ffnf) : 0;   /* the inference guard (pred_nf_check; unroll audit 11-14 #16): exit 1 */
     if (split) {
         for (int k = 0; k < 2; k++) { pside_t *S = &J.s[k]; nn_init(gpus[k]); nn_free(S->ctm); nn_free(S->dsh); nn_free(S->stsc); nn_free(S->red); nn_free(S->dyd); free(S->rows); free(S->own); }
         nn_init(gpus[1]); unet_free(u1); nn_init(gpu); split_free(sctx);
