@@ -98,6 +98,8 @@ per GPU.
 | nmlars vs Muon, both 0.003 | 1001-1600 | -0.018 [-0.021, -0.016] | -0.006 | -0.015 [-0.020, -0.010] | +0.031 | 4.1 / 6.3 |
 | nmlars vs Muon, both 0.003 | 1601-2000 | -0.016 [-0.019, -0.013] | -0.005 [-0.006, -0.004] | -0.007 [-0.011, -0.002] | +0.016 | 3.8 / 5.5 |
 | nmlars vs Muon, both 0.003 | 1-1000 | ~0 (CIs straddle 0) | | | | |
+| nmlars vs Muon, both 0.003, seed 8 | 1001-1600 | -0.007 [-0.010, -0.004] | -0.003 | -0.010 [-0.013, -0.007] | +0.021 | |
+| nmlars vs Muon, both 0.003, seed 8 | 1601-2000 | -0.003 [-0.006, -0.002] | -0.001 (n.s.) | -0.007 [-0.010, -0.003] | +0.014 | 3.1 / 3.8 |
 
 - The lr is monotone on every head: 0.003 beats 0.006, which beats 0.012. The start checkpoint had trained at 0.003 since its 11:59
   relaunch, so part of the gap is the shock of a higher lr. Either way, nothing argues for a larger lr. The fixture rewarded 2x (above);
@@ -111,7 +113,11 @@ per GPU.
   uneven: L0 8.6e-4 [6e-4, 1.3e-3], deep 1.3e-3 [8.5e-4, 1.9e-3], attention 1.6e-3 [1.1e-3, 3.2e-3]. nmlars puts every matrix at
   ~1.3e-3 [1.2e-3, 1.4e-3], so L0 gets ~1.5x the step and the attention outliers less.
 - The nmlars gain opens after the lars EMAs settle (beta 0.99, ~200 updates). Throughput is unchanged (0.668 vs 0.662 samp/s).
-- Open: which of NorMuon or lars carries it, a seed-8 repeat, and a 0.0015 control.
+- Seed 8 (other windows) confirms the direction at a smaller size. Cooldown loss: -0.016 (seed 7), -0.003 (seed 8). wind4: -0.007 in both
+  seeds. acc: +0.016 and +0.014. Every loss and wind4 CI after window 500 excludes 0 in both seeds.
+- Recommended for try7: `--normuon 1 --muon-lars 1` at Muon 0.003 / AdamW 3e-4 (main decides).
+- Open: which of NorMuon or lars carries the gain, a 0.0015 control, and a from-scratch 0.003 vs 0.006 peak pair (every arm above starts
+  from a checkpoint trained at 0.003, which favours <= 0.003).
 ## Sampler GPU work vs the training stream; the pair rule on both cards (2026-11-14, branch w4stream-20261114)
 
 **The w4 context stream was blocking.** Training kernels launch on the legacy default stream (no stream argument, no per-thread
