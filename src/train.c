@@ -287,6 +287,7 @@ static int unwrap2_heads_moved(const char *init_from) {
 }
 static double g_reject_warn = 100;
 static double g_outward_warn = 0.9;   /* --outward-warn S: warn when a source's aligned phase-gradient samples rise outward less often than S (0 off) */   /* mgpu: config */
+static size_t g_mil_reserve;   /* mgpu: config (set by the planner before the GPU threads; the planner's MIL share, checked against ink_mil_peak_bytes at each log line) */
 static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static float g_mil_r_um = 0.f, g_mil_R = 10.f, g_mil_step = 1.f, g_mil_tau = 0.f, g_mil_lambda = 1.f;   /* --ink-mil L
    (--ink-head): the normal-pooled MIL ink loss on each window's rays (inkmil.h): per supervised label pixel (mode 1: only those without an open face, the
    voxel target's unknowns), BCE of the pooled ink logit along the normal over +-R window voxels at step (tau 0: max; > 0: tau log mean exp), the mean
@@ -4270,6 +4271,12 @@ int cmd_train(int argc, char **argv) {
             }
             size_t mg_head = 0;   /* multi-GPU headroom per card (default 0.5 GB): peer contexts, gradient exchange and small late scratch */
             if (ng > 1) { const char *h = getenv("UFSM_MG_HEADROOM_GB"); mg_head = (size_t)((h ? atof(h) : 0.5) * 1e9); fmin = fmin > mg_head ? fmin - mg_head : 0; }
+            if (g_mil && ink_mil_bytes) {   /* --ink-mil: the MIL sort buffers at the ray cap, allocated lazily on the first MIL window (2026-11-15 try7 one
+                                               card: outside the plan, the first such window's cudaMalloc failed on a full card, exit 1 at step 1) */
+                g_mil_reserve = ink_mil_bytes(g_mil_max, g_mil_R, g_mil_step);
+                fmin = fmin > g_mil_reserve ? fmin - g_mil_reserve : 0;
+                fprintf(stderr, "memory: --ink-mil keeps %.2f GB free for its buffers (%d rays x %d samples)\n", g_mil_reserve / 1e9, g_mil_max, ink_mil_samples(g_mil_R, g_mil_step));
+            }
             if (g_val_u) {   /* --val-P: the validation copy's inference build at N^3 stays out of the training budget */
                 g_val_reserve = unet_infer_bytes(g_val_u, (shape5){B, g_xc, g_valP, g_valP, g_valP});
                 g_val_reserve += g_val_reserve * 2 / 5 + ((size_t)256 << 20);   /* (the dry build counts ~3/4 of what it takes: 1.08 GB at 384^3) */
@@ -5801,6 +5808,9 @@ int cmd_train(int argc, char **argv) {
             if (B > 1) for (char *w = strstr(affs, " of windows"); w; w = strstr(w, " of windows")) memcpy(w, " of batches", 11);   /* (B > 1: the label shares count GPU 0's batches with a label, not windows) */
             char gs[48] = ""; if (sc.echo_max > 0) snprintf(gs, sizeof gs, ", gate %.0f%%", 100 * gate / dt);   /* --echo-max: the echo probe's time while the GPUs still ran (not starvation) */
             /* samp/s and Mvox/s: every window trained (echoes, skipped steps), input voxels including the halo: work rates (the fresh rate: the echo affix) */
+            { static int mw;   /* mgpu: debug (warn-once; a racy double print is harmless) */
+              const size_t pk = g_mil_reserve && ink_mil_peak_bytes ? ink_mil_peak_bytes() : 0;
+              if (pk > g_mil_reserve && !mw++) fprintf(stderr, "ink mil: WARNING its buffers reached %.2f GB, the memory plan kept %.2f GB\n", pk / 1e9, g_mil_reserve / 1e9); }
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s %.1f Mvox/s (wait %.0f%%%s)%s%s\n", step, lr, acc_loss / nok, acc_bce / nok, acc_dice / nok, affs, acc_g / nok,
                     (double)nacc * B * nl / dt, (double)nacc * B * nl * g_Pz * P * P / 1e6 / dt, 100 * wait / dt, gs, vl >= 0 ? " val " : "", vl >= 0 ? vstr : "");
             {   /* the on-the-fly phase since the last log line: reads, tiles (on the GPU), the pair rule's seconds per read (summed over threads) */

@@ -160,16 +160,31 @@ static int g_mil_async = -1, g_mil_ovf;
 extern "C" int ink_mil_overflows(void) { return g_mil_ovf; }   /* tests: plane-bound overflows seen (each switched to the readback) */
 extern "C" void ink_mil_set_async(int on) { g_mil_async = on; }
 static __thread struct { unsigned *h, *d; cudaEvent_t ev; const float *dz; const inkray *rays; int D, nr, K, pend, cap; float R, step; } t_ph;
+static size_t mg_size(size_t n) { return n + n / 4 + 256; }
+static unsigned long long g_mil_peak;   /* mgpu: guarded (__atomic CAS max) the largest per-thread sum of the buffers (vs the planner's ink_mil_bytes) */
 static int mgrow(int i, size_t n) {
     if (t_ms.cap[i] >= n) return 0;
     if (t_ms.p[i]) cudaFree(t_ms.p[i]);
-    t_ms.p[i] = nullptr; t_ms.cap[i] = 0; const size_t c = n + n / 4 + 256;
+    t_ms.p[i] = nullptr; t_ms.cap[i] = 0; const size_t c = mg_size(n);
     if (cudaMalloc(&t_ms.p[i], c) != cudaSuccess) {   /* (2026-11-15 try7 one card: "bwd_slab failed" with no cause; this is the usual one) */
         size_t fr = 0, to = 0; const cudaError_t e = cudaGetLastError(); cudaMemGetInfo(&fr, &to);
         fprintf(stderr, "ink mil: device buffer %d: cudaMalloc of %.1f MB failed (%s; %.2f GB free of %.2f): outside the memory plan\n", i, c / 1e6, cudaGetErrorString(e), fr / 1e9, to / 1e9);
         return -1; }
-    t_ms.cap[i] = c; return 0;
+    t_ms.cap[i] = c;
+    unsigned long long t = 0; for (int k = 0; k < 8; k++) t += t_ms.cap[k];
+    for (unsigned long long o = __atomic_load_n(&g_mil_peak, __ATOMIC_RELAXED); t > o && !__atomic_compare_exchange_n(&g_mil_peak, &o, t, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);) {}
+    return 0;
 }
+/* the device bytes the MIL buffers reach at the trainer's ray cap nr (bwd_slab's sizes: pair keys / values twice, the counter, the
+   sort's temp for the cap, the fwd's per-ray loss): the planner keeps them free. 2026-11-15 try7 one card: they were allocated
+   lazily after the plan, the card was full and the first MIL window failed in cudaMalloc */
+extern "C" size_t ink_mil_bytes(int nr, float R, float step) {
+    const int K = ink_mil_samples(R, step); if (nr <= 0 || K < 1) return 0;
+    const size_t cap = (size_t)nr * K * 8;
+    size_t tm = 0; cub::DeviceRadixSort::SortPairs(nullptr, tm, (unsigned long long *)nullptr, (unsigned long long *)nullptr, (float *)nullptr, (float *)nullptr, (int)(cap < 0x7fffffffull ? cap : 0x7fffffffull), 0, 64, (cudaStream_t)0);
+    return mg_size((size_t)nr * sizeof(double)) + mg_size(cap * 8) + mg_size(cap * 4) + mg_size(cap * 8) + mg_size(cap * 4) + mg_size(64) + mg_size(tm + 16);
+}
+extern "C" size_t ink_mil_peak_bytes(void) { return (size_t)__atomic_load_n(&g_mil_peak, __ATOMIC_RELAXED); }
 extern "C" int ink_mil_samples(float R, float step) { return (int)floorf(2 * R / step + 1e-4f) + 1; }
 extern "C" int ink_mil_fwd_slab(const void *lg, int bf16, int z0, int nz, int D, int H, int W, const inkray *rays, int nr, float R, float step, float *acc, void *stream) {
     const int K = ink_mil_samples(R, step); if (K > KMAX || K < 1) return -2; if (nr <= 0) return 0;

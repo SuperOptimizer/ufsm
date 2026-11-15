@@ -135,6 +135,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ink mil: last %.4f, at most %.0f%% of windows with rays, up to %.0f rays a window\n", mil, best, rays);
         CHECK(best > 0 && rays > 0, "no window drew rays (%s)", p);
     }
+    /* the planner keeps the MIL buffers free (2026-11-15 try7 one card: allocated lazily after the plan, the first MIL window's cudaMalloc
+       failed on the full card): the "keeps" line, and the buffers never outgrow it; again at a small ray cap the windows exceed (the cap's
+       sizes are the ones reached) */
+    /* (the planner runs without UFSM_GRAD_MX8, which picks its mode by hand: these two runs leave it out) */
+    CHECK(!sh("%s train %s/fx/sources-mil.json --out %s/d --steps 3 --ink-mil 1 --ink-mil-mode 0 %s > %s/d.log 2>&1", U, d, d, common, d), "train --ink-mil, planner (%s/d.log)", d);
+    CHECK(!sh("grep -q '^memory: --ink-mil keeps [0-9.]* GB free for its buffers (65536 rays' %s/d.log && ! grep -q 'ink mil: WARNING its buffers reached' %s/d.log", d, d),
+          "no MIL reservation line, or the buffers outgrew it (%s/d.log)", d);
+    CHECK(!sh("%s train %s/fx/sources-mil.json --out %s/c --steps 4 --ink-mil 1 --ink-mil-mode 0 --ink-mil-max 64 %s > %s/c.log 2>&1", U, d, d, common, d), "train --ink-mil-max 64 (%s/c.log)", d);
+    CHECK(!sh("grep -q '^memory: --ink-mil keeps [0-9.]* GB free for its buffers (64 rays' %s/c.log && ! grep -q 'ink mil: WARNING its buffers reached' %s/c.log", d, d),
+          "--ink-mil-max 64: no reservation line, or the buffers outgrew it (%s/c.log)", d);
     /* the loss bookkeeping: lr 0, same seed: the step-1 loss of --ink-mil 1 = that of --ink-mil 0 + the mil term */
     CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/b1 --steps 1 --lr 0 --muon-lr 0 --ink-mil 1 --ink-mil-mode 0 %s > %s/b1.log 2>&1", U, d, d, common, d), "b1");
     CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/b0 --steps 1 --lr 0 --muon-lr 0 %s > %s/b0.log 2>&1", U, d, d, common, d), "b0");
