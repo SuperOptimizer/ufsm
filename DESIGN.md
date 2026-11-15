@@ -1914,8 +1914,61 @@ per GPU.
 - Control ratios at try6's LR: L0 1.7e-3, deeper convs 2.7e-3 (per matrix 1.2e-3 .. 4e-3), attention 5e-3, heads 1.5e-3, AdamW 5e-4.
 - The lower gn may come from the scale-invariant layers' weights growing faster (their gradients scale as 1 / |W|), not from extra
   stability.
-- Still to run: control at 2x lr (muon2x), NorMuon alone, lars alone, the corrected DoG alone and in the adaptive set, and a seed-8
-  control.
+- The fixture is synthetic: the desk A/B below (scroll data) supersedes these fixture numbers.
+
+**Desk A/B on scroll data** (scripts/opt/admuon_desk.sh)
+- Setup: both 5060 Tis, one arm per card, try6's last.ckpt (step 2350) as --init-from, sources-scratch1-ph80, try6's heads /
+  augmentation / XFLAGS, P 512, --accum 5, 2000 windows (400 updates), --det 1 seed 7 (step-10 losses identical across arms), WSD warmup
+  50 / cooldown 0.2.
+- Binary: 1bb0db8 (try6's rollback build) + the admuon commits, so b91a66c is outside the comparison. ~1.6-1.8 s per window.
+- Paired per 10-window log line against the named control, block-bootstrap 95 % CI. Windows 1601-2000 are the cooldown.
+
+| arm vs control | windows | loss | phase | wind4 | wind4 acc | gn (arm / control) |
+|---|---|---|---|---|---|---|
+| Muon 0.012 vs 0.006 | 1601-2000 | +0.013 [+0.009, +0.017] | +0.007 | +0.032 [+0.030, +0.035] | -0.084 | 4.3 / 6.4 |
+| Muon 0.012 vs 0.006 | 1001-1600 | +0.048 [+0.025, +0.075] | +0.018 | +0.032 | -0.057 | |
+| Muon 0.003 vs 0.006 | 1601-2000 | -0.039 [-0.045, -0.035] | -0.016 | -0.026 | +0.065 | 5.5 / 6.4 |
+| Muon 0.003 vs 0.006 | 1-500 | -0.041 [-0.049, -0.036] | -0.017 | -0.029 | +0.060 | |
+| nmlars vs Muon, both 0.003 | 1001-1600 | -0.018 [-0.021, -0.016] | -0.006 | -0.015 [-0.020, -0.010] | +0.031 | 4.1 / 6.3 |
+| nmlars vs Muon, both 0.003 | 1601-2000 | -0.016 [-0.019, -0.013] | -0.005 [-0.006, -0.004] | -0.007 [-0.011, -0.002] | +0.016 | 3.8 / 5.5 |
+| nmlars vs Muon, both 0.003 | 1-1000 | ~0 (CIs straddle 0) | | | | |
+| nmlars vs Muon, both 0.003, seed 8 | 1001-1600 | -0.007 [-0.010, -0.004] | -0.003 | -0.010 [-0.013, -0.007] | +0.021 | |
+| nmlars vs Muon, both 0.003, seed 8 | 1601-2000 | -0.003 [-0.006, -0.002] | -0.001 (n.s.) | -0.007 [-0.010, -0.003] | +0.014 | 3.1 / 3.8 |
+| normuon vs Muon, both 0.003 | 1001-1600 | -0.018 [-0.021, -0.016] | -0.007 | -0.010 [-0.016, -0.004] | +0.023 | 4.2 / 6.3 |
+| normuon vs Muon, both 0.003 | 1601-2000 | -0.017 [-0.019, -0.015] | -0.004 [-0.005, -0.004] | -0.012 [-0.015, -0.009] | +0.025 | 3.6 / 5.5 |
+| nmlars vs normuon (what lars adds) | 1601-2000 | +0.001 [-0.000, +0.003] | -0.000 | +0.004 [+0.001, +0.010] | -0.009 | |
+| normuon vs Muon, both 0.003, seed 8 (stopped at 740) | 1-500 | -0.002 [-0.004, -0.000] | -0.001 [-0.002, +0.000] | -0.003 [-0.005, -0.001] | +0.005 | |
+| normuon vs Muon, both 0.003, seed 8 (stopped at 740) | 501-740 | -0.004 [-0.008, -0.001] | -0.001 [-0.004, +0.001] | -0.007 [-0.009, -0.004] | +0.015 | 4.9 / 5.6 |
+| Muon 0.0015 vs 0.003, seed 7 (stopped at 830) | 1-500 | -0.018 [-0.023, -0.015] | -0.007 [-0.009, -0.005] | -0.009 [-0.012, -0.008] | +0.020 | |
+| Muon 0.0015 vs 0.003, seed 7 (stopped at 830) | 501-830 | -0.017 [-0.021, -0.012] | -0.007 [-0.009, -0.005] | -0.013 [-0.016, -0.009] | +0.027 | 4.5 / 4.9 |
+
+- The lr is monotone on every head: 0.003 beats 0.006, which beats 0.012. The start checkpoint had trained at 0.003 since its 11:59
+  relaunch, so part of the gap is the shock of a higher lr. Either way, nothing argues for a larger lr. The fixture rewarded 2x (above);
+  scroll data does not.
+- The corrected DoG collapsed on scroll data: eta 2.5e-4 by update ~11, 9.4e-5 by update 80, 1.6 % of --muon-lr. Early steps add less
+  distance than sqrt(kappa G), eta shrinks, and the distance never catches up. With the momentum correction it collapses, without it it
+  pins at the cap, so (c) is dropped.
+- That frozen-trunk arm tied the 0.006 control over windows 1-430: loss +0.001 [-0.006, +0.011]. Over a few hundred windows the heads
+  dominate.
+- nmlars (`--normuon 1 --muon-lars 1`, auto target, clamp 2) equalises the per-matrix update / weight ratio. The control at 0.003 is
+  uneven: L0 8.6e-4 [6e-4, 1.3e-3], deep 1.3e-3 [8.5e-4, 1.9e-3], attention 1.6e-3 [1.1e-3, 3.2e-3]. nmlars puts every matrix at
+  ~1.3e-3 [1.2e-3, 1.4e-3], so L0 gets ~1.5x the step and the attention outliers less.
+- The nmlars gain opens after the lars EMAs settle (beta 0.99, ~200 updates). Throughput is unchanged (0.668 vs 0.662 samp/s).
+- Seed 8 (other windows) confirms the direction at a smaller size. Cooldown loss: -0.016 (seed 7), -0.003 (seed 8). wind4: -0.007 in both
+  seeds. acc: +0.016 and +0.014. Every loss and wind4 CI after window 500 excludes 0 in both seeds.
+- Ablation (seed 7): NorMuon alone carries the whole gain, and lars adds nothing consistent on top. What helps is NorMuon's per-row
+  (per output channel) second-moment normalisation, not the per-layer equalisation of the update / weight ratio.
+- Seed-8 NorMuon (2026-11-15, stopped at window 740 for a merge gate, not rerun: two seeds were judged enough): same sign as seed 7,
+  smaller this early. Windows 501-740: loss -0.004 [-0.008, -0.001], wind4 -0.007 [-0.009, -0.004], phase flat, gn 4.9 vs 5.6. NorMuon
+  is positive on wind4 in both seeds. It also lowers gn (seed 7 -1.9 to -2.1, seed 8 -0.7), so its steps are steadier.
+- A 0.0015 control (seed 7, stopped at window 830) beats 0.003 by -0.017 loss, -0.007 phase, -0.013 wind4: about 4x NorMuon's effect.
+  The lr ranking is monotone (0.0015 > 0.003 > 0.006 > 0.012). That is what the start-checkpoint bias predicts: every arm resumes a
+  net converged at 0.003, and a smaller step disturbs it less. So this does not justify a lower peak lr. The from-scratch
+  check was not run: training was paused until the bug-fix round ends. It would be a pair of `admuon_desk_scratch2.sh` arms
+  (normuon, 0.003 vs 0.006, then 0.0015 vs 0.003; the original admuon_desk_scratch.sh's rm guard refused scratch_* outputs).
+- Recommended for try7: `--normuon 1` at Muon 0.003 / AdamW 3e-4. Run the from-scratch pair before choosing the peak lr. lars and DoG
+  stay off (both are opt-in flags, checkpoint-compatible).
+
 ## Sampler GPU work vs the training stream; the pair rule on both cards (2026-11-14, branch w4stream-20261114)
 
 **The w4 context stream was blocking.** Training kernels launch on the legacy default stream (no stream argument, no per-thread
