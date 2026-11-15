@@ -21,7 +21,11 @@ STRICT=$(sed -n 's/^set(UFSM_STRICT_UNITS \(.*\))$/\1/p' CMakeLists.txt)
 [ -n "$STRICT" ] || { echo "mcc_compile: UFSM_STRICT_UNITS not found in CMakeLists.txt"; exit 2; }
 SM=${UFSM_STRICT_MATH:-0}; case $SM in ON|on|1) SM=1;; *) SM=0;; esac
 if [ $SM = 1 ]; then HFP=; else HFP="-ffast-math -fno-finite-math-only"; fi
-export M H T STRICT SM HFP
+# the device library's function names (mcudahw's hw_lib table, cudahw/obj/lib.c), for the link check in one()
+LIB=; LC=${UFSM_MCC_CUDA:-$(dirname "$M")/cudahw}/obj/lib.c
+if [ -f "$LC" ]; then LIB=$T/lib.names; sed -n 's/^ *{"\(__mcuda_[A-Za-z0-9_]*\)".*/\1/p' "$LC" | sort -u > "$LIB"; [ -s "$LIB" ] || LIB=; fi
+[ -n "$LIB" ] || echo "mcc_compile: no device library table at $LC: the link check is skipped"
+export M H T STRICT SM HFP LIB
 one() {   # one SOURCE: compile it, print "FAIL name: first error" on failure
   f=$1; b=$(basename "${f%.*}")
   case $f in
@@ -30,10 +34,18 @@ one() {   # one SOURCE: compile it, print "FAIL name: first error" on failure
           set -- "$M" -mglibc -O3 $a $fp -D_GNU_SOURCE -DUFSM_ARCH=120 -DUFSM_CUDA_VERSION=mcc -isystem "$H" -include "$H/mcuda_device.h" -include src/ufsm_dev.cuh -Isrc;;
     *)    set -- "$M" -mglibc -std=c23 -O3 -march=native $HFP -pthread -D_GNU_SOURCE -Isrc -Ithird_party -Ithird_party/surfcomp -isystem "$H";;
   esac
-  if ! "$@" -c "$f" -o "$T/$b.o" > "$T/$b.log" 2>&1; then echo "FAIL $b: $(grep -m1 -E 'error|fatal' "$T/$b.log" || head -1 "$T/$b.log")"; fi
+  case $f in *.cu) set -- "$@" --ptx-out="$T/$b.ptx";; esac
+  if ! "$@" -c "$f" -o "$T/$b.o" > "$T/$b.log" 2>&1; then echo "FAIL $b: $(grep -m1 -E 'error|fatal' "$T/$b.log" || head -1 "$T/$b.log")"; return; fi
+  # link check: every device function the PTX calls but does not define must be in mcudahw's device library (the table its
+  # loader resolves __mcuda_NAME against; __mcuda_printf the driver's). An undefined one fails only when the module loads (11-15:
+  # __fdividef / __frcp_rn / __threadfence_system as implicit externs, in most lp kernels); ptxas -c and this compile miss it
+  if [ -f "$T/$b.ptx" ] && [ -n "$LIB" ]; then
+    u=$(sed -n 's/^\.extern \.func.* \(__mcuda_[A-Za-z0-9_]*\) *(.*/\1/p' "$T/$b.ptx" | sort -u | grep -vxF -f "$LIB" | grep -vx '__mcuda_printf' | head -3 | tr '\n' ' ')
+    [ -n "$u" ] && echo "FAIL $b: device functions no library defines (the module would not load): $u"
+  fi
 }
 export -f one
 out=$(ls src/*.c src/*.cu third_party/surfcomp/surfcomp.c | xargs -P "${UFSM_NCPU:-4}" -I{} bash -c 'one "$@"' _ {})
 n=$(ls src/*.c src/*.cu third_party/surfcomp/surfcomp.c | wc -l)
 if [ -n "$out" ]; then echo "$out"; echo "mcc_compile: $(echo "$out" | wc -l) of $n units failed ($M)"; exit 1; fi
-echo "mcc_compile: ok ($n units, $M)"
+echo "mcc_compile: ok ($n units, $M${LIB:+; device calls all in the library})"
