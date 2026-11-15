@@ -9,11 +9,11 @@ set -eu
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 "$MF" fx 256 2 1 > fx.log 2>&1
-C=(--task unwrap2 --levels 1 --P __P__ --B 1 --gpus __G__ --sampler-slots 4 --val-batches 0 --log-every 2 --ckpt-every 1000 --fp4 2
+C=(--task unwrap2 --levels 1 --P __P__ --B 1 --gpus __G__ --sampler-slots 4 --val-batches __VB__ --log-every 2 --ckpt-every 1000 --fp4 2
    --input-prec 8 --warmup 0 --seed 5 --wind4-tile 0 --widths 16,32,64 --lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --sched wsd --cooldown 0 --opt muon
    --muon-lr 0.002 --lr 0.001 --packed-weight 8)
 fail() { echo "FAIL: $*"; exit 1; }
-run() { local tag=$1 a=(); shift; for x in "${C[@]}"; do x=${x/__P__/${P_:-64}}; a+=("${x/__G__/${GPUS:-0}}"); done
+run() { local tag=$1 a=(); shift; for x in "${C[@]}"; do x=${x/__P__/${P_:-64}}; x=${x/__VB__/${VB_:-0}}; a+=("${x/__G__/${GPUS:-0}}"); done
         env ${ENV:-} "$U" train fx/sources.json --out $tag "${a[@]}" "$@" > $tag.log 2>&1 || fail "$tag ($D/$tag.log)"; }
 losses() { grep '^step' $1.log | sed 's/ [0-9.]* samp\/s.*//'; }
 ENV=UFSM_SAMPLER_DELAY_MS=250 run starve --workers 1 --steps 40 --echo-max 3
@@ -37,8 +37,17 @@ grep -q "echo-max off under --det 1" det1.log || fail "--det 1 did not switch ec
 echo "  --det 1: echo off, losses equal"
 # (4) --echo-max with validation batches under --gpu-aug 3 (try6, 2026-11-14: the validation sampler inherited --echo-max without cube
 #     batches and refused, "cannot construct validation sampler", so the run did not start): it starts, validates and trains
-run val --workers 2 --steps 8 --echo-max 3 --gpu-aug 3 --val-batches 2 --val-train-ok 1 --val-every 4
+VB_=2 run val --workers 2 --steps 8 --echo-max 3 --gpu-aug 3 --val-train-ok 1 --val-every 4
 [ "$(grep -c '^step' val.log)" = 4 ] || fail "echo + validation: not 4 step lines ($D/val.log)"
 ! grep -q "cannot construct validation sampler" val.log || fail "echo + validation: the validation sampler refused ($D/val.log)"
+grep -q "^2 validation batches of" val.log || fail "echo + validation: no validation batches drawn ($D/val.log; before 11-15 the base args' --val-batches 0 won: opt() takes the first)"
 echo "  --echo-max with --val-batches 2 under --gpu-aug 3: starts and trains"
+# (5) the validation windows' disk store against the free space (try7, 2026-11-15: 32 windows at P 768 = 159 GB filled /vesuvius): with
+#     "no" free space the run switches to --val-store regen and still validates; the stored path reports its size
+grep -q "^validation windows: 2 x [0-9.]* GB" val.log || fail "no validation windows size line ($D/val.log)"
+VB_=2 ENV=UFSM_VAL_DISK_FREE_GB=0.001 run valregen --workers 2 --steps 8 --echo-max 3 --gpu-aug 3 --val-train-ok 1 --val-every 4
+grep -q "\-\-val-store regen instead" valregen.log || fail "low disk: no switch to --val-store regen ($D/valregen.log)"
+[ "$(grep -c '^step' valregen.log)" = 4 ] || fail "low disk: not 4 step lines ($D/valregen.log)"
+[ "$(grep -c '^val ' valregen.log)" -ge 1 ] && [ "$(grep -c '^val ' valregen.log)" = "$(grep -c '^val ' val.log)" ] || fail "low disk: validation lines differ from the stored run ($D/val.log, $D/valregen.log)"
+echo "  --val-store disk with no free space: regen, validates"
 echo "test_echo: ok"
