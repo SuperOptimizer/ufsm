@@ -1134,7 +1134,12 @@ template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const
     if (MT == 4) TZ = 2;
     static int ring_env = -1;
     if (ring_env < 0) ring_env = getenv("UFSM_F4R") ? atoi(getenv("UFSM_F4R")) : 1;
-    if (ring_env && (Cip == 32 || (Cip == 64 && ring_env >= 1)) && !sp.up && !tz_env) {   /* one or two input chunks: staged once per z tile for
+    /* --skip-empty: a masked conv takes launch_f4 (the ring kernels ignore the mask). UFSM_SKIP_RING=1: the ring kernels anyway (the conv runs
+       dense and unmarked, its backward dense too: the pre-11-15 behaviour, for A/B benches) */
+    static int skring = -1; /* mgpu: env */ if (skring < 0) skring = getenv("UFSM_SKIP_RING") ? atoi(getenv("UFSM_SKIP_RING")) : 0;
+    const bool skm = !skring && IS_MX(TO) && nn_skip_masks(xs, sp);
+    if (skm && (Cip == 32 || Cip == 64) && getenv("UFSM_SKIP_DEBUG")) fprintf(stderr, "skip: masked %d->%d conv %dx%dx%d (Cip %d, up %d) bypasses the ring kernels\n", xs.c, cout, xs.d, xs.h, xs.w, Cip, sp.up);
+    if (ring_env && (Cip == 32 || (Cip == 64 && ring_env >= 1)) && !sp.up && !tz_env && !skm) {   /* one or two input chunks: staged once per z tile for
                                                                                          every output tile, planes in a ring */
         if (Cip == 32) switch (MT * 10 + TZ) {
         case 14: launch_f4r<1, 4, 1, T, TO>(x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp); return;
@@ -1151,7 +1156,7 @@ template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const
     if constexpr (IS_MX(T)) {   /* dec0.c1 of a 32-wide level 0 (32-channel up part | skip): the ring kernel with the up chunk staged per
                                    new plane (f4ru_stage; same bits as conv_fwd_f4_k). UFSM_F4RU=0: conv_fwd_f4_k */
         static int ru_env = -1; if (ru_env < 0) ru_env = getenv("UFSM_F4RU") ? atoi(getenv("UFSM_F4RU")) : 1;
-        if (ru_env && ring_env && sp.up == 2 && sp.x2 && !sp.sr && Cip == 64 && CxP == 32 && MT == 2 && TZ == 4 && !tz_env && !(gp.ns || sp.gp2.ns) && xs.c > Cx) {
+        if (ru_env && ring_env && !skm && sp.up == 2 && sp.x2 && !sp.sr && Cip == 64 && CxP == 32 && MT == 2 && TZ == 4 && !tz_env && !(gp.ns || sp.gp2.ns) && xs.c > Cx) {
             launch_f4r<2, 4, 2, T, TO, 1>(x, xs, wq, ws, b, cout, y, Cop, gp, osum, Go, sp);
             return;
         }

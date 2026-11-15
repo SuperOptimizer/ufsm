@@ -8,7 +8,8 @@
    (4) training (DESIGN 2026-11-14 "skip-air training"): forward + backward with MX-fp4 gradients. Every tile active: the gradient
        the dense one (within the dense run-to-run noise) and the masked backward-data / wgrad kernels did run; masks from the CT: the gradient finite, the
        masked backward counted, its cosine to the dense gradient reported (bit identity does not hold: the weight gradients' atomics); the checkpoint header round-trips skip_empty.
-   (5) the masked backward kernels exactly, at the try6 level-0 width 256 (audit 2026-11-14 kernels.md #11): one masked conv (16 x 32 x 32,
+   (5) the masked backward kernels exactly, at the try6 level-0 width 256 (audit 2026-11-14 kernels.md #11) and at 64 (the ring kernels' width, which a
+       masked conv bypasses): one masked conv (16 x 32 x 32,
        2 of 16 tiles active, a tile row out of every active tile's reach): backward-data on gy == the dense backward-data on gy zeroed outside
        the active tiles, bytes (the same SR seed; inactive tiles: the bias-0 epilogue); the weight gradient (the records of inactive tiles
        zeroed) == the dense one on the zeroed gy within the atomics' order (rel 1e-6); the bias gradient (summed before the zeroing) == the
@@ -45,11 +46,13 @@ int main(void) {
     nn_set_tf32(1); nn_set_f16(1); nn_set_sr(0); nn_set_prec(3);
     if (nn_set_prec_policy("all=fp4:fp4:fp4")) return 1;
     unet_set_act_mx4(1);
-    const int P = 64, ZM = 20;   /* material planes [0, ZM) */
-    /* UFSM_SANITIZE=racecheck (tests/sanitize.sh): section (4) runs only the three passes that reach the masked backward kernels (dense, all
-       active, CT masks) and skips its numeric comparisons (the plain run checks those). The full section died under racecheck after section (2)
-       with the pod cgroup's oom_kill counter rising (merge3, 11-14/15: 1900 s, oom_kill 3 -> 4); the cause is inferred, not confirmed. */
+    /* UFSM_SANITIZE=racecheck (tests/sanitize.sh), the QUICK size: a 32^3 window with material in z < 6 (level 0: 2 of 4 tile planes active
+       at margin 1, as 3-4 of 8 at P 64), no margin profile (the plain run checks it), and section (4) runs only the three passes that reach
+       the masked backward kernels (dense, all active, CT masks) without its numeric comparisons. At P 64 racecheck took ~110 s a forward on
+       the pod's RTX PRO 4000 and 3289 s in all (11-15), past the 30-min budget. (The full section (4) died under racecheck after section (2)
+       with the pod cgroup's oom_kill counter rising, 11-14/15: 1900 s, oom_kill 3 -> 4; the cause is inferred, not confirmed.) */
     const char *san = getenv("UFSM_SANITIZE"); const int race = san && !strcmp(san, "racecheck");
+    const int P = race ? 32 : 64, ZM = race ? 6 : 20;   /* material planes [0, ZM) */
     unet_cfg cfg = {}; cfg.nlev = 3; cfg.widths[0] = 96; cfg.widths[1] = 128; cfg.widths[2] = 160; cfg.cin = 4; cfg.cout = 2; cfg.G = 8; cfg.gn_ema = 1;
     unet *u = unet_create(&cfg); unet_init(u, 11);
     const shape5 xs = {1, 4, P, P, P}; const size_t p3 = (size_t)P * P * P, nx = 4 * p3;
@@ -93,7 +96,7 @@ int main(void) {
         CHECK(nm > 0, "masked launches");
     }
     {   /* the deviation profile by margin: mean |dlogit| per 4-plane band (z from the material top), over the mean |logit| */
-        for (int mg = 1; mg <= 3; mg++) {
+        for (int mg = 1; mg <= (race ? 0 : 3); mg++) {
             nn_skip_off(); nn_skip_build(dct, P, P, P, 1, 3, 0, mg);
             const double a0 = nn_skip_share(0);
             nn_d2h(lm, unet_forward(u, dx, xs, 0), no * 4);
@@ -177,11 +180,12 @@ int main(void) {
         remove(path); nn_free(dgy); free(gd); free(gm); free(gy);
     }
 sec5:
-    {   /* (5) masked backward-data / weight gradient == dense on the zeroed gy, width 256 */
-        /* UFSM_SANITIZE=racecheck (tests/sanitize.sh): width 64. At 256 the run died without output ~30 min in (likely the wide kernels' shared-memory tracking past the
-           pod's 31 GB cgroup: its oom_kill counter rose; "Target application returned an error", 0 hazards, 11-15);
-           the masked-vs-dense logic is the same at 64 (two 32-channel blocks) */
-        const int C = race ? 64 : 256, D = 16, H = 32, W = 32; const shape5 s5 = {1, C, D, H, W}; const size_t S = (size_t)D * H * W, n = (size_t)C * S, nw = (size_t)C * C * 27;
+    for (int wi = race; wi < 2; wi++) {   /* (5) masked backward-data / weight gradient == dense on the zeroed gy, widths 256 and 64 */
+        /* width 64 (Cip 64): fwd_f4_t's ring kernels (launch_f4r) do not take the mask; a masked conv must bypass them (nn_skip_masks). Before
+           (11-15) the 64-wide forward ran dense silently: masked counts 0, the racecheck run's only width, FAILed after 3289 s on the pod.
+           UFSM_SANITIZE=racecheck (tests/sanitize.sh): width 64 only. At 256 the run died without output ~30 min in (the wide kernels'
+           shared-memory tracking, 0 hazards, 11-15) */
+        const int C = wi ? 64 : 256, D = 16, H = 32, W = 32; const shape5 s5 = {1, C, D, H, W}; const size_t S = (size_t)D * H * W, n = (size_t)C * S, nw = (size_t)C * C * 27;
         const int my = 4, mx = 2; uint8_t hm[2 * 4 * 2] = {};   /* 2 x 4 x 2 tiles */
         hm[(0 * my + 0) * mx + 0] = 1; hm[(1 * my + 1) * mx + 1] = 1;   /* dilated by one tile: y tile 3 out of reach (gx there 0) */
         float *hx = malloc(n * 4), *hg = malloc(n * 4), *hz = malloc(n * 4), *hw = malloc(nw * 4);

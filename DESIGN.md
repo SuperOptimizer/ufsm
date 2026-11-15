@@ -6,6 +6,47 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Skip-empty: masked convs bypass the ring kernels; test_skip_empty racecheck QUICK (2026-11-15, branch skipmask-20261115)
+
+test_skip_empty~racecheck FAILed on the pod after 3289 s: section (5), at its racecheck width 64, reported masked forward 0, backward-data 0,
+wgrad 0 and gx bytes differing. This was neither a launch failure nor an OOM (the cgroup oom_kill counter stayed at 4). Only `launch_f4`
+(lp_f4fwd.cuh) applies the mask (`lp_skip_get`), and `fwd_f4_t` sends Cip 32 / 64 convs to the ring kernels (`launch_f4r`, and `f4ru` for
+dec0.c1) before it reaches `launch_f4`. So any 32 / 64-wide conv on a level grid ran dense silently in the forward and was never marked.
+For backward-data, a masked conv whose gy is 32 / 64 wide would land on the ring kernel and abort in `nn_skip_bwd_check`; that path was
+loud, not divergent.
+
+Fix: `nn_skip_masks(xs, sp)` (nn_skip.cu) gives `launch_f4`'s decision without `lp_skip_get`'s side effects: forward means the output grid
+is a level and there is no SR; backward-data means the conv was seen masked. When it is set, `fwd_f4_t` skips `launch_f4r` / `f4ru`.
+`p16_f4` (input <= 16 channels) and `f4u` (the fused upsample) still run dense. Their forward is consistent (the conv is not marked, so its
+backward runs dense too), and a masked conv whose backward-data reaches them aborts in `nn_skip_bwd_check` as before.
+
+test_skip_empty (5) now runs at widths 256 and 64. At 64 the masked bwd-data matches the dense one on the zeroed gy byte for byte, and the
+wgrad / bias rel is 0 (desk and pod). Under racecheck the test runs a QUICK size: P 32, material z < 6 (level 0: 2 of 4 tile planes active),
+no margin profile, and width 64 only in (5). At P 64 racecheck took ~110 s per forward on the pod's RTX PRO 4000 (setup + (1) 443 s,
+each margin forward 105-126 s). QUICK under racecheck: 505 s on the pod, 0 hazards, oom_kill unchanged (suite EST 760 s);
+synccheck (full size) 3 s, 0 errors. test_memws and test_split_ab (the skip-empty CLI paths) pass.
+
+Cost of the bypass at the try7 config: with try7's argv (widths 256-448, `--lat-c 29`, P 768, `UFSM_SKIP_DEBUG=1`), exactly one conv takes
+the bypass, the level-0 input conv 32 -> 256 at 192^3. Bench `/vesuvius/integ19/skbench/mb/bench_skipring.c` (desk 5060 Ti, MX-fp4,
+SR on, mean of 10). It times the masked `launch_f4` against `UFSM_SKIP_RING=1`, the old path (ring forward, dense and unmarked, so
+backward-data and wgrad run dense too):
+
+| active tile planes | masked fwd / bwd-data / wgrad, ms | ring (dense), ms | masked total vs ring |
+|---|---|---|---|
+| 6 of 24 | 7.78 / 4.67 / 20.88 | 15.27 / 14.55 / 35.11 | 33.3 vs 64.9 |
+| 12 of 24 | 10.97 / 8.06 / 25.41 | 15.29 / 14.56 / 35.13 | 44.4 vs 65.0 |
+| 18 of 24 | 14.32 / 11.57 / 32.59 | 15.29 / 14.56 / 35.13 | 58.5 vs 65.0 |
+| 24 of 24 | 17.69 / 14.70 / 36.28 | 15.30 / 14.58 / 35.18 | 68.7 vs 65.1 |
+
+The bypass costs at most +3.6 ms a window, at 100 % active. At the try6 step rate (0.28 windows/s over 2 GPUs, ~7 s a window a GPU)
+that is <0.1 %, under the 2 % threshold, so there is no follow-up to put the mask into the ring kernels. With air in the window the
+masked path is faster (-6 to -32 ms). `UFSM_SKIP_RING=1` stays as the A/B knob. `p16_f4` and `f4u` are not bypassed (see above).
+
+Runs affected: scratch2 try4 through try6 (11-14 08:22 onward, `--skip-empty 1 --skip-thr 0 --skip-margin 1`, `--lat-c 29`) ran that input
+conv dense in all three directions. Forward and backward were consistent: the conv was never marked, so its backward ran dense, and the
+masked-bwd-data-on-a-ring-kernel case aborts in `nn_skip_bwd_check` and never fired. Their losses and gradients are those of the net as
+run, so no correctness caveat applies; they only skipped less than `--skip-empty` reported. try7 (not launched) gets the masked conv.
+
 ## Fast-math round: the last four fast-tier failures (2026-11-15, branch fmfix-20261115, off fastmath-20261114)
 
 The fm integration (mega-audit 087325a0 + fastmath 9561823b, desk) left four fast-tier failures. Each checked against the master
