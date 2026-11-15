@@ -22,7 +22,7 @@ case "$ARM" in
   *) echo "unknown arm $ARM" >&2; exit 2 ;;
 esac
 mkdir -p "$OUT"; R="$OUT/scratch_${ARM}_lr${LR}_s$SEED"
-case "$R" in /vesuvius/ufsm/admuon/*/r_*) rm -rf -- "$R" ;; *) echo "refusing OUT $R" >&2; exit 2 ;; esac
+case "$R" in /vesuvius/ufsm/admuon/*/scratch_*) rm -rf -- "$R" ;; *) echo "refusing OUT $R" >&2; exit 2 ;; esac
 AUG="--zfix 1 --symmetry-p 0.5 --geometry-aug 1 --rotate-deg 5 --rotate-p 0.2 --elastic-p 0.15 --axis-jitter 1250 --axis-jitter-p 0.5 --axis-jitter-deg 20
   --aug none --aug-strength 1 --aug-blur-p 0.7 --aug-blur-s 1.6 --aug-lowres-p 0.1 --aug-lowres-s 0.6 --aug-paganin-p 0.2 --aug-paganin-s 1.0
   --aug-tone-p 0.3 --aug-gin-p 0.15 --aug-noise-p 0.15 --aug-cnoise-p 0.1
