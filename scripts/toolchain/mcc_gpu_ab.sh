@@ -21,10 +21,10 @@
 #            on / off: a ratio above 1 means the optimisation pays). Default arms, on the kernels each changes most (static
 #            SASS, 2026-11-14): NOLATCH stride 2 (conv_fwd_s2_f8_k<*,*,0> hot loop 513 -> 607 with the fold, lp_s2 total 576386 ->
 #            568327), NORANGE stride 2 (lp_s2 hot loops 16405 -> 15436), NOHOIST fp4 wgrad + stride 2 (lp_f4wgrad_i1 hot loop 30461
-#            -> 26578), NOFASTCALL wgrad / GN / level-0 misc (fmaf(1, x, 0) folds). NOLATCH_BUILD: the old name of SW_NOLATCH.
+#            -> 26578), NODIVCSE stride 2 (lp_s2 548193 -> 492637), NOFASTCALL wgrad / GN / level-0 misc (fmaf(1, x, 0) folds). NOLATCH_BUILD: the old name of SW_NOLATCH.
 # Fixed checkpoint: CKPT, else a copy of scratch2/last.ckpt taken once into OUT/fixed.ckpt (reruns reuse it).
 # Prerequisites in BOTH build dirs: ufsm, test_head_tc and the bench_* below (cmake --build DIR --target ufsm test_head_tc bench_f4conv ...;
-# missing ones are skipped and listed). Env: PARTS ("jit bench switch train predict"), SW_ARMS, SW_NOLATCH / SW_NORANGE / SW_NOHOIST /
+# missing ones are skipped and listed). Env: PARTS ("jit bench switch train predict"), SW_ARMS, SW_NOLATCH / SW_NORANGE / SW_NODIVCSE / SW_NOHOIST /
 # SW_NOFASTCALL, AB_JITCACHE, REPS (3), GPU (0, the card the benches use), JITN (8),
 # BENCH_RE (a regex over the bench lines below), TRAIN_STEPS, TRAIN_P, CMDFILE, CKPT, PBOX, TMO (per bench s, 900), LOCKWAIT (s, 1800).
 # Only in a GPU window (the desk cards otherwise belong to scratch2; feedback-desk-gpu-scratch2-only); the merge3 queue line runs it.
@@ -168,7 +168,7 @@ PY
 fi
 
 # ---- switch: one mcc optimisation off per arm (a nested run of this script, bench only, under the locks held here)
-SW_ARMS=${SW_ARMS:-"NOLATCH:^bench_s2 NORANGE:^bench_s2 NOHOIST:^(bench_wgrad4|bench_wgl0|GY8=1|bench_s2b|bench_s2$) NOFASTCALL:^(bench_wgrad4|bench_wgl0|GY8=1|bench_gn|UFSM_GN_X|bench_l0misc)"}
+SW_ARMS=${SW_ARMS:-"NOLATCH:^bench_s2 NORANGE:^bench_s2 NODIVCSE:^bench_s2 NOHOIST:^(bench_wgrad4|bench_wgl0|GY8=1|bench_s2b|bench_s2$) NOFASTCALL:^(bench_wgrad4|bench_wgl0|GY8=1|bench_gn|UFSM_GN_X|bench_l0misc)"}
 [ -n "${NOLATCH_BUILD:-}" ] && [ -z "${SW_NOLATCH:-}" ] && SW_NOLATCH=$NOLATCH_BUILD
 if part switch; then
   for arm in $SW_ARMS; do
