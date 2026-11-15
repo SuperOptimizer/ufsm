@@ -100,6 +100,9 @@ per GPU.
 | nmlars vs Muon, both 0.003 | 1-1000 | ~0 (CIs straddle 0) | | | | |
 | nmlars vs Muon, both 0.003, seed 8 | 1001-1600 | -0.007 [-0.010, -0.004] | -0.003 | -0.010 [-0.013, -0.007] | +0.021 | |
 | nmlars vs Muon, both 0.003, seed 8 | 1601-2000 | -0.003 [-0.006, -0.002] | -0.001 (n.s.) | -0.007 [-0.010, -0.003] | +0.014 | 3.1 / 3.8 |
+| normuon vs Muon, both 0.003 | 1001-1600 | -0.018 [-0.021, -0.016] | -0.007 | -0.010 [-0.016, -0.004] | +0.023 | 4.2 / 6.3 |
+| normuon vs Muon, both 0.003 | 1601-2000 | -0.017 [-0.019, -0.015] | -0.004 [-0.005, -0.004] | -0.012 [-0.015, -0.009] | +0.025 | 3.6 / 5.5 |
+| nmlars vs normuon (what lars adds) | 1601-2000 | +0.001 [-0.000, +0.003] | -0.000 | +0.004 [+0.001, +0.010] | -0.009 | |
 
 - The lr is monotone on every head: 0.003 beats 0.006, which beats 0.012. The start checkpoint had trained at 0.003 since its 11:59
   relaunch, so part of the gap is the shock of a higher lr. Either way, nothing argues for a larger lr. The fixture rewarded 2x (above);
@@ -115,7 +118,9 @@ per GPU.
 - The nmlars gain opens after the lars EMAs settle (beta 0.99, ~200 updates). Throughput is unchanged (0.668 vs 0.662 samp/s).
 - Seed 8 (other windows) confirms the direction at a smaller size. Cooldown loss: -0.016 (seed 7), -0.003 (seed 8). wind4: -0.007 in both
   seeds. acc: +0.016 and +0.014. Every loss and wind4 CI after window 500 excludes 0 in both seeds.
-- Recommended for try7: `--normuon 1 --muon-lars 1` at Muon 0.003 / AdamW 3e-4 (main decides).
+- Ablation (seed 7): NorMuon alone carries the whole gain, and lars adds nothing consistent on top. What helps is NorMuon's per-row
+  (per output channel) second-moment normalisation, not the per-layer equalisation of the update / weight ratio.
+- Recommended for try7: `--normuon 1` at Muon 0.003 / AdamW 3e-4 (main decides; seed-8 normuon confirmation queued).
 - Open: which of NorMuon or lars carries the gain, a 0.0015 control, and a from-scratch 0.003 vs 0.006 peak pair (every arm above starts
   from a checkpoint trained at 0.003, which favours <= 0.003).
 ## Sampler GPU work vs the training stream; the pair rule on both cards (2026-11-14, branch w4stream-20261114)
