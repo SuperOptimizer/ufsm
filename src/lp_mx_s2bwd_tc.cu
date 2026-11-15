@@ -1,5 +1,5 @@
 /* MX stride-2 backward-data of the narrow down convs (16 or 32 channels, Ci == Co) on the tensor cores */
-#include <mutex>
+#include <pthread.h>
 #include "lp_mxops.cuh"
 /* gx[ci][u] (+)= sum over the taps k with (u + 1 - k) even, o = (u + 1 - k) / 2 in range, of sum_co w[co][ci][k] gy[co][o]
    (k = 3, pad 1). The fine voxels split into 8 parity classes p (u = 2 m + p per axis); within a class every voxel uses
@@ -524,10 +524,11 @@ static s2q4_quads s2q4_build(void) {
     if (q != 9) { fprintf(stderr, "s2b_f4q: %d quads\n", q); abort(); }
     return Q;
 }
+static s2q4_quads g_s2q4_Q; static pthread_once_t g_s2q4_once = PTHREAD_ONCE_INIT;   /* mgpu: guarded (pthread_once; a function-local static initialiser
+    would not do: the CUDA units build with -fno-threadsafe-statics; was a racy lazy build. pthread_once, not std::call_once: the mcc toolchain's <mutex> has no once_flag) */
+static void s2q4_init(void) { g_s2q4_Q = s2q4_build(); }
 static int s2b_f4q(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, unsigned osr) {
-    static s2q4_quads Q; static std::once_flag qonce;   /* mgpu: guarded (std::call_once; a function-local static initialiser would not do: the
-                                                          CUDA units build with -fno-threadsafe-statics; was a racy lazy build) */
-    std::call_once(qonce, [] { Q = s2q4_build(); });
+    pthread_once(&g_s2q4_once, s2q4_init); const s2q4_quads &Q = g_s2q4_Q;
     uint8_t *wq = lp_buf<uint8_t>(0, (size_t)9 * 16 * 32), *ws = lp_buf<uint8_t>(1, (size_t)9 * 16 * 4);
     prep_w4q_k<<<nblk_(9 * 16 * 4, 128), 128>>>(w, wq, ws, Q);
     const int2 zw = zw_trange(xs.d, 4);   /* z-window: gx planes in tiles of 4 (2 gy planes) */
