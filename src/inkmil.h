@@ -23,6 +23,8 @@ __attribute__((weak)) int ink_mil_fwd_slab(const void *lg, int bf16, int z0, int
 __attribute__((weak)) int ink_mil_fin(float *acc, const inkray *rays, int nr, int D, int H, int W, float R, float step, float tau, float eps, float scale, double *loss, void *stream);
 __attribute__((weak)) void ink_mil_set_scale_dev(const float *p);   /* fin's scale x p[0] on the device (train: the head plane scale; nullptr: off) */
 __attribute__((weak)) void ink_mil_set_max(int nr);   /* the trainer's ray cap: bwd_slab sizes its buffers for it on first use (no growth in training) */
+__attribute__((weak)) size_t ink_mil_bytes(int nr, float R, float step);   /* the device bytes of the MIL buffers at ray cap nr: the planner keeps them free */
+__attribute__((weak)) size_t ink_mil_peak_bytes(void);   /* the largest per-thread total the buffers reached */
 __attribute__((weak)) void ink_mil_set_async(int on);   /* 1: bwd slabs bound their pair counts from fin's plane counts (no per-slab sync); 0: the per-slab readback */
 __attribute__((weak)) int ink_mil_swap_hostmem(const float *logit, int D, int H, int W, const inkray *ra, const inkray *rb, int nr, float R, float step, float tau,
                                                 float eps, float scale, int nslab, float *grad);   /* tests: rays B under step 1's backward, then step 2 on B */
