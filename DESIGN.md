@@ -1306,6 +1306,11 @@ level-1 set at 1..3), so try6's labels are unchanged; they matter as soon as tho
   256 field rows = 512 level-2 planes = 32 ref lattice cells (L 16 native voxels). So dir -1 is right (sheet identity 0.487 -> 0.762,
   fibfit) and removes the bias, and what is left is a z-periodic count-field artifact of that period (not the direction). Open: find
   the 512-plane structure in count-field (solve-cell / lattice blocking). Data `/vesuvius/ufsm/gt/pub1667-cmp/{slabcoh_cmp.txt,coh_dm1/}`.
+  **Cause and check (audit-unroll, 11-15):** the ref's --model-stride 4 (local gauge sums only on chunks % 4 == 0, 128-row chunks: rows
+  [512k, 512k + 128) widened +-64 by the solve-cell smoothing; gg = 0 elsewhere); fix shellfix 51f07ddf (z-interpolated gauge, MSTRIDE 1).
+  ref-dm1 rebuilt with --model-stride 1 (same flags, master binary): per-plane ref vs net coherence rows 200..4552 mean 0.337 -> 0.567,
+  p10 0.071 -> 0.432, planes < 0.35: 38 -> 5 of 69 (only the scroll ends, rows 200-328 and 4552); no alternation, 834-846 / 2990-3012 /
+  3896-3916 flat at 0.57-0.60 / 0.69-0.72 / 0.68-0.69. Data `/vesuvius/ufsm/gt/pub1667-cmp/{ref-dm1-s1,coh_dm1s1}`.
 - **#18:** fit-join with --ref gave a slab without ref cells and without overlap cells the first DP candidate, cen - 12 (every candidate
   cost 0): 12 turns off. It now takes the chain's prediction, the summary says how many slabs came from the ref / the chain / nothing,
   each unconstrained slab warns, `--require-constrained 1` exits 3 (test_fit_join cut-36 / cut-24 cases). 1667 / 1299 / P4 slab 0 have
