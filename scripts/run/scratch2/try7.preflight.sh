@@ -42,7 +42,7 @@ if [ "${1:-}" != --after ]; then
     [ -f $d/done ] && good "raster $r done" || bad "raster $r not done"
     grep -qF "\"$d\"" "$SRCJ" && good "sources read $d" || bad "sources json does not reference $d (try7 must read the datafix re-rasters)"; done
   grep -q ALLDONE /vesuvius/ufsm/datafix-20261114/raster/run.log 2>/dev/null && good "raster run.log ALLDONE" || bad "raster run.log has no ALLDONE"
-  if [ -f $R/scratch2.parse.ok ] && [ $R/scratch2.parse.ok -nt $E ] && [ $R/scratch2.parse.ok -nt "$U" ]; then good "parse check (UFSM_MEM_DRY) passed"
+  if [ -f $R/scratch2.parse.ok ] && [ $R/scratch2.parse.ok -nt $E ] && [ $R/scratch2.parse.ok -nt "$U" ]; then good "parse + memory plan: $(cat $R/scratch2.parse.ok) (try6 P768 on the old binary: 9.82 of 11.04 GB, margin 1.22)"
   else bad "no parse check newer than the env and binary: S2CTL_OWNER=merger2 bash $R/s2ctl.sh parse $E"; fi
   if [ -f $R/scratch2.audit.ok ] && [ $R/scratch2.audit.ok -nt $E ] && [ $R/scratch2.audit.ok -nt "$U" ]; then good "leak audit: $(cat $R/scratch2.audit.ok)"
   else bad "no leak audit newer than the env and binary: S2CTL_OWNER=merger2 bash $R/s2ctl.sh audit $E 1000"; fi
@@ -56,6 +56,7 @@ else
   z=$(grep -cE '^sources: .*: 0 held-out boxes from' $F)
   [ "$h" -ge "$n" ] && [ "$z" = 0 ] && good "$h of $n sources with held-out boxes, none with 0" || bad "held-out lines: $h of $n sources with boxes, $z with 0"
   grep -qE "^sources: .*: held-out box .* lies outside the CT" $F && bad "'lies outside the CT' in the dry log" || good "no box outside the CT"
+  grep -qiE "out of memory|grew after the memory plan|no mode fits|cudaErrorMemoryAllocation" $F && bad "memory trouble in the dry log: $(grep -iE -m1 'out of memory|grew after the memory plan|no mode fits|cudaErrorMemoryAllocation' $F | cut -c1-140)" || good "no OOM / workspace growth in the dry log"
   grep -qE "^val by source \(" $F && grep -qE "^val by scroll \(" $F && good "val by source / scroll lines" || bad "no 'val by source / scroll' line in the dry log"
 fi
 [ $ok = 1 ] && echo "PREFLIGHT OK" || echo "PREFLIGHT FAILED"; [ $ok = 1 ]
