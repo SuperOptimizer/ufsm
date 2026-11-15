@@ -11,8 +11,9 @@ set -eu
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3; G2=${UFSM_TEST_GPUS:-0,1}; N=${DPN:-4}
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 "$MF" fx 256 2 1 > fx.log 2>&1
-C=(fx/sources.json --task unwrap2   # (sources.json: the phase stored at level 0 = the training level; sources-l1.json is for level-1 windows: no coarse labels, dcd5e8b4)
-   --P 64 --B 1 --workers 2 --sampler-slots 4 --val-batches 0 --log-every 1 --ckpt-every 1000 --fp4 2
+C=(fx/sources.json --task unwrap2   # (sources.json + --levels 1 = level-0 windows only: the phase is stored at level 0; the default level mix also draws level 2,
+   # whose band codes need a stored phase at level 1 or 2: no coarse labels, sample.c labels_coarse; --levels refuses, --um-rungs skips)
+   --levels 1 --P 64 --B 1 --workers 2 --sampler-slots 4 --val-batches 0 --log-every 1 --ckpt-every 1000 --fp4 2
    --warmup 0 --seed 5 --widths 16,32,64 --det 1 --opt muon --lr 1e-3 --muon-lr 0.01)
 "$U" train "${C[@]}" --out dp --gpus "$G2" --steps "$N" > dp.log 2>&1 || { echo "FAIL: DP run ($D/dp.log)"; tail -5 dp.log; exit 1; }
 "$U" train "${C[@]}" --out acc --gpus 0 --steps $((2 * N)) --accum 2 > acc.log 2>&1 || { echo "FAIL: --accum run ($D/acc.log)"; tail -5 acc.log; exit 1; }
