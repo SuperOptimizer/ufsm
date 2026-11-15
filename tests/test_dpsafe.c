@@ -13,9 +13,12 @@
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); fails++; } } while (0)
 
-static void *worker_err(void *p) {   /* a worker: an invalid copy latches its own error; its nn_check sees it once */
+static void *worker_err(void *p) {   /* a worker: a failed allocation latches its own error (and posts it); its nn_check sees it once */
     (void)p; nn_init(0); nn_err_worker(1);
-    nn_d2h((void *)1, (const void *)1, 16);   /* (invalid pointers: cudaMemcpy fails, CKR latches) */
+    /* (not an invalid copy: on a driver in HMM addressing mode (the desk, 595 open module) cudaMemcpy takes (void *)1 as pageable host
+       memory and the copy segfaults in the driver instead of failing; an impossible cudaMalloc fails on every driver without touching
+       memory. UFSM_MALLOC_NULL=1 (set in main): nn_malloc returns null instead of ending the process) */
+    void *q = nn_malloc((size_t)1 << 60); if (q) nn_free(q);
     return nullptr;
 }
 static void *worker_quiet(void *p) {   /* a worker whose nn_check must not take another thread's posted error */
@@ -32,6 +35,7 @@ static unsigned seeds(unsigned salt, int n, unsigned *out) {
 }
 
 int main(void) {
+    setenv("UFSM_MALLOC_NULL", "1", 1);   /* (worker_err's failed allocation returns null, latched, instead of ending the process) */
     if (nn_init(0)) { fprintf(stderr, "test_dpsafe: no GPU\n"); return 1; }
     (void)nn_check();
     /* (1) error latches */
