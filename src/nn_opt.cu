@@ -41,7 +41,27 @@ __global__ void muon_sumsq_k(const float *x, size_t n, double *ss) {   /* block-
     if (threadIdx.x == 0) atomicAdd(ss, (double)r[0]);
 }
 __global__ void muon_scale_k(float *x, size_t n, const double *ss, float eps) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) x[i] *= (float)(1.0 / (sqrt(*ss) + eps)); }
-__global__ void muon_apply_k(float *p, const float *o, size_t n, float lr, float scale, float wd) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) p[i] = p[i] * (1.f - lr * wd) - lr * scale * o[i]; }
+/* the update scale per matrix: 0 Keller Jordan's sqrt(max(1, Co / K)); 1 (train --muon-scale spectral, Scion / muP): sqrt(Co / K), the
+   spectral norm's dual scaling sqrt(fan_out / fan_in) (fan_in = Ci k^3) under which the learning rate transfers across widths;
+   2 (train --muon-scale rms, Moonlight: Liu et al. 2025, arXiv 2502.16982): r sqrt(max(Co, K)). An orthogonal Co x K direction has
+   element RMS 1 / sqrt(max(Co, K)), so every matrix's update gets element RMS r (0.2: AdamW's typical update RMS), whatever its shape,
+   and Muon shares AdamW's lr. Under kj a 3^3 conv (K = 27 Ci >= Co) moves 1 / sqrt(27 Ci) per element: 1/29 at Ci 32, 1/110 at Ci 448
+   (DESIGN.md 2026-11-15 "Muon update scaling"). */
+__constant__ int c_mscale; __constant__ float c_mrms;   /* mgpu: per-device (written per device in train.c's per-GPU setup, each device its own copy) */
+static int h_mscale; static float h_mrms;   /* mgpu: config (the same value from every device's setup) host mirrors for nn_muon (the per-matrix reference path) */
+extern "C" void nn_muon_scale_mode(int m) { h_mscale = m; cudaMemcpyToSymbol(c_mscale, &m, sizeof m); }
+extern "C" void nn_muon_scale_rms(float r) { h_mrms = r; cudaMemcpyToSymbol(c_mrms, &r, sizeof r); }
+__host__ __device__ __forceinline__ float muon_scale_of(int m, float r, int Co, int K) {
+    return m == 2 ? r * sqrtf((float)(Co > K ? Co : K)) : m ? sqrtf((float)Co / (float)K) : sqrtf(fmaxf(1.f, (float)Co / (float)K)); }
+/* --muon-cwd 1: cautious weight decay (Chen, Liang et al. 2025, arXiv 2510.12402) on the Muon matrices: an element decays only where the
+   step u (subtracted) has the weight's sign (u w >= 0: step and decay both shrink |w|); elsewhere the decay would fight the optimizer's
+   direction and is skipped. DESIGN.md 2026-11-15 "Cautious weight decay". Off: the plain expression, bit for bit. */
+__constant__ int c_cwd;   /* mgpu: per-device (set per device in the per-GPU setup, as c_mscale) */
+extern "C" void nn_muon_cwd(int on) { cudaMemcpyToSymbol(c_cwd, &on, sizeof on); }
+__device__ __forceinline__ float muon_new_w(float w, float lr, float wd, float scale, float o) {   /* (lr * scale * o: the plain rounding order) */
+    if (!c_cwd) return w * (1.f - lr * wd) - lr * scale * o;
+    const float u = lr * scale * o; return u * w >= 0.f ? w * (1.f - lr * wd) - u : w - u; }
+__global__ void muon_apply_k(float *p, const float *o, size_t n, float lr, float scale, float wd) { size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) p[i] = muon_new_w(p[i], lr, wd, scale, o[i]); }
 extern "C" void nn_muon(float *p, const float *g, float *mom, int Co, int K, float lr, float beta, float wd, float *work) {
     size_t n = (size_t)Co * K;
     float *X = work, *Y = work + n, *A = work + 2 * n, *B = A + (size_t)Co * Co;
@@ -57,7 +77,7 @@ extern "C" void nn_muon(float *p, const float *g, float *mom, int Co, int K, flo
         mm_bx_k<<<gk, 256>>>(B, X, Co, K, a, Y);
         float *t = X; X = Y; Y = t;
     }
-    float scale = sqrtf(fmaxf(1.f, (float)Co / (float)K));
+    float scale = muon_scale_of(h_mscale, h_mrms, Co, K);
     muon_apply_k<<<nblk(n, 256), 256>>>(p, X, n, lr, scale, wd);
     KCHECK();
 }
@@ -72,15 +92,14 @@ __global__ void bmuon_scale_k(const muon_desc_t *d, const double *ss) {
     const muon_desc_t D = d[blockIdx.z]; size_t n = (size_t)D.Co * D.K; float inv = (float)(1.0 / (sqrt(ss[blockIdx.z]) + 1e-7));
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.X[i] *= inv;
 }
-/* the update scale per matrix: 0 Keller Jordan's sqrt(max(1, Co / K)); 1 (train --muon-scale spectral, Scion / muP): sqrt(Co / K), the
-   spectral norm's dual scaling sqrt(fan_out / fan_in) (fan_in = Ci k^3) under which the learning rate transfers across widths */
-__constant__ int c_mscale;
-extern "C" void nn_muon_scale_mode(int m) { cudaMemcpyToSymbol(c_mscale, &m, sizeof m); }
-__device__ __forceinline__ float muon_scale(int Co, int K) { return c_mscale ? sqrtf((float)Co / (float)K) : sqrtf(fmaxf(1.f, (float)Co / (float)K)); }
+__device__ __forceinline__ float muon_scale(int Co, int K) { return muon_scale_of(c_mscale, c_mrms, Co, K); }
+/* Muon-C / --muon-fro rescale O to a nominal element RMS: kj's sqrt(max(1, Co / K)) sqrt(min(Co, K) / (Co K)); under rms simply r */
+__device__ __forceinline__ double mc_target(int Co, int K) {
+    const double nk = (double)Co * K; return c_mscale == 2 ? (double)c_mrms : sqrt(fmax(1.0, (double)Co / K)) * sqrt(fmin((double)Co, (double)K) / nk); }
 __global__ void bmuon_apply_k(const muon_desc_t *d, int swap, float lr, float wd) {
     const muon_desc_t D = d[blockIdx.z]; const float *O = swap ? D.Y : D.X; size_t n = (size_t)D.Co * D.K;
     float scale = muon_scale(D.Co, D.K);
-    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.p[i] = D.p[i] * (1.f - lr * wd) - lr * scale * O[i];
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.p[i] = muon_new_w(D.p[i], lr, wd, scale, O[i]);
 }
 /* 5 Newton-Schulz iterations (modded-nanogpt coefficients) on every table entry's X (Co x K); returns the buffer flag of the
    result (1: Y) */
@@ -264,10 +283,10 @@ __global__ void mstat_k(const muon_desc_t *d, int swap, float lr, float wd, cons
     const float l = lrm ? lr * lrm[blockIdx.y] : lr; if (lrm) hb_lr *= lrm[blockIdx.y]; float scale = muon_scale(D.Co, D.K), st = 0.f; const int h = hb && hb[blockIdx.y];
     if (mc || h) { double so = 0; for (int j = 0; j < 32; j++) so += po[blockIdx.y * 32 + j];
         if (h) st = (float)((double)hb_lr * R[blockIdx.y] / fmax(sqrt(so), 1e-30));
-        else { const double nk = (double)n, tgt = sqrt(fmax(1.0, (double)D.Co / D.K)) * sqrt(fmin((double)D.Co, (double)D.K) / nk); scale = (float)(tgt / (sqrt(so / nk) + 1e-8)); } }
+        else { const double nk = (double)n, tgt = mc_target(D.Co, D.K); scale = (float)(tgt / (sqrt(so / nk) + 1e-8)); } }
     __shared__ double r[2][256]; double a = 0, b = 0;
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
-        const float w = D.p[i], nw = h ? w - st * O[i] : w * (1.f - l * wd) - l * scale * O[i], dw = nw - w; a += (double)dw * dw; b += (double)w * w; }
+        const float w = D.p[i], nw = h ? w - st * O[i] : muon_new_w(w, l, wd, scale, O[i]), dw = nw - w; a += (double)dw * dw; b += (double)w * w; }
     r[0][threadIdx.x] = a; r[1][threadIdx.x] = b; __syncthreads();
     for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) { r[0][threadIdx.x] += r[0][threadIdx.x + o]; r[1][threadIdx.x] += r[1][threadIdx.x + o]; } __syncthreads(); }
     if (!threadIdx.x) { atomicAdd(&out[2 * blockIdx.y], r[0][0]); atomicAdd(&out[2 * blockIdx.y + 1], r[1][0]); }
@@ -471,13 +490,13 @@ __global__ void mopt_apply_k(const muon_desc_t *d, int swap, int mc, const int *
     } else {
         float scale = muon_scale(D.Co, D.K);   /* Muon (as bmuon_apply_k) */
         if (mc) {
-            const double nk = (double)D.Co * D.K, tgt = sqrt(fmax(1.0, (double)D.Co / D.K)) * sqrt(fmin((double)D.Co, (double)D.K) / nk);
+            const double nk = (double)D.Co * D.K, tgt = mc_target(D.Co, D.K);
             scale = (float)(tgt / (sqrt(so / nk) + 1e-8));
         }
         if (disp) { float *dp = disp[blockIdx.y];   /* DoG: the direction's displacement since the anchor (decay left out) */
             for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
-                const float u = lr * scale * O[i]; D.p[i] = D.p[i] * (1.f - lr * wd) - u; const float v = dp[i] - u; dp[i] = v; dd += (double)v * v; } }
-        else for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.p[i] = D.p[i] * (1.f - lr * wd) - lr * scale * O[i];
+                const float u = lr * scale * O[i]; D.p[i] = c_cwd ? muon_new_w(D.p[i], lr, wd, scale, O[i]) : D.p[i] * (1.f - lr * wd) - u; const float v = dp[i] - u; dp[i] = v; dd += (double)v * v; } }
+        else for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) D.p[i] = muon_new_w(D.p[i], lr, wd, scale, O[i]);
     }
     mc_part(a, pw);
     if (pd) mc_part(dd, pd);

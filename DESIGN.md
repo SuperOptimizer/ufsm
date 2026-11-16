@@ -6,6 +6,53 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Muon update scaling (--muon-scale rms) and cautious weight decay (--muon-cwd 1) (2026-11-15, branches muonscale-20261115, cwd-20261115)
+
+Two opt-in Muon options, both off by default. They are implemented and tested; the quality A/B is deferred by the 11-15 drain order (plan
+below). They come from main's "improve adaptive Muon further" queue (items 3 and 4 of batch 1).
+
+**Shape-matched update scale, `--muon-scale rms --muon-rms r` (Moonlight, Liu et al. 2025, arXiv 2502.16982).** An orthogonalised
+Co x K direction has element RMS 1 / sqrt(max(Co, K)). Under the default kj scale sqrt(max(1, Co / K)) a 3^3 conv (K = 27 Ci >= Co) moves
+lr / sqrt(27 Ci) per element:
+
+| Ci | K = 27 Ci | kj element RMS / lr | rms element RMS / lr (r 0.2) |
+|---:|---:|---:|---:|
+| 32 | 864 | 0.034 (1/29) | 0.2 |
+| 256 | 6912 | 0.012 (1/83) | 0.2 |
+| 448 | 12096 | 0.0091 (1/110) | 0.2 |
+| 1x1 attention linear, C 288 | 288 | 0.059 (1/17) | 0.2 |
+
+The rms mode multiplies by r sqrt(max(Co, K)), so every matrix, conv or linear, gets element RMS r x lr and Muon takes AdamW-sized lrs.
+Muon-C and `--muon-fro` (O rescaled to a nominal RMS) target r under it. The per-matrix reference path `nn_muon` now follows the scale
+mode; before, it ignored `--muon-scale spectral` as well. lars (`--muon-lars`) uses the same scale function. To match the base
+update's total norm, lr_rms = lr_kj sqrt(sum Co / sum Co K) / r. For the scratch2 widths (256 .. 448, four 3^3 convs per level)
+that is 0.003 x 0.0104 / 0.2 = **1.5e-4**. Moonlight's recipe (Muon lr = AdamW lr = 3e-4) is ~2x that norm. The net effect: narrow and
+1x1 matrices move less than under kj, wide ones relatively more.
+
+Test (test_admuon, card 1): from the same state, the rms step equals the kj step times r sqrt(max(Co, K)) / sqrt(max(1, Co / K)) per
+matrix. The worst relative error is 2.1e-5 (plain), 2.1e-5 (ext), 3.7e-5 (ext + NorMuon), 2.9e-5 (ext + fro). The element RMS / (lr r)
+lands in [0.830, 0.914]: the quintic NS leaves singular values below 1. Under fro it is exactly 1.0000. mcc 9f63cdd (verify preset) and clang + nvcc
+give the same numbers.
+
+**Cautious weight decay, `--muon-cwd 1` (Chen, Liang et al. 2025, arXiv 2510.12402).** On the Muon matrices an element decays only where
+the step u = lr s O (subtracted) has the weight's sign (u w >= 0, so step and decay both shrink |w|). Elsewhere the decay would fight the
+optimizer's direction and is skipped. AdamW parameters are unchanged. Off, the update is the plain expression in the plain rounding order.
+Test (test_muoncwd, card 1): plain batch, ext and ext + NorMuon match the host reference to 3.0e-7 relative to |w| under mcc 9f63cdd
+(1.3e-6 under clang + nvcc). The mask decays 50.1 %
+of the elements. cwd on at wd 0 is bit for bit the plain step. Default `--wd 0.01` x Muon lr 0.003 is 3e-5 per update, which
+shrinks the weights only ~1 % over 300 updates. Cautious decay matters only with a real decay (`--muon-wd-mult 10`, wd 0.1).
+
+**Deferred A/B (WIP plan, script `scripts/opt/mab_arm.sh`).** One from-scratch arm per run on one card, P 256, 1500 windows, NorMuon,
+WSD warmup 150 cooldown 0.2, --accum 5, --det 1, seeds 7 and 8, held-out validation at the end. The run directory is deleted afterwards and
+the log kept. Arms:
+- `base` at 0.003 / 3e-4 (try7);
+- `base` at LR=0.0015 (the pending LR pair);
+- `rms` at MLR=1.5e-4 (the norm-matched lr; it isolates the per-layer redistribution);
+- `wd10` vs `cwd10` (Muon decay x10, plain vs cautious).
+Report paired per-10-window differences with block-bootstrap CIs (scripts/opt/pair_ab.py), per head (phase, wind4 separately), gn, and the held-out val.
+The noise floor is ~0.01. Batch 2 after that: tuned NS coefficients with fewer iterations (`--muon-ns polar` exists: measure
+orthogonality error, step time and fewer iterations), the conv reshape (out x in·27 vs per-tap vs in-major; Muon-C exists as the per-
+frequency variant), and a GNS-driven schedule.
 ## Ink teachers: MX-fp4 gambiarra / dino3d, fast prep, 2-D teacher labels (ink-teach) (2026-11-15, branch inkteach-20261115)
 
 **Part A: the 3-D teachers fast.** gambiarra (24.5 M params, 59.1 GMAC per 64^3 output crop = 225 kMAC / output voxel) ran 11.9 ms /
