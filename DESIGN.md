@@ -6,6 +6,24 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## NorMuon with --init-lr-mult (warm starts); try8 vs try6 was the warm start (2026-11-16, branch nmwarm-20261116)
+
+**Why try8 lagged.** try8 (scratch2, from scratch, one card) sat at phase bce 0.681 (ln 2 = 0.693) for 4300 steps; HOLD p05x 0.474 / 0.489
+at steps 2000 / 3000. try6 reached HOLD p05x 0.882 (ids0 0.810) at step 2357, u1-13790 0.887 / 0.813: HOLD is held out of every run
+(boxes.tsv), so those are fair. try6 was not from scratch: it resumed try5, the scratch2 net warm-started from widened u1-13750
+(--init-from --init-widen 1 --init-lr-mult 0.3 --init-lr-steps 2000; header init_inh, down_norm 1 from the donor). try4, from scratch,
+had stalled the same way ("phase stuck at ln2 for 2600 windows"). Everything else of try8 matched try6 (lr, accum windows, P, um rungs).
+The user (17:00): no more from-scratch runs; warm starts (try9).
+
+**NorMuon + --init-lr-mult.** The trainer refused --init-lr-mult with --normuon / --muon-ns polar. The ext path (muon_ext) already takes
+per-matrix lr multipliers (mx_lrm, --trunk-lr-mult); the inherited matrices (inh_has, the plain path's partition rule) now get init_lr
+there, recomputed each step (the --init-lr-steps ramp). A bug on the way: muon_table returned early on its later calls with the host
+descriptor list in collection order, while the device table had been partitioned inherited-first; the ext path indexes the multipliers
+and NorMuon's row offsets by that host list, so from the second step they paired with the wrong matrices. The early return now applies
+the same partition. test_init_lr: a NorMuon arm, two steps on one net; with the partition fix reverted its second step moves 6912
+inherited parameters at multiplier 0 (FAIL), with it 0. Still refused with --init-lr-mult: --trunk-lr-mult, anvil, Muon-C, hyperball,
+--muon-vr, the adaptive / cautious / Frobenius / AdEMAMix / attention-lr variants. Fast tier (card 0): 331 PASS, 1 SKIP, 2 NEED2.
+
 ## Unroll perf 1: the FBLEND half-stride grid ran each window up to 8 times; a per-run CT cache; field-blend tables (2026-11-16, branch unrollperf-20261116)
 
 Profile of the 0332 unroll (desk, card 1 shared, CT over https, u1 13000, FBLEND on): fields 2767 s = grid-0 predict 368 s (505

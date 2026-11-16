@@ -4274,7 +4274,18 @@ static int mx_any(const unet *u);
 static int mx_groupable(const unet *u);
 static void muon_table(unet *u, muon_build_t *b) {   /* the descriptor table and its scratch pool, built once (offsets first, then pointers) */
     for_each_mat(u, muon_collect, b);
-    if (u->muon_descs) return;
+    if (u->muon_descs) {   /* (a later call, e.g. the ext path each step: the host list in the device table's order, the --init-lr-mult partition
+                              included; 2026-11-16: NorMuon's row offsets and the per-matrix multipliers index this list) */
+        if (u->muon_part) {
+            muon_desc_t t[UNET_MAXCONV]; int k = 0;
+            for (int pass = 0; pass < 2; pass++) for (int i = 0; i < b->n; i++) {
+                const muon_desc_t *d = &b->h[i];
+                if (inh_has(u, (size_t)(d->p - u->p), (size_t)d->Co * d->K) == !pass) t[k++] = *d;
+            }
+            memcpy(b->h, t, sizeof(muon_desc_t) * (size_t)b->n);
+        }
+        return;
+    }
     u->muon_ntrunk = 0;   /* the table's trunk descriptors (weights below the attention stage): they come first (for_each_mat order); counted, not 4 x tbn: --muon-qkv-split makes more */
     if (u->tbn) { int i = 0; while (i < b->n && (size_t)(b->h[i].p - u->p) < u->tb_p0) i++; u->muon_ntrunk = i; for (int j = i; j < b->n; j++) if ((size_t)(b->h[j].p - u->p) < u->tb_p0) { fprintf(stderr, "muon: a trunk matrix after the stage's in the table\n"); abort(); } }
     u->muon_ninh = 0; u->muon_part = inh_on(u);
@@ -4478,8 +4489,14 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
     float *const *vp = u->mx_vr != 0.f ? u->mx_vrp : nullptr; const float vg = u->mx_vr;
     nn_muon_ext_opts(u->mx_caut);
     nn_muon_ext_fro(u->mx_fro);
-    if (trunk_lr_on(u)) {   /* --trunk-lr-mult: the trunk's matrices at trunk_lr x the rate, the stage's at 1 (as the plain path's two batches; audit muon #1) */
-        float hm[UNET_MAXCONV]; for (int i = 0; i < n; i++) hm[i] = (size_t)(b->h[i].p - u->p) < u->tb_p0 ? u->trunk_lr : 1.f;
+    if (trunk_lr_on(u) || inh_on(u)) {   /* --trunk-lr-mult: the trunk's matrices at trunk_lr x the rate, the stage's at 1 (as the plain path's two
+        batches; audit muon #1); --init-lr-mult: the inherited matrices (inh_has: the whole matrix inside one copied range, as the plain path's
+        partition) at init_lr x (2026-11-16, NorMuon + warm start). Every step: init_lr follows --init-lr-steps' ramp */
+        float hm[UNET_MAXCONV];
+        for (int i = 0; i < n; i++) {
+            const size_t off = (size_t)(b->h[i].p - u->p);
+            hm[i] = (trunk_lr_on(u) && off < u->tb_p0 ? u->trunk_lr : 1.f) * (inh_on(u) && inh_has(u, off, (size_t)b->h[i].Co * b->h[i].K) ? u->init_lr : 1.f);
+        }
         if (!u->mx_lrm) u->mx_lrm = nn_malloc((size_t)n * 4);
         nn_h2d(u->mx_lrm, hm, (size_t)n * 4);
     }
@@ -4492,7 +4509,7 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
     const float mixa = u->mx_mix_a != 0.f ? u->mx_mix_a * fminf(1.f, (float)++u->mx_mix_t / (float)u->mx_mix_T) : 0.f;
     nn_muon_ext_mix(u->mx_mix_a != 0.f ? u->mx_mixp : nullptr, u->mx_mix_b3, mixa);
     float *nr = u->mx_nm ? u->mx_nmrows : nullptr; const float b2 = u->mx_nm_b2;
-    float *const lrm0 = trunk_lr_on(u) ? u->mx_lrm : nullptr;
+    float *const lrm0 = trunk_lr_on(u) || inh_on(u) ? u->mx_lrm : nullptr;
     if (u->mx_c && nlin) {   /* Muon-C on the convs, the linears (Co x Ci, no kernel) on the plain direction; one row state, offsets sliced */
         nn_muon_ext_lrmult(lrm0);
         nn_muon_ext_batch(u->muon_descs, nconv3, u->muon_maxco, u->muon_maxk, u->mx_mcd, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
