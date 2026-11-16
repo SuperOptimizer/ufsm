@@ -6,6 +6,15 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## test_lat_head under compute-sanitizer: 2 SR draws instead of 24 (2026-11-15, branch buildspeed-port-20261115, off wip-snap-buildspeed)
+
+test_lat_head~racecheck was the slow tier's longest test (EST 4740 s): 24 stochastic-rounding draws x 3 nets, each a full backward
+under racecheck. The draws only average SR noise for check (b) (mean of K backwards vs the 16-bit reference, bound 2 / sqrt(K)); every
+kernel already runs at every shape on the first draw, and racecheck / synccheck judge each launch's accesses, which more draws do not
+change. Under UFSM_SANITIZE (tests/sanitize.sh) K is now 2 (TLH_K still overrides); the plain fast-tier runs keep 24. Measured (mcc
+build-verify, card 1 shared): racecheck 922.6 s (was ~4740 s), 0 errors, the mean-of-2 bound holds (trunk grads one 0.629, mean of
+2 0.46 < 2 / sqrt(2) x 0.629 + 0.01); synccheck 18.6 s; test_lat_head 4.2 s and ~FP8 2.7 s unchanged. Suite EST 4740 -> 930.
+
 ## Muon update scaling (--muon-scale rms) and cautious weight decay (--muon-cwd 1) (2026-11-15, branches muonscale-20261115, cwd-20261115)
 
 Two opt-in Muon options, both off by default. They are implemented and tested; the quality A/B is deferred by the 11-15 drain order (plan

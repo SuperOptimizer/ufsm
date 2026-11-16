@@ -43,7 +43,10 @@ static void detail(const unet_cfg *cfg, const float *g4, const float *ga) {   /*
 #undef T
 }
 int main(void) {
-    int bad = 0; const int K = getenv("TLH_K") ? atoi(getenv("TLH_K")) : 24, CO = 144;
+    /* UFSM_SANITIZE (tests/sanitize.sh): K 2. The draws only average the SR noise of (b); every kernel still runs at every shape, twice, and
+       racecheck / synccheck judge each launch's accesses, which the draws do not change (24 draws x 3 nets were 4740 s under racecheck) */
+    const char *san = getenv("UFSM_SANITIZE");
+    int bad = 0; const int K = getenv("TLH_K") ? atoi(getenv("TLH_K")) : san && *san ? 2 : 24, CO = 144;
     if (nn_init(0)) return test_no_gpu("test_lat_head", "nn_init(0) failed");
     nn_set_tf32(1); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1); nn_set_gn_stored(1);
     nn_set_prec(3); if (nn_set_prec_policy("all=fp4:fp4:fp4")) bad++;

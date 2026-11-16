@@ -361,7 +361,7 @@ test_ink_mil~racecheck                         | gpu,slow     |   120 | bash tes
 test_ink_mil~synccheck                         | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_ink_mil
 test_skip_empty~racecheck                      | gpu,slow     |   760 | bash tests/sanitize.sh racecheck ./$B/test_skip_empty
 test_skip_empty~synccheck                      | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_skip_empty
-test_lat_head~racecheck                        | gpu,slow     |  4740 | bash tests/sanitize.sh racecheck ./$B/test_lat_head
+test_lat_head~racecheck                        | gpu,slow     |   930 | bash tests/sanitize.sh racecheck ./$B/test_lat_head
 test_lat_head~synccheck                        | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_lat_head
 test_fstem~racecheck                           | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_fstem
 test_fstem~synccheck                           | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_fstem
