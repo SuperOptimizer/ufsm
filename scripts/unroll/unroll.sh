@@ -213,9 +213,12 @@ occlv() {   # --occupancy L for the fields: the first of levels LV+3, LV+2, LV+4
 }
 # FCTR / FCTK (default the run's CT): another CT root / key for the fields predict only, e.g. an unmasked or dilated-mask scan (audit-ugeom
 # 2026-11-14: 16.2 % of the published 1667 surface lies on zero (masked) CT, the outer turns clipped at the mask edge)
-# FBLEND=1 (OFF by default; audit 2026-11-14 #5, A/B pending): each part predicted on two tile grids (origin 0 and half the stride) and
+# FBLEND=1 (ON by default since 2026-11-16, audit #5 A/B below; FBLEND=0 the single grid, ~2x faster fields + the streamed ref): each part predicted on two tile grids (origin 0 and half the stride) and
 # blended with ufsm field-blend --tile (sin^2 weights: every cell leans on the window it sits deep inside), against the tile-border steps of
 # the single-grid fields (1667 u1 640/64: the normal plane t0 steps 4-5x its interior median at every 256-cell border). Lat fields only.
+# A/B 2026-11-16 (1667 u1 13000, 512 x 2048^2 level-2 box, scripts/unroll/seam_ab.sh): 256-border step / interior median, single grid vs
+# blended: phase y 1.43 -> 1.11, x 1.78 -> 1.09; t0 y 3.95 -> 2.42, x 6.08 -> 3.08. 896/192 windows: single 1.36 / 1.60 / 3.60 / 5.61, blended
+# the same as 640/64 blended at 2x the predict time: the blend, not the halo, removes the seams. 1152 windows do not fit a 16 GB card.
 # ONEPASS=1 (OFF by default; infer audit #8, A/B after the mega pass): the fit fields AND the ink heads (ink, c12, c13) from ONE predict
 # per z part: window 1152 / halo 64, --seam-inproc 1 (the heads blended over two tile grids on the GPU, the fields from grid 0),
 # heads full-grid into $O/ink/onepass (the parts' shards coexist); the ink stage then only links ink / c12 / c13. ~40 % less GPU time
@@ -227,7 +230,7 @@ fpred() {   # fpred GPU BOX OUT
       --seam-inproc 1 --heads ink,c12,c13 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --axis $O/axis.json $(occlv) --q 8 --levels 4 \
       --threads ${PTH:-14} --gpu $1 --ema 1 && { [ "$DRY" = 1 ] || [ -e $3/fields.json ]; }; return
   fi
-  if [ "${FBLEND:-0}" = 1 ] && [ "$FKIND" = lat ]; then
+  if [ "${FBLEND:-1}" = 1 ] && [ "$FKIND" = lat ]; then
     local st=$(( ${LWIN:-640} - 2 * ${LHALO:-64} )) gg
     for gg in 0 $((st / 2)); do fpred1 $1 $2 $3.g$gg $gg || return 1; done
     X $O/logs/fields.log $U field-blend $3 $3.g0 $3.g$((st / 2)) --tile $st,$st,$st --grids 0,0,0:$((st / 2)),$((st / 2)),$((st / 2)) --threads $TH || return 1
@@ -248,7 +251,7 @@ fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windo
 # the box rows in OUT/rows.ready) and runs count-field --pool-only --follow on it: the chunks in the parts' order, each once its rows are
 # written. The pooled sums equal a whole-box pass 1 (per chunk, disjoint solve rows; the prior from the middle row's chunk; the chunk
 # rows fixed by refcz in both runs), so the ref (--pool-cache) is byte-identical to the stage-barrier ref with those chunk rows.
-refstream_on() { [ "${REFSTREAM:-1}" = 1 ] && [ "${FBLEND:-0}" != 1 ] && ! onepass_on && [ "$FKIND" = lat ] && [ "${RECTOSP:-1}" = 0 ] && [ "${CTCAL:-0}" != 1 ] && [ -z "${REFCMD:-}" ] && [ "$DRY" != 1 ]; }
+refstream_on() { [ "${REFSTREAM:-1}" = 1 ] && [ "${FBLEND:-1}" != 1 ] && ! onepass_on && [ "$FKIND" = lat ] && [ "${RECTOSP:-1}" = 0 ] && [ "${CTCAL:-0}" != 1 ] && [ -z "${REFCMD:-}" ] && [ "$DRY" != 1 ]; }
 refstream() {   # refstream OUT PART..
   local S=$1; shift; local parts=("$@") k p pl z a b n=0 starts=() fs cz cfp=
   rm -rf $S $S.fin $O/ref.pool $O/ref.pool.ok; mkdir -p $S

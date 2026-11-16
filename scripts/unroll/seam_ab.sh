@@ -17,10 +17,10 @@ fp() {   # fp OUT WIN HALO GRID
   rm -rf "$1.tmp"; echo "$(basename "$1"): window $2 halo $3 grid $4: $(( $(date +%s) - t0 )) s, $(grep -m1 -oE '[0-9]+ windows to run' "$1.log")"
 }
 [ -e "$W/A/fields.json" ] || fp "$W/A" 640 64 0 || exit 1
-[ -e "$W/B/fields.json" ] || fp "$W/B" 1152 64 0 || exit 1
+[ -e "$W/B/fields.json" ] || fp "$W/B" 1152 64 0 || echo "B skipped: the 1152 window does not fit this card (13.8 GB buffer; a 24 GB card runs it)"
 [ -e "$W/C1/fields.json" ] || fp "$W/C1" 640 64 256 || exit 1
 if [ ! -e "$W/C/fields.json" ]; then t0=$(date +%s)
   "$U" field-blend "$W/C" "$W/A" "$W/C1" --tile 512,512,512 --grids 0,0,0:256,256,256 --threads 8 > "$W/C.log" 2>&1 || { echo "field-blend failed"; tail -3 "$W/C.log"; exit 1; }
   echo "C: field-blend $(( $(date +%s) - t0 )) s"; fi
-for a in A B C; do for p in pc ps t0 w; do "$U" read "$W/$a/$p" . 0 0 0 256 1024 1024 "$W/$a.$p.raw" --threads 8 > /dev/null 2>&1 || { echo "read $a $p failed"; exit 1; }; done; done
+for a in A B C; do [ -e "$W/$a/fields.json" ] || continue; for p in pc ps t0 w; do "$U" read "$W/$a/$p" . 0 0 0 256 1024 1024 "$W/$a.$p.raw" --threads 8 > /dev/null 2>&1 || { echo "read $a $p failed"; exit 1; }; done; done
 python3 -I "$REPO/scripts/unroll/seam_ab.py" "$W" $(( $(echo "$BOX" | cut -d, -f2) / 2 ))
