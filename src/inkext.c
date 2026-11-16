@@ -284,6 +284,14 @@ static void hann2(float *k, int T, float floor_) {   /* torch.hann_window(T, per
     double mx = 0; for (int i = 0; i < T; i++) for (int j = 0; j < T; j++) if (w[i] * w[j] > mx) mx = w[i] * w[j];
     for (int i = 0; i < T; i++) for (int j = 0; j < T; j++) { const float v = (float)(w[i] * w[j] / mx); k[i * T + j] = v < floor_ ? floor_ : v; }
 }
+static void hann_n2(float *k, int T) {   /* canonical2um hann2d: np.hanning(T + 2)[1:-1] outer / max (no floor) */
+    double w[T]; for (int i = 0; i < T; i++) w[i] = 0.5 - 0.5 * cos(2 * M_PI * (i + 1) / (T + 1));
+    double mx = 0; for (int i = 0; i < T; i++) for (int j = 0; j < T; j++) if (w[i] * w[j] > mx) mx = w[i] * w[j];
+    for (int i = 0; i < T; i++) for (int j = 0; j < T; j++) k[i * T + j] = (float)(w[i] * w[j] / mx);
+}
+/* the ink-sdk lanes that zero the columns without data (all D layers 0) after the blend, and their tile filters */
+static inline int ie_colvalid_kind(int kind) { return kind == IE_CANON2; }
+static inline double ie_min_valid(int kind) { return kind == IE_CANON2 ? 0.6 : 0.0; }   /* canonical-2um.toml min_valid_ratio */
 /* cv2 MORPH_ELLIPSE 7 x 7 */
 static const char ell7[7][8] = {"0001000", "0111110", "1111111", "1111111", "1111111", "0111110", "0001000"};
 
@@ -354,7 +362,7 @@ static void *gpu_worker(void *a) {
             for (int y = 0; y < ph; y++) for (int x = 0; x < pw; x++) {
                 const size_t g = (size_t)(G->ty[k] + y) * Wm + G->tx[k] + x; const float w = G->win[y * T + x];
                 if (X->kind == IE_V8IN) { G->num[g] += o[y * T + x] * w; G->den[g] += X->blend_norm ? w : 1.f; }
-                else if (ie_is_koine(X->kind)) { G->num[g] += o[y * T + x] * w; G->den[g] += w; }
+                else if (ie_is_koine(X->kind) || ie_colvalid_kind(X->kind)) { G->num[g] += o[y * T + x] * w; G->den[g] += w; }
                 else {   /* Hecate: probability x support (column has data) x window; den is the renderer's */
                     int sup = 0; for (int i = 0; i < D && !sup; i++) sup = tl[((size_t)i * T + y) * T + x] != 0;
                     G->num[g] += sup ? o[y * T + x] * w : 0.f;
@@ -405,15 +413,16 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     float *num = calloc((size_t)Wm * Hm, sizeof *num), *den = calloc((size_t)Wm * Hm, sizeof *den);
     free(X->dump); X->dump = X->dump_req ? calloc((size_t)D * Wm * Hm, 1) : nullptr;
     float *ctl = pctl ? calloc((size_t)Wm * Hm, sizeof *ctl) : nullptr; if (pctl) *pctl = ctl;   /* the surface layer (CT / 255) */
-    uint8_t *cov = X->kind == IE_V8IN ? calloc((size_t)Wm * Hm, 1) : nullptr;   /* v8in: max over depth > 0 */
+    uint8_t *cov = X->kind == IE_V8IN || ie_colvalid_kind(X->kind) ? calloc((size_t)Wm * Hm, 1) : nullptr;   /* max over depth > 0 (v8in: its coverage; ink-sdk lanes: valid columns) */
+    const int v8 = X->kind == IE_V8IN;
     float *win = malloc((size_t)T * T * sizeof *win);
     if (X->no_overlap) for (int i = 0; i < T * T; i++) win[i] = 1.f;   /* --no-overlap: stride = tile, blend off */
-    else if (X->kind == IE_V8IN) gkern64(win, T); else hann2(win, T, 0.001f);
+    else if (X->kind == IE_V8IN) gkern64(win, T); else if (X->kind == IE_CANON2) hann_n2(win, T); else hann2(win, T, 0.001f);
     int nx, ny; int *xs, *ys;
     const int stride = X->no_overlap ? T : X->stride > 0 ? X->stride : sp->stride;
     if (X->no_overlap) { xs = axis_starts_koine(Wm, T, stride, &nx); ys = axis_starts_koine(Hm, T, stride, &ny); }   /* tiles at 0, T, 2T .. and the last at L - T */
     else if (X->kind == IE_V8IN) { xs = axis_starts_v8(Wm, T, stride, &nx); ys = axis_starts_v8(Hm, T, stride, &ny); }
-    else if (ie_is_koine(X->kind)) { xs = axis_starts_koine(Wm, T, stride, &nx); ys = axis_starts_koine(Hm, T, stride, &ny); }
+    else if (ie_is_koine(X->kind) || ie_colvalid_kind(X->kind)) { xs = axis_starts_koine(Wm, T, stride, &nx); ys = axis_starts_koine(Hm, T, stride, &ny); }   /* canonical grid(): the same */
     else { xs = axis_starts_hecate(Wm, T, stride, &nx); ys = axis_starts_hecate(Hm, T, stride, &ny); }
     /* rolling row buffer: rows [rb0, rb1) */
     const int RB = T + 16; uint8_t **ring = malloc(RB * sizeof *ring); for (int i = 0; i < RB; i++) ring[i] = malloc((size_t)D * Wm);
@@ -424,11 +433,11 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     G.X = X; G.D = D; G.T = T; G.Wm = Wm; G.Hm = Hm; G.win = win; G.num = num; G.den = den; G.out = out;
     G.tiles = malloc((size_t)B * D * T * T); G.tx = malloc(B * sizeof *tx); G.ty = malloc(B * sizeof *ty);
     pthread_t gth; pthread_create(&gth, nullptr, gpu_worker, &G);
-    uint8_t *closed = cov ? calloc((size_t)Wm * Hm, 1) : nullptr; int closed_to = 0;   /* v8in: closed coverage valid for rows < closed_to */
+    uint8_t *closed = v8 ? calloc((size_t)Wm * Hm, 1) : nullptr; int closed_to = 0;   /* v8in: closed coverage valid for rows < closed_to */
     long long ntiles = 0, nskip = 0; double tr = 0, tg = 0; int fail = 0;
     #define ROW(r) ring[(r) % RB]
     for (int iy = 0; iy < ny && !fail; iy++) {
-        const int y0 = ys[iy], need1 = (y0 + T + (cov ? 8 : 0)) < Hm ? y0 + T + (cov ? 8 : 0) : Hm;
+        const int y0 = ys[iy], need1 = (y0 + T + (v8 ? 8 : 0)) < Hm ? y0 + T + (v8 ? 8 : 0) : Hm;
         if (y0 < rb0) { fprintf(stderr, "ink-ext: row order\n"); fail = 1; break; }
         if (y0 > rb1) rb1 = y0;
         if (rb0 < y0 - 8) rb0 = y0 - 8 > rb0 ? y0 - 8 : rb0;   /* keep a few rows behind for the v8in closing */
@@ -449,7 +458,7 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
             }
             rb1 = need1; tr += inow() - t0;
         }
-        if (cov) {   /* closing (dilate, erode with the 7 x 7 ellipse; outside pixels neutral) of the rows the tiles need */
+        if (v8) {   /* closing (dilate, erode with the 7 x 7 ellipse; outside pixels neutral) of the rows the tiles need */
             const int c1 = need1 - (need1 < Hm ? 6 : 0);
             for (int y = closed_to; y < c1; y++) for (int x = 0; x < Wm; x++) {
                 int all = 1;
@@ -485,6 +494,10 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
                     memcpy(dst, src, (size_t)pw); if (!anyv) for (int x = 0; x < pw; x++) if (src[x]) { anyv = 1; break; }
                 }
                 if (!anyv && (X->kind != IE_V8IN || X->no_overlap)) { nskip++; continue; }
+                if (ie_min_valid(X->kind) > 0) {   /* canonical: the tile's share of valid columns (beyond the map: invalid) */
+                    size_t nv = 0; for (int y = 0; y < ph; y++) for (int x = 0; x < pw; x++) nv += cov[(size_t)(y0 + y) * Wm + x0 + x];
+                    if ((double)nv / ((double)T * T) < ie_min_valid(X->kind)) { nskip++; continue; }
+                }
                 tx[nb] = x0; ty[nb] = y0; nb++;
             }
             if (nb == B || (ix == nx && iy == ny - 1 && nb)) {
@@ -503,6 +516,7 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     fprintf(stderr, "\rink-ext: %s %s: %lld tiles (%lld empty skipped), render %.1fs, net %.1fs (%.1f tiles/s), CT chunks decoded %llu\n", S->name, sp->name, ntiles, nskip, tr, tg, tg > 0 ? ntiles / tg : 0, (unsigned long long)X->lev[L].ndec);
     for (size_t i = 0; i < (size_t)Wm * Hm; i++) {
         const float d = den[i]; float p = ie_is_koine(X->kind) ? (d > 1e-6f ? num[i] / d : 0.f) : (d != 0 ? num[i] / d : 0.f);
+        if (ie_colvalid_kind(X->kind) && !cov[i]) p = 0.f;   /* ink-sdk: no CT in the column -> 0 */
         num[i] = !(p > 0) ? 0.f : p > 1 ? 1.f : p;
     }
     for (int i = 0; i < RB; i++) free(ring[i]);
@@ -571,7 +585,7 @@ static int raw_mode(int argc, char **argv, ie_net *net, int kind) {
 int cmd_ink_ext(int argc, char **argv) {
     const char *mname = iopt(argc, argv, "--model", nullptr), *weights = iopt(argc, argv, "--weights", nullptr);
     if (!mname || !weights) {
-        fprintf(stderr, "usage: ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um --weights W[,W2..] --surface TIFXYZ [--surface ..] --ct ROOT KEY --out DIR\n"
+        fprintf(stderr, "usage: ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um|reader2|dense9|rectina|trace3b|canon2 --weights W[,W2..] --surface TIFXYZ [--surface ..] --ct ROOT KEY --out DIR\n"
                         "         [--reverse] [--stride S] [--px-um U] [--batch B] [--gpu 0] [--threads 16] [--ct-mem 3] [--cache DIR] [--native] [--suffix S] [--prefix P]\n"
                         "         [--ct-local ROOT --local-levels 1,2] [--ct-um 2.399] [--surf-um U] [--no-overlap] [--norm tile|sheet] [--blend official|norm] [--grid-crop c,r,w,h]\n"
                         "         [--ct-tif] [--jpeg PATH] [--jpeg-stretch] [--layers DIR [--px-crop x,y,w,h]] [--dump-layers DIR] [--render-only]\n"

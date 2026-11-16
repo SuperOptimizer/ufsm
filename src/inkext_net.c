@@ -16,6 +16,12 @@ const ie_spec ie_specs[IE_NMODELS] = {
     {"hecate96", 16, 64, 9.596, 32, 8},
     {"reader3", 17, 384, 9.596, 192, 8},
     {"ink9um", 17, 128, 9.596, 64, 8},   /* scrollprize/ink_9um: 17 of 21 (9.6 um pooled) / 28 (native 9.362) layers, 128 px, overlap 0.5 */
+    /* ink-sdk profiles (src/ink_sdk/profiles/ink_9um-*.toml): the spacing is each profile's scale_um, the tile its checkpoint's patch_size */
+    {"reader2", 17, 128, 9.596, 64, 8},   /* domenicor046/reader-v2 step 40000 (9.6 um) */
+    {"dense9", 17, 128, 9.362, 64, 8},    /* Nieuwlaar/ink9um-dense-native step 16000 (native 9.362 um; weights/dense_native_016000.safetensors) */
+    {"rectina", 17, 384, 9.362, 192, 8},  /* evilaliv3/rectina m4 ckpt_020000 (9.362 um, 384 px; CC-BY-NC-4.0) */
+    {"trace3b", 17, 128, 9.362, 64, 8},   /* Jashann TRACE v3B_best (9.362 um, tolerance 0.1; CC-BY-NC-SA-4.0) */
+    {"canon2", 62, 256, 2.399, 128, 31},  /* canonical_2um r152_3ddec_v2_l5_epoch13 (Lightning .ckpt state_dict; divide 255, no clip) */
 };
 int ie_model_kind(const char *name) {
     for (int k = 0; k < IE_NMODELS; k++) if (!strcmp(name, ie_specs[k].name)) return k;
@@ -132,35 +138,43 @@ static int load_v8in(ie_net *n, const wl_dict *W) {
     return n->logit_w && !bad ? 0 : -1;
 }
 
+/* Hecate (keys under "canonical.") and canonical_2um (the same RegressionModel at the top level: backbone. decoder. normalization.) */
 static int load_hecate(ie_net *n, const wl_dict *W) {
-    int bad = 0; const char *P = "canonical.";
-    n->in_w = scal(W, "canonical.normalization.weight", &bad); n->in_b = scal(W, "canonical.normalization.bias", &bad);
-    n->in_rm = scal(W, "canonical.normalization.running_mean", &bad); n->in_rv = scal(W, "canonical.normalization.running_var", &bad);
-    n->zscale = scal(W, "depth_coordinate_scale", &bad);
+    int bad = 0; const char *P = n->kind == IE_CANON2 ? "" : "canonical."; char k[200];
+    if (n->kind == IE_CANON2 && !wl_get(W, "normalization.weight")) { n->in_w = 1; n->in_b = 0; n->in_rm = 0; n->in_rv = 1 - 1e-5f; }   /* with_norm False: identity */
+    else {
+        snprintf(k, sizeof k, "%snormalization.weight", P); n->in_w = scal(W, k, &bad); snprintf(k, sizeof k, "%snormalization.bias", P); n->in_b = scal(W, k, &bad);
+        snprintf(k, sizeof k, "%snormalization.running_mean", P); n->in_rm = scal(W, k, &bad); snprintf(k, sizeof k, "%snormalization.running_var", P); n->in_rv = scal(W, k, &bad);
+    }
+    n->zscale = n->kind == IE_CANON2 ? 0.f : scal(W, "depth_coordinate_scale", &bad);
     if (bad) return -1;
-    if (n->kind == IE_HEC24) { if (mkconv(&n->stem, W, "canonical.backbone.conv1.weight", "canonical.backbone.bn1", nullptr, 1, 2, 2, 3, 3, 3)) return -1; n->margin = 1; n->xys = 4; }
-    else { if (mkconv(&n->stem, W, "canonical.backbone.conv1.weight", "canonical.backbone.bn1", nullptr, 1, 1, 1, 1, 1, 1)) return -1; n->margin = 0; n->xys = 1; }
+    char cw[120], cb[120]; snprintf(cw, sizeof cw, "%sbackbone.conv1.weight", P); snprintf(cb, sizeof cb, "%sbackbone.bn1", P);
+    if (n->kind == IE_HEC24 || n->kind == IE_CANON2) { if (mkconv(&n->stem, W, cw, cb, nullptr, 1, 2, 2, 3, 3, 3)) return -1; n->margin = n->kind == IE_HEC24; n->xys = 4; }
+    else { if (mkconv(&n->stem, W, cw, cb, nullptr, 1, 1, 1, 1, 1, 1)) return -1; n->margin = 0; n->xys = 1; }
     static const int nb[4] = {3, 8, 36, 3};
     char pre[64]; snprintf(pre, sizeof pre, "%sbackbone.", P);
+    if (n->kind == IE_CANON2) {   /* the Lightning checkpoint may prefix model. / module. (the loader strips them): refuse anything else than the plain names */
+        snprintf(k, sizeof k, "%slayer3.35.conv3.weight", pre); if (!wl_get(W, k)) { fprintf(stderr, "ink-ext: canon2: no %s (not a ResNet-152 canonical checkpoint)\n", k); return -1; }
+    }
     if (load_resnet(n, W, pre, nb)) return -1;
     static const int dd[4] = {64, 128, 256, 512};
     for (int i = 0; i < 4; i++) {
         char a[120], g[120], b[120];
-        snprintf(a, sizeof a, "canonical.decoder.channel_reduce.%d.0.weight", i); snprintf(g, sizeof g, "canonical.decoder.channel_reduce.%d.1.weight", i); snprintf(b, sizeof b, "canonical.decoder.channel_reduce.%d.1.bias", i);
+        snprintf(a, sizeof a, "%sdecoder.channel_reduce.%d.0.weight", P, i); snprintf(g, sizeof g, "%sdecoder.channel_reduce.%d.1.weight", P, i); snprintf(b, sizeof b, "%sdecoder.channel_reduce.%d.1.bias", P, i);
         if (mkconv(&n->red[i], W, a, nullptr, nullptr, 1, 1, 1, 0, 0, 0) || !(n->red_g[i] = devvec(W, g, dd[i])) || !(n->red_b[i] = devvec(W, b, dd[i]))) return -1;
     }
     for (int j = 0; j < 3; j++) {
         char a[120], b[120]; rcb *R = &n->blk[j]; const int oc = dd[2 - j];
-        snprintf(a, sizeof a, "canonical.decoder.decoder_blocks.%d.conv1.weight", j); if (mkconv(&R->c1, W, a, nullptr, nullptr, 1, 1, 1, 1, 1, 1)) return -1;
-        snprintf(a, sizeof a, "canonical.decoder.decoder_blocks.%d.conv2.weight", j); if (mkconv(&R->c2, W, a, nullptr, nullptr, 1, 1, 1, 1, 1, 1)) return -1;
-        snprintf(a, sizeof a, "canonical.decoder.decoder_blocks.%d.shortcut.weight", j); if (mkconv(&R->sc, W, a, nullptr, nullptr, 1, 1, 1, 0, 0, 0)) return -1;
-        snprintf(a, sizeof a, "canonical.decoder.decoder_blocks.%d.gn1.weight", j); snprintf(b, sizeof b, "canonical.decoder.decoder_blocks.%d.gn1.bias", j);
+        snprintf(a, sizeof a, "%sdecoder.decoder_blocks.%d.conv1.weight", P, j); if (mkconv(&R->c1, W, a, nullptr, nullptr, 1, 1, 1, 1, 1, 1)) return -1;
+        snprintf(a, sizeof a, "%sdecoder.decoder_blocks.%d.conv2.weight", P, j); if (mkconv(&R->c2, W, a, nullptr, nullptr, 1, 1, 1, 1, 1, 1)) return -1;
+        snprintf(a, sizeof a, "%sdecoder.decoder_blocks.%d.shortcut.weight", P, j); if (mkconv(&R->sc, W, a, nullptr, nullptr, 1, 1, 1, 0, 0, 0)) return -1;
+        snprintf(a, sizeof a, "%sdecoder.decoder_blocks.%d.gn1.weight", P, j); snprintf(b, sizeof b, "%sdecoder.decoder_blocks.%d.gn1.bias", P, j);
         if (!(R->g1 = devvec(W, a, oc)) || !(R->b1 = devvec(W, b, oc))) return -1;
-        snprintf(a, sizeof a, "canonical.decoder.decoder_blocks.%d.gn2.weight", j); snprintf(b, sizeof b, "canonical.decoder.decoder_blocks.%d.gn2.bias", j);
+        snprintf(a, sizeof a, "%sdecoder.decoder_blocks.%d.gn2.weight", P, j); snprintf(b, sizeof b, "%sdecoder.decoder_blocks.%d.gn2.bias", P, j);
         if (!(R->g2 = devvec(W, a, oc)) || !(R->b2 = devvec(W, b, oc))) return -1;
     }
-    n->attn_w = devvec(W, "canonical.decoder.depth_collapse.attn_conv.weight", 64); n->attn_b = scal(W, "canonical.decoder.depth_collapse.attn_conv.bias", &bad);
-    n->logit_w = devvec(W, "canonical.decoder.logit.weight", 64); n->logit_b = scal(W, "canonical.decoder.logit.bias", &bad);
+    snprintf(k, sizeof k, "%sdecoder.depth_collapse.attn_conv.weight", P); n->attn_w = devvec(W, k, 64); snprintf(k, sizeof k, "%sdecoder.depth_collapse.attn_conv.bias", P); n->attn_b = scal(W, k, &bad);
+    snprintf(k, sizeof k, "%sdecoder.logit.weight", P); n->logit_w = devvec(W, k, 64); snprintf(k, sizeof k, "%sdecoder.logit.bias", P); n->logit_b = scal(W, k, &bad);
     return n->attn_w && n->logit_w && !bad ? 0 : -1;
 }
 
@@ -222,7 +236,7 @@ static int load_reader(ie_net *n, const wl_dict *W) {
 
 ie_net *ie_load(int kind, const char *weights) {
     if (kind < 0 || kind >= IE_NMODELS) return nullptr;
-    const char *sub = kind == IE_HEC24 || kind == IE_HEC96 ? "ema_model" : ie_is_koine(kind) ? "model" : nullptr;
+    const char *sub = kind == IE_HEC24 || kind == IE_HEC96 ? "ema_model" : ie_is_koine(kind) ? "model" : kind == IE_CANON2 ? "state_dict" : nullptr;
     wl_dict *W = nullptr;
     if (ie_is_koine(kind)) W = wl_load(weights, "ema_model");   /* koine infer.py prefers the EMA weights when a checkpoint has them */
     if (!W) W = wl_load(weights, sub);
@@ -231,6 +245,7 @@ ie_net *ie_load(int kind, const char *weights) {
     int rc;
     if (kind == IE_V8IN) rc = load_v8in(n, W);
     else if (ie_is_koine(kind)) rc = load_reader(n, W);
+    else if (kind == IE_CANON2) rc = load_hecate(n, W);
     else {
         const double um = wl_num(W, "sampling_um", 0);
         if (um > 0 && fabs(um - (kind == IE_HEC24 ? 2.4 : 9.6)) > 0.05) { fprintf(stderr, "ink-ext: %s is a %.1f um Hecate checkpoint\n", weights, um); rc = -1; }
@@ -246,9 +261,9 @@ void ie_free(ie_net *n) { if (n) free(n); }   /* device memory stays in the xnet
 size_t ie_tile_bytes_gpu(int kind) {
     switch (kind) {
     case IE_V8IN: return (size_t)700 << 20;
-    case IE_HEC24: return (size_t)700 << 20;
+    case IE_HEC24: case IE_CANON2: return (size_t)700 << 20;
     case IE_HEC96: return (size_t)40 << 20;
-    case IE_INK9UM: return (size_t)56 << 20;
+    case IE_INK9UM: case IE_READER2: case IE_DENSE9: case IE_TRACE3B: return (size_t)56 << 20;
     default: return (size_t)450 << 20;
     }
 }
@@ -339,7 +354,8 @@ static void hecate_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out,
     const int D = n->sp.D, T = n->sp.T, mg = n->margin, Dn = D - 2 * mg, s = n->xys, F = T / s; const size_t per = (size_t)D * T * T;
     /* the columns with data (raw.any over the full depth) at feature resolution (max-pooled over s x s) */
     uint8_t *sup = calloc((size_t)B * F * F, 1), *full = calloc((size_t)B * T * T, 1);
-    for (int i = 0; i < B; i++) for (int d = 0; d < D; d++) for (int y = 0; y < T; y++) for (int x = 0; x < T; x++)
+    if (n->kind == IE_CANON2) memset(sup, 1, (size_t)B * F * F);   /* canonical: the plain softmax over depth, no support mask */
+    else for (int i = 0; i < B; i++) for (int d = 0; d < D; d++) for (int y = 0; y < T; y++) for (int x = 0; x < T; x++)
         if (tiles[i * per + ((size_t)d * T + y) * T + x]) { full[((size_t)i * T + y) * T + x] = 1; sup[((size_t)i * F + y / s) * F + x / s] = 1; }
     uint8_t *crop = malloc((size_t)B * Dn * T * T);
     for (int i = 0; i < B; i++) memcpy(crop + (size_t)i * Dn * T * T, tiles + i * per + (size_t)mg * T * T, (size_t)Dn * T * T);
@@ -348,7 +364,7 @@ static void hecate_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out,
     uint8_t *dev; upload_tiles(crop, B, Dn, T, T, &dev); free(crop);
     xt x0 = xinput_u8(dev, B, Dn, T, T, lo, hi, a, b); xfree_dev(dev);
     xt st = xconv_fwd(&n->stem, x0, nullptr, XA_RELU); xt_free(&x0);
-    if (n->kind == IE_HEC24) { xt p = xmaxpool2d_k3s2(st); xt_free(&st); st = p; }
+    if (n->kind == IE_HEC24 || n->kind == IE_CANON2) { xt p = xmaxpool2d_k3s2(st); xt_free(&st); st = p; }
     xt f[4]; resnet_fwd(n, st, f);
     xt r4[4];
     for (int i = 0; i < 4; i++) {

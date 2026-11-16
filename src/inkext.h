@@ -8,13 +8,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum { IE_V8IN = 0, IE_HEC24 = 1, IE_HEC96 = 2, IE_READER3 = 3, IE_INK9UM = 4, IE_NMODELS = 5 };
-/* the koine_machines hybrid 3D-stem / 2D U-Net family (Reader V3 384 px, scrollprize/ink_9um 128 px): one network, koine infer.py
-   tiling (overlap 0.5, hann), normalize_robust per tile */
-static inline int ie_is_koine(int kind) { return kind == IE_READER3 || kind == IE_INK9UM; }
+enum { IE_V8IN = 0, IE_HEC24 = 1, IE_HEC96 = 2, IE_READER3 = 3, IE_INK9UM = 4,
+       /* the ink-sdk profiles' further ink_9um-family checkpoints (2026-11-16): same network (vesuvius_unet_3d_stem_2d, 508 tensors), own tile / spacing */
+       IE_READER2 = 5, IE_DENSE9 = 6, IE_RECTINA = 7, IE_TRACE3B = 8,
+       IE_CANON2 = 9,   /* scrollprize/ink_canonical_2um: Hecate 2.4's ResNet3D-152 + 3-D decoder, a plain depth softmax, 62 layers at 2.399 um */
+       IE_NMODELS = 10 };
+/* the koine_machines hybrid 3D-stem / 2D U-Net family (Reader V3 / V2, rectina m4 384 px, scrollprize/ink_9um, dense-native, TRACE v3B
+   128 px): one network, koine infer.py tiling (overlap 0.5, hann), normalize_robust (robust_mad, p1 / p99) per tile */
+static inline int ie_is_koine(int kind) { return kind == IE_READER3 || kind == IE_INK9UM || (kind >= IE_READER2 && kind <= IE_TRACE3B); }
 
 typedef struct {
-    const char *name;     /* v8in | hecate24 | hecate96 | reader3 | ink9um */
+    const char *name;     /* v8in | hecate24 | hecate96 | reader3 | ink9um | reader2 | dense9 | rectina | trace3b | canon2 */
     int D, T;             /* input layers, tile edge (pixels) */
     double px_um;         /* render spacing (pixel and layer step) */
     int stride;           /* default tile stride */
