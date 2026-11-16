@@ -664,6 +664,29 @@ so all chunks of a band that differ in z alone probed one chain. A full 64-bit m
 1); old vs fixed differ by the same (3.42 M px, max 2). test_ink_ext_tiling runs again (its weights linked under ~/ufsm-data/inkext;
 the PyTorch parity tests need upstream villa / hecate sources, not run here). Fast tier: 330 PASS, 1 SKIP, 2 NEED2 (card 0 in training).
 
+## mcc 16cd2b7: sin + cos fused into sincos; straight-line loops of 4+ trips unroll to 1800 instructions (2026-11-16, branch mcc-host2-20261116)
+
+Host-speed round 2. Per-function excess over clang (the 16 suite lines with the largest absolute excess, perf cycles:u): the
+largest were fit_vox2 + fit_grad_terms (fit's CPU loss; 47 G, clang 17.6 G for all of cpu_loss_run), write_spatial_tm (20 G), and
+cos / sin (31 G) where clang called sincos. Paired A/B (cpu_pair: both builds of a line back to back, min of 3; A/A noise +0.5 %).
+
+| change (microc) | cycles | instructions | lines that move (instructions) |
+|---|---|---|---|
+| aba120a: sin (x), cos (x) of one x, one dominating the other: one sincos call (glibc's sincosf64 / sincosf32 alias) | -1.54 % | -0.51 % | patchid -7.7 % cycles, score_par -7.1 %, surflabels -2.1 % instructions |
+| 16cd2b7: a straight-line body (no if / continue / break / return) of >= 4 trips unrolls up to 1800 IR instructions (was 1200; token pre-test 2400 -> 4800) | -1.08 % | -1.40 % | repair -11.5 % (cycles -5.3 %), fit_emb -8.2 %, fibertrace_dyad -5.4 %; none above +0.5 % |
+
+The first unroll try (1200 -> 2400 for any body) regressed test_raster +26 % instructions: chamfer_reference's 13-neighbour loop
+with an `if (out of box) continue` per neighbour, unrolled, computed all tests up front and spilled; branchy bodies keep 1200.
+Results are bit-identical (glibc's sincos is sin's and cos's code); all 167 PTX sidecars identical.
+
+Also measured and dropped: speculating an arm's load when the join reads the same address (makes write_spatial_tm's row clamp
+loop vectorisable: +0.02 % instructions overall), turning off "a test of a just-loaded value stays a branch" (+3.7 % cycles),
+splitting whole-record `= {0}` for slot_carve (13 refusals in all of ufsm's host code: no lever).
+
+Gap to clang, same commit, paired, 118 single-thread CPU lines: instructions 1.429x (pin 367942e) -> 1.397x; cycles 1.34-1.36x
+(the two runs in different load windows). What is left is broad: spilled scalars in long float functions (fit_vox2 still 2x),
+the vectoriser's 64-bit index loops (write_spatial_tm's B0 row), CT decoders (volcomp vfx_decode_sub).
+
 ## mcc 367942e: spill-slot sharing could give two live values one stack slot (fixed; try8 not affected) (2026-11-16, branch mcc-rafix-20261116)
 
 microc d2117c0 (11-15) shares a spill slot between the two sides of a copy when their live ranges never meet; the merged range list
