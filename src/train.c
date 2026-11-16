@@ -3041,10 +3041,6 @@ int cmd_train(int argc, char **argv) {
        in AdamW's v gives sqrt of a negative -> NaN on the first step; Adam's v as Muon's momentum). Refused unless --opt-reset 1, which
        starts this run's optimizer state at zero after the load */
     const int opt_reset = opt_atoi("--opt-reset", opt(argc, argv, "--opt-reset", "0"));
-    if (has_runtime > 0 && strcmp(resumed_runtime.optimizer, optname) && !opt_reset) {
-        fprintf(stderr, "--resume %s: trained with --opt %s, this run --opt %s: the optimizer states do not carry over; --opt-reset 1 starts them at zero\n", resume, resumed_runtime.optimizer, optname);
-        return 2;
-    }
     /* Muon variants: --muon-c 1 (Muon-C, per-frequency polarisation of the conv kernels), --hyperball 1 (fixed weight and update
        norms; eta = --hb-lr-mult x the Muon lr, default 1/sqrt(2): Muon's first relative step; replaces the decay) */
     const int muon_c = opt_atoi("--muon-c", opt(argc, argv, "--muon-c", "0")), hyperball = opt_atoi("--hyperball", opt(argc, argv, "--hyperball", "0"));
@@ -3101,6 +3097,12 @@ int cmd_train(int argc, char **argv) {
     if (muon_c || hyperball || ns_mode || normuon || muon_vr != 0.f || muon_kron || muon_caut || mix_a != 0.f || muon_lars || muon_dog || muon_fro) {
         snprintf(optlabel, sizeof optlabel, "muon%s%s%s%s%s%s%s%s%s%s%s", muon_c ? "-c" : "", hyperball ? "-hb" : "", ns_mode ? "+pe" : "", normuon ? "+nm" : "", muon_vr != 0.f ? "+vr" : "", muon_kron ? "+kr" : "", muon_caut ? "+ca" : "", mix_a != 0.f ? "+mx" : "",
                  muon_lars ? "+la" : "", muon_dog ? "+dg" : "", muon_fro ? "+fo" : ""); optname = optlabel; }
+    /* (the cross-optimizer --resume check, after the variant label: before (11-15) it compared the checkpoint's "muon+nm" with the plain
+       --opt "muon", so a --normuon run refused its own checkpoint: try7 gave up at step 450, rc 2 x 3) */
+    if (has_runtime > 0 && strcmp(resumed_runtime.optimizer, optname) && !opt_reset) {
+        fprintf(stderr, "--resume %s: trained with --opt %s, this run --opt %s: the optimizer states do not carry over; --opt-reset 1 starts them at zero\n", resume, resumed_runtime.optimizer, optname);
+        return 2;
+    }
     /* --trunk-lr-mult F: every parameter outside the attention stage (the conv trunk, heads, norms; Muon and AdamW) at F x the scheduled
        rates, the stage at the full rates (unet_set_trunk_lr; default 1) */
     const float trunk_lr = (float)opt_atof("--trunk-lr-mult", opt(argc, argv, "--trunk-lr-mult", "1"));

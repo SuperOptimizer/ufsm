@@ -77,4 +77,12 @@ print(f"  (3) {n} KLs on the step lines, the last: {last}")
 sys.exit(0 if n >= 6 * 4 and not bad else 1)
 PY
 [ $rc -eq 0 ] || fail "(3) KL group ($D/gr.log)"
+# (4) a --normuon run resumes from its own checkpoint (the label "muon+nm" against this run's: before 11-15 the check ran before the
+#     variant label and refused it, try7 gave up at step 450), and a plain-Muon resume of it is still refused (rc 2) without --opt-reset
+"$U" train fx/sources-ink.json --out nm --muon-lr 0.002 --lr 0.001 "${C[@]}" --P 64 --steps 2 --normuon 1 > nm.log 2>&1 || fail "(4) normuon ($D/nm.log)"
+"$U" train fx/sources-ink.json --out nm --muon-lr 0.002 --lr 0.001 "${C[@]}" --P 64 --steps 4 --normuon 1 --resume nm/last.ckpt > nm2.log 2>&1 || fail "(4) normuon resume refused ($D/nm2.log)"
+grep -q 'do not carry over' nm2.log && fail "(4) normuon resume: the optimizer check fired ($D/nm2.log)"
+rc=0; "$U" train fx/sources-ink.json --out nm --muon-lr 0.002 --lr 0.001 "${C[@]}" --P 64 --steps 6 --resume nm/last.ckpt > nm3.log 2>&1 || rc=$?
+[ $rc -eq 2 ] && grep -q 'trained with --opt muon+nm, this run --opt muon' nm3.log || fail "(4) plain Muon resuming a NorMuon checkpoint: rc $rc, not refused ($D/nm3.log)"
+echo "  (4) --normuon resumes its own checkpoint; plain Muon on it is refused"
 echo "test_gscale: ok"
