@@ -343,10 +343,12 @@ ref() {
   local cal=; [ "${CTCAL:-0}" = 1 ] && cal="--ct-cal $O/ct.cal"
   # the pass-1 sums streamed behind the fields predict (fields(): REFSTREAM): the same sums, so only the solve and model pass run here
   local pc=; [ "$DRY" != 1 ] && [ -e $O/ref.pool.ok ] && pc="--pool-cache $O/ref.pool --chunk-rows $(cat $O/ref.pool.ok)"
-  # DIRCOH=1 (off by default, unmeasured; audit-unroll 3a): no env / tsv hand -> two LS solves, --dir +1 into REF.p and -1 into REF.m, each
+  # DIRCOH=1 (ON by default since 2026-11-16; DIRCOH=0 refuses an unknown hand outright): measured (audit unroll #1, model-only solves): 1667
+  # -1 0.1731 vs +1 0.0986 (the published hand, margin 0.075); Paris 4 +1 0.0072 vs -1 0.0062 (margin 0.001 < 0.05: REFUSED, never wrong):
+  # where it cannot tell it refuses as before, so on is never worse. audit-unroll 3a: no env / tsv hand -> two LS solves, --dir +1 into REF.p and -1 into REF.m, each
   # printing "count-field: model coherence C" (|sum z| / sum |z| of the phase-vs-model phasors before smoothing; the wrong hand turns them
   # twice per revolution, so C ~ 0). The higher C wins by >= DIRCOH_MARGIN (0.05), else refuse. The pooled sums are dir-free (--pool-cache reused).
-  if [ -z "$sd" ] && [ "${DIRCOH:-0}" = 1 ] && [ -z "${REFCMD:-}" ]; then
+  if [ -z "$sd" ] && [ "${DIRCOH:-1}" = 1 ] && [ -z "${REFCMD:-}" ]; then
     local d c cp= cm=
     for d in p m; do
       [ "$DRY" = 1 ] || rm -rf $REF.$d

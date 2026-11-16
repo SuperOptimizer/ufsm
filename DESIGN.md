@@ -80,6 +80,96 @@ MXROT (its rotated variant had the higher held-out AUC loss).
 
 SPEED_PLACEHOLDER
 
+## ink-ext: the CT chunk hash saw no z (ink9um 1.21x, half the CPU) (2026-11-16, branch inkspeed-20261116)
+
+perf on ink9um over one PHerc1667 segment (194.6 Mpx, card 1, local CT): ct_find 45 % of the CPU samples, ct_tri 13 %, render_worker 8 %.
+chash took bits 20-29 of key x 0x9E37..: those depend only on key bits 0-29 (the chunk's x and the low bits of y), never on z (bits 42+),
+so all chunks of a band that differ in z alone probed one chain. A full 64-bit mix: wall 236 -> 196 s, user 1052 -> 560 s, render
+36 -> 16 s, network 87 -> 85 s. Output: ink-ext is not bit-reproducible run to run (the old binary twice: 3.45 M of 206.8 M px differ by
+1); old vs fixed differ by the same (3.42 M px, max 2). test_ink_ext_tiling runs again (its weights linked under ~/ufsm-data/inkext;
+the PyTorch parity tests need upstream villa / hecate sources, not run here). Fast tier: 330 PASS, 1 SKIP, 2 NEED2 (card 0 in training).
+
+## mcc 7add328: host code, where the 1.3-1.4x against clang comes from; the slot-argument inline bonus (2026-11-16, branch mcc-host-20261116)
+
+Priority 2 of the mcc round (host speed). Method: every fast-tier CPU line of tests/suite.txt without a gpu / slow / flaky tag and not
+python (118 lines), one CPU each (UFSM_NCPU=1), perf stat cycles:u + instructions:u, 8 lines at a time. The desk is shared (load 15-25
+from the other agents), so whole-run cycle totals drift by up to 10 % between runs; instruction counts do not. A/B now runs both builds
+of a line back to back on one worker, min of 3 (A/A: total +0.49 %, geomean 1.005).
+
+| 118 CPU lines, same commit, same window | G cycles | G instructions |
+|---|---|---|
+| clang + nvcc (llvm-verify, -march=native: AVX-512) | 925 | 2654 |
+| clang, -mno-avx512f | 955 | 2768 |
+| mcc 9aea0ba | 1245 | 3809 |
+
+So mcc runs 1.38x clang's instructions at about the same IPC, and AVX-512 is worth ~3 % to clang: the gap is code quality (registers,
+memory traffic, vectoriser coverage), not the vector width. GPU tests carry the same host gap (fast tier user CPU 1.52x).
+
+What was tried:
+- **Inline limit** (-finline-limit 12 default; 24 / 48 / 100): 100 is -2.3 % instructions, cycles within noise. More inlining alone is
+  not the lever.
+- **Spill choice** (ra.c spills the active interval with the least weight per length; weight alone, or per sqrt length): +2 % / +0 %
+  instructions, +3 % cycles. Dropped.
+- **Calls that pass a local's address** (microc 7add328, -finline-slotarg=160): one such call left in a function (volcomp's
+  vf_rdec_init(&rd, ...) before the token loop) keeps the whole record in memory, so slot_carve / opt_split cannot put its fields in
+  registers and every field access in the loop is a load or a store. Host call sites with an OP_SLOT argument now inline up to 160
+  instructions (clang's SROA bonus); device code unchanged (all 169 units' PTX byte-identical). Paired A/B: cycles -1.02 %, geomean
+  -1.9 %, instructions -0.35 %; test_flatten -26 %, test_idle_release -13 %, test_sampbias -12 %, test_crush -10 %; vf_decode_sub
+  -10 %. Release .text 10.16 -> 11.04 MB, build time unchanged. Fast tier (card 1): 330 PASS, 1 SKIP, 2 NEED2. microc gate green.
+
+Next (measured, not done): the register allocator spills whole intervals; its loop split (x64.c split_loops) only covers values a loop
+reads and does not write, so loop-carried scalars (counters, accumulators, bit-reader state) cost a load, the op and a store per
+iteration (vf_decode_sub's nnz_ac / hmask). Splitting written values at loops is the next step.
+
+## mcc 9aea0ba: PTX packed as MPY (~10x), verify builds keep it in sidecar files; GPU tests are not slower (2026-11-16, branch mcc-sass-20261116)
+
+Priority 1 of the mcc round (GPU test time, binary / build size). All numbers desk, same commit (master 9a9d46a4 + this branch),
+mcc against clang + nvcc (llvm-verify / llvm-release).
+
+**GPU test time: not a JIT problem once the cache is warm.** With ~/.cache/mcudahw warm (jit_warm.sh: 0 kernels to compile, 5 s
+scan), the smoke tier on card 1: 32 GPU tests 73.7 s wall under mcc vs 78.8 s under clang + nvcc (0.93x), 34 CPU tests 13.4 vs
+15.2 s. mcudahw's own work per process (unpacking, its text passes, hashing for the cache key) is ~3 % of test_unet's cycles; the
+rest is libcuda and the test. The "1.6x" was most likely cold-cache runs (every changed kernel is JIT-compiled once per text,
+GPU model and driver). The fast tier's CPU half: user time 500 s under mcc vs 385 s under clang (1.30x; wall 1.04x), which is the
+host-code gap (next priority), not the GPU path. The full fast tier on card 1 (sidecar build vs llvm-verify, same commit): 207 GPU tests 1399 s wall vs 1239 s (1.13x), their user CPU 1341 vs 881 s (1.52x); 124 CPU tests 393 vs 337 s wall, user 463 vs 335 s (1.38x); suite wall 264 vs 236 s. The GPU tests' extra time is the host code they run (references, data setup), not the JIT.
+
+**MPY packing (microc 413bb68, `--cuda-ptx-pack=2`, the default).** MPZ (11-15) was LZ77 with a varint distance per copy. PTX
+instantiations of one template differ in a few constants and register numbers, so copies break off and resume at the same
+distance; MPY codes three repeat offsets in 1-3 bits and entropy-codes literals, counts, lengths and offsets (canonical prefix
+codes of at most 11 bits, prices from a greedy parse of a 2 MB sample). `--cuda-ptx-pack=3` parses optimally (forward DP over 1024
+positions), 1 is MPZ, 0 plain. The unpacked text is byte for byte the same, so mcudahw's JIT cache keys do not change.
+
+| ufsm's 124 release units (337.6 MB of PTX) | packed | lp_f4fwd_i0p (18.6 MB): cycles |
+|---|---|---|
+| MPZ (a420db2) | 87.9 MB | ~1.8 G |
+| MPY pack 2 (greedy) | 43.5 MB | ~1.9 G |
+| MPY pack 3 (optimal) | 34.2 MB | ~10 G |
+| zstd -9 / -19 --long (reference) | 37.3 / 28.9 MB | 0.6 / 22 G |
+
+**Sidecar files (microc 9aea0ba, `--cuda-ptx-file`; ufsm `UFSM_PTX_FILE`, on in verify builds).** Every suite binary links every
+kernel unit, so each carried the same packed PTX. Now mcc writes a unit's record to OBJ.ptxz and the object keeps the plain
+prologue (what mcudahw's first-launch scan reads), two FNV-1a hashes and the file's absolute path; the bodies are read when first
+wanted, and a missing or stale file is refused with its name (`MCUDA_PTXDIR=DIR`: a moved build directory). Release binaries stay
+self-contained.
+
+| build (-j 8, desk) | wall | user / sys | size |
+|---|---|---|---|
+| release, mcc a420db2 (MPZ) | 15.9 s | 92.6 / - s | build/ufsm 108 MB |
+| release, MPY pack 2 | 14.4 s | 79.3 / 10.3 s | build/ufsm 63.1 MB |
+| release, MPY pack 3 (UFSM_PTX_PACK=3) | 23.7 s | 145.3 / 10.3 s | build/ufsm 53.7 MB |
+| release, clang + nvcc | - | - | build/ufsm 57.9 MB (31.4 MB fatbin) |
+| verify suite-bins, mcc a420db2 | 33.3 s | 170.9 / 47.0 s | 19 GB (test binaries ~140 MB) |
+| verify, MPY pack 2 | 31.1 s | 150.6 / 35.7 s | 9.6 GB |
+| verify, MPY pack 2 + sidecars | 23.6 s | 148.2 / 24.9 s | 1.8 GB (60 MB of .ptxz; test_ink_splat 23 MB) |
+| verify, clang + nvcc (cold ccache) | 9 m 13 s | 53 m user | 7.4 GB |
+
+Pack 2 stays the default everywhere (pack 3 costs +9 s on a full release build for 9 MB). Checks: the unpacked PTX of every unit is
+identical between a420db2 MPZ, pack 2, pack 3 and the sidecar build (169 release + 167 verify units); host .text identical in
+all 338 objects both builds made; test_unet's 57 kernel loads all came from the existing JIT cache (0 compiled); the fast tier
+from the sidecar build on card 1: 329 PASS, 2 data SKIP, 2 NEED2 (one card), wall 264 s. microc gate (stage0 -Werror, tests/c
+225/225 with lxlibc, glibc and -g, thr 50, as, abi 13/13, self) on 413bb68 and 9aea0ba; tests/ptxpack.sh 162/162 (every
+tests/cuda unit at levels 1-3 and with --cuda-ptx-file, damaged records and files refused, MCUDA_PTXDIR).
+
 ## The audit's post-pass GPU measurements: FBLEND on, the rest recorded (2026-11-16, master)
 
 try8 paused 06:30-08:04 for the GPU items the audit queued after the mega pass (outputs /vesuvius/ufsm/audit-20261114/postpass, rows in

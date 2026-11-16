@@ -470,6 +470,18 @@ elseif(UFSM_CUDA_COMPILER STREQUAL "mcc")
       "SHELL:-include ${CMAKE_SOURCE_DIR}/src/ufsm_dev.cuh")   # (the logical-device map, as the clang / nvcc paths: else cudaSetDevice is unwrapped and ufsm_dev_phys an implicit extern)
   set(UFSM_CU_FAST --cuda-fast-math)   # (nvcc's -use_fast_math)
   set(UFSM_CU_STRICT -fmad=false)
+  # how mcc packs each unit's PTX into its object (mcuda_pack.h): 1 MPZ, 2 MPY greedy, 3 MPY optimal; empty: mcc's default
+  set(UFSM_PTX_PACK "" CACHE STRING "mcc --cuda-ptx-pack level (empty: mcc's default)")
+  if(NOT UFSM_PTX_PACK STREQUAL "")
+    list(APPEND UFSM_CU_FLAGS --cuda-ptx-pack=${UFSM_PTX_PACK})
+  endif()
+  # verify builds: each unit's packed PTX in OBJ.ptxz beside its object, named by absolute path (mcc --cuda-ptx-file), so the ~240
+  # suite binaries do not carry ~50 MB each (a binary from build-verify/ runs where it was built; MCUDA_PTXDIR if the dir moved).
+  # Release binaries stay self-contained.
+  option(UFSM_PTX_FILE "mcc: unit PTX in sidecar files (default: on in verify builds)" ${UFSM_VERIFY})
+  if(UFSM_PTX_FILE)
+    list(APPEND UFSM_CU_FLAGS --cuda-ptx-file)
+  endif()
 endif()
 function(ufsm_cuda_obj name src arch)
   add_library(obj_${name} OBJECT ${src})
