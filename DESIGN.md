@@ -6,6 +6,21 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## conv_fwd_f4_k: double-buffered weight stages, opt-in (UFSM_F4_WDB=1) (2026-11-15, branch convfuse-port-20261115, off wip-convfuse-20261114)
+
+conv_fwd_f4_k (the MX-fp4 3^3 forward for Cip >= 96, i.e. every trunk conv above level 0) loads each 32-channel chunk's weights in two
+stages of 7 tap pairs, each behind a barrier: load, sync, MMA, sync. The parked convfuse WIP gives it two stage buffers: stage s + 1 is
+issued by cp.async (16-byte rows; the scale pairs by plain stores) before stage s's MMA, so the load overlaps the tensor cores, when
+two blocks per SM still fit (2 x (smem + 1 KB) <= the SM's shared memory; the fused-upsample instances keep one buffer). The port fixed
+one race: stage 0's copies were not committed as their own cp.async group, so the first `wait_group 1` could pass with them in flight.
+Same MMAs in the same order: outputs bit-identical (bench hashes equal; test_mx4_wide's exact references pass with it on and off).
+
+Measured (mcc build-verify, card 1 shared with merge3's suites at 100 % utilisation, so +-2 % noise; min of 10, two runs):
+256->256 @96^3 40.7 / 37.0 ms one buffer vs 37.3 / 37.2 two; 256->320 @96^3 46.4 / 45.7 vs 46.7 / 46.4 (0.98-0.99x, slower both
+runs); 448->288, 288->288 @48^3 and the GN+SiLU 256->256 / 448->448 within 1 %. No measured gain (the weight stage is a small part
+beside the input staging and MMAs at these widths), so it stays off by default: UFSM_F4_WDB=1 / lp_f4_wdb(1) turns it on. Kept tested
+by test_mx4_wide~F4_WDB=1 (fast tier); tests/bench_f4wide.c is the A/B (re-measure on an idle card before changing the default).
+
 ## Muon update scaling (--muon-scale rms) and cautious weight decay (--muon-cwd 1) (2026-11-15, branches muonscale-20261115, cwd-20261115)
 
 Two opt-in Muon options, both off by default. They are implemented and tested; the quality A/B is deferred by the 11-15 drain order (plan
