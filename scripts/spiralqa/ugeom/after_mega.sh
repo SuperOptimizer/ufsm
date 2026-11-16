@@ -35,7 +35,7 @@ packed)
     [ -e $d/model.json ] || CUDA_VISIBLE_DEVICES=${GPU:-0} nice -n 10 $U count-field $PF $OUT/cf.unused --dir $(sdir PHercParis4) --R 0 --pool 8 --phase-w 0.5 --wide 100,140 --wide-phase 15 \
       --model-only 1 --model-stride 4 $x --iters 1200 --model $d --threads 20 --mem-gb 24 > $OUT/p4ref-$n.log 2>&1
     bash "$H/gtboxes.sh" $PF $d $OUT/p4boxes.tsv /vesuvius/ufsm/gt/paris4-q9p6/q-9p6.zarr 9.6 $OUT/gt-p4-$n $U | sed "s/^/$n PH: /" | tee -a $OUT/packed.txt
-    bash "$H/gtboxes.sh" $PF $d $OUT/p4j.tsv /vesuvius/ufsm/univ/b1/gt/paris4/codesB48 4.8 $OUT/gtj-p4-$n $U | sed "s/^/$n J: /" | tee -a $OUT/packed.txt
+    bash "$H/gtboxes.sh" $PF $d $OUT/p4j.tsv /vesuvius/ufsm/datafix-20261114/raster/p4-codesB48 4.8 $OUT/gtj-p4-$n $U | sed "s/^/$n J: /" | tee -a $OUT/packed.txt
     nice -n 10 $U cf-demod $d $PF --step 8 --band 128 --cz 16 --threads 20 | grep 'z drift' | sed "s/^/$n /" | tee -a $OUT/packed.txt
   done ;;
 demod)

@@ -9,6 +9,7 @@
 set -euo pipefail
 F=$(readlink -f "$1") M=$2 BX=$3 CR=$4 CK=$5 OUT=$6 U=${7:-${U:-ufsm}}
 H=$(cd "$(dirname "$0")" && pwd); MK=${MKCROP:-$H/../../wbench/mkcrop.sh}
+[ -e "$CR/zarr.json" ] || [ -e "$CR/.zarray" ] || [ -e "$CR/$CK" ] || { echo "gtboxes: no GT codes store at $CR (missing / moved)" >&2; exit 2; }   # (11-16: a moved store scored "nothing" silently)
 mkdir -p "$OUT/crops"
 read -r oz oy ox h < <(jq -r '"\(.origin[0]) \(.origin[1]) \(.origin[2]) \(.h)"' "$F/fields.json")
 grep -v '^#' "$BX" | while IFS=$'\t' read -r nm sc z y x nz ny nx rest; do
