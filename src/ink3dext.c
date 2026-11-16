@@ -299,7 +299,8 @@ static int run_band_fast(run_ctx *C, int tz0, int tz1, int y0, int y1, int x0, i
     const int TY = y1 - y0, TX = x1 - x0, PZ = T + 64;
     const int64_t ys = C->A[1][lo[1]] - 32, xs = C->A[2][lo[2]] - 32;
     const int sy = (int)(C->A[1][hi[1]] + T + 32 - ys), sx = (int)(C->A[2][hi[2]] + T + 32 - xs);   /* multiples of 16 */
-    const size_t slab = (size_t)PZ * sy * sx, nbh = (size_t)(PZ / 16) * (sy / 16) * (sx / 16) * 256 * 4;
+    const int P = C->l1 ? 1 : 2;   /* slab voxels per output voxel */
+    const size_t slab = (size_t)PZ * sy * sx * P * P * P, nbh = (size_t)(PZ / 16) * (sy / 16) * (sx / 16) * 256 * 4;
     if (slab > C->slab_cap) { free(C->slab); C->slab_cap = slab; C->slab = malloc(slab); if (!C->slab) return -1; }
     if (slab > C->dslab_cap) { xfree_dev(C->dslab); C->dslab_cap = slab; C->dslab = xmalloc_dev(slab); if (!C->dslab) return -1; }
     if (nbh > C->dbh_cap) { xfree_dev(C->dbh); C->dbh_cap = nbh; C->dbh = xmalloc_dev(nbh); if (!C->dbh) return -1; }
@@ -318,15 +319,16 @@ static int run_band_fast(run_ctx *C, int tz0, int tz1, int y0, int y1, int x0, i
         C->nair += nj - nc;
         const double tc = now_s();
         const int64_t nzs = (int64_t)oz - 32; int64_t keep = 0;
-        if (zs != INT64_MIN && nzs > zs && nzs - zs < PZ) { keep = PZ - (nzs - zs); memmove(C->slab, C->slab + (size_t)(nzs - zs) * sy * sx, (size_t)keep * sy * sx); }
-        { const int64_t o[3] = {nzs + keep, ys, xs}, n[3] = {PZ - keep, sy, sx};
-          if (z3_read(C->ct, o, n, C->slab + (size_t)keep * sy * sx, C->nth)) { fprintf(stderr, "ink3d-ext: CT read: %s\n", z3_error()); return -1; } }
+        const size_t pl = (size_t)sy * sx * P * P;   /* bytes per slab plane */
+        if (zs != INT64_MIN && nzs > zs && nzs - zs < PZ) { keep = PZ - (nzs - zs); memmove(C->slab, C->slab + (size_t)(nzs - zs) * P * pl, (size_t)keep * P * pl); }
+        { const int64_t o[3] = {(nzs + keep) * P, ys * P, xs * P}, n[3] = {(PZ - keep) * P, (int64_t)sy * P, (int64_t)sx * P};
+          if (z3_read(C->ct, o, n, C->slab + (size_t)keep * P * pl, C->nth)) { fprintf(stderr, "ink3d-ext: CT read: %s\n", z3_error()); return -1; } }
         zs = nzs; C->tct += now_s() - tc;
         const double tp = now_s();
         xh2d(C->dslab, C->slab, slab);
-        i3f_bhist(C->dslab, PZ, sy, sx, C->dbh);
+        i3f_bhist(C->dslab, PZ * P, sy * P, sx * P, P, C->dbh);
         xh2d(C->dpyx, C->hpyx, sizeof(int) * 2 * nc);
-        i3f_cmax(C->dslab, sy, sx, T, C->dpyx, nc, C->dcmax);
+        i3f_cmax(C->dslab, sy * P, sx * P, T, P, C->dpyx, nc, C->dcmax);
         xd2h(C->hcmax, C->dcmax, sizeof(int) * nc);
         int m = 0;
         for (int j = 0; j < nc; j++) {
@@ -339,7 +341,7 @@ static int run_band_fast(run_ctx *C, int tz0, int tz1, int y0, int y1, int x0, i
             const int n = m - j0 < C->B ? m - j0 : C->B;
             xh2d(C->dpyx, C->hpyx + 2 * j0, sizeof(int) * 2 * n); xh2d(C->dorg, C->org + 3 * j0, sizeof(int) * 3 * n);
             void *x = xmalloc_dev((size_t)n * T * T * T * 2); if (!x) { fprintf(stderr, "ink3d-ext: out of device memory (input)\n"); return -1; }
-            i3f_crops(C->dslab, sy, sx, T, C->dbh, C->dpyx, n, x, nullptr);
+            i3f_crops(C->dslab, sy * P, sx * P, T, P, C->dbh, C->dpyx, n, x, nullptr);
             const float *lg = nullptr;
             if (gb_forward_x(C->net, x, n, &lg)) return -1;
             i3_blend(C->acc, C->wsum, C->R, TY, TX, lg, C->dorg, n, tz0, tz1, T);
@@ -400,7 +402,7 @@ int cmd_ink3d_ext(int argc, char **argv) {
     C.l1 = opt_atoi("--ct-l1", opt(argc, argv, "--ct-l1", "0"));   /* KEY is level 1 (4.8 um: the network's own input scale); box still in level-0 voxels */
     C.fast = opt_atoi("--fast", opt(argc, argv, "--fast", "0"));   /* level-1 input on an aligned grid, prep on the GPU (gambiarra) */
     C.T = opt_atoi("--tile", opt(argc, argv, "--tile", "64"));   /* --fast: crop edge at 4.8 um (64 = the published one) */
-    if (C.fast && (!C.l1 || G.pool_in != 2 || G.out != 64 || stride % 16 || C.T % 16 || C.T < 64 || C.T > 256 || stride > C.T)) { fprintf(stderr, "ink3d-ext: --fast needs --ct-l1 1, gambiarra, --tile 64..256 and --stride <= tile, multiples of 16\n"); return 2; }
+    if (C.fast && (G.pool_in != 2 || G.out != 64 || stride % 16 || C.T % 16 || C.T < 64 || C.T > 256 || stride > C.T)) { fprintf(stderr, "ink3d-ext: --fast needs gambiarra, --tile 64..256 and --stride <= tile, multiples of 16\n"); return 2; }
     if (C.fast && C.T != 64) { gb_set_tile(net, C.T); G.out = C.T; C.R = 2 * C.T; }
     int64_t V[3];
     for (int a = 0; a < 3; a++) V[a] = (C.l1 ? 2 : 1) * z3_meta_of(C.ct)->shape[a];
@@ -413,7 +415,7 @@ int cmd_ink3d_ext(int argc, char **argv) {
         const int64_t b0 = bv[a] / 4 * 4, b1 = (bv[a] + bv[3 + a] + 3) / 4 * 4;
         r48[0][a] = b0 / 2; r48[1][a] = (b1 / 2) < S1[a] ? b1 / 2 : S1[a];
         r96[0][a] = b0 / 4; r96[1][a] = (r48[1][a] + 1) / 2;
-        C.nA[a] = C.fast ? grid_axis_fast(z3_meta_of(C.ct)->shape[a], stride, C.T, &C.A[a]) : grid_axis(V[a], stride, &C.A[a]);
+        C.nA[a] = C.fast ? grid_axis_fast(C.l1 ? z3_meta_of(C.ct)->shape[a] : z3_meta_of(C.ct)->shape[a] / 2, stride, C.T, &C.A[a]) : grid_axis(V[a], stride, &C.A[a]);
     }
     fprintf(stderr, "ink3d-ext: CT %lldx%lldx%lld, box (4.8) z %lld..%lld y %lld..%lld x %lld..%lld, crop grid %dx%dx%d, batch %d, band %d, air < %d\n",
             (long long)V[0], (long long)V[1], (long long)V[2], (long long)r48[0][0], (long long)r48[1][0], (long long)r48[0][1], (long long)r48[1][1],

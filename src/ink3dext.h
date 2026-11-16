@@ -47,9 +47,9 @@ void i3_emit(float *acc, float *wsum, int R, int TY, int TX, int z0, int z1, uin
 /* the fast path (--fast): level-1 slab [Z][Y][X] on the device (Z = T + 64, Y, X multiples of 16), block histograms [Z/16][Y/16][X/16][256];
    crops of T^3 by their parent's (y, x) in the slab (multiples of 16; parent z = the slab): max of the crop region, and the fp16 network
    input [n][T^3] after the parent's p1 / p99 lut (lohi: the limits, optional) */
-void i3f_bhist(const uint8_t *slab, int Z, int Y, int X, uint32_t *hist);
-void i3f_cmax(const uint8_t *slab, int Y, int X, int T, const int *pyx_dev, int n, int *cmax_dev);
-void i3f_crops(const uint8_t *slab, int Y, int X, int T, const uint32_t *hist, const int *pyx_dev, int n, void *out_half, float *lohi_dev);
+void i3f_bhist(const uint8_t *slab, int Z, int Y, int X, int P, uint32_t *hist);   /* P: slab voxels per output voxel (2: level 0, 1: level 1); blocks of 16 P */
+void i3f_cmax(const uint8_t *slab, int Y, int X, int T, int P, const int *pyx_dev, int n, int *cmax_dev);
+void i3f_crops(const uint8_t *slab, int Y, int X, int T, int P, const uint32_t *hist, const int *pyx_dev, int n, void *out_half, float *lohi_dev);
 /* the network (src/ink3dext_net.c) */
 typedef struct gb_net gb_net;
 /* the network on a prepared fp16 input [B][net_in^3] (an xmalloc_dev buffer, consumed) */

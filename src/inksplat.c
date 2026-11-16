@@ -1560,6 +1560,7 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
         double F = cfg->label_scale; const double ew = S->w / S->scale, eh = S->h / S->scale;
         if (!(F > 0)) { F = 0.5 * (ew / (double)LL->W + eh / (double)LL->H); const double p2 = pow(2, round(log2(F))); if (fabs(F - p2) < 0.002 * p2) F = p2;
             const double mum = S->vox_um > 0 ? S->vox_um : cfg->ct_um; if (LL->um > 0 && mum > 0) F = LL->um / mum; }
+        { const double es = json_num(json_get(e, "label_scale"), 0); if (es > 0) F = es; }   /* per window (ink-teach rasters: K x the human F) */
         u->F = F; u->lr0 = 0; u->lc0 = 0; u->lw = LL->W; u->lh = LL->H;
         const json *cr = json_get(e, "crop");
         if (cr && cr->n == 4 && json_num(json_at(cr, 2), 0) > 0) { u->lc0 = (int64_t)json_num(json_at(cr, 0), 0); u->lr0 = (int64_t)json_num(json_at(cr, 1), 0); u->lw = (int64_t)json_num(json_at(cr, 2), 0); u->lh = (int64_t)json_num(json_at(cr, 3), 0); }
@@ -1886,4 +1887,211 @@ int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits) {
                         f->c.nexcl ? "" : " (the ink inside them is kept: the sampler's holdout mask hides it from training, validation reads it)");
     n -= nx;
     return (int)(n > 2000000000 ? 2000000000 : n);
+}
+
+/* ---------------- ufsm ink-teach: 2-D teacher ink maps -> gated soft label windows for the on-the-fly ink path (2026-11-15) ----------------
+   ufsm ink-teach --segs SEGS.json --teacher NAME=PATTERN [--teacher ..] --holdouts H.json --ct-key KEY --out DIR [--k 4] [--px-um 9.596]
+                  [--lo 0.1] [--hi 0.8] [--hold-margin 64] [--human-dilate 1] [--weights auc|equal] [--platt a,b] [--name-out S]
+   PATTERN: a teacher's model-grid map of a segment (ink-ext --native-only: px (i, j) = tifxyz grid (i du, j du), du = px-um / (mesh voxel
+   um / scale), uint8 p x 255), "%s" = the segment's "name" in SEGS. Per segment (the SEGS windows grouped by tifxyz): a raster on the human
+   label grid pooled K (teacher px (R, C) = label px [K R, K R + K) x [K C, K C + K), label_scale K x the human F, so the face splat places
+   it exactly where the human labels would go), each teacher bilinear at its centre. Calibration over the whole SEGS (one scroll):
+   per teacher the AUC against the human labels on fully supervised teacher px outside the held-out boxes; the ensemble logit
+   x = sum w_t logit(p_t) (w_t = AUC_t - 0.5 normalised, or equal); Platt p = sigmoid(a x + b) fitted on the same px (soft y = the
+   footprint's mean label). Output px: p x 255 where p <= lo or p >= hi (the confidence gate: in between is unknown), the mesh valid,
+   outside every held-out box grown by the margin (level-0 voxels) and not within --human-dilate teacher px of a human-supervised pixel
+   (human labels override teachers: the known-max merge of the splat would otherwise let a teacher raise a human no-ink).
+   Writes DIR/<name>/teach.zarr/0 + teachmask.zarr/0 (zarr v3, 1024^2 chunks, zstd, OME pixel size K x the label's) and
+   DIR/segs-teach.json ({"segments": [{name, tifxyz, labels, mask, label_scale, crop}]}), and prints per-teacher / ensemble AUC, the
+   Platt fit and the gate's coverage / accuracy against the human labels. */
+#include <zstd.h>
+typedef struct { char name[256], tifxyz[1024], lab[1024], msk[1024], val[1024]; int nwin; int64_t win[64][4]; } it_seg;
+static int it_write_zarr(const char *dir, const uint8_t *a, int64_t H, int64_t W, double um, int skip_empty) {
+    enum { CK = 1024 }; char p[1400];
+    snprintf(p, sizeof p, "%s/0", dir); if (mkdir_p(p)) return -1;
+    snprintf(p, sizeof p, "%s/zarr.json", dir); FILE *f = fopen(p, "wb"); if (!f) return -1;
+    fprintf(f, "{\"zarr_format\": 3, \"node_type\": \"group\", \"attributes\": {\"ufsm\": {\"content\": \"ink-teach\"}, \"ome\": {\"version\": \"0.5\", \"multiscales\": [{\"axes\": "
+               "[{\"name\": \"y\", \"type\": \"space\", \"unit\": \"micrometer\"}, {\"name\": \"x\", \"type\": \"space\", \"unit\": \"micrometer\"}], \"datasets\": [{\"path\": \"0\", "
+               "\"coordinateTransformations\": [{\"type\": \"scale\", \"scale\": [%.9g, %.9g]}]}]}]}}}\n", um, um); fclose(f);
+    snprintf(p, sizeof p, "%s/0/zarr.json", dir); f = fopen(p, "wb"); if (!f) return -1;
+    fprintf(f, "{\"zarr_format\": 3, \"node_type\": \"array\", \"shape\": [%lld, %lld], \"data_type\": \"uint8\", \"chunk_grid\": {\"name\": \"regular\", \"configuration\": "
+               "{\"chunk_shape\": [%d, %d]}}, \"chunk_key_encoding\": {\"name\": \"default\", \"configuration\": {\"separator\": \"/\"}}, \"fill_value\": 0, \"codecs\": "
+               "[{\"name\": \"bytes\"}, {\"name\": \"zstd\", \"configuration\": {\"level\": 5, \"checksum\": false}}]}\n", (long long)H, (long long)W, CK, CK); fclose(f);
+    uint8_t *c = malloc((size_t)CK * CK); const size_t cb = ZSTD_compressBound((size_t)CK * CK); uint8_t *z = malloc(cb); int rc = 0;
+    for (int64_t r0 = 0; r0 < H && !rc; r0 += CK) for (int64_t c0 = 0; c0 < W && !rc; c0 += CK) {
+        memset(c, 0, (size_t)CK * CK); int any = 0;
+        for (int64_t r = 0; r < CK && r0 + r < H; r++) { const int64_t n = c0 + CK <= W ? CK : W - c0; memcpy(c + (size_t)r * CK, a + (size_t)(r0 + r) * W + c0, (size_t)n);
+            for (int64_t q = 0; q < n && !any; q++) any = c[(size_t)r * CK + q] != 0; }
+        if (!any && skip_empty) continue;
+        const size_t zn = ZSTD_compress(z, cb, c, (size_t)CK * CK, 5); if (ZSTD_isError(zn)) { rc = -1; break; }
+        snprintf(p, sizeof p, "%s/0/c/%lld", dir, (long long)(r0 / CK)); if (mkdir_p(p)) { rc = -1; break; }
+        snprintf(p, sizeof p, "%s/0/c/%lld/%lld", dir, (long long)(r0 / CK), (long long)(c0 / CK)); f = fopen(p, "wb");
+        if (!f || fwrite(z, 1, zn, f) != zn) rc = -1;
+        if (f) fclose(f);
+    }
+    free(c); free(z); return rc;
+}
+static double it_auc(const float *x, const float *y, size_t n) {   /* ROC AUC of x for the binary y >= 0.5 (ties averaged; 1024-bin histogram of x in [-16, 16]) */
+    enum { NB = 4096 }; double hp[NB] = {0}, hn[NB] = {0}, P = 0, N = 0;
+    for (size_t i = 0; i < n; i++) { int b = (int)((x[i] + 16) / 32 * NB); b = b < 0 ? 0 : b >= NB ? NB - 1 : b; if (y[i] >= 0.5f) { hp[b]++; P++; } else { hn[b]++; N++; } }
+    double a = 0, cn = 0; for (int b = 0; b < NB; b++) { a += hp[b] * (cn + 0.5 * hn[b]); cn += hn[b]; }
+    return P > 0 && N > 0 ? a / (P * N) : NAN;
+}
+static inline float it_logit(float p) { p = p < 0.002f ? 0.002f : p > 0.998f ? 0.998f : p; return logf(p / (1 - p)); }
+int cmd_ink_teach(int argc, char **argv) {
+    const char *segs = sopt(argc, argv, "--segs", nullptr), *out = sopt(argc, argv, "--out", nullptr), *hof = sopt(argc, argv, "--holdouts", nullptr), *ctk = sopt(argc, argv, "--ct-key", nullptr);
+    int nt = 0; char tn[8][64], tp[8][1024];
+    for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n("--teacher")) && nt < 8) { const char *e = strchr(argv[i + 1], '='); if (!e) continue;
+        snprintf(tn[nt], sizeof tn[nt], "%.*s", (int)(e - argv[i + 1]), argv[i + 1]); snprintf(tp[nt], sizeof tp[nt], "%s", e + 1); nt++; }
+    if (!segs || !out || !nt || (hof && !ctk)) {
+        fprintf(stderr, "usage: ufsm ink-teach --segs SEGS.json --teacher NAME=PATTERN(%%s = segment name) [..] --holdouts H.json --ct-key KEY --out DIR [--k 4] [--px-um 9.596]\n"
+                        "         [--lo 0.1] [--hi 0.8] [--hold-margin 64] [--human-dilate 1] [--weights auc|equal] [--platt a,b] [--max-pairs 4000000]\n"
+                        "  2-D teacher maps (ink-ext --native-only) of every segment of SEGS -> AUC-weighted logit ensemble, Platt-calibrated on the human labels\n"
+                        "  outside the held-out boxes, confidence-gated (p <= lo or >= hi), human-supervised px and held-out boxes removed -> label windows\n"
+                        "  DIR/<name>/teach.zarr + teachmask.zarr and DIR/segs-teach.json for the on-the-fly ink path\n"); return 2; }
+    const int K = opt_atoi("--k", sopt(argc, argv, "--k", "4")), hdil = opt_atoi("--human-dilate", sopt(argc, argv, "--human-dilate", "1"));
+    const double px_um = opt_atof("--px-um", sopt(argc, argv, "--px-um", "9.596")), lo = opt_atof("--lo", sopt(argc, argv, "--lo", "0.1")), hi = opt_atof("--hi", sopt(argc, argv, "--hi", "0.8"));
+    const double hm = opt_atof("--hold-margin", sopt(argc, argv, "--hold-margin", "64")); const int eqw = !strcmp(sopt(argc, argv, "--weights", "auc"), "equal");
+    const size_t maxp = (size_t)opt_atoll("--max-pairs", sopt(argc, argv, "--max-pairs", "4000000"));
+    inksplat_cfg hc; memset(&hc, 0, sizeof hc);
+    if (hof && inkfly_holdouts(hof, ctk, &hc)) return 1;
+    fprintf(stderr, "ink-teach: %d teachers, K %d, gate p <= %g | p >= %g, %d held-out boxes (+%g voxels)\n", nt, K, lo, hi, hc.nexcl, hm);
+    /* the SEGS windows grouped by segment */
+    FILE *fp = fopen(segs, "rb"); if (!fp) { fprintf(stderr, "ink-teach: cannot open %s\n", segs); return 1; }
+    fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *txt = malloc((size_t)sz + 1); size_t rd = fread(txt, 1, (size_t)sz, fp); fclose(fp); txt[rd] = 0;
+    json *j = json_parse(txt, rd); free(txt); const json *sg = json_get(j, "segments");
+    if (!sg || sg->type != J_ARR) { fprintf(stderr, "ink-teach: %s: no segments\n", segs); json_free(j); return 1; }
+    it_seg *S = calloc(sg->n, sizeof *S); int ns = 0;
+    for (size_t i = 0; i < sg->n; i++) {
+        const json *e = json_at(sg, i); const char *tx = json_str(json_get(e, "tifxyz"), ""), *nm = json_str(json_get(e, "name"), ""), *cr0 = nullptr; (void)cr0;
+        int k = 0; while (k < ns && strcmp(S[k].tifxyz, tx)) k++;
+        if (k == ns) { snprintf(S[k].tifxyz, sizeof S[k].tifxyz, "%s", tx); snprintf(S[k].name, sizeof S[k].name, "%s", nm); snprintf(S[k].lab, sizeof S[k].lab, "%s", json_str(json_get(e, "labels"), ""));
+            snprintf(S[k].msk, sizeof S[k].msk, "%s", json_str(json_get(e, "mask"), "")); snprintf(S[k].val, sizeof S[k].val, "%s", json_str(json_get(e, "validation"), "")); ns++; }
+        const json *cr = json_get(e, "crop"); it_seg *s = &S[k];
+        if (!s->val[0]) snprintf(s->val, sizeof s->val, "%s", json_str(json_get(e, "validation"), ""));   /* (only some windows of a segment name it) */
+        if (s->nwin < 64) { int64_t *w = s->win[s->nwin++];
+            if (cr && cr->n == 4 && json_num(json_at(cr, 2), 0) > 0) for (int d = 0; d < 4; d++) w[d] = (int64_t)json_num(json_at(cr, (size_t)d), 0); else w[2] = -1; }
+    }
+    json_free(j);
+    /* pass 1 per segment: the teacher raster + the human footprint stats; kept for pass 2 (rasters are 1 / K^2 of the label grid) */
+    typedef struct { int64_t H, W; double F, lum; float *xt; uint8_t *valid, *hsup; float *hy; } itr;
+    itr *R = calloc(ns, sizeof *R); float *px = malloc(maxp * nt * sizeof *px), *py = malloc(maxp * sizeof *py); size_t np = 0, nseen = 0; uint64_t rng = 0x9E3779B97F4A7C15ull;
+    for (int si = 0; si < ns; si++) {
+        it_seg *s = &S[si]; itr *r = &R[si]; ssurf SS; if (ssurf_load(&SS, s->tifxyz)) return 1;
+        lsrc LL; if (lsrc_open(&LL, s->lab, -1, nullptr)) return 1;
+        double F; { const double ew = SS.w / SS.scale, eh = SS.h / SS.scale; F = 0.5 * (ew / (double)LL.W + eh / (double)LL.H); const double p2 = pow(2, round(log2(F))); if (fabs(F - p2) < 0.002 * p2) F = p2;
+            const double mum = SS.vox_um > 0 ? SS.vox_um : 2.399; if (LL.um > 0 && mum > 0) F = LL.um / mum; }
+        r->F = F; r->lum = LL.um; r->H = (LL.H + K - 1) / K; r->W = (LL.W + K - 1) / K; const size_t n = (size_t)r->H * r->W;
+        r->xt = calloc(n * nt, sizeof *r->xt); r->valid = calloc(n, 1); r->hsup = calloc(n, 1); r->hy = calloc(n, sizeof *r->hy);
+        /* teachers */
+        const double mum = SS.vox_um > 0 ? SS.vox_um : 2.399, du = px_um / (mum / SS.scale);
+        for (int t = 0; t < nt; t++) {
+            char p[1400]; snprintf(p, sizeof p, tp[t], s->name); int mw, mh; uint8_t *m = img_read_u8(p, &mw, &mh);
+            if (!m) { fprintf(stderr, "ink-teach: cannot read %s\n", p); return 1; }
+            for (int64_t a = 0; a < r->H; a++) for (int64_t b = 0; b < r->W; b++) {
+                const double lr = a * K + (K - 1) * 0.5, lc = b * K + (K - 1) * 0.5, gu = ((lc + 0.5) * F - 0.5) * SS.scale, gv = ((lr + 0.5) * F - 0.5) * SS.scale;
+                double P[3], N[3]; const size_t k = (size_t)a * r->W + b;
+                if (ssurf_pn(&SS, gu, gv, P, N)) continue;
+                if (!t) { int in = 0; for (int e = 0; e < hc.nexcl && !in; e++) { in = 1; for (int d = 0; d < 3; d++) in &= P[d] >= hc.excl[e][d] - hm && P[d] < hc.excl[e][d] + hc.excl[e][3 + d] + hm; }
+                          r->valid[k] = in ? 2 : 1; }   /* 2: inside a held-out box */
+                double mx = gu / du, my = gv / du; if (mx > mw - 1) mx = mw - 1; if (my > mh - 1) my = mh - 1;
+                const int x0 = (int)mx, y0 = (int)my, x1 = x0 + 1 < mw ? x0 + 1 : x0, y1 = y0 + 1 < mh ? y0 + 1 : y0; const double fx = mx - x0, fy = my - y0;
+                const double v = (1 - fy) * ((1 - fx) * m[(size_t)y0 * mw + x0] + fx * m[(size_t)y0 * mw + x1]) + fy * ((1 - fx) * m[(size_t)y1 * mw + x0] + fx * m[(size_t)y1 * mw + x1]);
+                r->xt[k * nt + t] = it_logit((float)(v / 255));
+            }
+            free(m);
+        }
+        /* the human supervision over the windows, pooled K: supervised count / label sum per teacher px (0/1 rasters x 255) */
+        lsrc LM; const int hasm = s->msk[0] && !lsrc_open(&LM, s->msk, -1, nullptr);
+        uint16_t *cnt = calloc(n, sizeof *cnt); float *sum = calloc(n, sizeof *sum);
+        for (int w = 0; w < s->nwin; w++) {
+            const int64_t *wn = s->win[w], c0 = wn[2] > 0 ? wn[0] : 0, r0 = wn[2] > 0 ? wn[1] : 0, ww = wn[2] > 0 ? wn[2] : LL.W, wh = wn[2] > 0 ? wn[3] : LL.H;
+            uint8_t lmax = 0, mmax = 0; enum { ST = 512 };
+            uint8_t *lb = malloc((size_t)ST * ww), *mb = malloc((size_t)ST * ww);
+            for (int pass = 0; pass < 2; pass++) for (int64_t rr = r0; rr < r0 + wh; rr += ST) {   /* pass 0: the 0/1 test (max over the window), 1: accumulate */
+                const int64_t hh = rr + ST <= r0 + wh ? ST : r0 + wh - rr;
+                if (lsrc_read(&LL, rr, c0, hh, ww, lb, 4) || (hasm && lsrc_read(&LM, rr, c0, hh, ww, mb, 4))) return 1;
+                if (!pass) { for (size_t q = 0; q < (size_t)hh * ww; q++) { if (lb[q] > lmax) lmax = lb[q]; if (hasm && mb[q] > mmax) mmax = mb[q]; } continue; }
+                for (int64_t a = 0; a < hh; a++) for (int64_t b = 0; b < ww; b++) {
+                    const int64_t lr = rr + a, lc = c0 + b; if (lr >= LL.H || lc >= LL.W) continue;
+                    const uint8_t mv = hasm ? mb[(size_t)a * ww + b] : 255; const int sup = mmax == 1 ? mv >= 1 : mv >= 128; if (!sup) continue;
+                    const size_t k = (size_t)(lr / K) * r->W + lc / K; if (cnt[k] < 65535) cnt[k]++;
+                    sum[k] += (lmax == 1 ? lb[(size_t)a * ww + b] * 255.f : lb[(size_t)a * ww + b]) / 255.f;
+                }
+            }
+            free(lb); free(mb);
+        }
+        if (s->val[0]) {   /* the segment's validation raster (villa validation_mask_v2: held out of the human training): no teacher label there either */
+            lsrc LV; if (lsrc_open(&LV, s->val, -1, nullptr)) return 1; enum { ST = 512 }; uint8_t *vb = malloc((size_t)ST * LV.W), vmax = 0; size_t nvl = 0;
+            for (int pass = 0; pass < 2; pass++) for (int64_t rr = 0; rr < LV.H; rr += ST) {
+                const int64_t hh = rr + ST <= LV.H ? ST : LV.H - rr; if (lsrc_read(&LV, rr, 0, hh, LV.W, vb, 4)) return 1;
+                for (int64_t a = 0; a < hh; a++) for (int64_t b = 0; b < LV.W; b++) { const uint8_t v = vb[(size_t)a * LV.W + b];
+                    if (!pass) { if (v > vmax) vmax = v; continue; }
+                    if (!(vmax == 1 ? v >= 1 : v >= 128) || (rr + a) / K >= r->H || b / K >= r->W) continue;
+                    const size_t k = (size_t)((rr + a) / K) * r->W + b / K; if (r->valid[k] == 1) { r->valid[k] = 3; nvl++; } } }
+            free(vb); lsrc_close(&LV); fprintf(stderr, "ink-teach: %s: %zu teacher px in the validation raster dropped\n", s->name, nvl);
+        }
+        size_t nsup = 0, nfull = 0;
+        for (size_t k = 0; k < n; k++) { if (!cnt[k]) continue; nsup++; r->hsup[k] = 1; r->hy[k] = sum[k] / cnt[k];
+            if (cnt[k] >= K * K && r->valid[k] == 1) { nfull++;   /* a calibration pair (reservoir over the scroll) */
+                size_t slot = np < maxp ? np++ : (rng ^= rng << 13, rng ^= rng >> 7, rng ^= rng << 17, (size_t)(rng % (nseen + 1)));
+                if (slot < maxp) { memcpy(px + slot * nt, r->xt + k * nt, nt * sizeof *px); py[slot] = r->hy[k]; }
+                nseen++; } }
+        free(cnt); free(sum); if (hasm) lsrc_close(&LM); lsrc_close(&LL);
+        size_t nv = 0, nh = 0; for (size_t k = 0; k < n; k++) { nv += r->valid[k] == 1; nh += r->valid[k] == 2; }
+        fprintf(stderr, "ink-teach: %s: %lld x %lld teacher px (label F %.4g, K %d), %zu valid, %zu in held-out boxes, %zu human-supervised (%zu calibration)\n",
+                s->name, (long long)r->W, (long long)r->H, F, K, nv, nh, nsup, nfull);
+        ssurf_free(&SS);
+    }
+    if (np < 1000) { fprintf(stderr, "ink-teach: only %zu calibration px\n", np); return 1; }
+    /* weights from the per-teacher AUC, then Platt on the ensemble logit */
+    double w[8], ws = 0; float *xe = malloc(np * sizeof *xe), *tmp = malloc(np * sizeof *tmp);
+    for (int t = 0; t < nt; t++) { for (size_t i = 0; i < np; i++) tmp[i] = px[i * nt + t]; const double a = it_auc(tmp, py, np);
+        w[t] = eqw ? 1 : fmax(a - 0.5, 0.01); ws += w[t]; fprintf(stderr, "ink-teach: teacher %s AUC %.4f on %zu calibration px\n", tn[t], a, np); }
+    for (int t = 0; t < nt; t++) w[t] /= ws;
+    for (size_t i = 0; i < np; i++) { double x = 0; for (int t = 0; t < nt; t++) x += w[t] * px[i * nt + t]; xe[i] = (float)x; }
+    double A = 1, B = 0;
+    const char *pl = sopt(argc, argv, "--platt", nullptr);
+    if (pl && sscanf(pl, "%lf,%lf", &A, &B) == 2) {}
+    else for (int it = 0; it < 50; it++) {   /* Newton on the soft-label log loss */
+        double g0 = 0, g1 = 0, h00 = 1e-9, h01 = 0, h11 = 1e-9;
+        for (size_t i = 0; i < np; i++) { const double p = 1 / (1 + exp(-(A * xe[i] + B))), d = p - py[i], q = p * (1 - p); g0 += d * xe[i]; g1 += d; h00 += q * xe[i] * xe[i]; h01 += q * xe[i]; h11 += q; }
+        const double det = h00 * h11 - h01 * h01; if (!(det > 0)) break;
+        const double dA = (h11 * g0 - h01 * g1) / det, dB = (h00 * g1 - h01 * g0) / det; A -= dA; B -= dB; if (fabs(dA) + fabs(dB) < 1e-7) break; }
+    { size_t keep = 0, ok = 0, ki = 0, yi = 0; double ll = 0;
+      for (size_t i = 0; i < np; i++) { const double p = 1 / (1 + exp(-(A * xe[i] + B))); const int y = py[i] >= 0.5f; yi += y; ll -= py[i] * log(fmax(p, 1e-9)) + (1 - py[i]) * log(fmax(1 - p, 1e-9));
+          if (p <= lo || p >= hi) { keep++; ok += (p >= 0.5) == y; ki += y && p >= hi; } }
+      fprintf(stderr, "ink-teach: ensemble (w%s", eqw ? " equal" : " AUC - 0.5:"); for (int t = 0; t < nt; t++) fprintf(stderr, " %s %.3f", tn[t], w[t]);
+      fprintf(stderr, ") AUC %.4f, Platt a %.4f b %.4f (log loss %.4f); gate keeps %.1f %% of the calibration px at accuracy %.4f, ink recall %.3f\n",
+              it_auc(xe, py, np), A, B, ll / np, 100.0 * keep / np, keep ? (double)ok / keep : 0, yi ? (double)ki / yi : 0); }
+    free(px); free(py); free(xe); free(tmp);
+    /* pass 2: gate, human override, write */
+    if (mkdir_p(out)) return 1;
+    char jp[1400]; snprintf(jp, sizeof jp, "%s/segs-teach.json", out); FILE *jf = fopen(jp, "wb"); if (!jf) return 1;
+    fprintf(jf, "{\"note\": \"ink-teach: %d-teacher ensemble (", nt); for (int t = 0; t < nt; t++) fprintf(jf, "%s%s %.3f", t ? ", " : "", tn[t], w[t]);
+    fprintf(jf, "), Platt a %.5g b %.5g, gate p <= %g | p >= %g, K %d; human-supervised px (+%d) and held-out boxes (+%g voxels) removed\",\n \"segments\": [\n", A, B, lo, hi, K, hdil, hm);
+    size_t tot = 0, tink = 0;
+    for (int si = 0; si < ns; si++) {
+        it_seg *s = &S[si]; itr *r = &R[si]; const size_t n = (size_t)r->H * r->W; uint8_t *L = calloc(n, 1), *M = calloc(n, 1); size_t nk = 0, ni = 0;
+        for (int64_t a = 0; a < r->H; a++) for (int64_t b = 0; b < r->W; b++) {
+            const size_t k = (size_t)a * r->W + b; if (r->valid[k] != 1) continue;
+            int hum = 0; for (int64_t da = -hdil; da <= hdil && !hum; da++) for (int64_t db = -hdil; db <= hdil && !hum; db++) {
+                const int64_t aa = a + da, bb = b + db; if (aa >= 0 && bb >= 0 && aa < r->H && bb < r->W) hum = r->hsup[(size_t)aa * r->W + bb]; }
+            if (hum) continue;
+            double x = 0; for (int t = 0; t < nt; t++) x += w[t] * r->xt[k * nt + t];
+            const double p = 1 / (1 + exp(-(A * x + B))); if (!(p <= lo || p >= hi)) continue;
+            L[k] = (uint8_t)lround(p * 255); M[k] = 255; nk++; ni += p >= 0.5;
+        }
+        char d[1400]; snprintf(d, sizeof d, "%s/%s/teach.zarr", out, s->name); const double um = r->lum > 0 ? r->lum * K : 0;
+        if (it_write_zarr(d, L, r->H, r->W, um, 1)) { fprintf(stderr, "ink-teach: cannot write %s\n", d); return 1; }
+        snprintf(d, sizeof d, "%s/%s/teachmask.zarr", out, s->name);
+        if (it_write_zarr(d, M, r->H, r->W, um, 1)) { fprintf(stderr, "ink-teach: cannot write %s\n", d); return 1; }
+        fprintf(jf, "  %s{\"name\": \"%s-teach\", \"tifxyz\": \"%s\", \"labels\": \"%s/%s/teach.zarr/0\", \"mask\": \"%s/%s/teachmask.zarr/0\", \"label_scale\": %.9g, \"crop\": [0, 0, %lld, %lld], "
+                    "\"teach_px\": %zu, \"teach_ink_px\": %zu}\n", si ? "," : "", s->name, s->tifxyz, out, s->name, out, s->name, r->F * K, (long long)r->W, (long long)r->H, nk, ni);
+        fprintf(stderr, "ink-teach: %s: %zu teacher label px (%.1f %% ink) = %.2f cm2\n", s->name, nk, nk ? 100.0 * ni / nk : 0, nk * pow(K * r->F * 2.399e-4, 2));   /* (label F x K canvas px of ~2.4 um mesh voxels) */
+        tot += nk; tink += ni; free(L); free(M); free(r->xt); free(r->valid); free(r->hsup); free(r->hy);
+    }
+    fprintf(jf, " ]}\n"); fclose(jf);
+    fprintf(stderr, "ink-teach: %zu teacher label px (%.1f %% ink) over %d segments -> %s\n", tot, tot ? 100.0 * tink / tot : 0, ns, jp);
+    free(R); free(S); return 0;
 }

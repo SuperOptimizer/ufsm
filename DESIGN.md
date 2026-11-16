@@ -6,6 +6,60 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Ink teachers: MX-fp4 gambiarra / dino3d, fast prep, 2-D teacher labels (ink-teach) (2026-11-15, branch inkteach-20261115)
+
+**Part A: the 3-D teachers fast.** gambiarra (24.5 M params, 59.1 GMAC per 64^3 output crop = 225 kMAC / output voxel) ran 11.9 ms /
+crop in the fp16 xnet (convs 71 %, InstanceNorm 22 %): ~1 Mvox/s end to end at stride 32. New in xnet (`UFSM_XNET_MX=6` MX-fp4 ue8m0
+scales per 16-K block, `=5` NVFP4-style ue4m3 block scales + an fp32 per-row weight scale):
+- `conv_mxh`: halo-tiled 3x3x3 MX-fp4 conv (`mma.sync m16n8k64 kind::mxf4nvf4`), 256-voxel output tiles staged with ldmatrix and
+  per-lane tap offsets, tile configs (2,4,32) / (4,4,16) / (4,8,8): 1.09 ms for the 64^3 32->32 conv at B 16 (~107 TMAC/s, ncu).
+  `conv_mx`: generic MX-fp4 implicit GEMM (stride 2, 1x1 skips, the transposed conv) with the tconv shuffle + bias + quantise in the
+  epilogue, straight into the decoder's concat buffer.
+- InstanceNorm sums out of the conv epilogues (double atomics); one fused apply (`k_inq`) = norm + residual + LReLU + the next conv's
+  MX copy; the head fused into the last apply; the 1-channel first block: the stem recomputed from constant-memory weights, its 1x1
+  skip IN analytic; pooled skips as a 2^3 stride-2 conv with w / 8.
+- `UFSM_XNET_FQ=A,W` (+ `_MASK`): fake quantisation for accuracy probes. Logit 1-corr vs fp16 (gambiarra): act/weights 8/8 0.002,
+  5/5 0.029, 6/6 0.040, 4/4 0.040: the weights dominate. dino3d MX6 0.008, MX5 0.003.
+- `test_xmx`: the MX conv against a host reference (formats 6 and 5, the halo and generic shapes).
+Network time 11.9 -> 1.36 ms / crop (ncu, base clocks: ~190 Mvox/s at 4.8 um without overlap); dino3d 1080 -> 164 ms per 256^3 crop.
+
+`ink3d-ext --fast 1`: the crop grid aligned to 16 output voxels, the p1 / p99 of each crop's parent (crop + 32 per side) as a sum of
+16^3-block histograms computed once per slab (exact, the published np.percentile), LUT, gather and the 2^3 pooling on the GPU, rolling
+slab reads; `--tile T` (64, 128) with parent T + 64.
+
+Gate (ink-vscore 3-D AUC, 24 held-out crops: 16 Paris 4 + 4 PHerc0139 + 4 PHerc1667; paired diff vs the fp16 reference, bootstrap 95 %):
+| run | Paris 4 | 0139 | 1667 | paired vs ref |
+|---|---|---|---|---|
+| gb_ref (fp16, stride 32) | 0.755 | 0.691 | 0.514 | |
+| dino3d fp16 | 0.727 | 0.651 | 0.561 | |
+| gb MX6 | 0.749 | 0.681 | 0.513 | -0.0056 [-0.0076, -0.0034] (0139 -0.010) |
+| gb stride 64 | 0.734 | 0.688 | 0.518 | -0.013 [-0.019, -0.008] (Paris 4 -0.021): rejected |
+| fast, level-1 input | 0.746 | 0.700 | 0.520 | Paris 4 -0.009: rejected (pooled level 0 kept) |
+| fast, level 0 (gbh_32) | 0.754 | 0.693 | 0.519 | -0.0000 [-0.0018, +0.0018] |
+(gambiarra trained on Paris 4: its Paris 4 numbers are optimistic.)
+
+**The 2-D teachers are far better labels.** ink-ext --native-only on the eval crop surfaces, ink-score vs the human labels:
+| teacher | Paris 4 | 0139 | 1667 |
+|---|---|---|---|
+| reader3 | 0.917 | 0.966 | 0.929 |
+| ink9um (s42 + s43) | 0.902 | 0.982 | 0.915 |
+| hecate96 | 0.884 | 0.901 | 0.821 |
+| reader3 + ink9um (logit mean) | 0.923 | 0.986 | 0.942 |
+Inside villa's own validation_mask_v2 (1667_w029_0, 63 % of its px; not trained on by them): reader3 0.893, ink9um 0.868, hecate96
+0.828. A gate on the Platt-calibrated reader3 + ink9um (leave-one-scroll-out on the crops), p <= 0.1 | p >= 0.8: coverage 0.77 / 0.63 /
+0.88, accuracy 0.994 / 0.967 / 0.905 (0139 / 1667 / Paris 4); the calibration differs by scroll, so it is fitted per scroll.
+
+**Part B: `ufsm ink-teach`** (src/inksplat.c): teacher maps per segment (ink-ext --native-only, 9.6 um) -> a raster on the human label
+grid pooled K = 4 (label_scale K x the human F: the face splat places a teacher pixel exactly where a human pixel there would go), the
+AUC-weighted logit ensemble, Platt per scroll on fully supervised teacher px outside the held-out boxes, the gate, minus the
+human-supervised px (+1 px: human labels override; the splat merges by known max), the held-out boxes (+64 voxels; the 24 eval crops
+all lie inside) and the segments' validation rasters. Output: zstd zarr windows + segs-teach.json for the on-the-fly ink path
+(inkfly_open: new per-window key "label_scale"; soft values reach the BCE as p). PHerc0139, reader3 alone: teacher AUC 0.959 on the
+human px, the gate keeps 81 % at accuracy 0.955; 280 M teacher px = 258 cm2 (6 % ink) vs ~10 M human-supervised at that grid, 59 MB.
+PHerc0139, reader3 + ink9um: per-teacher AUC 0.963 / 0.979, weights 0.49 / 0.51, ensemble AUC 0.980, Platt a 3.33 b -0.29;
+the gate keeps 88 % of the calibration px at accuracy 0.973 (ink recall 0.81); 287 M teacher px (6.0 % ink), 62 MB.
+2-D teacher inference: ~0.6 Mpx/s per teacher at 9.6 um (CT render over https bound), 2.5 Gpx over all labelled segments.
+
 ## Skip-empty: masked convs bypass the ring kernels; test_skip_empty racecheck QUICK (2026-11-15, branch skipmask-20261115)
 
 test_skip_empty~racecheck FAILed on the pod after 3289 s: section (5), at its racecheck width 64, reported masked forward 0, backward-data 0,
