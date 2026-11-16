@@ -6,6 +6,33 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Unroll perf 1: the FBLEND half-stride grid ran each window up to 8 times; a per-run CT cache; field-blend tables (2026-11-16, branch unrollperf-20261116)
+
+Profile of the 0332 unroll (desk, card 1 shared, CT over https, u1 13000, FBLEND on): fields 2767 s = grid-0 predict 368 s (505
+windows) + **half-stride predict 2055 s (3138 windows)** + field-blend 342 s (4714 CPU s); rectosp 289; ref 291 (card 1 full: the CG
+level 0 and the model / output passes fell back to the CPU; 36-79 s on a free card); slabs 377; snap 159 (CT decode over https 125 s).
+- **Half-stride grid.** predict.c's shards start at the box. On a box off the window grid (`--grid-origin 256` with a 512-aligned box),
+  every window whose interior covers k shards runs k times (once per shard, its cells clipped to the shard; up to 8x), so 3138 runs
+  instead of ~650 windows. unroll.sh (fpred1) now starts that predict's box back on its own grid (box - origin multiple of the stride,
+  up to 256 voxels earlier per axis; the end unchanged). field-blend crops an input that covers in[0]'s cells on the same grid to
+  them (offset / origin / shape, as `--box` does for in[0]). Each window computes the same cells either way, so the blend is
+  byte-identical. 512^3-cell box: 64 -> 27 runs, every chunk file equal. Whole fields stage on a 1024 x 2048^2 box of 0332 (master
+  unroll.sh vs this one, same binary): 249 -> 88 s, half-stride predict 253 runs / 199 s -> 73 / 38 s, blended fields byte-identical
+  (fields.json differs only in the input paths).
+- **CT cache (UFSM_HTTP_CACHE, CTCACHE).** z3_open uses `$UFSM_HTTP_CACHE` as the chunk cache of any HTTP array opened without one,
+  and predict defaults `--cache` (and with it the prefetcher) to it. unroll.sh exports `$O/ctcache` for an https CT (CTCACHE=0 off,
+  CTCACHE=DIR elsewhere; the default dir is deleted at the end unless KEEPCT=1), so the second grid, wrap-check, unroll-qa,
+  surf-stats, wrap-snap, render and faces read the CT locally after its first fetch. Grid-0 predict on a 32-window box: no cache
+  34.4 s (reader 27.3 s of z3_read), cold cache 23.0 s (reader 15.3 s, prefetch 16 threads), warm 19.7 s (reader 4.9 s, GPU-bound
+  at 0.52 s a window). Outputs byte-identical. Open question: a local CT root reads as slowly as https without a cache (`ufsm mirror`
+  of 0332 level 2, 5.8 GB in 51 s; predict reader 25.8 s against the cache's 4.9 s for the same windows; 0.08 vs 0.83 s for window
+  0, same decoder and syscall mix in strace). Pods with CTROOT on local disk read at the slow rate; not explained yet.
+- **field-blend.** sin / cos of the winding-mod-4 codes come from 256-entry tables (the same doubles), and the tile weight of each
+  cell is stepped through x / y / z instead of a div / mod per cell. 512^3 cells: 73.4 -> 49.5 CPU s (7.2 -> 5.3 s at 16 threads),
+  byte-identical to the 11-11 master binary. What is left: combine 29 %, atan2 / hypot ~9 %, the volcomp encode of the output 22 %.
+- Tests: test_fblend blends with a larger second input (B's whole zarr arrays, one / two cells more per side) against the per-cell
+  rules byte for byte, and refuses a smaller second input. test_http_reader checks that UFSM_HTTP_CACHE fills the same cache as --cache.
+
 ## Ink teachers: combining the ink-sdk ports, Hecate 2.4 joins reader3 + ink9um (+0.012 AUC) (2026-11-16)
 
 /vesuvius/ufsm/inkteach/ens/ens3.py (out ens3.txt): the 9 teachers with maps on all 24 held-out crops (reader3, ink9um s42+s43,

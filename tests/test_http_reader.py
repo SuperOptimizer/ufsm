@@ -244,7 +244,7 @@ def main():
             counter = 0
             manifests = []
             def read(mode="ok", key="array", origin=(-2, -1, -3), shape=(17, 18, 18), threads=4,
-                     cache=None, coalesce="1", parallel="1", success=True, multi=None, imem="1", tag=None):
+                     cache=None, coalesce="1", parallel="1", success=True, multi=None, imem="1", tag=None, extra=None):
                 nonlocal counter
                 with LOCK:
                     counter += 1; out = tmp / f"out-{counter}.raw"
@@ -254,6 +254,7 @@ def main():
                 env = dict(clean, UFSM_Z3_COALESCE=coalesce, UFSM_Z3_INDEX_PARALLEL=parallel, UFSM_Z3_INDEX_MEM=imem)
                 if multi is not None:
                     env["UFSM_HTTP_MULTI"] = multi
+                env.update(extra or {})
                 result = run(cmd, env, success)
                 if success:
                     limit = (256, 4, 4) if key == "long" else SHAPE
@@ -286,6 +287,10 @@ def main():
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
                 manifests = list(pool.map(combo, itertools.product(("0", "1"), ("0", "1"), ("0", "1"), (1, 4, 16))))
             assert all(m == manifests[0] for m in manifests), "encoded cache differs across execution modes"
+            # UFSM_HTTP_CACHE (unroll.sh's per-run CT cache): the cache of an HTTP array opened without --cache, filled the same way
+            env_cache = tmp / "env-cache"
+            read(extra={"UFSM_HTTP_CACHE": str(env_cache)}, tag="env")
+            assert manifest(env_cache) == manifests[0], "UFSM_HTTP_CACHE filled another cache than --cache"
             for threads in (1, 16):
                 read(threads=threads)
                 read(key="plain", threads=threads)

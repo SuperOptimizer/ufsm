@@ -89,6 +89,10 @@ REPO=${UNROLL_REPO:-$(cd $H/../.. && pwd)}
 IFS=$'\t' read -r _ R K UM LV AXS TBOX TZR TSTRIP <<< "$row"
 R=${CTROOT:-$R}; K=${CTKEY:-$K}; AXS=${AXIS:-$AXS}   # (pods: the CT mirrored to local disk; AXIS: an axis file other than the table's)
 LUM=$(awk -v u=$UM -v l=$LV 'BEGIN { printf "%.4g", u * 2 ^ l }')
+# CTCACHE (default $O/ctcache; 0 off): an HTTP CT is cached chunk by chunk on local disk for every stage (UFSM_HTTP_CACHE, src/zarr3.c):
+# the second fields grid, the checks, the trim, the snap and the renders read it locally, and the predicts prefetch into it (0332 32-window
+# box: 34.4 s without, 23.0 s cold, 19.7 s warm; outputs byte-identical). The default directory is deleted when the run finishes (KEEPCT=1 keeps it)
+case $R in http://*|https://*) [ "${CTCACHE:-}" != 0 ] && export UFSM_HTTP_CACHE=${CTCACHE:-$O/ctcache};; esac
 BOX=${BOX:-$TBOX}; ZR=${ZR:-$TZR}; [ "$TSTRIP" = - ] && TSTRIP=
 # a wrap id (--last N) is in ONE run's gauge only (P3 11-02: the prod run's --last 432 skipped the trim of a re-unroll numbered w025-w266):
 # a --last in scrolls.tsv / list.tsv is dropped here (the trim stage finds it per run); only a STRIPARGS env override keeps one (checked in trim)
@@ -239,9 +243,16 @@ fpred() {   # fpred GPU BOX OUT
   fpred1 $1 $2 $3 0
 }
 fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windows anchored at GRID (each axis)
+  # a box off the window grid runs each window once per 512 shard it touches (predict.c: up to 8x on the half-stride grid; 0332 FBLEND
+  # 3138 windows against 505 on grid 0, 34 of its 46 min fields): the box is started back on the grid instead (field-blend crops it to the
+  # grid-0 cells; the blended fields byte-identical, DESIGN 2026-11-16 unroll perf)
+  local box=$2 st=$(( ${LWIN:-640} - 2 * ${LHALO:-64} )) b d; IFS=, read -r -a b <<< "$2"
+  if [ "$4" != 0 ] && [ "$FKIND" = lat ]; then for d in 0 1 2; do
+    local s=$(( ((b[d] - $4) % st + st) % st )); [ $(( b[d] - s )) -ge 0 ] && b[d]=$(( b[d] - s )) && b[d + 3]=$(( b[d + 3] + s )); done
+    box=$(IFS=,; echo "${b[*]}"); fi
   local win; if [ "$FKIND" = lat ]; then win="--window ${LWIN:-640} --halo ${LHALO:-64}"
   else win="$([ "${FWIN:-prod}" = auto ] && echo "--window auto" || echo "--window-z 384 --halo-z 64 --window 640") --halo 64"; fi
-  X $O/logs/fields.log $U predict $CK ${FCTR:-$R} ${FCTK:-$K} $3.tmp --um $UM --level $LV --box $2 $win --shard 512 \
+  X $O/logs/fields.log $U predict $CK ${FCTR:-$R} ${FCTK:-$K} $3.tmp --um $UM --level $LV --box $box $win --shard 512 \
     --grid-origin $4,$4,$4 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
@@ -809,5 +820,6 @@ inkmain() { [ "${NOINK:-0}" != 1 ] && [ "$INKAT" != fields ] && ! done_ ink && i
 if [ "${PERWRAP:-0}" = 1 ]; then ( waitfor ink && stage perwrap perwrap && { [ "${FACES:-0}" = 1 ] && stage faces faces; true; } ) & PWP=$!; [ "$DRY" = 1 ] && wait $PWP; fi
 stage strip strip && upto strip && stage stripflat stripflat && stage distort distort && waitfor ink && stage stripimg stripimg || log "unroll: the strip stopped"
 wait
+[ "$DRY" = 1 ] || [ -n "${CTCACHE:-}" ] || [ "${KEEPCT:-0}" = 1 ] || { case "$O/ctcache" in /*/ctcache) rm -rf -- "$O/ctcache";; esac; }
 stage upload upload
 [ "$DRY" = 1 ] || log "unroll $S finished: $(for f in $O/state/*.done; do [ -e $f ] && printf '%s %s; ' $(basename $f .done) "$(cut -d, -f1 $f)"; done)"

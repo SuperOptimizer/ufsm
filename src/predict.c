@@ -1552,7 +1552,7 @@ static int predict_one(int argc, char **argv) {
     const int iso = opt_atoi("--iso", opt(argc, argv, "--iso", "0"));   /* the void cutoff: probability outputs 0 where CT < iso (the fit keeps CT > 0) */
     if (iso < 0 || iso > 255) { fprintf(stderr, "--iso: 0..255\n"); return 2; }
     nn_set_pred_iso(iso);
-    const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
+    const char *cache = opt(argc, argv, "--cache", getenv("UFSM_HTTP_CACHE")), *axisf = opt(argc, argv, "--axis", nullptr);
     /* no --axis = the radial input channels (scroll-outward direction) are zero for the whole run: the nets are trained with the axis on
        (almost) every source, so this silently degraded the latent ink / recto passes (audit 2026-11-14). An explicit --no-axis 1 runs anyway. */
     if (!(axisf && *axisf) && !opt_atoi("--no-axis", opt(argc, argv, "--no-axis", "0")) && !ufsm_env_on("UFSM_PRED_NO_AXIS")) {   /* (the env: the test suite's fixtures) */
