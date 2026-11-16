@@ -52,6 +52,7 @@ void lp_skip_rec_zero(uint8_t *buf, shape5 ys, int zs0, int zs1, size_t rec, ski
    forward needs xbf == ybf. Weights, biases and GroupNorm parameters are fp32; the weight gradient accepts fp32 or (with xbf) bf16 gy. */
 int lp_conv_fwd_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp);
 int lp_conv_fwd_f4(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, gnp_t gp, double *osum, int Go, split_t sp);
+void lp_f4_wdb(int on);   /* conv_fwd_f4_k double-buffered weight stages on / off (tests / benches; -1: UFSM_F4_WDB, default 0) */
 void lp_wmemo_step(unsigned step);   /* fp4 prepared-weight memo: new training step (weights changed) */
 void lp_wmemo_clear(void);
 void lp_set_w4_2d(int on);         /* 2D (32 x 32 tile) fp4 weight scales, shared by forward and backward-data (UFSM_W4_2D) */           /* weights changed outside a step (checkpoint load, EMA swap) */

@@ -336,6 +336,7 @@ __global__ void prep_w4_k(const float *__restrict__ w, uint8_t *__restrict__ wq,
    so forward and backward-data multiply the same quantised weights (exactly when both sides use the same 32-channel
    alignment: plane-major / 16-bit on both, or MX segments on both). Warp per tile, lane = row; same layout as prep_w4_k. */
 extern int g_w2d;
+extern int g_f4_wdb;
 __global__ void prep_w4_2d_k(const float *__restrict__ w, uint8_t *__restrict__ wq, uint8_t *__restrict__ ws, int Co, int Ci, int Cop, int Cip, int Cx = -1, int CxP = 0, int Ox = -1, int OxP = 0);   /* defined in lp_f4fwd.cu */
 /* --skip-empty: the output tile [oz0, oz0 + TZ) x [oy0, oy0 + 8) x [ox0, ox0 + 16) is inside one mask tile (8 x 8 x 16 cells; TZ <= 4
    divides 8, zoff a multiple of 8). sk_in: a staged input position's tile counts (backward-data: gy outside the active tiles is zero) */
@@ -349,14 +350,18 @@ __device__ __forceinline__ bool sk_in(const skipm_t &sk, int gz, int gy, int gx)
 template <int MT, int TZ, typename T, typename TO>
 __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                      const float *__restrict__ b, TO *__restrict__ y,
-                                                     int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip, gnp_t gp, double *__restrict__ osum, int Go, split_t sp, skipm_t sk) {
+                                                     int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip, gnp_t gp, double *__restrict__ osum, int Go, split_t sp, skipm_t sk,
+                                                     int db) {   /* db: two weight-stage buffers (launch_f4: when two blocks per SM still fit) */
     constexpr int BM = MT * 16, PG = 7, RZ = TZ / 2, NR = 2 * RZ, TT = (TZ + 2) * 180, NRX = NR;   /* PG: tap pairs per weight stage */
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sx = smem_raw;                         /* [TT pos][16 B] (LP_SW: [TT][32 B] int8, lp_st_row4) */
     uint8_t *sxs = sx + TT * LP_XB;                 /* [TT] */
-    uint8_t *wa = sxs + ((TT + 127) & ~127);        /* [PG pair][BM co][32 B] (tapA 16 B | tapB 16 B), swizzled (LP_SW: [PG][tap][BM][32 B] int8) */
-    unsigned short *was = (unsigned short *)(wa + PG * BM * 2 * LP_XB);   /* [PG][BM] (byte 0 tapA, byte 1 tapB) */
-    chan_t *ctab = (chan_t *)(wa + PG * BM * 2 * LP_XB + ((PG * BM * 2 + 15) & ~15));
+    constexpr int WST = PG * BM * 2 * LP_XB;          /* one weight stage */
+    uint8_t *wa = sxs + ((TT + 127) & ~127);        /* 2 x [PG pair][BM co][32 B] (tapA 16 B | tapB 16 B), swizzled (LP_SW: [PG][tap][BM][32 B] int8):
+                                                       stage s (chunk s / 2, tap pairs 7 (s & 1) ..) in buffer s & 1, the next one loading during the MMA */
+    const int nwb = db ? 2 : 1;
+    unsigned short *was = (unsigned short *)(wa + nwb * WST);   /* nwb x [PG][BM] (byte 0 tapA, byte 1 tapB) */
+    chan_t *ctab = (chan_t *)(wa + nwb * WST + ((nwb * PG * BM * 2 + 15) & ~15));
     float2 *cab = (float2 *)(ctab + 32); unsigned *sgm = (unsigned *)(cab + 32);   /* [32] (a, b), GN mask */
     uint8_t *cu = (uint8_t *)(sgm + 4), *cus = cu + (TZ / 2 + 4) * 96 * 32;   /* sp.up: coarse rows of the up segment (stage_up_coarse) */
     float2 *cab2 = (float2 *)(((uintptr_t)(sp.up ? cus + (TZ / 2 + 4) * 96 : cu) + 15) & ~(uintptr_t)15);   /* [32] slab GN: bank 1 (launch_f4) */
@@ -380,6 +385,27 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__rest
     const int Cx = sp.x2 ? sp.c_split : Ci;
     const bool G = gp.G != 0 || sp.gp2.G != 0;
     const bool act = sk_active(sk, oz0, oy0, ox0);   /* --skip-empty: an inactive tile skips the main loop (outputs = the bias) */
+    /* weight stage s (chunk s / 2, tap pairs PG (s & 1) ..) into buffer s & 1 (!db: buffer 0): the rows by cp.async (LP_SW: converted, plain stores),
+       the scale pairs by plain stores (two bytes from two taps); visible after the issuing thread's wait_group and a barrier */
+    auto wstage = [&](int s) {
+        const int c0 = (s >> 1) * 32, p0 = (s & 1) * PG;
+        const int bf = db ? s & 1 : 0;
+        uint8_t *wb = wa + bf * WST; unsigned short *wsb = was + bf * PG * BM;
+        for (int i = threadIdx.x; i < PG * BM * 2; i += 256) {
+            int pp = i / (BM * 2), r = i % (BM * 2), c = r >> 1, h = r & 1, tap = 2 * (p0 + pp) + h;
+            const uint8_t *src = wq + ((size_t)tap * Cop + co0 + c) * (Cip / 2) + c0 / 2;
+#ifdef LP_SW
+            lp_st_row4(wb + (pp * 2 + h) * BM * 32, c, __ldg((const uint4 *)src));
+#else
+            cp_async<16>(wb + pp * BM * 32 + sw16(c, h), src, true);
+#endif
+        }
+        for (int i = threadIdx.x; i < PG * BM; i += 256) {
+            int pp = i / BM, c = i % BM, tap = 2 * (p0 + pp);
+            wsb[i] = (unsigned short)(wsc[((size_t)tap * Cop + co0 + c) * nch + c0 / 32] | (wsc[((size_t)(tap + 1) * Cop + co0 + c) * nch + c0 / 32] << 8));
+        }
+    };
+    if (act) { wstage(0); asm volatile("cp.async.commit_group;\n" ::: "memory"); }   /* (its own group: stage 1 is committed separately before wait_group 1) */
     for (int ci0 = 0; act && ci0 < Cip; ci0 += 32) {
         __syncthreads();
         const bool upc = IS_MX(T) && sp.up && ci0 < (Cx + 31) / 32 * 32;   /* this chunk is the half-resolution x segment (decoder up part) */
@@ -452,39 +478,45 @@ __global__ void __launch_bounds__(256, LP_MINB(2)) conv_fwd_f4_k(const T *__rest
             lp_st_row4(sx, pos, make_uint4(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m), cvt_e2m1x8(v + 16, m), cvt_e2m1x8(v + 24, m)));
             sxs[pos] = (uint8_t)(e + 127);
         }
-        for (int p0 = 0; p0 < 14; p0 += PG) {
-            __syncthreads();
-            for (int i = threadIdx.x; i < PG * BM * 2; i += 256) {
-                int pp = i / (BM * 2), r = i % (BM * 2), c = r >> 1, h = r & 1, tap = 2 * (p0 + pp) + h;
-                const uint4 wv = __ldg((const uint4 *)(wq + ((size_t)tap * Cop + co0 + c) * (Cip / 2) + ci0 / 2));
-#ifdef LP_SW
-                lp_st_row4(wa + (pp * 2 + h) * BM * 32, c, wv);
-#else
-                *(uint4 *)(wa + pp * BM * 32 + sw16(c, h)) = wv;
-#endif
-            }
-            for (int i = threadIdx.x; i < PG * BM; i += 256) {
-                int pp = i / BM, c = i % BM, tap = 2 * (p0 + pp);
-                was[i] = (unsigned short)(wsc[((size_t)tap * Cop + co0 + c) * nch + ci0 / 32] | (wsc[((size_t)(tap + 1) * Cop + co0 + c) * nch + ci0 / 32] << 8));
+        for (int hp = 0; hp < 2; hp++) {   /* the chunk's two weight stages; db: stage s + 1 is issued before stage s's MMA */
+            const int s = 2 * (ci0 / 32) + hp;
+            if (hp) __syncthreads();   /* every warp is past stage s - 1's MMA: its buffer is free (hp 0: the chunk barrier) */
+            if (db) {
+                if (s + 1 < 2 * nch) wstage(s + 1);
+                asm volatile("cp.async.commit_group;\ncp.async.wait_group 1;\n" ::: "memory");   /* stage s landed (this thread's copies) */
+            } else {
+                if (s) wstage(s);   /* (stage 0: before the loop) */
+                asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
             }
             __syncthreads();
-            if (p0 == 0) f4r_mma_grp<MT, RZ, 0, 0, PG>(acc, sx, sxs, wa, was, oz0, wz, wr, lane);   /* (compile-time tap offsets, f4r_mma_grp) */
-            else f4r_mma_grp<MT, RZ, 0, PG, 14 - PG>(acc, sx, sxs, wa, was, oz0, wz, wr, lane);
+            if (hp == 0) f4r_mma_grp<MT, RZ, 0, 0, PG>(acc, sx, sxs, wa, was, oz0, wz, wr, lane);   /* (compile-time tap offsets, f4r_mma_grp) */
+            else f4r_mma_grp<MT, RZ, 0, PG, 14 - PG>(acc, sx, sxs, wa + (db ? WST : 0), was + (db ? PG * BM : 0), oz0, wz, wr, lane);
         }
     }
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     fwd_epilogue<MT, NRX, TO, true>(acc, smem_raw, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N);
 }
 template <int MT, int TZ, typename T, typename TO> void launch_f4(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, int Cip, gnp_t gp, double *osum, int Go, split_t sp) {
     constexpr int TT = (TZ + 2) * 180;
     const int xb = lp_xb();   /* staged row bytes: 16 (nibbles), 32 (sm_86 int8 tiles) */
-    size_t smem = (size_t)TT * xb + ((TT + 127) & ~127) + 7 * MT * 16 * 2 * xb + ((7 * MT * 16 * 2 + 15) & ~15) + 32 * sizeof(chan_t) + 32 * 8 + 16 + (sp.up ? (TZ / 2 + 4) * 96 * 33 + 16 : 0)
+    /* UFSM_F4_WDB=1 (opt-in): two weight-stage buffers, the next stage's cp.async issued before this stage's MMA, when two blocks per
+       SM still fit (5060 Ti / PRO 4000: 100 KB per SM; the fused-upsample instances keep one). Bit-identical outputs; measured no faster
+       (bench_f4wide, 11-15: 0.98-1.01x on the try6 trunk shapes), so off by default (DESIGN 2026-11-15) */
+    static int smpm[8];
+    if (g_f4_wdb < 0) g_f4_wdb = getenv("UFSM_F4_WDB") ? atoi(getenv("UFSM_F4_WDB")) : 0;
+    if (!smpm[cur_dev_()]) { int v = 0; cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerMultiprocessor, cur_dev_()); smpm[cur_dev_()] = v ? v : 1; }
+    const size_t wst = (size_t)7 * MT * 16 * 2 * xb, was1 = 7 * MT * 16 * 2;
+    size_t smem = (size_t)TT * xb + ((TT + 127) & ~127) + wst + ((was1 + 15) & ~15) + 32 * sizeof(chan_t) + 32 * 8 + 16 + (sp.up ? (TZ / 2 + 4) * 96 * 33 + 16 : 0)
                   + (gp.ns || sp.gp2.ns ? 32 * 8 + 16 : 0);   /* (slab GroupNorm: the second coefficient bank) */
+    const size_t sdb = smem + wst + ((2 * was1 + 15) & ~15) - ((was1 + 15) & ~15);
+    const int db = g_f4_wdb && 2 * (sdb + 1024) <= (size_t)smpm[cur_dev_()];
+    if (db) smem = sdb;
     if (smem < 8 * 256 * sizeof(float)) smem = 8 * 256 * sizeof(float);
     static int attr[8];
     if (!attr[cur_dev_()]) { attr[cur_dev_()] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4_k<MT, TZ, T, TO>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); }
     const skipm_t sk = IS_MX(TO) ? lp_skip_get(xs, sp, 1) : skipm_t{nullptr, nullptr, 0, 0, 0};   /* (--skip-empty: MX tensors only) */
     if (sk.mi && (gp.G || sp.gp2.G || sp.up)) { fprintf(stderr, "skip-empty: a masked backward-data with a GroupNorm / upsampled input\n"); abort(); }
-    conv_fwd_f4_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, sk);
+    conv_fwd_f4_k<MT, TZ, T, TO><<<grid, 256, smem>>>((const T *)x, wq, ws, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, sk, db);
 }
 /* ---- one or two 32-channel input chunks (Cip == 32 NCH, no fused upsample): conv_fwd_f4_k with the input staged once per z
    tile for all output tiles, and z tiles walked by the block with each chunk's input planes in a ring (TZ + 2 slots, plane gz in

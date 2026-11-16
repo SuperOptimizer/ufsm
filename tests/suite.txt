@@ -263,6 +263,7 @@ test_mx                                        | gpu,smoke    |     3 | ./$B/tes
 test_mx4                                       | gpu,smoke    |     5 | ./$B/test_mx4
 test_mx4_wide                                  | gpu          |    12 | UFSM_TEST_QUICK=1 ./$B/test_mx4_wide
 test_mx4_wide~full                             | gpu,slow     |    40 | ./$B/test_mx4_wide
+test_mx4_wide~F4_WDB=1                         | gpu          |    12 | UFSM_F4_WDB=1 UFSM_TEST_QUICK=1 ./$B/test_mx4_wide
 test_mx4~wideall                               | gpu          |    10 | TMX4_WIDE_ALL=1 ./$B/test_mx4
 test_head_tc                                   | gpu,smoke    |     3 | UFSM_TEST_QUICK=1 ./$B/test_head_tc
 test_hgscale                                   | gpu          |     3 | ./$B/test_hgscale

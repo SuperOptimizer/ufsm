@@ -5,6 +5,8 @@ extern "C" void lp_set_w4_2d(int on) { g_w2d = on; lp_wmemo_clear(); }   /* test
 extern "C" void lp_wmemo_step(unsigned step) { g_wmemo_step = step; }
 extern "C" void lp_wmemo_clear(void) { g_wmemo_gen++; }
 int g_w2d = -1;
+int g_f4_wdb = -1;   /* conv_fwd_f4_k double-buffered weight stages: -1 = UFSM_F4_WDB (default 0: off, DESIGN 2026-11-15) */
+extern "C" void lp_f4_wdb(int on) { g_f4_wdb = on; }   /* tests */
 unsigned g_wmemo_step = 0, g_wmemo_gen = 0;
 wmemo_s g_wmemo[8][WMEMO_N];
 /* instantiated in lp_f4fwd_i*.cu */
