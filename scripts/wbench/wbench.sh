@@ -15,6 +15,7 @@
 #   WZARGS= (empty): cube windows, no --window-z (latent-grid checkpoints: train --lat 4), with WIN / HALO.
 #   LATENTS="SCROLL=STORE ..." (e.g. "paris4=/mnt/scratch/lat/p4-l2.lc 1667=/mnt/scratch/lat/p1667-l2b.lc"): those scrolls' fields predicted from
 #   the ufsm lc-encode store of their CT level (predict --latents: --lat-basis checkpoints; paris4j falls back to paris4's store).
+#   NGRID (1): 2 / 4 / 8 window grids offset by half the 512 core, blended by field-blend --tile (the unroll's FBLEND = 2; per-box predicts)
 #   PBATCH (1): the boxes' fields predicted first, one predict --boxes process per scroll (needs a predict binary with --boxes, 2026-11-12:
 #   UP / U older than that: PBATCH=0); 0: a predict process per box inside the box loop, as before.
 set -u
@@ -79,6 +80,14 @@ predict() {   # predict OUTFIELDS z y x nz ny nx LOG [big]: fit fields of the bo
   # the box in that level's voxels and --fit-h 2^(1-DLV), so the fit fields keep their 19.2 um cells and the fitter / codes are unchanged.
   pbox $2 $3 $4 $5 $6 $7 $lg || return 1
   local rr vv; ctpick $lv $b0,$b1,$b2,$b3,$b4,$b5; echo "ct: $rr $vv level $lv" > $lg.root
+  if [ "${NGRID:-1}" -gt 1 ]; then   # NGRID 2 / 4 / 8: that many window grids offset by half the core (512 / 2), blended (field-blend --tile)
+    local gl k=0 g fs=() gs=(); case $NGRID in 2) gl="0,0,0 256,256,256";; 4) gl="0,0,0 256,256,0 256,0,256 0,256,256";;
+      8) gl="0,0,0 0,0,256 0,256,0 0,256,256 256,0,0 256,0,256 256,256,0 256,256,256";; *) echo "wbench: NGRID 1, 2, 4 or 8" > $lg; return 1;; esac
+    for g in $gl; do rm -rf $f.g$k $f.g$k.tmp
+      GO=$g $run ${UP:-$U} predict $CK $rr $vv $f.g$k.tmp --box $b0,$b1,$b2,$b3,$b4,$b5 --fit-zarr $f.g$k $(GO=$g pargs) ${lx:+--latents $lx} >> $lg 2>&1 || { rm -rf $f.g$k.tmp; return 1; }
+      rm -rf $f.g$k.tmp; fs+=($f.g$k); gs+=($g); k=$((k + 1)); done
+    $U field-blend $f "${fs[@]}" --tile 512,512,512 --grids $(IFS=:; echo "${gs[*]}") --threads $THREADS >> $lg 2>&1; local rc=$?; rm -rf "${fs[@]}"; return $rc
+  fi
   $run ${UP:-$U} predict $CK $rr $vv $f.tmp --box $b0,$b1,$b2,$b3,$b4,$b5 --fit-zarr $f $(pargs) ${lx:+--latents $lx} > $lg 2>&1; local rc=$?; rm -rf $f.tmp; return $rc
 }
 ctpick() {   # ctpick LV b0,..,b5 [box ...]: rr vv = the local CT copy (LOCALCT, the desk, 2026-11-12; keys without volumes/) when ctcover.py finds
@@ -102,7 +111,7 @@ pargs() {   # the predict options every box of a scroll shares (after pbox: lv, 
 pbatch() {   # PBATCH=1 (default): the fields of every box still to run, one predict --boxes process per scroll (the ~5 s start-up of a predict run
              # paid once per scroll, not per box; the same bytes as a process per box); per box its seconds in $O/BOX/pred.s
   local B; for B in $BL; do [ -e $FD/$B/fields.json ] || rm -f $O/$B/pred.s; done   # (a pred.s is this run's only, or that of the PHASE=predict run whose fields these are)
-  [ -n "$FIELDS" ] || [ "${PBATCH:-1}" != 1 ] && return 0
+  [ -n "$FIELDS" ] || [ "${PBATCH:-1}" != 1 ] || [ "${NGRID:-1}" -gt 1 ] && return 0
   [ -n "${STOPAT:-}" ] && [ $(date +%s) -ge $STOPAT ] && return 0   # (the window is over: nothing new on the GPU)
   local s nm z y x nz ny nx lv_ note n bf lg lx
   for s in $(for B in $BL; do awk -F'\t' -v b=$B '$1 == b {print $2}' $BT; done | sort -u); do
