@@ -6,6 +6,22 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## count-field: the density count rescaled at the solve (--pool-split, --rho-solve, --rho-map) (2026-11-15, branch geocount-port-20261115, off wip-snap-geocount)
+
+The geo-count audit (11-14) found the density head counting 1.2-1.3x the GT sheets on Paris 4 and 1667. `--rho-scale K` already
+scales the density term, but at pooling time, so every K costs a new pass 1 (~1 h on a whole scroll). Opt-in, off by default (outputs
+unchanged without the flags): `--pool-split 1` keeps the density term's level-0 pooled sums apart (Sd, Gd; S / G still hold density +
+phase), CPU pooling (the GPU pool path does not split; with the flag the chunk pools on the CPU); with `--pool-cache FILE` they go to /
+come from `FILE.dens` (4 float32 planes over the level-0 solve grid). `--rho-solve K` (global) and / or `--rho-map FILE` (float32 per
+level-0 solve cell, z-major; non-finite or <= 0: 1) then add (K - 1) Gd to G before the coarser levels are summed, the phase-gradient
+targets (--phase-w) untouched; either implies --pool-split, and a cached pool without its .dens is refused. The log line gives the
+Sd-weighted mean K. The quality A/B (K from the GT sheet counts per region on Paris 4 / 1667) is the open next step; geo-count's
+prototype had no real-data numbers.
+
+Test (test_countfield, mcc build-verify): with no --phase-w, G is the density term alone, so K x the split sums equals --rho-scale K's
+pooling up to float rounding. A --pool-split run into a cache, then --rho-solve 0.75 and --rho-map (0.75 everywhere) from that cache:
+wc vs the plain run 3.8e-6 turn, vs --rho-scale 0.75 8.6e-6 turn (both), over 52608 cells; the rest of test_countfield passes.
+
 ## Muon update scaling (--muon-scale rms) and cautious weight decay (--muon-cwd 1) (2026-11-15, branches muonscale-20261115, cwd-20261115)
 
 Two opt-in Muon options, both off by default. They are implemented and tested; the quality A/B is deferred by the 11-15 drain order (plan
