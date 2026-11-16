@@ -6,6 +6,62 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## ink-ext: every ink-sdk profile in our own ports (canon2, studio, tsf; the ink_9um / v8in / Hecate checkpoints) (2026-11-16, branch inksdk-20261116)
+
+The 18 profiles of github.com/LimeGS/ink-sdk (main 9afd5b0, MIT; src/ink_sdk/profiles/*.toml: weights, pinned revision, sha256,
+preprocessing; the lead's brief said 20, the repo has 18) now run in `ufsm ink-ext`. Their code was read to learn each architecture and
+its exact pre/post-processing (adapters, the vendored canonical / hecate / studio sources, lucidrains TimeSformer-pytorch 0.4.1, the
+v8-in modeling.py); nothing upstream is imported or executed, tests included: the parity references are tests/inksdk_ref.py, torch
+functional forwards written from those descriptions over the checkpoints' own tensors.
+
+Weights: /vesuvius/ufsm/inksdk/weights/<profile id>/ + SOURCE.txt (url at the pinned revision, sha256: all 18 match the profiles;
+license); fetch.sh in /vesuvius/ufsm/inksdk/scripts. Licenses: MIT except rectina m4 (CC-BY-NC-4.0), TRACE v3B (CC-BY-NC-SA-4.0),
+Studio (weights CC BY-NC 4.0, code MIT), the A-hn seeds (CC-BY-NC-4.0): non-commercial use only. dense-native publishes safetensors +
+its training config (ink-sdk rebuilds a .pth from them); ink-ext reads the safetensors directly (sha256 of the safetensors checked).
+
+| ink-ext --model | profile(s) | network | spacing, tile / stride | new code |
+|---|---|---|---|---|
+| reader2, dense9, rectina, trace3b | ink_9um@reader-v2-step040000, @dense-native-step016000, @rectina-m4, @trace-v3b-step5000 | the reader3 / ink9um vesuvius_unet_3d_stem_2d (508 tensors, robust_mad) | 9.6 / 9.362 / 9.362 / 9.362 um; 128 / 128 / 384 / 128 px, overlap 0.5 | spec rows only |
+| v8in (--weights) | v8in@ink-8um-v8in, @pherc0306b-ahn-s0 / s1 / s2 | the existing v8in port | 7.91 um (profile: 8.64), 64 / 21 | none |
+| hecate24, hecate96 | hecate@2.4um, @9.6um | existing; divisor 200 / 255, tile 256 / 64, stride 128 / 32 match the profiles | | none |
+| canon2 | canonical_2um@r152-3ddec-v2-l5-epoch13 | Hecate 2.4's ResNet3D-152 + 3-D decoder at the top level of a Lightning .ckpt, BatchNorm3d(1) on u8 / 255, a plain depth softmax (no support mask, no z-scale) | 2.399 um, 62 layers, 256 / 128, tiles with >= 60 % data columns, hanning(T + 2)[1:-1], data-free columns 0 | load / collapse variant of the Hecate path |
+| studio | studio@softloss-20261023 | DeepResidualUNet: GroupNorm(gcd(32, c)) + SiLU pre-activation 3-D residual U-Net (48..640), a learned softmax over the 16 planes; clamp(0, 200) / 255 | 9.362 um, 128 px windows at (y - 16, x - 16) reflect-padded as its crop() does, the central 96 x pixel-centred hann(96), stride 64 | studio_fwd; the context-window tiling |
+| tsf (--weights) | timesformer@gp-scroll1, @large-scroll1, @scroll5 | lucidrains TimeSformer 0.4.1: 26 frames x 16 patches of 16 px, dim 512, depth / heads 8 / 6, 16 / 8, 8 / 6 (read from the checkpoint), rotary, cls -> 4 x 4 logits; clip(0, 200) / 200 | 7.91 um, 64 / 16, np.hanning(64) (zero edges), data-free columns 0 | src/nn_xtsf.cu (patch rows, divided space-time attention with rotary + cls, GEGLU) + xnet 1x1 GEMMs + dinovol LayerNorm |
+
+Parity (ink-ext --raw-in fp16 vs the torch fp32 references; max |dlogit| over random + real surface-volume tiles rendered by ink-ext from
+an eval crop): reader2 0.0035, dense9 0.0044, trace3b 0.0028, rectina 0.0037, canon2 0.0014, studio 0.0023, tsf GP / large / scroll5
+0.0020 / 0.0017 / 0.0012, v8in 0.0073, A-hn s0 / s1 / s2 0.0060 / 0.014 / 0.0055, hecate24 0.0057, hecate96 0.036. The tiling + blend of
+canon2 / studio / tsf against numpy re-implementations of the adapters' sliding windows (ink-ext --raw-in as the per-tile oracle):
+max 1 / 255. test_xtsf: the three new kernels against host references (max 0.0005). Tests: test_xtsf (fast), test_ink_ext_inksdk_{koine,
+canon,studio,tsf,v8hec,blend} (slow tier; data in $UFSM_INKSDK = /vesuvius/ufsm/inksdk).
+
+Conventions kept: the layer offsets are i - (D - 1) / 2 for every model (the published renders' half-integer centre for even D; the
+profiles' n // 2 - D // 2 window differs by half a layer for even D, --shift moves it); the CT level and spacing rules of ink-ext.
+
+Eval (tvar.sh, the 24 held-out crops, ink-score AUC per scroll and the mean over crops; reference: reader3 0.9271, ink9um s42 + s43
+0.9175, hecate96 ~0.876):
+| tag | PHerc0139 | PHerc1667 | Paris 4 | all (n 24) |
+|---|---|---|---|---|
+| hecate24 | 0.9835 | 0.9680 | 0.9072 | 0.9301 |
+| reader3 at 9.362 um (its profile's spacing; default 9.596) | 0.9619 | 0.9188 | 0.9174 | 0.9250 |
+| rectina | 0.9496 | 0.9150 | 0.9146 | 0.9205 |
+| canon2 | 0.9622 | 0.9301 | 0.8843 | 0.9049 |
+| reader2 | 0.9460 | 0.8948 | 0.8918 | 0.9013 |
+| dense9 | 0.9627 | 0.8883 | 0.8807 | 0.8956 |
+| studio (forward) | 0.9320 | 0.8423 | 0.8921 | 0.8904 |
+| trace3b | 0.9310 | 0.8186 | 0.8500 | 0.8583 |
+| v8in A-hn s0 (forward) | 0.8956 | 0.8528 | 0.8127 | 0.8332 |
+| v8in (forward, 7.91 um) | 0.8537 | 0.8737 | 0.8095 | 0.8276 |
+| tsf GP (forward) | 0.6107 | 0.4720 | 0.8303 | 0.7340 |
+| tsf large (reverse) | 0.5275 | 0.5123 | 0.7226 | 0.6550 |
+| tsf scroll5 (reverse) | 0.5463 | 0.5131 | 0.5363 | 0.5341 |
+| studio / v8in / A-hn s0 / tsf GP reversed | | | | 0.549 / 0.554 / 0.512 / 0.484 |
+Direction: every model wants ink-ext's forward order on our renders, including Studio and the TimeSformers whose profiles name
+"reverse" primary (that is the order of a vc_render_tifxyz stack, which is ours reversed). The TimeSformers do not transfer (7.91 um
+scroll-1 / scroll-5 nets; only GP on Paris 4 is useful), and A-hn s1 / s2 were not run (s0 = v8in level).
+
+Speed: bench.sh (one 1/32 region of the 1667 w013 segment, card 1) follows in its own section.
+
 ## ink-ext: the CT chunk hash saw no z (ink9um 1.21x, half the CPU) (2026-11-16, branch inkspeed-20261116)
 
 perf on ink9um over one PHerc1667 segment (194.6 Mpx, card 1, local CT): ct_find 45 % of the CPU samples, ct_tri 13 %, render_worker 8 %.
