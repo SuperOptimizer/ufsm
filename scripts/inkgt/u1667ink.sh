@@ -8,9 +8,10 @@
 #      -> SCROLL-u1/inkr/TAG/<s>.tif, <s>_ct.tif (fill maps in inkr/TAG/fillmap)
 #   3. labels (inkgt/segs-SCROLL.json): scripts/inkgt/wrapscore.py on those renders -> sched/inkscore-u1-TAG.tsv (inkscore.sh columns)
 #   4. strip-mosaic: stripe JPEGs + overview for viewing -> SCROLL-u1/inkr/TAG/img (the contrast stretch from these renders; renders kept)
-# GPU 0 only: steps 1-2 wait for flock /tmp/gpu0-bench.lock (the desk's GPU-0 queue), so they run behind other GPU-0 jobs.
+# GPU IGPU (default 0): steps 1-2 wait for flock /tmp/gpu$IGPU-bench.lock (the desk's per-card queue), so they run behind other jobs there.
 # Resumable: a finished predict (ink.done) is kept (predict --heads takes no --resume), rendered stripes are kept, the score reruns. Env: SCROLL, U (ufsm), LV (2), MEMR (render memcap, 48G), TH (12).
 set -u
+IGPU=${IGPU:-0}   # (the card: its predicts / renders take /tmp/gpu$IGPU-bench.lock and wait for no other process above 200 MiB on it)
 CK=$(readlink -f "${1:?ckpt}"); TAG=${2:?tag}; SCROLL=${SCROLL:-PHerc1667}
 case $SCROLL in
   PHerc1667) K=PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr; UMV=2.399 ;;
@@ -30,7 +31,7 @@ key=$(python3 -I -c "print(round($UMV * 2 ** $LV, 3))")
 # before each GPU step: wait for the WAITF files (space-separated, e.g. another job's .done) and for no other GPU-0 process above 200 MiB
 WAITF=${WAITF:-}
 gpu0_wait() { local f u n=0; for f in $WAITF; do while [ ! -e $f ]; do [ $n = 0 ] && log "waiting for $f"; n=1; sleep 60; done; done
-  u=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i 0)
+  u=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i $IGPU)
   while nvidia-smi --query-compute-apps=gpu_uuid,used_memory --format=csv,noheader,nounits | awk -F', ' -v u=$u '$1 == u && $2 > 200 { b = 1 } END { exit !b }'; do
     [ $n -lt 2 ] && log "waiting for GPU 0 (a process above 200 MiB)"; n=2; sleep 60; done; }
 log() { echo "$(date '+%F %T') u1667ink $SCROLL $TAG: $*" | tee -a $RD/logs/run.log; }
@@ -74,7 +75,7 @@ if [ ! -e $INK/ink.done ]; then
   PQ="--q 0 --levels 1"; [ "${BLEND:-1}" = 1 ] || PQ=
   for g in 0 $([ "${BLEND:-1}" = 1 ] && echo 256); do
     log "predict grid $g (waiting for GPU 0)"; gpu0_wait
-    flock /tmp/gpu0-bench.lock env CUDA_VISIBLE_DEVICES=0 ~/bin/memcap -m 40G nice -n 10 $U predict $CK $R $K $INK/g$g --um $UMV --level $LV --box $(pbox $g) \
+    flock /tmp/gpu${IGPU}-bench.lock env CUDA_VISIBLE_DEVICES=$IGPU ~/bin/memcap -m 40G nice -n 10 $U predict $CK $R $K $INK/g$g --um $UMV --level $LV --box $(pbox $g) \
       --full-grid 1 --occupancy 5 --heads $HEADS --gpu 0 --threads $TH --window 544 --halo 16 --grid-origin $g,$g,$g $([ $g = 0 ] || echo --shard 256) --axis $AX $PQ > $RD/logs/predict_g$g.log 2>&1 ||
       { log "predict grid $g failed ($RD/logs/predict_g$g.log)"; exit 1; }
     [ -e $INK/g$g/ink/zarr.json ] || { log "no ink head output in $INK/g$g"; exit 1; }
@@ -92,12 +93,12 @@ fi
 for st in $SDIR/*/; do s=$(basename $st); [ -e $RD/$s.done ] && continue
   rm -rf $RD/in_$s; mkdir -p $RD/in_$s; ln -sfn $st $RD/in_$s/$s
   log "render $s (waiting for GPU 0)"; gpu0_wait
-  flock /tmp/gpu0-bench.lock env CUDA_VISIBLE_DEVICES=0 UFSM_RENDER_MEM=16 UFSM_RENDER_GPU_MEM=4 ~/bin/memcap -m ${MEMR:-48G} nice -n 10 \
+  flock /tmp/gpu${IGPU}-bench.lock env CUDA_VISIBLE_DEVICES=$IGPU UFSM_RENDER_MEM=16 UFSM_RENDER_GPU_MEM=4 ~/bin/memcap -m ${MEMR:-48G} nice -n 10 \
     $U render $RD/in_$s $RD --volume $INK/ink $key --ct $R $K/$LV --depth 1 --scale 1 --threads $TH $FILLX > $RD/logs/render_$s.log 2>&1 ||
     { log "render $s failed ($RD/logs/render_$s.log)"; exit 1; }
   [ -e $RD/${s}_fill.tif ] && mv $RD/${s}_fill.tif $RD/fillmap/
   if [ "${GATE:-1}" = 1 ]; then for h in c12 c13; do mkdir -p $RD/$h
-    flock /tmp/gpu0-bench.lock env CUDA_VISIBLE_DEVICES=0 UFSM_RENDER_MEM=16 UFSM_RENDER_GPU_MEM=4 ~/bin/memcap -m ${MEMR:-48G} nice -n 10 \
+    flock /tmp/gpu${IGPU}-bench.lock env CUDA_VISIBLE_DEVICES=$IGPU UFSM_RENDER_MEM=16 UFSM_RENDER_GPU_MEM=4 ~/bin/memcap -m ${MEMR:-48G} nice -n 10 \
       $U render $RD/in_$s $RD/$h --volume $INK/$h $key --ct $R $K/$LV --depth 1 --scale 1 --threads $TH $FILLX > $RD/logs/render_${s}_$h.log 2>&1 ||
       { log "render $s $h failed ($RD/logs/render_${s}_$h.log)"; exit 1; }
     rm -f $RD/$h/${s}_ct.tif $RD/$h/${s}_fill.tif; done; fi
