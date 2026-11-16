@@ -4,7 +4,10 @@ profile's sliding window (from the ink-sdk adapters' descriptions), with ink-ext
 checked by the parity tests):
 - canon2 (canonical2um.py): canonical grid() origins (stride 128, last at L - 256), tiles kept when >= 60 % of their columns hold data,
   window hanning(258)[1:-1] outer / max, prob x window summed over window sums, 0 where the sum is 0 or the column has no data.
-The stack (62 x 400 x 520) has an empty band and an empty corner, so tiles are dropped by the 60 % rule and columns zeroed.
+- studio (hf/inference.py --stride 64 --blend hann): 128 px windows at (y - 16, x - 16) reflect-padded past the map, starts
+  range(0, L, 64) + [max(L - 96, 0)], the central 96 px x a pixel-centred hann(96) summed over the weight sums, 0 where all 16
+  planes are 0. A 16 x 230 x 300 stack with an empty corner (ink-ext skips windows whose central 96 px hold no data: exact).
+The canon2 stack (62 x 400 x 520) has an empty band and an empty corner, so tiles are dropped by the 60 % rule and columns zeroed.
 |out - round(255 ref)| <= 1 (uint8)."""
 import os, pathlib, subprocess, sys, tempfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -12,7 +15,8 @@ import ink_ext_parity as P
 
 D0 = pathlib.Path(os.environ.get("UFSM_INKSDK", "/vesuvius/ufsm/inksdk")).expanduser()
 WC = D0 / "weights/canonical_2um@r152-3ddec-v2-l5-epoch13/r152_3ddec_v2_l5_epoch13.ckpt"
-P.need([WC])
+WS = D0 / "weights/studio@softloss-20261023/studio-softloss-20261023-ema.safetensors"
+P.need([WC, WS])
 import numpy as np
 import inksdk_ref as R
 
@@ -59,4 +63,25 @@ ref = np.where((den > 0) & valid, num / np.maximum(den, 1e-300), 0)
 print(f"canon2: {len(org)} of {len(grid(H, T, 128)) * len(grid(Wd, T, 128))} tiles kept")
 with tempfile.TemporaryDirectory(prefix="ufsm-inksdk-blend-") as d:
     check("canon2", run_layers("canon2", WC, stack, pathlib.Path(d)), ref)
+
+# ---- studio ----
+Dd, H, Wd = 16, 230, 300
+stack = np.clip(100 + 30 * rng.standard_normal((Dd, H, Wd)), 1, 255).astype(np.uint8)
+stack[:, 150:, 190:] = 0
+starts = lambda L: sorted(set(range(0, L, 64)) | {max(L - 96, 0)})
+def crop(a, y, x):   # inference.py crop(): reflect padding past the map
+    h, w = a.shape[-2:]
+    t = a[:, max(0, y):min(h, y + 128), max(0, x):min(w, x + 128)]
+    pad = ((0, 0), (max(0, -y), max(0, y + 128 - h)), (max(0, -x), max(0, x + 128 - w)))
+    return np.pad(t, pad, mode="reflect") if any(a or b for a, b in pad) else t
+org = [(y, x) for y in starts(H) for x in starts(Wd)]
+logit = P.run_c("studio", WS, np.stack([crop(stack, y - 16, x - 16) for y, x in org]), batch=4)
+w1 = 0.5 - 0.5 * np.cos(2 * np.pi * (np.arange(96) + 0.5) / 96); win = np.outer(w1, w1)
+num = np.zeros((H, Wd)); den = np.zeros((H, Wd))
+for (y, x), l in zip(org, logit):
+    p = 1 / (1 + np.exp(-l[16:112, 16:112].astype(np.float64))); hh, ww = min(96, H - y), min(96, Wd - x)
+    num[y:y + hh, x:x + ww] += p[:hh, :ww] * win[:hh, :ww]; den[y:y + hh, x:x + ww] += win[:hh, :ww]
+ref = np.where(den > 0, num / np.maximum(den, 1e-300), 0); ref[(stack == 0).all(0)] = 0
+with tempfile.TemporaryDirectory(prefix="ufsm-inksdk-blend-") as d:
+    check("studio", run_layers("studio", WS, stack, pathlib.Path(d)), ref)
 print("test_ink_ext_inksdk_blend: OK")

@@ -14,6 +14,10 @@ Networks:
   conv blocks with GroupNorm; a depth-attention collapse (1x1x1 logit, softmax over depth) and a 1x1 logit at 1/4 resolution):
   input u8 / 255 through the checkpoint's BatchNorm3d(1); the logits upsampled as probabilities (bilinear, align_corners False)
   and returned as their logits (clamped to float eps), the T x T map ink-ext writes.
+- studio(sd, tiles): Studio DeepResidualUNet (widths 48 96 192 384 640; pre-activation residual blocks GroupNorm(gcd(32, c)) + SiLU +
+  3x3x3 conv twice; GroupNorm + SiLU + strided 3x3x3 down convs (first (1, 2, 2), then 2); decoder: trilinear resize, 1x1 up conv,
+  concat with the skip, GroupNorm + SiLU + 1x1 fuse, residual blocks; head GroupNorm + SiLU + 1x1 conv; the logits weighted by
+  softmax(depth_logits) and summed over the 16 planes): input clamp(u8, 0, 200) / 255; the tile's logits (128 x 128).
 Each function takes uint8 tiles [B][D][T][T] (numpy) and returns float64 logits [B][T][T]."""
 import numpy as np
 
@@ -195,4 +199,34 @@ def canonical(sd, tiles, divisor=255.0):
             eps = 1.1920929e-07
             pr = pr.clamp(eps, 1 - eps)
             out.append(torch.log(pr / (1 - pr)).numpy())
+    return np.stack(out)
+
+
+def studio(sd, tiles):
+    import math, torch, torch.nn.functional as F
+    widths, enc_n, dec_n = [48, 96, 192, 384, 640], [2, 3, 4, 5, 6], [3, 3, 2, 2]
+    ns = lambda t, p: F.silu(F.group_norm(t, math.gcd(32, t.shape[1]), sd[p + ".weight"], sd[p + ".bias"], 1e-5))
+    def block(x, p):
+        h = F.conv3d(ns(x, p + ".branch.0"), sd[p + ".branch.2.weight"], padding=1)
+        return x + F.conv3d(ns(h, p + ".branch.3"), sd[p + ".branch.6.weight"], padding=1)
+    out = []
+    with torch.inference_mode():
+        for t in tiles:
+            x = torch.from_numpy(np.clip(t.astype(np.float32), 0, 200) / 255)[None, None]
+            x = F.conv3d(x, sd["stem.weight"], padding=1); skips = []
+            for i in range(5):
+                for j in range(enc_n[i]):
+                    x = block(x, f"enc.{i}.{j}")
+                if i < 4:
+                    skips.append(x)
+                    x = F.conv3d(ns(x, f"down.{i}.0"), sd[f"down.{i}.2.weight"], stride=(1 if i == 0 else 2, 2, 2), padding=1)
+            for k in range(4):
+                sk = skips[3 - k]
+                x = F.conv3d(F.interpolate(x, size=sk.shape[-3:], mode="trilinear", align_corners=False), sd[f"up.{k}.weight"])
+                x = F.conv3d(ns(torch.cat([x, sk], 1), f"fuse.{k}.0"), sd[f"fuse.{k}.2.weight"])
+                for j in range(dec_n[k]):
+                    x = block(x, f"dec.{k}.{j}")
+            h = F.conv3d(ns(x, "head.0"), sd["head.2.weight"], sd["head.2.bias"])
+            y = (h * sd["depth_logits"].softmax(0)[None, None, :, None, None]).sum(2)
+            out.append(y[0, 0].double().numpy())
     return np.stack(out)

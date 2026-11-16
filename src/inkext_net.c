@@ -22,6 +22,7 @@ const ie_spec ie_specs[IE_NMODELS] = {
     {"rectina", 17, 384, 9.362, 192, 8},  /* evilaliv3/rectina m4 ckpt_020000 (9.362 um, 384 px; CC-BY-NC-4.0) */
     {"trace3b", 17, 128, 9.362, 64, 8},   /* Jashann TRACE v3B_best (9.362 um, tolerance 0.1; CC-BY-NC-SA-4.0) */
     {"canon2", 62, 256, 2.399, 128, 31},  /* canonical_2um r152_3ddec_v2_l5_epoch13 (Lightning .ckpt state_dict; divide 255, no clip) */
+    {"studio", 16, 128, 9.362, 64, 7},    /* studio-softloss-20261023-ema (CC BY-NC 4.0 weights): 128 px windows, the central 96 written, Hann stride 64 */
 };
 int ie_model_kind(const char *name) {
     for (int k = 0; k < IE_NMODELS; k++) if (!strcmp(name, ie_specs[k].name)) return k;
@@ -47,6 +48,10 @@ struct ie_net {
     xconv f1, f2; float *f1g, *f1b, *f2g, *f2b; float *att_w; float att_b;
     xconv rstem; float *rstem_g, *rstem_b; int nst; int nblk[6]; bbd *st[6];
     xconv tconv[5], dconv[5]; float *dg[5], *db[5];
+    /* Studio DeepResidualUNet: widths 48 96 192 384 640, encoder blocks 2 3 4 5 6, decoder blocks 3 3 2 2 */
+    struct srb { xconv c1, c2; float *g1, *b1, *g2, *b2; } *senc[5], *sdec[4];
+    int nenc[5], ndec[4];
+    xconv sdown[4], sup[4], sfuse[4]; float *sdg[4], *sdb[4], *sfg[4], *sfb[4], *shg, *shb; float sdw[16];
 };
 
 static const wl_tensor *need(const wl_dict *W, const char *name) {
@@ -234,6 +239,87 @@ static int load_reader(ie_net *n, const wl_dict *W) {
     return bad ? -1 : 0;
 }
 
+static xt upload_tiles(const uint8_t *tiles, int B, int D, int H, int W, uint8_t **dev);
+/* ---- Studio (vesuvius-studio-multiscroll-cpt hf/model.py DeepResidualUNet(deeper=False)) ---- */
+static const int st_w[5] = {48, 96, 192, 384, 640}, st_ne[5] = {2, 3, 4, 5, 6}, st_nd[4] = {3, 3, 2, 2};
+static int st_groups(int c) { int a = 32, b = c; while (b) { const int t = a % b; a = b; b = t; } return a; }   /* GroupNorm(gcd(32, c), c) */
+static int load_srb(struct srb *R, const wl_dict *W, const char *p, int c) {
+    char a[160], b[160];
+    snprintf(a, sizeof a, "%s.branch.2.weight", p); if (mkconv(&R->c1, W, a, nullptr, nullptr, 1, 1, 1, 1, 1, 1)) return -1;
+    snprintf(a, sizeof a, "%s.branch.6.weight", p); if (mkconv(&R->c2, W, a, nullptr, nullptr, 1, 1, 1, 1, 1, 1)) return -1;
+    snprintf(a, sizeof a, "%s.branch.0.weight", p); snprintf(b, sizeof b, "%s.branch.0.bias", p); if (!(R->g1 = devvec(W, a, c)) || !(R->b1 = devvec(W, b, c))) return -1;
+    snprintf(a, sizeof a, "%s.branch.3.weight", p); snprintf(b, sizeof b, "%s.branch.3.bias", p); if (!(R->g2 = devvec(W, a, c)) || !(R->b2 = devvec(W, b, c))) return -1;
+    return 0;
+}
+static int load_studio(ie_net *n, const wl_dict *W) {
+    char a[160], b[160];
+    if (mkconv(&n->stem, W, "stem.weight", nullptr, nullptr, 1, 1, 1, 1, 1, 1)) return -1;
+    for (int i = 0; i < 5; i++) {
+        n->nenc[i] = st_ne[i]; n->senc[i] = calloc(st_ne[i], sizeof(struct srb));
+        for (int j = 0; j < st_ne[i]; j++) { snprintf(a, sizeof a, "enc.%d.%d", i, j); if (load_srb(&n->senc[i][j], W, a, st_w[i])) return -1; }
+        snprintf(a, sizeof a, "enc.%d.%d.branch.2.weight", i, st_ne[i]); if (wl_get(W, a)) { fprintf(stderr, "ink-ext: studio: more encoder blocks than DeepResidualUNet(deeper=False)\n"); return -1; }
+    }
+    for (int i = 0; i < 4; i++) {
+        snprintf(a, sizeof a, "down.%d.2.weight", i); if (mkconv(&n->sdown[i], W, a, nullptr, nullptr, i ? 2 : 1, 2, 2, 1, 1, 1)) return -1;
+        snprintf(a, sizeof a, "down.%d.0.weight", i); snprintf(b, sizeof b, "down.%d.0.bias", i); if (!(n->sdg[i] = devvec(W, a, st_w[i])) || !(n->sdb[i] = devvec(W, b, st_w[i]))) return -1;
+        const int c = st_w[3 - i];   /* decoder stage k works at width w[3 - k] */
+        snprintf(a, sizeof a, "up.%d.weight", i); if (mkconv(&n->sup[i], W, a, nullptr, nullptr, 1, 1, 1, 0, 0, 0)) return -1;
+        snprintf(a, sizeof a, "fuse.%d.2.weight", i); if (mkconv(&n->sfuse[i], W, a, nullptr, nullptr, 1, 1, 1, 0, 0, 0)) return -1;
+        snprintf(a, sizeof a, "fuse.%d.0.weight", i); snprintf(b, sizeof b, "fuse.%d.0.bias", i); if (!(n->sfg[i] = devvec(W, a, 2 * c)) || !(n->sfb[i] = devvec(W, b, 2 * c))) return -1;
+        n->ndec[i] = st_nd[i]; n->sdec[i] = calloc(st_nd[i], sizeof(struct srb));
+        for (int j = 0; j < st_nd[i]; j++) { snprintf(a, sizeof a, "dec.%d.%d", i, j); if (load_srb(&n->sdec[i][j], W, a, c)) return -1; }
+    }
+    if (!(n->shg = devvec(W, "head.0.weight", 48)) || !(n->shb = devvec(W, "head.0.bias", 48)) || !(n->logit_w = devvec(W, "head.2.weight", 48))) return -1;
+    int bad = 0; n->logit_b = scal(W, "head.2.bias", &bad);
+    const wl_tensor *dl = need(W, "depth_logits"); if (!dl || dl->numel != 16 || bad) return -1;
+    double mx = -1e300, sm = 0; for (int d = 0; d < 16; d++) mx = fmax(mx, dl->data[d]);
+    for (int d = 0; d < 16; d++) sm += exp(dl->data[d] - mx);
+    for (int d = 0; d < 16; d++) n->sdw[d] = (float)(exp(dl->data[d] - mx) / sm);   /* depth_logits.softmax(0) */
+    return 0;
+}
+static xt srb_fwd(const struct srb *R, xt x) {   /* x + conv(silu(gn(conv(silu(gn(x)))))) */
+    xt h = xt_new(x.n, x.d, x.h, x.w, x.c); xgn(x, st_groups(x.c), R->g1, R->b1, 1e-5f, nullptr, XA_SILU, h);
+    xt h1 = xconv_fwd(&R->c1, h, nullptr, XA_NONE); xt_free(&h);
+    xgn(h1, st_groups(h1.c), R->g2, R->b2, 1e-5f, nullptr, XA_SILU, h1);
+    xt y = xconv_fwd(&R->c2, h1, &x, XA_NONE); xt_free(&h1);
+    return y;
+}
+static void studio_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out) {
+    const int D = n->sp.D, T = n->sp.T;
+    float lo[B], hi[B], a[B], b[B]; for (int i = 0; i < B; i++) { lo[i] = 0; hi[i] = 200; a[i] = 1.f / 255; b[i] = 0; }   /* clamp(0, 200) / 255 */
+    uint8_t *dev; upload_tiles(tiles, B, D, T, T, &dev);
+    xt x0 = xinput_u8(dev, B, D, T, T, lo, hi, a, b); xfree_dev(dev);
+    xt x = xconv_fwd(&n->stem, x0, nullptr, XA_NONE); xt_free(&x0);
+    xt skip[4];
+    for (int i = 0; i < 5; i++) {
+        for (int j = 0; j < n->nenc[i]; j++) { xt y = srb_fwd(&n->senc[i][j], x); xt_free(&x); x = y; }
+        if (i < 4) {
+            skip[i] = x;
+            xt h = xt_new(x.n, x.d, x.h, x.w, x.c); xgn(x, st_groups(x.c), n->sdg[i], n->sdb[i], 1e-5f, nullptr, XA_SILU, h);
+            x = xconv_fwd(&n->sdown[i], h, nullptr, XA_NONE); xt_free(&h);
+        }
+    }
+    for (int k = 0; k < 4; k++) {
+        xt sk = skip[3 - k];
+        /* up(interpolate(x)): the bias-free 1x1 conv commutes with the (linear, per-channel) trilinear resize, so it runs first at the low resolution */
+        xt u = xconv_fwd(&n->sup[k], x, nullptr, XA_NONE); xt_free(&x);
+        xt r = xresize(u, sk.d, sk.h, sk.w); xt_free(&u);
+        xt c = xconcat(r, sk); xt_free(&r); xt_free(&skip[3 - k]);
+        xgn(c, st_groups(c.c), n->sfg[k], n->sfb[k], 1e-5f, nullptr, XA_SILU, c);
+        x = xconv_fwd(&n->sfuse[k], c, nullptr, XA_NONE); xt_free(&c);
+        for (int j = 0; j < n->ndec[k]; j++) { xt y = srb_fwd(&n->sdec[k][j], x); xt_free(&x); x = y; }
+    }
+    xgn(x, st_groups(x.c), n->shg, n->shb, 1e-5f, nullptr, XA_SILU, x);
+    const size_t TT = (size_t)T * T; float *lg = xmalloc_dev((size_t)B * D * TT * 4);
+    xhead(x, n->logit_w, n->logit_b, lg); xt_free(&x);
+    float *h3 = malloc((size_t)B * D * TT * 4); xd2h(h3, lg, (size_t)B * D * TT * 4); xfree_dev(lg);
+    for (int i = 0; i < B; i++) for (size_t p = 0; p < TT; p++) {   /* (head(x) * softmax(depth_logits)).sum(depth) */
+        double s = 0; for (int d = 0; d < D; d++) s += (double)n->sdw[d] * h3[((size_t)i * D + d) * TT + p];
+        out[(size_t)i * TT + p] = (float)s;
+    }
+    free(h3);
+}
+
 ie_net *ie_load(int kind, const char *weights) {
     if (kind < 0 || kind >= IE_NMODELS) return nullptr;
     const char *sub = kind == IE_HEC24 || kind == IE_HEC96 ? "ema_model" : ie_is_koine(kind) ? "model" : kind == IE_CANON2 ? "state_dict" : nullptr;
@@ -246,6 +332,7 @@ ie_net *ie_load(int kind, const char *weights) {
     if (kind == IE_V8IN) rc = load_v8in(n, W);
     else if (ie_is_koine(kind)) rc = load_reader(n, W);
     else if (kind == IE_CANON2) rc = load_hecate(n, W);
+    else if (kind == IE_STUDIO) rc = load_studio(n, W);
     else {
         const double um = wl_num(W, "sampling_um", 0);
         if (um > 0 && fabs(um - (kind == IE_HEC24 ? 2.4 : 9.6)) > 0.05) { fprintf(stderr, "ink-ext: %s is a %.1f um Hecate checkpoint\n", weights, um); rc = -1; }
@@ -262,6 +349,7 @@ size_t ie_tile_bytes_gpu(int kind) {
     switch (kind) {
     case IE_V8IN: return (size_t)700 << 20;
     case IE_HEC24: case IE_CANON2: return (size_t)700 << 20;
+    case IE_STUDIO: return (size_t)400 << 20;
     case IE_HEC96: return (size_t)40 << 20;
     case IE_INK9UM: case IE_READER2: case IE_DENSE9: case IE_TRACE3B: return (size_t)56 << 20;
     default: return (size_t)450 << 20;
@@ -449,9 +537,10 @@ int ie_forward(ie_net *n, const uint8_t *tiles, int B, float *out, int logits) {
     const size_t TT = (size_t)n->sp.T * n->sp.T;
     if (n->kind == IE_V8IN) v8in_fwd(n, tiles, B, out);
     else if (ie_is_koine(n->kind)) reader_fwd(n, tiles, B, out);
+    else if (n->kind == IE_STUDIO) studio_fwd(n, tiles, B, out);
     else hecate_fwd(n, tiles, B, out, logits);
     if (xnet_check("forward")) return -1;
-    if (!logits && (n->kind == IE_V8IN || ie_is_koine(n->kind))) for (size_t i = 0; i < (size_t)B * TT; i++) out[i] = 1.f / (1.f + expf(-out[i]));
+    if (!logits && (n->kind == IE_V8IN || ie_is_koine(n->kind) || n->kind == IE_STUDIO)) for (size_t i = 0; i < (size_t)B * TT; i++) out[i] = 1.f / (1.f + expf(-out[i]));
     return 0;
 }
 

@@ -254,7 +254,8 @@ test_ink_ext_ink9um                            | gpu,slow     |   241 | python3 
 test_ink_ext_tiling                            | gpu          |    24 | python3 tests/test_ink_ext_tiling.py
 test_ink_ext_inksdk_koine                      | gpu,slow     |    60 | python3 tests/test_ink_ext_inksdk_koine.py
 test_ink_ext_inksdk_canon                      | gpu,slow     |    30 | python3 tests/test_ink_ext_inksdk_canon.py
-test_ink_ext_inksdk_blend                      | gpu,slow     |    30 | python3 tests/test_ink_ext_inksdk_blend.py
+test_ink_ext_inksdk_blend                      | gpu,slow     |    45 | python3 tests/test_ink_ext_inksdk_blend.py
+test_ink_ext_inksdk_studio                     | gpu,slow     |    40 | python3 tests/test_ink_ext_inksdk_studio.py
 test_dinovol                                   | gpu,slow     |    86 | python3 tests/test_dinovol.py
 test_dinovol_embed                             | gpu,slow     |   591 | python3 tests/test_dinovol_embed.py
 test_hercuvit                                  | gpu,slow     |    77 | python3 tests/test_hercuvit.py
