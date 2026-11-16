@@ -31,12 +31,14 @@ that is 0.003 x 0.0104 / 0.2 = **1.5e-4**. Moonlight's recipe (Muon lr = AdamW l
 
 Test (test_admuon, card 1): from the same state, the rms step equals the kj step times r sqrt(max(Co, K)) / sqrt(max(1, Co / K)) per
 matrix. The worst relative error is 2.1e-5 (plain), 2.1e-5 (ext), 3.7e-5 (ext + NorMuon), 2.9e-5 (ext + fro). The element RMS / (lr r)
-lands in [0.830, 0.914]: the quintic NS leaves singular values below 1. Under fro it is exactly 1.0000.
+lands in [0.830, 0.914]: the quintic NS leaves singular values below 1. Under fro it is exactly 1.0000. mcc 9f63cdd (verify preset) and clang + nvcc
+give the same numbers.
 
 **Cautious weight decay, `--muon-cwd 1` (Chen, Liang et al. 2025, arXiv 2510.12402).** On the Muon matrices an element decays only where
 the step u = lr s O (subtracted) has the weight's sign (u w >= 0, so step and decay both shrink |w|). Elsewhere the decay would fight the
 optimizer's direction and is skipped. AdamW parameters are unchanged. Off, the update is the plain expression in the plain rounding order.
-Test (test_muoncwd, card 1): plain batch, ext and ext + NorMuon match the host reference to 1.3e-6, relative to |w|. The mask decays 50.1 %
+Test (test_muoncwd, card 1): plain batch, ext and ext + NorMuon match the host reference to 3.0e-7 relative to |w| under mcc 9f63cdd
+(1.3e-6 under clang + nvcc). The mask decays 50.1 %
 of the elements. cwd on at wd 0 is bit for bit the plain step. Default `--wd 0.01` x Muon lr 0.003 is 3e-5 per update, which
 shrinks the weights only ~1 % over 300 updates. Cautious decay matters only with a real decay (`--muon-wd-mult 10`, wd 0.1).
 
