@@ -435,7 +435,9 @@ elseif(UFSM_CUDA_COMPILER STREQUAL "mcc")
   # it through the driver at the first launch (cached in ~/.cache/mcudahw; MCUDA_PRECOMPILE=N warms the cache). --cuda-arch: the
   # PTX .target and __CUDA_ARCH__ (1200a: the block-scaled mma of the lp_* units). mcuda_device.h: what nvcc knows without a header.
   if(UFSM_ARCH STREQUAL "120")
-    set(UFSM_NN_ARCH --cuda-arch=1200)
+    # nn_* too on 1200a, as the native clang / nvcc build (SASS for the 'a' target): mcudahw JITs the PTX on the GPU present, so the
+    # 'a' target costs nothing there, and nn_xnet's MX-fp4 path (the block-scaled mma) failed ptxas on .target sm_120 (11-15, test_xmx)
+    set(UFSM_NN_ARCH --cuda-arch=1200a)
     set(UFSM_LP_ARCH --cuda-arch=1200a)
   else()
     set(UFSM_NN_ARCH --cuda-arch=${UFSM_ARCH}0)
