@@ -424,7 +424,7 @@ static int mx_skipped(int seq) {   /* seq in the list "i,j-k,..." */
     }
     return 0;
 }
-static float g_e4[127];   /* e4m3 code -> value (0 .. 126 = 448); mgpu: constant table */
+static float g_e4[127];   /* e4m3 code -> value (0 .. 126 = 448), filled once before any pack thread; mgpu: process */
 static float e4val(int cc) { const int E = (cc >> 3) & 15, M = cc & 7; return E ? ldexpf(1.f + M / 8.f, E - 7) : ldexpf(M / 8.f, -6); }
 static int e4code(float sv) {   /* sv an e4m3 value -> its code */
     if (g_e4[126] == 0.f) for (int cc = 0; cc < 127; cc++) g_e4[cc] = e4val(cc);
@@ -506,8 +506,8 @@ static void *pack_worker(void *a) {
     }
 }
 static int mx_pack1(xconv *c, const float *wk, int co, int sf, int wseq);
-static int g_mxrot = -1;   /* UFSM_XNET_MXROT=1: weights and activations of every MX conv H16-rotated per 16-block (exact in real arithmetic: the
-                                block dot products are invariant); mgpu: env */
+/* UFSM_XNET_MXROT=1: weights and activations of every MX conv H16-rotated per 16-block (exact in real arithmetic: block dot products are invariant) */
+static int g_mxrot = -1;   /* mgpu: env */
 static int g_mxa = -1;   /* UFSM_XNET_MXA=1: least-squares activation block scales (k_xq MODE bit 1); mgpu: env */
 extern "C" void xnet_set_mxrot(int on) { g_mxrot = on; }
 extern "C" void xnet_set_mxa(int on) { g_mxa = on; }
