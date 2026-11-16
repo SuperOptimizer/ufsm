@@ -2,7 +2,8 @@
 # scripts/rv/evwatch.sh RUN [EVERY 5000]: evaluate each new snapshot <run>/snap/<step>.ckpt (step % EVERY == 0) with scripts/rv/eval.sh.
 # The eval needs the training GPU (one 16 GB card holds the trainer): PAUSE=1 (default) stops the trainer gracefully (STOP file + SIGTERM:
 # it saves last.ckpt), runs the eval on that GPU, then relaunches it from <run>.relaunch (auto-resume). EVGPU / PAUSE=0: evaluate on another
-# GPU without pausing. Default PAUSE=auto: a free GPU of FREEGPUS (0) if its lock is free, else pause. Log <run>.evwatch.log; results /mnt/scratch/rv/eval/<name>-<step>.txt.
+# GPU without pausing. EVSC: the eval's scroll list (eval.sh's third argument, default "p1667 p139 p4"; EVSC=p1667: the clean scroll only, ~30 min).
+# Default PAUSE=auto: a free GPU of FREEGPUS (0) if its lock is free, else pause. Log <run>.evwatch.log; results /mnt/scratch/rv/eval/<name>-<step>.txt.
 set -u
 o=${1:?RUN}; EV=${2:-5000}; H=$(cd "$(dirname "$0")" && pwd); n=$(basename $o)
 while :; do
@@ -20,7 +21,7 @@ while :; do
       while [ -f $o.launcher.pid ] && kill -0 $(cat $o.launcher.pid) 2>/dev/null; do sleep 10; done
       rm -f $o.stop
     fi
-    GPU=${eg:-$(sed -nE 's/.* GPU=([0-9]+)[^ ]* .*/\1/p' $o.relaunch)} bash $H/eval.sh $c $n-$st >> $o.evwatch.log 2>&1; rc=$?
+    GPU=${eg:-$(sed -nE 's/.* GPU=([0-9]+)[^ ]* .*/\1/p' $o.relaunch)} bash $H/eval.sh $c $n-$st "${EVSC:-}" >> $o.evwatch.log 2>&1; rc=$?   # ("": eval.sh's default list; quoted: one argument)
     if [ $rc = 0 ]; then touch $o/snap/$st.evaldone
     else   # (a failed eval is retried next round, EVTRIES (2) times in all; then marked done with <step>.evalfail kept: audit eval#18)
       k=$(( $(cat $o/snap/$st.evalfail 2>/dev/null || echo 0) + 1 )); echo $k > $o/snap/$st.evalfail
