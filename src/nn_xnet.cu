@@ -112,7 +112,7 @@ __device__ __forceinline__ float act_f(float v, int act) {
    scale per 32 channels of a voxel / 32 K of a weight row, round to nearest even): the accuracy of an MX conv path, run on the fp16 kernels.
    The products of such values are exact in fp32, so a real MX kernel differs only by the fp32 summation order. Convs whose input has a
    channel count not divisible by 32 (the unfolded 1-channel stems) stay fp16. ---- */
-static int g_fq_a = -1, g_fq_w = 0, g_fq_seq = 0, g_fq_wseq = 0; static long long g_fq_mask = -1;   /* UFSM_XNET_FQ_MASK: hex bit i = conv i of a forward (xnet_seq_reset) */
+static int g_fq_a = -1, g_fq_w = 0, g_fq_seq = 0, g_fq_wseq = 0; static long long g_fq_mask = -1;   /* UFSM_XNET_FQ_MASK: hex bit i = conv i of a forward (xnet_seq_reset); mgpu: debug (UFSM_XNET_FQ accuracy probes; xnet is the single-threaded teacher runtime) */
 extern "C" void xnet_seq_reset(void) { g_fq_seq = 0; }
 static void fq_env(void) {
     if (g_fq_a >= 0) return;
@@ -366,7 +366,7 @@ extern "C" void xbn_fold(int co, const float *g, const float *b, const float *m,
 
 /* the MX-fp4 weight pack (see conv_mx): rows padded to Cop (multiple of 64), chunks to an even count; ue4m3 (5): per-row scale gs =
    amax / (6 448) so every block scale fits e4m3, values v / (e4m3(amax_b / 6 / gs) gs) */
-static int g_mx_env = -1;
+static int g_mx_env = -1;   /* mgpu: env */
 extern "C" void xnet_set_mx(int sf) { g_mx_env = sf; }
 static int mx_pack(xconv *c, const float *wk, int co, int sf) {
     const int nch = (c->K + 31) / 32, nst = (nch + 1) / 2, Cop = (co + 63) / 64 * 64; const size_t rch = (size_t)nst * 2;
@@ -828,7 +828,7 @@ template <int SF, int CFG> static void mxh_go(const MhP &P, dim3 gr, bool c32) {
 static int mxh_launch(const MxP &m, int sf, const unsigned *ws2) {
     if (m.kd != 3 || m.kh != 3 || m.kw != 3 || m.sd != 1 || m.sh != 1 || m.sw != 1 || m.pd != 1 || m.ph != 1 || m.pw != 1) return 0;
     if (!(m.Ci == 32 || m.Ci % 64 == 0) || m.Wo < 8 || !ws2) return 0;
-    static int env = -2; if (env == -2) env = getenv("UFSM_XNET_MXH") ? atoi(getenv("UFSM_XNET_MXH")) : 1;
+    static int env = -2; if (env == -2) env = getenv("UFSM_XNET_MXH") ? atoi(getenv("UFSM_XNET_MXH")) : 1;   /* mgpu: env */
     if (!env) return 0;
     MhP P; P.m = m; P.ws2 = ws2; const int cfg = m.Wo >= 32 ? 0 : m.Wo >= 16 ? 1 : 2;
     const int TZ = cfg == 0 ? 2 : 4, TY = cfg == 2 ? 8 : 4, TX = cfg == 0 ? 32 : cfg == 1 ? 16 : 8;
@@ -892,7 +892,7 @@ static void xstats(xt y, double *st) {
     const long long S = (long long)y.d * y.h * y.w; int ch = (int)((S + 1023) / 1024); if (ch > 1024) ch = 1024;
     k_stats<<<dim3(ch, y.n), y.c < 256 ? y.c : 256, 0, g_st>>>((const __half *)y.p, y.c, S, st);
 }
-static struct { int on; uint8_t *oq, *os; int oC; } g_tq;   /* xtconv_cat_q's target for the next MX tconv GEMM */
+static struct { int on; uint8_t *oq, *os; int oC; } g_tq;   /* xtconv_cat_q's target for the next MX tconv GEMM; mgpu: process (xnet runs on one host thread and one stream: set and consumed within one xtconv_cat_q call) */
 static inline size_t xq_soff(size_t numel) { return (numel / 2 + 15) / 16 * 16; }   /* the scales after the nibbles in xt.q */
 static inline size_t xq_size(size_t numel) { return xq_soff(numel) + numel / 8 + 16; }
 static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *lnw = nullptr, const float *lnb = nullptr, float lneps = 0.f, double *st = nullptr) {
@@ -1044,7 +1044,7 @@ extern "C" void xin_apply(xt *h, const float *coef, const xt *res, const float *
 /* ---- a 1 -> 32 channel 3x3x3 conv (pad 1, bias) on a one-channel fp16 input, never stored: pass 0 accumulates the IN sums of its fp16
    outputs ([n][32][2]) and of the input ([n][2]); pass 1 recomputes it and writes act(a y + b (+ alpha x + beta)) as fp16 (yh) and / or
    MX-fp4 (q). Thread per output voxel (32 accumulators), stats reduced over the warp then atomics. ---- */
-__constant__ float c_stem_w[32 * 27], c_stem_b[32];   /* xstem1's weights (FFMA constant operands; one stem net per process at a time) */
+__constant__ float c_stem_w[32 * 27], c_stem_b[32];   /* xstem1's weights (FFMA constant operands; one stem net per process at a time); mgpu: process (one stem net per process; xnet is single-threaded, one device) */
 __device__ __forceinline__ void stem_conv(const __half *x, long long n, int D, int H, int W, int zz, int yy, int xx, bool ok, float *v, float *xc) {
     float in[27];
 #pragma unroll
