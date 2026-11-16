@@ -3,6 +3,7 @@
    the label: ink 254 / no ink 0 inside the band on papyrus, unknown (255) outside the band, in the hole, and at unsupervised pixels;
    --flip moves a one-sided band to the other side; the coarse level keeps the band (known-max); --merge combines by max. */
 #include "inksplat.h"
+#include "inkflygpu.h"
 #include "dcache.h"
 #include "store.h"
 #include "tiffw.h"
@@ -216,8 +217,11 @@ int main(void) {
             else {   /* a visible device that computed nothing is a failure; no device at all (a CPU run) a skip of this part */
                 int ndev = 0; if (cudaGetDeviceCount(&ndev) != cudaSuccess) ndev = 0;
                 const unsigned long long gc = (unsigned long long)(inkfly_gpu_chunks() - g0);
-                fprintf(stderr, "onfly on the GPU: %llu chunks%s\n", gc, gc ? "" : ndev ? " with a device visible (FAIL)" : " (no device: the CPU ran; skipped)");
-                CHECK(gc > 0 || ndev == 0, "onfly on the GPU: %d device(s) visible, no chunk computed on one", ndev);
+                const unsigned long long ov = inkfly_gpu_over ? inkfly_gpu_over() : 0;
+                fprintf(stderr, "onfly on the GPU: %llu chunks, %llu over the budget%s\n", gc, ov, gc || ov ? "" : ndev ? " with a device visible (FAIL)" : " (no device: the CPU ran; skipped)");
+                if (getenv("TIS_OVER"))   /* (UFSM_INKFLY_GPU_MB=1: nothing fits; every chunk on the CPU, the same bytes, the GPU path left on) */
+                    CHECK(ndev == 0 || (gc == 0 && ov > 0), "onfly over the budget: %llu GPU chunks, %llu over", gc, ov);
+                else CHECK(gc > 0 || ndev == 0, "onfly on the GPU: %d device(s) visible, no chunk computed on one", ndev);
             }
             if (open == 0) {   /* the MIL rays (inkfly_rays) of the whole volume: every ray's point inside, mode 1 (no face) a subset of mode 0 */
                 void *hd = nullptr; z3 *f2 = inkfly_open(z3_open(cs, "ct.zarr/1", nullptr), sj, &c8, 64, nullptr, &hd);

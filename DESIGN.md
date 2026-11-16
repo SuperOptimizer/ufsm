@@ -6,6 +6,19 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The ink builder's GPU buffers under one budget (2026-11-16, try7's step-450 death)
+
+try7 (one card) logged "inkfly gpu: out of memory (nn_inkfly.cu:169)" at sampler start-up, switched the on-the-fly ink to the CPU
+for good, and died at step 450 with "CUDA error unknown error at a low-precision kernel (lp_check's latch)" before best.ckpt. The
+cause: every sampler worker kept its own stream and growing buffers on the training card (static __thread ictx), unbounded and
+never freed, beside the trainer; the file's header claimed one context behind a mutex, which the code never had. Now all threads'
+buffers are under one budget (UFSM_INKFLY_GPU_MB, default 1024) and above a free-memory reserve for the trainer
+(UFSM_INKFLY_RESERVE_MB, default 1536, cudaMemGetInfo); a chunk that does not fit, or a stream that cannot be made, goes to the
+CPU for that chunk only (return 1) and the GPU path stays on; over-budget chunks are counted (inkfly_gpu_over) and logged at
+1 and every 1000. Buffers are kept between chunks (cudaFree synchronises the device and would stall the trainer).
+test_ink_splat: 8 chunks on the GPU, 0 of 11.4 M voxels differ; test_ink_splat~over (UFSM_INKFLY_GPU_MB=1): 0 GPU chunks,
+8 over the budget, 0 voxels differ.
+
 ## mcc a420db2: -g location lists linear, not quadratic; the wip drain closed (2026-11-16, branch allin-20261116)
 
 The last microc leftovers merged by the lead after the agents were stopped: mcc-dwarf's uncommitted -g work (location lists

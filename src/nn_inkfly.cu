@@ -7,7 +7,11 @@
    C: one thread per chunk voxel: the CPU's finalize (held-out boxes, CT >= iso, the ink share, prob254) merged by known max into the
       chunk; the accumulators are cleared for the next unit.
    Built with FMA contraction off (CMakeLists.txt UFSM_STRICT_UNITS, under UFSM_STRICT_MATH=ON; fast math by default): every double expression rounds as gcc -std=c23's (no contraction), sqrt / division are IEEE, so the
-   bytes are the CPU's. One context behind a mutex (the sampler's workers take turns); buffers grow on demand. */
+   bytes are the CPU's. Per sampler thread a stream and buffers that grow on demand, all of them under one budget (UFSM_INKFLY_GPU_MB,
+   default 1024) and above a free-memory reserve for the trainer on the same device (UFSM_INKFLY_RESERVE_MB, default 1536): a chunk
+   that does not fit is done on the CPU (return 1), the GPU path stays on. (2026-11-15 try7: every worker kept its own buffers on the
+   training card without a bound; a cudaStreamCreate ran out of memory at start-up and switched the GPU path off for good, and the
+   trainer died at step 450 with an unknown CUDA error at its next check.) */
 #include <cuda_runtime.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -147,12 +151,28 @@ enum { B_CT, B_LAB, B_MSK, B_TIL, B_X, B_Y, B_Z, B_NREC, B_FREC, B_ACC, B_OUT, B
 typedef struct { int dev; cudaStream_t st; struct { void *p; size_t cap; } b[NB]; int nu; size_t base[1024]; du_t hu[1024]; } ictx;
 typedef struct { dc_t c; long long bb[6]; int nonempty, bad; unsigned cnt[1024], fcnt[1024]; } sm_t;
 static __thread ictx *t_ic;
+static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+static size_t g_held, g_budget, g_reserve;   /* bytes in every thread's buffers; their bound; the device memory left to the trainer */
+static void budget_init(void) {
+    if (g_budget) return;
+    const char *b = getenv("UFSM_INKFLY_GPU_MB"), *r = getenv("UFSM_INKFLY_RESERVE_MB");
+    g_budget = (size_t)(b && atol(b) > 0 ? atol(b) : 1024) << 20; g_reserve = (size_t)(r && atol(r) >= 0 ? atol(r) : 1536) << 20;
+}
+/* 0: buffer i holds n bytes; 1: not within the budget / reserve / allocator (this chunk on the CPU; the old buffer is kept) */
 static int grow(ictx *x, int i, size_t n) {
     if (x->b[i].cap >= n) return 0;
-    if (x->b[i].p) cudaFree(x->b[i].p);
-    size_t c = n + n / 4; x->b[i].p = nullptr; x->b[i].cap = 0;
-    if (cudaMalloc(&x->b[i].p, c) != cudaSuccess) return -1;
-    x->b[i].cap = c; return 0;
+    const size_t c = n + n / 4; int rc = 1;
+    pthread_mutex_lock(&g_mu); budget_init();
+    size_t fr = 0, tot = 0;
+    if (g_held - x->b[i].cap + c <= g_budget && cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr + x->b[i].cap >= c + g_reserve) {
+        void *p = nullptr;
+        if (cudaMalloc(&p, c) == cudaSuccess) {
+            if (x->b[i].p) cudaFree(x->b[i].p);
+            g_held = g_held - x->b[i].cap + c; x->b[i].p = p; x->b[i].cap = c; rc = 0;
+        } else (void)cudaGetLastError();   /* (the allocator's error is not sticky; clear it for the next check) */
+    }
+    pthread_mutex_unlock(&g_mu);
+    return rc;
 }
 static void to_dc(const ifg_cfg *cf, dc_t *hc) {
     memset(hc, 0, sizeof *hc);
@@ -161,18 +181,28 @@ static void to_dc(const ifg_cfg *cf, dc_t *hc) {
     for (int d = 0; d < 3; d++) { hc->a0[d] = cf->a0[d]; hc->b0[d] = cf->b0[d]; hc->shape[d] = cf->shape[d]; }
     for (int e = 0; e < cf->nexcl; e++) for (int d = 0; d < 6; d++) hc->excl[e][d] = cf->excl[e][d];
 }
+static unsigned long long g_over;
+static void atomic_over(void) {
+    pthread_mutex_lock(&g_mu); const unsigned long long k = ++g_over; const size_t h = g_held; pthread_mutex_unlock(&g_mu);
+    if (k == 1 || k % 1000 == 0) fprintf(stderr, "inkfly gpu: %llu chunk(s) over the GPU budget (%zu of %zu MiB held, %zu MiB reserve): on the CPU\n", k, h >> 20, g_budget >> 20, g_reserve >> 20);
+}
+extern "C" unsigned long long inkfly_gpu_over(void) { pthread_mutex_lock(&g_mu); const unsigned long long k = g_over; pthread_mutex_unlock(&g_mu); return k; }
 extern "C" void inkfly_gpu_device(int dev) { g_dev = dev; }
 extern "C" int inkfly_gpu_near(const ifg_unit *U, int nu, const ifg_cfg *cf, int64_t lo[3], int64_t hi[3], uint64_t *nnear) {
     int rc = 0; sm_t *hs = nullptr; ictx *x = t_ic;
     if (cf->ns > NSMAX || cf->nexcl > 64 || nu > 1024) return -2;
     if (!x) { x = t_ic = (ictx *)calloc(1, sizeof *x); x->dev = -1; }
-    if (x->dev != g_dev) { IG_CK(cudaSetDevice(g_dev)); if (x->st) cudaStreamDestroy(x->st); IG_CK(cudaStreamCreateWithFlags(&x->st, cudaStreamNonBlocking)); x->dev = g_dev; }
+    if (x->dev != g_dev) {
+        IG_CK(cudaSetDevice(g_dev)); if (x->st) { cudaStreamDestroy(x->st); x->st = nullptr; }
+        if (cudaStreamCreateWithFlags(&x->st, cudaStreamNonBlocking) != cudaSuccess) { (void)cudaGetLastError(); x->st = nullptr; return 1; }   /* (no stream now: this chunk on the CPU) */
+        x->dev = g_dev;
+    }
     IG_CK(cudaSetDevice(x->dev));
     {
         size_t nl = 0, nm = 0, nt = 0, np = 0, nr = 0;
         for (int i = 0; i < nu; i++) { const ifg_unit *h = &U[i]; nl += (size_t)h->rh * h->rw; nm += h->msk ? (size_t)h->rh * h->rw : 0; nt += h->ntiles; np += (size_t)h->pw * h->ph; nr += (size_t)h->ntiles * TS * TS; }
         if (grow(x, B_LAB, nl + 1) || grow(x, B_MSK, nm + 1) || grow(x, B_TIL, 4 * nt + 4) || grow(x, B_X, 4 * np + 4) || grow(x, B_Y, 4 * np + 4) || grow(x, B_Z, 4 * np + 4) ||
-            grow(x, B_NREC, nr * sizeof(nrec_t) + 64) || grow(x, B_FREC, nr * sizeof(frec) + 64) || grow(x, B_SM, sizeof(sm_t))) { fprintf(stderr, "inkfly gpu: out of device memory\n"); rc = -1; goto out; }
+            grow(x, B_NREC, nr * sizeof(nrec_t) + 64) || grow(x, B_FREC, nr * sizeof(frec) + 64) || grow(x, B_SM, sizeof(sm_t))) { atomic_over(); rc = 1; goto out; }
         hs = (sm_t *)calloc(1, sizeof *hs); to_dc(cf, &hs->c);
         for (int d = 0; d < 3; d++) { hs->bb[d] = INT64_MAX; hs->bb[3 + d] = INT64_MIN; }
         sm_t *ds = (sm_t *)x->b[B_SM].p;
@@ -205,7 +235,7 @@ extern "C" int inkfly_gpu_finish(const ifg_cfg *cf, const uint8_t *ctb, const in
     const size_t cv = (size_t)n[0] * n[1] * n[2], ncv = (size_t)cn[0] * cn[1] * cn[2];
     dc_t *hc = (dc_t *)calloc(1, sizeof *hc); int hb[2] = {0, 0};
     IG_CK(cudaSetDevice(x->dev));
-    if (grow(x, B_CT, ncv) || grow(x, B_ACC, 4 * cv * sizeof(unsigned)) || grow(x, B_OUT, cv)) { fprintf(stderr, "inkfly gpu: out of device memory\n"); rc = -1; goto out; }
+    if (grow(x, B_CT, ncv) || grow(x, B_ACC, 4 * cv * sizeof(unsigned)) || grow(x, B_OUT, cv)) { atomic_over(); rc = 1; goto out; }
     {
         to_dc(cf, hc); for (int d = 0; d < 3; d++) { hc->co[d] = co[d]; hc->cn[d] = cn[d]; hc->o[d] = o[d]; hc->n[d] = n[d]; }
         sm_t *ds = (sm_t *)x->b[B_SM].p; unsigned *acc = (unsigned *)x->b[B_ACC].p, *ni = acc, *nn = acc + cv, *pi = acc + 2 * cv, *pn = acc + 3 * cv; uint8_t *dout = (uint8_t *)x->b[B_OUT].p;

@@ -30,6 +30,7 @@ __attribute__((weak)) int inkfly_gpu_near(const ifg_unit *U, int nu, const ifg_c
 __attribute__((weak)) int inkfly_gpu_finish(const ifg_cfg *c, const uint8_t *ctb, const int64_t co[3], const int64_t cn[3], const int64_t o[3], const int64_t n[3],
                                             uint8_t *out, int *nonempty);
 __attribute__((weak)) void inkfly_gpu_device(int dev);
+__attribute__((weak)) unsigned long long inkfly_gpu_over(void);   /* chunks sent to the CPU by the GPU budget / reserve (nn_inkfly.cu) */
 #ifdef __cplusplus
 }
 #endif
