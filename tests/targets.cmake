@@ -137,6 +137,7 @@ ufsm_exe(test_gpu_input SUITE tests/test_gpu_input.c OBJS sample scannorm sample
          spatial_augment crush scrollaug cover sources band_onfly fuse fiberraster afv reg regmap zarr2 srpair view zarr3 store json z3w
          tiff zipr hf NN LP LIBS m curl zstd blosc z crypto CUDA)
 ufsm_exe(test_gpudec SUITE tests/test_gpudec.c OBJS zarr3 store json z3w nn_gpudec LIBS LDLIBS CUDA INC CUDA)
+target_compile_options(test_gpudec PRIVATE ${UFSM_IEEE_CFLAGS})   # (its reference decoder IEEE like zarr3.c: UFSM_EXACT_HOST)
 ufsm_exe(test_grad_mx4 SUITE tests/test_grad_mx4.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_gram SUITE tests/test_gram.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_grid_sparse SUITE tests/test_grid_sparse.c OBJS fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS
@@ -317,6 +318,7 @@ ufsm_exe(test_unwrap_targets SUITE tests/test_unwrap_targets.c OBJS NN LP LIBS m
 ufsm_exe(test_vcgpu SUITE tests/test_vcgpu.c OBJS vcgpu NN LP LIBS LDLIBS CUDA INC CUDA)
 ufsm_exe(test_volcomp SUITE tests/test_volcomp.c LIBS m)
 ufsm_exe(test_volcomp_fast SUITE tests/test_volcomp_fast.c OBJS zarr3 store json z3w LIBS LDLIBS)
+target_compile_options(test_volcomp_fast PRIVATE ${UFSM_IEEE_CFLAGS})   # (its reference decoder IEEE like zarr3.c: UFSM_EXACT_HOST)
 ufsm_exe(test_votes SUITE tests/test_votes.c OBJS votes scannorm edt band sheet ct_augment scan_augment spatial_augment crush scrollaug
          cover json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb embz LIBS
          LDLIBS)

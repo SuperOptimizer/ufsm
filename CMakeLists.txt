@@ -337,11 +337,24 @@ function(ufsm_host_obj name src)
   target_include_directories(obj_${name} SYSTEM PRIVATE ${UFSM_CUDA}/include)
 endfunction()
 
+# UFSM_EXACT_HOST / UFSM_EXACT_CU: IEEE in every build, fast math or not (2026-11-15). The volcomp decoders: zarr3.c (the host reader:
+# volcomp.h + volcomp_fast.h) and nn_gpudec.cu (the GPU decoder) must give the same bytes as each other and as the decoders the stores
+# were checked with, because the nets amplify a +-1 CT voxel: fast math moved 5-8 voxels per 160^3 window by 1 (the host IDCT's
+# signed zeros: -fsigned-zeros on zarr3.c alone restored it) and predict's rv then differed on 8 % of the bytes (max 120) of the
+# windows holding them, per-window GroupNorm statistics and MX-fp4 block scales spreading it (fm round 11-15, test_predict_heads
+# (1d): GPU vs host decode 16 %, max 123). The decode is ~80 % the serial tANS chain: IEEE costs it nothing measurable.
+set(UFSM_EXACT_HOST zarr3)
+set(UFSM_EXACT_CU nn_gpudec)
+set(UFSM_IEEE_CFLAGS -fno-fast-math -ffp-contract=off -fno-math-errno)
 file(GLOB UFSM_C_SRC CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.c)
 set(UFSM_CORE_OBJS)
 foreach(f ${UFSM_C_SRC})
   cmake_path(GET f STEM n)
-  ufsm_host_obj(${n} ${f})
+  if(n IN_LIST UFSM_EXACT_HOST)
+    ufsm_host_obj(${n} ${f} ${UFSM_IEEE_CFLAGS})
+  else()
+    ufsm_host_obj(${n} ${f})
+  endif()
   if(NOT n MATCHES "^(main|sysinfo_cli)$")
     list(APPEND UFSM_CORE_OBJS obj_${n})
   endif()
@@ -456,7 +469,7 @@ function(ufsm_cuda_obj name src arch)
   elseif(NOT UFSM_CUDA_COMPILER STREQUAL "nvcc")
     set_source_files_properties(${src} PROPERTIES LANGUAGE CXX)
   endif()
-  if(UFSM_STRICT_MATH AND name IN_LIST UFSM_STRICT_UNITS)
+  if((UFSM_STRICT_MATH AND name IN_LIST UFSM_STRICT_UNITS) OR name IN_LIST UFSM_EXACT_CU)
     set(fp ${UFSM_CU_STRICT})
   else()
     set(fp ${UFSM_CU_FAST})

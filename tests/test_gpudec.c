@@ -28,7 +28,9 @@
 #define CV VOLCOMP_CHUNK_VOXELS
 /* decoded bytes vs the reference: identical under UFSM_STRICT_MATH; under fast math (nn_gpudec and the host IDCT both contract /
    reassociate) +-1 on at most 1e-4 of the voxels, the codec's own cross-build allowance (volcomp.h: AVX2 vs C kernels +-1 LSB) */
-#define DEC_NE(what, a, b) fm_cmp_u8(what, a, b, CV, 1, 1e-4)
+/* exact in every build: the decoders are IEEE under the default fast math (CMakeLists.txt UFSM_EXACT_HOST / UFSM_EXACT_CU; this test is
+   built with the same IEEE flags, tests/targets.cmake) */
+#define DEC_NE(what, a, b) fm_cmp_u8(what, a, b, CV, 0, 0)
 static uint64_t lcg(uint64_t *s) { *s = *s * 6364136223846793005ull + 1442695040888963407ull; return *s >> 17; }
 static int fails = 0;
 static void check(const char *what, int ok) { printf("gpudec: %-100s %s\n", what, ok ? "ok" : "FAIL"); fails += !ok; }
