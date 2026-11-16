@@ -152,7 +152,7 @@ typedef struct { int dev; cudaStream_t st; struct { void *p; size_t cap; } b[NB]
 typedef struct { dc_t c; long long bb[6]; int nonempty, bad; unsigned cnt[1024], fcnt[1024]; } sm_t;
 static __thread ictx *t_ic;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
-static size_t g_held, g_budget, g_reserve;   /* bytes in every thread's buffers; their bound; the device memory left to the trainer */
+static size_t g_held, g_budget, g_reserve;   /* mgpu: guarded (g_mu; one ink device per process). bytes in every thread's buffers; their bound; the device memory left to the trainer */
 static void budget_init(void) {
     if (g_budget) return;
     const char *b = getenv("UFSM_INKFLY_GPU_MB"), *r = getenv("UFSM_INKFLY_RESERVE_MB");
@@ -181,7 +181,7 @@ static void to_dc(const ifg_cfg *cf, dc_t *hc) {
     for (int d = 0; d < 3; d++) { hc->a0[d] = cf->a0[d]; hc->b0[d] = cf->b0[d]; hc->shape[d] = cf->shape[d]; }
     for (int e = 0; e < cf->nexcl; e++) for (int d = 0; d < 6; d++) hc->excl[e][d] = cf->excl[e][d];
 }
-static unsigned long long g_over;
+static unsigned long long g_over;   /* mgpu: guarded (g_mu) */
 static void atomic_over(void) {
     pthread_mutex_lock(&g_mu); const unsigned long long k = ++g_over; const size_t h = g_held; pthread_mutex_unlock(&g_mu);
     if (k == 1 || k % 1000 == 0) fprintf(stderr, "inkfly gpu: %llu chunk(s) over the GPU budget (%zu of %zu MiB held, %zu MiB reserve): on the CPU\n", k, h >> 20, g_budget >> 20, g_reserve >> 20);
