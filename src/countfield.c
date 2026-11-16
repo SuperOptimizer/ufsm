@@ -117,6 +117,7 @@ typedef struct {
     double sheet0; /* eigenvalue ratio at which the sheetness weight starts */
     double kph, c0;   /* --phase-w kph: confident network phase gradients join the targets (weight kph x ramp(conf, c0, c0 + 0.3)) */
     int nb;           /* y bands per solve row (jobs = solve rows x bands: disjoint solve cells per job; 0 = 1) */
+    float *Sd, *Gd[3];   /* --pool-split 1: the density term alone (S, G hold density + phase); nullptr: none */
     double rs, ra, rb, wa, wb, wd, wp;   /* rs: --rho-scale (the density head's turn count x rs; 0 = 1); ra, rb: --rho-pow A,S0 (x (spacing / S0)^-A, rb = S0 in sp bytes); --wide A,B (sp bytes) --wide-dens wd --wide-phase wp: where the network spacing is wide the density weight x (1 - wd s), the phase weight x (1 + wp s), s = ramp(sp, wa, wb) */
 } cf_pool;
 static double cf_ph(const fit_fields *f, size_t i, double *c) { const double a = (f->pc[i] - 128) / 127.0, b = (f->ps[i] - 128) / 127.0; *c = f->w[i] ? hypot(a, b) : 0; return atan2(b, a) / (2 * M_PI); }
@@ -145,6 +146,7 @@ static void cf_pool_run(void *a, long j0, long j1, int t_) {   /* jobs [j0, j1):
             const double rho = p->rs * 8.0 / f->sp[i] * (p->ra != 0 ? pow(f->sp[i] / p->rb, -p->ra) : 1);   /* turns per field cell (x --rho-scale, x (sp / S0)^-A: --rho-pow) */
             const size_t j = ((size_t)Z * p->hh + y / p->P) * p->w + x / p->P;
             p->S[j] += (float)c; for (int k = 0; k < 3; k++) p->G[k][j] += (float)(c * rho * v[k]);
+            if (p->Sd) { p->Sd[j] += (float)c; for (int k = 0; k < 3; k++) p->Gd[k][j] += (float)(c * rho * v[k]); }
         }
     }
 }
@@ -657,6 +659,15 @@ int cmd_count_field(int argc, char **argv) {
         Sl[l] = calloc(L->n, sizeof(float)); for (int k = 0; k < 3; k++) Gl[l][k] = calloc(L->n, sizeof(float));
         if (!Sl[l] || !Gl[l][2]) { fprintf(stderr, "count-field: out of memory (solve grid)\n"); return 1; }
     }
+    /* --pool-split 1 (geocount prototype, off by default): the density term's pooled sums kept apart (Sd, Gd; level 0, CPU pooling) so
+       the solve can rescale the density count without re-pooling: --rho-solve K (global) and / or --rho-map FILE (float32 per level-0
+       solve cell, z-major) give G += (K - 1) Gd, the phase-gradient targets (--phase-w) untouched. With --pool-cache the split sums go
+       to / come from FILE.dens. (audit geo-count 11-14: the density head counts 1.2-1.3x the GT sheets on Paris 4 and 1667) */
+    const double rho_solve = opt_atof("--rho-solve", cf_opt(argc, argv, "--rho-solve", "1")); const char *rho_map = cf_opt(argc, argv, "--rho-map", "");
+    const int psplit = opt_atoi("--pool-split", cf_opt(argc, argv, "--pool-split", "0")) || rho_solve != 1 || *rho_map;
+    float *Sd0 = nullptr, *Gd0[3] = {nullptr, nullptr, nullptr};
+    if (psplit) { Sd0 = calloc(lv[0].n, sizeof(float)); for (int k = 0; k < 3; k++) Gd0[k] = calloc(lv[0].n, sizeof(float));
+                  if (!Sd0 || !Gd0[2]) { fprintf(stderr, "count-field: out of memory (--pool-split)\n"); return 1; } }
     /* pass 1: the pooled sums chunk by chunk; the label-free prior (direction, pitch) from the chunk holding the middle row */
     int dir = opt_atoi("--dir", cf_opt(argc, argv, "--dir", "0")), recto = 0, w4d = 0; double pitch = 8.0 * h;
     int dsrc = dir ? FIT_DIR_GIVEN : -1;   /* where dir came from (fit.h FIT_DIR_*; -1 not yet decided) */
@@ -667,6 +678,10 @@ int cmd_count_field(int argc, char **argv) {
     if (*pcache) { FILE *pf = fopen(pcache, "rb"); int hd[6]; double pv;
         if (pf && fread(hd, sizeof hd, 1, pf) == 1 && fread(&pv, sizeof pv, 1, pf) == 1 && hd[0] == lv[0].d && hd[1] == lv[0].hh && hd[2] == lv[0].w && hd[3] == P) {
             int ok = fread(Sl[0], sizeof(float), lv[0].n, pf) == lv[0].n; for (int k = 0; k < 3 && ok; k++) ok = fread(Gl[0][k], sizeof(float), lv[0].n, pf) == lv[0].n;
+            if (ok && psplit) { char dn[PATH_MAX]; snprintf(dn, sizeof dn, "%s.dens", pcache); FILE *df = fopen(dn, "rb"); ok = df && fread(Sd0, sizeof(float), lv[0].n, df) == lv[0].n;
+                for (int k = 0; k < 3 && ok; k++) ok = fread(Gd0[k], sizeof(float), lv[0].n, df) == lv[0].n;
+                if (df) fclose(df);
+                if (!ok) { fprintf(stderr, "count-field: --pool-split: no density sums %s (rerun pass 1 with --pool-split 1)\n", dn); return 1; } }
             if (ok) { cached = 1; if (!dir) { dir = hd[4]; dsrc = (hd[5] >> 16) - 1; if (dsrc < 0) dsrc = FIT_DIR_DEFAULT; }   /* (a cache without the source: unverified) */
                       pitch = pv; recto = hd[5] & 1; w4d = (hd[5] >> 1) & 0x7fff; fprintf(stderr, "count-field: pooled sums from %s\n", pcache); }
             else memset(Sl[0], 0, lv[0].n * sizeof(float));
@@ -694,6 +709,7 @@ int cmd_count_field(int argc, char **argv) {
         if (!z0) { recto = b.f.recto != nullptr; w4d = b.f.wd[0] ? b.f.w4_d : 0; }
         cf_pool pp = {&b.f, z0, z1 - z0, H, W, P, lv[0].hh, lv[0].w, h, g.cy, g.cx, na, Sl[0], {Gl[0][0], Gl[0][1], Gl[0][2]}, opt_atof("--emin", cf_opt(argc, argv, "--emin", "0.1")), opt_atof("--sheet0", cf_opt(argc, argv, "--sheet0", "0.4")), opt_atof("--phase-w", cf_opt(argc, argv, "--phase-w", "0")), opt_atof("--phase-c0", cf_opt(argc, argv, "--phase-c0", "0.4"))};
         pp.rs = opt_atof("--rho-scale", cf_opt(argc, argv, "--rho-scale", "1")); if (!(pp.rs > 0)) pp.rs = 1;
+        if (psplit) { pp.Sd = Sd0; for (int k = 0; k < 3; k++) pp.Gd[k] = Gd0[k]; }
         { double A = 0, S0 = 0; if (*cf_opt(argc, argv, "--rho-pow", "") && sscanf(cf_opt(argc, argv, "--rho-pow", ""), "%lf,%lf", &A, &S0) == 2 && S0 > 0) { pp.ra = A; pp.rb = S0 * 8 / (h * g.um); } }
         {   /* --wide A,B (network spacing, um) --wide-dens D (0..1) --wide-phase K: the density weight x (1 - D s), the confident phase weight x (1 + K s), s = ramp(spacing, A, B) */
             double a = 0, bw = 0; if (*cf_opt(argc, argv, "--wide", "") && sscanf(cf_opt(argc, argv, "--wide", ""), "%lf,%lf", &a, &bw) == 2 && bw > a) { pp.wa = a * 8 / (h * g.um); pp.wb = bw * 8 / (h * g.um); }
@@ -706,7 +722,7 @@ int cmd_count_field(int argc, char **argv) {
             fprintf(stderr, "count-field: read only: rows %d..%d hash %016llx\n", z0, z1, (unsigned long long)hs); cf_pre_give(&pre, &b);
             if (!pref && ci + 1 < nch) { const int n0 = ord[ci + 1] * CZ; cf_pre_start(&pre, in, n0, n0 + CZ < D ? n0 + CZ : D, 0); }
             continue; }
-        if (gpu) {   /* the chunk's solve rows on the GPU (the same sums in the same order) */
+        if (gpu && !psplit) {   /* the chunk's solve rows on the GPU (the same sums in the same order; --pool-split: the CPU) */
             const cf_gpu_poolcfg gc = {H, W, P, lv[0].hh, lv[0].w, na, h, g.cy, g.cx, pp.emin, pp.sheet0, pp.kph, pp.c0, pp.rs, pp.ra, pp.rb, pp.wa, pp.wb, pp.wd, pp.wp};
             const uint8_t *pl[10] = {b.f.pc, b.f.ps, b.f.t[0], b.f.t[1], b.f.t[2], b.f.t[3], b.f.t[4], b.f.t[5], b.f.sp, b.f.w};
             if (cf_gpu_pool(&gc, pl, z0, z1 - z0, Sl[0], Gl[0])) {
@@ -715,7 +731,7 @@ int cmd_count_field(int argc, char **argv) {
                 memset(Sl[0] + a, 0, (e - a) * sizeof(float)); for (int k = 0; k < 3; k++) memset(Gl[0][k] + a, 0, (e - a) * sizeof(float));
             }
         }
-        if (!gpu) { const int nr = (z1 - z0 + P - 1) / P; pp.nb = (4 * cf_nt + nr - 1) / nr; if (pp.nb > lv[0].hh) pp.nb = lv[0].hh; if (pp.nb < 1) pp.nb = 1;
+        if (!gpu || psplit) { const int nr = (z1 - z0 + P - 1) / P; pp.nb = (4 * cf_nt + nr - 1) / nr; if (pp.nb > lv[0].hh) pp.nb = lv[0].hh; if (pp.nb < 1) pp.nb = 1;
           cf_par((long)nr * pp.nb, cf_pool_run, &pp); gpu = gpu0; npc++; }   /* (jobs own whole solve-row y bands: no shared cells; same sum order) */
         t_pool += cf_now() - tl1;
         if (z0 <= D / 2 && D / 2 < z1) {
@@ -758,9 +774,25 @@ int cmd_count_field(int argc, char **argv) {
         int bad = !pf || fwrite(hd, sizeof hd, 1, pf) != 1 || fwrite(&pitch, sizeof pitch, 1, pf) != 1 || fwrite(Sl[0], sizeof(float), lv[0].n, pf) != lv[0].n;
         for (int k = 0; k < 3 && !bad; k++) bad = fwrite(Gl[0][k], sizeof(float), lv[0].n, pf) != lv[0].n;
         if (pf && fclose(pf)) bad = 1;
+        if (psplit && !bad) { char dn[PATH_MAX]; snprintf(dn, sizeof dn, "%s.dens", pcache); FILE *df = fopen(dn, "wb"); bad = !df || fwrite(Sd0, sizeof(float), lv[0].n, df) != lv[0].n;
+            for (int k = 0; k < 3 && !bad; k++) bad = fwrite(Gd0[k], sizeof(float), lv[0].n, df) != lv[0].n;
+            if (df && fclose(df)) bad = 1; }
         fprintf(stderr, bad ? "count-field: cannot write the pool cache %s\n" : "count-field: pooled sums -> %s\n", pcache);
         if (opt_atoi("--pool-only", cf_opt(argc, argv, "--pool-only", "0"))) return bad; }   /* (--pool-only 1: pass 1 into --pool-cache, nothing else) */
     free(ord); g_follow = nullptr;
+    if (rho_solve != 1 || *rho_map) {   /* --rho-solve K / --rho-map FILE: the density count rescaled per solve cell, G += (K - 1) Gd */
+        float *km = nullptr;
+        if (*rho_map) { FILE *mf = fopen(rho_map, "rb"); km = malloc(lv[0].n * sizeof(float));
+            if (!mf || !km || fread(km, sizeof(float), lv[0].n, mf) != lv[0].n) { fprintf(stderr, "count-field: --rho-map %s: need %zu float32 (the level-0 solve grid %dx%dx%d)\n", rho_map, lv[0].n, lv[0].d, lv[0].hh, lv[0].w); return 1; }
+            fclose(mf); }
+        double ks = 0, kw = 0;
+        for (size_t i = 0; i < lv[0].n; i++) { if (!(Sd0[i] > 0)) continue; const double K = rho_solve * (km && isfinite(km[i]) && km[i] > 0 ? km[i] : 1);
+            for (int k = 0; k < 3; k++) Gl[0][k][i] += (float)((K - 1) * Gd0[k][i]);
+            ks += K * Sd0[i]; kw += Sd0[i]; }
+        fprintf(stderr, "count-field: density count rescaled (--rho-solve %g%s%s): weighted mean K %.3f\n", rho_solve, *rho_map ? ", --rho-map " : "", rho_map, kw > 0 ? ks / kw : 0);
+        free(km);
+    }
+    free(Sd0); for (int k = 0; k < 3; k++) free(Gd0[k]);
     if (getenv("UFSM_CF_ZTILT")) {   /* per solve row: the share of data cells whose target normal tilts >= 30 deg out of the y-x plane (z crush) */
         for (int z = 0; z < lv[0].d; z++) { double nc = 0, nt = 0, sz = 0;
             for (size_t i = (size_t)z * lv[0].hh * lv[0].w; i < (size_t)(z + 1) * lv[0].hh * lv[0].w; i++) { if (!(Sl[0][i] > 0)) continue;

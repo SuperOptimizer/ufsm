@@ -216,6 +216,34 @@ int main(void) {
             if (w2[i0] == w2[i0] && w2[i1] == w2[i1] && tw > 1) { rs += (w2[i1] - w2[i0]) / tw; nr++; }
         }
         CHECK(nr >= 4 && fabs(rs / nr - 0.75) < 0.05, "--rho-scale 0.75: radial count ratio %.3f (%d segments)", nr ? rs / nr : 0, nr);
+        /* --pool-split / --rho-solve / --rho-map (geocount 11-15): the density term's sums kept apart, rescaled at the solve without
+           re-pooling. No --phase-w here, so G is the density term alone and K x the split sums is --rho-scale K's pooling up to float
+           rounding (K x a sum vs a sum of K x terms): wc equal to << 1e-3 turn. Run A pools once into --pool-cache (+ .dens) unscaled;
+           B (--rho-solve 0.75) and C (--rho-map, 0.75 in every cell) reuse it */
+        char pc[640], o7[640], o8[640], o9[640], rmap[640]; snprintf(pc, sizeof pc, "%s/pool_split.bin", dir); snprintf(rmap, sizeof rmap, "%s/rho_map.f32", dir);
+        snprintf(o7, sizeof o7, "%s/out_ps", dir); snprintf(o8, sizeof o8, "%s/out_rsolve", dir); snprintf(o9, sizeof o9, "%s/out_rmap", dir);
+        char *a7[] = {"ufsm", "count-field", in, o7, "--R", "0", "--dir", "1", "--pool", "1", "--threads", "4", "--rmin-um", "0", "--cf-gpu", "0", "--pool-split", "1", "--pool-cache", pc, nullptr};
+        CHECK(cmd_count_field(20, a7) == 0, "count-field --pool-split 1 failed");
+        int hd[6] = {0}; FILE *pf = fopen(pc, "rb"); CHECK(pf && fread(hd, sizeof hd, 1, pf) == 1, "no --pool-cache header"); if (pf) fclose(pf);
+        char dn[700]; snprintf(dn, sizeof dn, "%s.dens", pc); size_t ndn = 0; float *dens = read_f32(dn, &ndn);
+        const size_t nl0 = (size_t)hd[0] * hd[1] * hd[2];
+        CHECK(dens && nl0 > 0 && ndn == 4 * nl0, "--pool-split: %s holds %zu floats, want 4 x %zu", dn, ndn, nl0); free(dens);
+        float *km = malloc(nl0 * sizeof(float)); for (size_t i = 0; i < nl0; i++) km[i] = 0.75f;
+        FILE *mf = fopen(rmap, "wb"); CHECK(mf && fwrite(km, sizeof(float), nl0, mf) == nl0, "write the --rho-map"); if (mf) fclose(mf); free(km);
+        char *a8[] = {"ufsm", "count-field", in, o8, "--R", "0", "--dir", "1", "--pool", "1", "--threads", "4", "--rmin-um", "0", "--cf-gpu", "0", "--rho-solve", "0.75", "--pool-cache", pc, nullptr};
+        CHECK(cmd_count_field(20, a8) == 0, "count-field --rho-solve 0.75 failed");
+        char *a9[] = {"ufsm", "count-field", in, o9, "--R", "0", "--dir", "1", "--pool", "1", "--threads", "4", "--rmin-um", "0", "--cf-gpu", "0", "--rho-map", rmap, "--pool-cache", pc, nullptr};
+        CHECK(cmd_count_field(20, a9) == 0, "count-field --rho-map failed");
+        const char *ov[3] = {o7, o8, o9}; float *wv[3] = {0}; size_t nv[3] = {0};
+        for (int v = 0; v < 3; v++) { snprintf(pth, sizeof pth, "%s/wc.f32", ov[v]); wv[v] = read_f32(pth, &nv[v]); CHECK(wv[v] && nv[v] == n, "no wc.f32 in %s", ov[v]); }
+        if (wv[0] && wv[1] && wv[2] && nv[0] == n && nv[1] == n && nv[2] == n) {
+            double d0 = 0, d1 = 0, d2 = 0; size_t nn = 0;   /* d0: split, unscaled vs the plain run (wc); d1 / d2: --rho-solve / --rho-map vs --rho-scale */
+            for (size_t i = 0; i < n; i++) { if (!(w2[i] == w2[i]) || !(wc[i] == wc[i])) continue; nn++;
+                d0 = fmax(d0, fabs(wv[0][i] - wc[i])); d1 = fmax(d1, fabs(wv[1][i] - w2[i])); d2 = fmax(d2, fabs(wv[2][i] - w2[i])); }
+            printf("test_countfield: --pool-split vs plain %.2e, --rho-solve 0.75 vs --rho-scale 0.75 %.2e, --rho-map vs --rho-scale %.2e turn (%zu cells)\n", d0, d1, d2, nn);
+            CHECK(nn > n / 4 && d0 < 1e-3 && d1 < 1e-3 && d2 < 1e-3, "split / rho-solve / rho-map wc vs the pooled references: %.3e %.3e %.3e turn", d0, d1, d2);
+        }
+        for (int v = 0; v < 3; v++) free(wv[v]);
         free(w2);
     }
     {   /* same-sheet pairs (--fibers --cf-fib): the density under-counts a band (r 16..28 cells) in one sector (sp x 4: 0.75 of its 3 sheets),
