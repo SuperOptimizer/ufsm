@@ -3,7 +3,7 @@
 Ultra fast scroll model: a C23 + CUDA pipeline that trains a ~1 M-parameter 3-D convnet to predict the
 recto papyrus face in Vesuvius Challenge micro-CT, from scratch, using only the released ground truth:
 the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challenge-open-data` bucket.
-No teacher models, no distillation. All upstream data is re-exported once into the user's own codecs
+Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
 ## Ink teachers: MX-fp4 gambiarra / dino3d, fast prep, 2-D teacher labels (ink-teach) (2026-11-15, branch inkteach-20261115)
@@ -36,7 +36,26 @@ Gate (ink-vscore 3-D AUC, 24 held-out crops: 16 Paris 4 + 4 PHerc0139 + 4 PHerc1
 | gb stride 64 | 0.734 | 0.688 | 0.518 | -0.013 [-0.019, -0.008] (Paris 4 -0.021): rejected |
 | fast, level-1 input | 0.746 | 0.700 | 0.520 | Paris 4 -0.009: rejected (pooled level 0 kept) |
 | fast, level 0 (gbh_32) | 0.754 | 0.693 | 0.519 | -0.0000 [-0.0018, +0.0018] |
+| fast, level 0, MX5 (NVFP4-style) | 0.758 | 0.691 | 0.513 | +0.0019 [-0.0020, +0.0053]: passes; the fp4 default |
+| fast, level 0, MX6 | | | | -0.0051 [-0.0071, -0.0032]: the ue4m3 block scales are what make fp4 free |
+| fast, MX5, --tile 128 --stride 96 | 0.776 | 0.715 | 0.527 | +0.0205 [+0.0139, +0.0277]: more context helps every scroll |
+| fast, MX5, --tile 256 --stride 192 | 0.791 (11 of 16) | | | +0.026 [+0.013, +0.040] on 11 Paris 4 crops (stopped for the drain) |
 (gambiarra trained on Paris 4: its Paris 4 numbers are optimistic.)
+
+End to end over the 24 crop boxes (card 1 shared with the suites, so wall times are upper bounds; 77 % of the 64^3 crops are air and
+skipped, 65 % at tile 128): fp16 stride 32 1748 s (CT read 516 s, prep 86 s), MX5 stride 32 1775 s (CT read 1295 s: https-bound, the
+GPU is no longer the limit), MX5 tile 128 / stride 96 518 s (CT read 244 s, prep 64 s): 3.4x. Measured earlier on one 512^3 Paris 4 box:
+fp16 ~1.0 Mvox/s at stride 32 (7.9 at stride 64). A clean single-card Mvox/s table (CT local, no contention) is post-drain work.
+
+NVFP4 under mcc (fast math everywhere): test_xmx sf 5 failed on the k3 s1 shapes (max |d| 0.375, up to 2507 of 15360 outputs): x / d
+became x * (1 / d) and flipped round-half-even ties of the e2m1 / e4m3 rounding (d is not a power of two, unlike MX6). Fix: device
+`__fdiv_rn` for amax / 6 and v / d; host e2m1 by comparing |v| with the grid midpoints times d in double (exact products), amax / 6 in
+double. test_xmx passes on mcc 9f63cdd (all sf 6 and sf 5 shapes, max |d| <= 0.0134).
+
+Post-drain plan: (A) gambiarra default --fast 1 --tile 128..256 with MX5; finish the tile-256 / stride-64 runs; a clean Mvox/s table;
+dino3d through the same path; hecate96 (0.04 Mpx/s) through xnet fp4. (B) the 2-D teacher pass over Paris 4 / 1667 / the rest
+(~2 h of one card, CT-render bound), ink-teach per scroll, the A/B (u2ink smoke recipe, human vs human + teacher windows, 3-D AUC
+on the 24 crops = human labels only), then the 3-D teachers (gambiarra tile 128 MX5) as soft 3-D targets near the surfaces.
 
 **The 2-D teachers are far better labels.** ink-ext --native-only on the eval crop surfaces, ink-score vs the human labels:
 | teacher | Paris 4 | 0139 | 1667 |
@@ -59,6 +78,7 @@ human px, the gate keeps 81 % at accuracy 0.955; 280 M teacher px = 258 cm2 (6 %
 PHerc0139, reader3 + ink9um: per-teacher AUC 0.963 / 0.979, weights 0.49 / 0.51, ensemble AUC 0.980, Platt a 3.33 b -0.29;
 the gate keeps 88 % of the calibration px at accuracy 0.973 (ink recall 0.81); 287 M teacher px (6.0 % ink), 62 MB.
 2-D teacher inference: ~0.6 Mpx/s per teacher at 9.6 um (CT render over https bound), 2.5 Gpx over all labelled segments.
+
 ## mcc round: microc main 441a1a1 is ufsm's compiler; the encoder u8 tolerance 4 (2026-11-15, branch mccround-20261115)
 
 The user made mcc the only supported compiler. The clang + nvcc presets (llvm-release / llvm-verify) keep building for comparison.
