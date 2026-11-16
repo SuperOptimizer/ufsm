@@ -1,4 +1,5 @@
 #include "zarr3.h"
+#include "labcomp.h"
 #include "sysinfo.h"
 #include "json.h"
 #include <errno.h>
@@ -30,6 +31,8 @@ __attribute__((weak)) int lv_codec_parse(lv_codec *lc, const uint8_t *b, size_t 
 __attribute__((weak)) int lv_decode_voxels(const lv_codec *lc, const uint8_t *enc, size_t len, uint8_t *ct, int16_t *scratch);
 typedef struct z3 z3;
 __attribute__((weak)) int lv_box_voxels_gpu(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);   /* src/latvol_read.c (absent in binaries without it) */
+/* labcomp.c the same way (labcomp.h): a labcomp array fails to open in a binary built without it */
+__attribute__((weak)) int lbc_decode(const void *enc, size_t n, uint8_t *dst);
 
 static _Thread_local char errbuf[256];
 const char *z3_error(void) { return errbuf; }
@@ -75,6 +78,7 @@ static int parse_codecs(const json *codecs, z3_meta *m) {
         const char *name = json_str(json_get(c, "name"), "");
         if (!strcmp(name, "volcomp")) m->q = (float)json_num(json_path(c, "configuration.q"), 8.0);
         else if (!strcmp(name, "latvol")) m->latvol = 1;
+        else if (!strcmp(name, "labcomp")) { const char *k = json_str(json_path(c, "configuration.kind"), ""); m->lbc = !strcmp(k, "codes") ? LBC_KIND_CODES : 0; if (!m->lbc) return FAIL("labcomp: unknown kind \"%s\"", k); }
         else if (!strcmp(name, "zstd")) m->zstd = 1;
         else if (!strcmp(name, "bytes")) m->raw = 1;
         else if (!strcmp(name, "crc32c")) { if (i + 1 != codecs->n) return FAIL("crc32c must be the last inner codec"); m->crc = 1; }   /* (audit mini/volcomp 1: volcomp has no checksum of its own) */
@@ -83,6 +87,8 @@ static int parse_codecs(const json *codecs, z3_meta *m) {
     }
     if (m->q >= 0) m->raw = 0;
     if (m->latvol && (m->q >= 0 || m->zstd || m->raw)) return FAIL("latvol is the only inner codec of its chain");
+    if (m->lbc && (m->q >= 0 || m->zstd || m->latvol)) return FAIL("labcomp is the only coding codec of its chain");
+    if (m->lbc) m->raw = 0;
     return 0;
 }
 
@@ -175,9 +181,11 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
         }
         if (parse_codecs(json_path(c0, "configuration.codecs"), m)) goto bad;
     } else if (parse_codecs(codecs, m)) goto bad;
-    if (m->q >= 0 && (m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128)) {
-        FAIL("%s: volcomp needs 128^3 inner chunks", key); goto bad;
+    if ((m->q >= 0 || m->lbc) && (m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128)) {
+        FAIL("%s: volcomp / labcomp need 128^3 inner chunks", key); goto bad;
     }
+    if (m->lbc && m->esize != 1) { FAIL("%s: labcomp needs uint8", key); goto bad; }
+    if (m->lbc && !lbc_decode) { FAIL("%s: a labcomp array, and this binary is built without src/labcomp.c", key); goto bad; }
     if (m->latvol) {   /* the codec's side file: the transform, the step, the entropy tables */
         if (m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128 || m->esize != 1) { FAIL("%s: latvol needs uint8 128^3 inner chunks", key); goto bad; }
         if (!lv_codec_parse || !lv_codec_free || !lv_decode_voxels) { FAIL("%s: a latvol array, and this binary is built without src/latvol.c", key); goto bad; }
@@ -668,6 +676,10 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
         if (ZSTD_isError(r)) return FAIL("zstd: %s", ZSTD_getErrorName(r));
         enc = scratch;
         n = r;
+    }
+    if (m->lbc) {   /* label codecs (labcomp.h): whole chunks, exact streams */
+        if (lbc_decode(enc, n, dec)) return FAIL("labcomp: corrupt chunk in %s", z->key);
+        return 0;
     }
     if (m->latvol) {   /* latent cells: the rebuilt CT bytes (latvol.h; the cells themselves: z3_chunk_raw + the device decoder) */
         if (lv_decode_voxels(z->lv, enc, n, dec, nullptr)) return FAIL("latvol: corrupt chunk in %s", z->key);

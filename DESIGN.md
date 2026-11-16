@@ -6,6 +6,33 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Label compression: the labcomp codec for winding-code rasters (2026-11-15, branch labcomp-port-20261115, off wip-labcomp)
+
+Goal (user 11-15): the rendered training labels small enough to upload once and let pods download them instead of computing them.
+This lands the first codec and its plumbing; the upload itself is not part of it (no credentials, desk uplink 3 MB/s).
+
+- `src/labcomp.{c,h}`: one 128^3 uint8 chunk per stream ("LBC" + kind + version), a zarr v3 inner codec `labcomp` (inside
+  sharding_indexed, before crc32c), so a packed store is an ordinary sharded array. Kind 1 `codes` (winding-code rasters, exact): the
+  support (code != 0) as volcomp's lossless mask (mode 5), then every support voxel in raster order against its 13 causal
+  26-neighbours: "equals their majority code" (adaptive binary, context agreement x neighbour count), else "equals the second most
+  frequent", else the byte through an adaptive bit tree; LZMA-style integer range coder, 15-bit probabilities, deterministic. A sheet
+  carries one code over its patch, so the stream is essentially the sheet geometry.
+- Readers: zarr3.c parses the codec (`z3_meta.lbc`, uint8 128^3 only, the only coding codec of its chain) and decodes in
+  decode_into; band_onfly's tile_gpu (the on-the-fly pair-rule phase) decodes labcomp chunks on the host into its pack and uploads them
+  as raw chunks (no device decoder yet). Both reach lbc_decode through weak references (zarr3.c refuses a labcomp array in a binary
+  built without labcomp.c), so the test targets listing zarr3 / band_onfly link unchanged.
+- `ufsm labcomp-pack IN_ARRAY OUT_ARRAY [--threads N] [--verify 1]`: re-encodes a uint8 label array (stored chunks only, the chunk
+  map), every chunk decoded again and compared (--verify 0: off); OUT never overwritten; attributes kept plus a `labcomp` record.
+
+Numbers. Probe (labcomp agent, /vesuvius/ufsm/labcomp/probe/r2_codes.txt: 256^3 boxes of real 1667 / 175B / A48 codes rasters):
+6.5-24x smaller than volcomp lossless (380-1330x vs raw), one box 2.2x (A48_2: 1.4 % conflict voxels, eq-neighbour 0.83). Phase
+labels (r2_ph*.txt) would gain 1.3-1.7x lossless, ~1.6-3x lightly lossy: not implemented (kind 1 only). test_labcomp (mcc
+build-verify, CPU): synthetic sheets 0.23 bit per support voxel (157x vs raw), +0.5 % foreign codes 0.33 bit; random bytes 8.1 bit
+(0.99x); a 300 x 260 x 520 store packed 42x smaller than volcomp lossless, read back equal. Speed, one desk thread: encode 73-98,
+decode 85-93 Mvox/s per sheets chunk; z3_read of the whole store 55-57 Mvox/s vs 383-391 for volcomp lossless, so labcomp is a
+transport / archive format: a store a trainer reads hot should stay volcomp (or be unpacked after download). test_phase_onfly: the wind
+fixture's codes repacked give the same phase as phase-raster on the CPU and the GPU path.
+
 ## Muon update scaling (--muon-scale rms) and cautious weight decay (--muon-cwd 1) (2026-11-15, branches muonscale-20261115, cwd-20261115)
 
 Two opt-in Muon options, both off by default. They are implemented and tested; the quality A/B is deferred by the 11-15 drain order (plan
