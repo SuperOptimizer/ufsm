@@ -1048,6 +1048,98 @@ template <int SF> static void xq_launch(int mode, const __half *x, uint8_t *q, u
     default: k_xq<SF, 0><<<nblk(nb16, 256), 256, 0, g_st>>>(x, q, s, nb16); break;
     }
 }
+/* ---- the Reader depth fusion's 16 -> 16 channel 3x3x3 conv (stride 1, pad 1), fp16: halo-tiled direct conv. The implicit GEMM gathered
+   27 x 2 16-byte rows per output voxel from global (A-load bound: 9.8 ms per 4 reader3 tiles); here a block stages its (TZ + 2) (TY + 2)
+   (TX + 2) input halo and the 27 x 16 x 16 weights once in shared memory and runs 27 taps of m16n8k16 per 16 output voxels. Rows of 32 B
+   with the two 16-byte halves swapped on bit 2 of the row: 8 consecutive rows hit 8 distinct bank groups (conflict-free ldmatrix). ---- */
+template <int TZ, int TY, int TX, int NW> __global__ void __launch_bounds__(NW * 32) k_dfc16(const __half *x, const __half *w, int Kp, const float *scale, const float *bias,
+                                                                               __half *y, int D, int H, int W) {
+    extern __shared__ uint4 sm4[];
+    constexpr int HY = TY + 2, HX = TX + 2, HV = (TZ + 2) * HY * HX, MT = TZ * TY * TX / 16, MW = MT / NW, NT = NW * 32;
+    uint4 *sx = sm4, *sw = sm4 + HV * 2;
+    const int ntx = (W + TX - 1) / TX, nty = (H + TY - 1) / TY, ntz = (D + TZ - 1) / TZ;
+    long long bi = blockIdx.x; const int bx = (int)(bi % ntx); bi /= ntx; const int by = (int)(bi % nty); bi /= nty; const int bz = (int)(bi % ntz); const long long n = bi / ntz;
+    const int z0 = bz * TZ, y0 = by * TY, x0 = bx * TX, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    for (int i = tid; i < 27 * 16 * 2; i += NT) {
+        const int t = i >> 5, co = (i >> 1) & 15, h = i & 1;
+        sw[(t * 16 + co) * 2 + (h ^ ((co >> 2) & 1))] = *(const uint4 *)(w + (size_t)co * Kp + t * 16 + h * 8);
+    }
+    for (int i = tid; i < HV * 2; i += NT) {
+        const int v = i >> 1, h = i & 1, hz = v / (HY * HX), r = v - hz * HY * HX, hy = r / HX, hx = r - hy * HX;
+        const int gz = z0 - 1 + hz, gy = y0 - 1 + hy, gx = x0 - 1 + hx;
+        uint4 val = make_uint4(0u, 0u, 0u, 0u);
+        if (gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W) val = *(const uint4 *)(x + ((((size_t)n * D + gz) * H + gy) * (size_t)W + gx) * 16 + h * 8);
+        sx[v * 2 + (h ^ ((v >> 2) & 1))] = val;
+    }
+    __syncthreads();
+    float acc[MW][2][4];
+#pragma unroll
+    for (int i = 0; i < MW; i++)
+#pragma unroll
+        for (int j = 0; j < 2; j++)
+#pragma unroll
+            for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
+    int vb[MW];   /* halo row of each m-tile's first voxel (tap 0, 0, 0) */
+#pragma unroll
+    for (int i = 0; i < MW; i++) {
+        const int mt = warp * MW + i, oz = mt / (TY * TX / 16), rm = mt - oz * (TY * TX / 16), oy = rm / (TX / 16), ox = (rm - oy * (TX / 16)) * 16;
+        vb[i] = (oz * HY + oy) * HX + ox + (lane & 15);
+    }
+    const int brow = (lane & 7) + ((lane >> 4) << 3), bh = (lane >> 3) & 1, ah = lane >> 4;
+#pragma unroll 1
+    for (int t = 0; t < 27; t++) {
+        const int a = t / 9, b = (t / 3) % 3, c = t % 3, off = (a * HY + b) * HX + c;
+        unsigned r[4]; xldsm_x4(r, sw + (t * 16 + brow) * 2 + (bh ^ ((brow >> 2) & 1)));
+        const unsigned b0[2] = {r[0], r[1]}, b1[2] = {r[2], r[3]};
+#pragma unroll
+        for (int i = 0; i < MW; i++) {
+            const int v = vb[i] + off; unsigned af[4]; xldsm_x4(af, sx + v * 2 + (ah ^ ((v >> 2) & 1)));
+            mma16816(acc[i][0], af, b0); mma16816(acc[i][1], af, b1);
+        }
+    }
+    const int g = lane >> 2, t4 = lane & 3;
+#pragma unroll
+    for (int i = 0; i < MW; i++) {
+        const int mt = warp * MW + i, oz = mt / (TY * TX / 16), rm = mt - oz * (TY * TX / 16), oy = rm / (TX / 16), ox = (rm - oy * (TX / 16)) * 16;
+        const int gz = z0 + oz, gy = y0 + oy; if (gz >= D || gy >= H) continue;
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const int gx = x0 + ox + g + 8 * h; if (gx >= W) continue;
+            __half *o = y + ((((size_t)n * D + gz) * H + gy) * (size_t)W + gx) * 16;
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const int co = j * 8 + 2 * t4;
+                *(__half2 *)(o + co) = __floats2half2_rn(acc[i][j][2 * h] * scale[co] + bias[co], acc[i][j][2 * h + 1] * scale[co + 1] + bias[co + 1]);
+            }
+        }
+    }
+}
+template <int TZ, int TY, int TX, int NW> static bool dfc16_go(const xconv *c, xt in, xt y) {
+    constexpr size_t sm = ((size_t)(TZ + 2) * (TY + 2) * (TX + 2) * 2 + 27 * 16 * 2) * 16;
+    static unsigned attr = 0u;   /* mgpu: per-device (as launch1) */
+    int dv = 0; cudaGetDevice(&dv);
+    if (!(__atomic_load_n(&attr, __ATOMIC_ACQUIRE) >> (dv & 31) & 1u)) { cudaFuncSetAttribute(k_dfc16<TZ, TY, TX, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); __atomic_fetch_or(&attr, 1u << (dv & 31), __ATOMIC_RELEASE); }
+    const long long nb = (long long)in.n * ((in.d + TZ - 1) / TZ) * ((in.h + TY - 1) / TY) * ((in.w + TX - 1) / TX);
+    k_dfc16<TZ, TY, TX, NW><<<(unsigned)nb, NW * 32, sm, g_st>>>((const __half *)in.p, (const __half *)c->w, c->Kp, c->scale, c->bias, (__half *)y.p, in.d, in.h, in.w);
+    return true;
+}
+static int g_df16 = -1;   /* UFSM_XNET_DF16=0: the depth-fusion conv on the implicit GEMM (A/B); mgpu: env */
+extern "C" void xnet_set_df16(int v) { g_df16 = v; }
+static bool dfc16_try(const xconv *c, xt in, xt y, const xt *res, int act, double *st) {
+    if (g_df16 < 0) g_df16 = getenv("UFSM_XNET_DF16") ? atoi(getenv("UFSM_XNET_DF16")) : 1;
+    if (!g_df16 || c->mxq || c->unfold || c->tconv || c->ci != 16 || c->co != 16 || in.c != 16 || c->kd != 3 || c->kh != 3 || c->kw != 3) return false;
+    if (c->sd != 1 || c->sh != 1 || c->sw != 1 || c->pd != 1 || c->ph != 1 || c->pw != 1 || res || act != XA_NONE || st) return false;
+    switch (g_df16) {
+    case 2: return dfc16_go<2, 4, 32, 4>(c, in, y);
+    case 4: return dfc16_go<1, 8, 32, 4>(c, in, y);
+    case 5: return dfc16_go<2, 4, 32, 2>(c, in, y);
+    case 6: return dfc16_go<1, 4, 32, 4>(c, in, y);
+    case 7: return dfc16_go<1, 8, 32, 8>(c, in, y);
+    case 8: return dfc16_go<1, 16, 32, 8>(c, in, y);
+    case 9: return dfc16_go<2, 8, 32, 4>(c, in, y);
+    default: return dfc16_go<2, 8, 32, 8>(c, in, y);   /* 1: 8 warps of 4 m-tiles (consistently 1.5-1.7x the implicit GEMM in contended runs) */
+    }
+}
 static int g_cfg = -1, g_c16 = -1;   /* mgpu: env */
 static void conv_launch(const ConvP &p, int co) {
     if (g_cfg < 0) g_cfg = getenv("UFSM_XNET_CFG") ? atoi(getenv("UFSM_XNET_CFG")) : 0;
@@ -1130,7 +1222,7 @@ static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *ln
         return y;
     }
     if (g_verbose) fprintf(stderr, "xnet conv %dx%dx%d s%d%d%d ci %d co %d: in %dx%dx%dx%d out %dx%dx%d M %lld\n", c->kd, c->kh, c->kw, c->sd, c->sh, c->sw, c->ci, c->co, in.n, in.d, in.h, in.w, Do, Ho, Wo, p.M);
-    if (p.M > 0) conv_launch(p, c->co);
+    if (p.M > 0 && !dfc16_try(c, in, y, res, act, st)) conv_launch(p, c->co);
     if (st && !p.st && p.M > 0) xstats(y, st);
     if (c->unfold || fq.p) xt_free(&in);
     return y;

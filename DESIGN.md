@@ -6,6 +6,80 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## 2-D ink teachers in MX-fp4: quantiser options, deterministic GroupNorm, accuracy floor (2026-11-16, branch fp4teach-20261116)
+
+Goal: reader3 / ink9um (ink-ext, Reader V3 architecture on xnet) in MX-fp4 at fp16 accuracy. Gate as set: on the 24 held-out eval crops
+(16 Paris 4, 4 PHerc0139, 4 PHerc1667; mean per-crop AUC vs the human labels, paired vs fp16), within 0.001 overall and no scroll worse
+than 0.003. Tools in /vesuvius/ufsm/inkteach/fp4t: v.sh (tvar.sh on a binary, CROPS= for /vesuvius/ufsm/inkgt/evcrops-ho: 10 more
+crops on PHerc0500P2 / 0841), pair.sh (paired per scroll), pairci.py (paired, bootstrap 95 % CI), lerr.py (logit rms and 1 - corr vs
+the reference over all maps), bench.sh / benchpair.sh (one full PHerc1667 segment).
+
+**MX runs were not reproducible.** Two identical MX5 runs of ink9um differed by 0.004 on 1667 and 0.001 overall (logit 1 - corr 0.006
+between them). The cause was xgn: its GroupNorm statistics summed through float atomics (shared, then global), so the per-channel sums
+depended on the schedule. That is harmless in fp16 (rms logit 0.003 run to run), but every changed fp16 bit near an e2m1 rounding
+boundary moves a whole quantisation step. Fix: `k_gnpart` / `k_gnfin`, a one-pass sum and sum of squares of x - sh_c per (chunk,
+sample), with sh_c the sample's first voxel so there is no cancellation. Each thread has a fixed channel pair and row stride, rows
+combine in a fixed order, the chunks go to a buffer and are summed in order in double. MX runs now repeat byte for byte, and fp16 maps
+move rms 0.003 (AUC unchanged). The stats also got faster: 18.6 -> 3.7 ms per reader3 batch (old: 2 x 64 launches of a few blocks each,
+float smem atomics). Test: test_xmx gn (host double reference, mean >> std, 320 / 640 channels, run-to-run equality).
+
+**Quantiser options** (all off by default, so gambiarra / dino3d are unchanged; env at net load, setters for tests):
+- `UFSM_XNET_MXQ=1|2`: weight block scales of least squared error. Per 16-K block, the e4m3 codes -4 .. +2 around amax / 6 (MX6: 2^e
+  or 2^(e - 1)). 2 also searches the per-row scale gs = amax_row / 2688 x 2^(j / 8), j 0..7, which aligns the blocks' e4m3 grid.
+  Rel weight error 0.095 -> 0.0856 (reader3, every conv alike). Rows are packed on 16 threads (MXQ 2 load 25.8 -> 3.5 s).
+- `UFSM_XNET_MXA=1`: the same least-squares search for the activation block scales in k_xq (7 candidates x 16 values per block,
+  hidden in the memory-bound pass).
+- `UFSM_XNET_MXROT=1`: each 16-block of the weights (at pack) and of the inputs (in k_xq) rotated by H16 / 4. This is exact in real
+  arithmetic: the block dot products are invariant under the orthonormal transform. It applies to convs fed by k_xq only (the fused
+  gambiarra producers quantise unrotated: a rotated conv refuses a q-only input).
+- `UFSM_XNET_MX_SKIP=2-4,...`: convs (initialisation index within a net, `xnet_wseq_reset` per ie_load) kept fp16.
+- FQ probes: `UFSM_XNET_FQ` activation code 7 (least-squares scale) and code 9 (H16) for both operands.
+test_xmx covers MXQ 1 / 2, rot, lsa (sf 5 and 6, generic and halo kernels) against host references written from the definitions.
+Fast-math detail: the host reference and the pack must agree on every choice, so gs and amax / 6 / gs are computed in double, 2^(j / 8)
+comes from a table, and a later candidate replaces an earlier one only when it is 1e-9 better (weights) or 1e-5 better (activations,
+float on the device).
+
+**Where the error comes from** (ink9um, logit 1 - corr vs fp16 on PHerc1667, the most sensitive scroll):
+
+| variant | 1667 1 - corr | AUC 24 crops: all / 0139 / 1667 / Paris 4 |
+|---|---|---|
+| MX-fp8 acts + weights (FQ 8,8) | 0.0025 | -0.0004 / +0.0000 / -0.0042 / +0.0004 |
+| fp4 weights only (FQ 0,5) | 0.0095 | -0.0020 / -0.0007 / -0.0061 / -0.0012 |
+| fp4 weights only, H16 (FQ 0,9) | 0.0075 | -0.0004 / -0.0016 / -0.0024 / +0.0004 |
+| fp4 acts only (FQ 5,0) | 0.0178 | -0.0019 / -0.0009 / -0.0103 / +0.0000 |
+| fp4 acts only, LS scale (FQ 7,0) | 0.0114 | -0.0015 / -0.0030 / -0.0037 / -0.0005 |
+| fp4 acts only, H16 (FQ 9,0) | 0.0129 | -0.0008 / -0.0011 / -0.0064 / +0.0007 |
+| fp8 acts, fp4 weights H16 (FQ 8,9) | 0.0084 | -0.0007 / -0.0015 / -0.0047 / +0.0004 |
+| MX5 (real path) | 0.0228 | -0.0034 / -0.0012 / -0.0119 / -0.0017 |
+| MX5 MXQ 2 | 0.0177 | -0.0038 / -0.0030 / -0.0131 / -0.0017 |
+| MXQ 2 + MXA | 0.0172 | -0.0023 / -0.0012 / -0.0086 / -0.0010 |
+| MXQ 2 + MXA + ROT | 0.0192 | -0.0021 / -0.0018 / -0.0043 / -0.0016 |
+| MXQ 2 + MXA + ROT, convs 2-4 fp16 | 0.0149 | **-0.0005 / +0.0003 / -0.0003 / -0.0008** |
+| MXQ 2 + MXA + ROT, convs 2-4, 12-20 fp16 | 0.0093 | -0.0018 / -0.0001 / -0.0039 / -0.0017 |
+
+Stage sweep (MXQ 2, one group fp16 at a time; 1667 1 - corr from 0.0177): stem + stage 0 (convs 2-4) -0.0031, stage 1 (5-11) noise,
+stage 2 (12-20) -0.0035, stage 3 (21-33) -0.0023, stages 4 / 5 and both decoder halves 0. The error lives in the high-resolution encoder.
+Even fp8 everywhere misses the per-scroll gate on 1667 (-0.0042). Those 4 crops move ~0.004 under any perturbation, and AUC tracks
+the logit error only loosely: MXQ 2 cuts it 22 % and still loses AUC.
+
+**The gate does not hold beyond the 24 crops.** Paired AUC vs fp16 over all 34 crops (24 + the 10 held-out 0500P2 / 0841),
+bootstrap 95 % CI:
+
+| teacher | fp8 (FQ 8,8) | MX5 | MXQ2 + MXA | + convs 2-4 fp16 | + ROT, convs 2-4 fp16 |
+|---|---|---|---|---|---|
+| ink9um | +0.0012 [-0.0006, +0.0037] | -0.0048 [-0.0093, -0.0008] | | | -0.0021 [-0.0053, +0.0011] |
+| reader3 | +0.0003 [-0.0001, +0.0007] | -0.0015 [-0.0028, -0.0002] | -0.0018 [-0.0035, -0.0001] | -0.0012 [-0.0024, -0.0001] | -0.0020 [-0.0033, -0.0007] |
+
+Per-scroll AUC on the 24 crops (fp16 / MX5 / pick): ink9um all 0.9175 / 0.9141 / 0.9170, 0139 0.9818 / 0.9805 / 0.9821, 1667
+0.9153 / 0.9034 / 0.9150, Paris 4 0.9019 / 0.9002 / 0.9012. reader3 all 0.9271 / 0.9261 / 0.9265, 0139 0.9664 / 0.9646 / 0.9667, 1667
+0.9290 / 0.9280 / 0.9268, Paris 4 0.9168 / 0.9160 / 0.9163. Held-out (0500P2 / 0841): ink9um fp16 0.8045 / 0.7978, MX5 0.7861 / 0.7963,
+pick 0.7964 / 0.7935; reader3 fp16 0.8872 / 0.8734, MX5 0.8848 / 0.8707, pick 0.8822 / 0.8726. The picks' logit error on the
+held-out crops: ink9um 1 - corr 0.058 / 0.036 (MX5) -> 0.041 / 0.017; reader3 0.0064 / 0.0095 -> 0.0034 / 0.0030 (fp8: 0.0007).
+Picks: ink9um `UFSM_XNET_MX=5 UFSM_XNET_MXQ=2 UFSM_XNET_MXA=1 UFSM_XNET_MXROT=1 UFSM_XNET_MX_SKIP=2-4`, reader3 the same without
+MXROT (its rotated variant had the higher held-out AUC loss).
+
+SPEED_PLACEHOLDER
+
 ## The audit's post-pass GPU measurements: FBLEND on, the rest recorded (2026-11-16, master)
 
 try8 paused 06:30-08:04 for the GPU items the audit queued after the mega pass (outputs /vesuvius/ufsm/audit-20261114/postpass, rows in

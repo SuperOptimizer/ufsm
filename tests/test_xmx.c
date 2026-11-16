@@ -189,6 +189,16 @@ static void bench(void) {
 int main(void) {
     if (xnet_init(0)) { printf("SKIP: no GPU\n"); return 0; }
     if (getenv("XMX_BENCH")) { bench(); return 0; }
+    if (getenv("XMX_DFBENCH")) {   /* the Reader depth-fusion conv, 4 x 17 x 384^2 x 16: implicit GEMM (0) vs the halo-kernel variants; min of 10 */
+        xnet_set_mx(0); float *w = calloc(16 * 16 * 27, 4); for (int j = 0; j < 16 * 16 * 27; j++) w[j] = rnd() * 0.05f;
+        xconv c; xconv_init(&c, w, 16, 16, 3, 3, 3, 1, 1, 1, 1, 1, 1, nullptr, nullptr); xt x = xt_new(4, 17, 384, 384, 16);
+        for (int v = 0; v <= 8; v++) {
+            xnet_set_df16(v); double best = 1e9;
+            for (int r = 0; r < 10; r++) { xnet_sync(); const double t0 = now(); xt y = xconv_fwd(&c, x, nullptr, XA_NONE); xnet_sync(); const double t = now() - t0; xt_free(&y); if (t < best) best = t; }
+            printf("dfbench variant %d: %.3f ms\n", v, best * 1e3);
+        }
+        return 0;
+    }
     int fails = 0;
     for (int sf = 6; sf >= 5; sf--) {
         fails += run(sf, 2, 9, 7, 11, 32, 32, 3, 1, 0);
@@ -206,7 +216,8 @@ int main(void) {
             fails += run(sf, 1, 7, 9, 36, 128, 64, 3, 1, mode);
         }
     }
-    fails += run(0, 2, 7, 33, 29, 16, 16, 3, 1, 0);   /* fp16 igemm, 16 outputs (BN 16 tile; the Reader depth fusion) */
+    fails += run(0, 2, 7, 33, 29, 16, 16, 3, 1, 0);   /* fp16 16 -> 16 3x3x3: the halo kernel k_dfc16 (UFSM_XNET_DF16=0: the BN 16 igemm tile) */
+    fails += run(0, 1, 17, 20, 64, 16, 16, 3, 1, 0);  /* the Reader depth-fusion shape (17 layers), ragged z / y tiles */
     fails += run(0, 1, 5, 20, 24, 32, 32, 3, 1, 0);
     g_rot = 1;   /* H16-rotated blocks (UFSM_XNET_MXROT) */
     for (int sf = 6; sf >= 5; sf--) { fails += run(sf, 2, 9, 7, 11, 32, 32, 3, 1, 2); fails += run(sf, 1, 7, 9, 36, 128, 64, 3, 1, 0); fails += run(sf, 1, 6, 5, 7, 128, 256, 1, 1, 2); }
