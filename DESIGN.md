@@ -15,6 +15,38 @@ so all chunks of a band that differ in z alone probed one chain. A full 64-bit m
 1); old vs fixed differ by the same (3.42 M px, max 2). test_ink_ext_tiling runs again (its weights linked under ~/ufsm-data/inkext;
 the PyTorch parity tests need upstream villa / hecate sources, not run here). Fast tier: 330 PASS, 1 SKIP, 2 NEED2 (card 0 in training).
 
+## mcc 7add328: host code, where the 1.3-1.4x against clang comes from; the slot-argument inline bonus (2026-11-16, branch mcc-host-20261116)
+
+Priority 2 of the mcc round (host speed). Method: every fast-tier CPU line of tests/suite.txt without a gpu / slow / flaky tag and not
+python (118 lines), one CPU each (UFSM_NCPU=1), perf stat cycles:u + instructions:u, 8 lines at a time. The desk is shared (load 15-25
+from the other agents), so whole-run cycle totals drift by up to 10 % between runs; instruction counts do not. A/B now runs both builds
+of a line back to back on one worker, min of 3 (A/A: total +0.49 %, geomean 1.005).
+
+| 118 CPU lines, same commit, same window | G cycles | G instructions |
+|---|---|---|
+| clang + nvcc (llvm-verify, -march=native: AVX-512) | 925 | 2654 |
+| clang, -mno-avx512f | 955 | 2768 |
+| mcc 9aea0ba | 1245 | 3809 |
+
+So mcc runs 1.38x clang's instructions at about the same IPC, and AVX-512 is worth ~3 % to clang: the gap is code quality (registers,
+memory traffic, vectoriser coverage), not the vector width. GPU tests carry the same host gap (fast tier user CPU 1.52x).
+
+What was tried:
+- **Inline limit** (-finline-limit 12 default; 24 / 48 / 100): 100 is -2.3 % instructions, cycles within noise. More inlining alone is
+  not the lever.
+- **Spill choice** (ra.c spills the active interval with the least weight per length; weight alone, or per sqrt length): +2 % / +0 %
+  instructions, +3 % cycles. Dropped.
+- **Calls that pass a local's address** (microc 7add328, -finline-slotarg=160): one such call left in a function (volcomp's
+  vf_rdec_init(&rd, ...) before the token loop) keeps the whole record in memory, so slot_carve / opt_split cannot put its fields in
+  registers and every field access in the loop is a load or a store. Host call sites with an OP_SLOT argument now inline up to 160
+  instructions (clang's SROA bonus); device code unchanged (all 169 units' PTX byte-identical). Paired A/B: cycles -1.02 %, geomean
+  -1.9 %, instructions -0.35 %; test_flatten -26 %, test_idle_release -13 %, test_sampbias -12 %, test_crush -10 %; vf_decode_sub
+  -10 %. Release .text 10.16 -> 11.04 MB, build time unchanged. Fast tier (card 1): 330 PASS, 1 SKIP, 2 NEED2. microc gate green.
+
+Next (measured, not done): the register allocator spills whole intervals; its loop split (x64.c split_loops) only covers values a loop
+reads and does not write, so loop-carried scalars (counters, accumulators, bit-reader state) cost a load, the op and a store per
+iteration (vf_decode_sub's nnz_ac / hmask). Splitting written values at loops is the next step.
+
 ## mcc 9aea0ba: PTX packed as MPY (~10x), verify builds keep it in sidecar files; GPU tests are not slower (2026-11-16, branch mcc-sass-20261116)
 
 Priority 1 of the mcc round (GPU test time, binary / build size). All numbers desk, same commit (master 9a9d46a4 + this branch),
