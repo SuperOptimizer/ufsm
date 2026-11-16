@@ -42,9 +42,9 @@ level 0 and the model / output passes fell back to the CPU; 36-79 s on a free ca
   CTCACHE=DIR elsewhere; the default dir is deleted at the end unless KEEPCT=1), so the second grid, wrap-check, unroll-qa,
   surf-stats, wrap-snap, render and faces read the CT locally after its first fetch. Grid-0 predict on a 32-window box: no cache
   34.4 s (reader 27.3 s of z3_read), cold cache 23.0 s (reader 15.3 s, prefetch 16 threads), warm 19.7 s (reader 4.9 s, GPU-bound
-  at 0.52 s a window). Outputs byte-identical. Open question: a local CT root reads as slowly as https without a cache (`ufsm mirror`
-  of 0332 level 2, 5.8 GB in 51 s; predict reader 25.8 s against the cache's 4.9 s for the same windows; 0.08 vs 0.83 s for window
-  0, same decoder and syscall mix in strace). Pods with CTROOT on local disk read at the slow rate; not explained yet.
+  at 0.52 s a window). Outputs byte-identical. A local CT root reads at the warm-cache rate
+  (`ufsm mirror` of 0332 level 2, 5.8 GB in 51 s; predict reader 4.3 s for the 32 windows), so pods with CTROOT need no cache. (An
+  earlier "local is as slow as https" reading was a test script that still pointed at https.)
 - **field-blend.** sin / cos of the winding-mod-4 codes come from 256-entry tables (the same doubles), and the tile weight of each
   cell is stepped through x / y / z instead of a div / mod per cell. 512^3 cells: 73.4 -> 49.5 CPU s (7.2 -> 5.3 s at 16 threads),
   byte-identical to the 11-11 master binary. What is left: combine 29 %, atan2 / hypot ~9 %, the volcomp encode of the output 22 %.
