@@ -502,7 +502,7 @@ template <int MT, int TZ, typename T, typename TO> void launch_f4(dim3 grid, con
     /* UFSM_F4_WDB=1 (opt-in): two weight-stage buffers, the next stage's cp.async issued before this stage's MMA, when two blocks per
        SM still fit (5060 Ti / PRO 4000: 100 KB per SM; the fused-upsample instances keep one). Bit-identical outputs; measured no faster
        (bench_f4wide, 11-15: 0.98-1.01x on the try6 trunk shapes), so off by default (DESIGN 2026-11-15) */
-    static int smpm[8];
+    static int smpm[8];   /* mgpu: per-device (indexed by the current device: one host thread per device) */
     if (g_f4_wdb < 0) g_f4_wdb = getenv("UFSM_F4_WDB") ? atoi(getenv("UFSM_F4_WDB")) : 0;
     if (!smpm[cur_dev_()]) { int v = 0; cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerMultiprocessor, cur_dev_()); smpm[cur_dev_()] = v ? v : 1; }
     const size_t wst = (size_t)7 * MT * 16 * 2 * xb, was1 = 7 * MT * 16 * 2;
