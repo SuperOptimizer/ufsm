@@ -13,6 +13,7 @@ set -u
 CK=$(readlink -f "${1:?ckpt}"); T=${2:?tag}; H=$(cd "$(dirname "$0")/../.." && pwd); U=${U:-$H/build/ufsm}
 R=${CTROOT:-https://dl.ash2txt.org/community-uploads/forrest/volcomp}; K=${KEY:-PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr}
 B=${BOX:-4096,512,1024,1024,2048,2048}; E=${E:-/vesuvius/ufsm/wbench/univ}; O=$E/seamab-$T; mkdir -p "$O"
+GN=(); head -c 200000 "$CK" | head -1 | grep -aq '"gn_ema":1' && GN=(--gn-live 1)   # (gn_ema nets train on window statistics, as e2e.sh gnflag)
 AXA=(--no-axis 1); [ -n "${AXIS:-}" ] && AXA=(--axis "$AXIS")
 arm() { case $1 in A) echo "640 64";; B) echo "768 128";; C) echo "896 192";; D|E) echo "1152 64";; esac; }
 for a in ${ARMS:-A B C D E}; do
@@ -20,7 +21,7 @@ for a in ${ARMS:-A B C D E}; do
   [ -e "$O/$a/rv/zarr.json" ] && continue
   echo "$(date) arm $a: window $w halo $h ${X[*]}"
   $U predict "$CK" "$R" "$K" "$O/$a" --um 2.399 --level 2 --box $B --heads rv,ink,c0 --window $w --halo $h --shard 512 --q 0 --levels 1 \
-     --gpu ${GPU:-0} --threads 8 --cache ${WB:-/vesuvius/ufsm/wbench}/cache "${AXA[@]}" "${X[@]}" > "$O/$a.log" 2>&1 || echo "seam_ab: arm $a failed ($O/$a.log)"
+     --gpu ${GPU:-0} --threads 8 --cache ${WB:-/vesuvius/ufsm/wbench}/cache "${AXA[@]}" "${GN[@]}" "${X[@]}" > "$O/$a.log" 2>&1 || echo "seam_ab: arm $a failed ($O/$a.log)"
 done
 { echo "seam_ab $T: box $B (level 2), shard 512"
   for a in ${ARMS:-A B C D E}; do set -- $(arm $a); st=$(($1 - 2 * $2)); [ -e "$O/$a/rv/zarr.json" ] || { echo "arm $a: missing"; continue; }

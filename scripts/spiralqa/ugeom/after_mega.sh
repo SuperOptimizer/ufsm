@@ -13,6 +13,8 @@ STEP=${1:?filled|wide|packed|demod}; H=$(cd "$(dirname "$0")" && pwd); REPO=$(cd
 U=${U:-/vesuvius/ufsm/unroll/bin/ufsm}; R1667=/vesuvius/ufsm/unroll/PHerc1667-u1; OUT=${OUT:-/vesuvius/ufsm/audit-20261114/ugeom/after}
 BX=$R1667/score/boxes.tsv; GT="/vesuvius/ufsm/gt/PHerc1667-wind-20261016/codes 4.798"
 mkdir -p "$OUT"
+# (the spiral hand from spiral_dir.tsv: count-field refuses an evidence-free direction since 11-15, spiral-hand fix)
+sdir() { awk -F'\t' -v s="$1" '$1 == s && $2 ~ /^[+-]?1$/ { print $2 + 0; exit }' "$REPO/scripts/unroll/spiral_dir.tsv"; }
 case $STEP in
 filled)
   : "${CTROOT:?the filled store root}" "${CTKEY:?the filled store key}"
@@ -21,7 +23,7 @@ filled)
 wide)
   for v in "base|" "wd5|--wide-dens 0.5" "wd9|--wide-dens 0.9" "pw2|--phase-w 2"; do
     n=${v%%|*} x=${v#*|}; d=$OUT/ref-$n
-    [ -e $d/model.json ] || nice -n 10 $U count-field $R1667/fields/lat $OUT/cf.unused --R 0 --pool 8 --phase-w 0.5 --wide 100,140 --wide-phase 15 \
+    [ -e $d/model.json ] || nice -n 10 $U count-field $R1667/fields/lat $OUT/cf.unused --dir $(sdir PHerc1667) --R 0 --pool 8 --phase-w 0.5 --wide 100,140 --wide-phase 15 \
       --model-only 1 --model-stride 4 $x --iters 1200 --model $d --threads 20 --mem-gb 24 > $OUT/ref-$n.log 2>&1
     bash "$H/gtboxes.sh" $R1667/fields/lat $d $BX $GT $OUT/gt-ref-$n $U | tee -a $OUT/wide.txt
   done ;;
@@ -30,7 +32,7 @@ packed)
   awk -F'\t' '$2 == "paris4"' /vesuvius/ufsm/wbench/boxes.tsv > $OUT/p4boxes.tsv; grep -v '^#' /vesuvius/ufsm/wbench/cand-p4j.tsv > $OUT/p4j.tsv
   for v in "base|" "rp2|--rho-pow 0.2,150" "rp4|--rho-pow 0.4,150" "rs12|--rho-scale 1.2" "pw4|--phase-w 4"; do
     n=${v%%|*} x=${v#*|}; d=$OUT/p4ref-$n
-    [ -e $d/model.json ] || nice -n 10 $U count-field $PF $OUT/cf.unused --R 0 --pool 8 --phase-w 0.5 --wide 100,140 --wide-phase 15 \
+    [ -e $d/model.json ] || nice -n 10 $U count-field $PF $OUT/cf.unused --dir $(sdir PHercParis4) --R 0 --pool 8 --phase-w 0.5 --wide 100,140 --wide-phase 15 \
       --model-only 1 --model-stride 4 $x --iters 1200 --model $d --threads 20 --mem-gb 24 > $OUT/p4ref-$n.log 2>&1
     bash "$H/gtboxes.sh" $PF $d $OUT/p4boxes.tsv /vesuvius/ufsm/gt/paris4-q9p6/q-9p6.zarr 9.6 $OUT/gt-p4-$n $U | sed "s/^/$n PH: /" | tee -a $OUT/packed.txt
     bash "$H/gtboxes.sh" $PF $d $OUT/p4j.tsv /vesuvius/ufsm/univ/b1/gt/paris4/codesB48 4.8 $OUT/gtj-p4-$n $U | sed "s/^/$n J: /" | tee -a $OUT/packed.txt
