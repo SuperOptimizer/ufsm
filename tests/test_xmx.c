@@ -21,13 +21,19 @@ static float e4m3(float v) {
     int ex; frexpf(a, &ex); ex -= 1; if (ex < -6) ex = -6;
     const float ulp = ldexpf(1.f, ex - 3); return nearbyintf(a / ulp) * ulp;
 }
+static float e2m1_div(float v, float d) {   /* e2m1(v / d) without dividing: exact under fast math (x / d -> x * (1 / d) flipped ties under mcc) */
+    static const double M[7] = {.25, .75, 1.25, 1.75, 2.5, 3.5, 5.}; static const float G[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    const double a = fabs((double)v); int b = 0;
+    for (int i = 0; i < 7; i++) { const double t = M[i] * (double)d; if (a > t) { b = i + 1; continue; } if (a == t) b = (i & 1) ? i + 1 : i; break; }
+    return copysignf(G[b], v);
+}
 static void q16(float *v, int sf, float gs) {   /* one block of 16 in place */
     float am = 0.f; for (int i = 0; i < 16; i++) am = fmaxf(am, fabsf(v[i]));
     if (am == 0.f) return;
     float d;
     if (sf == 6) { int e; frexpf(am / 6.f, &e); if (ldexpf(1.f, e - 1) >= am / 6.f) e--; d = ldexpf(1.f, e); }
-    else d = e4m3(am / 6.f / gs) * gs;
-    for (int i = 0; i < 16; i++) v[i] = d > 0.f ? e2m1(v[i] / d) * d : 0.f;
+    else d = e4m3(gs == 1.f ? (float)((double)am / 6.0) : am / 6.f / gs) * gs;
+    for (int i = 0; i < 16; i++) v[i] = d > 0.f ? (sf == 6 ? e2m1(v[i] / d) : e2m1_div(v[i], d)) * d : 0.f;
 }
 static float h2f(uint16_t h) {   /* fp16 bits -> float */
     const int s = h >> 15, e = (h >> 10) & 31, m = h & 1023; float v;

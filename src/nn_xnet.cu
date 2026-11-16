@@ -126,6 +126,15 @@ static float e2m1_rn(float v) {   /* nearest of +-{0, .5, 1, 1.5, 2, 3, 4, 6}, t
     for (int i = 0; i < 8; i++) { const float d = fabsf(a - g[i]); if (d < bd || (d == bd && !(i & 1))) { bd = d; b = i; } }
     return copysignf(g[b], v);
 }
+/* e2m1_rn(v / d) exactly under fast math: |v| against the grid midpoints times d in double (products of <= 3 + 24 significant bits:
+   exact), ties to the even grid index; saturates at 6 */
+static float e2m1_div(float v, float d) {
+    static const double M[7] = {.25, .75, 1.25, 1.75, 2.5, 3.5, 5.}; static const float G[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    const double a = fabs((double)v); int b = 0;
+    for (int i = 0; i < 7; i++) { const double t = M[i] * (double)d; if (a > t) { b = i + 1; continue; } if (a == t) b = (i & 1) ? i + 1 : i; break; }
+    return copysignf(G[b], v);
+}
+static inline float div6(float a) { return (float)((double)a / 6.0); }   /* a / 6 correctly rounded to float (as __fdiv_rn) under fast math */
 static float e4m3_rn(float v) {   /* e4m3 (bias 7, max 448, subnormals 2^-9 steps), ties to even */
     const float a = fabsf(v); if (a >= 448.f) return copysignf(448.f, v); if (a == 0.f) return v;
     int ex; frexpf(a, &ex); ex -= 1; if (ex < -6) ex = -6;   /* a in [2^ex, 2^(ex + 1)) */
@@ -135,8 +144,8 @@ static float e4m3_rn(float v) {   /* e4m3 (bias 7, max 448, subnormals 2^-9 step
 static void fq_nv(float *v, int n, float gs) {
     for (int b0 = 0; b0 < n; b0 += 16) {
         float am = 0.f; for (int i = b0; i < b0 + 16 && i < n; i++) am = fmaxf(am, fabsf(v[i]));
-        const float sc = e4m3_rn(am / 6.f / gs) * gs; if (sc == 0.f) { for (int i = b0; i < b0 + 16 && i < n; i++) v[i] = 0.f; continue; }
-        for (int i = b0; i < b0 + 16 && i < n; i++) v[i] = e2m1_rn(v[i] / sc) * sc;
+        const float sc = e4m3_rn(gs == 1.f ? div6(am) : am / 6.f / gs) * gs; if (sc == 0.f) { for (int i = b0; i < b0 + 16 && i < n; i++) v[i] = 0.f; continue; }
+        for (int i = b0; i < b0 + 16 && i < n; i++) v[i] = e2m1_div(v[i], sc) * sc;
     }
 }
 static void fq_host(float *v, int n, int bits) {   /* one block of n <= 32 values in place */
@@ -162,7 +171,7 @@ __global__ void k_fq(const __half *x, __half *y, long long nblk, int bits) {   /
     if (bits == 5) {   /* two blocks of 16, e4m3 scale amax / 6 (no tensor scale: IN-normalised activations, |x| < 2688) */
         for (int h = 0; h < 2; h++) {
             float a = 0.f; for (int i = 16 * h; i < 16 * h + 16; i++) a = fmaxf(a, fabsf(v[i]));
-            const unsigned char c8 = cvt_e4m3(a / 6.f); const int ex = (c8 >> 3) & 15, mt = c8 & 7;
+            const unsigned char c8 = cvt_e4m3(__fdiv_rn(a, 6.f)); const int ex = (c8 >> 3) & 15, mt = c8 & 7;
             const float sc = ex ? ldexpf(1.f + mt / 8.f, ex - 7) : ldexpf(mt / 8.f, -6);
             for (int i = 16 * h; i < 16 * h + 16; i++) {
                 if (sc == 0.f) { y[b * 32 + i] = __float2half_rn(0.f); continue; }
@@ -391,7 +400,7 @@ static int mx_pack(xconv *c, const float *wk, int co, int sf) {
             }
             uint8_t *qb = q + ((size_t)o * rch + b / 2) * 16 + (b & 1) * 8;
             for (int i = 0; i < 16; i++) {
-                const float x = d > 0.f ? (sf == 6 ? ldexpf(v[i], 0) / d : v[i] / d) : 0.f; const float rq = e2m1_rn(x);
+                const float rq = d > 0.f ? (sf == 6 ? e2m1_rn(v[i] / d) : e2m1_div(v[i], d)) : 0.f;   /* (sf 6: d a power of two, exact) */
                 static const float G[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f}; int nib = 0; for (int gg = 0; gg < 8; gg++) if (G[gg] == fabsf(rq)) nib = gg;
                 if (rq < 0.f) nib |= 8;
                 qb[i / 2] |= (uint8_t)(nib << ((i & 1) * 4));
@@ -655,9 +664,9 @@ __global__ void __launch_bounds__((BM / 64) * (BN / 32) * 32) conv_mx(MxP p) {
                     am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 1)); am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 2));
                     uint8_t sc, lo, hi;
                     if constexpr (SF == 6) { const int ee = mx_exp(am, 1.f / 6.f); const float mm = exp2i(-ee); lo = cvt_e2m1x2(v[0] * mm, v[1] * mm); hi = cvt_e2m1x2(v[2] * mm, v[3] * mm); sc = (uint8_t)(ee + 127); }
-                    else { sc = cvt_e4m3(am / 6.f); const int ex = (sc >> 3) & 15, mt = sc & 7; const float d = ex ? ldexpf(1.f + mt / 8.f, ex - 7) : ldexpf(mt / 8.f, -6);
+                    else { sc = cvt_e4m3(__fdiv_rn(am, 6.f)); const int ex = (sc >> 3) & 15, mt = sc & 7; const float d = ex ? ldexpf(1.f + mt / 8.f, ex - 7) : ldexpf(mt / 8.f, -6);
                            const float r = d > 0.f ? 1.f / d : 0.f; (void)r;
-                           lo = cvt_e2m1x2(d > 0.f ? v[0] / d : 0.f, d > 0.f ? v[1] / d : 0.f); hi = cvt_e2m1x2(d > 0.f ? v[2] / d : 0.f, d > 0.f ? v[3] / d : 0.f); }
+                           lo = cvt_e2m1x2(d > 0.f ? __fdiv_rn(v[0], d) : 0.f, d > 0.f ? __fdiv_rn(v[1], d) : 0.f); hi = cvt_e2m1x2(d > 0.f ? __fdiv_rn(v[2], d) : 0.f, d > 0.f ? __fdiv_rn(v[3], d) : 0.f); }
                     if (cok) {
                         const int ch = p.oc0 + o0; uint8_t *rec = p.oq + (size_t)ov * (p.oC / 2) + ch / 2;
                         rec[t] = lo; rec[4 + t] = hi;
@@ -849,10 +858,10 @@ template <int SF> __global__ void k_xq(const __half *x, uint8_t *q, uint8_t *s, 
     uint2 o; uint8_t sc;
     if constexpr (SF == 6) { const int e = mx_exp(am, 1.f / 6.f); const float m = exp2i(-e); o.x = cvt_e2m1x8(v, m); o.y = cvt_e2m1x8(v + 8, m); sc = (uint8_t)(e + 127); }
     else {
-        sc = cvt_e4m3(am / 6.f); const int ex = (sc >> 3) & 15, mt = sc & 7; const float d = ex ? ldexpf(1.f + mt / 8.f, ex - 7) : ldexpf(mt / 8.f, -6);
+        sc = cvt_e4m3(__fdiv_rn(am, 6.f)); const int ex = (sc >> 3) & 15, mt = sc & 7; const float d = ex ? ldexpf(1.f + mt / 8.f, ex - 7) : ldexpf(mt / 8.f, -6);
         float w[16];
 #pragma unroll
-        for (int i = 0; i < 16; i++) w[i] = d > 0.f ? v[i] / d : 0.f;
+        for (int i = 0; i < 16; i++) w[i] = d > 0.f ? __fdiv_rn(v[i], d) : 0.f;
         o.x = cvt_e2m1x8(w, 1.f); o.y = cvt_e2m1x8(w + 8, 1.f);
     }
     *(uint2 *)(q + b * 8) = o;
@@ -1024,10 +1033,10 @@ template <int SF> __global__ void k_inq(__half *x, int C, long long S, long long
     uint2 o; uint8_t sc;
     if constexpr (SF == 6) { const int e = mx_exp(am, 1.f / 6.f); const float m = exp2i(-e); o.x = cvt_e2m1x8(v, m); o.y = cvt_e2m1x8(v + 8, m); sc = (uint8_t)(e + 127); }
     else {
-        sc = cvt_e4m3(am / 6.f); const int ex = (sc >> 3) & 15, mt = sc & 7; const float d = ex ? ldexpf(1.f + mt / 8.f, ex - 7) : ldexpf(mt / 8.f, -6);
+        sc = cvt_e4m3(__fdiv_rn(am, 6.f)); const int ex = (sc >> 3) & 15, mt = sc & 7; const float d = ex ? ldexpf(1.f + mt / 8.f, ex - 7) : ldexpf(mt / 8.f, -6);
         float w[16];
 #pragma unroll
-        for (int i = 0; i < 16; i++) w[i] = d > 0.f ? v[i] / d : 0.f;
+        for (int i = 0; i < 16; i++) w[i] = d > 0.f ? __fdiv_rn(v[i], d) : 0.f;
         o.x = cvt_e2m1x8(w, 1.f); o.y = cvt_e2m1x8(w + 8, 1.f);
     }
     *(uint2 *)(q + b * 8) = o; sq[(b >> 1) * 4 + (b & 1)] = sc;
@@ -1122,10 +1131,10 @@ __global__ void __launch_bounds__(128) k_stem(const __half *x, int N, int D, int
             for (int i = 0; i < 16; i++) am = fmaxf(am, fabsf(v[16 * hb + i]));
             unsigned lo, hi;
             if constexpr (SF == 6) { const int e = mx_exp(am, 1.f / 6.f); const float m = exp2i(-e); lo = cvt_e2m1x8(v + 16 * hb, m); hi = cvt_e2m1x8(v + 16 * hb + 8, m); s2[hb] = (uint8_t)(e + 127); }
-            else { const uint8_t sc = cvt_e4m3(am / 6.f); const int ex = (sc >> 3) & 15, mt = sc & 7; const float d = ex ? ldexpf(1.f + mt / 8.f, ex - 7) : ldexpf(mt / 8.f, -6);
+            else { const uint8_t sc = cvt_e4m3(__fdiv_rn(am, 6.f)); const int ex = (sc >> 3) & 15, mt = sc & 7; const float d = ex ? ldexpf(1.f + mt / 8.f, ex - 7) : ldexpf(mt / 8.f, -6);
                    float ww[16];
 #pragma unroll
-                   for (int i = 0; i < 16; i++) ww[i] = d > 0.f ? v[16 * hb + i] / d : 0.f;
+                   for (int i = 0; i < 16; i++) ww[i] = d > 0.f ? __fdiv_rn(v[16 * hb + i], d) : 0.f;
                    lo = cvt_e2m1x8(ww, 1.f); hi = cvt_e2m1x8(ww + 8, 1.f); s2[hb] = sc; }
             if (hb == 0) { o4.x = lo; o4.y = hi; } else { o4.z = lo; o4.w = hi; }
         }
