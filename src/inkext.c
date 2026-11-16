@@ -105,7 +105,9 @@ typedef struct {
     uint8_t *zero; uint32_t epoch; uint64_t ndec;
 } ctlev;
 static inline int64_t ckey(int64_t a, int64_t b, int64_t c) { return (a << 42) | (b << 21) | c; }
-static inline size_t chash(int64_t k, size_t cap) { uint64_t x = (uint64_t)k * 0x9E3779B97F4A7C15ull; return (size_t)(x >> 20) & (cap - 1); }
+/* (x >> 20) of the product alone (before 2026-11-16) depended only on key bits 0-29 (x and the low bits of y): every chunk differing in z
+   alone probed the same slot, ct_find was 45 % of ink9um's CPU samples. A full mix spreads every key bit over the slot index. */
+static inline size_t chash(int64_t k, size_t cap) { uint64_t x = (uint64_t)k; x ^= x >> 31; x *= 0x9E3779B97F4A7C15ull; x ^= x >> 29; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 32; return (size_t)x & (cap - 1); }
 static const uint8_t *ct_find(const ctlev *L, int64_t k) {
     for (size_t h = chash(k, L->hcap);; h = (h + 1) & (L->hcap - 1)) { if (L->hk[h] == k) return L->e[L->hv[h]].p; if (L->hk[h] == -1) return nullptr; }
 }

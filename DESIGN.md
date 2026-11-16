@@ -6,6 +6,15 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## ink-ext: the CT chunk hash saw no z (ink9um 1.21x, half the CPU) (2026-11-16, branch inkspeed-20261116)
+
+perf on ink9um over one PHerc1667 segment (194.6 Mpx, card 1, local CT): ct_find 45 % of the CPU samples, ct_tri 13 %, render_worker 8 %.
+chash took bits 20-29 of key x 0x9E37..: those depend only on key bits 0-29 (the chunk's x and the low bits of y), never on z (bits 42+),
+so all chunks of a band that differ in z alone probed one chain. A full 64-bit mix: wall 236 -> 196 s, user 1052 -> 560 s, render
+36 -> 16 s, network 87 -> 85 s. Output: ink-ext is not bit-reproducible run to run (the old binary twice: 3.45 M of 206.8 M px differ by
+1); old vs fixed differ by the same (3.42 M px, max 2). test_ink_ext_tiling runs again (its weights linked under ~/ufsm-data/inkext;
+the PyTorch parity tests need upstream villa / hecate sources, not run here). Fast tier: 330 PASS, 1 SKIP, 2 NEED2 (card 0 in training).
+
 ## mcc 9aea0ba: PTX packed as MPY (~10x), verify builds keep it in sidecar files; GPU tests are not slower (2026-11-16, branch mcc-sass-20261116)
 
 Priority 1 of the mcc round (GPU test time, binary / build size). All numbers desk, same commit (master 9a9d46a4 + this branch),
