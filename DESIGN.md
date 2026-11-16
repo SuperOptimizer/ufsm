@@ -6,6 +6,30 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The volcomp decoders stay IEEE under fast math (UFSM_EXACT_HOST / UFSM_EXACT_CU) (2026-11-15, branch fastmath-port-20261115, off wip-snap-fastmath)
+
+The fast-math round (fmfix, below) found that the GPU decoder's IDCT (nn_gpudec, `-use_fast_math`) and the host's (zarr3.c:
+volcomp.h + volcomp_fast.h, `-ffast-math`) round apart by +-1 on rare voxels, and that the nets amplify one such voxel: per-window
+GroupNorm statistics and MX-fp4 block scales spread it over the window (test_predict_heads (1d): 16 % of the rv bytes, max 123). It
+answered with tolerances. This takes the other way: the two decoders are compiled IEEE in every build, so a CT window is the same bytes
+whichever decoder made it, and the same bytes as the reference decoder the stores were checked with. CMakeLists.txt: `UFSM_EXACT_HOST`
+(zarr3) gets `-fno-fast-math -ffp-contract=off -fno-math-errno` after the common flags (the fast-math host signed zeros were the
+host-side half: -fsigned-zeros on zarr3.c alone restored it, fm round); `UFSM_EXACT_CU` (nn_gpudec) gets the strict CUDA flags
+(`-fmad=false` under mcc) whether or not UFSM_STRICT_MATH is on. test_gpudec / test_volcomp_fast build their reference decoder with the
+same IEEE flags and compare byte for byte again (fm_cmp_u8 tolerance 0 / 0); test_ct_gpu_decode compares GPU vs CPU decode, the
+batch hashes and the device inputs byte for byte in every build (before: only under strict); test_predict_heads (1d) the CT windows and
+the rv / ink outputs of the device-read runs byte for byte.
+
+Numbers (mcc build-verify, desk, 2026-11-15; PHerc0139 9.362 um level 0, a 512 x 1024 x 1024 box at 8000, 2500, 2500, 3 runs each,
+master d7910396 = the fast-math decoders vs this branch):
+- GPU decode (`ufsm read`, UFSM_GPU_DECODE=1, card 1 while merge3's suites shared it): master's output differs from the host decode on
+  3306 of 537 M voxels; this branch's equals it byte for byte. Speed within the noise of the shared card: 665 / 713 / 787 vs
+  814 / 696 / 670 Mvox/s, GPU round trips 0.36 s in both (8328 substreams).
+- Host decode (UFSM_GPU_DECODE=0): 518 / 539 / 582 vs 548 / 551 / 593 Mvox/s, the same bytes in this box (the +-1 voxels are rare; the
+  decode is mostly the serial tANS chain, the IDCT a small part).
+- Tests (mcc verify, card 1): test_gpudec, test_volcomp_fast, test_volcomp, test_z3_sink, test_ct_gpu_decode, test_predict_heads parts
+  0-2 pass, all decode comparisons exact.
+
 ## Eval tags carry their checkpoint's identity (scripts/wbench/ckid.sh) (2026-11-15, branch evalfix-port-20261115, off wt-evalfix)
 
 Eval audit 11-14 #21: wbench / wgate / ueval rows carried no checkpoint hash, and a rerun of a tag with another checkpoint overwrote
