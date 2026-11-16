@@ -48,6 +48,25 @@ level 0 and the model / output passes fell back to the CPU; 36-79 s on a free ca
 - **field-blend.** sin / cos of the winding-mod-4 codes come from 256-entry tables (the same doubles), and the tile weight of each
   cell is stepped through x / y / z instead of a div / mod per cell. 512^3 cells: 73.4 -> 49.5 CPU s (7.2 -> 5.3 s at 16 threads),
   byte-identical to the 11-11 master binary. What is left: combine 29 %, atan2 / hypot ~9 %, the volcomp encode of the output 22 %.
+- **recto-sp.** rr_peaks takes its 2R + 1 gaussian taps from a table built per call instead of an exp per tap per sample (exp
+  was a third of the CPU). 1024 x 2048^2 0332 box: 294.8 -> 175.7 CPU s (25.6 -> 18.6 s), byte-identical; test_recto compares the
+  smoothed floats with the per-sample exp at 5 sigmas (one past the 256-tap stack table).
+- **0332 end to end, UPTO=snap** (desk, card 1 shared with a 7 GB job at 100 % in both runs; master 7f2c69b8 + recto-sp):
+
+  | stage | 15:02 run (5dce8d46, ufsm-inkspeed 926b3bb4) | this branch |
+  |---|---|---|
+  | fields | 2767 s (12560 CPU s) | **683 s** (5180): grid 0 254 s / 505 windows, half grid 248 s / 502 windows, blend 180 s |
+  | rectosp | 289 | 223 (1468 CPU s) |
+  | ref | 291 (CPU fallbacks: card 1 full) | 60 (GPU) |
+  | slabs | 377 | 385 |
+  | join / check / wraps / trim | 10 / 65 / 25 / 24 | 10 / 35 / 24 / 4 |
+  | snap | 159 (CT decode over https 125 s) | **41** (cached CT) |
+  | **total to snap** | **4007 s** (+ 575 s of DIRCOH refs) | **1465 s (2.7x)** |
+
+  The ref and so everything after it differ from the 15:02 run: that run's ref ran its CG level 0 and model pass on the CPU (card 1
+  full) and used another binary. The equality check is the fields stage: old (5dce8d46) vs new unroll.sh, same binary, on a full
+  0332 cross-section (512 x 2784 x 3008 at z 4096, the box edges included): half grid 209 runs / 126 s -> 65 / 32 s, stage 166 -> 69 s,
+  every chunk file identical.
 - Tests: test_fblend blends with a larger second input (B's whole zarr arrays, one / two cells more per side) against the per-cell
   rules byte for byte, and refuses a smaller second input. test_http_reader checks that UFSM_HTTP_CACHE fills the same cache as --cache.
 
