@@ -6,6 +6,23 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## mcc a420db2: -g location lists linear, not quadratic; the wip drain closed (2026-11-16, branch allin-20261116)
+
+The last microc leftovers merged by the lead after the agents were stopped: mcc-dwarf's uncommitted -g work (location lists
+ranked per piece, phis named only for slots that are variables), finished (a missing qsort comparator) and fixed. As found,
+ufsm's -O3 -g build of predict.c took 164 s (01a9ee6: 2.0 s) and train.c over 360 s: x64.c placed a value's whole set of ranges
+once per instruction that ir_resolve()s to it (predict.c: 123 M places for 1598 variables, up to 1.65 M for one), and dwarf.c
+loclists scanned every place at every boundary. Now a (value, slot) pair places once, and the boundary sweep keeps the live places
+in a heap by rank (ties to the earlier in the list, the old choice): predict.c 1.8 s, train.c 2.9 s (01a9ee6: 3.3 s), objects
+byte-identical to the slow build (debug info included). All 171 ufsm C units: .text identical to 01a9ee6 and identical with and
+without -g. microc gate 225/225 every stage, thr 50, abi 13/13, self. ufsm fast tier (both cards): 330 PASS, 2 data SKIP, wall
+130 s; full release build 8 s, verify 11 s.
+
+Not merged, with reasons (ledger /vesuvius/ufsm/wipdrain/ledger.md): mcc-vec's uncommitted opt_vec change (a parallel fix of the
+s_vec dry-run bug main 6ceab31 already fixed), arrsplit2's inline slot bonus (measured worse; dropped by the user), splitdata
+(duplicate of splitwin; dropped by the user), pool2fast (on master since 11-12, later rewritten as cp_pool8). mcc-gpu's unswitch
+pass was never committed anywhere and is lost.
+
 ## UFSM_PRED_FIT_FUSED_SMALLH stays off: fith2_prof.sh measured (2026-11-16, branch fith2dec-port-20261116)
 
 The fused --fit-h 2 fit-field kernel (audit unroll #9, flag pending "until fith2_prof.sh has profiled it") measured with
