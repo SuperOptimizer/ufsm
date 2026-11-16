@@ -255,7 +255,8 @@ run_one() {
     command -v stdbuf > /dev/null && pre=(stdbuf -oL -eL "${pre[@]}")   # line-buffered stdout: logs interleave stdout and stderr in order
     local t0 t1; t0=$(date +%s.%N)
     local to=$TO es=${EST[$n]%.*}; [ "${es:-0}" -gt "$to" ] && to=$es   # a test whose EST exceeds -x gets EST as its timeout (the solo racecheck runs: measured x 1.5, sweep 11-14)
-    ( export B="$BDIR" TMPDIR="$tmp" UFSM_TEST_TMP="$tmp" UFSM_SUITE_TEST="$n" UFSM_PRED_NO_AXIS=1 UFSM_NCPU=$T UFSM_FIT_THREADS=$T UFSM_TIFF_THREADS=$T \
+    local mark="$OUT/$n.$a.$BASHPID"
+    ( export UFSM_SUITE_RUN="$mark" B="$BDIR" TMPDIR="$tmp" UFSM_TEST_TMP="$tmp" UFSM_SUITE_TEST="$n" UFSM_PRED_NO_AXIS=1 UFSM_NCPU=$T UFSM_FIT_THREADS=$T UFSM_TIFF_THREADS=$T \
              OMP_NUM_THREADS=$T OPENBLAS_NUM_THREADS=$T MKL_NUM_THREADS=$T
       # a test without the gpu tag sees no GPU: one that needs it fails or skips here instead of using a card without the lock (2026-11-13:
       # test_attn, test_attn_ray / _dfm, test_spiralfit, test_countfield, test_mesh_phase ran untagged on GPUs held by training runs)
@@ -267,6 +268,13 @@ run_one() {
       else TIMEFORMAT='%R %U %S 0'; { time timeout -k 20 "$to" "${pre[@]}" bash -c "$cm" 2>&1; } 2> "$OUT/tmp/$n.time"; fi
     ) > "$log.$a" 2>&1 < /dev/null
     rc=$?; t1=$(date +%s.%N)
+    # what the test left running: timeout -k only escalates while its own child lives, so a process that traps SIGTERM (ufsm train
+    # checkpoints on it) outlived a test killed for its time and spun on (2026-11-15 pod: an mcc-miscompiled train, 4 h at 200 % CPU,
+    # orphaned, holding /root/mega.lock). Every process carrying this attempt's marker goes.
+    if [ $rc != 0 ]; then
+      local lp; lp=$(grep -lzx "UFSM_SUITE_RUN=$mark" /proc/[0-9]*/environ 2> /dev/null | sed -E 's|/proc/([0-9]+)/environ|\1|')
+      [ -n "$lp" ] && { kill -KILL $lp 2> /dev/null; echo "run_suite: killed what the test left running: $(echo $lp)" >> "$log.$a"; }
+    fi
     read -r wall us sy rss < <(tail -n1 "$OUT/tmp/$n.time" 2> /dev/null); [[ ${wall:-x} =~ ^[0-9.]+$ ]] || { wall=$(awk -v a="$t0" -v b="$t1" 'BEGIN {printf "%.2f", b - a}'); us=0; sy=0; rss=0; }
     rss=$(( ${rss:-0} / 1024 ))
     # rc 77 is the automake SKIP code (test_lldec documents it); "SKIP: no GPU" from a test the runner granted a card means the card

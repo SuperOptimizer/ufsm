@@ -10,9 +10,12 @@ Production models: `wind96` (task unwrap, 9.6 um: phase, normals, density, recto
 ## Build and test
 
 ```sh
-cmake --preset release && cmake --build build -j 8      # build/ufsm. LLVM 22 (clang C23, nvcc with clang++ host for .cu, lld, compiler-rt), CMake >= 3.28,
-                                                        # Ninja; needs libcurl, libzstd, libblosc, zlib, libjpeg, xxhash (header),
-                                                        # OpenSSL libcrypto, CUDA 13.1+ (ptxas, cudart, cuBLASLt; sm_120 / sm_120a)
+scripts/toolchain/install_mcc.sh                        # once: microc (mcc + mcudahw) at cmake/mcc.version into ~/.local/mcc (~1 min)
+cmake --preset release && cmake --build build -j 8      # build/ufsm by mcc: host C23 and the .cu units (-> PTX in the objects), mcudahw
+                                                        # as the CUDA runtime; CMake >= 3.28, Ninja; needs libcurl, libzstd, libblosc,
+                                                        # zlib, libjpeg, xxhash (header), OpenSSL libcrypto, an NVIDIA driver (its JIT
+                                                        # compiles the PTX; libcublasLt.so). No CUDA toolkit, no clang / nvcc
+cmake --preset llvm-release && cmake --build build-llvm # clang + nvcc (cmake/llvm.cmake): kept building, for comparison
 cmake --preset verify && cmake --build build-verify --target test     # suite binaries + the fast tier (the merge gate)
 cmake --build build-verify --target test-slow           # the slow tier; test-all: both
 SUITE_FLAGS="-j 4 test_fit" cmake --build build-verify --target test # runner options (names matching a regex)
@@ -34,7 +37,13 @@ Configurations are build directories (`CMakePresets.json`): `build/` (release: t
 and `pod` / `pod-verify` / `pod-test` (6 jobs): `cmake --build --preset desk`. Binaries land in the build directory itself
 (`build/ufsm`, `build-verify/test_lat`). `ninja` alone in a build directory builds `ufsm`; `suite-bins` every suite binary.
 
-The toolchain is LLVM only (`cmake/llvm.cmake`): the newest `clang` / `clang-N` on PATH (`UFSM_LLVM_ROOT=/usr/lib/llvm-N` pins one),
+The toolchain is microc (`cmake/mcc.cmake`, since 2026-11-14): mcc compiles the host C (`-mglibc -std=c23 -O2`) and every .cu unit
+(its CUDA C++ subset; the device side becomes PTX kept in the object), and links against mcudahw, a static libcudart that dlopens
+the driver, has it JIT-compile the PTX at a kernel's first launch (cached in `~/.cache/mcudahw`; `MCUDA_PRECOMPILE=N ufsm sysinfo`
+fills the cache, scripts/pod/setup.sh does) and forwards cuBLASLt to the real libcublasLt.so. `UFSM_MCC` / `MCC_HOME` /
+`~/.local/mcc` locate it; `MCC_CC=/full/path/clang` where there is no /usr/bin/cc (mcc's glibc link driver). `tests/mcc_compile.sh`
+(suite line test_mcc_compile) compiles every unit with mcc. The previous toolchain, kept as presets llvm-release / llvm-verify:
+LLVM only (`cmake/llvm.cmake`): the newest `clang` / `clang-N` on PATH (`UFSM_LLVM_ROOT=/usr/lib/llvm-N` pins one),
 lld, llvm-ar / ranlib, compiler-rt builtins and crt files; the C++ library of the CUDA units' host side stays libstdc++ (CUDA's headers
 refuse libc++ on x86). CUDA: `UFSM_CUDA` (default /usr/local/cuda, else the newest /usr/local/cuda-*, else nvcc's prefix); only its
 device code goes through its nvcc by default (`UFSM_CUDA_COMPILER=nvcc`; `clang` compiles it with `clang -x cuda`, whose kernels ran

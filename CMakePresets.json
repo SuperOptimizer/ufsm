@@ -4,11 +4,11 @@
   "configurePresets": [
     {
       "name": "release",
-      "displayName": "release: build/ (fp16 / MX kernels; native: -march=native, SASS for the GPU present, full LTO)",
+      "displayName": "release: build/ (mcc + mcudahw, cmake/mcc.cmake; fp16 / MX kernels; sm_120 + sm_120a)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build",
-      "toolchainFile": "${sourceDir}/cmake/llvm.cmake",
-      "cacheVariables": {"UFSM_VERIFY": "OFF", "UFSM_ARCH": "auto"}
+      "toolchainFile": "${sourceDir}/cmake/mcc.cmake",
+      "cacheVariables": {"UFSM_VERIFY": "OFF", "UFSM_ARCH": "120"}
     },
     {
       "name": "verify",
@@ -37,6 +37,21 @@
       "inherits": "arch86",
       "binaryDir": "${sourceDir}/build86-verify",
       "cacheVariables": {"UFSM_VERIFY": "ON"}
+    },
+    {
+      "name": "llvm-release",
+      "displayName": "llvm-release: build-llvm/ (clang + nvcc, cmake/llvm.cmake: kept for comparison; mcc is the supported toolchain)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build-llvm",
+      "toolchainFile": "${sourceDir}/cmake/llvm.cmake",
+      "cacheVariables": {"UFSM_TOOLCHAIN": "llvm"}
+    },
+    {
+      "name": "llvm-verify",
+      "displayName": "llvm-verify: build-llvm-verify/ (the suite binaries with clang + nvcc, for bisecting / byte-comparing)",
+      "inherits": "llvm-release",
+      "binaryDir": "${sourceDir}/build-llvm-verify",
+      "cacheVariables": {"UFSM_VERIFY": "ON"}
     }
   ],
   "buildPresets": [
@@ -51,6 +66,8 @@
      "targets": ["suite-bins"]},
     {"name": "pod-test", "displayName": "pod: build + fast suite tier", "configurePreset": "verify", "jobs": 6, "targets": ["test"]},
     {"name": "arch86", "configurePreset": "arch86"},
-    {"name": "arch86-verify", "configurePreset": "arch86-verify", "targets": ["suite-bins"]}
+    {"name": "arch86-verify", "configurePreset": "arch86-verify", "targets": ["suite-bins"]},
+    {"name": "llvm-release", "configurePreset": "llvm-release", "jobs": 8},
+    {"name": "llvm-verify", "configurePreset": "llvm-verify", "jobs": 8, "targets": ["suite-bins"]}
   ]
 }

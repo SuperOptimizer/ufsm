@@ -6,7 +6,8 @@
 #      -> $POD/limits.txt; then `ufsm sysinfo` once the binary exists.
 #   2. deps: apt packages (root only), skipped when they are all present (xxhash: zarr3.c since iospeed): LLVM 22 (clang, lld,
 #      llvm, compiler-rt; from apt.llvm.org when the distribution lacks it), cmake, ninja, ccache, libcurl / zstd / blosc / zlib /
-#      ssl / jpeg / xxhash dev, jq, curl, rsync, time. No gcc: the whole build is LLVM (cmake/llvm.cmake).
+#      ssl / jpeg / xxhash dev, jq, curl, rsync, time. The build is mcc (microc, scripts/toolchain/install_mcc.sh); clang stays for mcc's
+#      stage 0 / glibc link driver and the llvm-release fallback preset.
 #   3. clone or fast-forward ufsm ($BRANCH, default master) into $POD/ufsm, then build it.
 #      CMake (cmake/llvm.cmake) finds the newest clang and /usr/local/cuda-* by itself: cmake --preset release (arch86 for
 #      non-12.x GPUs: software MX, since the fp4 / fp8 kernels need sm_120a), cmake --build -j <cgroup CPUs>. Always on the pod:
@@ -98,6 +99,17 @@ if [ -z "${ARCH:-}" ]; then
   case "$cc" in 12*|'') ARCH=120;; *) ARCH=86;; esac   # (lp_* need the 12.x block-scaled MMA; others: software MX)
 fi
 BD=build; PRESET=release; [ "$ARCH" = 86 ] && BD=build86 && PRESET=arch86 && U=$POD/ufsm/build86/ufsm
+# the toolchain: microc (mcc + mcudahw) at cmake/mcc.version into ~/.local/mcc (cmake/mcc.cmake finds it there). Stage 0 and mcc's
+# glibc-mode link need a C driver: /usr/bin/cc, else the newest clang (MCC_CC, exported for the build)
+if [ ! -x /usr/bin/cc ]; then
+  MCC_CC=$(ls /usr/bin/clang-[0-9]* /usr/lib/llvm-*/bin/clang 2>/dev/null | sort -V | tail -1); export MCC_CC
+  [ -n "$MCC_CC" ] || die "no /usr/bin/cc and no clang: mcc needs a C driver for stage 0 and its glibc link"
+  export CC=$MCC_CC
+fi
+if [ "${NOBUILD:-0}" != 1 ]; then
+  say "mcc $(cat $POD/ufsm/cmake/mcc.version)"
+  bash $POD/ufsm/scripts/toolchain/install_mcc.sh > $POD/mcc.log 2>&1 || { tail -20 $POD/mcc.log; die "install_mcc (log $POD/mcc.log)"; }
+fi
 # Native builds (2026-11-14: -march=native, SASS for this GPU only): a binary runs only where it was built. NOBUILD=1 reuses one
 # only when its build dir's native_id (cmake/native_id.sh at configure) matches this machine; FOREIGN_BINARY=1 is the explicit
 # override for a binary or objects built elsewhere (e.g. compiled on the desk), at the user's risk (SIGILL / no kernel image).
@@ -111,6 +123,13 @@ if [ "${NOBUILD:-0}" != 1 ]; then
 fi
 [ -x $U ] || die "no $U"
 $U sysinfo --disk $POD | tee $POD/sysinfo.txt
+# mcudahw JIT-compiles each kernel's PTX at its first launch (~/.cache/mcudahw, keyed by PTX + GPU model + driver): fill the cache now,
+# on all CPUs, not inside step 1. Every run (also NOBUILD=1: a new driver or GPU model after a reboot starts cold; a warm cache is a scan)
+if [ "${NOPRECOMPILE:-0}" != 1 ]; then
+  say "mcudahw: precompiling the kernels ($NCPU threads)"
+  jm=$(JITLOG=$POD/precompile.log bash $POD/ufsm/scripts/toolchain/jit_warm.sh $U $NCPU); jrc=$?; say "$jm"
+  [ $jrc = 0 ] || say "precompile failed (rc $jrc, log $POD/precompile.log); kernels will JIT at first use"
+fi
 
 # --- 4. smoke test ---
 if [ "${NOSMOKE:-0}" != 1 ] && [ ! -e $POD/state/smoke.$(git -C $POD/ufsm rev-parse --short HEAD) ]; then

@@ -14,12 +14,15 @@ design decisions, experiments and numbers; FINDINGS.md the results.
 ## Build and test
 
 ```sh
-cmake --preset release && cmake --build build -j 8            # build/ufsm (CMake + Ninja, LLVM 22: clang C23, lld; nvcc sm_120 / sm_120a)
+scripts/toolchain/install_mcc.sh                              # once per machine / pin: microc (mcc + mcudahw) at cmake/mcc.version, ~/.local/mcc
+cmake --preset release && cmake --build build -j 8            # build/ufsm by mcc (the only supported compiler since 2026-11-15; PTX, mcudahw)
+scripts/toolchain/jit_warm.sh build-verify/test_unet 8        # fill mcudahw's kernel cache before suites / training (cold JIT times tests out)
 cmake --preset verify && cmake --build build-verify --target test   # fast tier: the merge gate. test-slow / test-all: slow tier / both
 SUITE_FLAGS="-j 4 test_fit" cmake --build build-verify --target test # runner options: only tests whose name matches the regex
 cmake --build build-verify --target test_lat && build-verify/test_lat   # one test by hand
 cmake --preset arch86 && cmake --build build86                  # Ampere (software MX; sm_86 SASS + PTX); arch86-verify for its suite
 cmake --build build --target doctor                             # the toolchain picked + machine limits (ufsm sysinfo)
+cmake --preset llvm-verify && cmake --build build-llvm-verify # clang + nvcc, kept building for comparison / bisecting (llvm-release too)
 scripts/test/desk_suite.sh BRANCH   # push to the desk, build and run the suite there (one suite at a time)
 ```
 
@@ -27,9 +30,11 @@ scripts/test/desk_suite.sh BRANCH   # push to the desk, build and run the suite 
   (`UFSM_VERIFY=ON`, adds the bf16 / fp32 instantiations); `build86*/` for `UFSM_ARCH=86`. The suite binaries run from
   `build-verify/`; `test` also builds the release-dir helpers the Python tests use (`build/ufsm`, `make_pipeline_fixture` ...).
   On the desk: `~/bin/lowprio`, `-j 8` at most. ccache is shared across worktrees.
-- Device code goes through nvcc; its host compiler is probed at configure time (clang++ if that nvcc takes it with
-  `-allow-unsupported-compiler`, else the newest g++; printed as `-- ufsm: nvcc host compiler`, `-DUFSM_CUDA_HOST_COMPILER=` pins).
-  Host .c units and the link are always clang / lld.
+- Toolchain: microc (`cmake/mcc.cmake`, pin `cmake/mcc.version`): mcc compiles the host C and every .cu unit to PTX in the objects;
+  mcudahw JIT-compiles it at first launch (cached in ~/.cache/mcudahw). `UFSM_MCC` / `MCC_HOME` / `~/.local/mcc` locate it. An mcc
+  build-verify is ~65 GB (each binary embeds ~330 MB of PTX). The clang + nvcc presets (`llvm-release`, `llvm-verify`, cmake/llvm.cmake)
+  stay buildable for comparison: there nvcc's host compiler is probed at configure time (clang++ with `-allow-unsupported-compiler`,
+  else the newest g++), host .c units and the link clang / lld.
 - A new test: one `ufsm_exe(test_x SUITE tests/test_x.c OBJS ... LIBS ...)` line in `tests/targets.cmake` (OBJS `NN LP` = every
   nn_* / lp_* CUDA object, `CORE` = every src/*.c object but main, or named objects like `unet json`; LIBS `LDLIBS`, `CUDA`, `m`) and
   a line in `tests/suite.txt` (`NAME | TAGS | EST_SECONDS | COMMAND`; tag `gpu` if it touches the GPU, `gpu2` for two, `slow` above

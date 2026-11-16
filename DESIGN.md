@@ -59,6 +59,18 @@ human px, the gate keeps 81 % at accuracy 0.955; 280 M teacher px = 258 cm2 (6 %
 PHerc0139, reader3 + ink9um: per-teacher AUC 0.963 / 0.979, weights 0.49 / 0.51, ensemble AUC 0.980, Platt a 3.33 b -0.29;
 the gate keeps 88 % of the calibration px at accuracy 0.973 (ink recall 0.81); 287 M teacher px (6.0 % ink), 62 MB.
 2-D teacher inference: ~0.6 Mpx/s per teacher at 9.6 um (CT render over https bound), 2.5 Gpx over all labelled segments.
+## mcc round: microc main 441a1a1 is ufsm's compiler; the encoder u8 tolerance 4 (2026-11-15, branch mccround-20261115)
+
+The user made mcc the only supported compiler. The clang + nvcc presets (llvm-release / llvm-verify) keep building for comparison.
+The fast tier at microc main 441a1a1 (475ac78 + mainvfma 626fa40: vsearch / vector FMA / ptx setp.ftz + strip 688b3c6), desk card 1,
+release build/ beside build-verify, jit_warm first: 319 PASS, 2 NEED2 (one card), 2 SKIP (data), 1 FAIL. All 32 failures of the
+first mcc round (fc8e90e) pass. The one FAIL was test_predict_heads part 1: GPU vs CPU fit-field encoder, rv 9.6 plane, 1828 of
+16.7 M bytes differ, max 4. clang + nvcc stays within 2, so this is mcc's host float code (the u8 encoder), and an mcc strict build
+is byte for byte. Decision (lead, 11-15): the tolerance becomes FM_ENC_MAXD = 4 (tests/fm_tol.sh) for the rv / ink planes in
+fast-math builds; strict math stays exact. The host-math delta is a low-priority microc item (mcc-host: most likely the lossy
+volcomp q 8 encode or the pyramid downsampling in third_party/volcomp.h, one coefficient across a rounding boundary, not predict.c).
+Disk: an mcc build-verify is ~65 GB (every binary embeds ~330 MB of uncompressed PTX vs nvcc's ~68 MB compressed SASS fatbins);
+PTX compression / one shared kernel object are in progress (mcc-gpu, testspeed).
 
 ## Skip-empty: masked convs bypass the ring kernels; test_skip_empty racecheck QUICK (2026-11-15, branch skipmask-20261115)
 
@@ -1934,6 +1946,101 @@ From the targeted audit (/vesuvius/ufsm/audit-20261114/targeted/gnorm.md); corre
   a site (message names both ways out: `--gn-set ema`, `--gn-set run` = the live weights' set, or `--ema 0`). The recalibration pass (EMA weights,
   live statistics over ~200-500 windows, pooled) and the scratch2 A/B (A: corrected stats via `--gn-set run`, B: `--gn-live 1` on inferfix) are
   still to be measured on the GPU. Existing scratch2 checkpoints keep the old (non-pooled) variance in both sets until retrained.
+
+## mcc: GPU A/B harness, strict units, JIT warm-up, PTX size (2026-11-14, branch toolchain-mcc-20261114, mcc-gpu)
+
+- `scripts/toolchain/mcc_gpu_ab.sh NVCC_BUILD MCC_BUILD OUT` (one GPU window, all six desk locks; builds nothing): cold JIT
+  (`MCUDA_PRECOMPILE` into an empty cache, per-kernel ptxas seconds), every GPU bench_* plus test_head_tc's timing section (REPS
+  rounds alternating the builds, min ms per kernel, output hash / checksum lines compared with timings masked), 200 steps of the
+  live scratch2 argv / env (scratch2.resume.log) at P 768 with `--det 1 --gpu-input 1 --init-from` a fixed checkpoint, predict
+  (fit-zarr + heads all) on a 384^3 unseen box byte-compared, and the kernels production loads (`MCUDA_VERBOSE`) against all.
+  Output: OUT/ab.tsv (bench, line, item, nvcc, mcc, ratio, SLOW > 1.03, check same / diff / nondet), OUT/summary.txt.
+- Strict units under mcc (`UFSM_STRICT_UNITS`: nn_gpudec nn_cf nn_ftrace nn_latvol nn_band nn_fibre nn_inkfly nn_gpuenc
+  nn_mcodes nn_faces nn_render; byte-exact tests: test_gpudec, test_vcgpu, test_lldec, test_latvol, test_ftrace_gpu,
+  test_fiberraster, test_band_pair, test_faces_gpu, test_render_fill_gpu; test_countfield uses tolerances). Read from microc's
+  src/ptx.c, ir.c and cuda/hw/dev: `-fmad=false` is per invocation (opt_fmad), skips the fusion pass and writes `.rn` on every
+  f16 / f32 / f64 add / sub / mul, so ptxas cannot contract either; without `--cuda-fast-math` there is no `.ftz` / `.approx`,
+  division is `div.rn`, sqrt `sqrt.rn`, casts `cvt.rzi` / `cvt.rn`, floor / ceil / rint / lrint single cvt instructions,
+  round / lround / lroundf exact (trunc + compare) in the device library; constant folding rounds f32 at f32. The PTX of all 11
+  units compiled with the build's flags: 0 contracted fma / mad, 0 add / sub / mul without `.rn` (nn_gpuenc's one fma is its
+  explicit `__fmaf_rn`). Library calls left: nn_cf atan2 / hypot / pow / sin / cos / sincos (mcc's libm, not libdevice; its test
+  has tolerances), lround / llround / lroundf (exact). No mcc fix needed; the suite on the mcc build is the proof.
+- LTO / PGO under mcc (2026-11-15, microc lto-20261114 in main 87d9c98: -flto through the system link, sys_lto; .mcc.ir
+  SHF_EXCLUDE; -fprofile-generate run time in glibc libmcc.a): ufsm builds, links and passes the CPU suite with `-flto`,
+  `-fprofile-generate` and `-fprofile-use` (UFSM_EXTRA_CFLAGS). 78 single-thread CPU suite lines, cycles:u, min of 2, profile
+  from one suite pass: plain 1016.9 G, -flto 1062.6 (+4.5 %: test_zcache +22 %, test_phase_interp +17 %, test_volcomp_fast
+  +12 %; test_spatial_augment part1 -28 %), -fprofile-use 1014.3 (-0.25 %; surflabels -6 %, score_par +8 %), both 1034.4
+  (+1.7 %); the instrumented build ran ~32x slower. Decision: UFSM_LTO / PGO stay off under UFSM_TOOLCHAIN=mcc; the train
+  step is GPU-bound, so the kernels come first.
+- JIT warm-up: `scripts/toolchain/jit_warm.sh BIN [N]` (a no-op for nvcc builds), used by `scripts/pod/setup.sh` on every run
+  (also NOBUILD=1: the cache key is PTX + GPU name + driver version) and by the mcc build's `jit-warm` target.
+- PTX size, release flags (no UFSM_ALL_TYPES), mcc 953a5f2-era: 334.6 MB, 4012 kernels in 123 units (11.7 s wall at -j 2);
+  the other 45 units (lp_f4fwd_i3-5/i7, most f4 / f8 wgrad and f8 fwd instantiations, nn_fwdi1/3/5, nn_s2) have device code only
+  under verify. Largest: lp_mx_gnbwd 25.2 MB (384 kernels), lp_f4fwd_i0p 19.6, lp_s2 17.5 (196),
+  lp_f8fwd_i5 15.6, lp_f8fwd_i0s 15.5, lp_f8fwd_i5s 15.4, lp_f4fwd_i0 13.7, lp_mx_conv1 9.5 (206). Trimming waits for the A/B's
+  used-kernel list (production loads N of 4012): the fp8 forward family (lp_f8fwd_*, 111 MB, 268 kernels) is off the fp4-everywhere path; f4 forward
+  79 MB, f4 / f8 wgrad 23 / 15 MB.
+
+## The swap to microc: mcc is the default toolchain (2026-11-14, branch toolchain-mcc-20261114)
+
+The user asked for the full swap, not a staged one. On this branch:
+- `cmake --preset release` / `verify` / `arch86*` build with mcc: host C (`-mglibc -std=c23 -O2 -g`), every .cu unit, and
+  mcudahw as the CUDA runtime.
+- clang and nvcc remain only as `llvm-release` / `llvm-verify` (build-llvm*/), for bisecting and byte comparisons.
+- `scripts/toolchain/install_mcc.sh` fetches microc at `cmake/mcc.version`, builds stage 0 with the system cc (about 1 minute,
+  one core), builds the glibc support library and mcudahw, smoke-tests a threaded C23 program, and installs into ~/.local/mcc.
+- `scripts/pod/setup.sh` installs mcc before the build and then fills mcudahw's JIT cache on all CPUs (`MCUDA_PRECOMPILE`), so
+  the first training step does not compile 310 MB of PTX. Without /usr/bin/cc it uses the newest clang (`MCC_CC`).
+- `-g` emits DWARF 5 line tables and CFI (microc dwarf-20261114), so gdb, perf and `run_suite.sh -c` work as with clang.
+- The pin is 953a5f2 (microc branch mcc-int-20261114: x64simd + dwarf + vec-20261114 (953a5f2: + offset indexes a[i+k] and 64-bit plane indexes; on ufsm: sample 82 -> 92 vectorised loops, scan_augment 26 -> 29, papyrus 18 -> 21) + dwarf2: locals, types, inlined calls in gdb). vec-20261114 adds:
+  - x86-64 v128 lowering, with opt_vec on: SSE2 everywhere, SSE4.1 under -march=native;
+  - lane max/min from selects;
+  - u8 / u16 / i32 / f32 loops widened to 4-byte lanes;
+  - vectorised and scalar inline sqrt / floor / ceil / trunc / rint / lrint.
+  Superseded the same day (user: "native optimization"): host flags are `-O3 -march=native`. Every machine builds its own
+  binary; pods build theirs in setup.sh. mcc reads cpuid plus XGETBV and defines exactly what the CPU has. On the desk (9950X)
+  that is AVX2 / FMA / F16C / BMI2; AVX-512 is undefined until mcc's EVEX lands. VOLCOMP_NO_AVX2 is gone: microc ebdc34c
+  merged mcc-intrin (<immintrin.h> as VEX builtins). With these flags zarr3.o (volcomp) has 2521 ymm instructions, sample.o 663.
+  Host flags are now `-O3 -msse4.1 -fno-math-errno -g`. That is a fixed ISA, because binaries move between the desk and the pods;
+  mcc's output is byte-identical to its -march=native build on the desk. `-march=x86-64-v3` waits for fast intrinsics: it would
+  define __AVX2__ and switch ufsm onto the element-by-element intrinsic paths. The earlier 3.6x was measured at -O2, without the
+  vectoriser. mcc-vec's micro-benchmarks of ufsm's loop shapes, in ns per element (mcc -O2 / mcc -O3 / clang -O3 -march=native):
+  - papyrus u8 max: 0.661 / 0.033 / 0.008
+  - u8 -> float: 2.52 / 0.113 / 0.038
+  - float -> u8 clamp: 2.23 / 0.441 / 0.038
+  - 1/sqrt normalisation: 2.76 / 0.525 / 0.129
+  So mcc -O3 is still 3-12x behind clang here: 128-bit vectors against AVX2 / AVX-512. The gate
+  is green on the desk at both pins (b489496 for the -g step, ae30511 now):
+  - stage 0 builds clean under gcc 15 -Werror;
+  - tests/c pass 150/150 with mcc's libc, with glibc, and with -g; fuzz-x64 400 seeds without a failure (mcc-vec);
+  - tests/thr 50/50, the assembler test, and the ABI checks against gcc (13/13) pass;
+  - the self-bootstrap gives stage2 == stage3.
+- The nested-lambda fix lets the last two .cu units compile, so all 168 now do.
+- Still to measure in the mcc sweep: the CPU and GPU suites, predict byte-compared against the llvm build, training ms/step,
+  and the cold JIT time.
+- Known costs at this pin:
+  - host code is about 3.6x slower on the CPU tests (helpers are adding x86 vectorisation and fast intrinsics);
+  - kernel speed versus nvcc has not been measured on current master.
+
+## The microc toolchain: `--preset mcc` and the mcc compile check (2026-11-14, branch mcc-20261114)
+
+The user wants the whole toolchain moved to microc (github.com/SuperOptimizer/microc, our own project). mcc is a C compiler for
+C23 / GNU C, plus a C++ subset for `.cu` files that it compiles to PTX. mcudahw is its CUDA runtime: it dlopens libcuda, has the
+driver JIT-compile mcc's PTX and caches the result, and forwards cuBLASLt to the real library. The assessment is
+/vesuvius/ufsm/microc/PLAN.md. Measured on master 3b411d2, desk CPU only:
+- host: 160 of 160 .c files compile; 59 of 59 CPU suite tests pass with mcc-built binaries;
+- CUDA: 166 of 168 .cu files compile. Both failures are mcc bugs, now fixed on microc branches, source only so far.
+- Host code is 3.6x slower than clang -O3 -march=native in total. mcc has no x86 vectoriser and no immintrin.h yet.
+- Compile time: 5.8 s for all host files, 51 s for all .cu files, one at a time. ptxas moves to the driver JIT at the first run.
+
+This branch is source only and has not been configured or run (the user's rule until the sweep):
+- `cmake/mcc.cmake` and `UFSM_TOOLCHAIN=mcc`: the presets `mcc` (build-mcc/) and `mcc-verify`. mcc compiles both the C and the
+  .cu files; CMake treats a `.cu` file as a C source, and mcc reads it as CUDA C++ from its suffix. The CUDA libraries come from
+  mcudahw's lib64 (`UFSM_MCC_CUDA`), so no toolkit and no ccache are needed. Host flags are `-mglibc -std=c23 -O2 -pthread
+  -DVOLCOMP_NO_AVX2`. The CUDA flags are `--cuda-arch=1200` (nn_*), `1200a` (lp_*), `--cuda-fast-math`, and `-fmad=false` for
+  the strict units. The link language stays C.
+- `tests/mcc_compile.sh`, suite line `test_mcc_compile`: compiles every host .c file and every .cu file with mcc (compile only,
+  no GPU). It is skipped when there is no mcc, so ufsm's C++ idioms that mcc does not yet read show up at merge time.
 
 ## Fully adaptive Muon: update / weight statistics, per-layer step control, DoG global step (2026-11-14, branch admuon-20261114)
 

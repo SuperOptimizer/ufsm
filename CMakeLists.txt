@@ -1,4 +1,6 @@
-# ufsm: C23 host code + CUDA kernels, all compiled by LLVM (cmake/llvm.cmake: clang, clang -x cuda, lld, llvm-ar, compiler-rt,
+# ufsm: C23 host code + CUDA kernels, all compiled by mcc (microc, cmake/mcc.cmake: host C and the .cu units -> PTX, mcudahw runtime;
+# scripts/toolchain/install_mcc.sh). The previous toolchain stays as presets llvm-release / llvm-verify for bisecting:
+# (cmake/llvm.cmake: clang, clang -x cuda, lld, llvm-ar, compiler-rt,
 # libunwind, libc++). Ninja. Configurations are build directories (CMakePresets.json):
 #   build/            release: the fp16 / MX kernels training and inference use                (cmake --preset release)
 #   build-verify/     UFSM_VERIFY=ON: + the bf16 / fp32 tensor-core instantiations; the suite runs from here (--preset verify)
@@ -8,7 +10,7 @@
 # directory itself (build/ufsm, build-verify/test_lat), as with the old Makefile.
 cmake_minimum_required(VERSION 3.28)
 if(NOT CMAKE_TOOLCHAIN_FILE)
-  set(CMAKE_TOOLCHAIN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llvm.cmake)
+  set(CMAKE_TOOLCHAIN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/cmake/mcc.cmake)   # (since 2026-11-14; cmake/llvm.cmake: --preset llvm-release)
 endif()
 project(ufsm LANGUAGES C CXX)
 
@@ -58,10 +60,24 @@ set(CMAKE_C_FLAGS "")
 set(CMAKE_CXX_FLAGS "")
 
 # --- toolchain -------------------------------------------------------------------------------------------------------------
-if(NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
-  message(FATAL_ERROR "ufsm builds with clang only (cmake/llvm.cmake); got ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER}")
+# UFSM_TOOLCHAIN: llvm (cmake/llvm.cmake: clang + nvcc / clang -x cuda) or mcc (cmake/mcc.cmake: mcc for the host C and the CUDA
+# units, mcudahw for the runtime; --preset mcc). The mcc mode needs no CUDA toolkit: UFSM_CUDA is mcudahw's directory.
+set(UFSM_TOOLCHAIN llvm CACHE STRING "llvm (cmake/llvm.cmake) or mcc (cmake/mcc.cmake)")
+if(UFSM_TOOLCHAIN STREQUAL "mcc")
+  set(UFSM_CUDA_COMPILER mcc CACHE STRING "" FORCE)
+  set(UFSM_CUDA ${UFSM_MCC_CUDA} CACHE PATH "" FORCE)
+  set(UFSM_CUDA_VERSION mcc)
+  set(UFSM_LLVM_RUNTIME OFF CACHE BOOL "" FORCE)
+  set(UFSM_CCACHE OFF CACHE BOOL "" FORCE)   # (mcc compiles a unit in less time than ccache takes to hash it)
+  if(NOT EXISTS ${UFSM_CUDA}/include/mcuda_device.h OR NOT EXISTS ${UFSM_CUDA}/lib64/libcudart.a)
+    message(FATAL_ERROR "mcc: no mcudahw at ${UFSM_CUDA} (in the microc tree: sh mkcuda.sh MCC DIR hw; or -DUFSM_MCC_CUDA=)")
+  endif()
+elseif(NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
+  message(FATAL_ERROR "ufsm builds with clang (cmake/llvm.cmake) or mcc (cmake/mcc.cmake); got ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER}")
 endif()
-if(NOT UFSM_CUDA)
+if(UFSM_TOOLCHAIN STREQUAL "mcc")
+  # (no toolkit, no ptxas: the driver compiles mcc's PTX at run time)
+elseif(NOT UFSM_CUDA)
   if(EXISTS /usr/local/cuda/bin/ptxas)
     set(UFSM_CUDA /usr/local/cuda)
   else()
@@ -83,11 +99,13 @@ if(NOT UFSM_CUDA)
   endif()
   set(UFSM_CUDA ${UFSM_CUDA} CACHE PATH "" FORCE)
 endif()
-execute_process(COMMAND ${UFSM_CUDA}/bin/ptxas --version OUTPUT_VARIABLE _pv ERROR_QUIET)
-string(REGEX MATCH "release ([0-9.]+), V([0-9.]+)" _m "${_pv}")
-set(UFSM_CUDA_VERSION ${CMAKE_MATCH_2})
-if(NOT UFSM_CUDA_VERSION)
-  message(FATAL_ERROR "${UFSM_CUDA}/bin/ptxas --version: no version (${_pv})")
+if(NOT UFSM_TOOLCHAIN STREQUAL "mcc")
+  execute_process(COMMAND ${UFSM_CUDA}/bin/ptxas --version OUTPUT_VARIABLE _pv ERROR_QUIET)
+  string(REGEX MATCH "release ([0-9.]+), V([0-9.]+)" _m "${_pv}")
+  set(UFSM_CUDA_VERSION ${CMAKE_MATCH_2})
+  if(NOT UFSM_CUDA_VERSION)
+    message(FATAL_ERROR "${UFSM_CUDA}/bin/ptxas --version: no version (${_pv})")
+  endif()
 endif()
 if(UFSM_CCACHE)
   find_program(UFSM_CCACHE_EXE ccache)
@@ -174,6 +192,27 @@ set(UFSM_EXTRA_CFLAGS "" CACHE STRING "extra host C flags, appended last (experi
 separate_arguments(_extra UNIX_COMMAND "${UFSM_EXTRA_CFLAGS}")
 list(APPEND UFSM_CFLAGS ${_extra})
 set(UFSM_DEFS _GNU_SOURCE)
+if(UFSM_TOOLCHAIN STREQUAL "mcc")
+  # -mglibc: the machine's GNU C library (libcurl, zstd, blosc and the CUDA driver are its shared libraries). mcc takes and ignores
+  # -W and most -f. -march=native (user 11-14: every machine builds its own binary): mcc reads cpuid (+ XGETBV) and defines exactly
+  # what this CPU has; __AVX2__ / __FMA__ / __F16C__ / __BMI2__ switch ufsm's and volcomp's intrinsic paths on (mcc's <immintrin.h>
+  # is compiler builtins in VEX form since microc ebdc34c, 97 intrinsics byte-identical to clang). AVX-512 stays undefined until
+  # mcc's EVEX lands. A binary built here is for this machine only: pods build their own (scripts/pod/setup.sh).
+  # -O3: mcc's loop vectoriser. -fno-math-errno: sqrt in line, as with clang. -g: DWARF 5 lines, variables, CFI.
+  # Fast math (DESIGN 2026-11-14 "Fast math everywhere ..."): -ffast-math -fno-finite-math-only, which mcc parses (microc 08f32ee).
+  # Real effect today: reassociation (opt_vec vectorises float sums / dots: dot 0.467 -> 0.043 ns/elem at 256-bit); no host FMA
+  # contraction, reciprocal or no-signed-zeros transforms in mcc yet (gaps), so results differ from strict by sum order only. Float
+  # max / min reductions and the select -> min / max rewrite need -ffinite-math-only and stay off: NaN results stay exact.
+  # UFSM_STRICT_MATH=ON: the list without -ffast-math (sums in source order).
+  if(UFSM_STRICT_MATH)
+    set(UFSM_MCC_FP_CFLAGS)
+  else()
+    set(UFSM_MCC_FP_CFLAGS -ffast-math -fno-finite-math-only)
+  endif()
+  set(UFSM_CFLAGS -mglibc -std=c23 -O3 -march=native -fno-math-errno -g -pthread ${UFSM_MCC_FP_CFLAGS})
+  separate_arguments(_extra UNIX_COMMAND "${UFSM_EXTRA_CFLAGS}")
+  list(APPEND UFSM_CFLAGS ${_extra})
+endif()
 if(UFSM_STRICT_MATH)
   list(APPEND UFSM_DEFS UFSM_STRICT_MATH)   # tests/fm_tol.h: the GPU-vs-CPU / two-path tolerances collapse to exact
 endif()
@@ -282,8 +321,13 @@ add_library(ufsm_ldlibs INTERFACE)
 target_link_libraries(ufsm_ldlibs INTERFACE PkgConfig::UFSM_DEPS jpeg m pthread)
 add_library(ufsm_cudalibs INTERFACE)
 target_link_directories(ufsm_cudalibs INTERFACE ${UFSM_CUDA}/lib64)
-target_link_libraries(ufsm_cudalibs INTERFACE cudart cublasLt stdc++)
-target_link_options(ufsm_cudalibs INTERFACE -Wl,-rpath,${UFSM_CUDA}/lib64)
+if(UFSM_TOOLCHAIN STREQUAL "mcc")
+  # mcudahw's static libcudart.a (it dlopens libcuda.so.1 and libcublasLt.so); its libcublasLt.a / libstdc++.a hold nothing
+  target_link_libraries(ufsm_cudalibs INTERFACE cudart cublasLt stdc++ dl)
+else()
+  target_link_libraries(ufsm_cudalibs INTERFACE cudart cublasLt stdc++)
+  target_link_options(ufsm_cudalibs INTERFACE -Wl,-rpath,${UFSM_CUDA}/lib64)
+endif()
 
 function(ufsm_host_obj name src)
   add_library(obj_${name} OBJECT ${src})
@@ -386,10 +430,28 @@ if(UFSM_CUDA_COMPILER STREQUAL "nvcc")
   if(UFSM_PTXAS_SPLIT GREATER 1)
     list(APPEND UFSM_CU_FLAGS "SHELL:-Xptxas --split-compile=${UFSM_PTXAS_SPLIT}")
   endif()
+elseif(UFSM_CUDA_COMPILER STREQUAL "mcc")
+  # mcc reads a .cu as CUDA C++ (by its suffix) and writes the device side as PTX into the object; mcudahw links and JIT-compiles
+  # it through the driver at the first launch (cached in ~/.cache/mcudahw; MCUDA_PRECOMPILE=N warms the cache). --cuda-arch: the
+  # PTX .target and __CUDA_ARCH__ (1200a: the block-scaled mma of the lp_* units). mcuda_device.h: what nvcc knows without a header.
+  if(UFSM_ARCH STREQUAL "120")
+    set(UFSM_NN_ARCH --cuda-arch=1200)
+    set(UFSM_LP_ARCH --cuda-arch=1200a)
+  else()
+    set(UFSM_NN_ARCH --cuda-arch=${UFSM_ARCH}0)
+    set(UFSM_LP_ARCH --cuda-arch=${UFSM_ARCH}0)
+  endif()
+  set(UFSM_CU_FLAGS -mglibc -O3 -D_GNU_SOURCE -DUFSM_CUDA_VERSION=mcc "SHELL:-isystem ${UFSM_CUDA}/include"
+      "SHELL:-include ${UFSM_CUDA}/include/mcuda_device.h"
+      "SHELL:-include ${CMAKE_SOURCE_DIR}/src/ufsm_dev.cuh")   # (the logical-device map, as the clang / nvcc paths: else cudaSetDevice is unwrapped and ufsm_dev_phys an implicit extern)
+  set(UFSM_CU_FAST --cuda-fast-math)   # (nvcc's -use_fast_math)
+  set(UFSM_CU_STRICT -fmad=false)
 endif()
 function(ufsm_cuda_obj name src arch)
   add_library(obj_${name} OBJECT ${src})
-  if(NOT UFSM_CUDA_COMPILER STREQUAL "nvcc")
+  if(UFSM_CUDA_COMPILER STREQUAL "mcc")
+    set_source_files_properties(${src} PROPERTIES LANGUAGE C)   # (mcc: a .cu is CUDA C++ by its suffix)
+  elseif(NOT UFSM_CUDA_COMPILER STREQUAL "nvcc")
     set_source_files_properties(${src} PROPERTIES LANGUAGE CXX)
   endif()
   if(UFSM_STRICT_MATH AND name IN_LIST UFSM_STRICT_UNITS)
@@ -474,7 +536,7 @@ function(ufsm_exe name)
     endif()
   endforeach()
   target_link_libraries(${name} PRIVATE ${objs} ${libs})
-  if(cuda)
+  if(cuda AND NOT UFSM_TOOLCHAIN STREQUAL "mcc")   # (mcc links the CUDA objects as C: no C++ runtime in them)
     set_target_properties(${name} PROPERTIES LINKER_LANGUAGE CXX)
   endif()
   foreach(i ${A_INC})
@@ -563,9 +625,16 @@ endforeach()
 add_custom_target(suite-check
   COMMAND bash ${CMAKE_SOURCE_DIR}/cmake/suite_check.sh ${CMAKE_SOURCE_DIR} "${_suite}"
   USES_TERMINAL VERBATIM)
+# jit-warm (mcc): fill mcudahw's kernel cache for this build's ufsm on the first visible GPU (scripts/toolchain/jit_warm.sh: every kernel
+# the cache lacks through the driver's ptxas, cgroup CPUs at a time), so no kernel JIT-compiles inside a step. Needs a GPU
+if(UFSM_TOOLCHAIN STREQUAL "mcc")
+  add_custom_target(jit-warm
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/toolchain/jit_warm.sh $<TARGET_FILE:ufsm>
+    DEPENDS ufsm USES_TERMINAL VERBATIM)
+endif()
 # doctor: the toolchain picked, then the machine's real limits (cgroup CPUs / RAM, GPUs / MIG, CUDA, disk)
 add_custom_target(doctor
-  COMMAND ${CMAKE_COMMAND} -E echo "cmake: CC=${CMAKE_C_COMPILER} (clang ${CMAKE_C_COMPILER_VERSION}), CUDA=${UFSM_CUDA} (${UFSM_CUDA_VERSION}), ARCH=${UFSM_ARCH}, VERIFY=${UFSM_VERIFY}, runtime=$<IF:$<BOOL:${UFSM_LLVM_RUNTIME}>,compiler-rt,libgcc>+libstdc++, ccache=${UFSM_CCACHE_EXE}, build dir ${CMAKE_BINARY_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E echo "cmake: toolchain ${UFSM_TOOLCHAIN}, CC=${CMAKE_C_COMPILER} (${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}), CUDA=${UFSM_CUDA} (${UFSM_CUDA_VERSION}), ARCH=${UFSM_ARCH}, VERIFY=${UFSM_VERIFY}, runtime=$<IF:$<BOOL:${UFSM_LLVM_RUNTIME}>,compiler-rt,libgcc>+libstdc++, ccache=${UFSM_CCACHE_EXE}, build dir ${CMAKE_BINARY_DIR}"
   COMMAND ${CMAKE_COMMAND} -E echo "cmake: libs: libcurl=${UFSM_DEPS_libcurl_VERSION} libzstd=${UFSM_DEPS_libzstd_VERSION} blosc=${UFSM_DEPS_blosc_VERSION} zlib=${UFSM_DEPS_zlib_VERSION} libcrypto=${UFSM_DEPS_libcrypto_VERSION}"
   COMMAND ${CMAKE_BINARY_DIR}/ufsm sysinfo --disk ${CMAKE_SOURCE_DIR} --disk /tmp
   DEPENDS ufsm USES_TERMINAL VERBATIM)

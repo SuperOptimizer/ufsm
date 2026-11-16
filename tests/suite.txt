@@ -223,6 +223,7 @@ test_share_enc_a1                              | gpu          |     5 | ./$B/tes
 test_pipeline_cli                              | gpu2,l2      |    85 | python3 tests/test_pipeline_cli.py
 test_ingest_lut                                |              |     3 | python3 tests/test_ingest_lut.py
 test_mgpu_lint                                 |              |     2 | python3 tests/test_mgpu_lint.py
+test_suite_kill                                |              |     2 | bash tests/test_suite_kill.sh
 test_ink_blend                                 |              |     4 | python3 tests/test_ink_blend.py
 test_seamless                                  |              |     6 | python3 tests/test_seamless.py
 test_cover_training                            | gpu2,l2      |    16 | python3 tests/test_cover_training.py
@@ -353,6 +354,7 @@ test_mesh_phase                                | gpu          |     8 | tests/te
 test_lldec                                     | gpu,smoke    |     3 | ./$B/test_lldec $TMPDIR/lldec
 test_echo                                      | gpu          |    40 | tests/test_echo.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/echo
 test_lab_early_split                           | gpu          |    40 | tests/test_lab_early_split.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/labearlysplit
+test_mcc_compile                               |              |    30 | bash tests/mcc_compile.sh
 # the sanitize group (ops audit #9): compute-sanitizer racecheck (shared-memory hazards) / synccheck (barrier misuse) on small GPU tests
 test_ink_mil~racecheck                         | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_ink_mil
 test_ink_mil~synccheck                         | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_ink_mil
