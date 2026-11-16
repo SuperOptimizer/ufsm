@@ -49,6 +49,7 @@ if [ "$BOXES" = core ]; then BL=$(grep -v '^#' $BT | awk -F'\t' '$10 !~ /label-n
 else BL=$BOXES; fi
 step=$(head -c 16384 $CK | tr ',' '\n' | grep -a -m1 '"step":' | grep -aoE '[0-9]+')
 log "wgate $TAG ckpt $CK (step ${step:-?}) vs $REF: $(echo $BL | wc -w) boxes, sites ${SITES:-none}, predict $(basename $UP), fitter $(basename $U) ($FCFG), lanes $FL"
+. $H/ckid.sh; ckid_check $O "$CK" || exit 2; log "checkpoint id $CKID"
 echo "$CK" > $O/ckpt
 rm -f $O/ready/.end; rm -rf $O/claim/*
 

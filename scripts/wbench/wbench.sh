@@ -42,6 +42,7 @@ GQ=$H/gpuq.sh; [ -e $GQ ] || GQ=$H/../gpuq.sh; GPUQ_LOCK=$LOCK; . $GQ
 lk() { [ -n "$LK" ] && gpuq_acquire ${PRIO:-bg} wbench-$TAG; return 0; }
 ulk() { [ -n "$LK" ] && gpuq_yield; return 0; }
 log "wbench $TAG ckpt $CK fields $FT fitter $FCFG ($BIN $FIT) site $SITE gpu $GPU"
+. $H/ckid.sh; ckid_check $O "$CK" || exit 2; echo "$CKID" > $WB/res/$TAG.ckid; log "checkpoint id $CKID"
 echo "$CK" > $O/ckpt; echo "$BIN $FIT" > $O/fitter
 
 scroll() {   # scroll SCROLL: R V UM LV AX QR QK PR PK PF (PF: CT voxels per label-phase raster voxel)

@@ -30,6 +30,7 @@ RVSC=${RVSC:-p1667 p139 p4}; BOXES=${BOXES:-core}; REFS=${REFS:-}; GPUS=${GPUS:-
 PX=${PX-}; PXH=${PXH:-}; CTROOT=${CTROOT:-/vesuvius/ufsm/v2/ct}; RVE=${RVE:-/mnt/scratch/rv/eval}
 INKC=${INKC:-/vesuvius/ufsm/inkgt/evcrops /vesuvius/ufsm/inkgt/evcrops-ho}; INKGT=${INKGT:-/vesuvius/ufsm/inkgt/evgt /vesuvius/ufsm/inkgt/evgt-ho}
 Q=$E/$T/q; LG=$E/$T.ueval.log; mkdir -p $Q
+. $H/scripts/wbench/ckid.sh; ckid_check $E/$T "$CK" || exit 2
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $LG; }
 blk() { [[ " $BLOCKS " == *" $1 "* ]]; }
 has() { blk fit && [[ " $TASKS " == *" $1 "* ]]; }
@@ -41,7 +42,7 @@ boxes() { if [ "$BOXES" = core ]; then grep -v '^#' $H/scripts/wbench/boxes.tsv 
 crops() { for c in $WB/inkeval/crops $INKC; do grep -v '^#' $c/crops.tsv | cut -f1; done; }
 { blk unseen && grep -v '^#' $UB | cut -f1 | sed 's/^/u:/'; has rv && for s in $RVSC; do echo rv:$s; done; has fib && echo fib:hold
   paste -d '\n' <(has wind && boxes | sed 's/^/wind:/') <(has ink && crops | sed 's/^/ink:/') | grep . ; } > $Q/pieces
-log "ueval $T ckpt $CK binary $B ($(sha1sum $B | cut -c1-8)) blocks [$BLOCKS] fit tasks [$TASKS] gpus [$GPUS] split $SPLIT: $(wc -l < $Q/pieces) pieces"
+log "ueval $T ckpt $CK ($CKID) binary $B ($(sha1sum $B | cut -c1-8)) blocks [$BLOCKS] fit tasks [$TASKS] gpus [$GPUS] split $SPLIT: $(wc -l < $Q/pieces) pieces"
 
 # ---- the unseen block: a box's GPU piece (predicts, fit, wraps, renders) and its CPU QA
 ubox() { IFS=$'\t' read -r un sc ur uk uum ulv uz uy ux unz uny unx uax _ <<< "$(awk -F'\t' -v b=$1 '$1 == b' $UB)"; [ -n "${unx:-}" ]; }

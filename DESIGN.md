@@ -6,6 +6,16 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Eval tags carry their checkpoint's identity (scripts/wbench/ckid.sh) (2026-11-15, branch evalfix-port-20261115, off wt-evalfix)
+
+Eval audit 11-14 #21: wbench / wgate / ueval rows carried no checkpoint hash, and a rerun of a tag with another checkpoint overwrote
+`$O/ckpt` while the old fields, predictions and result rows stayed and were reused (every stage skips work whose output exists). Now
+`ckid_check DIR CKPT` (sourced) writes `DIR/ckid` = sha256 prefix (16 hex) + the header's `"step":N`, and refuses (exit 2) a tag dir
+that already holds another checkpoint's id; `FORCE_TAG=1` accepts it and says the outputs mix. wbench.sh (`runs/TAG`, plus
+`res/TAG.ckid` beside the result tsv), wgate.sh (`gate/TAG`) and ueval.sh (`E/TAG`, the id in its first log line) call it. Cost: one
+sha256 of the checkpoint per run, 1.7 s for the 2.08 GB admuon start.ckpt (page-cached). Test: tests/test_ckid.sh (fast tier, CPU, 0.05 s): accept,
+rerun, refuse (the old id kept), FORCE_TAG, missing file.
+
 ## Muon update scaling (--muon-scale rms) and cautious weight decay (--muon-cwd 1) (2026-11-15, branches muonscale-20261115, cwd-20261115)
 
 Two opt-in Muon options, both off by default. They are implemented and tested; the quality A/B is deferred by the 11-15 drain order (plan
