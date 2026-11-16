@@ -6,6 +6,25 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Ink teachers: combining the ink-sdk ports, Hecate 2.4 joins reader3 + ink9um (+0.012 AUC) (2026-11-16)
+
+/vesuvius/ufsm/inkteach/ens/ens3.py (out ens3.txt): the 9 teachers with maps on all 24 held-out crops (reader3, ink9um s42+s43,
+hecate24, canon2, rectina, reader2, dense9, studio, trace3b; v8in / A-hn / tsf / hecate96 left out: weak or not on every crop), per-crop
+AUC, paired bootstrap over crops vs the current ink-teach recipe (reader3 + ink9um logit sum, 0.9327 here).
+| combiner | PHerc0139 | PHerc1667 | Paris 4 | crops | dAUC [95 % CI] |
+|---|---|---|---|---|---|
+| z-sum reader3 + ink9um + hecate24 | 0.9911 | 0.9741 | 0.9260 | 0.9449 | +0.0121 [+0.0056, +0.0199] |
+| z-sum reader3 + hecate24 | 0.9877 | 0.9747 | 0.9253 | 0.9439 | +0.0112 [+0.0040, +0.0198] |
+| LOSO logistic stack, 5 best | 0.9897 | 0.9777 | 0.9221 | 0.9426 | +0.0099 |
+| LOSO stack, all 9 | 0.9893 | 0.9749 | 0.9171 | 0.9388 | +0.0060 (n.s.) |
+| current r3 + i9 logit | 0.9860 | 0.9419 | 0.9171 | 0.9327 | 0 |
+| hecate24 alone | 0.9835 | 0.9680 | 0.9083 | 0.9308 | |
+Greedy forward selection on z-logit sums stops at hecate24 + reader3 + ink9um (+ rectina: 0.9442, down). canon2, rectina, reader2,
+dense9, studio, trace3b add nothing to the three; the stacks give them ~0 or negative weight. Hecate 2.4 brings what the 9.6 um nets
+lack: PHerc1667 0.942 -> 0.974. Combiner: per-map z-score (median / std over the map) then sum; a learned stack is no better.
+Cost: hecate24 reads 2.4 um level 0 (not in the local CT mirror), tile 256 / stride 128: its throughput decides whether the full pass
+can afford it (bench pending).
+
 ## ink-ext: every ink-sdk profile in our own ports (canon2, studio, tsf; the ink_9um / v8in / Hecate checkpoints) (2026-11-16, branch inksdk-20261116)
 
 The 18 profiles of github.com/LimeGS/ink-sdk (main 9afd5b0, MIT; src/ink_sdk/profiles/*.toml: weights, pinned revision, sha256,
