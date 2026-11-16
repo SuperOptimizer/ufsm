@@ -53,6 +53,7 @@ typedef struct {
     void *w; float *scale, *bias;                        /* device: fp16 [Cop][Kp]; fp32 [co] */
     int tconv;                                           /* ConvTranspose k2 s2: GEMM to 4 (2D; tconv 1) or 8 (3D; tconv 2) co channels, shuffled */
     float *tbias;                                        /* the transposed conv's bias [co] */
+    int mxrot;                                           /* UFSM_XNET_MXROT: the packed weights are H16-rotated per 16-K block; the input is re-quantised rotated */
     void *mxq, *mxs, *mxs2; float *mxgs; int mxsf, nch;         /* UFSM_XNET_MX (ci % 32 == 0): packed fp4 weights [Cop][Kp / 2], scales [Cop][Kp / 32][4] (two 16-K
                                                             blocks per 32-K chunk, bytes 2..3 unused), the per-row fp32 scale (ue4m3 format), the scale format (6 ue8m0,
                                                             5 ue4m3), nch = 32-K chunks of K (the GEMM runs on the MX-fp4 tensor cores, inputs quantised on the fly) */
@@ -70,6 +71,7 @@ void xnet_set_mx(int sf);
 int xnet_mx(void);                      /* the MX format of convs initialised now (0: fp16) */
 void xnet_set_mxq(int mode);            /* the MX weight quantiser (UFSM_XNET_MXQ): 0 amax / 6 block scales, 1 least-squares block scales, 2 + row scale */
 void xnet_set_mx_skip(const char *list);   /* convs kept fp16 by their initialisation index ("3,7-9"; UFSM_XNET_MX_SKIP) */
+void xnet_set_mxrot(int on);            /* UFSM_XNET_MXROT: H16-rotate the 16-blocks of MX convs initialised from now (weights at pack, inputs in k_xq) */
 void xnet_wseq_reset(void);             /* a new net: initialisation indices restart at 0 (UFSM_XNET_MX_SKIP, UFSM_XNET_FQ weight mask) */
 /* the fused MX inference path (ink3d-ext): a conv that also returns the InstanceNorm sums of its output (st: device doubles [n][co][2]:
    sum, sum of squares; free with xfree_dev), the per-(sample, channel) affine of IN (coef [n][C][2]: a = gamma rstd, b = beta - mean a),

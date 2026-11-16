@@ -505,7 +505,26 @@ static void *pack_worker(void *a) {
         for (int o = o0; o < o0 + 8 && o < P->Cop; o++) pack_row(P, o);
     }
 }
+static int mx_pack1(xconv *c, const float *wk, int co, int sf, int wseq);
+static int g_mxrot = -1;   /* UFSM_XNET_MXROT=1: weights and activations of every MX conv H16-rotated per 16-block (exact in real arithmetic: the
+                                block dot products are invariant); mgpu: env */
+extern "C" void xnet_set_mxrot(int on) { g_mxrot = on; }
 static int mx_pack(xconv *c, const float *wk, int co, int sf, int wseq) {
+    if (g_mxrot < 0) { const char *e = getenv("UFSM_XNET_MXROT"); g_mxrot = e && *e ? atoi(e) : 0; }
+    float *wr = nullptr;
+    if (g_mxrot && c->K % 16 == 0) {
+        wr = (float *)malloc((size_t)co * c->K * sizeof(float)); if (!wr) return -1;
+        memcpy(wr, wk, (size_t)co * c->K * sizeof(float));
+        for (size_t b = 0; b < (size_t)co * c->K; b += 16) {
+            float *u = wr + b; for (int len = 1; len < 16; len <<= 1) for (int i = 0; i < 16; i += 2 * len) for (int j = i; j < i + len; j++) { const float a = u[j], cc = u[j + len]; u[j] = a + cc; u[j + len] = a - cc; }
+            for (int i = 0; i < 16; i++) u[i] *= .25f;
+        }
+        wk = wr; c->mxrot = 1;
+    }
+    const int rc = mx_pack1(c, wk, co, sf, wseq); free(wr);
+    return rc;
+}
+static int mx_pack1(xconv *c, const float *wk, int co, int sf, int wseq) {
     const int nch = (c->K + 31) / 32, nst = (nch + 1) / 2, Cop = (co + 63) / 64 * 64; const size_t rch = (size_t)nst * 2;
     uint8_t *q = (uint8_t *)calloc((size_t)Cop * rch * 16, 1), *sb = (uint8_t *)calloc((size_t)Cop * rch * 4, 1); float *gs = (float *)malloc(Cop * sizeof(float));
     double *err = (double *)calloc((size_t)Cop * 3, sizeof(double));
@@ -968,12 +987,25 @@ static int mxh_launch(const MxP &m, int sf, const unsigned *ws2) {
     return 1;
 }
 /* fp16 NDHWC (C % 32 == 0) -> the MX-fp4 activation layout above, one thread per (voxel, 16-channel block) */
-template <int SF> __global__ void k_xq(const __half *x, uint8_t *q, uint8_t *s, long long nb16) {
+__device__ __forceinline__ void wht16(float *u) {   /* u <- H16 u / 4 (orthonormal, its own inverse) */
+#pragma unroll
+    for (int len = 1; len < 16; len <<= 1)
+#pragma unroll
+        for (int i = 0; i < 16; i += 2 * len)
+#pragma unroll
+            for (int j = i; j < i + len; j++) { const float a = u[j], c = u[j + len]; u[j] = a + c; u[j + len] = a - c; }
+#pragma unroll
+    for (int i = 0; i < 16; i++) u[i] *= .25f;
+}
+template <int SF, bool ROT = false> __global__ void k_xq(const __half *x, uint8_t *q, uint8_t *s, long long nb16) {   /* ROT: each 16-block H16-rotated first (UFSM_XNET_MXROT) */
     const long long b = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (b >= nb16) return;
     __align__(16) __half hv[16]; *(uint4 *)hv = *(const uint4 *)(x + b * 16); *(uint4 *)(hv + 8) = *(const uint4 *)(x + b * 16 + 8);
     float v[16], am = 0.f;
 #pragma unroll
-    for (int i = 0; i < 16; i++) { v[i] = __half2float(hv[i]); am = fmaxf(am, fabsf(v[i])); }
+    for (int i = 0; i < 16; i++) v[i] = __half2float(hv[i]);
+    if constexpr (ROT) wht16(v);
+#pragma unroll
+    for (int i = 0; i < 16; i++) am = fmaxf(am, fabsf(v[i]));
     uint2 o; uint8_t sc;
     if constexpr (SF == 6) { const int e = mx_exp(am, 1.f / 6.f); const float m = exp2i(-e); o.x = cvt_e2m1x8(v, m); o.y = cvt_e2m1x8(v + 8, m); sc = (uint8_t)(e + 127); }
     else {
@@ -1042,11 +1074,14 @@ static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *ln
     p.K = c->K; p.Kp = c->Kp; p.M = (long long)in.n * Do * Ho * Wo; p.act = act; p.lnw = lnw; p.lnb = lnb; p.lneps = lneps;
     p.st = st && !res && act == XA_NONE ? st : nullptr;
     g_macs += (double)p.M * c->co * c->K;
-    if (c->mxq && !fq.p && in.c == c->ci && p.M > 0 && (in.p || in.q) && !(act & (XA_LN | XA_GLU)) && !res && (act & 15) == XA_NONE) {   /* the MX-fp4 path */
-        const long long nb16 = (long long)(xt_numel(in) / 16); uint8_t *qb = (uint8_t *)in.q, *qtmp = nullptr;
+    if (c->mxrot && !in.p) fprintf(stderr, "xnet: a rotated MX conv (UFSM_XNET_MXROT) needs its fp16 input (fused MX-only producers are not rotated)\n");
+    if (c->mxq && !fq.p && in.c == c->ci && p.M > 0 && (in.p || (in.q && !c->mxrot)) && !(act & (XA_LN | XA_GLU)) && !res && (act & 15) == XA_NONE) {   /* the MX-fp4 path */
+        const long long nb16 = (long long)(xt_numel(in) / 16); uint8_t *qb = c->mxrot ? nullptr : (uint8_t *)in.q, *qtmp = nullptr;   /* (a rotated conv re-quantises its input) */
         if (!qb) {
             qb = qtmp = (uint8_t *)xmalloc_dev(xq_size(xt_numel(in)));
-            if (c->mxsf == 6) k_xq<6><<<nblk(nb16, 256), 256, 0, g_st>>>((const __half *)in.p, qb, qb + xq_soff(xt_numel(in)), nb16);
+            if (c->mxrot) { if (c->mxsf == 6) k_xq<6, true><<<nblk(nb16, 256), 256, 0, g_st>>>((const __half *)in.p, qb, qb + xq_soff(xt_numel(in)), nb16);
+                            else k_xq<5, true><<<nblk(nb16, 256), 256, 0, g_st>>>((const __half *)in.p, qb, qb + xq_soff(xt_numel(in)), nb16); }
+            else if (c->mxsf == 6) k_xq<6><<<nblk(nb16, 256), 256, 0, g_st>>>((const __half *)in.p, qb, qb + xq_soff(xt_numel(in)), nb16);
             else k_xq<5><<<nblk(nb16, 256), 256, 0, g_st>>>((const __half *)in.p, qb, qb + xq_soff(xt_numel(in)), nb16);
         }
         uint8_t *sb = qb + xq_soff(xt_numel(in));

@@ -73,6 +73,8 @@ static void qrow_s(float *r, int K, int sf, int mode, float am) {   /* K % 16 ==
     }
     for (int k = 0; k < K; k += 16) q16s(r + k, sf, gs, 1);
 }
+static int g_rot = 0;   /* UFSM_XNET_MXROT: x and w 16-blocks rotated by H16 / 4 before the quantisation */
+static void wht16h(float *u) { for (int len = 1; len < 16; len <<= 1) for (int i = 0; i < 16; i += 2 * len) for (int j = i; j < i + len; j++) { const float a = u[j], c = u[j + len]; u[j] = a + c; u[j + len] = a - c; } for (int i = 0; i < 16; i++) u[i] *= .25f; }
 static float h2f(uint16_t h) {   /* fp16 bits -> float */
     const int s = h >> 15, e = (h >> 10) & 31, m = h & 1023; float v;
     if (e == 0) v = ldexpf((float)m, -24); else if (e == 31) v = m ? NAN : INFINITY; else v = ldexpf((float)(m | 1024), e - 25);
@@ -95,14 +97,15 @@ static int run(int sf, int N, int D, int H, int W, int ci, int co, int k, int st
     for (size_t i = 0; i < (size_t)co * ci * k * k * k; i++) w[i] = rnd() * 0.05f * (i % 13 == 0 ? 4.f : 1.f);
     for (int o = 0; o < co; o++) b[o] = rnd();
     /* the reference: quantised x and weights (GEMM order), double sums */
-    for (size_t v = 0; v < nx / ci; v++) for (int c = 0; c < ci; c += 16) q16(x + v * ci + c, sf, 1.f);
+    for (size_t v = 0; v < nx / ci; v++) for (int c = 0; c < ci; c += 16) { if (g_rot) wht16h(x + v * ci + c); q16(x + v * ci + c, sf, 1.f); }
     for (int o = 0; o < co; o++) {
         float am = 0.f;
         for (int i = 0; i < ci; i++) for (int t = 0; t < k * k * k; t++) { const float v = w[((size_t)o * ci + i) * k * k * k + t]; wk[(size_t)o * K + t * ci + i] = v; am = fmaxf(am, fabsf(v)); }
+        if (g_rot) { am = 0.f; for (int kk = 0; kk < K; kk += 16) wht16h(wk + (size_t)o * K + kk); for (int kk = 0; kk < K; kk++) am = fmaxf(am, fabsf(wk[(size_t)o * K + kk])); }
         if (mode && am > 0.f) qrow_s(wk + (size_t)o * K, K, sf, mode, am);
         else for (int kk = 0; kk < K; kk += 16) q16(wk + (size_t)o * K + kk, sf, sf == 5 && am > 0.f ? am / 2688.f : 1.f);
     }
-    xnet_set_mx(sf); xnet_set_mxq(mode);
+    xnet_set_mx(sf); xnet_set_mxq(mode); xnet_set_mxrot(g_rot);
     xconv c; if (xconv_init(&c, w, co, ci, k, k, k, st, st, st, pd, pd, pd, nullptr, b)) { fprintf(stderr, "xconv_init failed\n"); return 1; }
     xt xd = xt_new(N, D, H, W, ci); xh2d(xd.p, xh, nx * 2);
     xt yd = xconv_fwd(&c, xd, nullptr, XA_NONE); xd2h(yh, yd.p, ny * 2);
@@ -120,7 +123,7 @@ static int run(int sf, int N, int D, int H, int W, int ci, int co, int k, int st
         if (d > emax) emax = d; if (fabs(s) > ymax) ymax = fabs(s);
         if (d > 1e-3 * fabs(s) + 2e-4 * ymax + 1e-3) bad++;
     }
-    printf("sf %d q %d N %d %dx%dx%d ci %3d co %3d k %d s %d: max |d| %.3g (max |y| %.3g), %zu of %zu over the bound\n", sf, mode, N, D, H, W, ci, co, k, st, emax, ymax, bad, ny);
+    printf("sf %d q %d%s N %d %dx%dx%d ci %3d co %3d k %d s %d: max |d| %.3g (max |y| %.3g), %zu of %zu over the bound\n", sf, mode, g_rot ? " rot" : "", N, D, H, W, ci, co, k, st, emax, ymax, bad, ny);
     xt_free(&xd); xt_free(&yd); xconv_free(&c); free(xh); free(yh); free(x); free(w); free(wk); free(b);
     return bad != 0;
 }
@@ -190,7 +193,9 @@ int main(void) {
             fails += run(sf, 1, 7, 9, 36, 128, 64, 3, 1, mode);
         }
     }
-    xnet_set_mxq(0);
+    g_rot = 1;   /* H16-rotated blocks (UFSM_XNET_MXROT) */
+    for (int sf = 6; sf >= 5; sf--) { fails += run(sf, 2, 9, 7, 11, 32, 32, 3, 1, 2); fails += run(sf, 1, 7, 9, 36, 128, 64, 3, 1, 0); fails += run(sf, 1, 6, 5, 7, 128, 256, 1, 1, 2); }
+    g_rot = 0; xnet_set_mxq(0); xnet_set_mxrot(0);
     fails += run_gn(2, 17, 64, 48, 16, 16, 0.f);     /* the depth-fusion shape (InstanceNorm: G = C) */
     fails += run_gn(3, 1, 40, 36, 32, 32, 20.f);     /* mean >> std: the shifted sums */
     fails += run_gn(2, 1, 12, 12, 320, 32, 1.f);     /* deep level, 10 channels a group */
