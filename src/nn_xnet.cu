@@ -1332,45 +1332,43 @@ extern "C" xt xconcat_q(xt a, xt b) {
 }
 
 /* ---- GroupNorm / InstanceNorm ---- */
-__global__ void k_chansum(const __half *x, int C, long long S, int nchunk, const float *gmean /* [n][C] per-channel group mean or nullptr */, double *out /* [n][C] */) {
-    extern __shared__ float sh[];   /* C floats */
-    const int n = blockIdx.y; const long long per = (S + nchunk - 1) / nchunk, s0 = blockIdx.x * per, s1 = s0 + per < S ? s0 + per : S;
-    for (int c = threadIdx.x; c < C; c += blockDim.x) sh[c] = 0.f;
-    __syncthreads();
-    const __half *xb = x + (size_t)n * S * C; const float *gm = gmean ? gmean + (size_t)n * C : nullptr;
-    /* each thread a fixed channel pair column when C is even: elements i = s * C + c */
-    const long long total = (s1 - s0) * C;
-    float accv[8] = {0}; int cslot = -1;
-    if (C % 2 == 0 && blockDim.x % (C / 2) == 0 && C / 2 <= (int)blockDim.x) {
-        const int pairs = C / 2, cp = threadIdx.x % pairs, rows = blockDim.x / pairs; const int c = cp * 2;
-        float a0 = 0, a1 = 0; const float m0 = gm ? gm[c] : 0.f, m1 = gm ? gm[c + 1] : 0.f;
-        for (long long s = s0 + threadIdx.x / pairs; s < s1; s += rows) {
-            const __half2 v = *(const __half2 *)(xb + (size_t)s * C + c); const float f0 = __low2float(v) - m0, f1 = __high2float(v) - m1;
-            if (gm) { a0 += f0 * f0; a1 += f1 * f1; } else { a0 += f0; a1 += f1; }
+/* deterministic one-pass statistics: block (chunk, n) sums x - sh_c and its square per channel (sh_c = the sample's first voxel: no
+   cancellation), each thread a fixed channel pair and a fixed row stride, rows combined in a fixed order -> part[n][chunk][C][2]
+   (double). The old two-pass kernel combined with shared / global float atomics, so its sums depended on the schedule: harmless in
+   fp16, but every flip of an MX-fp4 rounding downstream moved the 2-D teachers' AUC by up to 0.004 per scroll between identical runs. */
+__global__ void k_gnpart(const __half *x, int C, long long S, int nchunk, double *part) {
+    extern __shared__ float sh[];   /* [rows][C][2] */
+    const int n = blockIdx.y, pairs = C / 2, t = threadIdx.x; const int rows = pairs <= (int)blockDim.x ? (int)blockDim.x / pairs : 1;
+    const long long per = (S + nchunk - 1) / nchunk, s0 = blockIdx.x * per, s1 = s0 + per < S ? s0 + per : S;
+    const __half *xb = x + (size_t)n * S * C;
+    for (int cp0 = pairs <= (int)blockDim.x ? t % pairs : t; cp0 < pairs; cp0 += (int)blockDim.x) {
+        const int row = pairs <= (int)blockDim.x ? t / pairs : 0; if (row >= rows) break;
+        const int c = cp0 * 2; const __half2 h0 = *(const __half2 *)(xb + c); const float m0 = __low2float(h0), m1 = __high2float(h0);
+        float a0 = 0.f, a1 = 0.f, q0 = 0.f, q1 = 0.f;
+        for (long long v = s0 + row; v < s1; v += rows) {
+            const __half2 h = *(const __half2 *)(xb + (size_t)v * C + c); const float f0 = __low2float(h) - m0, f1 = __high2float(h) - m1;
+            a0 += f0; a1 += f1; q0 += f0 * f0; q1 += f1 * f1;
         }
-        atomicAdd(&sh[c], a0); atomicAdd(&sh[c + 1], a1); cslot = 1;
+        float *o = sh + ((size_t)row * C + c) * 2; o[0] = a0; o[1] = q0; o[2] = a1; o[3] = q1;
+        if (pairs <= (int)blockDim.x) break;
     }
-    if (cslot < 0) {
-        for (long long i = threadIdx.x; i < total; i += blockDim.x) {
-            const int c = (int)(i % C); const float f = __half2float(xb[(size_t)s0 * C + i]) - (gm ? gm[c] : 0.f);
-            atomicAdd(&sh[c], gm ? f * f : f);
-        }
-    }
-    (void)accv;
     __syncthreads();
-    for (int c = threadIdx.x; c < C; c += blockDim.x) atomicAdd(&out[(size_t)n * C + c], (double)sh[c]);
+    for (int c = t; c < C; c += blockDim.x) {
+        double a = 0.0, q = 0.0;
+        for (int r = 0; r < rows; r++) { a += sh[((size_t)r * C + c) * 2]; q += sh[((size_t)r * C + c) * 2 + 1]; }
+        double *o = part + (((size_t)n * nchunk + blockIdx.x) * C + c) * 2; o[0] = a; o[1] = q;
+    }
 }
-__global__ void k_gn_mean(const double *sum, int n, int C, int G, long long S, float *gmean) {   /* per channel: its group's mean */
-    const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n * C) return;
-    const int nn = i / C, c = i % C, cpg = C / G, g = c / cpg; double s = 0;
-    for (int k = 0; k < cpg; k++) s += sum[(size_t)nn * C + g * cpg + k];
-    gmean[i] = (float)(s / ((double)S * cpg));
-}
-__global__ void k_gn_rstd(const double *sq, int n, int C, int G, long long S, float eps, float *rstd) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n * C) return;
-    const int nn = i / C, c = i % C, cpg = C / G, g = c / cpg; double s = 0;
-    for (int k = 0; k < cpg; k++) s += sq[(size_t)nn * C + g * cpg + k];
-    rstd[i] = (float)(1.0 / sqrt(s / ((double)S * cpg) + eps));
+__global__ void k_gnfin(const __half *x, const double *part, int n, int C, int G, long long S, int nchunk, float eps, float *gm, float *rs) {   /* thread per (n, group) */
+    const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n * G) return;
+    const int nn = i / G, g = i % G, cpg = C / G; double sx = 0.0, sxx = 0.0;
+    for (int c = g * cpg; c < (g + 1) * cpg; c++) {
+        double a = 0.0, q = 0.0; const double m = __half2float(x[(size_t)nn * S * C + c]);
+        for (int k = 0; k < nchunk; k++) { const double *p = part + (((size_t)nn * nchunk + k) * C + c) * 2; a += p[0]; q += p[1]; }
+        sx += a + (double)S * m; sxx += q + 2.0 * m * a + (double)S * m * m;
+    }
+    const double N = (double)S * cpg, mean = sx / N, var = fmax(sxx / N - mean * mean, 0.0); const float r = (float)(1.0 / sqrt(var + eps));
+    for (int c = g * cpg; c < (g + 1) * cpg; c++) { gm[(size_t)nn * C + c] = (float)mean; rs[(size_t)nn * C + c] = r; }
 }
 __global__ void k_gn_apply(const __half *x, const float *gm, const float *rs, const float *gamma, const float *beta, const __half *res, int act, __half *y, int C, long long S, size_t total) {
     for (size_t i = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) * 2; i < total; i += (size_t)gridDim.x * blockDim.x * 2) {
@@ -1383,18 +1381,14 @@ __global__ void k_gn_apply(const __half *x, const float *gm, const float *rs, co
 }
 extern "C" void xgn(xt x, int groups, const float *gamma, const float *beta, float eps, const xt *res, int act, xt y) {
     const int C = x.c, n = x.n; const long long S = (long long)x.d * x.h * x.w;
-    double *acc = (double *)xmalloc_dev((size_t)n * C * sizeof(double) * 2); float *gm = (float *)xmalloc_dev((size_t)n * C * 4 * 2), *rs = gm + (size_t)n * C;
-    cudaMemsetAsync(acc, 0, (size_t)n * C * sizeof(double) * 2, g_st);
-    int nchunk = (int)((S + 4095) / 4096); if (nchunk > 512) nchunk = 512; if (nchunk < 1) nchunk = 1;
-    const int th = (C / 2 <= 256 && 256 % (C / 2) == 0) ? 256 : (C / 2 <= 512 && 512 % (C / 2) == 0 ? 512 : 256);
-    dim3 g(nchunk, n);
-    k_chansum<<<g, th, C * sizeof(float), g_st>>>((const __half *)x.p, C, S, nchunk, nullptr, acc);
-    k_gn_mean<<<nblk((size_t)n * C, 256), 256, 0, g_st>>>(acc, n, C, groups, S, gm);
-    k_chansum<<<g, th, C * sizeof(float), g_st>>>((const __half *)x.p, C, S, nchunk, gm, acc + (size_t)n * C);
-    k_gn_rstd<<<nblk((size_t)n * C, 256), 256, 0, g_st>>>(acc + (size_t)n * C, n, C, groups, S, eps, rs);
+    int nchunk = (int)((512 + n - 1) / n); if (nchunk > S / 64) nchunk = (int)(S / 64); if (nchunk < 1) nchunk = 1;   /* ~512 blocks, >= 64 voxels each */
+    double *part = (double *)xmalloc_dev((size_t)n * nchunk * C * 2 * sizeof(double)); float *gm = (float *)xmalloc_dev((size_t)n * C * 4 * 2), *rs = gm + (size_t)n * C;
+    const int pairs = C / 2, rows = pairs <= 256 ? 256 / pairs : 1;
+    k_gnpart<<<dim3(nchunk, n), 256, (size_t)rows * C * 2 * sizeof(float), g_st>>>((const __half *)x.p, C, S, nchunk, part);
+    k_gnfin<<<nblk((size_t)n * groups, 64), 64, 0, g_st>>>((const __half *)x.p, part, n, C, groups, S, nchunk, eps, gm, rs);
     const size_t total = xt_numel(x); unsigned nb = nblk(total / 2, 256); if (nb > 65535 * 4) nb = 65535 * 4;
     k_gn_apply<<<nb, 256, 0, g_st>>>((const __half *)x.p, gm, rs, gamma, beta, res ? (const __half *)res->p : nullptr, act, (__half *)y.p, C, S, total);
-    xfree_dev(acc); xfree_dev(gm);
+    xfree_dev(part); xfree_dev(gm);
 }
 
 /* ---- data movement ---- */

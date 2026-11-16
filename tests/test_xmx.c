@@ -125,6 +125,32 @@ static int run(int sf, int N, int D, int H, int W, int ci, int co, int k, int st
     return bad != 0;
 }
 
+/* xgn (GroupNorm + residual + LReLU) against a double host reference, and run to run byte equality (the stats are deterministic) */
+static int run_gn(int N, int D, int H, int W, int C, int G, float off) {
+    const size_t S = (size_t)D * H * W, ne = (size_t)N * S * C;
+    uint16_t *xh = malloc(ne * 2), *rh = malloc(ne * 2), *y1 = malloc(ne * 2), *y2 = malloc(ne * 2); float *ga = malloc(C * 4), *be = malloc(C * 4);
+    for (size_t i = 0; i < ne; i++) { xh[i] = f2h(off * (1.f + 0.1f * (float)(i % C) / C) + rnd() * 2.f); rh[i] = f2h(rnd()); }
+    for (int c = 0; c < C; c++) { ga[c] = 1.f + 0.5f * rnd(); be[c] = 0.3f * rnd(); }
+    float *gd = xdev_floats(ga, C), *bd = xdev_floats(be, C);
+    xt x = xt_new(N, D, H, W, C), r = xt_new(N, D, H, W, C), y = xt_new(N, D, H, W, C); xh2d(r.p, rh, ne * 2);
+    for (int rep = 0; rep < 2; rep++) { xh2d(x.p, xh, ne * 2); xgn(x, G, gd, bd, 1e-5f, &r, XA_LRELU, y); xd2h(rep ? y2 : y1, y.p, ne * 2); }
+    if (xnet_check("test_xmx gn")) return 1;
+    double emax = 0; size_t bad = 0; const int cpg = C / G;
+    for (int n = 0; n < N; n++) for (int g = 0; g < G; g++) {
+        double s = 0, q = 0;
+        for (size_t v = 0; v < S; v++) for (int c = g * cpg; c < (g + 1) * cpg; c++) { const double f = h2f(xh[((size_t)n * S + v) * C + c]); s += f; q += f * f; }
+        const double m = s / ((double)S * cpg), rs = 1.0 / sqrt(q / ((double)S * cpg) - m * m + 1e-5);
+        for (size_t v = 0; v < S; v++) for (int c = g * cpg; c < (g + 1) * cpg; c++) {
+            const size_t i = ((size_t)n * S + v) * C + c; double t = (h2f(xh[i]) - m) * rs * ga[c] + be[c] + h2f(rh[i]); if (t < 0) t *= 0.01;
+            const double d = fabs(h2f(y1[i]) - t); if (d > emax) emax = d; if (d > 2e-3 * fabs(t) + 2e-3) bad++;
+        }
+    }
+    const int same = !memcmp(y1, y2, ne * 2);
+    printf("gn N %d %dx%dx%d C %3d G %2d offset %g: max |d| %.3g, %zu of %zu over the bound, runs %s\n", N, D, H, W, C, G, off, emax, bad, ne, same ? "equal" : "DIFFER");
+    xt_free(&x); xt_free(&r); xt_free(&y); xfree_dev(gd); xfree_dev(bd); free(xh); free(rh); free(y1); free(y2); free(ga); free(be);
+    return bad != 0 || !same;
+}
+
 #include <time.h>
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 /* XMX_BENCH=1: time the gambiarra-sized convs (16 crops) per format (0 fp16, 6, 5): TMAC/s */
@@ -165,6 +191,10 @@ int main(void) {
         }
     }
     xnet_set_mxq(0);
+    fails += run_gn(2, 17, 64, 48, 16, 16, 0.f);     /* the depth-fusion shape (InstanceNorm: G = C) */
+    fails += run_gn(3, 1, 40, 36, 32, 32, 20.f);     /* mean >> std: the shifted sums */
+    fails += run_gn(2, 1, 12, 12, 320, 32, 1.f);     /* deep level, 10 channels a group */
+    fails += run_gn(1, 1, 5, 7, 640, 32, 1.f);       /* more pairs than threads */
     printf("%s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }
