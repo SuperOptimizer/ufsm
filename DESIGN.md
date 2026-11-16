@@ -6,6 +6,31 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The audit's post-pass GPU measurements: FBLEND on, the rest recorded (2026-11-16, master)
+
+try8 paused 06:30-08:04 for the GPU items the audit queued after the mega pass (outputs /vesuvius/ufsm/audit-20261114/postpass, rows in
+its STATUS.md).
+- **Unroll #5, fit-field tile seams** (scripts/unroll/seam_ab.sh, 1667 u1 13000, a 512 x 2048^2 level-2 box): the step across the
+  256-cell tile borders over the interior median, one grid vs two grids blended (field-blend --tile): phase y 1.43 -> 1.11, x
+  1.78 -> 1.09; t0 y 3.95 -> 2.42, x 6.08 -> 3.08. 896 / 192 windows: single 1.36 / 1.60 / 3.60 / 5.61, blended identical to 640 / 64
+  blended at 2x the predict time: the blend removes the seams, not the halo. **FBLEND=1 is the unroll default** (FBLEND=0: one grid,
+  ~2x faster fields and the streamed ref). 1152 windows (13.8 GB buffer) do not fit a 16 GB card.
+- **Infer #3 / #8, predict window / halo** (scripts/infer/seam_ab.sh, try6-2357 rv / ink / c0, a 1024 x 2048^2 1667 level-2 box): mean
+  border jump 640/64 rv 2.11 ink 1.19 c0 3.83; 768/128 1.87 / 1.11 / 2.71; 896/192 1.77 / 1.09 / 2.24, wall 104 vs 108 s on an
+  https-bound box (compute 2.7x per window on local CT). Flags only, no default change.
+- **Unroll #1, the spiral hand by model coherence** (count-field --model-only, --dir +1 vs -1): 1667 0.0986 vs 0.1731 (-1, the
+  published hand, by 0.075 > DIRCOH_MARGIN 0.05); Paris 4 -1 0.0062, +1 pending (OOM-killed twice beside other jobs in the dev slice).
+- **Unroll #4:** held-out 1667 ink AUC 0.867 at LV 2 (inkpod 15000). **#21** (LV 1) deferred: the whole-scroll level-1 predict wrote
+  443 GB for one of its two grids and filled /vesuvius; it needs the held-out boxes only.
+- **Ugeom #4** (count-field ref variants, 1667, 70 C boxes): ids base 0.794, --wide-dens 0.5 0.811, 0.9 0.819, --phase-w 2 0.794: +0.026
+  on one scroll is at the noise edge, no default change. **#5** (Paris 4 packed): base PH ids 0.234, --rho-pow 0.2,150 0.199; the other
+  three variants and the J boxes in a later GPU window.
+- Bugs these runs found, fixed: the unroll scan tables pointed at deleted CT roots (volcomp, u0/vol: most scrolls could not start a
+  fresh unroll) -> v2/ct or the dl.ash2txt store, PHerc1667 a scrolls.tsv row with the u1 box (u0/prep's masks are gone); seam_ab
+  --gn-live for gn_ema checkpoints + --axis; after_mega count-field --dir (refused since the spiral-hand fix) and its CUDA device
+  (it ran on card 0 whatever GPU said); the Paris 4 J-box GT moved to the datafix raster ("nothing scored"); gtboxes.sh refuses a
+  missing GT store.
+
 ## The ink builder's GPU buffers under one budget (2026-11-16, try7's step-450 death)
 
 try7 (one card) logged "inkfly gpu: out of memory (nn_inkfly.cu:169)" at sampler start-up, switched the on-the-fly ink to the CPU
