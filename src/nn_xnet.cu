@@ -249,7 +249,7 @@ enum { KPAD = 64 };
 template <int BM, int BN, int WARPS_M, int WARPS_N, int BK, int NST>
 __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32) conv_igemm(ConvP p) {
     constexpr int NTH = WARPS_M * WARPS_N * 32, WM = BM / WARPS_M, WN = BN / WARPS_N, MI = WM / 16, NI = WN / 8;
-    constexpr int QC = BK / 8, RS = NTH / QC, AP = BM / RS, BP = BN / RS;   /* chunks per row, rows per pass, passes */
+    constexpr int QC = BK / 8, RS = NTH / QC, AP = BM / RS, BP = BN >= RS ? BN / RS : 1;   /* chunks per row, rows per pass, passes (BN < RS: one, part of the threads) */
     extern __shared__ __align__(128) unsigned char smem[];
     __half *sA = (__half *)smem, *sB = sA + NST * BM * BK;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -282,7 +282,7 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32) conv_igemm(ConvP p) {
 #pragma unroll
         for (int i = 0; i < BP; i++) {
             const int row = r0 + i * RS;
-            cp_async16(B + swz<BK>(row, q), p.w + (size_t)(n_base + row) * p.Kp + ks * BK + q * 8, 16);
+            if (BN >= RS || row < BN) cp_async16(B + swz<BK>(row, q), p.w + (size_t)(n_base + row) * p.Kp + ks * BK + q * 8, 16);
         }
         ci += BK;
         while (ci >= p.Ci) { ci -= p.Ci; if (++tx == p.kw) { tx = 0; if (++ty == p.kh) { ty = 0; tz++; } } }
@@ -1048,7 +1048,7 @@ template <int SF> static void xq_launch(int mode, const __half *x, uint8_t *q, u
     default: k_xq<SF, 0><<<nblk(nb16, 256), 256, 0, g_st>>>(x, q, s, nb16); break;
     }
 }
-static int g_cfg = -1;
+static int g_cfg = -1, g_c16 = -1;   /* mgpu: env */
 static void conv_launch(const ConvP &p, int co) {
     if (g_cfg < 0) g_cfg = getenv("UFSM_XNET_CFG") ? atoi(getenv("UFSM_XNET_CFG")) : 0;
     switch (g_cfg) {
@@ -1066,7 +1066,9 @@ static void conv_launch(const ConvP &p, int co) {
             else fprintf(stderr, "xnet: fused LayerNorm needs 32 or 64 outputs (%d)\n", co);
             break;
         }
-        if (co <= 32) launch1<128, 32, 4, 1, 32, 3>(p, co);
+        if (co <= 16) { if (g_c16 < 0) g_c16 = getenv("UFSM_XNET_C16") ? atoi(getenv("UFSM_XNET_C16")) : 1;   /* 16 outputs (the Reader depth fusion): no half-empty tile */
+                        if (g_c16 == 2) launch1<256, 16, 8, 1, 32, 3>(p, co); else if (g_c16) launch1<128, 16, 4, 1, 32, 3>(p, co); else launch1<128, 32, 4, 1, 32, 3>(p, co); }
+        else if (co <= 32) launch1<128, 32, 4, 1, 32, 3>(p, co);
         else if (co <= 64) launch1<128, 64, 4, 2, 32, 3>(p, co); else launch1<128, 128, 2, 4, 32, 3>(p, co); break;
     }
 }

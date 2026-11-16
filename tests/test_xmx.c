@@ -109,12 +109,13 @@ static int run(int sf, int N, int D, int H, int W, int ci, int co, int k, int st
     for (size_t i = 0; i < (size_t)co * ci * k * k * k; i++) w[i] = rnd() * 0.05f * (i % 13 == 0 ? 4.f : 1.f);
     for (int o = 0; o < co; o++) b[o] = rnd();
     /* the reference: quantised x and weights (GEMM order), double sums */
-    for (size_t v = 0; v < nx / ci; v++) for (int c = 0; c < ci; c += 16) { if (g_rot) wht16h(x + v * ci + c); q16a(x + v * ci + c, sf); }
+    if (sf) for (size_t v = 0; v < nx / ci; v++) for (int c = 0; c < ci; c += 16) { if (g_rot) wht16h(x + v * ci + c); q16a(x + v * ci + c, sf); }
     for (int o = 0; o < co; o++) {
         float am = 0.f;
         for (int i = 0; i < ci; i++) for (int t = 0; t < k * k * k; t++) { const float v = w[((size_t)o * ci + i) * k * k * k + t]; wk[(size_t)o * K + t * ci + i] = v; am = fmaxf(am, fabsf(v)); }
         if (g_rot) { am = 0.f; for (int kk = 0; kk < K; kk += 16) wht16h(wk + (size_t)o * K + kk); for (int kk = 0; kk < K; kk++) am = fmaxf(am, fabsf(wk[(size_t)o * K + kk])); }
-        if (mode && am > 0.f) qrow_s(wk + (size_t)o * K, K, sf, mode, am);
+        if (!sf) for (int kk = 0; kk < K; kk++) wk[(size_t)o * K + kk] = h2f(f2h(wk[(size_t)o * K + kk]));   /* fp16 path: fp16 weights */
+        else if (mode && am > 0.f) qrow_s(wk + (size_t)o * K, K, sf, mode, am);
         else for (int kk = 0; kk < K; kk += 16) q16(wk + (size_t)o * K + kk, sf, sf == 5 && am > 0.f ? am / 2688.f : 1.f);
     }
     xnet_set_mx(sf); xnet_set_mxq(mode); xnet_set_mxrot(g_rot); xnet_set_mxa(g_mxa);
@@ -205,6 +206,8 @@ int main(void) {
             fails += run(sf, 1, 7, 9, 36, 128, 64, 3, 1, mode);
         }
     }
+    fails += run(0, 2, 7, 33, 29, 16, 16, 3, 1, 0);   /* fp16 igemm, 16 outputs (BN 16 tile; the Reader depth fusion) */
+    fails += run(0, 1, 5, 20, 24, 32, 32, 3, 1, 0);
     g_rot = 1;   /* H16-rotated blocks (UFSM_XNET_MXROT) */
     for (int sf = 6; sf >= 5; sf--) { fails += run(sf, 2, 9, 7, 11, 32, 32, 3, 1, 2); fails += run(sf, 1, 7, 9, 36, 128, 64, 3, 1, 0); fails += run(sf, 1, 6, 5, 7, 128, 256, 1, 1, 2); }
     g_mxa = 1;   /* + least-squares activation scales (UFSM_XNET_MXA) */
