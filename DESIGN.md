@@ -6,6 +6,23 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## UFSM_PRED_FIT_FUSED_SMALLH stays off: fith2_prof.sh measured (2026-11-16, branch fith2dec-port-20261116)
+
+The fused --fit-h 2 fit-field kernel (audit unroll #9, flag pending "until fith2_prof.sh has profiled it") measured with
+scripts/unroll/fith2_prof.sh on card 1 (exclusive suite lock): master 9de7a772 built with the pinned mcc e52bb39, u1 13000, a 1667
+1024^3 level-2 box, --fit-h 2, UFSM_PRED_PROF=1.
+
+| run | plane path | fused (w4p) |
+|---|---|---|
+| predict wall, mcc e52bb39 | 3.51 s | 3.85 s (+10 %) |
+| predict wall, mcc 9f63cdd (11-15) | 3.61 s (GPU 2.25) | 4.02 s (GPU 2.68) |
+| kernel, 256^3 window, h 2 (e52bb39) | 4.9 ms | 10.9 ms (12.8 with the partner regions) |
+| kernel, h 2, nvcc (llvm-verify, 11-15) | 4.6 ms | 5.0 ms |
+
+Fields IDENTICAL (897 files) and test_fit_lat PASS in both runs. The fused kernel is slower under mcc (its code for fit_accum_lat_k;
+reported to mcc-gpu) and no faster under nvcc at h 2, so the default stays off (`UFSM_PRED_FIT_FUSED_SMALLH=1` keeps it reachable).
+Re-measure if mcc's code for the kernel changes; the same holds for the h 8 fused default (11.2 vs 5.3 ms, section below).
+
 ## The fused fit kernel's winding pass from planes (UFSM_PRED_FIT_W4P), and the fused kernel under mcc (2026-11-15, branch univinf-port-20261115)
 
 Ported from wip-snap-univinf-20261115 (efe2e22f, 11-12, written on the h 8 kernel; the WIP drain, /vesuvius/ufsm/wipdrain/ledger.md).

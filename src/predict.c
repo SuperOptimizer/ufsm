@@ -2216,7 +2216,7 @@ static int predict_one(int argc, char **argv) {
         /* --fit-zarr from a latent-grid net (--no-out 1, no --fit-ct: its ray reads the whole window): the heads upsampled (and guided) only over
            the planes of each z chunk of field cells, not [cout][W^3] fp16 (10 GB at W 640); UFSM_PRED_FIT_SLAB=0: the whole window */
         fzs = ffd && ffzm && half && hdiv == 4 && hmode == 1 && h16 && gpath && !ffct && tta <= 1 && !fea && !sheet_task && !slab && WR.skip && !(W % 4) && (!getenv("UFSM_PRED_FIT_SLAB") || ufsm_env_on("UFSM_PRED_FIT_SLAB"));
-        /* (--fit-h 1 / 2 / 4 fused: UFSM_PRED_FIT_FUSED_SMALLH=1, default off until scripts/unroll/fith2_prof.sh has profiled it on the GPU;
+        /* (--fit-h 1 / 2 / 4 fused: UFSM_PRED_FIT_FUSED_SMALLH=1, default off: profiled 2026-11-16 (fith2_prof.sh, mcc e52bb39) 10 % slower than the planes, DESIGN;
            byte-identical to the plane path in test_fit_lat, audit unroll #9) */
         fzl = fzs && (ffh == 8 || ((ffh == 1 || ffh == 2 || ffh == 4) && ufsm_env_on("UFSM_PRED_FIT_FUSED_SMALLH"))) && cfg.lat_guide != 8 &&
               (!getenv("UFSM_PRED_FIT_FUSED") || ufsm_env_on("UFSM_PRED_FIT_FUSED"));

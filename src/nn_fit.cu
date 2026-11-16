@@ -471,7 +471,7 @@ extern "C" void nn_fit_finalize_w4(const float *acc, size_t nf, uint8_t *a) { fi
 
 /* (h 1 / 2 / 4, audit unroll #9: the --fit-h 2 production fields went through the plane path. The same blocks of 8^3 voxels, on the latent
    cell grid of the window, and per field cell inside a block the serial sums of fit_accum_cell_k / fit_accum_w4_k, so the result is the
-   plane path's to the byte as at h 8; predict takes it with UFSM_PRED_FIT_FUSED_SMALLH=1, default off until profiled.)
+   plane path's to the byte as at h 8; predict takes it with UFSM_PRED_FIT_FUSED_SMALLH=1, default off: slower than the planes under mcc, DESIGN 2026-11-16.)
    nn_fit_accum_lat (fit.h): one block of 512 threads per field cell of 8^3 voxels (2^3 latent cells: --fit-zarr's windows keep the field
    cells on the cell grid), a voxel per thread in the sums as fit_accum_k. The plane path (predict's z-slab fzs: nn_lat_up_slab +
    nn_lat_shuffle + nn_fstem_fwd into [11][nz][W][W] fp16 planes, fit_accum_k, then the winding's own planes over +-d and fit_accum_w4_k)
