@@ -168,10 +168,35 @@ __global__ void k_fq(const __half *x, __half *y, long long nblk, int bits) {   /
         }
         return;
     }
-    if (bits == 5) {   /* two blocks of 16, e4m3 scale amax / 6 (no tensor scale: IN-normalised activations, |x| < 2688) */
+    if (bits == 9) {   /* probe: each 16-block rotated by the normalised Hadamard H16 (H16 / 4, its own inverse), MX5-quantised, rotated back */
+        for (int h = 0; h < 2; h++) {
+            float *u = v + 16 * h;
+            for (int len = 1; len < 16; len <<= 1) for (int i = 0; i < 16; i += 2 * len) for (int j = i; j < i + len; j++) { const float a = u[j], c = u[j + len]; u[j] = a + c; u[j + len] = a - c; }
+            float a = 0.f; for (int i = 0; i < 16; i++) { u[i] *= .25f; a = fmaxf(a, fabsf(u[i])); }
+            const unsigned char c8 = cvt_e4m3(__fdiv_rn(a, 6.f)); const int ex = (c8 >> 3) & 15, mt = c8 & 7;
+            const float sc = ex ? ldexpf(1.f + mt / 8.f, ex - 7) : ldexpf(mt / 8.f, -6);
+            for (int i = 0; i < 16; i++) { if (sc == 0.f) { u[i] = 0.f; continue; } const unsigned char c = cvt_e2m1x2(u[i] / sc, 0.f) & 15; u[i] = (c & 8 ? -1.f : 1.f) * G[c & 7] * sc; }
+            for (int len = 1; len < 16; len <<= 1) for (int i = 0; i < 16; i += 2 * len) for (int j = i; j < i + len; j++) { const float a2 = u[j], c = u[j + len]; u[j] = a2 + c; u[j + len] = a2 - c; }
+            for (int i = 0; i < 16; i++) y[b * 32 + 16 * h + i] = __float2half_rn(u[i] * .25f);
+        }
+        return;
+    }
+    if (bits == 5 || bits == 7) {   /* two blocks of 16, e4m3 scale amax / 6 (no tensor scale: IN-normalised activations, |x| < 2688); 7: the e4m3
+                                       code of least squared error among amax / 6's -4 .. +2 (probe of a least-squares activation quantiser) */
         for (int h = 0; h < 2; h++) {
             float a = 0.f; for (int i = 16 * h; i < 16 * h + 16; i++) a = fmaxf(a, fabsf(v[i]));
-            const unsigned char c8 = cvt_e4m3(__fdiv_rn(a, 6.f)); const int ex = (c8 >> 3) & 15, mt = c8 & 7;
+            unsigned char c8 = cvt_e4m3(__fdiv_rn(a, 6.f));
+            if (bits == 7 && a > 0.f) {
+                float be = -1.f; int bc = c8;
+                for (int cc = (int)c8 - 4; cc <= (int)c8 + 2; cc++) {
+                    if (cc < 1 || cc > 126) continue;
+                    const int ex = (cc >> 3) & 15, mt = cc & 7; const float sc = ex ? ldexpf(1.f + mt / 8.f, ex - 7) : ldexpf(mt / 8.f, -6); float e = 0.f;
+                    for (int i = 16 * h; i < 16 * h + 16; i++) { const unsigned char c = cvt_e2m1x2(v[i] / sc, 0.f) & 15; const float q = (c & 8 ? -1.f : 1.f) * G[c & 7] * sc - v[i]; e += q * q; }
+                    if (be < 0.f || e < be * (1.f - 1e-6f) || (cc == (int)c8 && e <= be)) { be = e; bc = cc; }
+                }
+                c8 = (unsigned char)bc;
+            }
+            const int ex = (c8 >> 3) & 15, mt = c8 & 7;
             const float sc = ex ? ldexpf(1.f + mt / 8.f, ex - 7) : ldexpf(mt / 8.f, -6);
             for (int i = 16 * h; i < 16 * h + 16; i++) {
                 if (sc == 0.f) { y[b * 32 + i] = __float2half_rn(0.f); continue; }
@@ -433,52 +458,67 @@ static int blk_scale(const float *v, float a, float gs, int sf, int mode, double
     if (err) *err = b;
     return bc;
 }
+typedef struct { const float *wk; int K, co, nch, sf, mode; size_t rch; uint8_t *q, *sb; float *gs; double *err; int Cop; int next; pthread_mutex_t mu; } mxpk;
+static void pack_row(const mxpk *P, int o) {   /* row o: its scales and nibbles; err[3 o ..]: old / new squared error, sum of squares */
+    const int K = P->K, sf = P->sf, mode = P->mode, nb = P->nch * 2; const size_t rch = P->rch;
+    const float *r = o < P->co ? P->wk + (size_t)o * K : nullptr; float am = 0.f; double wss = 0.0, e_old = 0.0, e_new = 0.0;
+    if (r) for (int k = 0; k < K; k++) { am = fmaxf(am, fabsf(r[k])); wss += (double)r[k] * r[k]; }
+    const float gs0 = sf == 5 && am > 0.f ? (mode ? (float)((double)am / 2688.0) : am / (6.f * 448.f)) : 1.f;
+    float g = gs0;   /* the row scale: gs0, or (mode 2, sf 5) the best of gs0 2^(j / 8) */
+    if (mode >= 2 && sf == 5 && r) {
+        double best = -1.0; float vb[16];
+        for (int j = 0; j < 8; j++) {
+            static const float R8[8] = {1.f, 1.0905077f, 1.1892071f, 1.2968396f, 1.4142135f, 1.5422108f, 1.6817929f, 1.8340081f};   /* 2^(j / 8) */
+            const float gj = gs0 * R8[j]; double tot = 0.0;
+            for (int bb = 0; bb < nb; bb++) {
+                float a = 0.f; for (int i = 0; i < 16; i++) { const int k = bb * 16 + i; vb[i] = k < K ? r[k] : 0.f; a = fmaxf(a, fabsf(vb[i])); }
+                double e; blk_scale(vb, a, gj, 5, mode, &e); tot += e;
+            }
+            if (best < 0.0 || tot < best * (1.0 - 1e-9)) { best = tot; g = gj; }
+        }
+    }
+    P->gs[o] = g;
+    for (int b = 0; b < nb; b++) {   /* 16-K blocks */
+        float vb[16], a = 0.f;
+        for (int i = 0; i < 16; i++) { const int k = b * 16 + i; vb[i] = r && k < K ? r[k] : 0.f; a = fmaxf(a, fabsf(vb[i])); }
+        float d; uint8_t code; double eb;
+        if (g_mxq_log && r) { double e0; blk_scale(vb, a, gs0, sf, 0, &e0); e_old += e0; }
+        if (sf == 6) { const int e = blk_scale(vb, a, 1.f, 6, mode, &eb); code = (uint8_t)(e + 127); d = ldexpf(1.f, e); }
+        else { const int cc = blk_scale(vb, a, g, 5, mode, &eb); code = (uint8_t)cc; d = g_e4[cc] * g; }
+        if (r) e_new += eb;
+        uint8_t *qb = P->q + ((size_t)o * rch + b / 2) * 16 + (b & 1) * 8;
+        for (int i = 0; i < 16; i++) {
+            const float rq = d > 0.f ? (sf == 6 ? e2m1_rn(vb[i] / d) : e2m1_div(vb[i], d)) : 0.f;   /* (sf 6: d a power of two, exact) */
+            static const float G[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f}; int nib = 0; for (int gg = 0; gg < 8; gg++) if (G[gg] == fabsf(rq)) nib = gg;
+            if (rq < 0.f) nib |= 8;
+            qb[i / 2] |= (uint8_t)(nib << ((i & 1) * 4));
+        }
+        P->sb[((size_t)o * rch + b / 2) * 4 + (b & 1)] = code;
+    }
+    P->err[3 * o] = e_old; P->err[3 * o + 1] = e_new; P->err[3 * o + 2] = wss;
+}
+static void *pack_worker(void *a) {
+    mxpk *P = (mxpk *)a;
+    for (;;) {
+        pthread_mutex_lock(&P->mu); const int o0 = P->next; P->next += 8; pthread_mutex_unlock(&P->mu);
+        if (o0 >= P->Cop) return nullptr;
+        for (int o = o0; o < o0 + 8 && o < P->Cop; o++) pack_row(P, o);
+    }
+}
 static int mx_pack(xconv *c, const float *wk, int co, int sf, int wseq) {
     const int nch = (c->K + 31) / 32, nst = (nch + 1) / 2, Cop = (co + 63) / 64 * 64; const size_t rch = (size_t)nst * 2;
     uint8_t *q = (uint8_t *)calloc((size_t)Cop * rch * 16, 1), *sb = (uint8_t *)calloc((size_t)Cop * rch * 4, 1); float *gs = (float *)malloc(Cop * sizeof(float));
-    if (!q || !sb || !gs) { free(q); free(sb); free(gs); return -1; }
+    double *err = (double *)calloc((size_t)Cop * 3, sizeof(double));
+    if (!q || !sb || !gs || !err) { free(q); free(sb); free(gs); free(err); return -1; }
     e4code(1.f);
     const int mode = g_mxq; double e_old = 0.0, e_new = 0.0, wss = 0.0;
-    for (int o = 0; o < Cop; o++) {
-        const float *r = o < co ? wk + (size_t)o * c->K : nullptr; float am = 0.f;
-        if (r) for (int k = 0; k < c->K; k++) { am = fmaxf(am, fabsf(r[k])); wss += (double)r[k] * r[k]; }
-        const float gs0 = sf == 5 && am > 0.f ? (mode ? (float)((double)am / 2688.0) : am / (6.f * 448.f)) : 1.f;
-        float v[64][16], ba[64];   /* (blocks per pass: rows are streamed in groups of 64 blocks) */
-        const int nb = nch * 2;
-        /* the row scale: gs0, or (mode 2, sf 5) the best of gs0 2^(j / 8) */
-        float g = gs0;
-        if (mode >= 2 && sf == 5 && r) {
-            double best = -1.0;
-            for (int j = 0; j < 8; j++) {
-                static const float R8[8] = {1.f, 1.0905077f, 1.1892071f, 1.2968396f, 1.4142135f, 1.5422108f, 1.6817929f, 1.8340081f};   /* 2^(j / 8) */
-                const float gj = gs0 * R8[j]; double tot = 0.0;
-                for (int b0 = 0; b0 < nb; b0 += 64) {
-                    const int n = nb - b0 < 64 ? nb - b0 : 64;
-                    for (int bb = 0; bb < n; bb++) { float a = 0.f; for (int i = 0; i < 16; i++) { const int k = (b0 + bb) * 16 + i; v[bb][i] = k < c->K ? r[k] : 0.f; a = fmaxf(a, fabsf(v[bb][i])); } ba[bb] = a; }
-                    for (int bb = 0; bb < n; bb++) { double e; blk_scale(v[bb], ba[bb], gj, 5, mode, &e); tot += e; }
-                }
-                if (best < 0.0 || tot < best * (1.0 - 1e-9)) { best = tot; g = gj; }
-            }
-        }
-        gs[o] = g;
-        for (int b = 0; b < nb; b++) {   /* 16-K blocks */
-            float vb[16], a = 0.f;
-            for (int i = 0; i < 16; i++) { const int k = b * 16 + i; vb[i] = r && k < c->K ? r[k] : 0.f; a = fmaxf(a, fabsf(vb[i])); }
-            float d; uint8_t code; double eb;
-            if (g_mxq_log && r) { double e0; blk_scale(vb, a, gs0, sf, 0, &e0); e_old += e0; }
-            if (sf == 6) { const int e = blk_scale(vb, a, 1.f, 6, mode, &eb); code = (uint8_t)(e + 127); d = ldexpf(1.f, e); }
-            else { const int cc = blk_scale(vb, a, gs[o], 5, mode, &eb); code = (uint8_t)cc; d = g_e4[cc] * gs[o]; }
-            if (r) e_new += eb;
-            uint8_t *qb = q + ((size_t)o * rch + b / 2) * 16 + (b & 1) * 8;
-            for (int i = 0; i < 16; i++) {
-                const float rq = d > 0.f ? (sf == 6 ? e2m1_rn(vb[i] / d) : e2m1_div(vb[i], d)) : 0.f;   /* (sf 6: d a power of two, exact) */
-                static const float G[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f}; int nib = 0; for (int gg = 0; gg < 8; gg++) if (G[gg] == fabsf(rq)) nib = gg;
-                if (rq < 0.f) nib |= 8;
-                qb[i / 2] |= (uint8_t)(nib << ((i & 1) * 4));
-            }
-            sb[((size_t)o * rch + b / 2) * 4 + (b & 1)] = code;
-        }
-    }
+    mxpk P = {wk, c->K, co, nch, sf, mode, rch, q, sb, gs, err, Cop, 0, PTHREAD_MUTEX_INITIALIZER};
+    /* rows in parallel when the search costs (mode >= 1: ~50x the amax pack); rows are independent, so the result does not depend on it */
+    const long work = (long)Cop * c->K * (mode >= 2 ? 8 : mode ? 1 : 0); int nth = work > (1L << 20) ? 16 : 1;
+    if (nth > 1) { pthread_t th[16]; int n = 0; for (; n < nth; n++) if (pthread_create(&th[n], nullptr, pack_worker, &P)) break; if (!n) pack_worker(&P); for (int t = 0; t < n; t++) pthread_join(th[t], nullptr); }
+    else pack_worker(&P);
+    for (int o = 0; o < Cop; o++) { e_old += err[3 * o]; e_new += err[3 * o + 1]; wss += err[3 * o + 2]; }
+    free(err);
     if (g_mxq_log) fprintf(stderr, "xnet mxq conv %d: %dx%dx%d ci %d co %d K %d: rel weight err %.5f -> %.5f (mode %d, sf %d)\n", wseq, c->kd, c->kh, c->kw, c->ci, co, c->K,
                            sqrt(e_old / (wss + 1e-30)), sqrt(e_new / (wss + 1e-30)), mode, sf);
     c->mxq = xmalloc_dev((size_t)Cop * rch * 16); c->mxs = xmalloc_dev((size_t)Cop * rch * 4); c->mxgs = (float *)xmalloc_dev(Cop * sizeof(float));
@@ -502,7 +542,12 @@ static int conv_upload(xconv *c, const float *wk /* [co][K] in GEMM order */, in
         float *wq = (float *)wk;
         for (int o = 0; o < co; o++) {
             float *r = wq + (size_t)o * c->K;
-            if (g_fq_w == 5) { float am = 0.f; for (int k = 0; k < c->K; k++) am = fmaxf(am, fabsf(r[k])); if (am > 0.f) fq_nv(r, c->K, am / (6.f * 448.f)); }
+            if (g_fq_w == 9) {   /* probe: H16-rotated 16-K blocks (as k_fq 9) */
+                auto wht = [](float *u) { for (int len = 1; len < 16; len <<= 1) for (int i = 0; i < 16; i += 2 * len) for (int j = i; j < i + len; j++) { const float a = u[j], c = u[j + len]; u[j] = a + c; u[j + len] = a - c; } for (int i = 0; i < 16; i++) u[i] *= .25f; };
+                for (int k = 0; k + 16 <= c->K; k += 16) wht(r + k);
+                float am = 0.f; for (int k = 0; k < c->K; k++) am = fmaxf(am, fabsf(r[k])); if (am > 0.f) fq_nv(r, c->K, am / (6.f * 448.f));
+                for (int k = 0; k + 16 <= c->K; k += 16) wht(r + k);
+            } else if (g_fq_w == 5) { float am = 0.f; for (int k = 0; k < c->K; k++) am = fmaxf(am, fabsf(r[k])); if (am > 0.f) fq_nv(r, c->K, am / (6.f * 448.f)); }
             else if (g_fq_w == 6) for (int k = 0; k < c->K; k += 16) fq_host(r + k, 16, 4);
             else for (int k = 0; k < c->K; k += 32) fq_host(r + k, 32, g_fq_w);
         }
