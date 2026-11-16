@@ -335,6 +335,7 @@ test_render_fill_gpu                           | gpu          |    12 | ./$B/tes
 test_jpegpar                                   | smoke        |    10 | ./$B/test_jpegpar
 test_sysinfo                                   |              |     5 | ./$B/test_sysinfo
 test_winauto                                   |              |     1 | ./$B/test_winauto
+test_labcomp                                   |              |     8 | ./$B/test_labcomp
 test_volcomp_fast                              |              |    25 | ./$B/test_volcomp_fast
 test_z3_autosub                                | smoke        |    10 | ./$B/test_z3_autosub
 test_z3_sink                                   |              |    10 | ./$B/test_z3_sink

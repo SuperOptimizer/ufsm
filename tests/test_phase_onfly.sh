@@ -3,7 +3,7 @@
 # phase-raster --pair 1 writes the stored phase; ufsm phase-onfly is byte-identical to it on the CPU and (with a GPU) on the GPU, also
 # with small tiles (--budget-mb 64: many tiles per window, halo seams); and two --det training runs, one on the stored phase and one on
 # the onfly phase, log the same losses. With a GPU every tile's codes are decoded on the device (volcomp lossless, k_ll_sub / k_ll_build)
-# and the CPU-decoded path (UFSM_ONFLY_CPU_DECODE=1) is checked too
+# and the CPU-decoded path (UFSM_ONFLY_CPU_DECODE=1) is checked too; the codes repacked with labcomp (labcomp-pack) give the same phase
 # Usage: test_phase_onfly.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
 . "$(dirname "$(readlink -f "$0")")/det_cmp.sh"
@@ -35,6 +35,16 @@ if nvidia-smi -L > /dev/null 2>&1; then
   onfly_run gpu.log 100 4 -- fx/band 1 --rmax 12 --ref ph 4.8 --windows 4 --P 100 --gpu 0 --budget-mb 64 --threads 4 || { echo "FAIL: GPU onfly differs ($D/gpu.log)"; tail -3 gpu.log; exit 1; }
   grep -qE ' ([1-9][0-9]*) of \1 tiles decoded on the GPU' gpu.log || { echo "FAIL: not every tile's codes decoded on the GPU ($D/gpu.log)"; tail -1 gpu.log; exit 1; }
   UFSM_ONFLY_CPU_DECODE=1 onfly_run gpuc.log 100 4 -- fx/band 1 --rmax 12 --ref ph 4.8 --windows 4 --P 100 --gpu 0 --budget-mb 64 --threads 4 || { echo "FAIL: GPU pair rule on CPU-decoded codes differs ($D/gpuc.log)"; exit 1; }
+fi
+# the codes repacked with the labcomp codec (ufsm labcomp-pack, src/labcomp.h; 2026-11-15): the same phase on the CPU (z3_read decodes
+# them) and on the GPU (tile_gpu decodes each chunk on the host into the pack, uploaded as a raw chunk)
+mkdir -p lc; [ -f fx/band/zarr.json ] && cp fx/band/zarr.json lc/
+"$U" labcomp-pack fx/band/1 lc/1 --threads 4 > lcp.log 2>&1 || { echo "FAIL: labcomp-pack ($D/lcp.log)"; exit 1; }
+grep -q 'every chunk verified exact' lcp.log || { echo "FAIL: labcomp-pack did not verify ($D/lcp.log)"; exit 1; }
+"$U" phase-onfly lc 1 --rmax 12 --ref ph 4.8 --windows 4 --P 100 --budget-mb 64 --threads 4 > lccpu.log 2>&1 || { echo "FAIL: CPU onfly on labcomp codes differs ($D/lccpu.log)"; exit 1; }
+if nvidia-smi -L > /dev/null 2>&1; then
+  onfly_run lcgpu.log 100 4 -- lc 1 --rmax 12 --ref ph 4.8 --windows 4 --P 100 --gpu 0 --budget-mb 64 --threads 4 || { echo "FAIL: GPU onfly on labcomp codes differs ($D/lcgpu.log)"; tail -3 lcgpu.log; exit 1; }
+  grep -qE ' ([1-9][0-9]*) of \1 tiles decoded on the GPU' lcgpu.log || { echo "FAIL: labcomp tiles not all through the device path ($D/lcgpu.log)"; tail -1 lcgpu.log; exit 1; }
 fi
 # fused sets (sources "onfly": {"sets": [...], "tol"}): two phases of the codes (radius 24 and 8: on this fixture they agree, so every
 # voxel takes the circular-mean path) fused by phase-fuse vs on the fly, CPU and GPU (the conflicts: PHerc0139 A + B in DESIGN.md)

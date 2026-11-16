@@ -181,6 +181,7 @@ static int usage(void) {
         "  ufsm convert-unwrap2 <unwrap.ckpt> <out.ckpt>   a task unwrap checkpoint as task unwrap2 (heads 2-10 -> 0-8, winding mod 4 fresh; no training step)\n"
         "  ufsm repack <in-array-dir> <out-array-dir> <shard> [--threads N]   lossless re-sharding of a z3w uint8 zarr (copies the compressed chunks)\n"
         "  ufsm z3-put <array-dir> <in.raw> --shape Z,Y,X --z0 Z0 --nz NZ [--shard 128] [--q 2]   raw uint8 planes -> whole shards of a volcomp array\n"
+        "  ufsm labcomp-pack IN_ARRAY_DIR OUT_ARRAY_DIR [--kind codes] [--threads N]   a label array re-encoded with the labcomp codec (exact, verified)\n"
         "  ufsm fields-pack IN OUT [--q-phase Q] [--q Q] [--ang A] [--conf C] [--mask-w 1] [--shard 512]   re-encode a fit-field store smaller (readers unchanged)\n"
         "  ufsm ink-gate OUT --ink R K --ink-um U --phase R K --phase-um U [--ignore R K] [--lo 0 --hi 125]   pseudo ink (prob254) restricted to a phase band (recto)\n"
         "  ufsm wraps <model-dir> <out-dir> [--step 8] [--fields DIR]          one tifxyz per wrap (level sets of W)\n"
@@ -4771,6 +4772,7 @@ static int cmd_sample(int argc, char **argv) {
 int cmd_repack(int argc, char **argv);   /* src/repack.c */
 int cmd_z3put(int argc, char **argv);    /* src/z3put.c */
 int cmd_fields_pack(int argc, char **argv);   /* src/fieldspack.c */
+int cmd_labcomp_pack(int argc, char **argv);   /* src/labcomp_cli.c */
 int cmd_ink_gate(int argc, char **argv);   /* src/inkgate.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
@@ -4899,6 +4901,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "repack")) return cmd_repack(argc, argv);
     if (!strcmp(cmd, "z3-put")) return cmd_z3put(argc, argv);
     if (!strcmp(cmd, "fields-pack")) return cmd_fields_pack(argc, argv);
+    if (!strcmp(cmd, "labcomp-pack")) return cmd_labcomp_pack(argc, argv);
     if (!strcmp(cmd, "ink-gate")) return cmd_ink_gate(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);

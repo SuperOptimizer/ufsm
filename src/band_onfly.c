@@ -1,5 +1,6 @@
 /* src/band_onfly.h: the pair-rule winding phase computed from the codes on read. */
 #include "band_onfly.h"
+#include "labcomp.h"
 #include "fuse.h"
 #include "band.h"
 #include "bandgpu.h"
@@ -9,6 +10,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
+__attribute__((weak)) int lbc_decode(const void *enc, size_t n, uint8_t *dst);   /* (labcomp.c; absent: zarr3.c refuses labcomp arrays at open) */
 #include <string.h>
 #include <time.h>
 
@@ -104,7 +106,7 @@ static int tile_gpu(z3 *codes, const int64_t co_[3], const int64_t cn_[3], const
     while (k < 3 && z3_derived_ctx(base) == &g_pool2_tag) { base = z3_base_of(base); k++; }
     if (z3_derived_ctx(base) || (k && !band_pair_gpu_codes_pool)) return -2;
     const z3_meta *m = z3_meta_of(base);
-    if (m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128 || m->esize != 1 || m->q != 0) return -2;
+    if (m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128 || m->esize != 1 || (m->q != 0 && !m->lbc)) return -2;
     int64_t co[3], cn[3], ro[3], rn[3];   /* in the base's voxels */
     for (int d = 0; d < 3; d++) {
         co[d] = co_[d] * (1 << k); cn[d] = cn_[d] * (1 << k); ro[d] = ro_[d] * (1 << k);
@@ -118,6 +120,14 @@ static int tile_gpu(z3 *codes, const int64_t co_[3], const int64_t cn_[3], const
         if (r < 0) return -1;
         if (!r) continue;
         uint32_t mode; bg_lchunk C; memset(&C, 0, sizeof C); C.o[0] = (int32_t)(cz * 128 - co[0]); C.o[1] = (int32_t)(cy * 128 - co[1]); C.o[2] = (int32_t)(cx * 128 - co[2]);
+        if (m->lbc) {   /* labcomp codes (labcomp.h): decoded here into the pack, uploaded as a raw chunk (no device decoder yet) */
+            const size_t ln = len;   /* (z3_chunk_raw strips the crc32c) */
+            const size_t ro_ = pk_put(K, nullptr, VOLCOMP_CHUNK_VOXELS, 16); if (ro_ == SIZE_MAX) { free(buf); return -1; }
+            if (lbc_decode(buf, ln, K->b + ro_)) { free(buf); return -2; }
+            free(buf); C.mode = VLL_MODE_RAW; C.raw_off = (uint32_t)ro_;
+            if (K->nch == K->ccap) { const int c = K->ccap ? 2 * K->ccap : 256; bg_lchunk *nc = realloc(K->ch, (size_t)c * sizeof *nc); if (!nc) return -1; K->ch = nc; K->ccap = c; }
+            K->ch[K->nch++] = C; continue;
+        }
         if (vll_chunk_mode(buf, len, &mode) != VOLCOMP_OK || (mode != VLL_MODE_CODED && mode != VLL_MODE_RAW && mode != VLL_MODE_CONST)) { free(buf); return -2; }
         C.mode = mode;
         if (mode == VLL_MODE_CONST) { if (len != VF_HDR_BYTES + 1u) { free(buf); return -2; } C.value = buf[VF_HDR_BYTES]; if (!C.value) { free(buf); continue; } }
