@@ -69,6 +69,15 @@ if(UFSM_TOOLCHAIN STREQUAL "mcc")
   set(UFSM_CUDA_VERSION mcc)
   set(UFSM_LLVM_RUNTIME OFF CACHE BOOL "" FORCE)
   set(UFSM_CCACHE OFF CACHE BOOL "" FORCE)   # (mcc compiles a unit in less time than ccache takes to hash it)
+  # A build dir keeps the compiler of its first configure (CMakeFiles/<ver>/CMakeCCompiler.cmake overrides the toolchain file), and
+  # UFSM_MCC_CUDA is cached from it: a later -DUFSM_MCC= only changed the cache entry while every object was still built by the old
+  # mcc ("no work to do"; the 2026-11-16 e52bb39 pin round gated 9f63cdd binaries that way).
+  file(REAL_PATH ${UFSM_MCC} _mcc_want)
+  file(REAL_PATH ${CMAKE_C_COMPILER} _mcc_have)
+  if(NOT _mcc_want STREQUAL _mcc_have)
+    message(FATAL_ERROR "mcc: this build dir was configured with ${CMAKE_C_COMPILER}, UFSM_MCC is now ${UFSM_MCC}: CMake keeps the first "
+                        "compiler, so delete ${CMAKE_BINARY_DIR} and configure again")
+  endif()
   if(NOT EXISTS ${UFSM_CUDA}/include/mcuda_device.h OR NOT EXISTS ${UFSM_CUDA}/lib64/libcudart.a)
     message(FATAL_ERROR "mcc: no mcudahw at ${UFSM_CUDA} (in the microc tree: sh mkcuda.sh MCC DIR hw; or -DUFSM_MCC_CUDA=)")
   endif()
