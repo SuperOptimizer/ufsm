@@ -288,7 +288,7 @@ static void hann2(float *k, int T, float floor_) {   /* torch.hann_window(T, per
 static const char ell7[7][8] = {"0001000", "0111110", "1111111", "1111111", "1111111", "0111110", "0001000"};
 
 typedef struct {
-    int kind; ie_net *net; const ie_spec *sp; int stride, batch, nth, reverse, blend_norm, no_overlap; size_t ct_mem; double px_um, shift;
+    int kind; ie_net *net; ie_net **ens; int nens; const ie_spec *sp;   /* nens > 1: the checkpoints ens[] averaged per batch in one pass */ int stride, batch, nth, reverse, blend_norm, no_overlap; size_t ct_mem; double px_um, shift;
     ctlev lev[6]; int nlev; double lev_um[6];
     uint8_t **stk; int stk_n, stk_w, stk_h;   /* --layers: a pre-rendered stack (ascending normal offsets) instead of the renderer */
     uint8_t *dump; int dump_req, render_only;  /* --dump-layers: the rendered model-grid stack [D][Hm][Wm] (run_surface allocates) */
@@ -323,6 +323,16 @@ static int ie_forward_tta(const irun *X, const uint8_t *tiles, int nb, int D, in
     return 0;
 }
 
+/* the batch through the run's net, or the mean over the ensemble ens[0..nens) (tmp: nb T T floats) */
+static int ie_forward_run(const irun *X, const uint8_t *tiles, int nb, float *out, float *tmp) {
+    if (X->nens <= 1) return ie_forward(X->net, tiles, nb, out, 0);
+    const size_t n = (size_t)nb * X->sp->T * X->sp->T;
+    if (ie_forward(X->ens[0], tiles, nb, out, 0)) return -1;
+    for (int k = 1; k < X->nens; k++) { if (ie_forward(X->ens[k], tiles, nb, tmp, 0)) return -1; for (size_t i = 0; i < n; i++) out[i] += tmp[i]; }
+    const float inv = 1.f / X->nens; for (size_t i = 0; i < n; i++) out[i] *= inv;
+    return 0;
+}
+
 /* the network side of run_surface in its own thread: batches handed over by the renderer (double buffered), forward,
    blend into num / den, so the CPU render of the next rows overlaps the GPU */
 typedef struct {
@@ -346,7 +356,11 @@ static void *gpu_worker(void *a) {
             if (need > cap) { free(tb); free(ob); tb = malloc(need); ob = malloc((size_t)X->batch * T * T * sizeof *ob); cap = tb && ob ? need : 0; }
             if (!cap) G->fail = 1;
             if (!G->fail && ie_forward_tta(X, G->tiles, nb, D, T, G->out, tb, ob)) G->fail = 1;
-        } else if (!G->fail && ie_forward(X->net, G->tiles, nb, G->out, 0)) G->fail = 1;
+        } else if (!G->fail) {
+            static _Thread_local float *eb; static _Thread_local size_t ecap; const size_t en = (size_t)X->batch * T * T;
+            if (X->nens > 1 && en > ecap) { free(eb); eb = malloc(en * sizeof *eb); ecap = eb ? en : 0; if (!eb) G->fail = 1; }
+            if (!G->fail && ie_forward_run(X, G->tiles, nb, G->out, eb)) G->fail = 1;
+        }
         G->tg += inow() - t0; G->ntiles += nb;
         if (!G->fail) for (int k = 0; k < nb; k++) {
             const float *o = G->out + (size_t)k * T * T; const uint8_t *tl = G->tiles + (size_t)k * D * T * T;
@@ -397,9 +411,9 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
             for (size_t i = 0; i < (size_t)D * Wm; i++) if (row[i]) { if (nv == cv) { cv *= 2; v = realloc(v, cv); } v[nv++] = row[i]; }
         }
         if (nv > 1000) {
-            float lo, hi, a, b; ie_robust_params(v, nv, &lo, &hi, &a, &b); ie_set_norm(X->net, 1, lo, hi, a, b);
+            float lo, hi, a, b; ie_robust_params(v, nv, &lo, &hi, &a, &b); ie_set_norm(X->net, 1, lo, hi, a, b); for (int k = 0; k < X->nens; k++) ie_set_norm(X->ens[k], 1, lo, hi, a, b);
             fprintf(stderr, "ink-ext: %s: sheet normalisation over %zu voxels of %d rows: p1 %.0f p99 %.0f median %.1f scale %.2f\n", S->name, nv, nr, lo, hi, -b / a, 1 / a);
-        } else { ie_set_norm(X->net, 0, 0, 0, 0, 0); fprintf(stderr, "ink-ext: %s: too few voxels for --norm sheet, per-tile normalisation\n", S->name); }
+        } else { ie_set_norm(X->net, 0, 0, 0, 0, 0); for (int k = 0; k < X->nens; k++) ie_set_norm(X->ens[k], 0, 0, 0, 0, 0); fprintf(stderr, "ink-ext: %s: too few voxels for --norm sheet, per-tile normalisation\n", S->name); }
         free(v); free(row);
     }
     float *num = calloc((size_t)Wm * Hm, sizeof *num), *den = calloc((size_t)Wm * Hm, sizeof *den);
@@ -719,7 +733,11 @@ surfaces:;
         /* the mean probability over the checkpoints (--weights a,b) x layer windows (--zwin); the first pass gives --ct-tif / --dump-layers */
         const double shift0 = opt_atof("--shift", iopt(argc, argv, "--shift", "0")); const int dreq = X.dump_req;
         float *pm = nullptr; uint8_t *dump0 = nullptr; int npass = 0, bad = 0;
-        for (int k = 0; k < nnet && !bad; k++) for (int z = 0; z < nzw && !bad; z++) {
+        /* --weights a,b without --zwin / --tta: one render pass, every checkpoint forwarded per batch (UFSM_IE_ENS1=0: a pass per checkpoint) */
+        static int ens1 = -1; if (ens1 < 0) ens1 = getenv("UFSM_IE_ENS1") ? atoi(getenv("UFSM_IE_ENS1")) : 1;   /* mgpu: env */
+        const int one = ens1 && nnet > 1 && nzw == 1 && X.tta <= 1 && !X.tta_depth;
+        X.ens = one ? nets : nullptr; X.nens = one ? nnet : 0;
+        for (int k = 0; k < (one ? 1 : nnet) && !bad; k++) for (int z = 0; z < nzw && !bad; z++) {
             X.net = nets[k]; X.shift = shift0 + zw[z]; X.dump_req = dreq && !npass;
             if (nnet * nzw > 1) fprintf(stderr, "ink-ext: pass %d/%d: weights %d, shift %+.2f layers\n", npass + 1, nnet * nzw, k, X.shift);
             float *q = run_surface(&X, &S, &Wm, &Hm, &du, want_ct && !npass ? &ctl : nullptr);
