@@ -107,12 +107,17 @@ static double rr_sample(const rr_job *J, const rr_src *s, double y, double x) { 
    samples, merged closer than sep samples; positions (samples, sub-sample), heights, prominences, half-prominence widths (samples) */
 int rr_peaks(const float *v, const uint8_t *mat, int n, double sig, double prom, int W, double sep, rr_hit *out, float *tmp) {
     const int R = sig > 0 ? (int)ceil(3 * sig) : 0;
+    /* the 2R + 1 gaussian taps once (the same doubles as per sample; exp was a third of recto-sp's CPU, 2026-11-16) */
+    double gs[256], *gk = 2 * R + 1 <= 256 ? gs : malloc(sizeof(double) * (2 * R + 1));
+    if (!gk) return 0;
+    for (int d = -R; d <= R; d++) gk[d + R] = exp(-0.5 * (d / sig) * (d / sig));
     for (int i = 0; i < n; i++) {
         if (!R) { tmp[i] = v[i]; continue; }
         double s = 0, ws = 0;
-        for (int d = -R; d <= R; d++) { const int k = i + d; if (k < 0 || k >= n || !(v[k] == v[k])) continue; const double g = exp(-0.5 * (d / sig) * (d / sig)); s += g * v[k]; ws += g; }
+        for (int d = -R; d <= R; d++) { const int k = i + d; if (k < 0 || k >= n || !(v[k] == v[k])) continue; const double g = gk[d + R]; s += g * v[k]; ws += g; }
         tmp[i] = ws > 0 && v[i] == v[i] ? (float)(s / ws) : NAN;
     }
+    if (gk != gs) free(gk);
     int k = 0;
     for (int i = 1; i + 1 < n; i++) {
         if (!mat[i] || !(tmp[i] == tmp[i]) || !(tmp[i] > tmp[i - 1])) continue;
