@@ -290,7 +290,7 @@ static void hann_n2(float *k, int T) {   /* canonical2um hann2d: np.hanning(T + 
     for (int i = 0; i < T; i++) for (int j = 0; j < T; j++) k[i * T + j] = (float)(w[i] * w[j] / mx);
 }
 /* the ink-sdk lanes that zero the columns without data (all D layers 0) after the blend, and their tile filters */
-static inline int ie_colvalid_kind(int kind) { return kind == IE_CANON2 || kind == IE_STUDIO; }
+static inline int ie_colvalid_kind(int kind) { return kind == IE_CANON2 || kind == IE_STUDIO || kind == IE_TSF; }
 /* Studio (hf/inference.py --stride 64 --blend hann): 128 px windows at (y - 16, x - 16), reflect-padded past the map, only their central
    96 px blended, starts range(0, L, stride) + [max(L - 96, 0)]; the window a pixel-centred hann(96) outer product */
 static inline int ie_ctx(int kind) { return kind == IE_STUDIO ? 16 : 0; }
@@ -440,7 +440,7 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     const int ctx = ie_ctx(X->kind), OW = T - 2 * ctx;
     float *win = malloc((size_t)T * T * sizeof *win);
     if (X->no_overlap) for (int i = 0; i < T * T; i++) win[i] = 1.f;   /* --no-overlap: stride = tile, blend off */
-    else if (X->kind == IE_V8IN) gkern64(win, T); else if (X->kind == IE_CANON2) hann_n2(win, T); else if (X->kind == IE_STUDIO) hann_pc(win, OW); else hann2(win, T, 0.001f);
+    else if (X->kind == IE_V8IN) gkern64(win, T); else if (X->kind == IE_CANON2) hann_n2(win, T); else if (X->kind == IE_STUDIO) hann_pc(win, OW); else if (X->kind == IE_TSF) hann2(win, T, 0.f); else hann2(win, T, 0.001f);   /* TimeSformer: np.hanning(64) outer, zero at the tile edges */
     int nx, ny; int *xs, *ys;
     const int stride = X->no_overlap ? OW : X->stride > 0 ? X->stride : sp->stride;
     if (ctx) { xs = axis_starts_studio(Wm, OW, stride, !X->no_overlap, &nx); ys = axis_starts_studio(Hm, OW, stride, !X->no_overlap, &ny); }   /* --no-overlap: Studio's own default (stride 96, written edge to edge) */
@@ -554,7 +554,7 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     free(G.tiles); free(G.tx); free(G.ty); pthread_mutex_destroy(&G.mu); pthread_cond_destroy(&G.cv);
     fprintf(stderr, "\rink-ext: %s %s: %lld tiles (%lld empty skipped), render %.1fs, net %.1fs (%.1f tiles/s), CT chunks decoded %llu\n", S->name, sp->name, ntiles, nskip, tr, tg, tg > 0 ? ntiles / tg : 0, (unsigned long long)X->lev[L].ndec);
     for (size_t i = 0; i < (size_t)Wm * Hm; i++) {
-        const float d = den[i]; float p = ie_is_koine(X->kind) ? (d > 1e-6f ? num[i] / d : 0.f) : (d != 0 ? num[i] / d : 0.f);
+        const float d = den[i]; float p = ie_is_koine(X->kind) ? (d > 1e-6f ? num[i] / d : 0.f) : (d > 0 ? num[i] / d : 0.f);
         if (ie_colvalid_kind(X->kind) && !cov[i]) p = 0.f;   /* ink-sdk: no CT in the column -> 0 */
         num[i] = !(p > 0) ? 0.f : p > 1 ? 1.f : p;
     }
@@ -624,7 +624,7 @@ static int raw_mode(int argc, char **argv, ie_net *net, int kind) {
 int cmd_ink_ext(int argc, char **argv) {
     const char *mname = iopt(argc, argv, "--model", nullptr), *weights = iopt(argc, argv, "--weights", nullptr);
     if (!mname || !weights) {
-        fprintf(stderr, "usage: ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um|reader2|dense9|rectina|trace3b|canon2|studio --weights W[,W2..] --surface TIFXYZ [--surface ..] --ct ROOT KEY --out DIR\n"
+        fprintf(stderr, "usage: ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um|reader2|dense9|rectina|trace3b|canon2|studio|tsf --weights W[,W2..] --surface TIFXYZ [--surface ..] --ct ROOT KEY --out DIR\n"
                         "         [--reverse] [--stride S] [--px-um U] [--batch B] [--gpu 0] [--threads 16] [--ct-mem 3] [--cache DIR] [--native] [--suffix S] [--prefix P]\n"
                         "         [--ct-local ROOT --local-levels 1,2] [--ct-um 2.399] [--surf-um U] [--no-overlap] [--norm tile|sheet] [--blend official|norm] [--grid-crop c,r,w,h]\n"
                         "         [--ct-tif] [--jpeg PATH] [--jpeg-stretch] [--layers DIR [--px-crop x,y,w,h]] [--dump-layers DIR] [--render-only]\n"

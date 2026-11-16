@@ -156,6 +156,7 @@ ufsm_exe(test_init_lr SUITE tests/test_init_lr.c OBJS unet NN LP LIBS LDLIBS CUD
 ufsm_exe(test_ink_air SUITE tests/test_ink_air.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_ink_gate SUITE tests/test_ink_gate.c OBJS inkgate json zarr3 store z3w LIBS LDLIBS)
 ufsm_exe(test_xmx SUITE tests/test_xmx.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_xtsf SUITE tests/test_xtsf.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_ink_mil SUITE tests/test_ink_mil.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_ink_mil_check SUITE tests/test_ink_mil_check.c OBJS z3w tiffw LIBS LDLIBS DEPS ufsm make_wind_fixture)
 ufsm_exe(test_ink_mil_train SUITE tests/test_ink_mil_train.c OBJS CORE NN LP LIBS LDLIBS CUDA DEPS ufsm make_wind_fixture)

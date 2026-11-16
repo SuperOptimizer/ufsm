@@ -18,6 +18,11 @@ Networks:
   3x3x3 conv twice; GroupNorm + SiLU + strided 3x3x3 down convs (first (1, 2, 2), then 2); decoder: trilinear resize, 1x1 up conv,
   concat with the skip, GroupNorm + SiLU + 1x1 fuse, residual blocks; head GroupNorm + SiLU + 1x1 conv; the logits weighted by
   softmax(depth_logits) and summed over the 16 planes): input clamp(u8, 0, 200) / 255; the tile's logits (128 x 128).
+- timesformer(sd, tiles): the ink TimeSformers (lucidrains TimeSformer-pytorch 0.4.1 semantics: patch rows (p1 p2 c) of 16 px, a cls
+  token, per layer pre-LayerNorm time attention, space attention (dim_head 64; the cls query over all tokens unrotated, patch queries
+  over the cls token + their frame column / frame row with rotary q / k: frame RotaryEmbedding, axial 4 x 4 patch embedding,
+  rotate_every_two), pre-LN GEGLU feed-forward; LayerNorm + Linear(512, 16) of the cls token = 4 x 4 logits): input clip(u8, 0, 200)
+  / 200, frames = the 26 layers in tile order; the 4 x 4 logits upsampled as probabilities (bilinear) and returned as logits.
 Each function takes uint8 tiles [B][D][T][T] (numpy) and returns float64 logits [B][T][T]."""
 import numpy as np
 
@@ -35,7 +40,7 @@ def load_state(path, prefer=("ema_model", "model", "state_dict")):
         def __setstate__(self, s): pass
     allowed = [(_Inert, n) for n in ("torch.optim.adamw.AdamW", "torch.optim.adam.Adam", "torch.optim.lr_scheduler.CosineAnnealingLR",
                                      "torch.optim.lr_scheduler.LambdaLR", "torch.optim.lr_scheduler.OneCycleLR")]
-    with torch.serialization.safe_globals([*allowed, (lambda *a: {}, "collections.defaultdict")]):
+    with torch.serialization.safe_globals([*allowed, (lambda *a: {}, "collections.defaultdict"), dict]):
         d = torch.load(path, map_location="cpu", weights_only=True)
     if isinstance(d, dict) and all(hasattr(v, "shape") for v in d.values()):
         sd = d
@@ -229,4 +234,62 @@ def studio(sd, tiles):
             h = F.conv3d(ns(x, "head.0"), sd["head.2.weight"], sd["head.2.bias"])
             y = (h * sd["depth_logits"].softmax(0)[None, None, :, None, None]).sum(2)
             out.append(y[0, 0].double().numpy())
+    return np.stack(out)
+
+
+def timesformer(sd, tiles):
+    import math, torch, torch.nn.functional as F
+    P = next(k[:-len("cls_token")] for k in sd if k.endswith("cls_token"))
+    g = lambda k: sd[P + k]
+    depth = sum(1 for k in sd if k.startswith(P + "layers.") and k.endswith(".0.fn.to_qkv.weight"))
+    H = g("layers.0.0.fn.to_qkv.weight").shape[0] // (3 * 64)
+    Fr, NP, C = 26, 16, 512
+    # rotary tables (fp32, as the modules compute them from their buffers)
+    fr = torch.arange(Fr, dtype=torch.float32)[:, None] * g("frame_rot_emb.inv_freqs")[None, :]
+    fr = torch.cat([fr, fr], -1); rot_t = (fr.sin(), fr.cos())                            # [26][64]
+    hs = torch.linspace(-1., 1., 4)[:, None] * g("image_rot_emb.scales")[None, :] * math.pi  # [4][16]
+    xs = hs[:, None, :].expand(4, 4, 16); ys = hs[None, :, :].expand(4, 4, 16)
+    sn = torch.cat([xs.sin(), ys.sin()], -1).reshape(16, 32).repeat_interleave(2, -1)
+    cs = torch.cat([xs.cos(), ys.cos()], -1).reshape(16, 32).repeat_interleave(2, -1)
+    rot_s = (sn, cs)                                                                       # [16][64]
+    def rot2(t):   # rotate_every_two
+        t2 = t.reshape(*t.shape[:-1], -1, 2)
+        return torch.stack([-t2[..., 1], t2[..., 0]], -1).reshape(t.shape)
+    def attention(x, pre, time):
+        b, n, _ = x.shape
+        q, k, v = F.linear(x, sd[pre + "fn.to_qkv.weight"]).chunk(3, -1)
+        sp = lambda t: t.reshape(b, n, H, 64).permute(0, 2, 1, 3).reshape(b * H, n, 64)
+        q, k, v = sp(q) * 64 ** -0.5, sp(k), sp(v)
+        cls_out = (q[:, :1] @ k.transpose(1, 2)).softmax(-1) @ v                           # [bH][1][64]
+        qr, kr, vr = (t[:, 1:].reshape(b * H, Fr, NP, 64) for t in (q, k, v))
+        if time:   # (b n) f d
+            qr, kr, vr = (t.permute(0, 2, 1, 3).reshape(b * H * NP, Fr, 64) for t in (qr, kr, vr)); sin, cos = rot_t
+        else:      # (b f) n d
+            qr, kr, vr = (t.reshape(b * H * Fr, NP, 64) for t in (qr, kr, vr)); sin, cos = rot_s
+        qr = qr * cos + rot2(qr) * sin; kr = kr * cos + rot2(kr) * sin
+        r = qr.shape[0] // (b * H)
+        kc = torch.cat([k[:, :1].repeat_interleave(r, 0), kr], 1); vc = torch.cat([v[:, :1].repeat_interleave(r, 0), vr], 1)
+        o = (qr @ kc.transpose(1, 2)).softmax(-1) @ vc
+        o = o.reshape(b * H, NP, Fr, 64).permute(0, 2, 1, 3) if time else o.reshape(b * H, Fr, NP, 64)
+        o = torch.cat([cls_out, o.reshape(b * H, Fr * NP, 64)], 1)
+        o = o.reshape(b, H, n, 64).permute(0, 2, 1, 3).reshape(b, n, H * 64)
+        return F.linear(o, sd[pre + "fn.to_out.0.weight"], sd[pre + "fn.to_out.0.bias"])
+    ln = lambda x, pre: F.layer_norm(x, (C,), sd[pre + ".weight"], sd[pre + ".bias"], 1e-5)
+    out = []
+    with torch.inference_mode():
+        for t in tiles:
+            v = torch.from_numpy(np.clip(t.astype(np.float32), 0, 200) / 200)                 # [26][64][64] = (f h w)
+            v = v.reshape(Fr, 4, 16, 4, 16).permute(0, 1, 3, 2, 4).reshape(1, Fr * NP, 256)  # b (f h w) (p1 p2 c)
+            x = torch.cat([g("cls_token")[None], F.linear(v, g("to_patch_embedding.weight"), g("to_patch_embedding.bias"))], 1)
+            for L in range(depth):
+                x = attention(ln(x, P + f"layers.{L}.0.norm"), P + f"layers.{L}.0.", True) + x
+                x = attention(ln(x, P + f"layers.{L}.1.norm"), P + f"layers.{L}.1.", False) + x
+                h = F.linear(ln(x, P + f"layers.{L}.2.norm"), g(f"layers.{L}.2.fn.net.0.weight"), g(f"layers.{L}.2.fn.net.0.bias"))
+                a, gate = h.chunk(2, -1)
+                x = F.linear(a * F.gelu(gate), g(f"layers.{L}.2.fn.net.3.weight"), g(f"layers.{L}.2.fn.net.3.bias")) + x
+            y = F.linear(F.layer_norm(x[:, 0], (C,), g("to_out.0.weight"), g("to_out.0.bias"), 1e-5), g("to_out.1.weight"), g("to_out.1.bias"))
+            pr = F.interpolate(y.reshape(1, 1, 4, 4).sigmoid(), size=(64, 64), mode="bilinear", align_corners=False)[0, 0].double()
+            eps = 1.1920929e-07
+            pr = pr.clamp(eps, 1 - eps)
+            out.append(torch.log(pr / (1 - pr)).numpy())
     return np.stack(out)

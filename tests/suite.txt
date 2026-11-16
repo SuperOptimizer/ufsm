@@ -195,6 +195,7 @@ test_ink_splat~over                            | gpu          |    10 | UFSM_INK
 test_ink_pool                                  |              |     3 | ./$B/test_ink_pool $TMPDIR/ink_pool
 test_ink_mil                                   | gpu          |     2 | ./$B/test_ink_mil
 test_xmx                                       | gpu          |     3 | ./$B/test_xmx
+test_xtsf                                      | gpu          |     2 | ./$B/test_xtsf
 test_grad_ar                                   | gpu          |     8 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
 test_grad_ar~2gpu                              | gpu2         |     8 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
 test_sumsq                                     | gpu          |     4 | ./$B/test_sumsq
@@ -256,6 +257,7 @@ test_ink_ext_inksdk_koine                      | gpu,slow     |    60 | python3 
 test_ink_ext_inksdk_canon                      | gpu,slow     |    30 | python3 tests/test_ink_ext_inksdk_canon.py
 test_ink_ext_inksdk_blend                      | gpu,slow     |    45 | python3 tests/test_ink_ext_inksdk_blend.py
 test_ink_ext_inksdk_studio                     | gpu,slow     |    40 | python3 tests/test_ink_ext_inksdk_studio.py
+test_ink_ext_inksdk_tsf                        | gpu,slow     |    20 | python3 tests/test_ink_ext_inksdk_tsf.py
 test_dinovol                                   | gpu,slow     |    86 | python3 tests/test_dinovol.py
 test_dinovol_embed                             | gpu,slow     |   591 | python3 tests/test_dinovol_embed.py
 test_hercuvit                                  | gpu,slow     |    77 | python3 tests/test_hercuvit.py

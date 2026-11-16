@@ -7,6 +7,8 @@ checked by the parity tests):
 - studio (hf/inference.py --stride 64 --blend hann): 128 px windows at (y - 16, x - 16) reflect-padded past the map, starts
   range(0, L, 64) + [max(L - 96, 0)], the central 96 px x a pixel-centred hann(96) summed over the weight sums, 0 where all 16
   planes are 0. A 16 x 230 x 300 stack with an empty corner (ink-ext skips windows whose central 96 px hold no data: exact).
+- tsf (timesformer.py): grid() origins of 64 px tiles at stride 16, tiles with any data column, window np.hanning(64) outer (0 on the
+  tile edges), 0 where the window sum is 0 or the column has no data. A 26 x 100 x 150 stack with an empty corner.
 The canon2 stack (62 x 400 x 520) has an empty band and an empty corner, so tiles are dropped by the 60 % rule and columns zeroed.
 |out - round(255 ref)| <= 1 (uint8)."""
 import os, pathlib, subprocess, sys, tempfile
@@ -16,7 +18,8 @@ import ink_ext_parity as P
 D0 = pathlib.Path(os.environ.get("UFSM_INKSDK", "/vesuvius/ufsm/inksdk")).expanduser()
 WC = D0 / "weights/canonical_2um@r152-3ddec-v2-l5-epoch13/r152_3ddec_v2_l5_epoch13.ckpt"
 WS = D0 / "weights/studio@softloss-20261023/studio-softloss-20261023-ema.safetensors"
-P.need([WC, WS])
+WT = D0 / "weights/timesformer@gp-scroll1/model.safetensors"
+P.need([WC, WS, WT])
 import numpy as np
 import inksdk_ref as R
 
@@ -84,4 +87,19 @@ for (y, x), l in zip(org, logit):
 ref = np.where(den > 0, num / np.maximum(den, 1e-300), 0); ref[(stack == 0).all(0)] = 0
 with tempfile.TemporaryDirectory(prefix="ufsm-inksdk-blend-") as d:
     check("studio", run_layers("studio", WS, stack, pathlib.Path(d)), ref)
+
+# ---- tsf ----
+Dd, H, Wd, T = 26, 100, 150, 64
+stack = np.clip(100 + 30 * rng.standard_normal((Dd, H, Wd)), 1, 255).astype(np.uint8)
+stack[:, 60:, 90:] = 0
+valid = (stack > 0).any(0)
+org = [(y, x) for y in grid(H, T, 16) for x in grid(Wd, T, 16) if valid[y:y + T, x:x + T].any()]
+logit = P.run_c("tsf", WT, np.stack([stack[:, y:y + T, x:x + T] for y, x in org]), batch=8)
+w1 = np.hanning(T); win = np.outer(w1, w1)
+num = np.zeros((H, Wd)); den = np.zeros((H, Wd))
+for (y, x), l in zip(org, logit):
+    num[y:y + T, x:x + T] += win / (1 + np.exp(-l.astype(np.float64))); den[y:y + T, x:x + T] += win
+ref = np.where((den > 0) & valid, num / np.maximum(den, 1e-300), 0)
+with tempfile.TemporaryDirectory(prefix="ufsm-inksdk-blend-") as d:
+    check("tsf", run_layers("tsf", WT, stack, pathlib.Path(d)), ref)
 print("test_ink_ext_inksdk_blend: OK")
