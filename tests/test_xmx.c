@@ -35,6 +35,44 @@ static void q16(float *v, int sf, float gs) {   /* one block of 16 in place */
     else d = e4m3(gs == 1.f ? (float)((double)am / 6.0) : am / 6.f / gs) * gs;
     for (int i = 0; i < 16; i++) v[i] = d > 0.f ? (sf == 6 ? e2m1(v[i] / d) : e2m1_div(v[i], d)) * d : 0.f;
 }
+/* the least-squares weight quantiser (UFSM_XNET_MXQ 1 / 2), from its definition: per 16-block the scale of least squared error among
+   the e4m3 values 4 codes below .. 2 above e4m3(amax / 6 / gs) (5; in double; the first of equal errors: the amax code, then ascending) or the
+   exponents e, e - 1 (6); mode 2 (5 only): the row scale gs = amax_row / 2688 (double) 2^(j / 8), j 0..7, of least row error (the first of equal: a later candidate wins only when 1e-9 better) */
+static float e4v(int cc) { const int E = (cc >> 3) & 15, M = cc & 7; return E ? ldexpf(1.f + M / 8.f, E - 7) : ldexpf(M / 8.f, -6); }
+static double qerr(const float *v, float d, int sf, float *out) {
+    double e = 0.0;
+    for (int i = 0; i < 16; i++) {   /* the error in double (G d is not always a float) */
+        const double q = (double)(d > 0.f ? (sf == 6 ? e2m1(v[i] / d) : e2m1_div(v[i], d)) : 0.f) * d; if (out) out[i] = (float)q; e += (q - v[i]) * (q - v[i]);
+    }
+    return e;
+}
+static double q16s(float *v, int sf, float gs, int apply) {   /* least-squares block scale; returns the block's error */
+    float am = 0.f; for (int i = 0; i < 16; i++) am = fmaxf(am, fabsf(v[i]));
+    if (am == 0.f) return 0.0;
+    float bd;
+    if (sf == 6) {
+        int e; frexpf(am / 6.f, &e); if (ldexpf(1.f, e - 1) >= am / 6.f) e--;
+        bd = ldexpf(1.f, e); if (qerr(v, ldexpf(1.f, e - 1), 6, nullptr) < qerr(v, bd, 6, nullptr) * (1.0 - 1e-9)) bd = ldexpf(1.f, e - 1);
+    } else {
+        const float sv = e4m3((float)((double)am / 6.0 / gs)); int c0 = 0; while (c0 < 126 && e4v(c0) != sv) c0++;
+        bd = sv * gs; double be = qerr(v, bd, 5, nullptr);
+        for (int cc = c0 - 4; cc <= c0 + 2; cc++) { if (cc < 1 || cc > 126 || cc == c0) continue; const double t = qerr(v, e4v(cc) * gs, 5, nullptr); if (t < be * (1.0 - 1e-9)) { be = t; bd = e4v(cc) * gs; } }
+    }
+    return qerr(v, bd, sf, apply ? v : nullptr);
+}
+static void qrow_s(float *r, int K, int sf, int mode, float am) {   /* K % 16 == 0 */
+    float gs = sf == 5 ? (float)((double)am / 2688.0) : 1.f;
+    if (mode >= 2 && sf == 5) {
+        double best = -1.0; const float g0 = gs; float tmp[16];
+        for (int j = 0; j < 8; j++) {
+            static const float R8[8] = {1.f, 1.0905077f, 1.1892071f, 1.2968396f, 1.4142135f, 1.5422108f, 1.6817929f, 1.8340081f};
+            const float gj = g0 * R8[j]; double t = 0.0;
+            for (int k = 0; k < K; k += 16) { memcpy(tmp, r + k, sizeof tmp); t += q16s(tmp, 5, gj, 0); }
+            if (best < 0.0 || t < best * (1.0 - 1e-9)) { best = t; gs = gj; }
+        }
+    }
+    for (int k = 0; k < K; k += 16) q16s(r + k, sf, gs, 1);
+}
 static float h2f(uint16_t h) {   /* fp16 bits -> float */
     const int s = h >> 15, e = (h >> 10) & 31, m = h & 1023; float v;
     if (e == 0) v = ldexpf((float)m, -24); else if (e == 31) v = m ? NAN : INFINITY; else v = ldexpf((float)(m | 1024), e - 25);
@@ -49,7 +87,7 @@ static uint16_t f2h(float f) {   /* round to nearest even */
 }
 static uint32_t rs = 12345; static float rnd(void) { rs = rs * 1664525u + 1013904223u; return (float)(rs >> 8) / 16777216.f * 2.f - 1.f; }
 
-static int run(int sf, int N, int D, int H, int W, int ci, int co, int k, int st) {
+static int run(int sf, int N, int D, int H, int W, int ci, int co, int k, int st, int mode) {
     const int pd = k / 2, Do = (D + 2 * pd - k) / st + 1, Ho = (H + 2 * pd - k) / st + 1, Wo = (W + 2 * pd - k) / st + 1, K = k * k * k * ci;
     const size_t nx = (size_t)N * D * H * W * ci, ny = (size_t)N * Do * Ho * Wo * co;
     uint16_t *xh = malloc(nx * 2), *yh = malloc(ny * 2); float *x = malloc(nx * 4), *w = malloc((size_t)co * ci * k * k * k * 4), *wk = malloc((size_t)co * K * 4), *b = malloc(co * 4);
@@ -61,9 +99,10 @@ static int run(int sf, int N, int D, int H, int W, int ci, int co, int k, int st
     for (int o = 0; o < co; o++) {
         float am = 0.f;
         for (int i = 0; i < ci; i++) for (int t = 0; t < k * k * k; t++) { const float v = w[((size_t)o * ci + i) * k * k * k + t]; wk[(size_t)o * K + t * ci + i] = v; am = fmaxf(am, fabsf(v)); }
-        for (int kk = 0; kk < K; kk += 16) q16(wk + (size_t)o * K + kk, sf, sf == 5 && am > 0.f ? am / 2688.f : 1.f);
+        if (mode && am > 0.f) qrow_s(wk + (size_t)o * K, K, sf, mode, am);
+        else for (int kk = 0; kk < K; kk += 16) q16(wk + (size_t)o * K + kk, sf, sf == 5 && am > 0.f ? am / 2688.f : 1.f);
     }
-    xnet_set_mx(sf);
+    xnet_set_mx(sf); xnet_set_mxq(mode);
     xconv c; if (xconv_init(&c, w, co, ci, k, k, k, st, st, st, pd, pd, pd, nullptr, b)) { fprintf(stderr, "xconv_init failed\n"); return 1; }
     xt xd = xt_new(N, D, H, W, ci); xh2d(xd.p, xh, nx * 2);
     xt yd = xconv_fwd(&c, xd, nullptr, XA_NONE); xd2h(yh, yd.p, ny * 2);
@@ -81,7 +120,7 @@ static int run(int sf, int N, int D, int H, int W, int ci, int co, int k, int st
         if (d > emax) emax = d; if (fabs(s) > ymax) ymax = fabs(s);
         if (d > 1e-3 * fabs(s) + 2e-4 * ymax + 1e-3) bad++;
     }
-    printf("sf %d N %d %dx%dx%d ci %3d co %3d k %d s %d: max |d| %.3g (max |y| %.3g), %zu of %zu over the bound\n", sf, N, D, H, W, ci, co, k, st, emax, ymax, bad, ny);
+    printf("sf %d q %d N %d %dx%dx%d ci %3d co %3d k %d s %d: max |d| %.3g (max |y| %.3g), %zu of %zu over the bound\n", sf, mode, N, D, H, W, ci, co, k, st, emax, ymax, bad, ny);
     xt_free(&xd); xt_free(&yd); xconv_free(&c); free(xh); free(yh); free(x); free(w); free(wk); free(b);
     return bad != 0;
 }
@@ -110,16 +149,22 @@ int main(void) {
     if (getenv("XMX_BENCH")) { bench(); return 0; }
     int fails = 0;
     for (int sf = 6; sf >= 5; sf--) {
-        fails += run(sf, 2, 9, 7, 11, 32, 32, 3, 1);
-        fails += run(sf, 1, 16, 16, 16, 64, 64, 3, 1);
-        fails += run(sf, 2, 10, 9, 8, 32, 64, 3, 2);
-        fails += run(sf, 1, 6, 5, 7, 128, 256, 1, 1);
-        fails += run(sf, 2, 4, 4, 4, 320, 320, 3, 1);
-        fails += run(sf, 1, 5, 6, 4, 96, 128, 3, 1);
-        fails += run(sf, 2, 5, 10, 40, 32, 32, 3, 1);    /* halo kernel: TX 32 tiles with ragged edges */
-        fails += run(sf, 1, 7, 9, 36, 128, 64, 3, 1);    /* halo kernel: two chunk pairs, ragged */
-        fails += run(sf, 1, 6, 6, 20, 64, 96, 3, 1);     /* halo kernel: TX 16, outputs not a multiple of 32 */
+        fails += run(sf, 2, 9, 7, 11, 32, 32, 3, 1, 0);
+        fails += run(sf, 1, 16, 16, 16, 64, 64, 3, 1, 0);
+        fails += run(sf, 2, 10, 9, 8, 32, 64, 3, 2, 0);
+        fails += run(sf, 1, 6, 5, 7, 128, 256, 1, 1, 0);
+        fails += run(sf, 2, 4, 4, 4, 320, 320, 3, 1, 0);
+        fails += run(sf, 1, 5, 6, 4, 96, 128, 3, 1, 0);
+        fails += run(sf, 2, 5, 10, 40, 32, 32, 3, 1, 0);    /* halo kernel: TX 32 tiles with ragged edges */
+        fails += run(sf, 1, 7, 9, 36, 128, 64, 3, 1, 0);    /* halo kernel: two chunk pairs, ragged */
+        fails += run(sf, 1, 6, 6, 20, 64, 96, 3, 1, 0);     /* halo kernel: TX 16, outputs not a multiple of 32 */
+        for (int mode = 1; mode <= 2; mode++) {            /* the least-squares weight scales (UFSM_XNET_MXQ) */
+            fails += run(sf, 2, 9, 7, 11, 32, 32, 3, 1, mode);
+            fails += run(sf, 1, 6, 5, 7, 128, 256, 1, 1, mode);
+            fails += run(sf, 1, 7, 9, 36, 128, 64, 3, 1, mode);
+        }
     }
+    xnet_set_mxq(0);
     printf("%s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

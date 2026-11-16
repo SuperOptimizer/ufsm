@@ -374,33 +374,104 @@ extern "C" void xbn_fold(int co, const float *g, const float *b, const float *m,
 }
 
 /* the MX-fp4 weight pack (see conv_mx): rows padded to Cop (multiple of 64), chunks to an even count; ue4m3 (5): per-row scale gs =
-   amax / (6 448) so every block scale fits e4m3, values v / (e4m3(amax_b / 6 / gs) gs) */
-static int g_mx_env = -1;   /* mgpu: env */
+   amax / (6 448) so every block scale fits e4m3, values v / (e4m3(amax_b / 6 / gs) gs).
+   UFSM_XNET_MXQ (xnet_set_mxq; default 0 = the amax / 6 scales above): 1 = per 16-K block the scale of least squared error among the
+   e4m3 codes -4 .. +2 around amax_b / 6 (5) / the exponents e - 1, e (6); 2 = 1 plus, for 5, the row scale gs 2^(j / 8), j 0..7 (gs = amax_row / 2688 in double), of
+   least row error (aligns the blocks' e4m3 grid). A candidate replaces an earlier one only when 1e-9 better (fast-math sums agree). No data: the weights alone. UFSM_XNET_MX_SKIP=i,j-k: convs (initialisation order of
+   a net, xnet_wseq_reset) kept fp16. UFSM_XNET_MXQ_LOG=1: each packed conv's relative weight error (old / new). */
+static int g_mx_env = -1, g_mxq = -1, g_mxq_log = 0;   /* mgpu: env */
+static char g_mx_skip[4096]; static int g_mx_skip_set = 0;   /* mgpu: env */
 extern "C" void xnet_set_mx(int sf) { g_mx_env = sf; }
-static int mx_pack(xconv *c, const float *wk, int co, int sf) {
+extern "C" void xnet_set_mxq(int mode) { g_mxq = mode; }
+extern "C" void xnet_set_mx_skip(const char *list) { snprintf(g_mx_skip, sizeof g_mx_skip, "%s", list ? list : ""); g_mx_skip_set = 1; }
+extern "C" void xnet_wseq_reset(void) { g_fq_wseq = 0; }
+static void mxq_env(void) {
+    if (g_mxq < 0) { const char *e = getenv("UFSM_XNET_MXQ"); g_mxq = e && *e ? atoi(e) : 0; const char *l = getenv("UFSM_XNET_MXQ_LOG"); g_mxq_log = l && *l ? atoi(l) : 0; }
+    if (!g_mx_skip_set) { const char *e = getenv("UFSM_XNET_MX_SKIP"); snprintf(g_mx_skip, sizeof g_mx_skip, "%s", e ? e : ""); g_mx_skip_set = 1; }
+}
+static int mx_skipped(int seq) {   /* seq in the list "i,j-k,..." */
+    const char *p = g_mx_skip;
+    while (*p) {
+        char *e; const long a = strtol(p, &e, 10); if (e == p) break; long b = a; p = e;
+        if (*p == '-') { b = strtol(p + 1, &e, 10); p = e; }
+        if (seq >= a && seq <= b) return 1;
+        while (*p == ',' || *p == ' ') p++;
+    }
+    return 0;
+}
+static float g_e4[127];   /* e4m3 code -> value (0 .. 126 = 448); mgpu: constant table */
+static float e4val(int cc) { const int E = (cc >> 3) & 15, M = cc & 7; return E ? ldexpf(1.f + M / 8.f, E - 7) : ldexpf(M / 8.f, -6); }
+static int e4code(float sv) {   /* sv an e4m3 value -> its code */
+    if (g_e4[126] == 0.f) for (int cc = 0; cc < 127; cc++) g_e4[cc] = e4val(cc);
+    int lo = 0, hi = 126; while (lo < hi) { const int m = (lo + hi) / 2; if (g_e4[m] < sv) lo = m + 1; else hi = m; }
+    return lo;
+}
+static double blk_err(const float *v, float d, int sf) {   /* squared error of one 16-block quantised with scale d (exact rounding) */
+    double e = 0.0;
+    for (int i = 0; i < 16; i++) { const double q = (double)(d > 0.f ? (sf == 6 ? e2m1_rn(v[i] / d) : e2m1_div(v[i], d)) : 0.f) * d - v[i]; e += q * q; }
+    return e;
+}
+/* the block scale: sf 6 the exponent e (d = 2^e), sf 5 the e4m3 code (d = e4[code] gs); mode 0: from amax, else least squared error */
+static int blk_scale(const float *v, float a, float gs, int sf, int mode, double *err) {
+    if (sf == 6) {
+        int e = 0; if (a > 0.f) { frexpf(a / 6.f, &e); if (ldexpf(1.f, e - 1) >= a / 6.f) e -= 1; } else e = -127;
+        if (e < -127) e = -127; if (e > 127) e = 127;
+        if (mode && a > 0.f) {
+            double b = blk_err(v, ldexpf(1.f, e), 6); int be = e;
+            if (e > -127) { const double t = blk_err(v, ldexpf(1.f, e - 1), 6); if (t < b * (1.0 - 1e-9)) { b = t; be = e - 1; } }
+            e = be; if (err) *err = b;
+        } else if (err) *err = blk_err(v, ldexpf(1.f, e), 6);
+        return e;
+    }
+    const float sv = e4m3_rn(mode ? (float)((double)a / 6.0 / gs) : a / 6.f / gs); const int c0 = e4code(sv);   /* (mode >= 1: in double, as the reference under fast math) */
+    double b = blk_err(v, sv * gs, 5); int bc = c0;
+    if (mode && a > 0.f)
+        for (int cc = c0 - 4; cc <= c0 + 2; cc++) {
+            if (cc < 1 || cc > 126 || cc == c0) continue;
+            const double t = blk_err(v, g_e4[cc] * gs, 5); if (t < b * (1.0 - 1e-9)) { b = t; bc = cc; }
+        }
+    if (err) *err = b;
+    return bc;
+}
+static int mx_pack(xconv *c, const float *wk, int co, int sf, int wseq) {
     const int nch = (c->K + 31) / 32, nst = (nch + 1) / 2, Cop = (co + 63) / 64 * 64; const size_t rch = (size_t)nst * 2;
     uint8_t *q = (uint8_t *)calloc((size_t)Cop * rch * 16, 1), *sb = (uint8_t *)calloc((size_t)Cop * rch * 4, 1); float *gs = (float *)malloc(Cop * sizeof(float));
     if (!q || !sb || !gs) { free(q); free(sb); free(gs); return -1; }
+    e4code(1.f);
+    const int mode = g_mxq; double e_old = 0.0, e_new = 0.0, wss = 0.0;
     for (int o = 0; o < Cop; o++) {
         const float *r = o < co ? wk + (size_t)o * c->K : nullptr; float am = 0.f;
-        if (r) for (int k = 0; k < c->K; k++) am = fmaxf(am, fabsf(r[k]));
-        gs[o] = sf == 5 && am > 0.f ? am / (6.f * 448.f) : 1.f;
-        for (int b = 0; b < nch * 2; b++) {   /* 16-K blocks */
-            float v[16], a = 0.f;
-            for (int i = 0; i < 16; i++) { const int k = b * 16 + i; v[i] = r && k < c->K ? r[k] : 0.f; a = fmaxf(a, fabsf(v[i])); }
-            float d; uint8_t code;
-            if (sf == 6) {
-                int e = 0; if (a > 0.f) { frexpf(a / 6.f, &e); if (ldexpf(1.f, e - 1) >= a / 6.f) e -= 1; } else e = -127;
-                if (e < -127) e = -127; if (e > 127) e = 127; code = (uint8_t)(e + 127); d = ldexpf(1.f, e);
-            } else {
-                const float sv = e4m3_rn(a / 6.f / gs[o]); int ex; const float fr = frexpf(sv, &ex); (void)fr;
-                /* encode sv (an e4m3 value) to its byte */
-                code = 0; for (int cc = 0; cc < 127; cc++) { const int E = (cc >> 3) & 15, M = cc & 7; const float val = E ? ldexpf(1.f + M / 8.f, E - 7) : ldexpf(M / 8.f, -6); if (val == sv) { code = (uint8_t)cc; break; } }
-                d = sv * gs[o];
+        if (r) for (int k = 0; k < c->K; k++) { am = fmaxf(am, fabsf(r[k])); wss += (double)r[k] * r[k]; }
+        const float gs0 = sf == 5 && am > 0.f ? (mode ? (float)((double)am / 2688.0) : am / (6.f * 448.f)) : 1.f;
+        float v[64][16], ba[64];   /* (blocks per pass: rows are streamed in groups of 64 blocks) */
+        const int nb = nch * 2;
+        /* the row scale: gs0, or (mode 2, sf 5) the best of gs0 2^(j / 8) */
+        float g = gs0;
+        if (mode >= 2 && sf == 5 && r) {
+            double best = -1.0;
+            for (int j = 0; j < 8; j++) {
+                static const float R8[8] = {1.f, 1.0905077f, 1.1892071f, 1.2968396f, 1.4142135f, 1.5422108f, 1.6817929f, 1.8340081f};   /* 2^(j / 8) */
+                const float gj = gs0 * R8[j]; double tot = 0.0;
+                for (int b0 = 0; b0 < nb; b0 += 64) {
+                    const int n = nb - b0 < 64 ? nb - b0 : 64;
+                    for (int bb = 0; bb < n; bb++) { float a = 0.f; for (int i = 0; i < 16; i++) { const int k = (b0 + bb) * 16 + i; v[bb][i] = k < c->K ? r[k] : 0.f; a = fmaxf(a, fabsf(v[bb][i])); } ba[bb] = a; }
+                    for (int bb = 0; bb < n; bb++) { double e; blk_scale(v[bb], ba[bb], gj, 5, mode, &e); tot += e; }
+                }
+                if (best < 0.0 || tot < best * (1.0 - 1e-9)) { best = tot; g = gj; }
             }
+        }
+        gs[o] = g;
+        for (int b = 0; b < nb; b++) {   /* 16-K blocks */
+            float vb[16], a = 0.f;
+            for (int i = 0; i < 16; i++) { const int k = b * 16 + i; vb[i] = r && k < c->K ? r[k] : 0.f; a = fmaxf(a, fabsf(vb[i])); }
+            float d; uint8_t code; double eb;
+            if (g_mxq_log && r) { double e0; blk_scale(vb, a, gs0, sf, 0, &e0); e_old += e0; }
+            if (sf == 6) { const int e = blk_scale(vb, a, 1.f, 6, mode, &eb); code = (uint8_t)(e + 127); d = ldexpf(1.f, e); }
+            else { const int cc = blk_scale(vb, a, gs[o], 5, mode, &eb); code = (uint8_t)cc; d = g_e4[cc] * gs[o]; }
+            if (r) e_new += eb;
             uint8_t *qb = q + ((size_t)o * rch + b / 2) * 16 + (b & 1) * 8;
             for (int i = 0; i < 16; i++) {
-                const float rq = d > 0.f ? (sf == 6 ? e2m1_rn(v[i] / d) : e2m1_div(v[i], d)) : 0.f;   /* (sf 6: d a power of two, exact) */
+                const float rq = d > 0.f ? (sf == 6 ? e2m1_rn(vb[i] / d) : e2m1_div(vb[i], d)) : 0.f;   /* (sf 6: d a power of two, exact) */
                 static const float G[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f}; int nib = 0; for (int gg = 0; gg < 8; gg++) if (G[gg] == fabsf(rq)) nib = gg;
                 if (rq < 0.f) nib |= 8;
                 qb[i / 2] |= (uint8_t)(nib << ((i & 1) * 4));
@@ -408,6 +479,8 @@ static int mx_pack(xconv *c, const float *wk, int co, int sf) {
             sb[((size_t)o * rch + b / 2) * 4 + (b & 1)] = code;
         }
     }
+    if (g_mxq_log) fprintf(stderr, "xnet mxq conv %d: %dx%dx%d ci %d co %d K %d: rel weight err %.5f -> %.5f (mode %d, sf %d)\n", wseq, c->kd, c->kh, c->kw, c->ci, co, c->K,
+                           sqrt(e_old / (wss + 1e-30)), sqrt(e_new / (wss + 1e-30)), mode, sf);
     c->mxq = xmalloc_dev((size_t)Cop * rch * 16); c->mxs = xmalloc_dev((size_t)Cop * rch * 4); c->mxgs = (float *)xmalloc_dev(Cop * sizeof(float));
     int rc = c->mxq && c->mxs && c->mxgs ? 0 : -1;
     if (!rc) { xh2d(c->mxq, q, (size_t)Cop * rch * 16); xh2d(c->mxs, sb, (size_t)Cop * rch * 4); xh2d(c->mxgs, gs, Cop * sizeof(float)); c->mxsf = sf; c->nch = nch; }
@@ -438,7 +511,8 @@ static int conv_upload(xconv *c, const float *wk /* [co][K] in GEMM order */, in
     if (wmax > 60000.f) fprintf(stderr, "xnet: conv weight %g overflows fp16\n", wmax);
     for (int o = 0; o < co; o++) { sc[o] = scale ? scale[o] : 1.f; bi[o] = bias ? bias[o] : 0.f; }
     if (g_mx_env < 0) { const char *e = getenv("UFSM_XNET_MX"); g_mx_env = e && *e ? atoi(e) : 0; if (g_mx_env != 0 && g_mx_env != 5 && g_mx_env != 6) { fprintf(stderr, "xnet: UFSM_XNET_MX %d (5 or 6)\n", g_mx_env); g_mx_env = 0; } }
-    if (g_mx_env && c->ci % 32 == 0 && !c->unfold && co % 8 == 0 && mx_pack(c, wk, co, g_mx_env)) { free(hw); free(sc); free(bi); return -1; }
+    mxq_env();
+    if (g_mx_env && c->ci % 32 == 0 && !c->unfold && co % 8 == 0 && !mx_skipped(wseq) && mx_pack(c, wk, co, g_mx_env, wseq)) { free(hw); free(sc); free(bi); return -1; }
     c->w = xmalloc_dev((size_t)c->Cop * c->Kp * 2); c->scale = (float *)xmalloc_dev(co * 4); c->bias = (float *)xmalloc_dev(co * 4);
     if (!c->w || !c->scale || !c->bias) { free(hw); free(sc); free(bi); return -1; }
     xh2d(c->w, hw, (size_t)c->Cop * c->Kp * 2); xh2d(c->scale, sc, co * 4); xh2d(c->bias, bi, co * 4);

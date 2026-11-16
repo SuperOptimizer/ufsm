@@ -228,7 +228,7 @@ ie_net *ie_load(int kind, const char *weights) {
     if (!W) W = wl_load(weights, sub);
     if (!W) { fprintf(stderr, "ink-ext: %s\n", wl_error()); return nullptr; }
     ie_net *n = calloc(1, sizeof *n); n->kind = kind; n->sp = ie_specs[kind];
-    int rc;
+    int rc; xnet_wseq_reset();   /* conv indices per net (UFSM_XNET_MX_SKIP) */
     if (kind == IE_V8IN) rc = load_v8in(n, W);
     else if (ie_is_koine(kind)) rc = load_reader(n, W);
     else {
@@ -399,7 +399,7 @@ static xt bbd_fwd(const bbd *B, xt x) {
     return h2;
 }
 static void reader_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out) {
-    const int D = n->sp.D, T = n->sp.T; const size_t per = (size_t)D * T * T;
+    const int D = n->sp.D, T = n->sp.T; const size_t per = (size_t)D * T * T; xnet_seq_reset();
     float lo[B], hi[B], a[B], b[B];
     for (int i = 0; i < B; i++) {
         if (n->gnorm) { lo[i] = n->g_lo; hi[i] = n->g_hi; a[i] = n->g_a; b[i] = n->g_b; }

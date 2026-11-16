@@ -68,6 +68,9 @@ int xtconv3_init(xconv *c, const float *w, int ci, int co, const float *bias);
 void xconv_free(xconv *c);
 void xnet_set_mx(int sf);
 int xnet_mx(void);                      /* the MX format of convs initialised now (0: fp16) */
+void xnet_set_mxq(int mode);            /* the MX weight quantiser (UFSM_XNET_MXQ): 0 amax / 6 block scales, 1 least-squares block scales, 2 + row scale */
+void xnet_set_mx_skip(const char *list);   /* convs kept fp16 by their initialisation index ("3,7-9"; UFSM_XNET_MX_SKIP) */
+void xnet_wseq_reset(void);             /* a new net: initialisation indices restart at 0 (UFSM_XNET_MX_SKIP, UFSM_XNET_FQ weight mask) */
 /* the fused MX inference path (ink3d-ext): a conv that also returns the InstanceNorm sums of its output (st: device doubles [n][co][2]:
    sum, sum of squares; free with xfree_dev), the per-(sample, channel) affine of IN (coef [n][C][2]: a = gamma rstd, b = beta - mean a),
    and the apply y = act(a x + b (+ a_r r + b_r | + r)) writing y over h's fp16 (want_half) and / or its MX copy (want_q). */
