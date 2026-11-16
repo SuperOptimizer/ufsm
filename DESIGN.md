@@ -6,6 +6,55 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## mcc 9aea0ba: PTX packed as MPY (~10x), verify builds keep it in sidecar files; GPU tests are not slower (2026-11-16, branch mcc-sass-20261116)
+
+Priority 1 of the mcc round (GPU test time, binary / build size). All numbers desk, same commit (master 9a9d46a4 + this branch),
+mcc against clang + nvcc (llvm-verify / llvm-release).
+
+**GPU test time: not a JIT problem once the cache is warm.** With ~/.cache/mcudahw warm (jit_warm.sh: 0 kernels to compile, 5 s
+scan), the smoke tier on card 1: 32 GPU tests 73.7 s wall under mcc vs 78.8 s under clang + nvcc (0.93x), 34 CPU tests 13.4 vs
+15.2 s. mcudahw's own work per process (unpacking, its text passes, hashing for the cache key) is ~3 % of test_unet's cycles; the
+rest is libcuda and the test. The "1.6x" was most likely cold-cache runs (every changed kernel is JIT-compiled once per text,
+GPU model and driver). The fast tier's CPU half: user time 500 s under mcc vs 385 s under clang (1.30x; wall 1.04x), which is the
+host-code gap (next priority), not the GPU path. The full fast tier on card 1 (sidecar build vs llvm-verify, same commit): 207 GPU tests 1399 s wall vs 1239 s (1.13x), their user CPU 1341 vs 881 s (1.52x); 124 CPU tests 393 vs 337 s wall, user 463 vs 335 s (1.38x); suite wall 264 vs 236 s. The GPU tests' extra time is the host code they run (references, data setup), not the JIT.
+
+**MPY packing (microc 413bb68, `--cuda-ptx-pack=2`, the default).** MPZ (11-15) was LZ77 with a varint distance per copy. PTX
+instantiations of one template differ in a few constants and register numbers, so copies break off and resume at the same
+distance; MPY codes three repeat offsets in 1-3 bits and entropy-codes literals, counts, lengths and offsets (canonical prefix
+codes of at most 11 bits, prices from a greedy parse of a 2 MB sample). `--cuda-ptx-pack=3` parses optimally (forward DP over 1024
+positions), 1 is MPZ, 0 plain. The unpacked text is byte for byte the same, so mcudahw's JIT cache keys do not change.
+
+| ufsm's 124 release units (337.6 MB of PTX) | packed | lp_f4fwd_i0p (18.6 MB): cycles |
+|---|---|---|
+| MPZ (a420db2) | 87.9 MB | ~1.8 G |
+| MPY pack 2 (greedy) | 43.5 MB | ~1.9 G |
+| MPY pack 3 (optimal) | 34.2 MB | ~10 G |
+| zstd -9 / -19 --long (reference) | 37.3 / 28.9 MB | 0.6 / 22 G |
+
+**Sidecar files (microc 9aea0ba, `--cuda-ptx-file`; ufsm `UFSM_PTX_FILE`, on in verify builds).** Every suite binary links every
+kernel unit, so each carried the same packed PTX. Now mcc writes a unit's record to OBJ.ptxz and the object keeps the plain
+prologue (what mcudahw's first-launch scan reads), two FNV-1a hashes and the file's absolute path; the bodies are read when first
+wanted, and a missing or stale file is refused with its name (`MCUDA_PTXDIR=DIR`: a moved build directory). Release binaries stay
+self-contained.
+
+| build (-j 8, desk) | wall | user / sys | size |
+|---|---|---|---|
+| release, mcc a420db2 (MPZ) | 15.9 s | 92.6 / - s | build/ufsm 108 MB |
+| release, MPY pack 2 | 14.4 s | 79.3 / 10.3 s | build/ufsm 63.1 MB |
+| release, MPY pack 3 (UFSM_PTX_PACK=3) | 23.7 s | 145.3 / 10.3 s | build/ufsm 53.7 MB |
+| release, clang + nvcc | - | - | build/ufsm 57.9 MB (31.4 MB fatbin) |
+| verify suite-bins, mcc a420db2 | 33.3 s | 170.9 / 47.0 s | 19 GB (test binaries ~140 MB) |
+| verify, MPY pack 2 | 31.1 s | 150.6 / 35.7 s | 9.6 GB |
+| verify, MPY pack 2 + sidecars | 23.6 s | 148.2 / 24.9 s | 1.8 GB (60 MB of .ptxz; test_ink_splat 23 MB) |
+| verify, clang + nvcc (cold ccache) | 9 m 13 s | 53 m user | 7.4 GB |
+
+Pack 2 stays the default everywhere (pack 3 costs +9 s on a full release build for 9 MB). Checks: the unpacked PTX of every unit is
+identical between a420db2 MPZ, pack 2, pack 3 and the sidecar build (169 release + 167 verify units); host .text identical in
+all 338 objects both builds made; test_unet's 57 kernel loads all came from the existing JIT cache (0 compiled); the fast tier
+from the sidecar build on card 1: 329 PASS, 2 data SKIP, 2 NEED2 (one card), wall 264 s. microc gate (stage0 -Werror, tests/c
+225/225 with lxlibc, glibc and -g, thr 50, as, abi 13/13, self) on 413bb68 and 9aea0ba; tests/ptxpack.sh 162/162 (every
+tests/cuda unit at levels 1-3 and with --cuda-ptx-file, damaged records and files refused, MCUDA_PTXDIR).
+
 ## The audit's post-pass GPU measurements: FBLEND on, the rest recorded (2026-11-16, master)
 
 try8 paused 06:30-08:04 for the GPU items the audit queued after the mega pass (outputs /vesuvius/ufsm/audit-20261114/postpass, rows in

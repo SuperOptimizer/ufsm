@@ -31,8 +31,9 @@ scripts/test/desk_suite.sh BRANCH   # push to the desk, build and run the suite 
   `build-verify/`; `test` also builds the release-dir helpers the Python tests use (`build/ufsm`, `make_pipeline_fixture` ...).
   On the desk: `~/bin/lowprio`, `-j 8` at most. ccache is shared across worktrees.
 - Toolchain: microc (`cmake/mcc.cmake`, pin `cmake/mcc.version`): mcc compiles the host C and every .cu unit to PTX in the objects;
-  mcudahw JIT-compiles it at first launch (cached in ~/.cache/mcudahw). `UFSM_MCC` / `MCC_HOME` / `~/.local/mcc` locate it. An mcc
-  build-verify is ~65 GB (each binary embeds ~330 MB of PTX). The clang + nvcc presets (`llvm-release`, `llvm-verify`, cmake/llvm.cmake)
+  mcudahw JIT-compiles it at first launch (cached in ~/.cache/mcudahw). `UFSM_MCC` / `MCC_HOME` / `~/.local/mcc` locate it. The PTX
+  is packed (MPY, ~10x); verify builds keep each unit's in `OBJ.ptxz` beside its object (`UFSM_PTX_FILE`, mcc --cuda-ptx-file), so
+  build-verify is ~1.8 GB and its binaries run only where they were built (`MCUDA_PTXDIR` if moved). The clang + nvcc presets (`llvm-release`, `llvm-verify`, cmake/llvm.cmake)
   stay buildable for comparison: there nvcc's host compiler is probed at configure time (clang++ with `-allow-unsupported-compiler`,
   else the newest g++), host .c units and the link clang / lld.
 - A new test: one `ufsm_exe(test_x SUITE tests/test_x.c OBJS ... LIBS ...)` line in `tests/targets.cmake` (OBJS `NN LP` = every
