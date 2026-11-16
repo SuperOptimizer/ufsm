@@ -23,6 +23,13 @@ Networks:
   over the cls token + their frame column / frame row with rotary q / k: frame RotaryEmbedding, axial 4 x 4 patch embedding,
   rotate_every_two), pre-LN GEGLU feed-forward; LayerNorm + Linear(512, 16) of the cls token = 4 x 4 logits): input clip(u8, 0, 200)
   / 200, frames = the 26 layers in tile order; the 4 x 4 logits upsampled as probabilities (bilinear) and returned as logits.
+- v8in(sd, tiles): v8-in / A-hn (ink8um InkDetector: InstanceNorm3d(1) affine on clip(u8, 0, 200) / 255, trilinear resize to
+  96 x 256 x 256, ResNet3D-50 (stem 7^3 stride (1, 2, 2), (1, 3, 3) max-pool), max over depth per level, a 2-D decoder of bilinear x2
+  ups (align_corners False), concat, 3x3 conv + BatchNorm + ReLU, a 1x1 logit): the 64 x 64 logits.
+- hecate(sd, tiles, um): Hecate 2.4 / 9.6 (the canonical network under "canonical."; 2.4: u8 / 200, the outer planes cut, stem 7^3
+  stride (1, 2, 2) + spatial 3x3 max-pool; 9.6: u8 / 255, a 3^3 stem, no pool): per-plane logits and attention scores + the depth
+  coordinate scale, a softmax over depth masked to the columns with data (max-pooled to the feature grid), renormalised, sigmoid,
+  bilinear up; the logits of that probability.
 Each function takes uint8 tiles [B][D][T][T] (numpy) and returns float64 logits [B][T][T]."""
 import numpy as np
 
@@ -292,4 +299,70 @@ def timesformer(sd, tiles):
             eps = 1.1920929e-07
             pr = pr.clamp(eps, 1 - eps)
             out.append(torch.log(pr / (1 - pr)).numpy())
+    return np.stack(out)
+
+
+def _canon_features(sd, x, P, stem):
+    """the canonical RegressionModel trunk on a normalised [1][1][D][T][T]: the decoder's last feature volume (64 channels)"""
+    import torch, torch.nn.functional as F
+    gn = lambda t, p: F.group_norm(t, min(32, t.shape[1]), sd[p + ".weight"], sd[p + ".bias"], 1e-5)
+    if stem == "7s2":
+        x = F.relu(_bn(F.conv3d(x, sd[P + "backbone.conv1.weight"], stride=(1, 2, 2), padding=3), sd, P + "backbone.bn1"))
+        x = F.max_pool3d(x, (1, 3, 3), (1, 2, 2), (0, 1, 1))
+    else:
+        x = F.relu(_bn(F.conv3d(x, sd[P + "backbone.conv1.weight"], padding=1), sd, P + "backbone.bn1"))
+    f = _resnet3d(sd, x, P + "backbone.", [3, 8, 36, 3])
+    r = [F.relu(gn(F.conv3d(f[i], sd[P + f"decoder.channel_reduce.{i}.0.weight"]), P + f"decoder.channel_reduce.{i}.1")) for i in range(4)]
+    x = r[3]
+    for j in range(3):
+        sk = r[2 - j]
+        x = torch.cat([F.interpolate(x, size=sk.shape[2:], mode="trilinear", align_corners=False), sk], 1)
+        p = P + f"decoder.decoder_blocks.{j}."
+        idn = F.conv3d(x, sd[p + "shortcut.weight"]) if p + "shortcut.weight" in sd else x
+        h = F.relu(gn(F.conv3d(x, sd[p + "conv1.weight"], padding=1), p + "gn1"))
+        x = F.relu(gn(F.conv3d(h, sd[p + "conv2.weight"], padding=1), p + "gn2") + idn)
+    return x
+
+
+def hecate(sd, tiles, um):
+    import torch, torch.nn.functional as F
+    P = "canonical."; margin, xys, div, stem = (1, 4, 200.0, "7s2") if um < 5 else (0, 1, 255.0, "3")
+    out = []
+    with torch.inference_mode():
+        for t in tiles:
+            D, T = t.shape[0], t.shape[-1]
+            x = _bn(torch.from_numpy(t.astype(np.float32) / div)[None, None], sd, P + "normalization")
+            feat = _canon_features(sd, x[:, :, margin:D - margin], P, stem)
+            lg = F.conv3d(feat, sd[P + "decoder.logit.weight"][:, :, None], sd[P + "decoder.logit.bias"])
+            sc = F.conv3d(feat, sd[P + "decoder.depth_collapse.attn_conv.weight"], sd[P + "decoder.depth_collapse.attn_conv.bias"])
+            half = sc.shape[2] // 2
+            sc = sc + sd["depth_coordinate_scale"] * ((torch.arange(sc.shape[2], dtype=torch.float32) - half) / half).view(1, 1, -1, 1, 1)
+            valid = torch.from_numpy((t > 0).any(0))[None, None, None].expand(1, 1, D - 2 * margin, T, T).float()
+            sup = F.max_pool3d(valid, (1, xys, xys)).bool()
+            w = sc.masked_fill(~sup, -1e4).softmax(2) * sup
+            w = w / w.sum(2, keepdim=True).clamp_min(1e-8)
+            pr = F.interpolate((w * lg).sum(2).sigmoid(), size=(T, T), mode="bilinear", align_corners=False)[0, 0].double()
+            eps = 1.1920929e-07
+            pr = pr.clamp(eps, 1 - eps)
+            out.append(torch.log(pr / (1 - pr)).numpy())
+    return np.stack(out)
+
+
+def v8in(sd, tiles):
+    import torch, torch.nn.functional as F
+    out = []
+    with torch.inference_mode():
+        for t in tiles:
+            x = torch.from_numpy(np.clip(t.astype(np.float32), 0, 200) / 255)[None, None]
+            x = F.instance_norm(x, weight=sd["normalization.weight"], bias=sd["normalization.bias"], eps=1e-5)
+            x = F.interpolate(x, size=(96, 256, 256), mode="trilinear", align_corners=False)
+            x = F.relu(_bn(F.conv3d(x, sd["backbone.conv1.weight"], stride=(1, 2, 2), padding=3), sd, "backbone.bn1"))
+            x = F.max_pool3d(x, (1, 3, 3), (1, 2, 2), (0, 1, 1))
+            fm = [f.amax(2) for f in _resnet3d(sd, x, "backbone.", [3, 4, 6, 3])]
+            for i in range(3, 0, -1):
+                up = F.interpolate(fm[i], scale_factor=2, mode="bilinear", align_corners=False)
+                c = torch.cat([fm[i - 1], up], 1)
+                fm[i - 1] = F.relu(_bn(F.conv2d(c, sd[f"decoder.convs.{i - 1}.0.weight"], padding=1), sd, f"decoder.convs.{i - 1}.1"))
+            y = F.conv2d(fm[0], sd["decoder.logit.weight"], sd["decoder.logit.bias"])
+            out.append(y[0, 0].double().numpy())
     return np.stack(out)
