@@ -86,7 +86,27 @@ held-out crops: ink9um 1 - corr 0.058 / 0.036 (MX5) -> 0.041 / 0.017; reader3 0.
 Picks: ink9um `UFSM_XNET_MX=5 UFSM_XNET_MXQ=2 UFSM_XNET_MXA=1 UFSM_XNET_MXROT=1 UFSM_XNET_MX_SKIP=2-4`, reader3 the same without
 MXROT (its rotated variant had the higher held-out AUC loss).
 
-SPEED_PLACEHOLDER
+### Speed: where an ink9um tile goes, and the depth-fusion fusions
+
+Card 1 was at 100 % from 2-4 other jobs throughout, so wall times swung +-40 % and only per-kernel minima from nsys (the same launch
+shape over 22 forwards, `nbp.sh`, `UFSM_IE_BENCH=32,10` = the new synthetic bench: B tiles x N forwards per checkpoint) are quoted.
+ink9um, 128x128x17 tiles, batch 32, ms of kernel time per tile per checkpoint:
+
+| path | total | depth fusion (f1 stem, f2 conv, GN, head, attention) | 2-D U-Net | GN stats |
+|---|---|---|---|---|
+| fp16, before (igemm f1 / f2, xgn + xhead + attn_max) | 0.88-0.93 | ~0.55 | ~0.25 | 0.17 |
+| MX5, before | 0.955 | ~0.55 | ~0.20 | 0.17 |
+| MX5, fused (this branch) | 0.650 | ~0.37 | ~0.20 | 0.08 |
+
+The 2-D U-Net that MX speeds up is only ~a quarter of the tile; the depth fusion on 17 full-resolution layers is the rest. Fused:
+`k_dfc1` (the 1 -> 16 stem straight from the one-channel input instead of xunfold + a K 72 implicit GEMM), the f1 GroupNorm +
+LReLU applied in `k_dfc16`'s halo load (`xconv_fwd_gnin`; f1 never rewritten), and `xdepth_collapse16` (f2's GroupNorm + LReLU,
+the attention logit, softmax over depth, weighted sum and max in one kernel reading f2 twice, never writing it). Output: test_xmx
+references (gnin max |d| 0, dattn 2.4e-4 vs the separate kernels, c1 vs a double reference); the AUC of both teachers on the 24
+crops is unchanged to the fourth digit. `--weights s42,s43` now runs one render pass forwarding both checkpoints per batch
+(`UFSM_IE_ENS1=0` for the old pass per checkpoint; byte-equal maps): the render / blend CPU work is halved. Host robust-norm
+params cost 0.07 ms per tile (ink9um). A/B switches: `UFSM_IE_DATTN=0`, `UFSM_XNET_DF1=0`, `UFSM_XNET_DF16=0`.
+Segment wall times on a quiet card: pending (`fp4t/quiet.sh`, `quiet2.sh`).
 
 ## ink-ext: the CT chunk hash saw no z (ink9um 1.21x, half the CPU) (2026-11-16, branch inkspeed-20261116)
 
