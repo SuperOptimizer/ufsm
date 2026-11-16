@@ -269,6 +269,15 @@ void nn_fit_accum_dm(const float *lg, const uint8_t *ct, const uint32_t *bits, i
 int nn_fit_accum_lat(const void *lg, int lh16, int d, int h, int w, int sbase, const float *stem, int C, const int *so, const uint8_t *ctx, const uint8_t *ct,
                      const uint32_t *bits, float mean, float isd, int hz, int halo, int tz, int ty, int tx, const int box[3], int fh, const int F[3],
                      int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc, int ch_w4, int dd, float *acc4);
+/* the same with the winding pass from planes (predict: UFSM_PRED_FIT_W4P, default on): pass A also writes the pair's fp16 logits of
+   window planes [wz0, wz0 + wnz) (every window voxel there; wnz must cover the interior's planes of the box plus dd) into wl
+   [2][wnz][4h][4w] (fp16), instead of recomputing the upsampling and the stem on 3 shifted partner regions per block; pass B
+   (fit_w4_plane_k) sums the winding terms from wl in the same order. The same bytes as nn_fit_accum_lat at every fh. Falls back to the
+   regions when the pair is a sub-cell channel (sbase >= 0, ch_w4 < 2) or wl is null. */
+int nn_fit_accum_lat_w4p(const void *lg, int lh16, int d, int h, int w, int sbase, const float *stem, int C, const int *so, const uint8_t *ctx, const uint8_t *ct,
+                         const uint32_t *bits, float mean, float isd, int hz, int halo, int tz, int ty, int tx, const int box[3], int fh, const int F[3],
+                         int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc, int ch_w4, int dd, float *acc4,
+                         void *wl, int wz0, int wnz);
 void nn_fit_accum_lat_debug(float *planes);   /* (tests: the next calls also write their region-0 logits, [channels][D H W] fp32; null: off) */
 /* W (or U = W + dir theta / 2 pi when with_theta) on a grid: row a at box-local native z rows[a].z, voxel (b, c) at y0 + (b + 0.5)
    step, x0 + (c + 0.5) step; per row model a (z - za) blended with model b (z - zb) by t: (1 - t) W_a + t W_b. ms: device array of
