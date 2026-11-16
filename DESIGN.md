@@ -121,6 +121,12 @@ its STATUS.md).
   (it ran on card 0 whatever GPU said); the Paris 4 J-box GT moved to the datafix raster ("nothing scored"); gtboxes.sh refuses a
   missing GT store.
 
+**Closing rows (2026-11-16 13:22).** e2e rerun on a3d7b7eb: PASS (12 rows). Unroll #21 ink at LV1 vs LV2 (1667, inkpod 15000):
+LV2 AUC 0.797 all / 0.589 heldout / 0.850 rest; LV1 0.50 on every split, training data included: the ink net only works at its
+training voxel size, so finer-level ink needs a net trained at 4.8 um. Geometry #5 packed (Paris 4 ids right, PH 4 boxes / J 34 boxes):
+base 0.234 / 0.259, rp2 0.199 / 0.206, rp4 0.150 / 0.181, rs12 0.152 / 0.170, pw4 identical to base: no default changes. Every audit
+item now has a result (/vesuvius/ufsm/audit-20261114/STATUS.md).
+
 ## The ink builder's GPU buffers under one budget (2026-11-16, try7's step-450 death)
 
 try7 (one card) logged "inkfly gpu: out of memory (nn_inkfly.cu:169)" at sampler start-up, switched the on-the-fly ink to the CPU
