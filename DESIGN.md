@@ -6,6 +6,39 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The fused fit kernel's winding pass from planes (UFSM_PRED_FIT_W4P), and the fused kernel under mcc (2026-11-15, branch univinf-port-20261115)
+
+Ported from wip-snap-univinf-20261115 (efe2e22f, 11-12, written on the h 8 kernel; the WIP drain, /vesuvius/ufsm/wipdrain/ledger.md).
+`predict --fit-zarr` with the fused kernel (nn_fit_accum_lat) and a winding pair (--task unwrap2's channels 9-10): every 8^3 block
+recomputed the upsampling and the fine stem on 3 partner regions (the block shifted by +d along z, y, x) only to read the pair's logits
+there. `nn_fit_accum_lat_w4p` instead writes the pair's fp16 logits once, in pass A (the block pass, its blocks extended by d along each
+axis so the partners are covered; no sums there), into `wl` [2][planes][W][W]. Pass B (`fit_w4_plane_k`) sums the winding terms from
+`wl` in the region path's order: h 8, one thread per accumulator over the block's 512 voxels; h 1 / 2 / 4, one thread per field cell
+(as the 11-14 small-h path). The values are fp16-exact either way (upsampled fp16, then + the stem's fp16-rounded term), so the
+accumulators are the same bytes. A sub-cell pair (sbase >= 0 and ch_w4 < 2) keeps the regions.
+- predict: on by default (`UFSM_PRED_FIT_W4P=0`: the regions); the planes are 4 B per voxel of the chunk's planes + d (fzW, logged
+  once), < 1/5 of the plane path's head planes, which the fused path does not allocate.
+- Tests: test_fit_lat (h 8 / 4 / 2, stem and sub-cell on / off, windows on and off the 4-voxel grid): 0 of the 12 + 9 accumulator
+  planes differ for w4p, and the winding planes are non-empty (512 of 512 cells with pairs at h 8). test_predict_heads (part 0):
+  fused w4p == fused regions == plane path for every field at --fit-h 8, and now at --fit-h 2 with `UFSM_PRED_FIT_FUSED_SMALLH=1`
+  (w4p and regions) == the plane path, whole volume and the off-grid box (the end-to-end check unrollperf-20261112 had, ported).
+- Kernel bench (test_fit_lat UFSM_TEST_BENCH=1, 256^3 window, stem + sub-cell on, d 16, card 1 under the exclusive suite lock):
+
+| build | h | plane path | fused, regions | fused, w4p | fused without the winding pass |
+|---|---|---|---|---|---|
+| mcc (verify) | 8 | 5.3 ms | 13.2 | **11.2** | 8.6 |
+| mcc (verify) | 2 | 4.9 | 12.8 | **10.8** | 8.2 |
+| llvm-verify (nvcc) | 8 | 6.3 | 5.4 | 5.4 | 3.7 |
+| llvm-verify (nvcc) | 2 | 4.6 | 5.0 | 5.0 | 3.4 |
+
+  w4p is 15 % faster than the regions under mcc and the same under nvcc, so it is the default. (unrollperf-20261112 measured nvcc
+  cells 2: plane 6.0 vs fused 5.6 ms, cells 8: 7.8 vs 5.5, on 11-12.)
+- **Open (not changed here): under mcc the fused kernel is 2.1-2.6x slower than the plane path** (11.2 vs 5.3 ms at h 8). nvcc's
+  fused kernel takes 5.4 ms, so it is mcc's PTX for fit_accum_lat_k (the mma16816 stem and the shared-memory union), not the design.
+  predict's default at --fit-h 8 is the fused kernel (`UFSM_PRED_FIT_FUSED=0`: the planes); production unrolls run --fit-h 2, which
+  takes the plane path unless `UFSM_PRED_FIT_FUSED_SMALLH=1`, so they are unaffected. Either the default at h 8 follows the compiler
+  or mcc's code for this kernel gets fixed (reported to mcc-gpu); the fit part is a small share of a fields predict either way.
+
 ## Muon update scaling (--muon-scale rms) and cautious weight decay (--muon-cwd 1) (2026-11-15, branches muonscale-20261115, cwd-20261115)
 
 Two opt-in Muon options, both off by default. They are implemented and tested; the quality A/B is deferred by the 11-15 drain order (plan

@@ -80,15 +80,30 @@ for a in pc ps sp t0 t3 w dz dq; do "$U" read f0z/$a "" 0 0 0 32 32 32 fa.raw > 
 # sub-cell head and the fine stem); also on a box inside the volume (the box clip at both ends). (--fit-zarr's strides, multiples
 # of --fit-h, and windows, of 16, keep the field cells on the latent cells: a halo is a multiple of 4)
 FF="pc ps t0 t1 t2 t3 t4 t5 sp w dz dy dx dq"
-cmpf() { for a in $FF; do "$U" read $1/$a "" 0 0 0 32 32 32 fa.raw > /dev/null 2>&1 && "$U" read $2/$a "" 0 0 0 32 32 32 fb.raw > /dev/null 2>&1 || fail "read fit field $a ($1 $2)"
+cmpf() { local n=${3:-32}; for a in $FF; do "$U" read $1/$a "" 0 0 0 $n $n $n fa.raw > /dev/null 2>&1 && "$U" read $2/$a "" 0 0 0 $n $n $n fb.raw > /dev/null 2>&1 || fail "read fit field $a ($1 $2)"
                           cmp -s fa.raw fb.raw || fail "fit field $a: the fused kernel against the plane path ($1 $2)"; done; }
 grep -q "fit fields fused from the cell logits" f0.log || fail "the fused fit kernel did not run ($D/f0.log)"
+grep -q "the winding pass from the pair's fp16 planes" f0.log || fail "the fused kernel's winding pass did not read the pair's planes (UFSM_PRED_FIT_W4P default) ($D/f0.log)"
+# the winding pass from the partner regions (UFSM_PRED_FIT_W4P=0) writes the same fields as the default (from the pair's planes)
+UFSM_PRED_FIT_W4P=0 "$U" predict s/last.ckpt fx ct fr "${P[@]}" --fit-zarr frz --no-out 1 > fr.log 2>&1 || fail "predict --fit-zarr, W4P 0 ($D/fr.log)"
+! grep -q "pair's fp16 planes" fr.log || fail "UFSM_PRED_FIT_W4P=0 still read the pair's planes ($D/fr.log)"
+cmpf f0z frz
 UFSM_PRED_FIT_FUSED=0 "$U" predict s/last.ckpt fx ct f3 "${P[@]}" --fit-zarr f3z --no-out 1 > f3.log 2>&1 || fail "predict --fit-zarr, plane path ($D/f3.log)"
 cmpf f0z f3z
 BX=(--box 8,16,24,240,232,224)
 "$U" predict s/last.ckpt fx ct f4 "${P[@]}" "${BX[@]}" --fit-zarr f4z --no-out 1 > f4.log 2>&1 || fail "predict --fit-zarr off-grid box ($D/f4.log)"
 UFSM_PRED_FIT_FUSED=0 "$U" predict s/last.ckpt fx ct f5 "${P[@]}" "${BX[@]}" --fit-zarr f5z --no-out 1 > f5.log 2>&1 || fail "predict --fit-zarr off-grid box, plane path ($D/f5.log)"
 cmpf f4z f5z
+# --fit-h 2 (the unroll's field cells) with the fused kernel (UFSM_PRED_FIT_FUSED_SMALLH=1; the pair from planes and from the regions) ==
+# the plane path, the whole volume and the off-grid box (the first 96^3 field cells)
+for x in "" "${BX[*]}"; do
+  UFSM_PRED_FIT_FUSED_SMALLH=1 "$U" predict s/last.ckpt fx ct g0 "${P[@]}" $x --fit-h 2 --fit-zarr g0z --no-out 1 > g0.log 2>&1 || fail "predict --fit-h 2 fused ($D/g0.log)"
+  grep -q "fit fields fused from the cell logits" g0.log && ! grep -q "fused fit kernel does not take" g0.log || fail "the fused kernel did not run at --fit-h 2 ($D/g0.log)"
+  UFSM_PRED_FIT_FUSED_SMALLH=1 UFSM_PRED_FIT_W4P=0 "$U" predict s/last.ckpt fx ct g1 "${P[@]}" $x --fit-h 2 --fit-zarr g1z --no-out 1 > g1.log 2>&1 || fail "predict --fit-h 2 fused, W4P 0 ($D/g1.log)"
+  "$U" predict s/last.ckpt fx ct g2 "${P[@]}" $x --fit-h 2 --fit-zarr g2z --no-out 1 > g2.log 2>&1 || fail "predict --fit-h 2 plane path ($D/g2.log)"
+  ! grep -q "fit fields fused" g2.log || fail "--fit-h 2 took the fused kernel without UFSM_PRED_FIT_FUSED_SMALLH ($D/g2.log)"
+  cmpf g0z g2z 96; cmpf g1z g2z 96; rm -rf g0z g1z g2z
+done
 # the fit writer's staging ring (UFSM_PRED_FIT_NBUF 2 / 8 against the default 4; 1 MB planes: many chunks a window) writes the same fields
 for nbf in 2 8; do UFSM_PRED_FIT_NBUF=$nbf UFSM_PRED_FIT_PLANES_MB=1 "$U" predict s/last.ckpt fx ct fn$nbf "${P[@]}" --fit-zarr fn${nbf}z --no-out 1 > fn$nbf.log 2>&1 || fail "predict --fit-zarr, ring $nbf ($D/fn$nbf.log)"
                   cmpf f2z fn${nbf}z; done

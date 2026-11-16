@@ -497,6 +497,7 @@ struct fl_args {
     int nch, ndm, ch[FL_MAXCH], slot[FL_MAXCH];   /* region 0's channels (ndm of the cell sums, then the winding pair) and their stem slots (-1 none) */
     int nsl, so[FL_MAXS], wso[2];                 /* region 0's slots -> stem outputs; regions 1-3: slot u = the winding channel u's output wso[u] (-1 none) */
     float *dbg;                                   /* (test_fit_lat: region 0's logits of the in-window voxels, [nch][D H W] fp32) */
+    __half *wl; int wz0, wnz;                     /* the winding pair's plane mode (nn_fit_accum_lat_w4p): region 0's pair logits of window planes [wz0, wz0 + wnz) into wl [2][wnz][H][W] */
 };
 static float *g_fl_dbg;
 extern "C" void nn_fit_accum_lat_debug(float *planes) { g_fl_dbg = planes; }
@@ -508,7 +509,7 @@ __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg
     const int tid = threadIdx.x, fi = blockIdx.x;
     const int fz = A.fz0 + fi / (A.nfy * A.nfx), fy = A.fy0 + (fi / A.nfx) % A.nfy, fx = A.fx0 + fi % A.nfx;   /* (the block's 8-voxel index) */
     const int bz0 = A.oz + fz * 8, by0 = A.oy + fy * 8, bx0 = A.ox + fx * 8;   /* its first box voxel (h 8: the field cell's) */
-    const int nreg = A.ch_w4 >= 0 ? 4 : 1, C = A.C;
+    const int nreg = A.ch_w4 >= 0 && !A.wl ? 4 : 1, C = A.C;   /* (plane mode: no partner regions, fit_w4_plane_k reads the pair from wl) */
     int org[4][3];
     for (int r = 0; r < 4; r++) { org[r][0] = bz0 - A.tz; org[r][1] = by0 - A.ty; org[r][2] = bx0 - A.tx; if (r) org[r][r - 1] += A.dd; }
     const size_t cv = (size_t)A.d * A.h * A.w, hw = (size_t)A.H * A.W;
@@ -606,6 +607,11 @@ __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg
     const size_t i = in ? ((size_t)wz * A.H + wy) * A.W + wx : 0;
     const bool mi = in && mat(i);
     if (A.dbg && in) for (int k = 0; k < A.nch; k++) A.dbg[(size_t)k * A.D * hw + i] = logit(0, k);
+    if (A.wl && wz >= A.wz0 && wz < A.wz0 + A.wnz && wz < A.D && wy >= 0 && wy < A.H && wx >= 0 && wx < A.W) {   /* the pair's logits for fit_w4_plane_k: every window
+                                                                                                                 voxel of the planes, the partners' too (fp16-exact values) */
+        const size_t pl = (size_t)A.wnz * hw, o = (size_t)(wz - A.wz0) * hw + (size_t)wy * A.W + wx;
+        A.wl[o] = __float2half_rn(logit(0, A.ndm)); A.wl[pl + o] = __float2half_rn(logit(0, A.ndm + 1));
+    }
     float v[11] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, rmax = 0.f, t9[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     if (in) {   /* fit_accum_k's per-voxel values */
         v[0] += 1.f;
@@ -617,7 +623,7 @@ __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg
             if (A.ch_recto >= 0) rmax = fmaxf(rmax, sg(9));
         }
     }
-    if (A.ch_w4 >= 0 && mi) {   /* fit_accum_w4_k's terms (0 for a skipped one: its sums start at +0 and never become -0) */
+    if (A.ch_w4 >= 0 && !A.wl && mi) {   /* fit_accum_w4_k's terms (0 for a skipped one: its sums start at +0 and never become -0) */
         const int kw = A.ndm;
         const float pr = 2.f / (1.f + __expf(-logit(0, kw))) - 1.f, pi = 2.f / (1.f + __expf(-logit(0, kw + 1))) - 1.f;
         for (int a = 0; a < 3; a++) {
@@ -647,7 +653,7 @@ __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg
                 atomicMax((int *)&acc[11 * A.nf + base], __float_as_int(s[11]));
             }
         }
-        if (A.ch_w4 < 0) return;
+        if (A.ch_w4 < 0 || A.wl) return;
         __syncthreads();
         for (int k = 0; k < 9; k++) U.red[k][tid] = t9[k];
         __syncthreads();
@@ -674,7 +680,7 @@ __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg
         for (int k = 0; k < 11; k++) if (U.red[k][0] != 0.f) atomicAdd(&acc[k * A.nf + base], U.red[k][0]);
         atomicMax((int *)&acc[11 * A.nf + base], __float_as_int(U.red[11][0]));
     }
-    if (A.ch_w4 < 0) return;
+    if (A.ch_w4 < 0 || A.wl) return;
     __syncthreads();
     for (int k = 0; k < 9; k++) U.red[k][tid] = t9[k];
     __syncthreads();
@@ -685,9 +691,62 @@ __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg
         if (s != 0.f) atomicAdd(&acc4[tid * A.nf + base], s);
     }
 }
-extern "C" int nn_fit_accum_lat(const void *lg, int lh16, int d, int h, int w, int sbase, const float *stem, int C, const int *so, const uint8_t *ctx, const uint8_t *ct,
-                                const uint32_t *bits, float mean, float isd, int hz, int halo, int tz, int ty, int tx, const int box[3], int fh, const int F[3],
-                                int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc, int ch_w4, int dd, float *acc4) {
+/* the plane mode's winding pass (nn_fit_accum_lat_w4p): fit_accum_w4_k's terms from the pair's fp16 logits in wl (pass A wrote them, the
+   values the partner regions computed: both are the upsampled fp16 logit plus the stem's fp16-rounded term), summed as fit_accum_lat_k
+   sums them (h 8: one thread per accumulator over the block's 512 voxels in order; h < 8: one thread per field cell, its voxels in order) */
+__global__ void __launch_bounds__(FL_T) fit_w4_plane_k(const __half *__restrict__ wl, const uint8_t *__restrict__ ctx, const uint8_t *__restrict__ ct,
+                                                      const uint32_t *__restrict__ bits, fl_args A, float *acc4) {
+    __shared__ float red[9][FL_T];
+    const int tid = threadIdx.x, fi = blockIdx.x;
+    const int fz = A.fz0 + fi / (A.nfy * A.nfx), fy = A.fy0 + (fi / A.nfx) % A.nfy, fx = A.fx0 + fi % A.nfx;
+    const int bz0 = A.oz + fz * 8, by0 = A.oy + fy * 8, bx0 = A.ox + fx * 8;
+    const size_t hw = (size_t)A.H * A.W, pl = (size_t)A.wnz * hw;
+    auto mat = [&](size_t i) { return bits ? (bits[i >> 5] >> (i & 31)) & 1u : (unsigned)((ct ? ct : ctx)[i] != 0); };
+    const int lz = tid >> 6, ly = (tid >> 3) & 7, lx = tid & 7;
+    const int gz = bz0 + lz, gy = by0 + ly, gx = bx0 + lx, wz = gz - A.tz, wy = gy - A.ty, wx = gx - A.tx;
+    const bool in = !(gz < 0 || gy < 0 || gx < 0 || gz >= A.bz || gy >= A.by || gx >= A.bx || wz < A.hz || wz >= A.D - A.hz || wy < A.halo || wy >= A.W - A.halo || wx < A.halo || wx >= A.W - A.halo);
+    float t9[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (in) {
+        const size_t i = ((size_t)wz * A.H + wy) * A.W + wx, o = (size_t)(wz - A.wz0) * hw + (size_t)wy * A.W + wx;
+        if (mat(i)) {
+            const float pr = 2.f / (1.f + __expf(-__half2float(wl[o]))) - 1.f, pi = 2.f / (1.f + __expf(-__half2float(wl[pl + o]))) - 1.f;
+            for (int a = 0; a < 3; a++) {
+                const size_t st = a == 0 ? A.dd * hw : a == 1 ? (size_t)A.dd * A.W : (size_t)A.dd;
+                if (!mat(i + st)) continue;
+                const float qr = 2.f / (1.f + __expf(-__half2float(wl[o + st]))) - 1.f, qi = 2.f / (1.f + __expf(-__half2float(wl[pl + o + st]))) - 1.f;
+                t9[3 * a] = qr * pr + qi * pi; t9[3 * a + 1] = qi * pr - qr * pi; t9[3 * a + 2] = 1.f;
+            }
+        }
+    }
+    for (int k = 0; k < 9; k++) red[k][tid] = t9[k];
+    __syncthreads();
+    if (A.fh == 8) {
+        if (tid < 9) {
+            float s = 0.f;
+#pragma unroll 16
+            for (int t = 0; t < FL_T; t++) s += red[tid][t];
+            if (s != 0.f) atomicAdd(&acc4[tid * A.nf + ((size_t)fz * A.F1 + fy) * A.F2 + fx], s);
+        }
+        return;
+    }
+    const int fh = A.fh, nc = 8 / fh, ncell = nc * nc * nc;
+    for (int c = tid; c < ncell; c += FL_T) {
+        const int cz = c / (nc * nc), cy = c / nc % nc, cx = c % nc;
+        float s[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0}; int any = 0;
+        for (int t = 0; t < fh * fh * fh; t++) {
+            const int q = ((cz * fh + t / (fh * fh)) * 8 + cy * fh + t / fh % fh) * 8 + cx * fh + t % fh;
+            for (int k = 0; k < 9; k++) s[k] += red[k][q];
+        }
+        for (int k = 0; k < 9; k++) any |= s[k] != 0.f;
+        if (!any) continue;
+        const size_t base = ((size_t)((bz0 + cz * fh) / fh) * A.F1 + (by0 + cy * fh) / fh) * A.F2 + (bx0 + cx * fh) / fh;
+        for (int k = 0; k < 9; k++) if (s[k] != 0.f) atomicAdd(&acc4[k * A.nf + base], s[k]);
+    }
+}
+static int fit_accum_lat_go(const void *lg, int lh16, int d, int h, int w, int sbase, const float *stem, int C, const int *so, const uint8_t *ctx, const uint8_t *ct,
+                            const uint32_t *bits, float mean, float isd, int hz, int halo, int tz, int ty, int tx, const int box[3], int fh, const int F[3],
+                            int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc, int ch_w4, int dd, float *acc4,
+                            void *wl, int wz0, int wnz) {
     if ((fh != 8 && fh != 4 && fh != 2 && fh != 1) || h != w || (stem && (C < 1 || C > FL_C || !ctx)) || (!bits && !ct && !ctx)) return 1;
     if ((fh == 8 && ((tz & 3) || (ty & 3) || (tx & 3))) || (ch_w4 >= 0 && (dd & 3))) return 1;   /* (field cells and the partner regions on the cell grid; h < 8: below) */
     fl_args A = {};
@@ -706,7 +765,7 @@ extern "C" int nn_fit_accum_lat(const void *lg, int lh16, int d, int h, int w, i
         A.slot[k] = A.nsl; A.so[A.nsl++] = o;
         if (k >= A.ndm) A.wso[k - A.ndm] = o;
     }
-    int f0[3], f1[3], og[3] = {0, 0, 0};
+    int f0[3], f1[3], e1[3], og[3] = {0, 0, 0};
     const int t[3] = {tz, ty, tx}, wn[3] = {A.D, A.W, A.W}, hn[3] = {hz, halo, halo};
     for (int k = 0; k < 3; k++) {
         int lo = t[k] + hn[k], hi = t[k] + wn[k] - hn[k]; if (lo < 0) lo = 0; if (hi > box[k]) hi = box[k];
@@ -717,16 +776,45 @@ extern "C" int nn_fit_accum_lat(const void *lg, int lh16, int d, int h, int w, i
             f0[k] = (lo - og[k] + 8 * 8) / 8 - 8; f1[k] = (hi - og[k] + 7 + 8 * 8) / 8 - 8;   /* (floor / ceil with lo - og >= -3) */
         }
         if (f1[k] <= f0[k]) return 0;
+        /* plane mode: pass A's blocks also over the partners (dd more voxels along each axis; they add no sums: outside the box or the interior) */
+        e1[k] = !wl ? f1[k] : fh == 8 ? (hi + dd + 7) / 8 : (hi + dd - og[k] + 7 + 8 * 8) / 8 - 8;
     }
     A.fh = fh; A.oz = og[0]; A.oy = og[1]; A.ox = og[2];
-    A.fz0 = f0[0]; A.fy0 = f0[1]; A.fx0 = f0[2]; A.nfy = f1[1] - f0[1]; A.nfx = f1[2] - f0[2]; A.F1 = F[1]; A.F2 = F[2];
-    A.nf = (size_t)F[0] * F[1] * F[2];
-    const size_t nb = (size_t)(f1[0] - f0[0]) * A.nfy * A.nfx;
-    if (nb > 0x7fffffff || A.nf > 0x7fffffff) return 1;
+    A.F1 = F[1]; A.F2 = F[2]; A.nf = (size_t)F[0] * F[1] * F[2];
+    if (A.nf > 0x7fffffff) return 1;
+    if (wl) {
+        int lo = tz + hz, hi = tz + A.D - hz; if (lo < 0) lo = 0; if (hi > box[0]) hi = box[0];   /* (the planes pass B reads: the interior's and their partners') */
+        if (wz0 > lo - tz || wz0 + wnz < hi - tz + dd || wz0 < 0 || wz0 + wnz > A.D) {
+            fprintf(stderr, "nn_fit_accum_lat_w4p: the pair's planes [%d, %d) miss [%d, %d) or leave the window (%d)\n", wz0, wz0 + wnz, lo - tz, hi - tz + dd, A.D); abort(); }
+        A.wl = (__half *)wl; A.wz0 = wz0; A.wnz = wnz;
+    }
+    A.fz0 = f0[0]; A.fy0 = f0[1]; A.fx0 = f0[2]; A.nfy = e1[1] - f0[1]; A.nfx = e1[2] - f0[2];
+    const size_t nb = (size_t)(e1[0] - f0[0]) * A.nfy * A.nfx;
+    if (nb > 0x7fffffff) return 1;
     if (lh16) fit_accum_lat_k<f16><<<(unsigned)nb, FL_T>>>((const f16 *)lg, stem, ctx, ct, bits, A, acc, acc4);
     else fit_accum_lat_k<float><<<(unsigned)nb, FL_T>>>((const float *)lg, stem, ctx, ct, bits, A, acc, acc4);
     KCHECK();
+    if (wl) {   /* pass B over the field blocks proper */
+        A.nfy = f1[1] - f0[1]; A.nfx = f1[2] - f0[2];
+        fit_w4_plane_k<<<(unsigned)((size_t)(f1[0] - f0[0]) * A.nfy * A.nfx), FL_T>>>(A.wl, ctx, ct, bits, A, acc4);
+        KCHECK();
+    }
     return 0;
+}
+extern "C" int nn_fit_accum_lat(const void *lg, int lh16, int d, int h, int w, int sbase, const float *stem, int C, const int *so, const uint8_t *ctx, const uint8_t *ct,
+                                const uint32_t *bits, float mean, float isd, int hz, int halo, int tz, int ty, int tx, const int box[3], int fh, const int F[3],
+                                int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc, int ch_w4, int dd, float *acc4) {
+    return fit_accum_lat_go(lg, lh16, d, h, w, sbase, stem, C, so, ctx, ct, bits, mean, isd, hz, halo, tz, ty, tx, box, fh, F, ch_recto, ch_phase, ch_normal, ch_density,
+                            dscale, dcode, acc, ch_w4, dd, acc4, nullptr, 0, 0);
+}
+extern "C" int nn_fit_accum_lat_w4p(const void *lg, int lh16, int d, int h, int w, int sbase, const float *stem, int C, const int *so, const uint8_t *ctx, const uint8_t *ct,
+                                    const uint32_t *bits, float mean, float isd, int hz, int halo, int tz, int ty, int tx, const int box[3], int fh, const int F[3],
+                                    int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc, int ch_w4, int dd, float *acc4,
+                                    void *wl, int wz0, int wnz) {
+    /* (the region path when the pair is a sub-cell channel: region 0 adds the sub-cell term there, the partner regions do not) */
+    const int pm = wl && ch_w4 >= 0 && !(sbase >= 0 && ch_w4 < 2);
+    return fit_accum_lat_go(lg, lh16, d, h, w, sbase, stem, C, so, ctx, ct, bits, mean, isd, hz, halo, tz, ty, tx, box, fh, F, ch_recto, ch_phase, ch_normal, ch_density,
+                            dscale, dcode, acc, ch_w4, dd, acc4, pm ? wl : nullptr, wz0, wnz);
 }
 
 /* fit.c fit_pool (no phase gradient, no CT spacing) of the device fields: one thread per pooled cell, the same sums in the same order

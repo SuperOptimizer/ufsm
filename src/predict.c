@@ -2179,7 +2179,8 @@ static int predict_one(int argc, char **argv) {
     unet_build(u, xn, 0);
     const int ct_stem = unet_ct_stem(u);   /* unet_forward_ct: no 16-bit input */
     int gdir = 0, fzs = 0, fzl = 0;   /* (fzl: the fused fit kernel, nn_fit_accum_lat; UFSM_PRED_FIT_FUSED=0 the plane path) the guided head's direct rv bytes (nn_lat_place_rvg); fit fields from a latent-grid net in z-chunk slabs */
-    void *fzA = nullptr, *fzB = nullptr, *fzX = nullptr; int fzP = 0;
+    void *fzA = nullptr, *fzB = nullptr, *fzX = nullptr, *fzW = nullptr; int fzP = 0;   /* fzW: the fused kernel's winding-pair planes (UFSM_PRED_FIT_W4P) */
+    const int fzw4p = !getenv("UFSM_PRED_FIT_W4P") || ufsm_env_on("UFSM_PRED_FIT_W4P");
     uint8_t *ctd = nullptr, *ctcp = nullptr; uint32_t *ctm = nullptr, *ctmi = nullptr; void *xd = nullptr; int ct_shared = 0, xd_shared = 0;
     pjob_t J = {0};
     split_ctx *sctx = nullptr;
@@ -3051,10 +3052,20 @@ static int predict_one(int argc, char **argv) {
                             if (fzl && !g8 && a >= hz && bq <= Wz - hz) {   /* the fused kernel (nn_fit_accum_lat): the same sums straight from the cell logits, no planes */
                                 int so_[16]; const int stm = cfg.fstem && !fstem_off;
                                 for (int c = 0; c < 16; c++) so_[c] = stm ? phead_stem_row(&cfg, c) : -1;
-                                if (!nn_fit_accum_lat(l2d, lh, Wz / 4, wc, wc, g64 ? cfg.cout - 128 : -1, stm ? unet_active_params(u) + unet_fstem_off(u) : nullptr, cfg.fstem, so_,
-                                                      ct_shared ? ctcp : ctd, ct_shared ? nullptr : ctd, ct_shared ? ctm : nullptr, (float)mean, (float)(1.0 / sd), hz, halo,
-                                                      (int)(tz - cz * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz,
-                                                      ff_rec, ff_ph, ff_nrm, ff_den, ffds, ffdc, ffacc, ffw4d ? ff_w4 : -1, ffw4d, ffacc4)) { nn_ptick("fit: fused"); goto fz_done; }
+                                /* UFSM_PRED_FIT_W4P (default on): the winding pair's logits of the chunk's planes a .. bq + d written once by the block pass into fzW,
+                                   the winding sums read from there (the same bytes; without it every block recomputes the upsampling and the stem on its 3 partner regions) */
+                                const int w4p = fzw4p && ffw4d;
+                                if (w4p && !fzW) {
+                                    if (!(fzW = nn_malloc((size_t)2 * (ffzc * ffh + ffw4d) * hw * 2))) { fprintf(stderr, "predict: --fit-zarr: no memory for the winding pair's planes\n"); return 1; }
+                                    fprintf(stderr, "predict: --fit-zarr: the winding pass from the pair's fp16 planes (%.0f MB; UFSM_PRED_FIT_W4P=0: the partner regions)\n",
+                                            (double)2 * (ffzc * ffh + ffw4d) * hw * 2 / 1e6);
+                                }
+                                if (!nn_fit_accum_lat_w4p(l2d, lh, Wz / 4, wc, wc, g64 ? cfg.cout - 128 : -1, stm ? unet_active_params(u) + unet_fstem_off(u) : nullptr, cfg.fstem, so_,
+                                                          ct_shared ? ctcp : ctd, ct_shared ? nullptr : ctd, ct_shared ? ctm : nullptr, (float)mean, (float)(1.0 / sd), hz, halo,
+                                                          (int)(tz - cz * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz,
+                                                          ff_rec, ff_ph, ff_nrm, ff_den, ffds, ffdc, ffacc, ffw4d ? ff_w4 : -1, ffw4d, ffacc4, w4p ? fzW : nullptr, a, bq + ffw4d - a)) {
+                                    nn_ptick("fit: fused"); goto fz_done;
+                                }
                                 fzl = 0; fprintf(stderr, "predict: --fit-zarr: the fused fit kernel does not take this configuration (--fit-h %d): the plane path\n", ffh);
                             }
                             if (!fzA) { fzP = ffzc * ffh + 8; fzA = nn_malloc((size_t)(cup + (g8 ? 8 : 0)) * fzP * hw * 2); if (ffw4d) fzB = nn_malloc((size_t)2 * (fzP + 2 * ffw4d) * hw * 2); if (g8 || cfg.fstem) fzX = nn_malloc((size_t)(fzP + 2 * ffw4d + 8) * hw * 2); }

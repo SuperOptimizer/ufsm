@@ -2,7 +2,9 @@
    sub-cell pair 0-1) + nn_fstem_fwd on the z-scored CT (nn_lat_ct_x) into [11][W^3] fp16 planes, then nn_fit_accum_dm and nn_fit_accum_w4
    (task unwrap2: phase 0-1, normal 2-7, density 8, winding mod 4 9-10, d 16), field cells of 8, 4 and 2 (--fit-h 2: audit unroll #9). A 96^3 window (24^3 cells, cout 144 =
    16 + 128 sub-cell outputs), halo 16, the box at window offsets on and off the cell grid; with and without the stem and the sub-cell
-   term. Pass: the 12 + 9 accumulator planes bit for bit. Usage: test_fit_lat */
+   term. Pass: the 12 + 9 accumulator planes bit for bit, for nn_fit_accum_lat and for nn_fit_accum_lat_w4p (the winding pass from the
+   pair's fp16 planes, predict's UFSM_PRED_FIT_W4P default; its 9 winding planes non-empty where the plane path's are). UFSM_TEST_BENCH=1:
+   timings of a 256^3 window. Usage: test_fit_lat */
 #include "nn.h"
 #include "fit.h"
 #include <math.h>
@@ -36,8 +38,8 @@ int main(void) {
         const int FH = FHS[fi]; if (o == 3 && FH != 2) continue;
         const int tz = OFF[o][0], ty = OFF[o][1], tx = OFF[o][2], box[3] = {WW + 8, WW - 8, WW}, F[3] = {(box[0] + FH - 1) / FH, (box[1] + FH - 1) / FH, (box[2] + FH - 1) / FH};
         const size_t nf = (size_t)F[0] * F[1] * F[2];
-        float *a0 = nn_malloc(12 * nf * 4), *a1 = nn_malloc(12 * nf * 4), *b0 = nn_malloc(9 * nf * 4), *b1 = nn_malloc(9 * nf * 4);
-        nn_zero(a0, 12 * nf * 4); nn_zero(a1, 12 * nf * 4); nn_zero(b0, 9 * nf * 4); nn_zero(b1, 9 * nf * 4);
+        float *a0 = nn_malloc(12 * nf * 4), *a1 = nn_malloc(12 * nf * 4), *b0 = nn_malloc(9 * nf * 4), *b1 = nn_malloc(9 * nf * 4), *a2 = nn_malloc(12 * nf * 4), *b2 = nn_malloc(9 * nf * 4);
+        nn_zero(a0, 12 * nf * 4); nn_zero(a1, 12 * nf * 4); nn_zero(b0, 9 * nf * 4); nn_zero(b1, 9 * nf * 4); nn_zero(a2, 12 * nf * 4); nn_zero(b2, 9 * nf * 4);
         nn_lat_up_slab(lgd, 1, 11, CW, CW, CW, 0, WW, pl);
         if (sb) nn_lat_shuffle(lgd, 1, CW, CW, CW, NB, 2, 0, WW, pl);
         if (st && nn_fstem_fwd(xd, WW, WW, WW, 0, WW, pd, C, NO, chs, pl, w3)) { fprintf(stderr, "fstem shape\n"); return 1; }
@@ -45,6 +47,12 @@ int main(void) {
         nn_fit_accum_w4((const float *)pl, ctd, nullptr, WW, WW, HALO, HALO, tz, ty, tx, box, FH, F, 9, DD, b0);
         if (nn_fit_accum_lat(lgd, 1, CW, CW, CW, sb ? NB : -1, st ? pd : nullptr, C, so, ctd, ctd, nullptr, mean, isd, HALO, HALO, tz, ty, tx, box, FH, F,
                              -1, 0, 2, 8, dscale, 0, a1, 9, DD, b1)) { fprintf(stderr, "nn_fit_accum_lat refused the configuration\n"); return 1; }
+        {   /* the winding pass from planes: the window's planes HALO .. WW (the interior's z from HALO, its partners + DD) */
+            void *wl = nn_malloc((size_t)2 * (WW - HALO) * WW * WW * 2); nn_zero(wl, (size_t)2 * (WW - HALO) * WW * WW * 2);
+            if (nn_fit_accum_lat_w4p(lgd, 1, CW, CW, CW, sb ? NB : -1, st ? pd : nullptr, C, so, ctd, ctd, nullptr, mean, isd, HALO, HALO, tz, ty, tx, box, FH, F,
+                                     -1, 0, 2, 8, dscale, 0, a2, 9, DD, b2, wl, HALO, WW - HALO)) { fprintf(stderr, "nn_fit_accum_lat_w4p refused the configuration\n"); return 1; }
+            nn_sync(); nn_free(wl);
+        }
         nn_sync();
         if (o == 0 && sb == 0 && FH == 8) {   /* (diagnosis: the per-voxel logits of the fused kernel against the planes) */
             float *dg = nn_malloc(11 * w3 * 4); nn_zero(dg, 11 * w3 * 4); nn_fit_accum_lat_debug(dg);
@@ -63,19 +71,19 @@ int main(void) {
                                 first / (WW * WW), first / WW % WW, first % WW, (double)(float)f, (double)hd[(size_t)k * w3 + first]); } }
             free(hd); free(hp); nn_free(dg);
         }
-        uint32_t *h0 = malloc(12 * nf * 4), *h1 = malloc(12 * nf * 4), *g0 = malloc(9 * nf * 4), *g1 = malloc(9 * nf * 4);
-        nn_d2h(h0, a0, 12 * nf * 4); nn_d2h(h1, a1, 12 * nf * 4); nn_d2h(g0, b0, 9 * nf * 4); nn_d2h(g1, b1, 9 * nf * 4);
-        size_t nd[21] = {0}, nset = 0;
-        for (int k = 0; k < 12; k++) for (size_t i = 0; i < nf; i++) nd[k] += h0[k * nf + i] != h1[k * nf + i];
-        for (int k = 0; k < 9; k++) for (size_t i = 0; i < nf; i++) nd[12 + k] += g0[k * nf + i] != g1[k * nf + i];
-        for (size_t i = 0; i < nf; i++) nset += h0[nf + i] != 0;
+        uint32_t *h0 = malloc(12 * nf * 4), *h1 = malloc(12 * nf * 4), *g0 = malloc(9 * nf * 4), *g1 = malloc(9 * nf * 4), *h2 = malloc(12 * nf * 4), *g2 = malloc(9 * nf * 4);
+        nn_d2h(h0, a0, 12 * nf * 4); nn_d2h(h1, a1, 12 * nf * 4); nn_d2h(g0, b0, 9 * nf * 4); nn_d2h(g1, b1, 9 * nf * 4); nn_d2h(h2, a2, 12 * nf * 4); nn_d2h(g2, b2, 9 * nf * 4);
+        size_t nd[21] = {0}, nset = 0, np = 0, npw = 0, nw = 0;
+        for (int k = 0; k < 12; k++) for (size_t i = 0; i < nf; i++) { nd[k] += h0[k * nf + i] != h1[k * nf + i]; np += h0[k * nf + i] != h2[k * nf + i]; }
+        for (int k = 0; k < 9; k++) for (size_t i = 0; i < nf; i++) { nd[12 + k] += g0[k * nf + i] != g1[k * nf + i]; npw += g0[k * nf + i] != g2[k * nf + i]; }
+        for (size_t i = 0; i < nf; i++) { nset += h0[nf + i] != 0; nw += g0[2 * nf + i] != 0; }
         size_t tot = 0; for (int k = 0; k < 21; k++) tot += nd[k];
-        const int bad = tot != 0 || nset < nf / 4;
+        const int bad = tot != 0 || np != 0 || npw != 0 || nset < nf / 4 || nw < nf / 8;   /* (nw: the winding pairs counted, a non-empty check) */
         printf("%s h %d stem %d sub-cell %d window at %3d %3d %3d: %zu of %zu cells with material, %zu accumulator values differ", bad ? "FAIL" : "ok  ", FH, st, sb, tz, ty, tx, nset, nf, tot);
         if (tot) { printf(" (planes:"); for (int k = 0; k < 21; k++) if (nd[k]) printf(" %d:%zu", k, nd[k]); printf(")"); }
-        printf("%s\n", bad ? "  <--" : "");
+        printf("; w4 planes mode: %zu + %zu differ (%zu cells with pairs)%s\n", np, npw, nw, bad ? "  <--" : "");
         fails += bad;
-        free(h0); free(h1); free(g0); free(g1); nn_free(a0); nn_free(a1); nn_free(b0); nn_free(b1);
+        free(h0); free(h1); free(g0); free(g1); free(h2); free(g2); nn_free(a0); nn_free(a1); nn_free(b0); nn_free(b1); nn_free(a2); nn_free(b2);
     }
     if (getenv("UFSM_TEST_BENCH")) for (int fi = 0; fi < 3; fi += 2) {   /* timing: a 256^3 window (the stem and the sub-cell term on), the plane path against the fused kernel, h 8 and 2 */
         const int FH = FHS[fi];
@@ -104,7 +112,14 @@ int main(void) {
             nn_fit_accum_lat(blgd, 1, BC, BC, BC, NB, pd, C, so, bctd, bctd, nullptr, mean, isd, HALO, HALO, 0, 0, 0, box, FH, F, -1, 0, 2, 8, dscale, 0, a, -1, DD, b); nn_sync(); double t2 = now_s();
             tn = fmin(tn, t1 - t0); tw = fmin(tw, t2 - t1);
         }
-        printf("bench: fused without the stem %.1f ms, without the winding pass %.1f ms\n", 1e3 * tn, 1e3 * tw);
+        double tq = 1e9; void *bwl = nn_malloc((size_t)2 * BW * BW * BW * 2);   /* (the winding pass from planes, UFSM_PRED_FIT_W4P) */
+        for (int r = 0; r < 5; r++) {
+            nn_sync(); double t0 = now_s();
+            nn_fit_accum_lat_w4p(blgd, 1, BC, BC, BC, NB, pd, C, so, bctd, bctd, nullptr, mean, isd, HALO, HALO, 0, 0, 0, box, FH, F, -1, 0, 2, 8, dscale, 0, a, 9, DD, b, bwl, HALO, BW - HALO);
+            nn_sync(); tq = fmin(tq, now_s() - t0);
+        }
+        nn_free(bwl);
+        printf("bench h %d: fused without the stem %.1f ms, without the winding pass %.1f ms, with the winding pass from planes (w4p) %.1f ms\n", FH, 1e3 * tn, 1e3 * tw, 1e3 * tq);
         printf("bench h %d %d^3 window: plane path %.1f ms (upsample + shuffle %.1f, stem %.1f, sums %.1f, winding %.1f), fused %.1f ms\n", FH, BW, 1e3 * tp, 1e3 * tu, 1e3 * tst, 1e3 * tdm,
                1e3 * (tp - tu - tst - tdm), 1e3 * tf);
         nn_free(a); nn_free(b); nn_free(bctd); nn_free(blgd); nn_free(bxd); nn_free(bpl); free(bct); free(blg);
