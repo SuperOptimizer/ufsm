@@ -18,15 +18,16 @@
 #   5..11 chain   REFCK on CHAINBOX (HOLD widened in y / x so the umbilicus sits inside: the count-field reference counts from the axis):
 #                 fields + heads -> count-field ref (spiral dir from scripts/unroll/spiral_dir.tsv) -> 2 z slab fits snapped to the ref (unroll.sh
 #                 lane recipe) -> fit-join --ref, the joined model scored against the GT codes, wrap-check -> wraps -> flatten (largest wrap) ->
-#                 render (ink head + CT) + ink-compare. Gated against the baseline file BASE (written by a run with BLESS=1, all rows PASS); with no
-#                 baseline yet only the absolute floors (MINJOINED, MINWRAPS) apply.
+#                 render (ink head + CT) + ink-compare. Gated against the baseline file BASE (written by a run with BLESS=1, all rows PASS; a
+#                 STEPS_ONLY run blesses only its own keys); with no baseline only MINWRAPS (and MINJOINED when set) apply. Each step runs when
+#                 its input exists, so a metric miss upstream never skips the rest of the chain.
 #   Prints step | result | numbers | log, writes OUT/results.tsv + OUT/metrics.tsv; exit 0 only when no row is FAIL / SKIP (WARN passes).
 #
 # Env: GPU (1: the CUDA device; desk card 0 runs scratch2), OUT (/vesuvius/ufsm/integ/e2e/<date>-<binary sha>; must be under /vesuvius),
 #   P (256), STEPS1 (200), STEPS (240), LOSSDROP (0.95), RESUMEFAC (1.3), WORKERS (6), SLOTS (4), LAUNCHENV (try7g0.launch.env of this tree),
 #   REFCK (/vesuvius/ufsm/audit-20261114/eval-scratch/try6-2357.ckpt), REFTAG (try6-gnlive), IDSTOL (0.05), PTOL (0.03), CHAINCK (ref | e2e),
 #   BASE (/vesuvius/ufsm/integ/e2e/baseline-<REFTAG>.tsv), BLESS (0; 1 writes BASE from this run when every row passed), BTOL (0.05),
-#   MINJOINED (0.40, a guess until the first blessed run), MINWRAPS (3), TH (12 CPU threads), MEMGB (36: ~/bin/memcap -m, the dev slice),
+#   MINJOINED (unset: no absolute floor; 0.40 failed a good join, 11-16), MINWRAPS (3), TH (12 CPU threads), MEMGB (36: ~/bin/memcap -m, the dev slice),
 #   LOCK (comma list of flock files held for the whole run; default this GPU's /vesuvius/ufsm/opt + /tmp/ufsm-suite-locks locks), LOCKWAIT (s, 7200),
 #   BUSYOK (0; 1 runs although another process holds > 200 MiB of the card), FORCE (1: reuse an existing OUT, its step dirs removed),
 #   CLEAN (1: the checkpoint ring / snapshots removed after the checks; last.ckpt kept), STEPS_ONLY ("" = all; e.g. "ref-box chain").
@@ -281,12 +282,14 @@ if want chain; then
   if ok_of slab-fits; then [ -e "$C/joined" ] && saferm "$C/joined"
     if X "$LG/join.log" ${CFTMO:-3600} "$U" fit-join "$C/joined" "$F" --blend 16 --ref "$REF" "${JARGS[@]}" &&
        X "$LG/joined-score.log" ${FITTMO:-1800} env UFSM_FIT_THREADS=$TH "$U" fit "$F" --model "$C/joined" --gpu 0 --codes "$QR" $QK --score-pairs 1; then
-      ag=$(num "$(grep 'integer agreement on the overlaps' "$LG/join.log" | tail -1 | awk '{print $NF}')"); ji=$(g_ids "$LG/joined-score.log"); jp=$(g_pair "$LG/joined-score.log" 1)
+      jok=1; ag=$(num "$(grep 'integer agreement on the overlaps' "$LG/join.log" | tail -1 | awk '{print $NF}')"); ji=$(g_ids "$LG/joined-score.log"); jp=$(g_pair "$LG/joined-score.log" 1)
       met join_agree "$ag"; met joined_ids "$ji"; met joined_p1x "$jp"
       X "$LG/wrapcheck.log" ${CFTMO:-3600} "$U" wrap-check "$C/joined" "$F" --ct "$CTR" "$CTK/$LV" --ct-um $LUM --tsv "$C/wrapcheck.tsv" --threads $TH; wrc=$?
       wv=$(grep -E '^wrap-check: verdicts' "$LG/wrapcheck.log" | tail -1 | sed 's/^wrap-check: //'); nr=$(echo "$wv" | grep -oE '[0-9]+ real' | awk '{print $1}')
       emp=$(awk -F'\t' 'NR > 1 { n++; e += $3 } END { if (n) printf "%.3f", e / n; else print "na" }' "$C/wrapcheck.tsv" 2>/dev/null); met wrapcheck_real "$(num "$nr")"
-      why=""; [ "$ji" != na ] && awkc "$ji >= ${MINJOINED:-0.40}" || why+=" joined ids $ji < MINJOINED ${MINJOINED:-0.40};"
+      why=""; [ "$ji" = na ] && why+=" no joined ids;"
+      # (no absolute floor by default: the 0.40 guess failed a good join, 11-16: llvm d7910396 0.340, mcc 9f63cdd / e52bb39 0.342; BASE + BTOL gate)
+      [ -n "${MINJOINED:-}" ] && [ "$ji" != na ] && ! awkc "$ji >= $MINJOINED" && why+=" joined ids $ji < MINJOINED $MINJOINED;"
       [ $wrc = 0 ] && [ "$emp" != na ] && awkc "$emp < 0.999" || why+=" wrap-check rc $wrc / no CT peaks (empty share $emp);"
       why+=$(vsbase joined_ids "$ji" hi ${BTOL:-0.05})$(vsbase joined_p1x "$jp" hi ${BTOL:-0.05})$(vsbase join_agree "$ag" hi ${BTOL:-0.05})
       nums="GT joined ids $ji p1x $jp, overlap agreement $ag, wrap-check $wv (CT-empty share $emp)"
@@ -294,8 +297,10 @@ if want chain; then
     else row join FAIL "fit-join or its GT score failed" "$LG/join.log"; fi
   else row join SKIP "slab fits failed" "$LG/slab-s000.log"; fi
 
-  # wraps (unroll.sh wraps(); --min-cm2 small: a box, not a scroll)
-  if ok_of join; then [ -e "$C/wraps" ] && saferm "$C/wraps"
+  # wraps (unroll.sh wraps(); --min-cm2 small: a box, not a scroll). Each downstream step runs whenever its input exists and gates only
+  # its own output: a metric miss on join must not hide a broken wraps / flatten / render (11-16: join FAIL on the guessed floor
+  # skipped the rest of the chain).
+  if [ "${jok:-0}" = 1 ] && [ -e "$C/joined/set.json" ]; then [ -e "$C/wraps" ] && saferm "$C/wraps"
     if X "$LG/wraps.log" ${CFTMO:-3600} "$U" wraps "$C/joined" "$C/wraps" --step 4 --out-um $LUM --sfc 0.25 --fields "$F" --threads $TH --min-cm2 ${MINCM2W:-0.05}; then
       nw=$(ls "$C/wraps" 2>/dev/null | grep -c '^w.*\.sfc$'); met wraps_n "$nw"; why=""
       [ "$nw" -ge ${MINWRAPS:-3} ] || why+=" $nw wraps < MINWRAPS ${MINWRAPS:-3};"; why+=$(vsbase wraps_n "$nw" rel 0.3)
@@ -305,8 +310,8 @@ if want chain; then
     else row wraps FAIL "wraps failed" "$LG/wraps.log"; fi
   else row wraps SKIP "no joined model" "$LG/join.log"; fi
 
-  # flatten + render the largest wrap (unroll.sh pw_one recipe)
-  if ok_of wraps; then
+  # flatten + render the largest wrap (unroll.sh pw_one recipe): on any wraps output, whatever the wraps row's count gates said
+  if ls "$C/wraps"/w*.sfc > /dev/null 2>&1 && ! grep -qP '^wraps\t(SKIP|FAIL\twraps failed)' "$RES"; then
     w=$(for f in "$C/wraps"/w*.sfc; do echo "$(stat -c %s "$f") $(basename "$f" .sfc)"; done | sort -rn | head -1 | awk '{print $2}')
     nv=$(stat -c %s "$C/wraps/$w.sfc"); dc=$(awk -v n=$nv -v m=1500000 'BEGIN { d = 1; while (n / (d * d) > m) d++; print d }')
     for d in orig flat up r; do [ -e "$C/$d" ] && saferm "$C/$d"; done; mkdir -p "$C/r/in"
@@ -318,7 +323,7 @@ if want chain; then
       [ -z "$why" ] && row flatten PASS "$w: $cm cm2 (decim $dc)" "$LG/flatten.log" || row flatten FAIL "$w: $cm cm2;$why" "$LG/flatten.log"
     else row flatten FAIL "flatten of $w failed" "$LG/flatten.log"; fi
   else row flatten SKIP "no wraps" "$LG/wraps.log"; fi
-  if ok_of flatten; then
+  if [ -n "${w:-}" ] && [ -e "$C/flat/$w/x.tif" ] && ! grep -qP '^flatten\t(SKIP|FAIL\tflatten of)' "$RES"; then
     ik=$(ls "$C/h/ink" 2>/dev/null | grep -v zarr.json | head -1)
     if [ -z "$ik" ]; then row render FAIL "no ink head output in $C/h" "$LG/chain-heads.log"
     elif X "$LG/flat-up.log" 600 "$U" tifxyz-scale "$C/flat" "$C/up" 1 --wraps $w --flip-rows 1 && ln -sfn "$C/up/$w" "$C/r/in/$w" &&
@@ -337,8 +342,12 @@ fi
 echo; echo "e2e $BSHA  $O"; column -t -s $'\t' "$O/table.tsv" | cut -c1-${COLS:-400}
 nbad=$(awk -F'\t' '$2 == "FAIL" || $2 == "SKIP"' "$RES" | wc -l)
 if [ "${BLESS:-0}" = 1 ]; then
-  if [ "$nbad" = 0 ] && [ -z "${STEPS_ONLY:-}" ]; then mkdir -p "$(dirname "$BASE")"; { printf '# e2e baseline: %s %s %s\n' "$(date +%F)" "$BSHA" "$O"; cat "$MET"; } > "$BASE.tmp" && mv "$BASE.tmp" "$BASE" && log "blessed: $BASE"
-  else log "BLESS=1 ignored: $nbad failed / skipped rows, or STEPS_ONLY set"; fi
+  # (a STEPS_ONLY run blesses only its own keys: they replace those of BASE, the other keys are kept)
+  if [ "$nbad" = 0 ]; then mkdir -p "$(dirname "$BASE")"
+    { printf '# e2e baseline: %s %s %s%s\n' "$(date +%F)" "$BSHA" "$O" "${STEPS_ONLY:+ (steps: $STEPS_ONLY)}"
+      [ -n "${STEPS_ONLY:-}" ] && [ -s "$BASE" ] && awk -F'\t' 'NR == FNR { k[$1]; next } !/^#/ && !($1 in k)' "$MET" "$BASE"
+      cat "$MET"; } > "$BASE.tmp" && mv "$BASE.tmp" "$BASE" && log "blessed: $BASE"
+  else log "BLESS=1 ignored: $nbad failed / skipped rows"; fi
 fi
 [ "$nbad" = 0 ] && { log "e2e PASS"; exit 0; }
 log "e2e FAIL: $nbad rows failed or skipped"; exit 1
