@@ -407,10 +407,16 @@ static void reader_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out)
     }
     uint8_t *dev; upload_tiles(tiles, B, D, T, T, &dev);
     xt x0 = xinput_u8(dev, B, D, T, T, lo, hi, a, b); xfree_dev(dev);
-    xt f1 = xconv_fwd(&n->f1, x0, nullptr, XA_NONE); xt_free(&x0); xgn(f1, f1.c, n->f1g, n->f1b, 1e-5f, nullptr, XA_LRELU, f1);
-    xt f2 = xconv_fwd(&n->f2, f1, nullptr, XA_NONE); xt_free(&f1); xgn(f2, f2.c, n->f2g, n->f2b, 1e-5f, nullptr, XA_LRELU, f2);
-    float *at = xmalloc_dev((size_t)B * D * T * T * 4); xhead(f2, n->att_w, n->att_b, at);
-    xt z = xdepth_attn_max(f2, at); xt_free(&f2); xfree_dev(at);
+    xt f1 = xconv_fwd(&n->f1, x0, nullptr, XA_NONE); xt_free(&x0);
+    float *g1 = xgn_stats(f1, f1.c, 1e-5f); xt f2 = xconv_fwd_gnin(&n->f2, f1, g1, g1 + (size_t)f1.n * f1.c, n->f1g, n->f1b, XA_LRELU); xfree_dev(g1); xt_free(&f1);
+    static int fused = -1; if (fused < 0) fused = getenv("UFSM_IE_DATTN") ? atoi(getenv("UFSM_IE_DATTN")) : 1;   /* 0: the separate GN / head / attention kernels; mgpu: env */
+    xt z;
+    if (fused && f2.c == 16 && D <= 32) { z = xdepth_collapse16(f2, f2.c, n->f2g, n->f2b, 1e-5f, XA_LRELU, n->att_w, n->att_b); xt_free(&f2); }
+    else {
+        xgn(f2, f2.c, n->f2g, n->f2b, 1e-5f, nullptr, XA_LRELU, f2);
+        float *at = xmalloc_dev((size_t)B * D * T * T * 4); xhead(f2, n->att_w, n->att_b, at);
+        z = xdepth_attn_max(f2, at); xt_free(&f2); xfree_dev(at);
+    }
     xt x = xconv_fwd(&n->rstem, z, nullptr, XA_NONE); xt_free(&z); xgn(x, x.c, n->rstem_g, n->rstem_b, 1e-5f, nullptr, XA_LRELU, x);
     xt skip[6];
     for (int s = 0; s < n->nst; s++) {

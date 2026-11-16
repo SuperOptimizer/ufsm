@@ -115,6 +115,11 @@ void xhead(xt x, const float *w_dev, float bias, float *out_dev);
 /* Reader V3 depth fusion: f [n][d][h][w][c], a [n][d][h][w] fp32 attention logits ->
    [n][1][h][w][2c] = (sum_d softmax_d(a) f, max_d f) */
 xt xdepth_attn_max(xt f, const float *a_dev);
+float *xgn_stats(xt x, int groups, float eps);
+xt xconv_fwd_gnin(const xconv *c, xt x, const float *gm, const float *rs, const float *gamma_dev, const float *beta_dev, int act);   /* conv(act(GN(x))) */   /* device [n][C] group mean, then [n][C] 1 / std (one block: free the returned pointer) */
+/* the Reader depth collapse fused: act(GroupNorm(f)) -> logits w . v + b per layer -> [n][1][h][w][32] = (softmax-weighted sum, max) over
+   the layers; equals xgn + xhead + xdepth_attn_max up to the logit summation order. f: 16 channels, <= 32 layers; f is not modified */
+xt xdepth_collapse16(xt f, int groups, const float *gamma_dev, const float *beta_dev, float eps, int act, const float *w_dev, float bias);
 /* Hecate depth collapse: s, l [n][d][h][w] fp32 (attention scores, logits), sup [n][h][w] uint8 (column has data),
    z-scale zs: out[n][h][w] = sum_d w_d l_d with w = masked softmax_d(s + zs (d - D/2) / (D/2)) renormalised */
 void xhecate_collapse(const float *s_dev, const float *l_dev, const uint8_t *sup_dev, int n, int d, int h, int w, float zs, float *out_dev);

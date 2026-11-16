@@ -167,6 +167,66 @@ static int run_gn(int N, int D, int H, int W, int C, int G, float off) {
     return bad != 0 || !same;
 }
 
+/* xdepth_collapse16 (fused GN apply + head + depth softmax / max) against the separate xgn + xhead + xdepth_attn_max */
+static int run_dattn(int N, int D, int H, int W) {
+    const size_t S = (size_t)D * H * W, ne = (size_t)N * S * 16, no = (size_t)N * H * W * 32;
+    uint16_t *fh = malloc(ne * 2), *y1 = malloc(no * 2), *y2 = malloc(no * 2); float ga[16], be[16], w[16];
+    for (size_t i = 0; i < ne; i++) fh[i] = f2h(rnd() * 3.f + 0.5f * (float)(i % 16) / 16);
+    for (int c = 0; c < 16; c++) { ga[c] = 1.f + 0.5f * rnd(); be[c] = 0.3f * rnd(); w[c] = rnd(); }
+    float *gd = xdev_floats(ga, 16), *bd = xdev_floats(be, 16), *wd = xdev_floats(w, 16);
+    xt f = xt_new(N, D, H, W, 16); xh2d(f.p, fh, ne * 2);
+    xt z = xdepth_collapse16(f, 16, gd, bd, 1e-5f, XA_LRELU, wd, 0.2f); xd2h(y1, z.p, no * 2); xt_free(&z);
+    xgn(f, 16, gd, bd, 1e-5f, nullptr, XA_LRELU, f); float *at = xmalloc_dev(N * S * 4); xhead(f, wd, 0.2f, at);
+    z = xdepth_attn_max(f, at); xd2h(y2, z.p, no * 2); xt_free(&z); xfree_dev(at);
+    if (xnet_check("test_xmx dattn")) return 1;
+    double emax = 0; size_t bad = 0;
+    for (size_t i = 0; i < no; i++) { const double a = h2f(y1[i]), b = h2f(y2[i]), d = fabs(a - b); if (d > emax) emax = d; if (d > 2e-3 * fabs(b) + 1e-3) bad++; }
+    printf("dattn N %d D %d %dx%d: max |d| %.3g vs the separate kernels, %zu of %zu over the bound\n", N, D, H, W, emax, bad, no);
+    xt_free(&f); xfree_dev(gd); xfree_dev(bd); xfree_dev(wd); free(fh); free(y1); free(y2);
+    return bad != 0;
+}
+
+/* xconv_fwd_gnin (GroupNorm + LReLU applied in the halo conv's load) against xgn then xconv_fwd */
+static int run_gnin(int N, int D, int H, int W) {
+    const size_t ne = (size_t)N * D * H * W * 16; uint16_t *fh = malloc(ne * 2), *y1 = malloc(ne * 2), *y2 = malloc(ne * 2); float ga[16], be[16], *w = malloc(16 * 16 * 27 * 4);
+    for (size_t i = 0; i < ne; i++) fh[i] = f2h(rnd() * 2.f + 1.f);
+    for (int c = 0; c < 16; c++) { ga[c] = 1.f + 0.5f * rnd(); be[c] = 0.3f * rnd(); }
+    for (int i = 0; i < 16 * 16 * 27; i++) w[i] = rnd() * 0.1f;
+    xnet_set_mx(0); xconv c; xconv_init(&c, w, 16, 16, 3, 3, 3, 1, 1, 1, 1, 1, 1, nullptr, nullptr);
+    float *gd = xdev_floats(ga, 16), *bd = xdev_floats(be, 16); xt f = xt_new(N, D, H, W, 16); xh2d(f.p, fh, ne * 2);
+    float *g = xgn_stats(f, 16, 1e-5f); xt y = xconv_fwd_gnin(&c, f, g, g + N * 16, gd, bd, XA_LRELU); xd2h(y1, y.p, ne * 2); xt_free(&y); xfree_dev(g);
+    xgn(f, 16, gd, bd, 1e-5f, nullptr, XA_LRELU, f); y = xconv_fwd(&c, f, nullptr, XA_NONE); xd2h(y2, y.p, ne * 2); xt_free(&y);
+    if (xnet_check("test_xmx gnin")) return 1;
+    double emax = 0; size_t bad = 0;
+    for (size_t i = 0; i < ne; i++) { const double a = h2f(y1[i]), b = h2f(y2[i]), d = fabs(a - b); if (d > emax) emax = d; if (d > 2e-3 * fabs(b) + 1e-3) bad++; }
+    printf("gnin N %d %dx%dx%d: max |d| %.3g vs xgn + conv, %zu of %zu over the bound\n", N, D, H, W, emax, bad, ne);
+    xt_free(&f); xconv_free(&c); xfree_dev(gd); xfree_dev(bd); free(fh); free(y1); free(y2); free(w);
+    return bad != 0;
+}
+
+/* the 1 -> 16 stem conv (k_dfc1) against a double host reference with fp16 weights */
+static int run_c1(int N, int D, int H, int W) {
+    const size_t nx = (size_t)N * D * H * W; uint16_t *xh = malloc(nx * 2), *yh = malloc(nx * 32); float *x = malloc(nx * 4), *w = malloc(16 * 27 * 4), b[16];
+    for (size_t i = 0; i < nx; i++) { xh[i] = f2h(rnd() * 3.f); x[i] = h2f(xh[i]); }
+    for (int i = 0; i < 16 * 27; i++) w[i] = rnd() * 0.3f;
+    for (int c = 0; c < 16; c++) b[c] = rnd();
+    xnet_set_mx(0); xconv c; xconv_init(&c, w, 16, 1, 3, 3, 3, 1, 1, 1, 1, 1, 1, nullptr, b);
+    xt xd = xt_new(N, D, H, W, 1); xh2d(xd.p, xh, nx * 2); xt y = xconv_fwd(&c, xd, nullptr, XA_NONE); xd2h(yh, y.p, nx * 32);
+    if (xnet_check("test_xmx c1")) return 1;
+    double emax = 0; size_t bad = 0;
+    for (int n = 0; n < N; n++) for (int z = 0; z < D; z++) for (int yy = 0; yy < H; yy++) for (int xx = 0; xx < W; xx++) for (int o = 0; o < 16; o++) {
+        double s = b[o];
+        for (int a = 0; a < 3; a++) for (int bb = 0; bb < 3; bb++) for (int e = 0; e < 3; e++) {
+            const int zi = z + a - 1, yi = yy + bb - 1, xi = xx + e - 1; if (zi < 0 || zi >= D || yi < 0 || yi >= H || xi < 0 || xi >= W) continue;
+            s += (double)x[(((size_t)n * D + zi) * H + yi) * W + xi] * h2f(f2h(w[o * 27 + (a * 3 + bb) * 3 + e]));
+        }
+        const double g = h2f(yh[((((size_t)n * D + z) * H + yy) * W + xx) * 16 + o]), d = fabs(g - s); if (d > emax) emax = d; if (d > 1e-3 * fabs(s) + 2e-3) bad++;
+    }
+    printf("c1 N %d %dx%dx%d: max |d| %.3g, %zu of %zu over the bound\n", N, D, H, W, emax, bad, nx * 16);
+    xt_free(&xd); xt_free(&y); xconv_free(&c); free(xh); free(yh); free(x); free(w);
+    return bad != 0;
+}
+
 #include <time.h>
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 /* XMX_BENCH=1: time the gambiarra-sized convs (16 crops) per format (0 fp16, 6, 5): TMAC/s */
@@ -226,6 +286,9 @@ int main(void) {
     g_rot = 0;
     for (int sf = 6; sf >= 5; sf--) { fails += run(sf, 2, 9, 7, 11, 32, 32, 3, 1, 2); fails += run(sf, 1, 6, 5, 7, 128, 256, 1, 1, 0); }
     g_mxa = 0; xnet_set_mxq(0); xnet_set_mxrot(0); xnet_set_mxa(0);
+    fails += run_dattn(2, 17, 40, 36);
+    fails += run_gnin(2, 17, 20, 70);
+    fails += run_c1(2, 17, 30, 41);
     fails += run_gn(2, 17, 64, 48, 16, 16, 0.f);     /* the depth-fusion shape (InstanceNorm: G = C) */
     fails += run_gn(3, 1, 40, 36, 32, 32, 20.f);     /* mean >> std: the shifted sums */
     fails += run_gn(2, 1, 12, 12, 320, 32, 1.f);     /* deep level, 10 channels a group */

@@ -65,10 +65,18 @@ the logit error only loosely: MXQ 2 cuts it 22 % and still loses AUC.
 **The gate does not hold beyond the 24 crops.** Paired AUC vs fp16 over all 34 crops (24 + the 10 held-out 0500P2 / 0841),
 bootstrap 95 % CI:
 
-| teacher | fp8 (FQ 8,8) | MX5 | MXQ2 + MXA | + convs 2-4 fp16 | + ROT, convs 2-4 fp16 |
-|---|---|---|---|---|---|
-| ink9um | +0.0012 [-0.0006, +0.0037] | -0.0048 [-0.0093, -0.0008] | | | -0.0021 [-0.0053, +0.0011] |
-| reader3 | +0.0003 [-0.0001, +0.0007] | -0.0015 [-0.0028, -0.0002] | -0.0018 [-0.0035, -0.0001] | -0.0012 [-0.0024, -0.0001] | -0.0020 [-0.0033, -0.0007] |
+| teacher | variant | paired AUC, 34 crops |
+|---|---|---|
+| ink9um | fp8 (FQ 8,8) | +0.0012 [-0.0006, +0.0037] |
+| ink9um | MX5 | -0.0048 [-0.0093, -0.0008] |
+| ink9um | MXQ2 + MXA + ROT, convs 2-4 fp16 (pick) | -0.0021 [-0.0053, +0.0011] |
+| ink9um | the same, convs 2-4 and 12-20 fp16 | -0.0021 [-0.0052, +0.0010] |
+| ink9um | fp8 acts, fp16 weights (FQ 8,0) | -0.0010 [-0.0023, +0.0002] |
+| reader3 | fp8 (FQ 8,8) | +0.0003 [-0.0001, +0.0007] |
+| reader3 | MX5 | -0.0015 [-0.0028, -0.0002] |
+| reader3 | MXQ2 + MXA | -0.0018 [-0.0035, -0.0001] |
+| reader3 | MXQ2 + MXA, convs 2-4 fp16 (pick) | -0.0012 [-0.0024, -0.0001] |
+| reader3 | MXQ2 + MXA + ROT, convs 2-4 fp16 | -0.0020 [-0.0033, -0.0007] |
 
 Per-scroll AUC on the 24 crops (fp16 / MX5 / pick): ink9um all 0.9175 / 0.9141 / 0.9170, 0139 0.9818 / 0.9805 / 0.9821, 1667
 0.9153 / 0.9034 / 0.9150, Paris 4 0.9019 / 0.9002 / 0.9012. reader3 all 0.9271 / 0.9261 / 0.9265, 0139 0.9664 / 0.9646 / 0.9667, 1667

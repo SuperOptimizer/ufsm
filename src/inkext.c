@@ -597,6 +597,21 @@ int cmd_ink_ext(int argc, char **argv) {
         if (!nnet) { fprintf(stderr, "ink-ext: no --weights\n"); return 2; }
     }
     ie_net *net = nets[0];
+    if (getenv("UFSM_IE_BENCH")) {   /* UFSM_IE_BENCH=B,N: N forwards of B synthetic tiles per checkpoint (CT-like noise), wall ms / tile after a warm-up batch */
+        int B = 32, N = 20; sscanf(getenv("UFSM_IE_BENCH"), "%d,%d", &B, &N);
+        const ie_spec *sp = &ie_specs[kind]; const size_t per = (size_t)sp->D * sp->T * sp->T;
+        uint8_t *t = malloc((size_t)B * per); float *o = malloc((size_t)B * sp->T * sp->T * sizeof *o); uint32_t r = 7;
+        for (size_t i = 0; i < (size_t)B * per; i++) { r = r * 1664525u + 1013904223u; t[i] = (uint8_t)(90 + ((r >> 24) & 63) + (i / sp->T % 37)); }
+        for (int k = 0; k < nnet; k++) if (ie_forward(nets[k], t, B, o, 0)) return 1;
+        { const double tp = inow(); float lo, hi, a, b; for (int i = 0; i < B; i++) ie_robust_params(t + (size_t)i * per, per, &lo, &hi, &a, &b);
+          printf("ink-ext bench: host robust params %.3f ms per tile\n", (inow() - tp) * 1e3 / B); }
+        const double t0 = inow();
+        for (int i = 0; i < N; i++) for (int k = 0; k < nnet; k++) if (ie_forward(nets[k], t, B, o, 0)) return 1;
+        const double dt = inow() - t0;
+        printf("ink-ext bench %s: batch %d, %d forwards x %d checkpoints: %.3f ms per tile per checkpoint, %.3f ms per tile (all checkpoints)\n", mname, B, N, nnet,
+               dt * 1e3 / ((double)N * B * nnet), dt * 1e3 / ((double)N * B));
+        free(t); free(o); return 0;
+    }
     if (iopt(argc, argv, "--raw-in", nullptr)) return raw_mode(argc, argv, net, kind);
     double zw[MAXE]; int nzw = 0;
     {   /* --zwin: extra layer shifts averaged (default: 0 only) */

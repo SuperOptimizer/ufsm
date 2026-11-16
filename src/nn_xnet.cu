@@ -1053,7 +1053,8 @@ template <int SF> static void xq_launch(int mode, const __half *x, uint8_t *q, u
    (TX + 2) input halo and the 27 x 16 x 16 weights once in shared memory and runs 27 taps of m16n8k16 per 16 output voxels. Rows of 32 B
    with the two 16-byte halves swapped on bit 2 of the row: 8 consecutive rows hit 8 distinct bank groups (conflict-free ldmatrix). ---- */
 template <int TZ, int TY, int TX, int NW> __global__ void __launch_bounds__(NW * 32) k_dfc16(const __half *x, const __half *w, int Kp, const float *scale, const float *bias,
-                                                                               __half *y, int D, int H, int W) {
+                                                                               __half *y, int D, int H, int W, const float *gm, const float *rs, const float *gg, const float *gb, int act) {
+    /* gm != nullptr: the input is GroupNorm-applied on load as k_gn_apply (x - gm) rs gamma + beta, act, fp16-rounded (padding stays 0) */
     extern __shared__ uint4 sm4[];
     constexpr int HY = TY + 2, HX = TX + 2, HV = (TZ + 2) * HY * HX, MT = TZ * TY * TX / 16, MW = MT / NW, NT = NW * 32;
     uint4 *sx = sm4, *sw = sm4 + HV * 2;
@@ -1068,7 +1069,14 @@ template <int TZ, int TY, int TX, int NW> __global__ void __launch_bounds__(NW *
         const int v = i >> 1, h = i & 1, hz = v / (HY * HX), r = v - hz * HY * HX, hy = r / HX, hx = r - hy * HX;
         const int gz = z0 - 1 + hz, gy = y0 - 1 + hy, gx = x0 - 1 + hx;
         uint4 val = make_uint4(0u, 0u, 0u, 0u);
-        if (gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W) val = *(const uint4 *)(x + ((((size_t)n * D + gz) * H + gy) * (size_t)W + gx) * 16 + h * 8);
+        if (gz >= 0 && gz < D && gy >= 0 && gy < H && gx >= 0 && gx < W) {
+            val = *(const uint4 *)(x + ((((size_t)n * D + gz) * H + gy) * (size_t)W + gx) * 16 + h * 8);
+            if (gm) {
+                __half *hv = (__half *)&val; const int q0 = (int)n * 16 + h * 8;
+#pragma unroll
+                for (int k = 0; k < 8; k++) hv[k] = __float2half_rn(act_f((__half2float(hv[k]) - gm[q0 + k]) * rs[q0 + k] * gg[h * 8 + k] + gb[h * 8 + k], act));
+            }
+        }
         sx[v * 2 + (h ^ ((v >> 2) & 1))] = val;
     }
     __syncthreads();
@@ -1114,30 +1122,32 @@ template <int TZ, int TY, int TX, int NW> __global__ void __launch_bounds__(NW *
         }
     }
 }
-template <int TZ, int TY, int TX, int NW> static bool dfc16_go(const xconv *c, xt in, xt y) {
+struct GnIn { const float *gm, *rs, *g, *b; int act; };
+template <int TZ, int TY, int TX, int NW> static bool dfc16_go(const xconv *c, xt in, xt y, const GnIn &gi) {
     constexpr size_t sm = ((size_t)(TZ + 2) * (TY + 2) * (TX + 2) * 2 + 27 * 16 * 2) * 16;
     static unsigned attr = 0u;   /* mgpu: per-device (as launch1) */
     int dv = 0; cudaGetDevice(&dv);
     if (!(__atomic_load_n(&attr, __ATOMIC_ACQUIRE) >> (dv & 31) & 1u)) { cudaFuncSetAttribute(k_dfc16<TZ, TY, TX, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); __atomic_fetch_or(&attr, 1u << (dv & 31), __ATOMIC_RELEASE); }
     const long long nb = (long long)in.n * ((in.d + TZ - 1) / TZ) * ((in.h + TY - 1) / TY) * ((in.w + TX - 1) / TX);
-    k_dfc16<TZ, TY, TX, NW><<<(unsigned)nb, NW * 32, sm, g_st>>>((const __half *)in.p, (const __half *)c->w, c->Kp, c->scale, c->bias, (__half *)y.p, in.d, in.h, in.w);
+    k_dfc16<TZ, TY, TX, NW><<<(unsigned)nb, NW * 32, sm, g_st>>>((const __half *)in.p, (const __half *)c->w, c->Kp, c->scale, c->bias, (__half *)y.p, in.d, in.h, in.w,
+                                                                  gi.gm, gi.rs, gi.g, gi.b, gi.act);
     return true;
 }
 static int g_df16 = -1;   /* UFSM_XNET_DF16=0: the depth-fusion conv on the implicit GEMM (A/B); mgpu: env */
 extern "C" void xnet_set_df16(int v) { g_df16 = v; }
-static bool dfc16_try(const xconv *c, xt in, xt y, const xt *res, int act, double *st) {
+static bool dfc16_try(const xconv *c, xt in, xt y, const xt *res, int act, double *st, const GnIn &gi = GnIn{}) {
     if (g_df16 < 0) g_df16 = getenv("UFSM_XNET_DF16") ? atoi(getenv("UFSM_XNET_DF16")) : 1;
     if (!g_df16 || c->mxq || c->unfold || c->tconv || c->ci != 16 || c->co != 16 || in.c != 16 || c->kd != 3 || c->kh != 3 || c->kw != 3) return false;
     if (c->sd != 1 || c->sh != 1 || c->sw != 1 || c->pd != 1 || c->ph != 1 || c->pw != 1 || res || act != XA_NONE || st) return false;
     switch (g_df16) {
-    case 2: return dfc16_go<2, 4, 32, 4>(c, in, y);
-    case 4: return dfc16_go<1, 8, 32, 4>(c, in, y);
-    case 5: return dfc16_go<2, 4, 32, 2>(c, in, y);
-    case 6: return dfc16_go<1, 4, 32, 4>(c, in, y);
-    case 7: return dfc16_go<1, 8, 32, 8>(c, in, y);
-    case 8: return dfc16_go<1, 16, 32, 8>(c, in, y);
-    case 9: return dfc16_go<2, 8, 32, 4>(c, in, y);
-    default: return dfc16_go<2, 8, 32, 8>(c, in, y);   /* 1: 8 warps of 4 m-tiles (consistently 1.5-1.7x the implicit GEMM in contended runs) */
+    case 2: return dfc16_go<2, 4, 32, 4>(c, in, y, gi);
+    case 4: return dfc16_go<1, 8, 32, 4>(c, in, y, gi);
+    case 5: return dfc16_go<2, 4, 32, 2>(c, in, y, gi);
+    case 6: return dfc16_go<1, 4, 32, 4>(c, in, y, gi);
+    case 7: return dfc16_go<1, 8, 32, 8>(c, in, y, gi);
+    case 8: return dfc16_go<1, 16, 32, 8>(c, in, y, gi);
+    case 9: return dfc16_go<2, 8, 32, 4>(c, in, y, gi);
+    default: return dfc16_go<2, 8, 32, 8>(c, in, y, gi);   /* 1: 8 warps of 4 m-tiles (consistently 1.5-1.7x the implicit GEMM in contended runs) */
     }
 }
 static int g_cfg = -1, g_c16 = -1;   /* mgpu: env */
@@ -1179,7 +1189,44 @@ static void xstats(xt y, double *st) {
 static struct { int on; uint8_t *oq, *os; int oC; } g_tq;   /* xtconv_cat_q's target for the next MX tconv GEMM; mgpu: process (xnet runs on one host thread and one stream: set and consumed within one xtconv_cat_q call) */
 static inline size_t xq_soff(size_t numel) { return (numel / 2 + 15) / 16 * 16; }   /* the scales after the nibbles in xt.q */
 static inline size_t xq_size(size_t numel) { return xq_soff(numel) + numel / 8 + 16; }
+/* a 1 -> 16 channel 3x3x3 conv (pad 1, stride 1) on a one-channel fp16 input: thread per output voxel, 27 inputs (L1) x 16 fp16 weights
+   (the packed unfolded GEMM row, as the implicit GEMM used them), fp32 sums. Replaces xunfold (8 channels written) + the implicit GEMM
+   (K 72 of mostly-zero taps): the Reader depth-fusion stem. */
+__global__ void k_dfc1(const __half *x, const __half *w, int Kp, const float *scale, const float *bias, __half *y, long long nvox, int D, int H, int W) {
+    __shared__ float sw[16 * 27];
+    for (int i = threadIdx.x; i < 16 * 27; i += blockDim.x) { const int o = i / 27, t = i % 27; sw[i] = __half2float(w[(size_t)o * Kp + (t / 3) * 8 + t % 3]); }
+    __syncthreads();
+    const long long v = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (v >= nvox) return;
+    const int xx = (int)(v % W); long long r = v / W; const int yy = (int)(r % H); r /= H; const int zz = (int)(r % D); const long long n = r / D;
+    float in[27];
+#pragma unroll
+    for (int a = 0; a < 3; a++)
+#pragma unroll
+        for (int b = 0; b < 3; b++)
+#pragma unroll
+            for (int e = 0; e < 3; e++) {
+                const int z = zz + a - 1, yv = yy + b - 1, xv = xx + e - 1;
+                in[(a * 3 + b) * 3 + e] = z >= 0 && z < D && yv >= 0 && yv < H && xv >= 0 && xv < W ? __half2float(x[((n * D + z) * H + yv) * (long long)W + xv]) : 0.f;
+            }
+    __align__(16) __half o[16];
+#pragma unroll
+    for (int c = 0; c < 16; c++) { float s = 0.f;
+#pragma unroll
+        for (int t = 0; t < 27; t++) s += in[t] * sw[c * 27 + t];
+        o[c] = __float2half_rn(s * scale[c] + bias[c]); }
+    uint4 *dst = (uint4 *)(y + v * 16); dst[0] = ((const uint4 *)o)[0]; dst[1] = ((const uint4 *)o)[1];
+}
+static int g_df1 = -1;   /* UFSM_XNET_DF1=0: the stem through xunfold + implicit GEMM (A/B); mgpu: env */
+static bool dfc1_try(const xconv *c, xt x, const xt *res, int act, double *st, xt *out) {
+    if (g_df1 < 0) g_df1 = getenv("UFSM_XNET_DF1") ? atoi(getenv("UFSM_XNET_DF1")) : 1;
+    if (!g_df1 || !c->unfold || c->kw0 != 3 || c->pw0 != 1 || c->co != 16 || c->kd != 3 || c->kh != 3 || c->pd != 1 || c->ph != 1) return false;
+    if (c->sd != 1 || c->sh != 1 || c->sw != 1 || x.c != 1 || res || act != XA_NONE || st) return false;
+    *out = xt_new(x.n, x.d, x.h, x.w, 16); const long long nv = (long long)x.n * x.d * x.h * x.w;
+    k_dfc1<<<nblk((size_t)nv, 128), 128, 0, g_st>>>((const __half *)x.p, (const __half *)c->w, c->Kp, c->scale, c->bias, (__half *)out->p, nv, x.d, x.h, x.w);
+    return true;
+}
 static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *lnw = nullptr, const float *lnb = nullptr, float lneps = 0.f, double *st = nullptr) {
+    { xt o; if (!lnw && dfc1_try(c, x, res, act, st, &o)) { g_fq_seq++; g_macs += (double)xt_numel(o) * 27; return o; } }
     xt in = x;
     if (c->unfold) in = xunfold(x, c->kw0, c->pw0);
     fq_env(); xt fq = {0};
@@ -1226,6 +1273,18 @@ static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *ln
     if (st && !p.st && p.M > 0) xstats(y, st);
     if (c->unfold || fq.p) xt_free(&in);
     return y;
+}
+__global__ void k_gn_apply(const __half *x, const float *gm, const float *rs, const float *gamma, const float *beta, const __half *res, int act, __half *y, int C, long long S, size_t total);
+/* y = conv(act(GroupNorm(x))) with the norm applied while the conv loads x (the 16 -> 16 depth-fusion conv; x unchanged), gm / rs from
+   xgn_stats; other convs: the apply runs first (x is overwritten) */
+extern "C" xt xconv_fwd_gnin(const xconv *c, xt x, const float *gm, const float *rs, const float *gamma, const float *beta, int act) {
+    const int Do = (x.d + 2 * c->pd - c->kd) / c->sd + 1, Ho = (x.h + 2 * c->ph - c->kh) / c->sh + 1, Wo = (x.w + 2 * c->pw - c->kw) / c->sw + 1;
+    xt y = xt_new(x.n, Do, Ho, Wo, c->co);
+    if (dfc16_try(c, x, y, nullptr, XA_NONE, nullptr, GnIn{gm, rs, gamma, beta, act})) return y;
+    xt_free(&y);
+    const size_t total = xt_numel(x); unsigned nb = nblk(total / 2, 256); if (nb > 65535 * 4) nb = 65535 * 4;
+    k_gn_apply<<<nb, 256, 0, g_st>>>((const __half *)x.p, gm, rs, gamma, beta, nullptr, act, (__half *)x.p, x.c, (long long)x.d * x.h * x.w, total);
+    return xconv_fwd(c, x, nullptr, XA_NONE);
 }
 extern "C" xt xconv_fwd_ln(const xconv *c, xt x, const xt *res, int act, const float *lnw, const float *lnb, float eps) {
     return conv_run(c, x, res, act | XA_LN, lnw, lnb, eps);
@@ -1536,16 +1595,23 @@ __global__ void k_gn_apply(const __half *x, const float *gm, const float *rs, co
         *(__half2 *)(y + i) = __floats2half2_rn(act_f(a, act), act_f(b, act));
     }
 }
-extern "C" void xgn(xt x, int groups, const float *gamma, const float *beta, float eps, const xt *res, int act, xt y) {
+/* the group statistics of x: device gm / rs [n][C] (group mean, 1 / std per channel, one allocation: rs = gm + n C; free gm) */
+extern "C" float *xgn_stats(xt x, int groups, float eps) {
     const int C = x.c, n = x.n; const long long S = (long long)x.d * x.h * x.w;
     int nchunk = (int)((512 + n - 1) / n); if (nchunk > S / 64) nchunk = (int)(S / 64); if (nchunk < 1) nchunk = 1;   /* ~512 blocks, >= 64 voxels each */
     double *part = (double *)xmalloc_dev((size_t)n * nchunk * C * 2 * sizeof(double)); float *gm = (float *)xmalloc_dev((size_t)n * C * 4 * 2), *rs = gm + (size_t)n * C;
     const int pairs = C / 2, rows = pairs <= 256 ? 256 / pairs : 1;
     k_gnpart<<<dim3(nchunk, n), 256, (size_t)rows * C * 2 * sizeof(float), g_st>>>((const __half *)x.p, C, S, nchunk, part);
     k_gnfin<<<nblk((size_t)n * groups, 64), 64, 0, g_st>>>((const __half *)x.p, part, n, C, groups, S, nchunk, eps, gm, rs);
+    xfree_dev(part);
+    return gm;
+}
+extern "C" void xgn(xt x, int groups, const float *gamma, const float *beta, float eps, const xt *res, int act, xt y) {
+    const int C = x.c, n = x.n; const long long S = (long long)x.d * x.h * x.w;
+    float *gm = xgn_stats(x, groups, eps), *rs = gm + (size_t)n * C;
     const size_t total = xt_numel(x); unsigned nb = nblk(total / 2, 256); if (nb > 65535 * 4) nb = 65535 * 4;
     k_gn_apply<<<nb, 256, 0, g_st>>>((const __half *)x.p, gm, rs, gamma, beta, res ? (const __half *)res->p : nullptr, act, (__half *)y.p, C, S, total);
-    xfree_dev(part); xfree_dev(gm);
+    xfree_dev(gm);
 }
 
 /* ---- data movement ---- */
@@ -1709,6 +1775,51 @@ extern "C" xt xdepth_attn_max(xt f, const float *a_dev) {
     xt y = xt_new(f.n, 1, f.h, f.w, 2 * f.c); const long long HW = (long long)f.h * f.w;
     unsigned nb = nblk((size_t)f.n * HW * f.c, 256); if (nb > 65535 * 8) nb = 65535 * 8;
     k_attn_max<<<nb, 256, 0, g_st>>>((const __half *)f.p, a_dev, (__half *)y.p, f.n, f.d, HW, f.c);
+    return y;
+}
+/* the Reader depth collapse in one pass (replaces xgn apply + xhead + xdepth_attn_max on the 17-layer tensor): thread per pixel, the 16
+   channels of each layer normalised and activated as k_gn_apply (rounded to fp16), the attention logit w . v + b, then softmax over the
+   layers (as k_attn_max: max, sum of exp, weights exp / den) re-reading the layers for the weighted sum and the max. f is read twice
+   (L2) and never written: the separate path wrote f and the logits and read f three times. */
+template <int DM> __global__ void k_dattn(const __half *f, const float *gm, const float *rs, const float *gamma, const float *beta, int act, const float *w, float b,
+                                          __half *y, int n, int D, long long HW) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (i >= (long long)n * HW) return;
+    const long long nn = i / HW, p = i - nn * HW; const float *g = gm + nn * 16, *r = rs + nn * 16;
+    float a[DM], am = -INFINITY;
+    auto load = [&](int d, float *v) {
+        __align__(16) __half hv[16]; const __half *src = f + ((nn * D + d) * HW + p) * 16;
+        *(uint4 *)hv = *(const uint4 *)src; *(uint4 *)(hv + 8) = *(const uint4 *)(src + 8);
+#pragma unroll
+        for (int c = 0; c < 16; c++) v[c] = __half2float(__float2half_rn(act_f((__half2float(hv[c]) - g[c]) * r[c] * gamma[c] + beta[c], act)));
+    };
+    for (int d = 0; d < D; d++) {
+        float v[16]; load(d, v); float s = 0.f;
+#pragma unroll
+        for (int c = 0; c < 16; c++) s += v[c] * w[c];
+        a[d] = s + b; am = fmaxf(am, a[d]);
+    }
+    float den = 0.f; for (int d = 0; d < D; d++) den += __expf(a[d] - am);
+    float sm[16], mx[16];
+#pragma unroll
+    for (int c = 0; c < 16; c++) { sm[c] = 0.f; mx[c] = -INFINITY; }
+    for (int d = 0; d < D; d++) {
+        float v[16]; load(d, v); const float e = __expf(a[d] - am) / den;
+#pragma unroll
+        for (int c = 0; c < 16; c++) { sm[c] += v[c] * e; mx[c] = fmaxf(mx[c], v[c]); }
+    }
+    __align__(16) __half o[32];
+#pragma unroll
+    for (int c = 0; c < 16; c++) { o[c] = __float2half_rn(sm[c]); o[16 + c] = __float2half_rn(mx[c]); }
+    uint4 *dst = (uint4 *)(y + i * 32);
+#pragma unroll
+    for (int k = 0; k < 4; k++) dst[k] = ((const uint4 *)o)[k];
+}
+extern "C" xt xdepth_collapse16(xt f, int groups, const float *gamma, const float *beta, float eps, int act, const float *w_dev, float bias) {
+    if (f.c != 16 || f.d > 32) { fprintf(stderr, "xnet: xdepth_collapse16 needs 16 channels and <= 32 layers (%d, %d)\n", f.c, f.d); return xt{}; }
+    float *gm = xgn_stats(f, groups, eps); const long long HW = (long long)f.h * f.w;
+    xt y = xt_new(f.n, 1, f.h, f.w, 32);
+    k_dattn<32><<<nblk((size_t)f.n * HW, 128), 128, 0, g_st>>>((const __half *)f.p, gm, gm + (size_t)f.n * 16, gamma, beta, act, w_dev, bias, (__half *)y.p, f.n, f.d, HW);
+    xfree_dev(gm);
     return y;
 }
 __global__ void k_hecate_collapse(const float *s, const float *l, const uint8_t *sup, int n, int D, long long HW, float zs, float *out) {
