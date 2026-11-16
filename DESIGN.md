@@ -71,6 +71,20 @@ so all chunks of a band that differ in z alone probed one chain. A full 64-bit m
 1); old vs fixed differ by the same (3.42 M px, max 2). test_ink_ext_tiling runs again (its weights linked under ~/ufsm-data/inkext;
 the PyTorch parity tests need upstream villa / hecate sources, not run here). Fast tier: 330 PASS, 1 SKIP, 2 NEED2 (card 0 in training).
 
+## mcc 367942e: spill-slot sharing could give two live values one stack slot (fixed; try8 not affected) (2026-11-16, branch mcc-rafix-20261116)
+
+microc d2117c0 (11-15) shares a spill slot between the two sides of a copy when their live ranges never meet; the merged range list
+is built by ra.c ranges_union, which held a pointer into the range pool (rg_next) across the pool's realloc. When the pool grew in
+the middle of a union, the link went into the freed block and the merged list lost its tail, so a later merge could put a value on a
+slot still live with another one. Found when an experimental loop split segfaulted in it (villawind.c -g); fixed by keeping the tail
+by index (microc 367942e).
+
+Scope, from an instrumented compiler that reproduces the old truncation (it gives the old frames byte for byte) and tests every merge
+against the true ranges: try8's binary (ufsm a3d7b7eb, mcc a420db2, release): 448 host units, 0 bad merges. Pin 7add328 (master
+0f8c0f18, verify): 3 bad merges in sample.c draw_. The fix changes 14 host objects (slot numbers and frame size only), PTX identical.
+The loop split that found it, extended to registers a loop writes (copy in, copies back at each exit), measured neutral (paired A/B
++0.19 % cycles, geomean 0.998) and was dropped.
+
 ## mcc 7add328: host code, where the 1.3-1.4x against clang comes from; the slot-argument inline bonus (2026-11-16, branch mcc-host-20261116)
 
 Priority 2 of the mcc round (host speed). Method: every fast-tier CPU line of tests/suite.txt without a gpu / slow / flaky tag and not
