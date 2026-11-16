@@ -508,7 +508,9 @@ static void *pack_worker(void *a) {
 static int mx_pack1(xconv *c, const float *wk, int co, int sf, int wseq);
 static int g_mxrot = -1;   /* UFSM_XNET_MXROT=1: weights and activations of every MX conv H16-rotated per 16-block (exact in real arithmetic: the
                                 block dot products are invariant); mgpu: env */
+static int g_mxa = -1;   /* UFSM_XNET_MXA=1: least-squares activation block scales (k_xq MODE bit 1); mgpu: env */
 extern "C" void xnet_set_mxrot(int on) { g_mxrot = on; }
+extern "C" void xnet_set_mxa(int on) { g_mxa = on; }
 static int mx_pack(xconv *c, const float *wk, int co, int sf, int wseq) {
     if (g_mxrot < 0) { const char *e = getenv("UFSM_XNET_MXROT"); g_mxrot = e && *e ? atoi(e) : 0; }
     float *wr = nullptr;
@@ -519,8 +521,10 @@ static int mx_pack(xconv *c, const float *wk, int co, int sf, int wseq) {
             float *u = wr + b; for (int len = 1; len < 16; len <<= 1) for (int i = 0; i < 16; i += 2 * len) for (int j = i; j < i + len; j++) { const float a = u[j], cc = u[j + len]; u[j] = a + cc; u[j + len] = a - cc; }
             for (int i = 0; i < 16; i++) u[i] *= .25f;
         }
-        wk = wr; c->mxrot = 1;
+        wk = wr; c->mxrot |= 1;
     }
+    if (g_mxa < 0) { const char *e = getenv("UFSM_XNET_MXA"); g_mxa = e && *e ? atoi(e) : 0; }
+    if (g_mxa) c->mxrot |= 2;
     const int rc = mx_pack1(c, wk, co, sf, wseq); free(wr);
     return rc;
 }
@@ -997,19 +1001,37 @@ __device__ __forceinline__ void wht16(float *u) {   /* u <- H16 u / 4 (orthonorm
 #pragma unroll
     for (int i = 0; i < 16; i++) u[i] *= .25f;
 }
-template <int SF, bool ROT = false> __global__ void k_xq(const __half *x, uint8_t *q, uint8_t *s, long long nb16) {   /* ROT: each 16-block H16-rotated first (UFSM_XNET_MXROT) */
+__device__ __forceinline__ float e4dec(int c) { const int ex = (c >> 3) & 15, mt = c & 7; return ex ? ldexpf(1.f + mt / 8.f, ex - 7) : ldexpf(mt / 8.f, -6); }
+__device__ __forceinline__ float sse16(const float *v, float d, bool pow2) {   /* squared error of one 16-block on the e2m1 grid with scale d */
+    constexpr float G[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f}; float e = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; i++) { const unsigned c = cvt_e2m1x2(pow2 ? v[i] * (1.f / d) : __fdiv_rn(v[i], d), 0.f) & 15u; const float r = (c & 8 ? -G[c & 7] : G[c & 7]) * d - v[i]; e += r * r; }
+    return e;
+}
+/* MODE bit 0 (UFSM_XNET_MXROT 1): each 16-block H16-rotated first; bit 1 (UFSM_XNET_MXA 1): the block scale of least squared error, sf 5
+   among the e4m3 codes -4 .. +2 around amax / 6, sf 6 among 2^e, 2^(e - 1) (an earlier candidate is kept unless 1e-5 worse) */
+template <int SF, int MODE = 0> __global__ void k_xq(const __half *x, uint8_t *q, uint8_t *s, long long nb16) {
     const long long b = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (b >= nb16) return;
     __align__(16) __half hv[16]; *(uint4 *)hv = *(const uint4 *)(x + b * 16); *(uint4 *)(hv + 8) = *(const uint4 *)(x + b * 16 + 8);
     float v[16], am = 0.f;
 #pragma unroll
     for (int i = 0; i < 16; i++) v[i] = __half2float(hv[i]);
-    if constexpr (ROT) wht16(v);
+    if constexpr (MODE & 1) wht16(v);
 #pragma unroll
     for (int i = 0; i < 16; i++) am = fmaxf(am, fabsf(v[i]));
     uint2 o; uint8_t sc;
-    if constexpr (SF == 6) { const int e = mx_exp(am, 1.f / 6.f); const float m = exp2i(-e); o.x = cvt_e2m1x8(v, m); o.y = cvt_e2m1x8(v + 8, m); sc = (uint8_t)(e + 127); }
-    else {
-        sc = cvt_e4m3(__fdiv_rn(am, 6.f)); const int ex = (sc >> 3) & 15, mt = sc & 7; const float d = ex ? ldexpf(1.f + mt / 8.f, ex - 7) : ldexpf(mt / 8.f, -6);
+    if constexpr (SF == 6) {
+        int e = mx_exp(am, 1.f / 6.f);
+        if constexpr ((MODE & 2) != 0) if (am > 0.f && e > -127 && sse16(v, exp2i(e - 1), true) < sse16(v, exp2i(e), true) * (1.f - 1e-5f)) e -= 1;
+        const float m = exp2i(-e); o.x = cvt_e2m1x8(v, m); o.y = cvt_e2m1x8(v + 8, m); sc = (uint8_t)(e + 127);
+    } else {
+        sc = cvt_e4m3(__fdiv_rn(am, 6.f));
+        if constexpr ((MODE & 2) != 0) if (am > 0.f) {
+            float be = sse16(v, e4dec(sc), false); int bc = sc;
+            for (int cc = (int)sc - 4; cc <= (int)sc + 2; cc++) { if (cc < 1 || cc > 126 || cc == (int)sc) continue; const float t = sse16(v, e4dec(cc), false); if (t < be * (1.f - 1e-5f)) { be = t; bc = cc; } }
+            sc = (uint8_t)bc;
+        }
+        const float d = e4dec(sc);
         float w[16];
 #pragma unroll
         for (int i = 0; i < 16; i++) w[i] = d > 0.f ? __fdiv_rn(v[i], d) : 0.f;
@@ -1017,6 +1039,14 @@ template <int SF, bool ROT = false> __global__ void k_xq(const __half *x, uint8_
     }
     *(uint2 *)(q + b * 8) = o;
     s[(b >> 1) * 4 + (b & 1)] = sc;
+}
+template <int SF> static void xq_launch(int mode, const __half *x, uint8_t *q, uint8_t *s, long long nb16) {
+    switch (mode & 3) {
+    case 1: k_xq<SF, 1><<<nblk(nb16, 256), 256, 0, g_st>>>(x, q, s, nb16); break;
+    case 2: k_xq<SF, 2><<<nblk(nb16, 256), 256, 0, g_st>>>(x, q, s, nb16); break;
+    case 3: k_xq<SF, 3><<<nblk(nb16, 256), 256, 0, g_st>>>(x, q, s, nb16); break;
+    default: k_xq<SF, 0><<<nblk(nb16, 256), 256, 0, g_st>>>(x, q, s, nb16); break;
+    }
 }
 static int g_cfg = -1;
 static void conv_launch(const ConvP &p, int co) {
@@ -1074,15 +1104,13 @@ static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *ln
     p.K = c->K; p.Kp = c->Kp; p.M = (long long)in.n * Do * Ho * Wo; p.act = act; p.lnw = lnw; p.lnb = lnb; p.lneps = lneps;
     p.st = st && !res && act == XA_NONE ? st : nullptr;
     g_macs += (double)p.M * c->co * c->K;
-    if (c->mxrot && !in.p) fprintf(stderr, "xnet: a rotated MX conv (UFSM_XNET_MXROT) needs its fp16 input (fused MX-only producers are not rotated)\n");
+    if (c->mxrot && !in.p) fprintf(stderr, "xnet: an MX conv with UFSM_XNET_MXROT / MXA needs its fp16 input (fused MX-only producers quantise the plain way)\n");
     if (c->mxq && !fq.p && in.c == c->ci && p.M > 0 && (in.p || (in.q && !c->mxrot)) && !(act & (XA_LN | XA_GLU)) && !res && (act & 15) == XA_NONE) {   /* the MX-fp4 path */
         const long long nb16 = (long long)(xt_numel(in) / 16); uint8_t *qb = c->mxrot ? nullptr : (uint8_t *)in.q, *qtmp = nullptr;   /* (a rotated conv re-quantises its input) */
         if (!qb) {
             qb = qtmp = (uint8_t *)xmalloc_dev(xq_size(xt_numel(in)));
-            if (c->mxrot) { if (c->mxsf == 6) k_xq<6, true><<<nblk(nb16, 256), 256, 0, g_st>>>((const __half *)in.p, qb, qb + xq_soff(xt_numel(in)), nb16);
-                            else k_xq<5, true><<<nblk(nb16, 256), 256, 0, g_st>>>((const __half *)in.p, qb, qb + xq_soff(xt_numel(in)), nb16); }
-            else if (c->mxsf == 6) k_xq<6><<<nblk(nb16, 256), 256, 0, g_st>>>((const __half *)in.p, qb, qb + xq_soff(xt_numel(in)), nb16);
-            else k_xq<5><<<nblk(nb16, 256), 256, 0, g_st>>>((const __half *)in.p, qb, qb + xq_soff(xt_numel(in)), nb16);
+            if (c->mxsf == 6) xq_launch<6>(c->mxrot, (const __half *)in.p, qb, qb + xq_soff(xt_numel(in)), nb16);
+            else xq_launch<5>(c->mxrot, (const __half *)in.p, qb, qb + xq_soff(xt_numel(in)), nb16);
         }
         uint8_t *sb = qb + xq_soff(xt_numel(in));
         MxP m; m.xq = qb; m.xs = sb; m.wq = (const uint8_t *)c->mxq; m.ws = (const uint8_t *)c->mxs; m.gs = c->mxgs; m.scale = c->scale; m.bias = c->bias; m.y = (__half *)y.p;
