@@ -27,6 +27,16 @@ int main(int argc, char **argv) {
     best = 1e9;
     for (int r = 0; r < 8; r++) { const double t = now(); nn_fstem_bwd(x, P, P, P, 64, NZ, p, C, NO, chs, lg, ns, gp); nn_sync(); if (now() - t < best) best = now() - t; }
     printf("fstem bwd: %.3f ms\n", best * 1e3);
+    {   /* the fused head-slab forward (nn_fstem_up_fwd: upsample + side pair sub-cells + stem, the trainer's path): cell logits of BASE + 128 channels */
+        const int BASE = NO, side = 0, cp = P / 4, z0 = 64, qa = z0 / 4 - 1, qd = NZ / 4 + 2; const size_t ncl = (size_t)(BASE + 128) * qd * cp * cp;
+        void *lc = nn_malloc(ncl * 2); { float *d = nn_malloc(ncl * 4); for (size_t i = 0; i < ncl; i++) hf[i] = 4 * RND(); nn_h2d(d, hf, ncl * 4); nn_f32_to_h16(d, ncl, lc, 1.f); nn_free(d); }
+        nn_fstem_up_fwd(x, P, P, P, z0, NZ, p, C, NO, chs, lg, ns, lc, qa, qd, side, BASE); nn_sync(); nn_d2h(hl, lg, nl * 2);
+        uint64_t h = 1469598103934665603ull; for (size_t i = 0; i < nl; i++) h = (h ^ hl[i]) * 1099511628211ull;
+        best = 1e9;
+        for (int r = 0; r < 8; r++) { const double t = now(); nn_fstem_up_fwd(x, P, P, P, z0, NZ, p, C, NO, chs, lg, ns, lc, qa, qd, side, BASE); nn_sync(); if (now() - t < best) best = now() - t; }
+        printf("fstem up fwd: %.3f ms, output hash %016llx\n", best * 1e3, (unsigned long long)h);
+        nn_free(lc);
+    }
     const char *e = nn_check(); if (e) { printf("CUDA: %s\n", e); return 1; }
     return 0;
 }
