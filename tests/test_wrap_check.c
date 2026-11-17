@@ -69,6 +69,16 @@ int main(void) {
     printf("test_wrap_check: right model %d real / %d dup (mean empty %.3f); doubled model %d real / %d dup (mean empty %.3f)\n", r1, d1, e1, r2, d2, e2);
     CHECK(r1 >= 3 && d1 == 0 && e1 < 0.1, "right model: %d real, %d dup, empty %.3f", r1, d1, e1);
     CHECK(d2 >= 3 && d2 > r2 && e2 > 0.35 && e2 < 0.65, "doubled model: %d real, %d dup, empty %.3f", r2, d2, e2);
+    {   /* --intervals (fix0332 11-17): one row per interval; on the right model the mean CT peaks per row is ~1 */
+        char iv[700]; snprintf(iv, sizeof iv, "%s/intervals.tsv", dir);
+        char *av4[] = {"ufsm", "wrap-check", m1, fd, "--ct", dir, "ct.zarr", "--ct-um", "9.6", "--nz", "4", "--nth", "90", "--threads", "4", "--intervals", iv};
+        CHECK(cmd_wrap_check(17, av4) == 0, "wrap-check --intervals");
+        FILE *f = fopen(iv, "r"); char ln[256]; long n = 0; double sp = 0; int hdr = f && fgets(ln, sizeof ln, f) && !strncmp(ln, "z\ty\tx\tr_mm", 10);
+        while (f && fgets(ln, sizeof ln, f)) { double a[7]; if (sscanf(ln, "%lf %lf %lf %lf %lf %lf %lf", &a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6]) >= 6) { n++; sp += a[5]; } }
+        if (f) fclose(f);
+        printf("test_wrap_check: --intervals %ld rows, %.3f CT peaks per row\n", n, n ? sp / n : 0);
+        CHECK(hdr && n > 100 && fabs(sp / n - 1) < 0.15, "--intervals: header %d, %ld rows, %.3f peaks per row", hdr, n, n ? sp / n : 0);
+    }
     /* --gt-int: intervals between consecutive GT sheets; the right model counts 1 turn per GT turn, the doubled one 2 */
     for (int mi = 0; mi < 2; mi++) {
         char t3[600]; snprintf(t3, sizeof t3, "%s/gti%d.tsv", dir, mi);

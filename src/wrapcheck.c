@@ -1,5 +1,5 @@
 /* ufsm wrap-check <model-or-set> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY] [--nz 16] [--nth 180] [--zr Z0,Z1]
-                   [--sigma 1.2] [--prom 1] [--w-scale 1] [--dup 0.5] [--threads 16] [--cache DIR] [--tsv OUT]
+                   [--sigma 1.2] [--prom 1] [--w-scale 1] [--dup 0.5] [--threads 16] [--cache DIR] [--tsv OUT] [--intervals OUT]
    Duplicate / over-count check of a fitted winding (a joined fit set or one model; its wraps are the level sets W = k, ufsm wraps):
    along radial rays from the umbilicus (--nth angles at --nz z levels evenly over the box, or over native box-local z [Z0, Z1)), every
    pair of consecutive wrap crossings k -> k + 1 (inside material: the fields' weight w > 0 on every sample between them) is an
@@ -39,7 +39,7 @@ static const char *wc_opt(int argc, char **argv, const char *name, const char *d
 static int wc_idx(int argc, char **argv, const char *name) { for (int i = 3; i < argc; i++) if (!strcmp(argv[i], opt_n(name))) return i; return -1; }
 static double wc_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 
-typedef struct { int k; float z, r, gapn, rct, rnet, gtq, tph, tdn, tref; uint8_t npk; int8_t gt; float tfit, trv, trf; } wc_int;   /* trv / trf (--gt-int): recto runs of the --recto volume / the fields' r plane over the interval (window shifted by half of it: the sheet at its end) */   /* tfit (--gt-int): the fit's turns over a GT interval */   /* tph / tdn / tref: the network phase turns, density turns (integral of |n.r| / sp) and --ref model turns between the two crossings (NAN: none) */   /* the interval from wrap k to k + 1 on a ray; gtq the GT turns, gt their class (< 0.5: 0, < 1.5: 1, 2; < -0.25: -1; -128 none) */
+typedef struct { int k; float z, r, gapn, rct, rnet, gtq, tph, tdn, tref; uint8_t npk; int8_t gt; float tfit, trv, trf, ym, xm; } wc_int;   /* trv / trf (--gt-int): recto runs of the --recto volume / the fields' r plane over the interval (window shifted by half of it: the sheet at its end) */   /* tfit (--gt-int): the fit's turns over a GT interval */   /* tph / tdn / tref: the network phase turns, density turns (integral of |n.r| / sp) and --ref model turns between the two crossings (NAN: none) */   /* the interval from wrap k to k + 1 on a ray; gtq the GT turns, gt their class (< 0.5: 0, < 1.5: 1, 2; < -0.25: -1; -128 none) */
 
 typedef struct {
     const fit_set *fs; const fit_model *m;
@@ -174,7 +174,7 @@ static void wc_rays(void *ctx, int a0, int a1, int t) {
             const double ym = cy + rm * sn, xm = cx + rm * cs; double g[3];
             const double gl = fit_set_gradW(J->fs, J->zl, ym, xm, 0.5, g);
             const double cosr = gl > 0 ? fabs(g[1] * sn + g[2] * cs) / gl : 1;
-            wc_int v = {ck[c], (float)J->zl, (float)rm, (float)((rb - ra) * cosr * J->um), NAN, NAN, NAN, NAN, NAN, NAN, 0, -128, NAN, NAN, NAN};
+            wc_int v = {ck[c], (float)J->zl, (float)rm, (float)((rb - ra) * cosr * J->um), NAN, NAN, NAN, NAN, NAN, NAN, 0, -128, NAN, NAN, NAN, (float)ym, (float)xm};
             {   /* network phase turns (wrapped steps summed, outward sign), density turns, ref turns between the crossings */
                 const int i0 = (int)ceil(ra / st), i1 = (int)floor(rb / st);
                 double sph = 0, sdn = 0; int nph = 0, ndn = 0, last = -1;
@@ -483,6 +483,12 @@ int cmd_wrap_check(int argc, char **argv) {
         nt2 = 0; for (size_t i = a; i < b; i++) tmp[nt2++] = all[i].gapn; s->mgap = wc_median(tmp, nt2);
         a = b;
     }
+    if (wc_opt(argc, argv, "--intervals", nullptr)) {   /* --intervals OUT: one line per interval (fix0332 11-17: cell gates from the CT agreement) */
+        FILE *qf = fopen(wc_opt(argc, argv, "--intervals", nullptr), "w"); if (!qf) { fprintf(stderr, "wrap-check: cannot write --intervals\n"); return 1; }
+        fprintf(qf, "z\ty\tx\tr_mm\tk\tnpk\trct\n");   /* (global native voxels of the model's grid: the midpoint of the interval) */
+        for (size_t i = 0; i < ni; i++) { const wc_int *v = &all[i]; if (v->gt != -128) continue;
+            fprintf(qf, "%.0f\t%.1f\t%.1f\t%.3f\t%d\t%d\t%.3f\n", v->z + morg[0], v->ym + morg[1], v->xm + morg[2], v->r * um / 1000, v->k, v->npk, v->rct); }
+        if (fclose(qf)) { fprintf(stderr, "wrap-check: cannot write --intervals\n"); return 1; } }
     FILE *tf = nullptr; const char *tsv = wc_opt(argc, argv, "--tsv", nullptr);
     if (tsv && !(tf = fopen(tsv, "w"))) { fprintf(stderr, "wrap-check: cannot write %s\n", tsv); return 1; }
     const char *hdr = "wrap\tintervals\tempty\tone\ttwo_plus\trct_med\trnet_med\tgap_um_med\tgt_n\tgt_mean\tgt0\tgt1\tgt2\tverdict\n";
