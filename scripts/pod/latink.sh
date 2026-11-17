@@ -6,6 +6,9 @@
 # The grid-256 pass writes 256 shards (inkB 11-13: with 512 shards each shard overlapped 8 shifted windows, ~7x the windows of grid 0).
 # LATWROUND=1 (OFF by default; infer audit #8): predict --window-round 1, 544 / 16 -> 640 / 64 with the same 512 interior for nets whose
 # window must be a multiple of 128 (scratch2, nlev 6); a no-op for u1-class nets. Needs a predict with --window-round (inferfix).
+# LATINK_BOX=z,y,x,nz,ny,nx (CT level voxels, origins on the 512 grid): ink only over that box, not the run's (Paris 4 on a 200 GB pod: the
+# whole box's three lossless heads are ~0.4 TB, 0332's 51 GB; the desk's P4 u1 ink was the band z 8192 + 2560 too). The renders show
+# ink inside it only.
 # Env: LATINK_CK (default /root/pod/ckpt/inkpod-15000.ckpt, the newest inkpod snap), ITH (threads).
 set -u
 O=${1:?}; G=${2:-0}; OUT=${3:?}; U=${U:-/root/pod/ufsm/build/ufsm}; CK=${LATINK_CK:-${POD:-/root/pod}/ckpt/inkpod-15000.ckpt}
@@ -15,7 +18,7 @@ if [ -n "${UNROLL_CT:-}" ]; then IFS='|' read -r R K UM LV <<< "$UNROLL_CT"
 else row=$(awk -F'\t' -v o=$(basename $O) 'NR > 1 && index(o, $1) == 1 { if (length($1) > l) { l = length($1); r = $0 } } END { print r }' $O/bin/scrolls.tsv)
   [ -n "$row" ] || { echo "latink: no scrolls.tsv row for $(basename $O) (set UNROLL_CT)"; exit 1; }
   R=$(echo "$row" | cut -f2); K=$(echo "$row" | cut -f3); UM=$(echo "$row" | cut -f4); LV=$(echo "$row" | cut -f5); fi
-LUM=$(awk -v u=$UM -v l=$LV 'BEGIN { printf "%.4g", u * 2 ^ l }'); BOX=$(cat $O/box.txt); T=$O/ink/lat.tmp; TH=${ITH:-12}
+LUM=$(awk -v u=$UM -v l=$LV 'BEGIN { printf "%.4g", u * 2 ^ l }'); BOX=${LATINK_BOX:-$(cat $O/box.txt)}; T=$O/ink/lat.tmp; TH=${ITH:-12}
 echo "latink: ck $CK, $R $K level $LV ($LUM um), box $BOX"
 mkdir -p $T
 # pbox SHIFT: the run's box moved down onto the pass's 512-voxel tile grid (origin = SHIFT mod 512), as seamless.c pass_box: an off-grid box
