@@ -15,15 +15,20 @@
 
 int g_f4v = -1;   /* mgpu: env (UFSM_F4V; lp_set_f4v: tests) */
 extern "C" void lp_set_f4v(int on) { g_f4v = on; }
+int g_f4_pn = -1;   /* mgpu: env */
+extern "C" void lp_set_f4_prenorm(int on) { g_f4_pn = on; }
+static int g_f4v_preslab = -1;   /* mgpu: env (UFSM_F4V_PRESLAB=Z: force the slabbed prenorm with Z-plane slabs; tests) */
+extern "C" void lp_set_f4v_preslab(int z) { g_f4v_preslab = z; }
 static unsigned long g_f4v_calls;   /* (tests: lp_f4v_calls) */
 extern "C" unsigned long lp_f4v_calls(void) { return g_f4v_calls; }
 extern "C" int lp_get_f4v(void) { if (g_f4v < 0) g_f4v = getenv("UFSM_F4V") ? atoi(getenv("UFSM_F4V")) : 0; return g_f4v; }
+int lp_f4v_slab_forced(void) { if (g_f4v_preslab < 0) g_f4v_preslab = getenv("UFSM_F4V_PRESLAB") ? atoi(getenv("UFSM_F4V_PRESLAB")) : 0; return lp_get_f4v() && g_f4v_preslab > 0; }
 
 #ifndef LP_SW
 constexpr int F4V_PG = 7;   /* tap pairs a weight stage (two a chunk, as conv_fwd_f4_k) */
 template <int MT, int TZ> struct f4v_geo {
     static constexpr int BM = MT * 16, TT = (TZ + 2) * 180, XB = TT * 16, XS = (TT + 127) & ~127, XBUF = XB + XS;
-    static constexpr int WST = F4V_PG * BM * 32, WSS = F4V_PG * BM * 2, WBUF = WST + WSS, SMEM = 2 * XBUF + 2 * WBUF, NI = (TT + 255) / 256;
+    static constexpr int WST = F4V_PG * BM * 32, WSS = F4V_PG * BM * 2, WBUF = WST + WSS, GT = 2 * 32 * 8 + 16, SMEM = 2 * XBUF + 2 * WBUF + GT, NI = (TT + 255) / 256;
 };
 /* wq [tap 28][Cop][Cip / 2] / ws [tap][Cop][nch] (prep_w4_k) -> wv [Cop / BM][nch][pair 14][BM][32 B] (tap 2 pp | 2 pp + 1 at sw16) and
    wvs [Cop / BM][nch][14][BM] (byte 0 tap 2 pp's scale, byte 1 tap 2 pp + 1's): conv_fwd_f4_k's weight stage contents, in its order */
@@ -153,7 +158,7 @@ __device__ __forceinline__ void f4v_epi_st(float (&acc)[MT][NR][2][4], unsigned 
         }
     }
 }
-template <int MT, int TZ, typename TO, bool ST>
+template <int MT, int TZ, typename TO, bool ST, bool G>   /* G: GN+SiLU staging (gp / sp.gp2) */
 __global__ void __launch_bounds__(256, 1) conv_fwd_f4v_k(const mx4_t *__restrict__ x, const uint8_t *__restrict__ wv, const unsigned short *__restrict__ wvs,
                                                          const float *__restrict__ b, TO *__restrict__ y, int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip,
                                                          gnp_t gp, double *__restrict__ osum, int Go, split_t sp, skipm_t sk) {
@@ -161,6 +166,8 @@ __global__ void __launch_bounds__(256, 1) conv_fwd_f4v_k(const mx4_t *__restrict
     constexpr int BM = GEO::BM, RZ = TZ / 2, NR = 2 * RZ, TT = GEO::TT, NI = GEO::NI, XB = GEO::XB, XBUF = GEO::XBUF, WST = GEO::WST, WBUF = GEO::WBUF;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *const xb0 = smem_raw, *const wb0 = smem_raw + 2 * XBUF;   /* input buffers [rows TT x 16 B | scales], weight buffers [rows | scale pairs] */
+    float2 *const gt = (float2 *)(wb0 + 2 * WBUF);                      /* GN+SiLU: [2][32] (a, b) of a chunk's channels, then [2] GN masks */
+    unsigned *const gmw = (unsigned *)(gt + 64);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int wz = warp >> 2, wr = (warp & 3) * 2;
     const int ox0 = blockIdx.x * 16, oy0 = blockIdx.y * 8;
@@ -215,18 +222,73 @@ __global__ void __launch_bounds__(256, 1) conv_fwd_f4v_k(const mx4_t *__restrict
             for (int i = threadIdx.x; i < WST / 16; i += 256) cp_async<16>(wb + i * 16, src + i * 16, true);
             for (int i = threadIdx.x; i < GEO::WSS / 16; i += 256) cp_async<16>(wb + WST + i * 16, ss + i * 16, true);
         };
-        issue_x(0, 0); store_s(0); issue_w(0);
+        /* GN+SiLU inputs (conv_fwd_f4_k's fastg staging, f4r_stage_g): the stored rows land by cp.async as above, then each thread
+           transforms its own positions in place one stage later (its own copies are visible to it after its wait_group): decode,
+           affine + SiLU (the halved affine when every channel has a GroupNorm, f4r_stage_g_t RG), requantise; the same bits */
+        auto gtab = [&](int c, int tb) {   /* chunk c's coefficients -> table tb (threads 0 .. 31) */
+            if (threadIdx.x < 32) {
+                const chan_t ch = make_chan(seg_ci(c * 32 + (int)threadIdx.x, Ci, Cx, CxP), Ci, Cx, n, plane, x, sp, gp, N, 0);
+                gt[tb * 32 + threadIdx.x] = make_float2(ch.a, ch.b);
+                const unsigned gm = __ballot_sync(0xffffffffu, ch.g != 0);
+                if (threadIdx.x == 0) gmw[tb] = gm;
+            }
+        };
+        auto xform = [&](int bi, int tb) {
+            uint8_t *sx = xb0 + bi * XBUF, *sxs = sx + XB;
+            const float2 *ab = gt + tb * 32;
+            const unsigned gm = gmw[tb];
+#pragma unroll 1
+            for (int k = 0; k < NI; k++) {
+                if (off[k] == -2) continue;
+                const int li = threadIdx.x + 256 * k;
+                const bool in = off[k] >= 0;
+                const uint4 rw = *(const uint4 *)(sx + li * 16);
+                const float sc = mx_scale(sreg[k]);
+                const unsigned w4[4] = {rw.x, rw.y, rw.z, rw.w};
+                float v[32];
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+#pragma unroll
+                    for (int q = 0; q < 4; q++) { const float2 a = dec_e2m1x2(w4[j] >> (8 * q)); v[8 * j + 2 * q] = a.x * sc; v[8 * j + 2 * q + 1] = a.y * sc; }
+                if (gm == 0xffffffffu) {
+#pragma unroll
+                    for (int j = 0; j < 32; j++) {
+                        const float2 c2 = ab[j];
+                        const float hh = fmaf(v[j], 0.5f * c2.x, 0.5f * c2.y);
+                        const float th = tanh_silu(hh);
+                        v[j] = in ? fmaf(hh, th, hh) : 0.f;
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 32; j++) if ((gm >> j) & 1u) { const float2 c2 = ab[j]; v[j] = in ? act_ab(v[j], c2.x, c2.y, true) : 0.f; }
+                }
+                unsigned amu = 0u;
+#pragma unroll
+                for (int j = 0; j < 32; j++) amu = amax_u(amu, v[j]);
+                const int e = mx_exp(__uint_as_float(amu), 1.f / 6.f);
+                const float m = exp2i(-e);
+                *(uint4 *)(sx + li * 16) = make_uint4(cvt_e2m1x8(v, m), cvt_e2m1x8(v + 8, m), cvt_e2m1x8(v + 16, m), cvt_e2m1x8(v + 24, m));
+                sxs[li] = (uint8_t)(e + 127);
+            }
+        };
+        issue_x(0, 0); issue_w(0);
         asm volatile("cp.async.commit_group;\n" ::: "memory");
+        if constexpr (G) {
+            gtab(0, 0);
+            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+            __syncthreads();
+            xform(0, 0);
+        } else store_s(0);
         const int ns = 2 * nch;
         for (int s = 0; s < ns; s++) {
             const int c = s >> 1, h = s & 1;
             asm volatile("cp.async.wait_group 0;\n" ::: "memory");   /* stage s and (h 0) chunk c landed (this thread's copies) */
             __syncthreads();                                         /* everyone's; and every warp is past stage s - 1's MMA */
             if (s + 1 < ns) {
-                if (!h && c + 1 < nch) issue_x(c + 1, (c + 1) & 1);   /* (buffer (c + 1) & 1: chunk c - 1's, done) */
-                if (h) store_s((c + 1) & 1);
+                if (!h && c + 1 < nch) { issue_x(c + 1, (c + 1) & 1); if constexpr (G) gtab(c + 1, (c + 1) & 1); }   /* (buffers (c + 1) & 1: chunk c - 1's, done) */
                 issue_w(s + 1);
                 asm volatile("cp.async.commit_group;\n" ::: "memory");
+                if (h) { if constexpr (G) xform((c + 1) & 1, (c + 1) & 1); else store_s((c + 1) & 1); }   /* (chunk c + 1's rows: this thread's copies, waited for above) */
             }
             const uint8_t *sx = xb0 + (c & 1) * XBUF, *sxs = sx + XB, *wa = wb0 + (s & 1) * WBUF;
             const unsigned short *was = (const unsigned short *)(wa + WST);
@@ -238,26 +300,23 @@ __global__ void __launch_bounds__(256, 1) conv_fwd_f4v_k(const mx4_t *__restrict
     else fwd_epilogue<MT, NR, TO, true>(acc, smem_raw, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N);
 }
 template <int MT, int TZ, typename TO>
-static void launch_f4v(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, int Cip, gnp_t gp, double *osum, int Go, const split_t &sp) {
+static void launch_f4v(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, int Cip, gnp_t gp, double *osum, int Go, const split_t &sp,
+                       const skipm_t &sk, bool prep = true) {
     using GEO = f4v_geo<MT, TZ>;
     const int nch = Cip / 32;
     uint8_t *wv = lp_buf<uint8_t>(0, (size_t)Cop * nch * 14 * 32);
     unsigned short *wvs = (unsigned short *)lp_buf<uint8_t>(1, (size_t)Cop * nch * 14 * 2);
     const size_t nr = (size_t)Cop * nch * 14 * 2;
-    prep_w4v_k<<<nblk_(nr, 256), 256>>>(wq, ws, wv, wvs, Cop, Cip, GEO::BM);
+    if (prep) prep_w4v_k<<<nblk_(nr, 256), 256>>>(wq, ws, wv, wvs, Cop, Cip, GEO::BM);
     size_t smem = GEO::SMEM;
     if (smem < 1024 + FEPI_SCR(16)) smem = 1024 + FEPI_SCR(16);
-    const skipm_t sk = lp_skip_get(xs, sp, 1);
     dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(zw_tiles(xs.d, TZ, sp) * (Cop / GEO::BM) * xs.n));
-    static int attr[8][2];
-    const int d = cur_dev_(), st = osum != nullptr;
-    if (!attr[d][st]) {
-        attr[d][st] = 1;
-        if (st) cudaFuncSetAttribute((const void *)conv_fwd_f4v_k<MT, TZ, TO, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        else cudaFuncSetAttribute((const void *)conv_fwd_f4v_k<MT, TZ, TO, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-    }
-    if (st) conv_fwd_f4v_k<MT, TZ, TO, true><<<grid, 256, smem>>>((const mx4_t *)x, wv, wvs, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, sk);
-    else conv_fwd_f4v_k<MT, TZ, TO, false><<<grid, 256, smem>>>((const mx4_t *)x, wv, wvs, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, sk);
+    const int d = cur_dev_(), st = osum != nullptr, g = gp.G != 0 || sp.gp2.G != 0;
+#define F4V_L(STV, GV) do { static int attr[8]; if (!attr[d]) { attr[d] = 1; cudaFuncSetAttribute((const void *)conv_fwd_f4v_k<MT, TZ, TO, STV, GV>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem); } \
+                            conv_fwd_f4v_k<MT, TZ, TO, STV, GV><<<grid, 256, smem>>>((const mx4_t *)x, wv, wvs, b, (TO *)y, xs.n, xs.c, xs.d, xs.h, xs.w, cout, Cop, Cip, gp, osum, Go, sp, sk); } while (0)
+    if (st) { if (g) F4V_L(true, true); else F4V_L(true, false); }
+    else { if (g) F4V_L(false, true); else F4V_L(false, false); }
+#undef F4V_L
 }
 #endif
 /* fwd_f4_t<mx4_t, mx4_t>'s hook, after its weight prep and gn_prenorm_f4_k: 1 if conv_fwd_f4v_k ran the conv */
@@ -267,12 +326,76 @@ int lp_f4v_try(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, c
     return 0;
 #else
     if (!lp_get_f4v() || lp_sw_build()) return 0;
-    if (Cop % 64 || gp.G || sp.gp2.G || sp.sr || sp.up || xs.d < 8) return 0;   /* (MT 4; copy staging only; small depths: conv_fwd_f4_k's 2-plane tiles) */
-    if (sp.zw1 && (sp.zw0 % 4 || (sp.zw1 % 4 && sp.zw1 != xs.d))) return 0;
     const size_t plane = (size_t)(sp.Di ? sp.Di : xs.d) * xs.h * xs.w;
-    if (plane >= ((size_t)1 << 31)) return 0;
-    if (osum && (sp.y2 || (xs.w & 15) || cout <= 16)) return 0;   /* the statistics epilogue: fwd_epi_mxt's conditions (f4v_epi_st) */
-    launch_f4v<4, 4, mx4_t>(x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp);
+    const char *why = Cop % 64 ? "Cop % 64" : gp.ns || sp.gp2.ns ? "slab-local GN" : sp.sr ? "staging SR" : sp.up ? "fused upsample" : xs.d < 8 ? "depth < 8"   /* (MT 4; copy staging only;
+                                                                                                                            small depths: conv_fwd_f4_k's 2-plane tiles) */
+                    : sp.zw1 && (sp.zw0 % 4 || (sp.zw1 % 4 && sp.zw1 != xs.d)) ? "z-window off 4-plane tiles" : plane >= ((size_t)1 << 31) ? "plane >= 2^31"
+                    : osum && (sp.y2 || (xs.w & 15) || cout <= 16) ? "statistics epilogue (split output / W % 16 / <= 16 outputs)" : nullptr;   /* (f4v_epi_st: fwd_epi_mxt's conditions) */
+    static int dbg = -1; if (dbg < 0) dbg = getenv("UFSM_F4V_DEBUG") ? atoi(getenv("UFSM_F4V_DEBUG")) : 0;   /* the first N calls: kernel and reason */
+    if (dbg > 0) { dbg--; fprintf(stderr, "f4v: %d->%d %dx%dx%d Cop %d Cip %d stats %d osr %d x2 %d: %s%s\n", xs.c, cout, xs.d, xs.h, xs.w, Cop, Cip, osum != nullptr, sp.osr != 0, sp.x2 != nullptr,
+                                   why ? "conv_fwd_f4_k, " : "conv_fwd_f4v_k", why ? why : ""); }
+    if (why) return 0;
+    launch_f4v<4, 4, mx4_t>(x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp, lp_skip_get(xs, sp, 1));
+    g_f4v_calls++;
+    return 1;
+#endif
+}
+
+#ifndef LP_SW
+/* gn_prenorm_f4_k over the input planes [a, a + L) only (into a depth-L tensor): the same staging and requantisation per voxel */
+__global__ void __launch_bounds__(256) gn_prenorm_f4z_k(const mx4_t *__restrict__ x, int N, int Ci, size_t S, int a, int L, int HW, gnp_t gp, uint8_t *__restrict__ y) {
+    __shared__ chan_t ctab[32]; __shared__ float2 cab[32]; __shared__ unsigned sgm;
+    const int blk = blockIdx.y, n = blockIdx.z, nb = Ci / 32;
+    if (threadIdx.x < 32) {
+        const split_t sp0 = {};
+        const chan_t c = make_chan(blk * 32 + (int)threadIdx.x, Ci, Ci, n, S, x, sp0, gp, N);
+        ctab[threadIdx.x] = c; cab[threadIdx.x] = make_float2(c.a, c.b);
+        const unsigned gm = __ballot_sync(0xffffffffu, c.g != 0);
+        if (threadIdx.x == 0) sgm = gm;
+    }
+    __syncthreads();
+    const size_t Ss = (size_t)L * HW, v = (size_t)blockIdx.x * 256 + threadIdx.x;
+    if (v >= Ss) return;
+    float val[32];
+    stage_row32<mx4_t>(ctab, (size_t)a * HW + v, true, true, val, cab, sgm);
+    unsigned amu = 0u;
+#pragma unroll
+    for (int k = 0; k < 32; k++) amu = amax_u(amu, val[k]);
+    const int e = mx_exp(__uint_as_float(amu), 1.f / 6.f);
+    const float m = exp2i(-e);
+    const size_t ri = ((size_t)n * nb + blk) * Ss + v;
+    *(uint4 *)(y + ri * 16) = make_uint4(cvt_e2m1x8(val, m), cvt_e2m1x8(val + 8, m), cvt_e2m1x8(val + 16, m), cvt_e2m1x8(val + 24, m));
+    y[(size_t)N * nb * Ss * 16 + ri] = (uint8_t)(e + 127);
+}
+#endif
+/* fwd_f4_t's GroupNorm input when the layer's MX-fp4 copy (gn_prenorm_f4_k) is over its workspace budget (unet_ws_plan's spare: try9's
+   level 0 needs 963 MB, the plan has 150): the copy by z slabs of Z output planes (a multiple of 4: conv_fwd_f4v_k's tiles), each slab's
+   input planes [z0 - 1, z1 + 1) prenormed into the budget, then conv_fwd_f4v_k on the output z-window [z0, z1) with that slab as a z-range
+   input (zi0 = -(z0 - 1), Di = its planes). The skip mask is taken once for the whole conv. Each output tile and its statistics are
+   those of the unslabbed conv (the tiles do not change; the statistics add in fixed point): the same bits as the in-kernel GroupNorm
+   staging (test_f4v) at a copy pass of the input instead of the staging's per-tile tanh (conv_fwd_f4v_k's G staging is not overlapped
+   with its MMAs: ncu L0 50 ms vs 29 ms copy-staged) */
+int lp_f4v_preslab(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, int Cip, gnp_t gp, double *osum, int Go, const split_t &sp) {
+#ifdef LP_SW
+    (void)x; (void)xs; (void)wq; (void)ws; (void)b; (void)cout; (void)y; (void)Cop; (void)Cip; (void)gp; (void)osum; (void)Go; (void)sp;
+    return 0;
+#else
+    if (!lp_get_f4v() || lp_sw_build() || Cop % 64 || xs.d < 8 || sp.zw1 || sp.Di || sp.y2 || (osum && ((xs.w & 15) || cout <= 16))) return 0;
+    if (g_f4v_preslab < 0) g_f4v_preslab = getenv("UFSM_F4V_PRESLAB") ? atoi(getenv("UFSM_F4V_PRESLAB")) : 0;
+    const int HW = xs.h * xs.w, nb = xs.c / 32;
+    const size_t pp = (size_t)xs.n * nb * HW * 17;   /* prenorm bytes per input plane */
+    if ((size_t)(xs.d + 2) * HW >= ((size_t)1 << 31)) return 0;
+    int Z = 0; uint8_t *q = nullptr;
+    if (g_f4v_preslab > 0) { Z = g_f4v_preslab & ~3; if (Z < 4) Z = 4; q = (uint8_t *)nn_ws(NN_WS_F4PRE, (size_t)(Z + 2) * pp); }
+    else for (Z = (xs.d + 3) & ~3; Z >= 8 && !(q = (uint8_t *)nn_ws(NN_WS_F4PRE, (size_t)(Z + 2) * pp)); Z = Z > 64 ? 64 : Z - 4) {}   /* the largest slab the budget holds */
+    if (!q) return 0;
+    const skipm_t sk = lp_skip_get(xs, sp, 1);
+    for (int z0 = 0; z0 < xs.d; z0 += Z) {
+        const int z1 = z0 + Z < xs.d ? z0 + Z : xs.d, a = z0 > 0 ? z0 - 1 : 0, e = z1 < xs.d ? z1 + 1 : xs.d, L = e - a;
+        gn_prenorm_f4z_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, xs.c, (size_t)xs.d * HW, a, L, HW, gp, q);
+        split_t s2 = sp; s2.zi0 = (int16_t)-a; s2.Di = (int16_t)L; s2.zw0 = (int16_t)z0; s2.zw1 = (int16_t)z1;
+        launch_f4v<4, 4, mx4_t>(q, xs, wq, ws, b, cout, y, Cop, Cip, gnp_t{}, osum, Go, s2, sk, z0 == 0);
+    }
     g_f4v_calls++;
     return 1;
 #endif

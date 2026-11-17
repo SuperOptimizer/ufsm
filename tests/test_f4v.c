@@ -12,6 +12,8 @@
 #include <string.h>
 
 void lp_set_f4v(int on);
+void lp_set_f4_prenorm(int on);
+void lp_set_f4v_preslab(int z);
 unsigned long lp_f4v_calls(void);
 int lp_sw_build(void);
 static uint64_t rs = 0xf4f4f4ull;
@@ -26,7 +28,7 @@ static void *mx4_rand(shape5 s, float sc) {
     lp_f32_to_mx4(d, s.n, s.c, shape_spatial(s), p); nn_free(d); return p;
 }
 static void *mx4_out(shape5 s, size_t *bytes) { const size_t b = nn_mx4_bytes(s); void *p = nn_malloc(b); nn_zero(p, b); nn_set_storage(p, b, 4); *bytes = b; return p; }
-enum { GN = 1, STATS = 2, OSR = 4, SPLIT = 8, ZWIN = 16, ZRANGE = 32, SST = 64 };
+enum { GN = 1, STATS = 2, OSR = 4, SPLIT = 8, ZWIN = 16, ZRANGE = 32, SST = 64, GN2 = 128, PRESLAB = 256 };
 static void run_case(const char *name, int Ci, int Co, int D, int H, int W, int fl) {
     const int Dx = fl & ZRANGE ? D + 3 : D;   /* (z-range: output plane z reads input plane z + 1 of a deeper input) */
     shape5 xs = {1, Ci, Dx, H, W}, ys = {1, Co, D, H, W};
@@ -40,6 +42,11 @@ static void run_case(const char *name, int Ci, int Co, int D, int H, int W, int 
     gnp_t gp = {0};
     float *ga = nullptr, *be = nullptr, *mu = nullptr, *rsd = nullptr;
     if (fl & GN) { ga = dev_rand(Ci, 0.2f, 1.f); be = dev_rand(Ci, 0.1f, 0.f); mu = dev_rand(G, 0.1f, 0.f); rsd = dev_rand(G, 0.1f, 1.f); gp = gnp_mk(ga, be, mu, rsd, G); }
+    float *g2a = nullptr, *g2b = nullptr, *g2m = nullptr, *g2r = nullptr;
+    if (fl & GN2) {   /* per-segment GroupNorms (decoder concat): gp over the first split channels, gp2 over the rest */
+        g2a = dev_rand(Ci - split, 0.3f, 1.f); g2b = dev_rand(Ci - split, 0.2f, 0.f); g2m = dev_rand(G, 0.2f, 0.f); g2r = dev_rand(G, 0.1f, 1.f);
+        sp.gp2 = gnp_mk(g2a, g2b, g2m, g2r, G);
+    }
     if (fl & OSR) sp.osr = 0x9e3779b9u;
     if (fl & ZWIN) { sp.zw0 = 4; sp.zw1 = D - 4; }
     if (fl & ZRANGE) { sp.zi0 = 1; sp.Di = (int16_t)Dx; }
@@ -53,11 +60,12 @@ static void run_case(const char *name, int Ci, int Co, int D, int H, int W, int 
     for (int k = 0; k < 2; k++) {
         if (fl & STATS) { os[k] = nn_malloc(osb); nn_zero(os[k], osb); }
         lp_set_f4v(k);
+        if (fl & PRESLAB) { lp_set_f4_prenorm(k); lp_set_f4v_preslab(k ? 8 : 0); }   /* old: the in-kernel GroupNorm staging; new: the prenorm by 8-plane slabs */
         if (k) c0 = lp_f4v_calls();
         lp_conv_fwd_f4(x, 4, xc, w, b, Co, y[k], 4, gp, os[k], fl & STATS ? Go : 0, sp);
     }
     const int ran = lp_f4v_calls() == c0 + 1;
-    lp_set_f4v(0);
+    lp_set_f4v(0); lp_set_f4_prenorm(1); lp_set_f4v_preslab(0);
     nn_sync();
     const char *e = lp_check();
     unsigned char *h0 = malloc(yb), *h1 = malloc(yb);
@@ -72,7 +80,7 @@ static void run_case(const char *name, int Ci, int Co, int D, int H, int W, int 
     check(msg, !e && ran && nd == 0 && sok && nz > yb / 4);
     free(h0); free(h1);
     nn_free(w); nn_free(b); nn_free(x); nn_free(x2); nn_free(y[0]); nn_free(y[1]); nn_free(os[0]); nn_free(os[1]);
-    nn_free(ga); nn_free(be); nn_free(mu); nn_free(rsd);
+    nn_free(ga); nn_free(be); nn_free(mu); nn_free(rsd); nn_free(g2a); nn_free(g2b); nn_free(g2m); nn_free(g2r);
 }
 int main(void) {
     nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0);
@@ -88,6 +96,13 @@ int main(void) {
     run_case("bdata, odd width, no stats", 128, 64, 9, 11, 37, OSR);
     run_case("split input (128 | 64), stats", 192, 128, 12, 16, 32, SPLIT | STATS);
     run_case("z-window [4, D - 4), stats", 128, 128, 16, 16, 32, STATS | ZWIN);
+    run_case("GN staged in the kernel (one output tile: no prenorm)", 128, 64, 12, 16, 32, GN | STATS);
+    run_case("GN staged, a partial chunk (80 channels: masked GN)", 80, 64, 10, 16, 32, GN | STATS);
+    run_case("GN staged, z-window (no prenorm)", 128, 128, 16, 16, 32, GN | STATS | ZWIN);
+    run_case("GN staged, split input, one GN over both", 192, 128, 12, 16, 32, GN | SPLIT | STATS);
+    run_case("GN staged, split input, per-segment GNs", 192, 256, 12, 24, 48, GN | GN2 | SPLIT | STATS);
+    run_case("slabbed prenorm vs in-kernel GN staging (8-plane slabs)", 128, 128, 20, 16, 32, GN | STATS | PRESLAB);
+    run_case("slabbed prenorm, stored stats, odd depth", 256, 192, 13, 24, 32, GN | STATS | SST | PRESLAB);
     run_case("z-range input (zi0 1, Di D + 3)", 128, 64, 12, 16, 32, ZRANGE | OSR);
     if (getenv("UFSM_TEST_QUICK") == nullptr) run_case("level-0 shape", 256, 256, 16, 64, 64, GN | STATS);
     printf("test_f4v: %s\n", bad ? "FAIL" : "ok");
