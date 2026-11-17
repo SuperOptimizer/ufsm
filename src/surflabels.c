@@ -34,7 +34,9 @@
    --gt ROOT KEY (winding_mod14 codes on the same grid, e.g. Paris 4 q-9p6.zarr 9.6): validation. The GT phase (pair rule on the GT
    codes) against ours where both are known (raw and kept), the per-wrap counts (the wrap whose sheet is the voxel's lower winding),
    and the pair winding accuracy (src/pairacc.h, 0.5 / 1 / 2 / 4 mm) of our winding (q of the lower sheet + phase) at the GT-coded kept
-   voxels. --tsv: the per-wrap table. Streaming: z bands of one shard row (the wraps' rows meeting it are decoded per band, ~16 B per
+   voxels. --gt-cells TSV [--gt-cell C (128)] [--gt-cell-mm D (0.4 C grid voxels)]: the same per cell of C^3 grid voxels (kept voxels
+   compared, their share within 1/4 turn, the pair accuracy at D of the cell's own records; the pseudo-label gate's two-fit agreement
+   map with another fit's codes as --gt). --tsv: the per-wrap table. Streaming: z bands of one shard row (the wraps' rows meeting it are decoded per band, ~16 B per
    vertex), blocks on --threads threads; deterministic for any thread count. */
 #include "band.h"
 #include "optcheck.h"
@@ -112,6 +114,7 @@ typedef struct {
     double gsplit; int ghalf;
     z3 *ag_r; int ag_s, ag_R, ag_rmin; _Atomic long long ag_kn[34], ag_gk[34], ag_g25[34];   /* --agree: recto field (on a grid ag_s x coarser), search +-ag_R voxels; bins 0..ag_R, ag_R + 1 = no agreement */          /* --gt-half A|B with --gt-split-mm: GT used only in z blocks of that parity (A even, B odd) */
     _Atomic long long ch_sn[COH_BINS + 1], ch_sa[COH_BINS + 1];   /* side agreement on papyrus per coherence bin (before the gate) */
+    int gcc; int64_t gcn[3]; _Atomic long long *gc_k, *gc_a;   /* --gt-cells: per cell of gcc^3 grid voxels, kept voxels compared with the GT phase / within 1/4 turn */
     int coh_cell, ct_scale; double min_coh; _Atomic long long ch_kn[COH_BINS + 1], ch_gk[COH_BINS + 1], ch_g10[COH_BINS + 1], ch_g25[COH_BINS + 1];   /* bin COH_BINS: no coherence (too few voxels) */
 } sl_job;
 
@@ -383,6 +386,8 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
     int hlast = -1; long long hrun = 0;   /* the holdout box of the current run of voxels and its count (flushed on a change: no atomic per voxel) */
     long long ncode = 0, nconf = 0, nknown = 0, nkept = 0, nig[IG_N] = {0}, gtk = 0, g10 = 0, g25 = 0, kgtk = 0, kg10 = 0, kg25 = 0, gb[PHASE_AGREE_BINS] = {0}, kb[PHASE_AGREE_BINS] = {0};
     sl_recs *R = &J->recs[tid]; const double mm = J->gum * 1e-3;
+    long long gci = -1, gck = 0, gca = 0;   /* --gt-cells: the current cell's run (flushed on a change: no atomic per voxel) */
+#define GC_FLUSH() do { if (gci >= 0 && gck) { atomic_fetch_add_explicit(&J->gc_k[gci], gck, memory_order_relaxed); atomic_fetch_add_explicit(&J->gc_a[gci], gca, memory_order_relaxed); } gck = gca = 0; } while (0)
     /* local CT coherence of the label phase: per cell of coh_cell^3 voxels, the correlation of the CT with cos(2 pi phase) over the
        voxels with a phase and CT > 0 (sheets on papyrus, gaps between them: high; a wrap in a gap or a missed sheet: low / negative) */
     const int Cc = J->coh_cell, nc = Cc > 0 ? B / Cc : 0; float *coh = nullptr;
@@ -467,6 +472,7 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
                 sdn++; sda += sa; if (!ig) { ksdn++; ksda += sa; }
                 if (!ig0) { csn[rb]++; csa[rb] += sa; }
             }
+            if (!ig && J->gc_k) { const long long ci = ((long long)(gz / J->gcc) * J->gcn[1] + gy / J->gcc) * J->gcn[2] + gx / J->gcc; if (ci != gci) { GC_FLUSH(); gci = ci; } gck++; gca += d < 0.25; }
             if (!ig) { kgtk++; kg10 += d < 0.1; kg25 += d < 0.25; kb[bin]++;
                        if (J->an_dist && X->lo[i] >= 0) { const int db = an_dbin(J->an_dist[X->cell[X->lo[i]]]); if (db >= 0) { atomic_fetch_add_explicit(&J->dk_gk[db], 1, memory_order_relaxed); atomic_fetch_add_explicit(&J->dk_g25[db], d < 0.25, memory_order_relaxed); } } }
             if (w) { atomic_fetch_add_explicit(&w->gk, 1, memory_order_relaxed); atomic_fetch_add_explicit(&w->g10, d < 0.1, memory_order_relaxed); atomic_fetch_add_explicit(&w->g25, d < 0.25, memory_order_relaxed);
@@ -486,6 +492,8 @@ static int sl_block(sl_job *J, sl_scratch *X, int si, int bk, int tid) {
             }
         }
     }
+    GC_FLUSH();
+#undef GC_FLUSH
     atomic_fetch_add(&J->ncode, ncode); atomic_fetch_add(&J->nconf, nconf); atomic_fetch_add(&J->nknown, nknown); atomic_fetch_add(&J->nkept, nkept);
     for (int k = 0; k < IG_N; k++) atomic_fetch_add(&J->nig[k], nig[k]);
     if (hlast >= 0) atomic_fetch_add(&J->holdn[hlast], hrun);
@@ -676,7 +684,7 @@ int cmd_surf_labels(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: ufsm surf-labels <wraps-dir> <out-dir> --axis F --axis-um U0 --dir +-1 --grid-um U (--shape Z,Y,X | --like ROOT KEY)\n"
                         "       [--wrapcheck TSV] [--first K] [--last K] [--drop w1,w2] [--band-peaks LO,HI] [--ct ROOT KEY [--min-onpap 0.2] [--ct-level 80] [--ct-range 15]]\n"
-                        "       [--exclude holdouts.json --exclude-ct NAME [--exclude-mm 0.5]] [--radius 20] [--block 256] [--shard 512] [--bake 1] [--min-coh T [--coh-cell 32]] [--gt ROOT KEY] [--tsv OUT] [--threads N]\n");
+                        "       [--exclude holdouts.json --exclude-ct NAME [--exclude-mm 0.5]] [--radius 20] [--block 256] [--shard 512] [--bake 1] [--min-coh T [--coh-cell 32]] [--gt ROOT KEY [--gt-cells TSV [--gt-cell 128] [--gt-cell-mm D]]] [--tsv OUT] [--threads N]\n");
         return 2;
     }
     const char *in = argv[2], *out = argv[3];
@@ -723,6 +731,15 @@ int cmd_surf_labels(int argc, char **argv) {
     { const int gi = sl_idx(argc, argv, "--gt"); if (J.an_mode == 1 && gi < 0) { fprintf(stderr, "wrap-anchor: --gt ROOT KEY (the published-segment winding codes on the grid) is the anchor source\n"); return 2; }
       if (gi > 0) { if (gi + 2 >= argc) return 2; J.gt = z3_open(store_open(argv[gi + 1]), argv[gi + 2], nullptr);
         if (!J.gt || memcmp(z3_meta_of(J.gt)->shape, J.shape, sizeof J.shape)) { fprintf(stderr, "surf-labels: --gt %s %s: cannot open or not on the grid\n", argv[gi + 1], argv[gi + 2]); return 1; } } }
+    /* --gt-cells FILE [--gt-cell C]: the GT comparison per cell of C^3 grid voxels (the pseudo-label gate's two-fit agreement, DESIGN 2026-11-17) */
+    const char *gcf = sl_opt(argc, argv, "--gt-cells", nullptr);
+    if (gcf) {
+        J.gcc = opt_atoi("--gt-cell", sl_opt(argc, argv, "--gt-cell", "128"));
+        if (!J.gt || J.gcc < 8) { fprintf(stderr, "surf-labels: --gt-cells needs --gt and --gt-cell >= 8\n"); return 2; }
+        size_t nc = 1; for (int d = 0; d < 3; d++) { J.gcn[d] = (J.shape[d] + J.gcc - 1) / J.gcc; nc *= (size_t)J.gcn[d]; }
+        J.gc_k = calloc(nc, sizeof *J.gc_k); J.gc_a = calloc(nc, sizeof *J.gc_a);
+        if (!J.gc_k || !J.gc_a) { fprintf(stderr, "surf-labels: --gt-cells: no memory for %zu cells\n", nc); return 1; }
+    }
     /* the wraps */
     int nw = 0, cap = 64; sl_wrap *W = calloc(cap, sizeof *W);
     struct stat ist;
@@ -1011,6 +1028,34 @@ int cmd_surf_labels(int argc, char **argv) {
           g.n = k2; pa_score(&g, mmv, 4, 200000, 0x5eed, a, ac, na, nc); free(g.r); }
         printf("surf-labels: pair winding right vs GT (%zu records):", all.n);
         for (int k = 0; k < 4; k++) printf(" %g mm %.4f cross %.4f (%zu / %zu)%s", mmv[k], a[k], ac[k], na[k], nc[k], k < 3 ? " |" : "\n");
+        if (J.gc_k) {   /* --gt-cells: per cell, the kept voxels' phase agreement and the pair winding accuracy of its own records (pairs inside the cell) */
+            const double gmm = J.gum * 1e-3, cmm = J.gcc * gmm, pd = opt_atof("--gt-cell-mm", sl_opt(argc, argv, "--gt-cell-mm", "0")) > 0 ? opt_atof("--gt-cell-mm", sl_opt(argc, argv, "--gt-cell-mm", "0")) : 0.4 * cmm;
+            const size_t ncell = (size_t)J.gcn[0] * J.gcn[1] * J.gcn[2];
+            size_t *cnt = calloc(ncell + 1, sizeof *cnt), *ord = malloc((n ? n : 1) * sizeof *ord); long long *rc = malloc((n ? n : 1) * sizeof *rc);
+            for (size_t k = 0; k < n; k++) {   /* (records are voxels gz * gmm: the cell of round(p / gmm)) */
+                long long c3[3]; for (int d = 0; d < 3; d++) { c3[d] = llround(tmp[k].p[d] / gmm) / J.gcc; if (c3[d] < 0) c3[d] = 0; if (c3[d] >= J.gcn[d]) c3[d] = J.gcn[d] - 1; }
+                rc[k] = (c3[0] * J.gcn[1] + c3[1]) * J.gcn[2] + c3[2]; cnt[rc[k] + 1]++; }
+            for (size_t c = 0; c < ncell; c++) cnt[c + 1] += cnt[c];
+            { size_t *pos = malloc((ncell + 1) * sizeof *pos); memcpy(pos, cnt, (ncell + 1) * sizeof *pos); for (size_t k = 0; k < n; k++) ord[pos[rc[k]]++] = k; free(pos); }
+            FILE *fc = fopen(gcf, "w"); if (!fc) { fprintf(stderr, "surf-labels: cannot write --gt-cells %s\n", gcf); return 1; }
+            fprintf(fc, "z\ty\tx\tn\tcell\tkept_gt_both\tkept_lt25\trecords\tpair_mm\tpair_acc\tpairs\n");
+            pa_buf g = {0}; g.r = malloc(256 * sizeof *g.r); g.cap = 256; g.T = all.T; long long ncw = 0;
+            for (size_t c = 0; c < ncell; c++) {
+                const long long kk = atomic_load(&J.gc_k[c]); const size_t r0 = cnt[c], r1 = cnt[c + 1];
+                if (!kk && r1 == r0) continue;
+                double pa = NAN, pac; size_t np = 0, npc = 0;
+                if (r1 - r0 >= 32) {
+                    if (r1 - r0 > g.cap) { g.cap = r1 - r0; g.r = realloc(g.r, g.cap * sizeof *g.r); }
+                    g.n = 0; for (size_t j = r0; j < r1; j++) g.r[g.n++] = all.r[ord[j]];
+                    pa_score(&g, &pd, 1, 4000, 0x5eed ^ c, &pa, &pac, &np, &npc);
+                }
+                const long long cz = (long long)(c / ((size_t)J.gcn[1] * J.gcn[2])), cy = (long long)(c / J.gcn[2] % J.gcn[1]), cx = (long long)(c % J.gcn[2]);
+                fprintf(fc, "%lld\t%lld\t%lld\t%d\t%lld\t%lld\t%.4f\t%zu\t%.3f\t%.4f\t%zu\n", cz * J.gcc, cy * J.gcc, cx * J.gcc, J.gcc, (long long)c, kk,
+                        kk ? (double)atomic_load(&J.gc_a[c]) / kk : NAN, r1 - r0, pd, pa, np); ncw++;
+            }
+            fclose(fc); free(g.r); free(cnt); free(ord); free(rc);
+            printf("surf-labels: --gt-cells %s: %lld cells of %d^3 grid voxels (pairs at %.3f mm inside each cell)\n", gcf, ncw, J.gcc, pd);
+        }
         if (J.an_dist) {   /* anchors: accuracy against the distance along the surface to the nearest voted cell */
             static const char *dl[5] = {"voted", "0-2.5mm", "2.5-10mm", "10-30mm", "30+mm"};
             printf("surf-labels: anchored accuracy vs distance to the nearest voted cell:\n  dist      gt_both      |d|<.25  pairs 0.5mm 1mm   2mm   4mm\n");
@@ -1067,6 +1112,6 @@ int cmd_surf_labels(int argc, char **argv) {
     if (J.ct) z3_close(J.ct);
     if (J.gt) z3_close(J.gt);
     if (J.ag_r) z3_close(J.ag_r);
-    free(J.holdn); free(J.holdnm);
+    free(J.holdn); free(J.holdnm); free((void *)J.gc_k); free((void *)J.gc_a);
     return hfail;
 }
