@@ -5,6 +5,8 @@
 #include "inkext.h"
 #include "wload.h"
 #include "xnet.h"
+#include "xtsf.h"
+#include "dinovol.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +18,14 @@ const ie_spec ie_specs[IE_NMODELS] = {
     {"hecate96", 16, 64, 9.596, 32, 8},
     {"reader3", 17, 384, 9.596, 192, 8},
     {"ink9um", 17, 128, 9.596, 64, 8},   /* scrollprize/ink_9um: 17 of 21 (9.6 um pooled) / 28 (native 9.362) layers, 128 px, overlap 0.5 */
+    /* ink-sdk profiles (src/ink_sdk/profiles/ink_9um-*.toml): the spacing is each profile's scale_um, the tile its checkpoint's patch_size */
+    {"reader2", 17, 128, 9.596, 64, 8},   /* domenicor046/reader-v2 step 40000 (9.6 um) */
+    {"dense9", 17, 128, 9.362, 64, 8},    /* Nieuwlaar/ink9um-dense-native step 16000 (native 9.362 um; weights/dense_native_016000.safetensors) */
+    {"rectina", 17, 384, 9.362, 192, 8},  /* evilaliv3/rectina m4 ckpt_020000 (9.362 um, 384 px; CC-BY-NC-4.0) */
+    {"trace3b", 17, 128, 9.362, 64, 8},   /* Jashann TRACE v3B_best (9.362 um, tolerance 0.1; CC-BY-NC-SA-4.0) */
+    {"canon2", 62, 256, 2.399, 128, 31},  /* canonical_2um r152_3ddec_v2_l5_epoch13 (Lightning .ckpt state_dict; divide 255, no clip) */
+    {"studio", 16, 128, 9.362, 64, 7},    /* studio-softloss-20261023-ema (CC BY-NC 4.0 weights): 128 px windows, the central 96 written, Hann stride 64 */
+    {"tsf", 26, 64, 7.91, 16, 13},        /* scrollprize TimeSformers (GP / large scroll1, scroll5): 4 x 4 logits per 64 px tile, stride 16, hann */
 };
 int ie_model_kind(const char *name) {
     for (int k = 0; k < IE_NMODELS; k++) if (!strcmp(name, ie_specs[k].name)) return k;
@@ -41,6 +51,13 @@ struct ie_net {
     xconv f1, f2; float *f1g, *f1b, *f2g, *f2b; float *att_w; float att_b;
     xconv rstem; float *rstem_g, *rstem_b; int nst; int nblk[6]; bbd *st[6];
     xconv tconv[5], dconv[5]; float *dg[5], *db[5];
+    /* Studio DeepResidualUNet: widths 48 96 192 384 640, encoder blocks 2 3 4 5 6, decoder blocks 3 3 2 2 */
+    struct srb { xconv c1, c2; float *g1, *b1, *g2, *b2; } *senc[5], *sdec[4];
+    int nenc[5], ndec[4];
+    xconv sdown[4], sup[4], sfuse[4]; float *sdg[4], *sdb[4], *sfg[4], *sfb[4], *shg, *shb; float sdw[16];
+    /* TimeSformer: depth layers of (time attention, space attention, GEGLU feed-forward), each pre-LayerNorm */
+    struct tsl { xconv qkv[2], ao[2], f0, f3; float *lg[3], *lb[3]; } *tl; int tdepth, theads;
+    xconv tpe; float *tcls, *trs[2], *trc[2]; float *thw, *thb, *tow, *tob;   /* final LN + Linear(512, 16) on the host */
 };
 
 static const wl_tensor *need(const wl_dict *W, const char *name) {
@@ -132,35 +149,43 @@ static int load_v8in(ie_net *n, const wl_dict *W) {
     return n->logit_w && !bad ? 0 : -1;
 }
 
+/* Hecate (keys under "canonical.") and canonical_2um (the same RegressionModel at the top level: backbone. decoder. normalization.) */
 static int load_hecate(ie_net *n, const wl_dict *W) {
-    int bad = 0; const char *P = "canonical.";
-    n->in_w = scal(W, "canonical.normalization.weight", &bad); n->in_b = scal(W, "canonical.normalization.bias", &bad);
-    n->in_rm = scal(W, "canonical.normalization.running_mean", &bad); n->in_rv = scal(W, "canonical.normalization.running_var", &bad);
-    n->zscale = scal(W, "depth_coordinate_scale", &bad);
+    int bad = 0; const char *P = n->kind == IE_CANON2 ? "" : "canonical."; char k[200];
+    if (n->kind == IE_CANON2 && !wl_get(W, "normalization.weight")) { n->in_w = 1; n->in_b = 0; n->in_rm = 0; n->in_rv = 1 - 1e-5f; }   /* with_norm False: identity */
+    else {
+        snprintf(k, sizeof k, "%snormalization.weight", P); n->in_w = scal(W, k, &bad); snprintf(k, sizeof k, "%snormalization.bias", P); n->in_b = scal(W, k, &bad);
+        snprintf(k, sizeof k, "%snormalization.running_mean", P); n->in_rm = scal(W, k, &bad); snprintf(k, sizeof k, "%snormalization.running_var", P); n->in_rv = scal(W, k, &bad);
+    }
+    n->zscale = n->kind == IE_CANON2 ? 0.f : scal(W, "depth_coordinate_scale", &bad);
     if (bad) return -1;
-    if (n->kind == IE_HEC24) { if (mkconv(&n->stem, W, "canonical.backbone.conv1.weight", "canonical.backbone.bn1", nullptr, 1, 2, 2, 3, 3, 3)) return -1; n->margin = 1; n->xys = 4; }
-    else { if (mkconv(&n->stem, W, "canonical.backbone.conv1.weight", "canonical.backbone.bn1", nullptr, 1, 1, 1, 1, 1, 1)) return -1; n->margin = 0; n->xys = 1; }
+    char cw[120], cb[120]; snprintf(cw, sizeof cw, "%sbackbone.conv1.weight", P); snprintf(cb, sizeof cb, "%sbackbone.bn1", P);
+    if (n->kind == IE_HEC24 || n->kind == IE_CANON2) { if (mkconv(&n->stem, W, cw, cb, nullptr, 1, 2, 2, 3, 3, 3)) return -1; n->margin = n->kind == IE_HEC24; n->xys = 4; }
+    else { if (mkconv(&n->stem, W, cw, cb, nullptr, 1, 1, 1, 1, 1, 1)) return -1; n->margin = 0; n->xys = 1; }
     static const int nb[4] = {3, 8, 36, 3};
     char pre[64]; snprintf(pre, sizeof pre, "%sbackbone.", P);
+    if (n->kind == IE_CANON2) {   /* the Lightning checkpoint may prefix model. / module. (the loader strips them): refuse anything else than the plain names */
+        snprintf(k, sizeof k, "%slayer3.35.conv3.weight", pre); if (!wl_get(W, k)) { fprintf(stderr, "ink-ext: canon2: no %s (not a ResNet-152 canonical checkpoint)\n", k); return -1; }
+    }
     if (load_resnet(n, W, pre, nb)) return -1;
     static const int dd[4] = {64, 128, 256, 512};
     for (int i = 0; i < 4; i++) {
         char a[120], g[120], b[120];
-        snprintf(a, sizeof a, "canonical.decoder.channel_reduce.%d.0.weight", i); snprintf(g, sizeof g, "canonical.decoder.channel_reduce.%d.1.weight", i); snprintf(b, sizeof b, "canonical.decoder.channel_reduce.%d.1.bias", i);
+        snprintf(a, sizeof a, "%sdecoder.channel_reduce.%d.0.weight", P, i); snprintf(g, sizeof g, "%sdecoder.channel_reduce.%d.1.weight", P, i); snprintf(b, sizeof b, "%sdecoder.channel_reduce.%d.1.bias", P, i);
         if (mkconv(&n->red[i], W, a, nullptr, nullptr, 1, 1, 1, 0, 0, 0) || !(n->red_g[i] = devvec(W, g, dd[i])) || !(n->red_b[i] = devvec(W, b, dd[i]))) return -1;
     }
     for (int j = 0; j < 3; j++) {
         char a[120], b[120]; rcb *R = &n->blk[j]; const int oc = dd[2 - j];
-        snprintf(a, sizeof a, "canonical.decoder.decoder_blocks.%d.conv1.weight", j); if (mkconv(&R->c1, W, a, nullptr, nullptr, 1, 1, 1, 1, 1, 1)) return -1;
-        snprintf(a, sizeof a, "canonical.decoder.decoder_blocks.%d.conv2.weight", j); if (mkconv(&R->c2, W, a, nullptr, nullptr, 1, 1, 1, 1, 1, 1)) return -1;
-        snprintf(a, sizeof a, "canonical.decoder.decoder_blocks.%d.shortcut.weight", j); if (mkconv(&R->sc, W, a, nullptr, nullptr, 1, 1, 1, 0, 0, 0)) return -1;
-        snprintf(a, sizeof a, "canonical.decoder.decoder_blocks.%d.gn1.weight", j); snprintf(b, sizeof b, "canonical.decoder.decoder_blocks.%d.gn1.bias", j);
+        snprintf(a, sizeof a, "%sdecoder.decoder_blocks.%d.conv1.weight", P, j); if (mkconv(&R->c1, W, a, nullptr, nullptr, 1, 1, 1, 1, 1, 1)) return -1;
+        snprintf(a, sizeof a, "%sdecoder.decoder_blocks.%d.conv2.weight", P, j); if (mkconv(&R->c2, W, a, nullptr, nullptr, 1, 1, 1, 1, 1, 1)) return -1;
+        snprintf(a, sizeof a, "%sdecoder.decoder_blocks.%d.shortcut.weight", P, j); if (mkconv(&R->sc, W, a, nullptr, nullptr, 1, 1, 1, 0, 0, 0)) return -1;
+        snprintf(a, sizeof a, "%sdecoder.decoder_blocks.%d.gn1.weight", P, j); snprintf(b, sizeof b, "%sdecoder.decoder_blocks.%d.gn1.bias", P, j);
         if (!(R->g1 = devvec(W, a, oc)) || !(R->b1 = devvec(W, b, oc))) return -1;
-        snprintf(a, sizeof a, "canonical.decoder.decoder_blocks.%d.gn2.weight", j); snprintf(b, sizeof b, "canonical.decoder.decoder_blocks.%d.gn2.bias", j);
+        snprintf(a, sizeof a, "%sdecoder.decoder_blocks.%d.gn2.weight", P, j); snprintf(b, sizeof b, "%sdecoder.decoder_blocks.%d.gn2.bias", P, j);
         if (!(R->g2 = devvec(W, a, oc)) || !(R->b2 = devvec(W, b, oc))) return -1;
     }
-    n->attn_w = devvec(W, "canonical.decoder.depth_collapse.attn_conv.weight", 64); n->attn_b = scal(W, "canonical.decoder.depth_collapse.attn_conv.bias", &bad);
-    n->logit_w = devvec(W, "canonical.decoder.logit.weight", 64); n->logit_b = scal(W, "canonical.decoder.logit.bias", &bad);
+    snprintf(k, sizeof k, "%sdecoder.depth_collapse.attn_conv.weight", P); n->attn_w = devvec(W, k, 64); snprintf(k, sizeof k, "%sdecoder.depth_collapse.attn_conv.bias", P); n->attn_b = scal(W, k, &bad);
+    snprintf(k, sizeof k, "%sdecoder.logit.weight", P); n->logit_w = devvec(W, k, 64); snprintf(k, sizeof k, "%sdecoder.logit.bias", P); n->logit_b = scal(W, k, &bad);
     return n->attn_w && n->logit_w && !bad ? 0 : -1;
 }
 
@@ -220,9 +245,181 @@ static int load_reader(ie_net *n, const wl_dict *W) {
     return bad ? -1 : 0;
 }
 
+static xt upload_tiles(const uint8_t *tiles, int B, int D, int H, int W, uint8_t **dev);
+static void up_prob(const float *h2, int B, int F, int T, int logits, float *out);
+/* ---- Studio (vesuvius-studio-multiscroll-cpt hf/model.py DeepResidualUNet(deeper=False)) ---- */
+static const int st_w[5] = {48, 96, 192, 384, 640}, st_ne[5] = {2, 3, 4, 5, 6}, st_nd[4] = {3, 3, 2, 2};
+static int st_groups(int c) { int a = 32, b = c; while (b) { const int t = a % b; a = b; b = t; } return a; }   /* GroupNorm(gcd(32, c), c) */
+static int load_srb(struct srb *R, const wl_dict *W, const char *p, int c) {
+    char a[160], b[160];
+    snprintf(a, sizeof a, "%s.branch.2.weight", p); if (mkconv(&R->c1, W, a, nullptr, nullptr, 1, 1, 1, 1, 1, 1)) return -1;
+    snprintf(a, sizeof a, "%s.branch.6.weight", p); if (mkconv(&R->c2, W, a, nullptr, nullptr, 1, 1, 1, 1, 1, 1)) return -1;
+    snprintf(a, sizeof a, "%s.branch.0.weight", p); snprintf(b, sizeof b, "%s.branch.0.bias", p); if (!(R->g1 = devvec(W, a, c)) || !(R->b1 = devvec(W, b, c))) return -1;
+    snprintf(a, sizeof a, "%s.branch.3.weight", p); snprintf(b, sizeof b, "%s.branch.3.bias", p); if (!(R->g2 = devvec(W, a, c)) || !(R->b2 = devvec(W, b, c))) return -1;
+    return 0;
+}
+static int load_studio(ie_net *n, const wl_dict *W) {
+    char a[160], b[160];
+    if (mkconv(&n->stem, W, "stem.weight", nullptr, nullptr, 1, 1, 1, 1, 1, 1)) return -1;
+    for (int i = 0; i < 5; i++) {
+        n->nenc[i] = st_ne[i]; n->senc[i] = calloc(st_ne[i], sizeof(struct srb));
+        for (int j = 0; j < st_ne[i]; j++) { snprintf(a, sizeof a, "enc.%d.%d", i, j); if (load_srb(&n->senc[i][j], W, a, st_w[i])) return -1; }
+        snprintf(a, sizeof a, "enc.%d.%d.branch.2.weight", i, st_ne[i]); if (wl_get(W, a)) { fprintf(stderr, "ink-ext: studio: more encoder blocks than DeepResidualUNet(deeper=False)\n"); return -1; }
+    }
+    for (int i = 0; i < 4; i++) {
+        snprintf(a, sizeof a, "down.%d.2.weight", i); if (mkconv(&n->sdown[i], W, a, nullptr, nullptr, i ? 2 : 1, 2, 2, 1, 1, 1)) return -1;
+        snprintf(a, sizeof a, "down.%d.0.weight", i); snprintf(b, sizeof b, "down.%d.0.bias", i); if (!(n->sdg[i] = devvec(W, a, st_w[i])) || !(n->sdb[i] = devvec(W, b, st_w[i]))) return -1;
+        const int c = st_w[3 - i];   /* decoder stage k works at width w[3 - k] */
+        snprintf(a, sizeof a, "up.%d.weight", i); if (mkconv(&n->sup[i], W, a, nullptr, nullptr, 1, 1, 1, 0, 0, 0)) return -1;
+        snprintf(a, sizeof a, "fuse.%d.2.weight", i); if (mkconv(&n->sfuse[i], W, a, nullptr, nullptr, 1, 1, 1, 0, 0, 0)) return -1;
+        snprintf(a, sizeof a, "fuse.%d.0.weight", i); snprintf(b, sizeof b, "fuse.%d.0.bias", i); if (!(n->sfg[i] = devvec(W, a, 2 * c)) || !(n->sfb[i] = devvec(W, b, 2 * c))) return -1;
+        n->ndec[i] = st_nd[i]; n->sdec[i] = calloc(st_nd[i], sizeof(struct srb));
+        for (int j = 0; j < st_nd[i]; j++) { snprintf(a, sizeof a, "dec.%d.%d", i, j); if (load_srb(&n->sdec[i][j], W, a, c)) return -1; }
+    }
+    if (!(n->shg = devvec(W, "head.0.weight", 48)) || !(n->shb = devvec(W, "head.0.bias", 48)) || !(n->logit_w = devvec(W, "head.2.weight", 48))) return -1;
+    int bad = 0; n->logit_b = scal(W, "head.2.bias", &bad);
+    const wl_tensor *dl = need(W, "depth_logits"); if (!dl || dl->numel != 16 || bad) return -1;
+    double mx = -1e300, sm = 0; for (int d = 0; d < 16; d++) mx = fmax(mx, dl->data[d]);
+    for (int d = 0; d < 16; d++) sm += exp(dl->data[d] - mx);
+    for (int d = 0; d < 16; d++) n->sdw[d] = (float)(exp(dl->data[d] - mx) / sm);   /* depth_logits.softmax(0) */
+    return 0;
+}
+static xt srb_fwd(const struct srb *R, xt x) {   /* x + conv(silu(gn(conv(silu(gn(x)))))) */
+    xt h = xt_new(x.n, x.d, x.h, x.w, x.c); xgn(x, st_groups(x.c), R->g1, R->b1, 1e-5f, nullptr, XA_SILU, h);
+    xt h1 = xconv_fwd(&R->c1, h, nullptr, XA_NONE); xt_free(&h);
+    xgn(h1, st_groups(h1.c), R->g2, R->b2, 1e-5f, nullptr, XA_SILU, h1);
+    xt y = xconv_fwd(&R->c2, h1, &x, XA_NONE); xt_free(&h1);
+    return y;
+}
+static void studio_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out) {
+    const int D = n->sp.D, T = n->sp.T;
+    float lo[B], hi[B], a[B], b[B]; for (int i = 0; i < B; i++) { lo[i] = 0; hi[i] = 200; a[i] = 1.f / 255; b[i] = 0; }   /* clamp(0, 200) / 255 */
+    uint8_t *dev; upload_tiles(tiles, B, D, T, T, &dev);
+    xt x0 = xinput_u8(dev, B, D, T, T, lo, hi, a, b); xfree_dev(dev);
+    xt x = xconv_fwd(&n->stem, x0, nullptr, XA_NONE); xt_free(&x0);
+    xt skip[4];
+    for (int i = 0; i < 5; i++) {
+        for (int j = 0; j < n->nenc[i]; j++) { xt y = srb_fwd(&n->senc[i][j], x); xt_free(&x); x = y; }
+        if (i < 4) {
+            skip[i] = x;
+            xt h = xt_new(x.n, x.d, x.h, x.w, x.c); xgn(x, st_groups(x.c), n->sdg[i], n->sdb[i], 1e-5f, nullptr, XA_SILU, h);
+            x = xconv_fwd(&n->sdown[i], h, nullptr, XA_NONE); xt_free(&h);
+        }
+    }
+    for (int k = 0; k < 4; k++) {
+        xt sk = skip[3 - k];
+        /* up(interpolate(x)): the bias-free 1x1 conv commutes with the (linear, per-channel) trilinear resize, so it runs first at the low resolution */
+        xt u = xconv_fwd(&n->sup[k], x, nullptr, XA_NONE); xt_free(&x);
+        xt r = xresize(u, sk.d, sk.h, sk.w); xt_free(&u);
+        xt c = xconcat(r, sk); xt_free(&r); xt_free(&skip[3 - k]);
+        xgn(c, st_groups(c.c), n->sfg[k], n->sfb[k], 1e-5f, nullptr, XA_SILU, c);
+        x = xconv_fwd(&n->sfuse[k], c, nullptr, XA_NONE); xt_free(&c);
+        for (int j = 0; j < n->ndec[k]; j++) { xt y = srb_fwd(&n->sdec[k][j], x); xt_free(&x); x = y; }
+    }
+    xgn(x, st_groups(x.c), n->shg, n->shb, 1e-5f, nullptr, XA_SILU, x);
+    const size_t TT = (size_t)T * T; float *lg = xmalloc_dev((size_t)B * D * TT * 4);
+    xhead(x, n->logit_w, n->logit_b, lg); xt_free(&x);
+    float *h3 = malloc((size_t)B * D * TT * 4); xd2h(h3, lg, (size_t)B * D * TT * 4); xfree_dev(lg);
+    for (int i = 0; i < B; i++) for (size_t p = 0; p < TT; p++) {   /* (head(x) * softmax(depth_logits)).sum(depth) */
+        double s = 0; for (int d = 0; d < D; d++) s += (double)n->sdw[d] * h3[((size_t)i * D + d) * TT + p];
+        out[(size_t)i * TT + p] = (float)s;
+    }
+    free(h3);
+}
+
+/* ---- TimeSformer (lucidrains TimeSformer-pytorch 0.4.1, dim 512, 26 frames of 64 px, 16 px patches, rotary, num_classes 16) ---- */
+static int lin(xconv *c, const wl_dict *W, const char *wname, const char *bname) {   /* nn.Linear as a 1x1x1 conv over the token rows */
+    const wl_tensor *w = need(W, wname); if (!w || w->ndim != 2) return -1;
+    const float *b = nullptr; if (bname) { const wl_tensor *t = need(W, bname); if (!t) return -1; b = t->data; }
+    return xconv_init(c, w->data, (int)w->shape[0], (int)w->shape[1], 1, 1, 1, 1, 1, 1, 0, 0, 0, nullptr, b);
+}
+static float *hostvec(const wl_dict *W, const char *name, int n) {
+    const wl_tensor *t = need(W, name); if (!t || t->numel != n) return nullptr;
+    float *v = malloc((size_t)n * sizeof *v); memcpy(v, t->data, (size_t)n * sizeof *v); return v;
+}
+static int load_tsf(ie_net *n, const wl_dict *W) {
+    char P[64] = "", a[200], b[200];   /* key prefix: "backbone." (safetensors) or "model.backbone." (Lightning) */
+    for (int i = 0; i < wl_count(W); i++) { const char *k = wl_at(W, i)->name; const char *e = strstr(k, "cls_token"); if (e && !e[9] && e - k < 60) { memcpy(P, k, (size_t)(e - k)); P[e - k] = 0; break; } }
+    snprintf(a, sizeof a, "%scls_token", P); const wl_tensor *cls = wl_get(W, a);
+    if (!cls || cls->numel != 512) { fprintf(stderr, "ink-ext: tsf: no 512-wide cls_token\n"); return -1; }
+    n->tcls = xdev_floats(cls->data, 512);
+    snprintf(a, sizeof a, "%sto_patch_embedding.weight", P); snprintf(b, sizeof b, "%sto_patch_embedding.bias", P); if (lin(&n->tpe, W, a, b)) return -1;
+    if (n->tpe.ci != 256) { fprintf(stderr, "ink-ext: tsf: patch dim %d, expected 256 (16 x 16 x 1)\n", n->tpe.ci); return -1; }
+    n->tdepth = 0; for (;; n->tdepth++) { snprintf(a, sizeof a, "%slayers.%d.0.fn.to_qkv.weight", P, n->tdepth); if (!wl_get(W, a)) break; }
+    snprintf(a, sizeof a, "%slayers.0.0.fn.to_qkv.weight", P); const wl_tensor *q = wl_get(W, a);
+    if (!n->tdepth || !q || q->shape[0] % (3 * 64)) { fprintf(stderr, "ink-ext: tsf: no attention layers (dim_head 64)\n"); return -1; }
+    n->theads = (int)(q->shape[0] / (3 * 64));
+    n->tl = calloc((size_t)n->tdepth, sizeof *n->tl);
+    for (int L = 0; L < n->tdepth; L++) {
+        struct tsl *T = &n->tl[L];
+        for (int k = 0; k < 2; k++) {
+            snprintf(a, sizeof a, "%slayers.%d.%d.fn.to_qkv.weight", P, L, k); if (lin(&T->qkv[k], W, a, nullptr)) return -1;
+            snprintf(a, sizeof a, "%slayers.%d.%d.fn.to_out.0.weight", P, L, k); snprintf(b, sizeof b, "%slayers.%d.%d.fn.to_out.0.bias", P, L, k); if (lin(&T->ao[k], W, a, b)) return -1;
+        }
+        snprintf(a, sizeof a, "%slayers.%d.2.fn.net.0.weight", P, L); snprintf(b, sizeof b, "%slayers.%d.2.fn.net.0.bias", P, L); if (lin(&T->f0, W, a, b)) return -1;
+        snprintf(a, sizeof a, "%slayers.%d.2.fn.net.3.weight", P, L); snprintf(b, sizeof b, "%slayers.%d.2.fn.net.3.bias", P, L); if (lin(&T->f3, W, a, b)) return -1;
+        for (int k = 0; k < 3; k++) {
+            snprintf(a, sizeof a, "%slayers.%d.%d.norm.weight", P, L, k); snprintf(b, sizeof b, "%slayers.%d.%d.norm.bias", P, L, k);
+            if (!(T->lg[k] = devvec(W, a, 512)) || !(T->lb[k] = devvec(W, b, 512))) return -1;
+        }
+    }
+    snprintf(a, sizeof a, "%sto_out.0.weight", P); n->thw = hostvec(W, a, 512); snprintf(a, sizeof a, "%sto_out.0.bias", P); n->thb = hostvec(W, a, 512);
+    snprintf(a, sizeof a, "%sto_out.1.weight", P); n->tow = hostvec(W, a, 16 * 512); snprintf(a, sizeof a, "%sto_out.1.bias", P); n->tob = hostvec(W, a, 16);
+    if (!n->thw || !n->thb || !n->tow || !n->tob) return -1;
+    /* rotary tables from the checkpoint's buffers: frames (RotaryEmbedding: t inv_freqs[j mod 32], the halves concatenated) and the 4 x 4
+       patch grid (AxialRotaryEmbedding: linspace(-1, 1) x scales x pi for h then w, each value repeated twice) */
+    snprintf(a, sizeof a, "%sframe_rot_emb.inv_freqs", P); const wl_tensor *iv = wl_get(W, a);
+    snprintf(a, sizeof a, "%simage_rot_emb.scales", P); const wl_tensor *scl = wl_get(W, a);
+    if (!iv || iv->numel != 32 || !scl || scl->numel != 16) { fprintf(stderr, "ink-ext: tsf: rotary buffers missing\n"); return -1; }
+    float ts[26 * 64], tc[26 * 64], is[16 * 64], ic[16 * 64];
+    for (int t = 0; t < 26; t++) for (int j = 0; j < 64; j++) { const float fr = (float)t * iv->data[j % 32]; ts[t * 64 + j] = sinf(fr); tc[t * 64 + j] = cosf(fr); }
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) for (int k = 0; k < 64; k++) {
+        const int e = k / 2; const float hs = -1.f + 2.f * i / 3, ws = -1.f + 2.f * j / 3;
+        const float v = e < 16 ? hs * scl->data[e] * (float)M_PI : ws * scl->data[e - 16] * (float)M_PI;
+        is[(i * 4 + j) * 64 + k] = sinf(v); ic[(i * 4 + j) * 64 + k] = cosf(v);
+    }
+    n->trs[0] = xdev_floats(is, 16 * 64); n->trc[0] = xdev_floats(ic, 16 * 64); n->trs[1] = xdev_floats(ts, 26 * 64); n->trc[1] = xdev_floats(tc, 26 * 64);
+    return 0;
+}
+static void tsf_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out, int logits) {
+    const int F = 26, S = 64, NP = 16, N = 1 + F * NP, C = 512, I = n->theads * 64;
+    uint8_t *dev; upload_tiles(tiles, B, F, S, S, &dev);
+    xt pin = xtsf_patches(dev, B, F, S, 16, 200.f, 200.f); xfree_dev(dev);   /* clip(0, 200) / 200 */
+    xt emb = xconv_fwd(&n->tpe, pin, nullptr, XA_NONE); xt_free(&pin);
+    float *x = xmalloc_dev((size_t)B * N * C * 4); xtsf_tokens(emb, n->tcls, x); xt_free(&emb);
+    const long long M = (long long)B * N;
+    for (int L = 0; L < n->tdepth; L++) {
+        const struct tsl *T = &n->tl[L];
+        for (int k = 0; k < 2; k++) {   /* time (k 0, frame rotary), then space (patch rotary) */
+            xt ln = xt_new(B, 1, 1, N, C); dv_layernorm32(x, T->lg[k], T->lb[k], 1e-5f, ln.p, M, C);
+            xt qkv = xconv_fwd(&T->qkv[k], ln, nullptr, XA_NONE); xt_free(&ln);
+            xt ao = xt_new(B, 1, 1, N, I); xtsf_attn(qkv, ao, n->theads, F, NP, k == 0, n->trs[k == 0], n->trc[k == 0]); xt_free(&qkv);
+            xt y = xconv_fwd(&T->ao[k], ao, nullptr, XA_NONE); xt_free(&ao);
+            dv_add_half(x, y.p, M * C); xt_free(&y);
+        }
+        xt ln = xt_new(B, 1, 1, N, C); dv_layernorm32(x, T->lg[2], T->lb[2], 1e-5f, ln.p, M, C);
+        xt h = xconv_fwd(&T->f0, ln, nullptr, XA_NONE); xt_free(&ln);
+        xt g = xtsf_geglu(h); xt_free(&h);
+        xt y = xconv_fwd(&T->f3, g, nullptr, XA_NONE); xt_free(&g);
+        dv_add_half(x, y.p, M * C); xt_free(&y);
+    }
+    float *hx = malloc((size_t)B * N * C * 4); xd2h(hx, x, (size_t)B * N * C * 4); xfree_dev(x);   /* (only the cls rows are needed) */
+    float *lg = malloc((size_t)B * 16 * sizeof *lg);
+    for (int b = 0; b < B; b++) {   /* to_out: LayerNorm(512) + Linear(512, 16) of the cls token -> 4 x 4 logits */
+        const float *c = hx + (size_t)b * N * C; double m = 0, v = 0; for (int i = 0; i < C; i++) m += c[i];
+        m /= C; for (int i = 0; i < C; i++) v += (c[i] - m) * (c[i] - m);
+        const double r = 1 / sqrt(v / C + 1e-5); double z[512];
+        for (int i = 0; i < C; i++) z[i] = (c[i] - m) * r * n->thw[i] + n->thb[i];
+        for (int o = 0; o < 16; o++) { double s = n->tob[o]; for (int i = 0; i < C; i++) s += z[i] * n->tow[(size_t)o * C + i]; lg[b * 16 + o] = (float)s; }
+    }
+    free(hx);
+    up_prob(lg, B, 4, S, logits, out);
+    free(lg);
+}
+
 ie_net *ie_load(int kind, const char *weights) {
     if (kind < 0 || kind >= IE_NMODELS) return nullptr;
-    const char *sub = kind == IE_HEC24 || kind == IE_HEC96 ? "ema_model" : ie_is_koine(kind) ? "model" : nullptr;
+    const char *sub = kind == IE_HEC24 || kind == IE_HEC96 ? "ema_model" : ie_is_koine(kind) ? "model" : kind == IE_CANON2 || kind == IE_TSF ? "state_dict" : nullptr;
     wl_dict *W = nullptr;
     if (ie_is_koine(kind)) W = wl_load(weights, "ema_model");   /* koine infer.py prefers the EMA weights when a checkpoint has them */
     if (!W) W = wl_load(weights, sub);
@@ -231,6 +428,9 @@ ie_net *ie_load(int kind, const char *weights) {
     int rc; xnet_wseq_reset();   /* conv indices per net (UFSM_XNET_MX_SKIP) */
     if (kind == IE_V8IN) rc = load_v8in(n, W);
     else if (ie_is_koine(kind)) rc = load_reader(n, W);
+    else if (kind == IE_CANON2) rc = load_hecate(n, W);
+    else if (kind == IE_STUDIO) rc = load_studio(n, W);
+    else if (kind == IE_TSF) rc = load_tsf(n, W);
     else {
         const double um = wl_num(W, "sampling_um", 0);
         if (um > 0 && fabs(um - (kind == IE_HEC24 ? 2.4 : 9.6)) > 0.05) { fprintf(stderr, "ink-ext: %s is a %.1f um Hecate checkpoint\n", weights, um); rc = -1; }
@@ -246,9 +446,11 @@ void ie_free(ie_net *n) { if (n) free(n); }   /* device memory stays in the xnet
 size_t ie_tile_bytes_gpu(int kind) {
     switch (kind) {
     case IE_V8IN: return (size_t)700 << 20;
-    case IE_HEC24: return (size_t)700 << 20;
+    case IE_HEC24: case IE_CANON2: return (size_t)700 << 20;
+    case IE_STUDIO: return (size_t)400 << 20;
+    case IE_TSF: return (size_t)24 << 20;
     case IE_HEC96: return (size_t)40 << 20;
-    case IE_INK9UM: return (size_t)56 << 20;
+    case IE_INK9UM: case IE_READER2: case IE_DENSE9: case IE_TRACE3B: return (size_t)56 << 20;
     default: return (size_t)450 << 20;
     }
 }
@@ -334,12 +536,32 @@ static xt rcb_fwd(const rcb *R, xt x) {
     xgn(h2, R->c2.co >= 32 ? 32 : R->c2.co, R->g2, R->b2, 1e-5f, &id, XA_RELU, h2); xt_free(&id);
     return h2;
 }
+/* B maps of F x F logits -> T x T: sigmoid, bilinear (align_corners False), the logit of the clamped probability (logits) or it */
+static void up_prob(const float *h2, int B, int F, int T, int logits, float *out) {
+    const float eps = 1.1920929e-07f;
+    for (int i = 0; i < B; i++) {
+        const float *g = h2 + (size_t)i * F * F; float *o = out + (size_t)i * T * T;
+        for (int y = 0; y < T; y++) {
+            float sy = F == T ? (float)y : ((float)F / T) * (y + 0.5f) - 0.5f; if (sy < 0) sy = 0;
+            const int y0 = (int)sy, y1 = y0 < F - 1 ? y0 + 1 : y0; const float ly = sy - y0;
+            for (int xx = 0; xx < T; xx++) {
+                float sx = F == T ? (float)xx : ((float)F / T) * (xx + 0.5f) - 0.5f; if (sx < 0) sx = 0;
+                const int x0 = (int)sx, x1 = x0 < F - 1 ? x0 + 1 : x0; const float lx = sx - x0;
+                const float p00 = 1 / (1 + expf(-g[y0 * F + x0])), p01 = 1 / (1 + expf(-g[y0 * F + x1])), p10 = 1 / (1 + expf(-g[y1 * F + x0])), p11 = 1 / (1 + expf(-g[y1 * F + x1]));
+                float p = (1 - ly) * ((1 - lx) * p00 + lx * p01) + ly * ((1 - lx) * p10 + lx * p11);
+                if (logits) { p = p < eps ? eps : p > 1 - eps ? 1 - eps : p; p = logf(p / (1 - p)); }
+                o[(size_t)y * T + xx] = p;
+            }
+        }
+    }
+}
 /* out: logits on the T x T grid (logit of the bilinearly upsampled probability) or probabilities */
 static void hecate_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out, int logits) {
     const int D = n->sp.D, T = n->sp.T, mg = n->margin, Dn = D - 2 * mg, s = n->xys, F = T / s; const size_t per = (size_t)D * T * T;
     /* the columns with data (raw.any over the full depth) at feature resolution (max-pooled over s x s) */
     uint8_t *sup = calloc((size_t)B * F * F, 1), *full = calloc((size_t)B * T * T, 1);
-    for (int i = 0; i < B; i++) for (int d = 0; d < D; d++) for (int y = 0; y < T; y++) for (int x = 0; x < T; x++)
+    if (n->kind == IE_CANON2) memset(sup, 1, (size_t)B * F * F);   /* canonical: the plain softmax over depth, no support mask */
+    else for (int i = 0; i < B; i++) for (int d = 0; d < D; d++) for (int y = 0; y < T; y++) for (int x = 0; x < T; x++)
         if (tiles[i * per + ((size_t)d * T + y) * T + x]) { full[((size_t)i * T + y) * T + x] = 1; sup[((size_t)i * F + y / s) * F + x / s] = 1; }
     uint8_t *crop = malloc((size_t)B * Dn * T * T);
     for (int i = 0; i < B; i++) memcpy(crop + (size_t)i * Dn * T * T, tiles + i * per + (size_t)mg * T * T, (size_t)Dn * T * T);
@@ -348,7 +570,7 @@ static void hecate_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out,
     uint8_t *dev; upload_tiles(crop, B, Dn, T, T, &dev); free(crop);
     xt x0 = xinput_u8(dev, B, Dn, T, T, lo, hi, a, b); xfree_dev(dev);
     xt st = xconv_fwd(&n->stem, x0, nullptr, XA_RELU); xt_free(&x0);
-    if (n->kind == IE_HEC24) { xt p = xmaxpool2d_k3s2(st); xt_free(&st); st = p; }
+    if (n->kind == IE_HEC24 || n->kind == IE_CANON2) { xt p = xmaxpool2d_k3s2(st); xt_free(&st); st = p; }
     xt f[4]; resnet_fwd(n, st, f);
     xt r4[4];
     for (int i = 0; i < 4; i++) {
@@ -368,23 +590,7 @@ static void hecate_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out,
     xhecate_collapse(sc, lg, sd, B, (int)(nv / ((size_t)B * F * F)), F, F, n->zscale, o2);
     float *h2 = malloc((size_t)B * F * F * 4); xd2h(h2, o2, (size_t)B * F * F * 4);
     xfree_dev(sc); xfree_dev(lg); xfree_dev(o2); xfree_dev(sd);
-    /* sigmoid, bilinear (align_corners False) F -> T, logit of the clamped probability */
-    const float eps = 1.1920929e-07f;
-    for (int i = 0; i < B; i++) {
-        const float *g = h2 + (size_t)i * F * F; float *o = out + (size_t)i * T * T;
-        for (int y = 0; y < T; y++) {
-            float sy = F == T ? (float)y : ((float)F / T) * (y + 0.5f) - 0.5f; if (sy < 0) sy = 0;
-            const int y0 = (int)sy, y1 = y0 < F - 1 ? y0 + 1 : y0; const float ly = sy - y0;
-            for (int xx = 0; xx < T; xx++) {
-                float sx = F == T ? (float)xx : ((float)F / T) * (xx + 0.5f) - 0.5f; if (sx < 0) sx = 0;
-                const int x0 = (int)sx, x1 = x0 < F - 1 ? x0 + 1 : x0; const float lx = sx - x0;
-                const float p00 = 1 / (1 + expf(-g[y0 * F + x0])), p01 = 1 / (1 + expf(-g[y0 * F + x1])), p10 = 1 / (1 + expf(-g[y1 * F + x0])), p11 = 1 / (1 + expf(-g[y1 * F + x1]));
-                float p = (1 - ly) * ((1 - lx) * p00 + lx * p01) + ly * ((1 - lx) * p10 + lx * p11);
-                if (logits) { p = p < eps ? eps : p > 1 - eps ? 1 - eps : p; p = logf(p / (1 - p)); }
-                o[(size_t)y * T + xx] = p;
-            }
-        }
-    }
+    up_prob(h2, B, F, T, logits, out);
     free(h2); free(sup); free(full);
 }
 
@@ -439,9 +645,11 @@ int ie_forward(ie_net *n, const uint8_t *tiles, int B, float *out, int logits) {
     const size_t TT = (size_t)n->sp.T * n->sp.T;
     if (n->kind == IE_V8IN) v8in_fwd(n, tiles, B, out);
     else if (ie_is_koine(n->kind)) reader_fwd(n, tiles, B, out);
+    else if (n->kind == IE_STUDIO) studio_fwd(n, tiles, B, out);
+    else if (n->kind == IE_TSF) tsf_fwd(n, tiles, B, out, logits);
     else hecate_fwd(n, tiles, B, out, logits);
     if (xnet_check("forward")) return -1;
-    if (!logits && (n->kind == IE_V8IN || ie_is_koine(n->kind))) for (size_t i = 0; i < (size_t)B * TT; i++) out[i] = 1.f / (1.f + expf(-out[i]));
+    if (!logits && (n->kind == IE_V8IN || ie_is_koine(n->kind) || n->kind == IE_STUDIO)) for (size_t i = 0; i < (size_t)B * TT; i++) out[i] = 1.f / (1.f + expf(-out[i]));
     return 0;
 }
 

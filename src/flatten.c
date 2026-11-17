@@ -81,6 +81,8 @@ static void wa_sort(wa *v, size_t n) {
     if (src != v) memcpy(v, src, n * sizeof *v);
     free(t); free(cnt);
 }
+typedef struct { wa *v; size_t n; } wa_job;
+static void *wa_sort_job(void *p) { wa_job *j = p; wa_sort(j->v, j->n); return nullptr; }
 static double wquant(wa *v, size_t n, double tot, double q) { double c = 0; for (size_t i = 0; i < n; i++) { c += v[i].w; if (c >= q * tot) return v[i].a; } return n ? v[n - 1].a : 0; }
 void flat_stats_of(const double *P, const int *tri, long long nt, const double *uv, flat_stats *s) {
     memset(s, 0, sizeof *s);
@@ -101,7 +103,10 @@ void flat_stats_of(const double *P, const int *tri, long long nt, const double *
     }
     if (A > 0) {
         s->energy = E / A; s->aniso12 = a12 / A; s->stretch12 = s12 / A; s->area_ratio = Auv / A;
-        wa_sort(an, n); wa_sort(mx, n); wa_sort(mn, n);
+        /* the three sorts at once (independent: 0332 w107's 5 stats x 3 sorts of 6 M were ~12 % of the flatten) */
+        wa_job jb[3] = {{an, n}, {mx, n}, {mn, n}}; pthread_t th[2]; int ok[2];
+        for (int k = 0; k < 2; k++) ok[k] = n > 100000 && pthread_create(&th[k], nullptr, wa_sort_job, &jb[k + 1]) == 0;
+        wa_sort(an, n); for (int k = 0; k < 2; k++) { if (ok[k]) pthread_join(th[k], nullptr); else wa_sort(jb[k + 1].v, n); }
         double An = 0; for (size_t i = 0; i < n; i++) An += an[i].w;
         s->aniso_p50 = wquant(an, n, An, 0.5); s->aniso_p95 = wquant(an, n, An, 0.95); s->aniso_p99 = wquant(an, n, An, 0.99);
         s->smax_p95 = wquant(mx, n, An, 0.95); s->smin_p05 = wquant(mn, n, An, 0.05);
@@ -358,6 +363,7 @@ static int build_level(const float *X, const float *Y, const float *Z, int w, in
 }
 void flat_mesh_free(flat_mesh *m) { free(m->gi); free(m->P); free(m->uv); free(m->uv0); free(m->tri); memset(m, 0, sizeof *m); }
 
+static int cmp_int(const void *a, const void *b) { const int x = *(const int *)a, y = *(const int *)b; return (x > y) - (x < y); }
 static long count_flips(const flat_mesh *m, const double *uv, uint8_t *bad) {   /* triangles with det <= 1e-3 of the grid map's; bad[v] marked */
     long nb = 0;
     for (int t = 0; t < m->nt; t++) {
@@ -409,19 +415,59 @@ static void prolongate(const level *C, level *F, const flat_opts *o) {
     for (size_t i = 0; i < n2; i++) m->uv[i] = m->uv0[i] + dl[i];
     long nb = count_flips(m, m->uv, bad), nb0 = nb, nbest = nb; int rounds = 0;
     double *dbest = nb ? malloc(n2 * 8) : nullptr; if (dbest) memcpy(dbest, dl, n2 * 8);   /* the state with the fewest bad triangles */
-    for (; nb && rounds < 200; rounds++) {   /* relax the vertices of bad triangles (and grow the set) */
-        memset(acc, 0, n2 * 8); memset(nn, 0, (size_t)m->nv * 4);
-        for (int t = 0; t < m->nt; t++) { const int *v = m->tri + 3 * t; for (int a = 0; a < 3; a++) if (bad[v[a]]) for (int b = 0; b < 3; b++) if (a != b) { acc[2 * v[a]] += dl[2 * v[b]]; acc[2 * v[a] + 1] += dl[2 * v[b] + 1]; nn[v[a]]++; } }
-        for (int v = 0; v < m->nv; v++) if (bad[v] && nn[v]) { dl[2 * v] = acc[2 * v] / nn[v]; dl[2 * v + 1] = acc[2 * v + 1] / nn[v]; }
-        for (size_t i = 0; i < n2; i++) m->uv[i] = m->uv0[i] + dl[i];
-        nb = count_flips(m, m->uv, bad);   /* (the relaxed set only grows: bad marks are kept) */
-        if (dbest && nb < nbest) { nbest = nb; memcpy(dbest, dl, n2 * 8); }
-        if (nb && rounds % 10 == 9) {   /* stuck: grow the relaxed region by one ring */
-            uint8_t *g = calloc((size_t)m->nv, 1);
-            for (int t = 0; t < m->nt; t++) { const int *v = m->tri + 3 * t; if (bad[v[0]] || bad[v[1]] || bad[v[2]]) g[v[0]] = g[v[1]] = g[v[2]] = 1; }
-            memcpy(bad, g, (size_t)m->nv); free(g);
-        }
+    /* relax the vertices of bad triangles (and grow the set). Only the active triangles (those with a relaxed vertex) are visited, in
+       index order: every other triangle keeps its grid-map-start state, unflipped (a flipped one has its vertices marked), so the sums,
+       counts and marks are the full sweeps' bit for bit (0332 w107: every level ran 200 rounds over the whole 6.3 M-triangle mesh, 42 %
+       of the flatten) */
+    int *vo = nullptr, *vl = nullptr, *act = nullptr, *bl = nullptr; uint8_t *ta = nullptr; size_t na = 0, nbl = 0;
+    if (nb) {
+        vo = calloc((size_t)m->nv + 1, sizeof(int)); vl = malloc((size_t)m->nt * 3 * sizeof(int)); act = malloc((size_t)m->nt * sizeof(int));
+        bl = malloc((size_t)m->nv * sizeof(int)); ta = calloc((size_t)m->nt, 1);
+        if (!vo || !vl || !act || !bl || !ta) { free(vo); free(vl); free(act); free(bl); free(ta); vo = vl = act = bl = nullptr; ta = nullptr; }
     }
+    if (vo) {   /* vertex -> triangles (ascending), the relaxed vertices, the active triangles */
+        for (int t = 0; t < m->nt; t++) for (int k = 0; k < 3; k++) vo[m->tri[3 * t + k] + 1]++;
+        for (int v = 0; v < m->nv; v++) vo[v + 1] += vo[v];
+        int *cur = malloc((size_t)m->nv * sizeof(int)); memcpy(cur, vo, (size_t)m->nv * sizeof(int));
+        for (int t = 0; t < m->nt; t++) for (int k = 0; k < 3; k++) vl[cur[m->tri[3 * t + k]]++] = t;
+        free(cur);
+    }
+#define PL_ADDV(v_) do { bl[nbl++] = (v_); for (int q_ = vo[v_]; q_ < vo[(v_) + 1]; q_++) if (!ta[vl[q_]]) { ta[vl[q_]] = 1; act[na++] = vl[q_]; } } while (0)
+    if (vo) { for (int v = 0; v < m->nv; v++) if (bad[v]) PL_ADDV(v); qsort(act, na, sizeof(int), cmp_int); }
+    for (; nb && rounds < 200; rounds++) {
+        if (!vo) {   /* (allocation failed: the full sweeps) */
+            memset(acc, 0, n2 * 8); memset(nn, 0, (size_t)m->nv * 4);
+            for (int t = 0; t < m->nt; t++) { const int *v = m->tri + 3 * t; for (int a = 0; a < 3; a++) if (bad[v[a]]) for (int b = 0; b < 3; b++) if (a != b) { acc[2 * v[a]] += dl[2 * v[b]]; acc[2 * v[a] + 1] += dl[2 * v[b] + 1]; nn[v[a]]++; } }
+            for (int v = 0; v < m->nv; v++) if (bad[v] && nn[v]) { dl[2 * v] = acc[2 * v] / nn[v]; dl[2 * v + 1] = acc[2 * v + 1] / nn[v]; }
+            for (size_t i = 0; i < n2; i++) m->uv[i] = m->uv0[i] + dl[i];
+            nb = count_flips(m, m->uv, bad);   /* (the relaxed set only grows: bad marks are kept) */
+            if (dbest && nb < nbest) { nbest = nb; memcpy(dbest, dl, n2 * 8); }
+            if (nb && rounds % 10 == 9) {   /* stuck: grow the relaxed region by one ring */
+                uint8_t *g = calloc((size_t)m->nv, 1);
+                for (int t = 0; t < m->nt; t++) { const int *v = m->tri + 3 * t; if (bad[v[0]] || bad[v[1]] || bad[v[2]]) g[v[0]] = g[v[1]] = g[v[2]] = 1; }
+                memcpy(bad, g, (size_t)m->nv); free(g);
+            }
+            continue;
+        }
+        for (size_t q = 0; q < nbl; q++) { const int v = bl[q]; acc[2 * v] = acc[2 * v + 1] = 0; nn[v] = 0; }
+        for (size_t q = 0; q < na; q++) { const int *v = m->tri + 3 * act[q]; for (int a = 0; a < 3; a++) if (bad[v[a]]) for (int b = 0; b < 3; b++) if (a != b) { acc[2 * v[a]] += dl[2 * v[b]]; acc[2 * v[a] + 1] += dl[2 * v[b] + 1]; nn[v[a]]++; } }
+        for (size_t q = 0; q < nbl; q++) { const int v = bl[q]; if (nn[v]) { dl[2 * v] = acc[2 * v] / nn[v]; dl[2 * v + 1] = acc[2 * v + 1] / nn[v]; }
+                                           m->uv[2 * v] = m->uv0[2 * v] + dl[2 * v]; m->uv[2 * v + 1] = m->uv0[2 * v + 1] + dl[2 * v + 1]; }
+        nb = 0; const size_t na0 = na;   /* count_flips over the active triangles; newly marked vertices activate theirs */
+        for (size_t q = 0; q < na0; q++) {
+            const int *v = m->tri + 3 * act[q]; const double *uv = m->uv, *a = uv + 2 * v[0], *b = uv + 2 * v[1], *c = uv + 2 * v[2];
+            const double *a0 = m->uv0 + 2 * v[0], *b0 = m->uv0 + 2 * v[1], *c0 = m->uv0 + 2 * v[2];
+            const double d = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]), d0 = (b0[0] - a0[0]) * (c0[1] - a0[1]) - (b0[1] - a0[1]) * (c0[0] - a0[0]);
+            if (!(d > 1e-3 * d0)) { nb++; for (int k = 0; k < 3; k++) if (!bad[v[k]]) { bad[v[k]] = 1; PL_ADDV(v[k]); } }
+        }
+        if (dbest && nb < nbest) { nbest = nb; for (size_t q = 0; q < nbl; q++) { const int v = bl[q]; dbest[2 * v] = dl[2 * v]; dbest[2 * v + 1] = dl[2 * v + 1]; } }
+        if (nb && rounds % 10 == 9) {   /* stuck: grow the relaxed region by one ring (every vertex of an active triangle) */
+            const size_t nact = na; for (size_t q = 0; q < nact; q++) { const int *v = m->tri + 3 * act[q]; for (int k = 0; k < 3; k++) if (!bad[v[k]]) { bad[v[k]] = 1; PL_ADDV(v[k]); } }
+        }
+        if (na != na0) qsort(act, na, sizeof(int), cmp_int);
+    }
+#undef PL_ADDV
+    free(vo); free(vl); free(act); free(bl); free(ta);
     if (nb && dbest && nb > 2 * nbest) {   /* relaxing spread the folds (P4 core chunks: 293 bad -> 4134 after 200 rounds, 3% of the mesh dropped and
                                           left as flaps): back to the state with the fewest, so only those triangles are dropped */
         memcpy(dl, dbest, n2 * 8); for (size_t i = 0; i < n2; i++) m->uv[i] = m->uv0[i] + dl[i]; nb = nbest;

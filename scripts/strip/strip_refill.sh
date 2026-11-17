@@ -28,14 +28,18 @@ S=($(ls $OUT/strip/flat/stripes))
 # INKGATE="ROOT1 ROOT2" (key INKK; the latent ink head's c12 / c13 = p_recto / p_verso, papyrus only, never supervised in air): every
 # stripe's ink render x max(p1, p2) / 255 (air -> 0; inkB's GATE=1), marked <s>.gated; only when both stores exist
 GATED=0; if [ -n "${INKGATE:-}" ]; then GATED=1; for gr in $INKGATE; do [ -e $gr/zarr.json ] || GATED=0; done; fi
+# the stripes rendered here take the gates in the same render pass (render --gate: the gate volumes at the ink's points, the same fill and
+# inpaint; byte for byte the three renders + img-gate below, test_render_gate; 2026-11-17); gate() is left for the driver's renders
+GX=(); if [ $GATED = 1 ]; then for gr in $INKGATE; do GX+=(--gate $gr $INKK); done; fi
 gate() {   # gate S: the ink render R/S.tif (its stripe linked in R/in_S) x max(gates)
   local s=$1 gi=0 gr; [ $GATED = 1 ] || return 0; [ -e $R/$s.gated ] && return 0
   local own=0; [ -d $R/in_$s ] || { own=1; mkdir -p $R/in_$s; ln -sfn $OUT/strip/flat/stripes/$s $R/in_$s/$s; }
   for gr in $INKGATE; do gi=$((gi + 1)); mkdir -p $R/gate$gi
     UFSM_RENDER_MEM=16 nice -n 10 $U render $R/in_$s $R/gate$gi --volume $gr $INKK --ct $CTR $CTK --depth 1 --scale 1 --threads $RENDER_NT $FILLX > $OUT/logs/refill_${s}_gate$gi.log 2>&1 || { log "gate render $s $gi FAILED"; return 1; }
     rm -f $R/gate$gi/${s}_ct.tif $R/gate$gi/${s}_fill.tif; done
-  python3 -I -c "import sys, os, numpy as np, tifffile as t; r, s = sys.argv[1:3]; i = t.imread(f'{r}/{s}.tif'); p = np.maximum(t.imread(f'{r}/gate1/{s}.tif'), t.imread(f'{r}/gate2/{s}.tif')).astype(np.float32) / 255
-t.imwrite(f'{r}/{s}.tif.g', (i.astype(np.float32) * p + 0.5).astype(i.dtype), compression=None); os.replace(f'{r}/{s}.tif.g', f'{r}/{s}.tif')" $R $s || { log "gate $s FAILED"; return 1; }
+  # (the product in C, byte for byte the numpy float32 step it replaced: 0332 2026-11-17 that step took 50-180 s per stripe beside the
+  # per-wrap renders, 2 GB float temporaries; img-gate ~5 s)
+  nice -n 10 $U img-gate $R/$s.tif $R/gate1/$s.tif $R/gate2/$s.tif || { log "gate $s FAILED"; return 1; }
   rm -f $R/gate1/$s.tif $R/gate2/$s.tif; [ $own = 1 ] && rm -r $R/in_$s; touch $R/$s.gated
 }
 if [ $GATED = 1 ] && [ -z "${STRETCH:-}" ] && [ ! -e $OUT/stretch.gated ]; then
@@ -43,14 +47,11 @@ if [ $GATED = 1 ] && [ -z "${STRETCH:-}" ] && [ ! -e $OUT/stretch.gated ]; then
   # would pull it): CT 0.5 / 99.8 % over rendered pixels (CT > 0), ink 1 / 99.9 % over papyrus pixels only (CT >= CTL), lead 11-13
   N=${#S[@]}; mids=(); for k in $((N / 2 - 1)) $((N / 2)) $((N / 2 + 1)); do [ $k -ge 0 ] && [ $k -lt $N ] && mids+=(${S[$k]}); done
   for s in "${mids[@]}"; do [ -e $R/$s.done ] || { mkdir -p $R/in_$s; ln -sfn $OUT/strip/flat/stripes/$s $R/in_$s/$s
-      UFSM_RENDER_MEM=16 nice -n 10 $U render $R/in_$s $R --volume $INK $INKK --ct $CTR $CTK --depth 1 --scale 1 --threads $RENDER_NT $FILLX > $OUT/logs/refill_$s.log 2>&1 || { log "render $s FAILED"; exit 1; }
-      [ -e $R/${s}_fill.tif ] && mv $R/${s}_fill.tif $M/; rm -r $R/in_$s; touch $R/$s.done; }
+      UFSM_RENDER_MEM=16 nice -n 10 $U render $R/in_$s $R --volume $INK $INKK --ct $CTR $CTK --depth 1 --scale 1 --threads $RENDER_NT $FILLX "${GX[@]}" > $OUT/logs/refill_$s.log 2>&1 || { log "render $s FAILED"; exit 1; }
+      [ -e $R/${s}_fill.tif ] && mv $R/${s}_fill.tif $M/; rm -r $R/in_$s; touch $R/$s.gated $R/$s.done; }
     gate $s || exit 1; done
-  st=$(python3 -I -c "import sys, numpy as np, tifffile as t; r, ctl = sys.argv[1], int(sys.argv[2]); c = []; k = []
-for s in sys.argv[3:]:
-    a = t.imread(f'{r}/{s}_ct.tif'); i = t.imread(f'{r}/{s}.tif'); c.append(a[a > 0][::7]); k.append(i[a >= ctl][::7])
-c = np.concatenate(c); k = np.concatenate(k); q = lambda v, lo, hi: (int(np.percentile(v, lo)), max(int(np.percentile(v, hi)), int(np.percentile(v, lo)) + 1))
-ca, cb = q(c, 0.5, 99.8); ia, ib = q(k, 1, 99.9); print(f'{ca},{cb},{ia},{ib}')" $R $CTL "${mids[@]}") || { log "gated stretch FAILED"; exit 1; }
+  # (in C, byte for byte the numpy step it replaced: every 7th masked pixel per stripe, numpy's linear percentiles; ~2 min -> ~5 s, 2026-11-17)
+  st=$(a=(); for s in "${mids[@]}"; do a+=($R/${s}_ct.tif $R/$s.tif); done; nice -n 10 $U img-stretch $CTL "${a[@]}") || { log "gated stretch FAILED"; exit 1; }
   log "stretch from the gated middle stripes (papyrus-only ink): $st (was $(cat $OUT/stretch.txt 2> /dev/null))"
   cp -f $OUT/stretch.txt $OUT/stretch.ungated.txt 2> /dev/null; echo $st > $OUT/stretch.txt; touch $OUT/stretch.gated
 fi
@@ -60,9 +61,9 @@ rend() {   # one stripe -> render_fill/<s>.tif, <s>_ct.tif, <s>.done; fillmap/<s
   local s=$1; [ -e $R/$s.done ] && return 0
   while [ $(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo) -lt $MEMGB ]; do sleep 30; done
   mkdir -p $R/in_$s; ln -sfn $OUT/strip/flat/stripes/$s $R/in_$s/$s
-  UFSM_RENDER_MEM=16 nice -n 10 $U render $R/in_$s $R --volume $INK $INKK --ct $CTR $CTK --depth 1 --scale 1 --threads $RENDER_NT $FILLX > $OUT/logs/refill_$s.log 2>&1 || { log "render $s FAILED"; return 1; }
-  [ -e $R/${s}_fill.tif ] && mv $R/${s}_fill.tif $M/
-  gate $s || return 1
+  rm -f $R/$s.gated
+  UFSM_RENDER_MEM=16 nice -n 10 $U render $R/in_$s $R --volume $INK $INKK --ct $CTR $CTK --depth 1 --scale 1 --threads $RENDER_NT $FILLX "${GX[@]}" > $OUT/logs/refill_$s.log 2>&1 || { log "render $s FAILED"; return 1; }
+  [ -e $R/${s}_fill.tif ] && mv $R/${s}_fill.tif $M/; [ $GATED = 1 ] && touch $R/$s.gated
   if [ -n "$PAP" ]; then mkdir -p $PAP
     nice -n 10 $U ink-compare $PAP/$s.jpg --ct $R/${s}_ct.tif --ink ink=$R/$s.tif --papyrus ink --papyrus-gain 1 --papyrus-bg 128 --stretch --stretch-ct \
       --px-um 9.6 --max-px 8000 --threads $RENDER_NT > $OUT/logs/refill_pap_$s.log 2>&1 || log "preview $s failed (exit $?)"; fi

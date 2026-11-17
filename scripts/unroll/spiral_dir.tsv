@@ -7,7 +7,7 @@ PHercMAN5	+1?	published, scan unverified	seghand.py, segments/20260321025901-MAN
 PHerc1299	?	unknown	no open-data segments on 20260309130042; phase loops: no loop with >= 1/2 confident cells (pitch ~5 field cells); u1 ref ran dir +1 (default)
 PHerc0009B	?	unknown	18 segments on 20250521125136, none covers >= 0.8 turn per row
 PHerc0257	?	unknown	no segments
-PHerc0332	?	unknown	2 old segments (other scans), < 0.8 turn
+PHerc0332	-1	estimator	u1 unroll 2026-11-17, both hands: DIRCOH coherence -1 0.0604 vs +1 0.0437 (under the 0.05 margin); unroll-qa -1 better on pw48 (16 vs 24 tiles over) / w4 (14 vs 17) / z drift (1.84 vs 1.95 turns), conf_lo tied; wrap-check identical. Weak: replace with GT when it exists
 PHerc0358	?	unknown	no segments
 PHerc0483B	?	unknown	no segments
 PHerc0490B	?	unknown	no segments

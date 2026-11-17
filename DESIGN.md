@@ -108,6 +108,403 @@ crops is unchanged to the fourth digit. `--weights s42,s43` now runs one render 
 params cost 0.07 ms per tile (ink9um). A/B switches: `UFSM_IE_DATTN=0`, `UFSM_XNET_DF1=0`, `UFSM_XNET_DF16=0`.
 Segment wall times on a quiet card: pending (`fp4t/quiet.sh`, `quiet2.sh`).
 
+## Training perf: the validation regen pass was 95 % THP compaction (2026-11-17, branch trainperf-20261117)
+
+try9's validation passes (--val-store regen, every 500 steps) idled card 0 for ~25 min each, and the step-5500 pass for >75 min. The 3
+validation workers were not sampling: after ~65 min each had 31-141 s user against 1500-3250 s system time; perf (15 s, the three
+threads): 99 % of the samples under `__alloc_pages_direct_compact <- do_huge_pmd_anonymous_page <- draw_` (the memmove into window
+scratch), 34 % in `native_queued_spin_lock_slowpath` from the HMM mmu notifiers of each migrated page, the rest TLB shootdowns;
+/proc/vmstat ~13 compaction stalls a second, all failing (Shmem 57 GB of pinned buffers and 20 GB of swap: no order-9 blocks to make).
+
+Cause: `sampler_start` requests huge pages for the worker scratch (`wbig_alloc`, MADV_HUGEPAGE) when `gpu_aug != 2`. The training
+sampler runs gpu_aug 2 (`--gpu-aug 3`), so it was off there (training workers 6100-6600 s user / 330-370 s system over 13 h), but the
+validation sampler is a copy with `vc.gpu_aug = 0`, and regen starts a fresh sampler at every pass, so each pass faulted its whole
+scratch again through compaction. The 2026-11-09 note had measured the same stall (493 s system vs 125 s user for 24 P 512 windows).
+
+Fix: `sample_cfg.thp_off`, set on the validation sampler (it warps nothing, so huge pages buy it nothing in any mode). The windows'
+bytes do not depend on the page backing. Live runs: `UFSM_SAMPLER_THP=0` (try9's launch.env since 08:45) does the same for every
+sampler. Expected pass time: the user time above, ~1-3 min of sampling plus the 32 forwards, against 25-75 min; at --val-every 2000
+that is ~10 % of the wall clock back (~30 % at 500).
+
+## Unroll perf 4: the strip's papyrus gate inside the render, the gated stretch in C (2026-11-17, branch unrollperf4-20261117)
+
+- strip_refill.sh rendered every stripe three times when the ink is gated (the ink, then each of c12 / c13 with the same CT, fill and
+  inpaint) and multiplied them with img-gate (perf 2). `ufsm render --gate ROOT KEY` (at most 2, needs --ct and --fill) decodes the gate
+  volumes in the same chunk-ordered pass (render.c now takes up to 4 volumes, CPU and GPU paths; the gates are sampled at the ink's
+  points, after the --fill search on the CT, with the ink's depth), runs them through the same push-pull, and writes the ink x max(gates)
+  / 255 with img-gate's table. Byte for byte the three renders + img-gate: tests/test_render_gate.c (CPU and GPU, a fixture with a CT
+  void, normal fill, inpainted and grid-hole pixels) and on real data, 0332 wraps w091 / w092 (the inkpod zarr standing in for both
+  gates): ink, CT and fill-flag images equal. Time per gated wrap 21-28 s -> 11.5-15 s (3 runs each, card 1 shared). On the 0332
+  stripimg run (5 stripes, 9:00 wall) the two gate renders per stripe were 2 x 20-50 s of the stripe's render work.
+- strip_refill.sh re-rendering a stripe the mosaic had consumed kept its old `.gated` marker and skipped the gate (latent since perf 2);
+  the render now clears the marker first.
+- The gated stretch (numpy's linear percentiles over every 7th masked pixel of the 3 middle stripes, ~2 min in python with the
+  full-size float temporaries) is `ufsm img-stretch CTL CT1 INK1 ...` (imggate.c, numpy's virtual-index / lerp arithmetic in doubles;
+  tests/test_img_gate.py: 12 random distributions equal to numpy). Three 0332 wrap renders (90 M CT pixels): 2.6 s vs numpy 182 s
+  (desk busy), the same 39,197,15,195.
+
+## recto-sp on the GPU: byte-identical fp64 profiles, the source decoded once into a device ring (2026-11-17, branch rectogpu-20261117)
+
+recto-sp (unroll stage rectosp: the fit fields' sp blended with the m7 recto-hit spacing, --half-um 400 --half2-um 800 --blend 0.3) was the
+second-largest unroll stage, all on the CPU, competing with the ink predict that runs beside it. `--gpu N` (default 0; -1 the CPU; the CPU
+path stays for --cls, no device, or too little device memory for the ring) now runs the per-cell part on the GPU (src/nn_rectosp.cu).
+Its sp and rsp chunk files are **identical** to master's on both scrolls (diff -r). test_recto_gpu (gpu) compares them byte for byte on a
+noisy lossy synthetic: 3 flag sets, 5 row blocks, ring wrap, stride 3 with --rows, the host-decode path, and zero runs.
+
+- **Exact fp64.** The kernel mirrors rs_axis / rs_tri / rr_peaks / rs_rows operation by operation in double. nn_rectosp is in
+  UFSM_EXACT_CU (-fmad=false in every build; a contracted FMA moves a peak position by an ulp and flips a median pick). rr_peaks' taps
+  come from rr_taps (rectoruler.c), so they are the same doubles. The tap sum for a full window is added on the device in rr_peaks'
+  order (host fast math may reassociate). The comparisons are moved to fp32 only where they are provably the same: minima of floats,
+  `float < double` against the nearest float bound (f_up / f_dn).
+- **fp64 is the floor.** A consumer card runs fp64 at 1/64 rate (ncu: fp64 pipe 84 % busy). The pipe charges a warp instruction the same
+  whatever its active lanes. So the kernel is one warp per cell with compacted work lists (ballot) in full warps:
+  - the samples to interpolate; eight zero corners give +0 at once
+  - the smoothed samples whose window is not all zero
+  - rr_peaks' candidates, which are independent: every sample its plateau skip passes over equals tmp[i] and is never a candidate. They
+    search their prominence in fp32 and are compacted in order.
+
+  Lane 0 merges the hits and picks the median. The cell axes run in their own kernel, one thread each (computed 32x per warp they were
+  40 % of the fp64 instructions). The grid is sized to the resident blocks (a grid-stride grid of 2.4 waves had a partial last wave).
+  One 1M-cell block went 394 -> 244 ms. Each sample still costs ~70 fp64 ops: the 0332 kernel total is ~30 s on a 5060 Ti.
+- **The source decoded once.** The CPU path decodes each 64-row block's source box with an 85-voxel halo each side: ~2.3x the volume.
+  The GPU path keeps the source as a device z ring of the run's fixed y / x box: 0332 512 x 2959 x 3183 = 4.8 GB, 1667 5.5 GB; RZ is a
+  multiple of 128 and one block step deeper than a block needs. Each block adds only its new slices, read up to the source's chunk-row
+  end, as whole 128^3 chunks gathered on the device (predict's nn_ctw_put / gpudec). It zeroes the slices first, so fill chunks
+  (57 % on 0332) cost nothing. While our kernel holds the GPU, the GPU decoder hands most chunks to the CPU (~16k host, ~500 device on
+  0332); the bytes are identical either way. The host-decode-and-upload variant (UFSM_RECTOSP_DEVDEC=0) uploaded 74 GB of raw slices
+  for 0332: 38 s of pageable copies.
+- **Pipeline.**
+  - A helper thread prepares block k+1 while block k's kernel runs. Its source part and its field part run on two threads. The field
+    part loads rows chunk-aligned and keeps them for the next block, loading t0..t5 and w only (fit_fields_skip_planes bit 4: no pc / ps).
+  - The shard row's net sp read, the blend (threaded) and the sp / rsp shard writes (two arrays at once) run in a writer thread behind
+    the next row's blocks. This also speeds the CPU path (0332 192 -> 129 s, same bytes).
+  - A pass-0 shard that the box covers entirely no longer re-reads the input sp.
+
+| warm m7 cache, 16 threads, card 1 shared | master (CPU) | this branch --gpu -1 | this branch GPU |
+|---|---|---|---|
+| PHerc0332 (3943 x 1392 x 1504 fields) | 192 s, 1864 CPU s, 9.6 GB | 129 s, 1595 CPU s | **38.7-45.0 s**, 500 CPU s, 6.3-6.7 GB |
+| PHerc1667 (4635 x 1568 x 1616) | 169 s, 1630 CPU s, 11.2 GB | 151 s, 1754 CPU s | **54.6-60.6 s**, 610-655 CPU s, 7.3-7.9 GB |
+
+The GPU run's time splits as:
+- blocks (kernel) 31-35 s
+- waiting for the helper: 6 s on 0332, 12-16 s on 1667 (its field loads take 35 s there)
+- the writer's shard writes: 19-23 s on 0332, 35-40 s on 1667, overlapped except for the last row
+
+Left: the 1667 field decode (t0..t5 + w of 11.7 G cells; only 1/64 of them are sampled, but the codec decodes whole chunks), the
+lossless shard encodes, and the fp64 kernel. A lazy profile (±half first, the ±half2 tail only where the inner window has fewer than
+--min-int intervals, exact when hit clusters separated by >= sep bound the window) would cut ~1/3 of the kernel: not done.
+## ink-ext --ct-floor (zero CT below T before normalisation): null, not merged; hecate24 MX5 is slower (2026-11-17)
+
+Question (user): would it help to zero air/void that is neither papyrus nor masked (low CT values)? Test: in ink-ext's render,
+every sampled u8 CT value < T becomes 0 before the model's own normalisation (default 0 = off). Scored on the 24 crops (tvar.sh),
+card 1. Patch kept at /vesuvius/ufsm/inksdk/work/ctfloor.patch (branch ctfloor-20261116, not merged).
+
+| model    | T  | 0139  | 1667  | Paris4 | all    | paired vs T 0 (pairci, 24 crops) |
+|----------|----|-------|-------|--------|--------|----------------------------------|
+| reader3  | 0  | .9664 | .9290 | .9168  | .9271  |                                  |
+| reader3  | 20 | .9664 | .9290 | .9168  | .9271  | +0.0000 (no sampled value < 20)  |
+| reader3  | 40 | .8641 | .8994 | .8929  | .8892  | -0.0379 [-0.0683, -0.0132]       |
+| reader3  | 60 | .9213 | .9227 | .8983  | .9062  | -0.0209 [-0.0328, -0.0104]       |
+| reader3  | 80 | .8956 | .9126 | .8801  | .8881  |                                  |
+| ink9um   | 0  | .9818 | .9152 | .9019  | .9175  |                                  |
+| ink9um   | 20 | .9817 | .9152 | .9019  | .9175  |                                  |
+| ink9um   | 40 | .8712 | .8788 | .8143  | .8345  | -0.0829 [-0.1152, -0.0530]       |
+| ink9um   | 60 | .9484 | .8666 | .8675  | .8808  |                                  |
+| ink9um   | 80 | .9185 | .8645 | .8522  | .8653  |                                  |
+| hecate24 | 0  | .9835 | .9680 | .9072  | .9301  |                                  |
+| hecate24 | 20 | .9806 | .9560 | .9075  | .9278  | -0.0023 [-0.0051, -0.0001]       |
+| hecate24 | 40 | .8782 | .7224 | .8103  | .8069  | -0.1231 [-0.1611, -0.0920]       |
+| hecate24 | 60 | .8543 | .6867 | .7334  | .7458  |                                  |
+| hecate24 | 80 | .8003 | .6532 | .5768  | .6268  |                                  |
+
+Every T > 0 loses or ties; best T is 0, so the z-sum combo stays at T 0 (.9449). Why: the nets were trained on unfloored CT and
+read the air/papyrus contrast and low-density texture (robust_mad / z-score normalisation shifts with the floor too); the air peak
+sits at 39-55 and the air/papyrus valley at 57-73 (airiso's air_iso.tsv), so T 40-80 cuts into the papyrus fringe where ink sits.
+A floor would have to be learned in training, not applied to frozen teachers.
+
+hecate24 MX-fp4 speed (bench region 1500,900,995,260 of 1667 w013, 102.98 Mpx at 2.399 um, card 1): fp16 846.9 s (0.122 Mpx/s,
+net 833.5 s, 7.4 tiles/s), UFSM_XNET_MX=5 1298.2 s (0.079 Mpx/s, net 1280.4 s, 4.8 tiles/s). MX5 holds AUC (-0.0002 [-0.0009,
++0.0004]) but is 1.53x slower on these 62x64x64 Co=64 3x3x3 convs, so hecate24 stays fp16. Render is 30-32 s of the wall
+(level-0 cache on disk), so the net is the whole cost.
+
+## Unroll perf 3: no context on unlisted cards; the ref's chunk rows fixed (2026-11-17, branch unrollperf3-20261117)
+
+- SGPU (perf 2) pinned the stages without a --gpu, but a predict on --gpu 1 still opened a 128 MiB context on card 0 (the training card;
+  lead). Without a caller's CUDA_VISIBLE_DEVICES the run now exports CUDA_VISIBLE_DEVICES = the cards it was given (FIELDGPUS, FITGPUS,
+  INKGPU, SGPU, RGPU; GVIS) and every --gpu passes the card's index in it (lg); per-job CUDA_VISIBLE_DEVICES=<card> stay physical ids.
+  DRY=1 prints each stage's CUDA_VISIBLE_DEVICES (desk, FITGPUS=FIELDGPUS=INKGPU=1: every stage 1, every --gpu 0).
+- The ref's chunk rows came from the free host memory (count-field --mem-gb lowered to 60 % of what was available) and change the ref:
+  0332 full3 / full4 picked 512 / 640 rows and their joined models differed. unroll.sh passes --chunk-rows ${REFCZ:-512} to every
+  count-field (solves, DIRCOH, the streamed pass 1); count-field takes fewer rows only when --mem-gb cannot hold the asked ones, and
+  then prints `DEFAULTED: count-field chunk rows = N (...)`; the ref stage logs the rows used to progress.log.
+
+## Unroll perf 2: stages pinned off card 0, 3 slab lanes, the ink beside the critical path, flatten's relax pass, the strip gate in C (2026-11-17, branch unrollperf2-20261117)
+
+0332 end to end WITHOUT UPTO on the desk (card 1 only: FIELDGPUS=FITGPUS=INKGPU=1, PERWRAP=1, local CT cache, master's FBLEND 0 /
+FSKIP 20). Stage walls in s; the ink runs beside the chain, stripimg and perwrap wait for it and run side by side:
+
+| stage | before (02:37) | + pinning, lanes, flatten, img-gate (full3) | + ink from the fields, blends at once (full4) |
+|---|---|---|---|
+| fields | 157 | 112 | 116 |
+| rectosp | 126 | 128 | 221 (beside the ink predicts) |
+| ref | 280 (CPU fallback) | 54 | 92 |
+| slabs | 320 (1 lane) | 155 (3 lanes) | 190 |
+| join .. snap | 173 | 174 | 190 |
+| strip + stripflat + distort | 226 | 83 | 139 |
+| ink (beside) | 771 from the slabs | 770 from the slabs | 682 from the fields, done before the snap |
+| stripimg | 764 | 433 | 457 |
+| perwrap | 784 | 608 | 612 |
+| **total** | **2441** | **1832** | **1422** |
+
+PHerc1667 end to end on the same setup (master c2216919, local CT, 44 per-wrap renders): 1248 s = fields 125, rectosp 293 and ref 111
+(the ink's predicts beside them), slabs 219 (73 slabs, 3 lanes), join .. snap 114, strip + stripflat + distort 82, then stripimg 281
+beside perwrap 385; the ink (651 s from the fields) was done at the end of the slabs.
+
+The joined models of full3 and full4 differ: the ref picked 512 vs 640 chunk rows from the free host memory (the ink's predicts beside
+it in full4), the nondeterminism of "Unroll perf 1"; with the same ref every slab fit is byte-identical whatever the lanes (below).
+
+- Card 0: unroll.sh ran every stage without a --gpu of its own (ref / refstream count-field, strip-flatten, the strip renders) on CUDA
+  device 0 whatever FITGPUS said. On the desk that is the training card: 0.7 GB free sent the ref's CG and the renders to the CPU, and
+  strip-flatten's SLIM ran there beside try8 (204 s; 30 s on the pod). SGPU (default: the first of FITGPUS) now pins them:
+  CUDA_VISIBLE_DEVICES=$SGPU for every stage except fields / slabs / ink / perwrap (those place themselves) and for the streamed ref;
+  an explicit CUDA_VISIBLE_DEVICES (also an empty one) is kept. The ref on card 1: 280 -> 54 s (CG + model pass on the GPU).
+- Slab lanes: a 0332 slab fit is 96 x 1392 x 1504 fields cells, ~1.9 GB of device memory, ~4.4 s of fit after ~1 s of setup; one lane
+  left the card idle between fits. Refitting all 62 slabs on card 1: 1 lane 232 s, 2 lanes 171 s, 3 lanes 132 s, 4 lanes 134 s (95 %
+  GPU busy), every delta.f32 byte-identical to the 1-lane run (so the joined model is too). fitlanes' auto rule was (device GB - 8) / 16
+  (1 lane on 16 GB cards, written for Paris-size slabs of 10-16 GB); now the device's free GB - 1 over 12 B per slab cell + 0.5 GB,
+  clamped to 1..3: 0332 3 lanes on a 16 GB card, a Paris 4 slab (~1.3 G cells) still 1. Without the fields' shape (DRY) the old rule.
+- flatten (per-wrap unroll renders, strip chunks): prolongate's flip relaxation swept the whole fine mesh 200 times per level (every
+  0332 level ran all 200 rounds; 6.3 M triangles at D1), 42 % of a flatten. It now visits only the triangles with a relaxed vertex, in
+  index order, so the sums, flip counts and marks are the full sweep's bit for bit (a triangle outside that set keeps its unflipped
+  start). The three quantile sorts of each stats line run on 3 threads. w107 (3.2 M vertices): 31.4 -> 18.1 s, outputs identical
+  (diff -r); all 69 wraps' flattens 2554 -> 1827 job-s in the pipeline. What is left is the GPU SLIM itself: fp64 CG, 200 steps per
+  iteration, every iteration at the cap (res 0.02-0.2), memory / fp64 bound on the 5060 Ti (1/64-rate fp64): all 69 wraps serially
+  671 s with 396 s inside the solves, 469 s with 4 or 8 jobs (the card saturated). Keeping the CG's scalars on the device (no host
+  round trip per step) changed nothing measurable (33.4 vs 32.4 s, 135 vs 133 s on the 25 smallest wraps; same bytes), so not kept.
+  Faster from here changes the results: fewer CG steps, fp32 CG, decimation by vertex count (the recipe picks --decim from the .sfc's
+  bytes, so 3 M-vertex wraps run at decim 1).
+- stripimg: strip_refill.sh's papyrus gate (ink render x max(c12, c13) / 255) was a numpy one-liner with 2 GB float32 temporaries per
+  0.5 G-pixel stripe: 28 s alone, 50-180 s beside the per-wrap renders, ~6 of stripimg's 11 minutes. `ufsm img-gate IMG G1 G2` does it
+  through a 256 x 256 table built with float32 rounding forced by casts (numpy's bytes; tests/test_img_gate.py checks all 65536 pairs
+  and both file layouts): ~5 s per stripe (the deflate reads). Its renders now run on card 1 (GPU path) too.
+- The ink was then the critical path: 770 s from the end of the slabs (INKAT=slabs) = ~5 min of predicts (two grids) and three
+  ink-blends one after the other (~125 s + 35 s of pyramid each, CPU, the card idle), while stripimg and perwrap waited for it (8.5 min
+  idle after distort in full3). latink.sh runs the three blends at once (independent outputs, same bytes). INKWAIT=0 with INKAT=fields
+  lets the slab lanes share the ink's card instead of waiting for all of it (INKAT=fields alone made the INKGPU lane wait: on a one-GPU
+  run the whole slab stage). One-GPU runs (FITGPUS = INKGPU) now default to INKAT=fields INKWAIT=0: full4, 1832 -> 1422 s; the ink
+  (10487 CPU s) slows rectosp / ref / slabs, but it is done before the snap. Runs with 2+ fit GPUs keep INKAT=slabs (not measured).
+- Left on 0332 (full4): perwrap 612 s and stripimg 457 s side by side after the snap (perwrap = the GPU SLIM above; stripimg = 3
+  renders per stripe, the ink and its two gates, ~10-30 s each, plus the mosaic), and the fields -> slabs chain (~620 s with the ink
+  beside it). The ink's predicts (~0.6 s per window, ~1000 windows over its two grids) are item (4), fp4teach's / inksdk's kernels.
+
+## Void zeroing (skip-empty) on the unroll fields: a small gain, on by default; PHerc0332's hand -1 by estimator (2026-11-17)
+
+User 11-16: "do we zero out air / void that is not papyrus but not masked either, would that help?" Before: only masked air (CT 0)
+was air anywhere (training's --skip-empty --skip-thr 0, the labels' air test); u1's fields predict ran dense; the ink teachers see raw
+CT. wbench GT A/B (u1 13000, 44 clean core boxes, card 1; predict --skip-empty 1 --skip-thr T --skip-margin 1: 8^3-cell tiles with no
+CT voxel above T left at their bias = void zeroed tile-wise), paired vs dense:
+| T | ids | A-B [95 % CI] | Paris 4 PH | Paris 4 J | 1667 |
+|---|---|---|---|---|---|
+| dense | 0.5327 | | 0.3916 | 0.4025 | 0.8836 |
+| 20 | 0.5369 | +0.0042 [+0.0003, +0.0086] | 0.4068 | 0.4079 | 0.8814 |
+| 40 | 0.5357 | +0.0030 [+0.0001, +0.0061] | 0.3998 | 0.4065 | 0.8824 |
+| 60 | 0.5294 | -0.0034 [-0.0168, +0.0069] | 0.4020 | 0.3973 | 0.8801 |
+The gain is on the packed Paris 4 boxes; 1667 (wide sheets) moves -0.002. Speed (unroll perf, above): fields predict -13 % on 0332 /
+1667, -6 % on packed Paris 4. unroll.sh: FSKIP (default 20; 0 = dense) on latent-grid fields. The voxel-level version for the ink
+teachers (ink-ext --ct-floor) is inksdk's; a training-side floor waits for that.
+
+PHerc0332's spiral hand: the u1 unroll with both hands (fields shared, then the +1 rerun on its own fields): DIRCOH -1 0.0604 vs +1
+0.0437 (refused, under the 0.05 margin); wrap-check identical (66 real / 8 dup / 3 merged, every rate equal); unroll-qa -1 better
+on pw48 (16 vs 24 tiles over 0.1) and w4 (14 vs 17 under 0.8), z drift 1.84 vs 1.95 turns, conf_lo 28 vs 27. spiral_dir.tsv: -1,
+source estimator. Both hands drift ~2 turns over z: 0332 is a hard scroll either way. The three-teacher ink maps of the six largest
+-1 wraps show no legible text (/vesuvius/ufsm/unroll2/ink/PHerc0332).
+
+## Window overlap on the GT boxes: more grids do not help, FBLEND off again (2026-11-17, branch ngrid-20261116)
+
+User 11-16: "stride = window / 2 so all voxels get inferenced 8 times" -- would it help in compressed sections? wbench NGRID 2 / 4 / 8
+(window grids offset by half the 512 core: 2 = the diagonal (the unroll's FBLEND), 4 = four of the corners, 8 = all; blended by
+field-blend --tile, per-box predicts), u1 13000, BOXES core (44 clean boxes: Paris 4 PH 4, Paris 4 J 28, 1667 12), card 1 shared:
+| grids | ids | A-B vs 1 grid [95 % CI] | Paris 4 PH | Paris 4 J | 1667 | predict wall |
+|---|---|---|---|---|---|---|
+| 1 | 0.5327 | | 0.3916 | 0.4025 | 0.8836 | 931 s |
+| 2 | 0.5307 | +0.0020 [-0.0120, +0.0154] | 0.3740 | 0.4020 | 0.8834 | 1340 s |
+| 4 | 0.5244 | +0.0083 [-0.0094, +0.0303] | 0.3643 | 0.3936 | 0.8830 | 1716 s |
+| 8 | 0.5170 | +0.0158 [-0.0037, +0.0383], P(1 grid better) 0.94 | 0.3611 | 0.3828 | 0.8819 | 2571 s |
+No gain anywhere; on the packed Paris 4 boxes more overlap trends worse (the averaged phase of shifted windows blurs close sheets).
+The 2-grid blend removed the seam steps (audit #5: phase 1.43 / 1.78 -> 1.11 / 1.09 of the interior) but does not move ids, so the
+unroll default goes back to one grid (FBLEND=0: half the fields time, and the streamed ref again). Results /vesuvius/ufsm/wbench/res/u1-ngrid*.tsv.
+
+## NorMuon with --init-lr-mult (warm starts); try8 vs try6 was the warm start (2026-11-16, branch nmwarm-20261116)
+
+**Why try8 lagged.** try8 (scratch2, from scratch, one card) sat at phase bce 0.681 (ln 2 = 0.693) for 4300 steps; HOLD p05x 0.474 / 0.489
+at steps 2000 / 3000. try6 reached HOLD p05x 0.882 (ids0 0.810) at step 2357, u1-13790 0.887 / 0.813: HOLD is held out of every run
+(boxes.tsv), so those are fair. try6 was not from scratch: it resumed try5, the scratch2 net warm-started from widened u1-13750
+(--init-from --init-widen 1 --init-lr-mult 0.3 --init-lr-steps 2000; header init_inh, down_norm 1 from the donor). try4, from scratch,
+had stalled the same way ("phase stuck at ln2 for 2600 windows"). Everything else of try8 matched try6 (lr, accum windows, P, um rungs).
+The user (17:00): no more from-scratch runs; warm starts (try9).
+
+**NorMuon + --init-lr-mult.** The trainer refused --init-lr-mult with --normuon / --muon-ns polar. The ext path (muon_ext) already takes
+per-matrix lr multipliers (mx_lrm, --trunk-lr-mult); the inherited matrices (inh_has, the plain path's partition rule) now get init_lr
+there, recomputed each step (the --init-lr-steps ramp). A bug on the way: muon_table returned early on its later calls with the host
+descriptor list in collection order, while the device table had been partitioned inherited-first; the ext path indexes the multipliers
+and NorMuon's row offsets by that host list, so from the second step they paired with the wrong matrices. The early return now applies
+the same partition. test_init_lr: a NorMuon arm, two steps on one net; with the partition fix reverted its second step moves 6912
+inherited parameters at multiplier 0 (FAIL), with it 0. Still refused with --init-lr-mult: --trunk-lr-mult, anvil, Muon-C, hyperball,
+--muon-vr, the adaptive / cautious / Frobenius / AdEMAMix / attention-lr variants. Fast tier (card 0): 331 PASS, 1 SKIP, 2 NEED2.
+
+## Unroll perf 1: the FBLEND half-stride grid ran each window up to 8 times; a per-run CT cache; field-blend tables (2026-11-16, branch unrollperf-20261116)
+
+Profile of the 0332 unroll (desk, card 1 shared, CT over https, u1 13000, FBLEND on): fields 2767 s = grid-0 predict 368 s (505
+windows) + **half-stride predict 2055 s (3138 windows)** + field-blend 342 s (4714 CPU s); rectosp 289; ref 291 (card 1 full: the CG
+level 0 and the model / output passes fell back to the CPU; 36-79 s on a free card); slabs 377; snap 159 (CT decode over https 125 s).
+- **Half-stride grid.** predict.c's shards start at the box. On a box off the window grid (`--grid-origin 256` with a 512-aligned box),
+  every window whose interior covers k shards runs k times (once per shard, its cells clipped to the shard; up to 8x), so 3138 runs
+  instead of ~650 windows. unroll.sh (fpred1) now starts that predict's box back on its own grid (box - origin multiple of the stride,
+  up to 256 voxels earlier per axis; the end unchanged). field-blend crops an input that covers in[0]'s cells on the same grid to
+  them (offset / origin / shape, as `--box` does for in[0]). Each window computes the same cells either way, so the blend is
+  byte-identical. 512^3-cell box: 64 -> 27 runs, every chunk file equal. Whole fields stage on a 1024 x 2048^2 box of 0332 (master
+  unroll.sh vs this one, same binary): 249 -> 88 s, half-stride predict 253 runs / 199 s -> 73 / 38 s, blended fields byte-identical
+  (fields.json differs only in the input paths).
+- **CT cache (UFSM_HTTP_CACHE, CTCACHE).** z3_open uses `$UFSM_HTTP_CACHE` as the chunk cache of any HTTP array opened without one,
+  and predict defaults `--cache` (and with it the prefetcher) to it. unroll.sh exports `$O/ctcache` for an https CT (CTCACHE=0 off,
+  CTCACHE=DIR elsewhere; the default dir is deleted at the end unless KEEPCT=1), so the second grid, wrap-check, unroll-qa,
+  surf-stats, wrap-snap, render and faces read the CT locally after its first fetch. Grid-0 predict on a 32-window box: no cache
+  34.4 s (reader 27.3 s of z3_read), cold cache 23.0 s (reader 15.3 s, prefetch 16 threads), warm 19.7 s (reader 4.9 s, GPU-bound
+  at 0.52 s a window). Outputs byte-identical. A local CT root reads at the warm-cache rate
+  (`ufsm mirror` of 0332 level 2, 5.8 GB in 51 s; predict reader 4.3 s for the 32 windows), so pods with CTROOT need no cache. (An
+  earlier "local is as slow as https" reading was a test script that still pointed at https.)
+- **field-blend.** sin / cos of the winding-mod-4 codes come from 256-entry tables (the same doubles), and the tile weight of each
+  cell is stepped through x / y / z instead of a div / mod per cell. 512^3 cells: 73.4 -> 49.5 CPU s (7.2 -> 5.3 s at 16 threads),
+  byte-identical to the 11-11 master binary. What is left: combine 29 %, atan2 / hypot ~9 %, the volcomp encode of the output 22 %.
+- **recto-sp.** rr_peaks takes its 2R + 1 gaussian taps from a table built per call instead of an exp per tap per sample (exp
+  was a third of the CPU). 1024 x 2048^2 0332 box: 294.8 -> 175.7 CPU s (25.6 -> 18.6 s), byte-identical; test_recto compares the
+  smoothed floats with the per-sample exp at 5 sigmas (one past the 256-tap stack table).
+- **Re-baseline with FBLEND off (master 5497da44 default: one grid; 0332 has m7, so rectosp runs and the ref is not streamed)**, 0332
+  to snap, card 1 shared, old = 5dce8d46 script + binary with FBLEND=0, new = master: fields 264 -> 163 s (the CT cache's prefetch),
+  rectosp 299 -> 148, ref 285 -> 382 (both on the CPU fallback, card full: old 128 rows per chunk at 6.9 GB available host memory,
+  new 640 at 28.8 GB), slabs 285 -> 268, check 55 -> 28, trim 21 -> 5, snap 102 -> 47; total 1346 -> 1078 s, without the ref
+  1061 -> 696 s (1.5x). wrap-check verdicts equal (65 / 8 / 3), slab fits s000-s022 byte-identical; from s023 on they and the snap
+  (70 vs 71 wraps) follow the ref, which differs because of its chunk rows.
+- **The ref depends on its chunk rows, which count-field picks from the free host memory.** Same 0332 fields (1536 x 2784 x 3008 at
+  z 2048), `--chunk-rows 128` vs `384`: delta.f32 differs on 99.99 % of cells, p99 0.017 turn, max 1.03 turns, model coherence
+  0.0589 vs 0.0605; the same chunk rows twice: byte-identical. So a ref (and everything after it) varies with how loaded the machine
+  is. Passing a fixed `--chunk-rows` (unroll.sh's refcz, from CFMEM and the field shape only) would make it reproducible; left to the
+  unroll owners (memory policy).
+- **--skip-empty on u1's fields predict (speed side; the accuracy A/B is the lead's wbench skipthr.sh)**, grid 0, local CT, card 1
+  shared, margin 1: 0332 whole box dense 243.2 s / thr 20 212.2 / 40 212.4 / 60 210.6 (mean level-0 active tile share .553 / .553 /
+  .536); 1667 whole box dense 271.7 / thr 40 235.3 (share .529); Paris 4 z 8192..10240 full section dense 216.0 / thr 40 203.6
+  (share .768). So -13 % per predict on 0332 / 1667, -6 % on packed Paris 4: ~60-75 s of a 683 / 872 s fields stage. The threshold
+  hardly matters on these masked scans (air is 0). Whole windows are already dropped before the GPU (--occupancy: no CT > 0 in the
+  interior on level 5; windows over absent chunks): 505 -> 473 run on 0332, 578 -> 524 on 1667; of the run windows 0 (thr 20) / 3
+  (thr 60) have no active level-0 tile (`UFSM_SKIP_REPORT=1` now counts them). Not made default (u1 trained dense).
+- **1667 (box at 0, local CT), fields + recto-sp** (desk, card 1 shared): fields 872 s (grid 0 373 s / 578 windows, half grid 272 s /
+  567 windows, blend 225 s). The old half grid planned 3524 windows (+752 air) on the same box: ~2290 s at the old 0.65 s a window,
+  so the old fields stage was ~2990 s (3.4x). recto-sp on its fields, warm m7 cache: 280 -> 157 s (2433 -> 1750 CPU s), byte-identical;
+  max RSS 8.1 -> 11.3 GB (two source blocks in flight).
+- **Boxes at 0** (1667, Paris 4 and every box starting at a volume face): the half-stride grid's box would start 256 voxels before
+  the volume, which predict refused, so unroll.sh kept the old box there and the 6x window runs. predict now accepts a box up to
+  a shard before the volume with --grid-origin (that CT reads as fill, as every window crossing a face already did), and unroll.sh
+  always starts the box on the grid. 1667 box 0,1024,1024 + 1024^3: half grid 46 runs (+18 air) / 28.7 s -> 18 / 12.2 s, the
+  blended planes identical. test_predict_fitgrid: a box at -64 equals the on-grid box on their common rows.
+- **recto-sp, part 2** (0332 full box, warm m7 cache, same fields): phases were source decode 52 s, profiles 56, field load 23,
+  blend 43, shard writes 18 of 207 s. The blend (net^(1-a) rsp^a per material cell, single-threaded exp / log) is a 256 x 256 table
+  of the same codes (43 -> 4 s), and each 64-row block's source box is decoded by a helper thread while the previous block's
+  profiles run. 225 -> 144 s, output byte-identical (sp and rsp chunk files). Larger row blocks (less halo re-decode) gave 173 -> 157 s
+  at 256 rows for +8 GB RSS: not taken; a decoded-chunk cache (zcache) needs ~4 GB of shm for the reuse distance: not in the dev slice.
+- **0332 end to end, UPTO=snap** (desk, card 1 shared with a 7 GB job at 100 % in both runs; master 7f2c69b8 + recto-sp):
+
+  | stage | 15:02 run (5dce8d46, ufsm-inkspeed 926b3bb4) | this branch |
+  |---|---|---|
+  | fields | 2767 s (12560 CPU s) | **683 s** (5180): grid 0 254 s / 505 windows, half grid 248 s / 502 windows, blend 180 s |
+  | rectosp | 289 | 223 (1468 CPU s) |
+  | ref | 291 (CPU fallbacks: card 1 full) | 60 (GPU) |
+  | slabs | 377 | 385 |
+  | join / check / wraps / trim | 10 / 65 / 25 / 24 | 10 / 35 / 24 / 4 |
+  | snap | 159 (CT decode over https 125 s) | **41** (cached CT) |
+  | **total to snap** | **4007 s** (+ 575 s of DIRCOH refs) | **1465 s (2.7x)** |
+
+  The ref and so everything after it differ from the 15:02 run: that run's ref ran its CG level 0 and model pass on the CPU (card 1
+  full) and used another binary. The equality check is the fields stage: old (5dce8d46) vs new unroll.sh, same binary, on a full
+  0332 cross-section (512 x 2784 x 3008 at z 4096, the box edges included): half grid 209 runs / 126 s -> 65 / 32 s, stage 166 -> 69 s,
+  every chunk file identical.
+- Tests: test_fblend blends with a larger second input (B's whole zarr arrays, one / two cells more per side) against the per-cell
+  rules byte for byte, and refuses a smaller second input. test_http_reader checks that UFSM_HTTP_CACHE fills the same cache as --cache.
+
+## Ink teachers: combining the ink-sdk ports, Hecate 2.4 joins reader3 + ink9um (+0.012 AUC) (2026-11-16)
+
+/vesuvius/ufsm/inkteach/ens/ens3.py (out ens3.txt): the 9 teachers with maps on all 24 held-out crops (reader3, ink9um s42+s43,
+hecate24, canon2, rectina, reader2, dense9, studio, trace3b; v8in / A-hn / tsf / hecate96 left out: weak or not on every crop), per-crop
+AUC, paired bootstrap over crops vs the current ink-teach recipe (reader3 + ink9um logit sum, 0.9327 here).
+| combiner | PHerc0139 | PHerc1667 | Paris 4 | crops | dAUC [95 % CI] |
+|---|---|---|---|---|---|
+| z-sum reader3 + ink9um + hecate24 | 0.9911 | 0.9741 | 0.9260 | 0.9449 | +0.0121 [+0.0056, +0.0199] |
+| z-sum reader3 + hecate24 | 0.9877 | 0.9747 | 0.9253 | 0.9439 | +0.0112 [+0.0040, +0.0198] |
+| LOSO logistic stack, 5 best | 0.9897 | 0.9777 | 0.9221 | 0.9426 | +0.0099 |
+| LOSO stack, all 9 | 0.9893 | 0.9749 | 0.9171 | 0.9388 | +0.0060 (n.s.) |
+| current r3 + i9 logit | 0.9860 | 0.9419 | 0.9171 | 0.9327 | 0 |
+| hecate24 alone | 0.9835 | 0.9680 | 0.9083 | 0.9308 | |
+Greedy forward selection on z-logit sums stops at hecate24 + reader3 + ink9um (+ rectina: 0.9442, down). canon2, rectina, reader2,
+dense9, studio, trace3b add nothing to the three; the stacks give them ~0 or negative weight. Hecate 2.4 brings what the 9.6 um nets
+lack: PHerc1667 0.942 -> 0.974. Combiner: per-map z-score (median / std over the map) then sum; a learned stack is no better.
+Cost: hecate24 reads 2.4 um level 0 (not in the local CT mirror), tile 256 / stride 128: its throughput decides whether the full pass
+can afford it (bench pending).
+
+## ink-ext: every ink-sdk profile in our own ports (canon2, studio, tsf; the ink_9um / v8in / Hecate checkpoints) (2026-11-16, branch inksdk-20261116)
+
+The 18 profiles of github.com/LimeGS/ink-sdk (main 9afd5b0, MIT; src/ink_sdk/profiles/*.toml: weights, pinned revision, sha256,
+preprocessing; the lead's brief said 20, the repo has 18) now run in `ufsm ink-ext`. Their code was read to learn each architecture and
+its exact pre/post-processing (adapters, the vendored canonical / hecate / studio sources, lucidrains TimeSformer-pytorch 0.4.1, the
+v8-in modeling.py); nothing upstream is imported or executed, tests included: the parity references are tests/inksdk_ref.py, torch
+functional forwards written from those descriptions over the checkpoints' own tensors.
+
+Weights: /vesuvius/ufsm/inksdk/weights/<profile id>/ + SOURCE.txt (url at the pinned revision, sha256: all 18 match the profiles;
+license); fetch.sh in /vesuvius/ufsm/inksdk/scripts. Licenses: MIT except rectina m4 (CC-BY-NC-4.0), TRACE v3B (CC-BY-NC-SA-4.0),
+Studio (weights CC BY-NC 4.0, code MIT), the A-hn seeds (CC-BY-NC-4.0): non-commercial use only. dense-native publishes safetensors +
+its training config (ink-sdk rebuilds a .pth from them); ink-ext reads the safetensors directly (sha256 of the safetensors checked).
+
+| ink-ext --model | profile(s) | network | spacing, tile / stride | new code |
+|---|---|---|---|---|
+| reader2, dense9, rectina, trace3b | ink_9um@reader-v2-step040000, @dense-native-step016000, @rectina-m4, @trace-v3b-step5000 | the reader3 / ink9um vesuvius_unet_3d_stem_2d (508 tensors, robust_mad) | 9.6 / 9.362 / 9.362 / 9.362 um; 128 / 128 / 384 / 128 px, overlap 0.5 | spec rows only |
+| v8in (--weights) | v8in@ink-8um-v8in, @pherc0306b-ahn-s0 / s1 / s2 | the existing v8in port | 7.91 um (profile: 8.64), 64 / 21 | none |
+| hecate24, hecate96 | hecate@2.4um, @9.6um | existing; divisor 200 / 255, tile 256 / 64, stride 128 / 32 match the profiles | | none |
+| canon2 | canonical_2um@r152-3ddec-v2-l5-epoch13 | Hecate 2.4's ResNet3D-152 + 3-D decoder at the top level of a Lightning .ckpt, BatchNorm3d(1) on u8 / 255, a plain depth softmax (no support mask, no z-scale) | 2.399 um, 62 layers, 256 / 128, tiles with >= 60 % data columns, hanning(T + 2)[1:-1], data-free columns 0 | load / collapse variant of the Hecate path |
+| studio | studio@softloss-20261023 | DeepResidualUNet: GroupNorm(gcd(32, c)) + SiLU pre-activation 3-D residual U-Net (48..640), a learned softmax over the 16 planes; clamp(0, 200) / 255 | 9.362 um, 128 px windows at (y - 16, x - 16) reflect-padded as its crop() does, the central 96 x pixel-centred hann(96), stride 64 | studio_fwd; the context-window tiling |
+| tsf (--weights) | timesformer@gp-scroll1, @large-scroll1, @scroll5 | lucidrains TimeSformer 0.4.1: 26 frames x 16 patches of 16 px, dim 512, depth / heads 8 / 6, 16 / 8, 8 / 6 (read from the checkpoint), rotary, cls -> 4 x 4 logits; clip(0, 200) / 200 | 7.91 um, 64 / 16, np.hanning(64) (zero edges), data-free columns 0 | src/nn_xtsf.cu (patch rows, divided space-time attention with rotary + cls, GEGLU) + xnet 1x1 GEMMs + dinovol LayerNorm |
+
+Parity (ink-ext --raw-in fp16 vs the torch fp32 references; max |dlogit| over random + real surface-volume tiles rendered by ink-ext from
+an eval crop): reader2 0.0035, dense9 0.0044, trace3b 0.0028, rectina 0.0037, canon2 0.0014, studio 0.0023, tsf GP / large / scroll5
+0.0020 / 0.0017 / 0.0012, v8in 0.0073, A-hn s0 / s1 / s2 0.0060 / 0.014 / 0.0055, hecate24 0.0057, hecate96 0.036. The tiling + blend of
+canon2 / studio / tsf against numpy re-implementations of the adapters' sliding windows (ink-ext --raw-in as the per-tile oracle):
+max 1 / 255. test_xtsf: the three new kernels against host references (max 0.0005). Tests: test_xtsf (fast), test_ink_ext_inksdk_{koine,
+canon,studio,tsf,v8hec,blend} (slow tier; data in $UFSM_INKSDK = /vesuvius/ufsm/inksdk).
+
+Conventions kept: the layer offsets are i - (D - 1) / 2 for every model (the published renders' half-integer centre for even D; the
+profiles' n // 2 - D // 2 window differs by half a layer for even D, --shift moves it); the CT level and spacing rules of ink-ext.
+
+Eval (tvar.sh, the 24 held-out crops, ink-score AUC per scroll and the mean over crops; reference: reader3 0.9271, ink9um s42 + s43
+0.9175, hecate96 ~0.876):
+| tag | PHerc0139 | PHerc1667 | Paris 4 | all (n 24) |
+|---|---|---|---|---|
+| hecate24 | 0.9835 | 0.9680 | 0.9072 | 0.9301 |
+| reader3 at 9.362 um (its profile's spacing; default 9.596) | 0.9619 | 0.9188 | 0.9174 | 0.9250 |
+| rectina | 0.9496 | 0.9150 | 0.9146 | 0.9205 |
+| canon2 | 0.9622 | 0.9301 | 0.8843 | 0.9049 |
+| reader2 | 0.9460 | 0.8948 | 0.8918 | 0.9013 |
+| dense9 | 0.9627 | 0.8883 | 0.8807 | 0.8956 |
+| studio (forward) | 0.9320 | 0.8423 | 0.8921 | 0.8904 |
+| trace3b | 0.9310 | 0.8186 | 0.8500 | 0.8583 |
+| v8in A-hn s0 (forward) | 0.8956 | 0.8528 | 0.8127 | 0.8332 |
+| v8in (forward, 7.91 um) | 0.8537 | 0.8737 | 0.8095 | 0.8276 |
+| tsf GP (forward) | 0.6107 | 0.4720 | 0.8303 | 0.7340 |
+| tsf large (reverse) | 0.5275 | 0.5123 | 0.7226 | 0.6550 |
+| tsf scroll5 (reverse) | 0.5463 | 0.5131 | 0.5363 | 0.5341 |
+| studio / v8in / A-hn s0 / tsf GP reversed | | | | 0.549 / 0.554 / 0.512 / 0.484 |
+Direction: every model wants ink-ext's forward order on our renders, including Studio and the TimeSformers whose profiles name
+"reverse" primary (that is the order of a vc_render_tifxyz stack, which is ours reversed). The TimeSformers do not transfer (7.91 um
+scroll-1 / scroll-5 nets; only GP on Paris 4 is useful), and A-hn s1 / s2 were not run (s0 = v8in level).
+
+Speed: bench.sh (one 1/32 region of the 1667 w013 segment, card 1) follows in its own section.
+
 ## ink-ext: the CT chunk hash saw no z (ink9um 1.21x, half the CPU) (2026-11-16, branch inkspeed-20261116)
 
 perf on ink9um over one PHerc1667 segment (194.6 Mpx, card 1, local CT): ct_find 45 % of the CPU samples, ct_tri 13 %, render_worker 8 %.
@@ -116,6 +513,20 @@ so all chunks of a band that differ in z alone probed one chain. A full 64-bit m
 36 -> 16 s, network 87 -> 85 s. Output: ink-ext is not bit-reproducible run to run (the old binary twice: 3.45 M of 206.8 M px differ by
 1); old vs fixed differ by the same (3.42 M px, max 2). test_ink_ext_tiling runs again (its weights linked under ~/ufsm-data/inkext;
 the PyTorch parity tests need upstream villa / hecate sources, not run here). Fast tier: 330 PASS, 1 SKIP, 2 NEED2 (card 0 in training).
+
+## mcc 367942e: spill-slot sharing could give two live values one stack slot (fixed; try8 not affected) (2026-11-16, branch mcc-rafix-20261116)
+
+microc d2117c0 (11-15) shares a spill slot between the two sides of a copy when their live ranges never meet; the merged range list
+is built by ra.c ranges_union, which held a pointer into the range pool (rg_next) across the pool's realloc. When the pool grew in
+the middle of a union, the link went into the freed block and the merged list lost its tail, so a later merge could put a value on a
+slot still live with another one. Found when an experimental loop split segfaulted in it (villawind.c -g); fixed by keeping the tail
+by index (microc 367942e).
+
+Scope, from an instrumented compiler that reproduces the old truncation (it gives the old frames byte for byte) and tests every merge
+against the true ranges: try8's binary (ufsm a3d7b7eb, mcc a420db2, release): 448 host units, 0 bad merges. Pin 7add328 (master
+0f8c0f18, verify): 3 bad merges in sample.c draw_. The fix changes 14 host objects (slot numbers and frame size only), PTX identical.
+The loop split that found it, extended to registers a loop writes (copy in, copies back at each exit), measured neutral (paired A/B
++0.19 % cycles, geomean 0.998) and was dropped.
 
 ## mcc 7add328: host code, where the 1.3-1.4x against clang comes from; the slot-argument inline bonus (2026-11-16, branch mcc-host-20261116)
 
@@ -222,6 +633,12 @@ its STATUS.md).
   --gn-live for gn_ema checkpoints + --axis; after_mega count-field --dir (refused since the spiral-hand fix) and its CUDA device
   (it ran on card 0 whatever GPU said); the Paris 4 J-box GT moved to the datafix raster ("nothing scored"); gtboxes.sh refuses a
   missing GT store.
+
+**Closing rows (2026-11-16 13:22).** e2e rerun on a3d7b7eb: PASS (12 rows). Unroll #21 ink at LV1 vs LV2 (1667, inkpod 15000):
+LV2 AUC 0.797 all / 0.589 heldout / 0.850 rest; LV1 0.50 on every split, training data included: the ink net only works at its
+training voxel size, so finer-level ink needs a net trained at 4.8 um. Geometry #5 packed (Paris 4 ids right, PH 4 boxes / J 34 boxes):
+base 0.234 / 0.259, rp2 0.199 / 0.206, rp4 0.150 / 0.181, rs12 0.152 / 0.170, pw4 identical to base: no default changes. Every audit
+item now has a result (/vesuvius/ufsm/audit-20261114/STATUS.md).
 
 ## The ink builder's GPU buffers under one budget (2026-11-16, try7's step-450 death)
 

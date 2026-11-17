@@ -3,7 +3,9 @@
    - the inherited ranges are exactly the copied tensors (count = the donor's level-1.. encoder / down / decoder tensors);
    - with multiplier 0, one Muon step and one AdamW step leave every inherited parameter bit-identical and change the fresh stem and head;
    - with multiplier 1 the inherited parameters do change (the split is not a freeze by accident);
-   - a checkpoint round trip keeps the ranges (unet_load), so a resumed run still holds the inherited parameters at the multiplier. */
+   - a checkpoint round trip keeps the ranges (unet_load), so a resumed run still holds the inherited parameters at the multiplier;
+   - the same with NorMuon (--normuon 1: the ext path's per-matrix multipliers), two steps on one net: the second step's host descriptor
+     list must follow the device table's inherited-first order (2026-11-16: it did not, the multipliers paired with the wrong matrices). */
 #include "unet.h"
 #include <math.h>
 #include <stdio.h>
@@ -46,18 +48,20 @@ int main(void) {
     float *xh = malloc(2 * p3 * 4); for (size_t i = 0; i < 2 * p3; i++) xh[i] = frand();
     float *x = nn_malloc(2 * p3 * 4); nn_h2d(x, xh, 2 * p3 * 4);
     int bad = 0;
-    for (int muon = 1; muon >= 0; muon--) {
-        unet *u = unet_create(&cu); unet_init(u, 11);
+    for (int arm = 2; arm >= 0; arm--) {
+        const int muon = arm >= 1, nm = arm == 2;
+        unet *u = unet_create(&cu); unet_init(u, 11); if (nm) unet_set_muon_variant(u, 0, 1, 0.95f);
         unet_set_init_shift(1); const int nt = unet_init_from(u, path); unet_set_init_shift(0);
         if (nt <= 0) { printf("init_from failed\n"); return 1; }
         int nr; unet_inherited_ranges(u, &nr);
-        printf("%s: %d tensors copied, %zu of %zu parameters inherited in %d ranges\n", muon ? "Muon" : "AdamW", nt, unet_inherited(u), unet_nparams(u), nr);
+        printf("%s: %d tensors copied, %zu of %zu parameters inherited in %d ranges\n", nm ? "NorMuon" : muon ? "Muon" : "AdamW", nt, unet_inherited(u), unet_nparams(u), nr);
         bad += !(unet_inherited(u) > 0 && unet_inherited(u) < unet_nparams(u));
-        bad += check(u, x, xs, nl, muon, 0.f, muon ? "Muon + AdamW step" : "AdamW step");
+        bad += check(u, x, xs, nl, muon, 0.f, nm ? "NorMuon + AdamW step" : muon ? "Muon + AdamW step" : "AdamW step");
+        bad += check(u, x, xs, nl, muon, 0.f, "second step (built table)");
         /* checkpoint round trip: the ranges come back, the multiplier still holds the inherited parameters */
         char p2[] = "/tmp/ufsm_test_initlr2_XXXXXX"; { int fd = mkstemp(p2); if (fd >= 0) close(fd); }
         if (unet_save(u, p2, 1, nullptr)) { printf("cannot save\n"); return 1; }
-        unet *v = unet_create(&cu);
+        unet *v = unet_create(&cu); if (nm) unet_set_muon_variant(v, 0, 1, 0.95f);
         if (unet_load(v, p2) < 0) { printf("cannot load\n"); return 1; }
         int nv; const size_t *rv = unet_inherited_ranges(v, &nv), *ru = unet_inherited_ranges(u, &nr);
         const int same = nv == nr && !memcmp(rv, ru, (size_t)nr * 2 * sizeof *ru);

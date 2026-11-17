@@ -3,6 +3,7 @@
    recto-ruler: the peaks count 1 per GT turn (offset-free), off share small; a dump is written; recto-cls trains on it; recto-sp gives
    the recto spacing 16 native voxels (sp code 64 at h 2) on the material cells. */
 #include "fit.h"
+#include "rectoruler.h"
 #include "z3w.h"
 #include "zarr3.h"
 #include "store.h"
@@ -35,7 +36,26 @@ static double tsv_val(const char *path, const char *table, const char *bin, cons
     return v;
 }
 
+/* rr_peaks' smoothing with its gaussian taps from a table (2026-11-16) against the per-sample exp it replaced: the same floats */
+static void peaks_taps(void) {
+    enum { N = 400 }; float v[N], t1[N], t2[N]; uint8_t mat[N]; rr_hit h[N / 2 + 2]; srand(5);
+    for (int i = 0; i < N; i++) { v[i] = (i % 97 == 13) ? NAN : (float)(100 + 80 * sin(i * 0.31) + rand() % 20); mat[i] = 1; }
+    const double sigs[] = {0.7, 2.0, 4.6, 30.0, 120.0};
+    for (int s = 0; s < 5; s++) {
+        const double sig = sigs[s]; const int R = (int)ceil(3 * sig);
+        for (int i = 0; i < N; i++) {
+            double a = 0, ws = 0;
+            for (int d = -R; d <= R; d++) { const int k = i + d; if (k < 0 || k >= N || !(v[k] == v[k])) continue; const double g = exp(-0.5 * (d / sig) * (d / sig)); a += g * v[k]; ws += g; }
+            t1[i] = ws > 0 && v[i] == v[i] ? (float)(a / ws) : NAN;
+        }
+        rr_peaks(v, mat, N, sig, 5, 20, 3, h, t2);
+        int bad = 0; for (int i = 0; i < N; i++) bad += memcmp(&t1[i], &t2[i], sizeof(float)) != 0;
+        CHECK(!bad, "rr_peaks sig %g: %d smoothed samples differ from the per-sample exp", sig, bad);
+    }
+}
+
 int main(void) {
+    peaks_taps();
     char dir[] = "/tmp/ufsm-recto-XXXXXX"; if (!mkdtemp(dir)) { fprintf(stderr, "FAIL: tmp dir\n"); return 1; }
     char p[700], m1[600], fd[600], cd[600], tsv[600], dump[600], cls[600], out[600];
     snprintf(m1, sizeof m1, "%s/m16", dir); snprintf(fd, sizeof fd, "%s/fields", dir); snprintf(cd, sizeof cd, "%s/codes", dir); snprintf(tsv, sizeof tsv, "%s/rr.tsv", dir);
@@ -73,8 +93,8 @@ int main(void) {
     char *ac[] = {"ufsm", "recto-cls", "train", cls, dump, "--trees", "5", "--depth", "2"};
     CHECK(cmd_recto_cls(9, ac) == 0, "recto-cls train");
     CHECK(access(cls, F_OK) == 0, "classifier file");
-    char *as[] = {"ufsm", "recto-sp", fd, out, "--src", dir, "rv.zarr", "9.6", "--stride", "2", "--half-um", "300", "--threads", "4"};
-    CHECK(cmd_recto_sp(14, as) == 0, "recto-sp");
+    char *as[] = {"ufsm", "recto-sp", fd, out, "--src", dir, "rv.zarr", "9.6", "--stride", "2", "--half-um", "300", "--threads", "4", "--gpu", "-1"};   /* (the CPU path; test_recto_gpu: the GPU's) */
+    CHECK(cmd_recto_sp(16, as) == 0, "recto-sp");
     {   z3 *z = z3_open(store_open(out), "rsp", nullptr); CHECK(z != nullptr, "open rsp");
         if (z) { uint8_t *b = malloc(nc); const int64_t o[3] = {0, 0, 0}, n[3] = {D, HH, HH}; CHECK(!z3_read(z, o, n, b, 4), "read rsp");
             long long cnt = 0, mat = 0; double s = 0; for (size_t i = 0; i < nc; i++) { if (!a[9][i]) continue; mat++; if (b[i]) { cnt++; s += b[i]; } }

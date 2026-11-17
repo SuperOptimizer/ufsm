@@ -2585,7 +2585,7 @@ int fit_fields_load_ex(const char *dir, int fz0, int fz1, int pool, fit_fields_b
        false ignores a stale one, absent: used when present) */
     const int w4_d = (int)json_num(json_get(j, "w4_d"), 0);
     const json *jr = json_get(j, "recto"); const int want_recto = !jr ? -1 : (jr->type == J_BOOL || jr->type == J_NUM) ? (jr->num != 0) : -1;
-    int act[17], nact = 0, boxraw[17] = {0}; for (int k = 0; k < 10; k++) if (!(g_skip_planes & 4 && pool == 1 && k >= 2 && k < 8) && !(g_skip_planes & 8 && pool == 1 && k == 8)) act[nact++] = k;   /* (bit 2: the normals stay off the host: fit_fields_load_stream; bit 3: no sp, fit-join) */
+    int act[17], nact = 0, boxraw[17] = {0}; for (int k = 0; k < 10; k++) if (!(g_skip_planes & 4 && pool == 1 && k >= 2 && k < 8) && !(g_skip_planes & 8 && pool == 1 && k == 8) && !(g_skip_planes & 16 && pool == 1 && k < 2)) act[nact++] = k;   /* (bit 2: the normals stay off the host: fit_fields_load_stream; bit 3: no sp, fit-join; bit 4: no phase pc / ps, recto-sp's GPU path) */
     if (pool == 1 && w4_d > 0 && !(g_skip_planes & 2)) for (int k = 10; k < 14; k++) act[nact++] = k;
     if (pool == 1 && want_recto != 0 && !(g_skip_planes & 1)) {
         snprintf(path, sizeof path, zarr ? "%s/r/zarr.json" : "%s/r.raw", dir);

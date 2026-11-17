@@ -174,7 +174,21 @@ static void test_sets(void) {
         /* and the tile weights matter: the plain blend differs somewhere in pc */
         fit_fields_buf g5; CHECK(fit_fields_load(o1, 0, 0, 1, &g5) == 0, "reload plain");
         int dif = 0; for (size_t i = 0; i < n; i++) dif += g4.a[0][i] != g5.a[0][i]; CHECK(dif > 0, "tile weights changed nothing");
-        fit_fields_free(&g4); fit_fields_free(&g5);
+        /* a second input over a larger box on the same cells (B's whole zarr arrays: one cell more before on z / x, two on y, one after)
+           is cropped to in[0]'s cells: the same blend byte for byte (unroll FBLEND: the half-stride grid predicted on its own grid's box) */
+        char bb[256], o6[256], o7[256]; snprintf(bb, sizeof bb, "%s/bbig", tmp); snprintf(o6, sizeof o6, "%s/tilebig", tmp); snprintf(o7, sizeof o7, "%s/small0", tmp);
+        mkdir(bb, 0755);
+        static const char *nm[15] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w", "dz", "dy", "dx", "dq", "r"};
+        for (int k = 0; k < 15; k++) { char a[512], b[512]; snprintf(a, sizeof a, "%s/%s", zb, nm[k]); snprintf(b, sizeof b, "%s/%s", bb, nm[k]); CHECK(symlink(a, b) == 0, "link %s", nm[k]); }
+        snprintf(p, sizeof p, "%s/fields.json", bb); FILE *fj = fopen(p, "w");
+        fprintf(fj, "{\"format\": \"zarr\", \"origin\": [98, 196, 298], \"shape\": [%d, %d, %d], \"h\": 2, \"um\": 9.6, \"w4_d\": 16}\n", D + 2, H + 2, W + 2); fclose(fj);
+        const char *in3[2] = {ra, bb};
+        CHECK(fblend_run2(o6, 2, in3, nullptr, &op, 2) == 0, "blend --tile, larger second input");
+        fit_fields_buf g6; CHECK(fit_fields_load(o6, 0, 0, 1, &g6) == 0, "load cropped tile blend");
+        for (int k = 0; k < 15; k++) { int bad = 0; for (size_t i = 0; i < n; i++) if (!g6.a[k] || g6.a[k][i] != ex[k][i]) bad++; CHECK(!bad, "cropped tile plane %d: %d cells differ", k, bad); }
+        fit_fields_free(&g6);
+        /* the first input is never cropped: the larger set first and the smaller second covers other cells (refused) */
+        const char *in4[2] = {bb, ra}; CHECK(fblend_run2(o7, 2, in4, nullptr, &op, 2) == 2, "smaller second input refused");
     }
     /* ct: A's own plane passed through (first input A); with B first it is not B's, so it is left out */
     snprintf(p, sizeof p, "%s/ct.raw", o1); FILE *f = fopen(p, "rb"); uint8_t got[D * H * W] = {0};

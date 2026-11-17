@@ -1544,7 +1544,7 @@ static int predict_one(int argc, char **argv) {
        A net trained with --skip-empty (checkpoint key skip_empty, DESIGN 2026-11-14): on by default with the training's threshold, margin
        and levels, so predict / ueval see the net they trained (--skip-empty 0: dense) */
     int skip_empty = opt_atoi("--skip-empty", opt(argc, argv, "--skip-empty", "-1")), skip_thr = opt_atoi("--skip-thr", opt(argc, argv, "--skip-thr", "-1")), skip_margin = opt_atoi("--skip-margin", opt(argc, argv, "--skip-margin", "-1")), skip_nl = 0;
-    long skip_wins = 0, skip_masked = 0, skip_calls = 0; double skip_share0 = 0;
+    long skip_wins = 0, skip_zero = 0, skip_masked = 0, skip_calls = 0; double skip_share0 = 0;
     const int fea = opt_atoi("--feather", opt(argc, argv, "--feather", "0"));   /* --feather B (above) */
     if (tta < 1 || tta > TTA_MAX) { fprintf(stderr, "predict: --tta 1..%d\n", TTA_MAX); return 2; }
     if (tta > 1 && ffct) { fprintf(stderr, "predict: --tta with --fit-ct is not supported (the CT planes pool one pass); add them later with ufsm ct-fields\n"); return 2; }
@@ -1552,7 +1552,7 @@ static int predict_one(int argc, char **argv) {
     const int iso = opt_atoi("--iso", opt(argc, argv, "--iso", "0"));   /* the void cutoff: probability outputs 0 where CT < iso (the fit keeps CT > 0) */
     if (iso < 0 || iso > 255) { fprintf(stderr, "--iso: 0..255\n"); return 2; }
     nn_set_pred_iso(iso);
-    const char *cache = opt(argc, argv, "--cache", nullptr), *axisf = opt(argc, argv, "--axis", nullptr);
+    const char *cache = opt(argc, argv, "--cache", getenv("UFSM_HTTP_CACHE")), *axisf = opt(argc, argv, "--axis", nullptr);
     /* no --axis = the radial input channels (scroll-outward direction) are zero for the whole run: the nets are trained with the axis on
        (almost) every source, so this silently degraded the latent ink / recto passes (audit 2026-11-14). An explicit --no-axis 1 runs anyway. */
     if (!(axisf && *axisf) && !opt_atoi("--no-axis", opt(argc, argv, "--no-axis", "0")) && !ufsm_env_on("UFSM_PRED_NO_AXIS")) {   /* (the env: the test suite's fixtures) */
@@ -1565,10 +1565,13 @@ static int predict_one(int argc, char **argv) {
         const size_t l = strlen(grid_attrs);
         snprintf(grid_attrs + l, sizeof grid_attrs - l, ",\"axis\":\"%s\",\"radial_sign\":%d", axisf && *axisf ? axisf : "none", axisf && *axisf ? (int)radial_sign : 0); }
     long long boxv[6]; const char *box = opt(argc, argv, "--box", nullptr); char tail;
+    /* with --grid-origin a box may start up to a shard before the volume (CT there reads as fill): unroll.sh starts the half-stride
+       fields grid's box on its own window grid, which for a box at 0 lies before the volume (2026-11-16) */
+    const long long lo0 = grid ? -(long long)opt_atoi("--shard", opt(argc, argv, "--shard", "512")) : 0;
     if (!isfinite(um) || um <= 0 || W <= 0 || halo < 0 || halo >= W / 2 || shard < 128 || shard % 128 ||
         level < 0 || level > 20 || nlev < 1 || nlev > 20 || nthreads < 1 || !isfinite(q) || q < 0 ||
         (box && (sscanf(box, "%lld,%lld,%lld,%lld,%lld,%lld%c", &boxv[0], &boxv[1], &boxv[2], &boxv[3], &boxv[4], &boxv[5], &tail) != 6 ||
-                 boxv[0] < 0 || boxv[1] < 0 || boxv[2] < 0 || boxv[3] <= 0 || boxv[4] <= 0 || boxv[5] <= 0))) {
+                 boxv[0] < lo0 || boxv[1] < lo0 || boxv[2] < lo0 || boxv[3] <= 0 || boxv[4] <= 0 || boxv[5] <= 0))) {
         fprintf(stderr, "invalid prediction geometry: require positive --um/window/box, 0 <= halo < window/2, shard a multiple of 128, and valid levels/threads/q\n"); return 2;
     }
     if (box) for (int d = 0; d < 3; d++) {
@@ -2937,7 +2940,7 @@ static int predict_one(int argc, char **argv) {
                 else nn_lowres_input(xd, xs, hdiv, hmode, lrt, x2, h16);
                 nn_ptick("input pool");
                 const int skw = skip_empty && half == 3 && ctd && gpath && !lat_store && !lvq;   /* (the CT window in ctd until the forward) */
-                if (skw && !nn_skip_build(ctd, Wz, W, W, 4, skip_nl, skip_thr, skip_margin)) { skip_wins++; if (ufsm_env_on("UFSM_SKIP_REPORT")) skip_share0 += nn_skip_share(0); }
+                if (skw && !nn_skip_build(ctd, Wz, W, W, 4, skip_nl, skip_thr, skip_margin)) { skip_wins++; if (ufsm_env_on("UFSM_SKIP_REPORT")) { const double sh0 = nn_skip_share(0); skip_share0 += sh0; skip_zero += sh0 <= 0; } }
                 if (skw && ufsm_env_on("UFSM_SKIP_AB")) skip_ab(u, x2, xn, h16, ctd, Wz, W, cfg.cout);   /* the dense / masked A/B of this window */
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
                 if (skw) { long m_, c_; nn_skip_counts(&m_, &c_); skip_masked += m_; skip_calls += c_; nn_skip_off(); }
@@ -3390,6 +3393,7 @@ static int predict_one(int argc, char **argv) {
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs end-to-end, the windows %.0fs)\n", out, ntiles, now() - t0, t_win);
     if (skip_empty) fprintf(stderr, "predict: --skip-empty: %ld windows masked (thr %d, margin %d), %ld of %ld conv launches masked%s%.3f\n", skip_wins, skip_thr, skip_margin, skip_masked, skip_calls,
                             ufsm_env_on("UFSM_SKIP_REPORT") ? ", mean level-0 active tile share " : "", ufsm_env_on("UFSM_SKIP_REPORT") && skip_wins ? skip_share0 / skip_wins : -1.);
+    if (skip_empty && ufsm_env_on("UFSM_SKIP_REPORT")) fprintf(stderr, "predict: --skip-empty: %ld windows with no active level-0 tile (run at their bias throughout)\n", skip_zero);
     if (lvm) { double ds = 0; long dn = 0; nn_latvol_stats(lvL, &ds, &dn);
         fprintf(stderr, "predict: latvol CT: %.3f GB of chunk streams uploaded and decoded on the device (%.4f B per box voxel); the decode kernels %.3f s in %ld windows (%.1f Gvox/s of window voxels); %ld windows as host-decoded voxels\n",
                 lv_up / 1e9, lv_up / ((double)bn[0] * bn[1] * bn[2]), ds, dn, ds > 0 ? (double)dn * (double)w3 / 1e9 / ds : 0., lv_nfb); }

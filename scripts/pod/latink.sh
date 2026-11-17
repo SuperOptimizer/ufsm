@@ -32,9 +32,11 @@ for g in 0 256; do
   for h in ink c12 c13; do [ -e $T/g$g/$h/zarr.json ] || { echo "latink: no $h in $T/g$g"; exit 1; }; done
   touch $T/g$g.done
 done
-for h in ink c12 c13; do
-  d=$OUT; [ $h = ink ] || d=$O/ink/$h.zarr; rm -rf $d
-  $U ink-blend $d --um $LUM --tile 512,512,512 --grids 0,0,0:256,256,256 $T/g0/$h $T/g256/$h --threads $TH || { echo "latink: ink-blend $h failed"; exit 1; }
-  [ -e $d/zarr.json ] || { echo "latink: no blended $h at $d"; exit 1; }
-done
+# the three heads' blends at once (independent outputs, the same bytes): one at a time they were 3 x ~125 s + 35 s of pyramid on 0332
+# (2026-11-17), ~45 % of the ink stage, the GPU idle; each blend's shard loop is read -> blend -> encode in turn, so they overlap well
+bl() { local h=$1 d=$OUT; [ $h = ink ] || d=$O/ink/$h.zarr; rm -rf $d
+  $U ink-blend $d --um $LUM --tile 512,512,512 --grids 0,0,0:256,256,256 $T/g0/$h $T/g256/$h --threads $TH > $T/blend.$h.log 2>&1 || { cat $T/blend.$h.log; echo "latink: ink-blend $h failed"; return 1; }
+  cat $T/blend.$h.log; [ -e $d/zarr.json ] || { echo "latink: no blended $h at $d"; return 1; }; }
+bp=(); for h in ink c12 c13; do bl $h & bp+=($!); done
+rc=0; for p in "${bp[@]}"; do wait $p || rc=1; done; [ $rc = 0 ] || exit 1
 rm -rf $T; echo "latink: done -> $OUT (+ c12.zarr c13.zarr)"

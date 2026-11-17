@@ -156,6 +156,7 @@ ufsm_exe(test_init_lr SUITE tests/test_init_lr.c OBJS unet NN LP LIBS LDLIBS CUD
 ufsm_exe(test_ink_air SUITE tests/test_ink_air.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_ink_gate SUITE tests/test_ink_gate.c OBJS inkgate json zarr3 store z3w LIBS LDLIBS)
 ufsm_exe(test_xmx SUITE tests/test_xmx.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_xtsf SUITE tests/test_xtsf.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_ink_mil SUITE tests/test_ink_mil.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_ink_mil_check SUITE tests/test_ink_mil_check.c OBJS z3w tiffw LIBS LDLIBS DEPS ufsm make_wind_fixture)
 ufsm_exe(test_ink_mil_train SUITE tests/test_ink_mil_train.c OBJS CORE NN LP LIBS LDLIBS CUDA DEPS ufsm make_wind_fixture)
@@ -232,6 +233,8 @@ ufsm_exe(test_rc SUITE tests/test_rc.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_recompute_live SUITE tests/test_recompute_live.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_recto SUITE tests/test_recto.c OBJS rectoruler rectocls rectosp reg fit fit_emb embz z3w fit_ct l1pot coreline json zarr3
          zarr2 store NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_recto_gpu SUITE tests/test_recto_gpu.c OBJS rectoruler rectocls rectosp reg fit fit_emb embz z3w fit_ct l1pot coreline json zarr3
+         zarr2 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_reg SUITE tests/test_reg.c OBJS reg reg_init zarr3 zarr2 store json LIBS LDLIBS)
 ufsm_exe(test_reg_render SUITE tests/test_reg_render.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_regz2 SUITE tests/test_regz2.c OBJS reg zarr3 zarr2 store json LIBS LDLIBS)
@@ -240,6 +243,8 @@ ufsm_exe(test_render_absent SUITE tests/test_render_absent.c OBJS render inkcomp
 ufsm_exe(test_render_fill_gpu SUITE tests/test_render_fill.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json nn_render
          nn_gpudec LIBS LDLIBS CUDA DEFS RENDER_GPU)
 ufsm_exe(test_render_known SUITE tests/test_render_known.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json LIBS
+         LDLIBS)
+ufsm_exe(test_render_gate SUITE tests/test_render_gate.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json LIBS
          LDLIBS)
 ufsm_exe(test_render_stream SUITE tests/test_render_stream.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json LIBS
          LDLIBS)

@@ -16,6 +16,7 @@ enum { RR_NF = 25,            /* features of a hit interval (rr_feat in rectorul
 typedef struct { float pos, h, prom, wid; } rr_hit;   /* samples along the ray; height / prominence 0..255; half-prominence width (samples) */
 typedef struct { float z, r, gtq, gapn, sp; int ray, ia, ib; float t[RR_NCOL]; } rr_iv;   /* one GT interval and each source's turns */
 
+int rr_taps(double sig, double *gk);   /* rr_peaks' gaussian taps gk[0 .. 2 R] for smoothing sig; returns R = ceil(3 sig) (0: sig <= 0, no taps) */
 int rr_peaks(const float *v, const uint8_t *mat, int n, double sig, double prom, int W, double sep, rr_hit *out, float *tmp);
 
 typedef struct rr_cls rr_cls;

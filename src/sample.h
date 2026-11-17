@@ -196,6 +196,8 @@ typedef struct {
     int emb_ch, emb_div;     /* train --distill: batch.emb, the sources' "emb" feature targets (emb_ch channels, sources.h) on the grid of emb_div^3 window
                                 voxels per cell (the head's level), pulled at each cell centre through the window's symmetry and warp (trilinear,
                                 renormalised); none (0) on crushed / torn / re-bent windows, sources without "emb" and cells outside its groups */
+    int thp_off;             /* 1: no transparent huge pages for the worker scratch whatever gpu_aug says (train's validation sampler: it warps nothing,
+                                and with gpu_aug 0 each fresh regen pass compacted memory for its huge pages; DESIGN 2026-11-17 trainperf) */
 } sample_cfg;
 /* the configurations whose every sample takes write_x (no warp, sheet prior, slab appearance plan, aux or condition channels): the
    radial channels then follow from the window's corner, symmetry and axis centres alone */

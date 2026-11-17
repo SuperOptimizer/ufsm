@@ -64,11 +64,13 @@ void fb_median_known_cw(int n, const uint8_t *const *a, const float *w, const fl
 void fb_median_known(int n, const uint8_t *const *a, const float *w, size_t ncell, uint8_t *o) { fb_median_known_cw(n, a, w, nullptr, ncell, o); }
 void fb_wind4_cw(int n, const uint8_t *const (*d)[4], const float *w, const float *const *cw, size_t ncell, uint8_t *const o[4]) {
     const double k = 2 * M_PI / 256;
+    /* cos / sin of the 256 codes: the very doubles cos(k * code) gives (libm cos / sin were 18 % of a field-blend, 2026-11-16) */
+    double ct[256], st[256]; for (int v = 0; v < 256; v++) { ct[v] = cos(k * v); st[v] = sin(k * v); }
     for (size_t j = 0; j < ncell; j++) {
         double rs = 0, ws = 0; for (int i = 0; i < n; i++) if (d[i][0]) ws += CW(i, j);
         for (int a = 0; a < 3; a++) {
             double x = 0, y = 0;
-            for (int i = 0; i < n; i++) if (d[i][0]) { const double q = CW(i, j) * d[i][3][j] / 255.0; x += q * cos(k * d[i][a][j]); y += q * sin(k * d[i][a][j]); }
+            for (int i = 0; i < n; i++) if (d[i][0]) { const double q = CW(i, j) * d[i][3][j] / 255.0; x += q * ct[d[i][a][j]]; y += q * st[d[i][a][j]]; }
             const double r = ws > 0 ? hypot(x, y) / ws : 0;
             o[a][j] = r > 0 ? (uint8_t)((long)lrint(atan2(y, x) / k) & 255) : 0;
             rs += r;
@@ -220,9 +222,10 @@ static void fb_job_combine(fb_slab *S, int j) {
         if (!(cwb = malloc((size_t)n * m * sizeof *cwb))) { atomic_store(&S->fail, 1); return; }
         for (int i = 0; i < n; i++) {
             float *q = cwb + (size_t)i * m; cw[i] = q;
+            int x = (int)(c0 % S->W), y = (int)(c0 / S->W % S->H), z = (int)(c0 / ((size_t)S->W * S->H));   /* (stepped, not divided per cell) */
             for (size_t t = 0; t < m; t++) {
-                const size_t jj = c0 + t; const int x = (int)(jj % S->W), y = (int)(jj / S->W % S->H), z = (int)(jj / ((size_t)S->W * S->H));
                 q[t] = S->aw[0][i][S->z0 + z] * S->aw[1][i][S->y0 + y] * S->aw[2][i][x];
+                if (++x == S->W) { x = 0; if (++y == S->H) { y = 0; z++; } }
             }
         }
         if (S->paste) for (size_t t = 0; t < m; t++) {   /* in[0] takes what the pasted boxes leave */
@@ -281,6 +284,18 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
             if (fabs(c - round(c)) > 1e-3) { fprintf(stderr, "field-blend: --paste: %s is off %s's cell grid on axis %d (%.3f cells)\n", in[i], in[0], d, c); rc = 2; goto done; }
             sub[i][d] = (int)lround(c);
         }
+    }
+    /* an input over a larger box on the same cell grid is cropped to in[0]'s cells (unroll FBLEND: the half-stride grid is predicted on a box
+       that starts on its own window grid, so each window runs once, not once per shard it touches: 0332 3138 -> ~650 windows, 2026-11-16) */
+    if (!paste) for (int i = 1; i < n; i++) {
+        if (fabs(I[i].h * I[i].um - I[0].h * I[0].um) > 1e-6 * I[0].h * I[0].um) continue;   /* (refused below) */
+        int c[3], ok = 1, any = 0;
+        for (int d = 0; d < 3; d++) {
+            const double x = (I[0].origin[d] * I[0].um - I[i].origin[d] * I[i].um) / (I[0].h * I[0].um);
+            c[d] = (int)lround(x); if (fabs(x - c[d]) > 1e-3 || c[d] < 0 || c[d] + I[0].shape[d] > I[i].shape[d]) ok = 0;
+            any |= c[d] != 0 || I[i].shape[d] != I[0].shape[d];
+        }
+        if (ok && any) for (int d = 0; d < 3; d++) { I[i].off[d] += c[d]; I[i].origin[d] += (long long)c[d] * I[i].h; I[i].shape[d] = I[0].shape[d]; }
     }
     if (!paste) for (int i = 1; i < n; i++) for (int d = 0; d < 3; d++)
         if (I[i].shape[d] != I[0].shape[d] || fabs(I[i].h * I[i].um - I[0].h * I[0].um) > 1e-6 * I[0].h * I[0].um ||

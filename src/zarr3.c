@@ -149,6 +149,10 @@ static z3 *z3_open_impl(store *s, const char *key, const char *cache_dir, int ty
     z->s = s;
     z->key = strdup(key);
     z->id = z3_next_id();
+    /* UFSM_HTTP_CACHE: the chunk cache of every HTTP array opened without one (unroll.sh: one per scroll run, so the fields predicts, the
+       checks, the snap and the renders read the CT from local disk after its first fetch; with the cache the predict's reader decodes
+       ~5x faster than from the network or a local root, DESIGN 2026-11-16 unroll perf). Local roots ignore it (store_cache_dir) */
+    if (!cache_dir || !*cache_dir) cache_dir = getenv("UFSM_HTTP_CACHE");
     z->cache = store_cache_dir(s, cache_dir);   /* (per root: a cache directory is never shared by two roots) */
     cache_validate(z->cache, key, val);
     pthread_mutex_init(&z->imu, nullptr);
