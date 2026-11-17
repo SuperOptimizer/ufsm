@@ -167,6 +167,15 @@ So --sparse24 mode 3, which changes results, no longer pays.
   fine input planes are a = max(z0 + zi0 - 1, 0) .. min(z1 + zi0 + 1, Di), the coarse ones are in the Di / 2 numbering, and the skip
   prenorm's mask offset is a - zi0. test_f4v has 3 new run_up cases (z-range, z-range + z-window, z-window); they are byte-equal,
   statistics included.
+  - fp4teach, 0332, 32 windows, both UFSM_F4V=1, interleaved twice, full-key ksum, outputs byte-identical (ms per window):
+
+    | recipe | master | convkup | change |
+    |---|---|---|---|
+    | fields | 177.0 / 175.6 | 170.1 / 168.8 | -3.9 % |
+    | ink | 138.5 / 138.8 | 121.9 | -12 % |
+
+  - Busy time: fields 243 -> 218 ms, ink 142 -> 129.
+  - Fields choice log: conv_fwd_f4v_k calls 72 -> 95.
 - Clusters, tried and parked (branch convkw-20261117, conv_bwd_w_f4wc_k, nvcc build, bit-equal to the plain kernel in test_f4wc):
   the CL co tiles of a (1, 1, CL) cluster share one x staging.
   - Each block stages every CL-th LY 1 group and bulk-copies its 432 B slot to the others (cp.async.bulk shared::cluster with
