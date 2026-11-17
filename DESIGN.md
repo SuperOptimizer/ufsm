@@ -6,6 +6,50 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fit-derived pseudo labels: gated winding labels from our unrolls, the build on the pod (2026-11-17, branch pseudolab-20261117)
+
+User (11-17): "at some point we need to feed our refined unwraps back in as training data — pseudolabeling and such"; (11-10) "judge the
+good parts from the bad parts". The fitter adds global spiral topology the net does not see, so a gated fit is a better target than the
+net's own predictions (the --ssl-heads path); errors are masked (weight 0), never negative labels. Desk CPU only so far.
+
+**Inventory (latent nets).** try9-6250 pod unrolls (dir -1; on the desk only wraps_snap 57 MB, qa, wrapcheck, strip; fields / joined stay
+on the pod): PHerc0332 wrap-check 54 / 7 / 4, unroll-qa tiles over conf_lo / pw48 / w4 25 / 36 / 10 of 48 -> 0.12 pass all three (0.14
+material-weighted), z drift 0.84 (ALARM), join 0.955, distort trusted 0.618; PHerc1667 39 / 6 / 6, 14 / 22 / 4 -> 0.44, drift 1.21, join
+0.960, trusted 0.623. u1-13000 PHerc0332 (unroll2, dir -1): 0.29 (0.33); its +1 twin 0.25. The 11-12 u1 batch (19 scrolls, default
++1, before unroll-qa) kept only logs except 1667-u1 (wrong hand), P4-u1 and 1299-u1; fibfit/1667/dm1 (dir -1 refit, 0.762 same-sheet vs
+the published unwrap). Dense unroll-qa (all 2126 material tiles of 128^3 cells, 13 min at 4 threads) of dm1 on the u1 fields: 0.673 pass
+(0.703 material-weighted), over conf_lo 244, pw48 525, w4 187.
+
+**Does the tile gate track truth.** geo-gate's per-GT-box ids (qa_rows.json, per-box gauge): 1667 joined boxes passing conf_lo <= 0.4,
+pw48 <= 0.1 and w4 >= 0.8: 41, mean ids 0.892, 88 % >= 0.8, none < 0.5; failing 13, mean 0.654. Paris 4 ref-cf: passing 6, mean 0.62 (2
+< 0.5); failing 31, mean 0.198. Inside a good run the tile gate selects good labels; a P4-like run must be refused whole (run gate).
+
+**Precedent.** -good (scripts/rv/good.sh: surf-labels -> gt-gate against the m7 prob, a stored gated phase, scope local) and -b3
+(scripts/univ/b3_1299.sh: phase on the fly from codes.zarr, rmax 20, one weight.zarr from phase-coh --coh 0 --box-scale --papyrus 64).
+sources.h's scope "w4" is the matching scope: the winding mod 4 trains per tile (the sampler unwraps the label phase inside the window),
+no long-range count loss.
+
+**Build (scripts/pseudo/build.sh RUN OUT), where the unroll ran.** Codes (1.6-2 GB) and weight (~1.4 GB) are label data: built on the pod
+from its own unroll, never copied desk -> pod. Steps: (1) unroll-qa --tiles 100000 --gate-boxes (new: every tile as a phase-coh box, s 0
+over a gate, 1 passing) and the run gate (material-weighted pass share >= RUNMIN 0.5, else REFUSED, exit 3); (2) surf-labels on
+wraps_snap (wrapcheck dup / merged, strip.args trim, --min-onpap 0.2, holdout boxes + 0.5 mm, dir from the manifest); (3) gt-gate against
+the m7 prob (good.sh's 25 deg / MINKEEP 0.3); (4) phase-check --cells -> the aligned reversed chunks (b3 rule (b), dirmask.py); (5)
+optional AGREE: surf-labels --gt OTHER --gt-cells (new: the GT comparison per cell) -> cells where two fits disagree (pair accuracy or
+phase agreement < 0.8, agreemask.py); (6) phase-coh --coh 0 --box-scale (agree, dir, tile) --box-default 0 --papyrus 64 -> weight.zarr;
+(7) source.json (scope w4, heads phase / normal / density / wind4 / rv, holdout_file + mask). scripts/pseudo/mksources.sh BASE OUT W DIRs
+adds them at total weight W in proportion to the gated volume. Cost on PHerc0332 u1 (desk, 4 threads): surf-labels 32 min, 3.4 GB RSS,
+66 / 73 wraps kept, phase known 21.1 cm3, kept 19.4 cm3 (0.917), codes 1.6 GB, the full phase raster 13 GB (deleted after the weight).
+
+**Qualifying now.** PHerc0332 fails the run gate (try9 0.12, u1 0.29). PHerc1667 passes (try9 0.44 on 48 tiles, dm1 0.70 dense),
+outside its GT and the C boxes. Paris 4 fails and has its own GT. The rated-good 1218 / 1299 and the -good scrolls 0139 / 0009B / 0175A
+need try9 pod unrolls with UQTILES=100000 (hands from count-field's model-coherence estimator first; 1299 / 0009B / 0175A are "?").
+
+**ssl-sources.sh MIRROR=1** (the pod A/B's unlabelled pool): the volumes of a list (VOLS, from the desk's v2/ct, a tiny file) read from
+the volcomp mirror, each checked by its zarr.json; HOLD=holdouts-20261114.json rejects every per-scroll holdout and wbench box on the CT;
+the axis is matched by scan basename. On the scratch1 -ho json: 37 unlabelled volumes on the mirror (35 locally), 11 with an axis.
+
+**Tests.** test_unroll_qa: --gate-boxes on the right model's 8 tiles (all s 1, 64^3 boxes) and the wrong model's box (s 0, --gate-scale 2
+doubles it). test_surflabels: --gt-cells against itself, every cell's kept voxels and pairs right.
 ## Unroll perf 6: 0332 end to end on master 64b2d3ed; flatten waits for device memory; the driver's stripes gated in the render (2026-11-17, branch unrollperf6-20261117)
 
 0332, card 1, u1 13000, INKAT=fields, TH=20 at nice 19 (lead: try9 first; desk load 32-39), CT cache cold (full4: warm), CLEAN=1;
