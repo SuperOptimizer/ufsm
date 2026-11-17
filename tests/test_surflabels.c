@@ -154,6 +154,19 @@ int main(void) {
     CHECK(!run(root, "wp", "d", "1", "4", "--drop", "w4", nullptr), "surf-labels --drop failed");
     CHECK(!run(root, "wd", "c", "1", "4", nullptr, nullptr, nullptr), "surf-labels dup failed");
     CHECK(!run(root, "wp", "g", "1", "4", nullptr, nullptr, "p1/codes.zarr"), "surf-labels --gt failed");
+    {   /* --gt-cells (2026-11-17): against itself every cell's kept voxels agree (share 1) and every cell's own pairs are right */
+        char gc[400]; snprintf(gc, sizeof gc, "%s/gtcells.tsv", root);
+        CHECK(!run(root, "wp", "gc", "1", "4", "--gt-cells", gc, "p1/codes.zarr"), "surf-labels --gt-cells failed");
+        FILE *f = fopen(gc, "r"); char l[512]; int rows = 0, agree = 0, scored = 0, right = 0;
+        if (f && fgets(l, sizeof l, f)) while (fgets(l, sizeof l, f)) {
+            long long z, y, x, c, kk; int n; double a25, pmm, pa; size_t nr, np;
+            if (sscanf(l, "%lld %lld %lld %d %lld %lld %lf %zu %lf %lf %zu", &z, &y, &x, &n, &c, &kk, &a25, &nr, &pmm, &pa, &np) < 9) continue;
+            rows++; agree += kk > 0 && a25 == 1.0; if (np > 0) { scored++; right += pa == 1.0; }
+        }
+        if (f) fclose(f);
+        CHECK(rows >= 4 && agree == rows && scored > 0 && right == scored, "--gt-cells against itself: cells with kept voxels or pairs that disagree");
+        fprintf(stderr, "test_surflabels: --gt-cells %d cells, %d agreeing, %d / %d pair-scored right\n", rows, agree, right, scored);
+    }
     { char ct[400]; for (int v = 0; v < 2; v++) {
         snprintf(ct, sizeof ct, "%s/ct%d", root, v); char o[32]; snprintf(o, sizeof o, "coh%d", v);
         char ax[400], wdp[400], od[400]; snprintf(ax, sizeof ax, "%s/axis.json", root); snprintf(wdp, sizeof wdp, "%s/wp", root); snprintf(od, sizeof od, "%s/%s", root, o);

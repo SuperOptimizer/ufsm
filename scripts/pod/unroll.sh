@@ -17,7 +17,11 @@ set -u
 S=${1:?usage: unroll.sh SCROLL}; shift || true
 POD=${POD:-$([ "$(id -u)" = 0 ] && echo /root/pod || echo $HOME/pod)}
 E=$POD/scrolls/$S.env; [ -e $E ] || { echo "pod/unroll: no $E: run scripts/pod/setup.sh $S first"; exit 2; }
+# the caller's CK / INKCK / U win over the env file's (setup.sh writes wind96 there; podunroll 11-17: CK=try9 from the environment was
+# silently replaced by the sourced file's wind96)
+CK0=${CK:-}; INKCK0=${INKCK:-}; U0=${U:-}
 . $E
+CK=${CK0:-$CK}; INKCK=${INKCK0:-$INKCK}; U=${U0:-$U}
 # axis check (lead 11-12, after MANB: its corpus axis sat 3-10 mm off the papyrus): the corpus axis vs the papyrus centroid on level LV+3;
 # off by > 2 mm at any of 5 z levels, or outside the papyrus -> the centroid axis (scrolls/S/axis_centroid.json). Skipped when the run already started (axis.json there).
 if [ ! -e ${UR:-$POD/unroll}/$S/axis.json ] && [ "${AXCHECK:-1}" = 1 ]; then U=$U POD=$POD bash ${UNROLL_REPO:-$POD/ufsm}/scripts/pod/axcheck.sh $S $AXS; [ $? = 3 ] && AXS=$POD/scrolls/$S/axis_centroid.json && sed -i "s#AXS=[^;]*;#AXS=$AXS;#" $E; fi
@@ -27,7 +31,7 @@ NC=$($U sysinfo --ncpu 2>/dev/null || echo ${NCPU:-8}); LIM=$($U sysinfo --limit
 # the driver reads its scan row (CT root, key, um, level, axis, box, zr, strip args) from scrolls.tsv beside it: give it one with
 # the pod's local CT (CTROOT / CTKEY env do the same in newer drivers)
 B=$POD/drv/$S; mkdir -p $B   # per-scroll helper dir: concurrent queue lanes must not share scrolls.tsv or inkpub.sh
-cp $D/unroll.sh $B/ && cp $D/fields_cat.sh $B/ 2>/dev/null; for f in $D/*.sh; do [ -e $B/$(basename $f) ] || cp $f $B/; done
+cp $D/unroll.sh $D/spiral_dir.tsv $B/ && cp $D/fields_cat.sh $B/ 2>/dev/null; for f in $D/*.sh; do [ -e $B/$(basename $f) ] || cp $f $B/; done
 printf 'scroll\troot\tkey\tum\tlevel\taxis\tbox\tzr\tstrip\n%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' $S $R $K $UM $LV $AXS $BOX "${ZR:--}" "${STRIPARGS:--}" > $B/scrolls.tsv
 export U CK INKCK UNROLL_REPO=$REPO CTROOT=$R CTKEY=$K BOX
 export UR=${UR:-$POD/unroll} TH=${TH:-$NC} PTH=${PTH:-$NC} ITH=${ITH:-$NC} FIELDGPUS=${FIELDGPUS:-0} FITGPUS=${FITGPUS:-0} INKGPU=${INKGPU:-0}
@@ -38,7 +42,9 @@ export UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4}
 export INKW=${INKW:-576}   # ink window: auto took 1600^3 / 90 GB on a free card and starved the other lane (0814, 11-12); 576 = 512 + 2 x halo 32 (feather needs window - 2 halo = k x shard)
 # ink: the latent universal ink head (user 11-13: no more ift3), inkB recipe: scripts/pod/latink.sh (2-grid predict --heads ink,c12,c13 + ink-blend);
 # the stripe renders gate the ink by max(p_recto, p_verso) (strip_refill.sh INKGATE)
-export INKCMD=${INKCMD-${UNROLL_REPO:-$POD/ufsm}/scripts/pod/latink.sh} INKNAME=${INKNAME:-inkpod-9000} INKGATE="${UR:-$POD/unroll}/$S/ink/c12.zarr ${UR:-$POD/unroll}/$S/ink/c13.zarr"
+# the ink checkpoint: the newest inkpod snap (15000, as the desk driver; podunroll 11-17: this wrapper still named 9000), uploaded as $POD/ckpt/inkpod-15000.ckpt
+export LATINK_CK=${LATINK_CK:-$POD/ckpt/inkpod-15000.ckpt}
+export INKCMD=${INKCMD-${UNROLL_REPO:-$POD/ufsm}/scripts/pod/latink.sh} INKNAME=${INKNAME:-inkpod-$(basename $LATINK_CK .ckpt | sed 's/^inkpod-//')} INKGATE="${UR:-$POD/unroll}/$S${TAG:-}/ink/c12.zarr ${UR:-$POD/unroll}/$S${TAG:-}/ink/c13.zarr"
 # a published ink (setup.sh fetched it): use it instead of predicting one
 if [ -n "${INKPUB:-}" ] && [ -z "${INKCMD:-}" ]; then export INKCMD="$B/inkpub.sh"
   printf '#!/bin/sh\n# INKCMD O GPU OUT: the published ink (setup.sh) linked in; a missing one fails loudly (no dangling link)\n[ -e %s/zarr.json ] || { echo "inkpub: %s has no zarr.json" >&2; exit 1; }\nmkdir -p "$(dirname "$3")" && ln -sfn %s "$3"\n' "$INKPUB" "$INKPUB" "$INKPUB" > $B/inkpub.sh; chmod +x $B/inkpub.sh; fi

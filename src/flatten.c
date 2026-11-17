@@ -270,7 +270,18 @@ int flat_gpu_devices(void) { return flat_gpu_count ? flat_gpu_count() : 0; }
 
 /* SLIM iterations on S (S->x = the current uv, flip-free) */
 static double slim_run(slim *S, const flat_opts *o, int iters, const char *tag) {
-    if (o->gpu && flat_slim_gpu) { double E; if (!flat_slim_gpu(S->g, S->A, S->tri, S->nt, S->vo, S->vl, S->nv, S->x, iters, o->cg_iters, o->tol, o->verbose, tag, o->gpu_dev, &E, o->cg_fp32)) return E; }
+    if (o->gpu && flat_slim_gpu) {
+        /* a full device (a shared card: the per-wrap lanes beside the strip renders) waits for memory, up to UFSM_FLAT_GPU_WAIT s (300), instead
+           of the CPU solver: 0332 e2e 2026-11-17, three wraps fell back at full resolution and took 179-246 s against ~25 s on the GPU */
+        const char *we = getenv("UFSM_FLAT_GPU_WAIT"); const double wmax = we ? atof(we) : 300; double waited = 0, E;
+        for (;;) {
+            const int rc = flat_slim_gpu(S->g, S->A, S->tri, S->nt, S->vo, S->vl, S->nv, S->x, iters, o->cg_iters, o->tol, o->verbose, tag, o->gpu_dev, &E, o->cg_fp32);
+            if (!rc) { if (waited > 0) fprintf(stderr, "flatten: %s: device memory after %.0f s of waiting\n", tag, waited); return E; }
+            if (rc != -2 || waited >= wmax) { if (rc == -2) fprintf(stderr, "flatten: %s: device memory full for %.0f s: CPU solver\n", tag, waited); break; }
+            if (waited == 0) fprintf(stderr, "flatten: %s: device memory full: waiting (up to %.0f s, UFSM_FLAT_GPU_WAIT) instead of the CPU solver\n", tag, wmax);
+            struct timespec ts = {2, 0}; nanosleep(&ts, nullptr); waited += 2;
+        }
+    }
     double E = energy_at(S, S->x); const size_t n2 = (size_t)S->nv * 2;
     if (o->verbose) fprintf(stderr, "flatten: %s %d vertices %d triangles, energy %.5f\n", tag, S->nv, S->nt, E);
     if (!isfinite(E)) return E;

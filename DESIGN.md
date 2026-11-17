@@ -41,6 +41,63 @@ Also measured (convk's conv_fwd_f4v_k, branch convk-20261117 71ef14b2, UFSM_F4V 
 kernel minima per window fields 178.0 -> 187.8 ms (+5.5 %), ink 128.0 -> 144.0 (+12.5 %); sent to convk before its merge.
 Ink teachers on the same quiet window: see the 2026-11-16 section (ink9um 1667 segment fp16 old 163.7 s, fused 127.9, MX5 100.9, pick 116.0).
 
+## Fit-derived pseudo labels: gated winding labels from our unrolls, the build on the pod (2026-11-17, branch pseudolab-20261117)
+
+User (11-17): "at some point we need to feed our refined unwraps back in as training data — pseudolabeling and such"; (11-10) "judge the
+good parts from the bad parts". The fitter adds global spiral topology the net does not see, so a gated fit is a better target than the
+net's own predictions (the --ssl-heads path); errors are masked (weight 0), never negative labels. Desk CPU only so far.
+
+**Inventory (latent nets).** try9-6250 pod unrolls (dir -1; on the desk only wraps_snap 57 MB, qa, wrapcheck, strip; fields / joined stay
+on the pod): PHerc0332 wrap-check 54 / 7 / 4, unroll-qa tiles over conf_lo / pw48 / w4 25 / 36 / 10 of 48 -> 0.12 pass all three (0.14
+material-weighted), z drift 0.84 (ALARM), join 0.955, distort trusted 0.618; PHerc1667 39 / 6 / 6, 14 / 22 / 4 -> 0.44, drift 1.21, join
+0.960, trusted 0.623. u1-13000 PHerc0332 (unroll2, dir -1): 0.29 (0.33); its +1 twin 0.25. The 11-12 u1 batch (19 scrolls, default
++1, before unroll-qa) kept only logs except 1667-u1 (wrong hand), P4-u1 and 1299-u1; fibfit/1667/dm1 (dir -1 refit, 0.762 same-sheet vs
+the published unwrap). Dense unroll-qa (all 2126 material tiles of 128^3 cells, 13 min at 4 threads) of dm1 on the u1 fields: 0.673 pass
+(0.703 material-weighted), over conf_lo 244, pw48 525, w4 187.
+
+**Does the tile gate track truth.** geo-gate's per-GT-box ids (qa_rows.json, per-box gauge): 1667 joined boxes passing conf_lo <= 0.4,
+pw48 <= 0.1 and w4 >= 0.8: 41, mean ids 0.892, 88 % >= 0.8, none < 0.5; failing 13, mean 0.654. Paris 4 ref-cf: passing 6, mean 0.62 (2
+< 0.5); failing 31, mean 0.198. Inside a good run the tile gate selects good labels; a P4-like run must be refused whole (run gate).
+
+**Precedent.** -good (scripts/rv/good.sh: surf-labels -> gt-gate against the m7 prob, a stored gated phase, scope local) and -b3
+(scripts/univ/b3_1299.sh: phase on the fly from codes.zarr, rmax 20, one weight.zarr from phase-coh --coh 0 --box-scale --papyrus 64).
+sources.h's scope "w4" is the matching scope: the winding mod 4 trains per tile (the sampler unwraps the label phase inside the window),
+no long-range count loss.
+
+**Build (scripts/pseudo/build.sh RUN OUT), where the unroll ran.** Codes (1.6-2 GB) and weight (~1.4 GB) are label data: built on the pod
+from its own unroll, never copied desk -> pod. Steps: (1) unroll-qa --tiles 100000 --gate-boxes (new: every tile as a phase-coh box, s 0
+over a gate, 1 passing) and the run gate (material-weighted pass share >= RUNMIN 0.5, else REFUSED, exit 3); (2) surf-labels on
+wraps_snap (wrapcheck dup / merged, strip.args trim, --min-onpap 0.2, holdout boxes + 0.5 mm, dir from the manifest); (3) gt-gate against
+the m7 prob (good.sh's 25 deg / MINKEEP 0.3); (4) phase-check --cells -> the aligned reversed chunks (b3 rule (b), dirmask.py); (5)
+optional AGREE: surf-labels --gt OTHER --gt-cells (new: the GT comparison per cell) -> cells where two fits disagree (pair accuracy or
+phase agreement < 0.8, agreemask.py); (6) phase-coh --coh 0 --box-scale (agree, dir, tile) --box-default 0 --papyrus 64 -> weight.zarr;
+(7) source.json (scope w4, heads phase / normal / density / wind4 / rv, holdout_file + mask). scripts/pseudo/mksources.sh BASE OUT W DIRs
+adds them at total weight W in proportion to the gated volume. Cost on PHerc0332 u1 (desk, 4 threads): surf-labels 32 min, 3.4 GB RSS,
+66 / 73 wraps kept, phase known 21.1 cm3, kept 19.4 cm3 (0.917), codes 1.6 GB, the full phase raster 13 GB (deleted after the weight).
+
+**Qualifying now.** PHerc0332 fails the run gate (try9 0.12, u1 0.29). PHerc1667 passes (try9 0.44 on 48 tiles, dm1 0.70 dense),
+outside its GT and the C boxes. Paris 4 fails and has its own GT. The rated-good 1218 / 1299 and the -good scrolls 0139 / 0009B / 0175A
+need try9 pod unrolls with UQTILES=100000 (hands from count-field's model-coherence estimator first; 1299 / 0009B / 0175A are "?").
+
+**ssl-sources.sh MIRROR=1** (the pod A/B's unlabelled pool): the volumes of a list (VOLS, from the desk's v2/ct, a tiny file) read from
+the volcomp mirror, each checked by its zarr.json; HOLD=holdouts-20261114.json rejects every per-scroll holdout and wbench box on the CT;
+the axis is matched by scan basename. On the scratch1 -ho json: 37 unlabelled volumes on the mirror (35 locally), 11 with an axis.
+
+**Tests.** test_unroll_qa: --gate-boxes on the right model's 8 tiles (all s 1, 64^3 boxes) and the wrong model's box (s 0, --gate-scale 2
+doubles it). test_surflabels: --gt-cells against itself, every cell's kept voxels and pairs right.
+## Unroll perf 6: 0332 end to end on master 64b2d3ed; flatten waits for device memory; the driver's stripes gated in the render (2026-11-17, branch unrollperf6-20261117)
+
+0332, card 1, u1 13000, INKAT=fields, TH=20 at nice 19 (lead: try9 first; desk load 32-39), CT cache cold (full4: warm), CLEAN=1;
+disk peak ~80 GB. Stage walls full4 (2026-11-17 05:00, 22445892) -> e2e5: fields 116 -> 152 (cold cache), rectosp 221 -> 87 (GPU),
+ref 92 -> 128, slabs 190 -> 230, join 24 -> 30, check 54 -> 68, wraps 37 -> 44, snap 61 -> 91 (CPU stages 20-50 % slower at nice 19
+under load), ink 682 -> 737, strip-flatten 118 -> 38 (fp32), stripimg 457 -> 442, perwrap 612 -> 1024; total 1422 -> 1928 s.
+
+- perwrap: three wraps (w082 246 s, w069 208 s, w096 179 s against ~25 s on the GPU) got "GPU unavailable (out of memory): CPU solver" at
+  full resolution, the card full with 4 flatten lanes beside the strip renders. flat_slim_gpu now returns -2 on a device allocation
+  failure (x untouched) and slim_run waits for memory, 2 s retries up to UFSM_FLAT_GPU_WAIT (300 s), before the CPU solver.
+- stripimg: the unroll driver renders the 3 middle stripes itself (the stretch) and strip_refill.sh gated them with 2 more renders each;
+  the driver now passes the c12 / c13 gates (render --gate, the same bytes) and marks them gated.
+
 ## Argus V2 (ruiconte): a Reader V3 fine-tune, runs in our reader3 port; ties reader3, adds nothing to the teacher combo (2026-11-17)
 
 Argus V2 (https://huggingface.co/ruiconte/argus-v2 @ a769fe54, `argus-v2.pth`, sha256 659130f7...de6fd matches the card, MIT,
@@ -62,6 +119,26 @@ Parity (test_ink_ext_inksdk_koine, our torch koine reference, 384 px tiles): max
 
 argus2 vs ink9um: +0.0072 [-0.0027, +0.0161]. It gains on 0139 (one of its training scrolls) and loses 0.02 on 1667. The
 card's +1 AUC point from the -2/0/+2 depth windows does not show here. Argus V2 is available as a teacher but does not join the combo.
+
+## Training perf 2: mcc's local arrays in the head kernels (fstem 1.75x, the guided fuse pass ~2x; byte-identical; 2026-11-17, branch trainperf-20261117)
+
+- **Audit.** `cuobjdump -res-usage` over the mcudahw cache (`~/.cache/mcudahw/*.cubin`, one file per call) lists the kernels with a
+  stack frame. Under mcc a small array indexed in a loop that is not unrolled lives in local memory, even when the loop has a constant
+  bound (nvcc would unroll it). The hot ones in try9's step: `lat_fuse_k` 2544 B (the guided side pair's v / ga [7][27], p / gp [7][9],
+  q / gq [7][3]; ~all of try9's lat_fuse calls are guided: lat_fuse_fin grid 6048 = 7 channels), `loss_stats_k` 1248 B and
+  `loss_grad_k` 624 B (the offset-tolerant path's helpers; not in try9's hot loop), `input_latc_k` 432, `fstem_fwd_k` / `fstem_bwd_k`
+  160 (h [16] in the 1x1 projection's `c < C` loop, go [16] in the backward, the W1 A fragments af [4][4]), `conv_fwd_f4_k` 80-216
+  (its accumulators; ptxas spills, not a loop-index array: left alone).
+- **Fix: `#pragma unroll` to the array's static bound, with the runtime bound as a guard** (`for c < FS_MAXC: if (c < C) v += ...`):
+  the same additions in the same order, so the bits are unchanged. fstem: stack 160 -> 96 B. bench_fstem (now also the fused
+  `nn_fstem_up_fwd`, the trainer's head-slab path, and hashes of all three outputs) at P 768, slab 16, 11 outputs, card 1 shared
+  with an unroll (min of 8): fused up fwd 5.04 -> 2.86 ms, plain fwd 1.96 -> 1.24-1.41, bwd 2.64-3.50 -> 1.82-1.93; the three hashes
+  identical to fd615b6f's at P 384. In try9 fstem_fwd_k is 96 calls x 4.37 ms a window: ~-170 ms (~3 %) expected, bwd ~-40 ms.
+- lat_fuse_k guided path: the channel loops of the per-row / per-voxel work unrolled (v and ga stay indexed per rz). test_lat_fuse
+  TLF_HASH=1 (new: FNV hash of each case's fused gradient) equal to the old build in all 8 cases; TLF_BENCH=768 guided grad min 12.3
+  -> 6.2 ms (shared card: only the min means anything). In try9 75 ms a window (48 calls x 1.56 ms): ~-35 ms expected.
+- Not done: loss_stats_k / loss_grad_k (frames from the tol path, not touched per voxel), conv_fwd_f4_k's spills (a register budget
+  question inside the MMA tile; the kernel is issue-bound on staging, see the headroom note in the section below).
 
 ## Training perf: try9's step profiled; the head adjoint's gather 7x faster, the w4 runs pinned (2026-11-17, branch trainperf-20261117)
 
@@ -698,6 +775,29 @@ so all chunks of a band that differ in z alone probed one chain. A full 64-bit m
 36 -> 16 s, network 87 -> 85 s. Output: ink-ext is not bit-reproducible run to run (the old binary twice: 3.45 M of 206.8 M px differ by
 1); old vs fixed differ by the same (3.42 M px, max 2). test_ink_ext_tiling runs again (its weights linked under ~/ufsm-data/inkext;
 the PyTorch parity tests need upstream villa / hecate sources, not run here). Fast tier: 330 PASS, 1 SKIP, 2 NEED2 (card 0 in training).
+
+## mcc 16cd2b7: sin + cos fused into sincos; straight-line loops of 4+ trips unroll to 1800 instructions (2026-11-16, branch mcc-host2-20261116)
+
+Host-speed round 2. Per-function excess over clang (the 16 suite lines with the largest absolute excess, perf cycles:u): the
+largest were fit_vox2 + fit_grad_terms (fit's CPU loss; 47 G, clang 17.6 G for all of cpu_loss_run), write_spatial_tm (20 G), and
+cos / sin (31 G) where clang called sincos. Paired A/B (cpu_pair: both builds of a line back to back, min of 3; A/A noise +0.5 %).
+
+| change (microc) | cycles | instructions | lines that move (instructions) |
+|---|---|---|---|
+| aba120a: sin (x), cos (x) of one x, one dominating the other: one sincos call (glibc's sincosf64 / sincosf32 alias) | -1.54 % | -0.51 % | patchid -7.7 % cycles, score_par -7.1 %, surflabels -2.1 % instructions |
+| 16cd2b7: a straight-line body (no if / continue / break / return) of >= 4 trips unrolls up to 1800 IR instructions (was 1200; token pre-test 2400 -> 4800) | -1.08 % | -1.40 % | repair -11.5 % (cycles -5.3 %), fit_emb -8.2 %, fibertrace_dyad -5.4 %; none above +0.5 % |
+
+The first unroll try (1200 -> 2400 for any body) regressed test_raster +26 % instructions: chamfer_reference's 13-neighbour loop
+with an `if (out of box) continue` per neighbour, unrolled, computed all tests up front and spilled; branchy bodies keep 1200.
+Results are bit-identical (glibc's sincos is sin's and cos's code); all 167 PTX sidecars identical.
+
+Also measured and dropped: speculating an arm's load when the join reads the same address (makes write_spatial_tm's row clamp
+loop vectorisable: +0.02 % instructions overall), turning off "a test of a just-loaded value stays a branch" (+3.7 % cycles),
+splitting whole-record `= {0}` for slot_carve (13 refusals in all of ufsm's host code: no lever).
+
+Gap to clang, same commit, paired, 118 single-thread CPU lines: instructions 1.429x (pin 367942e) -> 1.397x; cycles 1.34-1.36x
+(the two runs in different load windows). What is left is broad: spilled scalars in long float functions (fit_vox2 still 2x),
+the vectoriser's 64-bit index loops (write_spatial_tm's B0 row), CT decoders (volcomp vfx_decode_sub).
 
 ## mcc 367942e: spill-slot sharing could give two live values one stack slot (fixed; try8 not affected) (2026-11-16, branch mcc-rafix-20261116)
 

@@ -154,7 +154,9 @@ row=; for t in $POD/ufsm/scripts/unroll/scrolls.tsv $POD/ufsm/scripts/corpus/lis
   [ -e $t ] && row=$(awk -F'\t' -v s=$S '$1 == s' $t) && [ -n "$row" ] && break; done
 [ -n "$row" ] || die "$S is in neither scripts/unroll/scrolls.tsv nor scripts/corpus/list.tsv"
 IFS=$'\t' read -r _ _ K UM LV AXS TBOX TZR TSTRIP <<< "$row"
-MK=$(dirname $K)/volumes/$(basename $K); V=$POD/vol
+# the mirror key: SCROLL/volumes/SCAN; a key that already names volumes/ (scrolls.tsv rows of http CT, e.g. PHerc0332) is kept as is
+# (podunroll 11-17: it became PHerc0332/volumes/volumes/..., a 404)
+case $K in */volumes/*) MK=$K;; *) MK=$(dirname $K)/volumes/$(basename $K);; esac; V=$POD/vol
 mkdir -p $V/$K; fetch $MIRROR/$MK/zarr.json $V/$K/zarr.json || die "$MK/zarr.json"
 for l in ${LEVELS:-$(seq $LV $((LV + 3)))}; do
   curl -sfI $MIRROR/$MK/$l/zarr.json > /dev/null || continue

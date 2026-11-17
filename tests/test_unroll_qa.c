@@ -127,6 +127,26 @@ int main(void) {
         CHECK(rc == 0 && rows == 8, "tiled: exit %d, %d tiles (expected 8)", rc, rows);
         CHECK(col(tsv, "w4_x") > 0.99, "tiled: first tile wind4 x %.4f", col(tsv, "w4_x"));
     }
+    /* ---- --gate-boxes (pseudo-label gate, 2026-11-17): the right model's tiles all pass (s 1, one line each, the tiles' boxes); the wrong
+       model's box fails (s 0) and --gate-scale 2 doubles its coordinates ---- */
+    {
+        char gb[400]; snprintf(gb, sizeof gb, "%s/good.boxes", root);
+        char *av[] = {"ufsm", "unroll-qa", "--fields", fd, "--model", good, "--tile", "32", "--tiles", "8", "--threads", "2", "--gate-boxes", gb};
+        const int rc = cmd_unroll_qa(14, av);
+        FILE *f = fopen(gb, "r"); int lines = 0, pass = 0, sized = 0; char l[512];
+        while (f && fgets(l, sizeof l, f)) { if (l[0] == '#') continue; long long v[6]; int s;
+            if (sscanf(l, "%lld %lld %lld %lld %lld %lld %d", v, v + 1, v + 2, v + 3, v + 4, v + 5, &s) == 7) { lines++; pass += s == 1; sized += v[3] == 64 && v[4] == 64 && v[5] == 64; } }
+        if (f) fclose(f);
+        CHECK(rc == 0 && lines == 8 && pass == 8 && sized == 8, "gate boxes, right model: exit %d, %d lines, %d pass, %d of 64^3 voxels (expected 8, 8, 8)", rc, lines, pass, sized);
+        char bb[400]; snprintf(bb, sizeof bb, "%s/bad.boxes", root);
+        char *bv[] = {"ufsm", "unroll-qa", "--fields", fd, "--model", bad, "--fibres", fib, "--box", "0,0,0,64,256,256", "--threads", "2", "--gate-boxes", bb, "--gate-scale", "2"};
+        const int rb = cmd_unroll_qa(16, bv);
+        f = fopen(bb, "r"); long long v[6] = {-1, -1, -1, -1, -1, -1}; int s = -1, got = 0;
+        while (f && fgets(l, sizeof l, f)) if (l[0] != '#' && sscanf(l, "%lld %lld %lld %lld %lld %lld %d", v, v + 1, v + 2, v + 3, v + 4, v + 5, &s) == 7) got++;
+        if (f) fclose(f);
+        CHECK(rb == 0 && got == 1 && s == 0 && v[0] == 0 && v[3] == 128 && v[4] == 512 && v[5] == 512, "gate boxes, wrong model at scale 2: exit %d, %d lines, s %d, box %lld %lld %lld %lld %lld %lld (expected 1 line 0 0 0 128 512 512 0)",
+              rb, got, s, v[0], v[1], v[2], v[3], v[4], v[5]);
+    }
     if (!fails) { char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf -- '%s'", root); if (!strncmp(root, "/tmp/ufsm-unrollqa-", 19) && system(cmd)) {} }
     else fprintf(stderr, "(kept %s)\n", root);
     printf("%s\n", fails ? "test_unroll_qa: FAILED" : "test_unroll_qa: ok");

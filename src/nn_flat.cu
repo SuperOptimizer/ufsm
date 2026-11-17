@@ -220,7 +220,11 @@ extern "C" int flat_slim_gpu(const double *g, const double *A, const int *tri, i
              cudaMalloc(&G.Qf, T * 16) == cudaSuccess && cudaMalloc(&G.pf, V2 / 2) == cudaSuccess;
         if (ok) { k_tof<<<fl_grid(6LL * nt), FB>>>(6LL * nt, G.g, G.gf); k_tof<<<fl_grid(nt), FB>>>(nt, G.A, G.Af); }
     }
-    if (!ok) { fprintf(stderr, "flatten: GPU unavailable (%s): CPU solver\n", cudaGetErrorString(cudaGetLastError())); flg_free(&G); return -1; }
+    if (!ok) {   /* -2: the device memory is full (a shared card): the caller may wait and retry; x is untouched */
+        const cudaError_t ae = cudaGetLastError(); flg_free(&G);
+        if (ae == cudaErrorMemoryAllocation) return -2;
+        fprintf(stderr, "flatten: GPU unavailable (%s): CPU solver\n", cudaGetErrorString(ae)); return -1;
+    }
     const long long n2 = G.n2; const int bv = fl_grid(n2);
     double E = fl_energy(&G, G.x);
     if (verbose) fprintf(stderr, "flatten: %s %d vertices %d triangles, energy %.5f (GPU)\n", tag, nv, nt, E);

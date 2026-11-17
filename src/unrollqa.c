@@ -280,6 +280,7 @@ int cmd_unroll_qa(int argc, char **argv) {
         fprintf(stderr, "usage: ufsm unroll-qa --fields DIR --model SET [--ct ROOT KEY] [--fibres F.fib [--fib-um 2.4] [--hyst 0.75]]\n"
                         "         [--box Z,Y,X,NZ,NY,NX [--name N]]... | [--tile 128 --tiles 48 --min-mat 0.2]\n"
                         "         [--out DIR] [--threads 8] [--strict] [--max-conf-lo 0.40] [--max-pw48 0.10] [--min-w4 0.80] [--max-fib-pers 130] [--max-bad-share 0.35]\n"
+                        "         [--gate-boxes FILE [--gate-scale 1]]   (per-box verdicts as a phase-coh --box-scale file: s 0 over a gate, 1 passing)\n"
                         "  label-free sheet-identity QA of a fitted winding (src/unrollqa.c): per box / tile the fibre sheet changes, the net's\n"
                         "  winding-mod-4 agreement, normal tilt, density ratio, phase confidence / coherence, phase-unwrap witness, CT; warn lines,\n"
                         "  exit 3 under --strict when a gate fails (a box over its threshold; tiles: more than --max-bad-share of them; a threshold 0 turns a gate off)\n"); return 2;
@@ -371,6 +372,30 @@ int cmd_unroll_qa(int argc, char **argv) {
         fail |= bad;
     }
     if (fg) fclose(fg);
+    /* --gate-boxes FILE [--gate-scale S]: the per-box verdicts as a `phase-coh --box-scale` file for gated pseudo labels (DESIGN 2026-11-17
+       "Fit-derived pseudo labels"): every box as "z y x nz ny nx s", global native voxels x S (S: label grid / fields grid, e.g. 2 for
+       labels at half the fields' um), s 0 when any active gate is over (a gate unmeasured on the box, e.g. fibres, does not count) or
+       the box could not be measured, else 1. Passing boxes are written too, so the build can run phase-coh with --box-default 0 and
+       untiled material (tiles under --min-mat, outside the fields box) stays unlabelled. */
+    if (uq_opt(argc, argv, "--gate-boxes", nullptr)) {
+        const char *gp = uq_opt(argc, argv, "--gate-boxes", ""); const double gs = opt_atof("--gate-scale", uq_opt(argc, argv, "--gate-scale", "1"));
+        FILE *fb = gs > 0 ? fopen(gp, "w") : nullptr;
+        if (!fb) { fprintf(stderr, "unroll-qa: cannot write --gate-boxes %s (or --gate-scale %g <= 0)\n", gp, gs); free(M); free(bx); free(bn); if (C.fib) fib_free(&fib); if (C.ct) z3_close(C.ct); fit_set_free(S); return 1; }
+        fprintf(fb, "# unroll-qa gate boxes: z y x nz ny nx s (s 0 = a gate over or unmeasured box); scale %g; gates", gs);
+        for (int gi = 0; gi < UQ_NG; gi++) if (uq_gates[gi].thr > 0) fprintf(fb, " %s %s %g", uq_mname[uq_gates[gi].m], uq_gates[gi].sign > 0 ? "<=" : ">=", uq_gates[gi].thr);
+        fprintf(fb, "\n");
+        int npass = 0; double mp = 0, mt = 0;
+        for (int k = 0; k < nbox; k++) {
+            const int *c = bx[k]; int ok = 1, any = 0;
+            for (int gi = 0; gi < UQ_NG; gi++) { const uq_gate *G = &uq_gates[gi]; if (!(G->thr > 0)) continue; const double v = M[k][G->m]; if (!(v == v)) continue;
+                any = 1; if (G->sign > 0 ? v > G->thr : v < G->thr) ok = 0; }
+            ok &= any; const double mat = M[k][M_MAT] == M[k][M_MAT] ? M[k][M_MAT] : 0; npass += ok; mt += mat; mp += ok * mat;
+            long long g[6]; for (int d = 0; d < 3; d++) { g[d] = llround((double)(fo[d] + (long long)c[d] * h) * gs); g[3 + d] = llround((double)c[3 + d] * h * gs); }
+            fprintf(fb, "%lld %lld %lld %lld %lld %lld %d\n", g[0], g[1], g[2], g[3], g[4], g[5], ok);
+        }
+        fclose(fb);
+        printf("unroll-qa: gate boxes %s: %d of %d boxes pass (%.4f; material-weighted %.4f)\n", gp, npass, nbox, nbox ? (double)npass / nbox : 0, mt > 0 ? mp / mt : 0);
+    }
     printf("unroll-qa: %d boxes measured in %.1f s\n", nok, uq_now() - t0);
     free(M); free(bx); free(bn); if (C.fib) fib_free(&fib); if (C.ct) z3_close(C.ct); fit_set_free(S);
     return fail && strict ? 3 : 0;

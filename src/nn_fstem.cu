@@ -129,7 +129,10 @@ __global__ void __launch_bounds__(FS_BT) fstem_fwd_k(const f16 *__restrict__ x, 
     if (tid < FS_MAXC) { const int e = tid < C ? fs_w1_exp(p + tid * FS_T, ws) : 0; rsc[tid] = ldexpf(1.f, e); rinv[tid] = ldexpf(1.f, -e); }   /* (fstemw: per-row power-of-two W1 scale) */
     __syncthreads();
     unsigned af[4][4];   /* W1's A fragments (rows c >= C zero), each row scaled by rsc */
-    for (int s_ = 0; s_ < 4; s_++) for (int r = 0; r < 4; r++) {
+#pragma unroll
+    for (int s_ = 0; s_ < 4; s_++)
+#pragma unroll
+        for (int r = 0; r < 4; r++) {
         const int row = g + (r & 1) * 8, col = 16 * s_ + 2 * tq + (r >> 1) * 8;
         const float w0 = row < C ? p[row * FS_T + col] * rsc[row] : 0.f, w1 = row < C ? p[row * FS_T + col + 1] * rsc[row] : 0.f;
         const __half2 h2 = __floats2half2_rn(w0, w1); af[s_][r] = *(const unsigned *)&h2;
@@ -139,6 +142,7 @@ __global__ void __launch_bounds__(FS_BT) fstem_fwd_k(const f16 *__restrict__ x, 
     for (int j0 = wp * 8; j0 < t.nj; j0 += FS_BT / 32 * 8) {   /* (FS_BT / 32 warps x 8 blocks: one n-tile per warp and pass) */
         float c4[4] = {0.f, 0.f, 0.f, 0.f};
         const int jb = j0 + g < t.nj ? j0 + g : t.nj - 1;   /* (a tail tile repeats its last block: computed, not written) */
+#pragma unroll
         for (int s_ = 0; s_ < 4; s_++) {
             unsigned bf[2];
             bf[0] = *(const unsigned *)&sr[4 * s_ + tq / 2][2 * jb + 2 * (tq & 1)];
@@ -158,7 +162,9 @@ __global__ void __launch_bounds__(FS_BT) fstem_fwd_k(const f16 *__restrict__ x, 
         const size_t r0 = (size_t)(2 * t.bz - z0) * hw + (size_t)(2 * t.by) * W + 2 * bx;
         for (int o = 0; o < nout; o++) {
             if (chs.c[o] < 0) continue;   /* (an output the caller's planes do not hold) */
-            float v = 0.f; for (int c = 0; c < C; c++) v += W2[o * C + c] * h[c];
+            float v = 0.f;   /* (unrolled with a guard: a loop to C indexed h[] from local memory under mcc; the same sums, c ascending) */
+#pragma unroll
+            for (int c = 0; c < FS_MAXC; c++) if (c < C) v += W2[o * C + c] * h[c];
             __half2 *q0 = (__half2 *)(lg + (size_t)chs.c[o] * ns + r0), *q1 = (__half2 *)((f16 *)q0 + W), *q2 = (__half2 *)((f16 *)q0 + hw), *q3 = (__half2 *)((f16 *)q2 + W);
             __half2 o0, o1, o2, o3;
             if constexpr (UP) {
@@ -193,7 +199,10 @@ __global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, 
     if (tid < FS_MAXC) { const int e = tid < C ? fs_w1_exp(p + tid * FS_T, ws) : 0; rsc[tid] = ldexpf(1.f, e); rinv[tid] = ldexpf(1.f, -e); }
     __syncthreads();
     unsigned af[4][4];   /* W1's A fragments for the recompute (as the forward: the same scaled fp16 weights) */
-    for (int s_ = 0; s_ < 4; s_++) for (int r = 0; r < 4; r++) {
+#pragma unroll
+    for (int s_ = 0; s_ < 4; s_++)
+#pragma unroll
+        for (int r = 0; r < 4; r++) {
         const int row = gq + (r & 1) * 8, col = 16 * s_ + 2 * tq + (r >> 1) * 8;
         const __half2 h2 = __floats2half2_rn(row < C ? p[row * FS_T + col] * rsc[row] : 0.f, row < C ? p[row * FS_T + col + 1] * rsc[row] : 0.f); af[s_][r] = *(const unsigned *)&h2;
     }
@@ -208,6 +217,7 @@ __global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, 
             __syncthreads();   /* (the staged rows; the previous half's readers are done) */
             if (wp * 8 < nh) {   /* the pre-activations on the tensor cores into sh (n-tiles of 8 blocks: one per warp and half) */
                 const int j0 = jlo + wp * 8; float c4[4] = {0.f, 0.f, 0.f, 0.f}; const int jb = j0 + gq < jlo + nh ? j0 + gq : jlo + nh - 1;
+#pragma unroll
                 for (int s_ = 0; s_ < 4; s_++) {
                     unsigned bf[2];
                     bf[0] = *(const unsigned *)&sr[4 * s_ + tq / 2][2 * jb + 2 * (tq & 1)];
@@ -218,6 +228,7 @@ __global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, 
             }
             if (FS_BH > 32) for (int w = wp + FS_BT / 32; w * 8 < nh && w * 8 < FS_BH; w += FS_BT / 32) {   /* (64-block halves: warps take two n-tiles) */
                 const int j0 = jlo + w * 8; float c4[4] = {0.f, 0.f, 0.f, 0.f}; const int jb = j0 + gq < jlo + nh ? j0 + gq : jlo + nh - 1;
+#pragma unroll
                 for (int s_ = 0; s_ < 4; s_++) {
                     unsigned bf[2];
                     bf[0] = *(const unsigned *)&sr[4 * s_ + tq / 2][2 * jb + 2 * (tq & 1)];
@@ -237,11 +248,14 @@ __global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, 
             }
             __syncthreads();
             if (tid < nh) {
-                float go[FS_MAXO];
-                for (int o = 0; o < nout; o++) go[o] = sgo[tid][o];
+                float go[FS_MAXO];   /* (unrolled with guards: loops to nout indexed go[] from local memory under mcc; the same sums, o ascending) */
+#pragma unroll
+                for (int o = 0; o < FS_MAXO; o++) go[o] = o < nout ? sgo[tid][o] : 0.f;
                 for (int c = 0; c < C; c++) {
                     const float a = sh[tid][c], s = 1.f / (1.f + __expf(-a));
-                    float gh = 0.f; for (int o = 0; o < nout; o++) gh += W2[o * C + c] * go[o];
+                    float gh = 0.f;
+#pragma unroll
+                    for (int o = 0; o < FS_MAXO; o++) if (o < nout) gh += W2[o * C + c] * go[o];
                     sh[tid][c] = a * s; sgp[tid][c] = gh * s * (1.f + a * (1.f - s));
                 }
             } else if (tid < FS_BH) {   /* (blocks past the tile: zero rows, the products' K sums read whole k-steps) */
@@ -253,6 +267,7 @@ __global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, 
             for (int ks = 0; ks < nk; ks++) {
                 const int ja = 8 * ks + tq, jb2 = ja + 4;
                 const unsigned a[4] = {fs_tf(sgp[ja][gq]), fs_tf(sgp[ja][gq + 8]), fs_tf(sgp[jb2][gq]), fs_tf(sgp[jb2][gq + 8])};   /* A = dpre [c][j] */
+#pragma unroll
                 for (int n = 0; n < 2; n++) {
                     const int k = 8 * (2 * wp + n) + gq;   /* tap */
                     const unsigned b[2] = {fs_tf(ja < nh ? __half2float(sr[k / 4][2 * (jlo + ja) + k % 4]) : 0.f), fs_tf(jb2 < nh ? __half2float(sr[k / 4][2 * (jlo + jb2) + k % 4]) : 0.f)};
@@ -267,7 +282,10 @@ __global__ void __launch_bounds__(FS_BT) fstem_bwd_k(const f16 *__restrict__ x, 
             if (tid < C) for (int j = 0; j < nh; j++) db += sgp[j][tid];
         }
     }
-    for (int n = 0; n < 2; n++) for (int r = 0; r < 4; r++) {   /* C fragments: rows gq, gq + 8 (c), columns 2 tq, + 1 */
+#pragma unroll
+    for (int n = 0; n < 2; n++)
+#pragma unroll
+        for (int r = 0; r < 4; r++) {   /* C fragments: rows gq, gq + 8 (c), columns 2 tq, + 1 */
         const int c = gq + (r >> 1) * 8, k = 8 * (2 * wp + n) + 2 * tq + (r & 1);
         if (c < C) gp[c * FS_T + k] = d1[n][r];
     }
