@@ -6,9 +6,9 @@
 # The grid-256 pass writes 256 shards (inkB 11-13: with 512 shards each shard overlapped 8 shifted windows, ~7x the windows of grid 0).
 # LATWROUND=1 (OFF by default; infer audit #8): predict --window-round 1, 544 / 16 -> 640 / 64 with the same 512 interior for nets whose
 # window must be a multiple of 128 (scratch2, nlev 6); a no-op for u1-class nets. Needs a predict with --window-round (inferfix).
-# Env: LATINK_CK (default /root/pod/ckpt/inkpod-9000.ckpt), ITH (threads).
+# Env: LATINK_CK (default /root/pod/ckpt/inkpod-15000.ckpt, the newest inkpod snap), ITH (threads).
 set -u
-O=${1:?}; G=${2:-0}; OUT=${3:?}; U=${U:-/root/pod/ufsm/build/ufsm}; CK=${LATINK_CK:-${POD:-/root/pod}/ckpt/inkpod-9000.ckpt}
+O=${1:?}; G=${2:-0}; OUT=${3:?}; U=${U:-/root/pod/ufsm/build/ufsm}; CK=${LATINK_CK:-${POD:-/root/pod}/ckpt/inkpod-15000.ckpt}
 # the CT: UNROLL_CT="ROOT|KEY|UM|LEVEL" (unroll.sh exports it: CTROOT / CTKEY overrides included), else the scrolls.tsv row of this run's
 # scroll (O's basename, a TAG suffix allowed; was `tail -1`, the pods' one-row table: on the desk's full table that is another scroll)
 if [ -n "${UNROLL_CT:-}" ]; then IFS='|' read -r R K UM LV <<< "$UNROLL_CT"
