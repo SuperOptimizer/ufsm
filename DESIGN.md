@@ -6,6 +6,24 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Training perf: the validation regen pass was 95 % THP compaction (2026-11-17, branch trainperf-20261117)
+
+try9's validation passes (--val-store regen, every 500 steps) idled card 0 for ~25 min each, and the step-5500 pass for >75 min. The 3
+validation workers were not sampling: after ~65 min each had 31-141 s user against 1500-3250 s system time; perf (15 s, the three
+threads): 99 % of the samples under `__alloc_pages_direct_compact <- do_huge_pmd_anonymous_page <- draw_` (the memmove into window
+scratch), 34 % in `native_queued_spin_lock_slowpath` from the HMM mmu notifiers of each migrated page, the rest TLB shootdowns;
+/proc/vmstat ~13 compaction stalls a second, all failing (Shmem 57 GB of pinned buffers and 20 GB of swap: no order-9 blocks to make).
+
+Cause: `sampler_start` requests huge pages for the worker scratch (`wbig_alloc`, MADV_HUGEPAGE) when `gpu_aug != 2`. The training
+sampler runs gpu_aug 2 (`--gpu-aug 3`), so it was off there (training workers 6100-6600 s user / 330-370 s system over 13 h), but the
+validation sampler is a copy with `vc.gpu_aug = 0`, and regen starts a fresh sampler at every pass, so each pass faulted its whole
+scratch again through compaction. The 2026-11-09 note had measured the same stall (493 s system vs 125 s user for 24 P 512 windows).
+
+Fix: `sample_cfg.thp_off`, set on the validation sampler (it warps nothing, so huge pages buy it nothing in any mode). The windows'
+bytes do not depend on the page backing. Live runs: `UFSM_SAMPLER_THP=0` (try9's launch.env since 08:45) does the same for every
+sampler. Expected pass time: the user time above, ~1-3 min of sampling plus the 32 forwards, against 25-75 min; at --val-every 2000
+that is ~10 % of the wall clock back (~30 % at 500).
+
 ## Unroll perf 4: the strip's papyrus gate inside the render, the gated stretch in C (2026-11-17, branch unrollperf4-20261117)
 
 - strip_refill.sh rendered every stripe three times when the ink is gated (the ink, then each of c12 / c13 with the same CT, fill and

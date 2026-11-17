@@ -4393,7 +4393,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         long mf = 0; FILE *mi = fopen("/proc/meminfo", "r"); char ln[128];
         while (mi && fgets(ln, sizeof ln, mi)) if (!strncmp(ln, "MemFree:", 8)) { mf = atol(ln + 8); break; }
         if (mi) fclose(mi);
-        sp->thp = cfg->gpu_aug != 2 && mf > 16l << 20; atomic_store(&g_thp_last, sp->thp);
+        sp->thp = !cfg->thp_off && cfg->gpu_aug != 2 && mf > 16l << 20; atomic_store(&g_thp_last, sp->thp);
     }
     sp->prof = ufsm_env_on("UFSM_SAMPLER_PROF"); { static pthread_once_t once = PTHREAD_ONCE_INIT;   /* mgpu: guarded */
                                                   pthread_once(&once, sampler_env_once); }   /* (once: other samplers' workers read them) */
