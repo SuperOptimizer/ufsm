@@ -95,7 +95,30 @@ So --sparse24 mode 3, which changes results, no longer pays.
 - UFSM_F4W_MT4=1 (64 co x 8 ci tiles): 21.5 -> 20.3 ms. The LY 1 lanes then sit on 6 of the 11 producer warps.
 - Ceiling with the staging stubbed out: 12.4 ms (52 % tensor).
 - An x pre-pass into LY 1 records would move ~9.5 GB per call (~450 B per plane, channel and tile, read once per co tile): ~21 ms
-  of DRAM time, so no gain. Sharing one staging across a cluster of co tiles (DSMEM) is the remaining route.
+  of DRAM time, so no gain.
+- Clusters, tried and parked (branch convkw-20261117, conv_bwd_w_f4wc_k, nvcc build, bit-equal to the plain kernel in test_f4wc):
+  the CL co tiles of a (1, 1, CL) cluster share one x staging.
+  - Each block stages every CL-th LY 1 group and bulk-copies its 432 B slot to the others (cp.async.bulk shared::cluster with
+    complete_tx on their FULL mbarrier; scale pairs by u32 st.async). EMPTY counts all blocks' consumers.
+  - CL 4 splits each row over two lanes.
+  - A first version used per-row st.shared::cluster + fence.acq_rel.cluster: the fence compiled to MEMBAR + CCTL.IVALL per lane per
+    z-step (CL 2 54 ms, CL 4 98).
+  - The cluster-scope try_wait / arrive forms add CCTL.IVALL / ERRBAR; the CTA-scope forms are enough for shared-memory data.
+  - Card 1: 3 GPCs x 12 SMs, so clusters of 2 / 3 / 4 / 6 keep all 36 SMs busy and 8 idles a third of them.
+
+| ncu 128^3 256 -> 256 | ms |
+|---|---|
+| CL 1 (conv_bwd_w_f4ws_k, nvcc) | 24.7 |
+| CL 2 | 31.0 |
+| CL 4 | 41.4 |
+| CL 4 without the bulk copies (timing only) | 24.6 |
+| CL 4 without the remote scale stores | 37.1 |
+| CL 4 without any remote traffic | 21.5 |
+| CL 1 with the LY 1 staging removed (the consumer ceiling) | 12.4 |
+
+  Even free of remote traffic, staging a quarter of the groups with half rows gains only 13 %. The producers are bound by each
+  pass's latency (the chain decode -> GN / SiLU -> amax shuffles -> requantisation, then the per-pass barrier), not by their
+  instruction count. Next: more passes in flight per block.
 
 
 
