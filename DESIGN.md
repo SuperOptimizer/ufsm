@@ -6,6 +6,29 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Flatten solver A/B: fp32 matvec, relative-residual stop, decimation by vertex count: none merged (2026-11-17)
+
+The per-wrap flatten and strip-flatten (GPU SLIM, fp64 Jacobi PCG, 200 steps max) are fp64-bound on the 5060 Ti. Three variants
+were gated on all 72 0332 wraps (gate harness /vesuvius/ufsm/unrollperf/gate: strip-flatten + strip-distort, per wrap flatten ->
+render -> ink-compare; card 1 shared):
+
+| variant | strip s | per-wrap s | distort p95 | trusted | folded | per wrap vs GPU fp64 |
+|---|---|---|---|---|---|---|
+| GPU fp64 (a) | 214 | 711 | 0.1389 | 0.5821 | 0.00109 | - |
+| GPU fp64 (b) | 213 | 682 | 0.1389 | 0.5821 | 0.00109 | every metric identical (deterministic) |
+| CPU fp64 (41 wraps, ~8 min each) | 2241 | - | 0.1389 | 0.5819 | 0.00109 | the noise floor (two valid solvers) |
+| fp32 matvec (dots, vectors fp64) | 168 | 516 | 0.1389 | 0.5816 | 0.00108 | see below |
+| rtol 0.1 | 96 | 326 | 0.1429 | 0.5673 | 0.00111 | worse: dropped |
+| fp32 + rtol 0.1 | 85 | 331 | 0.1421 | 0.5657 | 0.00106 | worse: dropped |
+| decim by vertex count (1.5 M) | 227 | 571 | 0.1389 | 0.5821 | 0.00109 | aniso>1.2 +94 % (coarser on big wraps): dropped |
+
+fp32 against the rule (lead): on the 41 wraps with a CPU fp64 run (w035 / w069 included), fp32-vs-GPU64 per-wrap |rel| must stay
+within CPU-vs-GPU64 for every metric, means <= the CPU spread and no wrap beyond 1.5x its max. Per-wrap maxima: all within (aniso>1.2
+w069 12.9 % vs CPU 14.7 % on w068; cm2 w035 2.33 % both). Means: 6 of 17 metrics above the CPU spread: energy 1.05e-3 vs 0.96e-3,
+aniso p50 5.2e-4 vs 4.3e-4, p95 9.0e-4 vs 7.8e-4, p99 3.6e-3 vs 3.2e-3, ink mean 7.7e-5 vs 4.1e-5, frac50 3.4e-4 vs 2.4e-4. So fp32
+fails as specified (by 10-90 % on the means, though every one is <= 1e-3 relative); not merged. The WIP (flat_opts cg_rtol / cg_fp32,
+UFSM_FLAT_CG_RTOL / UFSM_FLAT_CG_FP32, nn_flat.cu fp32 kernels) is kept on the unrollperf worktree's stash, opt-in only.
+
 ## Unroll perf 5: volcomp's lossless encoder 2-2.5x, the lossless sink decoder ~25 % (byte-identical; 2026-11-17, branch unrollperf5-20261117)
 
 - The unroll's ink is now the critical path: with recto-sp on the GPU (192 -> ~45 s) the chain from the ink's start to snap is ~520 s
