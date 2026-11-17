@@ -6,6 +6,33 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## PHerc0332: try9 undercounts 20 %, u1's z drift is the top 5 mm; count-field --rho-r (2026-11-17, branch fix0332-20261117)
+
+0332 has no winding labels (0.1 % fibre-hf only), so every net is out of domain there; no GT, so the objectives are wrap-check
+(CT papyrus peaks per fitted turn, rct = fit gap / local CT peak spacing, verdicts), unroll-qa tile pass and the check stage's
+cf-demod z drift (along-sheet excursion of the ref; every drift number quoted for 0332 is that one command).
+| run (fields) | CT peaks / turn | rct median | real/dup/merged | wraps > 500 int. | drift | drift bands 2-27 | bands 28-29 |
+|---|---|---|---|---|---|---|---|
+| try9-6250, 640 windows (pod) | 1.200 | 1.24 | 54/7/4 | 62 | 0.84 | 0.70 | +0.34 |
+| try9-6250, 1152 windows (pod) | 1.148 | 1.15 | 56/10/4 | 65 | - | - | - |
+| u1-13000, unroll2 -1 (joined) | 1.014 | 1.00 | 66/8/3 | 72 | 1.84 | 0.29 | +1.62 |
+| u1 ref only (desk, base) | 1.042 | 1.05 | 64/8/3 | 70 | 1.91 | 0.22 | +1.63 |
+| u1 ref, --rho-solve 1.1 | 0.974 | 0.98 | 69/8/2 | 74 | 1.94 | 0.33 | +1.68 |
+- try9's fit follows its density head (density turns per fitted turn 1.02) and that head reads the sheet spacing ~20 % wide on
+  0332, flat in z (1.13-1.24 per z band) and radial: 1.3-1.5 CT peaks per turn at r 1-5 mm, ~1 at 8-10 mm, 0.7-0.85 past 10 mm
+  (1152 windows: the same shape, a quarter of the gap closed). The two fits' disagreement (pair accuracy 0.27 / 0.17 at 2 / 4 mm)
+  is that scale error accumulating. The network phase counts only 0.56 turns per fitted turn (u1 0.77), so --phase-w also pulls
+  toward fewer turns.
+- u1 counts right on average (2-4 mm still 1.2-1.29), and its 1.8-1.9 turn drift ALARM is 1.6 turns in bands 28-29 (native z
+  7168-7680, the scroll top, phase coherence 0.10-0.15, a third of a full band's cells); over bands 2-27 it is 0.22-0.34 turns,
+  under DRIFTWARN. Its CT peaks per turn at the top z band are 0.99, so the counts there are not off: the excursion is the
+  low-coherence top end. The global K moves the scale as expected (1.04 -> 0.97 at K 1.1) and leaves the drift unchanged.
+- Hand: unroll2's +1 / -1 runs are identical on wrap-check; not a lever.
+count-field `--rho-r R0:K0,R1:K1,...` (mm from the umbilicus, piecewise linear, constant past the ends): K by radius, times
+--rho-solve / --rho-map (implies --pool-split), for the radial count error above. test_countfield: a flat 0.75 profile == --rho-solve
+0.75 exactly (0 turn), decreasing radii refused. The try9 K / --rho-r arms on the pod were lost with it (11-17 evening); they need
+try9 fields regenerated on card 1.
+
 ## Predict forward: where the GPU time goes; the fit-field head per z chunk (1152 / 64 fields windows on a 16 GB card) (2026-11-17, branch predfwd-20261117)
 
 Profile on a quiet card 1 (0332 level 2, CT from a local cache, 32 windows; `UFSM_PRED_PROF`, `UFSM_PTICK`, nsys per-(kernel, grid, block)
