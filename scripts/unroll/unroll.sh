@@ -271,6 +271,13 @@ fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windo
   if [ "$4" != 0 ] && [ "$FKIND" = lat ]; then for d in 0 1 2; do
     local s=$(( ((b[d] - $4) % st + st) % st )); b[d]=$(( b[d] - s )); b[d + 3]=$(( b[d + 3] + s )); done   # (before 0 at a box at 0: predict reads fill there)
     box=$(IFS=,; echo "${b[*]}"); fi
+  # windows of k >= 2 shards (LWIN 1152 / LHALO 64: stride 1024): predict runs one window per k^3 shards only with the box origin on the
+  # window grid (predict.c kss), else --fit-zarr refuses the stride (podunroll 11-17: 0332's box origin 512 against grid 0). Grid 0
+  # becomes the scroll box's origin mod the stride per axis (512-stride windows: 0, no change). Multi-GPU z parts then need part starts on
+  # that grid too (FIELDGPUS with one card here).
+  local go=$4,$4,$4
+  if [ "$4" = 0 ] && [ "$FKIND" = lat ] && [ $st -gt 512 ]; then IFS=, read -r -a b <<< "$BOX"
+    go=$(( b[0] % st )),$(( b[1] % st )),$(( b[2] % st )); fi
   # FSKIP (lat fields; default 20, 0 = dense): --skip-empty 1 --skip-thr FSKIP --skip-margin 1, void tiles (no CT voxel above FSKIP) left at
   # their bias. wbench GT A/B 2026-11-17 (u1 13000, 44 boxes): ids dense 0.5327, thr 20 0.5369 (+0.004 [+0.0003, +0.009]), 40 0.5357
   # (+0.003, CI > 0), 60 0.5294 (n.s.); the gain sits on the packed Paris 4 boxes (+0.015 / +0.005); fields predict -13 % on 0332 / 1667
@@ -280,7 +287,7 @@ fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windo
   if [ "$FKIND" = lat ]; then win="--window ${LWIN:-640} --halo ${LHALO:-64}"
   else win="$([ "${FWIN:-prod}" = auto ] && echo "--window auto" || echo "--window-z 384 --halo-z 64 --window 640") --halo 64"; fi
   X $O/logs/fields.log $U predict $CK ${FCTR:-$R} ${FCTK:-$K} $3.tmp --um $UM --level $LV --box $box $win --shard 512 \
-    --grid-origin $4,$4,$4 --ema ${FEMA:-1} --q 8 --threads ${PTH:-14} --gpu $(lg $1) --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $sk $(occlv) &&
+    --grid-origin $go --ema ${FEMA:-1} --q 8 --threads ${PTH:-14} --gpu $(lg $1) --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $sk $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
 # --- the ref's pass 1 streamed behind the fields predict (REFSTREAM; 6a, 11-12) ---

@@ -2390,6 +2390,9 @@ static int predict_one(int argc, char **argv) {
             const int zsh = kss > 1 ? kss * shard : shard;
             while ((FZ * ffh) % zsh && FZ < 4096) FZ += FFS;
             if (stride % ffh || strd[0] % ffh || shard % ffh || (FZ * ffh) % zsh || (kss == 1 && shard % strd[0])) {
+                if (kss == 1 && !slab && stride % shard == 0 && stride / shard >= 2)   /* (podunroll 11-17: 1152 / 64 on a box at 512 with grid 0) */
+                    fprintf(stderr, "predict: --fit-zarr: a window stride of %d shards runs one window per %d^3 shards only with the box origin on the window grid "
+                                    "(box origin - --grid-origin a multiple of %d on every axis); this box is off it: --grid-origin <box origin mod %d> per axis\n", stride / shard, stride / shard, stride, stride);
                 fprintf(stderr, "predict: --fit-zarr needs the window strides (window - 2 halo; z: %d) divisible by --fit-h and the shard by --fit-h; "
                                 "per-shard windows a z stride dividing the shard (e.g. --window 288 --halo 16 or 544 / 16 with --shard 512), "
                                 "else a stride of k shards (e.g. --window 384 --halo 64 --shard 128)\n", strd[0]);
