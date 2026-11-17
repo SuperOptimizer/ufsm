@@ -862,12 +862,16 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
     const float inm0 = fmaxf(st[0], 1.f), inm1 = fmaxf(st[5], 1.f), fsc = fin[5];
     for (int rz = 0; rz < 4; rz++) {
         float p[7][9], gp[7][9];
+#pragma unroll
         for (int k = 0; k < 7; k++)
+#pragma unroll
             for (int j = 0; j < 9; j++) { p[k][j] = LW[rz][0] * v[k][j] + LW[rz][1] * v[k][9 + j] + LW[rz][2] * v[k][18 + j]; gp[k][j] = 0.f; }
         const int z = z0 + 4 * sz + rz, fzs_ = z;
         for (int ry = 0; ry < 4; ry++) {
             float q[7][3], gq[7][3];
+#pragma unroll
             for (int k = 0; k < 7; k++)
+#pragma unroll
                 for (int e = 0; e < 3; e++) { q[k][e] = LW[ry][0] * p[k][e] + LW[ry][1] * p[k][3 + e] + LW[ry][2] * p[k][6 + e]; gq[k][e] = 0.f; }
             const int y = 4 * cy + ry;
             const size_t vr = ((size_t)(4 * sz + rz) * H + y) * W + 4 * cx;
@@ -884,6 +888,7 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
                                 f2 = 0.5f * (__half2float(x[gv + (y + 1 < H ? W : 0)]) - __half2float(x[gv - (y > 0 ? W : 0)])),
                                 f3 = 0.5f * (__half2float(x[gv + (xx + 1 < W ? 1 : 0)]) - __half2float(x[gv - (xx > 0 ? 1 : 0)]));
                     float u[7];
+#pragma unroll
                     for (int k = 0; k < 7; k++) u[k] = __half2float(__float2half_rn(LW[rx][0] * q[k][0] + LW[rx][1] * q[k][1] + LW[rx][2] * q[k][2]));
                     const float tt = u[4] * f1 + u[5] * f2 + u[6] * f3;
                     const float l0 = __half2float(__float2half_rn(u[0] + u[2] * f0 + tt)), l1 = __half2float(__float2half_rn(u[1] + u[3] * f0 - tt));
@@ -901,16 +906,24 @@ __global__ void lat_fuse_k(const T *lg, int qd, int q0, int d, int h, int w, int
                     const float gd = g0 - g1;
                     const float gk[7] = {g0, g1, __half2float(__float2half_rn(g0 * f0)), __half2float(__float2half_rn(g1 * f0)), __half2float(__float2half_rn(gd * f1)),
                                          __half2float(__float2half_rn(gd * f2)), __half2float(__float2half_rn(gd * f3))};
+#pragma unroll
                     for (int k = 0; k < 7; k++)
+#pragma unroll
                         for (int e = 0; e < 3; e++) gq[k][e] += LW[rx][e] * gk[k];
                 }
             }
+#pragma unroll
             for (int k = 0; k < 7; k++)
+#pragma unroll
                 for (int b = 0; b < 3; b++)
+#pragma unroll
                     for (int e = 0; e < 3; e++) gp[k][b * 3 + e] += LW[ry][b] * gq[k][e];
         }
+#pragma unroll
         for (int k = 0; k < 7; k++)
+#pragma unroll
             for (int a = 0; a < 3; a++)
+#pragma unroll
                 for (int j = 0; j < 9; j++) ga[k][a * 9 + j] += LW[rz][a] * gp[k][j];
     }
     for (int k = 0; k < nk; k++)

@@ -227,6 +227,7 @@ int main(void) {
             nrep += memcmp(rb + k, rb2 + k, 4) != 0; nzr += ra[k] != 0;
         }
         const double rel = mx / (mg > 0 ? mg : 1), rms = sqrt(sq / (sr > 0 ? sr : 1));
+        if (getenv("TLF_HASH")) { uint64_t hh = 1469598103934665603ull; const unsigned char *b = (const unsigned char *)rb; for (size_t k = 0; k < C * cv * 4; k++) hh = (hh ^ b[k]) * 1099511628211ull; printf("  hash %016llx\n", (unsigned long long)hh); }   /* (kernel changes meant byte-identical: compare two builds) */
         const int bad = !(rel < 2e-5) || !(rms < 5e-6) || nrep || nzr < C * cv / 3;
         printf("  %dx%dx%d cells, slabs of %d, variant %d: max |fused - chain| %.3g of max %.3g (%.2g), rms ratio %.2g, %zu of %zu differ between two fused runs%s\n",
                d, h, w, Z, var, mx, mg, rel, rms, nrep, C * cv, bad ? "  FAIL" : "");
