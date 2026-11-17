@@ -108,7 +108,7 @@ fi
 # 6. the weight
 if [ ! -e "$OUT/weight.zarr/done" ]; then
   [ "$DRY" = 1 ] || cat $( [ -s "$AB" ] && echo "$AB" ) "$DB" "$GB" > "$OUT/all.boxes"
-  X "$OUT/logs/weight.log" "$U" phase-coh "$PR_" "$GUM" "$CTR" "$CTK/$LV" "$OUT" --coh 0 --box-scale "$OUT/all.boxes" --box-default 0 --papyrus 64 --pap-dilate 2 --threads "$TH" \
+  X "$OUT/logs/weight.log" "$U" phase-coh "$PR_" "$GUM" "$CTR" "$CTK/$LV" "$OUT" --weight 0.3,0.6 --coh 0 --box-scale "$OUT/all.boxes" --box-default 0 --papyrus 64 --pap-dilate 2 --threads "$TH" \
     || { log "phase-coh failed ($OUT/logs/weight.log)"; exit 1; }
   [ "$DRY" = 1 ] || { touch "$OUT/weight.zarr/done"; log "weight: $(grep -E 'box-scale|mean weight' "$OUT/logs/weight.log" | tr '\n' ' ')"; }
 fi
