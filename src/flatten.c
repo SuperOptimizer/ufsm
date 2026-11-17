@@ -33,7 +33,12 @@ static void parfor(long n, int nt, pf_fn f, void *ctx) {
     for (int t = 1; t < nt; t++) pthread_join(th[t], nullptr);
 }
 
-flat_opts flat_opts_default(void) { return (flat_opts){30, 200, 16, 20000, 1, 3.0, 1e-5, 0, 0, nullptr, 0, -1}; }
+/* cg_fp32: the GPU CG's matvec in fp32, on by default since 2026-11-17 (0332 / 1667 gate, DESIGN "Flatten solver A/B"); the fp64 solve:
+   UFSM_FLAT_CG_FP32=0 or --cg-fp32 0 */
+flat_opts flat_opts_default(void) {
+    const char *f = getenv("UFSM_FLAT_CG_FP32");
+    return (flat_opts){30, 200, 16, 20000, 1, 3.0, 1e-5, 0, 0, nullptr, 0, -1, f && *f ? atoi(f) : 1};
+}
 
 /* ---- per-triangle geometry: gradient coefficients g (6: g0, g1, g2 in the triangle's own 2D frame) and 3D area ---- */
 static int tri_frame(const double *p0, const double *p1, const double *p2, double g[6], double *area) {
@@ -259,13 +264,13 @@ static void slim_free(slim *S) {
 
 /* src/nn_flat.cu (weak: binaries without it, e.g. test_flatten, link CPU-only) */
 int flat_slim_gpu(const double *g, const double *A, const int *tri, int nt, const int *vo, const int *vl, int nv, double *x,
-                  int iters, int cg_iters, double tol, int verbose, const char *tag, int dev, double *Eout) __attribute__((weak));
+                  int iters, int cg_iters, double tol, int verbose, const char *tag, int dev, double *Eout, int fp32) __attribute__((weak));
 int flat_gpu_count(void) __attribute__((weak));
 int flat_gpu_devices(void) { return flat_gpu_count ? flat_gpu_count() : 0; }
 
 /* SLIM iterations on S (S->x = the current uv, flip-free) */
 static double slim_run(slim *S, const flat_opts *o, int iters, const char *tag) {
-    if (o->gpu && flat_slim_gpu) { double E; if (!flat_slim_gpu(S->g, S->A, S->tri, S->nt, S->vo, S->vl, S->nv, S->x, iters, o->cg_iters, o->tol, o->verbose, tag, o->gpu_dev, &E)) return E; }
+    if (o->gpu && flat_slim_gpu) { double E; if (!flat_slim_gpu(S->g, S->A, S->tri, S->nt, S->vo, S->vl, S->nv, S->x, iters, o->cg_iters, o->tol, o->verbose, tag, o->gpu_dev, &E, o->cg_fp32)) return E; }
     double E = energy_at(S, S->x); const size_t n2 = (size_t)S->nv * 2;
     if (o->verbose) fprintf(stderr, "flatten: %s %d vertices %d triangles, energy %.5f\n", tag, S->nv, S->nt, E);
     if (!isfinite(E)) return E;
@@ -695,6 +700,7 @@ int cmd_flatten(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm flatten <wraps-dir> <out-dir> [--wraps a,b,..] [--decim 1] [--iters 30] [--cg 200] [--min-verts 20000] [--out-step S] [--crop rect|none] [--max-aspect A] [--rects N] [--min-cm2 5] [--fill-holes 5000] [--max-edge 3] [--threads 16] [--gpu 1] [--sfc ERR] [--quiet 1]\n"); return 2; }
     flat_opts o = flat_opts_default();
     o.decim = opt_atoi("--decim", fopt(argc, argv, "--decim", "1")); o.iters = opt_atoi("--iters", fopt(argc, argv, "--iters", "30")); o.cg_iters = opt_atoi("--cg", fopt(argc, argv, "--cg", "200"));
+    if (fopt(argc, argv, "--cg-fp32", nullptr)) o.cg_fp32 = opt_atoi("--cg-fp32", fopt(argc, argv, "--cg-fp32", "0"));
     o.min_verts = opt_atoi("--min-verts", fopt(argc, argv, "--min-verts", "20000")); o.max_edge = opt_atof("--max-edge", fopt(argc, argv, "--max-edge", "3")); o.nthreads = ufsm_threads(opt_atoi("--threads", fopt(argc, argv, "--threads", "0")), 16);
     o.verbose = !opt_atoi("--quiet", fopt(argc, argv, "--quiet", "0")); o.gpu = opt_atoi("--gpu", fopt(argc, argv, "--gpu", "1"));
     const double ostep_opt = opt_atof("--out-step", fopt(argc, argv, "--out-step", "0")); const int crop = strcmp(fopt(argc, argv, "--crop", "rect"), "none") != 0;

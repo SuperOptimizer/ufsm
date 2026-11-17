@@ -804,6 +804,7 @@ int cmd_strip_flatten(int argc, char **argv) {
         /* chunks on --jobs workers (each --threads / jobs CPU threads; with --gpu 1 the SLIM iterations on device worker % devices), blended
            into the lattice strictly in chunk order: the sums are the same whatever the job count */
         const int ngpu = opt_atoi("--gpu", sopt(argc, argv, "--gpu", "1")) ? flat_gpu_devices() : 0;
+        if (sopt(argc, argv, "--cg-fp32", nullptr)) setenv("UFSM_FLAT_CG_FP32", sopt(argc, argv, "--cg-fp32", "1"), 1);   /* (flat_opts_default reads it; 0: fp64) */
         int jobs = opt_atoi("--jobs", sopt(argc, argv, "--jobs", "0"));
         /* default with GPUs: 3 per GPU or one per 3 threads, the larger (a job's chunk prep and blend are CPU work: the GPU sat at
            11-13% with 3 jobs; 0490B desk 120 chunks at 20 threads: 3 jobs 151-158 s, 6 jobs 96-134 s, 12 jobs 113-121 s; same files) */
