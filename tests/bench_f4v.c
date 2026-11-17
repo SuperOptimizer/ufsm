@@ -25,7 +25,7 @@ int main(int argc, char **argv) {
     void *x;
     if (cs == 0) { shape5 c = {1, Cx, D / 2, HW / 2, HW / 2}, k = {1, Cs, D, HW, HW}; x = mx4_rand(c); sp.x2 = mx4_rand(k); sp.c_split = Cx; sp.up = 1;
                    sp.gp2 = gnp_mk(dev_rand(Cs, 0.3f, 1.f), dev_rand(Cs, 0.2f, 0.f), dev_rand(G, 0.2f, 0.f), dev_rand(G, 0.1f, 1.f), G); }
-    else { x = mx4_rand(fs); if (cs == 2) { gp = (gnp_t){0}; sp.osr = 0x9e3779b9u; } }
+    else { x = mx4_rand(fs); if (cs == 2) { gp = (gnp_t){0}; sp.osr = 0x9e3779b9u; } if (cs == 3) gp = (gnp_t){0}; }   /* (3: plain input, statistics) */
     const size_t yb = nn_mx4_bytes(ys); void *y = nn_malloc(yb); nn_set_storage(y, yb, 4);
     double *os = nn_malloc(2 * 64 * 3 * 8);
     double best = 1e30;

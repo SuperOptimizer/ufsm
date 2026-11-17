@@ -28,7 +28,7 @@ static void *mx4_rand(shape5 s, float sc) {
     lp_f32_to_mx4(d, s.n, s.c, shape_spatial(s), p); nn_free(d); return p;
 }
 static void *mx4_out(shape5 s, size_t *bytes) { const size_t b = nn_mx4_bytes(s); void *p = nn_malloc(b); nn_zero(p, b); nn_set_storage(p, b, 4); *bytes = b; return p; }
-enum { GN = 1, STATS = 2, OSR = 4, SPLIT = 8, ZWIN = 16, ZRANGE = 32, SST = 64, GN2 = 128, PRESLAB = 256 };
+enum { GN = 1, STATS = 2, OSR = 4, SPLIT = 8, ZWIN = 16, ZRANGE = 32, SST = 64, GN2 = 128, PRESLAB = 256, V1 = 512, SL8 = 1024 };   /* V1: the new run at UFSM_F4V=1 (a GN input without the prenorm copy -> lp_f4v_preslab); SL8: its slabs 8 planes */
 static void run_case(const char *name, int Ci, int Co, int D, int H, int W, int fl) {
     const int Dx = fl & ZRANGE ? D + 3 : D;   /* (z-range: output plane z reads input plane z + 1 of a deeper input) */
     shape5 xs = {1, Ci, Dx, H, W}, ys = {1, Co, D, H, W};
@@ -59,7 +59,8 @@ static void run_case(const char *name, int Ci, int Co, int D, int H, int W, int 
     unsigned long c0 = 0;
     for (int k = 0; k < 2; k++) {
         if (fl & STATS) { os[k] = nn_malloc(osb); nn_zero(os[k], osb); }
-        lp_set_f4v(k);
+        lp_set_f4v(k ? (fl & V1 ? 1 : 2) : 0);
+        if (fl & SL8) lp_set_f4v_preslab(k ? 8 : 0);
         if (fl & PRESLAB) { lp_set_f4_prenorm(k); lp_set_f4v_preslab(k ? 8 : 0); }   /* old: the in-kernel GroupNorm staging; new: the prenorm by 8-plane slabs */
         if (k) c0 = lp_f4v_calls();
         lp_conv_fwd_f4(x, 4, xc, w, b, Co, y[k], 4, gp, os[k], fl & STATS ? Go : 0, sp);
@@ -98,7 +99,7 @@ static void run_up(const char *name, int Cx, int Cs, int Co, int D, int H, int W
     unsigned long c0 = 0;
     for (int k = 0; k < 2; k++) {
         if (stats) { os[k] = nn_malloc(osb); nn_zero(os[k], osb); }
-        lp_set_f4v(k); lp_set_f4v_preslab(k ? Z : 0);
+        lp_set_f4v(k ? 2 : 0); lp_set_f4v_preslab(k ? Z : 0);
         if (k) c0 = lp_f4v_calls();
         lp_conv_fwd_f4(c4, 4, fs, w, b, Co, y[k], 4, gp, os[k], stats ? Go : 0, sp);
     }
@@ -144,6 +145,12 @@ int main(void) {
     run_up("dec conv1, fused upsample, one slab", 96, 64, 128, 12, 24, 32, 0, 1);
     run_up("dec conv1, fused upsample, 4-plane slabs, odd sizes", 64, 96, 128, 14, 18, 32, 4, 1);
     run_case("z-range input (zi0 1, Di D + 3)", 128, 64, 12, 16, 32, ZRANGE | OSR);
+    /* GroupNorm inputs of z-range / z-window convs (unet's in-place level-0 slabs, predict): no prenorm copy there, so lp_f4v_preslab
+       prenorms the planes each slab reads, against conv_fwd_f4_k's in-kernel GN */
+    run_case("GN z-range input -> slabbed prenorm (one slab)", 96, 96, 16, 16, 32, GN | STATS | ZRANGE | V1);
+    run_case("GN z-range input -> slabbed prenorm (8-plane slabs)", 128, 128, 20, 16, 32, GN | STATS | ZRANGE | V1 | SL8);
+    run_case("GN z-window -> slabbed prenorm (8-plane slabs)", 96, 160, 24, 16, 32, GN | STATS | ZWIN | V1 | SL8);
+    run_case("GN z-range + z-window, odd width, no stats", 128, 96, 20, 16, 37, GN | ZRANGE | ZWIN | V1 | SL8);
     /* MT 2 (Cop % 64 != 0: the 96 / 160 / 288-wide nets; UFSM_F4V_MT=2 runs every case so) against conv_fwd_f4_k<2, 4> */
     run_case("MT 2: fwd GN + stats, 96 outputs", 96, 96, 16, 24, 48, GN | STATS);
     run_case("MT 2: fwd plain, 160 outputs, odd depth, no stats", 160, 160, 10, 16, 40, 0);

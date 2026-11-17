@@ -369,12 +369,17 @@ int lp_f4v_try(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, c
 #else
     if (!lp_get_f4v() || lp_sw_build()) return 0;
     const size_t plane = (size_t)(sp.Di ? sp.Di : xs.d) * xs.h * xs.w;
-    const char *why = gp.ns || sp.gp2.ns ? "slab-local GN" : sp.sr ? "staging SR" : sp.up ? "fused upsample"   /* (copy staging only; small depths: conv_fwd_f4_k's 2-plane tiles) */
+    /* the GN+SiLU staging (template G: the in-kernel GroupNorm, a layer with neither the prenorm copy nor its slabs, e.g. predict's z-window
+       convs) is not overlapped with the MMAs and loses to conv_fwd_f4_k's own GN staging (ncu 96 -> 96 64 x 160^2 7.86 vs 6.89 ms, 128 -> 128
+       64 x 80^2 3.24 vs 2.70; fp4teach's predict A/B: +5.5 % fields, +12.5 % ink): only with UFSM_F4V=2 (tests) */
+    const char *why = (gp.G || sp.gp2.G) && lp_get_f4v() < 2 ? "GN staging (UFSM_F4V=2)" : gp.ns || sp.gp2.ns ? "slab-local GN" : sp.sr ? "staging SR" : sp.up ? "fused upsample"   /* (copy staging only; small depths: conv_fwd_f4_k's 2-plane tiles) */
                     : sp.zw1 && (sp.zw0 % 4 || (sp.zw1 % 4 && sp.zw1 != xs.d)) ? "z-window off 4-plane tiles" : plane >= ((size_t)1 << 31) ? "plane >= 2^31"
                     : f4v_shape_why(xs, Cop, Cip, cout, osum, sp);
     static int dbg = -1; /* mgpu: debug */ if (dbg < 0) dbg = getenv("UFSM_F4V_DEBUG") ? atoi(getenv("UFSM_F4V_DEBUG")) : 0;   /* the first N calls: kernel and reason */
-    if (dbg > 0) { dbg--; fprintf(stderr, "f4v: %d->%d %dx%dx%d Cop %d Cip %d stats %d osr %d x2 %d (c_split %d) up %d gn %d/%d: %s%s\n", xs.c, cout, xs.d, xs.h, xs.w, Cop, Cip, osum != nullptr, sp.osr != 0, sp.x2 != nullptr, sp.c_split, sp.up, gp.G, sp.gp2.G,
+    if (dbg > 0) { dbg--; fprintf(stderr, "f4v: %d->%d %dx%dx%d Cop %d Cip %d stats %d osr %d x2 %d (c_split %d) up %d gn %d/%d zw %d..%d Di %d zi0 %d: %s%s\n", xs.c, cout, xs.d, xs.h, xs.w, Cop, Cip, osum != nullptr, sp.osr != 0, sp.x2 != nullptr, sp.c_split, sp.up, gp.G, sp.gp2.G, sp.zw0, sp.zw1, sp.Di, sp.zi0,
                                    why ? "conv_fwd_f4_k, " : "conv_fwd_f4v_k", why ? why : ""); }
+    if (why && (gp.G || sp.gp2.G) && lp_f4v_preslab(x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp)) return 1;   /* (a GroupNorm input without the prenorm
+                                                                                                                       copy: z-range / z-window convs, predict's slabs) */
     if (why) return 0;
     launch_f4v_mt(x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp, lp_skip_get(xs, sp, 1));
     __atomic_fetch_add(&g_f4v_calls, 1ul, __ATOMIC_RELAXED);
@@ -422,21 +427,24 @@ int lp_f4v_preslab(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *w
     (void)x; (void)xs; (void)wq; (void)ws; (void)b; (void)cout; (void)y; (void)Cop; (void)Cip; (void)gp; (void)osum; (void)Go; (void)sp;
     return 0;
 #else
-    if (!lp_get_f4v() || lp_sw_build() || f4v_shape_why(xs, Cop, Cip, cout, osum, sp) || sp.zw1 || sp.Di || sp.y2) return 0;
+    /* (a z-range input, sp.zi0 / sp.Di: output plane z reads input plane z + zi0 of the depth-Di x, as unet's in-place level-0 slabs (predict);
+       a z-window sp.zw0 / sp.zw1: only those output planes. The slabs cover the window, each prenorms the input planes it reads) */
+    if (!lp_get_f4v() || lp_sw_build() || f4v_shape_why(xs, Cop, Cip, cout, osum, sp) || sp.y2 || gp.ns || !gp.G || sp.x2 || sp.up || sp.sr || xs.c % 32 || Cip != xs.c) return 0;
+    if (sp.zw1 && (sp.zw0 % 4 || (sp.zw1 % 4 && sp.zw1 != xs.d))) return 0;
     if (g_f4v_preslab < 0) g_f4v_preslab = getenv("UFSM_F4V_PRESLAB") ? atoi(getenv("UFSM_F4V_PRESLAB")) : 0;
-    const int HW = xs.h * xs.w, nb = xs.c / 32;
+    const int HW = xs.h * xs.w, nb = xs.c / 32, zi = sp.zi0, Di = sp.Di ? sp.Di : xs.d, o0 = sp.zw1 ? sp.zw0 : 0, o1 = sp.zw1 ? sp.zw1 : xs.d;
     const size_t pp = (size_t)xs.n * nb * HW * 17;   /* prenorm bytes per input plane */
-    if ((size_t)(xs.d + 2) * HW >= ((size_t)1 << 31)) return 0;
+    if ((size_t)(o1 - o0 + 2) * HW >= ((size_t)1 << 31)) return 0;
     int Z = 0; uint8_t *q = nullptr;
     if (g_f4v_preslab > 0) { Z = g_f4v_preslab & ~3; if (Z < 4) Z = 4; q = (uint8_t *)nn_ws(NN_WS_F4PRE, (size_t)(Z + 2) * pp); }
-    else for (Z = (xs.d + 3) & ~3; Z >= 8 && !(q = (uint8_t *)nn_ws(NN_WS_F4PRE, (size_t)(Z + 2) * pp)); Z = Z > 64 ? 64 : Z - 4) {}   /* the largest slab the budget holds */
+    else for (Z = (o1 - o0 + 3) & ~3; Z >= 8 && !(q = (uint8_t *)nn_ws(NN_WS_F4PRE, (size_t)(Z + 2) * pp)); Z = Z > 64 ? 64 : Z - 4) {}   /* the largest slab the budget holds */
     if (!q) return 0;
     const skipm_t sk = lp_skip_get(xs, sp, 1);
-    for (int z0 = 0; z0 < xs.d; z0 += Z) {
-        const int z1 = z0 + Z < xs.d ? z0 + Z : xs.d, a = z0 > 0 ? z0 - 1 : 0, e = z1 < xs.d ? z1 + 1 : xs.d, L = e - a;
-        gn_prenorm_f4z_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, xs.c, xs.c, xs.c, 0, (size_t)xs.d * HW, a, L, HW, gp, split_t{}, q);
-        split_t s2 = sp; s2.zi0 = (int16_t)-a; s2.Di = (int16_t)L; s2.zw0 = (int16_t)z0; s2.zw1 = (int16_t)z1;
-        launch_f4v_mt(q, xs, wq, ws, b, cout, y, Cop, Cip, gnp_t{}, osum, Go, s2, sk, z0 == 0);
+    for (int z0 = o0; z0 < o1; z0 += Z) {
+        const int z1 = z0 + Z < o1 ? z0 + Z : o1, a = max(z0 + zi - 1, 0), e = min(z1 + zi + 1, Di), L = e - a;   /* (input planes) */
+        gn_prenorm_f4z_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, xs.c, xs.c, xs.c, 0, (size_t)Di * HW, a, L, HW, gp, split_t{}, q);
+        split_t s2 = sp; s2.zi0 = (int16_t)(zi - a); s2.Di = (int16_t)L; s2.zw0 = (int16_t)z0; s2.zw1 = (int16_t)z1;
+        launch_f4v_mt(q, xs, wq, ws, b, cout, y, Cop, Cip, gnp_t{}, osum, Go, s2, sk, z0 == o0);
     }
     __atomic_fetch_add(&g_f4v_calls, 1ul, __ATOMIC_RELAXED);
     return 1;
