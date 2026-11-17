@@ -6,6 +6,17 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Unroll perf 3: no context on unlisted cards; the ref's chunk rows fixed (2026-11-17, branch unrollperf3-20261117)
+
+- SGPU (perf 2) pinned the stages without a --gpu, but a predict on --gpu 1 still opened a 128 MiB context on card 0 (the training card;
+  lead). Without a caller's CUDA_VISIBLE_DEVICES the run now exports CUDA_VISIBLE_DEVICES = the cards it was given (FIELDGPUS, FITGPUS,
+  INKGPU, SGPU, RGPU; GVIS) and every --gpu passes the card's index in it (lg); per-job CUDA_VISIBLE_DEVICES=<card> stay physical ids.
+  DRY=1 prints each stage's CUDA_VISIBLE_DEVICES (desk, FITGPUS=FIELDGPUS=INKGPU=1: every stage 1, every --gpu 0).
+- The ref's chunk rows came from the free host memory (count-field --mem-gb lowered to 60 % of what was available) and change the ref:
+  0332 full3 / full4 picked 512 / 640 rows and their joined models differed. unroll.sh passes --chunk-rows ${REFCZ:-512} to every
+  count-field (solves, DIRCOH, the streamed pass 1); count-field takes fewer rows only when --mem-gb cannot hold the asked ones, and
+  then prints `DEFAULTED: count-field chunk rows = N (...)`; the ref stage logs the rows used to progress.log.
+
 ## Unroll perf 2: stages pinned off card 0, 3 slab lanes, the ink beside the critical path, flatten's relax pass, the strip gate in C (2026-11-17, branch unrollperf2-20261117)
 
 0332 end to end WITHOUT UPTO on the desk (card 1 only: FIELDGPUS=FITGPUS=INKGPU=1, PERWRAP=1, local CT cache, master's FBLEND 0 /

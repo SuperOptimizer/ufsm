@@ -82,7 +82,16 @@ FIELDGPUS=${FIELDGPUS:-0 1}; FITGPUS=${FITGPUS:-0 1}; DRY=${DRY:-0}; I=${SLABI:-
 # pooling, strip-flatten's SLIM and the stripimg renders went to card 0, the training card; its 0.7 GB free sent the ref's CG and the
 # renders to the CPU and strip-flatten took 204 s). An explicit CUDA_VISIBLE_DEVICES (also empty: GPUs hidden) is kept as given.
 SGPU=${SGPU:-${FITGPUS%% *}}
-sgpu() { [ -z "${CUDA_VISIBLE_DEVICES+x}" ] && [ -n "$SGPU" ] && echo "CUDA_VISIBLE_DEVICES=$SGPU"; return 0; }
+# GVIS: without a CUDA_VISIBLE_DEVICES of the caller's, every ufsm call of the run sees only the cards it was given (FIELDGPUS, FITGPUS,
+# INKGPU, SGPU, RGPU; lead 2026-11-17: a predict on --gpu 1 still opened a 128 MiB context on card 0, the training card): the run
+# exports CUDA_VISIBLE_DEVICES=GVIS, --gpu takes the card's index in it (lg), per-job CUDA_VISIBLE_DEVICES=<card> stay physical ids
+GVIS=
+if [ -z "${CUDA_VISIBLE_DEVICES+x}" ]; then
+  for g in $FIELDGPUS $FITGPUS $INKGPU $SGPU ${RGPU:-}; do case " $GVIS " in *" $g "*) ;; *) GVIS="$GVIS $g";; esac; done
+  GVIS=$(echo $GVIS); export CUDA_VISIBLE_DEVICES=${GVIS// /,}
+fi
+lg() { local i=0 g; [ -n "$GVIS" ] && for g in $GVIS; do [ "$g" = "$1" ] && { echo $i; return; }; i=$((i + 1)); done; echo $1; }
+sgpu() { [ -n "$GVIS" ] && [ -n "$SGPU" ] && echo "CUDA_VISIBLE_DEVICES=$SGPU"; return 0; }
 # SLABI / SLABOV: slab cells / overlap (default 64 / 16). A full-section Paris 3 slab (96 x 3680 x 4768 fields, 16.8 GB) does not fit a 16 GB GPU and
 # runs from managed memory at 20-60 min per slab (desk 5060 Ti, 11-01); SLABI=32 (64 rows, 11.2 GB) fits the device.
 PRIZE="PHerc0125 PHerc0175A PHerc0175B PHerc0191 PHerc0211 PHerc0257 PHerc0268 PHerc0306B PHerc0358 PHerc0483A PHerc0483B PHerc0490A PHerc0490B PHerc0800 PHerc0813 PHerc0826 PHerc0846A PHerc0846B PHerc1203 PHerc1218 PHerc1545"
@@ -147,7 +156,10 @@ X() { local l=$1; shift; if [ "$DRY" = 1 ]; then echo "    $*  > $l"; return 0; 
 stage() {
   local st=$1 fn=$2 t0 rc l=$O/logs/$1.log
   done_ $st && return 0; stopped && return 1
-  if [ "$DRY" = 1 ]; then echo "[$st]"; $fn; return 0; fi
+  if [ "$DRY" = 1 ]; then
+    case $st in fields|slabs|ink|inkcal|perwrap|faces) echo "[$st] (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-unset}; per-job --gpu / devices)"; $fn;;
+      *) if [ -n "$(sgpu)" ]; then echo "[$st] (CUDA_VISIBLE_DEVICES=$SGPU)"; CUDA_VISIBLE_DEVICES=$SGPU $fn; else echo "[$st] (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-unset})"; $fn; fi;; esac
+    return 0; fi
   log "$st start"; t0=$(date +%s); : >> $l; local m0=$(wc -l < $l)
   # (the stages that place themselves: fields / slabs / ink / perwrap pass --gpu or set CUDA_VISIBLE_DEVICES per job; the rest on SGPU)
   case $st in fields|slabs|ink|inkcal|perwrap|faces) $fn;; *) if [ -n "$(sgpu)" ]; then CUDA_VISIBLE_DEVICES=$SGPU $fn; else $fn; fi;; esac; rc=$?
@@ -239,7 +251,7 @@ fpred() {   # fpred GPU BOX OUT
   if onepass_on; then
     X $O/logs/fields.log $U predict $CK $R $K $O/ink/onepass --um $UM --level $LV --box $2 --full-grid 1 --shard 512 --window ${OPWIN:-1152} --halo 64 \
       --seam-inproc 1 --heads ink,c12,c13 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --axis $O/axis.json $(occlv) --q 8 --levels 4 \
-      --threads ${PTH:-14} --gpu $1 --ema 1 && { [ "$DRY" = 1 ] || [ -e $3/fields.json ]; }; return
+      --threads ${PTH:-14} --gpu $(lg $1) --ema 1 && { [ "$DRY" = 1 ] || [ -e $3/fields.json ]; }; return
   fi
   if [ "${FBLEND:-0}" = 1 ] && [ "$FKIND" = lat ]; then
     local st=$(( ${LWIN:-640} - 2 * ${LHALO:-64} )) gg
@@ -264,7 +276,7 @@ fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windo
   if [ "$FKIND" = lat ]; then win="--window ${LWIN:-640} --halo ${LHALO:-64}"
   else win="$([ "${FWIN:-prod}" = auto ] && echo "--window auto" || echo "--window-z 384 --halo-z 64 --window 640") --halo 64"; fi
   X $O/logs/fields.log $U predict $CK ${FCTR:-$R} ${FCTK:-$K} $3.tmp --um $UM --level $LV --box $box $win --shard 512 \
-    --grid-origin $4,$4,$4 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $sk $(occlv) &&
+    --grid-origin $4,$4,$4 --ema 1 --q 8 --threads ${PTH:-14} --gpu $(lg $1) --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $sk $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
 # --- the ref's pass 1 streamed behind the fields predict (REFSTREAM; 6a, 11-12) ---
@@ -344,13 +356,15 @@ ctcal() {
 # 0.5 mm pairs all 6 up (mean .679 -> .695), 4 mm pairs mean .286 -> .293, GT
 # intervals off .099 -> .083; 1667 all 5 slabs up (ids +.06..+.13, 4 mm pairs +.06..+.08); 0139 flat; 0846A wraps / CT peaks per turn same.
 # REFPH="--phase-w 4" = the old ref.
-# refpool: the ref's pass-1 (pooling) flags; refcz FIELDSJSON: the chunk rows count-field picks from --mem-gb CFMEM when memory is not
-# short (12 B per cell of a cross-section, a multiple of the pool 8, then of 128): the streamed pass 1 and the solve run pass it explicitly
+# refpool: the ref's pass-1 (pooling) flags. (refcz was: the chunk rows count-field picks from --mem-gb CFMEM when memory is not
+# short, 12 B per cell of a cross-section, a multiple of the pool 8, then of 128, until 2026-11-17)
 # MSTRIDE 1 (was 4): the model's local gauge from every chunk. With 4 only every 4th chunk had one (count-field now interpolates the rows
 # between, but the 1667 refs were coherent on 1 / K of z: unroll #8 recheck 11-14); the full pass costs ~4x a 7 s GPU model pass
 refpool() { echo "--R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --model-only 1 --model-stride ${MSTRIDE:-1} ${REFX:-}"; }
-refcz() { jq -r --argjson m ${CFMEM:-24} '(.shape[1] * .shape[2]) as $hw | (($m * 1e9 / (12 * $hw)) | floor) as $c | (($c / 8 | floor) * 8) as $c8 |
-                                         (if $c8 >= 128 then ($c8 / 128 | floor) * 128 else $c8 end) as $cz | if $cz < 8 then 8 else $cz end' $1; }
+# refcz: the ref's chunk rows, fixed (REFCZ, 512; lead 2026-11-17): they had come from the free host memory (--mem-gb lowered to 60 % of
+# what was available) and change the ref (0332: 512 vs 640 rows, delta p99 0.017 turn, max 1.03, so two runs' joined models differed).
+# count-field takes fewer only when --mem-gb cannot hold them, with a DEFAULTED: line; the ref stage logs the rows it used
+refcz() { echo ${REFCZ:-512}; }
 # SPIRALDIR: the spiral's hand for the ref (count-field --dir; the slabs take it from the ref). Default: scripts/unroll/spiral_dir.tsv
 # (measured against published surfaces), else count-field's own vote. Its ring vote can be empty (PHerc1667: sheets far from circles),
 # and then it fell back to +1 silently: the 11-12 1667 unroll had the wrong hand (sheet identity vs the published unwrap 0.48; the ref
@@ -375,7 +389,7 @@ ref() {
     for d in p m; do
       [ "$DRY" = 1 ] || rm -rf $REF.$d
       X $O/logs/ref.$d.log $U count-field $F $O/cf.unused $(refpool) --dir $([ $d = p ] && echo 1 || echo -1) --iters 1200 --model $REF.$d \
-        --threads $TH --mem-gb ${CFMEM:-24} $cal $pc || { log "ref: DIRCOH: the --dir $d solve failed (logs/ref.$d.log)"; return 1; }
+        --threads $TH --mem-gb ${CFMEM:-24} $cal ${pc:---chunk-rows $(refcz)} || { log "ref: DIRCOH: the --dir $d solve failed (logs/ref.$d.log)"; return 1; }
       [ "$DRY" = 1 ] && continue
       c=$(grep -oE 'count-field: model coherence [0-9.]+' $O/logs/ref.$d.log | tail -1 | awk '{print $4}')
       [ -n "$c" ] && [ -e $REF.$d/model.json ] || { log "ref: DIRCOH: no model coherence / model from the --dir $d solve"; return 1; }
@@ -391,9 +405,10 @@ ref() {
   fi
   if [ -n "${REFCMD:-}" ]; then X $O/logs/ref.log $REFCMD $F $REF $cal; else
   X $O/logs/ref.log $U count-field $F $O/cf.unused $(refpool) --iters 1200 --model $REF \
-    --threads $TH --mem-gb ${CFMEM:-24} $cal $pc; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; } ||
+    --threads $TH --mem-gb ${CFMEM:-24} $cal ${pc:---chunk-rows $(refcz)}; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; } ||
     { grep -q 'REFUSED' $O/logs/ref.log 2> /dev/null && log "ref: $(grep -o 'REFUSED.*' $O/logs/ref.log | tail -1 | cut -c1-220)"; return 1; }
   [ "$DRY" != 1 ] && log "ref: $(grep -oE 'count-field: dir [+-]1 \([^)]*\)' $O/logs/ref.log | tail -1)"
+  [ "$DRY" != 1 ] && log "ref: chunk rows $(grep -hoE '[0-9]+ rows per chunk' $O/logs/ref.log $O/logs/refstream.log 2> /dev/null | tail -1 | awk '{print $1}') (REFCZ ${REFCZ:-512})$(grep -hq '^DEFAULTED: count-field chunk rows' $O/logs/ref.log $O/logs/refstream.log 2> /dev/null && echo ': DEFAULTED, see logs/ref.log')"
   # the run manifest (audit-unroll): the direction the ref used and where it came from (env / tsv / gate = count-field's own evidence)
   if [ "$DRY" != 1 ] && type mset > /dev/null 2>&1; then
     mset spiral_dir "$(jq -r .dir $REF/model.json 2> /dev/null)"; mset spiral_dir_src "$sds$([ $sds = gate ] && grep -oE 'count-field: dir [+-]1 \(([^)]*)\)' $O/logs/ref.log | tail -1 | sed -E 's/.*\((.*)\)/: \1/')"; fi
@@ -431,7 +446,7 @@ inkcal() {
   [ "$DRY" = 1 ] || mkdir -p $O/ink
   local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
   cal=$(echo $box | awk -F, -v cz=${INKCALZ:-2048} '{ zc = $1 + int($4 / 2); z0 = zc - int(cz / 2); if (z0 < $1) z0 = $1; nz = cz; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
-  local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU --axis $O/axis.json $(occlv)"
+  local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $(lg $INKGPU) --axis $O/axis.json $(occlv)"
   [ -s $O/ink/gn.bin ] || { X $O/logs/inkcal.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P ${INKPX:-} --window ${INKW:-auto} --halo ${INKH:-32} --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
                              { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || return 1; }
 }
@@ -445,12 +460,12 @@ ink() {
     local h; for h in ink c12 c13; do [ -e $O/ink/onepass/$h/zarr.json ] || { log "ink: ONEPASS: no $h in $O/ink/onepass"; return 1; }; done
     rm -rf $INK $O/ink/c12.zarr $O/ink/c13.zarr; ln -s onepass/ink $INK; ln -s onepass/c12 $O/ink/c12.zarr; ln -s onepass/c13 $O/ink/c13.zarr; return 0
   fi
-  if [ -n "${INKCMD:-}" ]; then UNROLL_CT="$R|$K|$UM|$LV" X $O/logs/ink.log $INKCMD $O $INKGPU $INK || { log "ink: INKCMD '$INKCMD' failed (logs/ink.log)"; return 1; }
+  if [ -n "${INKCMD:-}" ]; then UNROLL_CT="$R|$K|$UM|$LV" X $O/logs/ink.log $INKCMD $O $(lg $INKGPU) $INK || { log "ink: INKCMD '$INKCMD' failed (logs/ink.log)"; return 1; }
     [ "$DRY" = 1 ] || [ -e $INK/zarr.json ] || { log "ink: INKCMD '$INKCMD' left no zarr at $INK (zarr.json missing; dangling link?)"; return 1; }
     return 0; fi
   local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
   cal=$(echo $box | awk -F, '{ zc = $1 + int($4 / 2); z0 = zc - 1024; if (z0 < $1) z0 = $1; nz = 2048; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
-  local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $INKGPU --axis $O/axis.json $(occlv)"
+  local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $(lg $INKGPU) --axis $O/axis.json $(occlv)"
   inkcal || return 1
   # one feathered pass (inklib.sh): window auto (576/32 on 16 GB, 1088/32 from ~46 GB free), each border blended over 32 voxels; resumable
   X $O/logs/ink.log $U predict $INKCK $R $K $INK $P ${INKPX:-} --box $box --window ${INKW:-auto} --halo ${INKH:-32} --feather ${INKF:-32} --full-grid 1 --resume 1 --levels 4 \
@@ -471,7 +486,7 @@ SLABFIT=${SLABFIT---steps 300,300,300,300,200,200 --batch 1000000}
 CROPM=${CROPM-2}; FITLOCK=${FITLOCK:-0}
 lane() {   # lane GPU
   local g=$1 k s d c0 c1 a b t0 rc ze ny nx dir
-  if [ "$DRY" = 1 ]; then echo "    lane GPU $g: per slab k: mkcrop.sh $F slabs/sNNN/f ($I cells + $OV overlap); $U fit slabs/sNNN/f --gpu $g --out slabs/sNNN/fit --dir REFDIR --ref-model $REF --ref-snap 1 --uw-repair 0 $([ "${CROPM:-0}" != 0 ] && echo --crop-material $CROPM) $SLABFIT [phase gate on by default; FITX=\"--phase-gate 0\" off] ${FITX:-}"; return 0; fi
+  if [ "$DRY" = 1 ]; then echo "    lane GPU $g: per slab k: mkcrop.sh $F slabs/sNNN/f ($I cells + $OV overlap); $U fit slabs/sNNN/f --gpu $(lg $g) --out slabs/sNNN/fit --dir REFDIR --ref-model $REF --ref-snap 1 --uw-repair 0 $([ "${CROPM:-0}" != 0 ] && echo --crop-material $CROPM) $SLABFIT [phase gate on by default; FITX=\"--phase-gate 0\" off] ${FITX:-}"; return 0; fi
   ze=$(jq -r '.shape[0]' $F/fields.json); ny=$(jq -r '.shape[1]' $F/fields.json); nx=$(jq -r '.shape[2]' $F/fields.json); dir=$(jq -r .dir $REF/model.json)
   for k in $(seq 0 $(( (ze + I - 1) / I - 1 ))); do
     stopped && return 0
@@ -484,7 +499,7 @@ lane() {   # lane GPU
     # device headroom since 6126e23; this is the fallback)
     local man=${FIT_MANAGED:-0}
     env UFSM_FIT_THREADS=$FTH_LANE $([ "$man" = 1 ] && echo UFSM_FIT_MANAGED=1) $([ "$FITLOCK" != 0 ] && echo UFSM_FIT_GPU_LOCK=$O/state/fitgpu$g.lock) $([ "$FITLOCK" = 2 ] && echo UFSM_FIT_LOCK_LATE=1) /usr/bin/time -v nice -n 5 \
-      $U fit $d/f --gpu $g --out $d/fit --dir $dir --ref-model $REF --ref-snap 1 --uw-repair 0 $([ "${CROPM:-0}" != 0 ] && echo --crop-material $CROPM) $SLABFIT ${FITX:-} > $d/fit.log 2>&1; rc=$?
+      $U fit $d/f --gpu $(lg $g) --out $d/fit --dir $dir --ref-model $REF --ref-snap 1 --uw-repair 0 $([ "${CROPM:-0}" != 0 ] && echo --crop-material $CROPM) $SLABFIT ${FITX:-} > $d/fit.log 2>&1; rc=$?
     echo "$s $c0..$c1 rc $rc gpu $g $(( $(date +%s) - t0 ))s$([ "$man" = 1 ] && echo " managed")" >> $O/slabs.txt
     if [ $rc = 0 ]; then touch $d/done; elif grep -q "no data for the prior" $d/fit.log; then touch $d/empty $d/done; fi
     rm -rf $d/f; exec 9>&-
@@ -504,9 +519,9 @@ fitlanes() {
   case "$ny$nx" in *[!0-9]*|'') ;; *) est=$(awk -v a=$((I + 2 * OV)) -v y=$ny -v x=$nx 'BEGIN { printf "%d", 12 * a * y * x / 1e8 + 5 }');; esac   # (0.1 GB)
   for g in $FITGPUS; do
     n=${FITLANES:-}
-    if [ -z "$n" ] && [ $est -gt 0 ]; then fr=$($U sysinfo 2> /dev/null | awk -v g=$g '$1 == "gpu" && $2 == g ":" && match($0, /\([0-9.]+ GB free\)/) { print int(10 * substr($0, RSTART + 1, RLENGTH - 10)) }')
+    if [ -z "$n" ] && [ $est -gt 0 ]; then fr=$($U sysinfo 2> /dev/null | awk -v g=$(lg $g) '$1 == "gpu" && $2 == g ":" && match($0, /\([0-9.]+ GB free\)/) { print int(10 * substr($0, RSTART + 1, RLENGTH - 10)) }')
       n=$(( (${fr:-0} - 10) / est )); [ $n -lt 1 ] && n=1; [ $n -gt 3 ] && n=3
-    elif [ -z "$n" ]; then gb=$($U sysinfo 2> /dev/null | awk -v g=$g '$1 == "gpu" && $2 == g ":" && match($0, /, [0-9.]+ GB \(/) { print int(substr($0, RSTART + 2, RLENGTH - 6)) }')
+    elif [ -z "$n" ]; then gb=$($U sysinfo 2> /dev/null | awk -v g=$(lg $g) '$1 == "gpu" && $2 == g ":" && match($0, /, [0-9.]+ GB \(/) { print int(substr($0, RSTART + 2, RLENGTH - 6)) }')
       n=$(( (${gb:-0} - 8) / 16 )); [ $n -lt 1 ] && n=1; [ $n -gt 3 ] && n=3; fi
     for i in $(seq $n); do out+="$g "; done
   done; echo $out

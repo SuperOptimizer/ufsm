@@ -644,7 +644,13 @@ int cmd_count_field(int argc, char **argv) {
     if (CZ >= 128 && 128 % P == 0) CZ = CZ / 128 * 128;   /* whole 128-row zarr shards per chunk (a shard straddling two chunks is decoded twice) */
     /* --chunk-rows N: the chunk height fixed (a multiple of the pool; the strided model pass and the prior's chunk depend on it, so a
        pass 1 run apart from the solve (--pool-only, --follow) and the solve run pass the same N; default: from --mem-gb as above) */
-    if (opt_atoi("--chunk-rows", cf_opt(argc, argv, "--chunk-rows", "0")) > 0) { CZ = opt_atoi("--chunk-rows", cf_opt(argc, argv, "--chunk-rows", "0")) / P * P; if (CZ < P) CZ = P; if (CZ > D) CZ = (D + P - 1) / P * P; }
+    /* a fixed N above what --mem-gb holds (the memory rule's CZ): the memory rule's, with a DEFAULTED: line (the rows change the ref;
+       unroll.sh passes 512 so runs are reproducible, lead 2026-11-17) */
+    if (opt_atoi("--chunk-rows", cf_opt(argc, argv, "--chunk-rows", "0")) > 0) {
+        const int req = opt_atoi("--chunk-rows", cf_opt(argc, argv, "--chunk-rows", "0")), czm = CZ;
+        CZ = req / P * P; if (CZ < P) CZ = P; if (CZ > D) CZ = (D + P - 1) / P * P;
+        if (CZ > czm) { UFSM_DEFAULTED("count-field chunk rows = %d (--chunk-rows %d does not fit --mem-gb %.1f: %d rows)", czm, req, memgb, czm); CZ = czm; }
+    }
     if (pref < 0) {   /* --prefetch default: two chunks of ~11 planes in half of what this process may still allocate (cgroup aware: the
                          host's MemAvailable let a 1667 ref inside a 40 GB memcap scope prefetch two 19.5 GB chunks and be OOM-killed, 11-12) */
         const double av = (double)ufsm_mem_available();
