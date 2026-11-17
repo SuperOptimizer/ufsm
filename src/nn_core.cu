@@ -730,7 +730,7 @@ static const char *const g_ws_name[NN_WS_N] = {
     "lp_buf f32 slot 0", "lp_buf f32 slot 1", "lp_buf f32 slot 2", "lp_buf f32 slot 3", "lp_buf f32 slot 4", "lp_buf f32 slot 5",
     "lp_buf f16 slot 0", "lp_buf f16 slot 1", "lp_buf f16 slot 2", "lp_buf f16 slot 3", "lp_buf f16 slot 4", "lp_buf f16 slot 5",
     "lp_buf bf16 slot 0", "lp_buf bf16 slot 1", "lp_buf bf16 slot 2", "lp_buf bf16 slot 3", "lp_buf bf16 slot 4", "lp_buf bf16 slot 5",
-    "fp4 GroupNorm input copy (prenorm)", "fine stem partial sums", "tc weight copy (16-bit)", "tc weight scales", "s2b gy overlap copy"};
+    "fp4 GroupNorm input copy (prenorm)", "fine stem partial sums", "tc weight copy (16-bit)", "tc weight scales", "s2b gy overlap copy", "s2 fp8 GroupNorm input copy (prenorm)"};
 static void *g_ws[8][NN_WS_N]; static size_t g_ws_cap[8][NN_WS_N], g_ws_lim[8][NN_WS_N]; static int g_ws_sealed[8];   /* mgpu: per-device */
 static pthread_mutex_t g_ws_mu = PTHREAD_MUTEX_INITIALIZER;   /* (the late-grow report and the totals; the slots themselves are per device) */
 static int ws_dev(void) { int d = 0; cudaGetDevice(&d); return d & 7; }
@@ -762,6 +762,7 @@ extern "C" int nn_ws_reserve(int id, size_t bytes) {   /* the current device's w
 }
 extern "C" void nn_ws_limit(int id, size_t bytes) { if (id >= 0 && id < NN_WS_N) g_ws_lim[ws_dev()][id] = bytes; }   /* 0: none */
 extern "C" void nn_ws_seal(int on) { g_ws_sealed[ws_dev()] = on; }
+extern "C" int nn_ws_sealed(void) { return g_ws_sealed[ws_dev()]; }   /* (1: the trainer's plan holds: optional workspaces stay out) */
 extern "C" size_t nn_ws_bytes(int id) { const int d = ws_dev(); if (id >= 0) return id < NN_WS_N ? g_ws_cap[d][id] : 0; size_t t = 0; for (int i = 0; i < NN_WS_N; i++) t += g_ws_cap[d][i]; return t; }
 extern "C" const char *nn_ws_name(int id) { return id >= 0 && id < NN_WS_N ? g_ws_name[id] : "?"; }
 extern "C" void ufsm_no_verify_types(const char *fn) {

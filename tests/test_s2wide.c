@@ -1,7 +1,7 @@
 /* conv_fwd_s2_f8_k with every output channel in one block (UFSM_S2_WIDE: MT 6 for 96 / 192 outputs, MT 8 for multiples of 128, MT 10 for 160) against
    its 32 / 64-row output tiles (lp_set_s2_wide 0 / 1 on the same operands): the same MMAs in the same order per accumulator, so every
    output byte must be identical. MX-fp4 inputs of 96 / 128 / 192 channels (the latent nets' level-0 -> 1 and 1 -> 2 down convs), with and
-   without the input's GroupNorm + SiLU in staging, partial tiles (MX-fp4 in and out: the kernel takes one activation type). Usage: test_s2wide */
+   without the input's GroupNorm + SiLU (in staging, and the wide tiles' prenorm pass s2_prenorm_k), partial tiles (MX-fp4 in and out: the kernel takes one activation type). Usage: test_s2wide */
 #include "nn.h"
 #include "nn_lp.h"
 #include <stdio.h>
@@ -9,6 +9,7 @@
 #include <string.h>
 
 void lp_set_s2_wide(int on);
+void lp_set_s2_pre(int on);
 static uint64_t rs = 0x52a1d3ull;
 static unsigned rnd(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (unsigned)(rs >> 32); }
 static float frand(void) { return (rnd() >> 8) * (1.f / 16777216.f) * 2.f - 1.f; }
@@ -31,11 +32,11 @@ static void run(int Ci, int Co, int D, int H, int W, int gn, int odt) {
     void *y[2]; unsigned char *h[2];
     for (int k = 0; k < 2; k++) {
         y[k] = nn_malloc(yb); nn_zero(y[k], yb); nn_set_storage(y[k], yb, odt);
-        lp_set_s2_wide(k);
+        lp_set_s2_wide(k); lp_set_s2_pre(k);
         lp_conv_fwd_s2_f8(x, 4, xs, w, b, Co, y[k], odt, ys, gp);
         nn_sync(); h[k] = malloc(yb); nn_d2h(h[k], y[k], yb);
     }
-    lp_set_s2_wide(1);
+    lp_set_s2_wide(1); lp_set_s2_pre(1);
     size_t nd = 0, nz = 0; for (size_t i = 0; i < yb; i++) { nd += h[0][i] != h[1][i]; nz += h[0][i] != 0; }
     const char *e = nn_check();
     const int ok = !e && nd == 0 && nz > yb / 4;

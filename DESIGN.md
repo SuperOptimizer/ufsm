@@ -6,6 +6,37 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The stride-2 fp8 down conv: one block for every output channel plus a prenorm pass, 2.1x (2026-11-17, branch convks2-20261117)
+
+conv_fwd_s2_f8_k (the 96 / 128 / 160-wide nets' down convs: predict, and the training forward) was staging-bound.
+- A block of 64 outputs (2 z x 4 y x 8 x) took one 32- or 64-row output tile: Cop 96 -> MT 2, three tiles.
+- So each tile re-staged its 765 input positions x 32 channels: decode, GN + SiLU, the block amax, e4m3. That is about 1,150 instructions
+  a thread per chunk against about 200 for the 27 x MT MMAs.
+- ncu, the fields window's 96 -> 96 160^3 -> 80^3 conv: 15.9 ms, 8 % tensor pipe.
+
+Two changes:
+- UFSM_S2_WIDE (default 1): MT 6 / 8 / 10 for 96 / 192, multiples of 128 and 160 outputs, so every output channel sits in one block and the
+  input is staged once. Three taps a weight round keep two blocks an SM.
+- UFSM_S2_PRE (default 1, with the wide tiles, not under a trainer's sealed memory plan, at most a quarter of the free memory):
+  s2_prenorm_k writes the GN input once as an MX-fp8 tensor with the bytes and scales the staging would form. The kernel then copies it
+  (TY: the output type stays MX-fp4).
+
+Per output the MMAs and their order are unchanged, so the bytes are identical: test_s2wide covers 96 / 128 / 160 / 192 / 256 outputs with
+and without GN and partial tiles, and the fields and ink predict outputs are byte-identical.
+
+| ncu, fields window | old | wide | wide + prenorm |
+|---|---|---|---|
+| 96 -> 96 160^3 | 15.9 | 8.4 | 1.6 + 5.4 |
+| 128 | 2.16 | 1.57 | 0.26 + 1.11 |
+| 160 | 0.88 | 0.47 | 0.04 + 0.35 |
+
+Predict, 0332, 32 windows, interleaved, full-key ksum:
+- fields: down convs 17.5 -> 8.2 ms per window; kernel time 151.0 / 151.0 -> 142.3 / 140.9 (-6.2 %).
+- ink: 11.8 -> 5.4 ms; 113.3 -> 106.9 (-5.6 %).
+
+Also tried: predict's cell head (144 outputs from 96 channels, conv1_mx_t_k in 9 passes of 16) on constant-bank weights, 48 outputs a
+pass (conv1_mx_cn_k, branch convkc1-20261117). It is bit-identical but slower: 21.7 -> 25.6 ms per window, since the 18 KB of weights
+overflow the constant cache, and 16 outputs a pass is no faster (ncu). Parked.
 ## test_unet~narrow's pod fault: a stale lean-2 plan flag in the fp32 rebuild (2026-11-17, branch narrow-nob-20261117)
 
 test_unet~narrow (P 32, MX-fp8 activations and gradients, lean 2, chunked up part) failed 3/3 on the RTX PRO 6000 and 2/2 on the PRO

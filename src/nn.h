@@ -705,7 +705,8 @@ void nn_signm(float *p, const float *g, float *m, size_t n, float lr, float b, f
 int lp_f8w_mixed_reserve(void);   /* the latent input conv's MX-fp8 x / MX-fp4 gy weight-gradient chunk copies (96 MB) on the current device now */
 /* kernel workspaces (nn_core.cu): one per-device registry of the kernels' grow-on-demand scratch, sized by the trainer's memory planner */
 enum { NN_WS_LPBUF = 0,   /* + 6 x the element type (0 uint8, 1 float, 2 __half, 3 bf16) + slot (0..5): lp_buf<T>(slot) */
-       NN_WS_F4PRE = 24, NN_WS_FSTEM, NN_WS_TCW, NN_WS_TCWSC, NN_WS_S2BCP, NN_WS_N };
+       NN_WS_F4PRE = 24, NN_WS_FSTEM, NN_WS_TCW, NN_WS_TCWSC, NN_WS_S2BCP, NN_WS_S2PRE, NN_WS_N };
+int nn_ws_sealed(void);   /* the current device's workspaces sealed by a memory plan (unet_ws_plan) */
 void *nn_ws(int id, size_t bytes);       /* the current device's workspace id of >= bytes (grown if needed; nullptr: no memory, or over a soft limit after the seal) */
 int nn_ws_reserve(int id, size_t bytes); /* grow it to >= bytes now (before the first step); -1 if the device is full */
 void nn_ws_limit(int id, size_t bytes);  /* after the seal, larger requests return nullptr (callers with a fallback); 0: none */
