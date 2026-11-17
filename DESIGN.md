@@ -6,6 +6,21 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## test_unet~narrow's pod fault: a stale lean-2 plan flag in the fp32 rebuild (2026-11-17, branch narrow-nob-20261117)
+
+test_unet~narrow (P 32, MX-fp8 activations and gradients, lean 2, chunked up part) failed 3/3 on the RTX PRO 6000 and 2/2 on the PRO
+4000 pods (illegal address, then "gn_dsums: cudaMalloc") and passed on the desk. Not the pod's JIT: with CUDA_LAUNCH_BLOCKING=1
+MCUDA_TRACE=1 the first faulting launch is conv_fwd_k<3, 1, 4> (the fp32 backward-data conv), whose SASS on the pod is identical
+to the desk's. A probe of each buffer's driver allocation (cuMemGetAddressRange) against the bytes the kernel touches found it on
+the desk too: in the nn_set_tf32(0) whole-network gradient pass, four decoder convs wrote their concat gradient (96 / 160 / 160 / 96
+channels) into 32 / 64 / 96 / 64-channel buffers (12.6 MB into 4.2 MB at level 0). build_acts' tensor-core gradient plan sets u->nob
+(lean 2: no B buffer, block_bwd writes the input gradient in place over gy) and free_acts never reset it, so the fp32 rebuild, which
+gives every level its own full-width gA / gB, still ran block_bwd's in-place branch. On the desk the overrun landed in mapped
+memory (silently: the fp32 reference gradient itself was off; rel L2 vs tensor cores 0.276 -> 0.264 once fixed), on the pods past
+the mapping. memcheck had not seen it (the overrun stays inside pooled allocations). Fix: free_acts resets nob (and gA_bytes) with
+the other plan flags. Pod PRO 4000: 2/2 pass. Only a rebuild that leaves the tensor-core plan for the fp32 one is affected (tests;
+training never switches nn_set_tf32).
+
 ## mcc 5744025: thread-block clusters (__cluster_dims__); live-range splitting at calls (2026-11-17, branch mcc-rasplit-20261117)
 
 **Clusters** (for convk's fp4 wgrad: the 8 co-tile CTAs of one ci tile stage x once instead of 8 times; x staging is 85 % of

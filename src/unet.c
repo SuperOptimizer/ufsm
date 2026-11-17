@@ -956,6 +956,8 @@ static void free_acts(unet *u) {
     if (u->h_r) { if (u->r_out || u->r_in) nn_sync(); nn_host_free(u->h_r); }
     u->h_r = nullptr; u->p3 = u->r_out = u->r_in = 0; u->R = u->Xp = u->Yp = nullptr; u->r_bytes = u->x_bytes = u->y_bytes = 0; u->zr = 0;
     u->gco = 0; u->gout_x1 = u->gout_home1 = nullptr; u->dno = u->dn_out = 0; u->sko = u->sk_out = 0;
+    u->nob = 0; u->gA_bytes = 0;   /* (set by the tensor-core gradient plan only: a stale nob from a lean-2 build made the fp32 rebuild's block_bwd
+                                     write a decoder's concat gradient in place over its 1/3-size gy: test_unet~narrow's nn_set_tf32(0) pass) */
     u->l3b = u->l3s = u->l3_skip_in = 0; u->l3_lo = 0; for (int k = 0; k < 4; k++) { u->l3x[k] = nullptr; u->l3xb[k] = 0; }
     u->built = 0; u->act_bytes = 0; u->grad_bytes = 0;
     u->last_a1_live = 0;
