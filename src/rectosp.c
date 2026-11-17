@@ -15,6 +15,12 @@
 #include "rectoruler.h"
 #define RSG_WEAK __attribute__((weak))
 #include "rectogpu.h"
+/* predict's device chunk gathers (src/nn_ctdev.cu, nn.h); weak: a binary without the CUDA objects runs the CPU path */
+void *nn_ctw_new(int dev) __attribute__((weak));
+void nn_ctw_free(void *w) __attribute__((weak));
+uint8_t *nn_ctw_host(void *w) __attribute__((weak));
+uint8_t *nn_ctw_dev(void *w) __attribute__((weak));
+int nn_ctw_put(void *w, uint32_t dm, int host, const int64_t co[3], const int64_t wo[3], const int64_t wn[3], const int64_t sh[3], uint8_t *dwin) __attribute__((weak));
 #include "sysinfo.h"
 #include "zarr3.h"
 #include "z3w.h"
@@ -159,30 +165,56 @@ static void rs_rows(void *ctx, int a0, int a1, int t) {
 /* ---- the GPU path (src/nn_rectosp.cu; not with --cls): the CPU's row blocks, each block's profiles on the device ----
    A helper thread runs one block ahead: the field rows (loaded in array-chunk-aligned spans of up to 128 rows, kept for the next block),
    the block's cells (rs_rows' grid and material test) and the source slices the block adds to the device's z ring (decoded once: each
-   read ends on the source's chunk rows, the next block starts where it ended). The main thread uploads those slices, runs the kernel
-   and writes the codes into the shard row's rsp exactly as rs_rows does. */
+   read ends on the source's chunk rows, the next block starts where it ended), uploaded while the previous block's kernel runs (the
+   ring is one block step deeper for that). The main thread runs the kernel and writes the codes into the shard row's rsp exactly as
+   rs_rows does. */
 int g_rectosp_gpu_blocks;   /* row blocks the last recto-sp ran on the GPU (tests) */
+long long g_rectosp_dev_chunks, g_rectosp_ring_chunks;   /* source chunks it decoded on the GPU decoder / gathered into the ring on the device (-1: the host decode path) (tests) */
 typedef struct { int sr, q0, q1, a0; int64_t so[3], sn[3], d0, d1; } rs_gblk;   /* shard row, rows, source box, ring slices to add */
 typedef struct {
     const char *in; z3 *zs; int nt, H, W, S, shp0; long long org[3], zoff0;
     const rs_gblk *bl; int k;   /* the block this job prepares */
     fit_fields_buf fb; int f0, f1, fok;   /* the cached field rows [f0, f1) */
-    uint8_t *stg; size_t stgcap; int32_t *zyx, *blk; uint8_t *t6; int M, Mcap; int rc; char err[256];
+    uint8_t *stg; size_t stgcap; int32_t *zyx, *blk; uint8_t *t6; int M, Mcap; int rc; char err[256], errf[256]; int rcf; double tup, tdec, tfld;
+    void **ctw; int nctw, ngpuw;   /* device decode (chunk workers: the first ngpuw on the GPU decoder, the rest on the CPU; nctw 0: z3_read + rsg_put) */
+    _Atomic long long ndev, nhost, nskip;
 } rs_gprep;
-static void *rs_gprep_main(void *a) {
-    rs_gprep *R = a; const rs_gblk *B = &R->bl[R->k]; R->rc = 0; R->M = 0;
+/* the block's new slices [z0, z1) from whole 128^3 chunks decoded into the device ring (chunk row by chunk row: the ring is a multiple of
+   128 slices, so a chunk row's slots are contiguous) */
+typedef struct { rs_gprep *R; const rs_gblk *B; int w; _Atomic long *next; long nch; int64_t cy0, cx0, ncy, ncx, cz0; _Atomic int *fail; } rs_cw;
+static void *rs_cw_main(void *a) {
+    rs_cw *C = a; rs_gprep *R = C->R; const rs_gblk *B = C->B; void *w = R->ctw[C->w]; uint8_t *hc = nn_ctw_host(w), *dc = C->w < R->ngpuw ? nn_ctw_dev(w) : nullptr;
+    z3_thread_cpu_decode(!dc);
+    const int64_t n128[3] = {128, 128, 128}, *sh = z3_meta_of(R->zs)->shape;
+    for (long j; (j = atomic_fetch_add(C->next, 1)) < C->nch && !atomic_load(C->fail);) {
+        const int64_t per = C->ncy * C->ncx, cz = C->cz0 + j / per, co[3] = {cz * 128, (C->cy0 + j / C->ncx % C->ncy) * 128, (C->cx0 + j % C->ncx) * 128};
+        uint32_t dm = 0;
+        if (z3_read_sub_dev(R->zs, co, n128, hc, 1, 0, dc, &dm)) { atomic_store(C->fail, 1); break; }
+        const int host = dm != 0xffffffffu;
+        if (host && !dm) { const uint64_t *q = (const uint64_t *)hc; uint64_t any = 0; for (size_t i = 0; i < ((size_t)1 << 21) / 8 && !any; i++) any |= q[i];
+                           if (!any) { atomic_fetch_add(&R->nskip, 1); continue; } }   /* (all fill: the slices are zeroed) */
+        atomic_fetch_add(host ? &R->nhost : &R->ndev, 1);
+        const int64_t zl = co[0] > B->d0 ? co[0] : B->d0, zh = co[0] + 128 < B->d1 ? co[0] + 128 : B->d1;
+        const int64_t wo[3] = {zl, B->so[1], B->so[2]}, wn[3] = {zh - zl, B->sn[1], B->sn[2]};
+        if (nn_ctw_put(w, dm, host, co, wo, wn, sh, rsg_slot(zl))) { atomic_store(C->fail, 1); break; }
+    }
+    z3_thread_cpu_decode(0);
+    return nullptr;
+}
+static void *rs_gfld_main(void *a) {   /* the block's field rows and cells (beside its source, on a thread of their own) */
+    rs_gprep *R = a; const rs_gblk *B = &R->bl[R->k]; R->rcf = 0; R->M = 0; const double tf0 = rs_now();
     const int a0 = B->a0, a1 = B->q1, H = R->H, W = R->W, S = R->S;
     if (!R->fok || a0 < R->f0 || a1 > R->f1) {   /* the field rows: from a0 to the array chunk row's end past a1 (the next block's rows) */
         if (R->fok) { fit_fields_free(&R->fb); R->fok = 0; }
         long long e = ((R->zoff0 + a1 + 127) / 128) * 128 - R->zoff0; if (e < a1) e = a1; if (e > R->shp0) e = R->shp0;
         fit_fields_skip_planes(1 | 2 | 8); fit_fields_ct_planes(0);
-        if (fit_fields_load(R->in, a0, (int)e, 1, &R->fb)) { R->rc = 1; snprintf(R->err, sizeof R->err, "cannot load field rows %d..%lld", a0, e); return nullptr; }
+        if (fit_fields_load(R->in, a0, (int)e, 1, &R->fb)) { R->rcf = 1; snprintf(R->errf, sizeof R->errf, "cannot load field rows %d..%lld", a0, e); return nullptr; }
         R->f0 = a0; R->f1 = (int)e; R->fok = 1;
     }
     const fit_fields *f = &R->fb.f; const int nyb = (H + S - 1) / S, nzb = (a1 - a0 + S - 1) / S, nxb = (W + S - 1) / S;
     const size_t cap = (size_t)nzb * nyb * nxb;
     if ((int)cap > R->Mcap) { free(R->zyx); free(R->blk); free(R->t6); R->zyx = malloc(cap * 3 * sizeof(int32_t)); R->blk = malloc(cap * 3 * sizeof(int32_t)); R->t6 = malloc(cap * 6); R->Mcap = (int)cap;
-                              if (!R->zyx || !R->blk || !R->t6) { R->rc = 1; snprintf(R->err, sizeof R->err, "out of memory"); return nullptr; } }
+                              if (!R->zyx || !R->blk || !R->t6) { R->rcf = 1; snprintf(R->errf, sizeof R->errf, "out of memory"); return nullptr; } }
     int M = 0;
     for (int zb = 0; zb < nzb; zb++) {   /* (rs_rows' cells: J->r0 = 0, J->nr = a1 - a0) */
         const int z = zb * S + S / 2; if (z >= a1 - a0) continue;
@@ -196,11 +228,133 @@ static void *rs_gprep_main(void *a) {
             } }
     }
     R->M = M;
-    if (B->d1 > B->d0) {   /* the slices this block adds to the ring */
+    R->tfld += rs_now() - tf0;
+    return nullptr;
+}
+static void rs_gsrc(rs_gprep *R, const rs_gblk *B) {   /* the slices the block adds to the ring */
+    if (B->d1 > B->d0 && R->nctw) {   /* the slices this block adds to the ring, decoded on the device */
+        const double td = rs_now();
+        if (rsg_zero(B->d0, B->d1 - B->d0)) { R->rc = 1; snprintf(R->err, sizeof R->err, "GPU memset failed"); return; }
+        _Atomic long next = 0; _Atomic int fail = 0; const int64_t cz0 = B->d0 / 128, cz1 = (B->d1 + 127) / 128, cy0 = B->so[1] / 128, cy1 = (B->so[1] + B->sn[1] + 127) / 128, cx0 = B->so[2] / 128, cx1 = (B->so[2] + B->sn[2] + 127) / 128;
+        rs_cw C[64]; pthread_t th[64]; int up[64] = {0}; const int nw = R->nctw < 64 ? R->nctw : 64;
+        for (int t = 0; t < nw; t++) { C[t] = (rs_cw){.R = R, .B = B, .w = t, .next = &next, .nch = (cz1 - cz0) * (cy1 - cy0) * (cx1 - cx0), .cy0 = cy0, .cx0 = cx0, .ncy = cy1 - cy0, .ncx = cx1 - cx0, .cz0 = cz0, .fail = &fail};
+                                       up[t] = pthread_create(&th[t], nullptr, rs_cw_main, &C[t]) == 0; if (!up[t]) rs_cw_main(&C[t]); }
+        for (int t = 0; t < nw; t++) if (up[t]) pthread_join(th[t], nullptr);
+        if (fail) { R->rc = 1; snprintf(R->err, sizeof R->err, "device chunk decode: %s", z3_error()); return; }
+        R->tdec += rs_now() - td;
+    } else if (B->d1 > B->d0) {   /* the slices this block adds to the ring */
+        const double td = rs_now();
         const size_t need = (size_t)(B->d1 - B->d0) * B->sn[1] * B->sn[2];
-        if (need > R->stgcap) { free(R->stg); R->stg = malloc(need); R->stgcap = R->stg ? need : 0; if (!R->stg) { R->rc = 1; snprintf(R->err, sizeof R->err, "out of memory"); return nullptr; } }
+        if (need > R->stgcap) { free(R->stg); R->stg = malloc(need); R->stgcap = R->stg ? need : 0; if (!R->stg) { R->rc = 1; snprintf(R->err, sizeof R->err, "out of memory"); return; } }
         const int64_t o[3] = {B->d0, B->so[1], B->so[2]}, nn[3] = {B->d1 - B->d0, B->sn[1], B->sn[2]};
-        if (z3_read(R->zs, o, nn, R->stg, R->nt)) { R->rc = 1; snprintf(R->err, sizeof R->err, "%s", z3_error()); }
+        if (z3_read(R->zs, o, nn, R->stg, R->nt)) { R->rc = 1; snprintf(R->err, sizeof R->err, "%s", z3_error()); return; }
+        const double tu = rs_now(); R->tdec += tu - td;
+        if (rsg_put(B->d0, B->d1 - B->d0, R->stg)) { R->rc = 1; snprintf(R->err, sizeof R->err, "GPU upload failed"); return; }
+        R->tup += rs_now() - tu;
+    }
+}
+static void *rs_gprep_main(void *a) {
+    rs_gprep *R = a; const rs_gblk *B = &R->bl[R->k]; R->rc = 0;
+    pthread_t fth; const int fup = !pthread_create(&fth, nullptr, rs_gfld_main, R); if (!fup) rs_gfld_main(R);
+    rs_gsrc(R, B);
+    if (fup) pthread_join(fth, nullptr);
+    if (!R->rc && R->rcf) { R->rc = 1; memcpy(R->err, R->errf, sizeof R->err); }
+    return nullptr;
+}
+
+typedef struct { const rs_gprep *R; const uint8_t *q; int a0, a1, q0, q1, b0, H, W, S; uint8_t *rsp; } rs_sc;
+static void rs_scatter(void *a, int c0, int c1, int t) {   /* the cells' codes into their stride blocks (cells write disjoint blocks) */
+    const rs_sc *C = a; (void)t; const int M = C->R->M, m0 = (int)((long)M * c0 / 64), m1 = (int)((long)M * c1 / 64), S = C->S, H = C->H, W = C->W;
+    for (int m = m0; m < m1; m++) {
+        if (!C->q[m]) continue;
+        const int32_t *bk = C->R->blk + 3 * m; const int zb = bk[0], yb = bk[1], xb = bk[2]; const size_t xl = (size_t)(xb * S + S <= W ? S : W - xb * S);
+        for (int a2 = zb * S; a2 < zb * S + S && a2 < C->a1 - C->a0; a2++) { const int r = C->a0 + a2; if (r < C->q0 || r >= C->q1) continue;
+            for (int b = yb * S; b < yb * S + S && b < H; b++) memset(C->rsp + ((size_t)(r - C->b0) * H + b) * W + xb * S, C->q[m], xl); }
+    }
+}
+/* one array's shards of the row: pass 0 sp (outside the box: the input sp, read only where the box leaves part of the shard's array
+   cells uncovered), pass 1 rsp (shards with box cells only) */
+typedef struct rs_fin rs_fin;
+typedef struct { rs_fin *F; int pass, rc; uint8_t *shard; } rs_wr;
+static void *rs_wr_main(void *arg);
+/* one shard row's blend into net and its sp (+ rsp) shard writes (outside the box: the input sp), freeing net and rsp */
+struct rs_fin {
+    uint8_t *net, *rsp; int nr, b0, b1, H, W, SH, nt, h; int64_t gz0, ash[3]; long long zoff[3]; z3 *zsp; z3w *wsp, *wrs; uint8_t *shard, *shard2;
+    double glo, ghi, minnet, blend, rlo, rhi, ra0, ra1, um; int ramp;
+    long long nmat, nrep; double tn, tb, tw; int rc;
+};
+typedef struct { const uint8_t (*lut)[256]; uint8_t *net; const uint8_t *rsp; size_t n; _Atomic long long nmat, nrep; } rs_bl;
+static void rs_blend_rows(void *a, int r0, int r1, int t) {
+    rs_bl *B = a; (void)t; long long nm = 0, nr = 0; const size_t per = (B->n + 255) / 256, i0 = (size_t)r0 * per, i1 = (size_t)r1 * per < B->n ? (size_t)r1 * per : B->n;
+    for (size_t i = i0; i < i1; i++) {
+        if (!B->net[i]) continue;
+        nm++;
+        const uint8_t o = B->lut[B->net[i]][B->rsp[i]]; if (!o) continue;
+        B->net[i] = o; nr++;
+    }
+    atomic_fetch_add(&B->nmat, nm); atomic_fetch_add(&B->nrep, nr);
+}
+static void *rs_fin_main(void *arg) {
+    rs_fin *F = arg; F->rc = 0; F->nmat = F->nrep = 0; const double t0 = rs_now();
+    const int H = F->H, W = F->W, SH = F->SH, b0 = F->b0, b1 = F->b1; const int64_t gz0 = F->gz0, *ash = F->ash; const long long *zoff = F->zoff;
+    const size_t plane = (size_t)H * W; uint8_t *net = F->net, *rsp = F->rsp; const int nt = F->nt;
+    {   const int64_t o[3] = {zoff[0] + b0, zoff[1], zoff[2]}, nn[3] = {F->nr, H, W};   /* the network sp of the rows */
+        if (z3_read(F->zsp, o, nn, net, nt)) { fprintf(stderr, "recto-sp: %s\n", z3_error()); F->rc = 1; return nullptr; } }
+    const double t1 = rs_now(); F->tn = t1 - t0;
+    /* blend into net */
+    /* the blended code depends on (net, rsp) alone: a 256 x 256 table of the very values the per-cell rule gives (0: kept). The
+       per-cell exp / log over every material cell of a shard row was 43 of 207 s single-threaded on 0332 (2026-11-16) */
+    static uint8_t lut[256][256]; static int lut_ok;   /* mgpu: env (a constant table built on first use; every builder writes the same bytes) */
+    if (!lut_ok) {
+        const double glo = F->glo, ghi = F->ghi, minnet = F->minnet, blend = F->blend, rlo = F->rlo, rhi = F->rhi, ra0 = F->ra0, ra1 = F->ra1, um = F->um; const int h = F->h, ramp = F->ramp;
+        for (int n8 = 1; n8 < 256; n8++) for (int r8 = 0; r8 < 256; r8++) {
+            uint8_t o = 0;
+            if (r8) {
+                const double r = (double)r8 / n8;
+                if (!(r < glo || r > ghi) && !(n8 * h / 8.0 * um < minnet)) {   /* --min-net-um: only where the network spacing is at least this wide */
+                    double a = blend;
+                    if (ramp) { const double su = n8 * h / 8.0 * um; a = su <= rlo ? ra0 : su >= rhi ? ra1 : ra0 + (ra1 - ra0) * (su - rlo) / (rhi - rlo); }   /* --blend-ramp: by the network spacing */
+                    const double v = exp((1 - a) * log(n8) + a * log(r8)); o = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lround(v));
+                }
+            }
+            lut[n8][r8] = o;
+        }
+        lut_ok = 1;
+    }
+    {   rs_bl B = {.lut = (const uint8_t (*)[256])lut, .net = net, .rsp = rsp, .n = plane * F->nr};   /* (threaded: 9 of 131 s single on 0332, 2026-11-17) */
+        fit_par(256, rs_blend_rows, &B); F->nmat = B.nmat; F->nrep = B.nrep; }
+    const double tw = rs_now(); F->tb = tw - t1;
+    /* write the shard row: sp here, rsp (when written) on a second thread at the same time (separate arrays) */
+    rs_wr P1 = {.F = F, .pass = 1, .shard = F->shard2}; pthread_t th; int up = F->wrs && !pthread_create(&th, nullptr, rs_wr_main, &P1);
+    rs_wr P0 = {.F = F, .pass = 0, .shard = F->shard}; rs_wr_main(&P0);
+    if (F->wrs && !up) rs_wr_main(&P1);
+    if (up) pthread_join(th, nullptr);
+    if (P0.rc || P1.rc) { F->rc = 1; return nullptr; }
+    free(net); free(rsp); F->tw = rs_now() - tw;
+    return nullptr;
+}
+
+static void *rs_wr_main(void *arg) {
+    rs_wr *A = arg; rs_fin *F = A->F; const int pass = A->pass; A->rc = 0; uint8_t *shard = A->shard;
+    const int H = F->H, W = F->W, SH = F->SH, b0 = F->b0, b1 = F->b1, nt = F->nt; const int64_t gz0 = F->gz0, *ash = F->ash; const long long *zoff = F->zoff;
+    {
+        z3w *w = pass ? F->wrs : F->wsp; const uint8_t *src = pass ? F->rsp : F->net;
+        for (int64_t sy = 0; sy * SH < ash[1]; sy++) for (int64_t sx = 0; sx * SH < ash[2]; sx++) {
+            memset(shard, 0, (size_t)SH * SH * SH);
+            const int64_t o[3] = {gz0, sy * SH, sx * SH}; int64_t nn[3] = {SH, SH, SH}; for (int d = 0; d < 3; d++) if (o[d] + nn[d] > ash[d]) nn[d] = ash[d] - o[d];
+            const int covered = o[0] >= zoff[0] + b0 && o[0] + nn[0] <= zoff[0] + b1 && o[1] >= zoff[1] && o[1] + nn[1] <= zoff[1] + H && o[2] >= zoff[2] && o[2] + nn[2] <= zoff[2] + W;
+            if (!pass && !covered) {
+                uint8_t *tb = malloc((size_t)nn[0] * nn[1] * nn[2]); if (z3_read(F->zsp, o, nn, tb, nt)) { fprintf(stderr, "recto-sp: %s\n", z3_error()); free(tb); A->rc = 1; return nullptr; }
+                for (int64_t a = 0; a < nn[0]; a++) for (int64_t b = 0; b < nn[1]; b++) memcpy(shard + ((size_t)a * SH + b) * SH, tb + ((size_t)a * nn[1] + b) * nn[2], nn[2]);
+                free(tb); }
+            int any = 0;
+            for (int a = 0; a < SH; a++) { const int64_t gz = gz0 + a, br = gz - zoff[0]; if (br < b0 || br >= b1) continue;
+                for (int b = 0; b < SH; b++) { const int64_t gy = sy * SH + b, by = gy - zoff[1]; if (by < 0 || by >= H) continue;
+                    const int64_t gx0 = sx * SH, x0 = gx0 - zoff[2] < 0 ? zoff[2] - gx0 : 0, x1 = gx0 + SH - zoff[2] > W ? W + zoff[2] - gx0 : SH; if (x1 <= x0) continue;
+                    memcpy(shard + ((size_t)a * SH + b) * SH + x0, src + ((size_t)(br - b0) * H + by) * W + (gx0 + x0 - zoff[2]), x1 - x0); any = 1; } }
+            if (!any && pass) continue;
+            if (z3w_write_shard(w, gz0 / SH, sy, sx, shard, nt)) { fprintf(stderr, "recto-sp: write: %s\n", z3w_error()); A->rc = 1; return nullptr; }
+        }
     }
     return nullptr;
 }
@@ -245,12 +399,12 @@ int cmd_recto_sp(int argc, char **argv) {
     z3w *wsp = z3w_create(path, ash, SH, 0, 0, attrs); if (!wsp) { fprintf(stderr, "recto-sp: %s\n", z3w_error()); return 1; }
     z3w *wrs = nullptr; if (!zrin) { snprintf(path, sizeof path, "%s/rsp", out); if (!(wrs = z3w_create(path, ash, SH, 0, 0, attrs))) { fprintf(stderr, "recto-sp: %s\n", z3w_error()); return 1; } }
     const int H = shp[1], W = shp[2]; const double t0 = rs_now(); long long tc = 0, te = 0, nrep = 0, nmat = 0;
-    uint8_t *shard = malloc((size_t)SH * SH * SH);
+    uint8_t *shard = malloc((size_t)SH * SH * SH), *shard2 = malloc((size_t)SH * SH * SH);
     const double prom = opt_atof("--prom", rs_opt(argc, argv, "--prom", "25")), sigma = opt_atof("--sigma", rs_opt(argc, argv, "--sigma", "0.5")), sepum = opt_atof("--sep-um", rs_opt(argc, argv, "--sep-um", "20"));
     const int minint = opt_atoi("--min-int", rs_opt(argc, argv, "--min-int", "3"));
     /* --gpu N (default 0; -1 the CPU): the profiles on device N (not with --cls). The plan: every row block of the run (the CPU's blocks),
        each one's source box and the ring slices it adds */
-    const int gdev = opt_atoi("--gpu", rs_opt(argc, argv, "--gpu", "0")); g_rectosp_gpu_blocks = 0;
+    const int gdev = opt_atoi("--gpu", rs_opt(argc, argv, "--gpu", "0")); g_rectosp_gpu_blocks = 0; g_rectosp_dev_chunks = g_rectosp_ring_chunks = 0;
     rs_gblk *gbl = nullptr; int ngb = 0, gon = 0; rs_gprep GP[2] = {0}; pthread_t gth; int gpend = 0, gnext = 0; double gtk = 0, gtp = 0, gtu = 0, gtr = 0, gtn = 0, gtb = 0, gtw = 0;
     if (zs && !cls && gdev >= 0 && rsg_open && rsg_free_mem(gdev) > 0) {
         const double hm = fmax(half, half2) / um + 2; const int64_t *ssh = z3_meta_of(zs)->shape; const int cz = z3_meta_of(zs)->chunk[0] > 0 ? z3_meta_of(zs)->chunk[0] : 128;
@@ -267,26 +421,39 @@ int cmd_recto_sp(int argc, char **argv) {
                 B->d0 = B->d1 = 0;
                 if (s1 > bz1) { B->d0 = s0 > bz1 ? s0 : bz1; B->d1 = (s1 + cz - 1) / cz * cz; if (B->d1 > ssh[0]) B->d1 = ssh[0]; if (B->d1 < s1) B->d1 = s1; bz1 = B->d1; }
                 if (bz1 - s0 > RZ) RZ = bz1 - s0;   /* (the ring holds [s0, bz1): nothing the block reads is overwritten) */
+                if (ngb > 1 && bz1 - gbl[ngb - 2].so[0] > RZ) RZ = bz1 - gbl[ngb - 2].so[0];   /* (nor while the previous block's kernel runs: its upload overlaps that) */
             }
         }
+        /* the source decoded on the device (whole 128^3 uint8 chunks into the ring, predict's chunk gathers; UFSM_RECTOSP_DEVDEC=0 off):
+           the ring a multiple of 128 slices so a chunk row's slots are contiguous */
+        const z3_meta *sm = z3_meta_of(zs);
+        const int devdec = sm->chunk[0] == 128 && sm->chunk[1] == 128 && sm->chunk[2] == 128 && sm->esize == 1 && nn_ctw_new && (!getenv("UFSM_RECTOSP_DEVDEC") || atoi(getenv("UFSM_RECTOSP_DEVDEC")));
+        if (devdec) RZ = (RZ + 127) / 128 * 128;
         const size_t ny = ngb ? gbl[0].sn[1] : 0, nx = ngb ? gbl[0].sn[2] : 0, ring = (size_t)RZ * ny * nx, fr = rsg_free_mem(gdev);
         const double st = 0.5 / F; const int n = 2 * (int)ceil(fmax(half, half2) / (st * um)) + 1;
-        const size_t scr = (size_t)200000 * (3 * n + 4) * 4;   /* (~ the scratch on a 36-SM card) */
+        const size_t scr = (size_t)256 << 20;   /* (the cell arrays) */
         if (!ngb) ;
+        else if (n > 1000) fprintf(stderr, "recto-sp: profiles of %d samples exceed the GPU kernel's shared memory: the CPU path\n", n);
         else if (ring + scr + ((size_t)512 << 20) > fr) fprintf(stderr, "recto-sp: GPU %d: %.1f GB free, the source ring needs %.1f GB: the CPU path\n", gdev, fr / 1e9, ring / 1e9);
         else if (rsg_open(gdev, RZ, (int64_t)ny, (int64_t)nx)) fprintf(stderr, "recto-sp: GPU %d unavailable: the CPU path\n", gdev);
         else { gon = 1; fprintf(stderr, "recto-sp: GPU %d: %d row blocks, source ring %lld x %zu x %zu (%.1f GB)\n", gdev, ngb, (long long)RZ, ny, nx, ring / 1e9); }
         if (!gon) { rsg_close(); free(gbl); gbl = nullptr; ngb = 0; }
         for (int b = 0; b < 2; b++) GP[b] = (rs_gprep){.in = in, .zs = zs, .nt = nt, .H = H, .W = W, .S = S, .shp0 = shp[0], .org = {org[0], org[1], org[2]}, .zoff0 = zoff[0], .bl = gbl};
+        if (gon && devdec) {   /* chunk workers: UFSM_RECTOSP_GPUW (16) on the GPU decoder (UFSM_GPU_DECODE=1 on device gdev unless set), --threads on the CPU */
+            char dv[16]; snprintf(dv, sizeof dv, "%d", gdev); setenv("UFSM_GPU_DECODE", "1", 0); setenv("UFSM_GPU_DECODE_DEV", dv, 0);
+            const int ng = getenv("UFSM_RECTOSP_GPUW") ? atoi(getenv("UFSM_RECTOSP_GPUW")) : 16, nw = (ng > 0 ? ng : 0) + nt < 64 ? (ng > 0 ? ng : 0) + nt : 64;
+            void **ctw = calloc(nw, sizeof *ctw); int ok = ctw != nullptr; for (int t = 0; t < nw && ok; t++) ok = (ctw[t] = nn_ctw_new(gdev)) != nullptr;
+            if (ok) for (int b = 0; b < 2; b++) { GP[b].ctw = ctw; GP[b].nctw = nw; GP[b].ngpuw = ng > 0 ? (ng < nw ? ng : nw) : 0; }
+            else { for (int t = 0; ctw && t < nw; t++) if (ctw[t]) nn_ctw_free(ctw[t]); free(ctw); fprintf(stderr, "recto-sp: no device chunk workers: the source decoded on the host\n"); }
+        }
         if (gon) { GP[0].k = 0; if (pthread_create(&gth, nullptr, rs_gprep_main, &GP[0])) rs_gprep_main(&GP[0]); else gpend = 1; }
     }
-    int gsr = 0;
+    int gsr = 0; rs_fin FW = {0}; pthread_t fth; int fpend = 0;
     /* shard rows of the array covering the box */
     for (int64_t gz0 = (zoff[0] / SH) * SH; gz0 < zoff[0] + shp[0]; gz0 += SH, gsr++) {
         const int b0 = (int)(gz0 - zoff[0] < 0 ? 0 : gz0 - zoff[0]), b1 = (int)(gz0 + SH - zoff[0] > shp[0] ? shp[0] : gz0 + SH - zoff[0]);   /* box rows in this shard row */
         const int nr = b1 - b0; if (nr <= 0) continue;
-        const size_t plane = (size_t)H * W; uint8_t *net = malloc(plane * nr), *rsp = calloc(plane * nr, 1);
-        { const double tn = rs_now(); const int64_t o[3] = {zoff[0] + b0, zoff[1], zoff[2]}, nn[3] = {nr, H, W}; if (z3_read(zsp, o, nn, net, nt)) { fprintf(stderr, "recto-sp: %s\n", z3_error()); return 1; } gtn += rs_now() - tn; }
+        const size_t plane = (size_t)H * W; uint8_t *net = malloc(plane * nr), *rsp = calloc(plane * nr, 1);   /* (net: read by the writer thread) */
         if (zrin) { const int64_t o[3] = {zoff[0] + b0, zoff[1], zoff[2]}, nn[3] = {nr, H, W}; if (z3_read(zrin, o, nn, rsp, nt)) { fprintf(stderr, "recto-sp: %s\n", z3_error()); return 1; } }
         else if (gon) {   /* this shard row's blocks on the GPU */
             for (; gnext < ngb && gbl[gnext].sr == gsr; gnext++) {
@@ -294,8 +461,6 @@ int cmd_recto_sp(int argc, char **argv) {
                 { const double tw = rs_now(); if (gpend) { pthread_join(gth, nullptr); gpend = 0; } gtp += rs_now() - tw; }
                 if (cur->rc) { fprintf(stderr, "recto-sp: block rows %d..%d: %s\n", B->q0, B->q1, cur->err); return 1; }
                 const double tk = rs_now();
-                if (B->d1 > B->d0 && rsg_put(B->d0, B->d1 - B->d0, cur->stg)) { fprintf(stderr, "recto-sp: GPU upload failed\n"); return 1; }
-                gtu += rs_now() - tk;
                 if (gnext + 1 < ngb) { rs_gprep *nx = &GP[(gnext + 1) & 1];   /* (the next block's fields are this one's cache when they hold its rows) */
                     if (cur->fok) { if (nx->fok) fit_fields_free(&nx->fb); nx->fb = cur->fb; nx->f0 = cur->f0; nx->f1 = cur->f1; nx->fok = 1; cur->fok = 0; }
                     nx->k = gnext + 1; if (pthread_create(&gth, nullptr, rs_gprep_main, nx)) rs_gprep_main(nx); else gpend = 1; }
@@ -308,13 +473,9 @@ int cmd_recto_sp(int argc, char **argv) {
                 { const double sig = sigma * 2; const int R = sig > 0 ? (int)ceil(3 * sig) : 0; if (R > RSG_RMAX) { fprintf(stderr, "recto-sp: --sigma too wide for the GPU path (use --gpu -1)\n"); return 1; } P.R = rr_taps(sig, P.gk); }
                 uint8_t *q = malloc(cur->M ? cur->M : 1); long long na = 0, ne = 0;
                 { const double tr = rs_now(); if (rsg_run(&P, cur->M, cur->zyx, cur->t6, q, &na, &ne)) { fprintf(stderr, "recto-sp: GPU run failed\n"); return 1; } gtr += rs_now() - tr; }
-                for (int m = 0; m < cur->M; m++) {   /* rs_rows' writes, clipped to [q0, q1) */
-                    if (!q[m]) continue;
-                    const int zb = cur->blk[3 * m], yb = cur->blk[3 * m + 1], xb = cur->blk[3 * m + 2]; const size_t xl = (size_t)(xb * S + S <= W ? S : W - xb * S);
-                    for (int a = zb * S; a < zb * S + S && a < a1 - a0; a++) { const int r = a0 + a; if (r < B->q0 || r >= B->q1) continue;
-                        for (int b = yb * S; b < yb * S + S && b < H; b++) memset(rsp + ((size_t)(r - b0) * H + b) * W + xb * S, q[m], xl); }
-                }
-                free(q); tc += na; te += ne; gtk += rs_now() - tk; g_rectosp_gpu_blocks++;
+                { rs_sc C = {.R = cur, .q = q, .a0 = a0, .a1 = a1, .q0 = B->q0, .q1 = B->q1, .b0 = b0, .H = H, .W = W, .S = S, .rsp = rsp};   /* rs_rows' writes, clipped to [q0, q1) */
+                  fit_par(64, rs_scatter, &C); }
+                free(q); tc += na; te += ne; gtk += rs_now() - tk; gtu = GP[0].tup + GP[1].tup; g_rectosp_gpu_blocks++;
                 fprintf(stderr, "\rrecto-sp: rows %d / %d (%lld cells, %.3f estimated, %.0f s)", B->q1, shp[0], tc, tc ? (double)te / tc : 0, rs_now() - t0);
             }
         }
@@ -355,59 +516,24 @@ int cmd_recto_sp(int argc, char **argv) {
                 fprintf(stderr, "\rrecto-sp: rows %d / %d (%lld cells, %.3f estimated, %.0f s)", q1, shp[0], tc, tc ? (double)te / tc : 0, rs_now() - t0);
             }
         }
-        const double tb = rs_now();
-        /* blend into net */
-        /* the blended code depends on (net, rsp) alone: a 256 x 256 table of the very values the per-cell rule gives (0: kept). The
-           per-cell exp / log over every material cell of a shard row was 43 of 207 s single-threaded on 0332 (2026-11-16) */
-        static uint8_t lut[256][256]; static int lut_ok;   /* mgpu: env (a constant table built on first use; every builder writes the same bytes) */
-        if (!lut_ok) {
-            for (int n8 = 1; n8 < 256; n8++) for (int r8 = 0; r8 < 256; r8++) {
-                uint8_t o = 0;
-                if (r8) {
-                    const double r = (double)r8 / n8;
-                    if (!(r < glo || r > ghi) && !(n8 * h / 8.0 * um < minnet)) {   /* --min-net-um: only where the network spacing is at least this wide */
-                        double a = blend;
-                        if (ramp) { const double su = n8 * h / 8.0 * um; a = su <= rlo ? ra0 : su >= rhi ? ra1 : ra0 + (ra1 - ra0) * (su - rlo) / (rhi - rlo); }   /* --blend-ramp: by the network spacing */
-                        const double v = exp((1 - a) * log(n8) + a * log(r8)); o = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lround(v));
-                    }
-                }
-                lut[n8][r8] = o;
-            }
-            lut_ok = 1;
-        }
-        for (size_t i = 0; i < plane * nr; i++) {
-            if (!net[i]) continue;
-            nmat++;
-            const uint8_t o = lut[net[i]][rsp[i]]; if (!o) continue;
-            net[i] = o; nrep++;
-        }
-        const double tw = rs_now(); gtb += tw - tb;
-        /* write the shard row (outside the box: the input sp) */
-        for (int pass = 0; pass < (wrs ? 2 : 1); pass++) {
-            z3w *w = pass ? wrs : wsp; const uint8_t *src = pass ? rsp : net;
-            for (int64_t sy = 0; sy * SH < ash[1]; sy++) for (int64_t sx = 0; sx * SH < ash[2]; sx++) {
-                memset(shard, 0, (size_t)SH * SH * SH);
-                if (!pass) { const int64_t o[3] = {gz0, sy * SH, sx * SH}; int64_t nn[3] = {SH, SH, SH}; for (int d = 0; d < 3; d++) if (o[d] + nn[d] > ash[d]) nn[d] = ash[d] - o[d];
-                    uint8_t *tb = malloc((size_t)nn[0] * nn[1] * nn[2]); if (z3_read(zsp, o, nn, tb, nt)) { fprintf(stderr, "recto-sp: %s\n", z3_error()); return 1; }
-                    for (int64_t a = 0; a < nn[0]; a++) for (int64_t b = 0; b < nn[1]; b++) memcpy(shard + ((size_t)a * SH + b) * SH, tb + ((size_t)a * nn[1] + b) * nn[2], nn[2]);
-                    free(tb); }
-                int any = 0;
-                for (int a = 0; a < SH; a++) { const int64_t gz = gz0 + a, br = gz - zoff[0]; if (br < b0 || br >= b1) continue;
-                    for (int b = 0; b < SH; b++) { const int64_t gy = sy * SH + b, by = gy - zoff[1]; if (by < 0 || by >= H) continue;
-                        const int64_t gx0 = sx * SH, x0 = gx0 - zoff[2] < 0 ? zoff[2] - gx0 : 0, x1 = gx0 + SH - zoff[2] > W ? W + zoff[2] - gx0 : SH; if (x1 <= x0) continue;
-                        memcpy(shard + ((size_t)a * SH + b) * SH + x0, src + ((size_t)(br - b0) * H + by) * W + (gx0 + x0 - zoff[2]), x1 - x0); any = 1; } }
-                if (!any && pass) continue;
-                if (z3w_write_shard(w, gz0 / SH, sy, sx, shard, nt)) { fprintf(stderr, "recto-sp: write: %s\n", z3w_error()); return 1; }
-            }
-        }
-        free(net); free(rsp); gtw += rs_now() - tw;
+        /* the blend and the shard writes of this row in a writer thread, behind the next row's blocks (one row in flight) */
+        if (fpend) { pthread_join(fth, nullptr); fpend = 0; if (FW.rc) return 1; nmat += FW.nmat; nrep += FW.nrep; gtn += FW.tn; gtb += FW.tb; gtw += FW.tw; }
+        FW = (rs_fin){.net = net, .rsp = rsp, .nr = nr, .b0 = b0, .b1 = b1, .gz0 = gz0, .H = H, .W = W, .SH = SH, .nt = nt, .zsp = zsp, .wsp = wsp, .wrs = wrs, .shard = shard, .shard2 = shard2,
+                      .glo = glo, .ghi = ghi, .minnet = minnet, .blend = blend, .ramp = ramp, .rlo = rlo, .rhi = rhi, .ra0 = ra0, .ra1 = ra1, .h = h, .um = um};
+        for (int d = 0; d < 3; d++) { FW.ash[d] = ash[d]; FW.zoff[d] = zoff[d]; }
+        if (pthread_create(&fth, nullptr, rs_fin_main, &FW)) { rs_fin_main(&FW); if (FW.rc) return 1; nmat += FW.nmat; nrep += FW.nrep; gtn += FW.tn; gtb += FW.tb; gtw += FW.tw; } else fpend = 1;
     }
+    if (fpend) { pthread_join(fth, nullptr); fpend = 0; if (FW.rc) return 1; nmat += FW.nmat; nrep += FW.nrep; gtn += FW.tn; gtb += FW.tb; gtw += FW.tw; }
     fprintf(stderr, "\n");
     if (z3w_close(wsp) || (wrs && z3w_close(wrs))) { fprintf(stderr, "recto-sp: close: %s\n", z3w_error()); return 1; }
     printf("recto-sp: %s -> %s: %lld cells probed, %.3f with a recto spacing; sp replaced on %.3f of the material cells (blend %g%s, gate %g..%g), %.0f s\n",
            in, out, tc, tc ? (double)te / tc : 0, nmat ? (double)nrep / nmat : 0, blend, ramp ? " ramp" : "", glo, ghi, rs_now() - t0);
-    if (gon) { fprintf(stderr, "recto-sp: GPU path: %.1f s waiting for the helper (fields, cells, source decode), %.1f s on the blocks (upload %.1f, kernel %.1f); net sp read %.1f, blend %.1f, shard writes %.1f\n", gtp, gtk, gtu, gtr, gtn, gtb, gtw);
-               if (gpend) pthread_join(gth, nullptr); for (int b = 0; b < 2; b++) { if (GP[b].fok) fit_fields_free(&GP[b].fb); free(GP[b].stg); free(GP[b].zyx); free(GP[b].blk); free(GP[b].t6); } rsg_close(); free(gbl); }
-    free(shard); rr_cls_free(cls); z3_close(zsp); if (zs) z3_close(zs); if (zrin) z3_close(zrin);
+    if (gon) { fprintf(stderr, "recto-sp: GPU path: %.1f s waiting for the helper (fields, cells, source decode), %.1f s on the blocks (kernel %.1f; the helper's uploads %.1f); writer thread: net sp read %.1f, blend %.1f, shard writes %.1f\n", gtp, gtk, gtr, gtu, gtn, gtb, gtw);
+               fprintf(stderr, "recto-sp: helper: fields + cells %.1f s, source %.1f s (%s: %lld chunks on the GPU decoder, %lld on the host, %lld fill)\n", GP[0].tfld + GP[1].tfld, GP[0].tdec + GP[1].tdec,
+                       GP[0].nctw ? "device decode" : "host decode + upload", (long long)(GP[0].ndev + GP[1].ndev), (long long)(GP[0].nhost + GP[1].nhost), (long long)(GP[0].nskip + GP[1].nskip));
+               g_rectosp_dev_chunks = GP[0].ndev + GP[1].ndev; g_rectosp_ring_chunks = GP[0].nctw ? GP[0].ndev + GP[1].ndev + GP[0].nhost + GP[1].nhost + GP[0].nskip + GP[1].nskip : -1;
+               if (gpend) pthread_join(gth, nullptr); if (GP[0].ctw) { for (int t = 0; t < GP[0].nctw; t++) nn_ctw_free(GP[0].ctw[t]); free(GP[0].ctw); }
+               for (int b = 0; b < 2; b++) { if (GP[b].fok) fit_fields_free(&GP[b].fb); free(GP[b].stg); free(GP[b].zyx); free(GP[b].blk); free(GP[b].t6); } rsg_close(); free(gbl); }
+    free(shard); free(shard2); rr_cls_free(cls); z3_close(zsp); if (zs) z3_close(zs); if (zrin) z3_close(zrin);
     return 0;
 }

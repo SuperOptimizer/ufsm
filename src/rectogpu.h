@@ -23,10 +23,15 @@ typedef struct {
 } rsg_par;
 
 int rsg_open(int dev, int64_t RZ, int64_t ny, int64_t nx) RSG_WEAK;   /* the ring (RZ slices of ny x nx) and the scratch */
-/* nz slices of global source z [z0, z0 + nz) (host, ny x nx each, contiguous) into their ring slots */
+/* nz slices of global source z [z0, z0 + nz) (host, ny x nx each, contiguous) into their ring slots; from any thread, on its own
+   stream beside rsg_run's kernel (the caller keeps those slots out of the running block's source box) */
 int rsg_put(int64_t z0, int64_t nz, const uint8_t *src) RSG_WEAK;
 /* M cells: zyx[3 M] (rows relative to par->org, as rs_rows' zz yy xx), t6[6 M] (t0..t5 bytes per cell) -> q[M] (0: no estimate);
    *nax += the cells whose axis was found (rs_rows' ncell), *nest += the estimates */
+/* the device address of global source slice z's ring slot (consecutive slices are contiguous up to the ring's end); slices [z0, z0 + nz)
+   zeroed (the device chunk gathers fill only the chunks that hold data) */
+uint8_t *rsg_slot(int64_t z) RSG_WEAK;
+int rsg_zero(int64_t z0, int64_t nz) RSG_WEAK;
 int rsg_run(const rsg_par *P, int M, const int32_t *zyx, const uint8_t *t6, uint8_t *q, long long *nax, long long *nest) RSG_WEAK;
 void rsg_close(void) RSG_WEAK;
 size_t rsg_free_mem(int dev) RSG_WEAK;   /* free device bytes (0: no device) */
