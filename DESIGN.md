@@ -257,6 +257,32 @@ Parity (test_ink_ext_inksdk_koine, our torch koine reference, 384 px tiles): max
 argus2 vs ink9um: +0.0072 [-0.0027, +0.0161]. It gains on 0139 (one of its training scrolls) and loses 0.02 on 1667. The
 card's +1 AUC point from the -2/0/+2 depth windows does not show here. Argus V2 is available as a teacher but does not join the combo.
 
+## Training perf 3: try9 is sampler-bound after the GPU gains; the host profile, word-wise byte scans in draw_ (2026-11-17, branch samplecpu-20261117)
+
+- **The swap's live rate stayed flat.** fd615b6f went into try9 at step 6942. The replay ran identical windows with --det and no
+  echo: windows 2-10 at 79.6 Mvox/s on the old binary and 88.1 on the new one (+10.7 %). Live, the first 360 windows ran 0.156
+  samp/s against 0.15 before. Echo went from 0-8 % to 10-24 % and fresh windows dropped to 0.11-0.14/s. The GPU is now waiting for
+  the sampler, so its gain shows up as more echo windows. Gate: wind4 acc 0.594 vs 0.604 and gn_step 0.88x, no rollback.
+- **Host profile** (perf, read-only, try9 live; desk at 28.4 of 32 cores niced work, 0 idle). The 10 workers ran on ~2.7 cores
+  together and spent ~75 % of their time asleep, ~19 core-s per fresh window. Where the CPU time goes:
+  - CT decode on the CPU (vfx_decode_subs_sink, dct16_inv, zcache_read): ~37 %. try9 has no --ct-gpu-decode.
+  - On-the-fly ink labels (inkfly_rays, tri_box_z, pool_derive, chunk): ~28 %. All of it runs on the CPU because the inkfly GPU
+    budget never fits beside the trainer: card 0 has 0.2 GB free against a 1536 MiB reserve, logged as "7000 chunk(s) over the GPU
+    budget".
+  - draw_'s whole-window byte loops: ~12 %.
+  - Faults, memset and memmove: ~8 %.
+  - CUDA calls inside the workers: ~5 %.
+  - The main thread spins ~0.6 core in cudaStreamSynchronize.
+  The context switches: 52 % timer preemptions (CPU contention), 13 % libcuda's launch rwlock, 12 % the w4 ctx_run nanosleep poll,
+  7 % page-cache reads.
+- **The byte loops** (src/bytescan.h, new): the aux planes' unknown fill, the ink-bit pack (plus the 0 / 1 mask rewrite) and the
+  --min-phase known counts over side / ink / aux. mcc leaves them as one movzbl per voxel. The new versions work on 64-bit words:
+  per-byte 0x80 flags with no carry across bytes, a popcount, and a multiply to gather the bits. Min of 5 runs on 118 M bytes
+  (desk loaded): count 0.061 -> 0.010 s, fill 0.130 -> 0.047 s. test_bytescan checks them against the byte loops: lengths 0-70 and
+  1 M, values biased to 0 / 1 / 127 / 128 / 251-255, byte-exact.
+- **Proposed, not yet done:** `--ct-gpu-decode 1 --ink-gpu 1` in launch.env. Both GPU paths are byte-identical (test_gpudec,
+  test_ink_splat). Together they move ~65 % of the sampler's CPU time onto card 1. The lead decides that, because card 1 is shared.
+
 ## Training perf 2: mcc's local arrays in the head kernels (fstem 1.75x, the guided fuse pass ~2x; byte-identical; 2026-11-17, branch trainperf-20261117)
 
 - **Audit.** `cuobjdump -res-usage` over the mcudahw cache (`~/.cache/mcudahw/*.cubin`, one file per call) lists the kernels with a

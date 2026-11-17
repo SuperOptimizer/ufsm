@@ -164,6 +164,7 @@ ufsm_exe(test_ink_pool SUITE tests/test_ink_pool.c OBJS CORE NN LP LIBS LDLIBS C
 ufsm_exe(test_ink_splat SUITE tests/test_ink_splat.c OBJS CORE NN LP LIBS LDLIBS CUDA INC CUDA)
 ufsm_exe(test_jpegpar SUITE tests/test_jpegpar.c OBJS jpegpar imgops tiffw tiff LIBS LDLIBS)
 ufsm_exe(test_gns SUITE tests/test_gns.c LIBS m)
+ufsm_exe(test_bytescan SUITE tests/test_bytescan.c LIBS m)
 ufsm_exe(test_json SUITE tests/test_json.c OBJS json LIBS LDLIBS)
 ufsm_exe(test_optcheck SUITE tests/test_optcheck.c)
 ufsm_exe(test_labcomp SUITE tests/test_labcomp.c OBJS labcomp labcomp_cli z3w zarr3 store json optcheck LIBS LDLIBS)

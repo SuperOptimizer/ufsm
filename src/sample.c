@@ -1,10 +1,12 @@
 #include "scannorm.h"
+#include "bytescan.h"
 #include "sample.h"
 #include "inksplat.h"
 [[gnu::weak]] int inkfly_cells(void *, int, const int64_t[3], uint8_t *);
 [[gnu::weak]] size_t inkfly_cache_bytes(size_t *);
 [[gnu::weak]] int inkfly_rays(void *, const int64_t[3], const int64_t[3], int, int, float, inkray **, size_t *);   /* (weak: test binaries without inksplat.o; only called for an onfly target) */
 #include "band.h"
+_Static_assert(PHASE_PERIOD == 252, "draw_ counts known phase as (b & 0xfc) != 0xfc");
 #include "band_w4dev.h"
 #include "target_erode.h"
 #include "papyrus.h"
@@ -3315,14 +3317,14 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
 #define MK(k) (ign_zero ? (uint8_t)(ctu[k] != 0) : (uint8_t)((ctu[k] != 0) & (mask[k] == 0)))
     /* tdead: the loss mask itself is read by nobody below (no packed plane, no sheet prior, the labels warped on the device): only the
        ink plane is written (one write stream fewer; the pass is DRAM-bound) */
-    for (int j = 0; j < c->aux_n; j++) { uint8_t *a = b->aux[j] + (size_t)i * p3; if (b->aux[j] == sp->c255) continue; for (size_t k = 0; k < p3; k++) if (!MK(k)) a[k] = 255; }   /* (the extra planes: unknown as the ink plane) */
+    for (int j = 0; j < c->aux_n; j++) { uint8_t *a = b->aux[j] + (size_t)i * p3; if (b->aux[j] == sp->c255) continue; bs_fill_unknown(a, ctu, ign_zero ? nullptr : mask, p3); }   /* (the extra planes: unknown as the ink plane; == for k: if (!MK(k)) a[k] = 255) */
     if (inkbits) {   /* (ink_bits: the known bit of each voxel; the plane itself on the device) */
         if (!ink_it) { fprintf(stderr, "sampler: ink bits without the rv cutoff\n"); return -1; }
         b->ink_it[i] = (int16_t)(ink_it > 256 ? 256 : ink_it);
         for (size_t k8 = 0; k8 < p3 / 8; k8++) {
-            unsigned v = 0;
-            for (int j = 0; j < 8; j++) { const size_t k = 8 * k8 + (size_t)j; const unsigned mk = ign_zero ? ctu[k] != 0 : (ctu[k] != 0) & (mask[k] == 0); if (!tdead) mask[k] = (uint8_t)mk; v |= mk << j; }
-            inkbits[k8] = (uint8_t)v;
+            const size_t k = 8 * k8; const uint64_t f = ~bs_unknown(ctu, ign_zero ? nullptr : mask, k) & BS_H;   /* (bit 7 of byte j: MK(k + j); word-wise, bytescan.h) */
+            if (!tdead) { const uint64_t w = f >> 7; memcpy(mask + k, &w, 8); }
+            inkbits[k8] = (uint8_t)bs_pack(f);
         }
     } else if (tdead && ink_it && ink_it <= 255) {
         const uint8_t *c8 = b->ct8 + (size_t)i * p3; const uint8_t it = (uint8_t)ink_it;
@@ -3643,9 +3645,9 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (c->side == 2 && c->min_phase > 0 && !s->ct_only) {   /* --min-phase: windows with (almost) no known phase supervise nothing (sources with band / phase
                                                  targets only draw anywhere in the scroll): rejected */
         const uint8_t *sd = b->side + (size_t)i * p3; size_t kn = ph_known;
-        if (kn == SIZE_MAX) { kn = 0; for (size_t k = 0; k < p3; k++) kn += sd[k] < PHASE_PERIOD; }
-        if (inkw && !c->rv_iso) { const uint8_t *ik = b->ink + (size_t)i * p3; for (size_t k = 0; k < p3; k++) kn += ik[k] != 255; }   /* (--ink-head: known ink supervises too: ink-only sources draw) */
-        for (int j = 0; j < c->aux_n; j++) { const uint8_t *ik = b->aux[j] + (size_t)i * p3; for (size_t k = 0; k < p3; k++) kn += ik[k] != 255; }
+        if (kn == SIZE_MAX) kn = bs_count_notall(sd, p3, 0xfc);   /* (sd[k] < PHASE_PERIOD 252) */
+        if (inkw && !c->rv_iso) { kn += bs_count_ne(b->ink + (size_t)i * p3, p3, 255); }   /* (--ink-head: known ink supervises too: ink-only sources draw) */
+        for (int j = 0; j < c->aux_n; j++) kn += bs_count_ne(b->aux[j] + (size_t)i * p3, p3, 255);
         if ((double)kn < c->min_phase * (double)p3) { if (Tw) tp_put(Tw, (NCH + 1) * p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); SL_ADD(SL_EMPTY); return 1; }   /* (counted as empty targets) */
     }
     if (c->emb_ch && s->ct_only) {   /* an unlabelled ("ct_only") source supervises only the distillation: windows with < 25% of the head cells targeted are redrawn */
