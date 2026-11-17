@@ -336,7 +336,7 @@ int lp_f4v_try(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, c
                                    why ? "conv_fwd_f4_k, " : "conv_fwd_f4v_k", why ? why : ""); }
     if (why) return 0;
     launch_f4v<4, 4, mx4_t>(x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp, lp_skip_get(xs, sp, 1));
-    g_f4v_calls++;
+    __atomic_fetch_add(&g_f4v_calls, 1ul, __ATOMIC_RELAXED);
     return 1;
 #endif
 }
@@ -397,7 +397,7 @@ int lp_f4v_preslab(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *w
         split_t s2 = sp; s2.zi0 = (int16_t)-a; s2.Di = (int16_t)L; s2.zw0 = (int16_t)z0; s2.zw1 = (int16_t)z1;
         launch_f4v<4, 4, mx4_t>(q, xs, wq, ws, b, cout, y, Cop, Cip, gnp_t{}, osum, Go, s2, sk, z0 == 0);
     }
-    g_f4v_calls++;
+    __atomic_fetch_add(&g_f4v_calls, 1ul, __ATOMIC_RELAXED);
     return 1;
 #endif
 }
@@ -528,7 +528,7 @@ int lp_f4v_preup(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws,
         split_t s2 = sp; s2.up = 0; s2.x2 = qs; s2.gp2 = gnp_t{}; s2.zi0 = (int16_t)-a; s2.Di = (int16_t)L; s2.zw0 = (int16_t)z0; s2.zw1 = (int16_t)z1;
         launch_f4v<4, 4, mx4_t>(qu, xs, wq, ws, b, cout, y, Cop, Cip, gnp_t{}, osum, Go, s2, sk, z0 == 0);
     }
-    g_f4v_calls++;
+    __atomic_fetch_add(&g_f4v_calls, 1ul, __ATOMIC_RELAXED);
     return 1;
 #endif
 }

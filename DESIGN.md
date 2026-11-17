@@ -6,6 +6,58 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## conv_fwd_f4v_k: the MX-fp4 3^3 conv at ~70 % of the MMA peak, bit-identical (2026-11-17, branch convk-20261117)
+
+**Diagnosis** (ncu works on the desk under mcudahw: bench_sp24, card 1). conv_fwd_f4_k<4, 2> at L0 (32 x 256^2 x 256, fwd after the
+prenorm): tensor pipe 46 % of peak, issue slots 23 % busy (IPC 0.92), 4 warps a scheduler with 0.38 eligible. Latency-bound, not
+issue-bound as read on 11-14. LP_MINB(2) caps it at 128 registers, so it spills (116 M LDL + 116 M STL a call: 55 % of the L1
+sectors, 56 % of the L2 traffic), and long_scoreboard is the top stall. The weight stage gathers 16 B per 32 B sector, with 279 M
+ldgsts bank conflicts. The input staging sits behind barriers with nothing in flight.
+
+**Kernel** (src/lp_f4v.cu). The MMA core and the per-accumulator order are unchanged: f4r_mma_grp's 4-row path with the
+mma_f4_sel scale selectors.
+- One block an SM: 233-255 registers, no spills, 67 KB smem.
+- A 16 x 8 x 4 output tile: 64 rows x 4 rows of 16 voxels a warp. A staged byte feeds 2x the MMAs, and the halo is 1080 positions
+  for 512 voxels (was 720 for 256).
+- The input tile is double-buffered by cp.async: 16 B rows, zero-filled when outside or masked. Its scale bytes go through
+  registers.
+- The weights are re-laid out once a call (prep_w4v_k into lp_buf u8 slots 0 / 1: [co block][chunk][pair][64][32 B], with the sw16
+  swizzle and the scale pairs pre-built). Each 7-pair stage is then one contiguous 15 KB copy, double-buffered.
+- The statistics epilogue (f4v_epi_st) keeps each 2-plane half's sums apart and adds them in conv_fwd_f4_k's warp order, so the GN
+  statistics come out bit-identical too.
+- GN+SiLU staging (template G): the rows land by cp.async, then each thread transforms its own positions one stage later. Bit-exact,
+  but not overlapped with the MMAs: L0 50 ms vs 29 ms copy-staged.
+
+**Coverage, via slabs** (UFSM_F4V_DEBUG=N prints each call's kernel and reason). try9 also had two other cases on the old kernel.
+Its L0 GN trunk convs used the in-kernel GN, because the plan's GroupNorm copy budget is 0.15 GB and the layer needs 963 MB. All
+four decoder conv1s are split inputs with the fused upsample and per-segment GNs. Both now run by z slabs that fit the budget:
+- lp_f4v_preslab: gn_prenorm_f4z_k per slab, then the copy-staged conv on the output z-window, with the slab as a z-range input.
+- lp_f4v_preup: per slab, the coarse rows once (up_coarse_f4v_k = f4ru_coarse), the up part at full resolution (up_fine_f4v_k =
+  f4ru_blend plus the e2m1 requantisation), the skip part prenormed, then the split conv.
+Every staged byte is the old staging's, so outputs and statistics are the same bits.
+Still on conv_fwd_f4_k: Cop % 64 != 0 (the 288-wide 12^3 / 6^3 levels), statistics with W % 16 != 0 (448 @ 24^3), slab-local GN,
+staging SR, ARCH=86.
+
+**Tests.** tests/test_f4v.c (fast tier) has 21 cases comparing old and new kernel. Each must show equal output bytes, equal GN
+statistics, and the new kernel actually having run. The cases cover:
+- GN + stats, partial tiles, stored stats, plain input;
+- bdata with output SR, odd width;
+- split input, z-window, z-range;
+- in-kernel GN: a masked partial chunk, a split input with one GN and with two;
+- the slabbed prenorm against the in-kernel GN;
+- the fused upsample with 8- and 4-plane slabs and with one slab, odd sizes;
+- the L0 shape.
+
+**Numbers** (ncu durations at base clocks, old -> new):
+
+| case | old ms | new ms | x | tensor % new |
+|---|---|---|---|---|
+| L0 32 x 256^2 x 256 copy-staged (fwd after prenorm / bdata) | 42.2 | 28.2-29.3 | 1.44-1.50 | 67-69 |
+| L1 32 x 128^2 x 320 | 16.5 | 10.6-11.1 | 1.49-1.55 | 69-72 |
+| L2 32 x 64^2 x 384 | 6.0 | 3.8-3.9 | 1.54-1.59 | 71-73 |
+| L3 16 x 32^2 x 448 | 1.08 | 0.72 | 1.50 | 71-73 |
+| L0 GN input over the prenorm budget (in-kernel GN -> 28-plane slabs, prenorm included) | 53.0 | 31.1 | 1.70 | |
+| dec0.c1 32 x 192^2, 320 up + 256 skip -> 256 (bench_f4v, 8-plane slabs, slab kernels included) | 74.1 | 39.2 | 1.89 | |
 ## Unroll perf 7: the heads' shards encoded by one pool for all heads (predict --heads at q 0; same bytes; 2026-11-17, branch inkwriters-20261117)
 
 fp4teach's quiet-card profile of the unroll's ink predict (0332, 32 windows 544 / 16, heads ink,c12,c13, q 0): wall 8.55 s, gpu(fwd+d2h)
