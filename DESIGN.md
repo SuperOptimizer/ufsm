@@ -45,6 +45,166 @@ ce3b6778 (the prenorm masked under --skip-empty) win, full-key minima per window
 149.9 -> 139.5 (-6.9 %); the fp4 convs + prenorm alone fields 38.7 -> 34.3, ink 73.3 -> 63.1 (run-to-run noise on the shared card ~+-2 %).
 Ink teachers on the same quiet window: see the 2026-11-16 section (ink9um 1667 segment fp16 old 163.7 s, fused 127.9, MX5 100.9, pick 116.0).
 
+## conv_fwd_f4v_k: the MX-fp4 3^3 conv at ~70 % of the MMA peak, bit-identical (2026-11-17, branch convk-20261117)
+
+**Diagnosis** (ncu works on the desk under mcudahw: bench_sp24, card 1). conv_fwd_f4_k<4, 2> at L0 (32 x 256^2 x 256, fwd after the
+prenorm): tensor pipe 46 % of peak, issue slots 23 % busy (IPC 0.92), 4 warps a scheduler with 0.38 eligible. Latency-bound, not
+issue-bound as read on 11-14. LP_MINB(2) caps it at 128 registers, so it spills (116 M LDL + 116 M STL a call: 55 % of the L1
+sectors, 56 % of the L2 traffic), and long_scoreboard is the top stall. The weight stage gathers 16 B per 32 B sector, with 279 M
+ldgsts bank conflicts. The input staging sits behind barriers with nothing in flight.
+
+**Kernel** (src/lp_f4v.cu). The MMA core and the per-accumulator order are unchanged: f4r_mma_grp's 4-row path with the
+mma_f4_sel scale selectors.
+- One block an SM: 233-255 registers, no spills, 67 KB smem.
+- A 16 x 8 x 4 output tile: 64 rows x 4 rows of 16 voxels a warp. A staged byte feeds 2x the MMAs, and the halo is 1080 positions
+  for 512 voxels (was 720 for 256).
+- The input tile is double-buffered by cp.async: 16 B rows, zero-filled when outside or masked. Its scale bytes go through
+  registers.
+- The weights are re-laid out once a call (prep_w4v_k into lp_buf u8 slots 0 / 1: [co block][chunk][pair][64][32 B], with the sw16
+  swizzle and the scale pairs pre-built). Each 7-pair stage is then one contiguous 15 KB copy, double-buffered.
+- The statistics epilogue (f4v_epi_st) keeps each 2-plane half's sums apart and adds them in conv_fwd_f4_k's warp order, so the GN
+  statistics come out bit-identical too.
+- GN+SiLU staging (template G): the rows land by cp.async, then each thread transforms its own positions one stage later. Bit-exact,
+  but not overlapped with the MMAs: L0 50 ms vs 29 ms copy-staged.
+
+**Coverage, via slabs** (UFSM_F4V_DEBUG=N prints each call's kernel and reason). try9 also had two other cases on the old kernel.
+Its L0 GN trunk convs used the in-kernel GN, because the plan's GroupNorm copy budget is 0.15 GB and the layer needs 963 MB. All
+four decoder conv1s are split inputs with the fused upsample and per-segment GNs. Both now run by z slabs that fit the budget:
+- lp_f4v_preslab: gn_prenorm_f4z_k per slab, then the copy-staged conv on the output z-window, with the slab as a z-range input.
+- lp_f4v_preup: per slab, the coarse rows once (up_coarse_f4v_k = f4ru_coarse), the up part at full resolution (up_fine_f4v_k =
+  f4ru_blend plus the e2m1 requantisation), the skip part prenormed, then the split conv.
+Every staged byte is the old staging's, so outputs and statistics are the same bits.
+Still on conv_fwd_f4_k: Cip <= 64 (the ring kernels take those before the hook), statistics with a 2-plane conv_fwd_f4_k tile and
+W % 16 != 0, slab-local GN, staging SR, ARCH=86.
+
+**MT 2, the default.** The first kernel had MT 4 (64 rows) and so needed Cop % 64 == 0. That left the 96 / 160-wide predict nets
+(u1, inkpod) on the old kernel, and fp4teach's predict A/B showed no gain.
+- MT 2 is 32 rows a block with 4 weight stages a chunk (pairs [0, 4) [4, 7) [7, 11) [11, 14): the same pairs in the same order).
+  That makes 46 KB and 128 registers, so two blocks fit an SM and one block's prologue / epilogue overlaps the other's MMAs.
+- It beats MT 4 at every width, so it is the default (UFSM_F4V_MT=4 keeps MT 4).
+- At short K (96 inputs: 3 chunks) MT 4 sat at 53 % tensor. ncu put ~20 % of its stall samples in the epilogue, with no other
+  block to cover it.
+- Statistics: each block reproduces the conv_fwd_f4_k block of its voxels. The per-channel sums depend on the block's voxels and
+  warp order, not its channel count. conv_fwd_f4_k runs MT 4 at TZ 2 (Cop % 64 == 0), else MT 2 at TZ 4 (depth >= 16) or TZ 2.
+  So f4v_epi_st (2-plane halves) is used when that tile is 2 planes deep, else the plain epilogue.
+- 11 more test_f4v cases (96 / 160 / 288 outputs), all byte-equal with UFSM_F4V_MT=0 and 4.
+- A tried variant: storing the scale bytes at issue removes MT 2's remaining spills (42 M LDL a call at L0) but stalls on the load:
+  29.1 vs 28.0 ms (F4V_SDIRECT, off).
+- Mixed MT 4 + an MT 2 tail for 96 / 160 was slower than all-MT 2: 1.90 / 0.85 ms vs 1.72 / 0.55.
+
+| case (ncu, GN + stats unless noted) | conv_fwd_f4_k ms | MT 4 ms | MT 2 ms |
+|---|---|---|---|
+| 96 -> 96 32 x 160^2 (u1 / inkpod level 0) | 2.16 | 1.90 (with a 32-row tail) | 1.72 |
+| 160 -> 160 40^3 | 0.72 | 0.85 (with a tail) | 0.55 |
+| 128 -> 128 64 x 80^2 | 2.00 | 1.51 | 1.46 |
+| L0 256 -> 256 32 x 256^2, bdata | 42.2 | 30.7 | 28.0 (69.5 % tensor) |
+| L1 320 -> 320 32 x 128^2, bdata | 16.5 | 11.6 | 10.5 |
+
+**Predict.** fp4teach's A/B (0332, fields u1 640/64 with --skip-empty, ink inkpod 544/16, 32 windows, nsys kernel minima) first showed
++5.5 / +12.5 % with F4V on. Four findings:
+- Predict's level-0 convs run as unet's in-place z-slabs (nn_set_zrange: sp.zi0 / sp.Di), which the prenorm copy excludes. Their
+  GroupNorm inputs ran f4v's in-kernel GN staging, which loses to conv_fwd_f4_k's (ncu 96 -> 96 64 x 160^2 7.86 vs 6.89 ms).
+  lp_f4v_preslab now takes z-range / z-window inputs: it prenorms only the planes each slab reads, then copy-stages the conv
+  (6.90 -> 4.26 ms prenorm included). The G staging runs only at UFSM_F4V=2 (tests).
+- The remaining "+2.9 / +4.4 %" was a measurement artefact. ksum.py took per-(kernel, grid product, block) minima, and the fast GN
+  convs and slow fused-upsample conv1s of conv_fwd_f4_k share grids. In the F4V=0 run the up calls were charged at the GN calls'
+  minimum; with F4V=1 they stood alone. The key now includes the grid dimensions, dynamic smem and registers.
+- Under --skip-empty the prenorm ran dense. gn_prenorm_f4z_k now skips every voxel the conv does not stage: outside the 3^3 halo of
+  an active output tile, or masked out of the input. test_skip_empty with forced slabs gives the F4V=0 logits.
+- Result, ce3b6778, full key, outputs byte-identical:
+
+| recipe | F4V=0 ms/window | F4V=1 ms/window | change | fp4 convs + prenorm | GPU busy |
+|---|---|---|---|---|---|
+| fields | 189.3 | 182.4 | -3.6 % | 38.7 -> 34.3 | 271.6 -> 258.1 |
+| ink | 149.9 | 139.5 | -6.9 % | 73.3 -> 63.1 | 323.4 -> 205.2 |
+
+(Run-to-run noise on the shared card is about +-2 %.) The fused-upsample conv1s still run conv_fwd_f4_k in predict: they get the
+z-range too, and lp_f4v_preup refuses it.
+
+**sparse24 on top.** bench_sp24 (wall clock, shared card 1), dense vs 2:4-sparse conv:
+- against conv_fwd_f4_k the sparse kernels win 1.24-3.35x;
+- against conv_fwd_f4v_k they win 1.06-1.08x at L0, 1.03-1.04x at L1, 1.02-1.03x at L2, 1.03-1.10x at L3, before their masking
+  costs.
+So --sparse24 mode 3, which changes results, no longer pays.
+
+**Weight gradient** (conv_bwd_w_f4ws_k, bench_wgl0 128^3 256 -> 256, ncu):
+- 21.5-22.4 ms, tensor 29 %, issue 57 %, no spills. 85 % of the instructions are the producers' x staging (decode, GN + SiLU with
+  3 MUFU, two requantisations), repeated for each co tile (8x at Co 256).
+- Dropping the bf16 round trip from the LY 1 decode is exact for MX inputs: 22.4 -> 21.9 ms.
+- UFSM_F4W_MT4=1 (64 co x 8 ci tiles): 21.5 -> 20.3 ms. The LY 1 lanes then sit on 6 of the 11 producer warps.
+- Ceiling with the staging stubbed out: 12.4 ms (52 % tensor).
+- An x pre-pass into LY 1 records would move ~9.5 GB per call (~450 B per plane, channel and tile, read once per co tile): ~21 ms
+  of DRAM time, so no gain.
+- Clusters, tried and parked (branch convkw-20261117, conv_bwd_w_f4wc_k, nvcc build, bit-equal to the plain kernel in test_f4wc):
+  the CL co tiles of a (1, 1, CL) cluster share one x staging.
+  - Each block stages every CL-th LY 1 group and bulk-copies its 432 B slot to the others (cp.async.bulk shared::cluster with
+    complete_tx on their FULL mbarrier; scale pairs by u32 st.async). EMPTY counts all blocks' consumers.
+  - CL 4 splits each row over two lanes.
+  - A first version used per-row st.shared::cluster + fence.acq_rel.cluster: the fence compiled to MEMBAR + CCTL.IVALL per lane per
+    z-step (CL 2 54 ms, CL 4 98).
+  - The cluster-scope try_wait / arrive forms add CCTL.IVALL / ERRBAR; the CTA-scope forms are enough for shared-memory data.
+  - Card 1: 3 GPCs x 12 SMs, so clusters of 2 / 3 / 4 / 6 keep all 36 SMs busy and 8 idles a third of them.
+
+| ncu 128^3 256 -> 256 | ms |
+|---|---|
+| CL 1 (conv_bwd_w_f4ws_k, nvcc) | 24.7 |
+| CL 2 | 31.0 |
+| CL 4 | 41.4 |
+| CL 4 without the bulk copies (timing only) | 24.6 |
+| CL 4 without the remote scale stores | 37.1 |
+| CL 4 without any remote traffic | 21.5 |
+| CL 1 with the LY 1 staging removed (the consumer ceiling) | 12.4 |
+
+  Even free of remote traffic, staging a quarter of the groups with half rows gains only 13 %. The producers are bound by each
+  pass's latency (the chain decode -> GN / SiLU -> amax shuffles -> requantisation, then the per-pass barrier), not by their
+  instruction count. Next: more passes in flight per block.
+
+
+
+**Tests.** tests/test_f4v.c (fast tier) has 21 cases comparing old and new kernel. Each must show equal output bytes, equal GN
+statistics, and the new kernel actually having run. The cases cover:
+- GN + stats, partial tiles, stored stats, plain input;
+- bdata with output SR, odd width;
+- split input, z-window, z-range;
+- in-kernel GN: a masked partial chunk, a split input with one GN and with two;
+- the slabbed prenorm against the in-kernel GN;
+- the fused upsample with 8- and 4-plane slabs and with one slab, odd sizes;
+- the L0 shape.
+
+**Numbers** (ncu durations at base clocks, old -> new):
+
+| case | old ms | new ms | x | tensor % new |
+|---|---|---|---|---|
+| L0 32 x 256^2 x 256 copy-staged (fwd after prenorm / bdata) | 42.2 | 28.2-29.3 | 1.44-1.50 | 67-69 |
+| L1 32 x 128^2 x 320 | 16.5 | 10.6-11.1 | 1.49-1.55 | 69-72 |
+| L2 32 x 64^2 x 384 | 6.0 | 3.8-3.9 | 1.54-1.59 | 71-73 |
+| L3 16 x 32^2 x 448 | 1.08 | 0.72 | 1.50 | 71-73 |
+| L0 GN input over the prenorm budget (in-kernel GN -> 28-plane slabs, prenorm included) | 53.0 | 31.1 | 1.70 | |
+| dec0.c1 32 x 192^2, 320 up + 256 skip -> 256 (bench_f4v, 8-plane slabs, slab kernels included) | 74.1 | 39.2 | 1.89 | |
+## Unroll perf 7: the heads' shards encoded by one pool for all heads (predict --heads at q 0; same bytes; 2026-11-17, branch inkwriters-20261117)
+
+fp4teach's quiet-card profile of the unroll's ink predict (0332, 32 windows 544 / 16, heads ink,c12,c13, q 0): wall 8.55 s, gpu(fwd+d2h)
+4.99 s, writer-wait 3.17 s; the 3 head writers 20.5 s over 96 shards, ~6.8 s each. Each head's writer did compress a shard with all
+--threads (z3w_write_shard), but shard by shard: its threads wait for the shard's slowest chunk (lossless chunk cost varies ~10x with the
+content) and its file write before the next shard, and the main thread (ring of 2) waits for the slowest head every window.
+
+- z3w_pool (src/z3w.c): one set of threads encodes the inner chunks of every queued shard of any array, oldest shard first; the thread that
+  encodes a shard's last chunk writes its file (z3w_write_shard's bytes: the same chunk gather + encode function and write_file) and calls
+  done. predict --heads: the CPU-encoded heads (q 0, or UFSM_PRED_GPU_ENC=0) share one pool of heads x --threads (as many threads as the
+  head writers had together) within ufsm_ncpu; a head writer hands its shard to the pool and takes the next one; the --resume log, the
+  GPU pyramid's pieces (pyacc_post, under its mutex) and the buffer's release run in done. Each head's ring has 3 buffers (was 2) so the
+  main thread does not wait for the slowest head's shard. UFSM_PRED_HPOOL=0: the previous writers; =N: N pool threads.
+- Bench (CPU only; 16 shards 512^3 x 3 heads decoded from PHerc1299's inkpod-9000 q 8 heads, re-encoded at q 0; desk at load 33-68, nice
+  19, so ranges): all shards queued, 3 writers x 8 threads 12.0 / 12.3 s wall, one pool of 24 6.6 s (1.8x); 3 x 3 threads 16.5 s, pool of
+  9 12.0 s. Emulated predict (one window per 0.15 s hands one shard per head, writer_submit's ring wait): 3 x 8 threads ring 2: 15-26 s;
+  pool 24, ring 2: 13-20 s; pool 24, ring 3: 9.8-11.2 s (1.5-2.6x); 9 threads: 3 x 3 20-33 s, pool ring 3 14-17 s. Serial cost: 1.4 s
+  (ink) to 2 s (c12, c13) a 512^3 shard per thread at nice 19.
+- Same bytes: tests/test_z3w_pool.c (3 arrays: q 0, q 8, uint16; fill chunks, an all-fill shard over a stale object, a failing shard
+  reported with its error, the others written); test_predict_heads (1b): every file of the q 0 heads' stores (shards 128 and 256, levels
+  3, GPU pyramid) equal with UFSM_PRED_HPOOL=0 (diff -r); the bench's pooled stores md5-equal to the per-head writers'.
+- Not measured on the GPU (card 1 booked; desk CPU the training bottleneck): the ink predict wall at a quiet moment against
+  UFSM_PRED_HPOOL=0 (fp4teach's recipe, expected toward the 5 s of GPU).
+
 ## Fit-derived pseudo labels: gated winding labels from our unrolls, the build on the pod (2026-11-17, branch pseudolab-20261117)
 
 User (11-17): "at some point we need to feed our refined unwraps back in as training data — pseudolabeling and such"; (11-10) "judge the
@@ -87,8 +247,18 @@ need try9 pod unrolls with UQTILES=100000 (hands from count-field's model-cohere
 the volcomp mirror, each checked by its zarr.json; HOLD=holdouts-20261114.json rejects every per-scroll holdout and wbench box on the CT;
 the axis is matched by scan basename. On the scratch1 -ho json: 37 unlabelled volumes on the mirror (35 locally), 11 with an axis.
 
+**The wbench 1667 boxes C25-C70 were never held out (found 11-17).** holdouts-20261114 has only C1-C24 for PHerc1667 (from
+wbench/holdouts.json, which predates the 10-25 C25-C70 additions), and every u1 sources file (sources-u1 / u1b / u1c / u1d) used
+wbench/holdouts.json too: u1 and try9 both trained on C25-C70 through 1667-gt / A48 / B48, i.e. on 9 of core's 12 1667 boxes (C26 ...
+C60). Core's 1667 rows are in-sample for both; the clean numbers are HOLD and the 11-14 holdout boxes. Lead 11-17:
+`/vesuvius/ufsm/univ/scratch1/holdouts-20261118.json` = holdouts-20261114 + the 46 boxes as `wb-C25` ... (score 0: masked from
+training, never validation boxes) for future runs; try9 keeps its holdouts at the resume (it has trained on them). Report core with the
+1667 rows split out. The 1667 pseudo source masks all 70 wbench C boxes: weight 0 on each box + 64 level-2 voxels (the first box list
+of its phase-coh weight) and holdout_file pseudo/holdouts-pseudo1667.json (= holdouts-20261118) with the run's --holdout-guard 32.
+
 **Tests.** test_unroll_qa: --gate-boxes on the right model's 8 tiles (all s 1, 64^3 boxes) and the wrong model's box (s 0, --gate-scale 2
 doubles it). test_surflabels: --gt-cells against itself, every cell's kept voxels and pairs right.
+
 ## Unroll perf 6: 0332 end to end on master 64b2d3ed; flatten waits for device memory; the driver's stripes gated in the render (2026-11-17, branch unrollperf6-20261117)
 
 0332, card 1, u1 13000, INKAT=fields, TH=20 at nice 19 (lead: try9 first; desk load 32-39), CT cache cold (full4: warm), CLEAN=1;
@@ -101,6 +271,8 @@ under load), ink 682 -> 737, strip-flatten 118 -> 38 (fp32), stripimg 457 -> 442
   failure (x untouched) and slim_run waits for memory, 2 s retries up to UFSM_FLAT_GPU_WAIT (300 s), before the CPU solver.
 - stripimg: the unroll driver renders the 3 middle stripes itself (the stretch) and strip_refill.sh gated them with 2 more renders each;
   the driver now passes the c12 / c13 gates (render --gate, the same bytes) and marks them gated.
+- The stripimg + perwrap re-measure of both fixes was skipped (lead: card 1 booked, the desk CPU the training bottleneck); the e2e5 data
+  is deleted, its logs in /vesuvius/ufsm/unrollperf/keep/e2e5.
 
 ## Argus V2 (ruiconte): a Reader V3 fine-tune, runs in our reader3 port; ties reader3, adds nothing to the teacher combo (2026-11-17)
 
@@ -123,6 +295,32 @@ Parity (test_ink_ext_inksdk_koine, our torch koine reference, 384 px tiles): max
 
 argus2 vs ink9um: +0.0072 [-0.0027, +0.0161]. It gains on 0139 (one of its training scrolls) and loses 0.02 on 1667. The
 card's +1 AUC point from the -2/0/+2 depth windows does not show here. Argus V2 is available as a teacher but does not join the combo.
+
+## Training perf 3: try9 is sampler-bound after the GPU gains; the host profile, word-wise byte scans in draw_ (2026-11-17, branch samplecpu-20261117)
+
+- **The swap's live rate stayed flat.** fd615b6f went into try9 at step 6942. The replay ran identical windows with --det and no
+  echo: windows 2-10 at 79.6 Mvox/s on the old binary and 88.1 on the new one (+10.7 %). Live, the first 360 windows ran 0.156
+  samp/s against 0.15 before. Echo went from 0-8 % to 10-24 % and fresh windows dropped to 0.11-0.14/s. The GPU is now waiting for
+  the sampler, so its gain shows up as more echo windows. Gate: wind4 acc 0.594 vs 0.604 and gn_step 0.88x, no rollback.
+- **Host profile** (perf, read-only, try9 live; desk at 28.4 of 32 cores niced work, 0 idle). The 10 workers ran on ~2.7 cores
+  together and spent ~75 % of their time asleep, ~19 core-s per fresh window. Where the CPU time goes:
+  - CT decode on the CPU (vfx_decode_subs_sink, dct16_inv, zcache_read): ~37 %. try9 has no --ct-gpu-decode.
+  - On-the-fly ink labels (inkfly_rays, tri_box_z, pool_derive, chunk): ~28 %. All of it runs on the CPU because the inkfly GPU
+    budget never fits beside the trainer: card 0 has 0.2 GB free against a 1536 MiB reserve, logged as "7000 chunk(s) over the GPU
+    budget".
+  - draw_'s whole-window byte loops: ~12 %.
+  - Faults, memset and memmove: ~8 %.
+  - CUDA calls inside the workers: ~5 %.
+  - The main thread spins ~0.6 core in cudaStreamSynchronize.
+  The context switches: 52 % timer preemptions (CPU contention), 13 % libcuda's launch rwlock, 12 % the w4 ctx_run nanosleep poll,
+  7 % page-cache reads.
+- **The byte loops** (src/bytescan.h, new): the aux planes' unknown fill, the ink-bit pack (plus the 0 / 1 mask rewrite) and the
+  --min-phase known counts over side / ink / aux. mcc leaves them as one movzbl per voxel. The new versions work on 64-bit words:
+  per-byte 0x80 flags with no carry across bytes, a popcount, and a multiply to gather the bits. Min of 5 runs on 118 M bytes
+  (desk loaded): count 0.061 -> 0.010 s, fill 0.130 -> 0.047 s. test_bytescan checks them against the byte loops: lengths 0-70 and
+  1 M, values biased to 0 / 1 / 127 / 128 / 251-255, byte-exact.
+- **Proposed, not yet done:** `--ct-gpu-decode 1 --ink-gpu 1` in launch.env. Both GPU paths are byte-identical (test_gpudec,
+  test_ink_splat). Together they move ~65 % of the sampler's CPU time onto card 1. The lead decides that, because card 1 is shared.
 
 ## Training perf 2: mcc's local arrays in the head kernels (fstem 1.75x, the guided fuse pass ~2x; byte-identical; 2026-11-17, branch trainperf-20261117)
 

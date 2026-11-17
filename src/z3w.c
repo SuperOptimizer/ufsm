@@ -177,6 +177,20 @@ static int encode_one(const z3w *w, const uint8_t *chunk, uint8_t *enc, size_t b
     memcpy(*out, enc, n); *len = n;
     return 0;
 }
+/* inner chunk i of a shard's data: gathered into chunk and encoded (*out nullptr: all fill, omitted); z3w_write_shard and the pool */
+static int shard_chunk(const z3w *w, const uint8_t *data, int i, uint8_t *chunk, uint8_t *enc, size_t bound, uint8_t **out, size_t *len) {
+    const int es = w->dtype ? w->esize : 1;
+    int cz = i / (w->cg * w->cg), cy = (i / w->cg) % w->cg, cx = i % w->cg;
+    int any = 0;
+    for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) {
+        const uint8_t *src = data + (((size_t)(cz * 128 + z) * w->shard + (cy * 128 + y)) * w->shard + cx * 128) * es;
+        uint8_t *dst = chunk + ((size_t)z * 128 + y) * 128 * es;
+        memcpy(dst, src, (size_t)128 * es);
+        if (!any) for (int x = 0; x < 128; x++) if (w->dtype ? !elem_is_fill(src + (size_t)x * es, w->dtype, w->fillv) : src[x] != (uint8_t)w->fill) { any = 1; break; }
+    }
+    if (!any) { *out = nullptr; *len = 0; return 0; }
+    return encode_one(w, chunk, enc, bound, out, len);
+}
 static void *worker(void *arg) {
     job *jb = arg;
     const z3w *w = jb->w;
@@ -187,16 +201,7 @@ static void *worker(void *arg) {
     for (;;) {
         int i = atomic_fetch_add(&jb->next, 1);
         if (i >= jb->nc || atomic_load(&jb->failed)) break;
-        int cz = i / (w->cg * w->cg), cy = (i / w->cg) % w->cg, cx = i % w->cg;
-        int any = 0;
-        for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) {
-            const uint8_t *src = jb->data + (((size_t)(cz * 128 + z) * w->shard + (cy * 128 + y)) * w->shard + cx * 128) * es;
-            uint8_t *dst = chunk + ((size_t)z * 128 + y) * 128 * es;
-            memcpy(dst, src, (size_t)128 * es);
-            if (!any) for (int x = 0; x < 128; x++) if (w->dtype ? !elem_is_fill(src + (size_t)x * es, w->dtype, w->fillv) : src[x] != (uint8_t)w->fill) { any = 1; break; }
-        }
-        if (!any) { jb->enc[i] = nullptr; jb->len[i] = 0; continue; }
-        if (encode_one(w, chunk, enc, bound, &jb->enc[i], &jb->len[i])) { atomic_store(&jb->failed, 1); break; }
+        if (shard_chunk(w, jb->data, i, chunk, enc, bound, &jb->enc[i], &jb->len[i])) { atomic_store(&jb->failed, 1); break; }
     }
     free(chunk); free(enc);
     return nullptr;
@@ -218,6 +223,67 @@ int z3w_write_shard(z3w *w, int64_t sz, int64_t sy, int64_t sx, const uint8_t *d
     for (int i = 0; i < nc; i++) free(jb.enc[i]);
     free(jb.enc); free(jb.len);
     return rc;
+}
+/* the shard pool: one set of threads encodes the inner chunks of shards submitted by any number of writers (predict's head writers,
+   one per head store), oldest shard first, chunk by chunk; a shard's file is written by the thread that encodes its last chunk, then
+   done(ctx, rc, err) runs on that thread. Each of 3 head writers compressing its 512^3 shard with its own --threads waited on the
+   shard's slowest chunk and its file write before the next shard (bench 2026-11-17, 16 shards x 3 q 0 heads: 3 x 8 threads 12.0 s
+   wall, one pool of 24 6.6 s); the bytes are z3w_write_shard's */
+typedef struct zp_job { z3w *w; const uint8_t *data; int64_t s[3]; int nc, next; atomic_int left, bad; uint8_t **enc; size_t *len;
+                        void (*done)(void *ctx, int rc, const char *err); void *ctx; struct zp_job *nx; char err[256]; } zp_job;
+struct z3w_pool { pthread_mutex_t mu; pthread_cond_t cv; zp_job *head, *tail; int stop, nt; pthread_t th[256]; };
+static void *pool_main(void *arg) {
+    z3w_pool *P = arg; uint8_t *chunk = nullptr, *enc = nullptr; size_t ccap = 0, ecap = 0;
+    for (;;) {
+        pthread_mutex_lock(&P->mu);
+        while (!P->head && !P->stop) pthread_cond_wait(&P->cv, &P->mu);
+        zp_job *J = P->head;
+        if (!J) { pthread_mutex_unlock(&P->mu); break; }
+        const int i = J->next++;
+        if (J->next == J->nc) { P->head = J->nx; if (!P->head) P->tail = nullptr; }
+        pthread_mutex_unlock(&P->mu);
+        const z3w *w = J->w; const int es = w->dtype ? w->esize : 1; const size_t cb = (size_t)VOLCOMP_CHUNK_VOXELS * es, bound = w->dtype ? VOLCOMP_TYPED_ENCODE_BOUND : VOLCOMP_ENCODE_BOUND;
+        if (ccap < cb) { free(chunk); chunk = malloc(cb); ccap = chunk ? cb : 0; }
+        if (ecap < bound) { free(enc); enc = malloc(bound); ecap = enc ? bound : 0; }
+        if (!atomic_load(&J->bad) && (!chunk || !enc || shard_chunk(w, J->data, i, chunk, enc, bound, &J->enc[i], &J->len[i]))) {
+            if (!chunk || !enc) fail("encode allocation");
+            if (!atomic_exchange(&J->bad, 1)) snprintf(J->err, sizeof J->err, "%s", errbuf);   /* (errbuf is this thread's; the shard's last chunk may be another's) */
+        }
+        if (atomic_fetch_sub(&J->left, 1) != 1) continue;
+        const int rc = atomic_load(&J->bad) ? -1 : write_file(w, J->s[0], J->s[1], J->s[2], J->enc, J->len, J->nc);
+        if (rc && !J->err[0]) snprintf(J->err, sizeof J->err, "%s", errbuf);
+        for (int c = 0; c < J->nc; c++) free(J->enc[c]);
+        if (J->done) J->done(J->ctx, rc, J->err);
+        free(J->enc); free(J->len); free(J);
+    }
+    free(chunk); free(enc);
+    return nullptr;
+}
+z3w_pool *z3w_pool_create(int nthreads) {
+    z3w_pool *P = calloc(1, sizeof *P); if (!P) return nullptr;
+    if (nthreads <= 0) nthreads = (int)ufsm_ncpu();
+    if (nthreads > 256) nthreads = 256;
+    pthread_mutex_init(&P->mu, nullptr); pthread_cond_init(&P->cv, nullptr);
+    for (int i = 0; i < nthreads; i++) { if (pthread_create(&P->th[P->nt], nullptr, pool_main, P)) break; P->nt++; }
+    if (!P->nt) { free(P); return nullptr; }
+    return P;
+}
+int z3w_pool_submit(z3w_pool *P, z3w *w, int64_t sz, int64_t sy, int64_t sx, const uint8_t *data, void (*done)(void *ctx, int rc, const char *err), void *ctx) {
+    zp_job *J = calloc(1, sizeof *J); const int nc = w->cg * w->cg * w->cg;
+    if (!J || !(J->enc = calloc((size_t)nc, sizeof(uint8_t *))) || !(J->len = calloc((size_t)nc, sizeof(size_t)))) { if (J) { free(J->enc); free(J); } return fail("pool allocation"); }
+    J->w = w; J->data = data; J->s[0] = sz; J->s[1] = sy; J->s[2] = sx; J->nc = nc; atomic_init(&J->left, nc); J->done = done; J->ctx = ctx;
+    pthread_mutex_lock(&P->mu);
+    if (P->tail) P->tail->nx = J; else P->head = J;
+    P->tail = J; pthread_cond_broadcast(&P->cv);
+    pthread_mutex_unlock(&P->mu);
+    return 0;
+}
+int z3w_pool_threads(const z3w_pool *P) { return P->nt; }
+void z3w_pool_destroy(z3w_pool *P) {
+    if (!P) return;
+    pthread_mutex_lock(&P->mu); P->stop = 1; pthread_cond_broadcast(&P->cv); pthread_mutex_unlock(&P->mu);
+    for (int i = 0; i < P->nt; i++) pthread_join(P->th[i], nullptr);
+    pthread_mutex_destroy(&P->mu); pthread_cond_destroy(&P->cv); free(P);
 }
 int z3w_shard_chunks(const z3w *w) { return w->cg * w->cg * w->cg; }
 int z3w_encode_chunk(const z3w *w, const uint8_t *chunk, uint8_t **enc, size_t *len) {
