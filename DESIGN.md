@@ -6,6 +6,28 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Void zeroing (skip-empty) on the unroll fields: a small gain, on by default; PHerc0332's hand -1 by estimator (2026-11-17)
+
+User 11-16: "do we zero out air / void that is not papyrus but not masked either, would that help?" Before: only masked air (CT 0)
+was air anywhere (training's --skip-empty --skip-thr 0, the labels' air test); u1's fields predict ran dense; the ink teachers see raw
+CT. wbench GT A/B (u1 13000, 44 clean core boxes, card 1; predict --skip-empty 1 --skip-thr T --skip-margin 1: 8^3-cell tiles with no
+CT voxel above T left at their bias = void zeroed tile-wise), paired vs dense:
+| T | ids | A-B [95 % CI] | Paris 4 PH | Paris 4 J | 1667 |
+|---|---|---|---|---|---|
+| dense | 0.5327 | | 0.3916 | 0.4025 | 0.8836 |
+| 20 | 0.5369 | +0.0042 [+0.0003, +0.0086] | 0.4068 | 0.4079 | 0.8814 |
+| 40 | 0.5357 | +0.0030 [+0.0001, +0.0061] | 0.3998 | 0.4065 | 0.8824 |
+| 60 | 0.5294 | -0.0034 [-0.0168, +0.0069] | 0.4020 | 0.3973 | 0.8801 |
+The gain is on the packed Paris 4 boxes; 1667 (wide sheets) moves -0.002. Speed (unroll perf, above): fields predict -13 % on 0332 /
+1667, -6 % on packed Paris 4. unroll.sh: FSKIP (default 20; 0 = dense) on latent-grid fields. The voxel-level version for the ink
+teachers (ink-ext --ct-floor) is inksdk's; a training-side floor waits for that.
+
+PHerc0332's spiral hand: the u1 unroll with both hands (fields shared, then the +1 rerun on its own fields): DIRCOH -1 0.0604 vs +1
+0.0437 (refused, under the 0.05 margin); wrap-check identical (66 real / 8 dup / 3 merged, every rate equal); unroll-qa -1 better
+on pw48 (16 vs 24 tiles over 0.1) and w4 (14 vs 17 under 0.8), z drift 1.84 vs 1.95 turns, conf_lo 28 vs 27. spiral_dir.tsv: -1,
+source estimator. Both hands drift ~2 turns over z: 0332 is a hard scroll either way. The three-teacher ink maps of the six largest
+-1 wraps show no legible text (/vesuvius/ufsm/unroll2/ink/PHerc0332).
+
 ## Window overlap on the GT boxes: more grids do not help, FBLEND off again (2026-11-17, branch ngrid-20261116)
 
 User 11-16: "stride = window / 2 so all voxels get inferenced 8 times" -- would it help in compressed sections? wbench NGRID 2 / 4 / 8

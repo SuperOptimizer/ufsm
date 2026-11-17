@@ -164,7 +164,7 @@ mstart() {
   if [ -n "${INKCMD:-}" ]; then mset inkcmd "$INKCMD"; mset ink_ck "${LATINK_CK:-the default of INKCMD}"; [ -n "${LATINK_CK:-}" ] && mset ink_ck_sha "$(fsha $LATINK_CK)"
   else mset ink_ck "$(readlink -f $INKCK)"; mset ink_ck_sha "$(fsha $INKCK)"; fi
   mset box "${BOX:-mask}"; mset zr "${ZR:--}"; mset stripargs_env "${STRIPARGS:-}"
-  mset env "$(for v in CK INKCK INKCMD LATINK_CK FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
+  mset env "$(for v in CK INKCK INKCMD LATINK_CK FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
 }
 mstage() {
   [ "$DRY" = 1 ] && return 0
@@ -250,10 +250,14 @@ fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windo
   if [ "$4" != 0 ] && [ "$FKIND" = lat ]; then for d in 0 1 2; do
     local s=$(( ((b[d] - $4) % st + st) % st )); b[d]=$(( b[d] - s )); b[d + 3]=$(( b[d + 3] + s )); done   # (before 0 at a box at 0: predict reads fill there)
     box=$(IFS=,; echo "${b[*]}"); fi
-  local win; if [ "$FKIND" = lat ]; then win="--window ${LWIN:-640} --halo ${LHALO:-64}"
+  # FSKIP (lat fields; default 20, 0 = dense): --skip-empty 1 --skip-thr FSKIP --skip-margin 1, void tiles (no CT voxel above FSKIP) left at
+  # their bias. wbench GT A/B 2026-11-17 (u1 13000, 44 boxes): ids dense 0.5327, thr 20 0.5369 (+0.004 [+0.0003, +0.009]), 40 0.5357
+  # (+0.003, CI > 0), 60 0.5294 (n.s.); the gain sits on the packed Paris 4 boxes (+0.015 / +0.005); fields predict -13 % on 0332 / 1667
+  local win sk=; [ "$FKIND" = lat ] && [ "${FSKIP:-20}" != 0 ] && sk="--skip-empty 1 --skip-thr ${FSKIP:-20} --skip-margin 1"
+  if [ "$FKIND" = lat ]; then win="--window ${LWIN:-640} --halo ${LHALO:-64}"
   else win="$([ "${FWIN:-prod}" = auto ] && echo "--window auto" || echo "--window-z 384 --halo-z 64 --window 640") --halo 64"; fi
   X $O/logs/fields.log $U predict $CK ${FCTR:-$R} ${FCTK:-$K} $3.tmp --um $UM --level $LV --box $box $win --shard 512 \
-    --grid-origin $4,$4,$4 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $(occlv) &&
+    --grid-origin $4,$4,$4 --ema 1 --q 8 --threads ${PTH:-14} --gpu $1 --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $sk $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
 # --- the ref's pass 1 streamed behind the fields predict (REFSTREAM; 6a, 11-12) ---
