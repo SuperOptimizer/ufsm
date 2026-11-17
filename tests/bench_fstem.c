@@ -26,7 +26,9 @@ int main(int argc, char **argv) {
     printf("fstem fwd P %d slab %d planes, %d outputs: %.3f ms (%.0f GB/s of logits RMW + x)\n", P, NZ, NO, best * 1e3, by / best / 1e9);
     best = 1e9;
     for (int r = 0; r < 8; r++) { const double t = now(); nn_fstem_bwd(x, P, P, P, 64, NZ, p, C, NO, chs, lg, ns, gp); nn_sync(); if (now() - t < best) best = now() - t; }
-    printf("fstem bwd: %.3f ms\n", best * 1e3);
+    { float *hg = malloc(np * 4); nn_zero(gp, np * 4); nn_fstem_bwd(x, P, P, P, 64, NZ, p, C, NO, chs, lg, ns, gp); nn_sync(); nn_d2h(hg, gp, np * 4);
+      uint64_t h = 1469598103934665603ull; const unsigned char *b = (const unsigned char *)hg; for (size_t i = 0; i < np * 4; i++) h = (h ^ b[i]) * 1099511628211ull;
+      printf("fstem bwd: %.3f ms, parameter gradient hash %016llx\n", best * 1e3, (unsigned long long)h); free(hg); }
     {   /* the fused head-slab forward (nn_fstem_up_fwd: upsample + side pair sub-cells + stem, the trainer's path): cell logits of BASE + 128 channels */
         const int BASE = NO, side = 0, cp = P / 4, z0 = 64, qa = z0 / 4 - 1, qd = NZ / 4 + 2; const size_t ncl = (size_t)(BASE + 128) * qd * cp * cp;
         void *lc = nn_malloc(ncl * 2); { float *d = nn_malloc(ncl * 4); for (size_t i = 0; i < ncl; i++) hf[i] = 4 * RND(); nn_h2d(d, hf, ncl * 4); nn_f32_to_h16(d, ncl, lc, 1.f); nn_free(d); }
