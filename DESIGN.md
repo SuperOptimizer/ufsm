@@ -61,6 +61,27 @@ W % 16 != 0, slab-local GN, staging SR, ARCH=86.
 | L0 256 -> 256 32 x 256^2, bdata | 42.2 | 30.7 | 28.0 (69.5 % tensor) |
 | L1 320 -> 320 32 x 128^2, bdata | 16.5 | 11.6 | 10.5 |
 
+**Predict.** fp4teach's A/B (0332, fields u1 640/64 with --skip-empty, ink inkpod 544/16, 32 windows, nsys kernel minima) first showed
++5.5 / +12.5 % with F4V on. Four findings:
+- Predict's level-0 convs run as unet's in-place z-slabs (nn_set_zrange: sp.zi0 / sp.Di), which the prenorm copy excludes. Their
+  GroupNorm inputs ran f4v's in-kernel GN staging, which loses to conv_fwd_f4_k's (ncu 96 -> 96 64 x 160^2 7.86 vs 6.89 ms).
+  lp_f4v_preslab now takes z-range / z-window inputs: it prenorms only the planes each slab reads, then copy-stages the conv
+  (6.90 -> 4.26 ms prenorm included). The G staging runs only at UFSM_F4V=2 (tests).
+- The remaining "+2.9 / +4.4 %" was a measurement artefact. ksum.py took per-(kernel, grid product, block) minima, and the fast GN
+  convs and slow fused-upsample conv1s of conv_fwd_f4_k share grids. In the F4V=0 run the up calls were charged at the GN calls'
+  minimum; with F4V=1 they stood alone. The key now includes the grid dimensions, dynamic smem and registers.
+- Under --skip-empty the prenorm ran dense. gn_prenorm_f4z_k now skips every voxel the conv does not stage: outside the 3^3 halo of
+  an active output tile, or masked out of the input. test_skip_empty with forced slabs gives the F4V=0 logits.
+- Result, ce3b6778, full key, outputs byte-identical:
+
+| recipe | F4V=0 ms/window | F4V=1 ms/window | change | fp4 convs + prenorm | GPU busy |
+|---|---|---|---|---|---|
+| fields | 189.3 | 182.4 | -3.6 % | 38.7 -> 34.3 | 271.6 -> 258.1 |
+| ink | 149.9 | 139.5 | -6.9 % | 73.3 -> 63.1 | 323.4 -> 205.2 |
+
+(Run-to-run noise on the shared card is about +-2 %.) The fused-upsample conv1s still run conv_fwd_f4_k in predict: they get the
+z-range too, and lp_f4v_preup refuses it.
+
 **sparse24 on top.** bench_sp24 (wall clock, shared card 1), dense vs 2:4-sparse conv:
 - against conv_fwd_f4_k the sparse kernels win 1.24-3.35x;
 - against conv_fwd_f4v_k they win 1.06-1.08x at L0, 1.03-1.04x at L1, 1.02-1.03x at L2, 1.03-1.10x at L3, before their masking
