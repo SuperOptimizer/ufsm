@@ -408,7 +408,8 @@ extern "C" int nn_w4runs_apply_z(const uint8_t *phase_d, int D, int H, int W, in
     if (o->noff > a->noff) { cudaFree(a->d_off); a->noff = 0; AK(cudaMalloc(&a->d_off, (o->noff + o->noff / 4 + 1024) * 4)); a->noff = o->noff + o->noff / 4 + 1024; }
     if (2 * o->nr > a->nlut) { cudaFree(a->d_lut); a->nlut = 0; AK(cudaMalloc(&a->d_lut, 2 * o->nr + o->nr / 2 + 8192)); a->nlut = 2 * o->nr + o->nr / 2 + 8192; }
     {   /* the runs through the pinned staging buffer (UFSM_W4_PINNED=0: straight from the slot's pageable copies, as before) */
-        static int pin = -1; if (pin < 0) { const char *e = getenv("UFSM_W4_PINNED"); pin = !(e && *e == '0'); }
+        static int pin = -1;   /* mgpu: env (read once; every thread reads the same value) */
+        if (pin < 0) { const char *e = getenv("UFSM_W4_PINNED"); pin = !(e && *e == '0'); }
         const size_t need = o->noff * 4 + 2 * o->nr;
         if (pin && need > a->nst) { if (a->h_st) { AK(cudaEventSynchronize(a->done)); cudaFreeHost(a->h_st); } a->h_st = nullptr; a->nst = 0;
                                      if (cudaHostAlloc((void **)&a->h_st, need + need / 4 + 65536, cudaHostAllocDefault) == cudaSuccess) a->nst = need + need / 4 + 65536; else { cudaGetLastError(); a->h_st = nullptr; } }

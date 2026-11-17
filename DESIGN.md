@@ -6,6 +6,58 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Training perf: try9's step profiled; the head adjoint's gather 7x faster, the w4 runs pinned (2026-11-17, branch trainperf-20261117)
+
+**Profile.** try9's exact argv and env (binary c2646d35, snap/5000.ckpt, `UFSM_MEM_FREE_GB 10.98` reproduces its plan "MX gradients,
+chunked, lean 2, shared encoder a1, 10.07 GB"), --det 1, lr 0, card 1 held exclusively, nsys over steps 5006-5013 (8 windows, one
+update), /vesuvius/ufsm/trainperf (rp.sh, nsum.py). The windows come from the wind fixture (make_wind_fixture fx 1024 2 1,
+sources-ink.json): the replay on try9's sources needs ~30-35 GB of host memory and was OOM-killed twice in the 40 GB dev slice.
+6.01 s a window (try9 on card 0: ~6.7 with real windows and the sampler's GPU work beside it). Per window:
+
+| stage | ms | share |
+|---|---|---|
+| 3^3 conv forward incl. the lean recompute and backward-data (conv_fwd_f4_k 1828, conv_fwd_s2_f8_k 138) | 1974 | 33 % |
+| weight gradients (conv_bwd_w_f4ws_k 1215, conv_bwd_w_s2_f8_k 142, the head's conv_bwd_w1_tc_k 187) | 1570 | 27 % |
+| head slabs / losses (lat_adj_xy_t_k 458, loss_grad + loss_stats 143, w4 events / runs / stats / grad 214, lat_fuse 92, slab_tg 61) | 1080 | 18 % |
+| fine stem (fstem_fwd_k 417: upsample + stem + logit write fused; fstem_bwd_k 106) | 526 | 9 % |
+| input build, scanner aug, label warps | 184 | 3 % |
+| head 1^3 forward / backward-data, GroupNorm, optimizer (NorMuon + AdamW at accum 10), MX converts | 136 / 120 / 72 / 18 | 6 % |
+| attention (4 blocks at the deepest level) | < 1 | 0 |
+| GPU idle: ~5 gaps > 10 ms a window, all in the label-warp stage at the window start | 210 | 3.5 % |
+| launch gaps < 1 ms (what CUDA graphs could remove) | 8 | 0.1 % |
+
+**The head adjoint's y / x gather** (nn_lat_up_adj_c: the slab's fp16 logit gradient onto the coarse cell grid, 2 calls a slab, 48 slabs)
+ran at ~30 GB/s: lat_adj_xy_t_k (the 11-13 "tiled" kernel) indexes lat_adj_w's 10-entry weight arrays with loop variables, so they
+live in local memory, and every voxel was staged 2.5 times. bench_latadj at try9's slab (192^2 cells, 16 planes, 14 channels), card 1:
+
+| kernel (UFSM_LAT_ADJ_TILE) | ms | GB/s of fp16 gradient read |
+|---|---|---|
+| 2: lat_adj_xy_t_k (the default until now) | 8.6-10.0 | 26-31 |
+| 0: lat_adj_xy_k (per cell) | 2.6-3.3 | 80-102 |
+| 1: lat_adj_xy_r_k (new default) | 1.0-1.2 | 220-260 |
+
+lat_adj_xy_r_k: a thread owns a coarse column of 8 coarse rows and walks the 38 fine rows they read once (1.19 reads per voxel), each
+row's 4 + 3 + 3 taps as three 8-byte loads (the neighbours' from L1), the weights in registers (lat_adj_w1, no tables), each row's x sum
+added into the coarse rows it reaches in ascending tap order: lat_adj_xy_k's sums term for term. test_lat compares all three modes
+byte for byte (3 grid shapes incl. a partial strip and a 1 x 1 grid, 3 slabs each). A first strip version with a local `const float
+A[10]` took 4.8 ms and one with per-row local tables 72 ms: under mcc any indexed small array costs local memory traffic.
+
+Fixture A/B (try9 binary / new / try9 binary, 14 windows, --det 1, lr 0): every step's losses identical across the three arms;
+5.921 / 5.551 / 5.951 s a window over steps 5003-5014: **-6.4 %**.
+
+**The w4 runs upload.** The window-start nsys timeline showed the trainer thread inside one cudaMemcpyHtoDAsync for ~150-200 ms with
+the GPU idle: nn_w4runs_apply_z copied the slot's runs (off / ro / cb, ~14 MB, malloc'd in the sampler slot) with cudaMemcpyAsync from
+pageable memory, which waits for the copy stream (the CT aug, the phase warp and its 453 MB round trips) to drain before it returns, so
+the forward was launched only after the label stage. They now go through a per-device pinned staging buffer (reused after the previous
+call's event; UFSM_W4_PINNED=0 the old path). Same bytes (test_w4dev, test_slot_planes; the fixture A/B's step lines identical). Small:
+the window-start idle gaps > 10 ms went 210 -> 188 ms a window (nsys, the same capture), the wall clock within noise (5.527 against
+5.506 / 5.557 s for the lat_adj binary before and after it). lat_adj_xy in that capture: 458 -> 41 ms a window.
+
+**What is left** (result-neutral): the label-warp stage's ~190 ms of idle GPU at the window start (its 453 MB D2H / H2D round trips of
+the ink / phase planes through the pinned label planes sit on the copy stream ahead of the forward's inputs), fstem_fwd_k at ~70 GB/s of
+logit writes (417 ms), and the convs (60 %, tuned: no fusion left, sparse24-20261113). Result-changing: --sparse24 mode 3 (~5 % of this
+step), skip-empty above thr 0. Not worth it: the optimizer (1.2 %), attention (0), CUDA graphs (launch gaps 0.1 %).
+
 ## Flatten solver A/B: the GPU CG matvec in fp32 by default; relative-residual stop and decimation by vertex count dropped (2026-11-17, branch flatfp32-20261117)
 
 The per-wrap flatten and strip-flatten (GPU SLIM, fp64 Jacobi PCG, 200 steps max) are fp64-bound on the 5060 Ti. Three variants
