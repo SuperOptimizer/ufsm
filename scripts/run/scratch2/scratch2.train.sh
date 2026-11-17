@@ -19,6 +19,7 @@ set -u
 NAME=${1:?NAME}; STEPS=${2:?STEPS}
 R=${R:-/vesuvius/ufsm/v2/rv/runs}; U=${U:-/vesuvius/ufsm/v2/rv/bin/ufsm}; SRCJ=${SRCJ:-/vesuvius/ufsm/v2/rv/sources-rv.json}
 GPU=${GPU:-0}; P=${P:-576}   # GPU: one id or a list "0,1" (data parallel over them: --gpus 0..n-1 of CUDA_VISIBLE_DEVICES=GPU)
+VIS=$GPU${AUXGPU:+,$AUXGPU}   # AUXGPU: one more visible card for the sampler's device work only (--ct-gpu-decode / --ink-gpu index NG = it); training stays on GPU (--gpus 0..NG-1)
 LOCK=${LOCK-$(echo $GPU | tr , '\n' | sed 's|.*|/vesuvius/ufsm/opt/gpu&.lock|' | paste -sd,)}   # comma list of flock files, one per GPU
 NG=$(echo $GPU | tr , '\n' | wc -l); GPUS=$(seq -s, 0 $((NG - 1)))
 ARCH=${ARCH:---widths 16,16,32,64,128,192,256}
@@ -56,13 +57,13 @@ SNAPB=0; strings "$U" | grep -qF -- "--snap-every" && SNAPB=1
     fi; sleep 60; done ) &
 if [ "${PARSE:-0}" = 1 ]; then   # (s2ctl.sh parse: every flag of the exact launch argv parses; UFSM_MEM_DRY exits after the planner, no training)
   echo "$(date) parse check (UFSM_MEM_DRY=1): $U train ${ARGS[*]}" >> $o.resume.log
-  UFSM_MEM_DRY=1 CUDA_VISIBLE_DEVICES=$GPU nice -n 10 /home/forrest/bin/memcap -t $U train "${ARGS[@]}" >> $o.log 2>&1; rc=$?
+  UFSM_MEM_DRY=1 CUDA_VISIBLE_DEVICES=$VIS nice -n 10 /home/forrest/bin/memcap -t $U train "${ARGS[@]}" >> $o.log 2>&1; rc=$?
   echo "$(date) parse check exit rc=$rc" >> $o.resume.log; exit $rc
 fi
 if [ "${AUDIT:-0}" -gt 0 ] 2>/dev/null; then   # (s2ctl.sh audit: datafix's held-out leak audit, sampler only, no GPU, the exact launch args)
   echo "$(date) hold audit: $AUDIT batches, sampler only: $U train ${ARGS[*]}" >> $o.resume.log
   # (AUDITGPU=1, idle cards only: the on-the-fly phase / fibre / ink label paths reserve on --onfly-gpu, which fails with no GPU visible -- 11-15 try7: "--onfly-gpu 0: no GPU pair rule")
-  UFSM_SAMPLER_ONLY=$AUDIT UFSM_HOLD_AUDIT=1 CUDA_VISIBLE_DEVICES=${AUDITGPU:+$GPU} nice -n 10 /home/forrest/bin/memcap -t $U train "${ARGS[@]}" >> $o.log 2>&1; rc=$?
+  UFSM_SAMPLER_ONLY=$AUDIT UFSM_HOLD_AUDIT=1 CUDA_VISIBLE_DEVICES=${AUDITGPU:+$VIS} nice -n 10 /home/forrest/bin/memcap -t $U train "${ARGS[@]}" >> $o.log 2>&1; rc=$?
   echo "$(date) hold audit exit rc=$rc" >> $o.resume.log; exit $rc
 fi
 for i in $(seq 0 ${RELAUNCH:-20}); do
@@ -77,7 +78,7 @@ for i in $(seq 0 ${RELAUNCH:-20}); do
   echo "$(date) start $i (GPU $GPU, lock ${LOCK:-none}): $U train ${ARGS[*]} ${RS[*]}" >> $o.resume.log
   # the GPU lock is held by this launcher (fd 9) for its lifetime, so <run>.pid is the trainer itself (SIGTERM = graceful save)
   if [ -n "$LOCK" ] && [ -z "${LOCKED:-}" ]; then fd=9; for lk in ${LOCK//,/ }; do eval "exec $fd> $lk"; flock $fd; fd=$((fd + 1)); done; LOCKED=1; echo "$(date) holding $LOCK" >> $o.resume.log; fi
-  CUDA_VISIBLE_DEVICES=$GPU nice -n 5 /home/forrest/bin/memcap -t $U train "${ARGS[@]}" "${RS[@]}" >> $o.log 2>&1 & echo $! > $o.pid
+  CUDA_VISIBLE_DEVICES=$VIS nice -n 5 /home/forrest/bin/memcap -t $U train "${ARGS[@]}" "${RS[@]}" >> $o.log 2>&1 & echo $! > $o.pid
   ( tp=$(cat $o.pid); sleep 15; { echo "$(date) trainer pid $tp env: $(tr '\0' '\n' < /proc/$tp/environ 2>/dev/null | grep -E '^(UFSM_|MALLOC_|CUDA_)' | sort | tr '\n' ' ')"
       echo "$(date) trainer pid $tp argv: $(tr '\0' ' ' < /proc/$tp/cmdline 2>/dev/null)"; } >> $o.resume.log ) &
   wait $(cat $o.pid); rc=$?
