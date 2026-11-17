@@ -171,7 +171,7 @@ fi
 
 # one test (runs in a background subshell): GPU lock, timeout, timing, one retry for flaky tests -> $OUT/res/<name>
 # res line: status rc wall user sys maxrss_mb gpus attempts
-# who holds card $1: the exclusive lock's holder (lslocks), else a foreign compute process (>= 1 GB, no UFSM_SUITE_TEST in its
+# who holds card $1: the exclusive lock's holder (lslocks), else a foreign compute process (>= 1 GB, no UFSM_SUITE_TEST / UFSM_SUITE_GUEST in its
 # environment; nvidia-smi sampled at most every 10 s into $OUT/gpuusers); prints "pid command" or nothing when the card is free of both
 UUIDS=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2> /dev/null | tr -d ' ')
 holder() {
@@ -189,7 +189,7 @@ holder() {
   u=$(echo "$UUIDS" | awk -F, -v i="$i" '$1 == i {print $2}'); [ -z "$u" ] && return
   while IFS=, read -r p c m; do
     [ "$c" = "$u" ] && [ "${m:-0}" -ge 1024 ] || continue
-    tr '\0' '\n' < /proc/$p/environ 2> /dev/null | grep -q '^UFSM_SUITE_TEST=' && continue
+    tr '\0' '\n' < /proc/$p/environ 2> /dev/null | grep -qE '^UFSM_SUITE_(TEST|GUEST)=' && continue   # (GUEST: a trainer's side work on a shared card, e.g. try9's CT decode + ink on card 1: suites run beside it)
     echo "$p $(tr '\0' ' ' < /proc/$p/cmdline 2> /dev/null | cut -c1-120) (${m} MiB on GPU $i, not a suite test)"; return
   done < "$f"
 }
