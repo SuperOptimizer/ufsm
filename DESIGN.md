@@ -28,6 +28,26 @@ Parity (test_ink_ext_inksdk_koine, our torch koine reference, 384 px tiles): max
 argus2 vs ink9um: +0.0072 [-0.0027, +0.0161]. It gains on 0139 (one of its training scrolls) and loses 0.02 on 1667. The
 card's +1 AUC point from the -2/0/+2 depth windows does not show here. Argus V2 is available as a teacher but does not join the combo.
 
+## Training perf 2: mcc's local arrays in the head kernels (fstem 1.75x, the guided fuse pass ~2x; byte-identical; 2026-11-17, branch trainperf-20261117)
+
+- **Audit.** `cuobjdump -res-usage` over the mcudahw cache (`~/.cache/mcudahw/*.cubin`, one file per call) lists the kernels with a
+  stack frame. Under mcc a small array indexed in a loop that is not unrolled lives in local memory, even when the loop has a constant
+  bound (nvcc would unroll it). The hot ones in try9's step: `lat_fuse_k` 2544 B (the guided side pair's v / ga [7][27], p / gp [7][9],
+  q / gq [7][3]; ~all of try9's lat_fuse calls are guided: lat_fuse_fin grid 6048 = 7 channels), `loss_stats_k` 1248 B and
+  `loss_grad_k` 624 B (the offset-tolerant path's helpers; not in try9's hot loop), `input_latc_k` 432, `fstem_fwd_k` / `fstem_bwd_k`
+  160 (h [16] in the 1x1 projection's `c < C` loop, go [16] in the backward, the W1 A fragments af [4][4]), `conv_fwd_f4_k` 80-216
+  (its accumulators; ptxas spills, not a loop-index array: left alone).
+- **Fix: `#pragma unroll` to the array's static bound, with the runtime bound as a guard** (`for c < FS_MAXC: if (c < C) v += ...`):
+  the same additions in the same order, so the bits are unchanged. fstem: stack 160 -> 96 B. bench_fstem (now also the fused
+  `nn_fstem_up_fwd`, the trainer's head-slab path, and hashes of all three outputs) at P 768, slab 16, 11 outputs, card 1 shared
+  with an unroll (min of 8): fused up fwd 5.04 -> 2.86 ms, plain fwd 1.96 -> 1.24-1.41, bwd 2.64-3.50 -> 1.82-1.93; the three hashes
+  identical to fd615b6f's at P 384. In try9 fstem_fwd_k is 96 calls x 4.37 ms a window: ~-170 ms (~3 %) expected, bwd ~-40 ms.
+- lat_fuse_k guided path: the channel loops of the per-row / per-voxel work unrolled (v and ga stay indexed per rz). test_lat_fuse
+  TLF_HASH=1 (new: FNV hash of each case's fused gradient) equal to the old build in all 8 cases; TLF_BENCH=768 guided grad min 12.3
+  -> 6.2 ms (shared card: only the min means anything). In try9 75 ms a window (48 calls x 1.56 ms): ~-35 ms expected.
+- Not done: loss_stats_k / loss_grad_k (frames from the tol path, not touched per voxel), conv_fwd_f4_k's spills (a register budget
+  question inside the MMA tile; the kernel is issue-bound on staging, see the headroom note in the section below).
+
 ## Training perf: try9's step profiled; the head adjoint's gather 7x faster, the w4 runs pinned (2026-11-17, branch trainperf-20261117)
 
 **Profile.** try9's exact argv and env (binary c2646d35, snap/5000.ckpt, `UFSM_MEM_FREE_GB 10.98` reproduces its plan "MX gradients,
