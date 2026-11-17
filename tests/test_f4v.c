@@ -82,6 +82,43 @@ static void run_case(const char *name, int Ci, int Co, int D, int H, int W, int 
     nn_free(w); nn_free(b); nn_free(x); nn_free(x2); nn_free(y[0]); nn_free(y[1]); nn_free(os[0]); nn_free(os[1]);
     nn_free(ga); nn_free(be); nn_free(mu); nn_free(rsd); nn_free(g2a); nn_free(g2b); nn_free(g2m); nn_free(g2r);
 }
+/* the decoder conv1 [up2(coarse Cx) | skip Cs] -> Co with both GroupNorms (sp.up: the fused upsample): old kernel vs the slab path */
+static void run_up(const char *name, int Cx, int Cs, int Co, int D, int H, int W, int Z, int stats) {
+    const int Ci = Cx + Cs, G = 8, Go = 8;
+    shape5 fs = {1, Ci, D, H, W}, cs = {1, Cx, D / 2, H / 2, W / 2}, ks = {1, Cs, D, H, W}, ys = {1, Co, D, H, W};
+    float *w = dev_rand((size_t)Co * Ci * 27, 0.04f, 0.f), *b = dev_rand(Co, 0.1f, 0.f);
+    void *c4 = mx4_rand(cs, 2.f), *k4 = mx4_rand(ks, 2.f);
+    float *ga = dev_rand(Cx, 0.2f, 1.f), *be = dev_rand(Cx, 0.1f, 0.f), *mu = dev_rand(G, 0.1f, 0.f), *rsd = dev_rand(G, 0.1f, 1.f);
+    float *g2a = dev_rand(Cs, 0.3f, 1.f), *g2b = dev_rand(Cs, 0.2f, 0.f), *g2m = dev_rand(G, 0.2f, 0.f), *g2r = dev_rand(G, 0.1f, 1.f);
+    gnp_t gp = gnp_mk(ga, be, mu, rsd, G);
+    split_t sp = {0}; sp.x2 = k4; sp.c_split = Cx; sp.up = 1; sp.gp2 = gnp_mk(g2a, g2b, g2m, g2r, G);
+    const size_t osb = (size_t)2 * Go * 3 * sizeof(double);
+    double *os[2] = {nullptr, nullptr};
+    size_t yb = 0; void *y[2] = {mx4_out(ys, &yb), mx4_out(ys, &yb)};
+    unsigned long c0 = 0;
+    for (int k = 0; k < 2; k++) {
+        if (stats) { os[k] = nn_malloc(osb); nn_zero(os[k], osb); }
+        lp_set_f4v(k); lp_set_f4v_preslab(k ? Z : 0);
+        if (k) c0 = lp_f4v_calls();
+        lp_conv_fwd_f4(c4, 4, fs, w, b, Co, y[k], 4, gp, os[k], stats ? Go : 0, sp);
+    }
+    const int ran = lp_f4v_calls() == c0 + 1;
+    lp_set_f4v(0); lp_set_f4v_preslab(0);
+    nn_sync();
+    const char *e = lp_check();
+    unsigned char *h0 = malloc(yb), *h1 = malloc(yb);
+    nn_d2h(h0, y[0], yb); nn_d2h(h1, y[1], yb);
+    size_t nd = 0, nz = 0; for (size_t i = 0; i < yb; i++) { nd += h0[i] != h1[i]; nz += h0[i] != 0; }
+    int sok = 1;
+    if (stats) { unsigned char s0[512], s1[512]; nn_d2h(s0, os[0], osb); nn_d2h(s1, os[1], osb); sok = !memcmp(s0, s1, osb); }
+    char msg[256];
+    snprintf(msg, sizeof msg, "%s: up %d + skip %d -> %d %dx%dx%d, Z %d: %zu of %zu bytes differ%s%s%s", name, Cx, Cs, Co, D, H, W, Z, nd, yb, stats ? (sok ? ", stats equal" : ", STATS DIFFER") : "",
+             ran ? "" : ", F4V NOT RUN", e ? e : "");
+    check(msg, !e && ran && nd == 0 && sok && nz > yb / 4);
+    free(h0); free(h1);
+    nn_free(w); nn_free(b); nn_free(c4); nn_free(k4); nn_free(y[0]); nn_free(y[1]); nn_free(os[0]); nn_free(os[1]);
+    nn_free(ga); nn_free(be); nn_free(mu); nn_free(rsd); nn_free(g2a); nn_free(g2b); nn_free(g2m); nn_free(g2r);
+}
 int main(void) {
     nn_init(getenv("UFSM_GPU") ? atoi(getenv("UFSM_GPU")) : 0);
     if (lp_sw_build()) { printf("test_f4v: sm_120a only (ARCH=86 build: conv_fwd_f4v_k not built), skipped\n"); return 0; }
@@ -103,6 +140,9 @@ int main(void) {
     run_case("GN staged, split input, per-segment GNs", 192, 256, 12, 24, 48, GN | GN2 | SPLIT | STATS);
     run_case("slabbed prenorm vs in-kernel GN staging (8-plane slabs)", 128, 128, 20, 16, 32, GN | STATS | PRESLAB);
     run_case("slabbed prenorm, stored stats, odd depth", 256, 192, 13, 24, 32, GN | STATS | SST | PRESLAB);
+    run_up("dec conv1, fused upsample", 64, 64, 64, 16, 16, 32, 8, 1);
+    run_up("dec conv1, fused upsample, one slab", 96, 64, 128, 12, 24, 32, 0, 1);
+    run_up("dec conv1, fused upsample, 4-plane slabs, odd sizes", 64, 96, 128, 14, 18, 32, 4, 1);
     run_case("z-range input (zi0 1, Di D + 3)", 128, 64, 12, 16, 32, ZRANGE | OSR);
     if (getenv("UFSM_TEST_QUICK") == nullptr) run_case("level-0 shape", 256, 256, 16, 64, 64, GN | STATS);
     printf("test_f4v: %s\n", bad ? "FAIL" : "ok");

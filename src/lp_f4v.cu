@@ -332,7 +332,7 @@ int lp_f4v_try(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, c
                     : sp.zw1 && (sp.zw0 % 4 || (sp.zw1 % 4 && sp.zw1 != xs.d)) ? "z-window off 4-plane tiles" : plane >= ((size_t)1 << 31) ? "plane >= 2^31"
                     : osum && (sp.y2 || (xs.w & 15) || cout <= 16) ? "statistics epilogue (split output / W % 16 / <= 16 outputs)" : nullptr;   /* (f4v_epi_st: fwd_epi_mxt's conditions) */
     static int dbg = -1; if (dbg < 0) dbg = getenv("UFSM_F4V_DEBUG") ? atoi(getenv("UFSM_F4V_DEBUG")) : 0;   /* the first N calls: kernel and reason */
-    if (dbg > 0) { dbg--; fprintf(stderr, "f4v: %d->%d %dx%dx%d Cop %d Cip %d stats %d osr %d x2 %d: %s%s\n", xs.c, cout, xs.d, xs.h, xs.w, Cop, Cip, osum != nullptr, sp.osr != 0, sp.x2 != nullptr,
+    if (dbg > 0) { dbg--; fprintf(stderr, "f4v: %d->%d %dx%dx%d Cop %d Cip %d stats %d osr %d x2 %d (c_split %d) up %d gn %d/%d: %s%s\n", xs.c, cout, xs.d, xs.h, xs.w, Cop, Cip, osum != nullptr, sp.osr != 0, sp.x2 != nullptr, sp.c_split, sp.up, gp.G, sp.gp2.G,
                                    why ? "conv_fwd_f4_k, " : "conv_fwd_f4v_k", why ? why : ""); }
     if (why) return 0;
     launch_f4v<4, 4, mx4_t>(x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp, lp_skip_get(xs, sp, 1));
@@ -343,12 +343,13 @@ int lp_f4v_try(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, c
 
 #ifndef LP_SW
 /* gn_prenorm_f4_k over the input planes [a, a + L) only (into a depth-L tensor): the same staging and requantisation per voxel */
-__global__ void __launch_bounds__(256) gn_prenorm_f4z_k(const mx4_t *__restrict__ x, int N, int Ci, size_t S, int a, int L, int HW, gnp_t gp, uint8_t *__restrict__ y) {
+/* (a split input's segment: padded channels cpo .. cpo + 32 gridDim.y of the conv's input, chan as the conv stages them; nb blocks out) */
+__global__ void __launch_bounds__(256) gn_prenorm_f4z_k(const mx4_t *__restrict__ x, int N, int Ci, int Cx, int CxP, int cpo, size_t S, int a, int L, int HW, gnp_t gp, split_t sp,
+                                                        uint8_t *__restrict__ y) {
     __shared__ chan_t ctab[32]; __shared__ float2 cab[32]; __shared__ unsigned sgm;
-    const int blk = blockIdx.y, n = blockIdx.z, nb = Ci / 32;
+    const int blk = blockIdx.y, n = blockIdx.z, nb = gridDim.y;
     if (threadIdx.x < 32) {
-        const split_t sp0 = {};
-        const chan_t c = make_chan(blk * 32 + (int)threadIdx.x, Ci, Ci, n, S, x, sp0, gp, N);
+        const chan_t c = make_chan(seg_ci(cpo + blk * 32 + (int)threadIdx.x, Ci, Cx, CxP), Ci, Cx, n, S, x, sp, gp, N);
         ctab[threadIdx.x] = c; cab[threadIdx.x] = make_float2(c.a, c.b);
         const unsigned gm = __ballot_sync(0xffffffffu, c.g != 0);
         if (threadIdx.x == 0) sgm = gm;
@@ -392,9 +393,140 @@ int lp_f4v_preslab(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *w
     const skipm_t sk = lp_skip_get(xs, sp, 1);
     for (int z0 = 0; z0 < xs.d; z0 += Z) {
         const int z1 = z0 + Z < xs.d ? z0 + Z : xs.d, a = z0 > 0 ? z0 - 1 : 0, e = z1 < xs.d ? z1 + 1 : xs.d, L = e - a;
-        gn_prenorm_f4z_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, xs.c, (size_t)xs.d * HW, a, L, HW, gp, q);
+        gn_prenorm_f4z_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, xs.c, xs.c, xs.c, 0, (size_t)xs.d * HW, a, L, HW, gp, split_t{}, q);
         split_t s2 = sp; s2.zi0 = (int16_t)-a; s2.Di = (int16_t)L; s2.zw0 = (int16_t)z0; s2.zw1 = (int16_t)z1;
         launch_f4v<4, 4, mx4_t>(q, xs, wq, ws, b, cout, y, Cop, Cip, gnp_t{}, osum, Go, s2, sk, z0 == 0);
+    }
+    g_f4v_calls++;
+    return 1;
+#endif
+}
+
+#ifndef LP_SW
+/* the fused upsample's coarse rows (f4ru_coarse per coarse voxel: decode, the coarse GroupNorm + SiLU, e4m3 requantisation) of coarse planes
+   [cza, cza + Lc): [N][nb1][Lc HWc] x 32 B, then the scale bytes */
+__global__ void __launch_bounds__(256) up_coarse_f4v_k(const mx4_t *__restrict__ x, int N, int Ci, int Cx, size_t cpl, int cza, int Lc, int HWc, gnp_t gp, split_t sp, uint8_t *__restrict__ cu) {
+    __shared__ chan_t ctab[32]; __shared__ float2 cab[32]; __shared__ unsigned sgm;
+    const int blk = blockIdx.y, n = blockIdx.z, nb1 = gridDim.y, CxP = (Cx + 31) / 32 * 32;
+    if (threadIdx.x < 32) {
+        const chan_t c = make_chan(seg_ci(blk * 32 + (int)threadIdx.x, Ci, Cx, CxP), Ci, Cx, n, cpl, x, sp, gp, N);
+        ctab[threadIdx.x] = c; cab[threadIdx.x] = make_float2(c.a, c.b);
+        const unsigned gm = __ballot_sync(0xffffffffu, c.g != 0);
+        if (threadIdx.x == 0) sgm = gm;
+    }
+    __syncthreads();
+    const size_t Ls = (size_t)Lc * HWc, i = (size_t)blockIdx.x * 256 + threadIdx.x;
+    if (i >= Ls) return;
+    const chan_t c0 = ctab[0];
+    const unsigned gmask = sgm;
+    float r[32];
+    const bool ok = c0.p != nullptr;
+    mx_row32<4>(c0, ok ? (size_t)cza * HWc + i : 0, ok, r);
+    if (gmask && ok) {
+#pragma unroll
+        for (int k = 0; k < 32; k++) if ((gmask >> k) & 1u) { const float2 ab = cab[k]; r[k] = act_ab(r[k], ab.x, ab.y, true); }
+    }
+    unsigned am = 0u;
+#pragma unroll
+    for (int k = 0; k < 32; k++) { const unsigned u = __float_as_uint(fabsf(r[k])); am = u <= 0x7f800000u ? max(am, u) : am; }
+    const int e = mx_exp(__uint_as_float(am), 1.f / 448.f);
+    const float m = exp2i(-e);
+    const size_t ri = ((size_t)n * nb1 + blk) * Ls + i;
+    uint4 *dst = (uint4 *)(cu + ri * 32);
+    dst[0] = make_uint4(cvt_e4m3x4(r[0] * m, r[1] * m, r[2] * m, r[3] * m), cvt_e4m3x4(r[4] * m, r[5] * m, r[6] * m, r[7] * m),
+                        cvt_e4m3x4(r[8] * m, r[9] * m, r[10] * m, r[11] * m), cvt_e4m3x4(r[12] * m, r[13] * m, r[14] * m, r[15] * m));
+    dst[1] = make_uint4(cvt_e4m3x4(r[16] * m, r[17] * m, r[18] * m, r[19] * m), cvt_e4m3x4(r[20] * m, r[21] * m, r[22] * m, r[23] * m),
+                        cvt_e4m3x4(r[24] * m, r[25] * m, r[26] * m, r[27] * m), cvt_e4m3x4(r[28] * m, r[29] * m, r[30] * m, r[31] * m));
+    cu[(size_t)N * nb1 * Ls * 32 + ri] = (uint8_t)(e + 127);
+}
+/* the up segment at fine planes [a, a + L): f4ru_blend's trilinear blend of the coarse rows (the same taps, weights, half2 sums and order),
+   requantised to e2m1 per (32-channel block, voxel) as conv_fwd_f4_k's staging: a depth-L MX-fp4 tensor of Cx channels */
+__global__ void __launch_bounds__(256) up_fine_f4v_k(const uint8_t *__restrict__ cu, int N, int cza, int Lc, int D, int H, int W, int a, int L, uint8_t *__restrict__ y) {
+    const int blk = blockIdx.y, n = blockIdx.z, nb1 = gridDim.y, HW = H * W, Dc = D >> 1, Hc = H >> 1, Wc = W >> 1;
+    const size_t Ls = (size_t)L * HW, v0 = (size_t)blockIdx.x * 256 + threadIdx.x, Lcs = (size_t)Lc * Hc * Wc;
+    if (v0 >= Ls) return;
+    const int gz = a + (int)(v0 / HW), gy = (int)(v0 % HW) / W, gx = (int)(v0 % W);
+    const uint8_t *cb = cu + ((size_t)n * nb1 + blk) * Lcs * 32, *cbs = cu + (size_t)N * nb1 * Lcs * 32 + ((size_t)n * nb1 + blk) * Lcs;
+    const int mz[2] = {gz >> 1, min(max((gz >> 1) + ((gz & 1) ? 1 : -1), 0), Dc - 1)}, my[2] = {gy >> 1, min(max((gy >> 1) + ((gy & 1) ? 1 : -1), 0), Hc - 1)},
+              mx[2] = {gx >> 1, min(max((gx >> 1) + ((gx & 1) ? 1 : -1), 0), Wc - 1)};
+    int lis[8]; unsigned em = 0u;
+#pragma unroll
+    for (int t = 0; t < 8; t++) { const int a2 = t >> 2, b2 = (t >> 1) & 1, c2 = t & 1; lis[t] = ((mz[a2] - cza) * Hc + my[b2]) * Wc + mx[c2]; em = max(em, (unsigned)cbs[lis[t]]); }
+    __half2 acc[16];
+#pragma unroll
+    for (int j = 0; j < 16; j++) acc[j] = __float2half2_rn(0.f);
+#pragma unroll
+    for (int a2 = 0; a2 < 2; a2++)
+#pragma unroll
+        for (int b2 = 0; b2 < 2; b2++)
+#pragma unroll
+            for (int c2 = 0; c2 < 2; c2++) {
+                const int li = lis[(a2 * 2 + b2) * 2 + c2];
+                const int de = (int)cbs[li] - (int)em;
+                const __half2 w3 = __float2half2_rn((a2 ? 0.25f : 0.75f) * (b2 ? 0.25f : 0.75f) * (c2 ? 0.25f : 0.75f) * (de >= -126 ? __uint_as_float((unsigned)(127 + de) << 23) : 0.f));
+                const uint4 h0 = *(const uint4 *)(cb + (size_t)li * 32), h1 = *(const uint4 *)(cb + (size_t)li * 32 + 16);
+                const unsigned w[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    unsigned lo, hi;
+                    lo = h2_e4m3x2(w[j] & 0xffff);
+                    hi = h2_e4m3x2(w[j] >> 16);
+                    acc[2 * j] = __hfma2(w3, *(const __half2 *)&lo, acc[2 * j]); acc[2 * j + 1] = __hfma2(w3, *(const __half2 *)&hi, acc[2 * j + 1]);
+                }
+            }
+    const float sm = mx_scale(em);
+    float val[32];
+#pragma unroll
+    for (int j = 0; j < 16; j++) { const float2 f = __half22float2(acc[j]); val[2 * j] = f.x * sm; val[2 * j + 1] = f.y * sm; }
+    unsigned amu = 0u;
+#pragma unroll
+    for (int k = 0; k < 32; k++) amu = amax_u(amu, val[k]);
+    const int e = mx_exp(__uint_as_float(amu), 1.f / 6.f);
+    const float m = exp2i(-e);
+    const size_t ri = ((size_t)n * nb1 + blk) * Ls + v0;
+    *(uint4 *)(y + ri * 16) = make_uint4(cvt_e2m1x8(val, m), cvt_e2m1x8(val + 8, m), cvt_e2m1x8(val + 16, m), cvt_e2m1x8(val + 24, m));
+    y[(size_t)N * nb1 * Ls * 16 + ri] = (uint8_t)(e + 127);
+}
+#endif
+/* fwd_f4_t's decoder conv1 with the fused 2x upsample (sp.up 2: [up2(x) | x2], per-segment GroupNorms): conv_fwd_f4_k staged the up
+   chunks (f4ru_coarse + f4ru_blend: 8 coarse rows a position, per output-channel tile and halo, 4 x 2.8x over) and GN-staged the skip
+   chunks. Here, by z slabs (as lp_f4v_preslab): the slab's coarse rows once (up_coarse_f4v_k), its up part at full resolution
+   (up_fine_f4v_k), its skip part prenormed (gn_prenorm_f4z_k on the second segment), then conv_fwd_f4v_k copy-staged on the two slab
+   tensors as a plain split input. Per voxel the staged bytes are conv_fwd_f4_k's (the same functions' arithmetic): the same outputs
+   and statistics bits (test_f4v) */
+int lp_f4v_preup(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, int Cip, gnp_t gp, double *osum, int Go, const split_t &sp) {
+#ifdef LP_SW
+    (void)x; (void)xs; (void)wq; (void)ws; (void)b; (void)cout; (void)y; (void)Cop; (void)Cip; (void)gp; (void)osum; (void)Go; (void)sp;
+    return 0;
+#else
+    const int Ci = xs.c, Cx = sp.c_split, CxP = (Cx + 31) / 32 * 32;
+    if (!lp_get_f4v() || lp_sw_build() || sp.up != 2 || !sp.x2 || Cx <= 16 || Ci - Cx <= 16 || sp.sr || gp.ns || sp.gp2.ns || sp.Di || sp.zw1 || sp.y2 || Cop % 64 || xs.d < 8
+        || (osum && ((xs.w & 15) || cout <= 16)) || ((size_t)(xs.d + 2) * xs.h * xs.w >= ((size_t)1 << 31))) return 0;
+    if (g_f4v_preslab < 0) g_f4v_preslab = getenv("UFSM_F4V_PRESLAB") ? atoi(getenv("UFSM_F4V_PRESLAB")) : 0;
+    const int HW = xs.h * xs.w, Hc = xs.h >> 1, Wc = xs.w >> 1, HWc = Hc * Wc, Dc = xs.d >> 1, nb1 = CxP / 32, nb2 = (Cip - CxP) / 32;
+    auto bytes = [&](int Z, size_t *o1, size_t *o2) {   /* (fine up | fine skip | coarse) for a Z-plane slab */
+        const size_t L = (size_t)Z + 2, Lc = L / 2 + 3;
+        *o1 = ((size_t)xs.n * nb1 * L * HW * 17 + 255) & ~(size_t)255;
+        *o2 = *o1 + (((size_t)xs.n * nb2 * L * HW * 17 + 255) & ~(size_t)255);
+        return *o2 + (size_t)xs.n * nb1 * Lc * HWc * 33;
+    };
+    size_t o1 = 0, o2 = 0;
+    int Z = 0; uint8_t *q = nullptr;
+    if (g_f4v_preslab > 0) { Z = g_f4v_preslab & ~3; if (Z < 4) Z = 4; q = (uint8_t *)nn_ws(NN_WS_F4PRE, bytes(Z, &o1, &o2)); }
+    else for (Z = (xs.d + 3) & ~3; Z >= 4 && !(q = (uint8_t *)nn_ws(NN_WS_F4PRE, bytes(Z, &o1, &o2))); Z = Z > 64 ? 64 : Z - 4) {}
+    if (!q) return 0;
+    bytes(Z, &o1, &o2);
+    const skipm_t sk = lp_skip_get(xs, sp, 1);
+    const size_t cpl = (size_t)Dc * HWc;
+    for (int z0 = 0; z0 < xs.d; z0 += Z) {
+        const int z1 = z0 + Z < xs.d ? z0 + Z : xs.d, a = z0 > 0 ? z0 - 1 : 0, e = z1 < xs.d ? z1 + 1 : xs.d, L = e - a;
+        const int cza = max((a >> 1) - 1, 0), czb = min(((e - 1) >> 1) + 2, Dc), Lc = czb - cza;   /* the coarse planes the blend reads */
+        uint8_t *qu = q, *qs = q + o1, *qc = q + o2;
+        up_coarse_f4v_k<<<dim3(nblk_((size_t)Lc * HWc, 256), (unsigned)nb1, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, Ci, Cx, cpl, cza, Lc, HWc, gp, sp, qc);
+        up_fine_f4v_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb1, (unsigned)xs.n), 256>>>(qc, xs.n, cza, Lc, xs.d, xs.h, xs.w, a, L, qu);
+        gn_prenorm_f4z_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb2, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, Ci, Cx, CxP, CxP, (size_t)xs.d * HW, a, L, HW, gp, sp, qs);
+        split_t s2 = sp; s2.up = 0; s2.x2 = qs; s2.gp2 = gnp_t{}; s2.zi0 = (int16_t)-a; s2.Di = (int16_t)L; s2.zw0 = (int16_t)z0; s2.zw1 = (int16_t)z1;
+        launch_f4v<4, 4, mx4_t>(qu, xs, wq, ws, b, cout, y, Cop, Cip, gnp_t{}, osum, Go, s2, sk, z0 == 0);
     }
     g_f4v_calls++;
     return 1;
