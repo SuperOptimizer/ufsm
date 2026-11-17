@@ -32,7 +32,8 @@ extern "C" int rsg_open(int dev, int64_t RZ, int64_t ny, int64_t nx, int maxM) {
     RG_CK(cudaSetDevice(dev)); g.dev = dev; g.RZ = RZ; g.ny = ny; g.nx = nx; g.ok = 1;   /* (ok: rsg_close frees a partial open) */
     RG_CK(cudaMalloc(&g.ring, (size_t)RZ * ny * nx));
     RG_CK(cudaMalloc(&g.cnt, 2 * sizeof(unsigned long long)));
-    RG_CK(cudaStreamCreateWithFlags(&g.su, cudaStreamNonBlocking)); RG_CK(cudaStreamCreateWithFlags(&g.sk, cudaStreamNonBlocking));
+    { int lo = 0, hi = 0; RG_CK(cudaDeviceGetStreamPriorityRange(&lo, &hi));   /* uploads / memsets ahead of the kernel's next blocks (rsg_run) */
+      RG_CK(cudaStreamCreateWithPriority(&g.su, cudaStreamNonBlocking, hi)); RG_CK(cudaStreamCreateWithPriority(&g.sk, cudaStreamNonBlocking, lo)); }
     int sms = 0; RG_CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
     g.G = (long)sms * 1536;
     if (maxM > 0) {   /* the cell arrays up front: no device allocation once the run is under way */
@@ -250,9 +251,17 @@ extern "C" int rsg_run(const rsg_par *P, int M, const int32_t *zyx, const uint8_
         int nb = 0, sms = 0; RG_CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_rsp, wpb * 32, smem)); RG_CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, g.dev));
         g.nres = (nb > 0 ? nb : 1) * sms; }
     k_axis<<<(unsigned)((M + 255) / 256), 256, 0, g.sk>>>(M, g.t6, g.nv);
-    const long nb = (M + wpb - 1) / wpb < g.nres ? (M + wpb - 1) / wpb : g.nres;
-    k_rsp<<<(unsigned)nb, wpb * 32, smem, g.sk>>>(*P, g.ring, g.RZ, M, g.zyx, g.nv, g.q, g.cnt);
-    RG_CK(cudaGetLastError());
+    /* the cells in launches of UFSM_RECTOSP_SLICE (32) cells per resident warp: a grid sized to the resident blocks holds every SM until
+       its launch ends, so the helper's chunk gathers and ring memsets (other streams) waited for the whole block's kernel (PHerc Paris 4
+       on the pod: 5.4 s a block, the helper serialised behind it: 698 of 1521 s waiting for it); between launches the higher-priority
+       streams' work goes first. The cells are independent: the same codes */
+    static long slw = -1; /* mgpu: env */ if (slw < 0) { const char *e = getenv("UFSM_RECTOSP_SLICE"); slw = e && *e ? atol(e) : 32; if (slw < 0) slw = 0; }
+    const long per = slw ? g.nres * (long)wpb * slw : M;
+    for (long m0 = 0; m0 < M; m0 += per) {
+        const long mn = M - m0 < per ? M - m0 : per, nb = (mn + wpb - 1) / wpb < g.nres ? (mn + wpb - 1) / wpb : g.nres;
+        k_rsp<<<(unsigned)nb, wpb * 32, smem, g.sk>>>(*P, g.ring, g.RZ, (int)mn, g.zyx + 3 * m0, g.nv + 3 * m0, g.q + m0, g.cnt);
+        RG_CK(cudaGetLastError());
+    }
     unsigned long long c[2]; RG_CK(cudaMemcpyAsync(c, g.cnt, sizeof c, cudaMemcpyDeviceToHost, g.sk));
     RG_CK(cudaMemcpyAsync(q, g.q, M, cudaMemcpyDeviceToHost, g.sk));
     RG_CK(cudaStreamSynchronize(g.sk));

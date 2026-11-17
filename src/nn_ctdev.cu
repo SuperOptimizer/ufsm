@@ -9,13 +9,16 @@
 #include <stdlib.h>
 
 typedef struct { cudaStream_t st; uint8_t *dch, *dh, *hch; int dev; } ctw_t;
-extern "C" void *nn_ctw_new(int dev) {
+/* hi: the worker's stream at the device's greatest priority (recto-sp: its gathers go ahead of the profile kernel's next blocks) */
+extern "C" void *nn_ctw_new_prio(int dev, int hi) {
     ctw_t *w = (ctw_t *)calloc(1, sizeof *w); if (!w) return nullptr;
     w->dev = dev; cudaSetDevice(dev);
-    if (cudaStreamCreateWithFlags(&w->st, cudaStreamNonBlocking) != cudaSuccess || cudaMalloc(&w->dch, 1u << 21) != cudaSuccess ||
+    int lo = 0, gp = 0; if (hi && cudaDeviceGetStreamPriorityRange(&lo, &gp) != cudaSuccess) { cudaGetLastError(); hi = 0; }
+    if ((hi ? cudaStreamCreateWithPriority(&w->st, cudaStreamNonBlocking, gp) : cudaStreamCreateWithFlags(&w->st, cudaStreamNonBlocking)) != cudaSuccess || cudaMalloc(&w->dch, 1u << 21) != cudaSuccess ||
         cudaMalloc(&w->dh, 1u << 21) != cudaSuccess || cudaMallocHost(&w->hch, 1u << 21) != cudaSuccess) { cudaGetLastError(); free(w); return nullptr; }
     return w;
 }
+extern "C" void *nn_ctw_new(int dev) { return nn_ctw_new_prio(dev, 0); }
 extern "C" void nn_ctw_free(void *h) {
     ctw_t *w = (ctw_t *)h; if (!w) return;
     cudaSetDevice(w->dev); cudaStreamSynchronize(w->st); cudaFree(w->dch); cudaFree(w->dh); cudaFreeHost(w->hch); cudaStreamDestroy(w->st); free(w);

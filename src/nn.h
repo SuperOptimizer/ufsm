@@ -534,6 +534,7 @@ void nn_lat_heads_place(const void *lg, int lh16, int d, int h, int w, int nh, c
 /* predict's device-resident CT window (src/nn_ctdev.cu): a reader worker's stream + device / host chunks; nn_ctw_put gathers one decoded
    chunk (device substreams dm, the host chunk too when host) into the window [wo, wo + wn) clipped to the array shape sh, and waits */
 void *nn_ctw_new(int dev);
+void *nn_ctw_new_prio(int dev, int hi);   /* hi: its stream at the greatest priority */
 void nn_ctw_free(void *w);
 uint8_t *nn_ctw_host(void *w);
 uint8_t *nn_ctw_dev(void *w);

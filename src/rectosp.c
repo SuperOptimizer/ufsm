@@ -17,6 +17,7 @@
 #include "rectogpu.h"
 /* predict's device chunk gathers (src/nn_ctdev.cu, nn.h); weak: a binary without the CUDA objects runs the CPU path */
 void *nn_ctw_new(int dev) __attribute__((weak));
+void *nn_ctw_new_prio(int dev, int hi) __attribute__((weak));
 void nn_ctw_free(void *w) __attribute__((weak));
 uint8_t *nn_ctw_host(void *w) __attribute__((weak));
 uint8_t *nn_ctw_dev(void *w) __attribute__((weak));
@@ -442,7 +443,7 @@ int cmd_recto_sp(int argc, char **argv) {
         if (gon && devdec) {   /* chunk workers: UFSM_RECTOSP_GPUW (16) on the GPU decoder (UFSM_GPU_DECODE=1 on device gdev unless set), --threads on the CPU */
             char dv[16]; snprintf(dv, sizeof dv, "%d", gdev); setenv("UFSM_GPU_DECODE", "1", 0); setenv("UFSM_GPU_DECODE_DEV", dv, 0);
             const int ng = getenv("UFSM_RECTOSP_GPUW") ? atoi(getenv("UFSM_RECTOSP_GPUW")) : 16, nw = (ng > 0 ? ng : 0) + nt < 64 ? (ng > 0 ? ng : 0) + nt : 64;
-            void **ctw = calloc(nw, sizeof *ctw); int ok = ctw != nullptr; for (int t = 0; t < nw && ok; t++) ok = (ctw[t] = nn_ctw_new(gdev)) != nullptr;
+            void **ctw = calloc(nw, sizeof *ctw); int ok = ctw != nullptr; for (int t = 0; t < nw && ok; t++) ok = (ctw[t] = nn_ctw_new_prio ? nn_ctw_new_prio(gdev, 1) : nn_ctw_new(gdev)) != nullptr;   /* (their gathers ahead of k_rsp: rsg_run) */
             if (ok) for (int b = 0; b < 2; b++) { GP[b].ctw = ctw; GP[b].nctw = nw; GP[b].ngpuw = ng > 0 ? (ng < nw ? ng : nw) : 0; }
             else { for (int t = 0; ctw && t < nw; t++) if (ctw[t]) nn_ctw_free(ctw[t]); free(ctw); fprintf(stderr, "recto-sp: no device chunk workers: the source decoded on the host\n"); }
         }
