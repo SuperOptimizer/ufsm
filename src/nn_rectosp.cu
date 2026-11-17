@@ -13,7 +13,7 @@
 
 #define RG_CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "recto-sp gpu: %s (%s:%d)\n", cudaGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
 
-static struct {
+static struct {   /* mgpu: process (one recto-sp run per process; its helper / chunk threads only upload into the ring) */
     int dev, ok; int64_t RZ, ny, nx; uint8_t *ring;
     long G;                                 /* resident threads (the grid's cap) */
     int32_t *zyx; uint8_t *t6, *q; double *nv; int Mcap, nres; unsigned long long *cnt;   /* nres: k_rsp blocks resident at once */

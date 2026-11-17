@@ -6,6 +6,56 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## recto-sp on the GPU: byte-identical fp64 profiles, the source decoded once into a device ring (2026-11-17, branch rectogpu-20261117)
+
+recto-sp (unroll stage rectosp: the fit fields' sp blended with the m7 recto-hit spacing, --half-um 400 --half2-um 800 --blend 0.3) was the
+second-largest unroll stage, all on the CPU, competing with the ink predict that runs beside it. `--gpu N` (default 0; -1 the CPU; the CPU
+path stays for --cls, no device, or too little device memory for the ring) now runs the per-cell part on the GPU (src/nn_rectosp.cu).
+Its sp and rsp chunk files are **identical** to master's on both scrolls (diff -r). test_recto_gpu (gpu) compares them byte for byte on a
+noisy lossy synthetic: 3 flag sets, 5 row blocks, ring wrap, stride 3 with --rows, the host-decode path, and zero runs.
+
+- **Exact fp64.** The kernel mirrors rs_axis / rs_tri / rr_peaks / rs_rows operation by operation in double. nn_rectosp is in
+  UFSM_EXACT_CU (-fmad=false in every build; a contracted FMA moves a peak position by an ulp and flips a median pick). rr_peaks' taps
+  come from rr_taps (rectoruler.c), so they are the same doubles. The tap sum for a full window is added on the device in rr_peaks'
+  order (host fast math may reassociate). The comparisons are moved to fp32 only where they are provably the same: minima of floats,
+  `float < double` against the nearest float bound (f_up / f_dn).
+- **fp64 is the floor.** A consumer card runs fp64 at 1/64 rate (ncu: fp64 pipe 84 % busy). The pipe charges a warp instruction the same
+  whatever its active lanes. So the kernel is one warp per cell with compacted work lists (ballot) in full warps:
+  - the samples to interpolate; eight zero corners give +0 at once
+  - the smoothed samples whose window is not all zero
+  - rr_peaks' candidates, which are independent: every sample its plateau skip passes over equals tmp[i] and is never a candidate. They
+    search their prominence in fp32 and are compacted in order.
+
+  Lane 0 merges the hits and picks the median. The cell axes run in their own kernel, one thread each (computed 32x per warp they were
+  40 % of the fp64 instructions). The grid is sized to the resident blocks (a grid-stride grid of 2.4 waves had a partial last wave).
+  One 1M-cell block went 394 -> 244 ms. Each sample still costs ~70 fp64 ops: the 0332 kernel total is ~30 s on a 5060 Ti.
+- **The source decoded once.** The CPU path decodes each 64-row block's source box with an 85-voxel halo each side: ~2.3x the volume.
+  The GPU path keeps the source as a device z ring of the run's fixed y / x box: 0332 512 x 2959 x 3183 = 4.8 GB, 1667 5.5 GB; RZ is a
+  multiple of 128 and one block step deeper than a block needs. Each block adds only its new slices, read up to the source's chunk-row
+  end, as whole 128^3 chunks gathered on the device (predict's nn_ctw_put / gpudec). It zeroes the slices first, so fill chunks
+  (57 % on 0332) cost nothing. While our kernel holds the GPU, the GPU decoder hands most chunks to the CPU (~16k host, ~500 device on
+  0332); the bytes are identical either way. The host-decode-and-upload variant (UFSM_RECTOSP_DEVDEC=0) uploaded 74 GB of raw slices
+  for 0332: 38 s of pageable copies.
+- **Pipeline.**
+  - A helper thread prepares block k+1 while block k's kernel runs. Its source part and its field part run on two threads. The field
+    part loads rows chunk-aligned and keeps them for the next block, loading t0..t5 and w only (fit_fields_skip_planes bit 4: no pc / ps).
+  - The shard row's net sp read, the blend (threaded) and the sp / rsp shard writes (two arrays at once) run in a writer thread behind
+    the next row's blocks. This also speeds the CPU path (0332 192 -> 129 s, same bytes).
+  - A pass-0 shard that the box covers entirely no longer re-reads the input sp.
+
+| warm m7 cache, 16 threads, card 1 shared | master (CPU) | this branch --gpu -1 | this branch GPU |
+|---|---|---|---|
+| PHerc0332 (3943 x 1392 x 1504 fields) | 192 s, 1864 CPU s, 9.6 GB | 129 s, 1595 CPU s | **38.7-45.0 s**, 500 CPU s, 6.3-6.7 GB |
+| PHerc1667 (4635 x 1568 x 1616) | 169 s, 1630 CPU s, 11.2 GB | 151 s, 1754 CPU s | **54.6-60.6 s**, 610-655 CPU s, 7.3-7.9 GB |
+
+The GPU run's time splits as:
+- blocks (kernel) 31-35 s
+- waiting for the helper: 6 s on 0332, 12-16 s on 1667 (its field loads take 35 s there)
+- the writer's shard writes: 19-23 s on 0332, 35-40 s on 1667, overlapped except for the last row
+
+Left: the 1667 field decode (t0..t5 + w of 11.7 G cells; only 1/64 of them are sampled, but the codec decodes whole chunks), the
+lossless shard encodes, and the fp64 kernel. A lazy profile (±half first, the ±half2 tail only where the inner window has fewer than
+--min-int intervals, exact when hit clusters separated by >= sep bound the window) would cut ~1/3 of the kernel: not done.
 ## ink-ext --ct-floor (zero CT below T before normalisation): null, not merged; hecate24 MX5 is slower (2026-11-17)
 
 Question (user): would it help to zero air/void that is neither papyrus nor masked (low CT values)? Test: in ink-ext's render,

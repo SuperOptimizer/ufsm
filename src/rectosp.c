@@ -168,8 +168,8 @@ static void rs_rows(void *ctx, int a0, int a1, int t) {
    read ends on the source's chunk rows, the next block starts where it ended), uploaded while the previous block's kernel runs (the
    ring is one block step deeper for that). The main thread runs the kernel and writes the codes into the shard row's rsp exactly as
    rs_rows does. */
-int g_rectosp_gpu_blocks;   /* row blocks the last recto-sp ran on the GPU (tests) */
-long long g_rectosp_dev_chunks, g_rectosp_ring_chunks;   /* source chunks it decoded on the GPU decoder / gathered into the ring on the device (-1: the host decode path) (tests) */
+int g_rectosp_gpu_blocks;   /* mgpu: debug */   /* row blocks the last recto-sp ran on the GPU (tests) */
+long long g_rectosp_dev_chunks, g_rectosp_ring_chunks;   /* mgpu: debug */   /* source chunks it decoded on the GPU decoder / gathered into the ring on the device (-1: the host decode path) (tests) */
 typedef struct { int sr, q0, q1, a0; int64_t so[3], sn[3], d0, d1; } rs_gblk;   /* shard row, rows, source box, ring slices to add */
 typedef struct {
     const char *in; z3 *zs; int nt, H, W, S, shp0; long long org[3], zoff0;
