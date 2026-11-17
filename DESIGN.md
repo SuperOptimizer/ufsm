@@ -51,6 +51,10 @@ level 0 and the model / output passes fell back to the CPU; 36-79 s on a free ca
 - **recto-sp.** rr_peaks takes its 2R + 1 gaussian taps from a table built per call instead of an exp per tap per sample (exp
   was a third of the CPU). 1024 x 2048^2 0332 box: 294.8 -> 175.7 CPU s (25.6 -> 18.6 s), byte-identical; test_recto compares the
   smoothed floats with the per-sample exp at 5 sigmas (one past the 256-tap stack table).
+- **1667 (box at 0, local CT), fields + recto-sp** (desk, card 1 shared): fields 872 s (grid 0 373 s / 578 windows, half grid 272 s /
+  567 windows, blend 225 s). The old half grid planned 3524 windows (+752 air) on the same box: ~2290 s at the old 0.65 s a window,
+  so the old fields stage was ~2990 s (3.4x). recto-sp on its fields, warm m7 cache: 280 -> 157 s (2433 -> 1750 CPU s), byte-identical;
+  max RSS 8.1 -> 11.3 GB (two source blocks in flight).
 - **Boxes at 0** (1667, Paris 4 and every box starting at a volume face): the half-stride grid's box would start 256 voxels before
   the volume, which predict refused, so unroll.sh kept the old box there and the 6x window runs. predict now accepts a box up to
   a shard before the volume with --grid-origin (that CT reads as fill, as every window crossing a face already did), and unroll.sh
