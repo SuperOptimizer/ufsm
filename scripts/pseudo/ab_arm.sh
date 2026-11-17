@@ -50,3 +50,12 @@ tp=$!; echo $tp > "$o.pid"
     sleep 60; done ) &
 wait $tp; rc=$?
 echo "$(date '+%F %T') $NAME exit rc=$rc, last step $(awk '/^step +[0-9]+ / {s=$2} END {print s + 0}' "$o.log")" | tee -a "$o.launch.log"
+# Appended arms (lead 11-17: arm C after B, before try9's resume; the running ab_chain cannot be edited): after a clean exit, a file
+# $R/NAME.next with one line "NEXTNAME SRCJ [EXTRA...]" runs that arm from the same SNAP here, after this arm's GPU locks are released.
+if [ "$rc" -eq 0 ] && [ -s "$R/$NAME.next" ]; then
+  for f in 7 8 9 10; do eval "exec $f>&-"; done
+  read -r -a NX < "$R/$NAME.next"
+  echo "$(date '+%F %T') appended arm ${NX[0]} after $NAME: ${NX[*]}" | tee -a "$R/pab-chain.log"
+  bash "$0" "${NX[@]:0:2}" "$SNAP" "${NX[@]:2}"; nrc=$?
+  echo "$(date '+%F %T') arm ${NX[0]} (appended): rc $nrc, $(grep -E '^step +[0-9]+ ' "$R/${NX[0]}.log" | tail -1 | cut -c1-120)" | tee -a "$R/pab-chain.log"
+fi

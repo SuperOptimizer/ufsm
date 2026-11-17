@@ -41,8 +41,8 @@ for rel in "${vols[@]}"; do
   root=$CTROOT; [ "$MIRROR" = 1 ] && root=$MIR
   jq -n --arg name "$scroll-$um-u" --arg root "$root" --arg ct "$key" --argjson um "$um" --argjson lo $lo --argjson hi $hi \
         --arg hold "$HOLD" --argjson rej "$rej" --arg ax "$ax" \
-        '{name: $name, scope: "global", root: $root, ct: $ct, um: $um, iso: 64, min_level: $lo, max_level: $hi, weight: 1, ct_only: 1,
-          holdout_file: $hold, holdout_reject: $rej} + (if $ax != "" then {axis: $ax} else {} end)' >> $tmp
+        '{name: $name, scope: "global", root: $root, ct: $ct, um: $um, iso: 64, min_level: $lo, max_level: $hi, weight: 1, ct_only: 1} + (if ($rej | length) > 0 then {holdout_file: $hold, holdout_reject: $rej} else {} end) + (if $ax != "" then {axis: $ax} else {} end)' >> $tmp
+  # (no holdout_file when no box of HOLD is on this CT: holdout_strict makes a holdout file that matches nothing fatal; 11-17)
   n=$((n + 1))
 done
 jq --slurpfile u $tmp '.sources += $u | .note = ((.note // "") + " + ssl-sources.sh: \($u | length) ct_only volumes (excluded '"$EXCL"')")' "$IN" > "$OUT"
