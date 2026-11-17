@@ -27,12 +27,16 @@ rendered per wrap on the same up/ surfaces.
 - inkpod on the strip stripes (inkscore.sh) gives 0.581 held-out / 0.839 rest, the same as per wrap and as the audit's LV2 row
   (0.589 / 0.850). So this is not misregistration: the latent ink head fits its training labels and does not carry to the 1667
   held-out boxes. reader3 / argus2 rank the same way as on the 24 crops.
+- Conclusion: on our own unroll's surfaces, the frozen 2-D teachers carry ink to held-out 1667 papyrus (reader3 0.858) and inkpod does
+  not (0.582, rest 0.84). reader3 is the best single production ink there. argus2 is equivalent within the CI, ink9um 0.04 lower. The
+  production-ink switch is the user's call.
 - hecate24 had no 1667 score. Even limited to the held-out ink boxes (70 wrap-box crops, 16 cm2, 253k samples; boxsel.py) it was cancelled
   with the pod. Paris 4 was not inked (its pod CT / ink were deleted when it was cancelled).
 
 **0332 papyrus renders** (`ink-compare --papyrus`, gain 1.5, floor median, tuned once on w048; the CT layer from `ink-ext
 --render-only --ct-tif`): /vesuvius/ufsm/podun/PHerc0332/ink/{reader3,ink9um,argus2}_pap (60 wraps <= 4000 px plus 2000 px
-crops of w046-w051 at reader3's strongest-ink windows), raw maps beside them, hecate24 on w047 only (about 90 min a 45 cm2 wrap at
+crops of w046-w051 at reader3's strongest-ink windows), raw maps beside them, hecate24 on w047 only (papyrus render redone on the desk: ink/hecate24/w047_hecate24_pap{,_g1}{,_crop}.jpg; hecate24 is near-binary, p50
+0.012 / p95 0.87, so gain 1 reads better than the shared 1.5; about 90 min a 45 cm2 wrap at
 2.4 um on the shared pod GPU, level 0 over https). `ink-compare --best-crop` goes through the in-memory path (render.c), which
 ignores --papyrus: find the window with --best-crop, render it with --crop. Crops on another flattening of the same scroll:
 `/vesuvius/ufsm/argus/mapcrop.py` moves a crop through its 3-D centre onto the new wraps (self-test: identical windows, 0 um).
@@ -1369,7 +1373,8 @@ its STATUS.md).
   https-bound box (compute 2.7x per window on local CT). Flags only, no default change.
 - **Unroll #1, the spiral hand by model coherence** (count-field --model-only, --dir +1 vs -1): 1667 0.0986 vs 0.1731 (-1, the
   published hand, by 0.075 > DIRCOH_MARGIN 0.05); Paris 4 -1 0.0062, +1 pending (OOM-killed twice beside other jobs in the dev slice).
-- **Unroll #4:** held-out 1667 ink AUC 0.867 at LV 2 (inkpod 15000). **#21** (LV 1) deferred: the whole-scroll level-1 predict wrote
+- **Unroll #4:** 1667 ink AUC at LV 2 (inkpod 15000): 0.867 was not a held-out number. Corrected 2026-11-17: held-out 0.589 (the closing
+  rows below), 0.581 on the try9-6250 pod unroll's stripes, 0.582 per wrap (see "2-D ink teachers on the try9-6250 pod unrolls"). **#21** (LV 1) deferred: the whole-scroll level-1 predict wrote
   443 GB for one of its two grids and filled /vesuvius; it needs the held-out boxes only.
 - **Ugeom #4** (count-field ref variants, 1667, 70 C boxes): ids base 0.794, --wide-dens 0.5 0.811, 0.9 0.819, --phase-w 2 0.794: +0.026
   on one scroll is at the noise edge, no default change. **#5** (Paris 4 packed): base PH ids 0.234, --rho-pow 0.2,150 0.199; the other
