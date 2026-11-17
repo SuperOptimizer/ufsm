@@ -40,8 +40,16 @@ LK=; [ -z "${NOLOCK:-}" ] && [ -n "${LOCK:-}" ] && [ "${CPU:-0}" != 1 ] && LK=$L
 # through the gpuq priority queue (scripts/gpuq.sh; PRIO bg by default: at every box / slab step it lets waiting jobs in, a "now"
 # check first); plain flock users of the same lock stay excluded
 GQ=$H/gpuq.sh; [ -e $GQ ] || GQ=$H/../gpuq.sh; GPUQ_LOCK=$LOCK; . $GQ
-lk() { [ -n "$LK" ] && gpuq_acquire ${PRIO:-bg} wbench-$TAG; return 0; }
-ulk() { [ -n "$LK" ] && gpuq_yield; return 0; }
+# The desk's shared GPU locks too (lead 11-17: the wbench lock alone let fit --gpu N run through other agents' exclusive timing
+# windows): per GPU step flock -s /vesuvius/ufsm/opt/gpu<N>.lock (trainers hold it exclusively) and -s /tmp/ufsm-suite-locks/gpu<N>.excl
+# (run_suite's shared lock; bench bursts take it exclusively), released at every box boundary like the wbench lock. DLOCKS overrides
+# the list (comma separated; "" = none); off by default where neither file's directory exists (laptop, pods).
+DLOCKS=${DLOCKS-$( [ "${CPU:-0}" != 1 ] && [ -z "${NOLOCK:-}" ] && [ -d /vesuvius/ufsm/opt ] && [ -d /tmp/ufsm-suite-locks ] && echo /vesuvius/ufsm/opt/gpu$GPU.lock,/tmp/ufsm-suite-locks/gpu$GPU.excl)}
+DLFD=()
+dlk() { local f fd; [ ${#DLFD[@]} -gt 0 ] && return 0; for f in ${DLOCKS//,/ }; do exec {fd}>> "$f" || continue; flock -s $fd; DLFD+=($fd); done; return 0; }
+dulk() { local fd; for fd in "${DLFD[@]}"; do exec {fd}>&-; done; DLFD=(); return 0; }
+lk() { dlk; [ -n "$LK" ] && gpuq_acquire ${PRIO:-bg} wbench-$TAG; return 0; }
+ulk() { dulk; [ -n "$LK" ] && gpuq_yield; return 0; }   # (the desk locks only around GPU steps: lk takes them again)
 log "wbench $TAG ckpt $CK fields $FT fitter $FCFG ($BIN $FIT) site $SITE gpu $GPU"
 . $H/ckid.sh; ckid_check $O "$CK" || exit 2; echo "$CKID" > $WB/res/$TAG.ckid; log "checkpoint id $CKID"
 echo "$CK" > $O/ckpt; echo "$BIN $FIT" > $O/fitter
@@ -247,5 +255,5 @@ if [ "$SLABS" = 1 ]; then
     [ -z "$FIELDS" ] && [ "$KEEP" = 0 ] && rm -rf $f
   done
 fi
-[ -n "$LK" ] && gpuq_release
+dulk; [ -n "$LK" ] && gpuq_release
 log "wbench $TAG finished"
