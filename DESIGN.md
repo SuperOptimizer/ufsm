@@ -75,9 +75,23 @@ call's event; UFSM_W4_PINNED=0 the old path). Same bytes (test_w4dev, test_slot_
 the window-start idle gaps > 10 ms went 210 -> 188 ms a window (nsys, the same capture), the wall clock within noise (5.527 against
 5.506 / 5.557 s for the lat_adj binary before and after it). lat_adj_xy in that capture: 458 -> 41 ms a window.
 
-**What is left** (result-neutral): the label-warp stage's ~190 ms of idle GPU at the window start (its 453 MB D2H / H2D round trips of
-the ink / phase planes through the pinned label planes sit on the copy stream ahead of the forward's inputs), fstem_fwd_k at ~70 GB/s of
-logit writes (417 ms), and the convs (60 %, tuned: no fusion left, sparse24-20261113). Result-changing: --sparse24 mode 3 (~5 % of this
+**The copy stream at the highest priority.** With the trainer thread unblocked, every label-stage operation was issued at the window
+start, yet the label planes were done only ~180 ms after the forward (nsys, the issue times of the copy stream's work): the w4 rebuild's
+~60 small kernels (w4_runs_k / w4_out_k, ~1 ms each) and the warps got SMs only between the forward's conv kernels, one per gap, and the
+head's first slab waits for them (ev_lab). copy_stream() is now created at cudaDeviceGetStreamPriorityRange's greatest priority
+(UFSM_COPY_PRIO=0: the default priority): idle gaps > 10 ms 186 -> 41 ms a window, kernels busy 96.4 -> 99.0 % of the capture, step
+lines identical, 5.464 -> 5.322 s a window (two arms 5.321 / 5.322): **-2.6 %**.
+
+**The head's weight gradient, 4 output tiles a block.** conv_bwd_w1_tc_k (256 MX-fp4 channels -> 160 outputs on the cell grid) ran one
+block per (8-output tile, 32-channel input block): every x tile was dequantised, GroupNorm-ed and SiLU-ed 20 times. NT 4 keeps 4 column
+tiles on one staged act(x) tile (the reduction buffer overlays the operand tiles after the loop); per (ci, co) the voxel order, the
+warps' order and the blocks are those of NT 1, so the sums are the same (test_hgscale: byte equal, 256 -> 160 and 32 -> 16; UFSM_W1_NT=1
+the old path). 189 -> 146 ms a window; 5.497 -> 5.453 s (**-0.8 %**).
+
+Together on the fixture: **5.921 -> 5.321 s a window (-10.1 %)** against try9's binary, every step line identical.
+
+**What is left** (result-neutral): fstem_fwd_k at ~70 GB/s of logit writes (417 ms; ~35 KB of shared memory a 128-thread block, so 2-3
+blocks an SM; ncu could not profile it inside the trainer under mcudahw), and the convs (60 %, tuned: no fusion left, sparse24-20261113). Result-changing: --sparse24 mode 3 (~5 % of this
 step), skip-empty above thr 0. Not worth it: the optimizer (1.2 %), attention (0), CUDA graphs (launch gaps 0.1 %).
 
 ## Flatten solver A/B: the GPU CG matvec in fp32 by default; relative-residual stop and decimation by vertex count dropped (2026-11-17, branch flatfp32-20261117)
