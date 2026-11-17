@@ -70,6 +70,25 @@ count-field `--rho-r R0:K0,R1:K1,...` (mm from the umbilicus, piecewise linear, 
 0.75 exactly (0 turn), decreasing radii refused. The try9 K / --rho-r arms on the pod were lost with it (11-17 evening); they need
 try9 fields regenerated on card 1.
 
+u1 arms (2026-11-17 evening, desk: u1-13000 fields of the +1 run at dir -1; ref level on the CPU, slabs + join + check on card 1).
+The top 5 mm is the scroll's broken top end at the end of the scan (CT to l2 z 8398 = the box top): level-3 slices at l2 z 4000
+whole, 7400 mottled with a dense core mass, 7800 frayed, 8200 a broken arc; unroll-qa tiles above l2 z 7680 conf_lo 0.77-0.98 and
+ctr_lo 0.76-0.91 (body ~0.5). So scrolls.tsv zr 512,7680 for PHerc0332, and cf-demod prints the body's excursion (bands with >= 1/2
+the fullest band's weight) apart from the ends (u1 base: whole 1.91, body 0.22, below +0.29, above +1.63); unroll.sh logs it.
+| arm (slabs + join) | tile pass | conf_lo / pw48 / w4 over | real/dup/merged | CT/turn | rct | wraps | body drift |
+|---|---|---|---|---|---|---|---|
+| base | 0.261 | 27/23/15 | 65/8/3 | 1.028 | 1.026 | 72 | 0.22 |
+| --rho-r 2:1,3:1.2,4:1.25,5:1 | 0.174 | 27/26/16 | 69/8/0 | 1.006 | 1.015 | 73 | 0.28 |
+| --phase-w 0.25 | 0.239 | 27/26/17 | 66/8/3 | 1.005 | 1.012 | 73 | 0.22 |
+| --phase-w 0.25 + that --rho-r | 0.217 | 27/27/20 | 72/8/0 | 0.975 | 0.980 | 76 | 0.25 |
+Ref level (CT/turn, body drift): base 1.042 / 0.22, --rho-solve 1.1 0.974 / 0.33, 1.2 0.916 / 0.32, --phase-w 0 0.949 / 0.49,
+--phase-w 1 1.066 / 0.33, --lambda 1e-6 1.041 / 0.86. A +10 % K moves the count ~6.5 % (the phase term holds it). No lever beats the
+base on tile pass; conf_lo (27/48 tiles over) is the same in every arm: the network is unsure on half the tiles. The objectives
+disagree: the corrections toward the CT's sheet count (merged 3 -> 0) fail more pw48 / w4 tiles, which score agreement with the
+network's own phase / winding mod 4, themselves counting only 0.77 turns per fitted turn here. u1 0332 default: the base ref + zr.
+The fix is model-side: 0332 body regions where wrap-check and the fit agree (r 5-10 mm) into the pseudo-label loop, a few human
+sheet anchors at r 2-4 mm where every net undercounts. try9's 20 % undercount: K / --rho-r arms on regenerated try9 fields (pod).
+
 ## Predict forward: where the GPU time goes; the fit-field head per z chunk (1152 / 64 fields windows on a 16 GB card) (2026-11-17, branch predfwd-20261117)
 
 Profile on a quiet card 1 (0332 level 2, CT from a local cache, 32 windows; `UFSM_PRED_PROF`, `UFSM_PTICK`, nsys per-(kernel, grid, block)
