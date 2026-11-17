@@ -6,6 +6,40 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## ink-ext --ct-floor (zero CT below T before normalisation): null, not merged; hecate24 MX5 is slower (2026-11-17)
+
+Question (user): would it help to zero air/void that is neither papyrus nor masked (low CT values)? Test: in ink-ext's render,
+every sampled u8 CT value < T becomes 0 before the model's own normalisation (default 0 = off). Scored on the 24 crops (tvar.sh),
+card 1. Patch kept at /vesuvius/ufsm/inksdk/work/ctfloor.patch (branch ctfloor-20261116, not merged).
+
+| model    | T  | 0139  | 1667  | Paris4 | all    | paired vs T 0 (pairci, 24 crops) |
+|----------|----|-------|-------|--------|--------|----------------------------------|
+| reader3  | 0  | .9664 | .9290 | .9168  | .9271  |                                  |
+| reader3  | 20 | .9664 | .9290 | .9168  | .9271  | +0.0000 (no sampled value < 20)  |
+| reader3  | 40 | .8641 | .8994 | .8929  | .8892  | -0.0379 [-0.0683, -0.0132]       |
+| reader3  | 60 | .9213 | .9227 | .8983  | .9062  | -0.0209 [-0.0328, -0.0104]       |
+| reader3  | 80 | .8956 | .9126 | .8801  | .8881  |                                  |
+| ink9um   | 0  | .9818 | .9152 | .9019  | .9175  |                                  |
+| ink9um   | 20 | .9817 | .9152 | .9019  | .9175  |                                  |
+| ink9um   | 40 | .8712 | .8788 | .8143  | .8345  | -0.0829 [-0.1152, -0.0530]       |
+| ink9um   | 60 | .9484 | .8666 | .8675  | .8808  |                                  |
+| ink9um   | 80 | .9185 | .8645 | .8522  | .8653  |                                  |
+| hecate24 | 0  | .9835 | .9680 | .9072  | .9301  |                                  |
+| hecate24 | 20 | .9806 | .9560 | .9075  | .9278  | -0.0023 [-0.0051, -0.0001]       |
+| hecate24 | 40 | .8782 | .7224 | .8103  | .8069  | -0.1231 [-0.1611, -0.0920]       |
+| hecate24 | 60 | .8543 | .6867 | .7334  | .7458  |                                  |
+| hecate24 | 80 | .8003 | .6532 | .5768  | .6268  |                                  |
+
+Every T > 0 loses or ties; best T is 0, so the z-sum combo stays at T 0 (.9449). Why: the nets were trained on unfloored CT and
+read the air/papyrus contrast and low-density texture (robust_mad / z-score normalisation shifts with the floor too); the air peak
+sits at 39-55 and the air/papyrus valley at 57-73 (airiso's air_iso.tsv), so T 40-80 cuts into the papyrus fringe where ink sits.
+A floor would have to be learned in training, not applied to frozen teachers.
+
+hecate24 MX-fp4 speed (bench region 1500,900,995,260 of 1667 w013, 102.98 Mpx at 2.399 um, card 1): fp16 846.9 s (0.122 Mpx/s,
+net 833.5 s, 7.4 tiles/s), UFSM_XNET_MX=5 1298.2 s (0.079 Mpx/s, net 1280.4 s, 4.8 tiles/s). MX5 holds AUC (-0.0002 [-0.0009,
++0.0004]) but is 1.53x slower on these 62x64x64 Co=64 3x3x3 convs, so hecate24 stays fp16. Render is 30-32 s of the wall
+(level-0 cache on disk), so the net is the whole cost.
+
 ## Unroll perf 3: no context on unlisted cards; the ref's chunk rows fixed (2026-11-17, branch unrollperf3-20261117)
 
 - SGPU (perf 2) pinned the stages without a --gpu, but a predict on --gpu 1 still opened a 128 MiB context on card 0 (the training card;
