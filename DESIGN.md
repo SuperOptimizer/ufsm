@@ -24,6 +24,9 @@ Originally no teacher models; since 2026-11-15 published ink networks run as tea
 - src/volcomp_fast.h vllx_decode_sub_sink, the DENSE loop: both tANS lanes in registers, a voxel pair per step, the context model by
   table: ~25 % fewer cycles per lossless chunk (decode only, 3.9 -> 3.0 G cycles over the 32 ink chunks); test_volcomp_vll decodes
   every synthetic chunk through the sink, whole and in a box cutting blocks.
+- ink-blend's voxel loop for two inputs (the unroll's grids): the row's wz wy product hoisted (the same (wz wy) wx order, volatile), the
+  masks per row: a further 13-17 % of a blend's cycles (0332 mini box, ink / c12 / c13: 135 -> 118, 149 -> 125, 150 -> 124 G cycles),
+  outputs identical (md5 of every file).
 - Predict, latink recipe, 32 windows: user CPU 240 -> 182 s, wall 12-14 s either way (GPU-bound); outputs identical. ink-blend of one
   head (0332 mini box, g0 + g256): 765 / 774 -> 639 / 650 G cycles (-17 %), outputs identical (all three heads compared).
 ## 2-D ink teachers in MX-fp4: quantiser options, deterministic GroupNorm, accuracy floor (2026-11-16, branch fp4teach-20261116)

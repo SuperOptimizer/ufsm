@@ -25,6 +25,19 @@ static void ib_rows(void *a, int z0, int z1, int t) {
     (void)t; const ib_job *J = a; const int64_t ny = J->n3[1], nx = J->n3[2];
     for (int z = z0; z < z1; z++) for (int64_t y = 0; y < ny; y++) {
         const size_t r = ((size_t)z * ny + y) * nx;
+        if (J->n == 2) {   /* (the unroll's two grids) the same arithmetic in the same order: wz wy per row, then x wx */
+            volatile double wzy0v = (double)J->wz[z] * J->wy[y], wzy1v = (double)J->wz[(size_t)J->S + z] * J->wy[(size_t)J->S + y];
+            const double wzy0 = wzy0v, wzy1 = wzy1v;
+            const float *wx0 = J->wx, *wx1 = J->wx + J->S; const uint8_t *i0 = J->in[0] + r, *i1 = J->in[1] + r;
+            const uint8_t *m0 = J->mk[0] ? J->mk[0] + r : nullptr, *m1 = J->mk[1] ? J->mk[1] + r : nullptr; uint8_t *o = J->out + r;
+            for (int64_t x = 0; x < nx; x++) {
+                double s = 0, w = 0;
+                if (!m0 || m0[x]) { const double wi = wzy0 * wx0[x]; s += wi * i0[x]; w += wi; }
+                if (!m1 || m1[x]) { const double wi = wzy1 * wx1[x]; s += wi * i1[x]; w += wi; }
+                o[x] = w > 0 ? (uint8_t)fmin(255.0, s / w + 0.5) : 0;
+            }
+            continue;
+        }
         for (int64_t x = 0; x < nx; x++) {
             double s = 0, w = 0;
             for (int i = 0; i < J->n; i++) {
