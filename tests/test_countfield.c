@@ -234,6 +234,18 @@ int main(void) {
         CHECK(cmd_count_field(20, a8) == 0, "count-field --rho-solve 0.75 failed");
         char *a9[] = {"ufsm", "count-field", in, o9, "--R", "0", "--dir", "1", "--pool", "1", "--threads", "4", "--rmin-um", "0", "--cf-gpu", "0", "--rho-map", rmap, "--pool-cache", pc, nullptr};
         CHECK(cmd_count_field(20, a9) == 0, "count-field --rho-map failed");
+        /* --rho-r (fix0332 11-17): a flat radial profile 0.75 == --rho-solve 0.75 (same solve, K per cell); a bad profile refused */
+        char o10[640]; snprintf(o10, sizeof o10, "%s/out_rhor", dir);
+        char *a10[] = {"ufsm", "count-field", in, o10, "--R", "0", "--dir", "1", "--pool", "1", "--threads", "4", "--rmin-um", "0", "--cf-gpu", "0", "--rho-r", "0:0.75,5:0.75", "--pool-cache", pc, nullptr};
+        CHECK(cmd_count_field(20, a10) == 0, "count-field --rho-r failed");
+        char o11[640]; snprintf(o11, sizeof o11, "%s/out_rhor_bad", dir);
+        char *a11[] = {"ufsm", "count-field", in, o11, "--R", "0", "--dir", "1", "--pool", "1", "--threads", "4", "--rmin-um", "0", "--cf-gpu", "0", "--rho-r", "2:1.1,1:1.2", "--pool-cache", pc, nullptr};
+        CHECK(cmd_count_field(20, a11) != 0, "count-field --rho-r with decreasing radii accepted");
+        { snprintf(pth, sizeof pth, "%s/wc.f32", o10); size_t n10 = 0; float *w10 = read_f32(pth, &n10); snprintf(pth, sizeof pth, "%s/wc.f32", o8); size_t n8 = 0; float *w8 = read_f32(pth, &n8);
+          CHECK(w10 && w8 && n10 == n && n8 == n, "no wc.f32 (--rho-r / --rho-solve)");
+          if (w10 && w8 && n10 == n && n8 == n) { double d = 0; for (size_t i = 0; i < n; i++) if (w8[i] == w8[i]) d = fmax(d, fabs(w10[i] - w8[i]));
+              printf("test_countfield: --rho-r flat 0.75 vs --rho-solve 0.75 %.2e turn\n", d); CHECK(d < 1e-5, "--rho-r flat vs --rho-solve: %.3e turn", d); }
+          free(w10); free(w8); }
         const char *ov[3] = {o7, o8, o9}; float *wv[3] = {0}; size_t nv[3] = {0};
         for (int v = 0; v < 3; v++) { snprintf(pth, sizeof pth, "%s/wc.f32", ov[v]); wv[v] = read_f32(pth, &nv[v]); CHECK(wv[v] && nv[v] == n, "no wc.f32 in %s", ov[v]); }
         if (wv[0] && wv[1] && wv[2] && nv[0] == n && nv[1] == n && nv[2] == n) {

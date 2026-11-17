@@ -670,7 +670,16 @@ int cmd_count_field(int argc, char **argv) {
        solve cell, z-major) give G += (K - 1) Gd, the phase-gradient targets (--phase-w) untouched. With --pool-cache the split sums go
        to / come from FILE.dens. (audit geo-count 11-14: the density head counts 1.2-1.3x the GT sheets on Paris 4 and 1667) */
     const double rho_solve = opt_atof("--rho-solve", cf_opt(argc, argv, "--rho-solve", "1")); const char *rho_map = cf_opt(argc, argv, "--rho-map", "");
-    const int psplit = opt_atoi("--pool-split", cf_opt(argc, argv, "--pool-split", "0")) || rho_solve != 1 || *rho_map;
+    /* --rho-r "R0:K0,R1:K1,...": K by the radius from the umbilicus (mm; piecewise linear, constant past the ends), times --rho-solve
+       and --rho-map. (fix0332 11-17: wrap-check's CT peaks per fitted turn by radius band is the label-free K(r); both 0332 fits
+       undercount at r 2-4 mm, 1.2-1.45 CT peaks per turn) */
+    enum { RHO_RN = 64 }; double rr_r[RHO_RN], rr_k[RHO_RN]; int rr_n = 0;
+    { const char *s = cf_opt(argc, argv, "--rho-r", ""); while (*s && rr_n < RHO_RN) { char *e; const double r = strtod(s, &e); if (e == s || *e != ':') break; s = e + 1;
+        const double k = strtod(s, &e); if (e == s) break; s = e;
+        if (!(k > 0) || (rr_n && !(r > rr_r[rr_n - 1]))) { fprintf(stderr, "count-field: --rho-r: K > 0 and increasing radii, R:K pairs\n"); return 1; }
+        rr_r[rr_n] = r; rr_k[rr_n++] = k; if (*s == ',') s++; }
+      if (*s) { fprintf(stderr, "count-field: --rho-r: cannot parse \"%s\" (want R0:K0,R1:K1,... in mm)\n", s); return 1; } }
+    const int psplit = opt_atoi("--pool-split", cf_opt(argc, argv, "--pool-split", "0")) || rho_solve != 1 || *rho_map || rr_n;
     float *Sd0 = nullptr, *Gd0[3] = {nullptr, nullptr, nullptr};
     if (psplit) { Sd0 = calloc(lv[0].n, sizeof(float)); for (int k = 0; k < 3; k++) Gd0[k] = calloc(lv[0].n, sizeof(float));
                   if (!Sd0 || !Gd0[2]) { fprintf(stderr, "count-field: out of memory (--pool-split)\n"); return 1; } }
@@ -786,16 +795,25 @@ int cmd_count_field(int argc, char **argv) {
         fprintf(stderr, bad ? "count-field: cannot write the pool cache %s\n" : "count-field: pooled sums -> %s\n", pcache);
         if (opt_atoi("--pool-only", cf_opt(argc, argv, "--pool-only", "0"))) return bad; }   /* (--pool-only 1: pass 1 into --pool-cache, nothing else) */
     free(ord); g_follow = nullptr;
-    if (rho_solve != 1 || *rho_map) {   /* --rho-solve K / --rho-map FILE: the density count rescaled per solve cell, G += (K - 1) Gd */
+    if (rho_solve != 1 || *rho_map || rr_n) {   /* --rho-solve K / --rho-map FILE / --rho-r: the density count rescaled per solve cell, G += (K - 1) Gd */
         float *km = nullptr;
         if (*rho_map) { FILE *mf = fopen(rho_map, "rb"); km = malloc(lv[0].n * sizeof(float));
             if (!mf || !km || fread(km, sizeof(float), lv[0].n, mf) != lv[0].n) { fprintf(stderr, "count-field: --rho-map %s: need %zu float32 (the level-0 solve grid %dx%dx%d)\n", rho_map, lv[0].n, lv[0].d, lv[0].hh, lv[0].w); return 1; }
             fclose(mf); }
+        if (rr_n) { if (!km) { km = malloc(lv[0].n * sizeof(float)); if (!km) return 1; for (size_t i = 0; i < lv[0].n; i++) km[i] = 1; }
+            const cf_lvl *L0 = &lv[0];
+            for (int z = 0; z < L0->d; z++) { const double pz = cf_center(L0, z), cy = cf_axis_at(g.cy, na, pz), cx = cf_axis_at(g.cx, na, pz);
+                for (int y = 0; y < L0->hh; y++) for (int x = 0; x < L0->w; x++) {
+                    const size_t i = ((size_t)z * L0->hh + y) * L0->w + x; const double r = hypot(cf_center(L0, y) - cy, cf_center(L0, x) - cx) * g.um / 1000;
+                    double k = rr_k[0]; if (r >= rr_r[rr_n - 1]) k = rr_k[rr_n - 1];
+                    else if (r > rr_r[0]) { int j = 1; while (r > rr_r[j]) j++; const double t = (r - rr_r[j - 1]) / (rr_r[j] - rr_r[j - 1]); k = rr_k[j - 1] + t * (rr_k[j] - rr_k[j - 1]); }
+                    if (isfinite(km[i]) && km[i] > 0) km[i] = (float)(km[i] * k); else km[i] = (float)k; } } }
         double ks = 0, kw = 0;
         for (size_t i = 0; i < lv[0].n; i++) { if (!(Sd0[i] > 0)) continue; const double K = rho_solve * (km && isfinite(km[i]) && km[i] > 0 ? km[i] : 1);
             for (int k = 0; k < 3; k++) Gl[0][k][i] += (float)((K - 1) * Gd0[k][i]);
             ks += K * Sd0[i]; kw += Sd0[i]; }
-        fprintf(stderr, "count-field: density count rescaled (--rho-solve %g%s%s): weighted mean K %.3f\n", rho_solve, *rho_map ? ", --rho-map " : "", rho_map, kw > 0 ? ks / kw : 0);
+        fprintf(stderr, "count-field: density count rescaled (--rho-solve %g%s%s%s%s): weighted mean K %.3f\n", rho_solve, *rho_map ? ", --rho-map " : "", rho_map,
+                rr_n ? ", --rho-r " : "", rr_n ? cf_opt(argc, argv, "--rho-r", "") : "", kw > 0 ? ks / kw : 0);
         free(km);
     }
     free(Sd0); for (int k = 0; k < 3; k++) free(Gd0[k]);
