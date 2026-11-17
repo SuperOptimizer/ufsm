@@ -417,14 +417,21 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_mx1_k(const uint8_t *x, const
    Per warp and 16 voxels: lanes 0-15 dequantise one voxel row each and apply the GN+SiLU affine into fp16 A[ci][voxel],
    lanes 16-31 copy that voxel's gy into B[co][voxel] (and sum it for the bias); one m16n8k16 MMA with fp32 accumulation.
    The fp16 rounding of act(x) is the only numerical difference from conv_bwd_w1_mx1_k. */
-template <int B, int CI>   /* CI = 16 or 32 input channels (one MX block row, block blk of Ct): CI / 16 MMA row tiles per 16 voxels; outputs co0 .. co0 + 7 */
+/* NT (trainperf 2026-11-17): NT column tiles of 8 outputs per block on the same staged act(x) tile: the dequantisation, GroupNorm and SiLU
+   of x ran once per 8 outputs (20 times per voxel for the 160-output latent head, 3.9 ms a P 768 slab); per (ci, co) the voxel order, the
+   warps' reduction order and the blocks are those of NT 1, so the sums are the same */
+template <int B, int CI, int NT = 1>   /* CI = 16 or 32 input channels (one MX block row, block blk of Ct): CI / 16 MMA row tiles per 16 voxels; outputs co0 .. co0 + 8 NT - 1 */
 __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const __half *gy, float *gw, float *gb, int N, size_t S, gnp_t gp, int nper, int Co, int co0, int Ct, int blk,
                                                          size_t vbase = 0, size_t vn = 0) {   /* (vn: voxels [vbase, vbase + vn) of x, gy holding vn per channel; 0: all) */
     constexpr int MTI = CI / 16;
-    blk += blockIdx.z % (Ct / CI); co0 += 8 * (blockIdx.z / (Ct / CI));   /* grid.z: all (output pass, input block) pairs in one launch (the heads' 92 M
+    blk += blockIdx.z % (Ct / CI); co0 += 8 * NT * (blockIdx.z / (Ct / CI));   /* grid.z: all (output pass, input block) pairs in one launch (the heads' 92 M
                                                                                level 0, 256 ch x 11+ outputs: 16 launches a slab call -> 1) */
-    __shared__ float ca[2][CI], cb[2][CI], red[8][CI * 8 + 8];   /* [bank]: slab GroupNorm, the block's first slab and the next */
-    __shared__ __align__(16) __half sA[8][CI][40], sB[8][8][40];   /* [warp][ci][voxel], [warp][co][voxel] (32 voxels); rows padded */
+    __shared__ float ca[2][CI], cb[2][CI];   /* [bank]: slab GroupNorm, the block's first slab and the next */
+    constexpr int RW = CI * 8 * NT + 8 * NT;   /* a warp's partial sums: [ci][co] then the biases */
+    constexpr size_t AB = sizeof(__half) * 8 * 40 * (CI + 8 * NT), RB = sizeof(float) * 8 * RW;
+    __shared__ __align__(16) unsigned char smab[AB > RB ? AB : RB];   /* the operand tiles, then (after the loop) the reduction */
+    __half (*sA)[CI][40] = (__half (*)[CI][40])smab, (*sB)[8 * NT][40] = (__half (*)[8 * NT][40])(smab + sizeof(__half) * 8 * 40 * CI);   /* [warp][ci][voxel], [warp][co][voxel] (32 voxels); rows padded */
+    float (*red)[RW] = (float (*)[RW])smab;
     const int n = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     if (!vn) vn = S;
     const int r0 = gp.ns ? gn_row_v(gp, n, min(vbase + (size_t)blockIdx.x * nper, S - 1)) : 0;
@@ -436,9 +443,13 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const 
     }
     __syncthreads();
     const uint8_t *sc = mx_sc<B>(x, N, Ct, S);
-    float c[MTI][4], bs[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float c[MTI][NT][4], bs[8 * NT];
 #pragma unroll
-    for (int m = 0; m < MTI; m++) c[m][0] = c[m][1] = c[m][2] = c[m][3] = 0.f;
+    for (int co = 0; co < 8 * NT; co++) bs[co] = 0.f;
+#pragma unroll
+    for (int m = 0; m < MTI; m++)
+#pragma unroll
+        for (int j = 0; j < NT; j++) c[m][j][0] = c[m][j][1] = c[m][j][2] = c[m][j][3] = 0.f;
     const int g = lane >> 2, t4 = lane & 3;
     const size_t v0 = vbase + (size_t)blockIdx.x * nper, v1 = min(vbase + vn, v0 + nper);
     for (size_t vb = v0 + warp * 32; vb < v1; vb += 8 * 32) {   /* 32 voxels per warp step: lane = voxel (its x row and its gy) */
@@ -451,7 +462,7 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const 
 #pragma unroll
             for (int k = 0; k < CI; k++) sA[warp][k][lane] = __float2half_rn(in ? (gp.G ? act_ab(r[k], cav[k], cbv[k], true) : r[k]) : 0.f);
 #pragma unroll
-            for (int co = 0; co < 8; co++) {
+            for (int co = 0; co < 8 * NT; co++) {
                 const __half h = in && co0 + co < Co ? gy[((size_t)n * Co + co0 + co) * vn + (v - vbase)] : __float2half_rn(0.f);
                 sB[warp][co][lane] = h; bs[co] += __half2float(h);
             }
@@ -459,34 +470,41 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const 
         __syncwarp();
 #pragma unroll
         for (int ks = 0; ks < 2; ks++) {
-            unsigned b[2];
-            b[0] = *(const unsigned *)&sB[warp][g][16 * ks + 2 * t4];     b[1] = *(const unsigned *)&sB[warp][g][16 * ks + 2 * t4 + 8];
 #pragma unroll
             for (int m = 0; m < MTI; m++) {
                 unsigned a[4];
                 a[0] = *(const unsigned *)&sA[warp][16 * m + g][16 * ks + 2 * t4];     a[1] = *(const unsigned *)&sA[warp][16 * m + g + 8][16 * ks + 2 * t4];
                 a[2] = *(const unsigned *)&sA[warp][16 * m + g][16 * ks + 2 * t4 + 8]; a[3] = *(const unsigned *)&sA[warp][16 * m + g + 8][16 * ks + 2 * t4 + 8];
-                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                             : "+f"(c[m][0]), "+f"(c[m][1]), "+f"(c[m][2]), "+f"(c[m][3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#pragma unroll
+                for (int j = 0; j < NT; j++) {
+                    unsigned b[2];
+                    b[0] = *(const unsigned *)&sB[warp][8 * j + g][16 * ks + 2 * t4]; b[1] = *(const unsigned *)&sB[warp][8 * j + g][16 * ks + 2 * t4 + 8];
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                 : "+f"(c[m][j][0]), "+f"(c[m][j][1]), "+f"(c[m][j][2]), "+f"(c[m][j][3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+                }
             }
         }
         __syncwarp();
     }
-    /* C[ci][co]: c0, c1 = C[16 m + g][2 t4 .. + 1], c2, c3 = C[16 m + g + 8][2 t4 .. + 1] */
+    /* C[ci][co]: c0, c1 = C[16 m + g][2 t4 .. + 1], c2, c3 = C[16 m + g + 8][2 t4 .. + 1] (co within tile j: + 8 j) */
+    constexpr int CO = 8 * NT;
+    __syncthreads();   /* (red overlays the operand tiles) */
 #pragma unroll
-    for (int m = 0; m < MTI; m++) {
-        red[warp][(16 * m + g) * 8 + 2 * t4] = c[m][0]; red[warp][(16 * m + g) * 8 + 2 * t4 + 1] = c[m][1];
-        red[warp][(16 * m + g + 8) * 8 + 2 * t4] = c[m][2]; red[warp][(16 * m + g + 8) * 8 + 2 * t4 + 1] = c[m][3];
-    }
+    for (int m = 0; m < MTI; m++)
 #pragma unroll
-    for (int co = 0; co < 8; co++) { float s = bs[co]; for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o); bs[co] = s; }
-    if (lane == 0) for (int co = 0; co < 8; co++) red[warp][CI * 8 + co] = bs[co];
+        for (int j = 0; j < NT; j++) {
+            red[warp][(16 * m + g) * CO + 8 * j + 2 * t4] = c[m][j][0]; red[warp][(16 * m + g) * CO + 8 * j + 2 * t4 + 1] = c[m][j][1];
+            red[warp][(16 * m + g + 8) * CO + 8 * j + 2 * t4] = c[m][j][2]; red[warp][(16 * m + g + 8) * CO + 8 * j + 2 * t4 + 1] = c[m][j][3];
+        }
+#pragma unroll
+    for (int co = 0; co < CO; co++) { float s = bs[co]; for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o); bs[co] = s; }
+    if (lane == 0) for (int co = 0; co < CO; co++) red[warp][CI * CO + co] = bs[co];
     __syncthreads();
-    for (int i = threadIdx.x; i < CI * 8 + 8; i += blockDim.x) {
+    for (int i = threadIdx.x; i < CI * CO + CO; i += blockDim.x) {
         float s = 0.f;
         for (int w = 0; w < 8; w++) s += red[w][i];
-        if (i < CI * 8) { const int ci = i / 8, co = i % 8; if (co0 + co < Co) atomicAdd(&gw[(size_t)(co0 + co) * Ct + blk * CI + ci], s); }
-        else if (gb && !blk && co0 + i - CI * 8 < Co) atomicAdd(&gb[co0 + i - CI * 8], s);
+        if (i < CI * CO) { const int ci = i / CO, co = i % CO; if (co0 + co < Co) atomicAdd(&gw[(size_t)(co0 + co) * Ct + blk * CI + ci], s); }
+        else if (gb && !blk && co0 + i - CI * CO < Co) atomicAdd(&gb[co0 + i - CI * CO], s);
     }
 }
 /* the whole head backward in one pass over the 32-channel MX input x and the fp16 logit gradient gy (up to 16 logits):
@@ -632,6 +650,8 @@ extern "C" int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy,
     lp_bwd_w1_mx(x, xdt, xs, gy, gydt, ys, gw, gp);
     return 0;
 }
+static int g_w1_nt = -1;   /* mgpu: config (UFSM_W1_NT=1: one 8-output tile per block, as before 2026-11-17; tests set it) */
+extern "C" int lp_set_w1_nt(int on) { if (g_w1_nt < 0) { const char *e = getenv("UFSM_W1_NT"); g_w1_nt = !(e && atoi(e) == 1); } const int was = g_w1_nt; if (on >= 0) g_w1_nt = on; return was; }
 /* the same over voxels [vb, vb + vn) of x with gy holding those vn voxels per channel (the level-0 slab stream's head, stage S4):
    16- or 32-channel MX x, fp16 gy, <= 16 outputs; weight and bias gradients accumulated; 0: not covered */
 extern "C" int lp_bwd_w1_mx_b_r(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp, size_t vb, size_t vn) {
@@ -643,7 +663,11 @@ extern "C" int lp_bwd_w1_mx_b_r(const void *x, int xdt, shape5 xs, const void *g
     int tgt = 8192; while (tgt > 512 && vn / tgt * nz < 128) tgt >>= 1;
     const int nper = slab_nper(gp, tgt);
     const dim3 grid((unsigned)((vn + nper - 1) / nper), xs.n, nz);
-    if (xs.c >= 32) {
+    if (xs.c >= 32 && lp_set_w1_nt(-1) && ys.c % 32 == 0) {   /* (the same voxel blocks; 4 output tiles per block) */
+        const dim3 g4(grid.x, grid.y, (unsigned)((ys.c / 32) * (xs.c / 32)));
+        if (xdt == 4) conv_bwd_w1_tc_k<4, 32, 4><<<g4, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, 0, xs.c, 0, vb, vn);
+        else conv_bwd_w1_tc_k<8, 32, 4><<<g4, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, 0, xs.c, 0, vb, vn);
+    } else if (xs.c >= 32) {
         if (xdt == 4) conv_bwd_w1_tc_k<4, 32><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, 0, xs.c, 0, vb, vn);
         else conv_bwd_w1_tc_k<8, 32><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, 0, xs.c, 0, vb, vn);
     } else if (xdt == 4) conv_bwd_w1_tc_k<4, 16><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, gw, gb, xs.n, S, gp, nper, ys.c, 0, 16, 0, vb, vn);

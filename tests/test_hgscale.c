@@ -107,17 +107,17 @@ static void head_case(int C, int K, int D, int H, int W) {
     const size_t nw = (size_t)K * C, gxb = nn_mx4_bytes(xs);
     float *pre = dev_vals(nw + K, 0.05f, 0.f); float *hpre = malloc((nw + K) * 4); nn_d2h(hpre, pre, (nw + K) * 4);
     float *gw = nn_malloc(nw * 4), *gb = nn_malloc((size_t)K * 4); void *gx = nn_malloc(gxb);
-    float *rw[3], *rb[3]; uint8_t *rx[3]; int rc = 0;
+    float *rw[4], *rb[4]; uint8_t *rx[4]; int rc = 0;
     const unsigned c0 = nn_sr_ctr();
-    for (int r = 0; r < 3; r++) {   /* r 0, 1: s 1 twice (does it repeat its bytes?), r 2: gy x 1024 at s 1024 */
+    for (int r = 0; r < 4; r++) {   /* r 0, 1: s 1 twice (does it repeat its bytes?), r 2: gy x 1024 at s 1024, r 3: s 1 with one output tile per block (lp_set_w1_nt 0) */
         rw[r] = malloc(nw * 4); rb[r] = malloc((size_t)K * 4); rx[r] = malloc(gxb);
         nn_h2d(gw, hpre, nw * 4); nn_h2d(gb, hpre + nw, (size_t)K * 4); nn_zero(gx, gxb); nn_set_storage(gx, gxb, 4);
-        nn_sr_set_ctr(c0); nn_set_head_gscale(r == 2 ? sc : 1.f);
+        nn_sr_set_ctr(c0); nn_set_head_gscale(r == 2 ? sc : 1.f); const int nt_was = lp_set_w1_nt(r == 3 ? 0 : -1);
         const void *g = r == 2 ? gysd : gyd;
         const int z1 = D / 2;   /* two slab ranges: planes [0, z1) (first: the transposed weights built) and [z1, D) (reused) */
         rc |= nn_head_bwd_z((const float *)x, nullptr, xs, g, K, w, gw, gb, (float *)gx, 0, (size_t)z1 * hw, 1);
         rc |= nn_head_bwd_z((const float *)x, nullptr, xs, g, K, w, gw, gb, (float *)gx, (size_t)z1 * hw, (size_t)(D - z1) * hw, 0);
-        nn_sync(); nn_d2h(rw[r], gw, nw * 4); nn_d2h(rb[r], gb, (size_t)K * 4); nn_d2h(rx[r], gx, gxb);
+        nn_sync(); nn_d2h(rw[r], gw, nw * 4); nn_d2h(rb[r], gb, (size_t)K * 4); nn_d2h(rx[r], gx, gxb); lp_set_w1_nt(nt_was);
     }
     nn_set_head_gscale(1.f);
     check("nn_head_bwd_z covered the shapes", rc == 0);
@@ -128,7 +128,9 @@ static void head_case(int C, int K, int D, int H, int W) {
     check(nm, same_or_close(rw[2], rw[0], nw, repw) && same_or_close(rb[2], rb[0], (size_t)K, repw));
     snprintf(nm, sizeof nm, "head gx (MX-fp4 bytes): s 1024 == s 1 (%d -> %d)", C, K);
     check(nm, repx ? !memcmp(rx[2], rx[0], gxb) : 1);
-    for (int r = 0; r < 3; r++) { free(rw[r]); free(rb[r]); free(rx[r]); }
+    snprintf(nm, sizeof nm, "head weight / bias gradients: 4 output tiles a block == 1 (%d -> %d)", C, K);
+    check(nm, same_or_close(rw[3], rw[0], nw, repw) && same_or_close(rb[3], rb[0], (size_t)K, repw));
+    for (int r = 0; r < 4; r++) { free(rw[r]); free(rb[r]); free(rx[r]); }
     free(gy); free(gys); free(hpre); nn_free(x); nn_free(w); nn_free(gyd); nn_free(gysd); nn_free(pre); nn_free(gw); nn_free(gb); nn_free(gx);
 }
 
