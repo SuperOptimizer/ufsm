@@ -778,9 +778,13 @@ stripimg() {
     # the 3 middle stripes' renders at once (SJOBS, default by memory: a Paris 4 stripe render peaks at ~21 GB RSS and 4 GB of device
     # pool; one after another they were 3 x 28 s of 84 s, on 1667 26 + 15 + 10 s; each render is independent: the same images)
     local sj=${SJOBS:-$(a=$(availgb); [ $a -ge 72 ] && echo 3 || { [ $a -ge 48 ] && echo 2 || echo 1; })} pids=() rc=0 p
+    # (with the c12 / c13 gates the renders take them in the same pass, render --gate: strip_refill.sh then has nothing to gate on these
+    # three, which were 2 extra renders each; the same bytes, test_render_gate. The stretch-only mosaic below then sees gated renders: the
+    # gated stretch strip_refill.sh computes replaces it either way)
+    local GX=() g; for g in $(inkgate); do GX+=(--gate $g $LUM); done
     srend() { local s=$1; mkdir -p $RF/in_$s; ln -sfn $ST/strip/flat/stripes/$s $RF/in_$s/$s
-      env $E /usr/bin/time -v nice -n 10 $U render $RF/in_$s $RF --volume $INK $LUM --ct $R $K/$LV --depth 1 --scale 1 --threads ${RENDER_NT:-$TH} $FILLX > $ST/logs/refill_$s.log 2>&1 || return 1
-      [ -e $RF/${s}_fill.tif ] && mv $RF/${s}_fill.tif $ST/fillmap/; rm -r $RF/in_$s; touch $RF/$s.done; }
+      env $E /usr/bin/time -v nice -n 10 $U render $RF/in_$s $RF --volume $INK $LUM --ct $R $K/$LV --depth 1 --scale 1 --threads ${RENDER_NT:-$TH} $FILLX "${GX[@]}" > $ST/logs/refill_$s.log 2>&1 || return 1
+      [ -e $RF/${s}_fill.tif ] && mv $RF/${s}_fill.tif $ST/fillmap/; rm -r $RF/in_$s; [ ${#GX[@]} -gt 0 ] && touch $RF/$s.gated; touch $RF/$s.done; }
     for k in $((N / 2 - 1)) $((N / 2)) $((N / 2 + 1)); do [ $k -ge 0 ] && [ $k -lt $N ] || continue; s=${S[$k]}; [ -e $RF/$s.done ] && continue
       while [ ${#pids[@]} -ge $sj ]; do wait ${pids[0]} || rc=1; pids=("${pids[@]:1}"); done
       srend $s & pids+=($!)

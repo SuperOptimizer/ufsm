@@ -6,6 +6,19 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Unroll perf 6: 0332 end to end on master 64b2d3ed; flatten waits for device memory; the driver's stripes gated in the render (2026-11-17, branch unrollperf6-20261117)
+
+0332, card 1, u1 13000, INKAT=fields, TH=20 at nice 19 (lead: try9 first; desk load 32-39), CT cache cold (full4: warm), CLEAN=1;
+disk peak ~80 GB. Stage walls full4 (2026-11-17 05:00, 22445892) -> e2e5: fields 116 -> 152 (cold cache), rectosp 221 -> 87 (GPU),
+ref 92 -> 128, slabs 190 -> 230, join 24 -> 30, check 54 -> 68, wraps 37 -> 44, snap 61 -> 91 (CPU stages 20-50 % slower at nice 19
+under load), ink 682 -> 737, strip-flatten 118 -> 38 (fp32), stripimg 457 -> 442, perwrap 612 -> 1024; total 1422 -> 1928 s.
+
+- perwrap: three wraps (w082 246 s, w069 208 s, w096 179 s against ~25 s on the GPU) got "GPU unavailable (out of memory): CPU solver" at
+  full resolution, the card full with 4 flatten lanes beside the strip renders. flat_slim_gpu now returns -2 on a device allocation
+  failure (x untouched) and slim_run waits for memory, 2 s retries up to UFSM_FLAT_GPU_WAIT (300 s), before the CPU solver.
+- stripimg: the unroll driver renders the 3 middle stripes itself (the stretch) and strip_refill.sh gated them with 2 more renders each;
+  the driver now passes the c12 / c13 gates (render --gate, the same bytes) and marks them gated.
+
 ## Argus V2 (ruiconte): a Reader V3 fine-tune, runs in our reader3 port; ties reader3, adds nothing to the teacher combo (2026-11-17)
 
 Argus V2 (https://huggingface.co/ruiconte/argus-v2 @ a769fe54, `argus-v2.pth`, sha256 659130f7...de6fd matches the card, MIT,
