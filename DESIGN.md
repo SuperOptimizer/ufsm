@@ -176,6 +176,16 @@ So --sparse24 mode 3, which changes results, no longer pays.
 
   - Busy time: fields 243 -> 218 ms, ink 142 -> 129.
   - Fields choice log: conv_fwd_f4v_k calls 72 -> 95.
+- Statistics at W % 16 (2026-11-17, branch convkw16-20261117). The shape gate refused statistics at widths that are not multiples of 16.
+  Predict ink's windows (544: level widths 136 / 68) therefore ran their GN z-range, fused-upsample and plain convs on the old kernel.
+  - At such widths conv_fwd_f4_k writes its output per lane (fwd_epilogue's last path), and its sums run per lane: the 2 rows, the x pairs,
+    v0 then v1, then the xor-1 and xor-2 shuffles, then old warp by old warp.
+  - The new kernel now calls fwd_epilogue<NOST>: the output and the stored_stats rewrite of acc, but not its statistics. f4v_st_pl then forms
+    each old warp's per-lane sums from its half of this warp's 4 rows, and f4v_epi_st's ordered tail adds them.
+  - Tests: 6 new test_f4v cases (W 36 / 40 / 37 / 68, stored stats, GN z-range, fused upsample), byte- and stats-equal.
+  - Ink predict (0332, 32 windows, interleaved twice, convk's runs on card 1): 121.5 / 121.6 -> 112.2 / 112.5 ms per window (-7.6 %), busy
+    128.8 -> 121.3. The old kernel's 18.6 ms is gone. Data shards byte-identical.
+  - Fields: 172.2 -> 167.9 ms (one run each, a foreign process on the card), byte-identical.
 - Clusters, tried and parked (branch convkw-20261117, conv_bwd_w_f4wc_k, nvcc build, bit-equal to the plain kernel in test_f4wc):
   the CL co tiles of a (1, 1, CL) cluster share one x staging.
   - Each block stages every CL-th LY 1 group and bulk-copies its 432 B slot to the others (cp.async.bulk shared::cluster with
