@@ -207,7 +207,7 @@ static void *rs_gfld_main(void *a) {   /* the block's field rows and cells (besi
     if (!R->fok || a0 < R->f0 || a1 > R->f1) {   /* the field rows: from a0 to the array chunk row's end past a1 (the next block's rows) */
         if (R->fok) { fit_fields_free(&R->fb); R->fok = 0; }
         long long e = ((R->zoff0 + a1 + 127) / 128) * 128 - R->zoff0; if (e < a1) e = a1; if (e > R->shp0) e = R->shp0;
-        fit_fields_skip_planes(1 | 2 | 8); fit_fields_ct_planes(0);
+        fit_fields_skip_planes(1 | 2 | 8 | 16); fit_fields_ct_planes(0);   /* (t0..t5 and w only: the phase planes were 2 of 9 decoded planes) */
         if (fit_fields_load(R->in, a0, (int)e, 1, &R->fb)) { R->rcf = 1; snprintf(R->errf, sizeof R->errf, "cannot load field rows %d..%lld", a0, e); return nullptr; }
         R->f0 = a0; R->f1 = (int)e; R->fok = 1;
     }
@@ -431,11 +431,11 @@ int cmd_recto_sp(int argc, char **argv) {
         if (devdec) RZ = (RZ + 127) / 128 * 128;
         const size_t ny = ngb ? gbl[0].sn[1] : 0, nx = ngb ? gbl[0].sn[2] : 0, ring = (size_t)RZ * ny * nx, fr = rsg_free_mem(gdev);
         const double st = 0.5 / F; const int n = 2 * (int)ceil(fmax(half, half2) / (st * um)) + 1;
-        const size_t scr = (size_t)256 << 20;   /* (the cell arrays) */
+        const size_t scr = (size_t)(((64 + S - 1) / S + 1) * ((H + S - 1) / S) * ((W + S - 1) / S)) * 40 + ((size_t)(nt + 16) << 22);   /* (the cell arrays, the chunk workers' buffers) */
         if (!ngb) ;
         else if (n > 1000) fprintf(stderr, "recto-sp: profiles of %d samples exceed the GPU kernel's shared memory: the CPU path\n", n);
         else if (ring + scr + ((size_t)512 << 20) > fr) fprintf(stderr, "recto-sp: GPU %d: %.1f GB free, the source ring needs %.1f GB: the CPU path\n", gdev, fr / 1e9, ring / 1e9);
-        else if (rsg_open(gdev, RZ, (int64_t)ny, (int64_t)nx)) fprintf(stderr, "recto-sp: GPU %d unavailable: the CPU path\n", gdev);
+        else if (rsg_open(gdev, RZ, (int64_t)ny, (int64_t)nx, ((64 + S - 1) / S + 1) * ((H + S - 1) / S) * ((W + S - 1) / S))) fprintf(stderr, "recto-sp: GPU %d unavailable: the CPU path\n", gdev);
         else { gon = 1; fprintf(stderr, "recto-sp: GPU %d: %d row blocks, source ring %lld x %zu x %zu (%.1f GB)\n", gdev, ngb, (long long)RZ, ny, nx, ring / 1e9); }
         if (!gon) { rsg_close(); free(gbl); gbl = nullptr; ngb = 0; }
         for (int b = 0; b < 2; b++) GP[b] = (rs_gprep){.in = in, .zs = zs, .nt = nt, .H = H, .W = W, .S = S, .shp0 = shp[0], .org = {org[0], org[1], org[2]}, .zoff0 = zoff[0], .bl = gbl};

@@ -22,7 +22,7 @@ typedef struct {
     double gk[2 * RSG_RMAX + 1];  /* rr_peaks' taps (rr_taps) */
 } rsg_par;
 
-int rsg_open(int dev, int64_t RZ, int64_t ny, int64_t nx) RSG_WEAK;   /* the ring (RZ slices of ny x nx) and the scratch */
+int rsg_open(int dev, int64_t RZ, int64_t ny, int64_t nx, int maxM) RSG_WEAK;   /* the ring (RZ slices of ny x nx) and the arrays of up to maxM cells a block */
 /* nz slices of global source z [z0, z0 + nz) (host, ny x nx each, contiguous) into their ring slots; from any thread, on its own
    stream beside rsg_run's kernel (the caller keeps those slots out of the running block's source box) */
 int rsg_put(int64_t z0, int64_t nz, const uint8_t *src) RSG_WEAK;

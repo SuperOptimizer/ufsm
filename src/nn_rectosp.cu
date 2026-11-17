@@ -27,21 +27,24 @@ extern "C" size_t rsg_free_mem(int dev) {
     return fr;
 }
 
-extern "C" int rsg_open(int dev, int64_t RZ, int64_t ny, int64_t nx) {
+extern "C" int rsg_open(int dev, int64_t RZ, int64_t ny, int64_t nx, int maxM) {
     rsg_close();
-    RG_CK(cudaSetDevice(dev)); g.dev = dev; g.RZ = RZ; g.ny = ny; g.nx = nx;
+    RG_CK(cudaSetDevice(dev)); g.dev = dev; g.RZ = RZ; g.ny = ny; g.nx = nx; g.ok = 1;   /* (ok: rsg_close frees a partial open) */
     RG_CK(cudaMalloc(&g.ring, (size_t)RZ * ny * nx));
     RG_CK(cudaMalloc(&g.cnt, 2 * sizeof(unsigned long long)));
     RG_CK(cudaStreamCreateWithFlags(&g.su, cudaStreamNonBlocking)); RG_CK(cudaStreamCreateWithFlags(&g.sk, cudaStreamNonBlocking));
     int sms = 0; RG_CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
-    g.G = (long)sms * 1536; g.ok = 1;
+    g.G = (long)sms * 1536;
+    if (maxM > 0) {   /* the cell arrays up front: no device allocation once the run is under way */
+        RG_CK(cudaMalloc(&g.zyx, (size_t)maxM * 3 * sizeof(int32_t))); RG_CK(cudaMalloc(&g.t6, (size_t)maxM * 6)); RG_CK(cudaMalloc(&g.q, maxM));
+        RG_CK(cudaMalloc(&g.nv, (size_t)maxM * 3 * sizeof(double))); g.Mcap = maxM; }
     return 0;
 }
 extern "C" void rsg_close(void) {
     if (!g.ok) return;
     cudaSetDevice(g.dev); if (g.su) cudaStreamDestroy(g.su); if (g.sk) cudaStreamDestroy(g.sk);
     cudaFree(g.ring); cudaFree(g.nv); cudaFree(g.zyx); cudaFree(g.t6); cudaFree(g.q); cudaFree(g.cnt);
-    memset(&g, 0, sizeof g);
+    cudaGetLastError(); memset(&g, 0, sizeof g);
 }
 extern "C" uint8_t *rsg_slot(int64_t z) { return g.ok ? g.ring + (size_t)(z % g.RZ) * g.ny * g.nx : nullptr; }
 extern "C" int rsg_zero(int64_t z0, int64_t nz) {
