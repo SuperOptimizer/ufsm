@@ -3,4 +3,4 @@ PHercParis4	/vesuvius/ufsm/v2/ct	PHercParis4/20260411134726-2.400um-0.2m-78keV-m
 PHercParis3	https://dl.ash2txt.org/community-uploads/forrest/volcomp	PHercParis3/volumes/20260427095331-2.400um-0.2m-78keV-masked.zarr	2.400	2	auto	0,1536,512,17105,7360,9536	-	--every 2
 PHerc0490B	https://dl.ash2txt.org/community-uploads/forrest/volcomp	PHerc0490B/volumes/20250521151215-8.640um-1.2m-116keV-masked.zarr	8.640	0	auto	0,512,0,10016,7831,8192	1024,9600	-
 PHerc1667	/vesuvius/ufsm/v2/ct	PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr	2.399	2	/vesuvius/ufsm/umbilicus/PHerc1667/umbilicus-full-resolution.json	0,0,0,9269,3136,3232	-	-
-PHerc0332	https://dl.ash2txt.org/community-uploads/forrest/volcomp	PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr	2.399	2	/vesuvius/ufsm/umbilicus/PHerc0332/umbilicus-full-resolution.json	512,512,512,7886,2784,3008	-	--last 68
+PHerc0332	https://dl.ash2txt.org/community-uploads/forrest/volcomp	PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr	2.399	2	/vesuvius/ufsm/umbilicus/PHerc0332/umbilicus-full-resolution.json	512,512,512,7886,2784,3008	512,7680	--last 68

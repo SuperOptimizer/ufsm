@@ -611,7 +611,9 @@ check() {
   if [ "${DRIFT:-1}" = 1 ]; then
     X $O/logs/drift.log $U cf-demod $REF $F --step ${DRIFTSTEP:-8} --band 128 --cz 16 --threads $TH ${DRIFTMAX:+--drift-max $DRIFTMAX}
     local rc=$?; [ "$DRY" = 1 ] && return 0
-    local dl; dl=$(grep '^cf-demod: z drift' $O/logs/drift.log | tail -1); log "check: ${dl#cf-demod: }"
+    local dl; dl=$(grep '^cf-demod: z drift:' $O/logs/drift.log | tail -1); log "check: ${dl#cf-demod: }"
+    # the body (bands with >= 1/2 the fullest band's weight) and the ends apart: 0332's 1.9-turn ALARM was 1.6 turns at the broken top end
+    local db; db=$(grep '^cf-demod: z drift body' $O/logs/drift.log | tail -1); [ -n "$db" ] && log "check: ${db#cf-demod: }"
     local ex; ex=$(echo "$dl" | sed -nE 's/.*along-sheet excursion ([0-9.]+) turns.*/\1/p')
     [ -n "$ex" ] && awk -v e=$ex -v w=${DRIFTWARN:-0.75} 'BEGIN { exit !(e > w) }' && log "check: ALARM: the ref drifts $ex turns along the sheets over z (> DRIFTWARN ${DRIFTWARN:-0.75}): sheet identity changes with height"
     [ $rc = 3 ] && { log "check: FAILED: z drift above DRIFTMAX $DRIFTMAX"; return 1; }

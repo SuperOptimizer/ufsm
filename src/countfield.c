@@ -1464,19 +1464,34 @@ int cmd_cf_demod(int argc, char **argv) {
        cap) swing by turns (P4 band 1: -4.7, 1667 band 0: -1.0) and are no evidence of a drift */
     double smax = 0; for (int b = 0; b < nb; b++) { double c = 0; for (int t = 0; t < CF_MAXT; t++) c += bacc[(size_t)t * nb + b][2]; smax = fmax(smax, c); }
     double prevang = 0, unw = 0, cum = 0, umin = 1e30, umax = -1e30, cmin = 1e30, cmax = -1e30; int first = 1;
+    double *bcum = calloc(3 * (size_t)nb, sizeof *bcum), *bdz = bcum + nb, *bfull = bcum + 2 * nb; int bb0 = -1, bb1 = -1;   /* the body: first .. last band with >= 1/2 the fullest band's weight */
+    if (!bcum) { fprintf(stderr, "cf-demod: out of memory\n"); return 1; }
     for (int b = 0; b < nb; b++) {
         double s[5] = {0}; for (int t = 0; t < CF_MAXT; t++) for (int k = 0; k < 5; k++) s[k] += bacc[(size_t)t * nb + b][k];
+        bcum[b] = cum;
         if (s[2] <= 0) continue;
+        if (s[2] >= 0.5 * smax) { if (bb0 < 0) bb0 = b; bb1 = b; }
         const int full = s[2] >= 0.25 * smax;
         const double ang = atan2(s[1], s[0]) / (2 * M_PI), coh = hypot(s[0], s[1]) / s[2];
         if (first) { unw = ang; first = 0; } else { double d = ang - prevang; d -= floor(d + 0.5); unw += d; }
         prevang = ang; const double hb = (b + 1 < nb ? band : D - b * band) * h, dz = s[4] > 0 ? s[3] / s[4] * hb : 0; cum += dz;
+        bcum[b] = cum; bdz[b] = dz; bfull[b] = full;
         if (full) { umin = fmin(umin, unw); umax = fmax(umax, unw); cmin = fmin(cmin, cum); cmax = fmax(cmax, cum); }
         printf("cf-demod: %4d  %8.0f  %8.0f  %.3f  %+.3f  %+.3f  %+.4f  %+.3f%s\n", b, b * band * h, s[2], coh, ang, unw, dz, cum, full ? "" : "  (end band: not counted)");
     }
     const double drift = cmax > cmin ? cmax - cmin : 0; if (!(umax > umin)) umin = umax = 0;
     printf("cf-demod: z drift: along-sheet excursion %.2f turns (end %+.2f), residual-phase excursion %.2f turns%s\n", drift, cum, umax - umin,
            dmax > 0 && drift > dmax ? " -- ALARM: above --drift-max" : "");
+    /* body vs ends (fix0332 11-17): PHerc0332's 1.9-turn u1 excursion was 1.6 turns in the top two bands, the scroll's broken top end
+       (phase coherence 0.10-0.15, a third of a full band's weight), and 0.22-0.34 over the body; the body excursion is the drift of the
+       sheet identity where the scroll is whole, the end changes say how much the ends add */
+    if (bb0 >= 0) { double bmin = 1e30, bmax = -1e30; for (int b = bb0; b <= bb1; b++) { bmin = fmin(bmin, bcum[b]); bmax = fmax(bmax, bcum[b]); }
+        double below = 0, above = 0;   /* (counted bands only, as the excursion: the uncounted end bands swing by turns) */
+        for (int b = 0; b < bb0; b++) if (bfull[b]) below += bdz[b];
+        for (int b = bb1 + 1; b < nb; b++) if (bfull[b]) above += bdz[b];
+        printf("cf-demod: z drift body: along-sheet excursion %.2f turns over bands %d..%d (native z %.0f..%.0f, >= 1/2 the fullest band's weight); "
+               "below it %+.2f, above it %+.2f turns\n", bmax - bmin, bb0, bb1, bb0 * band * h, fmin(D, (bb1 + 1) * band) * h, below, above); }
+    free(bcum);
     int rc = dmax > 0 && drift > dmax ? 3 : 0;
     if (*out) {   /* +-R box average of the node phasors (separable, clamped), then delta += arg / 2 pi */
         float *tmp = malloc((size_t)(m->lz > m->ly ? (m->lz > m->lx ? m->lz : m->lx) : (m->ly > m->lx ? m->ly : m->lx)) * 4);
