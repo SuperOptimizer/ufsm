@@ -208,6 +208,15 @@ need try9 pod unrolls with UQTILES=100000 (hands from count-field's model-cohere
 the volcomp mirror, each checked by its zarr.json; HOLD=holdouts-20261114.json rejects every per-scroll holdout and wbench box on the CT;
 the axis is matched by scan basename. On the scratch1 -ho json: 37 unlabelled volumes on the mirror (35 locally), 11 with an axis.
 
+**The wbench 1667 boxes C25-C70 were never held out (found 11-17).** holdouts-20261114 has only C1-C24 for PHerc1667 (from
+wbench/holdouts.json, which predates the 10-25 C25-C70 additions), and every u1 sources file (sources-u1 / u1b / u1c / u1d) used
+wbench/holdouts.json too: u1 and try9 both trained on C25-C70 through 1667-gt / A48 / B48, i.e. on 9 of core's 12 1667 boxes (C26 ...
+C60). Core's 1667 rows are in-sample for both; the clean numbers are HOLD and the 11-14 holdout boxes. Lead 11-17:
+`/vesuvius/ufsm/univ/scratch1/holdouts-20261118.json` = holdouts-20261114 + the 46 boxes as `wb-C25` ... (score 0: masked from
+training, never validation boxes) for future runs; try9 keeps its holdouts at the resume (it has trained on them). Report core with the
+1667 rows split out. The 1667 pseudo source masks all 70 wbench C boxes: weight 0 on each box + 64 level-2 voxels (the first box list
+of its phase-coh weight) and holdout_file pseudo/holdouts-pseudo1667.json (= holdouts-20261118) with the run's --holdout-guard 32.
+
 **Tests.** test_unroll_qa: --gate-boxes on the right model's 8 tiles (all s 1, 64^3 boxes) and the wrong model's box (s 0, --gate-scale 2
 doubles it). test_surflabels: --gt-cells against itself, every cell's kept voxels and pairs right.
 
