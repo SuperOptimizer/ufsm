@@ -1,6 +1,6 @@
 /* unet_set_head_infer_z (predict --fit-zarr's per-chunk head, 2026-11-17): an inference build without whole-window logits, whose head runs
    per level-0 z range in unet_head_fwd_z32, against the whole-window fp32 logits of the same net, weights and input. MX-fp4 activations and
-   fp16 compute as predict's embedded precision (prec 1, f16, act_mx4). Heads of 32 outputs (two passes of 16), 11 (one pass) and 144 with
+   fp16 compute as predict's embedded precision (prec 1, f16, act_mx4). Heads of 32 outputs (two passes of 16), 11 (one pass), 144 and 48 from 96 inputs (conv1_mx_cn_k) and 144 with
    head channels set (the fields predict's u1 shape: nine passes). Pass: every range (one plane, a middle run, the last planes, the whole
    window) bit for bit; the per-z build reports on and its forward returns no logits. Usage: test_headz */
 #include "nn.h"
@@ -11,8 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int run(int cout, int hc0, int hnc, int D) {
-    unet_cfg cfg = {3, {16, 16, 32}, 2, cout, 8};
+static int run(int cout, int hc0, int hnc, int D, int w0) {   /* w0: level 0's width, the head's inputs (96: u1; lp_conv1_fwd_mx_r's constant-bank conv1_mx_cn_k) */
+    unet_cfg cfg = {3, {w0, w0, 32}, 2, cout, 8};
     unet *u = unet_create(&cfg); unet_init(u, 11);
     if (hnc) unet_set_head_channels(u, hc0, hnc);
     const int rows = hnc ? hnc : cout;
@@ -42,7 +42,7 @@ static int run(int cout, int hc0, int hnc, int D) {
         if (bad) { fprintf(stderr, "test_headz: cout %d rows %d: planes [%d, %d): %zu of %d channels differ from the whole-window logits\n", cout, rows, z0, z1, bad, rows); fails++; }
     }
     const char *e = nn_check(); if (e) { fprintf(stderr, "test_headz: cuda: %s\n", e); fails++; }
-    printf("test_headz: cout %d (head rows %d from %d), %d x 32 x 40 level 0: %s\n", cout, rows, hc0, D, fails ? "FAIL" : "bit-identical over 5 ranges (2 into a wider plane stride)");
+    printf("test_headz: cout %d (head rows %d from %d) from %d inputs, %d x 32 x 40 level 0: %s\n", cout, rows, hc0, w0, D, fails ? "FAIL" : "bit-identical over 5 ranges (2 into a wider plane stride)");
     nn_free(xd); nn_free(yd); free(xh); free(ref); free(got); unet_free(u);
     return fails;
 }
@@ -51,9 +51,11 @@ int main(void) {
     if (nn_init(0)) return test_no_gpu("test_headz", "nn_init(0) failed");
     nn_set_prec(1); nn_set_f16(1); unet_set_act_mx4(1); unet_set_act_mx8(0);
     int fails = 0;
-    fails += run(32, 0, 0, 24);
-    fails += run(11, 0, 0, 16);
-    fails += run(144, 0, 144, 16);
+    fails += run(32, 0, 0, 24, 16);
+    fails += run(11, 0, 0, 16, 16);
+    fails += run(144, 0, 144, 16, 16);
+    fails += run(144, 0, 144, 16, 96);
+    fails += run(48, 0, 0, 12, 96);
     printf("test_headz: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

@@ -207,7 +207,7 @@ static bool conv1_tc(const void *x, int xdt, shape5 xs, const float *w, const fl
    thread share the GN+SiLU coefficient loads. Same values, same operations in the same order as conv1_mx_t_k: bit-identical logits.
    The weights / bias reach c1c_w by a device-to-device copy on the launch's stream (the compute stream), so back-to-back heads with
    other weights stay ordered. UFSM_CONV1_CONST=0: the staged kernel. */
-__constant__ float c1c_w[16 * 32 + 16];   /* [co][ci] (CO x CI) then the CO biases */
+__constant__ float c1c_w[48 * 128 + 48];   /* [co][ci] (CO x CI) then the CO biases (conv1_mx_cn_k: up to 48 x 128) */
 template <int B, int CI, int CO, typename YT, bool GN>   /* GN: gp.G != 0, a template argument so that the GroupNorm branch is not
                                                        tested per input channel and voxel inside the unrolled nest (nvcc unswitched it; mcc kept
                                                        64 uniform branch regions: 897 FFMAs and BSSY / BRA between them, 1605 FFMAs in nvcc's two copies) */
@@ -263,6 +263,90 @@ template <int CI, int CO> static void conv1_mx_c(const void *x, shape5 xs, const
     if (gp.G) conv1_mx_c_k<4, CI, CO, __half, true><<<(unsigned)((Sy + 511) / 512), 256>>>((const uint8_t *)x, y, S, gp, b != nullptr, vb, Sy, cy);
     else conv1_mx_c_k<4, CI, CO, __half, false><<<(unsigned)((Sy + 511) / 512), 256>>>((const uint8_t *)x, y, S, gp, b != nullptr, vb, Sy, cy);
 }
+/* the constant-bank head over NB 32-channel MX blocks (predict's cell head, lp_conv1_fwd_mx_r: 144 outputs from 96 channels, which ran
+   conv1_mx_t_k in 9 passes of 16, each decoding x and its GN+SiLU again: 2.6 ms a pass on a 160^3 window, ~4.8 TFLOP/s): CO outputs a
+   pass (48: 3 passes), V voxels a thread. Each output's sum is conv1_mx_t_k's (bias, then ci ascending, one FFMA each), so the logits are
+   its bits whatever the pass grouping. y: planes of stride Ly (fp32 or fp16) */
+template <int B, int NB, int CO, int V, typename YT, bool GN>
+__global__ void __launch_bounds__(256) conv1_mx_cn_k(const uint8_t *x, YT *y, size_t S, gnp_t gp, int hasb, size_t vb, size_t Sy, size_t Ly) {
+    constexpr int CI = 32 * NB;
+    __shared__ float2 sab[CI];
+    if (GN) for (int i = threadIdx.x; i < CI; i += blockDim.x) sab[i] = gn_ab(gp, 0, i, CI);
+    __syncthreads();
+    const uint8_t *sc = mx_sc<B>(x, 1, CI, S);
+    const size_t l0 = (size_t)blockIdx.x * (blockDim.x * V) + threadIdx.x;
+    float acc[V][CO];
+#pragma unroll
+    for (int j = 0; j < V; j++)
+#pragma unroll
+        for (int co = 0; co < CO; co++) acc[j][co] = hasb ? c1c_w[CO * CI + co] : 0.f;
+#pragma unroll
+    for (int blk = 0; blk < NB; blk++) {
+        float r[V][32];
+#pragma unroll
+        for (int j = 0; j < V; j++) {
+            const size_t vl = l0 + (size_t)j * blockDim.x, v = vb + vl;
+            if (vl < Sy && v < S) mx_load_row_b<B>(x, sc, (size_t)blk * S + v, 32, r[j]);
+            else {
+#pragma unroll
+                for (int k = 0; k < 32; k++) r[j][k] = 0.f;
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < 32; k++) {
+            const int ci = 32 * blk + k;
+            float2 ab = make_float2(0.f, 0.f);
+            if constexpr (GN) ab = sab[ci];
+#pragma unroll
+            for (int j = 0; j < V; j++) {
+                float xv = r[j][k];
+                if constexpr (GN) xv = act_ab(xv, ab.x, ab.y, true);
+#pragma unroll
+                for (int co = 0; co < CO; co++) acc[j][co] += c1c_w[co * CI + ci] * xv;
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < V; j++) {
+        const size_t vl = l0 + (size_t)j * blockDim.x, v = vb + vl;
+        if (vl >= Sy || v >= S) continue;
+#pragma unroll
+        for (int co = 0; co < CO; co++) { if constexpr (sizeof(YT) == 2) y[(size_t)co * Ly + vl] = __float2half(acc[j][co]); else y[(size_t)co * Ly + vl] = acc[j][co]; }
+    }
+}
+#ifndef C1N_CO
+#define C1N_CO 48
+#endif
+#ifndef C1N_V
+#define C1N_V 1
+#endif
+template <int B, int NB, typename YT>
+static void conv1_mx_cn(const void *x, shape5 xs, const float *w, const float *b, int cout, YT *y, gnp_t gp, size_t vb, size_t Sy, size_t Ly) {
+    constexpr int CO = C1N_CO, V = C1N_V, CI = 32 * NB;
+    const size_t S = shape_spatial(xs);
+    const unsigned grid = (unsigned)((Sy + 256 * V - 1) / (256 * V));
+    for (int c0 = 0; c0 < cout; c0 += CO) {   /* (cout % CO == 0) */
+        cudaMemcpyToSymbolAsync(c1c_w, w + (size_t)c0 * CI, sizeof(float) * CO * CI, 0, cudaMemcpyDeviceToDevice, 0);   /* (on the launch's stream) */
+        if (b) cudaMemcpyToSymbolAsync(c1c_w, b + c0, sizeof(float) * CO, sizeof(float) * CO * CI, cudaMemcpyDeviceToDevice, 0);
+        if (gp.G) conv1_mx_cn_k<B, NB, CO, V, YT, true><<<grid, 256>>>((const uint8_t *)x, y + (size_t)c0 * Ly, S, gp, b != nullptr, vb, Sy, Ly);
+        else conv1_mx_cn_k<B, NB, CO, V, YT, false><<<grid, 256>>>((const uint8_t *)x, y + (size_t)c0 * Ly, S, gp, b != nullptr, vb, Sy, Ly);
+    }
+}
+static int g_c1n = -1;   /* mgpu: env */
+extern "C" void nn_set_conv1_cn(int on) { g_c1n = on; }   /* (tests; env UFSM_CONV1_CN, default 1) */
+/* the multi-block constant-bank head when it applies (one sample, no slab GroupNorm, 64 / 96 / 128 inputs, cout a multiple of C1N_CO, a card
+   not shared by logical devices); 0: not taken */
+template <typename YT>
+static int conv1_cn(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, YT *y, gnp_t gp, size_t vb, size_t Sy, size_t Ly) {
+    if (g_c1n < 0) g_c1n = !getenv("UFSM_CONV1_CN") || atoi(getenv("UFSM_CONV1_CN"));
+    if (!g_c1n || (xdt != 4 && xdt != 8) || xs.n != 1 || gp.ns || (xs.c != 64 && xs.c != 96 && xs.c != 128) || cout % C1N_CO) return 0;
+    { int dv = 0; cudaGetDevice(&dv); if (ufsm_dev_share(dv) > 1) return 0; }   /* (c1c_w: one constant bank per physical card, as conv1_const) */
+#define C1N(B_) do { if (xs.c == 64) conv1_mx_cn<B_, 2>(x, xs, w, b, cout, y, gp, vb, Sy, Ly); else if (xs.c == 96) conv1_mx_cn<B_, 3>(x, xs, w, b, cout, y, gp, vb, Sy, Ly); \
+                     else conv1_mx_cn<B_, 4>(x, xs, w, b, cout, y, gp, vb, Sy, Ly); } while (0)
+    if (xdt == 4) C1N(4); else C1N(8);
+#undef C1N
+    return 1;
+}
 /* the constant-bank head when it applies (MX-fp4 input of one 16- or 32-channel block, one sample, no slab GroupNorm, a pass of 1, 2, 4,
    11 or 16 outputs); 0: not taken */
 static int g_c1c = -1;
@@ -313,6 +397,8 @@ extern "C" void lp_conv1_fwd_mx_h16_r(const void *x, int xdt, shape5 xs, const f
 extern "C" int lp_conv1_fwd_mx_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp, size_t vb, size_t nv, size_t ly) {
     if (xs.n != 1 || !nv) return -1;
     if (!ly) ly = nv;   /* (ly: the plane stride of y, >= nv: the planes of a wider buffer) */
+    { static int old0 = -1; if (old0 < 0) old0 = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;   /* mgpu: env */
+      if (!old0 && !slab_small(gp) && conv1_cn<float>(x, xdt, xs, w, b, cout, y, gp, vb, nv, ly)) { LPCK(); return 0; } }   /* (every pass at once) */
     if (cout > 16) {
         if (cout % 16) return -1;
         for (int c0 = 0; c0 < cout; c0 += 16) if (lp_conv1_fwd_mx_r(x, xdt, xs, w + (size_t)c0 * xs.c, b ? b + c0 : nullptr, 16, y + (size_t)c0 * ly, gp, vb, nv, ly)) return -1;
