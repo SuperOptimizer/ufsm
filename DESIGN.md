@@ -6,6 +6,130 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Argus V2 (ruiconte): a Reader V3 fine-tune, runs in our reader3 port; ties reader3, adds nothing to the teacher combo (2026-11-17)
+
+Argus V2 (https://huggingface.co/ruiconte/argus-v2 @ a769fe54, `argus-v2.pth`, sha256 659130f7...de6fd matches the card, MIT,
+fine-tune of domenicor046/reader-v3 (MIT) on native 8-9 um scans of PHerc0139 / 0814 / 0500P2 / 0009B / 0343P / 0172; code
+github.com/ruiconte/ink-swarm be2c6b8, read only, never run). Same network as Reader V3 (vesuvius_unet_3d_stem_2d, 17 layers centred on the
+surface, robust-MAD normalisation, 34.6 M parameters): the 508 state-dict keys and shapes are identical, so it runs as
+`ink-ext --model reader3 --weights argus-v2.pth` (tvar.sh case `argus2`), no new code. Weights /vesuvius/ufsm/inksdk/weights/argus-v2/.
+Parity (test_ink_ext_inksdk_koine, our torch koine reference, 384 px tiles): max |dlogit| 0.0077 random, 0.0037 real surface volume.
+
+| 24 held-out crops                 | 0139  | 1667  | Paris4 | all    | paired                                 |
+|-----------------------------------|-------|-------|--------|--------|----------------------------------------|
+| reader3                           | .9664 | .9290 | .9168  | .9271  |                                        |
+| argus2 fp16                       | .9704 | .9090 | .9172  | .9247  | vs reader3 -0.0024 [-0.0085, +0.0033]  |
+| argus2 MX5                        | .9694 | .9049 | .9173  | .9239  | vs fp16 -0.0008 [-0.0023, +0.0007]     |
+| argus2 --zwin -2,0,2              | .9705 | .9053 | .9184  | .9249  | vs single +0.0002 [-0.0009, +0.0012]   |
+| z-sum reader3+ink9um+hecate24     | .9911 | .9741 | .9260  | .9449  | (production)                           |
+| z-sum argus2+ink9um+hecate24      | .9907 | .9669 | .9264  | .9439  |                                        |
+| z-sum all four                    | .9897 | .9669 | .9278  | .9446  | greedy selection does not pick argus2  |
+
+argus2 vs ink9um: +0.0072 [-0.0027, +0.0161]. It gains on 0139 (one of its training scrolls) and loses 0.02 on 1667. The
+card's +1 AUC point from the -2/0/+2 depth windows does not show here. Argus V2 is available as a teacher but does not join the combo.
+
+## Training perf: try9's step profiled; the head adjoint's gather 7x faster, the w4 runs pinned (2026-11-17, branch trainperf-20261117)
+
+**Profile.** try9's exact argv and env (binary c2646d35, snap/5000.ckpt, `UFSM_MEM_FREE_GB 10.98` reproduces its plan "MX gradients,
+chunked, lean 2, shared encoder a1, 10.07 GB"), --det 1, lr 0, card 1 held exclusively, nsys over steps 5006-5013 (8 windows, one
+update), /vesuvius/ufsm/trainperf (rp.sh, nsum.py). The windows come from the wind fixture (make_wind_fixture fx 1024 2 1,
+sources-ink.json): the replay on try9's sources needs ~30-35 GB of host memory and was OOM-killed twice in the 40 GB dev slice.
+6.01 s a window (try9 on card 0: ~6.7 with real windows and the sampler's GPU work beside it). Per window:
+
+| stage | ms | share |
+|---|---|---|
+| 3^3 conv forward incl. the lean recompute and backward-data (conv_fwd_f4_k 1828, conv_fwd_s2_f8_k 138) | 1974 | 33 % |
+| weight gradients (conv_bwd_w_f4ws_k 1215, conv_bwd_w_s2_f8_k 142, the head's conv_bwd_w1_tc_k 187) | 1570 | 27 % |
+| head slabs / losses (lat_adj_xy_t_k 458, loss_grad + loss_stats 143, w4 events / runs / stats / grad 214, lat_fuse 92, slab_tg 61) | 1080 | 18 % |
+| fine stem (fstem_fwd_k 417: upsample + stem + logit write fused; fstem_bwd_k 106) | 526 | 9 % |
+| input build, scanner aug, label warps | 184 | 3 % |
+| head 1^3 forward / backward-data, GroupNorm, optimizer (NorMuon + AdamW at accum 10), MX converts | 136 / 120 / 72 / 18 | 6 % |
+| attention (4 blocks at the deepest level) | < 1 | 0 |
+| GPU idle: ~5 gaps > 10 ms a window, all in the label-warp stage at the window start | 210 | 3.5 % |
+| launch gaps < 1 ms (what CUDA graphs could remove) | 8 | 0.1 % |
+
+**The head adjoint's y / x gather** (nn_lat_up_adj_c: the slab's fp16 logit gradient onto the coarse cell grid, 2 calls a slab, 48 slabs)
+ran at ~30 GB/s: lat_adj_xy_t_k (the 11-13 "tiled" kernel) indexes lat_adj_w's 10-entry weight arrays with loop variables, so they
+live in local memory, and every voxel was staged 2.5 times. bench_latadj at try9's slab (192^2 cells, 16 planes, 14 channels), card 1:
+
+| kernel (UFSM_LAT_ADJ_TILE) | ms | GB/s of fp16 gradient read |
+|---|---|---|
+| 2: lat_adj_xy_t_k (the default until now) | 8.6-10.0 | 26-31 |
+| 0: lat_adj_xy_k (per cell) | 2.6-3.3 | 80-102 |
+| 1: lat_adj_xy_r_k (new default) | 1.0-1.2 | 220-260 |
+
+lat_adj_xy_r_k: a thread owns a coarse column of 8 coarse rows and walks the 38 fine rows they read once (1.19 reads per voxel), each
+row's 4 + 3 + 3 taps as three 8-byte loads (the neighbours' from L1), the weights in registers (lat_adj_w1, no tables), each row's x sum
+added into the coarse rows it reaches in ascending tap order: lat_adj_xy_k's sums term for term. test_lat compares all three modes
+byte for byte (3 grid shapes incl. a partial strip and a 1 x 1 grid, 3 slabs each). A first strip version with a local `const float
+A[10]` took 4.8 ms and one with per-row local tables 72 ms: under mcc any indexed small array costs local memory traffic.
+
+Fixture A/B (try9 binary / new / try9 binary, 14 windows, --det 1, lr 0): every step's losses identical across the three arms;
+5.921 / 5.551 / 5.951 s a window over steps 5003-5014: **-6.4 %**.
+
+**The w4 runs upload.** The window-start nsys timeline showed the trainer thread inside one cudaMemcpyHtoDAsync for ~150-200 ms with
+the GPU idle: nn_w4runs_apply_z copied the slot's runs (off / ro / cb, ~14 MB, malloc'd in the sampler slot) with cudaMemcpyAsync from
+pageable memory, which waits for the copy stream (the CT aug, the phase warp and its 453 MB round trips) to drain before it returns, so
+the forward was launched only after the label stage. They now go through a per-device pinned staging buffer (reused after the previous
+call's event; UFSM_W4_PINNED=0 the old path). Same bytes (test_w4dev, test_slot_planes; the fixture A/B's step lines identical). Small:
+the window-start idle gaps > 10 ms went 210 -> 188 ms a window (nsys, the same capture), the wall clock within noise (5.527 against
+5.506 / 5.557 s for the lat_adj binary before and after it). lat_adj_xy in that capture: 458 -> 41 ms a window.
+
+**The copy stream at the highest priority.** With the trainer thread unblocked, every label-stage operation was issued at the window
+start, yet the label planes were done only ~180 ms after the forward (nsys, the issue times of the copy stream's work): the w4 rebuild's
+~60 small kernels (w4_runs_k / w4_out_k, ~1 ms each) and the warps got SMs only between the forward's conv kernels, one per gap, and the
+head's first slab waits for them (ev_lab). copy_stream() is now created at cudaDeviceGetStreamPriorityRange's greatest priority
+(UFSM_COPY_PRIO=0: the default priority): idle gaps > 10 ms 186 -> 41 ms a window, kernels busy 96.4 -> 99.0 % of the capture, step
+lines identical, 5.464 -> 5.322 s a window (two arms 5.321 / 5.322): **-2.6 %**.
+
+**The head's weight gradient, 4 output tiles a block.** conv_bwd_w1_tc_k (256 MX-fp4 channels -> 160 outputs on the cell grid) ran one
+block per (8-output tile, 32-channel input block): every x tile was dequantised, GroupNorm-ed and SiLU-ed 20 times. NT 4 keeps 4 column
+tiles on one staged act(x) tile (the reduction buffer overlays the operand tiles after the loop); per (ci, co) the voxel order, the
+warps' order and the blocks are those of NT 1, so the sums are the same (test_hgscale: byte equal, 256 -> 160 and 32 -> 16; UFSM_W1_NT=1
+the old path). 189 -> 146 ms a window; 5.497 -> 5.453 s (**-0.8 %**).
+
+Together on the fixture: **5.921 -> 5.321 s a window (-10.1 %)** against try9's binary, every step line identical.
+
+**What is left** (result-neutral): fstem_fwd_k at ~70 GB/s of logit writes (417 ms; ~35 KB of shared memory a 128-thread block, so 2-3
+blocks an SM; ncu could not profile it inside the trainer under mcudahw), and the convs (60 %, tuned: no fusion left, sparse24-20261113). Result-changing: --sparse24 mode 3 (~5 % of this
+step), skip-empty above thr 0. Not worth it: the optimizer (1.2 %), attention (0), CUDA graphs (launch gaps 0.1 %).
+
+## Flatten solver A/B: the GPU CG matvec in fp32 by default; relative-residual stop and decimation by vertex count dropped (2026-11-17, branch flatfp32-20261117)
+
+The per-wrap flatten and strip-flatten (GPU SLIM, fp64 Jacobi PCG, 200 steps max) are fp64-bound on the 5060 Ti. Three variants
+were gated on all 72 0332 wraps (gate harness /vesuvius/ufsm/unrollperf/gate: strip-flatten + strip-distort, per wrap flatten ->
+render -> ink-compare; card 1 shared):
+
+| variant | strip s | per-wrap s | distort p95 | trusted | folded | per wrap vs GPU fp64 |
+|---|---|---|---|---|---|---|
+| GPU fp64 (a) | 214 | 711 | 0.1389 | 0.5821 | 0.00109 | - |
+| GPU fp64 (b) | 213 | 682 | 0.1389 | 0.5821 | 0.00109 | every metric identical (deterministic) |
+| CPU fp64 (41 wraps, ~8 min each) | 2241 | - | 0.1389 | 0.5819 | 0.00109 | the noise floor (two valid solvers) |
+| fp32 matvec (dots, vectors fp64) | 168 | 516 | 0.1389 | 0.5816 | 0.00108 | see below |
+| rtol 0.1 | 96 | 326 | 0.1429 | 0.5673 | 0.00111 | worse: dropped |
+| fp32 + rtol 0.1 | 85 | 331 | 0.1421 | 0.5657 | 0.00106 | worse: dropped |
+| decim by vertex count (1.5 M) | 227 | 571 | 0.1389 | 0.5821 | 0.00109 | aniso>1.2 +94 % (coarser on big wraps): dropped |
+
+fp32 against the noise floor (lead: CPU fp64 vs GPU fp64 = two valid solvers of the same problem; GPU fp64 run to run is
+bit-identical). 0332, the 41 wraps with a CPU fp64 run (w035 / w069 included): every per-wrap maximum within 1.5x the CPU-vs-GPU
+maximum (aniso>1.2 w069 12.9 % vs CPU 14.7 % on w068; cm2 w035 2.33 % both); 6 of 17 mean metrics above the CPU spread (energy 1.05e-3
+vs 0.96e-3, aniso p50 / p95 / p99, ink mean, frac50; each <= 1e-3 relative), judged noise against -27 % per wrap. w035 / w069 renders
+(ink + CT) fp32 vs fp64 side by side: no visible difference (/vesuvius/ufsm/unrollperf/gate/eyeball, deleted with the gate data).
+
+1667 (47 wraps, base run up to the strip with the ink head only; GPU fp64 vs fp32, one binary):
+
+| | strip s | per-wrap s | distort p95 | trusted | folded |
+|---|---|---|---|---|---|
+| GPU fp64 | 59 | 452 | 0.1409 | 0.6406 | 0.00143 |
+| fp32 | 67 | 356 | 0.1401 | 0.6402 | 0.00143 |
+
+aniso>1.2 per wrap: worst degradation +3.1 % relative (w041) against the 0332 CPU-vs-GPU worst +5.6 % (w049); fp32 better on 10
+wraps, worse on 13. The largest change (16 %, w003, 1.16 cm2, a strongly distorted wrap) is an improvement (aniso>1.2 14.5 -> 12.1 %,
+energy 4.30 -> 4.26). Trusted share -0.0004 (0332 CPU-vs-GPU -0.0002): accepted (lead, 0.06 % relative, changes both ways).
+Default since then: flatten / strip-flatten run the CG's matvec in fp32 (dot products, r / z / x / p and the step in fp64); the fp64
+solve is `--cg-fp32 0` or `UFSM_FLAT_CG_FP32=0`. test_flatten_gpu checks both paths against the CPU solver (fp32 max |duv| 3.2e-5 on the
+cone with holes, fp64 2.5e-6; energies equal to 1e-9). The rtol / vertex-count code is removed.
+
 ## Unroll perf 5: volcomp's lossless encoder 2-2.5x, the lossless sink decoder ~25 % (byte-identical; 2026-11-17, branch unrollperf5-20261117)
 
 - The unroll's ink is now the critical path: with recto-sp on the GPU (192 -> ~45 s) the chain from the ink's start to snap is ~520 s
@@ -24,6 +148,9 @@ Originally no teacher models; since 2026-11-15 published ink networks run as tea
 - src/volcomp_fast.h vllx_decode_sub_sink, the DENSE loop: both tANS lanes in registers, a voxel pair per step, the context model by
   table: ~25 % fewer cycles per lossless chunk (decode only, 3.9 -> 3.0 G cycles over the 32 ink chunks); test_volcomp_vll decodes
   every synthetic chunk through the sink, whole and in a box cutting blocks.
+- ink-blend's voxel loop for two inputs (the unroll's grids): the row's wz wy product hoisted (the same (wz wy) wx order, volatile), the
+  masks per row: a further 13-17 % of a blend's cycles (0332 mini box, ink / c12 / c13: 135 -> 118, 149 -> 125, 150 -> 124 G cycles),
+  outputs identical (md5 of every file).
 - Predict, latink recipe, 32 windows: user CPU 240 -> 182 s, wall 12-14 s either way (GPU-bound); outputs identical. ink-blend of one
   head (0332 mini box, g0 + g256): 765 / 774 -> 639 / 650 G cycles (-17 %), outputs identical (all three heads compared).
 ## 2-D ink teachers in MX-fp4: quantiser options, deterministic GroupNorm, accuracy floor (2026-11-16, branch fp4teach-20261116)
@@ -213,7 +340,7 @@ The GPU run's time splits as:
 Left: the 1667 field decode (t0..t5 + w of 11.7 G cells; only 1/64 of them are sampled, but the codec decodes whole chunks), the
 lossless shard encodes, and the fp64 kernel. A lazy profile (±half first, the ±half2 tail only where the inner window has fewer than
 --min-int intervals, exact when hit clusters separated by >= sep bound the window) would cut ~1/3 of the kernel: not done.
-## ink-ext --ct-floor (zero CT below T before normalisation): null, not merged; hecate24 MX5 is slower (2026-11-17)
+## ink-ext --ct-floor (zero CT below T before normalisation): null, not merged; hecate24 MX5 speed (2026-11-17)
 
 Question (user): would it help to zero air/void that is neither papyrus nor masked (low CT values)? Test: in ink-ext's render,
 every sampled u8 CT value < T becomes 0 before the model's own normalisation (default 0 = off). Scored on the 24 crops (tvar.sh),
@@ -242,10 +369,13 @@ read the air/papyrus contrast and low-density texture (robust_mad / z-score norm
 sits at 39-55 and the air/papyrus valley at 57-73 (airiso's air_iso.tsv), so T 40-80 cuts into the papyrus fringe where ink sits.
 A floor would have to be learned in training, not applied to frozen teachers.
 
-hecate24 MX-fp4 speed (bench region 1500,900,995,260 of 1667 w013, 102.98 Mpx at 2.399 um, card 1): fp16 846.9 s (0.122 Mpx/s,
-net 833.5 s, 7.4 tiles/s), UFSM_XNET_MX=5 1298.2 s (0.079 Mpx/s, net 1280.4 s, 4.8 tiles/s). MX5 holds AUC (-0.0002 [-0.0009,
-+0.0004]) but is 1.53x slower on these 62x64x64 Co=64 3x3x3 convs, so hecate24 stays fp16. Render is 30-32 s of the wall
-(level-0 cache on disk), so the net is the whole cost.
+hecate24 MX-fp4 speed (bench region 1500,900,995,260 of 1667 w013, 102.98 Mpx at 2.399 um, card 1). MX5 holds AUC (-0.0002 [-0.0009,
++0.0004]); the speed is not settled, card 1 was shared in every full-region run. 31cae5a0: fp16 846.9 s (0.122 Mpx/s), MX5 1298.2 s
+(0.079 Mpx/s; this run overlapped another card-1 job, so the earlier "MX5 1.53x slower" was contention). 07465e87, 09:10-09:35, card
+still shared: MX5 684.1 s (0.151 Mpx/s, 9.3 tiles/s), fp16 612.0 s (0.168 Mpx/s, 10.3 tiles/s). Net-only synthetic tiles
+(UFSM_IE_BENCH, idle card): fp16 91 / 88 / 95 ms per tile at batch 1 / 2 / 4, MX5 85 / 78 / 79. A quiet back-to-back pair is
+pending (scripts/benchh24c.sh in /vesuvius/ufsm/inksdk); hecate24 stays fp16 until then. Render is 29-32 s of the wall (level-0
+cache on disk), so the net is the whole cost.
 
 ## Unroll perf 3: no context on unlisted cards; the ref's chunk rows fixed (2026-11-17, branch unrollperf3-20261117)
 

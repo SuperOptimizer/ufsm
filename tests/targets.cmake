@@ -391,6 +391,7 @@ ufsm_exe(bench_wgl0 tests/bench_wgl0.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_sp24_mma SUITE tests/test_sp24_mma.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_sp24_conv SUITE tests/test_sp24_conv.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_sp24 tests/bench_sp24.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(bench_latadj tests/bench_latadj.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(s2b_replay tests/s2b_replay.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_widen SUITE tests/test_widen.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_sampbias SUITE tests/test_sampbias.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush

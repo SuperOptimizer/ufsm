@@ -118,6 +118,15 @@ static void cmp_gpu(const char *name, surf_fn f, int holes) {
             CHECK(!J[k].rc && J[k].m.nv == m[1].nv && !memcmp(J[k].m.uv, m[1].uv, (size_t)m[1].nv * 16), "%s: concurrent GPU run %d differs", name, k);
             if (!J[k].rc) flat_mesh_free(&J[k].m); }
     }
+    {   /* the fp64 CG (--cg-fp32 0; fp32 matvec is the default since 2026-11-17): the same tolerance against the CPU */
+        flat_opts o = flat_opts_default(); o.min_verts = 800; o.nthreads = 4; o.iters = 60; o.cg_iters = 400; o.tol = 1e-9; o.gpu = 1; o.cg_fp32 = 0;
+        flat_mesh m6; flat_stats b6, a6;
+        CHECK(!flat_grid(X, Y, Z, w, h, 1.0, &o, &m6, &b6, &a6), "%s: flat_grid fp64 failed", name);
+        double d6 = 0; for (int i = 0; m6.nv == m[0].nv && i < 2 * m[0].nv; i++) d6 = fmax(d6, fabs(m[0].uv[i] - m6.uv[i]));
+        printf("%s: GPU fp64 CG vs CPU max |duv| %.2e, energy %.9f vs %.9f\n", name, d6, a6.energy, a[0].energy);
+        CHECK(m6.nv == m[0].nv && d6 < 1e-4 && fabs(a[0].energy - a6.energy) < 1e-7, "%s: GPU fp64 solution differs (max |duv| %.3g)", name, d6);
+        flat_mesh_free(&m6);
+    }
     for (int k = 0; k < 3; k++) flat_mesh_free(&m[k]);
     free(X); free(Y); free(Z);
 }

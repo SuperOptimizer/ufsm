@@ -44,6 +44,7 @@ typedef struct {
     int gpu;            /* 1: SLIM iterations on the GPU when the binary has nn_flat.o and a device answers (same algorithm, fp64; else
                            the CPU solver). 0 (default): CPU */
     int gpu_dev;        /* the CUDA device of the GPU solver (-1: the thread's current device) */
+    int cg_fp32;        /* 1: the GPU CG's matvec in fp32 (dots and vectors fp64) */
 } flat_opts;
 flat_opts flat_opts_default(void);
 /* CUDA devices the GPU solver can use (0: none, or a binary without nn_flat.o) */

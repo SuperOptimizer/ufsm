@@ -564,9 +564,17 @@ extern "C" void *nn_malloc_try(size_t n) { { void *q = pool_dev(n ? n : 4); if (
 extern "C" void *nn_host_alloc_try(size_t n) { void *p = pool_take(n, 1); if (p) return p; if (cudaMallocHost(&p, n) != cudaSuccess) { cudaGetLastError(); if (!g_pool_on) return nullptr; pool_trim(1); if (cudaMallocHost(&p, n) != cudaSuccess) { cudaGetLastError(); return nullptr; } }
     host_track(p, n, __builtin_return_address(0)); pool_add(p, n, 1); return p; }
 extern "C" void nn_host_free(void *p) { if (p) { if (pool_release(p)) return; host_untrack(p); CK(cudaFreeHost(p)); } }
+/* the copy stream at the device's highest priority (trainperf 2026-11-17; UFSM_COPY_PRIO=0: the default priority): its batch work (the
+   input build, the label warps, the w4 rebuild's ~60 small kernels) otherwise got SMs only between the forward's conv kernels, and the
+   label planes of a P 768 window were done ~180 ms after the forward: the head slabs waited for them with the GPU idle */
 cudaStream_t copy_stream(void) {
-    static cudaStream_t st[8]; int d = 0; cudaGetDevice(&d); d &= 7;
-    if (!st[d]) CK(cudaStreamCreateWithFlags(&st[d], cudaStreamNonBlocking));
+    static cudaStream_t st[8]; int d = 0; cudaGetDevice(&d); d &= 7;   /* mgpu: guarded (one slot per device, its own host thread) */
+    if (!st[d]) {
+        static int pr = -1;   /* mgpu: env */
+        if (pr < 0) { const char *e = getenv("UFSM_COPY_PRIO"); pr = !(e && *e == '0'); }
+        int lo = 0, hi = 0; cudaDeviceGetStreamPriorityRange(&lo, &hi);
+        if (pr && hi != lo) CK(cudaStreamCreateWithPriority(&st[d], cudaStreamNonBlocking, hi)); else CK(cudaStreamCreateWithFlags(&st[d], cudaStreamNonBlocking));
+    }
     return st[d];
 }
 extern "C" void nn_d2h_copy_stream(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToHost, copy_stream())); }   /* d must be pinned */

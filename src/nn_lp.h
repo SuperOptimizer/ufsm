@@ -140,6 +140,7 @@ void lp_conv1_fwd_mx_h16_r(const void *x, int xdt, shape5 xs, const float *w, co
 int lp_conv1_fwd_mx_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp, size_t vb, size_t nv, size_t ly);   /* fp32 voxels [vb, vb + nv), the bits of lp_conv1_fwd_mx */
 void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp);
 int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp);
+int lp_set_w1_nt(int on);   /* lp_bwd_w1_mx_b_r: 4 output tiles per block on one staged act(x) tile (1, default) or one (0, UFSM_W1_NT=1); on < 0 reads; returns the previous */
 int lp_bwd_w1_mx_b_r(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp, size_t vb, size_t vn);   /* voxels [vb, vb + vn) */   /* also gb when it returns 1 */
 int lp_head_bwd_mx_r(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, const float *w, float *gw, float *gb, void *gx, int gxdt, gnp_t gp, unsigned sr,
                      size_t vb, size_t nv);   /* voxels [vb, vb + nv), gy planes of nv voxels */

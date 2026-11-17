@@ -338,8 +338,52 @@ __global__ void __launch_bounds__(AXT) lat_adj_xy_t_k(const f16 *g, int h, int w
     }
     t[((size_t)cs * h + cy) * w + cx] = s;
 }
+/* the same gather by coarse-row strips (trainperf 2026-11-17: lat_adj_xy_t_k ran at ~32 GB/s, 8.3 ms a 14-channel P 768 slab, ~460 ms a
+   window, mostly the local copies of lat_adj_w's weight table): a thread owns one coarse column cx of AXR coarse rows; it walks the 4 AXR + 6 fine rows its strip reads once (1.19 reads per
+   fine voxel instead of 2.5), loads each row's 4 fine voxels of cells cx - 1, cx, cx + 1 as 8-byte words (the neighbours' from L1), and
+   adds each row's x sum into the coarse rows it reaches in ascending tap order: lat_adj_xy_k's fp32 sums term for term, the same bytes */
+enum { AXR = 8, AXB = 64 };
+__device__ static inline float lat_adj_w1(int c, int n, int k) {   /* lat_adj_w's wt[k] (exact dyadic sums: any order gives the same float) */
+    float v = k == 0 || k == 9 ? 0.0625f : k == 1 || k == 8 ? 0.1875f : k == 2 || k == 7 ? 0.375f : k == 3 || k == 6 ? 0.625f : 0.75f;   /* (no local table) */
+    if (c == 0) v += k == 3 ? 0.375f : k == 4 ? 0.1875f : k == 5 ? 0.0625f : 0.f;
+    if (c == n - 1) v += k == 4 ? 0.0625f : k == 5 ? 0.1875f : k == 6 ? 0.375f : 0.f;
+    return v;
+}
+__global__ void __launch_bounds__(AXB) lat_adj_xy_r_k(const f16 *g, int h, int w, int nz, float *t) {
+    const int H = 4 * h, W = 4 * w, cx = blockIdx.x * AXB + threadIdx.x, cy0 = blockIdx.y * AXR, cs = blockIdx.z;
+    if (cx >= w) return;
+    const f16 *gs = g + (size_t)cs * H * W;
+    const int xl = cx > 0, xr = cx + 1 < w;   /* (x0 = 0 / x1 = 10: the taps into the neighbour cells) */
+    const float w0 = lat_adj_w1(cx, w, 0), w1 = lat_adj_w1(cx, w, 1), w2 = lat_adj_w1(cx, w, 2), w3 = lat_adj_w1(cx, w, 3), w4 = lat_adj_w1(cx, w, 4);
+    const float w5 = lat_adj_w1(cx, w, 5), w6 = lat_adj_w1(cx, w, 6), w7 = lat_adj_w1(cx, w, 7), w8 = lat_adj_w1(cx, w, 8), w9 = lat_adj_w1(cx, w, 9);
+    float s[AXR];
+#pragma unroll
+    for (int k = 0; k < AXR; k++) s[k] = 0.f;
+#pragma unroll
+    for (int j = 0; j < 4 * AXR + 6; j++) {   /* fine row fy = 4 cy0 - 3 + j: tap a = j - 4 k of coarse row cy0 + k */
+        const int fy = 4 * cy0 - 3 + j;
+        if (fy < 0 || fy >= H) continue;
+        const f16 *row = gs + (size_t)fy * W + 4 * cx;
+        const uint2 z2 = make_uint2(0u, 0u);
+        const uint2 qm = xl ? *(const uint2 *)(row - 4) : z2, q0 = *(const uint2 *)row, qp = xr ? *(const uint2 *)(row + 4) : z2;
+        const __half2 *A2 = (const __half2 *)&qm, *B2 = (const __half2 *)&q0, *C2 = (const __half2 *)&qp;
+        float r = 0.f;   /* (lat_adj_xy_k's order: b = x0 .. x1 - 1) */
+        if (xl) { r += w0 * __high2float(A2[0]); r += w1 * __low2float(A2[1]); r += w2 * __high2float(A2[1]); }
+        r += w3 * __low2float(B2[0]); r += w4 * __high2float(B2[0]); r += w5 * __low2float(B2[1]); r += w6 * __high2float(B2[1]);
+        if (xr) { r += w7 * __low2float(C2[0]); r += w8 * __high2float(C2[0]); r += w9 * __low2float(C2[1]); }
+#pragma unroll
+        for (int k = 0; k < AXR; k++) {
+            const int a = j - 4 * k, cy = cy0 + k;
+            if (a < 0 || a >= 10) continue;
+            if (cy >= h || (cy == 0 && a < 3) || (cy == h - 1 && a >= 7)) continue;
+            s[k] += lat_adj_w1(cy, h, a) * r;
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < AXR; k++) if (cy0 + k < h) t[((size_t)cs * h + cy0 + k) * w + cx] = s[k];
+}
 static int g_adj_tile = -1;   /* mgpu: config */
-extern "C" int nn_lat_set_adj_tile(int on) { if (g_adj_tile < 0) { const char *e = getenv("UFSM_LAT_ADJ_TILE"); g_adj_tile = !(e && *e == '0'); } const int was = g_adj_tile; if (on >= 0) g_adj_tile = on; return was; }
+extern "C" int nn_lat_set_adj_tile(int on) { if (g_adj_tile < 0) { const char *e = getenv("UFSM_LAT_ADJ_TILE"); g_adj_tile = e && *e ? atoi(e) : 1; }   /* 1 the row strips, 2 the 11-13 tiles, 0 per cell */ const int was = g_adj_tile; if (on >= 0) g_adj_tile = on; return was; }
 /* stage 2 (z): coarse planes [cz0, cz1) add their fine planes of the slab */
 __global__ void lat_adj_z_k(const float *t, int C, int d, int h, int w, int z0, int nz, int cz0, int cz1, float *gc, int q0, int qd) {
     const size_t pl = (size_t)h * w, nc = (size_t)(cz1 - cz0) * pl, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -611,7 +655,9 @@ extern "C" void nn_lat_up_adj_c(const void *g, int C, int d, int h, int w, int z
         const int a0 = max(z0 / 4 - 1, 0), a1 = min((z0 + nz) / 4 + 1, d);
         for (int c0 = 0; c0 < C; c0 += 28) {
             const int c = min(28, C - c0); const size_t n1 = (size_t)c * nz * h * w;
-            if (nn_lat_set_adj_tile(-1)) lat_adj_xy_t_k<<<dim3((unsigned)((w + AXT - 1) / AXT), (unsigned)h, (unsigned)(c * nz)), AXT>>>((const f16 *)g + (size_t)c0 * nz * 16 * h * w, h, w, nz, (float *)scratch);
+            const int tm = nn_lat_set_adj_tile(-1);
+            if (tm == 1) lat_adj_xy_r_k<<<dim3((unsigned)((w + AXB - 1) / AXB), (unsigned)((h + AXR - 1) / AXR), (unsigned)(c * nz)), AXB>>>((const f16 *)g + (size_t)c0 * nz * 16 * h * w, h, w, nz, (float *)scratch);
+            else if (tm == 2) lat_adj_xy_t_k<<<dim3((unsigned)((w + AXT - 1) / AXT), (unsigned)h, (unsigned)(c * nz)), AXT>>>((const f16 *)g + (size_t)c0 * nz * 16 * h * w, h, w, nz, (float *)scratch);
             else lat_adj_xy_k<<<nblk(n1, 256), 256>>>((const f16 *)g + (size_t)c0 * nz * 16 * h * w, c, h, w, nz, (float *)scratch);
             lat_adj_z_k<<<nblk((size_t)(a1 - a0) * h * w * c, 256), 256>>>((const float *)scratch, c, d, h, w, z0, nz, a0, a1, gc + (size_t)c0 * qd * h * w, q0, qd);
         }

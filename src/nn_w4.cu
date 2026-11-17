@@ -344,7 +344,10 @@ int ctx_run(w4ctx *c, const uint8_t *phase, int D, int H, int W, int tile, int m
     if (st) *st = acc;
     return next;
 }
-struct w4app { uint8_t *d_ph, *d_c; uint16_t *d_R; uint32_t *d_cnt; size_t vox, rows; uint32_t *d_off; size_t noff; uint8_t *d_lut; size_t nlut; cudaEvent_t done; };
+struct w4app { uint8_t *d_ph, *d_c; uint16_t *d_R; uint32_t *d_cnt; size_t vox, rows; uint32_t *d_off; size_t noff; uint8_t *d_lut; size_t nlut; cudaEvent_t done;
+                uint8_t *h_st; size_t nst; };   /* h_st: pinned staging of the runs' off / ro / cb (trainperf 2026-11-17: from the slot's malloc'd
+                                                  runs the async copies were synchronous, the trainer thread waited ~150 ms a window for the copy stream to
+                                                  drain before it could launch the forward); reused after the previous call's done */
 /* (per device, shared by every stream: nn_w4runs_label_z runs on the copy stream or stream 0 per call, so a call's stream first waits for
    the previous call's work on the scratch (done, recorded on its stream before the mutex is released); audit mini/cudasync #1: two calls
    on different streams could overwrite d_off / d_lut / d_ph under kernels still reading them) */
@@ -404,8 +407,22 @@ extern "C" int nn_w4runs_apply_z(const uint8_t *phase_d, int D, int H, int W, in
     { const size_t rmax = (size_t)(T < D ? T : D) * (T < H ? T : H) * ntx; if (rmax > a->rows) { cudaFree(a->d_cnt); a->rows = 0; AK(cudaMalloc(&a->d_cnt, rmax * 4)); a->rows = rmax; } }
     if (o->noff > a->noff) { cudaFree(a->d_off); a->noff = 0; AK(cudaMalloc(&a->d_off, (o->noff + o->noff / 4 + 1024) * 4)); a->noff = o->noff + o->noff / 4 + 1024; }
     if (2 * o->nr > a->nlut) { cudaFree(a->d_lut); a->nlut = 0; AK(cudaMalloc(&a->d_lut, 2 * o->nr + o->nr / 2 + 8192)); a->nlut = 2 * o->nr + o->nr / 2 + 8192; }
-    AK(cudaMemcpyAsync(a->d_off, o->off, o->noff * 4, cudaMemcpyHostToDevice, s));
-    if (o->nr) { AK(cudaMemcpyAsync(a->d_lut, o->ro, o->nr, cudaMemcpyHostToDevice, s)); AK(cudaMemcpyAsync(a->d_lut + o->nr, o->cb, o->nr, cudaMemcpyHostToDevice, s)); }
+    {   /* the runs through the pinned staging buffer (UFSM_W4_PINNED=0: straight from the slot's pageable copies, as before) */
+        static int pin = -1;   /* mgpu: env (read once; every thread reads the same value) */
+        if (pin < 0) { const char *e = getenv("UFSM_W4_PINNED"); pin = !(e && *e == '0'); }
+        const size_t need = o->noff * 4 + 2 * o->nr;
+        if (pin && need > a->nst) { if (a->h_st) { AK(cudaEventSynchronize(a->done)); cudaFreeHost(a->h_st); } a->h_st = nullptr; a->nst = 0;
+                                     if (cudaHostAlloc((void **)&a->h_st, need + need / 4 + 65536, cudaHostAllocDefault) == cudaSuccess) a->nst = need + need / 4 + 65536; else { cudaGetLastError(); a->h_st = nullptr; } }
+        if (pin && a->h_st && need <= a->nst) {
+            AK(cudaEventSynchronize(a->done));   /* (the previous call's copies out of the staging: long done, a window ago) */
+            memcpy(a->h_st, o->off, o->noff * 4); if (o->nr) { memcpy(a->h_st + o->noff * 4, o->ro, o->nr); memcpy(a->h_st + o->noff * 4 + o->nr, o->cb, o->nr); }
+            AK(cudaMemcpyAsync(a->d_off, a->h_st, o->noff * 4, cudaMemcpyHostToDevice, s));
+            if (o->nr) AK(cudaMemcpyAsync(a->d_lut, a->h_st + o->noff * 4, 2 * o->nr, cudaMemcpyHostToDevice, s));
+        } else {
+            AK(cudaMemcpyAsync(a->d_off, o->off, o->noff * 4, cudaMemcpyHostToDevice, s));
+            if (o->nr) { AK(cudaMemcpyAsync(a->d_lut, o->ro, o->nr, cudaMemcpyHostToDevice, s)); AK(cudaMemcpyAsync(a->d_lut + o->nr, o->cb, o->nr, cudaMemcpyHostToDevice, s)); }
+        }
+    }
     {
         size_t ob = 0;
         for (int z0 = 0; z0 < D; z0 += T) for (int y0 = 0; y0 < H; y0 += T) {

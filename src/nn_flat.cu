@@ -107,6 +107,32 @@ __global__ void k_update(long long n2, double alpha, double *d, const double *p,
     fl_bsum2(rz, rr, part);
 }
 __global__ void k_pdir(long long n2, double beta, const double *z, double *p) { GS(i, n2) p[i] = z[i] + beta * p[i]; }
+/* --cg-fp32 (UFSM_FLAT_CG_FP32, 2026-11-17): the CG's matvec in fp32 (float copies of g, A, M, Q and of the direction p; the per-vertex
+   sums in fp32, lam p and every dot product in fp64, r / z / d and the step fp64): the matvec is the solve's memory and fp64-rate bound
+   (the 5060 Ti runs fp64 at 1/64 of fp32) */
+__global__ void k_tof(long long n, const double *a, float *b) { GS(i, n) b[i] = (float)a[i]; }
+__global__ void k_triq_f(int nt, const float *g, const float *A, const int *tri, const float *M3, const float *src, float *Qo) {
+    GS(t, nt) {
+        const float *gg = g + 6 * t; const int *v = tri + 3 * t; float J[4] = {0, 0, 0, 0};
+        for (int k = 0; k < 3; k++) { const float u = src[2 * v[k]], w = src[2 * v[k] + 1]; J[0] += u * gg[2 * k]; J[1] += u * gg[2 * k + 1]; J[2] += w * gg[2 * k]; J[3] += w * gg[2 * k + 1]; }
+        const float *M = M3 + 3 * t, a = A[t]; float *Q = Qo + 4 * t;
+        Q[0] = a * (M[0] * J[0] + M[1] * J[2]); Q[1] = a * (M[0] * J[1] + M[1] * J[3]); Q[2] = a * (M[1] * J[0] + M[2] * J[2]); Q[3] = a * (M[1] * J[1] + M[2] * J[3]);
+    }
+}
+__global__ void k_gather_f(int nv, const int *vo, const int *vl, const float *Q4, const float *g, double lam, const double *src, double *dst, double *part) {
+    double pq = 0;
+    GS(v, nv) {
+        float a = 0, b = 0;
+        for (int i = vo[v]; i < vo[v + 1]; i++) {
+            const int t = vl[i] / 3, k = vl[i] % 3; const float *Q = Q4 + 4 * (long long)t, *gg = g + 6 * (long long)t + 2 * k;
+            a += Q[0] * gg[0] + Q[1] * gg[1]; b += Q[2] * gg[0] + Q[3] * gg[1];
+        }
+        const double da = lam * src[2 * v] + (double)a, db = lam * src[2 * v + 1] + (double)b;
+        dst[2 * v] = da; dst[2 * v + 1] = db; pq += src[2 * v] * da + src[2 * v + 1] * db;
+    }
+    fl_bsum2(pq, 0, part);
+}
+__global__ void k_pdir_f(long long n2, double beta, const double *z, double *p, float *pf) { GS(i, n2) { const double v = z[i] + beta * p[i]; p[i] = v; pf[i] = (float)v; } }
 __global__ void k_sub(long long n2, double *d, const double *x) { GS(i, n2) d[i] -= x[i]; }
 __global__ void k_axpy(long long n2, double a, const double *x, const double *d, double *xt) { GS(i, n2) xt[i] = x[i] + a * d[i]; }
 __global__ void k_maxstep(int nt, const int *tri, const double *x, const double *d, double *part) {
@@ -139,9 +165,10 @@ typedef struct {
     int nv, nt; long long n2;
     double *g, *A, *M, *MR, *Q, *x, *d, *rhs, *diag, *r, *z, *p, *q, *xt, *part, *part2, *res;
     int *tri, *vo, *vl;
+    float *gf, *Af, *Mf, *Qf, *pf;   /* (--cg-fp32) */
 } flg;
 static void flg_free(flg *G) {
-    void *p[] = {G->g, G->A, G->M, G->MR, G->Q, G->x, G->d, G->rhs, G->diag, G->r, G->z, G->p, G->q, G->xt, G->part, G->part2, G->res, G->tri, G->vo, G->vl};
+    void *p[] = {G->g, G->A, G->M, G->MR, G->Q, G->x, G->d, G->rhs, G->diag, G->r, G->z, G->p, G->q, G->xt, G->part, G->part2, G->res, G->tri, G->vo, G->vl, G->gf, G->Af, G->Mf, G->Qf, G->pf};
     for (size_t i = 0; i < sizeof p / sizeof *p; i++) if (p[i]) cudaFree(p[i]);
 }
 static double fl_sum2(flg *G, int nb, double *b) {   /* partials of the last kernel -> (a, b) on the host */
@@ -151,6 +178,11 @@ static double fl_sum2(flg *G, int nb, double *b) {   /* partials of the last ker
 static double fl_energy(flg *G, const double *x) {
     const int nb = fl_grid(G->nt); k_energy<<<nb, FB>>>(G->nt, G->g, G->A, G->tri, x, G->part);
     double a; const double e = fl_sum2(G, nb, &a); return a > 0 ? e / a : 0;
+}
+static double fl_matvec_f(flg *G, double lam, const double *x, double *y) {   /* y = A x from the float copy G->pf of x (= G->p) */
+    k_triq_f<<<fl_grid(G->nt), FB>>>(G->nt, G->gf, G->Af, G->tri, G->Mf, G->pf, G->Qf);
+    const int nb = fl_grid(G->nv); k_gather_f<<<nb, FB>>>(G->nv, G->vo, G->vl, G->Qf, G->gf, lam, x, y, G->part);
+    return fl_sum2(G, nb, nullptr);
 }
 static double fl_matvec(flg *G, double lam, const double *x, double *y) {
     k_triq<<<fl_grid(G->nt), FB>>>(G->nt, G->g, G->A, G->tri, G->M, x, G->Q);
@@ -162,7 +194,7 @@ static double fl_matvec(flg *G, double lam, const double *x, double *y) {
    updated in place. Returns 0 and the final energy in *Eout, -1 when the device is missing or out of memory (x untouched: the caller
    runs the CPU solver). */
 extern "C" int flat_slim_gpu(const double *g, const double *A, const int *tri, int nt, const int *vo, const int *vl, int nv, double *xh,
-                             int iters, int cg_iters, double tol, int verbose, const char *tag, int dev, double *Eout) {
+                             int iters, int cg_iters, double tol, int verbose, const char *tag, int dev, double *Eout, int fp32) {
     int ndev = 0; if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) { cudaGetLastError(); return -1; }
     if (dev >= 0) { if (dev >= ndev || cudaSetDevice(dev) != cudaSuccess) { cudaGetLastError(); return -1; } }
     else if (cudaGetDevice(&dev) != cudaSuccess) { cudaGetLastError(); return -1; }
@@ -183,6 +215,11 @@ extern "C" int flat_slim_gpu(const double *g, const double *A, const int *tri, i
     if (ok) ok = cudaMemcpy(G.g, g, T * 48, cudaMemcpyHostToDevice) == cudaSuccess && cudaMemcpy(G.A, A, T * 8, cudaMemcpyHostToDevice) == cudaSuccess &&
                  cudaMemcpy(G.tri, tri, T * 12, cudaMemcpyHostToDevice) == cudaSuccess && cudaMemcpy(G.vo, vo, ((size_t)nv + 1) * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
                  cudaMemcpy(G.vl, vl, T * 12, cudaMemcpyHostToDevice) == cudaSuccess && cudaMemcpy(G.x, xh, V2, cudaMemcpyHostToDevice) == cudaSuccess;
+    if (ok && fp32) {
+        ok = cudaMalloc(&G.gf, T * 24) == cudaSuccess && cudaMalloc(&G.Af, T * 4) == cudaSuccess && cudaMalloc(&G.Mf, T * 12) == cudaSuccess &&
+             cudaMalloc(&G.Qf, T * 16) == cudaSuccess && cudaMalloc(&G.pf, V2 / 2) == cudaSuccess;
+        if (ok) { k_tof<<<fl_grid(6LL * nt), FB>>>(6LL * nt, G.g, G.gf); k_tof<<<fl_grid(nt), FB>>>(nt, G.A, G.Af); }
+    }
     if (!ok) { fprintf(stderr, "flatten: GPU unavailable (%s): CPU solver\n", cudaGetErrorString(cudaGetLastError())); flg_free(&G); return -1; }
     const long long n2 = G.n2; const int bv = fl_grid(n2);
     double E = fl_energy(&G, G.x);
@@ -200,13 +237,14 @@ extern "C" int flat_slim_gpu(const double *g, const double *A, const int *tri, i
         double rr0, rz = fl_sum2(&G, bv, &rr0), hb[2];
         k_fin2<<<1, FB>>>(G.part2, bv, G.res); cudaMemcpy(hb, G.res, 16, cudaMemcpyDeviceToHost); const double bb = hb[0];
         int k = 0; double rr = rr0;
+        if (fp32) { k_tof<<<fl_grid(3LL * nt), FB>>>(3LL * nt, G.M, G.Mf); k_tof<<<bv, FB>>>(n2, G.p, G.pf); }
         for (; k < cg_iters && rr > 1e-14 * bb; k++) {
-            const double pq = fl_matvec(&G, lam, G.p, G.q); if (!(pq > 0)) break;
+            const double pq = fp32 ? fl_matvec_f(&G, lam, G.p, G.q) : fl_matvec(&G, lam, G.p, G.q); if (!(pq > 0)) break;
             const double alpha = rz / pq;
             k_update<<<bv, FB>>>(n2, alpha, G.d, G.p, G.r, G.q, G.z, G.diag, G.part);
             const double rz2 = fl_sum2(&G, bv, &rr);
             const double beta = rz2 / rz; rz = rz2;
-            k_pdir<<<bv, FB>>>(n2, beta, G.z, G.p);
+            if (fp32) k_pdir_f<<<bv, FB>>>(n2, beta, G.z, G.p, G.pf); else k_pdir<<<bv, FB>>>(n2, beta, G.z, G.p);
         }
         k_sub<<<bv, FB>>>(n2, G.d, G.x);
         /* line search: capped at 0.8 of the first inversion, halved until the energy falls */
