@@ -4,7 +4,8 @@
 #   - --resume from a copy of SNAP (a try9 snapshot: weights + optimizer + step), --out $R/NAME, --steps step(SNAP) + ARMSTEPS (2000:
 #     the wsd cooldown 0.2 then covers the arm's last 400 steps, the same in every arm), sources SRCJ;
 #   - --det 1 (both arms draw the same labelled windows from the same seed) and a reduced sampler: --workers 3 --sampler-slots 1
-#     --onfly-slots 1 --replay 2 (each window trained twice, a new device augmentation: the sampler needs half the windows);
+#     --onfly-slots 1, --echo-max 0 (echo reuse depends on sampler timing: with it the arms see different windows even under --det 1; lead
+#     11-17), so the trainer waits for fresh windows; WORKERS / SLOTS / ONFLYSLOTS / ECHO override (--replay K excludes --echo-max);
 #   - --val-every 100000000 (no in-run validation: HOLD / the holdout boxes are scored afterwards by wbench) and --snap-every 500;
 #   - no --init-from / --init-widen / --init-lr-* (the snapshot already holds the widened weights and is past the 2000-step ramp).
 # Memory: ufsm-train.slice, own scope capped at MEMCAP (40G). Tripwire, every 60 s: the trainer's RssAnon + RssShmem and MemAvailable to
@@ -20,14 +21,14 @@ argv=$(grep 'trainer pid .* argv:' "$RL" | tail -1 | sed 's/.* argv: //'); [ -n 
 read -r -a A <<< "$argv"
 st=$(head -c 200000 "$SNAP" | head -1 | grep -o '"step":[0-9]*' | head -1 | cut -d: -f2); [ -n "$st" ] || { echo "ab_arm: no step in $SNAP" >&2; exit 2; }
 # rebuild the argv: drop the binary, "train", the sources, and the flags replaced below (with their values)
-drop=" --out --steps --workers --sampler-slots --onfly-slots --val-every --snap-every --snap-keep-every --snap-keep-last --resume --init-from --init-widen --init-lr-mult --init-lr-steps --det --replay "
+drop=" --echo-max --out --steps --workers --sampler-slots --onfly-slots --val-every --snap-every --snap-keep-every --snap-keep-last --resume --init-from --init-widen --init-lr-mult --init-lr-steps --det "
 N=(); i=3
 while [ $i -lt ${#A[@]} ]; do
   a=${A[$i]}
   if [[ "$drop" == *" $a "* ]]; then i=$((i + 2)); continue; fi
   N+=("$a"); i=$((i + 1))
 done
-ARGS=("$SRCJ" --out "$o" --steps $((st + ARMSTEPS)) "${N[@]}" --workers ${WORKERS:-3} --sampler-slots ${SLOTS:-1} --onfly-slots 1 --replay ${REPLAY:-2} --det 1
+ARGS=("$SRCJ" --out "$o" --steps $((st + ARMSTEPS)) "${N[@]}" --workers ${WORKERS:-3} --sampler-slots ${SLOTS:-1} --onfly-slots ${ONFLYSLOTS:-1} --echo-max ${ECHO:-0} --det 1
       --val-every 100000000 --snap-every 500 --snap-keep-every 500 --snap-keep-last 8 --resume "$o/last.ckpt" "$@")
 if [ "${DRY:-0}" = 1 ]; then echo "CUDA_VISIBLE_DEVICES=$GPU memcap -t -m $MEMCAP $U train ${ARGS[*]}   # from $SNAP (step $st)"; exit 0; fi
 mkdir -p "$o"; cp --reflink=auto "$SNAP" "$o/last.ckpt" || exit 1; cp "$SRCJ" "$o/sources.json.first"
