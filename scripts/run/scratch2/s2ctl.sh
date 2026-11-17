@@ -59,8 +59,9 @@ do_dry() {   # the exact launch (scratch2.launch -> scratch2.train.sh, DRY=1) fo
   ( exec 8>&-; launchenv; [ -n "${DRYU:-}" ] && U=$DRYU; [ -n "${DRYLR0:-}" ] && { MLR=0; ALR=0; }; XFLAGS="$XFLAGS ${DRYXF:-}"
     cd $R && S2NAME=$N DRY=1 RESUME=1 FRESH=${DRYFRESH:-0} bash $R/scratch2.launch ) >> $LOG 2>&1
   sleep 5; local LP; LP=$(cat $D.launcher.pid 2>/dev/null)
-  for i in $(seq 1 180); do kill -0 "$LP" 2>/dev/null || break; sleep 5; done
-  kill -0 "$LP" 2>/dev/null && { kill -TERM "$(cat $D.pid 2>/dev/null)" 2>/dev/null; log "drystart: still running after 15 min, stopped"; return 1; }
+  local W=${DRYWAIT:-2400}   # (s; 900 until 2026-11-16: try9's fresh dry start, the cold sampler indexes, finished in 972 s and was stopped as failed)
+  for i in $(seq 1 $((W / 5))); do kill -0 "$LP" 2>/dev/null || break; sleep 5; done
+  kill -0 "$LP" 2>/dev/null && { kill -TERM "$(cat $D.pid 2>/dev/null)" 2>/dev/null; log "drystart: still running after $W s, stopped"; return 1; }
   local n rc; n=$(grep -cE '^step +[0-9]+ ' $D.log 2>/dev/null); rc=$(grep -o 'exit rc=[0-9]*' $D.resume.log 2>/dev/null | tail -1)
   if [ "${n:-0}" -ge 1 ] && [ "$rc" = "exit rc=0" ] && ! grep -qiE ' nan |non-finite|cannot construct' $D.log; then
     log "drystart OK: $n step lines, $rc ($(grep -E '^step' $D.log | tail -1 | cut -c1-50))"; grep -E 'held-out boxes|holdout|excluded|lies outside|val by (source|scroll)' $D.log > $LOG.dry-holdouts; cp $D.log $LOG.dry-last.log
