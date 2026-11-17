@@ -6,6 +6,21 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Window overlap on the GT boxes: more grids do not help, FBLEND off again (2026-11-17, branch ngrid-20261116)
+
+User 11-16: "stride = window / 2 so all voxels get inferenced 8 times" -- would it help in compressed sections? wbench NGRID 2 / 4 / 8
+(window grids offset by half the 512 core: 2 = the diagonal (the unroll's FBLEND), 4 = four of the corners, 8 = all; blended by
+field-blend --tile, per-box predicts), u1 13000, BOXES core (44 clean boxes: Paris 4 PH 4, Paris 4 J 28, 1667 12), card 1 shared:
+| grids | ids | A-B vs 1 grid [95 % CI] | Paris 4 PH | Paris 4 J | 1667 | predict wall |
+|---|---|---|---|---|---|---|
+| 1 | 0.5327 | | 0.3916 | 0.4025 | 0.8836 | 931 s |
+| 2 | 0.5307 | +0.0020 [-0.0120, +0.0154] | 0.3740 | 0.4020 | 0.8834 | 1340 s |
+| 4 | 0.5244 | +0.0083 [-0.0094, +0.0303] | 0.3643 | 0.3936 | 0.8830 | 1716 s |
+| 8 | 0.5170 | +0.0158 [-0.0037, +0.0383], P(1 grid better) 0.94 | 0.3611 | 0.3828 | 0.8819 | 2571 s |
+No gain anywhere; on the packed Paris 4 boxes more overlap trends worse (the averaged phase of shifted windows blurs close sheets).
+The 2-grid blend removed the seam steps (audit #5: phase 1.43 / 1.78 -> 1.11 / 1.09 of the interior) but does not move ids, so the
+unroll default goes back to one grid (FBLEND=0: half the fields time, and the streamed ref again). Results /vesuvius/ufsm/wbench/res/u1-ngrid*.tsv.
+
 ## NorMuon with --init-lr-mult (warm starts); try8 vs try6 was the warm start (2026-11-16, branch nmwarm-20261116)
 
 **Why try8 lagged.** try8 (scratch2, from scratch, one card) sat at phase bce 0.681 (ln 2 = 0.693) for 4300 steps; HOLD p05x 0.474 / 0.489
