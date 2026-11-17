@@ -8,6 +8,7 @@
    conflict-free. Scales as in the stride-1 kernel: per (position, 32 channels) for the input, per (tap, co, chunk)
    for the weights (same prep). */
 #define S2F8_T 765   /* 5 * 9 * 17 */
+#define S2F8_TG(MT) ((MT) > 4 ? 3 : 9)   /* taps per weight-staging round */
 /* 8 e2m1 nibbles (channel k = nibble k) -> 8 e4m3 bytes (exact: the e2m1 grid {0, .5, 1, 1.5, 2, 3, 4, 6} is a subset of e4m3) */
 __device__ __forceinline__ unsigned e2m1_e4m3(unsigned nb) { return (__byte_perm(0x3C383000u, 0x4C484440u, nb & 7u) & 0xffu) | ((nb & 8u) << 4); }
 __device__ __forceinline__ uint2 nib8_e4m3(unsigned w) {
@@ -21,7 +22,8 @@ template <int MT, typename T, bool P16 = false>   /* P16: <= 16 input channels, 
 __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f8_k(const T *__restrict__ x, const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsc,
                                                         const float *__restrict__ b, T *__restrict__ y,
                                                         int N, int Ci, int D, int H, int W, int Co, int Cop, int Cip, int Do, int Ho, int Wo, gnp_t gp, int2 zw) {   /* zw: z-window tiles (zw_trange) */
-    constexpr int BM = MT * 16, TG = 9;
+    constexpr int BM = MT * 16, TG = S2F8_TG(MT);   /* (MT 6 / 8: every output channel in one block, the input staged once instead of per 32 /
+                                                       64-row tile; 3 taps a weight round keep 2 blocks an SM. The same sums per output) */
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint8_t *sx = smem_raw;                         /* [S2F8_T pos][32 ci] swizzled */
     uint8_t *sxs = sx + S2F8_T * 32;                /* [S2F8_T] (768) */
@@ -276,7 +278,8 @@ __global__ void __launch_bounds__(256, 2) conv_fwd_s2_f8_k(const T *__restrict__
     }
 }
 template <int MT, typename T, bool P16 = false> static void launch_s2f8(dim3 grid, const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, int Cip, shape5 ys, gnp_t gp) {
-    size_t smem = (size_t)S2F8_T * 32 + 768 + 9 * MT * 16 * 32 + ((9 * MT * 16 + 15) & ~15) + 32 * sizeof(chan_t);
+    constexpr int TG = S2F8_TG(MT);
+    size_t smem = (size_t)S2F8_T * 32 + 768 + TG * MT * 16 * 32 + ((TG * MT * 16 + 15) & ~15) + 32 * sizeof(chan_t);
     static int attr[8];
     if (P16) { const size_t sp16 = (size_t)S2F8_T * 16 + 16 + 64 + 256 + 18 * MT * 16 * 33 + 16 + 16 * sizeof(chan_t); if (sp16 > smem) smem = sp16; }
     if (gp.ns) smem += 32 * 8 + 16;   /* (slab GroupNorm: the second coefficient bank, gn_bank2) */
@@ -611,6 +614,8 @@ extern "C" void lp_set_s2_f4(int on) { g_s2_f4 = on; }   /* tests: the fp4 down0
    (split grad rel 0.09-0.27 against ~6e-8 off) although the kernel is bitwise repeatable in isolation (test_mx4); not yet understood) */
 static int g_s2_f4g = -1;
 extern "C" void lp_set_s2_f4g(int on) { g_s2_f4g = on; }
+static int g_s2_wide = -1;   /* mgpu: env */
+extern "C" void lp_set_s2_wide(int on) { g_s2_wide = on; }   /* (tests) */
 extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float *w, const float *b, int cout, void *y, int ybf, shape5 ys, gnp_t gp) {
     lp_dtype_check("lp_conv_fwd_s2_f8", xbf, ybf);
     const int2 zw = zw_trange(ys.d, 2);   /* z-window (nn_set_zwin): the output tiles of 2 planes */
@@ -696,10 +701,13 @@ extern "C" int lp_conv_fwd_s2_f8(const void *x, int xbf, shape5 xs, const float 
     size_t nt = (size_t)27 * Cop * nch;
     prep_w8_k<<<nblk_(nt, 128), 128>>>(w, wq, ws, cout, xs.c, Cop, Cip);
     int MT = Cop % 64 == 0 ? 4 : Cop % 32 == 0 ? 2 : 1;
+    if (g_s2_wide < 0) g_s2_wide = getenv("UFSM_S2_WIDE") ? atoi(getenv("UFSM_S2_WIDE")) : 1;   /* (0: 32 / 64-row tiles) */
+    const int wide = g_s2_wide;
+    if (wide && (Cop == 96 || Cop == 192)) MT = 6; else if (wide && Cop % 128 == 0) MT = 8; else if (wide && Cop == 160) MT = 10;
     int nmt = Cop / (MT * 16);
     dim3 grid(nblk_(ys.w, 8), nblk_(ys.h, 4), (unsigned)(zw_ntiles(ys.d, 2, zw) * nmt * xs.n));
 #define S2L(MT_) do { if (xbf == 4) launch_s2f8<MT_, mx4_t>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, ys, gp); else if (xbf == 3) launch_s2f8<MT_, mx8_t>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, ys, gp); else if (xbf == 2) launch_s2f8<MT_, __half>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, ys, gp); else if (xbf) launch_s2f8<MT_, bf16>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, ys, gp); else launch_s2f8<MT_, float>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, ys, gp); } while (0)
-    switch (MT) { case 1: S2L(1); break; case 2: S2L(2); break; default: S2L(4); break; }
+    switch (MT) { case 1: S2L(1); break; case 2: S2L(2); break; case 6: S2L(6); break; case 8: S2L(8); break; case 10: S2L(10); break; default: S2L(4); break; }
 #undef S2L
     LPCK();
     return 0;
