@@ -390,6 +390,7 @@ ufsm_exe(bench_wgl0 tests/bench_wgl0.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 # 2:4 sparse MX-fp4 convolutions (src/lp_sp24*.cu, DESIGN.md 2026-11-13): instruction layout + throughput, conv kernels vs host
 ufsm_exe(test_sp24_mma SUITE tests/test_sp24_mma.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_sp24_conv SUITE tests/test_sp24_conv.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_f4v SUITE tests/test_f4v.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_sp24 tests/bench_sp24.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_latadj tests/bench_latadj.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(s2b_replay tests/s2b_replay.c OBJS NN LP LIBS m CUDA)

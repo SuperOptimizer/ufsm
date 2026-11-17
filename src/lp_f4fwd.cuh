@@ -1125,6 +1125,7 @@ __global__ void __launch_bounds__(256) gn_prenorm_f4_k(const T *__restrict__ x, 
    the planner gives it a budget (unet_ws_plan: the largest layer that fits the plan's spare, nn_ws_limit); a larger layer, or a full
    card, takes the in-kernel GroupNorm (nullptr). Before (2026-11-14 audit net#4) it grew to any layer that the free memory allowed,
    outside the plan: which layers ran it depended on what else happened to be allocated */
+int lp_f4v_try(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, const float *b, int cout, void *y, int Cop, int Cip, gnp_t gp, double *osum, int Go, const split_t &sp);   /* lp_f4v.cu */
 static inline uint8_t *f4_prenorm_buf(size_t n) { return (uint8_t *)nn_ws(NN_WS_F4PRE, n); }
 template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, double *osum, int Go, split_t sp) {
     static int uph2 = -1; if (uph2 < 0) uph2 = getenv("UFSM_UP_H2") ? atoi(getenv("UFSM_UP_H2")) : 1;
@@ -1204,6 +1205,7 @@ template <typename T, typename TO> void fwd_f4_t(const void *x, shape5 xs, const
             }
         }
     }
+    if constexpr (IS_MX4(T) && IS_MX4(TO)) if (!tz_env && lp_f4v_try(x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp)) return;   /* conv_fwd_f4v_k (lp_f4v.cu) */
     dim3 grid(nblk_(xs.w, 16), nblk_(xs.h, 8), (unsigned)(zw_tiles(xs.d, TZ, sp) * nmt * xs.n));
     switch (MT * 10 + TZ) {
     case 12: launch_f4<1, 2, T, TO>(grid, x, xs, wq, ws, b, cout, y, Cop, Cip, gp, osum, Go, sp); break;
