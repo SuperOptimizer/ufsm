@@ -390,8 +390,19 @@ int lp_f4v_try(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, c
 #ifndef LP_SW
 /* gn_prenorm_f4_k over the input planes [a, a + L) only (into a depth-L tensor): the same staging and requantisation per voxel */
 /* (a split input's segment: padded channels cpo .. cpo + 32 gridDim.y of the conv's input, chan as the conv stages them; nb blocks out) */
+/* --skip-empty (sk): only the voxels the conv stages, those in the 3^3 halo of an active output tile (and not masked out of the input, sk.mi):
+   the conv zero-fills the rest without reading them. zc: the conv's plane number of input plane a (a - zi0); Do, W: the conv's depth, width */
+__device__ __forceinline__ bool f4v_staged(const skipm_t &sk, int gz, int gy, int gx, int Do, int H, int W) {
+    if (sk.mi && !sk_in(sk, gz, gy, gx)) return false;
+    if (!sk.m) return true;
+    const int zl = max(gz - 1, 0) >> 3, zh = min(gz + 1, Do - 1) >> 3, yl = max(gy - 1, 0) >> 3, yh = min(gy + 1, H - 1) >> 3, xl = max(gx - 1, 0) >> 4, xh = min(gx + 1, W - 1) >> 4;
+    for (int tz = zl; tz <= zh; tz++)
+        for (int ty = yl; ty <= yh; ty++)
+            for (int tx = xl; tx <= xh; tx++) if (sk_active(sk, tz << 3, ty << 3, tx << 4)) return true;
+    return false;
+}
 __global__ void __launch_bounds__(256) gn_prenorm_f4z_k(const mx4_t *__restrict__ x, int N, int Ci, int Cx, int CxP, int cpo, size_t S, int a, int L, int HW, gnp_t gp, split_t sp,
-                                                        uint8_t *__restrict__ y) {
+                                                        uint8_t *__restrict__ y, skipm_t sk = skipm_t{}, int zc = 0, int Do = 0, int W = 0) {
     __shared__ chan_t ctab[32]; __shared__ float2 cab[32]; __shared__ unsigned sgm;
     const int blk = blockIdx.y, n = blockIdx.z, nb = gridDim.y;
     if (threadIdx.x < 32) {
@@ -403,6 +414,7 @@ __global__ void __launch_bounds__(256) gn_prenorm_f4z_k(const mx4_t *__restrict_
     __syncthreads();
     const size_t Ss = (size_t)L * HW, v = (size_t)blockIdx.x * 256 + threadIdx.x;
     if (v >= Ss) return;
+    if ((sk.m || sk.mi) && !f4v_staged(sk, zc + (int)(v / HW), (int)(v % HW) / W, (int)(v % HW) % W, Do, HW / W, W)) return;
     float val[32];
     stage_row32<mx4_t>(ctab, (size_t)a * HW + v, true, true, val, cab, sgm);
     unsigned amu = 0u;
@@ -442,7 +454,7 @@ int lp_f4v_preslab(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *w
     const skipm_t sk = lp_skip_get(xs, sp, 1);
     for (int z0 = o0; z0 < o1; z0 += Z) {
         const int z1 = z0 + Z < o1 ? z0 + Z : o1, a = max(z0 + zi - 1, 0), e = min(z1 + zi + 1, Di), L = e - a;   /* (input planes) */
-        gn_prenorm_f4z_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, xs.c, xs.c, xs.c, 0, (size_t)Di * HW, a, L, HW, gp, split_t{}, q);
+        gn_prenorm_f4z_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, xs.c, xs.c, xs.c, 0, (size_t)Di * HW, a, L, HW, gp, split_t{}, q, sk, a - zi, xs.d, xs.w);
         split_t s2 = sp; s2.zi0 = (int16_t)(zi - a); s2.Di = (int16_t)L; s2.zw0 = (int16_t)z0; s2.zw1 = (int16_t)z1;
         launch_f4v_mt(q, xs, wq, ws, b, cout, y, Cop, Cip, gnp_t{}, osum, Go, s2, sk, z0 == o0);
     }
@@ -573,7 +585,7 @@ int lp_f4v_preup(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws,
         uint8_t *qu = q, *qs = q + o1, *qc = q + o2;
         up_coarse_f4v_k<<<dim3(nblk_((size_t)Lc * HWc, 256), (unsigned)nb1, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, Ci, Cx, cpl, cza, Lc, HWc, gp, sp, qc);
         up_fine_f4v_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb1, (unsigned)xs.n), 256>>>(qc, xs.n, cza, Lc, xs.d, xs.h, xs.w, a, L, qu);
-        gn_prenorm_f4z_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb2, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, Ci, Cx, CxP, CxP, (size_t)xs.d * HW, a, L, HW, gp, sp, qs);
+        gn_prenorm_f4z_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb2, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, Ci, Cx, CxP, CxP, (size_t)xs.d * HW, a, L, HW, gp, sp, qs, sk, a, xs.d, xs.w);
         split_t s2 = sp; s2.up = 0; s2.x2 = qs; s2.gp2 = gnp_t{}; s2.zi0 = (int16_t)-a; s2.Di = (int16_t)L; s2.zw0 = (int16_t)z0; s2.zw1 = (int16_t)z1;
         launch_f4v_mt(qu, xs, wq, ws, b, cout, y, Cop, Cip, gnp_t{}, osum, Go, s2, sk, z0 == 0);
     }
