@@ -6,6 +6,26 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Unroll perf 5: volcomp's lossless encoder 2-2.5x, the lossless sink decoder ~25 % (byte-identical; 2026-11-17, branch unrollperf5-20261117)
+
+- The unroll's ink is now the critical path: with recto-sp on the GPU (192 -> ~45 s) the chain from the ink's start to snap is ~520 s
+  on 0332 against the ink's 682 s (full4). The ink predicts are GPU-bound (UFSM_PRED_PROF, latink recipe, 32 windows: gpu(fwd+d2h)
+  11.1 of 12.7 s wall; --threads 12 / 20 / 28 the same; UFSM_PRED_DEVREAD=1 the same wall at +50 % CPU, same bytes), but their
+  --q 0 head writers and the three concurrent ink-blends are CPU: perf on the predict, vll_encode_block 29 % + vll_encode 27 % +
+  the CT decode 13 %; on a blend the lossless decode (vllx_decode_sub_sink) 40 %, ib_rows 22 %, the encode 18 %. Ink runs beside
+  rectosp / ref / the slab fits, which want the same cores.
+- third_party/volcomp.h, the lossless encoder (the bytes unchanged): the bit writer stores whole 32-bit words (it wrote byte by byte;
+  shared with the lossy encoder, whose bytes are unchanged too); the block's DENSE / SPARSE cost estimate by one table lookup per voxel
+  (three 21-bit sums in a word) instead of per-voxel branches; DENSE tokens by table, the context by table, the counts in two
+  interleaved histograms; the tANS lanes in registers. One core, 32 ink / CT chunks of 128^3: 9.3 -> 3.7 / 9.1 -> 4.5 G cycles
+  (91 -> 229 / 92 -> 186 MB/s). Byte-identical to the old encoder over 76 chunks (ink, CT, 12 synthetic kinds covering CONST / RAW
+  chunks and CONST / SPARSE / DENSE / RAW blocks) at q 0, 2, 8, 32 (gcc A/B); tests/test_volcomp_vll.c holds the old encoder's sizes
+  and hashes for the synthetic chunks (lossless, integer-only so build-independent; mcc matches them).
+- src/volcomp_fast.h vllx_decode_sub_sink, the DENSE loop: both tANS lanes in registers, a voxel pair per step, the context model by
+  table: ~25 % fewer cycles per lossless chunk (decode only, 3.9 -> 3.0 G cycles over the 32 ink chunks); test_volcomp_vll decodes
+  every synthetic chunk through the sink, whole and in a box cutting blocks.
+- Predict, latink recipe, 32 windows: user CPU 240 -> 182 s, wall 12-14 s either way (GPU-bound); outputs identical. ink-blend of one
+  head (0332 mini box, g0 + g256): 765 / 774 -> 639 / 650 G cycles (-17 %), outputs identical (all three heads compared).
 ## 2-D ink teachers in MX-fp4: quantiser options, deterministic GroupNorm, accuracy floor (2026-11-16, branch fp4teach-20261116)
 
 Goal: reader3 / ink9um (ink-ext, Reader V3 architecture on xnet) in MX-fp4 at fp16 accuracy. Gate as set: on the 24 held-out eval crops

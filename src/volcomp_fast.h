@@ -8,7 +8,8 @@
  * recomputing them per coefficient, a level's extra bits and its sign in one read, and with AVX-512 (the desk's Zen 5) the y and z
  * transform passes on 16 lanes. Measured and dropped (slower on Zen 5 or no gain): eager branchless bit-reader refills, branchless
  * HybridUint selects, two substreams interleaved in one loop (separate coefficient lists, transforms after). The entropy decode is
- * a serial chain (~80% of a q 2 chunk); the reference was already close to what one core does. */
+ * a serial chain (~80% of a q 2 chunk); the reference was already close to what one core does. The lossless sink decoder
+ * (vllx_decode_sub_sink) keeps its DENSE lanes in registers too (~25 % fewer cycles, 2026-11-17). */
 #ifndef UFSM_VOLCOMP_FAST_H
 #define UFSM_VOLCOMP_FAST_H
 #include <pthread.h>
@@ -222,14 +223,29 @@ static volcomp_status vllx_decode_sub_sink(const vll_parsed *restrict p, uint32_
                 if (in) vll_rebuild(b, u);
                 break;
             }
-            default: {   /* VLL_BM_DENSE */
-                for (uint32_t i = 0; i < VF_BLKV; i++) {
-                    int lt = vf_rdec_get(&rd, &p->models[vll_dense_ctx(u, i)]);
-                    if (lt < 0 || (uint32_t)lt > VLL_TOKMAX_LVL) return VOLCOMP_ERR_CORRUPT;
-                    uint32_t uu;
-                    if (!vll_hyb_read(&br, (uint32_t)lt, &uu)) return VOLCOMP_ERR_CORRUPT;
-                    u[i] = (uint8_t)uu;
-                }
+            default: {   /* VLL_BM_DENSE: the two tANS lanes in registers, a voxel pair per step (4096 symbols: the lane order is unchanged
+                            after the block), the context models by table; the same reads in the same order as vf_rdec_get + vll_hyb_read */
+                const vf_model *M3[3] = {&p->models[VLL_M_LVLD], &p->models[VLL_M_LVLD + 1u], &p->models[VLL_M_LVLD + 2u]};
+                uint32_t xa = rd.x[rd.k], xb = rd.x[rd.k ^ 1u];
+#define VLLX_SYM(xl, i)                                                                                              \
+                do {                                                                                                  \
+                    const uint32_t a_ = (i) < 256u ? 0u : u[(i) - 256u];                                              \
+                    const vf_dentry *e_ = &M3[a_ == 0u ? 0u : (a_ <= 2u ? 1u : 2u)]->dt[xl];                          \
+                    uint32_t bits_;                                                                                   \
+                    if (!vf_br_get(&rd.br, e_->nb, &bits_)) return VOLCOMP_ERR_CORRUPT;                               \
+                    xl = e_->ns + bits_;                                                                              \
+                    const uint32_t lt_ = e_->sym;                                                                     \
+                    if (lt_ < VLL_NLIT) u[i] = (uint8_t)lt_;                                                          \
+                    else {                                                                                            \
+                        if (lt_ > VLL_TOKMAX_LVL) return VOLCOMP_ERR_CORRUPT;                                         \
+                        uint32_t uu_;                                                                                 \
+                        if (!vll_hyb_read(&br, lt_, &uu_)) return VOLCOMP_ERR_CORRUPT;                                \
+                        u[i] = (uint8_t)uu_;                                                                          \
+                    }                                                                                                 \
+                } while (0)
+                for (uint32_t i = 0; i < VF_BLKV; i += 2) { VLLX_SYM(xa, i); VLLX_SYM(xb, i + 1u); }
+#undef VLLX_SYM
+                rd.x[rd.k] = xa; rd.x[rd.k ^ 1u] = xb;
                 if (in) vll_rebuild(b, u);
                 break;
             }

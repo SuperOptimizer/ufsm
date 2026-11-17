@@ -968,24 +968,38 @@ static inline void vf_bw_init(vf_bitw *w, uint8_t *buf, size_t cap) {
   w->acc = 0;
   w->nbits = 0;
 }
+/* Up to 31 bits stay in the accumulator; whole 32-bit words are stored at once (the same bytes as a byte-at-a-time writer:
+ * LSB first, little-endian; ufsm 2026-11-17, the lossless encoder's tANS / bypass output was ~1/3 of its time byte by byte).
+ * The buffer overflows exactly when the byte writer's would (the flush writes the rest). */
 __attribute__((always_inline)) static inline bool vf_bw_put(vf_bitw *w, uint32_t v, uint32_t n) { /* n <= 32, v < 2^n */
   w->acc |= (uint64_t)v << w->nbits;
   w->nbits += n;
-  while (w->nbits >= 8) {
-    if (w->pos >= w->cap) return false;
-    w->buf[w->pos++] = (uint8_t)w->acc;
-    w->acc >>= 8;
-    w->nbits -= 8;
+  if (w->nbits >= 32) {
+    if (w->pos + 4u > w->cap) {
+      while (w->nbits >= 8) {
+        if (w->pos >= w->cap) return false;
+        w->buf[w->pos++] = (uint8_t)w->acc;
+        w->acc >>= 8;
+        w->nbits -= 8;
+      }
+      return true;
+    }
+    const uint32_t lo = (uint32_t)w->acc;
+    w->buf[w->pos] = (uint8_t)lo; w->buf[w->pos + 1] = (uint8_t)(lo >> 8); w->buf[w->pos + 2] = (uint8_t)(lo >> 16); w->buf[w->pos + 3] = (uint8_t)(lo >> 24);
+    w->pos += 4;
+    w->acc >>= 32;
+    w->nbits -= 32;
   }
   return true;
 }
 static inline bool vf_bw_flush(vf_bitw *w, size_t *n_out) {
-  if (w->nbits > 0) {
+  while (w->nbits > 0) {
     if (w->pos >= w->cap) return false;
     w->buf[w->pos++] = (uint8_t)w->acc;
-    w->acc = 0;
-    w->nbits = 0;
+    w->acc >>= 8;
+    w->nbits = w->nbits > 8 ? w->nbits - 8 : 0;
   }
+  w->acc = 0;
   *n_out = w->pos;
   return true;
 }
@@ -1215,14 +1229,30 @@ static size_t vf_tans_encode2(const vf_etab et[VF_NMODELS], const uint16_t *syms
                               uint32_t *fields, uint8_t *out, size_t out_cap) {
   uint32_t x[2] = {VF_PROB_SCALE, VF_PROB_SCALE};
   size_t nf = 0;
-  for (size_t i = n; i-- > 0;) {
-    const vf_esym *e = &et[syms[i] >> 8].sym[syms[i] & 0xffu];
-    if (e->delta_nb == 0xffffffffu) return 0;
-    uint32_t l = (uint32_t)i & 1u;
-    uint32_t nb = (x[l] + e->delta_nb) >> 16;
-    fields[nf++] = (x[l] & ((1u << nb) - 1u)) | nb << 27;
-    x[l] = et[syms[i] >> 8].state[(x[l] >> nb) + (uint32_t)e->delta_fs];
+  /* the two lanes in registers, one symbol of each per step (symbol i is on lane i & 1; the same fields in the same order as one
+   * symbol at a time; ufsm 2026-11-17) */
+#define VF_TANS_STEP(xl, i)                                                  \
+  do {                                                                       \
+    const uint16_t s_ = syms[i];                                             \
+    const vf_etab *t_ = &et[s_ >> 8];                                        \
+    const vf_esym e_ = t_->sym[s_ & 0xffu];                                  \
+    if (e_.delta_nb == 0xffffffffu) return 0;                                \
+    const uint32_t nb_ = (xl + e_.delta_nb) >> 16;                           \
+    fields[nf++] = (xl & ((1u << nb_) - 1u)) | nb_ << 27;                    \
+    xl = t_->state[(xl >> nb_) + (uint32_t)e_.delta_fs];                     \
+  } while (0)
+  {
+    uint32_t x0 = x[0], x1 = x[1];
+    size_t i = n;
+    if (i & 1u) { i--; VF_TANS_STEP(x0, i); }
+    while (i >= 2) {
+      VF_TANS_STEP(x1, i - 1);
+      VF_TANS_STEP(x0, i - 2);
+      i -= 2;
+    }
+    x[0] = x0; x[1] = x1;
   }
+#undef VF_TANS_STEP
   /* initial decoder states (lane 1 pushed first so lane 0 is read first) */
   fields[nf++] = (x[1] - VF_PROB_SCALE) | VF_PROB_BITS << 27;
   fields[nf++] = (x[0] - VF_PROB_SCALE) | VF_PROB_BITS << 27;
@@ -2483,16 +2513,25 @@ static bool vll_encode_block(vll_enc *restrict e, uint16_t **tp, vf_bitw *bw, co
   }
   uint8_t u[VF_BLKV];
   vll_residual(b, u);
-  uint64_t cd = 0, cs = 8;
-  uint32_t nnz = 0;
-  for (i = 0; i < VF_BLKV; i++) {
-    uint32_t uu = u[i];
-    cd += vll_bits(uu);
-    if (uu) {
-      nnz++;
-      cs += vll_bits(uu - 1u) + 5u;
-    }
+  /* the DENSE / SPARSE cost estimates and the nonzero count in one table lookup per voxel: three 21-bit sums in a word (at most
+   * 4096 x 17 < 2^21 each), the same integers as the per-voxel branches (ufsm 2026-11-17: that loop was ~1/3 of the block) */
+  static const uint64_t *cost = nullptr;
+  static uint64_t cost_tab[256];
+  if (!__atomic_load_n(&cost, __ATOMIC_ACQUIRE)) {
+    for (uint32_t v = 0; v < 256; v++)
+      cost_tab[v] = (uint64_t)vll_bits(v) | (v ? ((uint64_t)(vll_bits(v - 1u) + 5u) << 21 | (uint64_t)1 << 42) : 0);
+    __atomic_store_n(&cost, cost_tab, __ATOMIC_RELEASE);
   }
+  uint64_t acc4[4] = {0, 0, 0, 0};
+  for (i = 0; i < VF_BLKV; i += 4) {
+    acc4[0] += cost[u[i]];
+    acc4[1] += cost[u[i + 1]];
+    acc4[2] += cost[u[i + 2]];
+    acc4[3] += cost[u[i + 3]];
+  }
+  const uint64_t ct = acc4[0] + acc4[1] + acc4[2] + acc4[3];
+  const uint64_t cd = ct & 0x1fffffu, cs = 8u + (ct >> 21 & 0x1fffffu);
+  const uint32_t nnz = (uint32_t)(ct >> 42);
   uint32_t mode = (nnz <= VLL_SPARSE_MAX_NNZ && cs < cd) ? VLL_BM_SPARSE : VLL_BM_DENSE;
   if ((mode == VLL_BM_SPARSE ? cs : cd) >= (uint64_t)VF_BLKV * 8u) mode = VLL_BM_RAW;
   VLL_PUT(VLL_M_MODE, mode);
@@ -2513,11 +2552,36 @@ static bool vll_encode_block(vll_enc *restrict e, uint16_t **tp, vf_bitw *bw, co
     }
     VLL_PUT(vll_run_ctx(prev_run), VF_TOK_EOB);
   } else {
-    for (i = 0; i < VF_BLKV; i++) {
-      uint32_t t;
-      if (!vll_hyb_emit(bw, u[i], &t)) return false;
-      VLL_PUT(vll_dense_ctx(u, i), t);
+    /* tokens by table (literal u < 16, else 12 + msb(u) with the low bits bypassed in voxel order), the context from the voxel one
+     * z-plane back, the counts in two interleaved histograms per model: the same tokens, bits and counts as vll_hyb_emit + VLL_PUT
+     * voxel by voxel (ufsm 2026-11-17) */
+    static const uint8_t *tokt = nullptr;
+    static uint8_t tok_tab[256];
+    static const uint8_t ctx_tab[256] = {0, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                                          2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                                          2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                                          2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                                          2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                                          2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                                          2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                                          2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2};
+    if (!__atomic_load_n(&tokt, __ATOMIC_ACQUIRE)) {
+      for (uint32_t v = 0; v < 256; v++) tok_tab[v] = (uint8_t)(v < VLL_NLIT ? v : VLL_NLIT - 4u + vf_highbit(v));
+      __atomic_store_n(&tokt, tok_tab, __ATOMIC_RELEASE);
     }
+    uint32_t h[2][3][VF_NTOK];
+    memset(h, 0, sizeof h);
+    for (i = 0; i < VF_BLKV; i++) {
+      const uint32_t uu = u[i], t = tokt[uu], c = i < 256u ? 0u : ctx_tab[u[i - 256u]];
+      if (uu >= VLL_NLIT) {
+        const uint32_t k = t - (VLL_NLIT - 4u);
+        if (!vf_bw_put(bw, uu & ((1u << k) - 1u), k)) return false;
+      }
+      *tok++ = (uint16_t)(t | (VLL_M_LVLD + c) << 8);
+      h[i & 1u][c][t]++;
+    }
+    for (uint32_t c = 0; c < 3; c++)
+      for (uint32_t t = 0; t < VF_NTOK; t++) e->counts[VLL_M_LVLD + c][t] += h[0][c][t] + h[1][c][t];
   }
   *tp = tok;
   return true;

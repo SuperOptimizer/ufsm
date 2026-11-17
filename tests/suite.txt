@@ -215,6 +215,7 @@ test_ink_mil_check                             | gpu          |    90 | ./$B/tes
 test_pyports                                   |              |     1 | ./$B/test_pyports
 test_edt                                       | smoke        |     2 | ./$B/test_edt
 test_volcomp                                   | smoke        |     1 | ./$B/test_volcomp
+test_volcomp_vll                               | smoke        |     1 | ./$B/test_volcomp_vll
 test_typed_zarr                                | smoke        |     7 | ./$B/test_typed_zarr
 test_http_reader                               |              |    29 | python3 tests/test_http_reader.py
 test_checkpoint_runtime                        | smoke        |     1 | ./$B/test_checkpoint_runtime
