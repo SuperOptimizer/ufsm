@@ -24,6 +24,10 @@ FSKIP 20). Stage walls in s; the ink runs beside the chain, stripimg and perwrap
 | perwrap | 784 | 608 | 612 |
 | **total** | **2441** | **1832** | **1422** |
 
+PHerc1667 end to end on the same setup (master c2216919, local CT, 44 per-wrap renders): 1248 s = fields 125, rectosp 293 and ref 111
+(the ink's predicts beside them), slabs 219 (73 slabs, 3 lanes), join .. snap 114, strip + stripflat + distort 82, then stripimg 281
+beside perwrap 385; the ink (651 s from the fields) was done at the end of the slabs.
+
 The joined models of full3 and full4 differ: the ref picked 512 vs 640 chunk rows from the free host memory (the ink's predicts beside
 it in full4), the nondeterminism of "Unroll perf 1"; with the same ref every slab fit is byte-identical whatever the lanes (below).
 
