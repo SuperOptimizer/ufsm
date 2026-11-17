@@ -847,6 +847,7 @@ void nn_pred_stats_start(const uint8_t *ct, size_t n, void *scratch);
 void nn_pred_stats_finish(size_t *nz, double *sum, double *sq);
 void nn_pred_ctmask(const uint8_t *ct, size_t n, uint32_t *bits);   /* CT != 0 as bits ((n + 31) / 32 words) */
 void nn_pred_ctmask_t(const uint8_t *ct, size_t n, uint32_t *bits, int t);   /* predict --iso: bits of CT >= t */
+void nn_ct_floor(uint8_t *ct, size_t n, int t);   /* predict --ct-floor: CT < t -> 0 in place (t <= 1: nothing) */
 void nn_set_pred_iso(int t);
 int nn_get_pred_iso(void);   /* predict --iso: the CT window path places outputs only where CT >= t */
 void nn_pred_place_m(const float *lg, const uint32_t *bits, int W, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh);   /* nn_pred_place with the CT mask as bits */

@@ -1125,6 +1125,18 @@ __global__ void pred_ctmask_k(const uint8_t *ct, size_t n, uint32_t *bits, int t
 extern "C" void nn_pred_ctmask(const uint8_t *ct, size_t n, uint32_t *bits) { pred_ctmask_k<<<nblk((n + 31) / 32, 256), 256>>>(ct, n, bits, 1); KCHECK(); }
 /* predict --iso: the bit plane of CT >= t (the probability outputs' mask; the fit keeps the material mask of nn_pred_ctmask) */
 extern "C" void nn_pred_ctmask_t(const uint8_t *ct, size_t n, uint32_t *bits, int t) { pred_ctmask_k<<<nblk((n + 31) / 32, 256), 256>>>(ct, n, bits, t < 1 ? 1 : t); KCHECK(); }
+/* predict --ct-floor: CT voxels below t read as 0 (unmasked air / void as masked air, DESIGN 2026-11-17 "per-scroll air iso"), in place;
+   16 voxels a thread (n need not be a multiple: the tail per byte) */
+__global__ void ct_floor_k(uint8_t *ct, size_t n, int t) {
+    const size_t i = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) * 16;
+    if (i >= n) return;
+    if (i + 16 <= n && !((uintptr_t)(ct + i) & 15)) {
+        uint4 v = *(uint4 *)(ct + i); uint32_t w[4] = {v.x, v.y, v.z, v.w};
+        for (int q = 0; q < 4; q++) { uint32_t o = 0; for (int b = 0; b < 4; b++) { const uint32_t c = (w[q] >> (8 * b)) & 255u; o |= (c < (uint32_t)t ? 0u : c) << (8 * b); } w[q] = o; }
+        *(uint4 *)(ct + i) = make_uint4(w[0], w[1], w[2], w[3]);
+    } else for (size_t j = i; j < n && j < i + 16; j++) if (ct[j] < t) ct[j] = 0;
+}
+extern "C" void nn_ct_floor(uint8_t *ct, size_t n, int t) { if (t <= 1 || !n) return; ct_floor_k<<<nblk((n + 15) / 16, 256), 256>>>(ct, n, t); KCHECK(); }
 template <typename LT> __global__ void pred_place_m_k(const LT *lg, const uint32_t *bits, place_box B, int W, int oz, int oy, int ox, int shard, uint8_t *dsh) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)B.nz * B.ny * B.nx) return;

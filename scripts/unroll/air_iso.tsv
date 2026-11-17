@@ -1,0 +1,61 @@
+# air_iso.tsv: per-scan CT air / papyrus iso (ufsm ct-iso, DESIGN 2026-11-17 "per-scroll air iso"). One row per scan and level; key without
+# volumes/ (match on the zarr's basename). 8^3 grid of 128^3 boxes per level (boxes under 10 % nonzero skipped), 0 dropped, sigma-3 smoothing;
+# air = highest local max in [32, 90], valley = first minimum above it, pap = the next maximum, mid = (air + pap + 1) / 2 (packed-region iso),
+# depth = valley / smaller peak. Levels: the fields level (~9 um: L2 of the 2.2-2.4 um scans, L0 of the 7.9-9.4 um scans) and L0 / L1
+# where the ink teachers read. Regenerate one row: ufsm ct-iso ROOT KEY LEVEL --scroll SCROLL
+scroll	key	level	air	pap	valley	mid	depth	boxes	method
+PHerc0009B	PHerc0009B/20250521125136-8.640um-1.2m-116keV-masked.zarr	0	53	139	68	96	0.37	57	valley
+PHerc0009B	PHerc0009B/20250820154339-2.401um-0.3m-77keV-masked.zarr	1	51	175	69	113	0.32	33	valley
+PHerc0009B	PHerc0009B/20250820154339-2.401um-0.3m-77keV-masked.zarr	2	53	145	72	99	0.37	35	valley
+PHerc0125	PHerc0125/20250821151825-9.362um-1.2m-113keV-masked.zarr	0	52	122	68	87	0.33	77	valley
+PHerc0139	PHerc0139/20250728140407-9.362um-1.2m-113keV-masked.zarr	0	51	128	70	90	0.52	132	valley
+PHerc0139	PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr	1	40	115	61	78	0.52	85	valley
+PHerc0139	PHerc0139/20260102150214-2.399um-0.2m-78keV-masked.zarr	2	40	113	61	77	0.51	90	valley
+PHerc0172	PHerc0172/20241024131839-7.910um-53keV-masked.zarr	0	46	97	78	72	0.94	158	valley-weak
+PHerc0175A	PHerc0175A/20250521115057-8.640um-1.2m-116keV-masked.zarr	0	51	121	70	86	0.45	118	valley
+PHerc0175B	PHerc0175B/20250521125822-8.640um-1.2m-116keV-masked.zarr	0	52	124	69	88	0.46	144	valley
+PHerc0191	PHerc0191/20250821151635-9.362um-1.2m-113keV-masked.zarr	0	53	126	69	90	0.33	93	valley
+PHerc0211	PHerc0211/20250821151803-9.362um-1.2m-113keV-masked.zarr	0	54	132	72	93	0.29	71	valley
+PHerc0257	PHerc0257/20250821151750-9.362um-1.2m-113keV-masked.zarr	0	51	127	68	89	0.27	66	valley
+PHerc0268	PHerc0268/20251110183117-8.640um-1.2m-116keV-masked.zarr	0	53	130	74	92	0.41	119	valley
+PHerc0306B	PHerc0306B/20250521133212-8.640um-1.2m-116keV-masked.zarr	0	53	128	69	91	0.44	124	valley
+PHerc0332	PHerc0332/20251211183505-2.399um-0.2m-78keV-masked.zarr	0	41	138	71	90	0.53	76	valley
+PHerc0332	PHerc0332/20251211183505-2.399um-0.2m-78keV-masked.zarr	1	41	137	69	89	0.52	82	valley
+PHerc0332	PHerc0332/20251211183505-2.399um-0.2m-78keV-masked.zarr	2	41	133	69	87	0.54	91	valley
+PHerc0343	PHerc0343/20250521140437-8.640um-1.2m-116keV-masked.zarr	0	53	134	70	94	0.40	133	valley
+PHerc0358	PHerc0358/20250821151737-9.362um-1.2m-113keV-masked.zarr	0	52	134	72	93	0.30	96	valley
+PHerc0483A	PHerc0483A/20250521140913-8.640um-1.2m-116keV-masked.zarr	0	53	128	68	91	0.55	110	valley
+PHerc0483B	PHerc0483B/20251124083638-8.640um-1.2m-116keV-masked.zarr	0	51	122	68	87	0.36	106	valley
+PHerc0490A	PHerc0490A/20250521151210-8.640um-1.2m-116keV-masked.zarr	0	54	127	69	91	0.71	166	valley
+PHerc0490B	PHerc0490B/20250521151215-8.640um-1.2m-116keV-masked.zarr	0	53	134	69	94	0.50	150	valley
+PHerc0500P2	PHerc0500P2/20250526151718-2.215um-0.4m-111keV-masked.zarr	1	52	105	73	79	0.78	22	valley
+PHerc0500P2	PHerc0500P2/20250526151718-2.215um-0.4m-111keV-masked.zarr	2	53	108	72	81	0.72	30	valley
+PHerc0500P2	PHerc0500P2/20250820143440-9.362um-1.2m-113keV-masked.zarr	0	49	101	74	75	0.91	38	valley-weak
+PHerc0800	PHerc0800/20250521135224-8.640um-1.2m-116keV-masked.zarr	0	53	123	68	88	0.50	135	valley
+PHerc0813	PHerc0813/20250821151723-9.362um-1.2m-113keV-masked.zarr	0	51	127	70	89	0.30	91	valley
+PHerc0814	PHerc0814/20250804134230-9.362um-1.2m-113keV-masked.zarr	0	54	129	71	92	0.50	102	valley
+PHerc0814	PHerc0814/20260309142202-2.399um-0.2m-78keV-masked.zarr	1	42	120	62	81	0.53	87	valley
+PHerc0814	PHerc0814/20260309142202-2.399um-0.2m-78keV-masked.zarr	2	43	117	62	80	0.52	93	valley
+PHerc0826	PHerc0826/20250821151701-9.362um-1.2m-113keV-masked.zarr	0	50	126	69	88	0.44	88	valley
+PHerc0841	PHerc0841/20250821151531-9.366um-1.2m-113keV-masked.zarr	0	52	119	69	86	0.52	84	valley
+PHerc0841	PHerc0841/20260319124803-2.403um-0.2m-77keV-masked.zarr	1	39	113	58	76	0.50	85	valley
+PHerc0841	PHerc0841/20260319124803-2.403um-0.2m-77keV-masked.zarr	2	39	113	59	76	0.49	89	valley
+PHerc0846A	PHerc0846A/20250728152254-9.362um-1.2m-113keV-masked.zarr	0	55	146	70	101	0.45	108	valley
+PHerc0846B	PHerc0846B/20250804142305-9.362um-1.2m-113keV-masked.zarr	0	53	133	70	93	0.46	74	valley
+PHerc1203	PHerc1203/20250820131727-9.362um-1.2m-113keV-masked.zarr	0	53	128	71	91	0.29	104	valley
+PHerc1218	PHerc1218/20250521120456-8.640um-1.2m-116keV-masked.zarr	0	54	132	71	93	0.50	95	valley
+PHerc1299	PHerc1299/20260309130042-2.399um-0.2m-78keV-masked.zarr	1	45	104	68	75	0.86	45	valley-weak
+PHerc1299	PHerc1299/20260309130042-2.399um-0.2m-78keV-masked.zarr	2	45	104	68	75	0.84	56	valley
+PHerc1447	PHerc1447/20250521151220-8.640um-1.2m-116keV-masked.zarr	0	53	124	71	89	0.40	113	valley
+PHerc1451	PHerc1451/20250521151225-8.640um-1.2m-116keV-masked.zarr	0	52	130	76	91	0.36	135	valley
+PHerc1545	PHerc1545/20250821151648-9.362um-1.2m-113keV-masked.zarr	0	52	129	72	91	0.35	67	valley
+PHerc1667	PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr	0	42	114	61	78	0.62	75	valley
+PHerc1667	PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr	1	43	111	61	77	0.63	84	valley
+PHerc1667	PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr	2	43	112	63	78	0.61	93	valley
+PHercMAN5	PHercMAN5/20260311104824-2.399um-0.2m-78keV-masked.zarr	1	45	105	64	75	0.62	56	valley
+PHercMAN5	PHercMAN5/20260311104824-2.399um-0.2m-78keV-masked.zarr	2	45	104	63	75	0.60	69	valley
+PHercParis3	PHercParis3/20260427095331-2.400um-0.2m-78keV-masked.zarr	1	40	113	57	77	0.42	110	valley
+PHercParis3	PHercParis3/20260427095331-2.400um-0.2m-78keV-masked.zarr	2	40	113	57	77	0.35	115	valley
+PHercParis4	PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr	0	42	116	62	79	0.37	85	valley
+PHercParis4	PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr	1	43	114	61	79	0.37	88	valley
+PHercParis4	PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr	2	42	114	61	78	0.33	90	valley

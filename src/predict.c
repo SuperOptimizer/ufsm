@@ -61,6 +61,7 @@ typedef struct {
     pthread_mutex_t mu; pthread_cond_t cv;
     double t_read, t_stats, t_wait;   /* UFSM_PRED_PROF: seconds in z3_read, the stats scan, waiting for a free slot */
     int nostats;                      /* the window statistics are computed on the device (default path) */
+    int floor_;                       /* --ct-floor on the host (UFSM_PRED_HOSTPATH only; the device path floors after the upload) */
     int lv; lv_chunk_ref *lvref[NSLOT]; int lvn[NSLOT], lvmax; size_t lvbytes[NSLOT];   /* a latvol CT array read as cells: each slot holds the window's packed chunk streams (lv_read_box), no decode on the host */
     zr *lz; const long long *lzo; int lzc, lzt;   /* (lzt handles of the store, one decoding thread each) */   /* --latents: the window's stored cells instead of its CT (nz[k]: 0 when every cell is air) */
     uint8_t *dbuf[NSLOT]; void **ctw; int nctw, ngpuw; int64_t csh[3];   /* UFSM_PRED_DEVREAD: device windows, filled by nctw chunk workers (nn_ctw_*); csh the array shape */
@@ -132,6 +133,7 @@ static void *reader_main(void *arg) {
         else if (r->nostats) r->t_read += now() - t1;
         else {
             double t2 = now(); r->t_read += t2 - t1;
+            if (r->floor_ > 1) for (size_t j = 0; j < w3; j++) if (r->buf[k][j] < r->floor_) r->buf[k][j] = 0;
             const uint8_t *c = r->buf[k]; size_t nz = 0; double sum = 0, sq = 0;
             for (size_t j = 0; j < w3; j++) { nz += c[j] != 0; sum += c[j]; sq += (double)c[j] * c[j]; }
             r->nz[k] = nz; r->sum[k] = sum; r->sq[k] = sq;
@@ -1552,6 +1554,13 @@ static int predict_one(int argc, char **argv) {
     const int iso = opt_atoi("--iso", opt(argc, argv, "--iso", "0"));   /* the void cutoff: probability outputs 0 where CT < iso (the fit keeps CT > 0) */
     if (iso < 0 || iso > 255) { fprintf(stderr, "--iso: 0..255\n"); return 2; }
     nn_set_pred_iso(iso);
+    /* --ct-floor T (DESIGN 2026-11-17 "per-scroll air iso"): every CT voxel below T reads as 0 before anything sees the window (statistics,
+       the net's input, the skip-empty tiles, --fit-ct), i.e. an unmasked scan's air / void looks like a masked scan's; on the device after
+       the upload (every CT path: voxels, device reads, latvol cells rebuilt; a latvol's stored-index input is turned off), on the host in
+       the reader for UFSM_PRED_HOSTPATH. T from scripts/unroll/air_iso.tsv (ufsm ct-iso). 0 / 1: off */
+    const int ct_floor = opt_atoi("--ct-floor", opt(argc, argv, "--ct-floor", "0"));
+    if (ct_floor < 0 || ct_floor > 255) { fprintf(stderr, "--ct-floor: 0..255\n"); return 2; }
+    if (lat_store && ct_floor > 1) { fprintf(stderr, "predict: --ct-floor with --latents is not supported (the net's input comes from the stored cells, not the CT)\n"); return 2; }
     const char *cache = opt(argc, argv, "--cache", getenv("UFSM_HTTP_CACHE")), *axisf = opt(argc, argv, "--axis", nullptr);
     /* no --axis = the radial input channels (scroll-outward direction) are zero for the whole run: the nets are trained with the axis on
        (almost) every source, so this silently degraded the latent ink / recto passes (audit 2026-11-14). An explicit --no-axis 1 runs anyway. */
@@ -1563,7 +1572,8 @@ static int predict_one(int argc, char **argv) {
     if (grid) snprintf(grid_attrs, sizeof grid_attrs, ",\"grid_origin_zyx\":[%lld,%lld,%lld]", (long long)grid_origin[0], (long long)grid_origin[1], (long long)grid_origin[2]);
     {   /* the axis the radial input channels came from (none: --no-axis): every output store records it (audit 2026-11-14) */
         const size_t l = strlen(grid_attrs);
-        snprintf(grid_attrs + l, sizeof grid_attrs - l, ",\"axis\":\"%s\",\"radial_sign\":%d", axisf && *axisf ? axisf : "none", axisf && *axisf ? (int)radial_sign : 0); }
+        snprintf(grid_attrs + l, sizeof grid_attrs - l, ",\"axis\":\"%s\",\"radial_sign\":%d", axisf && *axisf ? axisf : "none", axisf && *axisf ? (int)radial_sign : 0);
+        const size_t l2 = strlen(grid_attrs); if (ct_floor > 1) snprintf(grid_attrs + l2, sizeof grid_attrs - l2, ",\"ct_floor\":%d", ct_floor); }
     long long boxv[6]; const char *box = opt(argc, argv, "--box", nullptr); char tail;
     /* with --grid-origin a box may start up to a shard before the volume (CT there reads as fill): unroll.sh starts the half-stride
        fields grid's box on its own window grid, which for a box at 0 lies before the volume (2026-11-16) */
@@ -2701,6 +2711,7 @@ static int predict_one(int argc, char **argv) {
                 lvq = 0; fprintf(stderr, "predict: latvol CT: a --skip-empty-trained net: the trunk's input from the rebuilt CT so its tile masks are built (not the stored indices)\n");
             } else
             if (!lvq) fprintf(stderr, "predict: latvol CT: the store's transform differs from the checkpoint's (max |db| %.3g): the trunk's input from the rebuilt CT\n", dm);
+            if (lvq && ct_floor > 1) { lvq = 0; fprintf(stderr, "predict: latvol CT: --ct-floor: the trunk's input from the rebuilt, floored CT (not the stored indices)\n"); }
         }
         rd.lv = 1; rd.lvmax = (int)((Wz / 128 + 2) * (W / 128 + 2) * (W / 128 + 2));
         for (int k = 0; k < NSLOT; k++) rd.lvref[k] = malloc((size_t)rd.lvmax * sizeof(lv_chunk_ref));
@@ -2721,7 +2732,7 @@ static int predict_one(int argc, char **argv) {
                    fprintf(stderr, "predict: UFSM_PRED_DEVREAD: no device windows (memory, chunking or no GPU decoder): the host path\n"); }
         else fprintf(stderr, "predict: the CT windows decoded into device memory (%d chunk workers on the GPU decoder, %d on the CPU, %.1f GB)\n", rd.ngpuw, nw - rd.ngpuw, NSLOT * (double)w3 / 1e9);
     }
-    rd.nostats = gpath;
+    rd.nostats = gpath; rd.floor_ = gpath ? 0 : ct_floor;
     atomic_store(&rd.filled, 0); atomic_store(&rd.consumed, 0); atomic_store(&rd.failed, 0);
     pthread_mutex_init(&rd.mu, nullptr); pthread_cond_init(&rd.cv, nullptr);
     pthread_t rth; pthread_create(&rth, nullptr, reader_main, &rd);
@@ -2835,17 +2846,18 @@ static int predict_one(int argc, char **argv) {
                     else nz = 0;
                 } else if (lvm) {   /* the packed streams up (into the CT window's own buffer: dead once decoded), the cells, the CT rebuilt from them */
                     lv_fb = rd.nz[k] && rd.lvn[k] < 0;
-                    if (lv_fb) { nn_h2d(ctd, ctu, w3); nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq); sq += (double)lvc->drop_ms * (double)nz; lv_nfb++; }
+                    if (lv_fb) { nn_h2d(ctd, ctu, w3); nn_ct_floor(ctd, w3, ct_floor); nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq); sq += (double)lvc->drop_ms * (double)nz; lv_nfb++; }
                     else if (rd.nz[k]) {
                         nn_h2d(ctd, ctu, rd.lvbytes[k]);
                         if (nn_latvol_decode(lvL, ctd, rd.lvref[k], rd.lvn[k], Wz / 4, W / 4, W / 4, lv_stride, lz_d)) { fprintf(stderr, "\npredict: latvol: a corrupt chunk stream in window %lld,%lld,%lld\n", (long long)o[0], (long long)o[1], (long long)o[2]); return 1; }
-                        nn_latvol_synth(lvL, lz_d, lv_stride, Wz / 4, W / 4, W / 4, ctd); nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq);
+                        nn_latvol_synth(lvL, lz_d, lv_stride, Wz / 4, W / 4, W / 4, ctd); nn_ct_floor(ctd, w3, ct_floor); nn_pred_stats(ctd, w3, stsc, &nz, &sum, &sq);
                         sq += (double)lvc->drop_ms * (double)nz; lv_up += (double)rd.lvbytes[k];
                     } else nz = 0;
                 } else {
                 if (pre_i == i) {   /* prefetched: the copy stream's upload, then one device copy (the prefetch buffer free again after it) */
                     nn_stream_wait(0, ev_pre); nn_d2d_async(ctd, ctpre, w3); nn_event_record(ev_preu, 0);
                 } else if (rd.dbuf[0]) nn_d2d(ctd, rd.dbuf[k], w3); else nn_h2d(ctd, ctu, w3);
+                nn_ct_floor(ctd, w3, ct_floor);   /* --ct-floor (stream 0, after the copy) */
                 nn_pred_stats_start(ctd, w3, stsc); stats_pending = 1;   /* (finished below, after the axis rows: no blocking copy here) */
                 }
                 if (stats_pending) {

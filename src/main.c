@@ -177,6 +177,7 @@ static int usage(void) {
         "  ufsm restore-eval <ckpt> <clean.npy>... [--family pyramid]   task restore: PSNR on clean crops degraded by one recipe\n"
         "  ufsm restore-stats <root> <key> --um U --box ... [--degrade scanner ...]   task restore: calibration statistics of a CT box\n"
         "  ufsm ct-hist <out.txt> <root> <key> z,y,x,n [...]  CT histograms of boxes (targets of train --aug-hist, the hist op)\n"
+        "  ufsm ct-iso <root> <key> <level> [--grid 8]      the scan's air / papyrus iso (scripts/unroll/air_iso.tsv; predict --ct-floor)\n"
         "  ufsm fit <fields-dir> [--slab Z] [--out MODEL] [--winding ZARR] [--codes ROOT KEY]   winding fitter (src/fit.h)\n"
         "  ufsm convert-unwrap2 <unwrap.ckpt> <out.ckpt>   a task unwrap checkpoint as task unwrap2 (heads 2-10 -> 0-8, winding mod 4 fresh; no training step)\n"
         "  ufsm repack <in-array-dir> <out-array-dir> <shard> [--threads N]   lossless re-sharding of a z3w uint8 zarr (copies the compressed chunks)\n"
@@ -4776,6 +4777,7 @@ int cmd_fields_pack(int argc, char **argv);   /* src/fieldspack.c */
 int cmd_labcomp_pack(int argc, char **argv);   /* src/labcomp_cli.c */
 int cmd_ink_gate(int argc, char **argv);   /* src/inkgate.c */
 int cmd_img_gate(int argc, char **argv);   /* src/imggate.c */
+int cmd_ct_iso(int argc, char **argv);     /* src/ctiso.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
 int cmd_annotate_serve(int argc, char **argv);   /* src/annot.c */
@@ -4970,6 +4972,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "codes-pool2")) return cmd_codes_pool2(argc, argv);
     if (!strcmp(cmd, "phase-fuse") || !strcmp(cmd, "recto-fuse")) return cmd_fuse(argc, argv);
     if (!strcmp(cmd, "ct-hist")) return cmd_ct_hist(argc, argv);
+    if (!strcmp(cmd, "ct-iso")) return cmd_ct_iso(argc, argv);
     if (!strcmp(cmd, "restore-eval")) return cmd_restore_eval(argc, argv);
     if (!strcmp(cmd, "restore-stats")) return cmd_restore_stats(argc, argv);
     if (!strcmp(cmd, "wrapdist")) return cmd_wrapdist(argc, argv);
