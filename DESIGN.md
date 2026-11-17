@@ -35,8 +35,48 @@ four decoder conv1s are split inputs with the fused upsample and per-segment GNs
 - lp_f4v_preup: per slab, the coarse rows once (up_coarse_f4v_k = f4ru_coarse), the up part at full resolution (up_fine_f4v_k =
   f4ru_blend plus the e2m1 requantisation), the skip part prenormed, then the split conv.
 Every staged byte is the old staging's, so outputs and statistics are the same bits.
-Still on conv_fwd_f4_k: Cop % 64 != 0 (the 288-wide 12^3 / 6^3 levels), statistics with W % 16 != 0 (448 @ 24^3), slab-local GN,
-staging SR, ARCH=86.
+Still on conv_fwd_f4_k: Cip <= 64 (the ring kernels take those before the hook), statistics with a 2-plane conv_fwd_f4_k tile and
+W % 16 != 0, slab-local GN, staging SR, ARCH=86.
+
+**MT 2, the default.** The first kernel had MT 4 (64 rows) and so needed Cop % 64 == 0. That left the 96 / 160-wide predict nets
+(u1, inkpod) on the old kernel, and fp4teach's predict A/B showed no gain.
+- MT 2 is 32 rows a block with 4 weight stages a chunk (pairs [0, 4) [4, 7) [7, 11) [11, 14): the same pairs in the same order).
+  That makes 46 KB and 128 registers, so two blocks fit an SM and one block's prologue / epilogue overlaps the other's MMAs.
+- It beats MT 4 at every width, so it is the default (UFSM_F4V_MT=4 keeps MT 4).
+- At short K (96 inputs: 3 chunks) MT 4 sat at 53 % tensor. ncu put ~20 % of its stall samples in the epilogue, with no other
+  block to cover it.
+- Statistics: each block reproduces the conv_fwd_f4_k block of its voxels. The per-channel sums depend on the block's voxels and
+  warp order, not its channel count. conv_fwd_f4_k runs MT 4 at TZ 2 (Cop % 64 == 0), else MT 2 at TZ 4 (depth >= 16) or TZ 2.
+  So f4v_epi_st (2-plane halves) is used when that tile is 2 planes deep, else the plain epilogue.
+- 11 more test_f4v cases (96 / 160 / 288 outputs), all byte-equal with UFSM_F4V_MT=0 and 4.
+- A tried variant: storing the scale bytes at issue removes MT 2's remaining spills (42 M LDL a call at L0) but stalls on the load:
+  29.1 vs 28.0 ms (F4V_SDIRECT, off).
+- Mixed MT 4 + an MT 2 tail for 96 / 160 was slower than all-MT 2: 1.90 / 0.85 ms vs 1.72 / 0.55.
+
+| case (ncu, GN + stats unless noted) | conv_fwd_f4_k ms | MT 4 ms | MT 2 ms |
+|---|---|---|---|
+| 96 -> 96 32 x 160^2 (u1 / inkpod level 0) | 2.16 | 1.90 (with a 32-row tail) | 1.72 |
+| 160 -> 160 40^3 | 0.72 | 0.85 (with a tail) | 0.55 |
+| 128 -> 128 64 x 80^2 | 2.00 | 1.51 | 1.46 |
+| L0 256 -> 256 32 x 256^2, bdata | 42.2 | 30.7 | 28.0 (69.5 % tensor) |
+| L1 320 -> 320 32 x 128^2, bdata | 16.5 | 11.6 | 10.5 |
+
+**sparse24 on top.** bench_sp24 (wall clock, shared card 1), dense vs 2:4-sparse conv:
+- against conv_fwd_f4_k the sparse kernels win 1.24-3.35x;
+- against conv_fwd_f4v_k they win 1.06-1.08x at L0, 1.03-1.04x at L1, 1.02-1.03x at L2, 1.03-1.10x at L3, before their masking
+  costs.
+So --sparse24 mode 3, which changes results, no longer pays.
+
+**Weight gradient** (conv_bwd_w_f4ws_k, bench_wgl0 128^3 256 -> 256, ncu):
+- 21.5-22.4 ms, tensor 29 %, issue 57 %, no spills. 85 % of the instructions are the producers' x staging (decode, GN + SiLU with
+  3 MUFU, two requantisations), repeated for each co tile (8x at Co 256).
+- Dropping the bf16 round trip from the LY 1 decode is exact for MX inputs: 22.4 -> 21.9 ms.
+- UFSM_F4W_MT4=1 (64 co x 8 ci tiles): 21.5 -> 20.3 ms. The LY 1 lanes then sit on 6 of the 11 producer warps.
+- Ceiling with the staging stubbed out: 12.4 ms (52 % tensor).
+- An x pre-pass into LY 1 records would move ~9.5 GB per call (~450 B per plane, channel and tile, read once per co tile): ~21 ms
+  of DRAM time, so no gain. Sharing one staging across a cluster of co tiles (DSMEM) is the remaining route.
+
+
 
 **Tests.** tests/test_f4v.c (fast tier) has 21 cases comparing old and new kernel. Each must show equal output bytes, equal GN
 statistics, and the new kernel actually having run. The cases cover:
