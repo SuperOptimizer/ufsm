@@ -137,6 +137,10 @@ void nn_srste24(float *g, const float *w, int co, int ci, int taps, float lambda
 /* sparse24 modes (src/nn_elem.cu mask_sp_k): 1 element-wise 2:4 along ci (dense kernels only), 2 pair-wise 4:8 along ci (the sparse fp4
    MMA's pattern: forward sparse), 3 transposable 2 x 2 blocks (forward and backward-data sparse); a conv the mode does not fit stays dense */
 int nn_sp24_eligible(int co, int ci, int mode);
+/* nn_cluster.cu: thread-block clusters of 1 x 1 x n blocks (n = 2 / 3 / 4 / 6) with dsm bytes of dynamic shared memory, a neighbour's shared
+   memory written through mapa (mode 0: st.shared::cluster; 1: st.async on mbarriers, then remote arrivals): 0 (*nbad wrong words), -2 not
+   available (pre-sm_90 build or card), else the CUDA error (tests/test_cluster.c) */
+int nn_cluster_selftest(int n, int mode, size_t dsm, int *nbad);
 void nn_mask24m(const float *w, float *out, int co, int ci, int taps, int mode);
 void nn_srste24m(float *g, const float *w, int co, int ci, int taps, float lambda, int mode);
 void nn_mask24x(const float *w, float *out, float r, float *aux, double *e2, int co, int ci, int taps, int mode, uint8_t *kb, int kin);   /* pruned x r into out, aux zeroed where pruned, energy {all, kept} into e2; kb: keep bytes out (kin 0) / in (kin 1) */

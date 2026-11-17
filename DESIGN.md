@@ -6,6 +6,43 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## mcc 5744025: thread-block clusters (__cluster_dims__); live-range splitting at calls (2026-11-17, branch mcc-rasplit-20261117)
+
+**Clusters** (for convk's fp4 wgrad: the 8 co-tile CTAs of one ci tile stage x once instead of 8 times; x staging is 85 % of
+conv_bwd_w_f4ws_k's instructions). `__cluster_dims__(x, y, z)` on a kernel (template instances included) is PTX
+`.reqnctapercluster x, y, z` on its .entry for sm_90 on, and nothing on ARCH=86. A plain `<<<>>>` (mcudahw's cuLaunchKernel)
+takes the shape from the kernel. The cluster operations are inline asm (mapa, st / ld.shared::cluster, barrier.cluster,
+fence.acq_rel.cluster, %cluster_ctarank / %cluster_nctarank; st.async ... mbarrier::complete_tx, mbarrier init / expect_tx /
+remote arrive / try_wait in a braced label loop), which mcc passes through. src/nn_cluster.cu + tests/test_cluster.c (gpu, smoke)
+on the desk's sm_120 card: clusters of 1 x 1 x N, N = 2 / 3 / 4 / 6 (convk: the card's 3 GPCs of 12 SMs hold 36 one-CTA-per-SM blocks in
+clusters of those, 8 only 24), 512 B and 90 KB of dynamic shared memory; each block writes into its neighbour's shared memory
+(st.shared::cluster, and st.async completing on the receiver's mbarrier, then every block arrives on each member's barrier
+remotely) and reads back what its predecessor wrote: 0 wrong words in all 16 cases. The ARCH=86 compile leaves out the cluster
+code and the directive (test SKIP there). All 169 other units' PTX is unchanged.
+
+**Live-range splitting at calls.** Every xmm register is caller-saved on x86-64, so ra.c (linear scan, no splitting) kept each
+float that lives across a call in a stack slot all its life, every read a load. Long float functions that call libm (fit_vox2:
+sincosf / logf / atan2f, 540 of 1574 instructions on the stack) paid that on each use. After the first allocation (beside the
+loop splits), a spilled register read at least twice in a call-free run of a block and not written there gets one copy before
+the run's first read; the run's reads use it. MCC_NOSPLITCALL=1: off; MCC_SPLITCALLMAX=N: the first N copies (bisecting).
+
+| paired A/B, 120 single-thread CPU suite lines, same ufsm source | cycles | geomean | instructions |
+|---|---|---|---|
+| 16cd2b7 then call splits | -1.01 % | 0.988 | -0.13 % |
+| call splits then 16cd2b7 (the old one second) | +2.15 % for the old | 1.012 | +0.05 % |
+
+Instructions hardly move (stack loads become register reads, copies are added); the gain is in cycles. (Measured before the
+slot-alias guard below, which only adds a move where a split copy's original shared its slot.)
+
+The first version miscompiled ufsm (the fast tier caught it: test_replay_lean SIGSEGV in nn_w4.cu's cpu_runs, `runs + a` NULL).
+A split copy that gets no register is given the original's stack slot (the loop splits' rule: the same value through the run).
+But once the original's range ends at the copy, move coalescing may put a register written in the run on that place: here the
+loop counter's next value (a + 1, moved back into a's phi), so the copy read a + 1. Bisected with MCC_SPLITCALLMAX to copy 94 of
+109 in that unit. Now the slot alias needs the original to be the slot's only register (the same guard covers the loop splits'
+copies). Two more lessons: a first A/B showed -5 % cycles because its baseline was built from an older ufsm tree (volcomp's faster
+lossless encoder came in between): rebuild both sides of an A/B from one source. And cpu_pair.sh does not check exit codes:
+the fast tier is the gate, not the timing run.
+
 ## PHerc0332: try9 undercounts 20 %, u1's z drift is the top 5 mm; count-field --rho-r (2026-11-17, branch fix0332-20261117)
 
 0332 has no winding labels (0.1 % fibre-hf only), so every net is out of domain there; no GT, so the objectives are wrap-check
