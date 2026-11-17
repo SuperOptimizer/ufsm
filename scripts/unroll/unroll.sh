@@ -120,7 +120,7 @@ F=$O/fields/$FNAME; REF=$O/ref-cf; INK=$O/ink/$INKNAME.zarr
 
 # the run's own copy of the scripts (bash reads scripts incrementally: editing the repo must not change a running driver)
 if [ "$DRY" != 1 ] && [ "${UNROLL_COPY:-0}" != 1 ]; then
-  mkdir -p $O/bin && cp $H/unroll.sh $H/fields_cat.sh $H/scrolls.tsv $H/spiral_dir.tsv $REPO/scripts/wbench/mkcrop.sh $REPO/scripts/strip/strip_run.sh $REPO/scripts/strip/strip_refill.sh $REPO/scripts/pod/latink.sh $O/bin/ || exit 1
+  mkdir -p $O/bin && cp $H/unroll.sh $H/fields_cat.sh $H/scrolls.tsv $H/spiral_dir.tsv $H/air_iso.tsv $REPO/scripts/wbench/mkcrop.sh $REPO/scripts/strip/strip_run.sh $REPO/scripts/strip/strip_refill.sh $REPO/scripts/pod/latink.sh $O/bin/ || exit 1
   UNROLL_COPY=1 UNROLL_REPO=$REPO exec bash $O/bin/unroll.sh "$@"
 fi
 MKCROP=$H/mkcrop.sh; [ -e $MKCROP ] || MKCROP=$REPO/scripts/wbench/mkcrop.sh
@@ -185,7 +185,7 @@ mstart() {
   if [ -n "${INKCMD:-}" ]; then mset inkcmd "$INKCMD"; mset ink_ck "${LATINK_CK:-the default of INKCMD}"; [ -n "${LATINK_CK:-}" ] && mset ink_ck_sha "$(fsha $LATINK_CK)"
   else mset ink_ck "$(readlink -f $INKCK)"; mset ink_ck_sha "$(fsha $INKCK)"; fi
   mset box "${BOX:-mask}"; mset zr "${ZR:--}"; mset stripargs_env "${STRIPARGS:-}"
-  mset env "$(for v in CK INKCK INKCMD LATINK_CK FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
+  mset env "$(for v in CK INKCK INKCMD LATINK_CK FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FFLOOR FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
 }
 mstage() {
   [ "$DRY" = 1 ] && return 0
@@ -263,6 +263,19 @@ fpred() {   # fpred GPU BOX OUT
   fi
   fpred1 $1 $2 $3 0
 }
+airiso() {   # airiso SPEC: a number as is; valley | mid [+N | -N]: that column of air_iso.tsv (ufsm ct-iso) for this scan (the zarr's basename) at the
+             # fields level LV (else its level 0..2 nearest LV), + N. No row: computed now with ufsm ct-iso (a DEFAULTED: line names it); failing that, refused
+  local sp=$1 col off=0 key=$(basename $K) t= row
+  case $sp in [0-9]*) echo $sp; return 0;; valley*|mid*) ;; *) echo "unroll: FSKIP / FFLOOR '$sp': a number or valley|mid[+-N]" >&2; return 1;; esac
+  col=${sp%%[+-]*}; [ "$col" != "$sp" ] && off=${sp#$col}; off=${off#+}
+  local ci=$([ "$col" = valley ] && echo 6 || echo 7) AT=$H/air_iso.tsv
+  for l in $LV 2 1 0; do row=$(awk -F'\t' -v k=$key -v l=$l '$0 !~ /^#/ && $3 == l && $2 ~ ("/" k "$")' $AT 2> /dev/null | head -1); [ -n "$row" ] && break; done
+  if [ -n "$row" ]; then t=$(echo "$row" | cut -f$ci)
+  else row=$($U ct-iso $R $K $LV --scroll $S 2> /dev/null); t=$(echo "$row" | cut -f$ci)
+    [[ "$t" =~ ^[0-9]+$ ]] || { echo "unroll: no air_iso.tsv row for $key and ct-iso found no air mode: give FSKIP / FFLOOR as a number" >&2; return 1; }
+    echo "DEFAULTED: air iso of $key (not in air_iso.tsv): ct-iso now: $(echo "$row" | cut -f4-10 | tr '\t' ' ')" >&2; fi
+  echo $(( t + off ))
+}
 fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windows anchored at GRID (each axis)
   # a box off the window grid runs each window once per 512 shard it touches (predict.c: up to 8x on the half-stride grid; 0332 FBLEND
   # 3138 windows against 505 on grid 0, 34 of its 46 min fields): the box is started back on the grid instead (field-blend crops it to the
@@ -274,11 +287,15 @@ fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windo
   # FSKIP (lat fields; default 20, 0 = dense): --skip-empty 1 --skip-thr FSKIP --skip-margin 1, void tiles (no CT voxel above FSKIP) left at
   # their bias. wbench GT A/B 2026-11-17 (u1 13000, 44 boxes): ids dense 0.5327, thr 20 0.5369 (+0.004 [+0.0003, +0.009]), 40 0.5357
   # (+0.003, CI > 0), 60 0.5294 (n.s.); the gain sits on the packed Paris 4 boxes (+0.015 / +0.005); fields predict -13 % on 0332 / 1667
-  local win sk=; [ "$FKIND" = lat ] && [ "${FSKIP:-20}" != 0 ] && sk="--skip-empty 1 --skip-thr ${FSKIP:-20} --skip-margin 1"
+  # FSKIP / FFLOOR also take a column of air_iso.tsv for this scan and level (valley | mid | valley+N | mid+N; airiso below). FFLOOR (default 0 =
+  # off): predict --ct-floor (CT voxels < T read as 0). wbench GT A/B 2026-11-17 (DESIGN "per-scroll air iso"): u1 13000 lost ids with a voxel
+  # floor at the valley; not a default
+  local win sk= fl= v; [ "$FKIND" = lat ] && [ "${FSKIP:-20}" != 0 ] && { v=$(airiso ${FSKIP:-20}) || return 1; sk="--skip-empty 1 --skip-thr $v --skip-margin 1"; }
+  [ "${FFLOOR:-0}" != 0 ] && { v=$(airiso $FFLOOR) || return 1; fl="--ct-floor $v"; }
   if [ "$FKIND" = lat ]; then win="--window ${LWIN:-640} --halo ${LHALO:-64}"
   else win="$([ "${FWIN:-prod}" = auto ] && echo "--window auto" || echo "--window-z 384 --halo-z 64 --window 640") --halo 64"; fi
   X $O/logs/fields.log $U predict $CK ${FCTR:-$R} ${FCTK:-$K} $3.tmp --um $UM --level $LV --box $box $win --shard 512 \
-    --grid-origin $4,$4,$4 --ema 1 --q 8 --threads ${PTH:-14} --gpu $(lg $1) --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $sk $(occlv) &&
+    --grid-origin $4,$4,$4 --ema 1 --q 8 --threads ${PTH:-14} --gpu $(lg $1) --axis $O/axis.json --levels 1 --fit-zarr $3 --fit-h 2 --fit-q 8 --fit-q-phase 4 --no-out 1 $sk $fl $(occlv) &&
     { [ "$DRY" = 1 ] || { rm -rf $3.tmp; [ -e $3/fields.json ]; }; }
 }
 # --- the ref's pass 1 streamed behind the fields predict (REFSTREAM; 6a, 11-12) ---
