@@ -248,7 +248,7 @@ fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windo
   # grid-0 cells; the blended fields byte-identical, DESIGN 2026-11-16 unroll perf)
   local box=$2 st=$(( ${LWIN:-640} - 2 * ${LHALO:-64} )) b d; IFS=, read -r -a b <<< "$2"
   if [ "$4" != 0 ] && [ "$FKIND" = lat ]; then for d in 0 1 2; do
-    local s=$(( ((b[d] - $4) % st + st) % st )); [ $(( b[d] - s )) -ge 0 ] && b[d]=$(( b[d] - s )) && b[d + 3]=$(( b[d + 3] + s )); done
+    local s=$(( ((b[d] - $4) % st + st) % st )); b[d]=$(( b[d] - s )); b[d + 3]=$(( b[d + 3] + s )); done   # (before 0 at a box at 0: predict reads fill there)
     box=$(IFS=,; echo "${b[*]}"); fi
   local win; if [ "$FKIND" = lat ]; then win="--window ${LWIN:-640} --halo ${LHALO:-64}"
   else win="$([ "${FWIN:-prod}" = auto ] && echo "--window auto" || echo "--window-z 384 --halo-z 64 --window 640") --halo 64"; fi

@@ -1565,10 +1565,13 @@ static int predict_one(int argc, char **argv) {
         const size_t l = strlen(grid_attrs);
         snprintf(grid_attrs + l, sizeof grid_attrs - l, ",\"axis\":\"%s\",\"radial_sign\":%d", axisf && *axisf ? axisf : "none", axisf && *axisf ? (int)radial_sign : 0); }
     long long boxv[6]; const char *box = opt(argc, argv, "--box", nullptr); char tail;
+    /* with --grid-origin a box may start up to a shard before the volume (CT there reads as fill): unroll.sh starts the half-stride
+       fields grid's box on its own window grid, which for a box at 0 lies before the volume (2026-11-16) */
+    const long long lo0 = grid ? -(long long)opt_atoi("--shard", opt(argc, argv, "--shard", "512")) : 0;
     if (!isfinite(um) || um <= 0 || W <= 0 || halo < 0 || halo >= W / 2 || shard < 128 || shard % 128 ||
         level < 0 || level > 20 || nlev < 1 || nlev > 20 || nthreads < 1 || !isfinite(q) || q < 0 ||
         (box && (sscanf(box, "%lld,%lld,%lld,%lld,%lld,%lld%c", &boxv[0], &boxv[1], &boxv[2], &boxv[3], &boxv[4], &boxv[5], &tail) != 6 ||
-                 boxv[0] < 0 || boxv[1] < 0 || boxv[2] < 0 || boxv[3] <= 0 || boxv[4] <= 0 || boxv[5] <= 0))) {
+                 boxv[0] < lo0 || boxv[1] < lo0 || boxv[2] < lo0 || boxv[3] <= 0 || boxv[4] <= 0 || boxv[5] <= 0))) {
         fprintf(stderr, "invalid prediction geometry: require positive --um/window/box, 0 <= halo < window/2, shard a multiple of 128, and valid levels/threads/q\n"); return 2;
     }
     if (box) for (int d = 0; d < 3; d++) {

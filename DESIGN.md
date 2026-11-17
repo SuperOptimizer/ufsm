@@ -51,6 +51,11 @@ level 0 and the model / output passes fell back to the CPU; 36-79 s on a free ca
 - **recto-sp.** rr_peaks takes its 2R + 1 gaussian taps from a table built per call instead of an exp per tap per sample (exp
   was a third of the CPU). 1024 x 2048^2 0332 box: 294.8 -> 175.7 CPU s (25.6 -> 18.6 s), byte-identical; test_recto compares the
   smoothed floats with the per-sample exp at 5 sigmas (one past the 256-tap stack table).
+- **Boxes at 0** (1667, Paris 4 and every box starting at a volume face): the half-stride grid's box would start 256 voxels before
+  the volume, which predict refused, so unroll.sh kept the old box there and the 6x window runs. predict now accepts a box up to
+  a shard before the volume with --grid-origin (that CT reads as fill, as every window crossing a face already did), and unroll.sh
+  always starts the box on the grid. 1667 box 0,1024,1024 + 1024^3: half grid 46 runs (+18 air) / 28.7 s -> 18 / 12.2 s, the
+  blended planes identical. test_predict_fitgrid: a box at -64 equals the on-grid box on their common rows.
 - **recto-sp, part 2** (0332 full box, warm m7 cache, same fields): phases were source decode 52 s, profiles 56, field load 23,
   blend 43, shard writes 18 of 207 s. The blend (net^(1-a) rsp^a per material cell, single-threaded exp / log) is a 256 x 256 table
   of the same codes (43 -> 4 s), and each 64-row block's source box is decoded by a helper thread while the previous block's

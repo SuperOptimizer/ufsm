@@ -97,6 +97,20 @@ int main(int argc, char **argv) {
         CHECK(predictx(argv[1], dir, ck2, o2, X[k].box, X[k].extra) == 0, "predict, box %s off the window grid (%s/log-f%s.txt)", X[k].box, dir, X[k].name);
         check_known(o2, X[k].name);
     }
+    /* a box that starts before the volume (unroll.sh's half-stride grid for a box at 0, 2026-11-16): accepted with --grid-origin, CT
+       there reads as fill, and its rows inside the on-grid box 64.. equal that box's planes */
+    {   char on[512]; snprintf(on, sizeof on, "%s/fneg", dir);
+        CHECK(predict(argv[1], dir, ck2, on, "-64,0,0,320,128,128") == 0, "predict, box before the volume (%s/log-fneg.txt)", dir);
+        fit_fields_buf n2, g2; const int ln = fit_fields_load(on, 0, 0, 1, &n2), lg2 = fit_fields_load(og, 0, 0, 1, &g2);
+        CHECK(!ln && !lg2, "load the fields (negative box)");
+        if (!ln && !lg2) {
+            CHECK(n2.shape[0] == 320 && n2.origin[0] == -64, "negative box: shape %d origin %lld", n2.shape[0], (long long)n2.origin[0]);
+            const size_t pl = (size_t)g2.shape[1] * g2.shape[2], n = (size_t)g2.shape[0] * pl; long diff = 0;
+            if (n2.shape[0] >= 128 + g2.shape[0]) for (int k = 0; k < 10; k++) for (size_t i = 0; i < n; i++) if (n2.a[k][128 * pl + i] != g2.a[k][i]) diff++;
+            CHECK(!diff, "negative box: rows 128.. differ from the box at 64 in %ld plane cells", diff);
+            fit_fields_free(&n2); fit_fields_free(&g2);
+        }
+    }
     if (!fails) { char cmd[600]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); if (system(cmd)) {} }
     if (fails) { fprintf(stderr, "test_predict_fitgrid: %d FAILED (kept %s)\n", fails, dir); return 1; }
     printf("test_predict_fitgrid: ok\n");
