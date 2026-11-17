@@ -6,6 +6,37 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## 2-D ink teachers on the try9-6250 pod unrolls: 1667 held-out GT, 0332 papyrus renders (2026-11-17)
+
+The RTX PRO 6000 pod's unrolls (try9-6250 fields; per-wrap flattened `up/wNNN` tifxyz) inked with the 2-D teachers via ink-ext
+(reader3, ink9um s42+s43, argus2 = Argus V2 as `--model reader3`; weights fetched on the pod from HF at the pinned revisions).
+reader3 on the pod: 10-45 s a wrap (120-250 tiles/s, render about 2/3 of it); 0332's 60 wraps (1511 cm2) took about 17 min a model.
+
+**1667 held-out GT.** `/vesuvius/ufsm/argus/pairwrap.py`: wrapscore.py's label sampling and foot points, then every map read at the
+same samples, paired vs reader3 with a bootstrap over 1024-label-px blocks. Validation + holdout samples within 40 um of our
+surfaces: 1,296,287, ink 0.255. inkpod = the unroll's own inkpod-15000, papyrus-gated (max c12, c13) and re-predicted at volcomp q4,
+rendered per wrap on the same up/ surfaces.
+
+| model    | held-out AUC | vs reader3 (95 % CI)        |
+|----------|--------------|-----------------------------|
+| reader3  | 0.8583       |                             |
+| argus2   | 0.8505       | -0.0078 [-0.0178, +0.0019]  |
+| ink9um   | 0.8170       | -0.0413 [-0.0606, -0.0229]  |
+| inkpod   | 0.5824       | -0.276 [-0.308, -0.243]     |
+
+- inkpod on the strip stripes (inkscore.sh) gives 0.581 held-out / 0.839 rest, the same as per wrap and as the audit's LV2 row
+  (0.589 / 0.850). So this is not misregistration: the latent ink head fits its training labels and does not carry to the 1667
+  held-out boxes. reader3 / argus2 rank the same way as on the 24 crops.
+- hecate24 had no 1667 score. Even limited to the held-out ink boxes (70 wrap-box crops, 16 cm2, 253k samples; boxsel.py) it was cancelled
+  with the pod. Paris 4 was not inked (its pod CT / ink were deleted when it was cancelled).
+
+**0332 papyrus renders** (`ink-compare --papyrus`, gain 1.5, floor median, tuned once on w048; the CT layer from `ink-ext
+--render-only --ct-tif`): /vesuvius/ufsm/podun/PHerc0332/ink/{reader3,ink9um,argus2}_pap (60 wraps <= 4000 px plus 2000 px
+crops of w046-w051 at reader3's strongest-ink windows), raw maps beside them, hecate24 on w047 only (about 90 min a 45 cm2 wrap at
+2.4 um on the shared pod GPU, level 0 over https). `ink-compare --best-crop` goes through the in-memory path (render.c), which
+ignores --papyrus: find the window with --best-crop, render it with --crop. Crops on another flattening of the same scroll:
+`/vesuvius/ufsm/argus/mapcrop.py` moves a crop through its 3-D centre onto the new wraps (self-test: identical windows, 0 um).
+
 ## latink at q 4 by default: the held-out ink AUC unchanged, the ink stage -23 % (2026-11-17, branch rectosp-20261117)
 
 latink.sh's LATINKQ (volcomp q of the grid passes, from the GPU's levels, and of the blends) defaults to 4 (was 0, lossless; 0 stays the
