@@ -11,7 +11,7 @@
 #           checkpoint header has "lat_c"; FKIND=lat / vox forces it): fields/lat from cube windows LWIN / LHALO (640 / 64, the gate's U1
 #           settings: stride 512, so the 512-voxel z parts keep one tile grid), the latent heads' fit planes (winding mod 4 too); --fit-h 2 runs
 #           the slab plane path (the fused nn_fit_accum_lat kernel takes --fit-h 8 only)
-#   ink     -> prep only; GPU INKGPU (1): INKAT=slabs (default) its GroupNorm calibration (inkcal) beside the ref, the main pass from
+#   ink     -> prep only; GPU INKGPU (1): INKAT=slabs (default with 2+ fit GPUs; one-GPU runs: INKAT=fields INKWAIT=0) its GroupNorm calibration (inkcal) beside the ref, the main pass from
 #           the end of the slabs (beside join .. stripflat, all CPU); INKAT=fields: all of it from when the fields are done: INKCMD (the ink agent's recipe; default: the feathered
 #           single pass of inklib.sh: ift3, frozen GN, --window auto --halo 32 --feather 32, resumable) -> ink/$INKNAME.zarr
 #   ctcal   -> fields (CTCAL=1 only, OFF by default): ufsm ct-cal --ct-um $LUM (the CT LEVEL's um) -> ct.cal; ref adds --ct-cal
@@ -77,6 +77,12 @@ if [ "$INKMODE" = lat ] && [ -z "${INKCMD+x}" ]; then
 fi
 INKNAME=${INKNAME:-ift3-24000}; TH=${TH:-$(ncpu)}; [ "$TH" -gt 20 ] 2> /dev/null && [ -z "${TH_ALL:-}" ] && TH=20; MINMEM=${MINMEM:-40}; INKGPU=${INKGPU:-1}
 FIELDGPUS=${FIELDGPUS:-0 1}; FITGPUS=${FITGPUS:-0 1}; DRY=${DRY:-0}; I=${SLABI:-64}; OV=${SLABOV:-16}
+# SGPU: the device of every stage that takes no --gpu of its own (ref / refstream count-field, strip-flatten, the strip renders, wraps ..),
+# the first of FITGPUS by default: they ran on CUDA device 0 whatever FITGPUS said (2026-11-17: with FITGPUS=1 on the desk, the ref's
+# pooling, strip-flatten's SLIM and the stripimg renders went to card 0, the training card; its 0.7 GB free sent the ref's CG and the
+# renders to the CPU and strip-flatten took 204 s). An explicit CUDA_VISIBLE_DEVICES (also empty: GPUs hidden) is kept as given.
+SGPU=${SGPU:-${FITGPUS%% *}}
+sgpu() { [ -z "${CUDA_VISIBLE_DEVICES+x}" ] && [ -n "$SGPU" ] && echo "CUDA_VISIBLE_DEVICES=$SGPU"; return 0; }
 # SLABI / SLABOV: slab cells / overlap (default 64 / 16). A full-section Paris 3 slab (96 x 3680 x 4768 fields, 16.8 GB) does not fit a 16 GB GPU and
 # runs from managed memory at 20-60 min per slab (desk 5060 Ti, 11-01); SLABI=32 (64 rows, 11.2 GB) fits the device.
 PRIZE="PHerc0125 PHerc0175A PHerc0175B PHerc0191 PHerc0211 PHerc0257 PHerc0268 PHerc0306B PHerc0358 PHerc0483A PHerc0483B PHerc0490A PHerc0490B PHerc0800 PHerc0813 PHerc0826 PHerc0846A PHerc0846B PHerc1203 PHerc1218 PHerc1545"
@@ -143,7 +149,8 @@ stage() {
   done_ $st && return 0; stopped && return 1
   if [ "$DRY" = 1 ]; then echo "[$st]"; $fn; return 0; fi
   log "$st start"; t0=$(date +%s); : >> $l; local m0=$(wc -l < $l)
-  $fn; rc=$?
+  # (the stages that place themselves: fields / slabs / ink / perwrap pass --gpu or set CUDA_VISIBLE_DEVICES per job; the rest on SGPU)
+  case $st in fields|slabs|ink|inkcal|perwrap|faces) $fn;; *) if [ -n "$(sgpu)" ]; then CUDA_VISIBLE_DEVICES=$SGPU $fn; else $fn; fi;; esac; rc=$?
   local cpu rss; read -r cpu rss < <(tail -n +$((m0 + 1)) $l | awk -F': ' '/User time|System time/ {c += $2} /Maximum resident/ {if ($2 > r) r = $2} END {printf "%.0f %.1f\n", c, r / 1048576}')
   if [ $rc = 0 ]; then echo "$(( $(date +%s) - t0 )) s wall, ${cpu:-0} CPU s, ${rss:-0} GB max RSS" > $O/state/$st.done; log "$st done: $(cat $O/state/$st.done)"; mstage $st
   else log "$st FAILED rc $rc (logs/$st.log)"; fi
@@ -280,7 +287,7 @@ refstream() {   # refstream OUT PART..
   for k in $(seq 1 $((${#parts[@]} - 1))); do j=$(echo "$j" | jq -c --argjson k $(( ${starts[$k]} * h )) --slurpfile b ${parts[$k]}/fields.partial.json '.axis = (.axis[0:$k] + $b[0].axis)'); done
   echo "$j" | jq -c --argjson n $n '.shape[0] = $n' > $S/fields.json; : > $S/rows.ready
   cz=$(refcz $S/fields.json)
-  ( nice -n 10 $U count-field $S $O/cf.unused $(refpool) --pool-cache $O/ref.pool --pool-only 1 --model $O/ref.pool.unused --chunk-rows $cz --follow $S/rows.ready \
+  ( env $(sgpu) nice -n 10 $U count-field $S $O/cf.unused $(refpool) --pool-cache $O/ref.pool --pool-only 1 --model $O/ref.pool.unused --chunk-rows $cz --follow $S/rows.ready \
       --follow-split ${starts[1]:-0} --threads ${REFSTH:-6} --read-threads ${REFSTH:-6} --mem-gb ${CFMEM:-24} >> $O/logs/refstream.log 2>&1 && echo $cz > $O/ref.pool.ok ) & cfp=$!
   local seen=() fin=0; for k in "${!parts[@]}"; do seen+=(0); done
   while :; do
@@ -483,16 +490,23 @@ lane() {   # lane GPU
     rm -rf $d/f; exec 9>&-
   done
 }
-# fitlanes: the slab-fit lanes, a GPU id per lane. Each GPU of FITGPUS gets FITLANES lanes; FITLANES unset means auto:
-# (device GB - 8) / 16, clamped to 1..3, so 16-24 GB cards get 1 lane, 48 GB MIG slices 2, and 96 GB cards 3.
+# fitlanes: the slab-fit lanes, a GPU id per lane. Each GPU of FITGPUS gets FITLANES lanes; FITLANES unset means auto: the device's
+# free GB (ufsm sysinfo, at the stage's start) - 1 over a fit's estimated device memory, 12 B per slab cell ((I + 2 OV) x ny x nx of the
+# fields) + 0.5 GB, clamped to 1..3 (2026-11-17: 0332's slabs are 96 x 1392 x 1504 = 0.2 G cells, ~1.9 GB per fit measured: 3 lanes on
+# one 16 GB 5060 Ti 232 -> 132 s for the 62 slabs, 4 lanes 134 s (95 % GPU busy), every delta.f32 byte-identical; a Paris 4 slab, ~1.3 G
+# cells, ~13 GB: 1 lane on 16 GB cards, 3 on 96 GB). Without the fields' shape (DRY): (device GB - 8) / 16, as before.
 # Measured on a 96 GB RTX PRO 6000 with 6 Paris 3 slabs and threads = CPUs / lanes: 1 lane 82.8 s, 2 lanes 54.8 s,
 # 3 lanes 47.9 s, delta.f32 byte-identical. A fit takes ~10-16 GB of device memory. The device size comes from
 # `ufsm sysinfo` (CUDA order, MIG-aware); when it is unknown, 1 lane.
 fitlanes() {
-  local g n gb i out=
+  local g n gb fr i out= ny nx est=0
+  ny=$(jq -r '.shape[1]' $F/fields.json 2> /dev/null); nx=$(jq -r '.shape[2]' $F/fields.json 2> /dev/null)
+  case "$ny$nx" in *[!0-9]*|'') ;; *) est=$(awk -v a=$((I + 2 * OV)) -v y=$ny -v x=$nx 'BEGIN { printf "%d", 12 * a * y * x / 1e8 + 5 }');; esac   # (0.1 GB)
   for g in $FITGPUS; do
     n=${FITLANES:-}
-    if [ -z "$n" ]; then gb=$($U sysinfo 2> /dev/null | awk -v g=$g '$1 == "gpu" && $2 == g ":" && match($0, /, [0-9.]+ GB \(/) { print int(substr($0, RSTART + 2, RLENGTH - 6)) }')
+    if [ -z "$n" ] && [ $est -gt 0 ]; then fr=$($U sysinfo 2> /dev/null | awk -v g=$g '$1 == "gpu" && $2 == g ":" && match($0, /\([0-9.]+ GB free\)/) { print int(10 * substr($0, RSTART + 1, RLENGTH - 10)) }')
+      n=$(( (${fr:-0} - 10) / est )); [ $n -lt 1 ] && n=1; [ $n -gt 3 ] && n=3
+    elif [ -z "$n" ]; then gb=$($U sysinfo 2> /dev/null | awk -v g=$g '$1 == "gpu" && $2 == g ":" && match($0, /, [0-9.]+ GB \(/) { print int(substr($0, RSTART + 2, RLENGTH - 6)) }')
       n=$(( (${gb:-0} - 8) / 16 )); [ $n -lt 1 ] && n=1; [ $n -gt 3 ] && n=3; fi
     for i in $(seq $n); do out+="$g "; done
   done; echo $out
@@ -507,7 +521,7 @@ slabs() {
   lanes=$(fitlanes); [ "$DRY" = 1 ] && echo "    slab lanes (GPU per lane): $lanes"
   ng=$(echo $lanes | wc -w); FTH_LANE=${FTHREADS:-$(( $(ncpu) / (ng > 0 ? ng : 1) ))}; [ $FTH_LANE -lt 2 ] && FTH_LANE=2
   for g in $lanes; do
-    if [ "$g" = "$INKGPU" ] && [ "${NOINK:-0}" != 1 ] && [ "$INKAT" = fields ] && ! done_ ink; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink is done or failed)" || while ! done_ ink && ! stopped && [ ! -e $O/state/ink.failed ]; do sleep 30; done; lane $g; } &
+    if [ "$g" = "$INKGPU" ] && [ "${NOINK:-0}" != 1 ] && [ "$INKAT" = fields ] && [ "${INKWAIT:-1}" = 1 ] && ! done_ ink; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink is done or failed)" || while ! done_ ink && ! stopped && [ ! -e $O/state/ink.failed ]; do sleep 30; done; lane $g; } &
     elif [ "$g" = "$INKGPU" ] && [ "${NOINK:-0}" != 1 ] && [ "$INKAT" != fields ] && ! done_ inkcal; then { [ "$DRY" = 1 ] && echo "    (GPU $g lane starts once the ink calibration is done or failed)" || while ! done_ inkcal && ! stopped && [ ! -e $O/state/inkcal.failed ]; do sleep 10; done; lane $g; } &
     else lane $g & fi; pids+=($!)
   done
@@ -809,8 +823,14 @@ stage fields fields || exit 1; upto fields
 # the ink on GPU $INKGPU. INKAT=slabs (default): its GroupNorm calibration beside the ref, the main pass from the end of the slabs, beside
 # the CPU stages join .. stripflat (P4 11-12: ink 892 s; with the fast ref its GPU-1 slab lane would wait for it); INKAT=fields: the
 # whole ink from the end of the fields, the GPU-1 slab lane waiting for it (before 11-12). The per-wrap renders beside the strip
+# INKWAIT=0 (with INKAT=fields): the lanes on INKGPU do not wait for the ink, they share the card (one-GPU desk runs: the ink, ~13 min on
+# 0332, would otherwise hold the whole slab stage back)
 # (a rerun of the same O clears the last run's .failed markers first: waitfor / the GPU lane stopped at once on a stale one, audit mini/shell #3)
 [ "$DRY" = 1 ] || rm -f $O/state/ink.failed $O/state/inkcal.failed
+# one-GPU runs (FITGPUS = INKGPU, the desk): INKAT=fields INKWAIT=0 by default (0332 2026-11-17, card 1 only: 1832 -> 1422 s end to end;
+# from the slabs the ink, 770 s, was the critical path and stripimg / perwrap waited 8.5 min for it; beside rectosp / ref / slabs those
+# slow down 128 -> 221, 54 -> 92, 149 -> 190 s but the ink is done before the snap)
+[ -z "${INKAT:-}" ] && [ "$(echo $FITGPUS)" = "$INKGPU" ] && { INKAT=fields; INKWAIT=${INKWAIT:-0}; }
 INKAT=${INKAT:-slabs}; inkbg() { rm -f $O/state/ink.failed; ( stage ink ink || touch $O/state/ink.failed ) & INKP=$!; [ "$DRY" = 1 ] && wait $INKP; return 0; }
 if [ "${NOINK:-0}" != 1 ]; then
   if [ "$INKAT" = fields ]; then inkbg; else rm -f $O/state/inkcal.failed; ( stage inkcal inkcal || touch $O/state/inkcal.failed ) & [ "$DRY" = 1 ] && wait; fi

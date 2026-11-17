@@ -240,7 +240,7 @@ int cmd_recto_sp(int argc, char **argv) {
         /* blend into net */
         /* the blended code depends on (net, rsp) alone: a 256 x 256 table of the very values the per-cell rule gives (0: kept). The
            per-cell exp / log over every material cell of a shard row was 43 of 207 s single-threaded on 0332 (2026-11-16) */
-        static uint8_t lut[256][256]; static int lut_ok;
+        static uint8_t lut[256][256]; static int lut_ok;   /* mgpu: env (a constant table built on first use; every builder writes the same bytes) */
         if (!lut_ok) {
             for (int n8 = 1; n8 < 256; n8++) for (int r8 = 0; r8 < 256; r8++) {
                 uint8_t o = 0;

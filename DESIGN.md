@@ -6,6 +6,61 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Unroll perf 2: stages pinned off card 0, 3 slab lanes, the ink beside the critical path, flatten's relax pass, the strip gate in C (2026-11-17, branch unrollperf2-20261117)
+
+0332 end to end WITHOUT UPTO on the desk (card 1 only: FIELDGPUS=FITGPUS=INKGPU=1, PERWRAP=1, local CT cache, master's FBLEND 0 /
+FSKIP 20). Stage walls in s; the ink runs beside the chain, stripimg and perwrap wait for it and run side by side:
+
+| stage | before (02:37) | + pinning, lanes, flatten, img-gate (full3) | + ink from the fields, blends at once (full4) |
+|---|---|---|---|
+| fields | 157 | 112 | 116 |
+| rectosp | 126 | 128 | 221 (beside the ink predicts) |
+| ref | 280 (CPU fallback) | 54 | 92 |
+| slabs | 320 (1 lane) | 155 (3 lanes) | 190 |
+| join .. snap | 173 | 174 | 190 |
+| strip + stripflat + distort | 226 | 83 | 139 |
+| ink (beside) | 771 from the slabs | 770 from the slabs | 682 from the fields, done before the snap |
+| stripimg | 764 | 433 | 457 |
+| perwrap | 784 | 608 | 612 |
+| **total** | **2441** | **1832** | **1422** |
+
+The joined models of full3 and full4 differ: the ref picked 512 vs 640 chunk rows from the free host memory (the ink's predicts beside
+it in full4), the nondeterminism of "Unroll perf 1"; with the same ref every slab fit is byte-identical whatever the lanes (below).
+
+- Card 0: unroll.sh ran every stage without a --gpu of its own (ref / refstream count-field, strip-flatten, the strip renders) on CUDA
+  device 0 whatever FITGPUS said. On the desk that is the training card: 0.7 GB free sent the ref's CG and the renders to the CPU, and
+  strip-flatten's SLIM ran there beside try8 (204 s; 30 s on the pod). SGPU (default: the first of FITGPUS) now pins them:
+  CUDA_VISIBLE_DEVICES=$SGPU for every stage except fields / slabs / ink / perwrap (those place themselves) and for the streamed ref;
+  an explicit CUDA_VISIBLE_DEVICES (also an empty one) is kept. The ref on card 1: 280 -> 54 s (CG + model pass on the GPU).
+- Slab lanes: a 0332 slab fit is 96 x 1392 x 1504 fields cells, ~1.9 GB of device memory, ~4.4 s of fit after ~1 s of setup; one lane
+  left the card idle between fits. Refitting all 62 slabs on card 1: 1 lane 232 s, 2 lanes 171 s, 3 lanes 132 s, 4 lanes 134 s (95 %
+  GPU busy), every delta.f32 byte-identical to the 1-lane run (so the joined model is too). fitlanes' auto rule was (device GB - 8) / 16
+  (1 lane on 16 GB cards, written for Paris-size slabs of 10-16 GB); now the device's free GB - 1 over 12 B per slab cell + 0.5 GB,
+  clamped to 1..3: 0332 3 lanes on a 16 GB card, a Paris 4 slab (~1.3 G cells) still 1. Without the fields' shape (DRY) the old rule.
+- flatten (per-wrap unroll renders, strip chunks): prolongate's flip relaxation swept the whole fine mesh 200 times per level (every
+  0332 level ran all 200 rounds; 6.3 M triangles at D1), 42 % of a flatten. It now visits only the triangles with a relaxed vertex, in
+  index order, so the sums, flip counts and marks are the full sweep's bit for bit (a triangle outside that set keeps its unflipped
+  start). The three quantile sorts of each stats line run on 3 threads. w107 (3.2 M vertices): 31.4 -> 18.1 s, outputs identical
+  (diff -r); all 69 wraps' flattens 2554 -> 1827 job-s in the pipeline. What is left is the GPU SLIM itself: fp64 CG, 200 steps per
+  iteration, every iteration at the cap (res 0.02-0.2), memory / fp64 bound on the 5060 Ti (1/64-rate fp64): all 69 wraps serially
+  671 s with 396 s inside the solves, 469 s with 4 or 8 jobs (the card saturated). Keeping the CG's scalars on the device (no host
+  round trip per step) changed nothing measurable (33.4 vs 32.4 s, 135 vs 133 s on the 25 smallest wraps; same bytes), so not kept.
+  Faster from here changes the results: fewer CG steps, fp32 CG, decimation by vertex count (the recipe picks --decim from the .sfc's
+  bytes, so 3 M-vertex wraps run at decim 1).
+- stripimg: strip_refill.sh's papyrus gate (ink render x max(c12, c13) / 255) was a numpy one-liner with 2 GB float32 temporaries per
+  0.5 G-pixel stripe: 28 s alone, 50-180 s beside the per-wrap renders, ~6 of stripimg's 11 minutes. `ufsm img-gate IMG G1 G2` does it
+  through a 256 x 256 table built with float32 rounding forced by casts (numpy's bytes; tests/test_img_gate.py checks all 65536 pairs
+  and both file layouts): ~5 s per stripe (the deflate reads). Its renders now run on card 1 (GPU path) too.
+- The ink was then the critical path: 770 s from the end of the slabs (INKAT=slabs) = ~5 min of predicts (two grids) and three
+  ink-blends one after the other (~125 s + 35 s of pyramid each, CPU, the card idle), while stripimg and perwrap waited for it (8.5 min
+  idle after distort in full3). latink.sh runs the three blends at once (independent outputs, same bytes). INKWAIT=0 with INKAT=fields
+  lets the slab lanes share the ink's card instead of waiting for all of it (INKAT=fields alone made the INKGPU lane wait: on a one-GPU
+  run the whole slab stage). One-GPU runs (FITGPUS = INKGPU) now default to INKAT=fields INKWAIT=0: full4, 1832 -> 1422 s; the ink
+  (10487 CPU s) slows rectosp / ref / slabs, but it is done before the snap. Runs with 2+ fit GPUs keep INKAT=slabs (not measured).
+- Left on 0332 (full4): perwrap 612 s and stripimg 457 s side by side after the snap (perwrap = the GPU SLIM above; stripimg = 3
+  renders per stripe, the ink and its two gates, ~10-30 s each, plus the mosaic), and the fields -> slabs chain (~620 s with the ink
+  beside it). The ink's predicts (~0.6 s per window, ~1000 windows over its two grids) are item (4), fp4teach's / inksdk's kernels.
+
 ## Void zeroing (skip-empty) on the unroll fields: a small gain, on by default; PHerc0332's hand -1 by estimator (2026-11-17)
 
 User 11-16: "do we zero out air / void that is not papyrus but not masked either, would that help?" Before: only masked air (CT 0)

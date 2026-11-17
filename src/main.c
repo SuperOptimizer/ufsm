@@ -191,6 +191,7 @@ static int usage(void) {
         "  ufsm overlay-red <ct-dir> <ink-dir> <out-dir> [ink2 [ink3]]   the 5-panel overlay of existing renders\n"
         "  ufsm tifxyz-scale <src> <dst> <div> [--offset z,y,x]   tifxyz coordinates / div - offset (e.g. 2.4 -> 9.6 um: 4; offset in output voxels)\n"
         "  ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif ..   CT | ink panels (half-res JPEG) + ink statistics per render\n"
+        "  ufsm img-gate IMG.tif GATE.tif [GATE.tif ..] [--out OUT.tif]   a render x max(gates) / 255 (the strip papyrus gate)\n"
         "  ufsm jpeg-fit IN.jpg OUT.jpg --div 2 | --max-px N                  a finished JPEG shrunk (OUT may be IN)\n"
         "  ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K]   tifxyz wraps -> surface-compressor .sfc (readers take .sfc wraps directly)\n"
         "  ufsm sheet-cut <wraps-dir> <out-dir> [--tol 0.3] [--min-cm2 0.25] [--max 8]   square flat sheets: largest isometric rectangles of each wrap\n"
@@ -4774,6 +4775,7 @@ int cmd_z3put(int argc, char **argv);    /* src/z3put.c */
 int cmd_fields_pack(int argc, char **argv);   /* src/fieldspack.c */
 int cmd_labcomp_pack(int argc, char **argv);   /* src/labcomp_cli.c */
 int cmd_ink_gate(int argc, char **argv);   /* src/inkgate.c */
+int cmd_img_gate(int argc, char **argv);   /* src/imggate.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
 int cmd_annotate_serve(int argc, char **argv);   /* src/annot.c */
@@ -4903,6 +4905,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "fields-pack")) return cmd_fields_pack(argc, argv);
     if (!strcmp(cmd, "labcomp-pack")) return cmd_labcomp_pack(argc, argv);
     if (!strcmp(cmd, "ink-gate")) return cmd_ink_gate(argc, argv);
+    if (!strcmp(cmd, "img-gate")) return cmd_img_gate(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "stitch")) return cmd_stitch(argc, argv);

@@ -34,8 +34,9 @@ gate() {   # gate S: the ink render R/S.tif (its stripe linked in R/in_S) x max(
   for gr in $INKGATE; do gi=$((gi + 1)); mkdir -p $R/gate$gi
     UFSM_RENDER_MEM=16 nice -n 10 $U render $R/in_$s $R/gate$gi --volume $gr $INKK --ct $CTR $CTK --depth 1 --scale 1 --threads $RENDER_NT $FILLX > $OUT/logs/refill_${s}_gate$gi.log 2>&1 || { log "gate render $s $gi FAILED"; return 1; }
     rm -f $R/gate$gi/${s}_ct.tif $R/gate$gi/${s}_fill.tif; done
-  python3 -I -c "import sys, os, numpy as np, tifffile as t; r, s = sys.argv[1:3]; i = t.imread(f'{r}/{s}.tif'); p = np.maximum(t.imread(f'{r}/gate1/{s}.tif'), t.imread(f'{r}/gate2/{s}.tif')).astype(np.float32) / 255
-t.imwrite(f'{r}/{s}.tif.g', (i.astype(np.float32) * p + 0.5).astype(i.dtype), compression=None); os.replace(f'{r}/{s}.tif.g', f'{r}/{s}.tif')" $R $s || { log "gate $s FAILED"; return 1; }
+  # (the product in C, byte for byte the numpy float32 step it replaced: 0332 2026-11-17 that step took 50-180 s per stripe beside the
+  # per-wrap renders, 2 GB float temporaries; img-gate ~5 s)
+  nice -n 10 $U img-gate $R/$s.tif $R/gate1/$s.tif $R/gate2/$s.tif || { log "gate $s FAILED"; return 1; }
   rm -f $R/gate1/$s.tif $R/gate2/$s.tif; [ $own = 1 ] && rm -r $R/in_$s; touch $R/$s.gated
 }
 if [ $GATED = 1 ] && [ -z "${STRETCH:-}" ] && [ ! -e $OUT/stretch.gated ]; then
