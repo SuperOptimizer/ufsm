@@ -34,8 +34,14 @@ ARGS=("$SRCJ" --out "$o" --steps $((st + ARMSTEPS)) "${N[@]}" --log-every ${LOGE
       --val-every 100000000 --snap-every 500 --snap-keep-every 500 --snap-keep-last 8 --resume "$o/last.ckpt" "$@")
 if [ "${DRY:-0}" = 1 ]; then echo "CUDA_VISIBLE_DEVICES=$GPU memcap -t -m $MEMCAP $U train ${ARGS[*]}   # from $SNAP (step $st)"; exit 0; fi
 mkdir -p "$o"; cp --reflink=auto "$SNAP" "$o/last.ckpt" || exit 1; cp "$SRCJ" "$o/sources.json.first"
-fd=7; for lk in /vesuvius/ufsm/opt/gpu$GPU.lock /tmp/ufsm-suite-locks/gpu$GPU.excl /tmp/ufsm-suite-locks/gpu$GPU.0 /tmp/ufsm-suite-locks/gpu$GPU.1; do
-  eval "exec $fd> $lk"; flock -x $fd; fd=$((fd + 1)); done   # (try9's own lock set: the run lock, the suite's exclusive lock and both slots)
+# team rule (lead 11-17): suite gpuN.excl first, then opt/gpuN.lock (then the slots); exclusive takers flock -x -w 5 -E 75 per lock and
+# on a timeout release everything taken so far, back off 20-40 s and retry the whole set (no hold-and-wait across agents).
+LKS=(/tmp/ufsm-suite-locks/gpu$GPU.excl /vesuvius/ufsm/opt/gpu$GPU.lock /tmp/ufsm-suite-locks/gpu$GPU.0 /tmp/ufsm-suite-locks/gpu$GPU.1)
+while :; do
+  fd=7; ok=1; for lk in "${LKS[@]}"; do eval "exec $fd> $lk"; flock -x -w 5 -E 75 $fd || { ok=0; break; }; fd=$((fd + 1)); done
+  [ $ok = 1 ] && break
+  for f in 7 8 9 10; do eval "exec $f>&-"; done; echo "$(date '+%F %T') $NAME: $lk busy, backing off" >> "$o.launch.log"; sleep $((20 + RANDOM % 21))
+done   # (fds 7-10 = the lock set, held for the arm's life; the appended-arm hook below closes them)
 echo "$(date '+%F %T') $NAME start from $SNAP (step $st): $U train ${ARGS[*]}" | tee -a "$o.launch.log"
 CUDA_VISIBLE_DEVICES=$GPU MALLOC_ARENA_MAX=4 UFSM_HEAD_SLAB_Z=${UFSM_HEAD_SLAB_Z:-16} UFSM_HOSTMEM=${UFSM_HOSTMEM:-1} UFSM_SAMPLER_THP=${UFSM_SAMPLER_THP:-0} nice -n 5 /home/forrest/bin/memcap -t -m "$MEMCAP" "$U" train "${ARGS[@]}" >> "$o.log" 2>&1 &
 tp=$!; echo $tp > "$o.pid"

@@ -19,6 +19,9 @@ ck 1 CUDA_VISIBLE_DEVICES=GPU-94355c13 GPU=0        # a UUID prefix, as CUDA acc
 ck 0 "CUDA_VISIBLE_DEVICES=GPU-249c84e8,1" GPU=0
 env CUDA_VISIBLE_DEVICES=1 GPU=1 bash -c "$(declare -f gpu_phys); gpu_phys 1" > /dev/null 2>&1 && { echo "FAIL: index outside CVD accepted"; bad=1; }
 env CUDA_VISIBLE_DEVICES=GPU-deadbeef bash -c "$(declare -f gpu_phys); gpu_phys 0" > /dev/null 2>&1 && { echo "FAIL: unknown UUID accepted"; bad=1; }
+# the team lock order (lead 11-17): suite gpuN.excl before opt/gpuN.lock, physical card
+eval "$(grep '^dlocks_for()' $W)"; o=$(dlocks_for "$(CUDA_VISIBLE_DEVICES=1 GPU=0 bash -c "$(declare -f gpu_phys); gpu_phys 0")")
+[ "$o" = /tmp/ufsm-suite-locks/gpu1.excl,/vesuvius/ufsm/opt/gpu1.lock ] || { echo "FAIL: DLOCKS order / card '$o'"; bad=1; }
 # the lock helper: held shared -> an exclusive try fails; released -> it succeeds
 : > "$T/a.lock"; DLOCKS=$T/a.lock; dlk
 flock -n -x "$T/a.lock" true && { echo "FAIL: exclusive got in while held"; bad=1; }

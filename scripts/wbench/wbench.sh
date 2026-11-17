@@ -41,7 +41,7 @@ LK=; [ -z "${NOLOCK:-}" ] && [ -n "${LOCK:-}" ] && [ "${CPU:-0}" != 1 ] && LK=$L
 # check first); plain flock users of the same lock stay excluded
 GQ=$H/gpuq.sh; [ -e $GQ ] || GQ=$H/../gpuq.sh; GPUQ_LOCK=$LOCK; . $GQ
 # The desk's shared GPU locks too (lead 11-17: the wbench lock alone let fit --gpu N run through other agents' exclusive timing
-# windows): per GPU step flock -s /vesuvius/ufsm/opt/gpu<N>.lock (trainers hold it exclusively) and -s /tmp/ufsm-suite-locks/gpu<N>.excl
+# windows): per GPU step flock -s /tmp/ufsm-suite-locks/gpu<N>.excl, then -s /vesuvius/ufsm/opt/gpu<N>.lock (trainers hold it exclusively)
 # (run_suite's shared lock; bench bursts take it exclusively), released at every box boundary like the wbench lock. DLOCKS overrides
 # the list (comma separated; "" = none); off by default where neither file's directory exists (laptop, pods).
 # The locks name PHYSICAL cards: GPU is an index into CUDA_VISIBLE_DEVICES when that is set (CUDA_VISIBLE_DEVICES=1 GPU=0 = card 1);
@@ -54,7 +54,8 @@ gpu_phys() {   # gpu_phys IDX: the physical index of logical device IDX under CU
   ${NVSMI:-nvidia-smi} --query-gpu=index,uuid --format=csv,noheader 2> /dev/null | awk -F', *' -v u="$e" 'index($2, u) == 1 || index("GPU-" $2, u) == 1 || index($2, "GPU-" u) == 1 {print $1; f = 1; exit} END {exit !f}' \
     || { echo "wbench: CUDA_VISIBLE_DEVICES entry $e not found by nvidia-smi" >&2; echo "$i"; return 1; }
 }
-DLOCKS=${DLOCKS-$( [ "${CPU:-0}" != 1 ] && [ -z "${NOLOCK:-}" ] && [ -d /vesuvius/ufsm/opt ] && [ -d /tmp/ufsm-suite-locks ] && g=$(gpu_phys "$GPU") && echo /vesuvius/ufsm/opt/gpu$g.lock,/tmp/ufsm-suite-locks/gpu$g.excl)}
+dlocks_for() { echo /tmp/ufsm-suite-locks/gpu$1.excl,/vesuvius/ufsm/opt/gpu$1.lock; }   # (team order, lead 11-17: suite excl first, then opt)
+DLOCKS=${DLOCKS-$( [ "${CPU:-0}" != 1 ] && [ -z "${NOLOCK:-}" ] && [ -d /vesuvius/ufsm/opt ] && [ -d /tmp/ufsm-suite-locks ] && g=$(gpu_phys "$GPU") && dlocks_for $g)}
 DLFD=()
 dlk() { local f fd; [ ${#DLFD[@]} -gt 0 ] && return 0; for f in ${DLOCKS//,/ }; do exec {fd}>> "$f" || continue; flock -s $fd; DLFD+=($fd); done; return 0; }
 dulk() { local fd; for fd in "${DLFD[@]}"; do exec {fd}>&-; done; DLFD=(); return 0; }
