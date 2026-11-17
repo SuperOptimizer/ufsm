@@ -307,6 +307,29 @@ extern "C" void lp_conv1_fwd_mx_h16_r(const void *x, int xdt, shape5 xs, const f
     }
     LPCK();
 }
+/* fp32 logits of voxels [vb, vb + nv) into planes of nv voxels (y [cout][nv]): the same kernel instantiations, passes and order as
+   lp_conv1_fwd_mx, so every voxel's logits are the bits of the whole-window call (one thread per voxel; vb only offsets the reads).
+   Predict's per-chunk head (unet_head_fwd_z32: no whole-window logits). -1: a configuration lp_conv1_fwd_mx runs elsewise (staged / old) */
+extern "C" int lp_conv1_fwd_mx_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp, size_t vb, size_t nv) {
+    if (xs.n != 1 || !nv) return -1;
+    if (cout > 16) {
+        if (cout % 16) return -1;
+        for (int c0 = 0; c0 < cout; c0 += 16) if (lp_conv1_fwd_mx_r(x, xdt, xs, w + (size_t)c0 * xs.c, b ? b + c0 : nullptr, 16, y + (size_t)c0 * nv, gp, vb, nv)) return -1;
+        return 0;
+    }
+    static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;   /* mgpu: env */
+    if (old || conv1_smem(xs, cout) > 32 * 1024 || slab_small(gp)) return -1;
+#define C1R(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, y, gp, cout, vb, nv); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, y, gp, cout, vb, nv); break; \
+                               case 3: conv1_mx_t<B, 3>(x, xs, w, b, y, gp, cout, vb, nv); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, y, gp, cout, vb, nv); break; \
+                               case 5: conv1_mx_t<B, 5>(x, xs, w, b, y, gp, cout, vb, nv); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, y, gp, cout, vb, nv); break; \
+                               case 7: conv1_mx_t<B, 7>(x, xs, w, b, y, gp, cout, vb, nv); break; case 8: conv1_mx_t<B, 8>(x, xs, w, b, y, gp, cout, vb, nv); break; \
+                               case 11: conv1_mx_t<B, 11>(x, xs, w, b, y, gp, cout, vb, nv); break; \
+                               default: conv1_mx_t<B, 16>(x, xs, w, b, y, gp, cout, vb, nv); } } while (0)
+    if (xdt == 4) C1R(4); else C1R(8);
+#undef C1R
+    LPCK();
+    return 0;
+}
 extern "C" void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp) {
     if (cout > 16 && cout % 16 == 0 && xs.n == 1) {   /* more outputs: passes of 16 */
         const size_t S = shape_spatial(xs);

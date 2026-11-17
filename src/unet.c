@@ -242,6 +242,7 @@ struct unet {
     int hfeat; float *hf_w, *hf_b;           /* unet_set_head_feat: inference head also writes dec[0]'s output (identity rows), its weights */
     const void *l0fg; void *l0fg_mx; size_t l0fg_cap;   /* unet_set_l0_feat_grad: an extra d loss / d (dec[0]'s output) at the head step; its MX scratch */
     int head_ext;                            /* unet_set_head_ext: training runs the head per z-slab outside (no whole-window logits) */
+    int head_iz, head_iz_on;                 /* unet_set_head_infer_z: inference without whole-window logits (the caller runs unet_head_fwd_z32); _on: this build */
     convp ds[UNET_MAXLEV];                   /* cfg.ds_levels: the deep-supervision 1^3 heads of decoder levels 1..ds_levels */
     float *ds_lg[UNET_MAXLEV];               /* their fp32 logits (training builds) */
     const float *ds_gl[UNET_MAXLEV];         /* their fp32 logit gradients for the next backward (unet_set_ds_grad) */
@@ -1704,7 +1705,9 @@ static void build_acts(unet *u, shape5 xs, int train) {
         float *lx = sdir ? X2 : X;   /* (direct slabs: X2 = dec[0].a1, dead after dec[0]'s conv2: the head writes the logits there directly) */
         u->logits = lx; u->lg_t1 = u->lg_x = 1; u->lg_p = lx; u->lg_bytes = act_bytes_of(y0);
     }
-    if (train && (u->head_ext || u->l0hb)) { u->logits = nullptr; u->lg_t1 = 0; }   /* head slabs (or the stream head, stage S4): no whole-window logits */
+    /* inference head per z range (unet_set_head_infer_z): the fp32 plane head only (an fp16-logit or head-feature build keeps its logits) */
+    u->head_iz_on = !train && u->head_iz && !u->logits_h16 && !u->hfeat && !u->lg_x && !u->l3b && !(u->l0st && u->l0h_fwd) && recompute() && os.n == 1;
+    if ((train && (u->head_ext || u->l0hb)) || u->head_iz_on) { u->logits = nullptr; u->lg_t1 = 0; }   /* head slabs (or the stream head, stage S4): no whole-window logits */
     else if (!u->logits) u->logits = dalloc(u, (lgb + 3) / 4);
     for (int j = 0; j < UNET_MAXLEV; j++) { u->ds_lg[j] = nullptr; u->ds_gl[j] = nullptr; }
     if (train) for (int j = 1; j <= u->cfg.ds_levels; j++) {   /* deep supervision: fp32 logits per supervised decoder level */
@@ -1824,6 +1827,12 @@ void unet_set_head_feat(unet *u, int on) {   /* takes effect at the next build *
     if (u->built && !u->train) free_acts(u);
     u->hfeat = !!on;
 }
+void unet_set_head_infer_z(unet *u, int on) {   /* takes effect at the next build */
+    if (u->head_iz == !!on) return;
+    if (u->built) free_acts(u);
+    u->head_iz = !!on;
+}
+int unet_head_infer_z_on(const unet *u) { return u->built && !u->train && u->head_iz_on; }
 void unet_set_head_ext(unet *u, int on) {   /* takes effect at the next build */
     if (u->head_ext == !!on) return;
     if (u->built) free_acts(u);
@@ -3001,7 +3010,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         }
     }
     nn_set_layer(3 * L - 2);
-    if (!(u->head_ext && !u->logits) && !l0h_on(u)) {   /* (the stream head ran per slab in F2; head slabs: the trainer runs the head per z-slab, unet_head_fwd_z; a training build has no
+    if (!(u->head_ext && !u->logits) && !(u->head_iz_on && !u->train) && !l0h_on(u)) {   /* (the stream head ran per slab in F2; head slabs: the trainer runs the head per z-slab, unet_head_fwd_z; a training build has no
                                             whole-window logits, so its validation forwards (train 0, no rebuild) skip the head too) */
         if (u->lg_t1 && !u->lg_x) nn_set_storage(u->logits, u->lg_bytes, 0);   /* plain fp32 plane-major logits over dec[0].a1 (or the level-1 buffer) */
         if (l3_sched(u)) {   /* (the coarse forward homes and the input in X3 copied out; without l3_sched dec[0]'s conv2 waited) */
@@ -3071,6 +3080,15 @@ int unet_head_fwd_z(unet *u, int z0, int z1, void *y16) {
     const size_t hw = (size_t)u->ls[0].h * u->ls[0].w;
     nn_set_layer(3 * u->cfg.nlev - 2);
     return nn_head_fwd_z(x, gn ? &g : nullptr, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, y16, (size_t)z0 * hw, (size_t)(z1 - z0) * hw);
+}
+/* the inference head (the same rows, weights and kernels as the whole-window forward's fp32 head) on level-0 planes [z0, z1) into fp32 planes
+   [rows][(z1 - z0) h w]: the bits the whole-window logits hold there. After an inference forward of a unet_set_head_infer_z build; -1 otherwise */
+int unet_head_fwd_z32(unet *u, int z0, int z1, float *y) {
+    if (!u->built || u->train || !u->head_iz_on || z0 < 0 || z1 > u->ls[0].d || z1 <= z0) return -1;
+    const int w0 = u->cfg.widths[0], hc0 = u->head_nc ? u->head_c0 : 0, hnc = u->head_nc ? u->head_nc : u->cfg.cout;
+    const size_t hwp = (size_t)u->ls[0].h * u->ls[0].w; nn_gn_t g = gn_out(u, &u->dec[0]);
+    nn_set_layer(3 * u->cfg.nlev - 2);
+    return nn_head_fwd_z32(u->dec[0].a2, &g, u->dec[0].ys, P(u, u->head.w) + (size_t)hc0 * w0, P(u, u->head.b) + hc0, hnc, y, (size_t)z0 * hwp, (size_t)(z1 - z0) * hwp);
 }
 int unet_head_bwd_z(unet *u, int z0, int z1, const void *gy16, int first) {
     const float *x; nn_gn_t g; const int gn = head_src(u, &x, &g);

@@ -185,6 +185,15 @@ template <typename TG> __global__ void head_bwd_x_z16_k(const __half *__restrict
     }
 }
 static int head_z16_ok(const float *x, const float *gx, shape5 xs, int cout) { return !ISMX(x) && (!gx || !ISMX(gx)) && ABF && xs.n == 1 && cout <= 16; }
+/* the fp32 inference head (nn_conv3d_fwd_x's 1^3 MX path, head_out_h16 off) on voxels [vb, vb + nv) into planes [cout][nv]: bit-identical to
+   those voxels of the whole-window call. -1: not an MX input or a configuration without the ranged kernel */
+extern "C" int nn_head_fwd_z32(const float *x, const nn_gn_t *gx, shape5 xs, const float *w, const float *b, int cout, float *y, size_t vb, size_t nv) {
+    if (!g_tf32 || !ISMX(x)) return -1;
+    exec_prec(0, 0);
+    const int r = lp_conv1_fwd_mx_r(x, MXDT(x), xs, w, b, cout, y, to_gnp(gx), vb, nv);
+    KCHECK();
+    return r;
+}
 extern "C" int nn_head_fwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, const float *w, const float *b, int cout, void *y16, size_t vb, size_t nv) {
     if (!g_tf32) return -1;
     if (head_z16_ok(x, nullptr, xs, cout)) {

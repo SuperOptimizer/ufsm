@@ -423,6 +423,12 @@ int unet_logits_h16(const unet *u);   /* the logits unet_forward returns are fp1
    gradient and unet_head_bwd_z per slab (first: the first slab). Takes effect at the next build; MX activations and 16-bit gradients
    (the fused head backward); -1 from the slab calls: not covered */
 void unet_set_head_ext(unet *u, int on);
+/* inference without whole-window logits (predict's fit-field chunks; u1 at W 1152: 13.8 GB of fp32 logits): the forward skips the 1^3 head and
+   unet_head_fwd_z32 runs it on level-0 planes [z0, z1) into fp32 planes [head rows][(z1 - z0) h w], bit-identical to those planes of the
+   whole-window logits. Takes effect at the next build; unet_head_infer_z_on: the built network has it (fp32 recompute heads only) */
+void unet_set_head_infer_z(unet *u, int on);
+int unet_head_infer_z_on(const unet *u);
+int unet_head_fwd_z32(unet *u, int z0, int z1, float *y);
 /* the attention stage's output tokens (cfg.attn_blocks > 0) after a forward: fp32 rows [nseq][S][C], S = attn_reg registers + the bottleneck
    grid (z y x); nullptr without the stage. unet_set_token_grad: an extra d loss / d tokens (same layout, the backward's scaled domain:
    multiply by nn_get_grad_scale() for 16-bit gradient storage) added at the stage output in the next backward (nullptr: none) */

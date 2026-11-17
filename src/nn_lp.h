@@ -137,6 +137,7 @@ void lp_up2_fwd_mx_blocks(const void *x, int xdt, shape5 xs, int b0, int nbk, vo
 void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp);
 void lp_conv1_fwd_mx_h16(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp);   /* fp16 output */
 void lp_conv1_fwd_mx_h16_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, size_t vb, size_t nv);   /* voxels [vb, vb + nv) into planes of nv */
+int lp_conv1_fwd_mx_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp, size_t vb, size_t nv);   /* fp32 voxels [vb, vb + nv), the bits of lp_conv1_fwd_mx */
 void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp);
 int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp);
 int lp_bwd_w1_mx_b_r(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp, size_t vb, size_t vn);   /* voxels [vb, vb + vn) */   /* also gb when it returns 1 */

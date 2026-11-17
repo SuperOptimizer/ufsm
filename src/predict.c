@@ -2179,7 +2179,19 @@ static int predict_one(int argc, char **argv) {
     const shape5 xn = half ? (shape5){1, cfg.cin, W / hdiv, W / hdiv, W / hdiv} : xs;   /* the network's input */
     int latin = 0; void *x2 = nullptr, *lrt = nullptr; float *lgf = nullptr;   /* half: the network's input, the intermediate grid (div 4), the full-resolution logits */
     /* the 16-bit input in the network's shared a1 scratch when it has one (free until the stem conv, after the input conversion) */
+    /* --fit-zarr in z-chunk slabs (fzs below, the plane path): the 1^3 head per chunk over the cell planes the chunk reads (unet_head_fwd_z32,
+       each plane once: two plane buffers, the overlap with the previous chunk copied) instead of the whole window's fp32 cell logits
+       [cout][(W/4)^3] (u1, 144 outputs: 2.4 GB at W 640, 13.8 GB at 1152: no 1152 window on a 16 GB card). The same bits (the ranged head
+       kernel, the _c upsampling / shuffle over held planes). Decided before the build (the window's buffers alias the network's); the fzs
+       test is the one below. UFSM_PRED_HEADZ=0: the whole-window logits */
+    {   const int fzs_pre = ffd && ffzm && half && hdiv == 4 && hmode == 1 && h16 && gpath && !ffct && tta <= 1 && !fea && !sheet_task && !slab && WR.skip && !(W % 4) && (!getenv("UFSM_PRED_FIT_SLAB") || ufsm_env_on("UFSM_PRED_FIT_SLAB"));
+        const int fzl_pre = fzs_pre && (ffh == 8 || ((ffh == 1 || ffh == 2 || ffh == 4) && ufsm_env_on("UFSM_PRED_FIT_FUSED_SMALLH"))) && cfg.lat_guide != 8 &&
+                            (!getenv("UFSM_PRED_FIT_FUSED") || ufsm_env_on("UFSM_PRED_FIT_FUSED"));
+        unet_set_head_infer_z(u, fzs_pre && !fzl_pre && !lhm && (!getenv("UFSM_PRED_HEADZ") || ufsm_env_on("UFSM_PRED_HEADZ"))); }
     unet_build(u, xn, 0);
+    const int headz = unet_head_infer_z_on(u);
+    if (headz) fprintf(stderr, "predict: --fit-zarr: the head per z chunk (no whole-window logits; UFSM_PRED_HEADZ=0: them)\n");
+    float *hzb[2] = {nullptr, nullptr}; int hzi = 0, hzq0 = 0, hzv = 0, hzcap = 0;   /* headz: the chunk's cell logits, planes [hzq0, hzq0 + hzv) of hzb[hzi] (channel stride hzcap planes) */
     const int ct_stem = unet_ct_stem(u);   /* unet_forward_ct: no 16-bit input */
     int gdir = 0, fzs = 0, fzl = 0;   /* (fzl: the fused fit kernel, nn_fit_accum_lat; UFSM_PRED_FIT_FUSED=0 the plane path) the guided head's direct rv bytes (nn_lat_place_rvg); fit fields from a latent-grid net in z-chunk slabs */
     void *fzA = nullptr, *fzB = nullptr, *fzX = nullptr, *fzW = nullptr; int fzP = 0;   /* fzW: the fused kernel's winding-pair planes (UFSM_PRED_FIT_W4P) */
@@ -2224,6 +2236,7 @@ static int predict_one(int argc, char **argv) {
         fzl = fzs && (ffh == 8 || ((ffh == 1 || ffh == 2 || ffh == 4) && ufsm_env_on("UFSM_PRED_FIT_FUSED_SMALLH"))) && cfg.lat_guide != 8 &&
               (!getenv("UFSM_PRED_FIT_FUSED") || ufsm_env_on("UFSM_PRED_FIT_FUSED"));
         if (fzl) fprintf(stderr, "predict: --fit-zarr: the fit fields fused from the cell logits (nn_fit_accum_lat)\n");
+        if (headz && (!fzs || fzl)) { fprintf(stderr, "predict: the per-chunk head without the plane path (fzs %d fzl %d)\n", fzs, fzl); return 2; }
         gdir = !cfg.fstem && rv2c < 0 && (cfg.lat_guide == 5 || cfg.lat_guide == 64) && half && hdiv == 4 && hmode == 1 && rvfuse && gpath && !fea && !ffd && tta <= 1 && !sheet_task && !slab && (!getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT"));
         if (((gdir && cfg.lat_guide == 5) || (fzs && (cfg.lat_guide == 8 || cfg.fstem)) || lhm) && ct_shared && !ctcp && !(ctcp = nn_malloc(w3))) { fprintf(stderr, "predict: no device memory for the guided head's CT copy\n"); return 1; }   /* (the forward overwrites ctd) */
         { const float *b_, *g_; float s_; const int lc_ = half == 3 ? unet_lat_basis(u, &b_, &g_, &s_) : 0;   /* (--latents and the guided head's slab path read the full-resolution input; a
@@ -3073,9 +3086,33 @@ static int predict_one(int argc, char **argv) {
                             }
                             if (!fzA) { fzP = ffzc * ffh + 8; fzA = nn_malloc((size_t)(cup + (g8 ? 8 : 0)) * fzP * hw * 2); if (ffw4d) fzB = nn_malloc((size_t)2 * (fzP + 2 * ffw4d) * hw * 2); if (g8 || cfg.fstem) fzX = nn_malloc((size_t)(fzP + 2 * ffw4d + 8) * hw * 2); }
                             if (nzs > fzP || a < hz || bq > Wz - hz) { fprintf(stderr, "predict: --fit-zarr: a z chunk outside its slab (%d .. %d of %d)\n", a, bq, fzP); return 1; }
+                            int q0 = 0, qd = Wz / 4; size_t cq_ = cv_;   /* the cell planes l2d holds (q0 .. q0 + qd, channel stride cq_ cells) */
+                            if (headz) {   /* this chunk's planes zs .. ze and the winding pair's, +- 1 cell (the upsampling taps), each computed once */
+                                const int zlo = ffw4d && ((a - ffw4d) & ~3) < zs ? (a - ffw4d) & ~3 : zs, zhi = ffw4d && ((bq + ffw4d + 3) & ~3) > ze ? (bq + ffw4d + 3) & ~3 : ze;
+                                const int n0 = zlo / 4 - 1 > 0 ? zlo / 4 - 1 : 0, n1 = zhi / 4 + 1 < Wz / 4 ? zhi / 4 + 1 : Wz / 4;
+                                const size_t pl = (size_t)wc * wc; const int hr = cfg.cout;
+                                if (n1 - n0 > hzcap) {   /* (first chunk, or a larger one: both buffers anew, nothing kept) */
+                                    for (int k = 0; k < 2; k++) { nn_free(hzb[k]); hzb[k] = nn_malloc((size_t)hr * (n1 - n0) * pl * 4); if (!hzb[k]) { fprintf(stderr, "predict: no device memory for the chunk head (%.2f GB)\n", (double)hr * (n1 - n0) * pl * 4 / 1e9); return 1; } }
+                                    hzcap = n1 - n0; hzv = 0;
+                                }
+                                if (za == 0) hzv = 0;   /* a new window: nothing held */
+                                const int o0 = n0 > hzq0 ? n0 : hzq0, o1 = n1 < hzq0 + hzv ? n1 : hzq0 + hzv, nw = hzi ^ 1;   /* the overlap with the held planes */
+                                if (o1 > o0) for (int c = 0; c < hr; c++) nn_d2d_async(hzb[nw] + ((size_t)c * hzcap + (o0 - n0)) * pl, hzb[hzi] + ((size_t)c * hzcap + (o0 - hzq0)) * pl, (size_t)(o1 - o0) * pl * 4);
+                                /* the new planes [n0, o0) and [o1, n1) (o0 == n0 when they overlap: chunks advance in z) */
+                                float *tmp = nullptr; const int ra[2][2] = {{n0, o1 > o0 ? o0 : n1}, {o1 > o0 ? o1 : n1, n1}};
+                                for (int r_ = 0; r_ < 2; r_++) { const int p0 = ra[r_][0], p1 = ra[r_][1]; if (p1 <= p0) continue;
+                                    if (p0 == n0 && p1 == n1) { if (unet_head_fwd_z32(u, p0, p1, hzb[nw])) { fprintf(stderr, "predict: the chunk head failed\n"); return 1; } continue; }
+                                    if (!tmp && !(tmp = nn_malloc((size_t)hr * (p1 - p0) * pl * 4))) { fprintf(stderr, "predict: no device memory for the chunk head\n"); return 1; }
+                                    if (unet_head_fwd_z32(u, p0, p1, tmp)) { fprintf(stderr, "predict: the chunk head failed\n"); return 1; }
+                                    for (int c = 0; c < hr; c++) nn_d2d_async(hzb[nw] + ((size_t)c * hzcap + (p0 - n0)) * pl, tmp + (size_t)c * (p1 - p0) * pl, (size_t)(p1 - p0) * pl * 4);
+                                    nn_sync(); nn_free(tmp); tmp = nullptr;
+                                }
+                                hzi = nw; hzq0 = n0; hzv = n1 - n0; l2d = hzb[hzi]; q0 = n0; qd = hzcap; cq_ = (size_t)hzcap * pl;
+                                nn_ptick("fit: chunk head");
+                            }
                             nn_ptick("fit: before the chunk");
-                            nn_lat_up_slab(l2d, lh, cup, wc, wc, wc, zs, nzs, fzA);
-                            if (g64) nn_lat_shuffle(l2d, lh, wc, wc, wc, cfg.cout - 128, 2, zs, nzs, fzA);   /* the sub-cell head: the phase pair's per-voxel terms */
+                            nn_lat_up_slab_c(l2d, lh, cup, wc, wc, wc, zs, nzs, fzA, q0, qd);
+                            if (g64) nn_lat_shuffle_c(l2d, lh, wc, wc, wc, cfg.cout - 128, 2, zs, nzs, fzA, q0, qd);   /* the sub-cell head: the phase pair's per-voxel terms */
                             nn_ptick("fit: upsample + shuffle");
                             /* train --fstem: the fine stem on planes z0 .. z0 + nz of the planes P (channel c at plane MAP), its CT taps (planes z0 - 1 .. z0 + nz) z-scored
                                from the window's bytes into fzX (the stem reads the window as if whole: only those planes) */
@@ -3088,7 +3125,7 @@ static int predict_one(int argc, char **argv) {
                             nn_ptick("fit: stem");
                             if (g8) {   /* the general guided head: the 8 coefficient planes (the head's last), the CT terms into the phase channels 0-1 */
                                 const int x0 = zs > 0 ? zs - 1 : 0, x1 = ze < W ? ze + 1 : W;
-                                nn_lat_up_slab((const char *)l2d + (size_t)24 * cv_ * es_, lh, 8, wc, wc, wc, zs, nzs, (char *)fzA + (size_t)11 * ns * 2);
+                                nn_lat_up_slab_c((const char *)l2d + (size_t)24 * cq_ * es_, lh, 8, wc, wc, wc, zs, nzs, (char *)fzA + (size_t)11 * ns * 2, q0, qd);
                                 nn_lat_ct_x(ct_shared ? ctcp : ctd, W, x0, x1 - x0, (float)mean, (float)(1.0 / sd), fzX);
                                 nn_lat_guide4((const void *)((uintptr_t)fzX - (size_t)x0 * hw * 2), W, W, W, zs, nzs, fzA, 11, 0, 2, 0);   /* (the window's x as if whole: only planes x0 .. x1 are read) */
                             }
@@ -3096,7 +3133,7 @@ static int predict_one(int argc, char **argv) {
                             nn_ptick("fit: accumulate");
                             if (ffw4d) {
                                 const int zb = (a - ffw4d) & ~3, zeb = (bq + ffw4d + 3) & ~3, nzb = zeb - zb;
-                                nn_lat_up_slab((const char *)l2d + (size_t)ff_w4 * cv_ * es_, lh, 2, wc, wc, wc, zb, nzb, fzB);
+                                nn_lat_up_slab_c((const char *)l2d + (size_t)ff_w4 * cq_ * es_, lh, 2, wc, wc, wc, zb, nzb, fzB, q0, qd);
                                 FZ_STEM(zb, nzb, fzB, c == ff_w4 ? 0 : c == ff_w4 + 1 ? 1 : -1);   /* (the winding mod 4 pair has the stem's term too) */
                                 nn_fit_accum_w4(fzB, ct_shared ? nullptr : ctd + (size_t)zb * hw, ct_shared ? ctm + (size_t)zb * hw / 32 : nullptr, nzb, W, ffw4d, halo, (int)(tz - cz * ffh) + zb, (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz, 0, ffw4d, ffacc4);
                                 nn_ptick("fit: winding mod 4");
