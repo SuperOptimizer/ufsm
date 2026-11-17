@@ -66,6 +66,17 @@ level 0 and the model / output passes fell back to the CPU; 36-79 s on a free ca
 - **recto-sp.** rr_peaks takes its 2R + 1 gaussian taps from a table built per call instead of an exp per tap per sample (exp
   was a third of the CPU). 1024 x 2048^2 0332 box: 294.8 -> 175.7 CPU s (25.6 -> 18.6 s), byte-identical; test_recto compares the
   smoothed floats with the per-sample exp at 5 sigmas (one past the 256-tap stack table).
+- **Re-baseline with FBLEND off (master 5497da44 default: one grid; 0332 has m7, so rectosp runs and the ref is not streamed)**, 0332
+  to snap, card 1 shared, old = 5dce8d46 script + binary with FBLEND=0, new = master: fields 264 -> 163 s (the CT cache's prefetch),
+  rectosp 299 -> 148, ref 285 -> 382 (both on the CPU fallback, card full: old 128 rows per chunk at 6.9 GB available host memory,
+  new 640 at 28.8 GB), slabs 285 -> 268, check 55 -> 28, trim 21 -> 5, snap 102 -> 47; total 1346 -> 1078 s, without the ref
+  1061 -> 696 s (1.5x). wrap-check verdicts equal (65 / 8 / 3), slab fits s000-s022 byte-identical; from s023 on they and the snap
+  (70 vs 71 wraps) follow the ref, which differs because of its chunk rows.
+- **The ref depends on its chunk rows, which count-field picks from the free host memory.** Same 0332 fields (1536 x 2784 x 3008 at
+  z 2048), `--chunk-rows 128` vs `384`: delta.f32 differs on 99.99 % of cells, p99 0.017 turn, max 1.03 turns, model coherence
+  0.0589 vs 0.0605; the same chunk rows twice: byte-identical. So a ref (and everything after it) varies with how loaded the machine
+  is. Passing a fixed `--chunk-rows` (unroll.sh's refcz, from CFMEM and the field shape only) would make it reproducible; left to the
+  unroll owners (memory policy).
 - **--skip-empty on u1's fields predict (speed side; the accuracy A/B is the lead's wbench skipthr.sh)**, grid 0, local CT, card 1
   shared, margin 1: 0332 whole box dense 243.2 s / thr 20 212.2 / 40 212.4 / 60 210.6 (mean level-0 active tile share .553 / .553 /
   .536); 1667 whole box dense 271.7 / thr 40 235.3 (share .529); Paris 4 z 8192..10240 full section dense 216.0 / thr 40 203.6
