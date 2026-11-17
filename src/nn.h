@@ -516,6 +516,9 @@ int nn_fstem_bwd(const void *x, int D, int H, int W, int z0, int nz, const float
    would leave them, byte for byte; C 0: no stem term (an --fstem-drop window). 1: a shape it does not take (multiples of 4) */
 int nn_fstem_up_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns,
                     const void *lc, int q0, int qd, int side, int base);
+/* the same with lh16 0: fp32 cell logits lc (predict's fit path; the bytes of nn_lat_up_slab_c + nn_lat_shuffle_c with lh16 0 + nn_fstem_fwd) */
+int nn_fstem_up_fwd_t(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns,
+                      const void *lc, int lh16, int q0, int qd, int side, int base);
 /* a latent-grid net's head straight from the cell logits lg [cout][d][h][w] into a device shard (src/nn_lathead.cu, predict --heads): the
    window interior ([hz, 4d - hz) x [halo, 4w - halo)^2) inside the shard [0, e) at offset o; channel c0 (a probability) or the recto / verso
    pair c0, c1 (nn_rv_fuse); sb0 / sb1 the sub-cell outputs' base of each (lat_guide 64: 16 + 64 j for the phase pair, else -1), s0 / s1 the

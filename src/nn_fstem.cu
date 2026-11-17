@@ -60,7 +60,8 @@ __device__ inline float fs_pre(const float *W1, const float *b1, int c, const fl
    read-modify-writes. The tile's 4 fine rows (2 z x 2 y) share their z / y-collapsed values per coarse column: qs [o][dz dy][column] */
 __device__ static const float FLW[4][3] = {{0.375f, 0.625f, 0.f}, {0.1875f, 0.75f, 0.0625f}, {0.0625f, 0.75f, 0.1875f}, {0.f, 0.625f, 0.375f}};   /* (nn_lat.cu LW) */
 enum { FSU_NC = FS_BT / 2 + 2 };
-struct fs_up { const f16 *lc; int d, h, w, q0, qd, side, base; };
+struct fs_up { const void *lc; int d, h, w, q0, qd, side, base, f32; };   /* f32: lc holds fp32 cell logits (predict's fit path), else fp16 */
+__device__ __forceinline__ float fsu_ld(const fs_up &up, size_t i) { return up.f32 ? ((const float *)up.lc)[i] : __half2float(((const f16 *)up.lc)[i]); }   /* (= ldv / lat_shuf_k's (float) of either type) */
 template <int RZ0, int RY0> __device__ __forceinline__ void fsu_q(const float (*v)[3], float *qo) {
 #pragma unroll
     for (int dz = 0; dz < 2; dz++) {
@@ -86,13 +87,13 @@ __device__ __forceinline__ void fsu_row(const float *qo, int bx, int cx0, f16 (*
 __device__ __forceinline__ void fsu_side(const fs_up &up, int ch, fs_tile t, int bx, f16 (*u)[2]) {   /* the side pair's sub-cell terms (lat_shuf_k) */
     const int js = ch - up.side; if (up.side < 0 || js < 0 || js > 1) return;
     const size_t nc = (size_t)up.qd * up.h * up.w, cell = ((size_t)((t.bz >> 1) - up.q0) * up.h + (t.by >> 1)) * up.w + (bx >> 1);
-    const f16 *s = up.lc + (size_t)(up.base + 64 * js) * nc + cell;
+    const size_t s0 = (size_t)(up.base + 64 * js) * nc + cell;
 #pragma unroll
     for (int r = 0; r < 4; r++)
 #pragma unroll
         for (int dx = 0; dx < 2; dx++) {
             const int sub = 16 * ((2 * t.bz + (r >> 1)) & 3) + 4 * ((2 * t.by + (r & 1)) & 3) + ((2 * bx + dx) & 3);
-            u[r][dx] = __float2half_rn(__half2float(u[r][dx]) + (float)s[(size_t)sub * nc]);
+            u[r][dx] = __float2half_rn(__half2float(u[r][dx]) + fsu_ld(up, s0 + (size_t)sub * nc));
         }
 }
 template <bool UP>
@@ -117,12 +118,12 @@ __global__ void __launch_bounds__(FS_BT, UP ? 1 : 8) fstem_fwd_k(const f16 *__re
         for (int k = tid; k < nout * ncol; k += blockDim.x) {
             const int o = k / ncol, col = k % ncol, ch = chs.c[o]; if (ch < 0) continue;
             const int cxs = min(max(cx0 - 1 + col, 0), up.w - 1);
-            const f16 *l = up.lc + (size_t)ch * cv;
+            const size_t l0 = (size_t)ch * cv;
             float v[3][3];
 #pragma unroll
             for (int a = 0; a < 3; a++)
 #pragma unroll
-                for (int b = 0; b < 3; b++) v[a][b] = ldv(l, ((size_t)iz[a] * up.h + iy[b]) * up.w + cxs);
+                for (int b = 0; b < 3; b++) v[a][b] = fsu_ld(up, l0 + ((size_t)iz[a] * up.h + iy[b]) * up.w + cxs);
             float *qo = qs + o * 4 * FSU_NC + col;
             if (rz0) { if (ry0) fsu_q<2, 2>(v, qo); else fsu_q<2, 0>(v, qo); } else { if (ry0) fsu_q<0, 2>(v, qo); else fsu_q<0, 0>(v, qo); }
         }
@@ -338,14 +339,18 @@ extern "C" int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, 
     fstem_fwd_k<false><<<(unsigned)nt, FS_BT, 0>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns, fs_up{}, nn_fstem_wscale()); KCHECK();
     return 0;
 }
-extern "C" int nn_fstem_up_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns,
-                               const void *lc, int q0, int qd, int side, int base) {
+extern "C" int nn_fstem_up_fwd_t(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns,
+                                 const void *lc, int lh16, int q0, int qd, int side, int base) {
     if (!(C == 0 ? nout >= 1 && nout <= FS_MAXO && !(H & 3) && !(W & 3) : fs_ok(D, H, W, z0, nz, C, nout)) || (D & 3) || (H & 3) || (W & 3) || (z0 & 3) || (nz & 3)) return 1;
     const int d = D / 4, h = H / 4, w = W / 4;
     const int lo = max(z0 / 4 - 1, 0), hi = min((z0 + nz) / 4, d - 1); if (lo < q0 || hi >= q0 + qd) return 1;   /* (the cell planes the taps read lie in [q0, q0 + qd)) */
     const size_t nt = (size_t)(nz / 2) * (H / 2) * ((W / 2 + FS_BT - 1) / FS_BT); if (!nt) return 0;
-    fstem_fwd_k<true><<<(unsigned)nt, FS_BT, sizeof(float) * 4 * FSU_NC * (size_t)nout>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns, fs_up{(const f16 *)lc, d, h, w, q0, qd, side, base}, nn_fstem_wscale()); KCHECK();
+    fstem_fwd_k<true><<<(unsigned)nt, FS_BT, sizeof(float) * 4 * FSU_NC * (size_t)nout>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns, fs_up{lc, d, h, w, q0, qd, side, base, !lh16}, nn_fstem_wscale()); KCHECK();
     return 0;
+}
+extern "C" int nn_fstem_up_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns,
+                               const void *lc, int q0, int qd, int side, int base) {
+    return nn_fstem_up_fwd_t(x, D, H, W, z0, nz, p, C, nout, chs, lg, ns, lc, 1, q0, qd, side, base);
 }
 /* the backward's partial sums at their largest (1024 blocks x the parameters; 5.3 MB at 16 -> 16) on the current device, before the trainer's
    memory planner measures the free memory (they were allocated at the first backward, outside the plan: 2026-11-14 audit net#4) */
