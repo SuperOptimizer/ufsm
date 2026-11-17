@@ -17,6 +17,7 @@
 #include "store.h"
 #include "json.h"
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +62,18 @@ static inline double rs_tri(const rs_job *J, double z, double y, double x) {   /
     return (1 - tz) * a + tz * c;
 }
 
+/* one row block's source box (native z [org + a0 h - half, org + a1 h + half], the box's y / x +- half), read by a helper thread */
+typedef struct { z3 *z; int nt, rc; int64_t so[3], sn[3]; uint8_t *buf; char err[256]; } rs_src;
+static void rs_src_box(rs_src *R, const long long org[3], int h, int a0, int a1, double hm, double F, int H, int W, const int64_t *ssh) {
+    const double za0 = org[0] + (double)a0 * h; const double lo[3] = {za0 - hm, org[1] - hm, org[2] - hm}, hi[3] = {za0 + (a1 - a0) * h + hm, org[1] + (double)H * h + hm, org[2] + (double)W * h + hm};
+    for (int d = 0; d < 3; d++) { int64_t s0 = (int64_t)floor(lo[d] * F) - 1, s1 = (int64_t)ceil(hi[d] * F) + 2; if (s0 < 0) s0 = 0; if (s1 > ssh[d]) s1 = ssh[d]; R->so[d] = s0; R->sn[d] = s1 - s0; }
+}
+static void *rs_src_main(void *a) {
+    rs_src *R = a; R->rc = 0; R->buf = malloc((size_t)R->sn[0] * R->sn[1] * R->sn[2]);
+    if (!R->buf) { R->rc = 1; snprintf(R->err, sizeof R->err, "out of memory"); return nullptr; }
+    if (z3_read(R->z, R->so, R->sn, R->buf, R->nt)) { R->rc = 1; snprintf(R->err, sizeof R->err, "%s", z3_error()); }
+    return nullptr;
+}
 static void rs_rows(void *ctx, int a0, int a1, int t) {
     rs_job *J = ctx; (void)t;
     const fit_fields *f = &J->b->f; const int H = J->H, W = J->W, S = J->S;
@@ -187,40 +200,67 @@ int cmd_recto_sp(int argc, char **argv) {
         const size_t plane = (size_t)H * W; uint8_t *net = malloc(plane * nr), *rsp = calloc(plane * nr, 1);
         { const int64_t o[3] = {zoff[0] + b0, zoff[1], zoff[2]}, nn[3] = {nr, H, W}; if (z3_read(zsp, o, nn, net, nt)) { fprintf(stderr, "recto-sp: %s\n", z3_error()); return 1; } }
         if (zrin) { const int64_t o[3] = {zoff[0] + b0, zoff[1], zoff[2]}, nn[3] = {nr, H, W}; if (z3_read(zrin, o, nn, rsp, nt)) { fprintf(stderr, "recto-sp: %s\n", z3_error()); return 1; } }
-        else for (int c0 = b0; c0 < b1; c0 += 64) {
-            const int c1 = c0 + 64 < b1 ? c0 + 64 : b1; const int q0 = c0 > R0 ? c0 : R0, q1 = c1 < R1 ? c1 : R1;
-            if (q1 <= q0) continue;
-            const int a0 = (q0 / S) * S, a1 = q1;   /* (stride blocks start at multiples of S) */
-            fit_fields_skip_planes(1 | 2); fit_fields_ct_planes(0);
-            const int hz = cls ? (int)ceil(fmax(half, half2) / um / h) + 1 : 0, l0 = a0 - hz < 0 ? 0 : a0 - hz, l1 = a1 + hz > shp[0] ? shp[0] : a1 + hz;   /* (--cls: the fields along the profiles: a halo of rows) */
-            fit_fields_buf fb; if (fit_fields_load(in, l0, l1, 1, &fb)) { fprintf(stderr, "recto-sp: cannot load field rows %d..%d\n", l0, l1); return 1; }
-            /* source block: native z [org + a0 h - half, org + a1 h + half], the box's y / x +- half */
-            const double hm = fmax(half, half2) / um + 2; rs_job J = {.b = &fb, .r0 = a0 - l0, .nr = a1 - a0, .F = F, .org = {org[0] + (long long)l0 * h, org[1], org[2]}, .cls = cls, .h = h, .S = S, .um = um, .half = fmax(half, half2), .half1 = half2 > half ? half : 0,
-                .prom = opt_atof("--prom", rs_opt(argc, argv, "--prom", "25")), .sigma = opt_atof("--sigma", rs_opt(argc, argv, "--sigma", "0.5")), .sep = opt_atof("--sep-um", rs_opt(argc, argv, "--sep-um", "20")), .minint = opt_atoi("--min-int", rs_opt(argc, argv, "--min-int", "3")), .H = H, .W = W};
-            const int64_t *ssh = z3_meta_of(zs)->shape; const double za0 = org[0] + (double)a0 * h; const double lo[3] = {za0 - hm, org[1] - hm, org[2] - hm}, hi[3] = {za0 + (a1 - a0) * h + hm, org[1] + (double)H * h + hm, org[2] + (double)W * h + hm};
-            for (int d = 0; d < 3; d++) { int64_t s0 = (int64_t)floor(lo[d] * F) - 1, s1 = (int64_t)ceil(hi[d] * F) + 2; if (s0 < 0) s0 = 0; if (s1 > ssh[d]) s1 = ssh[d]; J.so[d] = s0; J.sn[d] = s1 - s0; }
-            uint8_t *sb = malloc((size_t)J.sn[0] * J.sn[1] * J.sn[2]); if (!sb) { fprintf(stderr, "recto-sp: out of memory\n"); return 1; }
-            if (z3_read(zs, J.so, J.sn, sb, nt)) { fprintf(stderr, "recto-sp: source read: %s\n", z3_error()); return 1; }
-            J.src = sb;
-            /* output: rows a0..a1 of the box into rsp (rows from b0); the block starting before q0 / past b1 is clipped by the row test */
-            uint8_t *tmpo = calloc((size_t)(a1 - a0) * plane, 1); J.out = tmpo; J.oz0 = J.r0;
-            const int nyb = (H + S - 1) / S, nzb = (a1 - a0 + S - 1) / S;
-            fit_par(nzb * nyb, rs_rows, &J);
-            for (int r = q0; r < q1; r++) memcpy(rsp + (size_t)(r - b0) * plane, tmpo + (size_t)(r - a0) * plane, plane);
-            free(tmpo); free(sb); fit_fields_free(&fb);
-            tc += J.ncell; te += J.nest;
-            fprintf(stderr, "\rrecto-sp: rows %d / %d (%lld cells, %.3f estimated, %.0f s)", c1, shp[0], tc, tc ? (double)te / tc : 0, rs_now() - t0);
+        else {
+            /* the row blocks of this shard row; each block's source box is read by a helper thread while the previous block's profiles
+               run (the source decode was 52 of 173 s serial on 0332, 2026-11-16; the bytes are the same: one z3_read per block as before) */
+            int nb = 0, bq0[16], bq1[16], ba0[16];
+            for (int c0 = b0; c0 < b1; c0 += 64) {
+                const int c1 = c0 + 64 < b1 ? c0 + 64 : b1; const int q0 = c0 > R0 ? c0 : R0, q1 = c1 < R1 ? c1 : R1;
+                if (q1 <= q0) continue;
+                bq0[nb] = q0; bq1[nb] = q1; ba0[nb] = (q0 / S) * S; nb++;   /* (stride blocks start at multiples of S) */
+            }
+            const double hm = fmax(half, half2) / um + 2; const int64_t *ssh = z3_meta_of(zs)->shape;
+            rs_src RS[2] = {{.z = zs, .nt = nt}, {.z = zs, .nt = nt}}; pthread_t th; int pend = 0;
+            for (int k = 0; k < nb; k++) {
+                rs_src *cur = &RS[k & 1];
+                if (pend) { pthread_join(th, nullptr); pend = 0; }
+                else { rs_src_box(cur, org, h, ba0[k], bq1[k], hm, F, H, W, ssh); rs_src_main(cur); }
+                if (cur->rc) { fprintf(stderr, "recto-sp: source read: %s\n", cur->err); return 1; }
+                if (k + 1 < nb) { rs_src *nx = &RS[(k + 1) & 1]; rs_src_box(nx, org, h, ba0[k + 1], bq1[k + 1], hm, F, H, W, ssh);
+                                  if (pthread_create(&th, nullptr, rs_src_main, nx)) rs_src_main(nx); else pend = 1; }
+                const int q0 = bq0[k], q1 = bq1[k], a0 = ba0[k], a1 = q1;
+                fit_fields_skip_planes(1 | 2); fit_fields_ct_planes(0);
+                const int hz = cls ? (int)ceil(fmax(half, half2) / um / h) + 1 : 0, l0 = a0 - hz < 0 ? 0 : a0 - hz, l1 = a1 + hz > shp[0] ? shp[0] : a1 + hz;   /* (--cls: the fields along the profiles: a halo of rows) */
+                fit_fields_buf fb; if (fit_fields_load(in, l0, l1, 1, &fb)) { fprintf(stderr, "recto-sp: cannot load field rows %d..%d\n", l0, l1); return 1; }
+                /* source block: native z [org + a0 h - half, org + a1 h + half], the box's y / x +- half (rs_src_box) */
+                rs_job J = {.b = &fb, .r0 = a0 - l0, .nr = a1 - a0, .F = F, .org = {org[0] + (long long)l0 * h, org[1], org[2]}, .cls = cls, .h = h, .S = S, .um = um, .half = fmax(half, half2), .half1 = half2 > half ? half : 0,
+                    .prom = opt_atof("--prom", rs_opt(argc, argv, "--prom", "25")), .sigma = opt_atof("--sigma", rs_opt(argc, argv, "--sigma", "0.5")), .sep = opt_atof("--sep-um", rs_opt(argc, argv, "--sep-um", "20")), .minint = opt_atoi("--min-int", rs_opt(argc, argv, "--min-int", "3")), .H = H, .W = W};
+                for (int d = 0; d < 3; d++) { J.so[d] = cur->so[d]; J.sn[d] = cur->sn[d]; }
+                J.src = cur->buf;
+                /* output: rows a0..a1 of the box into rsp (rows from b0); the block starting before q0 / past b1 is clipped by the row test */
+                uint8_t *tmpo = calloc((size_t)(a1 - a0) * plane, 1); J.out = tmpo; J.oz0 = J.r0;
+                const int nyb = (H + S - 1) / S, nzb = (a1 - a0 + S - 1) / S;
+                fit_par(nzb * nyb, rs_rows, &J);
+                for (int r = q0; r < q1; r++) memcpy(rsp + (size_t)(r - b0) * plane, tmpo + (size_t)(r - a0) * plane, plane);
+                free(tmpo); free(cur->buf); cur->buf = nullptr; fit_fields_free(&fb);
+                tc += J.ncell; te += J.nest;
+                fprintf(stderr, "\rrecto-sp: rows %d / %d (%lld cells, %.3f estimated, %.0f s)", q1, shp[0], tc, tc ? (double)te / tc : 0, rs_now() - t0);
+            }
         }
         /* blend into net */
+        /* the blended code depends on (net, rsp) alone: a 256 x 256 table of the very values the per-cell rule gives (0: kept). The
+           per-cell exp / log over every material cell of a shard row was 43 of 207 s single-threaded on 0332 (2026-11-16) */
+        static uint8_t lut[256][256]; static int lut_ok;
+        if (!lut_ok) {
+            for (int n8 = 1; n8 < 256; n8++) for (int r8 = 0; r8 < 256; r8++) {
+                uint8_t o = 0;
+                if (r8) {
+                    const double r = (double)r8 / n8;
+                    if (!(r < glo || r > ghi) && !(n8 * h / 8.0 * um < minnet)) {   /* --min-net-um: only where the network spacing is at least this wide */
+                        double a = blend;
+                        if (ramp) { const double su = n8 * h / 8.0 * um; a = su <= rlo ? ra0 : su >= rhi ? ra1 : ra0 + (ra1 - ra0) * (su - rlo) / (rhi - rlo); }   /* --blend-ramp: by the network spacing */
+                        const double v = exp((1 - a) * log(n8) + a * log(r8)); o = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lround(v));
+                    }
+                }
+                lut[n8][r8] = o;
+            }
+            lut_ok = 1;
+        }
         for (size_t i = 0; i < plane * nr; i++) {
             if (!net[i]) continue;
             nmat++;
-            if (!rsp[i]) continue;
-            const double r = (double)rsp[i] / net[i]; if (r < glo || r > ghi) continue;
-            if (net[i] * h / 8.0 * um < minnet) continue;   /* --min-net-um: only where the network spacing is at least this wide */
-            double a = blend;
-            if (ramp) { const double su = net[i] * h / 8.0 * um; a = su <= rlo ? ra0 : su >= rhi ? ra1 : ra0 + (ra1 - ra0) * (su - rlo) / (rhi - rlo); }   /* --blend-ramp: by the network spacing */
-            const double v = exp((1 - a) * log(net[i]) + a * log(rsp[i])); net[i] = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : lround(v)); nrep++;
+            const uint8_t o = lut[net[i]][rsp[i]]; if (!o) continue;
+            net[i] = o; nrep++;
         }
         /* write the shard row (outside the box: the input sp) */
         for (int pass = 0; pass < (wrs ? 2 : 1); pass++) {

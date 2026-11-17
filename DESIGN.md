@@ -51,6 +51,11 @@ level 0 and the model / output passes fell back to the CPU; 36-79 s on a free ca
 - **recto-sp.** rr_peaks takes its 2R + 1 gaussian taps from a table built per call instead of an exp per tap per sample (exp
   was a third of the CPU). 1024 x 2048^2 0332 box: 294.8 -> 175.7 CPU s (25.6 -> 18.6 s), byte-identical; test_recto compares the
   smoothed floats with the per-sample exp at 5 sigmas (one past the 256-tap stack table).
+- **recto-sp, part 2** (0332 full box, warm m7 cache, same fields): phases were source decode 52 s, profiles 56, field load 23,
+  blend 43, shard writes 18 of 207 s. The blend (net^(1-a) rsp^a per material cell, single-threaded exp / log) is a 256 x 256 table
+  of the same codes (43 -> 4 s), and each 64-row block's source box is decoded by a helper thread while the previous block's
+  profiles run. 225 -> 144 s, output byte-identical (sp and rsp chunk files). Larger row blocks (less halo re-decode) gave 173 -> 157 s
+  at 256 rows for +8 GB RSS: not taken; a decoded-chunk cache (zcache) needs ~4 GB of shm for the reuse distance: not in the dev slice.
 - **0332 end to end, UPTO=snap** (desk, card 1 shared with a 7 GB job at 100 % in both runs; master 7f2c69b8 + recto-sp):
 
   | stage | 15:02 run (5dce8d46, ufsm-inkspeed 926b3bb4) | this branch |
