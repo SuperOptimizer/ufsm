@@ -85,10 +85,12 @@ SGPU=${SGPU:-${FITGPUS%% *}}
 # GVIS: without a CUDA_VISIBLE_DEVICES of the caller's, every ufsm call of the run sees only the cards it was given (FIELDGPUS, FITGPUS,
 # INKGPU, SGPU, RGPU; lead 2026-11-17: a predict on --gpu 1 still opened a 128 MiB context on card 0, the training card): the run
 # exports CUDA_VISIBLE_DEVICES=GVIS, --gpu takes the card's index in it (lg), per-job CUDA_VISIBLE_DEVICES=<card> stay physical ids
+# (UNROLL_GVIS: the run's copy in $O/bin is exec'd with the CUDA_VISIBLE_DEVICES set here; it keeps the same GVIS)
 GVIS=
-if [ -z "${CUDA_VISIBLE_DEVICES+x}" ]; then
+if [ -n "${UNROLL_GVIS:-}" ] && [ "${CUDA_VISIBLE_DEVICES:-}" = "${UNROLL_GVIS// /,}" ]; then GVIS=$UNROLL_GVIS
+elif [ -z "${CUDA_VISIBLE_DEVICES+x}" ]; then
   for g in $FIELDGPUS $FITGPUS $INKGPU $SGPU ${RGPU:-}; do case " $GVIS " in *" $g "*) ;; *) GVIS="$GVIS $g";; esac; done
-  GVIS=$(echo $GVIS); export CUDA_VISIBLE_DEVICES=${GVIS// /,}
+  GVIS=$(echo $GVIS); export CUDA_VISIBLE_DEVICES=${GVIS// /,} UNROLL_GVIS=$GVIS
 fi
 lg() { local i=0 g; [ -n "$GVIS" ] && for g in $GVIS; do [ "$g" = "$1" ] && { echo $i; return; }; i=$((i + 1)); done; echo $1; }
 sgpu() { [ -n "$GVIS" ] && [ -n "$SGPU" ] && echo "CUDA_VISIBLE_DEVICES=$SGPU"; return 0; }
