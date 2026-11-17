@@ -326,7 +326,7 @@ The GPU run's time splits as:
 Left: the 1667 field decode (t0..t5 + w of 11.7 G cells; only 1/64 of them are sampled, but the codec decodes whole chunks), the
 lossless shard encodes, and the fp64 kernel. A lazy profile (±half first, the ±half2 tail only where the inner window has fewer than
 --min-int intervals, exact when hit clusters separated by >= sep bound the window) would cut ~1/3 of the kernel: not done.
-## ink-ext --ct-floor (zero CT below T before normalisation): null, not merged; hecate24 MX5 is slower (2026-11-17)
+## ink-ext --ct-floor (zero CT below T before normalisation): null, not merged; hecate24 MX5 speed (2026-11-17)
 
 Question (user): would it help to zero air/void that is neither papyrus nor masked (low CT values)? Test: in ink-ext's render,
 every sampled u8 CT value < T becomes 0 before the model's own normalisation (default 0 = off). Scored on the 24 crops (tvar.sh),
@@ -355,10 +355,13 @@ read the air/papyrus contrast and low-density texture (robust_mad / z-score norm
 sits at 39-55 and the air/papyrus valley at 57-73 (airiso's air_iso.tsv), so T 40-80 cuts into the papyrus fringe where ink sits.
 A floor would have to be learned in training, not applied to frozen teachers.
 
-hecate24 MX-fp4 speed (bench region 1500,900,995,260 of 1667 w013, 102.98 Mpx at 2.399 um, card 1): fp16 846.9 s (0.122 Mpx/s,
-net 833.5 s, 7.4 tiles/s), UFSM_XNET_MX=5 1298.2 s (0.079 Mpx/s, net 1280.4 s, 4.8 tiles/s). MX5 holds AUC (-0.0002 [-0.0009,
-+0.0004]) but is 1.53x slower on these 62x64x64 Co=64 3x3x3 convs, so hecate24 stays fp16. Render is 30-32 s of the wall
-(level-0 cache on disk), so the net is the whole cost.
+hecate24 MX-fp4 speed (bench region 1500,900,995,260 of 1667 w013, 102.98 Mpx at 2.399 um, card 1). MX5 holds AUC (-0.0002 [-0.0009,
++0.0004]); the speed is not settled, card 1 was shared in every full-region run. 31cae5a0: fp16 846.9 s (0.122 Mpx/s), MX5 1298.2 s
+(0.079 Mpx/s; this run overlapped another card-1 job, so the earlier "MX5 1.53x slower" was contention). 07465e87, 09:10-09:35, card
+still shared: MX5 684.1 s (0.151 Mpx/s, 9.3 tiles/s), fp16 612.0 s (0.168 Mpx/s, 10.3 tiles/s). Net-only synthetic tiles
+(UFSM_IE_BENCH, idle card): fp16 91 / 88 / 95 ms per tile at batch 1 / 2 / 4, MX5 85 / 78 / 79. A quiet back-to-back pair is
+pending (scripts/benchh24c.sh in /vesuvius/ufsm/inksdk); hecate24 stays fp16 until then. Render is 29-32 s of the wall (level-0
+cache on disk), so the net is the whole cost.
 
 ## Unroll perf 3: no context on unlisted cards; the ref's chunk rows fixed (2026-11-17, branch unrollperf3-20261117)
 
