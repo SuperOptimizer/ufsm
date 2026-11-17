@@ -6,7 +6,7 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
-## Flatten solver A/B: fp32 matvec, relative-residual stop, decimation by vertex count: none merged (2026-11-17)
+## Flatten solver A/B: the GPU CG matvec in fp32 by default; relative-residual stop and decimation by vertex count dropped (2026-11-17, branch flatfp32-20261117)
 
 The per-wrap flatten and strip-flatten (GPU SLIM, fp64 Jacobi PCG, 200 steps max) are fp64-bound on the 5060 Ti. Three variants
 were gated on all 72 0332 wraps (gate harness /vesuvius/ufsm/unrollperf/gate: strip-flatten + strip-distort, per wrap flatten ->
@@ -22,12 +22,25 @@ render -> ink-compare; card 1 shared):
 | fp32 + rtol 0.1 | 85 | 331 | 0.1421 | 0.5657 | 0.00106 | worse: dropped |
 | decim by vertex count (1.5 M) | 227 | 571 | 0.1389 | 0.5821 | 0.00109 | aniso>1.2 +94 % (coarser on big wraps): dropped |
 
-fp32 against the rule (lead): on the 41 wraps with a CPU fp64 run (w035 / w069 included), fp32-vs-GPU64 per-wrap |rel| must stay
-within CPU-vs-GPU64 for every metric, means <= the CPU spread and no wrap beyond 1.5x its max. Per-wrap maxima: all within (aniso>1.2
-w069 12.9 % vs CPU 14.7 % on w068; cm2 w035 2.33 % both). Means: 6 of 17 metrics above the CPU spread: energy 1.05e-3 vs 0.96e-3,
-aniso p50 5.2e-4 vs 4.3e-4, p95 9.0e-4 vs 7.8e-4, p99 3.6e-3 vs 3.2e-3, ink mean 7.7e-5 vs 4.1e-5, frac50 3.4e-4 vs 2.4e-4. So fp32
-fails as specified (by 10-90 % on the means, though every one is <= 1e-3 relative); not merged. The WIP (flat_opts cg_rtol / cg_fp32,
-UFSM_FLAT_CG_RTOL / UFSM_FLAT_CG_FP32, nn_flat.cu fp32 kernels) is kept on the unrollperf worktree's stash, opt-in only.
+fp32 against the noise floor (lead: CPU fp64 vs GPU fp64 = two valid solvers of the same problem; GPU fp64 run to run is
+bit-identical). 0332, the 41 wraps with a CPU fp64 run (w035 / w069 included): every per-wrap maximum within 1.5x the CPU-vs-GPU
+maximum (aniso>1.2 w069 12.9 % vs CPU 14.7 % on w068; cm2 w035 2.33 % both); 6 of 17 mean metrics above the CPU spread (energy 1.05e-3
+vs 0.96e-3, aniso p50 / p95 / p99, ink mean, frac50; each <= 1e-3 relative), judged noise against -27 % per wrap. w035 / w069 renders
+(ink + CT) fp32 vs fp64 side by side: no visible difference (/vesuvius/ufsm/unrollperf/gate/eyeball, deleted with the gate data).
+
+1667 (47 wraps, base run up to the strip with the ink head only; GPU fp64 vs fp32, one binary):
+
+| | strip s | per-wrap s | distort p95 | trusted | folded |
+|---|---|---|---|---|---|
+| GPU fp64 | 59 | 452 | 0.1409 | 0.6406 | 0.00143 |
+| fp32 | 67 | 356 | 0.1401 | 0.6402 | 0.00143 |
+
+aniso>1.2 per wrap: worst degradation +3.1 % relative (w041) against the 0332 CPU-vs-GPU worst +5.6 % (w049); fp32 better on 10
+wraps, worse on 13. The largest change (16 %, w003, 1.16 cm2, a strongly distorted wrap) is an improvement (aniso>1.2 14.5 -> 12.1 %,
+energy 4.30 -> 4.26). Trusted share -0.0004 (0332 CPU-vs-GPU -0.0002): accepted (lead, 0.06 % relative, changes both ways).
+Default since then: flatten / strip-flatten run the CG's matvec in fp32 (dot products, r / z / x / p and the step in fp64); the fp64
+solve is `--cg-fp32 0` or `UFSM_FLAT_CG_FP32=0`. test_flatten_gpu checks both paths against the CPU solver (fp32 max |duv| 3.2e-5 on the
+cone with holes, fp64 2.5e-6; energies equal to 1e-9). The rtol / vertex-count code is removed.
 
 ## Unroll perf 5: volcomp's lossless encoder 2-2.5x, the lossless sink decoder ~25 % (byte-identical; 2026-11-17, branch unrollperf5-20261117)
 
