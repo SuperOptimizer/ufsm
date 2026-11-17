@@ -649,6 +649,9 @@ __global__ void __launch_bounds__(288, LP_MINB(2)) conv_bwd_w_f4_k(const T *__re
    the 101376 limit); 672 threads get 80 registers each (the cap: 21 warps count as 24). Same values as conv_bwd_w_f4_k
    with gpre; the gw sums group differently (per block over several tiles). ---- */
 #define WS_NC 9            /* consumer (MMA) warps */
+#ifndef F4W_BF16RT
+#define F4W_BF16RT 0
+#endif
 #ifndef WS_NP
 #define WS_NP 11           /* producer warps (11: 20 warps get 96 registers; 12 capped them at 80 with spills in the MMA loop. 15 measured slower) */
 #endif
@@ -891,7 +894,13 @@ __global__ void __launch_bounds__(WS_NT, 1) conv_bwd_w_f4ws_k(const T *__restric
                         float d;
                         if constexpr (IS_MX4(T)) { const float2 e = dec_e2m1x2(u & 255u); d = qhi ? e.y : e.x; }
                         else d = dec_e4m3x2((unsigned short)(u & 255u)).x;
+                        /* (was rounded through bf16, as the old decode tile: an identity for MX inputs, e2m1 / e4m3 times a power of two
+                           is exact in bf16 down to its subnormals; -DF4W_BF16RT=1 keeps the round trip for A/B) */
+#if F4W_BF16RT
                         xd[j] = __bfloat162float(__float2bfloat16(d * mx_scale(sb) + 0.f));
+#else
+                        xd[j] = d * mx_scale(sb) + 0.f;
+#endif
                     }
                 }
                 float v[18];
@@ -1214,13 +1223,19 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
             else if (xs.c % 8 == 0 && (sp.x2 == nullptr || sp.c_split % 8 == 0)) NTw = 1;
             if (ws_env == 3 && !(NTw == 2 && MT == 2)) NTw = 0;   /* UFSM_F4W_WS=3: the old selection (>= 32 outputs, 16-channel input tiles), A/B */
             /* (slab-local GroupNorm x, gnp_t ns: conv_bwd_w_f4_k below, which applies each plane's slab; the warp-specialised one does not yet) */
+            /* UFSM_F4W_MT4=1: 64 outputs x 8 input channels a block (MT 4, NT 1) instead of 32 x 16: the same accumulators a consumer warp
+               (3 x 4 x 1 x 4), half the x staging per MMA (each x element is decoded, GroupNorm-ed and requantised once per output tile:
+               ncu 2026-11-17, 85 % of conv_bwd_w_f4ws_k<2, 2>'s instructions are that staging) */
+            static int mt4_env = -1; /* mgpu: env */ if (mt4_env < 0) mt4_env = getenv("UFSM_F4W_MT4") ? atoi(getenv("UFSM_F4W_MT4")) : 0;
+            int MTw = MT;
+            if (mt4_env && MT == 2 && ys.c % 64 == 0 && xs.c % 8 == 0 && (sp.x2 == nullptr || sp.c_split % 8 == 0)) { MTw = 4; NTw = 1; }
             if constexpr (IS_MX(T)) if (ws_env && lay == 1 && !had && !sp.up && NTw) {
                 /* warp-specialised persistent kernel: the blocks of a channel tile split its (tile, z chunk) items; z chunks
                    short enough for >= 4 items per SM, then the block count with the shortest estimated makespan (waves x
                    items per block, in z-steps: + 1 per item for its 4-plane first step, + 6 per block for fill and drain).
                    16 outputs (MT 1, the 16-channel levels) and 8-channel input tiles (NTw 1) too: -28% per level-0 layer vs
                    conv_bwd_w_f4_k (desk P512, 16-wide net) */
-                const int nsm = ws_nsm(), combos = ((xs.c + 8 * NTw - 1) / (8 * NTw)) * ((ys.c + 16 * MT - 1) / (16 * MT)) * ys.n, ntile = nblk_(ys.w, 16) * nblk_(ys.h, 8);
+                const int nsm = ws_nsm(), combos = ((xs.c + 8 * NTw - 1) / (8 * NTw)) * ((ys.c + 16 * MTw - 1) / (16 * MTw)) * ys.n, ntile = nblk_(ys.w, 16) * nblk_(ys.h, 8);
                 int zc_w = zs1 - zs0;
                 while (zc_w > 4 && (size_t)combos * ntile * nblk_(zs1 - zs0, zc_w) < (size_t)4 * nsm) zc_w = (zc_w + 1) / 2;
                 const int nitem = ntile * nblk_(zs1 - zs0, zc_w);
@@ -1229,14 +1244,15 @@ template <typename T, typename TG> void bwd_w_f4_t(const void *x, shape5 xs, con
                     const double waves = (double)nblk_(combos * k, nsm), cost = waves * ((double)nblk_(nitem, k) * (zc_w + 1) + 6);
                     if (cost < best - 1e-9) { best = cost; nper = k; }
                 }
-                const dim3 gw3((unsigned)(nper * ys.n), (xs.c + 8 * NTw - 1) / (8 * NTw), (ys.c + 16 * MT - 1) / (16 * MT));
-                static int wattr[8][8];
+                const dim3 gw3((unsigned)(nper * ys.n), (xs.c + 8 * NTw - 1) / (8 * NTw), (ys.c + 16 * MTw - 1) / (16 * MTw));
+                static int wattr[8][16];
                 const bool wsl = gp.ns || sp.gp2.ns;   /* slab-local GroupNorm: the SL instance */
-                const int mi = (MT - 1) + 2 * (NTw - 1) + 4 * wsl;
+                const int mi = MTw == 4 ? 8 + wsl : (MT - 1) + 2 * (NTw - 1) + 4 * wsl;
 #define WSL1(M, NN, S) do { if (!wattr[cur_dev_()][mi]) { wattr[cur_dev_()][mi] = 1; cudaFuncSetAttribute((const void *)conv_bwd_w_f4ws_k<M, NN, T, S>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ws_smem<M, NN, T>()); } \
                         conv_bwd_w_f4ws_k<M, NN, T, S><<<gw3, WS_NT, ws_smem<M, NN, T>()>>>((const T *)x, gw, xs.n, xs.c, xs.d, xs.h, xs.w, ys.c, gp, sp, zc_w, buf, zs0, zs1, skk.m, skk.my, skk.mx); } while (0)
 #define WSL(M, NN) do { if (wsl) WSL1(M, NN, true); else WSL1(M, NN, false); } while (0)
-                if (MT == 1 && NTw == 1) WSL(1, 1);
+                if (MTw == 4) WSL(4, 1);
+                else if (MT == 1 && NTw == 1) WSL(1, 1);
                 else if (MT == 1) WSL(1, 2);
                 else if (NTw == 1) WSL(2, 1);
                 else WSL(2, 2);

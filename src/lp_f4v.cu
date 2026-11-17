@@ -19,7 +19,7 @@ int g_f4_pn = -1;   /* mgpu: env */
 extern "C" void lp_set_f4_prenorm(int on) { g_f4_pn = on; }
 static int g_f4v_preslab = -1;   /* mgpu: env (UFSM_F4V_PRESLAB=Z: force the slabbed prenorm with Z-plane slabs; tests) */
 extern "C" void lp_set_f4v_preslab(int z) { g_f4v_preslab = z; }
-static unsigned long g_f4v_calls;   /* (tests: lp_f4v_calls) */
+static unsigned long g_f4v_calls;   /* mgpu: guarded (atomics; tests: lp_f4v_calls) */
 extern "C" unsigned long lp_f4v_calls(void) { return g_f4v_calls; }
 extern "C" int lp_get_f4v(void) { if (g_f4v < 0) g_f4v = getenv("UFSM_F4V") ? atoi(getenv("UFSM_F4V")) : 0; return g_f4v; }
 int lp_f4v_slab_forced(void) { if (g_f4v_preslab < 0) g_f4v_preslab = getenv("UFSM_F4V_PRESLAB") ? atoi(getenv("UFSM_F4V_PRESLAB")) : 0; return lp_get_f4v() && g_f4v_preslab > 0; }
@@ -331,7 +331,7 @@ int lp_f4v_try(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws, c
                                                                                                                             small depths: conv_fwd_f4_k's 2-plane tiles) */
                     : sp.zw1 && (sp.zw0 % 4 || (sp.zw1 % 4 && sp.zw1 != xs.d)) ? "z-window off 4-plane tiles" : plane >= ((size_t)1 << 31) ? "plane >= 2^31"
                     : osum && (sp.y2 || (xs.w & 15) || cout <= 16) ? "statistics epilogue (split output / W % 16 / <= 16 outputs)" : nullptr;   /* (f4v_epi_st: fwd_epi_mxt's conditions) */
-    static int dbg = -1; if (dbg < 0) dbg = getenv("UFSM_F4V_DEBUG") ? atoi(getenv("UFSM_F4V_DEBUG")) : 0;   /* the first N calls: kernel and reason */
+    static int dbg = -1; /* mgpu: debug */ if (dbg < 0) dbg = getenv("UFSM_F4V_DEBUG") ? atoi(getenv("UFSM_F4V_DEBUG")) : 0;   /* the first N calls: kernel and reason */
     if (dbg > 0) { dbg--; fprintf(stderr, "f4v: %d->%d %dx%dx%d Cop %d Cip %d stats %d osr %d x2 %d (c_split %d) up %d gn %d/%d: %s%s\n", xs.c, cout, xs.d, xs.h, xs.w, Cop, Cip, osum != nullptr, sp.osr != 0, sp.x2 != nullptr, sp.c_split, sp.up, gp.G, sp.gp2.G,
                                    why ? "conv_fwd_f4_k, " : "conv_fwd_f4v_k", why ? why : ""); }
     if (why) return 0;
