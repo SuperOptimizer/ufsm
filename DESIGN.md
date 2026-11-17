@@ -6,6 +6,30 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Unroll perf 7: the heads' shards encoded by one pool for all heads (predict --heads at q 0; same bytes; 2026-11-17, branch inkwriters-20261117)
+
+fp4teach's quiet-card profile of the unroll's ink predict (0332, 32 windows 544 / 16, heads ink,c12,c13, q 0): wall 8.55 s, gpu(fwd+d2h)
+4.99 s, writer-wait 3.17 s; the 3 head writers 20.5 s over 96 shards, ~6.8 s each. Each head's writer did compress a shard with all
+--threads (z3w_write_shard), but shard by shard: its threads wait for the shard's slowest chunk (lossless chunk cost varies ~10x with the
+content) and its file write before the next shard, and the main thread (ring of 2) waits for the slowest head every window.
+
+- z3w_pool (src/z3w.c): one set of threads encodes the inner chunks of every queued shard of any array, oldest shard first; the thread that
+  encodes a shard's last chunk writes its file (z3w_write_shard's bytes: the same chunk gather + encode function and write_file) and calls
+  done. predict --heads: the CPU-encoded heads (q 0, or UFSM_PRED_GPU_ENC=0) share one pool of heads x --threads (as many threads as the
+  head writers had together) within ufsm_ncpu; a head writer hands its shard to the pool and takes the next one; the --resume log, the
+  GPU pyramid's pieces (pyacc_post, under its mutex) and the buffer's release run in done. Each head's ring has 3 buffers (was 2) so the
+  main thread does not wait for the slowest head's shard. UFSM_PRED_HPOOL=0: the previous writers; =N: N pool threads.
+- Bench (CPU only; 16 shards 512^3 x 3 heads decoded from PHerc1299's inkpod-9000 q 8 heads, re-encoded at q 0; desk at load 33-68, nice
+  19, so ranges): all shards queued, 3 writers x 8 threads 12.0 / 12.3 s wall, one pool of 24 6.6 s (1.8x); 3 x 3 threads 16.5 s, pool of
+  9 12.0 s. Emulated predict (one window per 0.15 s hands one shard per head, writer_submit's ring wait): 3 x 8 threads ring 2: 15-26 s;
+  pool 24, ring 2: 13-20 s; pool 24, ring 3: 9.8-11.2 s (1.5-2.6x); 9 threads: 3 x 3 20-33 s, pool ring 3 14-17 s. Serial cost: 1.4 s
+  (ink) to 2 s (c12, c13) a 512^3 shard per thread at nice 19.
+- Same bytes: tests/test_z3w_pool.c (3 arrays: q 0, q 8, uint16; fill chunks, an all-fill shard over a stale object, a failing shard
+  reported with its error, the others written); test_predict_heads (1b): every file of the q 0 heads' stores (shards 128 and 256, levels
+  3, GPU pyramid) equal with UFSM_PRED_HPOOL=0 (diff -r); the bench's pooled stores md5-equal to the per-head writers'.
+- Not measured on the GPU (card 1 booked; desk CPU the training bottleneck): the ink predict wall at a quiet moment against
+  UFSM_PRED_HPOOL=0 (fp4teach's recipe, expected toward the 5 s of GPU).
+
 ## Fit-derived pseudo labels: gated winding labels from our unrolls, the build on the pod (2026-11-17, branch pseudolab-20261117)
 
 User (11-17): "at some point we need to feed our refined unwraps back in as training data — pseudolabeling and such"; (11-10) "judge the
@@ -50,6 +74,7 @@ the axis is matched by scan basename. On the scratch1 -ho json: 37 unlabelled vo
 
 **Tests.** test_unroll_qa: --gate-boxes on the right model's 8 tiles (all s 1, 64^3 boxes) and the wrong model's box (s 0, --gate-scale 2
 doubles it). test_surflabels: --gt-cells against itself, every cell's kept voxels and pairs right.
+
 ## Unroll perf 6: 0332 end to end on master 64b2d3ed; flatten waits for device memory; the driver's stripes gated in the render (2026-11-17, branch unrollperf6-20261117)
 
 0332, card 1, u1 13000, INKAT=fields, TH=20 at nice 19 (lead: try9 first; desk load 32-39), CT cache cold (full4: warm), CLEAN=1;
@@ -62,6 +87,8 @@ under load), ink 682 -> 737, strip-flatten 118 -> 38 (fp32), stripimg 457 -> 442
   failure (x untouched) and slim_run waits for memory, 2 s retries up to UFSM_FLAT_GPU_WAIT (300 s), before the CPU solver.
 - stripimg: the unroll driver renders the 3 middle stripes itself (the stretch) and strip_refill.sh gated them with 2 more renders each;
   the driver now passes the c12 / c13 gates (render --gate, the same bytes) and marks them gated.
+- The stripimg + perwrap re-measure of both fixes was skipped (lead: card 1 booked, the desk CPU the training bottleneck); the e2e5 data
+  is deleted, its logs in /vesuvius/ufsm/unrollperf/keep/e2e5.
 
 ## Argus V2 (ruiconte): a Reader V3 fine-tune, runs in our reader3 port; ties reader3, adds nothing to the teacher combo (2026-11-17)
 

@@ -26,6 +26,8 @@ cmake --preset llvm-verify && cmake --build build-llvm-verify # clang + nvcc, ke
 scripts/test/desk_suite.sh BRANCH   # push to the desk, build and run the suite there (one suite at a time)
 ```
 
+- `cmake --build build-verify` (the default target) does not rebuild the suite's test binaries: after kernel or library changes run
+  suites through `--target test` (or build the test target), or stale binaries fail with "invalid device function".
 - Build dirs are configurations that never invalidate each other: `build/` (release, the fp16 / MX kernels) and `build-verify/`
   (`UFSM_VERIFY=ON`, adds the bf16 / fp32 instantiations); `build86*/` for `UFSM_ARCH=86`. The suite binaries run from
   `build-verify/`; `test` also builds the release-dir helpers the Python tests use (`build/ufsm`, `make_pipeline_fixture` ...).

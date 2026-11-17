@@ -325,6 +325,7 @@ ufsm_exe(test_unwrap_targets SUITE tests/test_unwrap_targets.c OBJS NN LP LIBS m
 ufsm_exe(test_vcgpu SUITE tests/test_vcgpu.c OBJS vcgpu NN LP LIBS LDLIBS CUDA INC CUDA)
 ufsm_exe(test_volcomp SUITE tests/test_volcomp.c LIBS m)
 ufsm_exe(test_volcomp_vll SUITE tests/test_volcomp_vll.c LIBS LDLIBS)
+ufsm_exe(test_z3w_pool SUITE tests/test_z3w_pool.c OBJS z3w LIBS LDLIBS)
 ufsm_exe(test_volcomp_fast SUITE tests/test_volcomp_fast.c OBJS zarr3 store json z3w LIBS LDLIBS)
 target_compile_options(test_volcomp_fast PRIVATE ${UFSM_IEEE_CFLAGS})   # (its reference decoder IEEE like zarr3.c: UFSM_EXACT_HOST)
 ufsm_exe(test_votes SUITE tests/test_votes.c OBJS votes scannorm edt band sheet ct_augment scan_augment spatial_augment crush scrollaug

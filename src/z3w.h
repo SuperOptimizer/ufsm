@@ -27,6 +27,15 @@ int z3w_write_shard(z3w *w, int64_t sz, int64_t sy, int64_t sx, const uint8_t *d
    z3w_write_shard_enc writes shard (sz, sy, sx) from (shard / 128)^3 such chunks (z-major; nullptr = fill) and frees them. */
 int z3w_encode_chunk(const z3w *w, const uint8_t *chunk, uint8_t **enc, size_t *len);
 int z3w_write_shard_enc(z3w *w, int64_t sz, int64_t sy, int64_t sx, uint8_t **enc, size_t *len);
+/* a pool of nthreads (<= 0: ufsm_ncpu) that encodes and writes shards for any number of arrays: z3w_pool_submit queues shard (sz, sy, sx)
+   of w from data (kept unchanged until done runs), whose chunks are encoded oldest shard first by whichever threads are free; the thread
+   that finishes the shard writes it (z3w_write_shard's bytes) and calls done(ctx, rc, err) (rc 0 ok; err z3w_error's text). Destroy
+   finishes the queued shards. */
+typedef struct z3w_pool z3w_pool;
+z3w_pool *z3w_pool_create(int nthreads);
+int z3w_pool_submit(z3w_pool *P, z3w *w, int64_t sz, int64_t sy, int64_t sx, const uint8_t *data, void (*done)(void *ctx, int rc, const char *err), void *ctx);
+int z3w_pool_threads(const z3w_pool *P);
+void z3w_pool_destroy(z3w_pool *P);
 int z3w_shard_chunks(const z3w *w);   /* (shard / 128)^3 */
 int z3w_close(z3w *w);
 /* Write an OME group zarr.json at dir listing levels[i] with voxel sizes um[i]; names are "%g" of um. */
