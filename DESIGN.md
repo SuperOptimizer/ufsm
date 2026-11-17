@@ -51,6 +51,13 @@ level 0 and the model / output passes fell back to the CPU; 36-79 s on a free ca
 - **recto-sp.** rr_peaks takes its 2R + 1 gaussian taps from a table built per call instead of an exp per tap per sample (exp
   was a third of the CPU). 1024 x 2048^2 0332 box: 294.8 -> 175.7 CPU s (25.6 -> 18.6 s), byte-identical; test_recto compares the
   smoothed floats with the per-sample exp at 5 sigmas (one past the 256-tap stack table).
+- **--skip-empty on u1's fields predict (speed side; the accuracy A/B is the lead's wbench skipthr.sh)**, grid 0, local CT, card 1
+  shared, margin 1: 0332 whole box dense 243.2 s / thr 20 212.2 / 40 212.4 / 60 210.6 (mean level-0 active tile share .553 / .553 /
+  .536); 1667 whole box dense 271.7 / thr 40 235.3 (share .529); Paris 4 z 8192..10240 full section dense 216.0 / thr 40 203.6
+  (share .768). So -13 % per predict on 0332 / 1667, -6 % on packed Paris 4: ~60-75 s of a 683 / 872 s fields stage. The threshold
+  hardly matters on these masked scans (air is 0). Whole windows are already dropped before the GPU (--occupancy: no CT > 0 in the
+  interior on level 5; windows over absent chunks): 505 -> 473 run on 0332, 578 -> 524 on 1667; of the run windows 0 (thr 20) / 3
+  (thr 60) have no active level-0 tile (`UFSM_SKIP_REPORT=1` now counts them). Not made default (u1 trained dense).
 - **1667 (box at 0, local CT), fields + recto-sp** (desk, card 1 shared): fields 872 s (grid 0 373 s / 578 windows, half grid 272 s /
   567 windows, blend 225 s). The old half grid planned 3524 windows (+752 air) on the same box: ~2290 s at the old 0.65 s a window,
   so the old fields stage was ~2990 s (3.4x). recto-sp on its fields, warm m7 cache: 280 -> 157 s (2433 -> 1750 CPU s), byte-identical;
