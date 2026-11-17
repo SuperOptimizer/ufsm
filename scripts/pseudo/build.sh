@@ -21,7 +21,7 @@
 #      pair accuracy (>= 50 pairs) is < AGMIN (0.8) or kept-voxel agreement < AGMIN: 0.
 #   6. phase-coh --coh 0 --box-scale (agree + dir + gate) --box-default 0 --papyrus 64 --pap-dilate 2 on the gated phase -> weight.zarr.
 #   7. source.json; the full phase rasters are deleted (KEEP=1 keeps them).
-# Env: U (ufsm), TH (8), HO (holdouts json, default the 11-14 per-scroll set), EXMM (0.5), RUNMIN (0.5), FNAME (lat), FIBRES (UFIB),
+# Env: QA (a pulled dense boxes.tsv instead of step 1's unroll-qa: no fields needed), CTROOT (CT root instead of the manifest's), U (ufsm), TH (8), HO (holdouts json, default the 11-14 per-scroll set), EXMM (0.5), RUNMIN (0.5), FNAME (lat), FIBRES (UFIB),
 #      M7 (prob ROOT/KEY at the label grid; default: found on the volcomp mirror as good.sh does; "none" skips), CACHE, DRY=1 (print only).
 set -uo pipefail
 RUN=${1:?RUN dir}; OUT=${2:?OUT dir}
@@ -36,10 +36,18 @@ read -r CTR CTK LV GUM <<< "$(jq -r '.ct' "$M" | sed -n 's/^\(\S*\) \(\S*\) leve
 [ -n "${GUM:-}" ] || { log "cannot parse the manifest ct line: $(jq -r '.ct' "$M")"; exit 2; }
 DIR=$(jq -r '.dir // empty' "$M"); case "$DIR" in 1|-1|+1) ;; *) log "REFUSED: the manifest has no spiral dir (got '$DIR')"; exit 2;; esac
 CTUM=$(awk -v g=$GUM -v l=$LV 'BEGIN {printf "%.10g", g / 2 ^ l}')   # (the scan's level-0 um: the axis frame)
+# CTROOT: build away from the unroll (e.g. on the desk from a pod run pulled to /vesuvius/ufsm/podun/S, lead 11-17): the CT root to read
+# instead of the manifest's (the pod's /root/pod/vol); a mirror-style key SCROLL/volumes/SCAN becomes SCROLL/SCAN under a local root
+if [ -n "${CTROOT:-}" ]; then CTR=$CTROOT; case "$CTROOT" in *://*) ;; *) CTK=${CTK/\/volumes\//\/};; esac; fi
 CTB=$(basename "$CTK"); CK=$(jq -r '.ck_sha // .ck // "?"' "$M")
 log "pseudo build $S: run $RUN (ck $CK, dir $DIR), CT $CTR $CTK/$LV at $GUM um, out $OUT"
 # 1. the tile gate (and the run gate)
 GB=$OUT/gate.boxes
+if [ ! -s "$GB" ] && [ -n "${QA:-}" ]; then   # QA: a dense unroll-qa boxes.tsv made where the fields are (pod check stage, UQTILES=100000)
+  [ -s "$QA" ] || { log "no QA tiles $QA"; exit 2; }
+  python3 "$H/scripts/pseudo/tilegate.py" "$QA" "$GB" > "$OUT/logs/unrollqa.log" || { log "tilegate failed"; exit 1; }
+  nt=$(awk 'END {print NR - 1}' "$QA"); [ "$nt" -ge 100 ] || log "WARNING: QA has only $nt tiles (a 48-tile sample, not the dense map?): the weight covers only those tiles"
+fi
 if [ ! -s "$GB" ]; then
   if [ "$DRY" != 1 ] && { [ ! -d "$RUN/fields/$FNAME" ] || [ ! -d "$RUN/joined" ]; }; then log "no $RUN/fields/$FNAME or $RUN/joined (unroll-qa needs both; kept on the pod until this build ran?)"; exit 2; fi
   fib=(); [ -n "${FIBRES:-}" ] && fib=(--fibres "$FIBRES")
