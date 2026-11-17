@@ -30,6 +30,7 @@ ap.add_argument("--vertices", default=None, help="coverage only from a vertex du
 ap.add_argument("--vertex-um", type=float, default=9.596, help="the dump's voxel size")
 ap.add_argument("--gate-auc", type=float, default=0, help="exit 3 when the held-out (validation + holdout) ink AUC at the middle tolerance is below this")
 ap.add_argument("--min-heldout", type=float, default=0.05, help="warn when held-out samples are fewer than this share of all (the per-scroll holdout rule: ~8-10 %% of boxes)")
+ap.add_argument("--dump", default=None, help="also save the per-sample arrays (P label points, LAB, INK, CT, miss_um, VAL, HOLD) as this .npz: paired bootstraps between maps")
 ap.add_argument("--self-test", action="store_true", help="map onto the published meshes themselves (the labels as the map): AUC 1, miss 0")
 a = ap.parse_args()
 tols = [float(t) for t in a.tol.split(",")]
@@ -193,6 +194,7 @@ for t in tols:
         ia, if1 = auc_f1(INK[si], LAB[si]); ca, cf1 = auc_f1(CT[sc_], LAB[sc_]); res[(t, nm)] = (ia, ca, s.sum() / max(sp.sum(), 1))
         rows.append(f"{t:g}\t{nm}\t{sp.sum()}\t{s.sum()}\t{s.sum() / max(sp.sum(), 1):.3f}\t{LAB[s].mean() if s.any() else float('nan'):.3f}\t{ia:.4f}\t{if1:.4f}\t{ca:.4f}\t{cf1:.4f}\t{np.median(miss_um[sp]) if sp.any() else float('nan'):.1f}")
 open(a.out, "w").write("\n".join(rows) + "\n"); print("\n".join(rows))
+if a.dump: np.savez_compressed(a.dump, P=P.astype(np.float32), LAB=LAB, INK=INK, CT=CT, miss_um=miss_um.astype(np.float32), VAL=VAL, HOLD=HOLD)
 tm = tols[len(tols) // 2]; ia, ca, cv = res[(tm, "heldout")]; ra = res[(tm, "rest")][0]; nh = (VAL | HOLD).mean()
 print(f"HEADLINE held-out (validation + holdout, {nh:.3f} of the samples) at {tm:g} um: ink AUC {ia:.4f} (CT {ca:.4f}), coverage {cv:.3f}; "
       f"training labels (rest) {ra:.4f}, not a quality number", flush=True)
