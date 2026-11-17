@@ -44,7 +44,7 @@ export INKW=${INKW:-576}   # ink window: auto took 1600^3 / 90 GB on a free card
 # the stripe renders gate the ink by max(p_recto, p_verso) (strip_refill.sh INKGATE)
 # the ink checkpoint: the newest inkpod snap (15000, as the desk driver; podunroll 11-17: this wrapper still named 9000), uploaded as $POD/ckpt/inkpod-15000.ckpt
 export LATINK_CK=${LATINK_CK:-$POD/ckpt/inkpod-15000.ckpt}
-export INKCMD=${INKCMD-${UNROLL_REPO:-$POD/ufsm}/scripts/pod/latink.sh} INKNAME=${INKNAME:-inkpod-$(basename $LATINK_CK .ckpt | sed 's/^inkpod-//')} INKGATE="${UR:-$POD/unroll}/$S/ink/c12.zarr ${UR:-$POD/unroll}/$S/ink/c13.zarr"
+export INKCMD=${INKCMD-${UNROLL_REPO:-$POD/ufsm}/scripts/pod/latink.sh} INKNAME=${INKNAME:-inkpod-$(basename $LATINK_CK .ckpt | sed 's/^inkpod-//')} INKGATE="${UR:-$POD/unroll}/$S${TAG:-}/ink/c12.zarr ${UR:-$POD/unroll}/$S${TAG:-}/ink/c13.zarr"
 # a published ink (setup.sh fetched it): use it instead of predicting one
 if [ -n "${INKPUB:-}" ] && [ -z "${INKCMD:-}" ]; then export INKCMD="$B/inkpub.sh"
   printf '#!/bin/sh\n# INKCMD O GPU OUT: the published ink (setup.sh) linked in; a missing one fails loudly (no dangling link)\n[ -e %s/zarr.json ] || { echo "inkpub: %s has no zarr.json" >&2; exit 1; }\nmkdir -p "$(dirname "$3")" && ln -sfn %s "$3"\n' "$INKPUB" "$INKPUB" "$INKPUB" > $B/inkpub.sh; chmod +x $B/inkpub.sh; fi
