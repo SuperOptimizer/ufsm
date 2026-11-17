@@ -1312,7 +1312,8 @@ template <int BM> __device__ __forceinline__ void fwd_stats_flush(const unsigned
         gn_acc_add(osum, 2 * ng + 1, (double)cs[BM + threadIdx.x]);
     }
 }
-template <int MT, int NR, typename T, bool FST = false, bool E16 = (MT == 1), bool OWN = false>   /* FST: try the shared-memory MX store paths (they check
+template <int MT, int NR, typename T, bool FST = false, bool E16 = (MT == 1), bool OWN = false, bool NOST = false>   /* NOST: the output (and the
+                                                                                stored_stats rewrite of acc) only; the caller sums the statistics (lp_f4v.cu). FST: try the shared-memory MX store paths (they check
                                                                                 their own requirements); E16: compile fwd_epi_mx16 (one-tile kernels; MT 2:
                                                                                 register pressure); OWN: the scratch is the kernel's own (nothing staged or
                                                                                 read by the MMA under it, no other output tile), the statistics accumulate
@@ -1327,8 +1328,8 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
     if (sp.yD) { oz0 += sp.yzo; zs0 += sp.yzo; zs1 += sp.yzo; D = sp.yD; }   /* direct slab output (nn_set_zrange_out): planes yzo.. of a depth-yD
                                                                              tensor; the launch's planes keep their statistics range */
     float *cs = (float *)smem_raw;
-    if (osum && !OWN) { __syncthreads(); for (int i = threadIdx.x; i < 2 * BM; i += blockDim.x) cs[i] = 0.f; __syncthreads(); }
-    bool mx_done = false, st_done = false;
+    if (osum && !OWN && !NOST) { __syncthreads(); for (int i = threadIdx.x; i < 2 * BM; i += blockDim.x) cs[i] = 0.f; __syncthreads(); }
+    bool mx_done = false, st_done = NOST;
     if constexpr (IS_MX(T) && FST && MT % 2 == 0) {
         unsigned dsm; asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dsm));
         const int OxP = sp.y2 ? (sp.o_pad ? sp.o_pad : (sp.o_split + 31) / 32 * 32) : Co;
@@ -1581,7 +1582,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                     for (int h = 0; h < 2; h++) { cs[m * 16 + g + 8 * h] += sps[m][h]; cs[BM + m * 16 + g + 8 * h] += spss[m][h]; }
             __syncthreads();
         }
-    if (osum && !OWN) {
+    if (osum && !OWN && !NOST) {
         __syncthreads();
         if (threadIdx.x < BM && co0 + (int)threadIdx.x < Co) {
             int cpg = Co / Go, ng = n * Go + (co0 + threadIdx.x) / cpg;

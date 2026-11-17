@@ -151,6 +151,13 @@ int main(void) {
     run_up("dec conv1, fused upsample, z-range input, 8-plane slabs", 64, 96, 96, 16, 16, 32, 8, 1, 1);
     run_up("dec conv1, fused upsample, z-range + z-window, one slab", 96, 64, 128, 20, 16, 32, 0, 1, 2);
     run_up("dec conv1, fused upsample, z-window, 4-plane slabs, no stats", 64, 64, 64, 16, 18, 32, 4, 0, 3);
+    /* W % 16 with statistics (conv_fwd_f4_k's per-lane epilogue order: f4v_st_pl; predict's ink windows, widths 68 / 136) */
+    run_case("W % 16, stats (2-plane old tiles)", 128, 128, 16, 16, 36, STATS);
+    run_case("W % 16, stored stats", 128, 128, 16, 16, 40, STATS | SST);
+    run_case("odd width, stats, depth < 16 (MT 2)", 96, 96, 12, 16, 37, STATS);
+    run_case("GN z-range, W 68, stats -> slabbed prenorm", 128, 128, 16, 16, 68, GN | STATS | ZRANGE | V1 | SL8);
+    run_case("GN z-range + z-window, W 36, stats", 96, 96, 20, 16, 36, GN | STATS | ZRANGE | ZWIN | V1 | SL8);
+    run_up("dec conv1, fused upsample, z-range, W 68, stats", 160, 128, 128, 16, 16, 68, 8, 1, 1);
     run_case("z-range input (zi0 1, Di D + 3)", 128, 64, 12, 16, 32, ZRANGE | OSR);
     /* GroupNorm inputs of z-range / z-window convs (unet's in-place level-0 slabs, predict): no prenorm copy there, so lp_f4v_preslab
        prenorms the planes each slab reads, against conv_fwd_f4_k's in-kernel GN */

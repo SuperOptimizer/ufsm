@@ -57,6 +57,7 @@ __global__ void prep_w4v_k(const uint8_t *__restrict__ wq, const uint8_t *__rest
    its warp w (wz' = w / 4 plane, wr = 2 (w % 4) rows) = this kernel's warp 4 half + w % 4, rows 2 (w / 4) .. + 1, and its sums are
    formed as there (rows in order, 16 voxels a row, the warps in order from 0, one fixed-point add per channel and half): the same
    statistics bits. Values, scales and SR keys per voxel as fwd_epi_mxt. */
+template <int MT> __device__ __forceinline__ void f4v_st_flush(unsigned char *smem_raw, double *osum, int n, int co0, int Co, int Go);
 template <int MT, int NR, typename T>
 __device__ __forceinline__ void f4v_epi_st(float (&acc)[MT][NR][2][4], unsigned char *smem_raw, T *y, const float *b, int n, int co0, int Co, int D, int H, int W,
                                            int oz0, int oy0, int ox0, int wz, int wr, double *osum, int Go, const split_t &sp, int N) {
@@ -146,6 +147,13 @@ __device__ __forceinline__ void f4v_epi_st(float (&acc)[MT][NR][2][4], unsigned 
     for (int hf = 0; hf < 2; hf++)
 #pragma unroll
         for (int jb = 0; jb < MT / 2; jb++) { tb[2 * BM * hf + 32 * jb + lane] = ps[hf][jb]; tb[2 * BM * hf + BM + 32 * jb + lane] = pss[hf][jb]; }
+    f4v_st_flush<MT>(smem_raw, osum, n, co0, Co, Go);
+}
+/* the ordered tail of the two-half statistics: per warp, at (smem_raw + 1024) + warp HV 36 floats, [2 halves][sums BM | squares BM] of its rows;
+   added as conv_fwd_f4_k<MT, 2>'s warps in order (its warp w of half block hb: this kernel's warp 4 hb + w % 4, half w / 4) */
+template <int MT>
+__device__ __forceinline__ void f4v_st_flush(unsigned char *smem_raw, double *osum, int n, int co0, int Co, int Go) {
+    constexpr int HV = 16, BM = MT * 16;
     __syncthreads();
     const float *t0 = (const float *)(smem_raw + 1024);
     float *cs = (float *)smem_raw;   /* [2 halves][2 BM] */
@@ -165,6 +173,48 @@ __device__ __forceinline__ void f4v_epi_st(float (&acc)[MT][NR][2][4], unsigned 
             gn_acc_add(osum, 2 * ng + 1, (double)cs[2 * BM * hb + BM + c]);
         }
     }
+}
+/* the statistics for W % 16 (conv_fwd_f4_k<MT, 2>'s per-lane MX epilogue, fwd_epilogue's last path: no smem output tile): after fwd_epilogue<NOST>
+   wrote the output (and, stored_stats, rewrote acc with the decoded values), each old warp's per-lane sums in its order (its 2 rows, the x
+   pairs, v0 then v1; then the xor 1, 2 shuffles), written where f4v_st_flush adds them in warp order. Old warp w of half block hb = this
+   warp 4 hb + w % 4 (wz = hb, wr = 2 (w % 4)), its rows the half w / 4 = r / 2 of this warp's 4 */
+template <int MT, int NR>
+__device__ __forceinline__ void f4v_st_pl(const float (&acc)[MT][NR][2][4], unsigned char *smem_raw, const float *b, int n, int co0, int Co, int D, int H, int W,
+                                          int oz0, int oy0, int ox0, int wz, int wr, double *osum, int Go, const split_t &sp) {
+    static_assert(NR == 4, "f4v_st_pl: two 2-plane halves");
+    constexpr int HV = 16, BM = MT * 16, RZ = NR / 2;
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    int zs0 = sp.zlo, zs1 = D - sp.zhi;
+    if (sp.yD) { oz0 += sp.yzo; zs0 += sp.yzo; zs1 += sp.yzo; D = sp.yD; }
+    __syncthreads();   /* the scratch is free (fwd_epilogue's per-lane path wrote no smem; the MMA stages are done) */
+    float *tb = (float *)(smem_raw + 1024) + (threadIdx.x >> 5) * HV * 36;
+#pragma unroll
+    for (int hf = 0; hf < 2; hf++)
+#pragma unroll
+        for (int m = 0; m < MT; m++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int co = co0 + m * 16 + g + 8 * h;
+                float ps = 0.f, pss = 0.f;
+#pragma unroll
+                for (int rr = 0; rr < 2; rr++) {
+                    const int r = 2 * hf + rr, oz = oz0 + wz * RZ + (r >> 1), oy = oy0 + wr + (r & 1);
+                    if (oz >= D || oy >= H || co >= Co) continue;
+                    const float bias = sp.stored_stats ? 0.f : b ? b[co] : 0.f;
+                    const bool zst = oz >= zs0 && oz < zs1;
+#pragma unroll
+                    for (int q = 0; q < 2; q++) {
+                        const int ox = ox0 + q * 8 + 2 * t;
+                        const float v0 = acc[m][r][q][2 * h] + bias, v1 = acc[m][r][q][2 * h + 1] + bias;
+                        if (ox < W && zst) { ps += v0; pss += v0 * v0; }
+                        if (ox + 1 < W && zst) { ps += v1; pss += v1 * v1; }
+                    }
+                }
+                ps += __shfl_xor_sync(0xffffffff, ps, 1); ps += __shfl_xor_sync(0xffffffff, ps, 2);
+                pss += __shfl_xor_sync(0xffffffff, pss, 1); pss += __shfl_xor_sync(0xffffffff, pss, 2);
+                if (t == 0) { tb[2 * BM * hf + m * 16 + g + 8 * h] = ps; tb[2 * BM * hf + BM + m * 16 + g + 8 * h] = pss; }
+            }
+    f4v_st_flush<MT>(smem_raw, osum, n, co0, Co, Go);
 }
 /* stage h's MMA (the compile-time pair range of h) */
 template <int MT, int RZ, int NSC, int H = 0, int NR = 2 * RZ>
@@ -312,7 +362,12 @@ __global__ void __launch_bounds__(256, f4v_minb<MT, TZ, NSC>()) conv_fwd_f4v_k(c
             f4v_mma_stage<MT, RZ, NSC>(h, acc, sx, sxs, wa, was, oz0, wz, wr, lane);
         }
     }
-    if constexpr (ST) f4v_epi_st<MT, NR, TO>(acc, smem_raw, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N);
+    if constexpr (ST) {
+        if (W & 15) {   /* (conv_fwd_f4_k's per-lane epilogue and its statistics order) */
+            fwd_epilogue<MT, NR, TO, true, (MT == 1), false, true>(acc, smem_raw, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N);
+            f4v_st_pl<MT, NR>(acc, smem_raw, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp);
+        } else f4v_epi_st<MT, NR, TO>(acc, smem_raw, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N);
+    }
     else fwd_epilogue<MT, NR, TO, true>(acc, smem_raw, y, b, n, co0, Co, D, H, W, oz0, oy0, ox0, wz, wr, osum, Go, sp, N);
 }
 template <int MT, int TZ, typename TO, int NSC = 2>
@@ -358,7 +413,8 @@ static const char *f4v_shape_why(shape5 xs, int Cop, int Cip, int cout, const do
     if (Cop % 32 || (Cop % 64 && !mt2)) return Cop % 32 ? "Cop % 32" : "Cop % 64 (UFSM_F4V_MT2=0)";
     if (xs.d < 8) return "depth < 8";
     if (osum && Cop % 64 && Cip <= 64) return "statistics of a Cop % 64 conv on <= 2 input chunks (conv_fwd_f4_k's ring tile)";
-    if (osum && (Cop % 64 == 0 || xs.d < 16) && (sp.y2 || (xs.w & 15) || cout <= 16)) return "statistics epilogue (split output / W % 16 / <= 16 outputs)";   /* (f4v_epi_st: fwd_epi_mxt's conditions) */
+    if (osum && (Cop % 64 == 0 || xs.d < 16) && (sp.y2 || cout <= 16)) return "statistics epilogue (split output / <= 16 outputs)";   /* (f4v_epi_st: fwd_epi_mxt's conditions; W % 16:
+                                                                                                                                   f4v_st_pl, the per-lane order) */
     return nullptr;
 }
 /* fwd_f4_t<mx4_t, mx4_t>'s hook, after its weight prep and gn_prenorm_f4_k: 1 if conv_fwd_f4v_k ran the conv */
