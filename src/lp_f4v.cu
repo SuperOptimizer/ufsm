@@ -21,7 +21,7 @@ static int g_f4v_preslab = -1;   /* mgpu: env (UFSM_F4V_PRESLAB=Z: force the sla
 extern "C" void lp_set_f4v_preslab(int z) { g_f4v_preslab = z; }
 static unsigned long g_f4v_calls;   /* mgpu: guarded (atomics; tests: lp_f4v_calls) */
 extern "C" unsigned long lp_f4v_calls(void) { return g_f4v_calls; }
-extern "C" int lp_get_f4v(void) { if (g_f4v < 0) g_f4v = getenv("UFSM_F4V") ? atoi(getenv("UFSM_F4V")) : 0; return g_f4v; }
+extern "C" int lp_get_f4v(void) { if (g_f4v < 0) g_f4v = getenv("UFSM_F4V") ? atoi(getenv("UFSM_F4V")) : 1; return g_f4v; }   /* (default on since 2026-11-17: byte-identical to conv_fwd_f4_k; UFSM_F4V=0 the old kernel) */
 int lp_f4v_slab_forced(void) { if (g_f4v_preslab < 0) g_f4v_preslab = getenv("UFSM_F4V_PRESLAB") ? atoi(getenv("UFSM_F4V_PRESLAB")) : 0; return lp_get_f4v() && g_f4v_preslab > 0; }
 
 #ifndef LP_SW
