@@ -31,14 +31,18 @@ plane path (fzs, not the fused fit-h 8 kernel) the build holds no logits (`unet_
 buffer that the `_c` upsample / shuffle kernels read (q0 / qd). Two buffers: the overlap with the previous chunk is one pitched copy, the new
 planes are written in place (`conv1_mx_t_k` plane stride Ly), so each cell plane's head runs once. The head is the same kernel instantiation
 with a voxel range: bit-identical (test_headz: couts 32 / 11 / 144, ranges incl. into a wider plane stride; 0332 640 / 64 fields zarr
-byte-identical, diff -r). Cost at 640 (nsys minima): kernels 171.6 + copies 35.1 ms per window vs 176.6 + 31.3 with the whole-window head
-(the first version's 144 per-channel copies per chunk cost +31 ms a window). 1152 / 64 now runs on the 16 GB card, 7.2 GB free after the
+byte-identical, diff -r). Cost at 640 (nsys minima per full launch configuration: kernel, grid x y z, block, dynamic smem, registers):
+kernels 182.2 + copies 35.1 ms per window vs 188.0 + 31.3 with the whole-window head (the first version's 144 per-channel copies per chunk
+cost +31 ms a window). (ksum.py grouped by grid product + block before convk's note 11-17: same-grid launches of one kernel with different
+specialisations shared a minimum, undercounting the slower ones; the figures here are rescored.) 1152 / 64 now runs on the 16 GB card, 7.2 GB free after the
 first window; GPU 9.23 s for the 1024 x 2048^2 box (4 windows) vs 10.81 s at 640 (32 windows), one other app on the card: about -15 %
 (the trunk's 27 % fewer computed voxels, the fit path unchanged). Host RSS 14.6 GB at 1152 (16 pinned shard buffers). UFSM_PRED_HEADZ=0:
 the whole-window logits.
 
-Also measured (convk's conv_fwd_f4v_k, branch convk-20261117 71ef14b2, UFSM_F4V on by default there): byte-identical predict outputs, but
-kernel minima per window fields 178.0 -> 187.8 ms (+5.5 %), ink 128.0 -> 144.0 (+12.5 %); sent to convk before its merge.
+Also measured: convk's conv_fwd_f4v_k (UFSM_F4V) on both predict recipes, byte-identical outputs throughout. 71ef14b2 lost (its GN convs
+ran in-kernel GN staging: predict's level-0 convs are z-range slabs, which the prenorm copy excluded); 32ba38cb (z-range prenorm) and
+ce3b6778 (the prenorm masked under --skip-empty) win, full-key minima per window F4V 0 -> 1: fields 189.3 -> 182.4 ms (-3.6 %), ink
+149.9 -> 139.5 (-6.9 %); the fp4 convs + prenorm alone fields 38.7 -> 34.3, ink 73.3 -> 63.1 (run-to-run noise on the shared card ~+-2 %).
 Ink teachers on the same quiet window: see the 2026-11-16 section (ink9um 1667 segment fp16 old 163.7 s, fused 127.9, MX5 100.9, pick 116.0).
 
 ## Fit-derived pseudo labels: gated winding labels from our unrolls, the build on the pod (2026-11-17, branch pseudolab-20261117)
