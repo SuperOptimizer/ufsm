@@ -561,33 +561,38 @@ int lp_f4v_preup(const void *x, shape5 xs, const uint8_t *wq, const uint8_t *ws,
     return 0;
 #else
     const int Ci = xs.c, Cx = sp.c_split, CxP = (Cx + 31) / 32 * 32;
-    if (!lp_get_f4v() || lp_sw_build() || sp.up != 2 || !sp.x2 || Cx <= 16 || Ci - Cx <= 16 || sp.sr || gp.ns || sp.gp2.ns || sp.Di || sp.zw1 || sp.y2 || f4v_shape_why(xs, Cop, Cip, cout, osum, sp)
-        || ((size_t)(xs.d + 2) * xs.h * xs.w >= ((size_t)1 << 31))) return 0;
+    /* (z-range / z-window as lp_f4v_preslab: output planes [o0, o1) read the fine input planes z + zi0 of the depth-Di inputs, the coarse
+       part's planes in the depth-Di / 2 numbering; unet's in-place decoder slabs in predict) */
+    if (!lp_get_f4v() || lp_sw_build() || sp.up != 2 || !sp.x2 || Cx <= 16 || Ci - Cx <= 16 || sp.sr || gp.ns || sp.gp2.ns || sp.y2 || f4v_shape_why(xs, Cop, Cip, cout, osum, sp))
+        return 0;
+    if (sp.zw1 && (sp.zw0 % 4 || (sp.zw1 % 4 && sp.zw1 != xs.d))) return 0;
+    const int zi = sp.zi0, Di = sp.Di ? sp.Di : xs.d, o0 = sp.zw1 ? sp.zw0 : 0, o1 = sp.zw1 ? sp.zw1 : xs.d;
+    if ((size_t)(o1 - o0 + 2) * xs.h * xs.w >= ((size_t)1 << 31) || (Di & 1)) return 0;
     if (g_f4v_preslab < 0) g_f4v_preslab = getenv("UFSM_F4V_PRESLAB") ? atoi(getenv("UFSM_F4V_PRESLAB")) : 0;
-    const int HW = xs.h * xs.w, Hc = xs.h >> 1, Wc = xs.w >> 1, HWc = Hc * Wc, Dc = xs.d >> 1, nb1 = CxP / 32, nb2 = (Cip - CxP) / 32;
+    const int HW = xs.h * xs.w, Hc = xs.h >> 1, Wc = xs.w >> 1, HWc = Hc * Wc, Dc = Di >> 1, nb1 = CxP / 32, nb2 = (Cip - CxP) / 32;
     auto bytes = [&](int Z, size_t *o1, size_t *o2) {   /* (fine up | fine skip | coarse) for a Z-plane slab */
         const size_t L = (size_t)Z + 2, Lc = L / 2 + 3;
         *o1 = ((size_t)xs.n * nb1 * L * HW * 17 + 255) & ~(size_t)255;
         *o2 = *o1 + (((size_t)xs.n * nb2 * L * HW * 17 + 255) & ~(size_t)255);
         return *o2 + (size_t)xs.n * nb1 * Lc * HWc * 33;
     };
-    size_t o1 = 0, o2 = 0;
+    size_t b1 = 0, b2 = 0;
     int Z = 0; uint8_t *q = nullptr;
-    if (g_f4v_preslab > 0) { Z = g_f4v_preslab & ~3; if (Z < 4) Z = 4; q = (uint8_t *)nn_ws(NN_WS_F4PRE, bytes(Z, &o1, &o2)); }
-    else for (Z = (xs.d + 3) & ~3; Z >= 4 && !(q = (uint8_t *)nn_ws(NN_WS_F4PRE, bytes(Z, &o1, &o2))); Z = Z > 64 ? 64 : Z - 4) {}
+    if (g_f4v_preslab > 0) { Z = g_f4v_preslab & ~3; if (Z < 4) Z = 4; q = (uint8_t *)nn_ws(NN_WS_F4PRE, bytes(Z, &b1, &b2)); }
+    else for (Z = (o1 - o0 + 3) & ~3; Z >= 4 && !(q = (uint8_t *)nn_ws(NN_WS_F4PRE, bytes(Z, &b1, &b2))); Z = Z > 64 ? 64 : Z - 4) {}
     if (!q) return 0;
-    bytes(Z, &o1, &o2);
+    bytes(Z, &b1, &b2);
     const skipm_t sk = lp_skip_get(xs, sp, 1);
     const size_t cpl = (size_t)Dc * HWc;
-    for (int z0 = 0; z0 < xs.d; z0 += Z) {
-        const int z1 = z0 + Z < xs.d ? z0 + Z : xs.d, a = z0 > 0 ? z0 - 1 : 0, e = z1 < xs.d ? z1 + 1 : xs.d, L = e - a;
+    for (int z0 = o0; z0 < o1; z0 += Z) {
+        const int z1 = z0 + Z < o1 ? z0 + Z : o1, a = max(z0 + zi - 1, 0), e = min(z1 + zi + 1, Di), L = e - a;   /* (fine input planes) */
         const int cza = max((a >> 1) - 1, 0), czb = min(((e - 1) >> 1) + 2, Dc), Lc = czb - cza;   /* the coarse planes the blend reads */
-        uint8_t *qu = q, *qs = q + o1, *qc = q + o2;
+        uint8_t *qu = q, *qs = q + b1, *qc = q + b2;
         up_coarse_f4v_k<<<dim3(nblk_((size_t)Lc * HWc, 256), (unsigned)nb1, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, Ci, Cx, cpl, cza, Lc, HWc, gp, sp, qc);
-        up_fine_f4v_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb1, (unsigned)xs.n), 256>>>(qc, xs.n, cza, Lc, xs.d, xs.h, xs.w, a, L, qu);
-        gn_prenorm_f4z_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb2, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, Ci, Cx, CxP, CxP, (size_t)xs.d * HW, a, L, HW, gp, sp, qs, sk, a, xs.d, xs.w);
-        split_t s2 = sp; s2.up = 0; s2.x2 = qs; s2.gp2 = gnp_t{}; s2.zi0 = (int16_t)-a; s2.Di = (int16_t)L; s2.zw0 = (int16_t)z0; s2.zw1 = (int16_t)z1;
-        launch_f4v_mt(qu, xs, wq, ws, b, cout, y, Cop, Cip, gnp_t{}, osum, Go, s2, sk, z0 == 0);
+        up_fine_f4v_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb1, (unsigned)xs.n), 256>>>(qc, xs.n, cza, Lc, Di, xs.h, xs.w, a, L, qu);
+        gn_prenorm_f4z_k<<<dim3(nblk_((size_t)L * HW, 256), (unsigned)nb2, (unsigned)xs.n), 256>>>((const mx4_t *)x, xs.n, Ci, Cx, CxP, CxP, (size_t)Di * HW, a, L, HW, gp, sp, qs, sk, a - zi, xs.d, xs.w);
+        split_t s2 = sp; s2.up = 0; s2.x2 = qs; s2.gp2 = gnp_t{}; s2.zi0 = (int16_t)(zi - a); s2.Di = (int16_t)L; s2.zw0 = (int16_t)z0; s2.zw1 = (int16_t)z1;
+        launch_f4v_mt(qu, xs, wq, ws, b, cout, y, Cop, Cip, gnp_t{}, osum, Go, s2, sk, z0 == o0);
     }
     __atomic_fetch_add(&g_f4v_calls, 1ul, __ATOMIC_RELAXED);
     return 1;

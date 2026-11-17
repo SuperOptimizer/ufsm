@@ -162,6 +162,11 @@ So --sparse24 mode 3, which changes results, no longer pays.
 - Ceiling with the staging stubbed out: 12.4 ms (52 % tensor).
 - An x pre-pass into LY 1 records would move ~9.5 GB per call (~450 B per plane, channel and tile, read once per co tile): ~21 ms
   of DRAM time, so no gain.
+- Predict's decoder conv1s (2026-11-17, branch convkup-20261117): lp_f4v_preup now takes the z-range / z-window inputs of unet's in-place
+  decoder slabs, which before fell back to the old kernel (90 calls a window in fields). The slabs walk the output window [zw0, zw1). The
+  fine input planes are a = max(z0 + zi0 - 1, 0) .. min(z1 + zi0 + 1, Di), the coarse ones are in the Di / 2 numbering, and the skip
+  prenorm's mask offset is a - zi0. test_f4v has 3 new run_up cases (z-range, z-range + z-window, z-window); they are byte-equal,
+  statistics included.
 - Clusters, tried and parked (branch convkw-20261117, conv_bwd_w_f4wc_k, nvcc build, bit-equal to the plain kernel in test_f4wc):
   the CL co tiles of a (1, 1, CL) cluster share one x staging.
   - Each block stages every CL-th LY 1 group and bulk-copies its 432 B slot to the others (cp.async.bulk shared::cluster with

@@ -84,15 +84,19 @@ static void run_case(const char *name, int Ci, int Co, int D, int H, int W, int 
     nn_free(ga); nn_free(be); nn_free(mu); nn_free(rsd); nn_free(g2a); nn_free(g2b); nn_free(g2m); nn_free(g2r);
 }
 /* the decoder conv1 [up2(coarse Cx) | skip Cs] -> Co with both GroupNorms (sp.up: the fused upsample): old kernel vs the slab path */
-static void run_up(const char *name, int Cx, int Cs, int Co, int D, int H, int W, int Z, int stats) {
-    const int Ci = Cx + Cs, G = 8, Go = 8;
-    shape5 fs = {1, Ci, D, H, W}, cs = {1, Cx, D / 2, H / 2, W / 2}, ks = {1, Cs, D, H, W}, ys = {1, Co, D, H, W};
+/* zr: 1 a z-range input (output plane z reads fine plane z + 2 of depth-(D + 4) inputs, unet's in-place decoder slabs in predict), 2 that plus
+   the z-window [4, D - 4), 3 the z-window only */
+static void run_up(const char *name, int Cx, int Cs, int Co, int D, int H, int W, int Z, int stats, int zr) {
+    const int Ci = Cx + Cs, G = 8, Go = 8, Di = zr == 1 || zr == 2 ? D + 4 : D;
+    shape5 fs = {1, Ci, D, H, W}, cs = {1, Cx, Di / 2, H / 2, W / 2}, ks = {1, Cs, Di, H, W}, ys = {1, Co, D, H, W};
     float *w = dev_rand((size_t)Co * Ci * 27, 0.04f, 0.f), *b = dev_rand(Co, 0.1f, 0.f);
     void *c4 = mx4_rand(cs, 2.f), *k4 = mx4_rand(ks, 2.f);
     float *ga = dev_rand(Cx, 0.2f, 1.f), *be = dev_rand(Cx, 0.1f, 0.f), *mu = dev_rand(G, 0.1f, 0.f), *rsd = dev_rand(G, 0.1f, 1.f);
     float *g2a = dev_rand(Cs, 0.3f, 1.f), *g2b = dev_rand(Cs, 0.2f, 0.f), *g2m = dev_rand(G, 0.2f, 0.f), *g2r = dev_rand(G, 0.1f, 1.f);
     gnp_t gp = gnp_mk(ga, be, mu, rsd, G);
     split_t sp = {0}; sp.x2 = k4; sp.c_split = Cx; sp.up = 1; sp.gp2 = gnp_mk(g2a, g2b, g2m, g2r, G);
+    if (zr == 1 || zr == 2) { sp.zi0 = 2; sp.Di = (int16_t)Di; }
+    if (zr >= 2) { sp.zw0 = 4; sp.zw1 = (int16_t)(D - 4); }
     const size_t osb = (size_t)2 * Go * 3 * sizeof(double);
     double *os[2] = {nullptr, nullptr};
     size_t yb = 0; void *y[2] = {mx4_out(ys, &yb), mx4_out(ys, &yb)};
@@ -113,9 +117,9 @@ static void run_up(const char *name, int Cx, int Cs, int Co, int D, int H, int W
     int sok = 1;
     if (stats) { unsigned char s0[512], s1[512]; nn_d2h(s0, os[0], osb); nn_d2h(s1, os[1], osb); sok = !memcmp(s0, s1, osb); }
     char msg[256];
-    snprintf(msg, sizeof msg, "%s: up %d + skip %d -> %d %dx%dx%d, Z %d: %zu of %zu bytes differ%s%s%s", name, Cx, Cs, Co, D, H, W, Z, nd, yb, stats ? (sok ? ", stats equal" : ", STATS DIFFER") : "",
+    snprintf(msg, sizeof msg, "%s: up %d + skip %d -> %d %dx%dx%d, Z %d, zr %d: %zu of %zu bytes differ%s%s%s", name, Cx, Cs, Co, D, H, W, Z, zr, nd, yb, stats ? (sok ? ", stats equal" : ", STATS DIFFER") : "",
              ran ? "" : ", F4V NOT RUN", e ? e : "");
-    check(msg, !e && ran && nd == 0 && sok && nz > yb / 4);
+    check(msg, !e && ran && nd == 0 && sok && nz > (zr >= 2 ? yb / 8 : yb / 4));
     free(h0); free(h1);
     nn_free(w); nn_free(b); nn_free(c4); nn_free(k4); nn_free(y[0]); nn_free(y[1]); nn_free(os[0]); nn_free(os[1]);
     nn_free(ga); nn_free(be); nn_free(mu); nn_free(rsd); nn_free(g2a); nn_free(g2b); nn_free(g2m); nn_free(g2r);
@@ -141,9 +145,12 @@ int main(void) {
     run_case("GN staged, split input, per-segment GNs", 192, 256, 12, 24, 48, GN | GN2 | SPLIT | STATS);
     run_case("slabbed prenorm vs in-kernel GN staging (8-plane slabs)", 128, 128, 20, 16, 32, GN | STATS | PRESLAB);
     run_case("slabbed prenorm, stored stats, odd depth", 256, 192, 13, 24, 32, GN | STATS | SST | PRESLAB);
-    run_up("dec conv1, fused upsample", 64, 64, 64, 16, 16, 32, 8, 1);
-    run_up("dec conv1, fused upsample, one slab", 96, 64, 128, 12, 24, 32, 0, 1);
-    run_up("dec conv1, fused upsample, 4-plane slabs, odd sizes", 64, 96, 128, 14, 18, 32, 4, 1);
+    run_up("dec conv1, fused upsample", 64, 64, 64, 16, 16, 32, 8, 1, 0);
+    run_up("dec conv1, fused upsample, one slab", 96, 64, 128, 12, 24, 32, 0, 1, 0);
+    run_up("dec conv1, fused upsample, 4-plane slabs, odd sizes", 64, 96, 128, 14, 18, 32, 4, 1, 0);
+    run_up("dec conv1, fused upsample, z-range input, 8-plane slabs", 64, 96, 96, 16, 16, 32, 8, 1, 1);
+    run_up("dec conv1, fused upsample, z-range + z-window, one slab", 96, 64, 128, 20, 16, 32, 0, 1, 2);
+    run_up("dec conv1, fused upsample, z-window, 4-plane slabs, no stats", 64, 64, 64, 16, 18, 32, 4, 0, 3);
     run_case("z-range input (zi0 1, Di D + 3)", 128, 64, 12, 16, 32, ZRANGE | OSR);
     /* GroupNorm inputs of z-range / z-window convs (unet's in-place level-0 slabs, predict): no prenorm copy there, so lp_f4v_preslab
        prenorms the planes each slab reads, against conv_fwd_f4_k's in-kernel GN */
@@ -158,8 +165,8 @@ int main(void) {
     run_case("MT 2: split input (160 | 64), stats", 224, 160, 16, 16, 32, SPLIT | STATS);
     run_case("MT 2: GN staged, split input, per-segment GNs", 224, 96, 16, 16, 32, GN | GN2 | SPLIT | STATS);
     run_case("MT 2: slabbed prenorm vs in-kernel GN staging", 96, 96, 20, 16, 32, GN | STATS | PRESLAB);
-    run_up("MT 2: dec conv1, fused upsample (128 up | 96 skip -> 96)", 128, 96, 96, 16, 16, 32, 8, 1);
-    run_up("MT 2: dec conv1, fused upsample, no stats, odd depth", 64, 96, 160, 14, 18, 32, 4, 0);
+    run_up("MT 2: dec conv1, fused upsample (128 up | 96 skip -> 96)", 128, 96, 96, 16, 16, 32, 8, 1, 0);
+    run_up("MT 2: dec conv1, fused upsample, no stats, odd depth", 64, 96, 160, 14, 18, 32, 4, 0, 0);
     run_case("MT 2: 288 outputs, GN + stats", 288, 288, 16, 12, 16, GN | STATS);
     run_case("MT 2: 96 outputs, stats, depth 12 (conv_fwd_f4_k's 2-plane tiles)", 128, 96, 12, 16, 32, GN | STATS);
     run_case("MT 2: 160 outputs, z-window, stats", 160, 160, 16, 16, 32, STATS | ZWIN);
