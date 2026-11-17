@@ -6,6 +6,29 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## recto-sp: the profile kernel in short launches, the helper's streams first (PHerc Paris 4's 1532 s; same codes; 2026-11-17, branch rectosp-20261117)
+
+Paris 4 on the pod (RTX PRO 6000, try9-6250 unroll): recto-sp 1521 s, 25.5k CPU s, against 0332 83 s and 1667 103 s. Its box is 8x 1667's
+(629 M cells against 62 M; 149 blocks of 4.2 M cells). From its log: 813 s on the blocks (kernel 799) + 698 s waiting for the helper = the
+wall; the helper's source 1508 s for 166k non-fill chunks (7066 on the GPU decoder, 158871 on the host). Host decode and https are not it:
+on the desk 10 ms CPU a chunk (ufsm read, 1 thread), 1024 cold chunks in 4 s (8 threads). The cause: k_rsp's grid is sized to the
+resident blocks, so a launch holds every SM until the block's last cell (5.4 s on P4); every chunk the helper puts into the ring (host
+or GPU decoded) is a gather kernel (nn_ctw_put) on another stream and waited for it, the 43 workers spinning in their syncs (the CPU s).
+The helper and the kernel ran one after the other instead of side by side.
+
+- rsg_run launches the cells in slices of UFSM_RECTOSP_SLICE (32) cells per resident warp (~100 ms on the pod's P4 blocks; 0: one
+  launch); the ring upload / memset stream and the chunk workers' streams (nn_ctw_new_prio) at the device's greatest priority, k_rsp's
+  at the least, so between launches the helper's work goes first. The cells are independent: the same codes (test_recto_gpu, also with
+  UFSM_RECTOSP_SLICE=1; the A/B's sp / rsp shard files md5-equal).
+- Desk A/B (card 1 shared, desk load 50-70, 1667-u1 fields 4635 x 1568 x 1616, warm m7 cache, 8 threads; interleaved 0 / 32 / 0 / 32):
+  wall 99.0 / 83.0 / 106.1 / 105.4 s; waiting for the helper 29.3 / 25.9 / 37.0 / 32.3 s; kernel 18.7 / 20.4 / 16.8 / 19.6 s; chunks
+  on the GPU decoder 1465 / 11876 / 1161 / 13136 (of ~17.8k non-fill): the decoder's gathers no longer wait for the kernel. On the desk
+  the 1667 kernel is short (0.25 s a block) so the wall moves within the noise; the P4 case (5.4 s blocks) is the one it is for:
+  expected ~1521 -> ~850 s (the kernel's 813), not measured (needs a big-card pod: the 28 GB ring does not fit a 5060 Ti).
+- Open: the kernel's cost per cell, 1.27 us on P4 against 0.10 us on 1667 (pod), with similar source density (m7 nonzero 55-75 % vs
+  37-67 %), the same n (335 samples) and flags. Suspect the 28 GB ring against 5.5 GB (TLB / L2 reach of the trilinear gathers); a
+  ring-size experiment waits for a big-card pod.
+
 ## The stride-2 fp8 down conv: one block for every output channel plus a prenorm pass, 2.1x (2026-11-17, branch convks2-20261117)
 
 conv_fwd_s2_f8_k (the 96 / 128 / 160-wide nets' down convs: predict, and the training forward) was staging-bound.
@@ -355,8 +378,10 @@ content) and its file write before the next shard, and the main thread (ring of 
 - Same bytes: tests/test_z3w_pool.c (3 arrays: q 0, q 8, uint16; fill chunks, an all-fill shard over a stale object, a failing shard
   reported with its error, the others written); test_predict_heads (1b): every file of the q 0 heads' stores (shards 128 and 256, levels
   3, GPU pyramid) equal with UFSM_PRED_HPOOL=0 (diff -r); the bench's pooled stores md5-equal to the per-head writers'.
-- Not measured on the GPU (card 1 booked; desk CPU the training bottleneck): the ink predict wall at a quiet moment against
-  UFSM_PRED_HPOOL=0 (fp4teach's recipe, expected toward the 5 s of GPU).
+- On the GPU (fp4teach, master 442668dd, 0332 ink recipe 544 / 16, 32 tiles, q 0, 3 heads, --threads 20, interleaved x2, card 1
+  nearly quiet): the stores byte-identical; writer-wait 3.42 / 2.59 -> 0.31 / 0.09 s, but the main wall only 11.62 / 11.80 -> 10.66 /
+  11.01 s (-7 %): gpu(fwd+d2h) rose 7.73 / 8.62 -> 9.60 / 9.81 s, the pool's threads now overlapping the forward and competing with it
+  (CPU / PCIe). The reader is the next floor (read 6.7-7.5 s, slot-wait 2.3-2.9 s).
 
 ## Fit-derived pseudo labels: gated winding labels from our unrolls, the build on the pod (2026-11-17, branch pseudolab-20261117)
 
