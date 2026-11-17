@@ -23,7 +23,7 @@ int main(void) {
     uint8_t *ctd = nn_malloc(w3), *d0 = nn_malloc(sh3), *d1 = nn_malloc(sh3); void *lgd = nn_malloc(COUT * cv * 2), *lgd32 = nn_malloc(COUT * cv * 4), *xd = nn_malloc(w3 * 2), *pl = nn_malloc(2 * w3 * 2); float *pd = nn_malloc(NP * 4);
     nn_h2d(ctd, ct, w3); nn_h2d(lgd, lg, COUT * cv * 2); nn_h2d(lgd32, lgf, COUT * cv * 4); nn_h2d(pd, pf, NP * 4);
     nn_lat_ct_x(ctd, WW, 0, WW, mean, isd, xd);
-    uint8_t *h0 = malloc(sh3), *h1 = malloc(sh3);
+    uint8_t *h0 = malloc(sh3), *h1 = malloc(sh3), *comp[2][3] = {{nullptr}};   /* comp: the composition's bytes per head with the stem */
     static const struct { const char *name; int c0, c1, sb0, sb1, s0, s1; } T[3] = {{"rv 11+12", 11, 12, -1, -1, 4, 5}, {"phase 0", 0, -1, 16, -1, 0, -1}, {"plain 3", 3, -1, -1, -1, -1, -1}};
     const int oz = 20, oy = -10, ox = 3;   /* window voxel v -> shard voxel o + v */
     for (int l32 = 0; l32 < 2; l32++) for (int st = 0; st < 2; st++) for (int t = 0; t < 3; t++) {   /* (l32: the cell logits in fp32, the same values) */
@@ -46,26 +46,44 @@ int main(void) {
         nn_lat_head_place(L, lh, CW, CW, CW, T[t].c0, T[t].c1, T[t].sb0, T[t].sb1, T[t].s0, T[t].s1, st ? pd : nullptr, C, NO, ctd, mean, isd, iso,
                           HALO, HALO, oz, oy, ox, SH, SH, SH, SH, d1);
         nn_sync(); nn_d2h(h0, d0, sh3); nn_d2h(h1, d1, sh3);
+        if (st) { comp[l32][t] = malloc(sh3); memcpy(comp[l32][t], h0, sh3); }
         size_t nd = 0, n2 = 0, nset = 0; for (size_t i = 0; i < sh3; i++) { const int e = abs((int)h0[i] - (int)h1[i]); nd += e != 0; n2 += e > 1; nset += h0[i] != 0; }
         const int bad = n2 > 0 || nd > sh3 / 1000 || nset < sh3 / 16;
         printf("%s %-9s logits %s stem %d: %zu of %zu bytes differ (%zu by more than 1), %zu set%s\n", bad ? "FAIL" : "ok  ", T[t].name, l32 ? "fp32" : "fp16", st, nd, sh3, n2, nset, bad ? "  <--" : "");
         fails += bad;
     }
-    /* nn_lat_heads_place (the three heads at once, the stem shared) against one nn_lat_head_place per head: byte-identical */
-    for (int l32 = 0; l32 < 2; l32++) {
+    /* nn_lat_heads_place (the three heads at once, the stem shared): lat_heads_k against one nn_lat_head_place per head, byte-identical;
+       lat_heads_tc_k (the tensor-core stem) against the composition, byte-identical, and against lat_heads_k: at most 0.1 % of the bytes, by 1 */
+    for (int l32 = 0; l32 < 2; l32++) for (int tc = 0; tc < 2; tc++) {
         const void *L = l32 ? lgd32 : lgd; const int lh = !l32;
-        int c0[3], c1[3], sb0[3], sb1[3], s0[3], s1[3]; uint8_t *ds[3];
-        for (int t = 0; t < 3; t++) { c0[t] = T[t].c0; c1[t] = T[t].c1; sb0[t] = T[t].sb0; sb1[t] = T[t].sb1; s0[t] = T[t].s0; s1[t] = T[t].s1; ds[t] = nn_malloc(sh3); nn_zero(ds[t], sh3); }
+        int c0[3], c1[3], sb0[3], sb1[3], s0[3], s1[3]; uint8_t *ds[3], *dt[3];
+        for (int t = 0; t < 3; t++) { c0[t] = T[t].c0; c1[t] = T[t].c1; sb0[t] = T[t].sb0; sb1[t] = T[t].sb1; s0[t] = T[t].s0; s1[t] = T[t].s1; ds[t] = nn_malloc(sh3); nn_zero(ds[t], sh3); dt[t] = nn_malloc(sh3); nn_zero(dt[t], sh3); }
+        nn_set_lat_heads_tc(tc);
         nn_lat_heads_place(L, lh, CW, CW, CW, 3, c0, c1, sb0, sb1, s0, s1, ds, pd, C, NO, ctd, mean, isd, iso, HALO, HALO, oz, oy, ox, SH, SH, SH, SH);
-        size_t nd = 0;
+        nn_set_lat_heads_tc(!tc);
+        nn_lat_heads_place(L, lh, CW, CW, CW, 3, c0, c1, sb0, sb1, s0, s1, dt, pd, C, NO, ctd, mean, isd, iso, HALO, HALO, oz, oy, ox, SH, SH, SH, SH);
+        nn_set_lat_heads_tc(1);
+        size_t nd = 0, nx = 0, x2 = 0;
         for (int t = 0; t < 3; t++) {
-            nn_zero(d1, sh3);
-            nn_lat_head_place(L, lh, CW, CW, CW, T[t].c0, T[t].c1, T[t].sb0, T[t].sb1, T[t].s0, T[t].s1, pd, C, NO, ctd, mean, isd, iso, HALO, HALO, oz, oy, ox, SH, SH, SH, SH, d1);
-            nn_sync(); nn_d2h(h0, ds[t], sh3); nn_d2h(h1, d1, sh3);
-            for (size_t i = 0; i < sh3; i++) nd += h0[i] != h1[i];
-            nn_free(ds[t]);
+            nn_sync(); nn_d2h(h0, ds[t], sh3);
+            if (tc) { for (size_t i = 0; i < sh3; i++) nd += h0[i] != comp[l32][t][i]; }
+            else {
+                nn_zero(d1, sh3);
+                nn_lat_head_place(L, lh, CW, CW, CW, T[t].c0, T[t].c1, T[t].sb0, T[t].sb1, T[t].s0, T[t].s1, pd, C, NO, ctd, mean, isd, iso, HALO, HALO, oz, oy, ox, SH, SH, SH, SH, d1);
+                nn_sync(); nn_d2h(h1, d1, sh3);
+                for (size_t i = 0; i < sh3; i++) nd += h0[i] != h1[i];
+                nn_d2h(h1, dt[t], sh3);   /* (lat_heads_tc_k) */
+                for (size_t i = 0; i < sh3; i++) { const int e = abs((int)h0[i] - (int)h1[i]); nx += e != 0; x2 += e > 1; }
+            }
+            nn_free(ds[t]); nn_free(dt[t]);
         }
-        printf("%s all three heads at once, logits %s: %zu bytes differ from one head at a time\n", nd ? "FAIL" : "ok  ", l32 ? "fp32" : "fp16", nd);
+        if (tc) printf("%s lat_heads_tc_k, logits %s: %zu bytes differ from the composition\n", nd ? "FAIL" : "ok  ", l32 ? "fp32" : "fp16", nd);
+        else {
+            printf("%s lat_heads_k, logits %s: %zu bytes differ from one head at a time\n", nd ? "FAIL" : "ok  ", l32 ? "fp32" : "fp16", nd);
+            const int bad = x2 > 0 || nx > 3 * sh3 / 1000;
+            printf("%s lat_heads_tc_k vs lat_heads_k, logits %s: %zu of %zu bytes differ (%zu by more than 1)\n", bad ? "FAIL" : "ok  ", l32 ? "fp32" : "fp16", nx, 3 * sh3, x2);
+            fails += bad;
+        }
         fails += nd != 0;
     }
     printf("%s\n", fails ? "FAIL" : "test_lathead: ok");

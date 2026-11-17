@@ -278,6 +278,167 @@ __global__ void __launch_bounds__(LHS_BT) lat_heads_k(const T *lg, const uint8_t
         }
     }
 }
+/* lat_heads_tc_k (UFSM_LATHEADS_TC, default 1; 0: lat_heads_k): the same heads with the stem on the tensor cores and 4 threads a cell.
+   lat_heads_k was latency-bound: one thread per cell at 255 registers left 8 % of the warps active (ncu, 0332 ink window: 41.0 ms, 15.0 of
+   them the stem). Here a block takes a row of LT_NC cells (cz, cy, cx0 ..) and
+   - stages the CT taps of its 4 x 64 stem blocks (z 4 cz - 1 .. + 4, y 4 cy - 1 .. + 4, x 4 cx0 - 1 ..; z-scored and rounded to fp16 as
+     nn_lat_ct_x stores them) once in shared memory,
+   - forms pre [16 c][8 blocks] per n-tile with mma m16n8k16 exactly as fstem_fwd_k (the same scaled fp16 W1 fragments, k-steps and B pairs,
+     so the same pre and h = silu(pre / scale + b1) bits as the slab composition's nn_fstem_fwd), h into shared memory,
+   - then thread (cell lane, warp rz) does the cell's z-quarter rz: its 16 voxels per head, lat_heads_k's arithmetic (the projection
+     W2 . h c ascending as fstem's, the fp16 adds, the rv fusion, the byte).
+   Its bytes equal the composition's (test_lathead); lat_heads_k's fp32 stem sums differ from them in the last fp16 bit, rarely a byte. */
+enum { LT_NC = 32, LT_BT = 128, LT_RWP = 4 * LT_NC + 8, LT_NB = 8 * LT_NC };
+template <typename T, int RZ>
+__device__ __forceinline__ void lt_quarter(const T *lg, const uint8_t *ct, const lh_args &A, const lhs_heads &HS, const float (*hs)[LH_MAXC + 1], const float *W2s,
+                                           int cz, int cy, int cx, int lane) {
+    const int d = A.d, h = A.h, w = A.w, H = 4 * h, W = 4 * w, C = A.C;
+    const int z = 4 * cz + RZ;
+    if (z < A.z0 || z >= A.z1) return;
+    const int iz[3] = {max(cz - 1, 0), cz, min(cz + 1, d - 1)}, iy[3] = {max(cy - 1, 0), cy, min(cy + 1, h - 1)}, ix[3] = {max(cx - 1, 0), cx, min(cx + 1, w - 1)};
+    const size_t cv = (size_t)d * h * w, cell = ((size_t)cz * h + cy) * w + cx;
+    for (int j = 0; j < HS.n; j++) {
+        const int np = HS.c1[j] >= 0 ? 2 : 1, ch[2] = {HS.c0[j], HS.c1[j]}, sr[2] = {C ? HS.s0[j] : -1, C ? HS.s1[j] : -1};
+        float p[2][3][3];
+#pragma unroll
+        for (int c = 0; c < 2; c++) {
+            if (c >= np) break;
+#pragma unroll
+            for (int b = 0; b < 3; b++)
+#pragma unroll
+                for (int e = 0; e < 3; e++) {
+                    float v[3];
+#pragma unroll
+                    for (int a = 0; a < 3; a++) v[a] = ldv(lg, (size_t)ch[c] * cv + ((size_t)iz[a] * h + iy[b]) * w + ix[e]);
+                    p[c][b][e] = LH_LW[RZ][0] * v[0] + LH_LW[RZ][1] * v[1] + LH_LW[RZ][2] * v[2];
+                }
+        }
+        float st[2][2][2];   /* the stem term of blocks (bz 2 cz + RZ / 2, by 2 cy + b, bx 2 cx + e) */
+#pragma unroll
+        for (int c = 0; c < 2; c++)
+#pragma unroll
+            for (int b = 0; b < 2; b++)
+#pragma unroll
+                for (int e = 0; e < 2; e++) {
+                    float s = 0.f;
+                    if (sr[c] >= 0) {
+                        const float *w2 = W2s + sr[c] * C, *hk = hs[(2 * (RZ >> 1) + b) * 2 * LT_NC + 2 * lane + e];
+                        for (int q = 0; q < C; q++) s += w2[q] * hk[q];
+                    }
+                    st[c][b][e] = s;
+                }
+        const T *sub[2] = {HS.sb0[j] >= 0 ? lg + (size_t)HS.sb0[j] * cv + cell : nullptr, HS.sb1[j] >= 0 ? lg + (size_t)HS.sb1[j] * cv + cell : nullptr};
+        uint8_t *dsh = HS.dsh[j];
+#pragma unroll
+        for (int ry = 0; ry < 4; ry++) {
+            const int y = 4 * cy + ry;
+            if (y < A.y0 || y >= A.y1) continue;
+            float q[2][3];
+#pragma unroll
+            for (int c = 0; c < 2; c++)
+#pragma unroll
+                for (int e = 0; e < 3; e++) q[c][e] = LH_LW[ry][0] * p[c][0][e] + LH_LW[ry][1] * p[c][1][e] + LH_LW[ry][2] * p[c][2][e];
+            const size_t kr = ((size_t)z * H + y) * W, gr = ((size_t)(A.oz + z) * A.shard + (A.oy + y)) * A.shard + A.ox;
+#pragma unroll
+            for (int rx = 0; rx < 4; rx++) {
+                const int x = 4 * cx + rx;
+                if (x < A.x0 || x >= A.x1) continue;
+                uint8_t o = 0;
+                if (ct[kr + x] >= A.iso) {
+                    const int s = 16 * RZ + 4 * ry + rx;
+                    float l[2];
+#pragma unroll
+                    for (int c = 0; c < 2; c++) {
+                        if (c >= np) break;
+                        float a = lh_h(LH_LW[rx][0] * q[c][0] + LH_LW[rx][1] * q[c][1] + LH_LW[rx][2] * q[c][2]);
+                        if (sub[c]) a = lh_h(a + ldv(sub[c], (size_t)s * cv));
+                        if (sr[c] >= 0) a = lh_h(a + st[c][ry >> 1][rx >> 1]);
+                        l[c] = a;
+                    }
+                    float lo = l[0];
+                    if (np == 2) {
+                        const float pr = 1.f / (1.f + __expf(-l[0])), pv = 1.f / (1.f + __expf(-l[1]));
+                        float f = (1.f + 254.f * (0.5f + 0.5f * (pr - pv))) / 255.f; f = fminf(fmaxf(f, 1.5f / 255.f), 1.f - 1e-4f);
+                        lo = lh_h(__logf(f / (1.f - f)));
+                    }
+                    o = (uint8_t)(255.f / (1.f + __expf(-lo)) + 0.5f);
+                }
+                dsh[gr + x] = o;
+            }
+        }
+    }
+}
+#ifndef LT_MINB
+#define LT_MINB 5
+#endif
+template <typename T>
+__global__ void __launch_bounds__(LT_BT, LT_MINB) lat_heads_tc_k(const T *lg, const uint8_t *ct, const float *sp_g, lh_args A, lhs_heads HS) {
+    /* the tap rows and then, over them, h: 18 KB instead of 28 (5 blocks an SM instead of 3) */
+    __shared__ __align__(16) float shm[LT_NB * (LH_MAXC + 1)];
+    __half (*sx)[LT_RWP] = (__half (*)[LT_RWP])shm;                  /* [6 z][6 y] tap rows */
+    float (*hs)[LH_MAXC + 1] = (float (*)[LH_MAXC + 1])shm;           /* h of block (2 a + b) 2 LT_NC + jb: bz 2 cz + a, by 2 cy + b, bx 2 cx0 + jb */
+    static_assert(36 * LT_RWP * 2 <= LT_NB * (LH_MAXC + 1) * 4, "lat_heads_tc_k: the tap rows fit under h");
+    __shared__ float b1[LH_MAXC], W2s[LH_MAXO * LH_MAXC], rsc[LH_MAXC], rinv[LH_MAXC];
+    const int C = A.C, nout = A.nout, tid = threadIdx.x, lane = tid & 31, wp = tid >> 5, g = lane >> 2, tq = lane & 3;
+    const int H = 4 * A.h, W = 4 * A.w, D = 4 * A.d;
+    const int c0z = A.z0 >> 2, c0y = A.y0 >> 2, c0x = A.x0 >> 2, ncy = ((A.y1 + 3) >> 2) - c0y, ncx = ((A.x1 + 3) >> 2) - c0x, nxt = (ncx + LT_NC - 1) / LT_NC;
+    const int xt = (int)(blockIdx.x % nxt), row = (int)(blockIdx.x / nxt), cy = c0y + row % ncy, cz = c0z + row / ncy, cx0 = c0x + xt * LT_NC, nj = min(LT_NC, c0x + ncx - cx0);
+    if (C) {
+        for (int k = tid; k < C; k += LT_BT) b1[k] = sp_g[C * 64 + k];
+        for (int k = tid; k < nout * C; k += LT_BT) W2s[k] = sp_g[C * 64 + C + k];
+        if (tid < LH_MAXC) { const int e = tid < C ? fs_w1_exp(sp_g + tid * 64, A.ws) : 0; rsc[tid] = ldexpf(1.f, e); rinv[tid] = ldexpf(1.f, -e); }
+        const int rl = 4 * nj + 2; const size_t hw = (size_t)H * W;
+        for (int k = tid; k < 36 * rl; k += LT_BT) {
+            const int r = k / rl, xq = k % rl, z = 4 * cz - 1 + r / 6, y = 4 * cy - 1 + r % 6, x = 4 * cx0 - 1 + xq;
+            sx[r][xq] = z >= 0 && z < D && y >= 0 && y < H && x >= 0 && x < W ? __float2half_rn(((float)ct[(size_t)z * hw + (size_t)y * W + x] - A.mean) * A.isd) : __float2half(0.f);
+        }
+        __syncthreads();
+        unsigned af[4][4];   /* (fstem_fwd_k's W1 fragments) */
+#pragma unroll
+        for (int s_ = 0; s_ < 4; s_++)
+#pragma unroll
+            for (int r = 0; r < 4; r++) {
+                const int rw = g + (r & 1) * 8, col = 16 * s_ + 2 * tq + (r >> 1) * 8;
+                const float w0 = rw < C ? sp_g[rw * 64 + col] * rsc[rw] : 0.f, w1 = rw < C ? sp_g[rw * 64 + col + 1] * rsc[rw] : 0.f;
+                const __half2 h2 = __floats2half2_rn(w0, w1); af[s_][r] = *(const unsigned *)&h2;
+            }
+        constexpr int NTW = LT_NB / 8 / (LT_BT / 32);   /* n-tiles a warp */
+        float c4s[NTW][4];
+#pragma unroll
+        for (int i = 0; i < NTW; i++) {   /* n-tile nt: 8 blocks jb0 .. of block row ab */
+            const int nt = wp + i * (LT_BT / 32), ab = nt / (2 * LT_NC / 8), a = ab >> 1, b = ab & 1, jb0 = (nt % (2 * LT_NC / 8)) * 8;
+            float *c4 = c4s[i]; c4[0] = c4[1] = c4[2] = c4[3] = 0.f;
+            if (jb0 >= 2 * nj) continue;   /* warp-uniform */
+            const int jb = min(jb0 + g, 2 * nj - 1);   /* (a tail tile repeats its last block) */
+#pragma unroll
+            for (int s_ = 0; s_ < 4; s_++) {   /* taps 16 s_ ..: z row s_ of the block, y rows tq / 2 (+ 2) */
+                unsigned bf[2];
+                bf[0] = *(const unsigned *)&sx[(2 * a + s_) * 6 + 2 * b + tq / 2][2 * jb + 2 * (tq & 1)];
+                bf[1] = *(const unsigned *)&sx[(2 * a + s_) * 6 + 2 * b + 2 + tq / 2][2 * jb + 2 * (tq & 1)];
+                mma16816<f16>(c4, af[s_], bf);
+            }
+        }
+        __syncthreads();   /* the tap rows are read: h goes over them */
+#pragma unroll
+        for (int i = 0; i < NTW; i++) {
+            const int nt = wp + i * (LT_BT / 32), ab = nt / (2 * LT_NC / 8), jb0 = (nt % (2 * LT_NC / 8)) * 8;
+            if (jb0 >= 2 * nj) continue;
+#pragma unroll
+            for (int r = 0; r < 4; r++) { const int c = g + (r >> 1) * 8, bk = jb0 + 2 * tq + (r & 1); if (c < C) { const float v = c4s[i][r] * rinv[c] + b1[c]; hs[ab * 2 * LT_NC + bk][c] = v / (1.f + __expf(-v)); } }   /* (fs_silu) */
+        }
+        __syncthreads();
+    }
+    if (lane >= nj) return;
+    const int cx = cx0 + lane;
+    switch (wp) {
+    case 0: lt_quarter<T, 0>(lg, ct, A, HS, hs, W2s, cz, cy, cx, lane); break;
+    case 1: lt_quarter<T, 1>(lg, ct, A, HS, hs, W2s, cz, cy, cx, lane); break;
+    case 2: lt_quarter<T, 2>(lg, ct, A, HS, hs, W2s, cz, cy, cx, lane); break;
+    default: lt_quarter<T, 3>(lg, ct, A, HS, hs, W2s, cz, cy, cx, lane); break;
+    }
+}
+static int g_lh_tc = -1;   /* mgpu: env */
+extern "C" void nn_set_lat_heads_tc(int on) { g_lh_tc = on; }   /* (tests: lat_heads_k with 0) */
 extern "C" void nn_lat_heads_place(const void *lg, int lh16, int d, int h, int w, int nh, const int *c0, const int *c1, const int *sb0, const int *sb1, const int *s0, const int *s1,
                                    uint8_t *const *dsh, const float *stem, int C, int nout, const uint8_t *ct, float mean, float isd, int iso,
                                    int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard) {
@@ -293,7 +454,12 @@ extern "C" void nn_lat_heads_place(const void *lg, int lh16, int d, int h, int w
         HS.c0[j] = c0[j]; HS.c1[j] = c1[j]; HS.sb0[j] = sb0[j]; HS.sb1[j] = sb1[j]; HS.s0[j] = s0[j]; HS.s1[j] = s1[j]; HS.dsh[j] = dsh[j];
     }
     const size_t n = (size_t)(((A.z1 + 3) >> 2) - (A.z0 >> 2)) * (((A.y1 + 3) >> 2) - (A.y0 >> 2)) * (((A.x1 + 3) >> 2) - (A.x0 >> 2));
-    if (lh16) lat_heads_k<f16><<<nblk(n, LHS_BT), LHS_BT>>>((const f16 *)lg, ct, stem, A, HS);
+    if (g_lh_tc < 0) { const char *e = getenv("UFSM_LATHEADS_TC"); g_lh_tc = !(e && *e == '0'); }
+    if (g_lh_tc) {
+        const size_t nb = (size_t)(((A.z1 + 3) >> 2) - (A.z0 >> 2)) * (((A.y1 + 3) >> 2) - (A.y0 >> 2)) * (((((A.x1 + 3) >> 2) - (A.x0 >> 2)) + LT_NC - 1) / LT_NC);
+        if (lh16) lat_heads_tc_k<f16><<<(unsigned)nb, LT_BT>>>((const f16 *)lg, ct, stem, A, HS);
+        else lat_heads_tc_k<float><<<(unsigned)nb, LT_BT>>>((const float *)lg, ct, stem, A, HS);
+    } else if (lh16) lat_heads_k<f16><<<nblk(n, LHS_BT), LHS_BT>>>((const f16 *)lg, ct, stem, A, HS);
     else lat_heads_k<float><<<nblk(n, LHS_BT), LHS_BT>>>((const float *)lg, ct, stem, A, HS);
     KCHECK();
 }
