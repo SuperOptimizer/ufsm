@@ -6,6 +6,41 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Predict forward: where the GPU time goes; the fit-field head per z chunk (1152 / 64 fields windows on a 16 GB card) (2026-11-17, branch predfwd-20261117)
+
+Profile on a quiet card 1 (0332 level 2, CT from a local cache, 32 windows; `UFSM_PRED_PROF`, `UFSM_PTICK`, nsys per-(kernel, grid, block)
+minima x count, /vesuvius/ufsm/predfwd/win.sh):
+
+| recipe | wall | GPU (fwd + d2h) | other | kernel min-sum / window | top kernels / window |
+|---|---|---|---|---|---|
+| ink (inkpod 15000, 544 / 16, heads ink c12 c13, q 0) | 8.55 s | 4.99 s | writer-wait 3.17 s | 128 ms | conv_fwd_f4_k 52.5, lat_heads_k 37.7, conv1_mx_t_k 14.6, conv_fwd_s2_f8_k 11.8 |
+| fields (u1 13000, 640 / 64, --fit-zarr, fit-h 2) | 9.3 s | 9.02 s | | 175 ms | fstem_fwd_k 55.8, conv_fwd_f4_k 28.3, conv1_mx_t_k 23.4, lat_up4_k 17.7, conv_fwd_s2_f8_k 17.4 |
+
+- Ink on a quiet card is bound by its writers, not the GPU: three single-thread q 0 head writers, 20.5 thread-seconds for 96 shards
+  (~6.8 s each against 5 s of GPU). The earlier "GPU-bound, 11 of 12.7 s" was a shared card. More writer threads per head: ~-38 % wall
+  (unrollperf's codec / writer area).
+- Fields per window (ptick, 284 ms): trunk 134, the fit path 127 (winding mod 4 46, fine stem 26, upsample + shuffle 23, before the chunk 23).
+  fstem_fwd_k is trainperf's kernel (also the training head); predict reuses its fix.
+- Halo overhead: fields 640 / 64 compute (640 / 512)^3 = 1.95 voxels per kept voxel, 1152 / 64 1.42; ink 544 / 16 1.20, and its two grids
+  double that (the latink A/B decides the second grid).
+
+**1152 fields windows did not fit a 16 GB card** (`cudaMalloc of 13.76 GB`, unet.c build_acts): the whole window's fp32 cell logits,
+288^3 cells x 144 outputs x 4 B, which the fit path reads per z chunk anyway; the activations at 1152 are ~3.3 GB. Change: with --fit-zarr's
+plane path (fzs, not the fused fit-h 8 kernel) the build holds no logits (`unet_set_head_infer_z`) and the 1^3 head runs per chunk
+(`unet_head_fwd_z32`) on the cell planes the chunk reads (its planes, the winding pair's +-d, +-1 cell of upsampling taps) into a held-plane
+buffer that the `_c` upsample / shuffle kernels read (q0 / qd). Two buffers: the overlap with the previous chunk is one pitched copy, the new
+planes are written in place (`conv1_mx_t_k` plane stride Ly), so each cell plane's head runs once. The head is the same kernel instantiation
+with a voxel range: bit-identical (test_headz: couts 32 / 11 / 144, ranges incl. into a wider plane stride; 0332 640 / 64 fields zarr
+byte-identical, diff -r). Cost at 640 (nsys minima): kernels 171.6 + copies 35.1 ms per window vs 176.6 + 31.3 with the whole-window head
+(the first version's 144 per-channel copies per chunk cost +31 ms a window). 1152 / 64 now runs on the 16 GB card, 7.2 GB free after the
+first window; GPU 9.23 s for the 1024 x 2048^2 box (4 windows) vs 10.81 s at 640 (32 windows), one other app on the card: about -15 %
+(the trunk's 27 % fewer computed voxels, the fit path unchanged). Host RSS 14.6 GB at 1152 (16 pinned shard buffers). UFSM_PRED_HEADZ=0:
+the whole-window logits.
+
+Also measured (convk's conv_fwd_f4v_k, branch convk-20261117 71ef14b2, UFSM_F4V on by default there): byte-identical predict outputs, but
+kernel minima per window fields 178.0 -> 187.8 ms (+5.5 %), ink 128.0 -> 144.0 (+12.5 %); sent to convk before its merge.
+Ink teachers on the same quiet window: see the 2026-11-16 section (ink9um 1667 segment fp16 old 163.7 s, fused 127.9, MX5 100.9, pick 116.0).
+
 ## Argus V2 (ruiconte): a Reader V3 fine-tune, runs in our reader3 port; ties reader3, adds nothing to the teacher combo (2026-11-17)
 
 Argus V2 (https://huggingface.co/ruiconte/argus-v2 @ a769fe54, `argus-v2.pth`, sha256 659130f7...de6fd matches the card, MIT,
