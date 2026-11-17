@@ -6,6 +6,21 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## latink at q 4 by default: the held-out ink AUC unchanged, the ink stage -23 % (2026-11-17, branch rectosp-20261117)
+
+latink.sh's LATINKQ (volcomp q of the grid passes, from the GPU's levels, and of the blends) defaults to 4 (was 0, lossless; 0 stays the
+switch). Check on PHerc1667 (podun's try9-6250 unroll, inkpod-15000), the band z 3328 + 512 (9.6 um; holdout box C2, part of C6), card 1
+shared, both arms the same binary: the raw ink rendered on all 44 wraps (inksdk/up), /vesuvius/ufsm/argus/pairwrap.py on the same
+held-out samples (207947 within 40 um with both maps valid, ink 0.236):
+
+| arm | ink AUC | vs q 0 (paired CI) | ink stage wall | CPU s | stores ink / c12 / c13 |
+|---|---|---|---|---|---|
+| q 0 | 0.6572 | | 117.8 s | 645 | 1.3 / 1.7 / 1.5 GB |
+| q 4 | 0.6574 | +0.0002 (-0.0006 .. +0.0010) | 90.6 s | 358 | 0.06 / 0.29 / 0.21 GB |
+
+Renders: mean |diff| 1.2-1.5 of 255, p99 6, max 26-36 (w030-w050); side by side (w035) no visible difference. The c12 / c13 gates are
+lossier (podunroll's 1024^3 box: mean |diff| c12 3.0) and were not scored separately here (they only gate the strip's ink).
+
 ## recto-sp: the profile kernel in short launches, the helper's streams first (PHerc Paris 4's 1532 s; same codes; 2026-11-17, branch rectosp-20261117)
 
 Paris 4 on the pod (RTX PRO 6000, try9-6250 unroll): recto-sp 1521 s, 25.5k CPU s, against 0332 83 s and 1667 103 s. Its box is 8x 1667's

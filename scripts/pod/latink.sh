@@ -9,7 +9,9 @@
 # LATINK_BOX=z,y,x,nz,ny,nx (CT level voxels, origins on the 512 grid): ink only over that box, not the run's (Paris 4 on a 200 GB pod: the
 # whole box's three lossless heads are ~0.4 TB, 0332's 51 GB; the desk's P4 u1 ink was the band z 8192 + 2560 too). The renders show
 # ink inside it only.
-# LATINKQ (default 0 = lossless): volcomp q of the grid passes and the blends. 1667 1024^3 box, three heads (podunroll 11-17): q 0 1145 MB,
+# LATINKQ (default 4 since 2026-11-17; 0 = lossless): volcomp q of the grid passes and the blends (q > 0: encoded from the GPU's levels).
+# q 4 vs q 0 on 1667 (band z 3328 + 512, 44 wraps, pairwrap on 207947 held-out samples): ink AUC 0.6574 vs 0.6572 (+0.0002, CI -0.0006..
+# +0.0010), renders mean |diff| 1.2-1.5 of 255 (p99 6), ink stage 118 -> 91 s wall, 645 -> 358 CPU s, stores 4.5 GB -> 0.57 GB. 1667 1024^3 box, three heads (podunroll 11-17): q 0 1145 MB,
 # q 4 147 MB (ink 21x; mean |diff| ink 1.41 / c12 3.02 of 255, 82 flips across 128 of 1.07 G voxels), q 8 81 MB (1.84 / 4.37),
 # q 32 23 MB (3.04 / 7.96, 1.9 M flips: too lossy)
 # Env: LATINK_CK (default /root/pod/ckpt/inkpod-15000.ckpt, the newest inkpod snap), ITH (threads).
@@ -34,14 +36,14 @@ for g in 0 256; do
   [ -e $T/g$g.done ] && continue; rm -rf $T/g$g
   # (--q 0 --levels 1: the passes are blended into OUT by ink-blend, which reads level 0 only; their own pyramid / quantisation was thrown away)
   $U predict $CK $R $K $T/g$g --um $UM --level $LV --box $(pbox $g) --full-grid 1 --occupancy $((LV + 3)) --heads ink,c12,c13 --gpu $G --threads $TH --shard $([ $g = 256 ] && echo 256 || echo 512) \
-    --window 544 --halo 16 $([ "${LATWROUND:-0}" = 1 ] && echo --window-round 1) --grid-origin $g,$g,$g --axis $O/axis.json --q ${LATINKQ:-0} --levels 1 || { echo "latink: predict grid $g failed"; exit 1; }
+    --window 544 --halo 16 $([ "${LATWROUND:-0}" = 1 ] && echo --window-round 1) --grid-origin $g,$g,$g --axis $O/axis.json --q ${LATINKQ:-4} --levels 1 || { echo "latink: predict grid $g failed"; exit 1; }
   for h in ink c12 c13; do [ -e $T/g$g/$h/zarr.json ] || { echo "latink: no $h in $T/g$g"; exit 1; }; done
   touch $T/g$g.done
 done
 # the three heads' blends at once (independent outputs, the same bytes): one at a time they were 3 x ~125 s + 35 s of pyramid on 0332
 # (2026-11-17), ~45 % of the ink stage, the GPU idle; each blend's shard loop is read -> blend -> encode in turn, so they overlap well
 bl() { local h=$1 d=$OUT; [ $h = ink ] || d=$O/ink/$h.zarr; rm -rf $d
-  $U ink-blend $d --um $LUM $([ "${LATINKQ:-0}" != 0 ] && echo --q $LATINKQ) --tile 512,512,512 --grids 0,0,0:256,256,256 $T/g0/$h $T/g256/$h --threads $TH > $T/blend.$h.log 2>&1 || { cat $T/blend.$h.log; echo "latink: ink-blend $h failed"; return 1; }
+  $U ink-blend $d --um $LUM $([ "${LATINKQ:-4}" != 0 ] && echo --q ${LATINKQ:-4}) --tile 512,512,512 --grids 0,0,0:256,256,256 $T/g0/$h $T/g256/$h --threads $TH > $T/blend.$h.log 2>&1 || { cat $T/blend.$h.log; echo "latink: ink-blend $h failed"; return 1; }
   cat $T/blend.$h.log; [ -e $d/zarr.json ] || { echo "latink: no blended $h at $d"; return 1; }; }
 bp=(); for h in ink c12 c13; do bl $h & bp+=($!); done
 rc=0; for p in "${bp[@]}"; do wait $p || rc=1; done; [ $rc = 0 ] || exit 1
