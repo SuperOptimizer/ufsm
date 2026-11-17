@@ -233,6 +233,8 @@ ufsm_exe(test_rc SUITE tests/test_rc.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_recompute_live SUITE tests/test_recompute_live.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_recto SUITE tests/test_recto.c OBJS rectoruler rectocls rectosp reg fit fit_emb embz z3w fit_ct l1pot coreline json zarr3
          zarr2 store NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_recto_gpu SUITE tests/test_recto_gpu.c OBJS rectoruler rectocls rectosp reg fit fit_emb embz z3w fit_ct l1pot coreline json zarr3
+         zarr2 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_reg SUITE tests/test_reg.c OBJS reg reg_init zarr3 zarr2 store json LIBS LDLIBS)
 ufsm_exe(test_reg_render SUITE tests/test_reg_render.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_regz2 SUITE tests/test_regz2.c OBJS reg zarr3 zarr2 store json LIBS LDLIBS)

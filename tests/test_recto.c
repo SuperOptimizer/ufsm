@@ -93,8 +93,8 @@ int main(void) {
     char *ac[] = {"ufsm", "recto-cls", "train", cls, dump, "--trees", "5", "--depth", "2"};
     CHECK(cmd_recto_cls(9, ac) == 0, "recto-cls train");
     CHECK(access(cls, F_OK) == 0, "classifier file");
-    char *as[] = {"ufsm", "recto-sp", fd, out, "--src", dir, "rv.zarr", "9.6", "--stride", "2", "--half-um", "300", "--threads", "4"};
-    CHECK(cmd_recto_sp(14, as) == 0, "recto-sp");
+    char *as[] = {"ufsm", "recto-sp", fd, out, "--src", dir, "rv.zarr", "9.6", "--stride", "2", "--half-um", "300", "--threads", "4", "--gpu", "-1"};   /* (the CPU path; test_recto_gpu: the GPU's) */
+    CHECK(cmd_recto_sp(16, as) == 0, "recto-sp");
     {   z3 *z = z3_open(store_open(out), "rsp", nullptr); CHECK(z != nullptr, "open rsp");
         if (z) { uint8_t *b = malloc(nc); const int64_t o[3] = {0, 0, 0}, n[3] = {D, HH, HH}; CHECK(!z3_read(z, o, n, b, 4), "read rsp");
             long long cnt = 0, mat = 0; double s = 0; for (size_t i = 0; i < nc; i++) { if (!a[9][i]) continue; mat++; if (b[i]) { cnt++; s += b[i]; } }

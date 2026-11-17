@@ -254,7 +254,7 @@ static int usage(void) {
         "  ufsm patch-id <wraps-dir> <out-dir> --axis F --axis-um U0 --dir +-1 --sheet ROOT KEY --grid-um U   sheet patches -> per-cell wrap id corrections (+ --gt check)\n"
         "  ufsm recto-ruler <model> <fields-dir> --codes ROOT KEY --src NAME ROOT KEY UM ...   recto predictions as a winding ruler vs GT (peaks per GT turn, interval dumps)\n"
         "  ufsm recto-cls train OUT DUMPS | eval MODEL DUMPS   interval classifier (turns between recto hits), boosted trees\n"
-        "  ufsm recto-sp IN-FIELDS OUT-FIELDS --src ROOT KEY UM [--blend 1]   fields with sp from recto hit spacing along the normal (count-field count target)\n"
+        "  ufsm recto-sp IN-FIELDS OUT-FIELDS --src ROOT KEY UM [--blend 1] [--gpu 0]   fields with sp from recto hit spacing along the normal (count-field count target)\n"
         "  ufsm geom-check <wraps-dir> --axis F --axis-um U [--out DIR]   wraps geometry QA: spacing, steep walls, jumps, merged / skipped neighbours, holes; guard limits\n"
         "  ufsm refine <wraps-in> <wraps-out> --fields DIR [--range 0.33] [--smooth-um 40]   vertices onto the fields' sheet phase\n"
         "  ufsm surf-stats <wraps-dir> --fields DIR [--ct ROOT KEY --ct-um U]   label-free surface quality (phase, switches, CT)\n"

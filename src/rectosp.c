@@ -1,5 +1,5 @@
 /* ufsm recto-sp IN-FIELDS OUT-FIELDS --src ROOT KEY UM [--rows R0,R1] [--stride 4] [--half-um 400] [--half2-um 0] [--prom 25] [--sigma 0.5] [--sep-um 20]
-                [--blend 1] [--gate 0.4,2.5] [--min-net-um 0] [--blend-ramp LO,HI,A0,A1] [--min-int 3] [--rsp-in DIR] [--threads N] [--cache DIR]
+                [--blend 1] [--gate 0.4,2.5] [--min-net-um 0] [--blend-ramp LO,HI,A0,A1] [--min-int 3] [--rsp-in DIR] [--threads N] [--cache DIR] [--gpu 0]
    Recto predictions as a count target for count-field: the sheet spacing sp of a fit-field set replaced by the spacing of recto hits
    along the field normal. Per field cell on a --stride grid (cells with material): the source profile along the principal axis of the
    cell's n n^T over +-half-um (trilinear, step half a source voxel), peaks as recto-ruler (rr_peaks: smoothing --sigma source voxels,
@@ -7,10 +7,14 @@
    (>= --min-int intervals; --half2-um U2 > half: the profile spans +-U2 and its intervals, >= 2, are used where +-half has too few) = one turn each (--cls MODEL: ufsm recto-cls turns per interval, spacing = their widths / turns) -> rsp (units of h / 8 native voxels, as sp; 0 none), written to the stride block.
    OUT gets sp = net^(1 - a) rsp^a (a = --blend; --blend-ramp LO,HI,A0,A1: a = A0 where the network spacing <= LO um, A1 >= HI, linear between) where rsp / net lies inside --gate, net sp elsewhere; rsp (the raw recto spacing); the
    other planes linked to IN's; fields.json copied. --rsp-in DIR: reuse DIR/rsp (only the blend runs). --rows R0,R1: box rows computed (the
-   others keep the net sp). The source is on the fields' scan (UM its voxel um; native = fields' um). Arrays: 512^3 shards, lossless. */
+   others keep the net sp). The source is on the fields' scan (UM its voxel um; native = fields' um). Arrays: 512^3 shards, lossless.
+   --gpu N (default 0; -1 the CPU): the profiles on device N (src/nn_rectosp.cu, the same codes byte for byte); the CPU path with --cls,
+   without a device, or when the device lacks the memory for the source ring. */
 #include "fit.h"
 #include "optcheck.h"
 #include "rectoruler.h"
+#define RSG_WEAK __attribute__((weak))
+#include "rectogpu.h"
 #include "sysinfo.h"
 #include "zarr3.h"
 #include "z3w.h"
@@ -152,6 +156,55 @@ static void rs_rows(void *ctx, int a0, int a1, int t) {
     free(v); free(tmp); free(mat); free(hp); free(spn); free(ph);
 }
 
+/* ---- the GPU path (src/nn_rectosp.cu; not with --cls): the CPU's row blocks, each block's profiles on the device ----
+   A helper thread runs one block ahead: the field rows (loaded in array-chunk-aligned spans of up to 128 rows, kept for the next block),
+   the block's cells (rs_rows' grid and material test) and the source slices the block adds to the device's z ring (decoded once: each
+   read ends on the source's chunk rows, the next block starts where it ended). The main thread uploads those slices, runs the kernel
+   and writes the codes into the shard row's rsp exactly as rs_rows does. */
+int g_rectosp_gpu_blocks;   /* row blocks the last recto-sp ran on the GPU (tests) */
+typedef struct { int sr, q0, q1, a0; int64_t so[3], sn[3], d0, d1; } rs_gblk;   /* shard row, rows, source box, ring slices to add */
+typedef struct {
+    const char *in; z3 *zs; int nt, H, W, S, shp0; long long org[3], zoff0;
+    const rs_gblk *bl; int k;   /* the block this job prepares */
+    fit_fields_buf fb; int f0, f1, fok;   /* the cached field rows [f0, f1) */
+    uint8_t *stg; size_t stgcap; int32_t *zyx, *blk; uint8_t *t6; int M, Mcap; int rc; char err[256];
+} rs_gprep;
+static void *rs_gprep_main(void *a) {
+    rs_gprep *R = a; const rs_gblk *B = &R->bl[R->k]; R->rc = 0; R->M = 0;
+    const int a0 = B->a0, a1 = B->q1, H = R->H, W = R->W, S = R->S;
+    if (!R->fok || a0 < R->f0 || a1 > R->f1) {   /* the field rows: from a0 to the array chunk row's end past a1 (the next block's rows) */
+        if (R->fok) { fit_fields_free(&R->fb); R->fok = 0; }
+        long long e = ((R->zoff0 + a1 + 127) / 128) * 128 - R->zoff0; if (e < a1) e = a1; if (e > R->shp0) e = R->shp0;
+        fit_fields_skip_planes(1 | 2 | 8); fit_fields_ct_planes(0);
+        if (fit_fields_load(R->in, a0, (int)e, 1, &R->fb)) { R->rc = 1; snprintf(R->err, sizeof R->err, "cannot load field rows %d..%lld", a0, e); return nullptr; }
+        R->f0 = a0; R->f1 = (int)e; R->fok = 1;
+    }
+    const fit_fields *f = &R->fb.f; const int nyb = (H + S - 1) / S, nzb = (a1 - a0 + S - 1) / S, nxb = (W + S - 1) / S;
+    const size_t cap = (size_t)nzb * nyb * nxb;
+    if ((int)cap > R->Mcap) { free(R->zyx); free(R->blk); free(R->t6); R->zyx = malloc(cap * 3 * sizeof(int32_t)); R->blk = malloc(cap * 3 * sizeof(int32_t)); R->t6 = malloc(cap * 6); R->Mcap = (int)cap;
+                              if (!R->zyx || !R->blk || !R->t6) { R->rc = 1; snprintf(R->err, sizeof R->err, "out of memory"); return nullptr; } }
+    int M = 0;
+    for (int zb = 0; zb < nzb; zb++) {   /* (rs_rows' cells: J->r0 = 0, J->nr = a1 - a0) */
+        const int z = zb * S + S / 2; if (z >= a1 - a0) continue;
+        for (int yb = 0; yb < nyb; yb++) { const int y = yb * S + S / 2, yy = y < H ? y : H - 1;
+            for (int xb = 0; xb < nxb; xb++) {
+                const int xx = xb * S + S / 2 < W ? xb * S + S / 2 : W - 1; const size_t ci = ((size_t)(a0 + z - R->f0) * H + yy) * W + xx;
+                if (!f->w[ci]) continue;
+                R->zyx[3 * M] = z; R->zyx[3 * M + 1] = yy; R->zyx[3 * M + 2] = xx; R->blk[3 * M] = zb; R->blk[3 * M + 1] = yb; R->blk[3 * M + 2] = xb;
+                for (int t = 0; t < 6; t++) R->t6[(size_t)M * 6 + t] = f->t[t][ci];
+                M++;
+            } }
+    }
+    R->M = M;
+    if (B->d1 > B->d0) {   /* the slices this block adds to the ring */
+        const size_t need = (size_t)(B->d1 - B->d0) * B->sn[1] * B->sn[2];
+        if (need > R->stgcap) { free(R->stg); R->stg = malloc(need); R->stgcap = R->stg ? need : 0; if (!R->stg) { R->rc = 1; snprintf(R->err, sizeof R->err, "out of memory"); return nullptr; } }
+        const int64_t o[3] = {B->d0, B->so[1], B->so[2]}, nn[3] = {B->d1 - B->d0, B->sn[1], B->sn[2]};
+        if (z3_read(R->zs, o, nn, R->stg, R->nt)) { R->rc = 1; snprintf(R->err, sizeof R->err, "%s", z3_error()); }
+    }
+    return nullptr;
+}
+
 static int rs_link(const char *in, const char *out, const char *name) {
     char a[2048], b[2048], r[4096]; snprintf(a, sizeof a, "%s/%s", in, name); snprintf(b, sizeof b, "%s/%s", out, name);
     if (access(a, F_OK)) return 0;
@@ -161,7 +214,7 @@ static int rs_link(const char *in, const char *out, const char *name) {
 
 int cmd_recto_sp(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: ufsm recto-sp IN-FIELDS OUT-FIELDS --src ROOT KEY UM [--rows R0,R1] [--stride 4] [--half-um 400] [--prom 25] [--sigma 0.5] [--sep-um 20]\n"
-                                    "       [--blend 1] [--gate 0.4,2.5] [--min-int 3] [--rsp-in DIR] [--threads N] [--cache DIR]\n"); return 2; }
+                                    "       [--blend 1] [--gate 0.4,2.5] [--min-int 3] [--rsp-in DIR] [--threads N] [--cache DIR] [--gpu 0 (-1 CPU)]\n"); return 2; }
     const char *in = argv[2], *out = argv[3]; const int nt = ufsm_threads(opt_atoi("--threads", rs_opt(argc, argv, "--threads", "0")), 16);
     fit_set_threads(nt);
     char path[4096]; snprintf(path, sizeof path, "%s/fields.json", in);
@@ -193,13 +246,78 @@ int cmd_recto_sp(int argc, char **argv) {
     z3w *wrs = nullptr; if (!zrin) { snprintf(path, sizeof path, "%s/rsp", out); if (!(wrs = z3w_create(path, ash, SH, 0, 0, attrs))) { fprintf(stderr, "recto-sp: %s\n", z3w_error()); return 1; } }
     const int H = shp[1], W = shp[2]; const double t0 = rs_now(); long long tc = 0, te = 0, nrep = 0, nmat = 0;
     uint8_t *shard = malloc((size_t)SH * SH * SH);
+    const double prom = opt_atof("--prom", rs_opt(argc, argv, "--prom", "25")), sigma = opt_atof("--sigma", rs_opt(argc, argv, "--sigma", "0.5")), sepum = opt_atof("--sep-um", rs_opt(argc, argv, "--sep-um", "20"));
+    const int minint = opt_atoi("--min-int", rs_opt(argc, argv, "--min-int", "3"));
+    /* --gpu N (default 0; -1 the CPU): the profiles on device N (not with --cls). The plan: every row block of the run (the CPU's blocks),
+       each one's source box and the ring slices it adds */
+    const int gdev = opt_atoi("--gpu", rs_opt(argc, argv, "--gpu", "0")); g_rectosp_gpu_blocks = 0;
+    rs_gblk *gbl = nullptr; int ngb = 0, gon = 0; rs_gprep GP[2] = {0}; pthread_t gth; int gpend = 0, gnext = 0; double gtk = 0, gtp = 0, gtu = 0, gtr = 0, gtn = 0, gtb = 0, gtw = 0;
+    if (zs && !cls && gdev >= 0 && rsg_open && rsg_free_mem(gdev) > 0) {
+        const double hm = fmax(half, half2) / um + 2; const int64_t *ssh = z3_meta_of(zs)->shape; const int cz = z3_meta_of(zs)->chunk[0] > 0 ? z3_meta_of(zs)->chunk[0] : 128;
+        int cap = 64; gbl = malloc(sizeof *gbl * cap); int64_t bz1 = -1, RZ = 0; int sr = 0;
+        for (int64_t gz0 = (zoff[0] / SH) * SH; gz0 < zoff[0] + shp[0]; gz0 += SH, sr++) {
+            const int b0 = (int)(gz0 - zoff[0] < 0 ? 0 : gz0 - zoff[0]), b1 = (int)(gz0 + SH - zoff[0] > shp[0] ? shp[0] : gz0 + SH - zoff[0]);
+            for (int c0 = b0; c0 < b1; c0 += 64) {
+                const int c1 = c0 + 64 < b1 ? c0 + 64 : b1; const int q0 = c0 > R0 ? c0 : R0, q1 = c1 < R1 ? c1 : R1;
+                if (q1 <= q0) continue;
+                if (ngb == cap) gbl = realloc(gbl, sizeof *gbl * (cap *= 2));
+                rs_gblk *B = &gbl[ngb++]; B->sr = sr; B->q0 = q0; B->q1 = q1; B->a0 = (q0 / S) * S;
+                rs_src R = {0}; rs_src_box(&R, org, h, B->a0, q1, hm, F, H, W, ssh); for (int d = 0; d < 3; d++) { B->so[d] = R.so[d]; B->sn[d] = R.sn[d]; }
+                const int64_t s0 = B->so[0], s1 = s0 + B->sn[0];
+                B->d0 = B->d1 = 0;
+                if (s1 > bz1) { B->d0 = s0 > bz1 ? s0 : bz1; B->d1 = (s1 + cz - 1) / cz * cz; if (B->d1 > ssh[0]) B->d1 = ssh[0]; if (B->d1 < s1) B->d1 = s1; bz1 = B->d1; }
+                if (bz1 - s0 > RZ) RZ = bz1 - s0;   /* (the ring holds [s0, bz1): nothing the block reads is overwritten) */
+            }
+        }
+        const size_t ny = ngb ? gbl[0].sn[1] : 0, nx = ngb ? gbl[0].sn[2] : 0, ring = (size_t)RZ * ny * nx, fr = rsg_free_mem(gdev);
+        const double st = 0.5 / F; const int n = 2 * (int)ceil(fmax(half, half2) / (st * um)) + 1;
+        const size_t scr = (size_t)200000 * (3 * n + 4) * 4;   /* (~ the scratch on a 36-SM card) */
+        if (!ngb) ;
+        else if (ring + scr + ((size_t)512 << 20) > fr) fprintf(stderr, "recto-sp: GPU %d: %.1f GB free, the source ring needs %.1f GB: the CPU path\n", gdev, fr / 1e9, ring / 1e9);
+        else if (rsg_open(gdev, RZ, (int64_t)ny, (int64_t)nx)) fprintf(stderr, "recto-sp: GPU %d unavailable: the CPU path\n", gdev);
+        else { gon = 1; fprintf(stderr, "recto-sp: GPU %d: %d row blocks, source ring %lld x %zu x %zu (%.1f GB)\n", gdev, ngb, (long long)RZ, ny, nx, ring / 1e9); }
+        if (!gon) { rsg_close(); free(gbl); gbl = nullptr; ngb = 0; }
+        for (int b = 0; b < 2; b++) GP[b] = (rs_gprep){.in = in, .zs = zs, .nt = nt, .H = H, .W = W, .S = S, .shp0 = shp[0], .org = {org[0], org[1], org[2]}, .zoff0 = zoff[0], .bl = gbl};
+        if (gon) { GP[0].k = 0; if (pthread_create(&gth, nullptr, rs_gprep_main, &GP[0])) rs_gprep_main(&GP[0]); else gpend = 1; }
+    }
+    int gsr = 0;
     /* shard rows of the array covering the box */
-    for (int64_t gz0 = (zoff[0] / SH) * SH; gz0 < zoff[0] + shp[0]; gz0 += SH) {
+    for (int64_t gz0 = (zoff[0] / SH) * SH; gz0 < zoff[0] + shp[0]; gz0 += SH, gsr++) {
         const int b0 = (int)(gz0 - zoff[0] < 0 ? 0 : gz0 - zoff[0]), b1 = (int)(gz0 + SH - zoff[0] > shp[0] ? shp[0] : gz0 + SH - zoff[0]);   /* box rows in this shard row */
         const int nr = b1 - b0; if (nr <= 0) continue;
         const size_t plane = (size_t)H * W; uint8_t *net = malloc(plane * nr), *rsp = calloc(plane * nr, 1);
-        { const int64_t o[3] = {zoff[0] + b0, zoff[1], zoff[2]}, nn[3] = {nr, H, W}; if (z3_read(zsp, o, nn, net, nt)) { fprintf(stderr, "recto-sp: %s\n", z3_error()); return 1; } }
+        { const double tn = rs_now(); const int64_t o[3] = {zoff[0] + b0, zoff[1], zoff[2]}, nn[3] = {nr, H, W}; if (z3_read(zsp, o, nn, net, nt)) { fprintf(stderr, "recto-sp: %s\n", z3_error()); return 1; } gtn += rs_now() - tn; }
         if (zrin) { const int64_t o[3] = {zoff[0] + b0, zoff[1], zoff[2]}, nn[3] = {nr, H, W}; if (z3_read(zrin, o, nn, rsp, nt)) { fprintf(stderr, "recto-sp: %s\n", z3_error()); return 1; } }
+        else if (gon) {   /* this shard row's blocks on the GPU */
+            for (; gnext < ngb && gbl[gnext].sr == gsr; gnext++) {
+                rs_gprep *cur = &GP[gnext & 1]; const rs_gblk *B = &gbl[gnext];
+                { const double tw = rs_now(); if (gpend) { pthread_join(gth, nullptr); gpend = 0; } gtp += rs_now() - tw; }
+                if (cur->rc) { fprintf(stderr, "recto-sp: block rows %d..%d: %s\n", B->q0, B->q1, cur->err); return 1; }
+                const double tk = rs_now();
+                if (B->d1 > B->d0 && rsg_put(B->d0, B->d1 - B->d0, cur->stg)) { fprintf(stderr, "recto-sp: GPU upload failed\n"); return 1; }
+                gtu += rs_now() - tk;
+                if (gnext + 1 < ngb) { rs_gprep *nx = &GP[(gnext + 1) & 1];   /* (the next block's fields are this one's cache when they hold its rows) */
+                    if (cur->fok) { if (nx->fok) fit_fields_free(&nx->fb); nx->fb = cur->fb; nx->f0 = cur->f0; nx->f1 = cur->f1; nx->fok = 1; cur->fok = 0; }
+                    nx->k = gnext + 1; if (pthread_create(&gth, nullptr, rs_gprep_main, nx)) rs_gprep_main(nx); else gpend = 1; }
+                const int a0 = B->a0, a1 = B->q1;
+                rsg_par P = {.h = h, .F = F, .st = 0.5 / F, .um = um, .prom = prom, .minint = minint, .half1 = half2 > half};
+                for (int d = 0; d < 3; d++) { P.so[d] = B->so[d]; P.sn[d] = B->sn[d]; }
+                P.org[0] = (double)(org[0] + (long long)a0 * h); P.org[1] = (double)org[1]; P.org[2] = (double)org[2];
+                const double hlf = fmax(half, half2); P.n = 2 * (int)ceil(hlf / (P.st * um)) + 1; P.c = P.n / 2;
+                P.inner = P.half1 ? half / (P.st * um) : 1e30; P.Wn = (int)lround(60 / (P.st * um)); P.sep = sepum / (P.st * um);
+                { const double sig = sigma * 2; const int R = sig > 0 ? (int)ceil(3 * sig) : 0; if (R > RSG_RMAX) { fprintf(stderr, "recto-sp: --sigma too wide for the GPU path (use --gpu -1)\n"); return 1; } P.R = rr_taps(sig, P.gk); }
+                uint8_t *q = malloc(cur->M ? cur->M : 1); long long na = 0, ne = 0;
+                { const double tr = rs_now(); if (rsg_run(&P, cur->M, cur->zyx, cur->t6, q, &na, &ne)) { fprintf(stderr, "recto-sp: GPU run failed\n"); return 1; } gtr += rs_now() - tr; }
+                for (int m = 0; m < cur->M; m++) {   /* rs_rows' writes, clipped to [q0, q1) */
+                    if (!q[m]) continue;
+                    const int zb = cur->blk[3 * m], yb = cur->blk[3 * m + 1], xb = cur->blk[3 * m + 2]; const size_t xl = (size_t)(xb * S + S <= W ? S : W - xb * S);
+                    for (int a = zb * S; a < zb * S + S && a < a1 - a0; a++) { const int r = a0 + a; if (r < B->q0 || r >= B->q1) continue;
+                        for (int b = yb * S; b < yb * S + S && b < H; b++) memset(rsp + ((size_t)(r - b0) * H + b) * W + xb * S, q[m], xl); }
+                }
+                free(q); tc += na; te += ne; gtk += rs_now() - tk; g_rectosp_gpu_blocks++;
+                fprintf(stderr, "\rrecto-sp: rows %d / %d (%lld cells, %.3f estimated, %.0f s)", B->q1, shp[0], tc, tc ? (double)te / tc : 0, rs_now() - t0);
+            }
+        }
         else {
             /* the row blocks of this shard row; each block's source box is read by a helper thread while the previous block's profiles
                run (the source decode was 52 of 173 s serial on 0332, 2026-11-16; the bytes are the same: one z3_read per block as before) */
@@ -237,6 +355,7 @@ int cmd_recto_sp(int argc, char **argv) {
                 fprintf(stderr, "\rrecto-sp: rows %d / %d (%lld cells, %.3f estimated, %.0f s)", q1, shp[0], tc, tc ? (double)te / tc : 0, rs_now() - t0);
             }
         }
+        const double tb = rs_now();
         /* blend into net */
         /* the blended code depends on (net, rsp) alone: a 256 x 256 table of the very values the per-cell rule gives (0: kept). The
            per-cell exp / log over every material cell of a shard row was 43 of 207 s single-threaded on 0332 (2026-11-16) */
@@ -262,6 +381,7 @@ int cmd_recto_sp(int argc, char **argv) {
             const uint8_t o = lut[net[i]][rsp[i]]; if (!o) continue;
             net[i] = o; nrep++;
         }
+        const double tw = rs_now(); gtb += tw - tb;
         /* write the shard row (outside the box: the input sp) */
         for (int pass = 0; pass < (wrs ? 2 : 1); pass++) {
             z3w *w = pass ? wrs : wsp; const uint8_t *src = pass ? rsp : net;
@@ -280,12 +400,14 @@ int cmd_recto_sp(int argc, char **argv) {
                 if (z3w_write_shard(w, gz0 / SH, sy, sx, shard, nt)) { fprintf(stderr, "recto-sp: write: %s\n", z3w_error()); return 1; }
             }
         }
-        free(net); free(rsp);
+        free(net); free(rsp); gtw += rs_now() - tw;
     }
     fprintf(stderr, "\n");
     if (z3w_close(wsp) || (wrs && z3w_close(wrs))) { fprintf(stderr, "recto-sp: close: %s\n", z3w_error()); return 1; }
     printf("recto-sp: %s -> %s: %lld cells probed, %.3f with a recto spacing; sp replaced on %.3f of the material cells (blend %g%s, gate %g..%g), %.0f s\n",
            in, out, tc, tc ? (double)te / tc : 0, nmat ? (double)nrep / nmat : 0, blend, ramp ? " ramp" : "", glo, ghi, rs_now() - t0);
+    if (gon) { fprintf(stderr, "recto-sp: GPU path: %.1f s waiting for the helper (fields, cells, source decode), %.1f s on the blocks (upload %.1f, kernel %.1f); net sp read %.1f, blend %.1f, shard writes %.1f\n", gtp, gtk, gtu, gtr, gtn, gtb, gtw);
+               if (gpend) pthread_join(gth, nullptr); for (int b = 0; b < 2; b++) { if (GP[b].fok) fit_fields_free(&GP[b].fb); free(GP[b].stg); free(GP[b].zyx); free(GP[b].blk); free(GP[b].t6); } rsg_close(); free(gbl); }
     free(shard); rr_cls_free(cls); z3_close(zsp); if (zs) z3_close(zs); if (zrin) z3_close(zrin);
     return 0;
 }

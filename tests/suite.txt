@@ -160,6 +160,7 @@ test_sheetscore                                |              |     3 | ./$B/tes
 test_patchsolve                                |              |     3 | ./$B/test_patchsolve
 test_patchid                                   |              |     3 | ./$B/test_patchid   
 test_recto                                     |              |     3 | ./$B/test_recto
+test_recto_gpu                                 | gpu          |     3 | ./$B/test_recto_gpu
 test_faces                                     |              |     1 | ./$B/test_faces
 test_fit_emb                                   |              |    60 | ./$B/test_fit_emb
 test_distill                                   | gpu          |     1 | ./$B/test_distill

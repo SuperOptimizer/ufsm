@@ -352,8 +352,10 @@ endfunction()
 # signed zeros: -fsigned-zeros on zarr3.c alone restored it) and predict's rv then differed on 8 % of the bytes (max 120) of the
 # windows holding them, per-window GroupNorm statistics and MX-fp4 block scales spreading it (fm round 11-15, test_predict_heads
 # (1d): GPU vs host decode 16 %, max 123). The decode is ~80 % the serial tANS chain: IEEE costs it nothing measurable.
+# nn_rectosp (2026-11-17): recto-sp's fp64 profiles give the CPU path's sp codes byte for byte (tests/test_recto_gpu.c); fp64 has no
+# fast-math variant worth having, only the FMA contraction, which would move the peak positions by an ulp and flip median picks.
 set(UFSM_EXACT_HOST zarr3)
-set(UFSM_EXACT_CU nn_gpudec)
+set(UFSM_EXACT_CU nn_gpudec nn_rectosp)
 set(UFSM_IEEE_CFLAGS -fno-fast-math -ffp-contract=off -fno-math-errno)
 file(GLOB UFSM_C_SRC CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.c)
 set(UFSM_CORE_OBJS)
