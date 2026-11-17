@@ -144,6 +144,18 @@ int main(void) {
     run_up("dec conv1, fused upsample, one slab", 96, 64, 128, 12, 24, 32, 0, 1);
     run_up("dec conv1, fused upsample, 4-plane slabs, odd sizes", 64, 96, 128, 14, 18, 32, 4, 1);
     run_case("z-range input (zi0 1, Di D + 3)", 128, 64, 12, 16, 32, ZRANGE | OSR);
+    /* MT 2 (Cop % 64 != 0: the 96 / 160 / 288-wide nets; UFSM_F4V_MT=2 runs every case so) against conv_fwd_f4_k<2, 4> */
+    run_case("MT 2: fwd GN + stats, 96 outputs", 96, 96, 16, 24, 48, GN | STATS);
+    run_case("MT 2: fwd plain, 160 outputs, odd depth, no stats", 160, 160, 10, 16, 40, 0);
+    run_case("MT 2: bdata, 96 outputs, output SR, odd width", 128, 96, 12, 16, 37, OSR);
+    run_case("MT 2: split input (160 | 64), stats", 224, 160, 16, 16, 32, SPLIT | STATS);
+    run_case("MT 2: GN staged, split input, per-segment GNs", 224, 96, 16, 16, 32, GN | GN2 | SPLIT | STATS);
+    run_case("MT 2: slabbed prenorm vs in-kernel GN staging", 96, 96, 20, 16, 32, GN | STATS | PRESLAB);
+    run_up("MT 2: dec conv1, fused upsample (128 up | 96 skip -> 96)", 128, 96, 96, 16, 16, 32, 8, 1);
+    run_up("MT 2: dec conv1, fused upsample, no stats, odd depth", 64, 96, 160, 14, 18, 32, 4, 0);
+    run_case("MT 2: 288 outputs, GN + stats", 288, 288, 16, 12, 16, GN | STATS);
+    run_case("MT 2: 96 outputs, stats, depth 12 (conv_fwd_f4_k's 2-plane tiles)", 128, 96, 12, 16, 32, GN | STATS);
+    run_case("MT 2: 160 outputs, z-window, stats", 160, 160, 16, 16, 32, STATS | ZWIN);
     if (getenv("UFSM_TEST_QUICK") == nullptr) run_case("level-0 shape", 256, 256, 16, 64, 64, GN | STATS);
     printf("test_f4v: %s\n", bad ? "FAIL" : "ok");
     return bad != 0;
