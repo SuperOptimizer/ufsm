@@ -33,3 +33,25 @@ with tempfile.TemporaryDirectory(prefix="ufsm-imggate-") as tmp:
     run(BIN, "img-gate", d / "i.tif", d / "g1.tif", d / "g2.tif")   # in place
     assert (t.imread(d / "i.tif") == ref).all()
 print("img-gate: 65536 pairs equal to numpy")
+
+# img-stretch: strip_refill.sh's gated stretch (numpy 'linear' percentiles of every 7th masked pixel per stripe), several distributions
+def np_stretch(ctl, pairs):
+    c, k = [], []
+    for a, i in pairs: c.append(a[a > 0][::7]); k.append(i[a >= ctl][::7])
+    c = np.concatenate(c); k = np.concatenate(k)
+    q = lambda v, lo, hi: (int(np.percentile(v, lo)), max(int(np.percentile(v, hi)), int(np.percentile(v, lo)) + 1))
+    ca, cb = q(c, 0.5, 99.8); ia, ib = q(k, 1, 99.9); return f"{ca},{cb},{ia},{ib}"
+with tempfile.TemporaryDirectory(prefix="ufsm-imgstretch-") as tmp:
+    d = pathlib.Path(tmp)
+    for trial in range(12):
+        pairs, args = [], []
+        for s in range(3):
+            h, w = int(rng.integers(50, 400)), int(rng.integers(50, 700))
+            if trial % 3 == 0: a = rng.integers(0, 256, (h, w)).astype(np.uint8)
+            elif trial % 3 == 1: a = np.clip(rng.normal(100, 40, (h, w)), 0, 255).astype(np.uint8)
+            else: a = (rng.integers(0, 3, (h, w)) * rng.integers(70, 90, (h, w))).astype(np.uint8)   # few distinct values: interpolation ties
+            i = np.clip(rng.normal(60 + 20 * s, 30 + trial, (h, w)), 0, 255).astype(np.uint8)
+            t.imwrite(d / f"c{s}.tif", a, compression="zlib" if s else None); t.imwrite(d / f"i{s}.tif", i); pairs.append((a, i)); args += [d / f"c{s}.tif", d / f"i{s}.tif"]
+        got = run(BIN, "img-stretch", 80, *args).strip(); ref = np_stretch(80, pairs)
+        assert got == ref, f"trial {trial}: img-stretch {got} vs numpy {ref}"
+print("img-stretch: 12 trials equal to numpy")

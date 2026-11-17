@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { RB = 32, SEGSLOTS = 64, MAXSTG = 512, MAXSEG = 4096 };   /* staging: two per decoder thread (render runs up to 128 + 128) */
+enum { RB = 32, RV = 4, SEGSLOTS = 64, MAXSTG = 512, MAXSEG = 4096 };   /* RV: render.c's volumes per render */   /* staging: two per decoder thread (render runs up to 128 + 128) */
 
 typedef struct { uint8_t *h; cudaStream_t st; cudaEvent_t ev; } rg_stage;
 typedef struct { uint8_t *seg[MAXSEG]; int nseg; uint8_t **freel; size_t nfree, capfree, cap, used; } rg_tier;   /* a slot pool: segments, free slots, bytes */
@@ -22,7 +22,7 @@ struct rgpu {
     rg_stage stg[MAXSTG]; int nstg;
     cudaStream_t st; cudaEvent_t e0[2], e1[2];             /* per launch buffer: timing; e1 blocking-sync (the driver sleeps, it does not spin) */
     /* the render */
-    int nv, ns, w, h, nimg; const uint8_t **dptr[2]; size_t nc[2];
+    int nv, ns, w, h, nimg; const uint8_t **dptr[RV]; size_t nc[RV];
     float *X[8], *Y[8], *Z[8]; uint8_t *vg[8]; int32_t *pxy; size_t nb, bmax;
     uint8_t *dout[2], *hout[2]; size_t outb;               /* two launch buffers (mapped pinned) */
     uint64_t *upd_d[2], *upd_h[2]; size_t ucap[2];         /* pointer updates: (v << 63 | ci, ptr) pairs */
@@ -63,7 +63,7 @@ extern "C" void rgpu_close(rgpu *G) {
     for (int k = 0; k < G->nstg; k++) { if (G->stg[k].st) { cudaStreamSynchronize(G->stg[k].st); cudaStreamDestroy(G->stg[k].st); } if (G->stg[k].ev) cudaEventDestroy(G->stg[k].ev); if (G->stg[k].h) cudaFreeHost(G->stg[k].h); }
     for (int k = 0; k < G->tier[0].nseg; k++) cudaFree(G->tier[0].seg[k]);
     for (int k = 0; k < G->tier[1].nseg; k++) cudaFreeHost(G->tier[1].seg[k]);
-    for (int v = 0; v < 2; v++) cudaFree(G->dptr[v]);
+    for (int v = 0; v < RV; v++) cudaFree(G->dptr[v]);
     for (int s = 0; s < 8; s++) { cudaFree(G->X[s]); cudaFree(G->Y[s]); cudaFree(G->Z[s]); cudaFree(G->vg[s]); }
     cudaFree(G->pxy);
     for (int b = 0; b < 2; b++) { if (G->e0[b]) cudaEventDestroy(G->e0[b]); if (G->e1[b]) cudaEventDestroy(G->e1[b]); if (G->hout[b]) cudaFreeHost(G->hout[b]); if (G->upd_h[b]) cudaFreeHost(G->upd_h[b]); }
@@ -146,9 +146,9 @@ extern "C" int rgpu_upload(rgpu *G, int k, uint8_t *d, uint32_t mask, int box, i
 }
 /* the render: nv volumes with nc[v] chunks in their tables, ns grids (w x h; vgrid[s] or nullptr), the blocks' (px, py) in render order,
    at most bmax blocks per launch, nimg output bytes per pixel (nv, + 1 with the fill flags) */
-extern "C" int rgpu_setup(rgpu *G, int nv, const size_t nc[2], int ns, const float *const *X, const float *const *Y, const float *const *Z, int w, int h,
+extern "C" int rgpu_setup(rgpu *G, int nv, const size_t nc[RV], int ns, const float *const *X, const float *const *Y, const float *const *Z, int w, int h,
                           const uint8_t *const *vgrid, const int32_t *pxy, size_t nb, size_t bmax, int nimg) {
-    if (G->broken || ns > 8 || nv > 2) return -1;
+    if (G->broken || ns > 8 || nv > RV) return -1;
     cudaError_t e = cudaSetDevice(G->dev); const size_t n = (size_t)w * h;
     G->nv = nv; G->ns = ns; G->w = w; G->h = h; G->nb = nb; G->bmax = bmax; G->nimg = nimg;
     for (int v = 0; v < nv && e == cudaSuccess; v++) {
@@ -172,12 +172,13 @@ extern "C" int rgpu_setup(rgpu *G, int nv, const size_t nc[2], int ns, const flo
     if (e == cudaSuccess) e = cudaStreamSynchronize(G->st);
     return rg_err(G, e, "setup");
 }
-__global__ void k_ptrs(const uint8_t **p0, const uint8_t **p1, const uint64_t *u, size_t n) {
+typedef struct { const uint8_t **p[RV]; } rg_tabs;
+__global__ void k_ptrs(rg_tabs T, const uint64_t *u, size_t n) {   /* key: ci | v << 62 */
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
     const uint64_t key = u[2 * i]; const uint8_t *p = (const uint8_t *)u[2 * i + 1];
-    (key >> 63 ? p1 : p0)[key & ~(1ull << 63)] = p;
+    T.p[key >> 62][key & ((1ull << 62) - 1)] = p;
 }
-/* chunk keys[i] (ci | v << 63) is now at device address ptrs[i] (nullptr: zero), before launch b (buffer b free: its last launch waited) */
+/* chunk keys[i] (ci | v << 62) is now at device address ptrs[i] (nullptr: zero), before launch b (buffer b free: its last launch waited) */
 extern "C" int rgpu_ptrs(rgpu *G, int b, const uint64_t *keys, uint8_t *const *ptrs, size_t n) {
     if (G->broken) return -1;
     if (!n) return 0;
@@ -192,11 +193,12 @@ extern "C" int rgpu_ptrs(rgpu *G, int b, const uint64_t *keys, uint8_t *const *p
     }
     if (e != cudaSuccess) return rg_err(G, e, "pointer table");
     for (size_t i = 0; i < n; i++) { G->upd_h[b][2 * i] = keys[i]; G->upd_h[b][2 * i + 1] = (uint64_t)(uintptr_t)ptrs[i]; }
-    k_ptrs<<<(unsigned)((n + 255) / 256), 256, 0, G->st>>>(G->dptr[0], G->dptr[1], G->upd_d[b], n);
+    rg_tabs T; for (int v = 0; v < RV; v++) T.p[v] = G->dptr[v];
+    k_ptrs<<<(unsigned)((n + 255) / 256), 256, 0, G->st>>>(T, G->upd_d[b], n);
     return rg_err(G, cudaGetLastError(), "pointer table");
 }
 
-typedef struct { rc_vol V[2]; int depth[2]; rc_fill F; int fill, nv, ns, w, h, ow, oh, nimg; double gs; const float *X[8], *Y[8], *Z[8]; const uint8_t *vg[8]; } rg_par;
+typedef struct { rc_vol V[RV]; int depth[RV]; rc_fill F; int fill, nv, ns, w, h, ow, oh, nimg; double gs; const float *X[8], *Y[8], *Z[8]; const uint8_t *vg[8]; } rg_par;
 /* block (kb + blockIdx.x), grid blockIdx.y: 32 x 8 threads, 4 rows each; out[((k ns + s) nimg + q) 1024 + r 32 + c]: volume q's value (q < nv),
    the fill flag (q = nv); pixels without a surface (or outside the image): 0 / RFILL_NONE (254), what the caller's images start as */
 __global__ void __launch_bounds__(256) k_render(rg_par P, const int32_t *pxy, size_t kb, uint8_t *out) {
@@ -204,7 +206,7 @@ __global__ void __launch_bounds__(256) k_render(rg_par P, const int32_t *pxy, si
     const int px = pxy[2 * (kb + k)] + c, py0 = pxy[2 * (kb + k) + 1];
     uint8_t *o = out + ((k * P.ns + s) * P.nimg) * (RB * RB);
     for (int r = threadIdx.y; r < RB; r += 8) {
-        const int py = py0 + r; uint8_t val[2] = {0, 0}, fl = 254;
+        const int py = py0 + r; uint8_t val[RV] = {0, 0, 0, 0}, fl = 254;
         if (px < P.ow && py < P.oh) rc_pixel(P.Z[s], P.Y[s], P.X[s], P.w, P.h, P.gs, px, py, P.V, P.nv, P.depth, P.fill ? &P.F : nullptr, P.vg[s], val, &fl);
         for (int q = 0; q < P.nv; q++) o[q * RB * RB + r * RB + c] = val[q];
         if (P.fill) o[P.nv * RB * RB + r * RB + c] = fl;

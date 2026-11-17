@@ -6,6 +6,23 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Unroll perf 4: the strip's papyrus gate inside the render, the gated stretch in C (2026-11-17, branch unrollperf4-20261117)
+
+- strip_refill.sh rendered every stripe three times when the ink is gated (the ink, then each of c12 / c13 with the same CT, fill and
+  inpaint) and multiplied them with img-gate (perf 2). `ufsm render --gate ROOT KEY` (at most 2, needs --ct and --fill) decodes the gate
+  volumes in the same chunk-ordered pass (render.c now takes up to 4 volumes, CPU and GPU paths; the gates are sampled at the ink's
+  points, after the --fill search on the CT, with the ink's depth), runs them through the same push-pull, and writes the ink x max(gates)
+  / 255 with img-gate's table. Byte for byte the three renders + img-gate: tests/test_render_gate.c (CPU and GPU, a fixture with a CT
+  void, normal fill, inpainted and grid-hole pixels) and on real data, 0332 wraps w091 / w092 (the inkpod zarr standing in for both
+  gates): ink, CT and fill-flag images equal. Time per gated wrap 21-28 s -> 11.5-15 s (3 runs each, card 1 shared). On the 0332
+  stripimg run (5 stripes, 9:00 wall) the two gate renders per stripe were 2 x 20-50 s of the stripe's render work.
+- strip_refill.sh re-rendering a stripe the mosaic had consumed kept its old `.gated` marker and skipped the gate (latent since perf 2);
+  the render now clears the marker first.
+- The gated stretch (numpy's linear percentiles over every 7th masked pixel of the 3 middle stripes, ~2 min in python with the
+  full-size float temporaries) is `ufsm img-stretch CTL CT1 INK1 ...` (imggate.c, numpy's virtual-index / lerp arithmetic in doubles;
+  tests/test_img_gate.py: 12 random distributions equal to numpy). Three 0332 wrap renders (90 M CT pixels): 2.6 s vs numpy 182 s
+  (desk busy), the same 39,197,15,195.
+
 ## recto-sp on the GPU: byte-identical fp64 profiles, the source decoded once into a device ring (2026-11-17, branch rectogpu-20261117)
 
 recto-sp (unroll stage rectosp: the fit fields' sp blended with the m7 recto-hit spacing, --half-um 400 --half2-um 800 --blend 0.3) was the

@@ -192,6 +192,7 @@ static int usage(void) {
         "  ufsm tifxyz-scale <src> <dst> <div> [--offset z,y,x]   tifxyz coordinates / div - offset (e.g. 2.4 -> 9.6 um: 4; offset in output voxels)\n"
         "  ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif ..   CT | ink panels (half-res JPEG) + ink statistics per render\n"
         "  ufsm img-gate IMG.tif GATE.tif [GATE.tif ..] [--out OUT.tif]   a render x max(gates) / 255 (the strip papyrus gate)\n"
+        "  ufsm img-stretch CTL CT1.tif INK1.tif [..]                     the strip's gated contrast stretch ca,cb,ia,ib\n"
         "  ufsm jpeg-fit IN.jpg OUT.jpg --div 2 | --max-px N                  a finished JPEG shrunk (OUT may be IN)\n"
         "  ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K]   tifxyz wraps -> surface-compressor .sfc (readers take .sfc wraps directly)\n"
         "  ufsm sheet-cut <wraps-dir> <out-dir> [--tol 0.3] [--min-cm2 0.25] [--max 8]   square flat sheets: largest isometric rectangles of each wrap\n"
@@ -4414,10 +4415,11 @@ static int cmd_blend(int argc, char **argv) {
     return 0;
 }
 /* render --fill: the share of surface pixels per class (stderr) and the cosmetic inpaint of the rest (--fill-inpaint L) */
-static void render_fill_report(const char *name, uint8_t *img, uint8_t *cimg, uint8_t *flag, int ow, int oh, int inpaint, int pm, int nthreads) {
+static void render_fill_report_g(const char *name, uint8_t *img, uint8_t *cimg, uint8_t *const *gates, int ng, uint8_t *flag, int ow, int oh, int inpaint, int pm, int nthreads) {
     size_t nin = 0;
-    if (inpaint > 0) {
-        uint8_t *const im[2] = {img, cimg}; const double t0 = now(); nin = img_pushpull_fill(im, 2, flag, ow, oh, inpaint, nthreads); const double t1 = now();
+    if (inpaint > 0) {   /* (the gates, render --gate, take the same push-pull: its channels are independent, each as in a render of its own) */
+        uint8_t *im[4] = {img, cimg}; for (int k = 0; k < ng && k < 2; k++) im[2 + k] = gates[k];
+        const double t0 = now(); nin = img_pushpull_fill(im, 2 + (ng < 2 ? ng : 2), flag, ow, oh, inpaint, nthreads); const double t1 = now();
         if (pm && img_patchmatch_fill(im, 2, flag, ow, oh, nthreads)) fprintf(stderr, "render: %s: PatchMatch out of memory (push-pull kept)\n", name);
         fprintf(stderr, "render: %s inpaint: push-pull %.1fs, PatchMatch %.1fs\n", name, t1 - t0, pm ? now() - t1 : 0.0);
     }
@@ -4430,6 +4432,10 @@ static void render_fill_report(const char *name, uint8_t *img, uint8_t *cimg, ui
                     "grid holes filled: %zu pixels (%.2f%% of the surface); no surface: %zu pixels\n",
             name, ns, (ns - non) * d, nfill * d, nin * d, nemp * d, ngrid, ngrid * d, nnone);
 }
+static void render_fill_report(const char *name, uint8_t *img, uint8_t *cimg, uint8_t *flag, int ow, int oh, int inpaint, int pm, int nthreads) {
+    render_fill_report_g(name, img, cimg, nullptr, 0, flag, ow, oh, inpaint, pm, nthreads);
+}
+void img_gate_lut(uint8_t lut[256][256]);   /* src/imggate.c */
 typedef struct { char path[1400]; const uint8_t *data; int w, h, rc; } rw_job;   /* ufsm render: one output TIFF */
 static void *rw_write(void *arg) { rw_job *J = arg; J->rc = tiffw_write(J->path, J->w, J->h, 1, J->data, 1); return nullptr; }
 static int cmd_render(int argc, char **argv) {
@@ -4447,6 +4453,9 @@ static int cmd_render(int argc, char **argv) {
 "    (copied from elsewhere on the render: it can read as ink strokes, so off since 2026-11-14); cosmetic, off by default; flag 250\n"
 "  --fill-grid V (with --fill): enclosed holes of the grid (invalid vertices, at most V per hole) bridged by interpolated vertices\n"
 "    (push-pull + Laplace), rendered like the rest; their pixels' flags + 100\n"
+"  --gate ROOT KEY (at most 2, with --fill): gate volumes on the volume's grid, rendered in the same pass at the same points (and\n"
+"    push-pull) as the volume; the volume's render is then written multiplied by max(gates) / 255 (ufsm img-gate's bytes): the strip's\n"
+"    papyrus gate in one render instead of three\n"
 "  --known: nearest voxel, 255 (prob254 unknown) skipped, the max over the known values within +-depth (label zarrs: ink-splat output);\n"
 "    on the CPU (the box read once when it fits UFSM_RENDER_MEM, else per tile); not with --fill / --joint\n"
                                      "  --crop: only that rectangle of each wrap's output pixels is rendered and written (e.g. a labelled region)\n"); return 2; }
@@ -4469,6 +4478,16 @@ static int cmd_render(int argc, char **argv) {
     const int remote = (vs && !store_is_local(vs)) || (cs && !store_is_local(cs));
     z3 *vz = vs ? z3_open(vs, argv[vi + 2], cache) : nullptr, *cz = cs ? z3_open(cs, argv[ci + 2], cache) : nullptr;
     if (!vz || (ci > 0 && !cz)) { fprintf(stderr, "render: %s\n", z3_error()); return 1; }
+    z3 *gz[2] = {nullptr, nullptr}; int ngate = 0;   /* --gate ROOT KEY (repeatable, 2 at most) */
+    for (int a = 4; a + 2 < argc; a++) {
+        if (strcmp(argv[a], opt_n("--gate"))) continue;
+        if (ngate == 2) { fprintf(stderr, "render: at most 2 --gate volumes\n"); return 2; }
+        store *gs_ = store_open(argv[a + 1]); gz[ngate] = gs_ ? z3_open(gs_, argv[a + 2], cache) : nullptr;
+        if (!gz[ngate]) { fprintf(stderr, "render: --gate %s %s: %s\n", argv[a + 1], argv[a + 2], z3_error()); return 1; }
+        ngate++; a += 2;
+    }
+    if (ngate && (!cz || fill_n < 0 || opt_atoi("--joint", opt(argc, argv, "--joint", "0")) || known || getenv("UFSM_RENDER_TILED") || fill_pm)) {
+        fprintf(stderr, "render: --gate needs --ct and --fill (the chunk-ordered renderer), not --joint / --known / --fill-pm\n"); return 2; }
     char cmd[1400]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", argv[3]); if (system(cmd)) return 1;
     DIR *dd = opendir(argv[2]); if (!dd) { fprintf(stderr, "render: cannot open %s\n", argv[2]); return 1; }
     struct dirent *de; int nw = 0;
@@ -4580,15 +4599,25 @@ static int cmd_render(int argc, char **argv) {
         if (!img || (cz && !cimg) || (fill_n >= 0 && !flag)) { fprintf(stderr, "render: out of memory\n"); return 1; }
         if (flag) memset(flag, RFILL_NONE, (size_t)ow * oh);
         if (!rvol && !known && !getenv("UFSM_RENDER_TILED")) {   /* (--known: render_rows below, the only nearest-voxel sampler) */
-            z3 *zs[2] = {vz, cz}; const int dp[2] = {depth, 0}; uint8_t *const im[2] = {img, cimg};
-            const size_t imgb = (size_t)ow * oh * (cz ? 2 : 1), cb = cbudget > imgb + ((size_t)1 << 30) ? (size_t)cbudget - imgb : (size_t)1 << 30;
+            uint8_t *gim[2] = {nullptr, nullptr};
+            for (int k = 0; k < ngate; k++) if (!(gim[k] = calloc((size_t)ow * oh, 1))) { fprintf(stderr, "render: out of memory\n"); return 1; }
+            z3 *zs[4] = {vz, cz, gz[0], gz[1]}; const int dp[4] = {depth, 0, depth, depth}; uint8_t *const im[4] = {img, cimg, gim[0], gim[1]};
+            const size_t imgb = (size_t)ow * oh * ((cz ? 2 : 1) + ngate), cb = cbudget > imgb + ((size_t)1 << 30) ? (size_t)cbudget - imgb : (size_t)1 << 30;
             const int io = remote ? (nthreads > 32 ? nthreads : 32) : nthreads;
             const float *const Xs[1] = {X}, *const Ys[1] = {Y}, *const Zs[1] = {Z}; uint8_t *const fls[1] = {flag}; const uint8_t *const vgs[1] = {vgrid};
             const render_fill RF = {fill_n, fill_thr, fill_pref, fls, vgrid ? vgs : nullptr};
             tw[0] = RNOW();
-            if (render_wraps_chunked_fill(zs, cz ? 2 : 1, dp, 1, Xs, Ys, Zs, w, h, gs, im, ow, oh, crs ? crop : nullptr, cb, nthreads, io, 1, flag ? &RF : nullptr)) { fprintf(stderr, "render: %s: render failed\n", de->d_name); return 1; }
+            if (render_wraps_chunked_fill(zs, (cz ? 2 : 1) + ngate, dp, 1, Xs, Ys, Zs, w, h, gs, im, ow, oh, crs ? crop : nullptr, cb, nthreads, io, 1, flag ? &RF : nullptr)) { fprintf(stderr, "render: %s: render failed\n", de->d_name); return 1; }
             tw[1] = RNOW();
-            if (flag) render_fill_report(de->d_name, img, cimg, flag, ow, oh, fill_inp, fill_pm, nthreads);
+            if (flag) render_fill_report_g(de->d_name, img, cimg, gim, ngate, flag, ow, oh, fill_inp, fill_pm, nthreads);
+            if (ngate) {   /* the volume x max(gates) / 255 (img-gate's table) */
+                static uint8_t glut[256][256]; static int glut_ok;   /* mgpu: main (the render command's thread) */
+                if (!glut_ok) { img_gate_lut(glut); glut_ok = 1; }
+                const size_t np = (size_t)ow * oh;
+                for (size_t i = 0; i < np; i++) { const uint8_t g = ngate > 1 && gim[1][i] > gim[0][i] ? gim[1][i] : gim[0][i]; img[i] = glut[img[i]][g]; }
+                fprintf(stderr, "render: %s: x max(%d gate%s) / 255\n", de->d_name, ngate, ngate > 1 ? "s" : "");
+            }
+            free(gim[0]); free(gim[1]);
             tw[2] = RNOW();
         } else
         /* output tiles: each reads only the volume around its own vertices (+- depth), so a wrap of any size renders in bounded memory */
@@ -4776,6 +4805,7 @@ int cmd_fields_pack(int argc, char **argv);   /* src/fieldspack.c */
 int cmd_labcomp_pack(int argc, char **argv);   /* src/labcomp_cli.c */
 int cmd_ink_gate(int argc, char **argv);   /* src/inkgate.c */
 int cmd_img_gate(int argc, char **argv);   /* src/imggate.c */
+int cmd_img_stretch(int argc, char **argv);   /* src/imggate.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
 int cmd_annotate_serve(int argc, char **argv);   /* src/annot.c */
@@ -4906,6 +4936,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "labcomp-pack")) return cmd_labcomp_pack(argc, argv);
     if (!strcmp(cmd, "ink-gate")) return cmd_ink_gate(argc, argv);
     if (!strcmp(cmd, "img-gate")) return cmd_img_gate(argc, argv);
+    if (!strcmp(cmd, "img-stretch")) return cmd_img_stretch(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "stitch")) return cmd_stitch(argc, argv);
