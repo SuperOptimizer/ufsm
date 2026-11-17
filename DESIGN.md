@@ -6,6 +6,28 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Argus V2 (ruiconte): a Reader V3 fine-tune, runs in our reader3 port; ties reader3, adds nothing to the teacher combo (2026-11-17)
+
+Argus V2 (https://huggingface.co/ruiconte/argus-v2 @ a769fe54, `argus-v2.pth`, sha256 659130f7...de6fd matches the card, MIT,
+fine-tune of domenicor046/reader-v3 (MIT) on native 8-9 um scans of PHerc0139 / 0814 / 0500P2 / 0009B / 0343P / 0172; code
+github.com/ruiconte/ink-swarm be2c6b8, read only, never run). Same network as Reader V3 (vesuvius_unet_3d_stem_2d, 17 layers centred on the
+surface, robust-MAD normalisation, 34.6 M parameters): the 508 state-dict keys and shapes are identical, so it runs as
+`ink-ext --model reader3 --weights argus-v2.pth` (tvar.sh case `argus2`), no new code. Weights /vesuvius/ufsm/inksdk/weights/argus-v2/.
+Parity (test_ink_ext_inksdk_koine, our torch koine reference, 384 px tiles): max |dlogit| 0.0077 random, 0.0037 real surface volume.
+
+| 24 held-out crops                 | 0139  | 1667  | Paris4 | all    | paired                                 |
+|-----------------------------------|-------|-------|--------|--------|----------------------------------------|
+| reader3                           | .9664 | .9290 | .9168  | .9271  |                                        |
+| argus2 fp16                       | .9704 | .9090 | .9172  | .9247  | vs reader3 -0.0024 [-0.0085, +0.0033]  |
+| argus2 MX5                        | .9694 | .9049 | .9173  | .9239  | vs fp16 -0.0008 [-0.0023, +0.0007]     |
+| argus2 --zwin -2,0,2              | .9705 | .9053 | .9184  | .9249  | vs single +0.0002 [-0.0009, +0.0012]   |
+| z-sum reader3+ink9um+hecate24     | .9911 | .9741 | .9260  | .9449  | (production)                           |
+| z-sum argus2+ink9um+hecate24      | .9907 | .9669 | .9264  | .9439  |                                        |
+| z-sum all four                    | .9897 | .9669 | .9278  | .9446  | greedy selection does not pick argus2  |
+
+argus2 vs ink9um: +0.0072 [-0.0027, +0.0161]. It gains on 0139 (one of its training scrolls) and loses 0.02 on 1667. The
+card's +1 AUC point from the -2/0/+2 depth windows does not show here. Argus V2 is available as a teacher but does not join the combo.
+
 ## Training perf: try9's step profiled; the head adjoint's gather 7x faster, the w4 runs pinned (2026-11-17, branch trainperf-20261117)
 
 **Profile.** try9's exact argv and env (binary c2646d35, snap/5000.ckpt, `UFSM_MEM_FREE_GB 10.98` reproduces its plan "MX gradients,
