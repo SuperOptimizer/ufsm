@@ -20,10 +20,20 @@ __device__ inline fs_tile fs_tile_of(size_t tl, int z0, int h2, int w2) {
     return t;
 }
 __device__ inline void fs_stage(const f16 *x, int D, int H, int W, fs_tile t, __half (*sr)[FS_RW]) {
-    const int rl = 2 * t.nj + 2; const size_t hw = (size_t)H * W;
-    for (int k = threadIdx.x; k < 16 * rl; k += blockDim.x) {
-        const int r = k / rl, q = k % rl, z = 2 * t.bz - 1 + r / 4, y = 2 * t.by - 1 + r % 4, xx = 2 * t.bx0 - 1 + q;
-        sr[r][q] = z >= 0 && z < D && y >= 0 && y < H && xx >= 0 && xx < W ? x[(size_t)z * hw + (size_t)y * W + xx] : __float2half(0.f);
+    /* row by row (no index division per element), the interior as aligned 4-byte pairs: sr[r][q] = x at xx = 2 bx0 - 1 + q, pair p covers
+       xx 2 bx0 - 2 + 2 p, + 1 (q 2 p - 1, 2 p); W even, so a pair is in or out of the window as a whole (the same bytes as the element loop) */
+    const int np = t.nj + 2, rl = 2 * t.nj + 2; const size_t hw = (size_t)H * W;
+    for (int r = 0; r < 16; r++) {
+        const int z = 2 * t.bz - 1 + r / 4, y = 2 * t.by - 1 + r % 4;
+        if (z < 0 || z >= D || y < 0 || y >= H) { for (int q = threadIdx.x; q < rl; q += blockDim.x) sr[r][q] = __float2half(0.f); continue; }
+        const f16 *row = x + (size_t)z * hw + (size_t)y * W;
+        for (int p = threadIdx.x; p < np; p += blockDim.x) {
+            const int xx = 2 * t.bx0 - 2 + 2 * p;
+            __half2 v = __floats2half2_rn(0.f, 0.f);
+            if (xx >= 0 && xx < W) v = *(const __half2 *)(row + xx);
+            if (p > 0) sr[r][2 * p - 1] = __low2half(v);
+            if (2 * p < rl) sr[r][2 * p] = __high2half(v);
+        }
     }
 }
 __device__ inline float fs_silu(float v) { return v / (1.f + __expf(-v)); }
@@ -86,12 +96,16 @@ __device__ __forceinline__ void fsu_side(const fs_up &up, int ch, fs_tile t, int
         }
 }
 template <bool UP>
-__global__ void __launch_bounds__(FS_BT) fstem_fwd_k(const f16 *__restrict__ x, int D, int H, int W, int z0, int nz, const float *__restrict__ p, int C, int nout, fs_chs chs, f16 *__restrict__ lg, size_t ns, fs_up up, int ws) {
+__global__ void __launch_bounds__(FS_BT, UP ? 1 : 8) fstem_fwd_k(const f16 *__restrict__ x, int D, int H, int W, int z0, int nz, const float *__restrict__ p, int C, int nout, fs_chs chs, f16 *__restrict__ lg, size_t ns, fs_up up, int ws) {
     __shared__ __align__(16) float sp[FS_MAXC + FS_MAXO * FS_MAXC];   /* b1, W2 */
     __shared__ float rsc[FS_MAXC], rinv[FS_MAXC];   /* W1's row scales (fs_w1_exp) and their inverses */
-    __shared__ __align__(16) __half sr[16][FS_RW];
-    __shared__ float hs[FS_BT][FS_FS];
-    __shared__ float qs[UP ? FS_MAXO * 4 * FSU_NC : 1];
+    /* sr (the staged rows, read by the MMAs) and hs (h of the tile's blocks, written after every MMA of the tile) share their memory, and qs
+       (UP) is dynamic, nout x 4 x FSU_NC floats: 19.2 -> 10.7 KB a block plain, 36 -> 13-23 KB fused (occupancy: shared memory limited the
+       plain kernel to 5 blocks an SM, ncu 2026-11-17: latency-bound at 41 % occupancy, 190 GB/s) */
+    __shared__ __align__(16) unsigned char srh[sizeof(float) * FS_BT * FS_FS > sizeof(__half) * 16 * FS_RW ? sizeof(float) * FS_BT * FS_FS : sizeof(__half) * 16 * FS_RW];
+    extern __shared__ __align__(16) float qs[];
+    __half (*sr)[FS_RW] = (__half (*)[FS_RW])srh;
+    float (*hs)[FS_FS] = (float (*)[FS_FS])srh;
     const int tid = threadIdx.x, lane = tid & 31, wp = tid >> 5, g = lane >> 2, tq = lane & 3;
     for (int k = tid; k < C + nout * C; k += blockDim.x) sp[k] = p[C * FS_T + k];
     const fs_tile t = fs_tile_of(blockIdx.x, z0, H / 2, W / 2);
@@ -139,8 +153,12 @@ __global__ void __launch_bounds__(FS_BT) fstem_fwd_k(const f16 *__restrict__ x, 
     }
     __syncthreads();
     const float *b1 = sp, *W2 = sp + C;
-    for (int j0 = wp * 8; j0 < t.nj; j0 += FS_BT / 32 * 8) {   /* (FS_BT / 32 warps x 8 blocks: one n-tile per warp and pass) */
-        float c4[4] = {0.f, 0.f, 0.f, 0.f};
+    float c4s[FS_BT / 32][4];   /* (the passes' MMA results, kept until every warp is done with sr: hs overwrites it) */
+#pragma unroll
+    for (int ps = 0; ps < FS_BT / 32; ps++) {   /* (FS_BT / 32 warps x 8 blocks: one n-tile per warp and pass) */
+        const int j0 = wp * 8 + ps * (FS_BT / 32 * 8);
+        float *c4 = c4s[ps]; c4[0] = c4[1] = c4[2] = c4[3] = 0.f;
+        if (j0 >= t.nj) continue;
         const int jb = j0 + g < t.nj ? j0 + g : t.nj - 1;   /* (a tail tile repeats its last block: computed, not written) */
 #pragma unroll
         for (int s_ = 0; s_ < 4; s_++) {
@@ -149,8 +167,14 @@ __global__ void __launch_bounds__(FS_BT) fstem_fwd_k(const f16 *__restrict__ x, 
             bf[1] = *(const unsigned *)&sr[4 * s_ + 2 + tq / 2][2 * jb + 2 * (tq & 1)];
             mma16816<f16>(c4, af[s_], bf);
         }
+    }
+    __syncthreads();   /* (sr is dead from here on) */
+#pragma unroll
+    for (int ps = 0; ps < FS_BT / 32; ps++) {
+        const int j0 = wp * 8 + ps * (FS_BT / 32 * 8); if (j0 >= t.nj) continue;
         /* c4: pre[c g, g + 8][blocks 2 tq, 2 tq + 1] */
-        for (int r = 0; r < 4; r++) { const int c = g + (r >> 1) * 8, b = 2 * tq + (r & 1); if (c < C && j0 + b < FS_BT) hs[j0 + b][c] = fs_silu(c4[r] * rinv[c] + b1[c]); }
+#pragma unroll
+        for (int r = 0; r < 4; r++) { const int c = g + (r >> 1) * 8, b = 2 * tq + (r & 1); if (c < C && j0 + b < FS_BT) hs[j0 + b][c] = fs_silu(c4s[ps][r] * rinv[c] + b1[c]); }
     }
     __syncthreads();
     const int j = tid;
@@ -311,7 +335,7 @@ static int fs_ok(int D, int H, int W, int z0, int nz, int C, int nout) {
 extern "C" int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns) {
     if (!fs_ok(D, H, W, z0, nz, C, nout)) return 1;
     const size_t nt = (size_t)(nz / 2) * (H / 2) * ((W / 2 + FS_BT - 1) / FS_BT); if (!nt) return 0;
-    fstem_fwd_k<false><<<(unsigned)nt, FS_BT>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns, fs_up{}, nn_fstem_wscale()); KCHECK();
+    fstem_fwd_k<false><<<(unsigned)nt, FS_BT, 0>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns, fs_up{}, nn_fstem_wscale()); KCHECK();
     return 0;
 }
 extern "C" int nn_fstem_up_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns,
@@ -320,7 +344,7 @@ extern "C" int nn_fstem_up_fwd(const void *x, int D, int H, int W, int z0, int n
     const int d = D / 4, h = H / 4, w = W / 4;
     const int lo = max(z0 / 4 - 1, 0), hi = min((z0 + nz) / 4, d - 1); if (lo < q0 || hi >= q0 + qd) return 1;   /* (the cell planes the taps read lie in [q0, q0 + qd)) */
     const size_t nt = (size_t)(nz / 2) * (H / 2) * ((W / 2 + FS_BT - 1) / FS_BT); if (!nt) return 0;
-    fstem_fwd_k<true><<<(unsigned)nt, FS_BT>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns, fs_up{(const f16 *)lc, d, h, w, q0, qd, side, base}, nn_fstem_wscale()); KCHECK();
+    fstem_fwd_k<true><<<(unsigned)nt, FS_BT, sizeof(float) * 4 * FSU_NC * (size_t)nout>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns, fs_up{(const f16 *)lc, d, h, w, q0, qd, side, base}, nn_fstem_wscale()); KCHECK();
     return 0;
 }
 /* the backward's partial sums at their largest (1024 blocks x the parameters; 5.3 MB at 16 -> 16) on the current device, before the trainer's

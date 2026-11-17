@@ -403,6 +403,41 @@ Parity (test_ink_ext_inksdk_koine, our torch koine reference, 384 px tiles): max
 argus2 vs ink9um: +0.0072 [-0.0027, +0.0161]. It gains on 0139 (one of its training scrolls) and loses 0.02 on 1667. The
 card's +1 AUC point from the -2/0/+2 depth windows does not show here. Argus V2 is available as a teacher but does not join the combo.
 
+## fstem forward for predict's shapes: occupancy, not bandwidth (byte-identical; 2026-11-17, branch fstempred-20261117)
+
+- **Why look:** the fields predict spends ~30 % of its kernel time in fstem_fwd_k: convk's profile, u1 13000, window 640, about
+  50 ms a window. It calls the plain kernel with 6 outputs, 4 of them held (channels 0, 1, 9, 10), adding into the planes that
+  lat_up_slab_c and lat_shuffle_c wrote.
+- **Diagnosis:** at P 640 / 4 outputs the plain kernel moved 185 GB/s, 41 % of DRAM. ncu (bench_fstem, card 1) put achieved
+  occupancy at 40 %. Shared memory capped it at 5 blocks an SM (19.2 KB a block), registers at 6, and warps sat waiting on
+  L1TEX. So the kernel was latency-bound. The fused variant (nn_fstem_up_fwd, the trainer's path) held 36 KB a block, i.e. 2
+  blocks an SM.
+- **Changes, all byte-identical:**
+  1. fs_stage goes row by row with aligned 4-byte pairs instead of a division and a bounds test per element.
+  2. The MMA results stay in registers until every warp has finished reading the staged rows. h then reuses their shared memory,
+     since sr and hs are a union: 10.7 KB a block.
+  3. The fused variant's qs is dynamic shared memory, sized nout x 4 x 66 floats instead of 16 x ....
+  4. Launch bounds: (128, 8) for the plain variant. The fused one stays at the default, because a 64-register cap made it spill
+     (2.8 -> 6-8 ms).
+- **Results**, bench_fstem, card 1 shared, min of 8 calls; old = master 105a9db9 (which already has the 454632bf unrolls):
+
+| shape | old ms | new ms |
+|---|---|---|
+| P 640 slab 64, 4 out, plain | 2.49 | 1.72 (1.45x) |
+| P 640 slab 16, 4 out, plain | 0.64 | 0.45 |
+| P 640 slab 64, 4 out, fused | 5.94 | 2.77 (2.1x) |
+| P 768 slab 16, 11 out, plain | 1.22-1.41 | 1.17 |
+| P 768 slab 16, 11 out, fused (training) | 2.86 | 1.54 (1.85x) |
+
+- **Checks:** at P 384 the forward, backward and fused-forward hashes equal master's. test_fstem passes, and so do its racecheck
+  and synccheck variants (0 hazards), test_predict_heads, test_heads and test_lat_fuse.
+- **Expected effect:**
+  - Predict fields: fstem ~50 -> ~35 ms a window.
+  - Training: 96 fused calls a window x ~1.3 ms, ~-125 ms (~2.5 %).
+- **Left for predict's call pattern (fp4teach):** the fields path still runs up-slab + shuffle + plain stem. That is two extra
+  read-modify-write passes over the stem's planes that the fused kernel writes once. The fused kernel now runs at P 640 / 4
+  outputs in 2.77 ms against the plain stem's 1.72 ms alone.
+
 ## Training perf 3: try9 is sampler-bound after the GPU gains; the host profile, word-wise byte scans in draw_ (2026-11-17, branch samplecpu-20261117)
 
 - **The swap's live rate stayed flat.** fd615b6f went into try9 at step 6942. The replay ran identical windows with --det and no
