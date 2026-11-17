@@ -106,16 +106,20 @@ done
 # the fit writer's staging ring (UFSM_PRED_FIT_NBUF 2 / 8 against the default 4; 1 MB planes: many chunks a window) writes the same fields
 for nbf in 2 8; do UFSM_PRED_FIT_NBUF=$nbf UFSM_PRED_FIT_PLANES_MB=1 "$U" predict s/last.ckpt fx ct fn$nbf "${P[@]}" --fit-zarr fn${nbf}z --no-out 1 > fn$nbf.log 2>&1 || fail "predict --fit-zarr, ring $nbf ($D/fn$nbf.log)"
                   cmpf f2z fn${nbf}z; done
-# super-shard windows with --fit-zarr (stride 2 shards: 288 / 16 at shard 128, as 1152 / 64 at 512): a box off the window grid is refused with
-# the grid named, and runs one window per 2^3 shards with --grid-origin = the box origin mod the stride (podunroll 11-17); the fused kernel
-# and the plane path write the same fields there
-PS=(--um 9.6 --level 0 --window 288 --halo 16 --shard 128 --levels 1 --threads 2 --q 0 --box 128,0,0,128,256,256 --fit-h 2 --no-out 1)
-! "$U" predict s/last.ckpt fx ct k0 "${PS[@]}" --fit-zarr k0z > k0.log 2>&1 || fail "super-shard --fit-zarr off the window grid ran ($D/k0.log)"
+# super-shard windows with --fit-zarr (stride 2 shards: 288 / 16 at shard 128, as 1152 / 64 at 512; a 384^3 CT fixture, net (1)): a box off the window grid is refused with
+# the grid named (--grid-origin 0,0,0 with the box at 128, as unroll.sh's grid 0 with 0332's box at 512), and runs one window per 2^3 shards with
+# --grid-origin = the box origin mod the stride (podunroll 11-17) = no --grid-origin (box-anchored windows) byte for byte; the fused kernel and
+# the plane path write the same fields there
+"$MF" fxb 384 2 1 > fxb.log 2>&1 || fail "make_wind_fixture 384 ($D/fxb.log)"
+PS=(--um 9.6 --level 0 --window 288 --halo 16 --shard 128 --levels 1 --threads 2 --q 0 --box 128,0,0,256,256,256 --fit-h 2 --no-out 1)
+! "$U" predict s/last.ckpt fxb ct k0 "${PS[@]}" --grid-origin 0,0,0 --fit-zarr k0z > k0.log 2>&1 || fail "super-shard --fit-zarr off the window grid ran ($D/k0.log)"
 grep -q "only with the box origin on the window grid" k0.log || fail "the off-grid refusal does not name the grid ($D/k0.log)"
-"$U" predict s/last.ckpt fx ct k1 "${PS[@]}" --grid-origin 128,0,0 --fit-zarr k1z > k1.log 2>&1 || fail "super-shard --fit-zarr, --grid-origin 128,0,0 ($D/k1.log)"
+"$U" predict s/last.ckpt fxb ct k1 "${PS[@]}" --grid-origin 128,0,0 --fit-zarr k1z > k1.log 2>&1 || fail "super-shard --fit-zarr, --grid-origin 128,0,0 ($D/k1.log)"
 grep -q "one window per 2^3 shards" k1.log || fail "no super-shard windows ($D/k1.log)"
-UFSM_PRED_FIT_FUSED=0 "$U" predict s/last.ckpt fx ct k2 "${PS[@]}" --grid-origin 128,0,0 --fit-zarr k2z > k2.log 2>&1 || fail "super-shard --fit-zarr, plane path ($D/k2.log)"
+UFSM_PRED_FIT_FUSED=0 "$U" predict s/last.ckpt fxb ct k2 "${PS[@]}" --grid-origin 128,0,0 --fit-zarr k2z > k2.log 2>&1 || fail "super-shard --fit-zarr, plane path ($D/k2.log)"
 cmpf k1z k2z 64
+"$U" predict s/last.ckpt fxb ct k3 "${PS[@]}" --fit-zarr k3z > k3.log 2>&1 || fail "super-shard --fit-zarr, no --grid-origin ($D/k3.log)"
+cmpf k1z k3z 64   # (no --grid-origin: the windows anchored at the box origin, the same windows)
 fi
 if part 1; then   # (1b), (1c)
 # (1b) the GPU pyramid (each level-0 shard pooled on the device, levels >= 1 encoded from the pieces) against the CPU pyramid (each level
