@@ -44,7 +44,17 @@ GQ=$H/gpuq.sh; [ -e $GQ ] || GQ=$H/../gpuq.sh; GPUQ_LOCK=$LOCK; . $GQ
 # windows): per GPU step flock -s /vesuvius/ufsm/opt/gpu<N>.lock (trainers hold it exclusively) and -s /tmp/ufsm-suite-locks/gpu<N>.excl
 # (run_suite's shared lock; bench bursts take it exclusively), released at every box boundary like the wbench lock. DLOCKS overrides
 # the list (comma separated; "" = none); off by default where neither file's directory exists (laptop, pods).
-DLOCKS=${DLOCKS-$( [ "${CPU:-0}" != 1 ] && [ -z "${NOLOCK:-}" ] && [ -d /vesuvius/ufsm/opt ] && [ -d /tmp/ufsm-suite-locks ] && echo /vesuvius/ufsm/opt/gpu$GPU.lock,/tmp/ufsm-suite-locks/gpu$GPU.excl)}
+# The locks name PHYSICAL cards: GPU is an index into CUDA_VISIBLE_DEVICES when that is set (CUDA_VISIBLE_DEVICES=1 GPU=0 = card 1);
+# UUID / MIG entries are mapped to the index by nvidia-smi.
+gpu_phys() {   # gpu_phys IDX: the physical index of logical device IDX under CUDA_VISIBLE_DEVICES
+  local i=$1 e; [ -z "${CUDA_VISIBLE_DEVICES+x}" ] && { echo "$i"; return; }
+  IFS=, read -r -a e <<< "$CUDA_VISIBLE_DEVICES"; e=${e[$i]:-}; e=${e// /}
+  [ -z "$e" ] && { echo "wbench: GPU $i is not in CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" >&2; echo "$i"; return 1; }
+  if [[ "$e" =~ ^[0-9]+$ ]]; then echo "$e"; return; fi
+  ${NVSMI:-nvidia-smi} --query-gpu=index,uuid --format=csv,noheader 2> /dev/null | awk -F', *' -v u="$e" 'index($2, u) == 1 || index("GPU-" $2, u) == 1 || index($2, "GPU-" u) == 1 {print $1; f = 1; exit} END {exit !f}' \
+    || { echo "wbench: CUDA_VISIBLE_DEVICES entry $e not found by nvidia-smi" >&2; echo "$i"; return 1; }
+}
+DLOCKS=${DLOCKS-$( [ "${CPU:-0}" != 1 ] && [ -z "${NOLOCK:-}" ] && [ -d /vesuvius/ufsm/opt ] && [ -d /tmp/ufsm-suite-locks ] && g=$(gpu_phys "$GPU") && echo /vesuvius/ufsm/opt/gpu$g.lock,/tmp/ufsm-suite-locks/gpu$g.excl)}
 DLFD=()
 dlk() { local f fd; [ ${#DLFD[@]} -gt 0 ] && return 0; for f in ${DLOCKS//,/ }; do exec {fd}>> "$f" || continue; flock -s $fd; DLFD+=($fd); done; return 0; }
 dulk() { local fd; for fd in "${DLFD[@]}"; do exec {fd}>&-; done; DLFD=(); return 0; }

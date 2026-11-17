@@ -401,3 +401,4 @@ test_retain                                    |              |     1 | bash tes
 test_evwatch                                   |              |     1 | bash tests/test_evwatch.sh
 test_podscripts                                |              |     1 | bash tests/test_podscripts.sh
 test_split_ab                                  | gpu2,slow    |   150 | tests/test_split_ab.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/splitab
+test_wbench_gpulock                            |              |     1 | tests/test_wbench_gpulock.sh
