@@ -524,6 +524,9 @@ extern "C" void nn_d2h(void *d, const void *s, size_t n) { CKR(cudaMemcpy(d, s, 
 extern "C" void nn_d2d(void *d, const void *s, size_t n) { CKR(cudaMemcpy(d, s, n, cudaMemcpyDeviceToDevice)); }
 extern "C" void nn_copy_async(void *d, const void *s, size_t n) { CKR(cudaMemcpyAsync(d, s, n, cudaMemcpyDefault, 0)); }   /* any direction (pinned host), ordered with the kernels */
 extern "C" void nn_d2d_async(void *d, const void *s, size_t n) { CKR(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToDevice, 0)); }   /* ordered with the kernels */
+extern "C" void nn_d2d_2d_async(void *d, size_t dpitch, const void *s, size_t spitch, size_t width, size_t rows) {   /* rows of width bytes, ordered with the kernels */
+    CKR(cudaMemcpy2DAsync(d, dpitch, s, spitch, width, rows, cudaMemcpyDeviceToDevice, 0));
+}
 __global__ void d2d_u4_k(uint4 *__restrict__ d, const uint4 *__restrict__ s, size_t n) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) d[i] = s[i];
 }

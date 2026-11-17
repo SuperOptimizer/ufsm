@@ -25,7 +25,7 @@ __global__ void conv1_mx_k(const uint8_t *x, const float *w, const float *b, flo
    (co, ci) made the kernel smem-instruction-bound. CO <= 8 (CP 8) or 16 (CP 16: 9..16 outputs, Co at run time). */
 template <int B, int CO, typename YT = float>   /* YT: fp32 or fp16 logits (lean training: the logit gradient fits beside fp16 logits) */
 __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const float *w, const float *b, YT *y, int N, int Ci, size_t S, gnp_t gp, int Co,
-                                                    size_t vb, size_t Sy, int Cy) {   /* Cy: y's channels per sample (Co, or more: a pass of a wider head) */   /* voxels [vb, vb + Sy) of x into y planes of Sy voxels (head slabs) */
+                                                    size_t vb, size_t Sy, int Cy, size_t Ly) {   /* Ly: y's plane stride (Sy, or a wider plane buffer) */   /* Cy: y's channels per sample (Co, or more: a pass of a wider head) */   /* voxels [vb, vb + Sy) of x into y planes of Sy voxels (head slabs) */
     constexpr int CP = CO <= 8 ? 8 : 16, C4 = CP / 4;
     extern __shared__ __align__(16) float c1s[];
     float4 *sw = (float4 *)c1s;                       /* [Ci][C4] (co 0..3, 4..7, ..) */
@@ -65,7 +65,7 @@ __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const floa
 #pragma unroll
     for (int co = 0; co < CO; co++) {
         if (co >= Co) break;
-        if constexpr (sizeof(YT) == 2) y[((size_t)n * Cy + co) * Sy + vl] = __float2half(acc[co]); else y[((size_t)n * Cy + co) * Sy + vl] = acc[co];
+        if constexpr (sizeof(YT) == 2) y[((size_t)n * Cy + co) * Ly + vl] = __float2half(acc[co]); else y[((size_t)n * Cy + co) * Ly + vl] = acc[co];
     }
 }
 /* voxels per block of the head's weight-gradient kernels: at most one slab (slab GroupNorm: a block's voxels span <= 2 slabs, its
@@ -77,9 +77,9 @@ static int slab_nper(const gnp_t &gp, int nper) {
 }
 static bool slab_small(const gnp_t &gp) { return gp.ns && gp.G && (long long)gp.zs * gp.zhw < 256; }   /* staged forward: >= 256 voxels per slab */
 static size_t conv1_smem(shape5 xs, int cout) { return (size_t)(2 * (xs.n > 2 ? xs.n : 2) * xs.c + (cout <= 8 ? 8 : 16) * xs.c) * sizeof(float); }   /* (>= 2 coefficient rows: slab banks) */
-template <int B, int CO, typename YT = float> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, YT *y, gnp_t gp, int cout, size_t vb = 0, size_t nv = 0, int cy = 0) {
+template <int B, int CO, typename YT = float> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, YT *y, gnp_t gp, int cout, size_t vb = 0, size_t nv = 0, int cy = 0, size_t ly = 0) {
     const size_t S = shape_spatial(xs), sm = conv1_smem(xs, cout), Sy = nv ? nv : S;
-    conv1_mx_t_k<B, CO, YT><<<dim3(nblk_(Sy, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp, cout, vb, Sy, cy ? cy : cout);
+    conv1_mx_t_k<B, CO, YT><<<dim3(nblk_(Sy, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp, cout, vb, Sy, cy ? cy : cout, ly ? ly : Sy);
 }
 /* the wide fp16-logit head on the tensor cores (perf2 2026-11-13): the latent nets' cell head (--lat-guide 3: 160 outputs from 256 MX-fp4
    channels) ran conv1_mx_t_k in 10 passes of 16 outputs, each re-reading x and doing 256 x 16 FFMAs a cell (P 512 92 M: 66 ms a step, ~5
@@ -310,21 +310,22 @@ extern "C" void lp_conv1_fwd_mx_h16_r(const void *x, int xdt, shape5 xs, const f
 /* fp32 logits of voxels [vb, vb + nv) into planes of nv voxels (y [cout][nv]): the same kernel instantiations, passes and order as
    lp_conv1_fwd_mx, so every voxel's logits are the bits of the whole-window call (one thread per voxel; vb only offsets the reads).
    Predict's per-chunk head (unet_head_fwd_z32: no whole-window logits). -1: a configuration lp_conv1_fwd_mx runs elsewise (staged / old) */
-extern "C" int lp_conv1_fwd_mx_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp, size_t vb, size_t nv) {
+extern "C" int lp_conv1_fwd_mx_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp, size_t vb, size_t nv, size_t ly) {
     if (xs.n != 1 || !nv) return -1;
+    if (!ly) ly = nv;   /* (ly: the plane stride of y, >= nv: the planes of a wider buffer) */
     if (cout > 16) {
         if (cout % 16) return -1;
-        for (int c0 = 0; c0 < cout; c0 += 16) if (lp_conv1_fwd_mx_r(x, xdt, xs, w + (size_t)c0 * xs.c, b ? b + c0 : nullptr, 16, y + (size_t)c0 * nv, gp, vb, nv)) return -1;
+        for (int c0 = 0; c0 < cout; c0 += 16) if (lp_conv1_fwd_mx_r(x, xdt, xs, w + (size_t)c0 * xs.c, b ? b + c0 : nullptr, 16, y + (size_t)c0 * ly, gp, vb, nv, ly)) return -1;
         return 0;
     }
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;   /* mgpu: env */
     if (old || conv1_smem(xs, cout) > 32 * 1024 || slab_small(gp)) return -1;
-#define C1R(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, y, gp, cout, vb, nv); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, y, gp, cout, vb, nv); break; \
-                               case 3: conv1_mx_t<B, 3>(x, xs, w, b, y, gp, cout, vb, nv); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, y, gp, cout, vb, nv); break; \
-                               case 5: conv1_mx_t<B, 5>(x, xs, w, b, y, gp, cout, vb, nv); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, y, gp, cout, vb, nv); break; \
-                               case 7: conv1_mx_t<B, 7>(x, xs, w, b, y, gp, cout, vb, nv); break; case 8: conv1_mx_t<B, 8>(x, xs, w, b, y, gp, cout, vb, nv); break; \
-                               case 11: conv1_mx_t<B, 11>(x, xs, w, b, y, gp, cout, vb, nv); break; \
-                               default: conv1_mx_t<B, 16>(x, xs, w, b, y, gp, cout, vb, nv); } } while (0)
+#define C1R(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; \
+                               case 3: conv1_mx_t<B, 3>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; \
+                               case 5: conv1_mx_t<B, 5>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; \
+                               case 7: conv1_mx_t<B, 7>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; case 8: conv1_mx_t<B, 8>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; \
+                               case 11: conv1_mx_t<B, 11>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; \
+                               default: conv1_mx_t<B, 16>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); } } while (0)
     if (xdt == 4) C1R(4); else C1R(8);
 #undef C1R
     LPCK();

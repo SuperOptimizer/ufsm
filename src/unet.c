@@ -3083,12 +3083,12 @@ int unet_head_fwd_z(unet *u, int z0, int z1, void *y16) {
 }
 /* the inference head (the same rows, weights and kernels as the whole-window forward's fp32 head) on level-0 planes [z0, z1) into fp32 planes
    [rows][(z1 - z0) h w]: the bits the whole-window logits hold there. After an inference forward of a unet_set_head_infer_z build; -1 otherwise */
-int unet_head_fwd_z32(unet *u, int z0, int z1, float *y) {
+int unet_head_fwd_z32(unet *u, int z0, int z1, float *y, size_t ly) {
     if (!u->built || u->train || !u->head_iz_on || z0 < 0 || z1 > u->ls[0].d || z1 <= z0) return -1;
     const int w0 = u->cfg.widths[0], hc0 = u->head_nc ? u->head_c0 : 0, hnc = u->head_nc ? u->head_nc : u->cfg.cout;
     const size_t hwp = (size_t)u->ls[0].h * u->ls[0].w; nn_gn_t g = gn_out(u, &u->dec[0]);
     nn_set_layer(3 * u->cfg.nlev - 2);
-    return nn_head_fwd_z32(u->dec[0].a2, &g, u->dec[0].ys, P(u, u->head.w) + (size_t)hc0 * w0, P(u, u->head.b) + hc0, hnc, y, (size_t)z0 * hwp, (size_t)(z1 - z0) * hwp);
+    return nn_head_fwd_z32(u->dec[0].a2, &g, u->dec[0].ys, P(u, u->head.w) + (size_t)hc0 * w0, P(u, u->head.b) + hc0, hnc, y, (size_t)z0 * hwp, (size_t)(z1 - z0) * hwp, ly);
 }
 int unet_head_bwd_z(unet *u, int z0, int z1, const void *gy16, int first) {
     const float *x; nn_gn_t g; const int gn = head_src(u, &x, &g);

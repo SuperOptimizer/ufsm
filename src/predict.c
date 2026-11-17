@@ -3097,16 +3097,12 @@ static int predict_one(int argc, char **argv) {
                                 }
                                 if (za == 0) hzv = 0;   /* a new window: nothing held */
                                 const int o0 = n0 > hzq0 ? n0 : hzq0, o1 = n1 < hzq0 + hzv ? n1 : hzq0 + hzv, nw = hzi ^ 1;   /* the overlap with the held planes */
-                                if (o1 > o0) for (int c = 0; c < hr; c++) nn_d2d_async(hzb[nw] + ((size_t)c * hzcap + (o0 - n0)) * pl, hzb[hzi] + ((size_t)c * hzcap + (o0 - hzq0)) * pl, (size_t)(o1 - o0) * pl * 4);
-                                /* the new planes [n0, o0) and [o1, n1) (o0 == n0 when they overlap: chunks advance in z) */
-                                float *tmp = nullptr; const int ra[2][2] = {{n0, o1 > o0 ? o0 : n1}, {o1 > o0 ? o1 : n1, n1}};
+                                const size_t cs = (size_t)hzcap * pl;   /* (the channel stride of both buffers) */
+                                if (o1 > o0) nn_d2d_2d_async(hzb[nw] + (size_t)(o0 - n0) * pl, cs * 4, hzb[hzi] + (size_t)(o0 - hzq0) * pl, cs * 4, (size_t)(o1 - o0) * pl * 4, (size_t)hr);
+                                /* the new planes [n0, o0) and [o1, n1) (one of them empty: chunks advance in z), written in place (plane stride cs) */
+                                const int ra[2][2] = {{n0, o1 > o0 ? o0 : n1}, {o1 > o0 ? o1 : n1, n1}};
                                 for (int r_ = 0; r_ < 2; r_++) { const int p0 = ra[r_][0], p1 = ra[r_][1]; if (p1 <= p0) continue;
-                                    if (p0 == n0 && p1 == n1) { if (unet_head_fwd_z32(u, p0, p1, hzb[nw])) { fprintf(stderr, "predict: the chunk head failed\n"); return 1; } continue; }
-                                    if (!tmp && !(tmp = nn_malloc((size_t)hr * (p1 - p0) * pl * 4))) { fprintf(stderr, "predict: no device memory for the chunk head\n"); return 1; }
-                                    if (unet_head_fwd_z32(u, p0, p1, tmp)) { fprintf(stderr, "predict: the chunk head failed\n"); return 1; }
-                                    for (int c = 0; c < hr; c++) nn_d2d_async(hzb[nw] + ((size_t)c * hzcap + (p0 - n0)) * pl, tmp + (size_t)c * (p1 - p0) * pl, (size_t)(p1 - p0) * pl * 4);
-                                    nn_sync(); nn_free(tmp); tmp = nullptr;
-                                }
+                                    if (unet_head_fwd_z32(u, p0, p1, hzb[nw] + (size_t)(p0 - n0) * pl, cs)) { fprintf(stderr, "predict: the chunk head failed\n"); return 1; } }
                                 hzi = nw; hzq0 = n0; hzv = n1 - n0; l2d = hzb[hzi]; q0 = n0; qd = hzcap; cq_ = (size_t)hzcap * pl;
                                 nn_ptick("fit: chunk head");
                             }

@@ -34,7 +34,8 @@ void nn_h2d(void *dst, const void *src, size_t bytes);
 void nn_d2h(void *dst, const void *src, size_t bytes);
 void nn_d2d(void *dst, const void *src, size_t bytes);
 void nn_copy_async(void *dst, const void *src, size_t bytes);   /* device / pinned host in any direction, on the compute stream */
-void nn_d2d_async(void *dst, const void *src, size_t bytes);   /* on the default stream, no host sync */
+void nn_d2d_async(void *dst, const void *src, size_t bytes);
+void nn_d2d_2d_async(void *dst, size_t dpitch, const void *src, size_t spitch, size_t width, size_t rows);   /* rows x width bytes, pitched, default stream */   /* on the default stream, no host sync */
 void nn_d2d_kernel(void *dst, const void *src, size_t bytes);  /* the same as a copy kernel (16-byte aligned dst, src): no copy engine */
 void nn_set_zrange(int zi0, int Di, int first, int last, int Do, int zo);   /* z-range of the next MX forward convs (see nn_bwd.cu): output planes zo + .. of Do, reading input planes zi0 + .. of a depth-Di input; Di 0 = off */
 void nn_set_zrange_out(int on);   /* 1: the z-range's MX conv outputs go to planes zo + .. of the depth-Do output itself (no temp; nn_bwd.cu) */
@@ -428,7 +429,7 @@ int nn_head_bwd_x(const float *x, const nn_gn_t *gx_gn, shape5 xs, const float *
 /* the head on voxels [vb, vb + nv) of x (trainer head slabs): fp16 logits / logit gradient as planes of nv voxels; bwd: first = the first
    slab of a backward (draws the SR seed the others reuse). -1: not covered (MX x / gx, 16-bit gradients) */
 int nn_head_fwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, const float *w, const float *b, int cout, void *y16, size_t vb, size_t nv);
-int nn_head_fwd_z32(const float *x, const nn_gn_t *gx, shape5 xs, const float *w, const float *b, int cout, float *y, size_t vb, size_t nv);   /* fp32 inference head, voxels [vb, vb + nv) */
+int nn_head_fwd_z32(const float *x, const nn_gn_t *gx, shape5 xs, const float *w, const float *b, int cout, float *y, size_t vb, size_t nv, size_t ly);   /* fp32 inference head, voxels [vb, vb + nv), y plane stride ly (0: nv) */
 int nn_head_bwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx, size_t vb, size_t nv, int first);   /* fused 1^3 head backward (MX x / gx, fp16 gy); -1 = not covered */
 int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, int up, shape5 xs,
                            const float *gy, shape5 ys, int k, int stride, float *gw, float *gb);   /* gw / gb accumulated */
