@@ -6,6 +6,44 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## lat_heads_tc_k: predict's heads with a tensor-core stem, 2.4x (2026-11-17, branch convklh-20261117)
+
+lat_heads_k (nn_lat_heads_place, predict --heads) was 31 % of the ink recipe's kernel time: 37.5 ms of 121.9 per window on the 0332 set.
+ncu on one window: 41.0 ms at 255 registers, 8 % of warps active, issue active 17.5 %. Without the stem (timing only) it ran 26.0 ms, so
+the stem was 15.0 ms and the rest was latency.
+
+lat_heads_tc_k (UFSM_LATHEADS_TC, default 1; 0 = lat_heads_k):
+- A block of 128 threads takes a row of 32 cells. It stages the CT taps of the row's 4 x 64 stem blocks once in shared memory (36 rows,
+  fp16, z-scored as nn_lat_ct_x).
+- pre = W1 taps runs per 8-block n-tile with mma m16n8k16, with fstem_fwd_k's scaled fp16 W1 fragments, k-steps and B pairs. pre and
+  h = silu(pre / scale + b1) are therefore the bits nn_fstem_fwd produces in the slab composition.
+- h goes into shared memory over the dead tap rows: 18 KB, 5 blocks an SM.
+- Thread (lane = cell, warp = z quarter) then does its 16 voxels per head with lat_heads_k's arithmetic (the W2 . h projection c
+  ascending as fstem's, the fp16 adds, the rv fusion, the byte).
+- __launch_bounds__(128, 5): 96 registers.
+
+| registers (ncu, 0332 window) | ms |
+|---|---|
+| 150 (smem-limited to 3 blocks) | 20.1 |
+| 128 | 17.0 |
+| 96 (some spills) | 16.9 |
+| 80 | 18.5 |
+
+Bytes:
+- test_lathead: byte-identical to the slab composition (lat_up + shuffle + nn_fstem_fwd + place). Against lat_heads_k, whose fp32 stem
+  sums run in another order: 14 of 12.3 M bytes differ, all by 1.
+- PHerc1667 1024^3 level-2 box (inkpod 15000), against lat_heads_k:
+
+  | head | voxels that differ (of 1.07 G) |
+  |---|---|
+  | ink | 434 |
+  | c12 | 1353 |
+  | c13 | 1151 |
+
+  All differ by 1; the means are unchanged.
+
+Ink recipe (0332, 32 windows, interleaved twice, the same binary at TC 0 / 1): 112.8 / 112.8 -> 91.4 / 90.6 ms per window (-19 %),
+lat_heads 37.5 -> 15.4-16.2 ms. Fields does not run this kernel.
 ## 2-D ink teachers on the try9-6250 pod unrolls: 1667 held-out GT, 0332 papyrus renders (2026-11-17)
 
 The RTX PRO 6000 pod's unrolls (try9-6250 fields; per-wrap flattened `up/wNNN` tifxyz) inked with the 2-D teachers via ink-ext
