@@ -1189,7 +1189,7 @@ static int pred_view_set(unet *u, const int64_t o[3], int Wz, int W) {   /* the 
 /* A latent-grid net (lat != 0: half_res 3, the direct cell input nn_lat_pred_input[_c], fit fields from the full-resolution fp16 planes lgf,
    no sub-cell guide or the 64-term one): the transformed CT window into the cell input x2 (and the skip mask from it), the trunk, the
    heads upsampled into lgf as in the plain pass (nch planes, fp16), back through T. */
-static int g_tta_ord[TTA_MAX];   /* the pass codes (tta_order; UFSM_TTA_ORDER) */
+static int g_tta_ord[TTA_MAX];   /* the pass codes (tta_order; UFSM_TTA_ORDER); mgpu: config (set in main before any predict thread) */
 typedef struct { unet *u; uint8_t *ctd; const uint8_t *ctsave; float mean, isd; const float *dyo, *dxo; float *dyt, *dyd; int axis; shape5 xs; int h16, D, W, nch, ch_normal;
                  int lat, latc, lguide, cout, skw, skip_nl, skip_thr, skip_margin; const float *lbas, *lgain; float lstep; void *x2; float **lgfp; shape5 xn; } tta_ctx;
 static const float *tta_pass(const tta_ctx *T, int code) {
