@@ -11,44 +11,48 @@ Originally no teacher models; since 2026-11-15 published ink networks run as tea
 On packed sheets the net's phase runs one cycle across ~3 touching GT sheets ("Where the packed-sheet deficit lives" below). No
 integer solve fixes that locally, so the export now says where it happens instead of passing it off as confident surface.
 
-**Truth.** GT radial intervals: along radial rays (16 z planes x 720 angles per box), consecutive GT sheet crossings one turn apart
-(codes, winding = (code - 1) / 18 mod 14), the net's unwrapped phase advance n across the interval; merged = n < 0.5. The kept wbench
-fields of u1 13790 (u1-fd615-core / -ho) and try9 base (pab-base-core / -ho): clean Paris 4 (PH1-3, HOLD, 28 J boxes) and 25 clean
-1667 boxes, 113 (net, box) pairs, 3.3 M intervals; merged share 0.02-0.06 on easy 1667 boxes, 0.66-0.70 on PH1 / J12.
-Prototype: /vesuvius/ufsm/mergeflag/proto (mfx.py features + truth, mfa.py / mff.py fits).
+**Truth and evaluation in C: `ufsm merge-flag --eval LIST`** (src/mergeflag.c; LIST lines "name scroll fields-dir codes-root
+codes-key"; box by box on threads, 3 min for all 114 pairs on 8 threads). GT radial intervals: along radial rays (16 z planes x 720
+angles per box, one native voxel a step, from the fields' axis), consecutive GT sheet crossings one turn apart (codes, winding =
+(code - 1) / 18 mod 14), the net's phase unwrapped across the interval: n; merged = n < 0.5 (the box's sign from the median). The
+interval's features are its middle cell's. This is the label phase's count by construction (the GT codes are what the label phase is
+rasterised from), without needing the phase raster, which is not on the desk for 1667. Boxes: the kept wbench fields of u1 13790
+(u1-fd615-core / -ho) and try9 base (pab-base-core / -ho): clean Paris 4 (PH1-3, HOLD, 28 J boxes) and 25 clean 1667 boxes: 114
+(net, box) pairs, 3.22 M intervals; merged share 0.02-0.06 on easy 1667 boxes, 0.60-0.70 on PH1 / PH2 / J12. (A numpy prototype gave
+the same numbers within 0.003 AUC; it is not kept: the evaluation is the C mode, test_mergeflag runs it on synthetic GT.)
 
 **Features** (net fields only; box filters with edge replication; per field cell):
 - amp9: the phase confidence |(pc, ps)| averaged over material cells, 9-cell box;
 - R5: the phase's turns per cell (per axis the angle of the 5-box mean of z(x + e_a) conj z(x), as a vector) times the density head's
   spacing in cells (5-box mean of the known sp / 8). Phase turns per density turn: ~1 where both count the same sheets, ~1/3 on a merge;
-- sp9: the density spacing, 9-box.
-Single-feature held-out AUC (low = merged): R5 0.925, amp9 0.894, sp9 0.793. Also tried, not kept: the same at 3 / 5 / 9 boxes,
-the spacing over 0.5 mm, phase coherence, normal anisotropy (0.51-0.54), wind4 vs phase disagreement (0.63): ten features gave
-held-out AUC 0.929 against 0.926 for these three, which need only pc / ps / sp / w.
+- sp9: the density spacing, 9-box (computed, weight 0 in the rule).
+Prototype screening also tried, and dropped: other box sizes, the spacing over 0.5 mm, phase coherence, normal anisotropy (AUC
+0.51-0.54), wind4 vs phase disagreement (0.63): ten features gained < 0.003 AUC over these.
 
-**Rule:** logistic, p = 1 / (1 + exp(-(4.0041 - 2.7562 amp9 - 6.5289 R5 - 0.0703 sp9))), fitted on every box; mf = round(255 p).
-Held-out numbers below are from the same fit on the even boxes (by name), tested on the odd ones:
+**Rule: fixed, round constants:** p = 1 / (1 + exp(-6.5 (0.62 - R5 - 0.5 amp9))) (--coef 4.03,-3.25,-6.5,0), mf = round(255 p).
+The fitted logistic (amp9, R5, sp9) is within 0.002 AUC of it on every split, so the fixed rule is the default:
 
-| held-out | intervals | merged | AUC | p >= 0.5: P / R | p >= 0.7: P / R |
-|---|---|---|---|---|---|
-| all | 1.66 M | 0.249 | 0.930 | 0.801 / 0.720 | 0.883 / 0.596 |
-| u1, Paris 4 / 1667 | 0.66 M / 0.16 M | 0.274 / 0.130 | 0.939 / 0.885 | 0.772 / 0.794, 0.805 / 0.393 | 0.866 / 0.670, 0.873 / 0.309 |
-| try9, Paris 4 / 1667 | 0.66 M / 0.16 M | 0.283 / 0.137 | 0.936 / 0.898 | 0.831 / 0.726, 0.838 / 0.393 | 0.902 / 0.591, 0.904 / 0.310 |
+| split (test boxes) | intervals | merged | fixed rule AUC | logistic AUC | R5 alone | amp9 alone | fixed: P / R at mf >= 128 |
+|---|---|---|---|---|---|---|---|
+| held-out boxes (fit even, test odd) | 1.64 M | 0.250 | 0.934 | 0.933 | 0.927 | 0.898 | 0.764 / 0.769 |
+| - of them Paris 4 | 1.33 M | 0.279 | 0.937 | 0.937 | 0.930 | | 0.764 / 0.802 |
+| - of them 1667 | 0.31 M | 0.125 | 0.903 | 0.902 | 0.889 | | 0.756 / 0.459 |
+| scroll-out: fit Paris 4, test 1667 | 0.64 M | 0.131 | 0.893 | 0.895 | 0.871 | 0.869 | 0.716 / 0.466 |
+| scroll-out: fit 1667, test Paris 4 | 2.58 M | 0.329 | 0.941 | 0.942 | 0.936 | 0.895 | 0.787 / 0.840 |
 
-- Within-box held-out AUC: median 0.917, p10 0.859 (52 pairs).
-- Cross-scroll: fit on Paris 4, test on 1667: AUC 0.886; the reverse: 0.942.
-- By GT gap (held-out): AUC 0.734 below 70 um (where the fields' 19.2 um cells cannot resolve the sheets anyway), then 0.902 / 0.934 /
-  0.950 / 0.959 at 70-100 / 100-130 / 130-180 / > 180 um.
-- **Gate (AUC >= 0.8 on held-out boxes): PASS.** On 1667 the recall at p >= 0.5 is ~0.4: the merges there are fewer and subtler.
+- Within-box AUC (median over boxes with 5-95 % merged): fixed 0.917 held-out, 0.902 on 1667 scroll-out, 0.920 on Paris 4 scroll-out.
+- R5 alone is 0.024 short on the 1667 scroll-out (0.871), so the rule keeps amp9; sp9's weight is not worth its own term.
+- By GT gap (prototype, held-out): AUC 0.73 below 70 um (where the 19.2 um cells cannot resolve the sheets), 0.90-0.96 above.
+- **Gate (AUC >= 0.8 on held-out boxes and across scrolls): PASS.** On 1667 the recall at mf >= 128 is ~0.46: its merges are fewer and subtler.
 
-**ufsm merge-flag FIELDS [--out DIR] [--thr 128]** (src/mergeflag.c): z slabs of 128 rows (+4 each side) in memory, 128 x 128 tiles
+**ufsm merge-flag FIELDS [--out DIR] [--thr 179]** (src/mergeflag.c): z slabs of 128 rows (+4 each side) in memory, 128 x 128 tiles
 on threads; writes plane mf (zarr, 128^3 shards, lossless; raw fields: mf.raw) with the coefficients and mf_thr in its attributes. The
-1667 q2 fields (4635 x 1568 x 1616 cells) take 9.0 min on 12 threads (1.4 GB of rows per plane set); 14.8 % of the material flagged;
+1667 q2 fields (4635 x 1568 x 1616 cells) take 9.0 min on 12 threads (1.4 GB of rows per plane set); the fixed rule flags 17.4 % of the material at mf >= 128;
 mf is 1.4 GB on disk. test_mergeflag: a numpy reference of the same definitions on synthetic fields (every cell within 1 byte,
-0.001 % off by one), the merged half flagged / the clean half not, crops, and wrap-mf's shares and grids. Against the prototype's
-features at PH1's intervals: correlation 0.9988 (the prototype's np.roll edge rule).
+0.001 % off by one), the merged half flagged / the clean half not, crops, wrap-mf's shares and grids, and --eval on synthetic GT codes
+(AUC 1.000 on every split).
 
-**Abstain in the unroll** (scripts/unroll/unroll.sh, MFLAG=1 default, MFTHR 128):
+**Abstain in the unroll** (scripts/unroll/unroll.sh, MFLAG=1 default, MFTHR 179):
 - mflag: a background stage started as soon as the final fields exist (after rectosp), beside ref / slabs / join on TH / 2 threads at
   nice 10, so it adds no wall to the critical path (it was first serial in check: +4-9 min, branch mfbg-20261118 moved it); only its
   consumers wait for state/mflag.done (mfready): the GT split, snap's wrapmf.tsv (before CLEAN deletes the planes it reads), perwrap's masks;
@@ -59,26 +63,27 @@ features at PH1's intervals: correlation 0.9988 (the prototype's np.roll edge ru
 - perwrap: r/<w>/<w>_mf.tif, the mask on the render's pixel grid (wrap-mf --render 1: (w - 1) step + 1 pixels, as render --scale 1).
 
 **GT check on 1667** (pod q2 joined model, u1 13790 fields, recto-blended sp as the unroll uses; 54 GT boxes, 2.31 G labelled voxels;
-deltas voxel-weighted, 95 % CI from a box bootstrap):
+the fixed rule; deltas voxel-weighted, 95 % CI from a box bootstrap):
 
-| confident = mf < | ids right | delta | CI | boxes up | coverage lost | wrong voxels removed |
-|---|---|---|---|---|---|---|
-| (all) | 0.8607 | | | | 0 | 0 |
-| 179 (p 0.7) | 0.8765 | +0.0157 | [+0.0116, +0.0203] | 51 / 54 | 4.5 % | 15.3 % |
-| 128 (p 0.5, default) | 0.8800 | +0.0193 | [+0.0145, +0.0243] | 51 / 54 | 6.5 % | 19.5 % |
-| 102 | 0.8817 | +0.0210 | [+0.0160, +0.0263] | 50 / 54 | 7.8 % | 21.7 % |
-| 77 | 0.8837 | +0.0230 | [+0.0178, +0.0284] | 50 / 54 | 9.4 % | 24.4 % |
-| 51 (p 0.2) | 0.8864 | +0.0257 | [+0.0203, +0.0315] | 51 / 54 | 12.1 % | 28.3 % |
+| confident = mf < | ids right | delta | CI | boxes up | coverage lost | wrong voxels removed | gain per point lost |
+|---|---|---|---|---|---|---|---|
+| (all) | 0.8607 | | | | 0 | 0 | |
+| 179 (p 0.7, default) | 0.8781 | +0.0174 | [+0.0130, +0.0221] | 50 / 54 | 5.4 % | 17.2 % | 0.0032 |
+| 153 | 0.8799 | +0.0191 | [+0.0144, +0.0242] | 49 / 54 | 6.5 % | 19.4 % | 0.0016 |
+| 128 (p 0.5) | 0.8815 | +0.0208 | [+0.0159, +0.0260] | 50 / 54 | 7.7 % | 21.5 % | 0.0014 |
+| 102 | 0.8834 | +0.0226 | [+0.0175, +0.0280] | 50 / 54 | 9.2 % | 24.0 % | 0.0012 |
+| 77 | 0.8854 | +0.0246 | [+0.0193, +0.0303] | 51 / 54 | 11.2 % | 26.9 % | 0.0010 |
+| 51 (p 0.2) | 0.8881 | +0.0274 | [+0.0218, +0.0333] | 51 / 54 | 14.4 % | 31.2 % | 0.0008 |
 
-Default threshold 128 is the knee: the gain per point of coverage lost falls from 0.0035 (to 179) and 0.0018 (179 -> 128) to 0.0013
-(128 -> 102), 0.0012 and 0.0010 below. At it: confident ids 0.8800, coverage lost 6.5 %.
-The uncertain part (mf >= 128) scores ids 0.605: its voxels are wrong 3.3x as often as the confident part's.
-**Gate (confident ids up measurably at <= 15 % coverage lost): PASS** (+0.019 at 6.5 %, +0.026 at 12 %).
+(The fitted logistic at 128, before the fixed rule: 0.8800, +0.019 at 6.5 % lost: the same curve.) **Default threshold 179, the knee**:
+the point farthest above the chord from (0, 0) to the 15 % end (0.0071 vs 0.0067 at 153, 0.0061 at 128); past it each point of coverage
+buys half as much. At it: confident ids 0.8781 (+0.017), coverage lost 5.4 %; the uncertain part scores 0.556, wrong 3.6x as often.
+**Gate (confident ids up measurably at <= 15 % coverage lost): PASS** (+0.017 at 5.4 %, +0.027 at 14.4 %).
 
-Per-wrap uncertain share on the q2 wraps (qa/wrapmf.tsv): 0.15 of all vertices; the core wraps w000-w003 0.91 / 0.80 / 0.65 / 0.51,
-the middle w013-w027 0.05-0.08, rising to 0.62 at w043 (the outer turns, where the papyrus thins). wrap-check's "merged" verdicts
-(w011-13, w018-22, w025-27; CT peaks between wraps) do not line up with it (shares 0.05-0.12): consistent with CT peaks being no counting
-reference (section "rhocal" below).
+Per-wrap uncertain share on the q2 wraps at 179 (qa/wrapmf.tsv): 0.14 of all vertices (the GT boxes sit in the middle turns, hence
+their 5.4 %); the core wraps w000-w003 0.90 / 0.78 / 0.63 / 0.48, the middle w013-w027 0.04-0.07, rising to 0.58 at w043 (the outer
+turns, where the papyrus thins). wrap-check's "merged" verdicts (w011-13, w018-22, w025-27; CT peaks between wraps) do not line up with
+it (shares 0.04-0.11): consistent with CT peaks being no counting reference (section "rhocal" below).
 
 **Limits.** A merge also shifts the numbering of every sheet beyond it; a local mask cannot remove that, so the confident part's gain
 is bounded: at 12 % coverage 28 % of the wrong voxels go, the rest are confident cells numbered from across a merge. The mask is for

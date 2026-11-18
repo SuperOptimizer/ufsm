@@ -970,7 +970,7 @@ int cmd_ink_cover(int argc, char **argv) {
     return 0;
 }
 
-/* ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR] [--thr 128] [--pool 4] [--out DIR [--render 1]] [--tsv FILE]: the merged-sheet
+/* ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR] [--thr 179] [--pool 4] [--out DIR [--render 1]] [--tsv FILE]: the merged-sheet
    flag (ufsm merge-flag, src/mergeflag.h) on every wrap: each vertex reads the share of mf >= thr cells in its pooled cell (pool^3
    field cells, fit_field_array_frac: a whole scroll's plane at pool 4 is ~1/64 of its cells). Per wrap the uncertain share (mean
    share over the valid vertices) and the share of vertices in a cell at least half flagged; --out: <wrap>_mf.tif per wrap (uint8
@@ -979,10 +979,10 @@ int cmd_ink_cover(int argc, char **argv) {
    uncertain vertices are where the exported wrap should not be read as a confident sheet. */
 int cmd_wrap_mf(int argc, char **argv) {
     if (argc < 3 || !sopt(argc, argv, "--fields", nullptr)) {
-        fprintf(stderr, "usage: ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR (default: the fields dir)] [--thr 128] [--pool 4] [--out DIR [--render 1]] [--tsv FILE]\n"); return 2;
+        fprintf(stderr, "usage: ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR (default: the fields dir)] [--thr 179] [--pool 4] [--out DIR [--render 1]] [--tsv FILE]\n"); return 2;
     }
     const char *fd = sopt(argc, argv, "--fields", ""), *md = sopt(argc, argv, "--mf", fd), *od = sopt(argc, argv, "--out", nullptr), *tp = sopt(argc, argv, "--tsv", nullptr);
-    const int thr = opt_atoi("--thr", sopt(argc, argv, "--thr", "128")), pool = opt_atoi("--pool", sopt(argc, argv, "--pool", "4")), rgrid = opt_atoi("--render", sopt(argc, argv, "--render", "0"));
+    const int thr = opt_atoi("--thr", sopt(argc, argv, "--thr", "179")), pool = opt_atoi("--pool", sopt(argc, argv, "--pool", "4")), rgrid = opt_atoi("--render", sopt(argc, argv, "--render", "0"));
     if (pool < 1 || thr < 1 || thr > 255) { fprintf(stderr, "wrap-mf: --pool >= 1, --thr 1..255\n"); return 2; }
     sf_fields F; if (sff_load_geom(fd, &F)) { fprintf(stderr, "wrap-mf: cannot read the fields %s\n", fd); return 1; }
     int shp[3]; uint8_t *fr = fit_field_array_frac(md, "mf", pool, thr, shp);

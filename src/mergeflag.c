@@ -13,10 +13,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
+#include <unistd.h>
 
-/* fitted on the wbench boxes' GT intervals (u1 13790 + try9 fields; DESIGN 2026-11-18 "merge-flag"): raw-unit coefficients */
-const mf_coef mf_coef_default = {.b = 4.0041, .c_amp = -2.7562, .c_r = -6.5289, .c_sp = -0.0703};
-const int mf_thr_default = 128;
+/* a fixed rule with round constants (merge-flag --eval: within 0.002 AUC of the fitted logistic on every split; DESIGN "merge-flag") */
+const mf_coef mf_coef_default = {.b = 4.03, .c_amp = -3.25, .c_r = -6.5, .c_sp = 0};   /* p = 1 / (1 + exp(-6.5 (0.62 - R5 - 0.5 amp9))) */
+const int mf_thr_default = 179;   /* the knee of 1667's GT coverage curve (DESIGN "merge-flag"): p >= 0.7 */
 
 enum { MF_R = 4 };
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
@@ -163,9 +167,15 @@ static void *mf_worker(void *a) {
 }
 
 /* ufsm merge-flag <fields-dir> [--out DIR] [--coef b,amp,r,sp] [--thr T] [--threads N] */
+static int cmd_merge_flag_eval(int argc, char **argv, const char *list);
+static int cmd_merge_flag_apply(int argc, char **argv, const char *src, const char *out);
 int cmd_merge_flag(int argc, char **argv) {
+    if (argc >= 5 && !strcmp(argv[2], opt_n("--apply"))) return cmd_merge_flag_apply(argc, argv, argv[3], argv[4]);
+    if (argc >= 4 && !strcmp(argv[2], opt_n("--eval"))) return cmd_merge_flag_eval(argc, argv, argv[3]);
     if (argc < 3) {
-        fprintf(stderr, "usage: ufsm merge-flag <fields-dir> [--out DIR] [--coef b,c_amp,c_r,c_sp] [--thr 128] [--threads N]\n"
+        fprintf(stderr, "usage: ufsm merge-flag <fields-dir> [--out DIR] [--coef b,c_amp,c_r,c_sp] [--thr 179] [--threads N]\n"
+                        "       ufsm merge-flag --apply FIELDS OUT [--mf-w 1 | --mf-cut T]   FIELDS' evidence down-weighted where merged (pc ps w x (1 - K mf / 255)) for count-field / fit\n"
+                        "       ufsm merge-flag --eval LIST [--coef ..] [--threads 4]   the rule against GT intervals (LIST: name scroll fields-dir codes-root codes-key)\n"
                         "  the merged-sheet score of every field cell (src/mergeflag.h) as plane mf: zarr fields -> DIR/mf (zarr, 128^3 shards), raw\n"
                         "  fields -> DIR/mf.raw (DIR: default the fields directory; a crop needs --out). Prints the material share flagged (mf >= thr).\n");
         return 2;
@@ -176,7 +186,7 @@ int cmd_merge_flag(int argc, char **argv) {
     if (crop && !strcmp(out, argv[2])) { fprintf(stderr, "merge-flag: %s is a crop of another fields set: give --out\n", argv[2]); json_free(I.j); return 2; }
     mf_coef c = mf_coef_default; const char *cs = opt(argc, argv, "--coef", nullptr);
     if (cs && sscanf(cs, "%lf,%lf,%lf,%lf", &c.b, &c.c_amp, &c.c_r, &c.c_sp) != 4) { fprintf(stderr, "merge-flag: --coef b,c_amp,c_r,c_sp\n"); return 2; }
-    const int thr = opt_atoi("--thr", opt(argc, argv, "--thr", "128")), nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16);
+    const int thr = opt_atoi("--thr", opt(argc, argv, "--thr", "179")), nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16);
     const char *names[4] = {"pc", "ps", "sp", "w"}; mf_rd rd[4];
     for (int k = 0; k < 4; k++) if (mf_rd_open(&rd[k], &I, names[k])) return 1;
     mkdir(out, 0775);
@@ -210,5 +220,295 @@ int cmd_merge_flag(int argc, char **argv) {
     if (fo && fclose(fo)) rc = 1;
     if (!rc) printf("merge-flag: %lld x %lld x %lld cells, %lld with material, flagged (mf >= %d) %.4f -> %s\n", D, H, W, nmat, thr, nmat ? (double)nflag / nmat : 0, p);
     json_free(I.j);
+    return rc;
+}
+
+/* ---- merge-flag --eval: the rule against GT, streamed box by box (no per-box arrays kept beyond its intervals) ----
+   Truth (GT intervals): in NZ z planes of each box, rays from the fields' axis at NTH angles, one native voxel a step; GT sheet
+   crossings = runs of labelled code voxels (code 1..252, winding (code - 1) / 18 mod 14), their middles; two consecutive crossings one
+   turn apart (d = 1 or 13 mod 14, >= 2 steps apart) make an interval; n = the net's phase (atan2 of the cell's pc, ps) unwrapped along
+   the ray between them, signed by d, the box's sign the median's; merged = n < 0.5 (the phase misses the turn). The interval's features
+   are the cell at its middle (mf_block over the whole box, borders replicated). */
+enum { EV_NZ = 16, EV_NTH = 720, EV_NF = 3 };
+typedef struct { float f[EV_NF], gap; uint8_t y; } ev_iv;   /* features amp9, r5, sp9; gap (um); y merged */
+typedef struct { char name[64], scroll[32], fields[1024], croot[1024], ckey[64]; ev_iv *iv; size_t n, cap; int rc; double merged; } ev_box;
+static void ev_push(ev_box *B, const ev_iv *v) {
+    if (B->n == B->cap) { B->cap = B->cap ? 2 * B->cap : 4096; B->iv = realloc(B->iv, B->cap * sizeof *B->iv); if (!B->iv) abort(); }
+    B->iv[B->n++] = *v;
+}
+static int ev_cmpd(const void *a, const void *b) { const double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
+static int ev_one(ev_box *B) {
+    mf_in I; if (mf_open(&I, B->fields)) return -1;
+    const long long D = I.shape[0], H = I.shape[1], W = I.shape[2]; const int h = I.h; const size_t N = (size_t)D * H * W;
+    const json *ax = json_get(I.j, "axis"); const char *names[4] = {"pc", "ps", "sp", "w"}; uint8_t *pl[4] = {0}; int rc = 0;
+    for (int k = 0; k < 4 && !rc; k++) { mf_rd r; if (!(pl[k] = malloc(N)) || mf_rd_open(&r, &I, names[k])) { rc = -1; break; } if (mf_rows(&r, 0, D, pl[k], 4)) rc = -1; mf_rd_close(&r); }
+    const int pd = (int)D + 2 * MF_R, ph = (int)H + 2 * MF_R, pw = (int)W + 2 * MF_R; const size_t PN = (size_t)pd * ph * pw;
+    uint8_t *b[4] = {0}, *o = rc ? nullptr : malloc(PN); float *fa[3] = {0};
+    if (!rc) for (int k = 0; k < 4; k++) {   /* the box with replicated borders */
+        if (!(b[k] = malloc(PN))) { rc = -1; break; }
+        for (int z = 0; z < pd; z++) for (int y = 0; y < ph; y++) {
+            long long gz = z - MF_R, gy = y - MF_R; gz = gz < 0 ? 0 : gz >= D ? D - 1 : gz; gy = gy < 0 ? 0 : gy >= H ? H - 1 : gy;
+            const uint8_t *s = pl[k] + ((size_t)gz * H + gy) * W; uint8_t *d = b[k] + ((size_t)z * ph + y) * pw;
+            for (int x = 0; x < pw; x++) { long long gx = x - MF_R; gx = gx < 0 ? 0 : gx >= W ? W - 1 : gx; d[x] = s[gx]; }
+        }
+    }
+    for (int k = 0; k < 3 && !rc; k++) if (!(fa[k] = malloc(PN * 4))) rc = -1;
+    if (!rc && o) { const long long g0[3] = {-MF_R, -MF_R, -MF_R}, gn[3] = {D, H, W}; mf_block(b[0], b[1], b[2], b[3], pd, ph, pw, g0, gn, &mf_coef_default, o, fa[0], fa[1], fa[2]); }
+    for (int k = 0; k < 4; k++) free(b[k]);
+    free(o);
+    z3 *cz = rc ? nullptr : z3_open(store_open(B->croot), B->ckey, nullptr);
+    if (!rc && !cz) { fprintf(stderr, "merge-flag --eval: %s: codes %s/%s: %s\n", B->name, B->croot, B->ckey, z3_error()); rc = -1; }
+    const double gtf = rc ? 1 : I.um / atof(B->ckey);   /* label voxels per native voxel */
+    const long long ny = H * h, nx = W * h, gy0 = (long long)floor(I.origin[1] * gtf), gx0 = (long long)floor(I.origin[2] * gtf);
+    const long long gny = (long long)(ny * gtf), gnx = (long long)(nx * gtf);
+    uint8_t *g = rc ? nullptr : malloc((size_t)gny * gnx); const size_t na = ax ? ax->n : 0;
+    int *ry = malloc(sizeof(int) * 4 * (ny + nx + 8)), *rx = ry + (ny + nx + 8), *kk = rx + (ny + nx + 8); double *un = malloc(sizeof(double) * (ny + nx + 8) * 2);
+    size_t s0 = B->n; double *nn = nullptr; size_t nnn = 0, nnc = 0;
+    for (int iz = 0; iz < EV_NZ && !rc; iz++) {
+        const int zc = (int)((iz + 0.5) * D / EV_NZ); const long long zn = (long long)zc * h + h / 2;
+        const int64_t o3[3] = {(int64_t)((I.origin[0] + zn) * gtf), gy0, gx0}, n3[3] = {1, gny, gnx};
+        if (z3_read(cz, o3, n3, g, 4)) { fprintf(stderr, "merge-flag --eval: %s: code read: %s\n", B->name, z3_error()); rc = -1; break; }
+        size_t any = 0; for (size_t i = 0; i < (size_t)gny * gnx; i++) { if (g[i] > 252) g[i] = 0; any += g[i] != 0; }
+        if (!any || !na) continue;
+        const json *a = json_at(ax, (size_t)zn < na ? (size_t)zn : na - 1); const double cy = json_num(json_at(a, 0), 0), cx = json_num(json_at(a, 1), 0);
+        const double R0 = hypot((double)ny, (double)nx) + fabs(cy) + fabs(cx);
+        for (int t = 0; t < EV_NTH; t++) {
+            const double th = t * 2 * M_PI / EV_NTH, sn = sin(th), cs = cos(th); int m = 0;
+            for (long long r = 0; r < (long long)R0 && m < ny + nx + 8; r++) {
+                const double y = cy + r * sn, x = cx + r * cs;
+                if (y >= 0 && x >= 0 && y < ny - 0.5 && x < nx - 0.5) { ry[m] = (int)y; rx[m] = (int)x; un[2 * m] = y; un[2 * m + 1] = x; m++; }
+                else if (m) break;
+            }
+            if (m < 32) continue;
+            double last = 0, acc = 0;   /* the phase unwrapped along the ray (cells), turns */
+            for (int i = 0; i < m; i++) {
+                const size_t c = ((size_t)zc * H + (size_t)(un[2 * i] / h)) * W + (size_t)(un[2 * i + 1] / h);
+                const double p = atan2(pl[1][c] - 128.0, pl[0][c] - 128.0) / (2 * M_PI);
+                if (i) { double d = p - last; d -= round(d); acc += d; } last = p; un[2 * i] = acc;   /* (y no longer needed: ry) */
+            }
+            int nc = 0; for (int i = 0; i < m;) {   /* crossings: run middles */
+                const long long ly = (long long)(ry[i] * gtf), lx = (long long)(rx[i] * gtf);
+                const uint8_t q = g[(size_t)(ly < gny ? ly : gny - 1) * gnx + (lx < gnx ? lx : gnx - 1)];
+                if (!q) { i++; continue; }
+                int e = i; for (; e < m; e++) { const long long ey = (long long)(ry[e] * gtf), ex = (long long)(rx[e] * gtf); if (!g[(size_t)(ey < gny ? ey : gny - 1) * gnx + (ex < gnx ? ex : gnx - 1)]) break; }
+                const int k = (i + e - 1) / 2; const long long ky = (long long)(ry[k] * gtf), kx = (long long)(rx[k] * gtf);
+                kk[nc++] = k; un[2 * k + 1] = ((g[(size_t)(ky < gny ? ky : gny - 1) * gnx + (kx < gnx ? kx : gnx - 1)] - 1) / 18) % 14; i = e;
+            }
+            for (int c = 0; c + 1 < nc; c++) {
+                const int k0 = kk[c], k1 = kk[c + 1]; const int d = (((int)un[2 * k1 + 1] - (int)un[2 * k0 + 1]) % 14 + 14) % 14;
+                if ((d != 1 && d != 13) || k1 - k0 < 2) continue;
+                const int km = (k0 + k1) / 2; const size_t pi = ((size_t)(zc + MF_R) * ph + (size_t)(ry[km] / h + MF_R)) * pw + (size_t)(rx[km] / h + MF_R);
+                ev_iv v = {.f = {fa[0][pi], fa[1][pi], fa[2][pi]}, .gap = (float)((k1 - k0) * I.um)};
+                ev_push(B, &v);
+                if (nnn == nnc) { nnc = nnc ? 2 * nnc : 4096; nn = realloc(nn, nnc * sizeof *nn); }
+                nn[nnn++] = (un[2 * k1] - un[2 * k0]) * (d == 1 ? 1 : -1);
+            }
+        }
+    }
+    if (!rc && nnn) {   /* the box's phase direction: the median's sign */
+        double *t = malloc(nnn * sizeof *t); memcpy(t, nn, nnn * sizeof *t); qsort(t, nnn, sizeof *t, ev_cmpd); const double sg = t[nnn / 2] < 0 ? -1 : 1; free(t);
+        size_t nm = 0; for (size_t i = 0; i < nnn; i++) { B->iv[s0 + i].y = nn[i] * sg < 0.5; nm += B->iv[s0 + i].y; }
+        B->merged = (double)nm / nnn;
+    }
+    free(nn); free(ry); free(un); free(g); if (cz) z3_close(cz);
+    for (int k = 0; k < 4; k++) free(pl[k]);
+    for (int k = 0; k < 3; k++) free(fa[k]);
+    json_free(I.j); return rc;
+}
+typedef struct { ev_box *B; int nb; _Atomic int next; } ev_job;
+static void *ev_worker(void *a) {
+    ev_job *J = a;
+    for (int i; (i = atomic_fetch_add(&J->next, 1)) < J->nb;) {
+        ev_box *B = &J->B[i]; B->rc = ev_one(B);
+        fprintf(stderr, "merge-flag --eval: %s (%s): %zu intervals, merged %.3f%s\n", B->name, B->scroll, B->n, B->merged, B->rc ? " FAILED" : "");
+    }
+    return nullptr;
+}
+/* AUC of score s (higher = merged) against y over the selected intervals (ties: average ranks) */
+typedef struct { double s; uint8_t y; } ev_sy;
+static int ev_cmpsy(const void *a, const void *b) { const double x = ((const ev_sy *)a)->s, y = ((const ev_sy *)b)->s; return x < y ? -1 : x > y; }
+static double ev_auc(ev_sy *v, size_t n) {
+    qsort(v, n, sizeof *v, ev_cmpsy); double rs = 0; size_t np = 0;
+    for (size_t i = 0; i < n;) { size_t j = i; while (j + 1 < n && v[j + 1].s == v[i].s) j++; const double r = (i + j + 2) / 2.0; for (size_t k = i; k <= j; k++) if (v[k].y) { rs += r; np++; } i = j + 1; }
+    const size_t nq = n - np; return np && nq ? (rs - np * (np + 1) / 2.0) / ((double)np * nq) : NAN;
+}
+/* models: score of interval v (higher = merged) */
+enum { EM_LOGIT, EM_COEF, EM_R5, EM_AMP, EM_SP, EM_N };
+static const char *const em_name[EM_N] = {"logistic (fitted on the split's train boxes)", "the rule (--coef / built-in)", "R5 alone (fixed: -R5)", "amp9 alone (-amp9)", "sp9 alone (-sp9)"};
+static double em_score(int m, const ev_iv *v, const double *w, const mf_coef *c) {
+    switch (m) {
+    case EM_LOGIT: return w[0] + w[1] * v->f[0] + w[2] * v->f[1] + w[3] * v->f[2];
+    case EM_COEF: return c->b + c->c_amp * v->f[0] + c->c_r * v->f[1] + c->c_sp * v->f[2];
+    case EM_R5: return -v->f[1];
+    case EM_AMP: return -v->f[0];
+    default: return -v->f[2];
+    }
+}
+/* logistic regression on the train boxes' intervals (standardised features, Newton, l2 1e-4); w raw-unit (b, amp, r, sp) */
+static void ev_logit(ev_box *B, int nb, const uint8_t *tr, double w[4]) {
+    double mu[3] = {0}, sd[3] = {0}; size_t n = 0;
+    for (int b = 0; b < nb; b++) if (tr[b]) for (size_t i = 0; i < B[b].n; i++) { n++; for (int k = 0; k < 3; k++) mu[k] += B[b].iv[i].f[k]; }
+    for (int k = 0; k < 3; k++) mu[k] /= n ? n : 1;
+    for (int b = 0; b < nb; b++) if (tr[b]) for (size_t i = 0; i < B[b].n; i++) for (int k = 0; k < 3; k++) { const double d = B[b].iv[i].f[k] - mu[k]; sd[k] += d * d; }
+    for (int k = 0; k < 3; k++) sd[k] = sqrt(sd[k] / (n ? n : 1)) + 1e-9;
+    double v[4] = {0, 0, 0, 0};   /* (z1, z2, z3, 1) */
+    for (int it = 0; it < 40; it++) {
+        double g[4] = {0}, Hm[4][4] = {{0}};
+        for (int b = 0; b < nb; b++) if (tr[b]) for (size_t i = 0; i < B[b].n; i++) {
+            const ev_iv *q = &B[b].iv[i]; const double x[4] = {(q->f[0] - mu[0]) / sd[0], (q->f[1] - mu[1]) / sd[1], (q->f[2] - mu[2]) / sd[2], 1};
+            double s = 0; for (int k = 0; k < 4; k++) s += v[k] * x[k];
+            const double p = 1 / (1 + exp(-s)), e = p - q->y, ww = p * (1 - p);
+            for (int k = 0; k < 4; k++) { g[k] += e * x[k]; for (int l = 0; l < 4; l++) Hm[k][l] += ww * x[k] * x[l]; }
+        }
+        for (int k = 0; k < 4; k++) { g[k] /= n; for (int l = 0; l < 4; l++) Hm[k][l] /= n; if (k < 3) { g[k] += 1e-4 * v[k]; Hm[k][k] += 1e-4; } }
+        double A[4][5]; for (int k = 0; k < 4; k++) { for (int l = 0; l < 4; l++) A[k][l] = Hm[k][l]; A[k][4] = g[k]; }
+        for (int c = 0; c < 4; c++) {   /* Gauss-Jordan with partial pivoting */
+            int p = c; for (int r = c + 1; r < 4; r++) if (fabs(A[r][c]) > fabs(A[p][c])) p = r;
+            for (int l = 0; l < 5; l++) { const double t = A[c][l]; A[c][l] = A[p][l]; A[p][l] = t; }
+            if (fabs(A[c][c]) < 1e-15) continue;
+            for (int r = 0; r < 4; r++) if (r != c) { const double f = A[r][c] / A[c][c]; for (int l = c; l < 5; l++) A[r][l] -= f * A[c][l]; }
+        }
+        for (int k = 0; k < 4; k++) if (fabs(A[k][k]) > 1e-15) v[k] -= A[k][4] / A[k][k];
+    }
+    w[0] = v[3]; for (int k = 0; k < 3; k++) { w[k + 1] = v[k] / sd[k]; w[0] -= v[k] * mu[k] / sd[k]; }
+}
+/* one report line: model m over the test boxes (te), pooled AUC, the within-box median AUC, P / R at p >= 0.5 for the score models */
+static void ev_report(const char *tag, int m, ev_box *B, int nb, const uint8_t *te, const double *w, const mf_coef *c) {
+    size_t n = 0; for (int b = 0; b < nb; b++) if (te[b]) n += B[b].n;
+    if (!n) return;
+    ev_sy *v = malloc(n * sizeof *v); size_t k = 0, tp = 0, fl = 0, pos = 0; double wa[512]; int nw = 0;
+    for (int b = 0; b < nb; b++) if (te[b]) {
+        const size_t k0 = k;
+        for (size_t i = 0; i < B[b].n; i++) { v[k].s = em_score(m, &B[b].iv[i], w, c); v[k].y = B[b].iv[i].y; pos += v[k].y;
+                                               if (m <= EM_COEF && v[k].s >= 0) { fl++; tp += v[k].y; } k++; }
+        if (B[b].merged > 0.05 && B[b].merged < 0.95 && nw < 512) { ev_sy *u = malloc((k - k0) * sizeof *u); memcpy(u, v + k0, (k - k0) * sizeof *u); wa[nw++] = ev_auc(u, k - k0); free(u); }
+    }
+    const double a = ev_auc(v, n); qsort(wa, nw, sizeof *wa, ev_cmpd);
+    printf("  %-28s %-46s n %8zu merged %.3f AUC %.3f within-box median %.3f (%d boxes)", tag, em_name[m], n, (double)pos / n, a, nw ? wa[nw / 2] : NAN, nw);
+    if (m <= EM_COEF) printf(" | p>=0.5 flagged %.3f P %.3f R %.3f", (double)fl / n, fl ? (double)tp / fl : 0, pos ? (double)tp / pos : 0);
+    printf("\n"); free(v);
+}
+static int ev_p4(const char *scroll) { return !strncmp(scroll, "paris4", 6); }
+/* ufsm merge-flag --eval LIST [--coef b,amp,r,sp] [--threads 4]: LIST lines "name scroll fields-dir codes-root codes-key" (codes key = its
+   um, e.g. 9.6 / 4.798). Splits: held-out (train the even boxes of the name-sorted list, test the odd), leave-one-scroll-out (Paris 4 vs
+   the rest, both ways); per split the fitted logistic, the given rule and the single features. Prints the logistic fitted on every box. */
+static int cmd_merge_flag_eval(int argc, char **argv, const char *list) {
+    FILE *f = fopen(list, "r"); if (!f) { fprintf(stderr, "merge-flag --eval: cannot open %s\n", list); return 1; }
+    ev_box *B = nullptr; int nb = 0, cap = 0; char ln[4096];
+    while (fgets(ln, sizeof ln, f)) {
+        if (ln[0] == '#' || ln[0] == '\n') continue;
+        if (nb == cap) { cap = cap ? 2 * cap : 64; B = realloc(B, cap * sizeof *B); }
+        ev_box *b = &B[nb]; memset(b, 0, sizeof *b);
+        if (sscanf(ln, "%63s %31s %1023s %1023s %63s", b->name, b->scroll, b->fields, b->croot, b->ckey) == 5) nb++;
+    }
+    fclose(f);
+    if (!nb) { fprintf(stderr, "merge-flag --eval: no boxes in %s\n", list); return 2; }
+    for (int a = 1; a < nb; a++) for (int c = a; c > 0 && strcmp(B[c - 1].name, B[c].name) > 0; c--) { ev_box t = B[c]; B[c] = B[c - 1]; B[c - 1] = t; }   /* (by name: the split) */
+    mf_coef c = mf_coef_default; const char *cs = opt(argc, argv, "--coef", nullptr);
+    if (cs && sscanf(cs, "%lf,%lf,%lf,%lf", &c.b, &c.c_amp, &c.c_r, &c.c_sp) != 4) { fprintf(stderr, "merge-flag: --coef b,c_amp,c_r,c_sp\n"); return 2; }
+    const int nt = opt_atoi("--threads", opt(argc, argv, "--threads", "4"));
+    ev_job J = {.B = B, .nb = nb}; pthread_t th[64]; const int m = nt < 1 ? 1 : nt > 64 ? 64 : nt;
+    for (int t = 0; t < m; t++) pthread_create(&th[t], nullptr, ev_worker, &J);
+    for (int t = 0; t < m; t++) pthread_join(th[t], nullptr);
+    size_t tot = 0; int nok = 0; for (int b = 0; b < nb; b++) if (!B[b].rc) { tot += B[b].n; nok++; } else B[b].n = 0;
+    printf("merge-flag --eval: %d of %d boxes, %zu GT intervals\n", nok, nb, tot);
+    uint8_t *tr = calloc(nb, 1), *te = calloc(nb, 1); double w[4];
+    /* a box listed for several nets (name NET-BOX) stays on one side of the held-out split: its rank among the distinct BOX names */
+    int *rk = calloc(nb, sizeof *rk);
+    for (int b = 0; b < nb; b++) {
+        const char *bn = strchr(B[b].name, '-') ? strchr(B[b].name, '-') + 1 : B[b].name;
+        for (int q = 0; q < nb; q++) {
+            const char *qn = strchr(B[q].name, '-') ? strchr(B[q].name, '-') + 1 : B[q].name; int first = 1;
+            for (int r = 0; r < q && first; r++) first = strcmp(strchr(B[r].name, '-') ? strchr(B[r].name, '-') + 1 : B[r].name, qn) != 0;
+            rk[b] += first && strcmp(qn, bn) < 0;
+        }
+    }
+    for (int split = 0; split < 3; split++) {
+        for (int b = 0; b < nb; b++) {
+            if (split == 0) tr[b] = rk[b] % 2 == 0; else if (split == 1) tr[b] = ev_p4(B[b].scroll); else tr[b] = !ev_p4(B[b].scroll);
+            te[b] = !tr[b];
+        }
+        const char *sn[3] = {"held-out boxes (even -> odd)", "scroll-out: Paris 4 -> rest", "scroll-out: rest -> Paris 4"};
+        ev_logit(B, nb, tr, w);
+        printf("%s: logistic b %.4f c_amp %.4f c_r %.4f c_sp %.4f\n", sn[split], w[0], w[1], w[2], w[3]);
+        for (int mm = 0; mm < EM_N; mm++) ev_report("all test boxes", mm, B, nb, te, w, &c);
+        if (split == 0) {   /* per scroll of the held-out boxes */
+            uint8_t *t2 = calloc(nb, 1);
+            for (int p = 1; p >= 0; p--) { for (int b = 0; b < nb; b++) t2[b] = te[b] && ev_p4(B[b].scroll) == p;
+                                            for (int mm = 0; mm < 3; mm++) ev_report(p ? "test boxes, Paris 4" : "test boxes, rest", mm, B, nb, t2, w, &c); }
+            free(t2);
+        }
+    }
+    for (int b = 0; b < nb; b++) tr[b] = 1;
+    ev_logit(B, nb, tr, w);
+    printf("merge-flag --eval: logistic on every box: --coef %.4f,%.4f,%.4f,%.4f\n", w[0], w[1], w[2], w[3]);
+    for (int b = 0; b < nb; b++) free(B[b].iv);
+    free(B); free(tr); free(te); free(rk);
+    return nok == nb ? 0 : 1;
+}
+
+/* ---- merge-flag --apply FIELDS OUT --mf-w K [--mf-cut T]: a fields set whose evidence in merged cells is down-weighted, for the
+   global counting (count-field's ref) and the slab fits: per cell f = 1 - K mf / 255 (--mf-cut T: f = 0 where mf >= T, else 1);
+   the phase confidence pc, ps scaled toward 128 by f and the material w by f (kept >= 1 where it was > 0: still material, but its
+   density / phase weight in count-field's least squares (w / 255) and the fitter's terms falls). OUT holds links to every other plane
+   of FIELDS (and its mf); pc ps w are re-encoded at their source volcomp q. Counts then propagate around merged regions instead of
+   through them. */
+static float mf_src_q(const char *dir, const char *name) {   /* the volcomp q of a zarr plane (0: lossless / none found) */
+    char p[1500]; snprintf(p, sizeof p, "%s/%s/zarr.json", dir, name); json *j = mf_json(p); if (!j) return 0;
+    float q = 0; const json *cs = json_get(j, "codecs");
+    for (size_t i = 0; cs && i < cs->n; i++) {
+        const json *c = json_at(cs, i); const json *in = json_get(json_get(c, "configuration"), "codecs");
+        for (size_t k = 0; in && k < in->n; k++) if (!strcmp(json_str(json_get(json_at(in, k), "name"), ""), "volcomp")) q = (float)json_num(json_get(json_get(json_at(in, k), "configuration"), "q"), 0);
+        if (!strcmp(json_str(json_get(c, "name"), ""), "volcomp")) q = (float)json_num(json_get(json_get(c, "configuration"), "q"), 0);
+    }
+    json_free(j); return q;
+}
+static inline uint8_t mf_scale_phase(uint8_t v, float f) { const float d = (v - 128) * f; return (uint8_t)lrintf(128 + d); }
+static int cmd_merge_flag_apply(int argc, char **argv, const char *src, const char *out) {
+    mf_in I; if (mf_open(&I, src)) return 1;
+    if (!I.zarr || I.off[0] || I.off[1] || I.off[2]) { fprintf(stderr, "merge-flag --apply: zarr fields (not a crop) only\n"); json_free(I.j); return 2; }
+    const double K = opt_atof("--mf-w", opt(argc, argv, "--mf-w", "1")); const int cut = opt_atoi("--mf-cut", opt(argc, argv, "--mf-cut", "0"));
+    const int nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16);
+    if (mkdir(out, 0775) && errno != EEXIST) { fprintf(stderr, "merge-flag --apply: cannot create %s\n", out); return 1; }
+    char p[1500], q[1500];
+    DIR *dd = opendir(src); if (!dd) return 1;   /* links: every entry but pc ps w (fields.json copied) */
+    for (struct dirent *e; (e = readdir(dd));) {
+        if (e->d_name[0] == '.' || !strcmp(e->d_name, "pc") || !strcmp(e->d_name, "ps") || !strcmp(e->d_name, "w") || !strcmp(e->d_name, "fields.json")) continue;
+        snprintf(p, sizeof p, "%s/%s", src, e->d_name); char rp[PATH_MAX]; if (!realpath(p, rp)) continue;
+        snprintf(q, sizeof q, "%s/%s", out, e->d_name); unlink(q); if (symlink(rp, q)) { fprintf(stderr, "merge-flag --apply: cannot link %s\n", q); closedir(dd); return 1; }
+    }
+    closedir(dd);
+    { snprintf(p, sizeof p, "%s/fields.json", src); snprintf(q, sizeof q, "%s/fields.json", out); FILE *a = fopen(p, "rb"), *b = fopen(q, "wb"); char buf[1 << 16]; size_t n;
+      if (!a || !b) { fprintf(stderr, "merge-flag --apply: cannot copy fields.json\n"); return 1; }
+      while ((n = fread(buf, 1, sizeof buf, a)) > 0) fwrite(buf, 1, n, b); fclose(a); if (fclose(b)) return 1; }
+    const char *names[4] = {"pc", "ps", "w", "mf"}; mf_rd rd[4]; for (int k = 0; k < 4; k++) if (mf_rd_open(&rd[k], &I, names[k])) return 1;
+    const long long D = I.shape[0], H = I.shape[1], W = I.shape[2]; const int64_t sh3[3] = {D, H, W}; z3w *zw[3];
+    for (int k = 0; k < 3; k++) {
+        char at[256]; snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"winding fitter fields (src/fit.h), merge-flag --apply: %s x (1 - %g mf / 255)%s\",\"h\":%d}}", names[k], K, cut ? " (cut)" : "", I.h);
+        snprintf(p, sizeof p, "%s/%s", out, names[k]);
+        if (!(zw[k] = z3w_create(p, sh3, SZ, mf_src_q(src, names[k]), k < 2 ? 128 : 0, at))) { fprintf(stderr, "merge-flag --apply: %s\n", z3w_error()); return 1; }
+    }
+    const size_t rows = (size_t)SZ * H * W; uint8_t *pl[4]; for (int k = 0; k < 4; k++) if (!(pl[k] = malloc(rows))) return 1;
+    uint8_t *sb = malloc((size_t)SZ * SZ * SZ); int rc = 0; size_t nmat = 0; double fsum = 0;
+    for (long long z0 = 0; z0 < D && !rc; z0 += SZ) {
+        const long long nz = z0 + SZ < D ? SZ : D - z0;
+        for (int k = 0; k < 4 && !rc; k++) if (mf_rows(&rd[k], z0, nz, pl[k], nt)) { fprintf(stderr, "merge-flag --apply: cannot read %s\n", names[k]); rc = 1; }
+        for (size_t i = 0; i < (size_t)nz * H * W && !rc; i++) {
+            if (!pl[2][i]) continue;
+            const float f = cut ? (pl[3][i] >= cut ? 0.f : 1.f) : fmaxf(0.f, 1.f - (float)K * pl[3][i] / 255.f);
+            pl[0][i] = mf_scale_phase(pl[0][i], f); pl[1][i] = mf_scale_phase(pl[1][i], f);
+            const int w = (int)lrintf(pl[2][i] * f); pl[2][i] = (uint8_t)(w < 1 ? 1 : w); nmat++; fsum += f;
+        }
+        for (int k = 0; k < 3 && !rc; k++) for (long long y0 = 0; y0 < H; y0 += SZ) for (long long x0 = 0; x0 < W; x0 += SZ) {   /* shards of 128^3 */
+            memset(sb, k < 2 ? 128 : 0, (size_t)SZ * SZ * SZ);
+            for (long long z = 0; z < nz; z++) for (long long y = y0; y < y0 + SZ && y < H; y++)
+                memcpy(sb + ((size_t)z * SZ + (y - y0)) * SZ, pl[k] + ((size_t)z * H + y) * W + x0, (size_t)(x0 + SZ < W ? SZ : W - x0));
+            if (z3w_write_shard(zw[k], z0 / SZ, y0 / SZ, x0 / SZ, sb, nt)) { fprintf(stderr, "merge-flag --apply: %s\n", z3w_error()); rc = 1; break; }
+        }
+    }
+    for (int k = 0; k < 3; k++) if (z3w_close(zw[k])) rc = 1;
+    for (int k = 0; k < 4; k++) { free(pl[k]); mf_rd_close(&rd[k]); }
+    free(sb); json_free(I.j);
+    if (!rc) printf("merge-flag --apply: %s -> %s: mean evidence factor %.4f over %zu material cells (%s)\n", src, out, nmat ? fsum / nmat : 0, nmat, cut ? "cut" : "linear");
     return rc;
 }

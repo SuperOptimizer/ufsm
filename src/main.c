@@ -264,7 +264,7 @@ static int usage(void) {
         "  ufsm geom-check <wraps-dir> --axis F --axis-um U [--out DIR]   wraps geometry QA: spacing, steep walls, jumps, merged / skipped neighbours, holes; guard limits\n"
         "  ufsm refine <wraps-in> <wraps-out> --fields DIR [--range 0.33] [--smooth-um 40]   vertices onto the fields' sheet phase\n"
         "  ufsm surf-stats <wraps-dir> --fields DIR [--ct ROOT KEY --ct-um U]   label-free surface quality (phase, switches, CT)\n"
-        "  ufsm merge-flag <fields-dir> [--out DIR] [--thr 128]               the merged-sheet score per field cell (plane mf: phase vs density count, confidence)\n"
+        "  ufsm merge-flag <fields-dir> [--out DIR] [--thr 179]               the merged-sheet score per field cell (plane mf: phase vs density count, confidence)\n"
         "  ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR] [--out DIR]       per-wrap uncertain share from mf, <wrap>_mf.tif masks on the vertex grid\n"
         "  ufsm self-gate <wraps-dir> <out-dir> --fields DIR --model FIT [--ct ..] [--nb FIT].. [--exclude ..]   strict stretches of a box fit -> label tifxyz + q.tif\n"
         "  ufsm ct-fields <ct-root> <key> <fields-dir> --ct-um U   CT planes ct / cs of a fit-field directory (fit --w-ct / --w-cspacing)\n"

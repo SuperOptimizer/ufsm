@@ -5,7 +5,8 @@
            vector) times the density head's sheet spacing in cells (5-box mean of the known sp / 8): phase turns per density turn,
            ~1 where both count the same sheets, ~1/3 where the phase runs one cycle across three touching sheets
      sp9   the density head's sheet spacing in cells (9-box mean of the known sp / 8): packed regions are narrow
-   and a logistic rule p = 1 / (1 + exp(-(b + c_amp amp9 + c_R R5 + c_sp sp9))) fitted on GT (DESIGN 2026-11-18 "merge-flag").
+   and the rule p = 1 / (1 + exp(-(b + c_amp amp9 + c_r R5 + c_sp sp9))), by default the fixed b 4.03, c_amp -3.25, c_r -6.5, c_sp 0,
+   i.e. 6.5 (0.62 - R5 - 0.5 amp9): within 0.002 AUC of a logistic fitted on GT on every split (merge-flag --eval; DESIGN 2026-11-18).
    Output plane mf (uint8): round(255 p) on material cells (w > 0), 0 elsewhere; the zarr attributes carry the coefficients and the
    recommended flag threshold (byte, attributes.ufsm.mf_thr). Box filters use edge replication at the box borders (scipy
    uniform_filter mode "nearest"); the neighbour product at the last cell of an axis repeats the one before. */

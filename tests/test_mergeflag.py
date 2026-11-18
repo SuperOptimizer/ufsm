@@ -91,7 +91,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-mflag-") as tmp:
         path.write_bytes(b'II*\x00' + pack('<I', 8) + ifd + data)
     tif(wd / "x.tif", gx); tif(wd / "y.tif", gy); tif(wd / "z.tif", np.full(gx.shape, 40, np.float32))
     (wd / "meta.json").write_text(json.dumps({"type": "seg", "format": "tifxyz", "scale": [0.25, 0.25], "voxel_size_um": 9.6, "winding": 5}))
-    out = run(BIN, "wrap-mf", t / "wraps", "--fields", f, "--pool", "1", "--out", t / "mfw", "--tsv", t / "mf.tsv")
+    out = run(BIN, "wrap-mf", t / "wraps", "--fields", f, "--thr", "128", "--pool", "1", "--out", t / "mfw", "--tsv", t / "mf.tsv")
     print(out.strip())
     row = (t / "mf.tsv").read_text().splitlines()[1].split('\t')
     exp = np.mean(mf[20 // h, (gy // h).astype(int), (gx // h).astype(int)] >= 128)
@@ -99,8 +99,32 @@ with tempfile.TemporaryDirectory(prefix="ufsm-mflag-") as tmp:
     assert 0.4 < exp < 0.6, exp
     from PIL import Image
     g = np.array(Image.open(t / "mfw" / "w005_mf.tif")); assert g.shape == gx.shape, g.shape   # the vertex grid
-    run(BIN, "wrap-mf", t / "wraps", "--fields", f, "--pool", "1", "--out", t / "mfr", "--render", "1")
+    run(BIN, "wrap-mf", t / "wraps", "--fields", f, "--thr", "128", "--pool", "1", "--out", t / "mfr", "--render", "1")
     rr = np.array(Image.open(t / "mfr" / "w005_mf.tif"))
     assert rr.shape == ((gx.shape[0] - 1) * 4 + 1, (gx.shape[1] - 1) * 4 + 1), rr.shape   # ufsm render --scale 1's pixel grid (step 4)
     assert (rr[::4, ::4] == g).all()
+    # merge-flag --eval on the same fields against synthetic GT codes: true sheets every 8 native voxels on both halves (the merged half's
+    # phase runs at a third of their rate), codes via ingest-labels (zarr v2 -> the volcomp store the eval reads)
+    zn, yn, xn = D * h, H * h, W * h
+    Z, Y, X = np.meshgrid(np.arange(zn), np.arange(yn), np.arange(xn), indexing='ij')
+    rr = np.hypot(Y + 0.5 - cy * h, X + 0.5 - cx * h); k = np.rint(rr / 8)
+    codes = np.where(np.abs(rr - 8 * k) < 0.6, 1 + 18 * (k.astype(int) % 14), 0).astype(np.uint8)
+    lv = t / "gt.zarr" / "0"; lv.mkdir(parents=True); C = 16   # (16^3 chunks: the 128 shard must be a multiple of them)
+    (lv / ".zarray").write_text(json.dumps({"shape": [zn, yn, xn], "chunks": [C] * 3, "dtype": "|u1", "fill_value": 0, "order": "C",
+                                            "filters": None, "compressor": None, "zarr_format": 2, "dimension_separator": "/"}))
+    for a in range(zn // C):
+        for b in range(yn // C):
+            (lv / str(a) / str(b)).mkdir(parents=True, exist_ok=True)
+            for c in range(xn // C): (lv / str(a) / str(b) / str(c)).write_bytes(codes[a * C:(a + 1) * C, b * C:(b + 1) * C, c * C:(c + 1) * C].tobytes())
+    (t / "lut.txt").write_text(" ".join(str(min(v, 254)) for v in range(256)))
+    run(BIN, "ingest-labels", t, "gt.zarr", t / "codes", "--um", "9.6", "--lut", t / "lut.txt", "--levels", "1", "--shard", "128", "--threads", "2")
+    (t / "ev.tsv").write_text(f"a-B1 paris4 {f} {t / 'codes'} 9.6\nb-B2 1667 {f} {t / 'codes'} 9.6\n")
+    r = subprocess.run([str(BIN), "merge-flag", "--eval", str(t / "ev.tsv"), "--threads", "2"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+    print(r.stdout.strip()); print(r.stderr.strip())
+    assert r.returncode == 0, r.stderr
+    rule = [l for l in r.stdout.splitlines() if "the rule" in l]
+    assert len(rule) >= 3, r.stdout
+    for l in rule:
+        auc = float(l.split(" AUC ")[1].split()[0]); mer = float(l.split(" merged ")[1].split()[0])
+        assert auc > 0.95 and 0.3 < mer < 0.7, l   # (about half the intervals lie in the merged half)
     print("test_mergeflag: PASS")
