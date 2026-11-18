@@ -89,7 +89,7 @@ sanity() {   # sanity ARM: finite losses, the ink bce trend, the rates; K/out/sm
     echo "samples/s (fresh) per logged line: $(sps_of $lg | tr '\n' ' ')"
     grep -E '^step +[0-9]+ ' $lg | grep -oE 'ink bce [0-9.naif-]+' | awk '{v[NR] = $3} END {if (NR < 6) {print "ink bce: only " NR " logged lines"; exit}
       a = (v[1] + v[2] + v[3]) / 3; b = (v[NR] + v[NR - 1] + v[NR - 2]) / 3; printf "ink bce: first 3 lines %.4f, last 3 %.4f (%s)\n", a, b, b < a ? "falling: OK" : "NOT falling: WARN"}'
-    echo "non-finite lines: $(grep -ciE 'non-finite|^step .*( nan| inf)' $lg)"
+    echo "non-finite lines: $(grep -ciE 'non-finite|^step .*( nan| inf)' $lg)"; echo "trainer host RSS peak (30 s samples): ${RSSPK:-?} GB"
     for m in memory.events memory.peak; do [ -r /sys/fs/cgroup/$m ] && echo "$m: $(tr '\n' ' ' < /sys/fs/cgroup/$m)"; done
   } > $f; cat $f >> $L
   cp $lg $RD/inksmoke$a.resume.log $K/steptime$a.txt $O/ 2>/dev/null; ls $RD/inksmoke$a/snap/*.ckpt > /dev/null 2>&1 && cp $(ls -t $RD/inksmoke$a/snap/*.ckpt | head -1) $O/inksmoke$a-$TAG.ckpt
@@ -99,18 +99,21 @@ arm() {   # arm A | B
   mkarms $a; [ $a = A ] || { prefetch $a; done_ prefetch$a$TAG || die "prefetch $a (log $K/prefetch$a$TAG.log)"; }
   say "arm $a: training $STEPS steps ($TAG, $(el))"; local t0=$(date +%s)
   ( R=$RD U=$U INIT=$K/ckpt/u1-13000-w.ckpt LATB=$K/kit/klt1.lcb GPU=$GPU LOCK=$LOCK RELAUNCH=3 WORKERS=${WORKERS:-1} SLOTS=${SLOTS:-2} bash $D/trainarm.sh $a $AD/sources-$a.json ) > $RD/arm$a.out 2>&1 &
-  local tp=$! st=0 sps
+  local tp=$! st=0 sps rss cg MEMS; RSSPK=0
   stoparm() { touch $RD/inksmoke$a.stop; kill $(cat $RD/inksmoke$a.pid 2>/dev/null) 2>/dev/null; sleep 30; sanity $a; die "$*"; }
   while kill -0 $tp 2>/dev/null; do
     st=$(awk '/^step +[0-9]+ / {s = $2} END {print s + 0}' $RD/inksmoke$a.log 2>/dev/null)
+    rss=$(awk '/^(RssAnon|RssShmem)/ {s += $2} END {printf "%.1f", s / 1048576}' /proc/$(cat $RD/inksmoke$a.pid 2>/dev/null)/status 2>/dev/null)
+    awk -v a=${rss:-0} -v b=${RSSPK:-0} 'BEGIN {exit !(a > b)}' && RSSPK=$rss   # the trainer's host RSS peak (30 s samples; the pod has 31 GB)
+    cg=$(awk '{printf "%.1f", $1 / 1073741824}' /sys/fs/cgroup/memory.current 2>/dev/null); MEMS="RSS ${RSSPK:-?} GB peak, cgroup ${cg:-?} GB"
     if [ "${st:-0}" -ge 10 ] && [ ! -e $K/gate10$a$TAG.ok ]; then   # the first step line: report it, and stop a hopeless arm at once
       { grep -E '^step +[0-9]+ ' $RD/inksmoke$a.log | head -1; grep -E 'memory:|planner|batch' $RD/inksmoke$a.log | tail -3; } > $K/steptime$a.txt
-      sps=$(sps_of $RD/inksmoke$a.log | head -1); say "arm $a: step $st at $(el) (trainer start + $(( ($(date +%s) - t0) / 60 )) min), $sps samples/s (gate ${MINSPS10:-0.03})"
+      sps=$(sps_of $RD/inksmoke$a.log | head -1); say "arm $a: step $st at $(el) (trainer start + $(( ($(date +%s) - t0) / 60 )) min), $sps samples/s (gate ${MINSPS10:-0.03}), $MEMS"
       touch $K/gate10$a$TAG.ok; awk -v a=${sps:-0} -v b=${MINSPS10:-0.03} 'BEGIN {exit !(a < b)}' && stoparm "arm $a below the step-10 gate: $sps samples/s"; fi
     if [ "${st:-0}" -ge 50 ] && [ ! -e $K/gate$a$TAG.ok ]; then   # the step-50 gate: the mean of the logged lines
       sps=$(sps_of $RD/inksmoke$a.log | awk '{s += $1; n++} END {printf "%.3f", n ? s / n : 0}')
       grep -E '^step +[0-9]+ ' $RD/inksmoke$a.log | head -6 > $K/steptime$a.txt.new && mv $K/steptime$a.txt.new $K/steptime$a.txt
-      echo "mean samples/s to step $st: $sps" >> $K/steptime$a.txt; say "arm $a: step $st at $(el), mean $sps samples/s (gate ${MINSPS:-0.1})"
+      echo "mean samples/s to step $st: $sps" >> $K/steptime$a.txt; say "arm $a: step $st at $(el), mean $sps samples/s (gate ${MINSPS:-0.1}), $MEMS"
       touch $K/gate$a$TAG.ok; awk -v a=$sps -v b=${MINSPS:-0.1} 'BEGIN {exit !(a < b)}' && stoparm "arm $a below the step-50 gate: $sps samples/s at step $st (fallback: --um-rungs 9.6 only)"; fi
     [ "$ARMMAX" -gt 0 ] && [ $(( $(date +%s) - t0 )) -gt "$ARMMAX" ] && stoparm "arm $a over ARMMAX ${ARMMAX} s at step $st"
     sleep 30; done
