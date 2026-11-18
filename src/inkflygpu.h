@@ -5,6 +5,10 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+
+/* held-out boxes per scan in the ink onfly path (inksplat_cfg.excl, inkfly cx, the GPU chunk config dc_t; was 64 until 2026-11-18: 1667 has
+   74 in holdouts-20261118, every one on a labelled mesh). The boxes live in device memory (dc_t via a pointer), not in kernel parameters. */
+#define INKFLY_MAXEXCL 256
 #ifdef __cplusplus
 extern "C" {
 #endif

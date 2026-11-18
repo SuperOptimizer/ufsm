@@ -28,7 +28,7 @@ typedef struct {
     const uint8_t *lab, *msk; long long rh, rw, rr0, rc0, lh, lw; const int32_t *tiles; int ntiles, ntx;
     const float *X, *Y, *Z; int pu0, pv0, pw, ph, mw, mh; double scale, F; long long glr0, glc0; int nsub, nt; double tstep;
 } du_t;
-typedef struct { double offr, offc, sign, face_a, thr, V, off, slack; int lo, ns, iso, run, gap; long long a0[3], b0[3], co[3], cn[3], o[3], n[3], shape[3]; int nexcl; long long excl[64][6]; } dc_t;
+typedef struct { double offr, offc, sign, face_a, thr, V, off, slack; int lo, ns, iso, run, gap; long long a0[3], b0[3], co[3], cn[3], o[3], n[3], shape[3]; int nexcl; long long excl[INKFLY_MAXEXCL][6]; } dc_t;
 typedef struct { int32_t r, c; int32_t fo; } frec;
 
 __device__ static inline void d_grid(const du_t &u, const dc_t &c, double r, double cc, double *gu, double *gv) {
@@ -190,7 +190,7 @@ extern "C" unsigned long long inkfly_gpu_over(void) { pthread_mutex_lock(&g_mu);
 extern "C" void inkfly_gpu_device(int dev) { g_dev = dev; }
 extern "C" int inkfly_gpu_near(const ifg_unit *U, int nu, const ifg_cfg *cf, int64_t lo[3], int64_t hi[3], uint64_t *nnear) {
     int rc = 0; sm_t *hs = nullptr; ictx *x = t_ic;
-    if (cf->ns > NSMAX || cf->nexcl > 64 || nu > 1024) return -2;
+    if (cf->ns > NSMAX || cf->nexcl > INKFLY_MAXEXCL || nu > 1024) return -2;
     if (!x) { x = t_ic = (ictx *)calloc(1, sizeof *x); x->dev = -1; }
     if (x->dev != g_dev) {
         IG_CK(cudaSetDevice(g_dev)); if (x->st) { cudaStreamDestroy(x->st); x->st = nullptr; }

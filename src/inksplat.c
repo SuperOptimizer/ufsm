@@ -934,7 +934,7 @@ int cmd_ink_splat(int argc, char **argv) {
     for (int i = 2; i + 1 < argc; i++) {
         if (strcmp(argv[i], opt_n("--exclude"))) continue;
         long long b[6];
-        if (c.nexcl >= 64 || sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) { fprintf(stderr, "ink-splat: --exclude z,y,x,nz,ny,nx (at most 64)\n"); return 2; }
+        if (c.nexcl >= INKFLY_MAXEXCL || sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) { fprintf(stderr, "ink-splat: --exclude z,y,x,nz,ny,nx (at most %d)\n", INKFLY_MAXEXCL); return 2; }
         for (int d = 0; d < 6; d++) c.excl[c.nexcl][d] = b[d];
         c.nexcl++;
     }
@@ -1133,7 +1133,7 @@ typedef struct {
     ifunit *U; int nU;
     iftile *T; size_t nT;
     int64_t gcell, gdim[3]; uint32_t *gstart, *glist;   /* tile grid: cells of gcell level-0 voxels -> tile ids (CSR) */
-    int ncx; int64_t cx[64][6];   /* the held-out boxes whose draw cells inkfly_cells drops (cfg excl; f->c.nexcl is 0 under excl_cells_only) */
+    int ncx; int64_t cx[INKFLY_MAXEXCL][6];   /* the held-out boxes whose draw cells inkfly_cells drops (cfg excl; f->c.nexcl is 0 under excl_cells_only) */
 } inkfly;
 static struct { _Atomic uint64_t reads, chunks, empty, hits, px, us, ct_us, gpu_chunks, gpu_us; } g_ifs;
 /* tests: UFSM_INKFLY_FAIL=N: the first N GPU chunks fail as if out of device memory (the CPU fallback from there) */
@@ -1647,7 +1647,7 @@ int inkfly_holdouts(const char *path, const char *ct_key, inksplat_cfg *cfg) {
         const json *e = json_at(bx, i); const char *ck = json_str(json_get(e, "ct"), ""); const json *l0 = json_get(e, "l0");
         if (strcmp(base_name(ck), want) || !l0 || l0->n != 6) continue;
         if (cfg->ho_score_only && json_num(json_get(e, "score"), 1) == 0) continue;
-        if (cfg->nexcl >= 64) { fprintf(stderr, "ink onfly: more than 64 held-out boxes for %s\n", want); json_free(j); return -1; }
+        if (cfg->nexcl >= INKFLY_MAXEXCL) { fprintf(stderr, "ink onfly: more than %d held-out boxes for %s\n", INKFLY_MAXEXCL, want); json_free(j); return -1; }
         for (int d = 0; d < 6; d++) cfg->excl[cfg->nexcl][d] = (int64_t)json_num(json_at(l0, (size_t)d), 0);
         cfg->nexcl++;
     }
