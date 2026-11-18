@@ -6,6 +6,31 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## ink-ext: the next tile row rendered while this one runs on the GPU; to_ref_grid threaded (2026-11-18, branch stripe-20261118, unrollperf)
+
+The stripes' reader3 (r3pre) is now the unroll's tail. In the pod A/B 1667 run it took 537 s for 39.3k tiles. At the GPU's
+~150 tiles/s that is ~262 s of net, so about half the wall was waiting. In run_surface the main thread rendered a tile row's rows,
+then handed its ~20 batches to the GPU worker one at a time, waiting on each. The next row's render therefore overlapped only the
+last batch: ws000 took render 62 s + net 142 s = 204 of its 233 s. The surface's TIF canvas (to_ref_grid, surf_pn per pixel, one
+thread over 59997 x 9793 px) added most of the remaining ~29 s.
+
+- Tile row iy + 1's new rows are rendered on a second thread while row iy's tiles go to the GPU. The ring grows by the largest
+  tile-row step: reader3 T 384, stride 192, ring 400 -> 600 rows x 17 layers x Wm, +200 MB on a 60k-px-wide stripe. The ahead
+  render runs only when its slots no longer hold rows the current tile row reads. Rows render in the same order into the same
+  slots, and the batch order is unchanged, so the output is the same bytes. UFSM_IE_AHEAD=0 restores the old order.
+- to_ref_grid runs over rows on the run's --threads.
+- Pod A/B, one ink-ext over stripes ws000 + ws002 + ws003 and wrap w040 (as r3pre does), batch 16, 8 threads. All 4 maps are
+  byte-identical in every arm.
+
+  | | ws000 | ws002 | total |
+  |---|---|---|---|
+  | master | 183.7 s | 99.0 s | 297 s |
+  | ahead off, to_ref_grid threaded | 168.1 s | 91.8 s | 274 s |
+  | branch | 118.0 s | 73.0 s | 205 s |
+
+  ws000 is now net 98 s + ~20 s of normalisation, TIF and JPEG. Expected in the unroll: stripe reader3 537 -> ~380 s. The residual
+  pass and every ink-ext call get the same overlap.
+
 ## try9 after the reboot: the card-1 layout sets the rate, not CPU contention; CPU weights for the trainer slice (2026-11-18, trainperf)
 
 try9 resumed at 13250 in the rev-card1 layout (CT decode + ink on card 1, onfly phase + fibre on card 0) ran 0.18-0.19 samp/s
