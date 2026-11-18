@@ -1015,6 +1015,7 @@ matter. At most CT / lookup as a same-scroll A/B diagnostic; counting stays a mo
 CT peak count it calibrates against reads 0.56-2.21 peaks per GT sheet depending on the spacing (see the next section and "GT scoring"
 below). Every "improvement" in the tables here (merges -> 0, CT peaks per turn -> 1) is in the wrong direction on 1667; read them as the
 record of a refuted method, not as gains.
+## Pod B rounds: 0332 count-rescale arms and the 1667 rhocal A/B (2026-11-17/18, podunroll + fix0332, branch podun-20261118)
 
 Pod B: RTX PRO 4000 Blackwell 24 GB (sm_120), cgroup 10.2 CPUs / 31 GB, 200 GB container disk; CT from dl.ash2txt, no labels on the pod.
 Fields at 640/64 (try9-era `pab-base` step 8690 with `--ema 0`, sha1 2de1ef9e; u1 step 13000 raw snap, weights-only, sha1 0d056422),
@@ -1145,6 +1146,8 @@ The plan (user-approved: smoke test only, ~10.5 h) is the retrain from the inkpo
    dropped (41 % of the chunks), before giving up.
 4. When the queue is done (state/ALLDONE: both arms, snapshots 1000 / 2000 / 3000), report the pod idle at once. Pull the six snapshots and
    score them on the desk (score.sh, pairwrap with --maps reader3=...,A=...,B=..., --ref reader3, --split heldout).
+**GT scoring (fix0332, desk).** _to be filled in: gtboxes on the itN models vs def-u1's ref; wrap-check --gt-int --ct --codes on def-u1's
+fields: CT peaks per GT turn by radius band._
 
 ## rectosp's m7 source fetched beside the fields: ufsm z3-fetch, 17.9k chunks cold in 22 s (2026-11-17, branch rdup-20261117)
 
