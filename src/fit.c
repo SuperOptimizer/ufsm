@@ -10,6 +10,7 @@
 #include "coreline.h"
 #include "l1pot.h"
 #include "fit_emb.h"
+#include "nn_uwsnap.h"
 #include <limits.h>
 #include <complex.h>
 #include <math.h>
@@ -499,6 +500,14 @@ static double uw_pdv(const fit_fields *f, size_t i, double a0) {
 /* atan2(ms, mc) of every (pc, ps) byte pair (uw_q's phase angle: the same expression, looked up) */
 static double g_uw_ang[65536]; static pthread_once_t g_uw_ang_once = PTHREAD_ONCE_INIT;
 static void uw_ang_init(void) { for (int p = 0; p < 256; p++) for (int s = 0; s < 256; s++) g_uw_ang[p << 8 | s] = atan2((s - 128) / 127.0, (p - 128) / 127.0); }
+/* the GPU pass's per-byte-pair tables (uw_accum_snap_gpu): uw_q's conf and uw_rec's ang / (2 pi), the same expressions on the host */
+static double g_uw_gtab[2 * 65536]; static pthread_once_t g_uw_gtab_once = PTHREAD_ONCE_INIT;
+static void uw_gtab_init(void) {
+    for (int p = 0; p < 256; p++) for (int s = 0; s < 256; s++) {
+        const double mc = (p - 128) / 127.0, ms = (s - 128) / 127.0;
+        g_uw_gtab[p << 8 | s] = sqrt(mc * mc + ms * ms); g_uw_gtab[65536 + (p << 8 | s)] = g_uw_ang[p << 8 | s] / (2 * M_PI);
+    }
+}
 /* the voxel's confidence (0: excluded) and its phase angle (ang null: not wanted); fit_cfg uw_pdv > 0: times exp(-pdv / uw_pdv^2) */
 static float uw_q(const fit_fields *f, size_t i, double min_conf, const fit_cfg *c, double *ang) {
     if (!f->w[i]) return 0;
@@ -672,6 +681,50 @@ static void uw_accum_snap(void *a, int i0, int i1, int t) {
         }
     }
     x->nreach[t] = nr; if (over) atomic_fetch_add(&x->over, over);
+}
+/* uw_accum_snap on the GPU (src/nn_uwsnap.cu) on the fit's device planes dpl (pc ps sp w): the tables from the same expressions
+   (ev_part_init / ev_party_init, the axis, the node rows' field rows and the field columns nearest to each node column, lround as
+   uw_accum's), the ref's lattice over the planes its rows read. x->acc / x->wsum written, *reached. 0, or -1 (unsupported / no device
+   memory: the caller runs the CPU pass) */
+static int uw_accum_snap_gpu(uw_ctx *x, const int *zr, const int *yr, const uint8_t *const *dpl, size_t *reached) {
+    const fit_fields *f = x->f; const fit_model *m = x->m; const fit_cfg *c = x->c; const fit_set *R = c->ref; const fit_model *G = R->global;
+    if (R->n || c->uw_pdv > 0) return -1;
+    const double tp0 = nn_wall_seconds();
+    pthread_once(&g_uw_gtab_once, uw_gtab_init);   /* (after uw_ang_init: fit_unwrap_voxels ran it) */
+    const int nag = (int)(G->D * G->h) + 1, D = f->D, H = f->H, W = f->W;
+    uws_z *zt = malloc(D * sizeof *zt); uws_row *rm = malloc((size_t)D * H * sizeof *rm), *rr = malloc((size_t)D * H * sizeof *rr);
+    int *xr = calloc(m->lx + 1, sizeof(int)); int rc = -1;
+    if (!zt || !rm || !rr || !xr) goto out;
+    int pmin = G->lz, pmax = -1;
+    for (int z = 0; z < D; z++) {
+        const double pz = (z + 0.5) * f->h, cy = axis_lerp(f->cy, x->na, pz), cx = axis_lerp(f->cx, x->na, pz), zrr = pz + c->ref_off[0];
+        ev_part P; ev_part_init(&P, m, pz); ev_part PR; ev_part_init(&PR, G, zrr);
+        const double gy = axis_lerp(G->cy, nag, zrr), gx = axis_lerp(G->cx, nag, zrr);
+        zt[z] = (uws_z){cy, cx, zrr, P.pit, P.off, PR.pit, PR.off, gy, gx, x->same_ok && c->ref_off[1] == 0 && c->ref_off[2] == 0 && gy == cy && gx == cx};
+        for (int b = 0; b < 2; b++) { const int pl = (int)(PR.za[b] / G->ly); if (pl < pmin) pmin = pl; if (pl > pmax) pmax = pl; }
+        for (int y = 0; y < H; y++) {
+            ev_party Q; ev_party_init(&Q, &P, (y + f->oy + 0.5) * f->h);
+            ev_party QR; ev_party_init(&QR, &PR, (y + f->oy + 0.5) * f->h + c->ref_off[1]);
+            uws_row *a = &rm[(size_t)z * H + y], *b = &rr[(size_t)z * H + y];
+            for (int k = 0; k < 4; k++) { a->base[k] = Q.base[k]; a->wzy[k] = Q.wzy[k]; b->base[k] = QR.base[k]; b->wzy[k] = QR.wzy[k]; }
+        }
+    }
+    const size_t rb = (size_t)pmin * G->ly * G->lx;   /* (the ref's planes pmin..pmax only) */
+    for (size_t k = 0; k < (size_t)D * H; k++) for (int q = 0; q < 4; q++) rr[k].base[q] -= rb;
+    for (int xx = 0; xx < W; xx++) { const double px = (xx + f->ox + 0.5) * f->h; const int cc = (int)lround(px / m->L); xr[(cc < m->lx ? cc : m->lx - 1) + 1]++; }
+    for (int cc = 0; cc < m->lx; cc++) xr[cc + 1] += xr[cc];
+    {
+        const uws_args A = {D, H, W, f->oy, f->ox, f->h, dpl[0], dpl[1], dpl[2], dpl[3], x->min_conf, c->packed_um, c->um, g_uw_gtab, zt, rm, rr,
+                            m->lz, m->ly, m->lx, m->L, (m->L & (m->L - 1)) == 0 ? 1.0 / m->L : 0, m->dir, m->delta,
+                            G->L, G->lx, G->dir, (G->L & (G->L - 1)) == 0 ? 1.0 / G->L : 0, G->delta + rb, (size_t)(pmax - pmin + 1) * G->ly * G->lx,
+                            c->ref_off[1], c->ref_off[2], x->rbias, x->kb, zr, yr, xr};
+        const double tg = nn_wall_seconds(); size_t ov = 0; rc = nn_uw_snap(&A, x->acc, x->wsum, reached, &ov);
+        if (getenv("UFSM_UW_GPU_TIMES")) fprintf(stderr, "uw gpu: tables %.3fs, device %.3fs\n", tg - tp0, nn_wall_seconds() - tg);
+        if (!rc && ov) atomic_fetch_add(&x->over, ov);
+    }
+out:
+    free(zt); free(rm); free(rr); free(xr);
+    return rc;
 }
 /* the bucket queue: per confidence level an array of voxel ids, appended at n and popped at h (FIFO; reset when emptied): sequential
    pushes, and the ids UQ_PD ahead are known, so their records are prefetched long before they are popped */
@@ -1577,7 +1630,7 @@ int fit_node_fill(int lz, int ly, int lx, uint8_t *have, double *corr, int maxpa
     free(fr);
     return npass;
 }
-static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_conf, const fit_cfg *c) {
+static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_conf, const fit_cfg *c, const uint8_t *const *dpl) {   /* dpl: f's device planes pc ps sp w (null: none) */
     const size_t n = (size_t)f->D * f->H * f->W; const int na = (int)(f->D * f->h) + 1;
     const uw_geo g = {f->D, f->H, f->W, (f->H + UB_M) / UB_S, (f->W + UB_M) / UB_S};
     const size_t nr = ((size_t)((f->D + UB_M) / UB_S) * g.bH * g.bW) << (3 * UB);   /* records, the bricks padded */
@@ -1598,7 +1651,7 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
     size_t seed = (size_t)-1; float qbest = 0;
     for (int t = 0; t < x.nt; t++) if (x.qb[t] > qbest) { qbest = x.qb[t]; seed = x.sb[t]; }   /* ties: the lowest voxel, as serially */
     const double t1 = nn_wall_seconds();
-    size_t reached = 0; double tsnap = 0, tacc = 0;
+    size_t reached = 0; double tsnap = 0, tacc = 0; int gpu = 0;
     uw_queue q; if (uq_init(&q)) { if (vbase) munmap(vbase, vlen); return 0; }
     if (seed != (size_t)-1) {
         {   /* the integer base: the seed (or seed model's) integer at the most confident voxel */
@@ -1659,8 +1712,26 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
         for (int b = 0; b < m->ly; b++) yr[b + 1] += yr[b];
         ua_job J = {&x, zr, yr}; tacc = nn_wall_seconds();
         if (seed != (size_t)-1 && fused) {
-            memset(x.nreach, 0, sizeof x.nreach);
-            const int nt = fit_par(m->lz * m->ly, uw_accum_snap, &J); for (int t = 0; t < nt; t++) reached += x.nreach[t];
+            const int chk = dpl && getenv("UFSM_UW_GPU_CHECK") && atoi(getenv("UFSM_UW_GPU_CHECK"));
+            size_t rg = 0; gpu = dpl && !(getenv("UFSM_UW_GPU") && !atoi(getenv("UFSM_UW_GPU"))) && !uw_accum_snap_gpu(&x, zr, yr, dpl, &rg);
+            double *ga = nullptr, *gw = nullptr;
+            if (gpu && chk) { ga = x.acc; gw = x.wsum; x.acc = calloc(nl, sizeof(double)); x.wsum = calloc(nl, sizeof(double)); }
+            if (!gpu || chk) {
+                memset(x.nreach, 0, sizeof x.nreach); const size_t ov0 = x.over;
+                const int nt = fit_par(m->lz * m->ly, uw_accum_snap, &J); for (int t = 0; t < nt; t++) reached += x.nreach[t];
+                if (chk) x.over = ov0;   /* (counted by both) */
+            }
+            if (gpu && chk) {   /* UFSM_UW_GPU_CHECK=1: both passes; the GPU's sums kept, their difference to the CPU's reported */
+                size_t nd = 0, ndw = 0; double ma = 0, mw = 0;
+                for (size_t k = 0; k < nl; k++) {
+                    if (memcmp(&ga[k], &x.acc[k], 8)) { nd++; if (fabs(ga[k] - x.acc[k]) > ma) ma = fabs(ga[k] - x.acc[k]); }
+                    if (memcmp(&gw[k], &x.wsum[k], 8)) { ndw++; if (fabs(gw[k] - x.wsum[k]) > mw) mw = fabs(gw[k] - x.wsum[k]); }
+                }
+                fprintf(stderr, "fit: voxel unwrapping GPU check: reached %zu (CPU %zu), node sums differ on %zu (max %.3g) / weights on %zu (max %.3g) of %zu nodes\n",
+                        rg, reached, nd, ma, ndw, mw, nl);
+                free(x.acc); free(x.wsum); x.acc = ga; x.wsum = gw;
+            }
+            if (gpu) reached = rg;
         } else if (!fused) fit_par(m->lz * m->ly, uw_accum, &J);
         tacc = nn_wall_seconds() - tacc;
         free(zr); free(yr);
@@ -1671,7 +1742,7 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
     const int npass = fit_node_fill(m->lz, m->ly, m->lx, have, corr, 64, getenv("UFSM_UW_FILL_OLD") && atoi(getenv("UFSM_UW_FILL_OLD")));
     for (size_t k = 0; k < nl; k++) m->delta[k] += (float)corr[k];
     if (c->verbose) fprintf(stderr, "fit: voxel unwrapping %d threads: setup %.2fs, flood %.2fs (ref snap %.2fs), nodes %.2fs (accumulation %.2fs, fill %.2fs %d passes, %zu nodes)%s\n", x.nt, t1 - t0,
-                            t2 - t1, tsnap, nn_wall_seconds() - t2, tacc, nn_wall_seconds() - tf0, npass, nl, fused ? ", no records: snap in the accumulation" : "");
+                            t2 - t1, tsnap, nn_wall_seconds() - t2, tacc, nn_wall_seconds() - tf0, npass, nl, fused ? (gpu ? ", no records: snap in the accumulation, on the GPU" : ", no records: snap in the accumulation") : "");
     if (x.over) fprintf(stderr, "fit: %zu voxels over 16383 turns from the seed left unreached\n", (size_t)x.over);
     if (vbase) munmap(vbase, vlen); free(x.acc); free(x.wsum); free(have); free(corr);
     return reached;
@@ -2201,7 +2272,7 @@ static fit_model *fit_run_dir(const fit_fields *f, const fit_cfg *c) {
                     fm = *f; fm.pc = mpc; fm.ps = mps; fu = &fm; um2 = umc * qmin * 0.95;
                     if (c->verbose) fprintf(stderr, "fit: CT phase joins the voxel unwrapping on %zu low-confidence voxels (%.1fs)\n", nadd, nn_wall_seconds() - tq);
                 }
-                const size_t rch = fit_unwrap_voxels(m, fu, um2, c); if (c->verbose) fprintf(stderr, "fit: voxel unwrapping reached %zu field voxels\n", rch);
+                const size_t rch = fit_unwrap_voxels(m, fu, um2, c, !cpu && fu == f ? (const uint8_t *const[4]){dpc, dps, dsp, dw} : nullptr); if (c->verbose) fprintf(stderr, "fit: voxel unwrapping reached %zu field voxels\n", rch);
                 free(mpc); free(mps);
             }
             else if (c->unwrap_voxels == 0) fit_unwrap_init(m, f, umc);

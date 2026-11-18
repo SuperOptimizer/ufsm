@@ -181,22 +181,31 @@ int main(void) {
                 }
                 printf("fit --ref-snap 1: the ref's integer on %.4f of the slab's voxels\n", ns ? (double)ok / ns : 0);
                 CHECK(ns && (double)ok / ns >= 0.99, "fit --ref-snap: the ref's integer on %.4f < 0.99", ns ? (double)ok / ns : 0);
-                /* the voxel unwrapping without records (fit.c uw_accum_snap, 11-18) against the three passes over the records it fuses
-                   (UFSM_UW_RECORDS=1) and without its shared radius / angle (UFSM_UW_SAME=0): the same model byte for byte */
+                /* the voxel unwrapping without records (fit.c uw_accum_snap, 11-18) on the CPU (UFSM_UW_GPU=0) against the three passes over
+                   the records it fuses (UFSM_UW_RECORDS=1) and without its shared radius / angle (UFSM_UW_SAME=0): the same model byte for
+                   byte. The default (ms) runs it on the GPU (src/nn_uwsnap.cu, 11-18): the CPU's sums up to the device's atan2 / hypot,
+                   so the model within 1e-5 (byte-identical on the 1667 slabs) */
+                setenv("UFSM_UW_GPU", "0", 1);
+                fit_model *mc = fit_run(&sb.f, &cs); CHECK(mc != nullptr, "fit --ref-snap UFSM_UW_GPU=0");
                 const char *ev[2][2] = {{"UFSM_UW_RECORDS", "UFSM_UW_SAME"}, {"1", "0"}};
-                for (int v = 0; v < 2; v++) {
-                    setenv(ev[0][v], ev[1][v], 1);
-                    fit_model *mr = fit_run(&sb.f, &cs); CHECK(mr != nullptr, "fit --ref-snap %s=%s", ev[0][v], ev[1][v]);
+                for (int v = 0; v < 3 && mc; v++) {
+                    if (v < 2) setenv(ev[0][v], ev[1][v], 1); else unsetenv("UFSM_UW_GPU");
+                    fit_model *mr = v < 2 ? fit_run(&sb.f, &cs) : ms; CHECK(mr != nullptr, "fit --ref-snap variant %d", v);
                     if (mr) {
-                        const size_t nl = (size_t)ms->lz * ms->ly * ms->lx;
-                        const int same = mr->lz == ms->lz && mr->ly == ms->ly && mr->lx == ms->lx && mr->nk == ms->nk && !memcmp(mr->delta, ms->delta, nl * sizeof(float))
-                                         && !memcmp(mr->pitch, ms->pitch, ms->nk * sizeof(float)) && !memcmp(mr->offset, ms->offset, ms->nk * sizeof(float));
-                        printf("fit --ref-snap 1, %s=%s: model %s\n", ev[0][v], ev[1][v], same ? "byte-identical" : "DIFFERS");
-                        CHECK(same, "fit --ref-snap: %s=%s changed the model", ev[0][v], ev[1][v]);
-                        fit_free(mr);
+                        const size_t nl = (size_t)mc->lz * mc->ly * mc->lx; double md = 0;
+                        const int shape = mr->lz == mc->lz && mr->ly == mc->ly && mr->lx == mc->lx && mr->nk == mc->nk;
+                        const int same = shape && !memcmp(mr->delta, mc->delta, nl * sizeof(float)) && !memcmp(mr->pitch, mc->pitch, mc->nk * sizeof(float))
+                                         && !memcmp(mr->offset, mc->offset, mc->nk * sizeof(float));
+                        if (shape) for (size_t k = 0; k < nl; k++) md = fmax(md, fabs((double)mr->delta[k] - mc->delta[k]));
+                        printf("fit --ref-snap 1, %s vs UFSM_UW_GPU=0: model %s (max |delta diff| %.3g)\n", v < 2 ? (v ? "UFSM_UW_SAME=0" : "UFSM_UW_RECORDS=1") : "the GPU pass",
+                               same ? "byte-identical" : "differs", md);
+                        if (v < 2) CHECK(same, "fit --ref-snap: %s=%s changed the model", ev[0][v], ev[1][v]);
+                        else CHECK(shape && md <= 1e-5, "fit --ref-snap: the GPU pass moved delta by %.3g", md);
+                        if (v < 2) fit_free(mr);
                     }
-                    unsetenv(ev[0][v]);
+                    if (v < 2) unsetenv(ev[0][v]);
                 }
+                unsetenv("UFSM_UW_GPU"); fit_free(mc);
                 fit_free(ms);
             }
             {   /* the phase gate (fit --phase-gate, src/phasegate.c): a phase that rotates with the sheets is kept; a dead (constant,
