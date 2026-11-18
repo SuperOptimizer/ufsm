@@ -1006,6 +1006,8 @@ static int cmd_band(int argc, char **argv) {
    --uw-rep-fib W (with --fibers, --uw-repair): the same pairs as votes in the slip repair (src/fit.c uwr_fib): W 16 ids +0.021 (P 0.999;
    J34 +0.14, HOLD -0.03), W >= 64 overrides the phase. --uw-rep-fib-hop F [--uw-rep-fib-min 1]: drop fibres whose in-piece pairs vote
    non-zero (flags ~0 fibres: the trace already follows the phase). --nondeg-floor F (0.4) --w-nondeg W: the nondegeneracy hinge.
+   --uw-rep-hidden H (< 1, with --uw-repair; levelsolve 11-18): touching votes across the sheets one-sided (more turns outward cost H of the
+   weight, fewer the whole: HerculeX's rays; the phase skips touching sheets).
    --phase-stretch S [--phase-stretch-r R]: the phase confidence x exp(-log2(s)^2 / 2 S^2), s the phase stretch (|grad phase| x spacing
    over a (2R+1)^3 box, R default 1), before the fit: where the phase skips sheets the density sets the turn count (0 off). */
 /* U (the unwrapped radius in turns; sheets where U - dir theta / 2 pi is an integer) for the scorer: fill(ctx, og, n3, step, codes, U)
@@ -1666,7 +1668,7 @@ static int cmd_fit(int argc, char **argv) {
         if (!(c.w_fib > 0) && !(c.w_fib_cons > 0) && !(c.uw_rep_fib > 0)) fprintf(stderr, "fit: --fibers without --w-fib / --w-fib-cons / --uw-rep-fib W > 0 (unused)\n");
     }
     c.uw_rep_qpow = (float)opt_atof("--uw-rep-qpow", opt(argc, argv, "--uw-rep-qpow", "3")); c.uw_rep_stretch = (float)opt_atof("--uw-rep-stretch", opt(argc, argv, "--uw-rep-stretch", "0.5"));
-    c.uw_rep_sr = opt_atoi("--uw-rep-sr", opt(argc, argv, "--uw-rep-sr", "1")); c.uw_rep_seed = (float)opt_atof("--uw-rep-seed", opt(argc, argv, "--uw-rep-seed", *opt(argc, argv, "--seed-model", "") ? "16" : "0"));   /* (fit --slab chaining: off unless given) */ c.uw_rep_geo_init = opt_atoi("--uw-rep-geo-init", opt(argc, argv, "--uw-rep-geo-init", "0")); c.uw_rep_off = opt_atoi("--uw-rep-off", opt(argc, argv, "--uw-rep-off", "0")); c.uw_rep_cons = opt_atoi("--uw-rep-cons", opt(argc, argv, "--uw-rep-cons", "1")); c.phase_stretch = (float)opt_atof("--phase-stretch", opt(argc, argv, "--phase-stretch", "0")); c.phase_stretch_r = opt_atoi("--phase-stretch-r", opt(argc, argv, "--phase-stretch-r", "1"));
+    c.uw_rep_sr = opt_atoi("--uw-rep-sr", opt(argc, argv, "--uw-rep-sr", "1")); c.uw_rep_seed = (float)opt_atof("--uw-rep-seed", opt(argc, argv, "--uw-rep-seed", *opt(argc, argv, "--seed-model", "") ? "16" : "0"));   /* (fit --slab chaining: off unless given) */ c.uw_rep_geo_init = opt_atoi("--uw-rep-geo-init", opt(argc, argv, "--uw-rep-geo-init", "0")); c.uw_rep_off = opt_atoi("--uw-rep-off", opt(argc, argv, "--uw-rep-off", "0")); c.uw_rep_cons = opt_atoi("--uw-rep-cons", opt(argc, argv, "--uw-rep-cons", "1")); c.uw_rep_hidden = (float)opt_atof("--uw-rep-hidden", opt(argc, argv, "--uw-rep-hidden", "1")); c.phase_stretch = (float)opt_atof("--phase-stretch", opt(argc, argv, "--phase-stretch", "0")); c.phase_stretch_r = opt_atoi("--phase-stretch-r", opt(argc, argv, "--phase-stretch-r", "1"));
     if (!(c.phase_stretch >= 0) || c.phase_stretch_r < 0 || c.phase_stretch_r > 4) { fprintf(stderr, "fit: --phase-stretch >= 0, --phase-stretch-r 0..4\n"); return 2; }
     /* embedding evidence for the slip repair (src/fit_emb.h): --emb GROUP (a dinovol-embed output group at the fields' scan level, or
        --emb-scale S embedding voxels per native voxel) [--emb-output tokens_unit] --uw-rep-emb W [--uw-rep-emb-d 16,48 native voxels]
