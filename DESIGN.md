@@ -124,6 +124,19 @@ OV 8 cuts the slab stage 12.5 % (wall; 14 % CPU) and the join 19 %: each slab fi
 overlap agreement drops 0.976 -> 0.962 (half the rows to agree on), but the GT score does not move (-0.0001 all boxes, +0.0003 inner,
 inside the gate of -0.005), the body drift is unchanged. SLABOV=16 restores the old overlap. e2e.sh's synthetic 2-slab run keeps 16.
 
+Stage-4 step count (same setup, OV 8; SLABFIT `--steps 300,300,300,300,N,200`, N = 200 the OV 8 arm above, runs deterministic):
+
+| stage-4 steps | slabs wall | stage 4 / stage 5 sum over 71 slabs | GT ids (54) | C2-C24 | join agreement | wrap-check real / dup / merged |
+|---|---|---|---|---|---|---|
+| 100 | 116 s | 151.5 / 35.4 s | 0.8594 | 0.8367 | 0.9755 | 31 / 5 / 13 |
+| 150 | 119 s | 154.3 / 37.9 s | 0.8602 | 0.8380 | 0.9677 | 31 / 5 / 13 |
+| 200 (default) | 119 s | 157.2 / 38.0 s | 0.8606 | 0.8389 | 0.9620 | 34 / 5 / 11 |
+| 300 | 127 s | 172.9 / 38.5 s | 0.8611 | 0.8397 | 0.9533 | 35 / 5 / 10 |
+
+Body drift 0.73 turns in every arm. The steps are not stage 4's cost: 100 fewer steps save 5.7 s of 157 summed over the slabs (~3 s
+wall over 3 lanes) at -0.0012 GT ids, because most of a slab's stage 4 is the voxel unwrapping before its first step (s030: setup 0.3 +
+flood 0.6 + nodes 0.8 s of 2.8 s). 300 steps add +0.0005 ids for +8 s wall. The default stays at 200; stage 4's lever is the unwrap.
+
 ## Pod q2: full PHerc1667 at master on an RTX PRO 4000 (u1 13790, every speedup); the per-wrap ink gate bug (2026-11-18, unrollperf)
 
 The podq2 queue (scripts/pod/podq2.sh, DESK=none + the desk pull scripts/pod/q2pull.sh) on a 24 GB RTX PRO 4000 Blackwell pod (cgroup
