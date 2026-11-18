@@ -6,7 +6,7 @@ set -eu
 src=$(readlink -f "$1") out=$2; z=$3 y=$4 x=$5 nz=$6 ny=$7 nx=$8
 mkdir -p "$out"
 fmt=$(jq -r '.format // "raw"' "$src/fields.json")
-for a in pc ps t0 t1 t2 t3 t4 t5 sp w dz dy dx dq r; do   # (the winding mod 4 planes and the recto plane when the source has them)
+for a in pc ps t0 t1 t2 t3 t4 t5 sp w dz dy dx dq r mf; do   # (the winding mod 4 planes and the recto plane when the source has them)
   if [ "$fmt" = zarr ]; then [ -e "$src/$a" ] && ln -sfn "$src/$a" "$out/$a"; else [ -e "$src/$a.raw" ] && ln -sfn "$src/$a.raw" "$out/$a.raw"; fi
 done
 jq -c --argjson z "$z" --argjson y "$y" --argjson x "$x" --argjson nz "$nz" --argjson ny "$ny" --argjson nx "$nx" --arg fmt "$fmt" '

@@ -1,5 +1,6 @@
 /* ufsm CLI. */
 #include "afv.h"
+#include "mergeflag.h"
 #include "optcheck.h"
 #include "sysinfo.h"
 #include "sample.h"
@@ -263,6 +264,8 @@ static int usage(void) {
         "  ufsm geom-check <wraps-dir> --axis F --axis-um U [--out DIR]   wraps geometry QA: spacing, steep walls, jumps, merged / skipped neighbours, holes; guard limits\n"
         "  ufsm refine <wraps-in> <wraps-out> --fields DIR [--range 0.33] [--smooth-um 40]   vertices onto the fields' sheet phase\n"
         "  ufsm surf-stats <wraps-dir> --fields DIR [--ct ROOT KEY --ct-um U]   label-free surface quality (phase, switches, CT)\n"
+        "  ufsm merge-flag <fields-dir> [--out DIR] [--thr 128]               the merged-sheet score per field cell (plane mf: phase vs density count, confidence)\n"
+        "  ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR] [--out DIR]       per-wrap uncertain share from mf, <wrap>_mf.tif masks on the vertex grid\n"
         "  ufsm self-gate <wraps-dir> <out-dir> --fields DIR --model FIT [--ct ..] [--nb FIT].. [--exclude ..]   strict stretches of a box fit -> label tifxyz + q.tif\n"
         "  ufsm ct-fields <ct-root> <key> <fields-dir> --ct-um U   CT planes ct / cs of a fit-field directory (fit --w-ct / --w-cspacing)\n"
         "  ufsm fit-join <out-set> <fields-dir> <slab-model> <z0> <z1> ...   independent z-slab fits -> one fit set, gauges matched on the overlaps\n"
@@ -1094,7 +1097,27 @@ static int sc_boxes_load(const char *path, const char *mode) {
     fprintf(stderr, "fit: --score-boxes: %d boxes from %s, scoring the label voxels %s them\n", g_nsbox, path, g_sbox_in ? "inside" : "outside");
     return 0;
 }
+/* fit --score-mf THR conf|unc [--score-mf-dir DIR]: score only the label voxels whose field cell has mf < THR (conf: the part an
+   abstaining export keeps as confident) or mf >= THR (unc), mf the merged-sheet plane of ufsm merge-flag (src/mergeflag.h) in the
+   fields directory (or DIR: same box). Label voxel i (label grid) lies at native cf (i + 1/4); its cell floor((that - org) / h). */
+static uint8_t *g_mf; static int g_mf_shp[3], g_mf_thr, g_mf_unc; static double g_mf_cf, g_mf_h; static long long g_mf_org[3];
+static void sc_mf_apply(const int64_t o[3], const int64_t n[3], uint8_t *b) {
+    for (int64_t z = 0; z < n[0]; z++) {
+        const long long cz = (long long)floor((g_mf_cf * (o[0] + z + 0.25) - g_mf_org[0]) / g_mf_h);
+        for (int64_t y = 0; y < n[1]; y++) {
+            const long long cy = (long long)floor((g_mf_cf * (o[1] + y + 0.25) - g_mf_org[1]) / g_mf_h); uint8_t *row = b + ((size_t)z * n[1] + y) * n[2];
+            for (int64_t x = 0; x < n[2]; x++) {
+                if (row[x] < 1 || row[x] > 252) continue;
+                const long long cx = (long long)floor((g_mf_cf * (o[2] + x + 0.25) - g_mf_org[2]) / g_mf_h);
+                const int in = cz >= 0 && cy >= 0 && cx >= 0 && cz < g_mf_shp[0] && cy < g_mf_shp[1] && cx < g_mf_shp[2];
+                const int flag = in && g_mf[((size_t)cz * g_mf_shp[1] + cy) * g_mf_shp[2] + cx] >= g_mf_thr;
+                if (flag != g_mf_unc) row[x] = 0;
+            }
+        }
+    }
+}
 static void sc_boxes_apply(const int64_t o[3], const int64_t n[3], uint8_t *b) {
+    if (g_mf) sc_mf_apply(o, n, b);
     if (!g_sbox) return;
     uint8_t *keep = malloc((size_t)n[2]);
     for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) {
@@ -2073,6 +2096,16 @@ static int cmd_fit(int argc, char **argv) {
         if (min) for (int d = 0; d < 3; d++) { so_[d] = (long long)fb.origin[d]; fc.off[d] = (double)(so_[d] - org[d]); }
         g_score_pairs = opt_atoi("--score-pairs", opt(argc, argv, "--score-pairs", "0"));
         { const int bi = arg_index(argc, argv, "--score-boxes"); if (bi > 0 && bi + 2 < argc && sc_boxes_load(argv[bi + 1], argv[bi + 2])) return 2; }
+        { const int mi = arg_index(argc, argv, "--score-mf");
+          if (mi > 0) {
+              if (mi + 2 >= argc || (strcmp(argv[mi + 2], "conf") && strcmp(argv[mi + 2], "unc"))) { fprintf(stderr, "fit: --score-mf THR conf|unc\n"); return 2; }
+              const char *md = opt(argc, argv, "--score-mf-dir", dir); int ms[3];
+              if (!(g_mf = fit_field_array(md, "mf", 1, ms))) { fprintf(stderr, "fit: --score-mf: cannot read the mf plane in %s (ufsm merge-flag)\n", md); return 1; }
+              for (int d = 0; d < 3; d++) { if (ms[d] != shp[d]) { fprintf(stderr, "fit: --score-mf: mf is %dx%dx%d, the fields %dx%dx%d\n", ms[0], ms[1], ms[2], shp[0], shp[1], shp[2]); return 1; }
+                                            g_mf_shp[d] = ms[d]; g_mf_org[d] = so_[d]; }
+              g_mf_thr = opt_atoi("--score-mf", argv[mi + 1]); g_mf_unc = !strcmp(argv[mi + 2], "unc"); g_mf_cf = cf; g_mf_h = h;
+              fprintf(stderr, "fit: --score-mf: scoring the label voxels in %s cells (mf %s %d)\n", g_mf_unc ? "uncertain" : "confident", g_mf_unc ? ">=" : "<", g_mf_thr);
+          } }
         if (*opt(argc, argv, "--zgauge", "") && zg_load(opt(argc, argv, "--zgauge", ""), opt_atof("--zgauge-scale", opt(argc, argv, "--zgauge-scale", "1")), opt_atof("--zgauge-f", opt(argc, argv, "--zgauge-f", "1")))) return 1;
         if (*opt(argc, argv, "--score-z", "") && sscanf(opt(argc, argv, "--score-z", ""), "%lf,%lf", &g_score_z0, &g_score_nz) != 2) { fprintf(stderr, "fit: --score-z Z0,NZ (box-local native z)\n"); return 2; }
         const int rc = score_codes(z, cf, so_, shp, h, fb.um, fb.cy, fb.cx, arg_index(argc, argv, "--score-detail") > 0, dump, fit_fill, gd && !getenv("UFSM_SCORE_DENSE") ? &fit_sparse : nullptr, &fc);
@@ -5019,6 +5052,8 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "surf-snap")) return cmd_surfsnap(argc, argv);
     if (!strcmp(cmd, "refine")) return cmd_refine(argc, argv);
     if (!strcmp(cmd, "surf-stats")) return cmd_surf_stats(argc, argv);
+    if (!strcmp(cmd, "merge-flag")) return cmd_merge_flag(argc, argv);
+    if (!strcmp(cmd, "wrap-mf")) return cmd_wrap_mf(argc, argv);
     if (!strcmp(cmd, "wrap-snap")) return cmd_wrap_snap(argc, argv);
     if (!strcmp(cmd, "surf-labels") || !strcmp(cmd, "wrap-anchor")) return cmd_surf_labels(argc, argv);
     if (!strcmp(cmd, "sheet-score")) return cmd_sheet_score(argc, argv);

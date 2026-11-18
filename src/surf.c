@@ -17,6 +17,7 @@
 #include "store.h"
 #include "json.h"
 #include <dirent.h>
+#include <sys/stat.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -967,4 +968,58 @@ int cmd_ink_cover(int argc, char **argv) {
     if (tf) fclose(tf);
     free(nm);
     return 0;
+}
+
+/* ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR] [--thr 128] [--pool 4] [--out DIR [--up K]] [--tsv FILE]: the merged-sheet
+   flag (ufsm merge-flag, src/mergeflag.h) on every wrap: each vertex reads the share of mf >= thr cells in its pooled cell (pool^3
+   field cells, fit_field_array_frac: a whole scroll's plane at pool 4 is ~1/64 of its cells). Per wrap the uncertain share (mean
+   share over the valid vertices) and the share of vertices in a cell at least half flagged; --out: <wrap>_mf.tif per wrap (uint8
+   share x255 on the vertex grid, 0 off the surface; --up K: each vertex K x K pixels, a render at K pixels per grid step). The
+   uncertain vertices are where the exported wrap should not be read as a confident sheet. */
+int cmd_wrap_mf(int argc, char **argv) {
+    if (argc < 3 || !sopt(argc, argv, "--fields", nullptr)) {
+        fprintf(stderr, "usage: ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR (default: the fields dir)] [--thr 128] [--pool 4] [--out DIR [--up 1]] [--tsv FILE]\n"); return 2;
+    }
+    const char *fd = sopt(argc, argv, "--fields", ""), *md = sopt(argc, argv, "--mf", fd), *od = sopt(argc, argv, "--out", nullptr), *tp = sopt(argc, argv, "--tsv", nullptr);
+    const int thr = opt_atoi("--thr", sopt(argc, argv, "--thr", "128")), pool = opt_atoi("--pool", sopt(argc, argv, "--pool", "4")), up = opt_atoi("--up", sopt(argc, argv, "--up", "1"));
+    if (pool < 1 || up < 1 || thr < 1 || thr > 255) { fprintf(stderr, "wrap-mf: --pool, --up >= 1, --thr 1..255\n"); return 2; }
+    sf_fields F; if (sff_load_geom(fd, &F)) { fprintf(stderr, "wrap-mf: cannot read the fields %s\n", fd); return 1; }
+    int shp[3]; uint8_t *fr = fit_field_array_frac(md, "mf", pool, thr, shp);
+    if (!fr) { fprintf(stderr, "wrap-mf: cannot read the mf plane in %s (ufsm merge-flag)\n", md); sff_free(&F); return 1; }
+    if (shp[0] != (F.D + pool - 1) / pool || shp[1] != (F.H + pool - 1) / pool || shp[2] != (F.W + pool - 1) / pool) {
+        fprintf(stderr, "wrap-mf: the mf plane (%d x %d x %d pooled) does not cover the fields' box (%d x %d x %d cells)\n", shp[0], shp[1], shp[2], F.D, F.H, F.W); free(fr); sff_free(&F); return 1;
+    }
+    char (*names)[256] = nullptr; const int nn = sf_names(argv[2], &names); if (nn <= 0) { fprintf(stderr, "wrap-mf: no wraps in %s\n", argv[2]); free(fr); sff_free(&F); return 1; }
+    if (od) mkdir(od, 0775);
+    FILE *tf = tp ? fopen(tp, "w") : nullptr; if (tp && !tf) { fprintf(stderr, "wrap-mf: cannot write %s\n", tp); return 1; }
+    if (tf) fprintf(tf, "wrap\tvertices\tuncertain\tflagged_half\n");
+    printf("  wrap  vertices  uncertain  flagged>=0.5\n");
+    double tot = 0, totf = 0; size_t totv = 0; int rc = 0;
+    for (int k = 0; k < nn; k++) {
+        sf_wrap s; if (sf_load(argv[2], names[k], &s)) continue;
+        const size_t n = (size_t)s.w * s.h; uint8_t *m = calloc(n, 1); size_t nv = 0, nh = 0; double sum = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (s.Z[i] < 0) continue;
+            double q[3]; sf_native(&s, &F, i, q, nullptr, 1); int c[3], in = 1;
+            for (int d = 0; d < 3; d++) { c[d] = (int)floor(q[d] / F.h) / pool; if (q[d] < 0 || c[d] >= shp[d]) in = 0; }
+            nv++; if (!in) continue;   /* (outside the fields: counted as confident: nothing flags it) */
+            const uint8_t v = fr[((size_t)c[0] * shp[1] + c[1]) * shp[2] + c[2]]; m[i] = v; sum += v / 255.0; nh += v >= 128;
+        }
+        printf("  w%03d %9zu  %9.4f  %12.4f\n", s.id, nv, nv ? sum / nv : 0, nv ? (double)nh / nv : 0);
+        if (tf) fprintf(tf, "w%03d\t%zu\t%.5f\t%.5f\n", s.id, nv, nv ? sum / nv : 0, nv ? (double)nh / nv : 0);
+        tot += sum; totf += nh; totv += nv;
+        if (od) {
+            const int W = s.w * up, H = s.h * up; uint8_t *im = malloc((size_t)W * H);
+            for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) im[(size_t)y * W + x] = m[(size_t)(y / up) * s.w + x / up];
+            char p[1500]; snprintf(p, sizeof p, "%s/%s_mf.tif", od, s.name);
+            if (tiffw_write(p, W, H, 1, im, 1)) { fprintf(stderr, "wrap-mf: cannot write %s\n", p); rc = 1; }
+            free(im);
+        }
+        free(m); sf_free(&s);
+    }
+    printf("wrap-mf: %d wraps, %zu vertices: uncertain share %.4f (vertices in a cell >= half flagged %.4f; mf >= %d, pool %d)\n", nn, totv, totv ? tot / totv : 0,
+           totv ? totf / totv : 0, thr, pool);
+    if (tf) fclose(tf);
+    free(names); free(fr); sff_free(&F);
+    return rc;
 }

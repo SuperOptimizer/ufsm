@@ -6,6 +6,8 @@
 # made relative to the fields' origin and divided by the fields' h. Writes OUTDIR/<name>.log and OUTDIR/summary.tsv (name, labelled
 # voxels, ids right, |err| < 0.08, |err| median) and prints the voxel-weighted means. Needs a binary with 3a8f25e (fit --model --codes on
 # a crop); the 11-12 unroll binary 29115c1 scores 0 voxels. (audit ugeom #2 / #5: ref-cf vs joined on 1667's 70 C boxes and P4's boxes)
+# FITX: extra fit flags (word-split), e.g. FITX="--score-mf 128 conf" scores only the label voxels in cells the merge-flag mask keeps
+# (FIELDS needs an mf plane: ufsm merge-flag; mkcrop.sh links it).
 set -euo pipefail
 F=$(readlink -f "$1") M=$2 BX=$3 CR=$4 CK=$5 OUT=$6 U=${7:-${U:-ufsm}}
 H=$(cd "$(dirname "$0")" && pwd); MK=${MKCROP:-$H/../../wbench/mkcrop.sh}
@@ -15,7 +17,7 @@ read -r oz oy ox h < <(jq -r '"\(.origin[0]) \(.origin[1]) \(.origin[2]) \(.h)"'
 grep -v '^#' "$BX" | while IFS=$'\t' read -r nm sc z y x nz ny nx rest; do
   [ -n "$nm" ] || continue
   c=$OUT/crops/$nm; [ -d "$c" ] || bash "$MK" "$F" "$c" $(( (z - oz) / h )) $(( (y - oy) / h )) $(( (x - ox) / h )) $(( nz / h )) $(( ny / h )) $(( nx / h )) > /dev/null
-  grep -qs 'fit score' "$OUT/$nm.log" || nice -n 10 "$U" fit "$c" --model "$M" --codes "$CR" "$CK" --cpu --score-detail 1 > "$OUT/$nm.log" 2>&1 || true
+  grep -qs 'fit score' "$OUT/$nm.log" || nice -n 10 "$U" fit "$c" --model "$M" --codes "$CR" "$CK" --cpu --score-detail 1 ${FITX:-} > "$OUT/$nm.log" 2>&1 || true
 done
 { printf 'name\tvoxels\tids\terr08\terr_med\n'
   for f in "$OUT"/*.log; do sed -nE "s/^fit score: ([0-9]+) labelled voxels, gauge [-0-9.]+, winding ids right ([0-9.]+), \|error\| < 0.08 turn ([0-9.]+), \|error\| median ([0-9.]+).*/$(basename "$f" .log)\t\1\t\2\t\3\t\4/p" "$f"; done
