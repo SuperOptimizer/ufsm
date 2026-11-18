@@ -52,6 +52,8 @@ if ! done_ setup; then
   mark setup
 fi
 [ -n "${GTPID:-}" ] && { wait $GTPID; GTPID=; }; done_ gt || die "gt fetch (log $K/gt.log)"
+# the kit's segment lists, sources-H0.json and axis/ next to the fetched GT (pod 11-18 14:50: mkarms found no K/inkgt/sources-H0.json)
+cp -rn $K/kit/inkgt/. $K/inkgt/ && [ -s $K/inkgt/sources-H0.json ] || die "no $K/inkgt/sources-H0.json (the kit's inkgt/)"
 # --- prefetch (CPU + network, in the background beside narrow + weights) ---
 mkarms() { [ -s $AD/sources-$1.json ] && return 0
   python3 -I $D/mkarms.py $K/inkgt/sources-H0.json $K/teach $K/kit/holdouts-20261118.json $AD $1 > $AD/mkarms$1.log 2>&1 || die "mkarms $1 (log $AD/mkarms$1.log)"; }
