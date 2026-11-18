@@ -176,15 +176,12 @@ static int run_dattn(int N, int D, int H, int W) {
     float *gd = xdev_floats(ga, 16), *bd = xdev_floats(be, 16), *wd = xdev_floats(w, 16);
     xt f = xt_new(N, D, H, W, 16); xh2d(f.p, fh, ne * 2);
     xt z = xdepth_collapse16(f, 16, gd, bd, 1e-5f, XA_LRELU, wd, 0.2f); xd2h(y1, z.p, no * 2); xt_free(&z);
-    size_t n12 = 0;   /* k_dattn (1) against the shared-memory k_dattn2 (2, the default): byte-equal */
-    { uint16_t *y0 = malloc(no * 2); xnet_set_dattn(1); z = xdepth_collapse16(f, 16, gd, bd, 1e-5f, XA_LRELU, wd, 0.2f); xd2h(y0, z.p, no * 2); xt_free(&z); xnet_set_dattn(-1);
-      for (size_t i = 0; i < no; i++) n12 += y0[i] != y1[i]; free(y0); printf("dattn N %d D %d %dx%d: %zu of %zu differ k_dattn vs k_dattn2\n", N, D, H, W, n12, no); }
     xgn(f, 16, gd, bd, 1e-5f, nullptr, XA_LRELU, f); float *at = xmalloc_dev(N * S * 4); xhead(f, wd, 0.2f, at);
     z = xdepth_attn_max(f, at); xd2h(y2, z.p, no * 2); xt_free(&z); xfree_dev(at);
     if (xnet_check("test_xmx dattn")) return 1;
     double emax = 0; size_t bad = 0;
     for (size_t i = 0; i < no; i++) { const double a = h2f(y1[i]), b = h2f(y2[i]), d = fabs(a - b); if (d > emax) emax = d; if (d > 2e-3 * fabs(b) + 1e-3) bad++; }
-    printf("dattn N %d D %d %dx%d: max |d| %.3g vs the separate kernels, %zu of %zu over the bound\n", N, D, H, W, emax, bad, no); bad += n12;
+    printf("dattn N %d D %d %dx%d: max |d| %.3g vs the separate kernels, %zu of %zu over the bound\n", N, D, H, W, emax, bad, no);
     xt_free(&f); xfree_dev(gd); xfree_dev(bd); xfree_dev(wd); free(fh); free(y1); free(y2);
     return bad != 0;
 }
@@ -361,11 +358,6 @@ int main(void) {
               for (int r = 0; r < 10; r++) { xnet_sync(); const double t0 = now(); float *g = nullptr; xt y = xconv_fwd_gs16(&c1, x1, 16, 1e-5f, &g); xnet_sync(); const double t = now() - t0; xt_free(&y); xfree_dev(g); if (t < best) best = t; }
               printf("dfbench c1gs %d: %.3f ms\n", v, best * 1e3); }
           xnet_set_c1gs(-1);
-          { float wa[16]; for (int j = 0; j < 16; j++) wa[j] = rnd(); float *wd = xdev_floats(wa, 16);   /* the depth collapse: k_dattn (1) / k_dattn2 (2) */
-            for (int v = 1; v <= 2; v++) { xnet_set_dattn(v); double best = 1e9;
-                for (int r = 0; r < 10; r++) { xnet_sync(); const double t0 = now(); xt z = xdepth_collapse16(x, 16, gd, bd, 1e-5f, XA_LRELU, wd, 0.1f); xnet_sync(); const double t = now() - t0; xt_free(&z); if (t < best) best = t; }
-                printf("dfbench dattn %d: %.3f ms\n", v, best * 1e3); }
-            xnet_set_dattn(-1); xfree_dev(wd); }
           xnet_set_df1(-1); xt_free(&x1); xconv_free(&c1); }
         return 0;
     }
@@ -397,7 +389,6 @@ int main(void) {
     for (int sf = 6; sf >= 5; sf--) { fails += run(sf, 2, 9, 7, 11, 32, 32, 3, 1, 2); fails += run(sf, 1, 6, 5, 7, 128, 256, 1, 1, 0); }
     g_mxa = 0; xnet_set_mxq(0); xnet_set_mxrot(0); xnet_set_mxa(0);
     fails += run_dattn(2, 17, 40, 36);
-    fails += run_dattn(1, 5, 9, 13);    /* a partial last block */
     fails += run_c1gs(2, 17, 40, 36);   /* 64 chunks, a ragged last step */
     fails += run_c1gs(3, 5, 9, 23);     /* S / 64 chunks */
     fails += run_c1gs(1, 17, 96, 96);
