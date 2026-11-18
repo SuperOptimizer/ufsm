@@ -6,6 +6,34 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## rhocal (label-free count calibration from CT peaks): rejected by 1667 GT; the CT peak count is no counting reference (2026-11-18, branch rhocal-20261117)
+
+Idea (lead / user 11-17: a per-scroll auto-calibration for the corpus, 0332 the test bed): wrap-check counts CT papyrus peaks per fitted
+turn by radius band; scale count-field's density term per band (--rho-r, K(r) <- K(r) x CT(r)^1.3, median-3, cap [0.8, 1.6], gated bands)
+until CT/turn ~ 1, keep it only if wrap-check dup + merged and the body z drift do not get worse. unroll.sh stage `rhocal` (RHOCAL=1,
+opt-in, RHOCALMODE radial | global, RHOCALMIN / MAX / G / TOL / IT); tests/test_rhocal.sh (fake ufsm).
+1667 A/B on pod B (u1 13000 and pab-base 8690 fields, 640/64, dir -1), GT ids right on the 54 non-noise 1667 wbench boxes (gtboxes,
+ref models; CPU on the desk; the GT codes never leave the desk):
+| fields | default ref | radial pass 1 / 2 / 3 | radial, K >= 0.95 | global pass 1 / 2 | rhocal's own verdict |
+|---|---|---|---|---|---|
+| u1 13000 | 0.831 (joined 0.853) | 0.581 / 0.526 / 0.517 | 0.581 / 0.526 | 0.592 / 0.501 | accepted (dup+merged 21 -> 8-11) |
+| pab-base 8690 | 0.669 (joined 0.699) | 0.523 / 0.375 / 0.376 | same | 0.491 / 0.305 | DEFAULTED (body drift +0.23..+0.51) |
+Why: wrap-check --gt-int --ct --codes on the default u1 ref (55386 intervals between consecutive GT sheets): per GT turn the fit counts
+1.024, the density term 1.22, the network phase 0.93, the CT peak detector 1.54 (off by >= 0.5 on 54 % of the intervals). The CT peaks per
+GT turn follow the sheet spacing: by GT gap 0.56 (< 70 um), 0.84 (85-100), 1.04 (115-130), 1.20 (150-180), 1.34 (180-230), 2.21 (> 230); by
+radius 1.96 (0-4 mm) .. 0.93 (12-14 mm). "CT peaks per fitted turn = 1" is right only near ~120 um gaps (Paris 4's 1.05 calibration was
+that regime). So the CT peak count can not calibrate a count, and wrap-check's verdicts reward the wrong direction too: the recovered u1
+rhocal fits checked 52 real / 12 dup / 0 merged against the default's 33 / 6 / 12 while losing 0.25-0.33 GT ids. unroll-qa's pw48 / w4
+fell with the "corrections" (0332 and 1667) and agreed with GT: the 11-17 claim that they penalise correct counting is withdrawn.
+Kept (master): wrap-check --bands / --intervals, cf-demod's body vs end drift + body z range, ZR=auto (opt-in), the DRIFTWARN ALARM on
+the body excursion, count-field --rho-r (a tool). rhocal stays on its branch (not merged): RHOCAL is not a default path anywhere.
+Corrections to the 11-17 PHerc0332 section below: "try9 undercounts 20 %" and "u1 counts right" rest on the same uncalibrated CT
+objective. Read through 1667's gap curve, try9's 0332 fit (gaps ~160 um, CT/turn 1.18) maps to ~1.0 turns per GT turn and u1's (~132 um,
+1.04) to ~0.95; the fits disagree (62 vs 72 wraps, pair accuracy 0.27 at 2 mm) but which is right is not decidable label-free with CT
+peaks. The 0332 AGREE pseudo-label boxes (CT/turn 0.95-1.05) are withdrawn. The broken top end (zr 512,7680) and body drift stand.
+Open: whether CT peaks per GT turn vs gap is the same curve on Paris 4 / 0139 (then a gap-calibrated lookup could check counts); until then
+counting is a model problem (labels on more scrolls).
+
 ## Latent-ink smoke on pod B: cancelled before a scored step. Cold https CT was the wall; the restart recipe (2026-11-18, scripts/inksmoke)
 
 The plan (user-approved: smoke test only, ~10.5 h) is the retrain from the inkpod diagnosis (section "Production ink = reader3").
@@ -517,6 +545,8 @@ lossless encoder came in between): rebuild both sides of an A/B from one source.
 the fast tier is the gate, not the timing run.
 
 ## PHerc0332: try9 undercounts 20 %, u1's z drift is the top 5 mm; count-field --rho-r (2026-11-17, branch fix0332-20261117)
+
+(Corrected 11-18, see "rhocal" above: the counting conclusions here used CT peaks per turn, which GT shows is not a counting reference.)
 
 0332 has no winding labels (0.1 % fibre-hf only), so every net is out of domain there; no GT, so the objectives are wrap-check
 (CT papyrus peaks per fitted turn, rct = fit gap / local CT peak spacing, verdicts), unroll-qa tile pass and the check stage's
