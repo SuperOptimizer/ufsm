@@ -22,7 +22,7 @@
 #      Writes $POD/scrolls/<S>.env for scripts/pod/unroll.sh.
 # Env: POD (default /root/pod as root, else ~/pod), BRANCH (master), REPO (https://github.com/SuperOptimizer/ufsm), MIRROR,
 #   NOAPT=1 (skip apt), NOBUILD=1 (reuse the binary if built on this machine), FOREIGN_BINARY=1 (reuse it anyway), NOSMOKE=1, LEVELS ("L ..." override), MTH (mirror threads, 12; the mirror answers 429 past 64
-#   requests in flight per IP), ARCH (auto). Log: $POD/setup.log.
+#   requests in flight per IP), ARCH (auto), LLVM=1 (clang-22 too: the llvm presets), CUBINS (a cubins-*.tar.zst of an earlier pod). Log: $POD/setup.log.
 set -uo pipefail
 S=${1:-}
 POD=${POD:-$([ "$(id -u)" = 0 ] && echo /root/pod || echo $HOME/pod)}
@@ -67,8 +67,12 @@ say "pod $POD: $NCPU CPUs, $MEMGB GB (cgroup)"
 
 # --- 2. deps ---
 LLVMV=22
-PKGS="clang-$LLVMV lld-$LLVMV llvm-$LLVMV libclang-rt-$LLVMV-dev cmake ninja-build ccache git pkg-config ca-certificates curl wget gnupg jq rsync time libcurl4-openssl-dev libzstd-dev libblosc-dev zlib1g-dev libssl-dev libjpeg-dev libxxhash-dev"
-if [ "${NOAPT:-0}" != 1 ] && command -v apt-get > /dev/null && ! apt-cache policy clang-$LLVMV 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+# LLVM (apt.llvm.org, ~55 s + its packages on the 11-18 pod) only where mcc needs it: no /usr/bin/cc for stage 0 and the glibc link, or
+# LLVM=1 (the llvm-release / llvm-verify comparison presets). mcc builds everything else itself
+NEEDLLVM=${LLVM:-0}; [ -x /usr/bin/cc ] || NEEDLLVM=1
+LLPKGS=; [ $NEEDLLVM = 1 ] && LLPKGS="clang-$LLVMV lld-$LLVMV llvm-$LLVMV libclang-rt-$LLVMV-dev"
+PKGS="$LLPKGS cmake ninja-build ccache git pkg-config ca-certificates curl wget gnupg jq rsync time libcurl4-openssl-dev libzstd-dev libblosc-dev zlib1g-dev libssl-dev libjpeg-dev libxxhash-dev zstd"
+if [ "${NOAPT:-0}" != 1 ] && [ $NEEDLLVM = 1 ] && command -v apt-get > /dev/null && ! apt-cache policy clang-$LLVMV 2>/dev/null | grep -q 'Candidate: [0-9]'; then
   [ "$(id -u)" = 0 ] || die "clang-$LLVMV has no apt candidate and not root: add apt.llvm.org or NOAPT=1"
   say "apt: adding apt.llvm.org for clang-$LLVMV"
   export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq --no-install-recommends wget gnupg lsb-release software-properties-common > /dev/null
@@ -127,12 +131,50 @@ if [ "${NOBUILD:-0}" != 1 ]; then
 fi
 [ -x $U ] || die "no $U"
 $U sysinfo --disk $POD | tee $POD/sysinfo.txt
+# the scroll's CT levels are network-bound: fetched in the background while the kernels JIT on the CPUs (pod 11-18: CT 61 s + JIT 52 s
+# one after the other); step 6 waits for it
+row=; K=; if [ -n "$S" ]; then for t in $POD/ufsm/scripts/unroll/scrolls.tsv $POD/ufsm/scripts/corpus/list.tsv; do
+  [ -e $t ] && row=$(awk -F'\t' -v s=$S '$1 == s' $t) && [ -n "$row" ] && break; done; fi
+[ -z "$S" ] || [ -n "$row" ] || die "$S is in neither scripts/unroll/scrolls.tsv nor scripts/corpus/list.tsv"
+[ -n "$row" ] && IFS=$'\t' read -r _ _ K UM LV AXS TBOX TZR TSTRIP <<< "$row"
+# the mirror key: SCROLL/volumes/SCAN; a key that already names volumes/ (scrolls.tsv rows of http CT, e.g. PHerc0332) is kept as is
+# (podunroll 11-17: it became PHerc0332/volumes/volumes/..., a 404)
+case $K in */volumes/*) MK=$K;; *) MK=$(dirname $K)/volumes/$(basename $K);; esac; V=$POD/vol
+ctfetch() {
+  mkdir -p $V/$K; fetch $MIRROR/$MK/zarr.json $V/$K/zarr.json || die "$MK/zarr.json"
+  for l in ${LEVELS:-$(seq $LV $((LV + 3)))}; do
+    curl -sfI $MIRROR/$MK/$l/zarr.json > /dev/null || continue
+    [ -e $POD/state/ct.$S.$l ] && continue
+    say "CT $MK level $l"
+    nice -n 5 $U mirror $MIRROR $MK/$l $V/$K/$l --threads $MTH --verify 2 || die "mirror $MK/$l"
+    touch $POD/state/ct.$S.$l
+  done
+}
+fetch() {   # fetch URL OUT: resumable, complete when the size matches Content-Length
+  local want have; want=$(curl -sfIL "$1" | awk 'tolower($1) == "content-length:" {n = $2} END {print n + 0}' | tr -d '\r')
+  have=$(stat -c %s "$2" 2>/dev/null || echo 0)
+  [ "$want" -gt 0 ] && [ "$have" = "$want" ] && return 0
+  curl -sfL --retry 5 -C - -o "$2" "$1" || curl -sfL --retry 5 -o "$2" "$1" || return 1
+  have=$(stat -c %s "$2"); [ "$want" = 0 ] || [ "$have" = "$want" ] || { echo "fetch: $2 has $have of $want bytes"; return 1; }; }
+CTP=; [ -n "$S" ] && { ctfetch & CTP=$!; }
+# CUBINS=FILE (a tar.zst of an earlier pod's ~/.cache/mcudahw, scp'd from the desk; never a public mirror): unpacked before the warm-up,
+# which then only compiles what is missing. The cache is keyed by PTX + GPU model + driver, so cubins of another model / driver are
+# just unused. After the warm-up the cache is packed into $POD/cubins-<gpu>-<driver>.tar.zst for the desk to pull for the next pod
+# (11-18 pod: 262 MB of cubins -> 33 MB zstd in 1.4 s, ~11 s at the desk's 3 MB/s uplink against the 52 s warm-up at 27 CPUs).
+JC=${MCUDAHW_CACHE:-$HOME/.cache/mcudahw}
+if [ -n "${CUBINS:-}" ]; then
+  [ -s "$CUBINS" ] || die "CUBINS=$CUBINS: no such file"
+  mkdir -p $JC && zstd -dcq "$CUBINS" | tar -xf - -C $JC --skip-old-files && say "cubins: $(ls $JC | wc -l) in $JC after $CUBINS"
+fi
 # mcudahw JIT-compiles each kernel's PTX at its first launch (~/.cache/mcudahw, keyed by PTX + GPU model + driver): fill the cache now,
 # on all CPUs, not inside step 1. Every run (also NOBUILD=1: a new driver or GPU model after a reboot starts cold; a warm cache is a scan)
 if [ "${NOPRECOMPILE:-0}" != 1 ]; then
   say "mcudahw: precompiling the kernels ($NCPU threads)"
   jm=$(JITLOG=$POD/precompile.log bash $POD/ufsm/scripts/toolchain/jit_warm.sh $U $NCPU); jrc=$?; say "$jm"
   [ $jrc = 0 ] || say "precompile failed (rc $jrc, log $POD/precompile.log); kernels will JIT at first use"
+  ck=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2> /dev/null | head -1 | tr -c 'A-Za-z0-9.\n' '_' | tr -s _)
+  [ $jrc = 0 ] && [ -n "$ck" ] && [ -d $JC ] && { tar -cf - -C $JC . | zstd -q -T$NCPU -10 > $POD/cubins-$ck.tar.zst.tmp && mv $POD/cubins-$ck.tar.zst.tmp $POD/cubins-$ck.tar.zst &&
+    say "cubins: $POD/cubins-$ck.tar.zst ($(du -h $POD/cubins-$ck.tar.zst | cut -f1); the desk pulls it for the next pod's CUBINS)"; }
 fi
 
 # --- 4. smoke test ---
@@ -143,12 +185,6 @@ if [ "${NOSMOKE:-0}" != 1 ] && [ ! -e $POD/state/smoke.$(git -C $POD/ufsm rev-pa
 fi
 
 # --- 5. checkpoints ---
-fetch() {   # fetch URL OUT: resumable, complete when the size matches Content-Length
-  local want have; want=$(curl -sfIL "$1" | awk 'tolower($1) == "content-length:" {n = $2} END {print n + 0}' | tr -d '\r')
-  have=$(stat -c %s "$2" 2>/dev/null || echo 0)
-  [ "$want" -gt 0 ] && [ "$have" = "$want" ] && return 0
-  curl -sfL --retry 5 -C - -o "$2" "$1" || curl -sfL --retry 5 -o "$2" "$1" || return 1
-  have=$(stat -c %s "$2"); [ "$want" = 0 ] || [ "$have" = "$want" ] || { echo "fetch: $2 has $have of $want bytes"; return 1; }; }
 for c in wind96-wk1-best; do fetch $BASE/ufsm/checkpoints/$c/$c.ckpt $POD/ckpt/$c.ckpt || die "checkpoint $c"; done   # (ift3 dropped 11-13: the latent ink head, /root/pod/latink.sh)
 # the production ink (unroll INKMODE=r3, 2026-11-17): Reader V3 (MIT) from HuggingFace at the pinned revision, sha256-checked
 R3URL=https://huggingface.co/domenicor046/reader-v3/resolve/aee1d64bced4eb35546348f3d276b9e2a0b99c46/reader-v3.pth
@@ -158,21 +194,7 @@ say "checkpoints: $(ls -l $POD/ckpt | awk 'NR > 1 {printf "%s %.0f MB  ", $9, $5
 
 # --- 6. the scroll ---
 [ -n "$S" ] || { say "done (no SCROLL: CT not fetched)"; exit 0; }
-row=; for t in $POD/ufsm/scripts/unroll/scrolls.tsv $POD/ufsm/scripts/corpus/list.tsv; do
-  [ -e $t ] && row=$(awk -F'\t' -v s=$S '$1 == s' $t) && [ -n "$row" ] && break; done
-[ -n "$row" ] || die "$S is in neither scripts/unroll/scrolls.tsv nor scripts/corpus/list.tsv"
-IFS=$'\t' read -r _ _ K UM LV AXS TBOX TZR TSTRIP <<< "$row"
-# the mirror key: SCROLL/volumes/SCAN; a key that already names volumes/ (scrolls.tsv rows of http CT, e.g. PHerc0332) is kept as is
-# (podunroll 11-17: it became PHerc0332/volumes/volumes/..., a 404)
-case $K in */volumes/*) MK=$K;; *) MK=$(dirname $K)/volumes/$(basename $K);; esac; V=$POD/vol
-mkdir -p $V/$K; fetch $MIRROR/$MK/zarr.json $V/$K/zarr.json || die "$MK/zarr.json"
-for l in ${LEVELS:-$(seq $LV $((LV + 3)))}; do
-  curl -sfI $MIRROR/$MK/$l/zarr.json > /dev/null || continue
-  [ -e $POD/state/ct.$S.$l ] && continue
-  say "CT $MK level $l"
-  nice -n 5 $U mirror $MIRROR $MK/$l $V/$K/$l --threads $MTH --verify 2 || die "mirror $MK/$l"
-  touch $POD/state/ct.$S.$l
-done
+wait $CTP || die "CT fetch (above)"
 P=$POD/scrolls/$S; mkdir -p $P
 for f in box.txt axis.json; do curl -sf $MIRROR/$S/representations/$C2F/$f -o $P/$f.tmp && mv $P/$f.tmp $P/$f; rm -f $P/$f.tmp; done
 if curl -sfI $MIRROR/$S/representations/$C2F/ink.zarr/zarr.json > /dev/null && [ ! -e $POD/state/ink.$S ]; then
