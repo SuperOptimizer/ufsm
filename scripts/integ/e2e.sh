@@ -262,7 +262,7 @@ if want chain; then
     [ -e "$C/cf.unused" ] && saferm "$C/cf.unused"
   fi
 
-  # slab fits (unroll.sh lane(): SLABI 64 / SLABOV 16 production; here 2 slabs of 128 interior cells, overlap 16, snapped to the ref)
+  # slab fits (unroll.sh lane(): SLABI 64 / SLABOV 8 production since 11-18; here 2 slabs of 128 interior cells, overlap 16, snapped to the ref)
   if ok_of count-field; then
     ze=$(jq -r '.shape[0]' "$F/fields.json"); ny=$(jq -r '.shape[1]' "$F/fields.json"); nx=$(jq -r '.shape[2]' "$F/fields.json"); I=${SLABI:-$(( (ze + 1) / 2 ))}; OV=${SLABOV:-16}
     JARGS=(); nf=0; ns=0; sl=""

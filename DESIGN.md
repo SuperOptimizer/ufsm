@@ -6,6 +6,24 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Slab overlap 8 instead of 16: the unroll default (2026-11-18, branch slabov8-20261118, fp4teach)
+
+unroll.sh's slab fits take SLABI 64 interior cells plus SLABOV overlap cells each side; the overlap rows feed fit-join's gauges. A/B on
+the pod (RTX PRO 4000) from the pod q2 PHerc1667 fields + ref-cf (u1 13790, RECTOSP, INKMODE r3 without ink, FITLANES 3, SLABFIT
+`--steps 300,300,300,300,200,200 --batch 1000000`, SPIRALDIR -1), slabs .. check, three arms in sequence under /root/gpu.lock; joined
+models pulled and GT-scored on the desk CPU (gtboxes.sh, the 54 boxes of the q2 score; C2-C24 = the 16 inner boxes):
+
+| arm | slabs wall / CPU | join wall | GT ids (54) | abs err < 0.08 | abs err median | C2-C24 ids | body drift | wrap-check |
+|---|---|---|---|---|---|---|---|---|
+| ref-cf (both) | | | 0.8388 | 0.2428 | 0.1495 | 0.8115 | | |
+| OV 16 | 136 s / 1636 s | 26 s | 0.8607 | 0.3375 | 0.1073 | 0.8386 | 0.73 turns | 34 real, 5 dup, 11 merged |
+| OV 8 | 119 s / 1413 s | 21 s | 0.8606 | 0.3377 | 0.1071 | 0.8389 | 0.73 turns | identical |
+| OV 16 repeat | 133 s / 1626 s | 26 s | 0.8607 | 0.3375 | 0.1073 | 0.8386 | 0.73 turns | identical (joined byte-identical) |
+
+OV 8 cuts the slab stage 12.5 % (wall; 14 % CPU) and the join 19 %: each slab fits 64 + 16 instead of 64 + 32 cells. The join's
+overlap agreement drops 0.976 -> 0.962 (half the rows to agree on), but the GT score does not move (-0.0001 all boxes, +0.0003 inner,
+inside the gate of -0.005), the body drift is unchanged. SLABOV=16 restores the old overlap. e2e.sh's synthetic 2-slab run keeps 16.
+
 ## Pod q2: full PHerc1667 at master on an RTX PRO 4000 (u1 13790, every speedup); the per-wrap ink gate bug (2026-11-18, unrollperf)
 
 The podq2 queue (scripts/pod/podq2.sh, DESK=none + the desk pull scripts/pod/q2pull.sh) on a 24 GB RTX PRO 4000 Blackwell pod (cgroup

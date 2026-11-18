@@ -84,7 +84,7 @@ if [ "$INKMODE" = lat ] && [ -z "${INKCMD+x}" ]; then
   INKNAME=${INKNAME:-inkpod-$(basename $LATINK_CK .ckpt)}
 fi
 INKNAME=${INKNAME:-ift3-24000}; TH=${TH:-$(ncpu)}; [ "$TH" -gt 20 ] 2> /dev/null && [ -z "${TH_ALL:-}" ] && TH=20; MINMEM=${MINMEM:-40}; INKGPU=${INKGPU:-1}
-FIELDGPUS=${FIELDGPUS:-0 1}; FITGPUS=${FITGPUS:-0 1}; DRY=${DRY:-0}; I=${SLABI:-64}; OV=${SLABOV:-16}
+FIELDGPUS=${FIELDGPUS:-0 1}; FITGPUS=${FITGPUS:-0 1}; DRY=${DRY:-0}; I=${SLABI:-64}; OV=${SLABOV:-8}
 # SGPU: the device of every stage that takes no --gpu of its own (ref / refstream count-field, strip-flatten, the strip renders, wraps ..),
 # the first of FITGPUS by default: they ran on CUDA device 0 whatever FITGPUS said (2026-11-17: with FITGPUS=1 on the desk, the ref's
 # pooling, strip-flatten's SLIM and the stripimg renders went to card 0, the training card; its 0.7 GB free sent the ref's CG and the
@@ -114,7 +114,8 @@ sgpu() { [ -n "$SGPU" ] || return 0
   if [ -n "$GVIS" ]; then echo "CUDA_VISIBLE_DEVICES=$SGPU"
   elif [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then local a; IFS=, read -r -a a <<< "$CUDA_VISIBLE_DEVICES"; [ -n "${a[$SGPU]:-}" ] && echo "CUDA_VISIBLE_DEVICES=${a[$SGPU]}"; fi
   return 0; }
-# SLABI / SLABOV: slab cells / overlap (default 64 / 16). A full-section Paris 3 slab (96 x 3680 x 4768 fields, 16.8 GB) does not fit a 16 GB GPU and
+# SLABI / SLABOV: slab cells / overlap (default 64 / 8; 16 before 11-18: pod 1667 A/B at OV 8 slabs 136 -> 119 s, join 26 -> 21 s, GT ids
+# 0.8607 -> 0.8606, C2-C24 0.8386 -> 0.8389, body drift 0.73 both, wrap-check verdicts identical; DESIGN). A full-section Paris 3 slab (96 x 3680 x 4768 fields, 16.8 GB) does not fit a 16 GB GPU and
 # runs from managed memory at 20-60 min per slab (desk 5060 Ti, 11-01); SLABI=32 (64 rows, 11.2 GB) fits the device.
 PRIZE="PHerc0125 PHerc0175A PHerc0175B PHerc0191 PHerc0211 PHerc0257 PHerc0268 PHerc0306B PHerc0358 PHerc0483A PHerc0483B PHerc0490A PHerc0490B PHerc0800 PHerc0813 PHerc0826 PHerc0846A PHerc0846B PHerc1203 PHerc1218 PHerc1545"
 
