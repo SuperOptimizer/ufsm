@@ -6,6 +6,8 @@
 # (ARMMAX 2700 s from the trainer's start) and a step-200 sanity (finite losses, ink bce of the last 3 logged lines vs the first 3); then
 # the trainer stops and K/out holds what the desk needs (podq.log, steptimeA.txt, smokeA.txt, the run log, the step-200 ckpt, memory.events).
 # FULL=1: the original ~10.5 h queue (all six scrolls, arm A 3000 steps, teach, arm B 3000 steps): only with a new user OK.
+#   SKIPA=1 (user 11-18: train from the 2-D teachers): no arm A; teach, then arm B for STEPSB steps (default STEPS); BUDGET_END (epoch s) refits
+#   arm B's steps at step 100 to the measured step time (see arm()).
 # Every stage leaves K/state/<stage>.done and is skipped once done; smoke and full keep separate runs / arms / state names. Stages:
 #   setup   ufsm COMMIT cloned into K/ufsm, microc at the pin in ~/.local/mcc (a no-op when it is there: an install into another prefix
 #           failed on pod B, stddef.h not found), build/ufsm + build-verify/test_unet
@@ -140,18 +142,30 @@ arm() {   # arm A | B
       touch $K/gate$a$TAG.ok; awk -v a=$sps -v b=${MINSPS:-0.1} 'BEGIN {exit !(a < b)}' && stoparm "arm $a below the step-50 gate: $sps samples/s at step $st (fallback: --um-rungs 9.6 only)"; fi
     for c in $RD/inksmoke$a/snap/*.ckpt; do [ -s "$c" ] || continue; n=$(basename $c .ckpt); [ -s $O/inksmoke$a-$TAG-$n.ckpt ] && continue
       cp $c $O/.tmp.ckpt && mv $O/.tmp.ckpt $O/inksmoke$a-$TAG-$n.ckpt && cp $RD/inksmoke$a.log $O/ && cp $L $O/podq.log && say "arm $a: snapshot $n -> $O (desk pull)"; done
+    # BUDGET_END (epoch s): at step 100 the measured step time (since the step-10 line) projects the arm's end; past BUDGET_END - 30 min
+    # the trainer is stopped and the arm restarts with the steps that fit (rounded down to 500; once: REFIT): the wsd schedule's cooldown
+    # needs the real STEPS, a cut run would never cool down
+    if [ -n "${BUDGET_END:-}" ] && [ -z "${REFIT:-}" ] && [ "${st:-0}" -ge 100 ] && [ -e $K/gate10$a$TAG.ok ]; then
+      local now=$(date +%s) s10=$(stat -c %Y $K/gate10$a$TAG.ok); local cs=$(( (now - s10) * 100 / (st - 10) )); REFIT=checked
+      if [ $(( now + (STEPS - st) * cs / 100 )) -gt $(( BUDGET_END - 1800 )) ]; then
+        NEWSTEPS=$(( (BUDGET_END - 1800 - now - 900) * 100 / cs / 500 * 500 )); [ $NEWSTEPS -ge 1000 ] || NEWSTEPS=1000
+        say "arm $a: $(( cs / 100 )).$(( cs % 100 )) s/step: $STEPS steps end past the budget: restart with $NEWSTEPS"
+        touch $RD/inksmoke$a.stop; kill $(cat $RD/inksmoke$a.pid 2>/dev/null) 2>/dev/null; sleep 30; wait $tp; return 42; fi
+      say "arm $a: $(( cs / 100 )).$(( cs % 100 )) s/step: $STEPS steps fit the budget"; fi
     [ "$ARMMAX" -gt 0 ] && [ $(( $(date +%s) - t0 )) -gt "$ARMMAX" ] && stoparm "arm $a over ARMMAX ${ARMMAX} s at step $st"
     sleep 30; done
   wait $tp; st=$(awk '/^step +[0-9]+ / {s = $2} END {print s + 0}' $RD/inksmoke$a.log 2>/dev/null)
   sanity $a; [ "${st:-0}" -ge $STEPS ] || die "arm $a stopped at step $st (logs $RD/inksmoke$a.log, .resume.log)"
   mark arm$a$TAG
 }
-arm A
+if [ "${SKIPA:-0}" = 1 ] && [ "$FULL" = 1 ]; then say "arm A skipped (SKIPA: teacher + human arm B only)"; else arm A; fi
 if [ "$FULL" != 1 ]; then cp $L $O/podq.log; touch $S/ALLDONE; say "ALLDONE: smoke arm A reached step $STEPS ($(el)); $O/smokeA.txt; the pod is idle"; cp $L $O/podq.log; exit 0; fi
 if ! done_ teach; then
   for sc in PHercParis4 PHerc1667 PHerc0139 PHerc0814 PHerc0009B PHercMAN5; do
     HOD=$AD U=$U GPU=$GPU LOCK=$LOCK bash $D/teach.sh $K $sc >> $L 2>&1 || die "teach $sc"
   done; mark teach
 fi
-arm B
+STEPS=${STEPSB:-$STEPS}
+while :; do arm B; rc=$?; [ $rc = 42 ] || break; STEPS=$NEWSTEPS; REFIT=done
+  case "$RD" in $K/runs/?*) rm -rf -- "$RD/inksmokeB" "$RD"/inksmokeB.*;; esac; rm -f $K/gate10B$TAG.ok $K/gateB$TAG.ok; done
 touch $S/ALLDONE; say "ALLDONE: both arms trained; the pod is idle"
