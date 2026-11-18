@@ -15,7 +15,7 @@
 set -u
 CK=$1; T=$2; SC=${3:-p1667 p139 p4}
 U=${U:-/vesuvius/ufsm/v2/rv/bin/ufsm.ev}; RU=${RU:-/vesuvius/ufsm/v2/recto/src2/build/ufsm}; GPU=${GPU:-1}; LOCK=${LOCK-/vesuvius/ufsm/opt/gpu$GPU.lock}
-E=${E:-/vesuvius/ufsm/scratch-mig/rv/eval}; TH=${TH:-16}; SH=${SH:-128}; CTR=${CTR:-/vesuvius/ufsm/v2/ct}; C=${CNT:-/vesuvius/ufsm/v2/count}
+E=${E:-/vesuvius/ufsm/scratch-mig/rv/eval}; TH=${TH:-16}; SH=${SH:-128}; CTR=${CTR:-/vesuvius/ufsm/v2/ct}; C=${CNT:?CNT=<count-field root> (the old default /vesuvius/ufsm/v2/count was deleted 2026-11-17)}
 # off the desk (2026-11-11, scripts/univ): CTR=<volcomp mirror> VOLP=volumes/ (the mirror keeps scans under <scroll>/volumes/), CNT, RVGT (GT root), RU
 RVGT=${RVGT:-/vesuvius/ufsm/gt}; VOLP=${VOLP:-}
 mkdir -p $E/$T; echo "== $T $CK $(date)" >> $E/$T.txt
