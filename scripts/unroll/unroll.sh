@@ -458,7 +458,7 @@ ref() {
 #     turn, 1.34-1.40 at r 2-4 mm), so: wrap-check the ref against the CT by 1 mm radius band (--bands), K(r) <- K(r) x CT(r)^RHOCALG
 #     on the bands with >= RHOCALN intervals, one-peak share >= 0.45 and empty / 2+ shares <= 0.4 (the rest hold the nearest used band),
 #     a 3-band median, K capped to [RHOCALMIN 0.8, RHOCALMAX 1.6]; re-solve the ref from a --pool-split cache (count-field --rho-r) and
-#     repeat until every used band is within RHOCALTOL (0.04) of 1 or RHOCALIT (3) passes. Kept only if wrap-check's dup + merged did not
+#     repeat until the used bands' interval-weighted mean |CT/turn - 1| is <= RHOCALTOL (0.04) or RHOCALIT (3) passes. Kept only if wrap-check's dup + merged did not
 #     rise and the body z drift (cf-demod) rose by <= 0.15 turn; else DEFAULTED: to the plain ref. The objective is wrap-check (the CT's
 #     sheets), not unroll-qa's pw48 / w4, which score agreement with the net's own phase / winding mod 4 and so penalise a correct count
 #     where the net is out of domain (0332: 0.77 phase turns per fitted turn). RHOCALMODE=global: one K for the whole scroll (the used
@@ -469,15 +469,18 @@ rcprof() {   # rcprof BANDS.tsv "R:K,..." (previous profile, empty = 1) -> the n
       for (i = 2; i <= np; i++) if (r <= pr[i]) return pk[i - 1] + (r - pr[i - 1]) / (pr[i] - pr[i - 1]) * (pk[i] - pk[i - 1]) }
     BEGIN { np = split(prev, pp, ","); for (i = 1; i <= np; i++) { split(pp[i], q, ":"); pr[i] = q[1]; pk[i] = q[2] }; if (prev == "") np = 0 }
     NR > 1 { nb++; r[nb] = ($1 + $2) / 2; nn[nb] = $3; ct[nb] = $4; use[nb] = ($3 >= nmin && $6 >= 0.45 && $5 <= 0.4 && $7 <= 0.4 && $4 > 0)
-             k[nb] = kprev(r[nb]) * (use[nb] ? $4 ^ g : 1); if (use[nb]) { nu++; if ($4 - 1 > tol || 1 - $4 > tol) off++ } }
+             k[nb] = kprev(r[nb]) * (use[nb] ? $4 ^ g : 1); if (use[nb]) nu++ }
     END { if (!nu) { print ""; exit }
           if (mode == "global") {   # RHOCALMODE=global: one K for the scroll, from the used bands pooled (n-weighted)
             for (i = 1; i <= nb; i++) if (use[i]) { sn += nn[i]; sc += nn[i] * ct[i] }; gk = kprev(0) * (sc / sn) ^ g
             gk = gk < kmin ? kmin : gk > kmax ? kmax : gk; printf "0:%.3f\n", gk; if (sc / sn - 1 <= tol && 1 - sc / sn <= tol) print "converged" > "/dev/fd/3"; exit }
           for (i = 1; i <= nb; i++) if (!use[i]) { best = -1; for (j = 1; j <= nb; j++) if (use[j] && (best < 0 || (i - j) ^ 2 < (i - best) ^ 2)) best = j; k[i] = k[best] }
           for (i = 1; i <= nb; i++) { a = k[i > 1 ? i - 1 : i]; b = k[i]; c = k[i < nb ? i + 1 : i]; m = a < b ? (b < c ? b : (a < c ? c : a)) : (a < c ? a : (b < c ? c : b))
-                                      m = m < kmin ? kmin : m > kmax ? kmax : m; out = out (i > 1 ? "," : "") sprintf("%.2f:%.3f", r[i], m) }
-          print out; if (!off) print "converged" > "/dev/fd/3" }' "$1"
+                                      capped = (m <= kmin || m >= kmax); m = m < kmin ? kmin : m > kmax ? kmax : m; out = out (i > 1 ? "," : "") sprintf("%.2f:%.3f", r[i], m)
+                                      if (use[i] && !capped) { ew += nn[i]; ea += nn[i] * (ct[i] > 1 ? ct[i] - 1 : 1 - ct[i]) } }   # (a band held at the cap cannot move)
+          # converged: the interval-weighted mean |CT/turn - 1| over the used, uncapped bands <= RHOCALTOL (per band, the median-3 makes
+          # neighbours with opposite errors (0332 u1 pass 2: 0.91 / 1.02 / 1.11) unreachable together, so a per-band test never stops)
+          print out; if (!ew || ea / ew <= tol) print "converged" > "/dev/fd/3" }' "$1"
 }
 rcscore() {   # rcscore MODEL TAG: wrap-check bands + verdicts and the body drift of a ref model -> "dupmerged body ctturn"
   local m=$1 t=$2
@@ -500,7 +503,7 @@ rhocal() {
     [ "$DRY" = 1 ] && np="0.50:1.000"
     [ -s $O/rhocal/conv ] && [ $it -gt 1 ] && { log "rhocal: converged after $((it - 1)) pass(es)"; break; }
     [ -n "$np" ] || { log "rhocal: DEFAULTED: no radius band passes the interval / one-peak gates: the plain ref kept"; return 0; }
-    [ -s $O/rhocal/conv ] && [ $it = 1 ] && { log "rhocal: the plain ref is already within ${RHOCALTOL:-0.04} on every used band: kept"; return 0; }
+    [ -s $O/rhocal/conv ] && [ $it = 1 ] && { log "rhocal: the plain ref is already within ${RHOCALTOL:-0.04} (mean |CT/turn - 1| over the used bands): kept"; return 0; }
     p=$np; log "rhocal: pass $it: --rho-r $p"; [ "$DRY" = 1 ] || rm -rf $O/rhocal/it$it
     X $O/logs/rhocal.it$it.log $U count-field $F $O/cf.unused $(refpool) --dir $dir --rho-r $p --iters 1200 --model $O/rhocal/it$it \
       --threads $TH --mem-gb ${CFMEM:-24} --chunk-rows $(refcz) $pc || return 1
