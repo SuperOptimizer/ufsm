@@ -195,7 +195,8 @@ On the desk: `scripts/pod/score1667.sh DESKDIR` (wrap-check --codes, gtboxes on 
 
 ```sh
 scp -r /vesuvius/ufsm/inksmoke/kit root@POD:/root/ink/kit                # tiny files only (352 KB)
-COMMIT=<master sha> CKURL=<fields checkpoint URL on the mirror> DESK=forrest@<desk, reachable from the pod> \
+scp /vesuvius/ufsm/v2/lat/runs/u1-donor-13790.ckpt root@POD:/root/pod/ckpt/u1-13790.ckpt   # the production fields model, 201 MB (sha1 checked)
+COMMIT=<master sha> DESK=forrest@<desk, reachable from the pod> \
   setsid nohup bash podq2.sh > /root/pod/podq2.out 2>&1 < /dev/null &   # (podq2.sh from raw.githubusercontent.com at COMMIT)
 ```
 

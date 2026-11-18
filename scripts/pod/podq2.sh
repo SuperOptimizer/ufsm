@@ -16,10 +16,11 @@
 #           and the stage table (stagetable.tsv: stage, start, end, wall s, CPU s, max RSS GB from progress.log) -> DESKDIR
 #   smoke   the ink smoke: K=/root/ink, the kit copied from the desk beforehand (tiny files; KIT), COMMIT=COMMIT bash $K/kit/podq.sh
 #           (its own state; its gates stop it) -- in the foreground of this queue, so STOPQ / a failure stops here
-# Env: POD (/root/pod), Q ($POD/q2), COMMIT (required: the master commit to run), CK (fields checkpoint path on the pod) or CKURL,
-#   CKSHA1, DESK (forrest@<desk host reachable from the pod>), DESKPORT (22), DESKKEY (~/.ssh/id_ed25519), DESKDIR
+# Env: POD (/root/pod), Q ($POD/q2), COMMIT (required: the master commit to run), CK (fields checkpoint path on the pod; default
+#   $POD/ckpt/u1-13790.ckpt, the production fields model (lead 11-18): the desk's /vesuvius/ufsm/v2/lat/runs/u1-donor-13790.ckpt, 201 MB,
+#   not on the mirror: scp it beforehand, ~70 s at the desk's uplink) or CKURL, CKSHA1 (default: u1 13790's 8854e4e5...), DESK (forrest@<desk host reachable from the pod>), DESKPORT (22), DESKKEY (~/.ssh/id_ed25519), DESKDIR
 #   (/vesuvius/ufsm/podun/PHerc1667-q2), K (/root/ink), NOSMOKE=1 (stop after the unroll), MINDISK (120 GB free on / before the unroll).
-# Run detached on the pod: COMMIT=... CK=/root/pod/ckpt/try9-6250-w.ckpt DESK=forrest@HOST setsid nohup bash $POD/ufsm/scripts/pod/podq2.sh > $POD/podq2.out 2>&1 < /dev/null &
+# Run detached on the pod: COMMIT=... DESK=forrest@HOST setsid nohup bash $POD/ufsm/scripts/pod/podq2.sh > $POD/podq2.out 2>&1 < /dev/null &
 # (from a fresh pod: copy this file there first, or clone the repo; setup clones COMMIT into $POD/ufsm and the queue then runs the same
 # script from the repo copy). Stop after the current step: touch $Q/STOPQ.
 set -uo pipefail
@@ -41,7 +42,7 @@ if ! done_ setup; then
     curl -sf -o $SU https://raw.githubusercontent.com/SuperOptimizer/ufsm/$COMMIT/scripts/pod/setup.sh || die "setup.sh at $COMMIT"; }; }   # (a fresh pod: no clone yet)
   BRANCH=$COMMIT POD=$POD bash $SU $S > $Q/setup.out 2>&1 || die "setup.sh (see $Q/setup.out)"
   ( cd $POD/ufsm && git rev-parse HEAD | grep -q "^$COMMIT" ) || die "the repo is not at $COMMIT"
-  CK=${CK:-$POD/ckpt/fields.ckpt}
+  CK=${CK:-$POD/ckpt/u1-13790.ckpt}; [ "$CK" = $POD/ckpt/u1-13790.ckpt ] && CKSHA1=${CKSHA1:-8854e4e5bd8ede2133c70aada6032a5b07715bb0}
   if [ ! -s $CK ]; then [ -n "${CKURL:-}" ] || die "no fields checkpoint: CK=$CK missing and no CKURL"; curl -fL --retry 5 -C - -o $CK.part "$CKURL" && mv $CK.part $CK || die "fetch $CKURL"; fi
   [ -z "${CKSHA1:-}" ] || [ "$(sha1sum $CK | cut -d' ' -f1)" = "$CKSHA1" ] || die "checkpoint $CK: sha1 mismatch"
   echo "$CK" > $Q/ck.path; mark setup
