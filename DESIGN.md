@@ -34,9 +34,10 @@ the 5060 Ti), up to check; GT ids on the 54 non-noise 1667 wbench boxes (gtboxes
 - wrap-check verdicts did not track GT here either (A: 17 merged at ids 0.729; see "rhocal" above).
 
 Fix (predict, src/gnmode.c): a gn_ema checkpoint whose --gn-ema-warm was never reached defaults to `--gn-live 1`, with a `DEFAULTED:`
-line; `--gn-live 0` forces the running statistics; warmed checkpoints, `--gn-frozen` and non-gn_ema nets unchanged. test_gnmode. Related,
-not changed: train's `--val-gn-live` defaults to 0, so a gn_ema run's validation (and its best.ckpt choice) is on the running statistics
-too (try9 runs that way). Also on the branch: unroll.sh FPX (extra fields-predict flags), and SGPU now applies under a caller's
+line; `--gn-live 0` forces the running statistics; warmed checkpoints, `--gn-frozen` and non-gn_ema nets unchanged. test_gnmode. Train's
+validation the same way (branch valgn-20261118): `--val-gn-live` unset = each window's own statistics while the net's ge_n < ge_warm (the
+function it trains with at that step; one DEFAULTED line), the running ones after; `--val-gn-live 0 | 1` forces either. Before, the
+default 0 validated try9 (and chose its best.ckpt) on the running statistics; try9 gets an explicit --val-gn-live 1 at its next launch. Also on the branch: unroll.sh FPX (extra fields-predict flags), and SGPU now applies under a caller's
 CUDA_VISIBLE_DEVICES (an index into it, as --gpu): with CUDA_VISIBLE_DEVICES=0,1 SGPU=1 the ref count-field had run on card 0, try9's card.
 
 ## Ink the papyrus once: the wraps' reader3 maps resampled from the stripes' (r3once; per-wrap AUC +0.004, 7.6k instead of 37.5k tiles; 2026-11-18, branch inkonce-20261118)

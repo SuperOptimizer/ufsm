@@ -17,5 +17,11 @@ int main(void) {
     CHECK(gn_live_choice(unw, nullptr, 0, 0, &d, &n, &w) == 0 && d == 0, "no gn_ema: not live");
     CHECK(gn_live_choice(nullptr, nullptr, 1, 0, &d, &n, &w) == 0 && d == 0 && n == -1 && w == -1, "no header: running (old checkpoints)");
     CHECK(gn_live_choice("{\"gn_ema\":1}", nullptr, 1, 0, &d, &n, &w) == 0 && d == 0, "header without ge_n / ge_warm: running");
+    /* train's validation (gn_live_choice_n): live before the warm-up step, running after it, --val-gn-live wins */
+    CHECK(gn_live_choice_n(nullptr, 1, 0, 300, 500, &d) == 1 && d == 1, "val before warm: live, defaulted");
+    CHECK(gn_live_choice_n(nullptr, 1, 0, 500, 500, &d) == 0 && d == 0, "val at warm: running");
+    CHECK(gn_live_choice_n("0", 1, 0, 300, 500, &d) == 0 && d == 0, "val --val-gn-live 0 before warm: running");
+    CHECK(gn_live_choice_n("1", 1, 0, 9000, 500, &d) == 1 && d == 0, "val --val-gn-live 1 after warm: live");
+    CHECK(gn_live_choice_n(nullptr, 0, 0, 0, 500, &d) == 0 && d == 0, "val, no gn_ema: not live");
     printf("test_gnmode: %s\n", fails ? "FAILED" : "ok"); return fails != 0;
 }

@@ -3,6 +3,8 @@
 #include "ckring.h"
 #include "gns.h"
 #include "optcheck.h"
+#include "defaulted.h"
+#include "gnmode.h"
 #include "nn.h"
 #include "sysinfo.h"
 #include "checkpoint.h"
@@ -2809,7 +2811,11 @@ int cmd_train(int argc, char **argv) {
     ck_cfg ckc = {opt_atoi("--ckpt-ring", opt(argc, argv, "--ckpt-ring", "4")), opt_atoi("--ckpt-ring-copy", opt(argc, argv, "--ckpt-ring-copy", "0")), opt_atoi("--snap-every", opt(argc, argv, "--snap-every", "0")),
                         opt_atoi("--snap-keep-every", opt(argc, argv, "--snap-keep-every", "5000")), opt_atoi("--snap-keep-last", opt(argc, argv, "--snap-keep-last", "5"))};
     const int val_live = opt_atoi("--val-live", opt(argc, argv, "--val-live", "0"));   /* validate the live weights instead of the EMA (e.g. resume a last.ckpt for one lr-0 step) */
-    const int val_gn_live = opt_atoi("--val-gn-live", opt(argc, argv, "--val-gn-live", "0"));   /* --gn-ema nets: validate on each window's own GroupNorm statistics instead of the running ones (audit 11-14 infer #2 A/B) */
+    /* --val-gn-live 0|1 (--gn-ema nets): validate on the running GroupNorm statistics (0) or each window's own (1). Default: the function the net
+       trains with at that step, i.e. its own statistics while --gn-ema-warm has not been reached (DEFAULTED line, once): before 11-18 the
+       default 0 validated try9 (warm 1e9) on statistics it never trained on, the mismatch that cost its 1667 unroll 0.07-0.11 GT ids */
+    const char *val_gn_arg = opt(argc, argv, "--val-gn-live", nullptr); if (val_gn_arg) (void)opt_atoi("--val-gn-live", val_gn_arg);
+    int val_gn_said = 0;
     g_valP = opt_atoi("--val-P", opt(argc, argv, "--val-P", "0"));   /* (checked once the window and the task are known) */
     const int l0_recal = opt_atoi("--l0-recal", opt(argc, argv, "--l0-recal", "4"));   /* --l0-norm ema: windows recalibrating the EMA weights' level-0 statistics before each validation */
     uint64_t seed = (uint64_t)opt_atoll("--seed", opt(argc, argv, "--seed", "0")); g_seed = seed;
@@ -5546,6 +5552,12 @@ int cmd_train(int argc, char **argv) {
             if (step % val_every == 0 || step == steps || g_stop) {
                 g_ptrunc_on = 0;   /* (validation: the plain phase loss) */
                 const int nv = split ? 2 : 1;   /* split: validation windows are split too */
+                int val_gn_live; {
+                    int dfl = 0; const long gn_n = unet_gn_ema_updates(G[0].u), gn_w = unet_gn_ema_warm(G[0].u);
+                    val_gn_live = gn_live_choice_n(val_gn_arg, unet_cfg_of(G[0].u)->gn_ema, 0, gn_n, gn_w, &dfl);
+                    if (dfl && !val_gn_said) { val_gn_said = 1; UFSM_DEFAULTED("train --val-gn-live = 1 (step %d: GroupNorm running statistics of %ld updates, --gn-ema-warm %ld "
+                                                                               "not reached: the net trains on each window's own; --val-gn-live 0 forces the running ones)", step, gn_n, gn_w); }
+                }
                 for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_use_ema(G[g].u, !val_live); if (val_gn_live) unet_gn_ema_live(G[g].u, 1); }   /* (--val-live 1: the live weights) */
                 {   /* validation on the buffer not holding the prefetched batch (its upload has completed: ev_up synced above) */
                     int keep = G[0].cur;

@@ -6,3 +6,5 @@
    flag and whether --gn-frozen was given. Returns 1 = live (window) statistics, 0 = running; *defaulted 1 when the choice was made for an
    unwarmed checkpoint without a --gn-live (the caller prints the DEFAULTED line), *n / *w the header's ge_n / ge_warm (-1: absent). */
 int gn_live_choice(const char *hdr, const char *arg, int gn_ema, int frozen, int *defaulted, long *n, long *w);
+/* gn_live_choice_n: the same rule on the numbers (train's validation: the net's ge_n / ge_warm at that step; arg the --val-gn-live value) */
+int gn_live_choice_n(const char *arg, int gn_ema, int frozen, long n, long w, int *defaulted);
