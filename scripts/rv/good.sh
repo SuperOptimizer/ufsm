@@ -52,7 +52,7 @@ for S in $L; do
     --out $O/gate --min-support 0 --orient-deg ${ORIENT:-25} --phase $LAB/$S --phase-key $PK/$key "${PR_[@]}" --ignore $LAB/$S --ignore-key ignore.zarr/$key \
     --phase-out $O/phase.zarr --min-keep ${MINKEEP:-0.3} --shard-frac ${SHFRAC:-1} --jobs ${JOBS:-16} > $O/gate.log 2>&1 || { echo "$(date) $S: gt-gate failed" >> $Q; continue; }
   cp $LAB/$S/surflabels.log $LAB/$S/phasecheck.txt $O/ 2>/dev/null
-  echo "$S $key $(grep -o 'holding [0-9.]*' $O/gate.log) $(grep -o '[0-9]* shards written' $O/gate.log) $(du -sh $O/phase.zarr | cut -f1)" > $O/summary.txt
+  echo "$S $key $(grep -o 'kept [0-9.]*' $O/gate.log) (sheet share) $(grep -o '[0-9]* shards written' $O/gate.log) $(du -sh $O/phase.zarr | cut -f1)" > $O/summary.txt
   touch $O/done; echo "$(date) $S done: $(cat $O/summary.txt)" >> $Q
   [ "${KEEPFULL:-0}" = 1 ] || rm -rf $LAB/$S
 done

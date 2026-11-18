@@ -52,7 +52,7 @@ int main(void) {
     int st = 0; waitpid(c, &st, 0);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "gt-gate ran (status %d)", st);
     f = fopen(res, "r"); char line[1024]; long long sh = -1, cells = -1, gc = -1; double share = -1;
-    while (f && fgets(line, sizeof line, f)) { fputs(line, stdout); if (strstr(line, "GT sheet voxels")) sscanf(line, "gt-gate: %lld GT sheet voxels, %lld cells with >= %*d, %lld gated (support < %*f) holding %lf", &sh, &cells, &gc, &share); }
+    while (f && fgets(line, sizeof line, f)) { fputs(line, stdout); if (strstr(line, "GT sheet voxels")) sscanf(line, "gt-gate: %lld GT sheet voxels, %lld cells with >= %*d (smaller cells kept unchecked), %lld gated (support < %*f) = %lf", &sh, &cells, &gc, &share); }
     if (f) fclose(f);
     CHECK(sh == nsheet, "sheet voxels %lld (fixture %ld)", sh, nsheet);
     CHECK(cells == 8 && gc == 4, "cells counted %lld, gated %lld (want 8 / 4: the x >= 64 half)", cells, gc);

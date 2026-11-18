@@ -88,7 +88,7 @@ if [ "${M7:-}" != none ] && [ ! -e "$GP/done" ]; then
     X "$OUT/logs/gtgate.log" "$U" gt-gate --gt "$LB" --gt-key "codes.zarr/$GUM" --prob "$m7r" --prob-key "$m7k" ${CACHE:+--cache "$CACHE"} --axis "$RUN/axis.json" --axis-scale "$AXS" \
        --out "$GP/gate" --min-support 0 --orient-deg "${ORIENT:-25}" --phase "$LB" --phase-key "phase.zarr/$GUM" --ignore "$LB" --ignore-key "ignore.zarr/$GUM" \
        --phase-out "$GP/phase.zarr" --min-keep "${MINKEEP:-0.3}" --jobs "$TH" || { log "gt-gate failed ($OUT/logs/gtgate.log)"; exit 1; }
-    [ "$DRY" = 1 ] || { touch "$GP/done"; log "gt-gate: $(grep -o 'holding [0-9.]* of the sheet voxels' "$OUT/logs/gtgate.log")"; }
+    [ "$DRY" = 1 ] || { touch "$GP/done"; log "gt-gate: $(grep -oE '[0-9.]+ of the sheet voxels gated, kept [0-9.]+' "$OUT/logs/gtgate.log")"; }
   fi
 fi
 [ "${M7:-}" != none ] && [ -d "$GP/phase.zarr" -o "$DRY" = 1 ] && PR_=$GP/phase.zarr || PR_=$LB/phase.zarr

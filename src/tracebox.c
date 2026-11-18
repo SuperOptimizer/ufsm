@@ -570,8 +570,11 @@ int cmd_gt_gate(int argc, char **argv) {
     if (J.wp && (z3w_close(J.wp) || z3w_write_group(tb_opt(argc, argv, "--phase-out", ""), &um, 1, "phase", nullptr))) { fprintf(stderr, "gt-gate: phase write failure\n"); return 1; }
     if (z3w_close(J.w) || z3w_write_group(out, &um, 1, "gt-gate", nullptr) || atomic_load(&J.fail)) { fprintf(stderr, "gt-gate: read / write failure\n"); return 1; }
     const long long sh = atomic_load(&J.sheet), g = atomic_load(&J.gated);
-    printf("gt-gate: %lld GT sheet voxels, %lld cells with >= %d, %lld gated (support < %.2f) holding %.3f of the sheet voxels -> %s (key %s)\n",
-           sh, (long long)atomic_load(&J.cells), J.minn, (long long)atomic_load(&J.gcells), J.mins, sh ? (double)g / sh : 0, out, key);
+    /* (eval audit 11-14 #19: the share was printed as "holding" and blamed on support even when --orient-deg gated the cell; good.sh stored
+       the gated share as the held one. Cells under --min-n are checked by neither rule and kept.) */
+    printf("gt-gate: %lld GT sheet voxels, %lld cells with >= %d (smaller cells kept unchecked), %lld gated (support < %.2f%s) = %.3f of the "
+           "sheet voxels gated, kept %.3f -> %s (key %s)\n", sh, (long long)atomic_load(&J.cells), J.minn, (long long)atomic_load(&J.gcells), J.mins,
+           J.odeg > 0 ? " or orientation" : "", sh ? (double)g / sh : 0, sh ? 1 - (double)g / sh : 0, out, key);
     if (J.odeg > 0) printf("gt-gate: --orient-deg %.0f: %lld cells gated for sheet direction (ours vs the m7 structure tensor)\n", J.odeg, (long long)atomic_load(&J.ocells));
     printf("gt-gate: ray frame --dir %s: %lld of %lld shards parallel\n", J.dir, (long long)atomic_load(&J.npar), (long long)atomic_load(&J.nfr));
     if (J.wp) printf("gt-gate: gated phase: %lld shards written (--min-keep %.2f, --shard-frac %.2f) -> %s\n", (long long)atomic_load(&J.pshards), J.minkeep, J.shfrac, tb_opt(argc, argv, "--phase-out", ""));
