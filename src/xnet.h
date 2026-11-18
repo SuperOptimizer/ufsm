@@ -104,6 +104,8 @@ void xbn_fold(int co, const float *g, const float *b, const float *m, const floa
 
 /* GroupNorm(groups) over D H W per sample, y = act(norm(x) gamma + beta (+ res)); y may be x (in place) */
 void xgn(xt x, int groups, const float *gamma_dev, const float *beta_dev, float eps, const xt *res, int act, xt y);
+void xgn_q(xt x, int groups, const float *gamma_dev, const float *beta_dev, float eps, const xt *res, int act, int want_q, xt *y);   /* xgn; want_q (an MX conv reads y next): y->q in the same pass (UFSM_XNET_GNQ=1) */
+void xnet_set_gnq(int v);   /* UFSM_XNET_GNQ: 1 xgn_q writes the MX copy, 0 (default) not */
 float *xdev_floats(const float *host, size_t n);       /* a cached device copy of host floats (free with xfree_dev) */
 
 xt xunfold(xt x, int kw, int pw);                      /* c = 1 -> c = 8: out[.., w, j] = x[.., w - pw + j] (j < kw), width W + 2pw - kw + 1 */

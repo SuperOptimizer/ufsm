@@ -278,6 +278,30 @@ static int run_c1(int N, int D, int H, int W) {
     return bad != 0;
 }
 
+/* xgn_q (k_gnq: the GroupNorm apply writing the MX copy of its output) against xgn then xq_ensure (k_gn_apply, k_xq): y and q byte-equal */
+static int run_gnq(int sf, int N, int H, int W, int C, int G, int withres, int act) {
+    const size_t ne = (size_t)N * H * W * C; uint16_t *xh = malloc(ne * 2), *rh = malloc(ne * 2); float ga[640], be[640]; int bad = 0;
+    for (size_t i = 0; i < ne; i++) { xh[i] = f2h(rnd() * 3.f + 0.2f * (float)(i % C) / C); rh[i] = f2h(rnd()); }
+    for (int c = 0; c < C; c++) { ga[c] = 1.f + 0.5f * rnd(); be[c] = 0.3f * rnd(); }
+    float *gd = xdev_floats(ga, C), *bd = xdev_floats(be, C);
+    xnet_set_mx(sf); xnet_set_gnq(1);
+    xt x = xt_new(N, 1, H, W, C), r = xt_new(N, 1, H, W, C); xh2d(r.p, rh, ne * 2);
+    xh2d(x.p, xh, ne * 2); xt a = xt_new(N, 1, H, W, C); xgn(x, G, gd, bd, 1e-5f, withres ? &r : nullptr, act, a); xq_ensure(&a);
+    xt b = x; b.q = nullptr; xh2d(x.p, xh, ne * 2); xgn_q(x, G, gd, bd, 1e-5f, withres ? &r : nullptr, act, 1, &b);   /* in place, as reader3 */
+    const size_t nq = (ne / 2 + 15) / 16 * 16 + ne / 8;   /* nibbles, then 4 bytes a 32-channel chunk of which 2 written: compare the written ones */
+    uint8_t *qa = malloc(nq + 64), *qb = malloc(nq + 64); uint16_t *ya = malloc(ne * 2), *yb = malloc(ne * 2);
+    xd2h(qa, a.q, nq); xd2h(qb, b.q, nq); xd2h(ya, a.p, ne * 2); xd2h(yb, b.p, ne * 2);
+    if (xnet_check("test_xmx gnq")) return 1;
+    size_t dy = 0, dq = 0; const size_t so = (ne / 2 + 15) / 16 * 16;
+    for (size_t i = 0; i < ne; i++) dy += ya[i] != yb[i];
+    for (size_t i = 0; i < so; i++) dq += qa[i] != qb[i];
+    for (size_t k = 0; k < ne / 32; k++) for (int j = 0; j < 2; j++) dq += qa[so + k * 4 + j] != qb[so + k * 4 + j];
+    printf("gnq sf %d N %d %dx%d C %d G %d res %d act %d: %zu of %zu y, %zu q bytes differ from xgn + k_xq\n", sf, N, H, W, C, G, withres, act, dy, ne, dq);
+    bad = dy != 0 || dq != 0;
+    xnet_set_gnq(-1); xnet_set_mx(0);
+    xt_free(&a); xt_free(&b); xt_free(&r); xfree_dev(gd); xfree_dev(bd); free(xh); free(rh); free(qa); free(qb); free(ya); free(yb);
+    return bad;
+}
 /* the 2-D transposed conv (k2 s2) shuffle: k_tshuffle8 (8 channels a thread, the default) byte-equal to the per-element k_tshuffle */
 static int run_ts(int N, int D, int H, int W, int ci, int co) {
     const size_t nx = (size_t)N * D * H * W * ci, ny = (size_t)N * D * 4 * H * W * co; uint16_t *xh = malloc(nx * 2), *y0 = malloc(ny * 2), *y1 = malloc(ny * 2);
@@ -386,6 +410,7 @@ int main(void) {
     for (int sf = 6; sf >= 5; sf--) { fails += run(sf, 2, 9, 7, 11, 32, 32, 3, 1, 2); fails += run(sf, 1, 6, 5, 7, 128, 256, 1, 1, 0); }
     g_mxa = 0; xnet_set_mxq(0); xnet_set_mxrot(0); xnet_set_mxa(0);
     fails += run_dattn(2, 17, 40, 36);
+    for (int sf = 5; sf <= 6; sf++) { fails += run_gnq(sf, 2, 13, 11, 64, 32, 0, XA_LRELU); fails += run_gnq(sf, 3, 6, 5, 320, 32, 1, XA_LRELU); fails += run_gnq(sf, 1, 9, 7, 32, 32, 1, XA_RELU); }
     fails += run_ts(2, 1, 7, 9, 32, 16);     /* ragged, two samples */
     fails += run_ts(1, 1, 24, 24, 64, 8);
     fails += run_ts(3, 1, 5, 13, 16, 64);

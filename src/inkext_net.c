@@ -594,13 +594,14 @@ static void hecate_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out,
     free(h2); free(sup); free(full);
 }
 
-static xt bbd_fwd(const bbd *B, xt x) {
-    xt h = xconv_fwd(&B->c1, x, nullptr, XA_NONE); xgn(h, h.c, B->g1, B->b1, 1e-5f, nullptr, XA_LRELU, h);
+/* wq: an MX conv reads the block's output next (xgn_q writes its MX copy then, UFSM_XNET_GNQ=1) */
+static xt bbd_fwd(const bbd *B, xt x, int wq) {
+    xt h = xconv_fwd(&B->c1, x, nullptr, XA_NONE); xgn_q(h, h.c, B->g1, B->b1, 1e-5f, nullptr, XA_LRELU, B->c2.mxq != nullptr, &h);
     xt h2 = xconv_fwd(&B->c2, h, nullptr, XA_NONE); xt_free(&h);
     xt sk = x; int own = 0;
     if (B->stride != 1) { sk = xavgpool2d_k2(x); own = 1; }
     if (B->has_sk) { xt p = xconv_fwd(&B->sk, sk, nullptr, XA_NONE); if (own) xt_free(&sk); xgn(p, p.c, B->gs, B->bs, 1e-5f, nullptr, XA_NONE, p); sk = p; own = 1; }
-    xgn(h2, h2.c, B->g2, B->b2, 1e-5f, &sk, XA_LRELU, h2);
+    xgn_q(h2, h2.c, B->g2, B->b2, 1e-5f, &sk, XA_LRELU, wq, &h2);
     if (own) xt_free(&sk);
     return h2;
 }
@@ -623,10 +624,12 @@ static void reader_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out)
         float *at = xmalloc_dev((size_t)B * D * T * T * 4); xhead(f2, n->att_w, n->att_b, at);
         z = xdepth_attn_max(f2, at); xt_free(&f2); xfree_dev(at);
     }
-    xt x = xconv_fwd(&n->rstem, z, nullptr, XA_NONE); xt_free(&z); xgn(x, x.c, n->rstem_g, n->rstem_b, 1e-5f, nullptr, XA_LRELU, x);
+    /* the MX conv that reads each block's output next: the next block's c1, after the last block the first tconv */
+#define R3_NEXTQ(s, i) ((i) + 1 < n->nblk[s] ? n->st[s][(i) + 1].c1.mxq != nullptr : (s) + 1 < n->nst ? n->st[(s) + 1][0].c1.mxq != nullptr : n->nst > 1 && n->tconv[0].mxq != nullptr)
+    xt x = xconv_fwd(&n->rstem, z, nullptr, XA_NONE); xt_free(&z); xgn_q(x, x.c, n->rstem_g, n->rstem_b, 1e-5f, nullptr, XA_LRELU, n->st[0][0].c1.mxq != nullptr, &x);
     xt skip[6];
     for (int s = 0; s < n->nst; s++) {
-        for (int i = 0; i < n->nblk[s]; i++) { xt y = bbd_fwd(&n->st[s][i], x); if (!(s > 0 && i == 0)) xt_free(&x); x = y; }
+        for (int i = 0; i < n->nblk[s]; i++) { xt y = bbd_fwd(&n->st[s][i], x, R3_NEXTQ(s, i)); if (!(s > 0 && i == 0)) xt_free(&x); x = y; }
         skip[s] = x;
     }
     xt l = skip[n->nst - 1];
@@ -634,8 +637,9 @@ static void reader_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out)
         xt up = xconv_fwd(&n->tconv[s], l, nullptr, XA_NONE); xt_free(&l);
         xt c = xconcat(up, skip[n->nst - 2 - s]); xt_free(&up); xt_free(&skip[n->nst - 2 - s]);
         l = xconv_fwd(&n->dconv[s], c, nullptr, XA_NONE); xt_free(&c);
-        xgn(l, l.c, n->dg[s], n->db[s], 1e-5f, nullptr, XA_LRELU, l);
+        xgn_q(l, l.c, n->dg[s], n->db[s], 1e-5f, nullptr, XA_LRELU, s + 1 < n->nst - 1 && n->tconv[s + 1].mxq != nullptr, &l);
     }
+#undef R3_NEXTQ
     float *lg = xmalloc_dev((size_t)B * T * T * 4);
     xhead(l, n->logit_w, n->logit_b, lg); xt_free(&l);
     xd2h(out, lg, (size_t)B * T * T * 4); xfree_dev(lg);

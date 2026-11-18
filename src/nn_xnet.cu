@@ -1827,6 +1827,34 @@ __global__ void k_gn_apply(const __half *x, const float *gm, const float *rs, co
         *(__half2 *)(y + i) = __floats2half2_rn(act_f(a, act), act_f(b, act));
     }
 }
+/* k_gn_apply with the MX-fp4 copy of its output (xgn_q): thread per 16-channel block; each element is k_gn_apply's expression (fp16-rounded,
+   written over y), the block then quantised as k_xq<SF, 0> (amax scales) quantises those halves: y and q are byte-equal to k_gn_apply then
+   k_xq, without k_xq's re-read of y (test_xmx gnq). C % 32 == 0 (two 16-blocks a 32-channel scale word). */
+template <int SF> __global__ void k_gnq(const __half *x, const float *gm, const float *rs, const float *gamma, const float *beta, const __half *res, int act, __half *y,
+                                        int C, long long S, long long nb16, uint8_t *q, uint8_t *sq) {
+    const long long b = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (b >= nb16) return;
+    const long long e0 = b * 16; const int c0 = (int)(e0 % C); const size_t nn = (size_t)(e0 / ((long long)C * S)), q0 = nn * C + c0;
+    __align__(16) __half hv[16], rv[16]; *(uint4 *)hv = *(const uint4 *)(x + e0); *(uint4 *)(hv + 8) = *(const uint4 *)(x + e0 + 8);
+    if (res) { *(uint4 *)rv = *(const uint4 *)(res + e0); *(uint4 *)(rv + 8) = *(const uint4 *)(res + e0 + 8); }
+    float v[16], am = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+        float a = (__half2float(hv[i]) - gm[q0 + i]) * rs[q0 + i] * gamma[c0 + i] + beta[c0 + i];
+        if (res) a += __half2float(rv[i]);
+        hv[i] = __float2half_rn(act_f(a, act)); v[i] = __half2float(hv[i]); am = fmaxf(am, fabsf(v[i]));
+    }
+    *(uint4 *)(y + e0) = *(const uint4 *)hv; *(uint4 *)(y + e0 + 8) = *(const uint4 *)(hv + 8);
+    uint2 o; uint8_t sc;
+    if constexpr (SF == 6) { const int e = mx_exp(am, 1.f / 6.f); const float m = exp2i(-e); o.x = cvt_e2m1x8(v, m); o.y = cvt_e2m1x8(v + 8, m); sc = (uint8_t)(e + 127); }
+    else {
+        sc = cvt_e4m3(__fdiv_rn(am, 6.f)); const float d = e4dec(sc);
+        float w[16];
+#pragma unroll
+        for (int i = 0; i < 16; i++) w[i] = d > 0.f ? __fdiv_rn(v[i], d) : 0.f;
+        o.x = cvt_e2m1x8(w, 1.f); o.y = cvt_e2m1x8(w + 8, 1.f);
+    }
+    *(uint2 *)(q + b * 8) = o; sq[(b >> 1) * 4 + (b & 1)] = sc;
+}
 static int g_gnold = -1;   /* mgpu: env */
 extern "C" void xnet_set_gnold(int v) { g_gnold = v; }
 /* the group statistics of x: device gm / rs [n][C] (group mean, 1 / std per channel, one allocation: rs = gm + n C; free gm) */
@@ -1849,6 +1877,23 @@ extern "C" void xgn(xt x, int groups, const float *gamma, const float *beta, flo
     float *gm = xgn_stats(x, groups, eps), *rs = gm + (size_t)n * C;
     const size_t total = xt_numel(x); unsigned nb = nblk(total / 2, 256); if (nb > 65535 * 4) nb = 65535 * 4;
     k_gn_apply<<<nb, 256, 0, g_st>>>((const __half *)x.p, gm, rs, gamma, beta, res ? (const __half *)res->p : nullptr, act, (__half *)y.p, C, S, total);
+    xfree_dev(gm);
+}
+
+static int g_gnq = -1;   /* UFSM_XNET_GNQ=1: xgn_q writes the MX copy of its output for the next MX conv (opt-in); mgpu: env */
+extern "C" void xnet_set_gnq(int v) { g_gnq = v; }
+/* xgn into *y, and with want_q (an MX conv reads y next) y->q = its MX-fp4 copy in the same pass (UFSM_XNET_GNQ=1, xnet_mx() 5 / 6, C % 32 == 0);
+   otherwise as xgn, and a q y carried is dropped (its fp16 values change) */
+extern "C" void xgn_q(xt x, int groups, const float *gamma, const float *beta, float eps, const xt *res, int act, int want_q, xt *y) {
+    if (g_gnq < 0) g_gnq = getenv("UFSM_XNET_GNQ") ? atoi(getenv("UFSM_XNET_GNQ")) : 0;
+    const int sf = xnet_mx();
+    if (!(g_gnq && want_q && sf && x.c % 32 == 0)) { if (y->q) { xfree_dev(y->q); y->q = nullptr; } xgn(x, groups, gamma, beta, eps, res, act, *y); return; }
+    const int C = x.c, n = x.n; const long long S = (long long)x.d * x.h * x.w; const size_t ne = xt_numel(x); const long long nb16 = (long long)(ne / 16);
+    float *gm = xgn_stats(x, groups, eps), *rs = gm + (size_t)n * C;
+    if (!y->q) y->q = xmalloc_dev(xq_size(ne));
+    uint8_t *q = (uint8_t *)y->q; const __half *rp = res ? (const __half *)res->p : nullptr;
+    if (sf == 5) k_gnq<5><<<nblk(nb16, 128), 128, 0, g_st>>>((const __half *)x.p, gm, rs, gamma, beta, rp, act, (__half *)y->p, C, S, nb16, q, q + xq_soff(ne));
+    else k_gnq<6><<<nblk(nb16, 128), 128, 0, g_st>>>((const __half *)x.p, gm, rs, gamma, beta, rp, act, (__half *)y->p, C, S, nb16, q, q + xq_soff(ne));
     xfree_dev(gm);
 }
 
