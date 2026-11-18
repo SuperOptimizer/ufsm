@@ -1,6 +1,7 @@
 #include "gnmode.h"
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 static long hdr_long(const char *hdr, const char *key) {
     const char *p = hdr ? strstr(hdr, key) : nullptr; return p ? atol(p + strlen(key)) : -1;
@@ -21,4 +22,10 @@ int ema_choice(const char *arg, double rel, int *defaulted) {
     if (arg && strcmp(arg, "auto")) return atoi(arg) != 0;
     if (rel > EMA_REL_MAX) { *defaulted = 1; return 0; }
     return 1;
+}
+
+float ema_update_decay(float ema, int per_window, long wpu, long ostep) {
+    if (ostep < 100) return 0.9f;
+    if (!per_window || wpu <= 1) return ema;
+    return (float)pow((double)ema, (double)wpu);
 }

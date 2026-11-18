@@ -42,5 +42,13 @@ int main(void) {
         CHECK(fabs(r - 0.1) < 1e-5, "checkpoint_ema_rel: ema = 1.1 p reads 0.1 (%.6f)", r);
         CHECK(checkpoint_ema_rel("no-such-file.ckpt") == -1, "checkpoint_ema_rel: missing file -1");
     }
+    /* ema_update_decay: --ema-per update keeps the decay, window raises it to the windows per update; 0.9 for the first 100 updates */
+    CHECK(ema_update_decay(0.999f, 0, 10, 500) == 0.999f, "per update: ema itself");
+    CHECK(fabsf(ema_update_decay(0.999f, 1, 10, 500) - 0.99004488f) < 1e-6f, "per window, 10 windows per update: 0.999^10");
+    CHECK(fabsf(ema_update_decay(0.9995f, 1, 10, 500) - 0.99501123f) < 1e-6f, "per window 0.9995 at accum 10: 0.9995^10");
+    CHECK(ema_update_decay(0.999f, 1, 1, 500) == 0.999f, "per window, 1 window per update: unchanged");
+    CHECK(ema_update_decay(0.999f, 1, 10, 99) == 0.9f && ema_update_decay(0.999f, 0, 10, 0) == 0.9f, "warmup: 0.9 below update 100");
+    { const float d1 = ema_update_decay(0.9995f, 1, 4, 500), d2 = ema_update_decay(0.9995f, 1, 8, 500);   /* the horizon in windows is accum-independent */
+      CHECK(fabs(4.0 / (1.0 - d1) - 8.0 / (1.0 - d2)) < 0.01 * 4.0 / (1.0 - d1), "per window: same horizon in windows at accum 4 and 8"); }
     printf("test_gnmode: %s\n", fails ? "FAILED" : "ok"); return fails != 0;
 }
