@@ -10,9 +10,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+void lp_set_c1v(int v);
 
-static int run(int cout, int hc0, int hnc, int D) {
-    unet_cfg cfg = {3, {16, 16, 32}, 2, cout, 8};
+static int run(int cout, int hc0, int hnc, int D, int w0) {   /* w0: level-0 width (the head conv input: 96 = the u1 fields net, three full 32-channel MX blocks) */
+    unet_cfg cfg = {3, {w0, 16, 32}, 2, cout, 8};
     unet *u = unet_create(&cfg); unet_init(u, 11);
     if (hnc) unet_set_head_channels(u, hc0, hnc);
     const int rows = hnc ? hnc : cout;
@@ -41,8 +42,18 @@ static int run(int cout, int hc0, int hnc, int D) {
         for (int c = 0; c < rows; c++) bad += memcmp(got + (size_t)c * st, ref + (size_t)c * S + (size_t)z0 * pl, nv * 4) != 0;
         if (bad) { fprintf(stderr, "test_headz: cout %d rows %d: planes [%d, %d): %zu of %d channels differ from the whole-window logits\n", cout, rows, z0, z1, bad, rows); fails++; }
     }
+    if (!fails) {   /* the V-blocked head conv (conv1_mx_tv_k, default) against conv1_mx_t_k: bit for bit */
+        const size_t nv = S; float *g1 = malloc((size_t)rows * nv * 4);
+        lp_set_c1v(1); unet_head_fwd_z32(u, 0, D, yd, 0); nn_sync(); nn_d2h(g1, yd, (size_t)rows * nv * 4);
+        for (int v = 2; v <= 3; v++) {   /* (2 the default V 1, 3 V 2) */
+            lp_set_c1v(v); unet_head_fwd_z32(u, 0, D, yd, 0); nn_sync(); nn_d2h(got, yd, (size_t)rows * nv * 4);
+            if (memcmp(g1, got, (size_t)rows * nv * 4)) { fprintf(stderr, "test_headz: cout %d: conv1_mx_tv_k (UFSM_C1_V %d) differs from conv1_mx_t_k\n", cout, v); fails++; }
+        }
+        lp_set_c1v(-1);
+        free(g1);
+    }
     const char *e = nn_check(); if (e) { fprintf(stderr, "test_headz: cuda: %s\n", e); fails++; }
-    printf("test_headz: cout %d (head rows %d from %d), %d x 32 x 40 level 0: %s\n", cout, rows, hc0, D, fails ? "FAIL" : "bit-identical over 5 ranges (2 into a wider plane stride)");
+    printf("test_headz: cout %d (head rows %d from %d), %d x 32 x 40 level 0 of %d channels: %s\n", cout, rows, hc0, D, w0, fails ? "FAIL" : "bit-identical over 5 ranges (2 into a wider plane stride)");
     nn_free(xd); nn_free(yd); free(xh); free(ref); free(got); unet_free(u);
     return fails;
 }
@@ -51,9 +62,11 @@ int main(void) {
     if (nn_init(0)) return test_no_gpu("test_headz", "nn_init(0) failed");
     nn_set_prec(1); nn_set_f16(1); unet_set_act_mx4(1); unet_set_act_mx8(0);
     int fails = 0;
-    fails += run(32, 0, 0, 24);
-    fails += run(11, 0, 0, 16);
-    fails += run(144, 0, 144, 16);
+    fails += run(32, 0, 0, 24, 16);
+    fails += run(11, 0, 0, 16, 16);
+    fails += run(144, 0, 144, 16, 16);
+    fails += run(144, 0, 144, 8, 96);
+    fails += run(11, 0, 0, 12, 48);   /* (one full block and a 16-channel tail) */
     printf("test_headz: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

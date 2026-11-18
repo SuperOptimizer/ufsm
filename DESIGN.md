@@ -6,6 +6,21 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The MX head conv at 3 blocks an SM: fields predict's conv1_mx_t_k -20 % (2026-11-17, branch convkc1v-20261117)
+
+conv1_mx_t_k (the 1x1 head conv on MX-fp4 level-0 activations, GN+SiLU on load; u1 fields: 96 inputs, nine passes of 16 outputs) was
+21.6 ms of a 0332 640 window's ~140 ms of kernels. ncu: ~5000 issued instructions a voxel for its 1536 FMAs (FFMA 37 %, LDS 10 %, MUFU
+6 %, the rest per-channel bounds checks, branches and addressing), 89 registers -> 2 blocks of 256 an SM, 58 % issue slots, 1.1
+eligible warps a scheduler.
+
+- **conv1_mx_tv_k** (UFSM_C1_V=2, default; 1 the old kernel): full 32-channel blocks without the per-channel checks, and
+  __launch_bounds__(256, 3) (85 registers, 24 warps an SM). Fields 0332 640 (nsys, 2 interleaved pairs): 21.6 -> 17.3 ms a window,
+  kernel min-sum 142.9 -> 138.5 ms; fit-zarr outputs byte-identical (0 data files differ). 4 blocks an SM: 20.2 ms.
+- V = 2 voxels a thread sharing each channel's weight loads (UFSM_C1_V=3): 204 registers, 8 warps an SM, 29.6 ms. Kept only as an option.
+- The same chains (bias, ci in order, act_ab on the same decoded value): test_headz now compares the kernels bit for bit. It also gained
+  96- and 48-channel level-0 cases (three full MX blocks; one full block and a tail). The trainer's head forward uses the same launcher,
+  so it is byte-identical there too.
+
 ## reader3 ink-ext: the depth-fusion conv streamed over depth, conv_igemm at 2 blocks an SM (2026-11-17, branch convkx-20261117)
 
 Profile (nsys, unrollperf's warm-cache PHerc1667 w035, 1012 tiles, card 1 shared): 9.6-15 s of kernels a wrap, the 128 x 128

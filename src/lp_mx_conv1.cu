@@ -68,6 +68,83 @@ __global__ void __launch_bounds__(256) conv1_mx_t_k(const uint8_t *x, const floa
         if constexpr (sizeof(YT) == 2) y[((size_t)n * Cy + co) * Ly + vl] = __float2half(acc[co]); else y[((size_t)n * Cy + co) * Ly + vl] = acc[co];
     }
 }
+/* conv1_mx_t_k with full 32-channel blocks run without the per-channel bounds checks and held to 3 blocks of 256 an SM (85 registers;
+   conv1_mx_t_k: 89, 2 blocks, 16 warps): ncu (fields 0332 640) had it at ~5000 issued instructions a voxel for 1536 FMAs, 58 % issue
+   slots, 1.1 eligible warps a scheduler. Fields 640 window: 21.6 -> 17.3 ms (3 blocks; 4 blocks 20.2). V voxels a thread (vl, vl +
+   blockDim, ..), each channel's weights feeding V chains, was slower at V 2 (204 registers, 8 warps an SM: 29.6 ms). Each output's
+   chain is conv1_mx_t_k's (bias, then ci in order, act_ab on the same decoded value): byte-identical (test_headz). */
+#ifndef C1V_MINB
+#define C1V_MINB 3
+#endif
+template <int B, int CO, int V, typename YT = float>
+__global__ void __launch_bounds__(V == 1 ? 256 : 128, V == 1 ? C1V_MINB : 1) conv1_mx_tv_k(const uint8_t *x, const float *w, const float *b, YT *y, int N, int Ci, size_t S, gnp_t gp, int Co,
+                                                     size_t vb, size_t Sy, int Cy, size_t Ly) {
+    constexpr int CP = CO <= 8 ? 8 : 16, C4 = CP / 4;
+    extern __shared__ __align__(16) float c1s[];
+    float4 *sw = (float4 *)c1s;
+    float2 *sab = (float2 *)(sw + C4 * Ci);
+    const int nb0 = blockIdx.y, NT = blockDim.x;
+    const size_t vblk = (size_t)blockIdx.x * NT * V;   /* this block's first voxel (local) */
+    const int r0 = gp.ns ? gn_row_v(gp, nb0, min(vb + vblk, S - 1)) : 0;
+    for (int i = threadIdx.x; i < (gp.ns ? 2 : N) * Ci; i += NT) {
+        const int n = i / Ci, ci = i % Ci;
+        if (gp.G) sab[i] = gn_ab(gp, gp.ns ? min(r0 + n, nb0 * gp.ns + gp.ns - 1) : n, ci, Ci);
+    }
+    for (int i = threadIdx.x; i < CP * Ci; i += NT) { const int ci = i / CP, co = i % CP; c1s[i] = co < Co ? w[co * Ci + ci] : 0.f; }
+    __syncthreads();
+    const int bw = mx_bw(Ci), nb = mx_nb(Ci);
+    const int n = blockIdx.y;
+    size_t vl[V], vv[V]; bool on[V]; const float2 *sabv[V];
+#pragma unroll
+    for (int j = 0; j < V; j++) {
+        vl[j] = vblk + threadIdx.x + (size_t)j * NT; vv[j] = vb + vl[j]; on[j] = vl[j] < Sy && vv[j] < S;
+        if (!on[j]) vv[j] = vb;   /* (a valid voxel to read; not stored) */
+        sabv[j] = sab + (gp.ns ? (gn_row_v(gp, n, vv[j]) - r0) * Ci : n * Ci);
+    }
+    if (!on[0]) return;
+    float acc[V][CO];
+#pragma unroll
+    for (int j = 0; j < V; j++)
+#pragma unroll
+        for (int co = 0; co < CO; co++) acc[j][co] = b && co < Co ? b[co] : 0.f;
+    const uint8_t *sc = mx_sc<B>(x, N, Ci, S);
+    for (int blk = 0; blk < nb; blk++) {
+        float r[V][32];
+#pragma unroll
+        for (int j = 0; j < V; j++) mx_load_row_b<B>(x, sc, ((size_t)n * nb + blk) * S + vv[j], bw, r[j]);
+        auto chan = [&](int k) {
+            const int ci = blk * bw + k;
+            float wv[CP];
+#pragma unroll
+            for (int q = 0; q < C4; q++) { const float4 t = sw[C4 * ci + q]; wv[4 * q] = t.x; wv[4 * q + 1] = t.y; wv[4 * q + 2] = t.z; wv[4 * q + 3] = t.w; }
+#pragma unroll
+            for (int j = 0; j < V; j++) {
+                float xv = r[j][k];
+                if (gp.G) { const float2 ab = sabv[j][ci]; xv = act_ab(xv, ab.x, ab.y, true); }
+#pragma unroll
+                for (int co = 0; co < CO; co++) acc[j][co] += wv[co] * xv;
+            }
+        };
+        if (bw == 32 && (blk + 1) * 32 <= Ci) {
+#pragma unroll
+            for (int k = 0; k < 32; k++) chan(k);
+        } else {
+#pragma unroll
+            for (int k = 0; k < 32; k++) { if (k >= bw || blk * bw + k >= Ci) break; chan(k); }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < V; j++) {
+        if (!on[j]) continue;
+#pragma unroll
+        for (int co = 0; co < CO; co++) {
+            if (co >= Co) break;
+            if constexpr (sizeof(YT) == 2) y[((size_t)n * Cy + co) * Ly + vl[j]] = __float2half(acc[j][co]); else y[((size_t)n * Cy + co) * Ly + vl[j]] = acc[j][co];
+        }
+    }
+}
+static int g_c1v = -1;   /* UFSM_C1_V: the MX head conv: 1 the old conv1_mx_t_k, 2 (default) conv1_mx_tv_k V 1, 3 its V 2 (slower); mgpu: env */
+extern "C" void lp_set_c1v(int v) { g_c1v = v; }   /* (tests) */
 /* voxels per block of the head's weight-gradient kernels: at most one slab (slab GroupNorm: a block's voxels span <= 2 slabs, its
    two coefficient banks) */
 static int slab_nper(const gnp_t &gp, int nper) {
@@ -79,7 +156,10 @@ static bool slab_small(const gnp_t &gp) { return gp.ns && gp.G && (long long)gp.
 static size_t conv1_smem(shape5 xs, int cout) { return (size_t)(2 * (xs.n > 2 ? xs.n : 2) * xs.c + (cout <= 8 ? 8 : 16) * xs.c) * sizeof(float); }   /* (>= 2 coefficient rows: slab banks) */
 template <int B, int CO, typename YT = float> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, YT *y, gnp_t gp, int cout, size_t vb = 0, size_t nv = 0, int cy = 0, size_t ly = 0) {
     const size_t S = shape_spatial(xs), sm = conv1_smem(xs, cout), Sy = nv ? nv : S;
-    conv1_mx_t_k<B, CO, YT><<<dim3(nblk_(Sy, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp, cout, vb, Sy, cy ? cy : cout, ly ? ly : Sy);
+    if (g_c1v < 0) g_c1v = getenv("UFSM_C1_V") ? atoi(getenv("UFSM_C1_V")) : 2;
+    if (g_c1v == 3 && CO >= 4 && !slab_small(gp)) conv1_mx_tv_k<B, CO, 2, YT><<<dim3(nblk_(Sy, 256), xs.n), 128, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp, cout, vb, Sy, cy ? cy : cout, ly ? ly : Sy);
+    else if (g_c1v == 2 && !slab_small(gp)) conv1_mx_tv_k<B, CO, 1, YT><<<dim3(nblk_(Sy, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp, cout, vb, Sy, cy ? cy : cout, ly ? ly : Sy);
+    else conv1_mx_t_k<B, CO, YT><<<dim3(nblk_(Sy, 256), xs.n), 256, sm>>>((const uint8_t *)x, w, b, y, xs.n, xs.c, S, gp, cout, vb, Sy, cy ? cy : cout, ly ? ly : Sy);
 }
 /* the wide fp16-logit head on the tensor cores (perf2 2026-11-13): the latent nets' cell head (--lat-guide 3: 160 outputs from 256 MX-fp4
    channels) ran conv1_mx_t_k in 10 passes of 16 outputs, each re-reading x and doing 256 x 16 FFMAs a cell (P 512 92 M: 66 ms a step, ~5
