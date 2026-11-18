@@ -35,6 +35,10 @@ eligible warps a scheduler.
   only). The trainer's preslab path uses the same kernel.
 - **up_fine_f4v_k at 4 blocks an SM** (UPF_MINB; branch convkupf-20261117): 99 registers -> 2 blocks, 31 % occupancy before.
   3.42 -> 2.69 ms a window (3 blocks 2.79, 6 blocks 3.12), 0 data files differ.
+- Tried for the head conv, byte-identical but not kept: passes of 48 outputs instead of 16 in lp_conv1_fwd_mx_r. The 96 inputs are
+  then decoded and GN+SiLU'd 3 times instead of 9, with the weights a float4 at a time. 17.6 -> 17.0 ms at 3 blocks of 128, 18.8 at 4,
+  20.1 with all 48 weights in registers. The kernel is FMA / LDS issue-bound, not decode-bound. fma.rn.f32x2 (FFMA2) runs on sm_120 under
+  mcc and is bit-identical to fmaf, but the microbenchmark peak is the same 11.3 TFMA/s: it saves issue slots only (~10 % ceiling here).
 
 ## reader3 ink-ext: the depth-fusion conv streamed over depth, conv_igemm at 2 blocks an SM (2026-11-17, branch convkx-20261117)
 
