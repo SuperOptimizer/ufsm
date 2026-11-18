@@ -354,7 +354,7 @@ test_faces_gpu                                 | gpu          |    10 | ./$B/tes
 test_render_fill                               | smoke        |    10 | ./$B/test_render_fill
 test_render_absent                             | smoke        |     1 | ./$B/test_render_absent
 test_z3_fetch                                  | smoke        |     2 | tests/test_z3_fetch.sh ./$B/ufsm
-test_surf_resample                             | smoke        |       7 | ./$B/test_surf_resample ./$B/ufsm
+test_surf_resample                             | smoke        |     7 | ./$B/test_surf_resample ./$B/ufsm
 test_render_known                              | smoke        |     5 | ./$B/test_render_known ./$B/ufsm
 test_render_gate                               |              |     6 | ./$B/test_render_gate ./$B/ufsm
 test_render_gate_gpu                           | gpu          |     6 | ./$B/test_render_gate ./$B/ufsm gpu
