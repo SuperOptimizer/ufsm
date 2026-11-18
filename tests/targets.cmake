@@ -71,6 +71,7 @@ ufsm_exe(test_checkpoint_runtime SUITE tests/test_checkpoint_runtime.c OBJS chec
 ufsm_exe(test_ckring SUITE tests/test_ckring.c OBJS ckring LIBS m)
 ufsm_exe(test_gt_gate SUITE tests/test_gt_gate.c OBJS CORE NN LP LIBS LDLIBS CUDA m)
 ufsm_exe(test_hold_frame SUITE tests/test_hold_frame.c OBJS CORE NN LP LIBS LDLIBS CUDA m)
+ufsm_exe(test_gttrans SUITE tests/test_gttrans.c OBJS CORE NN LP LIBS LDLIBS CUDA m)
 ufsm_exe(test_cond SUITE tests/test_cond.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush scrollaug cover json
          store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb embz LIBS LDLIBS)
 ufsm_exe(test_coreline SUITE tests/test_coreline.c OBJS coreline z3w fit fit_emb embz fit_ct l1pot json zarr3 store NN LP LIBS LDLIBS CUDA)
