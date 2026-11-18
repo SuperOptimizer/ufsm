@@ -15,6 +15,8 @@ case "$B" in /vesuvius/ufsm/merge/swap2/gate.*) rm -rf -- "$B";; esac; mkdir -p 
 proc_lines() { awk '/^resumed .* at step /{n++; delete a; k=0; next} n && /^step +[0-9]+ /{a[++k]=$0} END{for(i=2;i<=k;i++) print a[i]}' $L; }   # the current process's lines, first skipped
 med() { awk -v f="$1" '{ if (match($0, " " f " [0-9.]+")) { split(substr($0,RSTART,RLENGTH),x," "); v[++n]=x[2] } }
   END { if (!n) {print -1; exit} asort(v); print (n%2 ? v[(n+1)/2] : (v[n/2]+v[n/2+1])/2) }'; }
+nres() { grep -c "^resumed .* at step " $L; }   # trainperf 11-18: the new process is the one after the stop: wait for its own "resumed" line
+R0=$(nres)
 proc_lines | tail -$NL > $B/before.lines; N0=$(wc -l < $B/before.lines)
 [ "$N0" -ge $NL ] || { echo "gswap: the current process has only $N0 full lines (< $NL): wait"; exit 1; }
 A0=$(med acc < $B/before.lines); G0=$(med gn < $B/before.lines); echo "== baseline (current process, last $NL lines): acc median $A0, gn median $G0"
@@ -22,7 +24,7 @@ cp $E $B/launch.env.before
 bash $R/s2ctl.sh stop "gswap $SHA: save the previous checkpoint" || exit 1
 cp $o/last.ckpt $B/last.ckpt
 bash $R/s2ctl.sh resume $NB "gswap $SHA" || { echo "== resume failed: restoring"; cp $B/launch.env.before $E; bash $R/s2ctl.sh resume "" "gswap $SHA failed to start"; exit 1; }
-until [ "$(proc_lines | wc -l)" -ge $NL ]; do
+until [ "$(nres)" -gt "$R0" ] && [ "$(proc_lines | wc -l)" -ge $NL ]; do   # (11-18: without the nres check the old process's lines passed at once: 0c114db0 "GATE PASS" at resume time)
   kill -0 "$(cat $o.pid 2>/dev/null)" 2>/dev/null || { sleep 90; kill -0 "$(cat $o.pid 2>/dev/null)" 2>/dev/null || { echo "== TRAINER GONE $(date +%T)"; break; }; }; sleep 60; done
 proc_lines | head -$NL > $B/after.lines; N1=$(wc -l < $B/after.lines); A1=$(med acc < $B/after.lines); G1=$(med gn < $B/after.lines)
 echo "== after the swap, first $NL lines ($N1): acc median $A1, gn median $G1 vs $A0 / $G0"
