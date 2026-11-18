@@ -40,7 +40,8 @@ static double gw_pcorr(const double *a, const double *b, const double *c, int n)
     const double ab = gw_corr(a, b, n), ac = gw_corr(a, c, n), bc = gw_corr(b, c, n);
     return (ab - ac * bc) / sqrt((1 - ac * ac) * (1 - bc * bc));
 }
-static const double *gw_key; static int gw_cmpi(const void *a, const void *b) { const double x = gw_key[*(const int *)a], y = gw_key[*(const int *)b]; return (x > y) - (x < y); }
+static const double *gw_key;   /* mgpu: debug (gnw-stats, one thread: the qsort key) */
+static int gw_cmpi(const void *a, const void *b) { const double x = gw_key[*(const int *)a], y = gw_key[*(const int *)b]; return (x > y) - (x < y); }
 static void gw_rank(const double *v, double *r, int n) {   /* ranks with ties averaged */
     int *ix = malloc((size_t)n * sizeof *ix); for (int i = 0; i < n; i++) ix[i] = i;
     gw_key = v; qsort(ix, (size_t)n, sizeof *ix, gw_cmpi);
