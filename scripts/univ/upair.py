@@ -10,13 +10,14 @@ CIs: read a metric that moves the same way on most boxes and across metrics befo
 """
 import random, sys
 
-BETTER = {'h1': 1, 'on_pap': 1, 'gap_void': 1, 'contrast': 1, 'sp_cv': 0, 'jumps': -1, 'jumps_n': -1, 'nrm_deg': 0, 'nrm30': 0, 'rv_agree': 1, 'ink_air': -1,
+BETTER = {'h1': 1, 'on_pap': 1, 'gap_void': 1, 'contrast': 1, 'sp_cv': 0, 'jumps': -1, 'jumps_n': -1, 'nrm_deg': 0, 'nrm30': 0, 'rv_agree': 0, 'ink_air': -1,
           'ink_band': 1, 'fib_chg_m': -1, 'slip_l1': -1, 'seams': -1, 'fit_phase': -1, 'fit_normal': -1, 'fit_density': -1}
 # tiers from the validation against GT (scripts/univ/uqa_validate.py, 6 checkpoints x 44 wbench core boxes, 2026-11-12; DESIGN.md): the
 # share of same-box checkpoint pairs whose metric difference has the GT p05x difference's sign. jumps 0.77 (ids 0.60): primary. h1 /
 # gap_void / on_pap / contrast 0.61-0.64 (ids ~0.5): secondary. nrm_deg 0.25 (inverted: smoother normals = worse fits, over-smoothing),
 # sp_cv 0.49, nrm30 0.59 but -0.09 pooled: info only (no win count). rv / ink / fibre / fit-residual metrics: not validated yet (no heads
-# on the kept fits).
+# on the kept fits). rv_agree: no win count (11-18, eval audit #19: 0.486 on the e2e chain box, Paris 4, try6-2357: at 9.6 um the rv head marks
+# the sheet on both faces, so the side test carries no information; unvalidated, never gate on it).
 TIER = {'jumps': 'primary', 'h1': 'secondary', 'gap_void': 'secondary', 'on_pap': 'secondary', 'contrast': 'secondary', 'nrm_deg': 'info', 'sp_cv': 'info',
         'nrm30': 'info'}
 

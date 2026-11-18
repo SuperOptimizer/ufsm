@@ -17,7 +17,8 @@ Metrics (one tab row, header first, -> OUTDIR/uqa.tsv; a PNG of the mid-z slice 
   jumps_n    share of grid steps whose W step differs from the next by > 0.25 turn (tears; packed sheets pass)  lower (unvalidated)
   nrm_deg    median angle between the sheet normals (grad W) of neighbouring grid points;  nrm30  share > 30 deg   lower = smooth
   rv_agree   (RV) share of confident rv voxels (|rv - 128| > 32) in the band whose side agrees with the phase: recto on the inner face
-             (frac W just below phi: W grows outward), 0.5 = no relation, < 0.5 = the convention inverted          higher
+             (frac W just below phi: W grows outward), 0.5 = no relation, < 0.5 = the convention inverted          UNVALIDATED
+             (11-18: 0.486 on a Paris 4 box, try6-2357: the rv head is symmetric across the sheet at 9.6 um; info only, no gate)
   ink_air    (INK) share of ink (> 127) voxels off papyrus;  ink_band  share of ink voxels within the sheet band +- 0.15     lower / higher
 """
 import os, sys
