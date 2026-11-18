@@ -6,7 +6,8 @@
    window's own normalisation is; occupancy = the share of CT voxels > thr in the window (the CT array at window coordinates / ct-div:
    CT level 5 against level-2 windows = 8). Prints corr(D, occupancy) (Pearson and rank) and D by occupancy bin. With --boxes (the GT box
    list: name scroll z y x dz dy dx ..., window coordinates) and --arm NAME=DIR (gtboxes.sh's per-box output dir: *.tsv rows "name voxels
-   ids ..."): each box's window (the most interior overlap), per arm corr(ids, D) / corr(ids, interior occupancy), and per arm vs the
+   ids ..."): each box's window (the most interior overlap), per arm corr(ids, D) / corr(ids, interior occupancy) / corr(ids, D | occupancy)
+   (the partial correlation: does D predict ids beyond occupancy), and per arm vs the
    first one the paired difference and its correlation with D and occupancy. */
 #include "optcheck.h"
 #include "store.h"
@@ -34,6 +35,10 @@ static double gw_corr(const double *a, const double *b, int n) {
     ma /= k; mb /= k; double sab = 0, saa = 0, sbb = 0;
     for (int i = 0; i < n; i++) if (isfinite(a[i]) && isfinite(b[i])) { const double x = a[i] - ma, y = b[i] - mb; sab += x * y; saa += x * x; sbb += y * y; }
     return saa > 0 && sbb > 0 ? sab / sqrt(saa * sbb) : NAN;
+}
+static double gw_pcorr(const double *a, const double *b, const double *c, int n) {   /* corr(a, b) with c partialled out (linear) */
+    const double ab = gw_corr(a, b, n), ac = gw_corr(a, c, n), bc = gw_corr(b, c, n);
+    return (ab - ac * bc) / sqrt((1 - ac * ac) * (1 - bc * bc));
 }
 static const double *gw_key; static int gw_cmpi(const void *a, const void *b) { const double x = gw_key[*(const int *)a], y = gw_key[*(const int *)b]; return (x > y) - (x < y); }
 static void gw_rank(const double *v, double *r, int n) {   /* ranks with ties averaged */
@@ -164,8 +169,8 @@ int cmd_gnw_stats(int argc, char **argv) {
         printf("boxes: %d of %d scored in every arm (%d arms), median window coverage %.2f\n", m, nb, na, m ? gw_median(col, m) : NAN);
         for (int a = 0; a < na; a++) {
             double mean = 0; for (int k = 0; k < m; k++) { v[k] = B[sel[k]].ids[a]; mean += v[k] / m; }
-            printf("  %-8s ids mean %.4f: corr(ids, D) %+.3f (rank %+.3f), corr(ids, occ) %+.3f (rank %+.3f)\n", an[a], mean, gw_corr(v, Db, m), gw_rcorr(v, Db, m),
-                   gw_corr(v, Ob, m), gw_rcorr(v, Ob, m));
+            printf("  %-8s ids mean %.4f: corr(ids, D) %+.3f (rank %+.3f), corr(ids, occ) %+.3f (rank %+.3f), corr(ids, D | occ) %+.3f\n", an[a], mean, gw_corr(v, Db, m),
+                   gw_rcorr(v, Db, m), gw_corr(v, Ob, m), gw_rcorr(v, Ob, m), gw_pcorr(v, Db, Ob, m));
         }
         for (int a = 1; a < na; a++) {
             double mean = 0; int up = 0, dn = 0;
