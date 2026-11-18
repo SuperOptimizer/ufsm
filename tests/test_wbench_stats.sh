@@ -24,4 +24,12 @@ o=$(tail -c 32 $T/o.ckpt | od -An -tf4 | awk '{for (i = 1; i <= NF; i++) printf 
 head -c 60 $T/o.ckpt | grep -q '"step":20' || { echo "FAIL ckpt-avg header"; f=1; }
 { printf 'UFSM{"nlev":1,"nparams":3,"step":20,"extra":{}}\n'; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do printf "$three"; done; } > $T/c.ckpt
 $U ckpt-avg $T/o2.ckpt $T/a.ckpt $T/c.ckpt 2> /dev/null && { echo "FAIL ckpt-avg accepted another network"; f=1; }
+# --gn-ema / --l0-norm ema nets: the running statistics (ge_n / ge_run / l0_n / l0_run) differ per snapshot, the network does not (11-18)
+{ printf 'UFSM{"nlev":1,"gn_ema":1,"ge_n":10,"ge_warm":5,"ge_run":[0.5,1.5],"l0_n":3,"l0_run":[1],"nparams":2,"step":10,"extra":{}}\n'; for i in 1 2 3 4 5 6 7 8; do printf "$one"; done; } > $T/ga.ckpt
+{ printf 'UFSM{"nlev":1,"gn_ema":1,"ge_n":200,"ge_warm":5,"ge_run":[0.25,9.75],"l0_n":40,"l0_run":[2.5],"nparams":2,"step":20,"extra":{}}\n'; for i in 1 2 3 4 5 6 7 8; do printf "$three"; done; } > $T/gb.ckpt
+{ printf 'UFSM{"nlev":1,"gn_ema":1,"ge_n":200,"ge_warm":6,"ge_run":[0.25,9.75],"l0_n":40,"l0_run":[2.5],"nparams":2,"step":20,"extra":{}}\n'; for i in 1 2 3 4 5 6 7 8; do printf "$three"; done; } > $T/gc.ckpt
+$U ckpt-avg $T/go.ckpt $T/ga.ckpt $T/gb.ckpt 2> /dev/null || { echo "FAIL ckpt-avg refused snapshots that differ only in running statistics"; f=1; }
+o=$(tail -c 32 $T/go.ckpt | od -An -tf4 | awk '{for (i = 1; i <= NF; i++) printf "%g ", $i}'); [ "$o" = "2 2 2 2 3 3 3 3 " ] || { echo "FAIL ckpt-avg gn_ema values $o"; f=1; }
+head -c 80 $T/go.ckpt | grep -q '"ge_n":200' || { echo "FAIL ckpt-avg gn_ema header not the last input's"; f=1; }
+$U ckpt-avg $T/go2.ckpt $T/ga.ckpt $T/gc.ckpt 2> /dev/null && { echo "FAIL ckpt-avg accepted a different ge_warm"; f=1; }
 [ $f = 0 ] && echo "wbench-stats ok"; exit $f

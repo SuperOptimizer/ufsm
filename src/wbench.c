@@ -126,20 +126,34 @@ static long wb_hdr(FILE *f, char *line, size_t cap) {   /* reads "UFSM" + the he
     char mg[4]; if (fread(mg, 1, 4, f) != 4 || memcmp(mg, "UFSM", 4) || !fgets(line, (int)cap, f) || !strchr(line, '\n')) return -1;
     return ftell(f);
 }
+/* the network part of a header (up to "nparams") without the running statistics that change every step: "l0_n" / "ge_n" counts and
+   the "l0_run" / "ge_run" arrays (--l0-norm ema, --gn-ema nets: 11-18 try9's snapshots were refused as "not the same network") */
+static size_t wb_netkey(const char *h, size_t pre, char *o, size_t cap) {
+    static const char *const sk[] = {"\"l0_n\":", "\"ge_n\":", "\"l0_run\":[", "\"ge_run\":["};
+    size_t n = 0;
+    for (size_t i = 0; i < pre && n + 1 < cap;) {
+        int hit = -1; for (int k = 0; k < 4; k++) if (!strncmp(h + i, sk[k], strlen(sk[k]))) { hit = k; break; }
+        if (hit < 0) { o[n++] = h[i++]; continue; }
+        i += strlen(sk[hit]);
+        if (hit < 2) while (i < pre && h[i] != ',' && h[i] != '}') i++;   /* a number */
+        else { while (i < pre && h[i] != ']') i++; if (i < pre) i++; }    /* an array */
+    }
+    o[n] = 0; return n;
+}
 int cmd_ckpt_avg(int argc, char **argv) {
     int nin = 0; const char *in[256]; const char *out = argc > 2 ? argv[2] : nullptr;
     for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], opt_n("--arrays"))) { i++; continue; } if (nin < 256) in[nin++] = argv[i]; }
     const char *ar = wb_opt(argc, argv, "--arrays", "both"); const int both = strcmp(ar, "ema") != 0;
     if (!out || nin < 1 || (strcmp(ar, "ema") && strcmp(ar, "both"))) { fprintf(stderr, "usage: ufsm ckpt-avg OUT.ckpt IN1.ckpt [IN2.ckpt ...] [--arrays ema|both]\n"); return 2; }
-    enum { HL = UFSM_CHECKPOINT_HEADER }; static char h0[HL], h1[HL];   /* (mini ckpt audit #3: was 16 KiB, below every latent header) */ FILE *f[256]; long off[256]; size_t np = 0; long long sz = -1;
+    enum { HL = UFSM_CHECKPOINT_HEADER }; static char h0[HL], h1[HL], k0[HL], k1[HL];   /* mgpu: main (the ckpt-avg command, one thread). (mini ckpt audit #3: was 16 KiB, below every latent header) */ FILE *f[256]; long off[256]; size_t np = 0; long long sz = -1;
     for (int k = 0; k < nin; k++) {
         f[k] = fopen(in[k], "rb"); if (!f[k]) { fprintf(stderr, "ckpt-avg: cannot open %s\n", in[k]); return 1; }
         char *h = k ? h1 : h0; off[k] = wb_hdr(f[k], h, HL); if (off[k] < 0) { fprintf(stderr, "ckpt-avg: %s is not a ufsm checkpoint\n", in[k]); return 1; }
         const char *p = strstr(h, "\"nparams\":"); if (!p) { fprintf(stderr, "ckpt-avg: %s has no nparams\n", in[k]); return 1; }
         const size_t n = (size_t)atoll(p + 10), pre = (size_t)(p - h);
         fseek(f[k], 0, SEEK_END); const long long s = ftell(f[k]) - off[k]; fseek(f[k], off[k], SEEK_SET);
-        if (!k) { np = n; sz = s; }
-        else if (n != np || s != sz || strncmp(h0, h1, pre)) { fprintf(stderr, "ckpt-avg: %s is not the same network as %s\n", in[k], in[0]); return 1; }
+        if (!k) { np = n; sz = s; wb_netkey(h0, pre, k0, HL); }
+        else if (n != np || s != sz || strcmp(k0, (wb_netkey(h1, pre, k1, HL), k1))) { fprintf(stderr, "ckpt-avg: %s is not the same network as %s\n", in[k], in[0]); return 1; }
         if (k == nin - 1 && k) memcpy(h0, h1, HL);   /* the header of the last input */
     }
     if (sz < (long long)(2 * np * 4)) { fprintf(stderr, "ckpt-avg: truncated checkpoint\n"); return 1; }
