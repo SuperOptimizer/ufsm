@@ -2294,7 +2294,7 @@ int cmd_ink_audit(int argc, char **argv) {
     const char *tag = sopt(argc, argv, "--tag", "-"), *outp = sopt(argc, argv, "--out", nullptr), *hof = sopt(argc, argv, "--holdouts", nullptr);
     const int want_blk = sflag(argc, argv, "--blocks");
     if (c.ct_um <= 0 || c.level < 0 || c.level > 5 || Lp < 0 || Lp > 5 || stride < 1) { fprintf(stderr, "ink-audit: bad --ct-um / --level / --pred-level / --stride\n"); return 2; }
-    static int64_t reg[AU_MAXR][6]; int nreg = 0;
+    static int64_t reg[AU_MAXR][6]; int nreg = 0;   /* mgpu: main (ink-audit, one thread: the region table) */
     for (int i = 2; i + 1 < argc; i++) { if (strcmp(argv[i], opt_n("--region"))) continue; long long b[6];
         if (nreg >= AU_MAXR || sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) { fprintf(stderr, "ink-audit: --region z,y,x,nz,ny,nx (at most %d)\n", AU_MAXR); return 2; }
         for (int d = 0; d < 6; d++) reg[nreg][d] = b[d]; nreg++; }
@@ -2407,7 +2407,7 @@ int cmd_ink_audit(int argc, char **argv) {
         snprintf(p, sizeof p, "%s.hist.tsv", outp);
         if ((f = fopen(p, "w"))) { fprintf(f, "tag\tsplit\tkind\tclass\tcounts(0..255)\n");
             for (int sp = 0; sp < AU_SPN; sp++) for (int cl = 0; cl < 2; cl++) {
-                const uint64_t *H[3] = {A->ct[sp][cl], A->face[sp][cl], A->sc[sp][0][0][AU_S][cl]}; static const char *K[3] = {"ct_band", "face_off+128", "pred_max"};
+                const uint64_t *H[3] = {A->ct[sp][cl], A->face[sp][cl], A->sc[sp][0][0][AU_S][cl]}; static const char *K[3] = {"ct_band", "face_off+128", "pred_max"};   /* mgpu: debug (ink-audit report labels, read-only) */
                 for (int k = 0; k < (haveP ? 3 : 2); k++) { fprintf(f, "%s\t%s\t%s\t%s", tag, au_spn[sp], K[k], cl ? "ink" : "no"); for (int v = 0; v < 256; v++) fprintf(f, "\t%llu", (unsigned long long)H[k][v]); fputc('\n', f); } }
             fclose(f); }
         snprintf(p, sizeof p, "%s.iso.tsv", outp);
