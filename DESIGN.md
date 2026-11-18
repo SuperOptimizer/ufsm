@@ -34,6 +34,10 @@ k_dattn 7 %, k_dfc1x 6 %, k_tshuffle 4 %. ncu:
 Change: both at 2 stages (the K order is unchanged), and the 2-stage 128 x 64 at __launch_bounds__ minB 3 (94 registers). ncu, the same
 launches interleaved: 128 x 32 2.31-2.45 -> 1.94-1.96 ms (-17 %), 128 x 64 1.26 -> 1.06 ms (-16 %). conv_igemm over the wrap: 12.1-12.35 -> 11.2 s.
 The w035 map is byte-identical (0 of 39.4 M px; master against itself: 0). UFSM_XNET_NST32 / NST64=3: the 3-stage tiles.
+- **k_tshuffle8** (UFSM_XNET_TS8=0: the per-element k_tshuffle): the 2-D transposed conv's shuffle + bias 8 channels a thread (16-byte
+  loads / stores, the index decomposition once per 8 values; k_tshuffle's per-element 64-bit divisions were 4 % of reader3's kernels).
+  ncu 764 -> 324 us a launch. Pod (RTX PRO 4000), w035 at --batch 16: master, branch, master again: all outputs md5-identical.
+  test_xmx ts: byte-equal to k_tshuffle on 3 shapes (ragged, co 8 / 16 / 64).
 Tried: unrolling k_dattn's layer loops (a[] out of local memory) took 150 registers: 8.5 -> 13.3 ms. Not kept.
 
 ## Slab-fit kernels, step 1: fit_pool from tables, fit_loss2_list_k without its local arrays (2026-11-18, branch convkfit-20261118)

@@ -652,6 +652,19 @@ __global__ void k_tshuffle(const __half *g, const float *bias, __half *y, int n,
     }
 }
 
+/* k_tshuffle 8 channels a thread (co % 8 == 0): 16-byte loads and stores, the index decomposition once per 8 values; the same value per element
+   (fp16 + fp32 bias, rounded) (2026-11-18: k_tshuffle's per-element 64-bit divisions, 4 % of reader3's kernels) */
+__global__ void k_tshuffle8(const __half *g, const float *bias, __half *y, int n, int h, int w, int co) {
+    const int c8 = co / 8; const size_t total = (size_t)n * h * w * 4 * c8;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < total; i += (size_t)gridDim.x * blockDim.x) {
+        const int o8 = (int)(i % c8); size_t t = i / c8; const int ab = (int)(t % 4); t /= 4; const int x = (int)(t % w); t /= w; const int yy = (int)(t % h); const size_t nn = t / h;
+        const int a = ab >> 1, b = ab & 1;
+        uint4 v = *(const uint4 *)(g + i * 8); __half *hv = (__half *)&v;
+#pragma unroll
+        for (int k = 0; k < 8; k++) hv[k] = __float2half_rn(__half2float(hv[k]) + bias[o8 * 8 + k]);
+        *(uint4 *)(y + (((nn * 2 * h) + 2 * yy + a) * (size_t)(2 * w) + 2 * x + b) * co + o8 * 8) = v;
+    }
+}
 __global__ void k_tshuffle3(const __half *g, const float *bias, __half *y, size_t nd, int h, int w, int co) {
     /* g [nd][h][w][8][co] -> y [2 nd][2h][2w][co] (nd = n d: plane 2 (n D + z) + a = n 2D + 2z + a) */
     const size_t total = nd * h * w * 8 * co;
@@ -1451,6 +1464,8 @@ extern "C" xt xconv_fwd_gnin(const xconv *c, xt x, const float *gm, const float 
 extern "C" xt xconv_fwd_ln(const xconv *c, xt x, const xt *res, int act, const float *lnw, const float *lnb, float eps) {
     return conv_run(c, x, res, act | XA_LN, lnw, lnb, eps);
 }
+static int g_ts8 = -1;   /* UFSM_XNET_TS8=0: the 2-D transposed conv's shuffle per element (k_tshuffle); mgpu: env */
+extern "C" void xnet_set_ts8(int v) { g_ts8 = v; }
 extern "C" xt xconv_fwd(const xconv *c, xt x, const xt *res, int act) {
     if (!c->tconv) return conv_run(c, x, res, act);
     if (c->tconv == 2) {
@@ -1464,7 +1479,9 @@ extern "C" xt xconv_fwd(const xconv *c, xt x, const xt *res, int act) {
     xt g = conv_run(c, x, nullptr, XA_NONE);   /* [n][1][h][w][4 co] */
     const int co = c->co / 4; xt y = xt_new(x.n, x.d, 2 * x.h, 2 * x.w, co);
     const size_t total = (size_t)x.n * x.d * x.h * x.w * 4 * co;
-    k_tshuffle<<<nblk(total, 256) > 65535 * 8 ? 65535 * 8 : nblk(total, 256), 256, 0, g_st>>>((const __half *)g.p, c->tbias, (__half *)y.p, x.n * x.d, x.h, x.w, co);
+    if (g_ts8 < 0) g_ts8 = getenv("UFSM_XNET_TS8") ? atoi(getenv("UFSM_XNET_TS8")) : 1;
+    if (g_ts8 && co % 8 == 0) k_tshuffle8<<<nblk(total / 8, 256) > 65535 * 8 ? 65535 * 8 : nblk(total / 8, 256), 256, 0, g_st>>>((const __half *)g.p, c->tbias, (__half *)y.p, x.n * x.d, x.h, x.w, co);
+    else k_tshuffle<<<nblk(total, 256) > 65535 * 8 ? 65535 * 8 : nblk(total, 256), 256, 0, g_st>>>((const __half *)g.p, c->tbias, (__half *)y.p, x.n * x.d, x.h, x.w, co);
     xt_free(&g);
     return y;
 }
