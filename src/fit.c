@@ -501,7 +501,7 @@ static double uw_pdv(const fit_fields *f, size_t i, double a0) {
 static double g_uw_ang[65536]; static pthread_once_t g_uw_ang_once = PTHREAD_ONCE_INIT;
 static void uw_ang_init(void) { for (int p = 0; p < 256; p++) for (int s = 0; s < 256; s++) g_uw_ang[p << 8 | s] = atan2((s - 128) / 127.0, (p - 128) / 127.0); }
 /* the GPU pass's per-byte-pair tables (uw_accum_snap_gpu): uw_q's conf and uw_rec's ang / (2 pi), the same expressions on the host */
-static double g_uw_gtab[2 * 65536]; static pthread_once_t g_uw_gtab_once = PTHREAD_ONCE_INIT;
+static double g_uw_gtab[2 * 65536]; static pthread_once_t g_uw_gtab_once = PTHREAD_ONCE_INIT;   /* mgpu: process (written once under pthread_once, constant after) */
 static void uw_gtab_init(void) {
     for (int p = 0; p < 256; p++) for (int s = 0; s < 256; s++) {
         const double mc = (p - 128) / 127.0, ms = (s - 128) / 127.0;
