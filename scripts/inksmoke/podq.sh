@@ -64,7 +64,7 @@ arm() {   # arm A | B
   local a=$1; done_ arm$a && return 0
   python3 -I $D/mkarms.py $K/inkgt/sources-H0.json $K/teach $K/kit/holdouts-20261118.json $K/arms $a > $K/arms/mkarms$a.log 2>&1 || die "mkarms $a (log $K/arms/mkarms$a.log)"
   say "arm $a: training $STEPS steps"
-  ( R=$K/runs U=$U INIT=$K/ckpt/u1-13000-w.ckpt GPU=$GPU LOCK=$LOCK RELAUNCH=3 WORKERS=${WORKERS:-1} SLOTS=${SLOTS:-2} bash $D/trainarm.sh $a $K/arms/sources-$a.json ) > $K/runs/arm$a.out 2>&1 &
+  ( R=$K/runs U=$U INIT=$K/ckpt/u1-13000-w.ckpt LATB=$K/kit/klt1.lcb GPU=$GPU LOCK=$LOCK RELAUNCH=3 WORKERS=${WORKERS:-1} SLOTS=${SLOTS:-2} bash $D/trainarm.sh $a $K/arms/sources-$a.json ) > $K/runs/arm$a.out 2>&1 &
   local tp=$! st=0
   while kill -0 $tp 2>/dev/null; do
     st=$(awk '/^step +[0-9]+ / {s = $2} END {print s + 0}' $K/runs/inksmoke$a.log 2>/dev/null)
