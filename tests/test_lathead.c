@@ -23,6 +23,13 @@ int main(void) {
     uint8_t *ctd = nn_malloc(w3), *d0 = nn_malloc(sh3), *d1 = nn_malloc(sh3); void *lgd = nn_malloc(COUT * cv * 2), *lgd32 = nn_malloc(COUT * cv * 4), *xd = nn_malloc(w3 * 2), *pl = nn_malloc(2 * w3 * 2); float *pd = nn_malloc(NP * 4);
     nn_h2d(ctd, ct, w3); nn_h2d(lgd, lg, COUT * cv * 2); nn_h2d(lgd32, lgf, COUT * cv * 4); nn_h2d(pd, pf, NP * 4);
     nn_lat_ct_x(ctd, WW, 0, WW, mean, isd, xd);
+    {   /* nn_lat_ct_x (lat_ct_x8_k, 8 voxels a thread; and a z range at an odd offset) against the host expression */
+        uint16_t *xh = malloc(w3 * 2); nn_sync(); nn_d2h(xh, xd, w3 * 2); size_t nd = 0;
+        for (size_t i = 0; i < w3; i++) { const _Float16 r = (_Float16)(((float)ct[i] - mean) * isd); uint16_t rb; memcpy(&rb, &r, 2); nd += rb != xh[i]; }
+        nn_lat_ct_x(ctd, WW, 3, 5, mean, isd, pl); nn_sync(); nn_d2h(xh, pl, (size_t)5 * WW * WW * 2);
+        for (size_t i = 0; i < (size_t)5 * WW * WW; i++) { const _Float16 r = (_Float16)(((float)ct[(size_t)3 * WW * WW + i] - mean) * isd); uint16_t rb; memcpy(&rb, &r, 2); nd += rb != xh[i]; }
+        printf("test_lathead: nn_lat_ct_x: %zu of %zu values differ from the host\n", nd, w3 + (size_t)5 * WW * WW); fails += nd != 0; free(xh);
+    }
     uint8_t *h0 = malloc(sh3), *h1 = malloc(sh3), *comp[2][3] = {{nullptr}};   /* comp: the composition's bytes per head with the stem */
     static const struct { const char *name; int c0, c1, sb0, sb1, s0, s1; } T[3] = {{"rv 11+12", 11, 12, -1, -1, 4, 5}, {"phase 0", 0, -1, 16, -1, 0, -1}, {"plain 3", 3, -1, -1, -1, -1, -1}};
     const int oz = 20, oy = -10, ox = 3;   /* window voxel v -> shard voxel o + v */

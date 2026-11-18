@@ -20,6 +20,9 @@ eligible warps a scheduler.
 - The same chains (bias, ci in order, act_ab on the same decoded value): test_headz now compares the kernels bit for bit. It also gained
   96- and 48-channel level-0 cases (three full MX blocks; one full block and a tail). The trainer's head forward uses the same launcher,
   so it is byte-identical there too.
+- **lat_ct_x8_k** (UFSM_LAT_CTX8=0 the old kernel; branch convkct-20261117): the guided head's z-scored CT planes at 8 voxels a thread
+  (8-byte loads, 16-byte stores), the same expression. ncu had lat_ct_x_k at ~270 GB/s with one byte a thread. Fields 0332 640: 6.2 ->
+  4.75 ms a window, 0 data files differ; test_lathead checks it against the host expression.
 
 ## reader3 ink-ext: the depth-fusion conv streamed over depth, conv_igemm at 2 blocks an SM (2026-11-17, branch convkx-20261117)
 

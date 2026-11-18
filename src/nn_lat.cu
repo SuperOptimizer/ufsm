@@ -556,9 +556,21 @@ __global__ void lat_ct_x_k(const uint8_t *ct, size_t n, float mean, float isd, f
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i < n) x[i] = __float2half(((float)ct[i] - mean) * isd);
 }
+/* 8 voxels a thread (8-byte loads, 16-byte stores; the same expression per voxel): ncu 0332 640 had lat_ct_x_k at ~270 GB/s with one
+   byte a thread */
+__global__ void lat_ct_x8_k(const uint2 *ct, size_t n8, float mean, float isd, uint4 *x) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= n8) return;
+    const uint2 v = ct[i]; const uint8_t *b = (const uint8_t *)&v; uint4 o; f16 *h = (f16 *)&o;
+#pragma unroll
+    for (int k = 0; k < 8; k++) h[k] = __float2half(((float)b[k] - mean) * isd);
+    x[i] = o;
+}
 extern "C" void nn_lat_ct_x(const uint8_t *ct, int W, int z0, int nz, float mean, float isd, void *x) {
-    const size_t hw = (size_t)W * W, n = (size_t)nz * hw;
-    lat_ct_x_k<<<nblk(n, 256), 256>>>(ct + (size_t)z0 * hw, n, mean, isd, (f16 *)x); KCHECK();
+    const size_t hw = (size_t)W * W, n = (size_t)nz * hw; const uint8_t *c = ct + (size_t)z0 * hw;
+    static int v8 = -1; if (v8 < 0) v8 = getenv("UFSM_LAT_CTX8") ? atoi(getenv("UFSM_LAT_CTX8")) : 1;   /* 0: lat_ct_x_k (A/B); mgpu: env */
+    if (v8 && n % 8 == 0 && !((uintptr_t)c & 7) && !((uintptr_t)x & 15)) { lat_ct_x8_k<<<nblk(n / 8, 256), 256>>>((const uint2 *)c, n / 8, mean, isd, (uint4 *)x); KCHECK(); return; }
+    lat_ct_x_k<<<nblk(n, 256), 256>>>(c, n, mean, isd, (f16 *)x); KCHECK();
 }
 extern "C" void nn_lat_place_rvg(const void *lg, int lh16, int nb, int d, int h, int w, const uint8_t *ctg, float mean, float isd, const uint8_t *ct, const uint32_t *bits,
                                  int iso, int hz, int halo, int oz, int oy, int ox, int ez, int ey, int ex, int shard, uint8_t *dsh) {
