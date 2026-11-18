@@ -1269,7 +1269,7 @@ static void cellq_apply(const void *ld, int lh16, int C, int d, int h, int w, in
 
 /* the run's lazily sized buffers (the first window's sizes): file scope so that predict --boxes resets them between boxes (the device ones
    go back to nn_pool with the rest of the box's memory) */
-static struct { uint8_t *dsc; float *dcy, *dyt; uint8_t *ctsave; void *gsl, *tacc; } g_ps;
+static struct { uint8_t *dsc; float *dcy, *dyt; uint8_t *ctsave, *cttta; void *gsl, *tacc; } g_ps;
 static void pred_reset_statics(void) {
     free(g_ps.dsc); free(g_ps.dcy); free(g_ps.dyt); g_ps = (typeof(g_ps)){0};
     g_pmem = nullptr; g_pmv = 0; memset(g_pmo, 0, sizeof g_pmo);
@@ -2316,7 +2316,7 @@ static int predict_one(int argc, char **argv) {
         }
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
         /* --tta on a latent-grid net: the direct cell input, the fit fields from the whole-window planes (fzs is off with --tta), cube windows */
-        tta_lat = half == 3 && latin && ffd && ct_shared && Wz == W && !(W % 4) && (!cfg.lat_guide || cfg.lat_guide == 64) && !cfg.fstem && !degrade && !auxz && !lat_store && !fzs;
+        tta_lat = half == 3 && latin && ffd && Wz == W && !(W % 4) && (!cfg.lat_guide || cfg.lat_guide == 64) && !cfg.fstem && !degrade && !auxz && !lat_store && !fzs;
         if (tta > 1 && !tta_lat && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) {
             fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs) or a latent-grid net's direct cell input with fit fields and cube windows"
                             " (latent: half %d latin %d fit fields %d ct_shared %d window %d x %d lat_guide %d fstem %d)\n", half, latin, ffd != nullptr, ct_shared, Wz, W, cfg.lat_guide, cfg.fstem); return 2; }
@@ -2983,7 +2983,10 @@ static int predict_one(int argc, char **argv) {
             /* --tta: the CT window kept for the augmented passes (g_ps: reset per box) */
             if (tta > 1 && !g_ps.ctsave) { g_ps.ctsave = nn_malloc(w3); g_ps.dyt = malloc(2 * (size_t)W * sizeof(float)); if (!g_ps.ctsave || !g_ps.dyt) { fprintf(stderr, "predict: no memory for --tta\n"); return 1; } }
             if (tta > 1) nn_d2d(g_ps.ctsave, ctd, w3);
-            tta_ctx TC = {.u = u, .ctd = ctd, .ctsave = g_ps.ctsave, .mean = (float)mean, .isd = (float)(1.0 / sd), .dyo = dyo, .dxo = dxo, .dyt = g_ps.dyt, .dyd = dyd,
+            /* (a latent net with its own CT buffer (not the forward's scratch): the passes transform into a second one, so ctd keeps the
+               window the accumulators read the CT mask from) */
+            if (tta > 1 && tta_lat && !ct_shared && !g_ps.cttta && !(g_ps.cttta = nn_malloc(w3))) { fprintf(stderr, "predict: no memory for --tta\n"); return 1; }
+            tta_ctx TC = {.u = u, .ctd = tta_lat && !ct_shared ? g_ps.cttta : ctd, .ctsave = g_ps.ctsave, .mean = (float)mean, .isd = (float)(1.0 / sd), .dyo = dyo, .dxo = dxo, .dyt = g_ps.dyt, .dyd = dyd,
                                 .axis = ax.n > 0 ? (int)radial_sign : 0, .xs = xs, .h16 = h16, .D = Wz, .W = W, .nch = ffd ? (tta_lat && cfg.lat_guide == 64 ? 11 : cfg.cout) : 1, .ch_normal = ffd ? ff_nrm : -1,
                                 .lat = tta_lat, .lguide = cfg.lat_guide, .cout = cfg.cout, .skw = skip_empty && half == 3 && gpath && !lat_store && !lvq, .skip_nl = skip_nl, .skip_thr = skip_thr,
                                 .skip_margin = skip_margin, .x2 = x2, .lgfp = &lgf, .xn = xn};   /* (without fit fields the head computes only the written, scalar channel; lgf: allocated at the first window's forward) */
