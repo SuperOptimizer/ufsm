@@ -634,6 +634,10 @@ int cmd_count_field(int argc, char **argv) {
     if (strcmp(cmode, "w") && strcmp(cmode, "phase") && strcmp(cmode, "mix") && strcmp(cmode, "pmax")) { fprintf(stderr, "count-field: --conf w, phase, mix or pmax\n"); return 2; }
     double tr0 = 0, tr1 = 0; if (*cf_opt(argc, argv, "--trust", "") && sscanf(cf_opt(argc, argv, "--trust", ""), "%lf,%lf", &tr0, &tr1) != 2) { fprintf(stderr, "count-field: --trust C0,C1\n"); return 2; }
     if (R < 0 || Rz < 0) { fprintf(stderr, "count-field: --R / --Rz >= 0\n"); return 2; }
+    /* --mf-w K (the unroll's MFREF, DESIGN 2026-11-18 "counting around merges"): every field load scales pc ps w by 1 - K mf / 255 (the
+       fields' merge-flag plane), so the counts route around merged sheets */
+    const double mfw = opt_atof("--mf-w", cf_opt(argc, argv, "--mf-w", "0"));
+    if (mfw > 0) { char mp[1400]; snprintf(mp, sizeof mp, "%s/mf/zarr.json", in); if (access(mp, F_OK)) { fprintf(stderr, "count-field: --mf-w needs %s (ufsm merge-flag)\n", mp); return 2; } fit_fields_mf_weight(mfw); }
     fit_fields_buf g; if (fit_fields_load(in, 0, 0, 0, &g)) { fprintf(stderr, "count-field: cannot load %s\n", in); return 1; }   /* geometry + the axis table */
     const int D = g.shape[0], H = g.shape[1], W = g.shape[2], na = (int)(D * g.h) + 1; const size_t n = (size_t)D * H * W, HW = (size_t)H * W;
     const double h = g.h;

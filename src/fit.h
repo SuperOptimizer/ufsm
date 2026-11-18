@@ -311,6 +311,7 @@ int fit_fields_material_box(const char *dir, int margin, int align, int crop[4],
 /* later unpooled whole-box loads (fit_fields_load / _stream with pool 1) read only the cells y in [oy, oy + H), x in [ox, ox + W) of
    each row (their fit_fields carry oy ox H0 W0: positions stay the box's), the w plane copied from wbox (or read when null); on = 0 off */
 void fit_fields_crop(int on, int oy, int ox, int H, int W, const uint8_t *wbox);
+void fit_fields_mf_weight(double k);   /* K > 0: later fit_fields_load calls scale pc ps w by 1 - K mf / 255 (the fields' merge-flag plane mf; count-field --mf-w) */
 void fit_fields_skip_planes(int mask);   /* optional planes later fit_fields_load calls leave out (bit 0 the recto plane r, bit 1 the winding mod 4 planes dz dy dx dq, bit 2 the normals, bit 3 sp, bit 4 the phase pc ps (unpooled loads); default none): RAM and reads for fits whose terms do not read them */
 void fit_fields_recycle(int on);   /* 1: fit_fields_load_ex's prev without shared rows lends its planes to the new block (zarr fields: same bytes, no fresh pages) */
 int fit_fields_zchunk(const char *dir, long long *zoff);   /* the z rows per chunk of the fields' arrays (zarr; 128 for raw) and the box's z offset in them (*zoff; 0 raw): loads of chunk-aligned rows decode each chunk once */

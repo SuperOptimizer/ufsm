@@ -6,6 +6,43 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## merge-flag on the GPU, count-field --mf-w: 1667 in 34 s on the shared desk card (was 716 s on the pod's CPUs) (2026-11-18, branch mfgpu-20261118)
+
+MFREF put merge-flag in front of the ref, and the pod e2e measured it at 716 s (6904 CPU s; +454 s of critical path even in the
+background). perf on the CPU version: 71 % box3 (float box means with double prefix sums, strided y / z passes), 14 % mf_block, 5 %
+atan2f; decode 0.9 %, encode 0.6 %. So the work is the filters, and the I/O (4 planes in, 1 out) is small.
+
+**Exact integer sums (src/mf_core.h).** The 12 box sums behind the three features are integers: amp_q = round(65536 |(pc, ps)| / 127)
+on material, the material count, sp and its known count (9-box), sp / known (5-box), and the neighbour products' numerators
+(pc1 - 128)(pc0 - 128) + (ps1 - 128)(ps0 - 128) and the cross term per axis (5-box; the 127^2 cancels in atan2). Sums of integers are
+the same in any order, so CPU threads, GPU tiles and slab borders agree exactly; only mf_final's few double operations per cell remain.
+The CPU mf_block now uses the same sums (int64 prefix lines): against the previous float version, 3634 of 932 M interior cells differ,
+178 by more than 1 (atan2 near +-pi of a near-zero imaginary sum), 13 threshold flips at 179: the eval / GT numbers above stand.
+
+**GPU (src/nn_mf.cu).** Tiles of 32 output rows x YS columns (full x; YS from --gpu-mem) with a 4-cell halo in z / y. Three kernels,
+4 sums each (G0: the r 4 sums; G1: sp / known r 2 and the z products; G2: the y / x products + the final), each a 32 x 8 block
+column sliding along z: per plane the bytes of its (8 + 2r + 1) x (32 + 2r + 1) region into shared memory (fetched into registers one
+plane ahead), the cell values, x sums, y sums (the plane's box face), and the z window as a running sum over a register ring of the
+last 2r + 1 faces. G0 / G1 store their 8 sums, G2 adds its 4 and writes mf: in fp32, and where 255 p lands within a bound on fp32's
+error of a rounding edge (~2.5 % of material cells), the cell goes to a list finished by mf_final in fp64 (the CPU's arithmetic).
+ncu (32 x 722 x 1616 tile, card shared): G0 10.8 ms, G1 6.9, G2 17.6 before the fp32 final (fp64 pipe 62 % busy: divergent fallback
+in 73 % of warps), 4x less after it. Host: three overlapped stages (reader thread for slab k + 1, the GPU for slab k, a writer thread
+encoding slab k - 1's 128^3 shards a thread per shard: the old serial shard loop was 5 s per 384 rows), page-locked plane / mf
+buffers (2.4 GB for 1667), the field planes decoded on the same GPU (UFSM_GPU_DECODE, --gpu-decode 1 default).
+
+| 1667 q2 (4635 x 1568 x 1616, 3.97 G material cells) | wall | CPU s |
+|---|---|---|
+| CPU (pod, 13 threads, TH / 2) | 716 s | 6904 |
+| CPU (desk, 16 lowprio threads, + --weighted) | 689 s | |
+| GPU (desk card 1 shared with try9 + others at 57-100 % util, load 45) | **34 s** (kernels 15.6, GPU stage 21.7, waits on reads 9.3) | 175 |
+
+The GPU's mf equals the CPU's byte for byte: 973 M cells (1667 rows 2048-2432), and test_mergeflag --gpu (raw, crop, zarr fields with
+2 x 5 tiles). The whole-1667 flagged share 0.1398 = the CPU's.
+
+**count-field --mf-w K.** fit_fields_load scales pc ps w by 1 - K mf / 255 as it reads (fit_fields_mf_weight; the mf plane of the
+same fields, zarr), so the ref needs no weighted copy (the 3 planes the --weighted pass re-encoded at the source q: ~3x the mf write).
+test_mergeflag: count-field --mf-w 1 on the fields gives byte-identical model files to count-field on merge-flag --apply's planes
+(lossless test planes), and refuses fields without mf. On 1667 q2 (lossy re-encode vs exact weights): GT_PLACEHOLDER
 ## Train vs predict parity: the same function up to fp16 rounding, except the EMA default and the window context (2026-11-18, branch parity-20261118)
 
 Audit (fix0332, lead + user): does predict run the function that training validates and trains? One fixed window per scroll (1667 GT
@@ -77,13 +114,10 @@ reproduces the pod's to the printed digit: model coherence 0.2286, closing error
 - **Gate (all-voxel joined ids up on the 54 boxes, drift not up): PASS.** Paris 4: pending (needs a whole-scroll P4 field set + run).
 - The slabs, join and check are unchanged (master settings: slab overlap 8, FITLANES 1 on card 1, < 4 GB); only the ref's input changed.
 
-**Unroll (MFREF=1, the default):** mflag runs in the foreground right after rectosp with all threads and writes both mf and fields/mfw
-(`merge-flag F --weighted fields/mfw`, one pass); the ref's count-field reads fields/mfw (reff), the slabs read $F; refstream (pass 1
-behind the predict) is off under MFREF, and a pool cache is used only for unweighted fields; CLEAN removes fields/mfw. A failed mflag
-leaves the ref on $F (DEFAULTED line). MFREF=0 restores the background mflag (no wall). Cost on the critical path: the mflag pass,
-11.5 min on 16 desk threads under lowprio beside try9 (1667 q2, 4.4 GB RSS; the same evidence factor 0.8050 as --apply);
-on the pod's idle CPUs expected ~5-7 min. test_mergeflag: --weighted equals --apply byte for byte on zarr fields, the scaling, the links; test_podscripts: the
-ref's inputs, the foreground order, refstream off, CLEAN.
+**Unroll (MFREF=1, the default):** first as fields/mfw written by `merge-flag --weighted` (a019de5a); replaced the same day (above) by
+count-field --mf-w 1: the weighting inside every field load, no weighted copy written. mflag runs in the foreground right after rectosp,
+the ref's count-field gets --mf-w 1 once mflag is done, the slabs read $F; refstream (pass 1 behind the predict) is off under MFREF, a
+pool cache only for unweighted runs. A failed mflag leaves the ref unweighted (DEFAULTED line). MFREF=0: the background mflag (no wall).
 
 ## merge-flag: where the net merges touching sheets, flagged from its own fields; the unroll exports those parts as uncertain (2026-11-18, branch mergeflag-20261118)
 

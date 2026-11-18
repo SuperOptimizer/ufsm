@@ -29,7 +29,7 @@
 #           DEMOD=1 (off): no slab fits; join = cf-demod --out of the ref (the ref's integers, the phase's sub-turn; DEMODR nodes)
 #           with GTBOXES also the joined model's confident part (mf < MFTHR) and the uncertain share of the GT voxels (qa/gtboxes-joined-conf)
 #   mflag   -> rectosp (MFLAG=1 default, MFTHR 179): merge-flag, plane mf in the fields (the cells where the net's phase merges touching
-#           sheets); MFREF=1 (default): before the ref, which counts on fields/mfw (that evidence down-weighted); MFREF=0: in the background;
+#           sheets); MFREF=1 (default): on the GPU before the ref, which counts with that evidence down-weighted (--mf-w); MFREF=0: background;
 #           check's GT split, snap's qa/wrapmf.tsv and perwrap's <w>_mf.tif wait for it
 #   wraps   -> check: ufsm wraps (.sfc, step 4, --zr from scrolls.tsv, --min-cm2, --col-r p90)
 #   trim    -> wraps: from both ends, wraps beyond the wrap-check table, with collapsed gaps (rnet_med < RNETMIN 0.6) or near-empty (on-papyrus
@@ -249,20 +249,22 @@ mstage() {
 upto() { [ "${UPTO:-}" = "$1" ] && { [ "$DRY" = 1 ] && echo "(UPTO=$1: stop here)" || log "unroll: UPTO=$1 reached: stopping (re-run without UPTO for the rest)"; wait; exit 0; }; return 0; }
 # mflag (MFLAG=1, the default; src/mergeflag.h, DESIGN 2026-11-18 "merge-flag"): the fields' cells where the net's phase runs one cycle
 # over several touching sheets (phase vs density turn count, phase confidence; GT-fitted), plane mf in $F (CLEAN keeps it).
-# MFREF=1 (the default since 11-18): the ref counts on the fields with that evidence down-weighted (merge-flag --weighted fields/mfw:
-# pc ps w x (1 - mf / 255)), so counts propagate around merged regions instead of through them: 1667 q2 joined GT ids 0.8606 -> 0.9129
+# MFREF=1 (the default since 11-18): the ref counts with that evidence down-weighted (count-field --mf-w 1: every field load scales
+# pc ps w by 1 - mf / 255), so counts propagate around merged regions instead of through them: 1667 q2 joined GT ids 0.8606 -> 0.9129
 # (+0.052 [0.027, 0.081], 41 of 54 boxes up), ref 0.8388 -> 0.8896, z drift body 0.73 -> 0.56 turns. mflag then runs in the foreground
-# before the ref on all threads (1667: ~9 min on 12 desk threads); the slabs still read $F. A failed mflag: the ref on $F (DEFAULTED).
+# before the ref, on the GPU (merge-flag --gpu 0, src/nn_mf.cu: 1667 34 s on the shared desk card vs 716 s on the pod's CPUs; the CPU
+# path if the GPU has no room, DEFAULTED); the slabs read $F unweighted. A failed mflag: the ref unweighted (DEFAULTED).
 # MFREF=0: mflag in the background beside ref / slabs (no wall). Its consumers wait for it (mfready): the GT split (check),
-# qa/wrapmf.tsv (snap, before CLEAN), <wrap>_mf.tif (perwrap). MFTH: its threads (default TH; TH / 2 in the background).
+# qa/wrapmf.tsv (snap, before CLEAN), <wrap>_mf.tif (perwrap). MFTH: its CPU threads (default TH; TH / 2 in the background);
+# MFGPUMEM: its GPU tile memory (GB, default 2; plus ~4 x 136 rows x 4 planes of page-locked host memory).
 mfref() { [ "${MFLAG:-1}" = 1 ] && [ "${MFREF:-1}" = 1 ]; }
 mflag() { local th=${MFTH:-$(mfref && echo $TH || echo $(( (TH + 1) / 2 )))}
-  X $O/logs/mflag.log $U merge-flag $F --thr ${MFTHR:-179} --threads $th $(mfref && echo --weighted $O/fields/mfw) &&
-    { [ "$DRY" = 1 ] || log "mflag: $(grep '^merge-flag:' $O/logs/mflag.log | tail -1)$(mfref && echo "; $(grep '^merge-flag --weighted:' $O/logs/mflag.log | tail -1 | sed 's/^merge-flag //')")"; }; }
+  X $O/logs/mflag.log $U merge-flag $F --thr ${MFTHR:-179} --threads $th --gpu ${MFGPU:-0} --gpu-mem ${MFGPUMEM:-2} &&
+    { [ "$DRY" = 1 ] || log "mflag: $(grep '^merge-flag:' $O/logs/mflag.log | tail -1)$(grep -h '^DEFAULTED' $O/logs/mflag.log | head -1 | sed 's/^/; /')"; }; }
 mfbg() { [ "${MFLAG:-1}" = 1 ] || return 0; rm -f $O/state/mflag.failed
-  if mfref; then stage mflag mflag || { touch $O/state/mflag.failed; log "mflag: failed (logs/mflag.log); DEFAULTED: the ref counts on $F unweighted"; }; return 0; fi
+  if mfref; then stage mflag mflag || { touch $O/state/mflag.failed; log "mflag: failed (logs/mflag.log); DEFAULTED: the ref counts unweighted"; }; return 0; fi
   ( stage mflag mflag || { touch $O/state/mflag.failed; log "mflag: failed (logs/mflag.log); no uncertain mask, warn only"; } ) & MFP=$!; [ "$DRY" = 1 ] && wait $MFP; return 0; }
-reff() { if mfref && { [ "$DRY" = 1 ] || { done_ mflag && [ -e $O/fields/mfw/pc/zarr.json ]; }; }; then echo $O/fields/mfw; else echo $F; fi; }   # (the ref's input fields)
+mfw() { if mfref && { [ "$DRY" = 1 ] || { done_ mflag && [ -e $F/mf/zarr.json ]; }; }; then echo "--mf-w 1"; fi; }   # (the ref's count-field weighting flag)
 mfready() { [ "${MFLAG:-1}" = 1 ] && waitfor mflag; }   # (0: the mask is there; 1: MFLAG=0 / mflag failed / STOP)
 waitfor() { [ "$DRY" = 1 ] && { echo "    (waits for state/$1.done)"; return 0; }; while ! done_ $1; do stopped && return 1; [ -e $O/state/$1.failed ] && return 1; sleep 30; done; }
 
@@ -450,7 +452,7 @@ ref() {
   sds=$([ -n "${SPIRALDIR:-}" ] && echo env || { [ -n "$sd" ] && echo tsv || echo gate; })
   local cal=; [ "${CTCAL:-0}" = 1 ] && cal="--ct-cal $O/ct.cal"
   # the pass-1 sums streamed behind the fields predict (fields(): REFSTREAM): the same sums, so only the solve and model pass run here
-  local pc=; [ "$DRY" != 1 ] && [ -e $O/ref.pool.ok ] && [ "$(reff)" = $F ] && pc="--pool-cache $O/ref.pool --chunk-rows $(cat $O/ref.pool.ok)"
+  local pc=; [ "$DRY" != 1 ] && [ -e $O/ref.pool.ok ] && [ -z "$(mfw)" ] && pc="--pool-cache $O/ref.pool --chunk-rows $(cat $O/ref.pool.ok)"
   # DIRCOH=1 (ON by default since 2026-11-16; DIRCOH=0 refuses an unknown hand outright): measured (audit unroll #1, model-only solves): 1667
   # -1 0.1731 vs +1 0.0986 (the published hand, margin 0.075); Paris 4 +1 0.0072 vs -1 0.0062 (margin 0.001 < 0.05: REFUSED, never wrong):
   # where it cannot tell it refuses as before, so on is never worse. audit-unroll 3a: no env / tsv hand -> two LS solves, --dir +1 into REF.p and -1 into REF.m, each
@@ -460,7 +462,7 @@ ref() {
     local d c cp= cm=
     for d in p m; do
       [ "$DRY" = 1 ] || rm -rf $REF.$d
-      X $O/logs/ref.$d.log $U count-field $(reff) $O/cf.unused $(refpool) --dir $([ $d = p ] && echo 1 || echo -1) --iters 1200 --model $REF.$d \
+      X $O/logs/ref.$d.log $U count-field $F $O/cf.unused $(refpool) $(mfw) --dir $([ $d = p ] && echo 1 || echo -1) --iters 1200 --model $REF.$d \
         --threads $TH --mem-gb ${CFMEM:-24} $cal ${pc:---chunk-rows $(refcz)} || { log "ref: DIRCOH: the --dir $d solve failed (logs/ref.$d.log)"; return 1; }
       [ "$DRY" = 1 ] && continue
       c=$(grep -oE 'count-field: model coherence [0-9.]+' $O/logs/ref.$d.log | tail -1 | awk '{print $4}')
@@ -475,11 +477,11 @@ ref() {
     if type mset > /dev/null 2>&1; then mset spiral_dir "$(jq -r .dir $REF/model.json 2> /dev/null)"; mset spiral_dir_src "gate:coherence +1 $cp -1 $cm"; fi
     return 0
   fi
-  if [ -n "${REFCMD:-}" ]; then X $O/logs/ref.log $REFCMD $(reff) $REF $cal; else
-  X $O/logs/ref.log $U count-field $(reff) $O/cf.unused $(refpool) --iters 1200 --model $REF \
+  if [ -n "${REFCMD:-}" ]; then X $O/logs/ref.log $REFCMD $F $REF $cal; else
+  X $O/logs/ref.log $U count-field $F $O/cf.unused $(refpool) $(mfw) --iters 1200 --model $REF \
     --threads $TH --mem-gb ${CFMEM:-24} $cal ${pc:---chunk-rows $(refcz)}; fi && { [ "$DRY" = 1 ] || [ -e $REF/model.json ]; } ||
     { grep -q 'REFUSED' $O/logs/ref.log 2> /dev/null && log "ref: $(grep -o 'REFUSED.*' $O/logs/ref.log | tail -1 | cut -c1-220)"; return 1; }
-  [ "$DRY" != 1 ] && log "ref: $(grep -oE 'count-field: dir [+-]1 \([^)]*\)' $O/logs/ref.log | tail -1); fields $(reff)"
+  [ "$DRY" != 1 ] && log "ref: $(grep -oE 'count-field: dir [+-]1 \([^)]*\)' $O/logs/ref.log | tail -1)$([ -n "$(mfw)" ] && echo "; merge-flag weighted ($(mfw))")"
   [ "$DRY" != 1 ] && log "ref: chunk rows $(grep -hoE '[0-9]+ rows per chunk' $O/logs/ref.log $O/logs/refstream.log 2> /dev/null | tail -1 | awk '{print $1}') (REFCZ ${REFCZ:-512})$(grep -hq '^DEFAULTED: count-field chunk rows' $O/logs/ref.log $O/logs/refstream.log 2> /dev/null && echo ': DEFAULTED, see logs/ref.log')"
   # the run manifest (audit-unroll): the direction the ref used and where it came from (env / tsv / gate = count-field's own evidence)
   if [ "$DRY" != 1 ] && type mset > /dev/null 2>&1; then
@@ -843,7 +845,7 @@ snap() {
     if X $O/logs/wrapmf.log $U wrap-mf $wd --fields $F --thr ${MFTHR:-179} --tsv $O/qa/wrapmf.tsv; then [ "$DRY" = 1 ] || log "snap: $(grep '^wrap-mf:' $O/logs/wrapmf.log | tail -1)"
     else log "snap: wrap-mf failed (logs/wrapmf.log); warn only"; fi
   fi
-  [ "$DRY" = 1 ] || { [ "${CLEAN:-1}" = 1 ] && { find $F -mindepth 1 -maxdepth 1 ! -name fields.json ! -name mf -exec rm -rf {} +; rm -rf $O/fields/mfw; [ $F = $O/fields/$FNAME ] || find $O/fields/$FNAME -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; rm -rf $O/slabs/s???/fit; }; }
+  [ "$DRY" = 1 ] || { [ "${CLEAN:-1}" = 1 ] && { find $F -mindepth 1 -maxdepth 1 ! -name fields.json ! -name mf -exec rm -rf {} +; [ $F = $O/fields/$FNAME ] || find $O/fields/$FNAME -mindepth 1 -maxdepth 1 ! -name fields.json -exec rm -rf {} +; rm -rf $O/slabs/s???/fit; }; }
   return 0
 }
 strip() { local a=$STRIPARGS; [ -e $O/state/strip.args ] && a=$(cat $O/state/strip.args)

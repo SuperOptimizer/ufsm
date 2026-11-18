@@ -238,6 +238,7 @@ test_mgpu_lint                                 |              |     2 | python3 
 test_suite_kill                                |              |     2 | bash tests/test_suite_kill.sh
 test_ink_blend                                 |              |     4 | python3 tests/test_ink_blend.py
 test_mergeflag                                 |              |     3 | python3 tests/test_mergeflag.py
+test_mergeflag_gpu                             | gpu          |     5 | python3 tests/test_mergeflag.py --gpu
 test_img_gate                                  |              |     2 | python3 tests/test_img_gate.py
 test_seamless                                  |              |     6 | python3 tests/test_seamless.py
 test_cover_training                            | gpu2,l2      |    16 | python3 tests/test_cover_training.py

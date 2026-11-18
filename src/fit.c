@@ -1,6 +1,7 @@
 /* Winding fitter host side (src/fit.h): label-free prior per z knot (pitch from the spacing field, refined by the phase
    coherence of r / pitch - dir theta / 2 pi; offset = its argument), then Adam on delta (coarse to fine) and the knots. */
 #include "fit.h"
+#include "mf_core.h"
 #include "sysinfo.h"
 #include "fit_terms.h"
 #include "nn.h"
@@ -2603,6 +2604,8 @@ static int g_ct_planes = 3;   /* the CT planes fit_fields_load reads: bit 0 ct, 
 void fit_fields_ct_planes(int mask) { g_ct_planes = mask; }
 static int g_skip_planes;   /* optional planes fit_fields_load leaves out: bit 0 the recto plane, bit 1 the winding mod 4 planes */
 void fit_fields_skip_planes(int mask) { g_skip_planes = mask; }
+static double g_mfw;   /* mgpu: process (fit_fields_mf_weight: set once by count-field before its loads) */
+void fit_fields_mf_weight(double k) { g_mfw = k; }
 static struct { int on, oy, ox, H, W; const uint8_t *wbox; } g_crop;   /* fit_fields_crop (src/fit.h) */
 void fit_fields_crop(int on, int oy, int ox, int H, int W, const uint8_t *wbox) { g_crop.on = on && H > 0 && W > 0; g_crop.oy = oy; g_crop.ox = ox; g_crop.H = H; g_crop.W = W; g_crop.wbox = wbox; }
 /* fit_fields_recycle(1): a fit_fields_load_ex with a prev that shares no rows takes prev's planes (when they hold at least the new
@@ -2824,6 +2827,14 @@ int fit_fields_load_ex(const char *dir, int fz0, int fz1, int pool, fit_fields_b
             if (R.fail) return -1;
         }
         if (cside) core_mask(dir, &core, cside, org, h, b->um, shp[0], z0, nz, H, W, blk[0], blk[1], blk[9]);   /* the other side of the core: no data */
+        if (g_mfw > 0 && blk[9]) {   /* fit_fields_mf_weight: pc ps w x (1 - K mf / 255) where the net merges sheets (merge-flag --apply's arithmetic) */
+            if (!zarr) { fprintf(stderr, "fit: the merge-flag weighting needs zarr fields (%s)\n", dir); return -1; }
+            z3 *zm = z3_open(store_open(dir), "mf", nullptr); uint8_t *mf = zm ? malloc((size_t)nz * plane) : nullptr;
+            const int64_t o3[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n3[3] = {nz, H, W};
+            if (!zm || !mf || z3_read(zm, o3, n3, mf, fit_nthreads(16))) { fprintf(stderr, "fit: cannot read the mf plane of %s (merge-flag first)\n", dir); if (zm) z3_close(zm); free(mf); return -1; }
+            z3_close(zm);
+            mf_weight_rows(blk[0], blk[1], blk[9], mf, (size_t)nz * plane, g_mfw, 0, nullptr, nullptr); free(mf);
+        }
         if (pool == 1) {
             for (int g = 0; also && g < nz; g += also_pool) {   /* the pooled box's rows of this block */
                 const int gz = g + also_pool <= nz ? also_pool : nz - g;

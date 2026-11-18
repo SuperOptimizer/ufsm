@@ -3,8 +3,10 @@ axis whose phase advances once per 4 cells (sp says 4 cells) except in a "merged
 at lower confidence (the density head still says 4). Checks: every cell within 1 byte of the reference, the merged half flagged and the
 clean half not, the w = 0 corner 0, a crop without --out refused, and wrap-mf's per-wrap share on a flat tifxyz across both halves."""
 import json
+import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 
 import numpy as np
@@ -14,10 +16,13 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 BIN = ROOT / "build/ufsm"
 D, H, W, h = 40, 72, 80, 2
 COEF = (7.5, -4.0, -6.0, -0.2)   # b, c_amp, c_r, c_sp: merged = low confidence, low phase / density turns, narrow spacing
+GPU = "--gpu" in sys.argv   # (the suite's gpu line: the GPU path against the CPU's, byte for byte; else every merge-flag on the CPU)
+DEV = ["--gpu", "-1"]
 
 
-def run(*a, ok=True):
-    r = subprocess.run([str(v) for v in a], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+def run(*a, ok=True, cpu=False):
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="") if cpu else None   # (count-field: its CPU path, whatever GPU the suite gave)
+    r = subprocess.run([str(v) for v in a], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120, env=env)
     assert (r.returncode == 0) == ok, r.stdout
     return r.stdout
 
@@ -56,7 +61,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-mflag-") as tmp:
         a.tofile(f / f"{k}.raw")
     axis = [[cy * h, cx * h]] * (D * h + 1)
     (f / "fields.json").write_text(json.dumps({"format": "raw", "origin": [0, 0, 0], "shape": [D, H, W], "h": h, "um": 9.6, "axis": axis}))
-    out = run(BIN, "merge-flag", f, "--coef", ",".join(map(str, COEF)), "--thr", "128", "--threads", "3")
+    out = run(BIN, "merge-flag", f, "--coef", ",".join(map(str, COEF)), "--thr", "128", "--threads", "3", *DEV)
     print(out.strip())
     mf = np.fromfile(f / "mf.raw", np.uint8).reshape(D, H, W)
     ref = reference(pc, ps, sp, w, COEF)
@@ -74,8 +79,8 @@ with tempfile.TemporaryDirectory(prefix="ufsm-mflag-") as tmp:
     for k in ("pc", "ps", "sp", "w", "t0", "t1", "t2", "t3", "t4", "t5"): (c / f"{k}.raw").symlink_to(f / f"{k}.raw")
     (c / "fields.json").write_text(json.dumps({"format": "raw", "origin": [0, 20, 20], "shape": [D, H - 10, W - 10], "h": h, "um": 9.6,
                                                "raw_offset": [0, 10, 10], "raw_shape": [D, H, W], "axis": [[cy * h - 20, cx * h - 20]] * (D * h + 1)}))
-    run(BIN, "merge-flag", c, "--coef", ",".join(map(str, COEF)), ok=False)
-    run(BIN, "merge-flag", c, "--coef", ",".join(map(str, COEF)), "--out", t / "cmf")
+    run(BIN, "merge-flag", c, "--coef", ",".join(map(str, COEF)), *DEV, ok=False)
+    run(BIN, "merge-flag", c, "--coef", ",".join(map(str, COEF)), "--out", t / "cmf", *DEV)
     cm = np.fromfile(t / "cmf" / "mf.raw", np.uint8).reshape(D, H - 10, W - 10)
     assert np.abs(cm[:, 6:, 6:].astype(int) - mf[:, 16:, 16:].astype(int)).max() <= 1   # (away from the crop's own replicated border)
     # wrap-mf: a flat wrap at z = 40 native across the box (x native 8 .. 152): half its vertices in the merged half
@@ -115,7 +120,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-mflag-") as tmp:
     for a in range(zn // C):
         for b in range(yn // C):
             (lv / str(a) / str(b)).mkdir(parents=True, exist_ok=True)
-            for c in range(xn // C): (lv / str(a) / str(b) / str(c)).write_bytes(codes[a * C:(a + 1) * C, b * C:(b + 1) * C, c * C:(c + 1) * C].tobytes())
+            for cc in range(xn // C): (lv / str(a) / str(b) / str(cc)).write_bytes(codes[a * C:(a + 1) * C, b * C:(b + 1) * C, cc * C:(cc + 1) * C].tobytes())
     (t / "lut.txt").write_text(" ".join(str(min(v, 254)) for v in range(256)))
     run(BIN, "ingest-labels", t, "gt.zarr", t / "codes", "--um", "9.6", "--lut", t / "lut.txt", "--levels", "1", "--shard", "128", "--threads", "2")
     (t / "ev.tsv").write_text(f"a-B1 paris4 {f} {t / 'codes'} 9.6\nb-B2 1667 {f} {t / 'codes'} 9.6\n")
@@ -140,9 +145,9 @@ with tempfile.TemporaryDirectory(prefix="ufsm-mflag-") as tmp:
                 for c0 in range(W // 8): (lk / str(a0) / str(b0) / str(c0)).write_bytes(a[a0 * 8:a0 * 8 + 8, b0 * 8:b0 * 8 + 8, c0 * 8:c0 * 8 + 8].tobytes())
         run(BIN, "ingest-labels", t, f"{k}.zarr", t / f"z{k}", "--um", "9.6", "--lut", t / "lut.txt", "--levels", "1", "--shard", "128", "--threads", "2")
         (zf / k).symlink_to(t / f"z{k}" / "9.6")
-    (zf / "t0").symlink_to(t / "zsp" / "9.6")   # (an extra plane: linked as is)
+    for k in range(6): (zf / f"t{k}").symlink_to(t / "zsp" / "9.6")   # (the normal planes count-field reads; linked as is by --weighted)
     (zf / "fields.json").write_text(json.dumps({"format": "zarr", "origin": [0, 0, 0], "shape": [D, H, W], "h": h, "um": 9.6, "axis": axis}))
-    run(BIN, "merge-flag", zf, "--coef", ",".join(map(str, COEF)), "--weighted", t / "wtd", "--threads", "3")
+    run(BIN, "merge-flag", zf, "--coef", ",".join(map(str, COEF)), "--weighted", t / "wtd", "--threads", "3", *DEV)
     run(BIN, "merge-flag", "--apply", zf, t / "app", "--threads", "3")
     rd = lambda root, k: (run(BIN, "read", root, k, 0, 0, 0, D, H, W, t / "r.raw"), np.fromfile(t / "r.raw", np.uint8).reshape(D, H, W))[1]
     mz = rd(zf, "mf"); wz = rd(zf, "w")
@@ -154,4 +159,19 @@ with tempfile.TemporaryDirectory(prefix="ufsm-mflag-") as tmp:
     assert np.abs(rd(t / "wtd", "pc") - exp).max() <= 1
     ww = rd(t / "wtd", "w"); assert (ww[wz > 0] >= 1).all() and (ww[mz > 200] < wz[mz > 200]).all()
     assert (t / "wtd" / "t0").is_symlink() and (t / "wtd" / "sp").is_symlink()
+    # count-field --mf-w 1 (the unroll's MFREF: the weighting inside every field load) == count-field on merge-flag --apply's planes
+    cfa = ["--R", "0", "--pool", "4", "--model-only", "1", "--model-stride", "1", "--dir", "1", "--iters", "50", "--threads", "2"]
+    run(BIN, "count-field", t / "app", t / "cfa.unused", *cfa, "--model", t / "ma", cpu=True)
+    run(BIN, "count-field", zf, t / "cfb.unused", *cfa, "--model", t / "mb", "--mf-w", "1", cpu=True)
+    fa = sorted(p.name for p in (t / "ma").iterdir()); assert fa == sorted(p.name for p in (t / "mb").iterdir()), fa
+    for n in fa: assert (t / "ma" / n).read_bytes() == (t / "mb" / n).read_bytes(), n
+    run(BIN, "count-field", f, t / "cfc.unused", *cfa, "--model", t / "mc", "--mf-w", "1", ok=False, cpu=True)   # (raw fields without an mf plane: refused)
+    if GPU:   # the GPU path (src/nn_mf.cu) byte for byte against the CPU's: raw fields, a crop, zarr fields (2 x 5 tiles in z, y: --gpu-mem 0.0035)
+        for src, extra in ((f, []), (c, ["--out", t / "cg"]), (zf, ["--out", t / "zg"])):
+            g = run(BIN, "merge-flag", src, "--coef", ",".join(map(str, COEF)), "--thr", "128", "--gpu", "0", "--gpu-mem", "0.0035", *extra)
+            assert "DEFAULTED" not in g, g
+        cpu = lambda d, k: np.fromfile(d / k, np.uint8)
+        assert (np.fromfile(f / "mf.raw", np.uint8) == mf.ravel()).all()   # (the raw run above overwrote f/mf.raw: the same bytes)
+        assert (cpu(t / "cg", "mf.raw") == cpu(t / "cmf", "mf.raw")).all()
+        assert (rd(t / "zg", "mf") == mz).all()
     print("test_mergeflag: PASS")

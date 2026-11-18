@@ -1,5 +1,9 @@
 /* ufsm merge-flag / wrap-mf (src/mergeflag.h) */
 #include "mergeflag.h"
+#include "mf_core.h"
+#include "mfgpu.h"
+#include "gpudec.h"
+#include "defaulted.h"
 #include "json.h"
 #include "optcheck.h"
 #include "store.h"
@@ -17,77 +21,77 @@
 #include <errno.h>
 #include <limits.h>
 #include <unistd.h>
+#include <time.h>
 
 /* a fixed rule with round constants (merge-flag --eval: within 0.002 AUC of the fitted logistic on every split; DESIGN "merge-flag") */
 const mf_coef mf_coef_default = {.b = 4.03, .c_amp = -3.25, .c_r = -6.5, .c_sp = 0};   /* p = 1 / (1 + exp(-6.5 (0.62 - R5 - 0.5 amp9))) */
 const int mf_thr_default = 179;   /* the knee of 1667's GT coverage curve (DESIGN "merge-flag"): p >= 0.7 */
 
 enum { MF_R = 4 };
+static double mf_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
     for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
     return dflt;
 }   /* block border (cells): the 9-box */
 
-/* in-place box mean of edge length 2 r + 1 along each axis, valid on [r, n - r) per axis (the rest left as it was); double sums */
-static void box3(float *a, int D, int H, int W, int r, double *line, float *tmp) {
-    const double s = 1.0 / (2 * r + 1);
+/* in-place box sum of edge length 2 r + 1 along each axis, valid on [r, n - r) per axis (the rest left as it was); exact integers */
+static void box3i(int32_t *a, int D, int H, int W, int r, int64_t *line, int32_t *tmp) {
     for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) {   /* x */
-        float *p = a + ((size_t)z * H + y) * W; line[0] = 0; for (int x = 0; x < W; x++) line[x + 1] = line[x] + p[x];
-        for (int x = r; x < W - r; x++) tmp[x] = (float)((line[x + r + 1] - line[x - r]) * s);
+        int32_t *p = a + ((size_t)z * H + y) * W; line[0] = 0; for (int x = 0; x < W; x++) line[x + 1] = line[x] + p[x];
+        for (int x = r; x < W - r; x++) tmp[x] = (int32_t)(line[x + r + 1] - line[x - r]);
         for (int x = r; x < W - r; x++) p[x] = tmp[x];
     }
     for (int z = 0; z < D; z++) for (int x = r; x < W - r; x++) {   /* y */
-        float *p = a + (size_t)z * H * W + x; line[0] = 0; for (int y = 0; y < H; y++) line[y + 1] = line[y] + p[(size_t)y * W];
-        for (int y = r; y < H - r; y++) tmp[y] = (float)((line[y + r + 1] - line[y - r]) * s);
+        int32_t *p = a + (size_t)z * H * W + x; line[0] = 0; for (int y = 0; y < H; y++) line[y + 1] = line[y] + p[(size_t)y * W];
+        for (int y = r; y < H - r; y++) tmp[y] = (int32_t)(line[y + r + 1] - line[y - r]);
         for (int y = r; y < H - r; y++) p[(size_t)y * W] = tmp[y];
     }
     const size_t HW = (size_t)H * W;
     for (int y = r; y < H - r; y++) for (int x = r; x < W - r; x++) {   /* z */
-        float *p = a + (size_t)y * W + x; line[0] = 0; for (int z = 0; z < D; z++) line[z + 1] = line[z] + p[z * HW];
-        for (int z = r; z < D - r; z++) tmp[z] = (float)((line[z + r + 1] - line[z - r]) * s);
+        int32_t *p = a + (size_t)y * W + x; line[0] = 0; for (int z = 0; z < D; z++) line[z + 1] = line[z] + p[z * HW];
+        for (int z = r; z < D - r; z++) tmp[z] = (int32_t)(line[z + r + 1] - line[z - r]);
         for (int z = r; z < D - r; z++) p[z * HW] = tmp[z];
     }
 }
 
+/* the CPU reference of the GPU path (src/nn_mf.cu): the 12 integer sums of src/mf_core.h per cell, then mf_final */
 void mf_block(const uint8_t *pc, const uint8_t *ps, const uint8_t *sp, const uint8_t *w, int D, int H, int W, const long long g0[3],
               const long long gn[3], const mf_coef *c, uint8_t *out, float *amp9o, float *r5o, float *sp9o) {
     const size_t N = (size_t)D * H * W, HW = (size_t)H * W; const int n3[3] = {D, H, W}; const size_t st[3] = {HW, (size_t)W, 1};
-    float *am = malloc(N * 4), *ma = malloc(N * 4), *s5 = malloc(N * 4), *k5 = malloc(N * 4), *s9 = malloc(N * 4), *m9 = malloc(N * 4);
-    float *cr = malloc(N * 4), *ci = malloc(N * 4), *ka = calloc(N, 4);
-    const int L = D > H ? (D > W ? D : W) : (H > W ? H : W); double *line = malloc((L + 1) * sizeof *line); float *tmp = malloc(L * 4);
-    if (!am || !ma || !s5 || !k5 || !s9 || !m9 || !cr || !ci || !ka || !line || !tmp) abort();
-    for (size_t i = 0; i < N; i++) {
-        const float zr = (pc[i] - 128) / 127.0f, zi = (ps[i] - 128) / 127.0f, m = w[i] > 0;
-        am[i] = sqrtf(zr * zr + zi * zi) * m; ma[i] = m; s5[i] = s9[i] = sp[i] / 8.0f; k5[i] = m9[i] = sp[i] > 0;
-    }
-    box3(am, D, H, W, 4, line, tmp); box3(ma, D, H, W, 4, line, tmp);   /* amp9 = box9(amp w>0) / box9(w>0) */
-    box3(s9, D, H, W, 4, line, tmp); box3(m9, D, H, W, 4, line, tmp);   /* sp9 */
-    box3(s5, D, H, W, 2, line, tmp); box3(k5, D, H, W, 2, line, tmp);   /* sp5 (k5 holds its known-count until the axis loop) */
-    for (size_t i = 0; i < N; i++) s5[i] = s5[i] / fmaxf(k5[i], 1e-3f);
-    for (int a = 0; a < 3; a++) {   /* c_a = z(g' + e_a) conj z(g'), g' = min(g, N_a - 2) (the last cell repeats the one before) */
-        for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
-            const int q[3] = {z, y, x}; const size_t i = (size_t)z * HW + (size_t)y * W + x;
-            long long g = g0[a] + q[a]; if (g < 0) g = 0; if (g > gn[a] - 2) g = gn[a] - 2; if (g < 0) g = 0;
-            const long long l = g - g0[a];   /* the local index of g' (inside the block for every cell the 5-box reads) */
-            if (l < 0 || l + 1 >= n3[a]) { cr[i] = ci[i] = 0; continue; }
-            const size_t j0 = i + (size_t)(l - q[a]) * st[a], j1 = j0 + st[a];
-            if (gn[a] < 2) { cr[i] = ci[i] = 0; continue; }
-            const float ar = (pc[j0] - 128) / 127.0f, ai = (ps[j0] - 128) / 127.0f, br = (pc[j1] - 128) / 127.0f, bi = (ps[j1] - 128) / 127.0f;
-            cr[i] = br * ar + bi * ai; ci[i] = bi * ar - br * ai;   /* b conj(a) */
+    const int iD = D - 2 * MF_R, iH = H - 2 * MF_R, iW = W - 2 * MF_R;
+    const size_t NI = iD > 0 && iH > 0 && iW > 0 ? (size_t)iD * iH * iW : 0;
+    int32_t *a = malloc(N * 4), *S = malloc((NI ? NI : 1) * MF_NS * 4);
+    const int L = D > H ? (D > W ? D : W) : (H > W ? H : W); int64_t *line = malloc((L + 1) * sizeof *line); int32_t *tmp = malloc(L * 4);
+    if (!a || !S || !line || !tmp) abort();
+    for (int ch = 0; ch < MF_NS; ch++) {
+        if (ch < 6) for (size_t i = 0; i < N; i++) {
+            const int m = w[i] > 0;
+            a[i] = ch == 0 ? (m ? mf_ampq(pc[i], ps[i]) : 0) : ch == 1 ? m : ch == 2 || ch == 4 ? sp[i] : sp[i] > 0;
+        } else {   /* CR / CI of axis ax: z(g' + e_a) conj z(g'), g' = min(g, N_a - 2) */
+            const int ax = (ch - 6) / 2, im = (ch - 6) & 1;
+            for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+                const int q[3] = {z, y, x}; const size_t i = (size_t)z * HW + (size_t)y * W + x;
+                long long g = g0[ax] + q[ax]; if (g > gn[ax] - 2) g = gn[ax] - 2; if (g < 0) g = 0;
+                const long long l = g - g0[ax];
+                if (gn[ax] < 2 || l < 0 || l + 1 >= n3[ax]) { a[i] = 0; continue; }
+                const size_t j0 = i + (size_t)(l - q[ax]) * st[ax], j1 = j0 + st[ax];
+                const int ar = pc[j0] - 128, ai = ps[j0] - 128, br = pc[j1] - 128, bi = ps[j1] - 128;
+                a[i] = im ? bi * ar - br * ai : br * ar + bi * ai;
+            }
         }
-        box3(cr, D, H, W, 2, line, tmp); box3(ci, D, H, W, 2, line, tmp);
-        for (size_t i = 0; i < N; i++) { const float t = atan2f(ci[i], cr[i]) / (float)(2 * M_PI); ka[i] += t * t; }
+        box3i(a, D, H, W, mf_rad(ch), line, tmp);
+        size_t k = 0;
+        for (int z = MF_R; z < D - MF_R; z++) for (int y = MF_R; y < H - MF_R; y++) for (int x = MF_R; x < W - MF_R; x++, k++)
+            S[k * MF_NS + ch] = a[(size_t)z * HW + (size_t)y * W + x];
     }
-    for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
-        const size_t i = (size_t)z * HW + (size_t)y * W + x;
-        if (z < MF_R || y < MF_R || x < MF_R || z >= D - MF_R || y >= H - MF_R || x >= W - MF_R) { out[i] = 0; continue; }
-        const float amp9 = am[i] / fmaxf(ma[i], 1e-3f), sp9 = s9[i] / fmaxf(m9[i], 1e-3f), r5 = sqrtf(ka[i]) * s5[i];
-        if (amp9o) amp9o[i] = amp9; if (r5o) r5o[i] = r5; if (sp9o) sp9o[i] = sp9;
-        if (!w[i]) { out[i] = 0; continue; }
-        const double lg = c->b + c->c_amp * amp9 + c->c_r * r5 + c->c_sp * sp9;
-        out[i] = (uint8_t)lrint(255.0 / (1.0 + exp(-lg)));
+    memset(out, 0, N);
+    size_t k = 0;
+    for (int z = MF_R; z < D - MF_R; z++) for (int y = MF_R; y < H - MF_R; y++) for (int x = MF_R; x < W - MF_R; x++, k++) {
+        const size_t i = (size_t)z * HW + (size_t)y * W + x; const int32_t *s = S + k * MF_NS;
+        if (amp9o || r5o || sp9o) { const mf_feat f = mf_features(s); if (amp9o) amp9o[i] = (float)f.amp9; if (r5o) r5o[i] = (float)f.r5; if (sp9o) sp9o[i] = (float)f.sp9; }
+        out[i] = mf_final(s, w[i] > 0, c->b, c->c_amp, c->c_r, c->c_sp);
     }
-    free(am); free(ma); free(s5); free(k5); free(s9); free(m9); free(cr); free(ci); free(ka); free(line); free(tmp);
+    free(a); free(S); free(line); free(tmp);
 }
 
 /* ---- a fields directory (zarr planes or NAME.raw; crops: zarr_offset / raw_offset + raw_shape) ---- */
@@ -169,8 +173,85 @@ static void *mf_worker(void *a) {
 
 static int mf_link_dir(const char *src, const char *out);
 static int mf_weight_create(const mf_in *I, const char *src, const char *out, double K, int cut, z3w *zw[3]);
-static void mf_weight_rows(uint8_t *pc, uint8_t *ps, uint8_t *w, const uint8_t *mf, size_t n, double K, int cut, size_t *nmat, double *fsum);
-static int mf_write_rows(z3w *zw, const uint8_t *rows, long long z0, long long nz, long long H, long long W, int fill, uint8_t *sb, int nt);
+/* rows [z0, z0 + nz) as 128^3 shards, a thread per shard (each shard's encode is one chunk: z3w_write_shard's threads idle) */
+typedef struct { z3w *zw; const uint8_t *rows; long long z0, nz, H, W; int fill, ny, nx; _Atomic int next, fail; } mf_wjob;
+static void *mf_wpar(void *a) {
+    mf_wjob *J = a; uint8_t *sb = malloc((size_t)SZ * SZ * SZ); if (!sb) { atomic_store(&J->fail, 1); return nullptr; }
+    for (int t; (t = atomic_fetch_add(&J->next, 1)) < J->ny * J->nx;) {
+        const long long y0 = (long long)(t / J->nx) * SZ, x0 = (long long)(t % J->nx) * SZ;
+        memset(sb, J->fill, (size_t)SZ * SZ * SZ);
+        for (long long z = 0; z < J->nz; z++) for (long long y = y0; y < y0 + SZ && y < J->H; y++)
+            memcpy(sb + ((size_t)z * SZ + (y - y0)) * SZ, J->rows + ((size_t)z * J->H + y) * J->W + x0, (size_t)(x0 + SZ < J->W ? SZ : J->W - x0));
+        if (z3w_write_shard(J->zw, J->z0 / SZ, y0 / SZ, x0 / SZ, sb, 1)) atomic_store(&J->fail, 1);
+    }
+    free(sb); return nullptr;
+}
+static int mf_write_par(z3w *zw, const uint8_t *rows, long long z0, long long nz, long long H, long long W, int fill, int nt) {
+    mf_wjob J = {.zw = zw, .rows = rows, .z0 = z0, .nz = nz, .H = H, .W = W, .fill = fill, .ny = (int)((H + SZ - 1) / SZ), .nx = (int)((W + SZ - 1) / SZ)};
+    pthread_t th[64]; const int m = nt < 64 ? nt : 64;
+    for (int t = 0; t < m; t++) pthread_create(&th[t], nullptr, mf_wpar, &J);
+    for (int t = 0; t < m; t++) pthread_join(th[t], nullptr);
+    return atomic_load(&J.fail);
+}
+/* the GPU path, three stages overlapped: slab k + 1's planes read (a reader thread), slab k on the GPU (this thread), slab k - 1's mf
+   shards encoded and written (a writer thread). Double buffers: the planes (4 x (128 + 8) rows) and the mf rows */
+typedef struct { mf_rd *rd; uint8_t **pl; long long rz0, rnz; int nt, rc; } mf_rjob;
+static void *mf_rthread(void *a) {
+    mf_rjob *R = a; R->rc = 0;
+    for (int k = 0; k < 4 && !R->rc; k++) if (mf_rows(&R->rd[k], R->rz0, R->rnz, R->pl[k], R->nt)) R->rc = 1;
+    return nullptr;
+}
+typedef struct { z3w *zw; FILE *fo; const uint8_t *rows; long long z0, nz, H, W; int nt, rc; } mf_wjob2;
+static void *mf_wthread(void *a) {
+    mf_wjob2 *J = a; const size_t n = (size_t)J->nz * J->H * J->W; J->rc = 0;
+    if (J->zw && mf_write_par(J->zw, J->rows, J->z0, J->nz, J->H, J->W, 0, J->nt)) { fprintf(stderr, "merge-flag: shard write failed: %s\n", z3w_error()); J->rc = 1; }
+    if (J->fo && fwrite(J->rows, 1, n, J->fo) != n) { fprintf(stderr, "merge-flag: write failed\n"); J->rc = 1; }
+    return nullptr;
+}
+static int mf_run_gpu(mf_gpu *G, mf_rd *rd, uint8_t *pl0[4], long long D, long long H, long long W, const double cv[4], int thr, z3w *zw, FILE *fo, int nt,
+                      uint8_t *mfr, z3w *ww[3], uint8_t *wr[3], double K, int cut, size_t *wmat, double *wsum, long long *nmat, long long *nflag, double tm[4]) {
+    const size_t rmax = (size_t)(SZ + 2 * MF_R) * H * W, srow = (size_t)SZ * H * W;
+    uint8_t *plb[2][4] = {{0}}, *gr[2]; int rc = 0;   /* (page-locked: the uploads run at the bus rate) */
+    (void)pl0;
+    for (int b = 0; b < 2; b++) for (int k = 0; k < 4; k++) if (!(plb[b][k] = mf_gpu_host_alloc(rmax))) rc = 1;
+    gr[0] = mf_gpu_host_alloc(srow); gr[1] = mf_gpu_host_alloc(srow);
+    if (rc || !gr[0] || !gr[1]) { fprintf(stderr, "merge-flag: no page-locked host memory (%.1f GB)\n", (8.0 * rmax + 2.0 * srow) / 1e9); rc = 1; goto done; }
+    const int rnt = gpudec_threads(nt);
+    const long long ns = (D + SZ - 1) / SZ;
+    mf_rjob R = {.rd = rd}; mf_wjob2 Wj = {.zw = zw, .fo = fo, .H = H, .W = W, .nt = nt}; pthread_t rt, wt; int rrun = 0, wrun = 0;
+    #define MF_SLAB(i, z0_, nz_, rz0_, rz1_) const long long z0_ = (i) * SZ, nz_ = z0_ + SZ < D ? SZ : D - z0_, rz0_ = z0_ - MF_R < 0 ? 0 : z0_ - MF_R, rz1_ = z0_ + nz_ + MF_R > D ? D : z0_ + nz_ + MF_R
+    { MF_SLAB(0, z0, nz, rz0, rz1); (void)z0; (void)nz; R.pl = plb[0]; R.rz0 = rz0; R.rnz = rz1 - rz0; R.nt = rnt; mf_rthread(&R); if (R.rc) { rc = 1; goto done; } }
+    for (long long i = 0; i < ns && !rc; i++) {
+        MF_SLAB(i, z0, nz, rz0, rz1);
+        double t0 = mf_now();
+        if (rrun) { pthread_join(rt, nullptr); rrun = 0; if (R.rc) { fprintf(stderr, "merge-flag: cannot read rows near %lld\n", z0); rc = 1; break; } }
+        tm[0] += mf_now() - t0;
+        if (i + 1 < ns) { MF_SLAB(i + 1, z1_, nz1_, rz0n, rz1n); (void)z1_; (void)nz1_; R.pl = plb[(i + 1) & 1]; R.rz0 = rz0n; R.rnz = rz1n - rz0n; R.nt = rnt;
+                          pthread_create(&rt, nullptr, mf_rthread, &R); rrun = 1; }
+        uint8_t **pl = plb[i & 1], *g = gr[i & 1]; t0 = mf_now();
+        long long cm = 0, cf = 0;
+        if (mf_gpu_rows(G, (const uint8_t *const *)pl, D, rz0, rz1 - rz0, z0, nz, cv, thr, g, &cm, &cf)) { rc = 1; break; }
+        *nmat += cm; *nflag += cf; tm[1] += mf_now() - t0; t0 = mf_now();
+        if (wrun) { pthread_join(wt, nullptr); wrun = 0; if (Wj.rc) { rc = 1; break; } }
+        tm[2] += mf_now() - t0;
+        Wj.rows = g; Wj.z0 = z0; Wj.nz = nz; pthread_create(&wt, nullptr, mf_wthread, &Wj); wrun = 1;
+        if (mfr) {   /* --weighted: the slab's weighted planes (rows z0.. of the read buffer, which starts at rz0), here (no overlap) */
+            t0 = mf_now(); const size_t n = (size_t)nz * H * W, o = (size_t)(z0 - rz0) * H * W; const int src[3] = {0, 1, 3};
+            for (int k = 0; k < 3; k++) memcpy(wr[k], pl[src[k]] + o, n);
+            mf_weight_rows(wr[0], wr[1], wr[2], g, n, K, cut, wmat, wsum);
+            for (int k = 0; k < 3 && !rc; k++) if (mf_write_par(ww[k], wr[k], z0, nz, H, W, k < 2 ? 128 : 0, nt)) { fprintf(stderr, "merge-flag --weighted: %s\n", z3w_error()); rc = 1; }
+            tm[3] += mf_now() - t0;
+        }
+    }
+    if (rrun) pthread_join(rt, nullptr);
+    if (wrun) { pthread_join(wt, nullptr); if (Wj.rc) rc = 1; }
+    #undef MF_SLAB
+done:
+    for (int b = 0; b < 2; b++) for (int k = 0; k < 4; k++) mf_gpu_host_free(plb[b][k]);
+    mf_gpu_host_free(gr[0]); mf_gpu_host_free(gr[1]);
+    return rc;
+}
+
 /* ufsm merge-flag <fields-dir> [--out DIR] [--coef b,amp,r,sp] [--thr T] [--threads N] [--weighted DIR [--mf-w 1 | --mf-cut T]] */
 static int cmd_merge_flag_eval(int argc, char **argv, const char *list);
 static int cmd_merge_flag_apply(int argc, char **argv, const char *src, const char *out);
@@ -178,7 +259,7 @@ int cmd_merge_flag(int argc, char **argv) {
     if (argc >= 5 && !strcmp(argv[2], opt_n("--apply"))) return cmd_merge_flag_apply(argc, argv, argv[3], argv[4]);
     if (argc >= 4 && !strcmp(argv[2], opt_n("--eval"))) return cmd_merge_flag_eval(argc, argv, argv[3]);
     if (argc < 3) {
-        fprintf(stderr, "usage: ufsm merge-flag <fields-dir> [--out DIR] [--coef b,c_amp,c_r,c_sp] [--thr 179] [--threads N]\n"
+        fprintf(stderr, "usage: ufsm merge-flag <fields-dir> [--out DIR] [--coef b,c_amp,c_r,c_sp] [--thr 179] [--threads N] [--gpu 0 (-1: CPU)] [--gpu-mem 3]\n"
                         "       ... --weighted DIR: also DIR = the fields with their evidence x (1 - mf / 255) (merge-flag --apply in the same pass; zarr fields)\n"
                         "       ufsm merge-flag --apply FIELDS OUT [--mf-w 1 | --mf-cut T]   FIELDS' evidence down-weighted where merged (pc ps w x (1 - K mf / 255)) for count-field / fit\n"
                         "       ufsm merge-flag --eval LIST [--coef ..] [--threads 4]   the rule against GT intervals (LIST: name scroll fields-dir codes-root codes-key)\n"
@@ -206,7 +287,17 @@ int cmd_merge_flag(int argc, char **argv) {
     } else { snprintf(p, sizeof p, "%s/mf.raw", out); if (!(fo = fopen(p, "wb"))) { fprintf(stderr, "merge-flag: cannot write %s\n", p); return 1; } }
     uint8_t *pl[4] = {0}; const size_t rmax = (size_t)(SZ + 2 * MF_R) * H * W; for (int k = 0; k < 4; k++) if (!(pl[k] = malloc(rmax))) { fprintf(stderr, "merge-flag: out of memory\n"); return 1; }
     uint8_t *orows = fo ? malloc((size_t)SZ * H * W) : nullptr;
-    long long nmat = 0, nflag = 0; int rc = 0;
+    long long nmat = 0, nflag = 0; int rc = 0; double tm[4] = {0};   /* read, gpu, mf write, weighted planes (GPU path) */
+    /* --gpu N (default 0; -1: the CPU threads): the GPU path (src/nn_mf.cu), within 1 LSB of the CPU's; --gpu-mem GB its tiles */
+    const int gdev = opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")); mf_gpu *G = nullptr;
+    const double cv[4] = {c.b, c.c_amp, c.c_r, c.c_sp};
+    if (gdev >= 0) {
+        G = mf_gpu_open(gdev, H, W, opt_atof("--gpu-mem", opt(argc, argv, "--gpu-mem", "3")));
+        if (!G) UFSM_DEFAULTED("merge-flag: no GPU %d: the CPU path (%d threads)", gdev, nt);
+        else if (opt_atoi("--gpu-decode", opt(argc, argv, "--gpu-decode", "1"))) {   /* the field planes' volcomp decode on the same GPU (src/gpudec.h) */
+            char dv[16]; snprintf(dv, sizeof dv, "%d", gdev); setenv("UFSM_GPU_DECODE", "1", 0); setenv("UFSM_GPU_DECODE_DEV", dv, 0);
+        }
+    }
     /* --weighted DIR: the count-field input (the unroll's MFREF): pc ps w x (1 - K mf / 255) beside links to the other planes */
     const char *wd = opt(argc, argv, "--weighted", nullptr); z3w *ww[3] = {0}; uint8_t *mfr = nullptr, *wr[3] = {0}, *sb = nullptr;
     const double K = opt_atof("--mf-w", opt(argc, argv, "--mf-w", "1")); const int cut = opt_atoi("--mf-cut", opt(argc, argv, "--mf-cut", "0")); size_t wmat = 0; double wsum = 0;
@@ -216,10 +307,13 @@ int cmd_merge_flag(int argc, char **argv) {
         mfr = malloc((size_t)SZ * H * W); sb = malloc((size_t)SZ * SZ * SZ); for (int k = 0; k < 3; k++) wr[k] = malloc((size_t)SZ * H * W);
         if (!mfr || !sb || !wr[0] || !wr[1] || !wr[2]) { fprintf(stderr, "merge-flag: out of memory\n"); return 1; }
     }
-    for (long long z0 = 0; z0 < D && !rc; z0 += SZ) {
+    if (G) rc = mf_run_gpu(G, rd, pl, D, H, W, cv, thr, zw, fo, nt, wd ? mfr : nullptr, ww, wr, K, cut, &wmat, &wsum, &nmat, &nflag, tm);
+    for (long long z0 = 0; z0 < D && !rc && !G; z0 += SZ) {
         const long long nz = z0 + SZ < D ? SZ : D - z0, rz0 = z0 - MF_R < 0 ? 0 : z0 - MF_R, rz1 = z0 + nz + MF_R > D ? D : z0 + nz + MF_R;
-        for (int k = 0; k < 4 && !rc; k++) if (mf_rows(&rd[k], rz0, rz1 - rz0, pl[k], nt)) { fprintf(stderr, "merge-flag: cannot read %s rows %lld..%lld\n", names[k], rz0, rz1); rc = 1; }
+        double t0 = mf_now();
+        for (int k = 0; k < 4 && !rc; k++) if (mf_rows(&rd[k], rz0, rz1 - rz0, pl[k], G ? gpudec_threads(nt) : nt)) { fprintf(stderr, "merge-flag: cannot read %s rows %lld..%lld\n", names[k], rz0, rz1); rc = 1; }
         if (rc) break;
+        {
         mf_job J = {.I = &I, .c = &c, .z0 = z0, .nz = nz, .rz0 = rz0, .rnz = rz1 - rz0, .pl = {pl[0], pl[1], pl[2], pl[3]}, .outrows = orows, .mfrows = mfr, .zw = zw,
                     .ny = (int)((H + TY - 1) / TY), .nx = (int)((W + TY - 1) / TY), .thr = thr};
         pthread_t th[64]; const int m = nt < 64 ? nt : 64;
@@ -228,20 +322,23 @@ int cmd_merge_flag(int argc, char **argv) {
         if (atomic_load(&J.fail)) { fprintf(stderr, "merge-flag: shard write failed: %s\n", z3w_error()); rc = 1; }
         if (fo && fwrite(orows, 1, (size_t)nz * H * W, fo) != (size_t)(nz * H * W)) { fprintf(stderr, "merge-flag: write failed\n"); rc = 1; }
         nmat += atomic_load(&J.nmat); nflag += atomic_load(&J.nflag);
+        }
         if (wd && !rc) {   /* the slab's weighted planes (the rows z0.. of the read buffer: it starts at rz0) */
             const size_t n = (size_t)nz * H * W, o = (size_t)(z0 - rz0) * H * W; const int src[3] = {0, 1, 3};
             for (int k = 0; k < 3; k++) memcpy(wr[k], pl[src[k]] + o, n);
             mf_weight_rows(wr[0], wr[1], wr[2], mfr, n, K, cut, &wmat, &wsum);
-            for (int k = 0; k < 3 && !rc; k++) if (mf_write_rows(ww[k], wr[k], z0, nz, H, W, k < 2 ? 128 : 0, sb, nt)) { fprintf(stderr, "merge-flag --weighted: %s\n", z3w_error()); rc = 1; }
+            for (int k = 0; k < 3 && !rc; k++) if (mf_write_par(ww[k], wr[k], z0, nz, H, W, k < 2 ? 128 : 0, nt)) { fprintf(stderr, "merge-flag --weighted: %s\n", z3w_error()); rc = 1; }
+            tm[3] += mf_now() - t0;
         }
     }
     for (int k = 0; k < 3; k++) { if (ww[k] && z3w_close(ww[k])) rc = 1; free(wr[k]); }
-    free(mfr); free(sb);
+    free(mfr); free(sb); mf_gpu_close(G);
     if (wd && !rc) printf("merge-flag --weighted: %s: mean evidence factor %.4f over %zu material cells\n", wd, wmat ? wsum / wmat : 0, wmat);
     for (int k = 0; k < 4; k++) { free(pl[k]); mf_rd_close(&rd[k]); }
     free(orows);
     if (zw && z3w_close(zw)) { fprintf(stderr, "merge-flag: %s\n", z3w_error()); rc = 1; }
     if (fo && fclose(fo)) rc = 1;
+    if (!rc && G) printf("merge-flag gpu: waited for reads %.1f s, GPU %.1f s, waited for writes %.1f s, weighted planes %.1f s\n", tm[0], tm[1], tm[2], tm[3]);
     if (!rc) printf("merge-flag: %lld x %lld x %lld cells, %lld with material, flagged (mf >= %d) %.4f -> %s\n", D, H, W, nmat, thr, nmat ? (double)nflag / nmat : 0, p);
     json_free(I.j);
     return rc;
@@ -487,7 +584,6 @@ static float mf_src_q(const char *dir, const char *name) {   /* the volcomp q of
     }
     json_free(j); return q;
 }
-static inline uint8_t mf_scale_phase(uint8_t v, float f) { const float d = (v - 128) * f; return (uint8_t)lrintf(128 + d); }
 static int mf_link_dir(const char *src, const char *out) {   /* OUT: links to every entry of SRC but pc ps w, fields.json copied */
     if (mkdir(out, 0775) && errno != EEXIST) { fprintf(stderr, "merge-flag: cannot create %s\n", out); return 1; }
     char p[1500], q[1500]; DIR *dd = opendir(src); if (!dd) return 1;
@@ -511,23 +607,6 @@ static int mf_weight_create(const mf_in *I, const char *src, const char *out, do
     }
     return 0;
 }
-static void mf_weight_rows(uint8_t *pc, uint8_t *ps, uint8_t *w, const uint8_t *mf, size_t n, double K, int cut, size_t *nmat, double *fsum) {
-    for (size_t i = 0; i < n; i++) {
-        if (!w[i]) continue;
-        const float f = cut ? (mf[i] >= cut ? 0.f : 1.f) : fmaxf(0.f, 1.f - (float)K * mf[i] / 255.f);
-        pc[i] = mf_scale_phase(pc[i], f); ps[i] = mf_scale_phase(ps[i], f);
-        const int v = (int)lrintf(w[i] * f); w[i] = (uint8_t)(v < 1 ? 1 : v); (*nmat)++; *fsum += f;
-    }
-}
-static int mf_write_rows(z3w *zw, const uint8_t *rows, long long z0, long long nz, long long H, long long W, int fill, uint8_t *sb, int nt) {   /* rows [z0, z0 + nz) as 128^3 shards */
-    for (long long y0 = 0; y0 < H; y0 += SZ) for (long long x0 = 0; x0 < W; x0 += SZ) {
-        memset(sb, fill, (size_t)SZ * SZ * SZ);
-        for (long long z = 0; z < nz; z++) for (long long y = y0; y < y0 + SZ && y < H; y++)
-            memcpy(sb + ((size_t)z * SZ + (y - y0)) * SZ, rows + ((size_t)z * H + y) * W + x0, (size_t)(x0 + SZ < W ? SZ : W - x0));
-        if (z3w_write_shard(zw, z0 / SZ, y0 / SZ, x0 / SZ, sb, nt)) return 1;
-    }
-    return 0;
-}
 static int cmd_merge_flag_apply(int argc, char **argv, const char *src, const char *out) {
     mf_in I; if (mf_open(&I, src)) return 1;
     if (!I.zarr || I.off[0] || I.off[1] || I.off[2]) { fprintf(stderr, "merge-flag --apply: zarr fields (not a crop) only\n"); json_free(I.j); return 2; }
@@ -543,7 +622,7 @@ static int cmd_merge_flag_apply(int argc, char **argv, const char *src, const ch
         for (int k = 0; k < 4 && !rc; k++) if (mf_rows(&rd[k], z0, nz, pl[k], nt)) { fprintf(stderr, "merge-flag --apply: cannot read %s\n", names[k]); rc = 1; }
         if (rc) break;
         mf_weight_rows(pl[0], pl[1], pl[2], pl[3], (size_t)nz * H * W, K, cut, &nmat, &fsum);
-        for (int k = 0; k < 3 && !rc; k++) if (mf_write_rows(zw[k], pl[k], z0, nz, H, W, k < 2 ? 128 : 0, sb, nt)) { fprintf(stderr, "merge-flag --apply: %s\n", z3w_error()); rc = 1; }
+        for (int k = 0; k < 3 && !rc; k++) if (mf_write_par(zw[k], pl[k], z0, nz, H, W, k < 2 ? 128 : 0, nt)) { fprintf(stderr, "merge-flag --apply: %s\n", z3w_error()); rc = 1; }
     }
     for (int k = 0; k < 3; k++) if (z3w_close(zw[k])) rc = 1;
     for (int k = 0; k < 4; k++) { free(pl[k]); mf_rd_close(&rd[k]); }

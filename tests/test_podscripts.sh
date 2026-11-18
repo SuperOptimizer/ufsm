@@ -32,7 +32,7 @@ ck "merge-flag runs in the background after rectosp, before the ref (11-18: off 
 ck "no serial merge-flag in check" '! awk "/^check\(\) \{/,/^}\$/" $UR | grep -q "merge-flag \$F"'
 ck "the mask consumers wait for mflag (GT split, snap, perwrap)" '[ "$(grep -c "mfready && " $UR)" = 3 ]'
 ck "snap writes wrapmf.tsv before CLEAN deletes the field planes, and CLEAN keeps mf" '[ "$(ln_ "wrap-mf \$wd")" -lt "$(ln_ "CLEAN:-1}\" = 1 ] && { find \$F")" ] && grep -q "! -name fields.json ! -name mf" $UR'
-ck "MFREF: the ref counts on the weighted fields (reff), refstream off, pool cache only for unweighted, CLEAN drops mfw" 'grep -q "count-field \$(reff) \$O/cf.unused \$(refpool)" $UR && grep -q "REFCMD \$(reff)" $UR && grep -q "^refstream_on() { ! mfref" $UR && grep -q "\[ \"\$(reff)\" = \$F \] && pc=" $UR && grep -q "rm -rf \$O/fields/mfw;" $UR && [ "$(grep -c "count-field \$F " $UR)" = 0 ]'
-ck "MFREF: mflag in the foreground before the ref, writing fields/mfw" 'grep -q "if mfref; then stage mflag mflag ||" $UR && grep -q -- "--weighted \$O/fields/mfw" $UR'
+ck "MFREF: the ref's count-field weighted by mf (mfw), refstream off, pool cache only unweighted" 'grep -q "count-field \$F \$O/cf.unused \$(refpool) \$(mfw) --iters" $UR && grep -q "count-field \$F \$O/cf.unused \$(refpool) \$(mfw) --dir" $UR && grep -q "^refstream_on() { ! mfref" $UR && grep -q "\[ -z \"\$(mfw)\" \] && pc=" $UR'
+ck "MFREF: mflag in the foreground before the ref, on the GPU" 'grep -q "if mfref; then stage mflag mflag ||" $UR && grep -q -- "merge-flag \$F --thr \${MFTHR:-179} --threads \$th --gpu" $UR'
 [ $fails = 0 ] && echo "test_podscripts: ok" || echo "test_podscripts: $fails failure(s)"
 exit $((fails != 0))
