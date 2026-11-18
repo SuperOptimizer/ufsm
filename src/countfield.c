@@ -1160,6 +1160,10 @@ int cmd_count_field(int argc, char **argv) {
                 cn[k]++; cb[k] += cl[i] > 0.25; cs[k] += Sfine[i]; cr[k] += (Gfine[1][i] * ry + Gfine[2][i] * rx) / (r > 1 ? r : 1) / Sfine[i]; cg[k] += sqrt(Gfine[0][i] * Gfine[0][i] + Gfine[1][i] * Gfine[1][i] + Gfine[2][i] * Gfine[2][i]) / Sfine[i]; } }
         for (int k = 0; k < NRB; k++) if (cn[k] > 0) fprintf(stderr, "count-field debug: r %2d mm: %8.0f cells, closing > 0.25 %.3f, mean weight %.3f, radial density %.3f, |g| %.3f turns per field cell\n", k, cn[k], cb[k] / cn[k], cs[k] / cn[k] / ((double)P * P * P), cr[k] / cn[k], cg[k] / cn[k]);
     }
+    /* (the level-0 weights / targets and the fine gradient sums are not read past the closing error: 9 floats a solve cell freed before
+       the gauge / model passes, whose field pieces peak there; PHerc Paris 4's ref, 246 M solve cells, was OOM-killed at 29.2 GB RSS in a
+       31 GB pod, 2026-11-18) */
+    for (int k = 0; k < 3; k++) { free(L->wt[k]); free(L->tg[k]); L->wt[k] = L->tg[k] = nullptr; free(Gfine[k]); Gfine[k] = Gl[0][k] = nullptr; }
     cf_dm M = {nullptr, 0, L, D, H, W, R, na, dir, h, 0, g.cy, g.cx, nullptr, nullptr, nullptr, nullptr, 0, nullptr}; double tst2 = cf_now();
     if (mo) fit_fields_skip_planes(1 | 2 | 4);   /* (--model-only from here: pc / ps / sp / w read only) */
     /* --model-only R 0 on the GPU: the global gauge pass and the model pass in one read of the strided chunks. The phasor sums gr / gi
