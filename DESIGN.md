@@ -6,6 +6,28 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## xnet: a failed device allocation stops the process (2026-11-18, branch xnetalloc-20261118, unrollperf)
+
+Desk card 1, 10:55:58: Xid 31 (MMU fault at a null address) from the q2b reader3 ink-ext (--batch 16 beside try9 + fix0332), then
+"xnet: forward: an illegal memory access", and try9's card-1 context died with it. r3ink.log: "1417 MB in use exceeds the 382 MB device
+budget", then "cudaMalloc of 288 / 144 / 0 / 9 MB failed". xmalloc_dev returned nullptr after its retry, and no caller checked: the next
+forward wrote through the null buffers. The same pattern hit the 08:28 card-0 run.
+
+- xmalloc_dev never returns nullptr now. After the retry with the cache freed, it prints "xnet: cudaMalloc of N MB (B bytes) failed: out
+  of memory (... MB in use, ... MB budget; lower --batch / --gpu-mem): stopping before any launch" and calls _exit(XNET_OOM_RC = 75).
+  _exit, not exit, so no atexit handler or destructor touches the device after the failure, and the other threads (ink-ext's GPU worker)
+  stop with it. Every xnet user (ink-ext, ink3d, dinovol, villawind, hercuvit, surfrecto, surfeval, dino's SSL path) gets this. The raw
+  unchecked cudaMalloc calls in nn_dinovol / nn_villawind (cuBLASLt workspaces, bias16) go through xmalloc_dev too. deskq2.sh's
+  "out of memory" grep still matches, so its R3BATCH 16 -> 8 retry is unchanged. A trainer that hits this in dino's SSL path now exits
+  75 where it used to fault the context.
+- UFSM_XNET_FAIL_ALLOC=N fails the Nth fresh (cache-missing) allocation without touching the device. test_xnet_oom (CPU, card list
+  emptied) checks exit 75 and the message for 1 B / 4 KB / 9 MB / 288 MB.
+- Pod (RTX PRO 4000), reader3 UFSM_IE_BENCH=16,3:
+  - forced failures at allocations 1, 3, 8, 20, 40, 80, 160: rc 75, no illegal-access / fault line;
+  - a real failure at batch 1024 (78 GB): rc 75, no fault;
+  - baseline before / after: rc 0;
+  - reader3 on wrap w040 of the q2 run: map byte-identical to the pod master build (142 vs 140 tiles/s).
+
 ## Slab overlap 8 instead of 16: the unroll default (2026-11-18, branch slabov8-20261118, fp4teach)
 
 unroll.sh's slab fits take SLABI 64 interior cells plus SLABOV overlap cells each side; the overlap rows feed fit-join's gauges. A/B on
