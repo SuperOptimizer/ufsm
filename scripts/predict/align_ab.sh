@@ -2,7 +2,8 @@
 # align_ab.sh CKPT ROOT CT-GROUP UM BOX OUT (data audit #9, datafix 2026-11-14; post-pass GPU job): predict on one box twice with the
 # same window / halo, once on the default grid (window origins box + k stride - halo) and once with --align 128 (origins on the 128
 # grid like training's snapped windows), then compare the two outputs voxel by voxel over the box.
-#   BOX: z,y,x,nz,ny,nx on the CT level (pick an origin NOT = halo mod 128, e.g. ...+64, so the default grid is misaligned).
+#   BOX: z,y,x,nz,ny,nx on the CT level (pick an origin NOT = halo mod 128 so the default grid is misaligned: with HALO 64 a multiple of
+#   128; an origin of ...+64 puts the default grid on the 128 grid already and both runs are byte-identical, 11-18).
 #   Env: LEVEL (2), WIN (640), HALO (64; window - 2 halo must be a multiple of 128), GPU (0), U (build/ufsm), EXTRA (more predict flags,
 #   e.g. "--heads 1"), LOCK (a flock file to hold for the GPU part; empty = none).
 # Output: OUT/{grid,align} predictions, OUT/ab.txt: mean |a - b| (uint8), the share of voxels differing by > 8 and > 32, the Pearson

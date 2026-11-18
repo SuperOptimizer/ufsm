@@ -3548,6 +3548,9 @@ is the gate: 1218's weight array is 255 on 97 % of the labelled voxels (1299's g
 `scripts/predict/align_ab.sh CKPT ROOT CT UM BOX OUT` (a box origin off the grid, e.g. +64) prints mean |diff|, the > 8 / > 32 shares
 and the correlation overall, near window edges and in interiors. Rule: mean |diff| < 1 and > 32 under 0.1 % keeps the default,
 else --align 128 becomes the default.
+Result (2026-11-18, card 1, try6-2357 --ema 1 --gn-live 1, Paris 4 level 2 box 12288,3584,3584 x 512,768,768, window 384 / halo 64 for the
+~3 GB budget beside try9): mean |diff| 0.747, > 8 3.00 %, > 32 0.031 %, corr 0.9977; near window edges 0.746 / 0.030 %, interior 0.754 /
+0.038 % (a global shift, not an edge effect). Under the rule: --align 128 stays off by default (data audit #9 closed).
 
 **Data audit "lower" items (11-14, main: no deferrals).** Fibre positives in air: a fibre's own plane is unknown (255), not 254,
 where CT < `pos_iso` (default the source iso / 64; the iso -1 sources had no air test at all; CPU raster, the GPU kernel and
