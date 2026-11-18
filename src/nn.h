@@ -507,6 +507,7 @@ void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
 /* the fine voxel stem (src/nn_fstem.cu, train --fstem): params W1 [C][64] (4^3 taps at stride 2), b1 [C], W2 [nout][C]; fwd adds W2 silu(W1 x + b1)
    to the fp16 logit planes chs[o] (slab planes [z0, z0 + nz) of a D x H x W window, ns voxels a plane) on each 2^3 block; bwd accumulates the
    parameter gradients from fp16 gradient planes of that layout into gp. 1: a shape the kernels do not take (odd sizes, C or nout > 16) */
+void nn_fstem_set_pers(int v, int gcap);   /* tests: the fstem forward's persistent blocks (1, default) or a block per tile (0); -1: env UFSM_FSTEM_PERS; gcap: at most that many blocks */
 int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns);
 int nn_fstem_wscale(void);          /* W1's rows go to fp16 with a power-of-two scale (default; UFSM_FSTEM_WSCALE=0: unscaled); predict's mirror follows it */
 void nn_fstem_set_wscale(int on);

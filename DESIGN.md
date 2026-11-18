@@ -6,6 +6,27 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The fused fine stem: fields predict's fstem_fwd_k 46.7 -> 24.2 ms a window, same bytes (2026-11-17, branch convkfs-20261117)
+
+After the fused up + stem became the fields default (6a5933f1), fstem_fwd_k<true> took 47 of 122 ms of kernels a window (PHerc0332, 640
+windows, u1 13000), against a ~10 ms floor. The floor counts 6 fp16 outputs written once plus the CT read: fzA launches ~14.5 B a voxel, fzB
+(the w4 pair) ~6.5 B, ~198 GB over the profile, 442 ms at 448 GB/s, against 2072 measured. ncu on bench_fstem (P 512 slab of 32 planes, 6
+outputs) showed 92 registers, 41 % occupancy, DRAM 38 %, and two causes:
+- fs_stage. Each thread staged its 16 CT rows one after another (load, convert, store, next row), so it waited out 16 DRAM latencies in
+  turn: the top stall. mcc also emitted fs_stage out of line in the UP instance, on generic pointers, with every __half2 as two LD.E.U16
+  and every sr write a generic ST.E.U16. Now all 16 rows' loads go out before any store, and the helpers are __forceinline__.
+  bench 0.784 -> 0.630 ms fused, plain 0.583 -> 0.571.
+- The per-block setup. The W1 A fragments wait behind fs_w1_exp's scans and a barrier, 10.6 % of the samples, repeated by every
+  1024-voxel tile's block. The fused kernel is now persistent: 2 x the resident blocks (occupancy API), each looping over tiles, setup
+  once. bench 0.630 -> 0.561 ms; 1 x resident 0.574. The plain kernel, the trainer's head-slab instance, is slower persistent
+  (0.574 -> 0.59), so it keeps a block per tile.
+
+Every tile's arithmetic is unchanged. In situ: fstem_fwd_k 46.7 -> 24.2 ms a window, all kernels 121.8 -> 99.2. The fit-zarr fields
+(sp w dz dy dx pc) are byte-identical, 0 of 537 M voxels differ. bench_fstem's three output hashes are unchanged. test_fstem
+checks the persistent forward byte for byte against a block per tile (plain, fused fp16 / fp32 cells, 96 tiles over 3 blocks) and runs
+the fused-vs-chain checks with 3 blocks. UFSM_FSTEM_PERS: 0 a block per tile; N both kernels persistent at N x resident.
+Still ~14 ms above the floor: 92 registers and 5 blocks an SM; the per-output qs rows and the side-pair loads are the next items.
+
 ## ink-ext's CT prefetcher: reader3's unroll ink from 258 to 86 s over 5 wraps (same maps; 2026-11-17, branch r3fetch-20261117)
 
 The unroll's ink is now reader3 per surface (INKMODE=r3, da14d47f). Its end-to-end split on PHerc1667 (try9-6250 wraps, CT level 2 over

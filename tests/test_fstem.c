@@ -99,6 +99,38 @@ static int tiny_check(const uint16_t *x, void *xd) {
     nn_free(ld); nn_free(gd); nn_free(pd); nn_free(gpd); free(p); free(out); free(pf); free(gp); free(G); free(lg);
     return fails;
 }
+/* the persistent forward (blocks looping over tiles) against one block per tile: plain and fused (fp16 / fp32 cells), byte for byte */
+static int pers_check(void) {
+    enum { PD = 8, PH = 16, PW = 520, PC = 9, PBASE = 9, PLC = PBASE + 128 };
+    const int d = PD / 4, h = PH / 4, w = PW / 4; const size_t V = (size_t)PD * PH * PW, cpl = (size_t)h * w, NP = C * T + C + NO * C, ns = V;
+    uint64_t s = 23; int fails = 0;
+    uint16_t *x = malloc(V * 2), *ya = malloc(PC * ns * 2), *yb = malloc(PC * ns * 2); float *pf = malloc(NP * 4), *lc = malloc((size_t)PLC * d * cpl * 4);
+    for (size_t i = 0; i < V; i++) x[i] = f2h((float)(2 * rnd(&s)));
+    for (size_t i = 0; i < NP; i++) pf[i] = (float)(0.4 * rnd(&s));
+    for (size_t i = 0; i < (size_t)PLC * d * cpl; i++) lc[i] = (float)(4 * rnd(&s));
+    void *xd = nn_malloc(V * 2), *yd = nn_malloc(PC * ns * 2), *ch = nn_malloc((size_t)PLC * d * cpl * 4); float *pd = nn_malloc(NP * 4);
+    uint16_t *c16 = malloc((size_t)PLC * d * cpl * 2); for (size_t i = 0; i < (size_t)PLC * d * cpl; i++) c16[i] = f2h(lc[i]);
+    void *c16d = nn_malloc((size_t)PLC * d * cpl * 2);
+    nn_h2d(xd, x, V * 2); nn_h2d(pd, pf, NP * 4); nn_h2d(ch, lc, (size_t)PLC * d * cpl * 4); nn_h2d(c16d, c16, (size_t)PLC * d * cpl * 2);
+    for (int mode = 0; mode < 3; mode++) {   /* 0 plain (RMW onto planes), 1 fused fp16 cells, 2 fused fp32 cells */
+        for (int r = 0; r < 2; r++) {
+            nn_fstem_set_pers(r ? 1 : 0, r ? 3 : 0);
+            uint16_t *y0 = r ? yb : ya; for (size_t i = 0; i < PC * ns; i++) y0[i] = f2h((float)(0.001 * (double)(i % 997)));
+            nn_h2d(yd, y0, PC * ns * 2);
+            const int e = mode == 0 ? nn_fstem_fwd(xd, PD, PH, PW, 0, PD, pd, C, NO, chs, yd, ns)
+                                    : nn_fstem_up_fwd_t(xd, PD, PH, PW, 0, PD, pd, C, NO, chs, yd, ns, mode == 1 ? c16d : ch, mode == 1, 0, d, 0, PBASE);
+            if (e) { fprintf(stderr, "FAIL: pers shape\n"); return 1; }
+            nn_sync(); nn_d2h(y0, yd, PC * ns * 2);
+        }
+        size_t nd = 0; for (size_t i = 0; i < PC * ns; i++) nd += ya[i] != yb[i];
+        printf("fstem persistent fwd (%s, %d tiles over 3 blocks): %zu of %zu values differ from a block per tile\n", mode == 0 ? "plain" : mode == 1 ? "fused, fp16 cells" : "fused, fp32 cells",
+               PD / 2 * PH / 2 * ((PW / 2 + 127) / 128), nd, (size_t)PC * ns);
+        if (nd) { fprintf(stderr, "FAIL: persistent fstem forward\n"); fails++; }
+    }
+    nn_fstem_set_pers(-1, 0);
+    nn_free(xd); nn_free(yd); nn_free(ch); nn_free(c16d); nn_free(pd); free(x); free(ya); free(yb); free(pf); free(lc); free(c16);
+    return fails;
+}
 int main(void) {
     nn_init(0); int fails = 0; uint64_t s = 5;
     const size_t V = (size_t)D * H * W, NP = C * T + C + NO * C;
@@ -144,5 +176,7 @@ int main(void) {
     fails += tiny_check(x, xd);
     if (fails) return 1;
     if (up_check(1, 0) || up_check(0, 0) || up_check(1, 1) || up_check(0, 1)) return 1;
+    nn_fstem_set_pers(1, 3); if (up_check(1, 0) || up_check(0, 1)) return 1; nn_fstem_set_pers(-1, 0);   /* (the chains again with 3 persistent blocks) */
+    if (pers_check()) return 1;
     printf("test_fstem: ok\n"); return 0;
 }
