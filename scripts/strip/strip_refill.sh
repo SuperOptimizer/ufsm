@@ -11,6 +11,7 @@
 # PAP=DIR: also a papyrus-look preview per stripe (ink-compare --papyrus, --max-px 8000) DIR/<s>.jpg, made before the mosaic takes the
 # render. MEMGB: each render waits until MemAvailable exceeds it (default 80: a stripe render is ~40 GB RSS, keep 40 GB for the rest).
 #   env: U, CTR CTK (CT root / key at 9.6 um), INK INKK, INKGATE (two roots, key INKK: the ink gated by their max; the latent ink head), RENDER_NT, RJOBS (concurrent renders, 1), MOS_NT, MAXR, CTL, FILLX (render fill flags), STRETCH, PAP, MEMGB;
+#   R3INK (scripts/unroll/r3ink.sh, with its R3* env): each stripe's ink render replaced by a 2-D teacher on the stripe, CT-gated (unroll INKMODE=r3);
 #   STOP: OUT/STOP_FILL
 set -u
 OUT=$1
@@ -48,6 +49,7 @@ if [ $GATED = 1 ] && [ -z "${STRETCH:-}" ] && [ ! -e $OUT/stretch.gated ]; then
   N=${#S[@]}; mids=(); for k in $((N / 2 - 1)) $((N / 2)) $((N / 2 + 1)); do [ $k -ge 0 ] && [ $k -lt $N ] && mids+=(${S[$k]}); done
   for s in "${mids[@]}"; do [ -e $R/$s.done ] || { mkdir -p $R/in_$s; ln -sfn $OUT/strip/flat/stripes/$s $R/in_$s/$s
       UFSM_RENDER_MEM=16 nice -n 10 $U render $R/in_$s $R --volume $INK $INKK --ct $CTR $CTK --depth 1 --scale 1 --threads $RENDER_NT $FILLX "${GX[@]}" > $OUT/logs/refill_$s.log 2>&1 || { log "render $s FAILED"; exit 1; }
+      r3 $s || exit 1
       [ -e $R/${s}_fill.tif ] && mv $R/${s}_fill.tif $M/; rm -r $R/in_$s; touch $R/$s.gated $R/$s.done; }
     gate $s || exit 1; done
   # (in C, byte for byte the numpy step it replaced: every 7th masked pixel per stripe, numpy's linear percentiles; ~2 min -> ~5 s, 2026-11-17)
@@ -55,14 +57,20 @@ if [ $GATED = 1 ] && [ -z "${STRETCH:-}" ] && [ ! -e $OUT/stretch.gated ]; then
   log "stretch from the gated middle stripes (papyrus-only ink): $st (was $(cat $OUT/stretch.txt 2> /dev/null))"
   cp -f $OUT/stretch.txt $OUT/stretch.ungated.txt 2> /dev/null; echo $st > $OUT/stretch.txt; touch $OUT/stretch.gated
 fi
-for d in $R/*.done; do [ -e "$d" ] || continue; s=$(basename $d .done); [ -e $R/${s}_ct.tif ] && { gate $s || exit 1; }; done   # (renders reused from the driver)
+for d in $R/*.done; do [ -e "$d" ] || continue; s=$(basename $d .done); [ -e $R/${s}_ct.tif ] && { gate $s || exit 1; r3 $s || exit 1; }; done   # (renders reused from the driver)
 ST=${STRETCH:-$(cat $OUT/stretch.txt 2> /dev/null)}; [ -n "$ST" ] || { log "no stretch (OUT/stretch.txt or STRETCH)"; exit 1; }
+r3() {   # R3INK: the stripe's ink render replaced by the 2-D teacher's map on the same grid, gated by the filled CT (r3ink.sh)
+  local s=$1; [ -n "${R3INK:-}" ] || return 0; [ -e $R/$s.r3 ] && return 0
+  bash $R3INK $OUT/strip/flat/stripes/$s $R/$s.tif $R/${s}_ct.tif >> $OUT/logs/refill_$s.log 2>&1 || { log "r3ink $s FAILED (logs/refill_$s.log)"; return 1; }
+  touch $R/$s.r3
+}
 rend() {   # one stripe -> render_fill/<s>.tif, <s>_ct.tif, <s>.done; fillmap/<s>_fill.tif
   local s=$1; [ -e $R/$s.done ] && return 0
   while [ $(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo) -lt $MEMGB ]; do sleep 30; done
   mkdir -p $R/in_$s; ln -sfn $OUT/strip/flat/stripes/$s $R/in_$s/$s
-  rm -f $R/$s.gated
+  rm -f $R/$s.gated $R/$s.r3
   UFSM_RENDER_MEM=16 nice -n 10 $U render $R/in_$s $R --volume $INK $INKK --ct $CTR $CTK --depth 1 --scale 1 --threads $RENDER_NT $FILLX "${GX[@]}" > $OUT/logs/refill_$s.log 2>&1 || { log "render $s FAILED"; return 1; }
+  r3 $s || return 1
   [ -e $R/${s}_fill.tif ] && mv $R/${s}_fill.tif $M/; [ $GATED = 1 ] && touch $R/$s.gated
   if [ -n "$PAP" ]; then mkdir -p $PAP
     nice -n 10 $U ink-compare $PAP/$s.jpg --ct $R/${s}_ct.tif --ink ink=$R/$s.tif --papyrus ink --papyrus-gain 1 --papyrus-bg 128 --stretch --stretch-ct \

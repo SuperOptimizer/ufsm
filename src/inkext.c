@@ -422,8 +422,10 @@ static void gpu_submit(gworker *G, uint8_t **tiles, int **tx, int **ty, int nb) 
 /* the probability map (model grid Wm x Hm) of one surface */
 static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *pdu, float **pctl) {
     const ie_spec *sp = X->sp; const int D = sp->D, T = sp->T;
-    /* CT level: the coarsest not coarser than the spacing (5% slack) */
-    int L = 0; for (int l = 0; l < X->nlev; l++) if (X->lev_um[l] <= X->px_um * 1.05) L = l;
+    /* CT level: the coarsest present level not coarser than the spacing (5% slack); none (only coarser levels exist): refuse, a
+       coarser read would change the model's input */
+    int L = -1; for (int l = 0; l < X->nlev; l++) if (X->lev[l].z && X->lev_um[l] <= X->px_um * 1.05) L = l;
+    if (L < 0) { fprintf(stderr, "ink-ext: %s: no CT level at <= %.3f um (the model's %.3f um) present\n", S->name, X->px_um * 1.05, X->px_um); return nullptr; }
     irender R = {0}; R.S = S; R.L = &X->lev[L]; R.lscale = X->lev_um[L] / X->lev_um[0]; R.D = D; R.center = (D - 1) * 0.5; R.reverse = X->reverse; R.shift = X->shift;
     R.ss = (int)lround(X->px_um / X->lev_um[L]); if (R.ss < 1) R.ss = 1;
     R.du = X->px_um / (S->vox_um / S->scale); R.step_vox = X->px_um / X->lev_um[0];
@@ -737,13 +739,14 @@ int cmd_ink_ext(int argc, char **argv) {
         char k[1100], lk[8]; snprintf(k, sizeof k, "%s/%d", argv[ci + 2], l);
         int local = 0; if (lst) for (const char *q = llev; *q; q++) if (*q - '0' == l && (q == llev || q[-1] == ',') && (!q[1] || q[1] == ',')) local = 1;
         (void)lk;
-        z3 *z = z3_open(local ? lst : st, k, local ? nullptr : cache); if (!z) break;
+        X.lev_um[l] = ct_um * (1 << l);   /* OME scales are relative (1, 2, 4 ..): the level-0 voxel size is --ct-um */
+        /* a missing level is skipped, not the end (the unrolls' local CT copies hold levels 2-5 only: reader3 at 9.6 um needs level 2) */
+        z3 *z = z3_open(local ? lst : st, k, local ? nullptr : cache); if (!z) continue;
         if (local) fprintf(stderr, "ink-ext: CT level %d from %s\n", l, lroot);
         const z3_meta *m = z3_meta_of(z);
         if (m->chunk[0] != CE || m->chunk[1] != CE || m->chunk[2] != CE) { fprintf(stderr, "ink-ext: %s: chunks must be 128^3\n", k); return 1; }
         ctlev *L = &X.lev[l]; L->z = z; for (int d = 0; d < 3; d++) L->shape[d] = m->shape[d];
         L->budget = X.ct_mem; L->zero = calloc((size_t)CE * CE * CE, 1); X.nlev = l + 1;
-        X.lev_um[l] = ct_um * (1 << l);   /* OME scales are relative (1, 2, 4 ..): the level-0 voxel size is --ct-um */
     }
     if (!X.nlev) { fprintf(stderr, "ink-ext: no CT levels under %s %s: %s\n", argv[ci + 1], argv[ci + 2], z3_error()); return 1; }
     fprintf(stderr, "ink-ext: batch %d, CT %s %s (%d levels, %.3f um), stride %d\n", X.batch, argv[ci + 1], argv[ci + 2], X.nlev, X.lev_um[0], X.stride > 0 ? X.stride : X.sp->stride);
@@ -770,7 +773,8 @@ surfaces:;
         if (gc && (sscanf(gc, "%d,%d,%d,%d", cc, cc + 1, cc + 2, cc + 3) != 4 || isurf_crop(&S, cc[0], cc[1], cc[2], cc[3]))) { fprintf(stderr, "ink-ext: bad --grid-crop\n"); return 2; }
         const char *pre = iopt(argc, argv, "--prefix", ""); char nm[600]; snprintf(nm, sizeof nm, "%s%s", pre, S.name);
         if (iflag(argc, argv, "--inward") && !lonly) {   /* the layer order whose read runs radially inward (the published PHerc1447 renders' order, the w058 control) */
-            const char *oc = iopt(argc, argv, "--center", nullptr); double cx = X.lev[0].shape[2] * 0.5, cy = X.lev[0].shape[1] * 0.5;
+            const char *oc = iopt(argc, argv, "--center", nullptr); int l0 = 0; while (l0 + 1 < X.nlev && !X.lev[l0].z) l0++;   /* (the finest present level, in level-0 voxels) */
+            double cx = X.lev[l0].shape[2] * 0.5 * (1 << l0), cy = X.lev[l0].shape[1] * 0.5 * (1 << l0);
             if (oc) sscanf(oc, "%lf,%lf", &cx, &cy);
             double sum = 0; long cnt = 0;
             for (int r = 0; r + 1 < S.h; r += 4) for (int q = 0; q + 1 < S.w; q += 4) {

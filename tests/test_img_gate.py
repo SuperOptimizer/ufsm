@@ -32,7 +32,12 @@ with tempfile.TemporaryDirectory(prefix="ufsm-imggate-") as tmp:
     assert not bad.size, f"{bad.size} px differ, first i {i.flat[bad[0]]} g {max(g1.flat[bad[0]], g2.flat[bad[0]])}: {o.flat[bad[0]]} vs {ref.flat[bad[0]]}"
     run(BIN, "img-gate", d / "i.tif", d / "g1.tif", d / "g2.tif")   # in place
     assert (t.imread(d / "i.tif") == ref).all()
-print("img-gate: 65536 pairs equal to numpy")
+    # --min T (r3ink.sh's CT papyrus gate): the gate binarised, 255 where max(gates) >= T: IMG kept or zeroed
+    t.imwrite(d / "i.tif", i, compression="zlib", rowsperstrip=64)
+    for T in (0, 1, 80, 255):
+        run(BIN, "img-gate", d / "i.tif", d / "g1.tif", d / "g2.tif", "--min", T, "--out", d / "m.tif")
+        assert (t.imread(d / "m.tif") == np.where(np.maximum(g1, g2) >= T, i, 0)).all(), f"--min {T}"
+print("img-gate: 65536 pairs equal to numpy, --min binary gate exact")
 
 # img-stretch: strip_refill.sh's gated stretch (numpy 'linear' percentiles of every 7th masked pixel per stripe), several distributions
 def np_stretch(ctl, pairs):

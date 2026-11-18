@@ -68,9 +68,17 @@ ncpu() { local n; n=$($U sysinfo --ncpu 2> /dev/null) && [ "$n" -gt 0 ] 2> /dev/
 availgb() { local g; g=$($U sysinfo --avail-gb 2> /dev/null) && [ "$g" -ge 0 ] 2> /dev/null && { echo $g; return; }
             g=$(cgmax memory.max) && { awk -v m=$g '/^anon |^shmem / {u += $2} END {print int((m - u) / 1073741824)}' /sys/fs/cgroup/memory.stat; return; }
             awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo; }
-# the ink: INKMODE lat (default since 2026-11-14, the latent-ink-only policy): scripts/pod/latink.sh (two tile grids + ink-blend, ink / c12 /
-# c13 heads, --axis) with LATINK_CK (default the newest inkpod snap, 15000) as INKCMD; INKMODE ift3: the legacy feathered single pass of INKCK
-INKMODE=${INKMODE:-lat}
+# the ink: INKMODE r3 (default since 2026-11-17, user: "skip inkpod, it's no good"): no ink volume; every stripe / per-wrap render's ink is
+# replaced by a frozen 2-D teacher on that surface (r3ink.sh: ink-ext reader3; R3W=reader3.pth,argus-v2.pth for the reader3 + Argus V2
+# ensemble), papyrus-gated by the render's filled CT >= R3GATE (80). Held-out 1667 AUC on the try9-6250 wraps: reader3 0.858, argus2 0.851,
+# inkpod 0.582 (DESIGN "2-D ink teachers on the try9-6250 pod unrolls"). The renders read the CT as their --volume (its render is replaced).
+# INKMODE lat (opt-in; the default 2026-11-14 .. 11-17): scripts/pod/latink.sh (two tile grids + ink-blend, ink / c12 / c13 heads, --axis)
+# with LATINK_CK (default the inkpod 15000 snap) as INKCMD; INKMODE ift3: the legacy feathered single pass of INKCK
+INKMODE=${INKMODE:-r3}
+if [ "$INKMODE" = r3 ]; then
+  R3W=${R3W:-/vesuvius/ufsm/inksdk/weights/ink_9um@reader-v3/reader-v3.pth}; INKNAME=${INKNAME:-$(for w in ${R3W//,/ }; do basename $w .pth; done | paste -sd+)}
+  [ -z "${INKCMD:-}" ] || { echo "unroll: INKMODE=r3 takes no INKCMD (INKMODE=lat for latink)"; exit 2; }
+fi
 if [ "$INKMODE" = lat ] && [ -z "${INKCMD+x}" ]; then
   export LATINK_CK=${LATINK_CK:-/vesuvius/ufsm/v2/lat/runs/inkpod/snap/15000.ckpt} U; INKCMD="bash $([ -e $H/latink.sh ] && echo $H || echo $H/../pod)/latink.sh";   # (the run's copy in $O/bin, the repo's on DRY)
   INKNAME=${INKNAME:-inkpod-$(basename $LATINK_CK .ckpt)}
@@ -117,10 +125,13 @@ if [ -z "${STRIPARGS:-}" ]; then STRIPARGS=$(echo " $TSTRIP " | sed -E 's/ --las
 FKIND=${FKIND:-auto}; [ "$FKIND" = auto ] && { head -c 8192 "$CK" 2> /dev/null | grep -q '"lat_c"' && FKIND=lat || FKIND=vox; }
 FNAME=$([ "$FKIND" = lat ] && echo lat || echo wind96)
 F=$O/fields/$FNAME; REF=$O/ref-cf; INK=$O/ink/$INKNAME.zarr
+# the renders' --volume: the ink volume, or with INKMODE=r3 the CT itself (its render is replaced by r3ink.sh); r3ink.sh's settings exported
+if [ "$INKMODE" = r3 ]; then VROOT=$R; VKEY=$K/$LV; else VROOT=$INK; VKEY=$LUM; fi
+[ "$INKMODE" = r3 ] && export U R3CTR=$R R3CTK=$K R3W R3GATE=${R3GATE:-${FILLCT:-80}} R3TH=${R3TH:-8} R3X="--ct-um $UM ${R3X:-}"
 
 # the run's own copy of the scripts (bash reads scripts incrementally: editing the repo must not change a running driver)
 if [ "$DRY" != 1 ] && [ "${UNROLL_COPY:-0}" != 1 ]; then
-  mkdir -p $O/bin && cp $H/unroll.sh $H/fields_cat.sh $H/scrolls.tsv $H/spiral_dir.tsv $REPO/scripts/wbench/mkcrop.sh $REPO/scripts/strip/strip_run.sh $REPO/scripts/strip/strip_refill.sh $REPO/scripts/pod/latink.sh $O/bin/ || exit 1
+  mkdir -p $O/bin && cp $H/unroll.sh $H/fields_cat.sh $H/scrolls.tsv $H/spiral_dir.tsv $REPO/scripts/wbench/mkcrop.sh $REPO/scripts/strip/strip_run.sh $REPO/scripts/strip/strip_refill.sh $REPO/scripts/pod/latink.sh $H/r3ink.sh $O/bin/ || exit 1
   UNROLL_COPY=1 UNROLL_REPO=$REPO exec bash $O/bin/unroll.sh "$@"
 fi
 MKCROP=$H/mkcrop.sh; [ -e $MKCROP ] || MKCROP=$REPO/scripts/wbench/mkcrop.sh
@@ -182,10 +193,11 @@ mstart() {
   mset run_start "$(date '+%F %T')"; mset host "$(hostname)"; mset ufsm "$(readlink -f $U)"; mset ufsm_sha "$(fsha $U)"
   mset repo_commit "$(git -C $REPO rev-parse --short HEAD 2> /dev/null || cat $REPO/COMMIT 2> /dev/null || echo unknown)"
   mset ct "$R $K level $LV ($LUM um)"; mset ck "$(readlink -f $CK)"; mset ck_sha "$(fsha $CK)"; mset fields_kind $FKIND
-  if [ -n "${INKCMD:-}" ]; then mset inkcmd "$INKCMD"; mset ink_ck "${LATINK_CK:-the default of INKCMD}"; [ -n "${LATINK_CK:-}" ] && mset ink_ck_sha "$(fsha $LATINK_CK)"
+  if [ "$INKMODE" = r3 ]; then mset ink_ck "r3ink.sh $R3W"; mset ink_ck_sha "$(for w in ${R3W//,/ }; do fsha $w; done | paste -sd,)"
+  elif [ -n "${INKCMD:-}" ]; then mset inkcmd "$INKCMD"; mset ink_ck "${LATINK_CK:-the default of INKCMD}"; [ -n "${LATINK_CK:-}" ] && mset ink_ck_sha "$(fsha $LATINK_CK)"
   else mset ink_ck "$(readlink -f $INKCK)"; mset ink_ck_sha "$(fsha $INKCK)"; fi
   mset box "${BOX:-mask}"; mset zr "${ZR:--}"; mset stripargs_env "${STRIPARGS:-}"
-  mset env "$(for v in CK FEMA INKCK INKCMD LATINK_CK FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
+  mset env "$(for v in CK FEMA INKCK INKCMD LATINK_CK R3W R3GATE FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
 }
 mstage() {
   [ "$DRY" = 1 ] && return 0
@@ -453,7 +465,7 @@ rectosp() {
 # run on GPU INKGPU beside the ref (INKAT=slabs) while the main pass waits for the slabs. INKCMD: nothing (the recipe does its own).
 # INKCALZ: the band's rows (2048; P4: 505 windows, 148 s)
 inkcal() {
-  { [ -n "${INKCMD:-}" ] || onepass_on; } && return 0
+  { [ -n "${INKCMD:-}" ] || onepass_on || [ "$INKMODE" = r3 ]; } && return 0
   [ "$DRY" = 1 ] || mkdir -p $O/ink
   local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
   cal=$(echo $box | awk -F, -v cz=${INKCALZ:-2048} '{ zc = $1 + int($4 / 2); z0 = zc - int(cz / 2); if (z0 < $1) z0 = $1; nz = cz; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
@@ -462,6 +474,7 @@ inkcal() {
                              { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || return 1; }
 }
 ink() {
+  [ "$INKMODE" = r3 ] && { [ "$DRY" = 1 ] && echo "    (INKMODE=r3: no ink volume; the renders' ink is r3ink.sh on each surface, $R3W)"; return 0; }
   [ "$DRY" = 1 ] || mkdir -p $O/ink
   # INKCMD set but empty (a pod env with an unset path, "INKCMD=$X"): fail loudly instead of falling back to the default prediction;
   # any INKCMD must leave a readable zarr at $INK (a dangling link from a missing published ink fails here, not in the renders)
@@ -774,7 +787,7 @@ inkgate() { [ "${INKGATE:-1}" = 0 ] && return 0; [ -e $O/ink/c12.zarr/zarr.json 
 stripimg() {
   local ST=$O/strip RF=$O/strip/render_fill S N k s
   local E="UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_ZCACHE_ADMIT=${ZCACHE_ADMIT:-0.6} UFSM_JPEG_THREADS=$JPEGT UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} UFSM_RENDER_MEM=${UFSM_RENDER_MEM:-16} ${RGPU:+CUDA_VISIBLE_DEVICES=$RGPU}"
-  if [ "$DRY" = 1 ]; then echo "    $E: stretch from the 3 middle stripes (render $FILLX + strip-mosaic --stretch-only), then U=$U CTR=$R CTK=$K/$LV INK=$INK INKK=$LUM PAPMOS=$ST/img_pap bash scripts/strip/strip_refill.sh $ST"; return 0; fi
+  if [ "$DRY" = 1 ]; then echo "    $E: stretch from the 3 middle stripes (render $FILLX + strip-mosaic --stretch-only), then U=$U CTR=$R CTK=$K/$LV INK=$VROOT INKK=$VKEY PAPMOS=$ST/img_pap bash scripts/strip/strip_refill.sh $ST$([ "$INKMODE" = r3 ] && echo " (R3INK: each stripe's ink by r3ink.sh: $R3W, gate CT >= $R3GATE, $R3X)")"; return 0; fi
   mkdir -p $RF $ST/fillmap $ST/logs; S=($(ls $ST/strip/flat/stripes)); N=${#S[@]}; [ $N -gt 0 ] || return 1
   if [ ! -s $ST/stretch.txt ]; then
     # the 3 middle stripes' renders at once (SJOBS, default by memory: a Paris 4 stripe render peaks at ~21 GB RSS and 4 GB of device
@@ -785,7 +798,8 @@ stripimg() {
     # gated stretch strip_refill.sh computes replaces it either way)
     local GX=() g; for g in $(inkgate); do GX+=(--gate $g $LUM); done
     srend() { local s=$1; mkdir -p $RF/in_$s; ln -sfn $ST/strip/flat/stripes/$s $RF/in_$s/$s
-      env $E /usr/bin/time -v nice -n 10 $U render $RF/in_$s $RF --volume $INK $LUM --ct $R $K/$LV --depth 1 --scale 1 --threads ${RENDER_NT:-$TH} $FILLX "${GX[@]}" > $ST/logs/refill_$s.log 2>&1 || return 1
+      env $E /usr/bin/time -v nice -n 10 $U render $RF/in_$s $RF --volume $VROOT $VKEY --ct $R $K/$LV --depth 1 --scale 1 --threads ${RENDER_NT:-$TH} $FILLX "${GX[@]}" > $ST/logs/refill_$s.log 2>&1 || return 1
+      if [ "$INKMODE" = r3 ]; then env $E bash $H/r3ink.sh $ST/strip/flat/stripes/$s $RF/$s.tif $RF/${s}_ct.tif >> $ST/logs/refill_$s.log 2>&1 || return 1; touch $RF/$s.r3; fi   # (.r3: strip_refill.sh reuses it)
       [ -e $RF/${s}_fill.tif ] && mv $RF/${s}_fill.tif $ST/fillmap/; rm -r $RF/in_$s; [ ${#GX[@]} -gt 0 ] && touch $RF/$s.gated; touch $RF/$s.done; }
     for k in $((N / 2 - 1)) $((N / 2)) $((N / 2 + 1)); do [ $k -ge 0 ] && [ $k -lt $N ] || continue; s=${S[$k]}; [ -e $RF/$s.done ] && continue
       while [ ${#pids[@]} -ge $sj ]; do wait ${pids[0]} || rc=1; pids=("${pids[@]:1}"); done
@@ -798,7 +812,7 @@ stripimg() {
   fi
   # RJOBS: 2 stripe renders at once when >= 64 GB is available (0490B: 394 -> 355 s, 6.7 -> 18.4 GB RSS, same images), else 1
   local rj=${RJOBS:-$([ $(availgb) -ge 64 ] && echo 2 || echo 1)}
-  env $E U=$U CTR=$R CTK=$K/$LV INK=$INK INKK=$LUM RJOBS=$rj RENDER_NT=${RENDER_NT:-$TH} MOS_NT=${MOS_NT:-4} MAXR=${MAXR:-6} MEMGB=${RMEMGB:-0} \
+  env $E U=$U CTR=$R CTK=$K/$LV INK=$VROOT INKK=$VKEY $([ "$INKMODE" = r3 ] && echo "R3INK=$H/r3ink.sh") RJOBS=$rj RENDER_NT=${RENDER_NT:-$TH} MOS_NT=${MOS_NT:-4} MAXR=${MAXR:-6} MEMGB=${RMEMGB:-0} \
     PAPMOS=$ST/img_pap PGAIN=${PGAIN:-1} PAPPX=${PAPPX:-8000} FILLX="$FILLX" INKGATE="$(inkgate)" /usr/bin/time -v bash $REFILL $ST >> $O/logs/stripimg.log 2>&1 &&
     [ -e $ST/img_fill/overview.jpg ] && log "stripimg: $(grep '^strip-mosaic: .* overview' $ST/logs/mosaic_fill.log | head -1)"
 }
@@ -813,14 +827,15 @@ pw_one() {   # pw_one WRAP GPU (a background subshell: the cache env stays in it
   fi
   nice -n 10 $U tifxyz-scale $O/flat $O/up 1 --wraps $w --flip-rows 1 > /dev/null 2>&1 || return 1
   mkdir -p $d/in; ln -sfn $O/up/$w $d/in/$w
-  UFSM_RENDER_MEM=16 UFSM_RENDER_CHUNKED=1 UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} CUDA_VISIBLE_DEVICES=$gpu nice -n 10 $U render $d/in $d --volume $INK $LUM --ct $R $K/$LV --depth 1 --scale 1 --threads ${RTH:-8} > $d/render.log 2>&1 || return 1
+  UFSM_RENDER_MEM=16 UFSM_RENDER_CHUNKED=1 UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} CUDA_VISIBLE_DEVICES=$gpu nice -n 10 $U render $d/in $d --volume $VROOT $VKEY --ct $R $K/$LV --depth 1 --scale 1 --threads ${RTH:-8} > $d/render.log 2>&1 || return 1
+  if [ "$INKMODE" = r3 ]; then R3GPU=$gpu bash $H/r3ink.sh $O/up/$w $d/$w.tif $d/${w}_ct.tif >> $d/render.log 2>&1 || return 1; fi
   nice -n 10 $U ink-compare $O/img/${w}_full_side.jpg --ct $d/${w}_ct.tif --ink "$INKNAME=$d/$w.tif" --px-um $LUM --stretch --stretch-ct --max-px 65000 --threads ${RTH:-8} \
     --then $O/prev/${w}_side.jpg --max-px 8000 > $d/stats.txt 2>&1 || return 1   # (its status is the job's: audit mini/shell #4)
   [ -e $O/img/${w}_full_side.jpg ] && rm -f $d/$w.tif $d/${w}_ct.tif
   echo "$(date '+%F %T') $w $(grep -E '^[^ ]+: input' $L.flat.log | head -1 | grep -oE '= [0-9.]+ cm2')" >> $O/logs/perwrap.list
 }
 perwrap() {
-  [ "$DRY" = 1 ] && { echo "    per wrap (largest first, SPAR ${SPAR:-4}, GPUs of FITGPUS in turn): tifxyz-scale -> flatten --gpu 1 -> tifxyz-scale --flip-rows 1 -> render (ink + CT) -> ink-compare --then"; return 0; }
+  [ "$DRY" = 1 ] && { echo "    per wrap (largest first, SPAR ${SPAR:-4}, GPUs of FITGPUS in turn): tifxyz-scale -> flatten --gpu 1 -> tifxyz-scale --flip-rows 1 -> render (ink + CT)$([ "$INKMODE" = r3 ] && echo " -> r3ink.sh (the ink: $R3W, gate CT >= $R3GATE)") -> ink-compare --then"; return 0; }
   mkdir -p $O/orig $O/flat $O/up $O/r $O/img $O/prev $O/logs/pw
   local w k=0 nf=0 p pg=($FITGPUS) WD=$(wrapsdir); local -A pid
   for w in $(for f in $WD/w*.sfc; do w=$(basename $f .sfc); [ -e $O/img/${w}_full_side.jpg ] || echo "$(stat -c %s $f) $w"; done | sort -rn | awk '{print $2}'); do
