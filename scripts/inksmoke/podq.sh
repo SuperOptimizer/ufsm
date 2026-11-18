@@ -20,6 +20,8 @@
 #   (FULL)  teach: reader3 + ink9um maps of every labelled mesh, ink-teach per scroll; armB: sources-B.json, 3000 steps
 # Then K/state/ALLDONE: the pod is idle. Smoke time on a pod (estimate): setup ~5 min, prefetch ~15 min (166k chunks, beside narrow +
 # weights), trainer start (source index, ink targets) ~10 min, 200 steps ~5-10 min: ~35-45 min, capped by ARMMAX.
+# INIT (the trunk, default K/ckpt/u1-13000-w.ckpt, sha1-checked; another INIT: INITSHA1 checked when set) with TARCH / TXTRA / TUW for
+# trainarm.sh (try9: see there). MINFREE (GB, 60): the prefetch needs that much free on K's disk (all six scrolls ~47 GB at P 1024).
 # Env: K (/root/ink), COMMIT (required: the master commit), FULL (0), LOCK (/root/gpu.lock), BJ (6), GPU (0), STEPS (200 / 3000),
 #      SCROLLS (the subset above / all), MINSPS10, MINSPS, ARMMAX (2700 / 0 = none), WORKERS / SLOTS (2 / 3; a worker builds one window at a time, slots - 1 at once; desk dry run 11-18 at 1 / 2, 4 scrolls: 13-14 GB RSS, 1 worker thread at 100 %; the older sampler-only check
 #      of arm A held 23-24 GB RSS at 2 / 2 before any pinned memory; the pod cgroup has 31 GB). Run it from the kit copy (K/kit/podq.sh:
@@ -73,6 +75,8 @@ print('\\n'.join(bad[:10])); sys.exit(1 if bad else 0)" $AD/sources-$1.json > $A
 prefetch() {   # prefetch ARM: cold https CT read by one sampler worker gave 30 steps in 4 h on pod B (0.003 samples/s)
   done_ prefetch$1$TAG && return 0
   $U prefetch $AD/sources-$1.json --levels 2 --threads ${PFTH:-24} --P ${P:-1024} > $K/prefetch$1$TAG.log 2>&1 && touch $S/prefetch$1$TAG.done; }
+INIT=${INIT:-$K/ckpt/u1-13000-w.ckpt}; export TARCH="${TARCH:-}" TXTRA="${TXTRA:-}" TUW="${TUW:-1}"; [ -n "$TARCH" ] || unset TARCH
+fr=$(df -BG --output=avail $K | tail -1 | tr -dc 0-9); done_ prefetchA$TAG || [ "${fr:-0}" -ge ${MINFREE:-60} ] || die "only ${fr} GB free on $K (MINFREE ${MINFREE:-60})"
 mkarms A; PFPID=; if ! done_ prefetchA$TAG; then say "prefetch A ($TAG, scrolls ${SCROLLS:-all}) in the background"; prefetch A & PFPID=$!; fi
 # --- narrow ---
 if ! done_ narrow; then
@@ -91,8 +95,10 @@ if ! done_ weights; then
       e635558ae6a1a807a7e5ec1e83adfd45bc3c0ac53883ea43f1d4e085d62a9cab
   get https://huggingface.co/scrollprize/ink_9um/resolve/7109667e2607db1b90c37c8b09cb876ea7fe7bb1/hybrid_3d2d-seed43/step-075000.pth $K/weights/ink9um-s43.pth \
       2aeaa85a35ef28d7bc7bf3e848c4a6a91385e9132710927fdba41133c4ecb28f
-  [ "$(sha1sum $K/ckpt/u1-13000-w.ckpt 2>/dev/null | cut -d' ' -f1)" = 0d05642296829a4ca588bd7d91eb30f1470a3941 ] || cp /root/pod/ckpt/u1-13000-w.ckpt $K/ckpt/u1-13000-w.ckpt
-  [ "$(sha1sum $K/ckpt/u1-13000-w.ckpt | cut -d' ' -f1)" = 0d05642296829a4ca588bd7d91eb30f1470a3941 ] || die "u1-13000-w sha1"
+  if [ "$INIT" = $K/ckpt/u1-13000-w.ckpt ]; then
+    [ "$(sha1sum $K/ckpt/u1-13000-w.ckpt 2>/dev/null | cut -d' ' -f1)" = 0d05642296829a4ca588bd7d91eb30f1470a3941 ] || cp /root/pod/ckpt/u1-13000-w.ckpt $K/ckpt/u1-13000-w.ckpt
+    [ "$(sha1sum $K/ckpt/u1-13000-w.ckpt | cut -d' ' -f1)" = 0d05642296829a4ca588bd7d91eb30f1470a3941 ] || die "u1-13000-w sha1"
+  else [ -s "$INIT" ] || die "no INIT $INIT"; [ -z "${INITSHA1:-}" ] || [ "$(sha1sum "$INIT" | cut -d' ' -f1)" = "$INITSHA1" ] || die "INIT sha1 ($INIT)"; fi
   mark weights
 fi
 if [ -n "$PFPID" ]; then wait $PFPID; fi; done_ prefetchA$TAG || die "prefetch A (log $K/prefetchA$TAG.log)"; say "prefetch A done ($(el); $(tail -1 $K/prefetchA$TAG.log | cut -c1-160))"
@@ -115,7 +121,7 @@ arm() {   # arm A | B
   local a=$1; done_ arm$a$TAG && return 0
   mkarms $a; [ $a = A ] || { prefetch $a; done_ prefetch$a$TAG || die "prefetch $a (log $K/prefetch$a$TAG.log)"; }
   say "arm $a: training $STEPS steps ($TAG, $(el))"; local t0=$(date +%s)
-  ( R=$RD U=$U INIT=$K/ckpt/u1-13000-w.ckpt LATB=$K/kit/klt1.lcb GPU=$GPU LOCK=$LOCK RELAUNCH=3 WORKERS=${WORKERS:-2} SLOTS=${SLOTS:-3} bash $D/trainarm.sh $a $AD/sources-$a.json ) > $RD/arm$a.out 2>&1 &
+  ( R=$RD U=$U INIT=$INIT LATB=$K/kit/klt1.lcb GPU=$GPU LOCK=$LOCK RELAUNCH=3 WORKERS=${WORKERS:-2} SLOTS=${SLOTS:-3} bash $D/trainarm.sh $a $AD/sources-$a.json ) > $RD/arm$a.out 2>&1 &
   local tp=$! st=0 sps rss cg MEMS; RSSPK=0
   stoparm() { touch $RD/inksmoke$a.stop; kill $(cat $RD/inksmoke$a.pid 2>/dev/null) 2>/dev/null; sleep 30; sanity $a; die "$*"; }
   while kill -0 $tp 2>/dev/null; do
