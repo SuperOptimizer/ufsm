@@ -120,6 +120,7 @@ static int run(int sf, int N, int D, int H, int W, int ci, int co, int k, int st
     }
     xnet_set_mx(sf); xnet_set_mxq(mode); xnet_set_mxrot(g_rot); xnet_set_mxa(g_mxa);
     xconv c; if (xconv_init(&c, w, co, ci, k, k, k, st, st, st, pd, pd, pd, nullptr, b)) { fprintf(stderr, "xconv_init failed\n"); return 1; }
+    if (sf && c.mxrows < (co + 127) / 128 * 128) { fprintf(stderr, "co %d: %d packed MX weight rows, the BN 128 tiles read %d\n", co, c.mxrows, (co + 127) / 128 * 128); return 1; }
     xt xd = xt_new(N, D, H, W, ci); xh2d(xd.p, xh, nx * 2);
     xt yd = xconv_fwd(&c, xd, nullptr, XA_NONE); xd2h(yh, yd.p, ny * 2);
     if (xnet_check("test_xmx")) return 1;
@@ -369,6 +370,7 @@ int main(void) {
         fails += run(sf, 2, 5, 10, 40, 32, 32, 3, 1, 0);    /* halo kernel: TX 32 tiles with ragged edges */
         fails += run(sf, 1, 7, 9, 36, 128, 64, 3, 1, 0);    /* halo kernel: two chunk pairs, ragged */
         fails += run(sf, 1, 6, 6, 20, 64, 96, 3, 1, 0);     /* halo kernel: TX 16, outputs not a multiple of 32 */
+        fails += run(sf, 1, 4, 32, 32, 64, 320, 1, 1, 0);   /* the BN 128 tile with co % 128 = 64 (reader3's 320): its last tile column's weight rows */
         for (int mode = 1; mode <= 2; mode++) {            /* the least-squares weight scales (UFSM_XNET_MXQ) */
             fails += run(sf, 2, 9, 7, 11, 32, 32, 3, 1, mode);
             fails += run(sf, 1, 6, 5, 7, 128, 256, 1, 1, mode);

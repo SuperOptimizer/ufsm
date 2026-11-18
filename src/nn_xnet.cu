@@ -550,7 +550,10 @@ static int mx_pack(xconv *c, const float *wk, int co, int sf, int wseq) {
     return rc;
 }
 static int mx_pack1(xconv *c, const float *wk, int co, int sf, int wseq) {
-    const int nch = (c->K + 31) / 32, nst = (nch + 1) / 2, Cop = (co + 63) / 64 * 64; const size_t rch = (size_t)nst * 2;
+    /* rows padded to 128, the widest MX tile (BN 128): conv_mx's B loader fetches every row of its last column of tiles. Padded to 64 (until
+       2026-11-18), a 320-output conv's last tile read rows 320..383, 92 KB past its weights at K 2880: an intermittent illegal address in
+       reader3 / hecate MX5 (1 process in 5 on the pod, depending on what the allocator had mapped behind the block) */
+    const int nch = (c->K + 31) / 32, nst = (nch + 1) / 2, Cop = (co + 127) / 128 * 128; const size_t rch = (size_t)nst * 2;
     uint8_t *q = (uint8_t *)calloc((size_t)Cop * rch * 16, 1), *sb = (uint8_t *)calloc((size_t)Cop * rch * 4, 1); float *gs = (float *)malloc(Cop * sizeof(float));
     double *err = (double *)calloc((size_t)Cop * 3, sizeof(double));
     if (!q || !sb || !gs || !err) { free(q); free(sb); free(gs); free(err); return -1; }
@@ -567,7 +570,7 @@ static int mx_pack1(xconv *c, const float *wk, int co, int sf, int wseq) {
                            sqrt(e_old / (wss + 1e-30)), sqrt(e_new / (wss + 1e-30)), mode, sf);
     c->mxq = xmalloc_dev((size_t)Cop * rch * 16); c->mxs = xmalloc_dev((size_t)Cop * rch * 4); c->mxgs = (float *)xmalloc_dev(Cop * sizeof(float));
     int rc = c->mxq && c->mxs && c->mxgs ? 0 : -1;
-    if (!rc) { xh2d(c->mxq, q, (size_t)Cop * rch * 16); xh2d(c->mxs, sb, (size_t)Cop * rch * 4); xh2d(c->mxgs, gs, Cop * sizeof(float)); c->mxsf = sf; c->nch = nch; }
+    if (!rc) { xh2d(c->mxq, q, (size_t)Cop * rch * 16); xh2d(c->mxs, sb, (size_t)Cop * rch * 4); xh2d(c->mxgs, gs, Cop * sizeof(float)); c->mxsf = sf; c->nch = nch; c->mxrows = Cop; }
     if (!rc) {   /* the halo kernel's step scales: per (row, chunk pair) the four 16-K block scales in one word */
         uint8_t *s2 = (uint8_t *)malloc((size_t)Cop * rch * 2);
         for (size_t r = 0; r < (size_t)Cop * rch / 2; r++) { s2[4 * r] = sb[8 * r]; s2[4 * r + 1] = sb[8 * r + 1]; s2[4 * r + 2] = sb[8 * r + 4]; s2[4 * r + 3] = sb[8 * r + 5]; }
@@ -710,6 +713,7 @@ template <int BM, int BN, int WMn, int WNn, int BK, int NST> static void launch1
 struct MxP {
     const uint8_t *xq, *xs, *wq, *ws; const float *gs, *scale, *bias; __half *y;
     int Di, Hi, Wi, Ci, Do, Ho, Wo, Co, kd, kh, kw, sd, sh, sw, pd, ph, pw, nch, nsteps; long long M;
+    int wrows;   /* rows of the packed weights / scales (xconv.mxrows): every tile's B rows must lie below it */
     double *st;   /* IN sums of the fp16 output, [n][Co][2] (nullptr: none) */
     int tco; const float *tb; uint8_t *oq, *os; int oC, oc0;   /* tco > 0: a ConvTranspose3d(k 2, s 2) GEMM (column abc tco + o): output voxel
                                                                   (n, 2z + a, 2y + b, 2x + e), + tb[o]; oq / os: written as MX-fp4 channels
@@ -877,6 +881,9 @@ __global__ void __launch_bounds__((BM / 64) * (BN / 32) * 32) conv_mx(MxP p) {
     }
 }
 template <int BM, int BN, int SF> static void mx_launch(const MxP &m) {
+    if ((m.Co + BN - 1) / BN * BN > m.wrows) {   /* the tiles would read weight rows past the packed ones (see mx_pack1) */
+        fprintf(stderr, "xnet: MX conv with %d outputs and %d packed weight rows: BN %d tiles would read past them\n", m.Co, m.wrows, BN); fflush(stderr); _exit(XNET_OOM_RC + 1);
+    }
     static unsigned attr = 0; constexpr int sm = mx_smem<BM, BN>(); const int dv = g_dev & 31;
     if (!(__atomic_load_n(&attr, __ATOMIC_ACQUIRE) >> dv & 1u)) { cudaFuncSetAttribute(conv_mx<BM, BN, SF>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm); __atomic_fetch_or(&attr, 1u << dv, __ATOMIC_RELEASE); }
     dim3 gr((unsigned)((m.M + BM - 1) / BM), (unsigned)((m.Co + BN - 1) / BN));
@@ -1485,7 +1492,7 @@ static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *ln
         MxP m; m.xq = qb; m.xs = sb; m.wq = (const uint8_t *)c->mxq; m.ws = (const uint8_t *)c->mxs; m.gs = c->mxgs; m.scale = c->scale; m.bias = c->bias; m.y = (__half *)y.p;
         m.Di = in.d; m.Hi = in.h; m.Wi = in.w; m.Ci = in.c; m.Do = Do; m.Ho = Ho; m.Wo = Wo; m.Co = c->co;
         m.kd = c->kd; m.kh = c->kh; m.kw = c->kw; m.sd = c->sd; m.sh = c->sh; m.sw = c->sw; m.pd = c->pd; m.ph = c->ph; m.pw = c->pw;
-        m.nch = c->nch; m.nsteps = (c->nch + 1) / 2; m.M = p.M; m.st = st; m.tco = 0; m.tb = nullptr; m.oq = m.os = nullptr; m.oC = m.oc0 = 0;
+        m.nch = c->nch; m.nsteps = (c->nch + 1) / 2; m.M = p.M; m.wrows = c->mxrows; m.st = st; m.tco = 0; m.tb = nullptr; m.oq = m.os = nullptr; m.oC = m.oc0 = 0;
         if (g_tq.on && c->tconv == 2) { m.tco = c->co / 8; m.tb = c->tbias; m.oq = g_tq.oq; m.os = g_tq.os; m.oC = g_tq.oC; m.oc0 = 0; m.y = nullptr; }
         if (mxh_launch(m, c->mxsf, (const unsigned *)c->mxs2)) { xfree_dev(qtmp); if (c->unfold) xt_free(&in); return y; }
         if (c->nch > MX_MAXCH) fprintf(stderr, "xnet: MX conv with %d K chunks (> %d)\n", c->nch, MX_MAXCH);
