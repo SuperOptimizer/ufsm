@@ -2,6 +2,8 @@
    probability pyramid (uint8 p*255, q=8) in the published layout. */
 #include "scannorm.h"
 #include "optcheck.h"
+#include "defaulted.h"
+#include "gnmode.h"
 #include "nn.h"
 #include "sysinfo.h"
 #include "checkpoint.h"
@@ -1410,7 +1412,7 @@ static int predict_one(int argc, char **argv) {
                         "       [--ema-blend A]   a x final weights + (1 - a) x EMA (tail-average blend, e.g. 0.35)\n"
                         "       [--gn-stats stored|legacy]   defaults to the checkpoint's normalization contract\n"
                         "       [--window-round 1]   a --window the net's depth does not divide: widened to the next multiple, the halo grown to keep the interior\n"
-                        "       [--gn-live 1]   gn_ema nets: each window's own GroupNorm statistics (the training-mode function) instead of the running ones\n"
+                        "       [--gn-live 0|1]   gn_ema nets: 1 each window's own GroupNorm statistics (the training-mode function), 0 the running ones (default: 1 when the checkpoint's --gn-ema-warm was never reached)\n"
                         "       [--reference reference.json]   required for a surface_winding checkpoint, native level 0\n"
                         "       [--grid-origin z,y,x]   anchor tile interiors in selected-level CT voxels, independent of the output box\n"
                         "       [--input-gain G] [--input-bias B]   CT = G * zscore(CT) + B; radial inputs and material mask unchanged\n"
@@ -1812,16 +1814,20 @@ static int predict_one(int argc, char **argv) {
         fprintf(stderr, "predict: note: step %d checkpoint with --ema 1: the EMA weights lag the live ones by ~1000 steps early in a run; "
                         "for a snapshot comparison score --ema 0 (or --ema-blend) too\n", step);
     /* --gn-live 1 (gn_ema nets, audit 11-14 infer #2): normalise with each window's own GroupNorm statistics, the function the net trains
-       with while --gn-ema-warm has not ended; the default is the running statistics */
-    const int gn_live = opt_atoi("--gn-live", opt(argc, argv, "--gn-live", "0")) != 0;
-    if (gn_live && !cfg.gn_ema) { fprintf(stderr, "predict: --gn-live: %s has no running GroupNorm statistics (train --gn-ema): its windows use their own already\n", ckpt); return 2; }
-    if (gn_live) unet_gn_ema_live(u, 1);
-    if (cfg.gn_ema && !gn_live && !opt(argc, argv, "--gn-frozen", nullptr)) {
-        char *hh = checkpoint_header_line(ckpt); const char *wq = hh ? strstr(hh, "\"ge_warm\":") : nullptr, *nq = hh ? strstr(hh, "\"ge_n\":") : nullptr;
-        if (wq && nq && atol(nq + 7) < atol(wq + 10))
-            fprintf(stderr, "predict: note: GroupNorm on the running statistics (%ld updates), which the net never trained on (--gn-ema-warm %ld not reached); --gn-live 1 = the training-mode function\n", atol(nq + 7), atol(wq + 10));
+       with while --gn-ema-warm has not ended. Default (no --gn-live): live for a checkpoint whose warm-up was never reached (it never ran on
+       the running statistics: try9's 1667 unroll on them, GT ids 0.669 vs u1's 0.831, fix0332 11-18), else the running statistics;
+       --gn-live 0 forces the running ones */
+    int gn_live; {
+        char *hh = cfg.gn_ema ? checkpoint_header_line(ckpt) : nullptr; int dfl = 0; long gn_n = -1, gn_w = -1;
+        gn_live = gn_live_choice(hh, opt(argc, argv, "--gn-live", nullptr), cfg.gn_ema, opt(argc, argv, "--gn-frozen", nullptr) != nullptr, &dfl, &gn_n, &gn_w);
         free(hh);
+        if (gn_live && !cfg.gn_ema) { fprintf(stderr, "predict: --gn-live: %s has no running GroupNorm statistics (train --gn-ema): its windows use their own already\n", ckpt); return 2; }
+        if (dfl) UFSM_DEFAULTED("predict --gn-live = 1 (GroupNorm running statistics of %ld updates, --gn-ema-warm %ld never reached: the net trained on each "
+                                "window's own; --gn-live 0 forces the running ones)", gn_n, gn_w);
+        else if (cfg.gn_ema && !gn_live && gn_n >= 0 && gn_w >= 0 && gn_n < gn_w)
+            fprintf(stderr, "predict: note: --gn-live 0: GroupNorm on the running statistics (%ld updates), which the net never trained on (--gn-ema-warm %ld not reached)\n", gn_n, gn_w);
     }
+    if (gn_live) unet_gn_ema_live(u, 1);
     /* --gn-set ema|run|auto (a gn_ema net, EMA weights): which running set normalises. ema: the EMA weights' own (rune, an EMA of the live weights' window
        statistics, lagging them: scratch2 step 2357 had variance ratios down to 0.15); run: the live weights' set; auto (default): ema, but refused when the
        two sets differ by more than 1.5x at a site (targeted/gnorm.md #2; the measured fix is a recalibration pass, scripts/infer/gn_ab.sh arms) */
