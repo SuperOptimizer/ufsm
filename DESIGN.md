@@ -277,6 +277,15 @@ reproduces the pod's to the printed digit: model coherence 0.2286, closing error
 - **Gate (all-voxel joined ids up on the 54 boxes, drift not up): PASS.** Paris 4: pending (needs a whole-scroll P4 field set + run).
 - The slabs, join and check are unchanged (master settings: slab overlap 8, FITLANES 1 on card 1, < 4 GB); only the ref's input changed.
 
+**Follow-ups (11-18 evening).** Weighted slab fields as well as the weighted ref (the slabs on merge-flag --apply's planes): joined
+0.9138 vs 0.9129, +0.0008 [-0.0001, +0.0017], z drift body 0.62 vs 0.56, end +9.13 vs +1.17 turns: no gain, so the slabs stay on the
+unweighted fields. The weight's strength (count-field --mf-w K, f = 1 - K mf / 255; ref GT ids): K 0 0.8388, 0.6 0.8686, 0.8 0.8812,
+1 0.8896: monotone, K 1 stays. C19, the one box the weighting hurts (joined 0.613 -> 0.507): a core box (radius 3.5-8 mm in its log);
+base is right inside 6 mm and -1 outside, weighted fixes the outside (-1 share 0.46 -> 0.22 at 6.5-7 mm) but turns the inside +1
+(0.91 at 4.5-5 mm). 74-100 % of the material between it and the axis is flagged (the core turns): with that evidence gone the count
+across the core is the solve's regulariser. A floor does not help (ref C19 0.562 base, 0.471 K 1, 0.429 K 0.8, 0.428 K 0.6). The core
+is where the flag runs at ~0.9 of all wraps (wrapmf w000-w003): counting through it needs another reference (levelsolve's in-box fill).
+
 **Unroll (MFREF=1, the default):** first as fields/mfw written by `merge-flag --weighted` (a019de5a); replaced the same day (above) by
 count-field --mf-w 1: the weighting inside every field load, no weighted copy written. mflag runs in the foreground right after rectosp,
 the ref's count-field gets --mf-w 1 once mflag is done, the slabs read $F; refstream (pass 1 behind the predict) is off under MFREF, a
