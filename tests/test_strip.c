@@ -260,6 +260,39 @@ int main(void) {
         snprintf(cmd, sizeof cmd, "cd %s && for e in 1 2; do for t in 1 5; do for x in strip.sfc strip.tsv strip.json; do cmp ss_e${e}_t${t}_0/$x ss_e${e}_t${t}_1/$x && cmp ss_e${e}_t1_1/$x ss_e${e}_t${t}_0/$x || exit 1; done; done; done", root);
         CHECK(!system(cmd), "streamed strip differs from the whole-decode strip");
     }
+    /* strip-flatten's no-mesh rule (2026-11-18, proportional): wrap k1 with a 400-column gap holding only 8 isolated vertices (no triangle:
+       a full-size chunk without a mesh, as the 1667 z band 3072+1024's chunk of 204 scattered vertices). Below --nomesh-max (0.1 % of the
+       strip's valid vertices, the default) the stage continues with one DEFAULTED line; with --nomesh-max 1e-6 it fails. */
+    {
+        char wd[400], sd[400]; snprintf(wd, sizeof wd, "%s/gapwraps", root); snprintf(sd, sizeof sd, "%s/gapstrip", root);
+        snprintf(cmd, sizeof cmd, "rm -rf %s %s && mkdir -p %s", wd, sd, wd); CHECK(!system(cmd), "gap setup");
+        for (int k = k0; k <= k1; k++) {
+            const double rk = rad(k, atan2(0, 1)), dth = step / rk; const int cols = (int)ceil(2 * M_PI / dth) + 1;
+            float *X = malloc((size_t)cols * h * 4), *Y = malloc((size_t)cols * h * 4), *Z = malloc((size_t)cols * h * 4);
+            for (int r = 0; r < h; r++) for (int c = 0; c < cols; c++) {
+                const size_t i = (size_t)r * cols + (cols - 1 - c); const double th = -M_PI + c * dth, ta = atan2(sin(th), cos(th));
+                const double rr = rad(k, ta); X[i] = (float)(CX + rr * cos(th)); Y[i] = (float)(CY + rr * sin(th)); Z[i] = (float)(10 + r * step);
+                const int cc = cols - 1 - c;
+                if (k == k1 && cc >= 200 && cc < 600 && !(r % 12 == 5 && cc % 100 == 50)) X[i] = Y[i] = Z[i] = -1;   /* (the 8 kept: isolated) */
+            }
+            snprintf(p, sizeof p, "%s/w%03d", wd, k); CHECK(!tifxyz_write(p, cols, h, X, Y, Z, step, um, k, "test"), "write %s", p);
+            free(X); free(Y); free(Z);
+        }
+        { char *av[] = {"ufsm", "strip", wd, sd, "--threads", "4", "--err", "0.05"}; CHECK(!cmd_strip((int)(sizeof av / sizeof *av), av), "strip (gap) failed"); }
+        for (int side = 0; side < 2; side++) {
+            char lg[500], od[500]; snprintf(lg, sizeof lg, "%s/gapflat%d.log", root, side); snprintf(od, sizeof od, "%s/gapflat%d", root, side);
+            fflush(stderr); const int save = dup(2); FILE *lf = fopen(lg, "w"); if (lf) { dup2(fileno(lf), 2); }
+            char *av[] = {"ufsm", "strip-flatten", sd, "--out", od, "--stride", "96", "--threads", "4", "--stripe-px", "1500", "--iters", "30", "--nomesh-max", side ? "1e-6" : "0.001"};
+            const int rc = cmd_strip_flatten((int)(sizeof av / sizeof *av), av);
+            fflush(stderr); if (lf) { dup2(save, 2); fclose(lf); } close(save);
+            snprintf(cmd, sizeof cmd, "grep -q 'no mesh (a full-size chunk' %s", lg); const int nomesh = !system(cmd);
+            snprintf(cmd, sizeof cmd, "grep -q '^DEFAULTED: strip-flatten: [0-9]* full-size chunks without a mesh' %s", lg); const int dflt = !system(cmd);
+            CHECK(nomesh, "gap strip: no full-size chunk without a mesh (see %s): the fixture does not test the rule", lg);
+            if (!side) CHECK(rc == 0 && dflt, "below --nomesh-max: rc %d, DEFAULTED line %d (expected 0, 1; %s)", rc, dflt, lg);
+            else CHECK(rc != 0 && !dflt, "above --nomesh-max: rc %d, DEFAULTED line %d (expected a failure, no DEFAULTED; %s)", rc, dflt, lg);
+        }
+        printf("strip: no-mesh rule: below --nomesh-max continued (DEFAULTED), above failed\n");
+    }
     if (!fails && !getenv("TEST_STRIP_KEEP")) { snprintf(cmd, sizeof cmd, "rm -r %s", root); if (system(cmd)) {} }
     printf("test_strip: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;

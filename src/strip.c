@@ -15,7 +15,7 @@
      -> <out-dir>/strip.sfc (one surface-compressor file: x y z, rows z, columns Theta, joint XYZ within --err voxels, region-readable
         64 x 64 blocks: readers stream column ranges) + strip.tsv (segments: wrap, first strip column, columns, seam gap) + strip.json.
    ufsm strip-flatten <strip-dir> [--out DIR] [--decim D] [--stride S] [--iters 30] [--cg 200] [--threads 16] [--ostep S]
-                      [--stripe-px 60000] [--px-scale 1] [--flip-rows 1] [--max-edge 3]
+                      [--stripe-px 60000] [--px-scale 1] [--flip-rows 1] [--max-edge 3] [--nomesh-max 0.001]
      Hierarchical flattening of the whole strip (global SLIM on ~1e9 vertices is infeasible and would not stay a straight band):
      1. the global frame: T(c, r) = (U(c), r step), U(c) the cumulative median (over rows) 3D distance between consecutive columns: an
         arc-length parametrisation shared by every row, so the strip stays one straight band of the scroll's height;
@@ -36,6 +36,7 @@
      Look flags (default off, 2026-11-14): --ct-stretch-papyrus 1: the CT window from pixels >= --ct-level only (air no longer sets its low end);
      --ink-fixed 1: ink grey = probability (no percentile stretch: one p -> grey map across runs and models). */
 #include "flatten.h"
+#include "defaulted.h"
 #include "optcheck.h"
 #include "sysinfo.h"
 #include "imgops.h"
@@ -643,6 +644,7 @@ typedef struct {
     pthread_mutex_t mu; pthread_cond_t cv; int j0, commit; _Atomic int fail; int j1; _Atomic int next;
     _Atomic int nomesh, nomesh_full;   /* chunks flat_grid gave no mesh: any (the narrow last chunk can be legitimate), full-size ones (fail) */
     int hat;   /* --blend hat: the old partition of unity (linear hats); default cos^2 */
+    _Atomic size_t nval_seen, nval_dropped;   /* valid vertices of every chunk read / of the full-size chunks without a mesh (each with the chunks' 2x overlap) */
 } sf_ctx;
 typedef struct { sf_ctx *X; int w; } sf_warg;
 static void *sf_worker(void *arg) {
@@ -655,6 +657,7 @@ static void *sf_worker(void *arg) {
             const size_t n = (size_t)nc * F->h; float *Xs = malloc(n * 4), *Ys = malloc(n * 4), *Zs = malloc(n * 4);
             if (!Xs || !Ys || !Zs || st_read(&F->S, a, nc, X->nth, Xs, Ys, Zs)) atomic_store(&X->fail, 1);
             else {
+                { size_t nv0 = 0; for (size_t k = 0; k < n; k++) nv0 += Zs[k] >= 0; atomic_fetch_add(&X->nval_seen, nv0); }
                 flat_opts o = flat_opts_default(); o.decim = F->D; o.iters = X->iters; o.cg_iters = X->cg; o.nthreads = X->nth; o.max_edge = F->max_edge;
                 o.all_components = 1; o.verbose = X->verbose; o.tol = X->tol; o.gpu = X->ngpu > 0; o.gpu_dev = X->ngpu > 0 ? A->w % X->ngpu : -1;
                 double *cu = malloc((size_t)nc * 8); for (int c = 0; c < nc; c++) cu[c] = T_u(F, a + c) - T_u(F, a); o.col_u = cu;   /* SLIM from the frame */
@@ -663,8 +666,11 @@ static void *sf_worker(void *arg) {
                        leaves its columns to the neighbours' hat tails alone: fail. A narrow edge chunk (1299: the last, 11 columns) is counted) */
                     size_t nvalid = 0; for (size_t k = 0; k < n; k++) nvalid += Zs[k] >= 0;
                     const int full = nc == 2 * S + 1 && nvalid >= 3;
-                    atomic_fetch_add(&X->nomesh, 1); if (full) { atomic_fetch_add(&X->nomesh_full, 1); atomic_store(&X->fail, 1); }
-                    fprintf(stderr, "strip-flatten: chunk %d (columns %d..%d, %zu valid vertices): no mesh%s\n", j, a, b, nvalid, full ? ": FAILED (a full-size chunk)" : " (narrow chunk: its columns from the neighbours)");
+                    /* (11-18, lead: proportional. The stage fails when the full-size chunks without a mesh hold more than --nomesh-max (0.1 %) of
+                       the strip's valid vertices; below, a DEFAULTED line and their columns from the neighbours: the 1667 z band 3072+1024 failed on
+                       one chunk of 204 scattered vertices) */
+                    atomic_fetch_add(&X->nomesh, 1); if (full) { atomic_fetch_add(&X->nomesh_full, 1); atomic_fetch_add(&X->nval_dropped, nvalid); }
+                    fprintf(stderr, "strip-flatten: chunk %d (columns %d..%d, %zu valid vertices): no mesh%s\n", j, a, b, nvalid, full ? " (a full-size chunk: counted against --nomesh-max)" : " (narrow chunk: its columns from the neighbours)");
                 }
                 else { align_components(F, &m, a, nc); have = 1; }
                 free(cu);
@@ -752,7 +758,7 @@ static void *ss_worker(void *arg) {
 }
 
 int cmd_strip_flatten(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: ufsm strip-flatten <strip-dir> [--out DIR] [--decim D] [--stride S] [--iters 30] [--cg 200] [--threads 16] [--ostep S] [--stripe-px 60000] [--px-scale 1] [--flip-rows 1] [--max-edge 3] [--blend cos2|hat] [--reuse 1] [--gpu 1] [--jobs J] [--stripe-jobs 3] [--chunks J0,J1] [--tol 1e-5 (CG relative tolerance)] [--verbose 0]\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: ufsm strip-flatten <strip-dir> [--out DIR] [--decim D] [--stride S] [--iters 30] [--cg 200] [--threads 16] [--ostep S] [--stripe-px 60000] [--px-scale 1] [--flip-rows 1] [--max-edge 3] [--nomesh-max 0.001] [--blend cos2|hat] [--reuse 1] [--gpu 1] [--jobs J] [--stripe-jobs 3] [--chunks J0,J1] [--tol 1e-5 (CG relative tolerance)] [--verbose 0]\n"); return 2; }
     const char *sd = argv[2]; char od[1400]; snprintf(od, sizeof od, "%s", sopt(argc, argv, "--out", "")); if (!*od) snprintf(od, sizeof od, "%s/flat", sd);
     sflat F; memset(&F, 0, sizeof F);
     if (st_open(sd, &F.S)) return 1;
@@ -814,13 +820,20 @@ int cmd_strip_flatten(int argc, char **argv) {
         sf_ctx X = {&F, nchunk, S, nth / jobs > 0 ? nth / jobs : 1, ngpu, opt_atoi("--iters", sopt(argc, argv, "--iters", "30")), opt_atoi("--cg", sopt(argc, argv, "--cg", "200")),
                     opt_atoi("--verbose", sopt(argc, argv, "--verbose", "0")), opt_atof("--tol", sopt(argc, argv, "--tol", "1e-5")), cf, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, j0, j0, 0, j1};
         atomic_store(&X.next, j0);
+        const double nomesh_max = opt_atof("--nomesh-max", sopt(argc, argv, "--nomesh-max", "0.001"));   /* the share of the strip's valid vertices full-size no-mesh chunks may hold */
         { const char *bl = sopt(argc, argv, "--blend", "cos2"); X.hat = !strcmp(bl, "hat"); if (!X.hat && strcmp(bl, "cos2")) { fprintf(stderr, "strip-flatten: --blend cos2 | hat\n"); return 2; } }
         fprintf(stderr, "strip-flatten: chunks %d..%d on %d jobs x %d threads, SLIM on %s\n", j0, j1, jobs, X.nth, ngpu ? "the GPU" : "the CPU");
         pthread_t th[64]; sf_warg wa[64];
         for (int k = 0; k < jobs; k++) { wa[k] = (sf_warg){&X, k}; pthread_create(&th[k], nullptr, sf_worker, &wa[k]); }
         for (int k = 0; k < jobs; k++) pthread_join(th[k], nullptr);
         nomesh_all = atomic_load(&X.nomesh);
-        if (atomic_load(&X.fail)) { fprintf(stderr, "strip-flatten: FAILED: %s\n", atomic_load(&X.nomesh_full) ? "full-size chunks without a mesh (above)" : "read failed"); return 1; }
+        if (atomic_load(&X.fail)) { fprintf(stderr, "strip-flatten: FAILED: read failed\n"); return 1; }
+        if (atomic_load(&X.nomesh_full)) {
+            const size_t dr = atomic_load(&X.nval_dropped), se = atomic_load(&X.nval_seen); const double fr = se ? (double)dr / se : 1;
+            if (fr > nomesh_max) { fprintf(stderr, "strip-flatten: FAILED: full-size chunks without a mesh (above) hold %zu of %zu valid vertices (%.4f %% > --nomesh-max %.4g %%)\n", dr, se, 100 * fr, 100 * nomesh_max); return 1; }
+            UFSM_DEFAULTED("strip-flatten: %d full-size chunks without a mesh, %zu of %zu valid vertices (%.4f %% <= --nomesh-max %.4g %%): their columns from the neighbouring chunks",
+                           atomic_load(&X.nomesh_full), dr, se, 100 * fr, 100 * nomesh_max);
+        }
     }
     if (cf) fclose(cf);
     if (!reused) {
