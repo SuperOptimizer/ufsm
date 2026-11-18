@@ -355,7 +355,7 @@ static int fs_ok(int D, int H, int W, int z0, int nz, int C, int nout) {
 }
 /* UFSM_FSTEM_PERS: the forward's blocks. Unset: the fused (UP) kernel persistent, 2 x the resident blocks (bench_fstem P 512 x 32, 6 outputs:
    0.628 -> 0.561 ms; 1 x: 0.574), the plain one a block per tile (persistent: 0.574 -> 0.59 ms); N >= 1: both persistent, N x resident; 0: neither */
-static int g_fs_pers = -1, g_fs_gcap = 0;
+static int g_fs_pers = -1, g_fs_gcap = 0;   /* mgpu: env / test config */
 extern "C" void nn_fstem_set_pers(int v, int gcap) { g_fs_pers = v; g_fs_gcap = gcap; }   /* tests (-1: env / defaults); gcap > 0: at most gcap blocks (many tiles a block on small shapes) */
 static unsigned fs_grid(const void *k, size_t nt, size_t sm, bool up) {
     if (g_fs_pers < 0) g_fs_pers = getenv("UFSM_FSTEM_PERS") ? atoi(getenv("UFSM_FSTEM_PERS")) : 99;   /* mgpu: env; 99: unset (the defaults) */
