@@ -390,7 +390,8 @@ int main(void) {
     g_mxa = 0; xnet_set_mxq(0); xnet_set_mxrot(0); xnet_set_mxa(0);
     fails += run_dattn(2, 17, 40, 36);
     fails += run_c1gs(2, 17, 40, 36);   /* 64 chunks, a ragged last step */
-    fails += run_c1gs(3, 5, 9, 23);     /* S / 64 chunks */
+    fails += run_c1gs(3, 5, 9, 23);     /* S / 64 chunks, odd W: pairs across rows */
+    fails += run_c1gs(2, 7, 13, 1031);  /* odd chunk starts */
     fails += run_c1gs(1, 17, 96, 96);
     fails += run_ts(2, 1, 7, 9, 32, 16);     /* ragged, two samples */
     fails += run_ts(1, 1, 24, 24, 64, 8);

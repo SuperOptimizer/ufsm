@@ -1804,55 +1804,62 @@ extern "C" void xgn(xt x, int groups, const float *gamma, const float *beta, flo
 }
 
 /* The Reader stem conv (1 -> 16, 3x3x3, k_dfc1's chains) with its GroupNorm statistics in one pass (UFSM_XNET_C1GS=0: k_dfc1x, then
-   xgn_stats). A block owns one k_gnpart chunk (same nchunk, same 256 threads): per step its threads compute the 16 channels of 256
-   consecutive voxels of the chunk (thread t voxel t: k_dfc1's 27-tap chain per channel, zero taps included, then s scale + bias rounded),
+   xgn_stats). A block owns one k_gnpart chunk (same nchunk, same 256 threads): per step its threads compute the 16 channels of 512
+   consecutive voxels of the chunk (thread t voxels 2t, 2t + 1: k_dfc1's 27-tap chain per channel, zero taps included, then s scale + bias rounded),
    store them to y and to shared memory, and then thread (row t / 8, pair t % 8) adds its 8 voxels row, row + 32, ... in order: k_gnpart's
    per-thread sequence (voxels s0 + row + 32 k), so the partial sums, gm / rs and y are k_dfc1x + xgn_stats' bits, without y's re-read. */
 __global__ void __launch_bounds__(256) k_c1gs(const __half *x, const __half *w, int Kp, const float *scale, const float *bias, __half *y, int D, int H, int W, int nchunk, double *part) {
-    __shared__ __align__(16) float sw[16 * 28]; __shared__ __align__(16) __half sv[256 * 16]; __shared__ float sh[32 * 16 * 2]; __shared__ float m0s[16];
+    /* steps of 512 voxels, thread t voxels 2t, 2t + 1: in one x row the pair shares k_dfc1x<2>'s window and weight loads (each output's
+       chain unchanged); a pair across rows (odd W or chunk start) or past the chunk end runs each voxel alone */
+    __shared__ __align__(16) float sw[16 * 28]; __shared__ __align__(16) __half sv[512 * 16]; __shared__ float sh[32 * 16 * 2]; __shared__ float m0s[16];
     const int t = threadIdx.x, n = blockIdx.y; const long long S = (long long)D * H * W;
     for (int i = t; i < 16 * 28; i += 256) { const int o = i / 28, k = i % 28; sw[i] = k < 27 ? __half2float(w[(size_t)o * Kp + (k / 3) * 8 + k % 3]) : 0.f; }
     __syncthreads();
     const __half *xb = x + (size_t)n * S; __half *yb = y + (size_t)n * S * 16;
-    auto conv = [&](long long v, __half *o) {   /* k_dfc1's output voxel v of sample n */
+    auto conv2 = [&](long long v, int nv, __half *o0, __half *o1) {   /* voxels v (and v + 1 when nv == 2, same row): k_dfc1's chains */
         const int xx = (int)(v % W); long long r = v / W; const int yy = (int)(r % H); const int zz = (int)(r / H);
-        float in[27];
+        float in[36];   /* [a][b][e], e < 4 */
 #pragma unroll
         for (int a = 0; a < 3; a++)
 #pragma unroll
             for (int b = 0; b < 3; b++)
 #pragma unroll
-                for (int e = 0; e < 3; e++) {
+                for (int e = 0; e < 4; e++) {
                     const int z = zz + a - 1, yv = yy + b - 1, xv = xx + e - 1;
-                    in[(a * 3 + b) * 3 + e] = z >= 0 && z < D && yv >= 0 && yv < H && xv >= 0 && xv < W ? __half2float(xb[((long long)z * H + yv) * W + xv]) : 0.f;
+                    in[(a * 3 + b) * 4 + e] = (e < 3 || nv == 2) && z >= 0 && z < D && yv >= 0 && yv < H && xv >= 0 && xv < W ? __half2float(xb[((long long)z * H + yv) * W + xv]) : 0.f;
                 }
 #pragma unroll
         for (int c = 0; c < 16; c++) {   /* (the weights as k_dfc1x: 7 float4 a channel) */
             float wq[28];
 #pragma unroll
             for (int k4 = 0; k4 < 7; k4++) { const float4 q = *(const float4 *)(sw + c * 28 + k4 * 4); wq[k4 * 4] = q.x; wq[k4 * 4 + 1] = q.y; wq[k4 * 4 + 2] = q.z; wq[k4 * 4 + 3] = q.w; }
-            float s = 0.f;
+            float s0 = 0.f, s1 = 0.f;
 #pragma unroll
-            for (int k = 0; k < 27; k++) s += in[k] * wq[k];
-            o[c] = __float2half_rn(s * scale[c] + bias[c]); }
+            for (int k = 0; k < 27; k++) { s0 += in[(k / 3) * 4 + k % 3] * wq[k]; s1 += in[(k / 3) * 4 + k % 3 + 1] * wq[k]; }
+            o0[c] = __float2half_rn(s0 * scale[c] + bias[c]); o1[c] = __float2half_rn(s1 * scale[c] + bias[c]); }
     };
-    if (t == 0) { __align__(16) __half o[16]; conv(0, o); for (int c = 0; c < 16; c++) m0s[c] = __half2float(o[c]); }   /* the shift: y's first voxel */
+    if (t == 0) { __align__(16) __half o[16], od[16]; conv2(0, 1, o, od); for (int c = 0; c < 16; c++) m0s[c] = __half2float(o[c]); }   /* the shift: y's first voxel */
     const long long per = (S + nchunk - 1) / nchunk, s0 = blockIdx.x * per, s1 = s0 + per < S ? s0 + per : S;
     const int row = t >> 3, c = (t & 7) * 2;
     __syncthreads();
     const float m0 = m0s[c], m1 = m0s[c + 1];
     float a0 = 0.f, a1 = 0.f, q0 = 0.f, q1 = 0.f;
+    auto put = [&](long long v, int j, const __half *o) {
+        uint4 *dst = (uint4 *)(yb + v * 16); dst[0] = ((const uint4 *)o)[0]; dst[1] = ((const uint4 *)o)[1];
+        uint4 *sd = (uint4 *)(sv + j * 16); sd[0] = ((const uint4 *)o)[0]; sd[1] = ((const uint4 *)o)[1];
+    };
 #pragma unroll 1
-    for (long long b0 = s0; b0 < s1; b0 += 256) {
-        const long long v = b0 + t;
+    for (long long b0 = s0; b0 < s1; b0 += 512) {
+        const long long v = b0 + 2 * t;
         if (v < s1) {
-            __align__(16) __half o[16]; conv(v, o);
-            uint4 *dst = (uint4 *)(yb + v * 16); dst[0] = ((const uint4 *)o)[0]; dst[1] = ((const uint4 *)o)[1];
-            uint4 *sd = (uint4 *)(sv + t * 16); sd[0] = ((const uint4 *)o)[0]; sd[1] = ((const uint4 *)o)[1];
+            __align__(16) __half o0[16], o1[16];
+            const bool two = v + 1 < s1, row2 = two && (v + 1) % W != 0;
+            if (!two || row2) { conv2(v, two ? 2 : 1, o0, o1); put(v, 2 * t, o0); if (two) put(v + 1, 2 * t + 1, o1); }
+            else { conv2(v, 1, o0, o1); put(v, 2 * t, o0); conv2(v + 1, 1, o0, o1); put(v + 1, 2 * t + 1, o0); }
         }
         __syncthreads();
-#pragma unroll
-        for (int j = row; j < 256; j += 32) {
+#pragma unroll 4
+        for (int j = row; j < 512; j += 32) {
             if (b0 + j >= s1) break;
             const __half2 h = *(const __half2 *)(sv + j * 16 + c); const float f0 = __low2float(h) - m0, f1 = __high2float(h) - m1;
             a0 += f0; a1 += f1; q0 += f0 * f0; q1 += f1 * f1;
