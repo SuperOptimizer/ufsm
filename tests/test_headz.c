@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 void lp_set_c1v(int v);
+void lp_set_head_tc_r(int on);
 
 static int run(int cout, int hc0, int hnc, int D, int w0) {   /* w0: level-0 width (the head conv input: 96 = the u1 fields net, three full 32-channel MX blocks) */
     unet_cfg cfg = {3, {w0, 16, 32}, 2, cout, 8};
@@ -50,6 +51,13 @@ static int run(int cout, int hc0, int hnc, int D, int w0) {   /* w0: level-0 wid
             if (memcmp(g1, got, (size_t)rows * nv * 4)) { fprintf(stderr, "test_headz: cout %d: conv1_mx_tv_k (UFSM_C1_V %d) differs from conv1_mx_t_k\n", cout, v); fails++; }
         }
         lp_set_c1v(-1);
+        lp_set_head_tc_r(1);   /* the tensor-core per-z head (default in predict; > 16 outputs, 32k MX-fp4 channels): near-identical to the FFMA one */
+        unet_head_fwd_z32(u, 0, D, yd, 0); nn_sync(); nn_d2h(got, yd, (size_t)rows * nv * 4); lp_set_head_tc_r(0);
+        double dmax = 0, ref2 = 0; size_t nd = 0;
+        for (size_t i = 0; i < (size_t)rows * nv; i++) { const double d = fabs((double)got[i] - g1[i]); nd += got[i] != g1[i]; if (d > dmax) dmax = d; ref2 += (double)g1[i] * g1[i]; }
+        const double rms = sqrt(ref2 / ((double)rows * nv));
+        printf("test_headz: cout %d: tensor-core head vs FFMA: %zu of %zu logits differ, max |d| %.3g (logit rms %.3g)\n", cout, nd, (size_t)rows * nv, dmax, rms);
+        if (dmax > 0.02 * rms + 1e-3) { fprintf(stderr, "test_headz: cout %d: tensor-core head off by %.3g\n", cout, dmax); fails++; }
         free(g1);
     }
     const char *e = nn_check(); if (e) { fprintf(stderr, "test_headz: cuda: %s\n", e); fails++; }
@@ -61,6 +69,7 @@ int main(void) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (nn_init(0)) return test_no_gpu("test_headz", "nn_init(0) failed");
     nn_set_prec(1); nn_set_f16(1); unet_set_act_mx4(1); unet_set_act_mx8(0);
+    lp_set_head_tc_r(0);   /* (the per-z head bit-equal to the whole-window logits: the FFMA passes; the tensor-core one is checked against it) */
     int fails = 0;
     fails += run(32, 0, 0, 24, 16);
     fails += run(11, 0, 0, 16, 16);

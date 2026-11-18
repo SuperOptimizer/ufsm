@@ -170,9 +170,9 @@ template <int B, int CO, typename YT = float> static void conv1_mx_t(const void 
 enum { HTC_N = 128, HTC_KP = 40 };   /* cells per tile; activation rows of 32 halves padded to 40 (80 B: conflict-free fragment loads) */
 /* persistent blocks (one per SM: the fp16 weights of all MT x 16 outputs x Ci inputs stay in shared memory, rows padded by 8 halves), each
    walking cell tiles; per tile and 32-channel block the next block's x words are loaded before the current block's MMAs */
-template <int MT>
-__global__ void __launch_bounds__(256, 1) conv1_mx_tc_k(const uint8_t *__restrict__ x, const float *__restrict__ w, const float *__restrict__ b, __half *__restrict__ y,
-                                                        int N, int Ci, size_t S, gnp_t gp, int Co, size_t vb, size_t Sy, int Cy, int ntiles) {
+template <int MT, typename YT = __half>   /* YT float: predict's per-z fp32 logits (lp_conv1_fwd_mx_r), planes of stride Ly */
+__global__ void __launch_bounds__(256, 1) conv1_mx_tc_k(const uint8_t *__restrict__ x, const float *__restrict__ w, const float *__restrict__ b, YT *__restrict__ y,
+                                                        int N, int Ci, size_t S, gnp_t gp, int Co, size_t vb, size_t Sy, int Cy, int ntiles, size_t Ly) {
     extern __shared__ __align__(16) unsigned char htc_sm[];
     const int KW = Ci + 8;
     __half *sW = (__half *)htc_sm;                                   /* [MT * 16][KW] */
@@ -256,26 +256,31 @@ __global__ void __launch_bounds__(256, 1) conv1_mx_tc_k(const uint8_t *__restric
                     const int co = 16 * m + g + 8 * hr; if (co >= Co) continue;
                     const float bb = b ? b[co] : 0.f;
                     const size_t vl = vl0 + warp * 16 + 8 * j + 2 * t4;
-                    __half *yp = y + ((size_t)n * Cy + co) * Sy + vl;
+                    YT *yp = y + ((size_t)n * Cy + co) * Ly + vl;
                     const float c0 = acc[m][j][2 * hr] + bb, c1 = acc[m][j][2 * hr + 1] + bb;
-                    if (vl + 1 < Sy && vb + vl + 1 < S && !(((uintptr_t)yp) & 3)) *(__half2 *)yp = __floats2half2_rn(c0, c1);
+                    if constexpr (sizeof(YT) == 4) {
+                        if (vl + 1 < Sy && vb + vl + 1 < S && !(((uintptr_t)yp) & 7)) *(float2 *)yp = make_float2(c0, c1);
+                        else { if (vl < Sy && vb + vl < S) yp[0] = c0; if (vl + 1 < Sy && vb + vl + 1 < S) yp[1] = c1; }
+                    } else if (vl + 1 < Sy && vb + vl + 1 < S && !(((uintptr_t)yp) & 3)) *(__half2 *)yp = __floats2half2_rn(c0, c1);
                     else { if (vl < Sy && vb + vl < S) yp[0] = __float2half(c0); if (vl + 1 < Sy && vb + vl + 1 < S) yp[1] = __float2half(c1); }
                 }
     }
 }
-static int g_head_tc = -1;
+static int g_head_tc = -1, g_rtc = -1;
+extern "C" void lp_set_head_tc_r(int on) { g_rtc = on; }   /* tests: predict's per-z fp32 head on the tensor cores (1) or the FFMA passes (0); -1: env UFSM_HEAD_TC_R */
 extern "C" void lp_set_head_tc(int on) { g_head_tc = on; }   /* tests: the tensor-core wide head on / off (-1: env UFSM_HEAD_TC, default on) */
-static bool conv1_tc(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, size_t vb, size_t Sy) {
+template <typename YT = __half> static bool conv1_tc(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, size_t vb, size_t Sy, size_t Ly = 0) {
     if (g_head_tc < 0) g_head_tc = getenv("UFSM_HEAD_TC") ? atoi(getenv("UFSM_HEAD_TC")) : 1;
+    if (!Ly) Ly = Sy;
     const int MT = (cout + 15) / 16;
     const size_t sm = (size_t)MT * 16 * (xs.c + 8) * 2 + (size_t)HTC_N * HTC_KP * 2 + (size_t)2 * xs.c * sizeof(float2);
     if (!g_head_tc || xdt != 4 || xs.c % 32 || cout <= 16 || cout > 160 || sm > 99 * 1024) return false;
     const size_t S = shape_spatial(xs), ntiles = (size_t)xs.n * ((Sy + HTC_N - 1) / HTC_N);
-    static int nsm[8], attr[8][11]; int dev = 0; cudaGetDevice(&dev); dev &= 7;
+    static int nsm[8], attr[8][11]; int dev = 0; cudaGetDevice(&dev); dev &= 7;   /* (attr: per YT instantiation, a static per template) */
     if (!nsm[dev]) { int v = 0; cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev); nsm[dev] = v > 0 ? v : 36; }
     const unsigned grid = (unsigned)(ntiles < (size_t)nsm[dev] ? ntiles : (size_t)nsm[dev]);
-#define HTC(M_) do { if (!attr[dev][M_]) { attr[dev][M_] = 1; cudaFuncSetAttribute((const void *)conv1_mx_tc_k<M_>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024); } \
-                     conv1_mx_tc_k<M_><<<grid, 256, sm>>>((const uint8_t *)x, w, b, (__half *)y, xs.n, xs.c, S, gp, cout, vb, Sy, cout, (int)ntiles); } while (0)
+#define HTC(M_) do { if (!attr[dev][M_]) { attr[dev][M_] = 1; cudaFuncSetAttribute((const void *)conv1_mx_tc_k<M_, YT>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024); } \
+                     conv1_mx_tc_k<M_, YT><<<grid, 256, sm>>>((const uint8_t *)x, w, b, (YT *)y, xs.n, xs.c, S, gp, cout, vb, Sy, cout, (int)ntiles, Ly); } while (0)
     switch (MT) { case 2: HTC(2); break; case 3: HTC(3); break; case 4: HTC(4); break; case 5: HTC(5); break; case 6: HTC(6); break;
                   case 7: HTC(7); break; case 8: HTC(8); break; case 9: HTC(9); break; default: HTC(10); }
 #undef HTC
@@ -394,6 +399,9 @@ extern "C" int lp_conv1_fwd_mx_r(const void *x, int xdt, shape5 xs, const float 
     if (xs.n != 1 || !nv) return -1;
     if (!ly) ly = nv;   /* (ly: the plane stride of y, >= nv: the planes of a wider buffer) */
     if (cout > 16) {
+        static int rtc = -1; if (rtc < 0) rtc = getenv("UFSM_HEAD_TC_R") ? atoi(getenv("UFSM_HEAD_TC_R")) : 1;   /* 0: the FFMA passes of 16 (bit-equal to the whole-window fp32 logits); mgpu: env */
+        if (g_rtc >= 0) rtc = g_rtc;
+        if (rtc && conv1_tc<float>(x, xdt, xs, w, b, cout, y, gp, vb, nv, ly)) { LPCK(); return 0; }   /* (one tensor-core pass over all outputs: near-identical) */
         if (cout % 16) return -1;
         for (int c0 = 0; c0 < cout; c0 += 16) if (lp_conv1_fwd_mx_r(x, xdt, xs, w + (size_t)c0 * xs.c, b ? b + c0 : nullptr, 16, y + (size_t)c0 * ly, gp, vb, nv, ly)) return -1;
         return 0;
