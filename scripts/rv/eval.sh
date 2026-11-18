@@ -11,11 +11,11 @@
 # WZ="" for latent-grid checkpoints (train --lat 4: cubic windows only), WINDOW (640).
 # Env: U (rv binary), RU (ruler binary: RECTO's src2), GPU (1), LOCK, E (/vesuvius/ufsm/v2/rv/eval), TH (16), WIN (640/64, z 192/64).
 # LATENTS=STORE: predict from that ufsm lc-encode store of the scroll's CT level instead of the CT (--latents; one scroll per run, e.g.
-# SC=p1667 with /mnt/scratch/lat/p1667-l2.lc; --lat-basis checkpoints); each row's predict log then ends with its read accounting (UFSM_PRED_IO).
+# SC=p1667 with /home/forrest/scratch-mig/lat/p1667-l2.lc; --lat-basis checkpoints); each row's predict log then ends with its read accounting (UFSM_PRED_IO).
 set -u
 CK=$1; T=$2; SC=${3:-p1667 p139 p4}
 U=${U:-/vesuvius/ufsm/v2/rv/bin/ufsm.ev}; RU=${RU:-/vesuvius/ufsm/v2/recto/src2/build/ufsm}; GPU=${GPU:-1}; LOCK=${LOCK-/vesuvius/ufsm/opt/gpu$GPU.lock}
-E=${E:-/mnt/scratch/rv/eval}; TH=${TH:-16}; SH=${SH:-128}; CTR=${CTR:-/vesuvius/ufsm/v2/ct}; C=${CNT:-/vesuvius/ufsm/v2/count}
+E=${E:-/vesuvius/ufsm/scratch-mig/rv/eval}; TH=${TH:-16}; SH=${SH:-128}; CTR=${CTR:-/vesuvius/ufsm/v2/ct}; C=${CNT:-/vesuvius/ufsm/v2/count}
 # off the desk (2026-11-11, scripts/univ): CTR=<volcomp mirror> VOLP=volumes/ (the mirror keeps scans under <scroll>/volumes/), CNT, RVGT (GT root), RU
 RVGT=${RVGT:-/vesuvius/ufsm/gt}; VOLP=${VOLP:-}
 mkdir -p $E/$T; echo "== $T $CK $(date)" >> $E/$T.txt

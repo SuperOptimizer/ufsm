@@ -13,7 +13,7 @@
 #   KEEP (1: keep this TAG's fields for later fixed-fields runs; default 1), U (binary; default $WB/bin/ufsm = the pinned build), UP (predict binary, default U: a newer build for checkpoints the fitter pin cannot load),
 #   NOLOCK=1 (the caller holds the GPU lock).
 #   WZARGS= (empty): cube windows, no --window-z (latent-grid checkpoints: train --lat 4), with WIN / HALO.
-#   LATENTS="SCROLL=STORE ..." (e.g. "paris4=/mnt/scratch/lat/p4-l2.lc 1667=/mnt/scratch/lat/p1667-l2b.lc"): those scrolls' fields predicted from
+#   LATENTS="SCROLL=STORE ..." (e.g. "1667=/home/forrest/scratch-mig/lat/p1667-l2b.lc"): those scrolls' fields predicted from
 #   the ufsm lc-encode store of their CT level (predict --latents: --lat-basis checkpoints; paris4j falls back to paris4's store).
 #   NGRID (1): 2 / 4 / 8 window grids offset by half the 512 core, blended by field-blend --tile (the unroll's FBLEND = 2; per-box predicts)
 #   PBATCH (1): the boxes' fields predicted first, one predict --boxes process per scroll (needs a predict binary with --boxes, 2026-11-12:
