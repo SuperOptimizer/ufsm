@@ -6,6 +6,37 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Ink retrain from try9 on the 2-D teachers; ink-teach --extra (B2) (2026-11-18, branches inkteach / inkteachx-20261118, inksdk)
+
+User (via lead, 11-18): retrain the latent ink head from try9 (scratch2) on the 2-D teachers (reader3 + ink9um soft targets via
+ink-teach) plus the human labels, not from u1 and not human-only. Numbers that led here:
+- Pod smoke at P 1024 (u1 init, 4 scrolls, arm A): step-10 gate failed, 0.02 fresh samples/s, trainer RSS 23.6 GB at 2 workers / 3
+  slots. The sampler worker is one CPU thread, ~42 s per P 1024 window (desk dry run), so the arm was sampler-bound by ~15x.
+- Same smoke at P 512: step 10 0.27, step-50 mean 0.350 fresh samples/s (0.21-0.43 steady, 32-55 Mvox/s), 3.2 s/step, RSS 8.2 GB;
+  200 steps in 11 min. P 512 windows still carry 55-65k ink rays (the 65,536 cap at times), so ink supervision per step is ~unchanged.
+- The CT prefetch's `--levels 1,2` meant max level 1: level 2 was never prefetched before 11-18 (podq now passes `--levels 2`).
+- inkpod-15000 live (`--ema 0`) vs EMA on the 1667 held-out wraps: heldout 0.5824 vs 0.5824 (n 1,296,287), hold 0.5998 vs 0.6040,
+  valonly 0.5517 vs 0.5481 (reader3 0.858 / 0.862 / 0.856): the memorisation verdict is not a stale-EMA artefact.
+- try9's own ink head trains on the validation rasters (ink onfly `"validation": "off"`): of the eval's held-out split
+  (VAL | HOLD) only HOLD is clean for it (all 28 1667 ink holdout boxes lie inside its holdouts-20261114 boxes).
+  /vesuvius/ufsm/inksdk/pairwrap2.py adds the `hold` / `valonly` splits. inknorm's 3-D audit: try9-15000 EMA held-out 0.52-0.56,
+  no better than raw CT intensity.
+- Scoring try9-class nets: predict at window 640 / halo 64 (nlev 6) peaked 8.8 GB; 512 / 64 fits ~4.5 GB. Binaries before
+  a8babaff need an explicit `--gn-live 1` (try9's running GN statistics were never trained). latink.sh: LATINK_X, LATWIN / LATHALO.
+
+Pod run (podq FULL=1 SKIPA=1, /root/ink/FULL.sh): init try9 16000 weights-only (header muon_mom 0 + the p and EMA arrays, 832 MB;
+--init-from copies p -> p, ema -> ema, training runs on p), try9's architecture flags (TARCH / TXTRA / TUW in trainarm.sh), P 512;
+teach on every labelled mesh (27 meshes over 6 scrolls), then arm B for 6000 steps, refitted at step 100 to the measured step time so
+the run ends inside the 11 h slot (BUDGET_END; one restart, so the wsd cooldown still runs); B1000 held-out <= 0.60 stops it.
+
+**ink-teach --extra (B2).** ink-teach labelled only the human-labelled meshes (the whole mesh, outside held-out boxes and human px).
+`--extra NAME=TIFXYZ` / `--extra-list FILE` adds meshes without human labels (unroll wraps, unlabelled segments): their raster is the
+teacher's own px grid (label_scale = px_um / mesh voxel um, 4 at 9.596 / 2.399), calibrated with the labelled meshes' ensemble weights
+and Platt fit, gated the same way, held-out boxes removed, and px within --extra-clear (48) level-0 voxels of any labelled-mesh vertex
+dropped (there the human labels and the labelled mesh's own teacher px rule; it also keeps the 1667 validation rasters, which lie on
+labelled meshes, free of teacher labels). teach.sh reads KIT/kit/extra-SCROLL.tsv. Test: tests/test_ink_teach.py (CPU: a labelled
+mesh, an extra mesh 400 voxels away gets ~88k teacher px at 48.8 % ink on the half-ink stripes, one 10 voxels away is cleared).
+
 ## HerculeX exact integer levels: one-sided votes on our fitter and on patch-solve (2026-11-18, branch levelsolve-20261118)
 
 HerculeX (github adambetka2/HerculeX, MIT; README "Exact integer levels") gives patches integer turns f by an exact solve of

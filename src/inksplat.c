@@ -1905,7 +1905,16 @@ int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits) {
    DIR/segs-teach.json ({"segments": [{name, tifxyz, labels, mask, label_scale, crop}]}), and prints per-teacher / ensemble AUC, the
    Platt fit and the gate's coverage / accuracy against the human labels. */
 #include <zstd.h>
-typedef struct { char name[256], tifxyz[1024], lab[1024], msk[1024], val[1024]; int nwin; int64_t win[64][4]; } it_seg;
+typedef struct { char name[256], tifxyz[1024], lab[1024], msk[1024], val[1024]; int nwin, ext; int64_t win[64][4]; } it_seg;   /* ext: an --extra mesh (no human labels) */
+/* a set of coarse level-0 cells (open addressing, key = packed (z, y, x) / cell + 1): the labelled meshes' vertices for --extra-clear */
+typedef struct { uint64_t *k; size_t cap, n; } it_cells;
+static uint64_t it_ckey(int64_t z, int64_t y, int64_t x) { return ((uint64_t)(z & 0x1FFFFF) << 42 | (uint64_t)(y & 0x1FFFFF) << 21 | (uint64_t)(x & 0x1FFFFF)) + 1; }
+static void it_cadd(it_cells *c, uint64_t key) {
+    if (2 * (c->n + 1) > c->cap) { it_cells o = *c; c->cap = o.cap ? 2 * o.cap : 1 << 16; c->k = calloc(c->cap, 8); c->n = 0; for (size_t i = 0; i < o.cap; i++) if (o.k[i]) it_cadd(c, o.k[i]); free(o.k); }
+    size_t h = (size_t)(key * 0x9E3779B97F4A7C15ull) & (c->cap - 1); while (c->k[h] && c->k[h] != key) h = (h + 1) & (c->cap - 1);
+    if (!c->k[h]) { c->k[h] = key; c->n++; } }
+static int it_chas(const it_cells *c, uint64_t key) { if (!c->cap) return 0; size_t h = (size_t)(key * 0x9E3779B97F4A7C15ull) & (c->cap - 1);
+    while (c->k[h]) { if (c->k[h] == key) return 1; h = (h + 1) & (c->cap - 1); } return 0; }
 static int it_write_zarr(const char *dir, const uint8_t *a, int64_t H, int64_t W, double um, int skip_empty) {
     enum { CK = 1024 }; char p[1400];
     snprintf(p, sizeof p, "%s/0", dir); if (mkdir_p(p)) return -1;
@@ -1946,9 +1955,12 @@ int cmd_ink_teach(int argc, char **argv) {
     if (!segs || !out || !nt || (hof && !ctk)) {
         fprintf(stderr, "usage: ufsm ink-teach --segs SEGS.json --teacher NAME=PATTERN(%%s = segment name) [..] --holdouts H.json --ct-key KEY --out DIR [--k 4] [--px-um 9.596]\n"
                         "         [--lo 0.1] [--hi 0.8] [--hold-margin 64] [--human-dilate 1] [--weights auc|equal] [--platt a,b] [--max-pairs 4000000]\n"
+                        "         [--extra NAME=TIFXYZ ..] [--extra-list FILE (lines: NAME TIFXYZ)] [--extra-clear 48]\n"
                         "  2-D teacher maps (ink-ext --native-only) of every segment of SEGS -> AUC-weighted logit ensemble, Platt-calibrated on the human labels\n"
                         "  outside the held-out boxes, confidence-gated (p <= lo or >= hi), human-supervised px and held-out boxes removed -> label windows\n"
-                        "  DIR/<name>/teach.zarr + teachmask.zarr and DIR/segs-teach.json for the on-the-fly ink path\n"); return 2; }
+                        "  DIR/<name>/teach.zarr + teachmask.zarr and DIR/segs-teach.json for the on-the-fly ink path\n"
+                        "  --extra: meshes without human labels (unroll wraps, unlabelled segments): teacher labels on a teacher-px raster with the\n"
+                        "  calibration of the labelled ones, minus held-out boxes and minus px within --extra-clear level-0 voxels of a labelled mesh\n"); return 2; }
     const int K = opt_atoi("--k", sopt(argc, argv, "--k", "4")), hdil = opt_atoi("--human-dilate", sopt(argc, argv, "--human-dilate", "1"));
     const double px_um = opt_atof("--px-um", sopt(argc, argv, "--px-um", "9.596")), lo = opt_atof("--lo", sopt(argc, argv, "--lo", "0.1")), hi = opt_atof("--hi", sopt(argc, argv, "--hi", "0.8"));
     const double hm = opt_atof("--hold-margin", sopt(argc, argv, "--hold-margin", "64")); const int eqw = !strcmp(sopt(argc, argv, "--weights", "auc"), "equal");
@@ -1973,12 +1985,34 @@ int cmd_ink_teach(int argc, char **argv) {
             if (cr && cr->n == 4 && json_num(json_at(cr, 2), 0) > 0) for (int d = 0; d < 4; d++) w[d] = (int64_t)json_num(json_at(cr, (size_t)d), 0); else w[2] = -1; }
     }
     json_free(j);
+    /* --extra NAME=TIFXYZ / --extra-list FILE: meshes without human labels (B2, user 11-18: more teacher coverage than the labelled meshes) */
+    { int nx = 0; for (int i = 2; i + 1 < argc; i++) nx += !strcmp(argv[i], opt_n("--extra"));
+      const char *xl = sopt(argc, argv, "--extra-list", nullptr); char ln[2400];
+      if (xl) { FILE *xf = fopen(xl, "r"); if (!xf) { fprintf(stderr, "ink-teach: cannot open %s\n", xl); return 1; } while (fgets(ln, sizeof ln, xf)) nx++; fclose(xf); }
+      if (nx) { S = realloc(S, (ns + nx) * sizeof *S); memset(S + ns, 0, nx * sizeof *S);
+        const int ns0 = ns;
+        for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n("--extra"))) { const char *e = strchr(argv[i + 1], '='); if (!e) continue;
+            snprintf(S[ns].name, sizeof S[ns].name, "%.*s", (int)(e - argv[i + 1]), argv[i + 1]); snprintf(S[ns].tifxyz, sizeof S[ns].tifxyz, "%s", e + 1); S[ns++].ext = 1; }
+        if (xl) { FILE *xf = fopen(xl, "r"); char a[256], b[2048];
+          while (xf && fgets(ln, sizeof ln, xf)) if (ln[0] != '#' && sscanf(ln, "%255s %2047s", a, b) == 2) { snprintf(S[ns].name, sizeof S[ns].name, "%s", a); snprintf(S[ns].tifxyz, sizeof S[ns].tifxyz, "%s", b); S[ns++].ext = 1; }
+          if (xf) fclose(xf); }
+        for (int k = ns0; k < ns; k++) for (int q = 0; q < k; q++) if (!strcmp(S[k].name, S[q].name)) { fprintf(stderr, "ink-teach: --extra name %s used twice\n", S[k].name); return 1; }
+        fprintf(stderr, "ink-teach: %d extra meshes (no human labels)\n", ns - ns0); } }
+    const double xclear = opt_atof("--extra-clear", sopt(argc, argv, "--extra-clear", "48")); it_cells LC = {0};
+    for (int si = 0; si < ns && xclear > 0; si++) if (!S[si].ext) {   /* the labelled meshes' vertices, cells of xclear voxels (an extra px is cleared when its cell or a neighbour holds one) */
+        ssurf SS; if (ssurf_load(&SS, S[si].tifxyz)) return 1;
+        for (size_t q = 0; q < (size_t)SS.w * SS.h; q++) { const float z = SS.Z[q], y = SS.Y[q], x = SS.X[q]; if (!(z > 0 && y > 0 && x > 0)) continue;
+            it_cadd(&LC, it_ckey((int64_t)(z / xclear), (int64_t)(y / xclear), (int64_t)(x / xclear))); }
+        ssurf_free(&SS); }
     /* pass 1 per segment: the teacher raster + the human footprint stats; kept for pass 2 (rasters are 1 / K^2 of the label grid) */
     typedef struct { int64_t H, W; double F, lum; float *xt; uint8_t *valid, *hsup; float *hy; } itr;
     itr *R = calloc(ns, sizeof *R); float *px = malloc(maxp * nt * sizeof *px), *py = malloc(maxp * sizeof *py); size_t np = 0, nseen = 0; uint64_t rng = 0x9E3779B97F4A7C15ull;
     for (int si = 0; si < ns; si++) {
         it_seg *s = &S[si]; itr *r = &R[si]; ssurf SS; if (ssurf_load(&SS, s->tifxyz)) return 1;
-        lsrc LL; if (lsrc_open(&LL, s->lab, -1, nullptr)) return 1;
+        lsrc LL; memset(&LL, 0, sizeof LL);
+        if (s->ext) {   /* no label grid: label px = 1 / K teacher px, so the raster is the teacher's own px grid (F K mesh voxels = px_um) */
+            const double mum = SS.vox_um > 0 ? SS.vox_um : 2.399; LL.um = px_um / K; LL.W = (int64_t)ceil(SS.w / SS.scale / (LL.um / mum)); LL.H = (int64_t)ceil(SS.h / SS.scale / (LL.um / mum)); }
+        else if (lsrc_open(&LL, s->lab, -1, nullptr)) return 1;
         double F; { const double ew = SS.w / SS.scale, eh = SS.h / SS.scale; F = 0.5 * (ew / (double)LL.W + eh / (double)LL.H); const double p2 = pow(2, round(log2(F))); if (fabs(F - p2) < 0.002 * p2) F = p2;
             const double mum = SS.vox_um > 0 ? SS.vox_um : 2.399; if (LL.um > 0 && mum > 0) F = LL.um / mum; }
         r->F = F; r->lum = LL.um; r->H = (LL.H + K - 1) / K; r->W = (LL.W + K - 1) / K; const size_t n = (size_t)r->H * r->W;
@@ -1993,7 +2027,10 @@ int cmd_ink_teach(int argc, char **argv) {
                 double P[3], N[3]; const size_t k = (size_t)a * r->W + b;
                 if (ssurf_pn(&SS, gu, gv, P, N)) continue;
                 if (!t) { int in = 0; for (int e = 0; e < hc.nexcl && !in; e++) { in = 1; for (int d = 0; d < 3; d++) in &= P[d] >= hc.excl[e][d] - hm && P[d] < hc.excl[e][d] + hc.excl[e][3 + d] + hm; }
-                          r->valid[k] = in ? 2 : 1; }   /* 2: inside a held-out box */
+                          r->valid[k] = in ? 2 : 1;   /* 2: inside a held-out box */
+                          if (s->ext && !in && LC.n) { const int64_t cz = (int64_t)(P[0] / xclear), cy = (int64_t)(P[1] / xclear), cx = (int64_t)(P[2] / xclear); int nb = 0;
+                              for (int dz = -1; dz <= 1 && !nb; dz++) for (int dy = -1; dy <= 1 && !nb; dy++) for (int dx = -1; dx <= 1 && !nb; dx++) nb = it_chas(&LC, it_ckey(cz + dz, cy + dy, cx + dx));
+                              if (nb) r->valid[k] = 4; } }   /* 4: an extra mesh's px next to a labelled mesh (the human labels and their teacher px rule there) */
                 double mx = gu / du, my = gv / du; if (mx > mw - 1) mx = mw - 1; if (my > mh - 1) my = mh - 1;
                 const int x0 = (int)mx, y0 = (int)my, x1 = x0 + 1 < mw ? x0 + 1 : x0, y1 = y0 + 1 < mh ? y0 + 1 : y0; const double fx = mx - x0, fy = my - y0;
                 const double v = (1 - fy) * ((1 - fx) * m[(size_t)y0 * mw + x0] + fx * m[(size_t)y0 * mw + x1]) + fy * ((1 - fx) * m[(size_t)y1 * mw + x0] + fx * m[(size_t)y1 * mw + x1]);
@@ -2002,7 +2039,8 @@ int cmd_ink_teach(int argc, char **argv) {
             free(m);
         }
         /* the human supervision over the windows, pooled K: supervised count / label sum per teacher px (0/1 rasters x 255) */
-        lsrc LM; const int hasm = s->msk[0] && !lsrc_open(&LM, s->msk, -1, nullptr);
+        lsrc LM; const int hasm = !s->ext && s->msk[0] && !lsrc_open(&LM, s->msk, -1, nullptr);
+        if (s->ext) s->nwin = 0;
         uint16_t *cnt = calloc(n, sizeof *cnt); float *sum = calloc(n, sizeof *sum);
         for (int w = 0; w < s->nwin; w++) {
             const int64_t *wn = s->win[w], c0 = wn[2] > 0 ? wn[0] : 0, r0 = wn[2] > 0 ? wn[1] : 0, ww = wn[2] > 0 ? wn[2] : LL.W, wh = wn[2] > 0 ? wn[3] : LL.H;
@@ -2037,12 +2075,14 @@ int cmd_ink_teach(int argc, char **argv) {
                 size_t slot = np < maxp ? np++ : (rng ^= rng << 13, rng ^= rng >> 7, rng ^= rng << 17, (size_t)(rng % (nseen + 1)));
                 if (slot < maxp) { memcpy(px + slot * nt, r->xt + k * nt, nt * sizeof *px); py[slot] = r->hy[k]; }
                 nseen++; } }
-        free(cnt); free(sum); if (hasm) lsrc_close(&LM); lsrc_close(&LL);
-        size_t nv = 0, nh = 0; for (size_t k = 0; k < n; k++) { nv += r->valid[k] == 1; nh += r->valid[k] == 2; }
+        free(cnt); free(sum); if (hasm) lsrc_close(&LM); if (!s->ext) lsrc_close(&LL);
+        size_t nv = 0, nh = 0, nc = 0; for (size_t k = 0; k < n; k++) { nv += r->valid[k] == 1; nh += r->valid[k] == 2; nc += r->valid[k] == 4; }
+        if (s->ext) fprintf(stderr, "ink-teach: %s (extra): %zu px cleared near the labelled meshes\n", s->name, nc);
         fprintf(stderr, "ink-teach: %s: %lld x %lld teacher px (label F %.4g, K %d), %zu valid, %zu in held-out boxes, %zu human-supervised (%zu calibration)\n",
                 s->name, (long long)r->W, (long long)r->H, F, K, nv, nh, nsup, nfull);
         ssurf_free(&SS);
     }
+    free(LC.k);
     if (np < 1000) { fprintf(stderr, "ink-teach: only %zu calibration px\n", np); return 1; }
     /* weights from the per-teacher AUC, then Platt on the ensemble logit */
     double w[8], ws = 0; float *xe = malloc(np * sizeof *xe), *tmp = malloc(np * sizeof *tmp);

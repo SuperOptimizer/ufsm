@@ -240,6 +240,7 @@ test_ink_blend                                 |              |     4 | python3 
 test_mergeflag                                 |              |     3 | python3 tests/test_mergeflag.py
 test_mergeflag_gpu                             | gpu          |     5 | python3 tests/test_mergeflag.py --gpu
 test_img_gate                                  |              |     2 | python3 tests/test_img_gate.py
+test_ink_teach                                 |              |     3 | python3 tests/test_ink_teach.py
 test_seamless                                  |              |     6 | python3 tests/test_seamless.py
 test_cover_training                            | gpu2,l2      |    16 | python3 tests/test_cover_training.py
 test_univ2                                     | gpu2,l2      |    40 | tests/test_univ2.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/univ2
