@@ -7,7 +7,7 @@
 #   2. deps: apt packages (root only), skipped when they are all present (xxhash: zarr3.c since iospeed): LLVM 22 (clang, lld,
 #      llvm, compiler-rt; from apt.llvm.org when the distribution lacks it), cmake, ninja, ccache, libcurl / zstd / blosc / zlib /
 #      ssl / jpeg / xxhash dev, jq, curl, rsync, time. The build is mcc (microc, scripts/toolchain/install_mcc.sh); clang stays for mcc's
-#      stage 0 / glibc link driver and the llvm-release fallback preset.
+#      stage 0 / glibc link driver and the llvm-release fallback preset. Python tifffile (pip) for test_img_gate and inksdk's mkarms.
 #   3. clone or fast-forward ufsm ($BRANCH, default master) into $POD/ufsm, then build it.
 #      CMake (cmake/llvm.cmake) finds the newest clang and /usr/local/cuda-* by itself: cmake --preset release (arch86 for
 #      non-12.x GPUs: software MX, since the fp4 / fp8 kernels need sm_120a), cmake --build -j <cgroup CPUs>. Always on the pod:
@@ -87,6 +87,10 @@ fi
 # xxhash (zarr3.c) is the one fresh pod images lack: fail here, not halfway through the build
 [ -e /usr/include/xxhash.h ] || [ -e /usr/local/include/xxhash.h ] || die "xxhash.h missing: apt-get install libxxhash-dev"
 for t in git cmake ninja curl jq pkg-config; do command -v $t > /dev/null || die "$t missing"; done
+# python tifffile: test_img_gate and inksdk's mkarms read TIFs with it; pod images ship numpy but not tifffile (pod 11-18: the gate's one
+# fail, mkarms A). A failed install is a warning: the unroll itself is all ufsm
+python3 -c 'import tifffile' 2> /dev/null || { python3 -m pip install -q tifffile > /dev/null 2>&1 || python3 -m pip install -q --break-system-packages tifffile > /dev/null 2>&1; } ||
+  say "pip: tifffile install failed (test_img_gate / mkarms need it)"
 
 # --- 3. clone + build ---
 U=$POD/ufsm/build/ufsm
