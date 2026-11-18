@@ -6,6 +6,39 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## try9's 1667 unroll was on GroupNorm statistics it never trained on; live GN + the cooled checkpoint beat u1 (2026-11-18, branch gnlive-20261118)
+
+Question (lead): why is try9's full-scroll 1667 unroll (pod B def-pab: ref GT ids 0.669, body drift 1.35) so far behind u1's (0.831, 0.71)
+when the wbench box gap between the nets is 0.004-0.011? Cause: try9 trains with `--gn-ema 1 --gn-ema-warm 1000000000`, i.e. always on
+each window's own GroupNorm statistics; the running statistics are only accumulated (header ge_n 8690 < ge_warm 1e9). predict's default
+normalised with those running statistics (its own log said so: "GroupNorm on the running statistics (8690 updates), which the net never
+trained on"), the wbench scoring ran `--gn-live 1` (scripts/integ/e2e.sh gnflag). u1 has no gn_ema: its windows use their own statistics.
+
+Arms on desk card 1 at def-pab's exact settings (640/64 fields, `--ema 0`, dir -1, FSKIP 20, occupancy 5, the whole box; fields ~5 min on
+the 5060 Ti), up to check; GT ids on the 54 non-noise 1667 wbench boxes (gtboxes, CPU), /vesuvius/ufsm/fix0332/gn1667:
+
+| arm | checkpoint | GN at predict | ref ids | joined ids | ref ids C2-C24 (16) | wrap-check real/dup/merged | body drift |
+|---|---|---|---|---|---|---|---|
+| u1 (pod def-u1) | u1 13000 | own (no gn_ema) | 0.831 | 0.853 | 0.806 | 33 / 6 / 12 | 0.71 |
+| def-pab (pod) | pab-base 8690 (lr 3e-4) | running | 0.669 | 0.699 | 0.644 | 35 / 4 / 10 | 1.35 |
+| A | pab-A eval-10690 (lr 0 cooldown) | running | 0.729 | 0.754 | 0.707 | 26 / 4 / 17 | 0.50 |
+| B | pab-base 8690 | live (`--gn-live 1`) | 0.742 | 0.766 | 0.724 | 31 / 5 / 11 | 0.69 |
+| AL | pab-A eval-10690 | live | **0.841** | **0.863** | 0.813 | 32 / 5 / 10 | **0.23** |
+
+- Live GN: +0.07 ref ids on 8690 (0.669 -> 0.742), +0.11 on 10690 (0.729 -> 0.841); body drift 1.35 -> 0.69 / 0.50 -> 0.23.
+- Cooling (8690 -> 10690): +0.06 on the running statistics, +0.10 with live GN; the two compound. Neither alone reaches u1, both together
+  pass it (+0.010 ref, +0.010 joined, body drift a third of u1's).
+- In-sample caveat: 1667's C25-C70 boxes are in-sample for both nets (paired, so the comparison holds, but the level is optimistic). On the
+  16 boxes outside that range (C2-C24, 6.7e8 labelled voxels) the ranking is unchanged: AL 0.813 / 0.839 (ref / joined) vs u1 0.806 /
+  0.833, def-pab 0.644; per box AL vs u1 is a tie (ref 6 better / 7 worse by > 0.005, joined 7 / 7). So: AL >= u1, not clearly above it.
+- wrap-check verdicts did not track GT here either (A: 17 merged at ids 0.729; see "rhocal" above).
+
+Fix (predict, src/gnmode.c): a gn_ema checkpoint whose --gn-ema-warm was never reached defaults to `--gn-live 1`, with a `DEFAULTED:`
+line; `--gn-live 0` forces the running statistics; warmed checkpoints, `--gn-frozen` and non-gn_ema nets unchanged. test_gnmode. Related,
+not changed: train's `--val-gn-live` defaults to 0, so a gn_ema run's validation (and its best.ckpt choice) is on the running statistics
+too (try9 runs that way). Also on the branch: unroll.sh FPX (extra fields-predict flags), and SGPU now applies under a caller's
+CUDA_VISIBLE_DEVICES (an index into it, as --gpu): with CUDA_VISIBLE_DEVICES=0,1 SGPU=1 the ref count-field had run on card 0, try9's card.
+
 ## Ink the papyrus once: the wraps' reader3 maps resampled from the stripes' (r3once; per-wrap AUC +0.004, 7.6k instead of 37.5k tiles; 2026-11-18, branch inkonce-20261118)
 
 Under INKMODE=r3 the unroll inked the same papyrus twice with reader3: once per wrap (the per-wrap images, perwrap's r3pre) and once per
