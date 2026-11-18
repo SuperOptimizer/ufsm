@@ -21,7 +21,7 @@
 # Then K/state/ALLDONE: the pod is idle. Smoke time on a pod (estimate): setup ~5 min, prefetch ~15 min (166k chunks, beside narrow +
 # weights), trainer start (source index, ink targets) ~10 min, 200 steps ~5-10 min: ~35-45 min, capped by ARMMAX.
 # Env: K (/root/ink), COMMIT (required: the master commit), FULL (0), LOCK (/root/gpu.lock), BJ (6), GPU (0), STEPS (200 / 3000),
-#      SCROLLS (the subset above / all), MINSPS10, MINSPS, ARMMAX (2700 / 0 = none), WORKERS / SLOTS (1 / 2: the desk sampler-only check
+#      SCROLLS (the subset above / all), MINSPS10, MINSPS, ARMMAX (2700 / 0 = none), WORKERS / SLOTS (2 / 3; a worker builds one window at a time, slots - 1 at once; desk dry run 11-18 at 1 / 2, 4 scrolls: 13-14 GB RSS, 1 worker thread at 100 %; the older sampler-only check
 #      of arm A held 23-24 GB RSS at 2 / 2 before any pinned memory; the pod cgroup has 31 GB). Run it from the kit copy (K/kit/podq.sh:
 #      it clones the repo itself), detached: COMMIT=... setsid nohup bash K/kit/podq.sh > K/podq.out 2>&1 &
 set -uo pipefail
@@ -115,7 +115,7 @@ arm() {   # arm A | B
   local a=$1; done_ arm$a$TAG && return 0
   mkarms $a; [ $a = A ] || { prefetch $a; done_ prefetch$a$TAG || die "prefetch $a (log $K/prefetch$a$TAG.log)"; }
   say "arm $a: training $STEPS steps ($TAG, $(el))"; local t0=$(date +%s)
-  ( R=$RD U=$U INIT=$K/ckpt/u1-13000-w.ckpt LATB=$K/kit/klt1.lcb GPU=$GPU LOCK=$LOCK RELAUNCH=3 WORKERS=${WORKERS:-1} SLOTS=${SLOTS:-2} bash $D/trainarm.sh $a $AD/sources-$a.json ) > $RD/arm$a.out 2>&1 &
+  ( R=$RD U=$U INIT=$K/ckpt/u1-13000-w.ckpt LATB=$K/kit/klt1.lcb GPU=$GPU LOCK=$LOCK RELAUNCH=3 WORKERS=${WORKERS:-2} SLOTS=${SLOTS:-3} bash $D/trainarm.sh $a $AD/sources-$a.json ) > $RD/arm$a.out 2>&1 &
   local tp=$! st=0 sps rss cg MEMS; RSSPK=0
   stoparm() { touch $RD/inksmoke$a.stop; kill $(cat $RD/inksmoke$a.pid 2>/dev/null) 2>/dev/null; sleep 30; sanity $a; die "$*"; }
   while kill -0 $tp 2>/dev/null; do
