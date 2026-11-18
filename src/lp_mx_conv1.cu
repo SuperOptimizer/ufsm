@@ -266,7 +266,7 @@ __global__ void __launch_bounds__(256, 1) conv1_mx_tc_k(const uint8_t *__restric
                 }
     }
 }
-static int g_head_tc = -1, g_rtc = -1;
+static int g_head_tc = -1, g_rtc = -1;   /* mgpu: env / test config */
 extern "C" void lp_set_head_tc_r(int on) { g_rtc = on; }   /* tests: predict's per-z fp32 head on the tensor cores (1) or the FFMA passes (0); -1: env UFSM_HEAD_TC_R */
 extern "C" void lp_set_head_tc(int on) { g_head_tc = on; }   /* tests: the tensor-core wide head on / off (-1: env UFSM_HEAD_TC, default on) */
 template <typename YT = __half> static bool conv1_tc(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, size_t vb, size_t Sy, size_t Ly = 0) {
