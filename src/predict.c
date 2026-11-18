@@ -2318,7 +2318,8 @@ static int predict_one(int argc, char **argv) {
         /* --tta on a latent-grid net: the direct cell input, the fit fields from the whole-window planes (fzs is off with --tta), cube windows */
         tta_lat = half == 3 && latin && ffd && ct_shared && Wz == W && !(W % 4) && (!cfg.lat_guide || cfg.lat_guide == 64) && !cfg.fstem && !degrade && !auxz && !lat_store && !fzs;
         if (tta > 1 && !tta_lat && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) {
-            fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs) or a latent-grid net's direct cell input with fit fields and cube windows\n"); return 2; }
+            fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs) or a latent-grid net's direct cell input with fit fields and cube windows"
+                            " (latent: half %d latin %d fit fields %d ct_shared %d window %d x %d lat_guide %d fstem %d)\n", half, latin, ffd != nullptr, ct_shared, Wz, W, cfg.lat_guide, cfg.fstem); return 2; }
         if (tta > 1 && tta_lat) fprintf(stderr, "predict: --tta %d on the latent-grid net: the CT window through each symmetry into the cell input, the fit fields from the whole-window planes\n", tta);
     }
     int64_t ns[3];
