@@ -2225,7 +2225,7 @@ static int predict_one(int argc, char **argv) {
     const int ct_stem = unet_ct_stem(u);   /* unet_forward_ct: no 16-bit input */
     int gdir = 0, fzs = 0, fzl = 0;   /* (fzl: the fused fit kernel, nn_fit_accum_lat; UFSM_PRED_FIT_FUSED=0 the plane path) the guided head's direct rv bytes (nn_lat_place_rvg); fit fields from a latent-grid net in z-chunk slabs */
     void *fzA = nullptr, *fzB = nullptr, *fzX = nullptr, *fzW = nullptr; int fzP = 0;
-    int fsup_on = getenv("UFSM_PRED_FSUP") && *getenv("UFSM_PRED_FSUP") == '1';   /* UFSM_PRED_FSUP=1: the fused head slab (opt-in: slower so far, below) */   /* fzW: the fused kernel's winding-pair planes (UFSM_PRED_FIT_W4P) */
+    int fsup_on = !(getenv("UFSM_PRED_FSUP") && *getenv("UFSM_PRED_FSUP") == '0');   /* the fused head slab (UFSM_PRED_FSUP=0: the three kernels) */   /* fzW: the fused kernel's winding-pair planes (UFSM_PRED_FIT_W4P) */
     const int fzw4p = !getenv("UFSM_PRED_FIT_W4P") || ufsm_env_on("UFSM_PRED_FIT_W4P");
     uint8_t *ctd = nullptr, *ctcp = nullptr; uint32_t *ctm = nullptr, *ctmi = nullptr; void *xd = nullptr; int ct_shared = 0, xd_shared = 0;
     pjob_t J = {0};
@@ -3151,11 +3151,12 @@ static int predict_one(int argc, char **argv) {
                                 nn_lat_ct_x(ct_shared ? ctcp : ctd, W, x0_, x1_ - x0_, (float)mean, (float)(1.0 / sd), fzX); \
                                 if (nn_fstem_fwd((const void *)((uintptr_t)fzX - (size_t)x0_ * hw * 2), Wz, W, W, (z0_), (nz_), unet_active_params(u) + unet_fstem_off(u), cfg.fstem, cfg.fstem_out, fm_, (P), (size_t)(nz_) * hw)) { \
                                     fprintf(stderr, "predict: the fine stem: slab shape\n"); return 2; } } while (0)
-                            /* UFSM_PRED_FSUP=1 (opt-in): the fine stem's planes (its rows' channels among the NP planes from CH0) through
+                            /* UFSM_PRED_FSUP (default on; 0: the three kernels): the fine stem's planes (its rows' channels among the NP planes from CH0) through
                                nn_fstem_up_fwd_t (up-slab + the sub-cell shuffle + stem in one kernel, the same bytes), the other planes by the plain up-slab;
                                all 11 planes fused (zero W2 rows) was slower: nsys 2026-11-17 71.8 ms against 59.8 for the three kernels, the fused epilogue
                                upsamples serially per output at one block an SM; this split 63.1 against 59.8 (the fused instance: 95 registers + 6.3 KB
-                               dynamic shared against 62, 6.43 against 3.57 ms a launch): opt-in until the kernel's occupancy is fixed */
+                               dynamic shared against 62, 6.43 against 3.57 ms a launch); after trainperf's bc55ce95 (the upsample weights by index, no
+                               divergent branch) 57.5 against 59.6, all kernels 124.2 against 125.9: the default */
                             const int stm_ = cfg.fstem && !fstem_off; int fsu_ = 0;
 #define FZ_FSUP(z0_, nz_, P, LC, NP, CH0, SIDE) do { if (!fsup_on || !stm_ || cfg.fstem_out > 16 || (NP) > 30) break; int ch_[16]; unsigned cov_ = 0; \
                                 for (int k = 0; k < cfg.fstem_out; k++) ch_[k] = -1; \

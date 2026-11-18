@@ -269,7 +269,7 @@ memory (silently: the fp32 reference gradient itself was off; rel L2 vs tensor c
 the mapping. memcheck had not seen it (the overrun stays inside pooled allocations). Fix: free_acts resets nob (and gA_bytes) with
 the other plan flags. Pod PRO 4000: 2/2 pass. Only a rebuild that leaves the tensor-core plan for the fp32 one is affected (tests;
 training never switches nn_set_tf32).
-## Predict fields: the fused fstem_up slower than its three kernels (opt-in UFSM_PRED_FSUP=1); 1152 windows no GPU gain; writer pool; DF16 v7 (2026-11-17, branch fsup-20261117)
+## Predict fields: the fused fstem_up (default after trainperf's fix, -3.5 % of its kernels); 1152 windows no GPU gain; writer pool; DF16 v7 (2026-11-17, branch fsup-20261117)
 
 **Fused head slab.** trainperf's nn_fstem_up_fwd_t (fp32 cells) does up-slab + sub-cell shuffle + fine stem in one kernel. It is wired into
 predict's plane path (fzA and the winding pair fzB) and gives byte-identical fit stores at 640/64 and 1152/64. nsys kernel minima (u1 13000,
@@ -283,7 +283,10 @@ predict's plane path (fzA and the winding pair fzB) and gives byte-identical fit
 
 The fused instance runs at 95 registers + 6.3 KB dynamic shared memory against the plain one's 62 (`__launch_bounds__(FS_BT, 1)` for UP),
 6.43 against 3.57 ms for the same 63360-block launch, which outweighs the up-slab and shuffle passes it saves. So it stays opt-in
-(UFSM_PRED_FSUP=1, the hybrid split) until the kernel's occupancy is fixed; flipping the default needs only the env line.
+(UFSM_PRED_FSUP=1, the hybrid split) until the kernel's occupancy is fixed. It was not occupancy: trainperf's bc55ce95 (fsu_row picked its
+upsampling weights by bx & 1, a divergent branch in every warp; now by index, cell type templated, 32-bit offsets; 95 -> 78 registers)
+gives, on the same recipe: the three kernels 33.1 + 17.5 + 9.0 = 59.6, the hybrid 49.2 + 8.3 = 57.5 (-3.5 %), all kernels 125.9 -> 124.2
+ms per window, byte-identical. The hybrid is the default now (UFSM_PRED_FSUP=0: the three kernels); lat_shuf_k is gone from the fields path.
 
 **1152 against 640 fields windows, quiet card** (master 442668dd, same box, x2): 640/64 32 tiles, gpu(fwd+d2h) 9.09 / 9.17 s, main wall
 9.6 / 9.5 s, RSS 4 GB; 1152/64 4 tiles, gpu 9.34 / 9.20 s, main wall 13.7 / 11.1 s (the fit writer drains the last slabs after only 4
