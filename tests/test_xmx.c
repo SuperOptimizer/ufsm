@@ -226,6 +226,24 @@ static int run_dfs(int N, int D, int H, int W) {
     return bad != 0;
 }
 
+/* the GN applied while conv_igemm stages its A chunks (xconv_fwd_gnin, > 16 outputs) against xgn + xconv_fwd: byte-identical */
+static int run_gna(int N, int H, int W, int ci, int co, int k, int act) {
+    const size_t nx = (size_t)N * H * W * ci, ny = (size_t)N * H * W * co; uint16_t *fh = malloc(nx * 2), *y1 = malloc(ny * 2), *y2 = malloc(ny * 2);
+    float *ga = malloc(ci * 4), *be = malloc(ci * 4), *w = malloc((size_t)co * ci * k * k * 4);
+    for (size_t i = 0; i < nx; i++) fh[i] = f2h(rnd() * 2.f + 0.7f * (float)(i % ci) / ci);
+    for (int c = 0; c < ci; c++) { ga[c] = 1.f + 0.5f * rnd(); be[c] = 0.3f * rnd(); }
+    for (size_t i = 0; i < (size_t)co * ci * k * k; i++) w[i] = rnd() * 0.05f;
+    xnet_set_mx(0); xconv c; xconv_init(&c, w, co, ci, 1, k, k, 1, 1, 1, 0, k / 2, k / 2, nullptr, nullptr);
+    float *gd = xdev_floats(ga, ci), *bd = xdev_floats(be, ci); xt f = xt_new(N, 1, H, W, ci); xh2d(f.p, fh, nx * 2);
+    float *g = xgn_stats(f, ci, 1e-5f); xt y = xconv_fwd_gnin(&c, f, g, g + (size_t)N * ci, gd, bd, act); xd2h(y1, y.p, ny * 2); xt_free(&y); xfree_dev(g);
+    xgn(f, ci, gd, bd, 1e-5f, nullptr, act, f); y = xconv_fwd(&c, f, nullptr, XA_NONE); xd2h(y2, y.p, ny * 2); xt_free(&y);
+    if (xnet_check("test_xmx gna")) return 1;
+    size_t nd = 0; for (size_t i = 0; i < ny; i++) nd += y1[i] != y2[i];
+    printf("gna N %d %dx%d ci %3d co %3d k %d act %d: %zu of %zu differ from xgn + conv\n", N, H, W, ci, co, k, act, nd, ny);
+    xt_free(&f); xconv_free(&c); xfree_dev(gd); xfree_dev(bd); free(fh); free(y1); free(y2); free(w); free(ga); free(be);
+    return nd != 0;
+}
+
 /* the 1 -> 16 stem conv (k_dfc1) against a double host reference with fp16 weights */
 static int run_c1(int N, int D, int H, int W) {
     const size_t nx = (size_t)N * D * H * W; uint16_t *xh = malloc(nx * 2), *yh = malloc(nx * 32); float *x = malloc(nx * 4), *w = malloc(16 * 27 * 4), b[16];
@@ -328,6 +346,11 @@ int main(void) {
     g_mxa = 0; xnet_set_mxq(0); xnet_set_mxrot(0); xnet_set_mxa(0);
     fails += run_dattn(2, 17, 40, 36);
     fails += run_gnin(2, 17, 20, 70);
+    fails += run_gna(2, 20, 30, 32, 32, 3, XA_LRELU);
+    fails += run_gna(2, 19, 23, 64, 64, 3, XA_LRELU);
+    fails += run_gna(3, 12, 12, 320, 320, 3, XA_LRELU);
+    fails += run_gna(2, 15, 17, 128, 256, 3, XA_SILU);
+    fails += run_gna(1, 9, 11, 256, 96, 1, XA_RELU);
     fails += run_c1(2, 17, 30, 41);
     fails += run_c1(1, 3, 9, 23);     /* W % 4 ragged */
     fails += run_dfs(2, 17, 20, 70);   /* ragged y / x tiles */

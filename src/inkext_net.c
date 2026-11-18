@@ -595,8 +595,8 @@ static void hecate_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out,
 }
 
 static xt bbd_fwd(const bbd *B, xt x) {
-    xt h = xconv_fwd(&B->c1, x, nullptr, XA_NONE); xgn(h, h.c, B->g1, B->b1, 1e-5f, nullptr, XA_LRELU, h);
-    xt h2 = xconv_fwd(&B->c2, h, nullptr, XA_NONE); xt_free(&h);
+    xt h = xconv_fwd(&B->c1, x, nullptr, XA_NONE);   /* c2(lrelu(GN(h))): the GN applied as c2 stages its input (xconv_fwd_gnin; UFSM_XNET_GNA=0 apply first) */
+    float *g1 = xgn_stats(h, h.c, 1e-5f); xt h2 = xconv_fwd_gnin(&B->c2, h, g1, g1 + (size_t)h.n * h.c, B->g1, B->b1, XA_LRELU); xfree_dev(g1); xt_free(&h);
     xt sk = x; int own = 0;
     if (B->stride != 1) { sk = xavgpool2d_k2(x); own = 1; }
     if (B->has_sk) { xt p = xconv_fwd(&B->sk, sk, nullptr, XA_NONE); if (own) xt_free(&sk); xgn(p, p.c, B->gs, B->bs, 1e-5f, nullptr, XA_NONE, p); sk = p; own = 1; }

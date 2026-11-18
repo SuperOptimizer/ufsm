@@ -221,6 +221,7 @@ struct ConvP {
     long long M; int act;
     const float *lnw, *lnb; float lneps;   /* XA_LN: channel LayerNorm of the whole output row (one block holds every channel) */
     double *st;   /* IN sums [n][Co][2] of the fp16 output (plain epilogue, no res / act) */
+    const float *gm, *grs, *gg, *gb; int gact;   /* GNA: the input GroupNorm-applied on load as k_gn_apply ((x - gm) rs gamma + beta, act, fp16) */
 };
 __device__ __forceinline__ unsigned smem_u32(const void *p) { return (unsigned)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void cp_async16(void *dst, const void *src, int bytes) {
@@ -250,7 +251,7 @@ enum { KPAD = 64 };
                      ink-ext w035 A/B x3, byte-identical: register allocation only); 1 the old bound */
 #define XN_MINB 2
 #endif
-template <int BM, int BN, int WARPS_M, int WARPS_N, int BK, int NST>
+template <int BM, int BN, int WARPS_M, int WARPS_N, int BK, int NST, bool GNA = false>
 __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, WARPS_M * WARPS_N == 8 ? XN_MINB : 1) conv_igemm(ConvP p) {
     constexpr int NTH = WARPS_M * WARPS_N * 32, WM = BM / WARPS_M, WN = BN / WARPS_N, MI = WM / 16, NI = WN / 8;
     constexpr int QC = BK / 8, RS = NTH / QC, AP = BM / RS, BP = BN >= RS ? BN / RS : 1;   /* chunks per row, rows per pass, passes (BN < RS: one, part of the threads) */
@@ -259,29 +260,36 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, WARPS_M * WARPS_N == 8
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm0 = (warp / WARPS_N) * WM, wn0 = (warp % WARPS_N) * WN;
     const long long m_base = (long long)blockIdx.x * BM; const int n_base = blockIdx.y * BN;
-    const int q = tid % QC, r0 = tid / QC; int zb[AP], yb[AP], xb[AP]; long long nb[AP];
+    const int q = tid % QC, r0 = tid / QC; int zb[AP], yb[AP], xb[AP]; long long nb[AP]; int ns[AP];
 #pragma unroll
     for (int i = 0; i < AP; i++) {
         const long long m = m_base + r0 + i * RS;
         if (m < p.M) {
             long long t = m; const int xo = (int)(t % p.Wo); t /= p.Wo; const int yo = (int)(t % p.Ho); t /= p.Ho; const int zo = (int)(t % p.Do); t /= p.Do;
-            zb[i] = zo * p.sd - p.pd; yb[i] = yo * p.sh - p.ph; xb[i] = xo * p.sw - p.pw; nb[i] = t * p.Di;
-        } else { zb[i] = -(1 << 28); yb[i] = xb[i] = 0; nb[i] = 0; }
+            zb[i] = zo * p.sd - p.pd; yb[i] = yo * p.sh - p.ph; xb[i] = xo * p.sw - p.pw; nb[i] = t * p.Di; ns[i] = (int)t;
+        } else { zb[i] = -(1 << 28); yb[i] = xb[i] = 0; nb[i] = 0; ns[i] = 0; }
     }
     const int nk = p.Kp / BK;
     /* this thread's K position (tap tz, ty, tx and channel ci of k = ks BK + q 8), advanced by BK per loaded stage (loads go in ks order) */
     int ci = q * 8, tx = 0, ty = 0, tz = 0;
     while (ci >= p.Ci) { ci -= p.Ci; if (++tx == p.kw) { tx = 0; if (++ty == p.kh) { ty = 0; tz++; } } }
+    unsigned gok = 0u; unsigned long long gci = 0ull;   /* GNA: per ring slot, this thread's in-bounds chunk bits (AP each) and its channel (16 bits each) */
+    static_assert(!GNA || (NST * AP <= 32 && NST <= 4), "GNA ring metadata");
     auto load = [&](int slot, int ks) {
         const int k = ks * BK + q * 8; const bool kin = k < p.K;
         __half *A = sA + slot * BM * BK, *B = sB + slot * BN * BK;
+        unsigned okb = 0u;
 #pragma unroll
         for (int i = 0; i < AP; i++) {
             const int row = r0 + i * RS;
             const int zi = zb[i] + tz, yi = yb[i] + ty, xi = xb[i] + tx;
             const bool ok = kin && zi >= 0 && zi < p.Di && yi >= 0 && yi < p.Hi && xi >= 0 && xi < p.Wi;
             const __half *src = ok ? p.x + ((((nb[i] + zi) * p.Hi + yi) * (long long)p.Wi + xi) * p.Ci + ci) : p.x;
-            cp_async16(A + swz<BK>(row, q), src, ok ? 16 : 0);
+            cp_async16(A + swz<BK>(row, q), src, ok ? 16 : 0); okb |= (unsigned)ok << i;
+        }
+        if constexpr (GNA) {
+            gok = (gok & ~(((1u << AP) - 1u) << (slot * AP))) | okb << (slot * AP);
+            gci = (gci & ~(0xffffull << (slot * 16))) | (unsigned long long)ci << (slot * 16);
         }
 #pragma unroll
         for (int i = 0; i < BP; i++) {
@@ -290,6 +298,20 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, WARPS_M * WARPS_N == 8
         }
         ci += BK;
         while (ci >= p.Ci) { ci -= p.Ci; if (++tx == p.kw) { tx = 0; if (++ty == p.kh) { ty = 0; tz++; } } }
+    };
+    auto norm = [&](int slot) {   /* GNA: normalise this thread's own landed chunks of the slot in place (zero padding stays 0) */
+        if constexpr (GNA) {
+            __half *A = sA + slot * BM * BK; const int rci = (int)(gci >> (slot * 16) & 0xffffull); const unsigned okb = gok >> (slot * AP);
+#pragma unroll
+            for (int i = 0; i < AP; i++) {
+                if (!(okb >> i & 1u)) continue;
+                uint4 *ap = (uint4 *)(A + swz<BK>(r0 + i * RS, q)); uint4 val = *ap;
+                __half *hv = (__half *)&val; const int q0 = ns[i] * p.Ci + rci;
+#pragma unroll
+                for (int k = 0; k < 8; k++) hv[k] = __float2half_rn(act_f((__half2float(hv[k]) - p.gm[q0 + k]) * p.grs[q0 + k] * p.gg[rci + k] + p.gb[rci + k], p.gact));
+                *ap = val;
+            }
+        }
     };
     float acc[MI][NI][4];
 #pragma unroll
@@ -300,9 +322,9 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, WARPS_M * WARPS_N == 8
             for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
     for (int s = 0; s < NST - 1; s++) { if (s < nk) load(s, s); cp_commit(); }
     for (int ks = 0; ks < nk; ks++) {
-        cp_wait<NST - 2>(); __syncthreads();
-        const int slot = ks % NST;
-        if (ks + NST - 1 < nk) load((ks + NST - 1) % NST, ks + NST - 1);
+        cp_wait<NST - 2>(); norm(ks % NST); __syncthreads();   /* (a thread's own cp.async data is visible to it after the wait) */
+        const int slot = ks % NST; const bool ld = ks + NST - 1 < nk;
+        if (ld) load((ks + NST - 1) % NST, ks + NST - 1);
         cp_commit();
         const __half *A = sA + slot * BM * BK, *B = sB + slot * BN * BK;
 #pragma unroll
@@ -663,13 +685,13 @@ __global__ void k_tshuffle3(const __half *g, const float *bias, __half *y, size_
 }
 
 /* tile shapes: UFSM_XNET_CFG selects (default 0); per variant the tile follows the output channels (64 / 128 / >= 256) */
-template <int BM, int BN, int WMn, int WNn, int BK, int NST> static void launch1(const ConvP &p, int co) {
+template <int BM, int BN, int WMn, int WNn, int BK, int NST, bool GNA = false> static void launch1(const ConvP &p, int co) {
     const size_t sm = (size_t)NST * (BM + BN) * BK * 2;
     static unsigned attr = 0u;   /* mgpu: per-device (a bit per device: the attribute is per context; set first, then the bit, atomically) */
     int dv = 0; cudaGetDevice(&dv);
-    if (!(__atomic_load_n(&attr, __ATOMIC_ACQUIRE) >> (dv & 31) & 1u)) { cudaFuncSetAttribute(conv_igemm<BM, BN, WMn, WNn, BK, NST>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); __atomic_fetch_or(&attr, 1u << (dv & 31), __ATOMIC_RELEASE); }
+    if (!(__atomic_load_n(&attr, __ATOMIC_ACQUIRE) >> (dv & 31) & 1u)) { cudaFuncSetAttribute(conv_igemm<BM, BN, WMn, WNn, BK, NST, GNA>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); __atomic_fetch_or(&attr, 1u << (dv & 31), __ATOMIC_RELEASE); }
     dim3 g((unsigned)((p.M + BM - 1) / BM), (unsigned)((co + BN - 1) / BN));
-    conv_igemm<BM, BN, WMn, WNn, BK, NST><<<g, WMn * WNn * 32, sm, g_st>>>(p);
+    conv_igemm<BM, BN, WMn, WNn, BK, NST, GNA><<<g, WMn * WNn * 32, sm, g_st>>>(p);
 }
 /* ---- MX-fp4 implicit-GEMM convolution (UFSM_XNET_MX = 6: blocks of 16 K with a power-of-two ue8m0 scale, 5: NVFP4-style ue4m3 block
    scales and a per-output-channel fp32 weight scale): m16n8k64 kind::mxf4nvf4 scale_vec::4X, fp32 accumulation, fp16 output.
@@ -1265,6 +1287,10 @@ static bool dfc16_try(const xconv *c, xt in, xt y, const xt *res, int act, doubl
 static int g_cfg = -1, g_c16 = -1;   /* mgpu: env */
 static void conv_launch(const ConvP &p, int co) {
     if (g_cfg < 0) g_cfg = getenv("UFSM_XNET_CFG") ? atoi(getenv("UFSM_XNET_CFG")) : 0;
+    if (p.gm) {   /* GN on load (gna_ok): the default tiles */
+        if (co <= 32) launch1<128, 32, 4, 1, 32, 3, true>(p, co); else if (co <= 64) launch1<128, 64, 4, 2, 32, 3, true>(p, co); else launch1<128, 128, 2, 4, 32, 3, true>(p, co);
+        return;
+    }
     switch (g_cfg) {
     case 1:   /* 4 warps of 64 x 64 / 64 x 32 */
         if (co <= 64) launch1<128, 64, 2, 2, 32, 3>(p, co); else launch1<128, 128, 2, 2, 32, 3>(p, co); break;
@@ -1383,7 +1409,7 @@ static bool dfc1_try(const xconv *c, xt x, const xt *res, int act, double *st, x
     else k_dfc1<<<nblk((size_t)nv, 128), 128, 0, g_st>>>(xp, wp, c->Kp, c->scale, c->bias, yp, nv, x.d, x.h, x.w);
     return true;
 }
-static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *lnw = nullptr, const float *lnb = nullptr, float lneps = 0.f, double *st = nullptr) {
+static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *lnw = nullptr, const float *lnb = nullptr, float lneps = 0.f, double *st = nullptr, const GnIn *gna = nullptr) {
     { xt o; if (!lnw && dfc1_try(c, x, res, act, st, &o)) { g_fq_seq++; g_macs += (double)xt_numel(o) * 27; return o; } }
     xt in = x;
     if (c->unfold) in = xunfold(x, c->kw0, c->pw0);
@@ -1402,6 +1428,8 @@ static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *ln
     p.kd = c->kd; p.kh = c->kh; p.kw = c->kw; p.sd = c->sd; p.sh = c->sh; p.sw = c->sw; p.pd = c->pd; p.ph = c->ph; p.pw = c->pw;
     p.K = c->K; p.Kp = c->Kp; p.M = (long long)in.n * Do * Ho * Wo; p.act = act; p.lnw = lnw; p.lnb = lnb; p.lneps = lneps;
     p.st = st && !res && act == XA_NONE ? st : nullptr;
+    p.gm = p.grs = p.gg = p.gb = nullptr; p.gact = 0;
+    if (gna) { p.gm = gna->gm; p.grs = gna->rs; p.gg = gna->g; p.gb = gna->b; p.gact = gna->act; }
     g_macs += (double)p.M * c->co * c->K;
     if (c->mxrot && !in.p) fprintf(stderr, "xnet: an MX conv with UFSM_XNET_MXROT / MXA needs its fp16 input (fused MX-only producers quantise the plain way)\n");
     if (c->mxq && !fq.p && in.c == c->ci && p.M > 0 && (in.p || (in.q && !c->mxrot)) && !(act & (XA_LN | XA_GLU)) && !res && (act & 15) == XA_NONE) {   /* the MX-fp4 path */
@@ -1440,6 +1468,12 @@ extern "C" xt xconv_fwd_gnin(const xconv *c, xt x, const float *gm, const float 
     xt y = xt_new(x.n, Do, Ho, Wo, c->co);
     if (dfc16_try(c, x, y, nullptr, XA_NONE, nullptr, GnIn{gm, rs, gamma, beta, act})) return y;
     xt_free(&y);
+    static int gna = -1; if (gna < 0) gna = getenv("UFSM_XNET_GNA") ? atoi(getenv("UFSM_XNET_GNA")) : 1;   /* 0: apply, then the conv (A/B); mgpu: env */
+    fq_env();
+    if (gna && g_cfg <= 0 && !g_fq_a && !c->mxq && !c->unfold && !c->tconv && x.c == c->ci && x.c % 8 == 0 && c->co > 16 && (act & 15) == act) {
+        const GnIn gi{gm, rs, gamma, beta, act};   /* conv_igemm normalises its A chunks as it stages them: k_gn_apply's values, one pass less */
+        return conv_run(c, x, nullptr, XA_NONE, nullptr, nullptr, 0.f, nullptr, &gi);
+    }
     const size_t total = xt_numel(x); unsigned nb = nblk(total / 2, 256); if (nb > 65535 * 4) nb = 65535 * 4;
     k_gn_apply<<<nb, 256, 0, g_st>>>((const __half *)x.p, gm, rs, gamma, beta, nullptr, act, (__half *)x.p, x.c, (long long)x.d * x.h * x.w, total);
     return xconv_fwd(c, x, nullptr, XA_NONE);
