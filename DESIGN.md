@@ -6,6 +6,80 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Where the packed-sheet deficit lives: the net merges contact sheets; 4.8 um input and the Paris 4 spiral fit / segments both fail (2026-11-18, pseudolab)
+
+This follows "Packed sheets are not resolved by finer CT" below, and the lever memo (/vesuvius/ufsm/pseudolab/lever-memo.md). The
+scripts are in /vesuvius/ufsm/pseudolab/res48 (fieldcmp.py, fielddiag.py, w4diag.py, wb48.sh) and /vesuvius/ufsm/pseudolab/blight
+(sheetcmp.py).
+
+### (a) 4.8 um input, wbench DLV -1 (fd615b6f predict, cube windows; same fitter, codes, boxes)
+
+Boxes: packed PH1-3 / C1 / C2 / C19, control HOLD / C6 / C8 / C10 / C12 / C15 / C57.
+- **u1 13790:** packed Δids0 -0.063 [-0.136, +0.009]; control -0.195 [-0.377, -0.053] (C10 0.94 -> 0.30, C12 0.99 -> 0.56).
+- **try9 base (--gn-live 1):** packed -0.063; control -0.252.
+- **FAIL:** the gate was packed >= +0.05 with CI > 0. The packed boxes get worse too, so the "packed - control" difference only
+  reflects the controls collapsing: 4.8 um input is off-distribution for nets trained mostly at 9.6, as early nets were (u1-3000,
+  wind96, section 2026-11-12).
+
+### B-light: the Paris 4 extras (dropped, no try9 time)
+
+- **Spiral fit spiral-output-generation-19:** a 956 x 56913 tifxyz with per-vertex winding ids 10..135 (43.2 M vertices), x4 to the
+  2026 scan's 2.4 um voxels, rastered at 9.6 (16 GB, 4 min). Against the q-9p6 GT on the wbench Paris 4 boxes:
+  - sheets are placed well: 84 % of the packed GT sheets have a spiral sheet within 60 um, median 14-19 um;
+  - the winding is not: adjacent-step consistency is 0.735 at < 100 um gaps and 0.89 above (PH1 0.70);
+  - the best-gauge share per box is PH1 0.30 / PH2 0.45 / HOLD 0.67, against the try9 net's ids0 0.25 / 0.26 / 0.81, and the spiral's
+    numbers are in-sample (it was fit from verified patches).
+  It is net-quality, not GT-quality, where it matters.
+- **The 12 unused published segments,** wind-assigned into June's gauge with the July recipe:
+  - 5 duplicate June surfaces;
+  - 3 conflict (dropped);
+  - 4 are new: about 210 cm2, ~2 % of June's area, all in one neighbourhood.
+  Too little to clear the ~0.02 arm noise.
+
+### Diagnostics on the kept wbench fields (CPU; try9 base and u1 agree within ±0.08)
+
+- **The net merges contact sheets.** Between consecutive GT sheets one turn apart, the share where the net's unwrapped phase advances
+  < 0.5 turn, by gap (0-70 / 70-100 / 100-130 / 130-180 / > 180 um):
+  - HOLD 0.65 / 0.39 / 0.16 / 0.08 / 0.07;
+  - 1667 C2 0.62 / 0.20 / 0.09 / 0.04 / 0.02;
+  - C1 0.90 / 0.55 / 0.34 / 0.34 / 0.29.
+  There are almost no extra turns. The fields are h 2 (19.2 um cells), so the 0-70 bin is near the unwrap limit, but the 70-100
+  bin is clean and already shows the merge; no h 1 re-check is needed.
+- **PH1-3 are low-contrast regions.** The net merges there even at wide gaps (> 180 um: PH1 0.41, PH2 0.56, PH3 0.79). Compared with
+  HOLD / C2 / C10 / C15:
+  - the net's phase confidence (|pc, ps|) is 0.11-0.17 vs 0.51-0.72;
+  - the CT contrast (CV along the ray between GT sheets) is 0.15-0.26 vs 0.38-0.53 (PH3 at < 130 um gaps: 0.02-0.03, nearly flat CT).
+  The net is correctly unsure where the CT shows almost no sheet structure.
+- **The winding-mod-4 plane (dx over 32 voxels) does not rescue the count:** within 0.5 turn of GT at < 100 um gaps PH1 0.31 /
+  PH2 0.29 (0.25 = chance), HOLD 0.55, C2 0.65; at > 150 um 0.71-0.92. The density head's spacing tracks a typical spacing:
+  sp / GT gap is 1.4-1.75 at < 70 um and 0.4-0.8 above 180 um.
+- **The labels are reliable there.** The independent June and July tracings agree on the winding at 0.963 of the < 100 um sheet
+  crossings (adjacent-step consistency 0.94), against 0.99+ at wider gaps. The merges are the net's, not label noise.
+- **The fitter is not the limit.** On the label phase at the same 19.2 um cells it scores 0.81-0.99 on PH1-3 (the ceiling).
+
+### Where the deficit lives, and the recommended lever
+
+The deficit is in the net's local perception of sheets in contact. The labels there are good (~96 %), and the fitter counts them
+when given their phase. Finer CT does not show the sheets apart, and fed 4.8 um input breaks the net. Paris 4's extra data is either
+net-quality (the spiral) or tiny (the segments). The heads that should carry the count across contacts (wind4, density) are near
+chance or biased toward a typical spacing exactly there.
+
+**Lever: train on the contact sheets that are already labelled.** Weight the phase / wind4 loss up where GT sheets are < 100 um
+apart, and make the count heads see wider context. In Paris 4, 34 % of the GT turns are packed but only ~20 % of the labelled
+voxels, because packed turns are thin.
+
+**First experiment** (one paired arm from try9's next cooled checkpoint, the A/B harness, ~3.8 h on card 0 + evals; CPU prep first):
+- a per-source weight raster (the existing "weight" key) x3 where the local GT gap is < 100 um, built from the codes of Paris 4,
+  1667 and 0139;
+- holdout boxes masked as usual.
+**Gate on the GT holdouts:**
+- the packed boxes (PH1-3 / C1 / C19 / 139-1 / -2 / -3 / -8) Δids0 >= +0.03 with CI > 0, and the merge share at 70-100 um down
+  >= 0.1;
+- the non-packed holdouts not below -0.01.
+If it fails, the contact sheets carry no learnable local signal for this architecture, and the remaining route is a non-local one:
+counting turns across contacts from where the same sheets separate (fitter constraints along the sheet, e.g. the fibre / relative-
+winding links).
+
 ## try9's 1667 unroll was on GroupNorm statistics it never trained on; live GN + the cooled checkpoint beat u1 (2026-11-18, branch gnlive-20261118)
 
 Question (lead): why is try9's full-scroll 1667 unroll (pod B def-pab: ref GT ids 0.669, body drift 1.35) so far behind u1's (0.831, 0.71)
@@ -138,6 +212,7 @@ Before any 4.8 um teacher run, the premise was tested directly on the CT.
 | Paris 4 2.4 | 0.60 | 0.84 | 0.94 | 1.05 | 1.12 |
 | 1667 9.6 | 0.45 | 0.67 | 0.78 | 0.87 | 1.54 |
 | 1667 4.8 | 0.48 | 0.71 | 0.83 | 0.92 | 1.60 |
+| 1667 2.4 (NAS L0, --nz 4) | 0.50 | 0.74 | 0.84 | 0.93 | 1.64 |
 
 - **Per box** (gap < 100 um | >= 100 um, 9.6 -> 4.8):
   - PH1 0.60|1.10 -> 0.64|1.18 (2.4: 0.66|1.21);
