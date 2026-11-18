@@ -1808,7 +1808,7 @@ extern "C" void xgn(xt x, int groups, const float *gamma, const float *beta, flo
    consecutive voxels of the chunk (thread t voxels 2t, 2t + 1: k_dfc1's 27-tap chain per channel, zero taps included, then s scale + bias rounded),
    store them to y and to shared memory, and then thread (row t / 8, pair t % 8) adds its 8 voxels row, row + 32, ... in order: k_gnpart's
    per-thread sequence (voxels s0 + row + 32 k), so the partial sums, gm / rs and y are k_dfc1x + xgn_stats' bits, without y's re-read. */
-__global__ void __launch_bounds__(256) k_c1gs(const __half *x, const __half *w, int Kp, const float *scale, const float *bias, __half *y, int D, int H, int W, int nchunk, double *part) {
+__global__ void __launch_bounds__(256, 2) k_c1gs(const __half *x, const __half *w, int Kp, const float *scale, const float *bias, __half *y, int D, int H, int W, int nchunk, double *part) {
     /* steps of 512 voxels, thread t voxels 2t, 2t + 1: in one x row the pair shares k_dfc1x<2>'s window and weight loads (each output's
        chain unchanged); a pair across rows (odd W or chunk start) or past the chunk end runs each voxel alone */
     __shared__ __align__(16) float sw[16 * 28]; __shared__ __align__(16) __half sv[512 * 16]; __shared__ float sh[32 * 16 * 2]; __shared__ float m0s[16];
@@ -1854,8 +1854,12 @@ __global__ void __launch_bounds__(256) k_c1gs(const __half *x, const __half *w, 
         if (v < s1) {
             __align__(16) __half o0[16], o1[16];
             const bool two = v + 1 < s1, row2 = two && (v + 1) % W != 0;
-            if (!two || row2) { conv2(v, two ? 2 : 1, o0, o1); put(v, 2 * t, o0); if (two) put(v + 1, 2 * t + 1, o1); }
-            else { conv2(v, 1, o0, o1); put(v, 2 * t, o0); conv2(v + 1, 1, o0, o1); put(v + 1, 2 * t + 1, o0); }
+            const int np = two && !row2 ? 2 : 1;   /* (one rolled call site: a pair in one row, or each voxel alone) */
+#pragma unroll 1
+            for (int q = 0; q < np; q++) {
+                conv2(v + q, np == 1 && two ? 2 : 1, o0, o1); put(v + q, 2 * t + q, o0);
+                if (np == 1 && two) put(v + 1, 2 * t + 1, o1);
+            }
         }
         __syncthreads();
 #pragma unroll 4
