@@ -6,6 +6,37 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## reader3 MX-fp4 (UFSM_XNET_MX): the intermittent illegal address fixed; MX parked opt-in (2026-11-18, branch convkmxoob-20261118, convk)
+
+- The fault: plain MX5 runs of ink-ext died with rc 75 in about 1 of 5 processes on the pod (podrep: r3 of 5). The log said
+  "mcuda: k_tshuffle8: the driver's linker does not start (error 700)", then "cudaMalloc ... out of memory".
+  - Cause: conv_mx's B loader bounds the K chunk but not the output row. mx_pack1 padded the packed weight rows to 64, but the
+    BN 128 tile (co > 64, M >= 4096) reads ceil(co / 128) * 128 rows. reader3's 320-output convs (encoder stages 4-5, decoder 0,
+    tconvs 0-1) therefore read rows 320..383: ~92 KB of nibbles past the weights at K 2880, plus their scales. Those rows feed
+    only discarded columns, so the maps were right; whether the read faulted depended on what the cache allocator had placed
+    behind the block.
+  - The 700 is sticky. mcudahw JIT-links each kernel at its first launch, and the first one after the fault was the decoder's
+    k_tshuffle8. The next cudaMalloc then fails and reads as an OOM. k_tshuffle8 itself is in bounds.
+  - Not affected: the fp16 path (conv_mx is MX only) and the halo kernel conv_mxh (BN 32).
+  - Fix: rows padded to 128 (zero rows, valid outputs unchanged); xconv.mxrows; mx_launch exits if a tile grid passes the packed
+    rows. test_xmx adds co 320 at M 4096 (the BN 128 tile) and a row-count check.
+  - The fault was missed on the desk: CUDA_LAUNCH_BLOCKING, memcheck at small crops, synccheck and 3 cold-JIT runs were all clean.
+    racecheck on conv_mx (pod) is clean too.
+- Parked: MX stays opt-in for reader3. Numbers from the pod (RTX PRO 4000), w035, batch 16, nsys kernel totals:
+
+  | variant | kernel total | wall |
+  |---|---|---|
+  | fp16 | 5823 ms (conv_igemm 2776) | 8.9 s |
+  | pick unfused (MX5, MXQ 2, convs 2-4 skipped) | 5084 ms (conv_mx 1458, k_xq 278) | 10.5 s |
+  | pick with the fused GroupNorm + quantise k_gnq (UFSM_XNET_GNQ, branch convkgnq-20261118, byte-equal to xgn + k_xq) | 5426 ms | 11.1 s |
+
+  - k_gnq takes 916 ms, against 538 ms of k_gn_apply plus 172 ms of k_xq it replaces: one thread per 16-channel block coalesces poorly.
+  - Wall time is worse than fp16 on one window: 2-3 GPU-idle gaps of ~0.9 s before the first conv_mx launches (cold JIT of each
+    instantiation per binary).
+  - Quality is fine: held-out ink AUC on the 1667 q2 stripes was +0.0010 for the pick and 0.8734 for the fused pick (fp16 0.874,
+    gate -0.005).
+  - The estimated ceiling of fused quantisation was ~16-20 % of reader3 kernel time, below the bar for more work.
+
 ## Train vs predict parity: the same function up to fp16 rounding, except the EMA default and the window context (2026-11-18, branch parity-20261118)
 
 Audit (fix0332, lead + user): does predict run the function that training validates and trains? One fixed window per scroll (1667 GT
