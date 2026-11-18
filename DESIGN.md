@@ -6,6 +6,22 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Pod q2: full PHerc1667 at master on an RTX PRO 4000 (u1 13790, every speedup); the per-wrap ink gate bug (2026-11-18, unrollperf)
+
+The podq2 queue (scripts/pod/podq2.sh, DESK=none + the desk pull scripts/pod/q2pull.sh) on a 24 GB RTX PRO 4000 Blackwell pod (cgroup
+27.2 CPUs / 31 GB), master 2b021688, u1 13790 fields, INKMODE=r3 + R3ONCE, PERWRAP, KEEPINK: 23.5 min from the fields to the last wrap
+(setup 4 min before it). Stage walls (s; max RSS GB): fields 62 (5.9), rectosp 31, ref 53 (16.2 at the auto CFMEM), slabs 137, join 26,
+check 40, wraps 39, trim 11, snap 53, strip 26, stripflat 43, distort 12, stripimg 703 (14.7; the stripes' reader3 143.8 tiles/s), perwrap
+958 beside the strip chain (r3once: 44 wraps, residual reader3 143.8 tiles/s, then compose); cgroup peak 25 GB, no OOM kill. 4 stripes,
+179.2 cm, 1111 cm2, on papyrus 0.973. GT (desk, score1667.sh): gtboxes ids right joined 0.8607, ref-cf 0.8388 (54 boxes).
+
+Held-out ink AUC at 40 um: the stripes' raw reader3 maps 0.8739; the wraps' maps ungated (surf-resample stripes -> wraps) 0.8721; the
+wraps' maps as the unroll wrote them 0.6512. pw_fin ran r3ink.sh with its default gate (CT >= 80), meant for the strip renders' FILLED CT
+(--fill-ct 80 recentres it onto papyrus); the per-wrap renders have no --fill, their inked pixels sit at CT ~44 (median, w001), so the gate
+zeroed 46 % of the ink (95 % on w001). The CT render itself is unchanged by the render alias / --volume-out 0 (w001: byte-identical CT
+tif with UFSM_RENDER_ALIAS=0 and the volume written). pw_fin now passes R3GATE=${R3PWGATE:-0} (no gate); test_podscripts checks it.
+(The 11-17 desk AUC table above scored ungated maps, so it never saw the gate.)
+
 ## reader3 ink-ext: the narrow conv_igemm tiles at 2 stages (2026-11-18, branch convkr3-20261118)
 
 The ink stages are ~60 % of the pod 1667 unroll. Reader3 at the unroll shape (w035, --batch 16, nsys on the shared card 1; the shares, since

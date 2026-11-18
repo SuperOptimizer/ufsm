@@ -25,5 +25,6 @@ ck "podq2 only pushes from the pod (no rsync from the desk)" '! grep -nE "push [
 ck "podq2 keeps the per-wrap ink for the GT score" 'grep -q "KEEPINK=1" $Q2 && grep -q "KEEPINK" scripts/unroll/unroll.sh'
 t=$(printf '%s\n' "2026-11-18 03:20:05 rectosp start" "2026-11-18 03:20:11 rectosp done: 6 s wall, 32 CPU s, 5.6 GB max RSS" | awk "$(sed -n "s/^  awk '\(.*\)' \\\\$/\1/p" $Q2)")
 ck "podq2 stage table row${t:+ ($t)}" '[ "$t" = "$(printf "rectosp\t2026-11-18 03:20:05\t2026-11-18 03:20:11\t6\t32\t5.6")" ]'
+ck "per-wrap reader3 maps are not CT-gated (unfilled per-wrap CT, 11-18)" 'grep -q "R3GATE=\${R3PWGATE:-0} R3PRE=\$O/ink/r3/up bash \$H/r3ink.sh" scripts/unroll/unroll.sh'
 [ $fails = 0 ] && echo "test_podscripts: ok" || echo "test_podscripts: $fails failure(s)"
 exit $((fails != 0))

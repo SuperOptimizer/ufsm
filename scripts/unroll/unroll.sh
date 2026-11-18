@@ -887,7 +887,10 @@ pw_one() {   # pw_one WRAP GPU (a background subshell: the cache env stays in it
 }
 pw_fin() {   # pw_fin WRAP: (r3) the wrap's ink from r3pre, CT-gated; the side-by-side image + preview; the renders removed
   local w=$1 d=$O/r/$1
-  if [ "$INKMODE" = r3 ]; then R3PRE=$O/ink/r3/up bash $H/r3ink.sh $O/up/$w $d/$w.tif $d/${w}_ct.tif >> $d/render.log 2>&1 || return 1; fi
+  # (R3GATE 0 here, 11-18: the per-wrap renders have no --fill, so their CT is not recentred onto papyrus: the inked pixels sit at CT ~44
+  # (median, 1667 u1 w001) and r3ink.sh's CT >= 80 gate, meant for the strip's filled CT, zeroed 46 % of the ink: held-out AUC 0.651 vs
+  # 0.872 ungated (pod q2, 44 wraps). R3PWGATE sets a gate for a filled per-wrap CT.)
+  if [ "$INKMODE" = r3 ]; then R3GATE=${R3PWGATE:-0} R3PRE=$O/ink/r3/up bash $H/r3ink.sh $O/up/$w $d/$w.tif $d/${w}_ct.tif >> $d/render.log 2>&1 || return 1; fi
   nice -n 10 $U ink-compare $O/img/${w}_full_side.jpg --ct $d/${w}_ct.tif --ink "$INKNAME=$d/$w.tif" --px-um $LUM --stretch --stretch-ct --max-px 65000 --threads ${RTH:-8} \
     --then $O/prev/${w}_side.jpg --max-px 8000 > $d/stats.txt 2>&1 || return 1   # (its status is the job's: audit mini/shell #4)
   # (KEEPINK=1: the CT-gated ink map kept as ink/wraps/<w>.tif, the GT score's input: inkscore.sh TAG $O/up $O/ink/wraps; pod queue 11-18)

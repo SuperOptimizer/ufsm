@@ -41,7 +41,7 @@ C1=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader | awk -F', ' '$1 ==
   || { say "preflight FAILED ($OUT.preflight.log)"; fin 3; exit 3; }
 say "preflight ok: $(grep 'real GPU call' $OUT.preflight.log)"
 mkdir -p $OUT; rm -f $OUT/STOP $OUT/.guard_killed; say "unroll -> $OUT (R3BATCH $R3BATCH)"; run; rc=$?
-if [ $rc != 0 ] && [ ! -e $OUT/STOP ] && [ ! -e $OUT/.guard_killed ] && grep -lqiE "out of memory" $OUT/logs/r3*.log $OUT/r/*/render.log 2> /dev/null && [ $R3BATCH -gt 8 ]; then
+if [ $rc != 0 ] && [ ! -e $OUT/STOP ] && [ ! -e $OUT/.guard_killed ] && grep -lqiE "out of memory|cudaMalloc of .* failed|exceeds the .* device budget" $OUT/logs/r3*.log $OUT/r/*/render.log 2> /dev/null && [ $R3BATCH -gt 8 ]; then
   say "reader3 out of memory at R3BATCH $R3BATCH: resuming at 8"; export R3BATCH=8; run; rc=$?; fi
 [ $rc = 0 ] && [ -e $OUT/state/stripimg.done ] && [ -e $OUT/state/perwrap.done ] || { [ $rc = 0 ] && rc=9; }
 awk '/ start$/ {s[$3] = $1 " " $2} / done: / {st = $3; sub(/:$/, "", st); printf "%s\t%s\t%s %s\t%s\t%s\t%s\n", st, s[st], $1, $2, $5, $8, $11}' $OUT/progress.log \
