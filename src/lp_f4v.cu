@@ -457,7 +457,10 @@ __device__ __forceinline__ bool f4v_staged(const skipm_t &sk, int gz, int gy, in
             for (int tx = xl; tx <= xh; tx++) if (sk_active(sk, tz << 3, ty << 3, tx << 4)) return true;
     return false;
 }
-__global__ void __launch_bounds__(256) gn_prenorm_f4z_k(const mx4_t *__restrict__ x, int N, int Ci, int Cx, int CxP, int cpo, size_t S, int a, int L, int HW, gnp_t gp, split_t sp,
+#ifndef GPZ_MINB   /* 6 blocks of 256 an SM (was 101 registers -> 2 blocks; ncu: 29 % occupancy, 40 % issue, 25 % DRAM: latency-bound). Fields 0332 640: 5.6 ms a window -> 4.06 (3 blocks), 3.37 (4), 3.16 (5), 3.03 (6); byte-identical (register allocation only) */
+#define GPZ_MINB 6
+#endif
+__global__ void __launch_bounds__(256, GPZ_MINB) gn_prenorm_f4z_k(const mx4_t *__restrict__ x, int N, int Ci, int Cx, int CxP, int cpo, size_t S, int a, int L, int HW, gnp_t gp, split_t sp,
                                                         uint8_t *__restrict__ y, skipm_t sk = skipm_t{}, int zc = 0, int Do = 0, int W = 0) {
     __shared__ chan_t ctab[32]; __shared__ float2 cab[32]; __shared__ unsigned sgm;
     const int blk = blockIdx.y, n = blockIdx.z, nb = gridDim.y;

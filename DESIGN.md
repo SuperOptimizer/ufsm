@@ -29,6 +29,10 @@ eligible warps a scheduler.
   0 data files differ. The first version differed on ~130 of 135 M values of the radial channel: the compiler contracted
   dy dy + dx dx the other way round (the old SASS: FMUL dx dx, FFMA dy dy +). The new kernel pins fma(dy, dy, dx dx) with
   __fmaf_rn / __fmul_rn. test_lat compares old and new bit for bit, but its 73 k-voxel case is too small to show a 1e-6 flip.
+- **gn_prenorm_f4z_k at 6 blocks an SM** (GPZ_MINB; branch convkgpz-20261117): the slabbed GN+SiLU MX-fp4 copy of
+  conv_fwd_f4v_k's input. ncu: 101 registers -> 2 blocks of 256, 29 % occupancy, 40 % issue slots, 25 % DRAM, so latency-bound.
+  Fields 0332 640: 5.6 ms a window -> 4.06 / 3.37 / 3.16 / 3.03 at 3 / 4 / 5 / 6 blocks, 0 data files differ (register allocation
+  only). The trainer's preslab path uses the same kernel.
 
 ## reader3 ink-ext: the depth-fusion conv streamed over depth, conv_igemm at 2 blocks an SM (2026-11-17, branch convkx-20261117)
 
