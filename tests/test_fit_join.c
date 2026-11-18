@@ -217,7 +217,20 @@ int main(void) {
                     uint8_t *d = nn_malloc(7 * sn); const uint8_t *src[7] = {hpc, hps, sb.f.t[1], sb.f.t[2], sb.f.t[5], sb.f.sp, sb.f.w};
                     for (int k = 0; k < 7; k++) nn_h2d(d + k * sn, src[k], sn);
                     CHECK(!fit_phase_gate_gpu(d, d + sn, d + 2 * sn, d + 3 * sn, d + 4 * sn, d + 5 * sn, d + 6 * sn, sb.f.D, H, W, H8, ay, ax, wr, 0, 6, 0.3, 0.6, 0.5, sg, 0, 0), "phase gate (gpu)");
-                    nn_d2h(gpc, d, sn); nn_d2h(gps, d + sn, sn); nn_free(d);
+                    nn_d2h(gpc, d, sn); nn_d2h(gps, d + sn, sn);
+                    {   /* the first GPU kernels (UFSM_PG_OLD): the same bytes and statistics */
+                        for (int k = 0; k < 2; k++) nn_h2d(d + k * sn, src[k], sn);
+                        double so[4] = {0}; fit_phase_gate_gpu_set_old(1);
+                        CHECK(!fit_phase_gate_gpu(d, d + sn, d + 2 * sn, d + 3 * sn, d + 4 * sn, d + 5 * sn, d + 6 * sn, sb.f.D, H, W, H8, ay, ax, wr, 0, 6, 0.3, 0.6, 0.5, so, 0, 0), "phase gate (gpu, old)");
+                        fit_phase_gate_gpu_set_old(-1);
+                        uint8_t *opc = malloc(sn), *ops = malloc(sn); nn_d2h(opc, d, sn); nn_d2h(ops, d + sn, sn);
+                        /* (planes and the integer counts byte for byte; the sum of q is a double atomic: its order varies run to run) */
+                        const int pl = !memcmp(opc, gpc, sn) && !memcmp(ops, gps, sn), ct = so[0] == sg[0] && so[1] == sg[1] && so[3] == sg[3], same = pl && ct && fabs(so[2] - sg[2]) <= 1e-9 * fabs(so[2]);
+                        printf("phase gate gpu, new kernels vs the first: planes %s, counts %s, sum q %.17g / %.17g\n", pl ? "byte-identical" : "DIFFER", ct ? "equal" : "DIFFER", sg[2], so[2]);
+                        CHECK(same, "phase gate gpu: the new kernels differ from the first");
+                        free(opc); free(ops);
+                    }
+                    nn_free(d);
                     size_t same = 0, near1 = 0, nmx = 0; for (size_t i = 0; i < sn; i++) { if (!sb.f.w[i]) continue; nmx++; same += gpc[i] == cpc[i] && gps[i] == cps[i]; near1 += abs(gpc[i] - cpc[i]) <= 1 && abs(gps[i] - cps[i]) <= 1; }
                     printf("phase gate gpu vs cpu: identical on %.4f, within 1 on %.4f of %zu material cells; gated %.0f / %.0f, mean q %.4f / %.4f\n", nmx ? (double)same / nmx : 0,
                            nmx ? (double)near1 / nmx : 0, nmx, sg[1], sc[1], sg[3] ? sg[2] / sg[3] : 0, sc[3] ? sc[2] / sc[3] : 0);

@@ -27,6 +27,21 @@ With 3 lanes the slab stage is GPU-bound, so its kernels map about 1:1 to slab-s
   every LDL / STL but took 168 registers and 16 % occupancy: 330 us. With __launch_bounds__ 2 (128 regs): 277-288 us, no better. Not kept.
 All the sums are integers or the same double chains: the slab fit's delta.f32 / axis.f32 / model.json are byte-identical to master.
 
+Step 2 (same branch): the phase gate's k_pg_rates and the minibatch selection.
+- k_pg_rates: FP64-bound (86.6 % of the pipe), ~8 double divisions a cell. The divisions by byte constants (c0 = L / 127, t / 255) now
+  come from tables of the same doubles (k_pg_rates2): 12.0 -> 9.8 ms per 16 M-cell block. UFSM_PG_OLD=1 gives the first kernels;
+  test_fit_join checks planes and integer counts byte for byte against them (the sum of q is a double atomic, so its order varies run
+  to run).
+- Tried and dropped:
+  - k_pg_gate and k_pg_boxx with their 2R + 1 box-sum terms loaded 8 ahead, then added in the same order: the gate stayed at 23 ms, and
+    boxx went from 5.0 to 6.5 ms. The gate runs at IPC 0.16 with ~2400 SASS instructions a cell under mcc (NOP-padded DADD / F2F.F64
+    chains).
+  - A table for its blend: not byte-separable, since g (c8 - 128.0) / 127.0 rounds the product first.
+- fit_select_inv_k / fit_select_k: the box / crop index helpers did 64-bit divisions per candidate. The list path has < 2^32 box cells,
+  so fit_box_index32 / fit_crop_index32 compute the same integers in 32 bits. ncu on the same launches: select_inv 440 -> 333 us, select
+  56 -> 45 us. UFSM_FIT_SEL64=1 gives the size_t helpers.
+The slab fit's delta.f32 / axis.f32 / model.json are byte-identical to master again.
+
 ## Memory audit: where host / device memory goes per phase; count-field's ref reads shard pieces, 28.2 -> 8.1 GB at the same model bytes (2026-11-18, branch memopt-20261118)
 
 **The table** (measured 11-18; try9 = scratch2 on the desk, one card; unroll = PHerc1667, the 11-17 run and the 11-18 q2 desk run;

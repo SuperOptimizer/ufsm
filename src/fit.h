@@ -454,3 +454,4 @@ int fit_phase_gate_gpu_dw(uint8_t *pc, uint8_t *ps, const uint8_t *t1, const uin
                           int nz, int H, int W, double h, const float *ay, const float *ax, const float *dwref, int mode, int R, double lo, double hi, double rc, double st[4],
                           int oy, int ox);
 void fit_phase_gate_gpu_done(void);
+void fit_phase_gate_gpu_set_old(int v);   /* tests: 1 the first GPU kernels (row-by-row box sums, divisions in place), 0 the same bytes faster; -1: env UFSM_PG_OLD */

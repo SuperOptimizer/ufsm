@@ -88,6 +88,46 @@ __global__ void k_pg_gate(pg_dev P, const float *a2, const float *b2, const floa
     if (lm) atomicAdd(&cnt[0], lm); if (lg) atomicAdd(&cnt[1], lg); if (lq) { atomicAdd(&cnt[2], lq); atomicAdd(qs, lqs); }
 }
 
+/* k_pg_rates with the same bytes (2026-11-18; UFSM_PG_OLD=1 / fit_phase_gate_gpu_set_old: k_pg_rates): FP64-bound (86.6 % of the pipe,
+   ncu on the 1667 u1 s026 slab fit's 16 M-cell blocks; ~8 double divisions a cell), it now reads its divisions by byte constants (c0 =
+   L / 127, t / 255) from tables of the same doubles (pg_tab2_k): 12.0 -> 9.8 ms a block. Not kept: k_pg_gate (23 ms, IPC 0.16, ~2400
+   SASS instructions a cell under mcc) and k_pg_boxx with their box sums loaded 8 terms ahead (gate unchanged, boxx 5.0 -> 6.5 ms); the
+   gate's divisions are not byte-separable (g (c8 - 128.0) / 127.0 rounds the product first). */
+__global__ void pg_tab2_k(const float *tab, double *t2) {   /* t2: [65536] L / 127.0, [256] v / 255.0 */
+    const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= 65536) return;
+    t2[i] = tab[65536 + i] / 127.0; if (i < 256) t2[65536 + i] = i / 255.0;
+}
+__global__ void k_pg_rates2(pg_dev P, const double *__restrict__ t2, float *pa, float *pb) {
+    __shared__ double s255[256];
+    for (int k = threadIdx.x; k < 256; k += blockDim.x) s255[k] = t2[65536 + k];
+    __syncthreads();
+    const size_t HW = (size_t)P.H * P.W, n = (size_t)P.nz * HW;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        pa[i] = pb[i] = 0;
+        const int z = (int)(i / HW), y = (int)((i / P.W) % P.H), x = (int)(i % P.W);
+        if (P.mode || !P.w[i] || y == 0 || x == 0 || y + 1 >= P.H || x + 1 >= P.W || !P.sp[i]) continue;
+        const float *A = P.tab, *L = P.tab + 65536;
+        const double c0 = t2[P.pc[i] << 8 | P.ps[i]]; if (c0 < 0.125) continue;
+        double ry = (y + P.oy + 0.5) * P.h - P.ay[z], rx = (x + P.ox + 0.5) * P.h - P.ax[z]; const double rl = hypot(ry, rx); if (rl < 1) continue; ry /= rl; rx /= rl;
+        const double p0 = A[P.pc[i] << 8 | P.ps[i]];
+        const size_t ny[2] = {i - P.W, i + P.W}, nx[2] = {i - 1, i + 1}; double gy = 0, gx = 0; int ok = 1;
+        for (int s = 0; s < 2 && ok; s++) {
+            const size_t a = ny[s], b = nx[s];
+            if (L[P.pc[a] << 8 | P.ps[a]] < 16 || L[P.pc[b] << 8 | P.ps[b]] < 16) { ok = 0; break; }
+            double dy = A[P.pc[a] << 8 | P.ps[a]] - p0, dx = A[P.pc[b] << 8 | P.ps[b]] - p0;
+            dy -= floor(dy + 0.5); dx -= floor(dx + 0.5); gy += s ? dy : -dy; gx += s ? dx : -dx;
+        }
+        if (!ok) continue;
+        const double rate = (0.5 * gy * ry + 0.5 * gx * rx) / P.h;
+        const double nyy = s255[P.t1[i]], nxx = s255[P.t2[i]], nyx = s255[P.t5[i]] - 0.5;
+        const double nr = sqrt(fmax(0.0, ry * ry * nyy + rx * rx * nxx + 2 * ry * rx * nyx)), dn = nr / (P.sp[i] * P.h / 8.0);
+        pa[i] = (float)(c0 * rate); pb[i] = (float)(c0 * dn);
+    }
+}
+static double *g_pgtab2_d[PG_MAXDEV];   /* mgpu: per-device (pg_mu[dev]) */
+static int g_pg_old = -1;   /* mgpu: env / test config */
+extern "C" void fit_phase_gate_gpu_set_old(int v) { g_pg_old = v; }
+
 /* one block of nz field rows: device planes (pc ps t1 t2 t5 sp w at the block's first row; pc / ps rewritten in place), W_ref (nz x H x W:
    host, or the device with wdev: fit_phase_gate_gpu_dw), the axis per row (host, box-local native). st += {material, gated, sum q, n q}.
    keep: the scratch stays for the next block (fit_phase_gate_gpu_done). Returns 0 / -1. */
@@ -133,9 +173,20 @@ static int pg_run(uint8_t *pc, uint8_t *ps, const uint8_t *t1, const uint8_t *t2
         PG_CK(cudaMemcpy(dax, ay, nz * sizeof(float), cudaMemcpyHostToDevice)); PG_CK(cudaMemcpy(dax + nz, ax, nz * sizeof(float), cudaMemcpyHostToDevice));
         PG_CK(cudaMemset(cnt, 0, 3 * sizeof(unsigned long long))); PG_CK(cudaMemset(qs, 0, sizeof(double)));
         P.ay = dax; P.ax = dax + nz;
-        k_pg_rates<<<nb, TB>>>(P, b4, b4 + n);
-        k_pg_boxx<<<nb, TB>>>(P, b4, b4 + n, b4 + 2 * n, b4 + 3 * n);
-        k_pg_gate<<<nb, TB>>>(P, b4 + 2 * n, b4 + 3 * n, dw, o2, o2 + n, (float)lo, (float)hi, (float)rconf, cnt, qs);
+        if (g_pg_old < 0) g_pg_old = getenv("UFSM_PG_OLD") ? atoi(getenv("UFSM_PG_OLD")) : 0;
+        if (!g_pg_old && !g_pgtab2_d[dev]) {
+            if (cudaMalloc(&g_pgtab2_d[dev], (65536 + 256) * sizeof(double)) != cudaSuccess) { g_pgtab2_d[dev] = nullptr; cudaGetLastError(); }
+            else pg_tab2_k<<<256, 256>>>(g_pgtab, g_pgtab2_d[dev]);
+        }
+        if (g_pg_old || !g_pgtab2_d[dev]) {
+            k_pg_rates<<<nb, TB>>>(P, b4, b4 + n);
+            k_pg_boxx<<<nb, TB>>>(P, b4, b4 + n, b4 + 2 * n, b4 + 3 * n);
+            k_pg_gate<<<nb, TB>>>(P, b4 + 2 * n, b4 + 3 * n, dw, o2, o2 + n, (float)lo, (float)hi, (float)rconf, cnt, qs);
+        } else {
+            k_pg_rates2<<<nb, TB>>>(P, g_pgtab2_d[dev], b4, b4 + n);
+            k_pg_boxx<<<nb, TB>>>(P, b4, b4 + n, b4 + 2 * n, b4 + 3 * n);
+            k_pg_gate<<<nb, TB>>>(P, b4 + 2 * n, b4 + 3 * n, dw, o2, o2 + n, (float)lo, (float)hi, (float)rconf, cnt, qs);
+        }
         PG_CK(cudaGetLastError());
         PG_CK(cudaMemcpy(pc, o2, n, cudaMemcpyDeviceToDevice)); PG_CK(cudaMemcpy(ps, o2 + n, n, cudaMemcpyDeviceToDevice));
         PG_CK(cudaMemcpy(hc, cnt, sizeof hc, cudaMemcpyDeviceToHost)); PG_CK(cudaMemcpy(&hq, qs, sizeof hq, cudaMemcpyDeviceToHost));
