@@ -1,7 +1,7 @@
 /* ufsm patch-solve: global turn numbers for traced sheet patches in one box (unroll v3, P4; C port of scripts/v3/proto/psolve4.py).
    ufsm patch-solve --paths DIR --prob P --box Z0,Y0,X0,NZ,NY,NX --axis AXIS.json [--axis-scale 0.25] [--sgn -1]
                     [--prob-key K] [--gt G [--gt-key K]] [--cache DIR] [--minv 100] [--votes pair|ray] [--counter both|ridge|prob]
-                    [--min-votes 3] [--hidden 1 [--hidden-room -1]] [--draws 0] [--prune-frac 0.05] [--prune-thr 0.25] [--rounds 6] [--threads N] [--tsv OUT]
+                    [--min-votes 3] [--hidden 1 [--hidden-room -1] [--hidden-pitch 0]] [--draws 0] [--prune-frac 0.05] [--prune-thr 0.25] [--rounds 6] [--threads N] [--tsv OUT]
    Inputs (box-local voxel coordinates on the prob grid):
      --paths  a directory of tifxyz patches (VC3D paths/<name>/{x,y,z}.tif, -1 = invalid), patch coordinates relative to the box origin;
      --prob   the sheet probability (uint8) of the box: a .raw file (NZ x NY x NX, C order) or a zarr store root with --prob-key the array;
@@ -235,8 +235,11 @@ int cmd_patch_solve(int argc, char **argv) {
     /* --hidden H (levelsolve 11-18, HerculeX's one-sided rays): a gap vote turn_b - turn_a = d is a lower bound (a counter can miss a
        touching sheet but rarely invents one: 11-06 C2 29 % of GT gap-2 crossings counted one short), so a solve above d costs H of the
        vote's weight and one below it the whole; 1 = the symmetric vote. Weights are doubled when H != 1 (integer costs). */
-    const double hidden = opt_atof("--hidden", ps_opt(argc, argv, "--hidden", "1"));
-    const int64_t wsc = hidden == 1 ? 1 : 2;
+    double hidden = opt_atof("--hidden", ps_opt(argc, argv, "--hidden", "1"));
+    /* --hidden-pitch P (> 0): the one-sided votes only in a packed box, its pitch (the median gap of adjacent crossings) < P voxels; else
+       symmetric. 11-18, 30 1667 bed boxes at H 0.5: the 8 with pitch < 18 (9.6 um voxels) +0.091 right area (7 up), the 22 others -0.020. */
+    const double hpitch = opt_atof("--hidden-pitch", ps_opt(argc, argv, "--hidden-pitch", "0"));
+    int64_t wsc = hidden == 1 ? 1 : 2;
     /* --hidden-room R (with --hidden): a crossing is one-sided only where its gap has room for a missed sheet, dr >= (d + R) x the box pitch
        (a gap of d sheets at the pitch cannot hide one more: there the count is symmetric); default -1 = every crossing one-sided */
     const double hroom = opt_atof("--hidden-room", ps_opt(argc, argv, "--hidden-room", "-1"));
@@ -250,7 +253,7 @@ int cmd_patch_solve(int argc, char **argv) {
     if (!paths || !probp || !boxs || !axp || sscanf(boxs, "%lld,%lld,%lld,%lld,%lld,%lld", &bx[0], &bx[1], &bx[2], &bx[3], &bx[4], &bx[5]) != 6 || axs <= 0 ||
         (strcmp(vmode, "pair") && !ray) || !(use_r || use_p || use_pt || use_mx)) {
         fprintf(stderr, "usage: ufsm patch-solve --paths DIR --prob P [--prob-key K] --box Z0,Y0,X0,NZ,NY,NX --axis AXIS.json [--axis-scale S] [--sgn +-1]\n"
-                        "         [--gt G [--gt-key K]] [--minv 100] [--votes pair|ray] [--counter both|ridge|prob] [--min-votes 3] [--hidden 1 [--hidden-room -1]] [--draws 0] [--prune-frac 0.05]\n"
+                        "         [--gt G [--gt-key K]] [--minv 100] [--votes pair|ray] [--counter both|ridge|prob] [--min-votes 3] [--hidden 1 [--hidden-room -1] [--hidden-pitch 0]] [--draws 0] [--prune-frac 0.05]\n"
                         "         [--prune-thr 0.25] [--rounds 6] [--threads N] [--tsv OUT] [--cache DIR]\n");
         return 2;
     }
@@ -420,6 +423,7 @@ int cmd_patch_solve(int argc, char **argv) {
         if (m) { qsort(dv, m, 8, ps_dcmp); pitch = dv[m / 2]; }
         free(dv);
         printf("crossings %zu, adjacent by both counters %zu, pitch %.2f voxels\n", ncr, m, pitch);
+        if (hpitch > 0 && hidden != 1 && !(pitch > 0 && pitch < hpitch)) { printf("hidden: pitch %.2f >= %.2f: symmetric votes\n", pitch, hpitch); hidden = 1; wsc = 1; }
     }
     {   const char *ct = ps_opt(argc, argv, "--cross-tsv", nullptr);   /* diagnostic: every crossing (with --gt the GT turn difference) */
         FILE *f = ct ? fopen(ct, "w") : nullptr;
