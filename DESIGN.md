@@ -23,6 +23,12 @@ eligible warps a scheduler.
 - **lat_ct_x8_k** (UFSM_LAT_CTX8=0 the old kernel; branch convkct-20261117): the guided head's z-scored CT planes at 8 voxels a thread
   (8-byte loads, 16-byte stores), the same expression. ncu had lat_ct_x_k at ~270 GB/s with one byte a thread. Fields 0332 640: 6.2 ->
   4.75 ms a window, 0 data files differ; test_lathead checks it against the host expression.
+- **lat_pred_in_bas2_k** (UFSM_LAT_PIB2=0 the old kernel; branch convkpib-20261117): the --lat-basis input (29 projections of each
+  cell's 64 z-scored CT values) with the basis in shared memory (float4 reads), the cell's CT as 16 4-byte rows and dyo / dxo once a
+  plane. ncu: the old kernel issued ~12500 instructions a cell, 2077 global loads among them. Fields 0332 640: 8.5 -> 2.57 ms a window,
+  0 data files differ. The first version differed on ~130 of 135 M values of the radial channel: the compiler contracted
+  dy dy + dx dx the other way round (the old SASS: FMUL dx dx, FFMA dy dy +). The new kernel pins fma(dy, dy, dx dx) with
+  __fmaf_rn / __fmul_rn. test_lat compares old and new bit for bit, but its 73 k-voxel case is too small to show a 1e-6 flip.
 
 ## reader3 ink-ext: the depth-fusion conv streamed over depth, conv_igemm at 2 blocks an SM (2026-11-17, branch convkx-20261117)
 

@@ -632,9 +632,53 @@ __global__ void lat_pred_in_bas_k(const uint8_t *ct, int D, int W, float mean, f
     }
     for (int c = 0; c < 3; c++) y[(size_t)(C + c) * cv + i] = __float2half_rn(acc[c] * (1.f / 64.f));
 }
+/* lat_pred_in_bas_k with the basis in shared memory (float4 reads), the cell's CT read as 16 4-byte rows and dyo / dxo once per plane
+   (ncu 0332 640: ~12500 issued instructions a cell, 2077 global loads of them, for 64 x C FMAs; 8.5 ms a window). The same values in the
+   same order (v[k], the radial sums over k, s over k per channel): byte-identical (test_lat_bas). W % 4 == 0. */
+__global__ void __launch_bounds__(128) lat_pred_in_bas2_k(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
+                                                          const float *bas, const float *gain, int C, float step, f16 *y) {
+    extern __shared__ __align__(16) float sbas[];   /* [C][64] */
+    for (int i = threadIdx.x; i < C * 64; i += blockDim.x) sbas[i] = bas[i];
+    __syncthreads();
+    const int d = D / 4, h = W / 4;
+    const size_t cv = (size_t)d * h * h, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= cv) return;
+    const int z = (int)(i / ((size_t)h * h)), yy = (int)(i / h % h), xx = (int)(i % h);
+    float acc[3] = {0.f, 0.f, 0.f}, v[64];
+#pragma unroll
+    for (int a = 0; a < 4; a++) {
+        const int fz = 4 * z + a; const float dyz = dyo[fz], dxz = dxo[fz];
+#pragma unroll
+        for (int b = 0; b < 4; b++) {
+            const int fy = 4 * yy + b; const unsigned row = *(const unsigned *)(ct + ((size_t)fz * W + fy) * W + 4 * xx);
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int k = a * 16 + b * 4 + e, fx = 4 * xx + e;
+                const float dy = dyz + (float)fy, dx = dxz + (float)fx;   /* fma(dy, dy, dx dx): lat_pred_in_bas_k's contraction (its SASS), pinned */
+                const float inv = axis ? (float)axis / (sqrtf(__fmaf_rn(dy, dy, __fmul_rn(dx, dx))) + 1e-6f) : 0.f;
+                v[k] = __half2float(__float2half(((float)(row >> (8 * e) & 255u) - mean) * isd));
+                acc[1] += __half2float(__float2half(dy * inv)); acc[2] += __half2float(__float2half(dx * inv));
+            }
+        }
+    }
+    for (int c = 0; c < C; c++) {
+        float s = 0.f; const float4 *bc = (const float4 *)(sbas + c * 64);
+#pragma unroll
+        for (int k4 = 0; k4 < 16; k4++) { const float4 q = bc[k4]; s += q.x * v[4 * k4]; s += q.y * v[4 * k4 + 1]; s += q.z * v[4 * k4 + 2]; s += q.w * v[4 * k4 + 3]; }
+        if (step > 0.f) { const float lim = c ? 127.f : 32767.f; s = fminf(lim, fmaxf(-lim, rintf(s / step))) * step; }
+        y[(size_t)c * cv + i] = __float2half_rn(s * gain[c]);
+    }
+    for (int c = 0; c < 3; c++) y[(size_t)(C + c) * cv + i] = __float2half_rn(acc[c] * (1.f / 64.f));
+}
+static int g_pib2 = -1;   /* UFSM_LAT_PIB2=0: lat_pred_in_bas_k (A/B); mgpu: env */
+extern "C" void nn_lat_set_pib2(int v) { g_pib2 = v; }
 extern "C" void nn_lat_pred_input_c(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis,
                                     const float *bas, const float *gain, int C, float step, void *y) {
     const size_t cv = (size_t)(D / 4) * (W / 4) * (W / 4);
+    if (g_pib2 < 0) g_pib2 = getenv("UFSM_LAT_PIB2") ? atoi(getenv("UFSM_LAT_PIB2")) : 1;
+    if (g_pib2 && W % 4 == 0 && !((uintptr_t)ct & 3) && (size_t)C * 64 * 4 <= 48 * 1024) {
+        lat_pred_in_bas2_k<<<nblk(cv, 128), 128, (size_t)C * 64 * 4>>>(ct, D, W, mean, isd, dyo, dxo, axis, bas, gain, C, step, (f16 *)y); KCHECK(); return;
+    }
     lat_pred_in_bas_k<<<nblk(cv, 128), 128>>>(ct, D, W, mean, isd, dyo, dxo, axis, bas, gain, C, step, (f16 *)y); KCHECK();
 }
 extern "C" void nn_lat_pred_input(const uint8_t *ct, int D, int W, float mean, float isd, const float *dyo, const float *dxo, int axis, void *y) {

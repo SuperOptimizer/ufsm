@@ -2,6 +2,7 @@
    mode 1, fp32), for every slab split; its adjoint (nn_lat_up_adj, accumulated over the slabs) against nn_lowres_grad on an fp32 gradient
    and the dot-product identity <up(l), g> = <l, adj(g)>. Odd and even grid sizes, slab heights 1, 3, 7, 32, coarse fp16 and fp32 logits. */
 #include "nn.h"
+void nn_lat_set_pib2(int v);
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -230,6 +231,13 @@ int main(void) {
             nn_pred_input_d(d_ct, D, W, 117.3f, 1.f / 41.7f, d_dy, d_dy + D, axis, d_x, 1);
             nn_lat_input_x(d_x, d, h, h, d_bs, d_gn, C, q ? 0.05f : 0.f, d_ya);
             nn_lat_pred_input_c(d_ct, D, W, 117.3f, 1.f / 41.7f, d_dy, d_dy + D, axis, d_bs, d_gn, C, q ? 0.05f : 0.f, d_yb);
+            {   /* lat_pred_in_bas2_k (default) against lat_pred_in_bas_k: bit for bit */
+                uint16_t *yo = malloc((C + 3) * cv * 2); nn_lat_set_pib2(0);
+                nn_lat_pred_input_c(d_ct, D, W, 117.3f, 1.f / 41.7f, d_dy, d_dy + D, axis, d_bs, d_gn, C, q ? 0.05f : 0.f, d_ya); nn_lat_set_pib2(1);
+                nn_d2h(yo, d_ya, (C + 3) * cv * 2); nn_d2h(yb, d_yb, (C + 3) * cv * 2); cases++;
+                if (memcmp(yo, yb, (C + 3) * cv * 2)) { fprintf(stderr, "FAIL: lat_pred_in_bas2_k differs from lat_pred_in_bas_k (axis %d, step %d)\n", axis, q); fails++; }
+                free(yo); nn_lat_input_x(d_x, d, h, h, d_bs, d_gn, C, q ? 0.05f : 0.f, d_ya);
+            }
             nn_d2h(ya, d_ya, (C + 3) * cv * 2); nn_d2h(yb, d_yb, (C + 3) * cv * 2);
             size_t nd = 0, n1 = 0; for (size_t k = 0; k < (C + 3) * cv; k++) { nd += ya[k] != yb[k]; n1 += abs((int)ya[k] - (int)yb[k]) > 1; }
             cases++;
