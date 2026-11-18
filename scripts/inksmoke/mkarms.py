@@ -9,6 +9,7 @@ of the ink budget and the memorised scroll): WEIGHTS below, renormalised over th
 import json, os, sys
 H0, TD, HO, OD = sys.argv[1:5]; ARMS = sys.argv[5] if len(sys.argv) > 5 else "AB"; os.makedirs(OD, exist_ok=True)
 WEIGHTS = {"PHercParis4": 0.50, "PHerc0139": 0.20, "PHerc1667": 0.15, "PHerc0009B": 0.05, "PHerc0814": 0.05, "PHercMAN5": 0.05}
+ONLY = [t for t in os.environ.get("SCROLLS", "").split(",") if t]   # podq.sh's 1-h smoke: a subset of the scrolls (weights renormalised)
 src = json.load(open(H0)); HB = json.load(open(HO))
 def holdfile(x, sc):   # HOLDOUTS limited to the boxes on this source's scan that touch one of its meshes' bboxes (+128 voxels): the ink
     # onfly path takes at most INKFLY_MAXEXCL (256; 64 before 11-18) boxes per scan; a box away from every
@@ -33,6 +34,7 @@ for arm in ARMS:
     for x in s["sources"]:
         sc = x["name"].split("-")[0]
         if sc not in WEIGHTS: print(f"{arm}: {x['name']} dropped (no weight)"); continue
+        if ONLY and sc not in ONLY: print(f"{arm}: {x['name']} dropped (not in SCROLLS)"); continue
         x["weight"] = WEIGHTS[sc]; hf = holdfile(x, sc); x["holdout_file"] = hf; of = x["targets"]["ink"]["onfly"]; of["holdout_file"] = hf
         if arm == "B":
             t = os.path.join(TD, sc, "segs-teach.json")
