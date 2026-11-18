@@ -78,6 +78,8 @@ void xnet_set_mxa(int on);              /* UFSM_XNET_MXA: least-squares activati
 void xnet_set_df16(int v);              /* the 16 -> 16 3x3x3 fp16 conv: 0 implicit GEMM, 1 the halo kernel k_dfc16, 2..9 its other tilings, 10 (default) the depth-streaming k_dfc16s, 11..16 its tilings (UFSM_XNET_DF16) */
 void xnet_set_df1(int v);               /* the 1 -> 16 stem conv: 0 xunfold + implicit GEMM, 1 k_dfc1, 2 (default) / 4 k_dfc1x x-blocked by 2 / 4 (UFSM_XNET_DF1) */
 void xnet_set_ts8(int v);               /* the 2-D transposed conv's shuffle: 1 (default) k_tshuffle8, 8 channels a thread; 0 k_tshuffle per element (UFSM_XNET_TS8) */
+void xnet_set_wave(int v);              /* > 64-output fp16 convs: 1 (default) the tile that fills the SMs best (UFSM_XNET_WAVE; UFSM_XNET_CFG 5..8 force one), 0 always 128 x 128 */
+void xnet_set_cfg(int v);               /* the fp16 conv tiles (UFSM_XNET_CFG): 0 the default, 1..4 old alternatives, 5..8 force 128x128 / 128x64 / 64x64 / 64x32 (bench) */
 void xnet_wseq_reset(void);             /* a new net: initialisation indices restart at 0 (UFSM_XNET_MX_SKIP, UFSM_XNET_FQ weight mask) */
 /* the fused MX inference path (ink3d-ext): a conv that also returns the InstanceNorm sums of its output (st: device doubles [n][co][2]:
    sum, sum of squares; free with xfree_dev), the per-(sample, channel) affine of IN (coef [n][C][2]: a = gamma rstd, b = beta - mean a),

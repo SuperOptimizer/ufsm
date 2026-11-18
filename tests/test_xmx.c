@@ -317,6 +317,26 @@ static void bench(void) {
 int main(void) {
     if (xnet_init(0)) { printf("SKIP: no GPU\n"); return 0; }
     if (getenv("XMX_BENCH")) { bench(); return 0; }
+    if (getenv("XMX_IGBENCH") || getenv("XMX_IGTEST")) {   /* the Reader's 2-D 3x3 convs (N 8, d 1): UFSM_XNET_CFG 5..8 forced tiles vs the wave pick (0); byte-equal */
+        static const int L[][3] = {{48, 256, 256}, {24, 320, 320}, {12, 320, 320}, {96, 128, 128}, {24, 640, 320}, {12, 320, 1280}, {20, 96, 160}};
+        const int bench = getenv("XMX_IGBENCH") != nullptr; int bad = 0; xnet_set_mx(0);
+        for (size_t li = 0; li < sizeof L / sizeof L[0]; li++) {
+            const int Hs = L[li][0], ci = L[li][1], co = L[li][2], k = co == 1280 ? 1 : 3, N = 8;
+            float *w = calloc((size_t)co * ci * k * k, 4); for (size_t j = 0; j < (size_t)co * ci * k * k; j++) w[j] = rnd() * 0.05f;
+            xconv c; xconv_init(&c, w, co, ci, 1, k, k, 1, 1, 1, 0, k / 2, k / 2, nullptr, nullptr);
+            const size_t nx = (size_t)N * Hs * Hs * ci, ny = (size_t)N * Hs * Hs * co; uint16_t *xh = malloc(nx * 2), *y0 = malloc(ny * 2), *y1 = malloc(ny * 2);
+            for (size_t j = 0; j < nx; j++) xh[j] = f2h(rnd()); xt x = xt_new(N, 1, Hs, Hs, ci); xh2d(x.p, xh, nx * 2);
+            printf("ig %3d^2 ci %4d co %4d:", Hs, ci, co);
+            for (int v = 5; v <= 9; v++) {
+                const int cfg = v == 9 ? 0 : v; xnet_set_cfg(cfg); double best = 1e9;
+                for (int r = 0; r < (bench ? 10 : 1); r++) { xnet_sync(); const double t0 = now(); xt y = xconv_fwd(&c, x, nullptr, XA_NONE); xnet_sync(); const double t = now() - t0; if (t < best) best = t; xd2h(v == 5 ? y0 : y1, y.p, ny * 2); xt_free(&y); }
+                size_t nd = 0; if (v > 5) for (size_t j = 0; j < ny; j++) nd += y0[j] != y1[j];
+                bad += nd != 0; printf("  cfg %d %.3f ms%s", cfg, best * 1e3, nd ? " DIFFERS" : "");
+            }
+            printf("\n"); xnet_set_cfg(0); xt_free(&x); xconv_free(&c); free(w); free(xh); free(y0); free(y1);
+        }
+        printf("%s\n", bad ? "FAIL" : "PASS"); return bad != 0;
+    }
     if (getenv("XMX_DFBENCH")) {   /* the Reader depth-fusion conv, 4 x 17 x 384^2 x 16: implicit GEMM (0) vs the halo-kernel variants; min of 10 */
         xnet_set_mx(0); float *w = calloc(16 * 16 * 27, 4); for (int j = 0; j < 16 * 16 * 27; j++) w[j] = rnd() * 0.05f;
         xconv c; xconv_init(&c, w, 16, 16, 3, 3, 3, 1, 1, 1, 1, 1, 1, nullptr, nullptr); xt x = xt_new(4, 17, 384, 384, 16);

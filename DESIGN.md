@@ -104,6 +104,27 @@ zeroed 46 % of the ink (95 % on w001). The CT render itself is unchanged by the 
 tif with UFSM_RENDER_ALIAS=0 and the volume written). pw_fin now passes R3GATE=${R3PWGATE:-0} (no gate); test_podscripts checks it.
 (The 11-17 desk AUC table above scored ungated maps, so it never saw the gate.)
 
+## reader3 ink-ext on the pod: wave-aware tiles under 2 waves; stem / collapse fusions tried (2026-11-18, branches convkwave / convkc1-20261118)
+
+Pod (RTX PRO 4000, 70 SMs) nsys of reader3 at the unroll shape (w035, --batch 16, 5.86 s of kernels): conv_igemm 48 % (by grid: (288,2)
+10.7 %, (4608,1) 9.3 %, (1152,1) 8.4 %, the 128-thread (18432,1) 8.3 %, (72,3) 5.5 %, (18,3) 1.4 %), k_dfc16s 12 %, k_gnpart 11 % + k_gn_apply
+9 %, k_dattn 7.5 %, k_dfc1x 7 %, k_tshuffle8 1.5 %. The pod container has no GPU counter permission (ncu ERR_NVGPUCTRPERM): static
+checks via mcc PTX (--cuda-ptx-file --cuda-ptx-raw) + ptxas -c -v. The 128 x 128 conv_igemm's 120 B of spills are in the epilogue only
+(its main loop, 32 HMMA a K step, has none).
+- **Wave-aware tiles, under 2 waves only** (convkwave-20261117's pick, rebased onto the 2-stage 128 x 64): with the desk-measured
+  per-tile costs it moved 96^2 x 128 and 48^2 x 256 off 128 x 128 on the pod (0.314 -> 0.359 ms; conv_igemm +2.4 % in situ). Now only
+  grids under 2 waves of 128 x 128 are re-tiled: XMX_IGBENCH (N 8) 24^2 x 320 0.149 -> 0.127 ms, 12^2 x 320 0.095 -> 0.065, 24^2 640 -> 320
+  0.282 -> 0.261, 12^2 x 1280 0.036 -> 0.033; >= 2 waves unchanged. In situ 3 interleaved pairs, w035 md5-identical in all 8 runs;
+  nsys pair: conv_igemm 2810 -> 2769 ms (-1.5 %), kernels 5862 -> 5831 ms. XMX_IGTEST PASS. UFSM_XNET_WAVE=0: always 128 x 128.
+- Tried, byte-identical, slower (branch convkc1-20261118, not merged):
+  - k_c1gs: the stem conv (1 -> 16) and its GroupNorm statistics in one pass. A block owns one k_gnpart chunk; per step its 256
+    threads compute 256 / 512 consecutive voxels into shared memory and y, then each (row t / 8, pair t % 8) thread adds its voxels in
+    k_gnpart's order: y and gm / rs bit-equal (test_xmx c1gs, w035 md5). But XMX_DFBENCH (4 x 17 x 384^2) 2.28 ms separate (k_dfc1x 1.29
+    + k_gnpart) -> 3.28 (a voxel a thread), 4.97 (two, k_dfc1x<2>'s window), 5.01 (two at 2 blocks an SM: 142 -> 128 registers, no
+    spills); in situ k_c1gs 12.4 ms vs k_dfc1x 5.4 + k_gnpart ~2.2. The limiter was not found (no counters on the pod).
+  - k_dattn2: the depth collapse with each thread's GN-applied layers (17 x 32 B) in shared memory, f read once: 1.90 -> 2.57 ms
+    (XMX_DFBENCH), w035 net 8.6 -> 11.4 s: the second read of f was an L2 hit, and 64-thread blocks cost occupancy.
+
 ## reader3 ink-ext: the narrow conv_igemm tiles at 2 stages (2026-11-18, branch convkr3-20261118)
 
 The ink stages are ~60 % of the pod 1667 unroll. Reader3 at the unroll shape (w035, --batch 16, nsys on the shared card 1; the shares, since

@@ -1292,13 +1292,49 @@ static bool dfc16_try(const xconv *c, xt in, xt y, const xt *res, int act, doubl
     default: return dfc16s_go<8, 32, 8>(c, in, y, gi);   /* 10: depth-streaming, 2.1x k_dfc16 plain, 2.3x with the GN on load (XMX_DFBENCH) */
     }
 }
-static int g_cfg = -1, g_c16 = -1;   /* mgpu: env */
+static int g_cfg = -1, g_c16 = -1, g_wave = -1;   /* mgpu: env */
 static int g_nst32 = -1, g_nst64 = -1;   /* mgpu: env (UFSM_XNET_NST32 / NST64: the cp.async stages of the <= 32 / <= 64 output tiles) */
+static const float g_wave_eff[4] = {1.f, 1.16f, 1.07f, 1.33f};   /* relative cost a MAC of each tile at full waves (XMX_IGBENCH 48^2 x 256: 0.53 / 0.61 / 0.57 / 0.71 ms) */
+extern "C" void xnet_set_wave(int v) { g_wave = v; }
+extern "C" void xnet_set_cfg(int v) { g_cfg = v; }
+/* > 64 outputs, no fused LN / IN stats: the tile whose grid fills the SMs best. The deep Reader levels (24^2 / 12^2 x 8 tiles, 320
+   channels) ran 108 / 27 blocks of 128 x 128 on 72 block slots (1.5 / 0.4 waves) with 320 padded to 384. Every tile runs the same K
+   order (BK 32, kk inner) with the same mma per output: byte-identical whichever is picked. */
+template <int BM, int BN, int WMn, int WNn, int NST> static int tile_occ() {
+    static int occ[32] = {0}; int dv = 0; cudaGetDevice(&dv); dv &= 31;   /* mgpu: per-device (an idempotent occupancy cache) */
+    if (!occ[dv]) { int o = 0; const size_t sm = (size_t)NST * (BM + BN) * 32 * 2;
+        cudaFuncSetAttribute(conv_igemm<BM, BN, WMn, WNn, 32, NST>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, conv_igemm<BM, BN, WMn, WNn, 32, NST>, WMn * WNn * 32, sm); occ[dv] = o > 0 ? o : 1; }
+    return occ[dv];
+}
+static int wave_pick(const ConvP &p, int co) {
+    static int nsm[32] = {0}; int dv = 0; cudaGetDevice(&dv); dv &= 31;   /* mgpu: per-device (an idempotent SM-count cache) */
+    if (!nsm[dv]) { int v = 0; cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dv); nsm[dv] = v > 0 ? v : 1; }
+    const int BMs[4] = {128, 128, 64, 64}, BNs[4] = {128, 64, 64, 32};
+    const int occ[4] = {tile_occ<128, 128, 2, 4, 3>(), g_nst64 == 2 ? tile_occ<128, 64, 4, 2, 2>() : tile_occ<128, 64, 4, 2, 3>(), tile_occ<64, 64, 2, 2, 3>(), tile_occ<64, 32, 2, 1, 3>()};
+    /* only grids under 2 waves of 128 x 128 (pod RTX PRO 4000, XMX_IGBENCH: at >= 2 waves 128 x 128 was the fastest everywhere, 96^2 x 128 0.314
+       vs the model's 64 x 64 0.359 ms; under 2: 24^2 x 320 0.148 -> 0.127, 12^2 x 320 0.094 -> 0.066 ms) */
+    if ((p.M + 127) / 128 * ((co + 127) / 128) >= 2LL * occ[0] * nsm[dv]) return 0;
+    int best = 0; double bc = 1e300;
+    for (int i = 0; i < 4; i++) {
+        const long long nb = (p.M + BMs[i] - 1) / BMs[i] * ((co + BNs[i] - 1) / BNs[i]), slots = (long long)occ[i] * nsm[dv];
+        const double c = (double)((nb + slots - 1) / slots) * occ[i] * BMs[i] * BNs[i] * g_wave_eff[i];   /* waves x the SM's work a wave */
+        if (c < bc * 0.999) { bc = c; best = i; }
+    }
+    return best;
+}
 static void conv_launch(const ConvP &p, int co) {
     if (g_cfg < 0) g_cfg = getenv("UFSM_XNET_CFG") ? atoi(getenv("UFSM_XNET_CFG")) : 0;
+    if (g_wave < 0) g_wave = getenv("UFSM_XNET_WAVE") ? atoi(getenv("UFSM_XNET_WAVE")) : 1;
     if (g_nst32 < 0) g_nst32 = getenv("UFSM_XNET_NST32") ? atoi(getenv("UFSM_XNET_NST32")) : 2;
     if (g_nst64 < 0) g_nst64 = getenv("UFSM_XNET_NST64") ? atoi(getenv("UFSM_XNET_NST64")) : 2;
-    switch (g_cfg) {
+    int cfg = g_cfg;
+    if (cfg == 0 && g_wave && co > 64 && !(p.act & XA_LN) && !p.st) cfg = 5 + wave_pick(p, co);   /* 5 (128 x 128) .. 8 */
+    switch (cfg) {
+    case 5: launch1<128, 128, 2, 4, 32, 3>(p, co); break;
+    case 6: if (g_nst64 == 2) launch1<128, 64, 4, 2, 32, 2>(p, co); else launch1<128, 64, 4, 2, 32, 3>(p, co); break;
+    case 7: launch1<64, 64, 2, 2, 32, 3>(p, co); break;
+    case 8: launch1<64, 32, 2, 1, 32, 3>(p, co); break;
     case 1:   /* 4 warps of 64 x 64 / 64 x 32 */
         if (co <= 64) launch1<128, 64, 2, 2, 32, 3>(p, co); else launch1<128, 128, 2, 2, 32, 3>(p, co); break;
     case 2:   /* 128 x 256 tiles of 8 warps 64 x 64 for wide outputs */
