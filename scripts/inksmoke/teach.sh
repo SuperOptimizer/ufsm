@@ -4,9 +4,9 @@
 # reader3 (Reader V3) and ink9um (seeds 42 + 43 averaged), CT from the public volcomp mirror with one shared --cache, --batch pinned
 # -> KIT/maps/SCROLL/<teacher>/<name>.tif; then ufsm ink-teach (AUC-weighted logit ensemble, Platt per scroll, gate p <= 0.1 | p >= 0.8,
 # human px and KIT/arms/holdouts-SCROLL.json boxes + 64 voxels removed) -> KIT/teach/SCROLL/segs-teach.json. Restartable (finished maps
-# and a finished ink-teach are kept). Env: U (binary), GPU (0), LOCK (/root/gpu.lock: held per ink-ext call), BATCH (16), TH (8).
+# and a finished ink-teach are kept). Env: HOD (the holdouts-SCROLL.json dir, KIT/arms; podq.sh: KIT/arms/full), U (binary), GPU (0), LOCK (/root/gpu.lock: held per ink-ext call), BATCH (16), TH (8).
 set -uo pipefail; K=${1:?KIT}; S=${2:?SCROLL}; U=${U:?U}; R=https://dl.ash2txt.org/community-uploads/forrest/volcomp
-W3=$K/weights/reader-v3.pth; W42=$K/weights/ink9um-s42.pth; W43=$K/weights/ink9um-s43.pth; HO=$K/arms/holdouts-$S.json
+W3=$K/weights/reader-v3.pth; W42=$K/weights/ink9um-s42.pth; W43=$K/weights/ink9um-s43.pth; HO=${HOD:-$K/arms}/holdouts-$S.json
 for f in $W3 $W42 $W43 $HO $K/inkgt/segs-$S.json; do [ -s $f ] || { echo "teach: missing $f"; exit 1; }; done
 CT=$(python3 -I -c "import json; print([s['ct'] for s in json.load(open('$K/inkgt/sources-H0.json'))['sources'] if s['name'].startswith('$S-')][0])") || exit 1
 lk() { if [ -n "${LOCK:-}" ]; then flock "$LOCK" "$@"; else "$@"; fi; }

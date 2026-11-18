@@ -38,6 +38,8 @@ U=$K/ufsm/build/ufsm; D=$K/ufsm/scripts/inksmoke; export MCC_HOME=$HOME/.local/m
 # --- gt: in the background from the start (network + CPU only) ---
 if ! done_ gt; then ( bash $K/kit/gtfetch.sh $K/kit/gt.tsv $K/inkgt > $K/gt.log 2>&1 && touch $S/gt.done ) & GTPID=$!; else GTPID=; fi
 # --- setup ---
+if done_ setup && [ "$(git -C $K/ufsm rev-parse HEAD 2>/dev/null)" != "$(git -C $K/ufsm rev-parse "$COMMIT^{commit}" 2>/dev/null)" ]; then
+  say "setup: the clone is not at $COMMIT: fetch + incremental rebuild"; rm -f $S/setup.done; fi
 if ! done_ setup; then
   say "setup: clone + build $COMMIT"
   [ -d $K/ufsm/.git ] || git clone -q https://github.com/SuperOptimizer/ufsm $K/ufsm || die "clone"
@@ -92,7 +94,7 @@ sanity() {   # sanity ARM: finite losses, the ink bce trend, the rates; K/out/sm
     echo "non-finite lines: $(grep -ciE 'non-finite|^step .*( nan| inf)' $lg)"; echo "trainer host RSS peak (30 s samples): ${RSSPK:-?} GB"
     for m in memory.events memory.peak; do [ -r /sys/fs/cgroup/$m ] && echo "$m: $(tr '\n' ' ' < /sys/fs/cgroup/$m)"; done
   } > $f; cat $f >> $L
-  cp $lg $RD/inksmoke$a.resume.log $K/steptime$a.txt $O/ 2>/dev/null; ls $RD/inksmoke$a/snap/*.ckpt > /dev/null 2>&1 && cp $(ls -t $RD/inksmoke$a/snap/*.ckpt | head -1) $O/inksmoke$a-$TAG.ckpt
+  cp $lg $RD/inksmoke$a.resume.log $K/steptime$a.txt $O/ 2>/dev/null; ls $RD/inksmoke$a/snap/*.ckpt > /dev/null 2>&1 && for c in $RD/inksmoke$a/snap/*.ckpt; do [ -s $O/inksmoke$a-$TAG-$(basename $c .ckpt).ckpt ] || cp $c $O/inksmoke$a-$TAG-$(basename $c .ckpt).ckpt; done
   cp $L $O/podq.log; [ "$(grep -ciE 'non-finite|^step .*( nan| inf)' $lg)" = 0 ] || die "arm $a: non-finite losses ($f)"; }
 arm() {   # arm A | B
   local a=$1; done_ arm$a$TAG && return 0
@@ -115,6 +117,8 @@ arm() {   # arm A | B
       grep -E '^step +[0-9]+ ' $RD/inksmoke$a.log | head -6 > $K/steptime$a.txt.new && mv $K/steptime$a.txt.new $K/steptime$a.txt
       echo "mean samples/s to step $st: $sps" >> $K/steptime$a.txt; say "arm $a: step $st at $(el), mean $sps samples/s (gate ${MINSPS:-0.1}), $MEMS"
       touch $K/gate$a$TAG.ok; awk -v a=$sps -v b=${MINSPS:-0.1} 'BEGIN {exit !(a < b)}' && stoparm "arm $a below the step-50 gate: $sps samples/s at step $st (fallback: --um-rungs 9.6 only)"; fi
+    for c in $RD/inksmoke$a/snap/*.ckpt; do [ -s "$c" ] || continue; n=$(basename $c .ckpt); [ -s $O/inksmoke$a-$TAG-$n.ckpt ] && continue
+      cp $c $O/.tmp.ckpt && mv $O/.tmp.ckpt $O/inksmoke$a-$TAG-$n.ckpt && cp $RD/inksmoke$a.log $O/ && cp $L $O/podq.log && say "arm $a: snapshot $n -> $O (desk pull)"; done
     [ "$ARMMAX" -gt 0 ] && [ $(( $(date +%s) - t0 )) -gt "$ARMMAX" ] && stoparm "arm $a over ARMMAX ${ARMMAX} s at step $st"
     sleep 30; done
   wait $tp; st=$(awk '/^step +[0-9]+ / {s = $2} END {print s + 0}' $RD/inksmoke$a.log 2>/dev/null)
@@ -125,7 +129,7 @@ arm A
 if [ "$FULL" != 1 ]; then cp $L $O/podq.log; touch $S/ALLDONE; say "ALLDONE: smoke arm A reached step $STEPS ($(el)); $O/smokeA.txt; the pod is idle"; cp $L $O/podq.log; exit 0; fi
 if ! done_ teach; then
   for sc in PHercParis4 PHerc1667 PHerc0139 PHerc0814 PHerc0009B PHercMAN5; do
-    U=$U GPU=$GPU LOCK=$LOCK bash $D/teach.sh $K $sc >> $L 2>&1 || die "teach $sc"
+    HOD=$AD U=$U GPU=$GPU LOCK=$LOCK bash $D/teach.sh $K $sc >> $L 2>&1 || die "teach $sc"
   done; mark teach
 fi
 arm B
