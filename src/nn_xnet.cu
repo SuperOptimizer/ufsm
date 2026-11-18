@@ -2084,11 +2084,59 @@ template <int DM> __global__ void k_dattn(const __half *f, const float *gm, cons
 #pragma unroll
     for (int k = 0; k < 4; k++) dst[k] = ((const uint4 *)o)[k];
 }
+/* k_dattn with each thread's GN-applied layers kept in shared memory (fp16, the values pass 2 recomputed: the same rounded halves) instead
+   of re-reading f and re-applying the norm: f is read once. Layout [layer][half][thread] uint4 (consecutive threads, consecutive 16 B:
+   no bank conflicts); 64 threads a block, D 34 KB at 17 layers. Same chains, same order: byte-identical to k_dattn (test_xmx dattn). */
+template <int DM> __global__ void __launch_bounds__(64) k_dattn2(const __half *f, const float *gm, const float *rs, const float *gamma, const float *beta, int act, const float *w, float b,
+                                                                  __half *y, int n, int D, long long HW) {
+    extern __shared__ uint4 sl[];   /* [D][2][64] */
+    const int tid = threadIdx.x;
+    const long long i = blockIdx.x * (long long)blockDim.x + tid; if (i >= (long long)n * HW) return;
+    const long long nn = i / HW, p = i - nn * HW; const float *g = gm + nn * 16, *r = rs + nn * 16;
+    float a[DM], am = -INFINITY;
+    for (int d = 0; d < D; d++) {
+        __align__(16) __half hv[16]; const __half *src = f + ((nn * D + d) * HW + p) * 16;
+        *(uint4 *)hv = *(const uint4 *)src; *(uint4 *)(hv + 8) = *(const uint4 *)(src + 8);
+        __align__(16) __half hq[16]; float v[16];
+#pragma unroll
+        for (int c = 0; c < 16; c++) { hq[c] = __float2half_rn(act_f((__half2float(hv[c]) - g[c]) * r[c] * gamma[c] + beta[c], act)); v[c] = __half2float(hq[c]); }
+        sl[(d * 2) * 64 + tid] = ((const uint4 *)hq)[0]; sl[(d * 2 + 1) * 64 + tid] = ((const uint4 *)hq)[1];
+        float s = 0.f;
+#pragma unroll
+        for (int c = 0; c < 16; c++) s += v[c] * w[c];
+        a[d] = s + b; am = fmaxf(am, a[d]);
+    }
+    float den = 0.f; for (int d = 0; d < D; d++) den += __expf(a[d] - am);
+    float sm[16], mx[16];
+#pragma unroll
+    for (int c = 0; c < 16; c++) { sm[c] = 0.f; mx[c] = -INFINITY; }
+    for (int d = 0; d < D; d++) {
+        __align__(16) __half hq[16]; ((uint4 *)hq)[0] = sl[(d * 2) * 64 + tid]; ((uint4 *)hq)[1] = sl[(d * 2 + 1) * 64 + tid];
+        const float e = __expf(a[d] - am) / den;
+#pragma unroll
+        for (int c = 0; c < 16; c++) { const float v = __half2float(hq[c]); sm[c] += v * e; mx[c] = fmaxf(mx[c], v); }
+    }
+    __align__(16) __half o[32];
+#pragma unroll
+    for (int c = 0; c < 16; c++) { o[c] = __float2half_rn(sm[c]); o[16 + c] = __float2half_rn(mx[c]); }
+    uint4 *dst = (uint4 *)(y + i * 32);
+#pragma unroll
+    for (int k = 0; k < 4; k++) dst[k] = ((const uint4 *)o)[k];
+}
+static int g_dattn = -1;   /* UFSM_XNET_DATTN=1: k_dattn (f read twice); 2 (default) k_dattn2 (the layers in shared memory); mgpu: env */
+extern "C" void xnet_set_dattn(int v) { g_dattn = v; }
 extern "C" xt xdepth_collapse16(xt f, int groups, const float *gamma, const float *beta, float eps, int act, const float *w_dev, float bias) {
     if (f.c != 16 || f.d > 32) { fprintf(stderr, "xnet: xdepth_collapse16 needs 16 channels and <= 32 layers (%d, %d)\n", f.c, f.d); return xt{}; }
     float *gm = xgn_stats(f, groups, eps); const long long HW = (long long)f.h * f.w;
     xt y = xt_new(f.n, 1, f.h, f.w, 32);
-    k_dattn<32><<<nblk((size_t)f.n * HW, 128), 128, 0, g_st>>>((const __half *)f.p, gm, gm + (size_t)f.n * 16, gamma, beta, act, w_dev, bias, (__half *)y.p, f.n, f.d, HW);
+    if (g_dattn < 0) g_dattn = getenv("UFSM_XNET_DATTN") ? atoi(getenv("UFSM_XNET_DATTN")) : 2;
+    if (g_dattn == 2) {
+        const size_t sm = (size_t)f.d * 2 * 64 * 16;   /* (<= 64 KB at 32 layers) */
+        static unsigned attr = 0u;   /* mgpu: per-device (as dfc16s_go) */
+        int dv = 0; cudaGetDevice(&dv);
+        if (!(__atomic_load_n(&attr, __ATOMIC_ACQUIRE) >> (dv & 31) & 1u)) { cudaFuncSetAttribute(k_dattn2<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024); __atomic_fetch_or(&attr, 1u << (dv & 31), __ATOMIC_RELEASE); }
+        k_dattn2<32><<<nblk((size_t)f.n * HW, 64), 64, sm, g_st>>>((const __half *)f.p, gm, gm + (size_t)f.n * 16, gamma, beta, act, w_dev, bias, (__half *)y.p, f.n, f.d, HW);
+    } else k_dattn<32><<<nblk((size_t)f.n * HW, 128), 128, 0, g_st>>>((const __half *)f.p, gm, gm + (size_t)f.n * 16, gamma, beta, act, w_dev, bias, (__half *)y.p, f.n, f.d, HW);
     xfree_dev(gm);
     return y;
 }
