@@ -3119,7 +3119,7 @@ static int predict_one(int argc, char **argv) {
             if (gn_save) unet_gn_accumulate(u);
             if (getenv("UFSM_PARITY_GNW")) {   /* diagnostic (fix0332 11-18 parity audit): every window's GroupNorm statistics (unet_gn_stats_get: mean / rstd
                                                   per site and group), appended to FILE as int32 tz ty tx n + n floats, for the window-content study */
-                static size_t gnn; static float *gnh; if (!gnh) { gnn = unet_gn_nstats(u); gnh = malloc(gnn * 4); }
+                static size_t gnn; static float *gnh;   /* mgpu: debug (UFSM_PARITY_GNW, one predict thread) */ if (!gnh) { gnn = unet_gn_nstats(u); gnh = malloc(gnn * 4); }
                 if (gnh && !unet_gn_stats_get(u, gnh)) { FILE *gf = fopen(getenv("UFSM_PARITY_GNW"), "ab");
                     if (gf) { const int32_t hd[4] = {(int32_t)tz, (int32_t)ty, (int32_t)tx, (int32_t)gnn}; fwrite(hd, 4, 4, gf); fwrite(gnh, 4, gnn, gf); fclose(gf); } }
             }
@@ -3245,7 +3245,7 @@ static int predict_one(int argc, char **argv) {
                             }
                             if (getenv("UFSM_PARITY_DUMP")) {   /* diagnostic (fix0332 11-18 parity audit): the first window's full-resolution fp16 logits after the
                                                                    head chain, cup channels as [c][Wz][W][W] in DIR/predict.logits (cf. train's validation dump) */
-                                static int pwin; if (za == 0) pwin++;
+                                static int pwin; if (za == 0) pwin++;   /* mgpu: debug (UFSM_PARITY_DUMP) */
                                 if (pwin == 1) {
                                     char fn_[1200]; snprintf(fn_, sizeof fn_, "%s/predict.logits", getenv("UFSM_PARITY_DUMP"));
                                     FILE *pf = fopen(fn_, za == 0 ? "wb" : "r+b"); const size_t nsp = (size_t)nzs * hw; uint16_t *hp = malloc(nsp * 2);

@@ -1349,7 +1349,7 @@ static int hgs_choose(gpu_state *d, int nmil) {
    fp16 logits after the head chain (upsample / shuffle / fine stem), g_cout channels as [c][D][H][W] in DIR/train.logits, and its
    source / level / level-0 corner / um / shape in DIR/train.win, for predict on the same box (scripts/parity) */
 static void parity_dump_slab(gpu_state *d, int z0, int nz, int D, int H, int W) {
-    static int state;   /* 0: not started, 1: the first window running, 2: done (mgpu: GPU 0's thread only) */
+    static int state;   /* 0: not started, 1: the first window running, 2: done (mgpu: debug, UFSM_PARITY_DUMP; GPU 0's thread only) */
     if (d->dev != 0 || state == 2) return;
     if (z0 == 0) { if (state == 1) { state = 2; return; } state = 1; }
     char fn[1200]; const size_t hw = (size_t)H * W, ns = (size_t)nz * hw;

@@ -2811,7 +2811,7 @@ static void l0st_fwd_dec(unet *u);
    that change its numbers to DIR/modes.txt (UFSM_PARITY_TAG names the caller), with an FNV-1a hash of the weights it reads (the first
    4 MB: EMA or live) */
 static void unet_parity_modes(unet *u, shape5 xs, int train) {
-    static int nlines; if (nlines++ >= 64) return;
+    static int nlines; if (nlines++ >= 64) return;   /* mgpu: debug (UFSM_PARITY_DUMP modes lines) */
     char fn[1200]; snprintf(fn, sizeof fn, "%s/modes.txt", getenv("UFSM_PARITY_DUMP")); FILE *f = fopen(fn, "a"); if (!f) return;
     const float *w = unet_active_params(u); const size_t nb = u->np * 4 < (4u << 20) ? u->np * 4 : (4u << 20); uint8_t *h = malloc(nb);
     uint64_t hv = 1469598103934665603ull; if (h) { nn_sync(); nn_d2h(h, w, nb); for (size_t k = 0; k < nb; k++) hv = (hv ^ h[k]) * 1099511628211ull; free(h); }
