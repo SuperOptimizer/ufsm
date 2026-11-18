@@ -163,6 +163,7 @@ typedef struct {
    CG operator gathers them per cell through a cell -> (pair, entry) index, so the z-row threads never write a shared cell. */
 typedef struct cf_pairs {
     size_t np; uint32_t (*ix)[16]; float (*cw)[16]; float *t, *w0, *w, *q;   /* per pair: cells, coefficients, target, weights, c . v */
+    uint8_t *fix;   /* GT anchors (--anchor-pins / --anchor-pairs): kept at w0 by the Huber reweighting */
     size_t *rs; uint32_t *re;   /* cell i's entries re[rs[i] .. rs[i + 1]): pair * 16 + entry */
 } cf_pairs;
 static int cf_cmpf(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
@@ -280,7 +281,7 @@ static double cf_tri(const float *U, int d, int hh, int w, double qz, double qy,
 }
 
 /* ---- same-sheet pairs: the point list (box-local native z y x, target t in U), built per level ---- */
-typedef struct { float a[3], b[3], t; } cf_pt;
+typedef struct { float a[3], b[3], t, w; int pin; } cf_pt;   /* w > 0: its own weight (an anchor, fixed); pin: a row U(a) = t (b unused) */
 static int cf_data_at(const cf_lvl *L, const float *S, double smin, const float p[3]) {   /* the solve cell of a native point holds data */
     const double cs = (double)L->P * L->h; const int z = (int)floor(p[0] / cs), y = (int)floor(p[1] / cs), x = (int)floor(p[2] / cs);
     return z >= 0 && y >= 0 && x >= 0 && z < L->d && y < L->hh && x < L->w && S[((size_t)z * L->hh + y) * L->w + x] >= smin;
@@ -297,11 +298,12 @@ static void cf_tri_w(const cf_lvl *L, const float p[3], uint32_t ix[8], float cw
 static cf_pairs *cf_pairs_build(const cf_lvl *L, const cf_pt *P, size_t np, double w0) {
     cf_pairs *R = calloc(1, sizeof *R); if (!R) return nullptr;
     R->np = np; R->ix = malloc(np * sizeof *R->ix); R->cw = malloc(np * sizeof *R->cw); R->t = malloc(np * 4); R->w0 = malloc(np * 4); R->w = malloc(np * 4); R->q = malloc(np * 4);
-    R->rs = calloc(L->n + 1, sizeof(size_t)); R->re = malloc(np * 16 * sizeof(uint32_t));
-    if (!R->ix || !R->cw || !R->t || !R->w0 || !R->w || !R->q || !R->rs || !R->re) { fprintf(stderr, "count-field: out of memory (pairs)\n"); exit(1); }
+    R->rs = calloc(L->n + 1, sizeof(size_t)); R->re = malloc(np * 16 * sizeof(uint32_t)); R->fix = malloc(np ? np : 1);
+    if (!R->ix || !R->cw || !R->t || !R->w0 || !R->w || !R->q || !R->rs || !R->re || !R->fix) { fprintf(stderr, "count-field: out of memory (pairs)\n"); exit(1); }
     for (size_t p = 0; p < np; p++) {
-        cf_tri_w(L, P[p].a, R->ix[p], R->cw[p], -1.f); cf_tri_w(L, P[p].b, R->ix[p] + 8, R->cw[p] + 8, 1.f);
-        R->t[p] = P[p].t; R->w0[p] = R->w[p] = (float)w0;
+        if (P[p].pin) { cf_tri_w(L, P[p].a, R->ix[p], R->cw[p], 1.f); for (int k = 0; k < 8; k++) { R->ix[p][8 + k] = R->ix[p][k]; R->cw[p][8 + k] = 0; } }
+        else { cf_tri_w(L, P[p].a, R->ix[p], R->cw[p], -1.f); cf_tri_w(L, P[p].b, R->ix[p] + 8, R->cw[p] + 8, 1.f); }
+        R->t[p] = P[p].t; R->w0[p] = R->w[p] = (float)(P[p].w > 0 ? P[p].w : w0); R->fix[p] = P[p].w > 0;
         for (int k = 0; k < 16; k++) R->rs[R->ix[p][k] + 1]++;
     }
     for (size_t i = 0; i < L->n; i++) R->rs[i + 1] += R->rs[i];
@@ -309,11 +311,11 @@ static cf_pairs *cf_pairs_build(const cf_lvl *L, const cf_pt *P, size_t np, doub
     for (size_t p = 0; p < np; p++) for (int k = 0; k < 16; k++) R->re[fill[R->ix[p][k]]++] = (uint32_t)(p * 16 + k);
     free(fill); return R;
 }
-static void cf_pairs_free(cf_pairs *R) { if (!R) return; free(R->ix); free(R->cw); free(R->t); free(R->w0); free(R->w); free(R->q); free(R->rs); free(R->re); free(R); }
+static void cf_pairs_free(cf_pairs *R) { if (!R) return; free(R->fix); free(R->ix); free(R->cw); free(R->t); free(R->w0); free(R->w); free(R->q); free(R->rs); free(R->re); free(R); }
 /* the pairs' residuals c . U - t at U: Huber weights w0 min(1, delta / |r|); returns the share with |r| > 0.5 (turns) */
 static double cf_pairs_reweight(cf_pairs *R, const float *U, double delta, int set) {
     cf_pairs_q(R, U); size_t nb = 0;
-    for (size_t p = 0; p < R->np; p++) { const double r = fabs(R->q[p] - R->t[p]); nb += r > 0.5; if (set) R->w[p] = (float)(R->w0[p] * (r > delta ? delta / r : 1)); }
+    for (size_t p = 0; p < R->np; p++) { const double r = fabs(R->q[p] - R->t[p]); nb += r > 0.5; if (set && !R->fix[p]) R->w[p] = (float)(R->w0[p] * (r > delta ? delta / r : 1)); }
     return R->np ? (double)nb / R->np : 0;
 }
 
@@ -934,13 +936,14 @@ int cmd_count_field(int argc, char **argv) {
        solves. A fibre: resampled at 1 native voxel, pairs every 4th sample at the spans --cf-fib-spans (native, default 16,32,64,128),
        dW = 0 (W is constant along a sheet away from the theta cut; the cut is in t through dir * dtheta / 2 pi) */
     cf_pt *pts = nullptr; size_t npt = 0; const double wfib = opt_atof("--cf-fib", cf_opt(argc, argv, "--cf-fib", "0"));
-    if (wfib > 0) {
+    const char *apin = cf_opt(argc, argv, "--anchor-pins", ""), *apair = cf_opt(argc, argv, "--anchor-pairs", "");
+    if (wfib > 0 || *apin || *apair) {
         size_t cap = 0; const double zo = opt_atof("--fib-zoff", cf_opt(argc, argv, "--fib-zoff", "0"));
         #define CF_PUSH(A, B, DW) do { if (npt == cap) { cap = cap ? 2 * cap : 1 << 16; pts = realloc(pts, cap * sizeof *pts); if (!pts) return 1; } \
-            cf_pt *e_ = &pts[npt++]; for (int k_ = 0; k_ < 3; k_++) { e_->a[k_] = (float)(A)[k_]; e_->b[k_] = (float)(B)[k_]; } \
+            cf_pt *e_ = &pts[npt++]; e_->w = 0; e_->pin = 0; for (int k_ = 0; k_ < 3; k_++) { e_->a[k_] = (float)(A)[k_]; e_->b[k_] = (float)(B)[k_]; } \
             double ta_ = atan2((A)[1] - cf_axis_at(g.cy, na, (A)[0]), (A)[2] - cf_axis_at(g.cx, na, (A)[0])), tb_ = atan2((B)[1] - cf_axis_at(g.cy, na, (B)[0]), (B)[2] - cf_axis_at(g.cx, na, (B)[0])); \
             double dt_ = tb_ - ta_; dt_ -= 2 * M_PI * floor((dt_ + M_PI) / (2 * M_PI)); e_->t = (float)((DW) + dir * dt_ / (2 * M_PI)); } while (0)
-        if (*cf_opt(argc, argv, "--fibers", "")) {
+        if (wfib > 0 && *cf_opt(argc, argv, "--fibers", "")) {
             fib_set fs; if (fib_load(cf_opt(argc, argv, "--fibers", ""), &fs)) { fprintf(stderr, "count-field: cannot read --fibers %s\n", cf_opt(argc, argv, "--fibers", "")); return 1; }
             int sp[8] = {16, 32, 64, 128}, nsp = 4;
             if (*cf_opt(argc, argv, "--cf-fib-spans", "")) { nsp = 0; char *t = strdup(cf_opt(argc, argv, "--cf-fib-spans", "")); for (char *q = strtok(t, ","); q && nsp < 8; q = strtok(nullptr, ",")) sp[nsp++] = atoi(q); free(t); }
@@ -965,11 +968,27 @@ int cmd_count_field(int argc, char **argv) {
             }
             free(rq); fprintf(stderr, "count-field: %d fibres -> %zu same-sheet pairs (spans", fs.n, npt); for (int k = 0; k < nsp; k++) fprintf(stderr, " %d", sp[k]); fprintf(stderr, ")\n"); fib_free(&fs);
         }
-        if (*cf_opt(argc, argv, "--pairs", "")) {
+        if (wfib > 0 && *cf_opt(argc, argv, "--pairs", "")) {
             FILE *pf = fopen(cf_opt(argc, argv, "--pairs", ""), "rb"); float rec[7]; size_t n0 = npt;
             if (!pf) { fprintf(stderr, "count-field: cannot read --pairs %s\n", cf_opt(argc, argv, "--pairs", "")); return 1; }
             while (fread(rec, sizeof rec, 1, pf) == 1) { const double A[3] = {rec[0], rec[1], rec[2]}, B[3] = {rec[3], rec[4], rec[5]}; CF_PUSH(A, B, rec[6]); }
             fclose(pf); fprintf(stderr, "count-field: %zu pairs from --pairs\n", npt - n0);
+        }
+        /* --anchor-pins F (z y x U' n) / --anchor-pairs F (za ya xa zb yb xb dU n): ground-truth anchors (ufsm gt-anchors, box-local
+           native), rows U(a) = U' / U(b) - U(a) = dU + dir dtheta / 2 pi, weight --anchor-w x min(n, --anchor-ncap) (n: anchors merged
+           into the record), never Huber-reweighted (the GT is the truth: the data yields) */
+        const double aw = opt_atof("--anchor-w", cf_opt(argc, argv, "--anchor-w", "10")), ancap = opt_atof("--anchor-ncap", cf_opt(argc, argv, "--anchor-ncap", "4"));
+        for (int kind = 0; kind < 2; kind++) {
+            const char *fn = kind ? apair : apin; if (!*fn) continue;
+            FILE *af = fopen(fn, "rb"); if (!af) { fprintf(stderr, "count-field: cannot read %s\n", fn); return 1; }
+            float rec[8]; const int nr = kind ? 8 : 5; size_t n0 = npt;
+            while (fread(rec, 4, nr, af) == (size_t)nr) {
+                const double A[3] = {rec[0], rec[1], rec[2]};
+                if (kind) { const double B[3] = {rec[3], rec[4], rec[5]}; CF_PUSH(A, B, rec[6]); }
+                else { CF_PUSH(A, A, 0.0); pts[npt - 1].pin = 1; pts[npt - 1].t = rec[3]; }
+                pts[npt - 1].w = (float)(aw * fmin(rec[nr - 1], ancap));
+            }
+            fclose(af); fprintf(stderr, "count-field: %zu GT anchor %s from %s (weight %g x min(n, %g))\n", npt - n0, kind ? "pairs" : "pins", fn, aw, ancap);
         }
         #undef CF_PUSH
         if (!npt) fprintf(stderr, "count-field: --cf-fib %g but no pairs (--fibers / --pairs): off\n", wfib);
@@ -1032,7 +1051,8 @@ int cmd_count_field(int argc, char **argv) {
         fprintf(stderr, "count-field: level %d (%d field cells): %dx%dx%d, %d CG iterations, relative residual %.2e (%s %.1f s)\n", l, q, L->d, L->hh, L->w, it, rr, on_gpu ? "GPU" : "CPU", cf_now() - tcg);
         if (L->pr && l == 0) {   /* Huber IRLS on the pairs (level 0 only; the coarse levels take them unweighted) */
             fprintf(stderr, "count-field: pairs |c.U - t| > 0.5 turn: %.4f of %zu\n", cf_pairs_reweight(L->pr, L->U, fhub, 0), L->pr->np);
-            for (int k = 0; k < firls; k++) {
+            size_t nfree = 0; for (size_t pp = 0; pp < L->pr->np; pp++) nfree += !L->pr->fix[pp];   /* (anchors only: nothing to reweight) */
+            for (int k = 0; k < firls && nfree; k++) {
                 const double bad = cf_pairs_reweight(L->pr, L->U, fhub, 1); cf_par(L->d, cf_rhs_run, &RH);
                 const int it2 = cf_cg_solve(L, iters, 1e-5, &rr);
                 fprintf(stderr, "count-field: IRLS %d (Huber %.2f): before %.4f off by > 0.5; %d CG iterations, residual %.2e -> %.4f\n", k + 1, fhub, bad, it2, rr, cf_pairs_reweight(L->pr, L->U, fhub, 0));

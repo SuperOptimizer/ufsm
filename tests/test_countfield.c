@@ -371,6 +371,46 @@ int main(void) {
         CHECK(err[0] > 0.3, "the band under-count should break the sector without pairs (%.3f off)", err[0]);
         CHECK(err[1] < 0.05, "the fibre pairs should restore the sector (%.3f off with --cf-fib 4)", err[1]);
     }
+    {   /* GT anchors (--anchor-pairs / --anchor-pins, ufsm gt-anchors' records; anchors-20261118) on the band under-count above: radial
+           pairs 2 sheets apart across the band in the sector (dU = 2, gauge-free), or pins U' = r / p (U = W + theta / 2 pi) in and out
+           of the sector; both should restore the sector beyond the band as the fibres do. A wrong pair target (dU = 1) should not. */
+        char in3[600], pa[700], pi_[700], pw[700]; snprintf(in3, sizeof in3, "%s/in_band", dir); snprintf(pa, sizeof pa, "%s/anc_pairs.f32", dir); snprintf(pi_, sizeof pi_, "%s/anc_pins.f32", dir); snprintf(pw, sizeof pw, "%s/anc_wrong.f32", dir);
+        FILE *fa = fopen(pa, "wb"), *fi = fopen(pi_, "wb"), *fw = fopen(pw, "wb"); int npa = 0, npi = 0;
+        for (int zz = 2; zz < D * h; zz += 8) for (double th = 0.25; th < 1.4; th += 0.1) for (int k = 2; k < 12; k++) {
+            const double ra = p * (k + th / (2 * M_PI)), rb = p * (k + 2 + th / (2 * M_PI)); if (ra < 12 * h || rb > 40 * h) continue;
+            const float rec[8] = {zz + 0.5f, (float)(cy0 + ra * sin(th)), (float)(cx0 + ra * cos(th)), zz + 0.5f, (float)(cy0 + rb * sin(th)), (float)(cx0 + rb * cos(th)), 2, 1};
+            fwrite(rec, 4, 8, fa); npa++; float rw[8]; memcpy(rw, rec, sizeof rw); rw[6] = 1; fwrite(rw, 4, 8, fw);
+        }
+        for (int zz = 2; zz < D * h; zz += 8) for (double th = -3.0; th < 3.1; th += 0.15) for (double r = 10 * h; r < 44 * h; r += 2.5 * h) {
+            const float rec[5] = {zz + 0.5f, (float)(cy0 + r * sin(th)), (float)(cx0 + r * cos(th)), (float)(r / p), 1}; fwrite(rec, 4, 5, fi); npi++;
+        }
+        fclose(fa); fclose(fi); fclose(fw);
+        const char *vf[3] = {"--anchor-pairs", "--anchor-pins", "--anchor-pairs"}, *vp[3] = {pa, pi_, pw}, *vn[3] = {"pairs dU 2", "pins", "pairs dU 1 (wrong)"}; double err[3];
+        for (int v = 0; v < 3; v++) {
+            char o[700]; snprintf(o, sizeof o, "%s/out_anc%d", dir, v);
+            char *av[] = {"ufsm", "count-field", in3, o, "--R", "0", "--dir", "1", "--pool", "1", "--threads", "4", "--rmin-um", "0", "--cf-gpu", "0", (char *)vf[v], (char *)vp[v], "--anchor-w", "10", nullptr};
+            CHECK(cmd_count_field(20, av) == 0, "count-field (band, %s) failed", vn[v]);
+            snprintf(pth, sizeof pth, "%s/wc.f32", o); FILE *f3 = fopen(pth, "rb"); float *w3 = malloc(n * sizeof(float));
+            CHECK(f3 && fread(w3, sizeof(float), n, f3) == n, "no wc.f32 (anchors)"); if (f3) fclose(f3);
+            double gs = 0, gc = 0; int ne = 0, nb = 0;
+            for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+                const size_t i = ((size_t)3 * H + y) * W + x; const double py = (y + 0.5) * h, px = (x + 0.5) * h, r = hypot(py - cy0, px - cx0), th = atan2(py - cy0, px - cx0);
+                if (!(w3[i] == w3[i]) || r < 8 * h || r > 44 * h) continue;
+                if (th < -0.4 && th > -2.7) { gs += w3[i] - trueW(py, px); gc++; }
+            }
+            const double g0 = gc ? gs / gc : 0;
+            for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+                const size_t i = ((size_t)3 * H + y) * W + x; const double py = (y + 0.5) * h, px = (x + 0.5) * h, r = hypot(py - cy0, px - cx0), th = atan2(py - cy0, px - cx0);
+                if (!(w3[i] == w3[i]) || r < 30 * h || r > 40 * h || th < 0.4 || th > 1.2) continue;
+                ne++; nb += fabs(w3[i] - trueW(py, px) - g0) > 0.5;
+            }
+            err[v] = ne ? (double)nb / ne : 1; free(w3);
+            printf("band under-count, GT anchors %s (%d pairs / %d pins): W off by > 0.5 turn on %.3f of %d sector cells beyond the band\n", vn[v], npa, npi, err[v], ne);
+        }
+        CHECK(err[0] < 0.05, "radial GT pairs (dU 2) should restore the sector (%.3f off)", err[0]);
+        CHECK(err[1] < 0.05, "GT pins should restore the sector (%.3f off)", err[1]);
+        CHECK(err[2] > 0.3, "wrong pairs (dU 1) should not (%.3f off)", err[2]);
+    }
     {   /* a masked outer sector (geo-outer 2026-11-14: a zeroed CT under a tight SAM mask): r > MR cells and th in (0.2, 1.4) carry no
            data (material 0). Same-sheet arcs (every sheet, r 20..44 cells, th -0.6..2.2) run from the data into it. W has no data there
            (its edges hold only the theta term: radially flat), so with the arcs kept (--cf-fib-nodata keep) the sheets' data parts beside
