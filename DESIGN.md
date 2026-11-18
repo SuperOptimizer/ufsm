@@ -6,6 +6,26 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## reader3 ink-ext: the depth-fusion conv streamed over depth, conv_igemm at 2 blocks an SM (2026-11-17, branch convkx-20261117)
+
+Profile (nsys, unrollperf's warm-cache PHerc1667 w035, 1012 tiles, card 1 shared): 9.6-15 s of kernels a wrap, the 128 x 128
+conv_igemm ~1/3 (136 registers -> one 256-thread block an SM, 16 % warps active), k_dfc16 (the Reader's 16 -> 16 3x3x3 depth-fusion
+conv with GN on load) ~1/5, k_gnpart + k_gn_apply ~1/7, k_dfc1 ~1/14, k_dattn ~1/20.
+
+- **k_dfc16s** (UFSM_XNET_DF16=10, the new default; 1 the old halo kernel): a block owns a TY x TX column over the whole depth with
+  a ring of three (TY + 2)(TX + 2) planes; plane z + 2 is fetched into registers before plane z's 27 taps and stored (GN-applied) over
+  plane z - 1's slot after them. Reads and GN applies 2.66x -> 1.33x the outputs, smem 57 -> 46 KB (2 blocks an SM). Same tap order,
+  MMAs and expressions: byte-identical (test_xmx dfs: 42 cases, plain and GN-in, ragged). XMX_DFBENCH 4 x 17 x 384^2 (best of 10,
+  shared card): plain 6.35 -> 2.96 ms, GN-in 8.07 -> 3.45 ms (2.3x). Tilings 11-16 (4/8/16 rows, 2/4/8 warps) were slower.
+- **conv_igemm minB 2** (XN_MINB, 8-warp tiles only): 128 registers, two blocks an SM. Byte-identical (register allocation only).
+- In situ, ink-ext w035 with --batch 8 pinned, interleaved 3x against master's kernels (the card was shared, so per-kernel times are
+  normalised by k_gnpart's in the same run): k_dfc16 2.55-2.61 -> 1.21-1.26 (2.1x), 128 x 128 conv_igemm 4.03-4.16 -> 3.11-3.28
+  (-23 %); wraps byte-identical to master in every pair.
+- ink-ext is not run-to-run byte-stable unpinned: the auto --batch follows free device memory (8 / 10 / 16 on the shared card) and
+  two master runs at different batches differed on 270 k of 39 M pixels by 1 LSB; at a fixed batch every run is identical. A/Bs pin it.
+- Tried and dropped (bench, byte-identical but not faster): k_dfc1 with 2/4/8 x voxels a thread (float4 weights; 2.8 -> 6.7-8.3 ms),
+  k_gnpart with 4 rows' loads in flight + an 8-channel k_gn_apply (2.55 -> 2.52 ms). The GN kernels' reader3 time is ~8000 small
+  launches on the 2-D levels (~0.12 ms each): fusing the apply into the next conv's loads (as gnin) is the remaining lever.
 ## Production ink = reader3 (INKMODE=r3, the default); inkpod parked: memorisation, not labels (2026-11-17, branch inkr3-20261117)
 
 User decision 11-17: the latent ink head (inkpod) is not used in production until it is retrained. On the 1667 held-out regions it

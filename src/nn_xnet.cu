@@ -1241,7 +1241,7 @@ template <int TY, int TX, int NW> static bool dfc16s_go(const xconv *c, xt in, x
 static int g_df16 = -1;   /* UFSM_XNET_DF16=0: the depth-fusion conv on the implicit GEMM (A/B); mgpu: env */
 extern "C" void xnet_set_df16(int v) { g_df16 = v; }
 static bool dfc16_try(const xconv *c, xt in, xt y, const xt *res, int act, double *st, const GnIn &gi = GnIn{}) {
-    if (g_df16 < 0) g_df16 = getenv("UFSM_XNET_DF16") ? atoi(getenv("UFSM_XNET_DF16")) : 1;
+    if (g_df16 < 0) g_df16 = getenv("UFSM_XNET_DF16") ? atoi(getenv("UFSM_XNET_DF16")) : 10;
     if (!g_df16 || c->mxq || c->unfold || c->tconv || c->ci != 16 || c->co != 16 || in.c != 16 || c->kd != 3 || c->kh != 3 || c->kw != 3) return false;
     if (c->sd != 1 || c->sh != 1 || c->sw != 1 || c->pd != 1 || c->ph != 1 || c->pw != 1 || res || act != XA_NONE || st) return false;
     switch (g_df16) {
