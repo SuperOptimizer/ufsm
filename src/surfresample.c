@@ -9,7 +9,11 @@
    two closest surfaces are refined (Gauss-Newton on the bilinear patch, walking across cells) and the smaller residual wins, if
    <= --max-dist voxels (else the point has no source: 0). Destination pixels (render's grid: pixel / gs, corners valid when Z >= 0):
    the corners' source coordinates interpolated when all four corners have the same source surface, else (seams between source
-   surfaces) the pixel's own point projected from each corner's source position. Prints coverage and the residual distribution. */
+   surfaces) the pixel's own point projected from each corner's source position. Prints coverage and the residual distribution.
+   --geom-only 1 (SRC-MAPS "-"): only the --residual surfaces, from the geometry alone (every source surface counts as mapped; no map read
+   or written): the unroll writes them while reader3 still runs on the stripes, so the residual reader3 pass need not wait for the
+   resample (pod q2 1667: resample 172 s, then residual reader3 117 s, both after the stripe maps). The residual is the same as a full
+   run's whenever every source surface has its map (unroll.sh r3once compares the two and re-inks on a difference). */
 #include "imgops.h"
 #include "tiffw.h"
 #include "json.h"
@@ -96,6 +100,7 @@ typedef struct {
     rs_surf *S; int ns; rs_ent *E; size_t ne; double maxd2;
     const rs_surf *D; int16_t *vs; float *vr, *vc;     /* per destination vertex: source surface (-1 none), source grid row / col */
     uint8_t *out, *src, *sid; int ow, oh; double gs;   /* sid (--sid-out): the source surface + 1 (mod 255; 0 none) */   /* src: 1 where a pixel was sampled (--src-out) */
+    int geom;   /* --geom-only: no maps (out stays 0) */
     _Atomic int next; _Atomic uint64_t nv, nvok, npx, npxok, nseam, hist[8];
 } rs_job;
 static void rs_lookup(const rs_job *J, const double q[3], int *sid, double *fr, double *fc, double *d2out) {   /* the destination point q's source */
@@ -147,7 +152,7 @@ static void *rs_px_main(void *a) {
         const int s0 = J->vs[i[0]];
         if (s0 >= 0 && J->vs[i[1]] == s0 && J->vs[i[2]] == s0 && J->vs[i[3]] == s0) {
             double fr = 0, fc = 0; for (int k = 0; k < 4; k++) { fr += w4[k] * J->vr[i[k]]; fc += w4[k] * J->vc[i[k]]; }
-            J->out[(size_t)py * J->ow + px] = rs_sample(&J->S[s0], fr, fc); J->src[(size_t)py * J->ow + px] = 1; if (J->sid) J->sid[(size_t)py * J->ow + px] = (uint8_t)(s0 % 255 + 1); atomic_fetch_add(&J->npxok, 1); continue;
+            J->out[(size_t)py * J->ow + px] = J->geom ? 0 : rs_sample(&J->S[s0], fr, fc); J->src[(size_t)py * J->ow + px] = 1; if (J->sid) J->sid[(size_t)py * J->ow + px] = (uint8_t)(s0 % 255 + 1); atomic_fetch_add(&J->npxok, 1); continue;
         }
         /* a seam (or a corner without a source): the pixel's own point, projected from each corner's source position */
         double q[3] = {0, 0, 0}; const float *A[3] = {D->X, D->Y, D->Z};
@@ -157,7 +162,7 @@ static void *rs_px_main(void *a) {
             double fr, fc; const double d2 = rs_project(&J->S[s], q, J->vr[i[k]], J->vc[i[k]], &fr, &fc);
             if (d2 < bd) { bd = d2; bs = s; br = fr; bc = fc; } }
         if (bs < 0 || bd > J->maxd2) { int s; double fr = 0, fc = 0, d2; rs_lookup(J, q, &s, &fr, &fc, &d2); if (s < 0) continue; bs = s; br = fr; bc = fc; }
-        J->out[(size_t)py * J->ow + px] = rs_sample(&J->S[bs], br, bc); J->src[(size_t)py * J->ow + px] = 1; if (J->sid) J->sid[(size_t)py * J->ow + px] = (uint8_t)(bs % 255 + 1); atomic_fetch_add(&J->npxok, 1); atomic_fetch_add(&J->nseam, 1);
+        J->out[(size_t)py * J->ow + px] = J->geom ? 0 : rs_sample(&J->S[bs], br, bc); J->src[(size_t)py * J->ow + px] = 1; if (J->sid) J->sid[(size_t)py * J->ow + px] = (uint8_t)(bs % 255 + 1); atomic_fetch_add(&J->npxok, 1); atomic_fetch_add(&J->nseam, 1);
     }
     return nullptr;
 }
@@ -225,7 +230,7 @@ static int rs_compose(int argc, char **argv) {
 }
 int cmd_surf_resample(int argc, char **argv) {
     if (argc >= 3 && !strcmp(argv[2], opt_n("--compose"))) return rs_compose(argc, argv);
-    if (argc < 6) { fprintf(stderr, "usage: ufsm surf-resample SRC-SURFS SRC-MAPS DST-SURFS OUT [--suffix _reader3.tif] [--max-dist 4] [--scale 1] [--threads 8] [--src-out 1] [--sid-out 1] [--edge-band PX] [--fill-gap 16] [--residual DIR [--residual-margin 8] [--band-margin 32]]\n"
+    if (argc < 6) { fprintf(stderr, "usage: ufsm surf-resample SRC-SURFS SRC-MAPS DST-SURFS OUT [--suffix _reader3.tif] [--max-dist 4] [--scale 1] [--threads 8] [--src-out 1] [--sid-out 1] [--edge-band PX] [--fill-gap 16] [--residual DIR [--residual-margin 8] [--band-margin 32]] [--geom-only 1]\n"
                     "       ufsm surf-resample --compose OUT RMAPS [--suffix S]   OUT maps = resampled where OUT/<d>_src.tif, else RMAPS/<d><suffix>\n"); return 2; }
     const char *sd = argv[2], *md = argv[3], *dd = argv[4], *od = argv[5], *suf = rs_opt(argc, argv, "--suffix", "_reader3.tif");
     const double maxd = opt_atof("--max-dist", rs_opt(argc, argv, "--max-dist", "4")), rscale = opt_atof("--scale", rs_opt(argc, argv, "--scale", "1"));
@@ -234,6 +239,8 @@ int cmd_surf_resample(int argc, char **argv) {
     const char *resd = rs_opt(argc, argv, "--residual", nullptr); const int rmargin = opt_atoi("--residual-margin", rs_opt(argc, argv, "--residual-margin", "8")),
               bmargin = opt_atoi("--band-margin", rs_opt(argc, argv, "--band-margin", "32"));
     const int sido = opt_atoi("--sid-out", rs_opt(argc, argv, "--sid-out", "0"));   /* OUT/<d>_sid.tif: each pixel's source surface (sorted order) + 1 */
+    const int geom = opt_atoi("--geom-only", rs_opt(argc, argv, "--geom-only", "0"));   /* only the --residual surfaces (no maps) */
+    if (geom && !resd) { fprintf(stderr, "surf-resample: --geom-only needs --residual DIR\n"); return 2; }
     const int srco = opt_atoi("--src-out", rs_opt(argc, argv, "--src-out", "0"));   /* OUT/<d>_src.tif: 1 where sampled, 0 where no source (the residual) */
     const int nt0 = ufsm_threads(opt_atoi("--threads", rs_opt(argc, argv, "--threads", "8")), 8), nt = nt0 > 64 ? 64 : nt0 < 1 ? 1 : nt0;
     const double t0 = rs_now();
@@ -242,6 +249,7 @@ int cmd_surf_resample(int argc, char **argv) {
     rs_surf *S = calloc((size_t)ns, sizeof *S); size_t nv = 0; int nm = 0;
     for (int s = 0; s < ns; s++) {
         if (rs_load(sd, sn[s], &S[s])) return 1;
+        if (geom) { static uint8_t one; S[s].M = &one; S[s].mw = S[s].mh = 1; S[s].gs = 1; nm++; for (size_t i = 0; i < (size_t)S[s].w * S[s].h; i++) nv += S[s].Z[i] >= 0; continue; }   /* (M: "mapped"; never sampled) */
         char p[1400]; snprintf(p, sizeof p, "%s/%s%s", md, sn[s], suf); S[s].M = img_read_u8(p, &S[s].mw, &S[s].mh);
         if (!S[s].M) { fprintf(stderr, "surf-resample: no map %s: surface %s skipped\n", p, sn[s]); continue; }
         S[s].gs = (double)(S[s].mw - 1) / (S[s].w - 1);
@@ -257,12 +265,13 @@ int cmd_surf_resample(int argc, char **argv) {
     qsort(E, ne, sizeof *E, rs_ent_cmp);
     const double t1 = rs_now();
     fprintf(stderr, "surf-resample: %d source surfaces (%d with a map), %zu vertices indexed, %.1f s\n", ns, nm, ne, t1 - t0);
-    mkdir(od, 0777); int rc = 0;
+    if (!geom) mkdir(od, 0777);
+    int rc = 0;
     for (int k = 0; k < nd; k++) {
         rs_surf D = {0}; if (rs_load(dd, dn[k], &D)) { rc = 1; continue; }
         char p[1400]; snprintf(p, sizeof p, "%s/%s", dd, dn[k]); const double ms = rs_meta_scale(p);
         if (!(ms > 0)) { fprintf(stderr, "surf-resample: %s: no scale in meta.json\n", p); rc = 1; continue; }
-        rs_job J = {.S = S, .ns = ns, .E = E, .ne = ne, .maxd2 = maxd * maxd, .D = &D, .gs = rscale / ms};
+        rs_job J = {.S = S, .ns = ns, .E = E, .ne = ne, .maxd2 = maxd * maxd, .D = &D, .gs = rscale / ms, .geom = geom};
         J.ow = render_out_px(D.w, J.gs); J.oh = render_out_px(D.h, J.gs);
         const size_t n = (size_t)D.w * D.h;
         J.vs = malloc(n * sizeof *J.vs); J.vr = malloc(n * sizeof *J.vr); J.vc = malloc(n * sizeof *J.vc); J.out = calloc((size_t)J.ow * J.oh, 1); J.src = calloc((size_t)J.ow * J.oh, 1); J.sid = sido || band > 0 ? calloc((size_t)J.ow * J.oh, 1) : nullptr;
@@ -324,11 +333,11 @@ int cmd_surf_resample(int argc, char **argv) {
         free(bandpx);
         const double tc = rs_now();
         snprintf(p, sizeof p, "%s/%s%s", od, dn[k], suf);
-        if (tiffw_write(p, J.ow, J.oh, 1, J.out, 1)) { fprintf(stderr, "surf-resample: cannot write %s\n", p); rc = 1; }
+        if (!geom && tiffw_write(p, J.ow, J.oh, 1, J.out, 1)) { fprintf(stderr, "surf-resample: cannot write %s\n", p); rc = 1; }
         if (band > 0 || resd || fgap > 0) fprintf(stderr, "surf-resample: %s: %llu px in the %d-px band around source switches, %llu px filled from <= %d px away; residual surface: %llu vertices\n",
                                                   dn[k], (unsigned long long)nband, band, (unsigned long long)nfillg, fgap, (unsigned long long)nresv);
-        if (sido && J.sid) { snprintf(p, sizeof p, "%s/%s_sid.tif", od, dn[k]); if (tiffw_write(p, J.ow, J.oh, 1, J.sid, 1)) rc = 1; }
-        if (srco) { snprintf(p, sizeof p, "%s/%s_src.tif", od, dn[k]); if (tiffw_write(p, J.ow, J.oh, 1, J.src, 1)) { fprintf(stderr, "surf-resample: cannot write %s\n", p); rc = 1; } }
+        if (sido && J.sid && !geom) { snprintf(p, sizeof p, "%s/%s_sid.tif", od, dn[k]); if (tiffw_write(p, J.ow, J.oh, 1, J.sid, 1)) rc = 1; }
+        if (srco && !geom) { snprintf(p, sizeof p, "%s/%s_src.tif", od, dn[k]); if (tiffw_write(p, J.ow, J.oh, 1, J.src, 1)) { fprintf(stderr, "surf-resample: cannot write %s\n", p); rc = 1; } }
         const uint64_t v = J.nv, vo = J.nvok, h0 = J.hist[0], h1 = J.hist[1], h2 = J.hist[2], h3 = J.hist[3], h4 = J.hist[4];
         fprintf(stderr, "surf-resample: %s: %d x %d px, vertices %llu, with a source %.4f (residual < 0.25 / 0.5 / 1 / 2 / %.3g voxels: %.3f %.3f %.3f %.3f %.3f); "
                         "pixels %llu, sampled %.4f, at seams %llu; %.1f + %.1f s\n", dn[k], J.ow, J.oh, (unsigned long long)v, v ? (double)vo / v : 0, maxd,

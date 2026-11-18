@@ -906,23 +906,51 @@ pw_fin() {   # pw_fin WRAP: (r3) the wrap's ink from r3pre, CT-gated; the side-b
 # + 32 vertices of context) and composed in. 1667 pod data, 2026-11-18: held-out AUC 0.8622 at 40 um vs 0.8580 inking the wraps (the
 # stripe flatten reads better), seam band |d| vs the direct wrap map 4.3 (elsewhere 7.1); residual 7.6k of 37.5k tiles (desk 88 s vs
 # 826 s) + 98 s resample + 12 s compose on 8 CPU threads. It waits for the stripes' maps (state/strip_chain.failed, or UPTO: the old pass).
-r3once_ok() {
-  [ "${R3ONCE:-1}" = 1 ] && [ -z "${UPTO:-}" ] || return 1
-  while [ ! -e $O/ink/r3/strip.ok ] && [ ! -e $O/state/strip_chain.failed ]; do stopped && return 1; sleep 10; done
-  [ -e $O/ink/r3/strip.ok ] || { log "perwrap: no stripe maps (the strip stopped): reader3 over the wraps"; return 1; }
+# R3EARLY=1 (default, 2026-11-18): the residual surfaces come from the geometry alone (surf-resample --geom-only, the final stripes after
+# distort + the wraps' up/ surfaces) while reader3 still inks the stripes; once the stripes' maps land, the residual reader3 (GPU) runs
+# beside the CPU resample instead of after it (pod q2 1667: 172 s resample, then 117 s residual reader3). The resample's own residual
+# (res.chk) must equal the early one, else (a stripe without a map) it is re-inked from res.chk (a DEFAULTED: line). R3EARLY=0: the old order.
+r3stripes() {   # r3stripes FILE: wait for FILE (state/distort.done: the final stripes; ink/r3/strip.ok: their maps); 1 when the strip stopped
+  while [ ! -e $1 ] && [ ! -e $O/state/strip_chain.failed ]; do stopped && return 1; sleep 5; done
+  [ -e $1 ]
 }
-r3once() {   # r3once GPU UPDIR..: $O/ink/r3/up/<w>_$R3MODEL.tif from the stripes' maps + a residual reader3 pass
-  local g=$1 W=$O/ink/r3/once x; shift
-  case "$W" in */ink/r3/once) rm -rf -- "$W";; *) return 1;; esac
-  mkdir -p $W/dst $W/rmap $O/ink/r3/up || return 1
-  for x in "$@"; do [ -s $O/ink/r3/up/$(basename $x)_$R3MODEL.tif ] || ln -sfn $x $W/dst/$(basename $x); done
-  [ -n "$(ls $W/dst)" ] || return 0
+r3once_ok() {   # r3once_ok UPDIR..: (R3ONCE=1) the residual geometry (R3EARLY), then wait for the stripes' maps; 1: ink the wraps instead
+  [ "${R3ONCE:-1}" = 1 ] && [ -z "${UPTO:-}" ] || return 1
+  local W=$O/ink/r3/once x
+  if r3stripes $O/state/distort.done; then
+    case "$W" in */ink/r3/once) rm -rf -- "$W";; *) return 1;; esac
+    mkdir -p $W/dst $W/rmap $O/ink/r3/up || return 1
+    for x in "$@"; do [ -s $O/ink/r3/up/$(basename $x)_$R3MODEL.tif ] || ln -sfn $x $W/dst/$(basename $x); done
+    if [ "${R3EARLY:-1}" = 1 ] && [ -n "$(ls $W/dst)" ]; then
+      X $O/logs/r3once.log $U surf-resample $O/strip/strip/flat/stripes - $W/dst $W/geo --geom-only 1 --residual $W/res --threads $TH $(r3rsx) || return 1
+      log "r3once: early residual of $(ls $W/dst | wc -l) wraps: $(ls $W/res 2> /dev/null | wc -l) residual surfaces (the stripes' reader3 still running: $([ -e $O/ink/r3/strip.ok ] && echo no || echo yes))"
+    fi
+  fi
+  r3stripes $O/ink/r3/strip.ok && return 0
+  log "perwrap: no stripe maps (the strip stopped): reader3 over the wraps"; return 1
+}
+r3rsx() { echo "--edge-band ${R3BAND:-32} --fill-gap ${R3FILLGAP:-16} --residual-margin 8 --band-margin 32"; }
+r3once() {   # r3once GPU: (after r3once_ok) $O/ink/r3/up/<w>_$R3MODEL.tif from the stripes' maps + a residual reader3 pass
+  local g=$1 W=$O/ink/r3/once rp= rc=0 rres=res same=0
+  [ -n "$(ls $W/dst 2> /dev/null)" ] || return 0
+  [ "${R3EARLY:-1}" = 1 ] && rres=res.chk
+  if [ $rres = res.chk ] && [ -d $W/res ] && [ -n "$(ls $W/res)" ]; then r3pre $W/rmap "$g" $W/res/* & rp=$!; fi   # (GPU beside the CPU resample)
   X $O/logs/r3once.log $U surf-resample $O/strip/strip/flat/stripes $O/ink/r3/strip $W/dst $O/ink/r3/up --suffix _$R3MODEL.tif --threads $TH \
-    --src-out 1 --residual $W/res --edge-band ${R3BAND:-32} --fill-gap ${R3FILLGAP:-16} --residual-margin 8 --band-margin 32 || return 1
-  if [ -d $W/res ] && [ -n "$(ls $W/res)" ]; then r3pre $W/rmap "$g" $W/res/* || return 1; fi
+    --src-out 1 --residual $W/$rres $(r3rsx) || rc=1
+  [ -n "$rp" ] && { wait $rp || rc=1; }
+  [ $rc = 0 ] || return 1
+  if [ $rres = res.chk ]; then
+    if [ ! -e $W/res ] && [ ! -e $W/res.chk ]; then same=1; elif [ -d $W/res ] && [ -d $W/res.chk ] && diff -rq $W/res $W/res.chk > /dev/null; then same=1; fi
+    if [ $same = 0 ]; then
+      log "r3once: DEFAULTED: the early residual differs from the resample's ($W/res vs res.chk): re-inking the resample's"
+      case "$W" in */ink/r3/once) rm -rf -- "$W/rmap";; *) return 1;; esac; mkdir -p $W/rmap
+      mv $W/res.chk $W/res.redo 2> /dev/null; rres=res.redo
+    else rres=; fi
+  fi
+  if [ -n "$rres" ] && [ -d $W/$rres ] && [ -n "$(ls $W/$rres)" ]; then r3pre $W/rmap "$g" $W/$rres/* || return 1; fi
   X $O/logs/r3once.log $U surf-resample --compose $O/ink/r3/up $W/rmap --suffix _$R3MODEL.tif || return 1
   rm -f $O/ink/r3/up/*_src.tif
-  log "r3once: $# wraps from the stripes' maps: $(grep -oE '[0-9]+ px resampled, [0-9]+ nonzero from the residual maps' $O/logs/r3once.log | tail -1)"
+  log "r3once: $(ls $W/dst | wc -l) wraps from the stripes' maps: $(grep -oE '[0-9]+ px resampled, [0-9]+ nonzero from the residual maps' $O/logs/r3once.log | tail -1)"
 }
 perwrap() {
   [ "$DRY" = 1 ] && { echo "    per wrap (largest first, SPAR ${SPAR:-4}, GPUs of FITGPUS in turn): tifxyz-scale -> flatten --gpu 1 -> tifxyz-scale --flip-rows 1 -> render (ink + CT)$([ "$INKMODE" = r3 ] && echo "; then ONE ink-ext over all rendered wraps (r3pre, --cache $O/ink/ct.cache: $R3W) -> per wrap r3ink.sh (CT >= $R3GATE gate)") -> ink-compare --then"; return 0; }
@@ -937,7 +965,7 @@ perwrap() {
   if [ "$INKMODE" = r3 ]; then   # the rendered wraps' ink in ONE ink-ext (r3pre, first GPU of FITGPUS), then the images in parallel
     local rw=(); for p in $O/r/*/.rendered; do [ -e "$p" ] && rw+=($O/up/$(basename $(dirname $p))); done
     if [ ${#rw[@]} -gt 0 ]; then
-      if r3once_ok; then r3once ${pg[0]} "${rw[@]}" || return 1; else r3pre $O/ink/r3/up ${pg[0]} "${rw[@]}" || return 1; fi
+      if r3once_ok "${rw[@]}"; then r3once ${pg[0]} || return 1; else r3pre $O/ink/r3/up ${pg[0]} "${rw[@]}" || return 1; fi
       unset pid; local -A pid; for p in "${rw[@]}"; do w=$(basename $p); while [ $(jobs -r | wc -l) -ge ${SPAR:-4} ]; do sleep 2; done
         pw_fin $w & pid[$w]=$!; done
       for w in "${!pid[@]}"; do wait ${pid[$w]} || { nf=$((nf + 1)); echo "perwrap: $w image FAILED ($O/r/$w/render.log)" >> $O/logs/perwrap.log; }; done; fi

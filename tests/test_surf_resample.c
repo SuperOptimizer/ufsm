@@ -6,6 +6,7 @@
    - pixels over the source hole are unsampled (<d>_src.tif 0), the rest sampled; a residual surface is written that covers the hole
      (+ its margin) and nothing far from it, and --compose fills exactly the unsampled pixels from a residual map (here f itself);
    - --edge-band: pixels near the switch between the two sources are unsampled and join the residual;
+   - --geom-only 1 (no maps): byte-identical residual surfaces to the full run, with and without --fill-gap, no output maps;
    - >= 95 % of the vertices project within 0.25 voxels (the log's histogram; the hole's rim is the rest). */
 #include "imgops.h"
 #include "tiffw.h"
@@ -101,6 +102,16 @@ int main(int argc, char **argv) {
         {   double sh = -1; snprintf(q, sizeof q, "%s/o%d.log", dir, band); FILE *f = fopen(q, "r"); char ln[2000];
             while (f && fgets(ln, sizeof ln, f)) { const char *t = strstr(ln, "4 voxels: "); if (t) sh = atof(t + 10); } if (f) fclose(f);
             CHECK(sh >= 0.95, "band %d: %.3f of the vertices within 0.25 voxels (expected >= 0.95; only the source hole's rim is farther)", band, sh); }
+        for (int fg = 0; fg < 2; fg++) {   /* --geom-only (the unroll's early residual, no maps): the same residual surfaces as the full run, no map written */
+            const char *fx = fg ? "4" : "0"; const char *ed = band ? " --edge-band 6" : "";
+            snprintf(cmd, sizeof cmd, "'%s' surf-resample '%s/src' '%s/maps' '%s/dst' '%s/f%d%d' --threads 2 --residual '%s/fres%d%d' --residual-margin 2 --band-margin 3 --fill-gap %s%s 2> '%s/f%d%d.log' && "
+                     "'%s' surf-resample '%s/src' - '%s/dst' '%s/g%d%d' --threads 3 --geom-only 1 --residual '%s/gres%d%d' --residual-margin 2 --band-margin 3 --fill-gap %s%s 2> '%s/g%d%d.log' && "
+                     "for x in x y z; do cmp -s '%s/fres%d%d/w000/'$x.tif '%s/gres%d%d/w000/'$x.tif || exit 1; done && cmp -s '%s/fres%d%d/w000/meta.json' '%s/gres%d%d/w000/meta.json' && [ ! -e '%s/g%d%d' ]",
+                     argv[1], dir, dir, dir, dir, band, fg, dir, band, fg, fx, ed, dir, band, fg,
+                     argv[1], dir, dir, dir, band, fg, dir, band, fg, fx, ed, dir, band, fg,
+                     dir, band, fg, dir, band, fg, dir, band, fg, dir, band, fg, dir, band, fg);
+            CHECK(!system(cmd), "band %d fill-gap %s: --geom-only residual differs from the full run's (or wrote maps): %s/gres%d%d vs fres%d%d", band, fx, dir, band, fg, band, fg);
+        }
         fprintf(stderr, "test_surf_resample: band %d: %zu px sampled (mean |d| vs f %.3f), %zu unsampled, the hole and the residual right\n", band, ns, ns ? sum / ns : 0, nu);
         free(m); free(s);
     }
