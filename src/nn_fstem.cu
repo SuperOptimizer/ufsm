@@ -61,7 +61,7 @@ __device__ inline float fs_pre(const float *W1, const float *b1, int c, const fl
 __device__ static const float FLW[4][3] = {{0.375f, 0.625f, 0.f}, {0.1875f, 0.75f, 0.0625f}, {0.0625f, 0.75f, 0.1875f}, {0.f, 0.625f, 0.375f}};   /* (nn_lat.cu LW) */
 enum { FSU_NC = FS_BT / 2 + 2 };
 struct fs_up { const void *lc; int d, h, w, q0, qd, side, base, f32; };   /* f32: lc holds fp32 cell logits (predict's fit path), else fp16 */
-__device__ __forceinline__ float fsu_ld(const fs_up &up, size_t i) { return up.f32 ? ((const float *)up.lc)[i] : __half2float(((const f16 *)up.lc)[i]); }   /* (= ldv / lat_shuf_k's (float) of either type) */
+/* LT: the cell logits' type (f16 for training's heads, float for predict's fit path); ldv / lat_shuf_k's (float) of either type */
 template <int RZ0, int RY0> __device__ __forceinline__ void fsu_q(const float (*v)[3], float *qo) {
 #pragma unroll
     for (int dz = 0; dz < 2; dz++) {
@@ -81,22 +81,24 @@ __device__ __forceinline__ void fsu_row(const float *qo, int bx, int cx0, f16 (*
 #pragma unroll
     for (int r = 0; r < 4; r++) {
         const float q[3] = {qo[r * FSU_NC + k0], qo[r * FSU_NC + k0 + 1], qo[r * FSU_NC + k0 + 2]};
-        if (bx & 1) fsu_x<2>(q, u[r]); else fsu_x<0>(q, u[r]);
+        const int rx = (bx & 1) * 2;   /* (no branch: odd and even lanes of a warp took fsu_x<2> / <0> one after the other) */
+#pragma unroll
+        for (int dx = 0; dx < 2; dx++) u[r][dx] = __float2half_rn(FLW[rx + dx][0] * q[0] + FLW[rx + dx][1] * q[1] + FLW[rx + dx][2] * q[2]);
     }
 }
-__device__ __forceinline__ void fsu_side(const fs_up &up, int ch, fs_tile t, int bx, f16 (*u)[2]) {   /* the side pair's sub-cell terms (lat_shuf_k) */
+template <typename LT> __device__ __forceinline__ void fsu_side(const fs_up &up, int ch, fs_tile t, int bx, f16 (*u)[2]) {   /* the side pair's sub-cell terms (lat_shuf_k) */
     const int js = ch - up.side; if (up.side < 0 || js < 0 || js > 1) return;
-    const size_t nc = (size_t)up.qd * up.h * up.w, cell = ((size_t)((t.bz >> 1) - up.q0) * up.h + (t.by >> 1)) * up.w + (bx >> 1);
-    const size_t s0 = (size_t)(up.base + 64 * js) * nc + cell;
+    const size_t nc = (size_t)up.qd * up.h * up.w; const int cell = (((t.bz >> 1) - up.q0) * up.h + (t.by >> 1)) * up.w + (bx >> 1);   /* (the cell inside a channel: 32-bit) */
+    const LT *s0 = (const LT *)up.lc + (size_t)(up.base + 64 * js) * nc + cell;
 #pragma unroll
     for (int r = 0; r < 4; r++)
 #pragma unroll
         for (int dx = 0; dx < 2; dx++) {
             const int sub = 16 * ((2 * t.bz + (r >> 1)) & 3) + 4 * ((2 * t.by + (r & 1)) & 3) + ((2 * bx + dx) & 3);
-            u[r][dx] = __float2half_rn(__half2float(u[r][dx]) + fsu_ld(up, s0 + (size_t)sub * nc));
+            u[r][dx] = __float2half_rn(__half2float(u[r][dx]) + ldv(s0, (size_t)sub * nc));
         }
 }
-template <bool UP>
+template <bool UP, typename LT = f16>
 __global__ void __launch_bounds__(FS_BT, UP ? 1 : 8) fstem_fwd_k(const f16 *__restrict__ x, int D, int H, int W, int z0, int nz, const float *__restrict__ p, int C, int nout, fs_chs chs, f16 *__restrict__ lg, size_t ns, fs_up up, int ws) {
     __shared__ __align__(16) float sp[FS_MAXC + FS_MAXO * FS_MAXC];   /* b1, W2 */
     __shared__ float rsc[FS_MAXC], rinv[FS_MAXC];   /* W1's row scales (fs_w1_exp) and their inverses */
@@ -115,15 +117,20 @@ __global__ void __launch_bounds__(FS_BT, UP ? 1 : 8) fstem_fwd_k(const f16 *__re
         const int cz = t.bz >> 1, cy = t.by >> 1, cx0 = t.bx0 >> 1, ncol = t.nj / 2 + 2, rz0 = (2 * t.bz) & 3, ry0 = (2 * t.by) & 3;
         const int iz[3] = {max(cz - 1, 0) - up.q0, cz - up.q0, min(cz + 1, up.d - 1) - up.q0}, iy[3] = {max(cy - 1, 0), cy, min(cy + 1, up.h - 1)};
         const size_t cv = (size_t)up.qd * up.h * up.w;
+        int ro[3][3];   /* (the 9 cell rows' offsets in a channel, once a block: 32-bit, qd h w < 2^31) */
+#pragma unroll
+        for (int a = 0; a < 3; a++)
+#pragma unroll
+            for (int b = 0; b < 3; b++) ro[a][b] = (iz[a] * up.h + iy[b]) * up.w;
         for (int k = tid; k < nout * ncol; k += blockDim.x) {
             const int o = k / ncol, col = k % ncol, ch = chs.c[o]; if (ch < 0) continue;
             const int cxs = min(max(cx0 - 1 + col, 0), up.w - 1);
-            const size_t l0 = (size_t)ch * cv;
+            const LT *l = (const LT *)up.lc + (size_t)ch * cv;
             float v[3][3];
 #pragma unroll
             for (int a = 0; a < 3; a++)
 #pragma unroll
-                for (int b = 0; b < 3; b++) v[a][b] = fsu_ld(up, l0 + ((size_t)iz[a] * up.h + iy[b]) * up.w + cxs);
+                for (int b = 0; b < 3; b++) v[a][b] = ldv(l, ro[a][b] + cxs);
             float *qo = qs + o * 4 * FSU_NC + col;
             if (rz0) { if (ry0) fsu_q<2, 2>(v, qo); else fsu_q<2, 0>(v, qo); } else { if (ry0) fsu_q<0, 2>(v, qo); else fsu_q<0, 0>(v, qo); }
         }
@@ -134,7 +141,7 @@ __global__ void __launch_bounds__(FS_BT, UP ? 1 : 8) fstem_fwd_k(const f16 *__re
             const size_t r0 = (size_t)(2 * t.bz - z0) * hw + (size_t)(2 * t.by) * W + 2 * bx;
             for (int o = 0; o < nout; o++) {
                 const int ch = chs.c[o]; if (ch < 0) continue;
-                f16 u[4][2]; fsu_row(qs + o * 4 * FSU_NC, bx, cx0, u); fsu_side(up, ch, t, bx, u);
+                f16 u[4][2]; fsu_row(qs + o * 4 * FSU_NC, bx, cx0, u); fsu_side<LT>(up, ch, t, bx, u);
                 __half2 *q0 = (__half2 *)(lg + (size_t)ch * ns + r0), *q1 = (__half2 *)((f16 *)q0 + W), *q2 = (__half2 *)((f16 *)q0 + hw), *q3 = (__half2 *)((f16 *)q2 + W);
                 *q0 = __halves2half2(u[0][0], u[0][1]); *q1 = __halves2half2(u[1][0], u[1][1]); *q2 = __halves2half2(u[2][0], u[2][1]); *q3 = __halves2half2(u[3][0], u[3][1]);
             }
@@ -193,7 +200,7 @@ __global__ void __launch_bounds__(FS_BT, UP ? 1 : 8) fstem_fwd_k(const f16 *__re
             __half2 *q0 = (__half2 *)(lg + (size_t)chs.c[o] * ns + r0), *q1 = (__half2 *)((f16 *)q0 + W), *q2 = (__half2 *)((f16 *)q0 + hw), *q3 = (__half2 *)((f16 *)q2 + W);
             __half2 o0, o1, o2, o3;
             if constexpr (UP) {
-                f16 u[4][2]; fsu_row(qs + o * 4 * FSU_NC, bx, t.bx0 >> 1, u); fsu_side(up, chs.c[o], t, bx, u);
+                f16 u[4][2]; fsu_row(qs + o * 4 * FSU_NC, bx, t.bx0 >> 1, u); fsu_side<LT>(up, chs.c[o], t, bx, u);
                 o0 = __halves2half2(u[0][0], u[0][1]); o1 = __halves2half2(u[1][0], u[1][1]); o2 = __halves2half2(u[2][0], u[2][1]); o3 = __halves2half2(u[3][0], u[3][1]);
             } else { o0 = *q0; o1 = *q1; o2 = *q2; o3 = *q3; }   /* (x pairs: 4-byte aligned, W even) */
             *q0 = __floats2half2_rn(__low2float(o0) + v, __high2float(o0) + v); *q1 = __floats2half2_rn(__low2float(o1) + v, __high2float(o1) + v);
@@ -341,11 +348,15 @@ extern "C" int nn_fstem_fwd(const void *x, int D, int H, int W, int z0, int nz, 
 }
 extern "C" int nn_fstem_up_fwd_t(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns,
                                  const void *lc, int lh16, int q0, int qd, int side, int base) {
+    if ((size_t)qd * (H / 4) * (W / 4) >= (size_t)1 << 31) return 1;   /* (the kernel's in-channel cell offsets are 32-bit) */
     if (!(C == 0 ? nout >= 1 && nout <= FS_MAXO && !(H & 3) && !(W & 3) : fs_ok(D, H, W, z0, nz, C, nout)) || (D & 3) || (H & 3) || (W & 3) || (z0 & 3) || (nz & 3)) return 1;
     const int d = D / 4, h = H / 4, w = W / 4;
     const int lo = max(z0 / 4 - 1, 0), hi = min((z0 + nz) / 4, d - 1); if (lo < q0 || hi >= q0 + qd) return 1;   /* (the cell planes the taps read lie in [q0, q0 + qd)) */
     const size_t nt = (size_t)(nz / 2) * (H / 2) * ((W / 2 + FS_BT - 1) / FS_BT); if (!nt) return 0;
-    fstem_fwd_k<true><<<(unsigned)nt, FS_BT, sizeof(float) * 4 * FSU_NC * (size_t)nout>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns, fs_up{lc, d, h, w, q0, qd, side, base, !lh16}, nn_fstem_wscale()); KCHECK();
+    const fs_up u{lc, d, h, w, q0, qd, side, base, !lh16}; const size_t sm = sizeof(float) * 4 * FSU_NC * (size_t)nout;
+    if (lh16) fstem_fwd_k<true, f16><<<(unsigned)nt, FS_BT, sm>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns, u, nn_fstem_wscale());
+    else fstem_fwd_k<true, float><<<(unsigned)nt, FS_BT, sm>>>((const f16 *)x, D, H, W, z0, nz, p, C, nout, fs_list(chs, nout), (f16 *)lg, ns, u, nn_fstem_wscale());
+    KCHECK();
     return 0;
 }
 extern "C" int nn_fstem_up_fwd(const void *x, int D, int H, int W, int z0, int nz, const float *p, int C, int nout, const int *chs, void *lg, size_t ns,
