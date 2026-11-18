@@ -4,6 +4,7 @@
    read, row, column within the tile, a, b) = the CPU's walk order; pass 2 sets bit 63 where a sample's code is more than 4 codes from the
    winner's; then 0 (no sample) / 255 (conflict) / the winner's code. */
 #include "meshcodesgpu.h"
+#include "blksync.cuh"   /* (the sampler threads' waits sleep: blk_sync) */
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,6 +103,6 @@ extern "C" int mesh_codes_gpu_stamp(const mcg_tile *t, int nt, const float *xyz,
         MG_CK(cudaGetLastError());
         MG_CK(cudaMemcpyAsync(out + (size_t)z0 * plane, dout, nvox, cudaMemcpyDeviceToHost, x->st));
     }
-    MG_CK(cudaStreamSynchronize(x->st));
+    MG_CK(blk_sync(x->st));
     return 0;
 }

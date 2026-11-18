@@ -5,6 +5,7 @@
    so every q step is one coalesced row), the lower envelope in global scratch laid out [q][line], in chunks of lines. Pair kernel:
    one thread per voxel. */
 #include <cuda_runtime.h>
+#include "blksync.cuh"   /* (the sampler threads' waits sleep: blk_sync) */
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -292,7 +293,7 @@ static int bg_run(bg_ctx &G, const uint8_t *codes, const int n[3], float rmax, u
     if (bg_fields(G, n, rmax, tim ? ev : nullptr)) return -1;
     BG_CK(cudaMemcpyAsync(phase, G.phase, N, cudaMemcpyDeviceToHost, G.st));
     if (tim) cudaEventRecord(ev[5], G.st);
-    BG_CK(cudaStreamSynchronize(G.st));
+    BG_CK(blk_sync(G.st));
     if (tim) { float t[5]; for (int k = 0; k < 5; k++) cudaEventElapsedTime(&t[k], ev[k], ev[k + 1]);
         fprintf(stderr, "band gpu: %ldx%ldx%ld: H2D %.1f ms, parity 0 %.1f, parity 1 %.1f, pair %.1f, D2H %.1f\n", nz, ny, nx, t[0], t[1], t[2], t[3], t[4]);
         for (int k = 0; k < 6; k++) cudaEventDestroy(ev[k]); }
@@ -447,7 +448,7 @@ static int bg_codes_run(bg_ctx &G, const bg_lchunk *ch, int nch, const uint8_t *
             k_codes_pool2<<<(unsigned)((CN + 255) / 256), 256, 0, G.st>>>(src, (int)cz, (int)cy, (int)cx, dst);
         }
         if (pool) BG_CK(cudaGetLastError());
-        if (m0 > 0) { BG_CK(cudaStreamSynchronize(G.st)); for (long q = 0; q < m0 * 32; q++) if (!G.hstatus[q]) ok = 0; }
+        if (m0 > 0) { BG_CK(blk_sync(G.st)); for (long q = 0; q < m0 * 32; q++) if (!G.hstatus[q]) ok = 0; }
         z0 += sz;
     }
     if (tim) cudaEventRecord(ev[1], G.st);
@@ -458,7 +459,7 @@ static int bg_codes_run(bg_ctx &G, const bg_lchunk *ch, int nch, const uint8_t *
     P.dstPtr = make_cudaPitchedPtr(out, (size_t)cn[2], (size_t)cn[2], (size_t)cn[1]); P.extent = make_cudaExtent((size_t)cn[2], (size_t)cn[1], (size_t)cn[0]); P.kind = cudaMemcpyDeviceToHost;
     BG_CK(cudaMemcpy3DAsync(&P, G.st));
     if (tim) cudaEventRecord(ev[5], G.st);
-    BG_CK(cudaStreamSynchronize(G.st));
+    BG_CK(blk_sync(G.st));
     if (tim) { float t[5]; for (int k = 0; k < 5; k++) cudaEventElapsedTime(&t[k], ev[k], ev[k + 1]);
         fprintf(stderr, "band gpu codes: %ldx%ldx%ld (pool %d), %d chunks: decode %.1f ms, parity 0 %.1f, parity 1 %.1f, pair %.1f, crop D2H %.1f\n", nz, ny, nx, pool, nch, t[0], t[1], t[2], t[3], t[4]);
         for (int k = 0; k < 6; k++) cudaEventDestroy(ev[k]); }

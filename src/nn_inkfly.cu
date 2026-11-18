@@ -13,6 +13,7 @@
    training card without a bound; a cudaStreamCreate ran out of memory at start-up and switched the GPU path off for good, and the
    trainer died at step 450 with an unknown CUDA error at its next check.) */
 #include <cuda_runtime.h>
+#include "blksync.cuh"   /* (the sampler threads' waits sleep: blk_sync) */
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -222,7 +223,7 @@ extern "C" int inkfly_gpu_near(const ifg_unit *U, int nu, const ifg_cfg *cf, int
             IG_CK(cudaGetLastError());
             ol += l; om += h->msk ? l : 0; ot += h->ntiles; op += p; orr += (size_t)h->ntiles * TS * TS;
         }
-        IG_CK(cudaMemcpyAsync(hs, ds, sizeof *hs, cudaMemcpyDeviceToHost, x->st)); IG_CK(cudaStreamSynchronize(x->st));
+        IG_CK(cudaMemcpyAsync(hs, ds, sizeof *hs, cudaMemcpyDeviceToHost, x->st)); IG_CK(blk_sync(x->st));
         if (hs->bad) { rc = 1; goto out; }
         uint64_t s = 0; for (int i = 0; i < nu; i++) s += hs->cnt[i];
         *nnear = s; for (int d = 0; d < 3; d++) { lo[d] = hs->bb[d]; hi[d] = hs->bb[3 + d]; }
@@ -252,7 +253,7 @@ extern "C" int inkfly_gpu_finish(const ifg_cfg *cf, const uint8_t *ctb, const in
         }
         IG_CK(cudaMemcpyAsync(hb, &ds->nonempty, 2 * sizeof(int), cudaMemcpyDeviceToHost, x->st));
         IG_CK(cudaMemcpyAsync(out, dout, cv, cudaMemcpyDeviceToHost, x->st));
-        IG_CK(cudaStreamSynchronize(x->st));
+        IG_CK(blk_sync(x->st));
         if (hb[1]) { rc = 1; goto out; }
         *nonempty = hb[0];
     }

@@ -5,6 +5,7 @@
    dz^2 + dy^2 + dx^2 rounds as gcc -std=c23's (no contraction), sqrt is IEEE, so the codes are the CPU's. One context (device buffers
    grown on demand) behind a mutex: the sampler's workers take turns. */
 #include <cuda_runtime.h>
+#include "blksync.cuh"   /* (the sampler threads' waits sleep: blk_sync) */
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -174,7 +175,7 @@ extern "C" int fibre_gpu_box(const fr_step *st, long nst, const int64_t so[3], c
         const size_t tmpb = fsc_tmp_bytes(NB + 1);
         if (grow(5, tmpb)) { rc = -1; goto out; }
         FG_CK(fsc_exclusive_sum(g_buf[5], cnt, off, NB + 1, g_st));
-        int32_t tot32 = 0; FG_CK(cudaMemcpyAsync(&tot32, off + NB, 4, cudaMemcpyDeviceToHost, g_st)); FG_CK(cudaStreamSynchronize(g_st)); tot = tot32;
+        int32_t tot32 = 0; FG_CK(cudaMemcpyAsync(&tot32, off + NB, 4, cudaMemcpyDeviceToHost, g_st)); FG_CK(blk_sync(g_st)); tot = tot32;
         if (tot32 < 0) { rc = -1; goto out; }
         if (grow(2, (size_t)(tot ? tot : 1) * 4)) { rc = -1; goto out; }
         FG_CK(cudaMemsetAsync(cnt, 0, (size_t)(NB + 1) * 4, g_st));
@@ -192,7 +193,7 @@ extern "C" int fibre_gpu_box(const fr_step *st, long nst, const int64_t so[3], c
         if (tm) { cudaEventRecord(e1, g_st); FG_CK(cudaStreamSynchronize(g_st)); float km = 0; cudaEventElapsedTime(&km, e0, e1); cudaEventDestroy(e0); cudaEventDestroy(e1);
             fprintf(stderr, "  fibre gpu: %ld steps in the box, %ld bin entries, %.0f ms bins, %.0f ms H2D + kernel (kernel %.1f ms)\n", ns, tot, (tb - t00) * 1e3, (fg_t() - tb) * 1e3, km); }
         FG_CK(cudaMemcpyAsync(o0, d0, nv, cudaMemcpyDeviceToHost, g_st)); FG_CK(cudaMemcpyAsync(o1, d1, nv, cudaMemcpyDeviceToHost, g_st));   /* (o0 / o1 pinned: fibre_gpu_host_alloc) */
-        FG_CK(cudaStreamSynchronize(g_st));
+        FG_CK(blk_sync(g_st));
     }
 out:
     pthread_mutex_unlock(&g_mu);
