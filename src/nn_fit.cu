@@ -845,9 +845,62 @@ __global__ void fit_pool_k(const uint8_t *__restrict__ dfield, int D, int H, int
     const unsigned m = __ballot_sync(0xffffffffu, v[9] != 0);
     if ((threadIdx.x & 31) == 0 && m) atomicAdd(cnt_, (unsigned long long)__popc(m));
 }
+/* the same sums from tables (2026-11-18): every per-voxel term is a function of byte values only, so wi = w / 255, wi v (the six t planes) and
+   the spacing term 8 wi / (h sp) are looked up in tables built with the same __d*_rn operations (the same doubles), leaving only the __dadd_rn
+   chains in the original order: byte-identical planes. fit_pool_k was fp64-bound (two __ddiv_rn and eight __dmul_rn a voxel at 1/64 rate:
+   57 ms a launch on a 96 x 1568 x 1616 slab of h 2). tab: [256] wi, [256][256] wi v, [256][256] the spacing term */
+__global__ void fit_pool_tab_k(double h, double *tab) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= 65536) return;
+    const int wv = i >> 8, v = i & 255; const double wi = __ddiv_rn((double)wv, 255.0);
+    if (v == 0) tab[wv] = wi;
+    tab[256 + i] = __dmul_rn(wi, (double)v);
+    tab[256 + 65536 + i] = v ? __ddiv_rn(__dmul_rn(wi, 8.0), __dmul_rn(h, (double)v)) : 0.0;
+}
+__global__ void __launch_bounds__(256) fit_pool_t_k(const uint8_t *__restrict__ dfield, int D, int H, int W, double h, int fp, int pD, int pH, int pW, const double *__restrict__ tab,
+                                                    uint8_t *__restrict__ out, unsigned long long *cnt_) {
+    __shared__ double swi[256];
+    for (int k = threadIdx.x; k < 256; k += blockDim.x) swi[k] = tab[k];
+    __syncthreads();
+    const double *tp = tab + 256, *tr = tab + 256 + 65536;
+    const size_t np = (size_t)pD * pH * pW, o = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    uint8_t v[10] = {128, 128, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (o < np) {
+        const size_t n = (size_t)D * H * W; const int x = (int)(o % pW), y = (int)((o / pW) % pH), z = (int)(o / ((size_t)pW * pH));
+        const uint8_t *w = dfield + 9 * n, *sp = dfield + 8 * n;
+        double sw = 0, st[6] = {0, 0, 0, 0, 0, 0}, srho = 0, swr = 0; int cnt = 0;
+        const int na = min(fp, D - z * fp), nb = min(fp, H - y * fp), ne = min(fp, W - x * fp);
+        for (int a = 0; a < na; a++) for (int b = 0; b < nb; b++) {
+            const size_t r = ((size_t)(z * fp + a) * H + y * fp + b) * W + x * fp; cnt += ne;
+            for (int e = 0; e < ne; e++) {
+                const size_t i = r + e; const unsigned wv = w[i];
+                if (!wv) continue;
+                const double wi = swi[wv]; sw = __dadd_rn(sw, wi);
+#pragma unroll
+                for (int k = 0; k < 6; k++) st[k] = __dadd_rn(st[k], tp[(wv << 8) | dfield[(size_t)(2 + k) * n + i]]);
+                const unsigned s8 = sp[i];
+                if (s8) { srho = __dadd_rn(srho, tr[(wv << 8) | s8]); swr = __dadd_rn(swr, wi); }
+            }
+        }
+        if (sw > 0) {
+            v[9] = (uint8_t)llround(__ddiv_rn(__dmul_rn(255.0, sw), (double)cnt));
+            for (int k = 0; k < 6; k++) v[2 + k] = (uint8_t)llround(__ddiv_rn(st[k], sw));
+            if (swr > 0) { const double r = __ddiv_rn(8.0, __dmul_rn(__dmul_rn(h, (double)fp), __ddiv_rn(srho, swr))); v[8] = (uint8_t)(r < 1 ? 1 : r > 255 ? 255 : llround(r)); }
+        }
+        for (int k = 0; k < 10; k++) out[(size_t)k * np + o] = v[k];
+    }
+    const unsigned m = __ballot_sync(0xffffffffu, v[9] != 0);
+    if ((threadIdx.x & 31) == 0 && m) atomicAdd(cnt_, (unsigned long long)__popc(m));
+}
+static int g_pool_t = -1;   /* mgpu: env / test config (UFSM_FIT_POOLT=0: fit_pool_k, the per-voxel divisions) */
+extern "C" void nn_fit_set_pool_t(int v) { g_pool_t = v; }
 extern "C" void nn_fit_pool(const uint8_t *dfield, int D, int H, int W, double h, int fp, uint8_t *out, unsigned long long *cnt) {
     const int pD = (D + fp - 1) / fp, pH = (H + fp - 1) / fp, pW = (W + fp - 1) / fp; const size_t np = (size_t)pD * pH * pW;
-    fit_pool_k<<<nblk(np, 256), 256>>>(dfield, D, H, W, h, fp, pD, pH, pW, out, cnt); KCHECK();
+    if (g_pool_t < 0) g_pool_t = getenv("UFSM_FIT_POOLT") ? atoi(getenv("UFSM_FIT_POOLT")) : 1;
+    double *tab = g_pool_t ? (double *)nn_malloc_try((256 + 2 * 65536) * sizeof(double)) : nullptr;
+    if (!tab) { fit_pool_k<<<nblk(np, 256), 256>>>(dfield, D, H, W, h, fp, pD, pH, pW, out, cnt); KCHECK(); return; }
+    fit_pool_tab_k<<<256, 256>>>(h, tab);
+    fit_pool_t_k<<<nblk(np, 256), 256>>>(dfield, D, H, W, h, fp, pD, pH, pW, tab, out, cnt); KCHECK();
+    nn_free(tab);
 }
 
 /* analytic data terms (nn_fit_loss2): one evaluation per voxel (src/fit_terms.h fit_vox2) */
@@ -857,28 +910,29 @@ __global__ void fit_loss2_k(fit_dev f, long long *pi, long long *gi) {   /* (fix
     const size_t n = (size_t)f.D * f.H * f.W, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     const float wv = i < n && (f.stride <= 1 || fit_hash((unsigned)fit_box_index(&f, i) ^ f.salt) % (unsigned)f.stride == 0) ? f.w[i] * (1.f / 255.f) : 0.f;
     if (wv > 0.f) {
-        size_t ic[FIT_VOX2_MAXC]; float gv[FIT_VOX2_MAXC];
-        const int nc = fit_vox2(&f, i, wv, (float)(f.stride > 1 ? f.stride : 1), lp, ic, gv);
-        for (int c = 0; c < nc; c++) if (gv[c] != 0.f) fit_gadd(gi, ic[c], gv[c]);
+        fit_vox2(&f, i, wv, (float)(f.stride > 1 ? f.stride : 1), lp, nullptr, nullptr, gi);   /* (the corner gradients into gi from inside) */
         for (int q = 0; q < FIT_NPARTS; q++) lq[q] = fit_pfix(lp[q]);
     }
     fit_reduce_parts_fix(lq, red, pi);
 }
 __global__ void fit_loss2_list_k(fit_dev f, const unsigned *list, const unsigned *count, unsigned cap, long long *pi, long long *gi) {
     __shared__ long long red[FIT_NPARTS][FIT_TPB];
-    long long lp[FIT_NPARTS] = {0};   /* (per voxel in fixed point: the list order does not matter) */
+    /* the per-thread fixed-point parts accumulate in the thread's own column of red (per voxel in fixed point: the list order does not
+       matter), not in 11 registers pairs live across the loop: the kernel sat at the 128-register cap and spilled (ncu 2026-11-18) */
+    for (int q = 0; q < FIT_NPARTS; q++) red[q][threadIdx.x] = 0;
     const unsigned nc = min(*count, cap);
     const float sc = (float)f.stride;
     for (unsigned k = blockIdx.x * blockDim.x + threadIdx.x; k < nc; k += gridDim.x * blockDim.x) {
         const size_t i = list[k];
         const float wv = f.w[i] * (1.f / 255.f);
         double vp[FIT_NPARTS] = {0};
-        size_t ic[FIT_VOX2_MAXC]; float gv[FIT_VOX2_MAXC];
-        const int ncr = fit_vox2(&f, i, wv, sc, vp, ic, gv);
-        for (int c = 0; c < ncr; c++) if (gv[c] != 0.f) fit_gadd(gi, ic[c], gv[c]);
-        for (int q = 0; q < FIT_NPARTS; q++) lp[q] += fit_pfix(vp[q]);
+        fit_vox2(&f, i, wv, sc, vp, nullptr, nullptr, gi);   /* (the corner gradients into gi from inside) */
+#pragma unroll
+        for (int q = 0; q < FIT_NPARTS; q++) if (vp[q] != 0.0) red[q][threadIdx.x] += fit_pfix(vp[q]);
     }
-    fit_reduce_parts_fix(lp, red, pi);
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) for (int k = 0; k < FIT_NPARTS; k++) red[k][threadIdx.x] += red[k][threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) for (int k = 0; k < FIT_NPARTS; k++) if (k != FIT_P_SMOOTH && red[k][0] != 0) atomicAdd((unsigned long long *)&pi[k], (unsigned long long)red[k][0]);
 }
 /* Minibatch steps (stride > 1): the step's voxels (hash(i ^ salt) % stride == 0, material) are first listed (warp-aggregated appends),
    then evaluated by a grid-stride kernel over the list (fit_loss2_list_k; fit_loss2_k's thread per voxel of the slab was 60-100 ms a

@@ -1840,7 +1840,7 @@ static void cpu_loss_run(void *ctx, int t0_, int t1_, int t) {
             const size_t u = J->stride > 1 ? b * J->stride + fit_hash((unsigned)b ^ f->salt) % (unsigned)J->stride : b; size_t i;   /* (u: a box cell) */
             if (u >= n || !fit_crop_index(f, u, &i) || !f->w[i]) continue;
             size_t ic[FIT_VOX2_MAXC]; float gv[FIT_VOX2_MAXC];
-            const int nc = fit_vox2(f, i, f->w[i] * (1.f / 255.f), sc, lp, ic, gv);
+            const int nc = fit_vox2(f, i, f->w[i] * (1.f / 255.f), sc, lp, ic, gv, nullptr);
             for (int c = 0; c < nc; c++) pg[ic[c] - base] += gv[c];
         }
     }

@@ -333,6 +333,7 @@ void fit_stream_free(fit_stream *s);
    the 10 device planes out (back to back, pooled box ceil(D / fp) x ceil(H / fp) x ceil(W / fp)), byte-identical to the host pooling, and
    the count of its cells with material added to the device counter *cnt (src/nn_fit.cu; asynchronous) */
 void nn_fit_pool(const uint8_t *dfield, int D, int H, int W, double h, int fp, uint8_t *out, unsigned long long *cnt);
+void nn_fit_set_pool_t(int v);   /* tests: nn_fit_pool from tables (1, default) or with per-voxel divisions (0); -1: env UFSM_FIT_POOLT */
 /* host -> device uploads on a thread through pinned staging (src/nn_fit.cu): put queues a copy of the pageable range src (job id
    returned), wait blocks until that job's source has been read (reusable), close until every job is on the device, and frees */
 typedef struct nn_fit_up nn_fit_up;

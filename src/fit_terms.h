@@ -190,7 +190,18 @@ FIT_HD size_t fit_box_cells(const fit_dev *f) { return (size_t)f->D * (f->H0 ? f
    corners (indices ic, values gv: the voxel's 8, then with the winding mod 4 term 8 more per axis for its second points); returns
    the number of corners (0 inside the core: no terms) */
 #define FIT_VOX2_MAXC 32
-FIT_HD int fit_vox2(const fit_dev *f, size_t i, float wv, float sc, double lp[FIT_NPARTS], size_t ic[FIT_VOX2_MAXC], float gv[FIT_VOX2_MAXC]) {
+/* the device pass (2026-11-18): the corner gradients go straight into the fixed-point accumulator gi as they are known (fit_gadd's
+   conversion and constant; integer sums: any order, the same bits), not through ic / gv: the kernels' 32-entry ic / gv arrays, indexed by
+   a run-time count, lived in local memory (45 % of fit_loss2_list_k's L1 sectors, ncu). The host pass (gi unused) fills ic / gv as before. */
+#ifdef __CUDA_ARCH__
+#define FIT_V2_EMIT(k, v) do { const float v_ = (v); if (v_ != 0.f) atomicAdd((unsigned long long *)&gi[k], (unsigned long long)__double2ll_rn((double)v_ * 1125899906842624.0)); } while (0)
+#endif
+FIT_HD int fit_vox2(const fit_dev *f, size_t i, float wv, float sc, double lp[FIT_NPARTS], size_t ic_[FIT_VOX2_MAXC], float gv[FIT_VOX2_MAXC], long long *gi) {
+#ifdef __CUDA_ARCH__
+    size_t ic[8]; (void)ic_; (void)gv;
+#else
+    size_t *ic = ic_; (void)gi;
+#endif
     const int z = (int)(i / ((size_t)f->H * f->W)), y = (int)((i / f->W) % f->H) + f->oy, x = (int)(i % f->W) + f->ox;   /* (box cell: the crop's offset) */
     const float pz = (z + 0.5f) * f->h, py = (y + 0.5f) * f->h, px = (x + 0.5f) * f->h;
     /* axis and its z slope */
@@ -236,18 +247,31 @@ FIT_HD int fit_vox2(const fit_dev *f, size_t i, float wv, float sc, double lp[FI
         const float qc = f->wd[3 * n + i] * (1.f / 255.f), cc = f->w_w4 * wv * qc * sc, U0 = r / pit + off + del, kq = 1.5707963267948966f;
         for (int a = 0; a < 3; a++) {
             float th1, wc1[8];
-            const float U1 = fit_U_at(f, pz + (a == 0 ? f->w4_d : 0.f), py + (a == 1 ? f->w4_d : 0.f), px + (a == 2 ? f->w4_d : 0.f), &th1, ic + nc, wc1);
+#ifdef __CUDA_ARCH__
+            size_t ic1[8];
+#else
+            size_t *ic1 = ic + nc;
+#endif
+            const float U1 = fit_U_at(f, pz + (a == 0 ? f->w4_d : 0.f), py + (a == 1 ? f->w4_d : 0.f), px + (a == 2 ? f->w4_d : 0.f), &th1, ic1, wc1);
             const float dWm = (U1 - U0) - sdir * fit_wrap_pi(th1 - th) * i2p, dl = (float)f->wd[a * n + i] * (1.f / 64.f);
             float sa, ca; sincosf(kq * (dWm - dl), &sa, &ca);
             lp[FIT_P_WIND4] += cc * (1.f - ca);
             const float gW = cc * kq * sa;   /* dL / dW(x + d e_a); dL / dW(x) = -gW */
             dW -= gW;
+#ifdef __CUDA_ARCH__
+            for (int c = 0; c < 8; c++) FIT_V2_EMIT(ic1[c], gW * wc1[c]);
+#else
             for (int c = 0; c < 8; c++) gv[nc + c] = gW * wc1[c];
+#endif
             nc += 8;
         }
     }
     lp[FIT_P_TOTAL] = lp[FIT_P_PHASE] + lp[FIT_P_NORMAL] + lp[FIT_P_DENSITY] + lp[FIT_P_NONDEG] + lp[FIT_P_PGRAD] + lp[FIT_P_WIND4] + lp[FIT_P_RECTO]
                     + lp[FIT_P_CT] + lp[FIT_P_CSPACE];
+#ifdef __CUDA_ARCH__
+    for (int c = 0; c < 8; c++) FIT_V2_EMIT(ic[c], dW * wc[c] + dg[0] * gw[c][0] + dg[1] * gw[c][1] + dg[2] * gw[c][2]);
+#else
     for (int c = 0; c < 8; c++) gv[c] = dW * wc[c] + dg[0] * gw[c][0] + dg[1] * gw[c][1] + dg[2] * gw[c][2];
+#endif
     return nc;
 }

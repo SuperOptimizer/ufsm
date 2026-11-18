@@ -278,7 +278,7 @@ static int run_case(int dir) {
             for (size_t i = 0; i < n; i++) {
                 if (fit_hash((unsigned)i ^ fs.salt) % (unsigned)st || !w[i]) continue;
                 double lp[FIT_NPARTS] = {0}; size_t ic[FIT_VOX2_MAXC]; float gv[FIT_VOX2_MAXC];
-                const int nc = fit_vox2(&fs, i, w[i] * (1.f / 255.f), (float)st, lp, ic, gv); nsel++;
+                const int nc = fit_vox2(&fs, i, w[i] * (1.f / 255.f), (float)st, lp, ic, gv, nullptr); nsel++;
                 for (int q = 0; q < FIT_NPARTS; q++) ps_h[q] += lp[q];
                 for (int q = 0; q < nc; q++) gr[ic[q]] += gv[q];
             }
@@ -493,6 +493,26 @@ static void zarr_substream_case(void) {
     }
     char cmd[1500]; snprintf(cmd, sizeof cmd, "rm -rf -- '%s'", td); if (system(cmd)) {}
 }
+/* nn_fit_pool from tables (fit_pool_t_k) against the per-voxel divisions (fit_pool_k): pooled planes and counts byte for byte */
+static void pool_tab_case(void) {
+    const int D = 21, H = 37, W = 45; const size_t n = (size_t)D * H * W; uint8_t *f = malloc(10 * n); uint64_t s = 7;
+    for (size_t i = 0; i < 10 * n; i++) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; f[i] = (uint8_t)(s >> 40); }
+    for (size_t i = 0; i < n; i++) { if (f[9 * n + i] < 70) f[9 * n + i] = 0; if (f[8 * n + i] < 50) f[8 * n + i] = 0; }   /* (holes in w and sp) */
+    uint8_t *d = nn_malloc(10 * n); nn_h2d(d, f, 10 * n);
+    const int fps[3] = {2, 5, 8}; const double hs[2] = {2.0, 1.7};
+    for (int q = 0; q < 3; q++) for (int k = 0; k < 2; k++) {
+        const int fp = fps[q]; const size_t np = (size_t)((D + fp - 1) / fp) * ((H + fp - 1) / fp) * ((W + fp - 1) / fp);
+        uint8_t *o[2], *ho[2]; unsigned long long *c[2], hc[2];
+        for (int t = 0; t < 2; t++) {
+            o[t] = nn_malloc(10 * np); c[t] = nn_malloc(8); nn_zero(c[t], 8); nn_fit_set_pool_t(t);
+            nn_fit_pool(d, D, H, W, hs[k], fp, o[t], c[t]); nn_sync(); ho[t] = malloc(10 * np); nn_d2h(ho[t], o[t], 10 * np); nn_d2h(&hc[t], c[t], 8);
+        }
+        CHECK(memcmp(ho[0], ho[1], 10 * np) == 0 && hc[0] == hc[1], "fit_pool from tables differs from the divisions (fp %d, h %g)", fp, hs[k]);
+        for (int t = 0; t < 2; t++) { nn_free(o[t]); nn_free(c[t]); free(ho[t]); }
+    }
+    nn_fit_set_pool_t(-1); nn_free(d); free(f);
+    printf("fit_pool from tables: byte-identical to the per-voxel divisions (3 pool factors x 2 cell sizes)\n");
+}
 int main(void) {
     g_quick = getenv("UFSM_TEST_QUICK") && atoi(getenv("UFSM_TEST_QUICK"));
     if (getenv("FIT_CPU_ONLY")) {   /* (no GPU: the CPU backend's plain case alone, with its crop and huge-page checks) */
@@ -504,6 +524,7 @@ int main(void) {
     /* UFSM_TEST_PART=K/9 (tests/test_part.h): the cases below in 9 shards of 4-9 s (67 s whole on the pod, UFSM_TEST_QUICK); each case
        sets the globals it runs with, so a shard gives the same results as the whole sequence */
     TEST_PART(0) zarr_substream_case();
+    TEST_PART(0) pool_tab_case();
     TEST_PART(0) {   /* fit_unhash inverts fit_hash on every 32-bit word (the GPU minibatch selection enumerates the hashes) */
         const unsigned long long dx = g_quick ? 61 : 1;   /* (make test: every 61st word) */
         unsigned long long nbad = 0; for (unsigned long long x = 0; x < (1ull << 32); x += dx) nbad += fit_unhash(fit_hash((unsigned)x)) != (unsigned)x;

@@ -6,6 +6,27 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Slab-fit kernels, step 1: fit_pool from tables, fit_loss2_list_k without its local arrays (2026-11-18, branch convkfit-20261118)
+
+fp4teach profiled one slab fit: s026 of the desk 1667 u1 fields, 96 x 1568 x 1616 at h 2 cropped to the material, with unroll.sh's fit line.
+With 3 lanes the slab stage is GPU-bound, so its kernels map about 1:1 to slab-stage time. Actual per-fit totals: fit_loss2_list_k 747 ms
+(1000 launches), the phase gate 300 ms (k_pg_gate / rates / boxx), the selection 284 ms (fit_select_inv_k / fit_select_k), fit_pool_k 116 ms.
+- fit_pool_k was fp64-bound: two __ddiv_rn and eight __dmul_rn a voxel, at the 5060 Ti's 1/64 fp64 rate, one thread per pooled cell
+  walking ~8000 voxels. Every per-voxel term depends only on byte values: wi = w / 255, wi x (each t plane value), and
+  8 wi / (h sp). So fit_pool_t_k looks them up in tables built per call with the same __d*_rn operations (fit_pool_tab_k: 256 +
+  2 x 65536 doubles) and keeps only the __dadd_rn chains, in the original order. 115.8 -> 35.0 ms a fit; planes byte-identical
+  (test_fit pool_tab_case: 3 pool factors x 2 cell sizes, holes in w and sp). UFSM_FIT_POOLT=0: the old kernel.
+- fit_loss2_list_k: ncu showed 127 registers, 33 % occupancy, 0.58 IPC, and 45 % of the L1 sectors local memory. Two changes:
+  - On the device, fit_vox2 adds its corner gradients to the fixed-point accumulator as each one is known (fit_gadd's conversion),
+    instead of handing back the 32-entry ic / gv arrays the kernels indexed by a run-time count. The host pass (fit.c, the CPU
+    backend) still fills ic / gv.
+  - The per-thread fixed-point loss parts accumulate in the thread's own column of the shared reduction buffer, instead of 11
+    long longs live across the grid-stride loop.
+  127 -> 96 registers; ncu on the same launch (#300, interleaved): 314-333 -> 281-284 us. The remaining local traffic is the
+  trilinear corner loop's arrays, which mcc keeps rolled. Unrolling it (a plain #pragma unroll; mcc drops _Pragma in a macro) removed
+  every LDL / STL but took 168 registers and 16 % occupancy: 330 us. With __launch_bounds__ 2 (128 regs): 277-288 us, no better. Not kept.
+All the sums are integers or the same double chains: the slab fit's delta.f32 / axis.f32 / model.json are byte-identical to master.
+
 ## Memory audit: where host / device memory goes per phase; count-field's ref reads shard pieces, 28.2 -> 8.1 GB at the same model bytes (2026-11-18, branch memopt-20261118)
 
 **The table** (measured 11-18; try9 = scratch2 on the desk, one card; unroll = PHerc1667, the 11-17 run and the 11-18 q2 desk run;
