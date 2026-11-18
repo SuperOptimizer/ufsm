@@ -6,6 +6,48 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Unroll ink path: residual geometry early, faster surf-resample, check side by side; pod setup (2026-11-18, branch r3geom-20261118, unrollperf)
+
+In the pod q2 1667 timeline, perwrap (958 s) ended the run. Its critical path ran after the stripes' reader3 maps landed (14:42:36): the
+r3once surf-resample (172 s), then the residual reader3 (117 s), then compose (22 s) and pw_fin (21 s), in series.
+
+- surf-resample used 2-3 contended atomic adds per pixel and per vertex (npx / npxok / nseam, nv / nvok / hist) from 8 threads, and
+  every 1667 pixel takes the cheap bilinear path (0 seam pixels). Per-thread counters, added once per thread: pod, q2 data, full mode,
+  212 / 223 s -> 117 / 117 s wall, 1138 -> 400 CPU s. The pixel pass went 147 -> 55 s. Maps, src and residual surfaces byte-identical.
+- surf-resample --geom-only 1 (SRC-MAPS "-") writes only the --residual surfaces, from the geometry. Every source counts as mapped and
+  no map is read or written. On q2's 44 wraps it is byte-identical to the full run's residual. test_surf_resample checks band 0 / 6
+  and fill-gap 0 / 4.
+- unroll r3once (R3EARLY=1, the default): once distort.done exists (the final stripes) and the wraps are flattened, the residual is
+  written from the geometry while reader3 still inks the stripes. When strip.ok lands, the residual reader3 (GPU) runs beside the
+  resample (CPU). The resample writes its own residual to res.chk. If that differs from the early one (a stripe without a map), the
+  run logs DEFAULTED: and re-inks from res.chk. R3EARLY=0 restores the old order.
+- check: wrap-check, unroll-qa and cf-demod are independent, so they run side by side (2.8 + 24.2 + 13.2 s before). Verdicts are
+  logged in the old order.
+- Pod A/B: a copy of the q2 run (master 2b021688) with check, stripimg and perwrap redone by the branch, R3PWGATE=80 for q2's gated
+  per-wrap maps.
+
+  | | q2 | branch |
+  |---|---|---|
+  | check | 40 s | 25 s |
+  | perwrap | 958 s | 705 s |
+  | stripimg | 703 s | 699 s |
+
+  The early residual was written at 18:10:04, 138 s before the stripe maps. Residual reader3 ran at 124 tiles/s beside the resample
+  (147 alone). Byte comparison: all 44 per-wrap ink maps, all 4 stripe maps, and both mosaic overviews (img_fill, img_pap) identical.
+  perwrap now ends 6 s after stripimg, so stripimg is the run's tail: about 545 s of stripe reader3, then 79 s of stretch renders and
+  79 s of refill. The next win is the stripe renders overlapped with the stripe reader3.
+- Trim (11 s) is unchanged. It makes 3 serial surf-stats calls, and a prefetch would measure the large outer wraps the walk never asks for.
+- Pod setup.sh:
+  - pip tifffile (test_img_gate passes on the pod now; inksdk's mkarms needs it).
+  - LLVM / apt.llvm.org (55 s on the 11-18 pod) only without /usr/bin/cc, or with LLVM=1.
+  - The scroll's CT is fetched in the background beside the JIT warm-up (61 + 52 s in series before).
+  - CUBINS=FILE unpacks an earlier pod's mcudahw cache before the warm-up. The warm-up then packs the cache to
+    POD/cubins-<gpu>-<driver>.tar.zst (262 MB -> 33 MB, 1.4 s) for the desk to pull. Kept at
+    /vesuvius/ufsm/pod/cubins/cubins-NVIDIA_RTX_PRO_4000_Blackwell_595.112.07.tar.zst. A test setup on the pod with it: 64 kernels
+    JIT'd in 6 s instead of 2220 in 52 s; the whole setup (warm ccache, level 5 only) took 57 s.
+  - A desk-built binary cannot run on these pods (desk glibc 2.43, pod 2.39). Reuse a binary only between pods with the same
+    native_id (NOBUILD / FOREIGN_BINARY).
+
 ## xnet: a failed device allocation stops the process (2026-11-18, branch xnetalloc-20261118, unrollperf)
 
 Desk card 1, 10:55:58: Xid 31 (MMU fault at a null address) from the q2b reader3 ink-ext (--batch 16 beside try9 + fix0332), then
