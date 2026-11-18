@@ -511,11 +511,14 @@ rhocal() {
     [ "$DRY" = 1 ] && break
   done
   [ "$DRY" = 1 ] && return 0
-  local last; last=$(ls -d $O/rhocal/it* 2> /dev/null | sort -V | tail -1); [ -n "$last" ] || return 0
+  # the last pass's model: directories with a model.json only (an `ls -d it*` also listed it*.bands.tsv, which sort after itN, and
+  # moved a tsv into ref-cf: the 11-18 1667 u1 rhocal runs failed every slab)
+  local last; last=$(for d in $O/rhocal/it[0-9]*; do [ -d "$d" ] && [ -e "$d/model.json" ] && echo $d; done | sort -V | tail -1); [ -n "$last" ] || return 0
   set -- $s0; local d0=$1 b0=$2; set -- $s
-  if [ "$1" -gt "$d0" ] || awk -v a=$2 -v b=$b0 'BEGIN { exit !(a > b + 0.15) }'; then
-    log "rhocal: DEFAULTED: the calibrated ref is worse (dup+merged $d0 -> $1 or body drift $b0 -> $2): the plain ref kept"; return 0; fi
-  mv $REF $O/rhocal/ref0.model && mv $last $REF && log "rhocal: the ref is now $(basename $last) (--rho-r $p)"
+  if [ "$1" -gt "$d0" ]; then log "rhocal: DEFAULTED: wrap-check dup+merged rose $d0 -> $1: the plain ref kept"; return 0; fi
+  if awk -v a=$2 -v b=$b0 'BEGIN { exit !(a > b + 0.15) }'; then log "rhocal: DEFAULTED: the body drift rose $b0 -> $2 (> +0.15 turn): the plain ref kept"; return 0; fi
+  [ -e "$last/model.json" ] || { log "rhocal: no calibrated model in $last"; return 1; }
+  mv $REF $O/rhocal/ref0.model && mv $last $REF && [ -e $REF/model.json ] && log "rhocal: the ref is now $(basename $last) (--rho-r $p)" || { log "rhocal: FAILED to install $last as the ref"; return 1; }
   type mset > /dev/null 2>&1 && mset rho_auto "$p"; return 0
 }
 
