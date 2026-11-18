@@ -12,7 +12,9 @@
 #   teach   reader3 + ink9um maps of every labelled mesh, ink-teach per scroll (teach.sh; GPU lock per ink-ext call)
 #   armB    K/arms/sources-B.json (mkarms.py B) and arm B 3000 steps
 # Then K/state/ALLDONE: the pod is idle (the snapshots K/runs/inksmoke{A,B}/snap/{1000,2000,3000}.ckpt are scored on the desk).
-# Env: K (/root/ink), COMMIT (required: the master commit), LOCK (/root/gpu.lock), BJ (6), GPU (0), STEPS (3000).
+# Env: K (/root/ink), COMMIT (required: the master commit), LOCK (/root/gpu.lock), BJ (6), GPU (0), STEPS (3000), WORKERS / SLOTS (1 / 2:
+#      the desk sampler-only check of arm A held 23-24 GB RSS at 2 / 2 before any pinned memory; the pod cgroup has 31 GB). Run it from the
+#      kit copy (K/kit/podq.sh: it clones the repo itself), detached: COMMIT=... setsid nohup bash K/kit/podq.sh > K/podq.out 2>&1 &
 set -uo pipefail
 K=${K:-/root/ink}; COMMIT=${COMMIT:?COMMIT}; LOCK=${LOCK:-/root/gpu.lock}; BJ=${BJ:-6}; GPU=${GPU:-0}; export STEPS=${STEPS:-3000}
 S=$K/state; L=$K/podq.log; mkdir -p $S $K/runs $K/arms $K/teach $K/maps $K/weights $K/ckpt
@@ -61,7 +63,7 @@ arm() {   # arm A | B
   local a=$1; done_ arm$a && return 0
   python3 -I $D/mkarms.py $K/inkgt/sources-H0.json $K/teach $K/kit/holdouts-20261118.json $K/arms $a > $K/arms/mkarms$a.log 2>&1 || die "mkarms $a (log $K/arms/mkarms$a.log)"
   say "arm $a: training $STEPS steps"
-  ( R=$K/runs U=$U INIT=$K/ckpt/u1-13000-w.ckpt GPU=$GPU LOCK=$LOCK RELAUNCH=3 bash $D/trainarm.sh $a $K/arms/sources-$a.json ) > $K/runs/arm$a.out 2>&1 &
+  ( R=$K/runs U=$U INIT=$K/ckpt/u1-13000-w.ckpt GPU=$GPU LOCK=$LOCK RELAUNCH=3 WORKERS=${WORKERS:-1} SLOTS=${SLOTS:-2} bash $D/trainarm.sh $a $K/arms/sources-$a.json ) > $K/runs/arm$a.out 2>&1 &
   local tp=$! st=0
   while kill -0 $tp 2>/dev/null; do
     st=$(awk '/^step +[0-9]+ / {s = $2} END {print s + 0}' $K/runs/inksmoke$a.log 2>/dev/null)
