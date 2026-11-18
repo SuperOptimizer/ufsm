@@ -2,16 +2,17 @@
 # scripts/v2/fetchct.sh [LANE NLANES]: v2 training-level CT (8.64/9.36 um L0, 2.4 um scans L2, plus levels L+2.. as scripts/u0/copy.sh)
 # for every train + holdout scroll of scrolls.tsv (V2/scrolls.tsv, or scripts/corpus/list.tsv's scan when absent) -> V2/ct/<S>/<volume>.
 # Scans held elsewhere on the desk are symlinked (LOCAL, empty by default; an entry whose dir is gone falls through to a copy row).
-# Copy rows come from the u0 inventory sizes
-# (INV, default /vesuvius/ufsm/u0/inventory-all.tsv) and go through scripts/u0/copy.sh (resumable ufsm mirror, byte-identical shards,
-# done markers in V2/fetch/state, STOP file V2/fetch/STOP, live rate cap V2/fetch/mbps). Lanes split the copy rows round-robin;
+# Copy rows come from the inventory sizes (INV, default /vesuvius/ufsm/dlvol/inventory-volcomp.tsv: scripts/u0/inventory.sh's
+# columns for all 64 volcomp scans, built 11-17 from full remote listings by /vesuvius/ufsm/dlvol/mkinv.py; u0/inventory-all.tsv is
+# gone) and go through scripts/u0/copy.sh (resumable ufsm mirror, byte-identical shards, done markers in V2/fetch/state, STOP file
+# V2/fetch/STOP, live rate cap V2/fetch/mbps). Lanes split the copy rows round-robin;
 # each lane's mirror keeps UFSM_HTTP_INFLIGHT (default 48 / NLANES) requests in flight (the mirror 429s past 64 per IP).
 # INK=1: only the extra CT of the human ink sources (scripts/v2/inkscans.txt).
 # Env: V2 (/vesuvius/ufsm/v2), U (V2/src/build/ufsm), MINFREE (GB kept free on V2's disk, 100), TH (mirror threads per lane, 8).
 set -u
 LANE=${1:-0}; NL=${2:-1}
 H=$(cd "$(dirname "$0")" && pwd); REPO=$(cd $H/../.. && pwd)
-V2=${V2:-/vesuvius/ufsm/v2}; U=${U:-$V2/src/build/ufsm}; INV=${INV:-/vesuvius/ufsm/u0/inventory-all.tsv}
+V2=${V2:-/vesuvius/ufsm/v2}; U=${U:-$V2/src/build/ufsm}; INV=${INV:-/vesuvius/ufsm/dlvol/inventory-volcomp.tsv}
 A=$V2/fetch; mkdir -p $A/state $A/logs $V2/ct
 # local scans: scroll -> dir holding <volume>/ (symlinked as V2/ct/<S>/<volume>)
 # (the old P3 / 0490B defaults under /vesuvius/ufsm/u0/vol and P4's /vesuvius/ufsm/volcomp are gone since the 11-09 / 11-12 cleanups;
