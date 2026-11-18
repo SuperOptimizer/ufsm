@@ -6,6 +6,20 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## reader3 ink-ext: the narrow conv_igemm tiles at 2 stages (2026-11-18, branch convkr3-20261118)
+
+The ink stages are ~60 % of the pod 1667 unroll. Reader3 at the unroll shape (w035, --batch 16, nsys on the shared card 1; the shares, since
+other jobs inflate the times): conv_igemm 50 % (128 x 128: 31 %, 128 x 64: 11 %, 128 x 32: 8 %), k_gnpart + k_gn_apply 20 %, k_dfc16s 13 %,
+k_dattn 7 %, k_dfc1x 6 %, k_tshuffle 4 %. ncu:
+- 128 x 128 runs at 80 % SM throughput (fp16 MMA with fp32 accumulation, which runs at half rate on GeForce).
+- The GN kernels are at 85-94 % of DRAM bandwidth; only fusion is left for them (the stats fusion was parked: not byte-identical).
+- 128 x 32 (4 warps, 3 cp.async stages) was held to 3 blocks an SM by its 30.7 KB of shared memory, 25 % occupancy.
+- 128 x 64 (8 warps) was held to 2 by registers and shared memory, 33 %.
+Change: both at 2 stages (the K order is unchanged), and the 2-stage 128 x 64 at __launch_bounds__ minB 3 (94 registers). ncu, the same
+launches interleaved: 128 x 32 2.31-2.45 -> 1.94-1.96 ms (-17 %), 128 x 64 1.26 -> 1.06 ms (-16 %). conv_igemm over the wrap: 12.1-12.35 -> 11.2 s.
+The w035 map is byte-identical (0 of 39.4 M px; master against itself: 0). UFSM_XNET_NST32 / NST64=3: the 3-stage tiles.
+Tried: unrolling k_dattn's layer loops (a[] out of local memory) took 150 registers: 8.5 -> 13.3 ms. Not kept.
+
 ## Slab-fit kernels, step 1: fit_pool from tables, fit_loss2_list_k without its local arrays (2026-11-18, branch convkfit-20261118)
 
 fp4teach profiled one slab fit: s026 of the desk 1667 u1 fields, 96 x 1568 x 1616 at h 2 cropped to the material, with unroll.sh's fit line.

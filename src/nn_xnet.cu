@@ -251,7 +251,7 @@ enum { KPAD = 64 };
 #define XN_MINB 2
 #endif
 template <int BM, int BN, int WARPS_M, int WARPS_N, int BK, int NST>
-__global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, WARPS_M * WARPS_N == 8 ? XN_MINB : 1) conv_igemm(ConvP p) {
+__global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, WARPS_M * WARPS_N == 8 ? (NST == 2 && BN == 64 ? 3 : XN_MINB) : 1) conv_igemm(ConvP p) {   /* (the 2-stage 128 x 64 tile: 3 blocks an SM) */
     constexpr int NTH = WARPS_M * WARPS_N * 32, WM = BM / WARPS_M, WN = BN / WARPS_N, MI = WM / 16, NI = WN / 8;
     constexpr int QC = BK / 8, RS = NTH / QC, AP = BM / RS, BP = BN >= RS ? BN / RS : 1;   /* chunks per row, rows per pass, passes (BN < RS: one, part of the threads) */
     extern __shared__ __align__(128) unsigned char smem[];
@@ -1263,8 +1263,11 @@ static bool dfc16_try(const xconv *c, xt in, xt y, const xt *res, int act, doubl
     }
 }
 static int g_cfg = -1, g_c16 = -1;   /* mgpu: env */
+static int g_nst32 = -1, g_nst64 = -1;   /* mgpu: env (UFSM_XNET_NST32 / NST64: the cp.async stages of the <= 32 / <= 64 output tiles) */
 static void conv_launch(const ConvP &p, int co) {
     if (g_cfg < 0) g_cfg = getenv("UFSM_XNET_CFG") ? atoi(getenv("UFSM_XNET_CFG")) : 0;
+    if (g_nst32 < 0) g_nst32 = getenv("UFSM_XNET_NST32") ? atoi(getenv("UFSM_XNET_NST32")) : 2;
+    if (g_nst64 < 0) g_nst64 = getenv("UFSM_XNET_NST64") ? atoi(getenv("UFSM_XNET_NST64")) : 2;
     switch (g_cfg) {
     case 1:   /* 4 warps of 64 x 64 / 64 x 32 */
         if (co <= 64) launch1<128, 64, 2, 2, 32, 3>(p, co); else launch1<128, 128, 2, 2, 32, 3>(p, co); break;
@@ -1282,8 +1285,9 @@ static void conv_launch(const ConvP &p, int co) {
         }
         if (co <= 16) { if (g_c16 < 0) g_c16 = getenv("UFSM_XNET_C16") ? atoi(getenv("UFSM_XNET_C16")) : 1;   /* 16 outputs (the Reader depth fusion): no half-empty tile */
                         if (g_c16 == 2) launch1<256, 16, 8, 1, 32, 3>(p, co); else if (g_c16) launch1<128, 16, 4, 1, 32, 3>(p, co); else launch1<128, 32, 4, 1, 32, 3>(p, co); }
-        else if (co <= 32) launch1<128, 32, 4, 1, 32, 3>(p, co);
-        else if (co <= 64) launch1<128, 64, 4, 2, 32, 3>(p, co); else launch1<128, 128, 2, 4, 32, 3>(p, co); break;
+        else if (co <= 32) { if (g_nst32 == 2) launch1<128, 32, 4, 1, 32, 2>(p, co); else launch1<128, 32, 4, 1, 32, 3>(p, co); }
+        else if (co <= 64) { if (g_nst64 == 2) launch1<128, 64, 4, 2, 32, 2>(p, co); else launch1<128, 64, 4, 2, 32, 3>(p, co); }
+        else launch1<128, 128, 2, 4, 32, 3>(p, co); break;
     }
 }
 __global__ void k_stats(const __half *x, int C, long long S, double *st) {   /* [n][C][2] sums of an fp16 NDHWC tensor; grid (chunks, n) */
