@@ -100,6 +100,12 @@ elif [ -z "${CUDA_VISIBLE_DEVICES+x}" ]; then
   for g in $FIELDGPUS $FITGPUS $INKGPU $SGPU ${RGPU:-}; do case " $GVIS " in *" $g "*) ;; *) GVIS="$GVIS $g";; esac; done
   GVIS=$(echo $GVIS); export CUDA_VISIBLE_DEVICES=${GVIS// /,} UNROLL_GVIS=$GVIS
 fi
+# pcard: the CUDA_VISIBLE_DEVICES value for a per-job card id (FITGPUS / RGPU / r3pre's GPU). With GVIS the ids are physical cards; with the
+# caller's CUDA_VISIBLE_DEVICES they are indices into it, as --gpu is (lg). Before 11-18 the per-job lines set CUDA_VISIBLE_DEVICES=<id>
+# as given: a desk run with CUDA_VISIBLE_DEVICES=1 FITGPUS=0 ran perwrap's flatten / render / reader3 on card 0, the training card.
+pcard() { if [ -z "$GVIS" ] && [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then local a; IFS=, read -r -a a <<< "$CUDA_VISIBLE_DEVICES"
+    [ -n "${a[$1]:-}" ] || { echo "unroll: card index $1 not in CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" >&2; echo none; return 1; }; echo "${a[$1]}"
+  else echo $1; fi; }
 lg() { local i=0 g; [ -n "$GVIS" ] && for g in $GVIS; do [ "$g" = "$1" ] && { echo $i; return; }; i=$((i + 1)); done; echo $1; }
 # sgpu: SGPU's card for the stages without a --gpu. With the caller's CUDA_VISIBLE_DEVICES (no GVIS) SGPU is an index into that list, as
 # --gpu is (lg): before 11-18 it was then ignored and the ref count-field ran on the list's first card (CUDA_VISIBLE_DEVICES=0,1 SGPU=1:
@@ -140,7 +146,7 @@ VOUT=$([ "$INKMODE" = r3 ] && echo "--volume-out 0")
 # the fetched ones in the run's shared --cache $O/ink/ct.cache: neighbouring 1667 wraps share ~83 % of their chunks, a cold wrap was 46 of 50 s
 # CT fetch, warm 12 s, unrollperf 11-17); r3ink.sh then takes OUT/<name>_<model>.tif (R3PRE). GPU "": the run's device.
 r3pre() {
-  local out=$1 g=$2 a=() x; shift 2
+  local out=$1 g=$2 a=() x; shift 2; [ -n "$g" ] && { g=$(pcard $g) || return 1; }
   for x in "$@"; do [ -s $x/meta.json ] && [ ! -s $out/$(basename $x)_$R3MODEL.tif ] && a+=(--surface $x); done
   [ ${#a[@]} = 0 ] && return 0; mkdir -p $out $O/ink
   ${g:+env CUDA_VISIBLE_DEVICES=$g} nice -n 10 $U ink-ext --model $R3MODEL --weights $R3W "${a[@]}" --ct $R $K --out $out --threads $R3TH \
@@ -833,7 +839,7 @@ FILLX=${FILLX:---fill 4 --fill-ct ${FILLCT:-80} --fill-grid 50000 --fill-inpaint
 inkgate() { [ "${INKGATE:-1}" = 0 ] && return 0; [ -e $O/ink/c12.zarr/zarr.json ] && [ -e $O/ink/c13.zarr/zarr.json ] && echo "$O/ink/c12.zarr $O/ink/c13.zarr"; return 0; }
 stripimg() {
   local ST=$O/strip RF=$O/strip/render_fill S N k s
-  local E="UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_ZCACHE_ADMIT=${ZCACHE_ADMIT:-0.6} UFSM_JPEG_THREADS=$JPEGT UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} UFSM_RENDER_MEM=${UFSM_RENDER_MEM:-16} ${RGPU:+CUDA_VISIBLE_DEVICES=$RGPU}"
+  local E="UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_ZCACHE_ADMIT=${ZCACHE_ADMIT:-0.6} UFSM_JPEG_THREADS=$JPEGT UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} UFSM_RENDER_MEM=${UFSM_RENDER_MEM:-16} ${RGPU:+CUDA_VISIBLE_DEVICES=$(pcard $RGPU)}"
   if [ "$DRY" = 1 ]; then echo "    $E: stretch from the 3 middle stripes (render $FILLX + strip-mosaic --stretch-only), then U=$U CTR=$R CTK=$K/$LV INK=$VROOT INKK=$VKEY PAPMOS=$ST/img_pap bash scripts/strip/strip_refill.sh $ST$([ "$INKMODE" = r3 ] && echo " (R3INK: each stripe's ink by r3ink.sh: $R3W, gate CT >= $R3GATE, $R3X)")"; return 0; fi
   mkdir -p $RF $ST/fillmap $ST/logs; S=($(ls $ST/strip/flat/stripes)); N=${#S[@]}; [ $N -gt 0 ] || return 1
   if [ "$INKMODE" = r3 ]; then r3pre $O/ink/r3/strip "${RGPU:-}" $ST/strip/flat/stripes/* || return 1; export R3PRE=$O/ink/r3/strip R3PRECP=1; touch $O/ink/r3/strip.ok; fi   # (R3PRECP: the raw maps stay for r3once)
@@ -866,7 +872,7 @@ stripimg() {
 }
 # --- per-wrap renders (p4full3.sh) and faces ---
 pw_one() {   # pw_one WRAP GPU (a background subshell: the cache env stays in it); the wraps the strip uses (wraps_snap with SNAP=1, audit 11-14 #12)
-  zcon; local w=$1 gpu=$2 L=$O/logs/pw/$1 nv dc d=$O/r/$1 WD=$(wrapsdir)
+  zcon; local w=$1 gpu L=$O/logs/pw/$1 nv dc d=$O/r/$1 WD=$(wrapsdir); gpu=$(pcard $2) || return 1
   nv=$(stat -c %s $WD/$w.sfc); dc=$(awk -v n=$nv -v m=1500000 'BEGIN { d = 1; while (n / (d * d) > m) d++; print d }')
   if [ ! -e $O/flat/$w/x.tif ]; then
     nice -n 10 $U tifxyz-scale $WD $O/orig 1 --wraps $w > $L.scale.log 2>&1 || return 1

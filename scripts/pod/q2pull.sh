@@ -4,7 +4,7 @@
 # pod (ref-cf, joined, wraps_snap + qa, strip images, per-wrap img / prev / up / ink/wraps / the stripes' ink); at RU/.final the whole set
 # (fields/rsp included) and DIR/.synced, then scripts/pod/score1667.sh DIR (desk CPU, lowprio); then the smoke's outputs until
 # RU/.alldone (DIR/.pod_idle: the pod queue is empty). Temp names + rsync --partial; restartable (DIR/.pulled.<group> markers).
-# Env: PODH (root@HOST, required), PODPORT (22), PODKEY (~/.ssh/id_ed25519), DIR (/vesuvius/ufsm/podun/PHerc1667-q2pod), RU
+# Env: Q3WAIT=1 (the queue ends at podq3's ALLDONE, not podq2's), PODH (root@HOST, required), PODPORT (22), PODKEY (~/.ssh/id_ed25519), DIR (/vesuvius/ufsm/podun/PHerc1667-q2pod), RU
 # (/root/pod/unroll/PHerc1667), Q (/root/pod/q2), K (/root/ink), PERIOD (180). Run detached: setsid nohup bash q2pull.sh > LOG 2>&1 &
 set -u
 H=${PODH:?PODH=root@HOST}; SSH="ssh -p ${PODPORT:-22} -i ${PODKEY:-$HOME/.ssh/id_ed25519} -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30"
@@ -29,13 +29,18 @@ while :; do
   grp perwrap $RU/state/perwrap.done $D/ $RU/img $RU/prev $RU/up
   grp wink $RU/state/perwrap.done $D/ink/ $RU/ink/wraps
   if [ ! -e $D/.synced ] && has $RU/.final; then
-    get $H:$RU/fields/rsp $D/fields/ && get $H:$RU/ref-cf $H:$RU/joined $H:$RU/wraps_snap $H:$RU/qa $H:$RU/img $H:$RU/prev $H:$RU/up $D/ \
+    get -L $H:$RU/fields/rsp $D/fields/ && get $H:$RU/ref-cf $H:$RU/joined $H:$RU/wraps_snap $H:$RU/qa $H:$RU/img $H:$RU/prev $H:$RU/up $D/ \
       && get $H:$RU/strip/img_fill $H:$RU/strip/img_pap $H:$RU/strip/distort $D/strip/ && get $H:$RU/ink/wraps $H:$RU/ink/r3/strip $D/ink/ \
       && { touch $D/.synced; say "final pull done: $D/.synced"
            ( CUDA_VISIBLE_DEVICES= ~/bin/memcap ~/bin/lowprio bash $R/scripts/pod/score1667.sh $D PHerc1667-q2pod > $D/score.out 2>&1; say "score: $(tr '\n' ' ' < $D/score/score.txt)" ) & }
   fi
   get $H:$K/podq.log $H:$K/status $H:$K/steptimeA.txt $H:$K/out $D/smoke/ 2> /dev/null
-  if has $RU/.alldone || has $Q/state/ALLDONE; then [ -e $D/.synced ] && { touch $D/.pod_idle; say "POD QUEUE EMPTY ($D/.pod_idle)"; wait; exit 0; }; fi
-  if has $Q/state/FAILED; then say "pod queue FAILED: $($SSH $H "tail -1 $Q/podq2.log" 2> /dev/null)"; touch $D/.pod_failed; fi
+  # podq3 (after the unroll): its log / state, the GPU gate's report (/root/gate/last: gate.out, out/), the ink FULL's out/ (in smoke/out)
+  mkdir -p $D/q3 $D/gate; get $H:${Q3:-/root/pod/q3}/podq3.log $H:${Q3:-/root/pod/q3}/state $D/q3/ 2> /dev/null
+  has /root/gate/last/gate.out && get -L $H:/root/gate/last/gate.out $H:/root/gate/last/out $D/gate/ 2> /dev/null
+  if has ${Q3:-/root/pod/q3}/state/ALLDONE; then get $H:$K/out $H:$K/podq.log $D/smoke/; touch $D/.pod_idle; say "POD QUEUE EMPTY (podq3 ALLDONE; $D/.pod_idle)"; wait; exit 0; fi
+  if [ -n "${Q3WAIT:-}" ]; then :   # (podq3 runs after podq2: podq2's own end markers are not the queue's end)
+  elif has $RU/.alldone || has $Q/state/ALLDONE; then [ -e $D/.synced ] && { touch $D/.pod_idle; say "POD QUEUE EMPTY ($D/.pod_idle)"; wait; exit 0; }; fi
+  if [ -z "${Q3WAIT:-}" ] && has $Q/state/FAILED; then say "pod queue FAILED: $($SSH $H "tail -1 $Q/podq2.log" 2> /dev/null)"; touch $D/.pod_failed; fi
   sleep $P
 done
