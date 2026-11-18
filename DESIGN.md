@@ -3058,8 +3058,10 @@ Ref model gauge under --model-stride (unroll #8 follow-up, 2026-11-14; source on
 - The fix:
   - cf_gauge_fill_z: solve rows with all-zero sums take the sums linearly in z from the nearest summed rows, per column, before the
     smoothing. This is on whenever --model-only and K > 1.
-  - unroll.sh MSTRIDE now defaults to 1. On the GPU that is about 4x a 7 s model pass. corpus desk.sh / fd.sh keep K 4 (CPU time),
-    with the interpolation.
+  - unroll.sh MSTRIDE now defaults to 1. On the GPU that is about 4x a 7 s model pass. corpus desk.sh / fd.sh moved to 1 as well (11-15);
+    the measurement scripts (ugeom after_mega.sh, fibfit dir_gates_measure.sh) followed 11-18. Checked 11-18 (CPU, the 1667 ref-dm1
+    recipe on master): K 4 with the interpolation vs K 1: |W| difference mean 0.070 turn (no interpolation 0.081), worst row 0.150, model
+    coherence 0.1787 vs 0.1687; the K-4 period (512 field rows) halved (FFT amplitude 16.4 -> 8.8), not removed: K 1 everywhere.
 - To verify (post-pass, CPU): rerun the ref-dm1 count-field with --model-stride 4, then 1, and repeat pub1667's per-plane coherence
   scan. The alternation should be gone.
 

@@ -15,7 +15,7 @@ case "$OUT" in /vesuvius/*|/tmp/*) ;; *) echo "OUT must be under /vesuvius or /t
 mkdir -p "$OUT"; [ -x "$U" ] || { echo "no binary $U" >&2; exit 2; }
 MC=(); [ -x ~/bin/memcap ] && MC=(~/bin/memcap -m $((MEM + 6))G)
 # the unroll's ref options (unroll.sh refpool), without REFX
-RP=(--R 0 --pool 8 --phase-w 0.5 --wide 100,140 --wide-phase 15 --model-only 1 --model-stride 4 --iters 1200 --threads $TH --mem-gb $MEM)
+RP=(--R 0 --pool 8 --phase-w 0.5 --wide 100,140 --wide-phase 15 --model-only 1 --model-stride 1 --iters 1200 --threads $TH --mem-gb $MEM)
 TAB=$OUT/summary.tsv; printf 'scroll\ttsv\tw4\tloops\tgate\tCplus\tCminus\tcoherence\n' > "$TAB"
 for S in "${SCROLLS[@]}"; do
   F=/vesuvius/ufsm/unroll/$S-u1/fields/lat; D=$OUT/$S
