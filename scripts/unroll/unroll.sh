@@ -127,7 +127,7 @@ FNAME=$([ "$FKIND" = lat ] && echo lat || echo wind96)
 F=$O/fields/$FNAME; REF=$O/ref-cf; INK=$O/ink/$INKNAME.zarr
 # the renders' --volume: the ink volume, or with INKMODE=r3 the CT itself (its render is replaced by r3ink.sh); r3ink.sh's settings exported
 if [ "$INKMODE" = r3 ]; then VROOT=$R; VKEY=$K/$LV; else VROOT=$INK; VKEY=$LUM; fi
-[ "$INKMODE" = r3 ] && export U R3CTR=$R R3CTK=$K R3W R3MODEL=${R3MODEL:-reader3} R3GATE=${R3GATE:-${FILLCT:-80}} R3TH=${R3TH:-8} R3X="--ct-um $UM ${R3X:-}"
+[ "$INKMODE" = r3 ] && export U R3CTR=$R R3CTK=$K R3W R3MODEL=${R3MODEL:-reader3} R3GATE=${R3GATE:-${FILLCT:-80}} R3TH=${R3TH:-8} R3X="--ct-um $UM --batch ${R3BATCH:-16} ${R3X:-}"   # (a pinned --batch: auto-sized from free memory it changed 0.7 % of px by 1 LSB, unrollperf 11-17)
 # r3pre OUT GPU SURF..: ONE ink-ext over every surface that has no map in OUT yet (decoded chunks resident across surfaces, --ct-mem LRU;
 # the fetched ones in the run's shared --cache $O/ink/ct.cache: neighbouring 1667 wraps share ~83 % of their chunks, a cold wrap was 46 of 50 s
 # CT fetch, warm 12 s, unrollperf 11-17); r3ink.sh then takes OUT/<name>_<model>.tif (R3PRE). GPU "": the run's device.
