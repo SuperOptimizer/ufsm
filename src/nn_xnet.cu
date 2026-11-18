@@ -1776,14 +1776,18 @@ __global__ void k_gn_apply(const __half *x, const float *gm, const float *rs, co
 }
 static int g_gnold = -1;   /* mgpu: env */
 extern "C" void xnet_set_gnold(int v) { g_gnold = v; }
+static int gn_nchunk(int n, long long S) {   /* k_gnpart's chunks a sample (xgn_stats below) */
+    if (g_gnold < 0) g_gnold = getenv("UFSM_XNET_GNOLD") ? atoi(getenv("UFSM_XNET_GNOLD")) : 0;
+    int nchunk = g_gnold ? (int)((512 + n - 1) / n) : 64; if (nchunk > S / 64) nchunk = (int)(S / 64); if (nchunk < 1) nchunk = 1;
+    return nchunk;
+}
 /* the group statistics of x: device gm / rs [n][C] (group mean, 1 / std per channel, one allocation: rs = gm + n C; free gm) */
 extern "C" float *xgn_stats(xt x, int groups, float eps) {
     const int C = x.c, n = x.n; const long long S = (long long)x.d * x.h * x.w;
     /* chunks a sample: 64 (>= 64 voxels each), whatever the batch. The old count, 512 / n (~512 blocks), made each sample's partial sums
        and so its statistics depend on the batch size: ink-ext's auto --batch (free device memory) moved reader3's 1667 w035 wrap by one
        code on 0.7 % of its pixels between batch 8 and 16. UFSM_XNET_GNOLD=1: the old count (byte-exact with outputs before 2026-11-17) */
-    if (g_gnold < 0) g_gnold = getenv("UFSM_XNET_GNOLD") ? atoi(getenv("UFSM_XNET_GNOLD")) : 0;
-    int nchunk = g_gnold ? (int)((512 + n - 1) / n) : 64; if (nchunk > S / 64) nchunk = (int)(S / 64); if (nchunk < 1) nchunk = 1;
+    const int nchunk = gn_nchunk(n, S);
     double *part = (double *)xmalloc_dev((size_t)n * nchunk * C * 2 * sizeof(double)); float *gm = (float *)xmalloc_dev((size_t)n * C * 4 * 2), *rs = gm + (size_t)n * C;
     const int pairs = C / 2, rows = pairs <= 256 ? 256 / pairs : 1;
     k_gnpart<<<dim3(nchunk, n), 256, (size_t)rows * C * 2 * sizeof(float), g_st>>>((const __half *)x.p, C, S, nchunk, part);
@@ -1797,6 +1801,87 @@ extern "C" void xgn(xt x, int groups, const float *gamma, const float *beta, flo
     const size_t total = xt_numel(x); unsigned nb = nblk(total / 2, 256); if (nb > 65535 * 4) nb = 65535 * 4;
     k_gn_apply<<<nb, 256, 0, g_st>>>((const __half *)x.p, gm, rs, gamma, beta, res ? (const __half *)res->p : nullptr, act, (__half *)y.p, C, S, total);
     xfree_dev(gm);
+}
+
+/* The Reader stem conv (1 -> 16, 3x3x3, k_dfc1's chains) with its GroupNorm statistics in one pass (UFSM_XNET_C1GS=0: k_dfc1x, then
+   xgn_stats). A block owns one k_gnpart chunk (same nchunk, same 256 threads): per step its threads compute the 16 channels of 256
+   consecutive voxels of the chunk (thread t voxel t: k_dfc1's 27-tap chain per channel, zero taps included, then s scale + bias rounded),
+   store them to y and to shared memory, and then thread (row t / 8, pair t % 8) adds its 8 voxels row, row + 32, ... in order: k_gnpart's
+   per-thread sequence (voxels s0 + row + 32 k), so the partial sums, gm / rs and y are k_dfc1x + xgn_stats' bits, without y's re-read. */
+__global__ void __launch_bounds__(256) k_c1gs(const __half *x, const __half *w, int Kp, const float *scale, const float *bias, __half *y, int D, int H, int W, int nchunk, double *part) {
+    __shared__ __align__(16) float sw[16 * 28]; __shared__ __align__(16) __half sv[256 * 16]; __shared__ float sh[32 * 16 * 2]; __shared__ float m0s[16];
+    const int t = threadIdx.x, n = blockIdx.y; const long long S = (long long)D * H * W;
+    for (int i = t; i < 16 * 28; i += 256) { const int o = i / 28, k = i % 28; sw[i] = k < 27 ? __half2float(w[(size_t)o * Kp + (k / 3) * 8 + k % 3]) : 0.f; }
+    __syncthreads();
+    const __half *xb = x + (size_t)n * S; __half *yb = y + (size_t)n * S * 16;
+    auto conv = [&](long long v, __half *o) {   /* k_dfc1's output voxel v of sample n */
+        const int xx = (int)(v % W); long long r = v / W; const int yy = (int)(r % H); const int zz = (int)(r / H);
+        float in[27];
+#pragma unroll
+        for (int a = 0; a < 3; a++)
+#pragma unroll
+            for (int b = 0; b < 3; b++)
+#pragma unroll
+                for (int e = 0; e < 3; e++) {
+                    const int z = zz + a - 1, yv = yy + b - 1, xv = xx + e - 1;
+                    in[(a * 3 + b) * 3 + e] = z >= 0 && z < D && yv >= 0 && yv < H && xv >= 0 && xv < W ? __half2float(xb[((long long)z * H + yv) * W + xv]) : 0.f;
+                }
+#pragma unroll
+        for (int c = 0; c < 16; c++) {   /* (the weights as k_dfc1x: 7 float4 a channel) */
+            float wq[28];
+#pragma unroll
+            for (int k4 = 0; k4 < 7; k4++) { const float4 q = *(const float4 *)(sw + c * 28 + k4 * 4); wq[k4 * 4] = q.x; wq[k4 * 4 + 1] = q.y; wq[k4 * 4 + 2] = q.z; wq[k4 * 4 + 3] = q.w; }
+            float s = 0.f;
+#pragma unroll
+            for (int k = 0; k < 27; k++) s += in[k] * wq[k];
+            o[c] = __float2half_rn(s * scale[c] + bias[c]); }
+    };
+    if (t == 0) { __align__(16) __half o[16]; conv(0, o); for (int c = 0; c < 16; c++) m0s[c] = __half2float(o[c]); }   /* the shift: y's first voxel */
+    const long long per = (S + nchunk - 1) / nchunk, s0 = blockIdx.x * per, s1 = s0 + per < S ? s0 + per : S;
+    const int row = t >> 3, c = (t & 7) * 2;
+    __syncthreads();
+    const float m0 = m0s[c], m1 = m0s[c + 1];
+    float a0 = 0.f, a1 = 0.f, q0 = 0.f, q1 = 0.f;
+#pragma unroll 1
+    for (long long b0 = s0; b0 < s1; b0 += 256) {
+        const long long v = b0 + t;
+        if (v < s1) {
+            __align__(16) __half o[16]; conv(v, o);
+            uint4 *dst = (uint4 *)(yb + v * 16); dst[0] = ((const uint4 *)o)[0]; dst[1] = ((const uint4 *)o)[1];
+            uint4 *sd = (uint4 *)(sv + t * 16); sd[0] = ((const uint4 *)o)[0]; sd[1] = ((const uint4 *)o)[1];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = row; j < 256; j += 32) {
+            if (b0 + j >= s1) break;
+            const __half2 h = *(const __half2 *)(sv + j * 16 + c); const float f0 = __low2float(h) - m0, f1 = __high2float(h) - m1;
+            a0 += f0; a1 += f1; q0 += f0 * f0; q1 += f1 * f1;
+        }
+        __syncthreads();
+    }
+    float *o = sh + ((size_t)row * 16 + c) * 2; o[0] = a0; o[1] = q0; o[2] = a1; o[3] = q1;
+    __syncthreads();
+    if (t < 16) {
+        double a = 0.0, q = 0.0;
+        for (int r = 0; r < 32; r++) { a += sh[((size_t)r * 16 + t) * 2]; q += sh[((size_t)r * 16 + t) * 2 + 1]; }
+        double *op = part + (((size_t)n * nchunk + blockIdx.x) * 16 + t) * 2; op[0] = a; op[1] = q;
+    }
+}
+static int g_c1gs = -1;   /* UFSM_XNET_C1GS=0: the stem conv, then xgn_stats (k_gnpart re-reads it); mgpu: env */
+extern "C" void xnet_set_c1gs(int v) { g_c1gs = v; }
+extern "C" xt xconv_fwd_gs16(const xconv *c, xt x, int groups, float eps, float **gm_out) {
+    if (g_c1gs < 0) g_c1gs = getenv("UFSM_XNET_C1GS") ? atoi(getenv("UFSM_XNET_C1GS")) : 1;
+    if (g_df1 < 0) g_df1 = getenv("UFSM_XNET_DF1") ? atoi(getenv("UFSM_XNET_DF1")) : 2;
+    const bool ok = g_c1gs && g_df1 && c->unfold && c->kw0 == 3 && c->pw0 == 1 && c->co == 16 && c->kd == 3 && c->kh == 3 && c->pd == 1 && c->ph == 1 &&
+                    c->sd == 1 && c->sh == 1 && c->sw == 1 && x.c == 1;
+    if (!ok) { xt y = xconv_fwd(c, x, nullptr, XA_NONE); *gm_out = xgn_stats(y, groups, eps); return y; }
+    xt y = xt_new(x.n, x.d, x.h, x.w, 16); const long long S = (long long)x.d * x.h * x.w; const int n = x.n, C = 16, nchunk = gn_nchunk(n, S);
+    g_fq_seq++; g_macs += (double)xt_numel(y) * 27;   /* (as conv_run's dfc1 path) */
+    double *part = (double *)xmalloc_dev((size_t)n * nchunk * C * 2 * sizeof(double)); float *gm = (float *)xmalloc_dev((size_t)n * C * 4 * 2), *rs = gm + (size_t)n * C;
+    k_c1gs<<<dim3(nchunk, n), 256, 0, g_st>>>((const __half *)x.p, (const __half *)c->w, c->Kp, c->scale, c->bias, (__half *)y.p, x.d, x.h, x.w, nchunk, part);
+    k_gnfin<<<nblk((size_t)n * groups, 64), 64, 0, g_st>>>((const __half *)y.p, part, n, C, groups, S, nchunk, eps, gm, rs);
+    xfree_dev(part);
+    *gm_out = gm; return y;
 }
 
 /* ---- data movement ---- */

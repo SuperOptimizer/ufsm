@@ -278,6 +278,25 @@ static int run_c1(int N, int D, int H, int W) {
     return bad != 0;
 }
 
+/* the fused stem conv + GroupNorm statistics (k_c1gs, xconv_fwd_gs16) against k_dfc1x then xgn_stats: y and gm / rs bit-equal */
+static int run_c1gs(int N, int D, int H, int W) {
+    const size_t nx = (size_t)N * D * H * W; uint16_t *xh = malloc(nx * 2), *y0 = malloc(nx * 32), *y1 = malloc(nx * 32); float *w = malloc(16 * 27 * 4), b[16];
+    float *g0 = malloc((size_t)N * 32 * 4), *g1 = malloc((size_t)N * 32 * 4);
+    for (size_t i = 0; i < nx; i++) xh[i] = f2h(rnd() * 3.f + 1.f);
+    for (int i = 0; i < 16 * 27; i++) w[i] = rnd() * 0.3f;
+    for (int c = 0; c < 16; c++) b[c] = rnd();
+    xnet_set_mx(0); xconv c; xconv_init(&c, w, 16, 1, 3, 3, 3, 1, 1, 1, 1, 1, 1, nullptr, b);
+    xt xd = xt_new(N, D, H, W, 1); xh2d(xd.p, xh, nx * 2);
+    float *gd = nullptr;
+    xnet_set_c1gs(0); xt ya = xconv_fwd_gs16(&c, xd, 16, 1e-5f, &gd); xd2h(y0, ya.p, nx * 32); xd2h(g0, gd, (size_t)N * 32 * 4); xfree_dev(gd);
+    xnet_set_c1gs(1); xt yb = xconv_fwd_gs16(&c, xd, 16, 1e-5f, &gd); xd2h(y1, yb.p, nx * 32); xd2h(g1, gd, (size_t)N * 32 * 4); xfree_dev(gd); xnet_set_c1gs(-1);
+    if (xnet_check("test_xmx c1gs")) return 1;
+    size_t ny = 0, ng = 0; for (size_t i = 0; i < nx * 16; i++) ny += y0[i] != y1[i];
+    for (int i = 0; i < N * 32; i++) ng += memcmp(&g0[i], &g1[i], 4) != 0;
+    printf("c1gs N %d %dx%dx%d: %zu of %zu outputs, %zu of %d stats differ from k_dfc1x + xgn_stats\n", N, D, H, W, ny, nx * 16, ng, N * 32);
+    xt_free(&xd); xt_free(&ya); xt_free(&yb); xconv_free(&c); free(xh); free(y0); free(y1); free(w); free(g0); free(g1);
+    return ny != 0 || ng != 0;
+}
 /* the 2-D transposed conv (k2 s2) shuffle: k_tshuffle8 (8 channels a thread, the default) byte-equal to the per-element k_tshuffle */
 static int run_ts(int N, int D, int H, int W, int ci, int co) {
     const size_t nx = (size_t)N * D * H * W * ci, ny = (size_t)N * D * 4 * H * W * co; uint16_t *xh = malloc(nx * 2), *y0 = malloc(ny * 2), *y1 = malloc(ny * 2);
@@ -335,6 +354,10 @@ int main(void) {
           for (int v = 1; v <= 4; v++) { if (v == 3) continue; xnet_set_df1(v); double best = 1e9;
               for (int r = 0; r < 10; r++) { xnet_sync(); const double t0 = now(); xt y = xconv_fwd(&c1, x1, nullptr, XA_NONE); xnet_sync(); const double t = now() - t0; xt_free(&y); if (t < best) best = t; }
               printf("dfbench c1 variant %d: %.3f ms\n", v, best * 1e3); }
+          for (int v = 0; v <= 1; v++) { xnet_set_c1gs(v); double best = 1e9;   /* the stem + its statistics: separate (0) / fused (1) */
+              for (int r = 0; r < 10; r++) { xnet_sync(); const double t0 = now(); float *g = nullptr; xt y = xconv_fwd_gs16(&c1, x1, 16, 1e-5f, &g); xnet_sync(); const double t = now() - t0; xt_free(&y); xfree_dev(g); if (t < best) best = t; }
+              printf("dfbench c1gs %d: %.3f ms\n", v, best * 1e3); }
+          xnet_set_c1gs(-1);
           xnet_set_df1(-1); xt_free(&x1); xconv_free(&c1); }
         return 0;
     }
@@ -366,6 +389,9 @@ int main(void) {
     for (int sf = 6; sf >= 5; sf--) { fails += run(sf, 2, 9, 7, 11, 32, 32, 3, 1, 2); fails += run(sf, 1, 6, 5, 7, 128, 256, 1, 1, 0); }
     g_mxa = 0; xnet_set_mxq(0); xnet_set_mxrot(0); xnet_set_mxa(0);
     fails += run_dattn(2, 17, 40, 36);
+    fails += run_c1gs(2, 17, 40, 36);   /* 64 chunks, a ragged last step */
+    fails += run_c1gs(3, 5, 9, 23);     /* S / 64 chunks */
+    fails += run_c1gs(1, 17, 96, 96);
     fails += run_ts(2, 1, 7, 9, 32, 16);     /* ragged, two samples */
     fails += run_ts(1, 1, 24, 24, 64, 8);
     fails += run_ts(3, 1, 5, 13, 16, 64);

@@ -613,8 +613,8 @@ static void reader_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out)
     }
     uint8_t *dev; upload_tiles(tiles, B, D, T, T, &dev);
     xt x0 = xinput_u8(dev, B, D, T, T, lo, hi, a, b); xfree_dev(dev);
-    xt f1 = xconv_fwd(&n->f1, x0, nullptr, XA_NONE); xt_free(&x0);
-    float *g1 = xgn_stats(f1, f1.c, 1e-5f); xt f2 = xconv_fwd_gnin(&n->f2, f1, g1, g1 + (size_t)f1.n * f1.c, n->f1g, n->f1b, XA_LRELU); xfree_dev(g1); xt_free(&f1);
+    float *g1 = nullptr; xt f1 = xconv_fwd_gs16(&n->f1, x0, 16, 1e-5f, &g1); xt_free(&x0);
+    xt f2 = xconv_fwd_gnin(&n->f2, f1, g1, g1 + (size_t)f1.n * f1.c, n->f1g, n->f1b, XA_LRELU); xfree_dev(g1); xt_free(&f1);
     static int fused = -1; if (fused < 0) fused = getenv("UFSM_IE_DATTN") ? atoi(getenv("UFSM_IE_DATTN")) : 1;   /* 0: the separate GN / head / attention kernels; mgpu: env */
     xt z;
     if (fused && f2.c == 16 && D <= 32) { z = xdepth_collapse16(f2, f2.c, n->f2g, n->f2b, 1e-5f, XA_LRELU, n->att_w, n->att_b); xt_free(&f2); }
