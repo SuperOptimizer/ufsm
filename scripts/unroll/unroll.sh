@@ -101,7 +101,13 @@ elif [ -z "${CUDA_VISIBLE_DEVICES+x}" ]; then
   GVIS=$(echo $GVIS); export CUDA_VISIBLE_DEVICES=${GVIS// /,} UNROLL_GVIS=$GVIS
 fi
 lg() { local i=0 g; [ -n "$GVIS" ] && for g in $GVIS; do [ "$g" = "$1" ] && { echo $i; return; }; i=$((i + 1)); done; echo $1; }
-sgpu() { [ -n "$GVIS" ] && [ -n "$SGPU" ] && echo "CUDA_VISIBLE_DEVICES=$SGPU"; return 0; }
+# sgpu: SGPU's card for the stages without a --gpu. With the caller's CUDA_VISIBLE_DEVICES (no GVIS) SGPU is an index into that list, as
+# --gpu is (lg): before 11-18 it was then ignored and the ref count-field ran on the list's first card (CUDA_VISIBLE_DEVICES=0,1 SGPU=1:
+# card 0, the training card; fix0332 gn1667)
+sgpu() { [ -n "$SGPU" ] || return 0
+  if [ -n "$GVIS" ]; then echo "CUDA_VISIBLE_DEVICES=$SGPU"
+  elif [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then local a; IFS=, read -r -a a <<< "$CUDA_VISIBLE_DEVICES"; [ -n "${a[$SGPU]:-}" ] && echo "CUDA_VISIBLE_DEVICES=${a[$SGPU]}"; fi
+  return 0; }
 # SLABI / SLABOV: slab cells / overlap (default 64 / 16). A full-section Paris 3 slab (96 x 3680 x 4768 fields, 16.8 GB) does not fit a 16 GB GPU and
 # runs from managed memory at 20-60 min per slab (desk 5060 Ti, 11-01); SLABI=32 (64 rows, 11.2 GB) fits the device.
 PRIZE="PHerc0125 PHerc0175A PHerc0175B PHerc0191 PHerc0211 PHerc0257 PHerc0268 PHerc0306B PHerc0358 PHerc0483A PHerc0483B PHerc0490A PHerc0490B PHerc0800 PHerc0813 PHerc0826 PHerc0846A PHerc0846B PHerc1203 PHerc1218 PHerc1545"
@@ -184,11 +190,11 @@ stage() {
   done_ $st && return 0; stopped && return 1
   if [ "$DRY" = 1 ]; then
     case $st in fields|slabs|ink|inkcal|perwrap|faces) echo "[$st] (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-unset}; per-job --gpu / devices)"; $fn;;
-      *) if [ -n "$(sgpu)" ]; then echo "[$st] (CUDA_VISIBLE_DEVICES=$SGPU)"; CUDA_VISIBLE_DEVICES=$SGPU $fn; else echo "[$st] (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-unset})"; $fn; fi;; esac
+      *) local sg; sg=$(sgpu); if [ -n "$sg" ]; then echo "[$st] ($sg)"; CUDA_VISIBLE_DEVICES=${sg#CUDA_VISIBLE_DEVICES=} $fn; else echo "[$st] (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-unset})"; $fn; fi;; esac
     return 0; fi
   log "$st start"; t0=$(date +%s); : >> $l; local m0=$(wc -l < $l)
   # (the stages that place themselves: fields / slabs / ink / perwrap pass --gpu or set CUDA_VISIBLE_DEVICES per job; the rest on SGPU)
-  case $st in fields|slabs|ink|inkcal|perwrap|faces) $fn;; *) if [ -n "$(sgpu)" ]; then CUDA_VISIBLE_DEVICES=$SGPU $fn; else $fn; fi;; esac; rc=$?
+  case $st in fields|slabs|ink|inkcal|perwrap|faces) $fn;; *) local sg; sg=$(sgpu); if [ -n "$sg" ]; then CUDA_VISIBLE_DEVICES=${sg#CUDA_VISIBLE_DEVICES=} $fn; else $fn; fi;; esac; rc=$?
   local cpu rss; read -r cpu rss < <(tail -n +$((m0 + 1)) $l | awk -F': ' '/User time|System time/ {c += $2} /Maximum resident/ {if ($2 > r) r = $2} END {printf "%.0f %.1f\n", c, r / 1048576}')
   if [ $rc = 0 ]; then echo "$(( $(date +%s) - t0 )) s wall, ${cpu:-0} CPU s, ${rss:-0} GB max RSS" > $O/state/$st.done; log "$st done: $(cat $O/state/$st.done)"; mstage $st
   else log "$st FAILED rc $rc (logs/$st.log)"; fi
