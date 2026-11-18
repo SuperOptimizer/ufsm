@@ -561,7 +561,10 @@ __global__ void __launch_bounds__(256) up_coarse_f4v_k(const mx4_t *__restrict__
 }
 /* the up segment at fine planes [a, a + L): f4ru_blend's trilinear blend of the coarse rows (the same taps, weights, half2 sums and order),
    requantised to e2m1 per (32-channel block, voxel) as conv_fwd_f4_k's staging: a depth-L MX-fp4 tensor of Cx channels */
-__global__ void __launch_bounds__(256) up_fine_f4v_k(const uint8_t *__restrict__ cu, int N, int cza, int Lc, int D, int H, int W, int a, int L, uint8_t *__restrict__ y) {
+#ifndef UPF_MINB   /* 4 blocks of 256 an SM (was 99 registers -> 2 blocks, 31 % occupancy): fields 0332 640 3.42 -> 2.79 / 2.69 / 3.12 ms a window at 3 / 4 / 6; byte-identical */
+#define UPF_MINB 4
+#endif
+__global__ void __launch_bounds__(256, UPF_MINB) up_fine_f4v_k(const uint8_t *__restrict__ cu, int N, int cza, int Lc, int D, int H, int W, int a, int L, uint8_t *__restrict__ y) {
     const int blk = blockIdx.y, n = blockIdx.z, nb1 = gridDim.y, HW = H * W, Dc = D >> 1, Hc = H >> 1, Wc = W >> 1;
     const size_t Ls = (size_t)L * HW, v0 = (size_t)blockIdx.x * 256 + threadIdx.x, Lcs = (size_t)Lc * Hc * Wc;
     if (v0 >= Ls) return;
