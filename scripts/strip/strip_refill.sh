@@ -29,6 +29,8 @@ S=($(ls $OUT/strip/flat/stripes))
 # INKGATE="ROOT1 ROOT2" (key INKK; the latent ink head's c12 / c13 = p_recto / p_verso, papyrus only, never supervised in air): every
 # stripe's ink render x max(p1, p2) / 255 (air -> 0; inkB's GATE=1), marked <s>.gated; only when both stores exist
 GATED=0; if [ -n "${INKGATE:-}" ]; then GATED=1; for gr in $INKGATE; do [ -e $gr/zarr.json ] || GATED=0; done; fi
+# R3INK and ungated: the ink render is replaced by r3ink.sh before anything reads it, so render writes only the CT (+ fill flags)
+VOUT=; [ -n "${R3INK:-}" ] && [ $GATED = 0 ] && VOUT="--volume-out 0"
 # the stripes rendered here take the gates in the same render pass (render --gate: the gate volumes at the ink's points, the same fill and
 # inpaint; byte for byte the three renders + img-gate below, test_render_gate; 2026-11-17); gate() is left for the driver's renders
 GX=(); if [ $GATED = 1 ]; then for gr in $INKGATE; do GX+=(--gate $gr $INKK); done; fi
@@ -48,7 +50,7 @@ if [ $GATED = 1 ] && [ -z "${STRETCH:-}" ] && [ ! -e $OUT/stretch.gated ]; then
   # would pull it): CT 0.5 / 99.8 % over rendered pixels (CT > 0), ink 1 / 99.9 % over papyrus pixels only (CT >= CTL), lead 11-13
   N=${#S[@]}; mids=(); for k in $((N / 2 - 1)) $((N / 2)) $((N / 2 + 1)); do [ $k -ge 0 ] && [ $k -lt $N ] && mids+=(${S[$k]}); done
   for s in "${mids[@]}"; do [ -e $R/$s.done ] || { mkdir -p $R/in_$s; ln -sfn $OUT/strip/flat/stripes/$s $R/in_$s/$s
-      UFSM_RENDER_MEM=16 nice -n 10 $U render $R/in_$s $R --volume $INK $INKK --ct $CTR $CTK --depth 1 --scale 1 --threads $RENDER_NT $FILLX "${GX[@]}" > $OUT/logs/refill_$s.log 2>&1 || { log "render $s FAILED"; exit 1; }
+      UFSM_RENDER_MEM=16 nice -n 10 $U render $R/in_$s $R --volume $INK $INKK --ct $CTR $CTK --depth 1 --scale 1 --threads $RENDER_NT $FILLX "${GX[@]}" $VOUT > $OUT/logs/refill_$s.log 2>&1 || { log "render $s FAILED"; exit 1; }
       r3 $s || exit 1
       [ -e $R/${s}_fill.tif ] && mv $R/${s}_fill.tif $M/; rm -r $R/in_$s; touch $R/$s.gated $R/$s.done; }
     gate $s || exit 1; done

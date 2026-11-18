@@ -46,6 +46,7 @@
 
 int cmd_ingest_labels(int argc, char **argv);
 int cmd_z3_recode(int argc, char **argv);   /* src/ingest.c */
+int cmd_z3_fetch(int argc, char **argv);    /* src/z3fetch.c */
 int cmd_ink_blend(int argc, char **argv);   /* src/ingest.c */
 int cmd_ink_seam(int argc, char **argv);   /* src/inkseam.c */
 int cmd_ingest_kaggle(int argc, char **argv);
@@ -152,6 +153,7 @@ static int usage(void) {
         "  ufsm axis    <root> <ct-group-key> <out.json> [--cache DIR]  -> per-z centroid axis (umbilicus stand-in)\n"
         "  ufsm ingest-labels <root> <zarr-key> <out-dir> --um U   HF/S3 zarr v2 labels -> volcomp pyramid\n"
         "  ufsm z3-recode <group-dir> <out-group> --um U --lut FILE [--hist 1]   a local prob254 pyramid through a LUT (255 kept), value histogram\n"
+        "  ufsm z3-fetch ROOT KEY --cache DIR --box z,y,x,dz,dy,dx [--scale F] [--margin 128] [--threads 16]   the box's chunks into a z3 chunk cache (no decode)\n"
         "  ufsm ink-blend <out> --um U --tile S,S,S --grids z,y,x:... <in1> <in2> ...   overlapping uint8 predicts (predict --grid-origin) blended with sin^2 tile weights\n"
         "  ufsm ink-seam <zarr> --um U [--period 512] [--offset 0] [--n 24]   window-seam jump of a uint8 predict (border vs interior |dv|)\n"
         "  ufsm ingest-zip <labels.zip> <zarr-name> <out-dir> --um U  label zarr from the HF archive -> volcomp pyramid\n"
@@ -4458,8 +4460,12 @@ static int cmd_render(int argc, char **argv) {
 "    papyrus gate in one render instead of three\n"
 "  --known: nearest voxel, 255 (prob254 unknown) skipped, the max over the known values within +-depth (label zarrs: ink-splat output);\n"
 "    on the CPU (the box read once when it fits UFSM_RENDER_MEM, else per tile); not with --fill / --joint\n"
-                                     "  --crop: only that rectangle of each wrap's output pixels is rendered and written (e.g. a labelled region)\n"); return 2; }
+                                     "  --crop: only that rectangle of each wrap's output pixels is rendered and written (e.g. a labelled region)\n"
+                                     "  --volume-out 0 (needs --ct): the volume's image is not written, only <wrap>_ct.tif (+ _fill.tif): the unroll's INKMODE=r3 renders,\n"
+                                     "    whose volume is the CT itself and whose ink image r3ink.sh writes\n"); return 2; }
     const int vi = arg_index(argc, argv, "--volume"), ci = arg_index(argc, argv, "--ct");
+    const int vout = opt_atoi("--volume-out", opt(argc, argv, "--volume-out", "1"));
+    if (!vout && (ci < 0 || ci + 2 >= argc)) { fprintf(stderr, "render: --volume-out 0 needs --ct (nothing else is written)\n"); return 2; }
     int crop[4] = {0, 0, 0, 0}; const char *crs = opt(argc, argv, "--crop", nullptr);
     if (crs && (sscanf(crs, "%d,%d,%d,%d", &crop[0], &crop[1], &crop[2], &crop[3]) != 4 || crop[0] < 0 || crop[1] < 0 || crop[2] < 1 || crop[3] < 1)) { fprintf(stderr, "render: --crop x,y,w,h\n"); return 2; }
     if (vi < 0 || vi + 2 >= argc) { fprintf(stderr, "render: --volume ROOT KEY\n"); return 2; }
@@ -4569,7 +4575,7 @@ static int cmd_render(int argc, char **argv) {
                 uint8_t *img = im[k * nvol + v]; int fw = ow, fh = oh;
                 if (crs) { uint8_t *c2 = img_crop_u8(img, ow, oh, crop[0], crop[1], crop[2], crop[3]); if (!c2) { ok = 0; break; } free(img); im[k * nvol + v] = img = c2; fw = crop[2]; fh = crop[3]; }
                 char p[1400]; snprintf(p, sizeof p, "%s/%s%s.tif", argv[3], nm[k], v ? "_ct" : "");
-                if (tiffw_write(p, fw, fh, 1, img, 1)) { fprintf(stderr, "render: cannot write %s\n", p); ok = 0; }
+                if ((v || vout) && tiffw_write(p, fw, fh, 1, img, 1)) { fprintf(stderr, "render: cannot write %s\n", p); ok = 0; }
             }
             for (int k = 0; k < nj * nvol; k++) free(im[k]);
         }
@@ -4660,7 +4666,7 @@ static int cmd_render(int argc, char **argv) {
         { /* the renders (and the fill flags) written concurrently, each compressed on its own threads */
           rw_job wj[3] = {0}; int nj = 0; pthread_t wt[3];
           if (flag) { snprintf(wj[nj].path, sizeof wj[nj].path, "%s/%s_fill.tif", argv[3], de->d_name); wj[nj].data = flag; nj++; }
-          snprintf(wj[nj].path, sizeof wj[nj].path, "%s/%s.tif", argv[3], de->d_name); wj[nj].data = img; nj++;
+          if (vout) { snprintf(wj[nj].path, sizeof wj[nj].path, "%s/%s.tif", argv[3], de->d_name); wj[nj].data = img; nj++; }
           if (cimg) { snprintf(wj[nj].path, sizeof wj[nj].path, "%s/%s_ct.tif", argv[3], de->d_name); wj[nj].data = cimg; nj++; }
           for (int k = 0; k < nj; k++) { wj[k].w = fw; wj[k].h = fh; pthread_create(&wt[k], nullptr, rw_write, &wj[k]); }
           int bad = 0; for (int k = 0; k < nj; k++) { pthread_join(wt[k], nullptr); if (wj[k].rc) { fprintf(stderr, "render: cannot write %s\n", wj[k].path); bad = 1; } }
@@ -4866,6 +4872,7 @@ static int ufsm_main(int argc, char **argv) {
     }
     if (!strcmp(cmd, "ingest-labels")) return cmd_ingest_labels(argc, argv);
     if (!strcmp(cmd, "z3-recode")) return cmd_z3_recode(argc, argv);
+    if (!strcmp(cmd, "z3-fetch")) return cmd_z3_fetch(argc, argv);
     if (!strcmp(cmd, "ink-blend")) return cmd_ink_blend(argc, argv);
     if (!strcmp(cmd, "ink-seam")) return cmd_ink_seam(argc, argv);
     if (!strcmp(cmd, "ingest-kaggle")) return cmd_ingest_kaggle(argc, argv);

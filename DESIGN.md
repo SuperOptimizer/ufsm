@@ -6,6 +6,36 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## rectosp's m7 source fetched beside the fields: ufsm z3-fetch, 17.9k chunks cold in 22 s (2026-11-17, branch rdup-20261117)
+
+fp4teach found the pod's rectosp stage (103 s) waiting 77 s on its helper, mostly the cold network fetch of the m7 prob source (desk:
+cold 137 s wall / 104 s wait, warm cache 35.6 / 11.7 s). The source box is known at run start (box.txt), so unroll.sh now runs
+`ufsm z3-fetch SRC KEY --cache fields/rsp.cache --box BOX --scale LUM/um` in the background from the fields' start (m7fetch; M7FETCH=0
+off; rectosp stops it by PID before removing the cache). z3-fetch fetches every present inner chunk the box (+- 128 voxels) touches into
+z3_open's chunk cache, no decode, z first; per shard the box's uncached chunks are read in file order with neighbours merged into one
+range request exactly as z3_read coalesces (gap <= UFSM_Z3_GAP 64 KiB, span <= UFSM_Z3_SPAN 2 MiB; z3_prefetch_shard). Cache files are
+the ones z3_read writes (cache_put, tmp + rename): a reader beside it is safe.
+
+1667 m7 source (L2 prob, 9.596 um, 1024^3 shards of 128^3), the whole scroll box, desk, cold cache, 8 threads:
+
+| fetch | wall | chunks fetched |
+|---|---|---|
+| one request per inner chunk (z3_prefetch_chunk) | 323 s | 17,893 |
+| per shard, coalesced (z3_prefetch_shard, 160 shards) | 22.3 s | 17,893 |
+
+17,893 = the pod rectosp's 6,536 GPU- + 11,304 host-decoded chunks plus the margin's. 22 s is well inside the fields' 99 s, so rectosp
+should start warm (fp4teach's warm 35.6 s vs cold 137 s on the desk; the pod's 103 s -> ~30 s expected, not yet measured end to end).
+Test: test_z3_fetch (a 256^3-sharded array over a local range-serving HTTP root: 6 chunks in the box, 4 present, fetched in 1 request;
+a second fetch fetches nothing; the box then reads through the cache with no chunk requests and equals the local array).
+
+## render --volume-out 0: the r3 renders write no volume image (2026-11-17, branch rdup-20261117)
+
+Under INKMODE=r3 render's volume image (<wrap>.tif / <stripe>.tif) is always replaced by r3ink.sh (mv over it) before anything reads
+it, so writing it was wasted (the pod's ws000: writes 9.7 s, three images on their own threads). render --volume-out 0 (needs --ct)
+writes only <wrap>_ct.tif and the fill flags; the volume itself stays, aliased to the CT (decoded once, section below), because --fill's
+search needs a volume beside the CT. unroll.sh passes it on the per-wrap and the 3 stretch renders when INKMODE=r3 and the render has
+no --gate; strip_refill.sh when R3INK is set and it is ungated. test_render_gate: no volume image, CT and fill flags equal.
+
 ## render decodes one array once when it is several volumes: the r3 renders' CT x2 -> x1 (same bytes; 2026-11-17, branch rdup-20261117)
 
 Under INKMODE=r3 the unroll's renders pass the CT as both --volume and --ct (the volume's render is replaced by r3ink.sh), so every stripe

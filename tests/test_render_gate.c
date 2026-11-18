@@ -4,7 +4,7 @@
    same fill flags) combined by ufsm img-gate, which is the numpy float32 step strip_refill.sh used (test_img_gate.py); the CT render
    and the fill flags are those of the ungated render. argv[2] = "gpu": the gated render also on the GPU path (render --gpu 1), equal to
    the CPU's. --gate without --fill is refused. One array given as volume, CT and gate is decoded once (render's alias, 2026-11-17)
-   with the same bytes as per volume (UFSM_RENDER_ALIAS=0). */
+   with the same bytes as per volume (UFSM_RENDER_ALIAS=0); --volume-out 0 writes no volume image and the same CT / fill. */
 #include "imgops.h"
 #include "tiffw.h"
 #include "z3w.h"
@@ -108,6 +108,20 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr, "test_render_gate: %s: one array as volume, CT and gate: decoded once, equal\n", m ? "GPU" : "CPU");
         for (int al = 0; al < 2; al++) for (int k = 0; k < 3; k++) free(im[al][k]);
+    }
+    {   /* --volume-out 0 (the r3 renders: r3ink.sh writes the ink image): no <wrap>.tif, the CT and fill flags those of the full render */
+        snprintf(cmd, sizeof cmd, "mkdir -p '%s/vo' && '%s' render '%s/wraps' '%s/vo' --volume '%s' ct.zarr/0 --ct '%s' ct.zarr/0 --scale %g %s --volume-out 0 --gpu %d 2> '%s/vo.log' && "
+                 "mkdir -p '%s/vf' && '%s' render '%s/wraps' '%s/vf' --volume '%s' ct.zarr/0 --ct '%s' ct.zarr/0 --scale %g %s --gpu %d 2> '%s/vf.log'",
+                 dir, argv[1], dir, dir, dir, dir, gs, FX, gpu, dir, dir, argv[1], dir, dir, dir, dir, gs, FX, gpu, dir);
+        CHECK(!system(cmd), "render --volume-out 0 failed");
+        snprintf(p, sizeof p, "%s/vo/w000.tif", dir); CHECK(access(p, F_OK) != 0, "--volume-out 0 wrote %s", p);
+        char q[1200]; snprintf(p, sizeof p, "%s/vo", dir); snprintf(q, sizeof q, "%s/vf", dir);
+        uint8_t *oc = rd(p, "w000_ct.tif", ow, oh), *of = rd(p, "w000_fill.tif", ow, oh), *fc = rd(q, "w000_ct.tif", ow, oh), *ff = rd(q, "w000_fill.tif", ow, oh);
+        CHECK(!ndiff(oc, fc, no) && !ndiff(of, ff, no), "--volume-out 0: CT %zu, fill flags %zu pixels differ", ndiff(oc, fc, no), ndiff(of, ff, no));
+        free(oc); free(of); free(fc); free(ff);
+        snprintf(cmd, sizeof cmd, "'%s' render '%s/wraps' '%s/vo' --volume '%s' ct.zarr/0 --volume-out 0 --gpu 0 2> /dev/null", argv[1], dir, dir, dir);
+        CHECK(system(cmd) != 0, "--volume-out 0 without --ct accepted");
+        fprintf(stderr, "test_render_gate: --volume-out 0: no volume image, CT and fill flags equal\n");
     }
     snprintf(cmd, sizeof cmd, "'%s' render '%s/wraps' '%s/b' --volume '%s' ink.zarr/0 --ct '%s' ct.zarr/0 --gate '%s' g1.zarr/0 --gpu 0 2> /dev/null", argv[1], dir, dir, dir, dir, dir);
     CHECK(system(cmd) != 0, "--gate without --fill accepted");

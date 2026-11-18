@@ -127,6 +127,8 @@ FNAME=$([ "$FKIND" = lat ] && echo lat || echo wind96)
 F=$O/fields/$FNAME; REF=$O/ref-cf; INK=$O/ink/$INKNAME.zarr
 # the renders' --volume: the ink volume, or with INKMODE=r3 the CT itself (its render is replaced by r3ink.sh); r3ink.sh's settings exported
 if [ "$INKMODE" = r3 ]; then VROOT=$R; VKEY=$K/$LV; else VROOT=$INK; VKEY=$LUM; fi
+# (r3: render decodes that CT once for both, render's alias 2026-11-17, and writes no volume image, --volume-out 0: r3ink.sh writes it)
+VOUT=$([ "$INKMODE" = r3 ] && echo "--volume-out 0")
 [ "$INKMODE" = r3 ] && export U R3CTR=$R R3CTK=$K R3W R3MODEL=${R3MODEL:-reader3} R3GATE=${R3GATE:-${FILLCT:-80}} R3TH=${R3TH:-8} R3X="--ct-um $UM --batch ${R3BATCH:-16} ${R3X:-}"   # (a pinned --batch: auto-sized from free memory it changed 0.7 % of px by 1 LSB, unrollperf 11-17)
 # r3pre OUT GPU SURF..: ONE ink-ext over every surface that has no map in OUT yet (decoded chunks resident across surfaces, --ct-mem LRU;
 # the fetched ones in the run's shared --cache $O/ink/ct.cache: neighbouring 1667 wraps share ~83 % of their chunks, a cold wrap was 46 of 50 s
@@ -462,12 +464,29 @@ m7src() {
   key=$(curl -sf --max-time 60 $base/$z/ | grep -o 'href="[0-9.]*/"' | sed 's/href="//; s/\/"$//' | sort -g | head -1)
   [ -n "$key" ] && echo "$base/$z $key $key"
 }
+# m7fetch: the source box's chunks into rectosp's cache (ufsm z3-fetch, no decode) from the run start, beside the fields: on the pod
+# rectosp waited 77 of its 103 s on the cold fetch of the m7 source (~18k chunks; desk cold 137 s wall / 104 s wait vs warm 35.6 / 11.7 s,
+# fp4teach 2026-11-17). Its box is the run's box (CT level LV voxels) x LUM / the source um, +- 128 voxels (recto-sp's ring spans the
+# box's whole y / x extent). M7FETCH=0 off. rectosp stops it (by PID, m7stop) before it removes the cache.
+m7fetch() {
+  { [ "${RECTOSP:-1}" = 0 ] || [ "${M7FETCH:-1}" = 0 ]; } && return 0
+  [ "$DRY" = 1 ] && { echo "    (beside the fields: ufsm z3-fetch of the m7 source box into $O/fields/rsp.cache, logs/m7fetch.log)"; return 0; }
+  done_ rectosp && return 0
+  local src; src=$(m7src) || return 0; set -- $src
+  mkdir -p $O/fields $O/logs
+  nice -n 10 $U z3-fetch $1 $2 --cache $O/fields/rsp.cache --box $(cat $O/box.txt) --scale $(awk -v a=$LUM -v b=$3 'BEGIN { printf "%.6g", a / b }') \
+    --threads ${M7FETCHT:-16} > $O/logs/m7fetch.log 2>&1 || true
+}
+m7stop() {   # the m7fetch subshell and its z3-fetch, if still running (by PID; it only ever adds cache files)
+  [ -n "${M7P:-}" ] || return 0; local c; for c in $(pgrep -P $M7P); do kill $c 2> /dev/null; done; kill $M7P 2> /dev/null
+  while kill -0 $M7P 2> /dev/null; do sleep 1; done; M7P=
+}
 rectosp() {
   local src; src=$(m7src) || { log "rectosp: no m7 prob for $S $(basename $K | cut -c1-14) level $LV on the mirror: skipped (fields unchanged)"; [ "$DRY" = 1 ] || echo none > $O/rectosp.src; return 0; }
   log "rectosp: source $src"; [ "$DRY" = 1 ] || echo "$src" > $O/rectosp.src
   [ "$DRY" = 1 ] || rm -rf $O/fields/rsp
   X $O/logs/rectosp.log $U recto-sp $F $O/fields/rsp --src $src --cache $O/fields/rsp.cache --threads $TH ${RECTOSPX:---half-um 400 --half2-um 800 --blend 0.3} &&
-    { [ "$DRY" = 1 ] || { rm -rf $O/fields/rsp.cache; [ -e $O/fields/rsp/sp/zarr.json ]; }; }
+    { [ "$DRY" = 1 ] || { m7stop; rm -rf $O/fields/rsp.cache; [ -e $O/fields/rsp/sp/zarr.json ]; }; }
 }
 
 # --- ink (another agent's recipe via INKCMD SCROLLDIR GPU OUT; default the feathered single pass of scripts/corpus/inklib.sh) ---
@@ -810,7 +829,7 @@ stripimg() {
     # gated stretch strip_refill.sh computes replaces it either way)
     local GX=() g; for g in $(inkgate); do GX+=(--gate $g $LUM); done
     srend() { local s=$1; mkdir -p $RF/in_$s; ln -sfn $ST/strip/flat/stripes/$s $RF/in_$s/$s
-      env $E /usr/bin/time -v nice -n 10 $U render $RF/in_$s $RF --volume $VROOT $VKEY --ct $R $K/$LV --depth 1 --scale 1 --threads ${RENDER_NT:-$TH} $FILLX "${GX[@]}" > $ST/logs/refill_$s.log 2>&1 || return 1
+      env $E /usr/bin/time -v nice -n 10 $U render $RF/in_$s $RF --volume $VROOT $VKEY --ct $R $K/$LV --depth 1 --scale 1 --threads ${RENDER_NT:-$TH} $FILLX "${GX[@]}" $([ ${#GX[@]} = 0 ] && echo $VOUT) > $ST/logs/refill_$s.log 2>&1 || return 1
       if [ "$INKMODE" = r3 ]; then env $E bash $H/r3ink.sh $ST/strip/flat/stripes/$s $RF/$s.tif $RF/${s}_ct.tif >> $ST/logs/refill_$s.log 2>&1 || return 1; touch $RF/$s.r3; fi   # (.r3: strip_refill.sh reuses it)
       [ -e $RF/${s}_fill.tif ] && mv $RF/${s}_fill.tif $ST/fillmap/; rm -r $RF/in_$s; [ ${#GX[@]} -gt 0 ] && touch $RF/$s.gated; touch $RF/$s.done; }
     for k in $((N / 2 - 1)) $((N / 2)) $((N / 2 + 1)); do [ $k -ge 0 ] && [ $k -lt $N ] || continue; s=${S[$k]}; [ -e $RF/$s.done ] && continue
@@ -839,7 +858,7 @@ pw_one() {   # pw_one WRAP GPU (a background subshell: the cache env stays in it
   fi
   nice -n 10 $U tifxyz-scale $O/flat $O/up 1 --wraps $w --flip-rows 1 > /dev/null 2>&1 || return 1
   mkdir -p $d/in; ln -sfn $O/up/$w $d/in/$w
-  UFSM_RENDER_MEM=16 UFSM_RENDER_CHUNKED=1 UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} CUDA_VISIBLE_DEVICES=$gpu nice -n 10 $U render $d/in $d --volume $VROOT $VKEY --ct $R $K/$LV --depth 1 --scale 1 --threads ${RTH:-8} > $d/render.log 2>&1 || return 1
+  UFSM_RENDER_MEM=16 UFSM_RENDER_CHUNKED=1 UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} CUDA_VISIBLE_DEVICES=$gpu nice -n 10 $U render $d/in $d --volume $VROOT $VKEY --ct $R $K/$LV --depth 1 --scale 1 --threads ${RTH:-8} $VOUT > $d/render.log 2>&1 || return 1
   [ "$INKMODE" = r3 ] && { touch $d/.rendered; return 0; }   # (r3: pw_fin after the one ink-ext over all wraps, perwrap)
   pw_fin $w
 }
@@ -890,7 +909,8 @@ upload() {
 # --- the schedule ---
 [ "$DRY" = 1 ] && echo "unroll $S: O=$O U=$U ($R $K level $LV, $LUM um; box ${BOX:--}, zr ${ZR:--}, strip args '${STRIPARGS}'; CK $CK: $FKIND fields $F)"
 mstart; stage prep prep || exit 1; upto prep
-stage fields fields || exit 1; upto fields
+M7P=; if [ "$DRY" = 1 ]; then m7fetch; else m7fetch & M7P=$!; fi
+stage fields fields || { m7stop; exit 1; }; upto fields
 # the ink on GPU $INKGPU. INKAT=slabs (default): its GroupNorm calibration beside the ref, the main pass from the end of the slabs, beside
 # the CPU stages join .. stripflat (P4 11-12: ink 892 s; with the fast ref its GPU-1 slab lane would wait for it); INKAT=fields: the
 # whole ink from the end of the fields, the GPU-1 slab lane waiting for it (before 11-12). The per-wrap renders beside the strip
@@ -907,7 +927,7 @@ if [ "${NOINK:-0}" != 1 ]; then
   if [ "$INKAT" = fields ]; then inkbg; else rm -f $O/state/inkcal.failed; ( stage inkcal inkcal || touch $O/state/inkcal.failed ) & [ "$DRY" = 1 ] && wait; fi
 fi
 inkmain() { [ "${NOINK:-0}" != 1 ] && [ "$INKAT" != fields ] && ! done_ ink && inkbg; return 0; }
-{ [ "${RECTOSP:-1}" = 0 ] || stage rectosp rectosp; } || { log "unroll: rectosp failed"; wait; exit 1; }
+{ [ "${RECTOSP:-1}" = 0 ] || stage rectosp rectosp; } || { log "unroll: rectosp failed"; m7stop; wait; exit 1; }
 [ "${RECTOSP:-1}" != 0 ] && { [ -e $O/fields/rsp/fields.json ] || { [ "$DRY" = 1 ] && [ -n "$(m7src)" ]; }; } && F=$O/fields/rsp   # (the ref and every later stage read the blended fields)
 { [ "${CTCAL:-0}" != 1 ] || stage ctcal ctcal; } && stage ref ref && upto ref && stage slabs slabs && inkmain && upto slabs && stage join join && upto join && stage check check && upto check &&
   stage wraps wraps && upto wraps && stage trim trim && stage snap snap && upto snap ||
