@@ -1100,6 +1100,7 @@ static int sc_boxes_load(const char *path, const char *mode) {
 /* fit --score-mf THR conf|unc [--score-mf-dir DIR]: score only the label voxels whose field cell has mf < THR (conf: the part an
    abstaining export keeps as confident) or mf >= THR (unc), mf the merged-sheet plane of ufsm merge-flag (src/mergeflag.h) in the
    fields directory (or DIR: same box). Label voxel i (label grid) lies at native cf (i + 1/4); its cell floor((that - org) / h). */
+/* mgpu: process (set from the fit options before the scorer's reader threads start; read-only after) */
 static uint8_t *g_mf; static int g_mf_shp[3], g_mf_thr, g_mf_unc; static double g_mf_cf, g_mf_h; static long long g_mf_org[3];
 static void sc_mf_apply(const int64_t o[3], const int64_t n[3], uint8_t *b) {
     for (int64_t z = 0; z < n[0]; z++) {

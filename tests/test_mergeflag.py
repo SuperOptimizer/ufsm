@@ -97,4 +97,10 @@ with tempfile.TemporaryDirectory(prefix="ufsm-mflag-") as tmp:
     exp = np.mean(mf[20 // h, (gy // h).astype(int), (gx // h).astype(int)] >= 128)
     assert row[0] == "w005" and abs(float(row[2]) - exp) < 1e-3, (row, exp)
     assert 0.4 < exp < 0.6, exp
+    from PIL import Image
+    g = np.array(Image.open(t / "mfw" / "w005_mf.tif")); assert g.shape == gx.shape, g.shape   # the vertex grid
+    run(BIN, "wrap-mf", t / "wraps", "--fields", f, "--pool", "1", "--out", t / "mfr", "--render", "1")
+    rr = np.array(Image.open(t / "mfr" / "w005_mf.tif"))
+    assert rr.shape == ((gx.shape[0] - 1) * 4 + 1, (gx.shape[1] - 1) * 4 + 1), rr.shape   # ufsm render --scale 1's pixel grid (step 4)
+    assert (rr[::4, ::4] == g).all()
     print("test_mergeflag: PASS")

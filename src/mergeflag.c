@@ -15,7 +15,7 @@
 #include <sys/stat.h>
 
 /* fitted on the wbench boxes' GT intervals (u1 13790 + try9 fields; DESIGN 2026-11-18 "merge-flag"): raw-unit coefficients */
-const mf_coef mf_coef_default = {.b = 4.6911, .c_amp = -2.8313, .c_r = -6.6699, .c_sp = -0.1483};
+const mf_coef mf_coef_default = {.b = 4.0041, .c_amp = -2.7562, .c_r = -6.5289, .c_sp = -0.0703};
 const int mf_thr_default = 128;
 
 enum { MF_R = 4 };

@@ -970,19 +970,20 @@ int cmd_ink_cover(int argc, char **argv) {
     return 0;
 }
 
-/* ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR] [--thr 128] [--pool 4] [--out DIR [--up K]] [--tsv FILE]: the merged-sheet
+/* ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR] [--thr 128] [--pool 4] [--out DIR [--render 1]] [--tsv FILE]: the merged-sheet
    flag (ufsm merge-flag, src/mergeflag.h) on every wrap: each vertex reads the share of mf >= thr cells in its pooled cell (pool^3
    field cells, fit_field_array_frac: a whole scroll's plane at pool 4 is ~1/64 of its cells). Per wrap the uncertain share (mean
    share over the valid vertices) and the share of vertices in a cell at least half flagged; --out: <wrap>_mf.tif per wrap (uint8
-   share x255 on the vertex grid, 0 off the surface; --up K: each vertex K x K pixels, a render at K pixels per grid step). The
+   share x255 on the vertex grid, 0 off the surface; --render 1: on the pixel grid of ufsm render --scale 1 of that tifxyz instead, i.e.
+   (w - 1) step + 1 x (h - 1) step + 1 pixels, each the nearest vertex's: a channel beside <wrap>_ct.tif / <wrap>.tif). The
    uncertain vertices are where the exported wrap should not be read as a confident sheet. */
 int cmd_wrap_mf(int argc, char **argv) {
     if (argc < 3 || !sopt(argc, argv, "--fields", nullptr)) {
-        fprintf(stderr, "usage: ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR (default: the fields dir)] [--thr 128] [--pool 4] [--out DIR [--up 1]] [--tsv FILE]\n"); return 2;
+        fprintf(stderr, "usage: ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR (default: the fields dir)] [--thr 128] [--pool 4] [--out DIR [--render 1]] [--tsv FILE]\n"); return 2;
     }
     const char *fd = sopt(argc, argv, "--fields", ""), *md = sopt(argc, argv, "--mf", fd), *od = sopt(argc, argv, "--out", nullptr), *tp = sopt(argc, argv, "--tsv", nullptr);
-    const int thr = opt_atoi("--thr", sopt(argc, argv, "--thr", "128")), pool = opt_atoi("--pool", sopt(argc, argv, "--pool", "4")), up = opt_atoi("--up", sopt(argc, argv, "--up", "1"));
-    if (pool < 1 || up < 1 || thr < 1 || thr > 255) { fprintf(stderr, "wrap-mf: --pool, --up >= 1, --thr 1..255\n"); return 2; }
+    const int thr = opt_atoi("--thr", sopt(argc, argv, "--thr", "128")), pool = opt_atoi("--pool", sopt(argc, argv, "--pool", "4")), rgrid = opt_atoi("--render", sopt(argc, argv, "--render", "0"));
+    if (pool < 1 || thr < 1 || thr > 255) { fprintf(stderr, "wrap-mf: --pool >= 1, --thr 1..255\n"); return 2; }
     sf_fields F; if (sff_load_geom(fd, &F)) { fprintf(stderr, "wrap-mf: cannot read the fields %s\n", fd); return 1; }
     int shp[3]; uint8_t *fr = fit_field_array_frac(md, "mf", pool, thr, shp);
     if (!fr) { fprintf(stderr, "wrap-mf: cannot read the mf plane in %s (ufsm merge-flag)\n", md); sff_free(&F); return 1; }
@@ -1009,8 +1010,11 @@ int cmd_wrap_mf(int argc, char **argv) {
         if (tf) fprintf(tf, "w%03d\t%zu\t%.5f\t%.5f\n", s.id, nv, nv ? sum / nv : 0, nv ? (double)nh / nv : 0);
         tot += sum; totf += nh; totv += nv;
         if (od) {
-            const int W = s.w * up, H = s.h * up; uint8_t *im = malloc((size_t)W * H);
-            for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) im[(size_t)y * W + x] = m[(size_t)(y / up) * s.w + x / up];
+            const double gs = rgrid ? s.step : 1; const int W = (int)((s.w - 1) * gs) + 1, H = (int)((s.h - 1) * gs) + 1; uint8_t *im = malloc((size_t)W * H);
+            for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+                int vy = (int)lrint(y / gs), vx = (int)lrint(x / gs); if (vy >= s.h) vy = s.h - 1; if (vx >= s.w) vx = s.w - 1;
+                im[(size_t)y * W + x] = m[(size_t)vy * s.w + vx];
+            }
             char p[1500]; snprintf(p, sizeof p, "%s/%s_mf.tif", od, s.name);
             if (tiffw_write(p, W, H, 1, im, 1)) { fprintf(stderr, "wrap-mf: cannot write %s\n", p); rc = 1; }
             free(im);
