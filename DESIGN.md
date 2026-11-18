@@ -26,6 +26,10 @@ conv with GN on load) ~1/5, k_gnpart + k_gn_apply ~1/7, k_dfc1 ~1/14, k_dattn ~1
 - Tried and dropped (bench, byte-identical but not faster): k_dfc1 with 2/4/8 x voxels a thread (float4 weights; 2.8 -> 6.7-8.3 ms),
   k_gnpart with 4 rows' loads in flight + an 8-channel k_gn_apply (2.55 -> 2.52 ms). The GN kernels' reader3 time is ~8000 small
   launches on the 2-D levels (~0.12 ms each): fusing the apply into the next conv's loads (as gnin) is the remaining lever.
+- Parked (branch convkwave-20261117): wave-aware tiles for > 64 outputs (128x128 / 128x64 / 64x64 / 64x32 picked by waves x
+  occupancy x per-tile cost). ncu showed the 24^2 x 320 layer at 108 blocks on 72 slots (1.5 waves, tensor pipe 77 % active) and 12^2
+  at 27 blocks; XMX_IGBENCH: 24^2 -11 %, 12^2 -29 %, 12^2 x 1280 -25 %, byte-identical, but those layers are ~10 % of conv_igemm and
+  the in-situ A/B (3 pairs, normalised by k_gnpart) showed no gain beyond the +-3 % noise of the shared card.
 ## Production ink = reader3 (INKMODE=r3, the default); inkpod parked: memorisation, not labels (2026-11-17, branch inkr3-20261117)
 
 User decision 11-17: the latent ink head (inkpod) is not used in production until it is retrained. On the 1667 held-out regions it
