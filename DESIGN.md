@@ -6,6 +6,51 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Latent-ink smoke on pod B: cancelled before a scored step. Cold https CT was the wall; the restart recipe (2026-11-18, scripts/inksmoke)
+
+The plan (user-approved: smoke test only, ~10.5 h) is the retrain from the inkpod diagnosis (section "Production ink = reader3").
+- Two arms of 3000 steps from the u1 trunk (`/vesuvius/ufsm/podun/u1-13000-w.ckpt`, sha1 0d056422; `--lat-basis klt1.lcb` required).
+  - A: human ink labels only.
+  - B: human labels + ink-teach soft labels from reader3 + ink9um. On 1667 held-out the reader3 + ink9um logit blend scores 0.8623 vs
+    reader3 + argus2 0.8601, both within noise of reader3's 0.8583.
+- Both arms: holdouts-20261118; `--replay 1 --fstem-drop 0 --ink-radial-drop 0.15 --ink-mil-r-um 50 --um-rungs 4.8,9.6:3
+  --trunk-lr-mult 0.2`; per-scroll weights P4 0.50, 0139 0.20, 1667 0.15, the rest 0.05 each.
+- Scoring on the desk (scripts in /vesuvius/ufsm/inksmoke). `score.sh TAG CKPT` = latink over the whole 1667 box at level 2 (9 min on desk
+  card 1), the 17 labelled up/ wraps rendered (ink, c12, c13) and gated with img-gate (3.6 min), then pairwrap held-out vs reader3.
+  Validated: inkpod-15000 re-scored this way gives the pod table's 0.5824 exactly, on the same 1,296,287 samples.
+
+**What happened on pod B** (RTX PRO 4000 24 GB, 10.2 CPUs, 31 GB cgroup):
+- Setup (master clone, build, mcc from ~/.local/mcc) and test_unet~narrow (PASS) took 5 min.
+- The GT fetch took about 1 min: 291 files, md5-checked, from open-data S3 + the HF bucket (`gtmanifest.py` / `gtfetch.sh`; no labels desk -> pod).
+- Arm A then ran 30 steps in 4 h: 0.003 samples/s, 3.2 Mvox/s, and 809-1732 s per 10 steps in the derived cache (19-37 k ink-target
+  cells computed per 10 steps).
+- Cause: the CT came over https, cold, through one sampler worker (1 worker / 2 slots for the 31 GB cgroup: the desk sampler-only check
+  of arm A held 23-24 GB RSS at 2 / 2; the pod trainer's anon was 17.4 GB at 1 worker, with memory.events "max" counting, no OOM). The
+  worker reads serially, ~1 MB/s: 13 GB of CT in 4 h. The ink targets themselves are computed on the GPU and disk-cached; they only waited
+  on the CT.
+- `ufsm prefetch arms/sources-A.json --levels 1,2 --threads 48 --P 1024` fixed the input side: 481,871 chunks (~132 KB each), 47 GB local,
+  30 MB/s, 42 min (08:00-08:42).
+- Arm A was relaunched on the warm cache at 08:42:43. The user stopped the pod at 08:43:38, before its index finished, so the warm-cache
+  step rate is unmeasured. Reference: inkpod at P 1024 with local CT ran 0.8 samples/s, i.e. ~1 h for a 3000-step arm.
+
+**Fixes found on the way (merged):**
+- The ink onfly path took at most 64 held-out boxes per scan, and 1667 has 74 (all on labelled meshes). Now INKFLY_MAXEXCL = 256 (the boxes
+  are in device memory).
+- `--lat-basis` was missing (u1 needs it: without it the net had 4 inputs and --init-from failed).
+- install_mcc into a non-default prefix failed on the pod (stddef.h not found): podq uses ~/.local/mcc at the pin.
+
+**Restart recipe (a future pod, >= 24 GB GPU; the kit is /vesuvius/ufsm/inksmoke/kit, 316 KB + klt1.lcb):**
+1. `rsync -a kit/ POD:/root/ink/kit/`, `kit/inkgt/ -> /root/ink/inkgt/`, `kit/arms/ -> /root/ink/arms/`. The jsons point at /root/ink;
+   rebuild them with mksources_u2ink.py ROOT=... for another root.
+2. `COMMIT=<master> setsid nohup bash /root/ink/kit/podq.sh > /root/ink/podq.out 2>&1 &`. podq.sh now prefetches each arm's CT before
+   training (state/prefetchA.done; ~47 GB for A, more for B's teacher windows; disk >= 120 GB free) and stops an arm whose mean
+   samples/s at step 50 is below MINSPS (0.1).
+3. Report the step-10 line as soon as it prints (stepwatch.sh A 10: every 10-step line, STALL after 25 min without one) and the gate at
+   step 50. Below the gate, the fallback is `--um-rungs 9.6` only (production's rung; ~1/8 of the input chunks per window) with Paris 4
+   dropped (41 % of the chunks), before giving up.
+4. When the queue is done (state/ALLDONE: both arms, snapshots 1000 / 2000 / 3000), report the pod idle at once. Pull the six snapshots and
+   score them on the desk (score.sh, pairwrap with --maps reader3=...,A=...,B=..., --ref reader3, --split heldout).
+
 ## rectosp's m7 source fetched beside the fields: ufsm z3-fetch, 17.9k chunks cold in 22 s (2026-11-17, branch rdup-20261117)
 
 fp4teach found the pod's rectosp stage (103 s) waiting 77 s on its helper, mostly the cold network fetch of the m7 prob source (desk:

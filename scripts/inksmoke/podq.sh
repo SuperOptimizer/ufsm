@@ -8,8 +8,9 @@
 #   gt      the human ink GT from the public buckets (gtfetch.sh K/kit/gt.tsv: size + md5 checked) -> K/inkgt (the kit's segs-*.json,
 #           sources-H0.json and axis/ already point there)
 #   weights reader-v3, ink9um seeds 42 / 43 from HuggingFace at pinned revisions, sha256 checked; the u1 trunk copied once (sha1 checked)
-#   armA    K/arms/sources-A.json (mkarms.py A: weights capped, the per-scroll holdout files from the kit), then arm A 3000 steps (trainarm.sh;
-#           GPU lock held for the arm); its first 50 steps' step time -> K/steptime.txt
+#   armA    K/arms/sources-A.json (mkarms.py A: weights capped, the per-scroll holdout files from the kit), its CT prefetched (ufsm prefetch,
+#           48 threads), then arm A 3000 steps (trainarm.sh; GPU lock held for the arm); speed gate at step 50 (MINSPS 0.1 samples/s:
+#           below it the arm is stopped and the queue fails); the first steps -> K/steptimeA.txt (report them at step 10)
 #   teach   reader3 + ink9um maps of every labelled mesh, ink-teach per scroll (teach.sh; GPU lock per ink-ext call)
 #   armB    K/arms/sources-B.json (mkarms.py B) and arm B 3000 steps
 # Then K/state/ALLDONE: the pod is idle (the snapshots K/runs/inksmoke{A,B}/snap/{1000,2000,3000}.ckpt are scored on the desk).
@@ -63,6 +64,10 @@ fi
 arm() {   # arm A | B
   local a=$1; done_ arm$a && return 0
   python3 -I $D/mkarms.py $K/inkgt/sources-H0.json $K/teach $K/kit/holdouts-20261118.json $K/arms $a > $K/arms/mkarms$a.log 2>&1 || die "mkarms $a (log $K/arms/mkarms$a.log)"
+  # the arm's CT local first (pod B 11-18: cold https CT read by one sampler worker gave 30 steps in 4 h, 0.003 samples/s; ufsm prefetch
+  # of every labelled window's CT, levels 1-2 (+ 4-5 for the draw cells), 48 threads: 481,871 chunks, 47 GB at 30 MB/s in 42 min)
+  if ! done_ prefetch$a; then say "arm $a: prefetch (CT of every labelled window)"
+    $U prefetch $K/arms/sources-$a.json --levels 1,2 --threads ${PFTH:-48} --P ${P:-1024} > $K/prefetch$a.log 2>&1 || die "prefetch $a (log $K/prefetch$a.log)"; mark prefetch$a; fi
   say "arm $a: training $STEPS steps"
   ( R=$K/runs U=$U INIT=$K/ckpt/u1-13000-w.ckpt LATB=$K/kit/klt1.lcb GPU=$GPU LOCK=$LOCK RELAUNCH=3 WORKERS=${WORKERS:-1} SLOTS=${SLOTS:-2} bash $D/trainarm.sh $a $K/arms/sources-$a.json ) > $K/runs/arm$a.out 2>&1 &
   local tp=$! st=0
@@ -72,6 +77,12 @@ arm() {   # arm A | B
       grep -E '^step +[0-9]+ ' $K/runs/inksmoke$a.log | head -8 > $K/steptime$a.txt; grep -E 's/step|samp/s|Mvox/s' $K/runs/inksmoke$a.log | tail -3 >> $K/steptime$a.txt
       say "arm $a: step $st reached ($(date -u +%T)); first steps in $K/steptime$a.txt"
     fi
+    if [ "${st:-0}" -ge 50 ] && [ ! -e $K/gate$a.ok ]; then   # the speed gate at step 50: the mean samples/s of the logged 10-step lines
+      sps=$(grep -E '^step +[0-9]+ ' $K/runs/inksmoke$a.log | grep -oE '[0-9.]+ samp/s' | awk '{s += $1; n++} END {printf "%.3f", n ? s / n : 0}')
+      say "arm $a: step $st, $sps samples/s (gate ${MINSPS:-0.1})"
+      if awk -v a=$sps -v b=${MINSPS:-0.1} 'BEGIN {exit !(a < b)}'; then touch $K/runs/inksmoke$a.stop; kill $(cat $K/runs/inksmoke$a.pid) 2>/dev/null
+        die "arm $a below the speed gate: $sps samples/s at step $st (fallback: --um-rungs 9.6 only, Paris 4 dropped)"; fi
+      touch $K/gate$a.ok; fi
     sleep 60; done
   wait $tp; st=$(awk '/^step +[0-9]+ / {s = $2} END {print s + 0}' $K/runs/inksmoke$a.log 2>/dev/null)
   [ "${st:-0}" -ge $STEPS ] || die "arm $a stopped at step $st (logs $K/runs/inksmoke$a.log, .resume.log)"
