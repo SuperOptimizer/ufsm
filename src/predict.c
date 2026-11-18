@@ -2224,7 +2224,8 @@ static int predict_one(int argc, char **argv) {
     float *hzb[2] = {nullptr, nullptr}; int hzi = 0, hzq0 = 0, hzv = 0, hzcap = 0;   /* headz: the chunk's cell logits, planes [hzq0, hzq0 + hzv) of hzb[hzi] (channel stride hzcap planes) */
     const int ct_stem = unet_ct_stem(u);   /* unet_forward_ct: no 16-bit input */
     int gdir = 0, fzs = 0, fzl = 0;   /* (fzl: the fused fit kernel, nn_fit_accum_lat; UFSM_PRED_FIT_FUSED=0 the plane path) the guided head's direct rv bytes (nn_lat_place_rvg); fit fields from a latent-grid net in z-chunk slabs */
-    void *fzA = nullptr, *fzB = nullptr, *fzX = nullptr, *fzW = nullptr; int fzP = 0;   /* fzW: the fused kernel's winding-pair planes (UFSM_PRED_FIT_W4P) */
+    void *fzA = nullptr, *fzB = nullptr, *fzX = nullptr, *fzW = nullptr; int fzP = 0;
+    int fsup_on = getenv("UFSM_PRED_FSUP") && *getenv("UFSM_PRED_FSUP") == '1';   /* UFSM_PRED_FSUP=1: the fused head slab (opt-in: slower so far, below) */   /* fzW: the fused kernel's winding-pair planes (UFSM_PRED_FIT_W4P) */
     const int fzw4p = !getenv("UFSM_PRED_FIT_W4P") || ufsm_env_on("UFSM_PRED_FIT_W4P");
     uint8_t *ctd = nullptr, *ctcp = nullptr; uint32_t *ctm = nullptr, *ctmi = nullptr; void *xd = nullptr; int ct_shared = 0, xd_shared = 0;
     pjob_t J = {0};
@@ -3143,9 +3144,6 @@ static int predict_one(int argc, char **argv) {
                                 nn_ptick("fit: chunk head");
                             }
                             nn_ptick("fit: before the chunk");
-                            nn_lat_up_slab_c(l2d, lh, cup, wc, wc, wc, zs, nzs, fzA, q0, qd);
-                            if (g64) nn_lat_shuffle_c(l2d, lh, wc, wc, wc, cfg.cout - 128, 2, zs, nzs, fzA, q0, qd);   /* the sub-cell head: the phase pair's per-voxel terms */
-                            nn_ptick("fit: upsample + shuffle");
                             /* train --fstem: the fine stem on planes z0 .. z0 + nz of the planes P (channel c at plane MAP), its CT taps (planes z0 - 1 .. z0 + nz) z-scored
                                from the window's bytes into fzX (the stem reads the window as if whole: only those planes) */
 #define FZ_STEM(z0_, nz_, P, MAP) do { if (!cfg.fstem || fstem_off) break; const int x0_ = (z0_) > 0 ? (z0_) - 1 : 0, x1_ = (z0_) + (nz_) < Wz ? (z0_) + (nz_) + 1 : Wz; int fm_[16], k_ = 0; \
@@ -3153,8 +3151,32 @@ static int predict_one(int argc, char **argv) {
                                 nn_lat_ct_x(ct_shared ? ctcp : ctd, W, x0_, x1_ - x0_, (float)mean, (float)(1.0 / sd), fzX); \
                                 if (nn_fstem_fwd((const void *)((uintptr_t)fzX - (size_t)x0_ * hw * 2), Wz, W, W, (z0_), (nz_), unet_active_params(u) + unet_fstem_off(u), cfg.fstem, cfg.fstem_out, fm_, (P), (size_t)(nz_) * hw)) { \
                                     fprintf(stderr, "predict: the fine stem: slab shape\n"); return 2; } } while (0)
-                            FZ_STEM(zs, nzs, fzA, c < 11 ? c : -1);
-                            nn_ptick("fit: stem");
+                            /* UFSM_PRED_FSUP=1 (opt-in): the fine stem's planes (its rows' channels among the NP planes from CH0) through
+                               nn_fstem_up_fwd_t (up-slab + the sub-cell shuffle + stem in one kernel, the same bytes), the other planes by the plain up-slab;
+                               all 11 planes fused (zero W2 rows) was slower: nsys 2026-11-17 71.8 ms against 59.8 for the three kernels, the fused epilogue
+                               upsamples serially per output at one block an SM; this split 63.1 against 59.8 (the fused instance: 95 registers + 6.3 KB
+                               dynamic shared against 62, 6.43 against 3.57 ms a launch): opt-in until the kernel's occupancy is fixed */
+                            const int stm_ = cfg.fstem && !fstem_off; int fsu_ = 0;
+#define FZ_FSUP(z0_, nz_, P, LC, NP, CH0, SIDE) do { if (!fsup_on || !stm_ || cfg.fstem_out > 16 || (NP) > 30) break; int ch_[16]; unsigned cov_ = 0; \
+                                for (int k = 0; k < cfg.fstem_out; k++) ch_[k] = -1; \
+                                for (int j = 0; j < (NP); j++) { const int r_ = phead_stem_row(&cfg, (CH0) + j); if (r_ >= 0 && r_ < 16) { ch_[r_] = j; cov_ |= 1u << j; } } \
+                                if (!cov_ || ((SIDE) >= 0 && (~cov_ & 3u))) break;   /* (the shuffle's pair must be fused planes) */ \
+                                const int x0_ = (z0_) > 0 ? (z0_) - 1 : 0, x1_ = (z0_) + (nz_) < Wz ? (z0_) + (nz_) + 1 : Wz; \
+                                nn_lat_ct_x(ct_shared ? ctcp : ctd, W, x0_, x1_ - x0_, (float)mean, (float)(1.0 / sd), fzX); \
+                                if (nn_fstem_up_fwd_t((const void *)((uintptr_t)fzX - (size_t)x0_ * hw * 2), Wz, W, W, (z0_), (nz_), unet_active_params(u) + unet_fstem_off(u), cfg.fstem, \
+                                                      cfg.fstem_out, ch_, (P), (size_t)(nz_) * hw, (LC), lh, q0, qd, (SIDE), g64 ? cfg.cout - 128 : 0)) break; \
+                                fsu_ = 1; \
+                                for (int j = 0; j < (NP);) { if (cov_ >> j & 1u) { j++; continue; } int e_ = j; while (e_ < (NP) && !(cov_ >> e_ & 1u)) e_++; \
+                                    nn_lat_up_slab_c((const char *)(LC) + (size_t)j * cq_ * es_, lh, e_ - j, wc, wc, wc, (z0_), (nz_), (char *)(P) + (size_t)j * (nz_) * hw * 2, q0, qd); j = e_; } } while (0)
+                            FZ_FSUP(zs, nzs, fzA, l2d, cup, 0, g64 ? 0 : -1);
+                            if (fsu_) nn_ptick("fit: fused up + stem");
+                            else {
+                                nn_lat_up_slab_c(l2d, lh, cup, wc, wc, wc, zs, nzs, fzA, q0, qd);
+                                if (g64) nn_lat_shuffle_c(l2d, lh, wc, wc, wc, cfg.cout - 128, 2, zs, nzs, fzA, q0, qd);   /* the sub-cell head: the phase pair's per-voxel terms */
+                                nn_ptick("fit: upsample + shuffle");
+                                FZ_STEM(zs, nzs, fzA, c < 11 ? c : -1);
+                                nn_ptick("fit: stem");
+                            }
                             if (g8) {   /* the general guided head: the 8 coefficient planes (the head's last), the CT terms into the phase channels 0-1 */
                                 const int x0 = zs > 0 ? zs - 1 : 0, x1 = ze < W ? ze + 1 : W;
                                 nn_lat_up_slab_c((const char *)l2d + (size_t)24 * cq_ * es_, lh, 8, wc, wc, wc, zs, nzs, (char *)fzA + (size_t)11 * ns * 2, q0, qd);
@@ -3165,8 +3187,11 @@ static int predict_one(int argc, char **argv) {
                             nn_ptick("fit: accumulate");
                             if (ffw4d) {
                                 const int zb = (a - ffw4d) & ~3, zeb = (bq + ffw4d + 3) & ~3, nzb = zeb - zb;
-                                nn_lat_up_slab_c((const char *)l2d + (size_t)ff_w4 * cq_ * es_, lh, 2, wc, wc, wc, zb, nzb, fzB, q0, qd);
-                                FZ_STEM(zb, nzb, fzB, c == ff_w4 ? 0 : c == ff_w4 + 1 ? 1 : -1);   /* (the winding mod 4 pair has the stem's term too) */
+                                fsu_ = 0; FZ_FSUP(zb, nzb, fzB, (const char *)l2d + (size_t)ff_w4 * cq_ * es_, 2, ff_w4, -1);
+                                if (!fsu_) {
+                                    nn_lat_up_slab_c((const char *)l2d + (size_t)ff_w4 * cq_ * es_, lh, 2, wc, wc, wc, zb, nzb, fzB, q0, qd);
+                                    FZ_STEM(zb, nzb, fzB, c == ff_w4 ? 0 : c == ff_w4 + 1 ? 1 : -1);   /* (the winding mod 4 pair has the stem's term too) */
+                                }
                                 nn_fit_accum_w4(fzB, ct_shared ? nullptr : ctd + (size_t)zb * hw, ct_shared ? ctm + (size_t)zb * hw / 32 : nullptr, nzb, W, ffw4d, halo, (int)(tz - cz * ffh) + zb, (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz, 0, ffw4d, ffacc4);
                                 nn_ptick("fit: winding mod 4");
                             }

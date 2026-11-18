@@ -269,6 +269,55 @@ memory (silently: the fp32 reference gradient itself was off; rel L2 vs tensor c
 the mapping. memcheck had not seen it (the overrun stays inside pooled allocations). Fix: free_acts resets nob (and gA_bytes) with
 the other plan flags. Pod PRO 4000: 2/2 pass. Only a rebuild that leaves the tensor-core plan for the fp32 one is affected (tests;
 training never switches nn_set_tf32).
+## Predict fields: the fused fstem_up slower than its three kernels (opt-in UFSM_PRED_FSUP=1); 1152 windows no GPU gain; writer pool; DF16 v7 (2026-11-17, branch fsup-20261117)
+
+**Fused head slab.** trainperf's nn_fstem_up_fwd_t (fp32 cells) does up-slab + sub-cell shuffle + fine stem in one kernel. It is wired into
+predict's plane path (fzA and the winding pair fzB) and gives byte-identical fit stores at 640/64 and 1152/64. nsys kernel minima (u1 13000,
+0332 box, 640/64, ms per window; ksum.py, card shared with a wbench job, so minima only):
+
+| arm | fstem_fwd_k | lat_up4_k | lat_shuf_k | sum | all kernels |
+|---|---|---|---|---|---|
+| three kernels (default) | 33.2 | 17.6 | 9.0 | 59.8 | 141.5 |
+| all 11 planes fused (zero W2 rows for 2-8) | 71.8 | - | - | 71.8 | 154.8 |
+| stem planes fused, planes 2-8 plain up-slab | 54.4 | 8.7 | - | 63.1 | 146.1 |
+
+The fused instance runs at 95 registers + 6.3 KB dynamic shared memory against the plain one's 62 (`__launch_bounds__(FS_BT, 1)` for UP),
+6.43 against 3.57 ms for the same 63360-block launch, which outweighs the up-slab and shuffle passes it saves. So it stays opt-in
+(UFSM_PRED_FSUP=1, the hybrid split) until the kernel's occupancy is fixed; flipping the default needs only the env line.
+
+**1152 against 640 fields windows, quiet card** (master 442668dd, same box, x2): 640/64 32 tiles, gpu(fwd+d2h) 9.09 / 9.17 s, main wall
+9.6 / 9.5 s, RSS 4 GB; 1152/64 4 tiles, gpu 9.34 / 9.20 s, main wall 13.7 / 11.1 s (the fit writer drains the last slabs after only 4
+windows), RSS 14 GB. With --skip-empty, 640 drops air in finer pieces, which eats the halo saving (1.95x -> 1.42x on paper): no GPU gain on
+this box. The "-15 %" in the predfwd section was a contended number. 1152 needs nearly the whole 16 GB, so any other process on the card OOMs it.
+
+**Head writer pool (unrollperf's a923e259), 0332 ink, 544/16, q 0, 3 heads, x2:** byte-identical; writer-wait 3.42 / 2.59 -> 0.31 / 0.09 s,
+main wall 11.6 / 11.8 -> 10.7 / 11.0 s (-7 %). gpu(fwd+d2h) rises 1.5 s while the pool compresses beside the forward.
+
+**xnet DF16 variant 7** (2-D ink teachers, UFSM_IE_BENCH, x3, ms per tile per checkpoint, medians v1 / v7): ink9um fp16 1.375 / 1.443, MX5
+1.069 / 1.097; reader3 fp16 12.65 / 10.82, MX5 9.35 / 9.33. The spread between repeats is ±20 %, and the isolated kernel's 4.54 vs 6.27 ms does
+not show per tile, so the default stays 1.
+
+**Card-1 locks:** hold-and-wait across the two card-1 locks deadlocked three times on 11-17, because agents nested them in opposite orders.
+Team rule since then: the suite's gpuN.excl first, then opt/gpuN.lock; exclusive takers use `flock -x -w 5 -E 75` on both and back off.
+
+## Latent ink: two offset grids + ink-blend stay the default; one grid loses AUC on Paris 4 and shows the tile seams (2026-11-17, fp4teach)
+
+The question (lead): can the latink predict drop its second, offset 256 grid (half the ink GPU time) for one grid with a feathered blend? `--feather`
+does not take latent-grid nets (the cell grid owns the window edge), so the arm tested was one grid alone (grid 0) against the default pair
+blended. inkpod 15000, u1 unrolls, renders and wrapscore as the unroll's ink stage does (`scripts/inkgt/wrapscore.py --dump`, then
+`scripts/inkgt/pairab.py`: the paired AUC difference on the same label samples, spatial block bootstrap, 2048-voxel blocks, 95 %).
+
+| scroll | held-out tol | n | AUC blend | AUC grid 0 | grid 0 - blend [95 %] |
+|---|---|---|---|---|---|
+| PHerc1667 | 20 um | 1.10 M | 0.5888 | 0.5820 | -0.0067 [-0.0222, +0.0093] |
+| PHerc1667 | 40 um | 1.56 M | 0.5940 | 0.5876 | -0.0064 [-0.0204, +0.0071] |
+| PHerc1667 | 80 um | 1.79 M | 0.5983 | 0.5902 | -0.0081 [-0.0223, +0.0055] |
+| PHercParis4 | 40 um | 2.20 M | 0.7734 | 0.7670 | -0.0064 [-0.0132, -0.0010] |
+
+The seams (`ufsm ink-seam --period 512`, the mean jump across tile borders against the interior, render px): 1667 blend 1.11, grid 0 7.21; Paris 4
+blend 1.38, grid 0 9.49 (border / interior ratio 1.5-1.6 blended against 4.0-4.9 single): one grid draws the 512 tile grid into the ink.
+One grid is lower on both scrolls, significantly on Paris 4, and visibly seamed: the pair stays. (wrapscore on the 22 M-sample Paris 4 set
+peaks at 17.8 GB RSS: under the 40 GB dev slice run it alone.)
 
 ## mcc 5744025: thread-block clusters (__cluster_dims__); live-range splitting at calls (2026-11-17, branch mcc-rasplit-20261117)
 
