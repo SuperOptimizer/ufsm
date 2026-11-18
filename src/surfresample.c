@@ -128,31 +128,33 @@ static void rs_lookup(const rs_job *J, const double q[3], int *sid, double *fr, 
 }
 static void *rs_vert_main(void *a) {
     rs_job *J = a; const rs_surf *D = J->D;
+    uint64_t nv = 0, nvok = 0, hist[5] = {0};   /* (per-thread counts, added once: per-vertex atomics on shared lines serialised the threads) */
     for (int r; (r = atomic_fetch_add(&J->next, 1)) < D->h;) for (int c = 0; c < D->w; c++) {
         const size_t i = (size_t)r * D->w + c; J->vs[i] = -1;
         if (!(D->Z[i] >= 0)) continue;
-        atomic_fetch_add(&J->nv, 1);
+        nv++;
         const double q[3] = {D->X[i], D->Y[i], D->Z[i]}; int s; double fr = 0, fc = 0, d2;
         rs_lookup(J, q, &s, &fr, &fc, &d2);
         if (s < 0) continue;
-        J->vs[i] = (int16_t)s; J->vr[i] = (float)fr; J->vc[i] = (float)fc; atomic_fetch_add(&J->nvok, 1);
-        const double d = sqrt(d2); atomic_fetch_add(&J->hist[d < 0.25 ? 0 : d < 0.5 ? 1 : d < 1 ? 2 : d < 2 ? 3 : 4], 1);
+        J->vs[i] = (int16_t)s; J->vr[i] = (float)fr; J->vc[i] = (float)fc; nvok++;
+        const double d = sqrt(d2); hist[d < 0.25 ? 0 : d < 0.5 ? 1 : d < 1 ? 2 : d < 2 ? 3 : 4]++;
     }
+    atomic_fetch_add(&J->nv, nv); atomic_fetch_add(&J->nvok, nvok); for (int k = 0; k < 5; k++) atomic_fetch_add(&J->hist[k], hist[k]);
     return nullptr;
 }
 static void *rs_px_main(void *a) {
-    rs_job *J = a; const rs_surf *D = J->D;
+    rs_job *J = a; const rs_surf *D = J->D; uint64_t npx = 0, npxok = 0, nseam = 0;   /* (per-thread counts: 2 contended atomics a pixel were most of the pass) */
     for (int py; (py = atomic_fetch_add(&J->next, 1)) < J->oh;) for (int px = 0; px < J->ow; px++) {
         int r0 = (int)(py / J->gs), c0 = (int)(px / J->gs); r0 = r0 > D->h - 2 ? D->h - 2 : r0; c0 = c0 > D->w - 2 ? D->w - 2 : c0;
         const double v = py / J->gs - r0, u = px / J->gs - c0;
         const size_t i[4] = {(size_t)r0 * D->w + c0, (size_t)r0 * D->w + c0 + 1, (size_t)(r0 + 1) * D->w + c0, (size_t)(r0 + 1) * D->w + c0 + 1};
         if (!(D->Z[i[0]] >= 0 && D->Z[i[1]] >= 0 && D->Z[i[2]] >= 0 && D->Z[i[3]] >= 0)) continue;   /* (render: no surface there) */
-        atomic_fetch_add(&J->npx, 1);
+        npx++;
         const double w4[4] = {(1 - u) * (1 - v), u * (1 - v), (1 - u) * v, u * v};
         const int s0 = J->vs[i[0]];
         if (s0 >= 0 && J->vs[i[1]] == s0 && J->vs[i[2]] == s0 && J->vs[i[3]] == s0) {
             double fr = 0, fc = 0; for (int k = 0; k < 4; k++) { fr += w4[k] * J->vr[i[k]]; fc += w4[k] * J->vc[i[k]]; }
-            J->out[(size_t)py * J->ow + px] = J->geom ? 0 : rs_sample(&J->S[s0], fr, fc); J->src[(size_t)py * J->ow + px] = 1; if (J->sid) J->sid[(size_t)py * J->ow + px] = (uint8_t)(s0 % 255 + 1); atomic_fetch_add(&J->npxok, 1); continue;
+            J->out[(size_t)py * J->ow + px] = J->geom ? 0 : rs_sample(&J->S[s0], fr, fc); J->src[(size_t)py * J->ow + px] = 1; if (J->sid) J->sid[(size_t)py * J->ow + px] = (uint8_t)(s0 % 255 + 1); npxok++; continue;
         }
         /* a seam (or a corner without a source): the pixel's own point, projected from each corner's source position */
         double q[3] = {0, 0, 0}; const float *A[3] = {D->X, D->Y, D->Z};
@@ -162,8 +164,9 @@ static void *rs_px_main(void *a) {
             double fr, fc; const double d2 = rs_project(&J->S[s], q, J->vr[i[k]], J->vc[i[k]], &fr, &fc);
             if (d2 < bd) { bd = d2; bs = s; br = fr; bc = fc; } }
         if (bs < 0 || bd > J->maxd2) { int s; double fr = 0, fc = 0, d2; rs_lookup(J, q, &s, &fr, &fc, &d2); if (s < 0) continue; bs = s; br = fr; bc = fc; }
-        J->out[(size_t)py * J->ow + px] = J->geom ? 0 : rs_sample(&J->S[bs], br, bc); J->src[(size_t)py * J->ow + px] = 1; if (J->sid) J->sid[(size_t)py * J->ow + px] = (uint8_t)(bs % 255 + 1); atomic_fetch_add(&J->npxok, 1); atomic_fetch_add(&J->nseam, 1);
+        J->out[(size_t)py * J->ow + px] = J->geom ? 0 : rs_sample(&J->S[bs], br, bc); J->src[(size_t)py * J->ow + px] = 1; if (J->sid) J->sid[(size_t)py * J->ow + px] = (uint8_t)(bs % 255 + 1); npxok++; nseam++;
     }
+    atomic_fetch_add(&J->npx, npx); atomic_fetch_add(&J->npxok, npxok); atomic_fetch_add(&J->nseam, nseam);
     return nullptr;
 }
 static int rs_names(const char *dir, char ***out) {   /* the surface subdirectories (with x.tif), sorted */
