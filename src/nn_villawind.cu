@@ -101,7 +101,7 @@ static vwplan g_plans[16]; static int g_np = 0;
 static vwplan *plan_of(int ta, int tb, int m, int n, int k, int lda, long long sa, int ldb, long long sb, int ldd, long long sd, int d32, int batch) {
     for (int i = 0; i < g_np; i++) { vwplan *p = &g_plans[i];
         if (p->ta == ta && p->tb == tb && p->m == m && p->n == n && p->k == k && p->lda == lda && p->sa == sa && p->ldb == ldb && p->sb == sb && p->ldd == ldd && p->sd == sd && p->d32 == d32 && p->batch == batch) return p; }
-    if (!g_lt) { if (cublasLtCreate(&g_lt) != CUBLAS_STATUS_SUCCESS) return nullptr; cudaMalloc(&g_ws, WS); }
+    if (!g_lt) { if (cublasLtCreate(&g_lt) != CUBLAS_STATUS_SUCCESS) return nullptr; g_ws = xmalloc_dev(WS); }   /* (xmalloc_dev: a failure stops the process, never a null workspace) */
     if (g_np == 16) return nullptr;
     vwplan *p = &g_plans[g_np++]; *p = (vwplan){ta, tb, m, n, k, lda, ldb, ldd, d32, batch, sa, sb, sd};
     cublasLtMatmulDescCreate(&p->op, CUBLAS_COMPUTE_32F, CUDA_R_32F);

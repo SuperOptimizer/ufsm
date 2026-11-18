@@ -34,7 +34,8 @@ void xnet_trim(void);                   /* free the cached blocks */
 void xnet_set_budget(size_t bytes);     /* device bytes (in use + cached) before the cache is dropped; default: free at init - 1 GB */
 void xnet_mem_info(size_t *free_b, size_t *total_b);   /* device memory free / total (cudaMemGetInfo) */
 
-void *xmalloc_dev(size_t bytes);        /* cached device memory (nullptr on failure) */
+enum { XNET_OOM_RC = 75 };              /* exit status of a failed device allocation (xmalloc_dev never returns nullptr) */
+void *xmalloc_dev(size_t bytes);        /* cached device memory; a failed allocation prints and exits XNET_OOM_RC (UFSM_XNET_FAIL_ALLOC=N forces the Nth) */
 void xfree_dev(void *p);
 xt xt_new(int n, int d, int h, int w, int c);
 void xt_free(xt *t);

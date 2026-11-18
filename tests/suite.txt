@@ -12,6 +12,7 @@ test_target_erode                              |              |     1 | ./$B/tes
 test_wind_sampler                              |              |    19 | ./$B/test_wind_sampler
 test_sampbias                                  |              |     5 | ./$B/test_sampbias
 test_crush                                     |              |    17 | ./$B/test_crush
+test_xnet_oom                                  |              |     1 | ./$B/test_xnet_oom
 test_vwt_aug                                   |              |     2 | ./$B/test_vwt_aug
 test_zcache                                    |              |    10 | ./$B/test_zcache
 test_scrollaug                                 |              |    10 | ./$B/test_scrollaug

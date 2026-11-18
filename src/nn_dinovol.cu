@@ -608,7 +608,7 @@ extern "C" int dv_gemm_on(void) { if (g_use_lt < 0) { const char *e = getenv("UF
 extern "C" void dv_gemm_set(int on) { g_use_lt = on; }
 static ltplan *lt_plan(int M, int N, int K, int ldw, int dt, int epi, int beta) {
     for (int i = 0; i < g_nplans; i++) { ltplan *p = &g_plans[i]; if (p->M == M && p->N == N && p->K == K && p->ldw == ldw && p->dt == dt && p->epi == epi && p->beta == beta) return p; }
-    if (!g_lt) { if (cublasLtCreate(&g_lt) != CUBLAS_STATUS_SUCCESS) return nullptr; cudaMalloc(&g_ltws, LTWS); }
+    if (!g_lt) { if (cublasLtCreate(&g_lt) != CUBLAS_STATUS_SUCCESS) return nullptr; g_ltws = xmalloc_dev(LTWS); }   /* (xmalloc_dev: a failure stops the process, never a null workspace) */
     ltplan *p = &g_plans[g_nplans < 128 ? g_nplans++ : 127]; memset(p, 0, sizeof *p);
     p->M = M; p->N = N; p->K = K; p->ldw = ldw; p->dt = dt; p->epi = epi; p->beta = beta;
     const cudaDataType_t Dt = dt ? CUDA_R_32F : CUDA_R_16F;
@@ -633,7 +633,7 @@ __global__ void k_f2h(const float *x, __half *y, int n) { const int i = blockIdx
 static const void *bias16(const float *b, int n) {   /* fp16 copies of fp32 bias vectors (fp16 outputs take an fp16 bias) */
     static const float *key[256]; static void *val[256]; static int nk = 0;
     for (int i = 0; i < nk; i++) if (key[i] == b) return val[i];
-    void *h = nullptr; cudaMalloc(&h, (size_t)n * 2); k_f2h<<<(n + 255) / 256, 256, 0, ST>>>(b, (__half *)h, n);
+    void *h = xmalloc_dev((size_t)n * 2); k_f2h<<<(n + 255) / 256, 256, 0, ST>>>(b, (__half *)h, n);
     if (nk < 256) { key[nk] = b; val[nk] = h; nk++; }
     return h;
 }

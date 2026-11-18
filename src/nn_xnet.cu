@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static cudaStream_t g_st = nullptr;
 static int g_dev_ok = 0, g_verbose = 0, g_dev = 0;
@@ -47,6 +48,21 @@ static void bl_push(blist *l, blk b) {
     l->b[l->n++] = b;
 }
 static blk bl_take(blist *l, size_t i) { blk b = l->b[i]; l->b[i] = l->b[--l->n]; return b; }
+/* A failed device allocation stops the process here (stderr line, exit XNET_OOM_RC): no caller ever gets a null buffer to launch on.
+   11-18 desk card 1: ink-ext reader3 at --batch 16 got nullptr from four failed cudaMalloc (288 / 144 / 0 / 9 MB) and its next
+   forward wrote through them (Xid 31 null-address MMU fault), which took down the trainer's context on the same card.
+   UFSM_XNET_FAIL_ALLOC=N: the Nth cache-missing allocation fails without touching the device (tests/test_xnet_oom.c, pod forced-failure runs). */
+static long g_fail_at = -1, g_nalloc = 0;
+static int forced_fail(void) {
+    if (g_fail_at < 0) { const char *e = getenv("UFSM_XNET_FAIL_ALLOC"); g_fail_at = e && *e ? atol(e) : 0; }
+    return g_fail_at > 0 && ++g_nalloc == g_fail_at;
+}
+[[noreturn]] static void alloc_fatal(size_t n, int forced) {
+    fprintf(stderr, "xnet: cudaMalloc of %zu MB (%zu bytes) failed: out of memory%s (%zu MB in use, %zu MB budget; lower --batch / --gpu-mem): stopping before any launch\n",
+            n >> 20, n, forced ? " [UFSM_XNET_FAIL_ALLOC]" : "", g_inuse >> 20, g_budget >> 20);
+    fflush(stderr); fflush(stdout);
+    _exit(XNET_OOM_RC);   /* not exit(): no atexit / destructor touches the device after a failure; other threads stop with us */
+}
 extern "C" void *xmalloc_dev(size_t bytes) {
     const size_t n = round_up(bytes ? bytes : 1);
     pthread_mutex_lock(&g_mu);
@@ -54,6 +70,7 @@ extern "C" void *xmalloc_dev(size_t bytes) {
         blk b = bl_take(&g_free, i); g_cached -= n; bl_push(&g_used, b); g_inuse += n;
         pthread_mutex_unlock(&g_mu); return b.p;
     }
+    if (forced_fail()) alloc_fatal(n, 1);
     void *p = nullptr;
     if (g_inuse + g_cached + n > g_budget && g_cached) {   /* over budget: drop the cached blocks (WDDM pages instead of failing) */
         cudaStreamSynchronize(g_st);
@@ -61,11 +78,11 @@ extern "C" void *xmalloc_dev(size_t bytes) {
         g_free.n = 0; g_cached = 0;
     }
     if (g_inuse + n > g_budget && !g_warned) { g_warned = 1; fprintf(stderr, "xnet: %zu MB in use exceeds the %zu MB device budget (lower the batch)\n", (g_inuse + n) >> 20, g_budget >> 20); }
-    if (cudaMalloc(&p, n) != cudaSuccess) {   /* free the cache and retry once */
+    if (cudaMalloc(&p, n) != cudaSuccess || !p) {   /* free the cache and retry once */
         cudaGetLastError(); cudaStreamSynchronize(g_st);
         for (size_t i = 0; i < g_free.n; i++) cudaFree(g_free.b[i].p);
-        g_free.n = 0; g_cached = 0;
-        if (cudaMalloc(&p, n) != cudaSuccess) { cudaGetLastError(); pthread_mutex_unlock(&g_mu); fprintf(stderr, "xnet: cudaMalloc of %zu MB failed\n", n >> 20); return nullptr; }
+        g_free.n = 0; g_cached = 0; p = nullptr;
+        if (cudaMalloc(&p, n) != cudaSuccess || !p) { cudaGetLastError(); alloc_fatal(n, 0); }
     }
     bl_push(&g_used, blk{p, n}); g_inuse += n;
     pthread_mutex_unlock(&g_mu);
