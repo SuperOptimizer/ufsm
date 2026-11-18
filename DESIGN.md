@@ -6,6 +6,17 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## try9 after the reboot: the card-1 layout sets the rate, not CPU contention; CPU weights for the trainer slice (2026-11-18, trainperf)
+
+try9 resumed at 13250 in the rev-card1 layout (CT decode + ink on card 1, onfly phase + fibre on card 0) ran 0.18-0.19 samp/s
+(82 Mvox/s), against 0.25 (113 Mvox/s) before the crash. That 0.25 was item C's (09:04-10:56: onfly phase + fibre on card 1). The
+2.3 GB it frees on card 0 let the planner give the fp4 GroupNorm input copy 2.17 GB of spare instead of 0.33 GB (13.27 vs 10.98 GB
+free at plan time). The rev-card1 layout ran 0.18-0.19 / 81-86 Mvox/s on 07:46-08:53 too. The desk was CPU-saturated at the same time
+(load 58 / 32 CPUs; the main thread 25 % runnable-wait, nice 10 vs the dev jobs' 19 in one cpu group). `systemctl --user set-property
+ufsm-train.slice CPUWeight=10000` (ufsm-dev.slice 100; enables the cpu controller under ufsm.slice, persistent) cut that to 7 %, but
+the rate stayed 0.18: the step is GPU-bound (the main thread spin-waits in sched_yield). The weights are kept. Undo: set
+ufsm-train.slice CPUWeight=100.
+
 ## Unroll ink path: residual geometry early, faster surf-resample, check side by side; pod setup (2026-11-18, branch r3geom-20261118, unrollperf)
 
 In the pod q2 1667 timeline, perwrap (958 s) ended the run. Its critical path ran after the stripes' reader3 maps landed (14:42:36): the
