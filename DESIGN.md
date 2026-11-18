@@ -113,6 +113,15 @@ test_countfield `pieces_vs_chunks`: pieces of 8 / 12 / 16 rows against whole 24-
 byte (16: the last piece short), the stride-2 model pass in pieces, and a failed piece (UFSM_CF_TEST_PFAIL) whose chunk is redone on
 the CPU: the CPU run's bytes there, the GPU's elsewhere. REFSTREAM's `--pool-only --follow` beside the predicts uses the same path.
 
+**The rest of the audit (11-18).** (1) try9's on-the-fly phase slots and fibre planes move to the aux card at the --val-gn-live resume
+(`FIBGPU=1`, XFLAGS `--onfly-gpu 1`; lead-approved, trainperf verifies): card 0 -2.29 GB, card 1 +~2.3 GB; headroom, no speed expected.
+(2) The agents' shared scratchpad and stale /tmp test / suite dirs held 22.5 GB of tmpfs (RAM, and most of the 18 GB of swap in use):
+27 items not touched for 24 h deleted (16.6 GB; /tmp 29 -> 13 GB, swap 18 -> 10 GB, MemAvailable 93 -> 105 GB). test_latents.sh keeps
+its dir only on a failure (by design: "kept $D"). (3) stripimg's 18-19 GB is the stretch stripe render's decoded-chunk cache
+(UFSM_RENDER_MEM 16 in strip_refill.sh, halved to 50 % of available on smaller machines; the refill renders 1.7-3.8 GB): left as is, an
+8 GB A/B (same images, maybe re-decodes) only if a pod runs short. (4) Predict fields (host 5.8-6.2 GB, the 4.4 GB slab ring; ~8.5 GB GPU)
+and the trainer's host side (66-76 GB of a 140 GB slice) are not binding: no change.
+
 ## Where the packed-sheet deficit lives: the net merges contact sheets though they are labelled and loss-weighted x8; 4.8 um input and the Paris 4 spiral fit / segments both fail (2026-11-18, pseudolab)
 
 This follows "Packed sheets are not resolved by finer CT" below, and the lever memo (/vesuvius/ufsm/pseudolab/lever-memo.md). The
