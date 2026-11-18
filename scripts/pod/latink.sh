@@ -16,6 +16,7 @@
 # q 32 23 MB (3.04 / 7.96, 1.9 M flips: too lossy)
 # Env: LATINK_CK (default /root/pod/ckpt/inkpod-15000.ckpt, the newest inkpod snap), ITH (threads), LATINK_X (more predict args, e.g. --ema 0:
 # the live weights; predict uses the EMA by default, and a stale EMA (scratch2 try9, accum 10) scored far worse than live on 1667, 11-18).
+# LATWIN / LATHALO (544 / 16): the window and halo (a smaller window for a GPU budget: scratch2 try9 at 640 / 64 peaked 8.8 GB, 11-18).
 set -u
 O=${1:?}; G=${2:-0}; OUT=${3:?}; U=${U:-/root/pod/ufsm/build/ufsm}; CK=${LATINK_CK:-${POD:-/root/pod}/ckpt/inkpod-15000.ckpt}
 # the CT: UNROLL_CT="ROOT|KEY|UM|LEVEL" (unroll.sh exports it: CTROOT / CTKEY overrides included), else the scrolls.tsv row of this run's
@@ -37,7 +38,7 @@ for g in 0 256; do
   [ -e $T/g$g.done ] && continue; rm -rf $T/g$g
   # (--q 0 --levels 1: the passes are blended into OUT by ink-blend, which reads level 0 only; their own pyramid / quantisation was thrown away)
   $U predict $CK $R $K $T/g$g --um $UM --level $LV --box $(pbox $g) --full-grid 1 --occupancy $((LV + 3)) --heads ink,c12,c13 --gpu $G --threads $TH --shard $([ $g = 256 ] && echo 256 || echo 512) \
-    --window 544 --halo 16 $([ "${LATWROUND:-0}" = 1 ] && echo --window-round 1) ${LATINK_X:-} --grid-origin $g,$g,$g --axis $O/axis.json --q ${LATINKQ:-4} --levels 1 || { echo "latink: predict grid $g failed"; exit 1; }
+    --window ${LATWIN:-544} --halo ${LATHALO:-16} $([ "${LATWROUND:-0}" = 1 ] && echo --window-round 1) ${LATINK_X:-} --grid-origin $g,$g,$g --axis $O/axis.json --q ${LATINKQ:-4} --levels 1 || { echo "latink: predict grid $g failed"; exit 1; }
   for h in ink c12 c13; do [ -e $T/g$g/$h/zarr.json ] || { echo "latink: no $h in $T/g$g"; exit 1; }; done
   touch $T/g$g.done
 done
