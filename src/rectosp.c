@@ -75,10 +75,11 @@ static inline double rs_tri(const rs_job *J, double z, double y, double x) {   /
 
 /* one row block's source box (native z [org + a0 h - half, org + a1 h + half], the box's y / x +- half), read by a helper thread */
 typedef struct { z3 *z; int nt, rc; int64_t so[3], sn[3]; uint8_t *buf; char err[256]; } rs_src;
-static void rs_src_box(rs_src *R, const long long org[3], int h, int a0, int a1, double hm, double F, int H, int W, const int64_t *ssh) {
-    const double za0 = org[0] + (double)a0 * h; const double lo[3] = {za0 - hm, org[1] - hm, org[2] - hm}, hi[3] = {za0 + (a1 - a0) * h + hm, org[1] + (double)H * h + hm, org[2] + (double)W * h + hm};
+static void rs_src_box_y(rs_src *R, const long long org[3], int h, int a0, int a1, double hm, double F, int y0, int y1, int W, const int64_t *ssh) {   /* rows [y0, y1) */
+    const double za0 = org[0] + (double)a0 * h; const double lo[3] = {za0 - hm, org[1] + (double)y0 * h - hm, org[2] - hm}, hi[3] = {za0 + (a1 - a0) * h + hm, org[1] + (double)y1 * h + hm, org[2] + (double)W * h + hm};
     for (int d = 0; d < 3; d++) { int64_t s0 = (int64_t)floor(lo[d] * F) - 1, s1 = (int64_t)ceil(hi[d] * F) + 2; if (s0 < 0) s0 = 0; if (s1 > ssh[d]) s1 = ssh[d]; R->so[d] = s0; R->sn[d] = s1 - s0; }
 }
+static void rs_src_box(rs_src *R, const long long org[3], int h, int a0, int a1, double hm, double F, int H, int W, const int64_t *ssh) { rs_src_box_y(R, org, h, a0, a1, hm, F, 0, H, W, ssh); }
 static void *rs_src_main(void *a) {
     rs_src *R = a; R->rc = 0; R->buf = malloc((size_t)R->sn[0] * R->sn[1] * R->sn[2]);
     if (!R->buf) { R->rc = 1; snprintf(R->err, sizeof R->err, "out of memory"); return nullptr; }
@@ -171,7 +172,7 @@ static void rs_rows(void *ctx, int a0, int a1, int t) {
    rs_rows does. */
 int g_rectosp_gpu_blocks;   /* mgpu: debug */   /* row blocks the last recto-sp ran on the GPU (tests) */
 long long g_rectosp_dev_chunks, g_rectosp_ring_chunks;   /* mgpu: debug */   /* source chunks it decoded on the GPU decoder / gathered into the ring on the device (-1: the host decode path) (tests) */
-typedef struct { int sr, q0, q1, a0; int64_t so[3], sn[3], d0, d1; } rs_gblk;   /* shard row, rows, source box, ring slices to add */
+typedef struct { int sr, q0, q1, a0, tile, tb0, tb1; int64_t so[3], sn[3], d0, d1; } rs_gblk;   /* shard row, rows, y tile (its y blocks [tb0, tb1)), source box, ring slices to add */
 typedef struct {
     const char *in; z3 *zs; int nt, H, W, S, shp0; long long org[3], zoff0;
     const rs_gblk *bl; int k;   /* the block this job prepares */
@@ -219,7 +220,7 @@ static void *rs_gfld_main(void *a) {   /* the block's field rows and cells (besi
     int M = 0;
     for (int zb = 0; zb < nzb; zb++) {   /* (rs_rows' cells: J->r0 = 0, J->nr = a1 - a0) */
         const int z = zb * S + S / 2; if (z >= a1 - a0) continue;
-        for (int yb = 0; yb < nyb; yb++) { const int y = yb * S + S / 2, yy = y < H ? y : H - 1;
+        for (int yb = B->tb0; yb < B->tb1 && yb < nyb; yb++) { const int y = yb * S + S / 2, yy = y < H ? y : H - 1;
             for (int xb = 0; xb < nxb; xb++) {
                 const int xx = xb * S + S / 2 < W ? xb * S + S / 2 : W - 1; const size_t ci = ((size_t)(a0 + z - R->f0) * H + yy) * W + xx;
                 if (!f->w[ci]) continue;
@@ -409,33 +410,58 @@ int cmd_recto_sp(int argc, char **argv) {
     rs_gblk *gbl = nullptr; int ngb = 0, gon = 0; rs_gprep GP[2] = {0}; pthread_t gth; int gpend = 0, gnext = 0; double gtk = 0, gtp = 0, gtu = 0, gtr = 0, gtn = 0, gtb = 0, gtw = 0;
     if (zs && !cls && gdev >= 0 && rsg_open && rsg_free_mem(gdev) > 0) {
         const double hm = fmax(half, half2) / um + 2; const int64_t *ssh = z3_meta_of(zs)->shape; const int cz = z3_meta_of(zs)->chunk[0] > 0 ? z3_meta_of(zs)->chunk[0] : 128;
-        int cap = 64; gbl = malloc(sizeof *gbl * cap); int64_t bz1 = -1, RZ = 0; int sr = 0;
-        for (int64_t gz0 = (zoff[0] / SH) * SH; gz0 < zoff[0] + shp[0]; gz0 += SH, sr++) {
-            const int b0 = (int)(gz0 - zoff[0] < 0 ? 0 : gz0 - zoff[0]), b1 = (int)(gz0 + SH - zoff[0] > shp[0] ? shp[0] : gz0 + SH - zoff[0]);
-            for (int c0 = b0; c0 < b1; c0 += 64) {
-                const int c1 = c0 + 64 < b1 ? c0 + 64 : b1; const int q0 = c0 > R0 ? c0 : R0, q1 = c1 < R1 ? c1 : R1;
-                if (q1 <= q0) continue;
-                if (ngb == cap) gbl = realloc(gbl, sizeof *gbl * (cap *= 2));
-                rs_gblk *B = &gbl[ngb++]; B->sr = sr; B->q0 = q0; B->q1 = q1; B->a0 = (q0 / S) * S;
-                rs_src R = {0}; rs_src_box(&R, org, h, B->a0, q1, hm, F, H, W, ssh); for (int d = 0; d < 3; d++) { B->so[d] = R.so[d]; B->sn[d] = R.sn[d]; }
+        /* y tiles (2026-11-18): the ring is RZ slices of the whole y / x source box; on Paris 4 that was 28.2 GB, past a 24 GB card (and the
+           CPU path's box past a 31 GB pod: OOM). With nty tiles each block covers only the cells of y blocks [tb0, tb1) and its source box
+           only their rows +- the profile reach, padded to one size (the ring's); blocks run shard row by shard row, tile by tile (the rsp
+           rows are written per shard row), and the ring restarts at each tile (no upload ahead across a tile switch: its slots are the
+           running block's). Every profile sample lies within its cell's reach, inside both boxes: the same codes. nty: the fewest tiles
+           whose ring fits the free device memory (UFSM_RECTOSP_RING_GB caps it; UFSM_RECTOSP_TILES forces a count) */
+        const int nyb = (H + S - 1) / S; const size_t fr0 = rsg_free_mem(gdev);
+        const double rcap = getenv("UFSM_RECTOSP_RING_GB") ? atof(getenv("UFSM_RECTOSP_RING_GB")) * 1e9 : 0; const int tforce = getenv("UFSM_RECTOSP_TILES") ? atoi(getenv("UFSM_RECTOSP_TILES")) : 0;
+        int cap = 64, nty = tforce > 0 ? tforce : 1; int64_t RZ = 0, tny = 0; gbl = malloc(sizeof *gbl * cap);
+        for (;;) {
+            ngb = 0; RZ = 0; tny = 0; int sr = 0; if (nty > nyb) nty = nyb > 0 ? nyb : 1;
+            for (int64_t gz0 = (zoff[0] / SH) * SH; gz0 < zoff[0] + shp[0]; gz0 += SH, sr++) {
+                const int b0 = (int)(gz0 - zoff[0] < 0 ? 0 : gz0 - zoff[0]), b1 = (int)(gz0 + SH - zoff[0] > shp[0] ? shp[0] : gz0 + SH - zoff[0]);
+                for (int t = 0; t < nty; t++) {
+                    const int tb0 = (int)((long)t * nyb / nty), tb1 = (int)((long)(t + 1) * nyb / nty), y0 = tb0 * S, y1 = tb1 * S < H ? tb1 * S : H;
+                    for (int c0 = b0; c0 < b1; c0 += 64) {
+                        const int c1 = c0 + 64 < b1 ? c0 + 64 : b1; const int q0 = c0 > R0 ? c0 : R0, q1 = c1 < R1 ? c1 : R1;
+                        if (q1 <= q0) continue;
+                        if (ngb == cap) gbl = realloc(gbl, sizeof *gbl * (cap *= 2));
+                        rs_gblk *B = &gbl[ngb++]; B->sr = sr; B->q0 = q0; B->q1 = q1; B->a0 = (q0 / S) * S; B->tile = t; B->tb0 = tb0; B->tb1 = tb1;
+                        rs_src R = {0}; rs_src_box_y(&R, org, h, B->a0, q1, hm, F, y0, y1, W, ssh); for (int d = 0; d < 3; d++) { B->so[d] = R.so[d]; B->sn[d] = R.sn[d]; }
+                        if (B->sn[1] > tny) tny = B->sn[1];
+                    }
+                }
+            }
+            int64_t bz1 = -1;
+            for (int k = 0; k < ngb; k++) {   /* the ring slices each block adds; the ring restarts at a tile switch */
+                rs_gblk *B = &gbl[k]; const int same = k > 0 && gbl[k - 1].tile == B->tile;
+                if (B->sn[1] < tny) { int64_t o = B->so[1]; if (o > ssh[1] - tny) o = ssh[1] - tny; if (o < 0) o = 0; B->so[1] = o; B->sn[1] = tny; }   /* (one box size: the ring's) */
+                if (!same) bz1 = -1;
                 const int64_t s0 = B->so[0], s1 = s0 + B->sn[0];
                 B->d0 = B->d1 = 0;
                 if (s1 > bz1) { B->d0 = s0 > bz1 ? s0 : bz1; B->d1 = (s1 + cz - 1) / cz * cz; if (B->d1 > ssh[0]) B->d1 = ssh[0]; if (B->d1 < s1) B->d1 = s1; bz1 = B->d1; }
                 if (bz1 - s0 > RZ) RZ = bz1 - s0;   /* (the ring holds [s0, bz1): nothing the block reads is overwritten) */
-                if (ngb > 1 && bz1 - gbl[ngb - 2].so[0] > RZ) RZ = bz1 - gbl[ngb - 2].so[0];   /* (nor while the previous block's kernel runs: its upload overlaps that) */
+                if (same && bz1 - gbl[k - 1].so[0] > RZ) RZ = bz1 - gbl[k - 1].so[0];   /* (nor while the previous block's kernel runs: its upload overlaps that) */
             }
+            const size_t ring = (size_t)((RZ + 127) / 128 * 128) * tny * (ngb ? gbl[0].sn[2] : 0), need = ring + (size_t)(((64 + S - 1) / S + 1) * ((H + S - 1) / S) * ((W + S - 1) / S)) * 40 + ((size_t)(nt + 16) << 22) + ((size_t)768 << 20);   /* (the check below: scr + 512 MB, and slack) */
+            if (tforce > 0 || !ngb || nty >= nyb || nty >= 64 || ((rcap <= 0 || ring <= rcap) && need <= fr0)) break;
+            nty++;
         }
+        if (nty > 1) fprintf(stderr, "recto-sp: %d y tiles (%d y blocks each), source box %lld rows a tile\n", nty, (nyb + nty - 1) / nty, (long long)tny);
         /* the source decoded on the device (whole 128^3 uint8 chunks into the ring, predict's chunk gathers; UFSM_RECTOSP_DEVDEC=0 off):
            the ring a multiple of 128 slices so a chunk row's slots are contiguous */
         const z3_meta *sm = z3_meta_of(zs);
         const int devdec = sm->chunk[0] == 128 && sm->chunk[1] == 128 && sm->chunk[2] == 128 && sm->esize == 1 && nn_ctw_new && (!getenv("UFSM_RECTOSP_DEVDEC") || atoi(getenv("UFSM_RECTOSP_DEVDEC")));
         if (devdec) RZ = (RZ + 127) / 128 * 128;
-        const size_t ny = ngb ? gbl[0].sn[1] : 0, nx = ngb ? gbl[0].sn[2] : 0, ring = (size_t)RZ * ny * nx, fr = rsg_free_mem(gdev);
+        const size_t ny = ngb ? (size_t)tny : 0, nx = ngb ? gbl[0].sn[2] : 0, ring = (size_t)RZ * ny * nx, fr = rsg_free_mem(gdev);
         const double st = 0.5 / F; const int n = 2 * (int)ceil(fmax(half, half2) / (st * um)) + 1;
         const size_t scr = (size_t)(((64 + S - 1) / S + 1) * ((H + S - 1) / S) * ((W + S - 1) / S)) * 40 + ((size_t)(nt + 16) << 22);   /* (the cell arrays, the chunk workers' buffers) */
         if (!ngb) ;
         else if (n > 1000) fprintf(stderr, "recto-sp: profiles of %d samples exceed the GPU kernel's shared memory: the CPU path\n", n);
-        else if (ring + scr + ((size_t)512 << 20) > fr) fprintf(stderr, "recto-sp: GPU %d: %.1f GB free, the source ring needs %.1f GB: the CPU path\n", gdev, fr / 1e9, ring / 1e9);
+        else if (ring + scr + ((size_t)512 << 20) > fr || (rcap > 0 && ring > rcap)) fprintf(stderr, "recto-sp: GPU %d: %.1f GB free, the source ring needs %.1f GB: the CPU path\n", gdev, fr / 1e9, ring / 1e9);
         else if (rsg_open(gdev, RZ, (int64_t)ny, (int64_t)nx, ((64 + S - 1) / S + 1) * ((H + S - 1) / S) * ((W + S - 1) / S))) fprintf(stderr, "recto-sp: GPU %d unavailable: the CPU path\n", gdev);
         else { gon = 1; fprintf(stderr, "recto-sp: GPU %d: %d row blocks, source ring %lld x %zu x %zu (%.1f GB)\n", gdev, ngb, (long long)RZ, ny, nx, ring / 1e9); }
         if (!gon) { rsg_close(); free(gbl); gbl = nullptr; ngb = 0; }
@@ -462,9 +488,13 @@ int cmd_recto_sp(int argc, char **argv) {
                 { const double tw = rs_now(); if (gpend) { pthread_join(gth, nullptr); gpend = 0; } gtp += rs_now() - tw; }
                 if (cur->rc) { fprintf(stderr, "recto-sp: block rows %d..%d: %s\n", B->q0, B->q1, cur->err); return 1; }
                 const double tk = rs_now();
-                if (gnext + 1 < ngb) { rs_gprep *nx = &GP[(gnext + 1) & 1];   /* (the next block's fields are this one's cache when they hold its rows) */
-                    if (cur->fok) { if (nx->fok) fit_fields_free(&nx->fb); nx->fb = cur->fb; nx->f0 = cur->f0; nx->f1 = cur->f1; nx->fok = 1; cur->fok = 0; }
-                    nx->k = gnext + 1; if (pthread_create(&gth, nullptr, rs_gprep_main, nx)) rs_gprep_main(nx); else gpend = 1; }
+                /* the next block's prep: ahead of this kernel within a tile; after it at a tile switch (the new tile's ring slices are this
+                   block's slots) */
+                #define RS_GNEXT() do { rs_gprep *nx = &GP[(gnext + 1) & 1];   /* (the next block's fields are this one's cache when they hold its rows) */ \
+                    if (cur->fok) { if (nx->fok) fit_fields_free(&nx->fb); nx->fb = cur->fb; nx->f0 = cur->f0; nx->f1 = cur->f1; nx->fok = 1; cur->fok = 0; } \
+                    nx->k = gnext + 1; if (pthread_create(&gth, nullptr, rs_gprep_main, nx)) rs_gprep_main(nx); else gpend = 1; } while (0)
+                const int gahead = gnext + 1 < ngb && gbl[gnext + 1].tile == B->tile;
+                if (gahead) RS_GNEXT();
                 const int a0 = B->a0, a1 = B->q1;
                 rsg_par P = {.h = h, .F = F, .st = 0.5 / F, .um = um, .prom = prom, .minint = minint, .half1 = half2 > half};
                 for (int d = 0; d < 3; d++) { P.so[d] = B->so[d]; P.sn[d] = B->sn[d]; }
@@ -474,6 +504,8 @@ int cmd_recto_sp(int argc, char **argv) {
                 { const double sig = sigma * 2; const int R = sig > 0 ? (int)ceil(3 * sig) : 0; if (R > RSG_RMAX) { fprintf(stderr, "recto-sp: --sigma too wide for the GPU path (use --gpu -1)\n"); return 1; } P.R = rr_taps(sig, P.gk); }
                 uint8_t *q = malloc(cur->M ? cur->M : 1); long long na = 0, ne = 0;
                 { const double tr = rs_now(); if (rsg_run(&P, cur->M, cur->zyx, cur->t6, q, &na, &ne)) { fprintf(stderr, "recto-sp: GPU run failed\n"); return 1; } gtr += rs_now() - tr; }
+                if (!gahead && gnext + 1 < ngb) RS_GNEXT();   /* (rsg_run has returned: the kernel is done with the ring) */
+                #undef RS_GNEXT
                 { rs_sc C = {.R = cur, .q = q, .a0 = a0, .a1 = a1, .q0 = B->q0, .q1 = B->q1, .b0 = b0, .H = H, .W = W, .S = S, .rsp = rsp};   /* rs_rows' writes, clipped to [q0, q1) */
                   fit_par(64, rs_scatter, &C); }
                 free(q); tc += na; te += ne; gtk += rs_now() - tk; gtu = GP[0].tup + GP[1].tup; g_rectosp_gpu_blocks++;

@@ -3,7 +3,8 @@
    blocks of 64 rows and a partial one, so the source ring wraps and refills), box origin off the 512 / 128 grids, three flag sets:
    the unroll's (--half-um 400 --half2-um 800 --blend 0.3, stride 4), stride 3 (row blocks whose stride grid restarts off the block
    start) with --rows and the source decoded on the host (UFSM_RECTOSP_DEVDEC=0), and a wide --sigma / --sep-um. The source is
-   lossy (q 8, as the m7 stores), so the other sets decode it on the GPU decoder into the ring. */
+   lossy (q 8, as the m7 stores), so the other sets decode it on the GPU decoder into the ring. Each set also runs on the GPU in y tiles
+   (UFSM_RECTOSP_TILES 2 + set: the ring of a tile's rows only, restarted per tile; the Paris 4 fix) against the same CPU bytes. */
 #include "fit.h"
 #include "z3w.h"
 #include "zarr3.h"
@@ -78,23 +79,28 @@ int main(void) {
                               {"--stride", "5", "--half-um", "250", "--sigma", "1.7", "--sep-um", "35"}};
     uint8_t *b1 = malloc(nc), *b2 = malloc(nc);
     for (int s = 0; s < 3; s++) {
-        char o1[700], o2[700]; snprintf(o1, sizeof o1, "%s/cpu%d", dir, s); snprintf(o2, sizeof o2, "%s/gpu%d", dir, s);
-        for (int g = 0; g < 2; g++) {
-            char *av[20] = {"ufsm", "recto-sp", fd, g ? o2 : o1, "--src", dir, "rv.zarr", "9.6", "--threads", "4", "--gpu", g ? "0" : "-1"}; int ac = 12;
+        char o1[700], o2[700], o3[700]; snprintf(o1, sizeof o1, "%s/cpu%d", dir, s); snprintf(o2, sizeof o2, "%s/gpu%d", dir, s); snprintf(o3, sizeof o3, "%s/tile%d", dir, s);
+        for (int g = 0; g < 3; g++) {
+            char tl[8]; snprintf(tl, sizeof tl, "%d", 2 + s); if (g == 2) setenv("UFSM_RECTOSP_TILES", tl, 1);
+            char *av[20] = {"ufsm", "recto-sp", fd, g == 2 ? o3 : g ? o2 : o1, "--src", dir, "rv.zarr", "9.6", "--threads", "4", "--gpu", g ? "0" : "-1"}; int ac = 12;
             for (int k = 0; k < 8; k++) av[ac++] = (char *)sets[s][k];
             if (g && s == 1) setenv("UFSM_RECTOSP_DEVDEC", "0", 1);   /* (set 1: the source decoded on the host and uploaded) */
             CHECK(cmd_recto_sp(ac, av) == 0, "recto-sp set %d %s", s, g ? "gpu" : "cpu");
-            unsetenv("UFSM_RECTOSP_DEVDEC");
+            unsetenv("UFSM_RECTOSP_DEVDEC"); unsetenv("UFSM_RECTOSP_TILES");
             CHECK(g ? g_rectosp_gpu_blocks >= 3 : g_rectosp_gpu_blocks == 0, "set %d %s: %d blocks on the GPU", s, g ? "gpu" : "cpu", g_rectosp_gpu_blocks);
             if (g) { CHECK(s == 1 ? g_rectosp_ring_chunks == -1 : g_rectosp_ring_chunks > 0, "set %d: %lld source chunks into the ring on the device", s, g_rectosp_ring_chunks);
                      printf("test_recto_gpu: set %d: %lld source chunks via the device ring, %lld of them on the GPU decoder (it may hand chunks to the CPU)\n", s, g_rectosp_ring_chunks, g_rectosp_dev_chunks); }
         }
         for (int k = 0; k < 2; k++) {
             const char *key = k ? "rsp" : "sp";
-            CHECK(!read_all(o1, key, b1, nc, fsh) && !read_all(o2, key, b2, nc, fsh), "read %s set %d", key, s);
-            size_t nd = 0, nz = 0, first = (size_t)-1; for (size_t i = 0; i < nc; i++) { nz += b1[i] != 0; if (b1[i] != b2[i]) { if (!nd) first = i; nd++; } }
-            printf("test_recto_gpu: set %d %s: %zu of %zu cells differ (%zu nonzero on the CPU)\n", s, key, nd, nc, nz);
-            CHECK(nd == 0, "set %d %s: %zu cells differ, first %zu (cpu %d gpu %d)", s, key, nd, first, nd ? b1[first] : 0, nd ? b2[first] : 0);
+            CHECK(!read_all(o1, key, b1, nc, fsh), "read %s set %d", key, s);
+            for (int g = 1; g < 3; g++) {
+                CHECK(!read_all(g == 2 ? o3 : o2, key, b2, nc, fsh), "read %s set %d", key, s);
+                size_t nd = 0, nz = 0, first = (size_t)-1; for (size_t i = 0; i < nc; i++) { nz += b1[i] != 0; if (b1[i] != b2[i]) { if (!nd) first = i; nd++; } }
+                printf("test_recto_gpu: set %d %s %s: %zu of %zu cells differ (%zu nonzero on the CPU)\n", s, key, g == 2 ? "gpu tiles" : "gpu", nd, nc, nz);
+                CHECK(nd == 0, "set %d %s %s: %zu cells differ, first %zu (cpu %d gpu %d)", s, key, g == 2 ? "gpu tiles" : "gpu", nd, first, nd ? b1[first] : 0, nd ? b2[first] : 0);
+            }
+            size_t nz = 0; for (size_t i = 0; i < nc; i++) nz += b1[i] != 0;
             if (k) CHECK(nz > nc / 40, "set %d: only %zu recto spacings", s, nz);
         }
     }

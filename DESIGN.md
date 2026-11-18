@@ -45,6 +45,31 @@ test_mergeflag: count-field --mf-w 1 on the fields gives byte-identical model fi
 (lossless test planes), and refuses fields without mf. On 1667 q2 (exact weights vs the re-encoded planes):
 model coherence 0.3538 vs 0.3563, ref GT ids **0.8896 vs 0.8896** (|err| < 0.08 0.2610 vs 0.2611): the same ref.
 
+## recto-sp: the source ring in y tiles, so big scrolls fit a 24 GB card (2026-11-18, branch rsptile-20261118, unrollperf)
+
+The GPU path kept a z ring of the whole y / x source box (all field rows' y and x +- the profile reach). On PHerc Paris 4 that ring
+was 28.2 GB: more than the pod's 24 GB RTX PRO 4000, so recto-sp fell back to the CPU path. That path then held two whole-box
+source blocks plus the fields and was OOM-killed (rc 137) in the 31 GB pod cgroup. The P4 MFREF pair ran with RECTOSP=0 for that
+reason.
+
+Now the planner splits the cells' y blocks into nty tiles. A tile's blocks read only its rows +- the reach, padded to one height,
+which is the ring's height. The blocks run shard row by shard row and, inside each shard row, tile by tile; rsp is still written one
+shard row at a time. The ring restarts at each tile switch. Within a tile the next block's decode overlaps the kernel as before. At
+a switch the decode runs after the kernel, because the new tile's slices take the running block's slots.
+
+How nty is chosen: the fewest tiles whose ring, plus the cell arrays and 768 MB of slack, fits the device's free memory.
+- `UFSM_RECTOSP_RING_GB` caps the ring size.
+- `UFSM_RECTOSP_TILES` forces a tile count.
+
+Every profile sample lies within its cell's reach, so it is inside both the old box and the tile box: the codes are the same.
+
+Cost: each tile switch re-decodes the source chunk rows that neighbouring tiles share, about 2 x reach / tile height extra. At the
+unroll's +-800 um, the reach is ~85 source voxels.
+
+test_recto_gpu runs each of its three flag sets in 2, 3 and 4 tiles as well. sp and rsp match the CPU byte for byte in every case
+(desk card 1). Still to do: the P4 run on the pod (ring size, tile count, wall time against the untiled run's 1521 s), after the
+P4 pair and the final 1667 e2e.
+
 ## Train vs predict parity: the same function up to fp16 rounding, except the EMA default and the window context (2026-11-18, branch parity-20261118)
 
 Audit (fix0332, lead + user): does predict run the function that training validates and trains? One fixed window per scroll (1667 GT
