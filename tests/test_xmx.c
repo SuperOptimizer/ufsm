@@ -204,6 +204,28 @@ static int run_gnin(int N, int D, int H, int W) {
     return bad != 0;
 }
 
+/* k_dfc16s (UFSM_XNET_DF16 10..16, depth-streaming; 10 the default) against k_dfc16 (1): byte-identical, plain and with the GroupNorm applied on load */
+static int run_dfs(int N, int D, int H, int W) {
+    const size_t ne = (size_t)N * D * H * W * 16; uint16_t *fh = malloc(ne * 2), *y0 = malloc(ne * 2), *y1 = malloc(ne * 2); float ga[16], be[16], *w = malloc(16 * 16 * 27 * 4);
+    for (size_t i = 0; i < ne; i++) fh[i] = f2h(rnd() * 2.f + 0.5f);
+    for (int c = 0; c < 16; c++) { ga[c] = 1.f + 0.5f * rnd(); be[c] = 0.3f * rnd(); }
+    for (int i = 0; i < 16 * 16 * 27; i++) w[i] = rnd() * 0.1f;
+    xnet_set_mx(0); xconv c; xconv_init(&c, w, 16, 16, 3, 3, 3, 1, 1, 1, 1, 1, 1, nullptr, nullptr);
+    float *gd = xdev_floats(ga, 16), *bd = xdev_floats(be, 16); xt f = xt_new(N, D, H, W, 16); xh2d(f.p, fh, ne * 2); float *g = xgn_stats(f, 16, 1e-5f);
+    int bad = 0;
+    for (int gn = 0; gn < 2; gn++)
+        for (int v = 10; v <= 16; v++) {
+            xt y;
+            xnet_set_df16(1); y = gn ? xconv_fwd_gnin(&c, f, g, g + N * 16, gd, bd, XA_LRELU) : xconv_fwd(&c, f, nullptr, XA_NONE); xd2h(y0, y.p, ne * 2); xt_free(&y);
+            xnet_set_df16(v); y = gn ? xconv_fwd_gnin(&c, f, g, g + N * 16, gd, bd, XA_LRELU) : xconv_fwd(&c, f, nullptr, XA_NONE); xd2h(y1, y.p, ne * 2); xt_free(&y);
+            if (xnet_check("test_xmx dfs")) return 1;
+            size_t nd = 0; for (size_t i = 0; i < ne; i++) nd += y0[i] != y1[i];
+            printf("dfs N %d %dx%dx%d gn %d variant %d: %zu of %zu differ\n", N, D, H, W, gn, v, nd, ne); bad += nd != 0;
+        }
+    xnet_set_df16(10); xfree_dev(g); xt_free(&f); xconv_free(&c); xfree_dev(gd); xfree_dev(bd); free(fh); free(y0); free(y1); free(w);
+    return bad != 0;
+}
+
 /* the 1 -> 16 stem conv (k_dfc1) against a double host reference with fp16 weights */
 static int run_c1(int N, int D, int H, int W) {
     const size_t nx = (size_t)N * D * H * W; uint16_t *xh = malloc(nx * 2), *yh = malloc(nx * 32); float *x = malloc(nx * 4), *w = malloc(16 * 27 * 4), b[16];
@@ -252,10 +274,16 @@ int main(void) {
     if (getenv("XMX_DFBENCH")) {   /* the Reader depth-fusion conv, 4 x 17 x 384^2 x 16: implicit GEMM (0) vs the halo-kernel variants; min of 10 */
         xnet_set_mx(0); float *w = calloc(16 * 16 * 27, 4); for (int j = 0; j < 16 * 16 * 27; j++) w[j] = rnd() * 0.05f;
         xconv c; xconv_init(&c, w, 16, 16, 3, 3, 3, 1, 1, 1, 1, 1, 1, nullptr, nullptr); xt x = xt_new(4, 17, 384, 384, 16);
-        for (int v = 0; v <= 8; v++) {
+        for (int v = 0; v <= 16; v++) {
             xnet_set_df16(v); double best = 1e9;
             for (int r = 0; r < 10; r++) { xnet_sync(); const double t0 = now(); xt y = xconv_fwd(&c, x, nullptr, XA_NONE); xnet_sync(); const double t = now() - t0; xt_free(&y); if (t < best) best = t; }
             printf("dfbench variant %d: %.3f ms\n", v, best * 1e3);
+        }
+        float ga[16], be[16]; for (int k = 0; k < 16; k++) { ga[k] = 1.f; be[k] = 0.f; } float *gd = xdev_floats(ga, 16), *bd = xdev_floats(be, 16), *g = xgn_stats(x, 16, 1e-5f);
+        for (int v = 1; v <= 16; v += v == 1 ? 9 : 1) {   /* with the GroupNorm applied on load (the Reader's f2) */
+            xnet_set_df16(v); double best = 1e9;
+            for (int r = 0; r < 10; r++) { xnet_sync(); const double t0 = now(); xt y = xconv_fwd_gnin(&c, x, g, g + 4 * 16, gd, bd, XA_LRELU); xnet_sync(); const double t = now() - t0; xt_free(&y); if (t < best) best = t; }
+            printf("dfbench gnin variant %d: %.3f ms\n", v, best * 1e3);
         }
         return 0;
     }
@@ -289,6 +317,9 @@ int main(void) {
     fails += run_dattn(2, 17, 40, 36);
     fails += run_gnin(2, 17, 20, 70);
     fails += run_c1(2, 17, 30, 41);
+    fails += run_dfs(2, 17, 20, 70);   /* ragged y / x tiles */
+    fails += run_dfs(1, 3, 37, 33);
+    fails += run_dfs(1, 1, 9, 16);
     fails += run_gn(2, 17, 64, 48, 16, 16, 0.f);     /* the depth-fusion shape (InstanceNorm: G = C) */
     fails += run_gn(3, 1, 40, 36, 32, 32, 20.f);     /* mean >> std: the shifted sums */
     fails += run_gn(2, 1, 12, 12, 320, 32, 1.f);     /* deep level, 10 channels a group */
