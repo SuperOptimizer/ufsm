@@ -133,7 +133,7 @@ static void mf_rd_close(mf_rd *r) { if (r->z) z3_close(r->z); if (r->f) fclose(r
 enum { SZ = 128, TY = 128 };
 typedef struct {
     const mf_in *I; const mf_coef *c; long long z0, nz, rz0, rnz;   /* the slab's rows and the rows read (with the border) */
-    const uint8_t *pl[4]; uint8_t *outrows; z3w *zw; int ny, nx; _Atomic int next, fail; _Atomic long long nmat, nflag; int thr;
+    const uint8_t *pl[4]; uint8_t *outrows, *mfrows; z3w *zw; int ny, nx; _Atomic int next, fail; _Atomic long long nmat, nflag; int thr;
 } mf_job;
 static void *mf_worker(void *a) {
     mf_job *J = a; const long long H = J->I->shape[1], W = J->I->shape[2], D = J->I->shape[0];
@@ -158,6 +158,7 @@ static void *mf_worker(void *a) {
             for (long long x = 0; x < tx; x++) { nm += wm[x] > 0; nf += wm[x] > 0 && s[x] >= J->thr; }
             if (sh) memcpy(sh + ((size_t)z * TY + y) * TY, s, (size_t)tx);
             else memcpy(J->outrows + ((size_t)z * H + y0 + y) * W + x0, s, (size_t)tx);
+            if (J->mfrows) memcpy(J->mfrows + ((size_t)z * H + y0 + y) * W + x0, s, (size_t)tx);
         }
         atomic_fetch_add(&J->nmat, nm); atomic_fetch_add(&J->nflag, nf);
         if (sh && z3w_write_shard(J->zw, J->z0 / SZ, y0 / TY, x0 / TY, sh, 1)) atomic_store(&J->fail, 1);
@@ -166,7 +167,11 @@ static void *mf_worker(void *a) {
     free(o); free(sh); return nullptr;
 }
 
-/* ufsm merge-flag <fields-dir> [--out DIR] [--coef b,amp,r,sp] [--thr T] [--threads N] */
+static int mf_link_dir(const char *src, const char *out);
+static int mf_weight_create(const mf_in *I, const char *src, const char *out, double K, int cut, z3w *zw[3]);
+static void mf_weight_rows(uint8_t *pc, uint8_t *ps, uint8_t *w, const uint8_t *mf, size_t n, double K, int cut, size_t *nmat, double *fsum);
+static int mf_write_rows(z3w *zw, const uint8_t *rows, long long z0, long long nz, long long H, long long W, int fill, uint8_t *sb, int nt);
+/* ufsm merge-flag <fields-dir> [--out DIR] [--coef b,amp,r,sp] [--thr T] [--threads N] [--weighted DIR [--mf-w 1 | --mf-cut T]] */
 static int cmd_merge_flag_eval(int argc, char **argv, const char *list);
 static int cmd_merge_flag_apply(int argc, char **argv, const char *src, const char *out);
 int cmd_merge_flag(int argc, char **argv) {
@@ -174,6 +179,7 @@ int cmd_merge_flag(int argc, char **argv) {
     if (argc >= 4 && !strcmp(argv[2], opt_n("--eval"))) return cmd_merge_flag_eval(argc, argv, argv[3]);
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm merge-flag <fields-dir> [--out DIR] [--coef b,c_amp,c_r,c_sp] [--thr 179] [--threads N]\n"
+                        "       ... --weighted DIR: also DIR = the fields with their evidence x (1 - mf / 255) (merge-flag --apply in the same pass; zarr fields)\n"
                         "       ufsm merge-flag --apply FIELDS OUT [--mf-w 1 | --mf-cut T]   FIELDS' evidence down-weighted where merged (pc ps w x (1 - K mf / 255)) for count-field / fit\n"
                         "       ufsm merge-flag --eval LIST [--coef ..] [--threads 4]   the rule against GT intervals (LIST: name scroll fields-dir codes-root codes-key)\n"
                         "  the merged-sheet score of every field cell (src/mergeflag.h) as plane mf: zarr fields -> DIR/mf (zarr, 128^3 shards), raw\n"
@@ -201,11 +207,20 @@ int cmd_merge_flag(int argc, char **argv) {
     uint8_t *pl[4] = {0}; const size_t rmax = (size_t)(SZ + 2 * MF_R) * H * W; for (int k = 0; k < 4; k++) if (!(pl[k] = malloc(rmax))) { fprintf(stderr, "merge-flag: out of memory\n"); return 1; }
     uint8_t *orows = fo ? malloc((size_t)SZ * H * W) : nullptr;
     long long nmat = 0, nflag = 0; int rc = 0;
+    /* --weighted DIR: the count-field input (the unroll's MFREF): pc ps w x (1 - K mf / 255) beside links to the other planes */
+    const char *wd = opt(argc, argv, "--weighted", nullptr); z3w *ww[3] = {0}; uint8_t *mfr = nullptr, *wr[3] = {0}, *sb = nullptr;
+    const double K = opt_atof("--mf-w", opt(argc, argv, "--mf-w", "1")); const int cut = opt_atoi("--mf-cut", opt(argc, argv, "--mf-cut", "0")); size_t wmat = 0; double wsum = 0;
+    if (wd) {
+        if (!I.zarr || crop) { fprintf(stderr, "merge-flag: --weighted needs whole zarr fields\n"); return 2; }
+        if (mf_link_dir(argv[2], wd) || mf_weight_create(&I, argv[2], wd, K, cut, ww)) return 1;
+        mfr = malloc((size_t)SZ * H * W); sb = malloc((size_t)SZ * SZ * SZ); for (int k = 0; k < 3; k++) wr[k] = malloc((size_t)SZ * H * W);
+        if (!mfr || !sb || !wr[0] || !wr[1] || !wr[2]) { fprintf(stderr, "merge-flag: out of memory\n"); return 1; }
+    }
     for (long long z0 = 0; z0 < D && !rc; z0 += SZ) {
         const long long nz = z0 + SZ < D ? SZ : D - z0, rz0 = z0 - MF_R < 0 ? 0 : z0 - MF_R, rz1 = z0 + nz + MF_R > D ? D : z0 + nz + MF_R;
         for (int k = 0; k < 4 && !rc; k++) if (mf_rows(&rd[k], rz0, rz1 - rz0, pl[k], nt)) { fprintf(stderr, "merge-flag: cannot read %s rows %lld..%lld\n", names[k], rz0, rz1); rc = 1; }
         if (rc) break;
-        mf_job J = {.I = &I, .c = &c, .z0 = z0, .nz = nz, .rz0 = rz0, .rnz = rz1 - rz0, .pl = {pl[0], pl[1], pl[2], pl[3]}, .outrows = orows, .zw = zw,
+        mf_job J = {.I = &I, .c = &c, .z0 = z0, .nz = nz, .rz0 = rz0, .rnz = rz1 - rz0, .pl = {pl[0], pl[1], pl[2], pl[3]}, .outrows = orows, .mfrows = mfr, .zw = zw,
                     .ny = (int)((H + TY - 1) / TY), .nx = (int)((W + TY - 1) / TY), .thr = thr};
         pthread_t th[64]; const int m = nt < 64 ? nt : 64;
         for (int t = 0; t < m; t++) pthread_create(&th[t], nullptr, mf_worker, &J);
@@ -213,7 +228,16 @@ int cmd_merge_flag(int argc, char **argv) {
         if (atomic_load(&J.fail)) { fprintf(stderr, "merge-flag: shard write failed: %s\n", z3w_error()); rc = 1; }
         if (fo && fwrite(orows, 1, (size_t)nz * H * W, fo) != (size_t)(nz * H * W)) { fprintf(stderr, "merge-flag: write failed\n"); rc = 1; }
         nmat += atomic_load(&J.nmat); nflag += atomic_load(&J.nflag);
+        if (wd && !rc) {   /* the slab's weighted planes (the rows z0.. of the read buffer: it starts at rz0) */
+            const size_t n = (size_t)nz * H * W, o = (size_t)(z0 - rz0) * H * W; const int src[3] = {0, 1, 3};
+            for (int k = 0; k < 3; k++) memcpy(wr[k], pl[src[k]] + o, n);
+            mf_weight_rows(wr[0], wr[1], wr[2], mfr, n, K, cut, &wmat, &wsum);
+            for (int k = 0; k < 3 && !rc; k++) if (mf_write_rows(ww[k], wr[k], z0, nz, H, W, k < 2 ? 128 : 0, sb, nt)) { fprintf(stderr, "merge-flag --weighted: %s\n", z3w_error()); rc = 1; }
+        }
     }
+    for (int k = 0; k < 3; k++) { if (ww[k] && z3w_close(ww[k])) rc = 1; free(wr[k]); }
+    free(mfr); free(sb);
+    if (wd && !rc) printf("merge-flag --weighted: %s: mean evidence factor %.4f over %zu material cells\n", wd, wmat ? wsum / wmat : 0, wmat);
     for (int k = 0; k < 4; k++) { free(pl[k]); mf_rd_close(&rd[k]); }
     free(orows);
     if (zw && z3w_close(zw)) { fprintf(stderr, "merge-flag: %s\n", z3w_error()); rc = 1; }
@@ -464,47 +488,62 @@ static float mf_src_q(const char *dir, const char *name) {   /* the volcomp q of
     json_free(j); return q;
 }
 static inline uint8_t mf_scale_phase(uint8_t v, float f) { const float d = (v - 128) * f; return (uint8_t)lrintf(128 + d); }
+static int mf_link_dir(const char *src, const char *out) {   /* OUT: links to every entry of SRC but pc ps w, fields.json copied */
+    if (mkdir(out, 0775) && errno != EEXIST) { fprintf(stderr, "merge-flag: cannot create %s\n", out); return 1; }
+    char p[1500], q[1500]; DIR *dd = opendir(src); if (!dd) return 1;
+    for (struct dirent *e; (e = readdir(dd));) {
+        if (e->d_name[0] == '.' || !strcmp(e->d_name, "pc") || !strcmp(e->d_name, "ps") || !strcmp(e->d_name, "w") || !strcmp(e->d_name, "fields.json")) continue;
+        snprintf(p, sizeof p, "%s/%s", src, e->d_name); char rp[PATH_MAX]; if (!realpath(p, rp)) continue;
+        snprintf(q, sizeof q, "%s/%s", out, e->d_name); unlink(q); if (symlink(rp, q)) { fprintf(stderr, "merge-flag: cannot link %s\n", q); closedir(dd); return 1; }
+    }
+    closedir(dd);
+    snprintf(p, sizeof p, "%s/fields.json", src); snprintf(q, sizeof q, "%s/fields.json", out); FILE *a = fopen(p, "rb"), *b = fopen(q, "wb"); char buf[1 << 16]; size_t n;
+    if (!a || !b) { if (a) fclose(a); if (b) fclose(b); fprintf(stderr, "merge-flag: cannot copy fields.json\n"); return 1; }
+    while ((n = fread(buf, 1, sizeof buf, a)) > 0) fwrite(buf, 1, n, b);
+    fclose(a); return fclose(b) ? 1 : 0;
+}
+static int mf_weight_create(const mf_in *I, const char *src, const char *out, double K, int cut, z3w *zw[3]) {   /* OUT's pc ps w writers, at the source's q */
+    static const char *const nm[3] = {"pc", "ps", "w"}; const int64_t sh3[3] = {I->shape[0], I->shape[1], I->shape[2]}; char p[1500], at[256];
+    for (int k = 0; k < 3; k++) {
+        snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"winding fitter fields (src/fit.h), merge-flag weighted: %s x (1 - %g mf / 255)%s\",\"h\":%d}}", nm[k], K, cut ? " (cut)" : "", I->h);
+        snprintf(p, sizeof p, "%s/%s", out, nm[k]);
+        if (!(zw[k] = z3w_create(p, sh3, SZ, mf_src_q(src, nm[k]), k < 2 ? 128 : 0, at))) { fprintf(stderr, "merge-flag: %s\n", z3w_error()); return 1; }
+    }
+    return 0;
+}
+static void mf_weight_rows(uint8_t *pc, uint8_t *ps, uint8_t *w, const uint8_t *mf, size_t n, double K, int cut, size_t *nmat, double *fsum) {
+    for (size_t i = 0; i < n; i++) {
+        if (!w[i]) continue;
+        const float f = cut ? (mf[i] >= cut ? 0.f : 1.f) : fmaxf(0.f, 1.f - (float)K * mf[i] / 255.f);
+        pc[i] = mf_scale_phase(pc[i], f); ps[i] = mf_scale_phase(ps[i], f);
+        const int v = (int)lrintf(w[i] * f); w[i] = (uint8_t)(v < 1 ? 1 : v); (*nmat)++; *fsum += f;
+    }
+}
+static int mf_write_rows(z3w *zw, const uint8_t *rows, long long z0, long long nz, long long H, long long W, int fill, uint8_t *sb, int nt) {   /* rows [z0, z0 + nz) as 128^3 shards */
+    for (long long y0 = 0; y0 < H; y0 += SZ) for (long long x0 = 0; x0 < W; x0 += SZ) {
+        memset(sb, fill, (size_t)SZ * SZ * SZ);
+        for (long long z = 0; z < nz; z++) for (long long y = y0; y < y0 + SZ && y < H; y++)
+            memcpy(sb + ((size_t)z * SZ + (y - y0)) * SZ, rows + ((size_t)z * H + y) * W + x0, (size_t)(x0 + SZ < W ? SZ : W - x0));
+        if (z3w_write_shard(zw, z0 / SZ, y0 / SZ, x0 / SZ, sb, nt)) return 1;
+    }
+    return 0;
+}
 static int cmd_merge_flag_apply(int argc, char **argv, const char *src, const char *out) {
     mf_in I; if (mf_open(&I, src)) return 1;
     if (!I.zarr || I.off[0] || I.off[1] || I.off[2]) { fprintf(stderr, "merge-flag --apply: zarr fields (not a crop) only\n"); json_free(I.j); return 2; }
     const double K = opt_atof("--mf-w", opt(argc, argv, "--mf-w", "1")); const int cut = opt_atoi("--mf-cut", opt(argc, argv, "--mf-cut", "0"));
     const int nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16);
-    if (mkdir(out, 0775) && errno != EEXIST) { fprintf(stderr, "merge-flag --apply: cannot create %s\n", out); return 1; }
-    char p[1500], q[1500];
-    DIR *dd = opendir(src); if (!dd) return 1;   /* links: every entry but pc ps w (fields.json copied) */
-    for (struct dirent *e; (e = readdir(dd));) {
-        if (e->d_name[0] == '.' || !strcmp(e->d_name, "pc") || !strcmp(e->d_name, "ps") || !strcmp(e->d_name, "w") || !strcmp(e->d_name, "fields.json")) continue;
-        snprintf(p, sizeof p, "%s/%s", src, e->d_name); char rp[PATH_MAX]; if (!realpath(p, rp)) continue;
-        snprintf(q, sizeof q, "%s/%s", out, e->d_name); unlink(q); if (symlink(rp, q)) { fprintf(stderr, "merge-flag --apply: cannot link %s\n", q); closedir(dd); return 1; }
-    }
-    closedir(dd);
-    { snprintf(p, sizeof p, "%s/fields.json", src); snprintf(q, sizeof q, "%s/fields.json", out); FILE *a = fopen(p, "rb"), *b = fopen(q, "wb"); char buf[1 << 16]; size_t n;
-      if (!a || !b) { fprintf(stderr, "merge-flag --apply: cannot copy fields.json\n"); return 1; }
-      while ((n = fread(buf, 1, sizeof buf, a)) > 0) fwrite(buf, 1, n, b); fclose(a); if (fclose(b)) return 1; }
+    z3w *zw[3]; if (mf_link_dir(src, out) || mf_weight_create(&I, src, out, K, cut, zw)) return 1;
     const char *names[4] = {"pc", "ps", "w", "mf"}; mf_rd rd[4]; for (int k = 0; k < 4; k++) if (mf_rd_open(&rd[k], &I, names[k])) return 1;
-    const long long D = I.shape[0], H = I.shape[1], W = I.shape[2]; const int64_t sh3[3] = {D, H, W}; z3w *zw[3];
-    for (int k = 0; k < 3; k++) {
-        char at[256]; snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"winding fitter fields (src/fit.h), merge-flag --apply: %s x (1 - %g mf / 255)%s\",\"h\":%d}}", names[k], K, cut ? " (cut)" : "", I.h);
-        snprintf(p, sizeof p, "%s/%s", out, names[k]);
-        if (!(zw[k] = z3w_create(p, sh3, SZ, mf_src_q(src, names[k]), k < 2 ? 128 : 0, at))) { fprintf(stderr, "merge-flag --apply: %s\n", z3w_error()); return 1; }
-    }
+    const long long D = I.shape[0], H = I.shape[1], W = I.shape[2];
     const size_t rows = (size_t)SZ * H * W; uint8_t *pl[4]; for (int k = 0; k < 4; k++) if (!(pl[k] = malloc(rows))) return 1;
     uint8_t *sb = malloc((size_t)SZ * SZ * SZ); int rc = 0; size_t nmat = 0; double fsum = 0;
     for (long long z0 = 0; z0 < D && !rc; z0 += SZ) {
         const long long nz = z0 + SZ < D ? SZ : D - z0;
         for (int k = 0; k < 4 && !rc; k++) if (mf_rows(&rd[k], z0, nz, pl[k], nt)) { fprintf(stderr, "merge-flag --apply: cannot read %s\n", names[k]); rc = 1; }
-        for (size_t i = 0; i < (size_t)nz * H * W && !rc; i++) {
-            if (!pl[2][i]) continue;
-            const float f = cut ? (pl[3][i] >= cut ? 0.f : 1.f) : fmaxf(0.f, 1.f - (float)K * pl[3][i] / 255.f);
-            pl[0][i] = mf_scale_phase(pl[0][i], f); pl[1][i] = mf_scale_phase(pl[1][i], f);
-            const int w = (int)lrintf(pl[2][i] * f); pl[2][i] = (uint8_t)(w < 1 ? 1 : w); nmat++; fsum += f;
-        }
-        for (int k = 0; k < 3 && !rc; k++) for (long long y0 = 0; y0 < H; y0 += SZ) for (long long x0 = 0; x0 < W; x0 += SZ) {   /* shards of 128^3 */
-            memset(sb, k < 2 ? 128 : 0, (size_t)SZ * SZ * SZ);
-            for (long long z = 0; z < nz; z++) for (long long y = y0; y < y0 + SZ && y < H; y++)
-                memcpy(sb + ((size_t)z * SZ + (y - y0)) * SZ, pl[k] + ((size_t)z * H + y) * W + x0, (size_t)(x0 + SZ < W ? SZ : W - x0));
-            if (z3w_write_shard(zw[k], z0 / SZ, y0 / SZ, x0 / SZ, sb, nt)) { fprintf(stderr, "merge-flag --apply: %s\n", z3w_error()); rc = 1; break; }
-        }
+        if (rc) break;
+        mf_weight_rows(pl[0], pl[1], pl[2], pl[3], (size_t)nz * H * W, K, cut, &nmat, &fsum);
+        for (int k = 0; k < 3 && !rc; k++) if (mf_write_rows(zw[k], pl[k], z0, nz, H, W, k < 2 ? 128 : 0, sb, nt)) { fprintf(stderr, "merge-flag --apply: %s\n", z3w_error()); rc = 1; }
     }
     for (int k = 0; k < 3; k++) if (z3w_close(zw[k])) rc = 1;
     for (int k = 0; k < 4; k++) { free(pl[k]); mf_rd_close(&rd[k]); }

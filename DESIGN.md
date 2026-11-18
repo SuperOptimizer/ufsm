@@ -6,6 +6,38 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Counting around merges: the ref on mf-weighted fields; 1667 joined GT ids 0.8606 -> 0.9129 (2026-11-18, branch mfref-20261118)
+
+The merge-flag section below found that a local mask only removes ~20 % of the wrong voxels: a merge also misnumbers every sheet beyond
+it. The integers of the joined model come from the ref (count-field; the slab fits snap to it, --ref-snap 1), so the lever is the ref's
+least squares: count-field's per-cell weight is w / 255 times the orientation and sheetness ramps, and its phase-gradient targets need
+confident phase. `ufsm merge-flag --apply FIELDS OUT` (and `--weighted OUT` in merge-flag's own pass) writes the fields with pc, ps
+scaled toward 128 and w scaled by f = 1 - mf / 255 (w kept >= 1 on material), every other plane linked: the merged cells still exist
+but carry little evidence, so the solve carries the count around them (along z and around the turn) instead of through them.
+
+1667 q2 (u1 13790 fields, recto-blended sp; mf of the fixed rule; count-field with q2's flags on the desk CPU, 12 min; the base ref
+reproduces the pod's to the printed digit: model coherence 0.2286, closing error 2.040 turns):
+
+| ref fields | model coherence | closing error | ref GT ids | joined GT ids (desk card 1 slabs + join) | z drift body / whole / end (turns) |
+|---|---|---|---|---|---|
+| rsp (base) | 0.2286 | 2.040 | 0.8388 | 0.8606 (q2 pod: 0.8607) | 0.73 / 0.78 / +3.52 |
+| f = 1 - mf / 255 | 0.3563 | 2.072 | 0.8896 | **0.9129** | 0.56 / 0.61 / +1.17 |
+| f = 0 at mf >= 128 | 0.4254 | 2.133 | 0.8891 | | |
+
+- Joined, weighted vs base: +0.052 [+0.027, +0.081] (box bootstrap), 41 boxes up / 11 down; every loser within -0.006 except C19
+  (0.613 -> 0.507). Largest gains: C57 0.54 -> 0.91, C62 0.54 -> 0.92, C45 0.62 -> 0.95, C2 0.56 -> 0.84, C16 0.77 -> 0.97.
+- Ref, weighted vs base: +0.051 [+0.027, +0.079], 42 up / 11 down.
+- **Gate (all-voxel joined ids up on the 54 boxes, drift not up): PASS.** Paris 4: pending (needs a whole-scroll P4 field set + run).
+- The slabs, join and check are unchanged (master settings: slab overlap 8, FITLANES 1 on card 1, < 4 GB); only the ref's input changed.
+
+**Unroll (MFREF=1, the default):** mflag runs in the foreground right after rectosp with all threads and writes both mf and fields/mfw
+(`merge-flag F --weighted fields/mfw`, one pass); the ref's count-field reads fields/mfw (reff), the slabs read $F; refstream (pass 1
+behind the predict) is off under MFREF, and a pool cache is used only for unweighted fields; CLEAN removes fields/mfw. A failed mflag
+leaves the ref on $F (DEFAULTED line). MFREF=0 restores the background mflag (no wall). Cost on the critical path: the mflag pass,
+11.5 min on 16 desk threads under lowprio beside try9 (1667 q2, 4.4 GB RSS; the same evidence factor 0.8050 as --apply);
+on the pod's idle CPUs expected ~5-7 min. test_mergeflag: --weighted equals --apply byte for byte on zarr fields, the scaling, the links; test_podscripts: the
+ref's inputs, the foreground order, refstream off, CLEAN.
+
 ## merge-flag: where the net merges touching sheets, flagged from its own fields; the unroll exports those parts as uncertain (2026-11-18, branch mergeflag-20261118)
 
 On packed sheets the net's phase runs one cycle across ~3 touching GT sheets ("Where the packed-sheet deficit lives" below). No

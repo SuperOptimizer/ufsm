@@ -127,4 +127,31 @@ with tempfile.TemporaryDirectory(prefix="ufsm-mflag-") as tmp:
     for l in rule:
         auc = float(l.split(" AUC ")[1].split()[0]); mer = float(l.split(" merged ")[1].split()[0])
         assert auc > 0.95 and 0.3 < mer < 0.7, l   # (about half the intervals lie in the merged half)
+    # zarr fields (each plane ingested: values clipped at 254): merge-flag --weighted DIR (the unroll's MFREF ref input) equals
+    # merge-flag --apply on the same fields and mf; pc ps scaled toward 128 by 1 - mf / 255, w by it (>= 1 on material), others linked
+    zf = t / "zfields"; zf.mkdir()
+    for k, a in (("pc", pc), ("ps", ps), ("sp", sp), ("w", w)):
+        lk = t / f"{k}.zarr" / "0"; lk.mkdir(parents=True)
+        (lk / ".zarray").write_text(json.dumps({"shape": [D, H, W], "chunks": [8] * 3, "dtype": "|u1", "fill_value": 0, "order": "C",
+                                                "filters": None, "compressor": None, "zarr_format": 2, "dimension_separator": "/"}))
+        for a0 in range(D // 8):
+            for b0 in range(H // 8):
+                (lk / str(a0) / str(b0)).mkdir(parents=True, exist_ok=True)
+                for c0 in range(W // 8): (lk / str(a0) / str(b0) / str(c0)).write_bytes(a[a0 * 8:a0 * 8 + 8, b0 * 8:b0 * 8 + 8, c0 * 8:c0 * 8 + 8].tobytes())
+        run(BIN, "ingest-labels", t, f"{k}.zarr", t / f"z{k}", "--um", "9.6", "--lut", t / "lut.txt", "--levels", "1", "--shard", "128", "--threads", "2")
+        (zf / k).symlink_to(t / f"z{k}" / "9.6")
+    (zf / "t0").symlink_to(t / "zsp" / "9.6")   # (an extra plane: linked as is)
+    (zf / "fields.json").write_text(json.dumps({"format": "zarr", "origin": [0, 0, 0], "shape": [D, H, W], "h": h, "um": 9.6, "axis": axis}))
+    run(BIN, "merge-flag", zf, "--coef", ",".join(map(str, COEF)), "--weighted", t / "wtd", "--threads", "3")
+    run(BIN, "merge-flag", "--apply", zf, t / "app", "--threads", "3")
+    rd = lambda root, k: (run(BIN, "read", root, k, 0, 0, 0, D, H, W, t / "r.raw"), np.fromfile(t / "r.raw", np.uint8).reshape(D, H, W))[1]
+    mz = rd(zf, "mf"); wz = rd(zf, "w")
+    for k in ("pc", "ps", "w"):
+        a, b = rd(t / "wtd", k), rd(t / "app", k)
+        assert (a == b).all(), k
+    f_ = np.maximum(0, 1 - mz / 255.0)
+    pz = rd(zf, "pc"); exp = np.where(wz > 0, np.rint(128 + (pz.astype(float) - 128) * f_), pz)
+    assert np.abs(rd(t / "wtd", "pc") - exp).max() <= 1
+    ww = rd(t / "wtd", "w"); assert (ww[wz > 0] >= 1).all() and (ww[mz > 200] < wz[mz > 200]).all()
+    assert (t / "wtd" / "t0").is_symlink() and (t / "wtd" / "sp").is_symlink()
     print("test_mergeflag: PASS")
