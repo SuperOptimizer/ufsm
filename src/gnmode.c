@@ -16,3 +16,9 @@ int gn_live_choice_n(const char *arg, int gn_ema, int frozen, long n, long w, in
     if (n >= 0 && w >= 0 && n < w) { *defaulted = 1; return 1; }
     return 0;
 }
+int ema_choice(const char *arg, double rel, int *defaulted) {
+    *defaulted = 0;
+    if (arg && strcmp(arg, "auto")) return atoi(arg) != 0;
+    if (rel > EMA_REL_MAX) { *defaulted = 1; return 0; }
+    return 1;
+}

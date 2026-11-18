@@ -1435,7 +1435,7 @@ static int predict_one(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm predict <ckpt> <root> <ct-group-key> <out-dir> --um U [--level 0] [--box z,y,x,nz,ny,nx] [--window W] [--act-mx8 1]\n"
                         "       [--halo H] [--align 128] [--shard 512] [--gpu 0] [--cache DIR] [--axis umbilicus.json | --no-axis 1] [--levels 4] [--q 8] [--threads 16]\n"
-                        "       [--prec 0|1|2|3|4] [--policy enc0=1,...] [--f16 0|1] [--fp4 0|1] [--input-mx 0|1] [--input-prec 0|4|8] [--ema 1]   EMA or current weights (0)\n"
+                        "       [--prec 0|1|2|3|4] [--policy enc0=1,...] [--f16 0|1] [--fp4 0|1] [--input-mx 0|1] [--input-prec 0|4|8] [--ema auto|1|0]   EMA or current weights (auto: current when |ema - p| / |p| > 0.08)\n"
                         "       [--iso T]   probability outputs 0 where CT < T (the scan's void cutoff; the fit's material mask stays CT > 0)\n"
                         "       [--ema-blend A]   a x final weights + (1 - a) x EMA (tail-average blend, e.g. 0.35)\n"
                         "       [--gn-stats stored|legacy]   defaults to the checkpoint's normalization contract\n"
@@ -1532,7 +1532,17 @@ static int predict_one(int argc, char **argv) {
     if (*opt(argc, argv, "--aug-hist", "") && scan_aug_load_hist(opt(argc, argv, "--aug-hist", ""), &dg)) { fprintf(stderr, "predict: --aug-hist: cannot read the file\n"); return 2; }
     const int degrade = scan_aug_enabled(&dg); const uint64_t dg_seed = strtoull(opt(argc, argv, "--aug-seed", "1"), nullptr, 10);
     int nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 16);
-    const int use_ema = opt_atoi("--ema", opt(argc, argv, "--ema", "1")) != 0;
+    /* --ema auto (default): the EMA weights unless they lag the live ones by |ema - p| / |p| > EMA_REL_MAX. The EMA steps once per
+       optimizer update, so at --accum 10 decay 0.999 is a ~10 000-step horizon: pab-A 10690 (0.117) predicted with its EMA scored GT ids
+       0.798 vs 0.841 live on 1667, body drift 1.64 vs 0.23 (fix0332 11-18, DESIGN "Train vs predict parity"); u1 13000 reads 0.049 */
+    int use_ema; {
+        const char *ea = opt(argc, argv, "--ema", nullptr); const int need = !ea || !strcmp(ea, "auto"); int dfl = 0;
+        const double rel = need ? checkpoint_ema_rel(ckpt) : -1;
+        use_ema = ema_choice(ea, rel, &dfl);
+        if (dfl) fprintf(stderr, "DEFAULTED: predict --ema auto: the checkpoint's EMA weights lag the live ones (|ema - p| / |p| = %.3f > %.2f): "
+                                 "the live weights (--ema 1 forces the EMA)\n", rel, EMA_REL_MAX);
+        else if (need) fprintf(stderr, "predict: --ema auto: |ema - p| / |p| = %.3f: the EMA weights\n", rel);
+    }
     const char *blend_s = opt(argc, argv, "--ema-blend", nullptr);   /* tail-average blend: a x final weights + (1 - a) x EMA (modded-nanogpt 0.35) */
     const float ema_blend = blend_s ? (float)atof(blend_s) : -1.f;
     if (blend_s && !(ema_blend >= 0.f && ema_blend <= 1.f)) { fprintf(stderr, "--ema-blend: 0..1\n"); return 2; }
@@ -1842,9 +1852,6 @@ static int predict_one(int argc, char **argv) {
     if (ema_blend >= 0.f) unet_blend_ema(u, ema_blend);
     unet_use_ema(u, use_ema || ema_blend >= 0.f);
     if (infer_lean) unet_infer_release(u, 0);
-    if (use_ema && ema_blend < 0.f && step > 0 && step < 10000)   /* (audit 11-14 infer #11: decay 0.999 lags ~1000 steps; scratch2 at 1000-2000: |ema - p| / |p| 8-10 %) */
-        fprintf(stderr, "predict: note: step %d checkpoint with --ema 1: the EMA weights lag the live ones by ~1000 steps early in a run; "
-                        "for a snapshot comparison score --ema 0 (or --ema-blend) too\n", step);
     /* --gn-live 1 (gn_ema nets, audit 11-14 infer #2): normalise with each window's own GroupNorm statistics, the function the net trains
        with while --gn-ema-warm has not ended. Default (no --gn-live): live for a checkpoint whose warm-up was never reached (it never ran on
        the running statistics: try9's 1667 unroll on them, GT ids 0.669 vs u1's 0.831, fix0332 11-18), else the running statistics;

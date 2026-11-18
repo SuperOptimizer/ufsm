@@ -8,3 +8,7 @@
 int gn_live_choice(const char *hdr, const char *arg, int gn_ema, int frozen, int *defaulted, long *n, long *w);
 /* gn_live_choice_n: the same rule on the numbers (train's validation: the net's ge_n / ge_warm at that step; arg the --val-gn-live value) */
 int gn_live_choice_n(const char *arg, int gn_ema, int frozen, long n, long w, int *defaulted);
+/* ema_choice: whether inference / validation uses the EMA weights. arg the --ema (--val-live inverted by the caller) value: "0" / "1" win,
+   nullptr or "auto" = the EMA unless rel = |ema - p| / |p| > EMA_REL_MAX (then the live weights, *defaulted 1: the caller prints DEFAULTED). */
+#define EMA_REL_MAX 0.08
+int ema_choice(const char *arg, double rel, int *defaulted);

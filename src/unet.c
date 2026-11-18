@@ -4979,6 +4979,15 @@ void unet_gn_freeze(unet *u, const float *h) {
 void unet_gn_freeze_train(unet *u, int on) { u->gn_frz_train = on; }
 void unet_blend_ema(unet *u, float a) { nn_scale(u->ema, 1.f - a, u->np); nn_axpy(u->ema, a, u->p, u->np); nn_wmemo_clear(); }
 const float *unet_ema_params(const unet *u) { return u->ema; }
+double unet_ema_rel(const unet *u) {   /* |ema - p| / |p| over every parameter, host side in 4 MB pieces (one pass, ~0.2 s at 104 M) */
+    if (!u->p || !u->ema || u->p == u->ema) return 0.0;
+    enum { CH = 1 << 20 }; float *a = malloc(CH * 4), *b = malloc(CH * 4); double dd = 0, pp = 0;
+    for (size_t i = 0; i < u->np; i += CH) {
+        const size_t n = u->np - i < CH ? u->np - i : CH; nn_d2h(a, u->p + i, n * 4); nn_d2h(b, u->ema + i, n * 4);
+        for (size_t j = 0; j < n; j++) { const double d = (double)b[j] - a[j]; dd += d * d; pp += (double)a[j] * a[j]; }
+    }
+    free(a); free(b); return pp > 0 ? sqrt(dd / pp) : 0.0;
+}
 void unet_use_ema(unet *u, int on) { nn_wmemo_clear(); u->live = on ? u->ema : u->p; u->using_ema = on; if (!u->sparse24) u->fw = u->live; }
 const float *unet_fwd_params(const unet *u) { return u->cfg.film && u->fw == u->ffw ? u->live : u->fw; }   /* (film: the reader applies its own codes to the live weights) */
 /* ---- 2:4 structured sparsity: the forward reads a masked copy of the live weights; SR-STE keeps the master weights dense ---- */

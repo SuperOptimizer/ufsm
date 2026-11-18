@@ -90,3 +90,16 @@ int checkpoint_runtime_json(const checkpoint_runtime *r, char *out, size_t cap) 
         r->train_window, r->prec, r->f16, r->act_mx4, r->act_mx8, r->grad_mx8, r->input_mx, r->input_prec, r->gn_stored, p, o);
     return n < 0 || (size_t)n >= cap ? -1 : 0;
 }
+
+double checkpoint_ema_rel(const char *path) {   /* |ema - p| / |p| from the file: arrays p and ema follow the header line, nparams floats each */
+    char *h = checkpoint_header_line(path); if (!h) return -1;
+    const char *k = strstr(h, "\"nparams\":"); const size_t np = k ? strtoull(k + 10, nullptr, 10) : 0; const long off = (long)strlen(h) + 1; free(h);
+    FILE *f = np ? fopen(path, "rb") : nullptr; if (!f) return -1;
+    enum { CH = 1 << 20 }; float *a = malloc(CH * 4), *b = malloc(CH * 4); double dd = 0, pp = 0; int ok = a && b;
+    for (size_t i = 0; ok && i < np; i += CH) {
+        const size_t n = np - i < CH ? np - i : CH;
+        ok = !fseek(f, off + (long)(i * 4), SEEK_SET) && fread(a, 4, n, f) == n && !fseek(f, off + (long)((np + i) * 4), SEEK_SET) && fread(b, 4, n, f) == n;
+        for (size_t j = 0; ok && j < n; j++) { const double d = (double)b[j] - a[j]; dd += d * d; pp += (double)a[j] * a[j]; }
+    }
+    free(a); free(b); fclose(f); return ok && pp > 0 ? sqrt(dd / pp) : -1;
+}

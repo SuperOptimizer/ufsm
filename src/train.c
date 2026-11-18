@@ -2831,7 +2831,11 @@ int cmd_train(int argc, char **argv) {
     /* the checkpoint ring and snapshots (src/ckring.c, ops audit #10): reflinks of each last.ckpt, the newest --ckpt-ring kept */
     ck_cfg ckc = {opt_atoi("--ckpt-ring", opt(argc, argv, "--ckpt-ring", "4")), opt_atoi("--ckpt-ring-copy", opt(argc, argv, "--ckpt-ring-copy", "0")), opt_atoi("--snap-every", opt(argc, argv, "--snap-every", "0")),
                         opt_atoi("--snap-keep-every", opt(argc, argv, "--snap-keep-every", "5000")), opt_atoi("--snap-keep-last", opt(argc, argv, "--snap-keep-last", "5"))};
-    const int val_live = opt_atoi("--val-live", opt(argc, argv, "--val-live", "0"));   /* validate the live weights instead of the EMA (e.g. resume a last.ckpt for one lr-0 step) */
+    /* --val-live 1: validate the live weights (e.g. resume a last.ckpt for one lr-0 step), 0 the EMA; unset / auto: the EMA unless it lags
+       the live weights by |ema - p| / |p| > EMA_REL_MAX (predict --ema auto's rule: score the weights the unroll will run) */
+    const char *val_live_s = opt(argc, argv, "--val-live", "auto");
+    const char *val_ema_arg = !strcmp(val_live_s, "auto") ? nullptr : atoi(val_live_s) ? "0" : "1";
+    int val_live = 0, val_ema_said = 0;
     /* --val-gn-live 0|1 (--gn-ema nets): validate on the running GroupNorm statistics (0) or each window's own (1). Default: the function the net
        trains with at that step, i.e. its own statistics while --gn-ema-warm has not been reached (DEFAULTED line, once): before 11-18 the
        default 0 validated try9 (warm 1e9) on statistics it never trained on, the mismatch that cost its 1667 unroll 0.07-0.11 GT ids */
@@ -5578,6 +5582,13 @@ int cmd_train(int argc, char **argv) {
                     val_gn_live = gn_live_choice_n(val_gn_arg, unet_cfg_of(G[0].u)->gn_ema, 0, gn_n, gn_w, &dfl);
                     if (dfl && !val_gn_said) { val_gn_said = 1; UFSM_DEFAULTED("train --val-gn-live = 1 (step %d: GroupNorm running statistics of %ld updates, --gn-ema-warm %ld "
                                                                                "not reached: the net trains on each window's own; --val-gn-live 0 forces the running ones)", step, gn_n, gn_w); }
+                }
+                {
+                    nn_init(G[0].dev); const double rel = val_ema_arg ? -1 : unet_ema_rel(G[0].u); int dfl = 0;
+                    val_live = !ema_choice(val_ema_arg, rel, &dfl);
+                    if (rel >= 0) fprintf(stderr, "val: step %d: |ema - p| / |p| = %.4f: the %s weights\n", step, rel, val_live ? "live" : "EMA");
+                    if (dfl && !val_ema_said) { val_ema_said = 1; UFSM_DEFAULTED("train --val-live = 1 (step %d: the EMA weights lag the live ones, |ema - p| / |p| = %.3f > %.2f; "
+                                                                                 "--val-live 0 forces the EMA)", step, rel, EMA_REL_MAX); }
                 }
                 for (int g = 0; g < nv; g++) { nn_init(G[g].dev); unet_use_ema(G[g].u, !val_live); if (val_gn_live) unet_gn_ema_live(G[g].u, 1); }   /* (--val-live 1: the live weights) */
                 {   /* validation on the buffer not holding the prefetched batch (its upload has completed: ev_up synced above) */

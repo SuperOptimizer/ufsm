@@ -6,6 +6,53 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Train vs predict parity: the same function up to fp16 rounding, except the EMA default and the window context (2026-11-18, branch parity-20261118)
+
+Audit (fix0332, lead + user): does predict run the function that training validates and trains? One fixed window per scroll (1667 GT
+corner 20600,4676,3820 and Paris 4 38008,17540,21976, level 2, P 256) through train's validation (`--val-live 1 --noaug 1`, lr 0,
+`UFSM_LAT_FUSE=0` so the normal / density channels are materialised) and through predict (`--fit-zarr`, the window as the box, grid
+origin at its corner, halo 0), for try9's pab-A eval-10690 and u1 13000-w. Tools: `UFSM_PARITY_DUMP=DIR` (every forward appends its
+numerics modes + an FNV hash of the active weights to DIR/modes.txt; train dumps the first validation window's full-resolution fp16
+logits, predict its first window's), `UFSM_PARITY_GNW=FILE` (predict: each window's GroupNorm statistics), unroll.sh `FGRID` (window
+grid offset). `test_parity` (gpu) is the same check on a fixture latent net (basis, lat-guide 3, fstem 16, gn_ema unwarmed).
+
+| switch | train val | predict (default) | difference | impact | verdict |
+|---|---|---|---|---|---|
+| weights | EMA (`--val-live 0`) | EMA (`--ema 1`) | pab-A's EMA sits behind its own warm start | 1667 GT ids 0.798 vs 0.841 live, 46 / 54 boxes worse, body drift 1.64 vs 0.23 | **fixed: `auto`** |
+| GroupNorm | live (auto, c93d5610) | live (auto, a8babaff) | equal since 11-18 | was GT ids 0.669 vs 0.729-0.841 | fixed before |
+| head precision | fp16 cell logits (head_slab_pass) | fp32 chunk head (lh16_req 0, head_iz 1) | max abs d <= 0.008, 44-90 % bit-equal, corr 1.0000 | none | intended |
+| activations / input | fp4 acts, input prec 4, scan-norm 62.9 / 37.59, film 0.999 | the same (modes.txt equal, weights hash equal) | none | none | equal |
+| lat_step | 0.25 jittered (train aug: 0.224 seen) | 0.25 | aug only | none | intended |
+| fstem-drop, axis jitter, augment | train only (`--noaug 1` in val) | off | none in val | none | intended |
+| skip-empty | dense | `--skip-thr 20` | no change on a full window | none (wbench +0.004) | intended |
+| window size | 768 training windows (216 bottleneck tokens) | 640 + halo 64 (or 512) | 256 vs 384-640: phase rms 0.43-0.55, corr 0.92; w4 rms 0.64-0.71; 512 vs 640 still 0.19 / 0.24, even in the inner 128^3 | the output depends on the window; not converged at 640 | open (pod arms) |
+| basis-free `--lat 4` | cell-mean input | the same input (0.15 % ulp flips) | corr 0.85-0.97 | fixture only; no production net is basis-free | open |
+
+**The EMA.** `unet_ema` steps once per optimizer update (train.c, decay 0.999), so at `--accum 10` its horizon is ~10 000 steps, about
+the length of try9's whole lineage (pab-A: 8690 -> 10690 = 200 updates). The EMA is then an average over everything since the warm
+start: pab-A 10690's EMA projects to -0.07 on the base -> live fine-tune direction (behind pab-base) and lies 3.1x the fine-tune's
+displacement from the live weights. |ema - p| / |p|: pab-A 0.117, pab-base 0.134, u1 13000 0.049. Predicted with its EMA (arm E1,
+everything else = AL), 1667 scored 0.798 / joined 0.822 / drift 1.64 / 32 real 5 dup 12 merged vs AL's 0.841 / 0.863 / 0.23; on the
+out-of-sample C2-C24 boxes 0.735 vs 0.813. The default was EMA everywhere: predict `--ema 1`, unroll.sh `FEMA=1`, train validation
+`--val-live 0`, so try9's val numbers scored weights the unroll did not run (the AL / pod unrolls set FEMA=0 by hand).
+
+Fix: `--ema auto` (predict default, unroll.sh `FEMA` default) and `--val-live auto` (train default) use the EMA unless
+|ema - p| / |p| > 0.08 (`EMA_REL_MAX`, src/gnmode.h: between u1's 0.049 and pab's 0.117 -- two points, so it is printed every time:
+predict one line, validation one `val: step N: |ema - p| / |p| = ...` line per pass), then the live weights with a `DEFAULTED:` line.
+predict reads the two arrays from the file (`checkpoint_ema_rel`, before the store attributes record `ema`), train from the device
+(`unet_ema_rel`). Explicit `--ema 0|1` / `--val-live 0|1` win. `test_gnmode`: the rule and `checkpoint_ema_rel` on a synthetic file.
+Not changed: the EMA's per-update cadence (a per-window decay, 0.999^(1/accum) per update, would shorten the horizon 10x; it is a
+training change for the trainers to decide).
+
+**Window context.** The bottleneck attention runs over the window's tokens (8 at 256, 27 at 384, 64 at 512, 216 at 768 in training)
+and gfilm pools the window, so the field at a fixed voxel moves with the window around it, ~50x more than the fp16 head differences
+above, and 512 -> 640 has not converged. Per-window occupancy (CT fraction above the skip threshold) on the
+production 640 / 64 grid: 48 % of the CT windows hold < 0.25, while every GT box window holds >= 0.49. Window occupancy correlates with
+GT ids per box: AL +0.34, u1 +0.38, def-pab +0.085, with AL - u1 at -0.08 (the low-occupancy third: AL 0.775, u1 0.759; high third
+0.887 / 0.889). Position is confounded (low occupancy sits at the scroll's rim). The arms that separate the two (FGRID=256 grid shift,
+LWIN 576 / LHALO 32, FBLEND=1) need a GPU: queued on the pod since card 1 failed (Xid 31, 11-18 10:56). Note: `--fit-zarr` needs a
+stride that divides the 512 shard or is a multiple of it (640 / 64 and 576 / 32 are valid, 640 / 128 and 512 / 64 are not).
+
 ## Counting around merges: the ref on mf-weighted fields; 1667 joined GT ids 0.8606 -> 0.9129 (2026-11-18, branch mfref-20261118)
 
 The merge-flag section below found that a local mask only removes ~20 % of the wrong voxels: a merge also misnumbers every sheet beyond

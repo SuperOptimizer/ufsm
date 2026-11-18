@@ -229,6 +229,10 @@ void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int 
 void unet_ema(unet *u, float decay);
 /* Use the EMA weights (1) or the live weights (0) for forward. */
 void unet_use_ema(unet *u, int on);
+/* unet_ema_rel: |ema - p| / |p| (0 without separate EMA weights). With the EMA stepped once per optimizer update (decay 0.999, --accum 10:
+   a ~10 000-step horizon) a run of ~1000 updates keeps EMA weights far behind the live ones: pab-A 10690 0.117 (the EMA sits behind its
+   warm start, GT ids 0.798 vs live 0.841), u1 13000 0.049 (fix0332 11-18, DESIGN "Train vs predict parity") */
+double unet_ema_rel(const unet *u);
 const float *unet_fwd_params(const unet *u);   /* the device weights the forward uses now (EMA or live; train --val-P's copy reads them) */
 /* Frozen GroupNorm statistics for inference: unet_gn_nstats floats per sample (means and reciprocal standard deviations of every
    GroupNorm in a fixed order); unet_gn_stats_get copies sample 0 of the last forward (tensor-core path); unet_gn_freeze(h) makes
