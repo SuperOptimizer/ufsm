@@ -20,7 +20,7 @@ ck "evald marks done only on success" 'grep -q "if \[ \$NF = 0 \]; then rm -f \$
 Q2=scripts/pod/podq2.sh   # (11-18: the next pod session's queue)
 ck "podq2 / deskq2 / score1667 parse" 'bash -n $Q2 && bash -n scripts/pod/deskq2.sh && bash -n scripts/pod/q2pull.sh && bash -n scripts/pod/score1667.sh'
 ck "deskq2 pins card 1 for every stage" 'grep -q "export CUDA_VISIBLE_DEVICES=1 FIELDGPUS=0 FITGPUS=0 INKGPU=0; unset SGPU" scripts/pod/deskq2.sh'
-ck "podq2 probes the desk before the unroll" '[ "$(grep -n "^if ! done_ desk" $Q2 | cut -d: -f1)" -lt "$(grep -n "^if ! done_ unroll" $Q2 | cut -d: -f1)" ]'
+ck "podq2 probes the desk before the unroll" '[ "$(grep -n "^if ! done_ desk" $Q2 | tail -1 | cut -d: -f1)" -lt "$(grep -n "^if ! done_ unroll" $Q2 | cut -d: -f1)" ]'
 ck "podq2 only pushes from the pod (no rsync from the desk)" '! grep -nE "push [^#]*\\\$DESK:[^ ]* +\\\$(RU|Q|K)" $Q2'
 ck "podq2 keeps the per-wrap ink for the GT score" 'grep -q "KEEPINK=1" $Q2 && grep -q "KEEPINK" scripts/unroll/unroll.sh'
 t=$(printf '%s\n' "2026-11-18 03:20:05 rectosp start" "2026-11-18 03:20:11 rectosp done: 6 s wall, 32 CPU s, 5.6 GB max RSS" | awk "$(sed -n "s/^  awk '\(.*\)' \\\\$/\1/p" $Q2)")
