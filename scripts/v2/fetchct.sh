@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # scripts/v2/fetchct.sh [LANE NLANES]: v2 training-level CT (8.64/9.36 um L0, 2.4 um scans L2, plus levels L+2.. as scripts/u0/copy.sh)
 # for every train + holdout scroll of scrolls.tsv (V2/scrolls.tsv, or scripts/corpus/list.tsv's scan when absent) -> V2/ct/<S>/<volume>.
-# Scans already on the desk are symlinked (LOCAL: P3, P4, 0490B), never copied. Copy rows come from the u0 inventory sizes
+# Scans held elsewhere on the desk are symlinked (LOCAL, empty by default; an entry whose dir is gone falls through to a copy row).
+# Copy rows come from the u0 inventory sizes
 # (INV, default /vesuvius/ufsm/u0/inventory-all.tsv) and go through scripts/u0/copy.sh (resumable ufsm mirror, byte-identical shards,
 # done markers in V2/fetch/state, STOP file V2/fetch/STOP, live rate cap V2/fetch/mbps). Lanes split the copy rows round-robin;
 # each lane's mirror keeps UFSM_HTTP_INFLIGHT (default 48 / NLANES) requests in flight (the mirror 429s past 64 per IP).
@@ -13,13 +14,15 @@ H=$(cd "$(dirname "$0")" && pwd); REPO=$(cd $H/../.. && pwd)
 V2=${V2:-/vesuvius/ufsm/v2}; U=${U:-$V2/src/build/ufsm}; INV=${INV:-/vesuvius/ufsm/u0/inventory-all.tsv}
 A=$V2/fetch; mkdir -p $A/state $A/logs $V2/ct
 # local scans: scroll -> dir holding <volume>/ (symlinked as V2/ct/<S>/<volume>)
-declare -A LOCAL=([PHercParis3]=/vesuvius/ufsm/u0/vol/PHercParis3 [PHercParis4]=/vesuvius/ufsm/volcomp/PHercParis4 [PHerc0490B]=/vesuvius/ufsm/u0/vol/PHerc0490B)
+# (the old P3 / 0490B defaults under /vesuvius/ufsm/u0/vol and P4's /vesuvius/ufsm/volcomp are gone since the 11-09 / 11-12 cleanups;
+# 0490B and P4 are real dirs in V2/ct now, P3 lives on the NAS: forlinnas:/srv/nas/ufsm/volcomp, copy L2+ from there over the LAN)
+declare -A LOCAL=()
 EXCL=" PHerc0332 PHercMANB "
 list=$A/list-$LANE${INK:+-ink}.tsv; : > $list; n=0
 while IFS=$'\t' read -r S R K UM LV AX; do
   [ "$S" = scroll ] && continue; case "$EXCL" in *" $S "*) continue;; esac
   vol=$(basename $K)
-  if [ -n "${LOCAL[$S]:-}" ]; then
+  if [ -n "${LOCAL[$S]:-}" ] && [ -d ${LOCAL[$S]}/$vol ]; then
     [ $LANE = 0 ] && { mkdir -p $V2/ct/$S; [ -e $V2/ct/$S/$vol ] || ln -s ${LOCAL[$S]}/$vol $V2/ct/$S/$vol; }
     continue; fi
   row=$(awk -F'\t' -v s=$S -v v=$vol '$1 == s && $3 == v' $INV | head -1)
