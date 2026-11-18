@@ -794,16 +794,21 @@ stripflat() { X $O/logs/stripflat.log $U strip-flatten $O/strip/strip --decim ${
 # skipped a chunk ("no mesh": a hole later filled as if real); DISTGATE=0: measured and logged only
 distort() {
   local d=$O/strip/distort t
-  [ "$DRY" = 1 ] && { echo "    $U strip-distort $O/strip/strip/flat $d (gate: dist p95 <= ${DISTP95:-0.35}, folded <= ${DISTFOLD:-0.005}, no skipped chunk; DISTGATE=${DISTGATE:-1})"; return 0; }
+  [ "$DRY" = 1 ] && { echo "    $U strip-distort $O/strip/strip/flat $d (gate: dist p95 <= ${DISTP95:-0.35}, folded <= ${DISTFOLD:-0.005}, no full-size chunk without a mesh beyond strip-flatten --nomesh-max; DISTGATE=${DISTGATE:-1})"; return 0; }
   rm -rf $d; X $O/logs/distort.log $U strip-distort $O/strip/strip/flat $d --threads $TH || return 1
   t=$(grep -E '^strip-distort: total' $O/logs/distort.log | tail -1); [ -n "$t" ] || { log "distort: no totals (logs/distort.log)"; return 1; }
   log "distort: ${t#strip-distort: }"
   log "distort: strip-flatten: $(grep -E '^strip-flatten: flattened' $O/logs/stripflat.log | tail -1 | sed 's/^strip-flatten: //')"
   local p95 fold nom bad=; p95=$(echo "$t" | sed -nE 's/.* p95 ([0-9.]+) .*/\1/p'); fold=$(echo "$t" | sed -nE 's/.*folded ([0-9.]+).*/\1/p')
-  nom=$(grep -c 'no mesh' $O/logs/stripflat.log)
+  # (the latest strip-flatten in the appended log; 11-18 proportional rule: full-size chunks without a mesh that strip-flatten DEFAULTED
+  # (<= --nomesh-max of the strip's vertices) and narrow edge chunks are reported, not gated; full-size ones without a DEFAULTED line gate)
+  local sfl; sfl=$(awk '/^strip-flatten: chunks [0-9]+\.\.[0-9]+ on / {buf=""} {buf = buf $0 "\n"} END {printf "%s", buf}' $O/logs/stripflat.log)
+  nom=$(printf '%b' "$sfl" | grep -c 'no mesh (a full-size chunk'); local nnar dfl; nnar=$(printf '%b' "$sfl" | grep -c 'no mesh (narrow chunk'); dfl=$(printf '%b' "$sfl" | grep -m1 '^DEFAULTED: strip-flatten')
+  [ -n "$dfl" ] && { log "distort: $dfl (not gated)"; nom=0; }
+  [ "$nnar" -gt 0 ] && log "distort: strip-flatten: $nnar narrow edge chunk(s) without a mesh, their columns from the neighbours (not gated)"
   awk -v v=$p95 -v m=${DISTP95:-0.35} 'BEGIN { exit !(v > m) }' && bad+=" dist p95 $p95 > ${DISTP95:-0.35};"
   awk -v v=$fold -v m=${DISTFOLD:-0.005} 'BEGIN { exit !(v > m) }' && bad+=" folded $fold > ${DISTFOLD:-0.005};"
-  [ "$nom" -gt 0 ] && bad+=" strip-flatten skipped $nom chunk(s) (no mesh);"
+  [ "$nom" -gt 0 ] && bad+=" strip-flatten skipped $nom full-size chunk(s) (no mesh) without a DEFAULTED share;"
   [ -z "$bad" ] && return 0
   if [ "${DISTGATE:-1}" = 1 ]; then log "distort: GATE FAILED:$bad see strip/distort/*_dist.jpg (DISTGATE=0 to go on)"; return 1; fi
   log "distort: over the gate (DISTGATE=0, going on):$bad"; return 0
