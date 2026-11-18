@@ -71,8 +71,16 @@ int main(void) {
     CHECK(d2 >= 3 && d2 > r2 && e2 > 0.35 && e2 < 0.65, "doubled model: %d real, %d dup, empty %.3f", r2, d2, e2);
     {   /* --intervals (fix0332 11-17): one row per interval; on the right model the mean CT peaks per row is ~1 */
         char iv[700]; snprintf(iv, sizeof iv, "%s/intervals.tsv", dir);
-        char *av4[] = {"ufsm", "wrap-check", m1, fd, "--ct", dir, "ct.zarr", "--ct-um", "9.6", "--nz", "4", "--nth", "90", "--threads", "4", "--intervals", iv};
-        CHECK(cmd_wrap_check(17, av4) == 0, "wrap-check --intervals");
+        char bd[700]; snprintf(bd, sizeof bd, "%s/bands.tsv", dir);
+        char *av4[] = {"ufsm", "wrap-check", m1, fd, "--ct", dir, "ct.zarr", "--ct-um", "9.6", "--nz", "4", "--nth", "90", "--threads", "4", "--intervals", iv, "--bands", bd};
+        CHECK(cmd_wrap_check(19, av4) == 0, "wrap-check --intervals --bands");
+        {   /* --bands (rhocal): the radius-band rows add up to the interval count, CT peaks per turn ~1 on the right model */
+            FILE *bf = fopen(bd, "r"); char bl[256]; long bn = 0; double bp = 0; int bh = bf && fgets(bl, sizeof bl, bf) && !strncmp(bl, "r0_mm\tr1_mm\tn\tct_per_turn\t", 26);
+            while (bf && fgets(bl, sizeof bl, bf)) { double r0, r1, ct; long nn; if (sscanf(bl, "%lf %lf %ld %lf", &r0, &r1, &nn, &ct) == 4) { bn += nn; bp += ct * nn; } }
+            if (bf) fclose(bf);
+            printf("test_wrap_check: --bands %ld intervals, %.3f CT peaks per turn\n", bn, bn ? bp / bn : 0);
+            CHECK(bh && bn > 100 && fabs(bp / bn - 1) < 0.15, "--bands: header %d, %ld intervals, %.3f", bh, bn, bn ? bp / bn : 0);
+        }
         FILE *f = fopen(iv, "r"); char ln[256]; long n = 0; double sp = 0; int hdr = f && fgets(ln, sizeof ln, f) && !strncmp(ln, "z\ty\tx\tr_mm", 10);
         while (f && fgets(ln, sizeof ln, f)) { double a[7]; if (sscanf(ln, "%lf %lf %lf %lf %lf %lf %lf", &a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6]) >= 6) { n++; sp += a[5]; } }
         if (f) fclose(f);

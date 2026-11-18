@@ -1,5 +1,5 @@
 /* ufsm wrap-check <model-or-set> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY] [--nz 16] [--nth 180] [--zr Z0,Z1]
-                   [--sigma 1.2] [--prom 1] [--w-scale 1] [--dup 0.5] [--threads 16] [--cache DIR] [--tsv OUT] [--intervals OUT]
+                   [--sigma 1.2] [--prom 1] [--w-scale 1] [--dup 0.5] [--threads 16] [--cache DIR] [--tsv OUT] [--intervals OUT] [--bands OUT]
    Duplicate / over-count check of a fitted winding (a joined fit set or one model; its wraps are the level sets W = k, ufsm wraps):
    along radial rays from the umbilicus (--nth angles at --nz z levels evenly over the box, or over native box-local z [Z0, Z1)), every
    pair of consecutive wrap crossings k -> k + 1 (inside material: the fields' weight w > 0 on every sample between them) is an
@@ -429,6 +429,13 @@ int cmd_wrap_check(int argc, char **argv) {
         if (qz) printf("  %6lld  %6.3f", bs[bi][2], bs[bi][2] ? (double)bs[bi][3] / 1000 / bs[bi][2] : 0);
         printf("\n");
     }
+    if (wc_opt(argc, argv, "--bands", nullptr)) {   /* --bands OUT: the radius-band table as a tsv (rhocal: the label-free K(r) of count-field --rho-r) */
+        FILE *bf = fopen(wc_opt(argc, argv, "--bands", nullptr), "w"); if (!bf) { fprintf(stderr, "wrap-check: cannot write --bands\n"); return 1; }
+        fprintf(bf, "r0_mm\tr1_mm\tn\tct_per_turn\tempty\tone\ttwo_plus\tgt_n\tgt_per_turn\n");
+        for (int bi = 0; bi < nb; bi++) { if (!bs[bi][0]) continue; const double n = (double)bs[bi][0];
+            fprintf(bf, "%.3f\t%.3f\t%lld\t%.4f\t%.4f\t%.4f\t%.4f\t%lld\t%.4f\n", bi * band * um / 1000, (bi + 1) * band * um / 1000, bs[bi][0], cz ? bs[bi][1] / n : NAN,
+                    cz ? bs[bi][4] / n : NAN, cz ? (n - bs[bi][4] - bs[bi][5]) / n : NAN, cz ? bs[bi][5] / n : NAN, bs[bi][2], bs[bi][2] ? (double)bs[bi][3] / 1000 / bs[bi][2] : NAN); }
+        if (fclose(bf)) { fprintf(stderr, "wrap-check: cannot write --bands\n"); return 1; } }
     {   /* sources of the count: per fitted turn, the network phase turns, density turns, --ref turns and CT peaks, per radius band (means over intervals with a value) */
         double (*ss)[10] = calloc(nb + 1, sizeof *ss);   /* sum/n phase, density, ref, CT */
         for (size_t i = 0; i < ni; i++) {
