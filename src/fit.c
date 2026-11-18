@@ -455,13 +455,17 @@ typedef struct {
     double *acc, *wsum;
     double rbias;                          /* fit_cfg ref: the sub-turn offset U_ref - u (turns) */
     double complex rph[64]; double rpw[64]; /* per thread: its phasor sums */
+    int same_ok;                           /* uw_accum_snap may share the box's radius / angle with the ref (UFSM_UW_SAME=0: never; tests) */
     size_t nreach[64];                     /* per thread: the voxels uw_refsnap gave an integer */
 } uw_ctx;
 /* the ref model's (fit_cfg ref) U at a field voxel: W_ref at the same point of its box plus dir theta / 2 pi about this box's axis */
-static double uw_Uref(const uw_ctx *x, int z, int y, int xx) {
+static double uw_Uref_th(const uw_ctx *x, int z, int y, int xx, double th) {
     const fit_fields *f = x->f; const fit_cfg *c = x->c; const double pz = (z + 0.5) * f->h, py = (y + f->oy + 0.5) * f->h, px = (xx + f->ox + 0.5) * f->h;
-    const double th = atan2(py - axis_lerp(f->cy, x->na, pz), px - axis_lerp(f->cx, x->na, pz));
     return fit_set_W(c->ref, pz + c->ref_off[0], py + c->ref_off[1], px + c->ref_off[2]) + x->m->dir * th / (2 * M_PI);
+}
+static double uw_Uref(const uw_ctx *x, int z, int y, int xx) {
+    const fit_fields *f = x->f; const double pz = (z + 0.5) * f->h, py = (y + f->oy + 0.5) * f->h, px = (xx + f->ox + 0.5) * f->h;
+    return uw_Uref_th(x, z, y, xx, atan2(py - axis_lerp(f->cy, x->na, pz), px - axis_lerp(f->cx, x->na, pz)));
 }
 /* the records: fresh anonymous zero pages (= UK_UNSET, bk 0), written only where a voxel can be unwrapped. Up to UFSM_UW_HUGE_GB (default 0: never; huge pages stall in direct compaction when memory is fragmented, 15 s seen on a 10 M-voxel box)
    on transparent huge pages (the flood is memory-latency bound: fewer TLB misses), above that on 4 KB pages (one 8^3 brick per page),
@@ -506,23 +510,44 @@ static float uw_q(const fit_fields *f, size_t i, double min_conf, const fit_cfg 
     if (c->uw_pdv > 0) q *= exp(-uw_pdv(f, i, a) / (c->uw_pdv * c->uw_pdv));
     return (float)q;
 }
+/* a voxel's record values (uw_setup's): confidence q (<= 0: not unwrappable, nothing else set), wrapped U, bucket, theta about the
+   box's axis (cy, cx: the axis at the voxel's z) */
+static inline float uw_rec(const uw_ctx *x, size_t i, int y, int xx, double cy, double cx, float *uw, uint16_t *bk, double *th) {
+    const fit_fields *f = x->f; double ang = 0;
+    const float q = uw_q(f, i, x->min_conf, x->c, &ang);
+    if (q <= 0) return q;
+    *th = atan2((y + f->oy + 0.5) * f->h - cy, (xx + f->ox + 0.5) * f->h - cx);
+    double u = ang / (2 * M_PI) + x->m->dir * *th / (2 * M_PI); u -= floor(u);
+    *uw = (float)u; *bk = (uint16_t)(1 + (int)(fminf(q, 1.f) * (UQ_LEVELS - 2)));
+    return q;
+}
 static void uw_setup(void *a, int z0, int z1, int t) {
     uw_ctx *x = a; const fit_fields *f = x->f; const size_t HW = (size_t)f->H * f->W;
     float qb = 0; size_t sb = (size_t)-1;
     for (int z = z0; z < z1; z++) {
         const double pz = (z + 0.5) * f->h, cy = axis_lerp(f->cy, x->na, pz), cx = axis_lerp(f->cx, x->na, pz);
         for (int y = 0; y < f->H; y++) for (int xx = 0; xx < f->W; xx++) {
-            const size_t i = z * HW + (size_t)y * f->W + xx; double ang = 0;
-            const float q = uw_q(f, i, x->min_conf, x->c, &ang);
+            const size_t i = z * HW + (size_t)y * f->W + xx; float uw; uint16_t bk; double th;
+            const float q = uw_rec(x, i, y, xx, cy, cx, &uw, &bk, &th);
             if (q <= 0) continue;   /* (the record stays zero: uw 0, UK_UNSET, bk 0; its page untouched) */
-            uw_vox *v = &x->V[ub_id(&x->g, z, y, xx)]; v->k = UK_UNSET;
-            const double th = atan2((y + f->oy + 0.5) * f->h - cy, (xx + f->ox + 0.5) * f->h - cx);
-            double u = ang / (2 * M_PI) + x->m->dir * th / (2 * M_PI); u -= floor(u);
-            v->uw = (float)u; v->bk = (uint16_t)(1 + (int)(fminf(q, 1.f) * (UQ_LEVELS - 2)));
+            uw_vox *v = &x->V[ub_id(&x->g, z, y, xx)]; v->k = UK_UNSET; v->uw = uw; v->bk = bk;
             if (q > qb) { qb = q; sb = i; }
         }
     }
     x->qb[t] = qb; x->sb[t] = sb;
+}
+/* fit_cfg ref_snap 1 without records (uw_snapfused): uw_setup's seed (the first most confident voxel per thread) from q alone */
+static void uw_seedq(void *a, int z0, int z1, int t) {
+    uw_ctx *x = a; const fit_fields *f = x->f; const size_t HW = (size_t)f->H * f->W;
+    float qb = 0; size_t sb = (size_t)-1;
+    for (size_t i = (size_t)z0 * HW; i < (size_t)z1 * HW; i++) { const float q = uw_q(f, i, x->min_conf, x->c, nullptr); if (q > qb) { qb = q; sb = i; } }
+    x->qb[t] = qb; x->sb[t] = sb;
+}
+/* the record values of field voxel i (uw_snapfused: there are no records) */
+static float uw_rec_at(const uw_ctx *x, size_t i, float *uw, uint16_t *bk, double *th) {
+    const fit_fields *f = x->f; const int z = (int)(i / ((size_t)f->H * f->W)), y = (int)((i / f->W) % f->H), xx = (int)(i % f->W);
+    const double pz = (z + 0.5) * f->h;
+    return uw_rec(x, i, y, xx, axis_lerp(f->cy, x->na, pz), axis_lerp(f->cx, x->na, pz), uw, bk, th);
 }
 static void uw_seedmodel(void *a, int z0, int z1, int t) {   /* the seed model's region [seed_z0, seed_z): its integers */
     uw_ctx *x = a; const fit_fields *f = x->f; const fit_cfg *c = x->c;
@@ -545,6 +570,19 @@ static void uw_refbias(void *a, int z0, int z1, int t) {   /* fit_cfg ref: phaso
         for (int y = 0; y < f->H; y += 4) for (int xx = 0; xx < f->W; xx += 4) {
             const uw_vox *v = &x->V[ub_id(&x->g, z, y, xx)]; if (!v->bk) continue;
             s += v->bk * cexp(2 * M_PI * I * (uw_Uref(x, z, y, xx) - v->uw)); w += v->bk;
+        }
+    }
+    x->rph[t] = s; x->rpw[t] = w;
+}
+static void uw_refbias_f(void *a, int z0, int z1, int t) {   /* uw_refbias from the record values computed in place (uw_snapfused) */
+    uw_ctx *x = a; const fit_fields *f = x->f; const size_t HW = (size_t)f->H * f->W; double complex s = 0; double w = 0;
+    for (int z = z0; z < z1; z++) {
+        if (z & 1) continue;
+        const double pz = (z + 0.5) * f->h, cy = axis_lerp(f->cy, x->na, pz), cx = axis_lerp(f->cx, x->na, pz);
+        for (int y = 0; y < f->H; y += 4) for (int xx = 0; xx < f->W; xx += 4) {
+            float uw; uint16_t bk; double th;
+            if (uw_rec(x, z * HW + (size_t)y * f->W + xx, y, xx, cy, cx, &uw, &bk, &th) <= 0) continue;
+            s += bk * cexp(2 * M_PI * I * (uw_Uref_th(x, z, y, xx, th) - uw)); w += bk;
         }
     }
     x->rph[t] = s; x->rpw[t] = w;
@@ -595,6 +633,45 @@ static void uw_accum(void *a, int i0, int i1, int t_) {
             }
         }
     }
+}
+/* fit_cfg ref_snap 1 with no repair (uw_snapfused, the unroll's slab fits): uw_setup's record values, uw_refsnap's integer and uw_accum's
+   sums in one pass over the node rows, without the records (8 B a field voxel of fresh pages) or the two other passes: one atan2 for
+   theta where setup / refsnap / accum each took one, every value from the same expressions (byte-identical; UFSM_UW_RECORDS=1: the
+   three passes). Per thread: nreach the voxels given an integer */
+static void uw_accum_snap(void *a, int i0, int i1, int t) {
+    const ua_job *J = a; uw_ctx *x = J->x; const fit_fields *f = x->f; const fit_model *m = x->m; const fit_cfg *c = x->c; const size_t HW = (size_t)f->H * f->W;
+    const fit_set *R = c->ref; const fit_model *G = R->global; const int nag = (int)(G->D * G->h) + 1; size_t nr = 0, over = 0;
+    for (int it = i0; it < i1; it++) {
+        const int az = it / m->ly, bb = it % m->ly;
+        for (int z = J->zr[az]; z < J->zr[az + 1]; z++) {
+            const double pz = (z + 0.5) * f->h, cy = axis_lerp(f->cy, x->na, pz), cx = axis_lerp(f->cx, x->na, pz), zr = pz + c->ref_off[0];
+            ev_part P; ev_part_init(&P, m, pz);
+            ev_part PR; double gy = 0, gx = 0; if (!R->n) { ev_part_init(&PR, G, zr); gy = axis_lerp(G->cy, nag, zr); gx = axis_lerp(G->cx, nag, zr); }
+            /* the ref's axis at zr the box's at pz and no y / x offset (a z slab of the ref's box: 1667 s030 every row): yr - gy == dy and
+               xr - gx == dx bit for bit, so the ref's radius and angle are the box's (one hypot and atan2 a voxel, not two each) */
+            const int same = x->same_ok && !R->n && c->ref_off[1] == 0 && c->ref_off[2] == 0 && gy == cy && gx == cx;
+            for (int y = J->yr[bb]; y < J->yr[bb + 1]; y++) {
+                ev_party Q; ev_party_init(&Q, &P, (y + f->oy + 0.5) * f->h);
+                ev_party QR; if (!R->n) ev_party_init(&QR, &PR, (y + f->oy + 0.5) * f->h + c->ref_off[1]);
+                for (int xx = 0; xx < f->W; xx++) {
+                    float uw; uint16_t bk; double th;
+                    const float q = uw_rec(x, z * HW + (size_t)y * f->W + xx, y, xx, cy, cx, &uw, &bk, &th);
+                    if (q <= 0) continue;
+                    const double py = (y + f->oy + 0.5) * f->h, px = (xx + f->ox + 0.5) * f->h, dy = py - cy, dx = px - cx, yr = py + c->ref_off[1], xr = px + c->ref_off[2];
+                    const double rr = hypot(dy, dx);
+                    const double Wr = R->n ? fit_set_W(R, zr, yr, xr) : same ? ev_party_W(&QR, xr, rr, th) : ev_party_W(&QR, xr, hypot(yr - gy, xr - gx), atan2(yr - gy, xr - gx));
+                    const int32_t kr = (int32_t)round(Wr + m->dir * th / (2 * M_PI) - x->rbias - uw) - x->kb;
+                    if (!(kr > UK_UNSET && kr <= INT16_MAX)) { over++; continue; }
+                    nr++;
+                    const double Um = ev_party_W(&Q, px, rr, th) + m->dir * th / (2 * M_PI), Uv = (double)uw + (x->kb + (int16_t)kr);
+                    const int cc = (int)lround(px / m->L);
+                    const size_t kn = ((size_t)az * m->ly + bb) * m->lx + (cc < m->lx ? cc : m->lx - 1);
+                    x->acc[kn] += q * (Uv - Um); x->wsum[kn] += q;
+                }
+            }
+        }
+    }
+    x->nreach[t] = nr; if (over) atomic_fetch_add(&x->over, over);
 }
 /* the bucket queue: per confidence level an array of voxel ids, appended at n and popped at h (FIFO; reset when emptied): sequential
    pushes, and the ids UQ_PD ahead are known, so their records are prefetched long before they are popped */
@@ -1432,22 +1509,73 @@ static size_t uw_msf(uw_ctx *x, size_t nr, uint32_t sid, int32_t kseed, int verb
     free(M.rec); free(M.par); free(M.pot); free(M.par2); free(M.pot2); free(M.best); free(M.roots); free(M.mask); free(M.pre); free(M.base);
     return reached;
 }
-typedef struct { const fit_model *m; uint8_t *have; double *corr; int changed[64]; } nf_job;
-static void uw_nodefill(void *a, int a0, int a1, int t) {   /* lattice z planes [a0, a1): one pass of the node fill */
-    nf_job *J = a; const fit_model *m = J->m; int changed = 0;
-    for (size_t k = (size_t)a0 * m->ly * m->lx; k < (size_t)a1 * m->ly * m->lx; k++) {
+typedef struct { int lz, ly, lx; uint8_t *have; double *corr; int changed[64]; } nf_job;
+/* node k's 6-neighbours in the fill's order (z-, z+, y-, y+, x-, x+); returns their count (lattice edges) */
+static inline int nf_nbrs(int lz, int ly, int lx, size_t k, size_t nb[6]) {
+    const int aa = (int)(k / ((size_t)ly * lx)), b = (int)((k / lx) % ly), cc = (int)(k % lx); int n = 0;
+    const int t[6][3] = {{aa - 1, b, cc}, {aa + 1, b, cc}, {aa, b - 1, cc}, {aa, b + 1, cc}, {aa, b, cc - 1}, {aa, b, cc + 1}};
+    for (int q = 0; q < 6; q++) {
+        if (t[q][0] < 0 || t[q][1] < 0 || t[q][2] < 0 || t[q][0] >= lz || t[q][1] >= ly || t[q][2] >= lx) continue;
+        nb[n++] = ((size_t)t[q][0] * ly + t[q][1]) * lx + t[q][2];
+    }
+    return n;
+}
+/* node k's value from its have-1 neighbours (cnt: their count) */
+static inline int nf_mean(const nf_job *J, size_t k) {
+    size_t nb[6]; const int n = nf_nbrs(J->lz, J->ly, J->lx, k, nb); double sm = 0; int cnt = 0;
+    for (int q = 0; q < n; q++) if (J->have[nb[q]] == 1) { sm += J->corr[nb[q]]; cnt++; }
+    if (cnt) J->corr[k] = sm / cnt;
+    return cnt;
+}
+static void uw_nodefill(void *a, int a0, int a1, int t) {   /* lattice z planes [a0, a1): one pass of the node fill (old 1) */
+    nf_job *J = a; int changed = 0;
+    for (size_t k = (size_t)a0 * J->ly * J->lx; k < (size_t)a1 * J->ly * J->lx; k++) {
         if (J->have[k]) continue;
-        const int aa = (int)(k / ((size_t)m->ly * m->lx)), b = (int)((k / m->lx) % m->ly), cc = (int)(k % m->lx);
-        double sm = 0; int cnt = 0;
-        const int nb[6][3] = {{aa - 1, b, cc}, {aa + 1, b, cc}, {aa, b - 1, cc}, {aa, b + 1, cc}, {aa, b, cc - 1}, {aa, b, cc + 1}};
-        for (int q = 0; q < 6; q++) {
-            if (nb[q][0] < 0 || nb[q][1] < 0 || nb[q][2] < 0 || nb[q][0] >= m->lz || nb[q][1] >= m->ly || nb[q][2] >= m->lx) continue;
-            const size_t j = ((size_t)nb[q][0] * m->ly + nb[q][1]) * m->lx + nb[q][2];
-            if (J->have[j] == 1) { sm += J->corr[j]; cnt++; }
-        }
-        if (cnt) { J->corr[k] = sm / cnt; J->have[k] = 2; changed = 1; }
+        if (nf_mean(J, k)) { J->have[k] = 2; changed = 1; }
     }
     J->changed[t] = changed;
+}
+/* the node fill. A pass fills the have-0 nodes with a have-1 neighbour; those are exactly the unfilled neighbours of the nodes the
+   previous pass filled (any other have-1 neighbour would have filled them a pass earlier), so the frontier version visits each filled
+   node and its neighbours once where the sweep visited every node every pass: same nodes, same neighbour order, same doubles. 11-18
+   slab fits (1667 s030, 440 K nodes): the sweep always ran its 64 passes (nodes > 64 hops from material stay 0), 0.40 s of a slab's
+   1.9 s unwrap */
+int fit_node_fill(int lz, int ly, int lx, uint8_t *have, double *corr, int maxpass, int old) {
+    const size_t nl = (size_t)lz * ly * lx; nf_job J = {lz, ly, lx, have, corr, {0}}; int npass = 0;
+    if (old) {
+        for (int pass = 0; pass < maxpass; pass++) {   /* (a pass reads only earlier passes' nodes, have 1, and writes only have-0 nodes:
+                                                          lattice z planes on threads, the serial result) */
+            memset(J.changed, 0, sizeof J.changed);
+            fit_zpar(lz, fit_nthreads(lz), uw_nodefill, &J);
+            int changed = 0; for (int t = 0; t < 64; t++) changed |= J.changed[t];
+            for (size_t k = 0; k < nl; k++) if (have[k] == 2) have[k] = 1;
+            if (!changed) break;
+            npass++;
+        }
+        return npass;
+    }
+    size_t *fr = malloc(nl * sizeof *fr), nf = 0, nb[6];   /* the frontier: have 3 (queued) nodes, then this pass's */
+    if (!fr) return fit_node_fill(lz, ly, lx, have, corr, maxpass, 1);
+    for (size_t k = 0; k < nl; k++) {
+        if (have[k]) continue;
+        const int n = nf_nbrs(lz, ly, lx, k, nb); for (int q = 0; q < n; q++) if (have[nb[q]] == 1) { have[k] = 3; fr[nf++] = k; break; }
+    }
+    for (int pass = 0; pass < maxpass && nf; pass++) {
+        for (size_t e = 0; e < nf; e++) nf_mean(&J, fr[e]);   /* (reads have-1 nodes only: queued ones are 3) */
+        for (size_t e = 0; e < nf; e++) have[fr[e]] = 1;
+        npass++;
+        if (pass + 1 == maxpass) break;
+        size_t m = 0;   /* the next frontier, in place: this pass's nodes are have 1 now, their have-0 neighbours queue behind */
+        const size_t n0 = nf;
+        for (size_t e = 0; e < n0; e++) {
+            const int n = nf_nbrs(lz, ly, lx, fr[e], nb);
+            for (int q = 0; q < n; q++) if (!have[nb[q]]) { have[nb[q]] = 3; fr[nf++] = nb[q]; }
+        }
+        memmove(fr, fr + n0, (nf - n0) * sizeof *fr); m = nf - n0; nf = m;
+    }
+    for (size_t e = 0; e < nf; e++) if (have[fr[e]] == 3) have[fr[e]] = 0;   /* (queued past maxpass: unfilled, as the sweep leaves them) */
+    free(fr);
+    return npass;
 }
 static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_conf, const fit_cfg *c) {
     const size_t n = (size_t)f->D * f->H * f->W; const int na = (int)(f->D * f->h) + 1;
@@ -1455,33 +1583,44 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
     const size_t nr = ((size_t)((f->D + UB_M) / UB_S) * g.bH * g.bW) << (3 * UB);   /* records, the bricks padded */
     if (nr >= UQ_NONE) { fprintf(stderr, "fit: %zu field voxels exceed the unwrapping's 32-bit queue: use --slab\n", n); return 0; }
     const double t0 = nn_wall_seconds();
-    uw_ctx x = {.m = m, .f = f, .c = c, .min_conf = min_conf, .na = na, .nt = fit_nthreads(f->D), .g = g};
+    uw_ctx x = {.m = m, .f = f, .c = c, .min_conf = min_conf, .na = na, .nt = fit_nthreads(f->D), .g = g,
+                .same_ok = !(getenv("UFSM_UW_SAME") && !atoi(getenv("UFSM_UW_SAME")))};
     pthread_once(&g_uw_ang_once, uw_ang_init);
-    void *vbase = nullptr; size_t vlen = 0; uw_vox *V = x.V = uw_alloc_records(nr * sizeof *V, &vbase, &vlen);   /* (zero: every record UK_UNSET, bk 0) */
-    if (!V) { fprintf(stderr, "fit: out of memory for the voxel unwrapping\n"); return 0; }
-    fit_zpar(f->D, x.nt, uw_setup, &x);
+    /* uw_snapfused: the ref's integers everywhere (ref_snap 1) and no repair need no records: the seed from q, the ref bias and the
+       snapped integers computed in place, the last inside the node accumulation (uw_accum_snap) */
+    const int fused = c->ref && c->ref_snap == 1 && c->uw_repair <= 0 && !(getenv("UFSM_UW_RECORDS") && atoi(getenv("UFSM_UW_RECORDS")));
+    void *vbase = nullptr; size_t vlen = 0; uw_vox *V = nullptr;
+    if (!fused) {
+        V = x.V = uw_alloc_records(nr * sizeof *V, &vbase, &vlen);   /* (zero: every record UK_UNSET, bk 0) */
+        if (!V) { fprintf(stderr, "fit: out of memory for the voxel unwrapping\n"); return 0; }
+    }
+    fit_zpar(f->D, x.nt, fused ? uw_seedq : uw_setup, &x);
     size_t seed = (size_t)-1; float qbest = 0;
     for (int t = 0; t < x.nt; t++) if (x.qb[t] > qbest) { qbest = x.qb[t]; seed = x.sb[t]; }   /* ties: the lowest voxel, as serially */
     const double t1 = nn_wall_seconds();
-    size_t reached = 0;
-    uw_queue q; if (uq_init(&q)) { munmap(vbase, vlen); return 0; }
+    size_t reached = 0; double tsnap = 0, tacc = 0;
+    uw_queue q; if (uq_init(&q)) { if (vbase) munmap(vbase, vlen); return 0; }
     if (seed != (size_t)-1) {
         {   /* the integer base: the seed (or seed model's) integer at the most confident voxel */
             const int z = (int)(seed / ((size_t)f->H * f->W)), y = (int)((seed / f->W) % f->H), xx = (int)(seed % f->W);
             const double pz = (z + 0.5) * f->h, py = (y + f->oy + 0.5) * f->h, px = (xx + f->ox + 0.5) * f->h;
             const double th = atan2(py - axis_lerp(f->cy, na, pz), px - axis_lerp(f->cx, na, pz));
             if (c->ref) {   /* the sub-turn offset between the ref and the phase */
-                fit_zpar(f->D, x.nt, uw_refbias, &x);
+                fit_zpar(f->D, x.nt, fused ? uw_refbias_f : uw_refbias, &x);
                 double complex s = 0; double w = 0; for (int t = 0; t < x.nt; t++) { s += x.rph[t]; w += x.rpw[t]; }
                 x.rbias = cabs(s) > 0 ? carg(s) / (2 * M_PI) : 0;
                 if (c->verbose) fprintf(stderr, "fit: ref model: sub-turn offset U_ref - phase %+.3f turn (coherence %.3f)%s\n", x.rbias, w > 0 ? cabs(s) / w : 0,
                                         c->ref_snap ? ", integers snapped to the ref" : "");
             }
             const double Ub = (c->ref ? uw_Uref(&x, z, y, xx) - x.rbias : (c->seed ? fit_W(c->seed, pz + c->seed_off, py, px) : fit_W(m, pz, py, px)) + m->dir * th / (2 * M_PI));
-            x.kb = (int32_t)round(Ub - V[ub_id(&g, z, y, xx)].uw) - UK_BIAS;
+            float uws = 0; uint16_t bks; double ths; if (fused) uw_rec_at(&x, seed, &uws, &bks, &ths);
+            x.kb = (int32_t)round(Ub - (fused ? uws : V[ub_id(&g, z, y, xx)].uw)) - UK_BIAS;
         }
-        if (c->ref && c->ref_snap == 1) {   /* the ref's integers everywhere, no flood */
+        if (fused) {}   /* (the integers in uw_accum_snap) */
+        else if (c->ref && c->ref_snap == 1) {   /* the ref's integers everywhere, no flood */
+            tsnap = nn_wall_seconds();
             fit_zpar(f->D, x.nt, uw_refsnap, &x);
+            tsnap = nn_wall_seconds() - tsnap;
             for (int t = 0; t < x.nt; t++) reached += x.nreach[t];   /* (the records with bk and an integer) */
         }
         else if (c->uw_split > 0 && !c->seed && !c->ref) reached = uw_two_level(&x, c->uw_split, c->uw_tile > 0 ? c->uw_tile : 256, nr, c->verbose);
@@ -1518,23 +1657,23 @@ static size_t fit_unwrap_voxels(fit_model *m, const fit_fields *f, double min_co
         for (int y = 0; y < f->H; y++) { int b = (int)lround((y + f->oy + 0.5) * f->h / m->L); if (b >= m->ly) b = m->ly - 1; yr[b + 1]++; }
         for (int a = 0; a < m->lz; a++) zr[a + 1] += zr[a];
         for (int b = 0; b < m->ly; b++) yr[b + 1] += yr[b];
-        ua_job J = {&x, zr, yr}; fit_par(m->lz * m->ly, uw_accum, &J);
+        ua_job J = {&x, zr, yr}; tacc = nn_wall_seconds();
+        if (seed != (size_t)-1 && fused) {
+            memset(x.nreach, 0, sizeof x.nreach);
+            const int nt = fit_par(m->lz * m->ly, uw_accum_snap, &J); for (int t = 0; t < nt; t++) reached += x.nreach[t];
+        } else if (!fused) fit_par(m->lz * m->ly, uw_accum, &J);
+        tacc = nn_wall_seconds() - tacc;
         free(zr); free(yr);
     }
     uint8_t *have = calloc(nl, 1); double *corr = calloc(nl, sizeof(double));
     for (size_t k = 0; k < nl; k++) if (x.wsum[k] > 0) { corr[k] = x.acc[k] / x.wsum[k]; have[k] = 1; }
-    for (int pass = 0; pass < 64; pass++) {   /* nodes without voxels: the mean of their neighbours (a pass reads only earlier passes'
-                                                 nodes, have 1, and writes only have-0 nodes: lattice z planes on threads, the serial result) */
-        nf_job J = {m, have, corr, {0}};
-        fit_zpar(m->lz, fit_nthreads(m->lz), uw_nodefill, &J);
-        int changed = 0; for (int t = 0; t < 64; t++) changed |= J.changed[t];
-        for (size_t k = 0; k < nl; k++) if (have[k] == 2) have[k] = 1;
-        if (!changed) break;
-    }
+    const double tf0 = nn_wall_seconds();   /* nodes without voxels: the mean of their neighbours, up to 64 passes */
+    const int npass = fit_node_fill(m->lz, m->ly, m->lx, have, corr, 64, getenv("UFSM_UW_FILL_OLD") && atoi(getenv("UFSM_UW_FILL_OLD")));
     for (size_t k = 0; k < nl; k++) m->delta[k] += (float)corr[k];
-    if (c->verbose) fprintf(stderr, "fit: voxel unwrapping %d threads: setup %.1fs, flood %.1fs, nodes %.1fs\n", x.nt, t1 - t0, t2 - t1, nn_wall_seconds() - t2);
+    if (c->verbose) fprintf(stderr, "fit: voxel unwrapping %d threads: setup %.2fs, flood %.2fs (ref snap %.2fs), nodes %.2fs (accumulation %.2fs, fill %.2fs %d passes, %zu nodes)%s\n", x.nt, t1 - t0,
+                            t2 - t1, tsnap, nn_wall_seconds() - t2, tacc, nn_wall_seconds() - tf0, npass, nl, fused ? ", no records: snap in the accumulation" : "");
     if (x.over) fprintf(stderr, "fit: %zu voxels over 16383 turns from the seed left unreached\n", (size_t)x.over);
-    munmap(vbase, vlen); free(x.acc); free(x.wsum); free(have); free(corr);
+    if (vbase) munmap(vbase, vlen); free(x.acc); free(x.wsum); free(have); free(corr);
     return reached;
 }
 

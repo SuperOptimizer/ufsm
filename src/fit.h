@@ -405,6 +405,11 @@ void fit_set_threads(int n);   /* the CPU backend's / grid's thread count (0: al
    returns the thread count used (fit_par_threads(n): the count without running) */
 int fit_par(int n, void (*fn)(void *ctx, int a0, int a1, int t), void *ctx);
 int fit_par_threads(int n);
+/* the voxel unwrapping's node fill (src/fit.c): lattice nodes without voxels (have 0) take the mean of their 6-neighbours filled in earlier
+   passes (have 1), in (z, y, x) neighbour order, for up to maxpass passes; have ends 1 where filled. old 1: the reference, one sweep of
+   every node a pass (before 11-18); 0: the same values from a frontier (the neighbours of the previous pass's nodes). Returns the passes
+   that filled a node (the last one included) */
+int fit_node_fill(int lz, int ly, int lx, uint8_t *have, double *corr, int maxpass, int old);
 /* fit_fields_load plus: noread (the arrays allocated, nothing read: a pooled box to fill through `also`); also (pool 1 loads, rows
    [fz0, fz1) starting on a multiple of also_pool and ending on one or at the box end): each block of also_pool rows, masked, pooled into
    `also` (a noread pooled box of the whole box) exactly as its own pooled load would (fit --slab: the prior's loads fill the global fit's

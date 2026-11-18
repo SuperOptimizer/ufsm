@@ -181,6 +181,22 @@ int main(void) {
                 }
                 printf("fit --ref-snap 1: the ref's integer on %.4f of the slab's voxels\n", ns ? (double)ok / ns : 0);
                 CHECK(ns && (double)ok / ns >= 0.99, "fit --ref-snap: the ref's integer on %.4f < 0.99", ns ? (double)ok / ns : 0);
+                /* the voxel unwrapping without records (fit.c uw_accum_snap, 11-18) against the three passes over the records it fuses
+                   (UFSM_UW_RECORDS=1) and without its shared radius / angle (UFSM_UW_SAME=0): the same model byte for byte */
+                const char *ev[2][2] = {{"UFSM_UW_RECORDS", "UFSM_UW_SAME"}, {"1", "0"}};
+                for (int v = 0; v < 2; v++) {
+                    setenv(ev[0][v], ev[1][v], 1);
+                    fit_model *mr = fit_run(&sb.f, &cs); CHECK(mr != nullptr, "fit --ref-snap %s=%s", ev[0][v], ev[1][v]);
+                    if (mr) {
+                        const size_t nl = (size_t)ms->lz * ms->ly * ms->lx;
+                        const int same = mr->lz == ms->lz && mr->ly == ms->ly && mr->lx == ms->lx && mr->nk == ms->nk && !memcmp(mr->delta, ms->delta, nl * sizeof(float))
+                                         && !memcmp(mr->pitch, ms->pitch, ms->nk * sizeof(float)) && !memcmp(mr->offset, ms->offset, ms->nk * sizeof(float));
+                        printf("fit --ref-snap 1, %s=%s: model %s\n", ev[0][v], ev[1][v], same ? "byte-identical" : "DIFFERS");
+                        CHECK(same, "fit --ref-snap: %s=%s changed the model", ev[0][v], ev[1][v]);
+                        fit_free(mr);
+                    }
+                    unsetenv(ev[0][v]);
+                }
                 fit_free(ms);
             }
             {   /* the phase gate (fit --phase-gate, src/phasegate.c): a phase that rotates with the sheets is kept; a dead (constant,
