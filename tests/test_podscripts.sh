@@ -27,5 +27,10 @@ t=$(printf '%s\n' "2026-11-18 03:20:05 rectosp start" "2026-11-18 03:20:11 recto
 ck "podq2 stage table row${t:+ ($t)}" '[ "$t" = "$(printf "rectosp\t2026-11-18 03:20:05\t2026-11-18 03:20:11\t6\t32\t5.6")" ]'
 ck "per-wrap reader3 maps are not CT-gated (unfilled per-wrap CT, 11-18)" 'grep -q "R3GATE=\${R3PWGATE:-0} R3PRE=\$O/ink/r3/up bash \$H/r3ink.sh" scripts/unroll/unroll.sh'
 ck "unroll slab overlap defaults to 8 (SLABOV A/B 11-18)" 'grep -q "I=\${SLABI:-64}; OV=\${SLABOV:-8}" scripts/unroll/unroll.sh'
+UR=scripts/unroll/unroll.sh; ln_() { grep -n "$1" $UR | head -1 | cut -d: -f1; }
+ck "merge-flag runs in the background after rectosp, before the ref (11-18: off the critical path)" '[ -n "$(ln_ "^mfbg ")" ] && [ "$(ln_ "^mfbg ")" -gt "$(ln_ "F=\$O/fields/rsp")" ] && [ "$(ln_ "^mfbg ")" -lt "$(ln_ "stage ref ref")" ] && grep -q "( stage mflag mflag || " $UR'
+ck "no serial merge-flag in check" '! awk "/^check\(\) \{/,/^}\$/" $UR | grep -q "merge-flag \$F"'
+ck "the mask consumers wait for mflag (GT split, snap, perwrap)" '[ "$(grep -c "mfready && " $UR)" = 3 ]'
+ck "snap writes wrapmf.tsv before CLEAN deletes the field planes, and CLEAN keeps mf" '[ "$(ln_ "wrap-mf \$wd")" -lt "$(ln_ "CLEAN:-1}\" = 1 ] && { find \$F")" ] && grep -q "! -name fields.json ! -name mf" $UR'
 [ $fails = 0 ] && echo "test_podscripts: ok" || echo "test_podscripts: $fails failure(s)"
 exit $((fails != 0))

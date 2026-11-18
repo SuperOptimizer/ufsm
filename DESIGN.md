@@ -49,8 +49,12 @@ mf is 1.4 GB on disk. test_mergeflag: a numpy reference of the same definitions 
 features at PH1's intervals: correlation 0.9988 (the prototype's np.roll edge rule).
 
 **Abstain in the unroll** (scripts/unroll/unroll.sh, MFLAG=1 default, MFTHR 128):
-- check: merge-flag on the run's fields; with GTBOXES the joined model's confident part is scored too (fit --score-mf THR conf|unc:
-  only the label voxels in cells mf < THR / >= THR; gtboxes.sh passes FITX; mkcrop.sh links mf);
+- mflag: a background stage started as soon as the final fields exist (after rectosp), beside ref / slabs / join on TH / 2 threads at
+  nice 10, so it adds no wall to the critical path (it was first serial in check: +4-9 min, branch mfbg-20261118 moved it); only its
+  consumers wait for state/mflag.done (mfready): the GT split, snap's wrapmf.tsv (before CLEAN deletes the planes it reads), perwrap's masks;
+- check: with GTBOXES the joined model's confident part is scored too (fit --score-mf THR conf|unc: only the label voxels in cells
+  mf < THR / >= THR; gtboxes.sh passes FITX; mkcrop.sh links mf) and logged beside the joined line as "ids right X, uncertain share of
+  the GT voxels Y", so every GT-scored unroll reports both;
 - snap: `ufsm wrap-mf` writes qa/wrapmf.tsv, the per-wrap uncertain share (vertices in flagged cells); CLEAN keeps the mf plane;
 - perwrap: r/<w>/<w>_mf.tif, the mask on the render's pixel grid (wrap-mf --render 1: (w - 1) step + 1 pixels, as render --scale 1).
 
@@ -66,6 +70,8 @@ deltas voxel-weighted, 95 % CI from a box bootstrap):
 | 77 | 0.8837 | +0.0230 | [+0.0178, +0.0284] | 50 / 54 | 9.4 % | 24.4 % |
 | 51 (p 0.2) | 0.8864 | +0.0257 | [+0.0203, +0.0315] | 51 / 54 | 12.1 % | 28.3 % |
 
+Default threshold 128 is the knee: the gain per point of coverage lost falls from 0.0035 (to 179) and 0.0018 (179 -> 128) to 0.0013
+(128 -> 102), 0.0012 and 0.0010 below. At it: confident ids 0.8800, coverage lost 6.5 %.
 The uncertain part (mf >= 128) scores ids 0.605: its voxels are wrong 3.3x as often as the confident part's.
 **Gate (confident ids up measurably at <= 15 % coverage lost): PASS** (+0.019 at 6.5 %, +0.026 at 12 %).
 

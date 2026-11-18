@@ -27,8 +27,9 @@
 #           check also runs cf-demod on the ref (DRIFT=1: the label-free z drift of the sheet identity, ALARM > DRIFTWARN 0.75 turn,
 #           DRIFTMAX fails) and, with GTBOXES + GTCODES, scores joined / ref-cf on GT boxes (scripts/spiralqa/ugeom/gtboxes.sh, CPU).
 #           DEMOD=1 (off): no slab fits; join = cf-demod --out of the ref (the ref's integers, the phase's sub-turn; DEMODR nodes)
-#           check also runs merge-flag (MFLAG=1 default, MFTHR 128): plane mf in the fields, the cells where the net's phase merges
-#           touching sheets; with GTBOXES the joined model's confident part (mf < MFTHR) is scored too (qa/gtboxes-joined-conf)
+#           with GTBOXES also the joined model's confident part (mf < MFTHR) and the uncertain share of the GT voxels (qa/gtboxes-joined-conf)
+#   mflag   -> rectosp (background, MFLAG=1 default, MFTHR 128): merge-flag, plane mf in the fields (the cells where the net's phase merges
+#           touching sheets); check's GT split, snap's qa/wrapmf.tsv and perwrap's <w>_mf.tif wait for it
 #   wraps   -> check: ufsm wraps (.sfc, step 4, --zr from scrolls.tsv, --min-cm2, --col-r p90)
 #   trim    -> wraps: from both ends, wraps beyond the wrap-check table, with collapsed gaps (rnet_med < RNETMIN 0.6) or near-empty (on-papyrus
 #           <= PAPMIN 0.1; surf-stats) dropped: strip --first / --last = the first kept ids (state/strip.args; per-wrap inputs state/trim.tsv,
@@ -245,6 +246,15 @@ mstage() {
 }
 # upto STAGE: true when UPTO names STAGE (the schedule stops there: the background ink is waited for)
 upto() { [ "${UPTO:-}" = "$1" ] && { [ "$DRY" = 1 ] && echo "(UPTO=$1: stop here)" || log "unroll: UPTO=$1 reached: stopping (re-run without UPTO for the rest)"; wait; exit 0; }; return 0; }
+# mflag (MFLAG=1, the default; src/mergeflag.h, DESIGN 2026-11-18 "merge-flag"): the fields' cells where the net's phase runs one cycle
+# over several touching sheets (phase vs density turn count, phase confidence; GT-fitted), plane mf in $F (CLEAN keeps it). A background
+# stage from the moment the final fields exist (after rectosp), beside ref / slabs / join (1667 q2: 9 min on 12 CPU threads, 14.8 % of
+# the material flagged): no wall on the critical path. Its consumers wait for it (mfready): the GT split (check), qa/wrapmf.tsv (snap,
+# before CLEAN), <wrap>_mf.tif (perwrap). Warn only: a failed mflag leaves them out. MFTH: its threads (default TH / 2: it shares the CPU
+# with the ref and slab lanes, nice 10).
+mflag() { X $O/logs/mflag.log $U merge-flag $F --thr ${MFTHR:-128} --threads ${MFTH:-$(( (TH + 1) / 2 ))} && { [ "$DRY" = 1 ] || log "mflag: $(grep '^merge-flag:' $O/logs/mflag.log | tail -1)"; }; }
+mfbg() { [ "${MFLAG:-1}" = 1 ] || return 0; rm -f $O/state/mflag.failed; ( stage mflag mflag || { touch $O/state/mflag.failed; log "mflag: failed (logs/mflag.log); no uncertain mask, warn only"; } ) & MFP=$!; [ "$DRY" = 1 ] && wait $MFP; return 0; }
+mfready() { [ "${MFLAG:-1}" = 1 ] && waitfor mflag; }   # (0: the mask is there; 1: MFLAG=0 / mflag failed / STOP)
 waitfor() { [ "$DRY" = 1 ] && { echo "    (waits for state/$1.done)"; return 0; }; while ! done_ $1; do stopped && return 1; [ -e $O/state/$1.failed ] && return 1; sleep 30; done; }
 
 prep() {
@@ -688,14 +698,6 @@ check() {
     [ -n "$ex" ] && awk -v e=$ex -v w=${DRIFTWARN:-0.75} 'BEGIN { exit !(e > w) }' && log "check: ALARM: the ref drifts $ex turns along the sheets over z ($wh; > DRIFTWARN ${DRIFTWARN:-0.75}): sheet identity changes with height"
     [ $rc = 3 ] && { log "check: FAILED: z drift above DRIFTMAX $DRIFTMAX"; return 1; }
   fi
-  # merge-flag (MFLAG=1, the default; src/mergeflag.h, DESIGN 2026-11-18 "merge-flag"): the fields' cells where the net's phase runs one
-  # cycle over several touching sheets (phase vs density turn count, phase confidence; GT-fitted), plane mf in $F (kept by CLEAN). The
-  # wraps' vertices there are exported as uncertain: qa/wrapmf.tsv (snap), <wrap>_mf.tif beside the per-wrap renders (perwrap). 1667 q2:
-  # 14.8 % of the material flagged, 9 min on 12 CPU threads; warn only.
-  if [ "${MFLAG:-1}" = 1 ]; then
-    if X $O/logs/mflag.log $U merge-flag $F --thr ${MFTHR:-128} --threads $TH; then [ "$DRY" = 1 ] || log "check: $(grep '^merge-flag:' $O/logs/mflag.log | tail -1)"
-    else log "check: merge-flag failed (logs/mflag.log); no uncertain mask, warn only"; fi
-  fi
   # GT boxes (GTBOXES = a wbench-format tsv in fields-native voxels, GTCODES = "ROOT KEY"; off unless both are set): the joined model and
   # the ref scored on them (CPU): the only check here that sees sheet identity (wrap-check and the join agreement pass P4 at GT ids 0.18).
   # With the mf plane also the joined model's confident part (fit --score-mf: label voxels in cells mf < MFTHR) and its coverage.
@@ -703,9 +705,13 @@ check() {
     local gb=$REPO/scripts/spiralqa/ugeom/gtboxes.sh m
     for m in joined ref-cf; do MKCROP=$MKCROP bash $gb $F $O/$m $GTBOXES $GTCODES $O/qa/gtboxes-$m $U > $O/logs/gtboxes-$m.log 2>&1 &&
       log "check: GT boxes, $m: $(tail -1 $O/logs/gtboxes-$m.log)" || log "check: GT boxes, $m: failed (logs/gtboxes-$m.log)"; done
-    if [ -e $F/mf/zarr.json ]; then
-      FITX="--score-mf ${MFTHR:-128} conf" MKCROP=$MKCROP bash $gb $F $O/joined $GTBOXES $GTCODES $O/qa/gtboxes-joined-conf $U > $O/logs/gtboxes-joined-conf.log 2>&1 &&
-        log "check: GT boxes, joined, confident part (mf < ${MFTHR:-128}): $(tail -1 $O/logs/gtboxes-joined-conf.log)" || log "check: GT boxes, joined confident part: failed"
+    # the confident part (mf < MFTHR) and the uncertain share of the GT voxels beside the joined line: every GT-scored unroll reports both
+    if mfready && [ -e $F/mf/zarr.json ]; then
+      if FITX="--score-mf ${MFTHR:-128} conf" MKCROP=$MKCROP bash $gb $F $O/joined $GTBOXES $GTCODES $O/qa/gtboxes-joined-conf $U > $O/logs/gtboxes-joined-conf.log 2>&1; then
+        local va vc ic; va=$(sed -nE 's/^gtboxes: [0-9]+ boxes, ([0-9]+) labelled.*/\1/p' $O/logs/gtboxes-joined.log | tail -1)
+        read -r vc ic < <(sed -nE 's/^gtboxes: [0-9]+ boxes, ([0-9]+) labelled voxels: ids right ([0-9.]+).*/\1 \2/p' $O/logs/gtboxes-joined-conf.log | tail -1)
+        log "check: GT boxes, joined, confident part (mf < ${MFTHR:-128}): ids right ${ic:-?}, uncertain share of the GT voxels $(awk -v a=${va:-0} -v c=${vc:-0} 'BEGIN { if (a > 0) printf "%.4f", 1 - c / a; else print "?" }')"
+      else log "check: GT boxes, joined confident part: failed (logs/gtboxes-joined-conf.log)"; fi
     fi
   fi
 }
@@ -820,8 +826,9 @@ snap() {
     # (the masked-CT / no-data alarm in progress.log is geoouter-20261114's wraps --fields line; wrap-snap keeps its WARNING print, MASKMAX
     # passes --masked-max: fail above that share of the wrap vertices on masked CT, off by default)
   else log "snap: off (SNAP=0)"; fi
-  # the per-wrap uncertain share (merge-flag's mf, check stage): qa/wrapmf.tsv, the vertices in merged-sheet cells (wrap QA; warn only)
-  if [ -e $F/mf/zarr.json ] || [ "$DRY" = 1 ]; then
+  # the per-wrap uncertain share (the mflag stage's mf): qa/wrapmf.tsv, the vertices in merged-sheet cells (wrap QA; warn only). Waits
+  # for mflag (it reads the field planes that CLEAN below deletes)
+  if mfready && { [ -e $F/mf/zarr.json ] || [ "$DRY" = 1 ]; }; then
     local wd=$O/wraps; [ "${SNAP:-1}" = 1 ] && wd=$O/wraps_snap
     if X $O/logs/wrapmf.log $U wrap-mf $wd --fields $F --thr ${MFTHR:-128} --tsv $O/qa/wrapmf.tsv; then [ "$DRY" = 1 ] || log "snap: $(grep '^wrap-mf:' $O/logs/wrapmf.log | tail -1)"
     else log "snap: wrap-mf failed (logs/wrapmf.log); warn only"; fi
@@ -915,7 +922,7 @@ pw_one() {   # pw_one WRAP GPU (a background subshell: the cache env stays in it
   mkdir -p $d/in; ln -sfn $O/up/$w $d/in/$w
   UFSM_RENDER_MEM=16 UFSM_RENDER_CHUNKED=1 UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} CUDA_VISIBLE_DEVICES=$gpu nice -n 10 $U render $d/in $d --volume $VROOT $VKEY --ct $R $K/$LV --depth 1 --scale 1 --threads ${RTH:-8} $VOUT > $d/render.log 2>&1 || return 1
   # the uncertain mask on the render's pixel grid (merge-flag's mf; kept by pw_fin): r/<w>/<w>_mf.tif, share of merged-sheet cells x255
-  [ -e $F/mf/zarr.json ] && { nice -n 10 $U wrap-mf $d/in --fields $F --thr ${MFTHR:-128} --out $d --render 1 > $L.mf.log 2>&1 || echo "perwrap: $w wrap-mf failed ($L.mf.log)" >> $O/logs/perwrap.log; }
+  mfready && [ -e $F/mf/zarr.json ] && { nice -n 10 $U wrap-mf $d/in --fields $F --thr ${MFTHR:-128} --out $d --render 1 > $L.mf.log 2>&1 || echo "perwrap: $w wrap-mf failed ($L.mf.log)" >> $O/logs/perwrap.log; }
   [ "$INKMODE" = r3 ] && { touch $d/.rendered; return 0; }   # (r3: pw_fin after the one ink-ext over all wraps, perwrap)
   pw_fin $w
 }
@@ -1045,6 +1052,7 @@ fi
 inkmain() { [ "${NOINK:-0}" != 1 ] && [ "$INKAT" != fields ] && ! done_ ink && inkbg; return 0; }
 { [ "${RECTOSP:-1}" = 0 ] || stage rectosp rectosp; } || { log "unroll: rectosp failed"; m7stop; wait; exit 1; }
 [ "${RECTOSP:-1}" != 0 ] && { [ -e $O/fields/rsp/fields.json ] || { [ "$DRY" = 1 ] && [ -n "$(m7src)" ]; }; } && F=$O/fields/rsp   # (the ref and every later stage read the blended fields)
+mfbg   # (merge-flag in the background on the final fields; MFLAG=0 off)
 { [ "${CTCAL:-0}" != 1 ] || stage ctcal ctcal; } && stage ref ref && upto ref && stage slabs slabs && inkmain && upto slabs && stage join join && upto join && stage check check && upto check &&
   stage wraps wraps && upto wraps && stage trim trim && stage snap snap && upto snap ||
   { log "unroll: stopped before the strip"; wait; exit 1; }
