@@ -3579,11 +3579,12 @@ static int cmd_surfsnap(int argc, char **argv) {
     return nw ? 0 : 1;
 }
 
-/* ufsm field-blend OUT IN1 IN2 ... [--weights a,b,...] [--tile SZ,SY,SX --grids z,y,x:z,y,x:...] [--conf resultant|mean] [--threads N]:
+/* ufsm field-blend OUT IN1 IN2 ... [--weights a,b,...] [--tile SZ,SY,SX --grids z,y,x:z,y,x:...] [--conf resultant|mean|medoid] [--threads N]:
    fit-field sets of several models on one grid blended into OUT (src/fblend.h: the phase as the confidence-weighted complex mean,
    its length the new confidence). --tile: the inputs are overlapping predicts of one model on tile interiors of SZ x SY x SX level
    voxels (predict --window - 2 --halo; z: --window-z - 2 --halo-z) anchored at each input's --grid-origin (--grids, in input order):
-   per-cell weights sin^2 of the cell's place in its interior (fb_tile_w). --conf mean: the mean input confidence as the length.
+   per-cell weights sin^2 of the cell's place in its interior (fb_tile_w). --conf mean: the mean input confidence as the length;
+   --conf medoid: the phase of the input closest to the others, unchanged (a median of 3+ models).
    --paste F [--box z,y,x,nz,ny,nx]: IN2.. are sub-box predicts pasted over IN1 with F-cell feathered faces (src/fblend.h); --box
    writes only that part of IN1 (shard-aligned), for scripts/spiralqa/field_paste_link.sh to overlay on IN1's shards. */
 static int cmd_field_blend(int argc, char **argv) {
@@ -3607,7 +3608,7 @@ static int cmd_field_blend(int argc, char **argv) {
         if (k != n) { fprintf(stderr, "field-blend: %d weights for %d inputs\n", k, n); return 2; }
     }
     static fb_opts o; memset(&o, 0, sizeof o);
-    if (!strcmp(conf, "mean")) o.conf = FB_CONF_MEAN; else if (strcmp(conf, "resultant")) { fprintf(stderr, "field-blend: --conf resultant|mean\n"); return 2; }
+    if (!strcmp(conf, "mean")) o.conf = FB_CONF_MEAN; else if (!strcmp(conf, "medoid")) o.conf = FB_CONF_MEDOID; else if (strcmp(conf, "resultant")) { fprintf(stderr, "field-blend: --conf resultant|mean|medoid\n"); return 2; }
     if (!tile != !grids) { fprintf(stderr, "field-blend: --tile and --grids go together\n"); return 2; }
     if (tile) {
         if (sscanf(tile, "%lf,%lf,%lf", &o.stride[0], &o.stride[1], &o.stride[2]) != 3 || !(o.stride[0] > 0 && o.stride[1] > 0 && o.stride[2] > 0)) { fprintf(stderr, "field-blend: --tile SZ,SY,SX (> 0)\n"); return 2; }

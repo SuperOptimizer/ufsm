@@ -25,7 +25,9 @@ void fb_wind4(int n, const uint8_t *const (*d)[4], const float *w, size_t ncell,
 /* the same with per-cell weights: input i weighs w[i] x cw[i][j] at cell j (cw nullptr or cw[i] nullptr: 1). fb_phase_cw conf:
    FB_CONF_RESULTANT (fb_phase: the length of the weighted mean vector, disagreement lowers it) or FB_CONF_MEAN (the direction of
    the weighted mean vector with the weighted mean of the input confidences as its length: disagreement keeps the confidence) */
-enum { FB_CONF_RESULTANT = 0, FB_CONF_MEAN = 1 };
+/* FB_CONF_MEDOID: the phase of the input closest to the others (sum_k w_k (1 - cos dphi), ties: the more confident), its pc / ps
+   unchanged: a median of 3+ models (one model's outlier phase is dropped instead of averaged in; with 2 inputs the more confident) */
+enum { FB_CONF_RESULTANT = 0, FB_CONF_MEAN = 1, FB_CONF_MEDOID = 2 };
 void fb_phase_cw(int n, const uint8_t *const *pc, const uint8_t *const *ps, const float *w, const float *const *cw, int conf, size_t ncell, uint8_t *opc, uint8_t *ops);
 void fb_mean_cw(int n, const uint8_t *const *a, const float *w, const float *const *cw, size_t ncell, uint8_t *o);
 void fb_median_known_cw(int n, const uint8_t *const *a, const float *w, const float *const *cw, size_t ncell, uint8_t *o);

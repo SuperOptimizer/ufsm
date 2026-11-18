@@ -85,6 +85,15 @@ static void test_tiles(void) {
     enc(0.9, 0.1, &c[0], &s[0]); enc(0.9, 0.6, &c[1], &s[1]);
     { const uint8_t *pc[2] = {&c[0], &c[1]}, *ps[2] = {&s[0], &s[1]}; fb_phase_cw(2, pc, ps, w1, nullptr, FB_CONF_MEAN, 1, &oc, &os); }
     dec(oc, os, &cf, &ph); CHECK(cf < 0.02 || fabs(cf - 0.9) < 0.02, "conf mean opposite: %g", cf);
+    /* --conf medoid: of 3 inputs the one closest to the other two, its codes unchanged (the outlier at 0.5 turn is not averaged in) */
+    { uint8_t c3[3], s3[3]; enc(0.5, 0.02, &c3[0], &s3[0]); enc(0.9, 0.08, &c3[1], &s3[1]); enc(0.9, 0.55, &c3[2], &s3[2]);
+      const uint8_t *pc[3] = {&c3[0], &c3[1], &c3[2]}, *ps[3] = {&s3[0], &s3[1], &s3[2]}; const float w3[3] = {1, 1, 1};
+      fb_phase_cw(3, pc, ps, w3, nullptr, FB_CONF_MEDOID, 1, &oc, &os);
+      CHECK(oc == c3[1] && os == s3[1], "medoid of 3: (%d, %d), want input 1 (%d, %d)", oc, os, c3[1], s3[1]);
+      /* 2 inputs: equal cost, the more confident; a missing input does not take part */
+      fb_phase_cw(2, pc, ps, w3, nullptr, FB_CONF_MEDOID, 1, &oc, &os); CHECK(oc == c3[1] && os == s3[1], "medoid of 2: the more confident");
+      const uint8_t *pm[3] = {&c3[0], nullptr, &c3[2]}, *sm[3] = {&s3[0], nullptr, &s3[2]};
+      fb_phase_cw(3, pm, sm, w3, nullptr, FB_CONF_MEDOID, 1, &oc, &os); CHECK(oc == c3[2] && os == s3[2], "medoid, input 1 missing: the more confident of 0 / 2"); }
     /* the _cw rules equal the plain ones without cell weights */
     const uint8_t a0[4] = {0, 40, 10, 200}, a1[4] = {50, 0, 20, 100}; const uint8_t *a[2] = {a0, a1}; uint8_t o1[4], o2[4];
     fb_mean(2, a, w1, 4, o1); fb_mean_cw(2, a, w1, nullptr, 4, o2); CHECK(!memcmp(o1, o2, 4), "mean_cw");

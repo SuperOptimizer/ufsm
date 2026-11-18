@@ -28,6 +28,18 @@ void fb_phase_cw(int n, const uint8_t *const *pc, const uint8_t *const *ps, cons
             const double q = CW(i, j), vx = (pc[i][j] - 128.0) / 127.0, vy = (ps[i][j] - 128.0) / 127.0;
             x += q * vx; y += q * vy; ws += q; if (conf == FB_CONF_MEAN) m += q * hypot(vx, vy);
         }
+        if (conf == FB_CONF_MEDOID) {   /* the input whose phase is closest to the others (sum_k w_k (1 - cos(phi_i - phi_k)); ties: the more confident), kept as it is */
+            int best = -1; double bc = 0, br = 0;
+            for (int i = 0; i < n; i++) if (pc[i] && ps[i] && CW(i, j) > 0) {
+                const double ax = pc[i][j] - 128.0, ay = ps[i][j] - 128.0, ri = hypot(ax, ay); double c = 0;
+                for (int k = 0; k < n; k++) if (k != i && pc[k] && ps[k] && CW(k, j) > 0) {
+                    const double bx = pc[k][j] - 128.0, by = ps[k][j] - 128.0, rk = hypot(bx, by);
+                    c += CW(k, j) * (ri > 0 && rk > 0 ? 1 - (ax * bx + ay * by) / (ri * rk) : 1);
+                }
+                if (best < 0 || c < bc - 1e-12 || (fabs(c - bc) <= 1e-12 && ri > br)) { best = i; bc = c; br = ri; }
+            }
+            opc[j] = best < 0 ? 128 : pc[best][j]; ops[j] = best < 0 ? 128 : ps[best][j]; continue;
+        }
         if (ws > 0) { x /= ws; y /= ws; m /= ws; }
         if (conf == FB_CONF_MEAN) { const double r = hypot(x, y); if (r > 0) { x *= m / r; y *= m / r; } }
         opc[j] = clamp8(128 + 127 * x, 1); ops[j] = clamp8(128 + 127 * y, 1);
@@ -426,6 +438,7 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
             fprintf(f, "]");
         }
         if (opt && opt->conf == FB_CONF_MEAN) fprintf(f, ", \"conf\": \"mean\"");
+        if (opt && opt->conf == FB_CONF_MEDOID) fprintf(f, ", \"conf\": \"medoid\"");
         if (paste) fprintf(f, ", \"paste_feather\": %g", opt->feather);
         if (opt && opt->box) fprintf(f, ", \"box\": [%lld, %lld, %lld, %lld, %lld, %lld]", opt->b0[0], opt->b0[1], opt->b0[2], opt->bn[0], opt->bn[1], opt->bn[2]);
         fprintf(f, "}}\n");
