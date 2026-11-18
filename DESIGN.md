@@ -42,7 +42,9 @@ The GPU's mf equals the CPU's byte for byte: 973 M cells (1667 rows 2048-2432), 
 **count-field --mf-w K.** fit_fields_load scales pc ps w by 1 - K mf / 255 as it reads (fit_fields_mf_weight; the mf plane of the
 same fields, zarr), so the ref needs no weighted copy (the 3 planes the --weighted pass re-encoded at the source q: ~3x the mf write).
 test_mergeflag: count-field --mf-w 1 on the fields gives byte-identical model files to count-field on merge-flag --apply's planes
-(lossless test planes), and refuses fields without mf. On 1667 q2 (lossy re-encode vs exact weights): GT_PLACEHOLDER
+(lossless test planes), and refuses fields without mf. On 1667 q2 (exact weights vs the re-encoded planes):
+model coherence 0.3538 vs 0.3563, ref GT ids **0.8896 vs 0.8896** (|err| < 0.08 0.2610 vs 0.2611): the same ref.
+
 ## Train vs predict parity: the same function up to fp16 rounding, except the EMA default and the window context (2026-11-18, branch parity-20261118)
 
 Audit (fix0332, lead + user): does predict run the function that training validates and trains? One fixed window per scroll (1667 GT
