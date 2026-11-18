@@ -1753,10 +1753,16 @@ __global__ void k_gn_apply(const __half *x, const float *gm, const float *rs, co
         *(__half2 *)(y + i) = __floats2half2_rn(act_f(a, act), act_f(b, act));
     }
 }
+static int g_gnold = -1;   /* mgpu: env */
+extern "C" void xnet_set_gnold(int v) { g_gnold = v; }
 /* the group statistics of x: device gm / rs [n][C] (group mean, 1 / std per channel, one allocation: rs = gm + n C; free gm) */
 extern "C" float *xgn_stats(xt x, int groups, float eps) {
     const int C = x.c, n = x.n; const long long S = (long long)x.d * x.h * x.w;
-    int nchunk = (int)((512 + n - 1) / n); if (nchunk > S / 64) nchunk = (int)(S / 64); if (nchunk < 1) nchunk = 1;   /* ~512 blocks, >= 64 voxels each */
+    /* chunks a sample: 64 (>= 64 voxels each), whatever the batch. The old count, 512 / n (~512 blocks), made each sample's partial sums
+       and so its statistics depend on the batch size: ink-ext's auto --batch (free device memory) moved reader3's 1667 w035 wrap by one
+       code on 0.7 % of its pixels between batch 8 and 16. UFSM_XNET_GNOLD=1: the old count (byte-exact with outputs before 2026-11-17) */
+    if (g_gnold < 0) g_gnold = getenv("UFSM_XNET_GNOLD") ? atoi(getenv("UFSM_XNET_GNOLD")) : 0;
+    int nchunk = g_gnold ? (int)((512 + n - 1) / n) : 64; if (nchunk > S / 64) nchunk = (int)(S / 64); if (nchunk < 1) nchunk = 1;
     double *part = (double *)xmalloc_dev((size_t)n * nchunk * C * 2 * sizeof(double)); float *gm = (float *)xmalloc_dev((size_t)n * C * 4 * 2), *rs = gm + (size_t)n * C;
     const int pairs = C / 2, rows = pairs <= 256 ? 256 / pairs : 1;
     k_gnpart<<<dim3(nchunk, n), 256, (size_t)rows * C * 2 * sizeof(float), g_st>>>((const __half *)x.p, C, S, nchunk, part);

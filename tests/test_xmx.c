@@ -226,6 +226,28 @@ static int run_dfs(int N, int D, int H, int W) {
     return bad != 0;
 }
 
+/* the GroupNorm statistics are batch-independent: each sample's gm / rs bit-equal whether it is computed alone or inside a batch (any
+   size, any position), and within 1e-5 (relative) of the old batch-dependent chunking (UFSM_XNET_GNOLD=1) */
+static int run_gnx(int N, int D, int H, int W, int C, int G, float off) {
+    const size_t S = (size_t)D * H * W, ne = (size_t)N * S * C; uint16_t *xh = malloc(ne * 2); int bad = 0;
+    for (size_t i = 0; i < ne; i++) xh[i] = f2h(off * (1.f + 0.1f * (float)(i % C) / C) + rnd() * 2.f);
+    xt x = xt_new(N, D, H, W, C); xh2d(x.p, xh, ne * 2);
+    float *gb = xgn_stats(x, G, 1e-5f), *hb = malloc((size_t)N * C * 2 * 4), *h1 = malloc((size_t)C * 2 * 4), *ho = malloc((size_t)N * C * 2 * 4); xd2h(hb, gb, (size_t)N * C * 2 * 4); xfree_dev(gb);
+    xnet_set_gnold(1); gb = xgn_stats(x, G, 1e-5f); xd2h(ho, gb, (size_t)N * C * 2 * 4); xfree_dev(gb); xnet_set_gnold(0);
+    double dmax = 0;
+    for (size_t i = 0; i < (size_t)N * C * 2; i++) { const double d = fabs((double)hb[i] - ho[i]) / (fabs((double)ho[i]) + 1e-3); if (d > dmax) dmax = d; }
+    size_t nd = 0;
+    for (int n = 0; n < N; n++) {   /* sample n alone */
+        xt xs = {(char *)x.p + (size_t)n * S * C * 2, 1, D, H, W, C, nullptr}; float *g1 = xgn_stats(xs, G, 1e-5f); xd2h(h1, g1, (size_t)C * 2 * 4); xfree_dev(g1);
+        for (int c = 0; c < C; c++) { nd += memcmp(&h1[c], &hb[(size_t)n * C + c], 4) != 0; nd += memcmp(&h1[C + c], &hb[(size_t)N * C + (size_t)n * C + c], 4) != 0; }
+    }
+    if (xnet_check("test_xmx gnx")) return 1;
+    printf("gnx N %d %dx%dx%d C %3d G %2d offset %g: %zu of %d stats differ alone vs in the batch; max rel diff vs the old path %.2g\n", N, D, H, W, C, G, off, nd, N * C * 2, dmax);
+    bad = nd != 0 || dmax > 1e-5;
+    xt_free(&x); free(xh); free(hb); free(h1); free(ho);
+    return bad;
+}
+
 /* the 1 -> 16 stem conv (k_dfc1) against a double host reference with fp16 weights */
 static int run_c1(int N, int D, int H, int W) {
     const size_t nx = (size_t)N * D * H * W; uint16_t *xh = malloc(nx * 2), *yh = malloc(nx * 32); float *x = malloc(nx * 4), *w = malloc(16 * 27 * 4), b[16];
@@ -337,6 +359,10 @@ int main(void) {
     fails += run_gn(3, 1, 40, 36, 32, 32, 20.f);     /* mean >> std: the shifted sums */
     fails += run_gn(2, 1, 12, 12, 320, 32, 1.f);     /* deep level, 10 channels a group */
     fails += run_gn(1, 1, 5, 7, 640, 32, 1.f);       /* more pairs than threads */
+    fails += run_gnx(3, 17, 40, 36, 16, 16, 0.f);
+    fails += run_gnx(5, 1, 24, 24, 320, 32, 20.f);
+    fails += run_gnx(2, 1, 96, 96, 128, 32, 1.f);
+    fails += run_gnx(4, 1, 12, 12, 640, 32, 1.f);
     printf("%s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }

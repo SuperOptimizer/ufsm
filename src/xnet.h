@@ -117,6 +117,7 @@ void xhead(xt x, const float *w_dev, float bias, float *out_dev);
    [n][1][h][w][2c] = (sum_d softmax_d(a) f, max_d f) */
 xt xdepth_attn_max(xt f, const float *a_dev);
 float *xgn_stats(xt x, int groups, float eps);
+void xnet_set_gnold(int v);   /* GroupNorm statistics chunking: 0 (default) 64 chunks a sample whatever the batch (batch-independent), 1 the old 512 / n (byte-exact with outputs before 2026-11-17) (UFSM_XNET_GNOLD) */
 xt xconv_fwd_gnin(const xconv *c, xt x, const float *gm, const float *rs, const float *gamma_dev, const float *beta_dev, int act);   /* conv(act(GN(x))) */   /* device [n][C] group mean, then [n][C] 1 / std (one block: free the returned pointer) */
 /* the Reader depth collapse fused: act(GroupNorm(f)) -> logits w . v + b per layer -> [n][1][h][w][32] = (softmax-weighted sum, max) over
    the layers; equals xgn + xhead + xdepth_attn_max up to the logit summation order. f: 16 channels, <= 32 layers; f is not modified */

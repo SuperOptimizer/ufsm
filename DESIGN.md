@@ -64,6 +64,14 @@ conv with GN on load) ~1/5, k_gnpart + k_gn_apply ~1/7, k_dfc1 ~1/14, k_dattn ~1
 - Tried and dropped (bench, byte-identical but not faster): the first k_dfc1 x-blocking (2.8 -> 6.7-8.3 ms, see above),
   k_gnpart with 4 rows' loads in flight + an 8-channel k_gn_apply (2.55 -> 2.52 ms). The GN kernels' reader3 time is ~8000 small
   launches on the 2-D levels (~0.12 ms each): fusing the apply into the next conv's loads (as gnin) is the remaining lever.
+- **ink-ext batch independence** (branch convkgs-20261117; UFSM_XNET_GNOLD=1 the old path): xgn_stats split each sample into
+  512 / n chunks, so each sample's partial sums, its GroupNorm statistics and its output followed the batch size. ink-ext's auto --batch
+  follows free device memory, and two master runs at batch 8 / 16 differed on 267 k of 39.4 M px of the 1667 w035 wrap (max 1). Now 64
+  chunks a sample whatever the batch, with the same kernels and speed (k_gnpart / k_gn_apply 1.13-1.24 in both). w035: two batch-8 runs
+  and batch 16 are byte-identical (0 px). Against master at batch 8: 658 of 39.4 M px differ, by 1 code, so any pair AUC can move by
+  at most ~2 x 658 / 39.4 M = 3e-5. test_xmx gnx checks that each sample's gm / rs are bit-equal alone and inside a batch (4 shapes).
+  An exact-integer statistics version (fp16 values as integers in 64-bit limbs: any partition, any order) was also batch-independent,
+  but k_gnpart took 2.5x as long (64-bit integer ops). It is not kept, but it is the form a fused igemm-epilogue version would need.
 - Parked (branch convkwave-20261117): wave-aware tiles for > 64 outputs (128x128 / 128x64 / 64x64 / 64x32 picked by waves x
   occupancy x per-tile cost). ncu showed the 24^2 x 320 layer at 108 blocks on 72 slots (1.5 waves, tensor pipe 77 % active) and 12^2
   at 27 blocks; XMX_IGBENCH: 24^2 -11 %, 12^2 -29 %, 12^2 x 1280 -25 %, byte-identical, but those layers are ~10 % of conv_igemm and
