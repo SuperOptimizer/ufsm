@@ -6,6 +6,81 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## HerculeX exact integer levels: one-sided votes on our fitter and on patch-solve (2026-11-18, branch levelsolve-20261118)
+
+HerculeX (github adambetka2/HerculeX, MIT; README "Exact integer levels") gives patches integer turns f by an exact solve of
+min sum w rho(f_b - f_a - k): sheet edges have k = 0, and rays along the normal have k = the sheets crossed. A ray can miss a faint sheet,
+so its count is a lower bound: a residual on the permitted side costs half (one-sided). It solves both senses and keeps the cheaper, and
+keeps only the edges that all of 8 Exp-reweighted re-solves agree on. Our exact L1 machinery already does the symmetric half:
+src/l1pot (PUMA graph cuts, BK) in the fitter's slip repair (--uw-repair) and in patch-solve. New on this branch:
+- l1_vote.wn: the weight below d (0 = w, so every old caller is unchanged). Merging swaps w / wn when it flips a vote. The solve and the
+  energy use the asymmetric cost; the convexity that makes +-1 cut moves exact still holds. test_repair: 300 exhaustive one-sided
+  5-node trials (shifts -10..10; one-sided chains reach past the old +-6). UFSM_L1_DUMP records grow 24 -> 32 B.
+- fit --uw-rep-hidden H: a touching slip-repair vote between two pieces whose axis lies along the model normal (|n_ax| >= 1/2) is
+  one-sided. More turns outward cost H, fewer cost the whole.
+- patch-solve --hidden H: gap votes are one-sided. --hidden-room R makes a crossing one-sided only when dr >= (d + R) x pitch.
+  --hidden-pitch P makes the box's votes one-sided only when its pitch < P voxels.
+  --draws K is HerculeX's consensus: K Exp(1)-reweighted re-solves; only the largest comp of the edges every draw keeps stays active.
+  test_patchsolve has a merged-contact case: sheet 2 is hidden in sheet 3 for theta < -0.1, so most 1 -> 3 crossings count d 1.
+  Symmetric ray votes put 8 of 10 nodes off their sheet (score 0.886); --hidden 0.5 puts 0 of 9 active off (score 1.0; s1_0 pruned).
+  Pair votes keep only each pair's mode, so the minority count is gone before the solve; there --hidden changes nothing.
+
+**The phase route cannot carry a packed count (oracle).** Run: u1-fd615 fields, CPU fit, master ba6fdf77. The label-phase ceiling fit is
+passed as --ref-model with --uw-rep-ref 1000, so every slip-repair piece takes the GT integer. That is the best any patch-level integer
+solve on our phase can do.
+
+| box | base ids0 | pieces at the GT integer, 8^3 / 4^3 tiles | per-voxel GT integer (--ref-snap 1) | ceil |
+|---|---|---|---|---|
+| PH1 | 0.222 | 0.238 / 0.237 | 0.931 | 0.967 |
+| PH2 | 0.277 | 0.246 / 0.243 | 0.965 | 0.963 |
+| PH3 | 0.219 | 0.201 / 0.202 | 0.702 | 0.812 |
+| HOLD | 0.810 | 0.919 / 0.917 | 0.882 | 0.996 |
+
+- In PH1-3 the phase counts 1.79 / 1.61 / 1.33 turns too few per 0.5 mm radial segment (2.79 reference turns). One piece of net phase
+  spans 2-3 GT sheets, so only per-voxel integers (new local evidence) recover them.
+- HOLD's slips are piece-level: +0.11 is available there.
+- --uw-rep-hidden 0.5 over 34 boxes (PH1-3, HOLD, 21 J, 9 C): mean ids0 delta +0.0001 (PH1 +0.006, J19 -0.003, J24 -0.002, the rest
+  within +-0.0006). On a phase field a skipped sheet is a slower phase, not a loop residual, so there is nothing for a one-sided cut to act on.
+  Not a fitter option worth using. (The 1667 label phase was deleted in the 11-17 cleanup, so there are no 1667 oracles.)
+
+**patch-solve (unroll v3) on the 1667 GT bed.** The 11-06 bed was gone. It is rebuilt in /vesuvius/ufsm/levelsolve/v3bed (mkbox.sh: m7 L2
+prob + 1667 wind codes max-pooled 4.8 -> 9.6 um, 512^3; ev.sh / ev2.sh = scripts/v3/ev_box.sh with sheet-trace --tile 16). C7
+reproduces the 11-06 rec .576 / solve .934. Metric: right sheet+turn x matched area kept (pruning and --draws drop area), per box.
+
+| set | sym | --hidden 0.5 | --hidden 0.25 | GT-oracle edges |
+|---|---|---|---|---|
+| 10 bed boxes (C1-4, 7, 9, 11, 19, 21, 24) | 0.696 | 0.730 (+0.034 [-0.035, +0.114]) | 0.735 (+0.039 [-0.032, +0.114]) | 0.932 |
+| 20 more clean boxes (C10-C57, mostly open) | 0.729 | 0.723 (-0.006 [-0.030, +0.018]) | 0.681 (-0.048 [-0.099, -0.001]) | |
+| all 30 | 0.718 | 0.725 (+0.007) | 0.699 (-0.019) | |
+
+- Over the 30 boxes the gain follows packing: corr(packed share, delta at H 0.5) 0.43, corr(box pitch, delta) -0.40.
+  - The 8 boxes with patch-solve pitch < 18 voxels (C1-3, C19, C21, C22, C24, C29): +0.091, 7 of 8 up.
+  - The 22 others: -0.020 (C26 -0.142, C4 -0.133, C35 -0.088).
+
+- Packed boxes gain: C2 0.513 -> 0.712, C19 0.579 -> 0.719, C3 0.454 -> 0.686 (0.767 at H 0.5), C1 0.494 -> 0.586.
+- Others lose: C24 0.752 -> 0.617, C9 0.835 -> 0.723, C4 0.556 -> 0.423 (H 0.5).
+- --cross-tsv vote errors vs GT: C2 15.7 % under / 6.1 % over and C19 13.6 / 10.7, which the lower-bound model fits. C4 is 6.4 / 27.3
+  (duplicate / double-face crossings) and C9 4.0 / 4.2; one-sided votes amplify the overcounts.
+- Refinements that do not help:
+  - --hidden-room 0.5 / 0.25 brings C2 / C19 back to sym (0.579 / 0.582): the undercounted gaps have ordinary dr (as 11-06 found).
+  - --dup-frac 0.5 lowers sym itself to 0.646; with --hidden 0.25 it is 0.729.
+  - --votes ray is the same as pair (ray + H 0.5 0.735).
+  - --draws 8 (C2, H 0.25): right 0.831 -> 0.844 at area 0.857 -> 0.817, a precision knob only.
+
+Verdict: one-sided votes are the right model where the counter undercounts (merged contacts), and wrong where it overcounts
+(duplicates). Which error dominates differs by box, and the per-crossing guards tried here do not tell them apart. The box pitch does
+(above). --hidden-pitch P makes the votes one-sided only when the box pitch < P. The rule (H 0.5, P 18) was chosen on these 30 boxes,
+so it is checked held out on the other 1667 boxes of boxes.tsv. Of 40 scored, none has pitch < 18 (lowest C55 19.0). The rule is
+inert there (40 / 40 identical scores, sym mean 0.788), but that says nothing about the gain: the packed-annotated held-out boxes C5 /
+C20 / C23 trace only their open parts (recall 0.10-0.44, pitch 24-26). Held-out #2 used the z-neighbours of the 8 packed selection boxes (11 boxes; 8 have pitch < 18).
+- Switched boxes: -0.001 [-0.047, +0.033], 5 up / 3 down: CN2b +0.063, CN2a +0.049, CN1a +0.031, CN29b -0.141.
+- FAIL (pre-registered: CI > 0). The selection set's +0.091 does not hold up. Even in packed boxes the one-sided votes sometimes flip
+  which gauge wins the largest comp (C29 / CN29b, C24 / C4 in selection). This is the single-gauge instability 11-06 already saw
+  (C3 .77 / .50), and the half-price over-side makes it easier. Nothing is switched on by default.
+The fitter option is null. patch-solve --hidden is not a default either: with pitch gating it fails held out. It would need an overcount
+guard (a detector that separates double faces / duplicates) and a gauge-stable score first. The 1667-unroll step of the plan was not run,
+since no route passed its gate. Scripts and rows: /vesuvius/ufsm/levelsolve/{orc,hid,v3bed}.
+
 ## merge-flag on the GPU, count-field --mf-w: 1667 in 34 s on the shared desk card (was 716 s on the pod's CPUs) (2026-11-18, branch mfgpu-20261118)
 
 MFREF put merge-flag in front of the ref, and the pod e2e measured it at 716 s (6904 CPU s; +454 s of critical path even in the
