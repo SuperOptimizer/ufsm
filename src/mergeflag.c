@@ -533,6 +533,22 @@ static int cmd_merge_flag_eval(int argc, char **argv, const char *list) {
     for (int t = 0; t < m; t++) pthread_join(th[t], nullptr);
     size_t tot = 0; int nok = 0; for (int b = 0; b < nb; b++) if (!B[b].rc) { tot += B[b].n; nok++; } else B[b].n = 0;
     printf("merge-flag --eval: %d of %d boxes, %zu GT intervals\n", nok, nb, tot);
+    if (opt(argc, argv, "--gap-report", nullptr)) {   /* the rule at --thr against GT sheet gaps, per scroll: P / R of "gap < G um" */
+        const double G = opt_atof("--gap-report", opt(argc, argv, "--gap-report", "100")), t = (opt_atoi("--thr", opt(argc, argv, "--thr", "179")) - 0.5) / 255.0;
+        const double lt = log(t / (1 - t)); char seen[64][32]; int ns = 0;
+        for (int b = 0; b < nb; b++) { int k = 0; while (k < ns && strcmp(seen[k], B[b].scroll)) k++; if (k == ns && ns < 64) snprintf(seen[ns++], 32, "%s", B[b].scroll); }
+        for (int k = 0; k < ns; k++) {
+            size_t n = 0, fl = 0, sm = 0, tps = 0, mg = 0, tpm = 0; int bx = 0;
+            for (int b = 0; b < nb; b++) if (!strcmp(B[b].scroll, seen[k]) && B[b].n) { bx++;
+                for (size_t i = 0; i < B[b].n; i++) { const ev_iv *v = &B[b].iv[i]; const int f = em_score(EM_COEF, v, nullptr, &c) >= lt, g = v->gap < G;
+                                                       n++; fl += f; sm += g; tps += f && g; mg += v->y; tpm += f && v->y; } }
+            printf("gap-report %-10s %3d boxes, %9zu intervals: flagged (mf >= thr) %.3f | gap < %g um %.3f: P %.3f R %.3f | phase-merged %.3f: P %.3f R %.3f\n",
+                   seen[k], bx, n, n ? (double)fl / n : 0, G, n ? (double)sm / n : 0, fl ? (double)tps / fl : 0, sm ? (double)tps / sm : 0,
+                   n ? (double)mg / n : 0, fl ? (double)tpm / fl : 0, mg ? (double)tpm / mg : 0);
+        }
+        for (int b = 0; b < nb; b++) free(B[b].iv);
+        free(B); return nok == nb ? 0 : 1;
+    }
     uint8_t *tr = calloc(nb, 1), *te = calloc(nb, 1); double w[4];
     /* a box listed for several nets (name NET-BOX) stays on one side of the held-out split: its rank among the distinct BOX names */
     int *rk = calloc(nb, sizeof *rk);
