@@ -6,6 +6,44 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Packed sheets are not resolved by finer CT: CT peaks per GT turn at 9.6 / 4.8 / 2.4 um (2026-11-18, pseudolab)
+
+The next-lever memo (/vesuvius/ufsm/pseudolab/lever-memo.md) rested on the premise that finer CT resolves the sheets the 9.6 um net
+misses. On the holdouts, corr(packed share, ids0) is -0.55, and boxes with >= 30 % of their GT turns under 100 um score 0.47 vs 0.81.
+Before any 4.8 um teacher run, the premise was tested directly on the CT.
+
+- **Method:** fix0332's ctgt.py (section "The curve on three scrolls"; copy in /vesuvius/ufsm/pseudolab/res48 with SIG / L / P
+  tunable), on the same scan, the same GT codes (Paris 4 q-9p6 at 9.6, 1667 codes at 4.798) and the same rays. Only the CT level
+  changes: key 2 (9.6), key 1 (4.8), and for Paris 4 key 0 (2.4 um, NAS L0). Two detectors:
+  - (b) equal physical scale: sigma / mean-sd / prominence windows scaled with the voxel, 1.2 / 12 / 24 at 9.6 -> 2.4 / 24 / 48 at 4.8
+    -> 4.8 / 48 / 96 at 2.4;
+  - (a) native voxels, unscaled.
+  The 9.6 rerun reproduces fix0332's Paris 4 curve: 48901 vs 48897 intervals, 1.045 vs 1.044.
+- **CT peaks per GT turn, detector (b):**
+
+| | 0-70 um | 70-85 | 85-100 | 100-115 | all |
+|---|---|---|---|---|---|
+| Paris 4 9.6 | 0.52 | 0.74 | 0.88 | 0.97 | 1.05 |
+| Paris 4 4.8 | 0.58 | 0.80 | 0.93 | 1.03 | 1.11 |
+| Paris 4 2.4 | 0.60 | 0.84 | 0.94 | 1.05 | 1.12 |
+| 1667 9.6 | 0.45 | 0.67 | 0.78 | 0.87 | 1.54 |
+| 1667 4.8 | 0.48 | 0.71 | 0.83 | 0.92 | 1.60 |
+
+- **Per box** (gap < 100 um | >= 100 um, 9.6 -> 4.8):
+  - PH1 0.60|1.10 -> 0.64|1.18 (2.4: 0.66|1.21);
+  - PH3 0.75|1.57 -> 0.83|1.71;
+  - HOLD 0.70|1.11 -> 0.73|1.17;
+  - 1667 C1 / C2 / C19: +0.02 to +0.04 at gaps < 100 um, the same or more at wide gaps.
+  The rise is uniform, not selective for packed sheets. The share of 0-70 um turns whose count is off by >= 0.5 barely moves
+  (0.54 -> 0.51 -> 0.51).
+- **Detector (a):** raises every bin 1.6-2.6x (Paris 4 overall 1.69 at 4.8, 2.65 at 2.4). That is texture and noise peaks, not
+  sheets.
+- **Reading:** below ~100 um, adjacent sheets do not appear as separate CT maxima, even at 2.4 um. They behave as compressed into
+  contact, not as under-sampled. This corrects latbeat's "mostly resolution" (2026-11-11): the latent net's deficit at 60-150 um
+  spacing is real, but finer input CT does not visibly separate those sheets. The resolution lever (multi-res teachers for winding)
+  loses its premise. Still to test (cheap; the net is not a peak detector): u1 13790 fed 4.8 um (wbench DLV -1) on PH1-3 / C1 / C2 /
+  C19 against control boxes. Gate: packed Δids0 >= +0.05 with CI > 0, and >= +0.05 beyond the control Δ.
+
 ## Paired A/B/C from try9 8690: 1667 pseudo labels and DINO/ssl both null; the cooldown alone null too (2026-11-17/18, pseudolab)
 
 The question: do fit-derived pseudo labels (section "Fit-derived pseudo labels", 2026-11-17) or the unlabelled DINO/ssl trunk term
@@ -8498,7 +8536,7 @@ boxes, cells weighted equally:
 Per box: corr(share of cells with spacing < 100 um, p05x A - B) = -0.31; the 5 most packed boxes (share >= 0.25) lose -0.101 p05x,
 the 25 middle ones -0.027, the 9 least packed -0.033.
 
-Verdict: mostly resolution. The latent net's phase deficit is largest at 60-150 um sheet spacing (6-15 label voxels, 1.5-4 latent
+Verdict: mostly resolution (corrected 2026-11-18: finer CT does not separate the < 100 um sheets, section "Packed sheets are not resolved by finer CT"). The latent net's phase deficit is largest at 60-150 um sheet spacing (6-15 label voxels, 1.5-4 latent
 cells of 38.4 um per sheet period) and on Paris 4, where most sheets are that packed; its confidence there is 10-15 % lower; on 1667
 (wide sheets) its phase is better than wind96's. A smaller second deficit is the normal head at wide spacing (-0.012..-0.05 nal), where
 the latent spacing head is also worse (sperr .54 vs .39 at 150-250 um) while it is better in packed sheets. Next (queued): a stride-2
