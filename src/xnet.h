@@ -56,9 +56,10 @@ typedef struct {
     float *tbias;                                        /* the transposed conv's bias [co] */
     int mxrot;                                           /* bit 0 UFSM_XNET_MXROT: the packed weights are H16-rotated per 16-K block; bit 1 UFSM_XNET_MXA: least-
                                                             squares activation scales; either: the input is re-quantised by k_xq */
-    void *mxq, *mxs, *mxs2; float *mxgs; int mxsf, nch;         /* UFSM_XNET_MX (ci % 32 == 0): packed fp4 weights [Cop][Kp / 2], scales [Cop][Kp / 32][4] (two 16-K
+    void *mxq, *mxs, *mxs2; float *mxgs; int mxsf, nch, mxrows;   /* UFSM_XNET_MX (ci % 32 == 0): packed fp4 weights [Cop][Kp / 2], scales [Cop][Kp / 32][4] (two 16-K
                                                             blocks per 32-K chunk, bytes 2..3 unused), the per-row fp32 scale (ue4m3 format), the scale format (6 ue8m0,
-                                                            5 ue4m3), nch = 32-K chunks of K (the GEMM runs on the MX-fp4 tensor cores, inputs quantised on the fly) */
+                                                            5 ue4m3), nch = 32-K chunks of K, mxrows = Cop (co padded to 128, the widest MX tile) (the GEMM runs on the MX-fp4
+                                                            tensor cores, inputs quantised on the fly) */
 } xconv;
 
 /* w: PyTorch Conv weight [co][ci][kd][kh][kw] (fp32 host); scale / bias: per output channel (nullptr: 1 / 0). 0 on success. */
