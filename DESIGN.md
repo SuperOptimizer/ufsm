@@ -6,6 +6,25 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The fields head on the tensor cores: predict's per-z fp32 head 17.9 -> 6.2 ms a window, near-identical (2026-11-17, branch convktch-20261117)
+
+Predict's per-z fp32 fields head (lp_conv1_fwd_mx_r, > 16 outputs from MX-fp4 channels) ran conv1_mx_tv_k, FFMA passes of 16 outputs.
+It now runs conv1_mx_tc_k<MT, float>, the training head's one-pass m16n8k16 kernel with fp32 stores at plane stride Ly.
+UFSM_HEAD_TC_R=0 gives the FFMA passes, which are bit-equal to the whole-window logits.
+- PHerc0332 640 windows, u1 13000: the head 17.9 -> 6.2 ms a window, all kernels 125.8 -> 111.9 (before the fstem change).
+- fit-zarr against master, z3-diff:
+  - w (phase): byte-identical
+  - sp: 5.2 % of voxels by 1-3 codes
+  - pc: 20 % by 1 (max 5)
+  - dz / dy / dx: 16-36 % of voxels differ (mean 0.5-1.7 codes), with direction-flip shares of 3-10e-4
+- fit-compare with master as the reference: every line equal to master against itself, normal angle p90 0.2 against 0.1 degrees.
+- wbench core (44 boxes, u1 13000, fitter b29b1bda, only the predict binary differs; run by pseudolab):
+  - ids0 0.5318 against 0.5318, max |d| 0.0009 (18 boxes differ at all)
+  - ids 0.5327 against 0.5328, max |d| 0.0034, under the boxes' median ids_sd of 0.0118
+  - p1x 0.5550 against 0.5550
+  - HOLD ids0 0.8160 against 0.8161
+- test_headz: the TC head against the FFMA head within 0.002 on a logit rms of 2.2 (96 channels); equal on 16 / 48.
+
 ## Latent-ink smoke on pod B: cancelled before a scored step. Cold https CT was the wall; the restart recipe (2026-11-18, scripts/inksmoke)
 
 The plan (user-approved: smoke test only, ~10.5 h) is the retrain from the inkpod diagnosis (section "Production ink = reader3").
