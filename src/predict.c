@@ -1191,7 +1191,8 @@ static int pred_view_set(unet *u, const int64_t o[3], int Wz, int W) {   /* the 
    heads upsampled into lgf as in the plain pass (nch planes, fp16), back through T. */
 static int g_tta_ord[TTA_MAX];   /* the pass codes (tta_order; UFSM_TTA_ORDER); mgpu: config (set in main before any predict thread) */
 typedef struct { unet *u; uint8_t *ctd; const uint8_t *ctsave; float mean, isd; const float *dyo, *dxo; float *dyt, *dyd; int axis; shape5 xs; int h16, D, W, nch, ch_normal;
-                 int lat, latc, lguide, cout, skw, skip_nl, skip_thr, skip_margin; const float *lbas, *lgain; float lstep; void *x2; float **lgfp; shape5 xn; } tta_ctx;
+                 int lat, latc, lguide, cout, skw, skip_nl, skip_thr, skip_margin; const float *lbas, *lgain; float lstep; void *x2; float **lgfp; shape5 xn;
+                 int latin, hdiv, hmode, fstem, fstem_out; void *xd; void **lrtp; const float *fsp; } tta_ctx;   /* (latin 0: the plain pass's xd route; fsp: the fine stem's parameters, or null) */
 static const float *tta_pass(const tta_ctx *T, int code) {
     nn_tta_ct(T->ctsave, T->ctd, T->D, T->W, code);
     if (g_pv) { nn_tta_ct(g_pvsave, g_pvd, g_pvP, g_pvP, code); unet_set_attn_view(T->u, g_pvd, 1); }   /* (the view crop through the same T) */
@@ -1200,7 +1201,11 @@ static const float *tta_pass(const tta_ctx *T, int code) {
     pred_axis(T->u, T->axis != 0, T->D, T->dyt, T->dyt + T->W);
     const float *lg; int lh;
     if (T->lat) {
-        if (T->latc) nn_lat_pred_input_c(T->ctd, T->D, T->W, T->mean, T->isd, T->dyd, T->dyd + T->W, T->axis, T->lbas, T->lgain, T->latc, T->lstep, T->x2);
+        if (!T->latin) {   /* as the plain pass without the direct cell input (a fine-stem net: the stem reads the fp16 window xd) */
+            nn_pred_input_d(T->ctd, T->D, T->W, T->mean, T->isd, T->dyd, T->dyd + T->W, T->axis, T->xd, T->h16);
+            if (T->latc) nn_lat_input_x(T->xd, T->W / 4, T->W / 4, T->W / 4, T->lbas, T->lgain, T->latc, T->lstep, T->x2);
+            else nn_lowres_input(T->xd, T->xs, T->hdiv, T->hmode, *T->lrtp, T->x2, T->h16);
+        } else if (T->latc) nn_lat_pred_input_c(T->ctd, T->D, T->W, T->mean, T->isd, T->dyd, T->dyd + T->W, T->axis, T->lbas, T->lgain, T->latc, T->lstep, T->x2);
         else nn_lat_pred_input(T->ctd, T->D, T->W, T->mean, T->isd, T->dyd, T->dyd + T->W, T->axis, T->x2);
         if (T->skw) nn_skip_build(T->ctd, T->D, T->W, T->W, 4, T->skip_nl, T->skip_thr, T->skip_margin);
         const float *l2 = unet_forward_x(T->u, T->x2, T->xn, 0, T->h16);
@@ -1209,6 +1214,11 @@ static const float *tta_pass(const tta_ctx *T, int code) {
         if (T->lguide == 64) {
             nn_lat_up_slab(l2, l2h, 11, c4, c4, c4, 0, T->W, *T->lgfp);
             nn_lat_shuffle(l2, l2h, c4, c4, c4, T->cout - 128, 2, 0, T->W, *T->lgfp);
+            if (T->fsp) {   /* the fine stem into the 11 task planes (PRED_FSTEM of the plain pass: outputs c < 2 or c >= 9, in channel order) */
+                int fm[16], k = 0; const size_t w3 = (size_t)T->D * T->W * T->W;
+                for (int c = 0; c < T->cout && k < T->fstem_out; c++) if (c < 2 || c >= 9) fm[k++] = c < 11 ? c : -1;
+                if (nn_fstem_fwd(T->xd, T->W, T->W, T->W, 0, T->W, T->fsp, T->fstem, T->fstem_out, fm, *T->lgfp, w3)) { fprintf(stderr, "predict --tta: the fine stem failed\n"); exit(2); }
+            }
         } else nn_lat_up_slab(l2, l2h, T->cout, c4, c4, c4, 0, T->W, *T->lgfp);
         lg = *T->lgfp; lh = 1;
     } else { lg = unet_forward_ct(T->u, T->ctd, T->mean, T->isd, T->dyd, T->dyd + T->W, T->axis, T->xs, T->h16); lh = unet_logits_h16(T->u); }
@@ -2316,7 +2326,9 @@ static int predict_one(int argc, char **argv) {
         }
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
         /* --tta on a latent-grid net: the direct cell input, the fit fields from the whole-window planes (fzs is off with --tta), cube windows */
-        tta_lat = half == 3 && latin && ffd && Wz == W && !(W % 4) && (!cfg.lat_guide || cfg.lat_guide == 64) && !cfg.fstem && !degrade && !auxz && !lat_store && !fzs;
+        /* (a fine-stem net (--fstem, guide 64) has no direct cell input with --tta (fzs off): the xd route of the plain pass, the stem from xd) */
+        tta_lat = half == 3 && (latin || (xd && h16 && hdiv == 4 && hmode == 1)) && ffd && Wz == W && !(W % 4) && (!cfg.lat_guide || cfg.lat_guide == 64) && (!cfg.fstem || (cfg.lat_guide == 64 && h16 && !latin))
+                  && !degrade && !auxz && !lat_store && !fzs;
         if (tta > 1 && !tta_lat && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) {
             fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs) or a latent-grid net's direct cell input with fit fields and cube windows"
                             " (latent: half %d latin %d fit fields %d ct_shared %d window %d x %d lat_guide %d fstem %d)\n", half, latin, ffd != nullptr, ct_shared, Wz, W, cfg.lat_guide, cfg.fstem); return 2; }
@@ -2989,7 +3001,8 @@ static int predict_one(int argc, char **argv) {
             tta_ctx TC = {.u = u, .ctd = tta_lat && !ct_shared ? g_ps.cttta : ctd, .ctsave = g_ps.ctsave, .mean = (float)mean, .isd = (float)(1.0 / sd), .dyo = dyo, .dxo = dxo, .dyt = g_ps.dyt, .dyd = dyd,
                                 .axis = ax.n > 0 ? (int)radial_sign : 0, .xs = xs, .h16 = h16, .D = Wz, .W = W, .nch = ffd ? (tta_lat && cfg.lat_guide == 64 ? 11 : cfg.cout) : 1, .ch_normal = ffd ? ff_nrm : -1,
                                 .lat = tta_lat, .lguide = cfg.lat_guide, .cout = cfg.cout, .skw = skip_empty && half == 3 && gpath && !lat_store && !lvq, .skip_nl = skip_nl, .skip_thr = skip_thr,
-                                .skip_margin = skip_margin, .x2 = x2, .lgfp = &lgf, .xn = xn};   /* (without fit fields the head computes only the written, scalar channel; lgf: allocated at the first window's forward) */
+                                .skip_margin = skip_margin, .x2 = x2, .lgfp = &lgf, .xn = xn, .latin = latin, .hdiv = hdiv, .hmode = hmode, .fstem = cfg.fstem, .fstem_out = cfg.fstem_out,
+                                .xd = xd, .lrtp = &lrt, .fsp = tta_lat && cfg.fstem && !fstem_off ? unet_active_params(u) + unet_fstem_off(u) : nullptr};   /* (without fit fields the head computes only the written, scalar channel; lgf: allocated at the first window's forward) */
             TC.latc = tta_lat ? unet_lat_basis(u, &TC.lbas, &TC.lgain, &TC.lstep) : 0;
             if (ct_shared && ctmi != ctm) nn_pred_ctmask_t(ctd, w3, ctmi, iso);
             if (ctcp && ct_shared) nn_d2d_async(ctcp, ctd, w3);   /* --fit-ct reads the CT after the forward */
