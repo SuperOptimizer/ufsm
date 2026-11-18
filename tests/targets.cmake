@@ -247,6 +247,7 @@ ufsm_exe(test_render_fill_gpu SUITE tests/test_render_fill.c OBJS render inkcomp
          nn_gpudec LIBS LDLIBS CUDA DEFS RENDER_GPU)
 ufsm_exe(test_render_known SUITE tests/test_render_known.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json LIBS
          LDLIBS)
+ufsm_exe(test_surf_resample SUITE tests/test_surf_resample.c OBJS imgops jpegpar tiff tiffw LIBS LDLIBS m)
 ufsm_exe(test_render_gate SUITE tests/test_render_gate.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json LIBS
          LDLIBS)
 ufsm_exe(test_render_stream SUITE tests/test_render_stream.c OBJS render inkcompare imgops jpegpar tiff tiffw z3w zarr3 store json LIBS

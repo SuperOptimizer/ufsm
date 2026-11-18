@@ -824,7 +824,7 @@ stripimg() {
   local E="UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_ZCACHE_ADMIT=${ZCACHE_ADMIT:-0.6} UFSM_JPEG_THREADS=$JPEGT UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} UFSM_RENDER_MEM=${UFSM_RENDER_MEM:-16} ${RGPU:+CUDA_VISIBLE_DEVICES=$RGPU}"
   if [ "$DRY" = 1 ]; then echo "    $E: stretch from the 3 middle stripes (render $FILLX + strip-mosaic --stretch-only), then U=$U CTR=$R CTK=$K/$LV INK=$VROOT INKK=$VKEY PAPMOS=$ST/img_pap bash scripts/strip/strip_refill.sh $ST$([ "$INKMODE" = r3 ] && echo " (R3INK: each stripe's ink by r3ink.sh: $R3W, gate CT >= $R3GATE, $R3X)")"; return 0; fi
   mkdir -p $RF $ST/fillmap $ST/logs; S=($(ls $ST/strip/flat/stripes)); N=${#S[@]}; [ $N -gt 0 ] || return 1
-  if [ "$INKMODE" = r3 ]; then r3pre $O/ink/r3/strip "${RGPU:-}" $ST/strip/flat/stripes/* || return 1; export R3PRE=$O/ink/r3/strip; fi
+  if [ "$INKMODE" = r3 ]; then r3pre $O/ink/r3/strip "${RGPU:-}" $ST/strip/flat/stripes/* || return 1; export R3PRE=$O/ink/r3/strip R3PRECP=1; touch $O/ink/r3/strip.ok; fi   # (R3PRECP: the raw maps stay for r3once)
   if [ ! -s $ST/stretch.txt ]; then
     # the 3 middle stripes' renders at once (SJOBS, default by memory: a Paris 4 stripe render peaks at ~21 GB RSS and 4 GB of device
     # pool; one after another they were 3 x 28 s of 84 s, on 1667 26 + 15 + 10 s; each render is independent: the same images)
@@ -875,6 +875,31 @@ pw_fin() {   # pw_fin WRAP: (r3) the wrap's ink from r3pre, CT-gated; the side-b
   [ -e $O/img/${w}_full_side.jpg ] && rm -f $d/$w.tif $d/${w}_ct.tif $d/.rendered
   echo "$(date '+%F %T') $w $(grep -E '^[^ ]+: input' $O/logs/pw/$w.flat.log 2>/dev/null | head -1 | grep -oE '= [0-9.]+ cm2')" >> $O/logs/perwrap.list
 }
+# r3once (INKMODE=r3, R3ONCE=1 the default): the wraps' ink from the stripes' reader3 maps instead of a second reader3 pass over the same
+# papyrus. ufsm surf-resample projects each wrap pixel onto the stripes in 3-D and samples their raw maps; slivers the stripes miss by
+# <= 16 px take the nearest value; the rest (pieces the per-wrap flatten keeps but the stripes do not, and a 32-px band where a wrap
+# crosses a stripe boundary: reader3's tile-edge effect) is inked by reader3 on a residual copy of the wrap (those vertices + 8, the band
+# + 32 vertices of context) and composed in. 1667 pod data, 2026-11-18: held-out AUC 0.8622 at 40 um vs 0.8580 inking the wraps (the
+# stripe flatten reads better), seam band |d| vs the direct wrap map 4.3 (elsewhere 7.1); residual 7.6k of 37.5k tiles (desk 88 s vs
+# 826 s) + 98 s resample + 12 s compose on 8 CPU threads. It waits for the stripes' maps (state/strip_chain.failed, or UPTO: the old pass).
+r3once_ok() {
+  [ "${R3ONCE:-1}" = 1 ] && [ -z "${UPTO:-}" ] || return 1
+  while [ ! -e $O/ink/r3/strip.ok ] && [ ! -e $O/state/strip_chain.failed ]; do stopped && return 1; sleep 10; done
+  [ -e $O/ink/r3/strip.ok ] || { log "perwrap: no stripe maps (the strip stopped): reader3 over the wraps"; return 1; }
+}
+r3once() {   # r3once GPU UPDIR..: $O/ink/r3/up/<w>_$R3MODEL.tif from the stripes' maps + a residual reader3 pass
+  local g=$1 W=$O/ink/r3/once x; shift
+  case "$W" in */ink/r3/once) rm -rf -- "$W";; *) return 1;; esac
+  mkdir -p $W/dst $W/rmap $O/ink/r3/up || return 1
+  for x in "$@"; do [ -s $O/ink/r3/up/$(basename $x)_$R3MODEL.tif ] || ln -sfn $x $W/dst/$(basename $x); done
+  [ -n "$(ls $W/dst)" ] || return 0
+  X $O/logs/r3once.log $U surf-resample $O/strip/strip/flat/stripes $O/ink/r3/strip $W/dst $O/ink/r3/up --suffix _$R3MODEL.tif --threads $TH \
+    --src-out 1 --residual $W/res --edge-band ${R3BAND:-32} --fill-gap ${R3FILLGAP:-16} --residual-margin 8 --band-margin 32 || return 1
+  if [ -d $W/res ] && [ -n "$(ls $W/res)" ]; then r3pre $W/rmap "$g" $W/res/* || return 1; fi
+  X $O/logs/r3once.log $U surf-resample --compose $O/ink/r3/up $W/rmap --suffix _$R3MODEL.tif || return 1
+  rm -f $O/ink/r3/up/*_src.tif
+  log "r3once: $# wraps from the stripes' maps: $(grep -oE '[0-9]+ px resampled, [0-9]+ nonzero from the residual maps' $O/logs/r3once.log | tail -1)"
+}
 perwrap() {
   [ "$DRY" = 1 ] && { echo "    per wrap (largest first, SPAR ${SPAR:-4}, GPUs of FITGPUS in turn): tifxyz-scale -> flatten --gpu 1 -> tifxyz-scale --flip-rows 1 -> render (ink + CT)$([ "$INKMODE" = r3 ] && echo "; then ONE ink-ext over all rendered wraps (r3pre, --cache $O/ink/ct.cache: $R3W) -> per wrap r3ink.sh (CT >= $R3GATE gate)") -> ink-compare --then"; return 0; }
   mkdir -p $O/orig $O/flat $O/up $O/r $O/img $O/prev $O/logs/pw
@@ -887,7 +912,8 @@ perwrap() {
   for w in "${!pid[@]}"; do wait ${pid[$w]} || { nf=$((nf + 1)); echo "perwrap: $w FAILED (logs $O/logs/pw/$w.*, $O/r/$w/render.log)" >> $O/logs/perwrap.log; }; done   # (each job's rc, audit 11-14 #12)
   if [ "$INKMODE" = r3 ]; then   # the rendered wraps' ink in ONE ink-ext (r3pre, first GPU of FITGPUS), then the images in parallel
     local rw=(); for p in $O/r/*/.rendered; do [ -e "$p" ] && rw+=($O/up/$(basename $(dirname $p))); done
-    if [ ${#rw[@]} -gt 0 ]; then r3pre $O/ink/r3/up ${pg[0]} "${rw[@]}" || return 1
+    if [ ${#rw[@]} -gt 0 ]; then
+      if r3once_ok; then r3once ${pg[0]} "${rw[@]}" || return 1; else r3pre $O/ink/r3/up ${pg[0]} "${rw[@]}" || return 1; fi
       unset pid; local -A pid; for p in "${rw[@]}"; do w=$(basename $p); while [ $(jobs -r | wc -l) -ge ${SPAR:-4} ]; do sleep 2; done
         pw_fin $w & pid[$w]=$!; done
       for w in "${!pid[@]}"; do wait ${pid[$w]} || { nf=$((nf + 1)); echo "perwrap: $w image FAILED ($O/r/$w/render.log)" >> $O/logs/perwrap.log; }; done; fi
@@ -922,7 +948,7 @@ stage fields fields || { m7stop; exit 1; }; upto fields
 # INKWAIT=0 (with INKAT=fields): the lanes on INKGPU do not wait for the ink, they share the card (one-GPU desk runs: the ink, ~13 min on
 # 0332, would otherwise hold the whole slab stage back)
 # (a rerun of the same O clears the last run's .failed markers first: waitfor / the GPU lane stopped at once on a stale one, audit mini/shell #3)
-[ "$DRY" = 1 ] || rm -f $O/state/ink.failed $O/state/inkcal.failed
+[ "$DRY" = 1 ] || rm -f $O/state/ink.failed $O/state/inkcal.failed $O/state/strip_chain.failed
 # one-GPU runs (FITGPUS = INKGPU, the desk): INKAT=fields INKWAIT=0 by default (0332 2026-11-17, card 1 only: 1832 -> 1422 s end to end;
 # from the slabs the ink, 770 s, was the critical path and stripimg / perwrap waited 8.5 min for it; beside rectosp / ref / slabs those
 # slow down 128 -> 221, 54 -> 92, 149 -> 190 s but the ink is done before the snap)
@@ -938,7 +964,7 @@ inkmain() { [ "${NOINK:-0}" != 1 ] && [ "$INKAT" != fields ] && ! done_ ink && i
   stage wraps wraps && upto wraps && stage trim trim && stage snap snap && upto snap ||
   { log "unroll: stopped before the strip"; wait; exit 1; }
 if [ "${PERWRAP:-0}" = 1 ]; then ( waitfor ink && stage perwrap perwrap && { [ "${FACES:-0}" = 1 ] && stage faces faces; true; } ) & PWP=$!; [ "$DRY" = 1 ] && wait $PWP; fi
-stage strip strip && upto strip && stage stripflat stripflat && stage distort distort && waitfor ink && stage stripimg stripimg || log "unroll: the strip stopped"
+stage strip strip && upto strip && stage stripflat stripflat && stage distort distort && waitfor ink && stage stripimg stripimg || { log "unroll: the strip stopped"; [ "$DRY" = 1 ] || touch $O/state/strip_chain.failed; }   # (the marker: perwrap's r3once falls back to inking the wraps)
 wait
 [ "$DRY" = 1 ] || [ -n "${CTCACHE:-}" ] || [ "${KEEPCT:-0}" = 1 ] || { case "$O/ctcache" in /*/ctcache) rm -rf -- "$O/ctcache";; esac; }
 stage upload upload
