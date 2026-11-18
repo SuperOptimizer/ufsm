@@ -263,6 +263,7 @@ static int render_pass(z3 *z, rsheet *S, int ns, int k, const int *depth, int nd
 typedef struct { uint8_t v; int32_t ci; uint32_t first; } wdec;   /* decode list entry: volume, chunk, first group (1-based) */
 typedef struct {
     int nv; ctab T[RV]; int depth[RV]; uint32_t *first[RV], *last[RV], *smask[RV];   /* smask: per chunk the volcomp substreams any block reads */
+    int alias[RV];   /* volume v the same array as an earlier volume alias[v] (-1: none): its chunks are that volume's, decoded once */
     int ns; const float *const *Xs, *const *Ys, *const *Zs; int w, h; double gs; uint8_t *const *img; int ow, oh;   /* grid s, volume v: img[s nv + v] */
     const render_fill *F;                                 /* --fill or nullptr */
     rblock *b; int32_t (*blo)[RV][3], (*bhi)[RV][3]; uint32_t *bgrp; size_t nb; uint32_t ng;
@@ -331,7 +332,7 @@ static void wr_vols(const wrend *R, rc_vol *V) {   /* the chunk tables as render
     for (int v = 0; v < R->nv; v++) {
         const ctab *T = &R->T[v]; V[v].sh = T->sh;
         for (int d = 0; d < 3; d++) { V[v].c0[d] = T->c0[d]; V[v].cn[d] = T->cn[d]; }
-        V[v].ptr = (const uint8_t *const *)T->ptr;
+        V[v].ptr = (const uint8_t *const *)R->T[R->alias[v] >= 0 ? R->alias[v] : v].ptr;
     }
 }
 static void wr_block(const wrend *R, const rblock *B) {   /* render_core.h rc_pixel over the block's pixels, every grid */
@@ -480,14 +481,17 @@ static void wr_gpu_drive(wrend *R, size_t bmax) {
             while (ke < R->nb && ke - k < bmax && R->need[R->bgrp[ke]] <= rp) ke++;
             /* with a launch in flight, a small run waits for more (fewer, larger launches: CUDA calls serialise with the decoders') */
             if (ke > k && !(have && ke - k < WR_MINRUN && ke < R->nb) && !atomic_load(&R->fail)) {
-                const size_t nu = rp - up;
+                int nal = 0; for (int v = 0; v < R->nv; v++) nal += R->alias[v] >= 0;
+                const size_t nu = (rp - up) * (size_t)(1 + nal);   /* (each decoded chunk also under every alias's key) */
                 if (nu > ucap) { ucap = nu + ucap; uint64_t *k2 = realloc(keys, ucap * sizeof *keys); uint8_t **p2 = k2 ? realloc(ptrs, ucap * sizeof *ptrs) : nullptr;
                                  if (k2) keys = k2;
                                  if (p2) ptrs = p2;
                                  if (!k2 || !p2) { pthread_mutex_unlock(&R->mu); atomic_store(&R->fail, 1); break; } }
-                for (size_t e = up; e < rp; e++) { const wdec *D = &R->dl[e]; keys[e - up] = (uint64_t)D->ci | (uint64_t)D->v << 62; ptrs[e - up] = R->dp[D->v][D->ci]; }
+                size_t nk = 0;
+                for (size_t e = up; e < rp; e++) { const wdec *D = &R->dl[e]; keys[nk] = (uint64_t)D->ci | (uint64_t)D->v << 62; ptrs[nk++] = R->dp[D->v][D->ci];
+                    if (nal) for (int v = 0; v < R->nv; v++) if (R->alias[v] == D->v) { keys[nk] = (uint64_t)D->ci | (uint64_t)v << 62; ptrs[nk++] = R->dp[D->v][D->ci]; } }
                 pthread_mutex_unlock(&R->mu);
-                if (rgpu_ptrs(R->G, cur, keys, ptrs, nu) || rgpu_launch(R->G, cur, k, ke, V, R->depth, R->F ? &RF : nullptr, R->gs, R->ow, R->oh)) { WR_DFAIL(); break; }
+                if (rgpu_ptrs(R->G, cur, keys, ptrs, nk) || rgpu_launch(R->G, cur, k, ke, V, R->depth, R->F ? &RF : nullptr, R->gs, R->ow, R->oh)) { WR_DFAIL(); break; }
                 up = rp; launched = 1;
                 { const double t1 = rnow(); R->pt[6] += (uint64_t)((t1 - tp) * 1e6); tp = t1; }
             } else { pthread_mutex_unlock(&R->mu); ke = k; }
@@ -595,6 +599,17 @@ static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *
         int sh = 0; while ((1 << sh) < C) sh++;
         R->T[v].z = vz[v]; R->T[v].sh = sh; for (int d = 0; d < 3; d++) R->T[v].shape[d] = zm->shape[d];
         R->depth[v] = depth[v]; if (depth[v] > dm) dm = depth[v];
+        /* the same array as an earlier volume (the unroll's INKMODE=r3 renders pass the CT as --volume and --ct; UFSM_RENDER_ALIAS=0: off):
+           its chunks decoded and uploaded once, both volumes sampled from them (the same bytes; the pod's 1667 stripe ws000 decoded 37.6k
+           chunks and uploaded 63.5 GB, half of it the second copy) */
+        R->alias[v] = -1;
+        if (!getenv("UFSM_RENDER_ALIAS") || atoi(getenv("UFSM_RENDER_ALIAS")))
+            for (int u = 0; u < v && R->alias[v] < 0; u++) {
+                const z3_meta *um = z3_meta_of(vz[u]);
+                if (vz[u] == vz[v] || (!strcmp(z3_root(vz[u]), z3_root(vz[v])) && !strcmp(z3_key(vz[u]), z3_key(vz[v])) && um->chunk[0] == C && um->esize == zm->esize &&
+                                       um->shape[0] == zm->shape[0] && um->shape[1] == zm->shape[1] && um->shape[2] == zm->shape[2]))
+                    R->alias[v] = R->alias[u] >= 0 ? R->alias[u] : u;
+            }
     }
     R->F = F; if (F) dm += F->n;   /* the search moves every volume's window up to n voxels along the normal */
     {   size_t ab[2] = {0, 0}, nsh[2] = {0, 0}, tot = 0;   /* absent shards read as 0 (ink: "no ink"): their share of the surface, printed */
@@ -664,7 +679,7 @@ static int wr_run(z3 *const *vz, int nv, const int *depth, int ns, const float *
         for (size_t k = 0; k < nb; k++) {
             const uint32_t g = R->bgrp[k];
             for (int v = 0; v < nv; v++) {
-                ctab *T = &R->T[v];
+                ctab *T = &R->T[v]; if (R->alias[v] >= 0) continue;   /* (its blocks' chunk ranges are the aliased volume's: the same shift and reach) */
                 for (int64_t a = R->blo[k][v][0]; a <= R->bhi[k][v][0]; a++) for (int64_t y = R->blo[k][v][1]; y <= R->bhi[k][v][1]; y++) for (int64_t x = R->blo[k][v][2]; x <= R->bhi[k][v][2]; x++) {
                     const size_t ci = (size_t)(((a - T->c0[0]) * T->cn[1] + (y - T->c0[1])) * T->cn[2] + (x - T->c0[2]));
                     if (!R->first[v][ci]) {

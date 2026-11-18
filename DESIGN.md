@@ -6,6 +6,29 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## render decodes one array once when it is several volumes: the r3 renders' CT x2 -> x1 (same bytes; 2026-11-17, branch rdup-20261117)
+
+Under INKMODE=r3 the unroll's renders pass the CT as both --volume and --ct (the volume's render is replaced by r3ink.sh), so every stripe
+and per-wrap render decoded and uploaded each CT chunk twice (the pod's 1667 stripe ws000: 37.6k chunks, 63.5 GB uploaded, half of it
+the second copy). render's chunk-ordered path now aliases a volume to an earlier one when they are the same array (same z3 handle, or same
+root + key + chunk + shape + element size): the alias takes no decode-list entries and its chunk table is the earlier volume's (CPU), its
+device pointer keys the same slots (GPU). Block chunk ranges are already the same for all volumes (the reach is the max depth + fill
+reach), so lifetimes and frees are unchanged. UFSM_RENDER_ALIAS=0 restores per-volume decoding.
+
+PHerc1667 w035 (the whole try9-6250 wrap, 33.3k blocks, the unroll's r3 flags: --depth 1 --scale 1 FILLX, local CT level 2, card 1
+shared, pool 2.5 GB, 4 threads), arms interleaved, decode mode pinned:
+
+| decode | arm | wall | user | chunks | uploads |
+|---|---|---|---|---|---|
+| GPU (UFSM_GPU_DECODE=1) | per volume | 2.09, 2.07 s | 6.9 s | 7048 | 0 |
+| GPU | alias | 2.09, 1.48 s | 5.7 s | 3524 | 0 |
+| host (=0) | per volume | 9.18, 11.35 s | 38-46 s | 7048 | 9.72 GB |
+| host | alias | 5.37, 5.66 s | 23 s | 3524 | 4.86 GB |
+
+w035.tif / _ct.tif / _fill.tif byte-identical over all 12 runs (alias on/off, GPU/host decode). The first, unpinned pair mixed the modes:
+render enables GPU decode by itself only above ~3 GB of free device memory (render.c), which card 1 crossed between runs, so an unpinned
+A/B on a shared card measures the switch, not the change. Test: test_render_gate (CPU and GPU) renders the CT as volume, CT and a gate
+with alias on and off: equal bytes, and on the GPU a third of the chunks.
 ## The fused fine stem: fields predict's fstem_fwd_k 46.7 -> 24.2 ms a window, same bytes (2026-11-17, branch convkfs-20261117)
 
 After the fused up + stem became the fields default (6a5933f1), fstem_fwd_k<true> took 47 of 122 ms of kernels a window (PHerc0332, 640

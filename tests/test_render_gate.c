@@ -3,7 +3,8 @@
    binary (argv[1]): render --gate G1 --gate G2 must equal, byte for byte, the three separate renders (ink + CT, G1 + CT, G2 + CT, the
    same fill flags) combined by ufsm img-gate, which is the numpy float32 step strip_refill.sh used (test_img_gate.py); the CT render
    and the fill flags are those of the ungated render. argv[2] = "gpu": the gated render also on the GPU path (render --gpu 1), equal to
-   the CPU's. --gate without --fill is refused. */
+   the CPU's. --gate without --fill is refused. One array given as volume, CT and gate is decoded once (render's alias, 2026-11-17)
+   with the same bytes as per volume (UFSM_RENDER_ALIAS=0). */
 #include "imgops.h"
 #include "tiffw.h"
 #include "z3w.h"
@@ -83,6 +84,30 @@ int main(int argc, char **argv) {
         fprintf(stderr, "test_render_gate: %s: %zu pixels, %zu gated (%zu changed), %zu filled, %zu inpainted: equal\n", m ? "GPU" : "CPU", no, nz, ng, nfill, ninp);
         if (m) { snprintf(p, sizeof p, "grep -q 'render gpu' '%s/c.log'", dir); CHECK(system(p) != 0, "the GPU render fell back to the CPU (see %s/c.log)", dir); }
         free(ref); free(a); free(g1); free(act); free(afl); free(bi); free(bc); free(bf);
+    }
+    /* the same array as --volume, --ct and a --gate (the unroll's INKMODE=r3 renders: the CT twice): its chunks decoded once and shared
+       (2026-11-17), the same bytes as decoding it per volume (UFSM_RENDER_ALIAS=0), on the CPU and (gpu) the GPU */
+    for (int m = 0; m < 1 + gpu; m++) {
+        uint8_t *im[2][3] = {{0}};
+        for (int al = 0; al < 2; al++) {
+            snprintf(cmd, sizeof cmd, "mkdir -p '%s/al%d%d' && UFSM_RENDER_ALIAS=%d '%s' render '%s/wraps' '%s/al%d%d' --volume '%s' ct.zarr/0 --ct '%s' ct.zarr/0 --gate '%s' ct.zarr/0 --scale %g %s --gpu %d 2> '%s/al%d%d.log'",
+                     dir, m, al, al, argv[1], dir, dir, m, al, dir, dir, dir, gs, FX, m, dir, m, al);
+            CHECK(!system(cmd), "render, the CT as every volume (%s, alias %d) failed", m ? "GPU" : "CPU", al);
+            snprintf(p, sizeof p, "%s/al%d%d", dir, m, al);
+            im[al][0] = rd(p, "w000.tif", ow, oh); im[al][1] = rd(p, "w000_ct.tif", ow, oh); im[al][2] = rd(p, "w000_fill.tif", ow, oh);
+        }
+        size_t nzv = 0; for (size_t i = 0; im[1][0] && i < no; i++) nzv += im[1][0][i] != 0;
+        const size_t a0 = ndiff(im[0][0], im[1][0], no), a1 = ndiff(im[0][1], im[1][1], no), a2 = ndiff(im[0][2], im[1][2], no);
+        CHECK(nzv > no / 4 && !a0 && !a1 && !a2, "%s: one array as volume / CT / gate decoded once: volume %zu, CT %zu, fill flags %zu of %zu pixels differ from per-volume decoding (%zu nonzero)",
+              m ? "GPU" : "CPU", a0, a1, a2, no, nzv);
+        if (m) {   /* the GPU path's chunk count: one copy instead of three */
+            long n[2] = {0, 0};
+            for (int al = 0; al < 2; al++) { snprintf(p, sizeof p, "%s/al1%d.log", dir, al); FILE *f = fopen(p, "r"); char ln[600];
+                while (f && fgets(ln, sizeof ln, f)) { const char *q = strstr(ln, "chunk rows, "); if (q) n[al] = atol(q + 12); } if (f) fclose(f); }
+            CHECK(n[0] > 0 && n[1] * 3 == n[0], "GPU: %ld chunks decoded with the volumes aliased, %ld without (expected a third)", n[1], n[0]);
+        }
+        fprintf(stderr, "test_render_gate: %s: one array as volume, CT and gate: decoded once, equal\n", m ? "GPU" : "CPU");
+        for (int al = 0; al < 2; al++) for (int k = 0; k < 3; k++) free(im[al][k]);
     }
     snprintf(cmd, sizeof cmd, "'%s' render '%s/wraps' '%s/b' --volume '%s' ink.zarr/0 --ct '%s' ct.zarr/0 --gate '%s' g1.zarr/0 --gpu 0 2> /dev/null", argv[1], dir, dir, dir, dir, dir);
     CHECK(system(cmd) != 0, "--gate without --fill accepted");
