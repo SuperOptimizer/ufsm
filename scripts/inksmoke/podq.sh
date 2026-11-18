@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # scripts/inksmoke/podq.sh: the latent-ink smoke on a rented pod, unattended and restartable (2026-11-18; user: smoke test only, ~10.5 h).
 # Runs from K (/root/ink); every stage leaves K/state/<stage>.done and is skipped once done. Stages:
-#   setup   ufsm COMMIT cloned into K/ufsm, microc into K/mcc (not the shared ~/.local/mcc), build/ufsm + build-verify/test_unet
+#   setup   ufsm COMMIT cloned into K/ufsm, microc at the pin in ~/.local/mcc (a no-op when it is there: an install into another prefix
+#           failed on pod B, stddef.h not found), build/ufsm + build-verify/test_unet
 #           (-j BJ under /root/build.lock), mcudahw JIT cache warmed (CPU)
 #   narrow  test_unet~narrow (the RTX PRO fault class, fixed ab60f6ba) under GPU lock + timeout
 #   gt      the human ink GT from the public buckets (gtfetch.sh K/kit/gt.tsv: size + md5 checked) -> K/inkgt (the kit's segs-*.json,
@@ -22,7 +23,7 @@ say() { echo "$(date -u '+%F %T') podq: $*" | tee -a $L; echo "$*" > $K/status; 
 die() { say "FAILED: $*"; touch $S/FAILED; exit 1; }
 done_() { [ -e $S/$1.done ]; }; mark() { touch $S/$1.done; say "$1 done"; }
 rm -f $S/FAILED; say "start (commit $COMMIT)"
-U=$K/ufsm/build/ufsm; D=$K/ufsm/scripts/inksmoke; export MCC_HOME=$K/mcc
+U=$K/ufsm/build/ufsm; D=$K/ufsm/scripts/inksmoke; export MCC_HOME=$HOME/.local/mcc
 # --- gt: in the background from the start (network + CPU only) ---
 if ! done_ gt; then ( bash $K/kit/gtfetch.sh $K/kit/gt.tsv $K/inkgt > $K/gt.log 2>&1 && touch $S/gt.done ) & GTPID=$!; else GTPID=; fi
 # --- setup ---
@@ -30,7 +31,7 @@ if ! done_ setup; then
   say "setup: clone + build $COMMIT"
   [ -d $K/ufsm/.git ] || git clone -q https://github.com/SuperOptimizer/ufsm $K/ufsm || die "clone"
   git -C $K/ufsm fetch -q origin && git -C $K/ufsm checkout -q --detach $COMMIT || die "checkout $COMMIT"
-  bash $K/ufsm/scripts/toolchain/install_mcc.sh $K/mcc > $K/mcc.log 2>&1 || die "install_mcc (log $K/mcc.log)"
+  bash $K/ufsm/scripts/toolchain/install_mcc.sh > $K/mcc.log 2>&1 || die "install_mcc (log $K/mcc.log)"
   ( cd $K/ufsm && flock /root/build.lock bash -c "cmake --preset release && nice -n 5 cmake --build build -j $BJ --target ufsm && cmake --preset verify && nice -n 5 cmake --build build-verify -j $BJ --target test_unet" ) > $K/build.log 2>&1 \
     || die "build (log $K/build.log)"
   CUDA_VISIBLE_DEVICES=$GPU JITLOG=$K/jit.log bash $K/ufsm/scripts/toolchain/jit_warm.sh $U $BJ >> $L 2>&1
