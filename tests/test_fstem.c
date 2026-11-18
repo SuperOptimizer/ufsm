@@ -30,14 +30,14 @@ static double ref(const uint16_t *x, const double *p, const uint16_t *G, double 
     }
     return L;
 }
-static int up_check(int lh) {   /* lh 1: fp16 cell logits; 0: fp32 (predict's fit path: nn_fstem_up_fwd_t) */
+static int up_check(int lh, int zeros) {   /* lh 1: fp16 cell logits; 0: fp32 (predict's fit path: nn_fstem_up_fwd_t); zeros: most cells +-0 (signed-zero sums) */
     enum { UD = 12, UH = 8, UW = 264, UC = 9, BASE = 9, LC = BASE + 128 };
     const int d = UD / 4, h = UH / 4, w = UW / 4; const size_t V = (size_t)UD * UH * UW, cpl = (size_t)h * w, NP = C * T + C + NO * C;
     uint64_t s = 11; int fails = 0;
     const size_t eb = lh ? 2 : 4;   /* bytes a cell logit */
     uint16_t *x = malloc(V * 2); unsigned char *lc = malloc((size_t)LC * d * cpl * eb); float *pf = malloc(NP * 4);
     for (size_t i = 0; i < V; i++) x[i] = f2h((float)(2 * rnd(&s)));
-    for (size_t i = 0; i < (size_t)LC * d * cpl; i++) { const float v = (float)(4 * rnd(&s)); if (lh) ((uint16_t *)lc)[i] = f2h(v); else ((float *)lc)[i] = v; }   /* (fp32: not fp16-representable) */
+    for (size_t i = 0; i < (size_t)LC * d * cpl; i++) { float v = (float)(4 * rnd(&s)); if (zeros && v < 3.f) v = v < 0.f ? -0.f : 0.f; if (lh) ((uint16_t *)lc)[i] = f2h(v); else ((float *)lc)[i] = v; }   /* (fp32: not fp16-representable) */
     for (size_t i = 0; i < NP; i++) pf[i] = (float)(0.4 * rnd(&s));
     void *xd = nn_malloc(V * 2); float *pd = nn_malloc(NP * 4); nn_h2d(xd, x, V * 2); nn_h2d(pd, pf, NP * 4);
     const int sl[3][2] = {{0, 4}, {4, 4}, {8, 4}};
@@ -143,6 +143,6 @@ int main(void) {
     if (nn_fstem_fwd(xd, D, H, W, 1, 4, pd, C, NO, chs, ld, 4 * H * W) != 1) { fprintf(stderr, "FAIL: odd z0 accepted\n"); fails++; }
     fails += tiny_check(x, xd);
     if (fails) return 1;
-    if (up_check(1) || up_check(0)) return 1;
+    if (up_check(1, 0) || up_check(0, 0) || up_check(1, 1) || up_check(0, 1)) return 1;
     printf("test_fstem: ok\n"); return 0;
 }

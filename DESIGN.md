@@ -630,6 +630,36 @@ Parity (test_ink_ext_inksdk_koine, our torch koine reference, 384 px tiles): max
 argus2 vs ink9um: +0.0072 [-0.0027, +0.0161]. It gains on 0139 (one of its training scrolls) and loses 0.02 on 1667. The
 card's +1 AUC point from the -2/0/+2 depth windows does not show here. Argus V2 is available as a teacher but does not join the combo.
 
+## fstem fused forward: a divergent branch per lane, the cell type as a template (byte-identical; 2026-11-17, branch fsupreg-20261117)
+
+- **Why look:** fp4teach wired nn_fstem_up_fwd_t into predict's fields path. It was slower there: 54.4 ms + an 8.7 ms 7-channel
+  lat_up4 against 59.8 ms for stem + up + shuffle. fp4teach suspected registers (95 a thread, ~5 blocks an SM).
+- **Launch bounds were not it.** ncu durations are stable to 0.01 ms even with card 1 shared; P 640 slab 64, 4 outputs / P 768
+  slab 16, 11 outputs:
+
+| launch bound | registers | ms |
+|---|---|---|
+| (128, 1) | 95 | 3.06 / 1.70 |
+| (128, 6) | 80 | 3.68 / 1.72 |
+| (128, 8) | 64 | 3.90 / 1.83 |
+
+  Achieved occupancy stayed at 33-47 %.
+- **Two other ideas made it slower.** Prefetching the side pair's 16 sub-cell loads went to 123 registers and 3.44 ms. Batching 3
+  qs items a thread went to 3.52 ms.
+- **What ncu showed instead:** the fused kernel executed 491 M instructions against the plain kernel's 307 M.
+- **Two byte-identical fixes:**
+  1. fsu_row chose fsu_x<2> or fsu_x<0> by bx & 1. Odd and even lanes of a warp then ran both paths one after the other. Now the
+     weights row is picked by index (FLW[2 (bx & 1) + dx]), with the same expression.
+  2. The cell type is a template parameter (LT = f16 / float) instead of a runtime branch per load, and the cell-row offsets are
+     32-bit, computed once a block. nn_fstem_up_fwd_t refuses qd h w >= 2^31.
+- **Result:** 491 -> 433 M instructions, 95 -> 78 registers, ncu 3.06 -> 2.46 ms at P 640 / 4 outputs and 1.70 -> 1.40 ms at
+  P 768 / 11 outputs, the training head-slab shape.
+- **Checks:**
+  - bench hashes equal at P 384, P 640 and P 768.
+  - test_fstem gained cases where most cells are +-0, covering signed-zero sums. All 24 fused cases (fp16 / fp32 cells x
+    random / zeros x 3 slabs x stem on / off) match the up-slab + shuffle + stem chain in all 59136 logits.
+- **Expected for predict's fields path:** 54.4 x 0.8 + 8.7 ≈ 52 ms against 59.8 ms.
+
 ## fstem forward for predict's shapes: occupancy, not bandwidth (byte-identical; 2026-11-17, branch fstempred-20261117)
 
 - **Why look:** the fields predict spends ~30 % of its kernel time in fstem_fwd_k: convk's profile, u1 13000, window 640, about
