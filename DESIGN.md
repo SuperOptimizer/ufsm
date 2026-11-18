@@ -6,6 +6,50 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Paired A/B/C from try9 8690: 1667 pseudo labels and DINO/ssl both null; the cooldown alone null too (2026-11-17/18, pseudolab)
+
+The question: do fit-derived pseudo labels (section "Fit-derived pseudo labels", 2026-11-17) or the unlabelled DINO/ssl trunk term
+(section "Self-supervision for the latent net") help try9? A control-paired test, run while try9 was held (s2ctl hold 11-17 16:24 ->
+11-18 04:02, ~11.6 h; scripts/pseudo/ab_chain.sh + ab_arm.sh).
+
+- Base: try9's last.ckpt at the stop, step 8690 (pab-base.ckpt). Each arm resumes it for 2000 steps (--steps 10690) on card 0 with try9's
+  argv and binary pinned from scratch2.resume.log (ufsm.scratch2.fd615b6f, CPU CT decode), try9's full sampler (12 slots / 10 workers /
+  3 onfly slots), --det 1, --echo-max 0 (echo reuse depends on sampler timing), env MALLOC_ARENA_MAX 4, UFSM_HEAD_SLAB_Z 16,
+  UFSM_HOSTMEM 1, UFSM_SAMPLER_THP 0. --det check first: 2 x 20 steps, step lines byte-identical up to " qk ".
+- A (control): sources-scratch1-ph80-ho.json. B: A's weights x0.85 + PHerc1667-pseudo 0.15 (the dm1 refit, dir -1: tile gate 0.703
+  material-weighted, 29 of 79 wraps, 6878 mm3 of labels, gt-gate keeps 0.076, outward 0.9998; wbench C1-C70 +64 at weight 0 and the
+  11-14 holdouts + C25-C70 (holdouts-20261118) masked, guard 32; 0332 excluded). C: A + the 35 unlabelled ct_only scans
+  (ssl-sources.sh, HOLD=holdouts-20261118), --ssl 16 --ssl-share 0.25, trunk term only. MEM_DRY at P 768: A 11.25 GB, C 11.40 GB.
+- Schedule note: the WSD cooldown is 0.2 of the whole run, so with --steps 10690 it starts at 8552 and every arm decays ~2.8e-4 -> 0
+  over its 2000 steps. Arm - base differences therefore include the cooldown; only B-A and C-A are treatment effects.
+- Scoring: wbench, fd615b6f predict, cube windows (WZARGS=), --gn-live 1 (try9 never trains on its running GN stats); step 2000
+  (primary) and 1560 (ring 10250; 1500 is no snapshot step). Paired box bootstrap, 95 % CI. Clean sets: HOLD and the 11-14 holdouts
+  (45 boxes); core reported with 1667 split out (in-sample for try9 and u1). Results: wbench/res/pab-{base,A,B,C}-*.tsv, the stats
+  /vesuvius/ufsm/pseudolab/pseudo/abstats.py.
+
+ids0, treatment - control:
+
+| | HOLD (A -> X) | holdouts 45 | of them 1667 (24) | core Paris4 + 4j (32) | core 1667 (12) |
+|---|---|---|---|---|---|
+| B-A @2000 | 0.8029 -> 0.8026 | -0.012 [-0.035, +0.004] | -0.022 [-0.059, -0.001] | +0.014 [-0.008, +0.039] | -0.001 |
+| B-A @1560 | 0.8028 -> 0.8034 | +0.007 [-0.004, +0.024] | +0.014 [-0.002, +0.044] | +0.005 | -0.001 |
+| C-A @2000 | 0.8029 -> 0.7999 | -0.016 [-0.041, +0.001] | -0.022 [-0.059, +0.000] | +0.001 | -0.003 |
+| C-A @1560 | 0.8028 -> 0.8036 | -0.000 [-0.019, +0.021] | +0.012 [-0.003, +0.042] | -0.001 | -0.002 |
+| A-base (cooldown) | 0.8051 -> 0.8029 | +0.007 [-0.005, +0.023] | +0.010 | +0.009 [-0.013, +0.031] | -0.002 |
+
+- Noise: the 1667-holdout differences flip sign between 1560 and 2000 in both B and C (+0.014 -> -0.022): the arm-to-arm training noise
+  on 24 boxes is ~0.02, as large as any effect. Nothing here clears it: no measurable benefit from the 1667 pseudo labels or from
+  ssl, and the 2000 points lean slightly negative. The cooldown alone (A vs base) buys nothing measurable either.
+- Decision (lead 11-18): the pseudo-label loop does not proceed on this evidence; the SSL arm is dropped from try9's plans. 0332
+  stays out (fix0332's CT-peaks-per-turn gate failed 1667 GT, section "rhocal").
+- Reference, same scoring: base vs u1 13790 (fd615b6f predict, u1's native per-window GN = try9 under --gn-live 1): HOLD 0.8051 vs
+  0.8093; holdouts 0.6223 vs 0.6331 (-0.011 [-0.025, +0.001]; 1667 -0.016 [-0.039, -0.001]); core Paris4 -0.009. The wbench predict
+  binary alone moves u1's rows (10-25 pin vs fd615b6f: HOLD 0.8133 vs 0.8093, core Paris4 +0.012 [+0.001, +0.025]): rows from
+  different predict binaries are not comparable at the 0.01 level.
+- Tooling from the run: ab_arm.sh's NAME.next appends an arm to a running chain; ssl-sources.sh no longer writes a holdout_file on a
+  CT with no HOLD box (holdout_strict made those fatal); build.sh's phase-coh needs --weight under --coh 0; wbench.sh takes the desk's
+  shared GPU locks (suite gpuN.excl, then opt/gpuN.lock, physical card via CUDA_VISIBLE_DEVICES; test_wbench_gpulock).
+
 ## rhocal (label-free count calibration from CT peaks): rejected by 1667 GT; the CT peak count is no counting reference (2026-11-18, branch rhocal-20261117)
 
 Idea (lead / user 11-17: a per-scroll auto-calibration for the corpus, 0332 the test bed): wrap-check counts CT papyrus peaks per fitted
