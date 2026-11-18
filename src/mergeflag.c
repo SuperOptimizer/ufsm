@@ -545,6 +545,11 @@ static int cmd_merge_flag_eval(int argc, char **argv, const char *list) {
             printf("gap-report %-10s %3d boxes, %9zu intervals: flagged (mf >= thr) %.3f | gap < %g um %.3f: P %.3f R %.3f | phase-merged %.3f: P %.3f R %.3f\n",
                    seen[k], bx, n, n ? (double)fl / n : 0, G, n ? (double)sm / n : 0, fl ? (double)tps / fl : 0, sm ? (double)tps / sm : 0,
                    n ? (double)mg / n : 0, fl ? (double)tpm / fl : 0, mg ? (double)tpm / mg : 0);
+            const double ge[5] = {0, 50, 100, 200, 1e30}; printf("gap-report %-10s phase-merged by GT gap:", seen[k]);
+            for (int q = 0; q < 4; q++) { size_t nq = 0, mq = 0;
+                for (int b = 0; b < nb; b++) if (!strcmp(B[b].scroll, seen[k])) for (size_t i = 0; i < B[b].n; i++) { const ev_iv *v = &B[b].iv[i];
+                    if (v->gap >= ge[q] && v->gap < ge[q + 1]) { nq++; mq += v->y; } }
+                printf(" [%g,%g) um %.3f of %.3f%s", ge[q], q < 3 ? ge[q + 1] : INFINITY, nq ? (double)mq / nq : 0, n ? (double)nq / n : 0, q < 3 ? ";" : "\n"); }
         }
         for (int b = 0; b < nb; b++) free(B[b].iv);
         free(B); return nok == nb ? 0 : 1;
