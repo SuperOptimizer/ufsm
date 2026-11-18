@@ -127,7 +127,18 @@ FNAME=$([ "$FKIND" = lat ] && echo lat || echo wind96)
 F=$O/fields/$FNAME; REF=$O/ref-cf; INK=$O/ink/$INKNAME.zarr
 # the renders' --volume: the ink volume, or with INKMODE=r3 the CT itself (its render is replaced by r3ink.sh); r3ink.sh's settings exported
 if [ "$INKMODE" = r3 ]; then VROOT=$R; VKEY=$K/$LV; else VROOT=$INK; VKEY=$LUM; fi
-[ "$INKMODE" = r3 ] && export U R3CTR=$R R3CTK=$K R3W R3GATE=${R3GATE:-${FILLCT:-80}} R3TH=${R3TH:-8} R3X="--ct-um $UM ${R3X:-}"
+[ "$INKMODE" = r3 ] && export U R3CTR=$R R3CTK=$K R3W R3MODEL=${R3MODEL:-reader3} R3GATE=${R3GATE:-${FILLCT:-80}} R3TH=${R3TH:-8} R3X="--ct-um $UM ${R3X:-}"
+# r3pre OUT GPU SURF..: ONE ink-ext over every surface that has no map in OUT yet (decoded chunks resident across surfaces, --ct-mem LRU;
+# the fetched ones in the run's shared --cache $O/ink/ct.cache: neighbouring 1667 wraps share ~83 % of their chunks, a cold wrap was 46 of 50 s
+# CT fetch, warm 12 s, unrollperf 11-17); r3ink.sh then takes OUT/<name>_<model>.tif (R3PRE). GPU "": the run's device.
+r3pre() {
+  local out=$1 g=$2 a=() x; shift 2
+  for x in "$@"; do [ -s $x/meta.json ] && [ ! -s $out/$(basename $x)_$R3MODEL.tif ] && a+=(--surface $x); done
+  [ ${#a[@]} = 0 ] && return 0; mkdir -p $out $O/ink
+  ${g:+env CUDA_VISIBLE_DEVICES=$g} nice -n 10 $U ink-ext --model $R3MODEL --weights $R3W "${a[@]}" --ct $R $K --out $out --threads $R3TH \
+    --cache $O/ink/ct.cache $R3X >> $O/logs/r3ink.log 2>&1 || { log "r3pre: ink-ext failed ($O/logs/r3ink.log)"; return 1; }
+  log "r3pre: $(( ${#a[@]} / 2 )) surfaces -> $out: $(grep -oE '[0-9.]+ tiles/s' $O/logs/r3ink.log | tail -1)"
+}
 
 # the run's own copy of the scripts (bash reads scripts incrementally: editing the repo must not change a running driver)
 if [ "$DRY" != 1 ] && [ "${UNROLL_COPY:-0}" != 1 ]; then
@@ -789,6 +800,7 @@ stripimg() {
   local E="UFSM_ZCACHE_GB=$ZCACHE_GB UFSM_ZCACHE_ADMIT=${ZCACHE_ADMIT:-0.6} UFSM_JPEG_THREADS=$JPEGT UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} UFSM_RENDER_MEM=${UFSM_RENDER_MEM:-16} ${RGPU:+CUDA_VISIBLE_DEVICES=$RGPU}"
   if [ "$DRY" = 1 ]; then echo "    $E: stretch from the 3 middle stripes (render $FILLX + strip-mosaic --stretch-only), then U=$U CTR=$R CTK=$K/$LV INK=$VROOT INKK=$VKEY PAPMOS=$ST/img_pap bash scripts/strip/strip_refill.sh $ST$([ "$INKMODE" = r3 ] && echo " (R3INK: each stripe's ink by r3ink.sh: $R3W, gate CT >= $R3GATE, $R3X)")"; return 0; fi
   mkdir -p $RF $ST/fillmap $ST/logs; S=($(ls $ST/strip/flat/stripes)); N=${#S[@]}; [ $N -gt 0 ] || return 1
+  if [ "$INKMODE" = r3 ]; then r3pre $O/ink/r3/strip "${RGPU:-}" $ST/strip/flat/stripes/* || return 1; export R3PRE=$O/ink/r3/strip; fi
   if [ ! -s $ST/stretch.txt ]; then
     # the 3 middle stripes' renders at once (SJOBS, default by memory: a Paris 4 stripe render peaks at ~21 GB RSS and 4 GB of device
     # pool; one after another they were 3 x 28 s of 84 s, on 1667 26 + 15 + 10 s; each render is independent: the same images)
@@ -828,14 +840,19 @@ pw_one() {   # pw_one WRAP GPU (a background subshell: the cache env stays in it
   nice -n 10 $U tifxyz-scale $O/flat $O/up 1 --wraps $w --flip-rows 1 > /dev/null 2>&1 || return 1
   mkdir -p $d/in; ln -sfn $O/up/$w $d/in/$w
   UFSM_RENDER_MEM=16 UFSM_RENDER_CHUNKED=1 UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} CUDA_VISIBLE_DEVICES=$gpu nice -n 10 $U render $d/in $d --volume $VROOT $VKEY --ct $R $K/$LV --depth 1 --scale 1 --threads ${RTH:-8} > $d/render.log 2>&1 || return 1
-  if [ "$INKMODE" = r3 ]; then R3GPU=$gpu bash $H/r3ink.sh $O/up/$w $d/$w.tif $d/${w}_ct.tif >> $d/render.log 2>&1 || return 1; fi
+  [ "$INKMODE" = r3 ] && { touch $d/.rendered; return 0; }   # (r3: pw_fin after the one ink-ext over all wraps, perwrap)
+  pw_fin $w
+}
+pw_fin() {   # pw_fin WRAP: (r3) the wrap's ink from r3pre, CT-gated; the side-by-side image + preview; the renders removed
+  local w=$1 d=$O/r/$1
+  if [ "$INKMODE" = r3 ]; then R3PRE=$O/ink/r3/up bash $H/r3ink.sh $O/up/$w $d/$w.tif $d/${w}_ct.tif >> $d/render.log 2>&1 || return 1; fi
   nice -n 10 $U ink-compare $O/img/${w}_full_side.jpg --ct $d/${w}_ct.tif --ink "$INKNAME=$d/$w.tif" --px-um $LUM --stretch --stretch-ct --max-px 65000 --threads ${RTH:-8} \
     --then $O/prev/${w}_side.jpg --max-px 8000 > $d/stats.txt 2>&1 || return 1   # (its status is the job's: audit mini/shell #4)
-  [ -e $O/img/${w}_full_side.jpg ] && rm -f $d/$w.tif $d/${w}_ct.tif
-  echo "$(date '+%F %T') $w $(grep -E '^[^ ]+: input' $L.flat.log | head -1 | grep -oE '= [0-9.]+ cm2')" >> $O/logs/perwrap.list
+  [ -e $O/img/${w}_full_side.jpg ] && rm -f $d/$w.tif $d/${w}_ct.tif $d/.rendered
+  echo "$(date '+%F %T') $w $(grep -E '^[^ ]+: input' $O/logs/pw/$w.flat.log 2>/dev/null | head -1 | grep -oE '= [0-9.]+ cm2')" >> $O/logs/perwrap.list
 }
 perwrap() {
-  [ "$DRY" = 1 ] && { echo "    per wrap (largest first, SPAR ${SPAR:-4}, GPUs of FITGPUS in turn): tifxyz-scale -> flatten --gpu 1 -> tifxyz-scale --flip-rows 1 -> render (ink + CT)$([ "$INKMODE" = r3 ] && echo " -> r3ink.sh (the ink: $R3W, gate CT >= $R3GATE)") -> ink-compare --then"; return 0; }
+  [ "$DRY" = 1 ] && { echo "    per wrap (largest first, SPAR ${SPAR:-4}, GPUs of FITGPUS in turn): tifxyz-scale -> flatten --gpu 1 -> tifxyz-scale --flip-rows 1 -> render (ink + CT)$([ "$INKMODE" = r3 ] && echo "; then ONE ink-ext over all rendered wraps (r3pre, --cache $O/ink/ct.cache: $R3W) -> per wrap r3ink.sh (CT >= $R3GATE gate)") -> ink-compare --then"; return 0; }
   mkdir -p $O/orig $O/flat $O/up $O/r $O/img $O/prev $O/logs/pw
   local w k=0 nf=0 p pg=($FITGPUS) WD=$(wrapsdir); local -A pid
   for w in $(for f in $WD/w*.sfc; do w=$(basename $f .sfc); [ -e $O/img/${w}_full_side.jpg ] || echo "$(stat -c %s $f) $w"; done | sort -rn | awk '{print $2}'); do
@@ -844,6 +861,13 @@ perwrap() {
     pw_one $w ${pg[$((k % ${#pg[@]}))]} & pid[$w]=$!; k=$((k + 1))
   done
   for w in "${!pid[@]}"; do wait ${pid[$w]} || { nf=$((nf + 1)); echo "perwrap: $w FAILED (logs $O/logs/pw/$w.*, $O/r/$w/render.log)" >> $O/logs/perwrap.log; }; done   # (each job's rc, audit 11-14 #12)
+  if [ "$INKMODE" = r3 ]; then   # the rendered wraps' ink in ONE ink-ext (r3pre, first GPU of FITGPUS), then the images in parallel
+    local rw=(); for p in $O/r/*/.rendered; do [ -e "$p" ] && rw+=($O/up/$(basename $(dirname $p))); done
+    if [ ${#rw[@]} -gt 0 ]; then r3pre $O/ink/r3/up ${pg[0]} "${rw[@]}" || return 1
+      unset pid; local -A pid; for p in "${rw[@]}"; do w=$(basename $p); while [ $(jobs -r | wc -l) -ge ${SPAR:-4} ]; do sleep 2; done
+        pw_fin $w & pid[$w]=$!; done
+      for w in "${!pid[@]}"; do wait ${pid[$w]} || { nf=$((nf + 1)); echo "perwrap: $w image FAILED ($O/r/$w/render.log)" >> $O/logs/perwrap.log; }; done; fi
+  fi
   echo "perwrap: $(ls $O/img/*_full_side.jpg 2>/dev/null | wc -l) wraps rendered from $WD, $nf of $k failed" >> $O/logs/perwrap.log
   [ $nf = 0 ] && ! stopped   # (a STOP leaves wraps unrendered: no perwrap.done, the rerun renders them)
 }

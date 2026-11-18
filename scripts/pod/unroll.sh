@@ -43,10 +43,15 @@ export INKW=${INKW:-576}   # ink window: auto took 1600^3 / 90 GB on a free card
 # ink: the latent universal ink head (user 11-13: no more ift3), inkB recipe: scripts/pod/latink.sh (2-grid predict --heads ink,c12,c13 + ink-blend);
 # the stripe renders gate the ink by max(p_recto, p_verso) (strip_refill.sh INKGATE)
 # the ink checkpoint: the newest inkpod snap (15000, as the desk driver; podunroll 11-17: this wrapper still named 9000), uploaded as $POD/ckpt/inkpod-15000.ckpt
+# since 2026-11-17 the production ink is reader3 (INKMODE=r3, unroll.sh / r3ink.sh; setup.sh fetches reader-v3 to $POD/ckpt); INKMODE=lat: latink
+export INKMODE=${INKMODE:-r3}
+if [ "$INKMODE" = r3 ]; then export R3W=${R3W:-$POD/ckpt/reader-v3.pth}
+else
 export LATINK_CK=${LATINK_CK:-$POD/ckpt/inkpod-15000.ckpt}
 export INKCMD=${INKCMD-${UNROLL_REPO:-$POD/ufsm}/scripts/pod/latink.sh} INKNAME=${INKNAME:-inkpod-$(basename $LATINK_CK .ckpt | sed 's/^inkpod-//')} INKGATE="${UR:-$POD/unroll}/$S${TAG:-}/ink/c12.zarr ${UR:-$POD/unroll}/$S${TAG:-}/ink/c13.zarr"
+fi
 # a published ink (setup.sh fetched it): use it instead of predicting one
-if [ -n "${INKPUB:-}" ] && [ -z "${INKCMD:-}" ]; then export INKCMD="$B/inkpub.sh"
+if [ -n "${INKPUB:-}" ] && [ -z "${INKCMD:-}" ] && [ "$INKMODE" != r3 ]; then export INKCMD="$B/inkpub.sh"
   printf '#!/bin/sh\n# INKCMD O GPU OUT: the published ink (setup.sh) linked in; a missing one fails loudly (no dangling link)\n[ -e %s/zarr.json ] || { echo "inkpub: %s has no zarr.json" >&2; exit 1; }\nmkdir -p "$(dirname "$3")" && ln -sfn %s "$3"\n' "$INKPUB" "$INKPUB" "$INKPUB" > $B/inkpub.sh; chmod +x $B/inkpub.sh; fi
 mkdir -p $UR
 echo "$(date '+%F %T') pod/unroll $S: $NC CPUs, $LIM GB, TH $TH CFMEM $CFMEM MINMEM $MINMEM, CT $R/$K level $LV, box $BOX, axis $AXS, U $U" | tee -a $UR/pod-$S.log

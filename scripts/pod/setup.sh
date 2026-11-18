@@ -146,6 +146,10 @@ fetch() {   # fetch URL OUT: resumable, complete when the size matches Content-L
   curl -sfL --retry 5 -C - -o "$2" "$1" || curl -sfL --retry 5 -o "$2" "$1" || return 1
   have=$(stat -c %s "$2"); [ "$want" = 0 ] || [ "$have" = "$want" ] || { echo "fetch: $2 has $have of $want bytes"; return 1; }; }
 for c in wind96-wk1-best; do fetch $BASE/ufsm/checkpoints/$c/$c.ckpt $POD/ckpt/$c.ckpt || die "checkpoint $c"; done   # (ift3 dropped 11-13: the latent ink head, /root/pod/latink.sh)
+# the production ink (unroll INKMODE=r3, 2026-11-17): Reader V3 (MIT) from HuggingFace at the pinned revision, sha256-checked
+R3URL=https://huggingface.co/domenicor046/reader-v3/resolve/aee1d64bced4eb35546348f3d276b9e2a0b99c46/reader-v3.pth
+R3SHA=ea405417450abd8ace1b8ff79ebce3adb646c5e48ab95da46844d77efe984d8a
+[ "$(sha256sum $POD/ckpt/reader-v3.pth 2> /dev/null | cut -d' ' -f1)" = $R3SHA ] || { fetch $R3URL $POD/ckpt/reader-v3.pth && [ "$(sha256sum $POD/ckpt/reader-v3.pth | cut -d' ' -f1)" = $R3SHA ] || die "reader-v3 (sha256)"; }
 say "checkpoints: $(ls -l $POD/ckpt | awk 'NR > 1 {printf "%s %.0f MB  ", $9, $5 / 1e6}')"
 
 # --- 6. the scroll ---
