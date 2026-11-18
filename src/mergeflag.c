@@ -351,7 +351,20 @@ int cmd_merge_flag(int argc, char **argv) {
    the ray between them, signed by d, the box's sign the median's; merged = n < 0.5 (the phase misses the turn). The interval's features
    are the cell at its middle (mf_block over the whole box, borders replicated). */
 enum { EV_NZ = 16, EV_NTH = 720, EV_NF = 3 };
-typedef struct { float f[EV_NF], gap; uint8_t y; } ev_iv;   /* features amp9, r5, sp9; gap (um); y merged */
+typedef struct { float f[EV_NF], gap, cs; uint8_t y; } ev_iv;   /* features amp9, r5, sp9; gap (um, along the ray); cs |cos(ray, sheet normal)|; y merged */
+/* |cos| between the ray (sy, sx) and the GT sheet's in-slice normal at label voxel (ly, lx): the normal = the minor axis of the
+   covariance of the same-code label voxels within radius r (2-D, the slice; sheets' z tilt ignored); -1 when too few voxels */
+static float ev_cos(const uint8_t *g, long long gny, long long gnx, long long ly, long long lx, int r, double sy, double sx) {
+    const uint8_t c = g[(size_t)ly * gnx + lx]; double n = 0, my = 0, mx = 0, yy = 0, xx = 0, xy = 0;
+    for (long long y = ly - r; y <= ly + r; y++) for (long long x = lx - r; x <= lx + r; x++) {
+        if (y < 0 || x < 0 || y >= gny || x >= gnx || (y - ly) * (y - ly) + (x - lx) * (x - lx) > r * r || g[(size_t)y * gnx + x] != c) continue;
+        const double dy = (double)(y - ly), dx = (double)(x - lx); n++; my += dy; mx += dx; yy += dy * dy; xx += dx * dx; xy += dy * dx;
+    }
+    if (n < 2 * r) return -1;
+    my /= n; mx /= n; yy = yy / n - my * my; xx = xx / n - mx * mx; xy = xy / n - my * mx;
+    const double th = 0.5 * atan2(2 * xy, xx - yy);   /* the major axis (tangent) angle in (x, y); normal = (-sin, cos) in (x, y) */
+    const double nx = -sin(th), ny = cos(th); return (float)fabs(nx * sx + ny * sy);
+}
 typedef struct { char name[64], scroll[32], fields[1024], croot[1024], ckey[64]; ev_iv *iv; size_t n, cap; int rc; double merged; } ev_box;
 static void ev_push(ev_box *B, const ev_iv *v) {
     if (B->n == B->cap) { B->cap = B->cap ? 2 * B->cap : 4096; B->iv = realloc(B->iv, B->cap * sizeof *B->iv); if (!B->iv) abort(); }
@@ -383,7 +396,7 @@ static int ev_one(ev_box *B) {
     const long long ny = H * h, nx = W * h, gy0 = (long long)floor(I.origin[1] * gtf), gx0 = (long long)floor(I.origin[2] * gtf);
     const long long gny = (long long)(ny * gtf), gnx = (long long)(nx * gtf);
     uint8_t *g = rc ? nullptr : malloc((size_t)gny * gnx); const size_t na = ax ? ax->n : 0;
-    int *ry = malloc(sizeof(int) * 4 * (ny + nx + 8)), *rx = ry + (ny + nx + 8), *kk = rx + (ny + nx + 8); double *un = malloc(sizeof(double) * (ny + nx + 8) * 2);
+    int *ry = malloc(sizeof(int) * 4 * (ny + nx + 8)), *rx = ry + (ny + nx + 8), *kk = rx + (ny + nx + 8); double *un = malloc(sizeof(double) * (ny + nx + 8) * 2); float *csv = malloc(sizeof(float) * (ny + nx + 8));
     size_t s0 = B->n; double *nn = nullptr; size_t nnn = 0, nnc = 0;
     for (int iz = 0; iz < EV_NZ && !rc; iz++) {
         const int zc = (int)((iz + 0.5) * D / EV_NZ); const long long zn = (long long)zc * h + h / 2;
@@ -413,13 +426,15 @@ static int ev_one(ev_box *B) {
                 if (!q) { i++; continue; }
                 int e = i; for (; e < m; e++) { const long long ey = (long long)(ry[e] * gtf), ex = (long long)(rx[e] * gtf); if (!g[(size_t)(ey < gny ? ey : gny - 1) * gnx + (ex < gnx ? ex : gnx - 1)]) break; }
                 const int k = (i + e - 1) / 2; const long long ky = (long long)(ry[k] * gtf), kx = (long long)(rx[k] * gtf);
+                { const long long cy = ky < gny ? ky : gny - 1, cx = kx < gnx ? kx : gnx - 1; csv[nc] = ev_cos(g, gny, gnx, cy, cx, (int)lrint(8 * gtf), sn, cs); }
                 kk[nc++] = k; un[2 * k + 1] = ((g[(size_t)(ky < gny ? ky : gny - 1) * gnx + (kx < gnx ? kx : gnx - 1)] - 1) / 18) % 14; i = e;
             }
             for (int c = 0; c + 1 < nc; c++) {
                 const int k0 = kk[c], k1 = kk[c + 1]; const int d = (((int)un[2 * k1 + 1] - (int)un[2 * k0 + 1]) % 14 + 14) % 14;
                 if ((d != 1 && d != 13) || k1 - k0 < 2) continue;
                 const int km = (k0 + k1) / 2; const size_t pi = ((size_t)(zc + MF_R) * ph + (size_t)(ry[km] / h + MF_R)) * pw + (size_t)(rx[km] / h + MF_R);
-                ev_iv v = {.f = {fa[0][pi], fa[1][pi], fa[2][pi]}, .gap = (float)((k1 - k0) * I.um)};
+                ev_iv v = {.f = {fa[0][pi], fa[1][pi], fa[2][pi]}, .gap = (float)((k1 - k0) * I.um),
+                           .cs = csv[c] < 0 || csv[c + 1] < 0 ? -1.f : 0.5f * (csv[c] + csv[c + 1])};
                 ev_push(B, &v);
                 if (nnn == nnc) { nnc = nnc ? 2 * nnc : 4096; nn = realloc(nn, nnc * sizeof *nn); }
                 nn[nnn++] = (un[2 * k1] - un[2 * k0]) * (d == 1 ? 1 : -1);
@@ -431,7 +446,7 @@ static int ev_one(ev_box *B) {
         size_t nm = 0; for (size_t i = 0; i < nnn; i++) { B->iv[s0 + i].y = nn[i] * sg < 0.5; nm += B->iv[s0 + i].y; }
         B->merged = (double)nm / nnn;
     }
-    free(nn); free(ry); free(un); free(g); if (cz) z3_close(cz);
+    free(nn); free(ry); free(un); free(csv); free(g); if (cz) z3_close(cz);
     for (int k = 0; k < 4; k++) free(pl[k]);
     for (int k = 0; k < 3; k++) free(fa[k]);
     json_free(I.j); return rc;
@@ -550,6 +565,22 @@ static int cmd_merge_flag_eval(int argc, char **argv, const char *list) {
                 for (int b = 0; b < nb; b++) if (!strcmp(B[b].scroll, seen[k])) for (size_t i = 0; i < B[b].n; i++) { const ev_iv *v = &B[b].iv[i];
                     if (v->gap >= ge[q] && v->gap < ge[q + 1]) { nq++; mq += v->y; } }
                 printf(" [%g,%g) um %.3f of %.3f%s", ge[q], q < 3 ? ge[q + 1] : INFINITY, nq ? (double)mq / nq : 0, n ? (double)nq / n : 0, q < 3 ? ";" : "\n"); }
+            /* along the normal: gap x |cos|; |cos| quantiles; radial >= 200 um misses by normal gap */
+            size_t nc = 0; for (int b = 0; b < nb; b++) if (!strcmp(B[b].scroll, seen[k])) for (size_t i = 0; i < B[b].n; i++) nc += B[b].iv[i].cs >= 0;
+            double *cv = malloc((nc + 1) * sizeof *cv); size_t ci = 0, nb2[4] = {0}, mb2[4] = {0}, rm[3] = {0};
+            const double gn[5] = {0, 50, 100, 150, 1e30};
+            for (int b = 0; b < nb; b++) if (!strcmp(B[b].scroll, seen[k])) for (size_t i = 0; i < B[b].n; i++) { const ev_iv *v = &B[b].iv[i]; if (v->cs < 0) continue;
+                cv[ci++] = v->cs; const double ng = v->gap * v->cs; int q = 0; while (q < 3 && ng >= gn[q + 1]) q++; nb2[q]++; mb2[q] += v->y;
+                if (v->y && v->gap >= 200) rm[ng < 100 ? 0 : ng < 150 ? 1 : 2]++; }
+            qsort(cv, ci, sizeof *cv, ev_cmpd);
+            printf("gap-report %-10s |cos ray,normal| (%zu of %zu with a normal): p10 %.2f p25 %.2f median %.2f p75 %.2f p90 %.2f\n", seen[k], ci, n,
+                   ci ? cv[ci / 10] : 0, ci ? cv[ci / 4] : 0, ci ? cv[ci / 2] : 0, ci ? cv[3 * ci / 4] : 0, ci ? cv[9 * ci / 10] : 0);
+            printf("gap-report %-10s phase-merged by NORMAL gap:", seen[k]);
+            for (int q = 0; q < 4; q++) printf(" [%g,%g) um %.3f of %.3f%s", gn[q], q < 3 ? gn[q + 1] : INFINITY, nb2[q] ? (double)mb2[q] / nb2[q] : 0, ci ? (double)nb2[q] / ci : 0, q < 3 ? ";" : "\n");
+            const size_t rt = rm[0] + rm[1] + rm[2];
+            printf("gap-report %-10s misses with radial gap >= 200 um (%zu): normal gap < 100 um %.3f, 100-150 %.3f, >= 150 %.3f\n", seen[k], rt,
+                   rt ? (double)rm[0] / rt : 0, rt ? (double)rm[1] / rt : 0, rt ? (double)rm[2] / rt : 0);
+            free(cv);
         }
         for (int b = 0; b < nb; b++) free(B[b].iv);
         free(B); return nok == nb ? 0 : 1;
