@@ -592,7 +592,12 @@ function(ufsm_exe name)
   endif()
 endfunction()
 
-ufsm_exe(ufsm ALL SUITE src/main.c src/sysinfo_cli.c OBJS CORE NN LP LIBS LDLIBS CUDA)
+# every "--name" literal of the sources as a table: main() refuses a --flag no command knows (cmake/optnames.cmake, src/optcheck.h)
+file(GLOB UFSM_OPT_SRC CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.c ${CMAKE_SOURCE_DIR}/src/*.h ${CMAKE_SOURCE_DIR}/src/*.cu ${CMAKE_SOURCE_DIR}/src/*.cuh)
+add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/gen/opt_names.c
+  COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/src -DOUT=${CMAKE_BINARY_DIR}/gen/opt_names.c -P ${CMAKE_SOURCE_DIR}/cmake/optnames.cmake
+  DEPENDS ${UFSM_OPT_SRC} ${CMAKE_SOURCE_DIR}/cmake/optnames.cmake COMMENT "option names" VERBATIM)
+ufsm_exe(ufsm ALL SUITE src/main.c src/sysinfo_cli.c ${CMAKE_BINARY_DIR}/gen/opt_names.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 target_link_libraries(ufsm PRIVATE ufsm_cudalibs)   # (main.c / sysinfo_cli.c are C; the CUDA objects make it a C++ link)
 include(tests/targets.cmake)
 

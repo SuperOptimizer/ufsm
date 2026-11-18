@@ -13,6 +13,13 @@ extern "C" {
 const char *opt_n(const char *name);
 const char *opt_p(const char *prefix);
 int opt_unread(const char *who, int argc, char **argv);
+/* opt_unknown: the --flags (argv[2..]) that no command of this binary knows: not in NAMES (every "--name" literal of the sources,
+   build-generated: ufsm_opt_names; a literal with printf conversions, "--aug-%s-p", is a pattern), not under one of PREFIXES (opt_p
+   families), "--name=value" checked by its name. Each is named on stderr; returns how many. main() refuses them (exit 2) before any
+   work unless UFSM_OPT_LAX=1 (2026-11-17: wrap-check silently ignored an unknown --bands from a stale binary; opt_unread only warns,
+   and only after the command finished) */
+int opt_unknown(const char *who, int argc, char **argv, const char *const *names, const char *const *prefixes);
+int opt_match(const char *pat, const char *s);   /* a name pattern (printf conversions match any run) against s */
 int opt_atoi(const char *name, const char *v);
 long opt_atol(const char *name, const char *v);
 long long opt_atoll(const char *name, const char *v);

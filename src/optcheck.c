@@ -88,3 +88,31 @@ double opt_atof(const char *name, const char *v) {
     if (e == v || *num_end(e)) bad(name, v, "a number");
     return r;
 }
+
+/* opt_match: '%' [flags / width / precision / length] conversion matches any run of characters (incl. empty); the rest literally */
+int opt_match(const char *p, const char *s) {
+    for (; *p; p++, s++) {
+        if (*p == '%' && p[1] && p[1] != '%') {
+            const char *q = p + 1; while (*q && strchr("-+ #0123456789.hlLqjzt", *q)) q++;
+            if (!*q) return 0;
+            for (const char *t = s; ; t++) { if (opt_match(q + 1, t)) return 1; if (!*t) return 0; }
+        }
+        if (*p == '%' && p[1] == '%') p++;
+        if (*s != *p) return 0;
+    }
+    return !*s;
+}
+int opt_unknown(const char *who, int argc, char **argv, const char *const *names, const char *const *prefixes) {
+    int n = 0;
+    for (int i = 2; i < argc; i++) {
+        const char *a = argv[i];
+        if (!a || a[0] != '-' || a[1] != '-' || !a[2]) continue;   /* values, positionals, "-1", a bare "--" */
+        char nm[256]; size_t l = strcspn(a, "="); if (l >= sizeof nm) l = sizeof nm - 1; memcpy(nm, a, l); nm[l] = 0;
+        int ok = 0;
+        for (int k = 0; names && names[k] && !ok; k++) ok = strchr(names[k], '%') ? opt_match(names[k], nm) : !strcmp(names[k], nm);
+        for (int k = 0; prefixes && prefixes[k] && !ok; k++) ok = !strncmp(nm, prefixes[k], strlen(prefixes[k]));
+        if (!ok) { fprintf(stderr, "%s: ERROR: unknown option %s (no command of this binary reads it: a typo, a newer binary's flag, or an env-var switch?"
+                                   " UFSM_OPT_LAX=1 runs anyway)\n", who, nm); n++; }
+    }
+    return n;
+}

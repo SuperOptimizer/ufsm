@@ -5129,7 +5129,10 @@ static int ufsm_main(int argc, char **argv) {
 }
 /* every command: the --flags it never looked up are named when it returns successfully (src/optcheck.h; train also checks after its
    setup, before the long part). Not after a failure: a command that stops early has not read its options yet (false warnings) */
+extern const char *const ufsm_opt_names[], *const ufsm_opt_prefixes[];   /* build-generated (cmake/optnames.cmake) */
 int main(int argc, char **argv) {
+    /* a --flag that no command of this binary knows is refused before any work (src/optcheck.h opt_unknown; UFSM_OPT_LAX=1: run anyway) */
+    if (argc >= 3 && !(getenv("UFSM_OPT_LAX") && atoi(getenv("UFSM_OPT_LAX"))) && opt_unknown(argv[1], argc, argv, ufsm_opt_names, ufsm_opt_prefixes)) return 2;
     const int rc = ufsm_main(argc, argv);
     if (rc == 0 && argc >= 2) opt_unread(argv[1], argc, argv);
     return rc;

@@ -36,6 +36,17 @@ int main(void) {
     opt_n("--late");
     char *av2[] = {"ufsm", "cmd", "--late", "1"};
     CHECK(opt_unread("cmd", 4, av2) == 0, "a name read before the check");
+    /* opt_unknown (11-17): names, printf-pattern names, prefix families, --name=value; values / "-1" / a bare "--" skipped */
+    CHECK(opt_match("--aug-%s-p", "--aug-blur-p") && opt_match("--aug-%s-p", "--aug--p") && !opt_match("--aug-%s-p", "--aug-blur-s")
+          && opt_match("--l%02d", "--l07") && !opt_match("--x", "--xy") && opt_match("--a%%b", "--a%b"), "opt_match patterns");
+    {   const char *const nm[] = {"--threads", "--bands", "--aug-%s-p", nullptr}, *const pf[] = {"--vaug", nullptr};
+        char *ok[] = {"ufsm", "wrap-check", "m", "--threads", "4", "--bands=o.tsv", "--aug-noise-p", "0.5", "--vaug-flip", "1", "-1", "--"};
+        CHECK(opt_unknown("wrap-check", 12, ok, nm, pf) == 0, "known names, a pattern, a prefix family, --name=value: none unknown");
+        char *bad[] = {"ufsm", "wrap-check", "m", "--band", "o.tsv", "--threads", "4", "--aug-noise-s", "1", "--vau"};
+        CHECK(opt_unknown("wrap-check", 10, bad, nm, pf) == 3, "--band, --aug-noise-s and --vau unknown");
+        char *cmdonly[] = {"ufsm", "--threads"};
+        CHECK(opt_unknown("x", 2, cmdonly, nm, pf) == 0, "argv[1] (the command) is not checked");
+    }
     if (fails) { fprintf(stderr, "test_optcheck: %d FAILED\n", fails); return 1; }
     fprintf(stderr, "test_optcheck: ok\n"); return 0;
 }
