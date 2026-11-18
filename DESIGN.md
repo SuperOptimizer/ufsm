@@ -41,6 +41,9 @@ Step 2 (same branch): the phase gate's k_pg_rates and the minibatch selection.
   so fit_box_index32 / fit_crop_index32 compute the same integers in 32 bits. ncu on the same launches: select_inv 440 -> 333 us, select
   56 -> 45 us. UFSM_FIT_SEL64=1 gives the size_t helpers.
 The slab fit's delta.f32 / axis.f32 / model.json are byte-identical to master again.
+Measured end to end by fp4teach (12 slabs of the 1667 u1 fields, master 9c9c8977 against the previous binary, interleaved x2,
+outputs byte-identical): 1 lane 68.2 / 72.4 -> 61.1 / 57.9 s (-15 %), 3 lanes 42.8 / 42.9 -> 40.7 / 39.9 s (-6 %). The desk was at load
+~11, with a guest on card 1, so at 3 lanes the host side (5 threads a lane) capped it.
 
 ## Memory audit: where host / device memory goes per phase; count-field's ref reads shard pieces, 28.2 -> 8.1 GB at the same model bytes (2026-11-18, branch memopt-20261118)
 
