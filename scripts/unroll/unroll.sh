@@ -645,29 +645,39 @@ join() {
 }
 # check: wrap-check of the joined model (CT papyrus peaks between adjacent wraps along radial rays; per-wrap verdicts real / dup / merged
 # in wrapcheck.tsv). --ct-um is the CT level's um ($LUM); 0 CT peaks per turn overall = a wrong level / um: the stage fails
+# check: wrap-check, unroll-qa and cf-demod (the drift) are independent reads of the fields / model / CT: run side by side (pod q2 1667:
+# 2.8 + 24.2 + 13.2 s one after another, 40 s of the 15-stage chain), their logs and verdicts reported in the old order afterwards.
 check() {
-  X $O/logs/check.log $U wrap-check $O/joined $F --ct $R $K/$LV --ct-um $LUM --tsv $O/wrapcheck.tsv.tmp --threads $TH || return 1
-  [ "$DRY" = 1 ] && { echo "    $U unroll-qa --fields $F --model $O/joined --ct $R $K/$LV --out $O/qa/unroll-qa --tiles ${UQTILES:-48}${FIBRES:+ --fibres $FIBRES}$([ "${UQSTRICT:-0}" = 1 ] && echo ' --strict')  > $O/logs/unrollqa.log"; return 0; }
-  [ -s $O/wrapcheck.tsv.tmp ] && [ $(awk -F'\t' 'NR > 1 && $NF != ""' $O/wrapcheck.tsv.tmp | wc -l) -gt 0 ] || { log "check: wrap-check wrote no verdicts"; return 1; }
-  awk -F'\t' 'NR > 1 { n++; e += $3 } END { exit !(n > 0 && e / n < 0.999) }' $O/wrapcheck.tsv.tmp ||
-    { log "check: wrap-check found no CT peaks (empty share ~1 on every wrap): wrong --ct-um $LUM or CT level $K/$LV?"; return 1; }
-  mv $O/wrapcheck.tsv.tmp $O/wrapcheck.tsv
-  log "check: $(grep -E '^wrap-check: verdicts' $O/logs/check.log | tail -1)"
+  local uqs=() uqp= drp= uqrc=0 rc=0; [ "${UQSTRICT:-0}" = 1 ] && uqs=(--strict); [ -n "${FIBRES:-}" ] && uqs+=(--fibres $FIBRES)
   # unroll-qa: the label-free sheet-identity gates (wrap-check and the join agreement only measure self-consistency with the ref; DESIGN
   # 2026-11-14): 48 tiles of 128^3 cells, phase confidence / phase-unwrap witness / winding-mod-4 agreement (+ fibre sheet changes with
   # FIBRES=level-0 UFIB); its ok / WARN lines go to progress.log. Warn only; UQSTRICT=1 fails the stage on a gate. ~3-5 min CPU.
-  local uqs=(); [ "${UQSTRICT:-0}" = 1 ] && uqs=(--strict); [ -n "${FIBRES:-}" ] && uqs+=(--fibres $FIBRES)
-  mkdir -p $O/qa/unroll-qa
-  if ! X $O/logs/unrollqa.log $U unroll-qa --fields $F --model $O/joined --ct $R $K/$LV --out $O/qa/unroll-qa --threads $TH --tiles ${UQTILES:-48} "${uqs[@]}"; then
-    [ "${UQSTRICT:-0}" = 1 ] && { log "check: unroll-qa failed or a gate failed (UQSTRICT=1; logs/unrollqa.log)"; return 1; }
-    log "check: unroll-qa did not finish (logs/unrollqa.log); warn only, continuing"
-  fi
-  [ "$DRY" = 1 ] || grep -E '^unroll-qa: (ok|WARN) gate' $O/logs/unrollqa.log | while read -r l; do log "check: $l"; done
   # the ref's z drift against the sheets (audit ugeom #5: P4's integers drifted 3 turns over ~5 cm of height and every gate passed):
   # ufsm cf-demod (label-free, CPU; DRIFT=0 off): ALARM above DRIFTWARN turns of along-sheet excursion; DRIFTMAX: fail above it
-  if [ "${DRIFT:-1}" = 1 ]; then
-    X $O/logs/drift.log $U cf-demod $REF $F --step ${DRIFTSTEP:-8} --band 128 --cz 16 --threads $TH ${DRIFTMAX:+--drift-max $DRIFTMAX}
-    local rc=$?; [ "$DRY" = 1 ] && return 0
+  if [ "$DRY" = 1 ]; then
+    X $O/logs/check.log $U wrap-check $O/joined $F --ct $R $K/$LV --ct-um $LUM --tsv $O/wrapcheck.tsv.tmp --threads $TH
+    echo "    $U unroll-qa --fields $F --model $O/joined --ct $R $K/$LV --out $O/qa/unroll-qa --tiles ${UQTILES:-48}${FIBRES:+ --fibres $FIBRES}$([ "${UQSTRICT:-0}" = 1 ] && echo ' --strict')  > $O/logs/unrollqa.log"
+    [ "${DRIFT:-1}" = 1 ] && X $O/logs/drift.log $U cf-demod $REF $F --step ${DRIFTSTEP:-8} --band 128 --cz 16 --threads $TH ${DRIFTMAX:+--drift-max $DRIFTMAX}
+    return 0
+  fi
+  mkdir -p $O/qa/unroll-qa
+  X $O/logs/unrollqa.log $U unroll-qa --fields $F --model $O/joined --ct $R $K/$LV --out $O/qa/unroll-qa --threads $TH --tiles ${UQTILES:-48} "${uqs[@]}" & uqp=$!
+  [ "${DRIFT:-1}" = 1 ] && { X $O/logs/drift.log $U cf-demod $REF $F --step ${DRIFTSTEP:-8} --band 128 --cz 16 --threads $TH ${DRIFTMAX:+--drift-max $DRIFTMAX} & drp=$!; }
+  ckill() { wait $uqp $drp 2> /dev/null; }   # (a failed wrap-check: let the side jobs end with the stage; a kill would reach only the X subshells, not ufsm)
+  X $O/logs/check.log $U wrap-check $O/joined $F --ct $R $K/$LV --ct-um $LUM --tsv $O/wrapcheck.tsv.tmp --threads $TH || { ckill; return 1; }
+  [ -s $O/wrapcheck.tsv.tmp ] && [ $(awk -F'\t' 'NR > 1 && $NF != ""' $O/wrapcheck.tsv.tmp | wc -l) -gt 0 ] || { ckill; log "check: wrap-check wrote no verdicts"; return 1; }
+  awk -F'\t' 'NR > 1 { n++; e += $3 } END { exit !(n > 0 && e / n < 0.999) }' $O/wrapcheck.tsv.tmp ||
+    { ckill; log "check: wrap-check found no CT peaks (empty share ~1 on every wrap): wrong --ct-um $LUM or CT level $K/$LV?"; return 1; }
+  mv $O/wrapcheck.tsv.tmp $O/wrapcheck.tsv
+  log "check: $(grep -E '^wrap-check: verdicts' $O/logs/check.log | tail -1)"
+  wait $uqp || uqrc=1
+  if [ $uqrc = 1 ]; then
+    [ "${UQSTRICT:-0}" = 1 ] && { [ -n "$drp" ] && wait $drp 2> /dev/null; log "check: unroll-qa failed or a gate failed (UQSTRICT=1; logs/unrollqa.log)"; return 1; }
+    log "check: unroll-qa did not finish (logs/unrollqa.log); warn only, continuing"
+  fi
+  grep -E '^unroll-qa: (ok|WARN) gate' $O/logs/unrollqa.log | while read -r l; do log "check: $l"; done
+  if [ -n "$drp" ]; then
+    wait $drp; rc=$?
     local dl; dl=$(grep '^cf-demod: z drift:' $O/logs/drift.log | tail -1); log "check: ${dl#cf-demod: }"
     # the body (bands with >= 1/2 the fullest band's weight) and the ends apart: 0332's 1.9-turn ALARM was 1.6 turns at the broken top end
     local db; db=$(grep '^cf-demod: z drift body' $O/logs/drift.log | tail -1); [ -n "$db" ] && log "check: ${db#cf-demod: }"
