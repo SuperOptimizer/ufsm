@@ -23,7 +23,11 @@ conv with GN on load) ~1/5, k_gnpart + k_gn_apply ~1/7, k_dfc1 ~1/14, k_dattn ~1
   (-23 %); wraps byte-identical to master in every pair.
 - ink-ext is not run-to-run byte-stable unpinned: the auto --batch follows free device memory (8 / 10 / 16 on the shared card) and
   two master runs at different batches differed on 270 k of 39 M pixels by 1 LSB; at a fixed batch every run is identical. A/Bs pin it.
-- Tried and dropped (bench, byte-identical but not faster): k_dfc1 with 2/4/8 x voxels a thread (float4 weights; 2.8 -> 6.7-8.3 ms),
+- **k_dfc1x<2>** (UFSM_XNET_DF1=2, default; 1 the old k_dfc1): two x voxels a thread, each channel's 27 weights read as 7 float4
+  into registers and fed to both FMA chains, the 16 outputs packed into half2 words. Same chains: byte-identical (test_xmx c1).
+  XMX_DFBENCH 2.83 -> 1.75 ms (<4> 2.38); in situ (w035, batch 8, quiet card, 2 pairs) 0.81 -> 0.50 s a wrap, kernels 8.99 -> 8.6-8.7 s,
+  0 px differ. The first x-blocked try (below) indexed its output array by a rolled channel loop and ran 2-3x slower.
+- Tried and dropped (bench, byte-identical but not faster): the first k_dfc1 x-blocking (2.8 -> 6.7-8.3 ms, see above),
   k_gnpart with 4 rows' loads in flight + an 8-channel k_gn_apply (2.55 -> 2.52 ms). The GN kernels' reader3 time is ~8000 small
   launches on the 2-D levels (~0.12 ms each): fusing the apply into the next conv's loads (as gnin) is the remaining lever.
 - Parked (branch convkwave-20261117): wave-aware tiles for > 64 outputs (128x128 / 128x64 / 64x64 / 64x32 picked by waves x

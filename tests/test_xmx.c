@@ -245,6 +245,13 @@ static int run_c1(int N, int D, int H, int W) {
         const double g = h2f(yh[((((size_t)n * D + z) * H + yy) * W + xx) * 16 + o]), d = fabs(g - s); if (d > emax) emax = d; if (d > 1e-3 * fabs(s) + 2e-3) bad++;
     }
     printf("c1 N %d %dx%dx%d: max |d| %.3g, %zu of %zu over the bound\n", N, D, H, W, emax, bad, nx * 16);
+    uint16_t *y0 = malloc(nx * 32);   /* k_dfc1 (1) against the x-blocked k_dfc1x (2, 4): byte-equal */
+    for (int v = 1; v <= 4; v++) {
+        if (v == 3) continue;
+        xnet_set_df1(v); xt yv = xconv_fwd(&c, xd, nullptr, XA_NONE); xd2h(v == 1 ? y0 : yh, yv.p, nx * 32); xt_free(&yv);
+        if (v > 1) { size_t nd = 0; for (size_t i = 0; i < nx * 16; i++) nd += y0[i] != yh[i]; printf("c1 variant %d: %zu of %zu differ from k_dfc1\n", v, nd, nx * 16); bad += nd; }
+    }
+    xnet_set_df1(-1); free(y0);
     xt_free(&xd); xt_free(&y); xconv_free(&c); free(xh); free(yh); free(x); free(w);
     return bad != 0;
 }
@@ -285,6 +292,11 @@ int main(void) {
             for (int r = 0; r < 10; r++) { xnet_sync(); const double t0 = now(); xt y = xconv_fwd_gnin(&c, x, g, g + 4 * 16, gd, bd, XA_LRELU); xnet_sync(); const double t = now() - t0; xt_free(&y); if (t < best) best = t; }
             printf("dfbench gnin variant %d: %.3f ms\n", v, best * 1e3);
         }
+        { float w1[16 * 27]; for (int j = 0; j < 16 * 27; j++) w1[j] = rnd() * 0.3f; xconv c1; xconv_init(&c1, w1, 16, 1, 3, 3, 3, 1, 1, 1, 1, 1, 1, nullptr, nullptr); xt x1 = xt_new(4, 17, 384, 384, 1);
+          for (int v = 1; v <= 4; v++) { if (v == 3) continue; xnet_set_df1(v); double best = 1e9;
+              for (int r = 0; r < 10; r++) { xnet_sync(); const double t0 = now(); xt y = xconv_fwd(&c1, x1, nullptr, XA_NONE); xnet_sync(); const double t = now() - t0; xt_free(&y); if (t < best) best = t; }
+              printf("dfbench c1 variant %d: %.3f ms\n", v, best * 1e3); }
+          xnet_set_df1(-1); xt_free(&x1); xconv_free(&c1); }
         return 0;
     }
     int fails = 0;
@@ -317,6 +329,7 @@ int main(void) {
     fails += run_dattn(2, 17, 40, 36);
     fails += run_gnin(2, 17, 20, 70);
     fails += run_c1(2, 17, 30, 41);
+    fails += run_c1(1, 3, 9, 23);     /* W % 4 ragged */
     fails += run_dfs(2, 17, 20, 70);   /* ragged y / x tiles */
     fails += run_dfs(1, 3, 37, 33);
     fails += run_dfs(1, 1, 9, 16);

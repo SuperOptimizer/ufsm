@@ -1328,13 +1328,59 @@ __global__ void k_dfc1(const __half *x, const __half *w, int Kp, const float *sc
         o[c] = __float2half_rn(s * scale[c] + bias[c]); }
     uint4 *dst = (uint4 *)(y + v * 16); dst[0] = ((const uint4 *)o)[0]; dst[1] = ((const uint4 *)o)[1];
 }
-static int g_df1 = -1;   /* UFSM_XNET_DF1=0: the stem through xunfold + implicit GEMM (A/B); mgpu: env */
+/* k_dfc1 with XB consecutive x voxels a thread: each channel's 27 weights (7 float4 smem reads of [c][28]) feed XB FMA chains (k_dfc1:
+   one broadcast LDS an FMA); every output's chain is k_dfc1's (27 taps in order, zero taps included): byte-identical. */
+template <int XB> __global__ void __launch_bounds__(128) k_dfc1x(const __half *x, const __half *w, int Kp, const float *scale, const float *bias, __half *y, long long nthr, int D, int H, int W) {
+    __shared__ __align__(16) float sw[16 * 28];
+    for (int i = threadIdx.x; i < 16 * 28; i += blockDim.x) { const int o = i / 28, t = i % 28; sw[i] = t < 27 ? __half2float(w[(size_t)o * Kp + (t / 3) * 8 + t % 3]) : 0.f; }
+    __syncthreads();
+    const int WB = (W + XB - 1) / XB;
+    const long long u = blockIdx.x * (long long)blockDim.x + threadIdx.x; if (u >= nthr) return;
+    const int xb = (int)(u % WB) * XB; long long r = u / WB; const int yy = (int)(r % H); r /= H; const int zz = (int)(r % D); const long long n = r / D;
+    float in[27 * (XB + 2) / 3];   /* [a][b][e], e < XB + 2 */
+#pragma unroll
+    for (int a = 0; a < 3; a++)
+#pragma unroll
+        for (int b = 0; b < 3; b++)
+#pragma unroll
+            for (int e = 0; e < XB + 2; e++) {
+                const int z = zz + a - 1, yv = yy + b - 1, xv = xb + e - 1;
+                in[(a * 3 + b) * (XB + 2) + e] = z >= 0 && z < D && yv >= 0 && yv < H && xv >= 0 && xv < W ? __half2float(x[((n * D + z) * H + yv) * (long long)W + xv]) : 0.f;
+            }
+    unsigned pk[XB][8];
+#pragma unroll
+    for (int c = 0; c < 16; c++) {
+        float wq[28];
+#pragma unroll
+        for (int t4 = 0; t4 < 7; t4++) { const float4 v = *(const float4 *)(sw + c * 28 + t4 * 4); wq[t4 * 4] = v.x; wq[t4 * 4 + 1] = v.y; wq[t4 * 4 + 2] = v.z; wq[t4 * 4 + 3] = v.w; }
+        float s[XB];
+#pragma unroll
+        for (int k = 0; k < XB; k++) s[k] = 0.f;
+#pragma unroll
+        for (int t = 0; t < 27; t++)
+#pragma unroll
+            for (int k = 0; k < XB; k++) s[k] += in[(t / 3) * (XB + 2) + t % 3 + k] * wq[t];
+#pragma unroll
+        for (int k = 0; k < XB; k++) {
+            const unsigned short h = __half_as_ushort(__float2half_rn(s[k] * scale[c] + bias[c]));
+            if (c & 1) pk[k][c >> 1] |= (unsigned)h << 16; else pk[k][c >> 1] = h;
+        }
+    }
+    const long long v0 = ((n * D + zz) * H + yy) * (long long)W + xb;
+#pragma unroll
+    for (int k = 0; k < XB; k++) if (xb + k < W) { uint4 *dst = (uint4 *)(y + (v0 + k) * 16); dst[0] = make_uint4(pk[k][0], pk[k][1], pk[k][2], pk[k][3]); dst[1] = make_uint4(pk[k][4], pk[k][5], pk[k][6], pk[k][7]); }
+}
+static int g_df1 = -1;   /* UFSM_XNET_DF1=0: the stem through xunfold + implicit GEMM (A/B); 1 k_dfc1; 2 (default) k_dfc1x<2> (XMX_DFBENCH 2.83 -> 1.75 ms), 4 <4> (2.38); mgpu: env */
+extern "C" void xnet_set_df1(int v) { g_df1 = v; }
 static bool dfc1_try(const xconv *c, xt x, const xt *res, int act, double *st, xt *out) {
-    if (g_df1 < 0) g_df1 = getenv("UFSM_XNET_DF1") ? atoi(getenv("UFSM_XNET_DF1")) : 1;
+    if (g_df1 < 0) g_df1 = getenv("UFSM_XNET_DF1") ? atoi(getenv("UFSM_XNET_DF1")) : 2;
     if (!g_df1 || !c->unfold || c->kw0 != 3 || c->pw0 != 1 || c->co != 16 || c->kd != 3 || c->kh != 3 || c->pd != 1 || c->ph != 1) return false;
     if (c->sd != 1 || c->sh != 1 || c->sw != 1 || x.c != 1 || res || act != XA_NONE || st) return false;
     *out = xt_new(x.n, x.d, x.h, x.w, 16); const long long nv = (long long)x.n * x.d * x.h * x.w;
-    k_dfc1<<<nblk((size_t)nv, 128), 128, 0, g_st>>>((const __half *)x.p, (const __half *)c->w, c->Kp, c->scale, c->bias, (__half *)out->p, nv, x.d, x.h, x.w);
+    const __half *xp = (const __half *)x.p, *wp = (const __half *)c->w; __half *yp = (__half *)out->p; const long long rows = (long long)x.n * x.d * x.h;
+    if (g_df1 == 2) { const long long nt = rows * ((x.w + 1) / 2); k_dfc1x<2><<<nblk((size_t)nt, 128), 128, 0, g_st>>>(xp, wp, c->Kp, c->scale, c->bias, yp, nt, x.d, x.h, x.w); }
+    else if (g_df1 == 4) { const long long nt = rows * ((x.w + 3) / 4); k_dfc1x<4><<<nblk((size_t)nt, 128), 128, 0, g_st>>>(xp, wp, c->Kp, c->scale, c->bias, yp, nt, x.d, x.h, x.w); }
+    else k_dfc1<<<nblk((size_t)nv, 128), 128, 0, g_st>>>(xp, wp, c->Kp, c->scale, c->bias, yp, nv, x.d, x.h, x.w);
     return true;
 }
 static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *lnw = nullptr, const float *lnb = nullptr, float lneps = 0.f, double *st = nullptr) {

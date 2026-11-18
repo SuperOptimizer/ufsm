@@ -75,6 +75,7 @@ void xnet_set_mx_skip(const char *list);   /* convs kept fp16 by their initialis
 void xnet_set_mxrot(int on);            /* UFSM_XNET_MXROT: H16-rotate the 16-blocks of MX convs initialised from now (weights at pack, inputs in k_xq) */
 void xnet_set_mxa(int on);              /* UFSM_XNET_MXA: least-squares activation block scales for MX convs initialised from now */
 void xnet_set_df16(int v);              /* the 16 -> 16 3x3x3 fp16 conv: 0 implicit GEMM, 1 the halo kernel k_dfc16, 2..9 its other tilings, 10 (default) the depth-streaming k_dfc16s, 11..16 its tilings (UFSM_XNET_DF16) */
+void xnet_set_df1(int v);               /* the 1 -> 16 stem conv: 0 xunfold + implicit GEMM, 1 k_dfc1, 2 (default) / 4 k_dfc1x x-blocked by 2 / 4 (UFSM_XNET_DF1) */
 void xnet_wseq_reset(void);             /* a new net: initialisation indices restart at 0 (UFSM_XNET_MX_SKIP, UFSM_XNET_FQ weight mask) */
 /* the fused MX inference path (ink3d-ext): a conv that also returns the InstanceNorm sums of its output (st: device doubles [n][co][2]:
    sum, sum of squares; free with xfree_dev), the per-(sample, channel) affine of IN (coef [n][C][2]: a = gamma rstd, b = beta - mean a),
