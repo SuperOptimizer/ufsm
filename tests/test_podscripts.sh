@@ -18,7 +18,7 @@ ck "pod trainer launches use setsid${nos:+: $nos}" '[ -z "$nos" ]'
 ck "pod smoke test under the GPU lock + timeout" 'grep -qE "flock( -w [0-9]+)? /root/gpu.lock timeout -k [0-9]+ [0-9]+ \./\\\$BD/test_mx_sw" scripts/pod/setup.sh'
 ck "evald marks done only on success" 'grep -q "if \[ \$NF = 0 \]; then rm -f \$o/failed; touch \$o/done" scripts/fibers/evald.sh'
 Q2=scripts/pod/podq2.sh   # (11-18: the next pod session's queue)
-ck "podq2 / deskq2 / score1667 parse" 'bash -n $Q2 && bash -n scripts/pod/deskq2.sh && bash -n scripts/pod/score1667.sh'
+ck "podq2 / deskq2 / score1667 parse" 'bash -n $Q2 && bash -n scripts/pod/deskq2.sh && bash -n scripts/pod/q2pull.sh && bash -n scripts/pod/score1667.sh'
 ck "deskq2 pins card 1 for every stage" 'grep -q "export CUDA_VISIBLE_DEVICES=1 FIELDGPUS=0 FITGPUS=0 INKGPU=0; unset SGPU" scripts/pod/deskq2.sh'
 ck "podq2 probes the desk before the unroll" '[ "$(grep -n "^if ! done_ desk" $Q2 | cut -d: -f1)" -lt "$(grep -n "^if ! done_ unroll" $Q2 | cut -d: -f1)" ]'
 ck "podq2 only pushes from the pod (no rsync from the desk)" '! grep -nE "push [^#]*\\\$DESK:[^ ]* +\\\$(RU|Q|K)" $Q2'

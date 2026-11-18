@@ -19,7 +19,8 @@
 # Env: POD (/root/pod), Q ($POD/q2), COMMIT (required: the master commit to run), CK (fields checkpoint path on the pod; default
 #   $POD/ckpt/u1-13790.ckpt, the production fields model (lead 11-18): the desk's /vesuvius/ufsm/v2/lat/runs/u1-donor-13790.ckpt, 201 MB,
 #   not on the mirror: scp it beforehand, ~70 s at the desk's uplink) or CKURL, CKSHA1 (default: u1 13790's 8854e4e5...), DESK (forrest@<desk host reachable from the pod>), DESKPORT (22), DESKKEY (~/.ssh/id_ed25519), DESKDIR
-#   (/vesuvius/ufsm/podun/PHerc1667-q2), K (/root/ink), NOSMOKE=1 (stop after the unroll), MINDISK (120 GB free on / before the unroll).
+#   (/vesuvius/ufsm/podun/PHerc1667-q2; DESK=none: a pod that cannot reach the desk: no pushes, the desk pulls with
+#   scripts/pod/q2pull.sh, which ends on RU/.final (unroll) / RU/.alldone (queue)), TH / PTH / ITH (threads; default the cgroup's), K (/root/ink), NOSMOKE=1 (stop after the unroll), MINDISK (120 GB free on / before the unroll).
 # Run detached on the pod: COMMIT=... DESK=forrest@HOST setsid nohup bash $POD/ufsm/scripts/pod/podq2.sh > $POD/podq2.out 2>&1 < /dev/null &
 # (from a fresh pod: copy this file there first, or clone the repo; setup clones COMMIT into $POD/ufsm and the queue then runs the same
 # script from the repo copy). Stop after the current step: touch $Q/STOPQ.
@@ -52,6 +53,9 @@ CK=$(cat $Q/ck.path); U=$POD/ufsm/build/ufsm; RU=$POD/unroll/$S
 # --- desk: the pushes must work before any result exists ---
 stopq desk
 if ! done_ desk; then
+  [ "$DESK" = none ] && { say "DESK=none: no pushes; the desk pulls (scripts/pod/q2pull.sh)"; mark desk; }
+fi
+if ! done_ desk; then
   [ -n "$DESK" ] || die "DESK unset: set DESK=user@host (reachable from the pod), or run on the desk: PODH=root@<pod> bash scripts/pod/podpull.sh"
   echo "podq2 $(date -u +%s) $COMMIT" > $Q/desk.probe
   $SSH $DESK "mkdir -p $DESKDIR" && push $Q/desk.probe $DESK:$DESKDIR/desk.probe && $SSH $DESK "cat $DESKDIR/desk.probe" | grep -q "$COMMIT" \
@@ -74,10 +78,10 @@ pusher() {   # every 2 min: the small rows; each stage group's outputs once its 
 }
 if ! done_ unroll; then
   w=0; while [ "$(df -BG --output=avail / | tail -1 | tr -dc 0-9)" -lt $MINDISK ]; do [ $w = 0 ] && say "disk: < $MINDISK GB free on /: waiting"; w=1; sleep 60; done
-  rm -f $Q/pusher.stop; pusher & PP=$!
+  rm -f $Q/pusher.stop; PP=; [ "$DESK" != none ] && { pusher & PP=$!; }
   say "unroll start (CK $CK)"
-  ( cd $POD/ufsm && CK=$CK U=$U RECTOSP=1 INKMODE=r3 R3ONCE=1 PERWRAP=1 KEEPINK=1 CLEAN=0 timeout -k 60 ${QTIMEOUT:-21600} bash scripts/pod/unroll.sh $S > $Q/unroll.out 2>&1 ); rc=$?
-  touch $Q/pusher.stop; while kill -0 $PP 2> /dev/null; do sleep 5; done
+  ( cd $POD/ufsm && export TH=${TH:-} PTH=${PTH:-} ITH=${ITH:-}; [ -z "$TH" ] && unset TH PTH ITH; CK=$CK U=$U RECTOSP=1 INKMODE=r3 R3ONCE=1 PERWRAP=1 KEEPINK=1 CLEAN=0 timeout -k 60 ${QTIMEOUT:-21600} bash scripts/pod/unroll.sh $S > $Q/unroll.out 2>&1 ); rc=$?
+  touch $Q/pusher.stop; [ -n "$PP" ] && while kill -0 $PP 2> /dev/null; do sleep 5; done
   [ $rc = 0 ] && [ -e $RU/state/stripimg.done ] && [ -e $RU/state/perwrap.done ] || die "unroll rc $rc (no stripimg.done / perwrap.done: $Q/unroll.out, $RU/progress.log)"
   mark unroll
 fi
@@ -87,6 +91,10 @@ stopq push
 if ! done_ push; then
   awk '/ start$/ {s[$3] = $1 " " $2} / done: / {st = $3; sub(/:$/, "", st); w = $5; c = $8; r = $11; printf "%s\t%s\t%s %s\t%s\t%s\t%s\n", st, s[st], $1, $2, w, c, r}' \
     $RU/progress.log | awk -F'\t' 'BEGIN {print "stage\tstart\tend\twall_s\tcpu_s\tmax_rss_gb"} {print}' > $Q/stagetable.tsv
+  cp -f $Q/stagetable.tsv $RU/stagetable.tsv
+  if [ "$DESK" = none ]; then touch $RU/.final; mark push; say "unroll final ($RU/.final): the desk pulls it (scripts/pod/q2pull.sh)"; fi
+fi
+if ! done_ push; then
   $SSH $DESK "mkdir -p $DESKDIR/fields $DESKDIR/ink $DESKDIR/strip" || die "desk mkdir"
   push $RU/fields/rsp $DESK:$DESKDIR/fields/ && push $RU/ref-cf $RU/joined $RU/wrapcheck.tsv $RU/qa $RU/img $RU/prev $RU/up $RU/progress.log $RU/state $RU/logs $Q/stagetable.tsv $DESK:$DESKDIR/ \
     && push $RU/strip/img_fill $RU/strip/img_pap $RU/strip/distort $DESK:$DESKDIR/strip/ && push $RU/ink/wraps $RU/ink/r3/strip $DESK:$DESKDIR/ink/ || die "final push ($Q/push.err)"
@@ -103,7 +111,7 @@ if ! done_ smoke; then
   say "smoke start (K $K)"
   COMMIT=$COMMIT K=$K bash $K/kit/podq.sh > $K/podq.out 2>&1; rc=$?
   [ $rc = 0 ] && [ -e $K/state/ALLDONE ] || die "ink smoke rc $rc ($K/podq.log)"
-  $SSH $DESK "mkdir -p $DESKDIR/smoke"; push $K/podq.log $K/steptimeA.txt $K/out $DESK:$DESKDIR/smoke/ 2> /dev/null   # (out/: smokeA.txt, run / resume logs, the step-200 ckpt ~80 MB)
+  [ "$DESK" != none ] && $SSH $DESK "mkdir -p $DESKDIR/smoke" && push $K/podq.log $K/steptimeA.txt $K/out $DESK:$DESKDIR/smoke/ 2> /dev/null   # (out/: smokeA.txt, run / resume logs, the step-200 ckpt ~80 MB)
   mark smoke
 fi
-say "ALL DONE: the pod is idle"; touch $ST/ALLDONE
+say "ALL DONE: the pod is idle"; touch $ST/ALLDONE $RU/.alldone
