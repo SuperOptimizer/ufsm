@@ -2755,7 +2755,7 @@ int cmd_train(int argc, char **argv) {
     }
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm train <sources.json> --out DIR [--P 512] [--B 1] [--steps 20000] [--lr 1e-3] [--warmup 500 (steps; one step = one window per GPU) | --warmup-updates N (optimizer updates: N x accum steps)] [--wd 0.01]\n"
-                        "       [--dice 0.5] [--ema 0.999] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12 (new runs with --gpu-aug 2: 3)] [--gpu-aug 0|1|2 (new runs: 2)] [--sampler-slots N] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
+                        "       [--dice 0.5] [--ema 0.999] [--ema-per update|window] [--widths 16,32,64,80] [--down-norm 1] [--gpus 0,1] [--workers 12 (new runs with --gpu-aug 2: 3)] [--gpu-aug 0|1|2 (new runs: 2)] [--sampler-slots N] [--seed 0] [--det 1] [--resume CKPT] [--finetune 1] [--fp4 0|1|2 (default 2)] [--mem auto|auto16|default|wide] [--opt adamw|muon|anvil] [--muon-lr 0.02] [--muon-beta 0.95] [--anvil-lr 0.023] [--anvil-wd 2.25] [--sched cos|wsd] [--cooldown 0.2]\n"
                         "       [--rv 1 [--rv-iso 64] [--rv-verso-w 1]]\n"
                         "       [--val-batches 8] [--val-P N (validation windows of N^3 whatever P: the same voxels across window sizes)] [--log-every 20] [--val-every 500] [--ckpt-every 1000] [--clip 5] [--stop-at-update 1 (a signal inside an --accum update stops at its end)] [--gns-skip-echo 1] [--levels 0.5,0.25,0.15,0.1] [--fp32] [--f16 1] [--gscale 1024] [--gscale-grow 0 (N: x2 after N clean steps)] [--gscale-max 65536] [--prec 1|2|3|4] [--input-prec 0|4|8] [--policy enc0=1,dec0.c1=fp16:fp16:fp8,...] [--qat 2|3] [--wq 8|4] [--sparse24 STEP] [--sparse24-mode 1|2|3] [--sparse24-levels 0,1,...] [--sparse24-ramp N] [--sparse24-hard 0|1] [--srste 2e-4] [--pos-weight 1] [--tol 0..2] [--sr 1]\n"
                         "       [--seconds S] [--warmup-seconds S (default 5%% of time budget)] (time-based schedule and final checkpoint)\n"
@@ -2805,6 +2805,11 @@ int cmd_train(int argc, char **argv) {
     int P = opt_atoi("--P", opt(argc, argv, "--P", "512")), B = opt_atoi("--B", opt(argc, argv, "--B", "1")), steps = opt_atoi("--steps", opt(argc, argv, "--steps", "20000"));   /* 512^3 batch 1 per 16 GB GPU is the standard window (user, 2026-10-01) */
     float lr0 = (float)opt_atof("--lr", opt(argc, argv, "--lr", "1e-3")), wd = (float)opt_atof("--wd", opt(argc, argv, "--wd", "0.01")), dice_w = (float)opt_atof("--dice", opt(argc, argv, "--dice", "0.5"));
     float ema = (float)opt_atof("--ema", opt(argc, argv, "--ema", "0.999")), clip = (float)opt_atof("--clip", opt(argc, argv, "--clip", "5"));
+    /* --ema-per update|window (fix0332 11-18): --ema is the decay per optimizer update (default: old runs replay unchanged) or per training
+       window (ema^windows-per-update each update, ema_update_decay: the horizon 1/(1-ema) windows whatever --accum / --accum auto does) */
+    const char *ema_per_s = opt(argc, argv, "--ema-per", "update");
+    if (strcmp(ema_per_s, "update") && strcmp(ema_per_s, "window")) { fprintf(stderr, "--ema-per update|window\n"); return 2; }
+    const int ema_per_win = !strcmp(ema_per_s, "window");
     int warmup = opt_atoi("--warmup", opt(argc, argv, "--warmup", "500")), warmup_upd = opt_atoi("--warmup-updates", opt(argc, argv, "--warmup-updates", "0")), workers = opt_atoi("--workers", opt(argc, argv, "--workers", "12"));
     const int workers_asked = opt(argc, argv, "--workers", nullptr) != nullptr;
     double seconds = opt_atof("--seconds", opt(argc, argv, "--seconds", "0"));
@@ -4946,6 +4951,9 @@ int cmd_train(int argc, char **argv) {
     if (rep_every < 0 || rep_sync < 0 || rep_sync > 1) { fprintf(stderr, "--replica-check N >= 0, --replica-sync 0|1\n"); return 2; }
     if (acc_auto) fprintf(stderr, "--accum auto: %d windows per step, accum %d%s (max %d): target K %g x B_noise, up only, after %d updates, %d updates above %g x, a change per %d updates at most, x2 at most; lr unchanged\n",
                           acc_cfg.wps, accum, saved_acc > 0 ? " (resumed)" : "", acc_amax, acc_cfg.k, acc_cfg.warm, acc_cfg.hold, acc_cfg.margin, acc_cfg.gap);
+    { const long wpu = (long)accum * acc_cfg.wps; const float de = ema_update_decay(ema, ema_per_win, wpu, 1000);
+      fprintf(stderr, "ema: --ema %g per %s: decay %.6f per update (%ld windows per update), horizon %.0f updates = %.0f windows (0.9 for the first 100 updates)\n",
+              ema, ema_per_s, de, wpu, 1.0 / (1.0 - de), (double)wpu / (1.0 - de)); }
     float *gacc[64] = {nullptr}; int nacc_win = 0; long nclip_log = 0;   /* (nclip_log: --clip hits since the last log line; logged when > 0) */
     g_stop_upd = opt_atoi("--stop-at-update", opt(argc, argv, "--stop-at-update", "0")) != 0;
     if (accum > 1 || (acc_auto && acc_amax > 1)) { for (int g = 0; g < ng; g++) { nn_init(G[g].dev); gacc[g] = nn_malloc(np * 4); }
@@ -5434,7 +5442,7 @@ int cmd_train(int argc, char **argv) {
                 unet_qk_clip(d->u, qk_tau);
             }
             unet_sp24_project(d->u);                         /* hard 2:4: the update's pruned part dropped (no-op unless after the ramp) */
-            unet_ema(d->u, ostep < 100 ? 0.9f : ema);
+            unet_ema(d->u, ema_update_decay(ema, ema_per_win, (long)accum * acc_cfg.wps, ostep));   /* (--ema-per window: ema^windows per update) */
             unet_wquant(d->u, (unsigned)step);              /* no-op unless --wq */
             if (prof) nn_prof_end();
             nn_ptick("optimizer");
@@ -5445,6 +5453,9 @@ int cmd_train(int argc, char **argv) {
             const int na = accum_ctl_update(&actl, &acc_cfg, gns_bnoise(&gns));
             if (na != accum) {
                 fprintf(stderr, "step %d: --accum auto: accum %d -> %d (%d -> %d windows per update; B_noise %.0f, K %g; update %d)\n", step, accum, na, accum * acc_cfg.wps, na * acc_cfg.wps, gns_bnoise(&gns), acc_cfg.k, upd_now);
+                { const long wpu = (long)na * acc_cfg.wps; const float de = ema_update_decay(ema, ema_per_win, wpu, 1000);
+                  fprintf(stderr, "step %d: ema: --ema %g per %s: decay %.6f per update (%ld windows per update), horizon %.0f updates = %.0f windows\n",
+                          step, ema, ema_per_s, de, wpu, 1.0 / (1.0 - de), (double)wpu / (1.0 - de)); }
                 upd_base = upd_now; upd_cnt = 0; acc_anchor = step; accum = na; gns_small = 0; for (int k = 0; k < GG_MAX; k++) gg_small[k] = 0; if (ng > 1) nn_init(G[0].dev);
             }
         }

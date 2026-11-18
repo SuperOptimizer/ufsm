@@ -12,3 +12,9 @@ int gn_live_choice_n(const char *arg, int gn_ema, int frozen, long n, long w, in
    nullptr or "auto" = the EMA unless rel = |ema - p| / |p| > EMA_REL_MAX (then the live weights, *defaulted 1: the caller prints DEFAULTED). */
 #define EMA_REL_MAX 0.08
 int ema_choice(const char *arg, double rel, int *defaulted);
+/* ema_update_decay (fix0332 2026-11-18, per-window EMA): the decay one optimizer update applies to the training EMA. per_window 0: ema
+   itself (one EMA step per update: the horizon 1/(1-ema) updates = accum x windows-per-step times that in windows, ~10 000 windows for
+   0.999 at --accum 10, longer than pab-A's lineage: |ema - p| / |p| 0.117, EMA GT ids 0.798 vs live 0.841 on 1667); per_window 1:
+   ema^wpu, wpu the windows the update consumed, so the horizon is 1/(1-ema) windows whatever --accum (auto) does. Warmup: 0.9 for the
+   first 100 updates (ostep < 100) either way, as before. */
+float ema_update_decay(float ema, int per_window, long wpu, long ostep);
