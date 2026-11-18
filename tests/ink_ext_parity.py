@@ -7,6 +7,7 @@ and the official sources src/v8in (HF YoussefMoNader/ink-8um-v8in), src/hecate (
 villa merge-ink-pipelines: ink-detection/koine_machines, vesuvius/src/vesuvius/models + image_proc). Real tiles are CT boxes of
 the local PHerc1299 pyramid (UFSM_INKEXT_CT root + key, default ~/ufsm-data/vol PHerc1299/...), skipped when absent."""
 import os, pathlib, subprocess, sys, tempfile, types
+os.environ.setdefault("UFSM_XNET_MX", "0")   # the parity tests check the fp16 port; hecate24 defaults to MX5 otherwise
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 UFSM = ROOT / "build/ufsm"

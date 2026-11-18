@@ -656,6 +656,9 @@ int cmd_ink_ext(int argc, char **argv) {
                         "  --native-only: only <name>_<model>_native.tif/.jpg on the model grid (px (i, j) = tifxyz grid (i, j) x du; invalid cells 0), no canvas TIF\n"); return 2;
     }
     const int kind = ie_model_kind(mname); if (kind < 0) { fprintf(stderr, "ink-ext: unknown model %s\n", mname); return 2; }
+    /* hecate24 runs MX5 (NVFP4-style fp4) by default: 1667 w013 bench, card 1 exclusive, interleaved x2: net 484 vs 538 s (1.11x), wall
+       501 vs 552-602 s; held-out AUC -0.0002 [-0.0009, +0.0004] (DESIGN 2026-11-17). UFSM_XNET_MX=0 keeps fp16 (parity tests). */
+    if (kind == ie_model_kind("hecate24") && !getenv("UFSM_XNET_MX")) { setenv("UFSM_XNET_MX", "5", 1); fprintf(stderr, "ink-ext: hecate24 in MX5 (UFSM_XNET_MX=0: fp16)\n"); }
     if (xnet_init(opt_atoi("--gpu", iopt(argc, argv, "--gpu", "0")))) return 1;
     enum { MAXE = 16 }; ie_net *nets[MAXE]; int nnet = 0;
     {   /* --weights W1,W2,..: each checkpoint loaded once */

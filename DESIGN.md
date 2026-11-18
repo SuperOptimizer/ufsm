@@ -1125,9 +1125,16 @@ hecate24 MX-fp4 speed (bench region 1500,900,995,260 of 1667 w013, 102.98 Mpx at
 +0.0004]); the speed is not settled, card 1 was shared in every full-region run. 31cae5a0: fp16 846.9 s (0.122 Mpx/s), MX5 1298.2 s
 (0.079 Mpx/s; this run overlapped another card-1 job, so the earlier "MX5 1.53x slower" was contention). 07465e87, 09:10-09:35, card
 still shared: MX5 684.1 s (0.151 Mpx/s, 9.3 tiles/s), fp16 612.0 s (0.168 Mpx/s, 10.3 tiles/s). Net-only synthetic tiles
-(UFSM_IE_BENCH, idle card): fp16 91 / 88 / 95 ms per tile at batch 1 / 2 / 4, MX5 85 / 78 / 79. A quiet back-to-back pair is
-pending (scripts/benchh24c.sh in /vesuvius/ufsm/inksdk); hecate24 stays fp16 until then. Render is 29-32 s of the wall (level-0
-cache on disk), so the net is the whole cost.
+(UFSM_IE_BENCH, idle card): fp16 91 / 88 / 95 ms per tile at batch 1 / 2 / 4, MX5 85 / 78 / 79.
+**Clean pair (18:55-19:40, card 1 exclusive per arm, team lock rule, arms interleaved x2, no foreign process on card 1 in any arm;
+/vesuvius/ufsm/inksdk/scripts/benchh24f.sh, binary 07465e87):**
+| arm | wall | net | tiles/s | Mpx/s (wall) |
+|---|---|---|---|---|
+| MX5 rep 1 / 2 | 501.3 / 501.3 s | 485.4 / 483.2 s | 12.8 / 12.8 | 0.205 |
+| fp16 rep 1 / 2 | 551.5 / 601.6 s | 539.5 / 536.4 s | 11.5 / 11.6 | 0.187 / 0.171 |
+MX5 is 1.11x on the net (484 vs 538 s) and repeatable to 0.5 %. The render (15-87 s, level-0 CT from the disk cache) is the noisy part.
+All earlier contended runs read low by 20-40 %. Decision: ink-ext runs hecate24 in MX5 by default (UFSM_XNET_MX=0 for fp16; the
+parity tests set it, since they check the fp16 port).
 
 ## Unroll perf 3: no context on unlisted cards; the ref's chunk rows fixed (2026-11-17, branch unrollperf3-20261117)
 
