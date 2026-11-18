@@ -223,7 +223,7 @@ mstart() {
   elif [ -n "${INKCMD:-}" ]; then mset inkcmd "$INKCMD"; mset ink_ck "${LATINK_CK:-the default of INKCMD}"; [ -n "${LATINK_CK:-}" ] && mset ink_ck_sha "$(fsha $LATINK_CK)"
   else mset ink_ck "$(readlink -f $INKCK)"; mset ink_ck_sha "$(fsha $INKCK)"; fi
   mset box "${BOX:-mask}"; mset zr "${ZR:--}"; mset stripargs_env "${STRIPARGS:-}"
-  mset env "$(for v in CK FEMA FPX INKCK INKCMD LATINK_CK R3W R3GATE FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
+  mset env "$(for v in CK FEMA FPX INKCK INKCMD LATINK_CK R3W R3GATE R3PWGATE FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
 }
 mstage() {
   [ "$DRY" = 1 ] && return 0
@@ -904,7 +904,7 @@ pw_fin() {   # pw_fin WRAP: (r3) the wrap's ink from r3pre, CT-gated; the side-b
   if [ "$INKMODE" = r3 ]; then R3GATE=${R3PWGATE:-0} R3PRE=$O/ink/r3/up bash $H/r3ink.sh $O/up/$w $d/$w.tif $d/${w}_ct.tif >> $d/render.log 2>&1 || return 1; fi
   nice -n 10 $U ink-compare $O/img/${w}_full_side.jpg --ct $d/${w}_ct.tif --ink "$INKNAME=$d/$w.tif" --px-um $LUM --stretch --stretch-ct --max-px 65000 --threads ${RTH:-8} \
     --then $O/prev/${w}_side.jpg --max-px 8000 > $d/stats.txt 2>&1 || return 1   # (its status is the job's: audit mini/shell #4)
-  # (KEEPINK=1: the CT-gated ink map kept as ink/wraps/<w>.tif, the GT score's input: inkscore.sh TAG $O/up $O/ink/wraps; pod queue 11-18)
+  # (KEEPINK=1: the ink map (ungated, R3PWGATE) kept as ink/wraps/<w>.tif, the GT score's input: inkscore.sh TAG $O/up $O/ink/wraps; pod queue 11-18)
   [ "${KEEPINK:-0}" = 1 ] && [ -e $O/img/${w}_full_side.jpg ] && { mkdir -p $O/ink/wraps && mv -f $d/$w.tif $O/ink/wraps/$w.tif || return 1; }
   [ -e $O/img/${w}_full_side.jpg ] && rm -f $d/$w.tif $d/${w}_ct.tif $d/.rendered
   echo "$(date '+%F %T') $w $(grep -E '^[^ ]+: input' $O/logs/pw/$w.flat.log 2>/dev/null | head -1 | grep -oE '= [0-9.]+ cm2')" >> $O/logs/perwrap.list
@@ -963,7 +963,7 @@ r3once() {   # r3once GPU: (after r3once_ok) $O/ink/r3/up/<w>_$R3MODEL.tif from 
   log "r3once: $(ls $W/dst | wc -l) wraps from the stripes' maps: $(grep -oE '[0-9]+ px resampled, [0-9]+ nonzero from the residual maps' $O/logs/r3once.log | tail -1)"
 }
 perwrap() {
-  [ "$DRY" = 1 ] && { echo "    per wrap (largest first, SPAR ${SPAR:-4}, GPUs of FITGPUS in turn): tifxyz-scale -> flatten --gpu 1 -> tifxyz-scale --flip-rows 1 -> render (ink + CT)$([ "$INKMODE" = r3 ] && echo "; then ONE ink-ext over all rendered wraps (r3pre, --cache $O/ink/ct.cache: $R3W) -> per wrap r3ink.sh (CT >= $R3GATE gate)") -> ink-compare --then"; return 0; }
+  [ "$DRY" = 1 ] && { echo "    per wrap (largest first, SPAR ${SPAR:-4}, GPUs of FITGPUS in turn): tifxyz-scale -> flatten --gpu 1 -> tifxyz-scale --flip-rows 1 -> render (ink + CT)$([ "$INKMODE" = r3 ] && echo "; then ONE ink-ext over all rendered wraps (r3pre, --cache $O/ink/ct.cache: $R3W) -> per wrap r3ink.sh (CT gate ${R3PWGATE:-0}: unfilled per-wrap CT)") -> ink-compare --then"; return 0; }
   mkdir -p $O/orig $O/flat $O/up $O/r $O/img $O/prev $O/logs/pw
   local w k=0 nf=0 p pg=($FITGPUS) WD=$(wrapsdir); local -A pid
   for w in $(for f in $WD/w*.sfc; do w=$(basename $f .sfc); [ -e $O/img/${w}_full_side.jpg ] || echo "$(stat -c %s $f) $w"; done | sort -rn | awk '{print $2}'); do
