@@ -70,6 +70,7 @@ int cmd_surf_labels(int argc, char **argv);   /* src/surflabels.c */
 int cmd_sheet_score(int argc, char **argv);   /* src/sheetscore.c */
 int cmd_phase_coh(int argc, char **argv);   /* src/phasecoh.c */
 int cmd_patch_solve(int argc, char **argv);   /* src/patchsolve.c */
+int cmd_fill_oracle(int argc, char **argv);   /* src/filloracle.c */
 int cmd_trace_prep(int argc, char **argv);    /* src/tracebox.c */
 int cmd_patch_score(int argc, char **argv);   /* src/tracebox.c */
 int cmd_sheet_trace(int argc, char **argv);   /* src/sheettrace.c */
@@ -257,6 +258,7 @@ static int usage(void) {
         "  ufsm sheet-trace --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A --out DIR [--tol 2] [--step 2]   fast sheet patch tracer: radial peaks linked as height fields r(theta, z)\n"
         "  ufsm patch-score --paths DIR --gt G --box Z0,Y0,X0,NZ,NY,NX --axis A [--sgn S]   traced patches vs GT codes: sheet recall, precision, purity\n"
         "  ufsm patch-solve --paths DIR --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A [--gt G] ..   global turn numbers of traced sheet patches (ray gap votes, exact L1)\n"
+        "  ufsm fill-oracle --fields DIR --model M --codes ROOT KEY --out DIR [--mode fill|shape|ref|..] [--mask gt|mf]   count-constrained fill of merged spans (oracles; wind-score OUT)\n"
         "  ufsm phase-coh <phase-root> <key> <ct-root> <ct-key> <out> --weight T0,T1 [--cell 32]   CT-coherence phase weight of a rendered stored phase (re-gate)\n"
         "  ufsm sheet-score <ours-root> <ours-key> <gt-root> <gt-key> [--tol 1] [--prec-r 8] [--cell 64] [--box ..]   sheet recall / precision / local + global turn consistency of winding code rasters\n"
         "  ufsm surf-labels <wraps-dir|strip.sfc> <out-dir> --axis F --axis-um U0 --dir +-1 --grid-um U --like ROOT KEY   winding codes + pair phase + ignore from .sfc wraps\n"
@@ -5077,6 +5079,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "sheet-score")) return cmd_sheet_score(argc, argv);
     if (!strcmp(cmd, "phase-coh")) return cmd_phase_coh(argc, argv);
     if (!strcmp(cmd, "patch-solve")) return cmd_patch_solve(argc, argv);
+    if (!strcmp(cmd, "fill-oracle")) return cmd_fill_oracle(argc, argv);
     if (!strcmp(cmd, "trace-prep")) return cmd_trace_prep(argc, argv);
     if (!strcmp(cmd, "patch-score")) return cmd_patch_score(argc, argv);
     if (!strcmp(cmd, "sheet-trace")) return cmd_sheet_trace(argc, argv);
