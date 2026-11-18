@@ -399,6 +399,7 @@ test_w4dev~racecheck                           | gpu,slow     |   120 | bash tes
 test_w4dev~synccheck                           | gpu,slow     |   120 | bash tests/sanitize.sh synccheck ./$B/test_w4dev
 test_win_weight                                | gpu          |     2 | ./$B/test_win_weight
 test_retain                                    |              |     1 | bash tests/test_retain.sh
+test_rhocal                                    |              |     1 | bash tests/test_rhocal.sh
 test_evwatch                                   |              |     1 | bash tests/test_evwatch.sh
 test_podscripts                                |              |     1 | bash tests/test_podscripts.sh
 test_split_ab                                  | gpu2,slow    |   150 | tests/test_split_ab.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/splitab

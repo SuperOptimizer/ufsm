@@ -469,15 +469,17 @@ rcprof() {   # rcprof BANDS.tsv "R:K,..." (previous profile, empty = 1) -> the n
       for (i = 2; i <= np; i++) if (r <= pr[i]) return pk[i - 1] + (r - pr[i - 1]) / (pr[i] - pr[i - 1]) * (pk[i] - pk[i - 1]) }
     BEGIN { np = split(prev, pp, ","); for (i = 1; i <= np; i++) { split(pp[i], q, ":"); pr[i] = q[1]; pk[i] = q[2] }; if (prev == "") np = 0 }
     NR > 1 { nb++; r[nb] = ($1 + $2) / 2; nn[nb] = $3; ct[nb] = $4; use[nb] = ($3 >= nmin && $6 >= 0.45 && $5 <= 0.4 && $7 <= 0.4 && $4 > 0)
-             k[nb] = kprev(r[nb]) * (use[nb] ? $4 ^ g : 1); if (use[nb]) nu++ }
+             kp[nb] = kprev(r[nb]); k[nb] = kp[nb] * (use[nb] ? $4 ^ g : 1); if (use[nb]) nu++ }
     END { if (!nu) { print ""; exit }
           if (mode == "global") {   # RHOCALMODE=global: one K for the scroll, from the used bands pooled (n-weighted)
             for (i = 1; i <= nb; i++) if (use[i]) { sn += nn[i]; sc += nn[i] * ct[i] }; gk = kprev(0) * (sc / sn) ^ g
-            gk = gk < kmin ? kmin : gk > kmax ? kmax : gk; printf "0:%.3f\n", gk; if (sc / sn - 1 <= tol && 1 - sc / sn <= tol) print "converged" > "/dev/fd/3"; exit }
+            gk = gk < kmin ? kmin : gk > kmax ? kmax : gk; printf "0:%.3f\n", gk; k0 = kprev(0)
+            if ((sc / sn - 1 <= tol && 1 - sc / sn <= tol) || (k0 >= kmax - 1e-6 && sc > sn) || (k0 <= kmin + 1e-6 && sc < sn)) print "converged" > "/dev/fd/3"; exit }
           for (i = 1; i <= nb; i++) if (!use[i]) { best = -1; for (j = 1; j <= nb; j++) if (use[j] && (best < 0 || (i - j) ^ 2 < (i - best) ^ 2)) best = j; k[i] = k[best] }
           for (i = 1; i <= nb; i++) { a = k[i > 1 ? i - 1 : i]; b = k[i]; c = k[i < nb ? i + 1 : i]; m = a < b ? (b < c ? b : (a < c ? c : a)) : (a < c ? a : (b < c ? c : b))
-                                      capped = (m <= kmin || m >= kmax); m = m < kmin ? kmin : m > kmax ? kmax : m; out = out (i > 1 ? "," : "") sprintf("%.2f:%.3f", r[i], m)
-                                      if (use[i] && !capped) { ew += nn[i]; ea += nn[i] * (ct[i] > 1 ? ct[i] - 1 : 1 - ct[i]) } }   # (a band held at the cap cannot move)
+                                      m = m < kmin ? kmin : m > kmax ? kmax : m; out = out (i > 1 ? "," : "") sprintf("%.2f:%.3f", r[i], m)
+                                      held = (kp[i] >= kmax - 1e-6 && ct[i] > 1) || (kp[i] <= kmin + 1e-6 && ct[i] < 1)   # (already at the cap, pushed further: cannot move)
+                                      if (use[i] && !held) { ew += nn[i]; ea += nn[i] * (ct[i] > 1 ? ct[i] - 1 : 1 - ct[i]) } }
           # converged: the interval-weighted mean |CT/turn - 1| over the used, uncapped bands <= RHOCALTOL (per band, the median-3 makes
           # neighbours with opposite errors (0332 u1 pass 2: 0.91 / 1.02 / 1.11) unreachable together, so a per-band test never stops)
           print out; if (!ew || ea / ew <= tol) print "converged" > "/dev/fd/3" }' "$1"
