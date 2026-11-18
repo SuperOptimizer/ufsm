@@ -52,7 +52,7 @@ static blk bl_take(blist *l, size_t i) { blk b = l->b[i]; l->b[i] = l->b[--l->n]
    11-18 desk card 1: ink-ext reader3 at --batch 16 got nullptr from four failed cudaMalloc (288 / 144 / 0 / 9 MB) and its next
    forward wrote through them (Xid 31 null-address MMU fault), which took down the trainer's context on the same card.
    UFSM_XNET_FAIL_ALLOC=N: the Nth cache-missing allocation fails without touching the device (tests/test_xnet_oom.c, pod forced-failure runs). */
-static long g_fail_at = -1, g_nalloc = 0;
+static long g_fail_at = -1, g_nalloc = 0;   /* mgpu: guarded (g_mu) */
 static int forced_fail(void) {
     if (g_fail_at < 0) { const char *e = getenv("UFSM_XNET_FAIL_ALLOC"); g_fail_at = e && *e ? atol(e) : 0; }
     return g_fail_at > 0 && ++g_nalloc == g_fail_at;
