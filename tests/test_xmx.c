@@ -278,6 +278,23 @@ static int run_c1(int N, int D, int H, int W) {
     return bad != 0;
 }
 
+/* the 2-D transposed conv (k2 s2) shuffle: k_tshuffle8 (8 channels a thread, the default) byte-equal to the per-element k_tshuffle */
+static int run_ts(int N, int D, int H, int W, int ci, int co) {
+    const size_t nx = (size_t)N * D * H * W * ci, ny = (size_t)N * D * 4 * H * W * co; uint16_t *xh = malloc(nx * 2), *y0 = malloc(ny * 2), *y1 = malloc(ny * 2);
+    float *w = malloc((size_t)ci * co * 4 * 4), *b = malloc((size_t)co * 4);
+    for (size_t i = 0; i < nx; i++) xh[i] = f2h(rnd() * 3.f);
+    for (size_t i = 0; i < (size_t)ci * co * 4; i++) w[i] = rnd() * 0.1f;
+    for (int c = 0; c < co; c++) b[c] = rnd();
+    xnet_set_mx(0); xconv c; xtconv_init(&c, w, ci, co, b); xt xd = xt_new(N, D, H, W, ci); xh2d(xd.p, xh, nx * 2);
+    xnet_set_ts8(0); xt ya = xconv_fwd(&c, xd, nullptr, XA_NONE); xd2h(y0, ya.p, ny * 2);
+    xnet_set_ts8(1); xt yb = xconv_fwd(&c, xd, nullptr, XA_NONE); xd2h(y1, yb.p, ny * 2); xnet_set_ts8(-1);
+    if (xnet_check("test_xmx ts")) return 1;
+    size_t nd = 0; for (size_t i = 0; i < ny; i++) nd += y0[i] != y1[i];
+    printf("ts N %d %dx%dx%d %d -> %d: %zu of %zu differ from k_tshuffle\n", N, D, H, W, ci, co, nd, ny);
+    xt_free(&xd); xt_free(&ya); xt_free(&yb); xconv_free(&c); free(xh); free(y0); free(y1); free(w); free(b);
+    return nd != 0;
+}
+
 #include <time.h>
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 /* XMX_BENCH=1: time the gambiarra-sized convs (16 crops) per format (0 fp16, 6, 5): TMAC/s */
@@ -349,6 +366,9 @@ int main(void) {
     for (int sf = 6; sf >= 5; sf--) { fails += run(sf, 2, 9, 7, 11, 32, 32, 3, 1, 2); fails += run(sf, 1, 6, 5, 7, 128, 256, 1, 1, 0); }
     g_mxa = 0; xnet_set_mxq(0); xnet_set_mxrot(0); xnet_set_mxa(0);
     fails += run_dattn(2, 17, 40, 36);
+    fails += run_ts(2, 1, 7, 9, 32, 16);     /* ragged, two samples */
+    fails += run_ts(1, 1, 24, 24, 64, 8);
+    fails += run_ts(3, 1, 5, 13, 16, 64);
     fails += run_gnin(2, 17, 20, 70);
     fails += run_c1(2, 17, 30, 41);
     fails += run_c1(1, 3, 9, 23);     /* W % 4 ragged */
