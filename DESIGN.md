@@ -272,6 +272,40 @@ forward wrote through the null buffers. The same pattern hit the 08:28 card-0 ru
   - baseline before / after: rc 0;
   - reader3 on wrap w040 of the q2 run: map byte-identical to the pod master build (142 vs 140 tiles/s).
 
+## Slab-fit voxel unwrapping without records; the node fill from a frontier (2026-11-18, branch vunwrap-20261118, fp4teach)
+
+After the stage-4 step A/B (above: the steps are not stage 4's cost) the voxel unwrapping was 1.7 of a slab's 2.8 s stage 4 on the pod
+(1667 s030: setup 0.3, flood 0.6, nodes 0.8 s). perf on the desk: atan2 / hypot bound. For the unroll's fits (`--ref-snap 1 --uw-repair
+0`) every voxel took theta = atan2 about the box's axis three times (uw_setup, uw_refsnap, uw_accum), the ref's radius / angle once
+more, uw_q twice, and an 8 B record of fresh zero pages (0.5 GB a slab) was written and read twice. And the node fill (nodes without
+voxels: the mean of their filled neighbours) always ran its 64 passes, each a sweep of all 440 K lattice nodes: 0.40 s.
+
+- `fit_node_fill`: a pass fills exactly the unfilled neighbours of the previous pass's nodes, so the frontier version visits each filled
+  node and its neighbours once; same nodes, same neighbour order, same doubles (0.40 -> 0.03 s). `UFSM_UW_FILL_OLD=1`: the sweep.
+- uw_snapfused (ref_snap 1, no repair; `UFSM_UW_RECORDS=1`: the three passes over records): no records. The seed from q alone
+  (uw_seedq, the same per-thread first maximum), the ref bias on its subsample and the seed's integer base from record values computed
+  in place (uw_rec: uw_setup's expressions), and the snapped integer inside the node accumulation (uw_accum_snap): one atan2 and one
+  hypot a voxel. The ref's radius / angle reuse the box's when the ref's axis at zr is bit-equal to the box's at pz and the y / x
+  offsets are 0 (a z slab of the ref's box: every row of s030; checked per row, `UFSM_UW_SAME=0` off): equal arguments, equal results.
+  mcc contracts no host FMA, so one theta reproduces all three of the old ones.
+
+Byte-identical: the s030 model (desk, every run), test_fit_join's ref-snap slab against UFSM_UW_RECORDS=1 and UFSM_UW_SAME=0, test_uwfill
+(frontier vs sweep on random lattices, cap hit and not), and the pod's joined 1667 model (md5 = the OV 8 arm's in all four arms).
+
+Pod (RTX PRO 4000, 3 lanes x 9 threads, 1667 slabs .. join at OV 8, interleaved old / new x2, same binary, old = UFSM_UW_RECORDS=1
+UFSM_UW_FILL_OLD=1):
+
+| arm | slabs wall | slabs CPU | unwrap summed over 71 slabs (setup / flood / nodes) | stage 4 summed |
+|---|---|---|---|---|
+| old 1 | 117 s | 1428 s | 138.1 s (28.5 / 44.6 / 65.0) | 159.0 s |
+| new 1 | 99 s | 976 s | 70.2 s (6.7 / 3.1 / 60.4) | 91.0 s |
+| old 2 | 117 s | 1437 s | 140.0 s (28.7 / 44.8 / 66.5) | 160.7 s |
+| new 2 | 98 s | 976 s | 71.1 s (6.8 / 3.2 / 61.1) | 89.4 s |
+
+The slab stage -16 % wall, -32 % CPU; join unchanged (22 s). Single-thread on the desk (s030): unwrap 12.6 -> 7.8 s. What is left is
+the fused accumulation (~110 ns a voxel single-threaded: uw_q, one atan2 + hypot, two lattice evaluations); inlining ev_party_W did
+not change it.
+
 ## Slab overlap 8 instead of 16: the unroll default (2026-11-18, branch slabov8-20261118, fp4teach)
 
 unroll.sh's slab fits take SLABI 64 interior cells plus SLABOV overlap cells each side; the overlap rows feed fit-join's gauges. A/B on
