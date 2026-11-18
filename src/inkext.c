@@ -492,6 +492,51 @@ static void pf_close(ie_pf *P) {   /* the queue dropped: what is not fetched is 
     for (int i = 0; i < P->nt; i++) pthread_join(P->th[i], nullptr);
     pthread_mutex_destroy(&P->mu); pthread_cond_destroy(&P->cv); free(P);
 }
+/* the model-grid rows of run_surface's tile rows: a ring of RB rows; tile row iy needs rows [ylo, need1) (rf_span). rf_fill renders the
+   rows it lacks (and their dump / ctl / cov). run_surface renders tile row iy + 1's rows on a second thread while the tiles of row iy go
+   to the GPU: before (11-18 pod 1667 stripe ws000), the renderer waited for the GPU after each tile row and the GPU for the renderer
+   (render 62 s + net 142 s = 204 of 233 s). Rows are rendered in the same order into the same slots: the same bytes. */
+typedef struct {
+    irun *X; irender *R; const ie_spec *sp; uint8_t **ring; int RB, D, T, Wm, Hm, ctx, v8, *ys; float *ctl; uint8_t *cov;
+    int rb0, rb1, fail; double tr;
+} rfill;
+static void rf_span(const rfill *F, int iy, int *pylo, int *pneed1) {
+    const int y0 = F->ys[iy]; int ylo = y0, need1 = (y0 + F->T + (F->v8 ? 8 : 0)) < F->Hm ? y0 + F->T + (F->v8 ? 8 : 0) : F->Hm;
+    if (F->ctx) {   /* Studio: the rows of the reflect-padded window [y0 - ctx, y0 - ctx + T) */
+        int a = F->Hm, b = 0; for (int y = 0; y < F->T; y++) { const int r = crop_refl(y0 - F->ctx, y, F->T, F->Hm); if (r < a) a = r; if (r > b) b = r; }
+        ylo = a; need1 = b + 1;
+    }
+    *pylo = ylo; *pneed1 = need1;
+}
+static void rf_fill(rfill *F, int iy) {
+    irun *X = F->X; const int D = F->D, Wm = F->Wm, RB = F->RB; int ylo, need1; rf_span(F, iy, &ylo, &need1);
+    #define FROW(r) F->ring[(r) % RB]
+    if (ylo < F->rb0) { fprintf(stderr, "ink-ext: row order\n"); F->fail = 1; return; }
+    if (ylo > F->rb1) F->rb1 = ylo;
+    if (F->rb0 < ylo - 8) F->rb0 = ylo - 8 > F->rb0 ? ylo - 8 : F->rb0;   /* keep a few rows behind for the v8in closing */
+    if (F->rb0 < 0) F->rb0 = 0;
+    if (need1 > F->rb1) {
+        if (need1 - F->rb0 > RB) F->rb0 = need1 - RB;
+        if (F->rb1 < F->rb0) F->rb1 = F->rb0;
+        const double t0 = inow(); uint8_t *rp[need1 - F->rb1]; for (int r = F->rb1; r < need1; r++) rp[r - F->rb1] = FROW(r);
+        if (X->stk) {   /* model layer i = stack layer stk0 + i (reversed: stk0 + D - 1 - i), as the official readers select */
+            const int stk0 = X->stk_n / 2 - D / 2 + (int)lround(X->shift);
+            for (int r = F->rb1; r < need1; r++) for (int i = 0; i < D; i++)
+                memcpy(FROW(r) + (size_t)i * Wm, X->stk[stk0 + (X->reverse ? D - 1 - i : i)] + (size_t)r * Wm, (size_t)Wm);
+        } else if (render_rows(F->R, F->rb1, need1, rp, X->nth)) F->fail = 1;
+        if (X->dump) for (int r = F->rb1; r < need1; r++) for (int i = 0; i < D; i++) memcpy(X->dump + ((size_t)i * F->Hm + r) * Wm, FROW(r) + (size_t)i * Wm, (size_t)Wm);
+        if (F->ctl) for (int r = F->rb1; r < need1; r++) for (int x = 0; x < Wm; x++) F->ctl[(size_t)r * Wm + x] = FROW(r)[(size_t)F->sp->center * Wm + x] / 255.f;
+        if (F->cov) for (int r = F->rb1; r < need1; r++) for (int x = 0; x < Wm; x++) {
+            uint8_t m = 0; for (int i = 0; i < D; i++) m |= FROW(r)[(size_t)i * Wm + x];
+            F->cov[(size_t)r * Wm + x] = m != 0;
+        }
+        F->rb1 = need1; F->tr += inow() - t0;
+    }
+    #undef FROW
+}
+typedef struct { rfill *F; int iy; } rfjob;
+static void *rf_main(void *a) { rfjob *J = a; rf_fill(J->F, J->iy); return nullptr; }
+
 static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *pdu, float **pctl) {
     const ie_spec *sp = X->sp; const int D = sp->D, T = sp->T;
     irender R; const int L = render_init(X, S, &R);
@@ -530,9 +575,13 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     else if (X->kind == IE_V8IN) { xs = axis_starts_v8(Wm, T, stride, &nx); ys = axis_starts_v8(Hm, T, stride, &ny); }
     else if (ie_is_koine(X->kind) || ie_colvalid_kind(X->kind)) { xs = axis_starts_koine(Wm, T, stride, &nx); ys = axis_starts_koine(Hm, T, stride, &ny); }   /* canonical grid(): the same */
     else { xs = axis_starts_hecate(Wm, T, stride, &nx); ys = axis_starts_hecate(Hm, T, stride, &ny); }
-    /* rolling row buffer: rows [rb0, rb1) */
-    const int RB = T + 16; uint8_t **ring = malloc(RB * sizeof *ring); for (int i = 0; i < RB; i++) ring[i] = malloc((size_t)D * Wm);
-    int rb0 = 0, rb1 = 0;
+    /* rolling row buffer: rows [rb0, rb1); RB also holds the next tile row's new rows (rendered ahead): + the largest tile-row step.
+       UFSM_IE_AHEAD=0: render each tile row when it comes (the old order) */
+    static int ahead = -1; if (ahead < 0) ahead = getenv("UFSM_IE_AHEAD") ? atoi(getenv("UFSM_IE_AHEAD")) : 1;   /* mgpu: env */
+    int ystep = 0; for (int i = 0; i + 1 < ny; i++) if (ys[i + 1] - ys[i] > ystep) ystep = ys[i + 1] - ys[i];
+    const int RB = T + 16 + (ahead ? ystep + 8 : 0); uint8_t **ring = malloc(RB * sizeof *ring); for (int i = 0; i < RB; i++) ring[i] = malloc((size_t)D * Wm);
+    rfill F = {X, &R, sp, ring, RB, D, T, Wm, Hm, ctx, v8, ys, ctl, cov, 0, 0, 0, 0};
+    pthread_t rth; int rpend = -1; rfjob RJ;   /* the tile row being rendered ahead (-1 none) */
     const int B = X->batch; uint8_t *tiles = malloc((size_t)B * D * T * T); int *tx = malloc(B * sizeof *tx), *ty = malloc(B * sizeof *ty); int nb = 0;
     float *out = malloc((size_t)B * T * T * sizeof *out);
     gworker G = {0}; pthread_mutex_init(&G.mu, nullptr); pthread_cond_init(&G.cv, nullptr);
@@ -543,31 +592,9 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     long long ntiles = 0, nskip = 0; double tr = 0, tg = 0; int fail = 0;
     #define ROW(r) ring[(r) % RB]
     for (int iy = 0; iy < ny && !fail; iy++) {
-        const int y0 = ys[iy]; int ylo = y0, need1 = (y0 + T + (v8 ? 8 : 0)) < Hm ? y0 + T + (v8 ? 8 : 0) : Hm;
-        if (ctx) {   /* Studio: the rows of the reflect-padded window [y0 - ctx, y0 - ctx + T) */
-            int a = Hm, b = 0; for (int y = 0; y < T; y++) { const int r = crop_refl(y0 - ctx, y, T, Hm); if (r < a) a = r; if (r > b) b = r; }
-            ylo = a; need1 = b + 1;
-        }
-        if (ylo < rb0) { fprintf(stderr, "ink-ext: row order\n"); fail = 1; break; }
-        if (ylo > rb1) rb1 = ylo;
-        if (rb0 < ylo - 8) rb0 = ylo - 8 > rb0 ? ylo - 8 : rb0;   /* keep a few rows behind for the v8in closing */
-        if (rb0 < 0) rb0 = 0;
-        if (need1 > rb1) {
-            if (need1 - rb0 > RB) rb0 = need1 - RB;
-            if (rb1 < rb0) rb1 = rb0;
-            const double t0 = inow(); uint8_t *rp[RB]; for (int r = rb1; r < need1; r++) rp[r - rb1] = ROW(r);
-            if (X->stk) {   /* model layer i = stack layer stk0 + i (reversed: stk0 + D - 1 - i), as the official readers select */
-                for (int r = rb1; r < need1; r++) for (int i = 0; i < D; i++)
-                    memcpy(ROW(r) + (size_t)i * Wm, X->stk[stk0 + (X->reverse ? D - 1 - i : i)] + (size_t)r * Wm, (size_t)Wm);
-            } else if (render_rows(&R, rb1, need1, rp, X->nth)) fail = 1;
-            if (X->dump) for (int r = rb1; r < need1; r++) for (int i = 0; i < D; i++) memcpy(X->dump + ((size_t)i * Hm + r) * Wm, ROW(r) + (size_t)i * Wm, (size_t)Wm);
-            if (ctl) for (int r = rb1; r < need1; r++) for (int x = 0; x < Wm; x++) ctl[(size_t)r * Wm + x] = ROW(r)[(size_t)sp->center * Wm + x] / 255.f;
-            if (cov) for (int r = rb1; r < need1; r++) for (int x = 0; x < Wm; x++) {
-                uint8_t m = 0; for (int i = 0; i < D; i++) m |= ROW(r)[(size_t)i * Wm + x];
-                cov[(size_t)r * Wm + x] = m != 0;
-            }
-            rb1 = need1; tr += inow() - t0;
-        }
+        const int y0 = ys[iy]; int ylo, need1; rf_span(&F, iy, &ylo, &need1);
+        if (rpend == iy) { pthread_join(rth, nullptr); rpend = -1; } else rf_fill(&F, iy);
+        if (F.fail) { fail = 1; break; }
         if (v8) {   /* closing (dilate, erode with the 7 x 7 ellipse; outside pixels neutral) of the rows the tiles need */
             const int c1 = need1 - (need1 < Hm ? 6 : 0);
             for (int y = closed_to; y < c1; y++) for (int x = 0; x < Wm; x++) {
@@ -586,6 +613,10 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
                 closed[(size_t)y * Wm + x] = (uint8_t)all;
             }
             if (c1 > closed_to) closed_to = c1;
+        }
+        if (ahead && iy + 1 < ny) {   /* tile row iy + 1's rows on a second thread, unless their slots still hold rows this tile row reads */
+            int ylo2, need2; rf_span(&F, iy + 1, &ylo2, &need2); RJ = (rfjob){&F, iy + 1};
+            if (need2 - RB <= ylo - 8 && ylo2 >= ylo && !pthread_create(&rth, nullptr, rf_main, &RJ)) rpend = iy + 1;
         }
         for (int ix = 0; ix <= nx && !fail; ix++) {
             if (ix < nx) {
@@ -626,9 +657,11 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
                 gpu_submit(&G, &tiles, &tx, &ty, nb); nb = 0;
             }
         }
-        if (iy % 8 == 0) fprintf(stderr, "\rink-ext: %s row %d/%d: %lld tiles (%lld empty), render %.0fs, net %.0fs   ", sp->name, iy + 1, ny, G.ntiles, nskip, tr, G.tg);
+        if (iy % 8 == 0) fprintf(stderr, "\rink-ext: %s row %d/%d: %lld tiles (%lld empty), render %.0fs, net %.0fs   ", sp->name, iy + 1, ny, G.ntiles, nskip, F.tr, G.tg);
     }
     #undef ROW
+    if (rpend >= 0) { pthread_join(rth, nullptr); rpend = -1; if (F.fail) fail = 1; }
+    tr = F.tr;
     pthread_mutex_lock(&G.mu); G.quit = 1; pthread_cond_broadcast(&G.cv); pthread_mutex_unlock(&G.mu);
     pthread_join(gth, nullptr);
     if (G.fail) fail = 1;
@@ -646,18 +679,29 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     return num;
 }
 
-/* the model-grid map resampled (bilinear) onto the surface's ufsm-render grid ((w - 1) / scale + 1 wide), 0 where the surface is invalid */
-static uint8_t *to_ref_grid(const isurf *S, const float *p, int Wm, int Hm, double du, int *ow, int *oh) {
-    const double gs = 1 / S->scale; *ow = (int)((S->w - 1) * gs) + 1; *oh = (int)((S->h - 1) * gs) + 1;
-    uint8_t *o = calloc((size_t)*ow * *oh, 1); if (!o) return nullptr;
-    for (int py = 0; py < *oh; py++) for (int px = 0; px < *ow; px++) {
+/* the model-grid map resampled (bilinear) onto the surface's ufsm-render grid ((w - 1) / scale + 1 wide), 0 where the surface is invalid;
+   rows on nth threads (the run's --threads; each pixel on its own: the same bytes; 11-18 pod: one thread over a 59997 x 9793 stripe was most of the
+   ~29 s between a stripe's last batch and its TIF) */
+typedef struct { const isurf *S; const float *p; int Wm, Hm, ow, oh; double du, gs; uint8_t *o; _Atomic int next; } rgjob;
+static void *rg_main(void *a) {
+    rgjob *J = a; const isurf *S = J->S; const float *p = J->p; const int Wm = J->Wm, Hm = J->Hm, ow = J->ow; const double du = J->du, gs = J->gs;
+    for (int py; (py = atomic_fetch_add(&J->next, 1)) < J->oh;) for (int px = 0; px < ow; px++) {
         const double gu = px / gs, gv = py / gs; double P[3], N[3], a[3], b[3];
         if (surf_pn(S, gu, gv, P, N, a, b)) continue;
         double mx = gu / du, my = gv / du; if (mx > Wm - 1) mx = Wm - 1; if (my > Hm - 1) my = Hm - 1;
         const int x0 = (int)mx, y0 = (int)my, x1 = x0 + 1 < Wm ? x0 + 1 : x0, y1 = y0 + 1 < Hm ? y0 + 1 : y0; const double fx = mx - x0, fy = my - y0;
         const double v = (1 - fy) * ((1 - fx) * p[(size_t)y0 * Wm + x0] + fx * p[(size_t)y0 * Wm + x1]) + fy * ((1 - fx) * p[(size_t)y1 * Wm + x0] + fx * p[(size_t)y1 * Wm + x1]);
-        o[(size_t)py * *ow + px] = (uint8_t)lround(v * 255);
+        J->o[(size_t)py * ow + px] = (uint8_t)lround(v * 255);
     }
+    return nullptr;
+}
+static uint8_t *to_ref_grid(const isurf *S, const float *p, int Wm, int Hm, double du, int *ow, int *oh, int nth) {
+    const double gs = 1 / S->scale; *ow = (int)((S->w - 1) * gs) + 1; *oh = (int)((S->h - 1) * gs) + 1;
+    uint8_t *o = calloc((size_t)*ow * *oh, 1); if (!o) return nullptr;
+    rgjob J = {S, p, Wm, Hm, *ow, *oh, du, gs, o, 0};
+    const int nt = nth < 1 ? 1 : nth > 64 ? 64 : nth; pthread_t th[64];
+    for (int t = 0; t < nt; t++) pthread_create(&th[t], nullptr, rg_main, &J);
+    for (int t = 0; t < nt; t++) pthread_join(th[t], nullptr);
     return o;
 }
 static int write_gray_jpeg_half(const char *path, const uint8_t *g, int w, int h);
@@ -894,7 +938,7 @@ surfaces:;
             pm[i] = v;
         }
         if (ctl) {   /* --ct-tif: the model's surface layer on the render grid, <surf>_<model>_ct.tif */
-            int cw, chh; uint8_t *cg = to_ref_grid(&S, ctl, Wm, Hm, du, &cw, &chh);
+            int cw, chh; uint8_t *cg = to_ref_grid(&S, ctl, Wm, Hm, du, &cw, &chh, X.nth);
             snprintf(p, sizeof p, "%s/%s_%s%s_ct.tif", outdir, nm, mname, suffix);
             if (!cg || tiffw_write(p, cw, chh, 1, cg, 1)) { fprintf(stderr, "ink-ext: cannot write %s\n", p); rc = 1; }
             free(cg); free(ctl);
@@ -928,7 +972,7 @@ surfaces:;
         int ow, oh; uint8_t *g;
         if (X.stk) {   /* --layers: the stack's pixel grid is the output grid */
             ow = Wm; oh = Hm; g = malloc((size_t)Wm * Hm); for (size_t i = 0; i < (size_t)Wm * Hm; i++) g[i] = (uint8_t)lroundf(pm[i] * 255);
-        } else g = to_ref_grid(&S, pm, Wm, Hm, du, &ow, &oh);
+        } else g = to_ref_grid(&S, pm, Wm, Hm, du, &ow, &oh, X.nth);
         snprintf(p, sizeof p, "%s/%s_%s%s.tif", outdir, nm, mname, suffix);
         if (!g || tiffw_write(p, ow, oh, 1, g, 1)) { fprintf(stderr, "ink-ext: cannot write %s\n", p); rc = 1; }
         /* --jpeg PATH: the half-res JPEG there (default <out>/<name>_<model><suffix>.jpg); --jpeg-stretch: p1-p99 over the surface */
