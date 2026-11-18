@@ -35,6 +35,7 @@ HDR="tag	box	scroll	ids	ids0	ids_a	ids_b	ids_sd	e08	p05	p1	p2	p4	p05x	p1x	p2x	p4
 [ -s $RES ] || echo "$HDR" > $RES
 [ -s $CEIL ] || printf 'box\tceil\tceil_p1x\tfrom\n' > $CEIL
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a $O/run.log; }
+NFAIL=0; FAILED=""; nfail() { NFAIL=$((NFAIL + 1)); FAILED="${FAILED:+$FAILED }$1"; }   # boxes / sites that got no row (exit 1 at the end)
 # GPU lock per box / per slab GPU step (released in between so short jobs interleave); NOLOCK=1: the caller holds it
 LK=; [ -z "${NOLOCK:-}" ] && [ -n "${LOCK:-}" ] && [ "${CPU:-0}" != 1 ] && LK=$LOCK
 # through the gpuq priority queue (scripts/gpuq.sh; PRIO bg by default: at every box / slab step it lets waiting jobs in, a "now"
@@ -188,13 +189,13 @@ pbatch
 for B in $BL; do
   ulk
   [ -n "${STOPAT:-}" ] && [ $(date +%s) -ge $STOPAT ] && { log "stop: the GPU window ends (STOPAT); $B and later boxes left for the next window"; break; }
-  IFS=$'\t' read -r nm sc z y x nz ny nx lv note <<< "$(awk -F'\t' -v b=$B '$1 == b' $BT)"; [ -n "${nx:-}" ] || { log "no box $B"; continue; }
+  IFS=$'\t' read -r nm sc z y x nz ny nx lv note <<< "$(awk -F'\t' -v b=$B '$1 == b' $BT)"; [ -n "${nx:-}" ] || { log "no box $B"; nfail $B; continue; }
   grep -qP "^$TAG\t$B\t" $RES && { log "$B done"; continue; }
-  scroll $sc || { log "$B: unknown scroll $sc"; continue; }
+  scroll $sc || { log "$B: unknown scroll $sc"; nfail $B; continue; }
   d=$O/$B; mkdir -p $d; f=$FD/$B
   lk; t0=$(date +%s)   # (pred_s without the GPU queue wait)
-  if [ -n "$FIELDS" ]; then [ -e $f/fields.json ] || { log "$B: no fields $f"; continue; }
-  elif [ ! -e $f/fields.json ]; then rm -f $d/pred.s; predict $f $z $y $x $nz $ny $nx $d/pred.log || { log "$B predict failed"; continue; }; fi
+  if [ -n "$FIELDS" ]; then [ -e $f/fields.json ] || { log "$B: no fields $f"; nfail $B; continue; }
+  elif [ ! -e $f/fields.json ]; then rm -f $d/pred.s; predict $f $z $y $x $nz $ny $nx $d/pred.log || { log "$B predict failed"; nfail $B; continue; }; fi
   # PHASE=predict (2026-11-12): only the predicts of the row (fields stay on disk); a later plain run fits and scores from them
   [ "${PHASE:-}" = predict ] && continue
   t1=$(date +%s); ps=$((t1 - t0)); [ -s $d/pred.s ] && ps=$(cat $d/pred.s)   # (pbatch: the box's own seconds in the --boxes run)
@@ -244,11 +245,11 @@ if [ "$SLABS" = 1 ]; then
     ulk
     S=site$s; grep -qP "^$TAG\t$S\t" $RS && { log "$S done"; continue; }
     d=$O/$S; mkdir -p $d; f=$FD/$S; t0=$(date +%s)
-    if [ -n "$FIELDS" ]; then [ -e $f/fields.json ] || { log "$S: no fields $f"; continue; }
-    elif [ ! -e $f/fields.json ]; then lk; predict $f $((2 * s)) 1024 512 320 7168 7680 $d/pred.log big || { log "$S predict failed"; continue; }; ulk; fi
+    if [ -n "$FIELDS" ]; then [ -e $f/fields.json ] || { log "$S: no fields $f"; nfail $S; continue; }
+    elif [ ! -e $f/fields.json ]; then lk; predict $f $((2 * s)) 1024 512 320 7168 7680 $d/pred.log big || { log "$S predict failed"; nfail $S; continue; }; ulk; fi
     bash $H/mkcrop.sh $f $d/fA 0 96 96 96 3328 3520 > /dev/null; bash $H/mkcrop.sh $f $d/fB 64 96 96 96 3328 3520 > /dev/null; bash $H/mkcrop.sh $f $d/fC 0 96 96 160 3328 3520 > /dev/null
     if [ -n "$SLABORC" ]; then   # slab ceiling: label phase in the slab crops (--fill net: network planes where unlabelled)
-      for k in A B C; do RUNBIG $U fields-oracle $d/f$k $PR $PK $d/o$k --fill $SLABORC --phase-scale $PF > $d/orc$k.log 2>&1 || { log "$S: fields-oracle $k failed"; continue 2; }
+      for k in A B C; do RUNBIG $U fields-oracle $d/f$k $PR $PK $d/o$k --fill $SLABORC --phase-scale $PF > $d/orc$k.log 2>&1 || { log "$S: fields-oracle $k failed"; nfail $S; continue 2; }
         rm -rf $d/f$k; mv $d/o$k $d/f$k; done
     fi
     for k in A B; do lk; UFSM_FIT_THREADS=$THREADS RUNBIG $U fit $d/f$k $GF --out $d/fit$k --codes $QR $QK --score-detail 1 --score-pairs 1 --dir 1 --uw-repair 8 ${FIT//\{box\}/$S} > $d/fit$k.log 2>&1; ulk
@@ -268,3 +269,5 @@ if [ "$SLABS" = 1 ]; then
 fi
 dulk; [ -n "$LK" ] && gpuq_release
 log "wbench $TAG finished"
+# (lead 11-18: every predict of a run failed and wbench still exited 0, so a caller saw rc 0 with no rows) a lost box / site is an error
+if [ $NFAIL -gt 0 ]; then log "wbench $TAG FAILED: $NFAIL boxes / sites without a row ($FAILED)"; exit 1; fi
