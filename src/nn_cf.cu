@@ -122,15 +122,31 @@ static uint8_t *pin_get(int q, size_t n) {
     if (cudaHostAlloc((void **)&g_pin[q], n, cudaHostAllocDefault) != cudaSuccess) { cudaGetLastError(); g_pin[q] = nullptr; return nullptr; }
     g_pin_n[q] = n; return g_pin[q];
 }
+/* the field rows [ra, rb) of plane k from the host row blocks (each block's rows contiguous, the blocks covering [ra, rb)) into dst */
+static int rows_copy(uint8_t *dst, const cf_gpu_rows *bk, int nbk, int k, int ra, int rb, size_t HW, int upt, cudaStream_t sc, int pinned) {
+    for (int r = ra; r < rb;) {
+        int j = 0; while (j < nbk && !(bk[j].r0 <= r && r < bk[j].r1)) j++;
+        if (j == nbk) return 1;
+        const int e = rb < bk[j].r1 ? rb : bk[j].r1; const size_t n = (size_t)(e - r) * HW; const uint8_t *src = bk[j].pl[k] + (size_t)(r - bk[j].r0) * HW;
+        if (pinned) par_copy(dst + (size_t)(r - ra) * HW, src, n, upt);
+        else if (cudaMemcpyAsync(dst + (size_t)(r - ra) * HW, src, n, cudaMemcpyHostToDevice, sc) != cudaSuccess) return 1;
+        r = e;
+    }
+    return 0;
+}
 extern "C" int cf_gpu_pool(const cf_gpu_poolcfg *c, const uint8_t *const pl[10], int zoff, int nzl, float *S, float *const G[3]) {
+    cf_gpu_rows b; for (int k = 0; k < 10; k++) b.pl[k] = pl[k]; b.r0 = zoff; b.r1 = zoff + nzl;
+    return cf_gpu_pool_rows(c, &b, 1, zoff, nzl, zoff / c->P, (zoff + nzl + c->P - 1) / c->P, S, G);
+}
+extern "C" int cf_gpu_pool_rows(const cf_gpu_poolcfg *c, const cf_gpu_rows *bk, int nbk, int zoff, int nzl, int Zs0, int Zs1, float *S, float *const G[3]) {
     const size_t HW = (size_t)c->H * c->W, cells = (size_t)c->hh * c->w; const int P = c->P;
     uint8_t *dpl[2] = {nullptr, nullptr}; float *dax = nullptr, *dsg[2] = {nullptr, nullptr}; int rc = 1; cudaStream_t sk = nullptr, sc = nullptr; ph_tab T;
     /* groups of solve rows: their field rows (+1 halo row each side, inside the chunk) of the 10 planes under ~2 GB, two buffers: the
        next group's upload overlaps this group's kernel */
     size_t fr = 0, tot = 0; if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) { cudaGetLastError(); return 1; }
-    const double bud = fmin(2e9, (fr - fmin((double)fr, 512e6)) / 2.2);   /* per buffer: 2 GB, or less of a shared device */
+    const double bud = fmin(c->stage_max > 0 ? c->stage_max : 2e9, (fr - fmin((double)fr, 512e6)) / 2.2);   /* per buffer: 2 GB (stage_max), or less of a shared device */
     int gZ = (int)((bud / (10.0 * HW) - 2) / P); if (getenv("UFSM_CF_POOL_GZ")) gZ = atoi(getenv("UFSM_CF_POOL_GZ")); if (gZ < 1) gZ = 1;   /* (env: tests) */
-    const int Z0 = zoff / P, Z1 = (zoff + nzl + P - 1) / P; if (gZ > Z1 - Z0) gZ = Z1 - Z0;
+    const int Z0 = Zs0 > zoff / P ? Zs0 : zoff / P, Z1 = Zs1 < (zoff + nzl + P - 1) / P ? Zs1 : (zoff + nzl + P - 1) / P; if (Z1 <= Z0) return 0; if (gZ > Z1 - Z0) gZ = Z1 - Z0;
     const int maxr = gZ * P + 2, ng = (Z1 - Z0 + gZ - 1) / gZ; const size_t pb = (size_t)maxr * HW;
     if (tab_get(&T)) return 1;
     const int pinned = !getenv("UFSM_CF_PINNED") || atoi(getenv("UFSM_CF_PINNED")) != 0, upt = getenv("UFSM_CF_UP_THREADS") ? atoi(getenv("UFSM_CF_UP_THREADS")) : 4;
@@ -153,8 +169,8 @@ extern "C" int cf_gpu_pool(const cf_gpu_poolcfg *c, const uint8_t *const pl[10],
             int ra = Za * P - 1, rb = (Za + nZ) * P + 1; if (ra < zoff) ra = zoff; if (rb > zoff + nzl) rb = zoff + nzl;
             const size_t nb = (size_t)(rb - ra) * HW; uint8_t *hp = pinned ? pin_get(q, 10 * pb) : nullptr;
             for (int k = 0; k < 10; k++) {
-                if (hp) { par_copy(hp + k * pb, pl[k] + (size_t)(ra - zoff) * HW, nb, upt); CF_CK(cudaMemcpyAsync(dpl[q] + k * pb, hp + k * pb, nb, cudaMemcpyHostToDevice, sc)); }
-                else CF_CK(cudaMemcpyAsync(dpl[q] + k * pb, pl[k] + (size_t)(ra - zoff) * HW, nb, cudaMemcpyHostToDevice, sc));
+                if (hp) { if (rows_copy(hp + k * pb, bk, nbk, k, ra, rb, HW, upt, sc, 1)) goto fail; CF_CK(cudaMemcpyAsync(dpl[q] + k * pb, hp + k * pb, nb, cudaMemcpyHostToDevice, sc)); }
+                else if (rows_copy(dpl[q] + k * pb, bk, nbk, k, ra, rb, HW, upt, sc, 0)) goto fail;
             }
             CF_CK(cudaStreamSynchronize(sc));
         }
@@ -239,7 +255,7 @@ fail:
 }
 
 /* ---- the --model-only R 0 model pass: per solve cell gr / gi (cf_out_run's sums), the global gauge sum ---- */
-struct gs_k { ph_tab T; const uint8_t *pc, *ps, *w; int z0, z1, D, H, W, P, d, hh, w_, na, dir; double h; const float *cy, *cx, *U; float *gr, *gi; double *part; };
+struct gs_k { ph_tab T; const uint8_t *pc, *ps, *w; int z0, z1, zc, D, H, W, P, d, hh, w_, na, dir; double h; const float *cy, *cx, *U; float *gr, *gi; double *part; };
 __device__ __forceinline__ double d_Wcell(const gs_k &M, int z, int y, int x) {   /* cf_Wcell with the gauge 0 and no --gauge ls field */
     const double P = M.P, pz = (z + 0.5) * M.h, py = (y + 0.5) * M.h, px = (x + 0.5) * M.h;
     const double U = d_tri(M.U, M.d, M.hh, M.w_, (z + 0.5) / P - 0.5, (y + 0.5) / P - 0.5, (x + 0.5) / P - 0.5) + 0;
@@ -264,7 +280,7 @@ __global__ void k_gsum(gs_k M) {
                 if (cph < 1e-3) continue;
                 const double ph = M.T.a[k];
                 { const double e = ph - 2 * M_PI * Wf; gr += (float)(cph * cos(e)); gi += (float)(cph * sin(e)); }
-                if (i % 7 == 0) { double sn, cs; sincos(ph - 2 * M_PI * Wv, &sn, &cs); ar += cph * cs; ai += cph * sn; }
+                if ((i + (size_t)(M.z0 - M.zc) * HW) % 7 == 0) { double sn, cs; sincos(ph - 2 * M_PI * Wv, &sn, &cs); ar += cph * cs; ai += cph * sn; }   /* (every 7th voxel of the chunk from row zc) */
             }
         }
         const size_t o = ((size_t)(Z - Z0) * M.hh + Y) * M.w_ + X; M.gr[o] = gr; M.gi[o] = gi;   /* (the chunk's solve rows) */
@@ -289,13 +305,16 @@ fail:
     cf_gpu_gsum_end(); return 1;
 }
 extern "C" int cf_gpu_gsum_chunk(const uint8_t *pc, const uint8_t *ps, const uint8_t *w, int z0, int z1, float *gr, float *gi, double acc[2]) {
+    return cf_gpu_gsum_piece(pc, ps, w, z0, z1, z0, gr, gi, acc);
+}
+extern "C" int cf_gpu_gsum_piece(const uint8_t *pc, const uint8_t *ps, const uint8_t *w, int z0, int z1, int zc, float *gr, float *gi, double acc[2]) {
     gs_k &M = G_.M; const size_t HW = (size_t)M.H * M.W, nb = (size_t)(z1 - z0) * HW, cells = (size_t)M.hh * M.w_;
     const int Z0 = z0 / M.P, nZ = (z1 - 1) / M.P - Z0 + 1; const size_t nc = (size_t)nZ * cells; const unsigned nbk = (unsigned)((nc + 127) / 128);
     if (3 * nb > G_.cap) { cudaFree(G_.pl); G_.pl = nullptr; G_.cap = 0; CF_CK(cudaMalloc(&G_.pl, 3 * nb)); G_.cap = 3 * nb; }
     if (2 * nc > G_.gcap) { cudaFree(G_.g); G_.g = nullptr; G_.gcap = 0; CF_CK(cudaMalloc(&G_.g, 2 * nc * sizeof(float))); G_.gcap = 2 * nc; }
     M.gr = G_.g; M.gi = G_.g + nc;
     if (nbk > G_.pcap) { cudaFree(M.part); M.part = nullptr; free(G_.hp); G_.pcap = 0; CF_CK(cudaMalloc(&M.part, 2 * (size_t)nbk * sizeof(double))); G_.hp = (double *)malloc(2 * (size_t)nbk * sizeof(double)); if (!G_.hp) goto fail; G_.pcap = nbk; }
-    M.pc = G_.pl; M.ps = G_.pl + nb; M.w = G_.pl + 2 * nb; M.z0 = z0; M.z1 = z1;
+    M.pc = G_.pl; M.ps = G_.pl + nb; M.w = G_.pl + 2 * nb; M.z0 = z0; M.z1 = z1; M.zc = zc;
     CF_CK(cudaMemcpy(G_.pl, pc, nb, cudaMemcpyHostToDevice)); CF_CK(cudaMemcpy(G_.pl + nb, ps, nb, cudaMemcpyHostToDevice)); CF_CK(cudaMemcpy(G_.pl + 2 * nb, w, nb, cudaMemcpyHostToDevice));
     k_gsum<<<nbk, 128>>>(M); CF_CK(cudaGetLastError());
     CF_CK(cudaMemcpy(gr + (size_t)Z0 * cells, M.gr, nc * sizeof(float), cudaMemcpyDeviceToHost));

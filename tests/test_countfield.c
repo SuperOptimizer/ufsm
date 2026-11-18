@@ -84,6 +84,70 @@ static void gpu_vs_cpu(const char *dir) {
     free(cyv); free(cxv);
 }
 
+/* pass 1 / the GPU model pass in shard pieces (UFSM_CF_PIECE_ROWS, memopt 2026-11-18) against whole chunks (0): the pooled sums and
+   the model's delta byte for byte, pieces dividing the 24-row chunks or not (8, 12, 16: the last piece short), the model pass in pieces
+   (hh x w = 512 solve cells a row: any piece is whole 128-cell blocks); a piece whose GPU pooling fails redoes its chunk on the CPU */
+static void pieces_vs_chunks(const char *dir) {
+    if (!cf_gpu_ok || !cf_gpu_ok()) { printf("test_countfield: no GPU, pieces not tested\n"); return; }
+    enum { D2 = 48, H2 = 64, W2 = 128 };
+    const size_t n = (size_t)D2 * H2 * W2; uint8_t *a[10]; for (int k = 0; k < 10; k++) a[k] = calloc(n, 1);
+    unsigned rs = 11;
+    for (int z = 0; z < D2; z++) for (int y = 0; y < H2; y++) for (int x = 0; x < W2; x++) {
+        const size_t i = ((size_t)z * H2 + y) * W2 + x; const double cy = 32 * h + 3 * sin(z * 0.1), cx = 64 * h + 5 * cos(z * 0.07);
+        const double py = (y + 0.5) * h, px = (x + 0.5) * h, ry = py - cy, rx = px - cx, r = hypot(ry, rx); if (r < 2 * p) continue;
+        rs = rs * 1664525u + 1013904223u; const double nse = ((rs >> 8) / 16777216.0 - 0.5) * 0.3;
+        const double Wt = r / p - atan2(ry, rx) / (2 * M_PI) + 0.02 * z, ph = Wt + nse, cf = 0.4 + 0.55 * fabs(sin(0.3 * x + 0.2 * z));
+        a[0][i] = (uint8_t)lrint(128 + 127 * cf * cos(2 * M_PI * ph)); a[1][i] = (uint8_t)lrint(128 + 127 * cf * sin(2 * M_PI * ph));
+        const double t = 0.3 * sin(0.05 * z), nz = sin(t), ny = cos(t) * ry / r, nx = cos(t) * rx / r;
+        a[2][i] = (uint8_t)lrint(255 * nz * nz); a[3][i] = (uint8_t)lrint(255 * ny * ny); a[4][i] = (uint8_t)lrint(255 * nx * nx);
+        a[5][i] = (uint8_t)lrint(255 * (0.5 + nz * ny)); a[6][i] = (uint8_t)lrint(255 * (0.5 + nz * nx)); a[7][i] = (uint8_t)lrint(255 * (0.5 + ny * nx));
+        a[8][i] = (uint8_t)lrint(8 * p / h * (1 + 0.2 * sin(0.1 * y))); a[9][i] = (uint8_t)(150 + (rs >> 26));
+    }
+    const int na = D2 * h + 1; float *cyv = malloc(na * sizeof(float)), *cxv = malloc(na * sizeof(float));
+    for (int k = 0; k < na; k++) { cyv[k] = (float)(32 * h + 3 * sin(k / (double)h * 0.1)); cxv[k] = (float)(64 * h + 5 * cos(k / (double)h * 0.07)); }
+    char in[600]; snprintf(in, sizeof in, "%s/in5", dir);
+    const long long org[3] = {0, 0, 0}; const int shp[3] = {D2, H2, W2};
+    if (fit_fields_save(in, org, shp, h, 9.6, a, cyv, cxv, na)) { fails++; fprintf(stderr, "FAIL: cannot write the pieces input\n"); return; }
+    char mg[32]; snprintf(mg, sizeof mg, "%.9f", 24.5 * 12.0 * H2 * W2 / 1e9);   /* 24-row chunks (--model-only: 12 B per cell) */
+    static const char *rp[7] = {"0", "8", "12", "16", "16", "8", "0"}, *pf[7] = {"", "", "", "", "", "32", ""};   /* (run 5: the piece at row 32 fails; run 6: the CPU) */
+    float *dl[7] = {0}, *pc[7] = {0}; size_t nd[7] = {0}, npc[7] = {0};
+    for (int r = 0; r < 7; r++) {
+        char mdir[640], pcf[640], pth[700]; snprintf(mdir, sizeof mdir, "%s/m5-%d", dir, r); snprintf(pcf, sizeof pcf, "%s/pool5-%d.bin", dir, r);
+        char *av[] = {"ufsm", "count-field", in, "-", "--R", "0", "--pool", "4", "--phase-w", "4", "--iters", "600", "--model", mdir, "--model-only", "1",
+                      "--model-stride", r == 4 ? "2" : "1", "--threads", "4", "--mem-gb", mg, "--cf-gpu", r == 6 ? "0" : "1", "--pool-cache", pcf, "--rmin-um", "50", nullptr};
+        setenv("UFSM_CF_PIECE_ROWS", rp[r], 1); if (*pf[r]) setenv("UFSM_CF_TEST_PFAIL", pf[r], 1);
+        CHECK(cmd_count_field(28, av) == 0, "count-field pieces %s failed", rp[r]);
+        unsetenv("UFSM_CF_PIECE_ROWS"); unsetenv("UFSM_CF_TEST_PFAIL");
+        snprintf(pth, sizeof pth, "%s/delta.f32", mdir); dl[r] = read_f32(pth, &nd[r]); pc[r] = read_f32(pcf, &npc[r]);
+        CHECK(dl[r] && pc[r], "pieces %s: no model / pool cache", rp[r]);
+    }
+    for (int r = 1; r < 4; r++) if (dl[r] && pc[r] && dl[0] && pc[0]) {
+        size_t pd = 0, dd = 0, fp = (size_t)-1; for (size_t i = 0; i < npc[0] && npc[r] == npc[0]; i++) if (pc[r][i] != pc[0][i]) { pd++; if (fp == (size_t)-1) fp = i; }
+        for (size_t i = 0; i < nd[0] && nd[r] == nd[0]; i++) dd += dl[r][i] != dl[0][i];
+        if (pd || dd) printf("test_countfield: pieces %s: %zu pooled values differ (first %zu), %zu delta values\n", rp[r], pd, fp, dd);
+        CHECK(nd[r] == nd[0] && npc[r] == npc[0] && !memcmp(dl[r], dl[0], nd[0] * 4) && !memcmp(pc[r], pc[0], npc[0] * 4),
+              "pieces of %s rows: pooled sums / model delta not the whole-chunk bytes", rp[r]); }
+    {   /* the stride-2 model pass in pieces vs whole chunks (the pool cache from run 0 is the same sums: read back) */
+        char mdir[640], pcf[640], pth[700]; snprintf(mdir, sizeof mdir, "%s/m5-s2", dir); snprintf(pcf, sizeof pcf, "%s/pool5-3.bin", dir);
+        char *av[] = {"ufsm", "count-field", in, "-", "--R", "0", "--pool", "4", "--phase-w", "4", "--iters", "600", "--model", mdir, "--model-only", "1",
+                      "--model-stride", "2", "--threads", "4", "--mem-gb", mg, "--cf-gpu", "1", "--pool-cache", pcf, "--rmin-um", "50", nullptr};
+        setenv("UFSM_CF_PIECE_ROWS", "0", 1); CHECK(cmd_count_field(28, av) == 0, "count-field stride 2 whole chunks failed"); unsetenv("UFSM_CF_PIECE_ROWS");
+        size_t ns2 = 0; snprintf(pth, sizeof pth, "%s/delta.f32", mdir); float *d2 = read_f32(pth, &ns2);
+        CHECK(d2 && dl[4] && ns2 == nd[4] && !memcmp(d2, dl[4], ns2 * 4), "stride-2 model pass in pieces not the whole-chunk bytes");
+        free(d2);
+    }
+    if (pc[5] && pc[0] && pc[6] && npc[5] == npc[0] && npc[6] == npc[0]) {   /* the failed piece's chunk on the CPU: the CPU run's bytes there, the GPU's elsewhere */
+        const size_t cells = (size_t)(H2 / 4) * (W2 / 4), nl0 = (size_t)(D2 / 4) * cells; size_t ndiff = 0, ncpu = 0;   /* (S, G0..G2 after the 8-float header; chunk [24, 48) = solve rows 6..11) */
+        for (size_t i = 8; i < npc[0]; i++) { const size_t zr = (i - 8) % nl0 / cells; const int in_c = zr >= 6 && zr < 12; ndiff += pc[5][i] != (in_c ? pc[6][i] : pc[0][i]); ncpu += in_c && pc[6][i] != pc[0][i]; }
+        printf("test_countfield: pieces: a failed piece's chunk on the CPU: %zu values off (the CPU's in the chunk, %zu of them differ from the GPU's)\n", ndiff, ncpu);
+        CHECK(!ndiff && ncpu, "piece CPU fallback: %zu values are neither the CPU's in the chunk nor the GPU's outside", ndiff);
+    } else CHECK(0, "piece CPU fallback: no pool cache");
+    printf("test_countfield: pieces of 8 / 12 / 16 rows: pooled sums and model delta equal the whole-chunk run byte for byte\n");
+    for (int r = 0; r < 7; r++) { free(dl[r]); free(pc[r]); }
+    for (int k = 0; k < 10; k++) free(a[k]);
+    free(cyv); free(cxv);
+}
+
 /* no direction evidence (2026-11-14): no rings for the prior (all-zero fields), no --dir, no phase / w4 loops: count-field REFUSES (returns 2)
    instead of guessing +1 (fibfit: a wrong hand hops two sheets per turn), strict or not; --dir-default-ok 1 is the explicit opt-in. The child
    passes the return value through (a strict-defaults exit(3) would show as 3, i.e. a guess that was not refused). */
@@ -357,6 +421,7 @@ int main(void) {
         CHECK(err[1] < 0.05, "no-data pairs dropped: the data cells beside the masked sector should keep their count (%.3f off)", err[1]);
     }
     gpu_vs_cpu(dir);
+    pieces_vs_chunks(dir);
     defaulted_dir(dir);
     char cmd[700]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
     for (int k = 0; k < 10; k++) free(a[k]);

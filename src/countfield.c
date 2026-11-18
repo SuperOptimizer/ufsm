@@ -646,8 +646,14 @@ int cmd_count_field(int argc, char **argv) {
        pass 1 run apart from the solve (--pool-only, --follow) and the solve run pass the same N; default: from --mem-gb as above) */
     /* a fixed N above what --mem-gb holds (the memory rule's CZ): the memory rule's, with a DEFAULTED: line (the rows change the ref;
        unroll.sh passes 512 so runs are reproducible, lead 2026-11-17) */
+    /* (the cf-ref recipe on the GPU, --model-only R 0, holds whole chunks only for the prior: its 4 planes, ~4.5 B per cell; the passes
+       read shard pieces (below), so a requested --chunk-rows is capped by that, not by the 12 B per cell of whole-chunk reads) */
+    const int pieces_ok = (!getenv("UFSM_CF_PIECE_ROWS") || atoi(getenv("UFSM_CF_PIECE_ROWS")) > 0) && gpu && mo && !R && strcmp(cf_opt(argc, argv, "--gauge", "demod"), "ls")
+                          && !opt_atoi("--sp-w", cf_opt(argc, argv, "--sp-w", "0")) && !opt_atoi("--pool-split", cf_opt(argc, argv, "--pool-split", "0"))
+                          && opt_atof("--rho-solve", cf_opt(argc, argv, "--rho-solve", "1")) == 1 && !*cf_opt(argc, argv, "--rho-map", "") && !*cf_opt(argc, argv, "--rho-r", "");
     if (opt_atoi("--chunk-rows", cf_opt(argc, argv, "--chunk-rows", "0")) > 0) {
-        const int req = opt_atoi("--chunk-rows", cf_opt(argc, argv, "--chunk-rows", "0")), czm = CZ;
+        int czp = (int)(memgb * 1e9 / (4.5 * HW)); czp = czp / P * P; if (czp < P) czp = P; if (czp >= 128 && 128 % P == 0) czp = czp / 128 * 128;
+        const int req = opt_atoi("--chunk-rows", cf_opt(argc, argv, "--chunk-rows", "0")), czm = pieces_ok && czp > CZ ? czp : CZ;
         CZ = req / P * P; if (CZ < P) CZ = P; if (CZ > D) CZ = (D + P - 1) / P * P;
         if (CZ > czm) { UFSM_DEFAULTED("count-field chunk rows = %d (--chunk-rows %d does not fit --mem-gb %.1f: %d rows)", czm, req, memgb, czm); CZ = czm; }
     }
@@ -713,23 +719,88 @@ int cmd_count_field(int argc, char **argv) {
         if (ks) for (int i = 0; n < nch; i++) { if (i < ks) ord[n++] = i; if (ks + i < nch) ord[n++] = ks + i; }
         else for (int i = 0; i < nch; i++) ord[i] = i; }
     g_follow = *cf_opt(argc, argv, "--follow", "") ? cf_opt(argc, argv, "--follow", "") : nullptr;
-    cf_pre pre = {0}; if (!cached) cf_pre_start(&pre, in, ord[0] * CZ, ord[0] * CZ + CZ < D ? ord[0] * CZ + CZ : D, pref);
+    cf_pool pp0 = {nullptr, 0, 0, H, W, P, lv[0].hh, lv[0].w, h, g.cy, g.cx, na, Sl[0], {Gl[0][0], Gl[0][1], Gl[0][2]}, opt_atof("--emin", cf_opt(argc, argv, "--emin", "0.1")), opt_atof("--sheet0", cf_opt(argc, argv, "--sheet0", "0.4")), opt_atof("--phase-w", cf_opt(argc, argv, "--phase-w", "0")), opt_atof("--phase-c0", cf_opt(argc, argv, "--phase-c0", "0.4"))};
+    pp0.rs = opt_atof("--rho-scale", cf_opt(argc, argv, "--rho-scale", "1")); if (!(pp0.rs > 0)) pp0.rs = 1;
+    if (psplit) { pp0.Sd = Sd0; for (int k = 0; k < 3; k++) pp0.Gd[k] = Gd0[k]; }
+    { double A = 0, S0 = 0; if (*cf_opt(argc, argv, "--rho-pow", "") && sscanf(cf_opt(argc, argv, "--rho-pow", ""), "%lf,%lf", &A, &S0) == 2 && S0 > 0) { pp0.ra = A; pp0.rb = S0 * 8 / (h * g.um); } }
+    {   /* --wide A,B (network spacing, um) --wide-dens D (0..1) --wide-phase K: the density weight x (1 - D s), the confident phase weight x (1 + K s), s = ramp(spacing, A, B) */
+        double a = 0, bw = 0; if (*cf_opt(argc, argv, "--wide", "") && sscanf(cf_opt(argc, argv, "--wide", ""), "%lf,%lf", &a, &bw) == 2 && bw > a) { pp0.wa = a * 8 / (h * g.um); pp0.wb = bw * 8 / (h * g.um); }
+        if (pp0.wb > 0) { pp0.wd = opt_atof("--wide-dens", cf_opt(argc, argv, "--wide-dens", "0")); pp0.wp = opt_atof("--wide-phase", cf_opt(argc, argv, "--wide-phase", "0")); }
+    }
+    /* pass 1 in shard pieces (memopt 2026-11-18): the GPU pooling reads a chunk's rows RP at a time (RP = UFSM_CF_PIECE_ROWS, default
+       128 = the fields' zarr chunk, rounded to the pool; 0: whole chunks), each piece's last solve row deferred to the next piece with
+       its P + 1 rows kept (the phase gradient's halo row), the chunk bounds unchanged: the pooled sums of the whole-chunk path bit for
+       bit (cf_gpu_pool_rows). The prior's chunk (the middle row's) is read again afterwards without the six normal planes it does not
+       use. Host memory: two pieces (prefetch) instead of two chunks: 1667's ref 28.2 GB -> see DESIGN 2026-11-18 */
+    int RP = getenv("UFSM_CF_PIECE_ROWS") ? atoi(getenv("UFSM_CF_PIECE_ROWS")) : 128; RP = RP / P * P; if (RP > 0 && RP < 2 * P) RP = 2 * P;
+    const int pmode = !cached && gpu && !psplit && !getenv("UFSM_CF_READ_ONLY") && RP > 0 && RP < CZ;
+    const cf_gpu_poolcfg gc0 = {H, W, P, lv[0].hh, lv[0].w, na, h, g.cy, g.cx, pp0.emin, pp0.sheet0, pp0.kph, pp0.c0, pp0.rs, pp0.ra, pp0.rb, pp0.wa, pp0.wb, pp0.wd, pp0.wp, pmode ? (getenv("UFSM_CF_STAGE_MB") ? atof(getenv("UFSM_CF_STAGE_MB")) * 1e6 : 512e6) : 0};   /* (pieces: 512 MB upload buffers, 1 GB pinned) */
+    cf_pre pre = {0};
     const int gpu0 = gpu; int npc = 0;   /* (a chunk the GPU fails, e.g. short of memory on a shared device: the CPU; the next one tries again) */
-    for (int ci = 0; ci < nch && !cached; ci++) {
+    if (pmode) {
+        const int ppref = pref || 2 * 11.0 * RP * HW < 0.5 * (double)ufsm_mem_available();   /* (two pieces held: the prefetch nearly always fits) */
+        int np = 0; for (int ci = 0; ci < nch; ci++) { const int z0 = ord[ci] * CZ, z1 = z0 + CZ < D ? z0 + CZ : D; np += (z1 - z0 + RP - 1) / RP; }
+        int (*pc3)[3] = malloc((size_t)np * sizeof *pc3); np = 0;   /* pieces: first row, end row, the chunk's first row */
+        for (int ci = 0; ci < nch; ci++) { const int z0 = ord[ci] * CZ, z1 = z0 + CZ < D ? z0 + CZ : D; for (int a = z0; a < z1; a += RP) { pc3[np][0] = a; pc3[np][1] = a + RP < z1 ? a + RP : z1; pc3[np][2] = z0; np++; } }
+        const size_t crn = (size_t)(P + 1) * HW; uint8_t *carry = malloc(10 * crn); if (!carry) { fprintf(stderr, "count-field: out of memory (piece carry)\n"); return 1; }
+        int cr0 = 0, cfail = -1;   /* carry: field rows [cr0, cr0 + P + 1) of the previous piece; cfail: a chunk whose GPU pooling failed (redone on the CPU) */
+        cf_pre_start(&pre, in, pc3[0][0], pc3[0][1], ppref);
+        for (int j = 0; j < np; j++) {
+            const int a = pc3[j][0], e = pc3[j][1], z0 = pc3[j][2], z1 = z0 + CZ < D ? z0 + CZ : D; fit_fields_buf b;
+            if (cf_pre_take(&pre, &b)) return 1;
+            if (ppref && j + 1 < np) cf_pre_start(&pre, in, pc3[j + 1][0], pc3[j + 1][1], 1);
+            if (!a) { recto = b.f.recto != nullptr; w4d = b.f.wd[0] ? b.f.w4_d : 0; }
+            const double tl1 = cf_now();
+            if (cfail != z0) {
+                const uint8_t *pl[10] = {b.f.pc, b.f.ps, b.f.t[0], b.f.t[1], b.f.t[2], b.f.t[3], b.f.t[4], b.f.t[5], b.f.sp, b.f.w};
+                cf_gpu_rows bk[2]; int nbk = 0;
+                if (a > z0) { for (int k = 0; k < 10; k++) bk[nbk].pl[k] = carry + k * crn; bk[nbk].r0 = cr0; bk[nbk].r1 = cr0 + P + 1; nbk++; }
+                for (int k = 0; k < 10; k++) bk[nbk].pl[k] = pl[k]; bk[nbk].r0 = a; bk[nbk].r1 = e; nbk++;
+                const int Zs0 = a > z0 ? a / P - 1 : a / P, Zs1 = e < z1 ? e / P - 1 : (e + P - 1) / P;
+                const int tfail = getenv("UFSM_CF_TEST_PFAIL") && atoi(getenv("UFSM_CF_TEST_PFAIL")) == a;   /* (test: this piece's GPU pooling fails) */
+                if (tfail || cf_gpu_pool_rows(&gc0, bk, nbk, z0, z1 - z0, Zs0, Zs1, Sl[0], Gl[0])) { fprintf(stderr, "count-field: GPU pooling failed: rows %d..%d on the CPU\n", z0, z1); cfail = z0; }
+                else if (e < z1) { cr0 = e - P - 1; for (int k = 0; k < 10; k++) memcpy(carry + k * crn, pl[k] + (size_t)(cr0 - a) * HW, crn); }
+            }
+            t_pool += cf_now() - tl1;
+            cf_pre_give(&pre, &b);
+            if (!ppref && j + 1 < np) cf_pre_start(&pre, in, pc3[j + 1][0], pc3[j + 1][1], 0);
+            if (cfail == z0 && e == z1) {   /* the failed chunk whole on the CPU (its solve rows zeroed first) */
+                if (pre.busy) { fit_fields_buf nb_; if (cf_pre_take(&pre, &nb_)) return 1; cf_pre_give(&pre, &nb_); }   /* (the next piece's load finished first: one chunk + a piece held) */
+                fit_fields_buf cb; if (fit_fields_load(in, z0, z1, 1, &cb)) { fprintf(stderr, "count-field: cannot load rows %d..%d of %s\n", z0, z1, in); return 1; }
+                const size_t sa = (size_t)(z0 / P) * lv[0].hh * lv[0].w, se = (size_t)((z1 + P - 1) / P) * lv[0].hh * lv[0].w;
+                memset(Sl[0] + sa, 0, (se - sa) * sizeof(float)); for (int k = 0; k < 3; k++) memset(Gl[0][k] + sa, 0, (se - sa) * sizeof(float));
+                cf_pool pp = pp0; pp.f = &cb.f; pp.zoff = z0; pp.nzl = z1 - z0; const int nr = (z1 - z0 + P - 1) / P;
+                pp.nb = (4 * cf_nt + nr - 1) / nr; if (pp.nb > lv[0].hh) pp.nb = lv[0].hh; if (pp.nb < 1) pp.nb = 1;
+                const double tl2 = cf_now(); cf_par((long)nr * pp.nb, cf_pool_run, &pp); t_pool += cf_now() - tl2; npc++;
+                fit_fields_free(&cb); cfail = -1;
+                if (j + 1 < np) cf_pre_start(&pre, in, pc3[j + 1][0], pc3[j + 1][1], ppref);
+            }
+        }
+        if (pre.has_nxt) { fit_fields_free(&pre.nxt); pre.has_nxt = 0; }
+        free(carry); free(pc3);
+        {   /* the prior from the middle row's chunk, as the whole-chunk path takes it (pc ps sp w and the optional planes; no normals) */
+            const int zm0 = D / 2 / CZ * CZ, zm1 = zm0 + CZ < D ? zm0 + CZ : D; cf_pre pm_ = {0}; fit_fields_buf b;
+            fit_fields_skip_planes(mo ? 1 | 2 | 4 : 4); cf_pre_start(&pm_, in, zm0, zm1, 0); const int rc = cf_pre_take(&pm_, &b); fit_fields_skip_planes(mo ? 1 | 2 : 0);
+            if (rc) return 1;
+            fit_cfg pc = fit_cfg_default(); pc.dir = dir; pc.dir_loops = opt_atoi("--dir-loops", cf_opt(argc, argv, "--dir-loops", "0")); fit_model pm; memset(&pm, 0, sizeof pm);
+            if (!fit_init_prior(&b.f, &pc, &pm)) {
+                if (!dir) { dir = pm.dir; dsrc = pm.dir_src; }
+                float *pk = malloc(pm.nk * sizeof(float)); int npk = 0; for (int k = 0; k < pm.nk; k++) if (pm.pitch[k] > 0) pk[npk++] = pm.pitch[k];
+                if (npk) { for (int a = 1; a < npk; a++) for (int c = a; c > 0 && pk[c] < pk[c - 1]; c--) { const float t = pk[c]; pk[c] = pk[c - 1]; pk[c - 1] = t; } pitch = pk[npk / 2]; }
+                free(pk); free(pm.pitch); free(pm.offset);
+            }
+            fit_fields_free(&b);
+        }
+    }
+    if (!cached && !pmode) cf_pre_start(&pre, in, ord[0] * CZ, ord[0] * CZ + CZ < D ? ord[0] * CZ + CZ : D, pref);
+    for (int ci = 0; ci < nch && !cached && !pmode; ci++) {
         const int z0 = ord[ci] * CZ, z1 = z0 + CZ < D ? z0 + CZ : D; fit_fields_buf b;
         if (cf_pre_take(&pre, &b)) return 1;
         /* (without --prefetch the next chunk loads after this one is pooled and handed back: one chunk in RAM, not two; before, the
            synchronous load of the next chunk ran here, next to this one: two chunks either way, 39 GB for a 1667 ref at 768 rows) */
         if (pref && ci + 1 < nch) { const int n0 = ord[ci + 1] * CZ; cf_pre_start(&pre, in, n0, n0 + CZ < D ? n0 + CZ : D, pref); }
         if (!z0) { recto = b.f.recto != nullptr; w4d = b.f.wd[0] ? b.f.w4_d : 0; }
-        cf_pool pp = {&b.f, z0, z1 - z0, H, W, P, lv[0].hh, lv[0].w, h, g.cy, g.cx, na, Sl[0], {Gl[0][0], Gl[0][1], Gl[0][2]}, opt_atof("--emin", cf_opt(argc, argv, "--emin", "0.1")), opt_atof("--sheet0", cf_opt(argc, argv, "--sheet0", "0.4")), opt_atof("--phase-w", cf_opt(argc, argv, "--phase-w", "0")), opt_atof("--phase-c0", cf_opt(argc, argv, "--phase-c0", "0.4"))};
-        pp.rs = opt_atof("--rho-scale", cf_opt(argc, argv, "--rho-scale", "1")); if (!(pp.rs > 0)) pp.rs = 1;
-        if (psplit) { pp.Sd = Sd0; for (int k = 0; k < 3; k++) pp.Gd[k] = Gd0[k]; }
-        { double A = 0, S0 = 0; if (*cf_opt(argc, argv, "--rho-pow", "") && sscanf(cf_opt(argc, argv, "--rho-pow", ""), "%lf,%lf", &A, &S0) == 2 && S0 > 0) { pp.ra = A; pp.rb = S0 * 8 / (h * g.um); } }
-        {   /* --wide A,B (network spacing, um) --wide-dens D (0..1) --wide-phase K: the density weight x (1 - D s), the confident phase weight x (1 + K s), s = ramp(spacing, A, B) */
-            double a = 0, bw = 0; if (*cf_opt(argc, argv, "--wide", "") && sscanf(cf_opt(argc, argv, "--wide", ""), "%lf,%lf", &a, &bw) == 2 && bw > a) { pp.wa = a * 8 / (h * g.um); pp.wb = bw * 8 / (h * g.um); }
-            if (pp.wb > 0) { pp.wd = opt_atof("--wide-dens", cf_opt(argc, argv, "--wide-dens", "0")); pp.wp = opt_atof("--wide-phase", cf_opt(argc, argv, "--wide-phase", "0")); }
-        }
+        cf_pool pp = pp0; pp.f = &b.f; pp.zoff = z0; pp.nzl = z1 - z0;
         const double tl1 = cf_now();
         if (getenv("UFSM_CF_READ_ONLY")) {   /* (bench: the field reads only; FNV-1a of the chunk's planes for byte-identity checks) */
             const uint8_t *pl[10] = {b.f.pc, b.f.ps, b.f.t[0], b.f.t[1], b.f.t[2], b.f.t[3], b.f.t[4], b.f.t[5], b.f.sp, b.f.w}; uint64_t hs = 1469598103934665603ull;
@@ -738,7 +809,7 @@ int cmd_count_field(int argc, char **argv) {
             if (!pref && ci + 1 < nch) { const int n0 = ord[ci + 1] * CZ; cf_pre_start(&pre, in, n0, n0 + CZ < D ? n0 + CZ : D, 0); }
             continue; }
         if (gpu && !psplit) {   /* the chunk's solve rows on the GPU (the same sums in the same order; --pool-split: the CPU) */
-            const cf_gpu_poolcfg gc = {H, W, P, lv[0].hh, lv[0].w, na, h, g.cy, g.cx, pp.emin, pp.sheet0, pp.kph, pp.c0, pp.rs, pp.ra, pp.rb, pp.wa, pp.wb, pp.wd, pp.wp};
+            const cf_gpu_poolcfg gc = gc0;
             const uint8_t *pl[10] = {b.f.pc, b.f.ps, b.f.t[0], b.f.t[1], b.f.t[2], b.f.t[3], b.f.t[4], b.f.t[5], b.f.sp, b.f.w};
             if (cf_gpu_pool(&gc, pl, z0, z1 - z0, Sl[0], Gl[0])) {
                 fprintf(stderr, "count-field: GPU pooling failed: rows %d..%d on the CPU\n", z0, z1); gpu = 0;
@@ -784,7 +855,7 @@ int cmd_count_field(int argc, char **argv) {
         return 2;
     }
     if (getenv("UFSM_CF_READ_ONLY")) { fprintf(stderr, "count-field: read only: waited for field reads %.0f s, wall %.0f s\n", pre.t, cf_now() - tst0); return 0; }
-    if (!cached) fprintf(stderr, "count-field: pass 1: waited for field reads %.0f s, pooling %.0f s (%s, %d of %d chunks on the CPU; %d rows per chunk), wall %.0f s\n", pre.t, t_pool, gpu ? "GPU" : "CPU", gpu ? npc : (D + CZ - 1) / CZ, (D + CZ - 1) / CZ, CZ, cf_now() - tst0);
+    if (!cached) fprintf(stderr, "count-field: pass 1: waited for field reads %.0f s, pooling %.0f s (%s, %d of %d chunks on the CPU; %d rows per chunk%s), wall %.0f s\n", pre.t, t_pool, gpu ? "GPU" : "CPU", gpu ? npc : (D + CZ - 1) / CZ, (D + CZ - 1) / CZ, CZ, pmode ? ", read in pieces" : "", cf_now() - tst0);
     if (*pcache && !cached) { FILE *pf = fopen(pcache, "wb"); const int hd[6] = {lv[0].d, lv[0].hh, lv[0].w, P, dir, recto | w4d << 1 | (dsrc + 1) << 16};
         int bad = !pf || fwrite(hd, sizeof hd, 1, pf) != 1 || fwrite(&pitch, sizeof pitch, 1, pf) != 1 || fwrite(Sl[0], sizeof(float), lv[0].n, pf) != lv[0].n;
         for (int k = 0; k < 3 && !bad; k++) bad = fwrite(Gl[0][k], sizeof(float), lv[0].n, pf) != lv[0].n;
@@ -1096,13 +1167,18 @@ int cmd_count_field(int argc, char **argv) {
         ggr = calloc(L->n, sizeof(float)); ggi = calloc(L->n, sizeof(float)); if (!ggr || !ggi) { fprintf(stderr, "count-field: out of memory (gauge sums)\n"); return 1; }
         const cf_gpu_gscfg gc = {D, H, W, P, L->d, L->hh, L->w, na, dir, h, g.cy, g.cx, L->U};
         double acc[2] = {0, 0}; int ok = !cf_gpu_gsum_begin(&gc), z0 = 0; cf_pre pr2 = {0};
+        /* in shard pieces too (as pass 1; UFSM_CF_PIECE_ROWS) where a piece's solve cells are a multiple of the kernel's 128-cell blocks:
+           then every block sums the same cells and acc takes the same block partials in the same order, the whole-chunk result bit for
+           bit (1667: 16 solve rows x 196 x 202 = 4949 blocks). Else whole chunks */
+        const int R2 = RP > 0 && RP < CZ && (size_t)(RP / P) * lv[0].hh * lv[0].w % 128 == 0 ? RP : CZ;
+        const int pref2 = R2 < CZ ? 2 * 5.0 * R2 * HW < 0.5 * (double)ufsm_mem_available() : pref;
         while (z0 < D && (z0 / CZ) % mstride) z0 += CZ;
-        if (ok && z0 < D) cf_pre_start(&pr2, in, z0, z0 + CZ < D ? z0 + CZ : D, pref);
+        if (ok && z0 < D) cf_pre_start(&pr2, in, z0, z0 + R2 < D ? z0 + R2 : D, pref2);
         while (ok && z0 < D) {
-            const int z1 = z0 + CZ < D ? z0 + CZ : D; fit_fields_buf b; if (cf_pre_take(&pr2, &b)) return 1;
-            int zn = z0 + CZ; while (zn < D && (zn / CZ) % mstride) zn += CZ;
-            if (zn < D) cf_pre_start(&pr2, in, zn, zn + CZ < D ? zn + CZ : D, pref);
-            ok = !cf_gpu_gsum_chunk(b.f.pc, b.f.ps, b.f.w, z0, z1, ggr, ggi, acc);
+            const int zc1 = z0 / CZ * CZ + CZ < D ? z0 / CZ * CZ + CZ : D, z1 = z0 + R2 < zc1 ? z0 + R2 : zc1; fit_fields_buf b; if (cf_pre_take(&pr2, &b)) return 1;
+            int zn = z1; if (zn == zc1) while (zn < D && (zn / CZ) % mstride) zn += CZ;
+            if (zn < D) { const int zne = zn / CZ * CZ + CZ < D ? zn / CZ * CZ + CZ : D; cf_pre_start(&pr2, in, zn, zn + R2 < zne ? zn + R2 : zne, pref2); }
+            ok = !cf_gpu_gsum_piece(b.f.pc, b.f.ps, b.f.w, z0, z1, z0 / CZ * CZ, ggr, ggi, acc);
             fit_fields_free(&b); z0 = zn;
         }
         if (pr2.busy) { fit_fields_buf b; if (!cf_pre_take(&pr2, &b)) fit_fields_free(&b); }

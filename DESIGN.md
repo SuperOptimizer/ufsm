@@ -6,6 +6,60 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Memory audit: where host / device memory goes per phase; count-field's ref reads shard pieces, 28.2 -> 8.1 GB at the same model bytes (2026-11-18, branch memopt-20261118)
+
+**The table** (measured 11-18; try9 = scratch2 on the desk, one card; unroll = PHerc1667, the 11-17 run and the 11-18 q2 desk run;
+stage RSS from progress.log / stagetable.tsv, i.e. `time -v` of the stage's largest process):
+
+| phase | consumer | memory | note |
+|---|---|---|---|
+| train, card 0 | planner plan (mode 4: lean 2, chunked, shared a1) | 10.07 of 10.98 GB free | 22.2 B / vox at P 768, 2.54 GB host offloads each way |
+| | weights + optimizer + context | ~1.6 GB | 16.42 GB free after start-up |
+| | on-the-fly phase slots (3 x 384 MB) | 1.67 GB | `--onfly-gpu` default = the training card |
+| | kernel workspaces + fp4 GN copy | 0.72 + 0.33 GB | |
+| | fibre planes (`--fibre-gpu 0`) | 0.62 GB | 64 Mvox slab, ct + planes + steps |
+| | `--ink-mil` reserve | 0.33 GB | |
+| train, card 1 | try9's aux (CT decode, ink on the fly) | 1.5 GB | AUXGPU=1 |
+| train, host | trainer + sampler RSS | 66-72 GB, HWM 76.1 | RssAnon 48.2, RssShmem 23.4; slice cap 140 GB |
+| | pinned | 20.45 GB | 12 slots 14.73 (1.23 GB each), host label planes 3.17 (train.c lbh, 7 x p3), unet offloads ~2.5 |
+| | malloc in use / worker scratch / ink caches | 11-12 / 3-14 / 4.3 GB | arena free 5-13 GB, already malloc_trim'd per slot |
+| desk host, other | /tmp tmpfs (the agents' shared scratchpad) | 29 GB (23 in one scratchpad) | the 18 GB of swap in use is tmpfs pages: no process had > 0.3 GB swapped |
+| unroll, host | **ref** (count-field --model-only) | **28.2 GB** (11-17), 16.2 (q2) | 512-row chunks x 2.53 M cells x 10 B = 13 GB, x2 with --prefetch |
+| | stripimg | 18.4 / 17.6 GB | one stripe render (ws000, 509 M px) at UFSM_RENDER_MEM 16 (halves itself to 50 % of available) |
+| | rectosp, fields (predict), stripflat, join, snap, ink | 6.7, 5.8-6.2, 4.3-5.0, 4.5, 4.1-4.6, 3.5-4.1 GB | predict: the fit-field slab ring 4.4 GB (14.6 GB at 1152 windows) |
+| predict, GPU | fields on a 5060 Ti | ~8.5 GB | ink-ext's auto --batch follows the free memory |
+
+Most of the large figures are budgets that follow the available memory (the trainer's planner, count-field's --mem-gb and prefetch,
+the render's UFSM_RENDER_MEM, zcache): they shrink on a small machine without changing results, except count-field, whose chunk rows
+(a result-changing parameter) were capped by --mem-gb at 12 B per cell. The trainer's device memory buys no speed past the plan: at
+P 768 the no-offload modes need ~11.5 GB for -0.2 % step (DESIGN "P 768 data parallel", 11-13). Freeing card 0 would take
+`--onfly-gpu 1 --fibre-gpu 1` on try9 (-2.29 GB there, +2.3 GB on card 1, same kernels): headroom only, left to the swap process.
+
+**count-field in shard pieces.** Pass 1 (the pooling) needs a chunk's 10 planes only one solve row and its two halo rows at a time,
+and the GPU model pass only the solve rows themselves; whole 512-row chunks were held for the prior (the middle chunk) and because the
+phase gradient stops at the chunk's first / last row. Now the GPU paths read 128 rows at a time (UFSM_CF_PIECE_ROWS, the fields' zarr
+chunk; 0: whole chunks): `cf_gpu_pool_rows` takes the rows from host row blocks with the chunk bounds kept as the gradient's, each
+piece's last solve row waits for the next piece with its P + 1 rows kept (a 228 MB carry at 1667's 2.53 M cells a row); the model
+pass's pieces are whole 128-cell blocks of its kernel (else whole chunks) and sample the chunk's every 7th voxel from the chunk's first
+row (`cf_gpu_gsum_piece`), so acc takes the same block partials in the same order. The prior reads the middle chunk again afterwards
+with 4 of the 10 planes (pc ps sp w; it never reads the normals). The upload buffers are 512 MB (was 2 GB: 1 GB pinned instead of 4).
+A requested --chunk-rows on this path is capped by the prior's 4.5 B per cell instead of 12 (a 16 GB scope keeps 512 rows; before,
+its --mem-gb would have DEFAULTED the rows and changed the ref). CPU paths, --pool-split / --rho-* and the R > 0 output passes: as before.
+
+| 1667 q2 ref (count-field --model-only, 512-row chunks, --threads 8, card 1) | max RSS | wall | model |
+|---|---|---|---|
+| 11-17 desk/pod run, prefetch (two chunks) | 28.2-29.5 GB | 55 s (27 threads) | |
+| 11-18 q2 run, no prefetch (28 GB available) | 17.0 GB | 88 s | reference |
+| pieces, in a 16 GB memcap scope (3 runs) | **8.1 GB** | 76-92 s | delta.f32 / axis.f32 / model.json byte-identical |
+| pieces, UFSM_CF_STAGE_MB 2000 (the old 2 GB upload buffers) | 10.8 GB | 107 s | byte-identical |
+
+(Walls on card 1 shared with try9's aux and the unroll chain, 83 % busy: noise of +-15 s; pass 1's pooling 31-39 s at either staging
+size, so 512 MB stays.)
+
+test_countfield `pieces_vs_chunks`: pieces of 8 / 12 / 16 rows against whole 24-row chunks, pooled sums and the model delta byte for
+byte (16: the last piece short), the stride-2 model pass in pieces, and a failed piece (UFSM_CF_TEST_PFAIL) whose chunk is redone on
+the CPU: the CPU run's bytes there, the GPU's elsewhere. REFSTREAM's `--pool-only --follow` beside the predicts uses the same path.
+
 ## Where the packed-sheet deficit lives: the net merges contact sheets though they are labelled and loss-weighted x8; 4.8 um input and the Paris 4 spiral fit / segments both fail (2026-11-18, pseudolab)
 
 This follows "Packed sheets are not resolved by finer CT" below, and the lever memo (/vesuvius/ufsm/pseudolab/lever-memo.md). The
