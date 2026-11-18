@@ -121,6 +121,8 @@ free at plan time). The rev-card1 layout ran 0.18-0.19 / 81-86 Mvox/s on 07:46-0
 ufsm-train.slice CPUWeight=10000` (ufsm-dev.slice 100; enables the cpu controller under ufsm.slice, persistent) cut that to 7 %, but
 the rate stayed 0.18: the step is GPU-bound (the main thread spin-waits in sched_yield). The weights are kept. Undo: set
 ufsm-train.slice CPUWeight=100.
+Item C restored at 12:54 on the same binary (lead): plan 10.07 of 13.27 GB, GN copy 2.17 GB; steps 14050 / 14100 fresh 0.25 / 0.24,
+111 Mvox/s. try9 holds 3.3 GB on card 1, so card-1 jobs leave it 4.5 GB.
 
 ## Unroll ink path: residual geometry early, faster surf-resample, check side by side; pod setup (2026-11-18, branch r3geom-20261118, unrollperf)
 
