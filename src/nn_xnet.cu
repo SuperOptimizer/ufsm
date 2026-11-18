@@ -221,6 +221,7 @@ struct ConvP {
     long long M; int act;
     const float *lnw, *lnb; float lneps;   /* XA_LN: channel LayerNorm of the whole output row (one block holds every channel) */
     double *st;   /* IN sums [n][Co][2] of the fp16 output (plain epilogue, no res / act) */
+    double *gpart;   /* GroupNorm partials [m-block][Co][2] (sum, sum of squares of the stored fp16 values; S % BM == 0: a block is one sample's) */
 };
 __device__ __forceinline__ unsigned smem_u32(const void *p) { return (unsigned)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void cp_async16(void *dst, const void *src, int bytes) {
@@ -369,6 +370,36 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, WARPS_M * WARPS_N == 8
                 else { double *d = p.st + ((size_t)nn * p.Co + co) * 2; atomicAdd(d, (double)v0); atomicAdd(d + 1, (double)v0 * v0); atomicAdd(d + 2, (double)v1); atomicAdd(d + 3, (double)v1 * v1); }
             }
             if (nw * S < p.M) st_add(p.st, nw, p.Co, co, a0, c0, a1, c1, lane);
+        }
+        return;
+    }
+    if (p.gpart) {   /* plain epilogue + this block's GroupNorm partials, reduced in a fixed order (rows, lanes, warps): deterministic */
+        __syncthreads();   /* (the stage buffers are reused for the cross-warp sums) */
+        double *red = (double *)smem;   /* [WARPS_M][BN][2] */
+#pragma unroll
+        for (int ni = 0; ni < NI; ni++) {
+            const int col = wn0 + ni * 8 + t4 * 2, co = n_base + col; const bool cok = co < p.Co;
+            const float s0 = cok ? p.scale[co] : 0.f, s1 = cok ? p.scale[co + 1] : 0.f, b0 = cok ? p.bias[co] : 0.f, b1 = cok ? p.bias[co + 1] : 0.f;
+            float a0 = 0.f, c0 = 0.f, a1 = 0.f, c1 = 0.f;   /* (float within the warp: 8 rows a thread, then a 3-level tree; double across warps and blocks) */
+#pragma unroll
+            for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const long long m = m_base + wm0 + mi * 16 + g + h * 8; if (m >= p.M || !cok) continue;
+                const __half2 o = __floats2half2_rn(act_f(acc[mi][ni][2 * h] * s0 + b0, p.act), act_f(acc[mi][ni][2 * h + 1] * s1 + b1, p.act));
+                *(__half2 *)(p.y + (size_t)m * p.Co + co) = o;
+                const float v0 = __low2float(o), v1 = __high2float(o); a0 += v0; c0 += v0 * v0; a1 += v1; c1 += v1 * v1;
+            }
+#pragma unroll
+            for (int x = 4; x < 32; x <<= 1) { a0 += __shfl_xor_sync(0xffffffffu, a0, x); c0 += __shfl_xor_sync(0xffffffffu, c0, x); a1 += __shfl_xor_sync(0xffffffffu, a1, x); c1 += __shfl_xor_sync(0xffffffffu, c1, x); }
+            if (g == 0) { double *r = red + ((size_t)(wm0 / WM) * BN + col) * 2; r[0] = a0; r[1] = c0; r[2] = a1; r[3] = c1; }
+        }
+        __syncthreads();
+        for (int i = tid; i < BN; i += NTH) {
+            const int co = n_base + i; if (co >= p.Co) continue;
+            double a = 0.0, c = 0.0;
+            for (int w = 0; w < WARPS_M; w++) { a += red[((size_t)w * BN + i) * 2]; c += red[((size_t)w * BN + i) * 2 + 1]; }
+            double *d = p.gpart + ((size_t)blockIdx.x * p.Co + co) * 2; d[0] = a; d[1] = c;
         }
         return;
     }
@@ -1383,7 +1414,7 @@ static bool dfc1_try(const xconv *c, xt x, const xt *res, int act, double *st, x
     else k_dfc1<<<nblk((size_t)nv, 128), 128, 0, g_st>>>(xp, wp, c->Kp, c->scale, c->bias, yp, nv, x.d, x.h, x.w);
     return true;
 }
-static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *lnw = nullptr, const float *lnb = nullptr, float lneps = 0.f, double *st = nullptr) {
+static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *lnw = nullptr, const float *lnb = nullptr, float lneps = 0.f, double *st = nullptr, double *gpart = nullptr) {
     { xt o; if (!lnw && dfc1_try(c, x, res, act, st, &o)) { g_fq_seq++; g_macs += (double)xt_numel(o) * 27; return o; } }
     xt in = x;
     if (c->unfold) in = xunfold(x, c->kw0, c->pw0);
@@ -1401,7 +1432,7 @@ static xt conv_run(const xconv *c, xt x, const xt *res, int act, const float *ln
     p.Di = in.d; p.Hi = in.h; p.Wi = in.w; p.Ci = in.c; p.Do = Do; p.Ho = Ho; p.Wo = Wo; p.Co = c->co;
     p.kd = c->kd; p.kh = c->kh; p.kw = c->kw; p.sd = c->sd; p.sh = c->sh; p.sw = c->sw; p.pd = c->pd; p.ph = c->ph; p.pw = c->pw;
     p.K = c->K; p.Kp = c->Kp; p.M = (long long)in.n * Do * Ho * Wo; p.act = act; p.lnw = lnw; p.lnb = lnb; p.lneps = lneps;
-    p.st = st && !res && act == XA_NONE ? st : nullptr;
+    p.st = st && !res && act == XA_NONE ? st : nullptr; p.gpart = gpart;
     g_macs += (double)p.M * c->co * c->K;
     if (c->mxrot && !in.p) fprintf(stderr, "xnet: an MX conv with UFSM_XNET_MXROT / MXA needs its fp16 input (fused MX-only producers quantise the plain way)\n");
     if (c->mxq && !fq.p && in.c == c->ci && p.M > 0 && (in.p || (in.q && !c->mxrot)) && !(act & (XA_LN | XA_GLU)) && !res && (act & 15) == XA_NONE) {   /* the MX-fp4 path */
@@ -1776,6 +1807,44 @@ extern "C" void xgn(xt x, int groups, const float *gamma, const float *beta, flo
     const size_t total = xt_numel(x); unsigned nb = nblk(total / 2, 256); if (nb > 65535 * 4) nb = 65535 * 4;
     k_gn_apply<<<nb, 256, 0, g_st>>>((const __half *)x.p, gm, rs, gamma, beta, res ? (const __half *)res->p : nullptr, act, (__half *)y.p, C, S, total);
     xfree_dev(gm);
+}
+
+/* conv + its output's GroupNorm statistics from the conv epilogue (no second read of y): partials per 128-row block, reduced in a
+   fixed order, so deterministic and batch-independent (S % 128 == 0: every block is one sample's, at a fixed place in it). *gm: the
+   gm / rs of xgn_stats (nullptr where the fused form does not apply: the caller runs xgn_stats). UFSM_XNET_GNF=0: never fused. */
+__global__ void __launch_bounds__(128) k_gnfin_p(const double *part, int n, int C, int G, int nbs, long long S, float eps, float *gm, float *rs) {   /* block per (n, group): a fixed tree */
+    __shared__ double r0[128], r1[128];
+    const int nn = blockIdx.x / G, g = blockIdx.x % G, cpg = C / G, t = threadIdx.x; double sx = 0.0, sxx = 0.0;
+    for (int j = t; j < nbs; j += 128)
+        for (int c = g * cpg; c < (g + 1) * cpg; c++) { const double *q = part + (((size_t)nn * nbs + j) * C + c) * 2; sx += q[0]; sxx += q[1]; }
+    r0[t] = sx; r1[t] = sxx; __syncthreads();
+    for (int o = 64; o > 0; o >>= 1) { if (t < o) { r0[t] += r0[t + o]; r1[t] += r1[t + o]; } __syncthreads(); }
+    if (t) return;
+    const double N = (double)S * cpg, mean = r0[0] / N, var = fmax(r1[0] / N - mean * mean, 0.0); const float r = (float)(1.0 / sqrt(var + eps));
+    for (int c = g * cpg; c < (g + 1) * cpg; c++) { gm[(size_t)nn * C + c] = (float)mean; rs[(size_t)nn * C + c] = r; }
+}
+extern "C" xt xconv_fwd_gs(const xconv *c, xt x, int act, int groups, float eps, float **gm) {
+    static int gnf = -1; if (gnf < 0) gnf = getenv("UFSM_XNET_GNF") ? atoi(getenv("UFSM_XNET_GNF")) : 1;   /* mgpu: env */
+    if (g_cfg < 0) g_cfg = getenv("UFSM_XNET_CFG") ? atoi(getenv("UFSM_XNET_CFG")) : 0;
+    fq_env(); *gm = nullptr;
+    const int Do = (x.d + 2 * c->pd - c->kd) / c->sd + 1, Ho = (x.h + 2 * c->ph - c->kh) / c->sh + 1, Wo = (x.w + 2 * c->pw - c->kw) / c->sw + 1;
+    const long long S = (long long)Do * Ho * Wo;
+    const bool ok = gnf && g_cfg == 0 && !g_fq_a && !c->mxq && !c->unfold && !c->tconv && c->co > 16 && c->co % 2 == 0 && x.c == c->ci && S % 128 == 0 && !(act & (XA_LN | XA_GLU | XA_POSTRES))
+                    && groups > 0 && c->co % groups == 0;
+    if (!ok) return conv_run(c, x, nullptr, act);
+    const int nbs = (int)(S / 128); const size_t nb = (size_t)x.n * nbs;
+    double *part = (double *)xmalloc_dev(nb * c->co * 2 * sizeof(double));
+    xt y = conv_run(c, x, nullptr, act, nullptr, nullptr, 0.f, nullptr, part);
+    float *g = (float *)xmalloc_dev((size_t)x.n * c->co * 4 * 2);
+    k_gnfin_p<<<(unsigned)(x.n * groups), 128, 0, g_st>>>(part, x.n, c->co, groups, nbs, S, eps, g, g + (size_t)x.n * c->co);
+    xfree_dev(part); *gm = g;
+    return y;
+}
+/* xgn with given statistics (xgn_stats / xconv_fwd_gs) */
+extern "C" void xgn_with(xt x, const float *gm, const float *gamma, const float *beta, const xt *res, int act, xt y) {
+    const int C = x.c, n = x.n; const long long S = (long long)x.d * x.h * x.w; const float *rs = gm + (size_t)n * C;
+    const size_t total = xt_numel(x); unsigned nb = nblk(total / 2, 256); if (nb > 65535 * 4) nb = 65535 * 4;
+    k_gn_apply<<<nb, 256, 0, g_st>>>((const __half *)x.p, gm, rs, gamma, beta, res ? (const __half *)res->p : nullptr, act, (__half *)y.p, C, S, total);
 }
 
 /* ---- data movement ---- */

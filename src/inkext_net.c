@@ -594,13 +594,22 @@ static void hecate_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out,
     free(h2); free(sup); free(full);
 }
 
+/* conv, then its InstanceNorm (+ res, act) in place, the statistics from the conv's epilogue where xconv_fwd_gs applies (S % 128) */
+static xt conv_in(const xconv *c, xt x, float **gm) {
+    xt y = xconv_fwd_gs(c, x, XA_NONE, c->co, 1e-5f, gm);
+    if (!*gm) *gm = xgn_stats(y, y.c, 1e-5f);
+    return y;
+}
+static xt conv_in_apply(const xconv *c, xt x, const float *g, const float *b, const xt *res, int act) {
+    float *gm; xt y = conv_in(c, x, &gm); xgn_with(y, gm, g, b, res, act, y); xfree_dev(gm); return y;
+}
 static xt bbd_fwd(const bbd *B, xt x) {
-    xt h = xconv_fwd(&B->c1, x, nullptr, XA_NONE); xgn(h, h.c, B->g1, B->b1, 1e-5f, nullptr, XA_LRELU, h);
-    xt h2 = xconv_fwd(&B->c2, h, nullptr, XA_NONE); xt_free(&h);
+    xt h = conv_in_apply(&B->c1, x, B->g1, B->b1, nullptr, XA_LRELU);
+    float *g2; xt h2 = conv_in(&B->c2, h, &g2); xt_free(&h);
     xt sk = x; int own = 0;
     if (B->stride != 1) { sk = xavgpool2d_k2(x); own = 1; }
-    if (B->has_sk) { xt p = xconv_fwd(&B->sk, sk, nullptr, XA_NONE); if (own) xt_free(&sk); xgn(p, p.c, B->gs, B->bs, 1e-5f, nullptr, XA_NONE, p); sk = p; own = 1; }
-    xgn(h2, h2.c, B->g2, B->b2, 1e-5f, &sk, XA_LRELU, h2);
+    if (B->has_sk) { xt p = conv_in_apply(&B->sk, sk, B->gs, B->bs, nullptr, XA_NONE); if (own) xt_free(&sk); sk = p; own = 1; }
+    xgn_with(h2, g2, B->g2, B->b2, &sk, XA_LRELU, h2); xfree_dev(g2);
     if (own) xt_free(&sk);
     return h2;
 }
@@ -623,7 +632,7 @@ static void reader_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out)
         float *at = xmalloc_dev((size_t)B * D * T * T * 4); xhead(f2, n->att_w, n->att_b, at);
         z = xdepth_attn_max(f2, at); xt_free(&f2); xfree_dev(at);
     }
-    xt x = xconv_fwd(&n->rstem, z, nullptr, XA_NONE); xt_free(&z); xgn(x, x.c, n->rstem_g, n->rstem_b, 1e-5f, nullptr, XA_LRELU, x);
+    xt x = conv_in_apply(&n->rstem, z, n->rstem_g, n->rstem_b, nullptr, XA_LRELU); xt_free(&z);
     xt skip[6];
     for (int s = 0; s < n->nst; s++) {
         for (int i = 0; i < n->nblk[s]; i++) { xt y = bbd_fwd(&n->st[s][i], x); if (!(s > 0 && i == 0)) xt_free(&x); x = y; }
@@ -633,8 +642,7 @@ static void reader_fwd(const ie_net *n, const uint8_t *tiles, int B, float *out)
     for (int s = 0; s < n->nst - 1; s++) {
         xt up = xconv_fwd(&n->tconv[s], l, nullptr, XA_NONE); xt_free(&l);
         xt c = xconcat(up, skip[n->nst - 2 - s]); xt_free(&up); xt_free(&skip[n->nst - 2 - s]);
-        l = xconv_fwd(&n->dconv[s], c, nullptr, XA_NONE); xt_free(&c);
-        xgn(l, l.c, n->dg[s], n->db[s], 1e-5f, nullptr, XA_LRELU, l);
+        l = conv_in_apply(&n->dconv[s], c, n->dg[s], n->db[s], nullptr, XA_LRELU); xt_free(&c);
     }
     float *lg = xmalloc_dev((size_t)B * T * T * 4);
     xhead(l, n->logit_w, n->logit_b, lg); xt_free(&l);

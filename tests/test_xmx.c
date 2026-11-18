@@ -248,6 +248,35 @@ static int run_gnx(int N, int D, int H, int W, int C, int G, float off) {
     return bad;
 }
 
+/* xconv_fwd_gs (GroupNorm statistics from the conv epilogue) against xconv_fwd + xgn_stats: y bit-equal, gm / rs within 1e-5; and
+   batch-independent: each sample's gm / rs bit-equal computed alone */
+static int run_gs(int N, int H, int W, int ci, int co, int k, float off) {   /* off: input offset (output mean >> std) */
+    const size_t nx = (size_t)N * H * W * ci, ny = (size_t)N * H * W * co, S = (size_t)H * W; uint16_t *xh = malloc(nx * 2), *y1 = malloc(ny * 2), *y2 = malloc(ny * 2);
+    float *w = malloc((size_t)co * ci * k * k * 4), *g1 = malloc((size_t)N * co * 8), *g2 = malloc((size_t)N * co * 8), *ga = malloc((size_t)co * 8);
+    for (size_t i = 0; i < nx; i++) xh[i] = f2h(rnd() * 2.f + 0.3f + off);
+    for (size_t i = 0; i < (size_t)co * ci * k * k; i++) w[i] = rnd() * 0.05f + 0.01f;
+    xnet_set_mx(0); xconv c; xconv_init(&c, w, co, ci, 1, k, k, 1, 1, 1, 0, k / 2, k / 2, nullptr, nullptr);
+    xt x = xt_new(N, 1, H, W, ci); xh2d(x.p, xh, nx * 2);
+    float *gm; xt y = xconv_fwd_gs(&c, x, XA_NONE, co, 1e-5f, &gm); int bad = 0;
+    if (!gm) { printf("gs: not fused for %dx%d co %d\n", H, W, co); bad = 1; }
+    else {
+        xd2h(y1, y.p, ny * 2); xd2h(g1, gm, (size_t)N * co * 8); xfree_dev(gm); xt_free(&y);
+        y = xconv_fwd(&c, x, nullptr, XA_NONE); xd2h(y2, y.p, ny * 2); float *gr = xgn_stats(y, co, 1e-5f); xd2h(g2, gr, (size_t)N * co * 8); xfree_dev(gr); xt_free(&y);
+        size_t nd = 0; for (size_t i = 0; i < ny; i++) nd += y1[i] != y2[i];
+        double dm = 0; for (size_t i = 0; i < (size_t)N * co * 2; i++) { const double d = fabs((double)g1[i] - g2[i]) / (fabs((double)g2[i]) + 1e-3); if (d > dm) dm = d; }
+        size_t na = 0;
+        for (int n = 0; n < N; n++) {
+            xt xs = {(char *)x.p + (size_t)n * S * ci * 2, 1, 1, H, W, ci, nullptr}; float *g; xt ys = xconv_fwd_gs(&c, xs, XA_NONE, co, 1e-5f, &g); xd2h(ga, g, (size_t)co * 8); xfree_dev(g); xt_free(&ys);
+            for (int cc = 0; cc < co; cc++) { na += memcmp(&ga[cc], &g1[(size_t)n * co + cc], 4) != 0; na += memcmp(&ga[co + cc], &g1[(size_t)N * co + (size_t)n * co + cc], 4) != 0; }
+        }
+        printf("gs N %d %dx%d ci %3d co %3d k %d off %g: y %zu of %zu differ, gm / rs max rel diff vs xgn_stats %.2g, %zu of %d differ alone vs in the batch\n", N, H, W, ci, co, k, off, nd, ny, dm, na, N * co * 2);
+        bad = nd != 0 || dm > 1e-5 || na != 0;
+    }
+    if (xnet_check("test_xmx gs")) return 1;
+    xt_free(&x); xconv_free(&c); free(xh); free(y1); free(y2); free(w); free(g1); free(g2); free(ga);
+    return bad;
+}
+
 /* the 1 -> 16 stem conv (k_dfc1) against a double host reference with fp16 weights */
 static int run_c1(int N, int D, int H, int W) {
     const size_t nx = (size_t)N * D * H * W; uint16_t *xh = malloc(nx * 2), *yh = malloc(nx * 32); float *x = malloc(nx * 4), *w = malloc(16 * 27 * 4), b[16];
@@ -300,6 +329,22 @@ static void bench(void) {
 int main(void) {
     if (xnet_init(0)) { printf("SKIP: no GPU\n"); return 0; }
     if (getenv("XMX_BENCH")) { bench(); return 0; }
+    if (getenv("XMX_GSBENCH")) {   /* conv + GN stats: xconv_fwd + xgn_stats vs xconv_fwd_gs, the Reader's levels (N 8), min of 10 */
+        static const int L[][3] = {{384, 32, 32}, {192, 64, 64}, {96, 128, 128}, {48, 256, 256}};
+        xnet_set_mx(0);
+        for (int li = 0; li < 4; li++) {
+            const int Hs = L[li][0], ci = L[li][1], co = L[li][2]; float *w = calloc((size_t)co * ci * 9, 4); for (size_t j = 0; j < (size_t)co * ci * 9; j++) w[j] = rnd() * 0.05f;
+            xconv c; xconv_init(&c, w, co, ci, 1, 3, 3, 1, 1, 1, 0, 1, 1, nullptr, nullptr); xt x = xt_new(8, 1, Hs, Hs, ci);
+            double b0 = 1e9, b1 = 1e9;
+            for (int r = 0; r < 10; r++) {
+                xnet_sync(); double t0 = now(); xt y = xconv_fwd(&c, x, nullptr, XA_NONE); float *g = xgn_stats(y, co, 1e-5f); xnet_sync(); double t = now() - t0; if (t < b0) b0 = t; xfree_dev(g); xt_free(&y);
+                xnet_sync(); t0 = now(); y = xconv_fwd_gs(&c, x, XA_NONE, co, 1e-5f, &g); xnet_sync(); t = now() - t0; if (t < b1) b1 = t; xfree_dev(g); xt_free(&y);
+            }
+            printf("gsbench %3d^2 %3d -> %3d: conv + xgn_stats %.3f ms, fused %.3f ms\n", Hs, ci, co, b0 * 1e3, b1 * 1e3);
+            xt_free(&x); xconv_free(&c); free(w);
+        }
+        return 0;
+    }
     if (getenv("XMX_DFBENCH")) {   /* the Reader depth-fusion conv, 4 x 17 x 384^2 x 16: implicit GEMM (0) vs the halo-kernel variants; min of 10 */
         xnet_set_mx(0); float *w = calloc(16 * 16 * 27, 4); for (int j = 0; j < 16 * 16 * 27; j++) w[j] = rnd() * 0.05f;
         xconv c; xconv_init(&c, w, 16, 16, 3, 3, 3, 1, 1, 1, 1, 1, 1, nullptr, nullptr); xt x = xt_new(4, 17, 384, 384, 16);
@@ -360,6 +405,11 @@ int main(void) {
     fails += run_gn(2, 1, 12, 12, 320, 32, 1.f);     /* deep level, 10 channels a group */
     fails += run_gn(1, 1, 5, 7, 640, 32, 1.f);       /* more pairs than threads */
     fails += run_gnx(3, 17, 40, 36, 16, 16, 0.f);
+    fails += run_gs(3, 32, 48, 32, 32, 3, 0.f);
+    fails += run_gs(2, 16, 24, 64, 64, 3, 0.f);
+    fails += run_gs(3, 16, 16, 128, 256, 3, 0.f);
+    fails += run_gs(2, 16, 8, 320, 320, 1, 0.f);
+    fails += run_gs(2, 32, 32, 32, 32, 3, 10.f);   /* output mean ~ 30 std */
     fails += run_gnx(5, 1, 24, 24, 320, 32, 20.f);
     fails += run_gnx(2, 1, 96, 96, 128, 32, 1.f);
     fails += run_gnx(4, 1, 12, 12, 640, 32, 1.f);
