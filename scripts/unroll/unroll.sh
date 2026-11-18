@@ -453,6 +453,65 @@ ref() {
   return 0
 }
 
+# --- rhocal (RHOCAL=1; off by default until the GT A/B, DESIGN 2026-11-17 "rhocal"): the label-free per-scroll count calibration.
+#     The net's sheet spacing can be off by a radius-dependent factor on scrolls it never saw (PHerc0332: try9 1.2 CT peaks per fitted
+#     turn, 1.34-1.40 at r 2-4 mm), so: wrap-check the ref against the CT by 1 mm radius band (--bands), K(r) <- K(r) x CT(r)^RHOCALG
+#     on the bands with >= RHOCALN intervals, one-peak share >= 0.45 and empty / 2+ shares <= 0.4 (the rest hold the nearest used band),
+#     a 3-band median, K capped to [RHOCALMIN 0.8, RHOCALMAX 1.6]; re-solve the ref from a --pool-split cache (count-field --rho-r) and
+#     repeat until every used band is within RHOCALTOL (0.04) of 1 or RHOCALIT (3) passes. Kept only if wrap-check's dup + merged did not
+#     rise and the body z drift (cf-demod) rose by <= 0.15 turn; else DEFAULTED: to the plain ref. The objective is wrap-check (the CT's
+#     sheets), not unroll-qa's pw48 / w4, which score agreement with the net's own phase / winding mod 4 and so penalise a correct count
+#     where the net is out of domain (0332: 0.77 phase turns per fitted turn). ---
+rcprof() {   # rcprof BANDS.tsv "R:K,..." (previous profile, empty = 1) -> the next profile on stdout; "converged" on fd 3 when within RHOCALTOL
+  awk -F'\t' -v prev="$2" -v g=${RHOCALG:-1.3} -v nmin=${RHOCALN:-2000} -v kmin=${RHOCALMIN:-0.8} -v kmax=${RHOCALMAX:-1.6} -v tol=${RHOCALTOL:-0.04} '
+    function kprev(r,   i, a, b, k) { if (np == 0) return 1; if (r <= pr[1]) return pk[1]; if (r >= pr[np]) return pk[np]
+      for (i = 2; i <= np; i++) if (r <= pr[i]) return pk[i - 1] + (r - pr[i - 1]) / (pr[i] - pr[i - 1]) * (pk[i] - pk[i - 1]) }
+    BEGIN { np = split(prev, pp, ","); for (i = 1; i <= np; i++) { split(pp[i], q, ":"); pr[i] = q[1]; pk[i] = q[2] }; if (prev == "") np = 0 }
+    NR > 1 { nb++; r[nb] = ($1 + $2) / 2; use[nb] = ($3 >= nmin && $6 >= 0.45 && $5 <= 0.4 && $7 <= 0.4 && $4 > 0)
+             k[nb] = kprev(r[nb]) * (use[nb] ? $4 ^ g : 1); if (use[nb]) { nu++; if ($4 - 1 > tol || 1 - $4 > tol) off++ } }
+    END { if (!nu) { print ""; exit }
+          for (i = 1; i <= nb; i++) if (!use[i]) { best = -1; for (j = 1; j <= nb; j++) if (use[j] && (best < 0 || (i - j) ^ 2 < (i - best) ^ 2)) best = j; k[i] = k[best] }
+          for (i = 1; i <= nb; i++) { a = k[i > 1 ? i - 1 : i]; b = k[i]; c = k[i < nb ? i + 1 : i]; m = a < b ? (b < c ? b : (a < c ? c : a)) : (a < c ? a : (b < c ? c : b))
+                                      m = m < kmin ? kmin : m > kmax ? kmax : m; out = out (i > 1 ? "," : "") sprintf("%.2f:%.3f", r[i], m) }
+          print out; if (!off) print "converged" > "/dev/fd/3" }' "$1"
+}
+rcscore() {   # rcscore MODEL TAG: wrap-check bands + verdicts and the body drift of a ref model -> "dupmerged body ctturn"
+  local m=$1 t=$2
+  X $O/logs/rhocal.$t.wc.log $U wrap-check $m $F --ct $R $K/$LV --ct-um $LUM --threads $TH --bands $O/rhocal/$t.bands.tsv || return 1
+  X $O/logs/rhocal.$t.drift.log $U cf-demod $m $F --step ${DRIFTSTEP:-8} --band 128 --cz 16 --threads $TH || return 1
+  [ "$DRY" = 1 ] && { echo "0 0 1"; return 0; }
+  [ -s $O/rhocal/$t.bands.tsv ] || { log "rhocal: wrap-check wrote no --bands table (a binary without --bands?)"; return 1; }
+  local v b c; v=$(grep -oE 'verdicts: [0-9]+ real, [0-9]+ dup, [0-9]+ merged' $O/logs/rhocal.$t.wc.log | tail -1 | awk '{print $4 + $6}')
+  b=$(sed -nE 's/^cf-demod: z drift body: along-sheet excursion ([0-9.]+) turns.*/\1/p' $O/logs/rhocal.$t.drift.log | tail -1)
+  c=$(grep -oE 'CT papyrus peaks per fitted turn [0-9.]+' $O/logs/rhocal.$t.wc.log | tail -1 | awk '{print $NF}')
+  echo "${v:-999} ${b:-999} ${c:-0}"
+}
+rhocal() {
+  [ -e $O/rhocal/ref0.model ] && { log "rhocal: already applied (rhocal/ref0.model is the plain ref)"; return 0; }
+  mkdir -p $O/rhocal; local s0 s p= np it pc="--pool-split 1 --pool-cache $O/rhocal/pool" dir
+  dir=$([ "$DRY" = 1 ] && echo '$DIR' || jq -r .dir $REF/model.json)   # (the ref's hand: REFX's --dir from ref() is not in this shell)
+  s0=$(rcscore $REF ref0) || return 1; log "rhocal: ref: dup+merged / body drift / CT peaks per turn = $s0"
+  for it in $(seq 1 ${RHOCALIT:-3}); do
+    np=$(rcprof $O/rhocal/$([ $it = 1 ] && echo ref0 || echo it$((it - 1))).bands.tsv "$p" 3> $O/rhocal/conv)
+    [ "$DRY" = 1 ] && np="0.50:1.000"
+    [ -s $O/rhocal/conv ] && [ $it -gt 1 ] && { log "rhocal: converged after $((it - 1)) pass(es)"; break; }
+    [ -n "$np" ] || { log "rhocal: DEFAULTED: no radius band passes the interval / one-peak gates: the plain ref kept"; return 0; }
+    [ -s $O/rhocal/conv ] && [ $it = 1 ] && { log "rhocal: the plain ref is already within ${RHOCALTOL:-0.04} on every used band: kept"; return 0; }
+    p=$np; log "rhocal: pass $it: --rho-r $p"; [ "$DRY" = 1 ] || rm -rf $O/rhocal/it$it
+    X $O/logs/rhocal.it$it.log $U count-field $F $O/cf.unused $(refpool) --dir $dir --rho-r $p --iters 1200 --model $O/rhocal/it$it \
+      --threads $TH --mem-gb ${CFMEM:-24} --chunk-rows $(refcz) $pc || return 1
+    s=$(rcscore $O/rhocal/it$it it$it) || return 1; log "rhocal: pass $it: dup+merged / body drift / CT peaks per turn = $s"
+    [ "$DRY" = 1 ] && break
+  done
+  [ "$DRY" = 1 ] && return 0
+  local last; last=$(ls -d $O/rhocal/it* 2> /dev/null | sort -V | tail -1); [ -n "$last" ] || return 0
+  set -- $s0; local d0=$1 b0=$2; set -- $s
+  if [ "$1" -gt "$d0" ] || awk -v a=$2 -v b=$b0 'BEGIN { exit !(a > b + 0.15) }'; then
+    log "rhocal: DEFAULTED: the calibrated ref is worse (dup+merged $d0 -> $1 or body drift $b0 -> $2): the plain ref kept"; return 0; fi
+  mv $REF $O/rhocal/ref0.model && mv $last $REF && log "rhocal: the ref is now $(basename $last) (--rho-r $p)"
+  type mset > /dev/null 2>&1 && mset rho_auto "$p"; return 0
+}
+
 # --- rectosp: m7 recto spacing into the count target (see the header); the source: RECTOSRC, else the mirror's
 #     <SCROLL>/representations/predictions/surfaces/<scan id>-surface-*-surface-m7-L<LV>-prob.zarr at its finest level ---
 m7src() {
@@ -657,8 +716,9 @@ check() {
     local dl; dl=$(grep '^cf-demod: z drift:' $O/logs/drift.log | tail -1); log "check: ${dl#cf-demod: }"
     # the body (bands with >= 1/2 the fullest band's weight) and the ends apart: 0332's 1.9-turn ALARM was 1.6 turns at the broken top end
     local db; db=$(grep '^cf-demod: z drift body' $O/logs/drift.log | tail -1); [ -n "$db" ] && log "check: ${db#cf-demod: }"
-    local ex; ex=$(echo "$dl" | sed -nE 's/.*along-sheet excursion ([0-9.]+) turns.*/\1/p')
-    [ -n "$ex" ] && awk -v e=$ex -v w=${DRIFTWARN:-0.75} 'BEGIN { exit !(e > w) }' && log "check: ALARM: the ref drifts $ex turns along the sheets over z (> DRIFTWARN ${DRIFTWARN:-0.75}): sheet identity changes with height"
+    # the ALARM on the body's excursion (the whole one when there is no body line): the ends' swings are logged above, not alarmed
+    local ex wh=body; ex=$(echo "$db" | sed -nE 's/.*along-sheet excursion ([0-9.]+) turns.*/\1/p'); [ -n "$ex" ] || { wh=whole; ex=$(echo "$dl" | sed -nE 's/.*along-sheet excursion ([0-9.]+) turns.*/\1/p'); }
+    [ -n "$ex" ] && awk -v e=$ex -v w=${DRIFTWARN:-0.75} 'BEGIN { exit !(e > w) }' && log "check: ALARM: the ref drifts $ex turns along the sheets over z ($wh; > DRIFTWARN ${DRIFTWARN:-0.75}): sheet identity changes with height"
     [ $rc = 3 ] && { log "check: FAILED: z drift above DRIFTMAX $DRIFTMAX"; return 1; }
   fi
   # GT boxes (GTBOXES = a wbench-format tsv in fields-native voxels, GTCODES = "ROOT KEY"; off unless both are set): the joined model and
@@ -670,7 +730,11 @@ check() {
   fi
 }
 wraps() {
-  local zr=; [ -n "$ZR" ] && [ "$ZR" != - ] && zr="--zr $ZR"
+  local zr=; [ -n "$ZR" ] && [ "$ZR" != - ] && [ "$ZR" != auto ] && zr="--zr $ZR"
+  # ZR=auto (opt-in until the GT A/B): the body's z range from the check stage's cf-demod (bands with >= 1/2 the fullest band's phase
+  # weight): a broken end cap with no confident phase is not unrolled (PHerc0332: global z 1024..7680, the hand zr 512,7680)
+  if [ "$ZR" = auto ] && [ "$DRY" != 1 ]; then local bz; bz=$(sed -nE 's/^cf-demod: body z range ([0-9]+,[0-9]+).*/\1/p' $O/logs/drift.log 2> /dev/null | tail -1)
+    if [ -n "$bz" ]; then zr="--zr $bz"; log "wraps: ZR=auto: --zr $bz (the cf-demod body)"; else log "wraps: DEFAULTED: ZR=auto but no body z range in logs/drift.log (DRIFT=0?): no --zr"; fi; fi
   [ "$DRY" = 1 ] || rm -rf $O/wraps
   # the masked-CT gate (geo-outer 2026-11-14; the one no-data alarm): wraps drops roots on weak data cells (the fields' edge on a zeroed
   # CT); a share > --nodata-warn 0.02 means a mask that clips papyrus (the fields want the unmasked / filled CT). NODATAMAX F: exit 3 above
@@ -929,7 +993,7 @@ fi
 inkmain() { [ "${NOINK:-0}" != 1 ] && [ "$INKAT" != fields ] && ! done_ ink && inkbg; return 0; }
 { [ "${RECTOSP:-1}" = 0 ] || stage rectosp rectosp; } || { log "unroll: rectosp failed"; m7stop; wait; exit 1; }
 [ "${RECTOSP:-1}" != 0 ] && { [ -e $O/fields/rsp/fields.json ] || { [ "$DRY" = 1 ] && [ -n "$(m7src)" ]; }; } && F=$O/fields/rsp   # (the ref and every later stage read the blended fields)
-{ [ "${CTCAL:-0}" != 1 ] || stage ctcal ctcal; } && stage ref ref && upto ref && stage slabs slabs && inkmain && upto slabs && stage join join && upto join && stage check check && upto check &&
+{ [ "${CTCAL:-0}" != 1 ] || stage ctcal ctcal; } && stage ref ref && { [ "${RHOCAL:-0}" != 1 ] || stage rhocal rhocal; } && upto ref && stage slabs slabs && inkmain && upto slabs && stage join join && upto join && stage check check && upto check &&
   stage wraps wraps && upto wraps && stage trim trim && stage snap snap && upto snap ||
   { log "unroll: stopped before the strip"; wait; exit 1; }
 if [ "${PERWRAP:-0}" = 1 ]; then ( waitfor ink && stage perwrap perwrap && { [ "${FACES:-0}" = 1 ] && stage faces faces; true; } ) & PWP=$!; [ "$DRY" = 1 ] && wait $PWP; fi

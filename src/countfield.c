@@ -1490,7 +1490,9 @@ int cmd_cf_demod(int argc, char **argv) {
         for (int b = 0; b < bb0; b++) if (bfull[b]) below += bdz[b];
         for (int b = bb1 + 1; b < nb; b++) if (bfull[b]) above += bdz[b];
         printf("cf-demod: z drift body: along-sheet excursion %.2f turns over bands %d..%d (native z %.0f..%.0f, >= 1/2 the fullest band's weight); "
-               "below it %+.2f, above it %+.2f turns\n", bmax - bmin, bb0, bb1, bb0 * band * h, fmin(D, (bb1 + 1) * band) * h, below, above); }
+               "below it %+.2f, above it %+.2f turns\n", bmax - bmin, bb0, bb1, bb0 * band * h, fmin(D, (bb1 + 1) * band) * h, below, above);
+        /* the body's global native z range (unroll.sh ZR=auto: the wraps' --zr, so a broken end cap is not unrolled) */
+        printf("cf-demod: body z range %.0f,%.0f (global native)\n", m->origin[0] + bb0 * band * h, m->origin[0] + fmin(D, (bb1 + 1) * band) * h); }
     free(bcum);
     int rc = dmax > 0 && drift > dmax ? 3 : 0;
     if (*out) {   /* +-R box average of the node phasors (separable, clamped), then delta += arg / 2 pi */
