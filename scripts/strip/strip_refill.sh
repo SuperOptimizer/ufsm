@@ -45,6 +45,11 @@ gate() {   # gate S: the ink render R/S.tif (its stripe linked in R/in_S) x max(
   nice -n 10 $U img-gate $R/$s.tif $R/gate1/$s.tif $R/gate2/$s.tif || { log "gate $s FAILED"; return 1; }
   rm -f $R/gate1/$s.tif $R/gate2/$s.tif; [ $own = 1 ] && rm -r $R/in_$s; touch $R/$s.gated
 }
+r3() {   # (defined before its callers below, the gated stretch and the reuse loop: bash defines functions as it reads them, 11-18) R3INK: the stripe's ink render replaced by the 2-D teacher's map on the same grid, gated by the filled CT (r3ink.sh)
+  local s=$1; [ -n "${R3INK:-}" ] || return 0; [ -e $R/$s.r3 ] && return 0
+  bash $R3INK $OUT/strip/flat/stripes/$s $R/$s.tif $R/${s}_ct.tif >> $OUT/logs/refill_$s.log 2>&1 || { log "r3ink $s FAILED (logs/refill_$s.log)"; return 1; }
+  touch $R/$s.r3
+}
 if [ $GATED = 1 ] && [ -z "${STRETCH:-}" ] && [ ! -e $OUT/stretch.gated ]; then
   # the contrast stretch from the GATED renders of the 3 middle stripes (the driver's stretch.txt came from the ungated ones; gated air at 0
   # would pull it): CT 0.5 / 99.8 % over rendered pixels (CT > 0), ink 1 / 99.9 % over papyrus pixels only (CT >= CTL), lead 11-13
@@ -61,11 +66,6 @@ if [ $GATED = 1 ] && [ -z "${STRETCH:-}" ] && [ ! -e $OUT/stretch.gated ]; then
 fi
 for d in $R/*.done; do [ -e "$d" ] || continue; s=$(basename $d .done); [ -e $R/${s}_ct.tif ] && { gate $s || exit 1; r3 $s || exit 1; }; done   # (renders reused from the driver)
 ST=${STRETCH:-$(cat $OUT/stretch.txt 2> /dev/null)}; [ -n "$ST" ] || { log "no stretch (OUT/stretch.txt or STRETCH)"; exit 1; }
-r3() {   # R3INK: the stripe's ink render replaced by the 2-D teacher's map on the same grid, gated by the filled CT (r3ink.sh)
-  local s=$1; [ -n "${R3INK:-}" ] || return 0; [ -e $R/$s.r3 ] && return 0
-  bash $R3INK $OUT/strip/flat/stripes/$s $R/$s.tif $R/${s}_ct.tif >> $OUT/logs/refill_$s.log 2>&1 || { log "r3ink $s FAILED (logs/refill_$s.log)"; return 1; }
-  touch $R/$s.r3
-}
 rend() {   # one stripe -> render_fill/<s>.tif, <s>_ct.tif, <s>.done; fillmap/<s>_fill.tif
   local s=$1; [ -e $R/$s.done ] && return 0
   while [ $(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo) -lt $MEMGB ]; do sleep 30; done
