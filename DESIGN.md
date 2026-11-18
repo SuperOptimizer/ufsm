@@ -6,6 +6,46 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Production ink = reader3 (INKMODE=r3, the default); inkpod parked: memorisation, not labels (2026-11-17, branch inkr3-20261117)
+
+User decision 11-17: the latent ink head (inkpod) is not used in production until it is retrained. On the 1667 held-out regions it
+scores 0.58 against reader3's 0.858 (previous section). The unroll's ink is now reader3, applied to our own renders:
+- `scripts/unroll/r3ink.sh SURFDIR OUT.tif CT.tif` replaces a render's ink image with ink-ext on the same surface. ink-ext's canvas
+  is the render's grid, (w-1)/scale+1. The result is then gated by the filled CT: `img-gate --min T` binarises the gate image at
+  T = R3GATE, default FILLCT 80, so the output is 0 where CT < T. R3W picks the checkpoint (a,b = ensemble; argus2 runs as
+  `--model reader3`), R3MODEL the port.
+- One ink-ext call per surface set (`r3pre`): all stripes before the strip mosaic, and every per-wrap surface in wrap order between
+  perwrap's render pass and its finisher pass, with one shared `--cache $O/ink/ct.cache` (unrollperf's fetch threads switch on by
+  themselves with --cache and a remote CT). r3ink.sh picks up the precomputed `R3PRE/<name>_<model>.tif`, and a missed surface
+  falls back to its own call.
+  1667 w035 + w042 e2e (desk card 1, local CT levels 2-5): perwrap 75 -> 40 s; the net 39 -> 85 tiles/s with the warm shared
+  cache; the same mean (0.305 on w042).
+- The `ink` / `inkcal` stages are no-ops under r3, so the latent ink predict and its calibration no longer run. The `INKMODE=lat`
+  (latink / inkpod) and `ift3` modes are kept behind the flag. The pod's unroll.sh defaults to r3, and setup.sh fetches reader-v3
+  at its pinned HF revision (sha256 checked).
+- ink-ext skips CT levels that are missing (the unroll's local CT holds levels 2-5 only). It reads the coarsest present level
+  <= 1.05 x the model's spacing, else the finest present one.
+
+**Why inkpod does not transfer (diagnosis for the retrain).** 1667 scored on our wraps, 2-D surface AUC, 40 um tolerance:
+| map | training regions | held-out |
+|---|---|---|
+| reader3 | 0.839 | 0.858 |
+| inkpod | 0.84 | 0.582 |
+- The held-out regions are not harder (reader3 scores higher there), so 1667 is not a data floor at 9.6 um.
+- The 3-D targets are correctly registered. The splat (inkgt/gt PHerc1667.zarr 9.596, `render --known --depth 3`) rendered on the
+  17 labelled wraps has, inside the held-out regions, 95.4 % of its positives on human 2-D ink and a recall of 0.25 (open-face band
+  only); as a ranking map it scores AUC 0.62, because it is sparse.
+- The holdouts were honest (holdouts-ink.json boxes + the validation rasters of 35 of the 39 1667 segments).
+- The gap is memorisation. Positive ink supervision came only from human labels on 144 segments (37 % of the windows), with
+  replay 3 over 15k+ steps of P 1024 windows. Also fstem-drop 0.25 on ink windows (predict always runs the stem), training mostly
+  at the 4.8 um rung while production reads 9.6, and no held-out validation in the trainer.
+- Retrain plan, sent to the lead before any launch:
+  - ink-teach soft targets from reader3 + ink9um on all segments and on our unroll wraps;
+  - holdouts-20261118;
+  - fstem-drop 0, ink-radial-drop 0.15, ink-mil-r-um 50, replay 1, rungs weighted to 9.6, a per-scroll human weight cap;
+  - held-out 2-D AUC every 1000 steps, early stop;
+  - a 2-arm 3k-step smoke (human vs human + teacher) on the RTX PRO 4000 pod.
+
 ## lat_heads_tc_k: predict's heads with a tensor-core stem, 2.4x (2026-11-17, branch convklh-20261117)
 
 lat_heads_k (nn_lat_heads_place, predict --heads) was 31 % of the ink recipe's kernel time: 37.5 ms of 121.9 per window on the 0332 set.

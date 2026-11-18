@@ -422,10 +422,11 @@ static void gpu_submit(gworker *G, uint8_t **tiles, int **tx, int **ty, int nb) 
 /* the probability map (model grid Wm x Hm) of one surface */
 static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *pdu, float **pctl) {
     const ie_spec *sp = X->sp; const int D = sp->D, T = sp->T;
-    /* CT level: the coarsest present level not coarser than the spacing (5% slack); none (only coarser levels exist): refuse, a
-       coarser read would change the model's input */
-    int L = -1; for (int l = 0; l < X->nlev; l++) if (X->lev[l].z && X->lev_um[l] <= X->px_um * 1.05) L = l;
-    if (L < 0) { fprintf(stderr, "ink-ext: %s: no CT level at <= %.3f um (the model's %.3f um) present\n", S->name, X->px_um * 1.05, X->px_um); return nullptr; }
+    /* CT level: the coarsest present level not coarser than the spacing (5% slack); none qualifies (a scan coarser than the model):
+       the finest present level, as before levels could be missing; --layers without CT: level 0 (only its um is used) */
+    int L = -1, L0 = -1; for (int l = 0; l < X->nlev; l++) if (X->lev[l].z || X->stk) { if (L0 < 0) L0 = l; if (X->lev_um[l] <= X->px_um * 1.05) L = l; }
+    if (L < 0) L = L0;
+    if (L < 0) { fprintf(stderr, "ink-ext: %s: no CT level present\n", S->name); return nullptr; }
     irender R = {0}; R.S = S; R.L = &X->lev[L]; R.lscale = X->lev_um[L] / X->lev_um[0]; R.D = D; R.center = (D - 1) * 0.5; R.reverse = X->reverse; R.shift = X->shift;
     R.ss = (int)lround(X->px_um / X->lev_um[L]); if (R.ss < 1) R.ss = 1;
     R.du = X->px_um / (S->vox_um / S->scale); R.step_vox = X->px_um / X->lev_um[0];
