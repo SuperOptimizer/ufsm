@@ -96,6 +96,12 @@ conv with GN on load) ~1/5, k_gnpart + k_gn_apply ~1/7, k_dfc1 ~1/14, k_dattn ~1
   at most ~2 x 658 / 39.4 M = 3e-5. test_xmx gnx checks that each sample's gm / rs are bit-equal alone and inside a batch (4 shapes).
   An exact-integer statistics version (fp16 values as integers in 64-bit limbs: any partition, any order) was also batch-independent,
   but k_gnpart took 2.5x as long (64-bit integer ops). It is not kept, but it is the form a fused igemm-epilogue version would need.
+- Parked (branch convkgf-20261117): the GN statistics from the conv_igemm epilogue (xconv_fwd_gs). Per-128-row-block partials are
+  reduced in a fixed order; it needs S % 128 == 0, so every block lies inside one sample at a fixed place, and it is used for reader3's
+  bbd / rstem / dconv. Deterministic and batch-independent (w035 batch 8 x2 and 16: 0 px); 227 k of 39.4 M px differ by 1 from master.
+  XMX_GSBENCH (conv + stats, N 8): 384^2 -19 %, 192^2 -12 %, 96^2 -8 %, 48^2 0 with float in-warp partials; double partials gave no
+  gain. In situ (4 interleaved pairs on a shared, busy card) the GN+igemm share showed no gain beyond the noise, and float partials
+  without a shift are less robust when mean >> std. Not worth a 0.6 % pixel change.
 - Parked (branch convkwave-20261117): wave-aware tiles for > 64 outputs (128x128 / 128x64 / 64x64 / 64x32 picked by waves x
   occupancy x per-tile cost). ncu showed the 24^2 x 320 layer at 108 blocks on 72 slots (1.5 waves, tensor pipe 77 % active) and 12^2
   at 27 blocks; XMX_IGBENCH: 24^2 -11 %, 12^2 -29 %, 12^2 x 1280 -25 %, byte-identical, but those layers are ~10 % of conv_igemm and
