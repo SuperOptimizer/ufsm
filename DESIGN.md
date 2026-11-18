@@ -6,6 +6,61 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Ink the papyrus once: the wraps' reader3 maps resampled from the stripes' (r3once; per-wrap AUC +0.004, 7.6k instead of 37.5k tiles; 2026-11-18, branch inkonce-20261118)
+
+Under INKMODE=r3 the unroll inked the same papyrus twice with reader3: once per wrap (the per-wrap images, perwrap's r3pre) and once per
+strip stripe (the mosaic, stripimg's r3pre). On 1667 that is 37.5k vs 38.0k tiles (1187 vs 1189 M px), desk 826 s and 952 s on a shared
+5060 Ti (--batch 4); at the pod's 85 tiles/s ~440 s of GPU each, which made the strip chain the critical path (unrollperf 11-17).
+
+`ufsm surf-resample SRC-SURFS SRC-MAPS DST-SURFS OUT` moves a map rendered on one tifxyz surface set onto another by 3-D position, so it
+needs no lineage between the sets (the wraps' and the strip's flattenings are unrelated parametrisations): source vertices in a spatial
+hash (8-voxel cells), each destination vertex projected onto the nearest source surfaces' bilinear patches (Gauss-Newton, walking across
+cells; the closer of the two best surfaces, <= --max-dist 4 voxels), destination pixels on render's canvas interpolated from their
+corners (at a switch between sources: the pixel's own point projected), the source map sampled bilinearly. 97.6 % of the stripe vertices
+project within 0.25 voxels. CPU only: 4 stripes 62 s, 44 wraps ~95 s on 8 threads. test_surf_resample: a synthetic cylinder sheet, two
+overlapping sources (one with a hole) and a destination of its own parametrisation: mean |d| vs the analytic map 0.32 / 255.
+
+Which direction: 1667 held-out ink AUC (scripts/inkgt/inkscore.sh = wrapscore.py, 1.84 M held-out samples; desk reader3 maps on the
+try9-6250 pod surfaces, podun/PHerc1667/inksdk):
+
+| map | 20 um | 40 um | 80 um |
+|---|---|---|---|
+| A reader3 on the stripes | 0.8666 | 0.8624 | 0.8505 |
+| D reader3 on the wraps (the per-wrap images until now) | 0.8633 | 0.8580 | 0.8445 |
+| C wraps -> stripes resampled (A where no source) | 0.8635 | 0.8583 | 0.8450 |
+| E stripes -> wraps resampled (0 where no source) | 0.8662 | 0.8619 | 0.8496 |
+| F stripes -> wraps, composed (r3once, below) | 0.8664 | 0.8622 | 0.8500 |
+
+The resampling itself is free (C = D, E = A within 0.0005); the per-wrap images were the weaker inking (D 0.004 below A: reader3 reads
+the strip's chunked flattening better than the per-wrap SLIM one; not investigated further). Wraps -> stripes also cannot cover the
+stripes: the per-wrap flatten keeps part of each wrap only (w060: a 2177 x 2318 lattice, a 562 x 747 flat), 3.6 % of the stripe pixels
+have no per-wrap source (ws002 17 %, ws003 81 %). So the stripes are inked and the wraps resampled from them.
+
+r3once (unroll.sh, INKMODE=r3, R3ONCE=1 the default; perwrap after its renders waits for the stripes' raw maps, state/strip_chain.failed
+or UPTO: the old per-wrap r3pre): surf-resample stripes -> wraps with three additions, then one ink-ext over the residual, then --compose:
+- --fill-gap 16: unsampled surface slivers within 16 px of a sampled pixel take its value (35 % of the unsampled pixels are within 4 px,
+  44 % within 16: the stripes' and the wraps' borders differ by a few px);
+- --edge-band 32: 6 of the 44 wraps cross a stripe boundary, where the stripe maps carry reader3's tile-edge effect (stripes -> wraps
+  alone: |E - D| within 16 px of the switch 11.4 vs 7.1 elsewhere, p95 46 vs 28); a 32-px band there is left unsampled;
+- --residual DIR: per wrap a tifxyz copy holding only the vertices whose pixels are still unsampled, + 8 vertices of context (+ 32 for
+  the band: with 8 the band kept |d| 12.8), the rest invalid; reader3 on it skips the empty tiles; --compose puts its map into the
+  unsampled pixels. (Seeding the residual by the pixel under each vertex must use render's pixel rule, all 4 cell corners valid, or every
+  vertex next to a hole seeds it: 6.8 M residual vertices before, 1.6 M after.)
+
+Result F: held-out AUC 0.8622 at 40 um (+0.0042 over D, A's level); the seam band |F - D| 4.3 (it is inked on the wrap) vs 7.1 elsewhere;
+the residual pass 1.6 M vertices, 7,559 tiles (20 % of the per-wrap pass), desk 88 s vs 826 s; + 98 s resample and 12 s compose on
+8 CPU threads. Expected on the pod: perwrap's ~440 s GPU pass -> ~90 s GPU + ~110 s CPU (not yet measured end to end: the full-scale
+post-snap run on the desk was stopped for a GPU window at 04:03 and is resumable).
+
+## strip-flatten: a full-size chunk without a mesh fails only above 0.1 % of the strip's vertices (2026-11-18, branch inkonce-20261118)
+
+Audit 11-14 #7 made any full-size chunk (2 S + 1 columns) with surface but no mesh fail the stage (before, it was skipped with exit 0).
+The 1667 z band 3072+1024 (the r3 re-time) then failed on one chunk of 204 scattered vertices. Now the dropped vertices are summed over
+such chunks and the stage fails only when they exceed --nomesh-max (0.001) of the valid vertices of every chunk read (both counted with
+the chunks' 2x overlap); below it prints `DEFAULTED: strip-flatten: N full-size chunks without a mesh, D of V valid vertices (..)` and
+their columns come from the neighbouring chunks' tails, as a narrow edge chunk's do. test_strip: a 400-column gap with 8 isolated
+vertices (2 full-size chunks without a mesh, 16 of 401,552 vertices): continues with the DEFAULTED line at the default, fails at 1e-6.
+
 ## Packed sheets are not resolved by finer CT: CT peaks per GT turn at 9.6 / 4.8 / 2.4 um (2026-11-18, pseudolab)
 
 The next-lever memo (/vesuvius/ufsm/pseudolab/lever-memo.md) rested on the premise that finer CT resolves the sheets the 9.6 um net
