@@ -49,8 +49,22 @@ or UPTO: the old per-wrap r3pre): surf-resample stripes -> wraps with three addi
 
 Result F: held-out AUC 0.8622 at 40 um (+0.0042 over D, A's level); the seam band |F - D| 4.3 (it is inked on the wrap) vs 7.1 elsewhere;
 the residual pass 1.6 M vertices, 7,559 tiles (20 % of the per-wrap pass), desk 88 s vs 826 s; + 98 s resample and 12 s compose on
-8 CPU threads. Expected on the pod: perwrap's ~440 s GPU pass -> ~90 s GPU + ~110 s CPU (not yet measured end to end: the full-scale
-post-snap run on the desk was stopped for a GPU window at 04:03 and is resumable).
+8 CPU threads. Expected on the pod: perwrap's ~440 s GPU pass -> ~90 s GPU + ~110 s CPU.
+
+End to end on the desk (full 1667, post-snap, ur/PHerc1667-post1, card 1 shared with try9 + fix0332's predict, capped to <= ~5 GB of
+mine: R3BATCH 4, SPAR 1, SJOBS 1, RJOBS 1, UFSM_RENDER_GPU_MEM 2; card-1 peak 11.1 GB total):
+
+| step (perwrap + stripimg run side by side) | old (per-wrap r3pre) | r3once |
+|---|---|---|
+| stripes' r3pre (stripimg; its maps kept for r3once, R3PRECP) | 38.0k tiles, 952 s (r3all 11-17) | 38.0k tiles, 577 s (render 84 + net 493: the same work, a less crowded card) |
+| per-wrap reader3 (perwrap) | 37.5k tiles, 826 s | residual 7,559 tiles in 44 surfaces, 71 s (105.8 tiles/s) |
+| surf-resample stripes -> wraps / --compose (CPU, 8 threads) | - | 138 s / 16 s (1,183 M px resampled, 4.05 M from the residual) |
+| GPU reader3 tiles over both | 75.5k | 45.6k (-40 %) |
+
+perwrap 858 s wall here includes waiting for the stripes' maps (it starts r3once once ink/r3/strip.ok exists) under SPAR 1; the
+stripimg chain failed on its first try on a bug of the r3 wiring (strip_refill.sh called r3() before defining it: `r3: command not
+found` on the first reused stripe; fixed on this branch) and took 38 s after the fix on the kept renders and maps. Stage walls on the
+shared desk card are not the pod's; podq2.sh's stagetable.tsv will give the pod's.
 
 ## strip-flatten: a full-size chunk without a mesh fails only above 0.1 % of the strip's vertices (2026-11-18, branch inkonce-20261118)
 
@@ -60,6 +74,13 @@ such chunks and the stage fails only when they exceed --nomesh-max (0.001) of th
 the chunks' 2x overlap); below it prints `DEFAULTED: strip-flatten: N full-size chunks without a mesh, D of V valid vertices (..)` and
 their columns come from the neighbouring chunks' tails, as a narrow edge chunk's do. test_strip: a 400-column gap with 8 isolated
 vertices (2 full-size chunks without a mesh, 16 of 401,552 vertices): continues with the DEFAULTED line at the default, fails at 1e-6.
+
+The unroll's distort gate counted every "no mesh" line of stripflat.log (also narrow edge chunks, and the appended log's earlier runs)
+and stopped the strip at any. It now reads the latest strip-flatten invocation only: full-size chunks that strip-flatten DEFAULTED and
+narrow edge chunks are logged (`distort: DEFAULTED: ...`, `... narrow edge chunk(s) ... (not gated)`), full-size ones without a
+DEFAULTED share still gate. The 1667 band (z 3072+1024, ur/PHerc1667-r3) then ran through: stripflat 12 s (14 full-size chunks without
+a mesh, 2,774 of 19.3 M vertices, 0.0144 %; 3 narrow), distort 0 s (p95 0.207, folded 0.00288), stripimg 101 s (3 stripes, the stripes'
+r3pre 38.1 tiles/s on the shared card; strip 143.7 cm, 119.2 cm2, on papyrus 0.945).
 
 ## Packed sheets are not resolved by finer CT: CT peaks per GT turn at 9.6 / 4.8 / 2.4 um (2026-11-18, pseudolab)
 

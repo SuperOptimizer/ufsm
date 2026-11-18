@@ -877,6 +877,8 @@ pw_fin() {   # pw_fin WRAP: (r3) the wrap's ink from r3pre, CT-gated; the side-b
   if [ "$INKMODE" = r3 ]; then R3PRE=$O/ink/r3/up bash $H/r3ink.sh $O/up/$w $d/$w.tif $d/${w}_ct.tif >> $d/render.log 2>&1 || return 1; fi
   nice -n 10 $U ink-compare $O/img/${w}_full_side.jpg --ct $d/${w}_ct.tif --ink "$INKNAME=$d/$w.tif" --px-um $LUM --stretch --stretch-ct --max-px 65000 --threads ${RTH:-8} \
     --then $O/prev/${w}_side.jpg --max-px 8000 > $d/stats.txt 2>&1 || return 1   # (its status is the job's: audit mini/shell #4)
+  # (KEEPINK=1: the CT-gated ink map kept as ink/wraps/<w>.tif, the GT score's input: inkscore.sh TAG $O/up $O/ink/wraps; pod queue 11-18)
+  [ "${KEEPINK:-0}" = 1 ] && [ -e $O/img/${w}_full_side.jpg ] && { mkdir -p $O/ink/wraps && mv -f $d/$w.tif $O/ink/wraps/$w.tif || return 1; }
   [ -e $O/img/${w}_full_side.jpg ] && rm -f $d/$w.tif $d/${w}_ct.tif $d/.rendered
   echo "$(date '+%F %T') $w $(grep -E '^[^ ]+: input' $O/logs/pw/$w.flat.log 2>/dev/null | head -1 | grep -oE '= [0-9.]+ cm2')" >> $O/logs/perwrap.list
 }

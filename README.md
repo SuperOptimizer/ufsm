@@ -186,6 +186,19 @@ setsid nohup bash /root/pod/ufsm/scripts/pod/unroll.sh PHerc1299 > /root/pod/unr
 tail -f /root/pod/unroll/PHerc1299/progress.log        # per-stage wall / CPU / max RSS in state/*.done; stop: touch .../STOP
 ```
 
+The next pod session's queue (2026-11-18): `scripts/pod/podq2.sh` runs (1) a production-style full PHerc1667 unroll at a pinned master
+commit with every speedup (r3 + ink-once, m7 prefetch, render alias, the fields' fused head / fstem kernels, all defaults; PERWRAP=1,
+KEEPINK=1, CLEAN=0) and pushes it to the desk itself as each stage group lands (it refuses to start the unroll when the desk is not
+reachable), then (2) inksdk's latent-ink smoke (the kit's own `podq.sh`: CT prefetch, step-10 / step-50 gates). Restartable (`$Q/state`),
+`touch $Q/STOPQ` stops after the current step; `stagetable.tsv` holds each stage's start / end / wall / CPU / max RSS from progress.log.
+On the desk: `scripts/pod/score1667.sh DESKDIR` (wrap-check --codes, gtboxes on ref-cf / joined, held-out ink AUC on the wraps).
+
+```sh
+scp -r /vesuvius/ufsm/inksmoke/kit root@POD:/root/ink/kit                # tiny files only (352 KB)
+COMMIT=<master sha> CKURL=<fields checkpoint URL on the mirror> DESK=forrest@<desk, reachable from the pod> \
+  setsid nohup bash podq2.sh > /root/pod/podq2.out 2>&1 < /dev/null &   # (podq2.sh from raw.githubusercontent.com at COMMIT)
+```
+
 `setup.sh` fetches everything from the public mirror, never via the desk. The mirror gives about 40 MB/s on a pod; desk -> pod
 rsync manages only about 1.6 MB/s.
 - Checkpoints: `ufsm/checkpoints/{wind96-wk1-best,ift3-24000}`.
