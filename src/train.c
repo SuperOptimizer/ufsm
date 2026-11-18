@@ -1345,6 +1345,26 @@ static int hgs_choose(gpu_state *d, int nmil) {
     }
     return 1;
 }
+/* UFSM_PARITY_DUMP=DIR (diagnostic, fix0332 2026-11-18 train-vs-predict parity audit): the first validation window's full-resolution
+   fp16 logits after the head chain (upsample / shuffle / fine stem), g_cout channels as [c][D][H][W] in DIR/train.logits, and its
+   source / level / level-0 corner / um / shape in DIR/train.win, for predict on the same box (scripts/parity) */
+static void parity_dump_slab(gpu_state *d, int z0, int nz, int D, int H, int W) {
+    static int state;   /* 0: not started, 1: the first window running, 2: done (mgpu: GPU 0's thread only) */
+    if (d->dev != 0 || state == 2) return;
+    if (z0 == 0) { if (state == 1) { state = 2; return; } state = 1; }
+    char fn[1200]; const size_t hw = (size_t)H * W, ns = (size_t)nz * hw;
+    snprintf(fn, sizeof fn, "%s/train.logits", getenv("UFSM_PARITY_DUMP"));
+    FILE *f = fopen(fn, z0 == 0 ? "wb" : "r+b"); if (!f) return;
+    uint16_t *h = malloc(ns * 2); if (!h) { fclose(f); return; }
+    nn_sync();
+    for (int c = 0; c < g_cout; c++) { nn_d2h(h, (const char *)d->hs_lg + (size_t)c * ns * 2, ns * 2); fseeko(f, (off_t)(((size_t)c * D + z0) * hw * 2), SEEK_SET); fwrite(h, 2, ns, f); }
+    free(h); fclose(f);
+    if (z0 == 0) {
+        snprintf(fn, sizeof fn, "%s/train.win", getenv("UFSM_PARITY_DUMP")); FILE *g = fopen(fn, "w");
+        if (g) { fprintf(g, "src %d level %d corner %lld %lld %lld um %.6f D %d H %d W %d cout %d\n", d->srcb[d->cur], d->lvlb[d->cur], (long long)d->cornb[d->cur][0],
+                         (long long)d->cornb[d->cur][1], (long long)d->cornb[d->cur][2], d->um, D, H, W, g_cout); fclose(g); }
+    }
+}
 static void head_slab_pass(gpu_state *d, int pass) {
     const int D = g_Pz, H = d->hs_P, W = d->hs_P, Z = d->hs_z;
     const size_t hw = (size_t)H * W, l3 = (size_t)D * hw;
@@ -1562,6 +1582,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (g_lat_hs) { FT("  u guide / shuffle"); PT("upsample"); }
         if (!fsd && g_fstem && !d->fs_drop && nn_fstem_fwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns)) { fprintf(stderr, "--fstem: slab shape\n"); abort(); }
         if (g_fstem) FT("  u fine stem fwd");
+        if (!pass && !d->hs_train && getenv("UFSM_PARITY_DUMP")) parity_dump_slab(d, z0, nz, D, H, W);   /* (diagnostic: the parity audit's validation logits) */
         const shape5 one = {1, 1, nz, H, W}, two = {1, 2, nz, H, W}, seven = {1, 7, nz, H, W};
         static int tgf_on = -1; if (tgf_on < 0) tgf_on = !getenv("UFSM_SLAB_TG") || ufsm_env_on("UFSM_SLAB_TG");   /* (UFSM_SLAB_TG=0: the five kernels) */   /* mgpu: env */
         const int tgf = tgf_on && !tskip && !g_ptrunc_on && !pdir && (!g_rv || pap);   /* the phase-derived targets in one kernel (nn_slab_targets, byte-identical) */

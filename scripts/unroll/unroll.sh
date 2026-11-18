@@ -227,7 +227,7 @@ mstart() {
   elif [ -n "${INKCMD:-}" ]; then mset inkcmd "$INKCMD"; mset ink_ck "${LATINK_CK:-the default of INKCMD}"; [ -n "${LATINK_CK:-}" ] && mset ink_ck_sha "$(fsha $LATINK_CK)"
   else mset ink_ck "$(readlink -f $INKCK)"; mset ink_ck_sha "$(fsha $INKCK)"; fi
   mset box "${BOX:-mask}"; mset zr "${ZR:--}"; mset stripargs_env "${STRIPARGS:-}"
-  mset env "$(for v in CK FEMA FPX INKCK INKCMD LATINK_CK R3W R3GATE R3PWGATE FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
+  mset env "$(for v in CK FEMA FPX FGRID INKCK INKCMD LATINK_CK R3W R3GATE R3PWGATE FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
 }
 mstage() {
   [ "$DRY" = 1 ] && return 0
@@ -320,7 +320,7 @@ fpred() {   # fpred GPU BOX OUT
     X $O/logs/fields.log $U field-blend $3 $3.g0 $3.g$((st / 2)) --tile $st,$st,$st --grids 0,0,0:$((st / 2)),$((st / 2)),$((st / 2)) --threads $TH || return 1
     [ "$DRY" = 1 ] || { [ -e $3/fields.json ] && rm -rf $3.g0 $3.g$((st / 2)); }; return
   fi
-  fpred1 $1 $2 $3 0
+  fpred1 $1 $2 $3 ${FGRID:-0}   # (FGRID: the window grid's offset in each axis, e.g. half a stride; a window-placement A/B)
 }
 fpred1() {   # fpred1 GPU BOX OUT GRID: one predict of the fit fields, its windows anchored at GRID (each axis)
   # a box off the window grid runs each window once per 512 shard it touches (predict.c: up to 8x on the half-stride grid; 0332 FBLEND

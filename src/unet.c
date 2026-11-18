@@ -2807,6 +2807,23 @@ static int l0st_want(const unet *u);   /* the level-0 slab stream (stage S3; aft
 static int l0h_on(const unet *u);     /* its head per slab (stage S4) */
 static const float *l0st_fwd_enc(unet *u, const float *x);
 static void l0st_fwd_dec(unet *u);
+/* UFSM_PARITY_DUMP=DIR (diagnostic, fix0332 2026-11-18 train-vs-predict parity audit): every forward appends one line of the switches
+   that change its numbers to DIR/modes.txt (UFSM_PARITY_TAG names the caller), with an FNV-1a hash of the weights it reads (the first
+   4 MB: EMA or live) */
+static void unet_parity_modes(unet *u, shape5 xs, int train) {
+    static int nlines; if (nlines++ >= 64) return;
+    char fn[1200]; snprintf(fn, sizeof fn, "%s/modes.txt", getenv("UFSM_PARITY_DUMP")); FILE *f = fopen(fn, "a"); if (!f) return;
+    const float *w = unet_active_params(u); const size_t nb = u->np * 4 < (4u << 20) ? u->np * 4 : (4u << 20); uint8_t *h = malloc(nb);
+    uint64_t hv = 1469598103934665603ull; if (h) { nn_sync(); nn_d2h(h, w, nb); for (size_t k = 0; k < nb; k++) hv = (hv ^ h[k]) * 1099511628211ull; free(h); }
+    fprintf(f, "%s fwd_train %d xs %dx%dx%dx%dx%d using_ema %d gn_ema %d ge_live %d ge_userun %d ge_n %ld ge_warm %d gn_frozen %d act_mx4 %d act_mx8 %d "
+               "input_mx %d input_prec %d f16 %d tf32 %d lh16_req %d head_iz %d ct_stem %d ct_mode %d half_res %d lat_C %d lat_step %g lat_run_step %g "
+               "sc_c %g film %g,%g,%g,%g scale_cond %d gfilm %d sparse24 %d w_hash %016llx\n",
+            getenv("UFSM_PARITY_TAG") ? getenv("UFSM_PARITY_TAG") : "?", train, xs.n, xs.c, xs.d, xs.h, xs.w, u->using_ema, u->cfg.gn_ema, u->ge_live, u->ge_userun,
+            u->ge_n, u->ge_warm, gn_frozen(u), act_mx4(), act_mx8(), input_mx(), unet_input_prec(), nn_get_f16(), nn_get_tf32(), u->lh16_req, u->head_iz, u->ct_stem,
+            u->ct_mode, u->cfg.half_res, u->lat_C, u->lat_step, u->lat_run_step, u->sc_c, u->film_c[0], u->film_c[1], u->film_c[2], u->film_c[3], u->cfg.scale_cond,
+            u->cfg.gfilm, u->sparse24, (unsigned long long)hv);
+    fclose(f);
+}
 const float *unet_forward(unet *u, const float *x, shape5 xs, int train) { return unet_forward_x(u, x, xs, train, 0); }
 /* inference from the uint8 CT window (predict): needs a CT-stem build (unet_set_ct_input before the build, slabs on, MX-fp8 stem
    input): the network input is never materialised for the whole window */
@@ -2830,6 +2847,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     sp_cfg(u);
     unet_apply_sparse24(u);
     film_fwd(u);   /* (cfg.film: the effective norm affines of this forward's codes; its backward reads them too) */
+    if (getenv("UFSM_PARITY_DUMP")) unet_parity_modes(u, xs, train);   /* diagnostic (fix0332 11-18 parity audit): this forward's numerics modes */
     if (u->cfg.scale_cond) {   /* stem bias b + c v for this forward (and the recompute passes of its backward) */
         const int c0 = u->enc[0].c1.cout;
         if (!u->stem_b) u->stem_b = nn_malloc((size_t)c0 * 4);
