@@ -6,7 +6,7 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
-## Where the packed-sheet deficit lives: the net merges contact sheets; 4.8 um input and the Paris 4 spiral fit / segments both fail (2026-11-18, pseudolab)
+## Where the packed-sheet deficit lives: the net merges contact sheets though they are labelled and loss-weighted x8; 4.8 um input and the Paris 4 spiral fit / segments both fail (2026-11-18, pseudolab)
 
 This follows "Packed sheets are not resolved by finer CT" below, and the lever memo (/vesuvius/ufsm/pseudolab/lever-memo.md). The
 scripts are in /vesuvius/ufsm/pseudolab/res48 (fieldcmp.py, fielddiag.py, w4diag.py, wb48.sh) and /vesuvius/ufsm/pseudolab/blight
@@ -64,21 +64,18 @@ when given their phase. Finer CT does not show the sheets apart, and fed 4.8 um 
 net-quality (the spiral) or tiny (the segments). The heads that should carry the count across contacts (wind4, density) are near
 chance or biased toward a typical spacing exactly there.
 
-**Lever: train on the contact sheets that are already labelled.** Weight the phase / wind4 loss up where GT sheets are < 100 um
-apart, and make the count heads see wider context. In Paris 4, 34 % of the GT turns are packed but only ~20 % of the labelled
-voxels, because packed turns are thin.
+**Correction (same day): the contact-sheet loss weighting already exists and is on.** try9 and u1 both train with
+`--packed-weight 8` (`--packed-um` 120 default; section "Packed-sheet label targets" 2026-11-14 and the 10-13 density section). It
+weighs the phase and normal / density losses x1 at sheet spacing >= 120 um, rising to x8 at 60 um. So the labelled contact sheets
+already get up to 8x the loss, and both nets still merge them. A x3 weight raster (the first draft of this lever) would only lower
+that; it was not built.
 
-**First experiment** (one paired arm from try9's next cooled checkpoint, the A/B harness, ~3.8 h on card 0 + evals; CPU prep first):
-- a per-source weight raster (the existing "weight" key) x3 where the local GT gap is < 100 um, built from the codes of Paris 4,
-  1667 and 0139;
-- holdout boxes masked as usual.
-**Gate on the GT holdouts:**
-- the packed boxes (PH1-3 / C1 / C19 / 139-1 / -2 / -3 / -8) Δids0 >= +0.03 with CI > 0, and the merge share at 70-100 um down
-  >= 0.1;
-- the non-packed holdouts not below -0.01.
-If it fails, the contact sheets carry no learnable local signal for this architecture, and the remaining route is a non-local one:
-counting turns across contacts from where the same sheets separate (fitter constraints along the sheet, e.g. the fibre / relative-
-winding links).
+**Remaining lever: non-local counting across contacts.** Carry the turn count from where the same sheets separate:
+- fitter side: constraints along the sheet, e.g. fibre / relative-winding links. The fitter reaches 0.81-0.99 on PH1-3 given the
+  label phase.
+- net side: more context per prediction (halo 64 vs a theoretical receptive field of 439 cells; window borders cut it).
+Cheapest first check, with no training: fixed-fields wbench (FIELDS = the kept pab-base fields) on PH1-3 / HOLD / C1 / C19, with the
+fitter's long-range terms raised. If the counts recover, the lever is in the fitter; if not, it is the net's context.
 
 ## try9's 1667 unroll was on GroupNorm statistics it never trained on; live GN + the cooled checkpoint beat u1 (2026-11-18, branch gnlive-20261118)
 
