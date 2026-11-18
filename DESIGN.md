@@ -70,7 +70,10 @@ reproduces the 11-06 rec .576 / solve .934. Metric: right sheet+turn x matched a
 Verdict: one-sided votes are the right model where the counter undercounts (merged contacts), and wrong where it overcounts
 (duplicates). Which error dominates differs by box, and the per-crossing guards tried here do not tell them apart. The box pitch does
 (above). --hidden-pitch P makes the votes one-sided only when the box pitch < P. The rule (H 0.5, P 18) was chosen on these 30 boxes,
-so it is checked held out on the other 41 1667 boxes: HELDOUT. Nothing is switched on by default.
+so it is checked held out on the other 1667 boxes of boxes.tsv. Of 40 scored, none has pitch < 18 (lowest C55 19.0). The rule is
+inert there (40 / 40 identical scores, sym mean 0.788), but that says nothing about the gain: the packed-annotated held-out boxes C5 /
+C20 / C23 trace only their open parts (recall 0.10-0.44, pitch 24-26). Held-out #2, the z-neighbours of the 8 packed selection boxes:
+HELDOUT2. Nothing is switched on by default.
 The fitter option is null, and patch-solve --hidden needs an overcount guard (a detector that separates double faces / duplicates)
 before it can be a default. Scripts and rows: /vesuvius/ufsm/levelsolve/{orc,hid,v3bed}.
 
