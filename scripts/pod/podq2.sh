@@ -99,10 +99,11 @@ fi
 stopq smoke
 if ! done_ smoke; then
   [ -s $K/kit/podq.sh ] || die "no ink smoke kit at $K/kit (copy /vesuvius/ufsm/inksmoke/kit from the desk: small files only)"
+  ( cd $POD/ufsm && git merge-base --is-ancestor 44357ead $COMMIT ) || die "COMMIT predates 44357ead: the kit's ~40 min smoke (mkarms SCROLLS) needs it (inksdk 11-18)"
   say "smoke start (K $K)"
   COMMIT=$COMMIT K=$K bash $K/kit/podq.sh > $K/podq.out 2>&1; rc=$?
   [ $rc = 0 ] && [ -e $K/state/ALLDONE ] || die "ink smoke rc $rc ($K/podq.log)"
-  push $K/podq.log $K/steptimeA.txt $DESK:$DESKDIR/smoke/ 2> /dev/null
+  $SSH $DESK "mkdir -p $DESKDIR/smoke"; push $K/podq.log $K/steptimeA.txt $K/out $DESK:$DESKDIR/smoke/ 2> /dev/null   # (out/: smokeA.txt, run / resume logs, the step-200 ckpt ~80 MB)
   mark smoke
 fi
 say "ALL DONE: the pod is idle"; touch $ST/ALLDONE
