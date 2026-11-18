@@ -247,8 +247,12 @@ int cmd_surf_resample(int argc, char **argv) {
     const int srco = opt_atoi("--src-out", rs_opt(argc, argv, "--src-out", "0"));   /* OUT/<d>_src.tif: 1 where sampled, 0 where no source (the residual) */
     const int nt0 = ufsm_threads(opt_atoi("--threads", rs_opt(argc, argv, "--threads", "8")), 8), nt = nt0 > 64 ? 64 : nt0 < 1 ? 1 : nt0;
     const double t0 = rs_now();
-    char **sn, **dn; const int ns = rs_names(sd, &sn), nd = rs_names(dd, &dn);
-    if (ns < 1 || nd < 1 || ns > 32000) { fprintf(stderr, "surf-resample: no surfaces in %s or %s\n", sd, dd); return 1; }
+    /* --watch STOP: DST-SURFS is filled while this runs (the unroll links each wrap in as its flatten lands): every surface is done once,
+       new ones are picked up every 2 s, and the run ends when the file STOP exists and a scan after it finds nothing new */
+    const char *watch = rs_opt(argc, argv, "--watch", nullptr);
+    char **sn, **dn; const int ns = rs_names(sd, &sn); int nd = rs_names(dd, &dn);
+    if (nd < 0 && watch) { nd = 0; dn = nullptr; }
+    if (ns < 1 || (nd < 1 && !watch) || ns > 32000) { fprintf(stderr, "surf-resample: no surfaces in %s or %s\n", sd, dd); return 1; }
     rs_surf *S = calloc((size_t)ns, sizeof *S); size_t nv = 0; int nm = 0;
     for (int s = 0; s < ns; s++) {
         if (rs_load(sd, sn[s], &S[s])) return 1;
@@ -269,8 +273,13 @@ int cmd_surf_resample(int argc, char **argv) {
     const double t1 = rs_now();
     fprintf(stderr, "surf-resample: %d source surfaces (%d with a map), %zu vertices indexed, %.1f s\n", ns, nm, ne, t1 - t0);
     if (!geom) mkdir(od, 0777);
-    int rc = 0;
+    int rc = 0, ndone = 0, ndcap = 0; char **dl = nullptr;   /* (the names done: --watch rescans) */
+    for (int stop = 0;;) {
     for (int k = 0; k < nd; k++) {
+        int seen = 0; for (int i = 0; i < ndone && !seen; i++) seen = !strcmp(dl[i], dn[k]);
+        if (seen) continue;
+        if (ndone == ndcap) { ndcap = ndcap ? ndcap * 2 : 64; dl = realloc(dl, (size_t)ndcap * sizeof *dl); }
+        dl[ndone++] = strdup(dn[k]);
         rs_surf D = {0}; if (rs_load(dd, dn[k], &D)) { rc = 1; continue; }
         char p[1400]; snprintf(p, sizeof p, "%s/%s", dd, dn[k]); const double ms = rs_meta_scale(p);
         if (!(ms > 0)) { fprintf(stderr, "surf-resample: %s: no scale in meta.json\n", p); rc = 1; continue; }
@@ -348,6 +357,12 @@ int cmd_surf_resample(int argc, char **argv) {
                 (unsigned long long)J.npx, J.npx ? (double)J.npxok / J.npx : 0, (unsigned long long)J.nseam, tb - ta, tc - tb);
         free(J.vs); free(J.vr); free(J.vc); free(J.out); free(J.src); free(J.sid); free(D.X); free(D.Y); free(D.Z);
     }
-    fprintf(stderr, "surf-resample: %d surfaces -> %s, %.1f s\n", nd, od, rs_now() - t0);
+    if (!watch || stop) break;
+    struct stat st; stop = !stat(watch, &st);   /* (seen before the rescan: whatever landed before STOP is still picked up) */
+    if (!stop) { struct timespec ts = {2, 0}; nanosleep(&ts, nullptr); }
+    for (int k = 0; k < nd; k++) free(dn[k]); free(dn);
+    nd = rs_names(dd, &dn); if (nd < 0) { nd = 0; dn = nullptr; }
+    }
+    fprintf(stderr, "surf-resample: %d surfaces -> %s, %.1f s\n", ndone, od, rs_now() - t0);
     return rc;
 }

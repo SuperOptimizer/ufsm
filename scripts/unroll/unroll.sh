@@ -929,6 +929,7 @@ pw_one() {   # pw_one WRAP GPU (a background subshell: the cache env stays in it
     CUDA_VISIBLE_DEVICES=$gpu nice -n 10 $U flatten $O/orig $O/flat --wraps $w --decim $dc --threads ${FTH:-4} --crop none --gpu 1 > $L.flat.log 2>&1 || return 1
   fi
   nice -n 10 $U tifxyz-scale $O/flat $O/up 1 --wraps $w --flip-rows 1 > /dev/null 2>&1 || return 1
+  r3geo_add $w   # (the early residual's watcher takes the wrap now, not after every render)
   mkdir -p $d/in; ln -sfn $O/up/$w $d/in/$w
   UFSM_RENDER_MEM=16 UFSM_RENDER_CHUNKED=1 UFSM_RENDER_GPU_MEM=${UFSM_RENDER_GPU_MEM:-4} CUDA_VISIBLE_DEVICES=$gpu nice -n 10 $U render $d/in $d --volume $VROOT $VKEY --ct $R $K/$LV --depth 1 --scale 1 --threads ${RTH:-8} $VOUT > $d/render.log 2>&1 || return 1
   # the uncertain mask on the render's pixel grid (merge-flag's mf; kept by pw_fin): r/<w>/<w>_mf.tif, share of merged-sheet cells x255
@@ -964,10 +965,29 @@ r3stripes() {   # r3stripes FILE: wait for FILE (state/distort.done: the final s
   while [ ! -e $1 ] && [ ! -e $O/state/strip_chain.failed ]; do stopped && return 1; sleep 5; done
   [ -e $1 ]
 }
+# The early residual per wrap (11-18 e2e: one geometry pass after every per-wrap render landed only 55 s after the stripes' maps; the
+# flattens land minutes earlier): perwrap starts ONE surf-resample --geom-only --watch at its start (it waits for distort.done: the final
+# stripes), pw_one links each wrap into its DST as its up/ surface is written, r3once_ok links the rest (resumed runs), touches the STOP
+# file and waits. R3GTH: its threads (TH / 2: beside the flattens and renders).
+r3geo_start() {
+  R3GP=; [ "$INKMODE" = r3 ] && [ "${R3ONCE:-1}" = 1 ] && [ -z "${UPTO:-}" ] && [ "${R3EARLY:-1}" = 1 ] && [ "$DRY" != 1 ] || return 0
+  local W=$O/ink/r3/once
+  case "$W" in */ink/r3/once) rm -rf -- "$W";; *) return 1;; esac
+  mkdir -p $W/dst $W/rmap $O/ink/r3/up || return 1
+  ( r3stripes $O/state/distort.done || exit 0
+    X $O/logs/r3once.log $U surf-resample $O/strip/strip/flat/stripes - $W/dst $W/geo --geom-only 1 --residual $W/res --watch $W/dst.done \
+      --threads ${R3GTH:-$(( TH / 2 > 1 ? TH / 2 : 1 ))} $(r3rsx) ) & R3GP=$!
+}
+r3geo_add() { [ -n "${R3GP:-}" ] && [ ! -s $O/ink/r3/up/${1}_$R3MODEL.tif ] && ln -sfn $O/up/$1 $O/ink/r3/once/dst/$1; return 0; }
 r3once_ok() {   # r3once_ok UPDIR..: (R3ONCE=1) the residual geometry (R3EARLY), then wait for the stripes' maps; 1: ink the wraps instead
   [ "${R3ONCE:-1}" = 1 ] && [ -z "${UPTO:-}" ] || return 1
   local W=$O/ink/r3/once x
-  if r3stripes $O/state/distort.done; then
+  if [ -n "${R3GP:-}" ]; then   # the watcher's: the remaining wraps, then STOP
+    for x in "$@"; do r3geo_add $(basename $x); done; touch $W/dst.done
+    if wait $R3GP && [ -e $O/state/distort.done ]; then
+      log "r3once: early residual of $(ls $W/dst | wc -l) wraps: $(ls $W/res 2> /dev/null | wc -l) residual surfaces (the stripes' reader3 still running: $([ -e $O/ink/r3/strip.ok ] && echo no || echo yes))"
+    else rm -rf -- "$W/res"; log "r3once: the early residual did not finish: the resample's own is inked"; fi
+  elif r3stripes $O/state/distort.done; then
     case "$W" in */ink/r3/once) rm -rf -- "$W";; *) return 1;; esac
     mkdir -p $W/dst $W/rmap $O/ink/r3/up || return 1
     for x in "$@"; do [ -s $O/ink/r3/up/$(basename $x)_$R3MODEL.tif ] || ln -sfn $x $W/dst/$(basename $x); done
@@ -1006,9 +1026,10 @@ perwrap() {
   [ "$DRY" = 1 ] && { echo "    per wrap (largest first, SPAR ${SPAR:-4}, GPUs of FITGPUS in turn): tifxyz-scale -> flatten --gpu 1 -> tifxyz-scale --flip-rows 1 -> render (ink + CT)$([ "$INKMODE" = r3 ] && echo "; then ONE ink-ext over all rendered wraps (r3pre, --cache $O/ink/ct.cache: $R3W) -> per wrap r3ink.sh (CT gate ${R3PWGATE:-0}: unfilled per-wrap CT)") -> ink-compare --then"; return 0; }
   mkdir -p $O/orig $O/flat $O/up $O/r $O/img $O/prev $O/logs/pw
   local w k=0 nf=0 p pg=($FITGPUS) WD=$(wrapsdir); local -A pid
+  r3geo_start || return 1
   for w in $(for f in $WD/w*.sfc; do w=$(basename $f .sfc); [ -e $O/img/${w}_full_side.jpg ] || echo "$(stat -c %s $f) $w"; done | sort -rn | awk '{print $2}'); do
     stopped && break
-    while [ $(jobs -r | wc -l) -ge ${SPAR:-4} ]; do sleep 5; done; memok
+    while [ $(jobs -rp | grep -vx "${R3GP:-none}" | wc -l) -ge ${SPAR:-4} ]; do sleep 5; done; memok   # (the residual watcher is no render job)
     pw_one $w ${pg[$((k % ${#pg[@]}))]} & pid[$w]=$!; k=$((k + 1))
   done
   for w in "${!pid[@]}"; do wait ${pid[$w]} || { nf=$((nf + 1)); echo "perwrap: $w FAILED (logs $O/logs/pw/$w.*, $O/r/$w/render.log)" >> $O/logs/perwrap.log; }; done   # (each job's rc, audit 11-14 #12)

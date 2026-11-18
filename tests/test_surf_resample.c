@@ -6,7 +6,8 @@
    - pixels over the source hole are unsampled (<d>_src.tif 0), the rest sampled; a residual surface is written that covers the hole
      (+ its margin) and nothing far from it, and --compose fills exactly the unsampled pixels from a residual map (here f itself);
    - --edge-band: pixels near the switch between the two sources are unsampled and join the residual;
-   - --geom-only 1 (no maps): byte-identical residual surfaces to the full run, with and without --fill-gap, no output maps;
+   - --geom-only 1 (no maps): byte-identical residual surfaces to the full run, with and without --fill-gap, no output maps; with --watch
+     (the destination linked in while it runs, then the stop file) the same;
    - >= 95 % of the vertices project within 0.25 voxels (the log's histogram; the hole's rim is the rest). */
 #include "imgops.h"
 #include "tiffw.h"
@@ -111,6 +112,14 @@ int main(int argc, char **argv) {
                      argv[1], dir, dir, dir, band, fg, dir, band, fg, fx, ed, dir, band, fg,
                      dir, band, fg, dir, band, fg, dir, band, fg, dir, band, fg, dir, band, fg);
             CHECK(!system(cmd), "band %d fill-gap %s: --geom-only residual differs from the full run's (or wrote maps): %s/gres%d%d vs fres%d%d", band, fx, dir, band, fg, band, fg);
+        }
+        {   /* --watch STOP: DST filled while it runs (the unroll's per-wrap early residual): the same residual as the full run */
+            const char *ed = band ? " --edge-band 6" : "";
+            snprintf(cmd, sizeof cmd, "mkdir -p '%s/wd%d' && ( '%s' surf-resample '%s/src' - '%s/wd%d' '%s/wg%d' --threads 2 --geom-only 1 --watch '%s/wd%d.stop' "
+                     "--residual '%s/wres%d' --residual-margin 2 --band-margin 3 --fill-gap 0%s 2> '%s/w%d.log' & p=$!; sleep 1; ln -s '%s/dst/w000' '%s/wd%d/w000'; "
+                     "sleep 1; touch '%s/wd%d.stop'; wait $p ) && for x in x y z; do cmp -s '%s/res%d/w000/'$x.tif '%s/wres%d/w000/'$x.tif || exit 1; done",
+                     dir, band, argv[1], dir, dir, band, dir, band, dir, band, dir, band, ed, dir, band, dir, dir, band, dir, band, dir, band, dir, band);
+            CHECK(!system(cmd), "band %d: --watch residual differs from the full run's (%s/wres%d, %s/w%d.log)", band, dir, band, dir, band);
         }
         fprintf(stderr, "test_surf_resample: band %d: %zu px sampled (mean |d| vs f %.3f), %zu unsampled, the hole and the residual right\n", band, ns, ns ? sum / ns : 0, nu);
         free(m); free(s);
