@@ -78,6 +78,9 @@ typedef struct {
     int uw_rep_sr;                  /* the stretch's box radius (field voxels: (2r+1)^3; 0 the voxel's own central differences) */
     int uw_rep_off;                 /* the repair tiles' grid offset (field voxels on every axis, mod uw_repair; 0: tiles from the origin) */
     int uw_rep_cons;                /* > 1: the consensus repair: the voxel-wise majority integers of this many repairs on offset tile grids */
+    float uw_rep_hidden;            /* < 1 (levelsolve 11-18, HerculeX's one-sided rays): a touching vote of two pieces across the sheets (|normal
+                                       component| >= 1/2 on the pair's axis) is a lower bound: more turns outward cost this share of its weight,
+                                       fewer the whole (the phase skips touching sheets, it rarely adds one); 1 / 0 off */
     int uw_rep_geo_init;            /* 1: the uw_rep_geo votes from the init model's W (fit --init-model, e.g. a global coarse fit) */
     float uw_rep_seed;              /* with a seed model: each piece holding seeded voxels is tied to its seeded integers by an anchor vote of
                                        weight uw_rep_seed x its seeded voxels' confidence sum (so the repair cannot move the carried count; 0 free) */

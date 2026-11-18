@@ -14,22 +14,23 @@ static int vote_cmp(const void *p, const void *q) {
 size_t l1_votes_merge(l1_vote *v, size_t nv) {
     size_t m = 0;
     for (size_t i = 0; i < nv; i++) {
-        if (v[i].a == v[i].b || v[i].w <= 0) continue;
-        if (v[i].a > v[i].b) { const uint32_t t = v[i].a; v[i].a = v[i].b; v[i].b = t; v[i].d = -v[i].d; }
+        if (v[i].a == v[i].b || v[i].w <= 0 || v[i].wn < 0) continue;
+        if (!v[i].wn) v[i].wn = v[i].w;
+        if (v[i].a > v[i].b) { const uint32_t t = v[i].a; v[i].a = v[i].b; v[i].b = t; v[i].d = -v[i].d; const int64_t u = v[i].w; v[i].w = v[i].wn; v[i].wn = u; }
         v[m++] = v[i];
     }
     qsort(v, m, sizeof *v, vote_cmp);
     size_t o = 0;
     for (size_t i = 0; i < m; i++) {
-        if (o && v[o - 1].a == v[i].a && v[o - 1].b == v[i].b && v[o - 1].d == v[i].d) v[o - 1].w += v[i].w;
+        if (o && v[o - 1].a == v[i].a && v[o - 1].b == v[i].b && v[o - 1].d == v[i].d) { v[o - 1].w += v[i].w; v[o - 1].wn += v[i].wn; }
         else v[o++] = v[i];
     }
     return o;
 }
-static inline int64_t iabs64(int64_t x) { return x < 0 ? -x : x; }
+static inline int64_t vcost(const l1_vote *v, int64_t r) { return r >= 0 ? v->w * r : (v->wn ? v->wn : v->w) * -r; }   /* (wn 0: unmerged symmetric) */
 int64_t l1_energy(const l1_vote *v, size_t nv, const int32_t *s) {
     int64_t e = 0;
-    for (size_t i = 0; i < nv; i++) e += v[i].w * iabs64((int64_t)s[v[i].b] - s[v[i].a] - v[i].d);
+    for (size_t i = 0; i < nv; i++) e += vcost(&v[i], (int64_t)s[v[i].b] - s[v[i].a] - v[i].d);
     return e;
 }
 
@@ -335,7 +336,7 @@ int l1_solve(uint32_t n, const l1_vote *v, size_t nv, int32_t *s, int max_iter, 
         for (size_t e = 0; e < ne; e++) {
             const uint32_t a = v[eo[e]].a, b = v[eo[e]].b; const int64_t t = (int64_t)s[b] - s[a];
             int64_t A = 0, B = 0, C = 0;   /* f(t), f(t + sgn) (b moved), f(t - sgn) (a moved) */
-            for (size_t k = eo[e]; k < eo[e + 1]; k++) { A += v[k].w * iabs64(t - v[k].d); B += v[k].w * iabs64(t + sgn - v[k].d); C += v[k].w * iabs64(t - sgn - v[k].d); }
+            for (size_t k = eo[e]; k < eo[e + 1]; k++) { A += vcost(&v[k], t - v[k].d); B += vcost(&v[k], t + sgn - v[k].d); C += vcost(&v[k], t - sgn - v[k].d); }
             /* E = A + (B - A) [x_a = 0, x_b = 1] + (C - A) [x_a = 1, x_b = 0] (B + C >= 2 A: f is convex): two arcs without terminal ones
                while B, C >= A (the votes agree); else [1, 0] = x_a - x_b + [0, 1] (C < A) or [0, 1] = x_b - x_a + [1, 0] (B < A) moves
                the negative part onto the nodes. (Unaries on every node made BK push one tiny path per edge: 3 s per move -> 0.1 s.) */

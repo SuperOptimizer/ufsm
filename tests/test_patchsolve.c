@@ -19,15 +19,16 @@ static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
 enum { NZ = 48, NY = 128, NX = 128 };
 static double rk(int k) { return 18 + 8 * k; }
+static double MERGED = -0.1;   /* the merged-contact case: sheet 2 is hidden in sheet 3 for theta < MERGED (env TEST_MERGED: explore) */
 
-static int run(const char *root, const char *votes, const char *extra, double *score, int *oracle_changed) {
+static int run(const char *root, const char *votes, const char *extra, const char *val, double *score, int *oracle_changed) {
     char paths[600], prob[600], gt[600], ax[600], tsv[600], out[600];
     snprintf(paths, sizeof paths, "%s/paths", root); snprintf(prob, sizeof prob, "%s/prob.raw", root); snprintf(gt, sizeof gt, "%s/gt.raw", root);
     snprintf(ax, sizeof ax, "%s/axis.json", root); snprintf(tsv, sizeof tsv, "%s/nodes.tsv", root); snprintf(out, sizeof out, "%s/out.txt", root);
     char box[64]; snprintf(box, sizeof box, "0,0,0,%d,%d,%d", NZ, NY, NX);
     char *av[32] = {"ufsm", "patch-solve", "--paths", paths, "--prob", prob, "--gt", gt, "--box", box, "--axis", ax, "--sgn", "1",
                     "--votes", (char *)votes, "--threads", "3", "--tsv", tsv};
-    int ac = 20; if (extra) { av[ac++] = (char *)extra; av[ac++] = "1"; }
+    int ac = 20; if (extra) { av[ac++] = (char *)extra; av[ac++] = (char *)val; }
     fflush(stdout); FILE *sv = fopen(out, "w"); if (!sv) return -1;
     const int fd = dup(fileno(stdout)); dup2(fileno(sv), fileno(stdout));
     const int rc = cmd_patch_solve(ac, av);
@@ -42,14 +43,29 @@ static int run(const char *root, const char *votes, const char *extra, double *s
     return rc;
 }
 
-int main(void) {
-    char root[] = "/tmp/test_patchsolve_XXXXXX"; if (!mkdtemp(root)) return 1;
+/* the nodes table's check: the active (unpruned) nodes' turns = sheet index + one constant; returns the active nodes off it (-1: unread),
+   *nnode the active count */
+static int turns_off(const char *root, int *nnode) {
+    char p[700]; snprintf(p, sizeof p, "%s/nodes.tsv", root); FILE *f = fopen(p, "r"); char line[1024]; int off = 1 << 30, bad = 0; *nnode = 0;
+    if (!f) return -1;
+    if (!fgets(line, sizeof line, f)) { fclose(f); return -1; }
+    while (fgets(line, sizeof line, f)) {
+        char name[256]; int comp, act, gc, turn, gs, gp, gn, k; size_t nv;
+        if (sscanf(line, "%255s %d %zu %d %d %d %d %d %d", name, &comp, &nv, &act, &gc, &turn, &gs, &gp, &gn) != 9 || sscanf(name, "s%d_", &k) != 1) continue;
+        if (!act) continue;
+        (*nnode)++; if (off == 1 << 30) off = turn - k; bad += turn - k != off;
+    }
+    fclose(f); return bad;
+}
+/* prob + GT of the box; merged > -9: sheet 2 is missing from the prob where theta < merged (it touches sheet 3 there: the detector sees one
+   ridge), so rays from sheet 1 to 3 count one gap short on that arc */
+static void write_box(const char *root, double merged) {
     char p[700];
-    /* prob + GT */
     uint8_t *pb = calloc((size_t)NZ * NY * NX, 1), *g = calloc((size_t)NZ * NY * NX, 1);
     for (int z = 0; z < NZ; z++) for (int y = 0; y < NY; y++) for (int x = 0; x < NX; x++) {
         const double r = hypot(y - 64.0, x - 64.0), th = atan2(y - 64.0, x - 64.0); double best = 0; int kb = -1;
-        for (int k = 0; k < 6; k++) { const double d = r - rk(k), v = 250 * exp(-d * d / (2 * 1.2 * 1.2)); if (v > best) { best = v; kb = k; } }
+        for (int k = 0; k < 6; k++) { const double d = r - rk(k), v = k == 2 && th < merged ? 0 : 250 * exp(-d * d / (2 * 1.2 * 1.2)); if (v > best) { best = v; kb = k; } }
+        if (th < merged && fabs(r - rk(2)) < 0.75) kb = 2;   /* (the GT keeps the merged sheet) */
         if (fabs(th) > 2.4) best = 0;   /* arcs, not full rings: the ring GT (unlike a spiral's) jumps by a turn at theta = pi */
         const size_t i = ((size_t)z * NY + y) * NX + x; pb[i] = (uint8_t)lround(best);
         if (kb >= 0 && fabs(th) <= 2.4 && fabs(r - rk(kb)) < 0.75) g[i] = (uint8_t)(1 + ((lround(18 * (kb + th / (2 * M_PI))) % 252) + 252) % 252);
@@ -57,6 +73,13 @@ int main(void) {
     snprintf(p, sizeof p, "%s/prob.raw", root); FILE *f = fopen(p, "wb"); fwrite(pb, 1, (size_t)NZ * NY * NX, f); fclose(f);
     snprintf(p, sizeof p, "%s/gt.raw", root); f = fopen(p, "wb"); fwrite(g, 1, (size_t)NZ * NY * NX, f); fclose(f);
     free(pb); free(g);
+}
+
+int main(void) {
+    char root[] = "/tmp/test_patchsolve_XXXXXX"; if (!mkdtemp(root)) return 1;
+    char p[700]; FILE *f;
+    if (getenv("TEST_MERGED")) MERGED = atof(getenv("TEST_MERGED"));
+    write_box(root, -9);
     snprintf(p, sizeof p, "%s/axis.json", root); f = fopen(p, "w");
     fprintf(f, "{\"control_points\": [{\"x\": 64, \"y\": 64, \"z\": 0}, {\"x\": 64, \"y\": 64, \"z\": %d}]}\n", NZ - 1); fclose(f);
     /* patches: per traced sheet two arcs theta in [-0.9, 0.3] and [-0.3, 0.9], unit arc spacing, z 2..45, one invalid border column */
@@ -76,7 +99,7 @@ int main(void) {
     }
     for (int m = 0; m < 2; m++) {
         const char *votes = m ? "ray" : "pair"; double sc; int oc;
-        CHECK(run(root, votes, nullptr, &sc, &oc) == 0, "%s: patch-solve failed", votes);
+        CHECK(run(root, votes, nullptr, nullptr, &sc, &oc) == 0, "%s: patch-solve failed", votes);
         CHECK(fabs(sc - 1) < 1e-9, "%s: GT score %.4f, want 1", votes, sc);
         /* the node table: one graph comp, turns = sheet index + a constant */
         snprintf(p, sizeof p, "%s/nodes.tsv", root); f = fopen(p, "r"); char line[1024]; int nnode = 0, gc0 = -1, off = 1 << 30, bad = 0, gcs = 0;
@@ -97,7 +120,22 @@ int main(void) {
         CHECK(gcs == 0, "%s: %d nodes outside the first graph comp", votes, gcs);
         CHECK(bad == 0, "%s: %d nodes off the sheet index (sheet 2 untraced must be counted)", votes, bad);
         /* pair mode: every pair's mode equals the GT difference; ray mode keeps minority votes (a ray whose ridge misses sheet 2) as edges */
-        CHECK(run(root, votes, "--oracle", &sc, &oc) == 0 && (m ? oc <= 2 : oc == 0), "%s: oracle changed %d edges", votes, oc);
+        CHECK(run(root, votes, "--oracle", "1", &sc, &oc) == 0 && (m ? oc <= 2 : oc == 0), "%s: oracle changed %d edges", votes, oc);
+    }
+    /* merged contact (levelsolve 11-18): sheet 2 touches sheet 3 for theta < MERGED (-0.1), so most crossings 1 -> 3 there count one gap
+       (d 1, not 2). The symmetric votes follow that majority (8 of 10 nodes off); the one-sided ray votes (--hidden 0.5: a gap count is a
+       lower bound) must put every active node on its sheet index (one node, s1_0, is pruned as the edges' conflict). Pair votes keep only
+       each pair's mode, so the minority count is gone before the solve and --hidden cannot help them (not asserted). */
+    {   write_box(root, MERGED); double sc, s0; int oc, nn, nn0;
+        CHECK(run(root, "ray", nullptr, nullptr, &s0, &oc) == 0, "merged: patch-solve failed");
+        const int b0 = turns_off(root, &nn0);
+        CHECK(run(root, "ray", "--hidden", "0.5", &sc, &oc) == 0, "merged --hidden: patch-solve failed");
+        const int b1 = turns_off(root, &nn);
+        if (getenv("KEEP")) { char c2[800]; snprintf(c2, sizeof c2, "cat %s/nodes.tsv >&2", root); if (system(c2)) {} }
+        fprintf(stderr, "merged contact (ray votes): symmetric score %.4f (%d of %d active nodes off), one-sided %.4f (%d of %d off)\n", s0, b0, nn0, sc, b1, nn);
+        CHECK(nn >= 9 && b1 == 0 && fabs(sc - 1) < 1e-9, "merged: one-sided votes leave %d of %d active nodes off their sheet (score %.4f)", b1, nn, sc);
+        CHECK(b0 > 0 && s0 < 0.95, "merged: the symmetric votes already count the merged sheet (score %.4f: the case tests nothing)", s0);
+        write_box(root, -9);
     }
     char cmd[800];
     /* sheet-trace on the same prob (every sheet, incl. the untraced 2, is a peak ridge): 6 pure patches; tiled (--tile 8) the trace ->

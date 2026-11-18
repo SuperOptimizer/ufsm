@@ -39,6 +39,24 @@ static void test_l1(void) {
         int32_t s[5] = {0}; l1_stats st; l1_solve(n, v, nv, s, 64, &st);
         CHECK(st.e1 == best && l1_energy(v, nv, s) == best, "l1 trial %d: solver %lld, exhaustive %lld", trial, (long long)st.e1, (long long)best);
     }
+    for (int trial = 0; trial < 300; trial++) {   /* the same with one-sided votes (wn != w; a > b flips them; wn 0 = symmetric) */
+        const int n = 5; l1_vote v[24]; size_t nv = 0;
+        for (int k = 0; k < 12; k++) {
+            uint32_t a = rnd() % n, b = rnd() % n; if (a == b) continue;
+            v[nv++] = (l1_vote){a, b, (int32_t)(rnd() % 5) - 2, 1 + rnd() % 9, rnd() % 3 ? 1 + rnd() % 19 : 0};
+        }
+        l1_vote raw[24]; memcpy(raw, v, sizeof raw); const size_t nraw = nv;
+        nv = l1_votes_merge(v, nv);
+        int64_t best = INT64_MAX; int agree = 1;
+        for (int code = 0; code < 21 * 21 * 21 * 21; code++) {   /* (shifts -10..10: one-sided chains of +-2 votes reach past 6) */
+            int32_t s[5] = {0}; int c = code; for (int k = 1; k < 5; k++) { s[k] = c % 21 - 10; c /= 21; }
+            const int64_t e = l1_energy(v, nv, s); if (e < best) best = e;
+            if (code % 97 == 0 && e != l1_energy(raw, nraw, s)) agree = 0;   /* merging keeps the energy */
+        }
+        CHECK(agree, "l1 one-sided trial %d: merged votes change the energy", trial);
+        int32_t s[5] = {0}; l1_stats st; l1_solve(n, v, nv, s, 64, &st);
+        CHECK(st.e1 == best && l1_energy(v, nv, s) == best, "l1 one-sided trial %d: solver %lld, exhaustive %lld", trial, (long long)st.e1, (long long)best);
+    }
     /* a 3D grid of 12^3 nodes with consistent votes plus a ring of inconsistent ones and random noise: BK = Dinic */
     const int G = 12, n = G * G * G; l1_vote *v = malloc(sizeof *v * (size_t)n * 4); size_t nv = 0;
     for (int z = 0; z < G; z++) for (int y = 0; y < G; y++) for (int x = 0; x < G; x++) {

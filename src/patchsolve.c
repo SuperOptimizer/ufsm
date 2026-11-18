@@ -1,7 +1,7 @@
 /* ufsm patch-solve: global turn numbers for traced sheet patches in one box (unroll v3, P4; C port of scripts/v3/proto/psolve4.py).
    ufsm patch-solve --paths DIR --prob P --box Z0,Y0,X0,NZ,NY,NX --axis AXIS.json [--axis-scale 0.25] [--sgn -1]
                     [--prob-key K] [--gt G [--gt-key K]] [--cache DIR] [--minv 100] [--votes pair|ray] [--counter both|ridge|prob]
-                    [--min-votes 3] [--prune-frac 0.05] [--prune-thr 0.25] [--rounds 6] [--threads N] [--tsv OUT]
+                    [--min-votes 3] [--hidden 1] [--prune-frac 0.05] [--prune-thr 0.25] [--rounds 6] [--threads N] [--tsv OUT]
    Inputs (box-local voxel coordinates on the prob grid):
      --paths  a directory of tifxyz patches (VC3D paths/<name>/{x,y,z}.tif, -1 = invalid), patch coordinates relative to the box origin;
      --prob   the sheet probability (uint8) of the box: a .raw file (NZ x NY x NX, C order) or a zarr store root with --prob-key the array;
@@ -16,6 +16,7 @@
         >= 32 (scipy find_peaks semantics) on the ray; --counter both pools the two votes;
      4. edges: --votes pair = the per directed pair mode (>= --min-votes votes; weight = the mode's count), as the prototype;
                --votes ray  = every vote of pairs with >= --min-votes votes, merged by value (the L1 solve weighs them all);
+               --hidden H: gap votes one-sided (a solve above the counted gap costs H of the weight, below it all; 1 symmetric);
      5. solve: exact weighted L1 integer potentials (src/l1pot.h, PUMA graph cuts) instead of the prototype's LS + median sweeps;
      6. prune: up to --rounds times drop the nodes whose violated-edge weight share is >= max(--prune-thr, the top --prune-frac quantile)
         and re-solve, until no node reaches --prune-thr.
@@ -231,6 +232,12 @@ int cmd_patch_solve(int argc, char **argv) {
     const double dupf = opt_atof("--dup-frac", ps_opt(argc, argv, "--dup-frac", "0"));   /* > 0: crossings closer than dupf x pitch with no sheet between vote d = 0 */
     const char *lkinds = ps_opt(argc, argv, "--link-kinds", "seam,rseam");   /* sheet-trace link kinds used (contacts are unreliable: 11-06 C3 58% wrong) */   /* diagnostic: GT turn differences as the edge values */
     const int ray = !strcmp(vmode, "ray");
+    /* --hidden H (levelsolve 11-18, HerculeX's one-sided rays): a gap vote turn_b - turn_a = d is a lower bound (a counter can miss a
+       touching sheet but rarely invents one: 11-06 C2 29 % of GT gap-2 crossings counted one short), so a solve above d costs H of the
+       vote's weight and one below it the whole; 1 = the symmetric vote. Weights are doubled when H != 1 (integer costs). */
+    const double hidden = opt_atof("--hidden", ps_opt(argc, argv, "--hidden", "1"));
+    const int64_t wsc = hidden == 1 ? 1 : 2;
+    #define PS_GAPV(A, B, D, W) ((l1_vote){(A), (B), (D), hidden == 1 ? (int64_t)(W) : (int64_t)llround(2.0 * hidden * (double)(W)), wsc * (int64_t)(W)})
     /* --counter: a comma list of ridge (ridge runs), prob (prob peaks), pitch (round(dr / pitch), pitch = the box median dr of crossings
        with no sheet between by both counters), maxrp (max of ridge and pitch); both = ridge,prob */
     const int use_r = !strcmp(cmode, "both") || strstr(cmode, "ridge") != nullptr, use_p = !strcmp(cmode, "both") || strstr(cmode, "prob") != nullptr;
@@ -239,7 +246,7 @@ int cmd_patch_solve(int argc, char **argv) {
     if (!paths || !probp || !boxs || !axp || sscanf(boxs, "%lld,%lld,%lld,%lld,%lld,%lld", &bx[0], &bx[1], &bx[2], &bx[3], &bx[4], &bx[5]) != 6 || axs <= 0 ||
         (strcmp(vmode, "pair") && !ray) || !(use_r || use_p || use_pt || use_mx)) {
         fprintf(stderr, "usage: ufsm patch-solve --paths DIR --prob P [--prob-key K] --box Z0,Y0,X0,NZ,NY,NX --axis AXIS.json [--axis-scale S] [--sgn +-1]\n"
-                        "         [--gt G [--gt-key K]] [--minv 100] [--votes pair|ray] [--counter both|ridge|prob] [--min-votes 3] [--prune-frac 0.05]\n"
+                        "         [--gt G [--gt-key K]] [--minv 100] [--votes pair|ray] [--counter both|ridge|prob] [--min-votes 3] [--hidden 1] [--prune-frac 0.05]\n"
                         "         [--prune-thr 0.25] [--rounds 6] [--threads N] [--tsv OUT] [--cache DIR]\n");
         return 2;
     }
@@ -444,10 +451,10 @@ int cmd_patch_solve(int argc, char **argv) {
         for (size_t i = s, j; i < e; i = j) {
             uint32_t fs = rv[i].seq; for (j = i; j < e && rv[j].d == rv[i].d; j++) if (rv[j].seq < fs) fs = rv[j].seq;
             const long w = (long)(j - i);
-            if (ray) ed[ne++] = (l1_vote){rv[i].a, rv[i].b, rv[i].d, w};
+            if (ray) ed[ne++] = PS_GAPV(rv[i].a, rv[i].b, rv[i].d, w);
             if (w > bw || (w == bw && fs < bseq)) { bw = w; bd = rv[i].d; bseq = fs; }
         }
-        if (!ray) ed[ne++] = (l1_vote){rv[s].a, rv[s].b, bd, bw};
+        if (!ray) ed[ne++] = PS_GAPV(rv[s].a, rv[s].b, bd, bw);
         agw += (double)bw; agd += (double)bw * bw / (double)(e - s);
     }
     free(rv);
@@ -468,7 +475,7 @@ int cmd_patch_solve(int argc, char **argv) {
             }
             if (ia < 0 || ib < 0 || ia == ib) continue;
             const int64_t w = (int64_t)llround((double)cnt * linkw); if (w <= 0) continue;
-            ed = realloc(ed, (ne + 1) * sizeof *ed); ed[ne++] = (l1_vote){(uint32_t)ia, (uint32_t)ib, 0, w}; nadd++; wadd += (double)w;
+            ed = realloc(ed, (ne + 1) * sizeof *ed); ed[ne++] = (l1_vote){(uint32_t)ia, (uint32_t)ib, 0, wsc * w, wsc * w}; nadd++; wadd += (double)w;
         }
         fclose(lf);
         printf("links: %ld same-sheet edges (weight %.0f) from %s\n", nadd, wadd, linksp);
@@ -476,11 +483,11 @@ int cmd_patch_solve(int argc, char **argv) {
     if (gt && oracle) {   /* diagnostic: each edge's d replaced by the GT turn difference (mod 14, the representative nearest the vote) */
         long nch = 0; double wch = 0, wall = 0;
         for (size_t i = 0; i < ne; i++) {
-            l1_vote *v = &ed[i]; wall += (double)v->w;
+            l1_vote *v = &ed[i]; wall += (double)(v->wn ? v->wn : v->w);
             if (gd[v->a].gt < 0 || gd[v->b].gt < 0) continue;
             const int g = gd[v->b].gt - gd[v->a].gt; int best = v->d, bd = 1 << 30;
             for (int k = -3; k <= 3; k++) { const int c = g + 14 * k, dd = abs(c - v->d); if (dd < bd) { bd = dd; best = c; } }
-            if (best != v->d) { nch++; wch += (double)v->w; v->d = best; }
+            if (best != v->d) { nch++; wch += (double)(v->wn ? v->wn : v->w); v->d = best; }
         }
         printf("oracle: %ld edges changed (%.3f of edge weight)\n", nch, wall > 0 ? wch / wall : 0);
     }
@@ -503,7 +510,7 @@ int cmd_patch_solve(int argc, char **argv) {
         memset(bad, 0, N * 8); memset(tot, 0, N * 8); double vw = 0, tw = 0;
         for (size_t i = 0; i < ne; i++) {
             const l1_vote *v = &ed[i]; if (!active[v->a] || !active[v->b]) continue;
-            const int viol = x[v->b] - x[v->a] != v->d; const double w = (double)v->w;
+            const int viol = x[v->b] - x[v->a] != v->d; const double w = (double)(v->wn ? v->wn : v->w);   /* (the full weight) */
             tw += w; if (viol) { vw += w; bad[v->a] += w; bad[v->b] += w; } tot[v->a] += w; tot[v->b] += w;
         }
         double mx = 0; uint32_t nact = 0;

@@ -9,10 +9,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef struct { uint32_t a, b; int32_t d; int64_t w; } l1_vote;   /* s_b - s_a = d wanted, weight w > 0 (a != b) */
+/* s_b - s_a = d wanted (a != b): residual r = s_b - s_a - d costs w r when r >= 0 and wn (-r) when r < 0; wn 0 means wn = w (the symmetric
+   vote, every caller before 11-18). A one-sided vote (a lower bound: a ray that can miss a faint sheet but not invent one, HerculeX's rays)
+   is d with w = W / 2 and wn = W (src/l1pot.c, levelsolve 2026-11-18). */
+typedef struct { uint32_t a, b; int32_t d; int64_t w, wn; } l1_vote;
 typedef struct { int iters, moves, capped; int64_t e0, e1; size_t nedge, nmoved; double secs; uint64_t work; } l1_stats;   /* capped: the work budget stopped the moves (work: max-flow node / arc visits) */
 
-/* sort the votes by (a, b, d) with a < b (a vote with a > b is flipped) and merge equal ones (weights summed); returns the new count */
+/* sort the votes by (a, b, d) with a < b (a vote with a > b is flipped: d and the two weights swap sides) and merge equal ones (weights
+   summed; wn set to w where it was 0); returns the new count */
 size_t l1_votes_merge(l1_vote *v, size_t nv);
 /* minimise E from the shifts in s (n nodes, updated in place; votes merged by l1_votes_merge). max_iter bounds the moves (each a
    max flow). Returns 0, or -1 on allocation failure (s unchanged). */

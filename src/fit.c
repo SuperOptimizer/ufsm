@@ -874,11 +874,12 @@ static inline uint32_t uwr_gid(const uwr_ctx *u, int z, int y, int xx, uint32_t 
     const int t = (((z + u->o) / u->T) * u->nty + (y + u->o) / u->T) * u->ntx + (xx + u->o) / u->T; return u->tbase[t] + u->comp[id] - 1;
 }
 static inline double uw_U(const uw_ctx *x, uint32_t id) { return (double)x->V[id].uw + x->V[id].k; }   /* (the base kb cancels in differences) */
-static void uwr_vote(uwr_ctx *u, int th, uint32_t a, uint32_t b, int32_t d, int64_t w) {
+static void uwr_vote2(uwr_ctx *u, int th, uint32_t a, uint32_t b, int32_t d, int64_t w, int64_t wn) {   /* wn: weight below d (0: w) */
     if (a == b || w <= 0) return;
     if (u->nv[th] == u->cv[th]) { u->cv[th] = u->cv[th] ? 2 * u->cv[th] : 65536; u->v[th] = realloc(u->v[th], u->cv[th] * sizeof *u->v[th]); if (!u->v[th]) abort(); }
-    u->v[th][u->nv[th]++] = (l1_vote){a, b, d, w};
+    u->v[th][u->nv[th]++] = (l1_vote){a, b, d, w, wn};
 }
+static void uwr_vote(uwr_ctx *u, int th, uint32_t a, uint32_t b, int32_t d, int64_t w) { uwr_vote2(u, th, a, b, d, w, 0); }
 /* the model's U - dir theta / 2 pi = W and theta at a field voxel */
 static double uwr_Wm(const uw_ctx *x, int z, int y, int xx, double *th) {
     const fit_fields *f = x->f; const double pz = (z + 0.5) * f->h, py = (y + 0.5) * f->h, px = (xx + 0.5) * f->h;
@@ -995,7 +996,19 @@ static void uwr_tiles(void *a, int z0_, int z1_, int th) {
                     if (zn >= g->D || yn >= g->H || xn >= g->W) continue;
                     const uint32_t j = ub_id(g, zn, yn, xn); if (V[j].k == UK_UNSET) continue;
                     const uint32_t gb = uwr_gid(u, zn, yn, xn, j); if (ga == gb) continue;
-                    uwr_vote(u, th, ga, gb, (int32_t)lround(ui - uw_U(x, j)), uwr_w(u, V[i].bk < V[j].bk ? V[i].bk : V[j].bk, z, y, xx, zn, yn, xn));
+                    const int64_t wv = uwr_w(u, V[i].bk < V[j].bk ? V[i].bk : V[j].bk, z, y, xx, zn, yn, xn); const int32_t dv = (int32_t)lround(ui - uw_U(x, j));
+                    const double hid = u->c->uw_rep_hidden;
+                    if (hid > 0 && hid < 1) {   /* one-sided across the sheets: j lies outward of i (n_ax >= 1/2: W(j) - W(i) >= the phase's step) or inward */
+                        const fit_fields *f = x->f; const double h = f->h, pz = (z + 0.5 + 0.5 * (ax == 0)) * h, py = (y + 0.5 + 0.5 * (ax == 1)) * h, px = (xx + 0.5 + 0.5 * (ax == 2)) * h;
+                        const double gv[3] = {fit_W(x->m, pz + h, py, px) - fit_W(x->m, pz - h, py, px), fit_W(x->m, pz, py + h, px) - fit_W(x->m, pz, py - h, px),
+                                              fit_W(x->m, pz, py, px + h) - fit_W(x->m, pz, py, px - h)};
+                        const double gl = sqrt(gv[0] * gv[0] + gv[1] * gv[1] + gv[2] * gv[2]), na = gl > 1e-12 ? gv[ax] / gl : 0;
+                        const int64_t wh = wv, wl = (int64_t)llround(hid * (double)wv);
+                        if (na >= 0.5) { uwr_vote2(u, th, ga, gb, dv, wl > 0 ? wl : 1, wh); continue; }    /* above d (outward more turns): hidden */
+                        if (na <= -0.5) { uwr_vote2(u, th, ga, gb, dv, wh, wl > 0 ? wl : 1); continue; }   /* j inward: below d is hidden */
+                        uwr_vote2(u, th, ga, gb, dv, wh, wh); continue;
+                    }
+                    uwr_vote(u, th, ga, gb, dv, wv);
                 }
                 if (u->c->emb && u->c->uw_rep_emb > 0 && z % u->c->uw_rep_emb_sub == 0 && y % u->c->uw_rep_emb_sub == 0 && xx % u->c->uw_rep_emb_sub == 0) uwr_emb(u, th, z, y, xx, i, ga, ui);
                 /* evidence: votes between voxels farther apart (every other voxel per axis) */
