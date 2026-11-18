@@ -252,7 +252,7 @@ int cmd_surf_resample(int argc, char **argv) {
     rs_surf *S = calloc((size_t)ns, sizeof *S); size_t nv = 0; int nm = 0;
     for (int s = 0; s < ns; s++) {
         if (rs_load(sd, sn[s], &S[s])) return 1;
-        if (geom) { static uint8_t one; S[s].M = &one; S[s].mw = S[s].mh = 1; S[s].gs = 1; nm++; for (size_t i = 0; i < (size_t)S[s].w * S[s].h; i++) nv += S[s].Z[i] >= 0; continue; }   /* (M: "mapped"; never sampled) */
+        if (geom) { static const uint8_t one = 0; /* mgpu: const */ S[s].M = (uint8_t *)&one; S[s].mw = S[s].mh = 1; S[s].gs = 1; nm++; for (size_t i = 0; i < (size_t)S[s].w * S[s].h; i++) nv += S[s].Z[i] >= 0; continue; }   /* (M: "mapped"; never sampled) */
         char p[1400]; snprintf(p, sizeof p, "%s/%s%s", md, sn[s], suf); S[s].M = img_read_u8(p, &S[s].mw, &S[s].mh);
         if (!S[s].M) { fprintf(stderr, "surf-resample: no map %s: surface %s skipped\n", p, sn[s]); continue; }
         S[s].gs = (double)(S[s].mw - 1) / (S[s].w - 1);
