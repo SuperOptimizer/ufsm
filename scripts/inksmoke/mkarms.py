@@ -7,7 +7,8 @@ of the ink budget and the memorised scroll): WEIGHTS below, renormalised over th
   sources-B.json  each scroll's segment list + its ink-teach windows (TEACHDIR/<SCROLL>/segs-teach.json: reader3 + ink9um, Platt per
                   scroll, gate p <= 0.1 | p >= 0.8, human px and held-out boxes removed), same weights (inkteach/ab/mkab.py's layout)"""
 import json, os, sys
-H0, TD, HO, OD = sys.argv[1:5]; ARMS = sys.argv[5] if len(sys.argv) > 5 else "AB"; os.makedirs(OD, exist_ok=True)
+H0, TD, HO, OD = (os.path.abspath(a) for a in sys.argv[1:5]);   # absolute: the trainer opens the holdout files from its own cwd (pod 11-18)
+ARMS = sys.argv[5] if len(sys.argv) > 5 else "AB"; os.makedirs(OD, exist_ok=True)
 WEIGHTS = {"PHercParis4": 0.50, "PHerc0139": 0.20, "PHerc1667": 0.15, "PHerc0009B": 0.05, "PHerc0814": 0.05, "PHercMAN5": 0.05}
 ONLY = [t for t in os.environ.get("SCROLLS", "").split(",") if t]   # podq.sh's 1-h smoke: a subset of the scrolls (weights renormalised)
 src = json.load(open(H0)); HB = json.load(open(HO))

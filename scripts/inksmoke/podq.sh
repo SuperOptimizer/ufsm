@@ -57,10 +57,22 @@ cp -rn $K/kit/inkgt/. $K/inkgt/ 2> /dev/null; [ -s $K/inkgt/sources-H0.json ] ||
 # --- prefetch (CPU + network, in the background beside narrow + weights) ---
 mkarms() { [ -s $AD/sources-$1.json ] && return 0
   cp -n $K/kit/arms/holdouts-PHerc*.json $AD/ 2> /dev/null   # the desk-made per-scroll holdout files (pod 11-18: no tifffile in its python)
-  python3 -I $D/mkarms.py $K/inkgt/sources-H0.json $K/teach $K/kit/holdouts-20261118.json $AD $1 > $AD/mkarms$1.log 2>&1 || die "mkarms $1 (log $AD/mkarms$1.log)"; }
+  python3 -I $D/mkarms.py $K/inkgt/sources-H0.json $K/teach $K/kit/holdouts-20261118.json $AD $1 > $AD/mkarms$1.log 2>&1 || die "mkarms $1 (log $AD/mkarms$1.log)"
+  # every path the trainer opens must exist and be absolute (pod 11-18: a relative holdout_file failed at step 0, after the prefetch)
+  python3 -I -c "
+import json, os, sys
+bad = []
+def walk(v, k=''):
+    if isinstance(v, dict): [walk(x, k + '.' + n) for n, x in v.items()]
+    elif isinstance(v, list): [walk(x, k) for x in v]
+    elif isinstance(v, str) and (v.endswith('.json') or k.endswith(('holdout_file', 'axis', 'segments', 'tifxyz', 'labels', 'mask', 'validation'))) and not v.startswith('http') and '/' in v:
+        if not os.path.isabs(v) or not os.path.exists(v): bad.append(k + ' ' + v)
+d = json.load(open(sys.argv[1])); walk(d)
+for s in d['sources']: walk(json.load(open(s['targets']['ink']['onfly']['segments'])), s['name'] + '.segs')
+print('\\n'.join(bad[:10])); sys.exit(1 if bad else 0)" $AD/sources-$1.json > $AD/check$1.log 2>&1 || { rm -f $AD/sources-$1.json; die "sources-$1: missing or relative paths ($AD/check$1.log)"; }; }
 prefetch() {   # prefetch ARM: cold https CT read by one sampler worker gave 30 steps in 4 h on pod B (0.003 samples/s)
   done_ prefetch$1$TAG && return 0
-  $U prefetch $AD/sources-$1.json --levels 1,2 --threads ${PFTH:-48} --P ${P:-1024} > $K/prefetch$1$TAG.log 2>&1 && touch $S/prefetch$1$TAG.done; }
+  $U prefetch $AD/sources-$1.json --levels 2 --threads ${PFTH:-24} --P ${P:-1024} > $K/prefetch$1$TAG.log 2>&1 && touch $S/prefetch$1$TAG.done; }
 mkarms A; PFPID=; if ! done_ prefetchA$TAG; then say "prefetch A ($TAG, scrolls ${SCROLLS:-all}) in the background"; prefetch A & PFPID=$!; fi
 # --- narrow ---
 if ! done_ narrow; then
