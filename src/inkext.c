@@ -222,9 +222,10 @@ static void *render_worker(void *a) {
 }
 static int i64cmp(const void *a, const void *b) { const int64_t p = *(const int64_t *)a, q = *(const int64_t *)b; return (p > q) - (p < q); }
 /* rows [r0, r1) of the model grid -> rows[r - r0] ([D][Wm] each) */
-static int render_rows(const irender *R, int r0, int r1, uint8_t **rows, int nth) {
-    if (r1 <= r0) return 0;
-    /* the chunks: per 16 x 16 pixel block the box of its corner points +- the layer reach */
+/* the CT chunk keys rows [r0, r1) of the model grid read (sorted, unique; *n of them): per 16 x 16 pixel block the box of its corner
+   points +- the layer reach. render_rows makes them resident; the prefetcher fetches them ahead into the --cache */
+static int64_t *render_keys(const irender *R, int r0, int r1, size_t *pn) {
+    *pn = 0; if (r1 <= r0) return nullptr;
     const double reach = (R->center + fabs(R->shift) + 1.5) * R->step_vox + 2 * R->du * 4 + 2;
     size_t nk = 0, ck = 4096; int64_t *keys = malloc(ck * sizeof *keys);
     for (int by = r0; by < r1; by += 16) for (int bx = 0; bx < R->Wm; bx += 16) {
@@ -248,6 +249,11 @@ static int render_rows(const irender *R, int r0, int r1, uint8_t **rows, int nth
         }
     }
     qsort(keys, nk, sizeof *keys, i64cmp); size_t u = 0; for (size_t i = 0; i < nk; i++) if (!u || keys[i] != keys[u - 1]) keys[u++] = keys[i];
+    *pn = u; return keys;
+}
+static int render_rows(const irender *R, int r0, int r1, uint8_t **rows, int nth) {
+    if (r1 <= r0) return 0;
+    size_t u; int64_t *keys = render_keys(R, r0, r1, &u);
     int rc = ct_need(R->L, keys, u, nth); free(keys);
     rjob J = {R, r0, r1, rows, 0}; const int T = nth < 1 ? 1 : nth > 64 ? 64 : nth; pthread_t th[64];
     for (int t = 0; t < T; t++) pthread_create(&th[t], nullptr, render_worker, &J);
@@ -420,17 +426,76 @@ static void gpu_submit(gworker *G, uint8_t **tiles, int **tx, int **ty, int nb) 
 }
 
 /* the probability map (model grid Wm x Hm) of one surface */
-static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *pdu, float **pctl) {
-    const ie_spec *sp = X->sp; const int D = sp->D, T = sp->T;
+/* the renderer of surface S; returns its CT level */
+static int render_init(const irun *X, const isurf *S, irender *R) {
     /* CT level: the coarsest present level not coarser than the spacing (5% slack); none qualifies (a scan coarser than the model):
-       the finest present level, as before levels could be missing; --layers without CT: level 0 (only its um is used) */
+       the finest present level, as before levels could be missing; --layers without CT: level 0 (only its um is used). -1: none present */
     int L = -1, L0 = -1; for (int l = 0; l < X->nlev; l++) if (X->lev[l].z || X->stk) { if (L0 < 0) L0 = l; if (X->lev_um[l] <= X->px_um * 1.05) L = l; }
     if (L < 0) L = L0;
+    *R = (irender){0};
+    if (L < 0) return -1; R->S = S; R->L = (ctlev *)&X->lev[L]; R->lscale = X->lev_um[L] / X->lev_um[0]; R->D = X->sp->D; R->center = (X->sp->D - 1) * 0.5; R->reverse = X->reverse; R->shift = X->shift;
+    R->ss = (int)lround(X->px_um / X->lev_um[L]); if (R->ss < 1) R->ss = 1;
+    R->du = X->px_um / (S->vox_um / S->scale); R->step_vox = X->px_um / X->lev_um[0];
+    R->Wm = (int)((S->w - 1) / R->du) + 1; R->Hm = (int)((S->h - 1) / R->du) + 1;
+    return L;
+}
+/* the CT prefetcher (--fetch-threads, 16; with --cache and a remote CT): I/O threads fetch the encoded chunks a surface will read into the
+   --cache (z3_prefetch_chunk, no decode), in its row-band order, and the next surface's while this one's net runs, so render_rows'
+   decodes find them on disk instead of fetching each band's chunks one at a time between the bands (1667 w035 from a cold cache: render
+   46 of 50 s, ~90 chunks/s; warm 6 s). Only a hint: what it has not fetched yet the renderer reads itself, the same bytes. */
+typedef struct pf_job { z3 *z; int64_t *keys; size_t n; struct pf_job *nx; } pf_job;
+typedef struct { pthread_mutex_t mu; pthread_cond_t cv; pf_job *head, *tail; size_t next; int stop, nt; pthread_t th[64]; _Atomic long long nf, nfail; } ie_pf;
+static void *pf_main(void *a) {
+    ie_pf *P = a;
+    for (;;) {
+        pthread_mutex_lock(&P->mu);
+        while (!P->head && !P->stop) pthread_cond_wait(&P->cv, &P->mu);
+        if (!P->head) { pthread_mutex_unlock(&P->mu); return nullptr; }
+        pf_job *J = P->head; const int64_t k = J->keys[P->next++]; z3 *z = J->z;
+        if (P->next == J->n) { P->head = J->nx; if (!P->head) P->tail = nullptr; P->next = 0; free(J->keys); free(J); }
+        pthread_mutex_unlock(&P->mu);
+        const int r = z3_prefetch_chunk(z, k >> 42, (k >> 21) & 0x1fffff, k & 0x1fffff);
+        if (r > 0) atomic_fetch_add(&P->nf, 1); else if (r < 0) atomic_fetch_add(&P->nfail, 1);
+    }
+}
+static void pf_add(ie_pf *P, z3 *z, int64_t *keys, size_t n) {   /* takes keys */
+    if (!P || !n) { free(keys); return; }
+    pf_job *J = malloc(sizeof *J); if (!J) { free(keys); return; }
+    *J = (pf_job){z, keys, n, nullptr};
+    pthread_mutex_lock(&P->mu); if (P->tail) P->tail->nx = J; else P->head = J; P->tail = J; pthread_cond_broadcast(&P->cv); pthread_mutex_unlock(&P->mu);
+}
+/* surface S's chunks in its 64-row bands' order (a chunk again in a later band: skipped there as cached) */
+static void pf_surface(ie_pf *P, const irun *X, const isurf *S) {
+    if (!P || X->stk || !X->nlev) return;
+    irender R; if (render_init(X, S, &R) < 0 || !R.L->z) return;
+    size_t n = 0, cap = 0; int64_t *all = nullptr;
+    for (int r0 = 0; r0 < R.Hm; r0 += 64) {
+        size_t u; int64_t *k = render_keys(&R, r0, r0 + 64 < R.Hm ? r0 + 64 : R.Hm, &u);
+        if (n + u > cap) { cap = (n + u) * 2; all = realloc(all, cap * sizeof *all); }
+        if (u) memcpy(all + n, k, u * sizeof *k);
+        n += u; free(k);
+    }
+    pf_add(P, R.L->z, all, n);
+}
+static ie_pf *pf_open(int nt) {
+    if (nt <= 0) return nullptr;
+    ie_pf *P = calloc(1, sizeof *P); if (!P) return nullptr;
+    pthread_mutex_init(&P->mu, nullptr); pthread_cond_init(&P->cv, nullptr); if (nt > 64) nt = 64;
+    for (int i = 0; i < nt; i++) { if (pthread_create(&P->th[P->nt], nullptr, pf_main, P)) break; P->nt++; }
+    return P;
+}
+static void pf_close(ie_pf *P) {   /* the queue dropped: what is not fetched is not needed any more */
+    if (!P) return;
+    pthread_mutex_lock(&P->mu); P->stop = 1;
+    while (P->head) { pf_job *J = P->head; P->head = J->nx; free(J->keys); free(J); }
+    P->tail = nullptr; pthread_cond_broadcast(&P->cv); pthread_mutex_unlock(&P->mu);
+    for (int i = 0; i < P->nt; i++) pthread_join(P->th[i], nullptr);
+    pthread_mutex_destroy(&P->mu); pthread_cond_destroy(&P->cv); free(P);
+}
+static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *pdu, float **pctl) {
+    const ie_spec *sp = X->sp; const int D = sp->D, T = sp->T;
+    irender R; const int L = render_init(X, S, &R);
     if (L < 0) { fprintf(stderr, "ink-ext: %s: no CT level present\n", S->name); return nullptr; }
-    irender R = {0}; R.S = S; R.L = &X->lev[L]; R.lscale = X->lev_um[L] / X->lev_um[0]; R.D = D; R.center = (D - 1) * 0.5; R.reverse = X->reverse; R.shift = X->shift;
-    R.ss = (int)lround(X->px_um / X->lev_um[L]); if (R.ss < 1) R.ss = 1;
-    R.du = X->px_um / (S->vox_um / S->scale); R.step_vox = X->px_um / X->lev_um[0];
-    R.Wm = (int)((S->w - 1) / R.du) + 1; R.Hm = (int)((S->h - 1) / R.du) + 1;
     if (X->stk) { R.Wm = X->stk_w; R.Hm = X->stk_h; }   /* --layers: the stack's own pixel grid */
     const int stk0 = X->stk ? X->stk_n / 2 - D / 2 + (int)lround(X->shift) : 0;   /* the D central layers (koine / hecate rule), moved by --shift */
     if (X->stk && (stk0 < 0 || stk0 + D > X->stk_n)) { fprintf(stderr, "ink-ext: --layers has %d layers, %s needs %d\n", X->stk_n, sp->name, D); return nullptr; }
@@ -638,11 +703,25 @@ static int raw_mode(int argc, char **argv, ie_net *net, int kind) {
 }
 
 /* ufsm ink-ext --model M --weights W (--surface DIR ..|--surfaces LIST) --ct ROOT KEY --out DIR [options] */
+/* a loaded surface for the run: --surf-um, coordinates in the CT's level-0 voxels (e.g. 9.596 um level-2 wraps of a 2.399 um scan:
+   rescaled; S->vox_um, the physical grid spacing, is kept), --grid-crop (c0,r0,cols,rows of the tifxyz grid). 0 ok */
+static int surf_prep(const irun *X, isurf *S, int argc, char **argv, int quiet) {
+    { const double su = opt_atof("--surf-um", iopt(argc, argv, "--surf-um", "0")); if (su > 0) S->vox_um = su; }   /* tifxyz voxel size when its meta has none (default 2.399) */
+    if (X->nlev) {
+        const double f = S->vox_um / X->lev_um[0];
+        if (fabs(f - 1) > 0.01) {
+            for (size_t i = 0; i < (size_t)S->w * S->h; i++) if (S->Z[i] >= 0) { S->X[i] *= (float)f; S->Y[i] *= (float)f; S->Z[i] *= (float)f; }
+            if (!quiet) fprintf(stderr, "ink-ext: %s: surface in %.3f um voxels, CT level 0 %.3f um: coordinates x %.4f\n", S->name, S->vox_um, X->lev_um[0], f);
+        }
+    }
+    const char *gc = iopt(argc, argv, "--grid-crop", nullptr); int cc[4];
+    return gc && (sscanf(gc, "%d,%d,%d,%d", cc, cc + 1, cc + 2, cc + 3) != 4 || isurf_crop(S, cc[0], cc[1], cc[2], cc[3])) ? -1 : 0;
+}
 int cmd_ink_ext(int argc, char **argv) {
     const char *mname = iopt(argc, argv, "--model", nullptr), *weights = iopt(argc, argv, "--weights", nullptr);
     if (!mname || !weights) {
         fprintf(stderr, "usage: ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um|reader2|dense9|rectina|trace3b|canon2|studio|tsf --weights W[,W2..] --surface TIFXYZ [--surface ..] --ct ROOT KEY --out DIR\n"
-                        "         [--reverse] [--stride S] [--px-um U] [--batch B] [--gpu 0] [--threads 16] [--ct-mem 3] [--cache DIR] [--native] [--suffix S] [--prefix P]\n"
+                        "         [--reverse] [--stride S] [--px-um U] [--batch B] [--gpu 0] [--threads 16] [--ct-mem 3] [--cache DIR] [--fetch-threads 16] [--native] [--suffix S] [--prefix P]\n"
                         "         [--ct-local ROOT --local-levels 1,2] [--ct-um 2.399] [--surf-um U] [--no-overlap] [--norm tile|sheet] [--blend official|norm] [--grid-crop c,r,w,h]\n"
                         "         [--ct-tif] [--jpeg PATH] [--jpeg-stretch] [--layers DIR [--px-crop x,y,w,h]] [--dump-layers DIR] [--render-only]\n"
                         "         [--shift S] [--zwin a,b,..] [--calib] [--native-only]\n"
@@ -758,23 +837,23 @@ surfaces:;
     char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", outdir); if (system(p)) return 1;
     int rc = 0, ns = 0, nsurf = 0;
     for (int a = 2; a + 1 < argc; a++) nsurf += !strcmp(argv[a], opt_n("--surface"));
+    /* the CT prefetcher: with --cache and a remote CT only (a local store has nothing to fetch) */
+    ie_pf *pf = nullptr; int pf_next = -1;
+    if (cache && ci >= 0 && !X.stk && strstr(argv[ci + 1], "://") && nsurf) pf = pf_open(opt_atoi("--fetch-threads", iopt(argc, argv, "--fetch-threads", "16")));
     for (int a = 2; a < argc; a++) {
         const int lonly = X.stk && !nsurf && a == 2;   /* --layers without --surface: one pass named --name (default "layers") */
         if (!lonly && (a + 1 >= argc || strcmp(argv[a], opt_n("--surface")))) continue;
         isurf S;
         if (lonly) { memset(&S, 0, sizeof S); snprintf(S.name, sizeof S.name, "%s", iopt(argc, argv, "--name", "layers")); S.scale = 1; S.vox_um = X.px_um; S.w = S.h = 2; }
         else if (isurf_load(&S, argv[a + 1])) { fprintf(stderr, "ink-ext: cannot read tifxyz %s\n", argv[a + 1]); rc = 1; continue; }
-        { const double su = opt_atof("--surf-um", iopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* tifxyz voxel size when its meta has none (default 2.399) */
-        if (!lonly && X.nlev) {   /* surface coordinates in other voxels than the CT's level 0 (e.g. 9.596 um level-2 wraps of a 2.399 um scan): rescaled into
-                                     level-0 voxels; S.vox_um (the physical grid spacing, R.du) is kept */
-            const double f = S.vox_um / X.lev_um[0];
-            if (fabs(f - 1) > 0.01) {
-                for (size_t i = 0; i < (size_t)S.w * S.h; i++) if (S.Z[i] >= 0) { S.X[i] *= (float)f; S.Y[i] *= (float)f; S.Z[i] *= (float)f; }
-                fprintf(stderr, "ink-ext: %s: surface in %.3f um voxels, CT level 0 %.3f um: coordinates x %.4f\n", S.name, S.vox_um, X.lev_um[0], f);
-            }
+        if (!lonly && surf_prep(&X, &S, argc, argv, 0)) { fprintf(stderr, "ink-ext: bad --grid-crop\n"); return 2; }
+        if (pf) {   /* this surface's chunks (unless queued as the previous one's next), then the next surface's behind them */
+            if (a != pf_next) pf_surface(pf, &X, &S);
+            pf_next = -1;
+            for (int b = a + 2; b + 1 < argc; b++) if (!strcmp(argv[b], opt_n("--surface"))) {
+                isurf N; if (!isurf_load(&N, argv[b + 1])) { if (!surf_prep(&X, &N, argc, argv, 1)) pf_surface(pf, &X, &N); isurf_free(&N); }
+                pf_next = b; break; }
         }
-        const char *gc = iopt(argc, argv, "--grid-crop", nullptr); int cc[4];   /* c0,r0,cols,rows of the tifxyz grid */
-        if (gc && (sscanf(gc, "%d,%d,%d,%d", cc, cc + 1, cc + 2, cc + 3) != 4 || isurf_crop(&S, cc[0], cc[1], cc[2], cc[3]))) { fprintf(stderr, "ink-ext: bad --grid-crop\n"); return 2; }
         const char *pre = iopt(argc, argv, "--prefix", ""); char nm[600]; snprintf(nm, sizeof nm, "%s%s", pre, S.name);
         if (iflag(argc, argv, "--inward") && !lonly) {   /* the layer order whose read runs radially inward (the published PHerc1447 renders' order, the w058 control) */
             const char *oc = iopt(argc, argv, "--center", nullptr); int l0 = 0; while (l0 + 1 < X.nlev && !X.lev[l0].z) l0++;   /* (the finest present level, in level-0 voxels) */
@@ -860,6 +939,7 @@ surfaces:;
         fprintf(stderr, "ink-ext: %s -> %s/%s_%s%s.tif (%d x %d, mean %.3f over %zu px), %.1fs\n", S.name, outdir, nm, mname, suffix, ow, oh, cnt ? mean / cnt / 255 : 0, cnt, inow() - t0);
         free(g); free(pm); isurf_free(&S); ns++;
     }
+    if (pf) { fprintf(stderr, "ink-ext: prefetcher: %lld CT chunks fetched ahead (%d threads)%s\n", (long long)atomic_load(&pf->nf), pf->nt, atomic_load(&pf->nfail) ? ", some failed (read again by the renderer)" : ""); pf_close(pf); }
     if (!ns && !rc) fprintf(stderr, "ink-ext: no --surface given\n");
     return rc;
 }

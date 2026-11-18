@@ -6,6 +6,30 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## ink-ext's CT prefetcher: reader3's unroll ink from 258 to 86 s over 5 wraps (same maps; 2026-11-17, branch r3fetch-20261117)
+
+The unroll's ink is now reader3 per surface (INKMODE=r3, da14d47f). Its end-to-end split on PHerc1667 (try9-6250 wraps, CT level 2 over
+https, 8 threads, card 1 shared): w035 from a cold cache 50.2 s wall = render 46.3 s (3575 chunks, 1.1 GB: each band's chunks fetched one
+z3_read at a time, ~90 chunks/s, the band's rows waiting for them) + net 11.4 s (89 tiles/s) partly beside it; warm 12.3 s (render 6.0,
+net 11.2: net-bound); w036 after w035 needed 639 new chunks of 3848 (neighbouring wraps share ~83 %).
+
+- `--fetch-threads N` (16; with --cache and a remote CT): I/O threads fetch the encoded chunks of each surface into the --cache
+  (z3_prefetch_chunk, no decode) in its 64-row bands' order, and the next --surface's while this one's net runs; render_rows' decodes
+  then find them on disk. A hint only: a chunk not fetched yet the renderer reads itself, the same bytes. render_keys / render_init are
+  render_rows' / run_surface's own chunk and level choice, shared with it.
+- The unroll (inksdk's r3pre) runs one ink-ext per surface set with a shared `--cache $O/ink/ct.cache`, wraps in wrap order (decoded
+  chunks stay resident across surfaces, --ct-mem 3 GB), so the prefetcher is on there by default.
+
+| 5 consecutive wraps w035-w039, cold CT | wall |
+|---|---|
+| A: one process per wrap, no --cache (podink.sh) | 258.2 s |
+| B: one process, --cache, --fetch-threads 0 | 140.1 s |
+| C: one process, --cache, prefetcher (7982 chunks fetched ahead) | **86.3 s** (render 6.4-7.8 s a wrap, net 12.6-13.6 s: net-bound) |
+
+Maps: A == B byte for byte; C differed by 1 on 0.7 % of the pixels, because the free device memory on the shared card made ink-ext's
+automatic --batch 14 instead of 17 (the net's sums depend on the batch); C rerun with --batch 17 (and again after the rebase onto
+da14d47f): byte-identical to A on all 5 (2) wraps. A fixed --batch in the unroll's R3X keeps the maps reproducible (told inksdk).
+
 ## The MX head conv at 3 blocks an SM: fields predict's conv1_mx_t_k -20 % (2026-11-17, branch convkc1v-20261117)
 
 conv1_mx_t_k (the 1x1 head conv on MX-fp4 level-0 activations, GN+SiLU on load; u1 fields: 96 inputs, nine passes of 16 outputs) was
