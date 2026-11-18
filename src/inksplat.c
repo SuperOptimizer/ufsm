@@ -2106,16 +2106,16 @@ int cmd_ink_teach(int argc, char **argv) {
    surface point in one of H's boxes of this CT: the sampler masks every label there), VAL (the segment's "validation" raster >= 128;
    try9's sources have "validation": "off", so these pixels were trained on), TRAIN (the rest). With --region only pixels whose surface
    point lies in a region shrunk by the sample reach (the boxes a prediction covers) are counted, the region index kept per pixel.
-   Along the normal t = -40 .. 40 level-0 voxels: the CT (level --level) and the prediction (level --pred-level), trilinear.
+   Along the normal t = -56 .. 56 level-0 voxels: the CT (level --level) and the prediction (level --pred-level), trilinear.
    Reported per split (rows on stdout, --out PREFIX: PREFIX.shift.tsv / .region.tsv / .hist.tsv / .prof.tsv):
      supervised px and ink share; face found per class; face offset quantiles (the CT surface vs the mesh, level-0 voxels);
      CT band mean per class (raw, and z = (v - C) / S with --norm, the trainer's --scan-norm statistics), its AUC as an ink score;
      the prediction's band max / mean per class: AUC, quantiles, best-F1 threshold, F1 at 128; and the AUC at every band shift
-     s = -16 .. 16 relative to the face (the training band) and to the mesh: a best shift != 0 = label vs prediction misalignment.
+     s = -28 .. 28 relative to the face (the training band) and to the mesh: a best shift != 0 = label vs prediction misalignment.
    PREFIX.iso.tsv: per split and class the share of supervised px whose face is found at other isos (the same samples), and why it is not
    at --iso (no sample >= iso / runs too short / no gap after the run / the run starts beyond +8). --blocks: PREFIX.blocks.tsv, the
    face-found px per split and class in each 2048^3 level-0 block (where to predict). */
-enum { AU_S = 16, AU_T = 40, AU_NT = 2 * AU_T + 1, AU_NS = 2 * AU_S + 1, AU_MAXR = 64, AU_SPN = 3 };
+enum { AU_S = 28, AU_T = 56, AU_NT = 2 * AU_T + 1, AU_NS = 2 * AU_S + 1, AU_MAXR = 64, AU_SPN = 3 };
 static const char *const au_spn[AU_SPN] = {"TRAIN", "VAL", "HOLD"};
 typedef struct {
     uint64_t sc[AU_SPN][2][2][AU_NS][2][256];   /* [split][ref 0 face 1 mesh][agg 0 max 1 mean][shift][class][byte] */
