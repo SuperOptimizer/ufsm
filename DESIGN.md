@@ -32,8 +32,33 @@ Corrections to the 11-17 PHerc0332 section below: "try9 undercounts 20 %" and "u
 objective. Read through 1667's gap curve, try9's 0332 fit (gaps ~160 um, CT/turn 1.18) maps to ~1.0 turns per GT turn and u1's (~132 um,
 1.04) to ~0.95; the fits disagree (62 vs 72 wraps, pair accuracy 0.27 at 2 mm) but which is right is not decidable label-free with CT
 peaks. The 0332 AGREE pseudo-label boxes (CT/turn 0.95-1.05) are withdrawn. The broken top end (zr 512,7680) and body drift stand.
-Open: whether CT peaks per GT turn vs gap is the same curve on Paris 4 / 0139 (then a gap-calibrated lookup could check counts); until then
-counting is a model problem (labels on more scrolls).
+**The curve on three scrolls (11-18, CPU; /vesuvius/ufsm/fix0332/curve).** CT peaks per GT turn by GT normal gap (um), wrap-check --gt-int
+(model + fields) for 1667 (def-u1 ref) and Paris 4 (u1 ref-cf, q9p6 codes, z 6400-12800); 0139 has no fields on the desk, so ctgt.py does the
+same detector and interval rule fields-free (material = CT > 0, normal from the GT label structure tensor, wbench boxes; it reproduces
+1667's overall 1.545 vs wrap-check's 1.54 and reads its bins ~0.05-0.1 lower):
+
+| gap um | <70 | 70-85 | 85-100 | 100-115 | 115-130 | 130-150 | 150-180 | 180-230 | >230 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1667 wrap-check | 0.56 | 0.73 | 0.84 | 0.95 | 1.04 | 1.10 | 1.20 | 1.34 | 2.21 |
+| P4 wrap-check | 0.55 | 0.73 | 0.86 | 0.97 | 1.09 | 1.20 | 1.35 | 1.54 | 1.98 |
+| 1667 ctgt (boxes) | 0.46 | 0.68 | 0.78 | 0.88 | 0.96 | 1.05 | 1.15 | 1.30 | 2.14 |
+| P4 ctgt (boxes) | 0.51 | 0.76 | 0.87 | 0.96 | 1.06 | 1.16 | 1.26 | 1.43 | 1.88 |
+| 0139 ctgt (boxes) | 0.40 | 0.66 | 0.79 | 0.89 | 0.97 | 1.06 | 1.14 | 1.26 | 1.97 |
+
+Same shape on all three (0139 ~ 1667, P4 +0.05..0.2 above 130 um); the share off by >= 0.5 turn is 0.35-0.7 per interval everywhere. The
+lookup test: wrap-check --intervals now writes the fitted normal gap and the GT turns (gap_um, gtq; all rows), and CT / lookup = sum npk
+/ sum f(fitted gap) per model:
+
+| model | GT turns per fitted turn | raw CT/turn | CT / f_1667 | CT / f_P4 |
+|---|---|---|---|---|
+| 1667 def-u1 ref (GT ids 0.83) | 0.985 | 1.473 | 0.944 | 0.958 |
+| 1667 rc-u1 it3 (GT ids 0.52) | 0.955 | 1.237 | 0.905 | 0.907 |
+| P4 u1 ref-cf | 1.033 | 0.925 | 0.976 | 0.942 |
+
+Within a scroll the lookup ranks right where raw CT/turn ranked wrong (rhocal's dups read 0.905 vs 0.944), ~0.04 for 0.03 GT turns,
+most of it from the < 70 um bin. Across scrolls the level is not portable: P4's ref over-counts GT (1.033) yet reads 0.94-0.98, below
+or level with 1667's under-counting def. So no lookup target or gate: a calibration error of ~0.05 equals the counting errors that
+matter. At most CT / lookup as a same-scroll A/B diagnostic; counting stays a model problem (labels on more scrolls).
 
 ## Pod B rounds: 0332 count-rescale arms and the 1667 rhocal A/B, rhocal REJECTED by GT (2026-11-17/18, podunroll + fix0332, branch podun-20261118)
 

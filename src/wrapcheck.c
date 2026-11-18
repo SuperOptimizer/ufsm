@@ -492,9 +492,11 @@ int cmd_wrap_check(int argc, char **argv) {
     }
     if (wc_opt(argc, argv, "--intervals", nullptr)) {   /* --intervals OUT: one line per interval (fix0332 11-17: cell gates from the CT agreement) */
         FILE *qf = fopen(wc_opt(argc, argv, "--intervals", nullptr), "w"); if (!qf) { fprintf(stderr, "wrap-check: cannot write --intervals\n"); return 1; }
-        fprintf(qf, "z\ty\tx\tr_mm\tk\tnpk\trct\n");   /* (global native voxels of the model's grid: the midpoint of the interval) */
-        for (size_t i = 0; i < ni; i++) { const wc_int *v = &all[i]; if (v->gt != -128) continue;
-            fprintf(qf, "%.0f\t%.1f\t%.1f\t%.3f\t%d\t%d\t%.3f\n", v->z + morg[0], v->ym + morg[1], v->xm + morg[2], v->r * um / 1000, v->k, v->npk, v->rct); }
+        fprintf(qf, "z\ty\tx\tr_mm\tk\tnpk\trct\tgap_um\tgtq\n");   /* (global native voxels of the model's grid: the midpoint of the interval; gap_um the
+                                                                         fitted normal gap; gtq the GT turns over it with --codes, else nan) */
+        for (size_t i = 0; i < ni; i++) { const wc_int *v = &all[i];
+            fprintf(qf, "%.0f\t%.1f\t%.1f\t%.3f\t%d\t%d\t%.3f\t%.1f\t%.3f\n", v->z + morg[0], v->ym + morg[1], v->xm + morg[2], v->r * um / 1000, v->k, v->npk, v->rct,
+                    v->gapn, v->gt == -128 ? NAN : v->gtq); }
         if (fclose(qf)) { fprintf(stderr, "wrap-check: cannot write --intervals\n"); return 1; } }
     FILE *tf = nullptr; const char *tsv = wc_opt(argc, argv, "--tsv", nullptr);
     if (tsv && !(tf = fopen(tsv, "w"))) { fprintf(stderr, "wrap-check: cannot write %s\n", tsv); return 1; }
