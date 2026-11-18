@@ -657,8 +657,9 @@ check() {
     local dl; dl=$(grep '^cf-demod: z drift:' $O/logs/drift.log | tail -1); log "check: ${dl#cf-demod: }"
     # the body (bands with >= 1/2 the fullest band's weight) and the ends apart: 0332's 1.9-turn ALARM was 1.6 turns at the broken top end
     local db; db=$(grep '^cf-demod: z drift body' $O/logs/drift.log | tail -1); [ -n "$db" ] && log "check: ${db#cf-demod: }"
-    local ex; ex=$(echo "$dl" | sed -nE 's/.*along-sheet excursion ([0-9.]+) turns.*/\1/p')
-    [ -n "$ex" ] && awk -v e=$ex -v w=${DRIFTWARN:-0.75} 'BEGIN { exit !(e > w) }' && log "check: ALARM: the ref drifts $ex turns along the sheets over z (> DRIFTWARN ${DRIFTWARN:-0.75}): sheet identity changes with height"
+    # the ALARM on the body's excursion (the whole one when there is no body line): the ends' swings are logged above, not alarmed
+    local ex wh=body; ex=$(echo "$db" | sed -nE 's/.*along-sheet excursion ([0-9.]+) turns.*/\1/p'); [ -n "$ex" ] || { wh=whole; ex=$(echo "$dl" | sed -nE 's/.*along-sheet excursion ([0-9.]+) turns.*/\1/p'); }
+    [ -n "$ex" ] && awk -v e=$ex -v w=${DRIFTWARN:-0.75} 'BEGIN { exit !(e > w) }' && log "check: ALARM: the ref drifts $ex turns along the sheets over z ($wh; > DRIFTWARN ${DRIFTWARN:-0.75}): sheet identity changes with height"
     [ $rc = 3 ] && { log "check: FAILED: z drift above DRIFTMAX $DRIFTMAX"; return 1; }
   fi
   # GT boxes (GTBOXES = a wbench-format tsv in fields-native voxels, GTCODES = "ROOT KEY"; off unless both are set): the joined model and
@@ -670,7 +671,11 @@ check() {
   fi
 }
 wraps() {
-  local zr=; [ -n "$ZR" ] && [ "$ZR" != - ] && zr="--zr $ZR"
+  local zr=; [ -n "$ZR" ] && [ "$ZR" != - ] && [ "$ZR" != auto ] && zr="--zr $ZR"
+  # ZR=auto (opt-in): the body's z range from the check stage's cf-demod (bands with >= 1/2 the fullest band's phase
+  # weight): a broken end cap with no confident phase is not unrolled (PHerc0332: global z 1024..7680, the hand zr 512,7680)
+  if [ "$ZR" = auto ] && [ "$DRY" != 1 ]; then local bz; bz=$(sed -nE 's/^cf-demod: body z range ([0-9]+,[0-9]+).*/\1/p' $O/logs/drift.log 2> /dev/null | tail -1)
+    if [ -n "$bz" ]; then zr="--zr $bz"; log "wraps: ZR=auto: --zr $bz (the cf-demod body)"; else log "wraps: DEFAULTED: ZR=auto but no body z range in logs/drift.log (DRIFT=0?): no --zr"; fi; fi
   [ "$DRY" = 1 ] || rm -rf $O/wraps
   # the masked-CT gate (geo-outer 2026-11-14; the one no-data alarm): wraps drops roots on weak data cells (the fields' edge on a zeroed
   # CT); a share > --nodata-warn 0.02 means a mask that clips papyrus (the fields want the unmasked / filled CT). NODATAMAX F: exit 3 above

@@ -6,6 +6,108 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## rhocal (label-free count calibration from CT peaks): rejected by 1667 GT; the CT peak count is no counting reference (2026-11-18, branch rhocal-20261117)
+
+Idea (lead / user 11-17: a per-scroll auto-calibration for the corpus, 0332 the test bed): wrap-check counts CT papyrus peaks per fitted
+turn by radius band; scale count-field's density term per band (--rho-r, K(r) <- K(r) x CT(r)^1.3, median-3, cap [0.8, 1.6], gated bands)
+until CT/turn ~ 1, keep it only if wrap-check dup + merged and the body z drift do not get worse. unroll.sh stage `rhocal` (RHOCAL=1,
+RHOCALMODE radial | global, RHOCALMIN / MAX / G / TOL / IT) with tests/test_rhocal.sh: kept on branch rhocal-20261117 only, not merged.
+1667 A/B on pod B (u1 13000 and pab-base 8690 fields, 640/64, dir -1), GT ids right on the 54 non-noise 1667 wbench boxes (gtboxes,
+ref models; CPU on the desk; the GT codes never leave the desk):
+| fields | default ref | radial pass 1 / 2 / 3 | radial, K >= 0.95 | global pass 1 / 2 | rhocal's own verdict |
+|---|---|---|---|---|---|
+| u1 13000 | 0.831 (joined 0.853) | 0.581 / 0.526 / 0.517 | 0.581 / 0.526 | 0.592 / 0.501 | accepted (dup+merged 21 -> 8-11) |
+| pab-base 8690 | 0.669 (joined 0.699) | 0.523 / 0.375 / 0.376 | same | 0.491 / 0.305 | DEFAULTED (body drift +0.23..+0.51) |
+Why: wrap-check --gt-int --ct --codes on the default u1 ref (55386 intervals between consecutive GT sheets): per GT turn the fit counts
+1.024, the density term 1.22, the network phase 0.93, the CT peak detector 1.54 (off by >= 0.5 on 54 % of the intervals). The CT peaks per
+GT turn follow the sheet spacing: by GT gap 0.56 (< 70 um), 0.84 (85-100), 1.04 (115-130), 1.20 (150-180), 1.34 (180-230), 2.21 (> 230); by
+radius 1.96 (0-4 mm) .. 0.93 (12-14 mm). "CT peaks per fitted turn = 1" is right only near ~120 um gaps (Paris 4's 1.05 calibration was
+that regime). So the CT peak count can not calibrate a count, and wrap-check's verdicts reward the wrong direction too: the recovered u1
+rhocal fits checked 52 real / 12 dup / 0 merged against the default's 33 / 6 / 12 while losing 0.25-0.33 GT ids. unroll-qa's pw48 / w4
+fell with the "corrections" (0332 and 1667) and agreed with GT: the 11-17 claim that they penalise correct counting is withdrawn.
+Kept (master, branch rhocalkeep-20261118): wrap-check --bands / --intervals, cf-demod's body vs end drift + body z range, ZR=auto
+(opt-in), the DRIFTWARN ALARM on the body excursion, count-field --rho-r (a tool). The rhocal stage, its install fix and test_rhocal stay on
+branch rhocal-20261117 (pushed, not merged).
+Corrections to the 11-17 PHerc0332 section below: "try9 undercounts 20 %" and "u1 counts right" rest on the same uncalibrated CT
+objective. Read through 1667's gap curve, try9's 0332 fit (gaps ~160 um, CT/turn 1.18) maps to ~1.0 turns per GT turn and u1's (~132 um,
+1.04) to ~0.95; the fits disagree (62 vs 72 wraps, pair accuracy 0.27 at 2 mm) but which is right is not decidable label-free with CT
+peaks. The 0332 AGREE pseudo-label boxes (CT/turn 0.95-1.05) are withdrawn. The broken top end (zr 512,7680) and body drift stand.
+Open: whether CT peaks per GT turn vs gap is the same curve on Paris 4 / 0139 (then a gap-calibrated lookup could check counts); until then
+counting is a model problem (labels on more scrolls).
+
+## Pod B rounds: 0332 count-rescale arms and the 1667 rhocal A/B, rhocal REJECTED by GT (2026-11-17/18, podunroll + fix0332, branch podun-20261118)
+
+**Verdict first:** rhocal made 1667 worse on ground truth (GT ids 0.831 -> 0.50-0.59 with u1 fields, 0.669 -> 0.31-0.52 with pab), and the
+CT peak count it calibrates against reads 0.56-2.21 peaks per GT sheet depending on the spacing (see the next section and "GT scoring"
+below). Every "improvement" in the tables here (merges -> 0, CT peaks per turn -> 1) is in the wrong direction on 1667; read them as the
+record of a refuted method, not as gains.
+
+Pod B: RTX PRO 4000 Blackwell 24 GB (sm_120), cgroup 10.2 CPUs / 31 GB, 200 GB container disk; CT from dl.ash2txt, no labels on the pod.
+Fields at 640/64 (try9-era `pab-base` step 8690 with `--ema 0`, sha1 2de1ef9e; u1 step 13000 raw snap, weights-only, sha1 0d056422),
+`CLEAN=0`, dir -1 for both scrolls, `CFMEM=20` (count-field's re-solve was OOM-killed under a 20 GB cap at the default 24). Arms reuse
+the base run's fields by symlink plus the prep/fields/rectosp `.done` markers. The pod was stopped by the user 11-18 08:43 UTC; the
+container disk went with it (see "lost" below).
+
+**0332 count rescale (pab-base fields; `REFX` on the ref; UPTO=wraps).** "body drift" = check's along-sheet excursion over the body bands
+(`z drift body`), "peaks/turn" = CT papyrus peaks per fitted turn (wrap-check), pass = share of the 48 qa tiles passing conf_lo <= 0.4,
+pw48 <= 0.1 and w4 >= 0.8 together (k1.0 / rr1h: dense qa, 100k tiles). Wall per arm 714-1800 s (the dense qa takes ~20 min of it).
+
+| arm | REFX | real / dup / merged | body drift | along-sheet (end) | peaks/turn | rct median | wraps | pass |
+|---|---|---|---|---|---|---|---|---|
+| k1.0 | `--rho-solve 1.0` (base) | 55 / 7 / 3 | 0.29 | 0.62 (+1.73) | 1.176 | 1.212 | 64 | 0.092 (dense) |
+| k1.3 | `--rho-solve 1.3` | 73 / 8 / 0 | 0.56 | 0.83 (+1.53) | 0.942 | 0.949 | 81 | (dense) |
+| rr1h | `--rho-r` K(r) from k1.0's bands, milder (1.09-1.40, 0.96 outside) | 67 / 7 / 0 | 0.38 | 0.68 (+1.13) | 1.026 | 1.047 | 73 | 0.062 (dense) |
+| rr1 | `--rho-r` K(r) from k1.0's bands (1.14-1.62, 0.94 outside) | 72 / 7 / 0 | 0.49 | 0.82 (+1.23) | 0.958 | 0.972 | 77 | 0.062 |
+| k1.15 | `--rho-solve 1.15` | 64 / 7 / 2 | 0.52 | 0.89 (+1.55) | 1.044 | 1.061 | 72 | 0.083 |
+| k1.2 | `--rho-solve 1.2` | 65 / 9 / 2 | 0.33 | 0.80 (+1.56) | 1.006 | 1.021 | 76 | 0.146 |
+| ph25k12 | k1.2 + `--phase-w 0.25 --wide 100,140 --wide-phase 15` | 68 / 9 / 0 | 0.25 | 0.56 (+1.08) | 0.990 | 1.004 | 76 | 0.042 |
+
+Every rescale removes the merges and brings CT peaks per turn from 1.18 to ~1.0; radial (rr1h) and global (k1.2) tie on counting, so the
+1667 round tests a global rhocal too. By fix0332's pick rule (dup+merged <= 10, body drift <= 0.44, peaks/turn closest to 1) the best are
+ph25k12 and rr1h; the dense-qa reruns of those two were dropped (lead: the 48-tile qa is enough). test_unet~narrow at master f69cebd9
+passed 2/2 on this card (the RTX PRO fault fixed in ab60f6ba).
+
+**1667 rhocal A/B (rhocal-20261117: 9dc69bd1 binary, scripts 9dc69bd1 -> d502d788 -> 8c9d5300; RHOCALG 1.3; UPTO=check; no GT on the
+pod).** rhocal = wrap-check `--bands` of the ref -> count-field `--rho-r K(r)` re-solve from a `--pool-split` cache, up to 3 passes,
+kept only if dup+merged and the body drift do not get worse (+0.15). rc = radial K(r), rcg = `RHOCALMODE=global`, rcf = rc with
+`RHOCALMIN=0.95`; the later runs of each field set copy the first rhocal run's `rhocal/pool*` (passes ~60 s instead of ~7 min).
+rhocal triples are dup+merged / body drift / CT peaks per turn as rhocal scores them (wrap-check + cf-demod of the ref model).
+
+| run | rhocal passes | rhocal decision | check: real / dup / merged | body drift | wall |
+|---|---|---|---|---|---|
+| def-u1 | — (plain: 21 / 0.71 / 1.472) | — | 33 / 6 / 12 | 0.71 | 735 s |
+| rc-u1 | 8/0.73/1.271, 9/0.75/1.244, 10/0.79/1.237 | it3 (K 1.60 at r <= 8.5, 1.437 beyond) | 52 / 12 / 0 | 0.79 | rhocal 579 s, slabs..check 316 s |
+| rcg-u1 | 10/0.87/1.288, 11/0.85/1.225, 11/0.85/1.225 | it3 (K 1.60) | 52 / 13 / 0 | 0.85 | rhocal 215 s, 319 s |
+| rcf-u1 | 8/0.73/1.269, 9/0.75/1.244, converged | it2 | 52 / 12 / 0 | 0.75 | rhocal 148 s, 319 s |
+| def-pab | — (plain: 18 / 1.35 / 1.465) | — | 35 / 4 / 10 | 1.35 (DRIFTWARN ALARM) | 724 s |
+| rcg-pab | 7/1.72/1.242, 8/1.86/1.100, 8/1.86/1.100 | DEFAULTED (drift +0.51) | 34 / 4 / 11 | 1.35 | rhocal 589 s |
+| rc-pab | 7/1.74/1.238, 7/1.62/1.149, 7/1.58/1.157 | DEFAULTED (drift +0.23) | 35 / 4 / 10 | 1.35 | rhocal 208 s |
+| rcf-pab | as rc-pab | DEFAULTED | 35 / 4 / 10 | 1.35 | rhocal 209 s |
+
+- u1: the calibrated refs turn 12 merges into 0 and 33 real wraps into 52, at +0.04..+0.14 body drift and twice the dups; K sits at the
+  RHOCALMAX 1.6 cap in most bands and CT peaks per turn stays ~1.23, so on 1667 the cap binds (or the CT over-reads; fix0332's GT test
+  below decides which). The floor (rcf) changed nothing here: no band wanted K < 0.95.
+- pab: every calibrated pab ref drifts more (1.58-1.86 vs 1.35), so all three fell back; the pab fields' 1667 ref already carries the
+  DRIFTWARN alarm.
+- **Bug found**: rhocal picked its last pass with `ls -d $O/rhocal/it* | sort -V | tail -1`, which also matches `itN.bands.tsv` (sorts
+  after `itN`), so every accepted calibration moved the bands tsv into `ref-cf` as a plain file and all slab fits refused it (all three
+  u1 rc runs failed at slabs). Fix: match directories only (`it[0-9]*/`). The three runs were recovered on the pod by moving the tsv back
+  and `rhocal/itN` in as ref-cf (rhocal/ref0.model present, so rhocal skips) and resuming at slabs; the table's u1 check numbers are those.
+  The DEFAULTED message also names dup+merged when only the drift test fired.
+
+**Lost / kept.** Pod B dropped (user stop) while the recovered u1 runs were being synced: rcg-u1 / rcf-u1 joined + check logs, the rest of
+rc-u1's joined and qa, and def-pab's fields/lat are gone. On the desk, `/vesuvius/ufsm/podun/PHerc1667-rhocal/<TAG>/`: every run's
+progress.log and logs, the def / pab joined + check, all rhocal/itN models, def-u1's fields/lat (rsp links repointed to ../lat/X), rc-u1's
+partial joined (PARTIAL.txt); the 0332 arm diags in `/vesuvius/ufsm/podun/PHerc0332-try9b/`.
+
+**GT scoring (fix0332, desk; the GT codes never left the desk).** gtboxes (fit --model --codes, the 54 non-noise 1667 wbench boxes, 2.31e9
+labelled voxels) on every ref model, ids right / |err| < 0.08: def-u1 ref 0.831 / 0.241 (joined 0.853 / 0.334); rc-u1 it1 / it2 / it3 0.581
+/ 0.526 / 0.517; rcf-u1 it1 / it2 0.581 / 0.526; rcg-u1 it1 / it2 0.592 / 0.501; def-pab ref 0.669 / 0.172 (joined 0.699 / 0.238); rc-pab
+it1 / it3 0.523 / 0.376; rcg-pab it1 / it3 0.491 / 0.305. Each further pass is worse. wrap-check --gt-int --ct --codes on def-u1's ref
+(55386 intervals between consecutive GT sheets), per GT turn: fit 1.024, density 1.22, network phase 0.93, CT peaks 1.54 (by radius
+1.96 / 1.97 / 1.65 / 1.62 / 1.41 / 1.19 / 0.93 for 0-2 .. 12-14 mm; by GT gap 0.56 (< 70 um) .. 1.04 (115-130) .. 2.21 (> 230)). So u1
+counts 1667 right and the CT over-reads it: the "cap binds" reading above is wrong, rhocal pushed K the wrong way.
+
 ## The fields head on the tensor cores: predict's per-z fp32 head 17.9 -> 6.2 ms a window, near-identical (2026-11-17, branch convktch-20261117)
 
 Predict's per-z fp32 fields head (lp_conv1_fwd_mx_r, > 16 outputs from MX-fp4 channels) ran conv1_mx_tv_k, FFMA passes of 16 outputs.
@@ -536,6 +638,9 @@ lossless encoder came in between): rebuild both sides of an A/B from one source.
 the fast tier is the gate, not the timing run.
 
 ## PHerc0332: try9 undercounts 20 %, u1's z drift is the top 5 mm; count-field --rho-r (2026-11-17, branch fix0332-20261117)
+
+(Corrected 11-18, see "rhocal" above: the counting conclusions here used CT peaks per turn, which 1667 GT shows is no counting reference;
+the pw48 / w4 claim is withdrawn; the broken top end and the body / end drift split stand.)
 
 0332 has no winding labels (0.1 % fibre-hf only), so every net is out of domain there; no GT, so the objectives are wrap-check
 (CT papyrus peaks per fitted turn, rct = fit gap / local CT peak spacing, verdicts), unroll-qa tile pass and the check stage's
