@@ -34,6 +34,11 @@ conv with GN on load) ~1/5, k_gnpart + k_gn_apply ~1/7, k_dfc1 ~1/14, k_dattn ~1
   occupancy x per-tile cost). ncu showed the 24^2 x 320 layer at 108 blocks on 72 slots (1.5 waves, tensor pipe 77 % active) and 12^2
   at 27 blocks; XMX_IGBENCH: 24^2 -11 %, 12^2 -29 %, 12^2 x 1280 -25 %, byte-identical, but those layers are ~10 % of conv_igemm and
   the in-situ A/B (3 pairs, normalised by k_gnpart) showed no gain beyond the +-3 % noise of the shared card.
+- GN kernels are at the memory roofline (ncu in situ: k_gn_apply 80-92 % of memory throughput, the large k_gnpart ~69 %). Parked
+  (branch convkgn-20261117): the first GN of each Reader residual block applied inside c2's conv_igemm A staging (in place in smem after
+  cp.async, k_gn_apply's expression): byte-identical (test_xmx gna, w035 0 px), k_gn_apply -30 %, but conv_igemm +23 %: a 3x3 conv
+  stages every input 9 times (K = 9 Ci), so the apply runs 9x. A register-path (ld.global + transform + st.shared) form was the same.
+  Left: the stats as deterministic per-block partials in the producer's epilogue (a different summation order: near-identical).
 ## Production ink = reader3 (INKMODE=r3, the default); inkpod parked: memorisation, not labels (2026-11-17, branch inkr3-20261117)
 
 User decision 11-17: the latent ink head (inkpod) is not used in production until it is retrained. On the 1667 held-out regions it
