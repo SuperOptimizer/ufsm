@@ -1186,15 +1186,33 @@ static int pred_view_set(unet *u, const int64_t o[3], int Wz, int W) {   /* the 
 
 /* predict --tta: one augmented pass of a window (src/tta.h): the saved CT window through T into the network's input buffer, the
    mirrored axis rows, the forward, the logits back through T (in place); returns them */
-typedef struct { unet *u; uint8_t *ctd; const uint8_t *ctsave; float mean, isd; const float *dyo, *dxo; float *dyt, *dyd; int axis; shape5 xs; int h16, D, W, nch, ch_normal; } tta_ctx;
+/* A latent-grid net (lat != 0: half_res 3, the direct cell input nn_lat_pred_input[_c], fit fields from the full-resolution fp16 planes lgf,
+   no sub-cell guide or the 64-term one): the transformed CT window into the cell input x2 (and the skip mask from it), the trunk, the
+   heads upsampled into lgf as in the plain pass (nch planes, fp16), back through T. */
+static int g_tta_ord[TTA_MAX];   /* the pass codes (tta_order; UFSM_TTA_ORDER) */
+typedef struct { unet *u; uint8_t *ctd; const uint8_t *ctsave; float mean, isd; const float *dyo, *dxo; float *dyt, *dyd; int axis; shape5 xs; int h16, D, W, nch, ch_normal;
+                 int lat, latc, lguide, cout, skw, skip_nl, skip_thr, skip_margin; const float *lbas, *lgain; float lstep; void *x2; float **lgfp; shape5 xn; } tta_ctx;
 static const float *tta_pass(const tta_ctx *T, int code) {
     nn_tta_ct(T->ctsave, T->ctd, T->D, T->W, code);
     if (g_pv) { nn_tta_ct(g_pvsave, g_pvd, g_pvP, g_pvP, code); unet_set_attn_view(T->u, g_pvd, 1); }   /* (the view crop through the same T) */
     tta_axis(code, T->D, T->W, T->dyo, T->dxo, T->dyt, T->dyt + T->W);
     nn_h2d(T->dyd, T->dyt, 2 * (size_t)T->W * sizeof(float));
     pred_axis(T->u, T->axis != 0, T->D, T->dyt, T->dyt + T->W);
-    const float *lg = unet_forward_ct(T->u, T->ctd, T->mean, T->isd, T->dyd, T->dyd + T->W, T->axis, T->xs, T->h16);
-    const int lh = unet_logits_h16(T->u); nn_set_logits_h16(lh);
+    const float *lg; int lh;
+    if (T->lat) {
+        if (T->latc) nn_lat_pred_input_c(T->ctd, T->D, T->W, T->mean, T->isd, T->dyd, T->dyd + T->W, T->axis, T->lbas, T->lgain, T->latc, T->lstep, T->x2);
+        else nn_lat_pred_input(T->ctd, T->D, T->W, T->mean, T->isd, T->dyd, T->dyd + T->W, T->axis, T->x2);
+        if (T->skw) nn_skip_build(T->ctd, T->D, T->W, T->W, 4, T->skip_nl, T->skip_thr, T->skip_margin);
+        const float *l2 = unet_forward_x(T->u, T->x2, T->xn, 0, T->h16);
+        if (T->skw) nn_skip_off();
+        const int l2h = unet_logits_h16(T->u), c4 = T->W / 4;
+        if (T->lguide == 64) {
+            nn_lat_up_slab(l2, l2h, 11, c4, c4, c4, 0, T->W, *T->lgfp);
+            nn_lat_shuffle(l2, l2h, c4, c4, c4, T->cout - 128, 2, 0, T->W, *T->lgfp);
+        } else nn_lat_up_slab(l2, l2h, T->cout, c4, c4, c4, 0, T->W, *T->lgfp);
+        lg = *T->lgfp; lh = 1;
+    } else { lg = unet_forward_ct(T->u, T->ctd, T->mean, T->isd, T->dyd, T->dyd + T->W, T->axis, T->xs, T->h16); lh = unet_logits_h16(T->u); }
+    nn_set_logits_h16(lh);
     int src[32], sgn[32]; tta_channels(code, T->ch_normal, T->nch, src, sgn);
     nn_tta_logits((void *)lg, lh, T->D, T->W, code, T->nch, src, sgn);
     return lg;
@@ -1568,6 +1586,10 @@ static int predict_one(int argc, char **argv) {
     long skip_wins = 0, skip_zero = 0, skip_masked = 0, skip_calls = 0; double skip_share0 = 0;
     const int fea = opt_atoi("--feather", opt(argc, argv, "--feather", "0"));   /* --feather B (above) */
     if (tta < 1 || tta > TTA_MAX) { fprintf(stderr, "predict: --tta 1..%d\n", TTA_MAX); return 2; }
+    /* UFSM_TTA_ORDER=c1,c2,... (tests): the codes of passes 1.. (pass 0 is the plain window) instead of tta.h's order; "0" repeats the
+       identity through the augmented-pass path (test_tta_lat: --tta 2 with order 0 == --tta 1, byte for byte) */
+    for (int k = 0; k < TTA_MAX; k++) g_tta_ord[k] = tta_order[k];
+    if (getenv("UFSM_TTA_ORDER")) { const char *e = getenv("UFSM_TTA_ORDER"); for (int k = 1; k < TTA_MAX && *e; k++) { g_tta_ord[k] = (int)strtol(e, (char **)&e, 10); if (*e == ',') e++; else break; } }
     if (tta > 1 && ffct) { fprintf(stderr, "predict: --tta with --fit-ct is not supported (the CT planes pool one pass); add them later with ufsm ct-fields\n"); return 2; }
     float q = (float)opt_atof("--q", opt(argc, argv, "--q", "8"));
     const int iso = opt_atoi("--iso", opt(argc, argv, "--iso", "0"));   /* the void cutoff: probability outputs 0 where CT < iso (the fit keeps CT > 0) */
@@ -2229,7 +2251,7 @@ static int predict_one(int argc, char **argv) {
     if (headz) fprintf(stderr, "predict: --fit-zarr: the head per z chunk (no whole-window logits; UFSM_PRED_HEADZ=0: them)\n");
     float *hzb[2] = {nullptr, nullptr}; int hzi = 0, hzq0 = 0, hzv = 0, hzcap = 0;   /* headz: the chunk's cell logits, planes [hzq0, hzq0 + hzv) of hzb[hzi] (channel stride hzcap planes) */
     const int ct_stem = unet_ct_stem(u);   /* unet_forward_ct: no 16-bit input */
-    int gdir = 0, fzs = 0, fzl = 0;   /* (fzl: the fused fit kernel, nn_fit_accum_lat; UFSM_PRED_FIT_FUSED=0 the plane path) the guided head's direct rv bytes (nn_lat_place_rvg); fit fields from a latent-grid net in z-chunk slabs */
+    int gdir = 0, fzs = 0, fzl = 0, tta_lat = 0;   /* (fzl: the fused fit kernel, nn_fit_accum_lat; UFSM_PRED_FIT_FUSED=0 the plane path) the guided head's direct rv bytes (nn_lat_place_rvg); fit fields from a latent-grid net in z-chunk slabs */
     void *fzA = nullptr, *fzB = nullptr, *fzX = nullptr, *fzW = nullptr; int fzP = 0;
     int fsup_on = !(getenv("UFSM_PRED_FSUP") && *getenv("UFSM_PRED_FSUP") == '0');   /* the fused head slab (UFSM_PRED_FSUP=0: the three kernels) */   /* fzW: the fused kernel's winding-pair planes (UFSM_PRED_FIT_W4P) */
     const int fzw4p = !getenv("UFSM_PRED_FIT_W4P") || ufsm_env_on("UFSM_PRED_FIT_W4P");
@@ -2293,7 +2315,11 @@ static int predict_one(int argc, char **argv) {
             lvm = 1; lv_stride = lvc->C + 1; lz_d = nn_malloc(w3 / 64 * lv_stride);
         }
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
-        if (tta > 1 && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) { fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs)\n"); return 2; }
+        /* --tta on a latent-grid net: the direct cell input, the fit fields from the whole-window planes (fzs is off with --tta), cube windows */
+        tta_lat = half == 3 && latin && ffd && ct_shared && Wz == W && !(W % 4) && (!cfg.lat_guide || cfg.lat_guide == 64) && !cfg.fstem && !degrade && !auxz && !lat_store && !fzs;
+        if (tta > 1 && !tta_lat && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) {
+            fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs) or a latent-grid net's direct cell input with fit fields and cube windows\n"); return 2; }
+        if (tta > 1 && tta_lat) fprintf(stderr, "predict: --tta %d on the latent-grid net: the CT window through each symmetry into the cell input, the fit fields from the whole-window planes\n", tta);
     }
     int64_t ns[3];
     for (int d = 0; d < 3; d++) ns[d] = (bn[d] + shard - 1) / shard;
@@ -2956,8 +2982,11 @@ static int predict_one(int argc, char **argv) {
             /* --tta: the CT window kept for the augmented passes (g_ps: reset per box) */
             if (tta > 1 && !g_ps.ctsave) { g_ps.ctsave = nn_malloc(w3); g_ps.dyt = malloc(2 * (size_t)W * sizeof(float)); if (!g_ps.ctsave || !g_ps.dyt) { fprintf(stderr, "predict: no memory for --tta\n"); return 1; } }
             if (tta > 1) nn_d2d(g_ps.ctsave, ctd, w3);
-            const tta_ctx TC = {.u = u, .ctd = ctd, .ctsave = g_ps.ctsave, .mean = (float)mean, .isd = (float)(1.0 / sd), .dyo = dyo, .dxo = dxo, .dyt = g_ps.dyt, .dyd = dyd,
-                                .axis = ax.n > 0 ? (int)radial_sign : 0, .xs = xs, .h16 = h16, .D = Wz, .W = W, .nch = ffd ? cfg.cout : 1, .ch_normal = ffd ? ff_nrm : -1};   /* (without fit fields the head computes only the written, scalar channel) */
+            tta_ctx TC = {.u = u, .ctd = ctd, .ctsave = g_ps.ctsave, .mean = (float)mean, .isd = (float)(1.0 / sd), .dyo = dyo, .dxo = dxo, .dyt = g_ps.dyt, .dyd = dyd,
+                                .axis = ax.n > 0 ? (int)radial_sign : 0, .xs = xs, .h16 = h16, .D = Wz, .W = W, .nch = ffd ? (tta_lat && cfg.lat_guide == 64 ? 11 : cfg.cout) : 1, .ch_normal = ffd ? ff_nrm : -1,
+                                .lat = tta_lat, .lguide = cfg.lat_guide, .cout = cfg.cout, .skw = skip_empty && half == 3 && gpath && !lat_store && !lvq, .skip_nl = skip_nl, .skip_thr = skip_thr,
+                                .skip_margin = skip_margin, .x2 = x2, .lgfp = &lgf, .xn = xn};   /* (without fit fields the head computes only the written, scalar channel; lgf: allocated at the first window's forward) */
+            TC.latc = tta_lat ? unet_lat_basis(u, &TC.lbas, &TC.lgain, &TC.lstep) : 0;
             if (ct_shared && ctmi != ctm) nn_pred_ctmask_t(ctd, w3, ctmi, iso);
             if (ctcp && ct_shared) nn_d2d_async(ctcp, ctd, w3);   /* --fit-ct reads the CT after the forward */
             if (sheet_task) {
@@ -3071,7 +3100,7 @@ static int predict_one(int argc, char **argv) {
                 nn_fit_accum_cs(lg, ctk, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, ff_nrm, ff_den, ffds, ffdc, (float)(um * (1 << level)), ffacc + 13 * ffn);
             }
             if (ffd && !ffzm) for (int p = 1; p < tta; p++) {   /* --tta: the other passes into the same accumulators */
-                lg = tta_pass(&TC, tta_order[p]);
+                lg = tta_pass(&TC, g_tta_ord[p]);
                 nn_fit_accum_dm(lg, ctd, ctm, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, ff_rec, ff_ph, ff_nrm, ff_den, ffds, ffdc, ffacc);
                 if (ffw4d) nn_fit_accum_w4(lg, ctd, ctm, Wz, W, hz, halo, (int)tz, (int)ty, (int)tx, ffbox, ffh, ffF, ff_w4, ffw4d, ffacc4);
             }
@@ -3213,7 +3242,7 @@ static int predict_one(int argc, char **argv) {
                                             (float)(um * (1 << level)), ffacc + 13 * nl);
                         }
                         for (int p = 1; p < tta; p++) {   /* --tta: the other passes (one chunk: the whole interior) */
-                            lg = tta_pass(&TC, tta_order[p]);
+                            lg = tta_pass(&TC, g_tta_ord[p]);
                             nn_fit_accum_dm(lg, ctd, ctm, Wz, W, hz, halo, (int)(tz - cz * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz, ff_rec, ff_ph, ff_nrm, ff_den, ffds, ffdc, ffacc);
                             if (ffw4d) nn_fit_accum_w4(lg, ctd, ctm, Wz, W, hz, halo, (int)(tz - cz * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz, ff_w4, ffw4d, ffacc4);
                         }
@@ -3236,7 +3265,7 @@ static int predict_one(int argc, char **argv) {
                 if (!g_ps.tacc && !(g_ps.tacc = nn_malloc_try(w3 * 2))) { fprintf(stderr, "predict: --tta: no device memory for the accumulator (%.2f GB)\n", w3 * 2 / 1e9); return 1; }
                 const int lh0 = unet_logits_h16(u);
                 nn_tta_pacc(lg, lh0, w3, g_ps.tacc, 1);
-                for (int p = 1; p < tta; p++) { lg = tta_pass(&TC, tta_order[p]); nn_tta_pacc(lg, unet_logits_h16(u), w3, g_ps.tacc, 0); }
+                for (int p = 1; p < tta; p++) { lg = tta_pass(&TC, g_tta_ord[p]); nn_tta_pacc(lg, unet_logits_h16(u), w3, g_ps.tacc, 0); }
                 nn_tta_pmean((void *)lg, unet_logits_h16(u), w3, g_ps.tacc, tta);
                 nn_set_logits_h16(unet_logits_h16(u));
             }
