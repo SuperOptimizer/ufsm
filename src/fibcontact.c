@@ -137,7 +137,7 @@ int cmd_fiber_contacts(int argc, char **argv) {
     const double sc = ldexp(1.0, level);
     afv *A = afv_open(afp); if (!A) return 1;
     /* totals: contacts by gap bucket x (s_rad > 0) x dW in {-1, 0, +1, other}; also by s_gt */
-    static long T[2][NG + 1][2][4]; long mfn[NG + 1][2] = {{0}}; long fam_side[2][3] = {{0}}; float *tl[2] = {nullptr, nullptr}; size_t ntl[2] = {0}, ctl[2] = {0};
+    long T[2][NG + 1][2][4] = {{{{0}}}}; long mfn[NG + 1][2] = {{0}}; long fam_side[2][3] = {{0}}; float *tl[2] = {nullptr, nullptr}; size_t ntl[2] = {0}, ctl[2] = {0};
     char *nl = strdup(names);
     for (char *bn = strtok(nl, ","); bn; bn = strtok(nullptr, ",")) {
         FILE *bf = fopen(btp, "r"); if (!bf) return 1; char line[1024]; int64_t bo[3] = {0}, bs[3] = {0}; int found = 0;
@@ -254,7 +254,7 @@ int cmd_fiber_contacts(int argc, char **argv) {
     for (int f = 0; f < 2; f++) { const long n = fam_side[f][0] + fam_side[f][1] + fam_side[f][2]; if (!n) continue; qsort(tl[f], ntl[f], sizeof *tl[f], cmp_f);
         printf("%c: %ld fibres: inward (< -0.5) %.3f, mid %.3f, outward (> 0.5) %.3f; median %.2f, q25 %.2f, q75 %.2f\n", "HV"[f], n, (double)fam_side[f][0] / n, (double)fam_side[f][1] / n, (double)fam_side[f][2] / n,
                tl[f][ntl[f] / 2], tl[f][ntl[f] / 4], tl[f][3 * ntl[f] / 4]); free(tl[f]); }
-    static const char *GN[NG + 1] = {"<50um", "50-70", "70-100", "100-150", ">=150", "nogap"};
+    static const char *const GN[NG + 1] = {"<50um", "50-70", "70-100", "100-150", ">=150", "nogap"};
     for (int o = 0; o < 2; o++) {
         printf("\n(2) H -> V contacts by the GT gap on V's side, order by %s: n(V outward / inward) x GT dW (-1 0 +1 other); mf-flagged share\n", o ? "the GT normal (oracle)" : "the radial direction (no GT)");
         printf("gap\tn\tout:-1\tout:0\tout:+1\tout:oth\tin:-1\tin:0\tin:+1\tin:oth\tmf179\n");
