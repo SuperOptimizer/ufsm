@@ -509,7 +509,7 @@ void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
    fwd: rows (o * ld + n, o < 64 ng, n over nq planes of h x w cells) += W2 silu(pre + B * L) (pre: Hd rows, stride ldp; L: nq + 2 planes from
    the plane before), fp16 or fp32 (r32 / p32); p = B [Cl][27][Hd], W2 [64 ng][Hd]. bwd: from gy16 (the rows' fp16 gradient, stride ldg) the
    pre rows' gradient into gpre16 (fp16, stride ldg) and B / W2's gradients added to gp (deterministic sums; x 1 / the head plane scale).
-   1: a shape the kernels do not take (Hd 16 / 32 / 64, Cl <= 64, 64 ng <= 256) */
+   1: a shape the kernels do not take (Hd 16 / 32 / 64, Cl <= 64, ng <= 16) */
 void nn_latdec_cells(const void *x16, int D, int H, int W, int q0, int nq, const float *bas, const float *gain, int Cl, float step, float *L);
 int nn_latdec_fwd(void *rows, int r32, size_t ld, const void *pre, int p32, size_t ldp, const float *L, int nq, int h, int w, const float *p, int Hd, int Cl, int ng);
 size_t nn_latdec_scratch(size_t N, int Hd, int Cl, int ng);

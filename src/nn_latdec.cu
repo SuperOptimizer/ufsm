@@ -12,7 +12,7 @@
    (written as fp16 rows for the head's backward), and B / W2's gradients reduced over the cells in a fixed order (no float atomics). */
 #include "nn_common.cuh"
 
-enum { LD_TC = 32, LD_NT = 128, LD_HS = 65, LD_GA = 32, LD_GN = 32, LD_CH = 4096 };
+enum { LD_TC = 32, LD_NT = 128, LD_HS = 65, LD_GA = 32, LD_GN = 32, LD_CH = 4096, LD_OC = 128 };
 
 /* the cells' latent input: L [Cl][nq][h][w] fp32 for cell planes [q0, q0 + nq) of a D x H x W fp16 window (planes outside: 0) */
 __global__ void latdec_cells_k(const f16 *__restrict__ x, int D, int H, int W, int q0, int nq, const float *__restrict__ bas, const float *__restrict__ gain,
@@ -96,18 +96,23 @@ __global__ void __launch_bounds__(LD_NT) latdec_bwd_k(const f16 *__restrict__ gy
     const int q = blockIdx.z, y = blockIdx.y, x0 = blockIdx.x * LD_TC, cell = threadIdx.x & (LD_TC - 1), g = threadIdx.x / LD_TC, k0 = g * KG, x = x0 + cell;
     const bool ok = x < w; const size_t n = ((size_t)q * h + y) * w + x;
     ld_stage(L, nq, h, w, q, y, x0, Cl, Ls);
-    for (int o = g; o < no; o += 4) dys[cell * (no + 1) + o] = ok ? __half2float(gy[(size_t)o * ldg + n]) : 0.f;
     __syncthreads();
-    if (!ok) return;
     float acc[KG], dh[KG];
     ld_conv<KG>(Ls, B, Hd, Cl, cell, k0, acc);
 #pragma unroll
     for (int i = 0; i < KG; i++) dh[i] = 0.f;
-    for (int o = 0; o < no; o++) {
-        const float d = dys[cell * (no + 1) + o]; const float4 *w4 = (const float4 *)(W2 + (size_t)o * Hd + k0);
+    for (int oc = 0; oc < no; oc += LD_OC) {   /* the rows' gradient in chunks of LD_OC outputs through shared memory (--lat-sub: up to 1024) */
+        const int nc = no - oc < LD_OC ? no - oc : LD_OC;
+        __syncthreads();
+        for (int o = g; o < nc; o += 4) dys[cell * (LD_OC + 1) + o] = ok ? __half2float(gy[(size_t)(oc + o) * ldg + n]) : 0.f;
+        __syncthreads();
+        for (int o = 0; o < nc; o++) {
+            const float d = dys[cell * (LD_OC + 1) + o]; const float4 *w4 = (const float4 *)(W2 + (size_t)(oc + o) * Hd + k0);
 #pragma unroll
-        for (int i = 0; i < KG / 4; i++) { const float4 a = __ldg(w4 + i); dh[4 * i] += a.x * d; dh[4 * i + 1] += a.y * d; dh[4 * i + 2] += a.z * d; dh[4 * i + 3] += a.w * d; }
+            for (int i = 0; i < KG / 4; i++) { const float4 a = __ldg(w4 + i); dh[4 * i] += a.x * d; dh[4 * i + 1] += a.y * d; dh[4 * i + 2] += a.z * d; dh[4 * i + 3] += a.w * d; }
+        }
     }
+    if (!ok) return;
 #pragma unroll
     for (int i = 0; i < KG; i++) {
         const int k = k0 + i; const float p = acc[i] + __half2float(pre[(size_t)k * ldp + n]), sg = 1.f / (1.f + __expf(-p)), dp = dh[i] * sg * (1.f + p * (1.f - sg));
@@ -156,8 +161,8 @@ __global__ void latdec_red_k(const float *__restrict__ part, int nch, size_t npa
     gp[i] += (hp ? hp[1] : 1.f) * s;   /* (hp: the head plane scale out, a power of two) */
 }
 
-static size_t ld_smem(int Cl, int no, int bwd) { return sizeof(float) * ((size_t)Cl * 9 * (LD_TC + 2) + (bwd ? (size_t)LD_TC * (no + 1) : (size_t)LD_TC * LD_HS)); }
-static int ld_ok(int Hd, int Cl, int no) { return (Hd == 16 || Hd == 32 || Hd == 64) && Cl >= 1 && Cl <= 64 && no >= 1 && no <= 256 && ld_smem(Cl, no, 1) <= 99 * 1024 && ld_smem(Cl, no, 0) <= 99 * 1024; }
+static size_t ld_smem(int Cl, int no, int bwd) { return sizeof(float) * ((size_t)Cl * 9 * (LD_TC + 2) + (bwd ? (size_t)LD_TC * (LD_OC + 1) : (size_t)LD_TC * LD_HS)); }
+static int ld_ok(int Hd, int Cl, int no) { return (Hd == 16 || Hd == 32 || Hd == 64) && Cl >= 1 && Cl <= 64 && no >= 1 && no <= 1024 && ld_smem(Cl, no, 1) <= 99 * 1024 && ld_smem(Cl, no, 0) <= 99 * 1024; }
 static void ld_attr(const void *k, size_t sm) { if (sm > 48 * 1024) cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024); }
 extern "C" void nn_latdec_cells(const void *x16, int D, int H, int W, int q0, int nq, const float *bas, const float *gain, int Cl, float step, float *L) {
     const size_t nc = (size_t)nq * (H / 4) * (W / 4); if (!nc) return;

@@ -4064,7 +4064,7 @@ int cmd_train(int argc, char **argv) {
     if (g_lat_dec) {   /* the learned sub-cell decoder (unet_cfg.lat_dec, src/nn_latdec.cu): a nonlinear term on the sub-cell rows from the trunk and the latent cells */
         const int raw = opt_atoi("--lat-dec-raw", opt(argc, argv, "--lat-dec-raw", "0"));
         if ((g_lat_dec != 16 && g_lat_dec != 32 && g_lat_dec != 64) || !g_lat || g_lat_guide != 64 || B != 1 || split) { fprintf(stderr, "--lat-dec 16 / 32 / 64: --lat 4 --lat-guide 3, --B 1, no --split\n"); return 2; }
-        cfg.lat_dec = g_lat_dec; cfg.lat_dec_raw = raw != 0; cfg.lat_dec_ng = 2;
+        cfg.lat_dec = g_lat_dec; cfg.lat_dec_raw = raw != 0; cfg.lat_dec_ng = LSUBN;   /* (every --lat-sub group: the last 64 LSUBN head rows) */
         fprintf(stderr, "sub-cell decoder: %d silu features per cell from the trunk and the %s of the 3^3 neighbour cells into the %d sub-cell rows (W2 0: the linear head at start)\n",
                 g_lat_dec, raw ? "64 voxels" : "latent coefficients", 64 * cfg.lat_dec_ng);
     }

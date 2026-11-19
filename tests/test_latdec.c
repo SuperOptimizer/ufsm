@@ -1,6 +1,6 @@
 /* nn_latdec_cells / nn_latdec_fwd / nn_latdec_bwd (the learned sub-cell decoder, unet_cfg.lat_dec) against a double host reference on a 12 x 8 x 160
    fp16 window (3 x 2 x 40 cells: two 32-cell row tiles, every face of the 3^3 neighbourhood clipped somewhere), for Hd 16 / 32 / 64, Cl 29
-   (a random basis, step 0.25) and raw (Cl 64), 2 sub-cell groups (128 rows):
+   (a random basis, step 0.25) and raw (Cl 64), 2 sub-cell groups (128 rows) and 7 (--lat-sub rv,fib,ink: 448 rows):
    - the latent cells: quantised as input_latc_k (a rounding tie may flip one step: at most 0.2 % of the values);
    - forward, fp16 and fp32 rows / pre rows: rows += W2 silu(pre + B * L) to fp16 rounding;
    - W2 = 0: the rows byte-identical (+-0 kept: a zero term is never added);
@@ -13,7 +13,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-enum { D = 12, H = 8, W = 160, d = 3, h = 2, w = 40, NG = 2, NO = 128 };
+enum { D = 12, H = 8, W = 160, d = 3, h = 2, w = 40 };
+static int NG = 2, NO = 128;   /* sub-cell groups (--lat-sub: up to 16) */
 static double rnd(uint64_t *s) { *s = *s * 6364136223846793005ull + 1442695040888963407ull; return (double)(*s >> 11) * 0x1p-53 - 0.5; }
 static float h2f(uint16_t v) { _Float16 f; memcpy(&f, &v, 2); return (float)f; }
 static uint16_t f2h(float v) { _Float16 f = (_Float16)v; uint16_t r; memcpy(&r, &f, 2); return r; }
@@ -37,8 +38,8 @@ static void ref_fwd(const double *pre, const float *L, const double *B, const do
 static double ref_loss(const double *pre, const float *L, const double *B, const double *W2, int Hd, int Cl, const double *gy, double *y, double *a, double *hh) {
     ref_fwd(pre, L, B, W2, Hd, Cl, y, a, hh); double s = 0; for (size_t i = 0; i < (size_t)NO * NC; i++) s += gy[i] * y[i]; return s;
 }
-static void run(int Hd, int raw, uint64_t seed) {
-    const int Cl = raw ? 64 : 29; uint64_t s = seed;
+static void run(int Hd, int raw, int ng, uint64_t seed) {
+    const int Cl = raw ? 64 : 29; uint64_t s = seed; NG = ng; NO = 64 * ng;
     const size_t V = (size_t)D * H * W, nB = (size_t)Cl * 27 * Hd, nW2 = (size_t)NO * Hd, NP = nB + nW2, nL = (size_t)Cl * (d + 2) * h * w;
     uint16_t *x = malloc(V * 2); float *bas = malloc(29 * 64 * 4), gain[29];
     for (size_t i = 0; i < V; i++) x[i] = f2h((float)(4 * rnd(&s)));
@@ -144,14 +145,14 @@ static void run(int Hd, int raw, uint64_t seed) {
     for (size_t i = 0; i < nB; i++) { const double e = fabs(g1[i] - gB[i]); if (e > mgB) mgB = e; nbB += e > 1e-3 * (sB + fabs(gB[i])); }
     for (size_t i = 0; i < nW2; i++) { const double e = fabs(g1[nB + i] - gW[i]); if (e > mgW) mgW = e; nbW += e > 1e-3 * (sW + fabs(gW[i])); }
     CHECK(nbp == 0 && nbB == 0 && nbW == 0, "Hd %d raw %d: backward: pre %zu off (max %.3g), B %zu off (max %.3g, mean |g| %.3g), W2 %zu off (max %.3g, mean |g| %.3g)", Hd, raw, nbp, mg, nbB, mgB, sB, nbW, mgW, sW);
-    printf("test_latdec: Hd %2d Cl %2d: forward ok, W2 0 identical, backward max |e| pre %.2g B %.2g W2 %.2g, latent flips %zu\n", Hd, Cl, mg, mgB, mgW, flip);
+    printf("test_latdec: Hd %2d Cl %2d ng %d: forward ok, W2 0 identical, backward max |e| pre %.2g B %.2g W2 %.2g, latent flips %zu\n", Hd, Cl, NG, mg, mgB, mgW, flip);
     nn_free(xd); nn_free(basd); nn_free(gaind); nn_free(Ld); nn_free(pd); nn_free(rd); nn_free(prd); nn_free(gyd_); nn_free(gpd); nn_free(scr);
     free(x); free(bas); free(L); free(p); free(pB); free(pW); free(rows); free(pre); free(gy); free(pred); free(gyd); free(y); free(a); free(hh);
     free(gB); free(gW); free(gpre); free(g1); free(g2); free(g4); free(gp1); free(gp2);
 }
 int main(void) {
     nn_init(0);
-    run(16, 0, 1); run(32, 0, 2); run(64, 0, 3); run(64, 1, 4);
+    run(16, 0, 2, 1); run(32, 0, 2, 2); run(64, 0, 2, 3); run(64, 1, 2, 4); run(32, 0, 7, 5);   /* (7: phase + rv + fibre + ink, 448 rows: the gradient in 4 chunks) */
     if (fails) { fprintf(stderr, "test_latdec: %d failures\n", fails); return 1; }
     printf("test_latdec: ok\n");
     return 0;
