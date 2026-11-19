@@ -161,7 +161,9 @@ static gpu_state *g_G0;   /* the trainer's per-GPU states (an index for per-GPU 
 static const char *g_lat_fit; static int g_lat_fit_n = 24, g_lat_fit_k;   /* --lat-fit FILE [--lat-fit-n N]: fit the cell transform (latfit.h) on N training windows, write it, exit */
 static int g_lat_guide;   /* --lat-guide 1: the guided head (5 coefficient planes for the 2 side-slot channels; nn_lat_guide) */
 #define LBASE (g_cout <= 16 ? 16 : (g_cout + 15) / 16 * 16)   /* --lat-guide 3: the interpolated base outputs (the task's, rounded up to 16; 16 up to 16 outputs: the old 144-output head) */
-#define LNC (g_lat_guide == 64 ? LBASE + 128 : g_lat_guide == 8 ? 32 : g_cout + g_lat_guide)
+static int g_lat_nsub; static int8_t g_lat_sub[16];   /* --lat-sub (2026-11-19): the outputs with sub-cell rows, in row order (0: the phase pair only) */
+#define LSUBN (g_lat_nsub ? g_lat_nsub : 2)
+#define LNC (g_lat_guide == 64 ? LBASE + 64 * LSUBN : g_lat_guide == 8 ? 32 : g_cout + g_lat_guide)
 #define LUPC (g_lat_guide == 64 ? g_cout : LNC)
 static int g_lat_padup;   /* UFSM_LAT_PAD_UP=1: the head slabs upsample / adjoin the --fib-head pad outputs too (their gradient is zero: no effect but time) */
 /* the outputs the head slabs upsample and adjoin: LUPC without the trailing pad outputs [g_pad_ch, g_cout) (no loss, no reader, zero gradient: 9 of 32 for
@@ -234,6 +236,18 @@ static float g_fibn_lambda; static int g_fibn, g_fibn_r = 2, g_fibn_thr = 128, g
    plane of before, with every buffer, upload and planner term unchanged. The unwrap2 fibre head (--fib-head) adds the H and V tube masks
    (targets "fibre_h" / "fibre_v"), streamed with g_fd_r halo planes each side (the direction targets' second moments) */
 static float g_fibh_lambda; static int g_fibh, g_fib_ch = -1, g_pad_ch = -1;   /* g_pad_ch: more than 16 outputs are padded to a multiple of 16 (the 1^3 MX head kernels' passes of 16), outputs [g_pad_ch, g_cout) unsupervised */   /* --fib-head L: the unwrap2 fibre head, channels g_fib_ch: H, V masks, then the direction t t^T (6) and family (V) */
+/* --lat-sub: the sub-cell rows of the outputs after the phase pair (list entries 2 ..), one nn_lat_shuffle(_adj)(_c) per run of consecutive
+   channels; the phase pair keeps its own call (the old layout's bytes). dir 0 adds the terms to the slab planes hs [C][ns], dir 1 writes the
+   planes' gradient into the 16-bit coarse gradient gc. lg / gc hold cell planes [q0, q0 + qd) (qd 0: the whole grid, the non-_c kernels). */
+static void lat_sub_extra(int dir, const void *lg, int lh16, int d, int h, int w, int z0, int nz, void *hs, size_t ns, void *gc, int q0, int qd) {
+    for (int k = 2; k < g_lat_nsub;) {
+        int n = 1; while (k + n < g_lat_nsub && g_lat_sub[k + n] == g_lat_sub[k] + n) n++;
+        void *y = (char *)hs + (size_t)g_lat_sub[k] * ns * 2; const int base = LBASE + 64 * k;
+        if (!dir) { if (qd) nn_lat_shuffle_c(lg, lh16, d, h, w, base, n, z0, nz, y, q0, qd); else nn_lat_shuffle(lg, lh16, d, h, w, base, n, z0, nz, y); }
+        else { if (qd) nn_lat_shuffle_adj_c(y, d, h, w, base, n, z0, nz, gc, q0, qd); else nn_lat_shuffle_adj(y, d, h, w, base, n, z0, nz, gc); }
+        k += n;
+    }
+}
 static int g_naux, g_aux_of[AUX_N] = {-1, -1, -1, -1, -1}, g_aux_role[AUX_N];
 #define IPLANE (g_naux > 0)
 #define AUXH(b, j) ((j) ? (b)->aux[(j) - 1] : (b)->ink)   /* the host plane j of a batch */
@@ -1579,6 +1593,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
         else if (g_lat_hs && g_lat_guide == 64) nn_lat_shuffle_c(d->lgc, 1, D / 4, H / 4, W / 4, LBASE, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2, qa, qb - qa);
         else if (g_lat && g_lat_guide == 64) nn_lat_shuffle(d->lg, unet_logits_h16(d->u), D / 4, H / 4, W / 4, LBASE, 2, z0, nz, (char *)d->hs_lg + (size_t)g_side_ch * ns * 2);   /* the sub-cell head */
         else if (g_lat && g_lat_guide && !fside) LGUIDE(0);   /* --lat-guide: the side channels' sub-cell terms from the CT */
+        if (g_lat_nsub > 2) { if (g_lat_hs) lat_sub_extra(0, d->lgc, 1, D / 4, H / 4, W / 4, z0, nz, d->hs_lg, ns, nullptr, qa, qb - qa);
+                              else lat_sub_extra(0, d->lg, unet_logits_h16(d->u), D / 4, H / 4, W / 4, z0, nz, d->hs_lg, ns, nullptr, 0, 0); }
         if (g_lat_hs) { FT("  u guide / shuffle"); PT("upsample"); }
         if (!fsd && g_fstem && !d->fs_drop && nn_fstem_fwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns)) { fprintf(stderr, "--fstem: slab shape\n"); abort(); }
         if (g_fstem) FT("  u fine stem fwd");
@@ -1732,7 +1748,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 if (b > a) nn_fstem_bwd(d->x, D, H, W, a, b - a, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, (const char *)d->hs_lg + (size_t)(a - z0) * hw * 2, ns, unet_grad_ptr(d->u) + unet_fstem_off(d->u));
             }
             if (g_fstem) FT("  a fine stem bwd");
-            if (g_lat_guide == 64) nn_lat_shuffle_adj_c((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, LBASE, 2, z0, nz, d->latgl, q0, qc);
+            if (g_lat_guide == 64) { nn_lat_shuffle_adj_c((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, LBASE, 2, z0, nz, d->latgl, q0, qc);
+                                     if (g_lat_nsub > 2) lat_sub_extra(1, nullptr, 1, D / 4, H / 4, W / 4, z0, nz, d->hs_lg, ns, d->latgl, q0, qc); }
             else if (g_lat_guide && !fside) LGUIDE(1);
             FT("  a guide / shuffle adjoint");   /* the coefficient planes' gradients (the guided heads: every output is interpolated, all through the fp32 sums) */
             if (fuse) {   /* the fused groups straight from the cell logits (before the slab adjoint takes the normal targets as its scratch) */
@@ -1763,7 +1780,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (pipe) nn_event_record(d->evl_free[sj & 1], 0);
             continue;
         }
-        if (g_lat && g_lat_guide == 64) nn_lat_shuffle_adj((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, LBASE, 2, z0, nz, d->latgl);
+        if (g_lat && g_lat_guide == 64) { nn_lat_shuffle_adj((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, LBASE, 2, z0, nz, d->latgl);
+                                          if (g_lat_nsub > 2) lat_sub_extra(1, nullptr, 1, D / 4, H / 4, W / 4, z0, nz, d->hs_lg, ns, d->latgl, 0, 0); }
         else if (g_lat && g_lat_guide) LGUIDE(1);   /* the coefficient planes' gradients */
         if (g_lat) nn_lat_up_adj(d->hs_lg, LUPN, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab; any channel count: groups of 28) */   /* --lat: the slab's gradient onto the cell grid */
         else { if (d->gc_on) nn_gram16(d->hs_lg, !nn_get_f16(), g_cout, ns, ns, d->gcS);
@@ -3372,6 +3390,32 @@ int cmd_train(int argc, char **argv) {
             if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && pc.half_res == 3) g_lat_guide = pc.lat_guide; }
             if (g_lat_guide == 5 && !g_rv) { fprintf(stderr, "--lat-guide 1: with --rv (the two side channels; --lat-guide 2 for the phase channels)\n"); return 2; }
             if (g_lat_guide == 8 && g_cout > 24) { fprintf(stderr, "--lat-guide 2: at most 24 task outputs\n"); return 2; }
+            {   /* --lat-sub LIST (2026-11-19): more outputs with sub-cell rows after the phase pair (phase always first: its rows keep their place,
+                   so a phase-only donor's head copies by position and the new rows start at zero): rv (the recto / verso pair), fib (the fibre
+                   head's H / V masks), ink, cN (output N). The interpolated 38 um cell value alone cannot put a touching sheet's recto / verso or its
+                   fibre layers on the right voxel (rvsep 11-18: rv flips 0.25, fibre 0.17 per GT turn under 70 um) */
+                const char *ls = opt(argc, argv, "--lat-sub", nullptr); g_lat_nsub = 0;
+                if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && pc.half_res == 3 && pc.lat_nsub) { g_lat_nsub = pc.lat_nsub; memcpy(g_lat_sub, pc.lat_sub, sizeof g_lat_sub); ls = nullptr; } }
+                if (ls && g_lat_guide != 64) { fprintf(stderr, "--lat-sub: needs --lat-guide 3 (the sub-cell head)\n"); return 2; }
+                if (ls) { int n = 0; g_lat_sub[n++] = (int8_t)g_side_ch; g_lat_sub[n++] = (int8_t)(g_side_ch + 1);
+                    char *t = strdup(ls); int bad = 0;
+                    for (char *q = strtok(t, ","); q && !bad; q = strtok(nullptr, ",")) {
+                        int c0 = -1, nc = 0;
+                        if (!strcmp(q, "phase")) continue;
+                        else if (!strcmp(q, "rv")) { c0 = g_rv == 2 ? g_rv_ch : -1; nc = 2; }
+                        else if (!strcmp(q, "fib")) { c0 = g_fibh ? g_fib_ch : -1; nc = 2; }
+                        else if (!strcmp(q, "ink")) { c0 = g_ink2 ? g_ink2_ch : -1; nc = 1; }
+                        else if (q[0] == 'c' && q[1] >= '0' && q[1] <= '9') { c0 = atoi(q + 1); nc = 1; if (c0 >= g_cout) c0 = -1; }
+                        if (c0 < 0) { fprintf(stderr, "--lat-sub: %s: not an output of this net (rv: --rv 2, fib: --fib-head 1, ink: --ink-head 1, cN: N < %d)\n", q, g_cout); bad = 1; break; }
+                        for (int j = 0; j < nc; j++) { int dup = 0; for (int k = 0; k < n; k++) dup |= g_lat_sub[k] == c0 + j; if (dup) continue;
+                            if (n == 16) { fprintf(stderr, "--lat-sub: at most 16 outputs\n"); bad = 1; break; } g_lat_sub[n++] = (int8_t)(c0 + j); }
+                    }
+                    free(t); if (bad) return 2;
+                    g_lat_nsub = n > 2 ? n : 0;
+                }
+                cfg.lat_nsub = g_lat_nsub; memcpy(cfg.lat_sub, g_lat_sub, sizeof cfg.lat_sub);
+                if (g_lat_nsub) { fprintf(stderr, "--lat-sub: sub-cell rows for outputs"); for (int k = 0; k < g_lat_nsub; k++) fprintf(stderr, " %d", g_lat_sub[k]); fprintf(stderr, " (head %d outputs)\n", LNC); }
+            }
             g_half = 0; cfg.half_res = 3; cfg.cin = 4; cfg.cout = LNC; cfg.lat_guide = g_lat_guide;
             const char *lbp = opt(argc, argv, "--lat-basis", nullptr);
             g_lat_jit = (float)opt_atof("--lat-step-jitter", opt(argc, argv, "--lat-step-jitter", "0"));
@@ -4069,7 +4113,7 @@ int cmd_train(int argc, char **argv) {
             unet_init(d->u, seed + 1); /* deterministic: every GPU starts identical */
             if (g_restore) unet_zero_head(d->u);   /* residual net: output == input at step 0 */
             const char *init_from = opt(argc, argv, "--init-from", nullptr);   /* partial warm start from another architecture */
-            int widened = 0, subkeep = 0;   /* subkeep: the donor's sub-cell rows were copied (a lat_guide 64 donor of the same head shape) */
+            int widened = 0, subkeep = 0;   /* subkeep: the donor's head rows [0, subkeep) were copied (a lat_guide 64 donor of the same head shape, or a --lat-sub prefix) */
             if (init_from) {
                 unet_set_init_shift(opt_atoi("--init-shift", opt(argc, argv, "--init-shift", "0")));   /* a latent-grid net from a voxel donor: --init-shift 2 */
                 int rows[512];   /* --verso: recto copied into the verso channel, the donor's other rows (affinities) shifted up */
@@ -4117,7 +4161,7 @@ int cmd_train(int argc, char **argv) {
                     char *hd = checkpoint_header_line(init_from);
                     const char *r2 = hd ? strstr(hd, "\"rv\":{\"version\":2,\"recto\":") : nullptr, *uw = hd ? strstr(hd, "\"unwrap\":{\"version\":2") : nullptr, *ik = uw ? strstr(uw, "\"ink\":") : nullptr;
                     const int drv = r2 ? atoi(r2 + strlen("\"rv\":{\"version\":2,\"recto\":")) : -1, dink = ik ? atoi(ik + strlen("\"ink\":")) : -1; free(hd);
-                    const int dbase = g_lat_guide == 64 && dc.cout > 128 ? dc.cout - 128 : dc.cout;   /* the donor's interpolated outputs (its sub-cell rows after them) */
+                    const int dbase = g_lat_guide == 64 && dc.lat_guide == 64 ? unet_lat_sbase(&dc) : g_lat_guide == 64 && dc.cout > 128 ? dc.cout - 128 : dc.cout;   /* the donor's interpolated outputs (its sub-cell rows after them) */
                     for (int co = 0; co < cfg.cout; co++) rows[co] = co < 11 && co < dbase ? co : g_lat_guide == 64 && co >= LBASE && dbase + co - LBASE < dc.cout ? dbase + co - LBASE : -1;
                     if (g_rv == 2) for (int k = 0; k < 2; k++) rows[g_rv_ch + k] = drv >= 0 ? drv + k : -1;
                     if (g_ink2) rows[g_ink2_ch] = dink;
@@ -4138,10 +4182,16 @@ int cmd_train(int argc, char **argv) {
                 } else {
                 if (hm) { int k = 0; char *t = strdup(hm); for (char *q = strtok(t, ","); q && k < 64; q = strtok(nullptr, ",")) rows[k++] = atoi(q); free(t);
                     if (k != cfg.cout) { fprintf(stderr, "--head-map has %d rows, the network %d outputs\n", k, cfg.cout); return 2; } }
-                const int nt = g_verso || hm || w4map ? unet_init_from_map(d->u, init_from, rows) : unet_init_from(d->u, init_from);
+                int grow = 0;   /* --lat-sub from a donor with fewer sub-cell outputs (try9: the phase pair): rows by position up to its cout, the new sub-cell rows zero below */
+                if (!hm && !g_verso && !w4map && g_lat_guide == 64 && g_lat_nsub) { unet_cfg gc_; int gs_;
+                    if (!unet_peek(init_from, &gc_, &gs_) && gc_.half_res == 3 && gc_.lat_guide == 64 && gc_.cout < cfg.cout && unet_lat_sbase(&gc_) == LBASE) {
+                        int pre = 1; for (int k = 0; k < unet_lat_nsub(&gc_); k++) pre &= unet_lat_subch(&gc_, k) == g_lat_sub[k];
+                        if (pre) { grow = gc_.cout; for (int co = 0; co < cfg.cout; co++) rows[co] = co < grow ? co : -1;
+                            if (g == 0) fprintf(stderr, "init-from: --lat-sub: head rows 0-%d by position, the new sub-cell rows %d-%d start at zero\n", grow - 1, grow, cfg.cout - 1); } } }
+                const int nt = g_verso || hm || w4map || grow ? unet_init_from_map(d->u, init_from, rows) : unet_init_from(d->u, init_from);
                 if (nt < 0) { fprintf(stderr, "cannot initialise from %s\n", init_from); return 1; }
                 if (g_lat_guide == 64) { unet_cfg sc_; int ss_;   /* (2026-11-19: the reset below zeroed a sub-cell donor's copied rows on every plain --init-from: try9 warm starts began on the interpolated head) */
-                    subkeep = !unet_peek(init_from, &sc_, &ss_) && sc_.half_res == 3 && sc_.lat_guide == 64 && sc_.cout == cfg.cout && (!(g_verso || hm || w4map) || rows[LBASE] == LBASE); }
+                    subkeep = grow ? grow : !unet_peek(init_from, &sc_, &ss_) && sc_.half_res == 3 && sc_.lat_guide == 64 && sc_.cout == cfg.cout && (!(g_verso || hm || w4map) || rows[LBASE] == LBASE) ? cfg.cout : 0; }
                 if (w4map == 3 || fib_fresh) for (int k = 0; k < 9; k++) unet_head_row_reset(d->u, g_fib_ch + k, k < 2 ? (float)opt_atof("--fib-bias", opt(argc, argv, "--fib-bias", "-2")) : 0.f);
                 if (w4map && w4map != 3 && w4map != 5 && g_ink2) unet_head_row_reset(d->u, g_ink2_ch, (float)opt_atof("--ink-bias", opt(argc, argv, "--ink-bias", "-2")));   /* (a fresh ink row: zero weights, the prior bias; the donor's function elsewhere) */
                 {   /* --rv 2 from a donor without its pair (a plain unwrap2 net, or a latent net whose interpolated rows 11-15 never trained): fresh rv rows, bias --rv-bias */
@@ -4154,7 +4204,8 @@ int cmd_train(int argc, char **argv) {
                 if (g == 0 && init_lr != 1.f) fprintf(stderr, "--init-lr-mult %g: %zu of %zu parameters inherited\n", init_lr, unet_inherited(d->u), unet_nparams(d->u));
                 }
             }
-            if (g_lat_guide == 64 && subkeep && g == 0) fprintf(stderr, "sub-cell head: outputs %d-%d from the donor\n", LBASE, cfg.cout - 1);
+            if (g_lat_guide == 64 && subkeep > LBASE && g == 0) fprintf(stderr, "sub-cell head: outputs %d-%d from the donor\n", LBASE, subkeep - 1);
+            if (g_lat_guide == 64 && !widened && subkeep > LBASE) for (int co = subkeep; co < cfg.cout; co++) unet_head_row_reset(d->u, co, 0.f);   /* (--lat-sub growth: the new rows) */
             if (g_lat_guide == 64 && !widened && !subkeep) {   /* the sub-cell outputs start at zero (--init-widen: the donor's sub-cell rows): the net begins as the interpolated head (random rows gave a 4-voxel lattice wherever the labels do not reach) */
                 for (int co = LBASE; co < cfg.cout; co++) unet_head_row_reset(d->u, co, 0.f);
                 if (g == 0) fprintf(stderr, "sub-cell head: outputs %d-%d start at zero\n", LBASE, cfg.cout - 1);
