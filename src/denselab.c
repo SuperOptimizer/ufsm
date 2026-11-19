@@ -4,7 +4,11 @@
    chunks in S^3 shards, shards.bin = the rendered shards), which the cache then reads instead of computing (dcache_dense_root).
    The values are the cached array's own reads (z3_read of the array the sampler reads), so a rendered cell is byte-identical to the
    on-the-fly one by construction; --verify N checks it against a fresh compute (the array's inner, no cache). */
+#include "band_onfly.h"
 #include "dcache.h"
+#include "fiberraster.h"
+#include "inksplat.h"
+#include <zstd.h>
 #include "sources.h"
 #include "store.h"
 #include "optcheck.h"
@@ -71,7 +75,7 @@ static int dl_write_shards(const char *dir, int64_t S, const int64_t g[3], const
 /* render one array: every shard whose box (+ margin) reaches the array's base chunks (z3_box_any), not yet rendered */
 typedef struct {
     z3 *z; z3w *w; const char *dir; int64_t S, g[3]; uint8_t *bits; int64_t *todo; size_t ntodo; _Atomic size_t next, done; _Atomic int fail;
-    pthread_mutex_t mu; int inner_threads; double t0; uint64_t bytes0;
+    pthread_mutex_t mu; int inner_threads; double t0; uint64_t bytes0; int zprobe; _Atomic uint64_t zb3, zb19;   /* --zstd-probe: the shards' 128^3 chunks as zstd 3 / 19 */
 } dl_job;
 static void *dl_worker(void *a) {
     dl_job *J = a; const size_t SN = (size_t)J->S * J->S * J->S; uint8_t *buf = malloc(SN);
@@ -80,6 +84,18 @@ static void *dl_worker(void *a) {
         const int64_t s = J->todo[i], sz = s / (J->g[1] * J->g[2]), sy = s / J->g[2] % J->g[1], sx = s % J->g[2];
         const int64_t o[3] = {sz * J->S, sy * J->S, sx * J->S}, n[3] = {J->S, J->S, J->S};
         if (z3_read(J->z, o, n, buf, J->inner_threads)) { fprintf(stderr, "denselab: %s: read of shard %lld %lld %lld failed\n", J->dir, (long long)sz, (long long)sy, (long long)sx); J->fail = 1; break; }
+        if (J->zprobe) {   /* (the codec comparison: what the same chunks cost as the dcache's zstd cells; all-fill chunks omitted, as z3w does) */
+            const size_t C3 = 128 * 128 * 128, cap = ZSTD_compressBound(C3); uint8_t *ch = malloc(C3), *zb = malloc(cap); const int fill = z3_meta_of(J->z)->fill;
+            for (int64_t cz = 0; cz < J->S; cz += 128) for (int64_t cy = 0; cy < J->S; cy += 128) for (int64_t cx = 0; cx < J->S; cx += 128) {
+                int allf = 1;
+                for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) { const uint8_t *src = buf + ((size_t)(cz + z) * J->S + (cy + y)) * J->S + cx; memcpy(ch + ((size_t)z * 128 + y) * 128, src, 128);
+                                                                             for (int x = 0; x < 128 && allf; x++) allf = src[x] == fill; }
+                if (allf) continue;
+                size_t r = ZSTD_compress(zb, cap, ch, C3, 3); if (!ZSTD_isError(r)) J->zb3 += r;
+                if (J->zprobe > 1) { r = ZSTD_compress(zb, cap, ch, C3, 19); if (!ZSTD_isError(r)) J->zb19 += r; }
+            }
+            free(ch); free(zb);
+        }
         if (z3w_write_shard(J->w, sz, sy, sx, buf, J->inner_threads)) { fprintf(stderr, "denselab: %s: shard write: %s\n", J->dir, z3w_error()); J->fail = 1; break; }
         pthread_mutex_lock(&J->mu); J->bits[s] = 1; const size_t d = ++J->done;
         if (d % 16 == 0 || d == J->ntodo) {
@@ -96,7 +112,7 @@ static uint64_t dl_du(const char *dir) {   /* bytes under dir (one level of shar
     if (p) { if (fscanf(p, "%llu", &b) != 1) b = 0; pclose(p); }
     return b;
 }
-static int dl_render(z3 *z, const char *what, const char *root, int64_t S, int S_given, int64_t margin, int nthreads, int dry, size_t limit, double *gsec, uint64_t *gbytes) {
+static int dl_render(z3 *z, const char *what, const char *root, int64_t S, int S_given, int64_t margin, int nthreads, int dry, size_t limit, int zprobe, double *gsec, uint64_t *gbytes) {
     const char *key; char hex[25]; int C, pd; dcache_info(z, &key, hex, &C, &pd);
     const z3_meta *m = z3_meta_of(z); if (S % C) { fprintf(stderr, "denselab: %s: shard %lld is not a multiple of the cell %d\n", what, (long long)S, C); return 1; }
     char dir[1200], ad[1300]; snprintf(dir, sizeof dir, "%s/%s", root, hex); snprintf(ad, sizeof ad, "%s/a", dir);
@@ -129,7 +145,7 @@ static int dl_render(z3 *z, const char *what, const char *root, int64_t S, int S
     char attrs[1600]; snprintf(attrs, sizeof attrs, "{\"denselab\": {\"key_hash\": \"%s\", \"cell\": %d}}", hex, C);
     z3w *w = z3w_create(ad, m->shape, (int)S, 0, m->fill, attrs); if (!w) { fprintf(stderr, "denselab: %s: %s\n", ad, z3w_error()); free(bits); free(todo); return 1; }
     const double t0 = dl_now();
-    dl_job J = {.z = z, .w = w, .dir = dir, .S = S, .g = {g[0], g[1], g[2]}, .bits = bits, .todo = todo, .ntodo = nt, .t0 = t0};
+    dl_job J = {.z = z, .w = w, .dir = dir, .S = S, .g = {g[0], g[1], g[2]}, .bits = bits, .todo = todo, .ntodo = nt, .t0 = t0, .zprobe = zprobe};
     pthread_mutex_init(&J.mu, nullptr);
     const int nw = nthreads < 4 ? 1 : nthreads / 4; J.inner_threads = nthreads / nw > 0 ? nthreads / nw : 1;   /* (a few shards at once, each read with the rest) */
     pthread_t th[64]; const int m2 = nw > 64 ? 64 : nw;
@@ -140,6 +156,8 @@ static int dl_render(z3 *z, const char *what, const char *root, int64_t S, int S
     const double el = dl_now() - t0; const uint64_t by = dl_du(ad);
     printf("denselab: %s: %s, %zu shards in %.0f s, store %.3f GB (%.3f bit per voxel of the rendered shards)\n", what, rc ? "FAILED" : "done", nt, el, by / 1e9,
            nt ? 8.0 * by / ((double)nt * S * S * S) : 0);
+    if (zprobe) printf("denselab: %s: codec probe over the rendered shards: volcomp lossless %.4f GB, zstd 3 %.4f GB%s%.4f GB\n", what, by / 1e9, J.zb3 / 1e9,
+                       zprobe > 1 ? ", zstd 19 " : "", zprobe > 1 ? J.zb19 / 1e9 : 0.);
     *gsec += el; *gbytes += by;
     if (!rc && !partial) { char dp[1300]; snprintf(dp, sizeof dp, "%s/done", dir); FILE *f = fopen(dp, "wb"); if (f) { fprintf(f, "shards %zu rendered %zu bytes %llu seconds %.0f\n", ns, nt, (unsigned long long)by, el); fclose(f); } }
     pthread_mutex_destroy(&J.mu); free(bits); free(todo); return rc;
@@ -173,7 +191,7 @@ static int dl_verify(z3 *z, const char *what, int nbox, int64_t P, uint64_t seed
 int cmd_denselab_render(int argc, char **argv) {
     if (argc < 3 || argv[2][0] == '-') {
         fprintf(stderr, "usage: ufsm denselab-render SOURCES.json --out ROOT [--source N1,N2] [--kind phase,ink,fibre] [--levels a,b] [--shard 512] [--margin 128]\n"
-                        "                             [--threads 16] [--dry 1] [--limit N] [--verify N --P 96 --seed 1]\n"
+                        "                             [--threads 16] [--gpu D --gpu-slots 2 --gpu-mb 1024] [--dry 1] [--limit N] [--zstd-probe 1|2] [--verify N --P 96 --seed 1]\n"
                         "  renders every derived (cached) label array of the sources into ROOT/<key hash>/ (zarr + shards.bin); the derived cache\n"
                         "  then reads them ($UFSM_DENSELAB, default ~/nas/denselab). --verify N: N boxes per array, the store vs a fresh compute.\n");
         return 2;
@@ -191,6 +209,15 @@ int cmd_denselab_render(int argc, char **argv) {
     int la = 0, lb = MAXLEV - 1; if (lv && sscanf(lv, "%d,%d", &la, &lb) < 1) { fprintf(stderr, "denselab-render: --levels a,b\n"); return 2; }
     if (lv && !strchr(lv, ',')) lb = la;
     sources *SS = sources_load(argv[2]); if (!SS) { fprintf(stderr, "denselab-render: cannot load %s\n", argv[2]); return 1; }
+    const int gpu = opt_atoi("--gpu", opt(argc, argv, "--gpu", "-1"));
+    if (gpu >= 0) {   /* the training kernels (byte-identical to train's --onfly-gpu path): the pair rule (--gpu-slots tiles of --gpu-mb), ink, fibre */
+        const int gs = opt_atoi("--gpu-slots", opt(argc, argv, "--gpu-slots", "2")), gm = opt_atoi("--gpu-mb", opt(argc, argv, "--gpu-mb", "1024"));
+        if (phase_onfly_config(gpu, gs, gm, 1)) { fprintf(stderr, "denselab-render: --gpu %d: no GPU pair rule (or the reserve failed)\n", gpu); sources_free(SS); return 1; }
+        inkfly_gpu_config(gpu);
+        int nfib = 0; for (int i = 0; i < SS->n; i++) for (int c = 0; c < NTG; c++) nfib += SS->src[i].tgt_fib[c] && dl_name(names, SS->src[i].name);
+        if (nfib && dl_kind(kinds, "fibre") && fiber_onfly_config(gpu, (int)S) < 0) fprintf(stderr, "denselab-render: --gpu %d: fibre planes on the CPU\n", gpu);
+        printf("denselab-render: on-the-fly labels on GPU %d (pair rule %d slots of %d MB)\n", gpu, gs, gm);
+    }
     dl_arr *A = nullptr; int na = 0, ca = 0, nsel = 0;
     for (int i = 0; i < SS->n; i++) {
         source *s = &SS->src[i]; if (!dl_name(names, s->name)) continue; nsel++;
@@ -208,7 +235,7 @@ int cmd_denselab_render(int argc, char **argv) {
     int rc = 0; double sec = 0; uint64_t by = 0;
     for (int i = 0; i < na; i++)
         rc |= nverify ? dl_verify(A[i].z, A[i].what, nverify, opt_atoi("--P", opt(argc, argv, "--P", "96")), (uint64_t)opt_atoi("--seed", opt(argc, argv, "--seed", "1")) + 7919u * (unsigned)i, nt)
-                      : dl_render(A[i].z, A[i].what, out, S, opt(argc, argv, "--shard", nullptr) != nullptr, margin, nt, dry, (size_t)opt_atoi("--limit", opt(argc, argv, "--limit", "0")), &sec, &by);
+                      : dl_render(A[i].z, A[i].what, out, S, opt(argc, argv, "--shard", nullptr) != nullptr, margin, nt, dry, (size_t)opt_atoi("--limit", opt(argc, argv, "--limit", "0")), opt_atoi("--zstd-probe", opt(argc, argv, "--zstd-probe", "0")), &sec, &by);
     if (!nverify && !dry) printf("denselab-render: %d arrays, %.3f GB, %.0f s%s\n", na, by / 1e9, sec, rc ? ", FAILED" : "");
     free(A); sources_free(SS);
     return rc;
