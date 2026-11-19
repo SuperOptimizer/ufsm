@@ -6,6 +6,62 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Recto / verso and fibre direction do not separate touching sheets either: try9's heads count fewer boundaries than the CT (2026-11-18, branch rvsep-20261118, unrollperf)
+
+**Question (user via lead).** Each sheet is a recto layer (horizontal fibres) on a verso layer (vertical fibres). Along a ray through a
+stack the sequence is R V | R V | R V, so every sheet boundary is a V -> R (V-fibre -> H-fibre) step, even at zero gap. Could counting
+those steps count the touching sheets that the CT and the phase merge?
+
+**Tool.** `ufsm gt-trans` (src/gttrans.c) ports pseudolab's / fix0332's ctgt.py to C: the same boxes, rays, GT intervals, normal-gap rule
+and CT detector (section "Packed sheets are not resolved by finer CT"). Its CT row reproduces ctgt's on Paris 4: 48882 vs 48897 intervals,
+per turn 0.523 / 0.740 / 0.871 / 0.970, 1.044 overall.
+
+Per GT interval it also counts, on the same samples:
+- **rv state flips**, with hysteresis +-8 around 128 on `predict --heads rv` (1 + 254 (1 + p_r - p_v) / 2).
+- **Fibre state flips** from fib/H vs fib/V: state set where max >= 8 and the difference >= 4.
+- **Peaks** of the rv signal and of H - V, using the CT detector. These are recto-ruler's "peaks of the fused signal".
+
+A sheet's GT centre lies at its R | V interface, so the boundary direction should give 1 per turn. test_gttrans builds a synthetic stack
+of packed (38 um) and spaced (115 um) sheets and gets rv / fibre V -> R 0.94 / 1.06 per turn there, while the CT peaks merge (0.47).
+
+**Predictions.** try9 snap 16000, live weights (`--ema 0 --gn-live 1`), `--heads rv,c14,c15` (c14 / c15 = fib/H / fib/V), every wbench GT
+box of paris4 (PH1-3, HOLD), paris4j (J1-34) and 1667 (70). Window 256 / halo 64 and CT decoded on the CPU, to stay at 2.9 GB beside the
+ink trainer on desk card 1. Outputs and logs: /vesuvius/ufsm/unrollperf/rvsep/.
+
+**Per GT turn.** All columns are on the same intervals. "Flips" is the boundary direction (V -> R, V -> H) going outward; the reverse
+direction is within +-0.1 of it except on 1667's rv.
+
+| | gap 0-70 um | 70-85 | 85-100 | 100-115 | all |
+|---|---|---|---|---|---|
+| Paris 4 (PH1-3, HOLD): CT peaks | 0.52 | 0.74 | 0.87 | 0.97 | 1.04 |
+| rv flips V -> R | 0.25 | 0.34 | 0.43 | 0.56 | 0.60 |
+| rv peaks | 0.45 | 0.62 | 0.77 | 0.88 | 0.87 |
+| fibre flips V -> H | 0.17 | 0.28 | 0.36 | 0.47 | 0.47 |
+| (H - V) peaks | 0.36 | 0.55 | 0.64 | 0.74 | 0.80 |
+| Paris 4 July (J1-34): CT peaks | 0.35 | 0.68 | 0.79 | 0.92 | 1.20 |
+| rv flips / rv peaks | 0.16 / 0.28 | 0.38 / 0.60 | 0.47 / 0.72 | 0.57 / 0.84 | 0.64 / 0.99 |
+| fibre flips / (H - V) peaks | 0.12 / 0.23 | 0.30 / 0.49 | 0.38 / 0.59 | 0.44 / 0.68 | 0.50 / 0.88 |
+| 1667 (70 boxes): CT peaks | 0.45 | 0.67 | 0.78 | 0.88 | 1.54 |
+| rv flips / rv peaks | 0.26 / 0.41 | 0.37 / 0.63 | 0.42 / 0.72 | 0.48 / 0.79 | 0.65 / 1.07 |
+| fibre flips / (H - V) peaks | 0.21 / 0.37 | 0.33 / 0.50 | 0.39 / 0.60 | 0.46 / 0.67 | 0.53 / 1.04 |
+
+**Gate: not met.** No rv or fibre measure reaches 0.9 per turn below 70 um. Every one stays at or below the CT peaks (0.52 / 0.35 /
+0.45). They also fall short at wide gaps: rv flips are 0.6-0.9 per turn above 115 um.
+
+**Reading.** try9's side and fibre heads merge the touching sheets as the trunk does. The heads cannot add separation the trunk lacks.
+- The latent net sees 4-voxel cells (38 um at 9.6).
+- A packed pair (< 70 um) is two sheets, four layers of ~15-35 um each, inside two cells.
+- An R V R V alternation at that scale is below the representation. The heads come off the same cells through the sub-cell head.
+
+The fibre head marks tubes, not layer orientation. Its probabilities are mostly below 0.13 between fibres, so its states are sparse. This
+is a test of try9's heads, not of the physics. The CT itself does not separate the layers either: at 2.4 um, 0.60 per turn below 70 um
+(section above).
+
+**Remaining lever (not run).** A full-resolution recto / verso net:
+- rv1d2, whose recto-ruler counted 1.06 per GT turn on 1667 overall, is deleted.
+- A model whose rv output at 2.4-4.8 um keeps the layer alternation could be gated with this tool unchanged: `--rv` takes any store on
+  the CT key's grid.
+
 ## Ink retrain from try9 on the 2-D teachers; ink-teach --extra (B2) (2026-11-18, branches inkteach / inkteachx-20261118, inksdk)
 
 User (via lead, 11-18): retrain the latent ink head from try9 (scratch2) on the 2-D teachers (reader3 + ink9um soft targets via
