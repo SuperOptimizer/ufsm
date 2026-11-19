@@ -648,6 +648,8 @@ void unet_init(unet *u, uint64_t seed) {
         const double sa = 1.0 / sqrt((double)w0), sb = 1.0 / sqrt(27.0 * Cl);
         for (size_t i = 0; i < (size_t)H * w0; i++) h[o + i] = (float)(sa * gauss(&seed));
         for (size_t i = 0; i < (size_t)Cl * 27 * H; i++) h[ob + i] = (float)(sb * gauss(&seed));
+        const char *tw = getenv("UFSM_LATDEC_TEST_W2");   /* tests (test_parity): W2 ~ N(0, s^2 / H) instead of 0, so the decoder's term is large from the start */
+        if (tw && atof(tw) > 0) { const double sw = atof(tw) / sqrt((double)H); for (size_t i = 0; i < (size_t)64 * u->cfg.lat_dec_ng * H; i++) h[ob + (size_t)Cl * 27 * H + i] = (float)(sw * gauss(&seed)); }
     }
     nn_h2d(u->p, h, u->np * 4);
     nn_d2d(u->ema, u->p, u->np * 4);
@@ -2876,7 +2878,8 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     const int *w = u->cfg.widths;
     const float *cur = x;
     if (x_h16 && !ABF) { fprintf(stderr, "unet_forward_x: a 16-bit input needs the 16-bit activation storage\n"); abort(); }
-    if (u->cfg.lat_dec && !u->ld_ext) { u->ld_x = x_h16 ? xv : nullptr; u->ld_D = xs.d; u->ld_H = xs.h; u->ld_W = xs.w; }   /* (the decoder's latent input: the fp16 CT channel) */
+    if (u->cfg.lat_dec && !u->ld_ext) { u->ld_x = x_h16 && nn_get_f16() ? xv : nullptr; u->ld_D = 4 * xs.d; u->ld_H = 4 * xs.h; u->ld_W = 4 * xs.w; }   /* (the decoder's latent input: the
+                                                                         training forward's x, the fp16 CT channel at 4x the cell shape xs; predict: unet_set_latdec_ct) */
     /* Without MX gradients the four-channel input can stay 16-bit; the tap-packed FP8 kernel writes MX a1.
        MX gradients require a packed input for the available weight-gradient kernels (eight-wide MX rows). */
     const int xin_mx = input_mx();   /* MX-fp8 gradients require an MX x for the available weight-gradient kernels */

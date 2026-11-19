@@ -396,6 +396,7 @@ ufsm_exe(test_dcache_cap SUITE tests/test_dcache_cap.c OBJS dcache zarr3 store z
 ufsm_exe(test_dcache_phase SUITE tests/test_dcache_phase.c OBJS dcache zarr3 store z3w json LIBS LDLIBS)
 ufsm_exe(test_label_versions SUITE tests/test_label_versions.c OBJS band_onfly fuse band zarr3 store z3w json LIBS LDLIBS m)
 ufsm_exe(bench_fstem tests/bench_fstem.c OBJS CORE NN LP LIBS LDLIBS CUDA)
+ufsm_exe(bench_latdec tests/bench_latdec.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_wgl0 tests/bench_wgl0.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 # 2:4 sparse MX-fp4 convolutions (src/lp_sp24*.cu, DESIGN.md 2026-11-13): instruction layout + throughput, conv kernels vs host
 ufsm_exe(test_sp24_mma SUITE tests/test_sp24_mma.c OBJS NN LP LIBS m CUDA)

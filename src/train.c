@@ -290,7 +290,7 @@ static int g_gc;
    the fused normal / density group); --fstem-drop P: a training window without it (level dropout: the net keeps working without the fine
    level, as for scans with no finer data; validation and predict always use it) */
 static int g_fstem, g_fs_n, g_fs_ch[32]; static float g_fs_drop = 0.25f;
-static int g_lat_dec;   /* --lat-dec H: the learned sub-cell decoder (unet_cfg.lat_dec; the streamed head; latgc holds H more rows: its pre rows' gradient) */
+static int g_lat_dec;   /* mgpu: config. --lat-dec H: the learned sub-cell decoder (unet_cfg.lat_dec; the streamed head; latgc holds H more rows: its pre rows' gradient) */
 static sampler *g_vs_sp;   /* --vox-cap: the training sampler, for sampler_vox_scale */   /* mgpu: config */
 static float src_head_w(int si, int h) { return (si >= 0 && g_S && si < g_S->n ? g_S->src[si].head_w[h] : 1.f) * g_hmul[h] * (g_vs_sp && h != SH_INK && h != SH_FIBRE ? sampler_vox_scale(g_vs_sp, si) : 1.f); }   /* the source's "heads" multiplier x --uw */
 /* --init-from: does an unwrap2 donor keep its rv pair / ink row somewhere other than this net's channels (u1 rv 11-12 -> U2 ink 11, rv

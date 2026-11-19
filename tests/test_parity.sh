@@ -4,9 +4,9 @@
 # logits and level-0 corner) and the same box through predict (window = the validation window, halo 0, --fit-zarr) must agree to the
 # fp16 head rounding (max |dlogit| <= 0.02 every channel, >= 30 % of the values bit-equal), with the same numerics modes (weights hash,
 # GN live, MX formats, latent step, FiLM codes) in both modes.txt lines.
-# Usage: test_parity.sh UFSM MAKE_WIND_FIXTURE DIR
+# Usage: test_parity.sh UFSM MAKE_WIND_FIXTURE DIR [EXTRA TRAIN FLAGS] (e.g. "--lat-dec 32": the learned sub-cell decoder in both paths)
 set -eu
-U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
+U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3; X=(${4:-})
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
 fail() { echo "FAIL: $*"; exit 1; }
 "$MF" fx 256 2 1 > fx.log 2>&1
@@ -15,7 +15,7 @@ fail() { echo "FAIL: $*"; exit 1; }
 # (without a basis, --lat 4's cell-mean input, train and predict agree only to corr 0.85-0.97 on this fixture: DESIGN 2026-11-18 parity, open)
 T=(--task unwrap2 --levels 1 --P 128 --B 1 --gpus 0 --workers 2 --sampler-slots 4 --log-every 1 --ckpt-every 1000 --fp4 2 --input-prec 8
    --warmup 0 --wind4-tile 0 --widths 16,32,64 --det 1 --lat 4 --lat-basis "$D/basis.lcb" --lat-c 29 --lat-step 0.25 --lat-guide 3 --fstem 16
-   --gn-ema 1 --gn-ema-warm 1000000000 --seed 5)
+   --gn-ema 1 --gn-ema-warm 1000000000 --seed 5 "${X[@]}")
 "$U" train fx/sources.json --out a "${T[@]}" --steps 3 > a.log 2>&1 || fail "train ($D/a.log)"
 mkdir -p tr pr
 UFSM_PARITY_DUMP=$D/tr UFSM_PARITY_TAG=train UFSM_LAT_FUSE=0 "$U" train fx/sources.json --out b "${T[@]}" --steps 4 --resume a/last.ckpt --lr 0 --muon-lr 0 \
