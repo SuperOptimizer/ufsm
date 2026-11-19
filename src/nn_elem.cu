@@ -875,6 +875,23 @@ __global__ void packed_mask_k(const uint8_t *ph, int D, int H, int W, int s, flo
     float g[3]; if (!phase_grad(ph, i, D, H, W, s, g)) return;
     m[li] = packed_wt(sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]), um, packed_um, packed_w);
 }
+/* --contact-weight (2026-11-19, rvsub): a weighted loss mask raised to at least the contact weight where two labelled sheets touch: the
+   local spacing um / rho (phase gradient rho turns per voxel over +-s) at or below contact_um -> cw, linear down to 1 at 1.5 contact_um;
+   m = max(m, weight) on m != 0 (an rv mask keeps a larger packed weight); unknown gradients leave m */
+__global__ void contact_mask_k(const uint8_t *ph, int D, int H, int W, int s, float um, float contact_um, float cw, uint8_t *m, size_t i0, size_t n) {
+    const size_t li = blockIdx.x * (size_t)blockDim.x + threadIdx.x, i = i0 + li;
+    if (li >= n || !m[li]) return;
+    float g[3]; if (!phase_grad(ph, i, D, H, W, s, g)) return;
+    const float rho = sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]); if (!(rho > 0.f)) return;
+    const float sp = um / rho, f = fminf(1.f, fmaxf(0.f, (1.5f * contact_um - sp) / (0.5f * contact_um)));
+    const uint8_t wt = (uint8_t)fminf(255.f, rintf(1.f + (cw - 1.f) * f));
+    if (wt > m[li]) m[li] = wt;
+}
+extern "C" void nn_contact_mask_z(const uint8_t *phase, int d, int h, int w, int s, float um, float contact_um, float cw, uint8_t *m, int z0, int z1) {   /* m: planes [z0, z1) */
+    if (!(cw > 1.f)) return;
+    const size_t hw = (size_t)h * w, n = (size_t)(z1 - z0) * hw;
+    contact_mask_k<<<nblk(n, 256), 256>>>(phase, d, h, w, s, um, contact_um, cw, m, (size_t)z0 * hw, n); KCHECK();
+}
 extern "C" void nn_packed_mask(const uint8_t *phase, int d, int h, int w, int s, float um, float packed_um, float packed_w, uint8_t *m) {
     nn_packed_mask_z(phase, d, h, w, s, um, packed_um, packed_w, m, 0, d);
 }

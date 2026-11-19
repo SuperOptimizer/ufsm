@@ -24,6 +24,11 @@ la=$(grep '^step      1 ' a.log | sed 's/ qk .*//; s/ gn .*//'); lb=$(grep '^ste
 [ -n "$la" ] && paste <(tr ' ' '\n' <<< "$la") <(tr ' ' '\n' <<< "$lb") | awk '{a = $1; b = $2; gsub(/[^0-9.e+-]/, "", a); gsub(/[^0-9.e+-]/, "", b)
   if (a ~ /^[0-9.]+$/ && b ~ /^[0-9.]+$/) { if ((a - b) > 2e-4 || (b - a) > 2e-4) bad = 1 } else if ($1 != $2) bad = 1 } END { exit bad }' \
   || fail "step-1 losses with zero new rows: [$lb] vs the donor layout [$la]"
+# --contact-weight: the rv mask weighs touching sheets more (the rv bce moves, the phase bce does not)
+"$U" train fx/sources-ink.json --out b2 --lr 0 --muon-lr 0 "${C[@]}" --steps 2 --init-from don/last.ckpt --lat-sub rv,ink --contact-weight 8 --contact-um 100 > b2.log 2>&1 || fail "--contact-weight ($D/b2.log)"
+fb() { grep '^step      1 ' "$1" | grep -o "$2 bce [0-9.]*" | awk '{print $3}'; }
+[ "$(fb b.log phase)" = "$(fb b2.log phase)" ] || fail "--contact-weight moved the phase bce ($(fb b.log phase) -> $(fb b2.log phase))"
+[ "$(fb b.log rv)" != "$(fb b2.log rv)" ] || fail "--contact-weight left the rv bce at $(fb b.log rv) ($D/b2.log)"
 "$U" predict a/last.ckpt fx ct pa "${P[@]}" > pa.log 2>&1 || fail "predict a ($D/pa.log)"
 "$U" predict b/last.ckpt fx ct pb "${P[@]}" > pb.log 2>&1 || fail "predict b ($D/pb.log)"
 for h in rv ink; do rd pa/$h a.raw; rd pb/$h b.raw; cmp -s a.raw b.raw || fail "predict --heads $h: grown head (zero rows) != donor layout"; done
@@ -32,4 +37,4 @@ grep -q '^step     30 ' c.log || fail "no step 30 ($D/c.log)"
 "$U" predict c/last.ckpt fx ct pc "${P[@]}" > pc.log 2>&1 || fail "predict c ($D/pc.log)"
 grep -q 'rv (ch 12+13 sub-cell' pc.log || fail "predict does not read rv's sub-cell rows ($D/pc.log)"
 rd pb/rv b.raw; rd pc/rv c.raw; ! cmp -s b.raw c.raw || fail "trained sub-cell rows left predict --heads rv unchanged"
-echo "test_lat_sub: ok (step-1 losses equal with zero new rows; --heads rv / ink equal; trained rows reach predict)"
+echo "test_lat_sub: ok (rv bce $(fb b.log rv) -> $(fb b2.log rv) with --contact-weight 8; step-1 losses equal with zero new rows; --heads rv / ink equal; trained rows reach predict)"

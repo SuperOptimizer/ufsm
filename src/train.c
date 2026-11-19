@@ -311,6 +311,7 @@ static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static fl
 static int g_ink_air;   /* --ink-air S (--ink-head, needs the --rv papyrus plane): unlabelled air voxels on the S-voxel window lattice -> ink 0 targets (nn_ink_air) */
 static float g_ink_smooth;   /* --ink-smooth EPS (--ink-head): label smoothing of the ink BCE target, t (1 - eps) + eps / 2 (villa: 0.1) */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
+static float g_contact_w, g_contact_um = 70.f;   /* --contact-weight W [--contact-um U] (rvsub 2026-11-19): rv and fibre H / V masks x W where labelled sheets touch (spacing <= U) */
 static int g_dens_code; static float g_packed_w, g_packed_um = 120.f, g_dens_um, g_sheet_lo, g_sheet_hi;   /* --density-um U: x = density_scale rho (U / window um) (physical); --sheet-mask LO,HI */   /* --density-code, --packed-weight, --packed-um (task unwrap) */   /* mgpu: config */
 static inline float dens_scale_win(float um) { return g_dens_um > 0 && um > 0 ? g_dens_scale * g_dens_um / um : g_dens_scale; }   /* the window's density scale: physical with --density-um */
 static float g_ptrunc_tau, g_ptrunc_kappa = 0.5f; static int g_ptrunc_from = 5000, g_ptrunc_on;   /* --phase-trunc TAU [--phase-trunc-conf K] [--phase-trunc-from STEP]: the robust phase loss (nn_phase_trunc), on from STEP */
@@ -1273,6 +1274,7 @@ static int lhalo(int k) { return k == 0 ? g_norm_s : k >= 3 && k - 3 < g_naux &&
 #define FIBH_TARGETS() do { const uint8_t *fh_ = apl[g_aux_of[AUX_FIBH]], *fv_ = apl[g_aux_of[AUX_FIBV]]; \
         nn_ink_targets(fh_ + vb, ns, d->fht, d->fhm); nn_ink_targets(fv_ + vb, ns, d->fht + ns, d->fhm + ns); \
         nn_fib_head_dir(fh_, fv_, D, H, W, z0, nz, g_fd_r, 0.6f, d->fdt, d->fdm); \
+        if (g_contact_w > 1.f) for (int k_ = 0; k_ < 2; k_++) nn_contact_mask_z(sdb, D, H, W, g_norm_s, d->um, g_contact_um, g_contact_w, d->fhm + k_ * ns, z0, z1); \
         hs_clip(d, pass, d->fhm, z0, z1, hw); hs_clip(d, pass, d->fhm + ns, z0, z1, hw); hs_clip(d, pass, d->fdm, z0, z1, hw); } while (0)   /* (g_lsplit: this half's voxels) */
 #define FIBH_LOSS(grad) FIBH_LOSS_S(grad, 1.f)
 #define FIBH_LOSS_S(grad, mul_) do { const shape5 one_ = {1, 1, nz, H, W}, sev_ = {1, 7, nz, H, W}; \
@@ -1334,7 +1336,7 @@ static int hgs_choose(gpu_state *d, int nmil) {
     const int si = d->srcb[d->cur];
     float pw, rw; int u7; nn_loss_cfg_get(&pw, &rw, &u7);
     const float gs = nn_get_grad_scale();
-    const float mw = 2.f * (g_packed_w > 1.f ? g_packed_w : 1.f) * (g_rv_vw > 1.f ? g_rv_vw : 1.f);   /* hgs_mw: the largest mask weight (packed sheets, verso) x 2 */
+    const float pw_ = g_packed_w > g_contact_w ? g_packed_w : g_contact_w, mw = 2.f * (pw_ > 1.f ? pw_ : 1.f) * (g_rv_vw > 1.f ? g_rv_vw : 1.f);   /* (--contact-weight: a mask weight too) */   /* hgs_mw: the largest mask weight (packed sheets, verso) x 2 */
     const float lside = g_side_lambda * src_head_w(si, g_rv == 1 ? SH_RV : SH_PHASE), lnorm = g_norm_lambda * src_head_w(si, SH_NORMAL),
                 ldens = g_dens_lambda * src_head_w(si, SH_DENSITY), inkw = si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f;
     hgs_args a = {.nt = 0, .w4 = d->w4fin, .w4lam = g_w4_lambda * src_head_w(si, SH_WIND4), .milv = 0.f, .gs = gs, .rw = rw, .mw = mw};
@@ -1613,6 +1615,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             FT("  t packed mask (rv)");
             if (g_rv_vw != 1.f) nn_rv_verso_w(d->rvt, d->rvm, ns, g_rv_vw);
         }
+        if (g_rv && !tskip && g_contact_w > 1.f) nn_contact_mask_z(sdb, D, H, W, g_norm_s, d->um, g_contact_um, g_contact_w, d->rvm, z0, z1);   /* touching sheets (after the packed weight) */
         uint8_t *const st = g_rv == 1 ? d->rvt : d->sidet, *const sm = g_rv == 1 ? d->rvm : d->sidem;   /* the side slot's targets / mask (--rv 1: recto / verso) */
         if (g_rv && !pass && z0 == 0 && ufsm_env_on("UFSM_RV_CHECK")) {   /* what the rv loss reads on this slab: recto / verso / void / masked counts */
             uint8_t *h = malloc(3 * ns); nn_sync(); nn_d2h(h, d->rvt, 2 * ns); nn_d2h(h + 2 * ns, d->rvm, ns);
@@ -2949,7 +2952,9 @@ int cmd_train(int argc, char **argv) {
         /* --density-code 1: density target x / (1 + x), x = scale rho (never saturates; 0: min(1, x), which clips every spacing under
            scale x voxel size, 77 um at the default codes); --packed-weight W (> 1): the phase and normal / density losses weigh a voxel
            1 at a sheet spacing of --packed-um (120) or more, rising to W at half of it (the nets under-count packed sheets) */
-        g_dens_code = atoi(opt(argc,argv,"--density-code","0")); g_packed_w = (float)atof(opt(argc,argv,"--packed-weight","0")); g_packed_um = (float)atof(opt(argc,argv,"--packed-um","120"));
+        g_dens_code = atoi(opt(argc,argv,"--density-code","0")); g_packed_w = (float)atof(opt(argc,argv,"--packed-weight","0")); g_packed_um = (float)atof(opt(argc,argv,"--packed-um","120")); g_contact_w = (float)atof(opt(argc,argv,"--contact-weight","0")); g_contact_um = (float)atof(opt(argc,argv,"--contact-um","70"));
+        if (g_contact_w < 0 || g_contact_w > 255 || !(g_contact_um > 0)) { fprintf(stderr, "--contact-weight 0..255, --contact-um > 0\n"); return 2; }
+        if (g_contact_w > 1) fprintf(stderr, "--contact-weight %g: rv and fibre H / V losses x %g where labelled sheets are <= %g um apart (linear to 1 at %g um; head slabs only)\n", g_contact_w, g_contact_w, g_contact_um, 1.5 * g_contact_um);
         g_dens_um = (float)atof(opt(argc,argv,"--density-um","0"));
         if (g_dens_um < 0) { fprintf(stderr,"--density-um >= 0\n"); return 2; }
         if (sscanf(opt(argc,argv,"--sheet-mask","0,0"), "%f,%f", &g_sheet_lo, &g_sheet_hi) < 1) g_sheet_hi = g_sheet_lo = 0;
