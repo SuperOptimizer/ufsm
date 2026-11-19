@@ -20,6 +20,7 @@
    turn and the share off by >= 0.5 turn, as the ctgt.py table (and the CT peaks again on the intervals with predictions: the same rays for both); also the peaks of the rv signal and of H - V (the CT detector on those
    signals: recto-ruler's "peaks of the fused signal", one per sheet where the side runs alternate). */
 #include "fit.h"
+#include "latfit.h"
 #include "optcheck.h"
 #include "sysinfo.h"
 #include "store.h"
@@ -45,6 +46,7 @@ typedef struct { int box; int z; float rmm, dq, gap; int npk, rvf, rvb, fbf, fbb
 typedef struct {
     z3 *ct, *cd, *cl, **rvz, **fhz, **fvz; int plocal; double ctum, cum, clum, bum, rvthr, fthr, fmar, sig;
     const gt_box *bx; int nbox, nz, nth;
+    const lat_basis *lb; int lc; double lstep, lcen, lsc;   /* --lat-rt: the CT through the latent cell codec first */
     gt_row **rows; int *nrow, *cap;   /* per job */
     pthread_mutex_t mu; int done; char err[256];
 } gt_job;
@@ -114,6 +116,30 @@ static void flips(const int8_t *raw, int n, uint8_t *f12, uint8_t *f21) {
     for (int i = 0; i < n; i++) { const int r = raw[i]; if (!r || r == s) continue; if (s == 1 && r == 2) f12[i] = 1; else if (s == 2 && r == 1) f21[i] = 1; s = r; }
 }
 
+/* --lat-rt BASIS: replace plane zn of the CT by what a latent-grid net reads of it: each 4^3 cell (global 4-aligned grid) of the
+   normalised CT (v - centre) / scale on the first lc basis rows, quantised to lstep (0: not; |q| <= 127, the mean 32767) as
+   input_latc_k (lp_mx_cvt.cu) does, then back to voxels (orthonormal basis: the sum of q_c b_c) and to CT units */
+static int lat_rt(const gt_job *J, int64_t zn, int64_t Y0, int64_t X0, int H, int W, float *ct) {
+    const int64_t zc = zn & ~(int64_t)3, yc = Y0 & ~(int64_t)3, xc = X0 & ~(int64_t)3; const int dz = (int)(zn - zc);
+    const int HH = (int)(((Y0 + H + 3) & ~(int64_t)3) - yc), WW = (int)(((X0 + W + 3) & ~(int64_t)3) - xc);
+    uint8_t *b = malloc((size_t)4 * HH * WW); if (!b) return 1;
+    for (int k = 0; k < 4; k++) if (rd(J->ct, zc + k, yc, xc, HH, WW, b + (size_t)k * HH * WW)) { free(b); return 1; }
+    for (int cy = 0; cy < HH; cy += 4) for (int cx = 0; cx < WW; cx += 4) {
+        float v[64], r[64] = {0};
+        for (int k = 0; k < 64; k++) v[k] = (float)((b[((size_t)(k >> 4) * HH + cy + (k >> 2 & 3)) * WW + cx + (k & 3)] - J->lcen) / J->lsc);
+        for (int c = 0; c < J->lc; c++) {
+            float s = 0.f; for (int k = 0; k < 64; k++) s += J->lb->b[c][k] * v[k];
+            if (J->lstep > 0) { const float lim = c ? 127.f : 32767.f, st = (float)J->lstep; s = fminf(lim, fmaxf(-lim, rintf(s / st))) * st; }
+            for (int k = 0; k < 64; k++) r[k] += s * J->lb->b[c][k];
+        }
+        for (int k = 16 * dz; k < 16 * dz + 16; k++) {
+            const int64_t y = yc + cy + (k >> 2 & 3) - Y0, x = xc + cx + (k & 3) - X0;
+            if (y >= 0 && y < H && x >= 0 && x < W) ct[y * W + x] = (float)(r[k] * J->lsc + J->lcen);
+        }
+    }
+    free(b); return 0;
+}
+
 static void gt_plane(void *ctx, int a0, int a1, int t) {
     gt_job *J = ctx; (void)t;
     for (int job = a0; job < a1; job++) {
@@ -139,6 +165,7 @@ static void gt_plane(void *ctx, int a0, int a1, int t) {
         const double cy = (sy / nm + 0.5) / f2 - 0.5, cx = (sx / nm + 0.5) / f2 - 0.5, cyl = cy - y0, cxl = cx - x0;
         float *ct = malloc(sizeof(float) * (size_t)H * W), *rvf = rvb ? malloc(sizeof(float) * (size_t)H * W) : nullptr, *fhf = fhb ? malloc(sizeof(float) * (size_t)H * W) : nullptr, *fvf = fhb ? malloc(sizeof(float) * (size_t)H * W) : nullptr;
         for (size_t i = 0; i < (size_t)H * W; i++) { ct[i] = ctb[i]; if (rvf) rvf[i] = rvb[i]; if (fhf) { fhf[i] = fhb[i]; fvf[i] = fvb[i]; } }
+        if (J->lb && lat_rt(J, zn, Y0, X0, H, W, ct)) { pthread_mutex_lock(&J->mu); snprintf(J->err, sizeof J->err, "box %s z %lld: --lat-rt read: %s", B->name, (long long)zn, z3_error()); pthread_mutex_unlock(&J->mu); }
         const size_t qn = (size_t)QH * QW; float *lab = malloc(sizeof(float) * qn), *gy = malloc(sizeof(float) * qn), *gx = malloc(sizeof(float) * qn), *jyy = malloc(sizeof(float) * qn), *jxx = malloc(sizeof(float) * qn), *jyx = malloc(sizeof(float) * qn);
         for (size_t i = 0; i < qn; i++) lab[i] = cdb[i] > 0;
         gauss2(lab, QH, QW, 1.0); sobel(lab, QH, QW, 0, gy); sobel(lab, QH, QW, 1, gx);
@@ -216,6 +243,7 @@ int cmd_gt_trans(int argc, char **argv) {
     if (argc < 14) {
         fprintf(stderr, "usage: ufsm gt-trans ROOT CTKEY CTUM CODEROOT CODEKEY CODEUM CENTREKEY CENTREUM BOXES_TSV SCROLL BOXUM OUT.tsv [--nz 8] [--nth 360]\n"
                         "                     [--rv ROOT KEY] [--fh ROOT KEY --fv ROOT KEY] [--rv-thr 8] [--fib-thr 8] [--fib-margin 4] [--ct-sig 1.2] [--threads N]\n"
+                        "                     [--lat-rt BASIS.lcb --lat-c 29 --lat-step 0.25 --lat-norm CENTRE,SCALE]\n"
                         "  CT peaks, recto / verso and fibre-direction flips per GT turn by normal gap (src/gttrans.c)\n");
         return 2;
     }
@@ -224,6 +252,15 @@ int cmd_gt_trans(int argc, char **argv) {
                 .fthr = opt_atof("--fib-thr", gt_opt(argc, argv, "--fib-thr", "8")), .fmar = opt_atof("--fib-margin", gt_opt(argc, argv, "--fib-margin", "4")),
                 .sig = opt_atof("--ct-sig", gt_opt(argc, argv, "--ct-sig", "1.2"))};
     pthread_mutex_init(&J.mu, nullptr);
+    const char *lbp = gt_opt(argc, argv, "--lat-rt", nullptr);
+    if (lbp) {
+        lat_basis *lb = malloc(sizeof *lb); if (lat_basis_load(lbp, lb)) { fprintf(stderr, "gt-trans: --lat-rt: cannot read %s\n", lbp); return 1; }
+        J.lb = lb; J.lc = opt_atoi("--lat-c", gt_opt(argc, argv, "--lat-c", "29")); J.lstep = opt_atof("--lat-step", gt_opt(argc, argv, "--lat-step", "0.25"));
+        if (J.lc < 1 || J.lc > 64) { fprintf(stderr, "gt-trans: --lat-c 1..64\n"); return 1; }
+        const char *nm = gt_opt(argc, argv, "--lat-norm", nullptr);
+        if (!nm || sscanf(nm, "%lf,%lf", &J.lcen, &J.lsc) != 2 || J.lsc <= 0) { fprintf(stderr, "gt-trans: --lat-rt needs --lat-norm CENTRE,SCALE (predict's --scan-norm line)\n"); return 1; }
+        fprintf(stderr, "gt-trans: CT through the latent codec: %d coefficients of %s, step %g, norm (v - %g) / %g\n", J.lc, lbp, J.lstep, J.lcen, J.lsc);
+    }
     if (!(J.ct = gt_open(argv[2], argv[3])) || !(J.cd = gt_open(argv[5], argv[6])) || !(J.cl = gt_open(argv[2], argv[8]))) return 1;
     const char *rr = gt_opt2(argc, argv, "--rv", 0), *rk = gt_opt2(argc, argv, "--rv", 1), *hr = gt_opt2(argc, argv, "--fh", 0), *hk = gt_opt2(argc, argv, "--fh", 1),
                *vr = gt_opt2(argc, argv, "--fv", 0), *vk = gt_opt2(argc, argv, "--fv", 1);
