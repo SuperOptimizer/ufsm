@@ -28,7 +28,7 @@ int dcache_set_batch(z3 *z, int edge);
 int dcache_key_dir(const char *dir, const char *key, char *out, size_t nout);
 /* the default cache root: $UFSM_DERIVED_CACHE ("off" / "0" = none), else $HOME/.cache/ufsm/derived */
 const char *dcache_default_dir(void);
-typedef struct { uint64_t reads, cells_mem, cells_disk, cells_computed, cells_fill, disk_bytes_written; double s_compute, s_disk; uint64_t cells_evicted, cells_recomputed, bytes_evicted; } dcache_stats;
+typedef struct { uint64_t reads, cells_mem, cells_disk, cells_computed, cells_fill, disk_bytes_written; double s_compute, s_disk; uint64_t cells_evicted, cells_recomputed, bytes_evicted, cells_dense; double s_dense; } dcache_stats;
 void dcache_get_stats(dcache_stats *st);   /* process-wide sums over every cached array */
 /* one eviction pass over a cache root (the background thread's; tests): LRU key dirs deleted while the root is over UFSM_DCACHE_GB or its
    filesystem under UFSM_DCACHE_FREE_GB, keys used within UFSM_DCACHE_PROTECT_MIN kept. 1: another process holds the root's lock */
@@ -37,3 +37,11 @@ int dcache_evict_pass(const char *root);
    delta (circular, period 252) of the computed phase, the unknown mask exact; the memory copy is the same reconstruction. delta 0:
    exact (UDC1). Put delta in the array's key (lossy and exact cells never share a dir). Set before the first read. 0 ok */
 int dcache_set_phase(z3 *z, int delta);
+/* the dense label store (denselab, DESIGN 2026-11-19): ROOT/<hex>/{inputs.txt, a/ (zarr), shards.bin}; a cached array whose key has a
+   store there reads missed cells of rendered shards from it (then the local disk cache) instead of computing them. Root: $UFSM_DENSELAB
+   ("off" / "0" none), else $HOME/nas/denselab when that directory exists. Read once per process. */
+const char *dcache_dense_root(void);
+/* DIR/shards.bin: shard edge, shard grid, one byte per shard (1 rendered); 0 ok (*bits malloc'd) */
+int dcache_dense_shards(const char *dir, int64_t *S, int64_t grid[3], uint8_t **bits);
+/* a cached array's key text (owned by the array), its 24-hex hash (25 bytes with the NUL), cell edge and phase delta: 0, or -1 (not a cached array) */
+int dcache_info(z3 *z, const char **key, char hex[25], int *cell, int *pdelta);

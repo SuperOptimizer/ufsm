@@ -4019,8 +4019,8 @@ int cmd_train(int argc, char **argv) {
             sampler_hostmem(sq, stderr, 0);
             uint64_t prod = 0, rej = 0; sampler_stats(sq, &prod, &rej); fprintf(stderr, "sampler-only: produced %llu rejected %llu\n", (unsigned long long)prod, (unsigned long long)rej);
             { dcache_stats dc; dcache_get_stats(&dc); phase_onfly_stats po; phase_onfly_get_stats(&po);   /* (perf2: how much of the on-the-fly labels the derived cache served) */
-              fprintf(stderr, "sampler-only: derived cache %llu cells from memory, %llu from disk, %llu computed (%.1f s); onfly phase %llu reads, %llu tiles, %.1f s in the pair rule\n",
-                      (unsigned long long)dc.cells_mem, (unsigned long long)dc.cells_disk, (unsigned long long)dc.cells_computed, dc.s_compute,
+              fprintf(stderr, "sampler-only: derived cache %llu cells from memory, %llu from disk (%llu of them from the dense store, %.1f s), %llu computed (%.1f s); onfly phase %llu reads, %llu tiles, %.1f s in the pair rule\n",
+                      (unsigned long long)dc.cells_mem, (unsigned long long)(dc.cells_disk + dc.cells_dense), (unsigned long long)dc.cells_dense, dc.s_dense, (unsigned long long)dc.cells_computed, dc.s_compute,
                       (unsigned long long)po.reads, (unsigned long long)po.tiles, po.s_pair); }
             { phase_onfly_stats os; phase_onfly_get_stats(&os);
               if (os.reads) fprintf(stderr, "sampler-only: onfly phase: %llu reads, %llu tiles (%llu GPU-decoded, %llu skipped), %.1f M tile voxels; per read: %.0f ms queued for a tile buffer, %.0f ms in the pair rule (%.0f ms a tile, %.0f Mvox/s of tile), %.0f ms in CPU codes reads\n",
@@ -5966,10 +5966,10 @@ int cmd_train(int argc, char **argv) {
             }
             {   /* the derived-array caches (dcache.h: the onfly phase of meshes and, since 2026-11-13, of stored codes; the onfly ink) since the last line */
                 static dcache_stats d0; dcache_stats d1; dcache_get_stats(&d1);
-                const unsigned long long cm = d1.cells_mem - d0.cells_mem, cd = d1.cells_disk - d0.cells_disk, cc = d1.cells_computed - d0.cells_computed;
+                const unsigned long long cm = d1.cells_mem - d0.cells_mem, cd = d1.cells_disk - d0.cells_disk, cc = d1.cells_computed - d0.cells_computed, cs = d1.cells_dense - d0.cells_dense;
                 const unsigned long long ce = d1.cells_evicted - d0.cells_evicted, cr = d1.cells_recomputed - d0.cells_recomputed;
-                if (cm + cd + cc) fprintf(stderr, "  derived cache: %llu cells from memory, %llu from disk, %llu computed (%.1f s)%s", cm, cd, cc, d1.s_compute - d0.s_compute, ce + cr || d1.cells_evicted ? "" : "\n");
-                if ((cm + cd + cc) && (ce + cr || d1.cells_evicted)) fprintf(stderr, ", %llu of them recomputes of evicted cells; %llu cells (%.1f GB) evicted since the last line\n", cr, ce, (d1.bytes_evicted - d0.bytes_evicted) / 1e9);
+                if (cm + cd + cc + cs) fprintf(stderr, "  derived cache: %llu cells from memory, %llu from disk, %llu from the dense store, %llu computed (%.1f s)%s", cm, cd, cs, cc, d1.s_compute - d0.s_compute, ce + cr || d1.cells_evicted ? "" : "\n");
+                if ((cm + cd + cc + cs) && (ce + cr || d1.cells_evicted)) fprintf(stderr, ", %llu of them recomputes of evicted cells; %llu cells (%.1f GB) evicted since the last line\n", cr, ce, (d1.bytes_evicted - d0.bytes_evicted) / 1e9);
                 d0 = d1; }
             { static int memlog = -1; if (memlog < 0) memlog = ufsm_env_on("UFSM_SYNC_CHECK");   /* device memory free per GPU at each log line (a leak) */
               if (memlog) { fprintf(stderr, "  device memory free:"); for (int g = 0; g < ng; g++) { nn_init(G[g].dev); fprintf(stderr, " GPU %d %.1f MB", G[g].dev, nn_mem_free() / 1e6); } fprintf(stderr, "\n"); nn_init(G[0].dev); } }
