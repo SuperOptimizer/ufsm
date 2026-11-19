@@ -6,6 +6,59 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## How much GT does the global count need? Sparse GT anchors in count-field; P4 phase misses by normal gap (2026-11-18/19, branch anchors-20261118, mergeflag)
+
+User (via lead): "how much ground truth do we actually need?" Test: feed count-field's least-squares ref sparse GT anchors and score
+GT ids on boxes that got none. `ufsm gt-anchors CODES KEY FIELDS --boxes B.tsv --hold N,.. --kind pin|pair --p P` samples labelled
+GT voxels (a hash per voxel, rate P) outside the held-out boxes:
+- pin (A): the GT winding at a voxel, as U' = W + dir theta / 2 pi, lifted to the ref's 14-turn period after a per-box gauge pass
+  (mode of U'_ref - code / 18);
+- pair (R): from a sampled voxel, along the radial ray to the k-th distinct GT sheet (k 1..3, ~17 % each of dU +-1/2/3, median
+  47 native voxels apart): only the turn difference dU.
+Records are merged per 16-voxel cell. count-field `--anchor-pins F` / `--anchor-pairs F` add them as cf_pairs rows (pins: the a half
+only), weight `--anchor-w 10` x min(n, `--anchor-ncap 4`), never IRLS-reweighted, and kept in no-data cells (17 % of pairs were
+dropped there before 5220bf2b). test_countfield: GT pairs / pins restore a cut band sector (err 0.000), wrong dU does not (1.000).
+
+1667 q2 (try9 fields, mf-weighted ref `--mf-w 1`, CPU, pass 1 from a pool cache: ~7-10 min / run, 7-11 GB), 54 GT boxes split
+27 held out / 27 anchor boxes (3.20 cm^3, 1.18 G labelled voxels), seed 1, GT ids right:
+
+| kind | p | anchors | per cm^3 | anchor boxes | held-out boxes |
+|---|---|---|---|---|---|
+| none | 0 | 0 | 0 | 0.8876 | 0.8916 |
+| pair | 1e-5 | 10.1 k | 3.2 k | 0.8988 | 0.8907 |
+| pair | 1e-4 | 100 k | 31 k | 0.9351 | 0.8923 |
+| pair | 1e-3 | 1.0 M | 314 k | 0.9699 | 0.8926 |
+| pair | 1e-2 | 10 M | 3.1 M | 0.9736 | 0.8923 |
+| pair | 1e-1 | 101 M | 31 M | 0.9714 | 0.8923 |
+| pin | 1e-5 | 11.9 k | 3.7 k | 0.9178 | 0.8999 |
+| pin | 1e-4 | 117 k | 37 k | 0.9517 | 0.9006 |
+| pin | 1e-3 | 1.2 M | 369 k | 0.9692 | 0.9014 |
+| pin | 1e-2 | 11.8 M | 3.7 M | 0.9709 | 0.9003 |
+| pin | 1e-1 | 118 M | 37 M | 0.9711 | 0.9001 |
+
+- Locally anchors work: pins 3.7 k / cm^3 (~12 k points over the 27 boxes) already take the anchor boxes 0.888 -> 0.918, 37 k /
+  cm^3 -> 0.952, and both kinds saturate at ~0.97 from ~300 k / cm^3 (the rest is the per-box id scoring / label noise floor).
+  Pairs need ~10x the pins' density for the same local gain.
+- They do not carry: held-out boxes gain +0.008-0.010 with pins at any density (the absolute gauge spreads), pairs +0.000-0.001.
+  The ref's errors are local (merged / packed regions, C19-type cores) and the anchors' constraints die out within a box or two:
+  GT helps where it is, not around it. "How much GT": ~10^4 pins per cm^3 where counting fails, nothing gained elsewhere.
+- Seed 2 skipped (lead). Data: /vesuvius/ufsm/mergeflag/anc (sweep.sh, sweep.out, hold.txt).
+
+P4 phase misses (`merge-flag --eval --gap-report G [--thr T]`): per GT one-turn interval along radial rays (eval's truth: the net's
+phase misses the turn), the flag's P / R, the miss share by radial gap and by NORMAL gap (in-slice GT sheet normal from the
+covariance of the same-code label voxels, gap x |cos ray,normal|). 38 P4 GT boxes, identical intervals for both nets (same axis):
+
+| net | all 38 | PH1-3 | J1-34 | HOLD | PH1-3 at normal gap >= 150 um | J at >= 150 um | HOLD at >= 150 um |
+|---|---|---|---|---|---|---|---|
+| u1 13790 | 0.436 | 0.752 | 0.437 | 0.176 | 0.58 | 0.36 | 0.07 |
+| try9 16000 live | 0.379 | 0.606 | 0.381 | 0.174 | 0.38 | 0.29 | 0.08 |
+
+1667 (9 boxes): u1 0.183, try9 EMA 12750 0.234 (EMA understates try9; P4 EMA 0.514 vs live 0.379), >= 150 um 0.08 / 0.11.
+PH1-3 is oblique to the radial rays (median |cos| 0.63 vs 0.93-0.98 elsewhere: radial gaps overstate spacing 1.6x) and denser
+(52 % of normal gaps < 100 um vs 21 % in HOLD), but at the same normal gap it still misses 4-8x more than HOLD / 1667: a genuine
+phase failure on P4 (J boxes are not oblique), reduced by try9. The flag at mf >= 179 on u1 P4 fields: 38 % flagged, P 0.90 R 0.80
+vs the misses (1667 5.6 %, P 0.82 R 0.34): unrollperf's 42 % mf on P4 is real. Data: /vesuvius/ufsm/mergeflag/gapchk.
+
 ## Recto / verso and fibre direction do not separate touching sheets either: try9's heads count fewer boundaries than the CT (2026-11-18, branch rvsep-20261118, unrollperf)
 
 **Question (user via lead).** Each sheet is a recto layer (horizontal fibres) on a verso layer (vertical fibres). Along a ray through a
