@@ -37,6 +37,9 @@ typedef struct {
     int lat_guide;         /* latent-grid nets (half_res 3): 5 = the guided head (nn_lat_guide): cout = the task's outputs + 5 coefficient planes; 8 = the general form
                               (nn_lat_guide4): cout 32, the last 8 are 4 coefficients for each of the 2 guided channels; 64 = the sub-cell head
                               (nn_lat_shuffle): cout 144, outputs 16 + 64 j + sub are channel j's (the phase / side pair) value at each of the cell's 64 voxels */
+    int lat_nsub;          /* lat_guide 64 (--lat-sub, 2026-11-19): the outputs with sub-cell rows, lat_sub[0 .. lat_nsub), in row order: channel lat_sub[k]'s
+                              64 rows at sbase + 64 k, sbase = cout - 64 nsub; 0 = the phase pair only ({0, 1}: the old 144 / 160-output layout, no header key) */
+    int8_t lat_sub[16];
     int half_res;          /* the caller runs the network on 2x2x2 blocks of its window (nn_half_*): 1 pool (cin 4, the block means; logits
                               upsampled trilinearly), 2 pack (cin 8: the block means, the CT's sub-voxel gradients and contrast;
                               cout 8 per output, one per sub-voxel); 3 pool4, 4 pack4: the network on 4^3 blocks (a 2x pool / trilinear 2x
@@ -113,6 +116,15 @@ typedef struct {
                               features, a projection to fstem_out (<= 16) head outputs added on the logits by the trainer's head slabs). Params
                               appended last (W1 He-initialised, b1 and the projection zero: the donor's function), header key "fstem" only when on */
 } unet_cfg;
+/* the sub-cell head's layout (lat_guide 64): the channels with sub-cell rows, their first row (sbase + 64 k), -1 for a channel without */
+static inline int unet_lat_nsub(const unet_cfg *c) { return c->lat_guide != 64 ? 0 : c->lat_nsub ? c->lat_nsub : 2; }
+static inline int unet_lat_subch(const unet_cfg *c, int k) { return c->lat_nsub ? c->lat_sub[k] : k; }
+static inline int unet_lat_sbase(const unet_cfg *c) { return c->cout - 64 * unet_lat_nsub(c); }
+static inline int unet_lat_subrow(const unet_cfg *c, int ch) {
+    const int n = unet_lat_nsub(c);
+    for (int k = 0; k < n; k++) if (unet_lat_subch(c, k) == ch) return unet_lat_sbase(c) + 64 * k;
+    return -1;
+}
 /* the attention stage reads the scroll axis records (unet_set_attn_axis): radial attention, scroll RoPE or normal-frame deformable offsets */
 static inline int unet_cfg_axis(const unet_cfg *c) { return c->attn_blocks > 0 && (c->attn_axis == 1 || c->attn_pe == 3 || (c->attn_deform && c->attn_dinit == 1)); }
 static inline int unet_hr_div(int hr) { return hr >= 3 ? 4 : hr ? 2 : 1; }      /* the window voxels per network voxel along each axis */

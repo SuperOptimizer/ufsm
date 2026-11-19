@@ -363,8 +363,9 @@ int main(void) {
         nn_free(d_ct); nn_free(d_dy); nn_free(d_x); nn_free(d_t); nn_free(d_a); nn_free(d_b); nn_free(d_lc); nn_free(d_l16); nn_free(d_lt); nn_free(d_lf); nn_free(d_bits); nn_free(d_s0); nn_free(d_s1);
         free(ct); free(dy); free(ha); free(hb); free(lc); free(lc16); free(s0); free(s1);
     }
-    {   /* the sub-cell head (nn_lat_shuffle / _adj): forward against a host reference (fp16 and fp32 coarse logits), the adjoint by dot products */
-        const int d = 3, h = 2, w = 2, D = 12, H = 8, W = 8, base = 3, ng = 2, C = base + 64 * ng; const size_t nc = (size_t)d * h * w, hw = (size_t)H * W;
+    for (int sc_ = 0; sc_ < 3; sc_++) {   /* the sub-cell head (nn_lat_shuffle / _adj): forward against a host reference (fp16 and fp32 coarse logits), the adjoint by dot
+                                            products; the phase pair (base 3, 2 groups) and --lat-sub's later runs (a single output 128 rows on, a run of 3) */
+        const int d = 3, h = 2, w = 2, D = 12, H = 8, W = 8, base = sc_ == 0 ? 3 : sc_ == 1 ? 131 : 67, ng = sc_ == 0 ? 2 : sc_ == 1 ? 1 : 3, C = base + 64 * ng; const size_t nc = (size_t)d * h * w, hw = (size_t)H * W;
         float *lf = malloc(C * nc * 4); uint16_t *lh_ = malloc(C * nc * 2);
         for (size_t k = 0; k < C * nc; k++) { lh_[k] = f2h(ru()); lf[k] = h2f(lh_[k]); }
         void *d_lf = nn_malloc(C * nc * 4), *d_lh = nn_malloc(C * nc * 2), *d_gc = nn_malloc(C * nc * 2); nn_h2d(d_lf, lf, C * nc * 4); nn_h2d(d_lh, lh_, C * nc * 2);
@@ -390,7 +391,7 @@ int main(void) {
             nn_d2h(gc, d_gc, C * nc * 2);
             for (size_t k = (size_t)base * nc; k < C * nc; k++) dot2 += (double)lf[k] * h2f(gc[k]);
             const double de = fabs(dot1 - dot2) / (1e-9 + fabs(dot1)); cases++;
-            if (!(e0 < 3e-3) || !(de < 1e-4)) { fprintf(stderr, "FAIL: sub-cell head (%s logits): forward rel err %.3g, adjoint dot rel err %.3g\n", f ? "fp16" : "fp32", e0, de); fails++; }
+            if (!(e0 < 3e-3) || !(de < 1e-4)) { fprintf(stderr, "FAIL: sub-cell head (base %d, %d outputs, %s logits): forward rel err %.3g, adjoint dot rel err %.3g\n", base, ng, f ? "fp16" : "fp32", e0, de); fails++; }
         }
         free(lf); free(lh_); free(gc); nn_free(d_lf); nn_free(d_lh); nn_free(d_gc);
     }

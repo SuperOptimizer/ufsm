@@ -899,17 +899,17 @@ static int seam_flush(seam_t *M, phead_t *PH, int *phd) {   /* versions whose pa
 /* the fine stem's output row of channel c (train: the voxel-logit outputs c < 2 or c >= 9 below cout, the first fstem_out of them; -1 none) */
 static int phead_stem_row(const unet_cfg *cfg, int c) {
     if (!cfg->fstem) return -1;
-    int k = 0; const int nb = cfg->lat_guide == 64 ? cfg->cout - 128 : cfg->cout;
+    int k = 0; const int nb = cfg->lat_guide == 64 ? unet_lat_sbase(cfg) : cfg->cout;
     for (int j = 0; j < nb && k < cfg->fstem_out; j++) if (j < 2 || j >= 9) { if (j == c) return k; k++; }
     return -1;
 }
 static int phead_add(phead_t *H, int *nh, const unet_cfg *cfg, const char *name, int c0, int c1, const char *content) {
-    const int nb = cfg->lat_guide == 64 ? cfg->cout - 128 : cfg->cout;
+    const int nb = cfg->lat_guide == 64 ? unet_lat_sbase(cfg) : cfg->cout;
     if (*nh >= PHEAD_MAX || c0 < 0 || c0 >= nb || c1 >= nb) { fprintf(stderr, "predict --heads: %s: channel %d / %d outside the %d head outputs (or more than %d heads)\n", name, c0, c1, nb, PHEAD_MAX); return 1; }
     phead_t *h = &H[(*nh)++]; memset(h, 0, sizeof *h);
     snprintf(h->name, sizeof h->name, "%s", name); snprintf(h->content, sizeof h->content, "%s", content);
     h->c0 = c0; h->c1 = c1;
-    h->sb0 = cfg->lat_guide == 64 && c0 < 2 ? cfg->cout - 128 + 64 * c0 : -1; h->sb1 = cfg->lat_guide == 64 && c1 >= 0 && c1 < 2 ? cfg->cout - 128 + 64 * c1 : -1;
+    h->sb0 = unet_lat_subrow(cfg, c0); h->sb1 = c1 >= 0 ? unet_lat_subrow(cfg, c1) : -1;   /* (the phase pair's, or --lat-sub's rv / fibre / ink rows) */
     h->s0 = phead_stem_row(cfg, c0); h->s1 = c1 >= 0 ? phead_stem_row(cfg, c1) : -1;
     return 0;
 }
@@ -1213,7 +1213,7 @@ static const float *tta_pass(const tta_ctx *T, int code) {
         const int l2h = unet_logits_h16(T->u), c4 = T->W / 4;
         if (T->lguide == 64) {
             nn_lat_up_slab(l2, l2h, 11, c4, c4, c4, 0, T->W, *T->lgfp);
-            nn_lat_shuffle(l2, l2h, c4, c4, c4, T->cout - 128, 2, 0, T->W, *T->lgfp);
+            nn_lat_shuffle(l2, l2h, c4, c4, c4, unet_lat_sbase(unet_cfg_of(T->u)), 2, 0, T->W, *T->lgfp);
             if (T->fsp) {   /* the fine stem into the 11 task planes (PRED_FSTEM of the plain pass: outputs c < 2 or c >= 9, in channel order) */
                 int fm[16], k = 0; const size_t w3 = (size_t)T->D * T->W * T->W;
                 for (int c = 0; c < T->cout && k < T->fstem_out; c++) if (c < 2 || c >= 9) fm[k++] = c < 11 ? c : -1;
@@ -3069,7 +3069,7 @@ static int predict_one(int argc, char **argv) {
                 }
                 else if (ffd && cfg.lat_guide == 64) {   /* the sub-cell head: the 11 task planes, the phase pair's per-voxel terms */
                     nn_lat_up_slab(l2, unet_logits_h16(u), 11, W / 4, W / 4, W / 4, 0, W, lgf);
-                    nn_lat_shuffle(l2, unet_logits_h16(u), W / 4, W / 4, W / 4, cfg.cout - 128, 2, 0, W, lgf);
+                    nn_lat_shuffle(l2, unet_logits_h16(u), W / 4, W / 4, W / 4, unet_lat_sbase(&cfg), 2, 0, W, lgf);
                     if (cfg.fstem) PRED_FSTEM(0, W, lgf, w3, c < 11 ? c : -1);   /* (the 11 task planes) */
                 }
                 else if (ffd) nn_lat_up_slab(l2, unet_logits_h16(u), cfg.cout, W / 4, W / 4, W / 4, 0, W, lgf);   /* [cout][W][W][W] fp16: the accumulators' layout */
@@ -3086,7 +3086,7 @@ static int predict_one(int argc, char **argv) {
                         }
                         nn_lat_up_slab(l2, unet_logits_h16(u), 2, W / 4, W / 4, W / 4, z0, 32, g_ps.gsl);
                         if (cfg.lat_guide == 64) {   /* the sub-cell head: the side pair's per-voxel terms */
-                            if (!ufsm_env_on("UFSM_PRED_NOSHUF")) nn_lat_shuffle(l2, unet_logits_h16(u), W / 4, W / 4, W / 4, cfg.cout - 128, 2, z0, 32, g_ps.gsl);   /* (diagnostic: the interpolated base alone) */
+                            if (!ufsm_env_on("UFSM_PRED_NOSHUF")) nn_lat_shuffle(l2, unet_logits_h16(u), W / 4, W / 4, W / 4, unet_lat_sbase(&cfg), 2, z0, 32, g_ps.gsl);   /* (diagnostic: the interpolated base alone) */
                             if (cfg.fstem) PRED_FSTEM(z0, 32, g_ps.gsl, ns_, c < 2 ? c : -1);
                             for (int c = 0; c < 2; c++) nn_d2d_async((char *)lgf + ((size_t)c * w3 + (size_t)z0 * hw_) * 2, (char *)g_ps.gsl + (size_t)c * ns_ * 2, ns_ * 2);
                             continue;
@@ -3178,7 +3178,7 @@ static int predict_one(int argc, char **argv) {
                                     fprintf(stderr, "predict: --fit-zarr: the winding pass from the pair's fp16 planes (%.0f MB; UFSM_PRED_FIT_W4P=0: the partner regions)\n",
                                             (double)2 * (ffzc * ffh + ffw4d) * hw * 2 / 1e6);
                                 }
-                                if (!nn_fit_accum_lat_w4p(l2d, lh, Wz / 4, wc, wc, g64 ? cfg.cout - 128 : -1, stm ? unet_active_params(u) + unet_fstem_off(u) : nullptr, cfg.fstem, so_,
+                                if (!nn_fit_accum_lat_w4p(l2d, lh, Wz / 4, wc, wc, g64 ? unet_lat_sbase(&cfg) : -1, stm ? unet_active_params(u) + unet_fstem_off(u) : nullptr, cfg.fstem, so_,
                                                           ct_shared ? ctcp : ctd, ct_shared ? nullptr : ctd, ct_shared ? ctm : nullptr, (float)mean, (float)(1.0 / sd), hz, halo,
                                                           (int)(tz - cz * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz,
                                                           ff_rec, ff_ph, ff_nrm, ff_den, ffds, ffdc, ffacc, ffw4d ? ff_w4 : -1, ffw4d, ffacc4, w4p ? fzW : nullptr, a, bq + ffw4d - a)) {
@@ -3230,7 +3230,7 @@ static int predict_one(int argc, char **argv) {
                                 const int x0_ = (z0_) > 0 ? (z0_) - 1 : 0, x1_ = (z0_) + (nz_) < Wz ? (z0_) + (nz_) + 1 : Wz; \
                                 nn_lat_ct_x(ct_shared ? ctcp : ctd, W, x0_, x1_ - x0_, (float)mean, (float)(1.0 / sd), fzX); \
                                 if (nn_fstem_up_fwd_t((const void *)((uintptr_t)fzX - (size_t)x0_ * hw * 2), Wz, W, W, (z0_), (nz_), unet_active_params(u) + unet_fstem_off(u), cfg.fstem, \
-                                                      cfg.fstem_out, ch_, (P), (size_t)(nz_) * hw, (LC), lh, q0, qd, (SIDE), g64 ? cfg.cout - 128 : 0)) break; \
+                                                      cfg.fstem_out, ch_, (P), (size_t)(nz_) * hw, (LC), lh, q0, qd, (SIDE), g64 ? unet_lat_sbase(&cfg) : 0)) break; \
                                 fsu_ = 1; \
                                 for (int j = 0; j < (NP);) { if (cov_ >> j & 1u) { j++; continue; } int e_ = j; while (e_ < (NP) && !(cov_ >> e_ & 1u)) e_++; \
                                     nn_lat_up_slab_c((const char *)(LC) + (size_t)j * cq_ * es_, lh, e_ - j, wc, wc, wc, (z0_), (nz_), (char *)(P) + (size_t)j * (nz_) * hw * 2, q0, qd); j = e_; } } while (0)
@@ -3238,7 +3238,7 @@ static int predict_one(int argc, char **argv) {
                             if (fsu_) nn_ptick("fit: fused up + stem");
                             else {
                                 nn_lat_up_slab_c(l2d, lh, cup, wc, wc, wc, zs, nzs, fzA, q0, qd);
-                                if (g64) nn_lat_shuffle_c(l2d, lh, wc, wc, wc, cfg.cout - 128, 2, zs, nzs, fzA, q0, qd);   /* the sub-cell head: the phase pair's per-voxel terms */
+                                if (g64) nn_lat_shuffle_c(l2d, lh, wc, wc, wc, unet_lat_sbase(&cfg), 2, zs, nzs, fzA, q0, qd);   /* the sub-cell head: the phase pair's per-voxel terms */
                                 nn_ptick("fit: upsample + shuffle");
                                 FZ_STEM(zs, nzs, fzA, c < 11 ? c : -1);
                                 nn_ptick("fit: stem");
@@ -3365,7 +3365,7 @@ static int predict_one(int argc, char **argv) {
                     }
                     if (WR.skip) { if (writer_submit(&WR, sb, qz, qy, qx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb = writer_next(&WR, sb); sbuf = WR.buf[sb]; continue; }   /* --no-out */
                     nn_zero(dsh, WR.bytes);
-                    if (ldir && cfg.lat_guide == 64) nn_lat_place_rvs(l2d, unet_logits_h16(u), cfg.cout - 128, W / 4, W / 4, W / 4, ct_shared ? nullptr : ctd, ct_shared ? ctmi : nullptr, nn_get_pred_iso(), halo, halo,
+                    if (ldir && cfg.lat_guide == 64) nn_lat_place_rvs(l2d, unet_logits_h16(u), unet_lat_sbase(&cfg), W / 4, W / 4, W / 4, ct_shared ? nullptr : ctd, ct_shared ? ctmi : nullptr, nn_get_pred_iso(), halo, halo,
                                               (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);
                     else if (ldir && cfg.lat_guide) nn_lat_place_rvg(l2d, unet_logits_h16(u), cfg.cout - cfg.lat_guide, W / 4, W / 4, W / 4, ct_shared ? ctcp : ctd, (float)mean, (float)(1.0 / sd), ct_shared ? nullptr : ctd, ct_shared ? ctmi : nullptr, nn_get_pred_iso(), halo, halo,
                                               (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, dsh);

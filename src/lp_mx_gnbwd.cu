@@ -1144,7 +1144,7 @@ __global__ void __launch_bounds__(256) conv1_to_mx_tc_k(const __half *__restrict
 static int g_head_btc = -1;
 template <int YB> static bool conv1_to_mx_tc(const __half *x, int N, int Ci, size_t S, const float *w, int Co, void *y, unsigned sr, size_t vb, size_t vn) {
     if (g_head_btc < 0) g_head_btc = getenv("UFSM_HEAD_BTC") ? atoi(getenv("UFSM_HEAD_BTC")) : 1;   /* (default on since fuse 2026-11-14: the row scales; UFSM_HEAD_BTC=0 the FFMA kernel) */
-    if (!g_head_btc || Ci <= 16 || Ci > 192 || Co % 32) return false;
+    if (!g_head_btc || Ci <= 16 || Ci > 512 || Co % 32) return false;   /* (Ci > 192: only here, the K loop runs over any Kp; --lat-sub heads 336 / 480) */
     const int Kp = (Ci + 31) / 32 * 32;
     __half *wh = lp_buf<__half>(0, (size_t)Co * Kp + 2 * (size_t)Co);   /* (the only fp16 lp_buf: per element type, slots 0..5); then the row scales */
     float *rs = (float *)(wh + (size_t)Co * Kp);   /* (Co Kp even: Kp a multiple of 32) */
@@ -1157,7 +1157,7 @@ extern "C" void lp_set_head_btc(int on) { g_head_btc = on; }
 extern "C" int lp_head_btc_on(void) { if (g_head_btc < 0) g_head_btc = getenv("UFSM_HEAD_BTC") ? atoi(getenv("UFSM_HEAD_BTC")) : 1; return g_head_btc != 0; }   /* tests: the tensor-core head backward-data on / off (-1: env UFSM_HEAD_TC) */
 /* the same over rows [vb, vb + vn) (x holding vn voxels per channel; the level-0 slab stream's head, stage S4): fp16 / bf16 / fp32 x */
 extern "C" void lp_conv1_to_mx_r(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr, size_t vb, size_t vn) {
-    if (Ci > 192) { fprintf(stderr, "lp_conv1_to_mx_r: Ci %d > 192\n", Ci); abort(); }
+    if (Ci > 192 && !(gdt == 2 && lp_head_btc_on() && Ci <= 512 && Co % 32 == 0)) { fprintf(stderr, "lp_conv1_to_mx_r: Ci %d > 192 (above 192: fp16 gradients on the tensor-core path only, Ci <= 512, Co %% 32 == 0)\n", Ci); abort(); }
 #define C1M(YB) do { if (gdt == 2 && conv1_to_mx_tc<YB>((const __half *)x, N, Ci, S, w, Co, y, sr, vb, vn)) break; \
                      if (gdt == 2) conv1_to_mx_t<__half, YB>((const __half *)x, N, Ci, S, w, Co, y, sr, vb, vn); \
                      else if (gdt == 1) conv1_to_mx_t<bf16, YB>((const bf16 *)x, N, Ci, S, w, Co, y, sr, vb, vn); \
@@ -1167,7 +1167,7 @@ extern "C" void lp_conv1_to_mx_r(const void *x, int gdt, int N, int Ci, size_t S
     LPCK();
 }
 extern "C" void lp_conv1_to_mx(const void *x, int gdt, int N, int Ci, size_t S, const float *w, int Co, void *y, int ydt, unsigned sr) {
-    if (Ci > 192) { fprintf(stderr, "lp_conv1_to_mx: Ci %d > 192\n", Ci); abort(); }
+    if (Ci > 192 && !(gdt == 2 && lp_head_btc_on() && Ci <= 512 && Co % 32 == 0)) { fprintf(stderr, "lp_conv1_to_mx: Ci %d > 192 (above 192: fp16 gradients on the tensor-core path only, Ci <= 512, Co %% 32 == 0)\n", Ci); abort(); }
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
     if (!old || ydt == 4 || Ci > 8) {
 #define C1M(YB) do { if (gdt == 2 && conv1_to_mx_tc<YB>((const __half *)x, N, Ci, S, w, Co, y, sr, 0, 0)) break;   /* (the range form's kernel: whole == per range, bit for bit) */ \
