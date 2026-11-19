@@ -6,6 +6,25 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Count-constrained fill: no headroom over the mf-weighted ref (2026-11-18, branch fill-20261118, levelsolve)
+
+`ufsm fill-oracle` (src/filloracle.c): radial rays (every native z plane, arcs <= 0.7 voxel) through a box raster of the model's U; merged
+spans from the mf plane (mf >= 179) or GT-derived (GT sheet crossings chained one turn apart); inside each span U(a) + N (r - a) / (b - a)
+with N from GT, from the MFREF ref, or our own; scored with the fitter's wind-score. The unfilled raster reproduces the model's ids
+(C19 0.5079 vs 0.5074, PH1 0.2220 vs 0.2224).
+
+| box (1667 MFREF joined) | base | interp (our N) | fill (GT N) | shape (GT spacing) | ref N |
+|---|---|---|---|---|---|
+| C19 | 0.508 | 0.510 | 0.504 | 0.511 | 0.504 |
+| C31 | 0.611 | 0.611 | 0.611 | 0.612 | 0.610 |
+| C52 | 0.801 | 0.798 | 0.796 | 0.804 | 0.798 |
+| C70 | 0.816 | 0.812 | 0.807 | 0.820 | 0.810 |
+
+- Across mf spans the joined model already carries the GT's count (C19: spans hold 0.71 GT turns, the joined U 0.83). Even every GT
+  chain at the GT's own spacing, anchored at our U, gives 0.49 on C19: the loss is region-level turn offsets (a global count / slab-join
+  problem), not spacing inside merges. PH1 (box fit): 0.222 -> 0.218-0.253 for every fill variant.
+- Verdict: no in-box fill is built. The tool stays for future oracles.
+
 ## wgraph's fibre contact crossings against the GT: they do not divide touching sheets (2026-11-19, branch wgraph-20261119, mergeflag) -- PARKED
 
 User (via lead, 11-19): adapt villa's `vc_wgraph` (vesuvius/docs/wgraph.md, fiber_workflows.md, fiber_layout.md) to count-field, aimed
