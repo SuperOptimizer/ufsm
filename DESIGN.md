@@ -164,6 +164,77 @@ it is needed; the GT has no faces at this grid. Verdict: wgraph contact rows are
 (3) parallel winding distances are a network count field integrated along the connector, the information count-field already uses;
 (4) / (5) not built. Parked. Data: /vesuvius/ufsm/wgraph ({hold,ph,j}.tsv, o-*.tsv, summ.awk, oracle.awk). 1667 has no AFV.
 
+## Dense label store (denselab): every training label rendered once, on the NAS, read instead of recomputed (2026-11-19, branch denselab-20261119, mergeflag) -- DESIGN, step 1
+
+User (via lead, 11-19): render all training labels to dense 3-D volumes once, store them compressed on the NAS (forlinnas
+/srv/nas/ufsm, ~/nas), and have the sampler read them instead of computing them on the fly. NAS only, no dl.ash2txt upload.
+
+Inventory: what a training window's labels are made of today (try9's sources-scratch1-ph80-ho.json, 32 sources):
+
+| plane | made from | where | cached today |
+|---|---|---|---|
+| phase (u8 0..251, 255 unknown) | winding codes rasters / stamped meshes -> pair rule (band_onfly.c), per (codes set, rmax, level; pool2 pooled) | GPU or CPU | yes: dcache, key = codes path + stat + rmax + cell (~/.cache/ufsm/derived, zstd cells) |
+| codes (winding mod 14 x 18) | GT rasters (datafix-20261114/raster, volcomp lossless) or meshes (stamped per window) | stored / CPU | stored; meshes: only their vertex pack (.meshcodes-*.pack) |
+| ink (prob254, 255 unknown) | segments json (meshes + label rasters) splatted along the normal at the open face (inksplat.c) | GPU or CPU | yes: dcache level L (cell 128) + index.bin; L+1 pooled in memory |
+| ink MIL rays {p, n, y} | mesh points + signed normals (inkfly_rays), no plane | CPU | the tile index only |
+| fibre H / V (prob254) | AFV / .fib polylines (+ extra, map) rasterised (fiberraster.c) | GPU or CPU | NO (a 2-box reuse pool) |
+| band / side / w4 / wcomp | the phase (or band codes) per window | CPU / GPU | no (derived from phase) |
+| normals (6) + density + rv targets | the phase + papyrus per window, after augmentation | GPU | no |
+| papyrus / pm / rv papyrus / air mask | CT thresholds (iso) per window | CPU / GPU | no |
+
+So the derived cache already holds most of it: 170 GB on the desk today, all phase (P4 A48 / B48 at 3 levels 112 GB, 1667 A / B at
+3 levels 29 GB, 0172 15 GB, 1299 10 GB, 0139 7 GB) and ink (1.6 GB over 8 scrolls), but only the cells training has touched, local to
+the desk's /home disk, evicted LRU at 200 GB, and keyed by local paths + mtimes.
+
+What gets stored (one dense array per derived spec, the same values the on-the-fly path computes):
+- phase: per onfly spec x level, exactly the dcache array (its key hex). Every cell of the codes' support (+ rmax), not just the touched
+  ones. u8.
+- ink: per u2ink source, level L, the inkfly array (prob254 incl. 255 unknown = the known channel: known = v != 255, weight from the
+  sampler's existing rules); the MIL tile index (index.bin) beside it. Level L+1 stays a memory pooling of L (exact, cheap).
+- fibre H / V: per fibre source x level x plane: new, needs a dcache key (afv / extra / map files stat + cfg + CT key + level + plane
+  + a label version LBL_FIBRE). Today recomputed for every window: the main compute saved.
+- codes: archived beside (labcomp kind 1, 6-24x smaller than the volcomp-lossless rasters: 1667 A+B 9.4 GB -> ~0.5-1.5 GB, P4 107 GB
+  -> ~5-15 GB): not read by training once the phase is stored, kept so any phase variant can be rendered again from the NAS alone.
+- NOT stored: normals / density / rv / band / side / w4 / papyrus. They are cheap per-window functions of the phase and the CT that
+  must be evaluated after the window's spatial augmentation (a stored normal would have to be rotated, and its rounding would break
+  byte identity with today's targets). Storing their input (phase) removes all the expensive work.
+- Ink "signed band distance" for the MIL loss: today MIL works on rays (mesh point, signed normal, label) sampled along t in [-R, R];
+  there is no voxel plane. A dense equivalent (per voxel: signed distance along the nearest labelled mesh point's normal, int8 in level-L
+  voxels, 127 = none; plus that point's label bit) would be a NEW loss input, not byte-identical to the ray path. Proposal: store the
+  rays' tile index as today (exact) now; the dense signed-distance plane as a separate opt-in plane + loss variant, its own A/B.
+
+Format and read path:
+- Store = a zarr v3 array per key under ~/nas/denselab/<24-hex key>/ (inputs.txt with the key text, zarr.json), chunk = the dcache
+  cell (128 / 256), sharded 4^3 cells per shard file (NAS file counts: P4 phase would be ~150k cell files otherwise), inner codec zstd
+  (the dcache's own cell coding; byte-exact; volcomp lossless as the alternative where it wins: phase is smooth mod 252, measured on
+  1667 before choosing). labcomp only for codes (55 Mvox/s read: archive format).
+- dcache gets a read-only tier: on a cell miss (memory, local disk) it reads the cell from $UFSM_DENSELAB/<hex> (default ~/nas/denselab;
+  "off" disables) before computing, and writes it to the local disk cache as today. The NAS is never read hot: rclone FUSE does
+  147 MB/s sequential (measured, one 223 MB file) but per-file latency is high, so the local dcache stays the hot tier and the NAS
+  replaces the compute. Nothing changes in the sources json: same specs, same keys, same bytes; a store missing a cell falls back to
+  the compute (logged once per key).
+- `ufsm denselab-render SOURCES.json [--source NAME] [--kind phase,ink,fibre] --out ROOT [--threads N] [--gpu D]`: opens each source's
+  derived arrays exactly as the sampler does (sources.c), enumerates the cells of the label support (codes chunk map dilated by rmax;
+  ink index tiles; fibre polyline boxes + radius), computes them (GPU allowed on a free card; CPU otherwise) and writes the shards.
+  Resumable per shard; a store is marked complete (done file with cell count, bytes, seconds).
+- Keys stay the dcache keys (local paths + mtimes): a re-raster or a moved file changes the key and the store is simply not found
+  (compute fallback), never stale. Pods cannot use these keys (different paths): out of scope (NAS only).
+
+Expected sizes (zstd, from today's dcache cells; the full support is larger than the touched part, ~1-2x):
+
+| scroll | phase (all specs, all levels) | ink | fibre | codes (labcomp) |
+|---|---|---|---|---|
+| Paris 4 | ~110-200 GB | 0.9 GB | to measure (4 fibre sources) | ~5-15 GB |
+| 1667 | ~30-55 GB | 0.4 GB | none in try9's set | ~0.5-1.5 GB |
+| 0172 / 1299 / 0139 / 0500P2 / 1218 | ~35-60 GB | 0.3 GB (0139, 0814, MAN5, 0009B, 0841, 0500P2) | 1447 / 0175A / 0125 / 0139 / 1451 / 0332: to measure | ~1-3 GB |
+
+Total ~0.2-0.35 TB on a 30 TB NAS (23 TB free). Step 2 (1667 end to end) measures the real 1667 numbers and the fibre per-source size
+before anything else is rendered.
+
+Test (step 2, new test_denselab, CPU): a fixture scroll with codes, an ink segment and an AFV fibre: render the store, then sample
+windows (several levels, augmentation off and on) once with the store and once on the fly with an empty cache: label planes byte for
+byte equal; a store with a missing shard falls back to the compute and is still equal.
+
 ## How much GT does the global count need? Sparse GT anchors in count-field; P4 phase misses by normal gap (2026-11-18/19, branch anchors-20261118, mergeflag)
 
 User (via lead): "how much ground truth do we actually need?" Test: feed count-field's least-squares ref sparse GT anchors and score
