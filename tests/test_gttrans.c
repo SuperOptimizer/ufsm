@@ -24,6 +24,13 @@ static int write_arr(const char *path, const uint8_t *a) {   /* one shard holds 
     const int rc = z3w_write_shard(w, 0, 0, 0, sb, 4); free(sb); return rc | z3w_close(w);
 }
 
+static int z3w_arr2(const char *path, const uint8_t *a, int d) {   /* d planes of N x N, one shard */
+    const int64_t sh[3] = {d, N, N}; z3w *w = z3w_create(path, sh, S, 0, 0, nullptr); if (!w) return 1;
+    uint8_t *sb = calloc((size_t)S * S * S, 1);
+    for (int z = 0; z < d; z++) for (int y = 0; y < N; y++) memcpy(sb + ((size_t)z * S + y) * S, a + ((size_t)z * N + y) * N, N);
+    const int rc = z3w_write_shard(w, 0, 0, 0, sb, 4); free(sb); return rc | z3w_close(w);
+}
+
 int main(void) {
     char dir[] = "/tmp/ufsm-gttrans-XXXXXX"; if (!mkdtemp(dir)) { fprintf(stderr, "FAIL: tmp dir\n"); return 1; }
     const size_t n = (size_t)D * N * N; uint8_t *ct = calloc(n, 1), *cd = calloc(n, 1), *rv = calloc(n, 1), *fh = calloc(n, 1), *fv = calloc(n, 1);
@@ -65,7 +72,38 @@ int main(void) {
        only the packed deficit is checked) */
     CHECK(pk[0] / dq[0] < 0.6 && vr[0] / dq[0] > pk[0] / dq[0] + 0.3, "packed: CT %.3f vs rv %.3f per turn", pk[0] / dq[0], vr[0] / dq[0]);
     free(ct); free(cd); free(rv); free(fh); free(fv);
-    snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) fprintf(stderr, "(could not remove %s)\n", dir);
+    /* --orient on a textured CT: concentric sheets of a recto layer (inner, 5 voxels: stripes along z, period 4 = H fibres) and a verso
+       layer (outer, 5 voxels: stripes along the arc, period 4 = V fibres), packed pairs in contact (10 apart) and spaced (24 apart, air
+       between); every GT interval should hold one V -> H flip from the CT alone */
+    {
+        enum { D2 = 48 }; const size_t n2 = (size_t)D2 * N * N; uint8_t *c2 = calloc(n2, 1), *g2 = calloc(n2, 1);
+        double r2[32]; int k2 = 0; { double r = 12; for (int k = 0; k2 < 32 && r < 112; k++) { r2[k2++] = r; r += k % 2 ? 24 : 10; } }
+        for (int z = 0; z < D2; z++) for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+            const size_t i = ((size_t)z * N + y) * N + x; const double r = hypot(y - c, x - c), ph = atan2(y - c, x - c);
+            int best = -1; double bd = 1e9; for (int k = 0; k < k2; k++) if (fabs(r - r2[k]) < bd) { bd = fabs(r - r2[k]); best = k; }
+            const double d = r - r2[best];
+            if (d >= -5 && d < 0) c2[i] = (uint8_t)(110 + 80 * cos(2 * M_PI * z / 4.0));
+            else if (d >= 0 && d <= 5) c2[i] = (uint8_t)(110 + 80 * cos(2 * M_PI * r2[best] * ph / 4.0));   /* (the arc at the sheet radius: stripes parallel to z) */
+            else if (r < 116) c2[i] = 20;   /* (flat material between the spaced sheets: gt-trans takes intervals with CT > 0 all along) */
+            if (fabs(d) <= 1.0) g2[i] = (uint8_t)(1 + (18 * best) % 252);
+        }
+        snprintf(p, sizeof p, "%s/ct2", dir); CHECK(!z3w_arr2(p, c2, D2), "write ct2"); snprintf(p, sizeof p, "%s/cd2", dir); CHECK(!z3w_arr2(p, g2, D2), "write cd2");
+        { FILE *bf = fopen(bx, "w"); fprintf(bf, "T3\tsyn\t0\t0\t0\t%d\t%d\t%d\n", D2, N, N); fclose(bf); }
+        char *a2[] = {"ufsm", "gt-trans", dir, "ct2", "9.6", dir, "cd2", "9.6", "ct2", "9.6", bx, "syn", "9.6", out, "--nz", "2", "--nth", "90",
+                      "--orient", "1,1.5", "--threads", "4"};
+        CHECK(cmd_gt_trans((int)(sizeof a2 / sizeof *a2), a2) == 0, "gt-trans --orient failed");
+        double q2[2] = {0}, vh2[2] = {0}, hv2[2] = {0}; long n2c[2] = {0}; FILE *f2 = fopen(out, "r");
+        if (f2) { if (!fgets(line, sizeof line, f2)) line[0] = 0;
+            while (fgets(line, sizeof line, f2)) { char b[32]; int z, iv[11], of, ob, ok; double rm, q, g;
+                if (sscanf(line, "%31s %d %lf %lf %lf %d %d %d %d %d %d %d %d %d %d %d %d", b, &z, &rm, &q, &g, &iv[0], &iv[1], &iv[2], &iv[3], &iv[4], &iv[5], &iv[6], &iv[7], &iv[8], &of, &ob, &ok) != 17 || !ok) continue;
+                const int k = g < 150 ? 0 : 1; n2c[k]++; q2[k] += q; vh2[k] += of; hv2[k] += ob; }
+            fclose(f2); }
+        for (int k = 0; k < 2; k++) printf("test_gttrans --orient: %s: %ld intervals, V>H %.3f, H>V %.3f per GT turn\n", k ? "spaced" : "packed (contact)", n2c[k], q2[k] ? vh2[k] / q2[k] : 0, q2[k] ? hv2[k] / q2[k] : 0);
+        CHECK(n2c[0] > 50 && n2c[1] > 50, "--orient: too few intervals: %ld packed, %ld spaced", n2c[0], n2c[1]);
+        for (int k = 0; k < 2; k++) CHECK(q2[k] > 0 && fabs(vh2[k] / q2[k] - 1) < 0.1, "--orient V>H per turn %.3f (bucket %d)", q2[k] ? vh2[k] / q2[k] : 0, k);
+        free(c2); free(g2);
+    }
+    snprintf(p, sizeof p, getenv("KEEP") ? "true %s" : "rm -rf '%s'", dir); if (system(p)) fprintf(stderr, "(could not remove %s)\n", dir);
     if (fails) { fprintf(stderr, "test_gttrans: %d failure(s)\n", fails); return 1; }
     printf("test_gttrans: OK\n");
     return 0;
