@@ -219,7 +219,7 @@ test_accum                                     | gpu          |    20 | tests/te
 test_gscale                                    | gpu          |    55 | tests/test_gscale.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/gscale
 test_tcache                                    | gpu          |       40 | tests/test_tcache.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/tcache
 test_strict_sources                            | gpu          |    25 | tests/test_strict_sources.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/strictsrc
-test_init_heads                                | gpu          |    25 | tests/test_init_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/initheads
+test_init_heads                                | gpu          |    45 | tests/test_init_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/initheads
 test_ink_mil_check                             | gpu          |    90 | ./$B/test_ink_mil_check ./$B/ufsm ./$B/make_wind_fixture
 test_pyports                                   |              |     1 | ./$B/test_pyports
 test_edt                                       | smoke        |     2 | ./$B/test_edt

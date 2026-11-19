@@ -25,4 +25,14 @@ grep -q 'init-from: unwrap2 donor by head: .*fibre 1[0-9]-2[0-9] fresh' c.log ||
 grep -q 'init-from: head rows 0-12 copied, rows 13-21 (fibre head) fresh' d.log || fail "the positional fibre branch's line ($D/d.log)"
 fc=$(grep '^step      1' c.log | grep -o 'fib bce [0-9.]*' | awk '{print $3}'); fd=$(grep '^step      1' d.log | grep -o 'fib bce [0-9.]*' | awk '{print $3}')
 [ -n "$fc" ] && [ "$fc" = "$fd" ] || fail "fibre bce at step 1: by head $fc vs the fibre branch $fd (fresh rows in both)"
+# the third case (2026-11-19): a plain --init-from of a sub-cell (--lat-guide 3) donor keeps its sub-cell rows; the "start at zero" reset ran
+# after every such copy, so try9 warm starts began on the interpolated head (phase error 81-89 deg at step 50 against try9's 54)
+L=(--lat 4 --lat-guide 3)
+"$U" train fx/sources.json --out sd "${C[@]}" "${L[@]}" --steps 40 > sd.log 2>&1 || fail "sub-cell donor ($D/sd.log)"
+"$U" train fx/sources.json --out se --det 1 --lr 0 --muon-lr 0 "${C[@]}" "${L[@]}" --steps 2 --init-from sd/last.ckpt > se.log 2>&1 || fail "sub-cell init ($D/se.log)"
+grep -q 'sub-cell head: outputs [0-9]*-[0-9]* from the donor' se.log || fail "sub-cell rows not kept from the donor ($D/se.log)"
+! grep -q 'sub-cell head: .* start at zero' se.log || fail "sub-cell rows reset after the copy ($D/se.log)"
+"$U" train fx/sources.json --out sg "${C[@]}" --lat 4 --steps 2 > sg.log 2>&1 || fail "plain latent donor ($D/sg.log)"
+"$U" train fx/sources.json --out sf --det 1 --lr 0 --muon-lr 0 "${C[@]}" "${L[@]}" --steps 2 --init-from sg/last.ckpt > sf.log 2>&1 || fail "plain latent donor into a sub-cell net ($D/sf.log)"
+grep -q 'sub-cell head: .* start at zero' sf.log || fail "a donor without sub-cell rows must leave them at zero ($D/sf.log)"
 echo "test_init_heads: ok (rv bce at step 1: donor layout $ra, ink + rv mapped by head $rb; fresh fibre rows: fib bce $fc in both paths)"

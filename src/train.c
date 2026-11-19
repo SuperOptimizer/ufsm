@@ -4069,7 +4069,7 @@ int cmd_train(int argc, char **argv) {
             unet_init(d->u, seed + 1); /* deterministic: every GPU starts identical */
             if (g_restore) unet_zero_head(d->u);   /* residual net: output == input at step 0 */
             const char *init_from = opt(argc, argv, "--init-from", nullptr);   /* partial warm start from another architecture */
-            int widened = 0;
+            int widened = 0, subkeep = 0;   /* subkeep: the donor's sub-cell rows were copied (a lat_guide 64 donor of the same head shape) */
             if (init_from) {
                 unet_set_init_shift(opt_atoi("--init-shift", opt(argc, argv, "--init-shift", "0")));   /* a latent-grid net from a voxel donor: --init-shift 2 */
                 int rows[512];   /* --verso: recto copied into the verso channel, the donor's other rows (affinities) shifted up */
@@ -4140,6 +4140,8 @@ int cmd_train(int argc, char **argv) {
                     if (k != cfg.cout) { fprintf(stderr, "--head-map has %d rows, the network %d outputs\n", k, cfg.cout); return 2; } }
                 const int nt = g_verso || hm || w4map ? unet_init_from_map(d->u, init_from, rows) : unet_init_from(d->u, init_from);
                 if (nt < 0) { fprintf(stderr, "cannot initialise from %s\n", init_from); return 1; }
+                if (g_lat_guide == 64) { unet_cfg sc_; int ss_;   /* (2026-11-19: the reset below zeroed a sub-cell donor's copied rows on every plain --init-from: try9 warm starts began on the interpolated head) */
+                    subkeep = !unet_peek(init_from, &sc_, &ss_) && sc_.half_res == 3 && sc_.lat_guide == 64 && sc_.cout == cfg.cout && (!(g_verso || hm || w4map) || rows[LBASE] == LBASE); }
                 if (w4map == 3 || fib_fresh) for (int k = 0; k < 9; k++) unet_head_row_reset(d->u, g_fib_ch + k, k < 2 ? (float)opt_atof("--fib-bias", opt(argc, argv, "--fib-bias", "-2")) : 0.f);
                 if (w4map && w4map != 3 && w4map != 5 && g_ink2) unet_head_row_reset(d->u, g_ink2_ch, (float)opt_atof("--ink-bias", opt(argc, argv, "--ink-bias", "-2")));   /* (a fresh ink row: zero weights, the prior bias; the donor's function elsewhere) */
                 {   /* --rv 2 from a donor without its pair (a plain unwrap2 net, or a latent net whose interpolated rows 11-15 never trained): fresh rv rows, bias --rv-bias */
@@ -4152,7 +4154,8 @@ int cmd_train(int argc, char **argv) {
                 if (g == 0 && init_lr != 1.f) fprintf(stderr, "--init-lr-mult %g: %zu of %zu parameters inherited\n", init_lr, unet_inherited(d->u), unet_nparams(d->u));
                 }
             }
-            if (g_lat_guide == 64 && !widened) {   /* the sub-cell outputs start at zero (--init-widen: the donor's sub-cell rows): the net begins as the interpolated head (random rows gave a 4-voxel lattice wherever the labels do not reach) */
+            if (g_lat_guide == 64 && subkeep && g == 0) fprintf(stderr, "sub-cell head: outputs %d-%d from the donor\n", LBASE, cfg.cout - 1);
+            if (g_lat_guide == 64 && !widened && !subkeep) {   /* the sub-cell outputs start at zero (--init-widen: the donor's sub-cell rows): the net begins as the interpolated head (random rows gave a 4-voxel lattice wherever the labels do not reach) */
                 for (int co = LBASE; co < cfg.cout; co++) unet_head_row_reset(d->u, co, 0.f);
                 if (g == 0) fprintf(stderr, "sub-cell head: outputs %d-%d start at zero\n", LBASE, cfg.cout - 1);
             }
