@@ -546,6 +546,16 @@ __global__ void ad_ctl_k(const muon_desc_t *d, int n, const double *po, const do
     }
     if (m0) for (int i = 0; i < n; i++) a.lrm[i] *= m0[i];   /* the static trunk / stage multipliers on top (not part of the control loop) */
 }
+/* Direction probe (2026-11-19, admuon2; DESIGN "Fully adaptive Muon, part 2"): every S-th element of each matrix's final direction
+   s_i O_i (NorMuon's rows included, before the lr / adaptive multipliers) into buf[off[base + c] + j], j = i / S. An unbiased subsample
+   of the pooled inner products <v_t, v_t-k> (the momentum's autocorrelation) at 1 / S of the cost. nn_muon_probe(nullptr, ..): off. */
+static float *g_pr_buf; static const long long *g_pr_off; static int g_pr_stride, g_pr_base;
+extern "C" void nn_muon_probe(float *buf, const long long *off, int stride, int base) { g_pr_buf = buf; g_pr_off = off; g_pr_stride = stride; g_pr_base = base; }
+__global__ void probe_k(const muon_desc_t *d, int swap, float *buf, const long long *off, int S) {
+    const muon_desc_t D = d[blockIdx.y]; const float *O = swap ? D.Y : D.X; const size_t n = (size_t)D.Co * D.K, m = (n + S - 1) / (size_t)S;
+    const float sc = muon_scale(D.Co, D.K); float *b = buf + off[blockIdx.y];
+    for (size_t j = blockIdx.x * (size_t)blockDim.x + threadIdx.x; j < m; j += (size_t)gridDim.x * blockDim.x) b[j] = sc * O[j * (size_t)S];
+}
 __global__ void ad_dist_k(const double *pd, int n, double *dog) { if (threadIdx.x) return; double s = 0; for (int j = 0; j < 32 * n; j++) s += pd[j]; dog[3] = sqrt(s); }
 __global__ void hb_proj_k(const muon_desc_t *d, const int *hb, const float *R, const double *pw) {   /* back onto the sphere |W|_F = R */
     if (!hb[blockIdx.y]) return;
@@ -668,6 +678,7 @@ extern "C" void nn_muon_ext_batch(const void *descs, int nconv, int maxco, int m
         lrm = g_ad.lrm; if (g_ad.on_dog) { disp = g_ad.disp; pd = g_ad.part + (size_t)32 * nconv; }
     }
     if (g_mst) mstat_k<<<g2, 256>>>(d, swap, lr, wd, lrm, mcf, pa, hb, R, hb_lr, g_mst + 2 * (size_t)g_mst_base);
+    if (g_pr_buf && !mcd) probe_k<<<g2, 256>>>(d, swap, g_pr_buf, g_pr_off + g_pr_base, g_pr_stride);   /* (O before the apply: unchanged by it) */
     mopt_apply_k<<<g2, 256>>>(d, swap, mcf, hb, R, pa, pb, lr, wd, hb_lr, lrm, disp, pd);
     if (pd) ad_dist_k<<<1, 32>>>(pd, nconv, g_ad.dog);
     if (hb) hb_proj_k<<<g2, 256>>>(d, hb, R, pb);

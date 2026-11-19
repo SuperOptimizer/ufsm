@@ -156,6 +156,7 @@ struct unet {
     int ad_lars, ad_dog; float ad_tgt, ad_b, ad_c, ad_dogmax, ad_lrpeak;   /* adaptive Muon (unet_set_muon_adapt): (b) per-layer control, (c) DoG */
     float *ad_lrm, *ad_ema, *ad_dispbuf, **ad_dispp; double *ad_dogst, *ad_part;   /* their device state */
     float ad_ema_load[UNET_MAXCONV]; int ad_ema_nload; double ad_dog_load[3]; int ad_dog_nload;   /* from a checkpoint, uploaded at the next step */
+    struct mprobe *pr; int pr_S;                 /* --muon-probe S: the direction probe (host statistics; GPU 0 only) */
     float *qk_lmax, *qk_last;                    /* QK-clip: per attention block and head the step's max logit (device), and the max since unet_qk_lmax */
     float mx_mix_a, mx_mix_b3, *mx_mixbuf, **mx_mixp; int mx_mix_T, mx_mix_t;   /* --muon-ademamix A: the slow EMA per matrix, alpha 0 -> A over T steps */
     int mx_kr, mx_kr_every; float mx_kr_b2, mx_kr_eps; struct nn_kron *mx_kron;   /* --muon-kron 1: the Kronecker conv preconditioner (nn_kron.cu) */
@@ -285,6 +286,7 @@ struct unet {
     int init_lr_on; float init_lr;           /* unet_set_init_lr: lr multiplier of the inherited ranges (train --init-lr-mult) */
     const float *tb_xg;                      /* unet_set_token_grad: extra gradient at the stage output tokens */
 };
+static void mprobe_free(unet *u);   /* (the direction probe, below) */
 
 static int G_of(const unet *u, int c) { return u->cfg.G < c ? u->cfg.G : c; }
 /* output channels of the coarse block at level i that the decoder upsamples into level i - 1: dec[i] (cfg.dec_widths, 0 = the
@@ -548,7 +550,7 @@ void unet_free(unet *u) {
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
     nn_free(u->wm); nn_free(u->sp24_kb); if (u->muon_mom != u->v) nn_free(u->muon_mom); nn_free(u->muon_work);   /* (aliased into v: mom_alloc) */ muon_forget_table(u); nn_free(u->muon_descs); nn_free(u->mx_lrm); nn_free(u->stem_b);
     nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); nn_free(u->mx_nmrows); nn_free(u->mx_nmoff); nn_free(u->mx_vrbuf); nn_free(u->mx_vrp); nn_kron_free(u->mx_kron); nn_free(u->qk_lmax); nn_free(u->mx_mixbuf); nn_free(u->mx_mixp);
-    nn_free(u->am_dev); nn_free(u->ad_lrm); nn_free(u->ad_ema); nn_free(u->ad_dispbuf); nn_free(u->ad_dispp); nn_free(u->ad_dogst); nn_free(u->ad_part); nn_free(u->ost_dev); nn_free(u->ost_snap); free(u->ost_seg);
+    nn_free(u->am_dev); nn_free(u->ad_lrm); nn_free(u->ad_ema); nn_free(u->ad_dispbuf); nn_free(u->ad_dispp); nn_free(u->ad_dogst); nn_free(u->ad_part); mprobe_free(u); nn_free(u->ost_dev); nn_free(u->ost_snap); free(u->ost_seg);
     free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_pv); nn_free(u->ge_tw); nn_free(u->gf_g); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
     nn_free(u->anvil_v1); nn_free(u->anvil_pool); nn_free(u->anvil_descs); nn_free(u->ds_g16); nn_free(u->ds_tmp);
     nn_free(u->wq_q); nn_free(u->wq_sc); nn_free(u->wq_qe); nn_free(u->wq_sce);
@@ -4433,6 +4435,54 @@ static void am_muon(unet *u, float lr, float beta, float wd) {   /* plain batche
     for (int i = 0; i < u->muon_nconv; i++) m[i] = u->am_h[i] * (trunk_lr_on(u) && u->am_tr[i] ? u->trunk_lr : 1.f);
     for (int a = 0; a < u->muon_nconv;) { int e = a + 1; while (e < u->muon_nconv && m[e] == m[a]) e++; muon_batch(u, a, e - a, lr * m[a], beta, wd); a = e; }
 }
+/* ---- The direction probe (train --muon-probe S, 2026-11-19, DESIGN "Fully adaptive Muon, part 2") ----
+   Every S-th element of each Muon matrix's final direction v = s O (nn_muon_probe) is read back after every update. The host keeps
+   the last PR_L samples and logs, per --opt-stats line:
+   - rho_k = sum <v_t, v_t-k> / sum |v_t| |v_t-k| for k = 1, 2, 4, 8, 16: the directions' autocorrelation (a stride-S subsample of the
+     pooled inner product: unbiased, ~(n / S) coordinates);
+   - kappa16 = 1 + 2 sum_k=1..16 rho_k: the random-walk variance factor of the steps, as DoG's kappa = (1 + beta) / (1 - beta) assumes it
+     (39 at beta 0.95 for plain momentum);
+   - prog16 = |sum of the last 16 v| / sum of their |v|: 1 for a straight drift, sqrt(kappa / 16) for a random walk.
+   Diagnostics only: one device-to-host copy of ~n / S floats per update. */
+#define PR_L 16
+struct mprobe { long long M, *off_dev; float *buf, *ring; double dot[PR_L + 1], nrm[PR_L + 1], prog; int t, nprog, n; };
+static void mprobe_free(unet *u) { if (!u->pr) return; nn_free(u->pr->buf); nn_free(u->pr->off_dev); free(u->pr->ring); free(u->pr); u->pr = nullptr; }
+void unet_set_muon_probe(unet *u, int stride) { u->pr_S = stride > 0 ? stride : 0; }
+static void mprobe_setup(unet *u, const muon_build_t *b) {
+    if (!u->pr_S || u->pr) return;
+    struct mprobe *p = calloc(1, sizeof *p); long long off[UNET_MAXCONV + 1], t = 0;
+    for (int i = 0; i < b->n; i++) { off[i] = t; t += ((long long)b->h[i].Co * b->h[i].K + u->pr_S - 1) / u->pr_S; }
+    off[b->n] = t; p->M = t; p->n = b->n;
+    p->buf = nn_malloc((size_t)t * 4); p->off_dev = nn_malloc((size_t)(b->n + 1) * sizeof(long long)); nn_h2d(p->off_dev, off, (size_t)(b->n + 1) * sizeof(long long));
+    p->ring = calloc((size_t)PR_L * t, 4); u->pr = p;
+    fprintf(stderr, "muon-probe: every %d-th direction element, %lld per update (%.1f MB device, %.1f MB host)\n", u->pr_S, t, t * 4 / 1048576.0, PR_L * t * 4 / 1048576.0);
+}
+static void mprobe_collect(unet *u) {   /* after the update: this step's sample into the ring, the lag products and the 16-step progress */
+    struct mprobe *p = u->pr; if (!p) return;
+    float *v = p->ring + (size_t)(p->t % PR_L) * p->M; nn_d2h(v, p->buf, (size_t)p->M * 4);
+    double vv = 0; for (long long j = 0; j < p->M; j++) vv += (double)v[j] * v[j];
+    for (int k = 1; k <= PR_L && k <= p->t; k++) {
+        const float *w = p->ring + (size_t)((p->t - k) % PR_L) * p->M; double vw = 0, ww = 0;
+        for (long long j = 0; j < p->M; j++) { vw += (double)v[j] * w[j]; ww += (double)w[j] * w[j]; }
+        p->dot[k] += vw; p->nrm[k] += sqrt(vv * ww);
+    }
+    if (p->t >= PR_L - 1) {   /* the window of the last 16 samples (this one included) */
+        double s2 = 0, sn = 0;
+        for (int k = 0; k < PR_L; k++) { const float *w = p->ring + (size_t)((p->t - k) % PR_L) * p->M; double q = 0; for (long long j = 0; j < p->M; j++) q += (double)w[j] * w[j]; sn += sqrt(q); }
+        for (long long j = 0; j < p->M; j++) { double a = 0; for (int k = 0; k < PR_L; k++) a += p->ring[(size_t)((p->t - k) % PR_L) * p->M + j]; s2 += a * a; }
+        p->prog += sqrt(s2) / fmax(sn, 1e-30); p->nprog++;
+    }
+    p->t++;
+}
+static size_t mprobe_str(unet *u, char *buf, size_t cap) {   /* " probe rho 1 .. 2 .. 4 .. 8 .. 16 .. kappa16 .. prog16 .." (the interval's means), then reset */
+    struct mprobe *p = u->pr; if (!p || p->t < 2 || !cap) return 0;
+    size_t k = (size_t)snprintf(buf, cap, " probe rho"); double kap = 1;
+    for (int l = 1; l <= PR_L; l++) { const double r = p->nrm[l] > 0 ? p->dot[l] / p->nrm[l] : 0; kap += 2 * r;
+        if ((l & (l - 1)) == 0 && k < cap) k += (size_t)snprintf(buf + k, cap - k, " %d:%.3f", l, r); }
+    if (k < cap) k += (size_t)snprintf(buf + k, cap - k, " kappa16 %.2f prog16 %.3f", kap, p->nprog ? p->prog / p->nprog : 0.0);
+    memset(p->dot, 0, sizeof p->dot); memset(p->nrm, 0, sizeof p->nrm); p->prog = 0; p->nprog = 0;
+    return k < cap ? k : cap - 1;
+}
 static void ad_setup(unet *u, const muon_build_t *b, float beta) {   /* nn_muon_ext_adapt for this step's ext batch (state allocated once) */
     const int n = b->n;
     if (!u->ad_lrm) {
@@ -4561,20 +4611,23 @@ static void muon_ext(unet *u, const muon_build_t *b, float lr, float beta, float
         return;
     }
     if (u->ad_lars || u->ad_dog || am_on(u)) ad_setup(u, b, beta);
+    mprobe_setup(u, b);
     if (u->muon_ngrp > 1) {   /* (mx_groupable: the table's groups share one pool, run one after another) */
         for (int g = 0; g < u->muon_ngrp; g++) {
             const int i0 = u->muon_grp[g], k = u->muon_grp[g + 1] - i0;
+            if (u->pr) nn_muon_probe(u->pr->buf, u->pr->off_dev, u->pr_S, i0);
             nn_muon_ext_lrmult(lrm0 ? lrm0 + i0 : nullptr);
             nn_muon_ext_batch((const char *)u->muon_descs + sizeof(muon_desc_t) * (size_t)i0, k, u->muon_maxco, u->muon_maxk, nullptr, nullptr, 3, 0, 0,
                               nullptr, u->mx_R, 0, u->mx_part, lr, beta, wd, 0.f, u->mx_ns, nr, nr ? u->mx_nmoff + i0 : nullptr, u->mx_nmtot, b2, nullptr, 0.f);
         }
-        nn_muon_ext_lrmult(nullptr);
+        nn_muon_ext_lrmult(nullptr); nn_muon_probe(nullptr, nullptr, 0, 0); mprobe_collect(u);
         return;
     }
+    if (u->pr) nn_muon_probe(u->pr->buf, u->pr->off_dev, u->pr_S, 0);
     nn_muon_ext_lrmult(lrm0);
     nn_muon_ext_batch(u->muon_descs, n, u->muon_maxco, u->muon_maxk, u->mx_c ? u->mx_mcd : nullptr, u->mx_nsd, 3, u->mx_ns_maxm, u->mx_ns_maxn,
                       u->mx_hb ? u->mx_hbf : nullptr, u->mx_R, r_init, u->mx_part, lr, beta, wd, u->mx_hb_mult * lr, u->mx_ns, nr, u->mx_nmoff, u->mx_nmtot, b2, vp, vg);
-    nn_muon_ext_adapt(nullptr); nn_muon_ext_lrmult(nullptr);
+    nn_muon_ext_adapt(nullptr); nn_muon_ext_lrmult(nullptr); nn_muon_probe(nullptr, nullptr, 0, 0); mprobe_collect(u);
 }
 /* Muon's momentum in the AdamW second-moment buffer v (2026-11-13: -np floats per GPU, 416 MB at the 104 M scratch2 net). AdamW reads v only
    outside the Muon matrices (plain_ranges), the momentum lives only inside them, so the two never meet. UFSM_MUON_MOM_ALIAS=0: a buffer of
@@ -4701,8 +4754,9 @@ int unet_opt_stats_str(unet *u, char *buf, size_t cap) {
     if (u->ad_lrm && k < cap) {   /* adaptive Muon: the multipliers' range (x eta / lr_peak under DoG) and DoG's eta, rbar, |x - x0| */
         float m[UNET_MAXCONV]; nn_d2h(m, u->ad_lrm, (size_t)u->muon_nconv * 4); float a = m[0], z = m[0]; for (int i = 1; i < u->muon_nconv; i++) { a = fminf(a, m[i]); z = fmaxf(z, m[i]); }
         k += (size_t)snprintf(buf + k, cap - k, " lrm [%.3g %.3g]", a, z);
-        if (u->ad_dog && k < cap) { double d[4]; nn_d2h(d, u->ad_dogst, sizeof d); k += (size_t)snprintf(buf + k, cap - k, " dog eta %.3e rbar %.3e dist %.3e", d[2], d[0], d[3]); }
+        if (u->ad_dog && k < cap) { double d[4]; nn_d2h(d, u->ad_dogst, sizeof d); k += (size_t)snprintf(buf + k, cap - k, " dog eta %.3e rbar %.3e dist %.3e G %.3e", d[2], d[0], d[3], d[1]); }
     }
+    if (u->pr && k < cap) k += mprobe_str(u, buf + k, cap - k);
     return 1;
 }
 /* the optimizer's and the attention's device buffers now, on the current device (train: before the memory planner measures the free memory;

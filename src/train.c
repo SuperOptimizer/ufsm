@@ -4027,6 +4027,7 @@ int cmd_train(int argc, char **argv) {
         unet_set_muon_vr(d->u, muon_vr);
         unet_set_muon_cautious(d->u, muon_caut);
         unet_set_muon_adapt(d->u, muon_lars, lars_tgt, lars_b, lars_c, muon_dog, dog_max, muon_lr);
+        if (g == 0) unet_set_muon_probe(d->u, opt_atoi("--muon-probe", opt(argc, argv, "--muon-probe", "0")));   /* the direction probe (unet.c mprobe; logged on --opt-stats lines) */
         unet_set_attn_muon_lr(d->u, attn_mlr, attn_mlr_out);
         nn_muon_tc(muon_tc);
         unet_set_muon_qkv_split(d->u, muon_qkv); unet_set_muon_wd_mult(d->u, muon_wd_mult); unet_set_muon_fro(d->u, muon_fro); unet_set_muon_stem_adamw(d->u, muon_stem_adamw);

@@ -704,6 +704,7 @@ void nn_diff_sumsq(const float *a, const float *b, size_t n, double *out2);   /*
    fixed per-matrix multipliers (train --attn-muon-lr) applied on top. nullptr: off */
 typedef struct { float *lrm, *ema; double *dog; float *const *disp; double *part; const float *base; float lr_peak, lars_tgt, lars_b, lars_c, dog_eta0, dog_max, dog_kappa; int on_lars, on_dog; } nn_madapt;
 void nn_muon_ext_adapt(const nn_madapt *a);
+void nn_muon_probe(float *buf, const long long *off, int stride, int base);   /* the direction probe: every stride-th element of each matrix's final direction s O into buf[off[base + c] ..] at the next nn_muon_ext_batch calls; nullptr: off */
 void nn_muon_scale_mode(int m);   /* 0: sqrt(max(1, Co / K)); 1: spectral sqrt(Co / K) (train --muon-scale spectral); 2: r sqrt(max(Co, K)) (rms) */
 void nn_muon_scale_rms(float r);   /* mode 2's r: the update's element RMS (Moonlight 0.2) */
 void nn_muon_cwd(int on);   /* train --muon-cwd 1: cautious weight decay on the Muon matrices (decay only where step and weight agree in sign) */
