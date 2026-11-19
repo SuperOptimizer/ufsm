@@ -84,6 +84,8 @@ CT peaks per GT turn by normal gap (um):
 - try9's codec costs -0.004 / +0.003 / -0.013 peaks per turn below 70 um on P4 / P4 July / 1667.
   - That is small next to the rv heads' gap to the CT: 0.45 vs 0.52, 0.28 vs 0.35, 0.41 vs 0.45.
   - So the codec is not what throws the separation away. The loss is in the net (38 um cells, the trunk), not in its input.
+- 61 coefficients at step 0.02 (R1's plan) lose: below 70 um 0.515 / 0.347 / 0.438. The |q| <= 127 clamp caps AC coefficients at 2.54
+  normalised units and clips strong edges. A step that fine needs a wider code.
 - A lossless latent (61 coefficients, small step) gains nothing this detector sees. Only 13 coefficients start to lose (-0.016 on P4 below 70 um).
 - Caveats:
   - The detector smooths at sigma 1.2 voxels in the plane, so it cannot see detail finer than ~2 voxels.
