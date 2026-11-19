@@ -177,6 +177,18 @@ dropped (there the human labels and the labelled mesh's own teacher px rule; it 
 labelled meshes, free of teacher labels). teach.sh reads KIT/kit/extra-SCROLL.tsv. Test: tests/test_ink_teach.py (CPU: a labelled
 mesh, an extra mesh 400 voxels away gets ~88k teacher px at 48.8 % ink on the half-ink stripes, one 10 voxels away is cleared).
 
+**Result (11-18/19, desk card 1 instead of the pod: pod money ran out).** The same arm B (try9-16000 weights-only init, teacher-first
+targets on 6 scrolls, P 512, 1 worker / 2 slots, UFSM_MEM_FREE_GB 6.5 so try9 keeps 4.5 GB) ran beside try9 on its second card:
+try9's on-the-fly phase + fibre held card 1 at 55-98 % SM, the ink trainer got 0-44 % (pmon), wait 0 %: GPU-bound at 0.04-0.10
+samples/s (mean 0.09; 1000 steps 18:18 -> 22:02, vs 0.27-0.35 on the pod), planner lean 2 with 0.75 GB host offloads each way, card
+peak 7.6 GB, host RSS 18.4 GB. Ink bce 0.450 -> 0.455, MIL 0.475 -> 0.453 over the 1000 steps. Scored at B1000 (live weights,
+`--gn-live 1`, window 512 / halo 64, 1667 held-out wraps, pairwrap2): heldout AUC **0.541** (n 1,296,287; reader3 -0.317
+[-0.355, -0.282]), hold 0.524, valonly 0.569 (reader3 0.86 on all three): below the 0.60 gate, early stop 00:07. Verdict:
+try9 init + 2-D teachers at 1000 steps on a contended card = 0.54 held-out, no better than try9's untrained head (0.52-0.56) or raw
+CT. 1000 steps at P 512 is ~1000 windows: too few to say the recipe fails, too slow to find out on a shared card (6000 steps ~ 22 h).
+Not retried until a dedicated GPU (or a pod) is available; the kit (/vesuvius/ufsm/inksdk/desk9: teach rasters for 4 scrolls,
+sources-B, run3.sh driver with the B1000 gate) is ready to rerun as is.
+
 ## HerculeX exact integer levels: one-sided votes on our fitter and on patch-solve (2026-11-18, branch levelsolve-20261118)
 
 HerculeX (github adambetka2/HerculeX, MIT; README "Exact integer levels") gives patches integer turns f by an exact solve of
