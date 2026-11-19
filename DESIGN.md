@@ -62,6 +62,35 @@ is a test of try9's heads, not of the physics. The CT itself does not separate t
 - A model whose rv output at 2.4-4.8 um keeps the layer alternation could be gated with this tool unchanged: `--rv` takes any store on
   the CT key's grid.
 
+**The latent codec keeps the sheet separation (lead's question, 2026-11-18).** `gt-trans --lat-rt klt1.lcb --lat-c C --lat-step S
+--lat-norm CENTRE,SCALE` runs each 4^3 cell (global 4-aligned grid) of the CT through the cell transform before the peak detector:
+- the normalised values (try9's scan-norm: P4 85.8 / 37.95, 1667 62.9 / 37.59) projected on the first C basis rows;
+- quantised exactly as `input_latc_k` does: `rint(c / S) * S`, |q| <= 127, the mean <= 32767;
+- decoded back to voxels as the sum of q_c b_c, then to uint8 CT.
+
+CT peaks per GT turn by normal gap (um):
+
+| arm | P4 0-70 | 70-85 | 85-100 | 100-115 | all | P4 July 0-70 | 70-85 | all | 1667 0-70 | 70-85 | all |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| raw 9.6 CT | 0.523 | 0.740 | 0.871 | 0.970 | 1.044 | 0.352 | 0.680 | 1.199 | 0.454 | 0.674 | 1.541 |
+| 64 coefs, unquantised (check) | 0.523 | 0.740 | 0.871 | 0.970 | 1.044 | 0.352 | 0.680 | 1.199 | 0.454 | 0.674 | 1.541 |
+| 61, step 0.05 (R1-like) | 0.521 | 0.742 | 0.870 | 0.971 | 1.044 | 0.353 | 0.681 | 1.200 | 0.452 | 0.671 | 1.539 |
+| 29, unquantised | 0.520 | 0.736 | 0.869 | 0.966 | 1.040 | 0.352 | 0.678 | 1.197 | 0.451 | 0.669 | 1.537 |
+| 29, step 0.125 | 0.524 | 0.739 | 0.861 | 0.969 | 1.042 | 0.354 | 0.682 | 1.199 | 0.449 | 0.669 | 1.535 |
+| **29, step 0.25 (try9)** | **0.519** | **0.739** | **0.864** | **0.967** | **1.040** | **0.355** | **0.681** | **1.197** | **0.441** | **0.667** | **1.517** |
+| 13, step 0.25 | 0.507 | 0.720 | 0.848 | 0.948 | 1.023 | 0.348 | 0.669 | 1.176 | 0.432 | 0.655 | 1.495 |
+
+- The 64-coefficient decode is bit-exact to the raw CT, which validates the path.
+- try9's codec costs -0.004 / +0.003 / -0.013 peaks per turn below 70 um on P4 / P4 July / 1667.
+  - That is small next to the rv heads' gap to the CT: 0.45 vs 0.52, 0.28 vs 0.35, 0.41 vs 0.45.
+  - So the codec is not what throws the separation away. The loss is in the net (38 um cells, the trunk), not in its input.
+- A lossless latent (61 coefficients, small step) gains nothing this detector sees. Only 13 coefficients start to lose (-0.016 on P4 below 70 um).
+- Caveats:
+  - The detector smooths at sigma 1.2 voxels in the plane, so it cannot see detail finer than ~2 voxels.
+  - A first version decoded to float. Its sub-LSB residue broke the ties of flat masked runs, giving a 1667 64-coefficient "check" of 0.37
+    and a spurious try9 drop. The decode now rounds to uint8.
+- Setup: `/vesuvius/ufsm/unrollperf/rvsep/lat/run2.sh`, outputs `{p4,p4j,c7}.<arm>.out` (CPU, ~1 min per arm).
+
 ## Ink retrain from try9 on the 2-D teachers; ink-teach --extra (B2) (2026-11-18, branches inkteach / inkteachx-20261118, inksdk)
 
 User (via lead, 11-18): retrain the latent ink head from try9 (scratch2) on the 2-D teachers (reader3 + ink9um soft targets via

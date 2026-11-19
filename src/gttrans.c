@@ -118,7 +118,7 @@ static void flips(const int8_t *raw, int n, uint8_t *f12, uint8_t *f21) {
 
 /* --lat-rt BASIS: replace plane zn of the CT by what a latent-grid net reads of it: each 4^3 cell (global 4-aligned grid) of the
    normalised CT (v - centre) / scale on the first lc basis rows, quantised to lstep (0: not; |q| <= 127, the mean 32767) as
-   input_latc_k (lp_mx_cvt.cu) does, then back to voxels (orthonormal basis: the sum of q_c b_c) and to CT units */
+   input_latc_k (lp_mx_cvt.cu) does, then back to voxels (orthonormal basis: the sum of q_c b_c) and to uint8 CT */
 static int lat_rt(const gt_job *J, int64_t zn, int64_t Y0, int64_t X0, int H, int W, float *ct) {
     const int64_t zc = zn & ~(int64_t)3, yc = Y0 & ~(int64_t)3, xc = X0 & ~(int64_t)3; const int dz = (int)(zn - zc);
     const int HH = (int)(((Y0 + H + 3) & ~(int64_t)3) - yc), WW = (int)(((X0 + W + 3) & ~(int64_t)3) - xc);
@@ -134,7 +134,7 @@ static int lat_rt(const gt_job *J, int64_t zn, int64_t Y0, int64_t X0, int H, in
         }
         for (int k = 16 * dz; k < 16 * dz + 16; k++) {
             const int64_t y = yc + cy + (k >> 2 & 3) - Y0, x = xc + cx + (k & 3) - X0;
-            if (y >= 0 && y < H && x >= 0 && x < W) ct[y * W + x] = (float)(r[k] * J->lsc + J->lcen);
+            if (y >= 0 && y < H && x >= 0 && x < W) ct[y * W + x] = fminf(255.f, fmaxf(0.f, rintf((float)(r[k] * J->lsc + J->lcen))));   /* a uint8 decode (float residue broke flat masked runs' ties: 1667 64-coefficient check 0.37 vs raw 0.45) */
         }
     }
     free(b); return 0;
