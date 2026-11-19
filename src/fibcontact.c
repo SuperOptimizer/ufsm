@@ -29,7 +29,7 @@ static const char *fx_opt(int argc, char **argv, const char *k, const char *d) {
 static int fx_opt2(int argc, char **argv, const char *k) { for (int i = 1; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return i; return 0; }
 static double wrap14(double v) { v = fmod(v + 7, 14); if (v < 0) v += 14; return v - 7; }
 
-typedef struct { float p[3]; int run, fam, in, lab; float W, n[3], t; float q[3]; } xs;   /* q: the nearest code voxel; t: offset along n */
+typedef struct { float p[3]; int run, fam, in, lab; float W, n[3], t; float q[3]; float u; } xs;   /* u: offset from the sheet's mid-surface (CT run along n through q; NaN unknown) */   /* q: the nearest code voxel; t: offset along n */
 typedef struct { int64_t o[3], n[3]; uint8_t *c; } xbox;
 static inline int xc(const xbox *B, int64_t z, int64_t y, int64_t x) {
     z -= B->o[0]; y -= B->o[1]; x -= B->o[2];
@@ -85,6 +85,26 @@ static double xgap(const xbox *B, const xs *a, double dir, int maxd) {
     }
     return 0;
 }
+/* --ct: the sheet's papyrus run along n through its code voxel q (CT >= iso, trilinear, 0.5-voxel steps, <= 15 voxels each way): the
+   sample's offset from the run's middle (level voxels, + outward), NaN when the run is not bounded */
+typedef struct { int64_t o[3], n[3]; uint8_t *v; } xct;
+static double xtri(const xct *C, double z, double y, double x) {
+    z -= C->o[0]; y -= C->o[1]; x -= C->o[2];
+    const int64_t z0 = (int64_t)floor(z), y0 = (int64_t)floor(y), x0 = (int64_t)floor(x);
+    if (z0 < 0 || y0 < 0 || x0 < 0 || z0 + 1 >= C->n[0] || y0 + 1 >= C->n[1] || x0 + 1 >= C->n[2]) return NAN;
+    const double fz = z - z0, fy = y - y0, fx = x - x0; double r = 0;
+    for (int c = 0; c < 8; c++) { const int a = c >> 2, b = (c >> 1) & 1, d = c & 1;
+        r += (a ? fz : 1 - fz) * (b ? fy : 1 - fy) * (d ? fx : 1 - fx) * C->v[((size_t)(z0 + a) * C->n[1] + (y0 + b)) * C->n[2] + x0 + d]; }
+    return r;
+}
+static float xmid(const xct *C, const xs *s, double iso) {
+    double e[2] = {0, 0};
+    for (int k = 0; k < 2; k++) { const double dir = k ? 1 : -1; double t = 0; int ok = 0;
+        for (double u = 0.5; u <= 15; u += 0.5) { const double v = xtri(C, s->q[0] + dir * u * s->n[0], s->q[1] + dir * u * s->n[1], s->q[2] + dir * u * s->n[2]);
+            if (!(v == v)) break; if (v < iso) { ok = 1; break; } t = u; }
+        if (!ok) return NAN; e[k] = dir * t; }
+    const double mid = 0.5 * (e[0] + e[1]); return (float)(s->t - mid);
+}
 static int cmp_f(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return x < y ? -1 : x > y; }
 
 enum { NG = 5 };   /* gap buckets: < 50, 50-70, 70-100, 100-150, >= 150 um (and none) */
@@ -110,8 +130,10 @@ int cmd_fiber_contacts(int argc, char **argv) {
     { const int mi = fx_opt2(argc, argv, "--mf"); if (mi) { store *ms = store_open(argv[mi + 1]); mz = ms ? z3_open(ms, argv[mi + 2], nullptr) : nullptr; if (!mz) { fprintf(stderr, "fiber-contacts: cannot open the mf plane\n"); return 1; }
         if (sscanf(fx_opt(argc, argv, "--mf-origin", "0,0,0"), "%lf,%lf,%lf", &mo[0], &mo[1], &mo[2]) != 3) return 2; mh = opt_atoi("--mf-h", fx_opt(argc, argv, "--mf-h", "2")); } }
     FILE *fo = nullptr, *ff = nullptr;
-    { const char *p = fx_opt(argc, argv, "--out", nullptr); if (p && !(fo = fopen(p, "w"))) return 1; if (fo) fprintf(fo, "box\trun_h\trun_v\td\tdW\ts_rad\ts_gt\tc_rad\tc_gt\tgap_um\tmf\n");
+    { const char *p = fx_opt(argc, argv, "--out", nullptr); if (p && !(fo = fopen(p, "w"))) return 1; if (fo) fprintf(fo, "box\trun_h\trun_v\td\tdW\ts_rad\ts_gt\tc_rad\tc_gt\tgap_um\tmf\tu_h\tu_v\tU_h\tU_v\n");
       p = fx_opt(argc, argv, "--fibres", nullptr); if (p && !(ff = fopen(p, "w"))) return 1; if (ff) fprintf(ff, "box\trun\tfam\tn_lab\tt_median\tt_q25\tt_q75\n"); }
+    z3 *ctz = nullptr; const double isoarg = opt_atof("--iso", fx_opt(argc, argv, "--iso", "0"));
+    { const int ti = fx_opt2(argc, argv, "--ct"); if (ti) { store *ts = store_open(argv[ti + 1]); ctz = ts ? z3_open(ts, argv[ti + 2], nullptr) : nullptr; if (!ctz) { fprintf(stderr, "fiber-contacts: cannot open the CT\n"); return 1; } } }
     const double sc = ldexp(1.0, level);
     afv *A = afv_open(afp); if (!A) return 1;
     /* totals: contacts by gap bucket x (s_rad > 0) x dW in {-1, 0, +1, other}; also by s_gt */
@@ -155,13 +177,28 @@ int cmd_fiber_contacts(int argc, char **argv) {
         xbox G; const int hal = rad + gmax + 6;
         for (int d = 0; d < 3; d++) { G.o[d] = bo[d] - hal; G.n[d] = bs[d] + 2 * hal; if (G.o[d] < 0) { G.n[d] += G.o[d]; G.o[d] = 0; } }
         G.c = malloc((size_t)G.n[0] * G.n[1] * G.n[2]); if (!G.c || z3_read(cz, G.o, G.n, G.c, 8)) { fprintf(stderr, "fiber-contacts: %s: codes read failed\n", bn); return 1; }
+        xct Cct = {0}; double iso = 0;
+        if (ctz) { for (int d = 0; d < 3; d++) { Cct.o[d] = G.o[d]; Cct.n[d] = G.n[d]; } Cct.v = malloc((size_t)Cct.n[0] * Cct.n[1] * Cct.n[2]);
+            if (!Cct.v || z3_read(ctz, Cct.o, Cct.n, Cct.v, 8)) { fprintf(stderr, "fiber-contacts: %s: CT read failed\n", bn); return 1; }
+            /* iso: half way between the box's 10th CT percentile (air) and the median CT on the labelled voxels (papyrus), unless --iso */
+            if (isoarg > 0) iso = isoarg; else { long h0[256] = {0}, h1[256] = {0}; long n0 = 0, n1 = 0; const size_t NV = (size_t)Cct.n[0] * Cct.n[1] * Cct.n[2];
+                for (size_t i = 0; i < NV; i += 7) { h0[Cct.v[i]]++; n0++; if (G.c[i] >= 1 && G.c[i] <= 252) { h1[Cct.v[i]]++; n1++; } }
+                int p10 = 0; for (long a = 0; p10 < 255 && (a += h0[p10]) < n0 / 10; p10++) {}
+                int p50 = 0; for (long a = 0; p50 < 255 && (a += h1[p50]) < n1 / 2; p50++) {}
+                iso = 0.5 * (p10 + p50); printf("box %s: CT iso %.1f (air p10 %d, labelled median %d)\n", bn, iso, p10, p50); } }
         size_t nlab = 0;
         for (size_t k = 0; k < ns; k++) {
             xs *s = &S[k]; if (!s->in) continue;
             double ay, axx; axis_at(&ax, sc * (s->p[0] + 0.5) - 0.5, &ay, &axx);
             double r[3] = {0, s->p[1] - ((ay + 0.5) / sc - 0.5), s->p[2] - ((axx + 0.5) / sc - 0.5)}; const double rl = hypot(r[1], r[2]); if (rl < 1) continue; r[1] /= rl; r[2] /= rl;
-            if (!xlabel(&G, s, rad, r)) nlab++;
+            s->u = NAN; if (!xlabel(&G, s, rad, r)) { nlab++; if (Cct.v) s->u = xmid(&Cct, s, iso); }
         }
+        /* the fibre's face: the median of its samples' mid-surface offsets (a fibre stays in one layer) */
+        int maxrun = 0; for (size_t k = 0; k < ns; k++) if (S[k].run > maxrun) maxrun = S[k].run;
+        float *fu = malloc(((size_t)maxrun + 1) * sizeof *fu); for (int i = 0; i <= maxrun; i++) fu[i] = NAN;
+        for (size_t a = 0; a < ns;) { size_t b = a; while (b < ns && S[b].run == S[a].run) b++;
+            float *tv = malloc((b - a) * sizeof *tv); size_t m = 0; for (size_t k = a; k < b; k++) if (S[k].lab && S[k].u == S[k].u) tv[m++] = S[k].u;
+            if (m >= 4) { qsort(tv, m, sizeof *tv, cmp_f); fu[S[a].run] = tv[m / 2]; } free(tv); a = b; }
         /* (1) per fibre: the median offset of its labelled samples */
         long bside[2][3] = {{0}};
         for (size_t a = 0; a < ns;) {
@@ -203,10 +240,11 @@ int cmd_fiber_contacts(int argc, char **argv) {
                       uint8_t b; if (!z3_read(mz, o, n1, &b, 1)) mf = b; }
             bc[gi][crad > 0][wi]++; T[0][gi][crad > 0][wi]++; T[1][gi][cgt > 0][wi]++; nct++;
             if (mf >= 0) { mfn[gi][0]++; mfn[gi][1] += mf >= 179; }
-            if (fo) fprintf(fo, "%s\t%d\t%d\t%.2f\t%d\t%d\t%d\t%.3f\t%.3f\t%.1f\t%d\n", bn, h->run, v->run, d, dW, crad > 0 ? 1 : -1, cgt > 0 ? 1 : -1, crad, cgt, gap, mf);
+            if (fo) fprintf(fo, "%s\t%d\t%d\t%.2f\t%d\t%d\t%d\t%.3f\t%.3f\t%.1f\t%d\t%.2f\t%.2f\t%.2f\t%.2f\n", bn, h->run, v->run, d, dW, crad > 0 ? 1 : -1, cgt > 0 ? 1 : -1, crad, cgt, gap, mf,
+                            h->u, v->u, fu[h->run], fu[v->run]);
         }
         #undef XCELL
-        free(head); free(nxt);
+        free(head); free(nxt); free(fu); free(Cct.v);
         printf("box %s: %zu samples, %zu labelled; fibres H on the outward / middle / inward side %ld / %ld / %ld, V %ld / %ld / %ld; %ld contacts\n", bn, ns, nlab,
                bside[0][2], bside[0][1], bside[0][0], bside[1][2], bside[1][1], bside[1][0], nct);
         fflush(stdout); free(S); free(G.c);

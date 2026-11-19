@@ -6,6 +6,57 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## wgraph's fibre contact crossings against the GT: they do not divide touching sheets (2026-11-19, branch wgraph-20261119, mergeflag) -- PARKED
+
+User (via lead, 11-19): adapt villa's `vc_wgraph` (vesuvius/docs/wgraph.md, fiber_workflows.md, fiber_layout.md) to count-field, aimed
+at touching sheets. wgraph: AFV fibres are graph nodes; extraction finds fibre-fibre encounters (parallel: a transverse winding distance,
+the Lasagna winding density integrated along the connector, stored in 1/16 turn; perpendicular: H / V meetings) with endpoint normals and
+a unit connector A -> B for order; wrapped IRLS solves per fibre H / V / broken (period-2 phase) and a whole-fibre normal sign; a
+fractional-target L1 IRLS gives integer windings; UV fits fibres as straight fixed-length lines. No GT accuracy is reported there.
+The lever for us would be the H-V contact: same sheet (the H layer of one face over the V layer of the other) or two touching sheets,
+decided by the order along the oriented normal and the layer class, i.e. dU = 0 or +-1 rows for count-field (the anchor-row machinery).
+
+`ufsm fiber-contacts AFV --map reg.json --boxes B.tsv --names .. --codes ROOT KEY --axis U.json [--ct ROOT KEY] [--mf ..] [--out c.tsv]`
+(src/fibcontact.c): Paris4_1mm_v2 mapped into our scan by ufsm reg (p50 2.9 um, p90 9.7 um), resampled every level-2 voxel; per sample
+the nearest GT code voxel within 3 voxels (sheet, W) and the GT normal there (minor axis of the same-sheet code voxels' covariance,
+signed radially outward); contact = each H sample's nearest V sample within 6 voxels (58 um); GT dW; order = connector . normal; the GT
+gap on V's side; mf (arm B's u1 P4 plane) at the midpoint. 54 k contacts over the 38 P4 GT boxes (q-9p6 PH1-3 + HOLD, July codesB J1-34).
+
+(1) Layer class: the AFV family carries no side-of-sheet information. A fibre's median offset from its labelled face along the outward
+normal: HOLD H +0.50 / V +0.54 voxels, PH1-3 +0.04 / +0.06, J +0.22 / +0.21; the inward / mid / outward shares of H and V agree within
+0.02-0.08.
+
+(2) Contacts: the best rule per gap bucket (dW = 0, or dW = +-1 in the connector's direction):
+
+| GT gap | HOLD | PH1-3 | J1-34 |
+|---|---|---|---|
+| < 50 um | 0.79 (adjacent; n 339) | 0.74 (827) | 0.71 (1344) |
+| 50-70 um | 0.57 (1068) | 0.53 (1606) | 0.54 (3401) |
+| 70-100 um | 0.65 (same) | 0.64 | 0.63 |
+| 100-150 um | 0.94 | 0.91 | 0.92 |
+| >= 150 um | 1.00 | 0.99 | 1.00 |
+
+The order part works: when the GT says adjacent it is in the connector's direction 99-100 % of the time (the radial direction instead
+of the GT normal: -0.15 in oblique PH, -0.01 elsewhere). Same vs adjacent does not: a same-sheet H / V pair sits 3-6 voxels apart along
+the normal, like an adjacent pair in packed papyrus. Close crossings (|normal separation| <= 2 voxels) are 3-10 % of the contacts and
+mostly one sheet (0.67-0.80 under 50 um, 0.82-0.96 at 50-70). Contacts under 70 um are mf-flagged at 0.66-0.68 (PH), 0.37-0.57 (J),
+0.15-0.36 (HOLD).
+
+Face oracle (lead): each sample's face from the GT + CT, its offset from its sheet's mid-surface (the papyrus run, CT >= iso, along the
+GT normal through its code voxel; iso half way between the box's air p10 and the labelled median); also the fibre's median; same iff H
+and V sit on opposite faces of one sheet in the connector order, adjacent iff on the touching faces, else undecided:
+
+| GT gap | HOLD sample: decided / acc | HOLD fibre | PH sample | PH fibre | J sample | J fibre |
+|---|---|---|---|---|---|---|
+| < 50 um | 0.33 / 0.49 | 0.42 / 0.43 | 0.20 / 0.45 | 0.36 / 0.44 | 0.17 / 0.35 | 0.36 / 0.39 |
+| 50-70 um | 0.31 / 0.70 | 0.49 / 0.47 | 0.24 / 0.65 | 0.29 / 0.49 | 0.22 / 0.64 | 0.38 / 0.53 |
+| 70-100 um | 0.36 / 0.89 | 0.57 / 0.69 | 0.23 / 0.80 | 0.32 / 0.61 | 0.24 / 0.85 | 0.40 / 0.66 |
+
+Far below 0.9: at 9.6 um touching sheets are one papyrus run in the CT, so the mid-surface (and with it the face) is lost exactly where
+it is needed; the GT has no faces at this grid. Verdict: wgraph contact rows are not a route to touching sheets with what we have;
+(3) parallel winding distances are a network count field integrated along the connector, the information count-field already uses;
+(4) / (5) not built. Parked. Data: /vesuvius/ufsm/wgraph ({hold,ph,j}.tsv, o-*.tsv, summ.awk, oracle.awk). 1667 has no AFV.
+
 ## How much GT does the global count need? Sparse GT anchors in count-field; P4 phase misses by normal gap (2026-11-18/19, branch anchors-20261118, mergeflag)
 
 User (via lead): "how much ground truth do we actually need?" Test: feed count-field's least-squares ref sparse GT anchors and score
