@@ -33,9 +33,16 @@ static int dl_mkdirs(const char *p) {
     return mkdir(b, 0775) && errno != EEXIST ? -1 : 0;
 }
 /* one derived array to render: a cached array of a source, its kind / level for the log */
-typedef struct { z3 *z; char what[160]; } dl_arr;
+typedef struct { z3 *z; char what[200]; } dl_arr;
 static int dl_add(dl_arr **A, int *n, int *cap, z3 *z, const char *what) {
-    if (!z || dcache_info(z, nullptr, nullptr, nullptr, nullptr)) return 0;
+    if (!z) return 0;
+    if (dcache_info(z, nullptr, nullptr, nullptr, nullptr)) {   /* not cached itself (a fusion of cached sets, a pooled view): the cached arrays it reads */
+        if (!z3_derived_ctx(z)) return 0;
+        int r = 0; char w[200]; snprintf(w, sizeof w, "%s (input)", what);
+        r += dl_add(A, n, cap, z3_base_of(z), w);
+        for (int k = 0; k < 4; k++) { snprintf(w, sizeof w, "%s (input %d)", what, k + 1); r += dl_add(A, n, cap, z3_derived_cover_at(z, k), w); }
+        return r;
+    }
     char hex[25]; dcache_info(z, nullptr, hex, nullptr, nullptr);
     for (int i = 0; i < *n; i++) { char h2[25]; dcache_info((*A)[i].z, nullptr, h2, nullptr, nullptr); if (!strcmp(h2, hex)) return 0; }   /* (one key: once) */
     if (*n == *cap) { *cap = *cap ? 2 * *cap : 16; *A = realloc(*A, (size_t)*cap * sizeof **A); }
@@ -89,7 +96,7 @@ static uint64_t dl_du(const char *dir) {   /* bytes under dir (one level of shar
     if (p) { if (fscanf(p, "%llu", &b) != 1) b = 0; pclose(p); }
     return b;
 }
-static int dl_render(z3 *z, const char *what, const char *root, int64_t S, int S_given, int64_t margin, int nthreads, int dry, double *gsec, uint64_t *gbytes) {
+static int dl_render(z3 *z, const char *what, const char *root, int64_t S, int S_given, int64_t margin, int nthreads, int dry, size_t limit, double *gsec, uint64_t *gbytes) {
     const char *key; char hex[25]; int C, pd; dcache_info(z, &key, hex, &C, &pd);
     const z3_meta *m = z3_meta_of(z); if (S % C) { fprintf(stderr, "denselab: %s: shard %lld is not a multiple of the cell %d\n", what, (long long)S, C); return 1; }
     char dir[1200], ad[1300]; snprintf(dir, sizeof dir, "%s/%s", root, hex); snprintf(ad, sizeof ad, "%s/a", dir);
@@ -113,6 +120,8 @@ static int dl_render(z3 *z, const char *what, const char *root, int64_t S, int S
            what, dir, C, pd ? ", near-lossless" : "", (long long)m->shape[0], (long long)m->shape[1], (long long)m->shape[2], ns, (long long)S, nt, nhave, nskip);
     fflush(stdout);
     if (dry) { free(bits); free(todo); return 0; }
+    const int partial = limit && nt > limit;   /* --limit N: an evenly spread sample of the shards (sizes / speed); the store stays partial */
+    if (partial) { for (size_t i = 0; i < limit; i++) todo[i] = todo[(size_t)((double)i * nt / limit)]; nt = limit; }
     if (dl_mkdirs(dir)) { fprintf(stderr, "denselab: cannot create %s\n", dir); free(bits); free(todo); return 1; }
     { char ip[1300]; snprintf(ip, sizeof ip, "%s/inputs.txt", dir); FILE *f = fopen(ip, "wb"); if (!f || fprintf(f, "%s\n", key) < 0 || fclose(f)) { fprintf(stderr, "denselab: cannot write %s\n", ip); free(bits); free(todo); return 1; } }
     /* the shards not in reach are rendered too in the bits (their values are the fill: the cache computes nothing for them either way,
@@ -127,12 +136,12 @@ static int dl_render(z3 *z, const char *what, const char *root, int64_t S, int S
     for (int t = 0; t < m2; t++) pthread_create(&th[t], nullptr, dl_worker, &J);
     for (int t = 0; t < m2; t++) pthread_join(th[t], nullptr);
     int rc = J.fail || z3w_close(w) ? 1 : 0;
-    if (!rc) { for (size_t i = 0; i < ns; i++) bits[i] = 1; rc = dl_write_shards(dir, S, g, bits) ? 1 : 0; }   /* (complete: the out-of-reach shards are fill) */
+    if (!rc && !partial) { for (size_t i = 0; i < ns; i++) bits[i] = 1; rc = dl_write_shards(dir, S, g, bits) ? 1 : 0; }   /* (complete: the out-of-reach shards are fill) */
     const double el = dl_now() - t0; const uint64_t by = dl_du(ad);
     printf("denselab: %s: %s, %zu shards in %.0f s, store %.3f GB (%.3f bit per voxel of the rendered shards)\n", what, rc ? "FAILED" : "done", nt, el, by / 1e9,
            nt ? 8.0 * by / ((double)nt * S * S * S) : 0);
     *gsec += el; *gbytes += by;
-    if (!rc) { char dp[1300]; snprintf(dp, sizeof dp, "%s/done", dir); FILE *f = fopen(dp, "wb"); if (f) { fprintf(f, "shards %zu rendered %zu bytes %llu seconds %.0f\n", ns, nt, (unsigned long long)by, el); fclose(f); } }
+    if (!rc && !partial) { char dp[1300]; snprintf(dp, sizeof dp, "%s/done", dir); FILE *f = fopen(dp, "wb"); if (f) { fprintf(f, "shards %zu rendered %zu bytes %llu seconds %.0f\n", ns, nt, (unsigned long long)by, el); fclose(f); } }
     pthread_mutex_destroy(&J.mu); free(bits); free(todo); return rc;
 }
 /* --verify N: N random boxes per array inside its rendered shards: the cached read (served by the store; no local cache in this process)
@@ -164,7 +173,7 @@ static int dl_verify(z3 *z, const char *what, int nbox, int64_t P, uint64_t seed
 int cmd_denselab_render(int argc, char **argv) {
     if (argc < 3 || argv[2][0] == '-') {
         fprintf(stderr, "usage: ufsm denselab-render SOURCES.json --out ROOT [--source N1,N2] [--kind phase,ink,fibre] [--levels a,b] [--shard 512] [--margin 128]\n"
-                        "                             [--threads 16] [--dry 1] [--verify N --P 96 --seed 1]\n"
+                        "                             [--threads 16] [--dry 1] [--limit N] [--verify N --P 96 --seed 1]\n"
                         "  renders every derived (cached) label array of the sources into ROOT/<key hash>/ (zarr + shards.bin); the derived cache\n"
                         "  then reads them ($UFSM_DENSELAB, default ~/nas/denselab). --verify N: N boxes per array, the store vs a fresh compute.\n");
         return 2;
@@ -199,7 +208,7 @@ int cmd_denselab_render(int argc, char **argv) {
     int rc = 0; double sec = 0; uint64_t by = 0;
     for (int i = 0; i < na; i++)
         rc |= nverify ? dl_verify(A[i].z, A[i].what, nverify, opt_atoi("--P", opt(argc, argv, "--P", "96")), (uint64_t)opt_atoi("--seed", opt(argc, argv, "--seed", "1")) + 7919u * (unsigned)i, nt)
-                      : dl_render(A[i].z, A[i].what, out, S, opt(argc, argv, "--shard", nullptr) != nullptr, margin, nt, dry, &sec, &by);
+                      : dl_render(A[i].z, A[i].what, out, S, opt(argc, argv, "--shard", nullptr) != nullptr, margin, nt, dry, (size_t)opt_atoi("--limit", opt(argc, argv, "--limit", "0")), &sec, &by);
     if (!nverify && !dry) printf("denselab-render: %d arrays, %.3f GB, %.0f s%s\n", na, by / 1e9, sec, rc ? ", FAILED" : "");
     free(A); sources_free(SS);
     return rc;
