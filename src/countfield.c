@@ -1005,7 +1005,8 @@ int cmd_count_field(int argc, char **argv) {
             free(sv);
             const double smin = opt_atof("--cf-fib-smin", cf_opt(argc, argv, "--cf-fib-smin", "0.1")) * smed; const int keep = !strcmp(cf_opt(argc, argv, "--cf-fib-nodata", "drop"), "keep");
             size_t nk = 0, nbad = 0;
-            for (size_t p = 0; p < npt; p++) { const int ok = cf_data_at(L0, S0, smin, pts[p].a) && cf_data_at(L0, S0, smin, pts[p].b); nbad += !ok; if (ok || keep) pts[nk++] = pts[p]; }
+            for (size_t p = 0; p < npt; p++) {   /* (GT anchors are kept: their point is to set U where the data is weak) */
+                const int ok = pts[p].w > 0 || (cf_data_at(L0, S0, smin, pts[p].a) && cf_data_at(L0, S0, smin, pts[p].b)); nbad += !ok; if (ok || keep) pts[nk++] = pts[p]; }
             const double sh = (double)nbad / (double)npt;
             fprintf(stderr, "count-field: no-data: %zu of %zu pairs (%.4f) have an endpoint in a no-data solve cell (S < %.3g, %.2f x the median); %s\n",
                     nbad, npt, sh, smin, opt_atof("--cf-fib-smin", cf_opt(argc, argv, "--cf-fib-smin", "0.1")), keep ? "kept (--cf-fib-nodata keep)" : "dropped");
