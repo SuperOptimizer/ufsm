@@ -179,7 +179,7 @@ int cmd_fill_oracle(int argc, char **argv) {
     const char *fd = fo_opt(argc, argv, "--fields", nullptr), *md = fo_opt(argc, argv, "--model", nullptr), *od = fo_opt(argc, argv, "--out", nullptr);
     const char *rd = fo_opt(argc, argv, "--ref", nullptr), *ms = fo_opt(argc, argv, "--mode", "fill"), *mk = fo_opt(argc, argv, "--mask", "gt");
     int ci = -1; for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--codes"))) ci = i;
-    static const char *names[] = {"base", "interp", "fill", "shape", "ref", "fillc", "refc", "shapec"}; int mode = -1;
+    static const char *names[] = {"base", "interp", "fill", "shape", "ref", "fillc", "refc", "shapec"}; int mode = -1;   /* mgpu: debug (fill-oracle mode names, read-only) */
     for (int k = 0; k < 8; k++) if (!strcmp(ms, names[k])) mode = k;
     if (!fd || !md || !od || ci < 0 || mode < 0 || (strcmp(mk, "gt") && strcmp(mk, "mf") && strcmp(mk, "chain")) || ((mode == M_REF || mode == M_REFC) && !rd)) {
         fprintf(stderr, "usage: ufsm fill-oracle --fields DIR --model M --codes ROOT KEY --out DIR [--mode base|interp|fill|shape|ref|fillc|refc]"
