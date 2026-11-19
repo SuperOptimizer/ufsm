@@ -19,7 +19,7 @@ Records are merged per 16-voxel cell. count-field `--anchor-pins F` / `--anchor-
 only), weight `--anchor-w 10` x min(n, `--anchor-ncap 4`), never IRLS-reweighted, and kept in no-data cells (17 % of pairs were
 dropped there before 5220bf2b). test_countfield: GT pairs / pins restore a cut band sector (err 0.000), wrong dU does not (1.000).
 
-1667 q2 (try9 fields, mf-weighted ref `--mf-w 1`, CPU, pass 1 from a pool cache: ~7-10 min / run, 7-11 GB), 54 GT boxes split
+1667 q2 (u1-13790 fields, podun PHerc1667-q2pod; mf-weighted ref `--mf-w 1`, CPU, pass 1 from a pool cache: ~7-10 min / run, 7-11 GB), 54 GT boxes split
 27 held out / 27 anchor boxes (3.20 cm^3, 1.18 G labelled voxels), seed 1, GT ids right:
 
 | kind | p | anchors | per cm^3 | anchor boxes | held-out boxes |
