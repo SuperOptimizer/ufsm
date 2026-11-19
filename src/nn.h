@@ -504,6 +504,17 @@ void nn_gfilm_bwd(const float *p, float *g, size_t gam, size_t bet, size_t fo, i
 void nn_gfilm_tok(float *x, int C, long S, const float *dg);
 /* the Gram of K planes of 16-bit values (bf16 1, else fp16) with row stride ld over N entries: S[i K + j] += sum_n x_i x_j for j >= i (src/nn_gram.cu; train --grad-cos) */
 void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
+/* the learned sub-cell decoder of a latent-grid net (src/nn_latdec.cu, unet_cfg.lat_dec): L [Cl][nq][D/4 x ...] fp32 latent cells of cell planes
+   [q0, q0 + nq) from the fp16 CT window (input_latc_k's quantised coefficients times gain; bas nullptr: the cell's 64 voxels, Cl 64; planes outside 0).
+   fwd: rows (o * ld + n, o < 64 ng, n over nq planes of h x w cells) += W2 silu(pre + B * L) (pre: Hd rows, stride ldp; L: nq + 2 planes from
+   the plane before), fp16 or fp32 (r32 / p32); p = B [Cl][27][Hd], W2 [64 ng][Hd]. bwd: from gy16 (the rows' fp16 gradient, stride ldg) the
+   pre rows' gradient into gpre16 (fp16, stride ldg) and B / W2's gradients added to gp (deterministic sums; x 1 / the head plane scale).
+   1: a shape the kernels do not take (Hd 16 / 32 / 64, Cl <= 64, 64 ng <= 256) */
+void nn_latdec_cells(const void *x16, int D, int H, int W, int q0, int nq, const float *bas, const float *gain, int Cl, float step, float *L);
+int nn_latdec_fwd(void *rows, int r32, size_t ld, const void *pre, int p32, size_t ldp, const float *L, int nq, int h, int w, const float *p, int Hd, int Cl, int ng);
+size_t nn_latdec_scratch(size_t N, int Hd, int Cl, int ng);
+int nn_latdec_bwd(const void *gy16, size_t ldg, void *gpre16, const void *pre16, size_t ldp, const float *L, int nq, int h, int w, const float *p,
+                  int Hd, int Cl, int ng, float *gp, void *scratch);
 /* the fine voxel stem (src/nn_fstem.cu, train --fstem): params W1 [C][64] (4^3 taps at stride 2), b1 [C], W2 [nout][C]; fwd adds W2 silu(W1 x + b1)
    to the fp16 logit planes chs[o] (slab planes [z0, z0 + nz) of a D x H x W window, ns voxels a plane) on each 2^3 block; bwd accumulates the
    parameter gradients from fp16 gradient planes of that layout into gp. 1: a shape the kernels do not take (odd sizes, C or nout > 16) */

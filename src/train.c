@@ -290,6 +290,7 @@ static int g_gc;
    the fused normal / density group); --fstem-drop P: a training window without it (level dropout: the net keeps working without the fine
    level, as for scans with no finer data; validation and predict always use it) */
 static int g_fstem, g_fs_n, g_fs_ch[32]; static float g_fs_drop = 0.25f;
+static int g_lat_dec;   /* --lat-dec H: the learned sub-cell decoder (unet_cfg.lat_dec; the streamed head; latgc holds H more rows: its pre rows' gradient) */
 static sampler *g_vs_sp;   /* --vox-cap: the training sampler, for sampler_vox_scale */   /* mgpu: config */
 static float src_head_w(int si, int h) { return (si >= 0 && g_S && si < g_S->n ? g_S->src[si].head_w[h] : 1.f) * g_hmul[h] * (g_vs_sp && h != SH_INK && h != SH_FIBRE ? sampler_vox_scale(g_vs_sp, si) : 1.f); }   /* the source's "heads" multiplier x --uw */
 /* --init-from: does an unwrap2 donor keep its rv pair / ink row somewhere other than this net's channels (u1 rv 11-12 -> U2 ink 11, rv
@@ -4059,6 +4060,15 @@ int cmd_train(int argc, char **argv) {
         cfg.fstem = g_fstem; cfg.fstem_out = g_fs_n;
         fprintf(stderr, "fine stem: %d silu features of 4^3 voxels at stride 2 into %d head outputs, dropped on %.0f%% of the training windows\n", g_fstem, g_fs_n, 100 * g_fs_drop);
     }
+    g_lat_dec = opt_atoi("--lat-dec", opt(argc, argv, "--lat-dec", "0"));
+    if (g_lat_dec) {   /* the learned sub-cell decoder (unet_cfg.lat_dec, src/nn_latdec.cu): a nonlinear term on the sub-cell rows from the trunk and the latent cells */
+        const int raw = opt_atoi("--lat-dec-raw", opt(argc, argv, "--lat-dec-raw", "0"));
+        if ((g_lat_dec != 16 && g_lat_dec != 32 && g_lat_dec != 64) || !g_lat || g_lat_guide != 64 || B != 1 || split) { fprintf(stderr, "--lat-dec 16 / 32 / 64: --lat 4 --lat-guide 3, --B 1, no --split\n"); return 2; }
+        cfg.lat_dec = g_lat_dec; cfg.lat_dec_raw = raw != 0; cfg.lat_dec_ng = 2;
+        fprintf(stderr, "sub-cell decoder: %d silu features per cell from the trunk and the %s of the 3^3 neighbour cells into the %d sub-cell rows (W2 0: the linear head at start)\n",
+                g_lat_dec, raw ? "64 voxels" : "latent coefficients", 64 * cfg.lat_dec_ng);
+    }
+    if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && (pc.lat_dec != cfg.lat_dec || pc.lat_dec_raw != cfg.lat_dec_raw)) { fprintf(stderr, "--resume: the checkpoint's sub-cell decoder is %d / raw %d, the flags ask %d / %d (--lat-dec)\n", pc.lat_dec, pc.lat_dec_raw, cfg.lat_dec, cfg.lat_dec_raw); return 2; } }
     if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && (pc.fstem != cfg.fstem || pc.fstem_out != cfg.fstem_out)) { fprintf(stderr, "--resume: the checkpoint's fine stem is %d / %d, the flags ask %d / %d (--fstem)\n", pc.fstem, pc.fstem_out, cfg.fstem, cfg.fstem_out); return 2; } }
     for (int g = 0; g < ng; g++) {
         gpu_state *d = &G[g];
@@ -4288,6 +4298,7 @@ int cmd_train(int argc, char **argv) {
                     
                      && (!getenv("UFSM_LAT_FUSE") || ufsm_env_on("UFSM_LAT_FUSE"));
         for (int g = 0; g < ng; g++) unet_set_head_ext(G[g].u, g_head_slab && (!g_lat || g_lat_hs));
+        if (g_lat_dec && !g_lat_hs) { fprintf(stderr, "--lat-dec: the latent head stream (not UFSM_LAT_CHECK / UFSM_LAT_HEAD_STREAM=0)\n"); return 2; }
         if (g_fstem && !g_lat_hs) { fprintf(stderr, "--fstem: the latent head stream (head slabs of a multiple of 4 planes; not UFSM_LAT_CHECK / UFSM_LAT_HEAD_STREAM=0)\n"); return 2; }
         if (g_pg_lambda > 0 && !g_head_slab) { fprintf(stderr, "--pgrad-lambda needs the head-slab loss path (task unwrap2, B 1, no --split / --verso)\n"); return 2; }
         if (g_valP == P && !getenv("UFSM_VALP_FORCE")) g_valP = 0;   /* (UFSM_VALP_FORCE=1: the separate validation network at the training size, a test) */
@@ -4668,7 +4679,7 @@ int cmd_train(int argc, char **argv) {
                 d->hs_lg = nn_malloc(d->hs_lg_bytes = (size_t)(g_lat ? LUPC : g_cout) * tp3 * 2); d->hs_ds = nn_malloc(128 * sizeof(double)); d->hs_ent = nn_malloc(32 * sizeof(double)); nn_zero(d->hs_ent, 32 * sizeof(double)); d->hsz = nn_malloc(64 * sizeof(unsigned long long)); if (g_gc) d->gcS = nn_malloc((size_t)cfg.cout * cfg.cout * sizeof(double));
                 if (g_lat_hs) {   /* (the streamed head: hs_z / 4 + 2 cell planes of logits, fp32 sums, sub-cell gradient and the head's 16-bit gradient) */
                     const size_t nq = (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4);
-                    d->lgc = nn_malloc(nq * LNC * 2); d->latg = nn_malloc(nq * LGFC * 4); d->latgl = LGFC < LNC ? nn_malloc(nq * LNC * 2) : nullptr; d->latgc = nn_malloc(nq * LNC * 2);
+                    d->lgc = nn_malloc(nq * LNC * 2); d->latg = nn_malloc(nq * LGFC * 4); d->latgl = LGFC < LNC ? nn_malloc(nq * LNC * 2) : nullptr; d->latgc = nn_malloc(nq * (LNC + g_lat_dec) * 2);
                     if (g_lat_fuse) { d->fpart = nn_malloc(nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z)); if (g == 0) fprintf(stderr, "latent head stream: the gradient pass fused per cell for the normal / density channels%s (%.0f MB of partials; UFSM_LAT_FUSE=0 off)\n", g_lat_guide == 5 ? " and the guided side pair" : "", nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z) / 1e6); }
                     if (g == 0) fprintf(stderr, "latent head stream: the head per slab on %d cell planes (%.0f MB instead of %.2f GB of cell logits and gradients; UFSM_LAT_HEAD_STREAM=0 off)\n",
                                         g_hs_z / 4 + 2, (double)nq * (LNC * (LGFC < LNC ? 6 : 4) + LGFC * 4) / 1e6, (double)(p3 / 64) * (LNC * 4 + LGFC * 4) / 1e9);

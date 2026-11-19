@@ -115,6 +115,11 @@ typedef struct {
     int fstem, fstem_out;  /* C > 0 (<= 16): the fine voxel stem of a latent-grid net (nn_fstem_fwd: 4^3 taps at stride 2 of the CT channel, C silu
                               features, a projection to fstem_out (<= 16) head outputs added on the logits by the trainer's head slabs). Params
                               appended last (W1 He-initialised, b1 and the projection zero: the donor's function), header key "fstem" only when on */
+    int lat_dec, lat_dec_raw, lat_dec_ng;   /* H (16 / 32 / 64) > 0: the learned sub-cell decoder of a lat_guide 64 net (src/nn_latdec.cu): per cell
+                              h = silu(A f + a + B * L over the 3^3 neighbour cells), the last 64 lat_dec_ng head rows (the sub-cell rows) += W2 h.
+                              L: the latent input's lat_c coefficients (cin - 3) as input_latc_k quantises them, or (lat_dec_raw) the cell's 64 voxels.
+                              Params appended last (A [H][widths[0]], a [H], B [Cl][27][H], W2 [64 ng][H]; W2 0: the donor's function); header key
+                              "lat_dec" only when on. The head slabs (unet_head_fwd_z / _bwd_z) run it; the backward's gy16 needs room for H more rows */
 } unet_cfg;
 /* the sub-cell head's layout (lat_guide 64): the channels with sub-cell rows, their first row (sbase + 64 k), -1 for a channel without */
 static inline int unet_lat_nsub(const unet_cfg *c) { return c->lat_guide != 64 ? 0 : c->lat_nsub ? c->lat_nsub : 2; }
@@ -142,6 +147,8 @@ void unet_set_cond(unet *u, float c);
 /* cfg.film nets: the K codes of the following forward passes (and their backward) */
 void unet_set_film(unet *u, const float *codes, int k);
 size_t unet_fstem_off(const unet *u);
+size_t unet_latdec_off(const unet *u);   /* cfg.lat_dec: its parameter block (A, a, B, W2) */
+void unet_set_latdec_ct(unet *u, const void *x16, int D, int H, int W);   /* cfg.lat_dec: the fp16 CT window (4x the cell grid) the decoder reads from now on (predict: its forward takes cell inputs); default: the training forward's input */
 int unet_fstem_reset(unet *u, uint64_t seed);   /* the fine stem as unet_init leaves it (W1 He from seed, b1 and the projection W2 0: neutral), its optimizer state and EMA zeroed / reset; 0 ok */   /* cfg.fstem: the stem's parameters (W1, b1, W2) in the flat parameters */
 void unet_free(unet *u);
 void unet_reset_statics(void);   /* predict --boxes: forget the module's cached device buffers (nn_pool_box_end reclaims them) */

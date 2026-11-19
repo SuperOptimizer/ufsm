@@ -1208,6 +1208,7 @@ static const float *tta_pass(const tta_ctx *T, int code) {
         } else if (T->latc) nn_lat_pred_input_c(T->ctd, T->D, T->W, T->mean, T->isd, T->dyd, T->dyd + T->W, T->axis, T->lbas, T->lgain, T->latc, T->lstep, T->x2);
         else nn_lat_pred_input(T->ctd, T->D, T->W, T->mean, T->isd, T->dyd, T->dyd + T->W, T->axis, T->x2);
         if (T->skw) nn_skip_build(T->ctd, T->D, T->W, T->W, 4, T->skip_nl, T->skip_thr, T->skip_margin);
+        if (T->u && unet_cfg_of(T->u)->lat_dec) { if (!T->xd || !T->h16 || T->latin) { fprintf(stderr, "predict --tta: the sub-cell decoder reads the fp16 CT window (xd: no direct cell input)\n"); exit(2); } unet_set_latdec_ct(T->u, T->xd, T->W, T->W, T->W); }
         const float *l2 = unet_forward_x(T->u, T->x2, T->xn, 0, T->h16);
         if (T->skw) nn_skip_off();
         const int l2h = unet_logits_h16(T->u), c4 = T->W / 4;
@@ -2317,7 +2318,7 @@ static int predict_one(int argc, char **argv) {
         if (((gdir && cfg.lat_guide == 5) || (fzs && (cfg.lat_guide == 8 || cfg.fstem)) || lhm) && ct_shared && !ctcp && !(ctcp = nn_malloc(w3))) { fprintf(stderr, "predict: no device memory for the guided head's CT copy\n"); return 1; }   /* (the forward overwrites ctd) */
         { const float *b_, *g_; float s_; const int lc_ = half == 3 ? unet_lat_basis(u, &b_, &g_, &s_) : 0;   /* (--latents and the guided head's slab path read the full-resolution input; a
                                                                                                                  --lat-basis checkpoint: nn_lat_pred_input_c, fp16 storage) */
-          latin = half && hdiv == 4 && hmode == 1 && xs.c == 4 && (lc_ ? nn_get_f16() != 0 : cfg.cin == 4) && h16 && !auxz && !sheet_task && (!cfg.fstem || fzs || (lhm && !ffd)) && (!cfg.lat_guide || cfg.lat_guide == 64 || gdir || fzs)   /* (the sub-cell head reads no CT; the fine stem does: from the CT bytes in the multi-head and fit-slab paths) */
+          latin = half && hdiv == 4 && hmode == 1 && xs.c == 4 && !cfg.lat_dec && (lc_ ? nn_get_f16() != 0 : cfg.cin == 4) && h16 && !auxz && !sheet_task && (!cfg.fstem || fzs || (lhm && !ffd)) && (!cfg.lat_guide || cfg.lat_guide == 64 || gdir || fzs)   /* (the sub-cell head reads no CT; the fine stem does: from the CT bytes in the multi-head and fit-slab paths) */
                   && (!getenv("UFSM_PRED_LAT_INPUT") || ufsm_env_on("UFSM_PRED_LAT_INPUT")); }
         if (!xd && !ct_stem && !latin) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
@@ -3051,6 +3052,7 @@ static int predict_one(int argc, char **argv) {
                 const int skw = skip_empty && half == 3 && ctd && gpath && !lat_store && !lvq;   /* (the CT window in ctd until the forward) */
                 if (skw && !nn_skip_build(ctd, Wz, W, W, 4, skip_nl, skip_thr, skip_margin)) { skip_wins++; if (ufsm_env_on("UFSM_SKIP_REPORT")) { const double sh0 = nn_skip_share(0); skip_share0 += sh0; skip_zero += sh0 <= 0; } }
                 if (skw && ufsm_env_on("UFSM_SKIP_AB")) skip_ab(u, x2, xn, h16, ctd, Wz, W, cfg.cout);   /* the dense / masked A/B of this window */
+                if (cfg.lat_dec) { if (!xd || !h16) { fprintf(stderr, "predict: the sub-cell decoder (lat_dec) reads the fp16 CT window (xd)\n"); return 1; } unet_set_latdec_ct(u, xd, Wz, W, W); }
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
                 if (skw) { long m_, c_; nn_skip_counts(&m_, &c_); skip_masked += m_; skip_calls += c_; nn_skip_off(); }
                 /* train --fstem: the fine voxel stem on the CT channel (xd channel 0) into the planes the path holds: output o of the stem's list
