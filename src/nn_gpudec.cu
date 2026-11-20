@@ -268,7 +268,8 @@ fail:
 
 /* fail every request not done yet (under G.mu, after a device error) */
 static void gd_note_broken(void) {   /* the first device failure: one DEFAULTED line now (was: only the exit summary; 2026-11-20) */
-    static int said; if (__atomic_exchange_n(&said, 1, __ATOMIC_ACQ_REL)) return;
+    static int said;   /* mgpu: process (once per process, atomic exchange) */
+    if (__atomic_exchange_n(&said, 1, __ATOMIC_ACQ_REL)) return;
     UFSM_DEFAULTED("gpudec = the CPU decode from here (the GPU decoder on device %d failed after %llu substreams)", G.dev, (unsigned long long)G.n_subs);
 }
 static void fail_all(void) {
