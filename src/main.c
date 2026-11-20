@@ -147,6 +147,7 @@ static int usage(void) {
     fprintf(stderr,
         "ufsm — ultra fast scroll model\n"
         "  ufsm sysinfo [--ncpu | --avail-gb | --limit-gb] [--disk PATH]   real cgroup CPU / RAM limits, GPUs (MIG), CUDA, free disk\n"
+        "  ufsm codec-fit <basis.lcb> <root> <ct-group> <level> [--cl 20 --lambda L]   the learned input codec (stage 1): train + score against the KLT ladder\n"
         "  ufsm latvol  <basis.lcb> <root> <ct-group> <out-group> --levels L,.. [--c 29 --step 0.25 --gpu 0]   a CT group as latent cells: a drop-in CT source (latvol-check: against its source)\n"
         "  ufsm info    <root> <array-or-group-key> [--cache DIR]\n"
         "  ufsm read    <root> <array-key> z y x nz ny nx <out.raw> [--cache DIR] [--threads N]\n"
@@ -5109,6 +5110,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "overlay")) return cmd_overlay(argc, argv);
     if (!strcmp(cmd, "wind-score")) return cmd_wind_score(argc, argv);
     if (!strcmp(cmd, "latvol")) { int cmd_latvol(int, char **); return cmd_latvol(argc, argv); }   /* a CT group as latent cells, a drop-in CT source (src/latvol.h, latvol_cli.c) */
+    if (!strcmp(cmd, "codec-fit")) { int cmd_codec_fit(int, char **); return cmd_codec_fit(argc, argv); }   /* the learned input codec, stage 1 + its KLT pre-check (src/lcodec.h) */
     if (!strcmp(cmd, "latvol-check")) { int cmd_latvol_check(int, char **); return cmd_latvol_check(argc, argv); }
     if (!strcmp(cmd, "lc-encode")) { int cmd_lc_encode(int, char **); return cmd_lc_encode(argc, argv); }   /* latcomp v1 store of a CT volume (src/lc_cli.c) */
     if (!strcmp(cmd, "store-bench")) { int cmd_store_bench(int, char **); return cmd_store_bench(argc, argv); }
