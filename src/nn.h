@@ -513,6 +513,7 @@ void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
 void nn_latdec_cells(const void *x16, int D, int H, int W, int q0, int nq, const float *bas, const float *gain, int Cl, float step, void *L);   /* L fp16 */
 int nn_latdec_fwd(void *rows, int r32, size_t ld, const void *pre, int p32, size_t ldp, const void *L, int nq, int h, int w, const float *p, int Hd, int Cl, int ng);
 size_t nn_latdec_scratch(size_t N, int Hd, int Cl, int ng);
+void nn_latdec_wq(int fp4);   /* this thread's later fwd / bwd calls: B and W2 as MX-fp4 (e2m1, ue8m0 per 32 K; straight through); tensor-core path only (1 otherwise) */
 int nn_latdec_bwd(const void *gy16, size_t ldg, void *gpre16, const void *pre16, size_t ldp, const void *L, int nq, int h, int w, const float *p,
                   int Hd, int Cl, int ng, float *gp, void *scratch);
 /* the fine voxel stem (src/nn_fstem.cu, train --fstem): params W1 [C][64] (4^3 taps at stride 2), b1 [C], W2 [nout][C]; fwd adds W2 silu(W1 x + b1)

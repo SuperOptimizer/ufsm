@@ -4066,8 +4066,10 @@ int cmd_train(int argc, char **argv) {
         const int raw = opt_atoi("--lat-dec-raw", opt(argc, argv, "--lat-dec-raw", "0"));
         if ((g_lat_dec != 16 && g_lat_dec != 32 && g_lat_dec != 64) || !g_lat || g_lat_guide != 64 || B != 1 || split) { fprintf(stderr, "--lat-dec 16 / 32 / 64: --lat 4 --lat-guide 3, --B 1, no --split\n"); return 2; }
         cfg.lat_dec = g_lat_dec; cfg.lat_dec_raw = raw != 0; cfg.lat_dec_ng = LSUBN;   /* (every --lat-sub group: the last 64 LSUBN head rows) */
+        cfg.lat_dec_wq = opt_atoi("--lat-dec-fp4", opt(argc, argv, "--lat-dec-fp4", "0")) != 0;   /* MX-fp4 decoder weights (straight through; may differ from a resumed checkpoint's: quantisation-aware fine-tune) */
         fprintf(stderr, "sub-cell decoder: %d silu features per cell from the trunk and the %s of the 3^3 neighbour cells into the %d sub-cell rows (W2 0: the linear head at start)\n",
                 g_lat_dec, raw ? "64 voxels" : "latent coefficients", 64 * cfg.lat_dec_ng);
+        if (cfg.lat_dec_wq) fprintf(stderr, "sub-cell decoder: B and W2 as MX-fp4 (e2m1, a power-of-two scale per 32)\n");
     }
     if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && (pc.lat_dec != cfg.lat_dec || pc.lat_dec_raw != cfg.lat_dec_raw)) { fprintf(stderr, "--resume: the checkpoint's sub-cell decoder is %d / raw %d, the flags ask %d / %d (--lat-dec)\n", pc.lat_dec, pc.lat_dec_raw, cfg.lat_dec, cfg.lat_dec_raw); return 2; } }
     if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && (pc.fstem != cfg.fstem || pc.fstem_out != cfg.fstem_out)) { fprintf(stderr, "--resume: the checkpoint's fine stem is %d / %d, the flags ask %d / %d (--fstem)\n", pc.fstem, pc.fstem_out, cfg.fstem, cfg.fstem_out); return 2; } }

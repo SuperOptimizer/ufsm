@@ -3149,7 +3149,7 @@ static int latdec_rows(unet *u, void *rows, int r32, size_t ld, int c0, int nc, 
     for (int a = z0; a < z1; a += 8) {   /* (8 cell planes a pass: small scratch) */
         const int b = a + 8 < z1 ? a + 8 : z1; const size_t nv = (size_t)(b - a) * hw;
         if (latdec_inputs(u, a, b, 1)) return -1;
-        if (nn_latdec_fwd((char *)rows + ((size_t)(sb - c0) * ld + (size_t)(a - z0) * hw) * (r32 ? 4 : 2), r32, ld, u->ld_pre, 1, nv, u->ld_L, b - a, u->ls[0].h, u->ls[0].w,
+        nn_latdec_wq(u->cfg.lat_dec_wq); if (nn_latdec_fwd((char *)rows + ((size_t)(sb - c0) * ld + (size_t)(a - z0) * hw) * (r32 ? 4 : 2), r32, ld, u->ld_pre, 1, nv, u->ld_L, b - a, u->ls[0].h, u->ls[0].w,
                           P(u, u->ld_off + (size_t)H * w0 + H), H, latdec_cl(&u->cfg), ng)) return -1;
     }
     return 0;
@@ -3164,7 +3164,7 @@ int unet_head_fwd_z(unet *u, int z0, int z1, void *y16) {
     if (r || !u->cfg.lat_dec || b <= a) return r;
     if ((r = latdec_inputs(u, a, b, 0))) return r;
     const int H = u->cfg.lat_dec, ng = u->cfg.lat_dec_ng, w0 = u->cfg.widths[0]; const size_t nv = (size_t)(z1 - z0) * hw;
-    return nn_latdec_fwd((char *)y16 + ((size_t)(u->cfg.cout - 64 * ng) * nv + (size_t)(a - z0) * hw) * 2, 0, nv, u->ld_pre, 0, (size_t)(b - a) * hw, u->ld_L, b - a, u->ls[0].h, u->ls[0].w,
+    nn_latdec_wq(u->cfg.lat_dec_wq); return nn_latdec_fwd((char *)y16 + ((size_t)(u->cfg.cout - 64 * ng) * nv + (size_t)(a - z0) * hw) * 2, 0, nv, u->ld_pre, 0, (size_t)(b - a) * hw, u->ld_L, b - a, u->ls[0].h, u->ls[0].w,
                          P(u, u->ld_off + (size_t)H * w0 + H), H, latdec_cl(&u->cfg), ng);
 }
 void unet_set_latdec_range(unet *u, int a, int b) { u->ld_ra = a; u->ld_rb = b; }
@@ -3189,7 +3189,7 @@ int unet_head_bwd_z(unet *u, int z0, int z1, const void *gy16, int first) {
         nn_set_layer(3 * u->cfg.nlev - 2);
         if (latdec_inputs(u, z0, z1, 0)) return -1;
         ld_grow(&u->ld_sc, &u->ld_sc_n, nn_latdec_scratch(nv, H, Cl, ng));
-        if (nn_latdec_bwd((const char *)gy16 + (size_t)(co - 64 * ng) * nv * 2, nv, (char *)gy16 + (size_t)co * nv * 2, u->ld_pre, nv, u->ld_L, z1 - z0, u->ls[0].h, u->ls[0].w,
+        nn_latdec_wq(u->cfg.lat_dec_wq); if (nn_latdec_bwd((const char *)gy16 + (size_t)(co - 64 * ng) * nv * 2, nv, (char *)gy16 + (size_t)co * nv * 2, u->ld_pre, nv, u->ld_L, z1 - z0, u->ls[0].h, u->ls[0].w,
                           P(u, ob), H, Cl, ng, u->g + ob, u->ld_sc)) return -1;
         if (!u->ld_wc) { u->ld_wc = nn_malloc((size_t)nr * (w0 + 1) * 4 * 2); if (!u->ld_wc) return -1; u->ld_gwc = u->ld_wc + (size_t)nr * (w0 + 1); }
         float *wc = u->ld_wc, *bc = wc + (size_t)nr * w0, *gwc = u->ld_gwc, *gbc = gwc + (size_t)nr * w0;
@@ -5441,7 +5441,8 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.emb_lev) fprintf(f, ",\"emb_lev\":%d,\"emb_ch\":%d", u->cfg.emb_lev, u->cfg.emb_ch);
     if (u->cfg.film) fprintf(f, ",\"film\":%d", u->cfg.film);
     if (u->cfg.fstem) fprintf(f, ",\"fstem\":[%d,%d]", u->cfg.fstem, u->cfg.fstem_out);
-    if (u->cfg.lat_dec) fprintf(f, ",\"lat_dec\":[%d,%d,%d]", u->cfg.lat_dec, u->cfg.lat_dec_raw, u->cfg.lat_dec_ng);
+    if (u->cfg.lat_dec && u->cfg.lat_dec_wq) fprintf(f, ",\"lat_dec\":[%d,%d,%d,%d]", u->cfg.lat_dec, u->cfg.lat_dec_raw, u->cfg.lat_dec_ng, u->cfg.lat_dec_wq);
+    else if (u->cfg.lat_dec) fprintf(f, ",\"lat_dec\":[%d,%d,%d]", u->cfg.lat_dec, u->cfg.lat_dec_raw, u->cfg.lat_dec_ng);
     if (u->cfg.attn_blocks) fprintf(f,",\"attn_blocks\":%d,\"attn_pe\":%d,\"attn_reg\":%d,\"attn_mlp\":%d", u->cfg.attn_blocks, u->cfg.attn_pe, u->cfg.attn_reg, u->tbd.F);
     if (u->cfg.attn_vres) fprintf(f, ",\"attn_vres\":%d", u->cfg.attn_vres);
     if (u->cfg.attn_blocks && u->cfg.attn_axis) fprintf(f, ",\"attn_axis\":%d", u->cfg.attn_axis);
@@ -5550,7 +5551,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     cfg->emb_lev = (p = strstr(line, "\"emb_lev\":")) ? atoi(p + 10) : 0;
     cfg->emb_ch = (p = strstr(line, "\"emb_ch\":")) ? atoi(p + 9) : 0;
     cfg->film = (p = strstr(line, "\"film\":")) ? atoi(p + 7) : 0;
-    cfg->lat_dec = cfg->lat_dec_raw = cfg->lat_dec_ng = 0; if ((p = strstr(line, "\"lat_dec\":["))) sscanf(p + 11, "%d,%d,%d", &cfg->lat_dec, &cfg->lat_dec_raw, &cfg->lat_dec_ng);
+    cfg->lat_dec = cfg->lat_dec_raw = cfg->lat_dec_ng = cfg->lat_dec_wq = 0; if ((p = strstr(line, "\"lat_dec\":["))) sscanf(p + 11, "%d,%d,%d,%d", &cfg->lat_dec, &cfg->lat_dec_raw, &cfg->lat_dec_ng, &cfg->lat_dec_wq);
     cfg->fstem = cfg->fstem_out = 0; if ((p = strstr(line, "\"fstem\":["))) { cfg->fstem = atoi(p + 9); const char *q = strchr(p + 9, ','); cfg->fstem_out = q ? atoi(q + 1) : 0; }
     if ((p = strstr(line, "\"attn_blocks\":"))) cfg->attn_blocks = atoi(p + 14);
     if ((p = strstr(line, "\"attn_pe\":"))) cfg->attn_pe = atoi(p + 10);

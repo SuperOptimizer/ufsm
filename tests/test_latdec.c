@@ -7,7 +7,8 @@
    - backward: the pre rows' gradient (fp16) and B / W2's gradients against the reference's analytic ones, which are checked by central
      differences on a few entries; the head plane scale (nn_set_head_gscale 4) divides the parameter gradients exactly;
    - two runs bit-identical (no atomics). The tensor-core path by default (fp16 operands: tolerances 1e-3 forward fp32 rows, 6e-3 gradients),
-     UFSM_LATDEC_FFMA=1 the fp32 FFMA kernels (1e-4, 1e-3). Usage: test_latdec */
+     UFSM_LATDEC_FFMA=1 the fp32 FFMA kernels (1e-4, 1e-3);
+   - the MX-fp4 weight variant (nn_latdec_wq): the same checks against a reference on the host-quantised weights (wq_ref). Usage: test_latdec */
 #include "nn.h"
 #include <math.h>
 #include <stdint.h>
@@ -19,7 +20,23 @@ static int NG = 2, NO = 128;   /* sub-cell groups (--lat-sub: up to 16) */
 static double rnd(uint64_t *s) { *s = *s * 6364136223846793005ull + 1442695040888963407ull; return (double)(*s >> 11) * 0x1p-53 - 0.5; }
 static float h2f(uint16_t v) { _Float16 f; memcpy(&f, &v, 2); return (float)f; }
 static uint16_t f2h(float v) { _Float16 f = (_Float16)v; uint16_t r; memcpy(&r, &f, 2); return r; }
-static int fails;
+static int fails, WQ;   /* WQ: the MX-fp4 weight variant (nn_latdec_wq 1): the reference runs on the host-quantised weights (straight through) */
+/* the kernels' MX-fp4 rounding (nn_latdec.cu latdec_wq_k): a block of fp16 values onto e2m1 x 2^e, e the smallest with amax 2^-e <= 6, ties to even */
+static double e2m1(double x) { const double a = fabs(x);
+    const double q = a <= 0.25 ? 0 : a < 0.75 ? 0.5 : a <= 1.25 ? 1 : a < 1.75 ? 1.5 : a <= 2.5 ? 2 : a < 3.5 ? 3 : a <= 5 ? 4 : 6; return x < 0 ? -q : q; }
+static void wq_block(double **v, int n) {
+    double am = 0; for (int i = 0; i < n; i++) { *v[i] = (_Float16)*v[i]; if (fabs(*v[i]) > am) am = fabs(*v[i]); }
+    const float t = (float)am * (1.f / 6.f); uint32_t u; memcpy(&u, &t, 4); int e = (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0); e = e < -24 ? -24 : e > 15 ? 15 : e;
+    for (int i = 0; i < n; i++) *v[i] = (double)(_Float16)(e2m1(*v[i] * ldexp(1, -e)) * ldexp(1, e));
+}
+static void wq_ref(double *B, double *W2, int Hd, int Cl, int no) {   /* B [Cl][27][Hd] in the packed blocks (n, r, dx, 32 channels); W2 [no][Hd] along H */
+    const int CP = Cl <= 32 ? 32 : 64; double zero[64], *v[64];
+    for (int n = 0; n < Hd; n++) for (int t = 0; t < 9 * 3; t++) for (int c0 = 0; c0 < CP; c0 += 32) {
+        for (int i = 0; i < 32; i++) { const int c = c0 + i; zero[i] = 0; v[i] = c < Cl ? &B[((size_t)c * 27 + t) * Hd + n] : &zero[i]; }
+        wq_block(v, 32); }
+    const int bs = Hd < 32 ? Hd : 32;
+    for (int o = 0; o < no; o++) for (int k0 = 0; k0 < Hd; k0 += bs) { for (int i = 0; i < bs; i++) v[i] = &W2[(size_t)o * Hd + k0 + i]; wq_block(v, bs); }
+}
 static double TF = 1e-3, TG = 6e-3;   /* the tensor-core path (fp16 operands, fp32 sums); UFSM_LATDEC_FFMA=1 (fp32 throughout): 1e-4, 1e-3 */
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fprintf(stderr, "\n"); fails++; } } while (0)
 enum { NC = d * h * w };
@@ -70,6 +87,8 @@ static void run(int Hd, int raw, int ng, uint64_t seed) {
     float *p = malloc(NP * 4); double *pB = malloc(nB * 8), *pW = malloc(nW2 * 8);
     for (size_t i = 0; i < nB; i++) pB[i] = p[i] = (float)(rnd(&s) * 2 / sqrt(27.0 * Cl));
     for (size_t i = 0; i < nW2; i++) pW[i] = p[nB + i] = (float)(rnd(&s) * 2 / sqrt((double)Hd));
+    if (WQ) wq_ref(pB, pW, Hd, Cl, NO);
+    nn_latdec_wq(WQ);
     uint16_t *rows = malloc((size_t)NO * NC * 2), *pre = malloc((size_t)Hd * NC * 2), *gy = malloc((size_t)(NO + Hd) * NC * 2);
     double *pred = malloc((size_t)Hd * NC * 8), *gyd = malloc((size_t)NO * NC * 8);
     for (size_t i = 0; i < (size_t)NO * NC; i++) { rows[i] = f2h((float)(4 * rnd(&s))); if (i % 7 == 0) rows[i] = i % 14 ? 0x8000 : 0; }   /* (+-0 entries) */
@@ -147,7 +166,10 @@ static void run(int Hd, int raw, int ng, uint64_t seed) {
     for (size_t i = 0; i < nB; i++) { const double e = fabs(g1[i] - gB[i]); if (e > mgB) mgB = e; nbB += e > TG * (sB + fabs(gB[i])); }
     for (size_t i = 0; i < nW2; i++) { const double e = fabs(g1[nB + i] - gW[i]); if (e > mgW) mgW = e; nbW += e > TG * (sW + fabs(gW[i])); }
     CHECK(nbp == 0 && nbB == 0 && nbW == 0, "Hd %d raw %d: backward: pre %zu off (max %.3g), B %zu off (max %.3g, mean |g| %.3g), W2 %zu off (max %.3g, mean |g| %.3g)", Hd, raw, nbp, mg, nbB, mgB, sB, nbW, mgW, sW);
-    printf("test_latdec: Hd %2d Cl %2d ng %d: forward ok, W2 0 identical, backward max |e| pre %.2g B %.2g W2 %.2g, latent flips %zu\n", Hd, Cl, NG, mg, mgB, mgW, flip);
+    if (WQ) {   /* the quantisation is real: the unquantised reference differs */
+        size_t nd = 0; for (size_t i = 0; i < nW2; i++) nd += pW[i] != p[nB + i]; CHECK(nd * 2 > nW2, "Hd %d raw %d: fp4: only %zu of %zu W2 values quantised away", Hd, raw, nd, nW2); }
+    nn_latdec_wq(0);
+    printf("test_latdec%s: Hd %2d Cl %2d ng %d: forward ok, W2 0 identical, backward max |e| pre %.2g B %.2g W2 %.2g, latent flips %zu\n", WQ ? " fp4" : "", Hd, Cl, NG, mg, mgB, mgW, flip);
     nn_free(xd); nn_free(basd); nn_free(gaind); nn_free(Ld); nn_free(pd); nn_free(rd); nn_free(prd); nn_free(gyd_); nn_free(gpd); nn_free(scr);
     free(x); free(bas); free(L); free(p); free(pB); free(pW); free(rows); free(pre); free(gy); free(pred); free(gyd); free(y); free(a); free(hh);
     free(gB); free(gW); free(gpre); free(g1); free(g2); free(g4); free(gp1); free(gp2);
@@ -156,6 +178,9 @@ int main(void) {
     nn_init(0);
     if (getenv("UFSM_LATDEC_FFMA") && atoi(getenv("UFSM_LATDEC_FFMA"))) { TF = 1e-4; TG = 1e-3; }
     run(16, 0, 2, 1); run(32, 0, 2, 2); run(64, 0, 2, 3); run(64, 1, 2, 4); run(32, 0, 7, 5);   /* (7: phase + rv + fibre + ink, 448 rows: the gradient in 4 chunks) */
+    if (TF < 1e-3) {   /* FFMA: the fp4 weights are refused */
+        nn_latdec_wq(1); CHECK(nn_latdec_fwd(nullptr, 0, 1, nullptr, 0, 1, nullptr, 1, 1, 2, nullptr, 32, 29, 2) == 1, "fp4 weights: the FFMA path did not refuse"); nn_latdec_wq(0);
+    } else { WQ = 1; run(16, 0, 2, 6); run(64, 0, 7, 7); run(64, 1, 2, 8); WQ = 0; }
     if (fails) { fprintf(stderr, "test_latdec: %d failures\n", fails); return 1; }
     printf("test_latdec: ok\n");
     return 0;

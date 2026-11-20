@@ -83,6 +83,17 @@ H 32 is not cheaper (fwd 1.9 ms, bwd 2.8 ms: the L staging dominates). Step A/B 
 Gate (11-19): CPU fast tier 142 PASS (221 NOGPU under -g none); the touched GPU tests on card 1 50 PASS, test_lat_head~racecheck TIMEOUT
 at 1800 s (the sanitizer on the shared card; no FAIL). The tc-path racecheck runs in the next pod queue.
 
+**MX-fp4 weights (`--lat-dec-fp4 1`, 11-19).** B and W2 are used as MX-fp4: each block of 32 consecutive K of the packed GEMM operand
+(Bt rows: one neighbour row / dx and 32 channels; W2 rows along H, 16 at H 16) is rounded onto e2m1 x 2^e, e the trunk's ue8m0 rule
+(the smallest with amax 2^-e <= 6), ties to even. W2t is the transpose of the quantised W2h, so forward and backward see the same
+weights. The fp32 master weights and their gradients are untouched (straight through), so a fp16-trained decoder fine-tunes into fp4
+(`--resume` with the flag: a quantisation-aware fine-tune). The quantisation happens in the per-call weight pack (three tiny kernels,
+microseconds); the GEMMs stay fp16 mma, so this is a storage / precision variant, **not a speed one** (the decoder's cost is the L staging
+and the 3^3 conv on fp16 L, not the weights). Header: `"lat_dec":[H,raw,ng,1]`, the 4th value written only when on (old checkpoints
+read unchanged); predict applies it from the header. FFMA path refuses it. Tests: test_latdec runs every check against a reference on
+host-quantised weights (fp4 Hd 16 / 64, ng 2 / 7, raw; errors at the fp16 level: pre 5e-4, B 2e-3, W2 1.6e-3), test_latdec_train
+resumes the fp16 decoder into fp4 (header key, finite losses) and predicts a random-W2 fp4 net (rv differs from the fp16 one).
+
 ## Count-constrained fill: no headroom over the mf-weighted ref (2026-11-18, branch fill-20261118, levelsolve)
 
 `ufsm fill-oracle` (src/filloracle.c): radial rays (every native z plane, arcs <= 0.7 voxel) through a box raster of the model's U; merged

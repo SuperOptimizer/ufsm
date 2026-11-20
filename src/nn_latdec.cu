@@ -370,11 +370,40 @@ __global__ void __launch_bounds__(LD_NT) latdec_gw_tc_k(const f16 *__restrict__ 
         }
 }
 static int ld_ffma(void) { static int v = -1; if (v < 0) v = getenv("UFSM_LATDEC_FFMA") && atoi(getenv("UFSM_LATDEC_FFMA")) != 0; return v; }   /* mgpu: env */
+/* the MX-fp4 weight variant (nn_latdec_wq): every block of 32 consecutive K of a packed GEMM operand (Bt rows along k; W2h rows along H, 16
+   for H 16) rounded onto e2m1 x 2^e, e the smallest power-of-two scale with amax 2^-e <= 6 (the trunk's ue8m0 rule, lp_common mx_exp), round to
+   nearest even on the e2m1 grid {0, .5, 1, 1.5, 2, 3, 4, 6}; from the fp16 packed values (tests/test_latdec.c ld_wq_ref is the host copy).
+   W2t is the transpose of the quantised W2h. The fp32 master weights and their gradients are untouched (straight through) */
+__device__ __forceinline__ float ld_e2m1(float x) {
+    const float a = fabsf(x);
+    const float q = a <= 0.25f ? 0.f : a < 0.75f ? 0.5f : a <= 1.25f ? 1.f : a < 1.75f ? 1.5f : a <= 2.5f ? 2.f : a < 3.5f ? 3.f : a <= 5.f ? 4.f : 6.f;
+    return copysignf(q, x);
+}
+__global__ void latdec_wq_k(__half *w, size_t nblk_, int bs) {
+    const size_t b = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (b >= nblk_) return;
+    __half *v = w + b * bs; float am = 0.f;
+    for (int i = 0; i < bs; i++) am = fmaxf(am, fabsf(__half2float(v[i])));
+    const unsigned u = __float_as_uint(am * (1.f / 6.f)); int e = (int)((u >> 23) & 0xff) - 127 + ((u & 0x7fffff) != 0); e = max(-24, min(15, e));
+    const float sc = ldexpf(1.f, e), is = ldexpf(1.f, -e);
+    for (int i = 0; i < bs; i++) v[i] = __float2half_rn(ld_e2m1(__half2float(v[i]) * is) * sc);
+}
+__global__ void latdec_wt_k(const __half *W2h, __half *W2t, int Hd, int no) {
+    const size_t j = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (j >= (size_t)no * Hd) return;
+    W2t[(j % Hd) * no + j / Hd] = W2h[j];
+}
+static thread_local int g_ld_wq;   /* mgpu: per-thread (each GPU thread sets it before its calls) */
+extern "C" void nn_latdec_wq(int fp4) { g_ld_wq = fp4; }
 static __half *ld_pack(int Hd, int Cl, int no, const float *p, int *KPo) {   /* per device, grown: the fp16 weight copies of this call */
     static thread_local __half *buf[8]; static thread_local size_t cap[8]; int dv = 0; cudaGetDevice(&dv); dv &= 7;
     const int KP = 27 * (Cl <= 32 ? 32 : 64); const size_t n = (size_t)Hd * KP + 2 * (size_t)no * Hd;
     if (cap[dv] < n) { if (buf[dv]) cudaFree(buf[dv]); CK(cudaMalloc(&buf[dv], n * 2)); cap[dv] = n; }
     latdec_pack_k<<<nblk(n - (size_t)no * Hd, 256), 256>>>(p, Cl, Hd, no, KP, buf[dv], buf[dv] + (size_t)Hd * KP, buf[dv] + (size_t)Hd * KP + (size_t)no * Hd); KCHECK();
+    if (g_ld_wq) {
+        __half *Bt = buf[dv], *W2h = Bt + (size_t)Hd * KP; const int bs = Hd < 32 ? Hd : 32;
+        latdec_wq_k<<<nblk((size_t)Hd * KP / 32, 128), 128>>>(Bt, (size_t)Hd * KP / 32, 32);
+        latdec_wq_k<<<nblk((size_t)no * Hd / bs, 128), 128>>>(W2h, (size_t)no * Hd / bs, bs);
+        latdec_wt_k<<<nblk((size_t)no * Hd, 256), 256>>>(W2h, W2h + (size_t)no * Hd, Hd, no); KCHECK();
+    }
     *KPo = KP; return buf[dv];
 }
 static size_t ld_smem_tc(int Hd, int Cl, int KP, int bwd) { (void)Cl; return (size_t)LD_T2 * (bwd ? LD_OC + 8 : Hd + 8) * 2 + (size_t)2 * (LD_T2 + 2) * (KP / 27 + 8) * 2 + 16; }
@@ -388,7 +417,7 @@ extern "C" void nn_latdec_cells(const void *x16, int D, int H, int W, int q0, in
 #define LD_FWD(KG, TR, TP) do { ld_attr((const void *)latdec_fwd_k<KG, TR, TP>, sm); latdec_fwd_k<KG, TR, TP><<<grid, LD_NT, sm>>>((TR *)rows, ld, (const TP *)pre, ldp, L, nq, h, w, p, p + (size_t)Cl * 27 * Hd, Cl, no); } while (0)
 extern "C" int nn_latdec_fwd(void *rows, int r32, size_t ld, const void *pre, int p32, size_t ldp, const void *Lv, int nq, int h, int w, const float *p, int Hd, int Cl, int ng) {
     const int no = 64 * ng; const __half *L = (const __half *)Lv;
-    if (!ld_ok(Hd, Cl, no)) return 1;
+    if (!ld_ok(Hd, Cl, no) || (g_ld_wq && ld_ffma())) return 1;
     if (!nq) return 0;
     const dim3 grid((unsigned)((w + LD_TC - 1) / LD_TC), (unsigned)h, (unsigned)nq), grid2((unsigned)((w + LD_T2 - 1) / LD_T2), (unsigned)h, (unsigned)nq);
     if (!ld_ffma()) {
@@ -432,6 +461,7 @@ extern "C" int nn_latdec_bwd(const void *gy16, size_t ldg, void *gpre16, const v
 #undef LDB
         return 0;
     }
+    if (g_ld_wq) return 1;   /* (the fp4 weights: tensor-core path only) */
     const size_t sm = ld_smem(Cl, no, 1);
 #define LD_BWD(KG) do { ld_attr((const void *)latdec_bwd_k<KG>, sm); latdec_bwd_k<KG><<<grid, LD_NT, sm>>>((const f16 *)gy16, ldg, (f16 *)gpre16, (const f16 *)pre16, ldp, L, nq, h, w, B, W2, Cl, no, Hs, DP, N); } while (0)
     if (Hd == 16) LD_BWD(4); else if (Hd == 32) LD_BWD(8); else LD_BWD(16);

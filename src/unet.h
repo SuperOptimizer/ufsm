@@ -115,7 +115,8 @@ typedef struct {
     int fstem, fstem_out;  /* C > 0 (<= 16): the fine voxel stem of a latent-grid net (nn_fstem_fwd: 4^3 taps at stride 2 of the CT channel, C silu
                               features, a projection to fstem_out (<= 16) head outputs added on the logits by the trainer's head slabs). Params
                               appended last (W1 He-initialised, b1 and the projection zero: the donor's function), header key "fstem" only when on */
-    int lat_dec, lat_dec_raw, lat_dec_ng;   /* H (16 / 32 / 64) > 0: the learned sub-cell decoder of a lat_guide 64 net (src/nn_latdec.cu): per cell
+    int lat_dec, lat_dec_raw, lat_dec_ng, lat_dec_wq;   /* lat_dec_wq: B and W2 used as MX-fp4 (nn_latdec_wq; header key's 4th value, written when 1) */
+      /* H (16 / 32 / 64) > 0: the learned sub-cell decoder of a lat_guide 64 net (src/nn_latdec.cu): per cell
                               h = silu(A f + a + B * L over the 3^3 neighbour cells), the last 64 lat_dec_ng head rows (the sub-cell rows) += W2 h.
                               L: the latent input's lat_c coefficients (cin - 3) as input_latc_k quantises them, or (lat_dec_raw) the cell's 64 voxels.
                               Params appended last (A [H][widths[0]], a [H], B [Cl][27][H], W2 [64 ng][H]; W2 0: the donor's function); header key

@@ -3,7 +3,7 @@
 # ones (a fitted --lat-basis, --lat-guide 3, --fstem 16) trained 20 steps is the donor; --init-from it at lr 0 with and without --lat-dec 64
 # must log the same losses (W2 starts at 0: the decoder adds nothing, the head's backward on the extra rows changes no weight at lr 0);
 # trained at the normal lr the decoder must move the losses away from the plain head's; --lat-dec-raw 1 (64 voxels a cell) runs; --resume
-# refuses a decoder mismatch. Usage: test_latdec_train.sh UFSM MAKE_WIND_FIXTURE DIR
+# refuses a decoder mismatch; --lat-dec-fp4 1 (below). Usage: test_latdec_train.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
 rm -rf "$D"; mkdir -p "$D"; cd "$D"
@@ -43,4 +43,14 @@ P=(--um 9.6 --level 0 --window 160 --halo 16 --shard 128 --levels 1 --threads 2 
 "$U" predict sc/last.ckpt fx ct pc "${P[@]}" > pc.log 2>&1 || fail "predict random W2 ($D/pc.log)"
 for h in rv ink; do "$U" read pb/$h 9.6 0 0 0 256 256 256 b.raw > /dev/null 2>&1 && "$U" read pc/$h 9.6 0 0 0 256 256 256 c.raw > /dev/null 2>&1 || fail "read $h"
   ! cmp -s b.raw c.raw || fail "predict --heads $h: the decoder's term does not reach it"; done
+# --lat-dec-fp4 1 (MX-fp4 decoder weights): a quantisation-aware fine-tune resumed from the fp16 decoder checkpoint runs with finite losses and
+# writes the header key's 4th value; predict of a random-W2 fp4 decoder reads it back (its rv differs from the fp16 decoder's: the rounding is applied)
+"$U" train fx/sources.json --out e --det 1 "${C[@]}" "${L[@]}" --steps 10 --resume e/last.ckpt --lat-dec 64 --lat-dec-fp4 1 > e4.log 2>&1 || fail "fp4 fine-tune ($D/e4.log)"
+grep -q 'B and W2 as MX-fp4' e4.log || fail "no fp4 line ($D/e4.log)"
+grep -E '^step +10' e4.log | grep -qiE 'nan|inf' && fail "non-finite losses with fp4 weights ($D/e4.log)"
+head -c 131072 e/last.ckpt | grep -aqE '"lat_dec":\[64,0,[0-9]+,1\]' || fail "the fp4 checkpoint's header lacks lat_dec's 4th value"
+UFSM_LATDEC_TEST_W2=2 "$U" train fx/sources-ink.json --out s4 --lr 0 --muon-lr 0 "${S[@]}" --steps 1 --init-from sd/last.ckpt --lat-dec 32 --lat-dec-raw 1 --lat-dec-fp4 1 > s4.log 2>&1 || fail "random W2 fp4 ($D/s4.log)"
+"$U" predict s4/last.ckpt fx ct p4 "${P[@]}" > p4.log 2>&1 || fail "predict fp4 ($D/p4.log)"
+"$U" read p4/rv 9.6 0 0 0 256 256 256 d.raw > /dev/null 2>&1 && "$U" read pc/rv 9.6 0 0 0 256 256 256 c.raw > /dev/null 2>&1 || fail "read fp4 rv"
+! cmp -s c.raw d.raw || fail "predict: the fp4 decoder gave the fp16 decoder's rv (the header's fp4 flag not applied?)"
 echo "test_latdec_train: ok"
