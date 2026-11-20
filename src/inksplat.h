@@ -65,6 +65,11 @@ void inksplat_defaults(inksplat_cfg *c);
 int inksplat_run(const inksplat_cfg *c);
 int cmd_ink_splat(int argc, char **argv);
 int cmd_ink_vscore(int argc, char **argv);
+void *inksplat_label_open(const char *path, int64_t *H, int64_t *W);   /* a label raster (as --labels) for strided reads; nullptr on error */
+void inksplat_label_close(void *h);
+/* rows i * step (i in [i0, i1)), cols j * step (j in [j0, j1)) -> out (i1 - i0) x (j1 - j0) (outside the raster 0); *vmax their max. 0 ok */
+int inksplat_label_strided(void *h, int step, int64_t i0, int64_t i1, int64_t j0, int64_t j1, uint8_t *out, int *vmax, int nth);
+int cmd_ink_wrapscore(int argc, char **argv);
 uint8_t *inksplat_label_window(const char *path, int64_t r0, int64_t c0, int64_t h, int64_t w, int64_t *H, int64_t *W);   /* a 2-D label window (0 outside) */
 
 /* On the fly (2026-11-11): the --face splat of a list of label windows as a derived z3 array (zarr3.h z3_open_derived) on the grid of

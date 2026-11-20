@@ -197,6 +197,27 @@ static int lsrc_read(lsrc *L, int64_t r0, int64_t c0, int64_t h, int64_t w, uint
     return rc;
 }
 
+/* public: an open label raster, read strided (ink-wrapscore: rows i step, cols j step, read in blocks of rows so a 16k^2 window never
+   sits in memory whole) */
+void *inksplat_label_open(const char *path, int64_t *H, int64_t *W) {
+    lsrc *L = malloc(sizeof *L); if (!L) return nullptr;
+    if (lsrc_open(L, path, -1, nullptr)) { free(L); return nullptr; }
+    *H = L->H; *W = L->W; return L;
+}
+void inksplat_label_close(void *h) { if (h) { lsrc_close(h); free(h); } }
+int inksplat_label_strided(void *h, int step, int64_t i0, int64_t i1, int64_t j0, int64_t j1, uint8_t *out, int *vmax, int nth) {
+    lsrc *L = h; const int64_t ni = i1 - i0, nj = j1 - j0; int mx = 0; if (ni <= 0 || nj <= 0) { *vmax = 0; return 0; }
+    const int64_t bw = (nj - 1) * step + 1; int64_t B = (int64_t)(256ll << 20) / (bw * step); if (B < 1) B = 1;
+    uint8_t *buf = malloc((size_t)((B - 1) * step + 1) * bw); if (!buf) return -1;
+    for (int64_t a = 0; a < ni; a += B) {
+        const int64_t nb = a + B <= ni ? B : ni - a, bh = (nb - 1) * step + 1;
+        if (lsrc_read(L, (i0 + a) * step, j0 * step, bh, bw, buf, nth)) { free(buf); return -1; }
+        for (int64_t r = 0; r < nb; r++) { const uint8_t *s = buf + (size_t)(r * step) * bw; uint8_t *o = out + (size_t)(a + r) * nj;
+            for (int64_t j = 0; j < nj; j++) { const uint8_t v = s[j * step]; o[j] = v; if (v > mx) mx = v; } }
+    }
+    free(buf); *vmax = mx; return 0;
+}
+
 /* public: a 2-D label raster window (path as ink-splat's labels: zarr v3 2-D level, zarr v2 3-D (middle layer), uint8 TIFF / PNG);
    *H, *W the raster size; outside the raster 0. malloc'd h x w, nullptr on error. */
 uint8_t *inksplat_label_window(const char *path, int64_t r0, int64_t c0, int64_t h, int64_t w, int64_t *H, int64_t *W) {
