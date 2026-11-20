@@ -340,7 +340,7 @@ static void *pool_dev(size_t n) { void *p = pool_take(n, 0); if (p) { if (g_nreg
 extern "C" void *nn_malloc(size_t n) {
     { void *q = pool_dev(n); if (q) return q; }
     /* UFSM_TEST_MALLOC_FAIL_MB=M (tests): a buffer of >= M MB fails as an out-of-memory cudaMalloc would (the stop path, no real OOM) */
-    static long fail_mb = -2; if (fail_mb == -2) fail_mb = getenv("UFSM_TEST_MALLOC_FAIL_MB") ? atol(getenv("UFSM_TEST_MALLOC_FAIL_MB")) : -1;
+    static long fail_mb = -2; /* mgpu: env */ if (fail_mb == -2) fail_mb = getenv("UFSM_TEST_MALLOC_FAIL_MB") ? atol(getenv("UFSM_TEST_MALLOC_FAIL_MB")) : -1;
     void *p = nullptr; cudaError_t e = fail_mb >= 0 && n >= (size_t)fail_mb << 20 ? cudaErrorMemoryAllocation : cudaMalloc(&p, n);
     if (e != cudaSuccess && g_pool_on && !(fail_mb >= 0 && n >= (size_t)fail_mb << 20)) { cudaGetLastError(); pool_trim(1); e = cudaMalloc(&p, n); }   /* (the idle pool first) */
     if (e == cudaSuccess) pool_add(p, n, 0);

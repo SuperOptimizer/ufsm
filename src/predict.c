@@ -3575,8 +3575,10 @@ static int predict_one(int argc, char **argv) {
     if (pyramid_write_group(out, um_l, gpyr ? PH[0].pya->nlev : nlev, "ufsm-recto", attrs)) return 1;
     }
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs end-to-end, the windows %.0fs)\n", out, ntiles, now() - t0, t_win);
-    if (skip_empty) fprintf(stderr, "predict: --skip-empty: %ld windows masked (thr %d, margin %d), %ld of %ld conv launches masked%s%.3f\n", skip_wins, skip_thr, skip_margin, skip_masked, skip_calls,
-                            ufsm_env_on("UFSM_SKIP_REPORT") ? ", mean level-0 active tile share " : "", ufsm_env_on("UFSM_SKIP_REPORT") && skip_wins ? skip_share0 / skip_wins : -1.);
+    /* (the share only with UFSM_SKIP_REPORT: without it the line read "... masked-1.000", taken for "every conv skipped" (latcodec 11-20); a
+       masked launch runs the active tiles of its mask, not none) */
+    if (skip_empty) { fprintf(stderr, "predict: --skip-empty: %ld windows with tile masks (thr %d, margin %d), %ld of %ld conv launches ran on the masks' active tiles", skip_wins, skip_thr, skip_margin, skip_masked, skip_calls);
+                      if (ufsm_env_on("UFSM_SKIP_REPORT")) fprintf(stderr, ", mean level-0 active tile share %.3f", skip_wins ? skip_share0 / skip_wins : 0.); fprintf(stderr, "\n"); }
     if (skip_empty && ufsm_env_on("UFSM_SKIP_REPORT")) fprintf(stderr, "predict: --skip-empty: %ld windows with no active level-0 tile (run at their bias throughout)\n", skip_zero);
     if (lvm) { double ds = 0; long dn = 0; nn_latvol_stats(lvL, &ds, &dn);
         fprintf(stderr, "predict: latvol CT: %.3f GB of chunk streams uploaded and decoded on the device (%.4f B per box voxel); the decode kernels %.3f s in %ld windows (%.1f Gvox/s of window voxels); %ld windows as host-decoded voxels\n",
