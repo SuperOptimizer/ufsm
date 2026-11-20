@@ -208,8 +208,8 @@ Format and read path:
   cell (128 / 256), sharded 4^3 cells per shard file (NAS file counts: P4 phase would be ~150k cell files otherwise), inner codec zstd
   (the dcache's own cell coding; byte-exact; volcomp lossless as the alternative where it wins: phase is smooth mod 252, measured on
   1667 before choosing). labcomp only for codes (55 Mvox/s read: archive format).
-- dcache gets a read-only tier: on a cell miss (memory, local disk) it reads the cell from $UFSM_DENSELAB/<hex> (default ~/nas/denselab;
-  "off" disables) before computing, and writes it to the local disk cache as today. The NAS is never read hot: rclone FUSE does
+- dcache gets a read-only tier: on a cell miss (memory, local disk) it reads the cell from $UFSM_DENSELAB/<hex> (opt-in: unset = off,
+  as before; the default flips to ~/nas/denselab once 1667 is complete and a batch-hash A/B on real 1667 windows passes) before computing, and writes it to the local disk cache as today. The NAS is never read hot: rclone FUSE does
   147 MB/s sequential (measured, one 223 MB file) but per-file latency is high, so the local dcache stays the hot tier and the NAS
   replaces the compute. Nothing changes in the sources json: same specs, same keys, same bytes; a store missing a cell falls back to
   the compute (logged once per key).

@@ -39,7 +39,7 @@ int dcache_evict_pass(const char *root);
 int dcache_set_phase(z3 *z, int delta);
 /* the dense label store (denselab, DESIGN 2026-11-19): ROOT/<hex>/{inputs.txt, a/ (zarr), shards.bin}; a cached array whose key has a
    store there reads missed cells of rendered shards from it (then the local disk cache) instead of computing them. Root: $UFSM_DENSELAB
-   ("off" / "0" none), else $HOME/nas/denselab when that directory exists. Read once per process. */
+   (opt-in: unset, "off" or "0" = none; the stores live in ~/nas/denselab). Read once per process. */
 const char *dcache_dense_root(void);
 /* DIR/shards.bin: shard edge, shard grid, one byte per shard (1 rendered); 0 ok (*bits malloc'd) */
 int dcache_dense_shards(const char *dir, int64_t *S, int64_t grid[3], uint8_t **bits);

@@ -193,7 +193,7 @@ int cmd_denselab_render(int argc, char **argv) {
         fprintf(stderr, "usage: ufsm denselab-render SOURCES.json --out ROOT [--source N1,N2] [--kind phase,ink,fibre] [--levels a,b] [--shard 512] [--margin 128]\n"
                         "                             [--threads 16] [--gpu D --gpu-slots 2 --gpu-mb 1024] [--dry 1] [--limit N] [--zstd-probe 1|2] [--verify N --P 96 --seed 1]\n"
                         "  renders every derived (cached) label array of the sources into ROOT/<key hash>/ (zarr + shards.bin); the derived cache\n"
-                        "  then reads them ($UFSM_DENSELAB, default ~/nas/denselab). --verify N: N boxes per array, the store vs a fresh compute.\n");
+                        "  then reads them (with UFSM_DENSELAB=ROOT; unset = off). --verify N: N boxes per array, the store vs a fresh compute.\n");
         return 2;
     }
     const char *out = opt(argc, argv, "--out", nullptr); if (!out) { fprintf(stderr, "denselab-render: --out ROOT\n"); return 2; }

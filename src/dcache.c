@@ -56,9 +56,8 @@ const char *dcache_default_dir(void) {
 static char g_dl_root[1024]; static int g_dl_state;   /* mgpu: guarded (pthread_once) */
 static void dl_once(void) {
     const char *e = getenv("UFSM_DENSELAB");
-    if (e) { if (*e && strcmp(e, "off") && strcmp(e, "0")) snprintf(g_dl_root, sizeof g_dl_root, "%s", e); }
-    else { const char *h = getenv("HOME"); struct stat st; char p[1024]; snprintf(p, sizeof p, "%s/nas/denselab", h ? h : "");
-           if (h && *h && !stat(p, &st) && S_ISDIR(st.st_mode)) snprintf(g_dl_root, sizeof g_dl_root, "%s", p); }
+    /* opt-in (lead 11-19): unset = off until 1667 is complete and a batch-hash A/B on real windows passes */
+    if (e && *e && strcmp(e, "off") && strcmp(e, "0")) snprintf(g_dl_root, sizeof g_dl_root, "%s", e);
     g_dl_state = 1;
 }
 const char *dcache_dense_root(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, dl_once); return g_dl_root[0] ? g_dl_root : nullptr; }
