@@ -556,7 +556,7 @@ __global__ void ad_ctl_k(const muon_desc_t *d, int n, const double *po, const do
 /* Direction probe (2026-11-19, admuon2; DESIGN "Fully adaptive Muon, part 2"): every S-th element of each matrix's final direction
    s_i O_i (NorMuon's rows included, before the lr / adaptive multipliers) into buf[off[base + c] + j], j = i / S. An unbiased subsample
    of the pooled inner products <v_t, v_t-k> (the momentum's autocorrelation) at 1 / S of the cost. nn_muon_probe(nullptr, ..): off. */
-static float *g_pr_buf; static const long long *g_pr_off; static int g_pr_stride, g_pr_base; static long long g_pr_tot;
+static float *g_pr_buf; static const long long *g_pr_off; static int g_pr_stride, g_pr_base; static long long g_pr_tot;   /* mgpu: main (the optimizer step runs on the main thread; muon_ext sets them right before each rank's nn_muon_ext_batch and clears them after) */
 extern "C" void nn_muon_probe(float *buf, const long long *off, int stride, int base, long long tot) { g_pr_buf = buf; g_pr_off = off; g_pr_stride = stride; g_pr_base = base; g_pr_tot = tot; }
 __global__ void probe_k(const muon_desc_t *d, int swap, float *buf, const long long *off, int S, long long tot) {   /* (the weights before the step at buf + tot) */
     const muon_desc_t D = d[blockIdx.y]; const float *O = swap ? D.Y : D.X; const size_t n = (size_t)D.Co * D.K, m = (n + S - 1) / (size_t)S;
