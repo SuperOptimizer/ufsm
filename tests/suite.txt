@@ -215,6 +215,7 @@ test_sumsq                                     | gpu          |     4 | ./$B/tes
 test_dcache_batch                              |              |     2 | ./$B/test_dcache_batch
 test_dcache_cap                                |              |     2 | ./$B/test_dcache_cap $TMPDIR/dcache_cap
 test_dcache_phase                              |              |     5 | ./$B/test_dcache_phase $TMPDIR/dcache_phase
+test_denselab                                  |              |    10 | tests/test_denselab.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/denselab
 test_label_versions                            |              |     3 | ./$B/test_label_versions $TMPDIR/label_versions
 test_ink_air                                   | gpu          |     2 | ./$B/test_ink_air
 test_ink_mil_train                             | gpu          |    40 | ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture

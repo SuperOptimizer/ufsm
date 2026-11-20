@@ -1,6 +1,7 @@
 /* ufsm CLI. */
 #include "afv.h"
 #include "mergeflag.h"
+int cmd_denselab_render(int argc, char **argv);   /* src/denselab.c */
 #include "optcheck.h"
 #include "sysinfo.h"
 #include "sample.h"
@@ -271,6 +272,7 @@ static int usage(void) {
         "  ufsm geom-check <wraps-dir> --axis F --axis-um U [--out DIR]   wraps geometry QA: spacing, steep walls, jumps, merged / skipped neighbours, holes; guard limits\n"
         "  ufsm refine <wraps-in> <wraps-out> --fields DIR [--range 0.33] [--smooth-um 40]   vertices onto the fields' sheet phase\n"
         "  ufsm surf-stats <wraps-dir> --fields DIR [--ct ROOT KEY --ct-um U]   label-free surface quality (phase, switches, CT)\n"
+        "  ufsm denselab-render SOURCES.json --out ROOT [--source N] [--kind phase,ink,fibre]   every derived label array rendered once into the dense label store (zarr per key; the cache reads it)\n"
         "  ufsm merge-flag <fields-dir> [--out DIR] [--thr 179]               the merged-sheet score per field cell (plane mf: phase vs density count, confidence)\n"
         "  ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR] [--out DIR]       per-wrap uncertain share from mf, <wrap>_mf.tif masks on the vertex grid\n"
         "  ufsm self-gate <wraps-dir> <out-dir> --fields DIR --model FIT [--ct ..] [--nb FIT].. [--exclude ..]   strict stretches of a box fit -> label tifxyz + q.tif\n"
@@ -5074,6 +5076,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "refine")) return cmd_refine(argc, argv);
     if (!strcmp(cmd, "surf-stats")) return cmd_surf_stats(argc, argv);
     if (!strcmp(cmd, "merge-flag")) return cmd_merge_flag(argc, argv);
+    if (!strcmp(cmd, "denselab-render")) return cmd_denselab_render(argc, argv);
     if (!strcmp(cmd, "wrap-mf")) return cmd_wrap_mf(argc, argv);
     if (!strcmp(cmd, "wrap-snap")) return cmd_wrap_snap(argc, argv);
     if (!strcmp(cmd, "surf-labels") || !strcmp(cmd, "wrap-anchor")) return cmd_surf_labels(argc, argv);
