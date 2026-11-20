@@ -136,8 +136,10 @@ static void discover(const var_t *V) {
     }
 }
 
+int lp_sw_build(void);   /* (src/lp_mxsw.cu) */
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
+    if (lp_sw_build()) { printf("SKIP: test_sp24_mma: software MX build (ARCH < 120), no sparse block-scaled MMA\n"); return 0; }
     int bad = 0;
     const int disc = getenv("UFSM_SP24_DISCOVER") ? atoi(getenv("UFSM_SP24_DISCOVER")) : 0;
     int found[5][2] = {{0}};

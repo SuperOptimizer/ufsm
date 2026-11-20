@@ -315,8 +315,12 @@ static void bench(void) {
         }
     }
 }
+int lp_sw_build(void);   /* (src/lp_mxsw.cu) */
 int main(void) {
     if (xnet_init(0)) { printf("SKIP: no GPU\n"); return 0; }
+    /* conv_mx is the block-scaled tensor-core path only (no software emulation; UFSM_XNET_MX is opt-in, sm_120a): the arch86 suite on the
+       laptop 4060 failed it with ptxas "mma with block scale not supported on sm_86" (2026-11-20) */
+    if (lp_sw_build()) { printf("SKIP: test_xmx: software MX build (ARCH < 120): xnet's MX conv needs block-scaled MMA\n"); return 0; }
     if (getenv("XMX_BENCH")) { bench(); return 0; }
     if (getenv("XMX_IGBENCH") || getenv("XMX_IGTEST")) {   /* the Reader's 2-D 3x3 convs (N 8, d 1): UFSM_XNET_CFG 5..8 forced tiles vs the wave pick (0); byte-equal */
         static const int L[][3] = {{48, 256, 256}, {24, 320, 320}, {12, 320, 320}, {96, 128, 128}, {24, 640, 320}, {12, 320, 1280}, {20, 96, 160}};
