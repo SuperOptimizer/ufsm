@@ -6,6 +6,19 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## predict --channels: several logit channels of a voxel net from one forward (2026-11-20, branch mchan-20261120, fullvram)
+
+latcodec's fibre eval ran predict 8 times on the laptop (`--channel 0..7`: H, V, dyad c2..c7), ~24 s each, 23 s of it the windows:
+the same trunk forward 8 times. `--channels A,B,..` computes the head over [min, max] (unet_set_head_channels; fp16 logits, 2 B per
+window voxel per channel) and places every channel per window: A into OUT as `--channel A` does, each other into its own store
+(`--channel-outs DIR,..`, default OUT.cN) with its own writer (ring of 2 pinned shard buffers) and device shard. Extra attrs = the
+main ones with the run record's "channel" swapped, so zarr.json too equals a `--channel N` run's.
+- tests/test_predict_channels.sh: channels 2,0,3 of an unwrap2 net, windows 160 (one per shard), 288 (2^3 shards, the super-shard
+  path) and 96 (several windows per shard): all 12 files of each store identical to the single-channel runs; refusals checked.
+- Only the plain path: refused (exit 2) with --heads, latent / low-res nets, --channel rv, --fit-*, sheet tasks, --feather, --tta,
+  --split, --gpus, --resume, --no-out, --seamless 2. Memory: +2 B / window voxel per extra channel (544^3: +0.32 GB each) plus one
+  device shard per extra (512^3: 134 MB): on an 8 GB card a smaller --window may be needed for 8 channels.
+
 ## Fibre scoring: fiber-trace on all its threads, fibtrace_eval.sh fails loudly (2026-11-20, branch fibscore-20261120, fullvram)
 
 One Paris 4 HOLD fibre score (latcodec: f3m snapshots) was ~3.5 min of laptop predict (8 --channel runs, ~23 s of windows each) +

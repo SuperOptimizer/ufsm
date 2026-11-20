@@ -48,6 +48,7 @@ test_predict_heads~part1of3                   | gpu          |    25 | UFSM_TEST
 test_predict_heads~part2of3                   | gpu          |    25 | UFSM_TEST_PART=2/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
 test_predict_gpus2                            | gpu2         |    30 | tests/test_predict_gpus2.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predgpus2
 test_predict_boxes                             | gpu          |    40 | tests/test_predict_boxes.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predboxes
+test_predict_channels                          | gpu          |    30 | tests/test_predict_channels.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predchan
 test_tta_lat                                   | gpu          |    60 | tests/test_tta_lat.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/ttalat
 test_fstem                                     | gpu,smoke    |     3 | ./$B/test_fstem
 test_latdec                                    | gpu          |     5 | ./$B/test_latdec

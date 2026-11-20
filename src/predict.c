@@ -1459,6 +1459,8 @@ static int predict_one(int argc, char **argv) {
                         "                       windows' halo predictions; window - 2 halo = k * shard on the shard grid; --gpus deal contiguous z layers\n"
                         "       [--channel 0]   output channel written (band_affinity checkpoints: 1..6 = affinities z1 y1 x1 z8 y8 x8; ink: a task unwrap2 --ink-head\n"
                         "                       checkpoint's ink channel; with --fit-zarr / --fit-fields the volume of that channel beside the fields, one pass)\n"
+                        "       [--channels A,B,..] [--channel-outs DIR,..]   voxel nets: several channels from one forward per window; A into OUT, the others into\n"
+                        "                       the --channel-outs dirs (default OUT.cN); each store byte-identical to a --channel N run\n"
                         "       [--um-target U]   instead of --level: the level nearest U um (e.g. 9.6: the universal net's operating rung on any scan)\n"
                         "       [--heads LIST]   latent-grid (train --lat 4) checkpoints: every listed head from one trunk pass, each its own store <out>/<name>:\n"
                         "                        rv (recto / verso fused), ink, fib (fib/H, fib/V, fib/dyad/c2..c7, fib/fam), cN (channel N), all; with --fit-zarr too\n"
@@ -1556,6 +1558,32 @@ static int predict_one(int argc, char **argv) {
     const double radial_sign = opt_atof("--radial-sign", opt(argc, argv, "--radial-sign", "1"));   /* -1: reversed direction input (a recto model then marks the verso face) */
     if (radial_sign != 1 && radial_sign != -1) { fprintf(stderr, "predict: --radial-sign must be 1 or -1\n"); return 2; }
     const char *chs = opt(argc, argv, "--channel", "0");   /* output channel to write (band_affinity: 1..6 = affinities; "ink": a task unwrap2 --ink-head checkpoint's ink channel) */
+    /* --channels A,B,C (voxel nets, 2026-11-20): one trunk forward per window for several logit channels. The first is the main output
+       (as --channel A); each other is its own store, --channel-outs DIR,DIR (default <out>.c<N>), byte-identical to a --channel N run.
+       The head computes channels [min, max] (2 B per window voxel each in fp16) and every extra channel holds a device shard. */
+    enum { MCH_MAX = 16 }; int mch_n = 0, mch_c[MCH_MAX], mch_lo = 0; static char mch_first[16]; char mch_out[MCH_MAX][1400];
+    {   const char *ml = opt(argc, argv, "--channels", nullptr), *mo = opt(argc, argv, "--channel-outs", nullptr), *o0 = out;
+        if (ml) {
+            if (opt(argc, argv, "--channel", nullptr)) { fprintf(stderr, "predict: --channels and --channel together\n"); return 2; }
+            for (const char *p = ml; *p;) {
+                char *e; const long c = strtol(p, &e, 10);
+                if (e == p || c < 0 || c > 255 || (*e && *e != ',') || mch_n == MCH_MAX) { fprintf(stderr, "predict: --channels %s: up to %d channel numbers, comma-separated\n", ml, MCH_MAX); return 2; }
+                for (int k = 0; k < mch_n; k++) if (mch_c[k] == c) { fprintf(stderr, "predict: --channels %s: channel %ld twice\n", ml, c); return 2; }
+                mch_c[mch_n++] = (int)c; p = *e ? e + 1 : e;
+            }
+            mch_lo = mch_c[0]; for (int k = 1; k < mch_n; k++) if (mch_c[k] < mch_lo) mch_lo = mch_c[k];
+            snprintf(mch_first, sizeof mch_first, "%d", mch_c[0]); chs = mch_first;
+            const char *p = mo;
+            for (int k = 1; k < mch_n; k++) {
+                if (mo) {
+                    const char *e = p ? strchr(p, ',') : nullptr; const size_t n = !p ? 0 : e ? (size_t)(e - p) : strlen(p);
+                    if (!n || n >= sizeof mch_out[k]) { fprintf(stderr, "predict: --channel-outs %s: one directory per extra channel (%d)\n", mo, mch_n - 1); return 2; }
+                    memcpy(mch_out[k], p, n); mch_out[k][n] = 0; p = e ? e + 1 : nullptr;
+                } else snprintf(mch_out[k], sizeof mch_out[k], "%s.c%d", o0, mch_c[k]);
+            }
+            if (mo && p) { fprintf(stderr, "predict: --channel-outs %s: more directories than extra channels (%d)\n", mo, mch_n - 1); return 2; }
+        } else if (mo) { fprintf(stderr, "predict: --channel-outs without --channels\n"); return 2; }
+    }
     /* --channel rv (train --task unwrap2 --rv checkpoints): both side channels in one pass, written as 1 + 254 (1 + p_recto - p_verso) / 2, 0 where CT 0 */
     const int rvfuse = !strcmp(chs, "rv");
     /* --latents STORE (ufsm lc-encode): a --lat-basis checkpoint's cell channels come from the stored quantised coefficients (the window's
@@ -1775,6 +1803,14 @@ static int predict_one(int argc, char **argv) {
         fprintf(stderr, "predict: %s has a %s; its outputs need the latent device path (no --feather, --tta, --split, --window-z, --gpus workers, "
                         "UFSM_PRED_HOSTPATH); --fstem-off 1 runs without it\n", ckpt, cfg.fstem ? "fine stem" : "guided sub-cell head"); return 2; }
     const int lhm = nph > 0;   /* every output from the cell logits per shard (no full-resolution logits) */
+    if (mch_n > 1) {   /* --channels: the plain voxel-net path (full-resolution logits placed per shard) */
+        const char *why = lhm ? "--heads" : half ? "a low-resolution / latent net" : rvfuse ? "--channel rv" : ffd || ffz ? "--fit-*" : sheet_task ? "a sheet task" : fea ? "--feather"
+                        : tta > 1 ? "--tta" : split ? "--split" : nwork > 1 ? "--gpus" : sweep_out ? "--cond-sweep" : ufsm_env_on("UFSM_PRED_HOSTPATH") ? "UFSM_PRED_HOSTPATH"
+                        : opt_atoi("--resume", opt(argc, argv, "--resume", "0")) ? "--resume" : opt_atoi("--no-out", opt(argc, argv, "--no-out", "0")) ? "--no-out"
+                        : opt_atoi("--seam-inproc", opt(argc, argv, "--seam-inproc", "0")) ? "--seamless 2" : nullptr;
+        if (why) { fprintf(stderr, "predict: --channels: not with %s (one --channel per run there)\n", why); return 2; }
+        for (int k = 0; k < mch_n; k++) if (mch_c[k] >= cfg.cout) { fprintf(stderr, "predict: --channels: channel %d outside the net's %d outputs\n", mch_c[k], cfg.cout); return 2; }
+    }
     int ph_c0[PHEAD_MAX], ph_c1[PHEAD_MAX], ph_sb0[PHEAD_MAX], ph_sb1[PHEAD_MAX], ph_s0[PHEAD_MAX], ph_s1[PHEAD_MAX], phd = 0;   /* (nn_lat_heads_place; phd: the shard buffer in use) */
     for (int k = 0; k < nph; k++) { ph_c0[k] = PH[k].c0; ph_c1[k] = PH[k].c1; ph_sb0[k] = PH[k].sb0; ph_sb1[k] = PH[k].sb1; ph_s0[k] = PH[k].s0; ph_s1[k] = PH[k].s1; }
     if (lhm) { fprintf(stderr, "predict: %d head%s from one trunk pass:", nph, nph > 1 ? "s" : ""); for (int k = 0; k < nph; k++) { char c1[16] = ""; if (PH[k].c1 >= 0) snprintf(c1, sizeof c1, "+%d", PH[k].c1);
@@ -1918,6 +1954,7 @@ static int predict_one(int argc, char **argv) {
         if (gnh) unet_gn_freeze(uk, gnh);
         if (ffd || sweep_out || lhm) unet_set_head_channels(uk, 0, cfg.cout);   /* (--heads: every channel on the cell grid) */   /* every head: the recto channel 0 is written, the others pooled (or swept) */
         else if (rvfuse) unet_set_head_channels(uk, rv2c >= 0 && !cfg.lat_guide ? rv2c : 0, cfg.lat_guide ? cfg.cout : 2);   /* --channel rv: both side logits, fused into channel 0 after the forward */
+        else if (mch_n > 1) { int hi = mch_lo; for (int j = 0; j < mch_n; j++) if (mch_c[j] > hi) hi = mch_c[j]; unet_set_head_channels(uk, mch_lo, hi - mch_lo + 1); }   /* --channels: [min, max] */
         else if (!sheet_task) unet_set_head_channels(uk, hmode == 2 ? 8 * out_ch : out_ch, hmode == 2 ? 8 : 1);   /* only the written logit channel (desk widths: -24 B per window voxel) */
         /* fp16 logits (MX activations): the readers below take them as they are (nn_set_logits_h16 after each forward); the 11 heads
            of --fit-zarr were 44 B per window voxel in fp32, which pushed 640^3 windows past the 16 GB card (paged: 40x slower).
@@ -2204,7 +2241,27 @@ static int predict_one(int argc, char **argv) {
         for (int i = 0; i < WR.nw; i++) pthread_create(&WR.wth[i], nullptr, writer_main, &WR);
     }
     int sb = 0; uint8_t *sbuf = WR.buf[0];
-    /* the heads' pyramids on the GPU (pyacc_t) unless --resume (shards from an earlier run are not in memory) or UFSM_PRED_GPU_PYR=0 */
+    /* --channels: the extra channels' stores, each with its writer (a ring of 2 pinned buffers, the main writer's threads) and device shard;
+       attrs as a --channel N run writes them (the run record's "channel") */
+    struct mch_s { z3w *w; writer_t WR; uint8_t *dsh; int sb; char attrs[8192]; } *MC = mch_n > 1 ? calloc(mch_n, sizeof *MC) : nullptr;
+    for (int k = 1; k < mch_n; k++) {
+        struct mch_s *m = &MC[k]; char key0[48], key1[48], d[1500];
+        snprintf(key0, sizeof key0, "\"channel\":\"%s\"", chs); snprintf(key1, sizeof key1, "\"channel\":\"%d\"", mch_c[k]);
+        const char *f = strstr(attrs, key0);
+        if (!f) { fprintf(stderr, "predict: --channels: no run record in the attributes\n"); return 1; }
+        snprintf(m->attrs, sizeof m->attrs, "%.*s%s%s", (int)(f - attrs), attrs, key1, f + strlen(key0));
+        snprintf(d, sizeof d, "%s/%s", mch_out[k], lv);
+        if (!(m->w = z3w_create(d, ash, shard, q, 0, m->attrs))) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+        writer_t *X = &m->WR; X->w = m->w; X->nthreads = nthreads; X->bytes = WR.bytes; X->donefd = -1; X->nb = 2; X->gpu = gpu; X->async = WR.async;
+        for (int d2 = 0; d2 < 3; d2++) X->off[d2] = WR.off[d2];
+        X->buf[0] = nn_host_alloc(X->bytes); X->buf[1] = nn_host_alloc(X->bytes); m->dsh = nn_malloc_try(X->bytes);
+        if (!X->buf[0] || !X->buf[1] || !m->dsh) { fprintf(stderr, "predict: --channels: out of memory for channel %d's shard buffers (%.2f GB device, %.2f GB pinned; a smaller --shard)\n",
+                                                           mch_c[k], X->bytes / 1e9, 2 * X->bytes / 1e9); return 1; }
+        pthread_mutex_init(&X->mu, nullptr); pthread_cond_init(&X->cv, nullptr);
+        if (X->async) for (int j = 0; j < 2; j++) { X->evs[j] = nn_event_create(); X->evd[j] = nn_event_create(); }
+        X->nw = WR.nw; X->wt = WR.wt;
+        for (int i = 0; i < X->nw; i++) pthread_create(&X->wth[i], nullptr, writer_main, X);
+    }    /* the heads' pyramids on the GPU (pyacc_t) unless --resume (shards from an earlier run are not in memory) or UFSM_PRED_GPU_PYR=0 */
     /* the heads' chunks encoded from levels the GPU computes (vcgpu.h: volcomp_encode's streams; the CPU tokenises and entropy-codes),
        lossy q only (UFSM_PRED_GPU_ENC=0: the CPU encodes from the bytes) */
     const int genc = lhm && gpath && q > 0 && !(shard % 128) && (!getenv("UFSM_PRED_GPU_ENC") || ufsm_env_on("UFSM_PRED_GPU_ENC"));
@@ -2934,6 +2991,7 @@ static int predict_one(int argc, char **argv) {
                 pt = now();
                 if (any && lhm) { for (int j = 0; j < nph; j++) if (phead_submit(&PH[j], phd, sz, sy, sx, sz)) return 1; phd ^= 1; }
                 if (any) { if (gpath && !WR.skip) writer_d2h(&WR, sb, dsh); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } sb = writer_next(&WR, sb); sbuf = WR.buf[sb]; }
+                if (any) for (int c = 1; c < mch_n; c++) { writer_d2h(&MC[c].WR, MC[c].sb, MC[c].dsh); if (writer_submit(&MC[c].WR, MC[c].sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } MC[c].sb = writer_next(&MC[c].WR, MC[c].sb); }
                 else if (WR.donefd >= 0) dprintf(WR.donefd, "%lld %lld %lld\n", (long long)(sz + soff[0]), (long long)(sy + soff[1]), (long long)(sx + soff[2]));   /* all air: done */
                 p_wr += now() - pt;
                 fprintf(stderr, "\rshard %lld/%lld  %ld tiles (%ld air)  %.0fs   ", (long long)(cur_shard + 1), (long long)(ns[0] * ns[1] * ns[2]), ntiles, nskip, now() - t0);
@@ -2943,6 +3001,7 @@ static int predict_one(int argc, char **argv) {
             so[0] = sz * shard; so[1] = sy * shard; so[2] = sx * shard;
             for (int d = 0; d < 3; d++) se[d] = so[d] + shard < bn[d] ? so[d] + shard : bn[d];
             if (gpath) { if (!WR.skip) nn_zero(dsh, WR.bytes); for (int j = 0; j < nph; j++) phead_fresh(&PH[j], phd); } else memset(sbuf, 0, (size_t)shard * shard * shard);
+            for (int c = 1; c < mch_n; c++) nn_zero(MC[c].dsh, WR.bytes);
             any = 0;
             if (sheet_task) for (size_t j=0;j<(size_t)shard*shard*shard;j++) sheet_shard[j]=NAN;
         }
@@ -3334,7 +3393,9 @@ static int predict_one(int argc, char **argv) {
                     }
                 }
             }
-            if (ffd && out_ch && lg) lg = (const float *)((const char *)lg + (size_t)out_ch * w3 * (unet_logits_h16(u) ? 2 : 4));   /* every head computed: channel out_ch of the [c][window] logits for the probability volume (e.g. --channel ink beside --fit-zarr) */
+            const char *mch_lg = (const char *)lg; const size_t mch_cs = w3 * (unet_logits_h16(u) ? 2 : 4);   /* --channels: channel c at mch_lg + (c - lo) mch_cs */
+            if (mch_n > 1 && lg) lg = (const float *)(mch_lg + (size_t)(out_ch - mch_lo) * mch_cs);
+            if (ffd && out_ch && lg) lg =(const float *)((const char *)lg + (size_t)out_ch * w3 * (unet_logits_h16(u) ? 2 : 4));   /* every head computed: channel out_ch of the [c][window] logits for the probability volume (e.g. --channel ink beside --fit-zarr) */
             if (sheet_task) lg += (size_t)out_ch * w3;   /* channel c of the [c][W^3] logits (B = 1); otherwise the only one */
             if (!ffd && tta > 1) {   /* --tta on the probability: the mean of the K passes' probabilities, as logit(mean) in the last pass's buffer */
                 if (!g_ps.tacc && !(g_ps.tacc = nn_malloc_try(w3 * 2))) { fprintf(stderr, "predict: --tta: no device memory for the accumulator (%.2f GB)\n", w3 * 2 / 1e9); return 1; }
@@ -3410,6 +3471,15 @@ static int predict_one(int argc, char **argv) {
                     nn_ptick("shard d2h");
                     if (writer_submit(&WR, sb, qz, qy, qx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
                     sb = writer_next(&WR, sb); sbuf = WR.buf[sb];
+                    for (int c = 1; c < mch_n; c++) {   /* --channels: the extra channels' shards from the same logits */
+                        struct mch_s *m = &MC[c]; const float *lc = (const float *)(mch_lg + (size_t)(mch_c[c] - mch_lo) * mch_cs);
+                        nn_zero(m->dsh, WR.bytes);
+                        if (ct_shared) nn_pred_place_m(lc, ctmi, W, halo, (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, m->dsh);
+                        else nn_pred_place(lc, ctd, W, halo, (int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]), shard, m->dsh);
+                        writer_d2h(&m->WR, m->sb, m->dsh);
+                        if (writer_submit(&m->WR, m->sb, qz, qy, qx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+                        m->sb = writer_next(&m->WR, m->sb);
+                    }
                     nn_ptick("writer wait");
                 }
                 const char *e = nn_check();
@@ -3425,6 +3495,11 @@ static int predict_one(int argc, char **argv) {
                 if (WR.skip) ;
                 else if (ct_shared) nn_pred_place_m_d(lg, ctmi, Wz, W, hz, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
                 else nn_pred_place_d(lg, ctd, Wz, W, hz, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, dsh);
+                for (int c = 1; c < mch_n; c++) {   /* --channels */
+                    const float *lc = (const float *)(mch_lg + (size_t)(mch_c[c] - mch_lo) * mch_cs);
+                    if (ct_shared) nn_pred_place_m_d(lc, ctmi, Wz, W, hz, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, MC[c].dsh);
+                    else nn_pred_place_d(lc, ctd, Wz, W, hz, halo, (int)(tz - so[0]), (int)(ty - so[1]), (int)(tx - so[2]), (int)(se[0] - so[0]), (int)(se[1] - so[1]), (int)(se[2] - so[2]), shard, MC[c].dsh);
+                }
                 const char *e = nn_check();
                 if (e) { fprintf(stderr, "cuda: %s\n", e); return 1; }
                 if (pprof) { nn_sync(); p_gpu += now() - pt; }
@@ -3466,6 +3541,7 @@ static int predict_one(int argc, char **argv) {
     if (seam2 && seam_flush(&SM, PH, &phd)) return 1;
     if (!sup && cur_shard >= 0 && any && lhm) for (int j = 0; j < nph; j++) if (phead_submit(&PH[j], phd, sz, sy, sx, sz)) return 1;
     if (!sup && cur_shard >= 0 && any) { if (gpath && !WR.skip) writer_d2h(&WR, sb, dsh); if (writer_submit(&WR, sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } }
+    if (!sup && cur_shard >= 0 && any) for (int k = 1; k < mch_n; k++) { writer_d2h(&MC[k].WR, MC[k].sb, MC[k].dsh); if (writer_submit(&MC[k].WR, MC[k].sb, sz, sy, sx)) { fprintf(stderr, "%s\n", z3w_error()); return 1; } }
     else if (!sup && cur_shard >= 0 && WR.donefd >= 0) dprintf(WR.donefd, "%lld %lld %lld\n", (long long)(sz + soff[0]), (long long)(sy + soff[1]), (long long)(sx + soff[2]));
     if (sheet_task && cur_shard>=0 && sheet_write_shard(out,sheet_shard,shard,sz,sy,sx)) return 1;
     if (ufsm_env_on("UFSM_PROF")) { fprintf(stderr, "\n"); unet_prof_report(); }
@@ -3477,6 +3553,7 @@ static int predict_one(int argc, char **argv) {
                   for (int j = 0; j < nph; j++) { te += PH[j].pya->t_enc; ne += PH[j].pya->n_enc; if (pyacc_finish(PH[j].pya)) { fprintf(stderr, "predict: head %s: the GPU pyramid failed\n", PH[j].name); return 1; } }
                   if (pprof) fprintf(stderr, "predict profile (s): GPU pyramid: %.2f s in the head writers (%ld chunks of levels >= 1 encoded as they came), %.2f s for the rest\n", te, ne, now() - tf); }
       if (writer_finish(&WR)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
+      for (int k = 1; k < mch_n; k++) if (writer_finish(&MC[k].WR)) { fprintf(stderr, "predict: channel %d: %s\n", mch_c[k], z3w_error()); return 1; }
       if (pprof && !lhm) fprintf(stderr, "predict profile (s): writer: %.2f thread-seconds compressing %ld shards (%.0f MB/s per writer thread), tail after the last window %.2f\n",
                          WR.t_write, WR.n_write, WR.t_write > 0 ? WR.n_write * (double)WR.bytes / WR.t_write / 1e6 : 0., now() - tf);
       if (pprof && lhm) { double tw = 0; long nw = 0; for (int j = 0; j < nph; j++) { tw += PH[j].wr->t_write; nw += PH[j].wr->n_write; }
@@ -3598,6 +3675,14 @@ static int predict_one(int argc, char **argv) {
     if (!gpyr) for (int l = pp ? 2 : 1; l < nlev; l++) if (pyramid_build_level(out, um_l, l, ash, shard, q, 0, nthreads, attrs)) return 1;
     if (pyramid_write_group(out, um_l, gpyr ? PH[0].pya->nlev : nlev, "ufsm-recto", attrs)) return 1;
     }
+    for (int k = 1; k < mch_n; k++) {   /* --channels: the extra stores' pyramids (as the main one's) */
+        z3w_close(MC[k].w);
+        for (int l = 1; l < nlev; l++) if (pyramid_build_level(mch_out[k], um_l, l, ash, shard, q, 0, nthreads, MC[k].attrs)) return 1;
+        if (pyramid_write_group(mch_out[k], um_l, nlev, "ufsm-recto", MC[k].attrs)) return 1;
+        nn_host_free(MC[k].WR.buf[0]); nn_host_free(MC[k].WR.buf[1]); nn_free(MC[k].dsh);
+    }
+    if (mch_n > 1) fprintf(stderr, "predict: --channels: %d more channel stores (%s ...) from the same windows\n", mch_n - 1, mch_out[1]);
+    free(MC);
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs end-to-end, the windows %.0fs)\n", out, ntiles, now() - t0, t_win);
     /* (the share only with UFSM_SKIP_REPORT: without it the line read "... masked-1.000", taken for "every conv skipped" (latcodec 11-20); a
        masked launch runs the active tiles of its mask, not none) */
