@@ -14,13 +14,15 @@
 # AUC exactly) and writes eval/pair_TAG.{heldout,hold,valonly}.tsv itself (pairwrap2.py's columns, vs reader3) from the cached sample
 # table (FASTDIR/1667-up.uws). Any missing input, or > 0.1 % of the samples in ink shards the predict did not write, fails (exit 1, no
 # tsv). WSU: a ufsm with ink-wrapscore and predict --tile-list (default /vesuvius/ufsm/bin/ufsm-fullvram): FAST predicts with it, not U.
+# FASTREST=1: also the training samples (split rest; tiles FASTDIR/tiles-1667-rest, 203 + 202 instead of 131 + 125), eval/pair_TAG.rest.tsv.
 # The blend writes only the tiles0 shards, level 0 (LATINK_BLEND_X). h1-3000 1 min 52 s, fr1-1000 (10.7 M) 3 min 14 s on the shared card 1.
 set -u; TAG=${1:?TAG}; CK=${2:?CKPT}; U=${U:-/vesuvius/ufsm/bin/ufsm-inksdk}
 E=/vesuvius/ufsm/inksmoke/eval/$TAG; P=/vesuvius/ufsm/podun/PHerc1667; UP=$P/inksdk/up; CTR=/vesuvius/ufsm/v2/ct; CTK=PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr
 FAST=${FAST:-1}; FASTDIR=${FASTDIR:-/vesuvius/ufsm/inksmoke/fast}; WSU=${WSU:-/vesuvius/ufsm/bin/ufsm-fullvram}
+FTILES=$FASTDIR/tiles-1667; FSPLIT=heldout,hold,valonly; [ "${FASTREST:-0}" = 1 ] && { FTILES=$FASTDIR/tiles-1667-rest; FSPLIT=$FSPLIT,rest; }
 [ $FAST = 1 ] && [ -e $E/fast.done ] && { echo "score $TAG: done before (FAST)"; exit 0; }
 [ $FAST = 1 ] || { [ -s $E/map/w051.tif ] && { echo "score $TAG: done before"; exit 0; }; }
-[ $FAST = 1 ] && { [ -x $WSU ] && [ -s $FASTDIR/1667-up.uws ] && [ -s $FASTDIR/tiles-1667/tiles0.txt ] || { echo "score $TAG: FAST needs $WSU, $FASTDIR/1667-up.uws, $FASTDIR/tiles-1667"; exit 1; }; }
+[ $FAST = 1 ] && { [ -x $WSU ] && [ -s $FASTDIR/1667-up.uws ] && [ -s $FTILES/tiles0.txt ] || { echo "score $TAG: FAST needs $WSU, $FASTDIR/1667-up.uws, $FTILES"; exit 1; }; }
 exec 8> /vesuvius/ufsm/inksdk/score.lock; flock 8   # (one score at a time on the desk, team rule 11-20; the drivers queue here)
 mkdir -p $E/ink $E/in $E/map $E/r; cp $P/box.txt $P/axis.json $E/
 # GATEFROM=EVALDIR (a net without recto / verso rows, e.g. the full-res ink run): predict ink only; the papyrus gate (c12 / c13) is that
@@ -38,10 +40,10 @@ guard() { while :; do nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory -
   done; sleep 2; done; }
 guard & GP=$!; trap 'kill $GP 2>/dev/null; [ -s $E/gpumem.log ] && sort -k3 -n $E/gpumem.log | tail -1 | sed "s/^/peak: /" >> $E/gpupeak.txt' EXIT
 [ -e $E/ink/ink.zarr/zarr.json ] || $LK env CUDA_VISIBLE_DEVICES=1 U=$([ $FAST = 1 ] && echo $WSU || echo $U) LATINK_CK=$CK ITH=8 UNROLL_CT="$CTR|$CTK|2.399|2" ~/bin/memcap -m 36G ~/bin/lowprio \
-  env LATINK_HEADS=${GATEFROM:+ink} LATINK_TILES=${LATINK_TILES:-$([ $FAST = 1 ] && echo $FASTDIR/tiles-1667)} LATINK_BLEND_X="${LATINK_BLEND_X:-$([ $FAST = 1 ] && echo --tile-list ${LATINK_TILES:-$FASTDIR/tiles-1667}/tiles0.txt --levels 1)}" bash ${LATINK:-$(dirname "$(readlink -f "$0")")/../pod/latink.sh} $E 0 $E/ink/ink.zarr > $E/latink.log 2>&1 || { echo "score $TAG: latink failed ($E/latink.log)"; exit 1; }
+  env LATINK_HEADS=${GATEFROM:+ink} LATINK_TILES=${LATINK_TILES:-$([ $FAST = 1 ] && echo $FTILES)} LATINK_BLEND_X="${LATINK_BLEND_X:-$([ $FAST = 1 ] && echo --tile-list ${LATINK_TILES:-$FTILES}/tiles0.txt --levels 1)}" bash ${LATINK:-$(dirname "$(readlink -f "$0")")/../pod/latink.sh} $E 0 $E/ink/ink.zarr > $E/latink.log 2>&1 || { echo "score $TAG: latink failed ($E/latink.log)"; exit 1; }
 if [ $FAST = 1 ]; then
   ~/bin/memcap -m 12G ~/bin/lowprio $WSU ink-wrapscore $UP /vesuvius/ufsm/inkgt/segs-PHerc1667.json $(dirname $E)/pair_$TAG --ct-key $CTK --maps reader3=$P/ink/reader3/map \
-    --vmap $TAG=$E/ink --depth ${DEPTH:-4} --ref reader3 --nonzero reader3 --split heldout,hold,valonly --need w035-w051 --table $FASTDIR/1667-up.uws --threads 6 > $E/wrapscore.log 2>&1 \
+    --vmap $TAG=$E/ink --depth ${DEPTH:-4} --ref reader3 --nonzero reader3 --split $FSPLIT --need w035-w051 --table $FASTDIR/1667-up.uws --threads 6 > $E/wrapscore.log 2>&1 \
     || { echo "score $TAG: ink-wrapscore failed ($E/wrapscore.log)"; exit 1; }
   touch $E/fast.done; echo "score $TAG: FAST $(awk -F'\t' -v t=$TAG '$1 == t {print "heldout AUC", $3, "vs reader3", $4, "n", $2}' $(dirname $E)/pair_$TAG.heldout.tsv)"; exit 0
 fi
