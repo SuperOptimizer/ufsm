@@ -136,7 +136,7 @@ __host__ __device__ __forceinline__ int mx_rb(int bw, int bits) { return bw * bi
    the block-scaled MMA do not exist there. The storage formats are unchanged (e4m3 bytes / e2m1 nibbles + ue8m0 scales); the
    conversions become bit-exact integer code (mx_sw.cuh, the 2^32 / 256 / 16 input checks of tests/test_mx_sw.c) and the MMAs
    are emulated from the same register fragments (mma_f8 / mma_f4 / mma_f4x4 below), so every lp kernel runs unchanged. */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200) || (defined(UFSM_ARCH) && UFSM_ARCH == 86)
 #define LP_SW 1
 #endif
 #include "mx_sw.cuh"
