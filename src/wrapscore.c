@@ -25,6 +25,9 @@
 #include "inksplat.h"
 #include "json.h"
 #include "optcheck.h"
+#include "render_core.h"
+#include "store.h"
+#include "zarr3.h"
 #include <dirent.h>
 #include <math.h>
 #include <pthread.h>
@@ -348,6 +351,105 @@ static void *boot_worker(void *arg) {
     free(cnt); free(hp); return nullptr;
 }
 
+
+/* ---- the volume maps (--vmap): render's pixel (render_core.h rc_pixel, depth D, scale 1) at each sample's map pixel, gated as img-gate:
+   the ink volume x max(c12, c13) / 255, without rendering or writing the wraps; and the 512-tile lists a cropped predict needs ---- */
+static int need_set(const char *need, const wtable *t, uint8_t *in) {   /* "wNNN-wMMM" or "a,b,c" -> in[k]; -1 when a name is not a wrap */
+    memset(in, 0, (size_t)t->nw); int a, b, n = 0; char nb[2048]; snprintf(nb, sizeof nb, "%s", need);
+    if (sscanf(nb, "w%d-w%d", &a, &b) == 2) {
+        for (int q = a; q <= b; q++) { char nm[32]; snprintf(nm, sizeof nm, "w%03d", q); int f = 0;
+            for (int k = 0; k < t->nw; k++) if (!strcmp(t->W[k].name, nm)) { in[k] = 1; f = 1; n++; }
+            if (!f) { fprintf(stderr, "ink-wrapscore: --need %s: no wrap %s in the table\n", need, nm); return -1; } }
+        return n;
+    }
+    for (char *sv = nullptr, *x = strtok_r(nb, ",", &sv); x; x = strtok_r(nullptr, ",", &sv)) { int f = 0;
+        for (int k = 0; k < t->nw; k++) if (!strcmp(t->W[k].name, x)) { in[k] = 1; f = 1; n++; }
+        if (!f) { fprintf(stderr, "ink-wrapscore: --need: no wrap %s in the table\n", x); return -1; } }
+    return n;
+}
+static void samp_px(const wwrap *w, const wsamp *x, int *px, int *py) {   /* the sample's pixel of a scale-1 render (pairwrap2.py's lookup) */
+    const double gs = 1 / w->sc; const int ow = render_out_px(w->w, gs), oh = render_out_px(w->h, gs);
+    const double cw = w->w / w->sc, ch = w->h / w->sc, fx = ow / cw, fy = oh / ch;
+    int64_t xi = (int64_t)nearbyint(x->fc / w->sc * fx), yi = (int64_t)nearbyint(x->fr / w->sc * fy);
+    *px = (int)(xi < 0 ? 0 : xi > ow - 1 ? ow - 1 : xi); *py = (int)(yi < 0 ? 0 : yi > oh - 1 ? oh - 1 : yi);
+}
+static int px_point(const float *Z, const float *Y, const float *X, int w, int h, double gs, int px, int py, double P[3]) {   /* rc_pixel's point */
+    const double gu = px / gs, gv = py / gs; int c0 = (int)gu, r0 = (int)gv; if (c0 >= w - 1) c0 = w - 2; if (r0 >= h - 1) r0 = h - 2; if (c0 < 0 || r0 < 0) return 0;
+    const double fu = gu - c0, fv = gv - r0; const size_t i00 = (size_t)r0 * w + c0, i01 = i00 + 1, i10 = i00 + w, i11 = i10 + 1;
+    if (!(Z[i00] >= 0 && Z[i01] >= 0 && Z[i10] >= 0 && Z[i11] >= 0)) return 0;
+    const float *A[3] = {Z, Y, X};
+    for (int d = 0; d < 3; d++) { const double a = A[d][i00], b = A[d][i01], c = A[d][i10], e = A[d][i11]; P[d] = (1 - fv) * ((1 - fu) * a + fu * b) + fv * ((1 - fu) * c + fu * e); }
+    return 1;
+}
+typedef struct { float *X, *Y, *Z; } rgrid;
+static int cmp_u64b(const void *a, const void *b) { const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return (x > y) - (x < y); }
+enum { VMARG = 6 };   /* voxels around a pixel's point: depth 4 + the trilinear corner + rounding */
+typedef struct { z3 *z; int sh; const int64_t *shape; const uint64_t *keys; uint8_t **bufs; size_t nk; atomic_size_t next; int fail; } djob;
+static void *dec_worker(void *arg) {
+    djob *J = arg; const int64_t C = (int64_t)1 << J->sh; uint8_t *tmp = malloc((size_t)(C * C * C));
+    for (;;) {
+        const size_t i = atomic_fetch_add(&J->next, 1); if (i >= J->nk) break;
+        const uint64_t k = J->keys[i]; const int64_t c[3] = {(int64_t)(k >> 42), (int64_t)(k >> 21 & 0x1fffff), (int64_t)(k & 0x1fffff)};
+        int64_t o[3], n[3]; int in = 1; for (int d = 0; d < 3; d++) { o[d] = c[d] * C; n[d] = J->shape[d] - o[d] < C ? J->shape[d] - o[d] : C; in &= n[d] > 0; }
+        if (!in) { J->bufs[i] = nullptr; continue; }
+        uint8_t *b = calloc((size_t)(C * C * C), 1); if (!b || z3_read(J->z, o, n, tmp, 1)) { free(b); J->fail = 1; continue; }
+        for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) memcpy(b + ((size_t)z * C + y) * C, tmp + ((size_t)z * n[1] + y) * n[2], (size_t)n[2]);
+        J->bufs[i] = b;
+    }
+    free(tmp); return nullptr;
+}
+typedef struct { const wwrap *w; const rgrid *g; const size_t *idx; size_t n; const wsamp *S; int sh; const uint64_t *keys; uint8_t *const *bufs; size_t nk; int depth; uint8_t *out; atomic_size_t next; } ejob;
+static void *eval_worker(void *arg) {
+    ejob *J = arg; const double gs = 1 / J->w->sc; const int64_t C = (int64_t)1 << J->sh;
+    for (;;) {
+        const size_t i = atomic_fetch_add(&J->next, 1); if (i >= J->n) break;
+        const wsamp *x = &J->S[J->idx[i]]; int px, py; samp_px(J->w, x, &px, &py); double P[3]; J->out[i] = 0;
+        if (!px_point(J->g->Z, J->g->Y, J->g->X, J->w->w, J->w->h, gs, px, py, P)) continue;
+        rc_vol V; V.sh = J->sh; const uint8_t *ptr[27];
+        for (int d = 0; d < 3; d++) { int64_t a = (int64_t)floor((P[d] - VMARG) / C), b = (int64_t)floor((P[d] + VMARG) / C); if (a < 0) a = 0; if (b < a) b = a; V.c0[d] = a; V.cn[d] = b - a + 1; }
+        if (V.cn[0] * V.cn[1] * V.cn[2] > 27) continue;
+        for (int64_t a = 0; a < V.cn[0]; a++) for (int64_t b = 0; b < V.cn[1]; b++) for (int64_t c = 0; c < V.cn[2]; c++) {
+            const uint64_t k = (uint64_t)(V.c0[0] + a) << 42 | (uint64_t)(V.c0[1] + b) << 21 | (uint64_t)(V.c0[2] + c);
+            const uint64_t *f = bsearch(&k, J->keys, J->nk, sizeof k, cmp_u64b); ptr[(a * V.cn[1] + b) * V.cn[2] + c] = f ? J->bufs[f - J->keys] : nullptr; }
+        V.ptr = ptr; uint8_t val = 0;
+        if (rc_pixel(J->g->Z, J->g->Y, J->g->X, J->w->w, J->w->h, gs, px, py, &V, 1, &J->depth, nullptr, nullptr, &val, nullptr)) J->out[i] = val;
+    }
+    return nullptr;
+}
+/* one volume at the samples idx[0..n) of wrap w -> out[]; *absent: samples whose point's shard is not in the store */
+static int vol_eval(z3 *z, const wwrap *w, const rgrid *g, const wsamp *S, const size_t *idx, size_t n, int depth, int nth, uint8_t *out, size_t *absent) {
+    const z3_meta *m = z3_meta_of(z); const int C = m->chunk[0]; int sh = 0; while ((1 << sh) < C) sh++;
+    if (C != m->chunk[1] || C != m->chunk[2] || (1 << sh) != C) { fprintf(stderr, "ink-wrapscore: volume chunks must be cubes of a power of 2\n"); return -1; }
+    const double gs = 1 / w->sc; uint64_t *keys = malloc(n * 27 * sizeof *keys), *sk = malloc(n * sizeof *sk); size_t nk = 0, ns = 0;
+    for (size_t i = 0; i < n; i++) { int px, py; samp_px(w, &S[idx[i]], &px, &py); double P[3]; if (!px_point(g->Z, g->Y, g->X, w->w, w->h, gs, px, py, P)) continue;
+        int64_t a[3], b[3]; for (int d = 0; d < 3; d++) { a[d] = (int64_t)floor((P[d] - VMARG) / C); b[d] = (int64_t)floor((P[d] + VMARG) / C); if (a[d] < 0) a[d] = 0; if (b[d] < a[d]) b[d] = a[d]; }
+        for (int64_t p = a[0]; p <= b[0]; p++) for (int64_t q = a[1]; q <= b[1]; q++) for (int64_t r = a[2]; r <= b[2]; r++) if (nk < n * 27) keys[nk++] = (uint64_t)p << 42 | (uint64_t)q << 21 | (uint64_t)r;
+        int64_t s3[3]; int ok = 1; for (int d = 0; d < 3; d++) { const int64_t v = (int64_t)floor(P[d]); ok &= v >= 0 && v < m->shape[d]; s3[d] = v / m->shard[d]; }
+        sk[ns++] = ok ? ((uint64_t)s3[0] << 42 | (uint64_t)s3[1] << 21 | (uint64_t)s3[2]) : UINT64_MAX; }
+    qsort(keys, nk, sizeof *keys, cmp_u64b); size_t u = 0; for (size_t i = 0; i < nk; i++) if (!i || keys[i] != keys[i - 1]) keys[u++] = keys[i]; nk = u;
+    qsort(sk, ns, sizeof *sk, cmp_u64b); *absent = 0;
+    for (size_t i = 0; i < ns;) { size_t j = i; while (j < ns && sk[j] == sk[i]) j++;
+        if (sk[i] == UINT64_MAX || z3_shard_present(z, (int64_t)(sk[i] >> 42), (int64_t)(sk[i] >> 21 & 0x1fffff), (int64_t)(sk[i] & 0x1fffff)) != 1) *absent += j - i; i = j; }
+    uint8_t **bufs = calloc(nk ? nk : 1, sizeof *bufs); djob D = {.z = z, .sh = sh, .shape = m->shape, .keys = keys, .bufs = bufs, .nk = nk}; atomic_init(&D.next, 0);
+    const int nt = nth > 32 ? 32 : nth; pthread_t th[32];
+    for (int i = 0; i < nt; i++) pthread_create(&th[i], nullptr, dec_worker, &D);
+    for (int i = 0; i < nt; i++) pthread_join(th[i], nullptr);
+    int rc = D.fail ? -1 : 0;
+    if (!rc) { ejob E = {.w = w, .g = g, .idx = idx, .n = n, .S = S, .sh = sh, .keys = keys, .bufs = bufs, .nk = nk, .depth = depth, .out = out}; atomic_init(&E.next, 0);
+        for (int i = 0; i < nt; i++) pthread_create(&th[i], nullptr, eval_worker, &E);
+        for (int i = 0; i < nt; i++) pthread_join(th[i], nullptr); }
+    else fprintf(stderr, "ink-wrapscore: volume read failed: %s\n", z3_error());
+    for (size_t i = 0; i < nk; i++) free(bufs[i]);
+    free(bufs); free(keys); free(sk); return rc;
+}
+void img_gate_lut(uint8_t lut[256][256]);   /* src/imggate.c */
+static z3 *vol_open(const char *dir, const char *name, const char *key) {   /* DIR/NAME.zarr, level KEY */
+    char p[1400]; snprintf(p, sizeof p, "%s/%s.zarr", dir, name); struct stat st; if (stat(p, &st)) return nullptr;
+    store *s = store_open(p); z3 *z = s ? z3_open(s, key, nullptr) : nullptr;
+    if (!z) fprintf(stderr, "ink-wrapscore: %s level %s: %s\n", p, key, z3_error());
+    return z;
+}
+
 int cmd_ink_wrapscore(int argc, char **argv) {
     if (argc < 5) {
         fprintf(stderr, "usage: ufsm ink-wrapscore WRAPS SEGS.JSON OUT --ct-key K --maps name=DIR[,name=DIR ..] [--ref NAME] [--nonzero a,b] [--split heldout,hold,valonly]\n"
@@ -363,7 +465,12 @@ int cmd_ink_wrapscore(int argc, char **argv) {
     const double tol = opt_atof("--tol", wopt(argc, argv, "--tol", "40")), umL = opt_atof("--um-label", wopt(argc, argv, "--um-label", "2.399"));
     const int step = opt_atoi("--step", wopt(argc, argv, "--step", "8")), minn = opt_atoi("--min-n", wopt(argc, argv, "--min-n", "1000")),
               draws = opt_atoi("--draws", wopt(argc, argv, "--draws", "1000")), nth = opt_atoi("--threads", wopt(argc, argv, "--threads", "6"));
-    if (!ctkey || !maps || step < 1 || draws < 10 || nth < 1) { fprintf(stderr, "ink-wrapscore: --ct-key and --maps needed (--step >= 1, --draws >= 10)\n"); return 2; }
+    const char *vmaps = wopt(argc, argv, "--vmap", nullptr), *vkey = wopt(argc, argv, "--vkey", "9.596"), *tiles = wopt(argc, argv, "--tiles-out", nullptr);
+    const int depth = opt_atoi("--depth", wopt(argc, argv, "--depth", "4")), gate = opt_atoi("--gate", wopt(argc, argv, "--gate", "1"));
+    const double maxabs = opt_atof("--max-absent", wopt(argc, argv, "--max-absent", "0.001"));
+    if (!ctkey || (!maps && !vmaps && !tiles) || step < 1 || draws < 10 || nth < 1 || depth < 0 || depth > 64) {
+        fprintf(stderr, "ink-wrapscore: --ct-key and --maps / --vmap / --tiles-out needed (--step >= 1, --draws >= 10, --depth 0..64)\n"); return 2; }
+    if ((vmaps || tiles) && !need) { fprintf(stderr, "ink-wrapscore: --vmap / --tiles-out need --need (the wraps the volume maps cover)\n"); return 2; }
     if (holdf && *holdf) { struct stat st; if (stat(holdf, &st)) { fprintf(stderr, "ink-wrapscore: no holdouts file %s (--holdouts '' for none)\n", holdf); return 1; } }
     const double t0 = wnow(); wtable t = {0}; char key[KEYLEN]; table_key(key, sizeof key, wraps, segs, ctkey, holdf, step, umL);
     if (!tabf || table_load(&t, tabf, key)) {
@@ -371,15 +478,71 @@ int cmd_ink_wrapscore(int argc, char **argv) {
         for (int k = 0; k < t.nw; k++) { free(t.W[k].X); free(t.W[k].Y); free(t.W[k].Z); t.W[k].X = t.W[k].Y = t.W[k].Z = nullptr; }
         if (tabf && table_save(&t, tabf, key)) fprintf(stderr, "ink-wrapscore: warning: cannot write the table %s\n", tabf);
     } else printf("table: %s: %zu samples on %d wraps\n", tabf, t.ns, t.nw);
+    /* the samples to score: the requested splits within --tol */
+    uint8_t *ev = calloc(t.ns, 1); char *scp0 = strdup(splits);
+    for (char *sv = nullptr, *sp = strtok_r(scp0, ",", &sv); sp; sp = strtok_r(nullptr, ",", &sv)) {
+        const int mode = !strcmp(sp, "heldout") ? 0 : !strcmp(sp, "rest") ? 1 : !strcmp(sp, "all") ? 2 : !strcmp(sp, "hold") ? 3 : !strcmp(sp, "valonly") ? 4 : -1;
+        if (mode < 0) { fprintf(stderr, "ink-wrapscore: --split heldout | rest | all | hold | valonly\n"); return 2; }
+        for (size_t s = 0; s < t.ns; s++) { const wsamp *x = &t.S[s];
+            const int in = mode == 0 ? (x->val | x->hold) : mode == 1 ? (!x->val && !x->hold) : mode == 2 ? 1 : mode == 3 ? x->hold : (x->val && !x->hold);
+            if (in && x->miss * umL <= tol) ev[s] = 1; } }
+    free(scp0);
+    /* the --need wraps' grids (render coordinates) for the volume maps / tile lists */
+    uint8_t *inw = calloc(t.nw ? t.nw : 1, 1); rgrid *G = calloc(t.nw ? t.nw : 1, sizeof *G);
+    if (vmaps || tiles) {
+        if (need_set(need, &t, inw) <= 0) return 1;
+        for (int k = 0; k < t.nw; k++) { if (!inw[k]) continue; char p[1400]; int w, h; snprintf(p, sizeof p, "%s/%s", wraps, t.W[k].name);
+            if (load_xyz(p, &G[k].X, &G[k].Y, &G[k].Z, &w, &h) || w != t.W[k].w || h != t.W[k].h) { fprintf(stderr, "ink-wrapscore: cannot read the wrap %s (or its grid changed)\n", p); return 1; } }
+    }
+    if (tiles) {   /* latink.sh LATINK_TILES: the 512 tiles of grids 0 and 256 that hold a scored sample's pixel point (+- VMARG) */
+        size_t cap = 1 << 16, nt = 0; uint64_t *tk = malloc(cap * sizeof *tk); size_t npt = 0;
+        for (size_t s = 0; s < t.ns; s++) { if (!ev[s] || !inw[t.S[s].k]) continue; const wwrap *w = &t.W[t.S[s].k]; int px, py; double P[3]; samp_px(w, &t.S[s], &px, &py);
+            if (!px_point(G[t.S[s].k].Z, G[t.S[s].k].Y, G[t.S[s].k].X, w->w, w->h, 1 / w->sc, px, py, P)) continue; npt++;
+            for (int g = 0; g < 2; g++) { const double o = g ? 256 : 0; int64_t a[3], b[3];
+                for (int d = 0; d < 3; d++) { a[d] = (int64_t)floor((P[d] - VMARG - o) / 512); b[d] = (int64_t)floor((P[d] + VMARG - o) / 512); }
+                for (int64_t z = a[0]; z <= b[0]; z++) for (int64_t y = a[1]; y <= b[1]; y++) for (int64_t x = a[2]; x <= b[2]; x++) {
+                    if (nt + 1 >= cap) { cap *= 2; tk = realloc(tk, cap * sizeof *tk); }
+                    tk[nt++] = (uint64_t)g << 63 | (uint64_t)(z + 1024) << 42 | (uint64_t)(y + 1024) << 21 | (uint64_t)(x + 1024); } } }
+        qsort(tk, nt, sizeof *tk, cmp_u64b); size_t u = 0; for (size_t i = 0; i < nt; i++) if (!i || tk[i] != tk[i - 1]) tk[u++] = tk[i];
+        char cmd[1500]; snprintf(cmd, sizeof cmd, "%s", tiles); mkdir(cmd, 0775); int cnt[2] = {0, 0}; int bad = 0;
+        for (int g = 0; g < 2; g++) { char p[1500], q[1600]; snprintf(p, sizeof p, "%s/tiles%d.txt", tiles, g ? 256 : 0); snprintf(q, sizeof q, "%s.tmp", p); FILE *f = fopen(q, "w"); if (!f) { bad = 1; continue; }
+            for (size_t i = 0; i < u; i++) { if ((int)(tk[i] >> 63) != g) continue; fprintf(f, "%lld %lld %lld\n", (long long)(tk[i] >> 42 & 0x1fffff) - 1024, (long long)(tk[i] >> 21 & 0x1fffff) - 1024, (long long)(tk[i] & 0x1fffff) - 1024); cnt[g]++; }
+            if (fclose(f) || rename(q, p)) bad = 1; }
+        free(tk);
+        if (bad || !npt) { fprintf(stderr, "ink-wrapscore: FAILED: tile lists in %s (%zu sample points)\n", tiles, npt); return 1; }
+        printf("tiles: %zu sample points on the --need wraps -> %d tiles of grid 0, %d of grid 256 in %s\n", npt, cnt[0], cnt[1], tiles);
+        if (!maps && !vmaps) return 0;
+    }
     /* the maps */
-    char *mcp = strdup(maps); int nm = 0; char *mn[16], *md[16];
+    char *mcp = strdup(maps ? maps : ""); int nm = 0, nfm = 0; char *mn[16], *md[16];
     for (char *s = strtok(mcp, ","); s; s = strtok(nullptr, ",")) { char *e = strchr(s, '='); if (!e || nm == 16) { fprintf(stderr, "ink-wrapscore: --maps name=DIR,..\n"); return 2; } *e = 0; mn[nm] = s; md[nm++] = e + 1; }
+    nfm = nm; char *vcp = strdup(vmaps ? vmaps : "");
+    for (char *s = strtok(vcp, ","); s; s = strtok(nullptr, ",")) { char *e = strchr(s, '='); if (!e || nm == 16) { fprintf(stderr, "ink-wrapscore: --vmap name=DIR,..\n"); return 2; } *e = 0; mn[nm] = s; md[nm++] = e + 1; }
     int ri = -1; for (int m = 0; m < nm; m++) if (ref && !strcmp(mn[m], ref)) ri = m;
     if (ref && ri < 0) { fprintf(stderr, "ink-wrapscore: --ref %s is not one of --maps\n", ref); return 2; }
     int nzm[16]; for (int m = 0; m < nm; m++) { nzm[m] = !nzs; if (nzs) { char b[1024]; snprintf(b, sizeof b, ",%s,", nzs); char q[300]; snprintf(q, sizeof q, ",%s,", mn[m]); nzm[m] = strstr(b, q) != nullptr; } }
     int16_t *V = malloc((size_t)nm * t.ns * sizeof *V); for (size_t i = 0; i < (size_t)nm * t.ns; i++) V[i] = -1;
     int fail = 0;
-    for (int m = 0; m < nm; m++) {
+    for (int m = nfm; m < nm && !fail; m++) {   /* the volume maps */
+        const double tv = wnow(); z3 *zi = vol_open(md[m], "ink", vkey), *zg[2] = {gate ? vol_open(md[m], "c12", vkey) : nullptr, gate ? vol_open(md[m], "c13", vkey) : nullptr};
+        if (!zi || (gate && (!zg[0] || !zg[1]))) { fprintf(stderr, "ink-wrapscore: vmap %s: need %s/ink.zarr%s (level %s)\n", mn[m], md[m], gate ? ", c12.zarr, c13.zarr" : "", vkey); fail = 1; break; }
+        static uint8_t glut[256][256]; static int glut_ok; if (!glut_ok) { img_gate_lut(glut); glut_ok = 1; }   /* mgpu: main */
+        size_t nall = 0, nabs = 0;
+        for (int k = 0; k < t.nw && !fail; k++) {
+            if (!inw[k]) continue; size_t n = 0; size_t *idx = malloc(t.ns * sizeof *idx);
+            for (size_t s = 0; s < t.ns; s++) if (ev[s] && t.S[s].k == k) idx[n++] = s;
+            uint8_t *o[3] = {malloc(n + 1), malloc(n + 1), malloc(n + 1)};
+            for (int v = 0; v < (gate ? 3 : 1) && !fail; v++) { size_t ab = 0;
+                if (vol_eval(v ? zg[v - 1] : zi, &t.W[k], &G[k], t.S, idx, n, depth, nth, o[v], &ab)) fail = 1;
+                if (!v) nabs += ab; }
+            for (size_t i = 0; i < n && !fail; i++) V[(size_t)m * t.ns + idx[i]] = gate ? glut[o[0][i]][o[1][i] > o[2][i] ? o[1][i] : o[2][i]] : o[0][i];
+            nall += n; free(idx); free(o[0]); free(o[1]); free(o[2]);
+        }
+        z3_close(zi); if (zg[0]) z3_close(zg[0]); if (zg[1]) z3_close(zg[1]);
+        printf("vmap: %s: %zu samples on the --need wraps from %s (depth %d%s), %zu in shards the ink store lacks (%.0f s)\n", mn[m], nall, md[m], depth, gate ? ", x max(c12, c13)" : "", nabs, wnow() - tv);
+        if (!fail && (double)nabs > maxabs * (double)(nall ? nall : 1)) { fprintf(stderr, "ink-wrapscore: FAILED: vmap %s: %zu of %zu samples lie in shards missing from %s/ink.zarr (> --max-absent %g): a cropped / failed predict?\n", mn[m], nabs, nall, md[m], maxabs); fail = 1; }
+    }
+    for (int m = 0; m < nfm; m++) {
         struct stat st; if (stat(md[m], &st) || !S_ISDIR(st.st_mode)) { fprintf(stderr, "ink-wrapscore: map %s: no directory %s\n", mn[m], md[m]); fail = 1; continue; }
         int got = 0;
         for (int k = 0; k < t.nw; k++) {
@@ -452,6 +615,7 @@ int cmd_ink_wrapscore(int argc, char **argv) {
         free(dl); free(bh); free(H); free(bk); free(ok);
     }
     printf("ink-wrapscore: %.1f s\n", wnow() - t0);
-    free(scp); free(mcp); free(V); free(t.W); free(t.S);
+    for (int k = 0; k < t.nw; k++) { free(G[k].X); free(G[k].Y); free(G[k].Z); }
+    free(scp); free(mcp); free(vcp); free(V); free(t.W); free(t.S); free(ev); free(inw); free(G);
     return rc;
 }
