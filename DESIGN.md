@@ -307,6 +307,33 @@ boxes of the u1 / try9 rows; window 640 / halo 64, --gn-live 1, the rvsep predic
   fluctuation-dissipation relation (Yaida 2018 / SASA) plus prog_K vs sqrt(kappa / K). Notes: /vesuvius/ufsm/trainperf/admuon2/design.txt.
 
 ## resgate: 9.6 um detail arms fine-tuned on the GT boxes, PARTIAL (R0, R2 only; stopped 2026-11-19 by the user's "stop winding training")
+## mcc follow-ups: the 84903be host miscompile, sm_120 A/B (no pin move), cold JIT, const tables (2026-11-20, microc branches unswfix / cudaopt / jitorder / consttab-20261120, mcuda)
+
+- **84903be (x86-64 loop unswitching) miscompiled l1pot.c's l1_solve** (test_patchsolve, test_repair's l1 grid, test_wbench_stats fail at
+  microc main). opt.c unswitch() ran simplify_cfg() right after unswitch_one() without compute_dom(); forward_phi_blocks read stale
+  dominator numbers for the copy's new blocks, judged the copied loop header not to dominate its successor and turned its phis into
+  NOPs while the copy still used them (loop counters undefined: the move loop never stopped or counted the wrong work). Fix: compute_dom()
+  before that simplify_cfg and the one after gvn (+3 lines, the same 6 loops unswitched). microc unswfix-20261120 77947a9, test
+  tests/c/unswitch_dom.c (l1_solve reduced to 60 lines; fails 2 of 5 flag sets at main). ufsm fast tier on main + fix (laptop): 343 pass,
+  the 18 failures exactly the pin's. cudaopt-20261119 rebased onto it (aaa23b2; PTX byte-identical to 258d73f's on lp_f4v,
+  lp_mx_s2bwd_tc, nn_conv, nn_fstem, nn_gpudec).
+- **sm_120 A/B** (desk card 1, P 256, 12 try9-shaped steps, nsys, 2 runs each): GPU kernel sum pin 2.478 / 2.503 s, cudaopt 2.484 /
+  2.490 s: neutral (sm_89: 0.96x nvcc). Per kernel: conv1_mx_tc 1.26x, conv_bwd_w1_tc 1.17x, fstem_fwd 1.12x faster; conv_bwd_w_f4ws_k
+  (22 % of the step) 0.97x slower (its text differs: a real effect). w4_events_k "0.86x" is noise: the text the driver compiles is byte-
+  identical under both (MCUDA_DUMP), the same cubin; per-launch medians pin 80 / 87 us, cudaopt 95 / 100 us. Lead: no pin move (a cold
+  re-JIT on every machine for no sm_120 gain); revisit with a measured sm_120 gain or a needed host fix.
+- **Cold JIT is ptxas time, not mcc's PTX.** The big conv kernels are 1.3-4.3 MB of PTX and 20-90 s each in the driver's compiler (desk
+  warm-up: 124 kernels over 10 s = 68 % of 4379 s); the same 12 lp_f4v kernels take 45.7 s from mcc's PTX and 42.8 s from nvcc's, and
+  nvcc's SASS is as large (conv_fwd_f8s 2.6 MB vs 1.7 MB). 16 compile threads on the laptop (16 threads, 30 GB) inflated per-kernel times
+  ~10x (sum 18208 s, max 716 s). The driver's own JIT cache (~/.nv/ComputeCache) makes a second "cold" run look 10x faster: cold timings
+  need CUDA_CACHE_DISABLE=1. mcudahw's cache key is per kernel (its entry, the functions it reaches, its data, the module header, device
+  name, driver version). microc jitorder-20261120: MCUDA_PRECOMPILE compiles the largest kernels first; a per-kernel PATH.lock so
+  parallel cold processes compile a kernel once; MCUDA_KLOG=FILE (kernels a process loads) and MCUDA_PRECOMPILE_ONLY=@FILE (warm just
+  those) for devspeed's per-test warm-up. Largest-first ran (2294 kernels, 0 failures); the lock and the two knobs await a GPU context.
+- **Local const tables.** tol_dir's `const int t[13][3]`, inlined into loss_stats_k / loss_grad_k, was built on the stack per call:
+  1248 / 624-byte local depots (nvcc 160). microc consttab-20261120: an automatic array of const numbers with an all-constant initializer
+  becomes one static object (MCC_NOCTAB=1: off); nn_loss st.local 1710 -> 110. 13 of 176 ufsm .cu units change PTX, no STRICT unit.
+
 ## mcc CUDA backend: device inlining, constant tables, vector memory, f16 round trips (2026-11-20, microc branch cudaopt-20261119: 834ab75, LICM opt-in 258d73f; mcuda)
 
 Question: where does mcc's PTX lose to nvcc's, and what closes it? Measured on the laptop forlinlapnvidia (RTX 4060, sm_89, ARCH 86
