@@ -6,6 +6,56 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Dev-loop speed, part 1: the baseline; the runner starts in 0.2 s, waits cheaply, and -c selects by symbol reach (2026-11-20, branch devspeed-20261120)
+
+**Baseline** on the desk (load 100-107 on 32 threads, two trainers; lowprio, -j 4, mcc 5744025):
+
+| stage | time |
+|---|---|
+| configure (cmake --preset) | 10 s (generate 8.6 s) |
+| cold release build / cold verify suite-bins (256 binaries, 2.1 GB) | 103 s (208 CPU-s) / 162 s (370 CPU-s) |
+| no-op build | 0.3 s |
+| edit train.c -> build/ufsm | 14 s (train.c 13 s + link 2 s) |
+| edit a .cu (release / verify) | 3.4 s / 8.7 s (160 relinks) |
+| edit unet.h | 17 s |
+| edit nn.h (release / verify) | 94 s (157 units) / 45 s; nn.h changed 73 times in 7 days |
+| JIT, every kernel cold | ~29 min (mcuda); 1889 + 1037 cubins compiled at 03h / 07h today (pin moves) |
+| CPU fast tier, 146 tests | 30-100 s at -j 16, 110-150 s at -j 4-6 (657 CPU-s) |
+| GPU fast tier, 221 tests | not runnable while both desk cards train: NOGPU / BUSY in 40 of the last 45 desk runs |
+
+So compiling is not where the time goes. The unit PTX holds no source paths (only the host `__FILE__` strings do; raw PTX diffed between
+two worktrees), so `~/.cache/mcudahw` is shared by every worktree and build dir; a JIT is paid per changed kernel and per pin move.
+Off the desk: forlindesk (2x3090) has been offline for 2 days, the laptop's GPU runs latcodec's training (its CPU is idle), the NAS host is
+an N100 (storage only).
+
+**Runner start-up.** Parsing the manifest cost 4 subshells per line (`$(echo)`, `tr`, `sed`): 7.5 s wall / 5.7 CPU-s per runner start
+on the loaded desk (`-l`), 11.7 s for a one-test run. Trimmed in bash, plus one grep instead of one per binary for the "not in the
+manifest" warning: `-l` 0.23 s, a one-test run 0.9 s. The lists of every tier and of `-c` are identical to the old runner's.
+
+**Waiting on a held card.** Every poll (0.2-0.6 s) of every waiting GPU test ran `lslocks` (0.2 s, it scans /proc). That showed up as
+~110 % CPU in `ps` while one -W 3600 suite waited for card 1. Now `lslocks` runs only to name the holder once, the foreign-process check
+reads the 10 s nvidia-smi cache, and after 10 s of waiting the poll is every 2-4 s.
+
+**-c REF by symbol reach.** Under mcc the old rule selected every CUDA-linking binary's tests for any .cu / .cuh edit (266 of 368 for
+a one-line nn_opt.cu change). The DWARF basenames also missed headers without code lines. Now `$BDIR/.srcdeps.map` (`tests/srcdeps.awk`,
+rebuilt when a binary, build.ninja or the runner is newer: 1.5 s) lists, for each binary, the repo files of the objects its own
+objects reach through `nm` references (U and weak w / v: render.c reaches nn_render only weakly), with constructor objects
+(.init_array: fpenv, nn_band, tfx) as roots. Each object's files are its ninja depfile, so headers count too. One-line edits, tests
+selected (of 368):
+
+| file | old | new |
+|---|---|---|
+| src/nn_opt.cu | 266 | 170 |
+| src/nn_gpudec.cu | 266 | 73 |
+| src/nn_render.cu | 266 | 70 |
+| src/train.c | 84 | 68 |
+| src/unet.c | 145 | 131 |
+| src/sample.c | 105 | 91 |
+| tests/test_volcomp.c | 1 | 1 |
+| src/nn.h / nn_common.cuh | all CUDA | 261 / 243 |
+
+The floor is the 82 fast-tier tests that run `ufsm` itself (main reaches every command). New target `test-touched` = `-c` against the
+merge base with origin/master. test_run_suite checks the map on synthetic records.
 
 ## netsplit: which net output channels the unroll needs; normals and density from the phase gradient (2026-11-20, branch netsplit-20261120, unrollperf)
 

@@ -19,6 +19,7 @@ cmake --preset release && cmake --build build -j 8            # build/ufsm by mc
 scripts/toolchain/jit_warm.sh build-verify/test_unet 8        # fill mcudahw's kernel cache before suites / training (cold JIT times tests out)
 cmake --preset verify && cmake --build build-verify --target test   # fast tier: the merge gate. test-slow / test-all: slow tier / both
 SUITE_FLAGS="-j 4 test_fit" cmake --build build-verify --target test # runner options: only tests whose name matches the regex
+cmake --build build-verify --target test-touched   # only the fast-tier tests this branch can affect (run_suite -c merge-base, by symbol reach)
 cmake --build build-verify --target test_lat && build-verify/test_lat   # one test by hand
 cmake --preset arch86 && cmake --build build86                  # Ampere (software MX; sm_86 SASS + PTX); arch86-verify for its suite
 cmake --build build --target doctor                             # the toolchain picked + machine limits (ufsm sysinfo)

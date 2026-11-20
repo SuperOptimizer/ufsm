@@ -664,6 +664,11 @@ foreach(t fast slow all)
     COMMAND bash -c "exec tests/run_suite.sh -B '${_suite_b}' -t ${t} $SUITE_FLAGS"
     DEPENDS test-prep WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} USES_TERMINAL VERBATIM)
 endforeach()
+# test-touched: the fast-tier tests this branch can affect (run_suite -c <merge base with origin/master>, the symbol-reach map): the edit
+# loop's gate before the full tier / a GPU window; a build-system or runner change still selects everything
+add_custom_target(test-touched
+  COMMAND bash -c "b=$(git merge-base HEAD origin/master 2> /dev/null || git merge-base HEAD master) && exec tests/run_suite.sh -B '${_suite_b}' -t fast -c $b $SUITE_FLAGS"
+  DEPENDS test-prep WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} USES_TERMINAL VERBATIM)
 # every suite binary needs a line in tests/suite.txt and every tests/suite.txt binary a target (a merge that added only one half)
 add_custom_target(suite-check
   COMMAND bash ${CMAKE_SOURCE_DIR}/cmake/suite_check.sh ${CMAKE_SOURCE_DIR} "${_suite}"

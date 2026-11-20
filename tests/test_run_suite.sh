@@ -30,4 +30,31 @@ mkdir -p "$D/locks"; flock -x "$D/locks/gpu0.excl" sleep 300 > /dev/null 2>&1 < 
 check "card held exclusively: exit 3" "$(run f -g 0 -F -W 2 '^t_gpu$')" 3
 check "card held exclusively: BUSY" "$(st f t_gpu)" BUSY
 grep -q 'flock -x' "$D/out.f/logs/t_gpu.log" && echo "ok: the holder is named" || { echo "FAIL: no holder in the log"; cat "$D/out.f/logs/t_gpu.log"; fails=$((fails + 1)); }
+# -c's map (tests/srcdeps.awk): a binary depends on the files of the objects its own objects reach through symbols (strong and weak
+# references), constructor objects included; a linked but unreferenced object (b.o) and files outside the repo do not count
+got=$(awk -v R=/r/ -f "$H/tests/srcdeps.awk" <<'EOF' | sort | tr '\n' ' '
+L t CMakeFiles/t.dir/t.o
+L t a.o
+L t b.o
+L t c.o
+L t w.o
+L u a.o
+L u CMakeFiles/u.dir/u.o
+U CMakeFiles/t.dir/t.o fa
+U CMakeFiles/t.dir/t.o fw
+D a.o fa
+D b.o fb
+D w.o fw
+R c.o
+H CMakeFiles/t.dir/t.o /r/tests/t.c
+H a.o /r/src/a.c
+H a.o /r/src/a.h
+H a.o /usr/include/stdio.h
+H b.o /r/src/b.c
+H c.o /r/src/c.cu
+H w.o /r/src/w.cu
+H CMakeFiles/u.dir/u.o /r/tests/u.c
+EOF
+)
+check "srcdeps.awk: reach map" "$got" "t src/a.c t src/a.h t src/c.cu t src/w.cu t tests/t.c u tests/u.c "
 [ $fails = 0 ] && echo "test_run_suite: ok" || { echo "test_run_suite: $fails failure(s)"; exit 1; }
