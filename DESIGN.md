@@ -6,6 +6,58 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Learned input codec, stage 1: no gain over the KLT, volcomp far ahead per byte; stopped (2026-11-19, branch latcodec-20261119, latcodec)
+
+**Question.** Can a learned rate-distortion codec replace the KLT cells of latvol (lead's Task 2 design, approved 11-19), adopted only at
+>= 10 % fewer bytes at equal PSNR or task proxy? Stage 1 only (CPU); the user moved the focus to fibres / rv / ink the same evening, so no stage 2.
+
+**Tool.** `ufsm codec-fit BASIS ROOT GROUP LEVEL` (src/lcodec.{h,c}, lcodec_cli.c): latvol's 24 sample boxes (256^3, sd_ref as latvol);
+even boxes train, odd boxes score. Every arm is scored as latvol / volcomp chunks with tables fitted on the scoring boxes (the same rule for
+all): real stream bytes per box voxel, PSNR over the cells holding a nonzero byte.
+- codec (in the full KLT frame, x = coefficients / sd_ref): the KLT mean index kept (latvol's air rule and DPCM); cl - 1 learned channels
+  y = Wl x[1..63] + W2 silu(W1 f + b1), f = the cell's axes, its centred mean and per 26 neighbours the mean difference and 3 axes (hid 64);
+  linear synthesis S [cl - 1][63], stored as latvol rows (every reader unchanged); a factorised Laplace rate model with noise relaxation;
+  loss R + lambda D, Adam 3000 x 4096 cells, ~3-4 min a codec on 16 threads.
+- tier b (`--hid2 H`): + V2 silu(V1 [q, ctx] + c1) in the synthesis, ctx = the decoded mean indices of the cell and its 26 neighbours.
+- `--volcomp Q,..`: plain volcomp on the same boxes. `gt-trans --lat-codec CODEC.lcd` / `--vc-rt Q`: the task proxy through either.
+- test_latcodec (CPU, 2.4 s): gradients (both tiers) against central differences; at init the codec is the KLT (391 of 655k indices differ
+  by a rounding tie; rows and rebuild identical); the latvol stream round-trips; files; tier b with V2 0 = the linear rebuild.
+
+**PSNR per byte** (bytes saved against the KLT envelope over C 13 / 20 / 29 at the same PSNR, log-interpolated between steps):
+
+| arm | Paris 4 L2 | 1667 L2 | 0139 L0 |
+|---|---|---|---|
+| learned cl 13, lambda 0.002 / 0.004 / 0.008 | +2.7 / -1.4 / -12.8 % | -1.2 / -7.3 / -19.3 % | +4.1 / +4.4 / +3.0 % |
+| learned cl 20, lambda 0.002 / 0.004 / 0.008 | +1.1 / +2.9 / +0.4 % | -2.1 / -0.6 / -6.1 % | -4.5 / +3.3 / +3.0 % |
+| learned cl 29, lambda 0.002 / 0.004 / 0.008 | -8.0 / +2.0 / +2.3 % | -11.0 / -1.9 / +0.2 % | (synthesis rows > 2: not storable) |
+| learned cl 13, lambda 0.001 | (below the KLT range) | (below) | +7.3 % |
+| tier b, cl 20 hid2 32, lambda 0.004 | +8.7 % (0.0495 B/vox, 27.82 dB) | - | - |
+| volcomp q8 / q16 | **+45 % / +52 %** (0.0466 B/vox 30.10 dB; 0.0194, 26.46) | - | - |
+
+At ~0.05 B/vox the KLT ladder gives Paris 4 C 20 step 1.4 0.0562 / 27.99 dB, C 29 step 2.0 0.0443 / 26.71; volcomp q8 0.0466 / 30.10 dB:
+3 dB more at fewer bytes. The learned analysis buys -19 .. +7 % (mostly within +-4 %): with a linear per-cell synthesis the KLT is
+already near the cap; the small nonlinear synthesis adds +8.7 %; volcomp's 3-D transform + context coding is in another class.
+
+**Task proxy** (gt-trans CT peaks per GT turn by normal gap, the CT through each codec; reference rows in "The latent codec keeps the sheet
+separation" above):
+
+| arm (~B/vox, Paris 4 ladder) | P4 0-70 | 70-85 | 85-100 | all | 1667 0-70 | 70-85 | 85-100 | all |
+|---|---|---|---|---|---|---|---|---|
+| raw | 0.523 | 0.740 | 0.871 | 1.044 | 0.454 | 0.674 | 0.784 | 1.541 |
+| KLT 29 step 1.7 (~0.053) | 0.492 | 0.729 | 0.845 | 1.004 | 0.453 | 0.667 | 0.786 | 1.283 |
+| KLT 20 step 1.4 (0.056) | 0.493 | 0.723 | 0.843 | 1.003 | 0.440 | 0.662 | 0.778 | 1.291 |
+| KLT 13 step 1.0 (0.058) | 0.504 | 0.712 | 0.844 | 1.008 | 0.340 | 0.617 | 0.736 | 1.248 |
+| learned tier a cl 20 (0.055) | 0.484 | 0.703 | 0.819 | 0.980 | 0.438 | 0.644 | 0.761 | 1.281 |
+| learned tier b cl 20 (0.050) | 0.490 | 0.711 | 0.838 | 1.004 | 0.439 | 0.653 | 0.760 | 1.444 |
+| volcomp q8 (0.047) | **0.515** | 0.743 | 0.862 | 1.043 | **0.449** | 0.670 | 0.786 | 1.493 |
+| volcomp q4 (0.076) | 0.516 | 0.733 | 0.852 | 1.031 | 0.447 | 0.673 | 0.783 | 1.495 |
+
+(Both learned codecs are Paris 4's, applied to 1667 too.) The proxy agrees with PSNR: at ~0.05 B/vox the learned codecs lose 0.01-0.03
+peaks per turn against the KLT below 100 um; volcomp q8 at fewer bytes stays within 0.008 of raw (the KLT loses 0.03 on P4). Nothing
+reaches the 10 % bar on either axis except volcomp. **Decision (lead, 11-19): stop; no stage 2.** If the latent store's bytes matter again,
+the lever is volcomp-class coding of the cells (3-D transform + context), not a learned per-cell transform; the trunk's own input is not
+the bottleneck (the proxy loss of every codec is small next to the heads' gap). Data: /vesuvius/ufsm/latcodec/{pre,proxy}.
+
 ## Learned sub-cell decoder (--lat-dec): a nonlinear full-resolution output codec on the latent cells (2026-11-19, branch latcodec-20261119, latcodec)
 
 **Why.** The latent net's trunk runs on 4^3-voxel cells (38.4 um at 9.6). Its full-resolution outputs come from three parts:
