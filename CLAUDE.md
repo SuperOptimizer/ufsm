@@ -117,7 +117,12 @@ scripts/test/desk_suite.sh BRANCH   # push to the desk, build and run the suite 
   heavy job per agent. Card-1 GPU tests go into the shared batched slot (inksdk schedules it), scoring runs one job at a time.
 - **Widths** are multiples of 32, or exactly 8 / 16 (else gradients drop to MX-fp8 and the lean level-0 modes switch off).
 - **Disk:** outputs to /vesuvius or the NAS, never ~; delete or move to the NAS what no live run or DESIGN section needs.
-- **No approval prompts.** Don't send compound shell one-liners that need a human to approve (loops / `case` with `rm`, `sed -i`,
-  `mv` on many files): use the Edit tool for file edits, or write the steps to a script under /vesuvius/ufsm/<agent>/ and run that.
+- **No approval prompts.** A prompt from a subagent never reaches the user's web UI: the agent hangs. So never send a command the
+  checker can't verify. Banned in a Bash call: `rm` / `mv` / `sed -i` / `chmod` / `kill` inside loops, `case`, `if`, `&&` chains,
+  pipelines, `$(...)`, `bash -c` / `sh -c` / `zsh -c`, `find -delete` / `-exec rm`, `xargs rm`, globbed deletes. Instead:
+  - edit files with the Edit / Write tools;
+  - delete or move with one plain command per call on literal paths (`rm -r /vesuvius/ufsm/x/old`);
+  - multi-step work: Write a script file under /vesuvius/ufsm/<agent>/ first, then run it as `bash /vesuvius/ufsm/<agent>/x.sh`;
+  - read-only inspection (grep, ls, cat, du, ps, git log / status) may be compound.
   Scripts reference stable links (e.g. /vesuvius/ufsm/bin/ufsm-<agent> → current binary), never worktree paths, so repointing is one
-  `ln -sfn`.
+  `ln -sfn`. If a command of yours ever waits on approval, tell the lead at once.
