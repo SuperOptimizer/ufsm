@@ -21,6 +21,8 @@
 #     -I        incomplete is fine: exit 0 instead of 3 when GPU tests were not run (the edit loop; never a merge gate)
 #     -P        profile: strace marks the tests that open /dev/nvidia* (gpu column "+nv"), nvidia-smi samples their GPU memory
 #     -l        list the selected tests and exit
+#     -X REGEX  leave out the tests whose name matches (e.g. '~(racecheck|memcheck)' on a shared card)
+#     -K TAGS   only the tests carrying one of TAGS (an ERE over tag names, e.g. 'gpu|gpu2': the GPU half alone, for a GPU slot)
 #     -J N      JIT warm-up first: the kernels the selected GPU tests loaded when they last passed (per-test lists in $SUITE_KLOG_DIR,
 #               default ~/.cache/ufsm-suite/klog, recorded by every GPU test through mcudahw's MCUDA_KLOG) are compiled N at a time by
 #               one process (MCUDA_PRECOMPILE=N, MCUDA_PRECOMPILE_ONLY=@list) before any GPU test starts; CPU tests run meanwhile.
@@ -48,9 +50,9 @@ set -u
 H=$(cd "$(dirname "$0")/.." && pwd); cd "$H" || exit 2
 MANIFEST=${SUITE_MANIFEST:-$H/tests/suite.txt}
 TIER=fast; CHANGED=; J=${SUITE_J:-}; T=${SUITE_THREADS:-}; BDIR=build-verify; OUT=; GPUS=; GSLOTS=${SUITE_GPU_SLOTS:-}; TO=1800; PROF=0; LIST=0
-LWAIT=${SUITE_LOCK_WAIT:-300}; NOFOREIGN=0; INCOK=0; WARM=0; KLOGD=${SUITE_KLOG_DIR:-$HOME/.cache/ufsm-suite/klog}
-while getopts "t:c:j:T:B:o:g:G:x:W:J:FIPlh" o; do case $o in
-  J) WARM=$OPTARG;;
+LWAIT=${SUITE_LOCK_WAIT:-300}; NOFOREIGN=0; INCOK=0; WARM=0; KLOGD=${SUITE_KLOG_DIR:-$HOME/.cache/ufsm-suite/klog}; EXCL=; ONLYTAG=
+while getopts "t:c:j:T:B:o:g:G:x:W:J:X:K:FIPlh" o; do case $o in
+  J) WARM=$OPTARG;; X) EXCL=$OPTARG;; K) ONLYTAG=$OPTARG;;
   t) TIER=$OPTARG;; c) CHANGED=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; B) BDIR=$OPTARG;; o) OUT=$OPTARG;; g) GPUS=$OPTARG;; G) GSLOTS=$OPTARG;;
   x) TO=$OPTARG;; W) LWAIT=$OPTARG;; F) NOFOREIGN=1;; I) INCOK=1;; P) PROF=1;; l) LIST=1;; *) sed -n '2,40p' "$0"; exit 2;; esac; done
 shift $((OPTIND - 1)); FILTERS=("$@")
@@ -103,6 +105,8 @@ while IFS= read -r line; do
   [ $TIER = slow ] && [ $s = 0 ] && continue
   [ $TIER = smoke ] && { case ",$tg," in *,smoke,*) ;; *) continue;; esac; }
   if [ ${#FILTERS[@]} -gt 0 ]; then m=0; for f in "${FILTERS[@]}"; do [[ $n =~ $f ]] && m=1; done; [ $m = 0 ] && continue; fi
+  [ -n "$EXCL" ] && [[ $n =~ $EXCL ]] && continue
+  [ -n "$ONLYTAG" ] && ! [[ ",$tg," =~ ,($ONLYTAG), ]] && continue
   [ -n "${TAGS[$n]+x}" ] && { echo "run_suite: duplicate test name $n" >&2; exit 2; }
   NAMES+=("$n"); TAGS[$n]=$tg; EST[$n]=${es:-10}; CMD[$n]=$cm
 done < "$MANIFEST"
