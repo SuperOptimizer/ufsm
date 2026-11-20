@@ -6,6 +6,50 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+
+## netsplit: which net output channels the unroll needs; normals and density from the phase gradient (2026-11-20, branch netsplit-20261120, unrollperf)
+
+The user's goal: break the shared trunk into small single-target full-resolution nets with at most 4 output channels each, so the
+three-buffer memory mode applies. Step 1 is to find out which of today's ~24 output channels production reads, and which could be
+computed from another output.
+
+**Inventory (code read, master 2026-11-20; unroll.sh defaults, FKIND=lat fit fields `pc ps t0..t5 sp w dz dy dx dq`).**
+
+| channel (cout) | exported as | production consumers | verdict |
+|---|---|---|---|
+| phase cos / sin (2) | `pc ps` (mean 2 sigma - 1 over material; the length is the confidence) | the slab fit's data term; phase gate; count-field ref (phase-gradient targets, `--phase-w 0.5`); merge-flag (phasor products -> mf -> ref `--mf-w 1`); recto-sp; fit-join sample cells; wrap-check; wrap-snap `--target mix`; unroll-qa | **needed** |
+| normal n n^T (6) | `t0..t5` (zz yy xx, 0.5 + zy zx yx) | the fit's normal term (w_normal 3); count-field ref's count direction (principal axis + gates); phase gate \|n.r\|; recto-sp profile direction; wrap-check tdn; unroll-qa tilt | used; derivable? (below) |
+| density (1) | `sp` = 8 / (h rho) | the fit's density / nondegeneracy term; count-field ref magnitude rho = 8 / sp; phase gate expected rate; merge-flag S9 / S5; recto-sp (blended); wrap-check; wrap-snap spacing | used; derivable? (below) |
+| winding mod 4 (2) | `dz dy dx dq` | unroll-qa's warn-only gate only: `fit --wind4-weight` defaults 0; `--uw-rep-w4` needs `--uw-repair` (unroll passes 0); the `fit_dir_w4` hand vote never runs because unroll always passes `--dir` | **not consumed: cut** |
+| ink (1) | `--heads ink` | INKMODE=lat only (opt-in); production ink is reader3, a separate 2-D-teacher net | separate ink net |
+| recto / verso (2) | `--heads rv`, c12 / c13 | INKMODE=lat's ink gate only | research (rvsep: no counting lever) |
+| fibre H / V (2), dyad (6), family (1) | `fib/H fib/V fib/dyad fib/fam` | fiber-trace, univ eval, gt-trans; `fit --w-fib` defaults 0; fam has no reader | separate fibre net (H / V; dyad if tracing needs it) |
+| pad rows, cond, pap-head, distill, legacy tasks | none | training only | cut |
+
+`w` (material fraction) and `ct / cs` are not network outputs: predict computes them from the CT.
+
+**Derivability.** `ufsm fields-derive IN OUT [--normal 1] [--density 1] [--r 2] [--stats 1]` (src/fieldsderive.c,
+test_fieldsderive) rewrites a fit-field set:
+- Per material cell, it takes the phase gradient g (radians per cell) from central differences of the phasor (`arg(conj(z-) z+) / 2`;
+  one-sided where a neighbour has no phase), with weight |z|^2 / 127^2.
+- Over a (2r + 1)^3 box: T = sum c n n^T / sum c, and G = sum c |g| / sum c.
+- It encodes them as predict does: t from T, and sp = 16 pi / G (one phase turn per wrap). The other planes are links to IN.
+- test: a planar phase of known normal and period comes back within 3 codes on every plane.
+
+Agreement with the network's own heads on 1667 q2 (try9 lat fields, 3.97 G material cells, weight |phasor|^2):
+
+| box r | \|cos\| net normal vs phase-gradient normal: mean / p10 / median / share >= 0.95 | sp phase / sp net: p10 / median / p90 |
+|---|---|---|
+| 1 | 0.983 / 0.97 / 0.99 / 0.955 | 0.889 / 1.157 / 1.729 |
+| 2 | 0.987 / 0.98 / 0.99 / 0.970 | 0.901 / 1.157 / 1.682 |
+
+- The normal head is, to within a few degrees, the direction of the phase gradient.
+- The density head is not the magnitude of the phase gradient. The phase advances a median 14 % fewer turns than the density head
+  counts, and 10 % of cells are 1.7x sparser. This fits the phase merging sheets (packed regions) where the density head still
+  counts them.
+
+Ablations (the production ref and GT ids on the 54 1667 GT boxes, CPU) follow below as they land.
+
 ## 3-D ink readout check: the score path holds (depth 4 > reader3); the desk ink run T9C had a frozen head (2026-11-20, branch inkctl-20261120)
 
 The ink retrain from the cooled try9 (T9C, desk card 0, teacher-first sources, --lat-sub ink, P 768) scored held-out AUC 0.530 / 0.568 /
