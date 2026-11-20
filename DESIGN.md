@@ -6,6 +6,66 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Layer fibre orientation in the CT does not separate touching sheets at 2.4 um either (2026-11-19, branch orient-20261119, mergeflag)
+
+**Question (user via lead).** Each sheet is a recto layer (horizontal fibres) on a verso layer (vertical fibres). At 2.4 um, does
+the dominant in-plane fibre direction in the raw CT alternate H -> V -> H -> V once per sheet, even through contacts where density
+shows a single papyrus run? Gate: >= 0.9 V -> H flips per GT turn below 70 um normal gap, with a low false rate in open sheets.
+
+**Tool.** `gt-trans --orient SIG,RHO` (src/gttrans.c) uses the same rays, GT intervals and normal-gap rule as the CT-peaks and rv
+rows ("Recto / verso and fibre direction do not separate touching sheets either"). It needs no net:
+- The 3-D structure tensor of the CT: gaussian derivative SIG, integration RHO, in CT voxels. It is computed per box plane on 128^2
+  tiles from one z stack; tiles with no CT or no GT codes are skipped.
+- The tensor is projected on the plane of z (the scroll axis) and the sheet's in-slice tangent, taken from the GT label's normal
+  rather than the ray. With the ray, oblique sheets would leak their own faces into the tangential gradient.
+- A sample is H when the gradient lies along z (fibres along the tangent), V when it lies along the tangent. It needs coherence
+  >= `--orient-coh` and |cos 2a| > `--orient-margin`; otherwise it keeps the last state.
+- `--orient-persist UM`: a new state counts only once it has held over UM of classified samples (lead: about 1/3 of a sheet).
+- `--ct-l` / `--ct-p` scale the CT detector's windows. At 2.4 um it runs at equal physics (4.8 / 48 / 96), as in "Packed sheets are
+  not resolved by finer CT".
+- test_gttrans builds textured recto (z stripes) / verso (arc stripes) layers, 5 voxels each, packed in contact and spaced. It
+  counts 1.000 V -> H per GT turn in both, and 0.92 / 1.00 with a 20 um persistence.
+
+**Runs.** Paris 4 PH1-3 and HOLD (q-9p6 codes, --nz 8) and J1-34 (July codes B, --nz 4 at 2.4 um).
+- 2.4 um: L0 from the NAS (volcomp mount). 9.6 um control: level 2.
+- Base: sigma 1.5 / rho 2 voxels. Strict: coherence 0.5, margin 0.5.
+- PH + HOLD at 2.4 um swept coherence {0.2, 0.5} x persistence {8, 16, 25 um}; each arm ~1.6 min on 6 threads.
+- Columns below: V -> H flips per GT turn; "off" is the share of intervals with |flips - turns| >= 0.5. In the open sheets
+  (normal gap >= 150 um), flips per mm of normal path and the excess (flips - turns) per mm, i.e. the false rate.
+- The H -> V direction is within +-0.05 of V -> H everywhere.
+
+| arm | box | < 50 | 50-70 | < 70 | off < 70 | >= 150 /turn | /mm | excess /mm |
+|---|---|---|---|---|---|---|---|---|
+| CT peaks 2.4 um (b) | PH / HOLD | 0.42 / 0.39 | 0.71 / 0.58 | 0.61 / 0.56 | | | | |
+| 2.4 base | PH | 0.71 | 1.17 | **1.01** | 0.53 | 2.85 | 13.9 | 9.1 |
+| 2.4 base | HOLD | 0.45 | 0.59 | 0.57 | 0.53 | 1.92 | 9.9 | 4.7 |
+| 2.4 base | J | 0.32 | 0.81 | 0.57 | 0.60 | 2.31 | 10.4 | 5.9 |
+| 2.4 coh 0.2, persist 8 | PH / HOLD | 0.54 / 0.32 | 0.87 / 0.47 | 0.76 / 0.45 | 0.54 / 0.59 | 2.12 / 1.46 | 10.4 / 7.5 | 5.5 / 2.4 |
+| 2.4 coh 0.2, persist 16 | PH / HOLD | 0.36 / 0.23 | 0.57 / 0.34 | 0.50 / 0.33 | 0.60 / 0.68 | 1.36 / 0.99 | 6.6 / 5.1 | 1.8 / -0.0 |
+| 2.4 coh 0.2, persist 25 | PH / HOLD | 0.23 / 0.21 | 0.35 / 0.21 | 0.31 / 0.21 | 0.72 / 0.79 | 0.79 / 0.63 | 3.9 / 3.2 | -1.0 / -1.9 |
+| 2.4 strict (coh 0.5) | PH / HOLD | 0.36 / 0.22 | 0.56 / 0.32 | 0.49 / 0.31 | 0.61 / 0.70 | 1.31 / 0.94 | 6.4 / 4.8 | 1.5 / -0.3 |
+| 2.4 strict | J | 0.14 | 0.40 | 0.27 | 0.75 | 1.09 | 4.9 | 0.4 |
+| 2.4 coh 0.5, persist 8 | PH / HOLD | 0.27 / 0.20 | 0.41 / 0.23 | 0.36 / 0.23 | 0.69 / 0.77 | 0.92 / 0.70 | 4.5 / 3.6 | -0.4 / -1.6 |
+| 2.4 coh 0.5, persist 16 | PH / HOLD | 0.19 / 0.15 | 0.28 / 0.17 | 0.25 / 0.17 | 0.77 / 0.83 | 0.59 / 0.50 | 2.9 / 2.6 | -2.0 / -2.6 |
+| 9.6 control, base | PH / HOLD / J | 0.17 / 0.13 / 0.08 | 0.28 / 0.17 / 0.22 | 0.24 / 0.16 / 0.15 | 0.77 / 0.84 / 0.85 | 0.64 / 0.51 / 0.57 | 3.1 / 2.6 / 2.6 | -1.8 / -2.6 / -1.9 |
+
+**Gate: not met.**
+- Without filtering, PH reaches 1.01 per turn below 70 um. That is the noise rate, not the layers. The base arm flips at a constant
+  ~1.8-1.9 per 100 um of normal path in every gap bucket (< 50 through >= 115: 1.89 / 1.92 / 1.82 / 1.80 / 1.72 / 1.49). In open
+  sheets this gives 2.85 flips per turn and 9 false flips per mm.
+- Coherence and persistence remove the false flips. Every setting that brings the open-sheet excess to about 0 (PH: coh 0.5 /
+  persist 8; HOLD: coh 0.2 / persist 16 or strict) leaves 0.23-0.36 per turn below 70 um. That is below the CT peaks there
+  (0.56-0.61) and below the rv head (0.25-0.45, previous section).
+- Even at the zero-excess settings, the open-sheet "off" share is 0.5-0.7. The surviving flips do not fall one per interval; they
+  only average out.
+- 9.6 um has no orientation signal at contacts: 0.15-0.24 per turn below 70 um.
+
+**Reading.** At 2.4 um the CT's texture direction inside the papyrus changes about every 50 um at any spacing. That is fibre bundles,
+cracks and noise, not a clean recto / verso alternation. Once that is suppressed, the per-sheet alternation is not there to count,
+even in open sheets. With the CT peaks (section "Packed sheets are not resolved by finer CT") and try9's rv / fibre heads, this is the
+third signal that fails the contact gate. No CT-side measure here separates touching sheets at 2.4 um. Data and scripts:
+/vesuvius/ufsm/wgraph/orient (full.sh, pers.sh, bk.awk; one tsv per arm).
+
 ## Fully adaptive Muon, part 2: online kappa for DoG, autocool, DoWG (2026-11-19, branch admuon2-20261119, trainperf) -- CODE + TESTS, GPU A/B pending
 
 The 11-14 DoG collapse (eta 1.6 % of the lr by update 80) came from its fixed random-walk factor kappa = (1 + b) / (1 - b) (39 at
