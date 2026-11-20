@@ -1380,10 +1380,16 @@ static void skip_ab(unet *u, const void *x2, shape5 xn, int h16, uint8_t *ctd, i
             m[0] > 0 ? e[0] / m[0] : 0, mx[0], n[0] ? (double)same[0] / n[0] : 0, n[0] ? (double)flip[0] / n[0] : 0, m[1] > 0 ? e[1] / m[1] : 0, mx[1], n[1] ? (double)same[1] / n[1] : 0, n[1] ? (double)flip[1] / n[1] : 0);
     free(hct); free(mat); free(A); free(Bm);
 }
+/* a run that returns 0 with a CUDA error pending (a window path that did not check, a writer thread's failure after the last check) fails:
+   inksdk 11-20 scored boxes whose predict stopped on a device OOM as done (the predict stop path now also exits 1; this is the backstop) */
+static int pred_rc(int rc) {
+    const char *e = rc ? nullptr : nn_check();
+    if (e) { fprintf(stderr, "predict: a CUDA error was pending at the end of the run (%s): failing (exit 1)\n", e); return 1; }
+    return rc;
+}
 int cmd_predict(int argc, char **argv) {
     const char *bf = opt(argc, argv, "--boxes", nullptr);
-    if (!bf) return predict_one(argc, argv);
-    if (argc < 6) return predict_one(argc, argv);   /* (the usage) */
+    if (!bf || argc < 6) return pred_rc(predict_one(argc, argv));   /* (argc < 6: the usage) */
     FILE *f = fopen(bf, "r"); if (!f) { fprintf(stderr, "predict --boxes: cannot open %s\n", bf); return 1; }
     char ln[8192]; int nbox = 0, rc = 0; const double t0 = now();
     nn_pool_on();
@@ -1403,7 +1409,7 @@ int cmd_predict(int argc, char **argv) {
         const double tb = now();
         fprintf(stderr, "predict --boxes: box %d: %s -> %s\n", nbox + 1, tok[0], tok[1]);
         pred_reset_statics(); unet_reset_statics();
-        rc = predict_one(ac, av);
+        rc = pred_rc(predict_one(ac, av));
         nn_pool_box_end();
         free(av); nbox++;
         fprintf(stderr, "predict --boxes: box %d done in %.2f s (rc %d)\n", nbox, now() - tb, rc);
@@ -3463,6 +3469,7 @@ static int predict_one(int argc, char **argv) {
         for (int k = 0; k < ffz_np; k++) { z3w_close(ffzw[k]); free(ffsl[k]); }
         free(ffw.done); free(ffw.rg.own); free(ffw.sdone);
         nn_free(ffacc); nn_free(ffacc4); nn_free(ff8d); nn_host_free(ff8h);
+        { const char *e = nn_check(); if (e) { fprintf(stderr, "cuda: %s (no fields.json: the field set stays incomplete)\n", e); return 1; } }
         char p[1400]; if (nwork > 1) snprintf(p, sizeof p, "%s/fields.json.w%d", ffz, part); else snprintf(p, sizeof p, "%s/fields.json", ffz);   /* (workers: the parent renames one) */
         if (ffz_json(p, bo, bn, ffF, ffh, um * (1 << level), ffu2, ffw4d, &ax, level)) return 1;
         if (nwork <= 1) { snprintf(p, sizeof p, "%s/fields.partial.json", ffz); remove(p); }
@@ -3489,6 +3496,7 @@ static int predict_one(int argc, char **argv) {
             nn_fit_finalize_w4(ffacc4, ffn, d4); nn_sync(); for (int k = 0; k < 4; k++) nn_d2h(a14[10 + k], d4 + k * ffn, ffn);
             nn_free(d4); nn_free(ffacc4);
         }
+        { const char *e = nn_check(); if (e) { fprintf(stderr, "cuda: %s (the fit fields are not written)\n", e); return 1; } }
         const int saved = fit_fields_save_ex(ffd, org, ffF, ffh, um * (1 << level), a14, ffw4d, recto, cyb, cxb, na); free(recto);
         for (int k = 10; k < 14; k++) free(a14[k]);
         if (saved) { fprintf(stderr, "predict: cannot write the fit fields to %s\n", ffd); return 1; }
