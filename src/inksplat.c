@@ -312,7 +312,7 @@ static void *splat_worker(void *arg) {
             if (z3_read(J->old, so, n, buf, 2)) { atomic_store(&J->failed, 1); break; }
             have_old = 1;
         }
-        if (!have_old) memset(buf, 255, sv);
+        if (!have_old) memset(buf, c->unknown, sv);
         uint64_t ni = 0, nn = 0, nr = 0, nh = 0, nx = 0, cm[2][2] = {{0, 0}, {0, 0}}, vh[255] = {0}; int any = 0;
         for (int ci = 0; ci < NCS * NCS * NCS; ci++) {
             acc *ac = A[ci]; if (!ac) continue;
@@ -337,7 +337,7 @@ static void *splat_worker(void *arg) {
                 const int isink = ac->ni[k] && ac->ni[k] >= c->thr * h;
                 const uint8_t v = (uint8_t)(((isink ? ac->pi[k] : ac->pn[k]) * 254 + 127) / 255);
                 const size_t bi = ((size_t)(z - so[0]) * SH + (size_t)(y - so[1])) * SH + (size_t)(x - so[2]);
-                buf[bi] = buf[bi] == 255 ? v : (buf[bi] > v ? buf[bi] : v); vh[v]++;
+                buf[bi] = buf[bi] == c->unknown ? v : (buf[bi] > v ? buf[bi] : v); vh[v]++;
                 if (isink) ni++; else nn++;
                 if (pb && pb[k] != c->pred_skip) cm[v >= 127][pb[k] >= c->pred_thr]++;
                 cany = 1;
@@ -509,7 +509,7 @@ void inksplat_defaults(inksplat_cfg *c) {
     memset(c, 0, sizeof *c);
     c->label_z = c->mask_z = -1; c->band_a = -4; c->band_b = 4; c->layer_vox = 1; c->thr = 0.5; c->coarse = -1; c->threads = 6;
     c->face_a = -6; c->face_b = 0; c->face_lo = -6; c->face_hi = 20; c->face_run = 3; c->face_gap = 2;
-    c->iso = 1; c->pred_level = -1; c->pred_thr = 128; c->pred_skip = -1; c->stride = 4;
+    c->iso = 1; c->unknown = 255; c->pred_level = -1; c->pred_thr = 128; c->pred_skip = -1; c->stride = 4;
 }
 
 static int mkdir_p(const char *path) {
@@ -879,7 +879,7 @@ static int splat_points(const inksplat_cfg *c, const char *path, double radius_u
     for (size_t i = 0; i < n && !rc;) {
         size_t e = i; while (e < n && E[e].key == E[i].key) e++;
         const int64_t key = E[i].key, so[3] = {key / (ns[1] * ns[2]) * SH, key / ns[2] % ns[1] * SH, key % ns[2] * SH}, sn[3] = {SH, SH, SH};
-        if (old && z3_shard_present(old, so[0] / SH, so[1] / SH, so[2] / SH) == 1) { if (z3_read(old, so, sn, buf, 4)) rc = 1; } else memset(buf, 255, (size_t)SH * SH * SH);
+        if (old && z3_shard_present(old, so[0] / SH, so[1] / SH, so[2] / SH) == 1) { if (z3_read(old, so, sn, buf, 4)) rc = 1; } else memset(buf, c->unknown, (size_t)SH * SH * SH);
         for (size_t k = i; k < e && !rc; k++) {
             if (k + 1 < e && E[k + 1].idx == E[k].idx) continue;   /* the largest value of a voxel is last */
             const uint32_t id = E[k].idx; const int z = (int)(id / (SH * SH)), y = (int)(id / SH % SH), x = (int)(id % SH);
@@ -888,7 +888,7 @@ static int splat_points(const inksplat_cfg *c, const char *path, double radius_u
                             if (z3_read(ct, co, cn, ctc[cc], 4)) { rc = 1; break; } }
             const uint8_t cv = ctc[cc][(((size_t)(z & 127) * CH) + (y & 127)) * CH + (x & 127)];
             if (!cv || cv < c->iso) { nrej++; continue; }
-            buf[id] = buf[id] == 255 ? E[k].v : (buf[id] > E[k].v ? buf[id] : E[k].v);
+            buf[id] = buf[id] == c->unknown ? E[k].v : (buf[id] > E[k].v ? buf[id] : E[k].v);
             if (E[k].v) nink++; else nno++;
         }
         for (int cc = 0; cc < NCS * NCS * NCS; cc++) { free(ctc[cc]); ctc[cc] = nullptr; }
@@ -912,7 +912,7 @@ int cmd_ink_splat(int argc, char **argv) {
     if (argc < 3 || ci < 0 || ci + 2 >= argc) {
         fprintf(stderr, "usage: ufsm ink-splat <out-group|-> --surface TIFXYZ --labels L [--mask M] [--val V --val-mode exclude|only] --ct ROOT KEY --ct-um U [--level 0] --iso I\n"
                         "         [--band A,B (layers, -4,4)] [--layer-vox 1] [--flip] [--thr 0.5] [--label-z Z] [--label-scale F] [--label-offset r,c] [--crop c0,r0,w,h]\n"
-                        "         [--merge] [--coarse N] [--name NAME] [--summary JSON] [--preview JPG] [--pyramid-only] [--exclude z,y,x,nz,ny,nx (level-0, repeatable)]\n         ufsm ink-splat <out-group> --points VC3D.json --radius-um 5 --ct ROOT KEY --ct-um U [--level 0] --iso I [--merge]   (3D point labels) [--threads 6] [--cache DIR]\n"
+                        "         [--merge] [--unknown 255] [--coarse N] [--name NAME] [--summary JSON] [--preview JPG] [--pyramid-only] [--exclude z,y,x,nz,ny,nx (level-0, repeatable)]\n         ufsm ink-splat <out-group> --points VC3D.json --radius-um 5 --ct ROOT KEY --ct-um U [--level 0] --iso I [--merge]   (3D point labels) [--threads 6] [--cache DIR]\n"
                         "         [--pred ROOT KEY [--pred-level L] [--pred-thr 128] [--pred-skip V] [--profile T] [--stride 4]]\n"
                         "         [--face A,B [--face-search -6,20] [--face-run 3] [--face-gap 2]]   (the band per pixel relative to the open face on +N)\n"
                         "  L / M: a .tif / .png, or a zarr array dir (v3 2-D, v2 3-D at --label-z), local or https; '-' as out: profile only\n");
@@ -929,7 +929,7 @@ int cmd_ink_splat(int argc, char **argv) {
     if (sscanf(sopt(argc, argv, "--label-offset", "0,0"), "%lf,%lf", c.label_off, c.label_off + 1) != 2) { fprintf(stderr, "ink-splat: --label-offset r,c\n"); return 2; }
     const char *cr = sopt(argc, argv, "--crop", nullptr);
     if (cr && sscanf(cr, "%d,%d,%d,%d", c.crop, c.crop + 1, c.crop + 2, c.crop + 3) != 4) { fprintf(stderr, "ink-splat: --crop c0,r0,w,h\n"); return 2; }
-    c.merge = sflag(argc, argv, "--merge"); c.coarse = opt_atoi("--coarse", sopt(argc, argv, "--coarse", "-1")); c.name = sopt(argc, argv, "--name", nullptr); c.summary = sopt(argc, argv, "--summary", nullptr); c.preview = sopt(argc, argv, "--preview", nullptr);
+    c.merge = sflag(argc, argv, "--merge"); c.unknown = opt_atoi("--unknown", sopt(argc, argv, "--unknown", "255")); c.coarse = opt_atoi("--coarse", sopt(argc, argv, "--coarse", "-1")); c.name = sopt(argc, argv, "--name", nullptr); c.summary = sopt(argc, argv, "--summary", nullptr); c.preview = sopt(argc, argv, "--preview", nullptr);
     c.threads = ufsm_threads(opt_atoi("--threads", sopt(argc, argv, "--threads", "0")), 6); c.cache = sopt(argc, argv, "--cache", nullptr);
     for (int i = 2; i + 1 < argc; i++) {
         if (strcmp(argv[i], opt_n("--exclude"))) continue;

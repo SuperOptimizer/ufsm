@@ -5976,6 +5976,9 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
             inh_add(u, u->head.w + co * row, row); inh_add(u, u->head.b + co, 1);
         }
         n++;
+    } else if (u->head.k == o->head.k && u->head.cin != o->head.cin && u->enc[0].c2.cout != o->enc[0].c2.cout) {   /* a narrower / wider level 0 than the
+        donor's (2026-11-20, a 16-wide level 0 from wind96's 32): level 0 starts fresh, so the head over it does too (the caller's row resets still apply) */
+        fprintf(stderr, "init-from: the head reads %d level-0 channels, the donor's %d: the whole head starts fresh\n", u->head.cin, o->head.cin);
     } else { unet_free(o); return -1; }
     const size_t nfu = (u->fstem_off ? u->fstem_off : u->np) - u->film_off, nfo = (o->fstem_off ? o->fstem_off : o->np) - o->film_off;   /* (the FiLM block: before the stem) */
     if (!S && u->cfg.film && oc.film == u->cfg.film && u->film_off && nfo == nfu) {   /* the donor's FiLM pairs (same widths) */

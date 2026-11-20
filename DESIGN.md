@@ -57,6 +57,96 @@ device peak before it changes; the s2b gy overlap copy workspace (0.96 GB at P 7
 Not done: level-0 slab rings under lean 2 (the only way to P >= 768 at a 32-wide level 0, +30 % step in October), one window over both cards
 (--split z exists; the ink head refuses it outside --lat 4).
 
+## 3-D ink readout check: the score path holds (depth 4 > reader3); the desk ink run T9C had a frozen head (2026-11-20, branch inkctl-20261120)
+
+The ink retrain from the cooled try9 (T9C, desk card 0, teacher-first sources, --lat-sub ink, P 768) scored held-out AUC 0.530 / 0.568 /
+0.594 / 0.628 at steps 500 / 1000 / 2000 / 3000 on the 1667 pairwrap (reader3 0.858). Before blaming the net or the path, two controls.
+
+**Readout path: the training target scored through score.sh's path.** The 39 human label windows of 1667 were splatted to 3-D exactly as
+the trainer's onfly target (ink-splat, face -6..0, iso 64, level 2 = 9.596 um), then rendered on the 17 scored wraps, gated (img-gate
+c12 / c13) and scored with pairwrap2.
+
+| target volume | render | heldout | hold |
+|---|---|---|---|
+| splat, unknown = 255 (ink-splat default) | --depth 1 | 0.569 | 0.585 |
+| splat, --unknown 0 (new) | --depth 1 (score.sh until 11-20) | 0.798 | 0.803 |
+| splat, --unknown 0 | --depth 4 | 0.886 | 0.886 |
+| reader3 2-D maps (reference) | | 0.858 | 0.862 |
+
+- The 255 artefact: render reads ink-splat's unknown byte (255) as ink wherever a wrap passes unlabelled voxels. `ink-splat --unknown V`
+  writes another byte, 0 for a clean 0 / 254 target.
+- The depth-1 ceiling: the wraps sit a median 22 um (p90 77 um) from the label meshes, 2-8 voxels at 9.6 um. The label band is 6 voxels
+  on one side of the open face, so a one-voxel read misses part of it.
+- score.sh now renders with DEPTH (default 4), the max over +-4 voxels along the normal. Every 3-D ink score before 11-20 (inkpod 0.58,
+  arm B 0.54, T9C) was read at depth 1.
+
+**The net: frozen head.**
+- ink-audit on T9C's step-500 volume, in 3-D at the training-label voxels (no render): TRAIN AUC 0.584 at shift 0, the raw CT's own
+  0.595; HOLD 0.578. Ink / no-ink medians differ by 1 byte.
+- The optimizer line showed head W rms 4.542e-02 at step 11 and 4.542e-02 at step 2991.
+- Cause: trainarm.sh's u1-era smoke recipe, AdamW 1e-4 and Muon 0.002 x --trunk-lr-mult 0.2 = 4e-4 (try9: 3e-4 / 3e-3, 7.5x more on
+  the trunk). The new sub-cell ink rows start at zero and stayed there.
+- Fix arm T9F (running): try9's optimizer (no trunk mult, warmup 200, --init-lr-mult 0.3 for 2000 steps), --ink-lambda 3.
+  Gates: head W rms moves by step 300, ink-audit TRAIN >= 0.70 at 500, held-out (depth 4) >= 0.70 at 1000.
+## Fibre tracing toward mm-long, sheet-faithful fibres: fibhv-d + dyad + a sheet gate (2026-11-20, branch fibtrace-20261119, latcodec)
+
+Goal: fibres long and sheet-faithful enough for a fibre unwind and for count-field fibre ties (Paris 4 AFV ties gave +0.04 / +0.03
+GT ids). 1667 has no AFV set. New tools: `ufsm fiber-match OURS REF` (recall / precision against a reference fibre set,
+resampled every 10 um, 30 um reach, 30 degrees; "runs" = how far one of our lines follows one reference fibre; per-family lens:
+arc-median, share >= 1 / 2 mm), `fiber-trace --sheet FITSET | --sheet-phase ROOT KEY` (the line may not leave its start sheet:
+W unwrapped along the line, stop at |W - W0| > --sheet-tol 0.15 turn; field direction projected into the sheet plane; Newton
+pull-back onto W0; `--gap-mm G` carries the smoothed direction through up to G of weak support, resuming only where the field
+agrees), `--family-dir` (in gaps half the step along the family's in-sheet direction), `scripts/fibers/fibtrace_eval.sh`.
+
+Paris 4 HOLD (level-2 box 12288,4096,3584 + 512,576,768, ~5 x 5.5 x 7.4 mm). Reference: the open spiral AFV set (native 2.4 um;
+HOLD lies outside Paris4_1mm_v2). Sheet changes: fiber-judge --phase against GT phaseA. H / V per cell:
+
+| source / arm | persistent changes / m | >= 1 mm | >= 2 mm | recall | precision | runs arc-median |
+|---|---|---|---|---|---|---|
+| try9 cooled fibre head (window 640), tube | 8.5 / 31 | 0.155 / 0.366 | 0.011 / 0.066 | 0.04 / 0.22 | 0.03 / 0.07 | 0.09 / 0.14 mm |
+| fibhv-d 30000, tube axis | 55.6 / 173 | 0.143 / 0.100 | 0.013 / 0.003 | 0.41 / 0.30 | 0.23 / 0.17 | 0.27 / 0.26 mm |
+| fibhv-d 30000, dyad axis | 40.9 / 94.4 | 0.096 / 0.126 | 0.001 / 0.002 | 0.69 / 0.79 | 0.40 / 0.34 | 0.34 / 0.33 mm |
+| dyad, support 0.1 | 45.2 / 110.8 | 0.189 / 0.251 | 0.008 / 0.016 | 0.85 / 0.93 | 0.39 / 0.33 | 0.31 / 0.28 mm |
+| dyad, W gate (rg96R0 HOLD fit), gaps 0.3 mm (W3) | **4.0 / 7.6** | **0.658 / 0.486** | 0.275 / 0.127 | **0.88 / 0.87** | 0.38 / 0.32 | 0.21 / 0.21 mm |
+| W3 + --family-dir | 3.9 / 7.7 | 0.548 / 0.430 | 0.169 / 0.081 | 0.86 / 0.85 | 0.37 / 0.32 | 0.21 / 0.22 mm |
+| dyad, GT-phase gate (oracle), gaps 0.3 mm | 0 / 0.1 | 0.579 / 0.546 | 0.196 / 0.181 | 0.80 / 0.79 | 0.40 / 0.33 | 0.24 / 0.22 mm |
+| GT oracle, gaps 0.6 mm, --family-dir, --turn 45 | 0 / 0 | 0.630 / 0.654 | 0.224 / 0.257 | 0.81 / 0.81 | 0.33 / 0.26 | 0.22 / 0.22 mm |
+
+(fibhv-d 27000 dyad for reference: recall 0.50 / 0.76, precision 0.39 / 0.33.)
+
+- fibhv-d 30000 + dyad is the fibre source; try9's fibre head marks sheet layers (sheet-faithful, but 0.04 / 0.22 recall), dropped.
+- Ungated lines end on support (17.7k / 22.6k of the line ends), not on turns: the predicted fibre fades every ~0.6 mm.
+- The sheet gate + 0.3 mm gap carry is the lever: >= 1 mm share x5-7, sheet changes / m / 10, recall up (the bridged lines reach
+  reference fibres the short pieces missed). Lines now end mostly at the box (12k H ends): HOLD's size caps the lengths.
+- Runs on one reference fibre fall 0.34 -> 0.21 mm: across a gap a line lands on a neighbouring fibre of the same sheet. For
+  count-field ties that is still a valid same-sheet tie (lead: judge by sheet changes, >= 1 mm, recall; runs reported only).
+- --family-dir hurts in every arm (off).
+- Gaps up to 0.6 mm with the W gate (W6): >= 1 mm 0.792 / 0.698, >= 2 mm 0.433 / 0.295, recall 0.90 / 0.91, but precision
+  0.32 / 0.25 and 6.5 / 11.7 changes / m (W3: 4.0 / 7.6): longer at a higher hop rate; W3 stays the rule winner.
+- `--sheet-tol` is inert in the steered gate: the in-plane projection + the Newton pull-back hold every point on the seed's W, so
+  no line ever drifts to the tolerance (W3: 0 sheet stops; tol 0.45 gives a byte-identical .fib). Steered lines follow the fit's W
+  by construction. `--sheet-steer 0` makes W a cut only (no projection, no pull-back; drift > tol ends the line):
+  tol 0.45 + gaps 0.3 mm = 24.9 / 65.7 changes / m, >= 1 mm 0.647 / 0.504, recall 0.92 / 0.96, precision 0.44 / 0.37.
+- Gate-free continuity from the CT (`--sheet-ct ROOT KEY`: level-2 CT, 3^3 blur, structure-tensor normal over 5^3, steps
+  projected into the sheet plane, a ridge climb along the normal of at most a voxel a step, ends where no ridge lies within
+  --ct-r or its contrast stays below --ct-con past the gap allowance) does NOT hold the sheet on Paris 4 HOLD:
+  | arm | changes / m | >= 1 mm | recall |
+  |---|---|---|---|
+  | CT ridge, no gaps | 60.3 / 156.5 | 0.061 / 0.104 | 0.25 / 0.34 |
+  | CT ridge, gaps 0.3 mm | 78.0 / 210.7 | 0.712 / 0.736 | 0.87 / 0.92 |
+  | CT ridge, gaps 0.3 mm, --ct-r 2 --ct-con 4 | 68.2 / 191.3 | 0.592 / 0.614 | 0.82 / 0.87 |
+  | CT ridge, gaps 0.3 mm, --ct-con 16 | 76.7 / 214.5 | 0.708 / 0.732 | 0.87 / 0.92 |
+  Even without gaps the ridge climb hops more than the plain dyad trace (60 vs 41 / m): at 9.6 um the nearest density ridge
+  along the normal is often the neighbour's (compressed, touching sheets), the same failure as the earlier local touching-sheet
+  signals. Kept as an option, off.
+- Production rule: W3 (W from our own fit). Caveat (mergeflag): a W gate from the same fit the count field corrects agrees with
+  that W by construction and cuts a line exactly at the W jumps a tie could fix; so the 1667 tie test runs two arms.
+
+1667 (laptop RTX 4060, fibhv-d 30000, 8 channels, level-2 region 2816,512,512 + 1024,1024,1792 holding holdouts C2 / C6 / C12 /
+C15; ~87 s per channel): traces A (dyad, no gate) and B (q2 MFREF joined fit as the W gate, gaps 0.3 mm) -> mergeflag's
+count-field `--fibers` ties (fiber-export, --cf-fib-spans 64,256), scored on C2 / C6 / C12 / C15 against the no-tie MFREF ref.
+Results below when scored.
+
 ## Layer fibre orientation in the CT does not separate touching sheets at 2.4 um either (2026-11-19, branch orient-20261119, mergeflag)
 
 **Question (user via lead).** Each sheet is a recto layer (horizontal fibres) on a verso layer (vertical fibres). At 2.4 um, does
