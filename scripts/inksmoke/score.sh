@@ -8,7 +8,7 @@
 # Card 1 only (11-18): CUDA_VISIBLE_DEVICES=1 (PCI order, nvidia-smi's) and device 0 inside: latink's predict --gpu 1 alone opened card 0
 # too (the desk's try9 card). A guard polls nvidia-smi every 2 s: any process of this job on card 0, or one above GPUCAP MiB (6000: the
 # lead's card-1 limit beside try9's ~3.3 GB), is killed; the peak per process is logged to TAG/gpupeak.txt.
-# FAST=1 (2026-11-20, fullvram; default 0 until the drivers skip their own pairwrap2.py after a FAST score: it would overwrite the tsv with n = 0): latink over the held-out samples' 512 tiles only (LATINK_TILES, default
+# FAST=1 (2026-11-20, fullvram; the default since the drivers skip their pairwrap after a FAST score (TAG/fast.done); FAST=0: the renders): latink over the held-out samples' 512 tiles only (LATINK_TILES, default
 # FASTDIR/tiles-1667: ink-wrapscore --tiles-out, 131 + 125 tiles) and no render / img-gate / pairwrap2.py: `ufsm ink-wrapscore --vmap`
 # samples ink x max(c12, c13) at each held-out sample's render pixel (render's rc_pixel at DEPTH, img-gate's table: the rendered maps'
 # AUC exactly) and writes eval/pair_TAG.{heldout,hold,valonly}.tsv itself (pairwrap2.py's columns, vs reader3) from the cached sample
@@ -17,7 +17,7 @@
 # The blend writes only the tiles0 shards, level 0 (LATINK_BLEND_X). h1-3000 1 min 52 s, fr1-1000 (10.7 M) 3 min 14 s on the shared card 1.
 set -u; TAG=${1:?TAG}; CK=${2:?CKPT}; U=${U:-/vesuvius/ufsm/bin/ufsm-inksdk}
 E=/vesuvius/ufsm/inksmoke/eval/$TAG; P=/vesuvius/ufsm/podun/PHerc1667; UP=$P/inksdk/up; CTR=/vesuvius/ufsm/v2/ct; CTK=PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr
-FAST=${FAST:-0}; FASTDIR=${FASTDIR:-/vesuvius/ufsm/inksmoke/fast}; WSU=${WSU:-/vesuvius/ufsm/bin/ufsm-fullvram}
+FAST=${FAST:-1}; FASTDIR=${FASTDIR:-/vesuvius/ufsm/inksmoke/fast}; WSU=${WSU:-/vesuvius/ufsm/bin/ufsm-fullvram}
 [ $FAST = 1 ] && [ -e $E/fast.done ] && { echo "score $TAG: done before (FAST)"; exit 0; }
 [ $FAST = 1 ] || { [ -s $E/map/w051.tif ] && { echo "score $TAG: done before"; exit 0; }; }
 [ $FAST = 1 ] && { [ -x $WSU ] && [ -s $FASTDIR/1667-up.uws ] && [ -s $FASTDIR/tiles-1667/tiles0.txt ] || { echo "score $TAG: FAST needs $WSU, $FASTDIR/1667-up.uws, $FASTDIR/tiles-1667"; exit 1; }; }
