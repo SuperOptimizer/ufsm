@@ -167,9 +167,16 @@ static int fr_box(fr_job *J, const int64_t so[3], const int64_t n[3], uint8_t *d
                                of a P 1024 window took 3.9 GB of device memory beside the trainer, a slab of 64 M voxels 0.2 GB) */
         const size_t pl = (size_t)n[1] * n[2]; int64_t zs = (int64_t)(fiber_gpu_slab_vox() / (pl ? pl : 1)); if (zs < 1) zs = 1;
         gok = 1;
-        for (int64_t z0 = 0; z0 < n[0] && gok; z0 += zs) {
+        /* a slab the device cannot take (its steps / bin entries grow past the reserve, nothing left beside the trainer's plan): the same
+           slab in halves, down to 1/16 of the planned one, before the CPU raster. That raster is single-threaded inside the sampler's
+           read: P 384 with 5 AFV sources stalled training at 99.96 % of the main thread in fr_box / fr_stamp (latcodec's laptop run,
+           2026-11-20), so falling back says DEFAULTED once */
+        const int64_t zmin = zs / 16 > 0 ? zs / 16 : 1;
+        for (int64_t z0 = 0; z0 < n[0] && gok;) {
             const int64_t so2[3] = {so[0] + z0, so[1], so[2]}, n2[3] = {z0 + zs < n[0] ? zs : n[0] - z0, n[1], n[2]}; const size_t off = (size_t)z0 * pl;
-            if (fibre_gpu_box(t_st.s, t_st.n, so2, n2, R, J->rad + J->guard, cr, cg, J->ring > 0, have_ct ? ct + off : nullptr, J->iso, J->piso, o0 + off, o1 + off)) gok = 0;
+            if (!fibre_gpu_box(t_st.s, t_st.n, so2, n2, R, J->rad + J->guard, cr, cg, J->ring > 0, have_ct ? ct + off : nullptr, J->iso, J->piso, o0 + off, o1 + off)) z0 += n2[0];
+            else if (zs > zmin) zs = zs / 2 > zmin ? zs / 2 : zmin;
+            else gok = 0;
         }
         if (!gok) {   /* (this box on the CPU: same bytes, slower; was silent until 2026-11-20, latcodec's laptop run spent its CPU here) */
             static _Atomic long nfb;   /* mgpu: process (atomic) */

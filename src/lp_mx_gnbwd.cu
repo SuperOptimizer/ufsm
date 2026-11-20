@@ -923,10 +923,11 @@ extern "C" void lp_gn_silu_bwd_apply_mx(const void *x, int xdt, shape5 s, int G,
 
 /* dec[0]'s GN+SiLU backward from the recomputed head input gradient (gn_silu_bwd_*_hg_k): the stats into ds (as lp_gn_silu_bwd_mx) and
    the apply in place over x (as lp_gn_silu_bwd_apply_mx; no gy records below 32 channels: invalidated as lp_gn_silu_bwd_apply_rec
-   does). C 8 or 16 MX-fp4, 1..4 fp16 logit channels, the lane-pair kernels on (UFSM_GN_APPLY2) */
+   does). C 8 or 16 MX-fp4, 1..4 or 9 fp16 logit channels (9: train --single fib, the fibre H / V masks + the direction's 7; 2026-11-20),
+   the lane-pair kernels on (UFSM_GN_APPLY2) */
 extern "C" int lp_gn_silu_bwd_head_ok(int C, int ci) {
     static int a2 = -1; if (a2 < 0) a2 = getenv("UFSM_GN_APPLY2") ? atoi(getenv("UFSM_GN_APPLY2")) : 1;
-    return a2 && (C == 8 || C == 16) && ci >= 1 && ci <= 4;
+    return a2 && (C == 8 || C == 16) && ((ci >= 1 && ci <= 4) || ci == 9);
 }
 static int g_hg_exact = -1;   /* the recomputed gy: 1 exact fp32 (EX), 0 the two-op path's MX-fp4 bits, -1 env UFSM_GN_HEAD_EXACT (default 1) */
 extern "C" void lp_set_gn_head_exact(int on) { g_hg_exact = on; }
@@ -935,7 +936,7 @@ static int hg_exact(void) {
     return g_hg_exact >= 0 ? g_hg_exact : env;
 }
 #define HGK1(K, F, EX, ...) do { switch (ci) { case 1: K<1, F, EX><<<__VA_ARGS__; break; case 2: K<2, F, EX><<<__VA_ARGS__; break; \
-                                              case 3: K<3, F, EX><<<__VA_ARGS__; break; default: K<4, F, EX><<<__VA_ARGS__; } } while (0)
+                                              case 3: K<3, F, EX><<<__VA_ARGS__; break; case 9: K<9, F, EX><<<__VA_ARGS__; break; default: K<4, F, EX><<<__VA_ARGS__; } } while (0)
 #define HGK(K, F, ...) do { if (hg_exact()) HGK1(K, F, true, __VA_ARGS__); else HGK1(K, F, false, __VA_ARGS__); } while (0)
 extern "C" void lp_gn_silu_bwd_head_stats(const void *x, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                                           const void *gl, int ci, const float *wh, unsigned hs, double *ds, int ns) {
@@ -973,6 +974,7 @@ extern "C" void lp_gn_silu_bwd_head_apply(void *x, shape5 s, int G, const float 
 #define HGA1(F, EX) do { switch (ci) { case 1: hga<1, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr, ns); break; \
                                        case 2: hga<2, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr, ns); break; \
                                        case 3: hga<3, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr, ns); break; \
+                                       case 9: hga<9, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr, ns); break; \
                                        default: hga<4, F, EX>(xq, g, wh, hs, gamma, beta, mean, rstd, AB, s, G, gsr, ns); } } while (0)
     if (full && ex) HGA1(true, true); else if (full) HGA1(true, false); else if (ex) HGA1(false, true); else HGA1(false, false);
 #undef HGA1

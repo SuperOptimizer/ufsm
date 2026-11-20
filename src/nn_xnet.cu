@@ -720,6 +720,9 @@ struct MxP {
                                                                   [oc0, oc0 + tco) of an oC-channel tensor (y may then be nullptr) */
 };
 template <int SF> __device__ __forceinline__ void mma_x4(float *c, const unsigned *a, const unsigned *b, unsigned sa, unsigned sb) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200   /* no block-scaled MMA below sm_120 (ptxas rejects it): the MX xnet path is not run there */
+    __trap();
+#else
     if constexpr (SF == 6)
         asm volatile("mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue8m0 "
                      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0, 0}, %11, {0, 0};\n"
@@ -728,6 +731,7 @@ template <int SF> __device__ __forceinline__ void mma_x4(float *c, const unsigne
         asm volatile("mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
                      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0, 0}, %11, {0, 0};\n"
                      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sa), "r"(sb));
+#endif
 }
 template <int NB> __device__ __forceinline__ void cpa(void *dst, const void *src, bool ok) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;\n" :: "r"(smem_u32(dst)), "l"(src), "n"(NB), "r"(ok ? NB : 0) : "memory");

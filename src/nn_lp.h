@@ -91,6 +91,7 @@ const void *lp_gnpend_take(const void *gx, const void **gy, const float **cf);  
 void lp_set_stem_gnfuse(int on);   /* test hook: the network input conv's weight gradient fuses a pending GN apply (1, default; UFSM_STEM_GNFUSE), 0 flushes it */
 void lp_set_s2b_f4(int on);  /* the fp4 stride-2 backward-data (MX-fp4 gy): 3 for 32 and 64 channels, 1 for 32 only, 0 bf16 tensor cores, -1 env UFSM_S2B_F4 (default 3) */
 void lp_set_s2b_wide(int on);   /* the fp4 stride-2 backward-data at 256..448 channels (weight streaming): on by default (UFSM_S2B_WIDE=0 off); -1 env UFSM_S2B_WIDE */
+int lp_s2b_gycopy_conv(int cin, int cout);   /* 1: that cin -> cout stride-2 backward-data may copy an overlapping gy (NN_WS_S2BCP; unet_ws_plan) */
 void lp_set_s2_f4(int on);   /* the fp4 stride-2 forward (MX-fp4 32-channel input, widths % 16): 1 on, 0 fp8, -1 env UFSM_S2_F4 (default on) */
 void lp_set_f4w_gypre_kb(int kb);   /* gy pre-pass of the fp4 weight gradient: slab cap in KiB (0 off, -1 env UFSM_F4W_GYPRE MiB, default 96) */
 int lp_get_f4w_gypre_kb(void);
