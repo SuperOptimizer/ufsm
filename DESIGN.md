@@ -6,6 +6,50 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fully adaptive Muon, part 2: online kappa for DoG, autocool, DoWG (2026-11-19, branch admuon2-20261119, trainperf) -- CODE + TESTS, GPU A/B pending
+
+The 11-14 DoG collapse (eta 1.6 % of the lr by update 80) came from its fixed random-walk factor kappa = (1 + b) / (1 - b) (39 at
+b 0.95): Muon's orthogonalised directions decorrelate within a few steps (probe kappa16 2.2 -> 5.5 on try9, train smoke 3.9 -> 6.7),
+so DoG's G grew ~7x faster than the distance. The scalar controllers now live in `src/admctl.h` (plain C, shared by the one-thread
+GPU controller `ad_ctl_k` and the host test); the sample statistics come from the direction probe, which also samples the weights.
+
+- **Online kappa** (default with `--muon-dog`; `--muon-dog-kappa fixed` = the old factor): on the probe subsample (stride 64 when
+  `--muon-probe` is not given), e = lam e + v, c = <v, e_prev>, q = |v|^2, EMAs (`--muon-kappa-beta` 0.98), kappa = 1 + 2 cbar / qbar
+  clamped to [1, (1 + b) / (1 - b)]; lam = 1 - (1 - b) / 8. DoG's G accumulates kappa_t sched^2 |v|^2 (a walk whose correlation
+  changes has variance sum kappa_t |step|^2), so `adm_dog` keeps the 11-14 state layout and fixed-kappa runs are bit-identical.
+  A resume keeps the saved EMAs until e is refilled (8 / (1 - b) updates).
+- **`--muon-dog-w 1`**: DoWG (eta = rbar^2 / sqrt(sum rbar^2 kappa sched^2 |v|^2)). On an unbounded noisy walk it has no fixed point
+  (eta -> sqrt 2 eta per doubling; climbs to the cap in the CPU test): an option for the A/B, not a default.
+- **`--muon-autocool 1`** (now part of `--muon-adaptive`): a global lr factor f (x the schedule; also inside DoG's sched) that halves
+  (`-decay` 0.5, `-floor` 0.01) after a stationary block of M (`-m` 3) windows of N (`-n` 100) updates. Two statistics on the probe:
+  - centred FDR z = sum(2 (theta - c).D - |D|^2) / sum |D|^2 over the block, D the applied step, c a slow EMA of theta (horizon N M).
+    Yaida's relation holds for any fixed centre and any update rule; about c = 0 the theta.D noise grows as |theta| / |D|, i.e. 1 / f
+    (window z +-5 at f 1/8 on the test quadratic: chance decisions). The moving centre is corrected exactly
+    (+ ((1 - ck)^-2 - 1) |theta - c'|^2 per step; uncorrected z sat at -5.7 at stationarity). Pass: |z| < `-delta` 0.2.
+  - progress fraction r = |sum D|^2 / (N sum |D|^2) per window: 1 a drift, ~kappa / N noise, ~0 in a basin. Pass: every window < `-c`
+    0.2. (The first design normalised by the online kappa: a drift is long-range correlation and drives kappa to its clamp, pk stayed
+    ~2 on a pure slope. A single 50-update window's z was +-0.5 noise at stationarity, hence the blocks.)
+  The GT watchdog stays external. Logged on every --opt-stats line: `kappa`, `cool f z r stat dec`.
+- State: AD_NST = 32 doubles (rbar, G, eta, dist, kappa EMAs, autocool). Device: 4 x the probe's sample count floats (e, theta_prev,
+  theta_start, centre; 97 KB at the smoke net, ~6.5 MB at 104 M parameters / 64), statistics in one fixed 64 x 256 grid with
+  fixed-order partials (data-parallel replicas identical; every rank now takes the same probe stride, logging stays on GPU 0).
+  Checkpoint keys `adm_kap` [cbar, qbar, kappa, n] and `adm_cool` [f, windows, decays], written only when on.
+
+Tests:
+- `test_admctl` (CPU, 2.3 s): kappa white 1.03, AR(0.5) 2.90 (tapered 2.99, true 3), AR(0.9) 17.6 (tapered 18.0, true 19), drift
+  = the clamp 39; resume holds kappa over the refill. DoG eta / eta0 after 1500 AR(0.9) updates: fixed kappa 19 **0.29** (the
+  collapse), kappa 1 the cap (100), online **1.65**; white noise online 0.65; a drift reaches the cap. Autocool on a heavy-ball
+  quadratic (2000 coordinates, curvatures 0.002-0.2, start 30 sigma out, noise 1): first decay at step 2121 at **1.00 x** the uncooled
+  noise floor (0.125), 6 decays, final loss **0.09 x** the floor; a pure noisy slope: no decay.
+- `test_admuon` test_adapt2 (GPU): online kappa + DoG + autocool through adm_stat_k / ad_ctl_k equal the host controllers fed the
+  device's own probe samples, worst rel 2.4e-7 (with and without NorMuon); the old adapt / scale cases unchanged.
+- Train smoke (wind fixture, P 64, 12 + 4 steps, --muon-adaptive 1 and forced autocool thresholds): kappa 3.9 -> 6.7, DoG eta grows
+  1.8e-3 -> 2.3e-3 (lr 2e-3), one decay; resume "resumed kappa 6.72 (12 samples), autocool f 0.5"; `--muon-dog-w 1 --muon-dog-kappa
+  fixed` writes no new keys.
+
+GPU A/B: no longer on try9 winding fine-tunes (user 11-19: no winding-model work); planned on the 3-D ink run or the rv / fibre
+fine-tune with inksdk: (a) NorMuon, (e) NorMuon + autocool, (b) NorMuon + LARS + DoG (online kappa) + autocool.
+
 ## try9 end: GT sweep of the snapshots, the cooldown, and where fully adaptive Muon stopped (2026-11-19, trainperf)
 
 **Is try9 still improving on GT?** Phase-miss share (merge-flag --eval --gap-report 100 --thr 179, mergeflag's recipe: origin / axis
