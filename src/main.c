@@ -302,6 +302,7 @@ static int usage(void) {
         "  ufsm fiber-regscore <afv> (--map reg.json | --tr T.json) --pred ROOT KEY   a scan-to-scan map scored by fibre presence along mapped fibres (per-region residual shifts)\n"
         "  ufsm fit-phase-box <fit-set> z y x nz ny nx <out.raw> [--level L] [--step 2]   a fit set's winding phase over a CT box (uint8 band phase; fibre judge)\n"
         "  ufsm wrap-dump <wraps-dir> <out.f32> --z z0,z1 [--yx y0,y1,x0,x1] [--every 2]   wrap vertices of a slab as float32 (z, y, x, id, column / width) records\n"
+        "  ufsm fiber-match OURS.fib REF.afv|.fib --box Z,Y,X,NZ,NY,NX [--map reg.json]   our fibres vs a reference: lengths, recall, precision, how far one line follows one fibre\n"
         "  ufsm fiber-judge <fibres.afv|.fib> (--wraps DIR | --phase ROOT KEY | --set FITSET) --um U --slab Z0,NZ [--out rows.tsv]   do fibres stay in one sheet of our winding? (label-free judge)\n"
         "  ufsm fiber-link <in.fib> <out.fib> [--gap-mm 0.3]   join traced fibre pieces end to end (gap, tangent continuity, lateral offset)\n"
         "  ufsm fiber-trace <root> <key-prefix> <out.fib> --box Z,Y,X,NZ,NY,NX [--scaledown 3]   streamlines through a published fibre prediction (presence, nx, ny) -> UFIB\n"
@@ -4967,6 +4968,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "fit-phase-box")) return cmd_fit_phase_box(argc, argv);
     if (!strcmp(cmd, "wrap-dump")) return cmd_wrap_dump(argc, argv);
     if (!strcmp(cmd, "fiber-judge")) return cmd_fiber_judge(argc, argv);
+    if (!strcmp(cmd, "fiber-match")) { int cmd_fiber_match(int, char **); return cmd_fiber_match(argc, argv); }   /* our fibres vs a reference set: lens, recall, precision, runs (src/fibermatch.c) */
     if (!strcmp(cmd, "fiber-trace")) return cmd_fiber_trace(argc, argv);
     if (!strcmp(cmd, "fiber-raster")) return cmd_fiber_raster(argc, argv);
     if (!strcmp(cmd, "fiber-onfly")) return cmd_fiber_onfly(argc, argv);

@@ -101,6 +101,7 @@ ufsm_exe(test_fiberjudge SUITE tests/test_fiberjudge.c OBJS fiberjudge wrapdump 
          sources band_onfly fuse fiberraster regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb embz NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fiberraster SUITE tests/test_fiberraster.c OBJS fiberraster nn_fibre afv reg regmap z3w zarr3 zarr2 store json LIBS LDLIBS
          CUDA)
+ufsm_exe(test_fiber_match SUITE tests/test_fiber_match.c OBJS fibermatch afv reg regmap zarr3 zarr2 store json optcheck LIBS LDLIBS m)
 ufsm_exe(test_fibertrace SUITE tests/test_fibertrace.c OBJS fibertrace ftaxis nn_ftrace afv zarr2 zarr3 store json LIBS LDLIBS CUDA)
 ufsm_exe(test_fibertrace_dyad SUITE tests/test_fibertrace_dyad.c OBJS fibertrace ftaxis nn_ftrace afv zarr2 zarr3 z3w store json LIBS LDLIBS
          CUDA)
