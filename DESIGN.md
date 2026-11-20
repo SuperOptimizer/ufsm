@@ -307,7 +307,7 @@ boxes of the u1 / try9 rows; window 640 / halo 64, --gn-live 1, the rvsep predic
   fluctuation-dissipation relation (Yaida 2018 / SASA) plus prog_K vs sqrt(kappa / K). Notes: /vesuvius/ufsm/trainperf/admuon2/design.txt.
 
 ## resgate: 9.6 um detail arms fine-tuned on the GT boxes, PARTIAL (R0, R2 only; stopped 2026-11-19 by the user's "stop winding training")
-## mcc CUDA backend: device inlining, constant tables, vector memory, f16 round trips (2026-11-20, microc branch cudaopt-20261119, mcuda)
+## mcc CUDA backend: device inlining, constant tables, vector memory, f16 round trips (2026-11-20, microc branch cudaopt-20261119: 834ab75, LICM opt-in 258d73f; mcuda)
 
 Question: where does mcc's PTX lose to nvcc's, and what closes it? Measured on the laptop forlinlapnvidia (RTX 4060, sm_89, ARCH 86
 software MX) with a try9-shaped 12-step training on a fixture (P 256, widths 256,320,384,448,288,288, --lat 4, --fstem 16, nsys GPU
@@ -336,6 +336,11 @@ last copy of each .entry, against nvcc 13.3's objects; MMA-loop SASS counts).
 - Still slower than nvcc: conv_fwd_f4_k 1.05x (47 % of the step), conv_fwd_s2_f8 1.25x, conv_bwd_w_s2_f8 1.13x, sum_k 1.45x;
   conv_bwd_w_f4_k stays 0.81x (mcc wins). sm_120a ptxas totals: stack 140 KB against nvcc's 79 KB, mostly in non-hot kernels
   (loss_stats / grad ~2.4 % of a step).
+- Strict units: with UFSM_STRICT_MATH=ON (bit-exact against the CPU) the 17 GPU tests of the strict units (gpudec, band_pair,
+  latvol, vcgpu, ftrace, fibre / codes on the fly, faces, render, ink_splat, hgs, unwrap2_ink) pass under the branch as under main:
+  no FMA contraction flip. The f16 fold only removes f2h(h2f(x)) (a half's bits widened and narrowed); h2f(f2h(y)), the intended
+  rounding, stays (microc tests/cuda/h16rt.cu, output identical to nvcc's). With the fold a __half2 taken apart and stored keeps
+  its NaN payloads as nvcc does; main canonicalised them to 0x7fff.
 - Fast tier on the laptop with the branch: the same failures as mcc main without it (the laptop baseline already fails 18:
   gscale, parity, predict_heads, latents, accum ... on its 8 GB GPU). main itself fails test_patchsolve, test_repair (l1 grid) and
   test_wbench_stats, which the pin 5744025 passes: host code, first bad commit 84903be "x86-64: loops unswitched on a value they do
