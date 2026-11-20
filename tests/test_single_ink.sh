@@ -5,7 +5,7 @@
 #     (--det 1) its ink bce equals the donor layout's at every step (the same trunk, the same ink row);
 #  2. the three level-0 buffers under head slabs (unet.l3h: a 16-wide level 0, dec[1] 16): the planner takes them, and at lr 0 the ink
 #     losses equal the four-buffer layout's (UFSM_L0_3BUF=0);
-#  3. training steps run with finite ink losses in both layouts (>= 3 of 6 windows with ink), the checkpoint header is unwrap version 3 (single ink, ink 0), the net
+#  3. an 8-wide level 0 trains (three buffers only); training steps run with finite ink losses in both layouts (>= 3 of 6 windows with ink), the checkpoint header is unwrap version 3 (single ink, ink 0), the net
 #     has one output, and a resume continues.
 # Usage: test_single_ink.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
@@ -35,6 +35,10 @@ for m in t3 t4; do
   it=$(inkl $m.log | tr '\n' ' '); echo "$it" | awk '{n = 0; for (i = 1; i <= NF; i++) { if ($i != $i + 0) exit 1; n += $i > 0 } exit !(NF == 6 && n >= 3)}' \
     || fail "$m: ink bce over 6 steps: '$it' (the fixture's windows without ink: 0)"
 done
+# an 8-wide level 0 (the head's backward only through the three level-0 buffers' GN-recomputing kernel)
+C8=("${C[@]/#16,32,64/8,16,32}"); C8=("${C8[@]/#0,16/0,8}")   # (opt takes the first --widths: replace, do not append)
+"$U" train fx/sources-ink.json --out w8 "${C8[@]}" --single ink --steps 4 > w8.log 2>&1 || fail "8-wide level 0 ($D/w8.log)"
+grep -q 'shared encoder a1, three level-0 buffers, ' w8.log && grep -q '^step      4 ' w8.log || fail "8-wide level 0: no three-buffer plan or no step 4 ($D/w8.log)"
 head -1 t3/last.ckpt | grep -q '"unwrap":{"version":3,"single":"ink","ink":0' || fail "header: no unwrap version 3 single ink"
 "$U" train fx/sources-ink.json --out t3 "${C[@]}" --single ink --steps 8 --resume t3/last.ckpt > r.log 2>&1 || fail "resume ($D/r.log)"
 grep -q '^step      8 ' r.log || fail "resume: no step 8 ($D/r.log)"

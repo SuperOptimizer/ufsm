@@ -6,6 +6,57 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Full-resolution VRAM: single-target nets on the three level-0 buffers, P 704 on a 16 GB card (2026-11-20, branch fullvram-20261120, fullvram)
+Goal (lead, after the user's return to full-resolution nets, one small net per target): a bigger window for full-resolution training on
+one 16 GB desk card (5060 Ti), first for 3-D ink. Every number below is the planner's (dry builds at 15.6 GB free, the --ink-mil 0.33 GB
+reserved), checked against train's own dry runs where noted.
+
+Tool: `tests/bench_plan` (BM_WIDTHS / BM_DECW / BM_COUT / BM_P / BM_MODE, UFSM_MEM_REPORT): unet_train_bytes + the kernel workspaces of any
+architecture in train's planner modes, no sampler (5 s on the shared card as a guest). It reproduces train's network term exactly (wind96
+cout 12 with head slabs 80.5 B per voxel, w16d16 54.5).
+
+Network bytes per voxel (cout 1; mode 4 = MX-fp4 gradients, chunked, lean 2, shared encoder a1; l3b = the three level-0 buffers):
+| widths (dec[1]) | params | mode 4 | l3b | note |
+|---|---|---|---|---|
+| 32,64,96,128,160,192 (32) = wind96 | 10.7 M | 80.5 | - | l3b needs an 8 / 16-wide level 0: max P 512 |
+| 16,64,96,128,160,192 (16) | 10.5 M | 54.5 | refused | level 1 at 64 channels: the coarse shares (gout / down outputs / skips of levels >= 1) do not fit a 16-channel level-0 buffer |
+| 16,32,64,96,128,192 (16) | 6.7 M | 46.9 | 33.7 | |
+| 16,16,32,64,128,192,256 (16) | 12.7 M | 39.0 | 30.0 | October's production net |
+| 8,16,32,64,128,192,256 (8) | 12.7 M | 25.9 | 20.6 | |
+| 8,8,16,32,64,128,192 (8) | 5.3 M | 23.2 | 18.6 | |
+So the level-0 width sets the bytes (one 32-channel MX-fp4 tensor is 17 B per voxel, 16 channels 9), and level 1 must stay <= 32 channels
+for l3b to place the coarse tensors.
+
+What blocked l3b for the ink net: the ink head lives only in task unwrap2 (rows 0-10 phase / normal / density / winding, ink 11) and only in
+the head-slab loss path (unet head_ext), while l3b needs a whole-window fp16 logit plane of <= 4 outputs for its head-recomputing GroupNorm
+backward. Two changes:
+- unet.l3h (unet.c): l3b under head slabs. X3 keeps the fp16 logit plane as the gradient's home; the forward runs no whole head (the
+  trainer's slabs run it); in the backward the head callback's per-slab unet_head_bwd_z copies each slab's fp16 gradient rows into the
+  plane, then l3b's nn_gn_silu_bwd_head_ns runs as with whole logits. test_grad_mx4 (all 5 L0_NORM variants): l3h against the whole-head
+  l3b step at 16- and 8-channel level 0, slabs of 5 planes with a partial last one: logits bit for bit, gradients rel 1e-10 .. 1.1e-8 (the
+  weight gradients' atomic order; two l3b runs differ by the same), the same seed count and training bytes, the batch tail kept.
+  Head-plane gradient scaling (hgs_choose) is off under l3b: the fused backward does not divide a plane scale out.
+- train --single ink (task unwrap2 --ink-head 1): unet cout 1, the ink row only; the unwrap2 frame (g_cout 12) stays the trainer's logical
+  layout, the head slabs hold only the ink channel (g_ink2_ch 0), the phase / normal / winding losses, their derived targets and the
+  device side / winding / component planes are skipped. Header `"unwrap":{"version":3,"single":"ink","ink":0}` (checkpoint_ink_channel
+  reads it; --fit-fields refuses it); --init-from maps the donor's ink row into row 0. An 8-wide level 0 is allowed only when the plan takes
+  l3b (the per-slab head backward kernel takes 16 / 32 inputs). inksdk's ink sources (sources-B-axis.json) already weigh phase / normal /
+  wind4 0, so the ink run loses no supervision. tests/test_single_ink.sh: at lr 0 on the same windows (--det 1) the ink bce equals the
+  12-row donor layout's at every step (0.3073 / 0.2919 both), three == four level-0 buffers, training, resume, an 8-wide level 0.
+
+train dry runs (inksdk's ink2/vox.argv + --single ink, one source, 7 levels 16,16,32,64,128,192,256 dec 0,16):
+| P | network | task (labels / slabs / aug staging / workspaces / rest) | need | 15.27 GB budget |
+|---|---|---|---|---|
+| 640 | 7.86 GB (30.0 B/voxel) | 2.95 | 11.79 GB | fits |
+| 704 | 10.46 GB | 0.70 / 0.06 / 0.77 / 1.01 / 0.5 | 14.73 GB | fits (9.0 GB host offloads each way per step) |
+| 768 | 13.58 GB | 0.91 / 0.08 / 0.98 / 1.24 / 0.5 | 18.73 GB | 3.5 GB short |
+(the head slabs were 0.70 GB at P 768 before they held the ink channel alone.) An 8-wide level 0 plans P 768 at ~11.2 GB network +
+workspaces (20.6 B per voxel). Remaining candidates for P 768 at 16 wide: the planner counts two buffers per unwrap label plane where lean
+allocates one (2 B per voxel here; 6 B per voxel for every unwrap2 + ink run: 2.7 GB at P 768) -- to be checked against a measured
+device peak before it changes; the s2b gy overlap copy workspace (0.96 GB at P 768) sized for down0, whose gy and gx can overlap under l3b.
+Not done: level-0 slab rings under lean 2 (the only way to P >= 768 at a 32-wide level 0, +30 % step in October), one window over both cards
+(--split z exists; the ink head refuses it outside --lat 4).
+
 ## Layer fibre orientation in the CT does not separate touching sheets at 2.4 um either (2026-11-19, branch orient-20261119, mergeflag)
 
 **Question (user via lead).** Each sheet is a recto layer (horizontal fibres) on a verso layer (vertical fibres). At 2.4 um, does

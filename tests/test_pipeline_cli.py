@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
                                           "targets": {"recto": "labels"}, "holdout": [96, 96, 96, 32, 32, 32]}]}))
     opts = ["--P", "16", "--B", "1", "--levels", "1", "--gpus", "0", "--workers", "1", "--val-batches", "1", "--val-train-ok", "1",
             "--log-every", "1", "--val-every", "1", "--ckpt-every", "1", "--fp4", "2", "--down-norm", "1", "--input-prec", "8"]
-    train_env = {"UFSM_GRAD_MX8": "1"}
+    train_env = {"UFSM_GRAD_MX8": "1", "UFSM_GRAD_MX4": "0"}   # (the default widths 16,32,64,80 take MX-fp8 gradients: said explicitly, no DEFAULTED line)
     run("train", cfg, "--out", t / "first", "--steps", "2", "--warmup", "0", *opts, extra_env=train_env)
     old, wp = weights(t / "first/last.ckpt")
     assert old["extra"]["runtime"]["act_mx4"] == 1

@@ -3047,6 +3047,7 @@ int cmd_train(int argc, char **argv) {
         if (g_fibh) { g_fib_ch = g_cout; g_cout += 9; fprintf(stderr, "unwrap2 --fib-head: channels %d-%d the fibre H / V masks (the sources' \"fibre_h\" / \"fibre_v\" prob254), %d-%d the fibre axis t t^T, %d its family (V), from the tubes' second moments over %d^3 voxels; lambda %g x the source's \"fibre\" head weight\n", g_fib_ch, g_fib_ch + 1, g_fib_ch + 2, g_fib_ch + 7, g_fib_ch + 8, 2 * g_fd_r + 1, g_fibh_lambda); }
         if (g_fibh && g_cout > 16 && g_cout % 16) { g_pad_ch = g_cout; g_cout = (g_cout + 15) / 16 * 16; fprintf(stderr, "unwrap2: outputs %d-%d pad the head to %d (no loss)\n", g_pad_ch, g_cout - 1, g_cout); }
         g_lat_padup = ufsm_env_on("UFSM_LAT_PAD_UP");
+        if (g_single) g_ink2_ch = 0;   /* (--single: the head slabs hold the ink channel alone, in their channel 0; the frame's other channels have no planes) */
         if (g_naux > 1) fprintf(stderr, "head registry: %d aux label planes:%s%s%s%s\n", g_naux, g_rv ? " papyrus (rv)" : "", g_ink2 ? " ink" : "", g_fibn ? " fibre tubes (the sources' \"fibre\" target)" : "", g_fibh ? " fibre H, fibre V" : "");
         if (g_unwrap2) fprintf(stderr, "unwrap2: channels %d-%d phase, %d-%d normal n n^T, %d density (lambda %g, step %d), %d-%d winding mod 4 (gauge-free, lambda %g)\n",
                                g_side_ch, g_side_ch + 1, g_norm_ch, g_norm_ch + 5, g_norm_ch + 6, g_dens_lambda, g_norm_s, g_w4_ch, g_w4_ch + 1, g_w4_lambda);
@@ -4325,7 +4326,7 @@ int cmd_train(int argc, char **argv) {
            whole windows, MX activations; -22 B (logits) - 11 B (derived targets) per voxel. UFSM_HEAD_SLAB=0: whole-window head and losses;
            UFSM_HEAD_SLAB_Z: planes per slab (32) */
         g_head_slab = g_gl_inplace && g_unwrap && B == 1 && (!split || g_lsplit) && !g_verso && !g_pap_head && g_side == 2 && g_side_nc == 2
-                      && (g_unwrap2 ? g_side_ch == 0 && g_norm_ch == 2 && g_w4_ch == 9 : g_side_ch == 2 && g_norm_ch == 4) && g_cout == 11 + g_ink2 + 2 * (g_rv == 2) + 9 * g_fibh + (g_pad_ch >= 0 ? g_cout - g_pad_ch : 0) && (unet_act_mx() || nn_get_act_bf16()) && (cfg.widths[0] == 32 || (g_unwrap2 && cfg.widths[0] == 16) || g_lat) && !(getenv("UFSM_HEAD_SLAB") && !atoi(getenv("UFSM_HEAD_SLAB")));   /* (the fused
+                      && (g_unwrap2 ? g_side_ch == 0 && g_norm_ch == 2 && g_w4_ch == 9 : g_side_ch == 2 && g_norm_ch == 4) && g_cout == 11 + g_ink2 + 2 * (g_rv == 2) + 9 * g_fibh + (g_pad_ch >= 0 ? g_cout - g_pad_ch : 0) && (unet_act_mx() || nn_get_act_bf16()) && (cfg.widths[0] == 32 || (g_unwrap2 && cfg.widths[0] == 16) || g_lat || (g_single && cfg.widths[0] == 8)) && !(getenv("UFSM_HEAD_SLAB") && !atoi(getenv("UFSM_HEAD_SLAB")));   /* (the fused
                                                                                                      slab head backward takes exactly 32 inputs) */
         g_tm_unused = g_unwrap2 && g_head_slab && !g_ds && !ufsm_env_on("UFSM_TM_KEEP");   /* (the unwrap2 head slabs read only the side / winding planes) */
         if (g_single && !g_head_slab) { fprintf(stderr, "--single ink needs the head-slab loss path (task unwrap2, B 1, no --split / --deep-sup, MX activations, level-0 width 16 or 32; UFSM_HEAD_SLAB on)\n"); return 2; }
@@ -4378,6 +4379,13 @@ int cmd_train(int argc, char **argv) {
             for (int i = 0; i < cfg.nlev; i++) if (cfg.widths[i] % 32 && !(g4n && (cfg.widths[i] == 16 || cfg.widths[i] == 8))) g4ok = 0;
             for (int i = 0; i < cfg.nlev - 1; i++) if (cfg.dec_widths[i] > 0 && cfg.dec_widths[i] % 32 && !(g4n && (cfg.dec_widths[i] == 16 || cfg.dec_widths[i] == 8))) g4ok = 0;
             const int g4 = getenv("UFSM_GRAD_MX4") ? ufsm_env_on("UFSM_GRAD_MX4") : g4ok;
+            if (!g4ok && !getenv("UFSM_GRAD_MX4") && fp4 >= 2 && !*opt(argc, argv, "--policy", "")) {   /* (2026-11-20: two ladder nets lost an hour to this silently: ~2x gradient bytes) */
+                char bw[256] = ""; size_t nb = 0;
+                for (int i = 0; i < cfg.nlev; i++) if (cfg.widths[i] % 32 && !(g4n && (cfg.widths[i] == 16 || cfg.widths[i] == 8))) nb += snprintf(bw + nb, nb < sizeof bw ? sizeof bw - nb : 0, " width[%d]=%d", i, cfg.widths[i]);
+                for (int i = 0; i < cfg.nlev - 1; i++) if (cfg.dec_widths[i] > 0 && cfg.dec_widths[i] % 32 && !(g4n && (cfg.dec_widths[i] == 16 || cfg.dec_widths[i] == 8))) nb += snprintf(bw + nb, nb < sizeof bw ? sizeof bw - nb : 0, " dec[%d]=%d", i, cfg.dec_widths[i]);
+                if (P % (1 << (cfg.nlev - 1)) || g_Pz % (1 << (cfg.nlev - 1))) nb += snprintf(bw + nb, nb < sizeof bw ? sizeof bw - nb : 0, " P %d not a multiple of %d", P, 1 << (cfg.nlev - 1));
+                UFSM_DEFAULTED("activation gradients = MX-fp8, not MX-fp4 (%s; MX-fp4 needs every width and decoder width a multiple of 32 or 8 / 16): about 2x the gradient buffers, and no level-0 A share / three level-0 buffers", bw);
+            }
             if (g4 && !g4ok) { fprintf(stderr, "UFSM_GRAD_MX4: MX-fp4 gradients need --fp4 2 (fp4 weight gradients), widths that are multiples of 32 and P divisible by %d\n", 1 << (cfg.nlev - 1)); return 2; }
             unet_set_grad_mx4(g4);
             /* shared encoder a1 (recompute 1) with its host offload by default: ~0.6% step, -22 B per level-0 voxel; UFSM_RC_ENC_A1=0 off */
@@ -4501,7 +4509,7 @@ int cmd_train(int argc, char **argv) {
                 const int gdef = (getenv("UFSM_GN_DEFER") ? atoi(getenv("UFSM_GN_DEFER")) : 1) && !split && !cand[c].l3 && cfg.widths[0] % 32 == 0;
                 const size_t grec = !split && unet_grad_mx4() && (cfg.widths[0] % 32 == 0 || lp_gyrec_narrow()) && (getenv("UFSM_GYREC") ? atoi(getenv("UFSM_GYREC")) : 1)
                                     ? (gdef ? (size_t)100 << 20 : (size_t)B * cfg.widths[0] * (g_lat ? p3 / 64 : p3) * 136 / 256) : 0;   /* (--lat: level 0 is the 4^3-cell grid; the split's whole layer was counted per voxel: 77 GB at P 1024) */
-                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_fibdir > 0 ? (size_t)8 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)(g_single ? 0 : 4) * B * p3 + (size_t)g_hs_z * P * P * (2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 && !g_single ? (size_t)4 * B * p3 : 0) + ((size_t)2 * g_naux * B * p3 + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv))) * g_hs_z * P * P) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ws_residual + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && (gin || g_lat) ? (g_lsplit ? nn_aug_device_bytes_z(P, g_gpu_aug_want >= 2 && !g_w4dev_want ? 2 * P : P, g_Pz, 16) : nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0)) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
+                need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_fibdir > 0 ? (size_t)8 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)(g_single ? 0 : 4) * B * p3 + (size_t)g_hs_z * P * P * (g_single ? 2 : 2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 && !g_single ? (size_t)4 * B * p3 : 0) + ((size_t)2 * g_naux * B * p3 + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv))) * g_hs_z * P * P) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ws_residual + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && (gin || g_lat) ? (g_lsplit ? nn_aug_device_bytes_z(P, g_gpu_aug_want >= 2 && !g_w4dev_want ? 2 * P : P, g_Pz, 16) : nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0)) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
                 if (g_lat) need += (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) + (g_lat_hs ? ((size_t)LNC * (LGFC < LNC ? 6 : 4) + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) + (g_lat_fuse ? nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z) : 0) : ((size_t)LNC * 2 + (size_t)LGFC * 4) * (p3 / 64));   /* --lat: the full-resolution batch beside the cell-grid network, the coarse logit gradient (fp32 + 16-bit) */
                 if (g_ssl) need += (size_t)g_ssl * g_ssl_S * 5 + (size_t)g_ssl_npts * (g_ssl * 8 + 8) + 4096 + (size_t)g_sslh.nslot * (g_Pz / 4) * (P / 4) * (P / 4);   /* (+ --ssl-heads: a byte per head channel and cell) */
                   /* --ssl: int8 targets + the side head's fp32 gradient, the hinge's
@@ -4522,7 +4530,7 @@ int cmd_train(int argc, char **argv) {
                 if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 2) {   /* the task term's parts (GB; the window's full-resolution planes, bytes per voxel) */
                     const size_t v = (size_t)B * p3, aug = g_gpu_aug_want && (gin || g_lat) ? (g_lsplit ? nn_aug_device_bytes_z(P, g_gpu_aug_want >= 2 && !g_w4dev_want ? 2 * P : P, g_Pz, 16) : nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0)) : 0;
                     const size_t uwp = g_unwrap ? (size_t)(g_single ? 0 : 4) * v + (g_unwrap2 && !g_single ? (size_t)4 * v : 0) + (size_t)2 * g_naux * v : 0;
-                    const size_t uws = g_unwrap && g_head_slab ? (size_t)g_hs_z * P * P * (2 * g_cout + 11) + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv))) * g_hs_z * P * P : 0;
+                    const size_t uws = g_unwrap && g_head_slab ? (size_t)g_hs_z * P * P * (g_single ? 2 : 2 * g_cout + 11) + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv))) * g_hs_z * P * P : 0;
                     const size_t latb = g_lat ? (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) : 0;
                     const size_t lath = g_lat && g_lat_hs ? ((size_t)LNC * (LGFC < LNC ? 6 : 4) + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) + (g_lat_fuse ? nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z) : 0) : 0;
                     const double listed = (double)uwp + uws + aug + latb + lath + (g_mil ? mil_bytes() : 0), task = (double)need - grec - tb - tb / 14 - trainer - ((size_t)550 << 20);
@@ -4537,6 +4545,8 @@ int cmd_train(int argc, char **argv) {
                 if (need < min_need) { min_need = need; minc = c; min_hoff = pass; }   /* (no fit: the smallest mode evaluated) */
                 if (need <= fmin) { pick = c; pick_hoff = pass; pick_off = unet_last_offload_bytes(); pick_need = need; pick_grec = grec; }
             }
+            if (pick >= 0 && fastest && !pick_hoff && !l3_off && (cfg.widths[0] == 8 || cfg.widths[0] == 16) && unet_act_mx() && unet_grad_mx4())   /* (--mem fast never tries them while a no-offload mode fits) */
+                UFSM_DEFAULTED("memory mode = %s without host offloads (--mem fast: the three level-0 buffers need the host offloads and are only tried when nothing else fits; --mem auto takes them first)", cand[pick].what);
             if (pick < 0 && ng > 1) {   /* multi-GPU: no try-anyway (the other cards' buffers eat the slack: P 640 on 2 x 16 GB aborted in gn_dsums, 11-03) */
                 fprintf(stderr, "memory: no mode fits %.2f GB free per GPU with the %d-GPU headroom (%.2f GB kept; smallest mode needs %.2f GB): refusing "
                         "(use a smaller --P, fewer GPUs, or UFSM_MG_HEADROOM_GB)\n", fmin / 1e9, ng, mg_head / 1e9, (minc >= 0 ? min_need : need) / 1e9);
@@ -4634,6 +4644,10 @@ int cmd_train(int argc, char **argv) {
             d->hwh[i] = g_heads ? nn_host_alloc((size_t)B * g_tc) : nullptr;
             d->ev_up[i] = nn_event_create(); d->ev_lab[i] = nn_event_create();
         }
+        if (g_single && cfg.widths[0] == 8 && !unet_l0_3buf(d->u)) {   /* (the per-slab head backward takes 16 / 32 inputs; under the three level-0 buffers the
+                                                                         head's backward is unet's GN-recomputing one, which takes 8) */
+            fprintf(stderr, "--single ink: an 8-wide level 0 needs the three level-0 buffers (this plan: none; dec[1] <= 8, --mem auto)\n"); return 2;
+        }
         if (g_head_slab && bs) {   /* head slabs read the targets and mask in the backward (head_slab_cb), after the head's backward has
                                       started writing the gradient buffers: their own buffers (+3 B per voxel), the input stays inside */
             const size_t tb1 = g_tm_unused ? 256 : tbb, mb1 = g_tm_unused ? 256 : mbb;   /* (unwrap2: no recto target / mask is read) */
@@ -4711,7 +4725,7 @@ int cmd_train(int argc, char **argv) {
             const size_t sp3 = g_single ? 256 : lp3;   /* (--single: no phase plane on the device) */
             d->sideb[0] = nn_malloc(sp3); d->sideb[1] = lean ? d->sideb[0] : nn_malloc(sp3); d->sdb = d->sideb[d->cur];
             const size_t tp3 = g_head_slab ? (size_t)g_hs_z * P * P : (size_t)B * p3;   /* derived targets: one head slab, or the window */
-            d->sidet = nn_malloc((size_t)g_side_nc * tp3); d->sidem = nn_malloc(tp3);
+            d->sidet = nn_malloc(g_single ? 256 : (size_t)g_side_nc * tp3); d->sidem = nn_malloc(g_single ? 256 : tp3);   /* (--single: no phase targets) */
             d->sidew = nn_malloc(2); static const uint8_t one_w[2] = {1, 1}; nn_h2d(d->sidew, one_w, 2);
             d->sscratch = nn_malloc(nn_loss_scratch((shape5){1, g_side_nc, g_Pz, P, P}) + 64);
         }
@@ -4723,10 +4737,10 @@ int cmd_train(int argc, char **argv) {
         if (g_unwrap) {
             if (pm_used()) { d->pmb[0] = nn_malloc((size_t)B * p3); d->pmb[1] = lean ? d->pmb[0] : nn_malloc((size_t)B * p3); }   /* (unwrap2: no ink plane) */ d->pm = d->pmb[d->cur];
             const size_t tp3 = g_head_slab ? (size_t)g_hs_z * P * P : (size_t)B * p3;
-            d->nt = nn_malloc((size_t)7 * tp3); d->nm = nn_malloc(tp3);
+            d->nt = nn_malloc(g_single ? 256 : (size_t)7 * tp3); d->nm = nn_malloc(g_single ? 256 : tp3);   /* (--single: no normal / density targets) */
             if (g_head_slab) {
                 d->hs_z = g_hs_z; d->hs_P = P;
-                d->hs_lg = nn_malloc(d->hs_lg_bytes = (size_t)(g_lat ? LUPC : g_cout) * tp3 * 2); d->hs_ds = nn_malloc(128 * sizeof(double)); d->hs_ent = nn_malloc(32 * sizeof(double)); nn_zero(d->hs_ent, 32 * sizeof(double)); d->hsz = nn_malloc(64 * sizeof(unsigned long long)); if (g_gc) d->gcS = nn_malloc((size_t)cfg.cout * cfg.cout * sizeof(double));
+                d->hs_lg = nn_malloc(d->hs_lg_bytes = (size_t)(g_lat ? LUPC : g_single ? 1 : g_cout) * tp3 * 2); d->hs_ds = nn_malloc(128 * sizeof(double)); d->hs_ent = nn_malloc(32 * sizeof(double)); nn_zero(d->hs_ent, 32 * sizeof(double)); d->hsz = nn_malloc(64 * sizeof(unsigned long long)); if (g_gc) d->gcS = nn_malloc((size_t)cfg.cout * cfg.cout * sizeof(double));
                 if (g_lat_hs) {   /* (the streamed head: hs_z / 4 + 2 cell planes of logits, fp32 sums, sub-cell gradient and the head's 16-bit gradient) */
                     const size_t nq = (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4);
                     d->lgc = nn_malloc(nq * LNC * 2); d->latg = nn_malloc(nq * LGFC * 4); d->latgl = LGFC < LNC ? nn_malloc(nq * LNC * 2) : nullptr; d->latgc = nn_malloc(nq * (LNC + g_lat_dec) * 2);
