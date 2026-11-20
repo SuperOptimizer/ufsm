@@ -12,6 +12,9 @@ set -u; TAG=${1:?TAG}; CK=${2:?CKPT}; U=${U:-/home/forrest/ufsm-inksdk/build/ufs
 E=/vesuvius/ufsm/inksmoke/eval/$TAG; P=/vesuvius/ufsm/podun/PHerc1667; UP=$P/inksdk/up; CTR=/vesuvius/ufsm/v2/ct; CTK=PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr
 [ -s $E/map/w051.tif ] && { echo "score $TAG: done before"; exit 0; }
 mkdir -p $E/ink $E/in $E/map $E/r; cp $P/box.txt $P/axis.json $E/
+# GATEFROM=EVALDIR (a net without recto / verso rows, e.g. the full-res ink run): predict ink only; the papyrus gate (c12 / c13) is that
+# eval's volumes (t9c-500: try9's rv on the same 1667 grid), rendered here at this DEPTH
+[ -n "${GATEFROM:-}" ] && for h in c12 c13; do ln -sfn $GATEFROM/ink/$h.zarr $E/ink/$h.zarr; done
 LK="flock -s /tmp/ufsm-suite-locks/gpu1.excl flock -s /vesuvius/ufsm/opt/gpu1.lock"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID; GPUCAP=${GPUCAP:-6000}
 C0=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader | awk -F', ' '$1 == 0 {print $2}'); C1=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader | awk -F', ' '$1 == 1 {print $2}')
@@ -23,7 +26,7 @@ guard() { while :; do nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory -
   done; sleep 2; done; }
 guard & GP=$!; trap 'kill $GP 2>/dev/null; [ -s $E/gpumem.log ] && sort -k3 -n $E/gpumem.log | tail -1 | sed "s/^/peak: /" >> $E/gpupeak.txt' EXIT
 [ -e $E/ink/ink.zarr/zarr.json ] || $LK env CUDA_VISIBLE_DEVICES=1 U=$U LATINK_CK=$CK ITH=8 UNROLL_CT="$CTR|$CTK|2.399|2" ~/bin/memcap -m 36G ~/bin/lowprio \
-  bash /home/forrest/ufsm-inksdk/scripts/pod/latink.sh $E 0 $E/ink/ink.zarr > $E/latink.log 2>&1 || { echo "score $TAG: latink failed ($E/latink.log)"; exit 1; }
+  env LATINK_HEADS=${GATEFROM:+ink} bash ${LATINK:-$(dirname "$(readlink -f "$0")")/../pod/latink.sh} $E 0 $E/ink/ink.zarr > $E/latink.log 2>&1 || { echo "score $TAG: latink failed ($E/latink.log)"; exit 1; }
 for n in $(seq 35 51); do ln -sfn $UP/w0$n $E/in/w0$n; done
 for h in ink c12 c13; do v=$E/ink/$h.zarr; mkdir -p $E/r/$h; [ -e $E/r/$h/.done ] && continue
   $LK env CUDA_VISIBLE_DEVICES=1 UFSM_RENDER_MEM=16 UFSM_RENDER_CHUNKED=1 UFSM_RENDER_GPU_MEM=4 ~/bin/memcap -m 36G ~/bin/lowprio $U render $E/in $E/r/$h \
