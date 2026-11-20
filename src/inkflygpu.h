@@ -34,6 +34,8 @@ __attribute__((weak)) int inkfly_gpu_near(const ifg_unit *U, int nu, const ifg_c
 __attribute__((weak)) int inkfly_gpu_finish(const ifg_cfg *c, const uint8_t *ctb, const int64_t co[3], const int64_t cn[3], const int64_t o[3], const int64_t n[3],
                                             uint8_t *out, int *nonempty);
 __attribute__((weak)) void inkfly_gpu_device(int dev);
+__attribute__((weak)) size_t inkfly_gpu_budget(void);              /* the device bytes the ink chunks may hold (UFSM_INKFLY_GPU_MB, 1024 MiB) */
+__attribute__((weak)) void inkfly_gpu_set_reserve(size_t bytes);    /* the free memory left beside them (default 1536 MiB; UFSM_INKFLY_RESERVE_MB wins) */
 __attribute__((weak)) unsigned long long inkfly_gpu_over(void);   /* chunks sent to the CPU by the GPU budget / reserve (nn_inkfly.cu) */
 #ifdef __cplusplus
 }

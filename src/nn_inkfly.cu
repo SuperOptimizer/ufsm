@@ -12,6 +12,7 @@
    that does not fit is done on the CPU (return 1), the GPU path stays on. (2026-11-15 try7: every worker kept its own buffers on the
    training card without a bound; a cudaStreamCreate ran out of memory at start-up and switched the GPU path off for good, and the
    trainer died at step 450 with an unknown CUDA error at its next check.) */
+#include "defaulted.h"
 #include <cuda_runtime.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -184,10 +185,19 @@ static void to_dc(const ifg_cfg *cf, dc_t *hc) {
 static unsigned long long g_over;   /* mgpu: guarded (g_mu) */
 static void atomic_over(void) {
     pthread_mutex_lock(&g_mu); const unsigned long long k = ++g_over; const size_t h = g_held; pthread_mutex_unlock(&g_mu);
+    if (k == 1) UFSM_DEFAULTED("inkfly = the CPU for chunks over the GPU budget (%zu of %zu MiB held, %zu MiB reserve: the device is full; the planner keeps "
+                               "the budget free when the ink shares a training card, else lower UFSM_INKFLY_GPU_MB)", h >> 20, g_budget >> 20, g_reserve >> 20);
     if (k == 1 || k % 1000 == 0) fprintf(stderr, "inkfly gpu: %llu chunk(s) over the GPU budget (%zu of %zu MiB held, %zu MiB reserve): on the CPU\n", k, h >> 20, g_budget >> 20, g_reserve >> 20);
 }
 extern "C" unsigned long long inkfly_gpu_over(void) { pthread_mutex_lock(&g_mu); const unsigned long long k = g_over; pthread_mutex_unlock(&g_mu); return k; }
 extern "C" void inkfly_gpu_device(int dev) { g_dev = dev; }
+/* the trainer's memory planner (2026-11-20): the budget it keeps free on a training card that also runs the ink chunks, and the reserve
+   from then on (the plan already holds the trainer's own memory, so the 1536 MiB default guard shrinks to what the planner left); an
+   explicit UFSM_INKFLY_RESERVE_MB stays */
+extern "C" size_t inkfly_gpu_budget(void) { pthread_mutex_lock(&g_mu); budget_init(); const size_t b = g_budget; pthread_mutex_unlock(&g_mu); return b; }
+extern "C" void inkfly_gpu_set_reserve(size_t bytes) {
+    pthread_mutex_lock(&g_mu); budget_init(); const char *r = getenv("UFSM_INKFLY_RESERVE_MB"); if (!(r && atol(r) >= 0)) g_reserve = bytes; pthread_mutex_unlock(&g_mu);
+}
 extern "C" int inkfly_gpu_near(const ifg_unit *U, int nu, const ifg_cfg *cf, int64_t lo[3], int64_t hi[3], uint64_t *nnear) {
     int rc = 0; sm_t *hs = nullptr; ictx *x = t_ic;
     if (cf->ns > NSMAX || cf->nexcl > INKFLY_MAXEXCL || nu > 1024) return -2;

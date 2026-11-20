@@ -21,6 +21,7 @@
 #include <string.h>
 #include <time.h>
 #include "gpudec.h"
+#include "defaulted.h"
 
 enum { NSUB = 32, BLKV = 4096, TABW = 10 * 1024, NRADII = 46, TAB_BYTES = (TABW * 4 + NRADII * 4 + 15) & ~15, SUB_BYTES = 65536 };
 
@@ -266,7 +267,12 @@ fail:
 }
 
 /* fail every request not done yet (under G.mu, after a device error) */
+static void gd_note_broken(void) {   /* the first device failure: one DEFAULTED line now (was: only the exit summary; 2026-11-20) */
+    static int said; if (__atomic_exchange_n(&said, 1, __ATOMIC_ACQ_REL)) return;
+    UFSM_DEFAULTED("gpudec = the CPU decode from here (the GPU decoder on device %d failed after %llu substreams)", G.dev, (unsigned long long)G.n_subs);
+}
 static void fail_all(void) {
+    if (G.broken) gd_note_broken();
     for (int k = 0; k < NSLOT; k++) {
         gd_slot *S = &G.slot[k];
         if (S->state == S_OPEN || S->state == S_GPU) for (int r = 0; r < S->nreq; r++) if (!S->req[r]->state) S->req[r]->state = 3;
@@ -341,6 +347,10 @@ static void gd_stats_atexit(void) {
             (unsigned long long)G.n_subs, (unsigned long long)G.n_batches, G.n_batches ? (double)G.n_subs / G.n_batches : 0.0, (unsigned long long)G.n_redo, G.gpu_s);
     if (G.n_busy) fprintf(stderr, "gpudec: %llu round trips over %.0f ms (GPU busy): %llu requests decoded on the CPU meanwhile\n", (unsigned long long)G.n_busy, G.max_s * 1e3, (unsigned long long)G.n_cpu_busy);
 }
+static size_t gd_dev_bytes(void) {   /* the device buffers gd_init allocates (NSLOT slots) */
+    return (size_t)BLKV * 4 + (size_t)NSLOT * (G.in_cap + (size_t)G.max_items * SUB_BYTES + G.max_items * sizeof(gd_item) + MAXREQ * sizeof(gd_group)
+                                               + G.rec_cap * 4 + (size_t)G.max_items * META * 4 + G.max_items * 4);
+}
 static void gd_init(void) {
     const char *e = getenv("UFSM_GPU_DECODE");
     if (!e || !*e || !strcmp(e, "0")) return;
@@ -357,9 +367,9 @@ static void gd_init(void) {
     G.in_cap = (size_t)G.max_items * 40000 + ((size_t)16 << 20);   /* q 2 substreams are ~10-20 KB */
     G.rec_cap = (size_t)G.max_items * 49152 + ((size_t)16 << 20);   /* records (u32); a substream reserves its bound, 8 x its bypass bytes (q 2: ~5 KB) */
     if (G.in_cap > UINT32_MAX || G.rec_cap > UINT32_MAX) {   /* tok_off / rec_off are uint32 (audit mini/volcomp 7): ~87000 items at most */
-        fprintf(stderr, "gpudec: UFSM_GPU_DECODE_ITEMS %u needs offsets over 32 bits, decoding on the CPU\n", G.max_items); return; }
+        UFSM_DEFAULTED("gpudec = the CPU decode (UFSM_GPU_DECODE_ITEMS %u needs offsets over 32 bits)", G.max_items); return; }
     int nd = 0;
-    if (cudaGetDeviceCount(&nd) != cudaSuccess || G.dev < 0 || G.dev >= nd) { cudaGetLastError(); fprintf(stderr, "gpudec: no CUDA device %d, decoding on the CPU\n", G.dev); return; }
+    if (cudaGetDeviceCount(&nd) != cudaSuccess || G.dev < 0 || G.dev >= nd) { cudaGetLastError(); UFSM_DEFAULTED("gpudec = the CPU decode (no CUDA device %d: %d visible)", G.dev, nd); return; }
     int prev = 0; cudaGetDevice(&prev);
     GD_CK(cudaSetDevice(G.dev));
     GD_CK(cudaMalloc(&G.d_pos, BLKV * 4));
@@ -384,11 +394,13 @@ static void gd_init(void) {
     cudaSetDevice(prev);
     G.open = take_free();
     G.ok = 1;
+    fprintf(stderr, "gpudec: %.2f GB of device buffers on GPU %d (%d slots of %u items)\n", gd_dev_bytes() / 1e9, G.dev, NSLOT, G.max_items);
     atexit(gd_broken_atexit);
     if (getenv("UFSM_GPU_DECODE_STATS") && strcmp(getenv("UFSM_GPU_DECODE_STATS"), "0")) atexit(gd_stats_atexit);
     return;
 fail:
     cudaGetLastError(); cudaSetDevice(prev);
+    UFSM_DEFAULTED("gpudec = the CPU decode (its %.2f GB of buffers on GPU %d did not allocate)", gd_dev_bytes() / 1e9, G.dev);
 }
 
 /* the scan-position table goes to the device with the first request (volcomp.h's VF_SCAN16 lives on the C side) */
@@ -438,9 +450,9 @@ static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *dd
     const uint32_t kout = ddst ? 0 : k;
     pthread_mutex_lock(&G.mu);
     if (!G.have_scan) {
-        if (pos_upload(c->scan)) { G.broken = 1; pthread_cond_broadcast(&G.cv); pthread_mutex_unlock(&G.mu); return -1; }
+        if (pos_upload(c->scan)) { G.broken = 1; gd_note_broken(); pthread_cond_broadcast(&G.cv); pthread_mutex_unlock(&G.mu); return -1; }
         G.have_scan = 1;
-        if (pthread_create(&G.th, nullptr, service, nullptr) || pthread_create(&G.th2, nullptr, completer, nullptr)) { G.broken = 1; pthread_mutex_unlock(&G.mu); return -1; }
+        if (pthread_create(&G.th, nullptr, service, nullptr) || pthread_create(&G.th2, nullptr, completer, nullptr)) { G.broken = 1; gd_note_broken(); pthread_mutex_unlock(&G.mu); return -1; }
         pthread_detach(G.th); pthread_detach(G.th2);
     }
     gd_slot *S = nullptr;
