@@ -4,7 +4,8 @@
 #      (UFSM_TEST_NAN_LOGITS=1) the run reports the slabs and fails (exit 1), also on the host --fit-fields path;
 #  #17 --resume: predict-run-<level>.json (and the store's attrs) carry the run (checkpoint sha256, window, halo, q, ...); a resume of the
 #      same run goes on, also when zarr.json lost the record (and skips
-#      the listed shards), one with another q / window / checkpoint, or over a store written before the run record, is refused (exit 2).
+#      the listed shards), one with another q / window / checkpoint, or over a store written before the run record, is refused (exit 2);
+#  #18 a device OOM (forced: UFSM_TEST_MALLOC_FAIL_MB) exits non-zero and leaves no fields.json.
 # Usage: test_predict_guard.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
 U=$(readlink -f "$1"); MF=$(readlink -f "$2"); D=$3
@@ -53,4 +54,13 @@ refuse rc.log b/last.ckpt fx ct r "${P[@]}" "${R[@]}" --box 0,0,0,128,128,128
 sed -E 's/,"run":\{[^}]*\}//' zarr.json.keep > "$ZJ"; cp "$ZJ" zarr.json.keep; rm -f "$RJ"   # (a store of an older binary: neither record)
 refuse ro.log a/last.ckpt fx ct r "${P[@]}" "${R[@]}" --box 0,0,0,128,128,128
 grep -q 'an unrecorded (older binary) run' ro.log || fail "the old-store message ($D/ro.log)"
+# ---- #18 ---- (inksdk 11-20: a device OOM must fail the run and leave no completion marker; UFSM_TEST_MALLOC_FAIL_MB forces the stop path)
+for M in 1 64; do
+  set +e; UFSM_TEST_MALLOC_FAIL_MB=$M "$U" predict a/last.ckpt fx ct po$M "${F[@]}" --fit-zarr po$M/fz > po$M.log 2>&1; rc=$?; set -e
+  [ "$rc" != 0 ] || fail "a forced OOM (>= $M MB) exited 0 ($D/po$M.log)"
+  grep -q 'out of memory' po$M.log || fail "no OOM message ($D/po$M.log)"
+  [ ! -e po$M/fz/fields.json ] || fail "a forced OOM left fields.json ($D/po$M.log)"
+done
+set +e; UFSM_TEST_MALLOC_FAIL_MB=1 "$U" predict a/last.ckpt fx ct pq "${P[@]}" --box 0,0,0,128,128,128 --window 128 --halo 16 > pq.log 2>&1; rc=$?; set -e
+[ "$rc" != 0 ] || fail "a forced OOM (store output) exited 0 ($D/pq.log)"
 echo "test_predict_guard: ok"

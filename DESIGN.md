@@ -47,7 +47,191 @@ C15; ~87 s per channel): traces A (dyad, no gate) and B (q2 MFREF joined fit as 
 count-field `--fibers` ties (fiber-export, --cf-fib-spans 64,256), scored on C2 / C6 / C12 / C15 against the no-tie MFREF ref.
 Results below when scored.
 
+## Layer fibre orientation in the CT does not separate touching sheets at 2.4 um either (2026-11-19, branch orient-20261119, mergeflag)
+
+**Question (user via lead).** Each sheet is a recto layer (horizontal fibres) on a verso layer (vertical fibres). At 2.4 um, does
+the dominant in-plane fibre direction in the raw CT alternate H -> V -> H -> V once per sheet, even through contacts where density
+shows a single papyrus run? Gate: >= 0.9 V -> H flips per GT turn below 70 um normal gap, with a low false rate in open sheets.
+
+**Tool.** `gt-trans --orient SIG,RHO` (src/gttrans.c) uses the same rays, GT intervals and normal-gap rule as the CT-peaks and rv
+rows ("Recto / verso and fibre direction do not separate touching sheets either"). It needs no net:
+- The 3-D structure tensor of the CT: gaussian derivative SIG, integration RHO, in CT voxels. It is computed per box plane on 128^2
+  tiles from one z stack; tiles with no CT or no GT codes are skipped.
+- The tensor is projected on the plane of z (the scroll axis) and the sheet's in-slice tangent, taken from the GT label's normal
+  rather than the ray. With the ray, oblique sheets would leak their own faces into the tangential gradient.
+- A sample is H when the gradient lies along z (fibres along the tangent), V when it lies along the tangent. It needs coherence
+  >= `--orient-coh` and |cos 2a| > `--orient-margin`; otherwise it keeps the last state.
+- `--orient-persist UM`: a new state counts only once it has held over UM of classified samples (lead: about 1/3 of a sheet).
+- `--ct-l` / `--ct-p` scale the CT detector's windows. At 2.4 um it runs at equal physics (4.8 / 48 / 96), as in "Packed sheets are
+  not resolved by finer CT".
+- test_gttrans builds textured recto (z stripes) / verso (arc stripes) layers, 5 voxels each, packed in contact and spaced. It
+  counts 1.000 V -> H per GT turn in both, and 0.92 / 1.00 with a 20 um persistence.
+
+**Runs.** Paris 4 PH1-3 and HOLD (q-9p6 codes, --nz 8) and J1-34 (July codes B, --nz 4 at 2.4 um).
+- 2.4 um: L0 from the NAS (volcomp mount). 9.6 um control: level 2.
+- Base: sigma 1.5 / rho 2 voxels. Strict: coherence 0.5, margin 0.5.
+- PH + HOLD at 2.4 um swept coherence {0.2, 0.5} x persistence {8, 16, 25 um}; each arm ~1.6 min on 6 threads.
+- Columns below: V -> H flips per GT turn; "off" is the share of intervals with |flips - turns| >= 0.5. In the open sheets
+  (normal gap >= 150 um), flips per mm of normal path and the excess (flips - turns) per mm, i.e. the false rate.
+- The H -> V direction is within +-0.05 of V -> H everywhere.
+
+| arm | box | < 50 | 50-70 | < 70 | off < 70 | >= 150 /turn | /mm | excess /mm |
+|---|---|---|---|---|---|---|---|---|
+| CT peaks 2.4 um (b) | PH / HOLD | 0.42 / 0.39 | 0.71 / 0.58 | 0.61 / 0.56 | | | | |
+| 2.4 base | PH | 0.71 | 1.17 | **1.01** | 0.53 | 2.85 | 13.9 | 9.1 |
+| 2.4 base | HOLD | 0.45 | 0.59 | 0.57 | 0.53 | 1.92 | 9.9 | 4.7 |
+| 2.4 base | J | 0.32 | 0.81 | 0.57 | 0.60 | 2.31 | 10.4 | 5.9 |
+| 2.4 coh 0.2, persist 8 | PH / HOLD | 0.54 / 0.32 | 0.87 / 0.47 | 0.76 / 0.45 | 0.54 / 0.59 | 2.12 / 1.46 | 10.4 / 7.5 | 5.5 / 2.4 |
+| 2.4 coh 0.2, persist 16 | PH / HOLD | 0.36 / 0.23 | 0.57 / 0.34 | 0.50 / 0.33 | 0.60 / 0.68 | 1.36 / 0.99 | 6.6 / 5.1 | 1.8 / -0.0 |
+| 2.4 coh 0.2, persist 25 | PH / HOLD | 0.23 / 0.21 | 0.35 / 0.21 | 0.31 / 0.21 | 0.72 / 0.79 | 0.79 / 0.63 | 3.9 / 3.2 | -1.0 / -1.9 |
+| 2.4 strict (coh 0.5) | PH / HOLD | 0.36 / 0.22 | 0.56 / 0.32 | 0.49 / 0.31 | 0.61 / 0.70 | 1.31 / 0.94 | 6.4 / 4.8 | 1.5 / -0.3 |
+| 2.4 strict | J | 0.14 | 0.40 | 0.27 | 0.75 | 1.09 | 4.9 | 0.4 |
+| 2.4 coh 0.5, persist 8 | PH / HOLD | 0.27 / 0.20 | 0.41 / 0.23 | 0.36 / 0.23 | 0.69 / 0.77 | 0.92 / 0.70 | 4.5 / 3.6 | -0.4 / -1.6 |
+| 2.4 coh 0.5, persist 16 | PH / HOLD | 0.19 / 0.15 | 0.28 / 0.17 | 0.25 / 0.17 | 0.77 / 0.83 | 0.59 / 0.50 | 2.9 / 2.6 | -2.0 / -2.6 |
+| 9.6 control, base | PH / HOLD / J | 0.17 / 0.13 / 0.08 | 0.28 / 0.17 / 0.22 | 0.24 / 0.16 / 0.15 | 0.77 / 0.84 / 0.85 | 0.64 / 0.51 / 0.57 | 3.1 / 2.6 / 2.6 | -1.8 / -2.6 / -1.9 |
+
+**Gate: not met.**
+- Without filtering, PH reaches 1.01 per turn below 70 um. That is the noise rate, not the layers. The base arm flips at a constant
+  ~1.8-1.9 per 100 um of normal path in every gap bucket (< 50 through >= 115: 1.89 / 1.92 / 1.82 / 1.80 / 1.72 / 1.49). In open
+  sheets this gives 2.85 flips per turn and 9 false flips per mm.
+- Coherence and persistence remove the false flips. Every setting that brings the open-sheet excess to about 0 (PH: coh 0.5 /
+  persist 8; HOLD: coh 0.2 / persist 16 or strict) leaves 0.23-0.36 per turn below 70 um. That is below the CT peaks there
+  (0.56-0.61) and below the rv head (0.25-0.45, previous section).
+- Even at the zero-excess settings, the open-sheet "off" share is 0.5-0.7. The surviving flips do not fall one per interval; they
+  only average out.
+- 9.6 um has no orientation signal at contacts: 0.15-0.24 per turn below 70 um.
+
+**Reading.** At 2.4 um the CT's texture direction inside the papyrus changes about every 50 um at any spacing. That is fibre bundles,
+cracks and noise, not a clean recto / verso alternation. Once that is suppressed, the per-sheet alternation is not there to count,
+even in open sheets. With the CT peaks (section "Packed sheets are not resolved by finer CT") and try9's rv / fibre heads, this is the
+third signal that fails the contact gate. No CT-side measure here separates touching sheets at 2.4 um. Data and scripts:
+/vesuvius/ufsm/wgraph/orient (full.sh, pers.sh, bk.awk; one tsv per arm).
+
+## Fully adaptive Muon, part 2: online kappa for DoG, autocool, DoWG (2026-11-19, branch admuon2-20261119, trainperf) -- CODE + TESTS, GPU A/B pending
+
+The 11-14 DoG collapse (eta 1.6 % of the lr by update 80) came from its fixed random-walk factor kappa = (1 + b) / (1 - b) (39 at
+b 0.95): Muon's orthogonalised directions decorrelate within a few steps (probe kappa16 2.2 -> 5.5 on try9, train smoke 3.9 -> 6.7),
+so DoG's G grew ~7x faster than the distance. The scalar controllers now live in `src/admctl.h` (plain C, shared by the one-thread
+GPU controller `ad_ctl_k` and the host test); the sample statistics come from the direction probe, which also samples the weights.
+
+- **Online kappa** (default with `--muon-dog`; `--muon-dog-kappa fixed` = the old factor): on the probe subsample (stride 64 when
+  `--muon-probe` is not given), e = lam e + v, c = <v, e_prev>, q = |v|^2, EMAs (`--muon-kappa-beta` 0.98), kappa = 1 + 2 cbar / qbar
+  clamped to [1, (1 + b) / (1 - b)]; lam = 1 - (1 - b) / 8. DoG's G accumulates kappa_t sched^2 |v|^2 (a walk whose correlation
+  changes has variance sum kappa_t |step|^2), so `adm_dog` keeps the 11-14 state layout and fixed-kappa runs are bit-identical.
+  A resume keeps the saved EMAs until e is refilled (8 / (1 - b) updates).
+- **`--muon-dog-w 1`**: DoWG (eta = rbar^2 / sqrt(sum rbar^2 kappa sched^2 |v|^2)). On an unbounded noisy walk it has no fixed point
+  (eta -> sqrt 2 eta per doubling; climbs to the cap in the CPU test): an option for the A/B, not a default.
+- **`--muon-autocool 1`** (now part of `--muon-adaptive`): a global lr factor f (x the schedule; also inside DoG's sched) that halves
+  (`-decay` 0.5, `-floor` 0.01) after a stationary block of M (`-m` 3) windows of N (`-n` 100) updates. Two statistics on the probe:
+  - centred FDR z = sum(2 (theta - c).D - |D|^2) / sum |D|^2 over the block, D the applied step, c a slow EMA of theta (horizon N M).
+    Yaida's relation holds for any fixed centre and any update rule; about c = 0 the theta.D noise grows as |theta| / |D|, i.e. 1 / f
+    (window z +-5 at f 1/8 on the test quadratic: chance decisions). The moving centre is corrected exactly
+    (+ ((1 - ck)^-2 - 1) |theta - c'|^2 per step; uncorrected z sat at -5.7 at stationarity). Pass: |z| < `-delta` 0.2.
+  - progress fraction r = |sum D|^2 / (N sum |D|^2) per window: 1 a drift, ~kappa / N noise, ~0 in a basin. Pass: every window < `-c`
+    0.2. (The first design normalised by the online kappa: a drift is long-range correlation and drives kappa to its clamp, pk stayed
+    ~2 on a pure slope. A single 50-update window's z was +-0.5 noise at stationarity, hence the blocks.)
+  The GT watchdog stays external. Logged on every --opt-stats line: `kappa`, `cool f z r stat dec`.
+- State: AD_NST = 32 doubles (rbar, G, eta, dist, kappa EMAs, autocool). Device: 4 x the probe's sample count floats (e, theta_prev,
+  theta_start, centre; 97 KB at the smoke net, ~6.5 MB at 104 M parameters / 64), statistics in one fixed 64 x 256 grid with
+  fixed-order partials (data-parallel replicas identical; every rank now takes the same probe stride, logging stays on GPU 0).
+  Checkpoint keys `adm_kap` [cbar, qbar, kappa, n] and `adm_cool` [f, windows, decays], written only when on.
+
+Tests:
+- `test_admctl` (CPU, 2.3 s): kappa white 1.03, AR(0.5) 2.90 (tapered 2.99, true 3), AR(0.9) 17.6 (tapered 18.0, true 19), drift
+  = the clamp 39; resume holds kappa over the refill. DoG eta / eta0 after 1500 AR(0.9) updates: fixed kappa 19 **0.29** (the
+  collapse), kappa 1 the cap (100), online **1.65**; white noise online 0.65; a drift reaches the cap. Autocool on a heavy-ball
+  quadratic (2000 coordinates, curvatures 0.002-0.2, start 30 sigma out, noise 1): first decay at step 2121 at **1.00 x** the uncooled
+  noise floor (0.125), 6 decays, final loss **0.09 x** the floor; a pure noisy slope: no decay.
+- `test_admuon` test_adapt2 (GPU): online kappa + DoG + autocool through adm_stat_k / ad_ctl_k equal the host controllers fed the
+  device's own probe samples, worst rel 2.4e-7 (with and without NorMuon); the old adapt / scale cases unchanged.
+- Train smoke (wind fixture, P 64, 12 + 4 steps, --muon-adaptive 1 and forced autocool thresholds): kappa 3.9 -> 6.7, DoG eta grows
+  1.8e-3 -> 2.3e-3 (lr 2e-3), one decay; resume "resumed kappa 6.72 (12 samples), autocool f 0.5"; `--muon-dog-w 1 --muon-dog-kappa
+  fixed` writes no new keys.
+
+GPU A/B: no longer on try9 winding fine-tunes (user 11-19: no winding-model work); planned on the 3-D ink run or the rv / fibre
+fine-tune with inksdk: (a) NorMuon, (e) NorMuon + autocool, (b) NorMuon + LARS + DoG (online kappa) + autocool.
+
+## try9 end: GT sweep of the snapshots, the cooldown, and where fully adaptive Muon stopped (2026-11-19, trainperf)
+
+**Is try9 still improving on GT?** Phase-miss share (merge-flag --eval --gap-report 100 --thr 179, mergeflag's recipe: origin / axis
+from the reference fields, 0 interval mismatches vs t16 / u1mn on every row) on Paris 4 (38 boxes: PH1-3, J1-34, HOLD) and the 9 1667
+boxes of the u1 / try9 rows; window 640 / halo 64, --gn-live 1, the rvsep predict binary (unrollperf's t16 recipe); lower is better.
+1667 wbench ids: the same 9 boxes, fixed-fields CPU fit (higher is better). Scripts: /vesuvius/ufsm/trainperf/gt36/.
+
+| step | weights | P4 all | PH1-3 | J | HOLD | 1667 phase-miss | 1667 ids |
+|---|---|---|---|---|---|---|---|
+| 15000 | EMA (per update, ~10k-window horizon) | 0.617 | 0.892 | 0.626 | 0.300 | 0.266 | |
+| 15000 | live | 0.426 | 0.732 | 0.419 | 0.247 | 0.181 | |
+| 16000 | live | 0.379 | 0.606 | 0.381 | 0.174 | 0.172 | 0.802 |
+| 20000 | EMA (per window since the 16850 swap) | 0.463 | 0.742 | 0.467 | 0.194 | 0.180 | |
+| 25000 | EMA | 0.412 | 0.692 | 0.414 | 0.171 | 0.175 | |
+| 30000 | EMA | 0.404 | 0.695 | 0.403 | 0.176 | 0.166 | |
+| 36000 | EMA | 0.422 | 0.715 | 0.424 | 0.169 | 0.171 | 0.842 |
+| 36000 | live | 0.449 | 0.750 | 0.452 | 0.181 | 0.180 | 0.790 |
+| 37000 | EMA | 0.414 | 0.713 | 0.415 | 0.164 | 0.168 | |
+| cooled 33333 | EMA | 0.418 | 0.686 | 0.422 | 0.158 | 0.170 | 0.841 |
+| cooled 33333 | live | 0.435 | 0.729 | 0.438 | 0.163 | 0.172 | 0.842 |
+| u1 / try9 EMA-12750 (refs) | | | | | | 0.183 / 0.234 | 0.813 / 0.796 |
+
+- Snapshot-to-snapshot noise on P4 is ~+-0.03-0.04 (15000 live 0.426 vs 16000 live 0.379, 1000 steps apart), so there is no turn point:
+  after the per-window EMA settled (25000 on) P4 sits at 0.40-0.42 and 1667 at 0.166-0.175. 16000 is a lucky snapshot, not a peak.
+- Window 256 instead of 640 costs +0.14 P4 phase-miss on the same weights (16000: 0.520 vs 0.379): score only at the production window.
+- The per-update EMA was harmful (15000 EMA far behind its own live weights); the per-window EMA (--ema 0.9995 --ema-per window, swap
+  5aae217f at 16850) beats live at 36000 on both scrolls (P4 -0.027, 1667 ids +0.052).
+- Cooldown (user 11-19: kill the constant-lr run): from snap/30000 with try9's launch.env (5aae217f, NorMuon, per-window EMA, item-C
+  layout), runs/try9cool, --steps 33333 --cooldown 0.1: lr 3e-4 -> 0 linear over 30000 -> 33333 (launched via runs/cool.launch /
+  cool.train.sh, copies of scratch2.launch / .train.sh with a COOL fraction). Result: the live weights reach the EMA weights' level,
+  nothing beyond it. With the per-window EMA the cooldown is redundant; any late EMA checkpoint is the production try9.
+
+**Fully adaptive Muon, part 2 (branch admuon2-20261119, not merged; user stopped the winding training before its arms ran).**
+- `train --muon-probe S` (256126fa): every S-th element of each Muon matrix's final direction (NorMuon rows included) read back per
+  update; the --opt-stats line gets rho_k (lag 1, 2, 4, 8, 16 cosine of successive directions), kappa16 = 1 + 2 sum rho_k (the
+  random-walk factor DoG's kappa = (1 + b) / (1 - b) = 39 assumes) and prog16 = |sum of 16 steps| / sum |step|; DoG's G added to the line.
+- 85f54bfe: a --resume may add or drop the adaptive controllers (+la / +dg): the optimizer-tag check ignores them (momentum and NorMuon
+  rows carry over). The first DoG diagnosis arm had been refused by that check (rc 2).
+- Diagnosis: only the NorMuon arm ran, 3 updates (resumed snap/30000, P 768, accum 5) before the stop: rho_1 0.62 -> 0.77 -> 0.84,
+  rho_2 0.65 -> 0.76, kappa16 (truncated at the available lags) 2.2 -> 5.5 while the momentum refilled. Not enough for a verdict on
+  whether the measured kappa sits far below 39 (the hypothesis for DoG's collapse).
+- Designed, not coded: kappa estimated online on the probe subsample (EMA of <v_t, e_t> / |v_t|^2 with e an exponentially weighted sum
+  of past directions), DoG reformulated as eta = rbar / sqrt(kappa_hat G_raw) so kappa may change; an autocool controller from the
+  fluctuation-dissipation relation (Yaida 2018 / SASA) plus prog_K vs sqrt(kappa / K). Notes: /vesuvius/ufsm/trainperf/admuon2/design.txt.
+
 ## resgate: 9.6 um detail arms fine-tuned on the GT boxes, PARTIAL (R0, R2 only; stopped 2026-11-19 by the user's "stop winding training")
+## mcc CUDA backend: device inlining, constant tables, vector memory, f16 round trips (2026-11-20, microc branch cudaopt-20261119, mcuda)
+
+Question: where does mcc's PTX lose to nvcc's, and what closes it? Measured on the laptop forlinlapnvidia (RTX 4060, sm_89, ARCH 86
+software MX) with a try9-shaped 12-step training on a fixture (P 256, widths 256,320,384,448,288,288, --lat 4, --fstem 16, nsys GPU
+kernel time). The sm_120a production kernels cannot run there: they were compared statically (ptxas 13.3 sm_120a on mcc's PTX, the
+last copy of each .entry, against nvcc 13.3's objects; MMA-loop SASS counts).
+
+| build | GPU kernel time | vs nvcc |
+|---|---|---|
+| nvcc 13.3 (clang host) | 19.99 s | 1.00 |
+| mcc main (285d308) | 23.42 s | 1.17 |
+| + device inlining 300 / 400 | 19.34 s | 0.97 |
+| + const tables, vector ld/st, f16 round trips (cudaopt-20261119) | 19.28 s | 0.96 |
+
+- Device inlining was the gap: mcc inlined device functions of at most 12 IR instructions (the host limit), so every call left in a
+  kernel passed arguments and address-taken objects through local memory. At 300 instructions / 400 blocks: conv_*_s2_f8 3.3-3.8x
+  faster, conv_fwd_f4_k -12 %, JIT of the 51 s2 kernels 417 -> 225 CPU s, sm_120a CALLs 305 -> 88. 1000 gives nothing more.
+- Against inlining alone: fstem_fwd_k -13 % (its FLW table was 78 generic loads through mcudahw's global table: now immediates; its
+  __half values went f16 -> f32 -> f16 -> f32: 154 / 209 conversions against nvcc's 49 / 74), conv_bwd_w1_tc -9 %, lat_fuse -6 %;
+  nothing else moved by more than 3 %. Vector types got CUDA's alignment, so a float4 / uint4 / __half2 copy is one ld/st.v4 / v2
+  (PTX vector ops 3.4k -> 58k); ptxas had already merged most shared ones, which is why the time barely moved.
+- Device LICM, which mcc has but keeps off in device code, cut conv_fwd_s2_f8_k<8>'s MMA-loop SASS 663 -> 340 (nvcc 218), but on the
+  GPU that kernel ran exactly as before and bwd_data_s2_f4_k<4,8> was 31 % slower (6.87 -> 8.96 ms a launch); unguarded it doubles
+  ptxas spills over ufsm (65.7 -> 120.7 KB). Left opt-in (MCC_LICMPHI). mcc's MMA-loop counts overstate: hot.py takes the address
+  range of a backward branch, and mcc's block layout puts out-of-line code inside it. Static counts pick candidates; only the GPU
+  decides.
+- Still slower than nvcc: conv_fwd_f4_k 1.05x (47 % of the step), conv_fwd_s2_f8 1.25x, conv_bwd_w_s2_f8 1.13x, sum_k 1.45x;
+  conv_bwd_w_f4_k stays 0.81x (mcc wins). sm_120a ptxas totals: stack 140 KB against nvcc's 79 KB, mostly in non-hot kernels
+  (loss_stats / grad ~2.4 % of a step).
+- Fast tier on the laptop with the branch: the same failures as mcc main without it (the laptop baseline already fails 18:
+  gscale, parity, predict_heads, latents, accum ... on its 8 GB GPU). main itself fails test_patchsolve, test_repair (l1 grid) and
+  test_wbench_stats, which the pin 5744025 passes: host code, first bad commit 84903be "x86-64: loops unswitched on a value they do
+  not change". So the pin must not move to main as it is.
+- Pin: unchanged. Moving it needs the fix of 84903be upstream, the fast tier on a desk / pod (sm_120) and a GPU A/B against the old pin.
+ 9.6 um detail arms fine-tuned on the GT boxes, PARTIAL (R0, R2 only; stopped 2026-11-19 by the user's "stop winding training")
 
 Question: is try9's sheet detail limited by the latent input or by the fine stem? Each arm used try9's architecture (widths
 256,320,384,448,288,288, attention 4 + scroll PE, gfilm, sub-cell head) warm-started from try9-16000 weights. The from-scratch versions sat

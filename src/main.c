@@ -297,6 +297,7 @@ static int usage(void) {
         "  ufsm phase-conflict <a-root> <a-key> <b-root> <b-key> <out>   where two label phase sets disagree (> --tol turn): the sampler's phase ignore mask\n"
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
         "  ufsm fiber-contacts <afv> --map reg.json --boxes B.tsv --names A,B --codes R K --axis U.json   H / V fibre contacts vs GT: same sheet or adjacent (wgraph order test)\n"
+        "  ufsm fiber-mfstat F.fib FIELDS [--every 128 --spans 64,256 --thr 179]   share of count-field's fibre pairs crossing merge-flagged cells\n"
         "  ufsm fiber-check <afv> --tr T.json --boxes B.tsv --names A,B --codes R K --phase R K   do published fibre polylines link points of one GT sheet?\n"
         "  ufsm fiber-export <afv> <fields-dir> <out.fib> --tr T.json    fibre polylines in a fit box's coordinates for fit --fibers\n"
         "  ufsm fiber-regscore <afv> (--map reg.json | --tr T.json) --pred ROOT KEY   a scan-to-scan map scored by fibre presence along mapped fibres (per-region residual shifts)\n"
@@ -4880,6 +4881,7 @@ int cmd_strip_mosaic(int argc, char **argv);
 int cmd_strip_crop(int argc, char **argv);
 int cmd_fiber_check(int argc, char **argv);    /* src/fibercheck.c */
 int cmd_fiber_contacts(int argc, char **argv);   /* src/fibcontact.c */
+int cmd_fiber_mfstat(int argc, char **argv);   /* src/fibcontact.c */
 int cmd_fiber_export(int argc, char **argv);   /* src/fibercheck.c */
 int cmd_fiber_regscore(int argc, char **argv);   /* src/fibregscore.c */
 int cmd_fit_phase_box(int argc, char **argv);  /* src/fitphase.c */
@@ -4963,6 +4965,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-link")) return cmd_fiber_link(argc, argv);
     if (!strcmp(cmd, "fiber-check")) return cmd_fiber_check(argc, argv);
     if (!strcmp(cmd, "fiber-contacts")) return cmd_fiber_contacts(argc, argv);
+    if (!strcmp(cmd, "fiber-mfstat")) return cmd_fiber_mfstat(argc, argv);
     if (!strcmp(cmd, "fiber-export")) return cmd_fiber_export(argc, argv);
     if (!strcmp(cmd, "fiber-regscore")) return cmd_fiber_regscore(argc, argv);
     if (!strcmp(cmd, "fit-phase-box")) return cmd_fit_phase_box(argc, argv);

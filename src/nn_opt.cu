@@ -1,5 +1,6 @@
 /* CUDA ops: opt section of the former nn.cu */
 #include "nn_common.cuh"
+#include "admctl.h"
 
 __global__ void adamw_k(float *p, const float *g, float *m, float *v, size_t n, float lr, float b1, float b2, float eps, float wd, float c1, float c2) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -515,13 +516,17 @@ __global__ void mopt_apply_k(const muon_desc_t *d, int swap, int mc, const int *
        (weight decay is a regulariser, not progress). rbar_0 = eta0 |v_1| (eta0 = --muon-lr), so the first step is Muon's; eta is
        capped at dog_max. Applied lr = sched x eta x m_i (sched = the scheduled lr / lr_peak: warmup and the WSD cooldown stay on top).
        Consistent directions make the distance grow faster than sqrt(G): eta grows; a random walk keeps it; oscillation shrinks it.
-   dog: [rbar, G, eta, |x - x_0|]. All sums are fixed-order partials: every data-parallel replica computes the same multipliers. */
+   dog: [rbar, G, eta, |x - x_0|, ...] (AD_NST, src/admctl.h). All sums are fixed-order partials: every data-parallel replica computes the
+   same multipliers. admuon2 (2026-11-19): the scalar controllers live in src/admctl.h (shared with tests/test_admctl.c); on_kap replaces
+   the fixed kappa by the online estimate from the direction probe (the fixed one collapsed eta to 1.6 % of the lr by update 80 on scroll
+   data: Muon's directions decorrelate within a few steps), on_dog 2 is DoWG, on_cool the autocool factor (x the schedule, also inside
+   DoG's sched). */
 static nn_madapt g_ad; static int g_ad_on;
 static const float *g_lrm0; static int g_fro;   /* mgpu: process (set once before training, like g_ad); static per-matrix lr multipliers (trunk / stage: audit muon #1); --muon-fro 1 */
 extern "C" void nn_muon_ext_lrmult(const float *m) { g_lrm0 = m; }
 extern "C" void nn_muon_ext_fro(int on) { g_fro = on; }
 extern "C" void nn_muon_ext_adapt(const nn_madapt *a) { g_ad_on = a != nullptr; if (a) g_ad = *a; }
-__global__ void ad_ctl_k(const muon_desc_t *d, int n, const double *po, const double *pw, nn_madapt a, float lr, const float *m0) {
+__global__ void ad_ctl_k(const muon_desc_t *d, int n, const double *po, const double *pw, nn_madapt a, float lr, float beta, const float *m0) {
     if (threadIdx.x) return;
     double lsum = 0;
     for (int i = 0; i < n; i++) {
@@ -537,14 +542,51 @@ __global__ void ad_ctl_k(const muon_desc_t *d, int n, const double *po, const do
         if (a.base) m *= a.base[i];   /* (--attn-muon-lr: the fixed multipliers) */
         v2 += m * m * (double)a.lrm[i] * a.lrm[i]; a.lrm[i] = (float)m;
     }
-    if (a.on_dog) {
-        double *D = a.dog; const double sched = (double)lr / a.lr_peak, gi = (double)a.dog_kappa * sched * sched * v2;
-        if (D[1] <= 0.0 && gi > 0.0) D[0] = fmax(D[0], (double)a.dog_eta0 * sqrt(gi));
-        D[1] += gi; D[0] = fmax(D[0], D[3]);
-        D[2] = D[1] > 0.0 ? fmin(D[0] / sqrt(D[1]), (double)a.dog_max) : (double)a.dog_eta0;
-        const float f = (float)(D[2] / a.lr_peak); for (int i = 0; i < n; i++) a.lrm[i] *= f;
+    double *S = a.dog, kap = a.dog_kappa, cf = 1.0;
+    if (a.on_kap || a.on_cool) {   /* admuon2: the probe statistics (adm_stat_k's fixed-order partials) through the shared controllers */
+        double t[6]; for (int k = 0; k < 6; k++) { double s = 0; for (int j = 0; j < 64; j++) s += a.xpart[k * 64 + j]; t[k] = s; }
+        if (a.on_kap) { adm_kap(S, t[0], t[1], beta, a.kap_b); kap = adm_kappa(S); }
+        if (a.on_cool) { adm_cool(S, t[2], t[3], t[5], t[4], adm_cool_cfg{a.cool_n, a.cool_m, a.cool_delta, a.cool_c, a.cool_decay, a.cool_floor}); cf = adm_cool_f(S); }
     }
+    double f = cf;
+    if (a.on_dog) f *= adm_dog(S, kap, cf * lr / a.lr_peak, v2, a.dog_eta0, a.dog_max, a.on_dog == 2) / a.lr_peak;
+    if (f != 1.0) for (int i = 0; i < n; i++) a.lrm[i] *= (float)f;
     if (m0) for (int i = 0; i < n; i++) a.lrm[i] *= m0[i];   /* the static trunk / stage multipliers on top (not part of the control loop) */
+}
+/* Direction probe (2026-11-19, admuon2; DESIGN "Fully adaptive Muon, part 2"): every S-th element of each matrix's final direction
+   s_i O_i (NorMuon's rows included, before the lr / adaptive multipliers) into buf[off[base + c] + j], j = i / S. An unbiased subsample
+   of the pooled inner products <v_t, v_t-k> (the momentum's autocorrelation) at 1 / S of the cost. nn_muon_probe(nullptr, ..): off. */
+static float *g_pr_buf; static const long long *g_pr_off; static int g_pr_stride, g_pr_base; static long long g_pr_tot;   /* mgpu: main (the optimizer step runs on the main thread; muon_ext sets them right before each rank's nn_muon_ext_batch and clears them after) */
+extern "C" void nn_muon_probe(float *buf, const long long *off, int stride, int base, long long tot) { g_pr_buf = buf; g_pr_off = off; g_pr_stride = stride; g_pr_base = base; g_pr_tot = tot; }
+__global__ void probe_k(const muon_desc_t *d, int swap, float *buf, const long long *off, int S, long long tot) {   /* (the weights before the step at buf + tot) */
+    const muon_desc_t D = d[blockIdx.y]; const float *O = swap ? D.Y : D.X; const size_t n = (size_t)D.Co * D.K, m = (n + S - 1) / (size_t)S;
+    const float sc = muon_scale(D.Co, D.K); float *b = buf + off[blockIdx.y];
+    for (size_t j = blockIdx.x * (size_t)blockDim.x + threadIdx.x; j < m; j += (size_t)gridDim.x * blockDim.x) { b[j] = sc * O[j * (size_t)S]; b[tot + j] = D.p[j * (size_t)S]; }
+}
+/* admuon2's probe statistics (src/admctl.h), one fixed 64 x 256 grid (fixed-order partials into xp[k * 64 + block]): v = buf[0, M), theta =
+   buf[M, 2M); ext = [e | theta_prev | theta_start | centre], M floats each. 0: <v, e_prev>, 1: |v|^2 (then e = lam e + v); with S[AD_TV]
+   2: <theta_prev - centre, D>, 3: |D|^2 (D = theta_prev - theta), then centre += ck (theta - centre) (without: centre = theta), 5:
+   |theta - centre|^2; 4: |theta - theta_start|^2 (S[AD_WS]: theta_start = theta first). */
+__global__ void __launch_bounds__(256) adm_stat_k(const float *buf, long long M, float *ext, const double *S, float lam, float ck, int kap, int cool, double *xp) {
+    float *E = ext, *TP = ext + M, *TS = ext + 2 * M, *TC = ext + 3 * M; const int tv = cool && S[AD_TV] != 0.0, ws = cool && S[AD_WS] != 0.0;
+    double r[6] = {0, 0, 0, 0, 0, 0};
+    for (long long j = blockIdx.x * (long long)blockDim.x + threadIdx.x; j < M; j += (long long)gridDim.x * blockDim.x) {
+        if (kap) { const float v = buf[j], e = E[j]; r[0] += (double)v * e; r[1] += (double)v * v; E[j] = lam * e + v; }
+        if (cool) {
+            const float t = buf[M + j];
+            if (tv) { const float tp = TP[j], dd = tp - t, c = TC[j]; r[2] += (double)(tp - c) * dd; r[3] += (double)dd * dd; const float cn = c + ck * (t - c); TC[j] = cn; r[5] += (double)(t - cn) * (t - cn); }
+            else TC[j] = t;
+            TP[j] = t;
+            if (ws) TS[j] = t; else { const float w = t - TS[j]; r[4] += (double)w * w; }
+        }
+    }
+    __shared__ double sh[256];
+    for (int k = 0; k < 6; k++) {
+        sh[threadIdx.x] = r[k]; __syncthreads();
+        for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) sh[threadIdx.x] += sh[threadIdx.x + o]; __syncthreads(); }
+        if (threadIdx.x == 0) xp[k * 64 + blockIdx.x] = sh[0];
+        __syncthreads();
+    }
 }
 __global__ void ad_dist_k(const double *pd, int n, double *dog) { if (threadIdx.x) return; double s = 0; for (int j = 0; j < 32 * n; j++) s += pd[j]; dog[3] = sqrt(s); }
 __global__ void hb_proj_k(const muon_desc_t *d, const int *hb, const float *R, const double *pw) {   /* back onto the sphere |W|_F = R */
@@ -662,9 +704,14 @@ extern "C" void nn_muon_ext_batch(const void *descs, int nconv, int maxco, int m
     if (r_init) { mopt_sumsq_k<<<g2, 256>>>(d, -1, pb); hb_rinit_k<<<nconv, 32>>>(hb, R, pb); }
     mopt_sumsq_k<<<g2, 256>>>(d, swap, pa);
     const float *lrm = g_lrm0; const int mcf = mcd != nullptr || g_fro; float *const *disp = nullptr; double *pd = nullptr;
+    if (g_pr_buf && !mcd) probe_k<<<g2, 256>>>(d, swap, g_pr_buf, g_pr_off + g_pr_base, g_pr_stride, g_pr_tot);   /* (O and W before the apply) */
+    if (g_ad_on && (g_ad.on_kap || g_ad.on_cool)) {
+        if (!g_pr_buf || mcd || g_pr_base || g_pr_tot <= 0) { fprintf(stderr, "adaptive Muon: online kappa / autocool need the probe over the whole table\n"); abort(); }
+        adm_stat_k<<<64, 256>>>(g_pr_buf, g_pr_tot, g_ad.ext, g_ad.dog, (float)adm_lam(beta), (float)(1.0 / ((double)g_ad.cool_n * g_ad.cool_m)), g_ad.on_kap, g_ad.on_cool, g_ad.xpart);
+    }
     if (g_ad_on) {   /* adaptive Muon: |W|^2 per matrix, then the multipliers (one thread) */
         mopt_sumsq_k<<<g2, 256>>>(d, -1, g_ad.part);
-        ad_ctl_k<<<1, 32>>>(d, nconv, pa, g_ad.part, g_ad, lr, g_lrm0);
+        ad_ctl_k<<<1, 32>>>(d, nconv, pa, g_ad.part, g_ad, lr, beta, g_lrm0);
         lrm = g_ad.lrm; if (g_ad.on_dog) { disp = g_ad.disp; pd = g_ad.part + (size_t)32 * nconv; }
     }
     if (g_mst) mstat_k<<<g2, 256>>>(d, swap, lr, wd, lrm, mcf, pa, hb, R, hb_lr, g_mst + 2 * (size_t)g_mst_base);

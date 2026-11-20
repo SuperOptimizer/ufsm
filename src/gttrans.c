@@ -18,7 +18,13 @@
    outward) and the two intra-sheet flips at its ends: the boundary direction should count 1 per GT turn.
    OUT.tsv: one row per interval; stdout: per gap bucket (0-70 / 70-85 / 85-100 / 100-115 / ... um) turns, CT peaks, flips per GT
    turn and the share off by >= 0.5 turn, as the ctgt.py table (and the CT peaks again on the intervals with predictions: the same rays for both); also the peaks of the rv signal and of H - V (the CT detector on those
-   signals: recto-ruler's "peaks of the fused signal", one per sheet where the side runs alternate). */
+   signals: recto-ruler's "peaks of the fused signal", one per sheet where the side runs alternate).
+   --ct-l / --ct-p: the detector's local-sd and prominence windows (samples; 12 / 24 at 9.6 um, scale with the voxel for equal physics).
+   (d) --orient SIG,RHO: the layers' fibre orientation straight from the CT (no net): the 3-D structure tensor (gaussian derivative SIG,
+   integration RHO, CT voxels) of the CT (--orient-ct: another store on its grid) projected on the plane spanned by z (the scroll axis,
+   taken as z) and the sheet's in-slice tangent (from the GT label's normal); a sample is H (fibres perpendicular to the axis: the
+   gradient along z) where its coherence >= --orient-coh and cos 2a > --orient-margin, V where < -margin, else it keeps the last state
+   (also where CT < --orient-iso); --orient-persist UM: a new state must hold over UM of classified samples first; the V -> H / H -> V flips going outward per GT turn as (b). */
 #include "fit.h"
 #include "latfit.h"
 #include "lcodec.h"
@@ -44,10 +50,11 @@ static const char *gt_opt2(int argc, char **argv, const char *name, int k) {   /
 }
 
 typedef struct { char name[32]; int64_t b[6]; } gt_box;
-typedef struct { int box; int z; float rmm, dq, gap; int npk, rvf, rvb, fbf, fbb, rvok, fbok, rvpk, fhpk; } gt_row;
+typedef struct { int box; int z; float rmm, dq, gap; int npk, rvf, rvb, fbf, fbb, rvok, fbok, rvpk, fhpk, orf, orb, orok; } gt_row;
 typedef struct {
     z3 *ct, *cd, *cl, **rvz, **fhz, **fvz; int plocal; double ctum, cum, clum, bum, rvthr, fthr, fmar, sig;
-    const gt_box *bx; int nbox, nz, nth;
+    const gt_box *bx; int nbox, nz, nth, pkL, pkP;
+    z3 *oct; int orient, opers; double osig, orho, ocoh, omar, oiso;   /* --orient: the in-sheet fibre orientation from the CT structure tensor */
     const lat_basis *lb; int lc; double lstep, lcen, lsc;   /* --lat-rt: the CT through the latent cell codec first */
     const lcodec *lcd; double vcq;   /* --lat-codec: the learned codec instead (on --lat-rt's basis); --vc-rt Q: plain volcomp at quality Q instead */
     gt_row **rows; int *nrow, *cap;   /* per job */
@@ -94,14 +101,14 @@ static double bil(const float *img, int H, int W, double y, double x) {
     return (1 - ty) * ((1 - tx) * p[0] + tx * p[1]) + ty * ((1 - tx) * p[W] + tx * p[W + 1]);
 }
 /* ctgt.py's peaks(): wrap-check's detector, step 1 native; pk[i] = 1 at a peak */
-static void peaks(const double *C, const uint8_t *mat, int n, double sig, uint8_t *pk) {
+static void peaks(const double *C, const uint8_t *mat, int n, double sig, int L, int P, uint8_t *pk) {
     const int R = (int)ceil(3 * sig); double *gk = malloc(sizeof(double) * (2 * R + 1)); for (int d = -R; d <= R; d++) gk[d + R] = exp(-0.5 * (d / sig) * (d / sig));
     double *Cs = malloc(sizeof(double) * n), *ps = malloc(sizeof(double) * (n + 1)), *ps2 = malloc(sizeof(double) * (n + 1)); int *pc = malloc(sizeof(int) * (n + 1));
     for (int i = 0; i < n; i++) { double num = 0, den = 0; for (int d = -R; d <= R; d++) { const int j = i + d; if (j < 0 || j >= n) continue; if (!isnan(C[j])) { num += gk[d + R] * C[j]; den += gk[d + R]; } }
                                   Cs[i] = den > 0 ? num / fmax(den, 1e-12) : NAN; }
     ps[0] = ps2[0] = 0; pc[0] = 0;
     for (int i = 0; i < n; i++) { const int ok = !isnan(Cs[i]); const double v = ok ? Cs[i] : 0; ps[i + 1] = ps[i] + v; ps2[i + 1] = ps2[i] + v * v; pc[i + 1] = pc[i] + ok; }
-    const int L = 12, P = 24; memset(pk, 0, n);
+    memset(pk, 0, n);
     for (int i = 1; i < n - 1; i++) {
         if (!mat[i] || isnan(Cs[i]) || !(Cs[i] > Cs[i - 1]) || Cs[i] < Cs[i + 1]) continue;
         const int lo = i - L > 0 ? i - L : 0, hi = i + L + 1 < n ? i + L + 1 : n, c = pc[hi] - pc[lo]; if (c < 4) continue;
@@ -117,6 +124,17 @@ static void peaks(const double *C, const uint8_t *mat, int n, double sig, uint8_
 static void flips(const int8_t *raw, int n, uint8_t *f12, uint8_t *f21) {
     int s = 0; memset(f12, 0, n); memset(f21, 0, n);
     for (int i = 0; i < n; i++) { const int r = raw[i]; if (!r || r == s) continue; if (s == 1 && r == 2) f12[i] = 1; else if (s == 2 && r == 1) f21[i] = 1; s = r; }
+}
+
+/* flips() with persistence: a new state counts only once it holds for P classified samples (unknown samples neither count nor
+   break the run); the flip sits where that run started */
+static void flips_p(const int8_t *raw, int n, int P, uint8_t *f12, uint8_t *f21) {
+    int s = 0, c = 0, c0 = 0, cl = 0; memset(f12, 0, n); memset(f21, 0, n);
+    for (int i = 0; i < n; i++) {
+        const int r = raw[i]; if (!r) continue;
+        if (r != c) { c = r; c0 = i; cl = 0; }
+        if (++cl >= P && c != s) { if (s == 1 && c == 2) f12[c0] = 1; else if (s == 2 && c == 1) f21[c0] = 1; s = c; }
+    }
 }
 
 /* --lat-rt BASIS: replace plane zn of the CT by what a latent-grid net reads of it: each 4^3 cell (global 4-aligned grid) of the
@@ -191,6 +209,66 @@ static int vc_rt(const gt_job *J, int64_t zn, int64_t Y0, int64_t X0, int H, int
     free(ch); free(rb); free(enc); return rc;
 }
 
+/* --orient SIG,RHO: the 3-D structure tensor of the CT (gaussian derivative SIG, integration RHO, CT voxels; truncated at 3 sigma) on
+   plane zn of the box, its 6 components (zz yy xx zy zx yx) into T[6][H][W]. Tiles of 128^2 with their halo read from one z stack
+   (2K + 1 planes, K = Rs + Rr + 1); a tile whose CT plane or GT codes are empty stays 0 (no orientation there). */
+static int rd3(z3 *z, int64_t z0, int64_t y0, int64_t x0, int nz, int ny, int nx, uint8_t *out) {   /* a block, zeros outside the array */
+    const z3_meta *m = z3_meta_of(z); memset(out, 0, (size_t)nz * ny * nx);
+    const int64_t lo[3] = {z0, y0, x0}, n[3] = {nz, ny, nx}; int64_t a[3], b[3];
+    for (int k = 0; k < 3; k++) { a[k] = lo[k] < 0 ? 0 : lo[k]; b[k] = lo[k] + n[k] > m->shape[k] ? m->shape[k] : lo[k] + n[k]; if (b[k] <= a[k]) return 0; }
+    const int64_t o2[3] = {a[0], a[1], a[2]}, n2[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+    uint8_t *t = malloc((size_t)(n2[0] * n2[1] * n2[2])); if (!t) return 1;
+    if (z3_read(z, o2, n2, t, 1)) { free(t); return 1; }
+    for (int64_t zz = 0; zz < n2[0]; zz++) for (int64_t y = 0; y < n2[1]; y++)
+        memcpy(out + ((size_t)(zz + a[0] - z0) * ny + (y + a[1] - y0)) * nx + (a[2] - x0), t + ((size_t)zz * n2[1] + y) * n2[2], (size_t)n2[2]);
+    free(t); return 0;
+}
+static float *gk1(double s, int *R) { *R = (int)ceil(3 * s); float *k = malloc(sizeof(float) * (2 * *R + 1)); double sum = 0;
+    for (int i = -*R; i <= *R; i++) sum += k[i + *R] = (float)exp(-0.5 * i * i / (s * s));
+    for (int i = 0; i <= 2 * *R; i++) k[i] = (float)(k[i] / sum); return k; }
+static int orient_tensor(const gt_job *J, int64_t zn, int64_t Y0, int64_t X0, int H, int W, const uint8_t *cdb, int QH, int QW, int64_t qy0, int64_t qx0, double f, float *T) {
+    int Rs, Rr; float *ks = gk1(J->osig, &Rs), *kr = gk1(J->orho, &Rr); const int K = Rs + Rr + 1, NS = 2 * K + 1, SH = H + 2 * K, SW = W + 2 * K, TS = 128;
+    uint8_t *st = malloc((size_t)NS * SH * SW); memset(T, 0, sizeof(float) * 6 * (size_t)H * W);
+    if (!st || rd3(J->oct, zn - K, Y0 - K, X0 - K, NS, SH, SW, st)) { free(st); free(ks); free(kr); return 1; }
+    const int M = Rr + 1, AYm = TS + 2 * (M + Rs), AXm = TS + 2 * M, NZ = 2 * Rr + 3, PYm = TS + 2 * Rr;
+    float *A = malloc(sizeof(float) * (size_t)NS * AYm * AXm), *B = malloc(sizeof(float) * (size_t)NS * AXm * AXm), *G = malloc(sizeof(float) * (size_t)NZ * AXm * AXm),
+          *P = malloc(sizeof(float) * 6 * (size_t)PYm * PYm), *Q = malloc(sizeof(float) * 6 * (size_t)PYm * TS);
+    for (int ty = 0; ty < H; ty += TS) for (int tx = 0; tx < W; tx += TS) {
+        const int th = ty + TS > H ? H - ty : TS, tw = tx + TS > W ? W - tx : TS;
+        int any = 0; for (int y = ty; y < ty + th && !any; y++) for (int x = tx; x < tx + tw; x++) if (st[((size_t)K * SH + y + K) * SW + x + K]) { any = 1; break; }
+        if (!any) continue;
+        any = 0; { const int qa = (int)floor((Y0 + ty) * f) - (int)qy0, qb = (int)floor((Y0 + ty + th - 1) * f) - (int)qy0 + 1, xa = (int)floor((X0 + tx) * f) - (int)qx0, xb = (int)floor((X0 + tx + tw - 1) * f) - (int)qx0 + 1;
+            for (int y = qa < 0 ? 0 : qa; y < (qb > QH ? QH : qb) && !any; y++) for (int x = xa < 0 ? 0 : xa; x < (xb > QW ? QW : xb); x++) if (cdb[(size_t)y * QW + x]) { any = 1; break; } }
+        if (!any) continue;
+        const int AY = th + 2 * (M + Rs), AX = tw + 2 * M, HY = th + 2 * M, PY = th + 2 * Rr, PX = tw + 2 * Rr;
+        /* A: x-smoothed, rows ty - M - Rs .. , cols tx - M ..; stack index = plane coordinate + K */
+        for (int z = 0; z < NS; z++) for (int y = 0; y < AY; y++) {
+            const uint8_t *row = st + ((size_t)z * SH + (ty - M - Rs + y + K)) * SW; float *o = A + ((size_t)z * AY + y) * AX;
+            for (int x = 0; x < AX; x++) { const int c = tx - M + x + K; float v = 0; for (int i = -Rs; i <= Rs; i++) v += ks[i + Rs] * row[c + i]; o[x] = v; }
+        }
+        for (int z = 0; z < NS; z++) for (int y = 0; y < HY; y++) { float *o = B + ((size_t)z * HY + y) * AX;
+            for (int x = 0; x < AX; x++) { float v = 0; for (int i = -Rs; i <= Rs; i++) v += ks[i + Rs] * A[((size_t)z * AY + y + Rs + i) * AX + x]; o[x] = v; } }
+        for (int p = 0; p < NZ; p++) { const int zc = K - Rr - 1 + p; float *o = G + (size_t)p * HY * AX;
+            for (size_t i = 0; i < (size_t)HY * AX; i++) { float v = 0; for (int d = -Rs; d <= Rs; d++) v += ks[d + Rs] * B[(size_t)(zc + d) * HY * AX + i]; o[i] = v; } }
+        /* gradients (central differences) at planes 1 .. NZ - 2, z-integrated with the RHO kernel into P (PY x PX) */
+        memset(P, 0, sizeof(float) * 6 * (size_t)PY * PX);
+        for (int p = 1; p <= NZ - 2; p++) { const float wz = kr[p - 1]; const float *g = G + (size_t)p * HY * AX;
+            for (int y = 0; y < PY; y++) for (int x = 0; x < PX; x++) {
+                const size_t i = (size_t)(y + 1) * AX + x + 1;
+                const float gz = 0.5f * (g[i + (size_t)HY * AX] - g[i - (size_t)HY * AX]), gy = 0.5f * (g[i + AX] - g[i - AX]), gx = 0.5f * (g[i + 1] - g[i - 1]);
+                float *q = P + (size_t)y * PX + x; const size_t sP = (size_t)PY * PX;
+                q[0] += wz * gz * gz; q[sP] += wz * gy * gy; q[2 * sP] += wz * gx * gx; q[3 * sP] += wz * gz * gy; q[4 * sP] += wz * gz * gx; q[5 * sP] += wz * gy * gx;
+            } }
+        for (int c = 0; c < 6; c++) {   /* in-plane RHO integration: x then y, to the tile core */
+            const float *pc = P + (size_t)c * PY * PX; float *qc = Q + (size_t)c * PY * tw;
+            for (int y = 0; y < PY; y++) for (int x = 0; x < tw; x++) { float v = 0; for (int i = -Rr; i <= Rr; i++) v += kr[i + Rr] * pc[(size_t)y * PX + x + Rr + i]; qc[(size_t)y * tw + x] = v; }
+            for (int y = 0; y < th; y++) for (int x = 0; x < tw; x++) { float v = 0; for (int i = -Rr; i <= Rr; i++) v += kr[i + Rr] * qc[(size_t)(y + Rr + i) * tw + x];
+                T[(size_t)c * H * W + (size_t)(ty + y) * W + tx + x] = v; }
+        }
+    }
+    free(st); free(A); free(B); free(G); free(P); free(Q); free(ks); free(kr); return 0;
+}
+
 static void gt_plane(void *ctx, int a0, int a1, int t) {
     gt_job *J = ctx; (void)t;
     for (int job = a0; job < a1; job++) {
@@ -223,13 +301,18 @@ static void gt_plane(void *ctx, int a0, int a1, int t) {
         gauss2(lab, QH, QW, 1.0); sobel(lab, QH, QW, 0, gy); sobel(lab, QH, QW, 1, gx);
         for (size_t i = 0; i < qn; i++) { jyy[i] = gy[i] * gy[i]; jxx[i] = gx[i] * gx[i]; jyx[i] = gy[i] * gx[i]; }
         gauss2(jyy, QH, QW, 3); gauss2(jxx, QH, QW, 3); gauss2(jyx, QH, QW, 3);
+        float *OT = nullptr;
+        if (J->orient) {
+            OT = malloc(sizeof(float) * 6 * (size_t)H * W);
+            if (!OT || orient_tensor(J, zn, Y0, X0, H, W, cdb, QH, QW, qy0, qx0, f, OT)) { pthread_mutex_lock(&J->mu); snprintf(J->err, sizeof J->err, "box %s z %lld: --orient read: %s", B->name, (long long)zn, z3_error()); pthread_mutex_unlock(&J->mu); free(OT); OT = nullptr; }
+        }
         const int inside = cyl >= 0 && cyl < ny && cxl >= 0 && cxl < nx;
         const double rmin = inside ? 0 : hypot(fmin(fmax(cyl, 0), ny) - cyl, fmin(fmax(cxl, 0), nx) - cxl);
         double rmax = 0; { const double c[4][2] = {{0, 0}, {0, nx}, {ny, 0}, {ny, nx}}; for (int k = 0; k < 4; k++) rmax = fmax(rmax, hypot(c[k][0] - cyl, c[k][1] - cxl)); }
         const int nr0 = (int)rmin, nr1 = (int)rmax + 2, NR = nr1 - nr0; if (NR <= 0) goto freeall;
         double *C = malloc(sizeof(double) * NR), *ry = malloc(sizeof(double) * NR), *rx = malloc(sizeof(double) * NR), *rr = malloc(sizeof(double) * NR);
         uint8_t *mat = malloc(NR), *pk = malloc(NR), *q = malloc(NR), *a12 = malloc(NR), *a21 = malloc(NR), *b12 = malloc(NR), *b21 = malloc(NR), *rok = malloc(NR), *fok = malloc(NR);
-        int8_t *rs = malloc(NR), *fs = malloc(NR); double *RV = malloc(sizeof(double) * NR), *FH = malloc(sizeof(double) * NR); uint8_t *rpk = malloc(NR), *hpk = malloc(NR), *rmat = malloc(NR), *hmat = malloc(NR); int *qyv = malloc(sizeof(int) * NR), *qxv = malloc(sizeof(int) * NR);
+        int8_t *rs = malloc(NR), *fs = malloc(NR), *os = malloc(NR); uint8_t *o12 = malloc(NR), *o21 = malloc(NR); double *RV = malloc(sizeof(double) * NR), *FH = malloc(sizeof(double) * NR); uint8_t *rpk = malloc(NR), *hpk = malloc(NR), *rmat = malloc(NR), *hmat = malloc(NR); int *qyv = malloc(sizeof(int) * NR), *qxv = malloc(sizeof(int) * NR);
         for (int k = 0; k < J->nth; k++) {
             const double th = k * 2 * M_PI / J->nth + M_PI / J->nth, sn = sin(th), cs = cos(th);
             int i0 = -1, i1 = -1, ninb = 0;
@@ -245,9 +328,21 @@ static void gt_plane(void *ctx, int a0, int a1, int t) {
                 if (rvf) { const double v = bil(rvf, H, W, y, x); if (!isnan(v) && v >= 1) { rok[j] = 1; RV[j] = v; rmat[j] = 1; rs[j] = v > 128 + J->rvthr ? 2 : v < 128 - J->rvthr ? 1 : 0; } }   /* 2 = R, 1 = V */
                 if (fhf) { const double h = bil(fhf, H, W, y, x), v = bil(fvf, H, W, y, x);
                            if (!isnan(h) && !isnan(v)) { fok[j] = mat[j]; FH[j] = h - v; hmat[j] = mat[j]; fs[j] = h >= J->fthr && h >= v + J->fmar ? 2 : v >= J->fthr && v >= h + J->fmar ? 1 : 0; } }   /* 2 = H, 1 = V */
+                os[j] = 0;
+                if (OT && !isnan(C[j]) && C[j] >= J->oiso) {
+                    /* the in-sheet tangent from the GT label's in-slice normal (not the ray: oblique sheets would leak their own faces into
+                       the tangential gradient); the gradient tensor on the plane (z, tangent); its dominant gradient along z = fibres along
+                       the tangent = H (perpendicular to the scroll axis, taken as z), along the tangent = V */
+                    const int yy = qy < 0 ? 0 : qy >= QH ? QH - 1 : qy, xx = qx < 0 ? 0 : qx >= QW ? QW - 1 : qx; const size_t qi = (size_t)yy * QW + xx;
+                    const double a2 = 0.5 * atan2(2 * jyx[qi], jyy[qi] - jxx[qi]), ty_ = -sin(a2), tx_ = cos(a2); double t6[6]; int okt = 1;
+                    for (int c = 0; c < 6 && okt; c++) { t6[c] = bil(OT + (size_t)c * H * W, H, W, y, x); okt = !isnan(t6[c]); }
+                    if (okt) { const double tzz = t6[0], ttt = ty_ * ty_ * t6[1] + 2 * ty_ * tx_ * t6[5] + tx_ * tx_ * t6[2], tzt = ty_ * t6[3] + tx_ * t6[4];
+                               const double d = tzz - ttt, e = sqrt(d * d + 4 * tzt * tzt), tr = tzz + ttt;
+                               if (tr > 0 && e / tr >= J->ocoh) os[j] = d / e > J->omar ? 2 : d / e < -J->omar ? 1 : 0; }   /* 2 = H, 1 = V */
+                }
             }
-            peaks(C, mat, n, J->sig, pk); peaks(RV, rmat, n, J->sig, rpk); peaks(FH, hmat, n, J->sig, hpk);   /* (rv / H - V peaks: recto-ruler's "peaks of the fused signal") */
-            flips(rs, n, a12, a21); flips(fs, n, b12, b21);   /* a12: V -> R, a21: R -> V; b12: V -> H, b21: H -> V (outward) */
+            peaks(C, mat, n, J->sig, J->pkL, J->pkP, pk); peaks(RV, rmat, n, J->sig, J->pkL, J->pkP, rpk); peaks(FH, hmat, n, J->sig, J->pkL, J->pkP, hpk);   /* (rv / H - V peaks: recto-ruler's "peaks of the fused signal") */
+            flips(rs, n, a12, a21); flips(fs, n, b12, b21); flips_p(os, n, J->opers, o12, o21);   /* a12: V -> R, a21: R -> V; b12: V -> H, b21: H -> V (outward) */
             double pr = -1; int pq = 0;
             for (int i = 0; i < n;) {
                 if (!q[i]) { i++; continue; }
@@ -265,8 +360,8 @@ static void gt_plane(void *ctx, int a0, int a1, int t) {
                         double ns = 0;
                         for (int s2 = 0; s2 < 2; s2++) { const int kk = s2 ? ib : ia, yy = qyv[kk] < 0 ? 0 : qyv[kk] >= QH ? QH - 1 : qyv[kk], xx = qxv[kk] < 0 ? 0 : qxv[kk] >= QW ? QW - 1 : qxv[kk];
                             const size_t qi = (size_t)yy * QW + xx; const double a2 = 0.5 * atan2(2 * jyx[qi], jyy[qi] - jxx[qi]); ns += fabs(cos(a2) * sn + sin(a2) * cs); }
-                        gt_row w = {.box = (int)(B - J->bx), .z = (int)zn, .rmm = (float)(0.5 * (rr[ia] + rr[ib]) * J->ctum / 1000), .dq = (float)dq, .gap = (float)((ib - ia) * 0.5 * ns * J->ctum / dq), .rvok = 1, .fbok = 1};
-                        for (int j = ia; j < ib; j++) { w.npk += pk[j]; w.rvpk += rpk[j]; w.fhpk += hpk[j]; w.rvf += a12[j]; w.rvb += a21[j]; w.fbf += b12[j]; w.fbb += b21[j]; if (!rok[j]) w.rvok = 0; if (!fok[j]) w.fbok = 0; }
+                        gt_row w = {.box = (int)(B - J->bx), .z = (int)zn, .rmm = (float)(0.5 * (rr[ia] + rr[ib]) * J->ctum / 1000), .dq = (float)dq, .gap = (float)((ib - ia) * 0.5 * ns * J->ctum / dq), .rvok = 1, .fbok = 1, .orok = OT != nullptr};
+                        for (int j = ia; j < ib; j++) { w.npk += pk[j]; w.rvpk += rpk[j]; w.fhpk += hpk[j]; w.rvf += a12[j]; w.rvb += a21[j]; w.fbf += b12[j]; w.fbb += b21[j]; w.orf += o12[j]; w.orb += o21[j]; if (!rok[j]) w.rvok = 0; if (!fok[j]) w.fbok = 0; }
                         if (!rvf) w.rvok = 0; if (!fhf) w.fbok = 0;
                         if (*nr == *cp) { *cp = *cp ? 2 * *cp : 256; *R = realloc(*R, sizeof(gt_row) * *cp); }
                         (*R)[(*nr)++] = w;
@@ -275,9 +370,9 @@ static void gt_plane(void *ctx, int a0, int a1, int t) {
                 pr = cr0; pq = qc; i = e;
             }
         }
-        free(C); free(ry); free(rx); free(rr); free(mat); free(pk); free(q); free(a12); free(a21); free(b12); free(b21); free(rok); free(fok); free(rs); free(fs); free(RV); free(FH); free(rpk); free(hpk); free(rmat); free(hmat); free(qyv); free(qxv);
+        free(C); free(ry); free(rx); free(rr); free(mat); free(pk); free(q); free(a12); free(a21); free(b12); free(b21); free(rok); free(fok); free(rs); free(fs); free(RV); free(FH); free(rpk); free(hpk); free(rmat); free(hmat); free(qyv); free(qxv); free(os); free(o12); free(o21);
         freeall:
-        free(ct); free(rvf); free(fhf); free(fvf); free(lab); free(gy); free(gx); free(jyy); free(jxx); free(jyx);
+        free(OT); free(ct); free(rvf); free(fhf); free(fvf); free(lab); free(gy); free(gx); free(jyy); free(jxx); free(jyx);
         }
         next:
         free(ctb); free(rvb); free(fhb); free(fvb); free(cdb); free(clb);
@@ -295,14 +390,20 @@ int cmd_gt_trans(int argc, char **argv) {
     if (argc < 14) {
         fprintf(stderr, "usage: ufsm gt-trans ROOT CTKEY CTUM CODEROOT CODEKEY CODEUM CENTREKEY CENTREUM BOXES_TSV SCROLL BOXUM OUT.tsv [--nz 8] [--nth 360]\n"
                         "                     [--rv ROOT KEY] [--fh ROOT KEY --fv ROOT KEY] [--rv-thr 8] [--fib-thr 8] [--fib-margin 4] [--ct-sig 1.2] [--threads N]\n"
-                        "                     [--lat-rt BASIS.lcb --lat-c 29 --lat-step 0.25 --lat-norm CENTRE,SCALE [--lat-codec CODEC.lcd]] [--vc-rt Q]\n"
+                        "                     [--lat-rt BASIS.lcb --lat-c 29 --lat-step 0.25 --lat-norm CENTRE,SCALE [--lat-codec CODEC.lcd]] [--vc-rt Q] [--ct-l 12 --ct-p 24]\n"
+                        "                     [--orient SIG,RHO [--orient-coh 0.2] [--orient-margin 0.2] [--orient-iso 1] [--orient-persist UM] [--orient-ct ROOT KEY]]\n"
                         "  CT peaks, recto / verso and fibre-direction flips per GT turn by normal gap (src/gttrans.c)\n");
         return 2;
     }
     gt_job J = {.ctum = atof(argv[4]), .cum = atof(argv[7]), .clum = atof(argv[9]), .bum = atof(argv[12]), .nz = opt_atoi("--nz", gt_opt(argc, argv, "--nz", "8")),
                 .nth = opt_atoi("--nth", gt_opt(argc, argv, "--nth", "360")), .rvthr = opt_atof("--rv-thr", gt_opt(argc, argv, "--rv-thr", "8")),
                 .fthr = opt_atof("--fib-thr", gt_opt(argc, argv, "--fib-thr", "8")), .fmar = opt_atof("--fib-margin", gt_opt(argc, argv, "--fib-margin", "4")),
-                .sig = opt_atof("--ct-sig", gt_opt(argc, argv, "--ct-sig", "1.2"))};
+                .sig = opt_atof("--ct-sig", gt_opt(argc, argv, "--ct-sig", "1.2")), .pkL = opt_atoi("--ct-l", gt_opt(argc, argv, "--ct-l", "12")),
+                .pkP = opt_atoi("--ct-p", gt_opt(argc, argv, "--ct-p", "24")), .ocoh = opt_atof("--orient-coh", gt_opt(argc, argv, "--orient-coh", "0.2")),
+                .omar = opt_atof("--orient-margin", gt_opt(argc, argv, "--orient-margin", "0.2")), .oiso = opt_atof("--orient-iso", gt_opt(argc, argv, "--orient-iso", "1"))};
+    { const double pu = opt_atof("--orient-persist", gt_opt(argc, argv, "--orient-persist", "0")); J.opers = pu > 0 ? (int)ceil(pu / J.ctum) : 1; }
+    { const char *o = gt_opt(argc, argv, "--orient", nullptr);
+      if (o) { if (sscanf(o, "%lf,%lf", &J.osig, &J.orho) != 2 || J.osig <= 0 || J.orho <= 0) { fprintf(stderr, "gt-trans: --orient SIG,RHO (CT voxels)\n"); return 1; } J.orient = 1; } }
     pthread_mutex_init(&J.mu, nullptr);
     const char *lbp = gt_opt(argc, argv, "--lat-rt", nullptr);
     if (lbp) {
@@ -321,6 +422,9 @@ int cmd_gt_trans(int argc, char **argv) {
     }
     if (J.vcq > 0) fprintf(stderr, "gt-trans: CT through volcomp q %g\n", J.vcq);
     if (!(J.ct = gt_open(argv[2], argv[3])) || !(J.cd = gt_open(argv[5], argv[6])) || !(J.cl = gt_open(argv[2], argv[8]))) return 1;
+    J.oct = J.ct;
+    if (J.orient && gt_opt2(argc, argv, "--orient-ct", 1) && !(J.oct = gt_open(gt_opt2(argc, argv, "--orient-ct", 0), gt_opt2(argc, argv, "--orient-ct", 1)))) return 1;
+    if (J.orient) fprintf(stderr, "gt-trans: fibre orientation: structure tensor sigma %g, rho %g CT voxels, coherence >= %g, margin %g, CT >= %g, persistence %d samples\n", J.osig, J.orho, J.ocoh, J.omar, J.oiso, J.opers);
     const char *rr = gt_opt2(argc, argv, "--rv", 0), *rk = gt_opt2(argc, argv, "--rv", 1), *hr = gt_opt2(argc, argv, "--fh", 0), *hk = gt_opt2(argc, argv, "--fh", 1),
                *vr = gt_opt2(argc, argv, "--fv", 0), *vk = gt_opt2(argc, argv, "--fv", 1);
     if (hr && !vr) { fprintf(stderr, "gt-trans: --fh needs --fv\n"); return 1; }
@@ -352,28 +456,30 @@ int cmd_gt_trans(int argc, char **argv) {
     fit_par(nj, gt_plane, &J);
     if (*J.err) { fprintf(stderr, "gt-trans: %s\n", J.err); return 1; }
     FILE *fo = fopen(argv[13], "w"); if (!fo) { fprintf(stderr, "gt-trans: cannot write %s\n", argv[13]); return 1; }
-    fprintf(fo, "box\tz\tr_mm\tdq\tgap_um\tnpk\trv_VR\trv_RV\trv_ok\tfib_VH\tfib_HV\tfib_ok\trv_pk\tfib_HVpk\n");
+    fprintf(fo, "box\tz\tr_mm\tdq\tgap_um\tnpk\trv_VR\trv_RV\trv_ok\tfib_VH\tfib_HV\tfib_ok\trv_pk\tfib_HVpk\tor_VH\tor_HV\tor_ok\n");
     enum { NG = 9 }; const double GB[NG + 1] = {0, 70, 85, 100, 115, 130, 150, 180, 230, 1e9};
-    double sdq[NG + 1] = {0}, spk[NG + 1] = {0}, off[NG + 1] = {0}, rvdq[NG + 1] = {0}, rvf[NG + 1] = {0}, rvb[NG + 1] = {0}, rvoff[NG + 1] = {0}, fbdq[NG + 1] = {0}, fbf[NG + 1] = {0}, fbb[NG + 1] = {0}, fboff[NG + 1] = {0}, rvp[NG + 1] = {0}, rvpoff[NG + 1] = {0}, rvct[NG + 1] = {0}, rvctoff[NG + 1] = {0}, fhp[NG + 1] = {0}, fhpoff[NG + 1] = {0};
+    double sdq[NG + 1] = {0}, spk[NG + 1] = {0}, off[NG + 1] = {0}, rvdq[NG + 1] = {0}, rvf[NG + 1] = {0}, rvb[NG + 1] = {0}, rvoff[NG + 1] = {0}, fbdq[NG + 1] = {0}, fbf[NG + 1] = {0}, fbb[NG + 1] = {0}, fboff[NG + 1] = {0}, rvp[NG + 1] = {0}, rvpoff[NG + 1] = {0}, rvct[NG + 1] = {0}, rvctoff[NG + 1] = {0}, fhp[NG + 1] = {0}, fhpoff[NG + 1] = {0}, orf[NG + 1] = {0}, orb[NG + 1] = {0}, oroff[NG + 1] = {0};
     long cnt[NG + 1] = {0}, rvn[NG + 1] = {0}, fbn[NG + 1] = {0}, tot = 0;
     for (int j = 0; j < nj; j++) for (int i = 0; i < J.nrow[j]; i++) {
         const gt_row *w = &J.rows[j][i]; tot++;
-        fprintf(fo, "%s\t%d\t%.3f\t%.3f\t%.1f\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", bx[w->box].name, w->z, w->rmm, w->dq, w->gap, w->npk, w->rvf, w->rvb, w->rvok, w->fbf, w->fbb, w->fbok, w->rvpk, w->fhpk);
+        fprintf(fo, "%s\t%d\t%.3f\t%.3f\t%.1f\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", bx[w->box].name, w->z, w->rmm, w->dq, w->gap, w->npk, w->rvf, w->rvb, w->rvok, w->fbf, w->fbb, w->fbok, w->rvpk, w->fhpk, w->orf, w->orb, w->orok);
         int g = 0; while (g < NG - 1 && w->gap >= GB[g + 1]) g++;
         for (int a = 0; a < 2; a++) { const int k = a ? NG : g;   /* (bucket g and "all") */
             cnt[k]++; sdq[k] += w->dq; spk[k] += w->npk; off[k] += fabs(w->npk - w->dq) >= 0.5;
             if (w->rvok) { rvn[k]++; rvdq[k] += w->dq; rvf[k] += w->rvf; rvb[k] += w->rvb; rvoff[k] += fabs(w->rvf - w->dq) >= 0.5; rvp[k] += w->rvpk; rvpoff[k] += fabs(w->rvpk - w->dq) >= 0.5; rvct[k] += w->npk; rvctoff[k] += fabs(w->npk - w->dq) >= 0.5; }
+            if (w->orok) { orf[k] += w->orf; orb[k] += w->orb; oroff[k] += fabs(w->orf - w->dq) >= 0.5; }
             if (w->fbok) { fbn[k]++; fbdq[k] += w->dq; fbf[k] += w->fbf; fbb[k] += w->fbb; fboff[k] += fabs(w->fbf - w->dq) >= 0.5; fhp[k] += w->fhpk; fhpoff[k] += fabs(w->fhpk - w->dq) >= 0.5; } }
     }
     fclose(fo);
     printf("gt-trans %s: %ld GT intervals (%d boxes x %d z x %d rays)\n", argv[11], tot, nb, J.nz, J.nth);
-    printf("  gap (um)      n   CT/turn  off   |  rv n    CT/turn off    V>R/turn R>V/turn  off    rvpk/turn off   |  fib n   V>H/turn H>V/turn  off    (H-V)pk/turn off\n");
+    printf("  gap (um)      n   CT/turn  off   |  rv n    CT/turn off    V>R/turn R>V/turn  off    rvpk/turn off   |  fib n   V>H/turn H>V/turn  off    (H-V)pk/turn off%s\n", J.orient ? "   | CT orientation V>H/turn H>V/turn off" : "");
     for (int k = 0; k <= NG; k++) {
         if (cnt[k] < 50) continue;
         char lb[32]; if (k == NG) snprintf(lb, sizeof lb, "all"); else if (GB[k + 1] < 1e8) snprintf(lb, sizeof lb, "%.0f-%.0f", GB[k], GB[k + 1]); else snprintf(lb, sizeof lb, "%.0f-inf", GB[k]);
         printf("  %-9s %7ld   %.3f  %.3f", lb, cnt[k], spk[k] / sdq[k], off[k] / cnt[k]);
         if (rvn[k] >= 50) printf("  | %7ld   %.3f   %.3f   %.3f    %.3f    %.3f    %.3f   %.3f", rvn[k], rvct[k] / rvdq[k], rvctoff[k] / rvn[k], rvf[k] / rvdq[k], rvb[k] / rvdq[k], rvoff[k] / rvn[k], rvp[k] / rvdq[k], rvpoff[k] / rvn[k]); else printf("  |      -");
         if (fbn[k] >= 50) printf("   | %7ld   %.3f    %.3f    %.3f    %.3f   %.3f", fbn[k], fbf[k] / fbdq[k], fbb[k] / fbdq[k], fboff[k] / fbn[k], fhp[k] / fbdq[k], fhpoff[k] / fbn[k]); else printf("   |      -");
+        if (J.orient) printf("   | %.3f    %.3f    %.3f", orf[k] / sdq[k], orb[k] / sdq[k], oroff[k] / cnt[k]);
         printf("\n");
     }
     for (int j = 0; j < nj; j++) free(J.rows[j]); free(J.rows); free(J.nrow); free(J.cap); free(bx);

@@ -933,7 +933,7 @@ int cmd_count_field(int argc, char **argv) {
     }
     /* --fibers F.fib (ufsm fiber-export in this fields box's frame) / --pairs F.f32 (records za ya xa zb yb xb dW, box-local native):
        same-sheet pairs in the solve, weight --cf-fib W (0: off), Huber --cf-fib-huber D turns over --cf-fib-irls K reweighted level-0
-       solves. A fibre: resampled at 1 native voxel, pairs every 4th sample at the spans --cf-fib-spans (native, default 16,32,64,128),
+       solves. A fibre: resampled at 1 native voxel, pairs every 4th sample (--cf-fib-every N) at the spans --cf-fib-spans (native, default 16,32,64,128),
        dW = 0 (W is constant along a sheet away from the theta cut; the cut is in t through dir * dtheta / 2 pi) */
     cf_pt *pts = nullptr; size_t npt = 0; const double wfib = opt_atof("--cf-fib", cf_opt(argc, argv, "--cf-fib", "0"));
     const char *apin = cf_opt(argc, argv, "--anchor-pins", ""), *apair = cf_opt(argc, argv, "--anchor-pairs", "");
@@ -945,7 +945,7 @@ int cmd_count_field(int argc, char **argv) {
             double dt_ = tb_ - ta_; dt_ -= 2 * M_PI * floor((dt_ + M_PI) / (2 * M_PI)); e_->t = (float)((DW) + dir * dt_ / (2 * M_PI)); } while (0)
         if (wfib > 0 && *cf_opt(argc, argv, "--fibers", "")) {
             fib_set fs; if (fib_load(cf_opt(argc, argv, "--fibers", ""), &fs)) { fprintf(stderr, "count-field: cannot read --fibers %s\n", cf_opt(argc, argv, "--fibers", "")); return 1; }
-            int sp[8] = {16, 32, 64, 128}, nsp = 4;
+            int sp[8] = {16, 32, 64, 128}, nsp = 4; const int fev = opt_atoi("--cf-fib-every", cf_opt(argc, argv, "--cf-fib-every", "4"));   /* (pairs every fev samples: a whole scroll's AFV gives ~10^8 pairs at 4) */
             if (*cf_opt(argc, argv, "--cf-fib-spans", "")) { nsp = 0; char *t = strdup(cf_opt(argc, argv, "--cf-fib-spans", "")); for (char *q = strtok(t, ","); q && nsp < 8; q = strtok(nullptr, ",")) sp[nsp++] = atoi(q); free(t); }
             double *rq = nullptr; size_t rcap = 0;
             for (int r = 0; r < fs.n; r++) {
@@ -960,7 +960,7 @@ int cmd_count_field(int argc, char **argv) {
                     acc += Ls;
                 }
                 for (size_t b = 0; b < ns; b++) for (int di = 0; di < nsp; di++) {
-                    if (b < (size_t)sp[di] || (b - sp[di]) % 4) continue;
+                    if (b < (size_t)sp[di] || (b - sp[di]) % (size_t)(fev > 0 ? fev : 4)) continue;
                     const double *A = rq + 3 * (b - sp[di]), *B = rq + 3 * b;
                     if (A[0] < 0 || B[0] < 0 || A[0] > D * h || B[0] > D * h) continue;   /* (inside the box's rows) */
                     CF_PUSH(A, B, 0.0);

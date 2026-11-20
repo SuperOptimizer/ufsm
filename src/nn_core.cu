@@ -339,8 +339,10 @@ extern "C" void nn_pool_box_end(void) {
 static void *pool_dev(size_t n) { void *p = pool_take(n, 0); if (p) { if (g_nreg) nn_storage_forget(p); CK(cudaMemset(p, 0, n)); } return p; }
 extern "C" void *nn_malloc(size_t n) {
     { void *q = pool_dev(n); if (q) return q; }
-    void *p = nullptr; cudaError_t e = cudaMalloc(&p, n);
-    if (e != cudaSuccess && g_pool_on) { cudaGetLastError(); pool_trim(1); e = cudaMalloc(&p, n); }   /* (the idle pool first) */
+    /* UFSM_TEST_MALLOC_FAIL_MB=M (tests): a buffer of >= M MB fails as an out-of-memory cudaMalloc would (the stop path, no real OOM) */
+    static long fail_mb = -2; /* mgpu: env */ if (fail_mb == -2) fail_mb = getenv("UFSM_TEST_MALLOC_FAIL_MB") ? atol(getenv("UFSM_TEST_MALLOC_FAIL_MB")) : -1;
+    void *p = nullptr; cudaError_t e = fail_mb >= 0 && n >= (size_t)fail_mb << 20 ? cudaErrorMemoryAllocation : cudaMalloc(&p, n);
+    if (e != cudaSuccess && g_pool_on && !(fail_mb >= 0 && n >= (size_t)fail_mb << 20)) { cudaGetLastError(); pool_trim(1); e = cudaMalloc(&p, n); }   /* (the idle pool first) */
     if (e == cudaSuccess) pool_add(p, n, 0);
     if (e != cudaSuccess) {   /* say so (the sticky g_err alone surfaced as a segfault in the next copy to the null pointer) */
         size_t fr = 0, tot = 0; cudaGetLastError(); cudaMemGetInfo(&fr, &tot);

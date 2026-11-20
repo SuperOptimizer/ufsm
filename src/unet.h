@@ -219,6 +219,8 @@ void unet_set_muon_vr(unet *u, float gamma);
    (wo, w2) at F x F2; 0 / 1 = off. Plain batched Muon and the ext path; not with --init-lr-mult */
 void unet_set_attn_muon_lr(unet *u, float all, float out);
 void unet_set_muon_adapt(unet *u, int lars, float tgt, float beta, float clamp, int dog, float dog_max, float lr_peak);
+void unet_set_muon_probe(unet *u, int stride, int log);
+void unet_set_muon_adapt2(unet *u, int kap, float kb, int cool, int n, int m, float delta, float c, float decay, float floor);   /* train --muon-probe S: log the Muon directions' lag autocorrelation / kappa / progress (every S-th element; 0 off) */
 void unet_opt_stats_arm(unet *u);
 int unet_opt_stats_str(unet *u, char *buf, size_t cap);
 void unet_set_muon_cautious(unet *u, int on);

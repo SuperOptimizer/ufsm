@@ -267,3 +267,52 @@ int cmd_fiber_contacts(int argc, char **argv) {
     afv_close(A); z3_close(cz); if (mz) z3_close(mz);
     return 0;
 }
+
+/* ufsm fiber-mfstat F.fib FIELDS [--every 128] [--spans 64,256] [--samples 8] [--thr 179] [--sub 1] [--zoff 0]
+   The fibre pairs count-field --fibers builds (each run resampled at 1 native voxel, a pair every --every samples at each span, both ends
+   inside the fields' z rows) against the fields' merge-flag plane FIELDS/mf (cell = native / h): the share of pairs with a segment
+   sample (--samples points from A to B) at mf >= --thr, with an endpoint there, and the mean mf. --sub N: every N-th pair only. */
+int cmd_fiber_mfstat(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm fiber-mfstat F.fib FIELDS [--every 128] [--spans 64,256] [--samples 8] [--thr 179] [--sub 1] [--zoff 0]\n"); return 2; }
+    fib_set fs; if (fib_load(argv[2], &fs)) { fprintf(stderr, "fiber-mfstat: cannot read %s\n", argv[2]); return 1; }
+    char p[1200]; snprintf(p, sizeof p, "%s/fields.json", argv[3]); int h = 0;
+    { FILE *f = fopen(p, "r"); char buf[4096]; size_t n = f ? fread(buf, 1, sizeof buf - 1, f) : 0; if (f) fclose(f); buf[n] = 0; const char *q = strstr(buf, "\"h\":"); if (q) h = atoi(q + 4); }
+    if (h < 1) { fprintf(stderr, "fiber-mfstat: no h in %s\n", p); return 1; }
+    store *ms = store_open(argv[3]); z3 *mz = ms ? z3_open(ms, "mf", nullptr) : nullptr; if (!mz) { fprintf(stderr, "fiber-mfstat: cannot open %s/mf: %s\n", argv[3], z3_error()); return 1; }
+    const z3_meta *m = z3_meta_of(mz);
+    const int ev = opt_atoi("--every", fx_opt(argc, argv, "--every", "128")), ns = opt_atoi("--samples", fx_opt(argc, argv, "--samples", "8")), thr = opt_atoi("--thr", fx_opt(argc, argv, "--thr", "179")),
+              sub = opt_atoi("--sub", fx_opt(argc, argv, "--sub", "1"));
+    const double zo = opt_atof("--zoff", fx_opt(argc, argv, "--zoff", "0"));
+    int sp[8], nsp = 0; { char *t = strdup(fx_opt(argc, argv, "--spans", "64,256")); for (char *q = strtok(t, ","); q && nsp < 8; q = strtok(nullptr, ",")) sp[nsp++] = atoi(q); free(t); }
+    long np = 0, nseg = 0, nend = 0, nout = 0, k = 0; double smf = 0; long nspan[8][2] = {{0}};
+    double *rq = nullptr; size_t rcap = 0;
+    for (int r = 0; r < fs.n; r++) {
+        const float *pp = fs.pts + 3 * (size_t)fs.off[r]; const int n = fs.off[r + 1] - fs.off[r]; size_t nr = 0; double acc = 0, next = 0;
+        for (int i = 1; i < n; i++) {   /* (count-field's resampling) */
+            const double a[3] = {pp[3 * i - 3] - zo, pp[3 * i - 2], pp[3 * i - 1]}, d[3] = {pp[3 * i] - pp[3 * i - 3], pp[3 * i + 1] - pp[3 * i - 2], pp[3 * i + 2] - pp[3 * i - 1]};
+            const double Ls = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            for (; Ls > 0 && next <= acc + Ls; next += 1) { if (nr == rcap) { rcap = rcap ? 2 * rcap : 4096; rq = realloc(rq, 3 * rcap * sizeof *rq); } const double t = (next - acc) / Ls; for (int e = 0; e < 3; e++) rq[3 * nr + e] = a[e] + t * d[e]; nr++; }
+            acc += Ls;
+        }
+        for (size_t b = 0; b < nr; b++) for (int di = 0; di < nsp; di++) {
+            if (b < (size_t)sp[di] || (b - sp[di]) % (size_t)ev) continue;
+            const double *A = rq + 3 * (b - sp[di]), *B = rq + 3 * b;
+            if (A[0] < 0 || B[0] < 0 || A[0] > m->shape[0] * (double)h || B[0] > m->shape[0] * (double)h) continue;
+            if (k++ % sub) continue;
+            int hit = 0, endh = 0, got = 0; double s1 = 0;
+            for (int s = 0; s < ns; s++) {
+                const double t = ns > 1 ? (double)s / (ns - 1) : 0.5; int64_t o[3]; int in = 1;
+                for (int e = 0; e < 3; e++) { o[e] = (int64_t)floor((A[e] + t * (B[e] - A[e])) / h); in &= o[e] >= 0 && o[e] < m->shape[e]; }
+                if (!in) continue;
+                const int64_t n1[3] = {1, 1, 1}; uint8_t v; if (z3_read(mz, o, n1, &v, 1)) { fprintf(stderr, "fiber-mfstat: %s\n", z3_error()); return 1; }
+                got++; s1 += v; if (v >= thr) { hit = 1; if (s == 0 || s == ns - 1) endh = 1; }
+            }
+            if (!got) { nout++; continue; }
+            np++; nseg += hit; nend += endh; smf += s1 / got; nspan[di][0]++; nspan[di][1] += hit;
+        }
+    }
+    printf("fiber-mfstat %s: %ld pairs (every %d, %d samples, sub %d; %ld outside the mf plane): mf >= %d on the segment %.4f, at an endpoint %.4f, mean mf %.1f\n",
+           argv[2], np, ev, ns, sub, nout, thr, np ? (double)nseg / np : 0, np ? (double)nend / np : 0, np ? smf / np : 0);
+    for (int di = 0; di < nsp; di++) printf("  span %d: %ld pairs, segment share %.4f\n", sp[di], nspan[di][0], nspan[di][0] ? (double)nspan[di][1] / nspan[di][0] : 0);
+    free(rq); fib_free(&fs); z3_close(mz); return 0;
+}

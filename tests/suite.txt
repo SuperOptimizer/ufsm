@@ -316,6 +316,7 @@ test_muon                                      | gpu,smoke    |     1 | ./$B/tes
 test_muonc                                     | gpu          |     3 | ./$B/test_muonc
 test_muonx                                     | gpu          |     5 | ./$B/test_muonx
 test_admuon                                    | gpu          |     2 | ./$B/test_admuon
+test_admctl                                    |              |     3 | ./$B/test_admctl
 test_muoncwd                                   | gpu          |     2 | ./$B/test_muoncwd
 test_attnlr                                    | gpu          |     2 | ./$B/test_attnlr
 test_muon_pool                                 | gpu          |     2 | ./$B/test_muon_pool
