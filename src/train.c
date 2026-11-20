@@ -230,7 +230,7 @@ static int g_ink2, g_ink2_ch = -1;
    trainer keeps the unwrap2 channel layout as its logical frame (the head slab buffers, g_cout), the head writes and reads only the ink
    channel's planes there, the phase / normal / winding losses, their targets and label planes are skipped (no device side / winding planes:
    -8 B per voxel at lean). A <= 4-output head lets the three level-0 buffers apply under head slabs (unet.l3h) */
-static int g_single;
+static int g_single;   /* mgpu: config. --single ink (2026-11-20): a single-target net */
 /* --rv 1 (task unwrap2): channels 0-1 (the phase slot) are recto-side papyrus and verso-side papyrus instead of the phase's cos / sin:
    BCE against the stored phase's halves (recto: phase < 1/2 turn, from a recto face k to midway to k + 1; verso: the outer half) on
    papyrus (the sampler's papyrus plane = clean CT >= the source's "iso", else --rv-iso), 0 / 0 on void; papyrus of unknown phase masked.

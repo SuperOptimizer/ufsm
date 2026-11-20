@@ -204,6 +204,6 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     impossible['sources'][0]['holdout'] = [0, 0, 0, 128, 128, 128]
     impossible['sources'][0]['holdout_mode'] = 'reject'   # mask mode (default) keeps a fully held-out source eligible (holdfit f1424a2: only reject boxes forbid a window)
     cfg.write_text(json.dumps(impossible))
-    msg = run('train', cfg, '--out', t / 'impossible', '--steps', '1', *opts, ok=1)
+    msg = run('train', cfg, '--out', t / 'impossible', '--steps', '1', *opts, ok=1, extra_env={"UFSM_GRAD_MX4": "0"})
     assert 'no eligible sources' in msg, msg
     print("real CLI resume, portable precision, globally anchored crop/shard/worker predictions and geometry validation: ok")
