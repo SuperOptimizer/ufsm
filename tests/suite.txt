@@ -225,6 +225,7 @@ test_gscale                                    | gpu          |    55 | tests/te
 test_tcache                                    | gpu          |       40 | tests/test_tcache.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/tcache
 test_strict_sources                            | gpu          |    25 | tests/test_strict_sources.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/strictsrc
 test_init_heads                                | gpu          |    45 | tests/test_init_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/initheads
+test_single_ink                                | gpu          |    40 | tests/test_single_ink.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/singleink
 test_lat_sub                                   | gpu          |    40 | tests/test_lat_sub.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/latsub
 test_ink_mil_check                             | gpu          |    90 | ./$B/test_ink_mil_check ./$B/ufsm ./$B/make_wind_fixture
 test_pyports                                   |              |     1 | ./$B/test_pyports
@@ -426,3 +427,4 @@ test_unroll_cards                              |              |     1 | bash tes
 test_split_ab                                  | gpu2,slow    |   150 | tests/test_split_ab.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/splitab
 test_wbench_gpulock                            |              |     1 | tests/test_wbench_gpulock.sh
 test_wbench_fail                               |              |     2 | tests/test_wbench_fail.sh
+test_occ_cache                                 |              |     1 | ./$B/test_occ_cache $TMPDIR
