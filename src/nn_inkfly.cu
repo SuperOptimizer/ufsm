@@ -77,6 +77,32 @@ __device__ static int d_face_of(const float *s, int n, int lo, int iso, int run,
     }
     return FACE_NONE;
 }
+/* inksplat.c tri_box_z: rows [s0, s1) of the box in b; -1 outside the box, -2 a corner row outside the slab */
+__device__ static inline float d_tri_z(const uint8_t *b, const long long n[3], long long s0, long long s1, double z, double y, double x) {
+    if (z < 0 || y < 0 || x < 0 || z > n[0] - 1 || y > n[1] - 1 || x > n[2] - 1) return -1.f;
+    long long z0 = (long long)z, y0 = (long long)y, x0 = (long long)x; if (z0 >= n[0] - 1) z0 = n[0] - 2; if (y0 >= n[1] - 1) y0 = n[1] - 2; if (x0 >= n[2] - 1) x0 = n[2] - 2;
+    if (z0 < 0 || y0 < 0 || x0 < 0) return -1.f;
+    if (z0 < s0 || z0 + 1 >= s1) return -2.f;
+    const double fz = z - z0, fy = y - y0, fx = x - x0; double s = 0;
+    for (int c = 0; c < 8; c++) {
+        const long long a = z0 + (c >> 2 & 1) - s0, bb = y0 + (c >> 1 & 1), e = x0 + (c & 1);
+        s += (c >> 2 & 1 ? fz : 1 - fz) * (c >> 1 & 1 ? fy : 1 - fy) * (c & 1 ? fx : 1 - fx) * b[((size_t)a * n[1] + bb) * n[2] + e];
+    }
+    return (float)s;
+}
+typedef struct { double off, V, sign; int lo, ns, iso, run, gap; long long co[3], cn[3], z0, z1; } rp_t;
+/* the MIL rays' face search (inksplat.c inkfly_rays mode 1): one ray a thread */
+__global__ void k_rayface(rp_t p, const double *pn, unsigned n, const uint8_t *ct, uint8_t *drop, int *bad) {
+    const unsigned id = blockIdx.x * blockDim.x + threadIdx.x; if (id >= n) return;
+    const double *P = pn + 6 * (size_t)id, *N = P + 3; float raw[NSMAX], sm[NSMAX];
+    for (int k = 0; k < p.ns; k++) {
+        const double tt = (p.lo + k) * p.sign; double q[3];
+        for (int d = 0; d < 3; d++) q[d] = (P[d] + tt * N[d] - p.off) / p.V - p.co[d];
+        const float v = d_tri_z(ct, p.cn, p.z0, p.z1, q[0], q[1], q[2]); if (v < -1.5f) { atomicExch(bad, 1); return; } raw[k] = v < 0 ? 0 : v;
+    }
+    for (int k = 0; k < p.ns; k++) sm[k] = 0.25f * (raw[k > 0 ? k - 1 : 0] + 2 * raw[k] + raw[k < p.ns - 1 ? k + 1 : p.ns - 1]);
+    drop[id] = d_face_of(sm, p.ns, p.lo, p.iso, p.run, p.gap) != FACE_NONE;
+}
 typedef struct { int32_t r, c; double P[3], N[3]; } nrec_t;
 /* A1: the near pixels of one unit's candidate tiles, with their point / normal, and the level-0 box their samples reach */
 __global__ void k_near(du_t u, const dc_t *cp, nrec_t *rec, unsigned *nrec, long long *bb, int *bad) {
@@ -148,7 +174,7 @@ __global__ void k_final(const dc_t *cp, const uint8_t *ct, unsigned *ni, unsigne
 
 /* per calling thread: a stream and its buffers (the sampler's workers run concurrently; the device is the process's choice) */
 static int g_dev = 0;
-enum { B_CT, B_LAB, B_MSK, B_TIL, B_X, B_Y, B_Z, B_NREC, B_FREC, B_ACC, B_OUT, B_SM, B_DU, NB };
+enum { B_CT, B_LAB, B_MSK, B_TIL, B_X, B_Y, B_Z, B_NREC, B_FREC, B_ACC, B_OUT, B_SM, B_DU, B_RPN, B_RDR, NB };
 typedef struct { int dev; cudaStream_t st; struct { void *p; size_t cap; } b[NB]; int nu; size_t base[1024]; du_t hu[1024]; } ictx;
 typedef struct { dc_t c; long long bb[6]; int nonempty, bad; unsigned cnt[1024], fcnt[1024]; } sm_t;
 static __thread ictx *t_ic;
@@ -252,6 +278,39 @@ extern "C" int inkfly_gpu_near(const ifg_unit *U, int nu, const ifg_cfg *cf, int
     }
 out:
     free(hs); return rc;
+}
+static unsigned long long g_rays;   /* mgpu: guarded (g_mu) */
+extern "C" unsigned long long inkfly_gpu_rays(void) { pthread_mutex_lock(&g_mu); const unsigned long long k = g_rays; pthread_mutex_unlock(&g_mu); return k; }
+extern "C" int inkfly_gpu_rayface(const ifg_ray *p, const double *pn, size_t n, const uint8_t *ct, uint8_t *drop) {
+    int rc = 0; ictx *x = t_ic; int hbad = 0;
+    if (!n) return 0;
+    if (p->ns > NSMAX || n > 0xffffffffu) return 1;
+    if (!x) { x = t_ic = (ictx *)calloc(1, sizeof *x); x->dev = -1; }
+    if (x->dev != g_dev) {
+        IG_CK(cudaSetDevice(g_dev)); if (x->st) { cudaStreamDestroy(x->st); x->st = nullptr; }
+        if (cudaStreamCreateWithFlags(&x->st, cudaStreamNonBlocking) != cudaSuccess) { (void)cudaGetLastError(); x->st = nullptr; return 1; }
+        x->dev = g_dev;
+    }
+    IG_CK(cudaSetDevice(x->dev));
+    {
+        const size_t ncv = (size_t)(p->z1 - p->z0) * p->cn[1] * p->cn[2], nd = (n + 15) & ~(size_t)15;
+        if (grow(x, B_CT, ncv) || grow(x, B_RPN, n * 6 * sizeof(double)) || grow(x, B_RDR, nd + 16)) { atomic_over(); return 1; }
+        rp_t h; h.off = p->off; h.V = p->V; h.sign = p->sign; h.lo = p->lo; h.ns = p->ns; h.iso = p->iso; h.run = p->run; h.gap = p->gap;
+        for (int d = 0; d < 3; d++) { h.co[d] = p->co[d]; h.cn[d] = p->cn[d]; } h.z0 = p->z0; h.z1 = p->z1;
+        uint8_t *dd = (uint8_t *)x->b[B_RDR].p; int *db = (int *)(dd + nd);
+        IG_CK(cudaMemcpyAsync(x->b[B_CT].p, ct, ncv, cudaMemcpyHostToDevice, x->st));
+        IG_CK(cudaMemcpyAsync(x->b[B_RPN].p, pn, n * 6 * sizeof(double), cudaMemcpyHostToDevice, x->st));
+        IG_CK(cudaMemsetAsync(db, 0, sizeof(int), x->st));
+        k_rayface<<<(unsigned)((n + 127) / 128), 128, 0, x->st>>>(h, (const double *)x->b[B_RPN].p, (unsigned)n, (const uint8_t *)x->b[B_CT].p, dd, db);
+        IG_CK(cudaGetLastError());
+        IG_CK(cudaMemcpyAsync(drop, dd, n, cudaMemcpyDeviceToHost, x->st));
+        IG_CK(cudaMemcpyAsync(&hbad, db, sizeof(int), cudaMemcpyDeviceToHost, x->st));
+        IG_CK(cudaStreamSynchronize(x->st));
+        if (hbad) return 2;
+        pthread_mutex_lock(&g_mu); g_rays += n; pthread_mutex_unlock(&g_mu);
+    }
+out:
+    return rc;
 }
 extern "C" int inkfly_gpu_finish(const ifg_cfg *cf, const uint8_t *ctb, const int64_t co[3], const int64_t cn[3], const int64_t o[3], const int64_t n[3], uint8_t *out, int *nonempty) {
     int rc = 0; ictx *x = t_ic; if (!x || x->dev < 0) return -2;

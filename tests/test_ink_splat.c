@@ -236,6 +236,26 @@ int main(void) {
                     CHECK(n2 == n1 && (!n1 || !memcmp(r1, r2, n1 * sizeof *r1)), "rays in z slabs: %zu vs %zu whole-box, %s", n2, n1, n2 == n1 && (!n1 || !memcmp(r1, r2, n1 * sizeof *r1)) ? "identical" : "DIFFER");
                     unsetenv("UFSM_INKRAY_SLAB_MB"); free(r2);
                 }
+                {   /* the face search on the GPU (inkfly_gpu_rayface, 2026-11-20) == the CPU's rays byte for byte, whole box and in z slabs; with a
+                       device visible the rays were faced there (TIS_OVER: the budget refuses them, the CPU loop gives the same bytes) */
+                    int ndev = 0; if (cudaGetDeviceCount(&ndev) != cudaSuccess) ndev = 0;
+                    if (ndev && !getenv("UFSM_TEST_NO_GPU") && inkfly_gpu_rays) {
+                        inkfly_gpu_config(0); const unsigned long long g0r = inkfly_gpu_rays();
+                        for (int sl = 0; sl < 2; sl++) {
+                            if (sl) setenv("UFSM_INKRAY_SLAB_MB", "0.001", 1);
+                            inkray *r3 = nullptr; size_t n3 = 0;
+                            CHECK(!inkfly_rays(hd, wo, wn, 1, 1, 4, &r3, &n3), "inkfly_rays on the GPU");
+                            const int same = n3 == n1 && (!n1 || !memcmp(r1, r3, n1 * sizeof *r1));
+                            fprintf(stderr, "mil rays, face search on the GPU%s: %zu vs %zu on the CPU, %s\n", sl ? " (z slabs)" : "", n3, n1, same ? "identical" : "DIFFER");
+                            CHECK(same, "GPU ray face search differs from the CPU's%s", sl ? " (z slabs)" : "");
+                            free(r3); unsetenv("UFSM_INKRAY_SLAB_MB");
+                        }
+                        const unsigned long long gr = inkfly_gpu_rays() - g0r;
+                        fprintf(stderr, "mil rays faced on the GPU: %llu\n", gr);
+                        CHECK(getenv("TIS_OVER") ? gr == 0 : gr >= 2 * n0, "rays faced on the GPU: %llu (want %s)", gr, getenv("TIS_OVER") ? "0 over the budget" : ">= 2 x all rays");
+                        inkfly_gpu_config(-1);
+                    }
+                }
                 free(r0); free(r1); if (f2) z3_close(f2);
             }
             z3_close(fly);

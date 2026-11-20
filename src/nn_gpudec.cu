@@ -434,7 +434,7 @@ extern "C" void gpudec_stats(uint64_t *subs, uint64_t *batches, uint64_t *redo, 
     pthread_mutex_unlock(&G.mu);
 }
 
-static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *ddst) {
+static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *ddst, const gd_sink *sk) {
     if (!mask) return 0;
     if (!gpudec_enabled()) return -1;
     if ((double)__atomic_load_n(&G.busy_us, __ATOMIC_RELAXED) > now_s() * 1e6) { __atomic_fetch_add(&G.n_cpu_busy, 1, __ATOMIC_RELAXED); return -1; }   /* after a starved round trip */
@@ -495,20 +495,30 @@ static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *dd
     if (q.state != 1) return q.state == 2 ? 1 : -1;
     if (ddst) return 0;
     u = 0;
-    for (uint32_t s = 0; s < NSUB; s++) if (mask >> s & 1u) {   /* compact substream -> its 16 z planes of 32 x 128 in the chunk */
+    for (uint32_t s = 0; s < NSUB; s++) if (mask >> s & 1u) {   /* compact substream -> its 16 z planes of 32 x 128 in the chunk (a sink: the box's part
+                                                                     of them in the window) */
         const uint8_t *src = S->h_out + (size_t)(q.out0 + u++) * SUB_BYTES;
-        for (uint32_t z = 0; z < 16; z++) memcpy(dst + ((size_t)(16u * (s >> 2) + z) * 128u + 32u * (s & 3u)) * 128u, src + (size_t)z * 4096u, 4096);
+        if (sk) {
+            const int z0 = 16 * (int)(s >> 2), y0 = 32 * (int)(s & 3u), za = sk->b0[0] > z0 ? sk->b0[0] : z0, zb = sk->b1[0] < z0 + 16 ? sk->b1[0] : z0 + 16,
+                      ya = sk->b0[1] > y0 ? sk->b0[1] : y0, yb = sk->b1[1] < y0 + 32 ? sk->b1[1] : y0 + 32; const size_t w = (size_t)(sk->b1[2] - sk->b0[2]);
+            for (int z = za; z < zb; z++) for (int y = ya; y < yb; y++)
+                memcpy(sk->out + sk->off + (ptrdiff_t)((size_t)z * sk->zs + (size_t)y * sk->ys) + sk->b0[2], src + ((size_t)(z - z0) * 32u + (size_t)(y - y0)) * 128u + sk->b0[2], w);
+        } else for (uint32_t z = 0; z < 16; z++) memcpy(dst + ((size_t)(16u * (s >> 2) + z) * 128u + 32u * (s & 3u)) * 128u, src + (size_t)z * 4096u, 4096);
     }
     pthread_mutex_lock(&G.mu);
     if (--S->readers == 0) { S->state = S_FREE; if (G.open < 0) G.open = take_free(); pthread_cond_broadcast(&G.cv); }
     pthread_mutex_unlock(&G.mu);
     return 0;
 }
-extern "C" int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) { return gd_decode(c, mask, dst, nullptr); }
+extern "C" int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) { return gd_decode(c, mask, dst, nullptr, nullptr); }
+extern "C" int gpudec_decode_sink(const gd_chunk *c, uint32_t mask, const gd_sink *k) {
+    if (!k || k->b1[2] <= k->b0[2]) return -1;
+    return gd_decode(c, mask, nullptr, nullptr, k);
+}
 extern "C" int gpudec_decode_dev(const gd_chunk *c, uint32_t mask, uint8_t *dchunk) {
     if (!dchunk || !gpudec_enabled()) return -1;
     cudaPointerAttributes a;   /* device memory of the decoder's device only */
     if (cudaPointerGetAttributes(&a, dchunk) != cudaSuccess) { cudaGetLastError(); return -1; }
     if (a.type != cudaMemoryTypeDevice || a.device != ufsm_dev_phys(G.dev)) return -1;   /* (attributes name the physical device) */
-    return gd_decode(c, mask, nullptr, dchunk);
+    return gd_decode(c, mask, nullptr, dchunk, nullptr);
 }

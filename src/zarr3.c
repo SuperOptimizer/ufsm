@@ -341,6 +341,7 @@ __attribute__((weak)) int gpudec_enabled(void) { return 0; }
 __attribute__((weak)) int gpudec_threads(int nthreads) { return nthreads; }
 __attribute__((weak)) int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) { (void)c; (void)mask; (void)dst; return -1; }
 __attribute__((weak)) int gpudec_decode_dev(const gd_chunk *c, uint32_t mask, uint8_t *dchunk) { (void)c; (void)mask; (void)dchunk; return -1; }
+__attribute__((weak)) int gpudec_decode_sink(const gd_chunk *c, uint32_t mask, const gd_sink *k) { (void)c; (void)mask; (void)k; return -1; }
 __attribute__((weak)) void gpudec_stats(uint64_t *subs, uint64_t *batches, uint64_t *redo, double *gpu_s) { if (subs) *subs = 0; if (batches) *batches = 0; if (redo) *redo = 0; if (gpu_s) *gpu_s = 0; }
 /* decode the substreams in need of a parsed lossy chunk: on the GPU when it is on (a substream the GPU cannot decode, or a device
    error: the request on the CPU, the reference status and bytes), else volcomp_fast.h. dsink (z3_read_sub_dev): a device 128^3 chunk
@@ -353,6 +354,16 @@ static pthread_cond_t g_z3_cpu_cv = PTHREAD_COND_INITIALIZER;
 static int g_z3_cpu_busy, g_z3_cpu_max;
 static _Thread_local int g_z3_cpu_only;   /* z3_thread_cpu_decode: this thread's reads decode on the CPU whatever UFSM_GPU_DECODE says */
 void z3_thread_cpu_decode(int on) { g_z3_cpu_only = on; }
+static void z3_cpu_enter(void) {
+    pthread_mutex_lock(&g_z3_cpu_mu);
+    if (!g_z3_cpu_max) { const char *e = getenv("UFSM_GPU_DECODE_CPU_THREADS"); g_z3_cpu_max = e && atoi(e) > 0 ? atoi(e) : (int)ufsm_ncpu(); if (g_z3_cpu_max < 1) g_z3_cpu_max = 1; }
+    while (g_z3_cpu_busy >= g_z3_cpu_max) pthread_cond_wait(&g_z3_cpu_cv, &g_z3_cpu_mu);
+    g_z3_cpu_busy++;
+    pthread_mutex_unlock(&g_z3_cpu_mu);
+}
+static void z3_cpu_leave(void) { pthread_mutex_lock(&g_z3_cpu_mu); g_z3_cpu_busy--; pthread_cond_signal(&g_z3_cpu_cv); pthread_mutex_unlock(&g_z3_cpu_mu); }
+static _Atomic uint64_t g_z3_gsunk;   /* chunks the GPU decoder wrote into a window sink (tests) */
+uint64_t z3_gpu_sink_chunks(void) { return atomic_load(&g_z3_gsunk); }
 static volcomp_status z3_decode_subs(const vf_parsed *p, uint32_t need, uint8_t *dec, uint8_t *dsink, uint32_t *dev) {
     *dev = 0;
     if (!gpudec_enabled() || g_z3_cpu_only) return vfx_decode_subs(p, need, dec);
@@ -362,15 +373,24 @@ static volcomp_status z3_decode_subs(const vf_parsed *p, uint32_t need, uint8_t 
         if (dsink && gpudec_decode_dev(&g, need, dsink) == 0) { *dev = need; return VOLCOMP_OK; }
         if (gpudec_decode(&g, need, dec) == 0) return VOLCOMP_OK;
     }
-    pthread_mutex_lock(&g_z3_cpu_mu);
-    if (!g_z3_cpu_max) { const char *e = getenv("UFSM_GPU_DECODE_CPU_THREADS"); g_z3_cpu_max = e && atoi(e) > 0 ? atoi(e) : (int)ufsm_ncpu(); if (g_z3_cpu_max < 1) g_z3_cpu_max = 1; }
-    while (g_z3_cpu_busy >= g_z3_cpu_max) pthread_cond_wait(&g_z3_cpu_cv, &g_z3_cpu_mu);
-    g_z3_cpu_busy++;
-    pthread_mutex_unlock(&g_z3_cpu_mu);
+    z3_cpu_enter();
     volcomp_status st = vfx_decode_subs(p, need, dec);
-    pthread_mutex_lock(&g_z3_cpu_mu);
-    g_z3_cpu_busy--; pthread_cond_signal(&g_z3_cpu_cv);
-    pthread_mutex_unlock(&g_z3_cpu_mu);
+    z3_cpu_leave();
+    return st;
+}
+/* = z3_decode_subs into a window sink (decode_into's lossy sink): the GPU decoder's sink path when it is on, else / on its refusal the CPU's
+   sink decode (under the same CPU cap). 2026-11-20: with the GPU decoder on, the sink was off and every chunk went decode -> chunk -> window */
+static volcomp_status z3_decode_subs_sink(const vf_parsed *p, uint32_t need, const vfx_sink *k) {
+    if (!gpudec_enabled() || g_z3_cpu_only) return vfx_decode_subs_sink(p, need, k);
+    if (!p->strict) {
+        gd_chunk g = {p->payload, p->tok_n, p->byp_n, p->off, p->step, {0}, VF_SCAN16};
+        for (int m = 0; m < 10; m++) g.dt[m] = (const uint32_t *)p->models[m].dt;
+        const gd_sink gk = {k->out, k->off, k->zs, k->ys, {k->b0[0], k->b0[1], k->b0[2]}, {k->b1[0], k->b1[1], k->b1[2]}};
+        if (gpudec_decode_sink(&g, need, &gk) == 0) { atomic_fetch_add(&g_z3_gsunk, 1); return VOLCOMP_OK; }
+    }
+    z3_cpu_enter();
+    volcomp_status st = vfx_decode_subs_sink(p, need, k);
+    z3_cpu_leave();
     return st;
 }
 void z3_io_stats(uint64_t *cache_hits, uint64_t *store_reads) { *cache_hits = atomic_load(&g_z3_cache_hits); *store_reads = atomic_load(&g_z3_store_reads); }
@@ -639,13 +659,14 @@ static void copy_chunk(const job *jb, const work *w, const uint8_t *chunk) {
 
 /* the window sink of chunk w (volcomp_fast.h): its voxels decoded straight into the request's output, without the 128^3 chunk buffer
    and copy_chunk (3-8% of a training loader's CPU). Byte 128^3 volcomp chunks of a plain host read only: not z3_read_sub (its other
-   substreams read 0), a device-sink read, the shared decoded-chunk cache or the GPU decoder (they keep whole chunks).
+   substreams read 0), a device-sink read or the shared decoded-chunk cache (they keep whole chunks). The GPU decoder writes into the sink
+   too since 2026-11-20 (gpudec_decode_sink).
    UFSM_Z3_SINK=0 turns it off (A/B). 0: no sink */
 static _Atomic uint64_t g_z3_sunk;
 uint64_t z3_sink_chunks(void) { return atomic_load(&g_z3_sunk); }
 static int make_sink(const job *jb, const work *w, vfx_sink *k) {
     const z3_meta *m = &jb->z->m;
-    if (!option_on("UFSM_Z3_SINK") || jb->submask || jb->dsink || !jb->out || m->esize != 1 || m->q < 0 || m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128 || zshm_on() || gpudec_enabled()) return 0;
+    if (!option_on("UFSM_Z3_SINK") || jb->submask || jb->dsink || !jb->out || m->esize != 1 || m->q < 0 || m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128 || zshm_on()) return 0;
     const int64_t c0[3] = {w->sz * m->shard[0] + (int64_t)w->cz * 128, w->sy * m->shard[1] + (int64_t)w->cy * 128, w->sx * m->shard[2] + (int64_t)w->cx * 128};
     for (int i = 0; i < 3; i++) {   /* (copy_chunk's box: the request, the chunk and the array shape) */
         const int64_t lo = jb->o[i] > c0[i] ? jb->o[i] : c0[i]; int64_t hi = c0[i] + 128;
@@ -711,7 +732,7 @@ static int decode_into(const z3 *z, const uint8_t *enc, size_t n, uint8_t *dec, 
                     *sunk = 1; atomic_fetch_add(&g_z3_sunk, 1); return 0;
                 }
             } else if (mode == VLL_MODE_LOSSY) {
-                vf_parsed p; if (vf_parse(enc, n, &p) == VOLCOMP_OK && vfx_decode_subs_sink(&p, subs, k) == VOLCOMP_OK) { *sunk = 1; atomic_fetch_add(&g_z3_sunk, 1); return 0; }
+                vf_parsed p; if (vf_parse(enc, n, &p) == VOLCOMP_OK && z3_decode_subs_sink(&p, subs, k) == VOLCOMP_OK) { *sunk = 1; atomic_fetch_add(&g_z3_sunk, 1); return 0; }
             } else {
                 vll_parsed lp; st = vll_parse(enc, n, &lp);
                 for (uint32_t s = 0; s < VF_NSUB && st == VOLCOMP_OK; s++) if (subs >> s & 1) st = vllx_decode_sub_sink(&lp, s, k);

@@ -106,4 +106,5 @@ int z3_chunk_raw(z3 *z, int64_t cz, int64_t cy, int64_t cx, uint8_t **buf, size_
 const void *z3_latvol(const z3 *z);   /* (const lv_codec *) */
 uint64_t z3_id(const z3 *z);   /* process-unique id of this open array (never reused, unlike its address): cache keys */
 uint64_t z3_sink_chunks(void);   /* chunks decoded straight into a request's output (the window sink), process-wide */
+uint64_t z3_gpu_sink_chunks(void);   /* of those, the GPU decoder's (gpudec_decode_sink) */
 

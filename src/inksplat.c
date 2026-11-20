@@ -1805,11 +1805,24 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
         for (int64_t q = 0; q < nsl; q++) cnt[q + 1] += cnt[q];
         for (size_t i = 0; i < np; i++) ord[cnt[sl[i]]++] = (uint32_t)i;   /* (cnt[q] is now slab q's end = slab q+1's start) */
         float raw[256], sm[256]; int bad = 0;
+        double *pn = nullptr; uint8_t *gd = nullptr;   /* (the GPU face search: the slab's rays' P / N, their drop bytes) */
         for (int64_t q = 0, b0 = 0; q < nsl && !bad; b0 = cnt[q], q++) {
             if ((int64_t)cnt[q] == b0) continue;
             int64_t z0 = q * T - rz, z1 = (q + 1) * T + rz + 1; if (z0 < 0) z0 = 0; if (z1 > cn[0]) z1 = cn[0];
             const int64_t so[3] = {co[0] + z0, co[1], co[2]}, sn[3] = {z1 - z0, cn[1], cn[2]};
             if (f->zc ? zcache_read(f->zc, f->base_ct, so, sn, ctb) : z3_read(f->base_ct, so, sn, ctb, 1)) { bad = 1; break; }
+            if (inkfly_gpu_rayface && ifgpu_on()) {   /* the face search on the GPU (2026-11-20: 18 % of FR1's sampler CPU here; byte-identical) */
+                const size_t m = cnt[q] - (size_t)b0;
+                if (!pn) { pn = malloc(np * 6 * sizeof *pn); gd = malloc(np); }
+                if (pn && gd) {
+                    for (size_t j = 0; j < m; j++) { const cpx *x = &X[ord[b0 + j]]; memcpy(pn + 6 * j, x->P, 3 * sizeof(double)); memcpy(pn + 6 * j + 3, x->N, 3 * sizeof(double)); }
+                    ifg_ray rp = {f->off, V, sign, lo, ns, c->iso, c->face_run, c->face_gap, {co[0], co[1], co[2]}, {cn[0], cn[1], cn[2]}, z0, z1};
+                    const int g = inkfly_gpu_rayface(&rp, pn, m, ctb, gd);
+                    if (!g) { for (size_t j = 0; j < m; j++) drop[ord[b0 + j]] = gd[j]; continue; }
+                    if (g == 2) { bad = 1; break; }
+                    if (g < 0) { UFSM_DEFAULTED("inkfly = the CPU from here (the GPU ray face search failed: %d)", g); atomic_store(&g_ifgpu, 0); }
+                }
+            }
             for (int64_t j = b0; j < (int64_t)cnt[q]; j++) {
                 const cpx *x = &X[ord[j]];
                 for (int k = 0; k < ns; k++) { const double tt = (lo + k) * sign; double qq[3];
@@ -1820,7 +1833,7 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
                 drop[ord[j]] = face_of(sm, ns, lo, c->iso, c->face_run, c->face_gap) != FACE_NONE;
             }
         }
-        free(cnt); free(ord); free(sl); free(ctb);
+        free(cnt); free(ord); free(sl); free(ctb); free(pn); free(gd);
         if (bad) { fprintf(stderr, "ink-onfly: rays: a CT slab read failed or a sample left its slab\n"); free(drop); goto done; }
     }
     inkray *Rr = malloc((np ? np : 1) * sizeof *Rr); size_t nr = 0;
