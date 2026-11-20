@@ -2138,6 +2138,26 @@ double ink_mil_loss_host(const float *logit, double *grad, int D, int H, int W, 
     }
     free(z); return L;
 }
+/* the level-lev cells that hold supervised label pixels (every stride-th row / col; inkfly_rays mode 0 over the whole scan: the pixels near a
+   held-out box are left out): bit 1 a supervised pixel, bit 2 a positive (ink) one. 2026-11-20: the ladder drew from inkfly_cells' tile
+   boxes; ~97 % of its windows held no ink positive and 4 of 5 of those were dropped (empty_keep 0.2) after the CT read and the targets, 78-84 %
+   of all draws. With the two bits the sampler draws positive / any supervised cells in a set ratio and drops nothing (--ink-pos-frac).
+   bits (shape, zeroed by the caller); returns the cells marked, < 0 on an error */
+int inkfly_cells_sup(void *handle, int lev, const int64_t shape[3], uint8_t *bits, int stride) {
+    inkfly *f = handle; if (!f || f->V <= 0) return -1;
+    const int64_t o[3] = {0, 0, 0}, n[3] = {(int64_t)1 << 36, (int64_t)1 << 36, (int64_t)1 << 36};
+    inkray *r = nullptr; size_t nr = 0;
+    if (inkfly_rays(handle, o, n, 0, stride, 0.f, &r, &nr)) { free(r); return -1; }
+    const double cs = (double)((int64_t)1 << lev); size_t k = 0;
+    for (size_t i = 0; i < nr; i++) {
+        int64_t c[3]; int in = 1;
+        for (int d = 0; d < 3 && in; d++) { c[d] = (int64_t)floor(((double)r[i].p[d] * f->V + f->off) / cs); in = c[d] >= 0 && c[d] < shape[d]; }
+        if (!in) continue;
+        uint8_t *q = &bits[((size_t)c[0] * shape[1] + c[1]) * shape[2] + c[2]]; k += !*q; *q |= (uint8_t)(1 | (r[i].y ? 2 : 0));   /* (bit 2: a positive label) */
+    }
+    free(r);
+    return (int)(k > 2000000000 ? 2000000000 : k);
+}
 int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits) {
     const inkfly *f = handle; if (!f) return -1; const int64_t cs = (int64_t)1 << lev; size_t n = 0;
     for (size_t t = 0; t < f->nT; t++) {

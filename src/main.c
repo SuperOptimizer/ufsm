@@ -4551,7 +4551,7 @@ static int cmd_render(int argc, char **argv) {
         fprintf(stderr, "render: --gate needs --ct and --fill (the chunk-ordered renderer), not --joint / --known / --fill-pm\n"); return 2; }
     char cmd[1400]; snprintf(cmd, sizeof cmd, "mkdir -p '%s'", argv[3]); if (system(cmd)) return 1;
     DIR *dd = opendir(argv[2]); if (!dd) { fprintf(stderr, "render: cannot open %s\n", argv[2]); return 1; }
-    struct dirent *de; int nw = 0;
+    struct dirent *de; int nw = 0, nbad = 0;   /* nbad: w* entries whose x / y / z.tif could not be read (a dangling link, a dir mid-move) */
     /* the wraps' union box (+- depth): when it fits UFSM_RENDER_MEM GB (default 8) the volume (and CT) are read once and every tile samples
        them (wraps are rings around the axis: per-tile boxes are nearly the whole cross-section, re-decoded per wrap: 127 wraps of a 3.9 cm
        slab took 226 s) */
@@ -4598,7 +4598,9 @@ static int cmd_render(int argc, char **argv) {
             snprintf(p, sizeof p, "%s/%s/x.tif", argv[2], de->d_name); float *X = read_tif_f32(p, &w, &h);
             snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = read_tif_f32(p, &w2, &h2);
             snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = read_tif_f32(p, &w3, &h3);
-            if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || w < 2 || h < 2) { free(X); free(Y); free(Z); continue; }
+            if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || w < 2 || h < 2) {
+                fprintf(stderr, "render: %s/%s: x / y / z.tif unreadable or of different sizes: skipped\n", argv[2], de->d_name);
+                free(X); free(Y); free(Z); continue; }
             snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
             double step = 1; { char *b = tfx_meta_read(p); const char *q = b ? strstr(b, "\"scale\":") : nullptr; if (q && (q = strchr(q, '['))) { const double sc = atof(q + 1); if (sc > 0) step = 1 / sc; } free(b); }
             if (nj && (w != jw || h != jh || step != jstep)) { fprintf(stderr, "render: --joint: %s is %dx%d step %g, not %dx%d step %g\n", de->d_name, w, h, step, jw, jh, jstep); free(X); free(Y); free(Z); ok = 0; break; }
@@ -4637,6 +4639,7 @@ static int cmd_render(int argc, char **argv) {
         for (int k = 0; k < nj; k++) { free(nm[k]); free(JX[k]); free(JY[k]); free(JZ[k]); free(VG[k]); }
         closedir(dd); free(rvol); free(rct);
         if (!ok) return 1;
+        if (!nj) { fprintf(stderr, "render: no wrap rendered from %s\n", argv[2]); return 1; }
         fprintf(stderr, "render: %d wraps written to %s (one pass)\n", nj, argv[3]);
         return 0;
     }
@@ -4648,9 +4651,11 @@ static int cmd_render(int argc, char **argv) {
         snprintf(p, sizeof p, "%s/%s/x.tif", argv[2], de->d_name); float *X = read_tif_f32(p, &w, &h);
         snprintf(p, sizeof p, "%s/%s/y.tif", argv[2], de->d_name); float *Y = read_tif_f32(p, &w2, &h2);
         snprintf(p, sizeof p, "%s/%s/z.tif", argv[2], de->d_name); float *Z = read_tif_f32(p, &w3, &h3);
-        if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || w < 2 || h < 2) { free(X); free(Y); free(Z); continue; }
+        if (!X || !Y || !Z || w != w2 || w != w3 || h != h2 || h != h3 || w < 2 || h < 2) {
+            fprintf(stderr, "render: %s/%s: x / y / z.tif unreadable or of different sizes: skipped\n", argv[2], de->d_name); nbad++;
+            free(X); free(Y); free(Z); continue; }
         snprintf(p, sizeof p, "%s/%s/meta.json", argv[2], de->d_name);
-        double step = 1; { char *b = tfx_meta_read(p); const char *q = b ? strstr(b, "\"scale\":") : nullptr; if (q && (q = strchr(q, '['))) { const double sc = atof(q + 1); if (sc > 0) step = 1 / sc; } free(b); }
+    double step = 1; { char *b = tfx_meta_read(p); const char *q = b ? strstr(b, "\"scale\":") : nullptr; if (q && (q = strchr(q, '['))) { const double sc = atof(q + 1); if (sc > 0) step = 1 / sc; } free(b); }
         const double gs = step * scale;   /* output pixels per grid step */
         const int ow = render_out_px(w, gs), oh = render_out_px(h, gs);
         uint8_t *vgrid = nullptr;
@@ -4733,7 +4738,10 @@ static int cmd_render(int argc, char **argv) {
         free(X); free(Y); free(Z); free(img); free(cimg); free(vgrid); nw++;
     }
     closedir(dd); free(rvol); free(rct);
-    fprintf(stderr, "render: %d wraps written to %s\n", nw, argv[3]);
+    fprintf(stderr, "render: %d wraps written to %s%s\n", nw, argv[3], nbad ? " (some skipped: see above)" : "");
+    /* no wrap rendered = a failure, not an empty success (2026-11-20: renders run while the wraps dir moved to the NAS wrote 0 wraps with
+       exit 0, the scorer took the empty dir as done and scored n = 0) */
+    if (!nw) { fprintf(stderr, "render: no wrap rendered from %s (%d unreadable)\n", argv[2], nbad); return 1; }
     return 0;
 }
 

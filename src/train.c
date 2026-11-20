@@ -3846,6 +3846,12 @@ int cmd_train(int argc, char **argv) {
            lower: 80 % of an ink- / fibre-only source's no-positive windows are dropped, the hard negatives ink calibration wants) */
         const char *ek = opt(argc, argv, "--empty-keep", nullptr), *mf = opt(argc, argv, "--min-fg", nullptr);
         if (ek) sc.empty_keep = atof(ek);
+        /* --ink-pos-frac F (2026-11-20): onfly ink sources draw a window around a positive-label cell with p F, else around any supervised cell,
+           and drop none (was: ~97 % of draws without an ink positive, 4 of 5 of them dropped after the CT read: 78-84 % of all draws wasted;
+           default 0.5 (lead: even positive windows are 92-97 % non-ink voxels; positives are the scarce part); 0.15 keeps the old kept mix,
+           ~13 % positive windows; < 0: the old empty_keep draw */
+        sc.ink_pos_frac = opt_atof("--ink-pos-frac", opt(argc, argv, "--ink-pos-frac", "0.5"));
+        if (!(sc.ink_pos_frac <= 1)) { fprintf(stderr, "train: --ink-pos-frac <= 1 (< 0: off)\n"); return 2; }
         if (mf && !g_restore) sc.min_fg = atof(mf);
         if (!(sc.empty_keep >= 0 && sc.empty_keep <= 1) || !(sc.min_fg >= 0 && sc.min_fg <= 1)) { fprintf(stderr, "train: --empty-keep / --min-fg in [0, 1]\n"); return 2; }
     }   /* (data audit lower: edge windows spread instead of clamped; recipe, off by default) */

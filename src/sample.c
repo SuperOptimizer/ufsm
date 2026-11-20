@@ -2,7 +2,9 @@
 #include "bytescan.h"
 #include "sample.h"
 #include "inksplat.h"
+#include "defaulted.h"
 [[gnu::weak]] int inkfly_cells(void *, int, const int64_t[3], uint8_t *);
+[[gnu::weak]] int inkfly_cells_sup(void *, int, const int64_t[3], uint8_t *, int);
 [[gnu::weak]] size_t inkfly_cache_bytes(size_t *);
 [[gnu::weak]] int inkfly_rays(void *, const int64_t[3], const int64_t[3], int, int, float, inkray **, size_t *);   /* (weak: test binaries without inksplat.o; only called for an onfly target) */
 #include "band.h"
@@ -93,7 +95,7 @@ sample_cfg sample_cfg_default(void) {
     sample_cfg c = {0};
     c.P = 128; c.B = 2; c.nworkers = 8; c.nbuf = 6; c.seed = 0;
     c.level_p[0] = 0.5; c.level_p[1] = 0.25; c.level_p[2] = 0.15; c.level_p[3] = 0.1;
-    c.min_fg = 0.3; c.empty_keep = 0.2; c.holdout_guard = 16; c.augment = 1; c.snap = 1; c.symmetry_p = 1; c.chain_len = 8; c.chain_step = 0.5f;
+    c.min_fg = 0.3; c.empty_keep = 0.2; c.ink_pos_frac = 0.5; c.holdout_guard = 16; c.augment = 1; c.snap = 1; c.symmetry_p = 1; c.chain_len = 8; c.chain_step = 0.5f;
     c.crush = crush_cfg_default();
     return c;
 }
@@ -241,7 +243,8 @@ struct sampler {
     unsigned char (*lvl_ok)[2][MAXLEV];   /* per source: cached level availability (0 unknown, 1 no, 2 yes) */   /* per-stage nanoseconds (env UFSM_SAMPLER_PROF): read, targets, dilate, soft, trust, encode, zscore, augment, x16, other */
     int prof;
     double *cum;   /* cumulative source weights */
-    struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; } *occ;   /* per source: coarse label cells containing papyrus (guides the position draw) */
+    struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; uint32_t *pidx; size_t pn; } *occ;   /* per source: coarse label cells containing papyrus (guides the
+        position draw); pidx / pn: an onfly ink source's cells with positive labels (the stratified draw) */
     uint8_t *c255;   /* --plane bank (cfg.plane_bank): one window plane of 255 (pinned like the slots) that every all-unknown label role of every slot points at */
     pthread_t sn_th[16]; int sn_nth; void *sn_q;   /* --scan-norm: the statistics' prefetch threads (sn_pre) */
     /* the plane bank's shared spares (2026-11-14): each slot owns bank_own planes; a window whose source fills more (fibre H + V, a phase
@@ -2823,8 +2826,10 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         int64_t *lo = blo, *hi = bhi; if (box_bounds(s, m, n, l, r, lo, hi)) SL_OTHER_RET(); inbox = 1;
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (sp->occ[si].n) {   /* draw around a random coarse cell that contains papyrus */
-        size_t k = (size_t)(runif(r) * (double)sp->occ[si].n); if (k >= sp->occ[si].n) k = sp->occ[si].n - 1;
-        uint32_t id = sp->occ[si].idx[k];
+        uint32_t id;
+        if (sp->occ[si].pn && c->ink_pos_frac >= 0 && runif(r) < c->ink_pos_frac) {   /* the stratified ink draw: around a positive-label cell */
+            size_t k = (size_t)(runif(r) * (double)sp->occ[si].pn); if (k >= sp->occ[si].pn) k = sp->occ[si].pn - 1; id = sp->occ[si].pidx[k];
+        } else { size_t k = (size_t)(runif(r) * (double)sp->occ[si].n); if (k >= sp->occ[si].n) k = sp->occ[si].n - 1; id = sp->occ[si].idx[k]; }
         int64_t cz = id / (sp->occ[si].shape[1] * sp->occ[si].shape[2]), cy = (id / sp->occ[si].shape[2]) % sp->occ[si].shape[1], cx = id % sp->occ[si].shape[2];
         int64_t cc[3] = {cz, cy, cx};
         int dl = sp->occ[si].lev - l;    /* coarse cell -> level-l voxels */
@@ -3115,7 +3120,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         for (size_t k = 0; k < p3; k++) { const uint8_t v = ap[k] == 255 ? 0 : ap[k]; mx = v > mx ? v : mx; }
         tmax = mx;
     }
-    if (!c->cover && !c->papyrus && tgt_any && tmax == 0 && runif(r) > c->empty_keep) { tp_put(dpap, p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); SL_ADD(SL_EMPTY); return 1; }
+    const int strat = sp->occ[si].pn && c->ink_pos_frac >= 0;   /* (a stratified ink source: its negatives are drawn at the set ratio, none dropped) */
+    if (!c->cover && !c->papyrus && tgt_any && tmax == 0 && !strat && runif(r) > c->empty_keep) { tp_put(dpap, p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); SL_ADD(SL_EMPTY); return 1; }
     PROF_MARK(PS_TARGETS);
     uint8_t *near = nullptr;   /* --phase-near-um: voxels within the distance of a labelled wrap voxel (raw labels, before softening) */
     if (c->phase_near_um > 0 && c->side == 2 && w[0]) {
@@ -3935,21 +3941,37 @@ static occ_index label_occupancy(source *s) {
                 for (int d = 0; d < 3; d++) g[d] = mc->shape[d];
                 bits = calloc((size_t)g[0] * g[1] * g[2], 1);
                 if (!bits || inkfly_cells(s->ink_fly[ch], lc, g, bits) <= 0) { free(bits); continue; }
+                /* only the cells that hold supervised label pixels (2026-11-20: the tile boxes' cells left 84 % of the ladder's windows with
+                   < 0.1 % known ink, thrown away after the CT read, the augmentation and the targets); UFSM_INK_DRAW_SUP=0: the tile boxes */
+                if (inkfly_cells_sup && !(getenv("UFSM_INK_DRAW_SUP") && !strcmp(getenv("UFSM_INK_DRAW_SUP"), "0"))) {
+                    const size_t nb = (size_t)g[0] * g[1] * g[2]; uint8_t *sb = calloc(nb, 1); size_t ks = 0, kb = 0;
+                    const int ns = sb ? inkfly_cells_sup(s->ink_fly[ch], lc, g, sb, 8) : -1;
+                    if (ns > 0) for (size_t q = 0; q < nb; q++) { kb += bits[q]; ks += bits[q] & sb[q]; }   /* (and the tile boxes: held-out cells stay out) */
+                    if (ks) { for (size_t q = 0; q < nb; q++) bits[q] = bits[q] ? sb[q] : 0;   /* (bit 1 supervised, bit 2 positive) */
+                              fprintf(stderr, "sampler: %s: %zu of %zu level-%d tile-box cells hold supervised ink labels: the draw cells\n", s->name, ks, kb, lc); }
+                    else UFSM_DEFAULTED("%s: ink draw cells = the label tiles' boxes (no supervised label pixel found: %d)", s->name, ns);
+                    free(sb);
+                }
             } else if (z3_chunk_map(t0, g, &bits) <= 0) { free(bits); continue; }
             const int fly = s->ink_fly[ch] != nullptr;
             const size_t pl = (size_t)mc->shape[1] * mc->shape[2], tot = pl * (size_t)mc->shape[0];
             uint8_t *cb = tot < 4.29e9 ? malloc(tot) : nullptr; const int64_t zo[3] = {0, 0, 0}, zn[3] = {mc->shape[0], mc->shape[1], mc->shape[2]};
             if (!cb || z3_read(cc, zo, zn, cb, 8)) { free(cb); free(bits); continue; }
-            const int iso = s->iso > 0 ? s->iso : 1; size_t n = 0;
+            const int iso = s->iso > 0 ? s->iso : 1; size_t n = 0, npos = 0;
             for (int pass = 0; pass < 2; pass++) {
                 for (int64_t z = 0; z < mc->shape[0]; z++) for (int64_t y = 0; y < mc->shape[1]; y++) for (int64_t x = 0; x < mc->shape[2]; x++) {
                     const size_t k = ((size_t)z * mc->shape[1] + (size_t)y) * mc->shape[2] + (size_t)x;
                     const int64_t qz = fly ? z : z >> sh, qy = fly ? y : y >> sh, qx = fly ? x : x >> sh;
-                    if (cb[k] < iso || qz >= g[0] || qy >= g[1] || qx >= g[2] || !bits[((size_t)qz * g[1] + (size_t)qy) * g[2] + (size_t)qx]) continue;
-                    if (pass) o.idx[o.n++] = (uint32_t)k; else n++;
+                    if (cb[k] < iso || qz >= g[0] || qy >= g[1] || qx >= g[2]) continue;
+                    const uint8_t bv = bits[((size_t)qz * g[1] + (size_t)qy) * g[2] + (size_t)qx]; if (!bv) continue;
+                    const int pos = fly && (bv & 2);   /* (an onfly ink cell with a positive label: the stratified draw's positive list) */
+                    if (pass) { o.idx[o.n++] = (uint32_t)k; if (pos && o.pidx) o.pidx[o.pn++] = (uint32_t)k; } else { n++; npos += pos; }
                 }
                 if (!pass && (!n || !(o.idx = malloc(n * sizeof *o.idx)))) break;
+                if (!pass && npos) o.pidx = malloc(npos * sizeof *o.pidx);
             }
+            if (fly && o.n) fprintf(stderr, "sampler: %s: ink draw cells: %zu supervised, %zu with positive labels%s\n", s->name, o.n, o.pn,
+                                    o.pn ? "" : ": WARNING no positive cells, its windows hold negatives only (the stratified draw is off for it: empty_keep)");
             if (o.n) { o.lev = lc; for (int d = 0; d < 3; d++) o.shape[d] = mc->shape[d];
                 fprintf(stderr, "sampler: %s: %zu of %zu level-%d CT cells hold papyrus inside the stored target chunks (the draw cells)\n", s->name, o.n, tot, lc); }
             free(cb); free(bits);
@@ -4537,6 +4559,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
             }
         }
         sp->occ[i].idx = o.idx; sp->occ[i].n = o.n; sp->occ[i].lev = o.lev; for (int d = 0; d < 3; d++) sp->occ[i].shape[d] = o.shape[d];
+        sp->occ[i].pidx = o.pidx; sp->occ[i].pn = o.pn;
         if (!o.n && S->src[i].weight > 0 && sp->cum[i] > (i ? sp->cum[i - 1] : 0) && !cfg->holdout) {
             fprintf(stderr, "sampler: %s: no draw index (no coarse label level, mask, or level l0 + 3 .. 5 CT; an onfly ink target without supervised tiles): windows drawn uniformly over the whole scan%s\n",
                     S->src[i].name, cfg->strict_sources ? ": fatal (--strict-sources 1; weight 0 drops the source)" : "");
@@ -4762,7 +4785,7 @@ void sampler_stop(sampler *sp) {
     for (int t = 0; t < sp->sn_nth; t++) pthread_join(sp->sn_th[t], nullptr);
     if (sp->sn_q) { free(((sn_pre *)sp->sn_q)->jobs); free(sp->sn_q); }
     free(sp->rleft); free(sp->rq); free(sp->rdue); free(sp->rseq);
-    for (int i = 0; i < sp->S->n; i++) free(sp->occ[i].idx);
+    for (int i = 0; i < sp->S->n; i++) { free(sp->occ[i].idx); free(sp->occ[i].pidx); }
     free(sp->occ); free(sp->slot_j); free(sp->slots); free(sp->state); free(sp->th); free(sp->cum); free(sp->lvl_ok);
     free(sp);
 }

@@ -183,6 +183,33 @@ int main(int argc, char **argv) {
                   "[ $(grep -c '^step' %s/s0.txt) -ge 4 ] && cmp -s %s/s0.txt %s/s1.txt", d, d, d, d, d),
               "MIL training: default and UFSM_SERIALIZE=1 step lines differ (a stream-ordering race?): diff %s/s0.txt %s/s1.txt", d, d);
     }
+    {   /* the stratified ink draw (2026-11-20; sampler-only, no GPU): an ink-only source drew ~97 % windows without an ink positive and dropped 4
+           of 5 of them after the CT read (empty_keep 0.2). With --ink-pos-frac 0.5 (default) half the windows centre on a positive-label cell and
+           none are dropped as empty: fewer rejections than the old draw (--ink-pos-frac -1), a startup line with the per-source cell counts,
+           and a positive share of the known ink in a sane range (more than the old draw's, below 0.9) */
+        snprintf(p, sizeof p, "%s/fx/sources-ink.json", d); FILE *g = fopen(p, "w"); if (!g) return 1;
+        fprintf(g, "{\"sources\": [{\"name\": \"wind-fixture-ink\", \"root\": \"%s/fx\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/fx/axis.json\", \"weight\": 1, \"ink_weight\": 1, \"iso\": 100,\n"
+                   "  \"targets\": {\"ink\": {\"onfly\": {\"segments\": \"%s/fx/segs.json\", \"level\": 0, \"cache_dir\": \"%s/dcache\"}}}}]}\n", d, d, d, d);
+        fclose(g);
+        const char *so = "CUDA_VISIBLE_DEVICES= UFSM_SAMPLER_ONLY=40 UFSM_NCPU=4";
+        for (int v = 0; v < 2; v++)
+            CHECK(!sh("%s %s train %s/fx/sources-ink.json --out %s/so%d %s --single ink --ink-pos-frac %s > %s/so%d.log 2>&1", so, U, d, d, v, common, v ? "0.5" : "-1", d, v),
+                  "sampler-only %d (%s/so%d.log)", v, d, v);
+        double pr[2], rj[2], kn[2], ik[2]; int ok = 1;
+        for (int v = 0; v < 2; v++) {
+            char q[700]; snprintf(q, sizeof q, "%s/so%d.log", d, v); FILE *h = fopen(q, "r"); char ln[8192]; pr[v] = rj[v] = kn[v] = ik[v] = -1;
+            while (h && fgets(ln, sizeof ln, h)) {
+                const char *a = strstr(ln, "sampler-only: produced "); if (a) sscanf(a, "sampler-only: produced %lf rejected %lf", &pr[v], &rj[v]);
+                const char *b = strstr(ln, " windows, known "); if (b) sscanf(b, " windows, known %lf ink %lf", &kn[v], &ik[v]);
+            }
+            if (h) fclose(h);
+            ok &= pr[v] > 0 && rj[v] >= 0 && kn[v] > 0 && ik[v] >= 0;
+        }
+        const double f0 = ok ? ik[0] / kn[0] : -1, f1 = ok ? ik[1] / kn[1] : -1;
+        fprintf(stderr, "ink draw: old %g kept / %g rejected, positive share %.3f; stratified %g / %g, %.3f\n", pr[0], rj[0], f0, pr[1], rj[1], f1);
+        CHECK(ok && rj[1] < rj[0] && f1 > f0 && f1 < 0.9, "stratified draw: rejected %g vs %g, positive share %.3f vs %.3f (%s/so0.log, so1.log)", rj[1], rj[0], f1, f0, d);
+        CHECK(!sh("grep -q 'sampler: wind-fixture-ink: ink draw cells: [0-9]* supervised, [1-9][0-9]* with positive labels$' %s/so1.log", d), "no per-source draw-cell line (%s/so1.log)", d);
+    }
     if (getenv("TIMT_KEEP")) fprintf(stderr, "kept %s (sources %s/fx/sources-mil.json)\n", d, d);
     else if (!fails) sh("rm -rf %s", d);
     fprintf(stderr, "%s\n", fails ? "test_ink_mil_train: FAILED" : "test_ink_mil_train: ok");

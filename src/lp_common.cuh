@@ -136,7 +136,7 @@ __host__ __device__ __forceinline__ int mx_rb(int bw, int bits) { return bw * bi
    the block-scaled MMA do not exist there. The storage formats are unchanged (e4m3 bytes / e2m1 nibbles + ue8m0 scales); the
    conversions become bit-exact integer code (mx_sw.cuh, the 2^32 / 256 / 16 input checks of tests/test_mx_sw.c) and the MMAs
    are emulated from the same register fragments (mma_f8 / mma_f4 / mma_f4x4 below), so every lp kernel runs unchanged. */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200) || (defined(UFSM_ARCH) && UFSM_ARCH == 86)
 #define LP_SW 1
 #endif
 #include "mx_sw.cuh"
@@ -1389,6 +1389,10 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                 const int cl = sec ? cp - OxP : cp, bwt = mx_bw(Ct), rbt = mx_rb(bwt, B);
                 if (cl % bwt || cl >= Ct) continue;   /* not the first tile of a block, or pure padding (block-uniform) */
                 uint8_t *wsb = wb + NR * 16 * rbt;
+                /* SR keys: (channel) * S + voxel, mod 2^64. The channel row's base is formed once per tile, each element adds
+                   its voxel offset and the (mm, h) row step (the per-element 64-bit multiply was ~1/3 of the epilogue: ncu
+                   2026-11-20, conv_fwd_f4p_k 70 % of its instructions in this loop). Same keys, bit for bit. */
+                const uint64_t sr_cb = sp.osr ? ((uint64_t)n * Co + (sec ? cl + ((sp.o_split + 31) & ~31) : cp) + g) * (uint64_t)S + (uint64_t)(ox0 + 2 * t) : 0u;
 #pragma unroll
                 for (int r = 0; r < NR; r++)
 #pragma unroll
@@ -1396,6 +1400,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
 #pragma unroll
                         for (int vv = 0; vv < 2; vv++) {
                             const int lv = r * 16 + q2 * 8 + 2 * t + vv;
+                            const uint64_t sr_rid = sr_cb + ((size_t)(oz0 + wz * (NR / 2) + (r >> 1)) * H + oy0 + wr + (r & 1)) * W + (uint64_t)(q2 * 8 + vv);
                             float val[2][2], am = 0.f;
 #pragma unroll
                             for (int mm = 0; mm < 2; mm++)
@@ -1416,7 +1421,7 @@ __device__ __forceinline__ void fwd_epilogue(float (&acc)[MT][NR][2][4], unsigne
                                     for (int h = 0; h < 2; h++) {
                                         const float q = val[mm][h] * mult;
                                         /* MX-fp4 gradient: exact SR keyed by (output channel, voxel) */
-                                        const unsigned c4 = sp.osr ? sr_e2m1_nib(q, sr_hash(sp.osr, ((uint64_t)n * Co + (sec ? cl + ((sp.o_split + 31) & ~31) : cp) + mm * 16 + g + 8 * h) * (uint64_t)S + ((size_t)(oz0 + wz * (NR / 2) + (r >> 1)) * H + oy0 + wr + (r & 1)) * W + ox0 + q2 * 8 + 2 * t + vv) & 0xffffu)
+                                        const unsigned c4 = sp.osr ? sr_e2m1_nib(q, sr_hash(sp.osr, sr_rid + (uint64_t)(mm * 16 + 8 * h) * S) & 0xffffu)
                                                                    : (unsigned)(cvt_e2m1x2(q, 0.f) & 15);
                                         nib |= c4 << (8 * (2 * mm + h));
                                     }

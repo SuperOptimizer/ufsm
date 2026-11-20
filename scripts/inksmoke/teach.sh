@@ -7,7 +7,7 @@
 # and a finished ink-teach are kept). B2 (11-18): KIT/kit/extra-SCROLL.tsv (or EXTRA=FILE), lines "NAME TIFXYZ" of meshes without human
 # labels: their teacher maps too, and ink-teach --extra-list (teacher labels with the labelled meshes' calibration, held-out boxes and
 # px within 48 voxels of a labelled mesh removed). Env: HOD (the holdouts-SCROLL.json dir, KIT/arms; podq.sh: KIT/arms/full), U (binary), GPU (0), LOCK (/root/gpu.lock: held per ink-ext call), BATCH (16), TH (8).
-set -uo pipefail; K=${1:?KIT}; S=${2:?SCROLL}; U=${U:?U}; R=https://dl.ash2txt.org/community-uploads/forrest/volcomp
+set -uo pipefail; K=${1:?KIT}; S=${2:?SCROLL}; U=${U:?U}; R=${TEACH_CTR:-https://dl.ash2txt.org/community-uploads/forrest/volcomp}   # (TEACH_CTR: a local CT root, the desk 11-18)
 W3=$K/weights/reader-v3.pth; W42=$K/weights/ink9um-s42.pth; W43=$K/weights/ink9um-s43.pth; HO=${HOD:-$K/arms}/holdouts-$S.json
 for f in $W3 $W42 $W43 $HO $K/inkgt/segs-$S.json; do [ -s $f ] || { echo "teach: missing $f"; exit 1; }; done
 CT=$(python3 -I -c "import json; print([s['ct'] for s in json.load(open('$K/inkgt/sources-H0.json'))['sources'] if s['name'].startswith('$S-')][0])") || exit 1

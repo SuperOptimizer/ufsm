@@ -105,6 +105,14 @@ int main(int argc, char **argv) {
     CHECK(system(cmd) != 0, "--known --joint 1 accepted");
     snprintf(cmd, sizeof cmd, "'%s' render '%s/wraps' '%s/o3' --volume '%s' lab.zarr/0 --ct '%s' lab.zarr/0 --known --fill 2 2> /dev/null", argv[1], dir, dir, dir, dir);
     CHECK(system(cmd) != 0, "--known --fill accepted");
+    /* no wrap rendered = exit != 0 (11-20: a wraps dir mid-move to the NAS rendered 0 wraps with exit 0): a dir whose only wrap is a
+       dangling link, on both CPU paths and --joint */
+    snprintf(cmd, sizeof cmd, "mkdir -p '%s/gone' && ln -sfn '%s/nowhere' '%s/gone/w001'", dir, dir, dir); CHECK(!system(cmd), "dangling setup");
+    for (int m = 0; m < 3; m++) {
+        snprintf(cmd, sizeof cmd, "%s'%s' render '%s/gone' '%s/o4' --volume '%s' lab.zarr/0 --threads 2%s 2> '%s/o4.log'", m == 1 ? "UFSM_RENDER_MEM=0.000001 " : "",
+                 argv[1], dir, dir, dir, m == 2 ? " --joint 1" : "", dir);
+        CHECK(system(cmd) != 0, "render of 0 readable wraps exited 0 (path %d)", m);
+    }
     free(vol); free(buf); free(ref); free(X); free(Y); free(Z);
     if (!fails) { snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) {} }
     if (fails) { fprintf(stderr, "test_render_known: %d failures (kept %s)\n", fails, dir); return 1; }

@@ -17,4 +17,14 @@ scp -q "$here/cmake/mcc.version" "$H:$ROOT/setup/cmake/" || exit 2
 ssh "$H" "bash $ROOT/setup/scripts/toolchain/install_mcc.sh" || { echo "gpubox_setup: mcc install failed"; exit 1; }
 ssh "$H" "[ -x $ROOT/pyenv/bin/python3 ] || python3 -m venv $ROOT/pyenv; $ROOT/pyenv/bin/pip install -q numpy tifffile scipy pillow &&
   $ROOT/pyenv/bin/python3 -c 'import numpy, tifffile, scipy, PIL; print(\"pyenv ok\")'" || { echo "gpubox_setup: venv failed"; exit 1; }
-echo "gpubox_setup: $H ready: scripts/test/desk_suite.sh -H $H -a 86 -R $ROOT BRANCH"
+# test inputs that live in the desk's ~/ufsm-data (net weights only, never label data): test_ink_ext_tiling SKIPs without hecate (522 MB)
+for f in ufsm-data/inkext/weights/hecate_9.6um.pth; do
+  [ -f "$HOME/$f" ] || continue
+  ssh "$H" "[ -s \$HOME/$f ]" && continue
+  ssh "$H" "mkdir -p \$HOME/$(dirname "$f")" && scp -q "$HOME/$f" "$H:$f" && echo "gpubox_setup: copied ~/$f"
+done
+# the runner sizes GPU slots at 2.5 GB of free memory: on an 8 GB card three arch86 tests at once ran test_widen out of memory (laptop
+# 4060, 2026-11-20), so cards below 12 GB get -G 2
+mem=$(ssh "$H" "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | sort -n | head -1")
+g=; [ "${mem:-0}" -lt 12000 ] && g='SUITE_ARGS="-G 2" '
+echo "gpubox_setup: $H ready: ${g}scripts/test/desk_suite.sh -H $H -a 86 -R $ROOT BRANCH"
