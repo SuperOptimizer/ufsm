@@ -16,7 +16,6 @@
    --map's coarse frame (e.g. Paris 4: the 2023 all-lengths tracing through the reg map plus the native 2.4 um Paris4_v1 chains).
    Shards (--shard^3) are independent; --zband limits the z range written (level voxels, widened to whole shards). CPU. */
 #include "defaulted.h"
-#include <stdatomic.h>
 #include <math.h>
 #include "optcheck.h"
 #include <pthread.h>
@@ -179,10 +178,12 @@ static int fr_box(fr_job *J, const int64_t so[3], const int64_t n[3], uint8_t *d
             else if (zs > zmin) zs = zs / 2 > zmin ? zs / 2 : zmin;
             else gok = 0;
         }
-        if (!gok) { static atomic_int said; if (!atomic_exchange(&said, 1))
-            UFSM_DEFAULTED("fibre labels = the single-threaded CPU raster (the GPU builder failed on a %lld-plane slab of a %lldx%lldx%lld box, "
-                           "even halved: no device memory beside the training plan?); training can stall on it (UFSM_FIBRE_GPU_MVOX smaller, or a smaller P)",
-                           (long long)zs, (long long)n[0], (long long)n[1], (long long)n[2]); }
+        if (!gok) {   /* (this box on the CPU: same bytes, slower; was silent until 2026-11-20, latcodec's laptop run spent its CPU here) */
+            static _Atomic long nfb;   /* mgpu: process (atomic) */
+            const long k = atomic_fetch_add(&nfb, 1) + 1;
+            if (k == 1) UFSM_DEFAULTED("fibre planes = the CPU for boxes the GPU path refused (%lldx%lldx%lld box, %ld steps: device memory or size)", (long long)n[0], (long long)n[1], (long long)n[2], t_st.n);
+            else if (k % 1000 == 0) fprintf(stderr, "fibre planes: %ld boxes on the CPU (the GPU path refused them)\n", k);
+        }
     }
     if (gok) {
         if (g_fr_timing) fprintf(stderr, "fibre box %lldx%lldx%lld: %ld steps, %.0f ms polylines, %.0f ms CT, %.0f ms GPU\n", (long long)n[0], (long long)n[1], (long long)n[2], t_st.n, (ft1 - ft0) * 1e3, (ft2 - ft1) * 1e3, (fr_t() - ft2) * 1e3);

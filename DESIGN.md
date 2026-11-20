@@ -6,6 +6,139 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Dev-loop speed, part 1: the baseline; the runner starts in 0.2 s, waits cheaply, and -c selects by symbol reach (2026-11-20, branch devspeed-20261120)
+
+**Baseline** on the desk (load 100-107 on 32 threads, two trainers; lowprio, -j 4, mcc 5744025):
+
+| stage | time |
+|---|---|
+| configure (cmake --preset) | 10 s (generate 8.6 s) |
+| cold release build / cold verify suite-bins (256 binaries, 2.1 GB) | 103 s (208 CPU-s) / 162 s (370 CPU-s) |
+| no-op build | 0.3 s |
+| edit train.c -> build/ufsm | 14 s (train.c 13 s + link 2 s) |
+| edit a .cu (release / verify) | 3.4 s / 8.7 s (160 relinks) |
+| edit unet.h | 17 s |
+| edit nn.h (release / verify) | 94 s (157 units) / 45 s; nn.h changed 73 times in 7 days |
+| JIT, every kernel cold | ~29 min (mcuda); 1889 + 1037 cubins compiled at 03h / 07h today (pin moves) |
+| CPU fast tier, 146 tests | 30-100 s at -j 16, 110-150 s at -j 4-6 (657 CPU-s) |
+| GPU fast tier, 221 tests | not runnable while both desk cards train: NOGPU / BUSY in 40 of the last 45 desk runs |
+
+So compiling is not where the time goes. The unit PTX holds no source paths (only the host `__FILE__` strings do; raw PTX diffed between
+two worktrees), so `~/.cache/mcudahw` is shared by every worktree and build dir; a JIT is paid per changed kernel and per pin move.
+Off the desk: forlindesk (2x3090) has been offline for 2 days, the laptop's GPU runs latcodec's training (its CPU is idle), the NAS host is
+an N100 (storage only).
+
+**Runner start-up.** Parsing the manifest cost 4 subshells per line (`$(echo)`, `tr`, `sed`): 7.5 s wall / 5.7 CPU-s per runner start
+on the loaded desk (`-l`), 11.7 s for a one-test run. Trimmed in bash, plus one grep instead of one per binary for the "not in the
+manifest" warning: `-l` 0.23 s, a one-test run 0.9 s. The lists of every tier and of `-c` are identical to the old runner's.
+
+**Waiting on a held card.** Every poll (0.2-0.6 s) of every waiting GPU test ran `lslocks` (0.2 s, it scans /proc). That showed up as
+~110 % CPU in `ps` while one -W 3600 suite waited for card 1. Now `lslocks` runs only to name the holder once, the foreign-process check
+reads the 10 s nvidia-smi cache, and after 10 s of waiting the poll is every 2-4 s.
+
+**-c REF by symbol reach.** Under mcc the old rule selected every CUDA-linking binary's tests for any .cu / .cuh edit (266 of 368 for
+a one-line nn_opt.cu change). The DWARF basenames also missed headers without code lines. Now `$BDIR/.srcdeps.map` (`tests/srcdeps.awk`,
+rebuilt when a binary, build.ninja or the runner is newer: 1.5 s) lists, for each binary, the repo files of the objects its own
+objects reach through `nm` references (U and weak w / v: render.c reaches nn_render only weakly), with constructor objects
+(.init_array: fpenv, nn_band, tfx) as roots. Each object's files are its ninja depfile, so headers count too. One-line edits, tests
+selected (of 368):
+
+| file | old | new |
+|---|---|---|
+| src/nn_opt.cu | 266 | 170 |
+| src/nn_gpudec.cu | 266 | 73 |
+| src/nn_render.cu | 266 | 70 |
+| src/train.c | 84 | 68 |
+| src/unet.c | 145 | 131 |
+| src/sample.c | 105 | 91 |
+| tests/test_volcomp.c | 1 | 1 |
+| src/nn.h / nn_common.cuh | all CUDA | 261 / 243 |
+
+The floor is the 82 fast-tier tests that run `ufsm` itself (main reaches every command). New target `test-touched` = `-c` against the
+merge base with origin/master. test_run_suite checks the map on synthetic records.
+
+**test-prep's sibling configure.** `--target test` re-configured the sibling build dir (release for a verify dir) on every call: 7.2 s
+of generate on the loaded desk, 7.7 s for a no-op `test-prep`. `cmake/sibling_cfg.sh` skips it when the arguments are the ones the dir
+was configured with (DIR/.ufsm-sibling-cfg). A CMakeLists change still regenerates both dirs (ninja's own rule). No-op: 0.4 s.
+
+**The suite off the desk.** `scripts/test/desk_suite.sh -H HOST -a 86 -R ROOT` pushes a commit to another box, builds it with the arch86
+presets into build/ and build-verify/ (the Python tests read build/) and runs the tier there. On the laptop (Ryzen 7940HS, CPU idle
+while latcodec trains on its GPU), `SUITE_ARGS="-g none" desk_suite.sh -H forlinlapnvidia -a 86 -R /home/forrest/suite -m 8 -l 14 REF`
+takes 205-209 s to build and 64-73 s for the CPU fast tier, 148 / 148 passing, with no desk CPU used (the desk spends 657 CPU-s per
+CPU tier). The laptop's python3 has no numpy and no sudo: `ROOT/pyenv` (venv with numpy, tifffile, scipy, pillow) goes on PATH when
+present. With -H forlindesk the same line is the GPU gate on its 3090s once that box is back: under arch86 every GPU test runs, the
+lp_* kernels on their software MX paths.
+
+**Cold JIT inside GPU tests.** test_flatten_gpu's 427 s outlier (warm: 22 s) was 425 s of user CPU: the driver's ptxas runs in the
+test's process, so after a pin move or a kernel edit the first GPU tests pay the JIT inside their timeouts. mcudahw's cache key is per
+kernel (its text + needed device functions + globals, the GPU name and the driver version; cuda/hw/mod.c), so a .cuh edit re-JITs
+only the kernels whose text changed.
+
+## netsplit: which net output channels the unroll needs; normals and density from the phase gradient (2026-11-20, branch netsplit-20261120, unrollperf)
+
+The user's goal: break the shared trunk into small single-target full-resolution nets with at most 4 output channels each, so the
+three-buffer memory mode applies. Step 1 is to find out which of today's ~24 output channels production reads, and which could be
+computed from another output.
+
+**Inventory (code read, master 2026-11-20; unroll.sh defaults, FKIND=lat fit fields `pc ps t0..t5 sp w dz dy dx dq`).**
+
+| channel (cout) | exported as | production consumers | verdict |
+|---|---|---|---|
+| phase cos / sin (2) | `pc ps` (mean 2 sigma - 1 over material; the length is the confidence) | the slab fit's data term; phase gate; count-field ref (phase-gradient targets, `--phase-w 0.5`); merge-flag (phasor products -> mf -> ref `--mf-w 1`); recto-sp; fit-join sample cells; wrap-check; wrap-snap `--target mix`; unroll-qa | **needed** |
+| normal n n^T (6) | `t0..t5` (zz yy xx, 0.5 + zy zx yx) | the fit's normal term (w_normal 3); count-field ref's count direction (principal axis + gates); phase gate \|n.r\|; recto-sp profile direction; wrap-check tdn; unroll-qa tilt | used; derivable? (below) |
+| density (1) | `sp` = 8 / (h rho) | the fit's density / nondegeneracy term; count-field ref magnitude rho = 8 / sp; phase gate expected rate; merge-flag S9 / S5; recto-sp (blended); wrap-check; wrap-snap spacing | used; derivable? (below) |
+| winding mod 4 (2) | `dz dy dx dq` | unroll-qa's warn-only gate only: `fit --wind4-weight` defaults 0; `--uw-rep-w4` needs `--uw-repair` (unroll passes 0); the `fit_dir_w4` hand vote never runs because unroll always passes `--dir` | **not consumed: cut** |
+| ink (1) | `--heads ink` | INKMODE=lat only (opt-in); production ink is reader3, a separate 2-D-teacher net | separate ink net |
+| recto / verso (2) | `--heads rv`, c12 / c13 | INKMODE=lat's ink gate only | research (rvsep: no counting lever) |
+| fibre H / V (2), dyad (6), family (1) | `fib/H fib/V fib/dyad fib/fam` | fiber-trace, univ eval, gt-trans; `fit --w-fib` defaults 0; fam has no reader | separate fibre net (H / V; dyad if tracing needs it) |
+| pad rows, cond, pap-head, distill, legacy tasks | none | training only | cut |
+
+`w` (material fraction) and `ct / cs` are not network outputs: predict computes them from the CT.
+
+**Derivability.** `ufsm fields-derive IN OUT [--normal 1] [--density 1] [--r 2] [--stats 1]` (src/fieldsderive.c,
+test_fieldsderive) rewrites a fit-field set:
+- Per material cell, it takes the phase gradient g (radians per cell) from central differences of the phasor (`arg(conj(z-) z+) / 2`;
+  one-sided where a neighbour has no phase), with weight |z|^2 / 127^2.
+- Over a (2r + 1)^3 box: T = sum c n n^T / sum c, and G = sum c |g| / sum c.
+- It encodes them as predict does: t from T, and sp = 16 pi / G (one phase turn per wrap). The other planes are links to IN.
+- test: a planar phase of known normal and period comes back within 3 codes on every plane.
+
+Agreement with the network's own heads on 1667 q2 (try9 lat fields, 3.97 G material cells, weight |phasor|^2):
+
+| box r | \|cos\| net normal vs phase-gradient normal: mean / p10 / median / share >= 0.95 | sp phase / sp net: p10 / median / p90 |
+|---|---|---|
+| 1 | 0.983 / 0.97 / 0.99 / 0.955 | 0.889 / 1.157 / 1.729 |
+| 2 | 0.987 / 0.98 / 0.99 / 0.970 | 0.901 / 1.157 / 1.682 |
+
+- The normal head is, to within a few degrees, the direction of the phase gradient.
+- The density head is not the magnitude of the phase gradient. The phase advances a median 14 % fewer turns than the density head
+  counts, and 10 % of cells are 1.7x sparser. This fits the phase merging sheets (packed regions) where the density head still
+  counts them.
+
+**Ablations.** The production ref was run on derived field sets: unroll.sh ref()'s flags, `--dir -1`, no mf, chunk rows 256, CPU,
+6 threads. GT ids were scored on the 54 1667 GT boxes (gtboxes.sh). The difference to base is voxel-weighted and paired per box, with
+a 95 % bootstrap CI over the boxes (4000 resamples). Run noise floor: ~0.02-0.03 ids.
+
+| arm | ref GT ids | - base [95 % CI] | boxes up / down | model coherence |
+|---|---|---|---|---|
+| base (the net's t0..t5 and sp) | 0.8302 | | | 0.187 |
+| fN: normals from the phase gradient | **0.8487** | **+0.0185 [+0.0067, +0.0316]** | 30 / 23 | 0.230 |
+| fS: density from the phase gradient | 0.7943 | -0.0358 [-0.0747, +0.0049] | 19 / 35 | 0.242 |
+| fNS: both | 0.7946 | -0.0356 [-0.0745, +0.0052] | 18 / 36 | 0.235 |
+
+- **Normals: cut the 6-channel head.** Derived normals are at least as good, and a little better here: the CI excludes 0 but stays
+  inside the noise floor. A smoothed phase gradient is the direction the count-field ref needs. The net's normal head, pooled per
+  cell, is not more accurate than the phase it is trained against.
+- **Density: keep it (1 channel).** Replacing it costs ~0.036, with the CI almost all below 0. The density head carries sheet counts
+  that the phase loses where it merges sheets: median 1.16x, p90 1.7x sparser from the phase.
+- fNS = fS: once density comes from the phase, the normal source no longer matters.
+- Joined ids (slabs + join) were not run. The slab fits' normal term is the same n n^T and the ref drives the counting, so these are the
+  ref numbers only.
+
+**Minimal winding net (proposal):** phase 2 + density 1 = 3 output channels, which fits the <= 4 three-buffer mode. The normals are
+derived in predict's fit-field export (the fields-derive computation moved there) or by `fields-derive --density 0`. wind4 is cut,
+because no production reader uses it. Ink (1), rv (2) and fibre H / V (2) become their own single-target nets; fibre dyad and family
+come back only if tracing needs them.
 ## Full-resolution VRAM: single-target nets on the three level-0 buffers, P 704 on a 16 GB card (2026-11-20, branch fullvram-20261120, fullvram)
 Goal (lead, after the user's return to full-resolution nets, one small net per target): a bigger window for full-resolution training on
 one 16 GB desk card (5060 Ti), first for 3-D ink. Every number below is the planner's (dry builds at 15.6 GB free, the --ink-mil 0.33 GB
@@ -175,6 +308,47 @@ C15; ~87 s per channel): traces A (dyad, no gate) and B (q2 MFREF joined fit as 
 count-field `--fibers` ties (fiber-export, --cf-fib-spans 64,256), scored on C2 / C6 / C12 / C15 against the no-tie MFREF ref.
 Results below when scored.
 
+## rvsub: sub-cell rv / fibre rows + contact weight: PARKED, at most +0.03-0.04 rv peaks per turn, no fibre gain (2026-11-20)
+
+Question: does try9 miss recto / verso and fibre-direction switches between touching sheets because its head is cell-scale (4 voxels =
+38 um)? Can sub-cell output rows (`train --lat-sub rv,fib,ink`) and a contact weight on the rv / fibre masks where labelled sheets come
+within 70 um (`--contact-weight 4`) resolve them? Both flags are on master (51285c32 / e28318fe / b361b431) and stay opt-in.
+
+Setup:
+- Three arms on desk card 1, all warm from the cooled try9 (try9cool/cooled-33333): try9 recipe at P 256 / 9.6 um, 6000 steps, seed 3,
+  phase + AFV fibre sources (sources-96f.json).
+  - ABc: control (--rv 2 --fib-head 1).
+  - ABs: + --lat-sub rv,fib,ink --contact-weight 4.
+  - ABd: ABs + latcodec's sub-cell decoder (--lat-dec 64).
+- Score: ufsm gt-trans (rv / fibre flips and peaks per GT turn by normal gap) on the held-out Paris 4 boxes (PH2, HOLD) against the q9.6
+  GT and the July codes. Predict at window 640 / halo 64 with live weights, no --gn-live: predict refuses non-gn-ema checkpoints with
+  rc 2, and the first pass silently scored empty stores.
+
+GT gap below 70 um (Paris 4 / July):
+
+| arm | rv flips V>R + R>V per GT turn | rv peaks per GT turn | fibre (H-V) peaks per GT turn |
+|---|---|---|---|
+| CT peaks (reference) | | 0.683 / 0.435 | |
+| COOL0 (cooled try9, step 0) | 0.566 / 0.531 | 0.580 / 0.398 | 0.393 / 0.269 |
+| ABc | 0.755 / 0.525 | 0.547 / 0.341 | 0.362 / 0.243 |
+| ABs | 0.841 / 0.612 | 0.580 / 0.378 | 0.370 / 0.250 |
+| ABd | 0.790 / 0.554 | 0.617 / 0.373 | 0.375 / 0.244 |
+
+Results:
+- Sub-cell rows add +0.03 / +0.04 rv peaks per turn over the fine-tune control. ABd is the best on Paris 4 (0.617), but below COOL0 on
+  July.
+- No arm reaches the CT's own peak rate, and no arm lifts fibre peaks (all below COOL0).
+- Flips per turn rise (0.84 vs 0.76), but peaks do not. The arms switch side more often without separating more sheets.
+- wbench GT ids, ABs / ABd vs ABc: held-out packed +0.033 / +0.020, control -0.02 / -0.03, J27 -0.13 / -0.14 in both. That is mixed.
+
+Cost: --lat-sub rv,fib,ink +0.76 GB plan at P 768. Sub-cell predict at window 640 allocates a 7.86 GB buffer (OOMs beside another job on
+a 16 GB card).
+
+Step 3 (a fibre layer-orientation target) dropped. mergeflag's 2.4 um test found the CT's layer orientation itself flips only 0.27-0.49
+per turn below 70 um, below the CT peaks, so the target would have nothing to learn from.
+
+Kept: runs/rg96AB{c,s,d}-s3/last.ckpt and the gt-trans outputs in /vesuvius/ufsm/inksdk/resgate/abgt/.
+
 ## Layer fibre orientation in the CT does not separate touching sheets at 2.4 um either (2026-11-19, branch orient-20261119, mergeflag)
 
 **Question (user via lead).** Each sheet is a recto layer (horizontal fibres) on a verso layer (vertical fibres). At 2.4 um, does
@@ -325,7 +499,34 @@ boxes of the u1 / try9 rows; window 640 / halo 64, --gn-live 1, the rvsep predic
   fluctuation-dissipation relation (Yaida 2018 / SASA) plus prog_K vs sqrt(kappa / K). Notes: /vesuvius/ufsm/trainperf/admuon2/design.txt.
 
 ## resgate: 9.6 um detail arms fine-tuned on the GT boxes, PARTIAL (R0, R2 only; stopped 2026-11-19 by the user's "stop winding training")
-## mcc CUDA backend: device inlining, constant tables, vector memory, f16 round trips (2026-11-20, microc branch cudaopt-20261119, mcuda)
+## mcc follow-ups: the 84903be host miscompile, sm_120 A/B (no pin move), cold JIT, const tables (2026-11-20, microc branches unswfix / cudaopt / jitorder / consttab-20261120, mcuda)
+
+- **84903be (x86-64 loop unswitching) miscompiled l1pot.c's l1_solve** (test_patchsolve, test_repair's l1 grid, test_wbench_stats fail at
+  microc main). opt.c unswitch() ran simplify_cfg() right after unswitch_one() without compute_dom(); forward_phi_blocks read stale
+  dominator numbers for the copy's new blocks, judged the copied loop header not to dominate its successor and turned its phis into
+  NOPs while the copy still used them (loop counters undefined: the move loop never stopped or counted the wrong work). Fix: compute_dom()
+  before that simplify_cfg and the one after gvn (+3 lines, the same 6 loops unswitched). microc unswfix-20261120 77947a9, test
+  tests/c/unswitch_dom.c (l1_solve reduced to 60 lines; fails 2 of 5 flag sets at main). ufsm fast tier on main + fix (laptop): 343 pass,
+  the 18 failures exactly the pin's. cudaopt-20261119 rebased onto it (aaa23b2; PTX byte-identical to 258d73f's on lp_f4v,
+  lp_mx_s2bwd_tc, nn_conv, nn_fstem, nn_gpudec).
+- **sm_120 A/B** (desk card 1, P 256, 12 try9-shaped steps, nsys, 2 runs each): GPU kernel sum pin 2.478 / 2.503 s, cudaopt 2.484 /
+  2.490 s: neutral (sm_89: 0.96x nvcc). Per kernel: conv1_mx_tc 1.26x, conv_bwd_w1_tc 1.17x, fstem_fwd 1.12x faster; conv_bwd_w_f4ws_k
+  (22 % of the step) 0.97x slower (its text differs: a real effect). w4_events_k "0.86x" is noise: the text the driver compiles is byte-
+  identical under both (MCUDA_DUMP), the same cubin; per-launch medians pin 80 / 87 us, cudaopt 95 / 100 us. Lead: no pin move (a cold
+  re-JIT on every machine for no sm_120 gain); revisit with a measured sm_120 gain or a needed host fix.
+- **Cold JIT is ptxas time, not mcc's PTX.** The big conv kernels are 1.3-4.3 MB of PTX and 20-90 s each in the driver's compiler (desk
+  warm-up: 124 kernels over 10 s = 68 % of 4379 s); the same 12 lp_f4v kernels take 45.7 s from mcc's PTX and 42.8 s from nvcc's, and
+  nvcc's SASS is as large (conv_fwd_f8s 2.6 MB vs 1.7 MB). 16 compile threads on the laptop (16 threads, 30 GB) inflated per-kernel times
+  ~10x (sum 18208 s, max 716 s). The driver's own JIT cache (~/.nv/ComputeCache) makes a second "cold" run look 10x faster: cold timings
+  need CUDA_CACHE_DISABLE=1. mcudahw's cache key is per kernel (its entry, the functions it reaches, its data, the module header, device
+  name, driver version). microc jitorder-20261120: MCUDA_PRECOMPILE compiles the largest kernels first; a per-kernel PATH.lock so
+  parallel cold processes compile a kernel once; MCUDA_KLOG=FILE (kernels a process loads) and MCUDA_PRECOMPILE_ONLY=@FILE (warm just
+  those) for devspeed's per-test warm-up. Largest-first ran (2294 kernels, 0 failures); the lock and the two knobs await a GPU context.
+- **Local const tables.** tol_dir's `const int t[13][3]`, inlined into loss_stats_k / loss_grad_k, was built on the stack per call:
+  1248 / 624-byte local depots (nvcc 160). microc consttab-20261120: an automatic array of const numbers with an all-constant initializer
+  becomes one static object (MCC_NOCTAB=1: off); nn_loss st.local 1710 -> 110. 13 of 176 ufsm .cu units change PTX, no STRICT unit.
+
+## mcc CUDA backend: device inlining, constant tables, vector memory, f16 round trips (2026-11-20, microc branch cudaopt-20261119: 834ab75, LICM opt-in 258d73f; mcuda)
 
 Question: where does mcc's PTX lose to nvcc's, and what closes it? Measured on the laptop forlinlapnvidia (RTX 4060, sm_89, ARCH 86
 software MX) with a try9-shaped 12-step training on a fixture (P 256, widths 256,320,384,448,288,288, --lat 4, --fstem 16, nsys GPU
@@ -354,6 +555,11 @@ last copy of each .entry, against nvcc 13.3's objects; MMA-loop SASS counts).
 - Still slower than nvcc: conv_fwd_f4_k 1.05x (47 % of the step), conv_fwd_s2_f8 1.25x, conv_bwd_w_s2_f8 1.13x, sum_k 1.45x;
   conv_bwd_w_f4_k stays 0.81x (mcc wins). sm_120a ptxas totals: stack 140 KB against nvcc's 79 KB, mostly in non-hot kernels
   (loss_stats / grad ~2.4 % of a step).
+- Strict units: with UFSM_STRICT_MATH=ON (bit-exact against the CPU) the 17 GPU tests of the strict units (gpudec, band_pair,
+  latvol, vcgpu, ftrace, fibre / codes on the fly, faces, render, ink_splat, hgs, unwrap2_ink) pass under the branch as under main:
+  no FMA contraction flip. The f16 fold only removes f2h(h2f(x)) (a half's bits widened and narrowed); h2f(f2h(y)), the intended
+  rounding, stays (microc tests/cuda/h16rt.cu, output identical to nvcc's). With the fold a __half2 taken apart and stored keeps
+  its NaN payloads as nvcc does; main canonicalised them to 0x7fff.
 - Fast tier on the laptop with the branch: the same failures as mcc main without it (the laptop baseline already fails 18:
   gscale, parity, predict_heads, latents, accum ... on its 8 GB GPU). main itself fails test_patchsolve, test_repair (l1 grid) and
   test_wbench_stats, which the pin 5744025 passes: host code, first bad commit 84903be "x86-64: loops unswitched on a value they do

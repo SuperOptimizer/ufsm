@@ -4343,6 +4343,7 @@ void unet_adamw(unet *u, float lr, float b1, float b2, float eps, float wd, int 
 }
 static void for_each_conv3(unet *u, void (*fn)(unet *, const convp *, void *), void *arg);
 static void for_each_mat(unet *u, void (*fn)(unet *, const convp *, void *), void *arg);   /* the Muon matrices: the 3^3 convs + the attention linears */
+static int conv_level(const unet *u, const convp *c);
 /* Conv traversal follows graph order, not parameter offsets. Sort weight intervals before
    updating the complementary biases, norms and head, so each parameter has one owner. */
 typedef struct { const convp *c[UNET_MAXCONV]; int n; } conv_list;
@@ -4861,6 +4862,26 @@ static void ost_adam_after(unet *u) {
 }
 /* " upd/w L0 2.1e-03 [1.2e-03 3.4e-03] deep ...": per group the Frobenius-pooled ratio sqrt(sum |dW|^2 / sum |W|^2) and, for the Muon
    groups, the range of the per-matrix ratios. 0 when nothing was collected since the last call. */
+/* the parameter groups train's health check watches (2026-11-20, devspeed: T9C's ink head row sat frozen from step 11 to 2991): every
+   Muon matrix (a 3^3 conv / an attention linear), every output row of the 1^3 head (its weights: a head shared by several targets has
+   a row per target, and one row can freeze while the others train), and the AdamW ranges between them. Returns the count (<= cap) */
+typedef struct { size_t (*rg)[2]; char (*nm)[40]; int cap, n; } pg_list;
+static void pg_add(pg_list *L, size_t off, size_t n, const char *fmt, int a, int b) {
+    if (L->n < L->cap && n) { L->rg[L->n][0] = off; L->rg[L->n][1] = n; snprintf(L->nm[L->n], 40, fmt, a, b); L->n++; }
+}
+static void pg_mat(unet *u, const convp *c, void *arg) {
+    pg_list *L = arg; pg_add(L, c->w, (size_t)c->cout * c->cin * c->k * c->k * c->k, "conv L%d %dch", conv_level(u, c), c->cout);
+}
+static void pg_plain(unet *u, size_t off, size_t n, void *arg) {   /* (the head's weight rows split out of the range that holds them) */
+    pg_list *L = arg; const size_t hw = u->head.w, rw = (size_t)u->head.cin * u->head.k * u->head.k * u->head.k, he = hw + rw * (size_t)u->head.cout;
+    if (he <= off || hw >= off + n || !rw) { pg_add(L, off, n, "adamw @%d+%d", (int)off, (int)n); return; }
+    if (hw > off) pg_add(L, off, hw - off, "adamw @%d+%d", (int)off, (int)(hw - off));
+    for (int r = 0; r < u->head.cout; r++) pg_add(L, hw + rw * (size_t)r, rw, "head row %d%.0d", r, 0);
+    if (off + n > he) pg_add(L, he, off + n - he, "adamw @%d+%d", (int)he, (int)(off + n - he));
+}
+int unet_param_groups(unet *u, size_t (*rg)[2], char (*nm)[40], int cap) {
+    pg_list L = {rg, nm, cap, 0}; for_each_mat(u, pg_mat, &L); plain_ranges(u, pg_plain, &L); return L.n;
+}
 int unet_opt_stats_str(unet *u, char *buf, size_t cap) {
     if (!u->ost_have) return 0;
     u->ost_have = 0; if (!u->ost_ngrp) { ost_groups(u); u->ost_ngrp = 1; }

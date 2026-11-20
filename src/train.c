@@ -22,6 +22,7 @@
 #include "sources.h"
 [[gnu::weak]] int inkfly_cache_budget(size_t);   /* (inksplat.o: the shared ink cache budget, --ink-cache-mb) */
 #include "inksplat.h"
+#include "gpudec.h"
 #include "meshcodes.h"
 #include "inkmil.h"
 #include "hgs.h"
@@ -49,6 +50,30 @@
 #include "dino.h"
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+/* the start-up timeline (2026-11-20, devspeed: 10-20 min start-ups nobody could split): until the first step ends every stderr line of
+   train.c starts "t+12.3s " (monotonic since cmd_train), and tl_mark() records the phase ends for one "startup:" summary line after the
+   first step. Other files' lines stay as they are; UFSM_STARTUP_TIMES=0 turns the prefix off. */
+static double g_tl0, g_tl_t[8]; static const char *g_tl_n[8]; static int g_tl_k, g_tl_on, g_tl_bol = 1;   /* mgpu: main (start-up, before the threads) */
+static void tl_mark(const char *phase) { if (g_tl_k < 8) { g_tl_n[g_tl_k] = phase; g_tl_t[g_tl_k++] = now(); } }
+static int tl_fprintf(FILE *f, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static int tl_fprintf(FILE *f, const char *fmt, ...) {
+    va_list a; va_start(a, fmt); int r = 0;
+    if (f == stderr && g_tl_on) {   /* (one write per line: the prefix and the text together, so another thread's line does not split it) */
+        char b[4096]; int k = g_tl_bol ? snprintf(b, sizeof b, "t+%.1fs ", now() - g_tl0) : 0; const int m = vsnprintf(b + k, sizeof b - (size_t)k, fmt, a);
+        if (m >= 0 && (size_t)(k + m) < sizeof b) { r = fputs(b, f) < 0 ? -1 : k + m; g_tl_bol = k + m > 0 && b[k + m - 1] == '\n'; va_end(a); return r; }
+        va_end(a); va_start(a, fmt); if (k) fputs((b[k] = 0, b), f);
+    }
+    r = vfprintf(f, fmt, a); va_end(a);
+    const size_t n = strlen(fmt); if (f == stderr) g_tl_bol = n && fmt[n - 1] == '\n';
+    return r;
+}
+static void tl_summary(void) {
+    if (!g_tl_on) return;
+    g_tl_on = 0; char b[512]; size_t k = (size_t)snprintf(b, sizeof b, "startup: %.1f s to the first step's end:", (g_tl_k ? g_tl_t[g_tl_k - 1] : now()) - g_tl0);
+    for (int i = 0; i < g_tl_k && k < sizeof b; i++) k += (size_t)snprintf(b + k, sizeof b - k, " %s %.1f s%s", g_tl_n[i], g_tl_t[i] - (i ? g_tl_t[i - 1] : g_tl0), i + 1 < g_tl_k ? "," : "");
+    fprintf(stderr, "%s\n", b);
+}
+#define fprintf(...) tl_fprintf(__VA_ARGS__)
 /* option lookups go through src/optcheck.h: opt_unread() warns about command-line --flags no lookup has asked for (2026-11-12: train
    silently ignored a mistyped "--sampler-only 200", the env UFSM_SAMPLER_ONLY being the real switch, and trained on a GPU for an hour).
    train checks once its setup is done (the options read only later in the loop are few); main() checks again when any command returns */
@@ -314,6 +339,7 @@ static int unwrap2_heads_moved(const char *init_from) {
 }
 static double g_reject_warn = 100;
 static double g_outward_warn = 0.9;   /* --outward-warn S: warn when a source's aligned phase-gradient samples rise outward less often than S (0 off) */   /* mgpu: config */
+static int g_ink_dev = -1;   /* mgpu: config (the on-the-fly ink chunks' device, -1 none / the CPU: the planner keeps their budget free on a training card) */
 static size_t g_mil_reserve;   /* mgpu: config (set by the planner before the GPU threads; the planner's MIL share, checked against ink_mil_peak_bytes at each log line) */
 static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static float g_mil_r_um = 0.f, g_mil_R = 10.f, g_mil_step = 1.f, g_mil_tau = 0.f, g_mil_lambda = 1.f;   /* --ink-mil L
    (--ink-head): the normal-pooled MIL ink loss on each window's rays (inkmil.h): per supervised label pixel (mode 1: only those without an open face, the
@@ -466,6 +492,7 @@ static float ww_mil(int dev, int nmil) {   /* the MIL head's weight for a window
     return (float)w;
 }
 static int g_hs_tcache;   /* --hs-tcache 1 (UFSM_HS_TCACHE=0 / 1 overrides: tests): head_slab_pass keeps the slabs' derived targets for the gradient pass */
+static size_t g_tc_reserve;   /* mgpu: config (--hs-tcache: the planner's share, allocated at the first step) */
 static size_t g_val_reserve;   /* --val-P: device bytes the planner keeps free for that copy's inference build */
 static unet *g_val_u;          /* --val-P: that copy */
 
@@ -739,6 +766,20 @@ static int lw_pm(const batch *b) { return g_unwrap && g_pack && g_gpu_aug == 2 &
 static int plane_bank_want(void) { return !getenv("UFSM_PLANE_BANK") || ufsm_env_on("UFSM_PLANE_BANK"); }
 static int tm_slot_skip4(int split) { return !g_pack && (!split || g_lsplit) && (!getenv("UFSM_TM_SKIP4") || ufsm_env_on("UFSM_TM_SKIP4")); }
 static int pm_used(void) { return g_unwrap && (!g_unwrap2 || g_pap_head); }
+/* the task / heads signature (header "heads_sig", 2026-11-20): a resume whose task or heads differ from the checkpoint's is refused, not
+   defaulted (a relaunch that lost its HEADS argv restarted a fibre run as the rv task); --resume-heads-change 1 continues on purpose */
+static void heads_sig(const char *task, char *sig, size_t n) {
+    snprintf(sig, n, "task=%s cout=%d fibdir=%d fibh=%d rv=%d side=%d verso=%d aff=%d pap=%d", task, g_cout, g_fibdir > 0, g_fibh, g_rv, g_side, g_verso, g_aff, g_pap_head);
+}
+static int heads_check(const char *resume, const char *sig, int allow) {   /* 0 continue, 2 refuse; checkpoints without the key: 0 */
+    char *h = checkpoint_header_line(resume); const char *q = h ? strstr(h, "\"heads_sig\":\"") : nullptr; int rc = 0;
+    if (q) { q += 13; const char *e = strchr(q, '"'); const size_t L = e ? (size_t)(e - q) : 0;
+        if (e && (L != strlen(sig) || strncmp(q, sig, L))) {
+            if (!allow) { fprintf(stderr, "resume: the task / heads differ from the checkpoint's:\n  checkpoint: %.*s\n  this run:   %s\n"
+                                          "refusing (a relaunch with the wrong argv?); --resume-heads-change 1 continues on purpose\n", (int)L, q, sig); rc = 2; }
+            else fprintf(stderr, "DEFAULTED: --resume-heads-change 1: the heads change from \"%.*s\" to \"%s\"\n", (int)L, q, sig); } }
+    free(h); return rc;
+}
 /* one label kind of a batch (nn_label_warp's: 0 packed targets / mask, 1 phase, 2 winding mod 4 + component) into da (db): --gpu-aug 2
    batches (batch.ct8) carry source-grid labels for windows with a warped radial record, warped on the device (rad: the records' device
    copy, uploaded first by ct_upload); the rest are copies */
@@ -2780,8 +2821,71 @@ static void csv_extend_header(const char *path, const char *full) {   /* FULL: t
     fclose(f); if (fclose(o) == 0) rename(tmp, path); else remove(tmp);
 }
 
+/* the run-health warnings (2026-11-20, devspeed: T9C's ink head row sat at W rms 4.542e-02 from step 11 to 2991 and nobody saw it for
+   hours). (a) frozen parameters: the parameters at step0 + 10 kept on the host; at step0 + 100, + 300 and every log line after, a group
+   (unet_param_groups: each Muon matrix, each head output row, the AdamW ranges) with |W - W10| / |W10| < 1e-4 (or still all 0) prints
+   "WARNING frozen:", while its learning rate is > 0 and its gradient is not all 0 (a head without labels in the run is quiet by design).
+   (b) dead loss terms: a step-line term exactly 0 for 100+ steps while its "(N% of windows)" shows labelled windows (N > 0) prints
+   "WARNING dead loss:" (ink-only runs on a multi-head net print "phase bce 0.0000 (0% of windows)": quiet). --strict-health 1 exits 4 at the first warning (smoke arms die instead of running
+   for hours). mgpu: main (the step loop's log block) */
+static int g_strict_health;
+static void health_fail(void) { if (g_strict_health) { fprintf(stderr, "--strict-health 1: stopping (exit 4)\n"); fflush(stderr); exit(4); } }
+static void health_params(unet *u, int step, int step0, int logstep, float lr, float mlr) {
+    static float *w10; static size_t (*rg)[2]; static char (*nm)[40]; static int ng, last = -1; static size_t np;   /* mgpu: main */
+    if (step == step0 + 10 && !w10) {
+        np = unet_nparams(u); w10 = malloc(np * 4); rg = malloc(4096 * sizeof *rg); nm = malloc(4096 * sizeof *nm);
+        if (!w10 || !rg || !nm) { free(w10); w10 = nullptr; return; }
+        unet_params_d2h(u, w10); ng = unet_param_groups(u, rg, nm, 4096); return;
+    }
+    if (!w10 || !(step == step0 + 100 || step == step0 + 300 || (logstep && step > step0 + 300)) || !(lr > 0)) return;
+    float *w = malloc(np * 4), *gr = malloc(np * 4); if (!w || !gr) { free(w); free(gr); return; }
+    unet_params_d2h(u, w); nn_d2h(gr, unet_grad_ptr(u), np * 4);   /* (the last update's gradient, still in the buffer) */
+    int nf = 0; char b[1024]; size_t k = 0;
+    for (int i = 0; i < ng; i++) {
+        const int mat = !strncmp(nm[i], "conv", 4); if (mat && !(mlr > 0)) continue;
+        double gs = 0; for (size_t j = rg[i][0]; j < rg[i][0] + rg[i][1]; j++) gs += (double)gr[j] * gr[j];
+        if (gs == 0) continue;   /* (no gradient: a head row without labels in this run, by design; lead 11-20: only labelled groups that stop moving warn) */
+        double s0 = 0, d = 0; for (size_t j = rg[i][0]; j < rg[i][0] + rg[i][1]; j++) { const double a = w10[j], e = (double)w[j] - a; s0 += a * a; d += e * e; }
+        if (s0 > 0 ? sqrt(d / s0) < 1e-4 : d == 0) { if (nf++ < 12 && k < sizeof b) k += (size_t)snprintf(b + k, sizeof b - k, "%s%s (rms %.3e)", nf > 1 ? ", " : "", nm[i], sqrt(s0 / (double)rg[i][1])); }
+    }
+    free(w); free(gr);
+    if (nf && (step == step0 + 100 || step == step0 + 300 || nf != last)) {
+        fprintf(stderr, "WARNING frozen: %d of %d parameter groups unchanged since step %d (|dW| / |W| < 1e-4) at lr %.2e: %s%s\n", nf, ng, step0 + 10, lr, b, nf > 12 ? ", ..." : "");
+        health_fail();
+    }
+    last = nf;
+}
+static void health_terms(int step, const char *s) {   /* s: the step line's terms; a number after 1-2 words (outside parentheses) is a term's value */
+    static struct { char n[40]; int z0, warned; } T[64]; static int nt;   /* mgpu: main */
+    char w1[40] = "", w2[40] = ""; int depth = 0;
+    for (const char *p = s; *p;) {
+        while (*p == ' ') p++; if (!*p) break;
+        const char *e = p; while (*e && *e != ' ') e++; const int L = (int)(e - p);
+        for (const char *q = p; q < e; q++) depth += (*q == '(') - (*q == ')');
+        char t[64]; snprintf(t, sizeof t, "%.*s", L < 63 ? L : 63, p); p = e;
+        if (depth > 0 || strchr(t, ')')) { w1[0] = w2[0] = 0; continue; }
+        char *end; const double v = strtod(t, &end);
+        if (end != t && !*end && *w2) {
+            char nmv[40]; snprintf(nmv, sizeof nmv, "%s%s%s", w1, *w1 ? " " : "", w2);
+            int i = 0; while (i < nt && strcmp(T[i].n, nmv)) i++;
+            if (i == nt && nt < 64) { snprintf(T[nt].n, 40, "%s", nmv); T[nt].z0 = -1; T[nt].warned = 0; nt++; }
+            int lab = 0; { const char *q = p; while (*q == ' ') q++; int pc = 0, nn = 0;   /* its windows: "(N% of windows" with N > 0 (lead 11-20: a head with
+                no labels in the run, "(0% of windows)", or a term without that count is never "dead"; only labelled terms stuck at 0) */
+                if (*q == '(' && sscanf(q, "(%d%%%n", &pc, &nn) == 1 && nn > 0 && !strncmp(q + nn, " of windows", 11)) lab = pc > 0; }
+            if (i < nt) {
+                if (v != 0 || !strchr(t, '.') || !lab) T[i].z0 = -1;
+                else { if (T[i].z0 < 0) T[i].z0 = step;
+                       if (step - T[i].z0 >= 100 && !T[i].warned) { T[i].warned = 1; fprintf(stderr, "WARNING dead loss: \"%s\" has been exactly 0 since step %d (an enabled term with no gradient)\n", nmv, T[i].z0); health_fail(); } }
+            }
+            w1[0] = w2[0] = 0; continue;
+        }
+        if (end == t) { snprintf(w1, sizeof w1, "%s", w2); snprintf(w2, sizeof w2, "%s", t); } else w1[0] = w2[0] = 0;
+    }
+}
 int cmd_train(int argc, char **argv) {
+    g_tl0 = now(); { const char *e = getenv("UFSM_STARTUP_TIMES"); g_tl_on = !(e && !strcmp(e, "0")); }
     if (ufsm_env_on("UFSM_UW_SELFTEST")) return uw_selftest();
+    g_strict_health = opt_atoi("--strict-health", opt(argc, argv, "--strict-health", "0"));   /* 1: exit 4 at a "WARNING frozen:" / "dead loss:" */
     {   /* --ct-gpu-decode D (DESIGN 2026-11-13): the sampler's volcomp CT decode on GPU D (src/nn_gpudec.cu, byte-identical to the CPU decode;
            test_gpudec), i.e. UFSM_GPU_DECODE=1 UFSM_GPU_DECODE_DEV=D, set before the first z3 decode (the sources' draw-index reads) because the
            decoder reads its env once; -1 (default) keeps the CPU decode. Its statistics print at exit. */
@@ -3301,6 +3405,25 @@ int cmd_train(int argc, char **argv) {
                    for (int k = 0; k < ng; k++) { fprintf(stderr, " %d", devs[k]); devs[k] = k; } fprintf(stderr, " (data parallel on shared cards)\n"); }
     }
     for (int k = 0; k < ng; k++) g_w4devs[k] = devs[k]; g_w4n = ng;
+    {   /* every device flag names a visible device (2026-11-20, FR1: --ct-gpu-decode 1 under CUDA_VISIBLE_DEVICES=0 decoded on the CPU and
+           the ink on the full card 0 fell to the CPU: 19 % GPU busy, 23 Mvox/s instead of ~75, and nothing said so but one gpudec line). A
+           flag given explicitly with an index this process cannot see stops here; under UFSM_SAMPLER_ONLY (no GPU on purpose) it is a
+           DEFAULTED line and the CPU path */
+        const int nd = nn_device_count(), so = ufsm_env_on("UFSM_SAMPLER_ONLY");
+        static const char *const fl[] = {"--ct-gpu-decode", "--ink-gpu", "--fibre-gpu", "--onfly-gpu"};
+        for (size_t i = 0; i < sizeof fl / sizeof *fl; i++) {
+            const char *v = opt(argc, argv, fl[i], ""); if (!*v) continue;
+            for (const char *q = v; q && *q; q = strchr(q, ',') ? strchr(q, ',') + 1 : nullptr) {   /* (--onfly-gpu A,B: both) */
+                const int d = atoi(q); if (d < 0 || d < nd) continue;
+                if (so) { UFSM_DEFAULTED("%s %d = the CPU (no such CUDA device: %d visible, UFSM_SAMPLER_ONLY)", fl[i], d, nd); continue; }
+                fprintf(stderr, "train: %s %d: no such CUDA device (%d visible; CUDA_VISIBLE_DEVICES=%s): the work would fall back to the CPU. "
+                        "Device indices count within CUDA_VISIBLE_DEVICES; pass a visible one (or -1 for the CPU on purpose)\n", fl[i], d, nd,
+                        getenv("CUDA_VISIBLE_DEVICES") ? getenv("CUDA_VISIBLE_DEVICES") : "(unset)");
+                return 2;
+            }
+        }
+        for (int k = 0; k < ng && !so; k++) if (devs[k] < 0 || devs[k] >= nd) { fprintf(stderr, "train: --gpus: no CUDA device %d (%d visible)\n", devs[k], nd); return 2; }
+    }
     nn_init(devs[0]);   /* env precision knobs are read here; the storage modes decide the batch formats */
     g_xfmt = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8") ? (nn_get_f16() ? 1 : 2) : 0;
     g_g16 = nn_get_tf32() && nn_get_act_bf16() && nn_get_grad_bf16();
@@ -3599,7 +3722,7 @@ int cmd_train(int argc, char **argv) {
         const char *im = opt(argc, argv, "--ink-cache-mb", "0"); if (atol(im) > 0 && inkfly_cache_budget) inkfly_cache_budget((size_t)atol(im)); }
     { const char *pm = opt(argc, argv, "--onfly-cache-mb", "0"); if (atol(pm) > 0) sources_set_onfly_cache_mb((size_t)atol(pm)); }   /* the onfly phase cells' shared LRU (default 2048) */
     sources_set_strict(opt_atoi("--strict-sources", opt(argc, argv, "--strict-sources", "0")));
-    sources *S = sources_load(src);
+    tl_mark("setup"); sources *S = sources_load(src); tl_mark("sources");
     g_Sdiag = S;
     if (!S) return 1;
     g_S = S;
@@ -3614,6 +3737,8 @@ int cmd_train(int argc, char **argv) {
        scratch sources), one line per owner */
 #define ONFLY_MEM(what) do { size_t fr_, to_; if (!nn_dev_mem(&fr_, &to_) && to_) fprintf(stderr, "memory: %.2f GB free on the device after %s\n", fr_ / 1e9, what); } while (0)
     ONFLY_MEM("start-up");
+    if (ufsm_env_on("UFSM_GPU_DECODE")) { gpudec_enabled(); ONFLY_MEM("the CT decode buffers"); }   /* (--ct-gpu-decode: its device buffers now, before the
+        planner reads the free memory; they were allocated at the first decode, after the plan on a full card (2026-11-20: or not at all)) */
     {   /* sources with an on-the-fly phase (band_onfly.h): the pair rule on --onfly-gpu (default the run's first GPU; -1 the CPU), its
            --onfly-slots tile buffers of --onfly-mb each reserved now, before the memory planner reads the free device memory */
         float rmax = 0; for (int i = 0; i < S->n; i++) if (S->src[i].phase_onfly > rmax) rmax = S->src[i].phase_onfly;
@@ -3637,7 +3762,7 @@ int cmd_train(int argc, char **argv) {
         mesh_codes_gpu_config(opt_atoi("--onfly-gpu", opt(argc, argv, "--onfly-gpu", "0")));   /* the mesh codes stamp ("onfly": {"meshes"}) on the same device (-1 the CPU) */
         int nink = 0; for (int i = 0; i < S->n; i++) for (int c = 0; c < NTG; c++) nink += S->src[i].ink_fly[c] != nullptr;
         if (nink) {   /* "onfly" ink targets (inksplat.h inkfly_open): face + splat of a cold chunk on --onfly-gpu (per sampler thread a stream; -1 the CPU) */
-            const int og = opt_atoi("--ink-gpu", opt(argc, argv, "--ink-gpu", opt(argc, argv, "--onfly-gpu", "0"))); inkfly_gpu_config(og);   /* (--ink-gpu: as --fibre-gpu) */
+            const int og = opt_atoi("--ink-gpu", opt(argc, argv, "--ink-gpu", opt(argc, argv, "--onfly-gpu", "0"))); inkfly_gpu_config(og); g_ink_dev = og;   /* (--ink-gpu: as --fibre-gpu) */
             fprintf(stderr, "train: on-the-fly ink targets (%d) computed on %s %d (cached per 128^3 chunk: memory + %s)\n", nink, og >= 0 ? "GPU" : "CPU", og,
                     dcache_default_dir() ? dcache_default_dir() : "no disk cache"); ONFLY_MEM("the ink targets");
         }
@@ -4148,6 +4273,8 @@ int cmd_train(int argc, char **argv) {
         unet_set_fp16_logits(d->u, (!g_half || g_pkf) && !g_sheet && !ufsm_env_on("UFSM_LOGITS32"));
         if (g_lat_have) unet_set_lat_basis(d->u, g_lat_bas, g_lat_gain, g_lat_c, g_lat_step);
         if (resume) {
+            { char sig[256]; heads_sig(task, sig, sizeof sig);   /* before the load: a shape mismatch there would hide the reason */
+              if (heads_check(resume, sig, opt_atoi("--resume-heads-change", opt(argc, argv, "--resume-heads-change", "0")))) return 2; }
             const int grow = opt_atoi("--grow-head", opt(argc, argv, "--grow-head", "0"));   /* band_affinity warm start from a recto checkpoint */
             if (cfg.emb_lev) unet_init(d->u, seed + 1);   /* (a checkpoint without the side head gets this init inserted for it: unet_load copies
                                                               the block from u->p, which unet_create leaves unset -- zeros froze the 11-12 unissl
@@ -4446,7 +4573,7 @@ int cmd_train(int argc, char **argv) {
             static const int ord_small[] = {5, 4, 3, 2, 1, 0, 8, 7, 6, 9, 10, 11, 12, 13};   /* (16-bit modes: list order, no recompute-1 lean ones) */
             const int l3_off = getenv("UFSM_L0_3BUF") && !ufsm_env_on("UFSM_L0_3BUF");   /* (UFSM_L0_3BUF=0: never the three level-0 buffers) */
             const int fastest = !strcmp(mm, "fast");
-            size_t fmin = (size_t)-1;
+            tl_mark("labels + model"); size_t fmin = (size_t)-1;
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); unet_reserve(G[g].u, use_muon, muon_tc); if (g == 0 && use_muon && opt_stats > 0) unet_opt_stats_reserve(G[g].u); if (g_lat && lp_f8w_mixed_reserve()) fprintf(stderr, "memory: the input conv's chunk copies (96 MB) failed\n");
                                            if (g_fstem && nn_fstem_reserve(g_fstem, g_fs_n)) fprintf(stderr, "memory: the fine stem's partial sums failed\n"); }   /* (5.3 MB at 16 -> 16) */
             /* (the lazily allocated optimizer / attention / kernel workspaces exist now, so the free memory below has them out: 2026-11-14 audit) */
@@ -4471,8 +4598,17 @@ int cmd_train(int argc, char **argv) {
             }
             if (g_hs_tcache && g_unwrap2 && g_side == 2 && B == 1) {   /* --hs-tcache: its bytes stay out of the plan's budget (allocated at the first training step) */
                 const size_t tcr = ((size_t)g_Pz + 128) * P * P * ((size_t)g_side_nc + 1 + (g_rv ? 3 : 0) + 8);   /* (+ 128 planes: the last slab's rounding at any slab depth in use) */
-                fmin = fmin > tcr ? fmin - tcr : 0;
+                fmin = fmin > tcr ? fmin - tcr : 0; g_tc_reserve = tcr;
                 fprintf(stderr, "memory: --hs-tcache keeps %.2f GB free for the head slabs' derived targets (%d B a voxel)\n", tcr / 1e9, g_side_nc + 1 + (g_rv ? 3 : 0) + 8);
+            }
+            if (g_ink_dev >= 0 && inkfly_gpu_budget && inkfly_gpu_set_reserve) {   /* the on-the-fly ink chunks on a training card: their budget stays
+                out of the plan (2026-11-20 FR1: planned to the last GB, every chunk went to the CPU, 25 % of the sampler's CPU), with a small reserve beside */
+                int same = 0; for (int g = 0; g < ng; g++) same |= nn_dev_phys(G[g].dev) == nn_dev_phys(g_ink_dev);
+                if (same) {
+                    const size_t ib = inkfly_gpu_budget(), rs = (size_t)256 << 20; fmin = fmin > ib + rs ? fmin - ib - rs : 0; inkfly_gpu_set_reserve(rs);
+                    fprintf(stderr, "memory: the on-the-fly ink on training GPU %d keeps %.2f GB free (its UFSM_INKFLY_GPU_MB budget %.2f GB + %.2f GB reserve)\n",
+                            g_ink_dev, (ib + rs) / 1e9, ib / 1e9, rs / 1e9);
+                }
             }
             const shape5 xs = g_lat ? (shape5){B, cfg.cin, g_Pz / 4, P / 4, P / 4} : g_half ? (shape5){B, cfg.cin, P / g_hdiv, P / g_hdiv, P / g_hdiv} : (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P};   /* split: this GPU's slab of the window */
             const size_t p3 = p3l;
@@ -4858,6 +4994,13 @@ int cmd_train(int argc, char **argv) {
         size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;
         snprintf(runtime_extra+n-1, sizeof runtime_extra-n+1,
             ",\"target\":{\"version\":1,\"erode_native_voxels\":%d,\"erosion_kernel\":\"face6\",\"soft_sigma\":%.9g,\"soft_unit\":\"%s\",\"loss_tolerance_voxels\":%d}}", sc.erode, sc.soft, sc.soft_um ? "um" : "vox", nn_get_loss_tol());
+    }
+    {   /* the task / heads signature (2026-11-20): a resume whose task or heads differ from the checkpoint's is refused, not defaulted
+           (a relaunch that lost its HEADS argv silently restarted a fibre run as the rv task); --resume-heads-change 1 allows it on purpose */
+        char sig[256]; heads_sig(task, sig, sizeof sig);   /* (the resume check ran before the weights loaded: heads_check) */
+        size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;
+        snprintf(runtime_extra+n-1, sizeof runtime_extra-n+1, ",\"heads_sig\":\"%s\"}", sig);
+        fprintf(stderr, "heads: %s\n", sig);
     }
     if (g_fibdir > 0) {   /* the fibre direction head's channels (predict --channel picks one; the tracer reads the dyad) */
         size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;
@@ -5285,7 +5428,7 @@ int cmd_train(int argc, char **argv) {
         fprintf(stderr, "train: --lat-direct-p %g: %d of %d sources have a \"latvol\" twin; their direct windows take the trunk's input from the stored cells (no step jitter)\n", g_lat_dp, nlv, S->n);
         sc.lat_direct_p = g_lat_dp;
     }
-    sampler *sp = sampler_start(S, &sc); g_vs_sp = sp;
+    tl_mark("plan + workspaces"); sampler *sp = sampler_start(S, &sc); g_vs_sp = sp; tl_mark("sampler start");
     if (!sp) return 1;
     char logp[1400]; snprintf(logp, sizeof logp, "%s/log.csv", out);
     if (step0) csv_extend_header(logp, "step,lr,loss,bce,dice,active,gnorm,val_loss,val_bce,val_dice,samples_per_s,wait_s,gns,gns_g2,gns_s,gate_s");   /* (a resumed run's older log.csv: the header gains the new columns) */
@@ -5301,6 +5444,12 @@ int cmd_train(int argc, char **argv) {
     }
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
     int prof = ufsm_env_on("UFSM_PROF");
+    if (g_ink_dev >= 0 && inkfly_gpu_budget_from_free) {   /* the on-the-fly ink's budget from what the plan left (the first step's lazy
+        buffers kept back: MIL, --val-P, --hs-tcache, when the ink shares a training card), not the fixed 1024 MiB (2026-11-20 FR1) */
+        int same = 0; for (int g = 0; g < ng; g++) same |= nn_dev_phys(G[g].dev) == nn_dev_phys(g_ink_dev);
+        const size_t keep = ((size_t)256 << 20) + (same ? g_mil_reserve + g_val_reserve + g_tc_reserve : 0), b = inkfly_gpu_budget_from_free(keep);
+        if (b) fprintf(stderr, "memory: the on-the-fly ink's GPU budget %.2f GB on GPU %d (its free memory less %.2f GB kept)\n", b / 1e9, g_ink_dev, keep / 1e9);
+    }
     double t0 = now(), tlog = t0, wait = 0, gate = 0, acc_active = 0, acc_loss = 0, acc_bce = 0, acc_dice = 0, acc_g = 0; int nacc = 0;
     if (seconds) fprintf(stderr, "training budget %.1fs, time-based warmup %.1fs\n", seconds, warmup_seconds);
     if (schedule_seconds) fprintf(stderr,"wall-time LR horizon %.1fs, elapsed %.1fs, warmup %.1fs; finite cover/ramp origin preserved\n",schedule_seconds,schedule_elapsed,warmup_seconds);
@@ -5318,6 +5467,7 @@ int cmd_train(int argc, char **argv) {
     double *viks = nullptr; double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
     train_unread_flags(argc, argv);
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
+        if (step == step0 + 2 && g_tl_on) { tl_mark("first step"); tl_summary(); }   /* (the first batch's wait + the first step: the kernels' JIT) */
         {   /* UFSM_CUPROF=A,B: cudaProfilerStart before step A, Stop after step B (nsys --capture-range=cudaProfilerApi: a steady-state window of a P 1024 run) */
             static int pa = -2, pb; if (pa == -2) { const char *e = getenv("UFSM_CUPROF"); pa = -1; if (e && sscanf(e, "%d,%d", &pa, &pb) != 2) pa = -1; }
             extern int cudaProfilerStart(void), cudaProfilerStop(void), cudaDeviceSynchronize(void);
@@ -5737,6 +5887,9 @@ int cmd_train(int argc, char **argv) {
         if (g_restore) { acc_rn += G[0].rst_h[0]; acc_re += G[0].rst_h[3]; acc_rb += G[0].rst_h[4]; }
         if (g_count_lambda > 0) { acc_cnt += G[0].cnt_h[0]; acc_cnr += G[0].cnt_h[2]; for (int b = 0; b < 18; b++) acc_cbin[b] += G[0].cnt_h[3 + b]; }
         }
+        {   const int lg = step % log_every == 0;   /* the frozen-parameter check (health_params) on the step's updated weights */
+            if (step == step0 + 10 || step == step0 + 100 || step == step0 + 300 || (lg && step > step0 + 300)) {
+                nn_init(G[0].dev); health_params(G[0].u, step, step0, lg, lr, use_muon ? muon_lr * (lr0 > 0.f ? lr / lr0 : 0.f) : lr); } }
         if (step % log_every == 0 || step == steps || g_stop) {
             double dt = now() - tlog; const double nok = nacc - nskl > 0 ? nacc - nskl : 1;   /* (the means: over the steps not skipped) */
             double vl = -1, vb = 0, vd = 0, vh[TCMAX] = {0}; int vhn[TCMAX] = {0}; double vw4[6] = {0}, vw4n[3] = {0};   /* unwrap2: wind4 bce, worst-gauge bce, right turns, voxels, phase, normal; vw4n: windows with wind4 / phase / normal labels */
@@ -6034,6 +6187,7 @@ int cmd_train(int argc, char **argv) {
               if (pk > g_mil_reserve && !mw++) fprintf(stderr, "ink mil: WARNING its buffers reached %.2f GB, the memory plan kept %.2f GB\n", pk / 1e9, g_mil_reserve / 1e9); }
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s %.1f Mvox/s (wait %.0f%%%s)%s%s\n", step, lr, acc_loss / nok, acc_bce / nok, acc_dice / nok, affs, acc_g / nok,
                     (double)nacc * B * nl / dt, (double)nacc * B * nl * g_Pz * P * P / 1e6 / dt, 100 * wait / dt, gs, vl >= 0 ? " val " : "", vl >= 0 ? vstr : "");
+            health_terms(step, affs);   /* (dead loss terms: the per-term part; the top-level bce / dice are their aggregate) */
             {   /* the on-the-fly phase since the last log line: reads, tiles (on the GPU), the pair rule's seconds per read (summed over threads) */
                 static phase_onfly_stats o0; phase_onfly_stats o1; phase_onfly_get_stats(&o1);
                 if (o1.reads > o0.reads) fprintf(stderr, "  onfly phase: %llu reads, %llu tiles (%llu GPU-decoded), %.0f ms per read in the pair rule, %.0f ms in CPU codes reads\n",

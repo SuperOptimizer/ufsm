@@ -256,6 +256,10 @@ extern "C" int nn_set_devmap(int n, const int *phys) {
     for (int k = 0; k < n; k++) ufsm_devmap_[k] = phys[k];
     ufsm_ndevmap_ = n; return 0;
 }
+/* the CUDA devices this process sees (with a logical map: at least the logical count; 0 when none or no driver) and a logical device's
+   physical card: train's start-up check of the device flags and the planner's same-card test (2026-11-20) */
+extern "C" int nn_device_count(void) { int n = 0; if (cudaGetDeviceCount(&n) != cudaSuccess) { (void)cudaGetLastError(); return 0; } return n; }
+extern "C" int nn_dev_phys(int d) { return ufsm_dev_phys(d); }
 extern "C" int nn_init(int device) { { static int ser_done = 0;   /* mgpu: env (once per process: the first nn_init of any GPU thread, atomically) */
     if (!__atomic_exchange_n(&ser_done, 1, __ATOMIC_ACQ_REL) && ufsm_env_on("UFSM_SERIALIZE")) { setenv("CUDA_LAUNCH_BLOCKING", "1", 1); fprintf(stderr, "UFSM_SERIALIZE=1: CUDA_LAUNCH_BLOCKING=1, every launch and copy completes in program order (tests/test_serialize.sh)\n"); } }
     if (ufsm_env_on("UFSM_ACTF32")) g_actbf = 0; if (ufsm_env_on("UFSM_GRADF32")) g_gradbf = 0; if (ufsm_env_on("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } if (cudaSetDevice(device) != cudaSuccess) return -1; if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 3) { size_t fr = 0, tot = 0; cudaFree(0); cudaMemGetInfo(&fr, &tot); fprintf(stderr, "nn_init: device used %.1f MB after the context\n", (tot - fr) / 1e6); } return 0; }

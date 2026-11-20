@@ -171,6 +171,7 @@ test_sheetscore                                |              |     3 | ./$B/tes
 test_patchsolve                                |              |     3 | ./$B/test_patchsolve
 test_patchid                                   |              |     3 | ./$B/test_patchid   
 test_gttrans                                   |              |     2 | ./$B/test_gttrans
+test_fieldsderive                              |              |     2 | ./$B/test_fieldsderive
 test_recto                                     |              |     3 | ./$B/test_recto
 test_recto_gpu                                 | gpu          |     3 | ./$B/test_recto_gpu
 test_faces                                     |              |     1 | ./$B/test_faces
@@ -400,6 +401,8 @@ test_codes_grid                                |              |     2 | ./$B/tes
 test_mesh_phase                                | gpu          |     8 | tests/test_mesh_phase.sh ./$B/ufsm ./$B/test_mesh_phase $TMPDIR/meshphase
 test_lldec                                     | gpu,smoke    |     3 | ./$B/test_lldec $TMPDIR/lldec
 test_echo                                      | gpu          |    40 | tests/test_echo.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/echo
+test_train_devcheck                            |              |     2 | tests/test_train_devcheck.sh ./$B/ufsm $TMPDIR/devcheck
+test_health                                    | gpu,slow     |    60 | tests/test_health.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/health
 test_lab_early_split                           | gpu          |    40 | tests/test_lab_early_split.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/labearlysplit
 test_mcc_compile                               |              |    30 | bash tests/mcc_compile.sh
 # the sanitize group (ops audit #9): compute-sanitizer racecheck (shared-memory hazards) / synccheck (barrier misuse) on small GPU tests
@@ -428,3 +431,4 @@ test_split_ab                                  | gpu2,slow    |   150 | tests/te
 test_wbench_gpulock                            |              |     1 | tests/test_wbench_gpulock.sh
 test_wbench_fail                               |              |     2 | tests/test_wbench_fail.sh
 test_occ_cache                                 |              |     1 | ./$B/test_occ_cache $TMPDIR
+test_relaunch_argv                             |              |     2 | tests/test_relaunch_argv.sh $TMPDIR

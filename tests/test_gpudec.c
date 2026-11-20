@@ -160,6 +160,28 @@ static void part3(const char *dir) {
     uint64_t s1; gpudec_stats(&s1, nullptr, nullptr, nullptr);
     char msg[200]; snprintf(msg, sizeof msg, "z3_read_sub (%d chunk reads, full + random submasks) = reference, %llu substreams on the GPU", n, (unsigned long long)(s1 - s0));
     check(msg, ok && s1 > s0);
+    {   /* 3b (2026-11-20): plain z3_read of unaligned boxes across chunk borders with the GPU on = the same boxes decoded on the CPU; the GPU
+           decoder wrote them straight into the window (gpudec_decode_sink: the window sink, no 128^3 chunk + copy) */
+        uint8_t *full = malloc((size_t)256 * 256 * 384); int ok3 = full != nullptr, nb = 0;   /* (the reference: whole-chunk z3_read_sub reads, checked above, no sink) */
+        for (int cz = 0; cz < 2 && ok3; cz++) for (int cy = 0; cy < 2 && ok3; cy++) for (int cx = 0; cx < 3 && ok3; cx++) {
+            const int64_t o[3] = {cz * 128, cy * 128, cx * 128}, nn[3] = {128, 128, 128};
+            if (z3_read_sub(z, o, nn, got, 2, 0xffffffffu)) { ok3 = 0; break; }
+            for (int zz = 0; zz < 128; zz++) for (int yy = 0; yy < 128; yy++) memcpy(full + ((size_t)(cz * 128 + zz) * 256 + cy * 128 + yy) * 384 + cx * 128, got + ((size_t)zz * 128 + yy) * 128, 128);
+        }
+        const uint64_t g0 = z3_gpu_sink_chunks();
+        for (int t = 0; t < 12; t++) {
+            int64_t o[3], nn[3]; const int64_t sh[3] = {256, 256, 384};
+            for (int d = 0; d < 3; d++) { nn[d] = 1 + (int64_t)(lcg(&s) % 200); o[d] = (int64_t)(lcg(&s) % (uint64_t)(sh[d] - nn[d] + 1)); }
+            const size_t nv = (size_t)nn[0] * nn[1] * nn[2]; uint8_t *a = malloc(nv), *b = malloc(nv); memset(a, 7, nv);
+            for (int64_t zz = 0; zz < nn[0] && ok3; zz++) for (int64_t yy = 0; yy < nn[1]; yy++) memcpy(b + ((size_t)zz * nn[1] + yy) * nn[2], full + ((size_t)(o[0] + zz) * 256 + o[1] + yy) * 384 + o[2], (size_t)nn[2]);
+            const int ra = z3_read(z, o, nn, a, 2);
+            if (ra || fm_cmp_u8("z3_read window sink", a, b, nv, 0, 0)) ok3 = 0;
+            free(a); free(b); nb++;
+        }
+        const uint64_t g1 = z3_gpu_sink_chunks();
+        snprintf(msg, sizeof msg, "z3_read (%d unaligned boxes) with the GPU decoder = the CPU decode; %llu chunks decoded straight into the window on the GPU", nb, (unsigned long long)(g1 - g0));
+        check(msg, ok3 && g1 > g0); free(full);
+    }
     z3_close(z); store_close(st); free(got); free(ref);
 }
 

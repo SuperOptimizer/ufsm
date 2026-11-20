@@ -4613,6 +4613,15 @@ int sampler_batch_hash(const sampler *sp, const batch *b, const char **names, ui
     return n;
 }
 batch *sampler_next(sampler *sp) { return sampler_next_gate(sp, nullptr, nullptr); }
+/* a wait for a ready slot (sp->mu held). With a gate the GPU probe runs on each 0.5 ms pass, so the trainer's idle meter (the probe's first
+   "done") covers this wait too: until 2026-11-20 only the --echo-max path probed, and every other run logged "wait 0 %" however long the
+   GPU sat idle for data (FR1: 0 % at 19 % GPU busy) */
+static void wait_ready(sampler *sp, int (*busy)(void *), void *arg) {
+    if (!busy) { pthread_cond_wait(&sp->cv_ready, &sp->mu); return; }
+    pthread_mutex_unlock(&sp->mu); (void)busy(arg); pthread_mutex_lock(&sp->mu);
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 500000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+    pthread_cond_timedwait(&sp->cv_ready, &sp->mu, &ts);
+}
 batch *sampler_next_gate(sampler *sp, int (*busy)(void *), void *arg) {
     pthread_mutex_lock(&sp->mu);
     int k = -1;
@@ -4651,7 +4660,7 @@ batch *sampler_next_gate(sampler *sp, int (*busy)(void *), void *arg) {
                     int nw = -1; for (int j = 0; j < sp->nslots && nw < 0; j++) if (sp->state[j] == READY && !sp->rq[j]) nw = j;
                     if (nw >= 0) { k = nw; break; }
                 }
-                pthread_cond_wait(&sp->cv_ready, &sp->mu); continue;
+                wait_ready(sp, busy, arg); continue;
             }
         }
         if (sp->cfg.cover && (uint64_t)sp->next_take >= sp->cfg.cover->count - sp->cfg.cover_start) { pthread_mutex_unlock(&sp->mu); return nullptr; }
@@ -4662,7 +4671,7 @@ batch *sampler_next_gate(sampler *sp, int (*busy)(void *), void *arg) {
         for (int j = 0; j < sp->nslots; j++) if (sp->state[j] == READY && !(sp->rq && sp->rq[j])) { k = j; break; }
         if (k < 0) {
             if (atomic_load(&sp->stop)) { pthread_mutex_unlock(&sp->mu); return nullptr; }
-            pthread_cond_wait(&sp->cv_ready, &sp->mu);
+            wait_ready(sp, busy, arg);
         }
     }
     sp->slots[k].use = sp->rleft ? (sp->cfg.echo_max > 0 ? sp->cfg.echo_max : sp->cfg.replay - 1) - sp->rleft[k] : 0;

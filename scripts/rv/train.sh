@@ -30,9 +30,13 @@ ARGS=($SRCJ --out $o --gpus $GPUS --P $P --B 1 $ARCH $HEADS --steps $STEPS --sch
   --fp4 2 --gpu-aug 2 --input-prec 8 --mem ${MEMMODE:-auto} --val-store disk --workers ${WORKERS:-12} --sampler-slots ${SLOTS:-16} \
   --log-every ${LOGE:-50} --val-every ${VAL:-2000} --val-batches ${VALB:-16} --ckpt-every ${CKPT:-1000} --seed ${SEED:-3} --val-seed 1 --strict-sources ${STRICT:-1} \
   --warmup ${WARM:-2000} --muon-lr ${MLR:-0.02} --lr ${ALR:-0.001} $AUG ${EXTRA:-})
+# the trainer's argv, stored at a fresh launch and replayed verbatim by <run>.relaunch (REPLAY=1): a relaunch that rebuilt it from a
+# subset of the env silently restarted a fibre run as the default task (2026-11-20; train now also refuses a resume whose heads differ)
+if [ "${REPLAY:-0}" = 1 ] && [ -s $o.argv ]; then mapfile -d '' -t ARGS < $o.argv; echo "$(date) replaying $o.argv" >> $o.resume.log
+else printf '%s\0' "${ARGS[@]}" > $o.argv.tmp && mv $o.argv.tmp $o.argv; fi
 echo $$ > $o.launcher.pid
-printf 'cd %q && R=%q U=%q SRCJ=%q GPU=%q LOCK=%q P=%q ARCH=%q WORKERS=%q SLOTS=%q MEMMODE=%q ALR=%q MLR=%q WIND4L=%q ISO=%q EXTRA=%q SNAP=%q nohup bash %q %q %q >> %q 2>&1 &\n' \
-  "$PWD" "$R" "$U" "$SRCJ" "$GPU" "$LOCK" "$P" "$ARCH" "${WORKERS:-12}" "${SLOTS:-16}" "${MEMMODE:-auto}" "${ALR:-0.001}" "${MLR:-0.02}" "${WIND4L:-0.25}" "${ISO:-64}" "${EXTRA:-}" "${SNAP:-5000}" \
+printf 'cd %q && REPLAY=1 R=%q U=%q SRCJ=%q GPU=%q LOCK=%q SNAP=%q MINMEM=%q RELAUNCH=%q MAXFAIL=%q nohup bash %q %q %q >> %q 2>&1 &\n' \
+  "$PWD" "$R" "$U" "$SRCJ" "$GPU" "$LOCK" "${SNAP:-5000}" "${MINMEM:-40}" "${RELAUNCH:-20}" "${MAXFAIL:-3}" \
   "$(readlink -f $0)" "$NAME" "$STEPS" "$o.nohup" > $o.relaunch   # (scripts/rv/evwatch.sh: pause for an eval, then bash <run>.relaunch)
 # snapshots: every SNAP steps last.ckpt is copied to <run>/snap/<step>.ckpt (the eval checkpoints); the copy's own header names its step
 mkdir -p $o/snap

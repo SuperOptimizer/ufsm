@@ -21,6 +21,7 @@
 #include <string.h>
 #include <time.h>
 #include "gpudec.h"
+#include "defaulted.h"
 
 enum { NSUB = 32, BLKV = 4096, TABW = 10 * 1024, NRADII = 46, TAB_BYTES = (TABW * 4 + NRADII * 4 + 15) & ~15, SUB_BYTES = 65536 };
 
@@ -266,7 +267,13 @@ fail:
 }
 
 /* fail every request not done yet (under G.mu, after a device error) */
+static void gd_note_broken(void) {   /* the first device failure: one DEFAULTED line now (was: only the exit summary; 2026-11-20) */
+    static int said;   /* mgpu: process (once per process, atomic exchange) */
+    if (__atomic_exchange_n(&said, 1, __ATOMIC_ACQ_REL)) return;
+    UFSM_DEFAULTED("gpudec = the CPU decode from here (the GPU decoder on device %d failed after %llu substreams)", G.dev, (unsigned long long)G.n_subs);
+}
 static void fail_all(void) {
+    if (G.broken) gd_note_broken();
     for (int k = 0; k < NSLOT; k++) {
         gd_slot *S = &G.slot[k];
         if (S->state == S_OPEN || S->state == S_GPU) for (int r = 0; r < S->nreq; r++) if (!S->req[r]->state) S->req[r]->state = 3;
@@ -341,6 +348,10 @@ static void gd_stats_atexit(void) {
             (unsigned long long)G.n_subs, (unsigned long long)G.n_batches, G.n_batches ? (double)G.n_subs / G.n_batches : 0.0, (unsigned long long)G.n_redo, G.gpu_s);
     if (G.n_busy) fprintf(stderr, "gpudec: %llu round trips over %.0f ms (GPU busy): %llu requests decoded on the CPU meanwhile\n", (unsigned long long)G.n_busy, G.max_s * 1e3, (unsigned long long)G.n_cpu_busy);
 }
+static size_t gd_dev_bytes(void) {   /* the device buffers gd_init allocates (NSLOT slots) */
+    return (size_t)BLKV * 4 + (size_t)NSLOT * (G.in_cap + (size_t)G.max_items * SUB_BYTES + G.max_items * sizeof(gd_item) + MAXREQ * sizeof(gd_group)
+                                               + G.rec_cap * 4 + (size_t)G.max_items * META * 4 + G.max_items * 4);
+}
 static void gd_init(void) {
     const char *e = getenv("UFSM_GPU_DECODE");
     if (!e || !*e || !strcmp(e, "0")) return;
@@ -357,9 +368,9 @@ static void gd_init(void) {
     G.in_cap = (size_t)G.max_items * 40000 + ((size_t)16 << 20);   /* q 2 substreams are ~10-20 KB */
     G.rec_cap = (size_t)G.max_items * 49152 + ((size_t)16 << 20);   /* records (u32); a substream reserves its bound, 8 x its bypass bytes (q 2: ~5 KB) */
     if (G.in_cap > UINT32_MAX || G.rec_cap > UINT32_MAX) {   /* tok_off / rec_off are uint32 (audit mini/volcomp 7): ~87000 items at most */
-        fprintf(stderr, "gpudec: UFSM_GPU_DECODE_ITEMS %u needs offsets over 32 bits, decoding on the CPU\n", G.max_items); return; }
+        UFSM_DEFAULTED("gpudec = the CPU decode (UFSM_GPU_DECODE_ITEMS %u needs offsets over 32 bits)", G.max_items); return; }
     int nd = 0;
-    if (cudaGetDeviceCount(&nd) != cudaSuccess || G.dev < 0 || G.dev >= nd) { cudaGetLastError(); fprintf(stderr, "gpudec: no CUDA device %d, decoding on the CPU\n", G.dev); return; }
+    if (cudaGetDeviceCount(&nd) != cudaSuccess || G.dev < 0 || G.dev >= nd) { cudaGetLastError(); UFSM_DEFAULTED("gpudec = the CPU decode (no CUDA device %d: %d visible)", G.dev, nd); return; }
     int prev = 0; cudaGetDevice(&prev);
     GD_CK(cudaSetDevice(G.dev));
     GD_CK(cudaMalloc(&G.d_pos, BLKV * 4));
@@ -384,11 +395,13 @@ static void gd_init(void) {
     cudaSetDevice(prev);
     G.open = take_free();
     G.ok = 1;
+    fprintf(stderr, "gpudec: %.2f GB of device buffers on GPU %d (%d slots of %u items)\n", gd_dev_bytes() / 1e9, G.dev, NSLOT, G.max_items);
     atexit(gd_broken_atexit);
     if (getenv("UFSM_GPU_DECODE_STATS") && strcmp(getenv("UFSM_GPU_DECODE_STATS"), "0")) atexit(gd_stats_atexit);
     return;
 fail:
     cudaGetLastError(); cudaSetDevice(prev);
+    UFSM_DEFAULTED("gpudec = the CPU decode (its %.2f GB of buffers on GPU %d did not allocate)", gd_dev_bytes() / 1e9, G.dev);
 }
 
 /* the scan-position table goes to the device with the first request (volcomp.h's VF_SCAN16 lives on the C side) */
@@ -421,7 +434,7 @@ extern "C" void gpudec_stats(uint64_t *subs, uint64_t *batches, uint64_t *redo, 
     pthread_mutex_unlock(&G.mu);
 }
 
-static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *ddst) {
+static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *ddst, const gd_sink *sk) {
     if (!mask) return 0;
     if (!gpudec_enabled()) return -1;
     if ((double)__atomic_load_n(&G.busy_us, __ATOMIC_RELAXED) > now_s() * 1e6) { __atomic_fetch_add(&G.n_cpu_busy, 1, __ATOMIC_RELAXED); return -1; }   /* after a starved round trip */
@@ -438,9 +451,9 @@ static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *dd
     const uint32_t kout = ddst ? 0 : k;
     pthread_mutex_lock(&G.mu);
     if (!G.have_scan) {
-        if (pos_upload(c->scan)) { G.broken = 1; pthread_cond_broadcast(&G.cv); pthread_mutex_unlock(&G.mu); return -1; }
+        if (pos_upload(c->scan)) { G.broken = 1; gd_note_broken(); pthread_cond_broadcast(&G.cv); pthread_mutex_unlock(&G.mu); return -1; }
         G.have_scan = 1;
-        if (pthread_create(&G.th, nullptr, service, nullptr) || pthread_create(&G.th2, nullptr, completer, nullptr)) { G.broken = 1; pthread_mutex_unlock(&G.mu); return -1; }
+        if (pthread_create(&G.th, nullptr, service, nullptr) || pthread_create(&G.th2, nullptr, completer, nullptr)) { G.broken = 1; gd_note_broken(); pthread_mutex_unlock(&G.mu); return -1; }
         pthread_detach(G.th); pthread_detach(G.th2);
     }
     gd_slot *S = nullptr;
@@ -482,20 +495,30 @@ static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *dd
     if (q.state != 1) return q.state == 2 ? 1 : -1;
     if (ddst) return 0;
     u = 0;
-    for (uint32_t s = 0; s < NSUB; s++) if (mask >> s & 1u) {   /* compact substream -> its 16 z planes of 32 x 128 in the chunk */
+    for (uint32_t s = 0; s < NSUB; s++) if (mask >> s & 1u) {   /* compact substream -> its 16 z planes of 32 x 128 in the chunk (a sink: the box's part
+                                                                     of them in the window) */
         const uint8_t *src = S->h_out + (size_t)(q.out0 + u++) * SUB_BYTES;
-        for (uint32_t z = 0; z < 16; z++) memcpy(dst + ((size_t)(16u * (s >> 2) + z) * 128u + 32u * (s & 3u)) * 128u, src + (size_t)z * 4096u, 4096);
+        if (sk) {
+            const int z0 = 16 * (int)(s >> 2), y0 = 32 * (int)(s & 3u), za = sk->b0[0] > z0 ? sk->b0[0] : z0, zb = sk->b1[0] < z0 + 16 ? sk->b1[0] : z0 + 16,
+                      ya = sk->b0[1] > y0 ? sk->b0[1] : y0, yb = sk->b1[1] < y0 + 32 ? sk->b1[1] : y0 + 32; const size_t w = (size_t)(sk->b1[2] - sk->b0[2]);
+            for (int z = za; z < zb; z++) for (int y = ya; y < yb; y++)
+                memcpy(sk->out + sk->off + (ptrdiff_t)((size_t)z * sk->zs + (size_t)y * sk->ys) + sk->b0[2], src + ((size_t)(z - z0) * 32u + (size_t)(y - y0)) * 128u + sk->b0[2], w);
+        } else for (uint32_t z = 0; z < 16; z++) memcpy(dst + ((size_t)(16u * (s >> 2) + z) * 128u + 32u * (s & 3u)) * 128u, src + (size_t)z * 4096u, 4096);
     }
     pthread_mutex_lock(&G.mu);
     if (--S->readers == 0) { S->state = S_FREE; if (G.open < 0) G.open = take_free(); pthread_cond_broadcast(&G.cv); }
     pthread_mutex_unlock(&G.mu);
     return 0;
 }
-extern "C" int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) { return gd_decode(c, mask, dst, nullptr); }
+extern "C" int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) { return gd_decode(c, mask, dst, nullptr, nullptr); }
+extern "C" int gpudec_decode_sink(const gd_chunk *c, uint32_t mask, const gd_sink *k) {
+    if (!k || k->b1[2] <= k->b0[2]) return -1;
+    return gd_decode(c, mask, nullptr, nullptr, k);
+}
 extern "C" int gpudec_decode_dev(const gd_chunk *c, uint32_t mask, uint8_t *dchunk) {
     if (!dchunk || !gpudec_enabled()) return -1;
     cudaPointerAttributes a;   /* device memory of the decoder's device only */
     if (cudaPointerGetAttributes(&a, dchunk) != cudaSuccess) { cudaGetLastError(); return -1; }
     if (a.type != cudaMemoryTypeDevice || a.device != ufsm_dev_phys(G.dev)) return -1;   /* (attributes name the physical device) */
-    return gd_decode(c, mask, nullptr, dchunk);
+    return gd_decode(c, mask, nullptr, dchunk, nullptr);
 }

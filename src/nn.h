@@ -15,6 +15,8 @@ extern "C" {
 /* logical devices (src/ufsm_dev.cuh): device ids given to nn_* after this are logical, logical k running on physical phys[k]
    (train --gpus 0,0: two data-parallel ranks on one card). Call once, before any GPU thread starts; n = 0 clears. */
 int nn_set_devmap(int n, const int *phys);
+int nn_device_count(void);   /* the visible CUDA devices (0: none); with a map at least its logical count */
+int nn_dev_phys(int d);      /* logical device d's physical card (the identity without a map) */
 
 typedef struct { int n, c, d, h, w; } shape5;
 

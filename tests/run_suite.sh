@@ -21,6 +21,14 @@
 #     -I        incomplete is fine: exit 0 instead of 3 when GPU tests were not run (the edit loop; never a merge gate)
 #     -P        profile: strace marks the tests that open /dev/nvidia* (gpu column "+nv"), nvidia-smi samples their GPU memory
 #     -l        list the selected tests and exit
+#     -X REGEX  leave out the tests whose name matches (e.g. '~(racecheck|memcheck)' on a shared card)
+#     -K TAGS   only the tests carrying one of TAGS (an ERE over tag names, e.g. 'gpu|gpu2': the GPU half alone, for a GPU slot)
+#     -J N      JIT warm-up first: the kernels the selected GPU tests loaded when they last passed (per-test lists in $SUITE_KLOG_DIR,
+#               default ~/.cache/ufsm-suite/klog, recorded by every GPU test through mcudahw's MCUDA_KLOG) are compiled N at a time by
+#               one process (MCUDA_PRECOMPILE=N, MCUDA_PRECOMPILE_ONLY=@list) before any GPU test starts; CPU tests run meanwhile.
+#               After a pin move or a kernel edit the tests otherwise JIT inside their timeouts, each kernel once per process that
+#               launches it (test_flatten_gpu: 427 s cold vs 22 s warm). Needs an mcudahw with KLOG (microc jitorder-20261120 151dc28+;
+#               an older one ignores both variables). A test without a list JITs lazily as before.
 # Manifest lines: NAME | TAGS | EST_SECONDS | COMMAND   (bash, run from the repo root, $B = the build dir; # comments)
 #   tags: gpu (takes a GPU lock, CUDA_VISIBLE_DEVICES = that GPU), gpu2 (both GPUs when there are two), slow (test-slow tier),
 #   flaky (a failure is retried once and reported FLAKY when the retry passes), solo (runs with nothing else in this suite).
@@ -42,8 +50,9 @@ set -u
 H=$(cd "$(dirname "$0")/.." && pwd); cd "$H" || exit 2
 MANIFEST=${SUITE_MANIFEST:-$H/tests/suite.txt}
 TIER=fast; CHANGED=; J=${SUITE_J:-}; T=${SUITE_THREADS:-}; BDIR=build-verify; OUT=; GPUS=; GSLOTS=${SUITE_GPU_SLOTS:-}; TO=1800; PROF=0; LIST=0
-LWAIT=${SUITE_LOCK_WAIT:-300}; NOFOREIGN=0; INCOK=0
-while getopts "t:c:j:T:B:o:g:G:x:W:FIPlh" o; do case $o in
+LWAIT=${SUITE_LOCK_WAIT:-300}; NOFOREIGN=0; INCOK=0; WARM=0; KLOGD=${SUITE_KLOG_DIR:-$HOME/.cache/ufsm-suite/klog}; EXCL=; ONLYTAG=
+while getopts "t:c:j:T:B:o:g:G:x:W:J:X:K:FIPlh" o; do case $o in
+  J) WARM=$OPTARG;; X) EXCL=$OPTARG;; K) ONLYTAG=$OPTARG;;
   t) TIER=$OPTARG;; c) CHANGED=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; B) BDIR=$OPTARG;; o) OUT=$OPTARG;; g) GPUS=$OPTARG;; G) GSLOTS=$OPTARG;;
   x) TO=$OPTARG;; W) LWAIT=$OPTARG;; F) NOFOREIGN=1;; I) INCOK=1;; P) PROF=1;; l) LIST=1;; *) sed -n '2,40p' "$0"; exit 2;; esac; done
 shift $((OPTIND - 1)); FILTERS=("$@")
@@ -88,23 +97,43 @@ NAMES=(); declare -A TAGS EST CMD
 while IFS= read -r line; do
   line=${line%%$'\r'}; [[ -z "${line// }" || $line == \#* ]] && continue
   IFS='|' read -r n tg es cm <<< "$line"
-  n=$(echo $n); tg=$(echo $tg | tr -d ' '); es=$(echo $es); cm=$(echo "$cm" | sed 's/^ *//')
+  # (trimmed in bash: the $(echo) / tr / sed subshells, 4 per line, took 7.5 s wall / 5.7 CPU-s per runner start on the loaded desk)
+  n=${n//[[:space:]]/}; tg=${tg//[[:space:]]/}; es=${es//[[:space:]]/}; cm=${cm#"${cm%%[![:space:]]*}"}
   [ -z "$n" ] || [ -z "$cm" ] && { echo "run_suite: bad manifest line: $line" >&2; exit 2; }
   case ",$tg," in *,slow,*) s=1;; *) s=0;; esac
   [ $TIER = fast ] && [ $s = 1 ] && continue
   [ $TIER = slow ] && [ $s = 0 ] && continue
   [ $TIER = smoke ] && { case ",$tg," in *,smoke,*) ;; *) continue;; esac; }
   if [ ${#FILTERS[@]} -gt 0 ]; then m=0; for f in "${FILTERS[@]}"; do [[ $n =~ $f ]] && m=1; done; [ $m = 0 ] && continue; fi
+  [ -n "$EXCL" ] && [[ $n =~ $EXCL ]] && continue
+  [ -n "$ONLYTAG" ] && ! [[ ",$tg," =~ ,($ONLYTAG), ]] && continue
   [ -n "${TAGS[$n]+x}" ] && { echo "run_suite: duplicate test name $n" >&2; exit 2; }
   NAMES+=("$n"); TAGS[$n]=$tg; EST[$n]=${es:-10}; CMD[$n]=$cm
 done < "$MANIFEST"
 hastag() { case ",${TAGS[$1]}," in *,$2,*) return 0;; esac; return 1; }
 
 # -c REF: only the tests a change since REF (commits, the working tree and untracked files) can affect. A test depends on the files
-# its command and scripts name, and on the sources of the binaries it runs: the C sources and headers in their DWARF line tables
-# (build-system agnostic, cached per binary in $BDIR/.srcdeps), every CUDA source / header (nvcc objects carry no line tables) when
-# the binary links the GPU ops (nn_init). A build-system or runner change selects everything. For the edit loop; the merge gate stays -t fast.
-srcdeps() {   # a binary's dependency basenames (one per line), "@cuda" when it links nn.o
+# its command and scripts name, and on the repo files its binaries are made of. With a ninja build dir (every preset), that is the map
+# tests/srcdeps.awk builds ($BDIR/.srcdeps.map, rebuilt when a binary is newer): the sources and headers (ninja's depfiles) of the
+# objects a binary's own objects reach through symbol references, so a one-line .cu edit selects the tests whose binaries call into
+# that unit, not every binary that links the GPU ops (2026-11-20: nn_opt.cu 266 -> 69 binaries' tests; nn_gpudec 162 -> 5). Without
+# build.ninja, the old rule: DWARF line-table basenames, and every CUDA file for a binary with nn_init. A build-system or runner change
+# selects everything. For the edit loop; the merge gate stays -t fast.
+depmap() {   # (re)build $BDIR/.srcdeps.map; returns 1 when the build dir has no build.ninja / tools
+  local m=${SUITE_SRCDEPS:-$BDIR/.srcdeps}.map
+  [ -f "$BDIR/build.ninja" ] && command -v ninja > /dev/null && command -v nm > /dev/null || return 1
+  [ -f "$m" ] && [ -z "$(find "$BDIR" -maxdepth 1 -type f -perm -u+x -newer "$m" -print -quit 2> /dev/null)" ] && [ "$m" -nt "$BDIR/build.ninja" ] && [ "$m" -nt "$H/tests/srcdeps.awk" ] && [ "$m" -nt "$H/tests/run_suite.sh" ] && return 0
+  ( cd "$BDIR" || exit 1
+    awk '/^build [^ :]+: C_EXECUTABLE_LINKER/ { b = $2; sub(/:$/, "", b); for (i = 4; i <= NF && $i !~ /^\|/; i++) if ($i ~ /\.o$/) print "L", b, $i }' build.ninja > .srcdeps.links.$$
+    awk '{print $3}' .srcdeps.links.$$ | sort -u > .srcdeps.objs.$$
+    { cat .srcdeps.links.$$
+      xargs -a .srcdeps.objs.$$ nm -A 2> /dev/null | awk '{o = $1; sub(/:.*/, "", o); if (NF != 3) next; if ($2 ~ /^[TDBRVWCGSIu]$/) print "D", o, $3; else if ($2 ~ /^[Uwv]$/) print "U", o, $3}'   # (w / v: weak references, render.c -> nn_render's rgpu_*)
+      xargs -a .srcdeps.objs.$$ readelf -SW 2> /dev/null | awk '/^File: / {o = $2} /\.init_array|\.ctors/ && o != "" {print "R", o; o = ""}'
+      ninja -t deps 2> /dev/null | awk '/^[^ ].*: #deps/ {o = $1; sub(/:$/, "", o); next} NF {print "H", o, $1}'
+    } | awk -v R="$H/" -f "$H/tests/srcdeps.awk" > .srcdeps.map.$$; rc=$?
+    rm -f .srcdeps.links.$$ .srcdeps.objs.$$; exit $rc ) && mv "$BDIR/.srcdeps.map.$$" "$m" || { rm -f "$BDIR/.srcdeps.map.$$"; return 1; }
+}
+srcdeps() {   # a binary's dependency basenames (one per line), "@cuda" when it links nn.o (the fallback without build.ninja)
   local b=$1 c; c=${SUITE_SRCDEPS:-$BDIR/.srcdeps}/${b##*/}; [ -x "$b" ] || return 0
   if [ ! -f "$c" ] || [ "$c" -ot "$b" ]; then
     mkdir -p "${c%/*}"
@@ -115,24 +144,30 @@ srcdeps() {   # a binary's dependency basenames (one per line), "@cuda" when it 
 }
 if [ -n "$CHANGED" ]; then
   mapfile -t CF < <({ git diff --name-only "$CHANGED" -- 2> /dev/null; git ls-files --others --exclude-standard 2> /dev/null; } | sort -u)
-  ALLC=0; for f in "${CF[@]}"; do case $f in Makefile|CMakeLists.txt|CMakePresets.json|*.cmake|cmake/*|tests/run_suite.sh) ALLC=1;; esac; done
+  ALLC=0; for f in "${CF[@]}"; do case $f in Makefile|CMakeLists.txt|CMakePresets.json|*.cmake|cmake/*|tests/run_suite.sh|tests/srcdeps.awk) ALLC=1;; esac; done
   if [ $ALLC = 0 ]; then
-    KEEP=(); declare -A MLINE   # manifest lines added or changed since REF: those tests run
-    while IFS='|' read -r n _; do n=$(echo ${n#+}); [ -n "$n" ] && MLINE[$n]=1; done < <(git diff "$CHANGED" -- "$MANIFEST" 2> /dev/null | grep -E '^\+[^+#]')
+    KEEP=(); declare -A MLINE HITB   # manifest lines added or changed since REF: those tests run; HITB: binaries made of a changed file
+    while IFS='|' read -r n _; do n=${n#+}; n=${n//[[:space:]]/}; [ -n "$n" ] && MLINE[$n]=1; done < <(git diff "$CHANGED" -- "$MANIFEST" 2> /dev/null | grep -E '^\+[^+#]')
+    MAP=0; if depmap; then MAP=1
+      while read -r b _; do HITB[$b]=1; done < <(printf '%s\n' "${CF[@]}" | awk 'NR == FNR {c[$1] = 1; next} $2 in c' - "${SUITE_SRCDEPS:-$BDIR/.srcdeps}.map")
+    fi
     for n in "${NAMES[@]}"; do
       cm=${CMD[$n]}; bins=(); scripts=(); hit=0; [ -n "${MLINE[$n]+x}" ] && { KEEP+=("$n"); continue; }
       for w in $cm; do w=${w#./}; case $w in \$B/*) bins+=("$BDIR/${w#\$B/}");; build*/*) bins+=("$w");; tests/*) scripts+=("$w");; esac; done
       for s in "${scripts[@]}"; do [ -f "$s" ] && for w in $(grep -oE 'build[a-z0-9-]*/[A-Za-z0-9_]+' "$s" | sort -u); do bins+=("$BDIR/${w#*/}"); done; done
-      deps=" $(for b in "${bins[@]}"; do srcdeps "$b"; done | sort -u | tr '\n' ' ')"
-      for f in "${CF[@]}"; do
+      if [ $MAP = 1 ]; then   # (a binary of another build dir, e.g. build/ufsm for a verify suite, by its namesake in $BDIR)
+        for b in "${bins[@]}"; do [ -n "${HITB[${b##*/}]+x}" ] && { hit=1; break; }; done
+      else deps=" $(for b in "${bins[@]}"; do srcdeps "$b"; done | sort -u | tr '\n' ' ')"; fi
+      [ $hit = 0 ] && for f in "${CF[@]}"; do
         [[ " $cm " == *"$f"* ]] && { hit=1; break; }
         for s in "${scripts[@]}"; do [ "$s" = "$f" ] && hit=1; done; [ $hit = 1 ] && break
+        [ $MAP = 1 ] && continue
         case $f in src/*.cu|src/*.cuh) [[ $deps == *" @cuda "* ]] && { hit=1; break; };; esac
         case $f in *.c|*.h|*.cu|*.cuh|*.inc) [[ $deps == *" ${f##*/} "* ]] && { hit=1; break; };; esac
       done
       [ $hit = 1 ] && KEEP+=("$n")
     done
-    echo "run_suite: -c $CHANGED: ${#CF[@]} changed files select ${#KEEP[@]} of ${#NAMES[@]} tests"
+    echo "run_suite: -c $CHANGED: ${#CF[@]} changed files select ${#KEEP[@]} of ${#NAMES[@]} tests ($([ $MAP = 1 ] && echo "symbol-reach map" || echo "line tables"))"
     NAMES=("${KEEP[@]}")
   else echo "run_suite: -c $CHANGED: a build or runner file changed, every test selected"; fi
 fi
@@ -154,9 +189,21 @@ OUT=$(cd "$OUT" && pwd)
 # a card another run in this OUT gave up on (busy.<i>) is not this run's: a reused -o OUT kept the marker and every GPU test of the rerun
 # reported BUSY at once, -W notwithstanding (merge3 11-15: 201 BUSY after 1 s); the results of the earlier run are overwritten anyway
 rm -f -- "$OUT"/busy.*
+# -J N: one warm-up process ahead of the GPU tests (they wait for it; CPU tests do not), over the union of their recorded kernel lists
+WARMING=0
+if [ "$WARM" -gt 0 ] && [ $NG -gt 0 ] && [ -x "$BDIR/ufsm" ]; then
+  wl=(); for n in "${NAMES[@]}"; do isgpu "$n" && [ -s "$KLOGD/$n" ] && wl+=("$KLOGD/$n"); done
+  if [ ${#wl[@]} -gt 0 ]; then
+    sort -u "${wl[@]}" > "$OUT/warm.list"
+    n=_jitwarm; TAGS[$n]=gpu; EST[$n]=3600; CMD[$n]="MCUDA_PRECOMPILE=$WARM MCUDA_PRECOMPILE_ONLY=@$OUT/warm.list $(cd "$BDIR" && pwd)/ufsm sysinfo"
+    NAMES=("$n" "${NAMES[@]}"); QUEUE=("$n" "${QUEUE[@]}"); WARMING=1
+    echo "run_suite: -J $WARM: warming $(wc -l < "$OUT/warm.list") kernels of ${#wl[@]} GPU tests first"
+  fi
+fi
 TIMEBIN=; [ -x /usr/bin/time ] && TIMEBIN=/usr/bin/time
 # a test binary in the build dir that no manifest line runs (a merge that added a test to tests/targets.cmake only): say so
-for f in "$BDIR"/test_*; do [ -x "$f" ] || continue; grep -qwF "${f##*/}" "$MANIFEST" || echo "run_suite: WARNING: $f is not in $MANIFEST (add a line, or it never runs)"; done
+declare -A MWORD; while read -r w; do MWORD[$w]=1; done < <(grep -oE '[A-Za-z0-9_]+' "$MANIFEST" | sort -u)   # (one grep, not one per binary)
+for f in "$BDIR"/test_*; do [ -x "$f" ] || continue; [ -n "${MWORD[${f##*/}]+x}" ] || echo "run_suite: WARNING: $f is not in $MANIFEST (add a line, or it never runs)"; done
 echo "run_suite: ${#QUEUE[@]} tests ($TIER) from $BDIR, -j $J, $T threads/test, GPUs ${GPUS} x $GSLOTS, logs $OUT/logs ($(hostname), $NC CPUs)"
 
 # profile: nvidia-smi samples every 0.5 s, each GPU process mapped to its test through /proc/<pid>/environ (UFSM_SUITE_TEST)
@@ -175,11 +222,17 @@ fi
 # environment; nvidia-smi sampled at most every 10 s into $OUT/gpuusers); prints "pid command" or nothing when the card is free of both
 UUIDS=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2> /dev/null | tr -d ' ')
 holder() {
-  local i=$1 lf=$LOCKD/gpu$1.excl p u m f c t
+  local i=$1 lf=$LOCKD/gpu$1.excl p
   if command -v lslocks > /dev/null; then
     p=$(lslocks -n -o PID,MODE,PATH 2> /dev/null | awk -v f="$lf" '$3 == f && $2 == "WRITE" {print $1; exit}')
     [ -n "$p" ] && { echo "$p $(tr '\0' ' ' < /proc/$p/cmdline 2> /dev/null | cut -c1-120) (exclusive lock $lf)"; return; }
   fi
+  foreign "$i"
+}
+# a foreign compute process on card $1 (the half of holder() the poll loop needs once it holds gpu<i>.excl shared: no exclusive holder
+# can exist then, so no lslocks; that ran every 0.2-0.6 s per waiting test and cost ~1 core while a -W 3600 suite waited, 2026-11-20)
+foreign() {
+  local i=$1 p u m f c t
   [ $NOFOREIGN = 1 ] && return
   f=$OUT/gpuusers; t=$f.$BASHPID
   if [ ! -f "$f" ] || [ $(( $(date +%s) - $(stat -c %Y "$f" 2> /dev/null || echo 0) )) -ge 10 ]; then
@@ -208,8 +261,9 @@ run_one() {
       for i in "${GL[@]}"; do
         [[ " ${got[*]} " == *" $i "* ]] && continue
         exec {fx}> "$LOCKD/gpu$i.excl" || continue
-        if ! flock -s -n $fx || { h=$(holder "$i"); [ -n "$h" ]; }; then   # held exclusively (a trainer) or a foreign process on it
-          exec {fx}>&-; busy=$((busy + 1)); h=${h:-$(holder "$i")}
+        h=
+        if ! flock -s -n $fx || { h=$(foreign "$i"); [ -n "$h" ]; }; then   # held exclusively (a trainer) or a foreign process on it
+          exec {fx}>&-; busy=$((busy + 1)); [ -z "$said" ] && h=${h:-$(holder "$i")}
           [ -z "$said" ] && { echo "run_suite: $n waits for GPU $i: held by ${h:-? (exclusive lock)}"; said=1; }
           continue
         fi
@@ -242,7 +296,9 @@ run_one() {
             echo "BUSY 0 0 0 0 0 - 0" > "$OUT/res/$n"; return
           fi
         fi
-        sleep 0.$((RANDOM % 5 + 2))
+        # poll back-off: 0.2-0.6 s for the first 10 s (a slot of this or another suite frees soon), then 2-4 s while a card stays held
+        # by a trainer or a foreign process (minutes to hours under -W 3600; the poll is cheap now, but dozens of waiting tests add up)
+        if [ $(( $(date +%s) - w0 )) -lt 10 ]; then sleep 0.$((RANDOM % 5 + 2)); else sleep $((RANDOM % 3 + 2)); fi
       fi
     done
     g=$(IFS=,; echo "${got[*]}")
@@ -257,11 +313,12 @@ run_one() {
     local to=$TO es=${EST[$n]%.*}; [ "${es:-0}" -gt "$to" ] && to=$es   # a test whose EST exceeds -x gets EST as its timeout (the solo racecheck runs: measured x 1.5, sweep 11-14)
     local mark="$OUT/$n.$a.$BASHPID"
     ( export UFSM_SUITE_RUN="$mark" B="$BDIR" TMPDIR="$tmp" UFSM_TEST_TMP="$tmp" UFSM_SUITE_TEST="$n" UFSM_PRED_NO_AXIS=1 UFSM_NCPU=$T UFSM_FIT_THREADS=$T UFSM_TIFF_THREADS=$T \
-             OMP_NUM_THREADS=$T OPENBLAS_NUM_THREADS=$T MKL_NUM_THREADS=$T
+             OMP_NUM_THREADS=$T OPENBLAS_NUM_THREADS=$T MKL_NUM_THREADS=$T UFSM_STARTUP_TIMES=${UFSM_STARTUP_TIMES:-0}
       # a test without the gpu tag sees no GPU: one that needs it fails or skips here instead of using a card without the lock (2026-11-13:
       # test_attn, test_attn_ray / _dfm, test_spiralfit, test_countfield, test_mesh_phase ran untagged on GPUs held by training runs)
       if [ -n "$g" ]; then export CUDA_VISIBLE_DEVICES=$g; else export CUDA_VISIBLE_DEVICES=; fi
       [ -n "$lg" ] && export UFSM_TEST_GPUS=$lg      # (an l2 test on one card: two logical devices)
+      [ -n "$g" ] && [ "$n" != _jitwarm ] && export MCUDA_KLOG="$OUT/tmp/$n.klog"   # (the kernels it loads: -J's lists)
       echo $BASHPID > "$OUT/tmp/$n.pid"
       echo "# $n [${TAGS[$n]}] attempt $a gpu=${g:--} $(date '+%F %T') on $(hostname)"; echo "# $cm"
       if [ -n "$TIMEBIN" ]; then exec $TIMEBIN -f '%e %U %S %M' -o "$OUT/tmp/$n.time" timeout -k 20 "$to" "${pre[@]}" bash -c "$cm"
@@ -288,6 +345,11 @@ run_one() {
   done
   if [ $PROF = 1 ] && [ -f "$OUT/tmp/$n.strace" ]; then grep -q '/dev/nvidia' "$OUT/tmp/$n.strace" && g="${g:-}+nv"; rm -f "$OUT/tmp/$n.strace"; fi
   rm -f "$OUT/tmp/$n.pid"
+  if [ -s "$OUT/tmp/$n.klog" ]; then   # a passing GPU test's kernel list replaces its old one (-J)
+    local kt="$KLOGD/$n.$BASHPID"   # (not $BASHPID in the redirect: that expands in sort's forked child)
+    { [ $st = PASS ] || [ $st = FLAKY ]; } && mkdir -p "$KLOGD" && sort -u "$OUT/tmp/$n.klog" > "$kt" && mv -f "$kt" "$KLOGD/$n"
+    rm -f "$OUT/tmp/$n.klog"
+  fi
   for fd in "${fds[@]}"; do exec {fd}>&-; done
   rm -f "$OUT/slots.$BASHPID"
   [ $rc = 0 ] && rm -rf -- "$tmp"
@@ -298,7 +360,7 @@ run_one() {
 declare -A PNAME PGPU; RUN=0; GBUSY=0; SOLO=0; DONE=0; TOT=${#QUEUE[@]}; T0=$(date +%s)
 finish() {
   local p=$1 n=${PNAME[$1]} r; r=$(cat "$OUT/res/$n" 2> /dev/null || echo "FAIL ? 0 0 0 0 - 1")
-  RUN=$((RUN - 1)); [ "${PGPU[$p]}" = 1 ] && GBUSY=$((GBUSY - 1)); hastag "$n" solo && SOLO=0; DONE=$((DONE + 1))
+  RUN=$((RUN - 1)); [ "${PGPU[$p]}" = 1 ] && GBUSY=$((GBUSY - 1)); hastag "$n" solo && SOLO=0; DONE=$((DONE + 1)); [ "$n" = _jitwarm ] && WARMING=0
   unset "PNAME[$p]" "PGPU[$p]"
   set -- $r; printf '[%3d/%d %5ds] %-7s %7.1fs  %s\n' $DONE $TOT $(( $(date +%s) - T0 )) "$1" "$3" "$n"
 }
@@ -317,6 +379,7 @@ while [ ${#QUEUE[@]} -gt 0 ] || [ $RUN -gt 0 ]; do
         [ $NG = 1 ] && hastag "$n" gpu2 && ! hastag "$n" l2 && nr="NEED2 a gpu2 test without the l2 tag, one GPU here"
         if [ -n "$nr" ]; then echo "${nr%% *} 0 0 0 0 0 - 0" > "$OUT/res/$n"; echo "# not run: ${nr#* }" > "$OUT/logs/$n.log"
           unset "QUEUE[$i]"; QUEUE=("${QUEUE[@]}"); DONE=$((DONE + 1)); printf '[%3d/%d] %-7s (%s)  %s\n' $DONE $TOT "${nr%% *}" "${nr#* }" "$n"; started=1; break; fi
+        [ $WARMING = 1 ] && [ "$n" != _jitwarm ] && continue
         [ $GBUSY -ge $GCAP ] && continue
       fi
       if hastag "$n" solo; then [ $RUN -gt 0 ] && continue; SOLO=1; fi

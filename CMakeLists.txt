@@ -633,7 +633,7 @@ if(EXISTS /sys/fs/cgroup/cpu.max)
   endif()
 endif()
 set(UFSM_JOBS ${_jobs} CACHE STRING "parallel jobs of the nested release / verify build (test-prep)")
-# the sibling dir is (re)configured with this dir's settings every time (a configure of an existing dir is ~1 s), so the release
+# the sibling dir is configured with this dir's settings (cmake/sibling_cfg.sh: skipped when its arguments are unchanged, 7 s saved per test run), so the release
 # helpers the python tests run are built like the suite binaries (a sanitizer in UFSM_EXTRA_CFLAGS, the device compiler, -march)
 set(_cfg_common -G Ninja -S ${CMAKE_SOURCE_DIR} -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE} -DUFSM_ARCH=${UFSM_ARCH} -DUFSM_GPU_SM=${UFSM_GPU_SM}
     -DUFSM_CUDA=${UFSM_CUDA} -DUFSM_LLVM_RUNTIME=${UFSM_LLVM_RUNTIME} -DUFSM_CCACHE=${UFSM_CCACHE} -DUFSM_MARCH=${UFSM_MARCH}
@@ -642,12 +642,12 @@ set(_cfg_common -G Ninja -S ${CMAKE_SOURCE_DIR} -DCMAKE_TOOLCHAIN_FILE=${CMAKE_T
     -DUFSM_PGO=${UFSM_PGO} -DUFSM_PGO_DIR=${UFSM_PGO_DIR})
 if(UFSM_VERIFY)
   add_custom_target(test-prep
-    COMMAND ${CMAKE_COMMAND} ${_cfg_common} -B ${UFSM_REL_DIR} -DUFSM_VERIFY=OFF
+    COMMAND bash ${CMAKE_SOURCE_DIR}/cmake/sibling_cfg.sh ${CMAKE_COMMAND} ${UFSM_REL_DIR} ${_cfg_common} -DUFSM_VERIFY=OFF
     COMMAND ${CMAKE_COMMAND} --build ${UFSM_REL_DIR} -j ${UFSM_JOBS} --target ${UFSM_TEST_PREP_REL}
     DEPENDS suite-check suite-bins USES_TERMINAL VERBATIM)
 else()
   add_custom_target(test-prep
-    COMMAND ${CMAKE_COMMAND} ${_cfg_common} -B ${UFSM_VERIFY_DIR} -DUFSM_VERIFY=ON
+    COMMAND bash ${CMAKE_SOURCE_DIR}/cmake/sibling_cfg.sh ${CMAKE_COMMAND} ${UFSM_VERIFY_DIR} ${_cfg_common} -DUFSM_VERIFY=ON
     COMMAND ${CMAKE_COMMAND} --build ${UFSM_VERIFY_DIR} -j ${UFSM_JOBS} --target suite-bins
     DEPENDS suite-check ${UFSM_TEST_PREP_REL} USES_TERMINAL VERBATIM)
 endif()
@@ -664,6 +664,11 @@ foreach(t fast slow all)
     COMMAND bash -c "exec tests/run_suite.sh -B '${_suite_b}' -t ${t} $SUITE_FLAGS"
     DEPENDS test-prep WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} USES_TERMINAL VERBATIM)
 endforeach()
+# test-touched: the fast-tier tests this branch can affect (run_suite -c <merge base with origin/master>, the symbol-reach map): the edit
+# loop's gate before the full tier / a GPU window; a build-system or runner change still selects everything
+add_custom_target(test-touched
+  COMMAND bash -c "b=$(git merge-base HEAD origin/master 2> /dev/null || git merge-base HEAD master) && exec tests/run_suite.sh -B '${_suite_b}' -t fast -c $b $SUITE_FLAGS"
+  DEPENDS test-prep WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} USES_TERMINAL VERBATIM)
 # every suite binary needs a line in tests/suite.txt and every tests/suite.txt binary a target (a merge that added only one half)
 add_custom_target(suite-check
   COMMAND bash ${CMAKE_SOURCE_DIR}/cmake/suite_check.sh ${CMAKE_SOURCE_DIR} "${_suite}"
