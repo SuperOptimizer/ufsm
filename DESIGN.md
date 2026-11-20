@@ -115,7 +115,30 @@ Agreement with the network's own heads on 1667 q2 (try9 lat fields, 3.97 G mater
   counts, and 10 % of cells are 1.7x sparser. This fits the phase merging sheets (packed regions) where the density head still
   counts them.
 
-Ablations (the production ref and GT ids on the 54 1667 GT boxes, CPU) follow below as they land.
+**Ablations.** The production ref was run on derived field sets: unroll.sh ref()'s flags, `--dir -1`, no mf, chunk rows 256, CPU,
+6 threads. GT ids were scored on the 54 1667 GT boxes (gtboxes.sh). The difference to base is voxel-weighted and paired per box, with
+a 95 % bootstrap CI over the boxes (4000 resamples). Run noise floor: ~0.02-0.03 ids.
+
+| arm | ref GT ids | - base [95 % CI] | boxes up / down | model coherence |
+|---|---|---|---|---|
+| base (the net's t0..t5 and sp) | 0.8302 | | | 0.187 |
+| fN: normals from the phase gradient | **0.8487** | **+0.0185 [+0.0067, +0.0316]** | 30 / 23 | 0.230 |
+| fS: density from the phase gradient | 0.7943 | -0.0358 [-0.0747, +0.0049] | 19 / 35 | 0.242 |
+| fNS: both | 0.7946 | -0.0356 [-0.0745, +0.0052] | 18 / 36 | 0.235 |
+
+- **Normals: cut the 6-channel head.** Derived normals are at least as good, and a little better here: the CI excludes 0 but stays
+  inside the noise floor. A smoothed phase gradient is the direction the count-field ref needs. The net's normal head, pooled per
+  cell, is not more accurate than the phase it is trained against.
+- **Density: keep it (1 channel).** Replacing it costs ~0.036, with the CI almost all below 0. The density head carries sheet counts
+  that the phase loses where it merges sheets: median 1.16x, p90 1.7x sparser from the phase.
+- fNS = fS: once density comes from the phase, the normal source no longer matters.
+- Joined ids (slabs + join) were not run. The slab fits' normal term is the same n n^T and the ref drives the counting, so these are the
+  ref numbers only.
+
+**Minimal winding net (proposal):** phase 2 + density 1 = 3 output channels, which fits the <= 4 three-buffer mode. The normals are
+derived in predict's fit-field export (the fields-derive computation moved there) or by `fields-derive --density 0`. wind4 is cut,
+because no production reader uses it. Ink (1), rv (2) and fibre H / V (2) become their own single-target nets; fibre dyad and family
+come back only if tracing needs them.
 ## Full-resolution VRAM: single-target nets on the three level-0 buffers, P 704 on a 16 GB card (2026-11-20, branch fullvram-20261120, fullvram)
 Goal (lead, after the user's return to full-resolution nets, one small net per target): a bigger window for full-resolution training on
 one 16 GB desk card (5060 Ti), first for 3-D ink. Every number below is the planner's (dry builds at 15.6 GB free, the --ink-mil 0.33 GB
