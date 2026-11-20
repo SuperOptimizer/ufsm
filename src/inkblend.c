@@ -49,10 +49,13 @@ static void ib_rows(void *a, int z0, int z1, int t) {
         }
     }
 }
+/* --tile-list FILE (2026-11-20, fullvram: the FAST ink score): only the output shards listed ("iz iy ix" of --shard) are blended and
+   written; set by cmd_ink_blend for one ink_blend_run (mgpu: main) */
+static const uint8_t *g_ib_keep; static int64_t g_ib_kn[3];
 int cmd_ink_blend(int argc, char **argv) {
     const char *in[32]; int n = 0; const char *out = nullptr, *tile = nullptr, *grids = nullptr, *origins = nullptr;
     /* q 0 (lossless): the inputs are already q-coded by predict; a second lossy pass (the old default 32) stacked errors (urender audit 11-14) */
-    double um = 0, q = 0; int nlev = 4, S = 512, nt = ufsm_threads(0, 16);
+    double um = 0, q = 0; int nlev = 4, S = 512, nt = ufsm_threads(0, 16); const char *tlf = nullptr;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], opt_n("--um")) && i + 1 < argc) { um = atof(argv[++i]); continue; }
         if (!strcmp(argv[i], opt_n("--tile")) && i + 1 < argc) { tile = argv[++i]; continue; }
@@ -62,12 +65,13 @@ int cmd_ink_blend(int argc, char **argv) {
         if (!strcmp(argv[i], opt_n("--shard")) && i + 1 < argc) { S = atoi(argv[++i]); continue; }
         if (!strcmp(argv[i], opt_n("--q")) && i + 1 < argc) { q = atof(argv[++i]); continue; }
         if (!strcmp(argv[i], opt_n("--threads")) && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], opt_n("--tile-list")) && i + 1 < argc) { tlf = argv[++i]; continue; }
         if (!strncmp(argv[i], "--", 2)) { fprintf(stderr, "ink-blend: unknown option %s\n", argv[i]); return 2; }
         if (!out) out = argv[i]; else if (n < 32) in[n++] = argv[i]; else { fprintf(stderr, "ink-blend: at most 32 inputs\n"); return 2; }
     }
     double st[3], g[32][3];
     if (!out || n < 1 || um <= 0 || !tile || !grids || sscanf(tile, "%lf,%lf,%lf", &st[0], &st[1], &st[2]) != 3 || !(st[0] > 0 && st[1] > 0 && st[2] > 0) || S < 128 || S % 128) {
-        fprintf(stderr, "usage: ufsm ink-blend <out> --um U --tile SZ,SY,SX --grids z,y,x:z,y,x:... <in1> <in2> ... [--origins z,y,x:...] [--levels 4] [--shard 512] [--q 0 (lossless; volcomp q)] [--threads 16]\n"); return 2; }
+        fprintf(stderr, "usage: ufsm ink-blend <out> --um U --tile SZ,SY,SX --grids z,y,x:z,y,x:... <in1> <in2> ... [--origins z,y,x:...] [--levels 4] [--shard 512] [--q 0 (lossless; volcomp q)] [--threads 16] [--tile-list FILE (only these output shards)]\n"); return 2; }
     { int k = 0; char *t = strdup(grids);
       for (char *q = strtok(t, ":"); q; q = strtok(nullptr, ":")) { if (k < 32 && sscanf(q, "%lf,%lf,%lf", &g[k][0], &g[k][1], &g[k][2]) != 3) { free(t); fprintf(stderr, "ink-blend: --grids z,y,x:...\n"); return 2; } k++; }
       free(t); if (k != n) { fprintf(stderr, "ink-blend: %d grids for %d inputs\n", k, n); return 2; } }
@@ -75,7 +79,20 @@ int cmd_ink_blend(int argc, char **argv) {
     if (origins) { int k = 0; char *t = strdup(origins);
       for (char *q = strtok(t, ":"); q; q = strtok(nullptr, ":")) { long long a, b, c; if (k < 32 && sscanf(q, "%lld,%lld,%lld", &a, &b, &c) != 3) { free(t); fprintf(stderr, "ink-blend: --origins z,y,x:...\n"); return 2; } if (k < 32) { org[k][0] = a; org[k][1] = b; org[k][2] = c; } k++; }
       free(t); if (k != n) { fprintf(stderr, "ink-blend: %d origins for %d inputs\n", k, n); return 2; } }
-    return ink_blend_run(out, um, st, n, in, g, org, nlev, S, q, nt, "{\"ufsm\":{\"content\":\"ink probability (ink-blend of overlapping predicts)\"}}");
+    uint8_t *keep = nullptr;
+    if (tlf) {   /* the listed shards on a grid big enough for any index in the file (indices < 0 ignored) */
+        FILE *f = fopen(tlf, "r"); if (!f) { fprintf(stderr, "ink-blend: cannot open --tile-list %s\n", tlf); return 1; }
+        long long a, b, c; int64_t mx[3] = {0, 0, 0}; long nl = 0;
+        while (fscanf(f, "%lld %lld %lld", &a, &b, &c) == 3) { const long long t3[3] = {a, b, c}; for (int d = 0; d < 3; d++) if (t3[d] + 1 > mx[d]) mx[d] = t3[d] + 1; nl++; }
+        if (!nl) { fclose(f); fprintf(stderr, "ink-blend: --tile-list %s is empty\n", tlf); return 1; }
+        keep = calloc((size_t)(mx[0] * mx[1] * mx[2]), 1); rewind(f);
+        while (keep && fscanf(f, "%lld %lld %lld", &a, &b, &c) == 3) if (a >= 0 && b >= 0 && c >= 0) keep[((size_t)a * mx[1] + b) * mx[2] + c] = 1;
+        fclose(f); if (!keep) { fprintf(stderr, "ink-blend: out of memory\n"); return 1; }
+        g_ib_keep = keep; for (int d = 0; d < 3; d++) g_ib_kn[d] = mx[d];
+        fprintf(stderr, "ink-blend: --tile-list %s: %ld shards of %d\n", tlf, nl, S);
+    }
+    const int rc = ink_blend_run(out, um, st, n, in, g, org, nlev, S, q, nt, "{\"ufsm\":{\"content\":\"ink probability (ink-blend of overlapping predicts)\"}}");
+    g_ib_keep = nullptr; free(keep); return rc;
 }
 
 /* the blend itself (ink-blend; predict --seamless): n uint8 probability groups (level named by um) on overlapping tile grids (tile st,
@@ -100,6 +117,7 @@ int ink_blend_run(const char *out, double um, const double st[3], int n, const c
     int nw = 0, nskip = 0; double t0 = now();
     for (int64_t a = 0; a < ns[0]; a++) for (int64_t b = 0; b < ns[1]; b++) for (int64_t c = 0; c < ns[2]; c++) {
         const int64_t o[3] = {a * S, b * S, c * S}, nn[3] = {S, S, S};
+        if (g_ib_keep && (a >= g_ib_kn[0] || b >= g_ib_kn[1] || c >= g_ib_kn[2] || !g_ib_keep[((size_t)a * g_ib_kn[1] + b) * g_ib_kn[2] + c])) { nskip++; continue; }
         int any = 0;
         for (int i = 0; i < n && !any; i++) {   /* any input shard holding this output shard's box (input-local voxels o - origin, clipped) */
             const z3_meta *m = z3_meta_of(zz[i]); int64_t lo[3], hi[3]; int ok = 1;

@@ -71,4 +71,11 @@ with tempfile.TemporaryDirectory(prefix="ufsm-iblend-") as tmp:
         assert abs(o2[(z * N + y) * N + x] - o[(z * N + y) * N + x]) <= 1, (z, y, x, o2[(z * N + y) * N + x], o[(z * N + y) * N + x])
     for z, y, x in [(0, 0, 0), (5, 31, 100), (31, 31, 31)]:   # outside the placed input: input a alone
         assert o2[(z * N + y) * N + x] == 100, (z, y, x, o2[(z * N + y) * N + x])
+    # --tile-list (only the listed output shards): "0 0 0" = the full blend, "1 1 1" (another shard) writes nothing (reads as fill 0)
+    for name, lst, want in (("out3", "0 0 0\n", o), ("out4", "1 1 1\n", bytes(N ** 3))):
+        (t / f"{name}.txt").write_text(lst)
+        run(BIN, "ink-blend", t / name, "--um", "9.6", "--tile", f"{T},{T},{T}", "--grids", "0,0,0:32,32,32", *ins, "--q", "0", "--levels", "1", "--shard", "128", "--threads", "2",
+            "--tile-list", t / f"{name}.txt")
+        run(BIN, "read", t / name, "9.6", 0, 0, 0, N, N, N, t / f"{name}.raw")
+        assert (t / f"{name}.raw").read_bytes() == want, name
 print("test_ink_blend: ok")

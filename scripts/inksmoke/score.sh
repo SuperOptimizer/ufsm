@@ -37,7 +37,7 @@ guard() { while :; do nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory -
   done; sleep 2; done; }
 guard & GP=$!; trap 'kill $GP 2>/dev/null; [ -s $E/gpumem.log ] && sort -k3 -n $E/gpumem.log | tail -1 | sed "s/^/peak: /" >> $E/gpupeak.txt' EXIT
 [ -e $E/ink/ink.zarr/zarr.json ] || $LK env CUDA_VISIBLE_DEVICES=1 U=$U LATINK_CK=$CK ITH=8 UNROLL_CT="$CTR|$CTK|2.399|2" ~/bin/memcap -m 36G ~/bin/lowprio \
-  env LATINK_HEADS=${GATEFROM:+ink} LATINK_TILES=${LATINK_TILES:-$([ $FAST = 1 ] && echo $FASTDIR/tiles-1667)} bash ${LATINK:-$(dirname "$(readlink -f "$0")")/../pod/latink.sh} $E 0 $E/ink/ink.zarr > $E/latink.log 2>&1 || { echo "score $TAG: latink failed ($E/latink.log)"; exit 1; }
+  env LATINK_HEADS=${GATEFROM:+ink} LATINK_TILES=${LATINK_TILES:-$([ $FAST = 1 ] && echo $FASTDIR/tiles-1667)} LATINK_BLEND_X="${LATINK_BLEND_X:-$([ $FAST = 1 ] && echo --tile-list ${LATINK_TILES:-$FASTDIR/tiles-1667}/tiles0.txt --levels 1)}" bash ${LATINK:-$(dirname "$(readlink -f "$0")")/../pod/latink.sh} $E 0 $E/ink/ink.zarr > $E/latink.log 2>&1 || { echo "score $TAG: latink failed ($E/latink.log)"; exit 1; }
 if [ $FAST = 1 ]; then
   ~/bin/memcap -m 12G ~/bin/lowprio $WSU ink-wrapscore $UP /vesuvius/ufsm/inkgt/segs-PHerc1667.json $(dirname $E)/pair_$TAG --ct-key $CTK --maps reader3=$P/ink/reader3/map \
     --vmap $TAG=$E/ink --depth ${DEPTH:-4} --ref reader3 --nonzero reader3 --split heldout,hold,valonly --need w035-w051 --table $FASTDIR/1667-up.uws --threads 6 > $E/wrapscore.log 2>&1 \

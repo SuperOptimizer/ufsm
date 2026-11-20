@@ -23,6 +23,7 @@
 # the blend sees both grids' tiles at every listed point. LATINK_TILELIST (1, 11-20 fullvram): one predict per grid over the run's box with
 # --tile-list (the shards outside the tiles skipped as air), so the windows pipeline as a whole-box run; 0: the --boxes runs. For a scorer whose samples all lie in those tiles: 1667's are the shards of
 # an ink-splat of all its human labels (grid 0: the shard files present, 200 of 931) and the grid-256 tiles overlapping them (398).
+# LATINK_BLEND_X: more ink-blend args (score.sh FAST: --tile-list TILES/tiles0.txt --levels 1, only the scored shards, no pyramid).
 # LATINK_CHANNEL=ink: a full-resolution (voxel) checkpoint: predict --heads takes latent-grid nets only, so predict --channel ink into
 # g<grid>/ink (LATINK_HEADS must then be ink; 11-20 FR1 / ladder nets).
 set -u
@@ -64,7 +65,7 @@ done
 # the three heads' blends at once (independent outputs, the same bytes): one at a time they were 3 x ~125 s + 35 s of pyramid on 0332
 # (2026-11-17), ~45 % of the ink stage, the GPU idle; each blend's shard loop is read -> blend -> encode in turn, so they overlap well
 bl() { local h=$1 d=$OUT; [ $h = ink ] || d=$O/ink/$h.zarr; rm -rf $d
-  $U ink-blend $d --um $LUM $([ "${LATINKQ:-4}" != 0 ] && echo --q ${LATINKQ:-4}) --tile 512,512,512 --grids 0,0,0:256,256,256 $T/g0/$h $T/g256/$h --threads $TH > $T/blend.$h.log 2>&1 || { cat $T/blend.$h.log; echo "latink: ink-blend $h failed"; return 1; }
+  $U ink-blend $d --um $LUM $([ "${LATINKQ:-4}" != 0 ] && echo --q ${LATINKQ:-4}) --tile 512,512,512 --grids 0,0,0:256,256,256 $T/g0/$h $T/g256/$h --threads $TH ${LATINK_BLEND_X:-} > $T/blend.$h.log 2>&1 || { cat $T/blend.$h.log; echo "latink: ink-blend $h failed"; return 1; }
   cat $T/blend.$h.log; [ -e $d/zarr.json ] || { echo "latink: no blended $h at $d"; return 1; }; }
 bp=(); for h in ${HL//,/ }; do bl $h & bp+=($!); done
 rc=0; for p in "${bp[@]}"; do wait $p || rc=1; done; [ $rc = 0 ] || exit 1
