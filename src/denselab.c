@@ -248,6 +248,8 @@ int cmd_ink_rayface(int argc, char **argv) {
         fprintf(stderr, "usage: ufsm ink-rayface SOURCES.json [--source N1,N2] [--threads 8] [--gpu D] [--force 1] [--rays 2] [--verify N --P 256 --stride 2 --R 10 --seed 1]\n"
                         "  --rays S: also the per-tile ray lists of MIL mode 1 at stride S (0: none); --verify compares the rays a window gets from them / the bits\n"
                         "  with the face search on the CT; --diag N: the CT profiles of N faceless pixels per source, classified (threshold vs mesh offset)\n"
+                        "  --profile N --pvol NAME=ROOT|KEY|UM[;NAME=..] [--pbox z,y,x,nz,ny,nx] [--pout F.tsv] [--mil-um 50]: N supervised pixels' profiles along the\n"
+                        "  normal (t -40..40 level-0 voxels) of the CT and each volume (uint8 store, voxel UM um, the CT's frame) vs the face band / MIL band\n"
                         "  precomputes the MIL rays' face-drop bit of every supervised label pixel of each onfly ink target (rayface.bin in its cache dir)\n");
         return 2;
     }
@@ -257,6 +259,25 @@ int cmd_ink_rayface(int argc, char **argv) {
     const int rays = opt_atoi("--rays", opt(argc, argv, "--rays", "2")), diag = opt_atoi("--diag", opt(argc, argv, "--diag", "0"));
     const int P = opt_atoi("--P", opt(argc, argv, "--P", "256")), stride = opt_atoi("--stride", opt(argc, argv, "--stride", "2"));
     const float R = (float)atof(opt(argc, argv, "--R", "10")); uint64_t seed = (uint64_t)opt_atoi("--seed", opt(argc, argv, "--seed", "1"));
+    const int npro = opt_atoi("--profile", opt(argc, argv, "--profile", "0")); const char *pout = opt(argc, argv, "--pout", nullptr), *pvs = opt(argc, argv, "--pvol", nullptr);
+    const double milum = atof(opt(argc, argv, "--mil-um", "50")); int64_t pbox[6]; long long pb6[6]; const char *pbs = opt(argc, argv, "--pbox", nullptr);
+    const int pbox_ok = pbs && sscanf(pbs, "%lld,%lld,%lld,%lld,%lld,%lld", pb6, pb6 + 1, pb6 + 2, pb6 + 3, pb6 + 4, pb6 + 5) == 6;
+    if (pbs && !pbox_ok) { fprintf(stderr, "ink-rayface: --pbox z,y,x,nz,ny,nx (level 0)\n"); return 2; }
+    for (int d = 0; d < 6; d++) pbox[d] = pbox_ok ? pb6[d] : 0;
+    z3 *pvz[8]; double pvum[8]; char *pvn[8]; int npv = 0;
+    if (npro > 0 && pvs) {   /* NAME=ROOT|KEY|UM;NAME=... */
+        char *cp = strdup(pvs), *sv = nullptr;
+        for (char *it = strtok_r(cp, ";", &sv); it; it = strtok_r(nullptr, ";", &sv)) {
+            char *eq = strchr(it, '='), *b1 = eq ? strchr(eq + 1, '|') : nullptr, *b2 = b1 ? strchr(b1 + 1, '|') : nullptr;
+            if (!b2 || npv == 8) { fprintf(stderr, "ink-rayface: --pvol NAME=ROOT|KEY|UM (up to 8, ';'-separated): %s\n", it); return 2; }
+            *eq = *b1 = *b2 = 0; store *st = store_open(eq + 1); z3 *z = st ? z3_open(st, b1 + 1, nullptr) : nullptr;
+            if (!z) { fprintf(stderr, "ink-rayface: --pvol %s: cannot open %s %s: %s\n", it, eq + 1, b1 + 1, z3_error()); return 1; }
+            pvz[npv] = z; pvum[npv] = atof(b2 + 1); pvn[npv] = strdup(it);
+            if (!(pvum[npv] > 0)) { fprintf(stderr, "ink-rayface: --pvol %s: voxel size UM > 0\n", it); return 2; }
+            npv++;
+        }
+        free(cp);
+    }
     if (nver) setenv("UFSM_INK_RAYFACE", "0", 1);   /* (verify: the sources open without the bits; the build loads them per handle below) */
     sources *SS = sources_load(argv[2]); if (!SS) { fprintf(stderr, "ink-rayface: cannot load %s\n", argv[2]); return 1; }
     if (nver) unsetenv("UFSM_INK_RAYFACE");
@@ -275,6 +296,13 @@ int cmd_ink_rayface(int argc, char **argv) {
                 printf("ink-rayface: %s: ray lists (stride %d, mode 1) in %.0f s\n", s->name, rays, dl_now() - t1);
             }
             if (diag > 0 && inkfly_face_diag(h, diag, seed)) { rc = 1; break; }
+            if (npro > 0) {   /* --profile: the --pvol volumes along the label pixels' normals */
+                FILE *pf = pout ? fopen(pout, nh > 1 ? "a" : "w") : nullptr;
+                if (pout && !pf) { fprintf(stderr, "ink-rayface: cannot write %s\n", pout); rc = 1; break; }
+                if (inkfly_profile(h, npro, seed, npv, pvz, pvum, (const char *const *)pvn, pbox_ok ? pbox : nullptr, milum, pf)) { fprintf(stderr, "ink-rayface: %s: profile FAILED\n", s->name); rc = 1; }
+                if (pf && fclose(pf)) rc = 1;
+                if (rc) break;
+            }
             if (!nver) continue;
             /* windows at the onfly level around random supervised tiles: rays from the bits vs rays with the bits off (the face search) */
             int ok = 0, tried = 0; size_t nrays = 0;

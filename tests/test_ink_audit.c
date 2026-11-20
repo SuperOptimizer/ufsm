@@ -29,6 +29,7 @@ static void normal_at(double u, double v, double N[3]) {
 static int ink_at(int r, int c) { const double dr = r - 80, dc = c - 70; return dr * dr + dc * dc < 30 * 30 || (c >= 110 && c < 122); }
 static int sup_at(int r, int c) { (void)c; return !(r >= 120 && r < 140); }
 int cmd_ink_audit(int argc, char **argv);
+int cmd_ink_rayface(int argc, char **argv);
 
 int main(void) {
     char dir[] = "/tmp/ufsm_inkaudit_XXXXXX"; if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
@@ -97,6 +98,35 @@ int main(void) {
     CHECK(px[2] > 2000 && px[0] > 2000, "HOLD %ld / TRAIN %ld px", px[2], px[0]);
     snprintf(p, sizeof p, "%s/a.blocks.tsv", dir); f = fopen(p, "r"); int nb = 0; while (f && fgets(ln, sizeof ln, f)) nb++; if (f) fclose(f);
     CHECK(nb == 2, "blocks table rows %d (header + one 2048-block)", nb);
+    /* ink-rayface --profile (2026-11-20): the prediction as a volume along the label pixels' normals; its ink peak lies 10 .. 14 past the
+       open face (+6; the layer at t 16 .. 20), so none of its mass in the face band [f - 6, f], and the CT level as a volume equals the CT */
+    snprintf(p, sizeof p, "%s/src.json", dir); f = fopen(p, "w");
+    fprintf(f, "{\"sources\": [{\"name\": \"t\", \"root\": \"%s\", \"ct\": \"ct.zarr\", \"um\": 1, \"iso\": 100, \"targets\": {\"ink\": {\"encoding\": \"prob254\", \"min_level\": 0, "
+               "\"onfly\": {\"segments\": \"%s\", \"level\": 0, \"iso\": 100, \"face\": [-6, 0], \"cache_dir\": \"%s/dc\"}}}}]}\n", dir, segs, dir); fclose(f);
+    char srcj[600], pv[1400], ptsv[600], pout[600]; snprintf(srcj, sizeof srcj, "%s/src.json", dir); snprintf(ptsv, sizeof ptsv, "%s/p.tsv", dir); snprintf(pout, sizeof pout, "%s/p.out", dir);
+    snprintf(pv, sizeof pv, "pred=%s|pred.zarr/1|1;ctv=%s|ct.zarr/1|1", dir, dir);
+    fflush(stdout); fflush(stderr);
+    const pid_t c2 = fork();
+    if (c2 == 0) {
+        const int fd = open(pout, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) _exit(9); dup2(fd, 1);
+        char *av[] = {"ufsm", "ink-rayface", srcj, "--rays", "0", "--threads", "2", "--profile", "600", "--pvol", pv, "--pout", ptsv, nullptr};
+        const int r = cmd_ink_rayface(13, av); fflush(stdout); _exit(r);
+    }
+    st = 0; waitpid(c2, &st, 0); CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "ink-rayface --profile exit %d", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    f = fopen(pout, "r"); int seen = 0; char ctm[2][4096] = {"", ""};
+    while (f && fgets(ln, sizeof ln, f)) {
+        fputs(ln, stderr);
+        double h[13], band = -1, milb = -1; char nm2[32];
+        if (sscanf(ln, "ink profile: %31s ink, face: peak t - t_f (<-20 <-12 <-8 <-6 <-3 <0 0 <=3 <=6 <=8 <=12 <=20 >20): %lf%% %lf%% %lf%% %lf%% %lf%% %lf%% %lf%% %lf%% %lf%% %lf%% %lf%% %lf%% %lf%% | mass in the face band %lf%%, in the MIL band %lf%%",
+                   nm2, h, h + 1, h + 2, h + 3, h + 4, h + 5, h + 6, h + 7, h + 8, h + 9, h + 10, h + 11, h + 12, &band, &milb) == 16 && !strcmp(nm2, "pred")) {
+            seen = 1; CHECK(h[10] + h[11] > 90, "profile: pred peak at t_f + 9 .. 20 in %.1f%% of ink pixels", h[10] + h[11]);
+            CHECK(band < 15, "profile: pred mass in the face band %.1f%%", band);
+        }
+        if (strstr(ln, "ink, face         mean")) { const int k = !strncmp(ln, "ink profile: CT ", 16) ? 0 : strstr(ln, " ctv ") ? 1 : -1; if (k >= 0) snprintf(ctm[k], sizeof ctm[k], "%s", strstr(ln, "mean")); }
+    }
+    if (f) fclose(f);
+    CHECK(seen, "profile: no pred line");
+    CHECK(ctm[0][0] && !strcmp(ctm[0], ctm[1]), "profile: the CT as a volume differs from the CT channel");
     snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) {}
     free(X); free(Y); free(Z); free(lab); free(msk); free(ct); free(pr);
     if (fails) { fprintf(stderr, "test_ink_audit: %d FAILED\n", fails); return 1; }

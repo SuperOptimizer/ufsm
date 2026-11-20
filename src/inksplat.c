@@ -2075,6 +2075,94 @@ int inkfly_face_diag(void *handle, int nsample, uint64_t seed) {
     printf(" | after"); for (int b = 0; b < 8; b++) printf(" %llu", (unsigned long long)hoff[1][b]); printf("\n");
     return 0;
 }
+/* normal profiles of other ink volumes (2026-11-20, lead step 4b: where do upstream 3-D ink models put the ink along the mesh normal vs our
+   face band [face + a, face + b], the MIL ray band and the faceless pixels?). Up to nsample supervised pixels (inside box[6], level 0, when
+   given; up to 8 per tile; mil_um: the MIL reach in um), each: the smoothed CT along the ray over t in [-TR, TR] level-0 voxels (the face search as rays_face: the
+   open face t_f or none, the faceless classified as inkfly_face_diag) and every volume trilinear at the same points (volume k: voxel
+   vum[k] um, the CT's frame, voxel centres as a mean-pooled level: level-0 point P -> (P - (s - 1) / 2) / s, s = vum[k] / ct_um). One TSV row per pixel; stdout: per volume and group (ink / no ink x
+   face / faceless) the mean profile, and for ink pixels with a face the peak offset t_peak - t_f histogram and the share of the profile
+   mass in the face band and in |t| <= mil (level-0 voxels) */
+int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *vols, const double *vum, const char *const *vname, const int64_t *box, double mil_um, FILE *tsv) {
+    inkfly *f = handle; if (!f || !f->nT) { fprintf(stderr, "ink profile: no supervised tiles\n"); return -1; }
+    const inksplat_cfg *c = &f->c; const double V = f->V, sign = c->flip ? -1 : 1, mil = mil_um / c->ct_um; enum { TR = 40, NS = 2 * TR + 1, PT = 8, VMAX = 8 };
+    if (nv > VMAX) { fprintf(stderr, "ink profile: at most %d volumes\n", VMAX); return -1; }
+    const int lo = (int)floor(c->face_lo), hi = (int)ceil(c->face_hi), fa = (int)floor(c->face_a), fb = (int)ceil(c->face_b);
+    /* accumulators: group g = 2 * y + faceless; per channel (0 the CT, 1 + k the volumes) the profile sums */
+    double (*sum)[4][NS] = calloc((size_t)(nv + 1), sizeof *sum); uint64_t ng[4] = {0}, cls[4] = {0};
+    enum { PB = 13 }; uint64_t (*pk)[PB] = calloc((size_t)(nv + 1), sizeof *pk); double (*mband)[3] = calloc((size_t)(nv + 1), sizeof *mband);
+    size_t *ord = malloc(f->nT * sizeof *ord); cpx *X = nullptr; size_t cap = 0; int got = 0;
+    if (!sum || !pk || !mband || !ord) { free(sum); free(pk); free(mband); free(ord); return -1; }
+    size_t nt = 0; for (size_t t = 0; t < f->nT; t++) {   /* the tiles meeting the box */
+        int in = 1; if (box) for (int d = 0; d < 3; d++) if (f->T[t].hi[d] < box[d] || f->T[t].lo[d] >= box[d] + box[3 + d]) in = 0;
+        if (in) ord[nt++] = t; }
+    for (size_t i = nt; i > 1; i--) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; const size_t j = (size_t)((seed >> 20) % i), s = ord[i - 1]; ord[i - 1] = ord[j]; ord[j] = s; }
+    if (tsv) { fprintf(tsv, "tile\tpx\ty\tface\tclass\tPz\tPy\tPx\tNz\tNy\tNx"); for (int ch = 0; ch <= nv; ch++) for (int k = 0; k < NS; k++) fprintf(tsv, "\t%s%d", ch ? vname[ch - 1] : "ct", k - TR); fprintf(tsv, "\n"); }
+    float pr[VMAX + 1][NS];
+    for (size_t oi = 0; oi < nt && got < nsample; oi++) {
+        const size_t t = ord[oi]; size_t np = 0; double lo3[3] = {1e300, 1e300, 1e300}, hi3[3] = {-1e300, -1e300, -1e300};
+        if (tile_px(f, t, &X, &np, &cap, lo3, hi3) || !np) continue;
+        size_t pick[PT]; int npk = 0;   /* up to PT pixels of the tile inside the box */
+        for (int k = 0; k < PT * 8 && npk < PT; k++) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; const size_t i = (size_t)((seed >> 24) % np); int in = 1, dup = 0;
+            if (box) for (int d = 0; d < 3; d++) if (X[i].P[d] < box[d] || X[i].P[d] >= box[d] + box[3 + d]) in = 0;
+            for (int q = 0; q < npk; q++) dup |= pick[q] == i;
+            if (in && !dup) pick[npk++] = i; }
+        if (!npk) continue;
+        double a3[3] = {1e300, 1e300, 1e300}, b3[3] = {-1e300, -1e300, -1e300};   /* the picked points' box +- TR (level 0) */
+        for (int q = 0; q < npk; q++) for (int d = 0; d < 3; d++) { const double p = X[pick[q]].P[d]; if (p - TR < a3[d]) a3[d] = p - TR; if (p + TR > b3[d]) b3[d] = p + TR; }
+        uint8_t *buf[VMAX + 1] = {0}; int64_t co[VMAX + 1][3], cn[VMAX + 1][3]; int bad = 0;
+        for (int ch = 0; ch <= nv && !bad; ch++) {   /* one read per channel per tile: the CT at the onfly level, volume k in its voxels */
+            const double s = ch ? vum[ch - 1] / c->ct_um : V, of = (s - 1) / 2; size_t n = 1;
+            for (int d = 0; d < 3; d++) { co[ch][d] = (int64_t)floor((a3[d] - of) / s) - 2; cn[ch][d] = (int64_t)ceil((b3[d] - of) / s) + 3 - co[ch][d]; n *= (size_t)cn[ch][d]; }
+            if (n > ((size_t)1 << 30) || !(buf[ch] = malloc(n))) { bad = 1; break; }
+            if (z3_read(ch ? vols[ch - 1] : f->base_ct, co[ch], cn[ch], buf[ch], 1)) { fprintf(stderr, "ink profile: %s read failed: %s\n", ch ? vname[ch - 1] : "CT", z3_error()); bad = 1; }
+        }
+        for (int q = 0; q < npk && !bad && got < nsample; q++) {
+            const cpx *x = &X[pick[q]];
+            for (int ch = 0; ch <= nv; ch++) { const double s = ch ? vum[ch - 1] / c->ct_um : V, of = (s - 1) / 2;
+                for (int k = 0; k < NS; k++) { const double tt = (k - TR) * sign; double qq[3]; for (int d = 0; d < 3; d++) qq[d] = (x->P[d] + tt * x->N[d] - of) / s - co[ch][d];
+                    const float v = tri_box_z(buf[ch], cn[ch], 0, cn[ch][0], qq[0], qq[1], qq[2]); pr[ch][k] = v < 0 ? 0 : v; } }
+            float sm[NS]; for (int k = 0; k < NS; k++) sm[k] = 0.25f * (pr[0][k > 0 ? k - 1 : 0] + 2 * pr[0][k] + pr[0][k < NS - 1 ? k + 1 : NS - 1]);
+            /* the face as rays_face: the smoothed samples of [lo, hi] only (its smoothing clamps at the range ends) */
+            float rs[256]; const int ns = hi - lo + 1; for (int k = 0; k < ns; k++) rs[k] = pr[0][lo + k + TR];
+            float s2[256]; for (int k = 0; k < ns; k++) s2[k] = 0.25f * (rs[k > 0 ? k - 1 : 0] + 2 * rs[k] + rs[k < ns - 1 ? k + 1 : ns - 1]);
+            const int ft = face_of(s2, ns, lo, c->iso, c->face_run, c->face_gap);
+            int cl = -1;   /* faceless: (a) iso in range, rule rejects (b) iso only outside (c) papyrus under iso (d) none (inkfly_face_diag) */
+            if (ft == FACE_NONE) { float mx = 0; int near = 1 << 20;
+                for (int k = 0; k < NS; k++) { const int tv = k - TR; if (tv >= lo && tv <= hi) { if (sm[k] > mx) mx = sm[k]; } else if (sm[k] >= c->iso && abs(tv) < abs(near)) near = tv; }
+                cl = mx >= c->iso ? 0 : near != 1 << 20 ? 1 : mx >= c->iso / 2.f ? 2 : 3; cls[cl]++; }
+            const int g = 2 * (x->y != 0) + (ft == FACE_NONE); ng[g]++; got++;
+            for (int ch = 0; ch <= nv; ch++) {
+                for (int k = 0; k < NS; k++) sum[ch][g][k] += pr[ch][k];
+                if (g == 2) {   /* ink with a face: the peak offset and the band shares */
+                    int am = 0; double tot = 0, inb = 0, inm = 0; for (int k = 0; k < NS; k++) { if (pr[ch][k] > pr[ch][am]) am = k; const int tv = k - TR; tot += pr[ch][k];
+                        if (tv >= ft + fa && tv <= ft + fb) inb += pr[ch][k]; if (fabs((double)tv) <= mil) inm += pr[ch][k]; }
+                    const int o = am - TR - ft, b = o < -20 ? 0 : o < -12 ? 1 : o < -8 ? 2 : o < -6 ? 3 : o < -3 ? 4 : o < 0 ? 5 : o == 0 ? 6 : o <= 3 ? 7 : o <= 6 ? 8 : o <= 8 ? 9 : o <= 12 ? 10 : o <= 20 ? 11 : 12;
+                    pk[ch][b]++; if (tot > 0) { mband[ch][0] += inb / tot; mband[ch][1] += inm / tot; mband[ch][2] += 1; }
+                }
+            }
+            if (tsv) { fprintf(tsv, "%zu\t%u\t%d\t", t, x->px, x->y); if (ft == FACE_NONE) fprintf(tsv, "NA\t%c", "abcd"[cl]); else fprintf(tsv, "%d\tF", ft);
+                       fprintf(tsv, "\t%.2f\t%.2f\t%.2f\t%.4f\t%.4f\t%.4f", x->P[0], x->P[1], x->P[2], sign * x->N[0], sign * x->N[1], sign * x->N[2]);
+                       for (int ch = 0; ch <= nv; ch++) for (int k = 0; k < NS; k++) fprintf(tsv, "\t%.1f", pr[ch][k]); fprintf(tsv, "\n"); }
+        }
+        for (int ch = 0; ch <= nv; ch++) free(buf[ch]);
+        if (bad) { free(X); free(sum); free(pk); free(mband); free(ord); return -1; }
+    }
+    free(X); free(ord);
+    static const char *gn[4] = {"no ink, face", "no ink, faceless", "ink, face", "ink, faceless"};
+    printf("ink profile: %d pixels of %zu tiles (ink face %llu, ink faceless %llu, no-ink face %llu, no-ink faceless %llu; faceless a/b/c/d %llu/%llu/%llu/%llu), t in level-0 voxels "
+           "(%.3g um) along the face normal, face band [t_f %+d, t_f %+d], MIL |t| <= %.1f\n", got, nt, (unsigned long long)ng[2], (unsigned long long)ng[3], (unsigned long long)ng[0],
+           (unsigned long long)ng[1], (unsigned long long)cls[0], (unsigned long long)cls[1], (unsigned long long)cls[2], (unsigned long long)cls[3], c->ct_um, fa, fb, mil);
+    for (int ch = 0; ch <= nv; ch++) {
+        const char *nm = ch ? vname[ch - 1] : "CT";
+        for (int g = 0; g < 4; g++) { if (!ng[g]) continue; printf("ink profile: %-12s %-17s mean, t -40..40 step 4:", nm, gn[g]);
+            for (int k = 0; k < NS; k += 4) printf(" %.0f", sum[ch][g][k] / ng[g]); printf("\n"); }
+        if (ng[2]) { printf("ink profile: %-12s ink, face: peak t - t_f (<-20 <-12 <-8 <-6 <-3 <0 0 <=3 <=6 <=8 <=12 <=20 >20):", nm);
+            for (int b = 0; b < PB; b++) printf(" %.1f%%", 100.0 * pk[ch][b] / ng[2]);
+            printf(" | mass in the face band %.1f%%, in the MIL band %.1f%%\n", mband[ch][2] ? 100 * mband[ch][0] / mband[ch][2] : 0., mband[ch][2] ? 100 * mband[ch][1] / mband[ch][2] : 0.); }
+    }
+    free(sum); free(pk); free(mband);
+    return got ? 0 : -1;
+}
 int inkfly_raylist_have(void *handle) { const inkfly *f = handle; return f && f->rl_map ? f->rl_stride * 2 + f->rl_mode : 0; }
 /* (ink-rayface --verify, single-threaded: the rays with the bits ignored, i.e. the face search on the CT) */
 int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout);
