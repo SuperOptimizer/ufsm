@@ -6,6 +6,37 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## 3-D ink readout check: the score path holds (depth 4 > reader3); the desk ink run T9C had a frozen head (2026-11-20, branch inkctl-20261120)
+
+The ink retrain from the cooled try9 (T9C, desk card 0, teacher-first sources, --lat-sub ink, P 768) scored held-out AUC 0.530 / 0.568 /
+0.594 / 0.628 at steps 500 / 1000 / 2000 / 3000 on the 1667 pairwrap (reader3 0.858). Before blaming the net or the path, two controls.
+
+**Readout path: the training target scored through score.sh's path.** The 39 human label windows of 1667 were splatted to 3-D exactly as
+the trainer's onfly target (ink-splat, face -6..0, iso 64, level 2 = 9.596 um), then rendered on the 17 scored wraps, gated (img-gate
+c12 / c13) and scored with pairwrap2.
+
+| target volume | render | heldout | hold |
+|---|---|---|---|
+| splat, unknown = 255 (ink-splat default) | --depth 1 | 0.569 | 0.585 |
+| splat, --unknown 0 (new) | --depth 1 (score.sh until 11-20) | 0.798 | 0.803 |
+| splat, --unknown 0 | --depth 4 | 0.886 | 0.886 |
+| reader3 2-D maps (reference) | | 0.858 | 0.862 |
+
+- The 255 artefact: render reads ink-splat's unknown byte (255) as ink wherever a wrap passes unlabelled voxels. `ink-splat --unknown V`
+  writes another byte, 0 for a clean 0 / 254 target.
+- The depth-1 ceiling: the wraps sit a median 22 um (p90 77 um) from the label meshes, 2-8 voxels at 9.6 um. The label band is 6 voxels
+  on one side of the open face, so a one-voxel read misses part of it.
+- score.sh now renders with DEPTH (default 4), the max over +-4 voxels along the normal. Every 3-D ink score before 11-20 (inkpod 0.58,
+  arm B 0.54, T9C) was read at depth 1.
+
+**The net: frozen head.**
+- ink-audit on T9C's step-500 volume, in 3-D at the training-label voxels (no render): TRAIN AUC 0.584 at shift 0, the raw CT's own
+  0.595; HOLD 0.578. Ink / no-ink medians differ by 1 byte.
+- The optimizer line showed head W rms 4.542e-02 at step 11 and 4.542e-02 at step 2991.
+- Cause: trainarm.sh's u1-era smoke recipe, AdamW 1e-4 and Muon 0.002 x --trunk-lr-mult 0.2 = 4e-4 (try9: 3e-4 / 3e-3, 7.5x more on
+  the trunk). The new sub-cell ink rows start at zero and stayed there.
+- Fix arm T9F (running): try9's optimizer (no trunk mult, warmup 200, --init-lr-mult 0.3 for 2000 steps), --ink-lambda 3.
+  Gates: head W rms moves by step 300, ink-audit TRAIN >= 0.70 at 500, held-out (depth 4) >= 0.70 at 1000.
 ## Fibre tracing toward mm-long, sheet-faithful fibres: fibhv-d + dyad + a sheet gate (2026-11-20, branch fibtrace-20261119, latcodec)
 
 Goal: fibres long and sheet-faithful enough for a fibre unwind and for count-field fibre ties (Paris 4 AFV ties gave +0.04 / +0.03
