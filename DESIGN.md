@@ -80,6 +80,8 @@ voxels per output, from the cell's compressed input.
 ncu per slab at P 768, ng 7, H 64: fwd 39 -> 2.1 ms; bwd + the two weight-gradient GEMMs 110 -> 3.0 + 1.3 + 1.9 ms; cell encode 0.5 ms.
 H 32 is not cheaper (fwd 1.9 ms, bwd 2.8 ms: the L staging dominates). Step A/B at P 256, alternating A B A B: 1.59 / 1.66 vs
 1.47 / 1.47 samples/s, about 615 vs 680 ms, **+10.5 %**. Memory: scratch 83 MB, fp16 L ~17 MB at P 768.
+Gate (11-19): CPU fast tier 142 PASS (221 NOGPU under -g none); the touched GPU tests on card 1 50 PASS, test_lat_head~racecheck TIMEOUT
+at 1800 s (the sanitizer on the shared card; no FAIL). The tc-path racecheck runs in the next pod queue.
 
 ## Count-constrained fill: no headroom over the mf-weighted ref (2026-11-18, branch fill-20261118, levelsolve)
 
