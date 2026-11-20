@@ -6,6 +6,21 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fibre scoring: fiber-trace on all its threads, fibtrace_eval.sh fails loudly (2026-11-20, branch fibscore-20261120, fullvram)
+
+One Paris 4 HOLD fibre score (latcodec: f3m snapshots) was ~3.5 min of laptop predict (8 --channel runs, ~23 s of windows each) +
+3 arms x ~3 min of fibtrace_eval.sh. A fiber-trace there ran at 102 % CPU with --threads 6: ~90 % of it was the --dyad decode (a 16-step
+power iteration per voxel of the 512 x 576 x 768 box) in one thread, the rest the seed loop. Now the decode is threaded over voxel
+ranges and the seeds trace in parallel batches (48 per thread), committed in seed order (a line's trace reads the fields only; the
+occupancy decides only which seeds are kept): byte-identical .fib files.
+| arm (H family) | before | after |
+|---|---|---|
+| W3 (sheet-gated, gap 0.3 mm) | 74.7 s, 125 % CPU | 17.5 s, 523 % |
+| plain dyad | 63.1 s | 12.7 s |
+fibtrace_eval.sh per arm (H + V, trace + match + judge, T 6): ~3 min -> 40 s. It now fails (FAILED line, exit 1) on a missing mask, a
+trace / fiber-match / fiber-judge error, an empty .fib or empty summary fields (they used to leave a .sum with empty fields, exit 0),
+and writes the .fib / .sum through .tmp + rename.
+
 ## Ink scoring in C: ink-wrapscore (pairwrap in seconds, volume maps without renders, held-out tile lists) (2026-11-20, branch inkscore-20261120, fullvram)
 
 One held-out ink AUC per checkpoint took ~14 min of latink predict + 3 renders on card 1 and 15-30 min of CPU pairwrap2.py (wrapscore.py's
