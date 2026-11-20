@@ -4967,7 +4967,8 @@ static void ws_conv(unet *u, const convp *c, void *arg) {
     if (X.c >= 64 && Y.c >= 64) { ws_max(w, NN_WS_LPBUF + 2, ws_nb(Y.c) * nf * HWx * 33); ws_max(w, NN_WS_LPBUF + 3, ws_nb(X.c) * nf * HWx * 33); }
     ws_max(w, NN_WS_LPBUF + 6 + 4, (size_t)X.c * Y.c * 27 * 4); ws_max(w, NN_WS_LPBUF + 6 + 2, (size_t)X.c * Y.c * 27 * 4);
     if (X.c <= 64) ws_max(w, NN_WS_LPBUF + 18, (size_t)27 * X.c * (X.c + 8) * 2);   /* (lp_mx_s2bwd_tc.cu: bf16 weights, 16 - 64 channels) */
-    ws_max(w, NN_WS_S2BCP, ws_nb(Y.c) * Sy * 17);   /* (lp_mx_s2bwd_tc.cu: the gy copy when the planner's gy and gx overlap) */
+    if (grad_mx4() && lp_s2b_gycopy_conv(X.c, Y.c)) ws_max(w, NN_WS_S2BCP, ws_nb(Y.c) * Sy * 17);   /* (lp_mx_s2bwd_tc.cu: the gy copy when the planner's gy and gx overlap; only
+                                                                                                  the convs that take that kernel, 2026-11-20) */
 }
 size_t unet_ws_plan(unet *u, shape5 xs, size_t pre_budget, int reserve, size_t *pre_out) {
     (void)xs;   /* (the levels of the last build: u->ls) */

@@ -15,6 +15,8 @@
    --extra takes up to 4 comma-separated AFVs (2026-11-11): an entry is in the CT's own level-0 voxels, or, suffixed "@map", in the
    --map's coarse frame (e.g. Paris 4: the 2023 all-lengths tracing through the reg map plus the native 2.4 um Paris4_v1 chains).
    Shards (--shard^3) are independent; --zband limits the z range written (level voxels, widened to whole shards). CPU. */
+#include "defaulted.h"
+#include <stdatomic.h>
 #include <math.h>
 #include "optcheck.h"
 #include <pthread.h>
@@ -166,10 +168,21 @@ static int fr_box(fr_job *J, const int64_t so[3], const int64_t n[3], uint8_t *d
                                of a P 1024 window took 3.9 GB of device memory beside the trainer, a slab of 64 M voxels 0.2 GB) */
         const size_t pl = (size_t)n[1] * n[2]; int64_t zs = (int64_t)(fiber_gpu_slab_vox() / (pl ? pl : 1)); if (zs < 1) zs = 1;
         gok = 1;
-        for (int64_t z0 = 0; z0 < n[0] && gok; z0 += zs) {
+        /* a slab the device cannot take (its steps / bin entries grow past the reserve, nothing left beside the trainer's plan): the same
+           slab in halves, down to 1/16 of the planned one, before the CPU raster. That raster is single-threaded inside the sampler's
+           read: P 384 with 5 AFV sources stalled training at 99.96 % of the main thread in fr_box / fr_stamp (latcodec's laptop run,
+           2026-11-20), so falling back says DEFAULTED once */
+        const int64_t zmin = zs / 16 > 0 ? zs / 16 : 1;
+        for (int64_t z0 = 0; z0 < n[0] && gok;) {
             const int64_t so2[3] = {so[0] + z0, so[1], so[2]}, n2[3] = {z0 + zs < n[0] ? zs : n[0] - z0, n[1], n[2]}; const size_t off = (size_t)z0 * pl;
-            if (fibre_gpu_box(t_st.s, t_st.n, so2, n2, R, J->rad + J->guard, cr, cg, J->ring > 0, have_ct ? ct + off : nullptr, J->iso, J->piso, o0 + off, o1 + off)) gok = 0;
+            if (!fibre_gpu_box(t_st.s, t_st.n, so2, n2, R, J->rad + J->guard, cr, cg, J->ring > 0, have_ct ? ct + off : nullptr, J->iso, J->piso, o0 + off, o1 + off)) z0 += n2[0];
+            else if (zs > zmin) zs = zs / 2 > zmin ? zs / 2 : zmin;
+            else gok = 0;
         }
+        if (!gok) { static atomic_int said; if (!atomic_exchange(&said, 1))
+            UFSM_DEFAULTED("fibre labels = the single-threaded CPU raster (the GPU builder failed on a %lld-plane slab of a %lldx%lldx%lld box, "
+                           "even halved: no device memory beside the training plan?); training can stall on it (UFSM_FIBRE_GPU_MVOX smaller, or a smaller P)",
+                           (long long)zs, (long long)n[0], (long long)n[1], (long long)n[2]); }
     }
     if (gok) {
         if (g_fr_timing) fprintf(stderr, "fibre box %lldx%lldx%lld: %ld steps, %.0f ms polylines, %.0f ms CT, %.0f ms GPU\n", (long long)n[0], (long long)n[1], (long long)n[2], t_st.n, (ft1 - ft0) * 1e3, (ft2 - ft1) * 1e3, (fr_t() - ft2) * 1e3);

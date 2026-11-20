@@ -298,7 +298,7 @@ int main(void) {
        gy is checked against the fp32 reference after this loop */
     const uint64_t rs_hg = rs;   /* (the tests below draw the random inputs they drew before this one was added) */
     lp_set_gn_head_exact(0);
-    for (int C = 8; C <= 16; C *= 2) for (int co = 1; co <= 3; co++) for (int sh = 0; sh < 2; sh++) {
+    for (int C = 8; C <= 16; C *= 2) for (int co = 1; co <= 9; co = co == 3 ? 9 : co + 1) for (int sh = 0; sh < 2; sh++) {   /* (9: --single fib) */
         nn_set_tf32(1); nn_set_prec(3); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1);
         const shape5 s = sh ? (shape5){2, C, 6, 10, 14} : (shape5){1, C, 16, 32, 32}, os = {s.n, co, s.d, s.h, s.w};
         const int Gh = C / 4;

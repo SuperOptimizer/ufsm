@@ -554,6 +554,17 @@ static int g_s2b_f4 = -1;
 extern "C" void lp_set_s2b_f4(int on) { g_s2b_f4 = on; }
 static int g_s2b_wide = -1;
 extern "C" void lp_set_s2b_wide(int on) { g_s2b_wide = on; }   /* tests; -1: UFSM_S2B_WIDE */
+/* 1: s2b_f4 takes its tensor-core kernel (the one that copies an overlapping gy into NN_WS_S2BCP) for a cin -> cout stride-2 conv with
+   MX-fp4 gradients: unet_ws_plan sizes the copy for these only (2026-11-20: it planned the largest down conv's whole gy, 0.96 GB at P 768,
+   for nets whose only equal-width down conv is the 16-channel one, which takes s2b_f4q and copies nothing) */
+extern "C" int lp_s2b_gycopy_conv(int cin, int cout) {
+    const int f4 = g_s2b_f4 >= 0 ? g_s2b_f4 : getenv("UFSM_S2B_F4") ? atoi(getenv("UFSM_S2B_F4")) : 3;
+    const int wide = g_s2b_wide >= 0 ? g_s2b_wide : !getenv("UFSM_S2B_WIDE") || atoi(getenv("UFSM_S2B_WIDE")) > 0;
+    const int C = cin, NCH = C / 32;
+    const bool wideC = wide > 0 && C >= 256 && C <= 448 && C % 32 == 0 && NCH != 11 && NCH != 13;
+    if (!f4 || cout != C || (C != 32 && C != 64 && C != 96 && C != 128 && !wideC)) return 0;
+    return !(C >= 64 && (f4 & 2) == 0);
+}
 static int s2b_f4(const void *gy, shape5 ys, const float *w, shape5 xs, void *gx, int accum, int gdt, int xdt, unsigned osr) {
     if (g_s2b_f4 < 0) g_s2b_f4 = getenv("UFSM_S2B_F4") ? atoi(getenv("UFSM_S2B_F4")) : 3;
     const int C = xs.c, NCH = C / 32;

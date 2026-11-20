@@ -57,6 +57,24 @@ device peak before it changes; the s2b gy overlap copy workspace (0.96 GB at P 7
 Not done: level-0 slab rings under lean 2 (the only way to P >= 768 at a 32-wide level 0, +30 % step in October), one window over both cards
 (--split z exists; the ink head refuses it outside --lat 4).
 
+Follow-ups the same day (lead):
+- DEFAULTED lines (src/defaulted.h) for the two silent planner fallbacks that cost two ladder agents an hour: widths that are not a
+  multiple of 32 (or exactly 8 / 16) drop the activation gradients to MX-fp8 (~2x the gradient buffers, no lean level 0, no l3b): the
+  line names each offending width / decoder width; --mem fast's first pass never tries l3b while a no-offload mode fits: the line names
+  the mode taken. test_pipeline_cli's golden run sets UFSM_GRAD_MX4=0 for its default 16,32,64,80 net, so it stays DEFAULTED-free.
+- train --single fib (task unwrap2 --fib-head L): unet cout 9, the fibre head's rows only (H / V masks, the axis dyad, its family) at
+  channels 0-8 of the head slabs; the phase / normal / winding losses and planes off as for ink; header "unwrap" version 3 single fib
+  plus the fib_dir map at 0-8 (predict --heads fib reads it). --init-from maps the donor's "fib_dir" rows (unwrap2 --fib-head, --single
+  fib, or a task surface --fib-dir donor). l3b's head-recomputing GN backward was 1..4 logit channels; it now also takes 9 (a CI 9
+  instantiation: the weights sit in shared memory, the 9 logit values in registers). test_grad_mx4 checks co 9 bit for bit against the
+  two-op path; tests/test_single_fib.sh: lr-0 losses equal the donor layout's and three == four level-0 buffers.
+- The label-plane over-count: the planner counted 4 B (phase) + 4 B (unwrap2 winding / component) + 2 B per aux plane per voxel at any
+  lean; the allocation is one byte per plane and buffer, nbuf buffers (lean: 1). Now counted as allocated (P 704 lean: single ink
+  -0.35 GB, full unwrap2 + ink about -1.7 GB). The old surplus was part of the unexplained 3-5 % margin; inksdk's measured peaks check it.
+- The s2b gy copy workspace is planned only for the down convs that take the copying tensor-core kernel (cin == cout at 32 / 64 / 96 /
+  128 or 256-448 channels, lp_s2b_gycopy_conv). The small nets' only equal-width down conv is 16 -> 16 (s2b_f4q, no copy): -0.96 GB at
+  P 768 for every 1 / 3 / 5 M width set; wind96-style 32 / 64 nets keep it.
+
 ## Occupancy cache for on-the-fly fibre sources: relaunches skip the start-up scan (2026-11-20, branch occcache-20261120, latcodec)
 
 The sampler's draw-cell index (source_occupancy) of a source whose labels are stamped on the fly from fibre polylines reads the level-5
