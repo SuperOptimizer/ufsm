@@ -161,6 +161,7 @@ int cmd_fiber_trace(int argc, char **argv) {
         store *s_ = store_open(argv[phi + 1]); phz = s_ ? z3_open(s_, argv[phi + 2], cache) : nullptr; if (!phz) { fprintf(stderr, "fiber-trace: cannot open the phase %s %s\n", argv[phi + 1], argv[phi + 2]); return 1; }
         shp = argv[phi + 2];
     }
+    const int famdir = opt_atoi("--family-dir", ft_opt(argc, argv, "--family-dir", "0"));
     if (shp) {
         if (!phz) {
             if (!fit_set_load || !fit_set_W || !fit_set_gradW) { fprintf(stderr, "fiber-trace: --sheet is not linked into this binary\n"); return 2; }
@@ -279,7 +280,13 @@ int cmd_fiber_trace(int argc, char **argv) {
                     if (ok && gap > 0 && d2[0] * dsm[0] + d2[1] * dsm[1] + d2[2] * dsm[2] < P.cturn) ok = 0;   /* (resume only where the field agrees) */
                     if (ok && !gap && d2[0] * d[0] + d2[1] * d[1] + d2[2] * d[2] < P.cturn) { why = FT_TURN; break; }
                     if (!ok) {
-                        if ((r == FT_SUP || r == FT_COH || r == FT_OK) && gap < gapk) { gap++; for (int a = 0; a < 3; a++) d2[a] = dsm[a]; ft_inplane(&Q, p, d2); }
+                        if ((r == FT_SUP || r == FT_COH || r == FT_OK) && gap < gapk) { gap++; for (int a = 0; a < 3; a++) d2[a] = dsm[a];
+                            if (famdir && (famf == 'H' || famf == 'V')) {   /* --family-dir: half of the step from the family's in-sheet direction (H: along the sheet, horizontal; V: z in the sheet) */
+                                double g[3], fd[3]; const double m = ft_gW(&Q, p, g);
+                                if (m > 1e-9) { if (famf == 'H') { fd[0] = 0; fd[1] = g[2]; fd[2] = -g[1]; } else { fd[0] = 1; fd[1] = 0; fd[2] = 0; }
+                                    ft_inplane(&Q, p, fd); double c = fd[0] * dsm[0] + fd[1] * dsm[1] + fd[2] * dsm[2], nn = 0; const double sg = c < 0 ? -1 : 1;
+                                    for (int a = 0; a < 3; a++) { d2[a] = 0.5 * dsm[a] + 0.5 * sg * fd[a]; nn += d2[a] * d2[a]; } nn = sqrt(nn); if (nn > 0) for (int a = 0; a < 3; a++) d2[a] /= nn; } }
+                            ft_inplane(&Q, p, d2); }
                         else { why = r ? r : FT_TURN; break; }
                     } else { if (gap) ngap++; gap = 0; }
                 }
