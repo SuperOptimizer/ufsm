@@ -161,7 +161,7 @@ static gpu_state *g_G0;   /* the trainer's per-GPU states (an index for per-GPU 
 static const char *g_lat_fit; static int g_lat_fit_n = 24, g_lat_fit_k;   /* --lat-fit FILE [--lat-fit-n N]: fit the cell transform (latfit.h) on N training windows, write it, exit */
 static int g_lat_guide;   /* --lat-guide 1: the guided head (5 coefficient planes for the 2 side-slot channels; nn_lat_guide) */
 #define LBASE (g_cout <= 16 ? 16 : (g_cout + 15) / 16 * 16)   /* --lat-guide 3: the interpolated base outputs (the task's, rounded up to 16; 16 up to 16 outputs: the old 144-output head) */
-static int g_lat_nsub; static int8_t g_lat_sub[16];   /* --lat-sub (2026-11-19): the outputs with sub-cell rows, in row order (0: the phase pair only) */
+static int g_lat_nsub; static int8_t g_lat_sub[16];   /* mgpu: config. --lat-sub (2026-11-19): the outputs with sub-cell rows, in row order (0: the phase pair only) */
 #define LSUBN (g_lat_nsub ? g_lat_nsub : 2)
 #define LNC (g_lat_guide == 64 ? LBASE + 64 * LSUBN : g_lat_guide == 8 ? 32 : g_cout + g_lat_guide)
 #define LUPC (g_lat_guide == 64 ? g_cout : LNC)
@@ -312,7 +312,7 @@ static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static fl
 static int g_ink_air;   /* --ink-air S (--ink-head, needs the --rv papyrus plane): unlabelled air voxels on the S-voxel window lattice -> ink 0 targets (nn_ink_air) */
 static float g_ink_smooth;   /* --ink-smooth EPS (--ink-head): label smoothing of the ink BCE target, t (1 - eps) + eps / 2 (villa: 0.1) */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
-static float g_contact_w, g_contact_um = 70.f;   /* --contact-weight W [--contact-um U] (rvsub 2026-11-19): rv and fibre H / V masks x W where labelled sheets touch (spacing <= U) */
+static float g_contact_w, g_contact_um = 70.f;   /* mgpu: config. --contact-weight W [--contact-um U] (rvsub 2026-11-19): rv and fibre H / V masks x W where labelled sheets touch (spacing <= U) */
 static int g_dens_code; static float g_packed_w, g_packed_um = 120.f, g_dens_um, g_sheet_lo, g_sheet_hi;   /* --density-um U: x = density_scale rho (U / window um) (physical); --sheet-mask LO,HI */   /* --density-code, --packed-weight, --packed-um (task unwrap) */   /* mgpu: config */
 static inline float dens_scale_win(float um) { return g_dens_um > 0 && um > 0 ? g_dens_scale * g_dens_um / um : g_dens_scale; }   /* the window's density scale: physical with --density-um */
 static float g_ptrunc_tau, g_ptrunc_kappa = 0.5f; static int g_ptrunc_from = 5000, g_ptrunc_on;   /* --phase-trunc TAU [--phase-trunc-conf K] [--phase-trunc-from STEP]: the robust phase loss (nn_phase_trunc), on from STEP */

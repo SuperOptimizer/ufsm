@@ -70,6 +70,7 @@ int cmd_surf_labels(int argc, char **argv);   /* src/surflabels.c */
 int cmd_sheet_score(int argc, char **argv);   /* src/sheetscore.c */
 int cmd_phase_coh(int argc, char **argv);   /* src/phasecoh.c */
 int cmd_patch_solve(int argc, char **argv);   /* src/patchsolve.c */
+int cmd_fill_oracle(int argc, char **argv);   /* src/filloracle.c */
 int cmd_trace_prep(int argc, char **argv);    /* src/tracebox.c */
 int cmd_patch_score(int argc, char **argv);   /* src/tracebox.c */
 int cmd_sheet_trace(int argc, char **argv);   /* src/sheettrace.c */
@@ -257,6 +258,7 @@ static int usage(void) {
         "  ufsm sheet-trace --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A --out DIR [--tol 2] [--step 2]   fast sheet patch tracer: radial peaks linked as height fields r(theta, z)\n"
         "  ufsm patch-score --paths DIR --gt G --box Z0,Y0,X0,NZ,NY,NX --axis A [--sgn S]   traced patches vs GT codes: sheet recall, precision, purity\n"
         "  ufsm patch-solve --paths DIR --prob P --box Z0,Y0,X0,NZ,NY,NX --axis A [--gt G] ..   global turn numbers of traced sheet patches (ray gap votes, exact L1)\n"
+        "  ufsm fill-oracle --fields DIR --model M --codes ROOT KEY --out DIR [--mode fill|shape|ref|..] [--mask gt|mf]   count-constrained fill of merged spans (oracles; wind-score OUT)\n"
         "  ufsm phase-coh <phase-root> <key> <ct-root> <ct-key> <out> --weight T0,T1 [--cell 32]   CT-coherence phase weight of a rendered stored phase (re-gate)\n"
         "  ufsm sheet-score <ours-root> <ours-key> <gt-root> <gt-key> [--tol 1] [--prec-r 8] [--cell 64] [--box ..]   sheet recall / precision / local + global turn consistency of winding code rasters\n"
         "  ufsm surf-labels <wraps-dir|strip.sfc> <out-dir> --axis F --axis-um U0 --dir +-1 --grid-um U --like ROOT KEY   winding codes + pair phase + ignore from .sfc wraps\n"
@@ -291,6 +293,7 @@ static int usage(void) {
         "  ufsm ckpt-avg OUT.ckpt IN1.ckpt IN2.ckpt ... [--arrays ema|both]   uniform weight average of snapshots of one run (optimiser state of the last)\n"
         "  ufsm phase-conflict <a-root> <a-key> <b-root> <b-key> <out>   where two label phase sets disagree (> --tol turn): the sampler's phase ignore mask\n"
         "  ufsm fit-compare <reference-fields> <fields>                      fit fields vs a reference (phase, spacing, normals)\n"
+        "  ufsm fiber-contacts <afv> --map reg.json --boxes B.tsv --names A,B --codes R K --axis U.json   H / V fibre contacts vs GT: same sheet or adjacent (wgraph order test)\n"
         "  ufsm fiber-check <afv> --tr T.json --boxes B.tsv --names A,B --codes R K --phase R K   do published fibre polylines link points of one GT sheet?\n"
         "  ufsm fiber-export <afv> <fields-dir> <out.fib> --tr T.json    fibre polylines in a fit box's coordinates for fit --fibers\n"
         "  ufsm fiber-regscore <afv> (--map reg.json | --tr T.json) --pred ROOT KEY   a scan-to-scan map scored by fibre presence along mapped fibres (per-region residual shifts)\n"
@@ -4872,6 +4875,7 @@ int cmd_strip_flatten(int argc, char **argv);
 int cmd_strip_mosaic(int argc, char **argv);
 int cmd_strip_crop(int argc, char **argv);
 int cmd_fiber_check(int argc, char **argv);    /* src/fibercheck.c */
+int cmd_fiber_contacts(int argc, char **argv);   /* src/fibcontact.c */
 int cmd_fiber_export(int argc, char **argv);   /* src/fibercheck.c */
 int cmd_fiber_regscore(int argc, char **argv);   /* src/fibregscore.c */
 int cmd_fit_phase_box(int argc, char **argv);  /* src/fitphase.c */
@@ -4954,6 +4958,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "strip-crop")) return cmd_strip_crop(argc, argv);
     if (!strcmp(cmd, "fiber-link")) return cmd_fiber_link(argc, argv);
     if (!strcmp(cmd, "fiber-check")) return cmd_fiber_check(argc, argv);
+    if (!strcmp(cmd, "fiber-contacts")) return cmd_fiber_contacts(argc, argv);
     if (!strcmp(cmd, "fiber-export")) return cmd_fiber_export(argc, argv);
     if (!strcmp(cmd, "fiber-regscore")) return cmd_fiber_regscore(argc, argv);
     if (!strcmp(cmd, "fit-phase-box")) return cmd_fit_phase_box(argc, argv);
@@ -5074,6 +5079,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "sheet-score")) return cmd_sheet_score(argc, argv);
     if (!strcmp(cmd, "phase-coh")) return cmd_phase_coh(argc, argv);
     if (!strcmp(cmd, "patch-solve")) return cmd_patch_solve(argc, argv);
+    if (!strcmp(cmd, "fill-oracle")) return cmd_fill_oracle(argc, argv);
     if (!strcmp(cmd, "trace-prep")) return cmd_trace_prep(argc, argv);
     if (!strcmp(cmd, "patch-score")) return cmd_patch_score(argc, argv);
     if (!strcmp(cmd, "sheet-trace")) return cmd_sheet_trace(argc, argv);
