@@ -6,6 +6,48 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Ink sampler: the MIL rays from precomputed face bits and per-tile ray lists, 70 -> 225-250 Mvox/s (2026-11-20, branch inkstore-20261120, fullvram)
+
+The ink ladder's sampler (m3g argv: 6 onfly ink sources, MIL mode 1, P 256, 6 workers, sampler-only, no GPU) spent its time in the
+MIL rays, not the ink plane: the plane came from the derived disk cache (21072 cells from disk, 0 computed). Per window, inkfly_rays read
+every candidate tile's label raster (TIFF LZW, 12 % of the CPU), evaluated the mesh per pixel, and for mode 1 read and decoded a level-L
+CT slab around the window's mesh points (8x a level-2 window's voxels) to run the face search (~40 % of the CPU with the window's own CT).
+
+- Face bits (`rayface.bin`, beside the ink cache's index.bin, same key): per supervised tile 64 x 64 bits, 1 = the pixel's ray has an
+  open face (the voxel target covers it; mode 1 drops it). The face search depends only on the mesh point / normal, the CT and the face
+  config, all in the key, never on the window: the bits are the per-window search's. Built by `ufsm ink-rayface SOURCES` on the CPU
+  (or --gpu): tiles grouped by 128-voxel cell, the search per 64-voxel cell of points with its own box (first by tile batch: 0009B
+  643 s, a batch's box spanned the scroll; by cell 19 s).
+- Ray lists (`rays-s<S>-m<M>.bin`, --rays S, default 2 = --ink-mil-stride): per tile the rays inkfly_rays builds before the window and
+  held-out tests (point double, normal float, label bit; 40 B), so a window gathers its tiles' lists: no label raster, no mesh.
+  Two-pass build (count, then pwrite at the offsets): Paris 4's 8.1 GB never in memory.
+- Both are verified: `--verify N` (12 windows per source): the rays from the bits / lists equal the per-window face search byte for
+  byte, every source. test_ink_mil_train (3): strides 1 and 2 on the fixture, and a mode-1 run's first mil loss equals one with
+  UFSM_INK_RAYFACE=0. UFSM_INK_RAYFACE=0 / UFSM_INK_RAYLIST=0 ignore the files.
+
+| sources | tiles | face build | faced px | lists (s2, m1) | list build |
+|---|---|---|---|---|---|
+| 0009B | 14306 | 19 s | 22.5 M of 50.8 M (44.3 %) | 7.1 M rays, 0.28 GB | 3 s |
+| 0139 | 128005 | 146 s | 296 M of 430 M (68.9 %) | 33.4 M, 1.34 GB | 19 s |
+| 0814 | 2698 | 5 s | 7.3 M of 9.8 M (74.0 %) | 0.64 M, 0.03 GB | 0 s |
+| 1667 | 263602 | 257 s | 573 M of 895 M (64.0 %) | 80.5 M, 3.22 GB | 27 s |
+| MAN5 | 3019 | 2 s | 9.3 M of 11.2 M (83.0 %) | 0.48 M, 0.02 GB | 0 s |
+| Paris4 | 601736 | ~10 min | 1428 M of 2239 M (63.8 %) | 203 M, 8.11 GB | 113 s |
+
+Sampler-only on master d71aee72 + this (trainperf's stratified draw in: 3 rejected of 63), Mvox/s after the first batch:
+| arm | 60 batches | 200 batches (warm) |
+|---|---|---|
+| per-window face search (UFSM_INK_RAYFACE=0 UFSM_INK_RAYLIST=0, = master) | 70.0 | |
+| face bits | 193.6 | 168.7 |
+| face bits + ray lists | 114.9 (cold pages) | 225.1 / 251.2 |
+| MIL off (the ceiling) | 366.8 | |
+Earlier, before the stratified draw (e21b39f2): 18.1 per window, 51.8 MIL mode 0, 65.4 MIL off.
+
+Why a third of the supervised pixels have no face (`--diag 2000` per source: the [1 2 1] CT along the ray over |t| <= 40): the
+face rule's 2-sample air gap after the papyrus run is missing (dense / touching sheets) for 51-87 %, the mesh is off the papyrus by
+more than the run window [-4, 8] (mostly on the -t side) for 6-40 %, papyrus under iso 64 for <= 3 % (a per-source iso would recover
+almost nothing). Those pixels still train through the MIL rays (mode 1's rays are exactly them).
+
 ## Dev-loop speed, part 1: the baseline; the runner starts in 0.2 s, waits cheaply, and -c selects by symbol reach (2026-11-20, branch devspeed-20261120)
 
 **Baseline** on the desk (load 100-107 on 32 threads, two trainers; lowprio, -j 4, mcc 5744025):
