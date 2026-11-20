@@ -109,8 +109,8 @@ int main(void) {
     const pid_t c2 = fork();
     if (c2 == 0) {
         const int fd = open(pout, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) _exit(9); dup2(fd, 1);
-        char *av[] = {"ufsm", "ink-rayface", srcj, "--rays", "0", "--threads", "2", "--profile", "600", "--pvol", pv, "--pout", ptsv, nullptr};
-        const int r = cmd_ink_rayface(13, av); fflush(stdout); _exit(r);
+        char *av[] = {"ufsm", "ink-rayface", srcj, "--rays", "0", "--threads", "2", "--profile", "600", "--per-tile", "64", "--pvol", pv, "--pout", ptsv, nullptr};
+        const int r = cmd_ink_rayface(15, av); fflush(stdout); _exit(r);
     }
     st = 0; waitpid(c2, &st, 0); CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "ink-rayface --profile exit %d", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
     f = fopen(pout, "r"); int seen = 0; char ctm[2][4096] = {"", ""};
@@ -122,10 +122,14 @@ int main(void) {
             seen = 1; CHECK(h[10] + h[11] > 90, "profile: pred peak at t_f + 9 .. 20 in %.1f%% of ink pixels", h[10] + h[11]);
             CHECK(band < 15, "profile: pred mass in the face band %.1f%%", band);
         }
+        { int bt; double ba; char rr[32];
+          if (sscanf(ln, "ink profile auc: pred %31s", rr) == 1 && strstr(ln, "best t ") && sscanf(strstr(ln, "best t "), "best t %d AUC %lf", &bt, &ba) == 2) {
+              if (!strcmp(rr, "face")) { seen |= 2; CHECK(bt >= 10 && bt <= 14 && ba > 0.97, "profile auc: pred face-relative best t %+d AUC %.3f (the layer at t_f + 10 .. 14)", bt, ba); }
+              if (!strcmp(rr, "mesh")) { seen |= 4; CHECK(bt >= 16 && bt <= 20 && ba > 0.97, "profile auc: pred mesh-relative best t %+d AUC %.3f (the layer at 16 .. 20)", bt, ba); } } }
         if (strstr(ln, "ink, face         mean")) { const int k = !strncmp(ln, "ink profile: CT ", 16) ? 0 : strstr(ln, " ctv ") ? 1 : -1; if (k >= 0) snprintf(ctm[k], sizeof ctm[k], "%s", strstr(ln, "mean")); }
     }
     if (f) fclose(f);
-    CHECK(seen, "profile: no pred line");
+    CHECK(seen == 7, "profile: pred lines missing (%d)", seen);
     CHECK(ctm[0][0] && !strcmp(ctm[0], ctm[1]), "profile: the CT as a volume differs from the CT channel");
     snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) {}
     free(X); free(Y); free(Z); free(lab); free(msk); free(ct); free(pr);
