@@ -30,6 +30,21 @@ mkdir -p "$D/locks"; flock -x "$D/locks/gpu0.excl" sleep 300 > /dev/null 2>&1 < 
 check "card held exclusively: exit 3" "$(run f -g 0 -F -W 2 '^t_gpu$')" 3
 check "card held exclusively: BUSY" "$(st f t_gpu)" BUSY
 grep -q 'flock -x' "$D/out.f/logs/t_gpu.log" && echo "ok: the holder is named" || { echo "FAIL: no holder in the log"; cat "$D/out.f/logs/t_gpu.log"; fails=$((fails + 1)); }
+# -J: a passing GPU test's MCUDA_KLOG list is stored; the next -J run warms the union first (a mock ufsm records its environment)
+# and the GPU test starts only after it
+mkdir -p "$D/bin" "$D/klog"
+printf '#!/bin/sh\necho "$MCUDA_PRECOMPILE $MCUDA_PRECOMPILE_ONLY" > %s/warm.env; cat "${MCUDA_PRECOMPILE_ONLY#@}" >> %s/warm.env; sleep 1; date +%%s.%%N > %s/warm.t\n' "$D" "$D" "$D" > "$D/bin/ufsm"
+chmod +x "$D/bin/ufsm"
+cat > "$D/mj.txt" <<'EOF'
+t_kg    | gpu   | 1 | echo k_b >> "$MCUDA_KLOG"; echo k_a >> "$MCUDA_KLOG"; date +%s.%N > "$UFSM_TEST_TMP/../../t_kg.t"
+EOF
+jrun() { SUITE_MANIFEST=$D/mj.txt SUITE_LOCK_DIR=$D/locks SUITE_KLOG_DIR=$D/klog timeout 120 "$R" -o "$D/out.$1" -B "$D/bin" -g 0 -F "${@:2}" > "$D/log.$1" 2>&1; echo $?; }
+pkill -P "$LP" 2> /dev/null; kill "$LP" 2> /dev/null; LP=
+check "-J without lists: runs as before" "$(jrun j1 -J 2)" 0
+check "the passing GPU test's kernel list is stored" "$(tr '\n' ' ' < "$D/klog/t_kg" 2> /dev/null)" "k_a k_b "
+check "-J with a list: exit 0" "$(jrun j2 -J 3)" 0
+check "the warm-up got N and the list" "$(head -1 "$D/warm.env" 2> /dev/null | cut -d' ' -f1); $(tail -n +2 "$D/warm.env" 2> /dev/null | tr '\n' ' ')" "3; k_a k_b "
+check "the GPU test started after the warm-up" "$(awk 'NR == FNR {w = $1; next} {print ($1 > w) ? "after" : "before"}' "$D/warm.t" "$D/out.j2/t_kg.t" 2> /dev/null)" after
 # -c's map (tests/srcdeps.awk): a binary depends on the files of the objects its own objects reach through symbols (strong and weak
 # references), constructor objects included; a linked but unreferenced object (b.o) and files outside the repo do not count
 got=$(awk -v R=/r/ -f "$H/tests/srcdeps.awk" <<'EOF' | sort | tr '\n' ' '

@@ -21,6 +21,12 @@
 #     -I        incomplete is fine: exit 0 instead of 3 when GPU tests were not run (the edit loop; never a merge gate)
 #     -P        profile: strace marks the tests that open /dev/nvidia* (gpu column "+nv"), nvidia-smi samples their GPU memory
 #     -l        list the selected tests and exit
+#     -J N      JIT warm-up first: the kernels the selected GPU tests loaded when they last passed (per-test lists in $SUITE_KLOG_DIR,
+#               default ~/.cache/ufsm-suite/klog, recorded by every GPU test through mcudahw's MCUDA_KLOG) are compiled N at a time by
+#               one process (MCUDA_PRECOMPILE=N, MCUDA_PRECOMPILE_ONLY=@list) before any GPU test starts; CPU tests run meanwhile.
+#               After a pin move or a kernel edit the tests otherwise JIT inside their timeouts, each kernel once per process that
+#               launches it (test_flatten_gpu: 427 s cold vs 22 s warm). Needs an mcudahw with KLOG (microc jitorder-20261120 151dc28+;
+#               an older one ignores both variables). A test without a list JITs lazily as before.
 # Manifest lines: NAME | TAGS | EST_SECONDS | COMMAND   (bash, run from the repo root, $B = the build dir; # comments)
 #   tags: gpu (takes a GPU lock, CUDA_VISIBLE_DEVICES = that GPU), gpu2 (both GPUs when there are two), slow (test-slow tier),
 #   flaky (a failure is retried once and reported FLAKY when the retry passes), solo (runs with nothing else in this suite).
@@ -42,8 +48,9 @@ set -u
 H=$(cd "$(dirname "$0")/.." && pwd); cd "$H" || exit 2
 MANIFEST=${SUITE_MANIFEST:-$H/tests/suite.txt}
 TIER=fast; CHANGED=; J=${SUITE_J:-}; T=${SUITE_THREADS:-}; BDIR=build-verify; OUT=; GPUS=; GSLOTS=${SUITE_GPU_SLOTS:-}; TO=1800; PROF=0; LIST=0
-LWAIT=${SUITE_LOCK_WAIT:-300}; NOFOREIGN=0; INCOK=0
-while getopts "t:c:j:T:B:o:g:G:x:W:FIPlh" o; do case $o in
+LWAIT=${SUITE_LOCK_WAIT:-300}; NOFOREIGN=0; INCOK=0; WARM=0; KLOGD=${SUITE_KLOG_DIR:-$HOME/.cache/ufsm-suite/klog}
+while getopts "t:c:j:T:B:o:g:G:x:W:J:FIPlh" o; do case $o in
+  J) WARM=$OPTARG;;
   t) TIER=$OPTARG;; c) CHANGED=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; B) BDIR=$OPTARG;; o) OUT=$OPTARG;; g) GPUS=$OPTARG;; G) GSLOTS=$OPTARG;;
   x) TO=$OPTARG;; W) LWAIT=$OPTARG;; F) NOFOREIGN=1;; I) INCOK=1;; P) PROF=1;; l) LIST=1;; *) sed -n '2,40p' "$0"; exit 2;; esac; done
 shift $((OPTIND - 1)); FILTERS=("$@")
@@ -178,6 +185,17 @@ OUT=$(cd "$OUT" && pwd)
 # a card another run in this OUT gave up on (busy.<i>) is not this run's: a reused -o OUT kept the marker and every GPU test of the rerun
 # reported BUSY at once, -W notwithstanding (merge3 11-15: 201 BUSY after 1 s); the results of the earlier run are overwritten anyway
 rm -f -- "$OUT"/busy.*
+# -J N: one warm-up process ahead of the GPU tests (they wait for it; CPU tests do not), over the union of their recorded kernel lists
+WARMING=0
+if [ "$WARM" -gt 0 ] && [ $NG -gt 0 ] && [ -x "$BDIR/ufsm" ]; then
+  wl=(); for n in "${NAMES[@]}"; do isgpu "$n" && [ -s "$KLOGD/$n" ] && wl+=("$KLOGD/$n"); done
+  if [ ${#wl[@]} -gt 0 ]; then
+    sort -u "${wl[@]}" > "$OUT/warm.list"
+    n=_jitwarm; TAGS[$n]=gpu; EST[$n]=3600; CMD[$n]="MCUDA_PRECOMPILE=$WARM MCUDA_PRECOMPILE_ONLY=@$OUT/warm.list $(cd "$BDIR" && pwd)/ufsm sysinfo"
+    NAMES=("$n" "${NAMES[@]}"); QUEUE=("$n" "${QUEUE[@]}"); WARMING=1
+    echo "run_suite: -J $WARM: warming $(wc -l < "$OUT/warm.list") kernels of ${#wl[@]} GPU tests first"
+  fi
+fi
 TIMEBIN=; [ -x /usr/bin/time ] && TIMEBIN=/usr/bin/time
 # a test binary in the build dir that no manifest line runs (a merge that added a test to tests/targets.cmake only): say so
 declare -A MWORD; while read -r w; do MWORD[$w]=1; done < <(grep -oE '[A-Za-z0-9_]+' "$MANIFEST" | sort -u)   # (one grep, not one per binary)
@@ -296,6 +314,7 @@ run_one() {
       # test_attn, test_attn_ray / _dfm, test_spiralfit, test_countfield, test_mesh_phase ran untagged on GPUs held by training runs)
       if [ -n "$g" ]; then export CUDA_VISIBLE_DEVICES=$g; else export CUDA_VISIBLE_DEVICES=; fi
       [ -n "$lg" ] && export UFSM_TEST_GPUS=$lg      # (an l2 test on one card: two logical devices)
+      [ -n "$g" ] && [ "$n" != _jitwarm ] && export MCUDA_KLOG="$OUT/tmp/$n.klog"   # (the kernels it loads: -J's lists)
       echo $BASHPID > "$OUT/tmp/$n.pid"
       echo "# $n [${TAGS[$n]}] attempt $a gpu=${g:--} $(date '+%F %T') on $(hostname)"; echo "# $cm"
       if [ -n "$TIMEBIN" ]; then exec $TIMEBIN -f '%e %U %S %M' -o "$OUT/tmp/$n.time" timeout -k 20 "$to" "${pre[@]}" bash -c "$cm"
@@ -322,6 +341,11 @@ run_one() {
   done
   if [ $PROF = 1 ] && [ -f "$OUT/tmp/$n.strace" ]; then grep -q '/dev/nvidia' "$OUT/tmp/$n.strace" && g="${g:-}+nv"; rm -f "$OUT/tmp/$n.strace"; fi
   rm -f "$OUT/tmp/$n.pid"
+  if [ -s "$OUT/tmp/$n.klog" ]; then   # a passing GPU test's kernel list replaces its old one (-J)
+    local kt="$KLOGD/$n.$BASHPID"   # (not $BASHPID in the redirect: that expands in sort's forked child)
+    { [ $st = PASS ] || [ $st = FLAKY ]; } && mkdir -p "$KLOGD" && sort -u "$OUT/tmp/$n.klog" > "$kt" && mv -f "$kt" "$KLOGD/$n"
+    rm -f "$OUT/tmp/$n.klog"
+  fi
   for fd in "${fds[@]}"; do exec {fd}>&-; done
   rm -f "$OUT/slots.$BASHPID"
   [ $rc = 0 ] && rm -rf -- "$tmp"
@@ -332,7 +356,7 @@ run_one() {
 declare -A PNAME PGPU; RUN=0; GBUSY=0; SOLO=0; DONE=0; TOT=${#QUEUE[@]}; T0=$(date +%s)
 finish() {
   local p=$1 n=${PNAME[$1]} r; r=$(cat "$OUT/res/$n" 2> /dev/null || echo "FAIL ? 0 0 0 0 - 1")
-  RUN=$((RUN - 1)); [ "${PGPU[$p]}" = 1 ] && GBUSY=$((GBUSY - 1)); hastag "$n" solo && SOLO=0; DONE=$((DONE + 1))
+  RUN=$((RUN - 1)); [ "${PGPU[$p]}" = 1 ] && GBUSY=$((GBUSY - 1)); hastag "$n" solo && SOLO=0; DONE=$((DONE + 1)); [ "$n" = _jitwarm ] && WARMING=0
   unset "PNAME[$p]" "PGPU[$p]"
   set -- $r; printf '[%3d/%d %5ds] %-7s %7.1fs  %s\n' $DONE $TOT $(( $(date +%s) - T0 )) "$1" "$3" "$n"
 }
@@ -351,6 +375,7 @@ while [ ${#QUEUE[@]} -gt 0 ] || [ $RUN -gt 0 ]; do
         [ $NG = 1 ] && hastag "$n" gpu2 && ! hastag "$n" l2 && nr="NEED2 a gpu2 test without the l2 tag, one GPU here"
         if [ -n "$nr" ]; then echo "${nr%% *} 0 0 0 0 0 - 0" > "$OUT/res/$n"; echo "# not run: ${nr#* }" > "$OUT/logs/$n.log"
           unset "QUEUE[$i]"; QUEUE=("${QUEUE[@]}"); DONE=$((DONE + 1)); printf '[%3d/%d] %-7s (%s)  %s\n' $DONE $TOT "${nr%% *}" "${nr#* }" "$n"; started=1; break; fi
+        [ $WARMING = 1 ] && [ "$n" != _jitwarm ] && continue
         [ $GBUSY -ge $GCAP ] && continue
       fi
       if hastag "$n" solo; then [ $RUN -gt 0 ] && continue; SOLO=1; fi
