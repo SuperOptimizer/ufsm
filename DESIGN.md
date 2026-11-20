@@ -27,6 +27,17 @@ test_ink_wrapscore: a synthetic segment, two wraps, maps: n and AUC per split = 
 The predict stays the cost: fr1k-h16's tile run was 592 windows in 13.5 min on the shared card 1 (~1.4 s a window, one predict
 setup per box).
 
+Part 2, the FAST score (score.sh FAST=1): `predict --tile-list FILE` runs one predict over the box with every shard outside the
+listed 512 tiles skipped as air (one pipelined plan instead of --boxes' per-box runs; test_predict_boxes: the listed shards equal the
+whole-box run's), latink uses it for LATINK_TILES (LATINK_TILELIST=0: the --boxes runs); `ink-blend --tile-list` blends only the
+scored grid-0 shards, level 0 only (LATINK_BLEND_X); then ink-wrapscore --vmap. 1667 on the shared card 1 (a trainer beside it), from the
+score lock to the tsv:
+| net | windows (grid 0 + 256) | predict | blend | wrapscore | total | heldout AUC (old path) |
+|---|---|---|---|---|---|---|
+| h1-3000 (small) | 131 + 125 | 32 + 31 s | 29 s | 19 s | 1 min 52 s | 0.5222 (0.5222) |
+| fr1-1000 (10.7 M) | 131 + 125 | 73 + 71 s | 28 s | 20 s | 3 min 14 s | 0.5094 (0.5094) |
+The old path: ~14 min predict + ~2 min renders + 15-30 min pairwrap.
+
 ## Ink sampler: the MIL rays from precomputed face bits and per-tile ray lists, 70 -> 225-250 Mvox/s (2026-11-20, branch inkstore-20261120, fullvram)
 
 The ink ladder's sampler (m3g argv: 6 onfly ink sources, MIL mode 1, P 256, 6 workers, sampler-only, no GPU) spent its time in the
