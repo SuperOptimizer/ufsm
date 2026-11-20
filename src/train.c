@@ -1569,6 +1569,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                       *const fib = g_aux_of[AUX_FIB] >= 0 ? apl[g_aux_of[AUX_FIB]] : nullptr;   /* the registry's planes by role */
         const int q0 = z0 / 4 - 1, qc = Z / 4 + 2, qa = q0 > 0 ? q0 : 0, qb = z1 / 4 + 1 < D / 4 ? z1 / 4 + 1 : D / 4;   /* g_lat_hs: the cell planes [qa, qb) this slab reads / adds to; the rolling buffers start at plane q0 */
         if (g_lat_hs) {
+            if (g_lat_dec) unet_set_latdec_range(d->u, z0 / 4, (z1 + 3) / 4);   /* (the decoder on the slab's own cells: the sub-cell rows are read per voxel there only) */
             if (unet_head_fwd_z(d->u, qa, qb, d->lgc)) { fprintf(stderr, "latent head stream: the head is not covered per slab (UFSM_LAT_HEAD_STREAM=0)\n"); abort(); }
             if (!pass && getenv("UFSM_LGC_DUMP")) {   /* diagnostic: the first statistics pass's cell logits per slab, appended: int32 qa, qb (local cells), fp16 [LNC][qb - qa][plane] */
                 static thread_local int dn_[3];   /* mgpu: debug (per thread; DP threads share side -1 and its file: use one GPU or --split for this dump) */

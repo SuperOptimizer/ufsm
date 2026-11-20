@@ -20,19 +20,19 @@ int main(int argc, char **argv) {
     float *p = nn_malloc(np * 4); nn_h2d(p, hf, np * 4);
     float *bas = nn_malloc(64 * 64 * 4), *gain = nn_malloc(64 * 4); for (int i = 0; i < 64 * 64; i++) hf[i] = 0.1f * RND(); nn_h2d(bas, hf, 64 * 64 * 4); for (int i = 0; i < 64; i++) hf[i] = 1.f; nn_h2d(gain, hf, 64 * 4);
     void *x = nn_malloc(nx * 2); { float *d = nn_malloc(nx * 4); for (size_t i = 0; i < nx; i++) hf[i] = RND(); nn_h2d(d, hf, nx * 4); nn_f32_to_h16(d, nx, x, 1.f); nn_free(d); }
-    float *L = nn_malloc((size_t)Cl * (qf + 2) * pl * 4);
+    void *L = nn_malloc((size_t)Cl * (qf + 2) * pl * 2);
     void *rows = nn_malloc((size_t)(no + Hd) * nf * 2), *pre = nn_malloc((size_t)Hd * nf * 2); nn_zero(rows, (size_t)(no + Hd) * nf * 2); nn_zero(pre, (size_t)Hd * nf * 2);
     float *gp = nn_malloc(np * 4); nn_zero(gp, np * 4);
     void *scr = nn_malloc(nn_latdec_scratch(nb, Hd, Cl, NG));
     double tc = 1e9, tf = 1e9, tb = 1e9;
     for (int r = 0; r < 5; r++) {
         double t = now(); nn_latdec_cells(x, D, 4 * c, 4 * c, 1, qf + 2, Cl == 64 ? nullptr : bas, gain, Cl, Cl == 64 ? 0.f : 0.25f, L); nn_sync(); if (now() - t < tc) tc = now() - t;
-        t = now(); if (nn_latdec_fwd(rows, 0, nf, pre, 0, nf, L, qf, c, c, p, Hd, Cl, NG)) { fprintf(stderr, "fwd refused\n"); return 1; } nn_sync(); if (now() - t < tf) tf = now() - t;
+        t = now(); if (nn_latdec_fwd(rows, 0, nf, pre, 0, nb, L, qb, c, c, p, Hd, Cl, NG)) { fprintf(stderr, "fwd refused\n"); return 1; } nn_sync(); if (now() - t < tf) tf = now() - t;
         t = now(); if (nn_latdec_bwd(rows, nb, (char *)rows + (size_t)no * nb * 2, pre, nb, L, qb, c, c, p, Hd, Cl, NG, gp, scr)) { fprintf(stderr, "bwd refused\n"); return 1; } nn_sync(); if (now() - t < tb) tb = now() - t;
     }
     const int ns = P / Z;
     const double win = ns * (3 * tc + 2 * tf + tb);
-    printf("bench_latdec P %d Z %d H %d Cl %d ng %d: per slab cells %.3f ms, fwd (%d planes) %.3f ms, bwd (%d planes) %.3f ms; per window (%d slabs, 3 cells + 2 fwd + 1 bwd) %.1f ms; "
-           "scratch %.1f MB, L %.1f MB\n", P, Z, Hd, Cl, NG, tc * 1e3, qf, tf * 1e3, qb, tb * 1e3, ns, win * 1e3, nn_latdec_scratch(nb, Hd, Cl, NG) / 1e6, (double)Cl * (qf + 2) * pl * 4 / 1e6);
+    printf("bench_latdec P %d Z %d H %d Cl %d ng %d: per slab cells %.3f ms, fwd (%d own planes) %.3f ms, bwd (%d planes) %.3f ms; per window (%d slabs, 3 cells + 2 fwd + 1 bwd) %.1f ms; "
+           "scratch %.1f MB, L %.1f MB\n", P, Z, Hd, Cl, NG, tc * 1e3, qb, tf * 1e3, qb, tb * 1e3, ns, win * 1e3, nn_latdec_scratch(nb, Hd, Cl, NG) / 1e6, (double)Cl * (qf + 2) * pl * 4 / 1e6);
     return 0;
 }

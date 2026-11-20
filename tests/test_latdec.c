@@ -1,12 +1,13 @@
 /* nn_latdec_cells / nn_latdec_fwd / nn_latdec_bwd (the learned sub-cell decoder, unet_cfg.lat_dec) against a double host reference on a 12 x 8 x 160
    fp16 window (3 x 2 x 40 cells: two 32-cell row tiles, every face of the 3^3 neighbourhood clipped somewhere), for Hd 16 / 32 / 64, Cl 29
    (a random basis, step 0.25) and raw (Cl 64), 2 sub-cell groups (128 rows) and 7 (--lat-sub rv,fib,ink: 448 rows):
-   - the latent cells: quantised as input_latc_k (a rounding tie may flip one step: at most 0.2 % of the values);
+   - the latent cells (fp16): quantised as input_latc_k (a rounding tie may flip one step: at most 0.2 % of the values);
    - forward, fp16 and fp32 rows / pre rows: rows += W2 silu(pre + B * L) to fp16 rounding;
    - W2 = 0: the rows byte-identical (+-0 kept: a zero term is never added);
    - backward: the pre rows' gradient (fp16) and B / W2's gradients against the reference's analytic ones, which are checked by central
      differences on a few entries; the head plane scale (nn_set_head_gscale 4) divides the parameter gradients exactly;
-   - two runs bit-identical (no atomics). Usage: test_latdec */
+   - two runs bit-identical (no atomics). The tensor-core path by default (fp16 operands: tolerances 1e-3 forward fp32 rows, 6e-3 gradients),
+     UFSM_LATDEC_FFMA=1 the fp32 FFMA kernels (1e-4, 1e-3). Usage: test_latdec */
 #include "nn.h"
 #include <math.h>
 #include <stdint.h>
@@ -19,6 +20,7 @@ static double rnd(uint64_t *s) { *s = *s * 6364136223846793005ull + 144269504088
 static float h2f(uint16_t v) { _Float16 f; memcpy(&f, &v, 2); return (float)f; }
 static uint16_t f2h(float v) { _Float16 f = (_Float16)v; uint16_t r; memcpy(&r, &f, 2); return r; }
 static int fails;
+static double TF = 1e-3, TG = 6e-3;   /* the tensor-core path (fp16 operands, fp32 sums); UFSM_LATDEC_FFMA=1 (fp32 throughout): 1e-4, 1e-3 */
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fprintf(stderr, "\n"); fails++; } } while (0)
 enum { NC = d * h * w };
 /* L as a (planes -1 .. d) x h x w field: Lp(c, q, y, x), zero outside */
@@ -45,12 +47,12 @@ static void run(int Hd, int raw, int ng, uint64_t seed) {
     for (size_t i = 0; i < V; i++) x[i] = f2h((float)(4 * rnd(&s)));
     for (int i = 0; i < 29 * 64; i++) bas[i] = (float)(0.25 * rnd(&s));
     for (int c = 0; c < 29; c++) gain[c] = (float)(0.5 + rnd(&s));
-    void *xd = nn_malloc(V * 2); float *basd = nn_malloc(29 * 64 * 4), *gaind = nn_malloc(29 * 4), *Ld = nn_malloc(nL * 4);
+    void *xd = nn_malloc(V * 2); float *basd = nn_malloc(29 * 64 * 4), *gaind = nn_malloc(29 * 4), *Ld = nn_malloc(nL * 2);
     nn_h2d(xd, x, V * 2); nn_h2d(basd, bas, 29 * 64 * 4); nn_h2d(gaind, gain, 29 * 4);
     /* the latent cells, planes -1 .. d */
     const float step = 0.25f;
     nn_latdec_cells(xd, D, H, W, -1, d + 2, raw ? nullptr : basd, gaind, Cl, raw ? 0.f : step, Ld);
-    float *L = malloc(nL * 4); nn_sync(); nn_d2h(L, Ld, nL * 4);
+    float *L = malloc(nL * 4); { uint16_t *t = malloc(nL * 2); nn_sync(); nn_d2h(t, Ld, nL * 2); for (size_t i = 0; i < nL; i++) L[i] = h2f(t[i]); free(t); }   /* (fp16 cells) */
     size_t flip = 0, bad = 0;
     for (int c = 0; c < Cl; c++) for (int q = -1; q <= d; q++) for (int yy = 0; yy < h; yy++) for (int xx = 0; xx < w; xx++) {
         double r = 0;
@@ -61,7 +63,7 @@ static void run(int Hd, int raw, int ng, uint64_t seed) {
                    const double lim = c ? 127 : 32767; t = fmin(lim, fmax(-lim, rint(t / step))) * step; r = t * gain[c]; }
         }
         const double g = Lv(L, c, q, yy, xx), e = fabs(g - r);
-        if (e > 1e-5 * (1 + fabs(r))) { if (!raw && fabs(e - step * gain[c]) < 1e-4) flip++; else bad++; }
+        if (e > 1e-3 * (1 + fabs(r))) { if (!raw && fabs(e - step * gain[c]) < 2e-3 * (1 + fabs(r))) flip++; else bad++; }   /* (fp16: 2^-11 relative) */
     }
     CHECK(bad == 0 && flip * 500 <= nL, "Hd %d raw %d: latent cells: %zu wrong, %zu quantiser flips of %zu", Hd, raw, bad, flip, nL);
     /* parameters, rows, pre rows, the rows' gradient */
@@ -87,7 +89,7 @@ static void run(int Hd, int raw, int ng, uint64_t seed) {
         double me = 0; size_t nb = 0;
         if (r32) nn_d2h(rf, rd, (size_t)NO * NC * 4); else { uint16_t *t = malloc((size_t)NO * NC * 2); nn_d2h(t, rd, (size_t)NO * NC * 2); for (size_t i = 0; i < (size_t)NO * NC; i++) rf[i] = h2f(t[i]); free(t); }
         for (size_t i = 0; i < (size_t)NO * NC; i++) {
-            const double r = h2f(rows[i]) + y[i], e = fabs(rf[i] - r), tol = r32 ? 1e-4 * (1 + fabs(r)) : 2e-3 * (1 + fabs(r));
+            const double r = h2f(rows[i]) + y[i], e = fabs(rf[i] - r), tol = r32 ? TF * (1 + fabs(r)) : 2e-3 * (1 + fabs(r));
             if (e > me) me = e; nb += e > tol;
         }
         CHECK(nb == 0, "Hd %d raw %d: forward r32 %d p32 %d: %zu values off, max |e| %.3g", Hd, raw, r32, p32, nb, me);
@@ -142,8 +144,8 @@ static void run(int Hd, int raw, int ng, uint64_t seed) {
     double mg = 0, mgB = 0, mgW = 0; size_t nbp = 0, nbB = 0, nbW = 0;
     for (size_t i = 0; i < (size_t)Hd * NC; i++) { const double e = fabs(h2f(gp1[i]) - gpre[i]); if (e > mg) mg = e; nbp += e > 2e-3 * (1 + fabs(gpre[i])); }
     double sB = 0, sW = 0; for (size_t i = 0; i < nB; i++) sB += fabs(gB[i]); for (size_t i = 0; i < nW2; i++) sW += fabs(gW[i]); sB /= nB; sW /= nW2;
-    for (size_t i = 0; i < nB; i++) { const double e = fabs(g1[i] - gB[i]); if (e > mgB) mgB = e; nbB += e > 1e-3 * (sB + fabs(gB[i])); }
-    for (size_t i = 0; i < nW2; i++) { const double e = fabs(g1[nB + i] - gW[i]); if (e > mgW) mgW = e; nbW += e > 1e-3 * (sW + fabs(gW[i])); }
+    for (size_t i = 0; i < nB; i++) { const double e = fabs(g1[i] - gB[i]); if (e > mgB) mgB = e; nbB += e > TG * (sB + fabs(gB[i])); }
+    for (size_t i = 0; i < nW2; i++) { const double e = fabs(g1[nB + i] - gW[i]); if (e > mgW) mgW = e; nbW += e > TG * (sW + fabs(gW[i])); }
     CHECK(nbp == 0 && nbB == 0 && nbW == 0, "Hd %d raw %d: backward: pre %zu off (max %.3g), B %zu off (max %.3g, mean |g| %.3g), W2 %zu off (max %.3g, mean |g| %.3g)", Hd, raw, nbp, mg, nbB, mgB, sB, nbW, mgW, sW);
     printf("test_latdec: Hd %2d Cl %2d ng %d: forward ok, W2 0 identical, backward max |e| pre %.2g B %.2g W2 %.2g, latent flips %zu\n", Hd, Cl, NG, mg, mgB, mgW, flip);
     nn_free(xd); nn_free(basd); nn_free(gaind); nn_free(Ld); nn_free(pd); nn_free(rd); nn_free(prd); nn_free(gyd_); nn_free(gpd); nn_free(scr);
@@ -152,6 +154,7 @@ static void run(int Hd, int raw, int ng, uint64_t seed) {
 }
 int main(void) {
     nn_init(0);
+    if (getenv("UFSM_LATDEC_FFMA") && atoi(getenv("UFSM_LATDEC_FFMA"))) { TF = 1e-4; TG = 1e-3; }
     run(16, 0, 2, 1); run(32, 0, 2, 2); run(64, 0, 2, 3); run(64, 1, 2, 4); run(32, 0, 7, 5);   /* (7: phase + rv + fibre + ink, 448 rows: the gradient in 4 chunks) */
     if (fails) { fprintf(stderr, "test_latdec: %d failures\n", fails); return 1; }
     printf("test_latdec: ok\n");

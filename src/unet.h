@@ -148,6 +148,8 @@ void unet_set_cond(unet *u, float c);
 void unet_set_film(unet *u, const float *codes, int k);
 size_t unet_fstem_off(const unet *u);
 size_t unet_latdec_off(const unet *u);   /* cfg.lat_dec: its parameter block (A, a, B, W2) */
+void unet_set_latdec_range(unet *u, int a, int b);   /* cfg.lat_dec: the next unet_head_fwd_z decodes only cell planes [a, b) of its range (the trainer's head slab: its own planes, not the
+                                                       halo planes the upsampling reads; their sub-cell rows are never read there) */
 void unet_set_latdec_ct(unet *u, const void *x16, int D, int H, int W);   /* cfg.lat_dec: the fp16 CT window (4x the cell grid) the decoder reads from now on (predict: its forward takes cell inputs); default: the training forward's input */
 int unet_fstem_reset(unet *u, uint64_t seed);   /* the fine stem as unet_init leaves it (W1 He from seed, b1 and the projection W2 0: neutral), its optimizer state and EMA zeroed / reset; 0 ok */   /* cfg.fstem: the stem's parameters (W1, b1, W2) in the flat parameters */
 void unet_free(unet *u);

@@ -509,11 +509,11 @@ void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
    fwd: rows (o * ld + n, o < 64 ng, n over nq planes of h x w cells) += W2 silu(pre + B * L) (pre: Hd rows, stride ldp; L: nq + 2 planes from
    the plane before), fp16 or fp32 (r32 / p32); p = B [Cl][27][Hd], W2 [64 ng][Hd]. bwd: from gy16 (the rows' fp16 gradient, stride ldg) the
    pre rows' gradient into gpre16 (fp16, stride ldg) and B / W2's gradients added to gp (deterministic sums; x 1 / the head plane scale).
-   1: a shape the kernels do not take (Hd 16 / 32 / 64, Cl <= 64, ng <= 16) */
-void nn_latdec_cells(const void *x16, int D, int H, int W, int q0, int nq, const float *bas, const float *gain, int Cl, float step, float *L);
-int nn_latdec_fwd(void *rows, int r32, size_t ld, const void *pre, int p32, size_t ldp, const float *L, int nq, int h, int w, const float *p, int Hd, int Cl, int ng);
+   L is fp16 [Cl][planes][h][w]. 1: a shape the kernels do not take (Hd 16 / 32 / 64, Cl <= 64, ng <= 16) */
+void nn_latdec_cells(const void *x16, int D, int H, int W, int q0, int nq, const float *bas, const float *gain, int Cl, float step, void *L);   /* L fp16 */
+int nn_latdec_fwd(void *rows, int r32, size_t ld, const void *pre, int p32, size_t ldp, const void *L, int nq, int h, int w, const float *p, int Hd, int Cl, int ng);
 size_t nn_latdec_scratch(size_t N, int Hd, int Cl, int ng);
-int nn_latdec_bwd(const void *gy16, size_t ldg, void *gpre16, const void *pre16, size_t ldp, const float *L, int nq, int h, int w, const float *p,
+int nn_latdec_bwd(const void *gy16, size_t ldg, void *gpre16, const void *pre16, size_t ldp, const void *L, int nq, int h, int w, const float *p,
                   int Hd, int Cl, int ng, float *gp, void *scratch);
 /* the fine voxel stem (src/nn_fstem.cu, train --fstem): params W1 [C][64] (4^3 taps at stride 2), b1 [C], W2 [nout][C]; fwd adds W2 silu(W1 x + b1)
    to the fp16 logit planes chs[o] (slab planes [z0, z0 + nz) of a D x H x W window, ns voxels a plane) on each 2^3 block; bwd accumulates the

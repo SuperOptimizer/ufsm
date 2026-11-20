@@ -127,7 +127,7 @@ struct unet {
     void *l0r_hsk; size_t l0r_hskn;    /* the skip gradient's pinned host copy (stage S4's host mode: the device holds a ring) */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
     size_t gf_off; float *gf_g, *gf_g1, *gf_dg; int gf_K, gf_top, gf_dedup; void (*gf_red)(void *, float *, int); void *gf_redc;   /* cfg.gfilm: its A / B block (last), the pooled code vector, the affines before it, dg */
-    size_t ld_off; const void *ld_x; int ld_D, ld_H, ld_W, ld_ext; void *ld_pre, *ld_sc; float *ld_L, *ld_wc, *ld_gwc; size_t ld_pre_n, ld_sc_n, ld_L_n;   /* cfg.lat_dec: params, the forward's CT, scratch */
+    size_t ld_off; const void *ld_x; int ld_D, ld_H, ld_W, ld_ext, ld_ra, ld_rb; void *ld_pre, *ld_sc; float *ld_L, *ld_wc, *ld_gwc; size_t ld_pre_n, ld_sc_n, ld_L_n;   /* cfg.lat_dec: params, the forward's CT, scratch */
     size_t film_off, fstem_off; float film_c[4]; float *ffw;   /* cfg.film: the first A / D pair, the current codes, the forward copy of the weights (when nothing else copies them) */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
@@ -3130,7 +3130,7 @@ static int latdec_inputs(unet *u, int z0, int z1, int p32) {
     const size_t hw = (size_t)u->ls[0].h * u->ls[0].w, nv = (size_t)(z1 - z0) * hw;
     if (!u->ld_x || u->ld_D != 4 * u->ls[0].d || u->ld_H != 4 * u->ls[0].h || u->ld_W != 4 * u->ls[0].w) { fprintf(stderr, "unet: lat_dec needs the forward's fp16 CT channel (x_h16) at 4x the cell grid\n"); return -1; }
     if (!u->cfg.lat_dec_raw && u->lat_C != Cl) { fprintf(stderr, "unet: lat_dec reads %d latent coefficients, the transform has %d\n", Cl, u->lat_C); return -1; }
-    ld_grow((void **)&u->ld_L, &u->ld_L_n, (size_t)Cl * (z1 - z0 + 2) * hw * 4);
+    ld_grow((void **)&u->ld_L, &u->ld_L_n, (size_t)Cl * (z1 - z0 + 2) * hw * 2);   /* (fp16) */
     ld_grow(&u->ld_pre, &u->ld_pre_n, (size_t)H * nv * (p32 ? 4 : 2));
     nn_latdec_cells(u->ld_x, u->ld_D, u->ld_H, u->ld_W, z0 - 1, z1 - z0 + 2, u->cfg.lat_dec_raw ? nullptr : u->lat_bas, u->lat_gain, Cl,
                     u->cfg.lat_dec_raw ? 0.f : u->lat_run_step > 0.f ? u->lat_run_step : u->lat_step, u->ld_L);
@@ -3159,12 +3159,15 @@ int unet_head_fwd_z(unet *u, int z0, int z1, void *y16) {
     const size_t hw = (size_t)u->ls[0].h * u->ls[0].w;
     nn_set_layer(3 * u->cfg.nlev - 2);
     int r = nn_head_fwd_z(x, gn ? &g : nullptr, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, y16, (size_t)z0 * hw, (size_t)(z1 - z0) * hw);
-    if (r || !u->cfg.lat_dec || z1 <= z0) return r;
-    if ((r = latdec_inputs(u, z0, z1, 0))) return r;
+    const int ra = u->ld_rb > u->ld_ra ? u->ld_ra : z0, rb = u->ld_rb > u->ld_ra ? u->ld_rb : z1; u->ld_ra = u->ld_rb = 0;   /* (one call) */
+    const int a = ra > z0 ? ra : z0, b = rb < z1 ? rb : z1;
+    if (r || !u->cfg.lat_dec || b <= a) return r;
+    if ((r = latdec_inputs(u, a, b, 0))) return r;
     const int H = u->cfg.lat_dec, ng = u->cfg.lat_dec_ng, w0 = u->cfg.widths[0]; const size_t nv = (size_t)(z1 - z0) * hw;
-    return nn_latdec_fwd((char *)y16 + (size_t)(u->cfg.cout - 64 * ng) * nv * 2, 0, nv, u->ld_pre, 0, nv, u->ld_L, z1 - z0, u->ls[0].h, u->ls[0].w,
+    return nn_latdec_fwd((char *)y16 + ((size_t)(u->cfg.cout - 64 * ng) * nv + (size_t)(a - z0) * hw) * 2, 0, nv, u->ld_pre, 0, (size_t)(b - a) * hw, u->ld_L, b - a, u->ls[0].h, u->ls[0].w,
                          P(u, u->ld_off + (size_t)H * w0 + H), H, latdec_cl(&u->cfg), ng);
 }
+void unet_set_latdec_range(unet *u, int a, int b) { u->ld_ra = a; u->ld_rb = b; }
 /* the inference head (the same rows, weights and kernels as the whole-window forward's fp32 head) on level-0 planes [z0, z1) into fp32 planes
    [rows][(z1 - z0) h w]: the bits the whole-window logits hold there. After an inference forward of a unet_set_head_infer_z build; -1 otherwise */
 int unet_head_fwd_z32(unet *u, int z0, int z1, float *y, size_t ly) {
