@@ -57,6 +57,23 @@ selected (of 368):
 The floor is the 82 fast-tier tests that run `ufsm` itself (main reaches every command). New target `test-touched` = `-c` against the
 merge base with origin/master. test_run_suite checks the map on synthetic records.
 
+**test-prep's sibling configure.** `--target test` re-configured the sibling build dir (release for a verify dir) on every call: 7.2 s
+of generate on the loaded desk, 7.7 s for a no-op `test-prep`. `cmake/sibling_cfg.sh` skips it when the arguments are the ones the dir
+was configured with (DIR/.ufsm-sibling-cfg). A CMakeLists change still regenerates both dirs (ninja's own rule). No-op: 0.4 s.
+
+**The suite off the desk.** `scripts/test/desk_suite.sh -H HOST -a 86 -R ROOT` pushes a commit to another box, builds it with the arch86
+presets into build/ and build-verify/ (the Python tests read build/) and runs the tier there. On the laptop (Ryzen 7940HS, CPU idle
+while latcodec trains on its GPU), `SUITE_ARGS="-g none" desk_suite.sh -H forlinlapnvidia -a 86 -R /home/forrest/suite -m 8 -l 14 REF`
+takes 205-209 s to build and 64-73 s for the CPU fast tier, 148 / 148 passing, with no desk CPU used (the desk spends 657 CPU-s per
+CPU tier). The laptop's python3 has no numpy and no sudo: `ROOT/pyenv` (venv with numpy, tifffile, scipy, pillow) goes on PATH when
+present. With -H forlindesk the same line is the GPU gate on its 3090s once that box is back: under arch86 every GPU test runs, the
+lp_* kernels on their software MX paths.
+
+**Cold JIT inside GPU tests.** test_flatten_gpu's 427 s outlier (warm: 22 s) was 425 s of user CPU: the driver's ptxas runs in the
+test's process, so after a pin move or a kernel edit the first GPU tests pay the JIT inside their timeouts. mcudahw's cache key is per
+kernel (its text + needed device functions + globals, the GPU name and the driver version; cuda/hw/mod.c), so a .cuh edit re-JITs
+only the kernels whose text changed.
+
 ## netsplit: which net output channels the unroll needs; normals and density from the phase gradient (2026-11-20, branch netsplit-20261120, unrollperf)
 
 The user's goal: break the shared trunk into small single-target full-resolution nets with at most 4 output channels each, so the
