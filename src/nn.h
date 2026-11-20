@@ -504,6 +504,18 @@ void nn_gfilm_bwd(const float *p, float *g, size_t gam, size_t bet, size_t fo, i
 void nn_gfilm_tok(float *x, int C, long S, const float *dg);
 /* the Gram of K planes of 16-bit values (bf16 1, else fp16) with row stride ld over N entries: S[i K + j] += sum_n x_i x_j for j >= i (src/nn_gram.cu; train --grad-cos) */
 void nn_gram16(const void *x, int bf16, int K, size_t N, size_t ld, double *S);
+/* the learned sub-cell decoder of a latent-grid net (src/nn_latdec.cu, unet_cfg.lat_dec): L [Cl][nq][D/4 x ...] fp32 latent cells of cell planes
+   [q0, q0 + nq) from the fp16 CT window (input_latc_k's quantised coefficients times gain; bas nullptr: the cell's 64 voxels, Cl 64; planes outside 0).
+   fwd: rows (o * ld + n, o < 64 ng, n over nq planes of h x w cells) += W2 silu(pre + B * L) (pre: Hd rows, stride ldp; L: nq + 2 planes from
+   the plane before), fp16 or fp32 (r32 / p32); p = B [Cl][27][Hd], W2 [64 ng][Hd]. bwd: from gy16 (the rows' fp16 gradient, stride ldg) the
+   pre rows' gradient into gpre16 (fp16, stride ldg) and B / W2's gradients added to gp (deterministic sums; x 1 / the head plane scale).
+   L is fp16 [Cl][planes][h][w]. 1: a shape the kernels do not take (Hd 16 / 32 / 64, Cl <= 64, ng <= 16) */
+void nn_latdec_cells(const void *x16, int D, int H, int W, int q0, int nq, const float *bas, const float *gain, int Cl, float step, void *L);   /* L fp16 */
+int nn_latdec_fwd(void *rows, int r32, size_t ld, const void *pre, int p32, size_t ldp, const void *L, int nq, int h, int w, const float *p, int Hd, int Cl, int ng);
+size_t nn_latdec_scratch(size_t N, int Hd, int Cl, int ng);
+void nn_latdec_wq(int fp4);   /* this thread's later fwd / bwd calls: B and W2 as MX-fp4 (e2m1, ue8m0 per 32 K; straight through); tensor-core path only (1 otherwise) */
+int nn_latdec_bwd(const void *gy16, size_t ldg, void *gpre16, const void *pre16, size_t ldp, const void *L, int nq, int h, int w, const float *p,
+                  int Hd, int Cl, int ng, float *gp, void *scratch);
 /* the fine voxel stem (src/nn_fstem.cu, train --fstem): params W1 [C][64] (4^3 taps at stride 2), b1 [C], W2 [nout][C]; fwd adds W2 silu(W1 x + b1)
    to the fp16 logit planes chs[o] (slab planes [z0, z0 + nz) of a D x H x W window, ns voxels a plane) on each 2^3 block; bwd accumulates the
    parameter gradients from fp16 gradient planes of that layout into gp. 1: a shape the kernels do not take (odd sizes, C or nout > 16) */
@@ -779,6 +791,7 @@ void nn_unwrap_targets(const uint8_t *phase, int d, int h, int w, int s, float d
 void nn_unwrap_targets2(const uint8_t *phase, int d, int h, int w, int s, float dscale, int code, float um, float packed_um, float packed_w, uint8_t *t, uint8_t *m);
 void nn_packed_mask(const uint8_t *phase, int d, int h, int w, int s, float um, float packed_um, float packed_w, uint8_t *m);   /* 0/1 mask x the weight */
 void nn_packed_mask_z(const uint8_t *phase, int d, int h, int w, int s, float um, float packed_um, float packed_w, uint8_t *m, int z0, int z1);   /* m: planes [z0, z1) */
+void nn_contact_mask_z(const uint8_t *phase, int d, int h, int w, int s, float um, float contact_um, float cw, uint8_t *m, int z0, int z1);   /* --contact-weight: m = max(m, the touching-sheet weight) where m != 0 */
 /* train --fib-dir: the axis of the H / V label tubes (t: 2 planes, >= 128 = fibre; m: shared mask) -> 7 target planes (n n^T coding of the
    axis, family V) and a 0/1 mask, over the (2r + 1)^3 second moment of the voxel's family tube; lambda_1 / trace >= cmin (src/nn_elem.cu) */
 void nn_fib_dir_targets(const uint8_t *t, const uint8_t *m, int d, int h, int w, int r, float cmin, uint8_t *o, uint8_t *om);

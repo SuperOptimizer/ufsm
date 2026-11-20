@@ -42,6 +42,7 @@ test_idle_release                              |              |     8 | tests/te
 test_scan_norm                                 | gpu          |    14 | tests/test_scan_norm.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/scannorm
 test_predict_guard                             | gpu          |    20 | tests/test_predict_guard.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predguard
 test_parity                                    | gpu          |    30 | tests/test_parity.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/parity
+test_parity~latdec                             | gpu          |    30 | UFSM_LATDEC_TEST_W2=2 tests/test_parity.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/parity_latdec "--lat-dec 32"
 test_predict_heads~part0of3                   | gpu          |    25 | UFSM_TEST_PART=0/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
 test_predict_heads~part1of3                   | gpu          |    25 | UFSM_TEST_PART=1/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
 test_predict_heads~part2of3                   | gpu          |    25 | UFSM_TEST_PART=2/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
@@ -49,6 +50,8 @@ test_predict_gpus2                            | gpu2         |    30 | tests/tes
 test_predict_boxes                             | gpu          |    40 | tests/test_predict_boxes.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predboxes
 test_tta_lat                                   | gpu          |    60 | tests/test_tta_lat.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/ttalat
 test_fstem                                     | gpu,smoke    |     3 | ./$B/test_fstem
+test_latdec                                    | gpu          |     5 | ./$B/test_latdec
+test_latdec_train                              | gpu,slow     |    90 | tests/test_latdec_train.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/latdec_train
 test_slab_tg                                   | gpu,smoke    |     2 | ./$B/test_slab_tg
 test_lathead                                     | gpu          |     3 | ./$B/test_lathead
 test_fit_lat                                     | gpu          |     3 | ./$B/test_fit_lat
@@ -212,6 +215,7 @@ test_sumsq                                     | gpu          |     4 | ./$B/tes
 test_dcache_batch                              |              |     2 | ./$B/test_dcache_batch
 test_dcache_cap                                |              |     2 | ./$B/test_dcache_cap $TMPDIR/dcache_cap
 test_dcache_phase                              |              |     5 | ./$B/test_dcache_phase $TMPDIR/dcache_phase
+test_denselab                                  |              |    10 | tests/test_denselab.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/denselab
 test_label_versions                            |              |     3 | ./$B/test_label_versions $TMPDIR/label_versions
 test_ink_air                                   | gpu          |     2 | ./$B/test_ink_air
 test_ink_mil_train                             | gpu          |    40 | ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture
@@ -220,6 +224,7 @@ test_gscale                                    | gpu          |    55 | tests/te
 test_tcache                                    | gpu          |       40 | tests/test_tcache.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/tcache
 test_strict_sources                            | gpu          |    25 | tests/test_strict_sources.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/strictsrc
 test_init_heads                                | gpu          |    45 | tests/test_init_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/initheads
+test_lat_sub                                   | gpu          |    40 | tests/test_lat_sub.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/latsub
 test_ink_mil_check                             | gpu          |    90 | ./$B/test_ink_mil_check ./$B/ufsm ./$B/make_wind_fixture
 test_pyports                                   |              |     1 | ./$B/test_pyports
 test_edt                                       | smoke        |     2 | ./$B/test_edt
@@ -380,6 +385,7 @@ test_vcgpu                                     | gpu,smoke    |     5 | ./$B/tes
 test_lat                                       | gpu,smoke    |     1 | ./$B/test_lat
 test_cluster                                   | gpu,smoke    |     1 | ./$B/test_cluster
 test_latents                                   | gpu          |    25 | bash tests/test_latents.sh ./$B/ufsm ./$B/make_wind_fixture
+test_latcodec                                  | cpu          |     4 | ./$B/test_latcodec $TMPDIR
 test_latvol                                    | gpu          |     6 | ./$B/test_latvol
 test_latvol_sh                                 | gpu          |    60 | bash tests/test_latvol.sh ./$B/ufsm ./$B/make_wind_fixture ./$B/test_latvol_nolink
 test_lat_direct                                | gpu          |    60 | bash tests/test_lat_direct.sh ./$B/ufsm ./$B/make_wind_fixture

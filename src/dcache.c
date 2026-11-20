@@ -28,13 +28,16 @@ typedef struct dc {
     unsigned magic; int batch, pdelta;   /* pdelta: the near-lossless phase codec's bound (dcache_set_phase; 0 exact) */   /* batch: the edge (voxels) up to which a read's missed cells are computed as one box (dcache_set_batch) */
     z3 *in; int C, fill; int64_t shape[3], gc[3]; char *dir;   /* dir: ROOT/<hash> or nullptr (memory only) */
     dcache_pool *P; dent **hash; size_t nhash; _Atomic int disk_warned; _Atomic int64_t touched;   /* touched: the key dir's last-use stamp (s) */
+    char *key; char hex[25];   /* the inputs description and its 24-hex hash (also without a disk dir: the dense store's name) */
+    z3 *dz; store *ds; int64_t dS, dg[3]; uint8_t *dbits;   /* the dense label store (denselab): its array, shard edge, shard grid, rendered-shard bits */
 } dc;
-static struct { _Atomic uint64_t reads, mem, disk, comp, fill, wbytes, ns_comp, ns_disk, evicted, recomp, evbytes; } g_dc;
+static struct { _Atomic uint64_t reads, mem, disk, comp, fill, wbytes, ns_comp, ns_disk, evicted, recomp, evbytes, dense, ns_dense; } g_dc;
 static double dnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 void dcache_get_stats(dcache_stats *st) {
     st->reads = g_dc.reads; st->cells_mem = g_dc.mem; st->cells_disk = g_dc.disk; st->cells_computed = g_dc.comp; st->cells_fill = g_dc.fill;
     st->disk_bytes_written = g_dc.wbytes; st->s_compute = 1e-9 * (double)g_dc.ns_comp; st->s_disk = 1e-9 * (double)g_dc.ns_disk;
     st->cells_evicted = g_dc.evicted; st->cells_recomputed = g_dc.recomp; st->bytes_evicted = g_dc.evbytes;
+    st->cells_dense = g_dc.dense; st->s_dense = 1e-9 * (double)g_dc.ns_dense;
 }
 static char g_dc_home[1024];   /* mgpu: guarded (pthread_once). (built once: concurrent callers no longer rewrite the returned buffer; threads audit #9) */
 static void dc_home_once(void) { const char *h = getenv("HOME"); if (h && *h) snprintf(g_dc_home, sizeof g_dc_home, "%s/.cache/ufsm/derived", h); }
@@ -44,6 +47,50 @@ const char *dcache_default_dir(void) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;   /* mgpu: guarded */
     pthread_once(&once, dc_home_once);
     return g_dc_home[0] ? g_dc_home : nullptr;
+}
+/* ---- the dense label store (denselab, 2026-11-19): DESIGN "Dense label store" ----
+   ROOT/<24 hex of the key>/: inputs.txt (the key), a/ (a zarr v3 uint8 array of the cached array's shape, fill = its fill, volcomp
+   lossless 128^3 chunks in S^3 shards: ufsm denselab-render), shards.bin ("UDL1", i64 S, i64 grid[3], one byte per shard, 1 = rendered:
+   every voxel of it is the cached array's value; a shard not rendered is computed as before). A cell missed in memory and in the local
+   disk cache is read from the store when its shard is rendered (and written to the local disk cache), before any compute. */
+static char g_dl_root[1024]; static int g_dl_state;   /* mgpu: guarded (pthread_once) */
+static void dl_once(void) {
+    const char *e = getenv("UFSM_DENSELAB");
+    /* opt-in (lead 11-19): unset = off until 1667 is complete and a batch-hash A/B on real windows passes */
+    if (e && *e && strcmp(e, "off") && strcmp(e, "0")) snprintf(g_dl_root, sizeof g_dl_root, "%s", e);
+    g_dl_state = 1;
+}
+const char *dcache_dense_root(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, dl_once); return g_dl_root[0] ? g_dl_root : nullptr; }
+static void key_hex(const char *key, char hex[25]) {
+    unsigned char h[32]; unsigned nh = 0; hex[0] = 0;
+    if (!key || !EVP_Digest(key, strlen(key), h, &nh, EVP_sha256(), nullptr) || nh != 32) return;
+    for (int i = 0; i < 12; i++) snprintf(hex + 2 * i, 3, "%02x", h[i]);
+}
+int dcache_dense_shards(const char *dir, int64_t *S, int64_t grid[3], uint8_t **bits) {   /* DIR/shards.bin: 0 ok (bits malloc'd), -1 none / bad */
+    char p[1200]; snprintf(p, sizeof p, "%s/shards.bin", dir); FILE *f = fopen(p, "rb"); if (!f) return -1;
+    char mg[4]; int64_t h[4]; int rc = -1;
+    if (fread(mg, 1, 4, f) == 4 && !memcmp(mg, "UDL1", 4) && fread(h, 8, 4, f) == 4 && h[0] > 0 && h[1] > 0 && h[2] > 0 && h[3] > 0) {
+        const size_t n = (size_t)(h[1] * h[2] * h[3]); uint8_t *b = malloc(n);
+        if (b && fread(b, 1, n, f) == n) { *S = h[0]; for (int d = 0; d < 3; d++) grid[d] = h[1 + d]; *bits = b; rc = 0; } else free(b);
+    }
+    fclose(f); return rc;
+}
+static void dense_open(dc *c) {
+    const char *R = dcache_dense_root(); if (!R || !c->hex[0]) return;
+    char d[1200], ip[1300]; snprintf(d, sizeof d, "%s/%s", R, c->hex); snprintf(ip, sizeof ip, "%s/inputs.txt", d);
+    FILE *f = fopen(ip, "rb"); if (!f) return;
+    char *kt = malloc(strlen(c->key) + 3); const size_t kn = kt ? fread(kt, 1, strlen(c->key) + 2, f) : 0; fclose(f);
+    const int same = kt && kn == strlen(c->key) + 1 && !memcmp(kt, c->key, kn - 1) && kt[kn - 1] == '\n'; free(kt);
+    if (!same) { fprintf(stderr, "dcache: dense store %s: inputs.txt is not this key (a hash collision or a damaged store): not used\n", d); return; }
+    int64_t S, g[3]; uint8_t *bits = nullptr;
+    if (dcache_dense_shards(d, &S, g, &bits)) return;
+    store *st = store_open(d); z3 *z = st ? z3_open(st, "a", nullptr) : nullptr; const z3_meta *m = z ? z3_meta_of(z) : nullptr;
+    int ok = m && S % c->C == 0 && m->fill == c->fill;
+    for (int k = 0; ok && k < 3; k++) ok = m->shape[k] == c->shape[k] && g[k] == (c->shape[k] + S - 1) / S;
+    if (!ok) { fprintf(stderr, "dcache: dense store %s does not match the array (shape / fill / shard grid): not used\n", d); free(bits); if (z) z3_close(z); if (st) store_close(st); return; }
+    size_t nr = 0; for (int64_t i = 0; i < g[0] * g[1] * g[2]; i++) nr += bits[i] != 0;
+    c->dz = z; c->ds = st; c->dS = S; for (int k = 0; k < 3; k++) c->dg[k] = g[k]; c->dbits = bits;
+    fprintf(stderr, "dcache: dense store %s: %zu of %lld shards rendered\n", d, nr, (long long)(g[0] * g[1] * g[2]));
 }
 static int mkdirs(const char *p) {
     char b[1200]; snprintf(b, sizeof b, "%s", p);
@@ -329,11 +376,24 @@ static void cap_close(dc *c) {
 static void cell_path_k(const dc *c, int64_t key, char *p, size_t np, int64_t *cz) {
     const int64_t z = key / (c->gc[1] * c->gc[2]), y = key / c->gc[2] % c->gc[1], x = key % c->gc[2]; *cz = z; cell_path(c, z, y, x, p, np);
 }
-static int cell_disk(dc *c, dent *e) {   /* a claimed cell from disk: 1 found (data / cval set), 0 not */
-    if (!c->dir) return 0;
+static int cell_dense(dc *c, dent *e) {   /* a claimed cell from the dense store: 1 found (data / cval set; written to the local disk cache), 0 not */
+    if (!c->dz) return 0;
+    const int64_t z = e->key / (c->gc[1] * c->gc[2]), y = e->key / c->gc[2] % c->gc[1], x = e->key % c->gc[2];
+    const int64_t o[3] = {z * c->C, y * c->C, x * c->C}, n[3] = {c->C, c->C, c->C};
+    if (!c->dbits[((o[0] / c->dS) * c->dg[1] + o[1] / c->dS) * c->dg[2] + o[2] / c->dS]) return 0;
+    const double t = dnow(); uint8_t *data = malloc(cbytes(c)); if (!data) return 0;
+    if (z3_read(c->dz, o, n, data, 1)) { free(data); return 0; }
+    size_t k = 1; const size_t nb = cbytes(c); while (k < nb && data[k] == data[0]) k++;
+    uint8_t cval = 0; if (k == nb) { cval = data[0]; free(data); data = nullptr; }
+    if (c->dir && !c->pdelta && disk_room(c->dir)) { char p[1300]; int64_t cz; cell_path_k(c, e->key, p, sizeof p, &cz); disk_put(c, cz, p, data, cval, nullptr, 0); }
+    atomic_fetch_add(&g_dc.dense, 1); atomic_fetch_add(&g_dc.ns_dense, (uint64_t)((dnow() - t) * 1e9));
+    e->data = data; e->cval = cval; return 1;
+}
+static int cell_disk(dc *c, dent *e) {   /* a claimed cell from disk (the local cache, then the dense store): 1 found (data / cval set), 0 not */
+    if (!c->dir) return cell_dense(c, e);
     char p[1300]; int64_t cz; cell_path_k(c, e->key, p, sizeof p, &cz);
     const double t = dnow(); uint8_t *data = nullptr, cval = 0;
-    if (disk_get(c, p, &data, &cval)) return 0;
+    if (disk_get(c, p, &data, &cval)) return cell_dense(c, e);
     utimensat(AT_FDCWD, p, nullptr, 0);   /* (the cell's last use: the per-cell LRU's order) */
     atomic_fetch_add(&g_dc.disk, 1); atomic_fetch_add(&g_dc.ns_disk, (uint64_t)((dnow() - t) * 1e9));
     e->data = data; e->cval = cval; return 1;
@@ -473,6 +533,11 @@ int dcache_set_phase(z3 *z, int delta) {
     if (!c || c->magic != DC_MAGIC || delta < 0 || delta > 20) return -1;
     c->pdelta = delta; return 0;
 }
+int dcache_info(z3 *z, const char **key, char hex[25], int *cell, int *pdelta) {
+    dc *c = z ? (dc *)z3_derived_ctx(z) : nullptr;
+    if (!c || c->magic != DC_MAGIC || !c->key) return -1;
+    if (key) *key = c->key; if (hex) memcpy(hex, c->hex, 25); if (cell) *cell = c->C; if (pdelta) *pdelta = c->pdelta; return 0;
+}
 int dcache_set_batch(z3 *z, int edge) {
     dc *c = z ? (dc *)z3_derived_ctx(z) : nullptr;
     if (!c || c->magic != DC_MAGIC) return -1;
@@ -492,7 +557,7 @@ static void dc_free(void *p) {
         pthread_mutex_unlock(&P->mu);
         if (!P->shared) { pthread_mutex_destroy(&P->mu); pthread_cond_destroy(&P->cv); free(P); }
     }
-    cap_close(c); free(c->hash); free(c->dir); free(c);
+    cap_close(c); free(c->hash); free(c->dir); free(c->key); free(c->dbits); if (c->dz) z3_close(c->dz); if (c->ds) store_close(c->ds); free(c);
 }
 static dcache_pool *pool_new(size_t cap, int shared) {
     dcache_pool *P = calloc(1, sizeof *P); if (!P) return nullptr;
@@ -527,6 +592,7 @@ z3 *z3_open_cached_pool(z3 *inner, const char *dir, const char *key, int cell, d
     c->nhash = 1 << 16; c->hash = calloc(c->nhash, sizeof *c->hash); c->P = pool;
     char d[1200];
     if (dir && *dir && key && !dcache_key_dir(dir, key, d, sizeof d)) { c->dir = strdup(d); cap_open(c, dir); }
+    if (key && *key) { c->key = strdup(key); key_hex(key, c->hex); dense_open(c); }
     z3 *z = z3_open_derived(inner, c->fill, dc_read, c, dc_free);
     if (!z) { dc_free(c); z3_close(inner); }
     return z;

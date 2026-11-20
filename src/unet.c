@@ -128,6 +128,7 @@ struct unet {
     void *l0r_hsk; size_t l0r_hskn;    /* the skip gradient's pinned host copy (stage S4's host mode: the device holds a ring) */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
     size_t gf_off; float *gf_g, *gf_g1, *gf_dg; int gf_K, gf_top, gf_dedup; void (*gf_red)(void *, float *, int); void *gf_redc;   /* cfg.gfilm: its A / B block (last), the pooled code vector, the affines before it, dg */
+    size_t ld_off; const void *ld_x; int ld_D, ld_H, ld_W, ld_ext, ld_ra, ld_rb; void *ld_pre, *ld_sc; float *ld_L, *ld_wc, *ld_gwc; size_t ld_pre_n, ld_sc_n, ld_L_n;   /* cfg.lat_dec: params, the forward's CT, scratch */
     size_t film_off, fstem_off; float film_c[4]; float *ffw;   /* cfg.film: the first A / D pair, the current codes, the forward copy of the weights (when nothing else copies them) */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
     convp down[UNET_MAXLEV], head;
@@ -422,12 +423,16 @@ static void gfilm_bwd(unet *u, long S) {
     if (tok) nn_gfilm_tok(u->tb_cs, K, S, u->gf_dg);
 }
 size_t unet_fstem_off(const unet *u) { return u->fstem_off; }
+size_t unet_latdec_off(const unet *u) { return u->ld_off; }
+static size_t fstem_np(const unet_cfg *c) { return c->fstem ? (size_t)c->fstem * 64 + c->fstem + (size_t)c->fstem_out * c->fstem : 0; }
+static int latdec_cl(const unet_cfg *c) { return c->lat_dec_raw ? 64 : c->cin - 3; }
+static size_t latdec_np(const unet_cfg *c) { const size_t H = (size_t)c->lat_dec; return c->lat_dec ? H * c->widths[0] + H + (size_t)latdec_cl(c) * 27 * H + (size_t)64 * c->lat_dec_ng * H : 0; }
 size_t unet_gfilm_off(const unet *u) { return u->gf_off; }
 void unet_set_gfilm_reduce(unet *u, void (*fn)(void *ctx, float *dg, int K), void *ctx, int top, int dedup) { u->gf_red = fn; u->gf_redc = ctx; u->gf_top = top; u->gf_dedup = dedup; }
 static double gauss(uint64_t *s);
 int unet_fstem_reset(unet *u, uint64_t seed) {
     if (!u->cfg.fstem) return -1;
-    const size_t off = u->fstem_off, nf = (u->gf_off ? u->gf_off : u->np) - off, nw = (size_t)u->cfg.fstem * 64; float *h = calloc(nf, sizeof *h); if (!h) return -1;
+    const size_t off = u->fstem_off, nf = fstem_np(&u->cfg), nw = (size_t)u->cfg.fstem * 64; float *h = calloc(nf, sizeof *h); if (!h) return -1;
     const double sd = sqrt(2.0 / 64); for (size_t i = 0; i < nw; i++) h[i] = (float)(sd * gauss(&seed));   /* (unet_init's: W1 He, b1 and W2 0) */
     nn_h2d(u->p + off, h, nf * 4); nn_h2d(u->ema + off, h, nf * 4);
     nn_zero(u->m + off, nf * 4); nn_zero(u->v + off, nf * 4); if (u->muon_mom) nn_zero(u->muon_mom + off, nf * 4);
@@ -511,6 +516,12 @@ unet *unet_create(const unet_cfg *cfg) {
         u->gf_K = cfg->widths[L - 1]; u->gf_off = off;
         for (int i = L - 2; i >= 0; i--) off += (size_t)2 * u->gf_K * u->dec[i].n2.c;
     }
+    if (cfg->lat_dec) {   /* (after gfilm: last; 16-byte aligned for the decoder's float4 rows) */
+        const int H = cfg->lat_dec;
+        if ((H != 16 && H != 32 && H != 64) || cfg->half_res != 3 || cfg->lat_guide != 64 || cfg->lat_dec_ng < 1 || 64 * cfg->lat_dec_ng > cfg->cout || latdec_cl(cfg) < 1 || latdec_cl(cfg) > 64) {
+            fprintf(stderr, "unet: lat_dec takes H 16 / 32 / 64 on a lat_guide 64 latent-grid net (ng %d, cout %d, Cl %d)\n", cfg->lat_dec_ng, cfg->cout, latdec_cl(cfg)); abort(); }
+        off = (off + 3) & ~(size_t)3; u->ld_off = off; off += latdec_np(cfg);
+    }
     u->np = off;
     if (ufsm_env_on("UFSM_DEBUG")) {
         for (int i = 0; i < L; i++) fprintf(stderr, "enc%d c1.w %zu c1.b %zu n1 %zu c2.w %zu c2.b %zu n2 %zu\n", i, u->enc[i].c1.w, u->enc[i].c1.b, u->enc[i].n1.gamma, u->enc[i].c2.w, u->enc[i].c2.b, u->enc[i].n2.gamma);
@@ -551,7 +562,7 @@ void unet_free(unet *u) {
     free_acts(u);
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema); nn_free(u->hf_w); nn_free(u->l0fg_mx); free(u->inh);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
-    nn_free(u->wm); nn_free(u->sp24_kb); if (u->muon_mom != u->v) nn_free(u->muon_mom); nn_free(u->muon_work);   /* (aliased into v: mom_alloc) */ muon_forget_table(u); nn_free(u->muon_descs); nn_free(u->mx_lrm); nn_free(u->stem_b);
+    nn_free(u->wm); nn_free(u->sp24_kb); if (u->muon_mom != u->v) nn_free(u->muon_mom); nn_free(u->muon_work);   /* (aliased into v: mom_alloc) */ muon_forget_table(u); nn_free(u->muon_descs); nn_free(u->mx_lrm); nn_free(u->stem_b); nn_free(u->ld_pre); nn_free(u->ld_sc); nn_free(u->ld_L); nn_free(u->ld_wc);
     nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); nn_free(u->mx_nmrows); nn_free(u->mx_nmoff); nn_free(u->mx_vrbuf); nn_free(u->mx_vrp); nn_kron_free(u->mx_kron); nn_free(u->qk_lmax); nn_free(u->mx_mixbuf); nn_free(u->mx_mixp);
     nn_free(u->am_dev); nn_free(u->ad_lrm); nn_free(u->ad_ema); nn_free(u->ad_dispbuf); nn_free(u->ad_dispp); nn_free(u->ad_dogst); nn_free(u->ad_part); nn_free(u->ad_ext); nn_free(u->ad_xpart); mprobe_free(u); nn_free(u->ost_dev); nn_free(u->ost_snap); free(u->ost_seg);
     free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_pv); nn_free(u->ge_tw); nn_free(u->gf_g); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
@@ -637,6 +648,14 @@ void unet_init(unet *u, uint64_t seed) {
         }
     }
     if (u->cfg.fstem) { const double sd = sqrt(2.0 / 64); for (size_t i = 0; i < (size_t)u->cfg.fstem * 64; i++) h[u->fstem_off + i] = (float)(sd * gauss(&seed)); }   /* (b1, W2 0) */
+    if (u->cfg.lat_dec) {   /* A ~ 1 / sqrt(widths[0]) (unit-variance rows for unit features), B ~ 1 / sqrt(27 Cl); a and W2 0 (the donor's function) */
+        const int H = u->cfg.lat_dec, w0 = u->cfg.widths[0], Cl = latdec_cl(&u->cfg); const size_t o = u->ld_off, ob = o + (size_t)H * w0 + H;
+        const double sa = 1.0 / sqrt((double)w0), sb = 1.0 / sqrt(27.0 * Cl);
+        for (size_t i = 0; i < (size_t)H * w0; i++) h[o + i] = (float)(sa * gauss(&seed));
+        for (size_t i = 0; i < (size_t)Cl * 27 * H; i++) h[ob + i] = (float)(sb * gauss(&seed));
+        const char *tw = getenv("UFSM_LATDEC_TEST_W2");   /* tests (test_parity): W2 ~ N(0, s^2 / H) instead of 0, so the decoder's term is large from the start */
+        if (tw && atof(tw) > 0) { const double sw = atof(tw) / sqrt((double)H); for (size_t i = 0; i < (size_t)64 * u->cfg.lat_dec_ng * H; i++) h[ob + (size_t)Cl * 27 * H + i] = (float)(sw * gauss(&seed)); }
+    }
     nn_h2d(u->p, h, u->np * 4);
     nn_d2d(u->ema, u->p, u->np * 4);
     nn_zero(u->m, u->np * 4); nn_zero(u->v, u->np * 4);
@@ -2840,6 +2859,7 @@ const float *unet_forward_ct(unet *u, const uint8_t *ct, float mean, float isd, 
     u->ctin.on = 0;
     return lg;
 }
+static int latdec_rows(unet *u, void *rows, int r32, size_t ld, int c0, int nc, int z0, int z1);
 const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x_h16) {
     const float *x = (const float *)xv;
     nn_set_nlev(u->cfg.nlev);   /* layer ids / names of the precision policy, manifests and profiles (a no-op unless the depth changed) */
@@ -2863,6 +2883,8 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
     const int *w = u->cfg.widths;
     const float *cur = x;
     if (x_h16 && !ABF) { fprintf(stderr, "unet_forward_x: a 16-bit input needs the 16-bit activation storage\n"); abort(); }
+    if (u->cfg.lat_dec && !u->ld_ext) { u->ld_x = x_h16 && nn_get_f16() ? xv : nullptr; u->ld_D = 4 * xs.d; u->ld_H = 4 * xs.h; u->ld_W = 4 * xs.w; }   /* (the decoder's latent input: the
+                                                                         training forward's x, the fp16 CT channel at 4x the cell shape xs; predict: unet_set_latdec_ct) */
     /* Without MX gradients the four-channel input can stay 16-bit; the tap-packed FP8 kernel writes MX a1.
        MX gradients require a packed input for the available weight-gradient kernels (eight-wide MX rows). */
     const int xin_mx = input_mx();   /* MX-fp8 gradients require an MX x for the available weight-gradient kernels */
@@ -3077,6 +3099,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         else if (recompute()) { nn_gn_t g = gn_out(u, &u->dec[0]); int r; PROF(0, r = nn_conv3d_fwd_x(u->dec[0].a2, &g, nullptr, nullptr, 0, 0, u->dec[0].ys, hw, hb, hnc_, 1, 1, u->logits, 0, 0.f, nullptr, nullptr)); if (r) rc_fail("head"); }
         else PROF(0, nn_conv3d_fwd(cur, u->dec[0].ys, hw, hb, hnc_, 1, 1, u->logits));
         nn_set_head_out_h16(0);
+        if (u->cfg.lat_dec && !u->train && latdec_rows(u, u->logits, !u->logits_h16, shape_spatial(u->ls[0]), hc0, hnc_, 0, u->ls[0].d)) rc_fail("lat_dec (inference head)");
     }
     if (u->a0_share && train && u->a2_out) nn_stream_wait(0, u->ev_a2[1]);   /* the loss writes the logit gradient over the skip's buffer next */
     if (ufsm_env_on("UFSM_DEBUG") && !ABF && !recompute() && u->logits) {
@@ -3100,12 +3123,56 @@ static int head_src(unet *u, const float **x, nn_gn_t *g) {
     if (recompute()) { *g = gn_out(u, d0); *x = d0->a2; return 1; }
     *x = d0->s2; return 0;
 }
+/* cfg.lat_dec: device scratch of at least n bytes (kept; grown) */
+static void *ld_grow(void **p, size_t *have, size_t n) {
+    if (*have < n) { nn_free(*p); *p = nn_malloc(n); *have = *p ? n : 0; if (!*p) { fprintf(stderr, "unet: lat_dec scratch of %.0f MB failed\n", n / 1e6); abort(); } }
+    return *p;
+}
+/* the decoder's inputs for cell planes [z0, z1): L over [z0 - 1, z1 + 1) into ld_L, the pre rows (A f + a: the 1^3 head's kernel on the A rows)
+   into ld_pre (fp16 [H][(z1 - z0) h w]). 0 ok */
+static int latdec_inputs(unet *u, int z0, int z1, int p32) {
+    const int H = u->cfg.lat_dec, Cl = latdec_cl(&u->cfg), w0 = u->cfg.widths[0];
+    const size_t hw = (size_t)u->ls[0].h * u->ls[0].w, nv = (size_t)(z1 - z0) * hw;
+    if (!u->ld_x || u->ld_D != 4 * u->ls[0].d || u->ld_H != 4 * u->ls[0].h || u->ld_W != 4 * u->ls[0].w) { fprintf(stderr, "unet: lat_dec needs the forward's fp16 CT channel (x_h16) at 4x the cell grid\n"); return -1; }
+    if (!u->cfg.lat_dec_raw && u->lat_C != Cl) { fprintf(stderr, "unet: lat_dec reads %d latent coefficients, the transform has %d\n", Cl, u->lat_C); return -1; }
+    ld_grow((void **)&u->ld_L, &u->ld_L_n, (size_t)Cl * (z1 - z0 + 2) * hw * 2);   /* (fp16) */
+    ld_grow(&u->ld_pre, &u->ld_pre_n, (size_t)H * nv * (p32 ? 4 : 2));
+    nn_latdec_cells(u->ld_x, u->ld_D, u->ld_H, u->ld_W, z0 - 1, z1 - z0 + 2, u->cfg.lat_dec_raw ? nullptr : u->lat_bas, u->lat_gain, Cl,
+                    u->cfg.lat_dec_raw ? 0.f : u->lat_run_step > 0.f ? u->lat_run_step : u->lat_step, u->ld_L);
+    const float *x; nn_gn_t g; int gn = head_src(u, &x, &g);
+    if (p32 && !u->train) { g = gn_out(u, &u->dec[0]); x = u->dec[0].a2; gn = 1; }   /* (the inference head's input, as unet_head_fwd_z32 reads it) */
+    if (p32) return nn_head_fwd_z32(x, gn ? &g : nullptr, u->dec[0].ys, P(u, u->ld_off), P(u, u->ld_off + (size_t)H * w0), H, u->ld_pre, (size_t)z0 * hw, nv, 0);
+    return nn_head_fwd_z(x, gn ? &g : nullptr, u->dec[0].ys, P(u, u->ld_off), P(u, u->ld_off + (size_t)H * w0), H, u->ld_pre, (size_t)z0 * hw, nv);
+}
+void unet_set_latdec_ct(unet *u, const void *x16, int D, int H, int W) { u->ld_ext = 1; u->ld_x = x16; u->ld_D = D; u->ld_H = H; u->ld_W = W; }
+/* the decoder on an inference head's fp32 / fp16 rows: rows = the first head row the buffer holds (c0) at plane z0, row stride ld, planes [z0, z1);
+   the sub-cell rows must all be held ([c0, c0 + nc) covers them), else nothing (they are not read). 0 ok */
+static int latdec_rows(unet *u, void *rows, int r32, size_t ld, int c0, int nc, int z0, int z1) {
+    const int H = u->cfg.lat_dec, ng = u->cfg.lat_dec_ng, w0 = u->cfg.widths[0], sb = u->cfg.cout - 64 * ng;
+    if (!H || z1 <= z0 || c0 > sb || c0 + nc < u->cfg.cout) return 0;
+    const size_t hw = (size_t)u->ls[0].h * u->ls[0].w;
+    for (int a = z0; a < z1; a += 8) {   /* (8 cell planes a pass: small scratch) */
+        const int b = a + 8 < z1 ? a + 8 : z1; const size_t nv = (size_t)(b - a) * hw;
+        if (latdec_inputs(u, a, b, 1)) return -1;
+        nn_latdec_wq(u->cfg.lat_dec_wq); if (nn_latdec_fwd((char *)rows + ((size_t)(sb - c0) * ld + (size_t)(a - z0) * hw) * (r32 ? 4 : 2), r32, ld, u->ld_pre, 1, nv, u->ld_L, b - a, u->ls[0].h, u->ls[0].w,
+                          P(u, u->ld_off + (size_t)H * w0 + H), H, latdec_cl(&u->cfg), ng)) return -1;
+    }
+    return 0;
+}
 int unet_head_fwd_z(unet *u, int z0, int z1, void *y16) {
     const float *x; nn_gn_t g; const int gn = head_src(u, &x, &g);
     const size_t hw = (size_t)u->ls[0].h * u->ls[0].w;
     nn_set_layer(3 * u->cfg.nlev - 2);
-    return nn_head_fwd_z(x, gn ? &g : nullptr, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, y16, (size_t)z0 * hw, (size_t)(z1 - z0) * hw);
+    int r = nn_head_fwd_z(x, gn ? &g : nullptr, u->dec[0].ys, P(u, u->head.w), P(u, u->head.b), u->cfg.cout, y16, (size_t)z0 * hw, (size_t)(z1 - z0) * hw);
+    const int ra = u->ld_rb > u->ld_ra ? u->ld_ra : z0, rb = u->ld_rb > u->ld_ra ? u->ld_rb : z1; u->ld_ra = u->ld_rb = 0;   /* (one call) */
+    const int a = ra > z0 ? ra : z0, b = rb < z1 ? rb : z1;
+    if (r || !u->cfg.lat_dec || b <= a) return r;
+    if ((r = latdec_inputs(u, a, b, 0))) return r;
+    const int H = u->cfg.lat_dec, ng = u->cfg.lat_dec_ng, w0 = u->cfg.widths[0]; const size_t nv = (size_t)(z1 - z0) * hw;
+    nn_latdec_wq(u->cfg.lat_dec_wq); return nn_latdec_fwd((char *)y16 + ((size_t)(u->cfg.cout - 64 * ng) * nv + (size_t)(a - z0) * hw) * 2, 0, nv, u->ld_pre, 0, (size_t)(b - a) * hw, u->ld_L, b - a, u->ls[0].h, u->ls[0].w,
+                         P(u, u->ld_off + (size_t)H * w0 + H), H, latdec_cl(&u->cfg), ng);
 }
+void unet_set_latdec_range(unet *u, int a, int b) { u->ld_ra = a; u->ld_rb = b; }
 /* the inference head (the same rows, weights and kernels as the whole-window forward's fp32 head) on level-0 planes [z0, z1) into fp32 planes
    [rows][(z1 - z0) h w]: the bits the whole-window logits hold there. After an inference forward of a unet_set_head_infer_z build; -1 otherwise */
 int unet_head_fwd_z32(unet *u, int z0, int z1, float *y, size_t ly) {
@@ -3113,11 +3180,33 @@ int unet_head_fwd_z32(unet *u, int z0, int z1, float *y, size_t ly) {
     const int w0 = u->cfg.widths[0], hc0 = u->head_nc ? u->head_c0 : 0, hnc = u->head_nc ? u->head_nc : u->cfg.cout;
     const size_t hwp = (size_t)u->ls[0].h * u->ls[0].w; nn_gn_t g = gn_out(u, &u->dec[0]);
     nn_set_layer(3 * u->cfg.nlev - 2);
-    return nn_head_fwd_z32(u->dec[0].a2, &g, u->dec[0].ys, P(u, u->head.w) + (size_t)hc0 * w0, P(u, u->head.b) + hc0, hnc, y, (size_t)z0 * hwp, (size_t)(z1 - z0) * hwp, ly);
+    const int r = nn_head_fwd_z32(u->dec[0].a2, &g, u->dec[0].ys, P(u, u->head.w) + (size_t)hc0 * w0, P(u, u->head.b) + hc0, hnc, y, (size_t)z0 * hwp, (size_t)(z1 - z0) * hwp, ly);
+    if (r || !u->cfg.lat_dec) return r;
+    return latdec_rows(u, y, 1, ly ? ly : (size_t)(z1 - z0) * hwp, hc0, hnc, z0, z1);
 }
 int unet_head_bwd_z(unet *u, int z0, int z1, const void *gy16, int first) {
     const float *x; nn_gn_t g; const int gn = head_src(u, &x, &g);
     const size_t hw = (size_t)u->ls[0].h * u->ls[0].w;
+    if (u->cfg.lat_dec && z1 > z0) {   /* the decoder's backward: its parameters' gradients, the pre rows' gradient as rows cout .. cout + H of gy16;
+                                          then the head's backward on the cout + H rows at once (gx is written, not accumulated) */
+        const int H = u->cfg.lat_dec, ng = u->cfg.lat_dec_ng, w0 = u->cfg.widths[0], Cl = latdec_cl(&u->cfg), co = u->cfg.cout, nr = co + H;
+        const size_t nv = (size_t)(z1 - z0) * hw, ob = u->ld_off + (size_t)H * w0 + H;
+        nn_set_layer(3 * u->cfg.nlev - 2);
+        if (latdec_inputs(u, z0, z1, 0)) return -1;
+        ld_grow(&u->ld_sc, &u->ld_sc_n, nn_latdec_scratch(nv, H, Cl, ng));
+        nn_latdec_wq(u->cfg.lat_dec_wq); if (nn_latdec_bwd((const char *)gy16 + (size_t)(co - 64 * ng) * nv * 2, nv, (char *)gy16 + (size_t)co * nv * 2, u->ld_pre, nv, u->ld_L, z1 - z0, u->ls[0].h, u->ls[0].w,
+                          P(u, ob), H, Cl, ng, u->g + ob, u->ld_sc)) return -1;
+        if (!u->ld_wc) { u->ld_wc = nn_malloc((size_t)nr * (w0 + 1) * 4 * 2); if (!u->ld_wc) return -1; u->ld_gwc = u->ld_wc + (size_t)nr * (w0 + 1); }
+        float *wc = u->ld_wc, *bc = wc + (size_t)nr * w0, *gwc = u->ld_gwc, *gbc = gwc + (size_t)nr * w0;
+        nn_d2d(wc, P(u, u->head.w), (size_t)co * w0 * 4); nn_d2d(wc + (size_t)co * w0, P(u, u->ld_off), (size_t)H * w0 * 4);
+        nn_d2d(bc, P(u, u->head.b), (size_t)co * 4); nn_d2d(bc + co, P(u, u->ld_off + (size_t)H * w0), (size_t)H * 4);
+        nn_d2d(gwc, u->g + u->head.w, (size_t)co * w0 * 4); nn_d2d(gwc + (size_t)co * w0, u->g + u->ld_off, (size_t)H * w0 * 4);
+        nn_d2d(gbc, u->g + u->head.b, (size_t)co * 4); nn_d2d(gbc + co, u->g + u->ld_off + (size_t)H * w0, (size_t)H * 4);
+        const int r = nn_head_bwd_z(x, gn ? &g : nullptr, u->dec[0].ys, gy16, nr, wc, gwc, gbc, u->gout[0], (size_t)z0 * hw, nv, first);
+        nn_d2d(u->g + u->head.w, gwc, (size_t)co * w0 * 4); nn_d2d(u->g + u->ld_off, gwc + (size_t)co * w0, (size_t)H * w0 * 4);
+        nn_d2d(u->g + u->head.b, gbc, (size_t)co * 4); nn_d2d(u->g + u->ld_off + (size_t)H * w0, gbc + co, (size_t)H * 4);
+        return r;
+    }
     return nn_head_bwd_z(x, gn ? &g : nullptr, u->dec[0].ys, gy16, u->cfg.cout, P(u, u->head.w), u->g + u->head.w, u->g + u->head.b, u->gout[0],
                          (size_t)z0 * hw, (size_t)(z1 - z0) * hw, first);
 }
@@ -5423,6 +5512,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
       if (any) { fputs(",\"enc_blocks\":[", f); for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.enc_blocks[i]); fputc(']', f); } }
     if (u->cfg.half_res) fprintf(f, ",\"half_res\":%d", u->cfg.half_res);
     if (u->cfg.lat_guide) fprintf(f, ",\"lat_guide\":%d", u->cfg.lat_guide);
+    if (u->cfg.lat_nsub) { fputs(",\"lat_sub\":[", f); for (int k = 0; k < u->cfg.lat_nsub; k++) fprintf(f, "%s%d", k ? "," : "", u->cfg.lat_sub[k]); fputc(']', f); }   /* (only when set: older readers see the old header) */
     if (u->lat_C) {   /* the cell transform: rows of 64 weights, the gains, the step */
         fprintf(f, ",\"lat_c\":%d", u->lat_C); wfl(f, ",\"lat_step\":", u->lat_step, 9); fputs(",\"lat_gain\":[", f);
         for (int i = 0; i < u->lat_C; i++) wfl(f, i ? "," : "", u->lat_hg[i], 9);
@@ -5433,6 +5523,8 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     if (u->cfg.emb_lev) fprintf(f, ",\"emb_lev\":%d,\"emb_ch\":%d", u->cfg.emb_lev, u->cfg.emb_ch);
     if (u->cfg.film) fprintf(f, ",\"film\":%d", u->cfg.film);
     if (u->cfg.fstem) fprintf(f, ",\"fstem\":[%d,%d]", u->cfg.fstem, u->cfg.fstem_out);
+    if (u->cfg.lat_dec && u->cfg.lat_dec_wq) fprintf(f, ",\"lat_dec\":[%d,%d,%d,%d]", u->cfg.lat_dec, u->cfg.lat_dec_raw, u->cfg.lat_dec_ng, u->cfg.lat_dec_wq);
+    else if (u->cfg.lat_dec) fprintf(f, ",\"lat_dec\":[%d,%d,%d]", u->cfg.lat_dec, u->cfg.lat_dec_raw, u->cfg.lat_dec_ng);
     if (u->cfg.attn_blocks) fprintf(f,",\"attn_blocks\":%d,\"attn_pe\":%d,\"attn_reg\":%d,\"attn_mlp\":%d", u->cfg.attn_blocks, u->cfg.attn_pe, u->cfg.attn_reg, u->tbd.F);
     if (u->cfg.attn_vres) fprintf(f, ",\"attn_vres\":%d", u->cfg.attn_vres);
     if (u->cfg.attn_blocks && u->cfg.attn_axis) fprintf(f, ",\"attn_axis\":%d", u->cfg.attn_axis);
@@ -5543,11 +5635,13 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     if ((p = strstr(line, "\"enc_blocks\":["))) { p += 14; for (int i = 0; i < UNET_MAXLEV && *p && *p != ']'; i++) { cfg->enc_blocks[i] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     if ((p = strstr(line, "\"half_res\":"))) cfg->half_res = atoi(p + 11);
     if ((p = strstr(line, "\"lat_guide\":"))) cfg->lat_guide = atoi(p + 12);
+    cfg->lat_nsub = 0; if ((p = strstr(line, "\"lat_sub\":["))) { p += 11; while (cfg->lat_nsub < 16 && *p && *p != ']') { cfg->lat_sub[cfg->lat_nsub++] = (int8_t)strtol(p, (char **)&p, 10); if (*p == ',') p++; } }
     cfg->w4_2d = (p = strstr(line, "\"w4_2d\":")) ? atoi(p + 8) : 0;
     if ((p = strstr(line, "\"ds_levels\":"))) cfg->ds_levels = atoi(p + 12);
     cfg->emb_lev = (p = strstr(line, "\"emb_lev\":")) ? atoi(p + 10) : 0;
     cfg->emb_ch = (p = strstr(line, "\"emb_ch\":")) ? atoi(p + 9) : 0;
     cfg->film = (p = strstr(line, "\"film\":")) ? atoi(p + 7) : 0;
+    cfg->lat_dec = cfg->lat_dec_raw = cfg->lat_dec_ng = cfg->lat_dec_wq = 0; if ((p = strstr(line, "\"lat_dec\":["))) sscanf(p + 11, "%d,%d,%d,%d", &cfg->lat_dec, &cfg->lat_dec_raw, &cfg->lat_dec_ng, &cfg->lat_dec_wq);
     cfg->fstem = cfg->fstem_out = 0; if ((p = strstr(line, "\"fstem\":["))) { cfg->fstem = atoi(p + 9); const char *q = strchr(p + 9, ','); cfg->fstem_out = q ? atoi(q + 1) : 0; }
     if ((p = strstr(line, "\"attn_blocks\":"))) cfg->attn_blocks = atoi(p + 14);
     if ((p = strstr(line, "\"attn_pe\":"))) cfg->attn_pe = atoi(p + 10);
@@ -5872,7 +5966,7 @@ int unet_init_from_map(unet *u, const char *path, const int *head_rows) {
         if (same) { nn_d2d(u->p + u->film_off, o->p + o->film_off, nf * 4); nn_d2d(u->ema + u->film_off, o->ema + o->film_off, nf * 4); inh_add(u, u->film_off, nf); n++; }
     }
     if (!S && u->cfg.fstem && oc.fstem == u->cfg.fstem && oc.fstem_out == u->cfg.fstem_out) {   /* the donor's stem */
-        const size_t nf = (u->gf_off ? u->gf_off : u->np) - u->fstem_off; nn_d2d(u->p + u->fstem_off, o->p + o->fstem_off, nf * 4); nn_d2d(u->ema + u->fstem_off, o->ema + o->fstem_off, nf * 4); inh_add(u, u->fstem_off, nf); n++;
+        const size_t nf = fstem_np(&u->cfg); nn_d2d(u->p + u->fstem_off, o->p + o->fstem_off, nf * 4); nn_d2d(u->ema + u->fstem_off, o->ema + o->fstem_off, nf * 4); inh_add(u, u->fstem_off, nf); n++;
     }
     if (!S && u->cfg.scale_cond && oc.scale_cond && u->enc[0].c1.cout == o->enc[0].c1.cout) {
         nn_d2d(u->p + u->sc_w, o->p + o->sc_w, (size_t)u->enc[0].c1.cout * 4); nn_d2d(u->ema + u->sc_w, o->ema + o->sc_w, (size_t)u->enc[0].c1.cout * 4); n++;

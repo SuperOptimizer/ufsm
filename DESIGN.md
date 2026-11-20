@@ -6,6 +6,250 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## try9 end: GT sweep of the snapshots, the cooldown, and where fully adaptive Muon stopped (2026-11-19, trainperf)
+
+**Is try9 still improving on GT?** Phase-miss share (merge-flag --eval --gap-report 100 --thr 179, mergeflag's recipe: origin / axis
+from the reference fields, 0 interval mismatches vs t16 / u1mn on every row) on Paris 4 (38 boxes: PH1-3, J1-34, HOLD) and the 9 1667
+boxes of the u1 / try9 rows; window 640 / halo 64, --gn-live 1, the rvsep predict binary (unrollperf's t16 recipe); lower is better.
+1667 wbench ids: the same 9 boxes, fixed-fields CPU fit (higher is better). Scripts: /vesuvius/ufsm/trainperf/gt36/.
+
+| step | weights | P4 all | PH1-3 | J | HOLD | 1667 phase-miss | 1667 ids |
+|---|---|---|---|---|---|---|---|
+| 15000 | EMA (per update, ~10k-window horizon) | 0.617 | 0.892 | 0.626 | 0.300 | 0.266 | |
+| 15000 | live | 0.426 | 0.732 | 0.419 | 0.247 | 0.181 | |
+| 16000 | live | 0.379 | 0.606 | 0.381 | 0.174 | 0.172 | 0.802 |
+| 20000 | EMA (per window since the 16850 swap) | 0.463 | 0.742 | 0.467 | 0.194 | 0.180 | |
+| 25000 | EMA | 0.412 | 0.692 | 0.414 | 0.171 | 0.175 | |
+| 30000 | EMA | 0.404 | 0.695 | 0.403 | 0.176 | 0.166 | |
+| 36000 | EMA | 0.422 | 0.715 | 0.424 | 0.169 | 0.171 | 0.842 |
+| 36000 | live | 0.449 | 0.750 | 0.452 | 0.181 | 0.180 | 0.790 |
+| 37000 | EMA | 0.414 | 0.713 | 0.415 | 0.164 | 0.168 | |
+| cooled 33333 | EMA | 0.418 | 0.686 | 0.422 | 0.158 | 0.170 | 0.841 |
+| cooled 33333 | live | 0.435 | 0.729 | 0.438 | 0.163 | 0.172 | 0.842 |
+| u1 / try9 EMA-12750 (refs) | | | | | | 0.183 / 0.234 | 0.813 / 0.796 |
+
+- Snapshot-to-snapshot noise on P4 is ~+-0.03-0.04 (15000 live 0.426 vs 16000 live 0.379, 1000 steps apart), so there is no turn point:
+  after the per-window EMA settled (25000 on) P4 sits at 0.40-0.42 and 1667 at 0.166-0.175. 16000 is a lucky snapshot, not a peak.
+- Window 256 instead of 640 costs +0.14 P4 phase-miss on the same weights (16000: 0.520 vs 0.379): score only at the production window.
+- The per-update EMA was harmful (15000 EMA far behind its own live weights); the per-window EMA (--ema 0.9995 --ema-per window, swap
+  5aae217f at 16850) beats live at 36000 on both scrolls (P4 -0.027, 1667 ids +0.052).
+- Cooldown (user 11-19: kill the constant-lr run): from snap/30000 with try9's launch.env (5aae217f, NorMuon, per-window EMA, item-C
+  layout), runs/try9cool, --steps 33333 --cooldown 0.1: lr 3e-4 -> 0 linear over 30000 -> 33333 (launched via runs/cool.launch /
+  cool.train.sh, copies of scratch2.launch / .train.sh with a COOL fraction). Result: the live weights reach the EMA weights' level,
+  nothing beyond it. With the per-window EMA the cooldown is redundant; any late EMA checkpoint is the production try9.
+
+**Fully adaptive Muon, part 2 (branch admuon2-20261119, not merged; user stopped the winding training before its arms ran).**
+- `train --muon-probe S` (256126fa): every S-th element of each Muon matrix's final direction (NorMuon rows included) read back per
+  update; the --opt-stats line gets rho_k (lag 1, 2, 4, 8, 16 cosine of successive directions), kappa16 = 1 + 2 sum rho_k (the
+  random-walk factor DoG's kappa = (1 + b) / (1 - b) = 39 assumes) and prog16 = |sum of 16 steps| / sum |step|; DoG's G added to the line.
+- 85f54bfe: a --resume may add or drop the adaptive controllers (+la / +dg): the optimizer-tag check ignores them (momentum and NorMuon
+  rows carry over). The first DoG diagnosis arm had been refused by that check (rc 2).
+- Diagnosis: only the NorMuon arm ran, 3 updates (resumed snap/30000, P 768, accum 5) before the stop: rho_1 0.62 -> 0.77 -> 0.84,
+  rho_2 0.65 -> 0.76, kappa16 (truncated at the available lags) 2.2 -> 5.5 while the momentum refilled. Not enough for a verdict on
+  whether the measured kappa sits far below 39 (the hypothesis for DoG's collapse).
+- Designed, not coded: kappa estimated online on the probe subsample (EMA of <v_t, e_t> / |v_t|^2 with e an exponentially weighted sum
+  of past directions), DoG reformulated as eta = rbar / sqrt(kappa_hat G_raw) so kappa may change; an autocool controller from the
+  fluctuation-dissipation relation (Yaida 2018 / SASA) plus prog_K vs sqrt(kappa / K). Notes: /vesuvius/ufsm/trainperf/admuon2/design.txt.
+
+## resgate: 9.6 um detail arms fine-tuned on the GT boxes, PARTIAL (R0, R2 only; stopped 2026-11-19 by the user's "stop winding training")
+
+Question: is try9's sheet detail limited by the latent input or by the fine stem? Each arm used try9's architecture (widths
+256,320,384,448,288,288, attention 4 + scroll PE, gfilm, sub-cell head) warm-started from try9-16000 weights. The from-scratch versions sat
+at phase BCE ln 2 for 4000 windows, as try4 / try8 did. Recipe: try9's warm-start lr (x0.3 for 2000 steps), NorMuon. Training: 6000 steps
+at P 256 / 9.6 um on 15 GT boxes inside the production holdouts, seed 3, desk card 1. Arms:
+- R0: the pure latent net (no fine stem).
+- R2: R0 + the fine stem (--fstem 16 --fstem-drop 0).
+- Planned but dropped: R2p (try9 recipe unchanged), T16 (try9-16000 itself), R3 (the voxel net warm from wind96), W96 (wind96 baseline).
+
+Scoring: wbench at window 640, GT ids per box (/vesuvius/ufsm/inksdk/resgate/RESULTS.txt). gaprep: mergeflag's gap report on the same
+fields (gap/TAG/gap.out). Held-out boxes PH2 J7 J11 J25; control boxes HOLD J19 J20 J27.
+
+| box (held out) | R0 ids | R2 ids | R2 - R0 |
+|---|---|---|---|
+| PH2 | 0.3268 | 0.3221 | -0.005 |
+| J7  | 0.4156 | 0.2974 | -0.118 |
+| J11 | 0.5170 | 0.4814 | -0.036 |
+| J25 | 0.6131 | 0.6142 | +0.001 |
+| mean | | | -0.039 |
+
+Control mean R2 - R0: -0.020 (HOLD -0.053, J27 -0.035).
+
+Gap report, held-out boxes, share of GT intervals phase-merged:
+
+| fields | all | GT gap [50,100) um | [100,200) | [200,inf) |
+|---|---|---|---|---|
+| try9-16000 (t16) | 0.311 | | | |
+| u1 | 0.363 | | | |
+| R0 | 0.269 | 0.474 | 0.244 | 0.182 |
+| R2 | 0.269 | 0.463 | 0.241 | 0.194 |
+
+Reading:
+- The fine stem (R2) does not help. On ids it hurts, mostly through J7.
+- Merges per GT gap are the same for R0 and R2.
+- Fine-tuning on the boxes lowers try9's held-out merge rate from 0.311 to 0.269 for either arm.
+- These are single-seed results. Without R3 / W96 there is no latent-vs-voxel answer.
+
+Kept: last.ckpt of rg96R0-s3 / rg96R2-s3 (the rings were deleted for disk).
+
+## Learned input codec, stage 1: no gain over the KLT, volcomp far ahead per byte; stopped (2026-11-19, branch latcodec-20261119, latcodec)
+
+**Question.** Can a learned rate-distortion codec replace the KLT cells of latvol (lead's Task 2 design, approved 11-19), adopted only at
+>= 10 % fewer bytes at equal PSNR or task proxy? Stage 1 only (CPU); the user moved the focus to fibres / rv / ink the same evening, so no stage 2.
+
+**Tool.** `ufsm codec-fit BASIS ROOT GROUP LEVEL` (src/lcodec.{h,c}, lcodec_cli.c): latvol's 24 sample boxes (256^3, sd_ref as latvol);
+even boxes train, odd boxes score. Every arm is scored as latvol / volcomp chunks with tables fitted on the scoring boxes (the same rule for
+all): real stream bytes per box voxel, PSNR over the cells holding a nonzero byte.
+- codec (in the full KLT frame, x = coefficients / sd_ref): the KLT mean index kept (latvol's air rule and DPCM); cl - 1 learned channels
+  y = Wl x[1..63] + W2 silu(W1 f + b1), f = the cell's axes, its centred mean and per 26 neighbours the mean difference and 3 axes (hid 64);
+  linear synthesis S [cl - 1][63], stored as latvol rows (every reader unchanged); a factorised Laplace rate model with noise relaxation;
+  loss R + lambda D, Adam 3000 x 4096 cells, ~3-4 min a codec on 16 threads.
+- tier b (`--hid2 H`): + V2 silu(V1 [q, ctx] + c1) in the synthesis, ctx = the decoded mean indices of the cell and its 26 neighbours.
+- `--volcomp Q,..`: plain volcomp on the same boxes. `gt-trans --lat-codec CODEC.lcd` / `--vc-rt Q`: the task proxy through either.
+- test_latcodec (CPU, 2.4 s): gradients (both tiers) against central differences; at init the codec is the KLT (391 of 655k indices differ
+  by a rounding tie; rows and rebuild identical); the latvol stream round-trips; files; tier b with V2 0 = the linear rebuild.
+
+**PSNR per byte** (bytes saved against the KLT envelope over C 13 / 20 / 29 at the same PSNR, log-interpolated between steps):
+
+| arm | Paris 4 L2 | 1667 L2 | 0139 L0 |
+|---|---|---|---|
+| learned cl 13, lambda 0.002 / 0.004 / 0.008 | +2.7 / -1.4 / -12.8 % | -1.2 / -7.3 / -19.3 % | +4.1 / +4.4 / +3.0 % |
+| learned cl 20, lambda 0.002 / 0.004 / 0.008 | +1.1 / +2.9 / +0.4 % | -2.1 / -0.6 / -6.1 % | -4.5 / +3.3 / +3.0 % |
+| learned cl 29, lambda 0.002 / 0.004 / 0.008 | -8.0 / +2.0 / +2.3 % | -11.0 / -1.9 / +0.2 % | (synthesis rows > 2: not storable) |
+| learned cl 13, lambda 0.001 | (below the KLT range) | (below) | +7.3 % |
+| tier b, cl 20 hid2 32, lambda 0.004 | +8.7 % (0.0495 B/vox, 27.82 dB) | - | - |
+| volcomp q8 / q16 | **+45 % / +52 %** (0.0466 B/vox 30.10 dB; 0.0194, 26.46) | - | - |
+
+At ~0.05 B/vox the KLT ladder gives Paris 4 C 20 step 1.4 0.0562 / 27.99 dB, C 29 step 2.0 0.0443 / 26.71; volcomp q8 0.0466 / 30.10 dB:
+3 dB more at fewer bytes. The learned analysis buys -19 .. +7 % (mostly within +-4 %): with a linear per-cell synthesis the KLT is
+already near the cap; the small nonlinear synthesis adds +8.7 %; volcomp's 3-D transform + context coding is in another class.
+
+**Task proxy** (gt-trans CT peaks per GT turn by normal gap, the CT through each codec; reference rows in "The latent codec keeps the sheet
+separation" above):
+
+| arm (~B/vox, Paris 4 ladder) | P4 0-70 | 70-85 | 85-100 | all | 1667 0-70 | 70-85 | 85-100 | all |
+|---|---|---|---|---|---|---|---|---|
+| raw | 0.523 | 0.740 | 0.871 | 1.044 | 0.454 | 0.674 | 0.784 | 1.541 |
+| KLT 29 step 1.7 (~0.053) | 0.492 | 0.729 | 0.845 | 1.004 | 0.453 | 0.667 | 0.786 | 1.283 |
+| KLT 20 step 1.4 (0.056) | 0.493 | 0.723 | 0.843 | 1.003 | 0.440 | 0.662 | 0.778 | 1.291 |
+| KLT 13 step 1.0 (0.058) | 0.504 | 0.712 | 0.844 | 1.008 | 0.340 | 0.617 | 0.736 | 1.248 |
+| learned tier a cl 20 (0.055) | 0.484 | 0.703 | 0.819 | 0.980 | 0.438 | 0.644 | 0.761 | 1.281 |
+| learned tier b cl 20 (0.050) | 0.490 | 0.711 | 0.838 | 1.004 | 0.439 | 0.653 | 0.760 | 1.444 |
+| volcomp q8 (0.047) | **0.515** | 0.743 | 0.862 | 1.043 | **0.449** | 0.670 | 0.786 | 1.493 |
+| volcomp q4 (0.076) | 0.516 | 0.733 | 0.852 | 1.031 | 0.447 | 0.673 | 0.783 | 1.495 |
+
+(Both learned codecs are Paris 4's, applied to 1667 too.) The proxy agrees with PSNR: at ~0.05 B/vox the learned codecs lose 0.01-0.03
+peaks per turn against the KLT below 100 um; volcomp q8 at fewer bytes stays within 0.008 of raw (the KLT loses 0.03 on P4). Nothing
+reaches the 10 % bar on either axis except volcomp. **Decision (lead, 11-19): stop; no stage 2.** If the latent store's bytes matter again,
+the lever is volcomp-class coding of the cells (3-D transform + context), not a learned per-cell transform; the trunk's own input is not
+the bottleneck (the proxy loss of every codec is small next to the heads' gap). Data: /vesuvius/ufsm/latcodec/{pre,proxy}.
+
+## Learned sub-cell decoder (--lat-dec): a nonlinear full-resolution output codec on the latent cells (2026-11-19, branch latcodec-20261119, latcodec)
+
+**Why.** The latent net's trunk runs on 4^3-voxel cells (38.4 um at 9.6). Its full-resolution outputs come from three parts:
+- the interpolated cell logits;
+- the linear sub-cell rows (one 1^3 head row per voxel of the cell, for the phase pair and, since --lat-sub, for rv / fibre / ink);
+- the fine stem (silu of 4^3 raw-CT taps at stride 2, so 19.2 um blocks).
+
+None of these is a nonlinear function of the trunk's context *and* the cell's fine detail together. The packed-sheet deficit (sections
+"Recto / verso ... do not separate touching sheets" and "Where the packed-sheet deficit lives") is a full-resolution decision of exactly
+that kind. Example: two sheets merged into one cell, with the trunk knowing roughly where they are and the CT detail saying where the
+layers alternate. The decoder treats the sub-cell rows as a learned output codec: each cell's code is decoded nonlinearly into its 64
+voxels per output, from the cell's compressed input.
+
+**Model.** Per cell c (src/nn_latdec.cu, unet_cfg.lat_dec H, header key "lat_dec":[H, raw, ng]; params appended last):
+
+    pre_k = A_k . f_c + a_k + sum_{c', t in 3^3} B[c'][t][k] L_c'(c + t),   h = silu(pre),   subrow_o(c) += sum_k W2[o][k] h_k
+
+- f_c is the head's input (dec[0], 256 channels). A / a are H more rows of the 1^3 head, so they run in the head's own kernels: the MX
+  input, its GN + SiLU, the head plane scale. The head's backward runs once on the cout + H rows, because gx is written, not accumulated.
+- L is the latent input itself: the lat_c (29) KLT coefficients of each cell, quantised exactly as input_latc_k quantises them (before
+  the MX rounding), over the 3^3 neighbour cells. The decoder therefore reads what a latvol store holds.
+  - --lat-dec-raw 1: L is instead the cell's 64 voxels (Cl 64, the complete basis, unquantised). This is the ablation of the 29-coefficient
+    truncation.
+- o runs over all 64 ng sub-cell rows: ng = 2 for the phase pair; with --lat-sub, every group, e.g. rv,fib,ink gives ng 7 and 448 rows.
+- W2 starts at 0, so the net starts as its donor. Rows are never written with a zero term, so they stay byte-identical, signed zeros included.
+
+**Kernels.**
+- Forward: one 128-thread block per 32-cell row tile, with the 3 x 3 neighbour rows of L staged in shared memory and 4 groups of H/4
+  hidden units per cell. W2 projects from shared memory and adds into the fp16 (training) or fp32 (predict) rows.
+- Backward:
+  - Recomputes pre, h and silu'. The rows' gradient comes in through shared memory in chunks of 128 outputs. It writes dpre as fp16
+    head rows plus fp32 scratch.
+  - B / W2 gradients are chunked outer-product sums (4096 cells a chunk), summed over chunks in a fixed order. There are no float
+    atomics, so --det runs are bit-stable. They are scaled by 1 / the head plane scale.
+- Plain fp32 FFMA; tensor cores (mma) are the next step if the bench says so.
+- The head backward-data kernel (conv1_to_mx_tc) now takes any number of rows: K runs in chunks of 32. The FFMA fallback goes to 256.
+
+**Wiring.**
+- train --lat-dec H needs the streamed head (g_lat_hs), B 1 and no --split. The trainer's latgc has H more rows.
+- unet_head_fwd_z / _bwd_z run the decoder per head slab. The training forward's x (the fp16 CT at 4x the cell shape) is its CT.
+- Predict: unet_set_latdec_ct(xd) is called before the forward. The decoder runs in the whole-window inference head and in
+  unet_head_fwd_z32 (fit-zarr chunks), into the cell logits, so every reader gets the decoded rows: the fused fstem_up path,
+  nn_lathead, --heads and fit fields.
+- Predict's direct cell input (latin) is off for decoder nets, because the decoder reads xd.
+
+**Tests (card 1, as suite guests).**
+- test_latdec: against a double host reference for Hd 16 / 32 / 64, Cl 29 / 64 and ng 2 / 7.
+  - The latent cells match (0 quantiser flips).
+  - Forward: fp16 / fp32 rows and pre rows within fp16 rounding.
+  - W2 = 0 leaves the rows byte-identical.
+  - Backward max |e|: pre 4.8e-4 (fp16), B 5.8e-6, W2 3.8e-6. The reference gradient is checked by central differences.
+  - Two runs are bit-identical; head plane scale 4 divides exactly.
+- test_latdec_train: a fixture latent net with a fitted basis, --lat-guide 3, --fstem 16.
+  - --init-from at lr 0: the step losses with and without --lat-dec 64 are identical.
+  - Trained 6 steps: step 1 is identical (W2 0), and by step 6 the phase bce moved (0.6938 plain vs 0.6822 decoder) while the normal bce
+    is untouched (0.9108 both): the decoder acts on the sub-cell rows only.
+  - --lat-dec-raw runs; --resume refuses a decoder mismatch.
+  - --lat-sub rv,ink + the raw decoder (320 rows): W2 0 equal losses; predict --heads rv,ink changes with a random W2.
+- test_parity~latdec (UFSM_LATDEC_TEST_W2=2: a random W2, so the decoder's term is O(1) from step 0): train vs predict --fit-zarr is
+  max |d| 0.0078 on the phase pair (bit-equal 0.65), the same tolerance as the plain parity test.
+
+**Cost.** The first FFMA kernels (scalar fp32 over the 783-wide 3^3 x 29 conv, 32-cell tiles, the slab's halo planes decoded too) cost
+16.7 s per P 768 window in bench_latdec. In training at P 256 (resgate recipe, --lat-sub rv,fib,ink, card 1) that was 1.65 vs 1.07 samples/s:
+606 vs 935 ms per step, +54 %. The tensor-core rewrite (dc88a53a, `UFSM_LATDEC_FFMA=1` keeps the FFMA kernels):
+- every GEMM on mma m16n8k16 (fp16 in, fp32 accumulate): the conv, h W2, dy W2^T, and both weight gradients (chunked, fixed-order reduction);
+- 64-cell tiles, a warp 16 cells x all H, so each A fragment is used H / 8 times;
+- K ordered by neighbour row / dx / channel (channels padded to 32 / 64): one transposed fp16 L row staged at a time, A fragments are
+  aligned 4-byte smem loads (the per-element k -> offset table cost 2x);
+- B / W2 fragments and the head rows' old values prefetched one step ahead (the loads were 70 % of the stall samples);
+- the latent cells in fp16;
+- the trainer decodes only the slab's own cell planes (unet_set_latdec_range): their halo planes' sub-cell rows are never read.
+ncu per slab at P 768, ng 7, H 64: fwd 39 -> 2.1 ms; bwd + the two weight-gradient GEMMs 110 -> 3.0 + 1.3 + 1.9 ms; cell encode 0.5 ms.
+H 32 is not cheaper (fwd 1.9 ms, bwd 2.8 ms: the L staging dominates). Step A/B at P 256, alternating A B A B: 1.59 / 1.66 vs
+1.47 / 1.47 samples/s, about 615 vs 680 ms, **+10.5 %**. Memory: scratch 83 MB, fp16 L ~17 MB at P 768.
+Gate (11-19): CPU fast tier 142 PASS (221 NOGPU under -g none); the touched GPU tests on card 1 50 PASS, test_lat_head~racecheck TIMEOUT
+at 1800 s (the sanitizer on the shared card; no FAIL). The tc-path racecheck runs in the next pod queue.
+
+**MX-fp4 weights (`--lat-dec-fp4 1`, 11-19).** B and W2 are used as MX-fp4: each block of 32 consecutive K of the packed GEMM operand
+(Bt rows: one neighbour row / dx and 32 channels; W2 rows along H, 16 at H 16) is rounded onto e2m1 x 2^e, e the trunk's ue8m0 rule
+(the smallest with amax 2^-e <= 6), ties to even. W2t is the transpose of the quantised W2h, so forward and backward see the same
+weights. The fp32 master weights and their gradients are untouched (straight through), so a fp16-trained decoder fine-tunes into fp4
+(`--resume` with the flag: a quantisation-aware fine-tune). The quantisation happens in the per-call weight pack (three tiny kernels,
+microseconds); the GEMMs stay fp16 mma, so this is a storage / precision variant, **not a speed one** (the decoder's cost is the L staging
+and the 3^3 conv on fp16 L, not the weights). Header: `"lat_dec":[H,raw,ng,1]`, the 4th value written only when on (old checkpoints
+read unchanged); predict applies it from the header. FFMA path refuses it. Tests: test_latdec runs every check against a reference on
+host-quantised weights (fp4 Hd 16 / 64, ng 2 / 7, raw; errors at the fp16 level: pre 5e-4, B 2e-3, W2 1.6e-3), test_latdec_train
+resumes the fp16 decoder into fp4 (header key, finite losses) and predicts a random-W2 fp4 net (rv differs from the fp16 one).
+
+## Count-constrained fill: no headroom over the mf-weighted ref (2026-11-18, branch fill-20261118, levelsolve)
+
+`ufsm fill-oracle` (src/filloracle.c): radial rays (every native z plane, arcs <= 0.7 voxel) through a box raster of the model's U; merged
+spans from the mf plane (mf >= 179) or GT-derived (GT sheet crossings chained one turn apart); inside each span U(a) + N (r - a) / (b - a)
+with N from GT, from the MFREF ref, or our own; scored with the fitter's wind-score. The unfilled raster reproduces the model's ids
+(C19 0.5079 vs 0.5074, PH1 0.2220 vs 0.2224).
+
+| box (1667 MFREF joined) | base | interp (our N) | fill (GT N) | shape (GT spacing) | ref N |
+|---|---|---|---|---|---|
+| C19 | 0.508 | 0.510 | 0.504 | 0.511 | 0.504 |
+| C31 | 0.611 | 0.611 | 0.611 | 0.612 | 0.610 |
+| C52 | 0.801 | 0.798 | 0.796 | 0.804 | 0.798 |
+| C70 | 0.816 | 0.812 | 0.807 | 0.820 | 0.810 |
+
+- Across mf spans the joined model already carries the GT's count (C19: spans hold 0.71 GT turns, the joined U 0.83). Even every GT
+  chain at the GT's own spacing, anchored at our U, gives 0.49 on C19: the loss is region-level turn offsets (a global count / slab-join
+  problem), not spacing inside merges. PH1 (box fit): 0.222 -> 0.218-0.253 for every fill variant.
+- Verdict: no in-box fill is built. The tool stays for future oracles.
+
 ## wgraph's fibre contact crossings against the GT: they do not divide touching sheets (2026-11-19, branch wgraph-20261119, mergeflag) -- PARKED
 
 User (via lead, 11-19): adapt villa's `vc_wgraph` (vesuvius/docs/wgraph.md, fiber_workflows.md, fiber_layout.md) to count-field, aimed
@@ -56,6 +300,77 @@ Far below 0.9: at 9.6 um touching sheets are one papyrus run in the CT, so the m
 it is needed; the GT has no faces at this grid. Verdict: wgraph contact rows are not a route to touching sheets with what we have;
 (3) parallel winding distances are a network count field integrated along the connector, the information count-field already uses;
 (4) / (5) not built. Parked. Data: /vesuvius/ufsm/wgraph ({hold,ph,j}.tsv, o-*.tsv, summ.awk, oracle.awk). 1667 has no AFV.
+
+## Dense label store (denselab): every training label rendered once, on the NAS, read instead of recomputed (2026-11-19, branch denselab-20261119, mergeflag) -- DESIGN, step 1
+
+User (via lead, 11-19): render all training labels to dense 3-D volumes once, store them compressed on the NAS (forlinnas
+/srv/nas/ufsm, ~/nas), and have the sampler read them instead of computing them on the fly. NAS only, no dl.ash2txt upload.
+
+Inventory: what a training window's labels are made of today (try9's sources-scratch1-ph80-ho.json, 32 sources):
+
+| plane | made from | where | cached today |
+|---|---|---|---|
+| phase (u8 0..251, 255 unknown) | winding codes rasters / stamped meshes -> pair rule (band_onfly.c), per (codes set, rmax, level; pool2 pooled) | GPU or CPU | yes: dcache, key = codes path + stat + rmax + cell (~/.cache/ufsm/derived, zstd cells) |
+| codes (winding mod 14 x 18) | GT rasters (datafix-20261114/raster, volcomp lossless) or meshes (stamped per window) | stored / CPU | stored; meshes: only their vertex pack (.meshcodes-*.pack) |
+| ink (prob254, 255 unknown) | segments json (meshes + label rasters) splatted along the normal at the open face (inksplat.c) | GPU or CPU | yes: dcache level L (cell 128) + index.bin; L+1 pooled in memory |
+| ink MIL rays {p, n, y} | mesh points + signed normals (inkfly_rays), no plane | CPU | the tile index only |
+| fibre H / V (prob254) | AFV / .fib polylines (+ extra, map) rasterised (fiberraster.c) | GPU or CPU | NO (a 2-box reuse pool) |
+| band / side / w4 / wcomp | the phase (or band codes) per window | CPU / GPU | no (derived from phase) |
+| normals (6) + density + rv targets | the phase + papyrus per window, after augmentation | GPU | no |
+| papyrus / pm / rv papyrus / air mask | CT thresholds (iso) per window | CPU / GPU | no |
+
+So the derived cache already holds most of it: 170 GB on the desk today, all phase (P4 A48 / B48 at 3 levels 112 GB, 1667 A / B at
+3 levels 29 GB, 0172 15 GB, 1299 10 GB, 0139 7 GB) and ink (1.6 GB over 8 scrolls), but only the cells training has touched, local to
+the desk's /home disk, evicted LRU at 200 GB, and keyed by local paths + mtimes.
+
+What gets stored (one dense array per derived spec, the same values the on-the-fly path computes):
+- phase: per onfly spec x level, exactly the dcache array (its key hex). Every cell of the codes' support (+ rmax), not just the touched
+  ones. u8.
+- ink: per u2ink source, level L, the inkfly array (prob254 incl. 255 unknown = the known channel: known = v != 255, weight from the
+  sampler's existing rules); the MIL tile index (index.bin) beside it. Level L+1 stays a memory pooling of L (exact, cheap).
+- fibre H / V: per fibre source x level x plane: new, needs a dcache key (afv / extra / map files stat + cfg + CT key + level + plane
+  + a label version LBL_FIBRE). Today recomputed for every window: the main compute saved.
+- codes: archived beside (labcomp kind 1, 6-24x smaller than the volcomp-lossless rasters: 1667 A+B 9.4 GB -> ~0.5-1.5 GB, P4 107 GB
+  -> ~5-15 GB): not read by training once the phase is stored, kept so any phase variant can be rendered again from the NAS alone.
+- NOT stored: normals / density / rv / band / side / w4 / papyrus. They are cheap per-window functions of the phase and the CT that
+  must be evaluated after the window's spatial augmentation (a stored normal would have to be rotated, and its rounding would break
+  byte identity with today's targets). Storing their input (phase) removes all the expensive work.
+- Ink "signed band distance" for the MIL loss: today MIL works on rays (mesh point, signed normal, label) sampled along t in [-R, R];
+  there is no voxel plane. A dense equivalent (per voxel: signed distance along the nearest labelled mesh point's normal, int8 in level-L
+  voxels, 127 = none; plus that point's label bit) would be a NEW loss input, not byte-identical to the ray path. Proposal: store the
+  rays' tile index as today (exact) now; the dense signed-distance plane as a separate opt-in plane + loss variant, its own A/B.
+
+Format and read path:
+- Store = a zarr v3 array per key under ~/nas/denselab/<24-hex key>/ (inputs.txt with the key text, zarr.json), chunk = the dcache
+  cell (128 / 256), sharded 4^3 cells per shard file (NAS file counts: P4 phase would be ~150k cell files otherwise), inner codec zstd
+  (the dcache's own cell coding; byte-exact; volcomp lossless as the alternative where it wins: phase is smooth mod 252, measured on
+  1667 before choosing). labcomp only for codes (55 Mvox/s read: archive format).
+- dcache gets a read-only tier: on a cell miss (memory, local disk) it reads the cell from $UFSM_DENSELAB/<hex> (opt-in: unset = off,
+  as before; the default flips to ~/nas/denselab once 1667 is complete and a batch-hash A/B on real 1667 windows passes) before computing, and writes it to the local disk cache as today. The NAS is never read hot: rclone FUSE does
+  147 MB/s sequential (measured, one 223 MB file) but per-file latency is high, so the local dcache stays the hot tier and the NAS
+  replaces the compute. Nothing changes in the sources json: same specs, same keys, same bytes; a store missing a cell falls back to
+  the compute (logged once per key).
+- `ufsm denselab-render SOURCES.json [--source NAME] [--kind phase,ink,fibre] --out ROOT [--threads N] [--gpu D]`: opens each source's
+  derived arrays exactly as the sampler does (sources.c), enumerates the cells of the label support (codes chunk map dilated by rmax;
+  ink index tiles; fibre polyline boxes + radius), computes them (GPU allowed on a free card; CPU otherwise) and writes the shards.
+  Resumable per shard; a store is marked complete (done file with cell count, bytes, seconds).
+- Keys stay the dcache keys (local paths + mtimes): a re-raster or a moved file changes the key and the store is simply not found
+  (compute fallback), never stale. Pods cannot use these keys (different paths): out of scope (NAS only).
+
+Expected sizes (zstd, from today's dcache cells; the full support is larger than the touched part, ~1-2x):
+
+| scroll | phase (all specs, all levels) | ink | fibre | codes (labcomp) |
+|---|---|---|---|---|
+| Paris 4 | ~110-200 GB | 0.9 GB | to measure (4 fibre sources) | ~5-15 GB |
+| 1667 | ~30-55 GB | 0.4 GB | none in try9's set | ~0.5-1.5 GB |
+| 0172 / 1299 / 0139 / 0500P2 / 1218 | ~35-60 GB | 0.3 GB (0139, 0814, MAN5, 0009B, 0841, 0500P2) | 1447 / 0175A / 0125 / 0139 / 1451 / 0332: to measure | ~1-3 GB |
+
+Total ~0.2-0.35 TB on a 30 TB NAS (23 TB free). Step 2 (1667 end to end) measures the real 1667 numbers and the fibre per-source size
+before anything else is rendered.
+
+Test (step 2, new test_denselab, CPU): a fixture scroll with codes, an ink segment and an AFV fibre: render the store, then sample
+windows (several levels, augmentation off and on) once with the store and once on the fly with an empty cache: label planes byte for
+byte equal; a store with a missing shard falls back to the compute and is still equal.
 
 ## How much GT does the global count need? Sparse GT anchors in count-field; P4 phase misses by normal gap (2026-11-18/19, branch anchors-20261118, mergeflag)
 
