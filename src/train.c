@@ -52,6 +52,11 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 /* option lookups go through src/optcheck.h: opt_unread() warns about command-line --flags no lookup has asked for (2026-11-12: train
    silently ignored a mistyped "--sampler-only 200", the env UFSM_SAMPLER_ONLY being the real switch, and trained on a GPU for an hour).
    train checks once its setup is done (the options read only later in the loop are few); main() checks again when any command returns */
+/* an optimizer label without the adaptive-controller tags "+la" / "+dg" (they carry no optimizer state of their own across a --resume) */
+static void opt_label_core(const char *in, char *out, size_t cap) {
+    size_t k = 0; for (const char *p = in; *p && k + 1 < cap; ) { if (!strncmp(p, "+la", 3) || !strncmp(p, "+dg", 3)) { p += 3; continue; } out[k++] = *p++; }
+    out[k] = 0;
+}
 static const char *opt(int argc, char **argv, const char *name, const char *dflt) {
     opt_n(name);
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(name))) return argv[i + 1];
@@ -3139,7 +3144,10 @@ int cmd_train(int argc, char **argv) {
                  muon_lars ? "+la" : "", muon_dog ? "+dg" : "", muon_fro ? "+fo" : "", muon_spec == 2 ? "+rm" : "", muon_cwd ? "+cw" : ""); optname = optlabel; }
     /* (the cross-optimizer --resume check, after the variant label: before (11-15) it compared the checkpoint's "muon+nm" with the plain
        --opt "muon", so a --normuon run refused its own checkpoint: try7 gave up at step 450, rc 2 x 3) */
-    if (has_runtime > 0 && strcmp(resumed_runtime.optimizer, optname) && !opt_reset) {
+    /* (admuon2 11-19: the adaptive controllers' tags (+la lars, +dg DoG) change only the per-matrix lr multipliers; Muon's momentum and
+       NorMuon's rows carry over, and the controllers' own state starts fresh (adm_ema / adm_dog absent): a warm start may add or drop them) */
+    char oa[32], ob[32]; opt_label_core(resumed_runtime.optimizer, oa, sizeof oa); opt_label_core(optname, ob, sizeof ob);
+    if (has_runtime > 0 && strcmp(oa, ob) && !opt_reset) {
         fprintf(stderr, "--resume %s: trained with --opt %s, this run --opt %s: the optimizer states do not carry over; --opt-reset 1 starts them at zero\n", resume, resumed_runtime.optimizer, optname);
         return 2;
     }
