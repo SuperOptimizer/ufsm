@@ -248,10 +248,11 @@ int cmd_ink_rayface(int argc, char **argv) {
         fprintf(stderr, "usage: ufsm ink-rayface SOURCES.json [--source N1,N2] [--threads 8] [--gpu D] [--force 1] [--rays 2] [--verify N --P 256 --stride 2 --R 10 --seed 1]\n"
                         "  --rays S: also the per-tile ray lists of MIL mode 1 at stride S (0: none); --verify compares the rays a window gets from them / the bits\n"
                         "  with the face search on the CT; --diag N: the CT profiles of N faceless pixels per source, classified (threshold vs mesh offset)\n"
-                        "  --profile N --pvol NAME=ROOT|KEY|UM[;NAME=..] [--pbox z,y,x,nz,ny,nx] [--pout F.tsv] [--pauc F.tsv] [--per-tile 8] [--mil-um 50]:\n"
+                        "  --profile N --pvol NAME=ROOT|KEY|UM[;NAME=..] [--pbox z,y,x,nz,ny,nx] [--pout F.tsv] [--pauc F.tsv] [--per-tile 8] [--pfeat 1] [--mil-um 50]:\n"
                         "  N supervised pixels' (at most per-tile of each label tile) profiles along the\n"
                         "  normal (t -40..40 level-0 voxels) of the CT and each volume (uint8 store, voxel UM um, the CT's frame) vs the face band / MIL band,\n"
-                        "  and each volume's AUC against the labels at every t (relative to the mesh, to the open face, the faceless pixels; --pauc: the table)\n"
+                        "  and each volume's AUC against the labels at every t (relative to the mesh, to the open face, the faceless pixels; --pauc: the table);\n"
+                        "  --pfeat 1: per volume also its derivative along t (NAME.g) and in-plane texture (NAME.s) as channels (e.g. the CT at level 0 as a volume)\n"
                         "  precomputes the MIL rays' face-drop bit of every supervised label pixel of each onfly ink target (rayface.bin in its cache dir)\n");
         return 2;
     }
@@ -262,7 +263,7 @@ int cmd_ink_rayface(int argc, char **argv) {
     const int P = opt_atoi("--P", opt(argc, argv, "--P", "256")), stride = opt_atoi("--stride", opt(argc, argv, "--stride", "2"));
     const float R = (float)atof(opt(argc, argv, "--R", "10")); uint64_t seed = (uint64_t)opt_atoi("--seed", opt(argc, argv, "--seed", "1"));
     const int npro = opt_atoi("--profile", opt(argc, argv, "--profile", "0")); const char *pout = opt(argc, argv, "--pout", nullptr), *pvs = opt(argc, argv, "--pvol", nullptr);
-    const char *pauc = opt(argc, argv, "--pauc", nullptr); const int ptile = opt_atoi("--per-tile", opt(argc, argv, "--per-tile", "8"));
+    const char *pauc = opt(argc, argv, "--pauc", nullptr); const int ptile = opt_atoi("--per-tile", opt(argc, argv, "--per-tile", "8")), pfeat = opt_atoi("--pfeat", opt(argc, argv, "--pfeat", "0"));
     const double milum = atof(opt(argc, argv, "--mil-um", "50")); int64_t pbox[6]; long long pb6[6]; const char *pbs = opt(argc, argv, "--pbox", nullptr);
     const int pbox_ok = pbs && sscanf(pbs, "%lld,%lld,%lld,%lld,%lld,%lld", pb6, pb6 + 1, pb6 + 2, pb6 + 3, pb6 + 4, pb6 + 5) == 6;
     if (pbs && !pbox_ok) { fprintf(stderr, "ink-rayface: --pbox z,y,x,nz,ny,nx (level 0)\n"); return 2; }
@@ -302,7 +303,7 @@ int cmd_ink_rayface(int argc, char **argv) {
             if (npro > 0) {   /* --profile: the --pvol volumes along the label pixels' normals */
                 FILE *pf = pout ? fopen(pout, nh > 1 ? "a" : "w") : nullptr, *af = pauc ? fopen(pauc, nh > 1 ? "a" : "w") : nullptr;
                 if ((pout && !pf) || (pauc && !af)) { fprintf(stderr, "ink-rayface: cannot write %s\n", pout && !pf ? pout : pauc); rc = 1; break; }
-                if (inkfly_profile(h, npro, seed, npv, pvz, pvum, (const char *const *)pvn, pbox_ok ? pbox : nullptr, milum, ptile, pf, af)) { fprintf(stderr, "ink-rayface: %s: profile FAILED\n", s->name); rc = 1; }
+                if (inkfly_profile(h, npro, seed, npv, pvz, pvum, (const char *const *)pvn, pbox_ok ? pbox : nullptr, milum, ptile, pfeat, pf, af)) { fprintf(stderr, "ink-rayface: %s: profile FAILED\n", s->name); rc = 1; }
                 if (pf && fclose(pf)) rc = 1;
                 if (af && fclose(af)) rc = 1;
                 if (rc) break;

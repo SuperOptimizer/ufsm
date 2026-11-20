@@ -2083,24 +2083,30 @@ int inkfly_face_diag(void *handle, int nsample, uint64_t seed) {
    face / faceless) the mean profile, and for ink pixels with a face the peak offset t_peak - t_f histogram and the share of the profile
    mass in the face band and in |t| <= mil (level-0 voxels). A volume voxel 255 is unknown (prob254 targets): -1 in the TSV, out of the
    AUC, the peak and the mass */
-int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *vols, const double *vum, const char *const *vname, const int64_t *box, double mil_um, int per_tile, FILE *tsv, FILE *auc) {
+int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *vols, const double *vum, const char *const *vname, const int64_t *box, double mil_um, int per_tile, int feat, FILE *tsv, FILE *auc) {
     inkfly *f = handle; if (!f || !f->nT) { fprintf(stderr, "ink profile: no supervised tiles\n"); return -1; }
     const inksplat_cfg *c = &f->c; const double V = f->V, sign = c->flip ? -1 : 1, mil = mil_um / c->ct_um; enum { TR = 40, NS = 2 * TR + 1, VMAX = 8 }; const int PT = per_tile > 0 ? per_tile : 8;
     if (nv > VMAX) { fprintf(stderr, "ink profile: at most %d volumes\n", VMAX); return -1; }
     const int lo = (int)floor(c->face_lo), hi = (int)ceil(c->face_hi), fa = (int)floor(c->face_a), fb = (int)ceil(c->face_b);
+    /* channels: 0 the CT (onfly level), 1 .. nv the volumes, then with feat per volume k its derived channels NAME.g (the signed derivative
+       along t, 128 + 2 dv/dt per level-0 voxel) and NAME.s (in-plane texture: 4 x the std over a 3 x 3 grid of one volume voxel spacing
+       in the tangent plane) */
+    const int nd = nv + 1, nch = nd + (feat ? 2 * nv : 0); char cname[3 * VMAX + 1][48];
+    snprintf(cname[0], sizeof cname[0], "CT"); for (int k = 0; k < nv; k++) { snprintf(cname[1 + k], sizeof cname[0], "%s", vname[k]);
+        if (feat) { snprintf(cname[nd + 2 * k], sizeof cname[0], "%s.g", vname[k]); snprintf(cname[nd + 2 * k + 1], sizeof cname[0], "%s.s", vname[k]); } }
     /* accumulators: group g = 2 * y + faceless; per channel (0 the CT, 1 + k the volumes) the profile sums */
-    double (*sum)[4][NS] = calloc((size_t)(nv + 1), sizeof *sum); uint64_t ng[4] = {0}, cls[4] = {0};
-    enum { PB = 13 }; uint64_t (*pk)[PB] = calloc((size_t)(nv + 1), sizeof *pk); double (*mband)[3] = calloc((size_t)(nv + 1), sizeof *mband);
+    double (*sum)[4][NS] = calloc((size_t)nch, sizeof *sum); uint64_t ng[4] = {0}, cls[4] = {0};
+    enum { PB = 13 }; uint64_t (*pk)[PB] = calloc((size_t)nch, sizeof *pk); double (*mband)[3] = calloc((size_t)nch, sizeof *mband);
     size_t *ord = malloc(f->nT * sizeof *ord); cpx *X = nullptr; size_t cap = 0; int got = 0;
     /* AUC(t) of every channel against the labels: ref 0 the mesh (all pixels, t), 1 the face (pixels with a face, t - t_f), 2 the mesh (faceless only) */
-    uint64_t (*ah)[3][NS][2][256] = calloc((size_t)(nv + 1), sizeof *ah); size_t *pick = malloc((size_t)PT * sizeof *pick);
+    uint64_t (*ah)[3][NS][2][256] = calloc((size_t)nch, sizeof *ah); size_t *pick = malloc((size_t)PT * sizeof *pick);
     if (!sum || !pk || !mband || !ord || !ah || !pick) { free(sum); free(pk); free(mband); free(ord); free(ah); free(pick); return -1; }
     size_t nt = 0; for (size_t t = 0; t < f->nT; t++) {   /* the tiles meeting the box */
         int in = 1; if (box) for (int d = 0; d < 3; d++) if (f->T[t].hi[d] < box[d] || f->T[t].lo[d] >= box[d] + box[3 + d]) in = 0;
         if (in) ord[nt++] = t; }
     for (size_t i = nt; i > 1; i--) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; const size_t j = (size_t)((seed >> 20) % i), s = ord[i - 1]; ord[i - 1] = ord[j]; ord[j] = s; }
-    if (tsv) { fprintf(tsv, "tile\tpx\ty\tface\tclass\tPz\tPy\tPx\tNz\tNy\tNx"); for (int ch = 0; ch <= nv; ch++) for (int k = 0; k < NS; k++) fprintf(tsv, "\t%s%d", ch ? vname[ch - 1] : "ct", k - TR); fprintf(tsv, "\n"); }
-    float pr[VMAX + 1][NS];
+    if (tsv) { fprintf(tsv, "tile\tpx\ty\tface\tclass\tPz\tPy\tPx\tNz\tNy\tNx"); for (int ch = 0; ch < nch; ch++) for (int k = 0; k < NS; k++) fprintf(tsv, "\t%s%d", ch ? cname[ch] : "ct", k - TR); fprintf(tsv, "\n"); }
+    float pr[3 * VMAX + 1][NS];
     for (size_t oi = 0; oi < nt && got < nsample; oi++) {
         const size_t t = ord[oi]; size_t np = 0; double lo3[3] = {1e300, 1e300, 1e300}, hi3[3] = {-1e300, -1e300, -1e300};
         if (tile_px(f, t, &X, &np, &cap, lo3, hi3) || !np) continue;
@@ -2127,6 +2133,22 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
                     if (ch && v >= 0) {   /* a volume's 255 = unknown (prob254 targets): the nearest voxel 255 -> -1, left out of the AUC / peak / mass */
                         int64_t r3[3]; for (int d = 0; d < 3; d++) { r3[d] = (int64_t)lround(qq[d]); if (r3[d] > cn[ch][d] - 1) r3[d] = cn[ch][d] - 1; }
                         if (buf[ch][((size_t)r3[0] * cn[ch][1] + r3[1]) * cn[ch][2] + r3[2]] == 255) pr[ch][k] = -1; } } }
+            if (feat) {   /* the derived channels of each volume */
+                double ta[3], tb[3]; { const double *N = x->N; const int ax = fabs(N[0]) <= fabs(N[1]) && fabs(N[0]) <= fabs(N[2]) ? 0 : fabs(N[1]) <= fabs(N[2]) ? 1 : 2;
+                    double e[3] = {0, 0, 0}; e[ax] = 1; ta[0] = N[1] * e[2] - N[2] * e[1]; ta[1] = N[2] * e[0] - N[0] * e[2]; ta[2] = N[0] * e[1] - N[1] * e[0];
+                    const double l = sqrt(ta[0] * ta[0] + ta[1] * ta[1] + ta[2] * ta[2]); for (int d = 0; d < 3; d++) ta[d] /= l;
+                    tb[0] = N[1] * ta[2] - N[2] * ta[1]; tb[1] = N[2] * ta[0] - N[0] * ta[2]; tb[2] = N[0] * ta[1] - N[1] * ta[0]; }
+                for (int k0 = 0; k0 < nv; k0++) { const int ch = 1 + k0; const double s = vum[k0] / c->ct_um, of = (s - 1) / 2; float *G = pr[nd + 2 * k0], *T = pr[nd + 2 * k0 + 1];
+                    for (int k = 0; k < NS; k++) {
+                        const float a = pr[ch][k > 0 ? k - 1 : 0], b = pr[ch][k < NS - 1 ? k + 1 : NS - 1];
+                        G[k] = a < 0 || b < 0 ? -1 : fminf(255.f, fmaxf(0.f, 128.f + 2.f * (b - a) / (k > 0 && k < NS - 1 ? 2.f : 1.f)));
+                        const double tt = (k - TR) * sign; double m = 0, m2 = 0; int ok = 1;
+                        for (int i = -1; i <= 1 && ok; i++) for (int j = -1; j <= 1; j++) { double qq[3];
+                            for (int d = 0; d < 3; d++) qq[d] = (x->P[d] + tt * x->N[d] + s * (i * ta[d] + j * tb[d]) - of) / s - co[ch][d];
+                            const float v = tri_box_z(buf[ch], cn[ch], 0, cn[ch][0], qq[0], qq[1], qq[2]); if (v < 0) { ok = 0; break; } m += v; m2 += (double)v * v; }
+                        T[k] = ok ? fminf(255.f, 4.f * (float)sqrt(fmax(m2 / 9 - (m / 9) * (m / 9), 0))) : -1;
+                    } }
+            }
             float sm[NS]; for (int k = 0; k < NS; k++) sm[k] = 0.25f * (pr[0][k > 0 ? k - 1 : 0] + 2 * pr[0][k] + pr[0][k < NS - 1 ? k + 1 : NS - 1]);
             /* the face as rays_face: the smoothed samples of [lo, hi] only (its smoothing clamps at the range ends) */
             float rs[256]; const int ns = hi - lo + 1; for (int k = 0; k < ns; k++) rs[k] = pr[0][lo + k + TR];
@@ -2137,7 +2159,7 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
                 for (int k = 0; k < NS; k++) { const int tv = k - TR; if (tv >= lo && tv <= hi) { if (sm[k] > mx) mx = sm[k]; } else if (sm[k] >= c->iso && abs(tv) < abs(near)) near = tv; }
                 cl = mx >= c->iso ? 0 : near != 1 << 20 ? 1 : mx >= c->iso / 2.f ? 2 : 3; cls[cl]++; }
             const int g = 2 * (x->y != 0) + (ft == FACE_NONE); ng[g]++; got++;
-            for (int ch = 0; ch <= nv; ch++) {
+            for (int ch = 0; ch < nch; ch++) {
                 for (int k = 0; k < NS; k++) { sum[ch][g][k] += fmaxf(pr[ch][k], 0); if (pr[ch][k] < 0) continue; const int b = pr[ch][k] > 255 ? 255 : (int)lroundf(pr[ch][k]), yy = x->y != 0;
                     ah[ch][0][k][yy][b]++; if (ft == FACE_NONE) ah[ch][2][k][yy][b]++; else { const int r = k - ft; if (r >= 0 && r < NS) ah[ch][1][r][yy][b]++; } }
                 if (g == 2) {   /* ink with a face: the peak offset and the band shares */
@@ -2149,7 +2171,7 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
             }
             if (tsv) { fprintf(tsv, "%zu\t%u\t%d\t", t, x->px, x->y); if (ft == FACE_NONE) fprintf(tsv, "NA\t%c", "abcd"[cl]); else fprintf(tsv, "%d\tF", ft);
                        fprintf(tsv, "\t%.2f\t%.2f\t%.2f\t%.4f\t%.4f\t%.4f", x->P[0], x->P[1], x->P[2], sign * x->N[0], sign * x->N[1], sign * x->N[2]);
-                       for (int ch = 0; ch <= nv; ch++) for (int k = 0; k < NS; k++) fprintf(tsv, "\t%.1f", pr[ch][k]); fprintf(tsv, "\n"); }
+                       for (int ch = 0; ch < nch; ch++) for (int k = 0; k < NS; k++) fprintf(tsv, "\t%.1f", pr[ch][k]); fprintf(tsv, "\n"); }
         }
         for (int ch = 0; ch <= nv; ch++) free(buf[ch]);
         if (bad) { free(X); free(sum); free(pk); free(mband); free(ord); free(ah); free(pick); return -1; }
@@ -2159,8 +2181,8 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
     printf("ink profile: %d pixels of %zu tiles (ink face %llu, ink faceless %llu, no-ink face %llu, no-ink faceless %llu; faceless a/b/c/d %llu/%llu/%llu/%llu), t in level-0 voxels "
            "(%.3g um) along the face normal, face band [t_f %+d, t_f %+d], MIL |t| <= %.1f\n", got, nt, (unsigned long long)ng[2], (unsigned long long)ng[3], (unsigned long long)ng[0],
            (unsigned long long)ng[1], (unsigned long long)cls[0], (unsigned long long)cls[1], (unsigned long long)cls[2], (unsigned long long)cls[3], c->ct_um, fa, fb, mil);
-    for (int ch = 0; ch <= nv; ch++) {
-        const char *nm = ch ? vname[ch - 1] : "CT";
+    for (int ch = 0; ch < nch; ch++) {
+        const char *nm = cname[ch];
         for (int g = 0; g < 4; g++) { if (!ng[g]) continue; printf("ink profile: %-12s %-17s mean, t -40..40 step 4:", nm, gn[g]);
             for (int k = 0; k < NS; k += 4) printf(" %.0f", sum[ch][g][k] / ng[g]); printf("\n"); }
         if (ng[2]) { printf("ink profile: %-12s ink, face: peak t - t_f (<-20 <-12 <-8 <-6 <-3 <0 0 <=3 <=6 <=8 <=12 <=20 >20):", nm);
@@ -2170,8 +2192,8 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
     /* AUC(t): stdout t -16 .. 16 per volume and reference, the best t; the whole table (t -40 .. 40) to auc */
     static const char *rn[3] = {"mesh", "face", "mesh-faceless"};
     if (auc) fprintf(auc, "volume\tref\tt\tn_ink\tn_no\tauc\n");
-    for (int ch = 0; ch <= nv; ch++) for (int r = 0; r < 3; r++) {
-        const char *nm = ch ? vname[ch - 1] : "CT"; double best = -1; int bt = 0; char line[2048]; int ln = 0;
+    for (int ch = 0; ch < nch; ch++) for (int r = 0; r < 3; r++) {
+        const char *nm = cname[ch]; double best = -1; int bt = 0; char line[2048]; int ln = 0;
         for (int k = 0; k < NS; k++) {
             const uint64_t *h1 = ah[ch][r][k][1], *h0 = ah[ch][r][k][0]; uint64_t n1 = 0, n0 = 0; double a = 0, c0 = 0;   /* AUC = P(ink > no) + P(=)/2 */
             for (int v = 0; v < 256; v++) { n1 += h1[v]; n0 += h0[v]; }
