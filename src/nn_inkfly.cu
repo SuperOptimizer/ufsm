@@ -195,6 +195,19 @@ extern "C" void inkfly_gpu_device(int dev) { g_dev = dev; }
    from then on (the plan already holds the trainer's own memory, so the 1536 MiB default guard shrinks to what the planner left); an
    explicit UFSM_INKFLY_RESERVE_MB stays */
 extern "C" size_t inkfly_gpu_budget(void) { pthread_mutex_lock(&g_mu); budget_init(); const size_t b = g_budget; pthread_mutex_unlock(&g_mu); return b; }
+/* the budget from the device's free memory once the trainer holds its plan (2026-11-20, lead: FR1's P 384 windows hit the fixed 1024 MiB
+   with 673 MiB held while the card had room): budget = what the ink holds + the free memory - keep, reserve = keep. An explicit
+   UFSM_INKFLY_GPU_MB stays. Returns the budget (0: unchanged) */
+extern "C" size_t inkfly_gpu_budget_from_free(size_t keep) {
+    pthread_mutex_lock(&g_mu); budget_init(); size_t fr = 0, tot = 0, b = 0; const char *e = getenv("UFSM_INKFLY_GPU_MB");
+    int prev = -1; cudaGetDevice(&prev);
+    if (!(e && atol(e) > 0) && cudaSetDevice(g_dev) == cudaSuccess && cudaMemGetInfo(&fr, &tot) == cudaSuccess) {
+        b = g_held + (fr > keep ? fr - keep : 0); if (b < ((size_t)64 << 20)) b = (size_t)64 << 20;
+        g_budget = b; const char *r = getenv("UFSM_INKFLY_RESERVE_MB"); if (!(r && atol(r) >= 0)) g_reserve = keep;
+    } else (void)cudaGetLastError();
+    if (prev >= 0) cudaSetDevice(prev);
+    pthread_mutex_unlock(&g_mu); return b;
+}
 extern "C" void inkfly_gpu_set_reserve(size_t bytes) {
     pthread_mutex_lock(&g_mu); budget_init(); const char *r = getenv("UFSM_INKFLY_RESERVE_MB"); if (!(r && atol(r) >= 0)) g_reserve = bytes; pthread_mutex_unlock(&g_mu);
 }

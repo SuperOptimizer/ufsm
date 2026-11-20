@@ -463,6 +463,7 @@ static float ww_mil(int dev, int nmil) {   /* the MIL head's weight for a window
     return (float)w;
 }
 static int g_hs_tcache;   /* --hs-tcache 1 (UFSM_HS_TCACHE=0 / 1 overrides: tests): head_slab_pass keeps the slabs' derived targets for the gradient pass */
+static size_t g_tc_reserve;   /* mgpu: config (--hs-tcache: the planner's share, allocated at the first step) */
 static size_t g_val_reserve;   /* --val-P: device bytes the planner keeps free for that copy's inference build */
 static unet *g_val_u;          /* --val-P: that copy */
 
@@ -4447,7 +4448,7 @@ int cmd_train(int argc, char **argv) {
             }
             if (g_hs_tcache && g_unwrap2 && g_side == 2 && B == 1) {   /* --hs-tcache: its bytes stay out of the plan's budget (allocated at the first training step) */
                 const size_t tcr = ((size_t)g_Pz + 128) * P * P * ((size_t)g_side_nc + 1 + (g_rv ? 3 : 0) + 8);   /* (+ 128 planes: the last slab's rounding at any slab depth in use) */
-                fmin = fmin > tcr ? fmin - tcr : 0;
+                fmin = fmin > tcr ? fmin - tcr : 0; g_tc_reserve = tcr;
                 fprintf(stderr, "memory: --hs-tcache keeps %.2f GB free for the head slabs' derived targets (%d B a voxel)\n", tcr / 1e9, g_side_nc + 1 + (g_rv ? 3 : 0) + 8);
             }
             if (g_ink_dev >= 0 && inkfly_gpu_budget && inkfly_gpu_set_reserve) {   /* the on-the-fly ink chunks on a training card: their budget stays
@@ -5270,6 +5271,12 @@ int cmd_train(int argc, char **argv) {
     }
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
     int prof = ufsm_env_on("UFSM_PROF");
+    if (g_ink_dev >= 0 && inkfly_gpu_budget_from_free) {   /* the on-the-fly ink's budget from what the plan left (the first step's lazy
+        buffers kept back: MIL, --val-P, --hs-tcache, when the ink shares a training card), not the fixed 1024 MiB (2026-11-20 FR1) */
+        int same = 0; for (int g = 0; g < ng; g++) same |= nn_dev_phys(G[g].dev) == nn_dev_phys(g_ink_dev);
+        const size_t keep = ((size_t)256 << 20) + (same ? g_mil_reserve + g_val_reserve + g_tc_reserve : 0), b = inkfly_gpu_budget_from_free(keep);
+        if (b) fprintf(stderr, "memory: the on-the-fly ink's GPU budget %.2f GB on GPU %d (its free memory less %.2f GB kept)\n", b / 1e9, g_ink_dev, keep / 1e9);
+    }
     double t0 = now(), tlog = t0, wait = 0, gate = 0, acc_active = 0, acc_loss = 0, acc_bce = 0, acc_dice = 0, acc_g = 0; int nacc = 0;
     if (seconds) fprintf(stderr, "training budget %.1fs, time-based warmup %.1fs\n", seconds, warmup_seconds);
     if (schedule_seconds) fprintf(stderr,"wall-time LR horizon %.1fs, elapsed %.1fs, warmup %.1fs; finite cover/ramp origin preserved\n",schedule_seconds,schedule_elapsed,warmup_seconds);
