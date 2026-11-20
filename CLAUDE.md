@@ -117,3 +117,7 @@ scripts/test/desk_suite.sh BRANCH   # push to the desk, build and run the suite 
   heavy job per agent. Card-1 GPU tests go into the shared batched slot (inksdk schedules it), scoring runs one job at a time.
 - **Widths** are multiples of 32, or exactly 8 / 16 (else gradients drop to MX-fp8 and the lean level-0 modes switch off).
 - **Disk:** outputs to /vesuvius or the NAS, never ~; delete or move to the NAS what no live run or DESIGN section needs.
+- **No approval prompts.** Don't send compound shell one-liners that need a human to approve (loops / `case` with `rm`, `sed -i`,
+  `mv` on many files): use the Edit tool for file edits, or write the steps to a script under /vesuvius/ufsm/<agent>/ and run that.
+  Scripts reference stable links (e.g. /vesuvius/ufsm/bin/ufsm-<agent> → current binary), never worktree paths, so repointing is one
+  `ln -sfn`.
