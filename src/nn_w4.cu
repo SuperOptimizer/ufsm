@@ -9,6 +9,7 @@
                   offsets the host's prefix sums give: tiles in raster order, rows in scan order = the CPU's run numbering)
      w4_out_k     per voxel the winding code and the component from its run's root offset / component byte (w4_pass1) */
 #include <cuda_runtime.h>
+#include "blksync.cuh"   /* (w4_wait) */
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -185,9 +186,13 @@ static volatile int g_w4_inject;
 static bool w4_inj(void) { return g_w4_inject > 0 && __sync_sub_and_fetch(&g_w4_inject, 1) >= 0; }
 
 #define CK(x) do { if ((x) != cudaSuccess) return -2; } while (0)
-/* cudaStreamSynchronize spins a core while the stream waits behind the trainer's kernels: poll with short sleeps instead (the
-   worker's CPU time is what this path is for) */
+/* cudaStreamSynchronize spins a core while the stream waits behind the trainer's kernels: the worker sleeps on a blocking event
+   (blk_sync; 11-17: the 100 us nanosleep poll that was here made ~12 % of the workers' context switches, trainperf), the poll is kept
+   for UFSM_SPIN_SYNC=1 (the A/B's old arm) */
 cudaError_t w4_wait(cudaStream_t st) {
+    static int poll = -1;
+    if (poll < 0) { const char *e = getenv("UFSM_SPIN_SYNC"); poll = e && atoi(e) > 0; }
+    if (!poll) return blk_sync(st);
     for (;;) {
         const cudaError_t e = cudaStreamQuery(st);
         if (e != cudaErrorNotReady) return e;

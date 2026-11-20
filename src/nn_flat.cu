@@ -198,11 +198,9 @@ extern "C" int flat_slim_gpu(const double *g, const double *A, const int *tri, i
     int ndev = 0; if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) { cudaGetLastError(); return -1; }
     if (dev >= 0) { if (dev >= ndev || cudaSetDevice(dev) != cudaSuccess) { cudaGetLastError(); return -1; } }
     else if (cudaGetDevice(&dev) != cudaSuccess) { cudaGetLastError(); return -1; }
-    static pthread_mutex_t fmu = PTHREAD_MUTEX_INITIALIZER; static unsigned flags_set = 0;   /* per device: host waits block instead of spinning
-                                                                                               (the desk's cores are busy with other jobs) */
-    pthread_mutex_lock(&fmu);
-    if (dev < 32 && !(flags_set >> dev & 1)) { flags_set |= 1u << dev; if (cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) != cudaSuccess) cudaGetLastError(); }
-    pthread_mutex_unlock(&fmu);
+    /* (no cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) here any more: mcudahw ignored it until microc devflags-20261117, and
+       measured with it applied (11-17, PHerc0332 strip, card 1, 4 pairs) blocking cost +17 % wall for -6 % CPU: the SLIM chunks make
+       many short round trips and a woken nice-19 thread waits for a core. Flatten's waits spin.) */
     flg G; memset(&G, 0, sizeof G); G.nv = nv; G.nt = nt; G.n2 = 2LL * nv;
     const size_t T = (size_t)nt, V2 = (size_t)G.n2 * 8;
     int ok = cudaMalloc(&G.g, T * 48) == cudaSuccess && cudaMalloc(&G.A, T * 8) == cudaSuccess && cudaMalloc(&G.M, T * 24) == cudaSuccess &&
