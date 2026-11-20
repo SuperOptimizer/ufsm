@@ -84,12 +84,36 @@ typedef struct { const ft_vol *V; double sup, coh, cturn, h; } ft_par;
    iso-W surface through the current point, the point is pulled back onto the line's W after each step, and the line stops once its
    unwrapped W has drifted more than --sheet-tol turn from the seed's. With it, --gap-mm G carries a line through up to G of
    unsupported / incoherent field along its smoothed in-sheet direction (resuming where the field agrees within --turn). */
-typedef struct { const fit_set *S; double sc, org[3], off[3], tol; } ft_sheet;   /* set voxel = (box voxel + off + 0.5) sc - 0.5 - org */
+/* --sheet-phase ROOT KEY instead: a band-phase raster on the box's grid (0..251 = turns x 252, 255 unknown; GT phase as the oracle gate,
+   or a predicted one): W = the phase interpolated circularly (corners unwrapped against the first known one), its gradient by central
+   differences continued across the wrap. A line's W is unwrapped along it either way. */
+typedef struct { const fit_set *S; const uint8_t *ph; int64_t pn[3]; double sc, org[3], off[3], tol; } ft_sheet;   /* set voxel = (box voxel + off + 0.5) sc - 0.5 - org */
+static double ft_Wph(const ft_sheet *Q, const double p[3]) {
+    int64_t i0[3]; double f[3];
+    for (int d = 0; d < 3; d++) { if (!(p[d] >= 0 && p[d] <= (double)(Q->pn[d] - 1))) return NAN; i0[d] = (int64_t)p[d]; if (i0[d] > Q->pn[d] - 2) i0[d] = Q->pn[d] - 2; if (i0[d] < 0) i0[d] = 0; f[d] = p[d] - (double)i0[d]; }
+    double s = 0, sw = 0, ref = NAN;
+    for (int c = 0; c < 8; c++) {
+        const double w = (c & 4 ? f[0] : 1 - f[0]) * (c & 2 ? f[1] : 1 - f[1]) * (c & 1 ? f[2] : 1 - f[2]);
+        const int v = Q->ph[((size_t)(i0[0] + (c >> 2)) * Q->pn[1] + (size_t)(i0[1] + ((c >> 1) & 1))) * Q->pn[2] + (size_t)(i0[2] + (c & 1))];
+        if (v > 251 || !(w > 0)) continue;
+        double t = v / 252.0; if (isnan(ref)) ref = t; else t -= round(t - ref);
+        s += w * t; sw += w;
+    }
+    return sw > 0.25 ? s / sw : NAN;
+}
 static double ft_W(const ft_sheet *Q, const double p[3]) {
+    if (Q->ph) return ft_Wph(Q, p);
     double n[3]; for (int d = 0; d < 3; d++) n[d] = (p[d] + Q->off[d] + 0.5) * Q->sc - 0.5 - Q->org[d];
     return fit_set_W(Q->S, n[0], n[1], n[2]);
 }
 static double ft_gW(const ft_sheet *Q, const double p[3], double g[3]) {   /* grad W per box voxel */
+    if (Q->ph) {
+        double m2 = 0;
+        for (int d = 0; d < 3; d++) { double a[3] = {p[0], p[1], p[2]}, b[3] = {p[0], p[1], p[2]}; a[d] += 1; b[d] -= 1;
+            const double wa = ft_Wph(Q, a), wb = ft_Wph(Q, b); if (!isfinite(wa) || !isfinite(wb)) { g[0] = g[1] = g[2] = 0; return 0; }
+            double dd = wa - wb; dd -= round(dd); g[d] = dd / 2; m2 += g[d] * g[d]; }
+        return sqrt(m2);
+    }
     double n[3]; for (int d = 0; d < 3; d++) n[d] = (p[d] + Q->off[d] + 0.5) * Q->sc - 0.5 - Q->org[d];
     const double m = fit_set_gradW(Q->S, n[0], n[1], n[2], 0.5, g); for (int d = 0; d < 3; d++) g[d] *= Q->sc;
     return m * Q->sc;
@@ -117,7 +141,7 @@ int cmd_fiber_trace(int argc, char **argv) {
     if (argc < 7 || sscanf(ft_opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
         fprintf(stderr, "usage: ufsm fiber-trace <root> <key-prefix> <out.fib> --box Z,Y,X,NZ,NY,NX (prediction voxels) [--scaledown 3] [--cache DIR] [--thr 64] [--bin 8]\n"
                         "       [--support 0.2] [--coh 0.65] [--turn 35] [--step 1] [--half 256] [--min-len 24] [--sep 1] [--threads 4] [--gpu G]\n"
-                        "       [--sheet FITSET [--vox-um U] [--sheet-tol 0.15] [--gap-mm G --um LEVEL0_UM]]   (the fitter's winding gates and steers the lines)\n");
+                        "       [--sheet FITSET [--vox-um U] | --sheet-phase ROOT KEY] [--sheet-tol 0.15] [--gap-mm G --um LEVEL0_UM]   (a winding / phase gates and steers the lines)\n");
         return 2;
     }
     const int sd = opt_atoi("--scaledown", ft_opt(argc, argv, "--scaledown", "3")), thr = opt_atoi("--thr", ft_opt(argc, argv, "--thr", "64")), bin = opt_atoi("--bin", ft_opt(argc, argv, "--bin", "8")), half = opt_atoi("--half", ft_opt(argc, argv, "--half", "256"));
@@ -130,12 +154,20 @@ int cmd_fiber_trace(int argc, char **argv) {
     const int bridge = opt_atoi("--bridge", ft_opt(argc, argv, "--bridge", "0")); size_t nbridge = 0;   /* steps straight on through a support dip */   /* with --family H|V: the axis from the layer normal + the family direction */
     if (str < 1 || str > 8 || blur < 0 || blur > 4) { fprintf(stderr, "fiber-trace: --st-r 1..8, --blur 0..4\n"); return 2; }
     long long mo_g[3] = {0, 0, 0};   /* --mask-origin (also the dyad channels' origin) */
-    ft_sheet Q = {0}; const char *shp = ft_opt(argc, argv, "--sheet", nullptr); int gapk = 0; size_t ngap = 0;
+    ft_sheet Q = {0}; const char *shp = ft_opt(argc, argv, "--sheet", nullptr); int gapk = 0; size_t ngap = 0; const int phi = ft_flag(argc, argv, "--sheet-phase");
+    z3 *phz = nullptr; uint8_t *phb = nullptr;
+    if (phi) {
+        if (phi + 2 >= argc || shp) { fprintf(stderr, "fiber-trace: --sheet-phase ROOT KEY (not with --sheet)\n"); return 2; }
+        store *s_ = store_open(argv[phi + 1]); phz = s_ ? z3_open(s_, argv[phi + 2], cache) : nullptr; if (!phz) { fprintf(stderr, "fiber-trace: cannot open the phase %s %s\n", argv[phi + 1], argv[phi + 2]); return 1; }
+        shp = argv[phi + 2];
+    }
     if (shp) {
-        if (!fit_set_load || !fit_set_W || !fit_set_gradW) { fprintf(stderr, "fiber-trace: --sheet is not linked into this binary\n"); return 2; }
-        Q.S = fit_set_load(shp); if (!Q.S) { fprintf(stderr, "fiber-trace: cannot load the fit set %s\n", shp); return 1; }
-        const fit_model *m = Q.S->global; const double vum = opt_atof("--vox-um", ft_opt(argc, argv, "--vox-um", "0"));   /* a prediction voxel's um (0: the set's) */
-        Q.sc = vum > 0 && m->um > 0 ? vum / m->um : 1; for (int d = 0; d < 3; d++) Q.org[d] = (double)m->origin[d];
+        if (!phz) {
+            if (!fit_set_load || !fit_set_W || !fit_set_gradW) { fprintf(stderr, "fiber-trace: --sheet is not linked into this binary\n"); return 2; }
+            Q.S = fit_set_load(shp); if (!Q.S) { fprintf(stderr, "fiber-trace: cannot load the fit set %s\n", shp); return 1; }
+            const fit_model *m = Q.S->global; const double vum = opt_atof("--vox-um", ft_opt(argc, argv, "--vox-um", "0"));   /* a prediction voxel's um (0: the set's) */
+            Q.sc = vum > 0 && m->um > 0 ? vum / m->um : 1; for (int d = 0; d < 3; d++) Q.org[d] = (double)m->origin[d];
+        }
         Q.tol = opt_atof("--sheet-tol", ft_opt(argc, argv, "--sheet-tol", "0.15"));
         const double gmm = opt_atof("--gap-mm", ft_opt(argc, argv, "--gap-mm", "0")), lum = opt_atof("--um", ft_opt(argc, argv, "--um", "0"));
         if (gmm > 0) { if (!(lum > 0)) { fprintf(stderr, "fiber-trace: --gap-mm needs --um (level-0 um)\n"); return 2; } gapk = (int)lround(gmm * 1000 / (lum * ldexp(1.0, sd) * P.h)); }
@@ -191,6 +223,17 @@ int cmd_fiber_trace(int argc, char **argv) {
                 ft_ridge_axis(vol[0], n, vol[1], vol[2], str, pri); } } }
     const ft_vol V = {vol[0], vol[1], vol[2], {n[0], n[1], n[2]}}; P.V = &V; const size_t nv = (size_t)n[0] * n[1] * n[2];
     for (int d = 0; d < 3; d++) Q.off[d] = (double)o[d];
+    if (phz) {   /* the phase over the traced box (global coordinates of its grid = box voxel + o) */
+        phb = malloc((size_t)n[0] * n[1] * n[2]); const z3_meta *pm = z3_meta_of(phz); memset(phb, 255, (size_t)n[0] * n[1] * n[2]);
+        int64_t a[3], e[3]; for (int d = 0; d < 3; d++) { a[d] = o[d] < 0 ? 0 : o[d]; e[d] = o[d] + n[d] > pm->shape[d] ? pm->shape[d] : o[d] + n[d]; }
+        if (e[0] > a[0] && e[1] > a[1] && e[2] > a[2]) {
+            const int64_t nn[3] = {e[0] - a[0], e[1] - a[1], e[2] - a[2]}; uint8_t *t = malloc((size_t)(nn[0] * nn[1] * nn[2]));
+            if (!t || z3_read(phz, a, nn, t, nth)) { fprintf(stderr, "fiber-trace: phase read failed\n"); return 1; }
+            for (int64_t z = 0; z < nn[0]; z++) for (int64_t y = 0; y < nn[1]; y++) memcpy(phb + ((size_t)(z + a[0] - o[0]) * n[1] + (size_t)(y + a[1] - o[1])) * n[2] + (size_t)(a[2] - o[2]), t + ((size_t)z * nn[1] + y) * nn[2], (size_t)nn[2]);
+            free(t);
+        }
+        z3_close(phz); Q.ph = phb; for (int d = 0; d < 3; d++) Q.pn[d] = n[d];
+    }
     /* seeds: the presence maximum of each bin^3 cell */
     const int64_t g[3] = {(n[0] + bin - 1) / bin, (n[1] + bin - 1) / bin, (n[2] + bin - 1) / bin}; uint64_t *sd_ = malloc(((size_t)g[0] * g[1] * g[2] + 1) * sizeof *sd_); size_t ns = 0, npres = 0;
     for (int64_t cz = 0; cz < g[0]; cz++) for (int64_t cy = 0; cy < g[1]; cy++) for (int64_t cx = 0; cx < g[2]; cx++) {
@@ -211,20 +254,20 @@ int cmd_fiber_trace(int argc, char **argv) {
         double ds[3]; { double T[6], s; if (!ft_tensor(&V, p0, T, &s) || s < P.sup || ft_axis(T, d0, ds) < P.coh) continue; }
         /* the line: backward half reversed, the seed, forward half */
         int nb = 0, nf = 0, ends[2] = {FT_HALF, FT_HALF}; double *fw = line + (size_t)half * 3, *seedp = fw;
-        double W0 = 0; if (Q.S) { W0 = ft_W(&Q, p0); if (!isfinite(W0)) continue; ft_inplane(&Q, p0, ds); }
+        const int gate = Q.S || Q.ph; double W0 = 0; if (gate) { W0 = ft_W(&Q, p0); if (!isfinite(W0)) continue; ft_inplane(&Q, p0, ds); }
         for (int side = 0; side < 2; side++) {
             double p[3] = {p0[0], p0[1], p0[2]}, d[3] = {side ? -ds[0] : ds[0], side ? -ds[1] : ds[1], side ? -ds[2] : ds[2]}, dsm[3] = {d[0], d[1], d[2]};
             int why = FT_HALF, gap = 0; double wprev = W0, woff = 0;
             for (int k = 0; k < half; k++) {
                 double d1[3], d2[3], pm[3]; int r = ft_dir(&P, p, d, d1);
-                if (r == FT_SUP && bridge > 0 && !Q.S && k + bridge < half) {   /* --bridge K: straight on through a support dip of up to K steps */
+                if (r == FT_SUP && bridge > 0 && !gate && k + bridge < half) {   /* --bridge K: straight on through a support dip of up to K steps */
                     double pb[3] = {p[0], p[1], p[2]}; int kb = 0, ok = 0;
                     for (kb = 1; kb <= bridge; kb++) { for (int a = 0; a < 3; a++) pb[a] += P.h * d[a]; if (ft_dir(&P, pb, d, d1) == FT_OK) { ok = 1; break; } }
                     if (ok) { for (int b = 1; b <= kb; b++) { double *q = side ? seedp - 3 * (++nb) : seedp + 3 * (++nf); for (int a = 0; a < 3; a++) q[a] = p[a] + b * P.h * d[a]; }
                         for (int a = 0; a < 3; a++) { p[a] = pb[a]; }
                         k += kb; nbridge++; r = FT_OK; }
                 }
-                if (!Q.S) {
+                if (!gate) {
                     if (r) { why = r; break; }
                     for (int a = 0; a < 3; a++) pm[a] = p[a] + 0.5 * P.h * d1[a];
                     if ((r = ft_dir(&P, pm, d1, d2))) { why = r; break; }
@@ -242,7 +285,7 @@ int cmd_fiber_trace(int argc, char **argv) {
                 }
                 for (int a = 0; a < 3; a++) { p[a] += P.h * d2[a]; d[a] = d2[a]; }
                 if (!(p[0] >= 0 && p[1] >= 0 && p[2] >= 0 && p[0] <= (double)(n[0] - 1) && p[1] <= (double)(n[1] - 1) && p[2] <= (double)(n[2] - 1))) { why = FT_BOX; break; }
-                if (Q.S) {   /* back onto the line's W (two Newton steps along grad W, at most a voxel each), then the drift gate */
+                if (gate) {   /* back onto the line's W (two Newton steps along grad W, at most a voxel each), then the drift gate */
                     for (int it = 0; it < 2; it++) { double g[3]; const double m = ft_gW(&Q, p, g); double w = ft_W(&Q, p); if (!isfinite(w) || !(m > 1e-9)) break;
                         double dw = w + woff - W0; if (dw - (wprev - W0) > 0.5) dw -= 1; else if (dw - (wprev - W0) < -0.5) dw += 1;
                         double s_ = -dw / (m * m); if (s_ * m > 1) s_ = 1 / m; if (s_ * m < -1) s_ = -1 / m;
@@ -281,6 +324,6 @@ int cmd_fiber_trace(int argc, char **argv) {
     printf("fiber-trace: %d streamlines (%zu H, %zu V), %d points, total length %.0f prediction voxels, mean %.1f -> %s\n", F.n, nH, (size_t)F.n - nH, F.npts, tot, F.n ? tot / F.n : 0, argv[4]);
     printf("fiber-trace: line ends (kept lines): support %zu, coherence %zu, turn %zu, box %zu, half %zu, sheet %zu; %zu bridged dips, %zu sheet gaps crossed\n", nstop[FT_SUP], nstop[FT_COH], nstop[FT_TURN], nstop[FT_BOX], nstop[FT_HALF], nstop[FT_SHEET], nbridge, ngap);
     if (fib_save(argv[4], &F)) { fprintf(stderr, "fiber-trace: cannot write %s\n", argv[4]); return 1; }
-    free(line); free(occ); free(sd_); fib_free(&F); for (int k = 0; k < 3; k++) free(vol[k]);
+    free(line); free(occ); free(sd_); fib_free(&F); free(phb); for (int k = 0; k < 3; k++) free(vol[k]);
     return 0;
 }
