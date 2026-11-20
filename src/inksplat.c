@@ -2447,6 +2447,13 @@ int inkfly_cells_sup(void *handle, int lev, const int64_t shape[3], uint8_t *bit
     free(r);
     return (int)(k > 2000000000 ? 2000000000 : k);
 }
+int inkfly_draw_key(void *handle, char *k, size_t nk) {
+    const inkfly *f = handle; if (!f || !f->kdir[0] || nk < 64) return -1;
+    size_t at = (size_t)snprintf(k, nk, "inkfly %s held-out %d", f->kdir, f->ncx);
+    for (int e = 0; e < f->ncx && at < nk; e++) at += (size_t)snprintf(k + at, nk - at, " %lld,%lld,%lld,%lld,%lld,%lld", (long long)f->cx[e][0], (long long)f->cx[e][1],
+                                                         (long long)f->cx[e][2], (long long)f->cx[e][3], (long long)f->cx[e][4], (long long)f->cx[e][5]);
+    return at < nk ? 0 : -1;
+}
 int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits) {
     const inkfly *f = handle; if (!f) return -1; const int64_t cs = (int64_t)1 << lev; size_t n = 0;
     for (size_t t = 0; t < f->nT; t++) {

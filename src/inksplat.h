@@ -95,6 +95,8 @@ int inkfly_map_coarse(const char *map, char *key, size_t nkey, double *um);
 int inkfly_map_boxes(const char *map, int64_t (*b)[6], int nb, double pad);
 size_t inkfly_cache_bytes(size_t *ct_bytes);
 int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits);
+/* the sampler's draw-cell cache key part (occcache.c): the inputs key's disk cache dir + the held-out boxes; -1 without a disk cache */
+int inkfly_draw_key(void *handle, char *k, size_t nk);
 int inkfly_cells_sup(void *handle, int lev, const int64_t shape[3], uint8_t *bits, int stride);   /* the cells holding supervised label pixels (bit 1) / positive ones (bit 2): the sampler's draw cells */
 /* a normal-pooled MIL ray (train's ink MIL loss): p the label pixel's mesh point, n its unit normal (+ = the recto side), in the window's
    level voxels (window origin 0); y the 2-D label (1 ink); w a weight */

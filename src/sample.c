@@ -4055,12 +4055,17 @@ static occ_index mask_occupancy(source *s) {
 [[gnu::weak]] int occ_cache_save(const char *, const char *, const occ_index *);
 [[gnu::weak]] const char *dcache_default_dir(void);
 occ_index source_occupancy(source *s) {
-    /* on-the-fly fibre sources: the index from the disk cache when its inputs are unchanged (Paris 4's level-5 scan: ~15-20 min a launch);
+    /* on-the-fly fibre and ink sources: the index from the disk cache when its inputs are unchanged (Paris 4's level-5 scan: ~15-20 min a launch;
+       its ink draw cells, the supervised-pixel scan + the level-5 CT read: 168 s, 2026-11-20);
        UFSM_OCC_CACHE=0: always computed */
     char key[8192]; const char *dir = occ_cache_key && dcache_default_dir && !(getenv("UFSM_OCC_CACHE") && !atoi(getenv("UFSM_OCC_CACHE"))) ? dcache_default_dir() : nullptr;
     const int ck = dir && *dir && !occ_cache_key(s, key, sizeof key);
     if (ck) { occ_index c = {nullptr, 0, -1, {0, 0, 0}};
-        if (!occ_cache_load(dir, key, &c)) { fprintf(stderr, "sampler: %s: %zu level-%d draw cells from the occupancy cache\n", s->name, c.n, c.lev); return c; } }
+        if (!occ_cache_load(dir, key, &c)) { int fly = 0; for (int ch = 0; ch < NTG; ch++) fly |= s->ink_fly[ch] != nullptr;
+            fprintf(stderr, "sampler: %s: %zu level-%d draw cells from the occupancy cache\n", s->name, c.n, c.lev);
+            if (fly) fprintf(stderr, "sampler: %s: ink draw cells: %zu supervised, %zu with positive labels%s\n", s->name, c.n, c.pn,
+                             c.pn ? "" : ": WARNING no positive cells, its windows hold negatives only (the stratified draw is off for it: empty_keep)");
+            return c; } }
     occ_index o = label_occupancy(s);
     if (ck && o.n && occ_cache_save(dir, key, &o)) fprintf(stderr, "sampler: %s: the occupancy cache write failed (computed again next launch)\n", s->name);
     if (!o.n && s->mask) { free(o.idx); o = mask_occupancy(s); }

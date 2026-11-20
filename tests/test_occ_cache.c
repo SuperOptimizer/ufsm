@@ -26,7 +26,12 @@ int main(int argc, char **argv) {
     CHECK(occ_cache_load(cache, key, &r), "empty cache: a miss");
     CHECK(!occ_cache_save(cache, key, &o), "save");
     CHECK(!occ_cache_load(cache, key, &r) && r.n == 5 && r.lev == 5 && r.shape[0] == 16 && r.shape[2] == 16 && !memcmp(r.idx, idx, sizeof idx), "load = saved");
+    CHECK(r.pn == 0 && !r.pidx, "no positive list: none loaded");
     free(r.idx); r.idx = nullptr;
+    /* the stratified ink draw's positive cells (UOC2, 2026-11-20) load back too */
+    { uint32_t pos[2] = {17, 4095}; occ_index op = o; op.pidx = pos; op.pn = 2; char kp[8200]; snprintf(kp, sizeof kp, "%s|pos", key);
+      CHECK(!occ_cache_save(cache, kp, &op) && !occ_cache_load(cache, kp, &r) && r.n == 5 && r.pn == 2 && r.pidx && !memcmp(r.pidx, pos, sizeof pos), "positive cells = saved");
+      free(r.idx); free(r.pidx); r.idx = r.pidx = nullptr; r.pn = 0; }
     /* each input change: another key */
     f.rad = 2.5; CHECK(!occ_cache_key(&s, key2, sizeof key2) && strcmp(key, key2) && occ_cache_load(cache, key2, &r), "radius changes the key"); f.rad = 2;
     f.plane = 1; occ_cache_key(&s, key2, sizeof key2); CHECK(strcmp(key, key2), "plane changes the key"); f.plane = 0;
