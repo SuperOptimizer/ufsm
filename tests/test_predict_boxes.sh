@@ -26,4 +26,15 @@ for i in 0 1 2 3; do
   diff -r p/o$i b/o$i > d$i.txt || fail "box $i: --boxes differs from its own process ($(wc -l < d$i.txt) files, $D/d$i.txt)"
   echo "  box $i (${BOX[$i]} ${EXTRA[$i]}): $n files identical"
 done
+# --tile-list (2026-11-20): one run over box 0 computing only the listed 128-tiles (2 of 8 shards): their level-0 shard files equal the
+# whole-box run's, nothing else of level 0 is written
+printf '0 0 0\n1 1 0\n' > tl.txt
+"$U" predict s/last.ckpt fx ct t --box ${BOX[0]} --tile-list tl.txt --tile-list-size 128 "${P[@]}" --q 0 > t.log 2>&1 || fail "predict --tile-list ($D/t.log)"
+grep -q "tile-list tl.txt: 2 of 2 tiles in the box, 6 shards outside them skipped" t.log || fail "the --tile-list line ($D/t.log)"
+nt=0; while IFS= read -r f; do
+  cmp -s "t/$f" "p/o0/$f" || fail "--tile-list: $f differs from the whole-box run"; nt=$((nt + 1))
+done < <(cd t && find . -path '*/c/*' -type f | grep -E '/(0|9\.6|9\.600)/c/' | sed 's#^\./##')
+nw=$(cd p/o0 && find . -path '*/c/*' -type f | grep -cE '/(0|9\.6|9\.600)/c/')
+[ "$nt" -gt 0 ] && [ "$nt" -lt "$nw" ] || fail "--tile-list: $nt level-0 shard files (whole box: $nw)"
+echo "  --tile-list: $nt level-0 shard files identical (whole box $nw)"
 echo PASS

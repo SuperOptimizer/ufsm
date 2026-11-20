@@ -2354,7 +2354,12 @@ static int predict_one(int argc, char **argv) {
        whose own region is zero on the coarse level, one coarse voxel of margin, predicts nothing) */
     uint8_t *sskip = nullptr; long nresumed = 0, nocc = 0;
     uint8_t *occb = nullptr; int64_t occo[3] = {0, 0, 0}, occn[3] = {0, 0, 0}; int occf = 1;   /* --occupancy: the coarse level over the box (tile tests below) */
-    if (resume || occl >= 0 || lat_store) {
+    /* --tile-list FILE (2026-11-20, fullvram: the ink score's held-out tiles in ONE pipelined run instead of predict --boxes' per-box runs):
+       "iz iy ix" per line, the --tile-list-size (512) tiles at the grid origin (--grid-origin, else 0): every shard of the box outside
+       them is skipped as air (not computed, not written) */
+    const char *tlf = opt(argc, argv, "--tile-list", nullptr); const int64_t tls = opt_atoi("--tile-list-size", opt(argc, argv, "--tile-list-size", "512"));
+    if (tlf && (tls < shard || tls % shard)) { fprintf(stderr, "predict: --tile-list-size %lld must be a multiple of the shard %d\n", (long long)tls, shard); return 2; }
+    if (resume || occl >= 0 || lat_store || tlf) {
         sskip = calloc((size_t)(ns[0] * ns[1] * ns[2]), 1);
         if (!sskip) { fprintf(stderr, "predict: out of memory\n"); return 1; }
         FILE *df = resume && !(lhm && hspec) ? fopen(donep, "r") : nullptr;
@@ -2436,6 +2441,25 @@ static int predict_one(int argc, char **argv) {
             }
             occb = ob; occf = f; for (int d = 0; d < 3; d++) { occo[d] = o0[d]; occn[d] = n0[d]; }
             if (oc) z3_close(oc);
+        }
+        if (tlf) {
+            FILE *tf = fopen(tlf, "r"); if (!tf) { fprintf(stderr, "predict: cannot open --tile-list %s\n", tlf); return 1; }
+            const int64_t nsh = ns[0] * ns[1] * ns[2]; uint8_t *keep = calloc((size_t)nsh, 1); long long a, b, c; long nl = 0, nin = 0, ntl = 0;
+            if (!keep) { fclose(tf); fprintf(stderr, "predict: out of memory\n"); return 1; }
+            while (fscanf(tf, "%lld %lld %lld", &a, &b, &c) == 3) {   /* the tile's shards in the box */
+                nl++; const long long t3[3] = {a, b, c}; int64_t lo[3], hi[3]; int any = 1;
+                for (int d = 0; d < 3; d++) { const int64_t g0 = grid_origin[d] + t3[d] * tls - bo[d], g1 = g0 + tls;
+                    lo[d] = g0 > 0 ? g0 / shard : 0; hi[d] = g1 > 0 ? (g1 + shard - 1) / shard : 0; if (hi[d] > ns[d]) hi[d] = ns[d]; any &= hi[d] > lo[d]; }
+                if (!any) continue;
+                nin++;
+                for (int64_t z = lo[0]; z < hi[0]; z++) for (int64_t y = lo[1]; y < hi[1]; y++) for (int64_t x = lo[2]; x < hi[2]; x++) keep[(z * ns[1] + y) * ns[2] + x] = 1;
+            }
+            fclose(tf);
+            for (int64_t k = 0; k < nsh; k++) if (!keep[k] && !sskip[k]) { sskip[k] = 2; ntl++; }
+            free(keep);
+            if (!nin) { fprintf(stderr, "predict: --tile-list %s: none of its %ld tiles meets the box\n", tlf, nl); return 1; }
+            fprintf(stderr, "predict: --tile-list %s: %ld of %ld tiles in the box, %ld shards outside them skipped\n", tlf, nin, nl, ntl);
+            nocc += ntl;
         }
         fprintf(stderr, "predict: %lld shards in the box: %ld already written (--resume), %ld air on %s %d (--occupancy), %lld to compute\n",
                 (long long)(ns[0] * ns[1] * ns[2]), nresumed, nocc, lat_store ? "the latent store, grid" : "CT level", lat_store ? 32 : occl, (long long)(ns[0] * ns[1] * ns[2]) - nresumed - nocc);

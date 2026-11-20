@@ -20,7 +20,8 @@
 # LATINK_HEADS (ink,c12,c13): the heads predicted (ink only for a net without recto / verso rows: score.sh GATEFROM brings the gate).
 # LATINK_TILES=DIR (11-20, scoring in minutes): only the 512 tiles listed in DIR/tiles0.txt and DIR/tiles256.txt ("iz iy ix" per line, the
 # tile at origin i * 512 + grid) are predicted, one predict --boxes run per grid into the --full-grid store (x runs merged into one box);
-# the blend sees both grids' tiles at every listed point. For a scorer whose samples all lie in those tiles: 1667's are the shards of
+# the blend sees both grids' tiles at every listed point. LATINK_TILELIST (1, 11-20 fullvram): one predict per grid over the run's box with
+# --tile-list (the shards outside the tiles skipped as air), so the windows pipeline as a whole-box run; 0: the --boxes runs. For a scorer whose samples all lie in those tiles: 1667's are the shards of
 # an ink-splat of all its human labels (grid 0: the shard files present, 200 of 931) and the grid-256 tiles overlapping them (398).
 # LATINK_CHANNEL=ink: a full-resolution (voxel) checkpoint: predict --heads takes latent-grid nets only, so predict --channel ink into
 # g<grid>/ink (LATINK_HEADS must then be ink; 11-20 FR1 / ladder nets).
@@ -46,7 +47,9 @@ for g in 0 256; do
   [ -e $T/g$g.done ] && continue; rm -rf $T/g$g
   # (--q 0 --levels 1: the passes are blended into OUT by ink-blend, which reads level 0 only; their own pyramid / quantisation was thrown away)
   BX=(--box $(pbox $g))
-  if [ -n "${LATINK_TILES:-}" ]; then   # (x runs of listed tiles -> one box line each, clamped to the volume's box)
+  if [ -n "${LATINK_TILES:-}" ] && [ "${LATINK_TILELIST:-1}" = 1 ]; then   # (one predict over the run's box, every shard outside the listed tiles skipped)
+    BX=(--box $(pbox $g) --tile-list $LATINK_TILES/tiles$g.txt --tile-list-size 512); echo "latink: grid $g: $(wc -l < $LATINK_TILES/tiles$g.txt) tiles (--tile-list)"
+  elif [ -n "${LATINK_TILES:-}" ]; then   # (x runs of listed tiles -> one box line each, clamped to the volume's box)
     sort -n -k1,1 -k2,2 -k3,3 $LATINK_TILES/tiles$g.txt | awk -v g=$g -v B="$BOX" -v o=$T/g$g${LATINK_CHANNEL:+/$HL} 'BEGIN { split(B, b, ",") }
       function out() { if (n) { z0 = z * 512 + g; y0 = y * 512 + g; x0 = x * 512 + g; x1 = (x + n) * 512 + g; z1 = z0 + 512; y1 = y0 + 512
         if (z0 < b[1]) z0 = b[1]; if (y0 < b[2]) y0 = b[2]; if (x0 < b[3]) x0 = b[3]; if (z1 > b[1] + b[4]) z1 = b[1] + b[4]; if (y1 > b[2] + b[5]) y1 = b[2] + b[5]; if (x1 > b[3] + b[6]) x1 = b[3] + b[6]
