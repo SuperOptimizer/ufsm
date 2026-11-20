@@ -46,7 +46,10 @@ scripts/test/desk_suite.sh BRANCH   # push to the desk, build and run the suite 
 - `tests/run_suite.sh` takes machine-wide GPU locks (`/tmp/ufsm-suite-locks`: `gpu<i>.excl` shared plus a slot), so concurrent suites
   share the GPUs; a trainer takes `gpu<i>.excl` exclusively. A card held by a trainer or a foreign process: its tests go BUSY after `-W`
   seconds. `-g none` runs only the CPU tests. Exit 0 pass, 1 fail, 3 INCOMPLETE (GPU tests not run: NOGPU / BUSY / NEED2): not a merge
-  gate. The GPU half of a merge: `scripts/test/pod_gate.sh REF` (the perf pod, `run_suite -c <merge base>` under /root/gpu.lock).
+  gate. The GPU half of a merge: `scripts/test/gpuslot.sh add BRANCH` (queues its touched GPU tests for the batched desk card-1 slot
+  inksdk opens; results in /vesuvius/ufsm/suite/results.txt), or the whole tier off the desk: `scripts/test/desk_suite.sh -H forlindesk
+  -a 86 BRANCH` (arch86: lp_* on software MX). The CPU half off the desk: `SUITE_ARGS="-g none" scripts/test/desk_suite.sh -H
+  forlinlapnvidia -a 86 -R /home/forrest/suite -m 8 -l 14 BRANCH`. `run_suite -J N` warms the selected GPU tests' kernels first.
 - One GPU, 2-GPU tests: `train --gpus 0,0` runs two data-parallel ranks as logical devices on one card (src/ufsm_dev.cuh); gpu2 tests
   tagged `l2` run that way on one-GPU machines (UFSM_TEST_GPUS=0,0).
 - Training runs: `scripts/run/install_health.sh RUN` (the health watcher service); `scripts/run/replay_ab.sh RUN OLD NEW` before a
