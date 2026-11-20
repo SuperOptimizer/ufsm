@@ -5,7 +5,9 @@
    (2) on the synthetic spiral (tests/make_wind_fixture.c, N 256) with one spiral sheet as a tifxyz segment (ink stripes on its
        canvas) and the source's "ink" target on the fly: train --task unwrap2 --ink-head 1 --ink-mil 1 --ink-dice 0.25 runs a few
        steps with the symmetries and warps on; the log's "ink mil" is finite, positive, on > 0 windows with rays; at --ink-mil 0 the
-       first step's loss equals the --ink-mil run's minus its mil term (same seed, lr 0).
+       first step's loss equals the --ink-mil run's minus its mil term (same seed, lr 0);
+   (3) ufsm ink-rayface: the precomputed face-drop bits give MIL mode 1's rays byte for byte, and a mode-1 run on them logs the same
+       first-step mil loss as one with the per-window face search (UFSM_INK_RAYFACE=0).
    Usage: test_ink_mil_train <ufsm binary> <make_wind_fixture binary> */
 #include "inksplat.h"
 #include "sample.h"
@@ -134,6 +136,18 @@ int main(int argc, char **argv) {
         if (g) fclose(g);
         fprintf(stderr, "ink mil: last %.4f, at most %.0f%% of windows with rays, up to %.0f rays a window\n", mil, best, rays);
         CHECK(best > 0 && rays > 0, "no window drew rays (%s)", p);
+    }
+    {   /* ink-rayface (2026-11-20): the precomputed face-drop bits give mode 1's rays byte for byte (windows around supervised tiles,
+           strides 1 and 2); a mode-1 run then reads them (no CT per window) and its first step's loss equals a run with the bits off */
+        CHECK(!sh("%s ink-rayface %s/fx/sources-mil.json --threads 2 --verify 6 --P 64 --stride 1 > %s/rf1.log 2>&1", U, d, d), "ink-rayface --verify stride 1 (%s/rf1.log)", d);
+        CHECK(!sh("%s ink-rayface %s/fx/sources-mil.json --threads 2 --verify 6 --P 64 --stride 2 --seed 7 > %s/rf2.log 2>&1", U, d, d), "ink-rayface --verify stride 2 (%s/rf2.log)", d);
+        CHECK(!sh("grep -q '6 of 6 windows (P 64, stride 1) byte-identical' %s/rf1.log && grep -q '6 of 6 windows (P 64, stride 2) byte-identical' %s/rf2.log", d, d), "rayface rays differ (%s/rf1.log, rf2.log)", d);
+        CHECK(!sh("grep -Eq 'faced pixels' %s/rf1.log && ! grep -q ' 0 faced pixels' %s/rf1.log", d, d), "the fixture faced no pixel (%s/rf1.log): mode 1 untested", d);
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/m1 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 1 %s > %s/m1.log 2>&1", U, d, d, common, d), "mode 1 with the bits (%s/m1.log)", d);
+        CHECK(!sh("UFSM_INK_RAYFACE=0 UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/m0 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 1 %s > %s/m0.log 2>&1", U, d, d, common, d), "mode 1 without (%s/m0.log)", d);
+        snprintf(p, sizeof p, "%s/m1.log", d); const double l1 = log_first(p, " ink mil "); snprintf(p, sizeof p, "%s/m0.log", d); const double l0 = log_first(p, " ink mil ");
+        fprintf(stderr, "ink-rayface: mode 1 first-step ink mil %.6f with the bits, %.6f with the face search\n", l1, l0);
+        CHECK(isfinite(l1) && l1 == l0, "mode 1 ink mil with the bits %g vs the face search %g", l1, l0);
     }
     /* the planner keeps the MIL buffers free (2026-11-15 try7 one card: allocated lazily after the plan, the first MIL window's cudaMalloc
        failed on the full card): the "keeps" line, and the buffers never outgrow it; again at a small ray cap the windows exceed (the cap's

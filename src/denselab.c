@@ -240,3 +240,49 @@ int cmd_denselab_render(int argc, char **argv) {
     free(A); sources_free(SS);
     return rc;
 }
+/* ufsm ink-rayface (2026-11-20): every onfly ink source's MIL face-drop bits (inksplat.h inkfly_rayface_build) into its cache dir, so the
+   sampler's MIL mode 1 reads no CT (sampler-only P 256, the ink ladder's sources: 18.1 -> ~52 Mvox/s). --verify N: N windows per source,
+   the rays from the bits vs the face search, byte for byte */
+int cmd_ink_rayface(int argc, char **argv) {
+    if (argc < 3 || argv[2][0] == '-') {
+        fprintf(stderr, "usage: ufsm ink-rayface SOURCES.json [--source N1,N2] [--threads 8] [--gpu D] [--force 1] [--verify N --P 256 --stride 2 --R 10 --seed 1]\n"
+                        "  precomputes the MIL rays' face-drop bit of every supervised label pixel of each onfly ink target (rayface.bin in its cache dir)\n");
+        return 2;
+    }
+    const char *names = opt(argc, argv, "--source", nullptr);
+    const int nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8), gpu = opt_atoi("--gpu", opt(argc, argv, "--gpu", "-1"));
+    const int force = opt_atoi("--force", opt(argc, argv, "--force", "0")), nver = opt_atoi("--verify", opt(argc, argv, "--verify", "0"));
+    const int P = opt_atoi("--P", opt(argc, argv, "--P", "256")), stride = opt_atoi("--stride", opt(argc, argv, "--stride", "2"));
+    const float R = (float)atof(opt(argc, argv, "--R", "10")); uint64_t seed = (uint64_t)opt_atoi("--seed", opt(argc, argv, "--seed", "1"));
+    if (nver) setenv("UFSM_INK_RAYFACE", "0", 1);   /* (verify: the sources open without the bits; the build loads them per handle below) */
+    sources *SS = sources_load(argv[2]); if (!SS) { fprintf(stderr, "ink-rayface: cannot load %s\n", argv[2]); return 1; }
+    if (nver) unsetenv("UFSM_INK_RAYFACE");
+    inkfly_gpu_config(gpu);   /* (-1: the CPU face search, none tried on a device) */
+    int rc = 0, nh = 0;
+    for (int i = 0; i < SS->n && !rc; i++) {
+        source *s = &SS->src[i]; if (!dl_name(names, s->name)) continue;
+        for (int c = 0; c < NTG && !rc; c++) {
+            void *h = s->ink_fly[c]; if (!h) continue; nh++;
+            const double t0 = dl_now();
+            if (inkfly_rayface_build(h, nt, force || nver)) { fprintf(stderr, "ink-rayface: %s: FAILED\n", s->name); rc = 1; break; }
+            printf("ink-rayface: %s: built in %.0f s\n", s->name, dl_now() - t0);
+            if (!nver) continue;
+            /* windows at the onfly level around random supervised tiles: rays from the bits vs rays with the bits off (the face search) */
+            int ok = 0, tried = 0; size_t nrays = 0;
+            for (int k = 0; k < nver * 20 && tried < nver; k++) {
+                seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+                int64_t o[3]; if (inkfly_sample_window(h, seed, P, o)) continue;
+                const int64_t n[3] = {P, P, P}; inkray *a = nullptr, *b = nullptr; size_t na = 0, nb = 0;
+                if (inkfly_rays(h, o, n, 1, stride, R, &a, &na) || inkfly_rays_noface(h, o, n, 1, stride, R, &b, &nb)) { free(a); free(b); rc = 1; break; }
+                tried++; nrays += na;
+                const int same = na == nb && (!na || !memcmp(a, b, na * sizeof *a));
+                if (!same) printf("ink-rayface verify: %s: window %lld %lld %lld: %zu rays from the bits, %zu from the face search: DIFFER\n", s->name, (long long)o[0], (long long)o[1], (long long)o[2], na, nb);
+                ok += same; free(a); free(b);
+            }
+            printf("ink-rayface verify: %s: %d of %d windows (P %d, stride %d) byte-identical, %zu rays%s\n", s->name, ok, tried, P, stride, nrays, ok == tried && tried ? "" : "  FAIL");
+            if (ok != tried || !tried) rc = 1;
+        }
+    }
+    if (!nh) { fprintf(stderr, "ink-rayface: no onfly ink target in the selected sources\n"); rc = 1; }
+    sources_free(SS); return rc;
+}

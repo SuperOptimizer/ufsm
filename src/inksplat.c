@@ -6,6 +6,9 @@
 #include "dcache.h"
 #include "label_versions.h"
 #include <dirent.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include "inkflygpu.h"
 #include "inkmil.h"
@@ -1135,7 +1138,10 @@ typedef struct {
     iftile *T; size_t nT;
     int64_t gcell, gdim[3]; uint32_t *gstart, *glist;   /* tile grid: cells of gcell level-0 voxels -> tile ids (CSR) */
     int ncx; int64_t cx[INKFLY_MAXEXCL][6];   /* the held-out boxes whose draw cells inkfly_cells drops (cfg excl; f->c.nexcl is 0 under excl_cells_only) */
+    char kdir[1200];                          /* the cache key dir (index.bin, rayface.bin), "" without a disk cache */
+    const uint8_t *rf; void *rf_map; size_t rf_len;   /* rayface.bin mapped: per tile 64 x 64 bits, 1 = that label pixel's ray has an open face (dropped in MIL mode 1) */
 } inkfly;
+static void inkfly_rayface_load(inkfly *f);
 static struct { _Atomic uint64_t reads, chunks, empty, hits, px, us, ct_us, gpu_chunks, gpu_us; } g_ifs;
 /* tests: UFSM_INKFLY_FAIL=N: the first N GPU chunks fail as if out of device memory (the CPU fallback from there) */
 static int inkfly_fail_inject(void) { static _Atomic int left = -2; if (left == -2) { const char *e = getenv("UFSM_INKFLY_FAIL"); atomic_store(&left, e ? atoi(e) : 0); }
@@ -1155,6 +1161,7 @@ static void inkfly_free(void *p) {
     if (f->zc) zcache_drop(f->zc, f->base_ct);   /* (the shared ink CT cache outlives this source) */
     for (int i = 0; i < f->nS; i++) ssurf_free(&f->S[i]);
     for (int i = 0; i < f->nL; i++) lsrc_close(&f->Ls[i]);
+    if (f->rf_map) munmap(f->rf_map, f->rf_len);
     free(f->S); free(f->Spath); free(f->Ls); free(f->Lpath); free(f->U); free(f->T); free(f->gstart); free(f->glist); free(f);
 }
 static int box_hit(const int32_t lo[3], const int32_t hi[3], const int64_t a[3], const int64_t b[3]) {   /* [lo, hi] vs [a, b) */
@@ -1604,6 +1611,8 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
         }
     }
     json_free(j); j = nullptr;
+    snprintf(f->kdir, sizeof f->kdir, "%s", kdir);
+    inkfly_rayface_load(f);
     {   /* tile grid: 1024-voxel cells */
         f->gcell = 1024; size_t ng = 1;
         for (int d = 0; d < 3; d++) { f->gdim[d] = (f->shape[d] * (int64_t)f->V + f->gcell - 1) / f->gcell; ng *= (size_t)f->gdim[d]; }
@@ -1731,6 +1740,161 @@ int cmd_ink_onfly(int argc, char **argv) {
     free(A); z3_close(z); store_close(cs);
     return 0;
 }
+/* a candidate ray: mesh point, unit normal (level-0 voxels), the 2-D label, its tile and pixel (64 x 64 tile-local) */
+typedef struct { double P[3], N[3]; uint8_t y; uint32_t t; uint16_t px; } cpx;
+/* the face search of rays X[0, np) on the level's CT (inkfly_chunk's): drop[i] = 1 where the ray has an open face. lo3 / hi3: the
+   points' box (level 0) widened by reach. In z slabs of the CT box (2026-11-13): the whole box of a level-(L+1) window read at level L
+   is (2 x 1040)^3 = 8.9 GB at P 1024 (a 30 GB sampler-only run OOM'd on it); a slab holds the rows its points' samples reach, the
+   samples' coordinates are the whole box's, so the bits are any box's. 0 ok, -1 a CT read failed or a sample left its slab */
+static int rays_face(inkfly *f, const cpx *X, size_t np, const double lo3[3], const double hi3[3], uint8_t *drop) {
+    const inksplat_cfg *c = &f->c; const double V = f->V;
+    const int lo = (int)floor(c->face_lo), hi = (int)ceil(c->face_hi), ns = hi - lo + 1; const double sign = c->flip ? -1 : 1;
+    const int reach = (int)ceil(fmax(fabs(c->face_lo), fabs(c->face_hi))) + 2;
+    int64_t co[3], cn[3]; for (int d = 0; d < 3; d++) { co[d] = (int64_t)floor((lo3[d] - f->off) / V) - 1; cn[d] = (int64_t)ceil((hi3[d] - f->off) / V) + 2 - co[d]; }
+    const int64_t rz = (int64_t)ceil(reach / V) + 2, plane = cn[1] * cn[2];
+    const char *e = getenv("UFSM_INKRAY_SLAB_MB"); const double mb = e ? atof(e) : 256;
+    int64_t T = (int64_t)(mb * 1048576 / (double)plane) - 2 * rz; if (T < 16) T = 16; if (T > cn[0]) T = cn[0];
+    const int64_t nsl = (cn[0] + T - 1) / T;
+    uint32_t *cnt = calloc((size_t)nsl + 1, sizeof *cnt), *ord = malloc(np * sizeof *ord), *sl = malloc(np * sizeof *sl);
+    uint8_t *ctb = malloc((size_t)(T + 2 * rz + 2) * (size_t)plane);
+    if (!cnt || !ord || !sl || !ctb) { free(cnt); free(ord); free(sl); free(ctb); return -1; }
+    for (size_t i = 0; i < np; i++) { int64_t q = (int64_t)floor((X[i].P[0] - f->off) / V - co[0]) / T; if (q < 0) q = 0; if (q >= nsl) q = nsl - 1; sl[i] = (uint32_t)q; cnt[q + 1]++; }
+    for (int64_t q = 0; q < nsl; q++) cnt[q + 1] += cnt[q];
+    for (size_t i = 0; i < np; i++) ord[cnt[sl[i]]++] = (uint32_t)i;   /* (cnt[q] is now slab q's end = slab q+1's start) */
+    float raw[256], sm[256]; int bad = 0;
+    double *pn = nullptr; uint8_t *gd = nullptr;   /* (the GPU face search: the slab's rays' P / N, their drop bytes) */
+    for (int64_t q = 0, b0 = 0; q < nsl && !bad; b0 = cnt[q], q++) {
+        if ((int64_t)cnt[q] == b0) continue;
+        int64_t z0 = q * T - rz, z1 = (q + 1) * T + rz + 1; if (z0 < 0) z0 = 0; if (z1 > cn[0]) z1 = cn[0];
+        const int64_t so[3] = {co[0] + z0, co[1], co[2]}, sn[3] = {z1 - z0, cn[1], cn[2]};
+        if (f->zc ? zcache_read(f->zc, f->base_ct, so, sn, ctb) : z3_read(f->base_ct, so, sn, ctb, 1)) { bad = 1; break; }
+        if (inkfly_gpu_rayface && ifgpu_on()) {   /* the face search on the GPU (2026-11-20: 18 % of FR1's sampler CPU here; byte-identical) */
+            const size_t m = cnt[q] - (size_t)b0;
+            if (!pn) { pn = malloc(np * 6 * sizeof *pn); gd = malloc(np); }
+            if (pn && gd) {
+                for (size_t j = 0; j < m; j++) { const cpx *x = &X[ord[b0 + j]]; memcpy(pn + 6 * j, x->P, 3 * sizeof(double)); memcpy(pn + 6 * j + 3, x->N, 3 * sizeof(double)); }
+                ifg_ray rp = {f->off, V, sign, lo, ns, c->iso, c->face_run, c->face_gap, {co[0], co[1], co[2]}, {cn[0], cn[1], cn[2]}, z0, z1};
+                const int g = inkfly_gpu_rayface(&rp, pn, m, ctb, gd);
+                if (!g) { for (size_t j = 0; j < m; j++) drop[ord[b0 + j]] = gd[j]; continue; }
+                if (g == 2) { bad = 1; break; }
+                if (g < 0) { UFSM_DEFAULTED("inkfly = the CPU from here (the GPU ray face search failed: %d)", g); atomic_store(&g_ifgpu, 0); }
+            }
+        }
+        for (int64_t j = b0; j < (int64_t)cnt[q]; j++) {
+            const cpx *x = &X[ord[j]];
+            for (int k = 0; k < ns; k++) { const double tt = (lo + k) * sign; double qq[3];
+                for (int d = 0; d < 3; d++) qq[d] = (x->P[d] + tt * x->N[d] - f->off) / V - co[d];
+                const float v = tri_box_z(ctb, cn, z0, z1, qq[0], qq[1], qq[2]); if (v < -1.5f) { bad = 1; break; } raw[k] = v < 0 ? 0 : v; }
+            if (bad) break;
+            for (int k = 0; k < ns; k++) sm[k] = 0.25f * (raw[k > 0 ? k - 1 : 0] + 2 * raw[k] + raw[k < ns - 1 ? k + 1 : ns - 1]);
+            drop[ord[j]] = face_of(sm, ns, lo, c->iso, c->face_run, c->face_gap) != FACE_NONE;
+        }
+    }
+    free(cnt); free(ord); free(sl); free(ctb); free(pn); free(gd);
+    return bad ? -1 : 0;
+}
+/* rayface.bin (2026-11-20): the face-drop bit of every label pixel of every supervised tile, so MIL mode 1 needs no CT. The face search
+   of a ray depends only on its mesh point / normal, the CT and the face config, all in the cache key (the dir is index.bin's), never on
+   the window or the held-out boxes; so the bits are the on-the-fly path's. Sampler-only, P 256, the ink ladder's 6 sources: 18.1 Mvox/s
+   with the per-window face search (its level-L CT slabs were ~40 % of the sampler CPU), 51.8 without it. Layout: "URF1", u64 tiles,
+   then 512 bytes per tile (bit r * 64 + c of the tile's 64 x 64 pixels; pixels without a mesh point / supervision: 0) */
+enum { RF_HDR = 16, RF_TB = 512 };
+static void inkfly_rayface_load(inkfly *f) {
+    { const char *e = getenv("UFSM_INK_RAYFACE"); if (!*f->kdir || (e && (!*e || !strcmp(e, "0")))) return; }
+    char pth[1300]; snprintf(pth, sizeof pth, "%s/rayface.bin", f->kdir);
+    const int fd = open(pth, O_RDONLY); if (fd < 0) return;
+    struct stat st; uint8_t h[RF_HDR]; uint64_t nt = 0;
+    if (fstat(fd, &st) || pread(fd, h, RF_HDR, 0) != RF_HDR || memcmp(h, "URF1", 4) || (memcpy(&nt, h + 8, 8), nt != f->nT) || (size_t)st.st_size != RF_HDR + (size_t)nt * RF_TB) {
+        fprintf(stderr, "ink onfly: %s does not match the tile index (%llu tiles): ignored, faces searched per window\n", pth, (unsigned long long)f->nT); close(fd); return; }
+    void *m = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0); close(fd);
+    if (m == MAP_FAILED) return;
+    f->rf_map = m; f->rf_len = (size_t)st.st_size; f->rf = (const uint8_t *)m + RF_HDR;
+}
+/* the candidate pixels of tile t (every supervised pixel with a mesh point; no window / held-out test) into *X (grown), the box */
+static int tile_px(inkfly *f, size_t t, cpx **X, size_t *np, size_t *cap, double lo3[3], double hi3[3]) {
+    const inksplat_cfg *c = &f->c; const ifunit *u = &f->U[f->T[t].unit]; const int tl = (int)f->T[t].tile, tx = tl % u->ntx, ty = tl / u->ntx;
+    const int64_t r0 = (int64_t)ty * TS, c0 = (int64_t)tx * TS, r1 = r0 + TS < u->lh ? r0 + TS : u->lh, c1 = c0 + TS < u->lw ? c0 + TS : u->lw, rh = r1 - r0, rw = c1 - c0;
+    const int reach = (int)ceil(fmax(fabs(c->face_lo), fabs(c->face_hi))) + 2;
+    uint8_t *lab = malloc((size_t)rh * rw), *msk = nullptr;
+    if (!lab || lsrc_read(&f->Ls[u->lab], u->lr0 + r0, u->lc0 + c0, rh, rw, lab, 1) || ifu_mask(f, u, r0, c0, rh, rw, &msk)) { free(lab); free(msk); return -1; }
+    if (u->lab01) for (size_t k = 0; k < (size_t)rh * rw; k++) lab[k] *= 255;
+    geo G = {0}; G.c = c; G.S = &f->S[u->surf]; G.F = u->F; G.lab = lab; G.msk = msk; G.lw = rw; G.lh = rh; G.lr0 = u->lr0 + r0; G.lc0 = u->lc0 + c0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
+    for (int64_t r = 0; r < rh; r++) for (int64_t cc = 0; cc < rw; cc++) {
+        if (!px_sup(&G, r, cc)) continue;
+        double gu, gv, P[3], N[3]; px_grid(&G, (double)r, (double)cc, &gu, &gv);
+        if (ssurf_pn(G.S, gu, gv, P, N)) continue;
+        if (*np == *cap) { *cap = *cap ? 2 * *cap : 65536; cpx *q = realloc(*X, *cap * sizeof *q); if (!q) { free(lab); free(msk); return -1; } *X = q; }
+        cpx *x = &(*X)[(*np)++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = 0; x->t = (uint32_t)t; x->px = (uint16_t)(r * TS + cc);
+        for (int d = 0; d < 3; d++) { if (P[d] - reach < lo3[d]) lo3[d] = P[d] - reach; if (P[d] + reach > hi3[d]) hi3[d] = P[d] + reach; }
+    }
+    free(lab); free(msk); return 0;
+}
+/* the build's batches: tiles sorted by the Morton code of their centre's 128-voxel cell, a batch = up to 64 tiles of one cell, so its CT
+   box is about a cell (consecutive tiles of a label row were a slab across the scroll: 0009B's 14306 tiles took 643 s on 6 CPUs, ~90 %
+   of it CT decode; by cell 17 s, the same bits) and neighbouring batches share the decoded chunks (the ink CT cache) */
+typedef struct { inkfly *f; uint8_t *bits; const uint32_t *ord; const size_t *bs; size_t nb, nt; _Atomic size_t next, done; _Atomic int fail; double t0; } rfjob;
+static int rf_cmp(const void *a, const void *b) { const uint64_t *x = a, *y = b; return x[0] != y[0] ? (x[0] < y[0] ? -1 : 1) : (x[1] < y[1] ? -1 : x[1] > y[1]); }
+static uint64_t rf_morton(uint64_t z, uint64_t y, uint64_t x) {
+    uint64_t m = 0; for (int i = 0; i < 21; i++) m |= ((z >> i & 1) << (3 * i + 2)) | ((y >> i & 1) << (3 * i + 1)) | ((x >> i & 1) << (3 * i)); return m;
+}
+static void *rf_worker(void *a) {
+    rfjob *J = a; inkfly *f = J->f; cpx *X = nullptr; size_t cap = 0; uint8_t *drop = nullptr; size_t dcap = 0;
+    for (;;) {
+        const size_t k = atomic_fetch_add(&J->next, 1); if (k >= J->nb || atomic_load(&J->fail)) break;
+        const size_t b = J->bs[k], e = J->bs[k + 1]; size_t np = 0; double lo3[3] = {1e300, 1e300, 1e300}, hi3[3] = {-1e300, -1e300, -1e300};
+        for (size_t i = b; i < e; i++) if (tile_px(f, J->ord[i], &X, &np, &cap, lo3, hi3)) { atomic_store(&J->fail, 1); break; }
+        if (atomic_load(&J->fail)) break;
+        if (np > dcap) { free(drop); dcap = np; drop = malloc(dcap); if (!drop) { atomic_store(&J->fail, 1); break; } }
+        if (np) { memset(drop, 0, np); if (rays_face(f, X, np, lo3, hi3, drop)) { atomic_store(&J->fail, 1); break; } }
+        for (size_t i = 0; i < np; i++) if (drop[i]) J->bits[(size_t)X[i].t * RF_TB + X[i].px / 8] |= (uint8_t)(1u << (X[i].px % 8));   /* (tiles of a batch: this thread's only) */
+        const size_t dn = atomic_fetch_add(&J->done, e - b) + (e - b);
+        if (dn / 20000 != (dn - (e - b)) / 20000) fprintf(stderr, "ink rayface: %zu of %zu tiles, %.0f s\n", dn, J->nt, snow() - J->t0);
+    }
+    free(X); free(drop); return nullptr;
+}
+int inkfly_rayface_build(void *handle, int nthreads, int force) {
+    inkfly *f = handle; if (!f) return -1;
+    if (!*f->kdir) { fprintf(stderr, "ink rayface: no disk cache dir for this source (cache_dir / UFSM_DERIVED_CACHE)\n"); return -1; }
+    char pth[1300], tmp[1400]; snprintf(pth, sizeof pth, "%s/rayface.bin", f->kdir); snprintf(tmp, sizeof tmp, "%s.%d.tmp", pth, (int)getpid());
+    if (f->rf && !force) { fprintf(stderr, "ink rayface: %s exists (%zu tiles)\n", pth, f->nT); return 0; }
+    uint8_t *bits = calloc(f->nT ? f->nT : 1, RF_TB); uint64_t *key = malloc((f->nT ? f->nT : 1) * 2 * sizeof *key);
+    uint32_t *ord = malloc((f->nT ? f->nT : 1) * sizeof *ord); size_t *bs = malloc((f->nT + 2) * sizeof *bs);
+    if (!bits || !key || !ord || !bs) { free(bits); free(key); free(ord); free(bs); return -1; }
+    for (size_t t = 0; t < f->nT; t++) { uint64_t c[3]; for (int d = 0; d < 3; d++) { const int64_t m = ((int64_t)f->T[t].lo[d] + f->T[t].hi[d]) / 2; c[d] = m > 0 ? (uint64_t)m / 128 : 0; }
+        key[2 * t] = rf_morton(c[0], c[1], c[2]); key[2 * t + 1] = t; }
+    qsort(key, f->nT, 2 * sizeof *key, rf_cmp);
+    size_t nb = 0; for (size_t i = 0; i < f->nT; i++) { ord[i] = (uint32_t)key[2 * i + 1]; if (!i || key[2 * i] != key[2 * i - 2] || i - bs[nb - 1] >= 64) bs[nb++] = i; }
+    bs[nb] = f->nT; free(key);
+    rfjob J = {f, bits, ord, bs, nb, f->nT, 0, 0, 0, snow()};
+    const int nth = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads; pthread_t th[64];
+    for (int i = 0; i < nth; i++) pthread_create(&th[i], nullptr, rf_worker, &J);
+    for (int i = 0; i < nth; i++) pthread_join(th[i], nullptr);
+    free(ord); free(bs);
+    if (atomic_load(&J.fail)) { fprintf(stderr, "ink rayface: failed (a label / mask / CT read)\n"); free(bits); return -1; }
+    FILE *o = fopen(tmp, "wb"); uint8_t h[RF_HDR] = {'U', 'R', 'F', '1'}; const uint64_t nt = f->nT; memcpy(h + 8, &nt, 8);
+    const int ok = o && fwrite(h, 1, RF_HDR, o) == RF_HDR && fwrite(bits, RF_TB, f->nT, o) == f->nT;
+    if (!o || fclose(o) || !ok || rename(tmp, pth)) { unlink(tmp); fprintf(stderr, "ink rayface: cannot write %s\n", pth); free(bits); return -1; }
+    uint64_t nd = 0; for (size_t k = 0; k < f->nT * (size_t)RF_TB; k++) nd += (uint64_t)__builtin_popcount(bits[k]);
+    fprintf(stderr, "ink rayface: %s: %zu tiles, %llu faced pixels, %.0f s\n", pth, f->nT, (unsigned long long)nd, snow() - J.t0);
+    free(bits);
+    if (f->rf_map) { munmap(f->rf_map, f->rf_len); f->rf_map = nullptr; f->rf = nullptr; }
+    inkfly_rayface_load(f);
+    return f->rf ? 0 : -1;
+}
+int inkfly_rayface_have(void *handle) { const inkfly *f = handle; return f && f->rf; }
+/* (ink-rayface --verify, single-threaded: the rays with the bits ignored, i.e. the face search on the CT) */
+int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout);
+int inkfly_rays_noface(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout) {
+    inkfly *f = handle; if (!f) return -1; const uint8_t *k = f->rf; f->rf = nullptr;
+    const int rc = inkfly_rays(handle, o, n, mode, stride, R, out, nout); f->rf = k; return rc;
+}
+/* a level-L window of edge P centred on a random supervised tile (seed); 0 ok */
+int inkfly_sample_window(void *handle, uint64_t seed, int P, int64_t o[3]) {
+    const inkfly *f = handle; if (!f || !f->nT) return -1; const size_t t = (size_t)((seed >> 17) % f->nT);
+    for (int d = 0; d < 3; d++) { const double cz = 0.5 * ((double)f->T[t].lo[d] + f->T[t].hi[d]); o[d] = (int64_t)floor((cz - f->off) / f->V) - P / 2 + (int64_t)((seed >> (3 + 9 * d)) % 33) - 16;
+                                  if (o[d] < 0) o[d] = 0; }
+    return 0;
+}
 /* the normal-pooled MIL rays of a window (2026-11-11, villa's normal_pooled_3d): per supervised label pixel (every stride-th row / col of
    its label window) whose mesh point lies in the window, the point and the unit normal in the window's level voxels and the 2-D label.
    mode 1: only the pixels without an open face (the ones the --face voxel target leaves unknown; the face search as inkfly_chunk's on
@@ -1755,7 +1919,6 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
     }
     for (size_t i = 1; i < nc; i++) { uint32_t t = cand[i]; size_t j = i; while (j > 0 && (f->T[cand[j - 1]].unit > f->T[t].unit || (f->T[cand[j - 1]].unit == f->T[t].unit && f->T[cand[j - 1]].tile > f->T[t].tile))) { cand[j] = cand[j - 1]; j--; } cand[j] = t; }
     /* candidate pixels: point in the window, not near a held-out box */
-    typedef struct { double P[3], N[3]; uint8_t y; } cpx;
     size_t pc = 1024, np = 0; cpx *X = malloc(pc * sizeof *X); int rc = -1;
     double lo3[3] = {1e300, 1e300, 1e300}, hi3[3] = {-1e300, -1e300, -1e300}; const int reach = (int)ceil(fmax(fabs(c->face_lo), fabs(c->face_hi))) + 2;
     for (size_t q0 = 0; q0 < nc;) {
@@ -1783,58 +1946,18 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
                     if (ex) continue;
                     if (np == pc) { pc *= 2; X = realloc(X, pc * sizeof *X); }
                     cpx *x = &X[np++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = lab[(size_t)(r - rr0) * rw + (cc - rc0)] >= 128;
+                    x->t = cand[q]; x->px = (uint16_t)((r - r0) * TS + (cc - c0));
                     for (int d = 0; d < 3; d++) { if (P[d] - reach < lo3[d]) lo3[d] = P[d] - reach; if (P[d] + reach > hi3[d]) hi3[d] = P[d] + reach; }
                 } }
         }
         free(lab); free(msk); q0 = q1;
     }
-    const int lo = (int)floor(c->face_lo), hi = (int)ceil(c->face_hi), ns = hi - lo + 1; const double sign = c->flip ? -1 : 1;
+    const double sign = c->flip ? -1 : 1;
     uint8_t *drop = nullptr;
-    if (mode == 1 && np) {   /* the face search on the level's CT, as inkfly_chunk. In z slabs of the CT box (2026-11-13): the whole box of a
-                                level-(L+1) window read at level L is (2 x 1040)^3 = 8.9 GB at P 1024 (a 30 GB sampler-only run OOM'd on it); a
-                                slab holds the rows its points' samples reach, the samples' coordinates are the whole box's, so byte-identical */
-        int64_t co[3], cn[3]; for (int d = 0; d < 3; d++) { co[d] = (int64_t)floor((lo3[d] - f->off) / V) - 1; cn[d] = (int64_t)ceil((hi3[d] - f->off) / V) + 2 - co[d]; }
-        const int64_t rz = (int64_t)ceil(reach / V) + 2, plane = cn[1] * cn[2];
-        const char *e = getenv("UFSM_INKRAY_SLAB_MB"); const double mb = e ? atof(e) : 256;
-        int64_t T = (int64_t)(mb * 1048576 / (double)plane) - 2 * rz; if (T < 16) T = 16; if (T > cn[0]) T = cn[0];
-        const int64_t nsl = (cn[0] + T - 1) / T;
-        uint32_t *cnt = calloc((size_t)nsl + 1, sizeof *cnt), *ord = malloc(np * sizeof *ord), *sl = malloc(np * sizeof *sl);
-        drop = calloc(np, 1); uint8_t *ctb = malloc((size_t)(T + 2 * rz + 2) * (size_t)plane);
-        if (!cnt || !ord || !sl || !drop || !ctb) { free(cnt); free(ord); free(sl); free(ctb); free(drop); goto done; }
-        for (size_t i = 0; i < np; i++) { int64_t q = (int64_t)floor((X[i].P[0] - f->off) / V - co[0]) / T; if (q < 0) q = 0; if (q >= nsl) q = nsl - 1; sl[i] = (uint32_t)q; cnt[q + 1]++; }
-        for (int64_t q = 0; q < nsl; q++) cnt[q + 1] += cnt[q];
-        for (size_t i = 0; i < np; i++) ord[cnt[sl[i]]++] = (uint32_t)i;   /* (cnt[q] is now slab q's end = slab q+1's start) */
-        float raw[256], sm[256]; int bad = 0;
-        double *pn = nullptr; uint8_t *gd = nullptr;   /* (the GPU face search: the slab's rays' P / N, their drop bytes) */
-        for (int64_t q = 0, b0 = 0; q < nsl && !bad; b0 = cnt[q], q++) {
-            if ((int64_t)cnt[q] == b0) continue;
-            int64_t z0 = q * T - rz, z1 = (q + 1) * T + rz + 1; if (z0 < 0) z0 = 0; if (z1 > cn[0]) z1 = cn[0];
-            const int64_t so[3] = {co[0] + z0, co[1], co[2]}, sn[3] = {z1 - z0, cn[1], cn[2]};
-            if (f->zc ? zcache_read(f->zc, f->base_ct, so, sn, ctb) : z3_read(f->base_ct, so, sn, ctb, 1)) { bad = 1; break; }
-            if (inkfly_gpu_rayface && ifgpu_on()) {   /* the face search on the GPU (2026-11-20: 18 % of FR1's sampler CPU here; byte-identical) */
-                const size_t m = cnt[q] - (size_t)b0;
-                if (!pn) { pn = malloc(np * 6 * sizeof *pn); gd = malloc(np); }
-                if (pn && gd) {
-                    for (size_t j = 0; j < m; j++) { const cpx *x = &X[ord[b0 + j]]; memcpy(pn + 6 * j, x->P, 3 * sizeof(double)); memcpy(pn + 6 * j + 3, x->N, 3 * sizeof(double)); }
-                    ifg_ray rp = {f->off, V, sign, lo, ns, c->iso, c->face_run, c->face_gap, {co[0], co[1], co[2]}, {cn[0], cn[1], cn[2]}, z0, z1};
-                    const int g = inkfly_gpu_rayface(&rp, pn, m, ctb, gd);
-                    if (!g) { for (size_t j = 0; j < m; j++) drop[ord[b0 + j]] = gd[j]; continue; }
-                    if (g == 2) { bad = 1; break; }
-                    if (g < 0) { UFSM_DEFAULTED("inkfly = the CPU from here (the GPU ray face search failed: %d)", g); atomic_store(&g_ifgpu, 0); }
-                }
-            }
-            for (int64_t j = b0; j < (int64_t)cnt[q]; j++) {
-                const cpx *x = &X[ord[j]];
-                for (int k = 0; k < ns; k++) { const double tt = (lo + k) * sign; double qq[3];
-                    for (int d = 0; d < 3; d++) qq[d] = (x->P[d] + tt * x->N[d] - f->off) / V - co[d];
-                    const float v = tri_box_z(ctb, cn, z0, z1, qq[0], qq[1], qq[2]); if (v < -1.5f) { bad = 1; break; } raw[k] = v < 0 ? 0 : v; }
-                if (bad) break;
-                for (int k = 0; k < ns; k++) sm[k] = 0.25f * (raw[k > 0 ? k - 1 : 0] + 2 * raw[k] + raw[k < ns - 1 ? k + 1 : ns - 1]);
-                drop[ord[j]] = face_of(sm, ns, lo, c->iso, c->face_run, c->face_gap) != FACE_NONE;
-            }
-        }
-        free(cnt); free(ord); free(sl); free(ctb); free(pn); free(gd);
-        if (bad) { fprintf(stderr, "ink-onfly: rays: a CT slab read failed or a sample left its slab\n"); free(drop); goto done; }
+    if (mode == 1 && np) {   /* the face search: the precomputed bits (rayface.bin) or on the level's CT now */
+        drop = calloc(np, 1); if (!drop) goto done;
+        if (f->rf) for (size_t i = 0; i < np; i++) drop[i] = f->rf[(size_t)X[i].t * RF_TB + X[i].px / 8] >> (X[i].px % 8) & 1;
+        else if (rays_face(f, X, np, lo3, hi3, drop)) { fprintf(stderr, "ink-onfly: rays: a CT slab read failed or a sample left its slab\n"); free(drop); goto done; }
     }
     inkray *Rr = malloc((np ? np : 1) * sizeof *Rr); size_t nr = 0;
     for (size_t i = 0; i < np; i++) {

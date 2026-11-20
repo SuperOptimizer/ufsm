@@ -87,6 +87,12 @@ typedef struct { float p[3], n[3]; uint8_t y, pad[3]; float w; float rs; } inkra
    target's unknowns); stride: every stride-th label row / col; pixels within R + 1 level voxels of a held-out box are left out.
    *out malloc'd. 0 ok. */
 int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout);
+/* mode 1's face-drop bits of every supervised label pixel, precomputed into the source's cache dir (rayface.bin beside index.bin;
+   inkfly_rays then reads no CT; UFSM_INK_RAYFACE=0 ignores the file). build: computes and writes it (force: again), 0 ok; have: 1 loaded */
+int inkfly_rayface_build(void *handle, int nthreads, int force);
+int inkfly_rayface_have(void *handle);
+int inkfly_rays_noface(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout);   /* (verify: the bits ignored) */
+int inkfly_sample_window(void *handle, uint64_t seed, int P, int64_t o[3]);   /* a level-L window around a random supervised tile */
 /* the onfly ink target's 2x pooling of one 2^3 block (prob254 bytes, 255 unknown): the rounded mean of the known children, unknown when none.
    Until 2026-11-14 (datafix) the known max: any inked child made the whole coarse voxel ink, so the 9.6 um ink target of a layer a few 4.8 um
    voxels thick was dilated by up to one 4.8 um voxel per face (2/3 of the human-ink windows train at 9.6 um). The stored pyramids of
