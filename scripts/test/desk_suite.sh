@@ -43,7 +43,7 @@ set -u
 SHA=$1 TIER=$2 J=$3 T=$4 MEMGB=$5 BJ=$6 KEEP=$7 FILT=$8 XARGS=$9 LOADMAX=${10} WAITMIN=${11} ARCH=${12:-120} ROOT=${13:-/vesuvius/ufsm/suite}
 S=${SHA:0:12}; W=$ROOT/$S
 # a host whose python3 lacks the test references' modules (the laptop: no numpy, no sudo) keeps a venv in ROOT/pyenv:
-#   python3 -m venv ROOT/pyenv && ROOT/pyenv/bin/pip install numpy tifffile scipy
+#   python3 -m venv ROOT/pyenv && ROOT/pyenv/bin/pip install numpy tifffile scipy pillow
 [ -x "$ROOT/pyenv/bin/python3" ] && export PATH=$ROOT/pyenv/bin:$PATH
 deskok() {   # wait (<= WAITMIN) until MemAvailable >= MEMGB and the 1-min load <= LOADMAX: the desk's own jobs come first
   local i a l n=$(( WAITMIN * 2 ))
