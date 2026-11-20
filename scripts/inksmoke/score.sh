@@ -8,9 +8,10 @@
 # Card 1 only (11-18): CUDA_VISIBLE_DEVICES=1 (PCI order, nvidia-smi's) and device 0 inside: latink's predict --gpu 1 alone opened card 0
 # too (the desk's try9 card). A guard polls nvidia-smi every 2 s: any process of this job on card 0, or one above GPUCAP MiB (6000: the
 # lead's card-1 limit beside try9's ~3.3 GB), is killed; the peak per process is logged to TAG/gpupeak.txt.
-set -u; TAG=${1:?TAG}; CK=${2:?CKPT}; U=${U:-/home/forrest/ufsm-inksdk/build/ufsm}
+set -u; TAG=${1:?TAG}; CK=${2:?CKPT}; U=${U:-/vesuvius/ufsm/bin/ufsm-inksdk}
 E=/vesuvius/ufsm/inksmoke/eval/$TAG; P=/vesuvius/ufsm/podun/PHerc1667; UP=$P/inksdk/up; CTR=/vesuvius/ufsm/v2/ct; CTK=PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr
 [ -s $E/map/w051.tif ] && { echo "score $TAG: done before"; exit 0; }
+exec 8> /vesuvius/ufsm/inksdk/score.lock; flock 8   # (one score at a time on the desk, team rule 11-20; the drivers queue here)
 mkdir -p $E/ink $E/in $E/map $E/r; cp $P/box.txt $P/axis.json $E/
 # GATEFROM=EVALDIR (a net without recto / verso rows, e.g. the full-res ink run): predict ink only; the papyrus gate (c12 / c13) is that
 # eval's volumes (t9c-500: try9's rv on the same 1667 grid), rendered here at this DEPTH
@@ -30,7 +31,7 @@ guard & GP=$!; trap 'kill $GP 2>/dev/null; [ -s $E/gpumem.log ] && sort -k3 -n $
 for n in $(seq 35 51); do ln -sfn $UP/w0$n $E/in/w0$n; done
 for h in ink c12 c13; do v=$E/ink/$h.zarr; mkdir -p $E/r/$h; [ -e $E/r/$h/.done ] && continue
   $LK env CUDA_VISIBLE_DEVICES=1 UFSM_RENDER_MEM=16 UFSM_RENDER_CHUNKED=1 UFSM_RENDER_GPU_MEM=4 ~/bin/memcap -m 36G ~/bin/lowprio $U render $E/in $E/r/$h \
-    --volume $v 9.596 --ct $CTR $CTK/2 --depth ${DEPTH:-4} --scale 1 --threads 8 > $E/render_$h.log 2>&1 && touch $E/r/$h/.done || { echo "score $TAG: render $h failed ($E/render_$h.log)"; exit 1; }
+    --volume $v 9.596 --ct $CTR $CTK/2 --depth ${DEPTH:-4} --scale 1 --threads 8 > $E/render_$h.log 2>&1 && grep -q "render: 17 wraps written" $E/render_$h.log && touch $E/r/$h/.done || { echo "score $TAG: render $h failed ($E/render_$h.log)"; exit 1; }
 done
 # (render --gate needs --fill: the gate as in strip_refill.sh, the ink render x max(c12, c13) / 255, img-gate)
 for n in $(seq 35 51); do w=w0$n; [ -s $E/map/$w.tif ] && continue
