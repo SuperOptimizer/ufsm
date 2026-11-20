@@ -318,7 +318,9 @@ static void *completer(void *arg) {
         const double dt = now_s() - S->t0;
         pthread_mutex_lock(&G.mu);
         G.gpu_s += dt;
-        if (dt > G.max_s) { __atomic_store_n(&G.busy_us, (int64_t)((now_s() + G.cool_s) * 1e6), __ATOMIC_RELAXED); G.n_busy++; }   /* starved (time sliced next to another
+        if (dt > G.max_s && !G.n_busy++) UFSM_DEFAULTED("gpudec = the CPU decode for %.2f s after each GPU round trip over %.0f ms (GPU busy: %.0f ms; "
+                                                        "UFSM_GPU_DECODE_MAX_MS / _COOL_S; the exit summary counts them)", G.cool_s, G.max_s * 1e3, dt * 1e3);
+        if (dt > G.max_s) { __atomic_store_n(&G.busy_us, (int64_t)((now_s() + G.cool_s) * 1e6), __ATOMIC_RELAXED); }   /* starved (time sliced next to another
                                                                                                                                      job's kernels): the CPU for a while */
         if (rc) G.broken = 1;
         G.n_batches++; G.inflight--;
@@ -361,8 +363,11 @@ static void gd_init(void) {
     const char *mb = getenv("UFSM_GPU_DECODE_MIN_BYTES");
     G.min_bytes = mb ? (uint32_t)atoi(mb) : 2048u;   /* per substream, compressed (Paris 4 CT q 2: ~9 KB; ink q 32: ~200 B) */
     const char *ms = getenv("UFSM_GPU_DECODE_MAX_MS"), *cs = getenv("UFSM_GPU_DECODE_COOL_S");
-    G.max_s = (ms && atof(ms) > 0 ? atof(ms) : 60.0) * 1e-3;   /* an idle GPU: 5-12 ms for a full batch */
-    G.cool_s = cs && atof(cs) >= 0 ? atof(cs) : 2.0;
+    /* an idle GPU: 5-12 ms for a full batch. 2026-11-20: was 60 ms / 2 s; with three trainers time-slicing card 0 every 60 ms trip sent the
+       next 2 s to the CPU (ladder r1: 105 trips, 210 of 563 s, 108868 requests) while the CPU was the bottleneck. Now 500 ms / 0.25 s: a busy
+       GPU still decodes faster for the run than the starved CPU does, the cut stays for a GPU that is stuck */
+    G.max_s = (ms && atof(ms) > 0 ? atof(ms) : 500.0) * 1e-3;
+    G.cool_s = cs && atof(cs) >= 0 ? atof(cs) : 0.25;
     const char *fl = getenv("UFSM_GPU_DECODE_FLIGHT");   /* batches running at once (each slot: ~0.3 GB of device buffers at 1024 items) */
     G.flight = fl && atoi(fl) > 0 ? (atoi(fl) < NSLOT - 1 ? atoi(fl) : NSLOT - 1) : 2;
     G.in_cap = (size_t)G.max_items * 40000 + ((size_t)16 << 20);   /* q 2 substreams are ~10-20 KB */

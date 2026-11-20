@@ -24,6 +24,8 @@ typedef struct {
     float rung_tol, rung_shift_p;   /* (0: 0.5); --rung-shift-p: the drawn rung moved to a neighbouring one (both ways alike) with this probability */
     double min_fg;           /* reject a patch whose CT nonzero fraction is below this */
     double empty_keep;       /* probability of keeping a patch whose target is all zero */
+    double ink_pos_frac;     /* onfly ink sources with positive-label cells: the share of windows drawn around a positive cell (the rest around any
+                                supervised cell), and no empty_keep rejection for them (train --ink-pos-frac; < 0: the old rejection draw) */
     int augment;             /* 0 = none, 1 = all 48 cube symmetries + intensity, 2 = the 24 proper rotations + intensity */
     int holdout;             /* 0 = train: never draw patches touching a source's holdout box; 1 = validation: draw only inside holdout boxes */
     int holdout_reject;      /* training windows that overlap a held-out box (any same-CT source's): 0 = keep the window, every label unknown
@@ -273,7 +275,8 @@ void sample_axis_record_spatial_test(float *r, const int64_t o[3], int P, int ha
 
 typedef struct sampler sampler;
 
-typedef struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; } occ_index;   /* coarse label cells that contain surface */
+typedef struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; uint32_t *pidx; size_t pn; } occ_index;   /* coarse label cells that contain surface
+    (pidx / pn: an onfly ink source's cells with positive labels: the stratified draw, cfg ink_pos_frac) */
 occ_index source_occupancy(source *s);
 /* warm the CT chunk cache for the labelled cells of every pyramid source (levels 0..maxlev, a fraction of the cells) */
 /* warm the CT chunk cache around every labelled cell: training windows up to P level voxels at the levels a source trains on

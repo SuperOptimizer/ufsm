@@ -15,6 +15,8 @@ C=(--task unwrap2 --levels 1 --P 64 --B 1 --gpus 0 --workers 2 --sampler-slots 4
    --warmup 0 --seed 5 --wind4-tile 0 --widths 96,128,160 --det 1 --lat 4 --lat-guide 3 --rv 2 --rv-iso 100 --ink-head 1 --fstem 16 --opt muon)
 UFSM_SP24_REPORT=1 UFSM_SP24_CHECK=1 "$U" train fx/sources-ink.json --out s "${C[@]}" --steps 8 --sparse24 3 --sparse24-mode 3 --sparse24-ramp 2 > s.log 2>&1 \
   || fail "train (1) ($D/s.log)"
+# (an ARCH=86 build has no sparse block-scaled MMA: the switch runs but the dense software kernels stay; arch86 suite 2026-11-20)
+grep -q 'through the software kernels of this build' s.log && { echo "SKIP: test_sp24_train: software MX build, no sparse MMA"; exit 0; }
 grep -q '^step 3: 2:4 sparsity on (mode 3, levels all, ramp 2 steps, hard' s.log || fail "switch line ($D/s.log)"
 grep -q '^step 4: sparse24 mask applied; kept |w|^2 per level: L0 ' s.log || fail "mask applied at step 4 ($D/s.log)"
 ! grep -q 'non-finite' s.log || fail "non-finite step ($D/s.log)"
