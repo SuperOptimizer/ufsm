@@ -6,6 +6,51 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## try9 end: GT sweep of the snapshots, the cooldown, and where fully adaptive Muon stopped (2026-11-19, trainperf)
+
+**Is try9 still improving on GT?** Phase-miss share (merge-flag --eval --gap-report 100 --thr 179, mergeflag's recipe: origin / axis
+from the reference fields, 0 interval mismatches vs t16 / u1mn on every row) on Paris 4 (38 boxes: PH1-3, J1-34, HOLD) and the 9 1667
+boxes of the u1 / try9 rows; window 640 / halo 64, --gn-live 1, the rvsep predict binary (unrollperf's t16 recipe); lower is better.
+1667 wbench ids: the same 9 boxes, fixed-fields CPU fit (higher is better). Scripts: /vesuvius/ufsm/trainperf/gt36/.
+
+| step | weights | P4 all | PH1-3 | J | HOLD | 1667 phase-miss | 1667 ids |
+|---|---|---|---|---|---|---|---|
+| 15000 | EMA (per update, ~10k-window horizon) | 0.617 | 0.892 | 0.626 | 0.300 | 0.266 | |
+| 15000 | live | 0.426 | 0.732 | 0.419 | 0.247 | 0.181 | |
+| 16000 | live | 0.379 | 0.606 | 0.381 | 0.174 | 0.172 | 0.802 |
+| 20000 | EMA (per window since the 16850 swap) | 0.463 | 0.742 | 0.467 | 0.194 | 0.180 | |
+| 25000 | EMA | 0.412 | 0.692 | 0.414 | 0.171 | 0.175 | |
+| 30000 | EMA | 0.404 | 0.695 | 0.403 | 0.176 | 0.166 | |
+| 36000 | EMA | 0.422 | 0.715 | 0.424 | 0.169 | 0.171 | 0.842 |
+| 36000 | live | 0.449 | 0.750 | 0.452 | 0.181 | 0.180 | 0.790 |
+| 37000 | EMA | 0.414 | 0.713 | 0.415 | 0.164 | 0.168 | |
+| cooled 33333 | EMA | 0.418 | 0.686 | 0.422 | 0.158 | 0.170 | 0.841 |
+| cooled 33333 | live | 0.435 | 0.729 | 0.438 | 0.163 | 0.172 | 0.842 |
+| u1 / try9 EMA-12750 (refs) | | | | | | 0.183 / 0.234 | 0.813 / 0.796 |
+
+- Snapshot-to-snapshot noise on P4 is ~+-0.03-0.04 (15000 live 0.426 vs 16000 live 0.379, 1000 steps apart), so there is no turn point:
+  after the per-window EMA settled (25000 on) P4 sits at 0.40-0.42 and 1667 at 0.166-0.175. 16000 is a lucky snapshot, not a peak.
+- Window 256 instead of 640 costs +0.14 P4 phase-miss on the same weights (16000: 0.520 vs 0.379): score only at the production window.
+- The per-update EMA was harmful (15000 EMA far behind its own live weights); the per-window EMA (--ema 0.9995 --ema-per window, swap
+  5aae217f at 16850) beats live at 36000 on both scrolls (P4 -0.027, 1667 ids +0.052).
+- Cooldown (user 11-19: kill the constant-lr run): from snap/30000 with try9's launch.env (5aae217f, NorMuon, per-window EMA, item-C
+  layout), runs/try9cool, --steps 33333 --cooldown 0.1: lr 3e-4 -> 0 linear over 30000 -> 33333 (launched via runs/cool.launch /
+  cool.train.sh, copies of scratch2.launch / .train.sh with a COOL fraction). Result: the live weights reach the EMA weights' level,
+  nothing beyond it. With the per-window EMA the cooldown is redundant; any late EMA checkpoint is the production try9.
+
+**Fully adaptive Muon, part 2 (branch admuon2-20261119, not merged; user stopped the winding training before its arms ran).**
+- `train --muon-probe S` (256126fa): every S-th element of each Muon matrix's final direction (NorMuon rows included) read back per
+  update; the --opt-stats line gets rho_k (lag 1, 2, 4, 8, 16 cosine of successive directions), kappa16 = 1 + 2 sum rho_k (the
+  random-walk factor DoG's kappa = (1 + b) / (1 - b) = 39 assumes) and prog16 = |sum of 16 steps| / sum |step|; DoG's G added to the line.
+- 85f54bfe: a --resume may add or drop the adaptive controllers (+la / +dg): the optimizer-tag check ignores them (momentum and NorMuon
+  rows carry over). The first DoG diagnosis arm had been refused by that check (rc 2).
+- Diagnosis: only the NorMuon arm ran, 3 updates (resumed snap/30000, P 768, accum 5) before the stop: rho_1 0.62 -> 0.77 -> 0.84,
+  rho_2 0.65 -> 0.76, kappa16 (truncated at the available lags) 2.2 -> 5.5 while the momentum refilled. Not enough for a verdict on
+  whether the measured kappa sits far below 39 (the hypothesis for DoG's collapse).
+- Designed, not coded: kappa estimated online on the probe subsample (EMA of <v_t, e_t> / |v_t|^2 with e an exponentially weighted sum
+  of past directions), DoG reformulated as eta = rbar / sqrt(kappa_hat G_raw) so kappa may change; an autocool controller from the
+  fluctuation-dissipation relation (Yaida 2018 / SASA) plus prog_K vs sqrt(kappa / K). Notes: /vesuvius/ufsm/trainperf/admuon2/design.txt.
+
 ## resgate: 9.6 um detail arms fine-tuned on the GT boxes, PARTIAL (R0, R2 only; stopped 2026-11-19 by the user's "stop winding training")
 
 Question: is try9's sheet detail limited by the latent input or by the fine stem? Each arm used try9's architecture (widths
