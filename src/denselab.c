@@ -245,13 +245,16 @@ int cmd_denselab_render(int argc, char **argv) {
    the rays from the bits vs the face search, byte for byte */
 int cmd_ink_rayface(int argc, char **argv) {
     if (argc < 3 || argv[2][0] == '-') {
-        fprintf(stderr, "usage: ufsm ink-rayface SOURCES.json [--source N1,N2] [--threads 8] [--gpu D] [--force 1] [--verify N --P 256 --stride 2 --R 10 --seed 1]\n"
+        fprintf(stderr, "usage: ufsm ink-rayface SOURCES.json [--source N1,N2] [--threads 8] [--gpu D] [--force 1] [--rays 2] [--verify N --P 256 --stride 2 --R 10 --seed 1]\n"
+                        "  --rays S: also the per-tile ray lists of MIL mode 1 at stride S (0: none); --verify compares the rays a window gets from them / the bits\n"
+                        "  with the face search on the CT\n"
                         "  precomputes the MIL rays' face-drop bit of every supervised label pixel of each onfly ink target (rayface.bin in its cache dir)\n");
         return 2;
     }
     const char *names = opt(argc, argv, "--source", nullptr);
     const int nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8), gpu = opt_atoi("--gpu", opt(argc, argv, "--gpu", "-1"));
     const int force = opt_atoi("--force", opt(argc, argv, "--force", "0")), nver = opt_atoi("--verify", opt(argc, argv, "--verify", "0"));
+    const int rays = opt_atoi("--rays", opt(argc, argv, "--rays", "2"));
     const int P = opt_atoi("--P", opt(argc, argv, "--P", "256")), stride = opt_atoi("--stride", opt(argc, argv, "--stride", "2"));
     const float R = (float)atof(opt(argc, argv, "--R", "10")); uint64_t seed = (uint64_t)opt_atoi("--seed", opt(argc, argv, "--seed", "1"));
     if (nver) setenv("UFSM_INK_RAYFACE", "0", 1);   /* (verify: the sources open without the bits; the build loads them per handle below) */
@@ -266,6 +269,11 @@ int cmd_ink_rayface(int argc, char **argv) {
             const double t0 = dl_now();
             if (inkfly_rayface_build(h, nt, force || nver)) { fprintf(stderr, "ink-rayface: %s: FAILED\n", s->name); rc = 1; break; }
             printf("ink-rayface: %s: built in %.0f s\n", s->name, dl_now() - t0);
+            if (rays > 0) {   /* the per-tile ray lists of MIL mode 1 at --rays S (the trainer's --ink-mil-stride, 2) */
+                const double t1 = dl_now();
+                if (inkfly_raylist_build(h, rays, 1, nt)) { fprintf(stderr, "ink-rayface: %s: ray lists FAILED\n", s->name); rc = 1; break; }
+                printf("ink-rayface: %s: ray lists (stride %d, mode 1) in %.0f s\n", s->name, rays, dl_now() - t1);
+            }
             if (!nver) continue;
             /* windows at the onfly level around random supervised tiles: rays from the bits vs rays with the bits off (the face search) */
             int ok = 0, tried = 0; size_t nrays = 0;
