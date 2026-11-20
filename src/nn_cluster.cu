@@ -14,9 +14,14 @@
 #else
 #define CLU_ON 0
 #endif
+#if CLU_ON || !defined(__CUDA_ARCH__)
+#define CLU_DIMS(n) __cluster_dims__(1, 1, n)
+#else
+#define CLU_DIMS(n)   /* nvcc rejects the attribute below sm_90 */
+#endif
 
 template <int N, int M>
-__global__ void __cluster_dims__(1, 1, N) __launch_bounds__(128, 1) clu_k(unsigned *out) {
+__global__ void CLU_DIMS(N) __launch_bounds__(128, 1) clu_k(unsigned *out) {
     extern __shared__ unsigned dyn[];
     __shared__ __align__(16) unsigned s[128];
     __shared__ __align__(8) unsigned long long mb;
