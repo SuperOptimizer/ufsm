@@ -6,6 +6,46 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## resgate: 9.6 um detail arms fine-tuned on the GT boxes, PARTIAL (R0, R2 only; stopped 2026-11-19 by the user's "stop winding training")
+
+Question: is try9's sheet detail limited by the latent input or by the fine stem? Each arm used try9's architecture (widths
+256,320,384,448,288,288, attention 4 + scroll PE, gfilm, sub-cell head) warm-started from try9-16000 weights. The from-scratch versions sat
+at phase BCE ln 2 for 4000 windows, as try4 / try8 did. Recipe: try9's warm-start lr (x0.3 for 2000 steps), NorMuon. Training: 6000 steps
+at P 256 / 9.6 um on 15 GT boxes inside the production holdouts, seed 3, desk card 1. Arms:
+- R0: the pure latent net (no fine stem).
+- R2: R0 + the fine stem (--fstem 16 --fstem-drop 0).
+- Planned but dropped: R2p (try9 recipe unchanged), T16 (try9-16000 itself), R3 (the voxel net warm from wind96), W96 (wind96 baseline).
+
+Scoring: wbench at window 640, GT ids per box (/vesuvius/ufsm/inksdk/resgate/RESULTS.txt). gaprep: mergeflag's gap report on the same
+fields (gap/TAG/gap.out). Held-out boxes PH2 J7 J11 J25; control boxes HOLD J19 J20 J27.
+
+| box (held out) | R0 ids | R2 ids | R2 - R0 |
+|---|---|---|---|
+| PH2 | 0.3268 | 0.3221 | -0.005 |
+| J7  | 0.4156 | 0.2974 | -0.118 |
+| J11 | 0.5170 | 0.4814 | -0.036 |
+| J25 | 0.6131 | 0.6142 | +0.001 |
+| mean | | | -0.039 |
+
+Control mean R2 - R0: -0.020 (HOLD -0.053, J27 -0.035).
+
+Gap report, held-out boxes, share of GT intervals phase-merged:
+
+| fields | all | GT gap [50,100) um | [100,200) | [200,inf) |
+|---|---|---|---|---|
+| try9-16000 (t16) | 0.311 | | | |
+| u1 | 0.363 | | | |
+| R0 | 0.269 | 0.474 | 0.244 | 0.182 |
+| R2 | 0.269 | 0.463 | 0.241 | 0.194 |
+
+Reading:
+- The fine stem (R2) does not help. On ids it hurts, mostly through J7.
+- Merges per GT gap are the same for R0 and R2.
+- Fine-tuning on the boxes lowers try9's held-out merge rate from 0.311 to 0.269 for either arm.
+- These are single-seed results. Without R3 / W96 there is no latent-vs-voxel answer.
+
+Kept: last.ckpt of rg96R0-s3 / rg96R2-s3 (the rings were deleted for disk).
+
 ## Learned input codec, stage 1: no gain over the KLT, volcomp far ahead per byte; stopped (2026-11-19, branch latcodec-20261119, latcodec)
 
 **Question.** Can a learned rate-distortion codec replace the KLT cells of latvol (lead's Task 2 design, approved 11-19), adopted only at
