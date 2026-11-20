@@ -6,6 +6,27 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Ink scoring in C: ink-wrapscore (pairwrap in seconds, volume maps without renders, held-out tile lists) (2026-11-20, branch inkscore-20261120, fullvram)
+
+One held-out ink AUC per checkpoint took ~14 min of latink predict + 3 renders on card 1 and 15-30 min of CPU pairwrap2.py (wrapscore.py's
+sampling, KD tree and Gauss-Newton foot points redone for each of 3 splits), and a missing map gave an n = 0 table instead of a failure.
+`ufsm ink-wrapscore WRAPS SEGS OUT` is wrapscore.py + pairwrap2.py in C:
+- Everything up to the maps depends only on (wraps, segs, step, ct key, holdouts): `--table FILE` caches it (keyed on the inputs' sizes /
+  mtimes; 1667's 7.79 M samples on 44 up wraps: 60 s to build, 0.5 GB), so a score is the maps' lookups and the AUCs: 7 s for 3 splits.
+- 1667 tgt0-d4 vs pairwrap2.py: heldout n 1296287 = and AUCs 0.8855 / 0.8583 (reader3) =; hold / valonly AUCs = (n 775029 vs 775028:
+  one sample's foot point rounds to the neighbouring map pixel). The bootstrap CI uses our RNG: within the bootstrap noise of numpy's.
+- `--vmap NAME=DIR`: DIR/{ink,c12,c13}.zarr evaluated at each sample's pixel with render's rc_pixel (render_core.h, depth --depth 4)
+  and img-gate's table: the gated render's value without rendering. fr1k-h16 (depth 4) and t9c-3000 (rendered at depth 1) give the
+  rendered maps' AUCs exactly; 8 s for three volumes.
+- `--tiles-out DIR`: latink.sh's LATINK_TILES lists from the held-out samples on --need wraps only: 131 + 125 tiles (grids 0 / 256)
+  instead of 200 + 398 (every human label's ink-splat shard).
+- Hard failures, exit 1 and no tsv: an unreadable segment / raster / wrap, a map dir missing or lacking a --need wrap, a
+  non-proportional map, a split under --min-n samples, a nan AUC, more than --max-absent (0.001) of the samples in ink shards the
+  store lacks (a cropped or failed predict).
+test_ink_wrapscore: a synthetic segment, two wraps, maps: n and AUC per split = wrapscore.py's; the cached table; the failures.
+The predict stays the cost: fr1k-h16's tile run was 592 windows in 13.5 min on the shared card 1 (~1.4 s a window, one predict
+setup per box).
+
 ## Ink sampler: the MIL rays from precomputed face bits and per-tile ray lists, 70 -> 225-250 Mvox/s (2026-11-20, branch inkstore-20261120, fullvram)
 
 The ink ladder's sampler (m3g argv: 6 onfly ink sources, MIL mode 1, P 256, 6 workers, sampler-only, no GPU) spent its time in the
