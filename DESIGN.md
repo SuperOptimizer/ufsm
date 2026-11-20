@@ -6,7 +6,41 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
-## resgate: 9.6 um detail arms fine-tuned on the GT boxes, PARTIAL (R0, R2 only; stopped 2026-11-19 by the user's "stop winding training")
+## mcc CUDA backend: device inlining, constant tables, vector memory, f16 round trips (2026-11-20, microc branch cudaopt-20261119, mcuda)
+
+Question: where does mcc's PTX lose to nvcc's, and what closes it? Measured on the laptop forlinlapnvidia (RTX 4060, sm_89, ARCH 86
+software MX) with a try9-shaped 12-step training on a fixture (P 256, widths 256,320,384,448,288,288, --lat 4, --fstem 16, nsys GPU
+kernel time). The sm_120a production kernels cannot run there: they were compared statically (ptxas 13.3 sm_120a on mcc's PTX, the
+last copy of each .entry, against nvcc 13.3's objects; MMA-loop SASS counts).
+
+| build | GPU kernel time | vs nvcc |
+|---|---|---|
+| nvcc 13.3 (clang host) | 19.99 s | 1.00 |
+| mcc main (285d308) | 23.42 s | 1.17 |
+| + device inlining 300 / 400 | 19.34 s | 0.97 |
+| + const tables, vector ld/st, f16 round trips (cudaopt-20261119) | 19.28 s | 0.96 |
+
+- Device inlining was the gap: mcc inlined device functions of at most 12 IR instructions (the host limit), so every call left in a
+  kernel passed arguments and address-taken objects through local memory. At 300 instructions / 400 blocks: conv_*_s2_f8 3.3-3.8x
+  faster, conv_fwd_f4_k -12 %, JIT of the 51 s2 kernels 417 -> 225 CPU s, sm_120a CALLs 305 -> 88. 1000 gives nothing more.
+- Against inlining alone: fstem_fwd_k -13 % (its FLW table was 78 generic loads through mcudahw's global table: now immediates; its
+  __half values went f16 -> f32 -> f16 -> f32: 154 / 209 conversions against nvcc's 49 / 74), conv_bwd_w1_tc -9 %, lat_fuse -6 %;
+  nothing else moved by more than 3 %. Vector types got CUDA's alignment, so a float4 / uint4 / __half2 copy is one ld/st.v4 / v2
+  (PTX vector ops 3.4k -> 58k); ptxas had already merged most shared ones, which is why the time barely moved.
+- Device LICM, which mcc has but keeps off in device code, cut conv_fwd_s2_f8_k<8>'s MMA-loop SASS 663 -> 340 (nvcc 218), but on the
+  GPU that kernel ran exactly as before and bwd_data_s2_f4_k<4,8> was 31 % slower (6.87 -> 8.96 ms a launch); unguarded it doubles
+  ptxas spills over ufsm (65.7 -> 120.7 KB). Left opt-in (MCC_LICMPHI). mcc's MMA-loop counts overstate: hot.py takes the address
+  range of a backward branch, and mcc's block layout puts out-of-line code inside it. Static counts pick candidates; only the GPU
+  decides.
+- Still slower than nvcc: conv_fwd_f4_k 1.05x (47 % of the step), conv_fwd_s2_f8 1.25x, conv_bwd_w_s2_f8 1.13x, sum_k 1.45x;
+  conv_bwd_w_f4_k stays 0.81x (mcc wins). sm_120a ptxas totals: stack 140 KB against nvcc's 79 KB, mostly in non-hot kernels
+  (loss_stats / grad ~2.4 % of a step).
+- Fast tier on the laptop with the branch: the same failures as mcc main without it (the laptop baseline already fails 18:
+  gscale, parity, predict_heads, latents, accum ... on its 8 GB GPU). main itself fails test_patchsolve, test_repair (l1 grid) and
+  test_wbench_stats, which the pin 5744025 passes: host code, first bad commit 84903be "x86-64: loops unswitched on a value they do
+  not change". So the pin must not move to main as it is.
+- Pin: unchanged. Moving it needs the fix of 84903be upstream, the fast tier on a desk / pod (sm_120) and a GPU A/B against the old pin.
+ 9.6 um detail arms fine-tuned on the GT boxes, PARTIAL (R0, R2 only; stopped 2026-11-19 by the user's "stop winding training")
 
 Question: is try9's sheet detail limited by the latent input or by the fine stem? Each arm used try9's architecture (widths
 256,320,384,448,288,288, attention 4 + scroll PE, gfilm, sub-cell head) warm-started from try9-16000 weights. The from-scratch versions sat
