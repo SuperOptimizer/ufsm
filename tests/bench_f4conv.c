@@ -87,7 +87,8 @@ int main(int argc, char **argv) {
         {"fwd 64 -> 64 (gn+silu, stats) @P/2", 4, 64, 64, 0, 1, 1, 0, 2}, {"bdata 64 -> 64 (mx8, SR) @P/2", 3, 64, 64, 0, 0, 0, 1, 2},
         {"bdata 64 -> 96 + 64 (mx8, SR) @P/2", 3, 64, 160, 96, 0, 0, 1, 2},
         {"bdata 32 -> 32 (mx4, SR)", 4, 32, 32, 0, 0, 0, 1, 1}, {"bdata 32 -> 64 + 32 (mx4, SR)", 4, 32, 96, 64, 0, 0, 1, 1},   /* the trainer's MX-fp4 gradients (10, 11) */
-        {"bdata 16 -> 16 (mx4, SR)", 4, 16, 16, 0, 0, 0, 1, 1}, {"bdata 16 -> 16 + 16 (mx4, SR)", 4, 16, 32, 16, 0, 0, 1, 1}};   /* 16-wide level 0 (12, 13) */
+        {"bdata 16 -> 16 (mx4, SR)", 4, 16, 16, 0, 0, 0, 1, 1}, {"bdata 16 -> 16 + 16 (mx4, SR)", 4, 16, 32, 16, 0, 0, 1, 1},   /* 16-wide level 0 (12, 13) */
+        {"bdata 8 -> 8 (mx4, SR)", 4, 8, 8, 0, 0, 0, 1, 1}, {"bdata 8 -> 16 (mx4, SR)", 4, 8, 16, 0, 0, 0, 1, 1}};   /* 8-wide level 0 (14, 15: conv_fwd_f4p_k) */
     for (int l = 0; l < (int)(sizeof L / sizeof L[0]) && want("fwd"); l++) {
         if (getenv("BENCH_FL") && l != atoi(getenv("BENCH_FL"))) continue;   /* one forward / bdata case */
         const int Pl = P / L[l].dv; const size_t Sl = (size_t)Pl * Pl * Pl;
