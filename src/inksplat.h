@@ -96,6 +96,7 @@ int inkfly_rayface_have(void *handle);
    inkfly_rays at that stride / mode then reads no label raster and evaluates no mesh. build 0 ok; have: 2 stride + mode, 0 none */
 int inkfly_raylist_build(void *handle, int stride, int mode, int nthreads);
 int inkfly_raylist_have(void *handle);
+int inkfly_face_diag(void *handle, int nsample, uint64_t seed);   /* the faceless pixels' CT profiles, classified (ink-rayface --diag) */
 int inkfly_rays_noface(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout);   /* (verify: the bits ignored) */
 int inkfly_sample_window(void *handle, uint64_t seed, int P, int64_t o[3]);   /* a level-L window around a random supervised tile */
 /* the onfly ink target's 2x pooling of one 2^3 block (prob254 bytes, 255 unknown): the rounded mean of the known children, unknown when none.

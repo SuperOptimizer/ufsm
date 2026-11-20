@@ -2001,6 +2001,59 @@ int inkfly_raylist_build(void *handle, int stride, int mode, int nthreads) {
     if (!rc) { inkfly_raylist_load(f, stride, mode); if (!f->rl_map) rc = -1; }
     return rc;
 }
+/* the faceless pixels' CT profiles (2026-11-20, lead): for up to nsample supervised pixels without a face (rayface.bin), the [1 2 1]
+   smoothed CT along the ray over t in [-TR, TR] level-0 voxels, classified: (a) the CT reaches iso inside the search range [face_lo,
+   face_hi] but the face rule (run / gap) rejects it; (b) iso is reached only outside the range (the mesh is off the surface by more than
+   the window); (c) papyrus under iso (max in range >= iso / 2: a threshold problem); (d) nothing within TR (air / a gap). Printed: the
+   counts, the in-range max histogram, the offset of the nearest iso crossing for (b) */
+int inkfly_face_diag(void *handle, int nsample, uint64_t seed) {
+    inkfly *f = handle; if (!f || !f->rf || !f->nT) { fprintf(stderr, "ink face diag: no rayface.bin loaded\n"); return -1; }
+    const inksplat_cfg *c = &f->c; const double V = f->V, sign = c->flip ? -1 : 1; enum { TR = 40, NS = 2 * TR + 1 };
+    uint64_t cls[4] = {0}, asub[3] = {0}, hmax[8] = {0}, hoff[2][9] = {{0}}; int got = 0, tries = 0; cpx *X = nullptr; size_t cap = 0;
+    while (got < nsample && tries++ < nsample * 50) {
+        seed = seed * 6364136223846793005ull + 1442695040888963407ull; const size_t t = (size_t)((seed >> 20) % f->nT);
+        size_t np = 0; double lo3[3] = {1e300, 1e300, 1e300}, hi3[3] = {-1e300, -1e300, -1e300};
+        if (tile_px(f, t, &X, &np, &cap, lo3, hi3) || !np) continue;
+        size_t pick = SIZE_MAX; for (size_t k = 0, i0 = (size_t)(seed >> 40) % np; k < np && pick == SIZE_MAX; k++) { const size_t i = (i0 + k) % np;
+            if (!(f->rf[t * RF_TB + X[i].px / 8] >> (X[i].px % 8) & 1)) pick = i; }
+        if (pick == SIZE_MAX) continue;
+        const cpx *x = &X[pick]; int64_t co[3], cn[3];
+        for (int d = 0; d < 3; d++) { co[d] = (int64_t)floor((x->P[d] - f->off) / V - TR / V) - 2; cn[d] = (int64_t)ceil(2 * TR / V) + 5; }
+        uint8_t *ctb = malloc((size_t)cn[0] * cn[1] * cn[2]); if (!ctb) break;
+        if (z3_read(f->base_ct, co, cn, ctb, 1)) { free(ctb); continue; }
+        float raw[NS], sm[NS];
+        for (int k = 0; k < NS; k++) { const double tt = (k - TR) * sign; double q[3]; for (int d = 0; d < 3; d++) q[d] = (x->P[d] + tt * x->N[d] - f->off) / V - co[d];
+            const float v = tri_box_z(ctb, cn, 0, cn[0], q[0], q[1], q[2]); raw[k] = v < 0 ? 0 : v; }
+        free(ctb);
+        for (int k = 0; k < NS; k++) sm[k] = 0.25f * (raw[k > 0 ? k - 1 : 0] + 2 * raw[k] + raw[k < NS - 1 ? k + 1 : NS - 1]);
+        const int lo = (int)floor(c->face_lo), hi = (int)ceil(c->face_hi); float mx = 0; int near = 1 << 20;
+        for (int k = 0; k < NS; k++) { const int tv = k - TR; if (tv >= lo && tv <= hi) { if (sm[k] > mx) mx = sm[k]; } else if (sm[k] >= c->iso && abs(tv) < abs(near)) near = tv; }
+        const int cl = mx >= c->iso ? 0 : near != 1 << 20 ? 1 : mx >= c->iso / 2.f ? 2 : 3; cls[cl]++;
+        if (cl == 0) {   /* (a) split as face_of decides: the first papyrus run meeting t [-4, 8] is short / has no air gap after it, or no run meets it */
+            const int n0 = lo + TR, n1 = hi + TR + 1; int why = 2;
+            for (int i = n0; i < n1;) { if (sm[i] < c->iso) { i++; continue; } int j = i; while (j < n1 && sm[j] >= c->iso) j++;
+                const int t0 = i - TR, t1 = j - 1 - TR;
+                if (t1 >= -4 && t0 <= 8) { why = j - i < c->face_run ? 0 : 1; break; }
+                if (t0 > 8) break; i = j; }
+            asub[why]++;
+        }
+        hmax[mx >= 255 ? 7 : (int)(mx / 32)]++;
+        if (cl == 1) { const int a = abs(near), b = a <= 8 ? 0 : a <= 12 ? 1 : a <= 16 ? 2 : a <= 20 ? 3 : a <= 25 ? 4 : a <= 30 ? 5 : a <= 35 ? 6 : 7; hoff[near > 0][b]++; }
+        if (got < 3) { fprintf(stderr, "ink face diag: example class %c, t %d..%d:", "abcd"[cl], -TR, TR); for (int k = 0; k < NS; k += 4) fprintf(stderr, " %.0f", sm[k]); fprintf(stderr, "\n"); }
+        got++;
+    }
+    free(X);
+    printf("ink face diag: %d faceless pixels (iso %d, search t [%g, %g], |t| <= %d level-0 voxels): (a) iso in range, the run / gap rule rejects %.1f%%, "
+           "(b) iso only outside the range %.1f%%, (c) papyrus under iso (in-range max >= iso / 2) %.1f%%, (d) none %.1f%%\n", got, c->iso, c->face_lo, c->face_hi, TR,
+           got ? 100.0 * cls[0] / got : 0., got ? 100.0 * cls[1] / got : 0., got ? 100.0 * cls[2] / got : 0., got ? 100.0 * cls[3] / got : 0.);
+    printf("ink face diag: (a) split: the run meeting t [-4, 8] shorter than %d samples %.1f%%, no %d-sample air gap after it (dense / touching) %.1f%%, "
+           "no run meets t [-4, 8] (papyrus elsewhere in the range) %.1f%%\n", c->face_run, got ? 100.0 * asub[0] / got : 0., c->face_gap, got ? 100.0 * asub[1] / got : 0.,
+           got ? 100.0 * asub[2] / got : 0.);
+    printf("ink face diag: in-range max CT histogram (0-31 .. 224-255):"); for (int b = 0; b < 8; b++) printf(" %llu", (unsigned long long)hmax[b]); printf("\n");
+    printf("ink face diag: (b) nearest iso crossing |t| (<=8, <=12, <=16, <=20, <=25, <=30, <=35, <=40): before the range"); for (int b = 0; b < 8; b++) printf(" %llu", (unsigned long long)hoff[0][b]);
+    printf(" | after"); for (int b = 0; b < 8; b++) printf(" %llu", (unsigned long long)hoff[1][b]); printf("\n");
+    return 0;
+}
 int inkfly_raylist_have(void *handle) { const inkfly *f = handle; return f && f->rl_map ? f->rl_stride * 2 + f->rl_mode : 0; }
 /* (ink-rayface --verify, single-threaded: the rays with the bits ignored, i.e. the face search on the CT) */
 int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout);
