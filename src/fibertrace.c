@@ -255,20 +255,24 @@ int cmd_fiber_trace(int argc, char **argv) {
         const char *dy = ft_opt(argc, argv, "--dyad", nullptr);
         if (mi && dy) {   /* --dyad DIR: the direction head's six predicted dyad channels (train --fib-dir; predict --channel 2..7 into DIR/c2 .. DIR/c7,
                              same level key and box frame as the mask): the axis = the principal eigenvector of the decoded dyad, not the mask's tube */
-            const size_t nv = (size_t)n[0] * n[1] * n[2]; uint8_t *dc[6]; const int64_t lo[3] = {o[0] - mo_g[0], o[1] - mo_g[1], o[2] - mo_g[2]};
+            /* in z slabs of 32 planes: the six channels of a slab at a time (a whole-box read took 6 bytes / voxel more: a 1.9 G-voxel
+               1667 region was OOM-killed at 30 GB) */
+            const size_t pl = (size_t)n[1] * n[2]; const int64_t SZ = 32; uint8_t *dc[6]; z3 *dz[6];
             for (int c = 0; c < 6; c++) { char root[1400]; snprintf(root, sizeof root, "%s/c%d", dy, 2 + c);
-                store *s = store_open(root); z3 *z = s ? z3_open(s, argv[mi + 2], cache) : nullptr; dc[c] = malloc(nv);
-                if (!z || !dc[c] || z3_read(z, lo, n, dc[c], nth)) { fprintf(stderr, "fiber-trace: cannot read the dyad channel %s %s\n", root, argv[mi + 2]); return 1; }
-                z3_close(z); }
-            for (size_t i = 0; i < nv; i++) {
-                const double C[6] = {dc[0][i] / 255., dc[1][i] / 255., dc[2][i] / 255., dc[3][i] / 255. - 0.5, dc[4][i] / 255. - 0.5, dc[5][i] / 255. - 0.5};
-                double v[3] = {0, 0, 0}; v[C[0] >= C[1] && C[0] >= C[2] ? 0 : C[1] >= C[2] ? 1 : 2] = 1;
-                for (int it = 0; it < 16; it++) { const double w[3] = {C[0] * v[0] + C[3] * v[1] + C[4] * v[2], C[3] * v[0] + C[1] * v[1] + C[5] * v[2], C[4] * v[0] + C[5] * v[1] + C[2] * v[2]};
-                    const double m = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]); if (!(m > 0)) break; v[0] = w[0] / m; v[1] = w[1] / m; v[2] = w[2] / m; }
-                if (v[0] < 0) { v[0] = -v[0]; v[1] = -v[1]; v[2] = -v[2]; }
-                vol[1][i] = (uint8_t)lround(128 + 127 * v[2]); vol[2][i] = (uint8_t)lround(128 + 127 * v[1]);
+                store *s = store_open(root); dz[c] = s ? z3_open(s, argv[mi + 2], cache) : nullptr; dc[c] = malloc(pl * SZ);
+                if (!dz[c] || !dc[c]) { fprintf(stderr, "fiber-trace: cannot read the dyad channel %s %s\n", root, argv[mi + 2]); return 1; } }
+            for (int64_t z0 = 0; z0 < n[0]; z0 += SZ) {
+                const int64_t nz = n[0] - z0 < SZ ? n[0] - z0 : SZ; const int64_t lo[3] = {o[0] - mo_g[0] + z0, o[1] - mo_g[1], o[2] - mo_g[2]}, nn[3] = {nz, n[1], n[2]};
+                for (int c = 0; c < 6; c++) if (z3_read(dz[c], lo, nn, dc[c], nth)) { fprintf(stderr, "fiber-trace: dyad channel c%d read failed\n", 2 + c); return 1; }
+                for (size_t j = 0; j < pl * (size_t)nz; j++) { const size_t i = (size_t)z0 * pl + j;
+                    const double C[6] = {dc[0][j] / 255., dc[1][j] / 255., dc[2][j] / 255., dc[3][j] / 255. - 0.5, dc[4][j] / 255. - 0.5, dc[5][j] / 255. - 0.5};
+                    double v[3] = {0, 0, 0}; v[C[0] >= C[1] && C[0] >= C[2] ? 0 : C[1] >= C[2] ? 1 : 2] = 1;
+                    for (int it = 0; it < 16; it++) { const double w[3] = {C[0] * v[0] + C[3] * v[1] + C[4] * v[2], C[3] * v[0] + C[1] * v[1] + C[5] * v[2], C[4] * v[0] + C[5] * v[1] + C[2] * v[2]};
+                        const double m = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]); if (!(m > 0)) break; v[0] = w[0] / m; v[1] = w[1] / m; v[2] = w[2] / m; }
+                    if (v[0] < 0) { v[0] = -v[0]; v[1] = -v[1]; v[2] = -v[2]; }
+                    vol[1][i] = (uint8_t)lround(128 + 127 * v[2]); vol[2][i] = (uint8_t)lround(128 + 127 * v[1]); }
             }
-            for (int c = 0; c < 6; c++) free(dc[c]);
+            for (int c = 0; c < 6; c++) { free(dc[c]); z3_close(dz[c]); }
         } else {   /* --gpu G: the axis on the GPU (byte-identical, src/nn_ftrace.cu; ~97 % of a CPU --mask trace), the CPU on any failure */
             const int gpu = opt_atoi("--gpu", ft_opt(argc, argv, "--gpu", "-1")); const char pri = prior_on && (famf == 'H' || famf == 'V') ? famf : 0;
             if (gpu < 0 || ft_ridge_axis_gpu(gpu, vol[0], n, vol[1], vol[2], str, pri)) { if (gpu >= 0) fprintf(stderr, "fiber-trace: the GPU axis failed; on the CPU\n");

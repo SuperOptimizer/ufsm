@@ -18,6 +18,7 @@ ufsm_exe(bench_gn tests/bench_gn.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_head tests/bench_head.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_head2 tests/bench_head2.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_l0_ring tests/bench_l0_ring.c OBJS unet NN LP LIBS m CUDA)
+ufsm_exe(bench_plan tests/bench_plan.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(bench_l0misc tests/bench_l0misc.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_lp tests/bench_lp.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_mem tests/bench_mem.c OBJS unet NN LP LIBS m CUDA)
@@ -415,3 +416,4 @@ ufsm_exe(test_widen SUITE tests/test_widen.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_sampbias SUITE tests/test_sampbias.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush
          scrollaug cover json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb
          embz LIBS LDLIBS)
+ufsm_exe(test_occ_cache SUITE tests/test_occ_cache.c OBJS occcache dcache zarr3 store z3w json LIBS LDLIBS)

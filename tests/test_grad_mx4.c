@@ -59,12 +59,12 @@ static float *w_s2b_e2m1(const float *wd, int C) {
     float *d = nn_malloc(nw * 4); nn_h2d(d, h, nw * 4); free(h); return d;
 }
 /* head-slab test callback: the backward's head step per slab of Z planes, the logit gradient copied from the whole-layout gl */
-typedef struct { unet *v; void *gl; void *sb; size_t S, hw; int D, Z, bad; } hs_ctx;
+typedef struct { unet *v; void *gl; void *sb; size_t S, hw; int D, Z, bad, nc; } hs_ctx;   /* nc: head outputs (0: 11) */
 static void hs_cb(void *p) {
     hs_ctx *h = p;
     for (int z0 = 0; z0 < h->D; z0 += h->Z) {
         const int z1 = z0 + h->Z < h->D ? z0 + h->Z : h->D; const size_t ns = (size_t)(z1 - z0) * h->hw;
-        for (int c = 0; c < 11; c++) nn_d2d((char *)h->sb + c * ns * 2, (const char *)h->gl + (c * h->S + z0 * h->hw) * 2, ns * 2);
+        for (int c = 0; c < (h->nc ? h->nc : 11); c++) nn_d2d((char *)h->sb + c * ns * 2, (const char *)h->gl + (c * h->S + z0 * h->hw) * 2, ns * 2);
         if (unet_head_bwd_z(h->v, z0, z1, h->sb, z0 == 0)) h->bad++;
     }
 }
@@ -1012,6 +1012,42 @@ int main(void) {
                 if (!okc) bad++;
                 for (int k = 0; k < 2; k++) { free(lc[k]); free(gc[k]); }
                 free(rec); nn_free(drec); nn_free(ctf); nn_free(ct);
+            }
+            if (wc == 0 || wc == 2) {   /* head slabs on the three buffers (unet.l3h, the trainer's head_slab_pass with a <= 4-output head): the
+                                           head per z-slab of 5 planes (a partial last slab) through unet_head_fwd_z, the slab logit gradients
+                                           through unet_head_bwd_z into X3; against the whole-head l3b step above: the logits, gradients and
+                                           seeds bit for bit (gradients up to the atomic order), no whole-window logits returned, the same training bytes, the batch tail kept */
+                const size_t hw = (size_t)xs.h * xs.w; const int co = cfg.cout, Z = 5;
+                void *glh = nn_malloc(no * 2); nn_f32_to_h16(gy[0], no, glh, nn_get_grad_scale());
+                hs_ctx hc = {v, glh, nn_malloc((size_t)co * Z * hw * 2), S, hw, xs.d, Z, 0, co};
+                unet_set_l0_3buf(1); unet_set_head_ext(v, 1); unet_set_head_cb(v, hs_cb, &hc);
+                unet_set_batch_bytes(v, 2 * S, tailb);
+                const size_t mh = unet_train_bytes(v, xs);
+                unet_build(v, xs, 1);
+                const int l3h = unet_l0_3buf(v);
+                void *tp = nullptr; unet_batch_scratch2(v, 2 * S, tailb, &tp);
+                int tk = tp != nullptr; if (tp) nn_h2d(tp, pat, tailb);
+                nn_set_sr_step(9000); const float *lg = unet_forward(v, xi[0], xs, 1); unet_zero_grad(v);
+                uint16_t *ls = malloc(no * 2);
+                for (int z0 = 0; z0 < xs.d; z0 += Z) {
+                    const int z1 = z0 + Z < xs.d ? z0 + Z : xs.d; const size_t ns = (size_t)(z1 - z0) * hw;
+                    if (unet_head_fwd_z(v, z0, z1, hc.sb)) { hc.bad++; break; }
+                    nn_sync(); for (int c = 0; c < co; c++) nn_d2h(ls + c * S + z0 * hw, (const char *)hc.sb + c * ns * 2, ns * 2);
+                }
+                if (tp) { nn_d2h(chk, tp, tailb); if (memcmp(chk, pat, tailb)) tk = 0; }
+                nn_set_sr_step(9100); unet_backward_x(v, nullptr, 1); const unsigned ch = nn_sr_ctr();
+                float *gh = malloc(np * 4); unet_grad_d2h(v, gh);
+                size_t ln = 0; for (size_t i = 0; i < no; i++) ln += ls[i] != lgs[1][0][i];
+                size_t gn = 0; double d2 = 0, r2 = 0;   /* (the weight gradients' atomic order: rel ~1e-9 between two l3b runs too) */
+                for (size_t i = 0; i < np; i++) { gn += memcmp(&gh[i], &gg[1][0][i], 4) != 0; const double dd = (double)gh[i] - gg[1][0][i]; d2 += dd * dd; r2 += (double)gg[1][0][i] * gg[1][0][i]; }
+                const double rh = sqrt(d2 / r2);
+                const int okh = l3h && !lg && !hc.bad && !ln && rh < 1e-6 && ch == ctr[1][0] && mh == mem[1] && tk && !nn_check();
+                snprintf(nm, sizeof nm, "three buffers + head slabs {%d,..} vs whole head", cfg.widths[0]);
+                printf("  %-46s layout %d, logits differ %zu, grads differ %zu of %zu (rel %.3g), seeds %u / %u, train bytes %zu / %zu, batch tail %s%s\n",
+                       nm, l3h, ln, gn, np, rh, ch, ctr[1][0], mh, mem[1], tk ? "kept" : "CLOBBERED", okh ? "" : "  FAIL");
+                if (!okh) bad++;
+                unet_set_head_ext(v, 0); unet_set_head_cb(v, nullptr, nullptr);
+                free(ls); free(gh); nn_free(glh); nn_free(hc.sb);
             }
             for (int on = 0; on < 2; on++) { for (int k = 0; k < 3; k++) free(lgs[on][k]); for (int st = 0; st < 2; st++) free(gg[on][st]); }
             unet_set_l0_3buf(-1); unet_free(v); nn_free(own); free(pat); free(chk);

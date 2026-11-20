@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
                                           "targets": {"recto": "labels"}, "holdout": [96, 96, 96, 32, 32, 32]}]}))
     opts = ["--P", "16", "--B", "1", "--levels", "1", "--gpus", "0", "--workers", "1", "--val-batches", "1", "--val-train-ok", "1",
             "--log-every", "1", "--val-every", "1", "--ckpt-every", "1", "--fp4", "2", "--down-norm", "1", "--input-prec", "8"]
-    train_env = {"UFSM_GRAD_MX8": "1"}
+    train_env = {"UFSM_GRAD_MX8": "1", "UFSM_GRAD_MX4": "0"}   # (the default widths 16,32,64,80 take MX-fp8 gradients: said explicitly, no DEFAULTED line)
     run("train", cfg, "--out", t / "first", "--steps", "2", "--warmup", "0", *opts, extra_env=train_env)
     old, wp = weights(t / "first/last.ckpt")
     assert old["extra"]["runtime"]["act_mx4"] == 1
@@ -204,6 +204,6 @@ with tempfile.TemporaryDirectory(prefix="ufsm-pipeline-") as tmp:
     impossible['sources'][0]['holdout'] = [0, 0, 0, 128, 128, 128]
     impossible['sources'][0]['holdout_mode'] = 'reject'   # mask mode (default) keeps a fully held-out source eligible (holdfit f1424a2: only reject boxes forbid a window)
     cfg.write_text(json.dumps(impossible))
-    msg = run('train', cfg, '--out', t / 'impossible', '--steps', '1', *opts, ok=1)
+    msg = run('train', cfg, '--out', t / 'impossible', '--steps', '1', *opts, ok=1, extra_env={"UFSM_GRAD_MX4": "0"})
     assert 'no eligible sources' in msg, msg
     print("real CLI resume, portable precision, globally anchored crop/shard/worker predictions and geometry validation: ok")
