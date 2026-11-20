@@ -2081,7 +2081,8 @@ int inkfly_face_diag(void *handle, int nsample, uint64_t seed) {
    open face t_f or none, the faceless classified as inkfly_face_diag) and every volume trilinear at the same points (volume k: voxel
    vum[k] um, the CT's frame, voxel centres as a mean-pooled level: level-0 point P -> (P - (s - 1) / 2) / s, s = vum[k] / ct_um). One TSV row per pixel; stdout: per volume and group (ink / no ink x
    face / faceless) the mean profile, and for ink pixels with a face the peak offset t_peak - t_f histogram and the share of the profile
-   mass in the face band and in |t| <= mil (level-0 voxels) */
+   mass in the face band and in |t| <= mil (level-0 voxels). A volume voxel 255 is unknown (prob254 targets): -1 in the TSV, out of the
+   AUC, the peak and the mass */
 int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *vols, const double *vum, const char *const *vname, const int64_t *box, double mil_um, int per_tile, FILE *tsv, FILE *auc) {
     inkfly *f = handle; if (!f || !f->nT) { fprintf(stderr, "ink profile: no supervised tiles\n"); return -1; }
     const inksplat_cfg *c = &f->c; const double V = f->V, sign = c->flip ? -1 : 1, mil = mil_um / c->ct_um; enum { TR = 40, NS = 2 * TR + 1, VMAX = 8 }; const int PT = per_tile > 0 ? per_tile : 8;
@@ -2122,7 +2123,10 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
             const cpx *x = &X[pick[q]];
             for (int ch = 0; ch <= nv; ch++) { const double s = ch ? vum[ch - 1] / c->ct_um : V, of = (s - 1) / 2;
                 for (int k = 0; k < NS; k++) { const double tt = (k - TR) * sign; double qq[3]; for (int d = 0; d < 3; d++) qq[d] = (x->P[d] + tt * x->N[d] - of) / s - co[ch][d];
-                    const float v = tri_box_z(buf[ch], cn[ch], 0, cn[ch][0], qq[0], qq[1], qq[2]); pr[ch][k] = v < 0 ? 0 : v; } }
+                    const float v = tri_box_z(buf[ch], cn[ch], 0, cn[ch][0], qq[0], qq[1], qq[2]); pr[ch][k] = v < 0 ? 0 : v;
+                    if (ch && v >= 0) {   /* a volume's 255 = unknown (prob254 targets): the nearest voxel 255 -> -1, left out of the AUC / peak / mass */
+                        int64_t r3[3]; for (int d = 0; d < 3; d++) { r3[d] = (int64_t)lround(qq[d]); if (r3[d] > cn[ch][d] - 1) r3[d] = cn[ch][d] - 1; }
+                        if (buf[ch][((size_t)r3[0] * cn[ch][1] + r3[1]) * cn[ch][2] + r3[2]] == 255) pr[ch][k] = -1; } } }
             float sm[NS]; for (int k = 0; k < NS; k++) sm[k] = 0.25f * (pr[0][k > 0 ? k - 1 : 0] + 2 * pr[0][k] + pr[0][k < NS - 1 ? k + 1 : NS - 1]);
             /* the face as rays_face: the smoothed samples of [lo, hi] only (its smoothing clamps at the range ends) */
             float rs[256]; const int ns = hi - lo + 1; for (int k = 0; k < ns; k++) rs[k] = pr[0][lo + k + TR];
@@ -2134,11 +2138,11 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
                 cl = mx >= c->iso ? 0 : near != 1 << 20 ? 1 : mx >= c->iso / 2.f ? 2 : 3; cls[cl]++; }
             const int g = 2 * (x->y != 0) + (ft == FACE_NONE); ng[g]++; got++;
             for (int ch = 0; ch <= nv; ch++) {
-                for (int k = 0; k < NS; k++) { sum[ch][g][k] += pr[ch][k]; const int b = pr[ch][k] > 255 ? 255 : (int)lroundf(pr[ch][k]), yy = x->y != 0;
+                for (int k = 0; k < NS; k++) { sum[ch][g][k] += fmaxf(pr[ch][k], 0); if (pr[ch][k] < 0) continue; const int b = pr[ch][k] > 255 ? 255 : (int)lroundf(pr[ch][k]), yy = x->y != 0;
                     ah[ch][0][k][yy][b]++; if (ft == FACE_NONE) ah[ch][2][k][yy][b]++; else { const int r = k - ft; if (r >= 0 && r < NS) ah[ch][1][r][yy][b]++; } }
                 if (g == 2) {   /* ink with a face: the peak offset and the band shares */
-                    int am = 0; double tot = 0, inb = 0, inm = 0; for (int k = 0; k < NS; k++) { if (pr[ch][k] > pr[ch][am]) am = k; const int tv = k - TR; tot += pr[ch][k];
-                        if (tv >= ft + fa && tv <= ft + fb) inb += pr[ch][k]; if (fabs((double)tv) <= mil) inm += pr[ch][k]; }
+                    int am = 0; double tot = 0, inb = 0, inm = 0; for (int k = 0; k < NS; k++) { if (pr[ch][k] > pr[ch][am]) am = k; const int tv = k - TR; const double pv = fmax(pr[ch][k], 0); tot += pv;
+                        if (tv >= ft + fa && tv <= ft + fb) inb += pv; if (fabs((double)tv) <= mil) inm += pv; }
                     const int o = am - TR - ft, b = o < -20 ? 0 : o < -12 ? 1 : o < -8 ? 2 : o < -6 ? 3 : o < -3 ? 4 : o < 0 ? 5 : o == 0 ? 6 : o <= 3 ? 7 : o <= 6 ? 8 : o <= 8 ? 9 : o <= 12 ? 10 : o <= 20 ? 11 : 12;
                     pk[ch][b]++; if (tot > 0) { mband[ch][0] += inb / tot; mband[ch][1] += inm / tot; mband[ch][2] += 1; }
                 }
