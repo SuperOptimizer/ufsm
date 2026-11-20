@@ -171,6 +171,7 @@ test_sheetscore                                |              |     3 | ./$B/tes
 test_patchsolve                                |              |     3 | ./$B/test_patchsolve
 test_patchid                                   |              |     3 | ./$B/test_patchid   
 test_gttrans                                   |              |     2 | ./$B/test_gttrans
+test_fieldsderive                              |              |     2 | ./$B/test_fieldsderive
 test_recto                                     |              |     3 | ./$B/test_recto
 test_recto_gpu                                 | gpu          |     3 | ./$B/test_recto_gpu
 test_faces                                     |              |     1 | ./$B/test_faces

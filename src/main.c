@@ -247,6 +247,7 @@ static int usage(void) {
         "  ufsm gt-anchors CODES_ROOT KEY FIELDS --boxes B --hold N,.. --kind pin|pair --p P --out F   sparse GT anchors for count-field --anchor-pins / --anchor-pairs\n"
         "  ufsm annot-export ANN.json [--fib F] [--pairs T] [--gate B --level L] [--points DIR --like R K --level L]   annotations -> fitter votes / gate boxes / sparse codes\n"
         "  ufsm annot-regions OUT.tsv [--judge T.tsv ..] [--wrapcheck W --wraps D --um0 U]   flagged regions (fibre judge, wrap check) for annotate-serve --regions\n"
+        "  ufsm fields-derive IN OUT [--normal 1] [--density 1] [--r 2]   a fit-field set with t0..t5 / sp from the phase gradient (netsplit ablation)\n"
         "  ufsm gt-trans ROOT CTKEY CTUM CODEROOT CODEKEY CODEUM CENTREKEY CENTREUM BOXES SCROLL BOXUM OUT.tsv [--rv R K] [--fh R K --fv R K]   CT peaks / recto-verso / fibre flips per GT turn by gap\n"
         "  ufsm wrap-check <model> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY]   duplicate / merged wraps: CT peaks between adjacent wraps along radial rays\n"
         "  ufsm unroll-qa --fields DIR --model SET [--ct ROOT KEY] [--fibres F.fib] [--box ..]... [--out DIR] [--strict]   label-free sheet-identity gates (phase confidence, phase-unwrap witness, wind4, fibres)\n"
@@ -4867,6 +4868,7 @@ int cmd_img_stretch(int argc, char **argv);   /* src/imggate.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
 int cmd_gt_trans(int argc, char **argv);   /* src/gttrans.c */
+int cmd_fields_derive(int argc, char **argv);   /* src/fieldsderive.c */
 int cmd_annotate_serve(int argc, char **argv);   /* src/annot.c */
 int cmd_annot_export(int argc, char **argv);   /* src/annot_export.c */
 int cmd_gt_anchors(int argc, char **argv);   /* src/anchors.c */
@@ -4948,6 +4950,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "fit-join")) return cmd_fit_join(argc, argv);
     if (!strcmp(cmd, "wrap-check")) return cmd_wrap_check(argc, argv);
     if (!strcmp(cmd, "gt-trans")) return cmd_gt_trans(argc, argv);
+    if (!strcmp(cmd, "fields-derive")) return cmd_fields_derive(argc, argv);
     if (!strcmp(cmd, "annotate-serve")) return cmd_annotate_serve(argc, argv);
     if (!strcmp(cmd, "annot-export")) return cmd_annot_export(argc, argv);
     if (!strcmp(cmd, "gt-anchors")) return cmd_gt_anchors(argc, argv);
