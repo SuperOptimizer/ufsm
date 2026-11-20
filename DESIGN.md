@@ -6,6 +6,47 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fibre tracing toward mm-long, sheet-faithful fibres: fibhv-d + dyad + a sheet gate (2026-11-20, branch fibtrace-20261119, latcodec)
+
+Goal: fibres long and sheet-faithful enough for a fibre unwind and for count-field fibre ties (Paris 4 AFV ties gave +0.04 / +0.03
+GT ids). 1667 has no AFV set. New tools: `ufsm fiber-match OURS REF` (recall / precision against a reference fibre set,
+resampled every 10 um, 30 um reach, 30 degrees; "runs" = how far one of our lines follows one reference fibre; per-family lens:
+arc-median, share >= 1 / 2 mm), `fiber-trace --sheet FITSET | --sheet-phase ROOT KEY` (the line may not leave its start sheet:
+W unwrapped along the line, stop at |W - W0| > --sheet-tol 0.15 turn; field direction projected into the sheet plane; Newton
+pull-back onto W0; `--gap-mm G` carries the smoothed direction through up to G of weak support, resuming only where the field
+agrees), `--family-dir` (in gaps half the step along the family's in-sheet direction), `scripts/fibers/fibtrace_eval.sh`.
+
+Paris 4 HOLD (level-2 box 12288,4096,3584 + 512,576,768, ~5 x 5.5 x 7.4 mm). Reference: the open spiral AFV set (native 2.4 um;
+HOLD lies outside Paris4_1mm_v2). Sheet changes: fiber-judge --phase against GT phaseA. H / V per cell:
+
+| source / arm | persistent changes / m | >= 1 mm | >= 2 mm | recall | precision | runs arc-median |
+|---|---|---|---|---|---|---|
+| try9 cooled fibre head (window 640), tube | 8.5 / 31 | 0.155 / 0.366 | 0.011 / 0.066 | 0.04 / 0.22 | 0.03 / 0.07 | 0.09 / 0.14 mm |
+| fibhv-d 30000, tube axis | 55.6 / 173 | 0.143 / 0.100 | 0.013 / 0.003 | 0.41 / 0.30 | 0.23 / 0.17 | 0.27 / 0.26 mm |
+| fibhv-d 30000, dyad axis | 40.9 / 94.4 | 0.096 / 0.126 | 0.001 / 0.002 | 0.69 / 0.79 | 0.40 / 0.34 | 0.34 / 0.33 mm |
+| dyad, support 0.1 | 45.2 / 110.8 | 0.189 / 0.251 | 0.008 / 0.016 | 0.85 / 0.93 | 0.39 / 0.33 | 0.31 / 0.28 mm |
+| dyad, W gate (rg96R0 HOLD fit), gaps 0.3 mm (W3) | **4.0 / 7.6** | **0.658 / 0.486** | 0.275 / 0.127 | **0.88 / 0.87** | 0.38 / 0.32 | 0.21 / 0.21 mm |
+| W3 + --family-dir | 3.9 / 7.7 | 0.548 / 0.430 | 0.169 / 0.081 | 0.86 / 0.85 | 0.37 / 0.32 | 0.21 / 0.22 mm |
+| dyad, GT-phase gate (oracle), gaps 0.3 mm | 0 / 0.1 | 0.579 / 0.546 | 0.196 / 0.181 | 0.80 / 0.79 | 0.40 / 0.33 | 0.24 / 0.22 mm |
+| GT oracle, gaps 0.6 mm, --family-dir, --turn 45 | 0 / 0 | 0.630 / 0.654 | 0.224 / 0.257 | 0.81 / 0.81 | 0.33 / 0.26 | 0.22 / 0.22 mm |
+
+(fibhv-d 27000 dyad for reference: recall 0.50 / 0.76, precision 0.39 / 0.33.)
+
+- fibhv-d 30000 + dyad is the fibre source; try9's fibre head marks sheet layers (sheet-faithful, but 0.04 / 0.22 recall), dropped.
+- Ungated lines end on support (17.7k / 22.6k of the line ends), not on turns: the predicted fibre fades every ~0.6 mm.
+- The sheet gate + 0.3 mm gap carry is the lever: >= 1 mm share x5-7, sheet changes / m / 10, recall up (the bridged lines reach
+  reference fibres the short pieces missed). Lines now end mostly at the box (12k H ends): HOLD's size caps the lengths.
+- Runs on one reference fibre fall 0.34 -> 0.21 mm: across a gap a line lands on a neighbouring fibre of the same sheet. For
+  count-field ties that is still a valid same-sheet tie (lead: judge by sheet changes, >= 1 mm, recall; runs reported only).
+- --family-dir hurts in every arm (off).
+- Production rule: W3 (W from our own fit). Caveat (mergeflag): a W gate from the same fit the count field corrects agrees with
+  that W by construction and cuts a line exactly at the W jumps a tie could fix; so the 1667 tie test runs two arms.
+
+1667 (laptop RTX 4060, fibhv-d 30000, 8 channels, level-2 region 2816,512,512 + 1024,1024,1792 holding holdouts C2 / C6 / C12 /
+C15; ~87 s per channel): traces A (dyad, no gate) and B (q2 MFREF joined fit as the W gate, gaps 0.3 mm) -> mergeflag's
+count-field `--fibers` ties (fiber-export, --cf-fib-spans 64,256), scored on C2 / C6 / C12 / C15 against the no-tie MFREF ref.
+Results below when scored.
+
 ## resgate: 9.6 um detail arms fine-tuned on the GT boxes, PARTIAL (R0, R2 only; stopped 2026-11-19 by the user's "stop winding training")
 
 Question: is try9's sheet detail limited by the latent input or by the fine stem? Each arm used try9's architecture (widths
