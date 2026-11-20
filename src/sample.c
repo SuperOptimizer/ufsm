@@ -3725,6 +3725,9 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     b->level[i] = (int8_t)l;
     memcpy(b->corner[i], o, sizeof o);
     for (int d = 0; d < 3; d++) b->corner[i][d] <<= l;
+    if (getenv("UFSM_LOG_WIN"))   /* diagnostic: each built window (source, level, level-0 corner) — e.g. to predict an --overfit / --replay window */
+        fprintf(stderr, "window: source %d %s level %d corner %lld %lld %lld\n", si, s->name ? s->name : "?", l,
+                (long long)b->corner[i][0], (long long)b->corner[i][1], (long long)b->corner[i][2]);
     if (c->view_P) {   /* scan fusion: the view crop centred on the window, the window's symmetry (unwarped windows: no spatial aug with views) */
         const int Pv = c->view_P; const size_t pv3 = (size_t)Pv * Pv * Pv; uint8_t *dst = b->xv + (size_t)i * pv3;
         b->vok[i] = 0;
