@@ -16,10 +16,14 @@
 # tsv). WSU: a ufsm with ink-wrapscore and predict --tile-list (default /vesuvius/ufsm/bin/ufsm-fullvram): FAST predicts with it, not U.
 # FASTREST=1: also the training samples (split rest; tiles FASTDIR/tiles-1667-rest, 203 + 202 instead of 131 + 125), eval/pair_TAG.rest.tsv.
 # The blend writes only the tiles0 shards, level 0 (LATINK_BLEND_X). h1-3000 1 min 52 s, fr1-1000 (10.7 M) 3 min 14 s on the shared card 1.
+# FASTLV=1 (11-20, fullvram; default 2): the FAST predict at 4.8 um (level 1, nets trained at --um-rungs 4.8): box x 2, each 9.6 um 512 tile
+# -> its 2^3 level-1 tiles (grid 0) and the 3^3 grid-256 tiles over it (E/tiles-l1), blended with --levels 2: the 9.596 level (2^3 mean)
+# is what ink-wrapscore --vmap reads, on the same samples / table as the level-2 scores.
 set -u; TAG=${1:?TAG}; CK=${2:?CKPT}; U=${U:-/vesuvius/ufsm/bin/ufsm-inksdk}
 E=/vesuvius/ufsm/inksmoke/eval/$TAG; P=/vesuvius/ufsm/podun/PHerc1667; UP=$P/inksdk/up; CTR=/vesuvius/ufsm/v2/ct; CTK=PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr
 FAST=${FAST:-1}; FASTDIR=${FASTDIR:-/vesuvius/ufsm/inksmoke/fast}; WSU=${WSU:-/vesuvius/ufsm/bin/ufsm-fullvram}
 FTILES=$FASTDIR/tiles-1667; FSPLIT=heldout,hold,valonly; [ "${FASTREST:-0}" = 1 ] && { FTILES=$FASTDIR/tiles-1667-rest; FSPLIT=$FSPLIT,rest; }
+FASTLV=${FASTLV:-2}; [ $FASTLV = 1 ] || [ $FASTLV = 2 ] || { echo "score $TAG: FASTLV 1 or 2"; exit 1; }; [ $FASTLV = 1 ] && [ $FAST != 1 ] && { echo "score $TAG: FASTLV=1 needs FAST=1"; exit 1; }
 [ $FAST = 1 ] && [ -e $E/fast.done ] && { echo "score $TAG: done before (FAST)"; exit 0; }
 [ $FAST = 1 ] || { [ -s $E/map/w051.tif ] && { echo "score $TAG: done before"; exit 0; }; }
 [ $FAST = 1 ] && { [ -x $WSU ] && [ -s $FASTDIR/1667-up.uws ] && [ -s $FTILES/tiles0.txt ] || { echo "score $TAG: FAST needs $WSU, $FASTDIR/1667-up.uws, $FTILES"; exit 1; }; }
@@ -39,8 +43,15 @@ guard() { while :; do nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory -
     echo "$(date +%T) $p $m" >> $E/gpumem.log; [ "$m" -gt $GPUCAP ] && { echo "$(date +%T) KILL pid $p at $m MiB > $GPUCAP" >> $E/gpupeak.txt; kill $p; }
   done; sleep 2; done; }
 guard & GP=$!; trap 'kill $GP 2>/dev/null; [ -s $E/gpumem.log ] && sort -k3 -n $E/gpumem.log | tail -1 | sed "s/^/peak: /" >> $E/gpupeak.txt' EXIT
-[ -e $E/ink/ink.zarr/zarr.json ] || $LK env CUDA_VISIBLE_DEVICES=1 U=$([ $FAST = 1 ] && echo $WSU || echo $U) LATINK_CK=$CK ITH=8 UNROLL_CT="$CTR|$CTK|2.399|2" ~/bin/memcap -m 36G ~/bin/lowprio \
-  env LATINK_HEADS=${GATEFROM:+ink} LATINK_TILES=${LATINK_TILES:-$([ $FAST = 1 ] && echo $FTILES)} LATINK_BLEND_X="${LATINK_BLEND_X:-$([ $FAST = 1 ] && echo --tile-list ${LATINK_TILES:-$FTILES}/tiles0.txt --levels 1)}" bash ${LATINK:-$(dirname "$(readlink -f "$0")")/../pod/latink.sh} $E 0 $E/ink/ink.zarr > $E/latink.log 2>&1 || { echo "score $TAG: latink failed ($E/latink.log)"; exit 1; }
+LBOX=; if [ $FASTLV = 1 ]; then   # (the level-1 tiles over the scored 9.6 um tiles; LATINK_TILES then names level-1 lists)
+  FT2=$FTILES; FTILES=$E/tiles-l1; mkdir -p $FTILES
+  awk '{ for (a = 0; a < 2; a++) for (b = 0; b < 2; b++) for (c = 0; c < 2; c++) print 2 * $1 + a, 2 * $2 + b, 2 * $3 + c }' $FT2/tiles0.txt | sort -u > $FTILES/tiles0.txt
+  awk '{ for (a = -1; a < 2; a++) for (b = -1; b < 2; b++) for (c = -1; c < 2; c++) if (2 * $1 + a >= 0 && 2 * $2 + b >= 0 && 2 * $3 + c >= 0) print 2 * $1 + a, 2 * $2 + b, 2 * $3 + c }' \
+    $FT2/tiles0.txt | sort -u > $FTILES/tiles256.txt
+  LBOX=$(awk -F, '{ printf "%d,%d,%d,%d,%d,%d", 2 * $1, 2 * $2, 2 * $3, 2 * $4, 2 * $5, 2 * $6 }' $E/box.txt)
+  echo "score $TAG: FASTLV 1: box $LBOX, $(wc -l < $FTILES/tiles0.txt) + $(wc -l < $FTILES/tiles256.txt) level-1 tiles"; fi
+[ -e $E/ink/ink.zarr/zarr.json ] || $LK env CUDA_VISIBLE_DEVICES=1 U=$([ $FAST = 1 ] && echo $WSU || echo $U) LATINK_CK=$CK ITH=8 UNROLL_CT="$CTR|$CTK|2.399|$FASTLV" ~/bin/memcap -m 36G ~/bin/lowprio \
+  env ${LBOX:+LATINK_BOX=$LBOX} LATINK_HEADS=${GATEFROM:+ink} LATINK_TILES=${LATINK_TILES:-$([ $FAST = 1 ] && echo $FTILES)} LATINK_BLEND_X="${LATINK_BLEND_X:-$([ $FAST = 1 ] && echo --tile-list ${LATINK_TILES:-$FTILES}/tiles0.txt --levels $((3 - FASTLV)))}" bash ${LATINK:-$(dirname "$(readlink -f "$0")")/../pod/latink.sh} $E 0 $E/ink/ink.zarr > $E/latink.log 2>&1 || { echo "score $TAG: latink failed ($E/latink.log)"; exit 1; }
 if [ $FAST = 1 ]; then
   ~/bin/memcap -m 12G ~/bin/lowprio $WSU ink-wrapscore $UP /vesuvius/ufsm/inkgt/segs-PHerc1667.json $(dirname $E)/pair_$TAG --ct-key $CTK --maps reader3=$P/ink/reader3/map \
     --vmap $TAG=$E/ink --depth ${DEPTH:-4} --ref reader3 --nonzero reader3 --split $FSPLIT --need w035-w051 --table $FASTDIR/1667-up.uws --threads 6 > $E/wrapscore.log 2>&1 \
