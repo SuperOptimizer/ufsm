@@ -17,6 +17,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +29,7 @@ enum { FD_S = 128 };
 typedef struct {
     z3 *pc, *ps, *w; z3w *zt[6], *zsp; int D, H, W, R, dn, dd, nys;
     atomic_long nmat, nfall; atomic_int fail;
+    z3 *nt[7]; int st, wr; pthread_mutex_t mu; double hc[100], hr[200];   /* --stats: the network's t0..t5, sp against the derived ones */
 } fd_job;
 
 static int fd_rd(z3 *z, int z0, int z1, int y0, int y1, int W, uint8_t *o) {   /* rows [z0, z1) x [y0, y1) x W, clamped by the caller */
@@ -97,7 +99,12 @@ static void fd_task(void *ctx, int a0, int a1, int th) {
             A[5 * gn + k] = c * n1 * n2; A[6 * gn + k] = c * gl; A[7 * gn + k] = c;
         }
         for (int q = 0; q < 8; q++) fd_box3(A + (size_t)q * gn, gnz, gny, W, R);
-        long nm = 0, nf = 0;
+        long nm = 0, nf = 0; uint8_t *nb = nullptr; double hc[100] = {0}, hr[200] = {0};
+        if (J->st) {   /* the network's planes on the output rows */
+            const size_t on = (size_t)(z1 - z0) * (y1 - y0) * W; nb = malloc(7 * on);
+            for (int q = 0; q < 7 && nb; q++) if (fd_rd(J->nt[q], z0, z1, y0, y1, W, nb + q * on)) { free(nb); nb = nullptr; }
+            if (!nb) { fprintf(stderr, "fields-derive: --stats read failed: %s\n", z3_error()); atomic_store(&J->fail, 1); }
+        }
         for (int z = z0; z < z1; z++) for (int y = y0; y < y1; y++) for (int x = 0; x < W; x++) {
             if (!w[PI_(z, y, x)]) continue;
             nm++; const size_t k = ((size_t)(z - gz0) * gny + (y - gy0)) * W + x; const float C = A[7 * gn + k];
@@ -105,11 +112,28 @@ static void fd_task(void *ctx, int a0, int a1, int th) {
             uint8_t t[7];
             for (int q = 0; q < 6; q++) { const float v = (q < 3 ? 0.f : 0.5f) + A[(size_t)q * gn + k] / C; t[q] = (uint8_t)lroundf(255.f * fminf(1.f, fmaxf(0.f, v))); }
             const float G = A[6 * gn + k] / C, sp = G > 0.f ? 16.f * (float)M_PI / G : 0.f; t[6] = (uint8_t)(sp <= 0.f ? 0 : sp < 1.f ? 1 : sp > 255.f ? 255 : lroundf(sp));
+            if (nb) {   /* principal axes of both tensors (power iteration, as count-field's cf_axis), |cos|; sp ratio; weight |z|^2 */
+                const size_t on = (size_t)(z1 - z0) * (y1 - y0) * W, j = ((size_t)(z - z0) * (y1 - y0) + (y - y0)) * W + x, ii = PI_(z, y, x);
+                const float zr = pc[ii] - 128.f, zi = ps[ii] - 128.f, c = (zr * zr + zi * zi) * (1.f / (127.f * 127.f));
+                double ax[2][3];
+                for (int m2 = 0; m2 < 2; m2++) {
+                    double tt[6]; for (int q = 0; q < 6; q++) tt[q] = (m2 ? nb[q * on + j] : t[q]) / 255.0 - (q < 3 ? 0 : 0.5);
+                    const double T[3][3] = {{tt[0], tt[3], tt[4]}, {tt[3], tt[1], tt[5]}, {tt[4], tt[5], tt[2]}};
+                    double *v = ax[m2]; v[0] = v[1] = v[2] = 0; v[tt[0] >= tt[1] && tt[0] >= tt[2] ? 0 : tt[1] >= tt[2] ? 1 : 2] = 1;
+                    for (int it = 0; it < 16; it++) { double u[3] = {0, 0, 0}; for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) u[a] += T[a][b] * v[b];
+                        const double l = sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]); if (l < 1e-12) break; for (int a = 0; a < 3; a++) v[a] = u[a] / l; }
+                }
+                const double cs = fabs(ax[0][0] * ax[1][0] + ax[0][1] * ax[1][1] + ax[0][2] * ax[1][2]);
+                hc[cs >= 1 ? 99 : (int)(cs * 100)] += c;
+                const int sn = nb[6 * on + j];
+                if (sn && t[6]) { const double lr = log2((double)t[6] / sn); int b = (int)floor((lr + 2) * 50); hr[b < 0 ? 0 : b > 199 ? 199 : b] += c; }
+            }
             for (int q = 0; q < 7; q++) A[(size_t)q * gn + k] = (float)t[q];   /* (the sums are spent: the codes go to the first 7 slots) */
         }
         atomic_fetch_add(&J->nmat, nm); atomic_fetch_add(&J->nfall, nf);
+        if (nb) { pthread_mutex_lock(&J->mu); for (int b = 0; b < 100; b++) J->hc[b] += hc[b]; for (int b = 0; b < 200; b++) J->hr[b] += hr[b]; pthread_mutex_unlock(&J->mu); free(nb); }
         /* the shards of this (zs, ys) row: x shards one after another */
-        for (int xs = 0; xs * FD_S < W && !atomic_load(&J->fail); xs++) {
+        for (int xs = 0; J->wr && xs * FD_S < W && !atomic_load(&J->fail); xs++) {
             memset(ob, 0, (size_t)7 * FD_S * FD_S * FD_S);
             const int x0 = xs * FD_S, x1 = x0 + FD_S < W ? x0 + FD_S : W;
             for (int z = z0; z < z1; z++) for (int y = y0; y < y1; y++) for (int x = x0; x < x1; x++) {
@@ -135,7 +159,7 @@ static const char *fd_opt(int argc, char **argv, const char *name, const char *d
 
 int cmd_fields_derive(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: ufsm fields-derive IN OUT [--normal 1] [--density 1] [--r 2] [--q 8] [--threads N]\n"
+        fprintf(stderr, "usage: ufsm fields-derive IN OUT [--normal 1] [--density 1] [--r 2] [--q 8] [--threads N] [--stats 1 [--write 0]]\n"
                         "  the normal planes t0..t5 and / or the density plane sp from the phase gradient (pc, ps); other planes linked (src/fieldsderive.c)\n");
         return 2;
     }
@@ -143,15 +167,17 @@ int cmd_fields_derive(int argc, char **argv) {
     fd_job J = {.R = opt_atoi("--r", fd_opt(argc, argv, "--r", "2")), .dn = opt_atoi("--normal", fd_opt(argc, argv, "--normal", "1")),
                 .dd = opt_atoi("--density", fd_opt(argc, argv, "--density", "1"))};
     const float q = (float)opt_atof("--q", fd_opt(argc, argv, "--q", "8"));
+    J.st = opt_atoi("--stats", fd_opt(argc, argv, "--stats", "0")); J.wr = opt_atoi("--write", fd_opt(argc, argv, "--write", "1")); pthread_mutex_init(&J.mu, nullptr);
     fit_set_threads(opt_atoi("--threads", fd_opt(argc, argv, "--threads", "0")));
     if (!J.dn && !J.dd) { fprintf(stderr, "fields-derive: nothing to derive (--normal 0 --density 0)\n"); return 2; }
     store *s = store_open(in); if (!s) { fprintf(stderr, "fields-derive: cannot open %s\n", in); return 1; }
     if (!(J.pc = z3_open(s, "pc", nullptr)) || !(J.ps = z3_open(s, "ps", nullptr)) || !(J.w = z3_open(s, "w", nullptr))) { fprintf(stderr, "fields-derive: %s: no pc / ps / w zarr planes\n", in); return 1; }
+    for (int k = 0; k < 7 && J.st; k++) if (!(J.nt[k] = z3_open(s, k < 6 ? (const char *[]){"t0", "t1", "t2", "t3", "t4", "t5"}[k] : "sp", nullptr))) { fprintf(stderr, "fields-derive: --stats: %s has no t0..t5 / sp\n", in); return 1; }
     const z3_meta *m = z3_meta_of(J.pc); J.D = (int)m->shape[0]; J.H = (int)m->shape[1]; J.W = (int)m->shape[2];
-    if (mkdir(out, 0775) && errno != EEXIST) { fprintf(stderr, "fields-derive: cannot create %s\n", out); return 1; }
+    if (J.wr && mkdir(out, 0775) && errno != EEXIST) { fprintf(stderr, "fields-derive: cannot create %s\n", out); return 1; }
     /* links to every entry of IN except the planes written here */
-    DIR *d = opendir(in); if (!d) return 1; struct dirent *e;
-    while ((e = readdir(d))) {
+    DIR *d = J.wr ? opendir(in) : nullptr; if (J.wr && !d) return 1; struct dirent *e;
+    while (d && (e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
         const int tpl = e->d_name[0] == 't' && e->d_name[1] >= '0' && e->d_name[1] <= '5' && !e->d_name[2];
         if ((J.dn && tpl) || (J.dd && !strcmp(e->d_name, "sp"))) continue;
@@ -163,11 +189,11 @@ int cmd_fields_derive(int argc, char **argv) {
         char *rp = realpath(in, nullptr); snprintf(a, sizeof a, "%s/%s", rp ? rp : in, e->d_name); free(rp);
         unlink(b); if (symlink(a, b)) { fprintf(stderr, "fields-derive: cannot link %s\n", b); return 1; }
     }
-    closedir(d);
+    if (d) closedir(d);
     const int64_t sh[3] = {J.D, J.H, J.W};
     char at[256]; snprintf(at, sizeof at, "{\"ufsm\":{\"content\":\"winding fitter fields (src/fit.h), ufsm fields-derive r %d from the phase gradient\"}}", J.R);
     for (int k = 0; k < 7; k++) {
-        if ((k < 6 && !J.dn) || (k == 6 && !J.dd)) continue;
+        if (!J.wr || (k < 6 && !J.dn) || (k == 6 && !J.dd)) continue;
         char p[2048]; snprintf(p, sizeof p, "%s/%s", out, k < 6 ? (const char *[]){"t0", "t1", "t2", "t3", "t4", "t5"}[k] : "sp");
         z3w *zw = z3w_create(p, sh, FD_S, q, 0, at); if (!zw) { fprintf(stderr, "fields-derive: %s\n", z3w_error()); return 1; }
         if (k < 6) J.zt[k] = zw; else J.zsp = zw;
@@ -179,5 +205,14 @@ int cmd_fields_derive(int argc, char **argv) {
     if (J.zsp && z3w_close(J.zsp)) rc = 1;
     fprintf(stderr, "fields-derive: %s%s%s from the phase gradient (r %d): %ld material cells, %ld (%.4f) without phase in their box (t, sp 0)%s\n",
             J.dn ? "t0..t5" : "", J.dn && J.dd ? " + " : "", J.dd ? "sp" : "", J.R, (long)J.nmat, (long)J.nfall, J.nmat ? (double)J.nfall / J.nmat : 0.0, rc ? ": FAILED" : "");
+    if (J.st) {   /* weighted quantiles */
+        double tc = 0, tr = 0; for (int b = 0; b < 100; b++) tc += J.hc[b]; for (int b = 0; b < 200; b++) tr += J.hr[b];
+        double acc = 0, mc = 0; int q10 = -1, q50 = -1; for (int b = 0; b < 100; b++) { acc += J.hc[b]; mc += J.hc[b] * (b + 0.5) / 100; if (q10 < 0 && acc >= 0.1 * tc) q10 = b; if (q50 < 0 && acc >= 0.5 * tc) q50 = b; }
+        double a2 = 0; int r10 = -1, r50 = -1, r90 = -1; for (int b = 0; b < 200; b++) { a2 += J.hr[b]; if (r10 < 0 && a2 >= 0.1 * tr) r10 = b; if (r50 < 0 && a2 >= 0.5 * tr) r50 = b; if (r90 < 0 && a2 >= 0.9 * tr) r90 = b; }
+        double c95 = 0; for (int b = 95; b < 100; b++) c95 += J.hc[b];
+        fprintf(stderr, "fields-derive --stats (weight |phasor|^2): |cos| network vs phase-gradient normal: mean %.3f, p10 %.2f, median %.2f, share >= 0.95 %.3f; "
+                        "sp phase / network: p10 %.3f, median %.3f, p90 %.3f\n", tc ? mc / tc : 0, q10 / 100.0, q50 / 100.0, tc ? c95 / tc : 0,
+                exp2((r10 + 0.5) / 50 - 2), exp2((r50 + 0.5) / 50 - 2), exp2((r90 + 0.5) / 50 - 2));
+    }
     return rc;
 }
