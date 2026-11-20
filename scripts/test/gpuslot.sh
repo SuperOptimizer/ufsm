@@ -26,6 +26,7 @@ built() { [ -f "$ROOT/${1:0:12}/.built" ]; }
 case $cmd in
 add)
   REF=${1:?REF}; RX=${2:-}
+  [ "$REF" = HEAD ] && REF=$(git rev-parse --abbrev-ref HEAD)
   SHA=$(git rev-parse --verify "$REF^{commit}") || exit 2
   BASE=$(git merge-base "$SHA" origin/master 2> /dev/null || git merge-base "$SHA" master) || exit 2
   git push -q "$ROOT/repo.git" "$SHA:refs/suite/${SHA:0:12}" "$BASE:refs/suite/base-${BASE:0:12}" || exit 2
@@ -64,7 +65,7 @@ drain)
     echo "gpuslot: $T $REF ($S): ${left} s left in the slot"
     # (GPU tests only: the CPU half is the agent's own gate; never sanitizers on a shared card)
     ( cd "$W" && timeout -k 30 "$left" tests/run_suite.sh -B build-verify -t fast -g "$G" -x "$X" -W 60 -o "$O" -X '~(racecheck|memcheck)' \
-        -K 'gpu|gpu2' -I "${sel[@]}" ) > "$O.log" 2>&1
+        -K 'gpu|gpu2' "${sel[@]}" ) > "$O.log" 2>&1
     rc=$?
     sum=$(awk -F'\t' 'NR > 1 {c[$2]++} END {for (s in c) printf "%s %d ", s, c[s]}' "$O/results.tsv" 2> /dev/null)
     printf '%s %s %-28s rc %s  %s %s\n' "$(date '+%m-%d %H:%M')" "$T" "$REF" "$rc" "${sum:-no results}" "$O/summary.txt" | tee -a "$RES"
@@ -75,7 +76,7 @@ drain)
 status)
   echo "queue ($Q):"; [ -s "$Q" ] && while IFS='|' read -r T SHA BASE REF RX WHO; do
     printf '  %s %-28s %s %s %s\n' "$T" "$REF" "${SHA:0:12}" "$(built "$SHA" && echo built || echo "not built")" "${RX:-touched}"; done < "$Q"
-  echo "last results ($RES):"; tail -n 8 "$RES" 2> /dev/null
+  echo "last results ($RES):"; tail -n 8 "$RES" 2> /dev/null; true
   ;;
 *) sed -n '2,20p' "$0"; exit 2;;
 esac
