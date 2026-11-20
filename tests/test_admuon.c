@@ -7,8 +7,11 @@
      (b) + (c) together;
    - --muon-scale rms (DESIGN.md 2026-11-15 "Muon update scaling"): from the same state, the rms step equals the kj step times
      r sqrt(max(Co, K)) / sqrt(max(1, Co / K)) per matrix (the same direction O), its element RMS is ~r / lr, and exactly r under
-     --muon-fro (O rescaled to the nominal RMS); plain and ext (+ NorMuon). */
+     --muon-fro (O rescaled to the nominal RMS); plain and ext (+ NorMuon);
+   - admuon2 (2026-11-19, src/admctl.h): the online kappa, DoG on it and autocool on the GPU equal the host controllers fed the
+     device's own probe samples (test_adapt2; the controllers themselves: tests/test_admctl.c). */
 #include "nn.h"
+#include "admctl.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,8 +94,8 @@ static double mscale(int Co, int K) { return sqrt(fmax(1.0, (double)Co / K)); }
 static void test_adapt(int nm, int lars, float tgt, int dog, float kappa) {
     batch a, b; batch_new(&a, 9); batch_new(&b, 9);
     const float lr0 = 0.02f, wd = 0.1f, sched[5] = {1.f, 1.f, 0.7f, 0.4f, 0.1f}, lb = 0.9f, lc = 2.f, dmax = 3.f;
-    float *lrm = nn_malloc(N * 4), *ema = nn_malloc(N * 4), *disp[N]; double *dst = nn_malloc(4 * sizeof(double)), *part = nn_malloc((size_t)64 * N * sizeof(double));
-    nn_zero(ema, N * 4); nn_zero(dst, 4 * sizeof(double));
+    float *lrm = nn_malloc(N * 4), *ema = nn_malloc(N * 4), *disp[N]; double *dst = nn_malloc(AD_NST * sizeof(double)), *part = nn_malloc((size_t)64 * N * sizeof(double));
+    nn_zero(ema, N * 4); nn_zero(dst, AD_NST * sizeof(double));
     for (int i = 0; i < N; i++) { const size_t nw = (size_t)CO[i] * KK[i]; disp[i] = nn_malloc(nw * 4); nn_zero(disp[i], nw * 4); }
     void *ddisp = nn_malloc(sizeof disp); nn_h2d(ddisp, disp, sizeof disp);
     const nn_madapt ad = {.lrm = lrm, .ema = ema, .dog = dst, .disp = (float *const *)ddisp, .part = part, .lr_peak = lr0, .lars_tgt = tgt, .lars_b = lb, .lars_c = lc,
@@ -148,6 +151,57 @@ static void test_adapt(int nm, int lars, float tgt, int dog, float kappa) {
     nn_free(lrm); nn_free(ema); nn_free(dst); nn_free(part); nn_free(ddisp); batch_free(&a); batch_free(&b);
 }
 
+/* admuon2 (src/admctl.h): online kappa + DoG + autocool through adm_stat_k / ad_ctl_k, the probe at stride 1 (so the probe's |v|^2 is
+   DoG's v2). Each step the host reads the device's probe state before the step (e, theta_prev, theta_start, centre) and the samples
+   after it, forms the six statistics in double and runs the same controllers; the state vectors must agree. Autocool windows of 2
+   updates in blocks of 2 (decisions every 5 steps), delta / c huge so the decays fire: the decay path runs on the GPU too. */
+static void test_adapt2(int nm) {
+    batch a; batch_new(&a, 11);
+    const float lr0 = 0.02f, wd = 0.1f, beta = 0.9f;
+    long long off[N + 1], M = 0; for (int i = 0; i < N; i++) { off[i] = M; M += (long long)CO[i] * KK[i]; } off[N] = M;
+    long long *doff = nn_malloc(sizeof off); nn_h2d(doff, off, sizeof off);
+    float *buf = nn_malloc((size_t)2 * M * 4), *ext = nn_malloc((size_t)4 * M * 4), *lrm = nn_malloc(N * 4), *ema = nn_malloc(N * 4), *disp[N];
+    nn_zero(ext, (size_t)4 * M * 4); nn_zero(ema, N * 4);
+    double *dst = nn_malloc(AD_NST * sizeof(double)), *part = nn_malloc((size_t)64 * N * sizeof(double)), *xpart = nn_malloc(6 * 64 * sizeof(double));
+    double S[AD_NST] = {0}; S[AD_COOL] = 1; nn_h2d(dst, S, sizeof S);
+    for (int i = 0; i < N; i++) { const size_t nw = (size_t)CO[i] * KK[i]; disp[i] = nn_malloc(nw * 4); nn_zero(disp[i], nw * 4); }
+    void *ddisp = nn_malloc(sizeof disp); nn_h2d(ddisp, disp, sizeof disp);
+    const adm_cool_cfg cc = {2, 2, 1e9, 1e9, 0.5, 0.2};
+    const nn_madapt ad = {.lrm = lrm, .ema = ema, .dog = dst, .disp = (float *const *)ddisp, .part = part, .lr_peak = lr0, .dog_eta0 = lr0, .dog_max = 3 * lr0,
+                          .dog_kappa = 19.f, .on_dog = 1, .ext = ext, .xpart = xpart, .kap_b = 0.9f, .cool_delta = (float)cc.delta, .cool_c = (float)cc.c,
+                          .cool_decay = (float)cc.decay, .cool_floor = (float)cc.floor, .on_kap = 1, .on_cool = 1, .cool_n = cc.n, .cool_m = cc.m};
+    float *pre = malloc((size_t)4 * M * 4), *smp = malloc((size_t)2 * M * 4); double worst = 0; int wi = -1;
+    const float ck = (float)adm_ckeep(cc), lam = (float)adm_lam(beta);
+    for (int it = 0; it < 12; it++) {
+        set_g(&a, nullptr, 500 + it); const float sched = it < 3 ? 0.5f + it * 0.25f : 1.f, lr = lr0 * sched;
+        nn_d2h(pre, ext, (size_t)4 * M * 4);
+        nn_muon_probe(buf, doff, 1, 0, M); nn_muon_ext_adapt(&ad); step(&a, 1, nm, lr, wd); nn_muon_ext_adapt(nullptr); nn_muon_probe(nullptr, nullptr, 0, 0, 0);
+        nn_d2h(smp, buf, (size_t)2 * M * 4);
+        const float *E = pre, *TP = pre + M, *TS = pre + 2 * M, *TC = pre + 3 * M, *v = smp, *th = smp + M;
+        const int tv = S[AD_TV] != 0.0, ws = S[AD_WS] != 0.0; double t[6] = {0};
+        for (long long j = 0; j < M; j++) {
+            t[0] += (double)v[j] * E[j]; t[1] += (double)v[j] * v[j];
+            if (tv) { const float dd = TP[j] - th[j], cn = TC[j] + ck * (th[j] - TC[j]); t[2] += (double)(TP[j] - TC[j]) * dd; t[3] += (double)dd * dd; t[5] += (double)(th[j] - cn) * (th[j] - cn); }
+            if (!ws) { const float w = th[j] - TS[j]; t[4] += (double)w * w; }
+        }
+        (void)lam;
+        adm_kap(S, t[0], t[1], beta, 0.9); const double kap = adm_kappa(S);
+        adm_cool(S, t[2], t[3], t[5], t[4], cc); const double cf = adm_cool_f(S);
+        adm_dog(S, kap, cf * lr / lr0, t[1], lr0, 3 * lr0, 0);
+        double h[AD_NST]; nn_d2h(h, dst, sizeof h);
+        S[AD_DIST] = h[AD_DIST];   /* (the displacement: the GPU's own float buffer) */
+        for (int k = 0; k < AD_NST; k++) { if (k == AD_DIST) continue; const double r = fabs(h[k] - S[k]) / fmax(fabs(S[k]), 1e-12); if (r > worst) { worst = r; wi = k; } }
+        if (it == 11) printf("  step 12: kappa %.3f, eta %.4g, cool f %.3g (%g decays), z %.3g, r %.3g\n", h[AD_KAP], h[AD_ETA], h[AD_COOL], h[AD_NDEC], h[AD_Z], h[AD_PK]);
+        for (int k = 0; k < AD_NST; k++) S[k] = h[k];   /* continue from the GPU's state */
+    }
+    printf("adapt2 nm %d (online kappa + DoG + autocool): state worst rel %.2e (index %d)\n", nm, worst, wi);
+    CHECK(worst < 1e-4, "admuon2 state off: %.3e at %d", worst, wi);
+    CHECK(S[AD_NDEC] >= 1, "autocool never decayed on the GPU path");
+    free(pre); free(smp);
+    for (int i = 0; i < N; i++) nn_free(disp[i]);
+    nn_free(doff); nn_free(buf); nn_free(ext); nn_free(lrm); nn_free(ema); nn_free(dst); nn_free(part); nn_free(xpart); nn_free(ddisp); batch_free(&a);
+}
+
 /* A at kj, B at rms r from the same weights, momentum and gradient: dB = dA * s_rms / s_kj per matrix; RMS(dB) / lr ~ r (exactly r with fro) */
 static void test_scale(int ext, int nm, int fro) {
     batch a, b; batch_new(&a, 9); batch_new(&b, 9);
@@ -184,6 +238,8 @@ int main(void) {
     test_adapt(0, 1, 0.05f, 0, 1.f);
     test_adapt(0, 0, 0.f, 1, 1.f);    /* kappa 1: the distance overtakes rbar_0 within the 5 steps (the max branch) */
     test_adapt(1, 1, 0.f, 1, 19.f);   /* unet's kappa at beta 0.9 */
+    test_adapt2(0);
+    test_adapt2(1);
     test_scale(0, 0, 0);
     test_scale(1, 0, 0);
     test_scale(1, 1, 0);

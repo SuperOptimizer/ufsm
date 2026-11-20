@@ -3098,6 +3098,20 @@ int cmd_train(int argc, char **argv) {
     const int muon_lars = muon_adapt ? 1 : opt_atoi("--muon-lars", opt(argc, argv, "--muon-lars", "0")), muon_dog = muon_adapt ? 1 : opt_atoi("--muon-dog", opt(argc, argv, "--muon-dog", "0"));
     const float lars_tgt = (float)opt_atof("--muon-lars-target", opt(argc, argv, "--muon-lars-target", "0")), lars_b = (float)opt_atof("--muon-lars-beta", opt(argc, argv, "--muon-lars-beta", "0.99"));
     const float lars_c = (float)opt_atof("--muon-lars-clamp", opt(argc, argv, "--muon-lars-clamp", "2")), dog_max = (float)opt_atof("--muon-dog-max", opt(argc, argv, "--muon-dog-max", "2"));
+    /* admuon2 (2026-11-19, src/admctl.h, DESIGN "Fully adaptive Muon, part 2"): --muon-dog-w 1 = DoWG; --muon-dog-kappa online (default) |
+       fixed: DoG's random-walk factor estimated from the direction probe (EMA --muon-kappa-beta) or the old (1 + beta) / (1 - beta);
+       --muon-autocool 1 (part of --muon-adaptive): the global Muon lr factor x --muon-autocool-decay (floor --muon-autocool-floor) after
+       a block of --muon-autocool-m windows of --muon-autocool-n updates is stationary (centred FDR |z| < --muon-autocool-delta, every
+       window's progress fraction r < --muon-autocool-c; src/admctl.h). */
+    const int dog_w = opt_atoi("--muon-dog-w", opt(argc, argv, "--muon-dog-w", "0")), autocool = muon_adapt ? 1 : opt_atoi("--muon-autocool", opt(argc, argv, "--muon-autocool", "0"));
+    const char *dog_kmode = opt(argc, argv, "--muon-dog-kappa", "online"); const int kap_online = !strcmp(dog_kmode, "online");
+    const float kap_b = (float)opt_atof("--muon-kappa-beta", opt(argc, argv, "--muon-kappa-beta", "0.98"));
+    const int ac_n = opt_atoi("--muon-autocool-n", opt(argc, argv, "--muon-autocool-n", "100")), ac_m = opt_atoi("--muon-autocool-m", opt(argc, argv, "--muon-autocool-m", "3"));
+    const float ac_delta = (float)opt_atof("--muon-autocool-delta", opt(argc, argv, "--muon-autocool-delta", "0.2")), ac_c = (float)opt_atof("--muon-autocool-c", opt(argc, argv, "--muon-autocool-c", "0.2"));
+    const float ac_decay = (float)opt_atof("--muon-autocool-decay", opt(argc, argv, "--muon-autocool-decay", "0.5")), ac_floor = (float)opt_atof("--muon-autocool-floor", opt(argc, argv, "--muon-autocool-floor", "0.01"));
+    if ((dog_w != 0 && dog_w != 1) || (autocool != 0 && autocool != 1) || (!kap_online && strcmp(dog_kmode, "fixed")) || !(kap_b >= 0.f && kap_b < 1.f) || ac_n < 2 || ac_m < 1
+        || !(ac_delta > 0.f) || !(ac_c > 0.f) || !(ac_decay > 0.f && ac_decay < 1.f) || !(ac_floor > 0.f && ac_floor <= 1.f) || (dog_w && !muon_dog)) {
+        fprintf(stderr, "--muon-dog-w 0 | 1 (with --muon-dog), --muon-dog-kappa online | fixed, --muon-kappa-beta in [0, 1), --muon-autocool 0 | 1, -n >= 2, -m >= 1, -delta, -c > 0, -decay in (0, 1), -floor in (0, 1]\n"); return 2; }
     if (muon_lars < 0 || muon_lars > 1 || muon_dog < 0 || muon_dog > 1 || !(lars_tgt >= 0.f) || !(lars_b >= 0.f && lars_b < 1.f) || !(lars_c >= 1.f) || !(dog_max > 0.f)) {
         fprintf(stderr, "--muon-lars / --muon-dog 0 | 1, --muon-lars-target >= 0, --muon-lars-beta in [0, 1), --muon-lars-clamp >= 1, --muon-dog-max > 0\n"); return 2; }
     const char *muon_ns = opt(argc, argv, "--muon-ns", "fixed"); const int normuon = muon_adapt ? 1 : opt_atoi("--normuon", opt(argc, argv, "--normuon", "0"));
@@ -3134,7 +3148,7 @@ int cmd_train(int argc, char **argv) {
     const float attn_mlr = (float)opt_atof("--attn-muon-lr", opt(argc, argv, "--attn-muon-lr", "1")), attn_mlr_out = (float)opt_atof("--attn-muon-lr-out", opt(argc, argv, "--attn-muon-lr-out", "1"));
     if (!(attn_mlr > 0.f) || !(attn_mlr_out > 0.f)) { fprintf(stderr, "--attn-muon-lr / --attn-muon-lr-out: > 0\n"); return 2; }
     if ((attn_mlr != 1.f || attn_mlr_out != 1.f) && (!use_muon || muon_c || hyperball)) { fprintf(stderr, "--attn-muon-lr: needs --opt muon, not with --muon-c / --hyperball\n"); return 2; }
-    if ((muon_lars || muon_dog) && (!use_muon || muon_c || hyperball)) { fprintf(stderr, "--muon-lars / --muon-dog / --muon-adaptive need --opt muon, not with --muon-c / --hyperball\n"); return 2; }
+    if ((muon_lars || muon_dog || autocool) && (!use_muon || muon_c || hyperball)) { fprintf(stderr, "--muon-lars / --muon-dog / --muon-adaptive need --opt muon, not with --muon-c / --hyperball\n"); return 2; }
     if ((ns_mode || normuon || muon_vr != 0.f || muon_kron || muon_caut || mix_a != 0.f) && !use_muon) { fprintf(stderr, "--muon-ns polar / --normuon / --muon-vr / --muon-kron / --muon-cautious / --muon-ademamix need --opt muon\n"); return 2; }
     if (muon_kron < 0 || muon_kron > 1 || kron_every < 1 || !(kron_b2 >= 0.f && kron_b2 < 1.f) || !(kron_eps > 0.f)) { fprintf(stderr, "--muon-kron 0 | 1, --muon-kron-every >= 1, --muon-kron-b2 in [0, 1), --muon-kron-eps > 0\n"); return 2; }
     if (!(muon_vr >= 0.f && muon_vr <= 1.f)) { fprintf(stderr, "--muon-vr: 0 .. 1\n"); return 2; }
@@ -4034,8 +4048,9 @@ int cmd_train(int argc, char **argv) {
         unet_set_muon_variant(d->u, ns_mode, normuon, normuon_b2);
         unet_set_muon_vr(d->u, muon_vr);
         unet_set_muon_cautious(d->u, muon_caut);
-        unet_set_muon_adapt(d->u, muon_lars, lars_tgt, lars_b, lars_c, muon_dog, dog_max, muon_lr);
-        if (g == 0) unet_set_muon_probe(d->u, opt_atoi("--muon-probe", opt(argc, argv, "--muon-probe", "0")));   /* the direction probe (unet.c mprobe; logged on --opt-stats lines) */
+        unet_set_muon_adapt(d->u, muon_lars, lars_tgt, lars_b, lars_c, muon_dog ? 1 + dog_w : 0, dog_max, muon_lr);
+        unet_set_muon_probe(d->u, opt_atoi("--muon-probe", opt(argc, argv, "--muon-probe", "0")), g == 0);   /* the direction probe (unet.c mprobe; logged on --opt-stats lines) */
+        unet_set_muon_adapt2(d->u, muon_dog && kap_online, kap_b, autocool, ac_n, ac_m, ac_delta, ac_c, ac_decay, ac_floor);
         unet_set_attn_muon_lr(d->u, attn_mlr, attn_mlr_out);
         nn_muon_tc(muon_tc);
         unet_set_muon_qkv_split(d->u, muon_qkv); unet_set_muon_wd_mult(d->u, muon_wd_mult); unet_set_muon_fro(d->u, muon_fro); unet_set_muon_stem_adamw(d->u, muon_stem_adamw);

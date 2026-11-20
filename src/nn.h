@@ -701,10 +701,14 @@ void nn_diff_sumsq(const float *a, const float *b, size_t n, double *out2);   /*
 /* adaptive Muon for the next nn_muon_ext_batch calls (train --muon-lars / --muon-dog; see nn_opt.cu): lrm (n floats, written) the
    per-matrix lr multipliers; ema (n floats, 0 = unset) the (b) ratio EMA; dog (4 doubles) the (c) state [rbar, G, eta, |x - x0|];
    disp (device array of per-matrix float buffers, Co K each) the displacement; part 64 n doubles of scratch; base (n floats or nullptr)
-   fixed per-matrix multipliers (train --attn-muon-lr) applied on top. nullptr: off */
-typedef struct { float *lrm, *ema; double *dog; float *const *disp; double *part; const float *base; float lr_peak, lars_tgt, lars_b, lars_c, dog_eta0, dog_max, dog_kappa; int on_lars, on_dog; } nn_madapt;
+   fixed per-matrix multipliers (train --attn-muon-lr) applied on top. nullptr: off.
+   admuon2 (2026-11-19, src/admctl.h): dog holds AD_NST doubles; on_dog 2 = DoWG; on_kap: kappa estimated online from the probe
+   (nn_muon_probe must be set, with tot > 0), dog_kappa is then unused; on_cool: autocool (cool_*). Both need ext: 4 x the probe's tot
+   floats of device state (e, theta_prev, theta_start, the centre; zeroed) and xpart: 6 x 64 doubles of scratch. */
+typedef struct { float *lrm, *ema; double *dog; float *const *disp; double *part; const float *base; float lr_peak, lars_tgt, lars_b, lars_c, dog_eta0, dog_max, dog_kappa; int on_lars, on_dog;
+                 float *ext; double *xpart; float kap_b, cool_delta, cool_c, cool_decay, cool_floor; int on_kap, on_cool, cool_n, cool_m; } nn_madapt;
 void nn_muon_ext_adapt(const nn_madapt *a);
-void nn_muon_probe(float *buf, const long long *off, int stride, int base);   /* the direction probe: every stride-th element of each matrix's final direction s O into buf[off[base + c] ..] at the next nn_muon_ext_batch calls; nullptr: off */
+void nn_muon_probe(float *buf, const long long *off, int stride, int base, long long tot);   /* the direction probe: every stride-th element of each matrix's final direction s O into buf[off[base + c] ..] (and of its weights before the step into buf[tot + off[base + c] ..]) at the next nn_muon_ext_batch calls; nullptr: off */
 void nn_muon_scale_mode(int m);   /* 0: sqrt(max(1, Co / K)); 1: spectral sqrt(Co / K) (train --muon-scale spectral); 2: r sqrt(max(Co, K)) (rms) */
 void nn_muon_scale_rms(float r);   /* mode 2's r: the update's element RMS (Moonlight 0.2) */
 void nn_muon_cwd(int on);   /* train --muon-cwd 1: cautious weight decay on the Muon matrices (decay only where step and weight agree in sign) */
