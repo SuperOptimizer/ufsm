@@ -30,6 +30,13 @@ GPUS=0,0 P_=128 ENV=UFSM_SAMPLER_DELAY_MS=250 run split --workers 1 --steps 20 -
 grep '^step' split.log | grep -q ' echo [1-9][0-9]*% (GPU idle for data [0-9]*%; fresh [0-9.]* samp/s)' || fail "split: no echo / GPU-idle share ($D/split.log)"
 echo "  --split z: $(grep '^step' split.log | tail -1 | grep -o 'echo [0-9]*% (GPU idle for data [0-9]*%; fresh [0-9.]* samp/s)')"
 grep '^step' split.log | grep -q '(wait [0-9]*%, gate [0-9]*%)' || fail "split: no wait / gate split on the step line ($D/split.log)"
+# (3b) starved WITHOUT --echo-max: the step lines' "wait" is the GPU's idle for data (2026-11-20: only the echo path probed the GPU, so
+#      every other run logged "wait 0 %"; FR1 sat at 19 % GPU busy with "wait 0 %"). One worker at +250 ms a window vs a P 64 step: most
+#      of the time is waiting
+ENV=UFSM_SAMPLER_DELAY_MS=250 run starve0 --workers 1 --steps 12
+w=$(grep '^step' starve0.log | tail -n +2 | grep -oE '\(wait [0-9]+%' | tr -dc '0-9\n' | sort -n | tail -1)
+[ "${w:-0}" -ge 30 ] || fail "starved, no echo: the step lines' wait is ${w:-none} % (want >= 30) ($D/starve0.log)"
+echo "  starved without echo: wait up to $w %"
 run det0 --workers 2 --steps 8 --det 1
 run det1 --workers 2 --steps 8 --det 1 --echo-max 3
 grep -q "echo-max off under --det 1" det1.log || fail "--det 1 did not switch echo off ($D/det1.log)"

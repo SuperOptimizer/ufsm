@@ -1,5 +1,6 @@
 /* ufsm ink-splat (inksplat.h): published 2D ink labels -> sparse 3D label zarr on the CT grid, and the depth profile of a 3D ink
    prediction along the labelled surface. */
+#include "defaulted.h"
 #include "inksplat.h"
 #include "optcheck.h"
 #include "dcache.h"
@@ -1141,7 +1142,7 @@ static int inkfly_fail_inject(void) { static _Atomic int left = -2; if (left == 
     return atomic_load(&left) > 0 && atomic_fetch_sub(&left, 1) > 0; }
 static _Atomic int g_ifgpu = -1;   /* -1 undecided (first chunk: $UFSM_INKFLY_CPU / $UFSM_INKFLY_GPU), 0 CPU, 1 GPU */
 uint64_t inkfly_gpu_chunks(void) { return atomic_load(&g_ifs.gpu_chunks); }
-void inkfly_gpu_config(int dev) { if (dev < 0 || !inkfly_gpu_near) { g_ifgpu = 0; return; } inkfly_gpu_device(dev); g_ifgpu = 1; }
+void inkfly_gpu_config(int dev) { if (dev < 0 || !inkfly_gpu_near) { if (dev >= 0) UFSM_DEFAULTED("inkfly = the CPU (GPU %d asked, the binary has no nn_inkfly)", dev); g_ifgpu = 0; return; } inkfly_gpu_device(dev); g_ifgpu = 1; }
 static int ifgpu_on(void) {
     int g = atomic_load(&g_ifgpu); if (g >= 0) return g;
     const char *e = getenv("UFSM_INKFLY_CPU"), *d = getenv("UFSM_INKFLY_GPU");
@@ -1218,7 +1219,7 @@ static int inkfly_chunk_gpu(inkfly *f, const int64_t o[3], const int64_t n[3], c
         uint64_t npx = 0; int64_t lo[3], hi[3]; double tg = snow();
         int g = inkfly_gpu_near(U, (int)nu, &C, lo, hi, &npx);
         atomic_fetch_add(&g_ifs.gpu_us, (uint64_t)((snow() - tg) * 1e6));
-        if (g) { if (g < 0) { fprintf(stderr, "ink onfly: the GPU near pass failed (%d): the CPU from here\n", g); atomic_store(&g_ifgpu, 0); } rc = 1; goto done; }
+        if (g) { if (g < 0) { UFSM_DEFAULTED("inkfly = the CPU from here (the GPU near pass failed: %d)", g); atomic_store(&g_ifgpu, 0); } rc = 1; goto done; }
         if (!npx) { memset(out, 255, (size_t)n[0] * n[1] * n[2]); *nonempty = 0; rc = 0; goto done; }   /* (no CT read: nothing reaches the chunk) */
         /* the CT box: the near pixels' samples (the CPU's box, rounded out) */
         int64_t co[3], cn[3]; size_t ncv = 1;
@@ -1229,7 +1230,7 @@ static int inkfly_chunk_gpu(inkfly *f, const int64_t o[3], const int64_t n[3], c
         atomic_fetch_add(&g_ifs.ct_us, (uint64_t)((snow() - tc) * 1e6));
         tg = snow(); g = inkfly_fail_inject() ? -1 : inkfly_gpu_finish(&C, ctb, co, cn, o, n, out, nonempty);
         atomic_fetch_add(&g_ifs.gpu_us, (uint64_t)((snow() - tg) * 1e6));
-        if (g < 0) { fprintf(stderr, "ink onfly: the GPU chunk failed (%d): the CPU from here\n", g); atomic_store(&g_ifgpu, 0); rc = 1; }
+        if (g < 0) { UFSM_DEFAULTED("inkfly = the CPU from here (the GPU chunk failed: %d)", g); atomic_store(&g_ifgpu, 0); rc = 1; }
         else { rc = g; if (!g) { atomic_fetch_add(&g_ifs.px, npx); atomic_fetch_add(&g_ifs.gpu_chunks, 1); } }
     }
 done:
@@ -1804,11 +1805,24 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
         for (int64_t q = 0; q < nsl; q++) cnt[q + 1] += cnt[q];
         for (size_t i = 0; i < np; i++) ord[cnt[sl[i]]++] = (uint32_t)i;   /* (cnt[q] is now slab q's end = slab q+1's start) */
         float raw[256], sm[256]; int bad = 0;
+        double *pn = nullptr; uint8_t *gd = nullptr;   /* (the GPU face search: the slab's rays' P / N, their drop bytes) */
         for (int64_t q = 0, b0 = 0; q < nsl && !bad; b0 = cnt[q], q++) {
             if ((int64_t)cnt[q] == b0) continue;
             int64_t z0 = q * T - rz, z1 = (q + 1) * T + rz + 1; if (z0 < 0) z0 = 0; if (z1 > cn[0]) z1 = cn[0];
             const int64_t so[3] = {co[0] + z0, co[1], co[2]}, sn[3] = {z1 - z0, cn[1], cn[2]};
             if (f->zc ? zcache_read(f->zc, f->base_ct, so, sn, ctb) : z3_read(f->base_ct, so, sn, ctb, 1)) { bad = 1; break; }
+            if (inkfly_gpu_rayface && ifgpu_on()) {   /* the face search on the GPU (2026-11-20: 18 % of FR1's sampler CPU here; byte-identical) */
+                const size_t m = cnt[q] - (size_t)b0;
+                if (!pn) { pn = malloc(np * 6 * sizeof *pn); gd = malloc(np); }
+                if (pn && gd) {
+                    for (size_t j = 0; j < m; j++) { const cpx *x = &X[ord[b0 + j]]; memcpy(pn + 6 * j, x->P, 3 * sizeof(double)); memcpy(pn + 6 * j + 3, x->N, 3 * sizeof(double)); }
+                    ifg_ray rp = {f->off, V, sign, lo, ns, c->iso, c->face_run, c->face_gap, {co[0], co[1], co[2]}, {cn[0], cn[1], cn[2]}, z0, z1};
+                    const int g = inkfly_gpu_rayface(&rp, pn, m, ctb, gd);
+                    if (!g) { for (size_t j = 0; j < m; j++) drop[ord[b0 + j]] = gd[j]; continue; }
+                    if (g == 2) { bad = 1; break; }
+                    if (g < 0) { UFSM_DEFAULTED("inkfly = the CPU from here (the GPU ray face search failed: %d)", g); atomic_store(&g_ifgpu, 0); }
+                }
+            }
             for (int64_t j = b0; j < (int64_t)cnt[q]; j++) {
                 const cpx *x = &X[ord[j]];
                 for (int k = 0; k < ns; k++) { const double tt = (lo + k) * sign; double qq[3];
@@ -1819,7 +1833,7 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
                 drop[ord[j]] = face_of(sm, ns, lo, c->iso, c->face_run, c->face_gap) != FACE_NONE;
             }
         }
-        free(cnt); free(ord); free(sl); free(ctb);
+        free(cnt); free(ord); free(sl); free(ctb); free(pn); free(gd);
         if (bad) { fprintf(stderr, "ink-onfly: rays: a CT slab read failed or a sample left its slab\n"); free(drop); goto done; }
     }
     inkray *Rr = malloc((np ? np : 1) * sizeof *Rr); size_t nr = 0;

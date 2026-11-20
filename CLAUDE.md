@@ -19,6 +19,7 @@ cmake --preset release && cmake --build build -j 8            # build/ufsm by mc
 scripts/toolchain/jit_warm.sh build-verify/test_unet 8        # fill mcudahw's kernel cache before suites / training (cold JIT times tests out)
 cmake --preset verify && cmake --build build-verify --target test   # fast tier: the merge gate. test-slow / test-all: slow tier / both
 SUITE_FLAGS="-j 4 test_fit" cmake --build build-verify --target test # runner options: only tests whose name matches the regex
+cmake --build build-verify --target test-touched   # only the fast-tier tests this branch can affect (run_suite -c merge-base, by symbol reach)
 cmake --build build-verify --target test_lat && build-verify/test_lat   # one test by hand
 cmake --preset arch86 && cmake --build build86                  # Ampere (software MX; sm_86 SASS + PTX); arch86-verify for its suite
 cmake --build build --target doctor                             # the toolchain picked + machine limits (ufsm sysinfo)
@@ -45,7 +46,10 @@ scripts/test/desk_suite.sh BRANCH   # push to the desk, build and run the suite 
 - `tests/run_suite.sh` takes machine-wide GPU locks (`/tmp/ufsm-suite-locks`: `gpu<i>.excl` shared plus a slot), so concurrent suites
   share the GPUs; a trainer takes `gpu<i>.excl` exclusively. A card held by a trainer or a foreign process: its tests go BUSY after `-W`
   seconds. `-g none` runs only the CPU tests. Exit 0 pass, 1 fail, 3 INCOMPLETE (GPU tests not run: NOGPU / BUSY / NEED2): not a merge
-  gate. The GPU half of a merge: `scripts/test/pod_gate.sh REF` (the perf pod, `run_suite -c <merge base>` under /root/gpu.lock).
+  gate. The GPU half of a merge: `scripts/test/gpuslot.sh add BRANCH` (queues its touched GPU tests for the batched desk card-1 slot
+  inksdk opens; results in /vesuvius/ufsm/suite/results.txt), or the whole tier off the desk: `scripts/test/desk_suite.sh -H forlindesk
+  -a 86 BRANCH` (arch86: lp_* on software MX). The CPU half off the desk: `SUITE_ARGS="-g none" scripts/test/desk_suite.sh -H
+  forlinlapnvidia -a 86 -R /home/forrest/suite -m 8 -l 14 BRANCH`. `run_suite -J N` warms the selected GPU tests' kernels first.
 - One GPU, 2-GPU tests: `train --gpus 0,0` runs two data-parallel ranks as logical devices on one card (src/ufsm_dev.cuh); gpu2 tests
   tagged `l2` run that way on one-GPU machines (UFSM_TEST_GPUS=0,0).
 - Training runs: `scripts/run/install_health.sh RUN` (the health watcher service); `scripts/run/replay_ab.sh RUN OLD NEW` before a
@@ -100,3 +104,29 @@ scripts/test/desk_suite.sh BRANCH   # push to the desk, build and run the suite 
   fibres from dl.ash2txt community-uploads/qual/AutomatedFiberVolumes, and the ground truth from dl.ash2txt, and compute every
   label on the fly during training (the sampler's on-the-fly paths plus the derived-label cache). Only tiny files (sources json,
   axis jsons, scripts) may be copied.
+
+## Team rules (agents; 2026-11-20)
+
+- **Concise.** Messages and reports: lead with the result or the decision needed, numbers in a short table, ≤ ~10 lines. No
+  restating plans, no repeating an earlier report, no "waiting" notes: write only when something changed or you need an answer.
+- **Master constantly.** Merge the day a change passes its touched tests; merge origin/master in every few hours and before building
+  any run binary. After a merge delete the branch (`--force-with-lease`) and its worktree. One worktree per agent. Unmerged work
+  older than a day gets merged or deleted. `scripts/dev/cleanup.sh` lists stale branches / worktrees / build dirs.
+- **No silent fallbacks.** Any CPU fallback, precision drop or skipped path prints `DEFAULTED:`. Gates treat a missing or empty
+  score as "scoring failed" (alert), never as a fail / STOP.
+- **Check a new run within 15 min:** device placement lines (CT decode, ink / fibre labels on the GPU), no DEFAULTED, GPU busy from
+  `nvidia-smi dmon` (60 s mean; the log's "wait" alone is not proof), Mvox/s. Device indices are the ones inside the process's
+  CUDA_VISIBLE_DEVICES.
+- **Desk CPU belongs to the trainers.** Nothing but trainers in ufsm-train.slice; other jobs in ufsm-dev.slice, ≤ 6 threads, one
+  heavy job per agent. Card-1 GPU tests go into the shared batched slot (inksdk schedules it), scoring runs one job at a time.
+- **Widths** are multiples of 32, or exactly 8 / 16 (else gradients drop to MX-fp8 and the lean level-0 modes switch off).
+- **Disk:** outputs to /vesuvius or the NAS, never ~; delete or move to the NAS what no live run or DESIGN section needs.
+- **No approval prompts.** A prompt from a subagent never reaches the user's web UI: the agent hangs. So never send a command the
+  checker can't verify. Banned in a Bash call: `rm` / `mv` / `sed -i` / `chmod` / `kill` inside loops, `case`, `if`, `&&` chains,
+  pipelines, `$(...)`, `bash -c` / `sh -c` / `zsh -c`, `find -delete` / `-exec rm`, `xargs rm`, globbed deletes. Instead:
+  - edit files with the Edit / Write tools;
+  - delete or move with one plain command per call on literal paths (`rm -r /vesuvius/ufsm/x/old`);
+  - multi-step work: Write a script file under /vesuvius/ufsm/<agent>/ first, then run it as `bash /vesuvius/ufsm/<agent>/x.sh`;
+  - read-only inspection (grep, ls, cat, du, ps, git log / status) may be compound.
+  Scripts reference stable links (e.g. /vesuvius/ufsm/bin/ufsm-<agent> → current binary), never worktree paths, so repointing is one
+  `ln -sfn`. If a command of yours ever waits on approval, tell the lead at once.

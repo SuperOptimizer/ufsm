@@ -22,6 +22,7 @@
 #include "sources.h"
 [[gnu::weak]] int inkfly_cache_budget(size_t);   /* (inksplat.o: the shared ink cache budget, --ink-cache-mb) */
 #include "inksplat.h"
+#include "gpudec.h"
 #include "meshcodes.h"
 #include "inkmil.h"
 #include "hgs.h"
@@ -314,6 +315,7 @@ static int unwrap2_heads_moved(const char *init_from) {
 }
 static double g_reject_warn = 100;
 static double g_outward_warn = 0.9;   /* --outward-warn S: warn when a source's aligned phase-gradient samples rise outward less often than S (0 off) */   /* mgpu: config */
+static int g_ink_dev = -1;   /* mgpu: config (the on-the-fly ink chunks' device, -1 none / the CPU: the planner keeps their budget free on a training card) */
 static size_t g_mil_reserve;   /* mgpu: config (set by the planner before the GPU threads; the planner's MIL share, checked against ink_mil_peak_bytes at each log line) */
 static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static float g_mil_r_um = 0.f, g_mil_R = 10.f, g_mil_step = 1.f, g_mil_tau = 0.f, g_mil_lambda = 1.f;   /* --ink-mil L
    (--ink-head): the normal-pooled MIL ink loss on each window's rays (inkmil.h): per supervised label pixel (mode 1: only those without an open face, the
@@ -466,6 +468,7 @@ static float ww_mil(int dev, int nmil) {   /* the MIL head's weight for a window
     return (float)w;
 }
 static int g_hs_tcache;   /* --hs-tcache 1 (UFSM_HS_TCACHE=0 / 1 overrides: tests): head_slab_pass keeps the slabs' derived targets for the gradient pass */
+static size_t g_tc_reserve;   /* mgpu: config (--hs-tcache: the planner's share, allocated at the first step) */
 static size_t g_val_reserve;   /* --val-P: device bytes the planner keeps free for that copy's inference build */
 static unet *g_val_u;          /* --val-P: that copy */
 
@@ -3310,6 +3313,25 @@ int cmd_train(int argc, char **argv) {
                    for (int k = 0; k < ng; k++) { fprintf(stderr, " %d", devs[k]); devs[k] = k; } fprintf(stderr, " (data parallel on shared cards)\n"); }
     }
     for (int k = 0; k < ng; k++) g_w4devs[k] = devs[k]; g_w4n = ng;
+    {   /* every device flag names a visible device (2026-11-20, FR1: --ct-gpu-decode 1 under CUDA_VISIBLE_DEVICES=0 decoded on the CPU and
+           the ink on the full card 0 fell to the CPU: 19 % GPU busy, 23 Mvox/s instead of ~75, and nothing said so but one gpudec line). A
+           flag given explicitly with an index this process cannot see stops here; under UFSM_SAMPLER_ONLY (no GPU on purpose) it is a
+           DEFAULTED line and the CPU path */
+        const int nd = nn_device_count(), so = ufsm_env_on("UFSM_SAMPLER_ONLY");
+        static const char *const fl[] = {"--ct-gpu-decode", "--ink-gpu", "--fibre-gpu", "--onfly-gpu"};
+        for (size_t i = 0; i < sizeof fl / sizeof *fl; i++) {
+            const char *v = opt(argc, argv, fl[i], ""); if (!*v) continue;
+            for (const char *q = v; q && *q; q = strchr(q, ',') ? strchr(q, ',') + 1 : nullptr) {   /* (--onfly-gpu A,B: both) */
+                const int d = atoi(q); if (d < 0 || d < nd) continue;
+                if (so) { UFSM_DEFAULTED("%s %d = the CPU (no such CUDA device: %d visible, UFSM_SAMPLER_ONLY)", fl[i], d, nd); continue; }
+                fprintf(stderr, "train: %s %d: no such CUDA device (%d visible; CUDA_VISIBLE_DEVICES=%s): the work would fall back to the CPU. "
+                        "Device indices count within CUDA_VISIBLE_DEVICES; pass a visible one (or -1 for the CPU on purpose)\n", fl[i], d, nd,
+                        getenv("CUDA_VISIBLE_DEVICES") ? getenv("CUDA_VISIBLE_DEVICES") : "(unset)");
+                return 2;
+            }
+        }
+        for (int k = 0; k < ng && !so; k++) if (devs[k] < 0 || devs[k] >= nd) { fprintf(stderr, "train: --gpus: no CUDA device %d (%d visible)\n", devs[k], nd); return 2; }
+    }
     nn_init(devs[0]);   /* env precision knobs are read here; the storage modes decide the batch formats */
     g_xfmt = nn_get_tf32() && nn_get_act_bf16() && !ufsm_env_on("UFSM_ACT_MX8") ? (nn_get_f16() ? 1 : 2) : 0;
     g_g16 = nn_get_tf32() && nn_get_act_bf16() && nn_get_grad_bf16();
@@ -3623,6 +3645,8 @@ int cmd_train(int argc, char **argv) {
        scratch sources), one line per owner */
 #define ONFLY_MEM(what) do { size_t fr_, to_; if (!nn_dev_mem(&fr_, &to_) && to_) fprintf(stderr, "memory: %.2f GB free on the device after %s\n", fr_ / 1e9, what); } while (0)
     ONFLY_MEM("start-up");
+    if (ufsm_env_on("UFSM_GPU_DECODE")) { gpudec_enabled(); ONFLY_MEM("the CT decode buffers"); }   /* (--ct-gpu-decode: its device buffers now, before the
+        planner reads the free memory; they were allocated at the first decode, after the plan on a full card (2026-11-20: or not at all)) */
     {   /* sources with an on-the-fly phase (band_onfly.h): the pair rule on --onfly-gpu (default the run's first GPU; -1 the CPU), its
            --onfly-slots tile buffers of --onfly-mb each reserved now, before the memory planner reads the free device memory */
         float rmax = 0; for (int i = 0; i < S->n; i++) if (S->src[i].phase_onfly > rmax) rmax = S->src[i].phase_onfly;
@@ -3646,7 +3670,7 @@ int cmd_train(int argc, char **argv) {
         mesh_codes_gpu_config(opt_atoi("--onfly-gpu", opt(argc, argv, "--onfly-gpu", "0")));   /* the mesh codes stamp ("onfly": {"meshes"}) on the same device (-1 the CPU) */
         int nink = 0; for (int i = 0; i < S->n; i++) for (int c = 0; c < NTG; c++) nink += S->src[i].ink_fly[c] != nullptr;
         if (nink) {   /* "onfly" ink targets (inksplat.h inkfly_open): face + splat of a cold chunk on --onfly-gpu (per sampler thread a stream; -1 the CPU) */
-            const int og = opt_atoi("--ink-gpu", opt(argc, argv, "--ink-gpu", opt(argc, argv, "--onfly-gpu", "0"))); inkfly_gpu_config(og);   /* (--ink-gpu: as --fibre-gpu) */
+            const int og = opt_atoi("--ink-gpu", opt(argc, argv, "--ink-gpu", opt(argc, argv, "--onfly-gpu", "0"))); inkfly_gpu_config(og); g_ink_dev = og;   /* (--ink-gpu: as --fibre-gpu) */
             fprintf(stderr, "train: on-the-fly ink targets (%d) computed on %s %d (cached per 128^3 chunk: memory + %s)\n", nink, og >= 0 ? "GPU" : "CPU", og,
                     dcache_default_dir() ? dcache_default_dir() : "no disk cache"); ONFLY_MEM("the ink targets");
         }
@@ -4470,8 +4494,17 @@ int cmd_train(int argc, char **argv) {
             }
             if (g_hs_tcache && g_unwrap2 && g_side == 2 && B == 1) {   /* --hs-tcache: its bytes stay out of the plan's budget (allocated at the first training step) */
                 const size_t tcr = ((size_t)g_Pz + 128) * P * P * ((size_t)g_side_nc + 1 + (g_rv ? 3 : 0) + 8);   /* (+ 128 planes: the last slab's rounding at any slab depth in use) */
-                fmin = fmin > tcr ? fmin - tcr : 0;
+                fmin = fmin > tcr ? fmin - tcr : 0; g_tc_reserve = tcr;
                 fprintf(stderr, "memory: --hs-tcache keeps %.2f GB free for the head slabs' derived targets (%d B a voxel)\n", tcr / 1e9, g_side_nc + 1 + (g_rv ? 3 : 0) + 8);
+            }
+            if (g_ink_dev >= 0 && inkfly_gpu_budget && inkfly_gpu_set_reserve) {   /* the on-the-fly ink chunks on a training card: their budget stays
+                out of the plan (2026-11-20 FR1: planned to the last GB, every chunk went to the CPU, 25 % of the sampler's CPU), with a small reserve beside */
+                int same = 0; for (int g = 0; g < ng; g++) same |= nn_dev_phys(G[g].dev) == nn_dev_phys(g_ink_dev);
+                if (same) {
+                    const size_t ib = inkfly_gpu_budget(), rs = (size_t)256 << 20; fmin = fmin > ib + rs ? fmin - ib - rs : 0; inkfly_gpu_set_reserve(rs);
+                    fprintf(stderr, "memory: the on-the-fly ink on training GPU %d keeps %.2f GB free (its UFSM_INKFLY_GPU_MB budget %.2f GB + %.2f GB reserve)\n",
+                            g_ink_dev, (ib + rs) / 1e9, ib / 1e9, rs / 1e9);
+                }
             }
             const shape5 xs = g_lat ? (shape5){B, cfg.cin, g_Pz / 4, P / 4, P / 4} : g_half ? (shape5){B, cfg.cin, P / g_hdiv, P / g_hdiv, P / g_hdiv} : (shape5){B, cfg.cin, split ? g_Dl : g_Pz, P, P};   /* split: this GPU's slab of the window */
             const size_t p3 = p3l;
@@ -5302,6 +5335,12 @@ int cmd_train(int argc, char **argv) {
     }
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
     int prof = ufsm_env_on("UFSM_PROF");
+    if (g_ink_dev >= 0 && inkfly_gpu_budget_from_free) {   /* the on-the-fly ink's budget from what the plan left (the first step's lazy
+        buffers kept back: MIL, --val-P, --hs-tcache, when the ink shares a training card), not the fixed 1024 MiB (2026-11-20 FR1) */
+        int same = 0; for (int g = 0; g < ng; g++) same |= nn_dev_phys(G[g].dev) == nn_dev_phys(g_ink_dev);
+        const size_t keep = ((size_t)256 << 20) + (same ? g_mil_reserve + g_val_reserve + g_tc_reserve : 0), b = inkfly_gpu_budget_from_free(keep);
+        if (b) fprintf(stderr, "memory: the on-the-fly ink's GPU budget %.2f GB on GPU %d (its free memory less %.2f GB kept)\n", b / 1e9, g_ink_dev, keep / 1e9);
+    }
     double t0 = now(), tlog = t0, wait = 0, gate = 0, acc_active = 0, acc_loss = 0, acc_bce = 0, acc_dice = 0, acc_g = 0; int nacc = 0;
     if (seconds) fprintf(stderr, "training budget %.1fs, time-based warmup %.1fs\n", seconds, warmup_seconds);
     if (schedule_seconds) fprintf(stderr,"wall-time LR horizon %.1fs, elapsed %.1fs, warmup %.1fs; finite cover/ramp origin preserved\n",schedule_seconds,schedule_elapsed,warmup_seconds);

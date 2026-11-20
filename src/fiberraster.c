@@ -15,6 +15,7 @@
    --extra takes up to 4 comma-separated AFVs (2026-11-11): an entry is in the CT's own level-0 voxels, or, suffixed "@map", in the
    --map's coarse frame (e.g. Paris 4: the 2023 all-lengths tracing through the reg map plus the native 2.4 um Paris4_v1 chains).
    Shards (--shard^3) are independent; --zband limits the z range written (level voxels, widened to whole shards). CPU. */
+#include "defaulted.h"
 #include <math.h>
 #include "optcheck.h"
 #include <pthread.h>
@@ -169,6 +170,12 @@ static int fr_box(fr_job *J, const int64_t so[3], const int64_t n[3], uint8_t *d
         for (int64_t z0 = 0; z0 < n[0] && gok; z0 += zs) {
             const int64_t so2[3] = {so[0] + z0, so[1], so[2]}, n2[3] = {z0 + zs < n[0] ? zs : n[0] - z0, n[1], n[2]}; const size_t off = (size_t)z0 * pl;
             if (fibre_gpu_box(t_st.s, t_st.n, so2, n2, R, J->rad + J->guard, cr, cg, J->ring > 0, have_ct ? ct + off : nullptr, J->iso, J->piso, o0 + off, o1 + off)) gok = 0;
+        }
+        if (!gok) {   /* (this box on the CPU: same bytes, slower; was silent until 2026-11-20, latcodec's laptop run spent its CPU here) */
+            static _Atomic long nfb;   /* mgpu: process (atomic) */
+            const long k = atomic_fetch_add(&nfb, 1) + 1;
+            if (k == 1) UFSM_DEFAULTED("fibre planes = the CPU for boxes the GPU path refused (%lldx%lldx%lld box, %ld steps: device memory or size)", (long long)n[0], (long long)n[1], (long long)n[2], t_st.n);
+            else if (k % 1000 == 0) fprintf(stderr, "fibre planes: %ld boxes on the CPU (the GPU path refused them)\n", k);
         }
     }
     if (gok) {

@@ -145,6 +145,14 @@ int main(int argc, char **argv) {
     CHECK(!sh("%s train %s/fx/sources-mil.json --out %s/c --steps 4 --ink-mil 1 --ink-mil-mode 0 --ink-mil-max 64 %s > %s/c.log 2>&1", U, d, d, common, d), "train --ink-mil-max 64 (%s/c.log)", d);
     CHECK(!sh("grep -q '^memory: --ink-mil keeps [0-9.]* GB free for its buffers (64 rays' %s/c.log && ! grep -q 'ink mil: WARNING its buffers reached' %s/c.log", d, d),
           "--ink-mil-max 64: no reservation line, or the buffers outgrew it (%s/c.log)", d);
+    /* the on-the-fly ink and --ct-gpu-decode on the training card (2026-11-20 FR1: the plan took the card, every ink chunk and (on an
+       invisible device) the CT decode ran on the CPU): the planner keeps the ink's budget free and plans after the decoder's buffers exist */
+    CHECK(!sh("UFSM_MEM_DRY=1 %s train %s/fx/sources-mil.json --out %s/e --steps 2 --ct-gpu-decode 0 --ink-gpu 0 %s > %s/e.log 2>&1", U, d, d, common, d), "dry plan (%s/e.log)", d);
+    CHECK(!sh("grep -q '^memory: the on-the-fly ink on training GPU 0 keeps 1.34 GB free' %s/e.log && grep -q '^gpudec: [0-9.]* GB of device buffers on GPU 0' %s/e.log "
+              "&& grep -q '^memory: [0-9.]* GB free on the device after the CT decode buffers' %s/e.log && ! grep -q '^DEFAULTED' %s/e.log", d, d, d, d),
+          "no ink reservation / CT decode buffer lines, or a DEFAULTED line (%s/e.log)", d);
+    CHECK(!sh("grep -q \"^memory: the on-the-fly ink's GPU budget [0-9.]* GB on GPU 0\" %s/d.log && ! grep -q '^DEFAULTED: inkfly' %s/d.log", d, d),
+          "the ink's budget was not sized from the free memory, or chunks fell to the CPU (%s/d.log)", d);
     /* the loss bookkeeping: lr 0, same seed: the step-1 loss of --ink-mil 1 = that of --ink-mil 0 + the mil term */
     CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/b1 --steps 1 --lr 0 --muon-lr 0 --ink-mil 1 --ink-mil-mode 0 %s > %s/b1.log 2>&1", U, d, d, common, d), "b1");
     CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/b0 --steps 1 --lr 0 --muon-lr 0 %s > %s/b0.log 2>&1", U, d, d, common, d), "b0");
