@@ -21,6 +21,8 @@
    signals: recto-ruler's "peaks of the fused signal", one per sheet where the side runs alternate). */
 #include "fit.h"
 #include "latfit.h"
+#include "lcodec.h"
+#include "volcomp.h"
 #include "optcheck.h"
 #include "sysinfo.h"
 #include "store.h"
@@ -47,6 +49,7 @@ typedef struct {
     z3 *ct, *cd, *cl, **rvz, **fhz, **fvz; int plocal; double ctum, cum, clum, bum, rvthr, fthr, fmar, sig;
     const gt_box *bx; int nbox, nz, nth;
     const lat_basis *lb; int lc; double lstep, lcen, lsc;   /* --lat-rt: the CT through the latent cell codec first */
+    const lcodec *lcd; double vcq;   /* --lat-codec: the learned codec instead (on --lat-rt's basis); --vc-rt Q: plain volcomp at quality Q instead */
     gt_row **rows; int *nrow, *cap;   /* per job */
     pthread_mutex_t mu; int done; char err[256];
 } gt_job;
@@ -140,6 +143,54 @@ static int lat_rt(const gt_job *J, int64_t zn, int64_t Y0, int64_t X0, int H, in
     free(b); return 0;
 }
 
+/* --lat-codec FILE: plane zn through the learned codec (lcodec.h): every 4^3 cell's indices from its 3^3 neighbourhood (the encoder side
+   reads the planes around), rebuilt by the decoder (tier a: the linear rows; tier b: + the nonlinear term) */
+static int lcd_rt(const gt_job *J, int64_t zn, int64_t Y0, int64_t X0, int H, int W, float *ct) {
+    const lcodec *L = J->lcd; const int64_t zc = (zn & ~(int64_t)3) - 4, yc = (Y0 & ~(int64_t)3) - 4, xc = (X0 & ~(int64_t)3) - 4; const int dz = (int)(zn - zc - 4);
+    const int HH = (int)(((Y0 + H + 3) & ~(int64_t)3) + 4 - yc), WW = (int)(((X0 + W + 3) & ~(int64_t)3) + 4 - xc), ny = HH / 4, nx = WW / 4;
+    uint8_t *b = malloc((size_t)12 * HH * WW); float *xg = malloc(sizeof(float) * 64 * 3 * (size_t)ny * nx); uint8_t *anyc = malloc((size_t)3 * ny * nx);
+    if (!b || !xg || !anyc) { free(b); free(xg); free(anyc); return 1; }
+    for (int k = 0; k < 12; k++) if (rd(J->ct, zc + k, yc, xc, HH, WW, b + (size_t)k * HH * WW)) { free(b); free(xg); free(anyc); return 1; }
+    for (int cz = 0; cz < 3; cz++) for (int cy = 0; cy < ny; cy++) for (int cx = 0; cx < nx; cx++) {
+        float v[64]; int a = 0; const size_t ci = ((size_t)cz * ny + cy) * nx + cx;
+        for (int k = 0; k < 64; k++) { const uint8_t u = b[((size_t)(4 * cz + (k >> 4)) * HH + 4 * cy + (k >> 2 & 3)) * WW + 4 * cx + (k & 3)]; v[k] = u; a |= u; }
+        anyc[ci] = a != 0;
+        for (int j = 0; j < 64; j++) { float s = 0.f; for (int k = 0; k < 64; k++) s += J->lb->b[j][k] * v[k]; xg[ci * 64 + j] = s / L->sd_ref; }
+    }
+    float f[LCD_NF], cx_[LCD_NCX]; int16_t q[64]; uint8_t r[64];
+    for (int cy = 1; cy < ny - 1; cy++) for (int cx = 1; cx < nx - 1; cx++) {
+        const size_t ci = ((size_t)ny + cy) * nx + cx;
+        lcodec_feat(L, xg, 3, ny, nx, 1, cy, cx, f); lcodec_encode_cell(L, f, xg + ci * 64, anyc[ci], q);
+        lcodec_ctx(L, f, xg[ci * 64], cx_); lcodec_rebuild(L, J->lb, q, cx_, r);
+        for (int k = 16 * dz; k < 16 * dz + 16; k++) {
+            const int64_t y = yc + 4 * cy + (k >> 2 & 3) - Y0, x = xc + 4 * cx + (k & 3) - X0;
+            if (y >= 0 && y < H && x >= 0 && x < W) ct[y * W + x] = r[k];
+        }
+    }
+    free(b); free(xg); free(anyc); return 0;
+}
+/* --vc-rt Q: plane zn as plain volcomp at quality Q stores it: the 128^3 chunks (global grid) under the plane encoded and decoded */
+static int vc_rt(const gt_job *J, int64_t zn, int64_t Y0, int64_t X0, int H, int W, float *ct) {
+    const z3_meta *m = z3_meta_of(J->ct); const int64_t z0 = zn & ~(int64_t)127;
+    uint8_t *ch = malloc(1 << 21), *rb = malloc(1 << 21), *enc = malloc(VOLCOMP_ENCODE_BOUND); int rc = 0;
+    if (!ch || !rb || !enc) { free(ch); free(rb); free(enc); return 1; }
+    for (int64_t y0 = Y0 & ~(int64_t)127; y0 < Y0 + H && !rc; y0 += 128) for (int64_t x0 = X0 & ~(int64_t)127; x0 < X0 + W && !rc; x0 += 128) {
+        memset(ch, 0, 1 << 21);
+        const int64_t o[3] = {z0, y0 < 0 ? 0 : y0, x0 < 0 ? 0 : x0}, n[3] = {z0 + 128 > m->shape[0] ? m->shape[0] - z0 : 128,
+                          (y0 + 128 > m->shape[1] ? m->shape[1] : y0 + 128) - o[1], (x0 + 128 > m->shape[2] ? m->shape[2] : x0 + 128) - o[2]};
+        if (n[0] > 0 && n[1] > 0 && n[2] > 0) {
+            uint8_t *t = malloc((size_t)(n[0] * n[1] * n[2])); if (!t || z3_read(J->ct, o, n, t, 1)) { free(t); rc = 1; break; }
+            for (int64_t a = 0; a < n[0]; a++) for (int64_t b = 0; b < n[1]; b++) memcpy(ch + ((size_t)a * 128 + (size_t)(o[1] - y0 + b)) * 128 + (size_t)(o[2] - x0), t + ((size_t)a * n[1] + b) * n[2], (size_t)n[2]);
+            free(t);
+        }
+        size_t len = 0;
+        if (volcomp_encode(ch, (float)J->vcq, enc, VOLCOMP_ENCODE_BOUND, &len) != VOLCOMP_OK || volcomp_decode(enc, len, rb, 1 << 21) != VOLCOMP_OK) { rc = 1; break; }
+        const uint8_t *pl = rb + (size_t)(zn - z0) * 128 * 128;
+        for (int yy = 0; yy < 128; yy++) for (int xx = 0; xx < 128; xx++) { const int64_t y = y0 + yy - Y0, x = x0 + xx - X0; if (y >= 0 && y < H && x >= 0 && x < W) ct[y * W + x] = pl[yy * 128 + xx]; }
+    }
+    free(ch); free(rb); free(enc); return rc;
+}
+
 static void gt_plane(void *ctx, int a0, int a1, int t) {
     gt_job *J = ctx; (void)t;
     for (int job = a0; job < a1; job++) {
@@ -165,7 +216,8 @@ static void gt_plane(void *ctx, int a0, int a1, int t) {
         const double cy = (sy / nm + 0.5) / f2 - 0.5, cx = (sx / nm + 0.5) / f2 - 0.5, cyl = cy - y0, cxl = cx - x0;
         float *ct = malloc(sizeof(float) * (size_t)H * W), *rvf = rvb ? malloc(sizeof(float) * (size_t)H * W) : nullptr, *fhf = fhb ? malloc(sizeof(float) * (size_t)H * W) : nullptr, *fvf = fhb ? malloc(sizeof(float) * (size_t)H * W) : nullptr;
         for (size_t i = 0; i < (size_t)H * W; i++) { ct[i] = ctb[i]; if (rvf) rvf[i] = rvb[i]; if (fhf) { fhf[i] = fhb[i]; fvf[i] = fvb[i]; } }
-        if (J->lb && lat_rt(J, zn, Y0, X0, H, W, ct)) { pthread_mutex_lock(&J->mu); snprintf(J->err, sizeof J->err, "box %s z %lld: --lat-rt read: %s", B->name, (long long)zn, z3_error()); pthread_mutex_unlock(&J->mu); }
+        if ((J->vcq > 0 ? vc_rt(J, zn, Y0, X0, H, W, ct) : J->lcd ? lcd_rt(J, zn, Y0, X0, H, W, ct) : 0) ) { pthread_mutex_lock(&J->mu); snprintf(J->err, sizeof J->err, "box %s z %lld: --lat-codec / --vc-rt read", B->name, (long long)zn); pthread_mutex_unlock(&J->mu); }
+        else if (!J->lcd && J->vcq <= 0 && J->lb && lat_rt(J, zn, Y0, X0, H, W, ct)) { pthread_mutex_lock(&J->mu); snprintf(J->err, sizeof J->err, "box %s z %lld: --lat-rt read: %s", B->name, (long long)zn, z3_error()); pthread_mutex_unlock(&J->mu); }
         const size_t qn = (size_t)QH * QW; float *lab = malloc(sizeof(float) * qn), *gy = malloc(sizeof(float) * qn), *gx = malloc(sizeof(float) * qn), *jyy = malloc(sizeof(float) * qn), *jxx = malloc(sizeof(float) * qn), *jyx = malloc(sizeof(float) * qn);
         for (size_t i = 0; i < qn; i++) lab[i] = cdb[i] > 0;
         gauss2(lab, QH, QW, 1.0); sobel(lab, QH, QW, 0, gy); sobel(lab, QH, QW, 1, gx);
@@ -243,7 +295,7 @@ int cmd_gt_trans(int argc, char **argv) {
     if (argc < 14) {
         fprintf(stderr, "usage: ufsm gt-trans ROOT CTKEY CTUM CODEROOT CODEKEY CODEUM CENTREKEY CENTREUM BOXES_TSV SCROLL BOXUM OUT.tsv [--nz 8] [--nth 360]\n"
                         "                     [--rv ROOT KEY] [--fh ROOT KEY --fv ROOT KEY] [--rv-thr 8] [--fib-thr 8] [--fib-margin 4] [--ct-sig 1.2] [--threads N]\n"
-                        "                     [--lat-rt BASIS.lcb --lat-c 29 --lat-step 0.25 --lat-norm CENTRE,SCALE]\n"
+                        "                     [--lat-rt BASIS.lcb --lat-c 29 --lat-step 0.25 --lat-norm CENTRE,SCALE [--lat-codec CODEC.lcd]] [--vc-rt Q]\n"
                         "  CT peaks, recto / verso and fibre-direction flips per GT turn by normal gap (src/gttrans.c)\n");
         return 2;
     }
@@ -261,6 +313,13 @@ int cmd_gt_trans(int argc, char **argv) {
         if (!nm || sscanf(nm, "%lf,%lf", &J.lcen, &J.lsc) != 2 || J.lsc <= 0) { fprintf(stderr, "gt-trans: --lat-rt needs --lat-norm CENTRE,SCALE (predict's --scan-norm line)\n"); return 1; }
         fprintf(stderr, "gt-trans: CT through the latent codec: %d coefficients of %s, step %g, norm (v - %g) / %g\n", J.lc, lbp, J.lstep, J.lcen, J.lsc);
     }
+    const char *lcp = gt_opt(argc, argv, "--lat-codec", nullptr); J.vcq = opt_atof("--vc-rt", gt_opt(argc, argv, "--vc-rt", "0"));
+    if (lcp) {
+        if (!J.lb) { fprintf(stderr, "gt-trans: --lat-codec needs --lat-rt BASIS (its KLT frame)\n"); return 1; }
+        lcodec *L = malloc(sizeof *L); if (lcodec_read(L, lcp)) { fprintf(stderr, "gt-trans: --lat-codec: cannot read %s\n", lcp); return 1; }
+        J.lcd = L; fprintf(stderr, "gt-trans: CT through the learned codec %s (cl %d, hid2 %d, mean step %.3f x sd %.2f)\n", lcp, L->cl, L->hid2, L->mstep, L->sd_ref);
+    }
+    if (J.vcq > 0) fprintf(stderr, "gt-trans: CT through volcomp q %g\n", J.vcq);
     if (!(J.ct = gt_open(argv[2], argv[3])) || !(J.cd = gt_open(argv[5], argv[6])) || !(J.cl = gt_open(argv[2], argv[8]))) return 1;
     const char *rr = gt_opt2(argc, argv, "--rv", 0), *rk = gt_opt2(argc, argv, "--rv", 1), *hr = gt_opt2(argc, argv, "--fh", 0), *hk = gt_opt2(argc, argv, "--fh", 1),
                *vr = gt_opt2(argc, argv, "--fv", 0), *vk = gt_opt2(argc, argv, "--fv", 1);

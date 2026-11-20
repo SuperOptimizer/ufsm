@@ -5,28 +5,31 @@
 #include <stdlib.h>
 #include <string.h>
 
-lcodec_off lcodec_offs(int cl, int hid) {
+lcodec_off lcodec_offs(int cl, int hid, int hid2) {
     const size_t K = (size_t)cl - 1; lcodec_off o;
     o.Wl = 0; o.W1 = K * LCD_NAX; o.b1 = o.W1 + (size_t)hid * LCD_NF; o.W2 = o.b1 + (size_t)hid; o.S = o.W2 + K * (size_t)hid; o.lb = o.S + K * LCD_NAX;
+    o.V1 = o.lb + K; o.c1 = o.V1 + (size_t)hid2 * (K + LCD_NCX); o.V2 = o.c1 + (size_t)hid2; o.end = o.V2 + (size_t)LCD_NAX * hid2;
     return o;
 }
-size_t lcodec_np(int cl, int hid) { return lcodec_offs(cl, hid).lb + (size_t)cl - 1; }
+size_t lcodec_np(int cl, int hid, int hid2) { return lcodec_offs(cl, hid, hid2).end; }
 static double gauss(uint64_t *s) {   /* Box-Muller on a splitmix stream */
     double u[2];
     for (int i = 0; i < 2; i++) { uint64_t z = (*s += 0x9E3779B97F4A7C15ull); z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= z >> 31;
                                   u[i] = ((double)(z >> 11) + 0.5) * 0x1p-53; }
     return sqrt(-2 * log(u[0])) * cos(6.283185307179586 * u[1]);
 }
-int lcodec_init(lcodec *lc, int cl, int hid, float sd_ref, float s0, const float *sigma, float mean_c, uint64_t seed) {
+int lcodec_init(lcodec *lc, int cl, int hid, int hid2, float sd_ref, float s0, const float *sigma, float mean_c, uint64_t seed) {
     memset(lc, 0, sizeof *lc);
-    if (cl < 2 || cl > 64 || hid < 1 || hid > 256 || !(s0 > 0) || !(sd_ref > 0)) return -1;
-    lc->cl = cl; lc->hid = hid; lc->sd_ref = sd_ref; lc->mstep = s0; lc->mean_c = mean_c; lc->np = lcodec_np(cl, hid);
+    if (cl < 2 || cl > 64 || hid < 1 || hid > 256 || hid2 < 0 || hid2 > 256 || !(s0 > 0) || !(sd_ref > 0)) return -1;
+    lc->cl = cl; lc->hid = hid; lc->hid2 = hid2; lc->sd_ref = sd_ref; lc->mstep = s0; lc->mean_c = mean_c; lc->np = lcodec_np(cl, hid, hid2);
     lc->p = calloc(lc->np, sizeof *lc->p); if (!lc->p) return -1;
-    const lcodec_off o = lcodec_offs(cl, hid); const int K = cl - 1;
+    const lcodec_off o = lcodec_offs(cl, hid, hid2); const int K = cl - 1;
     for (int c = 0; c < K; c++) { lc->p[o.Wl + (size_t)c * LCD_NAX + c] = 1.f / s0; lc->p[o.S + (size_t)c * LCD_NAX + c] = s0;
                                   lc->p[o.lb + c] = logf(fmaxf(sigma ? sigma[c + 1] : 1.f, 1e-3f) / s0); }
     const double sw = 1 / sqrt((double)LCD_NF);
     for (size_t i = 0; i < (size_t)hid * LCD_NF; i++) lc->p[o.W1 + i] = (float)(sw * gauss(&seed));
+    const double sv = 1 / sqrt((double)(K + LCD_NCX));
+    for (size_t i = 0; i < (size_t)hid2 * (K + LCD_NCX); i++) lc->p[o.V1 + i] = (float)(sv * gauss(&seed));
     return 0;
 }
 void lcodec_free(lcodec *lc) { free(lc->p); memset(lc, 0, sizeof *lc); }
@@ -45,7 +48,7 @@ void lcodec_feat(const lcodec *lc, const float *xg, int n0, int n1, int n2, int 
 }
 static inline float silu(float a) { return a / (1.f + expf(-a)); }
 void lcodec_analysis(const lcodec *lc, const float *f, const float *x, float *y) {
-    const lcodec_off o = lcodec_offs(lc->cl, lc->hid); const int K = lc->cl - 1, Hd = lc->hid; float h[256];
+    const lcodec_off o = lcodec_offs(lc->cl, lc->hid, lc->hid2); const int K = lc->cl - 1, Hd = lc->hid; float h[256];
     for (int k = 0; k < Hd; k++) { const float *w = lc->p + o.W1 + (size_t)k * LCD_NF; float a = lc->p[o.b1 + k]; for (int j = 0; j < LCD_NF; j++) a += w[j] * f[j]; h[k] = silu(a); }
     for (int c = 0; c < K; c++) { const float *wl = lc->p + o.Wl + (size_t)c * LCD_NAX, *w2 = lc->p + o.W2 + (size_t)c * Hd; float s = 0;
                                   for (int j = 0; j < LCD_NAX; j++) s += wl[j] * x[1 + j];
@@ -60,6 +63,30 @@ void lcodec_encode_cell(const lcodec *lc, const float *f, const float *x, int an
     float m = rintf(x[0] / lc->mstep); m = m < 0 ? 0 : m > 32767 ? 32767 : m;
     q[0] = (int16_t)lv_fwd_mean((int)m, nz);
 }
+static inline float qmean(float x0, float ms) { float m = rintf(x0 / ms); return m < 0 ? 0 : m > 32767 ? 32767 : m; }
+void lcodec_ctx(const lcodec *lc, const float *f, float x0, float *ctx) {
+    const float ms = lc->mstep, m = qmean(x0, ms);
+    ctx[0] = 0.125f * ms * m - lc->mean_c;
+    for (int i = 0; i < 26; i++) ctx[1 + i] = 0.125f * ms * (qmean(x0 + 8.f * f[64 + 4 * i], ms) - m);
+}
+/* tier b's term: h2 = silu(V1 d + c1), d = [yq, ctx]; t [63] = V2 h2 */
+static void tierb(const lcodec *lc, const float *yq, const float *ctx, float *a2, float *h2, float *t) {
+    const lcodec_off o = lcodec_offs(lc->cl, lc->hid, lc->hid2); const int K = lc->cl - 1, ND = K + LCD_NCX;
+    for (int k = 0; k < lc->hid2; k++) { const float *w = lc->p + o.V1 + (size_t)k * ND; float s = lc->p[o.c1 + k];
+        for (int j = 0; j < K; j++) s += w[j] * yq[j];
+        for (int j = 0; j < LCD_NCX; j++) s += w[K + j] * ctx[j];
+        a2[k] = s; h2[k] = s / (1.f + expf(-s)); }
+    for (int j = 0; j < LCD_NAX; j++) { const float *w = lc->p + o.V2 + (size_t)j * lc->hid2; float s = 0; for (int k = 0; k < lc->hid2; k++) s += w[k] * h2[k]; t[j] = s; }
+}
+void lcodec_rebuild(const lcodec *lc, const lat_basis *lb, const int16_t *q, const float *ctx, uint8_t *v) {
+    if (!q[0]) { memset(v, 0, 64); return; }
+    const lcodec_off o = lcodec_offs(lc->cl, lc->hid, lc->hid2); const int K = lc->cl - 1; float xr[LCD_NAX], yq[64], a2[256], h2[256], t[LCD_NAX];
+    for (int c = 0; c < K; c++) yq[c] = q[1 + c];
+    for (int j = 0; j < LCD_NAX; j++) { float s = 0; for (int c = 0; c < K; c++) s += lc->p[o.S + (size_t)c * LCD_NAX + j] * yq[c]; xr[j] = s; }
+    if (lc->hid2) { tierb(lc, yq, ctx, a2, h2, t); for (int j = 0; j < LCD_NAX; j++) xr[j] += t[j]; }
+    for (int k = 0; k < 64; k++) { double s = (double)q[0] * lc->mstep * lb->b[0][k]; for (int j = 0; j < LCD_NAX; j++) s += (double)xr[j] * lb->b[1 + j][k];
+        const double b = rint(s * lc->sd_ref); v[k] = (uint8_t)(b < 1 ? 1 : b > 255 ? 255 : b); }
+}
 /* -log2 of the Laplace(0, b) mass of [t - 1/2, t + 1/2] and its derivatives in t and in log b */
 static inline double lap_F(double t, double b) { return t >= 0 ? 1 - 0.5 * exp(-t / b) : 0.5 * exp(t / b); }
 static inline double lap_f(double t, double b) { return exp(-fabs(t) / b) / (2 * b); }
@@ -71,7 +98,7 @@ static double lap_bits(double t, double b, double *dt, double *dlb) {
     return -log2(P);
 }
 double lcodec_loss_grad(const lcodec *lc, int n, const float *f, const float *x, const float *u, double lambda, float *g, double *R, double *D) {
-    const lcodec_off o = lcodec_offs(lc->cl, lc->hid); const int K = lc->cl - 1, Hd = lc->hid; const double sd2 = (double)lc->sd_ref * lc->sd_ref, inv = 1.0 / n;
+    const lcodec_off o = lcodec_offs(lc->cl, lc->hid, lc->hid2); const int K = lc->cl - 1, Hd = lc->hid, H2 = lc->hid2; const double sd2 = (double)lc->sd_ref * lc->sd_ref, inv = 1.0 / n;
     double Rs = 0, Ds = 0; float a[256], h[256], yt[64], dy[64], dh[256];
     const float *Wl = lc->p + o.Wl, *W1 = lc->p + o.W1, *b1 = lc->p + o.b1, *W2 = lc->p + o.W2, *S = lc->p + o.S, *lb = lc->p + o.lb;
     for (int i = 0; i < n; i++) {
@@ -86,11 +113,24 @@ double lcodec_loss_grad(const lcodec *lc, int n, const float *f, const float *x,
             double dt, dl; r += lap_bits(yt[c], exp(lb[c]), &dt, &dl);
             dy[c] = (float)(dt / 64 * inv); g[o.lb + c] += (float)(dl / 64 * inv);
         }
-        double e2 = 0; const double ce = 2 * lambda * sd2 / 64 * inv;
+        double e2 = 0; const double ce = 2 * lambda * sd2 / 64 * inv; float ctx[LCD_NCX], a2[256], h2[256], tb[LCD_NAX], ev[LCD_NAX];
+        if (H2) { lcodec_ctx(lc, fi, xi[0], ctx); tierb(lc, yt, ctx, a2, h2, tb); }
         for (int j = 0; j < LCD_NAX; j++) {
-            float xr = 0; for (int c = 0; c < K; c++) xr += S[(size_t)c * LCD_NAX + j] * yt[c];
-            const float e = xr - xi[1 + j]; e2 += (double)e * e;
+            float xr = H2 ? tb[j] : 0.f; for (int c = 0; c < K; c++) xr += S[(size_t)c * LCD_NAX + j] * yt[c];
+            const float e = xr - xi[1 + j]; e2 += (double)e * e; ev[j] = (float)(ce * e);
             for (int c = 0; c < K; c++) { dy[c] += (float)(ce * e * S[(size_t)c * LCD_NAX + j]); g[o.S + (size_t)c * LCD_NAX + j] += (float)(ce * e * yt[c]); }
+        }
+        if (H2) {   /* tier b's backward: V2, then through silu to V1, c1 and the noisy indices */
+            const int ND = K + LCD_NCX;
+            for (int k = 0; k < H2; k++) {
+                float dh2 = 0; for (int j = 0; j < LCD_NAX; j++) { dh2 += ev[j] * lc->p[o.V2 + (size_t)j * H2 + k]; g[o.V2 + (size_t)j * H2 + k] += ev[j] * h2[k]; }
+                const float sg = 1.f / (1.f + expf(-a2[k])), da = dh2 * sg * (1.f + a2[k] * (1.f - sg));
+                if (da == 0.f) continue;
+                const float *w = lc->p + o.V1 + (size_t)k * ND; float *gv = g + o.V1 + (size_t)k * ND;
+                for (int c = 0; c < K; c++) { gv[c] += da * yt[c]; dy[c] += da * w[c]; }
+                for (int j = 0; j < LCD_NCX; j++) gv[K + j] += da * ctx[j];
+                g[o.c1 + k] += da;
+            }
         }
         Rs += r / 64; Ds += e2 * sd2 / 64;
         for (int k = 0; k < Hd; k++) dh[k] = 0;
@@ -110,7 +150,7 @@ double lcodec_loss_grad(const lcodec *lc, int n, const float *f, const float *x,
     return (Rs + lambda * Ds) * inv;
 }
 int lcodec_lv(const lcodec *lc, const lat_basis *lb, const uint64_t (*hist)[LV_NSYM], lv_codec *out) {
-    const lcodec_off o = lcodec_offs(lc->cl, lc->hid); const int K = lc->cl - 1; float rows[64 * 64];
+    const lcodec_off o = lcodec_offs(lc->cl, lc->hid, lc->hid2); const int K = lc->cl - 1; float rows[64 * 64];
     for (int k = 0; k < 64; k++) rows[k] = lb->b[0][k];
     for (int c = 0; c < K; c++) for (int k = 0; k < 64; k++) {
         double s = 0; for (int j = 0; j < LCD_NAX; j++) s += (double)lc->p[o.S + (size_t)c * LCD_NAX + j] * lb->b[1 + j][k];
@@ -121,25 +161,27 @@ int lcodec_lv(const lcodec *lc, const lat_basis *lb, const uint64_t (*hist)[LV_N
 }
 int lcodec_write(const lcodec *lc, const char *path) {
     FILE *f = fopen(path, "wb"); if (!f) return -1;
-    const int32_t hd[2] = {lc->cl, lc->hid}; const float fl[3] = {lc->sd_ref, lc->mstep, lc->mean_c}; const uint64_t np = lc->np;
-    int ok = fwrite("LCD1", 1, 4, f) == 4 && fwrite(hd, 4, 2, f) == 2 && fwrite(fl, 4, 3, f) == 3 && fwrite(&np, 8, 1, f) == 1 && fwrite(lc->p, 4, lc->np, f) == lc->np;
+    const int32_t hd[3] = {lc->cl, lc->hid, lc->hid2}; const float fl[3] = {lc->sd_ref, lc->mstep, lc->mean_c}; const uint64_t np = lc->np; const int nh = lc->hid2 ? 3 : 2;
+    int ok = fwrite(lc->hid2 ? "LCD2" : "LCD1", 1, 4, f) == 4 && fwrite(hd, 4, (size_t)nh, f) == (size_t)nh && fwrite(fl, 4, 3, f) == 3 && fwrite(&np, 8, 1, f) == 1 && fwrite(lc->p, 4, lc->np, f) == lc->np;
     ok &= fclose(f) == 0;
     return ok ? 0 : -1;
 }
 int lcodec_read(lcodec *lc, const char *path) {
     memset(lc, 0, sizeof *lc); FILE *f = fopen(path, "rb"); if (!f) return -1;
-    char m[4]; int32_t hd[2]; float fl[3]; uint64_t np = 0;
-    int ok = fread(m, 1, 4, f) == 4 && !memcmp(m, "LCD1", 4) && fread(hd, 4, 2, f) == 2 && fread(fl, 4, 3, f) == 3 && fread(&np, 8, 1, f) == 1
-             && hd[0] >= 2 && hd[0] <= 64 && hd[1] >= 1 && hd[1] <= 256 && np == lcodec_np(hd[0], hd[1]);
-    if (ok) { lc->cl = hd[0]; lc->hid = hd[1]; lc->sd_ref = fl[0]; lc->mstep = fl[1]; lc->mean_c = fl[2]; lc->np = np; lc->p = malloc(np * 4); ok = lc->p && fread(lc->p, 4, np, f) == np; }
+    char m[4]; int32_t hd[3] = {0, 0, 0}; float fl[3]; uint64_t np = 0;
+    int ok = fread(m, 1, 4, f) == 4 && (!memcmp(m, "LCD1", 4) || !memcmp(m, "LCD2", 4));
+    const int nh = ok && m[3] == '2' ? 3 : 2;
+    ok = ok && fread(hd, 4, (size_t)nh, f) == (size_t)nh && fread(fl, 4, 3, f) == 3 && fread(&np, 8, 1, f) == 1
+         && hd[0] >= 2 && hd[0] <= 64 && hd[1] >= 1 && hd[1] <= 256 && hd[2] >= 0 && hd[2] <= 256 && np == lcodec_np(hd[0], hd[1], hd[2]);
+    if (ok) { lc->cl = hd[0]; lc->hid = hd[1]; lc->hid2 = hd[2]; lc->sd_ref = fl[0]; lc->mstep = fl[1]; lc->mean_c = fl[2]; lc->np = np; lc->p = malloc(np * 4); ok = lc->p && fread(lc->p, 4, np, f) == np; }
     fclose(f);
     if (!ok) { lcodec_free(lc); return -1; }
     return 0;
 }
 uint64_t lcodec_hash(const lcodec *lc) {
-    uint64_t h = 1469598103934665603ull; const int32_t hd[2] = {lc->cl, lc->hid}; const float fl[3] = {lc->sd_ref, lc->mstep, lc->mean_c};
+    uint64_t h = 1469598103934665603ull; const int32_t hd[3] = {lc->cl, lc->hid, lc->hid2}; const float fl[3] = {lc->sd_ref, lc->mstep, lc->mean_c};
 #define LCH(ptr, n) do { const uint8_t *b_ = (const uint8_t *)(ptr); for (size_t i_ = 0; i_ < (n); i_++) { h ^= b_[i_]; h *= 1099511628211ull; } } while (0)
-    LCH(hd, sizeof hd); LCH(fl, sizeof fl); LCH(lc->p, lc->np * 4);
+    LCH(hd, lc->hid2 ? sizeof hd : 2 * sizeof hd[0]); LCH(fl, sizeof fl); LCH(lc->p, lc->np * 4);
 #undef LCH
     return h;
 }

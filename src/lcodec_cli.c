@@ -9,6 +9,7 @@
 #include "optcheck.h"
 #include "store.h"
 #include "zarr3.h"
+#include "volcomp.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -65,7 +66,7 @@ static void chunk_ct(const uint8_t *ct, int g, uint8_t *o) {
     for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) memcpy(o + ((size_t)z * 128 + y) * 128, ct + ((size_t)((g >> 2) * 128 + z) * E + (g >> 1 & 1) * 128 + y) * E + (g & 1) * 128, 128);
 }
 /* score indices qb[b] [NCELL][C] of the evaluation boxes with codec rows of lc0 (tables refitted on them): bytes / voxel, PSNR */
-static int score(const lv_codec *lc0, const float *rows, int nb, int16_t **qb, uint8_t **ct, double *bpv, double *psnr) {
+static int score(const lv_codec *lc0, const float *rows, int nb, int16_t **qb, uint8_t **ct, uint8_t **rec, double *bpv, double *psnr) {   /* rec: the boxes' rebuilt bytes (tier b), else lv_inverse */
     const int C = lc0->C; uint64_t (*hist)[LV_NSYM] = calloc(LV_MAXC, sizeof *hist); int16_t *q = malloc((size_t)32768 * C * 2);
     uint8_t *ch = malloc(1 << 21), *rb = malloc(1 << 21), *enc = malloc(LV_CHUNK_BOUND); int rc = 0;
     for (int b = 0; b < nb; b++) for (int g = 0; g < 8; g++) { chunk_q(qb[b], C, g, q); lv_hist(lc0, q, hist); }
@@ -75,7 +76,8 @@ static int score(const lv_codec *lc0, const float *rows, int nb, int16_t **qb, u
         chunk_q(qb[b], C, g, q); size_t len = 0;
         if (lv_encode_chunk(&lc, q, enc, &len)) { rc = -1; break; }
         bytes += (double)len;
-        lv_inverse(&lc, q, rb); chunk_ct(ct[b], g, ch);
+        if (rec) chunk_ct(rec[b], g, rb); else lv_inverse(&lc, q, rb);
+        chunk_ct(ct[b], g, ch);
         for (int cz = 0; cz < 32; cz++) for (int cy = 0; cy < 32; cy++) for (int cx = 0; cx < 32; cx++) {
             int a = 0; double s = 0;
             for (int k = 0; k < 64; k++) { const size_t vi = ((size_t)(4 * cz + (k >> 4)) * 128 + 4 * cy + (k >> 2 & 3)) * 128 + 4 * cx + (k & 3); a |= ch[vi]; const double e = (double)rb[vi] - ch[vi]; s += e * e; }
@@ -89,18 +91,38 @@ out:
     return rc;
 }
 
+/* plain volcomp at quality qv on the evaluation boxes' 128^3 chunks: bytes / voxel, PSNR over the same cells */
+static int score_vc(float qv, int nb, uint8_t **ct, double *bpv, double *psnr) {
+    uint8_t *ch = malloc(1 << 21), *rb = malloc(1 << 21), *enc = malloc(VOLCOMP_ENCODE_BOUND); double bytes = 0, se = 0, n = 0; int rc = 0;
+    for (int b = 0; b < nb && !rc; b++) for (int g = 0; g < 8; g++) {
+        chunk_ct(ct[b], g, ch); size_t len = 0;
+        if (volcomp_encode(ch, qv, enc, VOLCOMP_ENCODE_BOUND, &len) != VOLCOMP_OK || volcomp_decode(enc, len, rb, 1 << 21) != VOLCOMP_OK) { rc = -1; break; }
+        bytes += (double)len;
+        for (int cz = 0; cz < 32; cz++) for (int cy = 0; cy < 32; cy++) for (int cx = 0; cx < 32; cx++) {
+            int a = 0; double s = 0;
+            for (int k = 0; k < 64; k++) { const size_t vi = ((size_t)(4 * cz + (k >> 4)) * 128 + 4 * cy + (k >> 2 & 3)) * 128 + 4 * cx + (k & 3); a |= ch[vi]; const double e = (double)rb[vi] - ch[vi]; s += e * e; }
+            if (a) { se += s; n += 64; }
+        }
+    }
+    free(ch); free(rb); free(enc);
+    *bpv = bytes / ((double)nb * E * E * E); *psnr = se > 0 ? 10 * log10(255.0 * 255.0 / (se / n)) : 99;
+    return rc;
+}
 typedef struct { const lcodec *lc; const float *f, *x, *u; int n; double lambda; float *g; double loss, R, D; } gjob;
 static void *grad_run(void *a) { gjob *j = a; j->loss = lcodec_loss_grad(j->lc, j->n, j->f, j->x, j->u, j->lambda, j->g, &j->R, &j->D); return nullptr; }
 
 int cmd_codec_fit(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: ufsm codec-fit BASIS.lcb ROOT CT-GROUP LEVEL [--cl 20 --hid 64 --lambda L --s0 1 --steps 3000 --batch 4096 --lr 0.002 --seed 1\n"
-                        "        --threads 16 --boxes 24 --out CODEC.lcd --eval CODEC.lcd --klt 13,20,29 --klt-steps 0.5,0.7,1,1.4,2,2.8 (none: -)]\n"
+                        "        --threads 16 --boxes 24 --out CODEC.lcd --eval CODEC.lcd --klt 13,20,29 --klt-steps 0.5,0.7,1,1.4,2,2.8 (none: -) --hid2 0 --volcomp Q,..]\n"
+                        "  --hid2 H: tier b, a nonlinear synthesis term (H hidden; not latvol rows). --volcomp: plain volcomp arms on the same boxes.\n"
                         "  stage 1 of the learned input codec: trains on the even sample boxes, scores it and the KLT ladder on the odd ones\n"
                         "  (real latvol stream bytes per voxel, PSNR). --eval: score a saved codec instead of training one.\n");
         return 2;
     }
     lat_basis lb; if (lat_basis_load(argv[2], &lb)) { fprintf(stderr, "codec-fit: cannot read %s\n", argv[2]); return 1; }
+    const int hid2 = opt_atoi("--hid2", opt(argc, argv, "--hid2", "0"));
+    const char *vcl = opt(argc, argv, "--volcomp", "-");
     const int cl = opt_atoi("--cl", opt(argc, argv, "--cl", "20")), hid = opt_atoi("--hid", opt(argc, argv, "--hid", "64")), steps = opt_atoi("--steps", opt(argc, argv, "--steps", "3000"));
     const int batch = opt_atoi("--batch", opt(argc, argv, "--batch", "4096")), nth = opt_atoi("--threads", opt(argc, argv, "--threads", "16")), nbox = opt_atoi("--boxes", opt(argc, argv, "--boxes", "24"));
     const double lambda = opt_atof("--lambda", opt(argc, argv, "--lambda", "0.01")), s0 = opt_atof("--s0", opt(argc, argv, "--s0", "1")), lr0 = opt_atof("--lr", opt(argc, argv, "--lr", "0.002"));
@@ -133,13 +155,19 @@ int cmd_codec_fit(int argc, char **argv) {
                     for (int g = 0; g < 8; g++) { chunk_ct(ct[ev[i]], g, ch); lv_forward(&lc, ch, q);
                         for (int zz = 0; zz < 32; zz++) for (int yy = 0; yy < 32; yy++) for (int xx = 0; xx < 32; xx++)
                             memcpy(qb[i] + ((size_t)(((g >> 2) * 32 + zz) * NCB + (g >> 1 & 1) * 32 + yy) * NCB + (g & 1) * 32 + xx) * C, q + ((size_t)(zz * 32 + yy) * 32 + xx) * C, (size_t)C * 2); } }
-                double bpv, ps_; if (!score(&lc, &lb.b[0][0], nev, qb, ctev, &bpv, &ps_)) printf("klt C %2d step %.3g: %.4f B/vox, PSNR %.2f dB\n", C, step, bpv, ps_);
+                double bpv, ps_; if (!score(&lc, &lb.b[0][0], nev, qb, ctev, nullptr, &bpv, &ps_)) printf("klt C %2d step %.3g: %.4f B/vox, PSNR %.2f dB\n", C, step, bpv, ps_);
                 for (int i = 0; i < nev; i++) free(qb[i]);
                 free(q); free(ch); lv_codec_free(&lc); fflush(stdout);
             }
             ps = strchr(ps, ','); if (!ps) break; ps++;
         }
         pc = strchr(pc, ','); if (!pc) break; pc++;
+    }
+    if (strcmp(vcl, "-")) for (const char *pv = vcl; *pv;) {
+        const double qv = atof(pv); double bpv, ps_;
+        if (!score_vc((float)qv, nev, ctev, &bpv, &ps_)) printf("volcomp q %g: %.4f B/vox, PSNR %.2f dB\n", qv, bpv, ps_);
+        fflush(stdout);
+        pv = strchr(pv, ','); if (!pv) break; pv++;
     }
     /* the learned codec: trained, or read */
     lcodec lc;
@@ -151,7 +179,7 @@ int cmd_codec_fit(int argc, char **argv) {
         for (int i = 0; i < ntr; i++) for (int c = 0; c < NCELL; c++) if (any[tr[i]][c]) { cand[ncand][0] = (uint32_t)tr[i]; cand[ncand++][1] = (uint32_t)c;
                 const float *x = xg[tr[i]] + (size_t)c * 64; for (int j = 0; j < 64; j++) ss[j] += (double)x[j] * x[j]; mc += 0.125 * x[0]; nm++; }
         for (int j = 1; j < 64; j++) sig[j] = (float)sqrt(ss[j] / (double)nm);
-        if (lcodec_init(&lc, cl, hid, (float)sd, (float)s0, sig, (float)(mc / (double)nm), seed)) { fprintf(stderr, "codec-fit: bad --cl / --hid / --s0\n"); return 2; }
+        if (lcodec_init(&lc, cl, hid, hid2, (float)sd, (float)s0, sig, (float)(mc / (double)nm), seed)) { fprintf(stderr, "codec-fit: bad --cl / --hid / --s0\n"); return 2; }
         const int K = cl - 1; const size_t np = lc.np;
         float *f = malloc((size_t)batch * LCD_NF * 4), *x = malloc((size_t)batch * 64 * 4), *u = malloc((size_t)batch * K * 4), *gt = calloc((size_t)nth * np, 4);
         double *m1 = calloc(np, 8), *m2 = calloc(np, 8); uint64_t rs = seed * 0x9E3779B97F4A7C15ull + 7;
@@ -176,7 +204,7 @@ int cmd_codec_fit(int argc, char **argv) {
             if (it % 250 == 0 || it == steps - 1) fprintf(stderr, "codec-fit: step %5d loss %.4f R %.4f bit/vox D %.3f (%.0f s)\n", it, ema, eR, eD, now() - t0);
         }
         /* the mean channel's step: the learned channels' median effective step (|S_c|), a uniform-step allocation */
-        { const lcodec_off o = lcodec_offs(cl, hid); float nr[64];
+        if (!hid2) { const lcodec_off o = lcodec_offs(cl, hid, 0); float nr[64];   /* (tier b keeps s0: its decoder context is the mean indices at that step) */
           for (int c = 0; c < K; c++) { double s = 0; for (int j = 0; j < LCD_NAX; j++) s += (double)lc.p[o.S + (size_t)c * LCD_NAX + j] * lc.p[o.S + (size_t)c * LCD_NAX + j]; nr[c] = (float)sqrt(s); }
           for (int a = 1; a < K; a++) for (int b = a; b > 0 && nr[b] < nr[b - 1]; b--) { const float t = nr[b]; nr[b] = nr[b - 1]; nr[b - 1] = t; }
           lc.mstep = nr[K / 2]; }
@@ -184,13 +212,16 @@ int cmd_codec_fit(int argc, char **argv) {
         if (out && lcodec_write(&lc, out)) { fprintf(stderr, "codec-fit: cannot write %s\n", out); return 1; }
     }
     { lv_codec lv; if (lcodec_lv(&lc, &lb, nullptr, &lv)) { fprintf(stderr, "codec-fit: the codec's synthesis does not fit latvol's rows\n"); return 1; }
-      float f[LCD_NF];
-      for (int i = 0; i < nev; i++) { const int b = ev[i]; qb[i] = malloc((size_t)NCELL * cl * 2);
-          for (int c = 0; c < NCELL; c++) { lcodec_feat(&lc, xg[b], NCB, NCB, NCB, c / (NCB * NCB), c / NCB % NCB, c % NCB, f); lcodec_encode_cell(&lc, f, xg[b] + (size_t)c * 64, any[b][c], qb[i] + (size_t)c * cl); } }
+      float f[LCD_NF], cx[LCD_NCX]; uint8_t *rec[64] = {nullptr}, v[64];
+      for (int i = 0; i < nev; i++) { const int b = ev[i]; qb[i] = malloc((size_t)NCELL * lc.cl * 2); if (lc.hid2) rec[i] = calloc((size_t)E * E * E, 1);
+          for (int c = 0; c < NCELL; c++) { const int z0 = c / (NCB * NCB), y0 = c / NCB % NCB, x0 = c % NCB; int16_t *q = qb[i] + (size_t)c * lc.cl;
+              lcodec_feat(&lc, xg[b], NCB, NCB, NCB, z0, y0, x0, f); lcodec_encode_cell(&lc, f, xg[b] + (size_t)c * 64, any[b][c], q);
+              if (lc.hid2) { lcodec_ctx(&lc, f, xg[b][(size_t)c * 64], cx); lcodec_rebuild(&lc, &lb, q, cx, v);
+                  for (int k = 0; k < 64; k++) rec[i][((size_t)(4 * z0 + (k >> 4)) * E + 4 * y0 + (k >> 2 & 3)) * E + 4 * x0 + (k & 3)] = v[k]; } } }
       double bpv, ps_;
-      if (!score(&lv, &lv.basis[0][0], nev, qb, ctev, &bpv, &ps_))
-          printf("learned cl %2d hid %d lambda %.4g: %.4f B/vox, PSNR %.2f dB (mean step %.3f x sd, hash %016llx)\n", cl, lc.hid, lambda, bpv, ps_, lc.mstep, (unsigned long long)lcodec_hash(&lc));
-      for (int i = 0; i < nev; i++) free(qb[i]);
+      if (!score(&lv, &lv.basis[0][0], nev, qb, ctev, lc.hid2 ? rec : nullptr, &bpv, &ps_))
+          printf("learned cl %2d hid %d hid2 %d lambda %.4g: %.4f B/vox, PSNR %.2f dB (mean step %.3f x sd, hash %016llx)\n", lc.cl, lc.hid, lc.hid2, lambda, bpv, ps_, lc.mstep, (unsigned long long)lcodec_hash(&lc));
+      for (int i = 0; i < nev; i++) { free(qb[i]); free(rec[i]); }
       lv_codec_free(&lv); }
     lcodec_free(&lc);
     for (int k = 0; k < ns; k++) { free(ct[k]); free(xg[k]); free(any[k]); }

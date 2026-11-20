@@ -15,18 +15,20 @@
 #include "latfit.h"
 #include "latvol.h"
 
-enum { LCD_NF = 63 + 1 + 26 * 4, LCD_NAX = 63 };
+enum { LCD_NF = 63 + 1 + 26 * 4, LCD_NAX = 63, LCD_NCX = 27 };
 typedef struct {
     int cl, hid;          /* channels (mean + cl - 1 learned, cl <= 64), hidden width */
+    int hid2;             /* > 0: tier b, a nonlinear synthesis term x += V2 silu(V1 [q, ctx] + c1) (ctx: lcodec_ctx, the decoded mean indices of the
+                             cell and its 26 neighbours); not latvol rows: rebuilt by lcodec_rebuild. 0: the linear synthesis alone */
     float sd_ref, mstep;  /* grey levels per x unit; the mean channel's step in x units (the store's step_raw = mstep sd_ref) */
     float mean_c;         /* the feature's mean centring (x units of the cell mean) */
-    size_t np; float *p;  /* Wl [K][63], W1 [hid][NF], b1 [hid], W2 [K][hid], S [K][63], lb [K]  (K = cl - 1) */
+    size_t np; float *p;  /* Wl [K][63], W1 [hid][NF], b1 [hid], W2 [K][hid], S [K][63], lb [K]  (K = cl - 1); tier b: V1 [hid2][K + NCX], c1 [hid2], V2 [63][hid2] */
 } lcodec;
-typedef struct { size_t Wl, W1, b1, W2, S, lb; } lcodec_off;
-lcodec_off lcodec_offs(int cl, int hid);
-size_t lcodec_np(int cl, int hid);
+typedef struct { size_t Wl, W1, b1, W2, S, lb, V1, c1, V2, end; } lcodec_off;
+lcodec_off lcodec_offs(int cl, int hid, int hid2);
+size_t lcodec_np(int cl, int hid, int hid2);
 /* init as the KLT at step s0 (x units): Wl = I / s0, S = I s0, W2 0, W1 ~ N(0, 1 / NF), lb = log(sigma / s0) (sigma: the axes' sd, x units) */
-int lcodec_init(lcodec *lc, int cl, int hid, float sd_ref, float s0, const float *sigma, float mean_c, uint64_t seed);
+int lcodec_init(lcodec *lc, int cl, int hid, int hid2, float sd_ref, float s0, const float *sigma, float mean_c, uint64_t seed);   /* tier b: V2 0 (= tier a) */
 void lcodec_free(lcodec *lc);
 /* the features of cell (z, y, x) of a grid of n0 x n1 x n2 cells, xg [cells][64] (x units); missing neighbours repeat the cell */
 void lcodec_feat(const lcodec *lc, const float *xg, int n0, int n1, int n2, int z, int y, int x, float *f);
@@ -34,12 +36,16 @@ void lcodec_feat(const lcodec *lc, const float *xg, int n0, int n1, int n2, int 
 void lcodec_analysis(const lcodec *lc, const float *f, const float *x, float *y);
 /* indices of a cell: q [cl] int16 (q[0] the mean, latvol's rules; all 0: air); any: the cell holds a nonzero byte */
 void lcodec_encode_cell(const lcodec *lc, const float *f, const float *x, int any, int16_t *q);
+/* tier b's decoder context of a cell from its features and mean coefficient: ctx [NCX] (x units; what a decoder knows from the mean indices) */
+void lcodec_ctx(const lcodec *lc, const float *f, float x0, float *ctx);
+/* the decoder: a cell's 64 bytes from its indices q [cl] and ctx (tier a: the float form of latvol's rows; 1..255, air 0) */
+void lcodec_rebuild(const lcodec *lc, const lat_basis *lb, const int16_t *q, const float *ctx, uint8_t *v);
 /* loss and gradient (added into g, scaled by 1 / n) of n cells: f [n][NF], x [n][64], u [n][cl - 1] the noise; returns the mean loss,
    *R bits / voxel and *D grey levels^2 / voxel (axes only) */
-double lcodec_loss_grad(const lcodec *lc, int n, const float *f, const float *x, const float *u, double lambda, float *g, double *R, double *D);
+double lcodec_loss_grad(const lcodec *lc, int n, const float *f, const float *x, const float *u, double lambda, float *g, double *R, double *D);   /* (tier b: ctx from f, x) */
 /* the store codec: latvol rows (row 0 the KLT mean row, rows c the synthesis), step mstep, the given histograms (nullptr: flat) */
 int lcodec_lv(const lcodec *lc, const lat_basis *lb, const uint64_t (*hist)[LV_NSYM], lv_codec *out);
-/* file: "LCD1", cl, hid, sd_ref, mstep, mean_c, np, params (little endian) */
+/* file: "LCD1", cl, hid, sd_ref, mstep, mean_c, np, params (little endian); "LCD2" (tier b): hid2 after hid */
 int lcodec_write(const lcodec *lc, const char *path);
 int lcodec_read(lcodec *lc, const char *path);
 /* a hash of the codec (the checkpoint's lat_codec): FNV-1a 64 over the file bytes' fields */
