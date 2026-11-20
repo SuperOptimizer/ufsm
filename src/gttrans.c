@@ -24,7 +24,7 @@
    integration RHO, CT voxels) of the CT (--orient-ct: another store on its grid) projected on the plane spanned by z (the scroll axis,
    taken as z) and the sheet's in-slice tangent (from the GT label's normal); a sample is H (fibres perpendicular to the axis: the
    gradient along z) where its coherence >= --orient-coh and cos 2a > --orient-margin, V where < -margin, else it keeps the last state
-   (also where CT < --orient-iso); the V -> H / H -> V flips going outward per GT turn as (b). */
+   (also where CT < --orient-iso); --orient-persist UM: a new state must hold over UM of classified samples first; the V -> H / H -> V flips going outward per GT turn as (b). */
 #include "fit.h"
 #include "latfit.h"
 #include "lcodec.h"
@@ -54,7 +54,7 @@ typedef struct { int box; int z; float rmm, dq, gap; int npk, rvf, rvb, fbf, fbb
 typedef struct {
     z3 *ct, *cd, *cl, **rvz, **fhz, **fvz; int plocal; double ctum, cum, clum, bum, rvthr, fthr, fmar, sig;
     const gt_box *bx; int nbox, nz, nth, pkL, pkP;
-    z3 *oct; int orient; double osig, orho, ocoh, omar, oiso;   /* --orient: the in-sheet fibre orientation from the CT structure tensor */
+    z3 *oct; int orient, opers; double osig, orho, ocoh, omar, oiso;   /* --orient: the in-sheet fibre orientation from the CT structure tensor */
     const lat_basis *lb; int lc; double lstep, lcen, lsc;   /* --lat-rt: the CT through the latent cell codec first */
     const lcodec *lcd; double vcq;   /* --lat-codec: the learned codec instead (on --lat-rt's basis); --vc-rt Q: plain volcomp at quality Q instead */
     gt_row **rows; int *nrow, *cap;   /* per job */
@@ -124,6 +124,17 @@ static void peaks(const double *C, const uint8_t *mat, int n, double sig, int L,
 static void flips(const int8_t *raw, int n, uint8_t *f12, uint8_t *f21) {
     int s = 0; memset(f12, 0, n); memset(f21, 0, n);
     for (int i = 0; i < n; i++) { const int r = raw[i]; if (!r || r == s) continue; if (s == 1 && r == 2) f12[i] = 1; else if (s == 2 && r == 1) f21[i] = 1; s = r; }
+}
+
+/* flips() with persistence: a new state counts only once it holds for P classified samples (unknown samples neither count nor
+   break the run); the flip sits where that run started */
+static void flips_p(const int8_t *raw, int n, int P, uint8_t *f12, uint8_t *f21) {
+    int s = 0, c = 0, c0 = 0, cl = 0; memset(f12, 0, n); memset(f21, 0, n);
+    for (int i = 0; i < n; i++) {
+        const int r = raw[i]; if (!r) continue;
+        if (r != c) { c = r; c0 = i; cl = 0; }
+        if (++cl >= P && c != s) { if (s == 1 && c == 2) f12[c0] = 1; else if (s == 2 && c == 1) f21[c0] = 1; s = c; }
+    }
 }
 
 /* --lat-rt BASIS: replace plane zn of the CT by what a latent-grid net reads of it: each 4^3 cell (global 4-aligned grid) of the
@@ -331,7 +342,7 @@ static void gt_plane(void *ctx, int a0, int a1, int t) {
                 }
             }
             peaks(C, mat, n, J->sig, J->pkL, J->pkP, pk); peaks(RV, rmat, n, J->sig, J->pkL, J->pkP, rpk); peaks(FH, hmat, n, J->sig, J->pkL, J->pkP, hpk);   /* (rv / H - V peaks: recto-ruler's "peaks of the fused signal") */
-            flips(rs, n, a12, a21); flips(fs, n, b12, b21); flips(os, n, o12, o21);   /* a12: V -> R, a21: R -> V; b12: V -> H, b21: H -> V (outward) */
+            flips(rs, n, a12, a21); flips(fs, n, b12, b21); flips_p(os, n, J->opers, o12, o21);   /* a12: V -> R, a21: R -> V; b12: V -> H, b21: H -> V (outward) */
             double pr = -1; int pq = 0;
             for (int i = 0; i < n;) {
                 if (!q[i]) { i++; continue; }
@@ -380,7 +391,7 @@ int cmd_gt_trans(int argc, char **argv) {
         fprintf(stderr, "usage: ufsm gt-trans ROOT CTKEY CTUM CODEROOT CODEKEY CODEUM CENTREKEY CENTREUM BOXES_TSV SCROLL BOXUM OUT.tsv [--nz 8] [--nth 360]\n"
                         "                     [--rv ROOT KEY] [--fh ROOT KEY --fv ROOT KEY] [--rv-thr 8] [--fib-thr 8] [--fib-margin 4] [--ct-sig 1.2] [--threads N]\n"
                         "                     [--lat-rt BASIS.lcb --lat-c 29 --lat-step 0.25 --lat-norm CENTRE,SCALE [--lat-codec CODEC.lcd]] [--vc-rt Q] [--ct-l 12 --ct-p 24]\n"
-                        "                     [--orient SIG,RHO [--orient-coh 0.2] [--orient-margin 0.2] [--orient-iso 1] [--orient-ct ROOT KEY]]\n"
+                        "                     [--orient SIG,RHO [--orient-coh 0.2] [--orient-margin 0.2] [--orient-iso 1] [--orient-persist UM] [--orient-ct ROOT KEY]]\n"
                         "  CT peaks, recto / verso and fibre-direction flips per GT turn by normal gap (src/gttrans.c)\n");
         return 2;
     }
@@ -390,6 +401,7 @@ int cmd_gt_trans(int argc, char **argv) {
                 .sig = opt_atof("--ct-sig", gt_opt(argc, argv, "--ct-sig", "1.2")), .pkL = opt_atoi("--ct-l", gt_opt(argc, argv, "--ct-l", "12")),
                 .pkP = opt_atoi("--ct-p", gt_opt(argc, argv, "--ct-p", "24")), .ocoh = opt_atof("--orient-coh", gt_opt(argc, argv, "--orient-coh", "0.2")),
                 .omar = opt_atof("--orient-margin", gt_opt(argc, argv, "--orient-margin", "0.2")), .oiso = opt_atof("--orient-iso", gt_opt(argc, argv, "--orient-iso", "1"))};
+    { const double pu = opt_atof("--orient-persist", gt_opt(argc, argv, "--orient-persist", "0")); J.opers = pu > 0 ? (int)ceil(pu / J.ctum) : 1; }
     { const char *o = gt_opt(argc, argv, "--orient", nullptr);
       if (o) { if (sscanf(o, "%lf,%lf", &J.osig, &J.orho) != 2 || J.osig <= 0 || J.orho <= 0) { fprintf(stderr, "gt-trans: --orient SIG,RHO (CT voxels)\n"); return 1; } J.orient = 1; } }
     pthread_mutex_init(&J.mu, nullptr);
@@ -412,7 +424,7 @@ int cmd_gt_trans(int argc, char **argv) {
     if (!(J.ct = gt_open(argv[2], argv[3])) || !(J.cd = gt_open(argv[5], argv[6])) || !(J.cl = gt_open(argv[2], argv[8]))) return 1;
     J.oct = J.ct;
     if (J.orient && gt_opt2(argc, argv, "--orient-ct", 1) && !(J.oct = gt_open(gt_opt2(argc, argv, "--orient-ct", 0), gt_opt2(argc, argv, "--orient-ct", 1)))) return 1;
-    if (J.orient) fprintf(stderr, "gt-trans: fibre orientation: structure tensor sigma %g, rho %g CT voxels, coherence >= %g, margin %g, CT >= %g\n", J.osig, J.orho, J.ocoh, J.omar, J.oiso);
+    if (J.orient) fprintf(stderr, "gt-trans: fibre orientation: structure tensor sigma %g, rho %g CT voxels, coherence >= %g, margin %g, CT >= %g, persistence %d samples\n", J.osig, J.orho, J.ocoh, J.omar, J.oiso, J.opers);
     const char *rr = gt_opt2(argc, argv, "--rv", 0), *rk = gt_opt2(argc, argv, "--rv", 1), *hr = gt_opt2(argc, argv, "--fh", 0), *hk = gt_opt2(argc, argv, "--fh", 1),
                *vr = gt_opt2(argc, argv, "--fv", 0), *vk = gt_opt2(argc, argv, "--fv", 1);
     if (hr && !vr) { fprintf(stderr, "gt-trans: --fh needs --fv\n"); return 1; }

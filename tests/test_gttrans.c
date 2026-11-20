@@ -90,7 +90,7 @@ int main(void) {
         snprintf(p, sizeof p, "%s/ct2", dir); CHECK(!z3w_arr2(p, c2, D2), "write ct2"); snprintf(p, sizeof p, "%s/cd2", dir); CHECK(!z3w_arr2(p, g2, D2), "write cd2");
         { FILE *bf = fopen(bx, "w"); fprintf(bf, "T3\tsyn\t0\t0\t0\t%d\t%d\t%d\n", D2, N, N); fclose(bf); }
         char *a2[] = {"ufsm", "gt-trans", dir, "ct2", "9.6", dir, "cd2", "9.6", "ct2", "9.6", bx, "syn", "9.6", out, "--nz", "2", "--nth", "90",
-                      "--orient", "1,1.5", "--threads", "4"};
+                      "--orient", "1,1.5", "--orient-persist", "20", "--threads", "4"};   /* (persistence 3 samples < the 5-voxel layers) */
         CHECK(cmd_gt_trans((int)(sizeof a2 / sizeof *a2), a2) == 0, "gt-trans --orient failed");
         double q2[2] = {0}, vh2[2] = {0}, hv2[2] = {0}; long n2c[2] = {0}; FILE *f2 = fopen(out, "r");
         if (f2) { if (!fgets(line, sizeof line, f2)) line[0] = 0;
