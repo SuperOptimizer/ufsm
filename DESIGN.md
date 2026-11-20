@@ -157,6 +157,47 @@ C15; ~87 s per channel): traces A (dyad, no gate) and B (q2 MFREF joined fit as 
 count-field `--fibers` ties (fiber-export, --cf-fib-spans 64,256), scored on C2 / C6 / C12 / C15 against the no-tie MFREF ref.
 Results below when scored.
 
+## rvsub: sub-cell rv / fibre rows + contact weight: PARKED, at most +0.03-0.04 rv peaks per turn, no fibre gain (2026-11-20)
+
+Question: does try9 miss recto / verso and fibre-direction switches between touching sheets because its head is cell-scale (4 voxels =
+38 um)? Can sub-cell output rows (`train --lat-sub rv,fib,ink`) and a contact weight on the rv / fibre masks where labelled sheets come
+within 70 um (`--contact-weight 4`) resolve them? Both flags are on master (51285c32 / e28318fe / b361b431) and stay opt-in.
+
+Setup:
+- Three arms on desk card 1, all warm from the cooled try9 (try9cool/cooled-33333): try9 recipe at P 256 / 9.6 um, 6000 steps, seed 3,
+  phase + AFV fibre sources (sources-96f.json).
+  - ABc: control (--rv 2 --fib-head 1).
+  - ABs: + --lat-sub rv,fib,ink --contact-weight 4.
+  - ABd: ABs + latcodec's sub-cell decoder (--lat-dec 64).
+- Score: ufsm gt-trans (rv / fibre flips and peaks per GT turn by normal gap) on the held-out Paris 4 boxes (PH2, HOLD) against the q9.6
+  GT and the July codes. Predict at window 640 / halo 64 with live weights, no --gn-live: predict refuses non-gn-ema checkpoints with
+  rc 2, and the first pass silently scored empty stores.
+
+GT gap below 70 um (Paris 4 / July):
+
+| arm | rv flips V>R + R>V per GT turn | rv peaks per GT turn | fibre (H-V) peaks per GT turn |
+|---|---|---|---|
+| CT peaks (reference) | | 0.683 / 0.435 | |
+| COOL0 (cooled try9, step 0) | 0.566 / 0.531 | 0.580 / 0.398 | 0.393 / 0.269 |
+| ABc | 0.755 / 0.525 | 0.547 / 0.341 | 0.362 / 0.243 |
+| ABs | 0.841 / 0.612 | 0.580 / 0.378 | 0.370 / 0.250 |
+| ABd | 0.790 / 0.554 | 0.617 / 0.373 | 0.375 / 0.244 |
+
+Results:
+- Sub-cell rows add +0.03 / +0.04 rv peaks per turn over the fine-tune control. ABd is the best on Paris 4 (0.617), but below COOL0 on
+  July.
+- No arm reaches the CT's own peak rate, and no arm lifts fibre peaks (all below COOL0).
+- Flips per turn rise (0.84 vs 0.76), but peaks do not. The arms switch side more often without separating more sheets.
+- wbench GT ids, ABs / ABd vs ABc: held-out packed +0.033 / +0.020, control -0.02 / -0.03, J27 -0.13 / -0.14 in both. That is mixed.
+
+Cost: --lat-sub rv,fib,ink +0.76 GB plan at P 768. Sub-cell predict at window 640 allocates a 7.86 GB buffer (OOMs beside another job on
+a 16 GB card).
+
+Step 3 (a fibre layer-orientation target) dropped. mergeflag's 2.4 um test found the CT's layer orientation itself flips only 0.27-0.49
+per turn below 70 um, below the CT peaks, so the target would have nothing to learn from.
+
+Kept: runs/rg96AB{c,s,d}-s3/last.ckpt and the gt-trans outputs in /vesuvius/ufsm/inksdk/resgate/abgt/.
+
 ## Layer fibre orientation in the CT does not separate touching sheets at 2.4 um either (2026-11-19, branch orient-20261119, mergeflag)
 
 **Question (user via lead).** Each sheet is a recto layer (horizontal fibres) on a verso layer (vertical fibres). At 2.4 um, does
