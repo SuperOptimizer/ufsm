@@ -5,7 +5,8 @@
    - with multiplier 1 the inherited parameters do change (the split is not a freeze by accident);
    - a checkpoint round trip keeps the ranges (unet_load), so a resumed run still holds the inherited parameters at the multiplier;
    - the same with NorMuon (--normuon 1: the ext path's per-matrix multipliers), two steps on one net: the second step's host descriptor
-     list must follow the device table's inherited-first order (2026-11-16: it did not, the multipliers paired with the wrong matrices). */
+     list must follow the device table's inherited-first order (2026-11-16: it did not, the multipliers paired with the wrong matrices);
+   - a narrower level 0 with a head row map (unet_init_from_map) copies the same tensors as the plain copy: level 0 and the head fresh. */
 #include "unet.h"
 #include <math.h>
 #include <stdio.h>
@@ -69,6 +70,18 @@ int main(void) {
         bad += check(v, x, xs, nl, muon, 0.f, "resumed step");
         bad += check(v, x, xs, nl, muon, 1.f, "resumed step, no multiplier");
         unet_free(v); unet_free(u); unlink(p2);
+    }
+    {   /* a narrower level 0 than the donor's with a head row map (2026-11-20: a 16-wide level 0 warm-started from wind96's 32, --ink-head):
+           the map path took -1 on the head's input width; now level 0 and the whole head start fresh and the rest is copied, the same
+           tensors as the plain shape-matched copy */
+        unet_cfg cw = cd; cw.widths[0] = 4; cw.cout = 5; cw.cin = 1;
+        unet *a = unet_create(&cw); unet_init(a, 5); unet *b = unet_create(&cw); unet_init(b, 5);
+        const int rows[5] = {0, 1, 2, 3, -1};
+        const int na = unet_init_from_map(a, path, rows), nb = unet_init_from(b, path);
+        const size_t ia = unet_inherited(a), ib = unet_inherited(b);
+        const int ok = na > 0 && na == nb && ia == ib && ia > 0 && ia < unet_nparams(a);
+        printf("narrower level 0 + head rows: %d / %d tensors, %zu / %zu of %zu parameters inherited%s\n", na, nb, ia, ib, unet_nparams(a), ok ? "" : "  FAIL");
+        bad += !ok; unet_free(a); unet_free(b);
     }
     unlink(path);
     printf(bad ? "FAILED\n" : "ok\n");
