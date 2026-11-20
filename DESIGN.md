@@ -6,6 +6,81 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Learned sub-cell decoder (--lat-dec): a nonlinear full-resolution output codec on the latent cells (2026-11-19, branch latcodec-20261119, latcodec)
+
+**Why.** The latent net's trunk runs on 4^3-voxel cells (38.4 um at 9.6). Its full-resolution outputs come from three parts:
+- the interpolated cell logits;
+- the linear sub-cell rows (one 1^3 head row per voxel of the cell, for the phase pair and, since --lat-sub, for rv / fibre / ink);
+- the fine stem (silu of 4^3 raw-CT taps at stride 2, so 19.2 um blocks).
+
+None of these is a nonlinear function of the trunk's context *and* the cell's fine detail together. The packed-sheet deficit (sections
+"Recto / verso ... do not separate touching sheets" and "Where the packed-sheet deficit lives") is a full-resolution decision of exactly
+that kind. Example: two sheets merged into one cell, with the trunk knowing roughly where they are and the CT detail saying where the
+layers alternate. The decoder treats the sub-cell rows as a learned output codec: each cell's code is decoded nonlinearly into its 64
+voxels per output, from the cell's compressed input.
+
+**Model.** Per cell c (src/nn_latdec.cu, unet_cfg.lat_dec H, header key "lat_dec":[H, raw, ng]; params appended last):
+
+    pre_k = A_k . f_c + a_k + sum_{c', t in 3^3} B[c'][t][k] L_c'(c + t),   h = silu(pre),   subrow_o(c) += sum_k W2[o][k] h_k
+
+- f_c is the head's input (dec[0], 256 channels). A / a are H more rows of the 1^3 head, so they run in the head's own kernels: the MX
+  input, its GN + SiLU, the head plane scale. The head's backward runs once on the cout + H rows, because gx is written, not accumulated.
+- L is the latent input itself: the lat_c (29) KLT coefficients of each cell, quantised exactly as input_latc_k quantises them (before
+  the MX rounding), over the 3^3 neighbour cells. The decoder therefore reads what a latvol store holds.
+  - --lat-dec-raw 1: L is instead the cell's 64 voxels (Cl 64, the complete basis, unquantised). This is the ablation of the 29-coefficient
+    truncation.
+- o runs over all 64 ng sub-cell rows: ng = 2 for the phase pair; with --lat-sub, every group, e.g. rv,fib,ink gives ng 7 and 448 rows.
+- W2 starts at 0, so the net starts as its donor. Rows are never written with a zero term, so they stay byte-identical, signed zeros included.
+
+**Kernels.**
+- Forward: one 128-thread block per 32-cell row tile, with the 3 x 3 neighbour rows of L staged in shared memory and 4 groups of H/4
+  hidden units per cell. W2 projects from shared memory and adds into the fp16 (training) or fp32 (predict) rows.
+- Backward:
+  - Recomputes pre, h and silu'. The rows' gradient comes in through shared memory in chunks of 128 outputs. It writes dpre as fp16
+    head rows plus fp32 scratch.
+  - B / W2 gradients are chunked outer-product sums (4096 cells a chunk), summed over chunks in a fixed order. There are no float
+    atomics, so --det runs are bit-stable. They are scaled by 1 / the head plane scale.
+- Plain fp32 FFMA; tensor cores (mma) are the next step if the bench says so.
+- The head backward-data kernel (conv1_to_mx_tc) now takes any number of rows: K runs in chunks of 32. The FFMA fallback goes to 256.
+
+**Wiring.**
+- train --lat-dec H needs the streamed head (g_lat_hs), B 1 and no --split. The trainer's latgc has H more rows.
+- unet_head_fwd_z / _bwd_z run the decoder per head slab. The training forward's x (the fp16 CT at 4x the cell shape) is its CT.
+- Predict: unet_set_latdec_ct(xd) is called before the forward. The decoder runs in the whole-window inference head and in
+  unet_head_fwd_z32 (fit-zarr chunks), into the cell logits, so every reader gets the decoded rows: the fused fstem_up path,
+  nn_lathead, --heads and fit fields.
+- Predict's direct cell input (latin) is off for decoder nets, because the decoder reads xd.
+
+**Tests (card 1, as suite guests).**
+- test_latdec: against a double host reference for Hd 16 / 32 / 64, Cl 29 / 64 and ng 2 / 7.
+  - The latent cells match (0 quantiser flips).
+  - Forward: fp16 / fp32 rows and pre rows within fp16 rounding.
+  - W2 = 0 leaves the rows byte-identical.
+  - Backward max |e|: pre 4.8e-4 (fp16), B 5.8e-6, W2 3.8e-6. The reference gradient is checked by central differences.
+  - Two runs are bit-identical; head plane scale 4 divides exactly.
+- test_latdec_train: a fixture latent net with a fitted basis, --lat-guide 3, --fstem 16.
+  - --init-from at lr 0: the step losses with and without --lat-dec 64 are identical.
+  - Trained 6 steps: step 1 is identical (W2 0), and by step 6 the phase bce moved (0.6938 plain vs 0.6822 decoder) while the normal bce
+    is untouched (0.9108 both): the decoder acts on the sub-cell rows only.
+  - --lat-dec-raw runs; --resume refuses a decoder mismatch.
+  - --lat-sub rv,ink + the raw decoder (320 rows): W2 0 equal losses; predict --heads rv,ink changes with a random W2.
+- test_parity~latdec (UFSM_LATDEC_TEST_W2=2: a random W2, so the decoder's term is O(1) from step 0): train vs predict --fit-zarr is
+  max |d| 0.0078 on the phase pair (bit-equal 0.65), the same tolerance as the plain parity test.
+
+**Cost.** The first FFMA kernels (scalar fp32 over the 783-wide 3^3 x 29 conv, 32-cell tiles, the slab's halo planes decoded too) cost
+16.7 s per P 768 window in bench_latdec. In training at P 256 (resgate recipe, --lat-sub rv,fib,ink, card 1) that was 1.65 vs 1.07 samples/s:
+606 vs 935 ms per step, +54 %. The tensor-core rewrite (dc88a53a, `UFSM_LATDEC_FFMA=1` keeps the FFMA kernels):
+- every GEMM on mma m16n8k16 (fp16 in, fp32 accumulate): the conv, h W2, dy W2^T, and both weight gradients (chunked, fixed-order reduction);
+- 64-cell tiles, a warp 16 cells x all H, so each A fragment is used H / 8 times;
+- K ordered by neighbour row / dx / channel (channels padded to 32 / 64): one transposed fp16 L row staged at a time, A fragments are
+  aligned 4-byte smem loads (the per-element k -> offset table cost 2x);
+- B / W2 fragments and the head rows' old values prefetched one step ahead (the loads were 70 % of the stall samples);
+- the latent cells in fp16;
+- the trainer decodes only the slab's own cell planes (unet_set_latdec_range): their halo planes' sub-cell rows are never read.
+ncu per slab at P 768, ng 7, H 64: fwd 39 -> 2.1 ms; bwd + the two weight-gradient GEMMs 110 -> 3.0 + 1.3 + 1.9 ms; cell encode 0.5 ms.
+H 32 is not cheaper (fwd 1.9 ms, bwd 2.8 ms: the L staging dominates). Step A/B at P 256, alternating A B A B: 1.59 / 1.66 vs
+1.47 / 1.47 samples/s, about 615 vs 680 ms, **+10.5 %**. Memory: scratch 83 MB, fp16 L ~17 MB at P 768.
+
 ## Count-constrained fill: no headroom over the mf-weighted ref (2026-11-18, branch fill-20261118, levelsolve)
 
 `ufsm fill-oracle` (src/filloracle.c): radial rays (every native z plane, arcs <= 0.7 voxel) through a box raster of the model's U; merged
