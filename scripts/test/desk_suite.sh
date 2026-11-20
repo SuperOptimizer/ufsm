@@ -3,7 +3,7 @@
 # any clone. The commit is pushed over ssh into the desk's bare repo /vesuvius/ufsm/suite/repo.git (nothing has to be on GitHub),
 # exported to /vesuvius/ufsm/suite/<sha>, built (CMake presets release + verify; ccache, shared across the sha dirs) and tested at nice 10.
 #
-#   scripts/test/desk_suite.sh [-t fast|slow|all] [-j N] [-T N] [-m GB] [-l LOAD] [-w MIN] [-b N] [-k] REF [REGEX...]
+#   scripts/test/desk_suite.sh [-t fast|slow|all] [-j N] [-T N] [-m GB] [-l LOAD] [-w MIN] [-b N] [-H HOST] [-a 86] [-R ROOT] [-k] REF [REGEX...]
 #     REF     branch, tag or commit of the local repo (uncommitted changes are not sent)
 #     -t      tier (default fast = the test target); -j / -T: runner jobs / threads per test (default 8 / 3)
 #     -m GB -l LOAD: before the build and before the tests the desk must have MemAvailable >= GB (default 40) and a 1-min
@@ -15,12 +15,16 @@
 # >= 3 GB free, most free first (the runner's GPU locks keep it to one suite test per GPU); none free -> GPU tests are SKIPped.
 # Output: build log tail on a build failure, the runner's progress, failing tests' logs and the summary. Logs stay on the desk in
 # /vesuvius/ufsm/suite/<sha>/out (the last 8 sha dirs are kept). Exit = the runner's (0 = all passed).
+#     -H HOST  another GPU box (default the desk, env DESK); -a 86: Ampere / Ada boxes (forlindesk 2x3090, the laptop 4060): presets
+#             arch86 / arch86-verify into build/ and build-verify/ (the Python tests read build/): the lp_* kernels run their software
+#             MX paths there, every other kernel as on the desk (2026-11-20: the GPU gate off the training desk)
+#     -R ROOT  the work dir on HOST (default /vesuvius/ufsm/suite, env SUITE_ROOT; the laptop has no /vesuvius: e.g. ~/suite)
 set -u
-DESK=${DESK:-forrest@192.168.0.175}; ROOT=/vesuvius/ufsm/suite
+DESK=${DESK:-forrest@192.168.0.175}; ROOT=${SUITE_ROOT:-/vesuvius/ufsm/suite}; ARCH=120
 TIER=fast; J=8; T=3; MEMGB=40; LOADMAX=32; WAITMIN=60; BJ=8; KEEP=0
-while getopts "t:j:T:m:l:w:b:kh" o; do case $o in
-  t) TIER=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; m) MEMGB=$OPTARG;; l) LOADMAX=$OPTARG;; w) WAITMIN=$OPTARG;; b) BJ=$OPTARG;; k) KEEP=1;; *) sed -n '2,19p' "$0"; exit 2;; esac; done
-shift $((OPTIND - 1)); [ $# -ge 1 ] || { sed -n '2,19p' "$0"; exit 2; }
+while getopts "t:j:T:m:l:w:b:H:a:R:kh" o; do case $o in
+  t) TIER=$OPTARG;; j) J=$OPTARG;; T) T=$OPTARG;; m) MEMGB=$OPTARG;; l) LOADMAX=$OPTARG;; w) WAITMIN=$OPTARG;; b) BJ=$OPTARG;; H) DESK=$OPTARG;; a) ARCH=$OPTARG;; R) ROOT=$OPTARG;; k) KEEP=1;; *) sed -n '2,22p' "$0"; exit 2;; esac; done
+shift $((OPTIND - 1)); [ $# -ge 1 ] || { sed -n '2,22p' "$0"; exit 2; }
 REF=$1; shift
 SHA=$(git rev-parse --verify "$REF^{commit}") || exit 2
 [[ $SHA =~ ^[0-9a-f]{40}$ ]] || exit 2
@@ -36,8 +40,8 @@ RS=$ROOT/.remote-${SHA:0:12}.sh
 ssh -o ConnectTimeout=10 "$DESK" "cat > $RS" <<'REMOTE' || exit 2
 
 set -u
-SHA=$1 TIER=$2 J=$3 T=$4 MEMGB=$5 BJ=$6 KEEP=$7 FILT=$8 XARGS=$9 LOADMAX=${10} WAITMIN=${11}
-ROOT=/vesuvius/ufsm/suite; S=${SHA:0:12}; W=$ROOT/$S
+SHA=$1 TIER=$2 J=$3 T=$4 MEMGB=$5 BJ=$6 KEEP=$7 FILT=$8 XARGS=$9 LOADMAX=${10} WAITMIN=${11} ARCH=${12:-120} ROOT=${13:-/vesuvius/ufsm/suite}
+S=${SHA:0:12}; W=$ROOT/$S
 deskok() {   # wait (<= WAITMIN) until MemAvailable >= MEMGB and the 1-min load <= LOADMAX: the desk's own jobs come first
   local i a l n=$(( WAITMIN * 2 ))
   for ((i = 0; i <= n; i++)); do
@@ -62,7 +66,7 @@ if [ ! -f $W/.built ]; then
   mkdir -p $W && git -C $ROOT/repo.git archive "$SHA" | tar -x -C $W || exit 2
   echo "desk_suite: building in $W (cmake + ninja -j $BJ, nice 10)"; t0=$(date +%s)
   cd $W || exit 2
-  if ! inbg bash -c "{ cmake --preset release && cmake --preset verify; } > build.log 2>&1 &&
+  if ! inbg bash -c "{ if [ $ARCH = 86 ]; then cmake --preset arch86 -B build && cmake --preset arch86-verify -B build-verify; else cmake --preset release && cmake --preset verify; fi; } > build.log 2>&1 &&
           nice -n 10 cmake --build build -j $BJ --target ufsm test_sheet make_pipeline_fixture test_http_reader test_sampler_safety \
           test_formats >> build.log 2>&1 && nice -n 10 cmake --build build-verify -j $BJ --target suite-bins >> build.log 2>&1"; then
     echo "desk_suite: BUILD FAILED ($W/build.log):"; grep -E 'error|Error' $W/build.log | head -30; tail -n 15 $W/build.log; exit 2; fi
@@ -78,4 +82,4 @@ cd $W && eval inbg nice -n 10 tests/run_suite.sh -t "$TIER" -j "$J" -T "$T" -g "
 ls -dt $ROOT/[0-9a-f]*/ 2> /dev/null | tail -n +9 | while read -r d; do d=${d%/}; [[ ${d##*/} =~ ^[0-9a-f]{12}$ ]] && rm -rf -- "$ROOT/${d##*/}"; done
 exit $rc
 REMOTE
-ssh -tt -o ConnectTimeout=10 "$DESK" "bash $RS $(printf '%q ' "$SHA" "$TIER" "$J" "$T" "$MEMGB" "$BJ" "$KEEP" "$FILT" "${SUITE_ARGS:-}" "$LOADMAX" "$WAITMIN")"
+ssh -tt -o ConnectTimeout=10 "$DESK" "bash $RS $(printf '%q ' "$SHA" "$TIER" "$J" "$T" "$MEMGB" "$BJ" "$KEEP" "$FILT" "${SUITE_ARGS:-}" "$LOADMAX" "$WAITMIN" "$ARCH" "$ROOT")"
