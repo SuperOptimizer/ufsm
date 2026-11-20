@@ -2810,8 +2810,9 @@ static void csv_extend_header(const char *path, const char *full) {   /* FULL: t
 /* the run-health warnings (2026-11-20, devspeed: T9C's ink head row sat at W rms 4.542e-02 from step 11 to 2991 and nobody saw it for
    hours). (a) frozen parameters: the parameters at step0 + 10 kept on the host; at step0 + 100, + 300 and every log line after, a group
    (unet_param_groups: each Muon matrix, each head output row, the AdamW ranges) with |W - W10| / |W10| < 1e-4 (or still all 0) prints
-   "WARNING frozen:", while its learning rate is > 0. (b) dead loss terms: a term of the step line (" phase bce 0.0000 (0% of windows)")
-   exactly 0 for 100+ steps prints "WARNING dead loss:". --strict-health 1 exits 4 at the first warning (smoke arms die instead of running
+   "WARNING frozen:", while its learning rate is > 0 and its gradient is not all 0 (a head without labels in the run is quiet by design).
+   (b) dead loss terms: a step-line term exactly 0 for 100+ steps while its "(N% of windows)" shows labelled windows (N > 0) prints
+   "WARNING dead loss:" (ink-only runs on a multi-head net print "phase bce 0.0000 (0% of windows)": quiet). --strict-health 1 exits 4 at the first warning (smoke arms die instead of running
    for hours). mgpu: main (the step loop's log block) */
 static int g_strict_health;
 static void health_fail(void) { if (g_strict_health) { fprintf(stderr, "--strict-health 1: stopping (exit 4)\n"); fflush(stderr); exit(4); } }
@@ -2823,15 +2824,17 @@ static void health_params(unet *u, int step, int step0, int logstep, float lr, f
         unet_params_d2h(u, w10); ng = unet_param_groups(u, rg, nm, 4096); return;
     }
     if (!w10 || !(step == step0 + 100 || step == step0 + 300 || (logstep && step > step0 + 300)) || !(lr > 0)) return;
-    float *w = malloc(np * 4); if (!w) return;
-    unet_params_d2h(u, w);
+    float *w = malloc(np * 4), *gr = malloc(np * 4); if (!w || !gr) { free(w); free(gr); return; }
+    unet_params_d2h(u, w); nn_d2h(gr, unet_grad_ptr(u), np * 4);   /* (the last update's gradient, still in the buffer) */
     int nf = 0; char b[1024]; size_t k = 0;
     for (int i = 0; i < ng; i++) {
         const int mat = !strncmp(nm[i], "conv", 4); if (mat && !(mlr > 0)) continue;
+        double gs = 0; for (size_t j = rg[i][0]; j < rg[i][0] + rg[i][1]; j++) gs += (double)gr[j] * gr[j];
+        if (gs == 0) continue;   /* (no gradient: a head row without labels in this run, by design; lead 11-20: only labelled groups that stop moving warn) */
         double s0 = 0, d = 0; for (size_t j = rg[i][0]; j < rg[i][0] + rg[i][1]; j++) { const double a = w10[j], e = (double)w[j] - a; s0 += a * a; d += e * e; }
         if (s0 > 0 ? sqrt(d / s0) < 1e-4 : d == 0) { if (nf++ < 12 && k < sizeof b) k += (size_t)snprintf(b + k, sizeof b - k, "%s%s (rms %.3e)", nf > 1 ? ", " : "", nm[i], sqrt(s0 / (double)rg[i][1])); }
     }
-    free(w);
+    free(w); free(gr);
     if (nf && (step == step0 + 100 || step == step0 + 300 || nf != last)) {
         fprintf(stderr, "WARNING frozen: %d of %d parameter groups unchanged since step %d (|dW| / |W| < 1e-4) at lr %.2e: %s%s\n", nf, ng, step0 + 10, lr, b, nf > 12 ? ", ..." : "");
         health_fail();
@@ -2852,8 +2855,11 @@ static void health_terms(int step, const char *s) {   /* s: the step line's term
             char nmv[40]; snprintf(nmv, sizeof nmv, "%s%s%s", w1, *w1 ? " " : "", w2);
             int i = 0; while (i < nt && strcmp(T[i].n, nmv)) i++;
             if (i == nt && nt < 64) { snprintf(T[nt].n, 40, "%s", nmv); T[nt].z0 = -1; T[nt].warned = 0; nt++; }
+            int lab = 0; { const char *q = p; while (*q == ' ') q++; int pc = 0, nn = 0;   /* its windows: "(N% of windows" with N > 0 (lead 11-20: a head with
+                no labels in the run, "(0% of windows)", or a term without that count is never "dead"; only labelled terms stuck at 0) */
+                if (*q == '(' && sscanf(q, "(%d%%%n", &pc, &nn) == 1 && nn > 0 && !strncmp(q + nn, " of windows", 11)) lab = pc > 0; }
             if (i < nt) {
-                if (v != 0 || !strchr(t, '.')) T[i].z0 = -1;
+                if (v != 0 || !strchr(t, '.') || !lab) T[i].z0 = -1;
                 else { if (T[i].z0 < 0) T[i].z0 = step;
                        if (step - T[i].z0 >= 100 && !T[i].warned) { T[i].warned = 1; fprintf(stderr, "WARNING dead loss: \"%s\" has been exactly 0 since step %d (an enabled term with no gradient)\n", nmv, T[i].z0); health_fail(); } }
             }
