@@ -39,6 +39,24 @@ HOLD lies outside Paris4_1mm_v2). Sheet changes: fiber-judge --phase against GT 
 - Runs on one reference fibre fall 0.34 -> 0.21 mm: across a gap a line lands on a neighbouring fibre of the same sheet. For
   count-field ties that is still a valid same-sheet tie (lead: judge by sheet changes, >= 1 mm, recall; runs reported only).
 - --family-dir hurts in every arm (off).
+- Gaps up to 0.6 mm with the W gate (W6): >= 1 mm 0.792 / 0.698, >= 2 mm 0.433 / 0.295, recall 0.90 / 0.91, but precision
+  0.32 / 0.25 and 6.5 / 11.7 changes / m (W3: 4.0 / 7.6): longer at a higher hop rate; W3 stays the rule winner.
+- `--sheet-tol` is inert in the steered gate: the in-plane projection + the Newton pull-back hold every point on the seed's W, so
+  no line ever drifts to the tolerance (W3: 0 sheet stops; tol 0.45 gives a byte-identical .fib). Steered lines follow the fit's W
+  by construction. `--sheet-steer 0` makes W a cut only (no projection, no pull-back; drift > tol ends the line):
+  tol 0.45 + gaps 0.3 mm = 24.9 / 65.7 changes / m, >= 1 mm 0.647 / 0.504, recall 0.92 / 0.96, precision 0.44 / 0.37.
+- Gate-free continuity from the CT (`--sheet-ct ROOT KEY`: level-2 CT, 3^3 blur, structure-tensor normal over 5^3, steps
+  projected into the sheet plane, a ridge climb along the normal of at most a voxel a step, ends where no ridge lies within
+  --ct-r or its contrast stays below --ct-con past the gap allowance) does NOT hold the sheet on Paris 4 HOLD:
+  | arm | changes / m | >= 1 mm | recall |
+  |---|---|---|---|
+  | CT ridge, no gaps | 60.3 / 156.5 | 0.061 / 0.104 | 0.25 / 0.34 |
+  | CT ridge, gaps 0.3 mm | 78.0 / 210.7 | 0.712 / 0.736 | 0.87 / 0.92 |
+  | CT ridge, gaps 0.3 mm, --ct-r 2 --ct-con 4 | 68.2 / 191.3 | 0.592 / 0.614 | 0.82 / 0.87 |
+  | CT ridge, gaps 0.3 mm, --ct-con 16 | 76.7 / 214.5 | 0.708 / 0.732 | 0.87 / 0.92 |
+  Even without gaps the ridge climb hops more than the plain dyad trace (60 vs 41 / m): at 9.6 um the nearest density ridge
+  along the normal is often the neighbour's (compressed, touching sheets), the same failure as the earlier local touching-sheet
+  signals. Kept as an option, off.
 - Production rule: W3 (W from our own fit). Caveat (mergeflag): a W gate from the same fit the count field corrects agrees with
   that W by construction and cuts a line exactly at the W jumps a tie could fix; so the 1667 tie test runs two arms.
 
