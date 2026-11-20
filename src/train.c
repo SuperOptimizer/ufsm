@@ -4839,6 +4839,24 @@ int cmd_train(int argc, char **argv) {
         snprintf(runtime_extra+n-1, sizeof runtime_extra-n+1,
             ",\"target\":{\"version\":1,\"erode_native_voxels\":%d,\"erosion_kernel\":\"face6\",\"soft_sigma\":%.9g,\"soft_unit\":\"%s\",\"loss_tolerance_voxels\":%d}}", sc.erode, sc.soft, sc.soft_um ? "um" : "vox", nn_get_loss_tol());
     }
+    {   /* the task / heads signature (2026-11-20): a resume whose task or heads differ from the checkpoint's is refused, not defaulted
+           (a relaunch that lost its HEADS argv silently restarted a fibre run as the rv task); --resume-heads-change 1 allows it on purpose */
+        char sig[256]; snprintf(sig, sizeof sig, "task=%s cout=%d fibdir=%d fibh=%d rv=%d side=%d verso=%d aff=%d pap=%d", task, g_cout, g_fibdir > 0, g_fibh, g_rv, g_side, g_verso, g_aff, g_pap_head);
+        const int hchg = opt_atoi("--resume-heads-change", opt(argc, argv, "--resume-heads-change", "0"));
+        if (resume) {
+            char *h = checkpoint_header_line(resume); const char *q = h ? strstr(h, "\"heads_sig\":\"") : nullptr;
+            if (q) { q += 13; const char *e = strchr(q, '"'); const size_t L = e ? (size_t)(e - q) : 0;
+                if (e && (L != strlen(sig) || strncmp(q, sig, L)) && !hchg) {
+                    fprintf(stderr, "resume: the task / heads differ from the checkpoint's:\n  checkpoint: %.*s\n  this run:   %s\n"
+                                    "refusing (a relaunch with the wrong argv?); --resume-heads-change 1 continues on purpose\n", (int)L, q, sig);
+                    free(h); return 2; }
+                if (e && (L != strlen(sig) || strncmp(q, sig, L))) fprintf(stderr, "DEFAULTED: --resume-heads-change 1: the heads change from \"%.*s\" to \"%s\"\n", (int)L, q, sig); }
+            free(h);
+        }
+        size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;
+        snprintf(runtime_extra+n-1, sizeof runtime_extra-n+1, ",\"heads_sig\":\"%s\"}", sig);
+        fprintf(stderr, "heads: %s\n", sig);
+    }
     if (g_fibdir > 0) {   /* the fibre direction head's channels (predict --channel picks one; the tracer reads the dyad) */
         size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;
         snprintf(runtime_extra+n-1, sizeof runtime_extra-n+1, ",\"fib_dir\":{\"version\":1,\"channels\":{\"H\":0,\"V\":1,\"dyad\":[%d,%d,%d,%d,%d,%d],\"family_v\":%d},\"encoding\":\"zz yy xx 0.5+zy 0.5+zx 0.5+yx\",\"r\":%d,\"lambda\":%.9g}}",
