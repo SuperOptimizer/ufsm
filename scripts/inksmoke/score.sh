@@ -8,15 +8,25 @@
 # Card 1 only (11-18): CUDA_VISIBLE_DEVICES=1 (PCI order, nvidia-smi's) and device 0 inside: latink's predict --gpu 1 alone opened card 0
 # too (the desk's try9 card). A guard polls nvidia-smi every 2 s: any process of this job on card 0, or one above GPUCAP MiB (6000: the
 # lead's card-1 limit beside try9's ~3.3 GB), is killed; the peak per process is logged to TAG/gpupeak.txt.
+# FAST=1 (2026-11-20, fullvram; default 0 until the drivers skip their own pairwrap2.py after a FAST score: it would overwrite the tsv with n = 0): latink over the held-out samples' 512 tiles only (LATINK_TILES, default
+# FASTDIR/tiles-1667: ink-wrapscore --tiles-out, 131 + 125 tiles) and no render / img-gate / pairwrap2.py: `ufsm ink-wrapscore --vmap`
+# samples ink x max(c12, c13) at each held-out sample's render pixel (render's rc_pixel at DEPTH, img-gate's table: the rendered maps'
+# AUC exactly) and writes eval/pair_TAG.{heldout,hold,valonly}.tsv itself (pairwrap2.py's columns, vs reader3) from the cached sample
+# table (FASTDIR/1667-up.uws). Any missing input, or > 0.1 % of the samples in ink shards the predict did not write, fails (exit 1, no
+# tsv). WSU: a ufsm with ink-wrapscore (default /vesuvius/ufsm/bin/ufsm-fullvram).
 set -u; TAG=${1:?TAG}; CK=${2:?CKPT}; U=${U:-/vesuvius/ufsm/bin/ufsm-inksdk}
 E=/vesuvius/ufsm/inksmoke/eval/$TAG; P=/vesuvius/ufsm/podun/PHerc1667; UP=$P/inksdk/up; CTR=/vesuvius/ufsm/v2/ct; CTK=PHerc1667/20251217075048-2.399um-0.2m-78keV-masked.zarr
-[ -s $E/map/w051.tif ] && { echo "score $TAG: done before"; exit 0; }
+FAST=${FAST:-0}; FASTDIR=${FASTDIR:-/vesuvius/ufsm/inksmoke/fast}; WSU=${WSU:-/vesuvius/ufsm/bin/ufsm-fullvram}
+[ $FAST = 1 ] && [ -e $E/fast.done ] && { echo "score $TAG: done before (FAST)"; exit 0; }
+[ $FAST = 1 ] || { [ -s $E/map/w051.tif ] && { echo "score $TAG: done before"; exit 0; }; }
+[ $FAST = 1 ] && { [ -x $WSU ] && [ -s $FASTDIR/1667-up.uws ] && [ -s $FASTDIR/tiles-1667/tiles0.txt ] || { echo "score $TAG: FAST needs $WSU, $FASTDIR/1667-up.uws, $FASTDIR/tiles-1667"; exit 1; }; }
 exec 8> /vesuvius/ufsm/inksdk/score.lock; flock 8   # (one score at a time on the desk, team rule 11-20; the drivers queue here)
 mkdir -p $E/ink $E/in $E/map $E/r; cp $P/box.txt $P/axis.json $E/
 # GATEFROM=EVALDIR (a net without recto / verso rows, e.g. the full-res ink run): predict ink only; the papyrus gate (c12 / c13) is that
 # eval's volumes (t9c-500: try9's rv on the same 1667 grid), rendered here at this DEPTH
 [ -n "${GATEFROM:-}" ] && for h in c12 c13; do ln -sfn $GATEFROM/ink/$h.zarr $E/ink/$h.zarr; done
 LK="flock -s /tmp/ufsm-suite-locks/gpu1.excl flock -s /vesuvius/ufsm/opt/gpu1.lock"
+unset CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY   # (a card-0 MPS client env must not reach the card-1 predict)
 export CUDA_DEVICE_ORDER=PCI_BUS_ID; GPUCAP=${GPUCAP:-6000}
 C0=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader | awk -F', ' '$1 == 0 {print $2}'); C1=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader | awk -F', ' '$1 == 1 {print $2}')
 [ -n "$C0" ] && [ -n "$C1" ] || { echo "score $TAG: no card uuids"; exit 1; }
@@ -27,7 +37,13 @@ guard() { while :; do nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory -
   done; sleep 2; done; }
 guard & GP=$!; trap 'kill $GP 2>/dev/null; [ -s $E/gpumem.log ] && sort -k3 -n $E/gpumem.log | tail -1 | sed "s/^/peak: /" >> $E/gpupeak.txt' EXIT
 [ -e $E/ink/ink.zarr/zarr.json ] || $LK env CUDA_VISIBLE_DEVICES=1 U=$U LATINK_CK=$CK ITH=8 UNROLL_CT="$CTR|$CTK|2.399|2" ~/bin/memcap -m 36G ~/bin/lowprio \
-  env LATINK_HEADS=${GATEFROM:+ink} bash ${LATINK:-$(dirname "$(readlink -f "$0")")/../pod/latink.sh} $E 0 $E/ink/ink.zarr > $E/latink.log 2>&1 || { echo "score $TAG: latink failed ($E/latink.log)"; exit 1; }
+  env LATINK_HEADS=${GATEFROM:+ink} LATINK_TILES=${LATINK_TILES:-$([ $FAST = 1 ] && echo $FASTDIR/tiles-1667)} bash ${LATINK:-$(dirname "$(readlink -f "$0")")/../pod/latink.sh} $E 0 $E/ink/ink.zarr > $E/latink.log 2>&1 || { echo "score $TAG: latink failed ($E/latink.log)"; exit 1; }
+if [ $FAST = 1 ]; then
+  ~/bin/memcap -m 12G ~/bin/lowprio $WSU ink-wrapscore $UP /vesuvius/ufsm/inkgt/segs-PHerc1667.json $(dirname $E)/pair_$TAG --ct-key $CTK --maps reader3=$P/ink/reader3/map \
+    --vmap $TAG=$E/ink --depth ${DEPTH:-4} --ref reader3 --nonzero reader3 --split heldout,hold,valonly --need w035-w051 --table $FASTDIR/1667-up.uws --threads 6 > $E/wrapscore.log 2>&1 \
+    || { echo "score $TAG: ink-wrapscore failed ($E/wrapscore.log)"; exit 1; }
+  touch $E/fast.done; echo "score $TAG: FAST $(awk -F'\t' -v t=$TAG '$1 == t {print "heldout AUC", $3, "vs reader3", $4, "n", $2}' $(dirname $E)/pair_$TAG.heldout.tsv)"; exit 0
+fi
 for n in $(seq 35 51); do ln -sfn $UP/w0$n $E/in/w0$n; done
 for h in ink c12 c13; do v=$E/ink/$h.zarr; mkdir -p $E/r/$h; [ -e $E/r/$h/.done ] && continue
   $LK env CUDA_VISIBLE_DEVICES=1 UFSM_RENDER_MEM=16 UFSM_RENDER_CHUNKED=1 UFSM_RENDER_GPU_MEM=4 ~/bin/memcap -m 36G ~/bin/lowprio $U render $E/in $E/r/$h \
