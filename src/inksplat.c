@@ -1832,7 +1832,8 @@ static int tile_px(inkfly *f, size_t t, cpx **X, size_t *np, size_t *cap, double
 /* the build's batches: tiles sorted by the Morton code of their centre's 128-voxel cell, a batch = up to 64 tiles of one cell, so its CT
    box is about a cell (consecutive tiles of a label row were a slab across the scroll: 0009B's 14306 tiles took 643 s on 6 CPUs, ~90 %
    of it CT decode; by cell 17 s, the same bits) and neighbouring batches share the decoded chunks (the ink CT cache) */
-typedef struct { inkfly *f; uint8_t *bits; const uint32_t *ord; const size_t *bs; size_t nb, nt; _Atomic size_t next, done; _Atomic int fail; double t0; } rfjob;
+typedef struct { inkfly *f; uint8_t *bits; const uint32_t *ord; const size_t *bs; size_t nb, nt; _Atomic size_t next, done; _Atomic int fail; double t0;
+                 _Atomic uint64_t *usup, *uface; } rfjob;   /* per unit: supervised pixels with a mesh point, those with a face */
 static int rf_cmp(const void *a, const void *b) { const uint64_t *x = a, *y = b; return x[0] != y[0] ? (x[0] < y[0] ? -1 : 1) : (x[1] < y[1] ? -1 : x[1] > y[1]); }
 static uint64_t rf_morton(uint64_t z, uint64_t y, uint64_t x) {
     uint64_t m = 0; for (int i = 0; i < 21; i++) m |= ((z >> i & 1) << (3 * i + 2)) | ((y >> i & 1) << (3 * i + 1)) | ((x >> i & 1) << (3 * i)); return m;
@@ -1845,8 +1846,30 @@ static void *rf_worker(void *a) {
         for (size_t i = b; i < e; i++) if (tile_px(f, J->ord[i], &X, &np, &cap, lo3, hi3)) { atomic_store(&J->fail, 1); break; }
         if (atomic_load(&J->fail)) break;
         if (np > dcap) { free(drop); dcap = np; drop = malloc(dcap); if (!drop) { atomic_store(&J->fail, 1); break; } }
-        if (np) { memset(drop, 0, np); if (rays_face(f, X, np, lo3, hi3, drop)) { atomic_store(&J->fail, 1); break; } }
+        /* the face search per 64-voxel cell of the points (level 0), each with its own tight box: one batch's tiles may still spread over the
+           scan (0139: a tile's mesh points far apart), and one box over all of them decoded slabs across the scroll (~1.3 h for 128k tiles) */
+        if (np) {
+            memset(drop, 0, np); uint64_t *ky = malloc(np * 2 * sizeof *ky); cpx *Y = malloc(np * sizeof *Y); uint8_t *dy = malloc(np);
+            if (!ky || !Y || !dy) { free(ky); free(Y); free(dy); atomic_store(&J->fail, 1); break; }
+            for (size_t i = 0; i < np; i++) { uint64_t c3[3]; for (int d = 0; d < 3; d++) c3[d] = X[i].P[d] > 0 ? (uint64_t)(X[i].P[d] / 64) : 0; ky[2 * i] = rf_morton(c3[0], c3[1], c3[2]); ky[2 * i + 1] = i; }
+            qsort(ky, np, 2 * sizeof *ky, rf_cmp);
+            (void)lo3; (void)hi3;
+            const int reach = (int)ceil(fmax(fabs(f->c.face_lo), fabs(f->c.face_hi))) + 2;
+            for (size_t a = 0; a < np && !atomic_load(&J->fail);) {
+                size_t b2 = a; double l3[3] = {1e300, 1e300, 1e300}, h3[3] = {-1e300, -1e300, -1e300};
+                while (b2 < np && ky[2 * b2] == ky[2 * a]) { const cpx *x = &X[ky[2 * b2 + 1]]; Y[b2 - a] = *x;
+                    for (int d = 0; d < 3; d++) { if (x->P[d] - reach < l3[d]) l3[d] = x->P[d] - reach; if (x->P[d] + reach > h3[d]) h3[d] = x->P[d] + reach; } b2++; }
+                memset(dy, 0, b2 - a);
+                if (rays_face(f, Y, b2 - a, l3, h3, dy)) { atomic_store(&J->fail, 1); break; }
+                for (size_t i = a; i < b2; i++) drop[ky[2 * i + 1]] = dy[i - a];
+                a = b2;
+            }
+            free(ky); free(Y); free(dy);
+            if (atomic_load(&J->fail)) break;
+        }
         for (size_t i = 0; i < np; i++) if (drop[i]) J->bits[(size_t)X[i].t * RF_TB + X[i].px / 8] |= (uint8_t)(1u << (X[i].px % 8));   /* (tiles of a batch: this thread's only) */
+        for (size_t i = 0; i < np; i++) { const uint32_t un = f->T[X[i].t].unit; atomic_fetch_add_explicit(&J->usup[un], 1, memory_order_relaxed);
+                                          if (drop[i]) atomic_fetch_add_explicit(&J->uface[un], 1, memory_order_relaxed); }
         const size_t dn = atomic_fetch_add(&J->done, e - b) + (e - b);
         if (dn / 20000 != (dn - (e - b)) / 20000) fprintf(stderr, "ink rayface: %zu of %zu tiles, %.0f s\n", dn, J->nt, snow() - J->t0);
     }
@@ -1865,11 +1888,22 @@ int inkfly_rayface_build(void *handle, int nthreads, int force) {
     qsort(key, f->nT, 2 * sizeof *key, rf_cmp);
     size_t nb = 0; for (size_t i = 0; i < f->nT; i++) { ord[i] = (uint32_t)key[2 * i + 1]; if (!i || key[2 * i] != key[2 * i - 2] || i - bs[nb - 1] >= 64) bs[nb++] = i; }
     bs[nb] = f->nT; free(key);
-    rfjob J = {f, bits, ord, bs, nb, f->nT, 0, 0, 0, snow()};
+    rfjob J = {f, bits, ord, bs, nb, f->nT, 0, 0, 0, snow(), calloc((size_t)f->nU + 1, sizeof(uint64_t)), calloc((size_t)f->nU + 1, sizeof(uint64_t))};
+    if (!J.usup || !J.uface) { free(bits); free(ord); free(bs); free(J.usup); free(J.uface); return -1; }
     const int nth = nthreads < 1 ? 1 : nthreads > 64 ? 64 : nthreads; pthread_t th[64];
     for (int i = 0; i < nth; i++) pthread_create(&th[i], nullptr, rf_worker, &J);
     for (int i = 0; i < nth; i++) pthread_join(th[i], nullptr);
     free(ord); free(bs);
+    {   /* the face-found share per segment (label window) and in all: a pixel without a face is no voxel target (MIL rays only); a scan whose
+           CT never reaches the iso along the face range [face_lo, face_hi] gets no voxel ink at all (2026-11-20 lead: per-source iso?) */
+        uint64_t ts = 0, tf = 0;
+        for (int i = 0; i < f->nU; i++) { const uint64_t su = atomic_load(&J.usup[i]), fa = atomic_load(&J.uface[i]); ts += su; tf += fa;
+            printf("ink rayface: segment %d (%s): %llu supervised pixels with a mesh point, %llu (%.1f%%) with a face\n", i, f->Lpath[f->U[i].lab], (unsigned long long)su,
+                   (unsigned long long)fa, su ? 100.0 * fa / su : 0.); }
+        printf("ink rayface: all %d segments: %llu supervised pixels, %llu (%.1f%%) with a face (iso %d, face [%g, %g], searched along t [%g, %g])\n", f->nU, (unsigned long long)ts,
+               (unsigned long long)tf, ts ? 100.0 * tf / ts : 0., f->c.iso, f->c.face_a, f->c.face_b, f->c.face_lo, f->c.face_hi);
+        free(J.usup); free(J.uface);
+    }
     if (atomic_load(&J.fail)) { fprintf(stderr, "ink rayface: failed (a label / mask / CT read)\n"); free(bits); return -1; }
     FILE *o = fopen(tmp, "wb"); uint8_t h[RF_HDR] = {'U', 'R', 'F', '1'}; const uint64_t nt = f->nT; memcpy(h + 8, &nt, 8);
     const int ok = o && fwrite(h, 1, RF_HDR, o) == RF_HDR && fwrite(bits, RF_TB, f->nT, o) == f->nT;
