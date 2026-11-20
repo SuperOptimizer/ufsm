@@ -766,6 +766,20 @@ static int lw_pm(const batch *b) { return g_unwrap && g_pack && g_gpu_aug == 2 &
 static int plane_bank_want(void) { return !getenv("UFSM_PLANE_BANK") || ufsm_env_on("UFSM_PLANE_BANK"); }
 static int tm_slot_skip4(int split) { return !g_pack && (!split || g_lsplit) && (!getenv("UFSM_TM_SKIP4") || ufsm_env_on("UFSM_TM_SKIP4")); }
 static int pm_used(void) { return g_unwrap && (!g_unwrap2 || g_pap_head); }
+/* the task / heads signature (header "heads_sig", 2026-11-20): a resume whose task or heads differ from the checkpoint's is refused, not
+   defaulted (a relaunch that lost its HEADS argv restarted a fibre run as the rv task); --resume-heads-change 1 continues on purpose */
+static void heads_sig(const char *task, char *sig, size_t n) {
+    snprintf(sig, n, "task=%s cout=%d fibdir=%d fibh=%d rv=%d side=%d verso=%d aff=%d pap=%d", task, g_cout, g_fibdir > 0, g_fibh, g_rv, g_side, g_verso, g_aff, g_pap_head);
+}
+static int heads_check(const char *resume, const char *sig, int allow) {   /* 0 continue, 2 refuse; checkpoints without the key: 0 */
+    char *h = checkpoint_header_line(resume); const char *q = h ? strstr(h, "\"heads_sig\":\"") : nullptr; int rc = 0;
+    if (q) { q += 13; const char *e = strchr(q, '"'); const size_t L = e ? (size_t)(e - q) : 0;
+        if (e && (L != strlen(sig) || strncmp(q, sig, L))) {
+            if (!allow) { fprintf(stderr, "resume: the task / heads differ from the checkpoint's:\n  checkpoint: %.*s\n  this run:   %s\n"
+                                          "refusing (a relaunch with the wrong argv?); --resume-heads-change 1 continues on purpose\n", (int)L, q, sig); rc = 2; }
+            else fprintf(stderr, "DEFAULTED: --resume-heads-change 1: the heads change from \"%.*s\" to \"%s\"\n", (int)L, q, sig); } }
+    free(h); return rc;
+}
 /* one label kind of a batch (nn_label_warp's: 0 packed targets / mask, 1 phase, 2 winding mod 4 + component) into da (db): --gpu-aug 2
    batches (batch.ct8) carry source-grid labels for windows with a warped radial record, warped on the device (rad: the records' device
    copy, uploaded first by ct_upload); the rest are copies */
@@ -4254,6 +4268,8 @@ int cmd_train(int argc, char **argv) {
         unet_set_fp16_logits(d->u, (!g_half || g_pkf) && !g_sheet && !ufsm_env_on("UFSM_LOGITS32"));
         if (g_lat_have) unet_set_lat_basis(d->u, g_lat_bas, g_lat_gain, g_lat_c, g_lat_step);
         if (resume) {
+            { char sig[256]; heads_sig(task, sig, sizeof sig);   /* before the load: a shape mismatch there would hide the reason */
+              if (heads_check(resume, sig, opt_atoi("--resume-heads-change", opt(argc, argv, "--resume-heads-change", "0")))) return 2; }
             const int grow = opt_atoi("--grow-head", opt(argc, argv, "--grow-head", "0"));   /* band_affinity warm start from a recto checkpoint */
             if (cfg.emb_lev) unet_init(d->u, seed + 1);   /* (a checkpoint without the side head gets this init inserted for it: unet_load copies
                                                               the block from u->p, which unet_create leaves unset -- zeros froze the 11-12 unissl
@@ -4958,6 +4974,13 @@ int cmd_train(int argc, char **argv) {
         size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;
         snprintf(runtime_extra+n-1, sizeof runtime_extra-n+1,
             ",\"target\":{\"version\":1,\"erode_native_voxels\":%d,\"erosion_kernel\":\"face6\",\"soft_sigma\":%.9g,\"soft_unit\":\"%s\",\"loss_tolerance_voxels\":%d}}", sc.erode, sc.soft, sc.soft_um ? "um" : "vox", nn_get_loss_tol());
+    }
+    {   /* the task / heads signature (2026-11-20): a resume whose task or heads differ from the checkpoint's is refused, not defaulted
+           (a relaunch that lost its HEADS argv silently restarted a fibre run as the rv task); --resume-heads-change 1 allows it on purpose */
+        char sig[256]; heads_sig(task, sig, sizeof sig);   /* (the resume check ran before the weights loaded: heads_check) */
+        size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;
+        snprintf(runtime_extra+n-1, sizeof runtime_extra-n+1, ",\"heads_sig\":\"%s\"}", sig);
+        fprintf(stderr, "heads: %s\n", sig);
     }
     if (g_fibdir > 0) {   /* the fibre direction head's channels (predict --channel picks one; the tracer reads the dyad) */
         size_t n = strlen(runtime_extra); runtime_extra[n-1] = 0;

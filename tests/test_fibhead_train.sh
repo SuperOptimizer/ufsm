@@ -3,7 +3,7 @@
 # wind fixture's tube rasters: whole-voxel trunk; latent (--lat 4 --rv 2) with the label stream check (the fibre planes' +-r halo planes,
 # 0 differing bytes) and streamed == device-kept planes; --init-from a run without the head (rows kept, fibre rows fresh) and a resume;
 # the fine stem with the head (16 stem outputs, the pad channels excluded); a fibre-only source (fibre_h / fibre_v, no band / phase) draws around papyrus cells in the stored target chunks, alone and mixed
-# with a winding source
+# with a winding source; the resume's heads signature (header heads_sig, logged) and the refusal of a resume whose heads differ
 # Usage: test_fibhead_train.sh UFSM MAKE_WIND_FIXTURE DIR
 set -eu
 . "$(dirname "$(readlink -f "$0")")/det_cmp.sh"
@@ -30,6 +30,11 @@ ok fs.log '^step      4 .* fib bce [0-9]\.[0-9]* dir 0\.[0-9]*' "fstem + fib-hea
 ok ini.log 'init-from: head rows 0-12 copied, rows 13-21 (fibre head) fresh' "init-from rows"
 "$U" train fx/sources-fibhv.json --out ini "${C[@]}" "${L[@]}" --steps 5 --fib-head 1 --resume ini/last.ckpt > res.log 2>&1 || { echo "FAIL: resume ($D/res.log)"; exit 1; }
 ok res.log '^step      5 .* fib bce' "resume"
+ok res.log '^heads: task=unwrap2 cout=[0-9]* fibdir=0 fibh=1 ' "resume: the heads signature"
+head -1 ini/last.ckpt | grep -q '"heads_sig":"task=unwrap2 cout=[0-9]* fibdir=0 fibh=1 ' || { echo "FAIL: header heads_sig"; exit 1; }
+# a resume whose heads differ (here: the relaunch lost --fib-head) is refused, not defaulted
+rc=0; "$U" train fx/sources-fibhv.json --out ini "${C[@]}" "${L[@]}" --steps 6 --resume ini/last.ckpt > resx.log 2>&1 || rc=$?
+[ $rc = 2 ] && grep -q 'resume: the task / heads differ from the checkpoint' resx.log || { echo "FAIL: a heads-changing resume was not refused (rc $rc, $D/resx.log)"; exit 1; }
 head -1 ini/last.ckpt | grep -q '"fib_dir":{"version":1,"head":1,"channels":{"H":13,"V":14' || { echo "FAIL: header fib_dir"; exit 1; }
 python3 - <<'PY'
 import json

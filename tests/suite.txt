@@ -430,3 +430,4 @@ test_split_ab                                  | gpu2,slow    |   150 | tests/te
 test_wbench_gpulock                            |              |     1 | tests/test_wbench_gpulock.sh
 test_wbench_fail                               |              |     2 | tests/test_wbench_fail.sh
 test_occ_cache                                 |              |     1 | ./$B/test_occ_cache $TMPDIR
+test_relaunch_argv                             |              |     2 | tests/test_relaunch_argv.sh $TMPDIR
