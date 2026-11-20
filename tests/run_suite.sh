@@ -313,7 +313,7 @@ run_one() {
     local to=$TO es=${EST[$n]%.*}; [ "${es:-0}" -gt "$to" ] && to=$es   # a test whose EST exceeds -x gets EST as its timeout (the solo racecheck runs: measured x 1.5, sweep 11-14)
     local mark="$OUT/$n.$a.$BASHPID"
     ( export UFSM_SUITE_RUN="$mark" B="$BDIR" TMPDIR="$tmp" UFSM_TEST_TMP="$tmp" UFSM_SUITE_TEST="$n" UFSM_PRED_NO_AXIS=1 UFSM_NCPU=$T UFSM_FIT_THREADS=$T UFSM_TIFF_THREADS=$T \
-             OMP_NUM_THREADS=$T OPENBLAS_NUM_THREADS=$T MKL_NUM_THREADS=$T
+             OMP_NUM_THREADS=$T OPENBLAS_NUM_THREADS=$T MKL_NUM_THREADS=$T UFSM_STARTUP_TIMES=${UFSM_STARTUP_TIMES:-0}
       # a test without the gpu tag sees no GPU: one that needs it fails or skips here instead of using a card without the lock (2026-11-13:
       # test_attn, test_attn_ray / _dfm, test_spiralfit, test_countfield, test_mesh_phase ran untagged on GPUs held by training runs)
       if [ -n "$g" ]; then export CUDA_VISIBLE_DEVICES=$g; else export CUDA_VISIBLE_DEVICES=; fi

@@ -50,6 +50,30 @@
 #include "dino.h"
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+/* the start-up timeline (2026-11-20, devspeed: 10-20 min start-ups nobody could split): until the first step ends every stderr line of
+   train.c starts "t+12.3s " (monotonic since cmd_train), and tl_mark() records the phase ends for one "startup:" summary line after the
+   first step. Other files' lines stay as they are; UFSM_STARTUP_TIMES=0 turns the prefix off. */
+static double g_tl0, g_tl_t[8]; static const char *g_tl_n[8]; static int g_tl_k, g_tl_on, g_tl_bol = 1;   /* mgpu: main (start-up, before the threads) */
+static void tl_mark(const char *phase) { if (g_tl_k < 8) { g_tl_n[g_tl_k] = phase; g_tl_t[g_tl_k++] = now(); } }
+static int tl_fprintf(FILE *f, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static int tl_fprintf(FILE *f, const char *fmt, ...) {
+    va_list a; va_start(a, fmt); int r = 0;
+    if (f == stderr && g_tl_on) {   /* (one write per line: the prefix and the text together, so another thread's line does not split it) */
+        char b[4096]; int k = g_tl_bol ? snprintf(b, sizeof b, "t+%.1fs ", now() - g_tl0) : 0; const int m = vsnprintf(b + k, sizeof b - (size_t)k, fmt, a);
+        if (m >= 0 && (size_t)(k + m) < sizeof b) { r = fputs(b, f) < 0 ? -1 : k + m; g_tl_bol = k + m > 0 && b[k + m - 1] == '\n'; va_end(a); return r; }
+        va_end(a); va_start(a, fmt); if (k) fputs((b[k] = 0, b), f);
+    }
+    r = vfprintf(f, fmt, a); va_end(a);
+    const size_t n = strlen(fmt); if (f == stderr) g_tl_bol = n && fmt[n - 1] == '\n';
+    return r;
+}
+static void tl_summary(void) {
+    if (!g_tl_on) return;
+    g_tl_on = 0; char b[512]; size_t k = (size_t)snprintf(b, sizeof b, "startup: %.1f s to the first step's end:", (g_tl_k ? g_tl_t[g_tl_k - 1] : now()) - g_tl0);
+    for (int i = 0; i < g_tl_k && k < sizeof b; i++) k += (size_t)snprintf(b + k, sizeof b - k, " %s %.1f s%s", g_tl_n[i], g_tl_t[i] - (i ? g_tl_t[i - 1] : g_tl0), i + 1 < g_tl_k ? "," : "");
+    fprintf(stderr, "%s\n", b);
+}
+#define fprintf(...) tl_fprintf(__VA_ARGS__)
 /* option lookups go through src/optcheck.h: opt_unread() warns about command-line --flags no lookup has asked for (2026-11-12: train
    silently ignored a mistyped "--sampler-only 200", the env UFSM_SAMPLER_ONLY being the real switch, and trained on a GPU for an hour).
    train checks once its setup is done (the options read only later in the loop are few); main() checks again when any command returns */
@@ -2783,8 +2807,65 @@ static void csv_extend_header(const char *path, const char *full) {   /* FULL: t
     fclose(f); if (fclose(o) == 0) rename(tmp, path); else remove(tmp);
 }
 
+/* the run-health warnings (2026-11-20, devspeed: T9C's ink head row sat at W rms 4.542e-02 from step 11 to 2991 and nobody saw it for
+   hours). (a) frozen parameters: the parameters at step0 + 10 kept on the host; at step0 + 100, + 300 and every log line after, a group
+   (unet_param_groups: each Muon matrix, each head output row, the AdamW ranges) with |W - W10| / |W10| < 1e-4 (or still all 0) prints
+   "WARNING frozen:", while its learning rate is > 0. (b) dead loss terms: a term of the step line (" phase bce 0.0000 (0% of windows)")
+   exactly 0 for 100+ steps prints "WARNING dead loss:". --strict-health 1 exits 4 at the first warning (smoke arms die instead of running
+   for hours). mgpu: main (the step loop's log block) */
+static int g_strict_health;
+static void health_fail(void) { if (g_strict_health) { fprintf(stderr, "--strict-health 1: stopping (exit 4)\n"); fflush(stderr); exit(4); } }
+static void health_params(unet *u, int step, int step0, int logstep, float lr, float mlr) {
+    static float *w10; static size_t (*rg)[2]; static char (*nm)[40]; static int ng, last = -1; static size_t np;   /* mgpu: main */
+    if (step == step0 + 10 && !w10) {
+        np = unet_nparams(u); w10 = malloc(np * 4); rg = malloc(4096 * sizeof *rg); nm = malloc(4096 * sizeof *nm);
+        if (!w10 || !rg || !nm) { free(w10); w10 = nullptr; return; }
+        unet_params_d2h(u, w10); ng = unet_param_groups(u, rg, nm, 4096); return;
+    }
+    if (!w10 || !(step == step0 + 100 || step == step0 + 300 || (logstep && step > step0 + 300)) || !(lr > 0)) return;
+    float *w = malloc(np * 4); if (!w) return;
+    unet_params_d2h(u, w);
+    int nf = 0; char b[1024]; size_t k = 0;
+    for (int i = 0; i < ng; i++) {
+        const int mat = !strncmp(nm[i], "conv", 4); if (mat && !(mlr > 0)) continue;
+        double s0 = 0, d = 0; for (size_t j = rg[i][0]; j < rg[i][0] + rg[i][1]; j++) { const double a = w10[j], e = (double)w[j] - a; s0 += a * a; d += e * e; }
+        if (s0 > 0 ? sqrt(d / s0) < 1e-4 : d == 0) { if (nf++ < 12 && k < sizeof b) k += (size_t)snprintf(b + k, sizeof b - k, "%s%s (rms %.3e)", nf > 1 ? ", " : "", nm[i], sqrt(s0 / (double)rg[i][1])); }
+    }
+    free(w);
+    if (nf && (step == step0 + 100 || step == step0 + 300 || nf != last)) {
+        fprintf(stderr, "WARNING frozen: %d of %d parameter groups unchanged since step %d (|dW| / |W| < 1e-4) at lr %.2e: %s%s\n", nf, ng, step0 + 10, lr, b, nf > 12 ? ", ..." : "");
+        health_fail();
+    }
+    last = nf;
+}
+static void health_terms(int step, const char *s) {   /* s: the step line's terms; a number after 1-2 words (outside parentheses) is a term's value */
+    static struct { char n[40]; int z0, warned; } T[64]; static int nt;   /* mgpu: main */
+    char w1[40] = "", w2[40] = ""; int depth = 0;
+    for (const char *p = s; *p;) {
+        while (*p == ' ') p++; if (!*p) break;
+        const char *e = p; while (*e && *e != ' ') e++; const int L = (int)(e - p);
+        for (const char *q = p; q < e; q++) depth += (*q == '(') - (*q == ')');
+        char t[64]; snprintf(t, sizeof t, "%.*s", L < 63 ? L : 63, p); p = e;
+        if (depth > 0 || strchr(t, ')')) { w1[0] = w2[0] = 0; continue; }
+        char *end; const double v = strtod(t, &end);
+        if (end != t && !*end && *w2) {
+            char nmv[40]; snprintf(nmv, sizeof nmv, "%s%s%s", w1, *w1 ? " " : "", w2);
+            int i = 0; while (i < nt && strcmp(T[i].n, nmv)) i++;
+            if (i == nt && nt < 64) { snprintf(T[nt].n, 40, "%s", nmv); T[nt].z0 = -1; T[nt].warned = 0; nt++; }
+            if (i < nt) {
+                if (v != 0 || !strchr(t, '.')) T[i].z0 = -1;
+                else { if (T[i].z0 < 0) T[i].z0 = step;
+                       if (step - T[i].z0 >= 100 && !T[i].warned) { T[i].warned = 1; fprintf(stderr, "WARNING dead loss: \"%s\" has been exactly 0 since step %d (an enabled term with no gradient)\n", nmv, T[i].z0); health_fail(); } }
+            }
+            w1[0] = w2[0] = 0; continue;
+        }
+        if (end == t) { snprintf(w1, sizeof w1, "%s", w2); snprintf(w2, sizeof w2, "%s", t); } else w1[0] = w2[0] = 0;
+    }
+}
 int cmd_train(int argc, char **argv) {
+    g_tl0 = now(); { const char *e = getenv("UFSM_STARTUP_TIMES"); g_tl_on = !(e && !strcmp(e, "0")); }
     if (ufsm_env_on("UFSM_UW_SELFTEST")) return uw_selftest();
+    g_strict_health = opt_atoi("--strict-health", opt(argc, argv, "--strict-health", "0"));   /* 1: exit 4 at a "WARNING frozen:" / "dead loss:" */
     {   /* --ct-gpu-decode D (DESIGN 2026-11-13): the sampler's volcomp CT decode on GPU D (src/nn_gpudec.cu, byte-identical to the CPU decode;
            test_gpudec), i.e. UFSM_GPU_DECODE=1 UFSM_GPU_DECODE_DEV=D, set before the first z3 decode (the sources' draw-index reads) because the
            decoder reads its env once; -1 (default) keeps the CPU decode. Its statistics print at exit. */
@@ -3616,7 +3697,7 @@ int cmd_train(int argc, char **argv) {
         const char *im = opt(argc, argv, "--ink-cache-mb", "0"); if (atol(im) > 0 && inkfly_cache_budget) inkfly_cache_budget((size_t)atol(im)); }
     { const char *pm = opt(argc, argv, "--onfly-cache-mb", "0"); if (atol(pm) > 0) sources_set_onfly_cache_mb((size_t)atol(pm)); }   /* the onfly phase cells' shared LRU (default 2048) */
     sources_set_strict(opt_atoi("--strict-sources", opt(argc, argv, "--strict-sources", "0")));
-    sources *S = sources_load(src);
+    tl_mark("setup"); sources *S = sources_load(src); tl_mark("sources");
     g_Sdiag = S;
     if (!S) return 1;
     g_S = S;
@@ -4453,7 +4534,7 @@ int cmd_train(int argc, char **argv) {
             static const int ord_small[] = {5, 4, 3, 2, 1, 0, 8, 7, 6, 9, 10, 11, 12, 13};   /* (16-bit modes: list order, no recompute-1 lean ones) */
             const int l3_off = getenv("UFSM_L0_3BUF") && !ufsm_env_on("UFSM_L0_3BUF");   /* (UFSM_L0_3BUF=0: never the three level-0 buffers) */
             const int fastest = !strcmp(mm, "fast");
-            size_t fmin = (size_t)-1;
+            tl_mark("labels + model"); size_t fmin = (size_t)-1;
             for (int g = 0; g < ng; g++) { nn_init(G[g].dev); unet_reserve(G[g].u, use_muon, muon_tc); if (g == 0 && use_muon && opt_stats > 0) unet_opt_stats_reserve(G[g].u); if (g_lat && lp_f8w_mixed_reserve()) fprintf(stderr, "memory: the input conv's chunk copies (96 MB) failed\n");
                                            if (g_fstem && nn_fstem_reserve(g_fstem, g_fs_n)) fprintf(stderr, "memory: the fine stem's partial sums failed\n"); }   /* (5.3 MB at 16 -> 16) */
             /* (the lazily allocated optimizer / attention / kernel workspaces exist now, so the free memory below has them out: 2026-11-14 audit) */
@@ -5296,7 +5377,7 @@ int cmd_train(int argc, char **argv) {
         fprintf(stderr, "train: --lat-direct-p %g: %d of %d sources have a \"latvol\" twin; their direct windows take the trunk's input from the stored cells (no step jitter)\n", g_lat_dp, nlv, S->n);
         sc.lat_direct_p = g_lat_dp;
     }
-    sampler *sp = sampler_start(S, &sc); g_vs_sp = sp;
+    tl_mark("plan + workspaces"); sampler *sp = sampler_start(S, &sc); g_vs_sp = sp; tl_mark("sampler start");
     if (!sp) return 1;
     char logp[1400]; snprintf(logp, sizeof logp, "%s/log.csv", out);
     if (step0) csv_extend_header(logp, "step,lr,loss,bce,dice,active,gnorm,val_loss,val_bce,val_dice,samples_per_s,wait_s,gns,gns_g2,gns_s,gate_s");   /* (a resumed run's older log.csv: the header gains the new columns) */
@@ -5335,6 +5416,7 @@ int cmd_train(int argc, char **argv) {
     double *viks = nullptr; double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
     train_unread_flags(argc, argv);
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
+        if (step == step0 + 2 && g_tl_on) { tl_mark("first step"); tl_summary(); }   /* (the first batch's wait + the first step: the kernels' JIT) */
         {   /* UFSM_CUPROF=A,B: cudaProfilerStart before step A, Stop after step B (nsys --capture-range=cudaProfilerApi: a steady-state window of a P 1024 run) */
             static int pa = -2, pb; if (pa == -2) { const char *e = getenv("UFSM_CUPROF"); pa = -1; if (e && sscanf(e, "%d,%d", &pa, &pb) != 2) pa = -1; }
             extern int cudaProfilerStart(void), cudaProfilerStop(void), cudaDeviceSynchronize(void);
@@ -5754,6 +5836,9 @@ int cmd_train(int argc, char **argv) {
         if (g_restore) { acc_rn += G[0].rst_h[0]; acc_re += G[0].rst_h[3]; acc_rb += G[0].rst_h[4]; }
         if (g_count_lambda > 0) { acc_cnt += G[0].cnt_h[0]; acc_cnr += G[0].cnt_h[2]; for (int b = 0; b < 18; b++) acc_cbin[b] += G[0].cnt_h[3 + b]; }
         }
+        {   const int lg = step % log_every == 0;   /* the frozen-parameter check (health_params) on the step's updated weights */
+            if (step == step0 + 10 || step == step0 + 100 || step == step0 + 300 || (lg && step > step0 + 300)) {
+                nn_init(G[0].dev); health_params(G[0].u, step, step0, lg, lr, use_muon ? muon_lr * (lr0 > 0.f ? lr / lr0 : 0.f) : lr); } }
         if (step % log_every == 0 || step == steps || g_stop) {
             double dt = now() - tlog; const double nok = nacc - nskl > 0 ? nacc - nskl : 1;   /* (the means: over the steps not skipped) */
             double vl = -1, vb = 0, vd = 0, vh[TCMAX] = {0}; int vhn[TCMAX] = {0}; double vw4[6] = {0}, vw4n[3] = {0};   /* unwrap2: wind4 bce, worst-gauge bce, right turns, voxels, phase, normal; vw4n: windows with wind4 / phase / normal labels */
@@ -6051,6 +6136,7 @@ int cmd_train(int argc, char **argv) {
               if (pk > g_mil_reserve && !mw++) fprintf(stderr, "ink mil: WARNING its buffers reached %.2f GB, the memory plan kept %.2f GB\n", pk / 1e9, g_mil_reserve / 1e9); }
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s %.1f Mvox/s (wait %.0f%%%s)%s%s\n", step, lr, acc_loss / nok, acc_bce / nok, acc_dice / nok, affs, acc_g / nok,
                     (double)nacc * B * nl / dt, (double)nacc * B * nl * g_Pz * P * P / 1e6 / dt, 100 * wait / dt, gs, vl >= 0 ? " val " : "", vl >= 0 ? vstr : "");
+            health_terms(step, affs);   /* (dead loss terms: the per-term part; the top-level bce / dice are their aggregate) */
             {   /* the on-the-fly phase since the last log line: reads, tiles (on the GPU), the pair rule's seconds per read (summed over threads) */
                 static phase_onfly_stats o0; phase_onfly_stats o1; phase_onfly_get_stats(&o1);
                 if (o1.reads > o0.reads) fprintf(stderr, "  onfly phase: %llu reads, %llu tiles (%llu GPU-decoded), %.0f ms per read in the pair rule, %.0f ms in CPU codes reads\n",

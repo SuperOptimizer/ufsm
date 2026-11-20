@@ -223,6 +223,9 @@ void unet_set_muon_probe(unet *u, int stride, int log);
 void unet_set_muon_adapt2(unet *u, int kap, float kb, int cool, int n, int m, float delta, float c, float decay, float floor);   /* train --muon-probe S: log the Muon directions' lag autocorrelation / kappa / progress (every S-th element; 0 off) */
 void unet_opt_stats_arm(unet *u);
 int unet_opt_stats_str(unet *u, char *buf, size_t cap);
+/* train's frozen-parameter check: the groups (offset, count into the unet_nparams floats) with a name each: every Muon matrix, every head
+   output row, the AdamW ranges between; the count (<= cap) */
+int unet_param_groups(unet *u, size_t (*rg)[2], char (*nm)[40], int cap);
 void unet_set_muon_cautious(unet *u, int on);
 void unet_set_muon_wd_mult(unet *u, float mult);   /* --muon-wd-mult (default 1): multiplier of the weight decay on the Muon matrices only */
 void unet_set_muon_fro(unet *u, int on);           /* --muon-fro 1: every matrix's polarised direction rescaled to the nominal Frobenius norm */
