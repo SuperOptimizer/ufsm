@@ -57,6 +57,16 @@ device peak before it changes; the s2b gy overlap copy workspace (0.96 GB at P 7
 Not done: level-0 slab rings under lean 2 (the only way to P >= 768 at a 32-wide level 0, +30 % step in October), one window over both cards
 (--split z exists; the ink head refuses it outside --lat 4).
 
+## Occupancy cache for on-the-fly fibre sources: relaunches skip the start-up scan (2026-11-20, branch occcache-20261120, latcodec)
+
+The sampler's draw-cell index (source_occupancy) of a source whose labels are stamped on the fly from fibre polylines reads the level-5
+target over the whole scroll: every fibre of the set stamped once. Those boxes exceed the GPU fibre builder's buffers, so it runs
+fr_box on one CPU core (laptop f3m launch: ~15-20 min for Paris 4's 2.47e9 level-5 cells, per launch and per ladder rung). The index now
+lives on disk beside the derived-label cache (dcache_key_dir, as inksplat's index): key = CT key, um, levels, iso and every fibre spec
+(afv / extra / map / tr with file size + mtime, radius / guard / ring / iso / piso / plane), format "UOC1"; a truncated file or any input
+change is a miss; UFSM_OCC_CACHE=0 off. Desk sampler-only on PHerc0125 (3mm_v2, CPU planes): 1059 s -> 8 s (75938 draw cells, same).
+test_occ_cache covers the round trip, the key's sensitivity and the truncated-file miss.
+
 ## 3-D ink readout check: the score path holds (depth 4 > reader3); the desk ink run T9C had a frozen head (2026-11-20, branch inkctl-20261120)
 
 The ink retrain from the cooled try9 (T9C, desk card 0, teacher-first sources, --lat-sub ink, P 768) scored held-out AUC 0.530 / 0.568 /
