@@ -942,7 +942,8 @@ static void ct_upload(const batch *b, void *x, void *rad, int B, int P, int asyn
     if (g_gpu_in) { if (async) nn_h2d_copy_stream(rad, b->rad, rad_bytes(B)); else nn_h2d(rad, b->rad, rad_bytes(B)); }
 }
 /* diagnostic UFSM_DUMP_WIN=PREFIX (with UFSM_SYNC_UPLOAD=1 and --gpu-input 0, cubes): the first UFSM_DUMP_N (8) host windows as
-   PREFIX-NN.jpg, rows z-mid / y-mid / x-mid, columns CT channel | phase hue over the CT | winding mod 4 hue over the CT (unknown: CT only) */
+   PREFIX-NN.jpg, rows z-mid / y-mid / x-mid, columns CT channel | phase hue over the CT (a host ink plane instead: the ink target, red =
+   ink, blue tint = known no ink) | winding mod 4 hue over the CT (unknown: CT only) */
 int jpeg_write_rgb(const char *path, int w, int h, const uint8_t *rgb, int quality);   /* (imgops.h) */
 static int g_dump_nd;   /* mgpu: guarded (g_dump_mu: one numbering, the GPUs' threads share the PREFIX-NN names) */
 static pthread_mutex_t g_dump_mu = PTHREAD_MUTEX_INITIALIZER;   /* mgpu: guarded */
@@ -963,7 +964,12 @@ static void dump_win_(const batch *b, int B, int P) {
                 float v; if (g_xfmt == 1) { _Float16 h; memcpy(&h, x + vi, 2); v = (float)h; } else { uint32_t u = (uint32_t)x[vi] << 16; memcpy(&v, &u, 4); }
                 const int g = (int)(128 + 40 * v), gc = g < 0 ? 0 : g > 255 ? 255 : g;
                 uint8_t *o = img + ((size_t)row * 3 * P + (size_t)c * P + k) * 3; o[0] = o[1] = o[2] = (uint8_t)gc;
-                const uint8_t *L = c == 1 ? b->side : c == 2 ? b->w4 : nullptr;
+                const uint8_t *L = c == 1 ? (b->ink ? b->ink : b->side) : c == 2 ? b->w4 : nullptr;
+                if (c == 1 && b->ink) {   /* the ink target (prob254, 255 unknown): red with its probability, known no-ink blue-tinted */
+                    const int v = b->ink[(size_t)s * p3 + vi];
+                    if (v < 255) { o[0] = (uint8_t)(gc / 2 + v / 2); o[1] = (uint8_t)(gc / 2); o[2] = (uint8_t)(gc / 2 + (254 - v) / 4); }
+                    continue;
+                }
                 if (L && L[(size_t)s * p3 + vi] < 252) {
                     const double h = L[(size_t)s * p3 + vi] / 252.0 * (c == 2 ? 4 : 1);   /* (w4: 63 codes a turn: the hue cycles every turn) */
                     const double cr[3] = {.5 + .5 * cos(2 * M_PI * h), .5 + .5 * cos(2 * M_PI * (h - 1. / 3)), .5 + .5 * cos(2 * M_PI * (h - 2. / 3))};
