@@ -1,0 +1,160 @@
+/* predict --surf (DESIGN 2026-11-20 "inksurf"): the surface ink head on unrolled wraps (tifxyz). Each wrap's map grid (one pixel per window
+   voxel along the surface, the training patch's spacing) is cut into Hp x Hp patches with a halo; a patch runs in the first prediction
+   window whose interior holds its points (+- the K layers); per window: the trunk's level-0 features (unet_head_ext_fwd with identity
+   rows), each assigned patch resampled, the 2-D head, the core's probabilities into the wrap's map (uint8 1..255, 0 = no surface / no
+   window). DIR/<wrap>.tif, the ink-wrapscore --maps format. */
+#include "surfpred.h"
+#include "inksurf.h"
+#include "imgops.h"
+#include "tiffw.h"
+#include "nn.h"
+#include "json.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static double tifxyz_meta_scale(const char *p) {   /* meta.json scale[0] (grid vertices per native voxel); <= 0 on failure */
+    FILE *f = fopen(p, "rb"); if (!f) return -1; fseek(f, 0, SEEK_END); const long l = ftell(f); fseek(f, 0, SEEK_SET);
+    char *b = malloc((size_t)l + 1); const int ok = b && fread(b, 1, (size_t)l, f) == (size_t)l; fclose(f); if (!ok) { free(b); return -1; }
+    json *j = json_parse(b, (size_t)l); free(b); if (!j) return -1; const double s = json_num(json_at(json_get(j, "scale"), 0), -1); json_free(j); return s;
+}
+typedef struct { char dir[1024], name[256]; int w, h, mw, mh, na, nb; double sc; float *X, *Y, *Z; uint8_t *map; long *pid; } spw;
+typedef struct { int wr, a0, b0, pa, pb; int64_t lo[3], hi[3]; long tile; } spp;
+struct surfp {
+    spw *W; int nw; spp *P; long np; int Hp, halo, core, K, C0; double s; isf_dev dev; isf_win win; float *idw; void *feat; size_t featc;
+    long *tp, *toff; long ntile, nrun, nfit; uint8_t *tdone;
+};
+static int grid_pt(const spw *w, double gu, double gv, double P[3]) {   /* the wrap's grid at (col gu, row gv), bilinear; 0: an invalid corner */
+    int c0 = (int)floor(gu), r0 = (int)floor(gv); if (c0 < 0 || r0 < 0 || c0 >= w->w - 1 || r0 >= w->h - 1) return 0;
+    const double fu = gu - c0, fv = gv - r0; const size_t i00 = (size_t)r0 * w->w + c0, i01 = i00 + 1, i10 = i00 + w->w, i11 = i10 + 1;
+    if (!(w->Z[i00] >= 0 && w->Z[i01] >= 0 && w->Z[i10] >= 0 && w->Z[i11] >= 0)) return 0;
+    const float *A[3] = {w->Z, w->Y, w->X};
+    for (int d = 0; d < 3; d++) { const double a = A[d][i00], b = A[d][i01], c = A[d][i10], e = A[d][i11]; P[d] = (1 - fv) * ((1 - fu) * a + fu * b) + fv * ((1 - fu) * c + fu * e); }
+    return 1;
+}
+/* map pixel (row a, col b) -> the level point (z, y, x) and unit normal; 0: off the surface */
+static int map_pt(const surfp *S, const spw *w, int a, int b, float q[6]) {
+    const double g = S->s * w->sc;   /* grid px per map px */
+    double P[3], A[3], B[3], C[3], D[3];
+    if (!grid_pt(w, b * g, a * g, P) || !grid_pt(w, (b + 1) * g, a * g, A) || !grid_pt(w, (b - 1) * g, a * g, B) || !grid_pt(w, b * g, (a + 1) * g, C) || !grid_pt(w, b * g, (a - 1) * g, D)) return 0;
+    const double u[3] = {A[0] - B[0], A[1] - B[1], A[2] - B[2]}, v[3] = {C[0] - D[0], C[1] - D[1], C[2] - D[2]};
+    double n[3] = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]}; const double l = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (!(l > 1e-9)) return 0;
+    for (int d = 0; d < 3; d++) { q[d] = (float)((P[d] - 0.5 * (S->s - 1)) / S->s); q[3 + d] = (float)(n[d] / l); }
+    return 1;
+}
+surfp *surfp_open(const char *wraps, const char *isf, int C0, int Hp, int halo, int K, double s) {
+    if (Hp < 32 || Hp % 16 || halo < 0 || 2 * halo >= Hp) { fprintf(stderr, "predict --surf: --surf-P a multiple of 16 >= 32, --surf-halo < P / 2\n"); return nullptr; }
+    surfp *S = calloc(1, sizeof *S); S->Hp = Hp; S->halo = halo; S->core = Hp - 2 * halo; S->K = K; S->C0 = C0; S->s = s;
+    char *cp = strdup(wraps); int cap = 0;
+    for (char *t = strtok(cp, ","); t; t = strtok(nullptr, ",")) {
+        if (S->nw == cap) { cap = cap ? 2 * cap : 16; S->W = realloc(S->W, (size_t)cap * sizeof *S->W); }
+        spw *w = &S->W[S->nw]; memset(w, 0, sizeof *w); snprintf(w->dir, sizeof w->dir, "%s", t);
+        size_t L = strlen(w->dir); while (L > 1 && w->dir[L - 1] == '/') w->dir[--L] = 0;
+        const char *bn = strrchr(w->dir, '/'); snprintf(w->name, sizeof w->name, "%s", bn ? bn + 1 : w->dir);
+        char p[1300]; int w2, h2, w3, h3;
+        snprintf(p, sizeof p, "%s/x.tif", w->dir); w->X = img_read_f32(p, &w->w, &w->h);
+        snprintf(p, sizeof p, "%s/y.tif", w->dir); w->Y = img_read_f32(p, &w2, &h2);
+        snprintf(p, sizeof p, "%s/z.tif", w->dir); w->Z = img_read_f32(p, &w3, &h3);
+        snprintf(p, sizeof p, "%s/meta.json", w->dir); w->sc = tifxyz_meta_scale(p);
+        if (!w->X || !w->Y || !w->Z || w2 != w->w || w3 != w->w || h2 != w->h || h3 != w->h || !(w->sc > 0)) { fprintf(stderr, "predict --surf: cannot read the tifxyz %s\n", w->dir); free(cp); surfp_free(S); return nullptr; }
+        w->mw = (int)ceil(w->w / w->sc / s); w->mh = (int)ceil(w->h / w->sc / s); w->map = calloc((size_t)w->mw * w->mh, 1);
+        S->nw++;
+    }
+    free(cp);
+    if (isf_dev_init(&S->dev, C0, Hp, K, 1)) { fprintf(stderr, "predict --surf: out of GPU memory for the head\n"); surfp_free(S); return nullptr; }
+    int st = 0; if (isf_load(&S->dev, isf, &st)) { fprintf(stderr, "predict --surf: cannot load the surface head %s (its trunk channels x layers must be %d x %d)\n", isf, C0, K); surfp_free(S); return nullptr; }
+    if (isf_win_alloc(&S->win, Hp, K, 1.f)) { surfp_free(S); return nullptr; }
+    float *h = calloc((size_t)C0 * (C0 + 1), 4); for (int c = 0; c < C0; c++) h[(size_t)c * C0 + c] = 1.f;
+    S->idw = nn_malloc((size_t)C0 * (C0 + 1) * 4); nn_h2d(S->idw, h, (size_t)C0 * (C0 + 1) * 4); free(h);
+    /* the patches: core tiles of every wrap's map, each with its level bbox (+ the layers' reach + 2) */
+    long pcap = 0; const float ext = 0.5f * (K - 1) + 2;
+    for (int k = 0; k < S->nw; k++) {
+        spw *w = &S->W[k]; w->na = (w->mh + S->core - 1) / S->core; w->nb = (w->mw + S->core - 1) / S->core; w->pid = malloc((size_t)w->na * w->nb * sizeof *w->pid);
+        for (size_t q = 0; q < (size_t)w->na * w->nb; q++) w->pid[q] = -1;
+        for (int pa = 0; pa < w->na; pa++) for (int pb = 0; pb < w->nb; pb++) {
+            const int a0 = pa * S->core - halo, b0 = pb * S->core - halo;
+            spp p = {k, a0, b0, pa, pb, {INT64_MAX, INT64_MAX, INT64_MAX}, {INT64_MIN, INT64_MIN, INT64_MIN}, -1}; int any = 0;
+            for (int i = 0; i < Hp; i++) for (int j = 0; j < Hp; j++) { const int a = a0 + i, b = b0 + j; if (a < 0 || b < 0 || a >= w->mh || b >= w->mw) continue;
+                float q[6]; if (!map_pt(S, w, a, b, q)) continue;
+                const int core = i >= halo && i < Hp - halo && j >= halo && j < Hp - halo; any |= core;
+                for (int d = 0; d < 3; d++) { const int64_t lo = (int64_t)floor(q[d] - ext), hi = (int64_t)ceil(q[d] + ext); if (lo < p.lo[d]) p.lo[d] = lo; if (hi > p.hi[d]) p.hi[d] = hi; } }
+            if (!any) continue;
+            if (S->np == pcap) { pcap = pcap ? 2 * pcap : 1024; S->P = realloc(S->P, (size_t)pcap * sizeof *S->P); }
+            w->pid[(size_t)pa * w->nb + pb] = S->np; S->P[S->np++] = p;
+        }
+    }
+    fprintf(stderr, "predict --surf: %d wraps, %ld patches of %d px (core %d, map px = %.0f level-0 voxels), head from %s (step %d)\n", S->nw, S->np, Hp, S->core, s, isf, st);
+    return S;
+}
+void surfp_free(surfp *S) {
+    if (!S) return;
+    for (int k = 0; k < S->nw; k++) { free(S->W[k].X); free(S->W[k].Y); free(S->W[k].Z); free(S->W[k].map); free(S->W[k].pid); }
+    free(S->W); free(S->P); free(S->tp); free(S->toff); free(S->tdone); isf_dev_free(&S->dev); isf_win_free(&S->win); nn_free(S->idw); nn_free(S->feat); free(S);
+}
+static int fits(const spp *q, const int64_t o[3], const int64_t n[3], const int m[3]) {
+    for (int d = 0; d < 3; d++) if (q->lo[d] < o[d] + m[d] || q->hi[d] >= o[d] + n[d] - m[d]) return 0;
+    return 1;
+}
+/* the windows: greedily one centred on each patch not yet placed, which also takes the unplaced patches of the same wrap within two patch
+   rows / cols that fit its interior. *o: malloc'd origins [3 per window]; returns the window count */
+long surfp_plan(surfp *S, const int64_t n[3], const int m[3], int64_t **o) {
+    long cap = 256, nt = 0, fit = 0; *o = malloc((size_t)cap * 3 * sizeof **o);
+    for (long p = 0; p < S->np; p++) {
+        spp *q = &S->P[p]; if (q->tile >= 0) continue;
+        int64_t c[3]; for (int d = 0; d < 3; d++) c[d] = (q->lo[d] + q->hi[d]) / 2 - n[d] / 2;
+        if (!fits(q, c, n, m)) continue;
+        if (nt == cap) { cap *= 2; *o = realloc(*o, (size_t)cap * 3 * sizeof **o); }
+        memcpy(*o + 3 * nt, c, sizeof c);
+        const spw *w = &S->W[q->wr];
+        for (int da = -2; da <= 2; da++) for (int db = -2; db <= 2; db++) {
+            const int a = q->pa + da, b = q->pb + db; if (a < 0 || b < 0 || a >= w->na || b >= w->nb) continue;
+            const long r = w->pid[(size_t)a * w->nb + b]; if (r < 0 || S->P[r].tile >= 0) continue;
+            if (fits(&S->P[r], c, n, m)) { S->P[r].tile = nt; fit++; } }
+        nt++;
+    }
+    S->nfit = fit; S->ntile = nt;
+    free(S->toff); free(S->tp); S->toff = calloc((size_t)nt + 1, sizeof *S->toff); S->tp = malloc((size_t)(fit ? fit : 1) * sizeof *S->tp);
+    for (long p = 0; p < S->np; p++) if (S->P[p].tile >= 0) S->toff[S->P[p].tile + 1]++;
+    for (long t = 0; t < nt; t++) S->toff[t + 1] += S->toff[t];
+    long *pos = malloc((size_t)(nt + 1) * sizeof *pos); memcpy(pos, S->toff, (size_t)(nt + 1) * sizeof *pos);
+    for (long p = 0; p < S->np; p++) if (S->P[p].tile >= 0) S->tp[pos[S->P[p].tile]++] = p;
+    free(pos);
+    if (fit < S->np) fprintf(stderr, "DEFAULTED: predict --surf: %ld of %ld patches fit no window's interior (a patch curved past the window's interior): their pixels stay 0 (a smaller --surf-P or a larger --window)\n", S->np - fit, S->np);
+    fprintf(stderr, "predict --surf: %ld patches in %ld windows\n", fit, nt);
+    return nt;
+}
+int surfp_window(surfp *S, unet *u, long t, const int64_t o[3], int D, int H, int W) {
+    if (t < 0 || t >= S->ntile || S->toff[t] == S->toff[t + 1]) return 0;
+    const size_t V = (size_t)D * H * W;
+    if (S->featc < (size_t)S->C0 * V * 2) { nn_free(S->feat); S->featc = (size_t)S->C0 * V * 2; S->feat = nn_malloc(S->featc); if (!S->feat) { S->featc = 0; fprintf(stderr, "predict --surf: out of GPU memory for the window's features\n"); return -1; } }
+    if (unet_head_ext_fwd(u, S->idw, S->idw + (size_t)S->C0 * S->C0, S->C0, S->feat)) { fprintf(stderr, "predict --surf: the trunk's features are not covered (unet_head_ext_fwd)\n"); return -1; }
+    const int Hp = S->Hp; const size_t n = (size_t)Hp * Hp;
+    for (long k = S->toff[t]; k < S->toff[t + 1]; k++) {
+        const spp *p = &S->P[S->tp[k]]; spw *w = &S->W[p->wr]; isf_win *iw = &S->win; iw->np = 0;
+        for (int i = 0; i < Hp; i++) for (int j = 0; j < Hp; j++) {
+            const size_t q = (size_t)i * Hp + j; float *pn = iw->pn + 6 * q; float v[6];
+            iw->lab[q] = 0; iw->wt[q] = 0; pn[0] = pn[1] = pn[2] = -1e6f; pn[3] = 1; pn[4] = pn[5] = 0;
+            const int a = p->a0 + i, b = p->b0 + j; if (a < 0 || b < 0 || a >= w->mh || b >= w->mw || !map_pt(S, w, a, b, v)) continue;
+            for (int d = 0; d < 3; d++) { pn[d] = v[d] - (float)o[d]; pn[3 + d] = v[3 + d]; } iw->wt[q] = 1; iw->np++;
+        }
+        if (isf_win_lists(iw, D, H, W) || isf_dev_upload(&S->dev, iw)) { fprintf(stderr, "predict --surf: the patch's lists failed (memory)\n"); return -1; }
+        if (!S->dev.nv) continue;
+        nn_isf_take(S->feat, S->C0, V, 0, S->dev.vox, 0, S->dev.nv, S->dev.fc, S->dev.nv);
+        isf_dev_step(&S->dev, iw, 1.f, 0, 1.f, nullptr, nullptr);
+        for (int i = S->halo; i < Hp - S->halo; i++) for (int j = S->halo; j < Hp - S->halo; j++) {
+            const size_t q = (size_t)i * Hp + j; const int a = p->a0 + i, b = p->b0 + j; if (!(iw->wt[q] > 0) || a >= w->mh || b >= w->mw) continue;
+            const double pr = 1 / (1 + exp(-(double)S->dev.zh[q])); w->map[(size_t)a * w->mw + b] = (uint8_t)(1 + lrint(pr * 254)); }
+        S->nrun++;
+    }
+    (void)n;
+    return 0;
+}
+int surfp_write(surfp *S, const char *dir) {
+    char p[1600]; int rc = 0;
+    for (int k = 0; k < S->nw; k++) { snprintf(p, sizeof p, "%s/%s.tif", dir, S->W[k].name);
+        if (tiffw_write(p, S->W[k].mw, S->W[k].mh, 1, S->W[k].map, 1)) { fprintf(stderr, "predict --surf: cannot write %s\n", p); rc = -1; } }
+    fprintf(stderr, "predict --surf: %ld of %ld patches run, %d maps in %s\n", S->nrun, S->np, S->nw, dir);
+    return rc;
+}

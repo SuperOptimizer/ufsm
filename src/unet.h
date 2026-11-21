@@ -490,6 +490,10 @@ void unet_blend_ema(unet *u, float a);          /* EMA weights := a x live + (1 
 void unet_set_head_cb(unet *u, void (*cb)(void *), void *ctx);
 int unet_head_fwd_z(unet *u, int z0, int z1, void *y16);
 int unet_head_bwd_z(unet *u, int z0, int z1, const void *gy16, int first);
+/* train --ink-surf: dec[0]'s output (as the head reads it) on planes [z0, z1) as fp16 [widths[0]][(z1 - z0) h w]; and the next unet_head_bwd_z
+   calls' extra d loss / d those features (the same layout, the backward's scaled domain incl. the head plane scale; nullptr: none) */
+int unet_head_feat_z(unet *u, int z0, int z1, void *y16);
+void unet_set_head_feat_grad_z(unet *u, const void *g16);
 /* the spatial split: the head input's k innermost halo planes (dec[0]'s output) from the other GPU, so the head logits of the halo cells next to
    the cut are the window's (a collective; train --lat 4 --split z: the head slabs upsample owned voxels next to the cut from it). No-op unsplit */
 typedef void (*unet_halo_k_fn)(const void *p, shape5 s, int esz, int h, int k);

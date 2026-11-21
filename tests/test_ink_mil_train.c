@@ -148,6 +148,11 @@ int main(int argc, char **argv) {
         snprintf(p, sizeof p, "%s/m1.log", d); const double l1 = log_first(p, " ink mil "); snprintf(p, sizeof p, "%s/m0.log", d); const double l0 = log_first(p, " ink mil ");
         fprintf(stderr, "ink-rayface: mode 1 first-step ink mil %.6f with the bits, %.6f with the face search\n", l1, l0);
         CHECK(isfinite(l1) && l1 == l0, "mode 1 ink mil with the bits %g vs the face search %g", l1, l0);
+        /* (2026-11-20 inksurf) a version-2 mode-0 list (every pixel + its index) serves mode 1 through the face bits: the same loss again */
+        CHECK(!sh("%s ink-rayface %s/fx/sources-mil.json --threads 2 --rays 2 --rays-mode 0 > %s/rfm0.log 2>&1 && grep -q 'ray lists (stride 2, mode 0)' %s/rfm0.log", U, d, d, d), "ink-rayface --rays-mode 0 (%s/rfm0.log)", d);
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/m2 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 1 %s > %s/m2.log 2>&1", U, d, d, common, d), "mode 1 from the mode-0 list (%s/m2.log)", d);
+        snprintf(p, sizeof p, "%s/m2.log", d); const double l2 = log_first(p, " ink mil ");
+        CHECK(isfinite(l2) && l2 == l1, "mode 1 ink mil from the mode-0 list %g vs %g", l2, l1);
     }
     /* the planner keeps the MIL buffers free (2026-11-15 try7 one card: allocated lazily after the plan, the first MIL window's cudaMalloc
        failed on the full card): the "keeps" line, and the buffers never outgrow it; again at a small ray cap the windows exceed (the cap's
@@ -209,6 +214,28 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ink draw: old %g kept / %g rejected, positive share %.3f; stratified %g / %g, %.3f\n", pr[0], rj[0], f0, pr[1], rj[1], f1);
         CHECK(ok && rj[1] < rj[0] && f1 > f0 && f1 < 0.9, "stratified draw: rejected %g vs %g, positive share %.3f vs %.3f (%s/so0.log, so1.log)", rj[1], rj[0], f1, f0, d);
         CHECK(!sh("grep -q 'sampler: wind-fixture-ink: ink draw cells: [0-9]* supervised, [1-9][0-9]* with positive labels$' %s/so1.log", d), "no per-source draw-cell line (%s/so1.log)", d);
+    }
+    {   /* train --ink-surf (2026-11-20, DESIGN "inksurf"): the surface head beside the voxel ink losses, its patch from the mode-2 rays (the MIL keeps
+           its mode-1 subset): the log's "ink surf" finite and positive on windows with a patch, the unmasked share > 0; RUN/last.ckpt.isf written
+           and taken by --resume; at lr 0 (all three; MIL mode 0, rays on the fixture) the step lines' other losses equal a run without it (the head adds only its own term;
+           the MIL's rays from the mode-2 list are mode 0's) */
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/sf --steps 6 --ckpt-every 3 --ink-mil 1 --ink-mil-mode 1 --ink-surf 1 --isf-P 32 --isf-step 2 --isf-k 2 %s > %s/sf.log 2>&1",
+                  U, d, d, common, d), "train --ink-surf (%s/sf.log)", d);
+        snprintf(p, sizeof p, "%s/sf.log", d); int fs = 0; const double sl = log_last(p, " ink surf ", &fs);
+        FILE *g = fopen(p, "r"); char ln[8192]; double win = 0, um = 0;
+        while (g && fgets(ln, sizeof ln, g)) { const char *q = strstr(ln, " ink surf "); if (!q) continue; const char *o = strchr(q, '(');
+            if (o) { const double w = atof(o + 1); if (w > win) win = w; const char *uu = strstr(o, "patch "); if (uu) { const double x = atof(uu + 6); if (x > um) um = x; } } }
+        if (g) fclose(g);
+        fprintf(stderr, "ink surf: last %.4f, up to %.0f%% of windows with a patch, up to %.0f%% unmasked\n", sl, win, um);
+        CHECK(fs && isfinite(sl) && sl > 0 && sl < 5 && win > 0 && um > 0, "ink surf logged %d value %g, windows %g%%, unmasked %g%% (%s)", fs, sl, win, um, p);
+        snprintf(p, sizeof p, "%s/sf/last.ckpt.isf", d); CHECK(!access(p, F_OK), "no %s", p);
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/sf2 --steps 2 --resume %s/sf/last.ckpt --ink-mil 1 --ink-mil-mode 1 --ink-surf 1 --isf-P 32 --isf-step 2 --isf-k 2 %s > %s/sf2.log 2>&1",
+                  U, d, d, d, common, d), "--resume with the head (%s/sf2.log)", d);
+        CHECK(!sh("grep -q 'ink surf: head from .*last.ckpt.isf (step 6)' %s/sf2.log", d), "--resume did not take the surface head (%s/sf2.log)", d);
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/sb1 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 0 --ink-surf 1 --isf-lr 0 --isf-P 32 --isf-step 2 --isf-k 2 %s > %s/sb1.log 2>&1", U, d, d, common, d), "sb1");
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/sb0 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 0 %s > %s/sb0.log 2>&1", U, d, d, common, d), "sb0");
+        CHECK(!sh("for x in sb0 sb1; do grep -E '^(t\\+[0-9.]+s )?step ' %s/$x.log | sed -E 's/^t\\+[0-9.]+s //; s/ ink surf [^(]*\\([^)]*\\)//; s/ [0-9.]+ samp\\/s.*//; s/ (wait|gn) [0-9.%%]+//g' > %s/$x.txt; done; cmp -s %s/sb0.txt %s/sb1.txt", d, d, d, d),
+              "the step losses differ with --ink-surf at lr 0 (%s/sb0.txt, sb1.txt)", d);
     }
     if (getenv("TIMT_KEEP")) fprintf(stderr, "kept %s (sources %s/fx/sources-mil.json)\n", d, d);
     else if (!fails) sh("rm -rf %s", d);

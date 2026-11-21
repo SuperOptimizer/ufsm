@@ -72,14 +72,14 @@ static void test_resample(void) {
     int *dv = nn_malloc((size_t)(L.nv + 1) * 4), *doff = nn_malloc((size_t)(L.nv + 1) * 4), *dent = nn_malloc((size_t)L.ne * 4); float *dew = nn_malloc((size_t)L.ne * 4);
     nn_h2d(dv, L.vox, (size_t)L.nv * 4); nn_h2d(doff, L.off, (size_t)(L.nv + 1) * 4); nn_h2d(dent, L.ent, (size_t)L.ne * 4); nn_h2d(dew, L.ew, (size_t)L.ne * 4);
     float *dG = dup_h2d(G, (size_t)C * K * n), *dg = nn_malloc(C * S * 4), *g1 = malloc(C * S * 4), *g2 = malloc(C * S * 4);
-    nn_zero(dg, C * S * 4); nn_isf_gather(dG, C, K, n, dv, doff, dent, dew, L.nv, dg, ISF_F32, S, 1.f, 0); nn_d2h(g1, dg, C * S * 4);
-    nn_zero(dg, C * S * 4); nn_isf_gather(dG, C, K, n, dv, doff, dent, dew, L.nv, dg, ISF_F32, S, 1.f, 0); nn_d2h(g2, dg, C * S * 4);
+    nn_zero(dg, C * S * 4); nn_isf_gather(dG, C, K, n, dv, doff, dent, dew, L.nv, dg, ISF_F32, S, 1.f, nullptr, 0); nn_d2h(g1, dg, C * S * 4);
+    nn_zero(dg, C * S * 4); nn_isf_gather(dG, C, K, n, dv, doff, dent, dew, L.nv, dg, ISF_F32, S, 1.f, nullptr, 0); nn_d2h(g2, dg, C * S * 4);
     const double lhs = dotd(ref, G, (size_t)C * K * n), rhs = dotd(F, g1, C * S);
     fprintf(stderr, "adjoint: <R F, G> %.9g  <F, R^T G> %.9g  (%zu entries over %d voxels)\n", lhs, rhs, (size_t)L.ne, L.nv);
     CHECK(fabs(lhs - rhs) <= 1e-5 * (fabs(lhs) + 1), "adjoint %.9g vs %.9g", lhs, rhs);
     CHECK(!memcmp(g1, g2, C * S * 4), "gather not bit-identical run to run");
     /* fp16 gradient output with scale: g16 = scale * g within fp16 rounding; acc adds */
-    void *dg16 = nn_malloc(C * S * 2); nn_zero(dg16, C * S * 2); nn_isf_gather(dG, C, K, n, dv, doff, dent, dew, L.nv, dg16, ISF_F16, S, 8.f, 0);
+    void *dg16 = nn_malloc(C * S * 2); nn_zero(dg16, C * S * 2); nn_isf_gather(dG, C, K, n, dv, doff, dent, dew, L.nv, dg16, ISF_F16, S, 8.f, nullptr, 0);
     uint16_t *h16 = malloc(C * S * 2); nn_d2h(h16, dg16, C * S * 2); md = 0; for (size_t i = 0; i < C * S; i++) md = fmax(md, fabs(h2f(h16[i]) - 8 * g1[i]) / (1 + fabs(8 * g1[i])));
     CHECK(md < 2e-3, "gather fp16 rel %.2e", md);
     (void)bf2f;
@@ -97,7 +97,7 @@ static void test_2d(void) {
         nn_isf2_conv(dx, Ci, H, W, dw, db, Co, k, dy); nn_d2h(y, dy, ny * 4); conv_ref(x, Ci, H, W, w, b, Co, k, yr);
         double md = 0; for (size_t i = 0; i < ny; i++) md = fmax(md, fabs(y[i] - yr[i])); CHECK(md < 1e-4, "conv k%d fwd %.2e", k, md);
         nn_isf2_conv_bd(dgy, Co, H, W, dw, Ci, k, dgx, 0); nn_d2h(gx, dgx, nx * 4);
-        nn_isf2_conv_bw(dx, Ci, H, W, dgy, Co, k, dgw, dgb); nn_d2h(gw, dgw, nw * 4); nn_d2h(gb, dgb, Co * 4);
+        nn_isf2_conv_bw(dx, Ci, H, W, dgy, Co, k, dgw, dgb, 0); nn_d2h(gw, dgw, nw * 4); nn_d2h(gb, dgb, Co * 4);
         conv_ref(x, Ci, H, W, w, nullptr, Co, k, yr);   /* <conv_nobias(x), gy> = <x, gx> = <w, gw> */
         const double a = dotd(yr, gy, ny), bx = dotd(x, gx, nx), bw = dotd(w, gw, nw); double sb = 0; for (size_t i = 0; i < ny; i++) sb += gy[i];
         double gbm = 0; for (int c = 0; c < Co; c++) { double s = 0; for (int q = 0; q < H * W; q++) s += gy[c * H * W + q]; gbm = fmax(gbm, fabs(s - gb[c])); }
@@ -132,7 +132,7 @@ static void test_head_fd(void) {
     { const size_t np = isfhead_nparams(h); float *p = malloc(np * 4); nn_d2h(p, isfhead_params(h), np * 4); for (size_t i = 0; i < np; i++) p[i] += 0.05f * frand();   /* (the output conv off its small init) */
       nn_h2d(isfhead_params(h), p, np * 4); free(p); }
     float *dx = dup_h2d(x, nx), *dr = dup_h2d(r, n);
-    isfhead_forward(h, dx); const float *gxd = isfhead_backward(h, dr); float *gx = malloc(nx * 4); nn_d2h(gx, gxd, nx * 4);
+    isfhead_forward(h, dx); isfhead_zero_grad(h); const float *gxd = isfhead_backward(h, dr); float *gx = malloc(nx * 4); nn_d2h(gx, gxd, nx * 4);
     const size_t np = isfhead_nparams(h); float *gp = malloc(np * 4), *p = malloc(np * 4); nn_d2h(gp, isfhead_grads(h), np * 4); nn_d2h(p, isfhead_params(h), np * 4);
     /* directional derivatives (central differences of fp32 sums are ~1e-6 noisy, so single tiny entries are not a test; a random direction's
        derivative is O(|g|)): the input, and each conv's weights + bias apart */
@@ -232,8 +232,8 @@ static void test_toy(void) {
             nn_isf2_bce_grad(zl, dlab, dw, n, 1.f / n, dgl);
             if (it % 50 == 0) { nn_d2h(z, zl, n * 4); double l = 0; for (int i = 0; i < n; i++) { const double p = 1 / (1 + exp(-z[i])); l -= lab[i] > 0.5f ? log(p + 1e-9) : log(1 - p + 1e-9); }
                                 fprintf(stderr, "toy step %d: loss %.4f, train AUC %.3f\n", it, l / n, auc(z, lab, n)); }
-            const float *gpatch = isfhead_backward(h, dgl);
-            nn_zero(gf, V * C0 * 2); nn_isf_gather(gpatch, C0, K, n, dv, doff, dent, dew, L.nv, gf, ft, V, unet_bwd_gscale(), 0);
+            isfhead_zero_grad(h); const float *gpatch = isfhead_backward(h, dgl);
+            nn_zero(gf, V * C0 * 2); nn_isf_gather(gpatch, C0, K, n, dv, doff, dent, dew, L.nv, gf, ft, V, unet_bwd_gscale(), nullptr, 0);
             unet_set_l0_feat_grad(u, gf); unet_backward_x(u, glz, 1); unet_set_l0_feat_grad(u, nullptr);
             if (it == 1) t0 = unet_grad_norm(u);
             unet_muon(u, 0.01f, 0.95f, 1e-3f, 0.9f, 0.999f, 1e-8f, 0.f, it);
@@ -269,6 +269,54 @@ static void test_toy(void) {
     nn_free(dct); nn_free(dpn); nn_free(dlab); nn_free(dw); nn_free(dpatch); nn_free(dgl); isfhead_free(h); unet_free(u); unet_free(uv); free(lv16); free(gv); free(lvf); nn_free(dgv); nn_free(gv16);
 }
 
+/* (6) the trainer's path: the feature gradient injected per head slab (unet_head_feat_z / unet_set_head_feat_grad_z, the head's rows + the feature
+   rows in one fused backward) against the whole-window injection (unet_set_l0_feat_grad), same weights, same random feature gradient, zero
+   logit gradient: the trunk's parameter gradients agree (cosine), the slab features equal the whole-window ones (unet_head_ext_fwd) */
+typedef struct { unet *u; const void *g; void *zero, *rows; int D, Z, C; size_t hw; } slab_ctx;
+static void slab_cb(void *p) {
+    slab_ctx *c = p;
+    for (int z0 = 0; z0 < c->D; z0 += c->Z) { const int z1 = z0 + c->Z < c->D ? z0 + c->Z : c->D; const size_t ns = (size_t)(z1 - z0) * c->hw;
+        for (int k = 0; k < c->C; k++) nn_d2d((char *)c->rows + (size_t)k * ns * 2, (const char *)c->g + ((size_t)k * c->D * c->hw + (size_t)z0 * c->hw) * 2, ns * 2);
+        unet_set_head_feat_grad_z(c->u, c->rows);
+        if (unet_head_bwd_z(c->u, z0, z1, c->zero, z0 == 0)) { fprintf(stderr, "FAIL: the combined head backward is not covered\n"); fails++; }
+        unet_set_head_feat_grad_z(c->u, nullptr); }
+}
+static void test_slab_inject(void) {
+    nn_set_tf32(1); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1); nn_set_gn_stored(1);
+    nn_set_prec(3); CHECK(!nn_set_prec_policy("all=fp4:fp4:fp4"), "prec policy"); setenv("UFSM_F4_WGRAD", "1", 1);
+    unet_set_act_mx4(1); unet_set_grad_mx8(1); unet_set_grad_mx4(0);
+    for (int w0i = 0; w0i < 2; w0i++) {   /* widths[0] 16 (the fixture's) and 32 (sH's: 1 + 32 rows padded to 40) */
+        const int C0 = w0i ? 32 : 16, T = 32, Z = 8; unet_cfg cfg = {3, {C0, 32, 64}, 1, 1, 8, 1, 0};
+        const size_t V = (size_t)T * T * T; const shape5 xs = {1, 1, T, T, T};
+        float *x = malloc(V * 4); for (size_t i = 0; i < V; i++) x[i] = frand(); float *dx = dup_h2d(x, V);
+        uint16_t *g = malloc(V * C0 * 2); for (size_t i = 0; i < V * C0; i++) g[i] = f2h(1024.f * 1e-3f * frand());
+        void *dg = nn_malloc(V * C0 * 2); nn_h2d(dg, g, V * C0 * 2); void *zl = nn_malloc(V * 2); nn_zero(zl, V * 2);
+        unet *a = unet_create(&cfg); unet_init(a, 9); unet_set_fp16_logits(a, 1);
+        unet *b = unet_create(&cfg); unet_init(b, 9); unet_set_fp16_logits(b, 1); unet_set_head_ext(b, 1);
+        void *zero = nn_malloc(V * 2); nn_zero(zero, V * 2); void *rows = nn_malloc((size_t)Z * T * T * C0 * 2);
+        slab_ctx sc = {b, dg, zero, rows, T, Z, C0, (size_t)T * T}; unet_set_head_cb(b, slab_cb, &sc);
+        const size_t np = unet_nparams(a); float *ga = malloc(np * 4), *gb = malloc(np * 4);
+        nn_set_sr_step(500); unet_zero_grad(a); unet_forward(a, dx, xs, 1);
+        float *hid = calloc((size_t)C0 * (C0 + 1), 4); for (int c = 0; c < C0; c++) hid[(size_t)c * C0 + c] = 1.f; float *did = dup_h2d(hid, (size_t)C0 * (C0 + 1));
+        void *fa = nn_malloc(V * C0 * 2), *fb = nn_malloc(V * C0 * 2);
+        CHECK(!unet_head_ext_fwd(a, did, did + (size_t)C0 * C0, C0, fa), "head_ext_fwd");
+        nn_set_sr_step(600); unet_set_l0_feat_grad(a, dg); unet_backward_x(a, zl, 1); unet_set_l0_feat_grad(a, nullptr); unet_grad_d2h(a, ga);
+        nn_set_sr_step(500); unet_zero_grad(b); unet_forward(b, dx, xs, 1);
+        for (int z0 = 0; z0 < T; z0 += Z) { void *q = nn_malloc((size_t)Z * T * T * C0 * 2); CHECK(!unet_head_feat_z(b, z0, z0 + Z, q), "head_feat_z");
+            for (int k = 0; k < C0; k++) nn_d2d((char *)fb + ((size_t)k * V + (size_t)z0 * T * T) * 2, (char *)q + (size_t)k * Z * T * T * 2, (size_t)Z * T * T * 2); nn_free(q); }
+        nn_set_sr_step(600); unet_backward_x(b, zl, 1); unet_grad_d2h(b, gb);
+        const char *e = nn_check(); CHECK(!e, "CUDA %s", e ? e : "");
+        uint16_t *ha = malloc(V * C0 * 2), *hb = malloc(V * C0 * 2); nn_d2h(ha, fa, V * C0 * 2); nn_d2h(hb, fb, V * C0 * 2);
+        double fd = 0; for (size_t i = 0; i < V * C0; i++) fd = fmax(fd, fabs(h2f(ha[i]) - h2f(hb[i])));
+        double ab = 0, aa = 0, bb = 0; for (size_t i = 0; i < np; i++) { ab += (double)ga[i] * gb[i]; aa += (double)ga[i] * ga[i]; bb += (double)gb[i] * gb[i]; }
+        const double cs = ab / sqrt(aa * bb + 1e-300), rn = sqrt(bb / (aa + 1e-300));
+        fprintf(stderr, "slab injection (widths[0] %d): features max |slab - whole| %.2e; trunk gradients cosine %.5f, norm ratio %.4f\n", C0, fd, cs, rn);
+        CHECK(fd < 1e-3, "slab features differ (%.2e)", fd); CHECK(cs > 0.995 && fabs(rn - 1) < 0.02 && aa > 0, "slab injection: cosine %.5f norm ratio %.4f", cs, rn);
+        free(x); free(g); free(ga); free(gb); free(hid); free(ha); free(hb); nn_free(dx); nn_free(dg); nn_free(zl); nn_free(zero); nn_free(rows); nn_free(did); nn_free(fa); nn_free(fb);
+        unet_free(a); unet_free(b);
+    }
+}
+
 int main(void) {
     if (nn_init(0)) return 77;
     g_ink = envf("TIS_INK", g_ink); g_bg = envf("TIS_BG", g_bg); g_sp0 = envf("TIS_SP0", g_sp0); g_sp1 = envf("TIS_SP1", g_sp1);
@@ -276,6 +324,7 @@ int main(void) {
     if (getenv("TIS_SEED")) rs = (uint64_t)atoll(getenv("TIS_SEED"));
     if (!getenv("TIS_TOY_ONLY")) { test_resample(); test_2d(); test_head_fd(); }
     test_toy();
+    if (!getenv("TIS_TOY_ONLY")) test_slab_inject();
     if (fails) { fprintf(stderr, "test_inksurf: %d FAILED\n", fails); return 1; }
     fprintf(stderr, "test_inksurf: PASS\n"); return 0;
 }

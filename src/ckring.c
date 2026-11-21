@@ -55,6 +55,12 @@ static int list_steps(const char *dir, long **steps) {
     closedir(d); if (n) qsort(*steps, n, sizeof(long), cmp_long); return n;
 }
 
+/* train --ink-surf: SRC.isf (the surface head) follows its checkpoint into the ring / snapshots */
+static void ck_side(const char *src, const char *dst, int allow_copy) {
+    char a[4200], b[4300]; snprintf(a, sizeof a, "%s.isf", src); snprintf(b, sizeof b, "%s.isf", dst);
+    if (access(a, F_OK)) return;
+    if (ck_clone(a, b, allow_copy) < 0) fprintf(stderr, "ckring: cannot copy %s to %s\n", a, b);
+}
 int ck_prune(const char *dir, int keep_last, int keep_every) {
     long *st; const int n = list_steps(dir, &st); int del = 0, kept = 0;
     for (int i = n - 1; i >= 0; i--) {   /* newest first: the grid ones stay, plus the newest keep_last others */
@@ -62,6 +68,7 @@ int ck_prune(const char *dir, int keep_last, int keep_every) {
         if (kept < keep_last) { kept++; continue; }
         char p[4200]; snprintf(p, sizeof p, "%s/%ld.ckpt", dir, st[i]);
         if (!unlink(p)) del++;
+        snprintf(p, sizeof p, "%s/%ld.ckpt.isf", dir, st[i]); unlink(p);   /* (train --ink-surf's head beside it, if any) */
     }
     free(st); return del;
 }
@@ -71,6 +78,7 @@ int ck_after_save(ck_cfg *c, const char *out, int step) {
     if (c->ring > 0 && !c->ring_off) {
         snprintf(d, sizeof d, "%s/ring", out); mkdir(d, 0755); snprintf(dst, sizeof dst, "%s/%d.ckpt", d, step);
         const int h = ck_clone(last, dst, c->allow_copy);
+        ck_side(last, dst, c->allow_copy);
         if (h == -2) { fprintf(stderr, "ckring: %s cannot reflink (filesystem without FICLONE): the checkpoint ring is off (--ckpt-ring-copy 1 copies)\n", out); c->ring_off = 1; }
         else if (h < 0) rc = -1;
         else ck_prune(d, c->ring, 0);
@@ -78,6 +86,7 @@ int ck_after_save(ck_cfg *c, const char *out, int step) {
     if (c->snap_every > 0 && step > 0 && step % c->snap_every == 0) {
         snprintf(d, sizeof d, "%s/snap", out); mkdir(d, 0755); snprintf(dst, sizeof dst, "%s/%d.ckpt", d, step);
         const int h = ck_clone(last, dst, 1);   /* (a snapshot is wanted either way: copied when it cannot be cloned) */
+        if (h >= 0) ck_side(last, dst, 1);
         if (h < 0) rc = -1;
         else { fprintf(stderr, "snapshot %d -> %s (%s)\n", step, dst, h ? "copied" : "reflink");
                if (c->snap_keep_last > 0 || c->snap_keep_every > 0) ck_prune(d, c->snap_keep_last, c->snap_keep_every); }

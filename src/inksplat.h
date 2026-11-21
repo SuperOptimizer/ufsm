@@ -88,7 +88,9 @@ int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits);
 int inkfly_cells_sup(void *handle, int lev, const int64_t shape[3], uint8_t *bits, int stride);   /* the cells holding supervised label pixels (bit 1) / positive ones (bit 2): the sampler's draw cells */
 /* a normal-pooled MIL ray (train's ink MIL loss): p the label pixel's mesh point, n its unit normal (+ = the recto side), in the window's
    level voxels (window origin 0); y the 2-D label (1 ink); w a weight */
-typedef struct { float p[3], n[3]; uint8_t y, pad[3]; float w; float rs; } inkray;   /* rs: reach scale (--ink-mil-r-um): the sampler stretches n by it so the K samples span the physical reach; 0 counts as 1 */
+typedef struct { float p[3], n[3]; uint8_t y, pad; uint16_t unit; float w; float rs; int32_t lr, lc; } inkray;
+/* pad (mode 2): 1 = no open face (the ray mode 1 keeps). (unit, lr, lc): the pixel's labelled unit (segment) and its label-grid row / col in that unit's label raster (the surface head's patch
+   coordinates, train --ink-surf; -1 when a version-1 ray list (no pixel index) gave the ray) */   /* rs: reach scale (--ink-mil-r-um): the sampler stretches n by it so the K samples span the physical reach; 0 counts as 1 */
 /* the rays of the level-L window o / n (inkfly's level): mode 0 every supervised pixel, 1 only those without an open face (the voxel
    target's unknowns); stride: every stride-th label row / col; pixels within R + 1 level voxels of a held-out box are left out.
    *out malloc'd. 0 ok. */
