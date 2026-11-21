@@ -112,7 +112,7 @@ __global__ void isf2_conv_k(const float *__restrict__ x, int Ci, int H, int W, c
     }
     y[i] = s;
 }
-extern "C" void nn_isf2_conv(const float *x, int Ci, int H, int W, const float *w, const float *b, int Co, int k, float *y) {
+extern "C" void nn_isf2_conv_ref(const float *x, int Ci, int H, int W, const float *w, const float *b, int Co, int k, float *y) {
     isf2_conv_k<<<nblk((size_t)Co * H * W, 128), 128>>>(x, Ci, H, W, w, b, Co, k, y); KCHECK();
 }
 __global__ void isf2_conv_bd_k(const float *__restrict__ gy, int Co, int H, int W, const float *__restrict__ w, int Ci, int k, float *__restrict__ gx, int acc) {
@@ -127,7 +127,7 @@ __global__ void isf2_conv_bd_k(const float *__restrict__ gy, int Co, int H, int 
     }
     gx[i] = acc ? gx[i] + s : s;
 }
-extern "C" void nn_isf2_conv_bd(const float *gy, int Co, int H, int W, const float *w, int Ci, int k, float *gx, int acc) {
+extern "C" void nn_isf2_conv_bd_ref(const float *gy, int Co, int H, int W, const float *w, int Ci, int k, float *gx, int acc) {
     isf2_conv_bd_k<<<nblk((size_t)Ci * H * W, 128), 128>>>(gy, Co, H, W, w, Ci, k, gx, acc); KCHECK();
 }
 /* weight gradient: one block per (co, ci, tap), a fixed-order tree over the pixels (256 threads, strided partials) */
@@ -149,8 +149,111 @@ __global__ void __launch_bounds__(256) isf2_bias_bw_k(const float *__restrict__ 
     for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) sh[threadIdx.x] += sh[threadIdx.x + o]; __syncthreads(); }
     if (!threadIdx.x) gb[blockIdx.x] = sh[0] + (acc ? gb[blockIdx.x] : 0.f);
 }
-extern "C" void nn_isf2_conv_bw(const float *x, int Ci, int H, int W, const float *gy, int Co, int k, float *gw, float *gb, int acc) {
+extern "C" void nn_isf2_conv_bw_ref(const float *x, int Ci, int H, int W, const float *gy, int Co, int k, float *gw, float *gb, int acc) {
     isf2_conv_bw_k<<<(unsigned)(Co * Ci * k * k), 256>>>(x, Ci, H, W, gy, Co, k, gw, acc);
+    if (gb) isf2_bias_bw_k<<<(unsigned)Co, 256>>>(gy, (size_t)H * W, gb, acc);
+    KCHECK();
+}
+/* The tiled convs (inkperf 2026-11-21): the _ref kernels above, faster, with the same bits. They run every output's sum in the _ref order:
+   channel, then dy, then dx, with out-of-range taps skipped, not added as 0. The weight gradient uses the same 256 strided partials and
+   the same tree. The speed comes from reuse only. Forward / data gradient: a 16 x 16 pixel tile with its halo and the weights in shared
+   memory, OB outputs per thread. Weight gradient: GC x GI x K^2 weights per block, so gy and x are read once for all of them. S1's head
+   step on the desk: see DESIGN 2026-11-21 "isfperf". test_inksurf checks every shape against the _ref kernels bit for bit. */
+enum { IT = 16, ICB = 8 };
+template <int K, int OB, bool BD>
+__global__ void __launch_bounds__(256) isf2_conv_t_k(const float *__restrict__ in, int Cl, int H, int W, const float *__restrict__ w, const float *__restrict__ b, int nOut,
+                                                     float *__restrict__ y, int acc) {
+    constexpr int T = IT + K - 1, R = K / 2, KK = K * K;
+    __shared__ float xs[ICB][T * T]; __shared__ float ws[OB][ICB][KK];
+    const int tx = threadIdx.x, ty = threadIdx.y, tid = ty * IT + tx, ox = blockIdx.x * IT, oy = blockIdx.y * IT, o0 = blockIdx.z * OB;
+    const int px = ox + tx, py = oy + ty; const size_t HW = (size_t)H * W;
+    float s[OB];
+#pragma unroll
+    for (int o = 0; o < OB; o++) s[o] = !BD && b && o0 + o < nOut ? b[o0 + o] : 0.f;
+    for (int c0 = 0; c0 < Cl; c0 += ICB) {
+        const int nc = Cl - c0 < ICB ? Cl - c0 : ICB;
+        __syncthreads();
+        for (int e = tid; e < nc * T * T; e += 256) { const int c = e / (T * T), q = e % (T * T), yy = oy + q / T - R, xx = ox + q % T - R;
+            xs[c][q] = yy >= 0 && yy < H && xx >= 0 && xx < W ? in[(size_t)(c0 + c) * HW + (size_t)yy * W + xx] : 0.f; }
+        for (int e = tid; e < OB * nc * KK; e += 256) { const int o = e / (nc * KK), c = e / KK % nc, t = e % KK;
+            ws[o][c][t] = o0 + o < nOut ? (BD ? w[((size_t)(c0 + c) * nOut + o0 + o) * KK + t] : w[((size_t)(o0 + o) * Cl + c0 + c) * KK + t]) : 0.f; }
+        __syncthreads();
+        for (int c = 0; c < nc; c++)
+#pragma unroll
+            for (int dy = 0; dy < K; dy++) {
+                const int yy = BD ? py - dy + R : py + dy - R; if (yy < 0 || yy >= H) continue;
+#pragma unroll
+                for (int dx = 0; dx < K; dx++) {
+                    const int xx = BD ? px - dx + R : px + dx - R; if (xx < 0 || xx >= W) continue;
+                    const float v = xs[c][(yy - oy + R) * T + xx - ox + R];
+#pragma unroll
+                    for (int o = 0; o < OB; o++) s[o] += ws[o][c][dy * K + dx] * v;
+                }
+            }
+    }
+    if (px >= W || py >= H) return;
+#pragma unroll
+    for (int o = 0; o < OB; o++) if (o0 + o < nOut) { const size_t i = (size_t)(o0 + o) * HW + (size_t)py * W + px; y[i] = BD && acc ? y[i] + s[o] : s[o]; }
+}
+template <int K, bool BD> static void conv_t(const float *in, int Cl, int H, int W, const float *w, const float *b, int nOut, float *y, int acc) {
+    const dim3 bl(IT, IT);
+    if (nOut >= 16) isf2_conv_t_k<K, 16, BD><<<dim3(nblk(W, IT), nblk(H, IT), nblk(nOut, 16)), bl>>>(in, Cl, H, W, w, b, nOut, y, acc);
+    else if (nOut >= 4) isf2_conv_t_k<K, 4, BD><<<dim3(nblk(W, IT), nblk(H, IT), nblk(nOut, 4)), bl>>>(in, Cl, H, W, w, b, nOut, y, acc);
+    else isf2_conv_t_k<K, 1, BD><<<dim3(nblk(W, IT), nblk(H, IT), (unsigned)nOut), bl>>>(in, Cl, H, W, w, b, nOut, y, acc);
+}
+template <int K, int GC, int GI>
+__global__ void __launch_bounds__(256) isf2_conv_bw_t_k(const float *__restrict__ x, int Ci, int H, int W, const float *__restrict__ gy, int Co, float *__restrict__ gw, int acc) {
+    constexpr int R = K / 2, KK = K * K, NW = GC * GI * KK;
+    __shared__ float sh[NW][256];
+    const int t = threadIdx.x, ci0 = blockIdx.x * GI, co0 = blockIdx.y * GC; const size_t HW = (size_t)H * W;
+    float a[GC][GI][KK];
+#pragma unroll
+    for (int c = 0; c < GC; c++)
+#pragma unroll
+        for (int i = 0; i < GI; i++)
+#pragma unroll
+            for (int k = 0; k < KK; k++) a[c][i][k] = 0.f;
+    for (size_t q = t; q < HW; q += 256) {
+        const int py = (int)(q / W), px = (int)(q % W); float g[GC];
+#pragma unroll
+        for (int c = 0; c < GC; c++) g[c] = co0 + c < Co ? gy[(size_t)(co0 + c) * HW + q] : 0.f;
+#pragma unroll
+        for (int k = 0; k < KK; k++) {
+            const int yy = py + k / K - R, xx = px + k % K - R;
+            if (yy < 0 || yy >= H || xx < 0 || xx >= W) continue;
+#pragma unroll
+            for (int i = 0; i < GI; i++) {
+                const float xv = ci0 + i < Ci ? x[(size_t)(ci0 + i) * HW + (size_t)yy * W + xx] : 0.f;
+#pragma unroll
+                for (int c = 0; c < GC; c++) a[c][i][k] += g[c] * xv;
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < GC; c++)
+#pragma unroll
+        for (int i = 0; i < GI; i++)
+#pragma unroll
+            for (int k = 0; k < KK; k++) sh[(c * GI + i) * KK + k][t] = a[c][i][k];
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (t < o) for (int j = 0; j < NW; j++) sh[j][t] += sh[j][t + o]; __syncthreads(); }
+    for (int j = t; j < NW; j += 256) {
+        const int c = j / (GI * KK), i = j / KK % GI, k = j % KK; if (co0 + c >= Co || ci0 + i >= Ci) continue;
+        const size_t gi = ((size_t)(co0 + c) * Ci + ci0 + i) * KK + k; gw[gi] = sh[j][0] + (acc ? gw[gi] : 0.f);
+    }
+}
+extern "C" void nn_isf2_conv(const float *x, int Ci, int H, int W, const float *w, const float *b, int Co, int k, float *y) {
+    if (k == 3) conv_t<3, false>(x, Ci, H, W, w, b, Co, y, 0); else if (k == 1) conv_t<1, false>(x, Ci, H, W, w, b, Co, y, 0); else { nn_isf2_conv_ref(x, Ci, H, W, w, b, Co, k, y); return; }
+    KCHECK();
+}
+extern "C" void nn_isf2_conv_bd(const float *gy, int Co, int H, int W, const float *w, int Ci, int k, float *gx, int acc) {
+    if (k == 3) conv_t<3, true>(gy, Co, H, W, w, nullptr, Ci, gx, acc); else if (k == 1) conv_t<1, true>(gy, Co, H, W, w, nullptr, Ci, gx, acc); else { nn_isf2_conv_bd_ref(gy, Co, H, W, w, Ci, k, gx, acc); return; }
+    KCHECK();
+}
+extern "C" void nn_isf2_conv_bw(const float *x, int Ci, int H, int W, const float *gy, int Co, int k, float *gw, float *gb, int acc) {
+    if (k == 3) isf2_conv_bw_t_k<3, 2, 2><<<dim3(nblk(Ci, 2), nblk(Co, 2)), 256>>>(x, Ci, H, W, gy, Co, gw, acc);
+    else if (k == 1) isf2_conv_bw_t_k<1, 4, 8><<<dim3(nblk(Ci, 8), nblk(Co, 4)), 256>>>(x, Ci, H, W, gy, Co, gw, acc);
+    else { nn_isf2_conv_bw_ref(x, Ci, H, W, gy, Co, k, gw, gb, acc); return; }
     if (gb) isf2_bias_bw_k<<<(unsigned)Co, 256>>>(gy, (size_t)H * W, gb, acc);
     KCHECK();
 }

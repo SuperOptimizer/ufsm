@@ -120,14 +120,43 @@ static void test_2d(void) {
     }
 }
 
+/* (3b) the tiled convs against the one-thread-per-output _ref kernels, bit for bit: odd sizes (partial tiles), channel counts off the
+   kernels' groups (1, 5, 17, 33 vs 4 / 8 / 16), k 1 / 3, the data gradient's accumulate, the weight gradient's acc (inkperf 2026-11-21) */
+static void test_2d_tiled(void) {
+    static const int S[][5] = {{5, 4, 3, 10, 8}, {17, 33, 3, 37, 20}, {33, 1, 1, 21, 19}, {8, 16, 1, 16, 16}, {3, 5, 3, 2, 3}, {40, 48, 3, 64, 64}, {96, 17, 1, 33, 47}};
+    for (size_t s = 0; s < sizeof S / sizeof S[0]; s++) {
+        const int Ci = S[s][0], Co = S[s][1], k = S[s][2], H = S[s][3], W = S[s][4]; const size_t nx = (size_t)Ci * H * W, ny = (size_t)Co * H * W, nw = (size_t)Co * Ci * k * k;
+        float *h = malloc((nx > ny ? (nx > nw ? nx : nw) : (ny > nw ? ny : nw)) * 4), *h2 = malloc((nx > ny ? (nx > nw ? nx : nw) : (ny > nw ? ny : nw)) * 4);
+        for (size_t i = 0; i < nx; i++) h[i] = frand(); float *dx = dup_h2d(h, nx);
+        for (size_t i = 0; i < ny; i++) h[i] = frand(); float *dgy = dup_h2d(h, ny);
+        for (size_t i = 0; i < nw; i++) h[i] = 0.3f * frand(); float *dw = dup_h2d(h, nw);
+        for (int i = 0; i < Co; i++) h[i] = frand(); float *db = dup_h2d(h, Co);
+        float *y0 = nn_malloc(ny * 4), *y1 = nn_malloc(ny * 4), *g0 = nn_malloc(nx * 4), *g1 = nn_malloc(nx * 4), *w0 = nn_malloc(nw * 4), *w1 = nn_malloc(nw * 4), *b0 = nn_malloc(Co * 4), *b1 = nn_malloc(Co * 4);
+        int bad[3] = {0, 0, 0};
+        for (int acc = 0; acc < 2; acc++) {
+            if (!acc) { nn_isf2_conv_ref(dx, Ci, H, W, dw, db, Co, k, y0); nn_isf2_conv(dx, Ci, H, W, dw, db, Co, k, y1);
+                        nn_d2h(h, y0, ny * 4); nn_d2h(h2, y1, ny * 4); bad[0] |= memcmp(h, h2, ny * 4) != 0;
+                        nn_d2d(g0, dx, nx * 4); nn_d2d(g1, dx, nx * 4); nn_zero(w0, nw * 4); nn_zero(w1, nw * 4); }
+            nn_isf2_conv_bd_ref(dgy, Co, H, W, dw, Ci, k, g0, acc); nn_isf2_conv_bd(dgy, Co, H, W, dw, Ci, k, g1, acc);
+            nn_d2h(h, g0, nx * 4); nn_d2h(h2, g1, nx * 4); bad[1] |= memcmp(h, h2, nx * 4) != 0;
+            nn_isf2_conv_bw_ref(dx, Ci, H, W, dgy, Co, k, w0, b0, acc); nn_isf2_conv_bw(dx, Ci, H, W, dgy, Co, k, w1, b1, acc);
+            nn_d2h(h, w0, nw * 4); nn_d2h(h2, w1, nw * 4); bad[2] |= memcmp(h, h2, nw * 4) != 0;
+        }
+        CHECK(!bad[0] && !bad[1] && !bad[2], "tiled conv %d -> %d k%d %dx%d: forward %s, data grad %s, weight grad %s (vs _ref)", Ci, Co, k, H, W,
+              bad[0] ? "DIFFERS" : "=", bad[1] ? "DIFFERS" : "=", bad[2] ? "DIFFERS" : "=");
+        free(h); free(h2); nn_free(dx); nn_free(dgy); nn_free(dw); nn_free(db); nn_free(y0); nn_free(y1); nn_free(g0); nn_free(g1); nn_free(w0); nn_free(w1); nn_free(b0); nn_free(b1);
+    }
+    fprintf(stderr, "tiled convs: bit-identical to the _ref kernels on %zu shapes: %s\n", sizeof S / sizeof S[0], fails ? "NO" : "yes");
+}
+
 static double g_labs;   /* sum |r z| of the last evaluation: the scale of its fp32 rounding noise */
 static double head_loss(isfhead *h, const float *dx, const float *r, int n) {
     float *z = malloc(n * 4); nn_d2h(z, isfhead_forward(h, dx), n * 4); nn_sync(); double s = 0; g_labs = 0;
     for (int i = 0; i < n; i++) { s += (double)r[i] * z[i]; g_labs += fabs((double)r[i] * z[i]); } free(z); return s;
 }
-static void test_head_fd(void) {
-    const int cin = 4, Hp = 16, Wp = 16, n = Hp * Wp; const size_t nx = (size_t)cin * n;
-    isfhead *h = isfhead_create(cin, Hp, Wp, 7); CHECK(h, "isfhead_create"); if (!h) return;
+static void test_head_fd(int L) {   /* (depth L: 4 the S1 / S2 head, 5 the S3 one) */
+    const int cin = 4, Hp = L > 4 ? 1 << L : 16, Wp = Hp, n = Hp * Wp; const size_t nx = (size_t)cin * n;
+    isfhead *h = isfhead_create_d(cin, Hp, Wp, L, 7); CHECK(h, "isfhead_create_d %d", L); if (!h) return;
     float *x = malloc(nx * 4), *r = malloc(n * 4); for (size_t i = 0; i < nx; i++) x[i] = frand(); for (int i = 0; i < n; i++) r[i] = frand();
     { const size_t np = isfhead_nparams(h); float *p = malloc(np * 4); nn_d2h(p, isfhead_params(h), np * 4); for (size_t i = 0; i < np; i++) p[i] += 0.05f * frand();   /* (the output conv off its small init) */
       nn_h2d(isfhead_params(h), p, np * 4); free(p); }
@@ -137,7 +166,7 @@ static void test_head_fd(void) {
     /* directional derivatives (central differences of fp32 sums are ~1e-6 noisy, so single tiny entries are not a test; a random direction's
        derivative is O(|g|)): the input, and each conv's weights + bias apart */
     double worst = 0; char wn[32] = "";
-    for (int t = -1; t < isfhead_nconv(); t++) {
+    for (int t = -1; t < isfhead_nconv(h); t++) {
         size_t o = 0, m = nx; float *v = t < 0 ? x : p, *dv = t < 0 ? dx : isfhead_params(h); const float *g = t < 0 ? gx : gp;
         if (t >= 0) o = isfhead_conv_span(h, t, &m);
         float *d = malloc(m * 4), *v0 = malloc(m * 4); double gd = 0, dn = 0; memcpy(v0, v + o, m * 4);
@@ -155,9 +184,31 @@ static void test_head_fd(void) {
         if (rel > 1 || getenv("TIS_V")) fprintf(stderr, "  %s%d: fd %.6g analytic %.6g (noise floor %.2g)\n", t < 0 ? "input" : "conv ", t < 0 ? 0 : t, fd, gd, nf);
         free(d); free(v0);
     }
-    fprintf(stderr, "head gradients: worst directional difference %.2f of the tolerance (3e-3 |g| + noise floor; %s; input + %d convs)\n", worst, wn, isfhead_nconv());
-    CHECK(worst < 1, "head gradients %.2f of the tolerance at %s", worst, wn);
+    fprintf(stderr, "head gradients (depth %d): worst directional difference %.2f of the tolerance (3e-3 |g| + noise floor; %s; input + %d convs)\n", L, worst, wn, isfhead_nconv(h));
+    CHECK(worst < 1, "head gradients (depth %d) %.2f of the tolerance at %s", L, worst, wn);
     free(x); free(r); free(gx); free(gp); free(p); nn_free(dx); nn_free(dr); isfhead_free(h);
+}
+
+/* (S3, 2026-11-21) a depth-4 .isf into a depth-5 head (--isf-depth 5 from S2): the 12 convs of the same role / level / shape take the file's
+   parameters byte for byte (stem, level-0 conv, encoder 1-4, decoder 3-0, output, readout); the encoder 5, bottleneck and decoder 4 stay
+   fresh; a depth-5 file round-trips with ISF2 */
+static void test_isf_depth(void) {
+    isf_dev a, b, c; const int C = 4, K = 3, Hp = 64; char p4[] = "/tmp/test_isf_depth_XXXXXX"; const int fd = mkstemp(p4); if (fd >= 0) close(fd);
+    CHECK(!isf_dev_init_d(&a, C, Hp, K, 4, 3) && !isf_dev_init_d(&b, C, Hp, K, 5, 5), "isf_dev_init_d");
+    CHECK(!isf_save(&a, p4, 7), "isf_save depth 4");
+    int st = -1, nm = -1, L = 0; CHECK(!isf_peek(p4, nullptr, &L, &st) && L == 4 && st == 7, "isf_peek depth %d step %d", L, st);
+    CHECK(!isf_load_x(&b, p4, &st, &nm) && nm == 12 && st == 0, "depth 4 -> 5: %d convs mapped (12), step %d", nm, st);
+    const size_t na = isfhead_nparams(a.h), nb = isfhead_nparams(b.h); float *pa = malloc(na * 4), *pb = malloc(nb * 4);
+    nn_d2h(pa, isfhead_params(a.h), na * 4); nn_d2h(pb, isfhead_params(b.h), nb * 4);
+    static const int ma[12] = {0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12}, mb[12] = {0, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14}; int same = 0;
+    for (int q = 0; q < 12; q++) { size_t n0, n1; const size_t o0 = isfhead_conv_span(a.h, ma[q], &n0), o1 = isfhead_conv_span(b.h, mb[q], &n1);
+        same += n0 == n1 && !memcmp(pa + o0, pb + o1, n0 * 4); }
+    CHECK(same == 12, "%d of 12 mapped convs byte-identical", same);
+    char p5[300]; snprintf(p5, sizeof p5, "%s.5", p4); CHECK(!isf_save(&b, p5, 9), "isf_save depth 5");
+    CHECK(!isf_dev_init_d(&c, C, Hp, K, 5, 11) && !isf_load_x(&c, p5, &st, &nm) && nm == 15 && st == 9, "depth 5 round trip: %d convs, step %d", nm, st);
+    float *pc = malloc(nb * 4); nn_d2h(pc, isfhead_params(c.h), nb * 4); CHECK(!memcmp(pb, pc, nb * 4), "depth 5 round trip parameters");
+    fprintf(stderr, "isf depth: 4 -> 5 mapped %d of 15 convs (12 byte-identical), depth 5 round trip ok\n", 12);
+    unlink(p4); unlink(p5); free(pa); free(pb); free(pc); isf_dev_free(&a); isf_dev_free(&b); isf_dev_free(&c);
 }
 
 /* ---- (5) the toy ---- */
@@ -322,7 +373,7 @@ int main(void) {
     g_ink = envf("TIS_INK", g_ink); g_bg = envf("TIS_BG", g_bg); g_sp0 = envf("TIS_SP0", g_sp0); g_sp1 = envf("TIS_SP1", g_sp1);
     g_a0 = envf("TIS_A0", g_a0); g_a1 = envf("TIS_A1", g_a1); g_wl0 = envf("TIS_WL0", g_wl0); g_wl1 = envf("TIS_WL1", g_wl1); g_gap = envf("TIS_GAP", g_gap); g_moff = envf("TIS_MOFF", g_moff); TP = (int)envf("TIS_TP", (float)TP);
     if (getenv("TIS_SEED")) rs = (uint64_t)atoll(getenv("TIS_SEED"));
-    if (!getenv("TIS_TOY_ONLY")) { test_resample(); test_2d(); test_head_fd(); }
+    if (!getenv("TIS_TOY_ONLY")) { test_resample(); test_2d(); test_2d_tiled(); test_head_fd(4); test_head_fd(5); test_isf_depth(); }
     test_toy();
     if (!getenv("TIS_TOY_ONLY")) test_slab_inject();
     if (fails) { fprintf(stderr, "test_inksurf: %d FAILED\n", fails); return 1; }

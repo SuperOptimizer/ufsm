@@ -65,6 +65,8 @@ typedef struct {
     double um;              /* level-0 voxel size */
     double weight;
     double ink_weight;   /* "ink_weight" (default 1): train --ink-head, this source's ink loss x the factor (e.g. pseudo labels < human) */
+    double surf_weight;  /* "surf_weight" (default 1): train --ink-surf, this source's surface-head loss x the factor (S3 teacher pixels: 0.5) */
+    int surf_only;       /* "surf_only" (default 0): 1 = only the surface head trains on this source (teacher maps): no voxel ink / MIL loss, soft labels */
     int min_level;    /* training never draws levels below this (e.g. 1 for a 1.1 um scan whose level 0 is finer than the others) */
     int max_level;    /* ... nor above this (-1: no limit); e.g. a teacher target whose coarser levels are only downsampled copies */
     int geometry;     /* 0: never spatially augmented (zoom / rotation / elastic) */

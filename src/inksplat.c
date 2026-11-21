@@ -1838,11 +1838,16 @@ static void inkfly_rayface_load(inkfly *f) {
     if (m == MAP_FAILED) return;
     f->rf_map = m; f->rf_len = (size_t)st.st_size; f->rf = (const uint8_t *)m + RF_HDR;
 }
+/* the ray stride in a unit's label px: the stride counts canvas px (level-0 voxels along the mesh), so a coarse label raster (an ink-teach
+   map, label_scale K > 1) gets its rays every max(1, stride / K) of its px (S3 2026-11-21: K 4 teacher px at stride 2 would leave 19.2 um
+   gaps in a 9.6 um patch); F = 1 rasters (every human label set) unchanged */
+static inline int ifu_stride(const ifunit *u, int stride) { if (!(u->F > 1.5)) return stride; const int s = (int)lround(stride / u->F); return s > 1 ? s : 1; }
 /* the candidate pixels of tile t (every supervised pixel with a mesh point; no window / held-out test) into *X (grown), the box */
 static int tile_px_s(inkfly *f, size_t t, cpx **X, size_t *np, size_t *cap, double lo3[3], double hi3[3], int stride);
 static int tile_px(inkfly *f, size_t t, cpx **X, size_t *np, size_t *cap, double lo3[3], double hi3[3]) { return tile_px_s(f, t, X, np, cap, lo3, hi3, 1); }
 static int tile_px_s(inkfly *f, size_t t, cpx **X, size_t *np, size_t *cap, double lo3[3], double hi3[3], int stride) {
     const inksplat_cfg *c = &f->c; const ifunit *u = &f->U[f->T[t].unit]; const int tl = (int)f->T[t].tile, tx = tl % u->ntx, ty = tl / u->ntx;
+    const int su = ifu_stride(u, stride);
     const int64_t r0 = (int64_t)ty * TS, c0 = (int64_t)tx * TS, r1 = r0 + TS < u->lh ? r0 + TS : u->lh, c1 = c0 + TS < u->lw ? c0 + TS : u->lw, rh = r1 - r0, rw = c1 - c0;
     const int reach = (int)ceil(fmax(fabs(c->face_lo), fabs(c->face_hi))) + 2;
     uint8_t *lab = malloc((size_t)rh * rw), *msk = nullptr;
@@ -1850,12 +1855,12 @@ static int tile_px_s(inkfly *f, size_t t, cpx **X, size_t *np, size_t *cap, doub
     if (u->lab01) for (size_t k = 0; k < (size_t)rh * rw; k++) lab[k] *= 255;
     geo G = {0}; G.c = c; G.S = &f->S[u->surf]; G.F = u->F; G.lab = lab; G.msk = msk; G.lw = rw; G.lh = rh; G.lr0 = u->lr0 + r0; G.lc0 = u->lc0 + c0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
     for (int64_t r = 0; r < rh; r++) for (int64_t cc = 0; cc < rw; cc++) {
-        if ((u->lr0 + r0 + r) % stride || (u->lc0 + c0 + cc) % stride) continue;
+        if ((u->lr0 + r0 + r) % su || (u->lc0 + c0 + cc) % su) continue;
         if (!px_sup(&G, r, cc)) continue;
         double gu, gv, P[3], N[3]; px_grid(&G, (double)r, (double)cc, &gu, &gv);
         if (ssurf_pn(G.S, gu, gv, P, N)) continue;
         if (*np == *cap) { *cap = *cap ? 2 * *cap : 65536; cpx *q = realloc(*X, *cap * sizeof *q); if (!q) { free(lab); free(msk); return -1; } *X = q; }
-        cpx *x = &(*X)[(*np)++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = lab[(size_t)r * rw + cc] >= 128; x->t = (uint32_t)t; x->px = (uint16_t)(r * TS + cc);
+        cpx *x = &(*X)[(*np)++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = c->soft_y ? lab[(size_t)r * rw + cc] : lab[(size_t)r * rw + cc] >= 128; x->t = (uint32_t)t; x->px = (uint16_t)(r * TS + cc);
         for (int d = 0; d < 3; d++) { if (P[d] - reach < lo3[d]) lo3[d] = P[d] - reach; if (P[d] + reach > hi3[d]) hi3[d] = P[d] + reach; }
     }
     free(lab); free(msk); return 0;
@@ -2290,8 +2295,8 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
         for (size_t q = q0; q < q1; q++) {
             const int t = (int)f->T[cand[q]].tile, tx = t % u->ntx, ty = t / u->ntx;
             const int64_t r0 = (int64_t)ty * TS, c0 = (int64_t)tx * TS, r1 = r0 + TS < u->lh ? r0 + TS : u->lh, c1 = c0 + TS < u->lw ? c0 + TS : u->lw;
-            for (int64_t r = r0; r < r1; r++) { if ((u->lr0 + r) % stride) continue;
-                for (int64_t cc = c0; cc < c1; cc++) { if ((u->lc0 + cc) % stride) continue;
+            for (int64_t r = r0; r < r1; r++) { if ((u->lr0 + r) % ifu_stride(u, stride)) continue;
+                for (int64_t cc = c0; cc < c1; cc++) { if ((u->lc0 + cc) % ifu_stride(u, stride)) continue;
                     if (!px_sup(&G, r - rr0, cc - rc0)) continue;
                     double gu, gv, P[3], N[3]; px_grid(&G, (double)(r - rr0), (double)(cc - rc0), &gu, &gv);
                     if (ssurf_pn(G.S, gu, gv, P, N)) continue;
@@ -2300,7 +2305,7 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
                     int ex = 0; for (int e = 0; e < c->nexcl && !ex; e++) { const int64_t *bx = c->excl[e]; ex = 1; for (int d = 0; d < 3 && ex; d++) ex = P[d] > bx[d] - ex_m && P[d] < bx[d] + bx[3 + d] + ex_m; }
                     if (ex) continue;
                     if (np == pc) { pc *= 2; X = realloc(X, pc * sizeof *X); }
-                    cpx *x = &X[np++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = lab[(size_t)(r - rr0) * rw + (cc - rc0)] >= 128;
+                    cpx *x = &X[np++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = c->soft_y ? lab[(size_t)(r - rr0) * rw + (cc - rc0)] : lab[(size_t)(r - rr0) * rw + (cc - rc0)] >= 128;
                     x->t = cand[q]; x->px = (uint16_t)((r - r0) * TS + (cc - c0));
                     for (int d = 0; d < 3; d++) { if (P[d] - reach < lo3[d]) lo3[d] = P[d] - reach; if (P[d] + reach > hi3[d]) hi3[d] = P[d] + reach; }
                 } }
