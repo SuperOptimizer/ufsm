@@ -1010,6 +1010,7 @@ static void isf_resolve(gpu_state *d) {   /* --ink-surf: the launched head step'
     static int dbg = -1; if (dbg < 0) dbg = ufsm_env_on("UFSM_ISF_DBG");
     if (dbg) fprintf(stderr, "isfdbg resolve cur %d got %d l %.9g auc %.9g\n", d->isf_cur, d->isf_got, l, d->isf_auc);
 }
+static int isf_at(int k) { static int a = -1; if (a < 0) a = getenv("UFSM_ISF_AT") ? atoi(getenv("UFSM_ISF_AT")) : 0; return a == k; }
 static void isf_join(gpu_state *d, int i) {   /* buffer i's patch build done (a no-op without one in flight) */
     if (!d->isf_thon[i]) return;
     pthread_join(d->isf_th[i], nullptr); d->isf_thon[i] = 0;
@@ -1489,6 +1490,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
     const size_t hw = (size_t)H * W, l3 = (size_t)D * hw;
     if (!pass && d->ev_lab[d->cur]) nn_stream_wait(0, d->ev_lab[d->cur]);   /* (lab_early: the label warp in hs_lg / lsc, the device-kept planes) */
     nn_set_logits_h16(1);
+    if (pass && isf_at(3)) isf_resolve(d);
     nn_set_head_gscale_dev(pass && d->hgs_on ? d->hgsd : nullptr);   /* the gradient pass: the producers' planes at this window's head plane scale (hgs_choose, device {s, 1 / s}), the head's backward divides it out */
     static int lchk = -1; if (lchk < 0) lchk = g_lat && ufsm_env_on("UFSM_LAT_CHECK");
     /* UFSM_PTICK: the slab phases by pass */
@@ -1995,9 +1997,11 @@ static void head_slab_pass(gpu_state *d, int pass) {
 #undef HZP
     }
     nn_set_head_gscale_dev(nullptr);
+    if (!pass && isf_at(1)) isf_resolve(d);
 }
 static void head_slab_cb(void *ctx) {
     gpu_state *d = ctx;
+    if (isf_at(2)) isf_resolve(d);
     head_slab_pass(d, 1);
     if (d->hsplit) nn_event_record(d->ev_hs, 0);   /* the derived-target planes are free for the next batch (upload_async) */
 }
