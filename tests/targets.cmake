@@ -13,6 +13,7 @@ ufsm_exe(aug_render tests/aug_render.c OBJS scannorm edt band sheet ct_augment s
 ufsm_exe(bench_attn tests/bench_attn.c OBJS NN LP LIBS LDLIBS CUDA)
 ufsm_exe(bench_conv tests/bench_conv.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_f4conv tests/bench_f4conv.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(bench_isfhead tests/bench_isfhead.c OBJS inksurf unet NN LP LIBS m CUDA)
 ufsm_exe(bench_f4wide tests/bench_f4wide.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_gn tests/bench_gn.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(bench_head tests/bench_head.c OBJS NN LP LIBS m CUDA)
