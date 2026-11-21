@@ -121,6 +121,7 @@ int main(int argc, char **argv) {
     test_map();
     if (argc != 3) { fprintf(stderr, "usage: test_ink_mil_train <ufsm binary> <make_wind_fixture binary>\n"); return 2; }
     const char *U = argv[1];
+    setenv("UFSM_STARTUP_TIMES", "0", 1);   /* (as run_suite: no "t+N.Ns" prefix on train's lines, which the '^memory:' / '^step' greps read; by hand = the suite) */
     char d[] = "/tmp/test_inkmil_XXXXXX"; if (!mkdtemp(d)) return 1;
     const int FN = getenv("TIMT_N") ? atoi(getenv("TIMT_N")) : 256;   /* TIMT_N / TIMT_KEEP=1 (benches): a larger fixture, kept with its MIL source */
     /* (FX_FAINT .375,.625: papyrus below the sources' iso 100 for z in [96, 160): the segment's rows there have no open face, a non-empty
