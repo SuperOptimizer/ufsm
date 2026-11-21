@@ -352,7 +352,7 @@ static size_t g_mil_reserve;   /* mgpu: config (set by the planner before the GP
    one of the 8 orientations and the normal reversed half the time (unrolled wraps have any orientation / sign: predict --surf) */
 static uint64_t g_seed;   /* --seed (mgpu: config) */
 static int g_isf, g_isf_P = 256, g_isf_step = 4, g_isf_k = 4, g_isf_aug = 1; static float g_isf_lambda, g_isf_lr = 1e-3f, g_isf_wd = 0.f;
-static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static float g_mil_r_um = 0.f, g_mil_R = 10.f, g_mil_step = 1.f, g_mil_tau = 0.f, g_mil_lambda = 1.f;   /* --ink-mil L
+static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static float g_mil_r_um = 0.f, g_mil_R = 10.f, g_mil_step = 1.f, g_mil_tau = 0.f, g_mil_lambda = 1.f;   /* mgpu: config. --ink-mil L
    (--ink-head): the normal-pooled MIL ink loss on each window's rays (inkmil.h): per supervised label pixel (mode 1: only those without an open face, the
    voxel target's unknowns), BCE of the pooled ink logit along the normal over +-R window voxels at step (tau 0: max; > 0: tau log mean exp), the mean
    over the window's rays x L x the source's ink weight; at most --ink-mil-max rays a window (the device buffers; the backward's sort ~300 B per sample) */

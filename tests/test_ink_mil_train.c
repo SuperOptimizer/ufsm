@@ -121,6 +121,7 @@ int main(int argc, char **argv) {
     test_map();
     if (argc != 3) { fprintf(stderr, "usage: test_ink_mil_train <ufsm binary> <make_wind_fixture binary>\n"); return 2; }
     const char *U = argv[1];
+    setenv("UFSM_STARTUP_TIMES", "0", 1);   /* (as run_suite: no "t+N.Ns" prefix on train's lines, which the '^memory:' / '^step' greps read; by hand = the suite) */
     char d[] = "/tmp/test_inkmil_XXXXXX"; if (!mkdtemp(d)) return 1;
     const int FN = getenv("TIMT_N") ? atoi(getenv("TIMT_N")) : 256;   /* TIMT_N / TIMT_KEEP=1 (benches): a larger fixture, kept with its MIL source */
     /* (FX_FAINT .375,.625: papyrus below the sources' iso 100 for z in [96, 160): the segment's rows there have no open face, a non-empty
@@ -243,6 +244,46 @@ int main(int argc, char **argv) {
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/sf2 --steps 2 --resume %s/sf/last.ckpt --ink-mil 1 --ink-mil-mode 1 --ink-surf 1 --isf-P 32 --isf-step 2 --isf-k 2 %s > %s/sf2.log 2>&1",
                   U, d, d, d, common, d), "--resume with the head (%s/sf2.log)", d);
         CHECK(!sh("grep -q 'ink surf: head from .*last.ckpt.isf (step 6)' %s/sf2.log", d), "--resume did not take the surface head (%s/sf2.log)", d);
+        /* ckpt-avg (11-21): averages the .isf head beside the trunk: parameters = the mean of sf and pert (sf with every head parameter
+           + i % 7 / 8, Adam m + 1: sf2's two resumed steps leave the head unchanged), header and Adam moments those of the last input; an
+           input without a sidecar next to one with is an error */
+        {
+            char pa[1024], pb[1024]; snprintf(pa, sizeof pa, "%s/sf/last.ckpt.isf", d); snprintf(pb, sizeof pb, "%s/pert.ckpt.isf", d);
+            FILE *fa = fopen(pa, "rb"), *fb = fopen(pb, "wb"); long sa = 0; int ok = fa && fb;
+            if (ok) { fseek(fa, 0, SEEK_END); sa = ftell(fa); rewind(fa); }
+            unsigned char *A = ok && sa > 20 ? malloc(sa) : nullptr; ok = A && fread(A, 1, sa, fa) == (size_t)sa;
+            if (ok) {
+                int hdr; memcpy(&hdr, A, 4); const long hl = hdr == 0x31465349 ? 16 : 20, np = (sa - hl) / 12;
+                for (long i = 0; i < 2 * np; i++) { float x; memcpy(&x, A + hl + 4 * i, 4); x += i < np ? (float)(i % 7) / 8 : 1.f; memcpy(A + hl + 4 * i, &x, 4); }
+                ok = fwrite(A, 1, sa, fb) == (size_t)sa;
+            }
+            free(A); if (fa) fclose(fa); if (fb && fclose(fb)) ok = 0;
+            CHECK(ok, "cannot write %s", pb);
+        }
+        CHECK(!sh("cp %s/sf/last.ckpt %s/pert.ckpt && %s ckpt-avg %s/avg.ckpt %s/sf/last.ckpt %s/pert.ckpt > %s/avg.log 2>&1", d, d, U, d, d, d, d), "ckpt-avg (%s/avg.log)", d);
+        {
+            char pa[1024], pb[1024], po[1024]; snprintf(pa, sizeof pa, "%s/sf/last.ckpt.isf", d); snprintf(pb, sizeof pb, "%s/pert.ckpt.isf", d);
+            snprintf(po, sizeof po, "%s/avg.ckpt.isf", d);
+            FILE *fa = fopen(pa, "rb"), *fb = fopen(pb, "rb"), *fo = fopen(po, "rb"); long sa = 0, sb = 0, so = 0;
+            if (fa) { fseek(fa, 0, SEEK_END); sa = ftell(fa); rewind(fa); } if (fb) { fseek(fb, 0, SEEK_END); sb = ftell(fb); rewind(fb); }
+            if (fo) { fseek(fo, 0, SEEK_END); so = ftell(fo); rewind(fo); }
+            CHECK(fa && fb && fo && sa == sb && sb == so && sa > 16, "ckpt-avg: no / mis-sized %s (%ld %ld %ld)", po, sa, sb, so);
+            if (fa && fb && fo && sa == sb && sb == so && sa > 16) {
+                unsigned char *A = malloc(sa), *B = malloc(sa), *O = malloc(sa);
+                const int rd = fread(A, 1, sa, fa) == (size_t)sa && fread(B, 1, sa, fb) == (size_t)sa && fread(O, 1, sa, fo) == (size_t)sa;
+                int hdr; memcpy(&hdr, A, 4); const long hl = hdr == 0x31465349 ? 16 : 20, np = (sa - hl) / 12; long bad = 0, moved = 0;
+                for (long i = 0; i < np; i++) {
+                    float x, y, z; memcpy(&x, A + hl + 4 * i, 4); memcpy(&y, B + hl + 4 * i, 4); memcpy(&z, O + hl + 4 * i, 4);
+                    bad += z != (float)(((double)x + y) / 2); moved += x != y;
+                }
+                CHECK(rd && !bad && moved > 0, "ckpt-avg .isf: %ld of %ld parameters not the mean (%ld differ between the inputs)", bad, np, moved);
+                CHECK(!memcmp(O, B, hl) && !memcmp(O + hl + 4 * np, B + hl + 4 * np, 8 * np), "ckpt-avg .isf: header / moments not the last input's");
+                free(A); free(B); free(O);
+            }
+            if (fa) fclose(fa); if (fb) fclose(fb); if (fo) fclose(fo);
+        }
+        CHECK(sh("cp %s/sf/last.ckpt %s/nohead.ckpt && %s ckpt-avg %s/avg2.ckpt %s/nohead.ckpt %s/pert.ckpt > %s/avg2.log 2>&1", d, d, U, d, d, d, d) &&
+              !sh("grep -q '1 of 2 inputs have a .isf' %s/avg2.log", d), "ckpt-avg with one sidecar missing did not fail (%s/avg2.log)", d);
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/sb1 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 0 --ink-surf 1 --isf-lr 0 --isf-P 32 --isf-step 2 --isf-k 2 %s > %s/sb1.log 2>&1", U, d, d, common, d), "sb1");
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/sb0 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 0 %s > %s/sb0.log 2>&1", U, d, d, common, d), "sb0");
         CHECK(!sh("for x in sb0 sb1; do grep -E '^(t\\+[0-9.]+s )?step ' %s/$x.log | sed -E 's/^t\\+[0-9.]+s //; s/ ink surf [^(]*\\([^)]*\\)//; s/ [0-9.]+ samp\\/s.*//; s/ (wait|gn) [0-9.%%]+//g' > %s/$x.txt; done; cmp -s %s/sb0.txt %s/sb1.txt", d, d, d, d),
