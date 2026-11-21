@@ -1562,7 +1562,7 @@ static int predict_one(int argc, char **argv) {
     /* --channels A,B,C (voxel nets, 2026-11-20): one trunk forward per window for several logit channels. The first is the main output
        (as --channel A); each other is its own store, --channel-outs DIR,DIR (default <out>.c<N>), byte-identical to a --channel N run.
        The head computes channels [min, max] (2 B per window voxel each in fp16) and every extra channel holds a device shard. */
-    enum { MCH_MAX = 16 }; int mch_n = 0, mch_c[MCH_MAX], mch_lo = 0; static char mch_first[16]; char mch_out[MCH_MAX][1400];
+    enum { MCH_MAX = 16 }; int mch_n = 0, mch_c[MCH_MAX], mch_lo = 0; static char mch_first[16]; char mch_out[MCH_MAX][1400];   /* mgpu: main (predict --channels: the first channel as --channel text, set once before any worker) */
     {   const char *ml = opt(argc, argv, "--channels", nullptr), *mo = opt(argc, argv, "--channel-outs", nullptr), *o0 = out;
         if (ml) {
             if (opt(argc, argv, "--channel", nullptr)) { fprintf(stderr, "predict: --channels and --channel together\n"); return 2; }

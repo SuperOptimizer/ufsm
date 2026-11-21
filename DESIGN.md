@@ -72,6 +72,41 @@ voxel apart. The head trains on the 2-D labels directly, with no splat.
   The toy tests plumbing and learnability; the advantage has to show on real data: ink-wrapscore on 1667 / P4 (dev) and
   0841 / 1447 (clean) vs sH at the same steps.
 
+## 3-D ink: the H recipe sweep and arm K, a surface-proximity input (2026-11-20, branch inkk-20261120, inksdk)
+
+**H recipe** (wind96 widths 32..192, dec 0,32, init wind96-u2, trunk-lr-mult 0.2, lr 9e-4 / muon 9e-3, wsd constant, P 256, the six
+human-ink scrolls, ink face band [-6, 0]). Scores: 1667 = ink-wrapscore held-out / rest (depth 4, the 17 up wraps); P4 = the 16
+wbench Paris 4 eval crops (all held-out boxes), mean AUC (p4score.sh; gambiarra port 0.767 on the same crops).
+
+| ckpt | 1667 held-out | 1667 rest | P4 (16) |
+|---|---|---|---|
+| sH-5000 | 0.592 | 0.588 | 0.836 (9 crops) |
+| sH-10000 | 0.614 | 0.628 | 0.842 |
+| sH-15000 | 0.654 | 0.652 | 0.856 |
+| sH-20000 | 0.671 | 0.679 | |
+| sH-25000 | 0.658 | 0.675 | 0.865 |
+| NH-5000 (face [-2, 4]) | 0.598 | 0.582 | 0.778 |
+| M1H-5000 (P4 gambiarra targets) | 0.484 | 0.501 | 0.833 |
+| M2H-10000 (M1H-3000 on six scrolls) | 0.617 | 0.633 | 0.860 |
+
+NH stopped at 5k: fullvram's profile showed gambiarra's "+3 peak" is the edge of a flat t_f-4..+4 plateau, its mean output peaks at
+t_f-2..0, inside our band. On 1667 local CT is near chance (intensity 0.57, 3x3 texture 0.50: lead), so reader3's 0.86 comes from
+in-plane context along the surface; hence arm K.
+
+**Arm K: the net is told where the scored surface is.** A fifth input (train --aux-input 1 / predict --aux) holds the proximity to
+the segment meshes: `ufsm raster --dist 1` (new) writes 254 on a mesh, linear (3-4-5 chamfer) to 0 at T+1 voxels (T 6 at 9.6 um,
+~60 um), 0 beyond, from the same meshes at train and predict time (training: each scroll's labelled segments, segs-*-HT.json;
+Paris 4 scoring: the same Paris 4 segment meshes; 1667 scoring: the unroll's 17 up wraps), so the channel never comes from the
+per-pixel face search (which fails on 25-40 % of ink pixels and would correlate with the label). Unsigned: tifxyz normal signs are
+not consistent across authors; the CT gives the side. The stem grows 4 -> 5 inputs with zero weights (init-from), step 0 = H.
+Seven volumes (6 scrolls + 1667 up) took ~25 min on 6 threads (Paris 4: 490 active 512^3 shards, 365 s).
+
+- The aux input followed the CT's symmetry only, not its spatial warp (rotate / elastic); fixed (trilinear as the ink plane, outside
+  0). --aux-input turns --gpu-input / --gpu-aug off: those now print DEFAULTED: (were WARNING).
+- Sampler-only, Paris 4 source, sH's recipe, 6 workers, no GPU: K 221 Mvox/s, H (host path too, no GPU) 126 Mvox/s; the net needs
+  ~33 Mvox/s, so the host augmentation does not starve K.
+- K-H launched 11-20 ~22:00 on card 0; scores every 5k to 30k (sweep8k).
+
 ## predict --channels: several logit channels of a voxel net from one forward (2026-11-20, branch mchan-20261120, fullvram)
 
 latcodec's fibre eval ran predict 8 times on the laptop (`--channel 0..7`: H, V, dyad c2..c7), ~24 s each, 23 s of it the windows:
