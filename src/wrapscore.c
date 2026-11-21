@@ -442,6 +442,7 @@ static int vol_eval(z3 *z, const wwrap *w, const rgrid *g, const wsamp *S, const
     for (size_t i = 0; i < nk; i++) free(bufs[i]);
     free(bufs); free(keys); free(sk); return rc;
 }
+static int64_t fdiv512(int64_t v) { return v >= 0 ? v / 512 : -((-v + 511) / 512); }   /* floor(v / 512) */
 void img_gate_lut(uint8_t lut[256][256]);   /* src/imggate.c */
 static z3 *vol_open(const char *dir, const char *name, const char *key) {   /* DIR/NAME.zarr, level KEY */
     char p[1400]; snprintf(p, sizeof p, "%s/%s.zarr", dir, name); struct stat st; if (stat(p, &st)) return nullptr;
@@ -455,7 +456,8 @@ int cmd_ink_wrapscore(int argc, char **argv) {
         fprintf(stderr, "usage: ufsm ink-wrapscore WRAPS SEGS.JSON OUT --ct-key K --maps name=DIR[,name=DIR ..] [--ref NAME] [--nonzero a,b] [--split heldout,hold,valonly]\n"
                         "  [--tol 40] [--step 8] [--holdouts H.json] [--um-label 2.399] [--table FILE] [--need w035-w051] [--min-n 1000] [--draws 1000] [--threads 6]\n"
                         "  the held-out ink AUC of rendered maps on an unroll's wraps against the published human labels (wrapscore.py / pairwrap2.py in C);\n"
-                        "  --table caches the checkpoint-independent samples and foot points; OUT.<split>.tsv per split; any missing input fails (exit 1)\n");
+                        "  --table caches the checkpoint-independent samples and foot points; OUT.<split>.tsv per split; any missing input fails (exit 1)\n"
+                        "  [--vmap NAME=DIR] [--tiles-out DIR [--tiles-sub S]]: volume maps; the 512 tiles (grids 0 / 256) the samples read, S x finer (2: a level-1 predict of a level-2 --vkey)\n");
         return 2;
     }
     const char *wraps = argv[2], *segs = argv[3], *out = argv[4];
@@ -494,12 +496,22 @@ int cmd_ink_wrapscore(int argc, char **argv) {
         for (int k = 0; k < t.nw; k++) { if (!inw[k]) continue; char p[1400]; int w, h; snprintf(p, sizeof p, "%s/%s", wraps, t.W[k].name);
             if (load_xyz(p, &G[k].X, &G[k].Y, &G[k].Z, &w, &h) || w != t.W[k].w || h != t.W[k].h) { fprintf(stderr, "ink-wrapscore: cannot read the wrap %s (or its grid changed)\n", p); return 1; } }
     }
-    if (tiles) {   /* latink.sh LATINK_TILES: the 512 tiles of grids 0 and 256 that hold a scored sample's pixel point (+- VMARG) */
+    if (tiles) {   /* latink.sh LATINK_TILES: the 512 tiles of grids 0 and 256 that hold a scored sample's pixel point (+- VMARG). --tiles-sub S
+                      (2026-11-21, inkperf): the tiles of a predict S times finer than --vkey (S 2: score.sh FASTLV=1, level-1 tiles whose 2^3
+                      mean is the scored level): exactly the children of the voxels read, not every child of the coarse tiles */
+        const int tsub = opt_atoi("--tiles-sub", wopt(argc, argv, "--tiles-sub", "1"));
+        if (tsub < 1 || tsub > 8 || (tsub & (tsub - 1))) { fprintf(stderr, "ink-wrapscore: --tiles-sub 1, 2, 4 or 8\n"); return 2; }
         size_t cap = 1 << 16, nt = 0; uint64_t *tk = malloc(cap * sizeof *tk); size_t npt = 0;
         for (size_t s = 0; s < t.ns; s++) { if (!ev[s] || !inw[t.S[s].k]) continue; const wwrap *w = &t.W[t.S[s].k]; int px, py; double P[3]; samp_px(w, &t.S[s], &px, &py);
             if (!px_point(G[t.S[s].k].Z, G[t.S[s].k].Y, G[t.S[s].k].X, w->w, w->h, 1 / w->sc, px, py, P)) continue; npt++;
-            for (int g = 0; g < 2; g++) { const double o = g ? 256 : 0; int64_t a[3], b[3];
-                for (int d = 0; d < 3; d++) { a[d] = (int64_t)floor((P[d] - VMARG - o) / 512); b[d] = (int64_t)floor((P[d] + VMARG - o) / 512); }
+            for (int g = 0; g < 2; g++) { const int64_t o = g ? 256 : 0; int64_t a[3], b[3];
+                for (int d = 0; d < 3; d++) {   /* the --vkey voxels [lo, hi] read around P -> their tsub^3 children on the predict's level */
+                    int64_t lo = (int64_t)floor(P[d] - VMARG), hi = (int64_t)floor(P[d] + VMARG);
+                    if (tsub > 1) { lo = lo >> 4 << 4; hi = (hi >> 4 << 4) + 15; }   /* (whole 16^3 volcomp blocks: at q > 0 a voxel's decoded value depends on its
+                                                                                       block, so every voxel of a read block keeps both grids; tsub 1 keeps the
+                                                                                       lists the FAST scores were made with) */
+                    lo *= tsub; hi = hi * tsub + tsub - 1;
+                    a[d] = fdiv512(lo - o); b[d] = fdiv512(hi - o); }
                 for (int64_t z = a[0]; z <= b[0]; z++) for (int64_t y = a[1]; y <= b[1]; y++) for (int64_t x = a[2]; x <= b[2]; x++) {
                     if (nt + 1 >= cap) { cap *= 2; tk = realloc(tk, cap * sizeof *tk); }
                     tk[nt++] = (uint64_t)g << 63 | (uint64_t)(z + 1024) << 42 | (uint64_t)(y + 1024) << 21 | (uint64_t)(x + 1024); } } }
