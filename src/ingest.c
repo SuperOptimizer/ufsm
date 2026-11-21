@@ -707,6 +707,7 @@ typedef struct {
     int64_t ns[3]; int64_t shape[3]; z3w *w; atomic_int failed, done; int nthreads;
     rtile *tiles; size_t ntile; size_t *offset; uint32_t *refs;
     int indexed, reference_distance, binary, band, value;   /* value: write winding_mod14 codes of the per-vertex values */
+    int dist;   /* raster --dist 1: the surface-proximity input (train --aux-input): 254 on a mesh, falling to 0 at T + 1 voxels, 0 beyond */
 } rjob;
 
 #include "raster_cpu.h"
@@ -724,7 +725,7 @@ static void raster_shard(int si, int tid, void *ud) {
         for (int d = 0; d < 3; d++) if (m->lo[d] * j->scale > hi[d] || m->hi[d] * j->scale < lo[d]) hit = 0;
         if (hit) { any = 1; break; }
     }
-    if (!any) { atomic_fetch_add(&j->done, 1); return; }   /* missing shard = fill 255 = ignore */
+    if (!any) { atomic_fetch_add(&j->done, 1); return; }   /* missing shard = the fill (255 = ignore; --value / --dist: 0) */
     size_t NN = (size_t)N * N * N;
     uint8_t *d = malloc(NN);
     if (!d) { atomic_store(&j->failed, 1); return; }
@@ -786,6 +787,9 @@ static void raster_shard(int si, int tid, void *ud) {
     if (!buf) { free(d); atomic_store(&j->failed, 1); return; }
     if (j->value) for (int z = 0; z < S; z++) for (int y = 0; y < S; y++)
         memcpy(buf + ((size_t)z * S + y) * S, d + ((size_t)(z + M) * N + (y + M)) * N + M, (size_t)S);
+    else if (j->dist) { const int cap = 3 * j->T + 3; for (int z = 0; z < S; z++) for (int y = 0; y < S; y++) {
+        const uint8_t *src = d + ((size_t)(z + M) * N + (y + M)) * N + M; uint8_t *dst = buf + ((size_t)z * S + y) * S;
+        for (int x = 0; x < S; x++) dst[x] = src[x] >= cap ? 0 : (uint8_t)((254 * (cap - src[x]) + cap / 2) / cap); } }
     else if (j->binary && !j->reference_distance && j->band) raster_expand_mask(d, N, buf, S, M);
     else for (int z = 0; z < S; z++) for (int y = 0; y < S; y++) {
         const uint8_t *src = d + ((size_t)(z + M) * N + (y + M)) * N + M;
@@ -800,7 +804,8 @@ static void raster_shard(int si, int tid, void *ud) {
 }
 
 int cmd_raster(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm raster <out-dir> --shape Z,Y,X --um U [--level L] [--binary 0|1] [--band-chamfer 0|4] [--T 3] [--levels 6] [--threads 8] [--shard 1024] [--raster-index 1] [--reference-distance 0] [--value q.tif] <mesh.sfc|tifxyz-dir>...\n"
+    if (argc < 4) { fprintf(stderr, "usage: ufsm raster <out-dir> --shape Z,Y,X --um U [--level L] [--binary 0|1] [--band-chamfer 0|4] [--T 3] [--levels 6] [--threads 8] [--shard 1024] [--raster-index 1] [--reference-distance 0] [--value q.tif] [--dist 1] <mesh.sfc|tifxyz-dir>...\n"
+                                  "  --dist 1: surface proximity (train --aux-input 1, predict --aux): 254 on a mesh, linear to 0 at T+1 voxels (--levels 1)\n"
                                   "  --value NAME: per-vertex float32 image in each tifxyz dir (winding q, turns) -> winding_mod14 codes (one level, no band)\n"); return 2; }
     const char *out = argv[2];
     long long Z = 0, Y = 0, X = 0;
@@ -816,6 +821,8 @@ int cmd_raster(int argc, char **argv) {
     }
     const char *value_name = opt(argc, argv, "--value", "");
     if (*value_name && (binary || nlev != 1)) { fprintf(stderr, "raster --value: use --binary 0 --levels 1\n"); return 2; }
+    const int dist = opt_atoi("--dist", opt(argc, argv, "--dist", "0"));
+    if (dist && (binary || nlev != 1 || *value_name)) { fprintf(stderr, "raster --dist 1: use --binary 0 --levels 1, no --value\n"); return 2; }
     mesh *meshes[4096]; int nm = 0;
     for (int i = 3; i < argc && nm < 4096; i++) {
         if (argv[i][0] == '-') { i++; continue; }
@@ -832,11 +839,12 @@ int cmd_raster(int argc, char **argv) {
     z3w_level_name(um_l, lv, sizeof lv);
     snprintf(ldir, sizeof ldir, "%s/%s", out, lv);
     if (*value_name) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"grid\":\"block-centre\",\"content\":\"winding\",\"source\":\"raster of %d meshes, value %s\",\"encoding\":\"winding_mod14\",\"code\":\"1 + (round(q*18) mod 252); 0 empty; 255 conflict (>1/4 turn)\"}}", nm, value_name);
+    else if (dist) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"grid\":\"block-centre\",\"content\":\"surface proximity\",\"source\":\"raster of %d meshes\",\"T\":%d,\"encoding\":\"254 on a mesh, linear (3-4-5 chamfer) to 0 at T+1 voxels; 0 far\"}}", nm, T);
     else if (binary) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"grid\":\"block-centre\",\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"encoding\":\"binary\",\"surface_band_chamfer\":%d,\"codec\":\"volcomp-mask-lossless\",\"background\":\"all non-surface voxels\"}}", nm, band);
     else snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"grid\":\"block-centre\",\"content\":\"labels\",\"source\":\"raster of %d meshes\",\"T\":%d,\"encoding\":\"0=bg,254=surface,255=ignore\"}}", nm, T);
-    z3w *w = binary ? z3w_create_mask(ldir, shape, shard, attrs) : z3w_create(ldir, shape, shard, 0.f, *value_name ? 0 : 255, attrs);
+    z3w *w = binary ? z3w_create_mask(ldir, shape, shard, attrs) : z3w_create(ldir, shape, shard, 0.f, *value_name || dist ? 0 : 255, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
-    rjob j = {.meshes = meshes, .nm = nm, .scale = scale, .shard = shard, .margin = binary || *value_name ? 2 : T + 3, .T = T, .binary = binary, .band=band, .value = *value_name != 0,
+    rjob j = {.meshes = meshes, .nm = nm, .scale = scale, .shard = shard, .margin = binary || *value_name ? 2 : T + 3, .T = T, .binary = binary, .band=band, .value = *value_name != 0, .dist = dist,
               .ns = {(shape[0] + shard - 1) / shard, (shape[1] + shard - 1) / shard, (shape[2] + shard - 1) / shard},
               .shape = {shape[0], shape[1], shape[2]}, .w = w, .nthreads = nthreads,
               .indexed = opt_atoi("--raster-index", opt(argc, argv, "--raster-index", "1")),

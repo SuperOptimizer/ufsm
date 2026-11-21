@@ -127,6 +127,45 @@ static void volumes(const char *root) {
     for (int i = 0; i < 3; i++) { free(meshes[i]->xyz); free(meshes[i]->valid); free(meshes[i]); }
 }
 
+/* raster --dist 1 (arm K's surface-proximity input): indexed + row transform == the reference, and against the plain label raster of
+   the same meshes: its surface (254, chamfer <= 4) has codes >= 254 (cap - 4) / cap, its ignore band edge (> 3T) codes <= 254 * 2 / cap */
+static void dist_volumes(const char *root) {
+    mesh *meshes[3] = {fixture(0), fixture(1), fixture(2)};
+    for (int ci = 0; ci < 2; ci++) {
+        const double scale = ci ? 0.5 : 1.0; const int T = 6, cap = 3 * T + 3;
+        int64_t shape[3] = {257, 129, 257}; char path[3][1024];
+        for (int mode = 0; mode < 3; mode++) {   /* 0 reference distance, 1 indexed, 2 the label raster */
+            snprintf(path[mode], sizeof path[mode], "%s/dist%d-%d", root, ci, mode);
+            z3w *writer = z3w_create(path[mode], shape, 128, 0.f, mode < 2 ? 0 : 255, "{}");
+            rjob j = {.meshes = meshes, .nm = 3, .scale = scale, .shard = 128, .margin = T + 3, .T = T, .ns = {3, 2, 3}, .shape = {257,129,257}, .w = writer,
+                      .indexed = mode >= 1, .reference_distance = mode == 0, .dist = mode < 2, .nthreads = 1};
+            if (j.indexed && raster_index(&j)) { failures++; return; }
+            for (int si = 0; si < 18; si++) raster_shard(si, 0, &j);
+            if (atomic_load(&j.failed)) failures++;
+            free(j.tiles); free(j.offset); free(j.refs); z3w_close(writer);
+        }
+        const int64_t origin[3] = {0,0,0}; const size_t n = (size_t)shape[0] * shape[1] * shape[2]; uint8_t *v[3]; int ok = 1;
+        for (int mode = 0; mode < 3; mode++) {
+            store *s = store_open(path[mode]); z3 *z = s ? z3_open(s, ".", nullptr) : nullptr; v[mode] = malloc(n);
+            if (!z || z3_read(z, origin, shape, v[mode], 1)) ok = 0;
+            z3_close(z); store_close(s);
+        }
+        size_t on = 0, near = 0, bad = 0;
+        if (ok && memcmp(v[0], v[1], n)) { fprintf(stderr, "dist raster: indexed != reference (scale %g)\n", scale); failures++; }
+        for (size_t k = 0; ok && k < n; k++) {
+            const int c = v[1][k], l = v[2][k];
+            if (c > 254) bad++;
+            if (l == 254) { on++; if (c < (254 * (cap - 4) + cap / 2) / cap) bad++; }
+            else if (l == 255 && c > (254 * 2 + cap / 2) / cap && c) bad++;
+            else if (c) near++;
+        }
+        if (!ok || bad || !on || !near) { fprintf(stderr, "dist raster scale %g: read %d, %zu codes off the label raster (%zu on, %zu near)\n", scale, ok, bad, on, near); failures++; }
+        else printf("dist raster scale=%g: indexed == reference, %zu surface / %zu band voxels agree with the label raster\n", scale, on, near);
+        for (int mode = 0; mode < 3; mode++) free(v[mode]);
+    }
+    for (int i = 0; i < 3; i++) { free(meshes[i]->xyz); free(meshes[i]->valid); free(meshes[i]); }
+}
+
 static void binary_pool(void) {
     uint8_t in[8 * 8 * 8], out[4 * 4 * 4];
     for (int pattern = 0; pattern < 6; pattern++) {
@@ -191,7 +230,7 @@ static void pooled_pyramid(const char *root) {
 int main(void) {
     char root[] = "/tmp/ufsm-raster-test-XXXXXX";
     if (!mkdtemp(root)) return 2;
-    distances(); binary_pool(); volumes(root); pooled_pyramid(root);
+    distances(); binary_pool(); volumes(root); dist_volumes(root); pooled_pyramid(root);
     printf("CPU raster tests: %s (%s)\n", failures ? "FAIL" : "PASS", root);
     return failures != 0;
 }

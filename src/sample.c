@@ -3640,7 +3640,12 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
         uint8_t *aw = tp_get(p3, 1), *as = tp_get(p3, 0);
         if (!aw || !as || (s->aux && s->aux_level == l && aux_window(s, o, P, aw))) { tp_put(aw, p3); tp_put(as, p3); return -1; }
-        sym_u8(aw, as, Pz, P, y);
+        /* the CT's spatial warp too (arm K 11-20: a surface-proximity aux must stay on the CT's sheet; it was symmetry only, fine for the
+           smooth void fraction): trilinear as the ink plane, outside 0; crushed / torn / delaminated / re-bent windows (their CT re-drawn,
+           the aux not): all 0, as a window without an aux volume */
+        if (crushed || torn || delam || curved) memset(as, 0, p3);
+        else if (spatial.active) { sample_warp_ink(aw, as, P, y.perm, y.flip, &spatial); for (size_t k = 0; k < p3; k++) if (as[k] == 255) as[k] = 0; }
+        else sym_u8(aw, as, Pz, P, y);
         for (size_t k = 0; k < p3; k++) {
             const float v = as[k] / 127.5f - 1.f;
             if (X) X[4 * p3 + k] = v; else if (c->xfmt == 1) { _Float16 hv = (_Float16)v; memcpy(&H[4 * p3 + k], &hv, 2); } else H[4 * p3 + k] = bf16_rn(v);
