@@ -185,7 +185,7 @@ typedef struct {
     double *hs_ent, ent_h[32]; float kl_side, kl_rv, kl_norm, kl_w4, kl_ink, kl_fib[2], ang_side; unsigned long long *hsz; long hsz_pass;
     /* --ink-surf: the surface head (device), each buffer's patch (host: built from its rays at mil_take), this window's loss / unmasked fraction /
        patch AUC for the log (isf_got: the window had labelled patch pixels), the MIL's own ray subset per buffer */
-    isf_dev isf; isf_win isfw[2]; int isf_on, isf_got; double isf_l, isf_frac, isf_auc; inkray *isf_mr[2]; size_t isf_mrc[2]; long isf_nwin;
+    isf_dev isf; isf_win isfw[2]; int isf_on, isf_got; double isf_l, isf_frac, isf_auc; inkray *isf_mr[2]; size_t isf_mrc[2]; long isf_nwin; double isf_bms;
 } gpu_state;
 /* hs_ent layout (doubles): the phase / side pair, rv pair, normal 7, ink, fibre H, V, fibre direction 7, the phase pair's angle error (sum, count) */
 enum { HE_SIDE = 0, HE_RV = 2, HE_NORM = 4, HE_INK = 11, HE_FIBH = 12, HE_FIBV = 13, HE_FDIR = 14, HE_ANG = 21, HE_N = 23 };
@@ -1003,8 +1003,10 @@ static void mil_take(gpu_state *d, const batch *b, int i, int copy_stream) {   /
     if (g_isf) {   /* --ink-surf: the patch from every ray; the MIL its own rays (mode 1: the faceless ones), evenly thinned to the cap */
         const int na = src ? b->nmil[0] : 0;
         unsigned aug = 0; if (g_isf_aug) { uint64_t h = (g_seed + 0x9E3779B97F4A7C15ull * (uint64_t)++d->isf_nwin) ^ 0xD1B54A32D192ED03ull; h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32; aug = (unsigned)(h & 15); }
+        const double tb0 = now();
         if (isf_win_build(&d->isfw[i], src, na, g_isf_P, g_isf_step, 2 * g_isf_k + 1, 1.f, g_Pz, d->hs_P, d->hs_P, aug)) { fprintf(stderr, "ink surf: the patch build failed (host memory)\n"); exit(1); }
         if (d->isf_mrc[i] < (size_t)na) { free(d->isf_mr[i]); d->isf_mrc[i] = (size_t)na; d->isf_mr[i] = malloc((size_t)na * sizeof(inkray) + 1); if (!d->isf_mr[i]) { fprintf(stderr, "ink surf: out of host memory\n"); exit(1); } }
+        d->isf_bms = 1e3 * (now() - tb0);
         inkray *mr = d->isf_mr[i]; int m = 0; for (int k = 0; k < na; k++) if (g_mil_mode == 0 || src[k].pad) mr[m++] = src[k];   /* (per buffer: an async copy may still read the other) */
         if (m > g_mil_max) { for (int k = 0; k < g_mil_max; k++) mr[k] = mr[(size_t)k * m / g_mil_max]; m = g_mil_max; }
         src = mr; n = m;
@@ -5525,7 +5527,7 @@ int cmd_train(int argc, char **argv) {
     double acc_siden = 0, acc_normn = 0, acc_w4n = 0;   /* windows that carry side / phase, normal, wind4 labels (their loss > 0): the logged means are over them, as ink / fib */
     double acc_fh[2] = {0}, acc_fhn = 0;   /* --fib-head: mask / direction bce sums, windows with known fibre labels */
     double acc_kl[8] = {0}, acc_kln[8] = {0};   /* head slabs: the KL (bce - the targets' entropy) of phase / side, rv, normal, wind4, ink, fibre, fibre direction; [7] the phase angle error */
-    double *viks = nullptr; double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0, acc_isf = 0, acc_isfn = 0, acc_isfa = 0, acc_isfan = 0, acc_isff = 0, acc_isfw = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
+    double *viks = nullptr; double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0, acc_isf = 0, acc_isfn = 0, acc_isfa = 0, acc_isfan = 0, acc_isff = 0, acc_isfw = 0, acc_isfb = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
     train_unread_flags(argc, argv);
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
         if (step == step0 + 2 && g_tl_on) { tl_mark("first step"); tl_summary(); }   /* (the first batch's wait + the first step: the kernels' JIT) */
@@ -5933,7 +5935,7 @@ int cmd_train(int argc, char **argv) {
         if (step_ok) {
         if (g_unwrap) { acc_ink += G[0].iout[0]; if (G[0].norm_raw > 0) { acc_norm += G[0].norm_raw; acc_normn += 1; } }   /* (labels present: the unweighted loss, also under --norm-lambda 0) */
         if (g_mil && G[0].mil_n) { acc_mil += G[0].mil_raw; acc_miln += 1; acc_milr += G[0].mil_n; }
-        if (G[0].isf_on) { acc_isfw += 1; acc_isff += G[0].isf_frac; if (G[0].isf_l >= 0) { acc_isf += G[0].isf_l; acc_isfn += 1; } if (G[0].isf_auc >= 0) { acc_isfa += G[0].isf_auc; acc_isfan += 1; } G[0].isf_l = G[0].isf_auc = -1; G[0].isf_frac = 0; }
+        if (G[0].isf_on) { acc_isfw += 1; acc_isff += G[0].isf_frac; acc_isfb += G[0].isf_bms; if (G[0].isf_l >= 0) { acc_isf += G[0].isf_l; acc_isfn += 1; } if (G[0].isf_auc >= 0) { acc_isfa += G[0].isf_auc; acc_isfan += 1; } G[0].isf_l = G[0].isf_auc = -1; G[0].isf_frac = 0; }
         if (g_fibh && (G[0].fhout[0][2] > 0 || G[0].fhout[1][2] > 0)) { acc_fh[0] += G[0].fib_raw[0]; acc_fh[1] += G[0].fib_raw[1]; acc_fhn += 1; }
         if (g_fibdir > 0) acc_norm += G[0].norm_raw;
         if (g_fibn && G[0].fib_h[0] > 0) { acc_fib += G[0].fib_h[1] / G[0].fib_h[0]; acc_fibv += G[0].fib_h[0]; acc_fibn += 1; }
@@ -6171,9 +6173,10 @@ int cmd_train(int argc, char **argv) {
             if (g_fibn) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " fibn %.4f (%.0f%% of windows, %.0f vox)", acc_fibn > 0 ? acc_fib / acc_fibn : 0.0, 100.0 * acc_fibn / nok, acc_fibn > 0 ? acc_fibv / acc_fibn : 0.0); }
             if (g_ink2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f (%.0f%% of windows)", acc_inkn > 0 ? acc_ink / acc_inkn : 0.0, 100.0 * acc_inkn / nok); }
             if (g_mil) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink mil %.4f (%.0f%% of windows, %.0f rays)", acc_miln > 0 ? acc_mil / acc_miln : 0.0, 100.0 * acc_miln / nok, acc_miln > 0 ? acc_milr / acc_miln : 0.0); acc_mil = acc_miln = acc_milr = 0; }
-            if (g_isf) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink surf %.4f auc %.3f (%.0f%% of windows, patch %.0f%% unmasked)", acc_isfn > 0 ? acc_isf / acc_isfn : 0.0,
-                                                          acc_isfan > 0 ? acc_isfa / acc_isfan : 0.0, acc_isfw > 0 ? 100.0 * acc_isfn / acc_isfw : 0.0, acc_isfw > 0 ? 100.0 * acc_isff / acc_isfw : 0.0);
-                         acc_isf = acc_isfn = acc_isfa = acc_isfan = acc_isff = acc_isfw = 0; }
+            if (g_isf) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink surf %.4f auc %.3f (%.0f%% of windows, patch %.0f%% unmasked, build %.0f ms)", acc_isfn > 0 ? acc_isf / acc_isfn : 0.0,
+                                                          acc_isfan > 0 ? acc_isfa / acc_isfan : 0.0, acc_isfw > 0 ? 100.0 * acc_isfn / acc_isfw : 0.0, acc_isfw > 0 ? 100.0 * acc_isff / acc_isfw : 0.0,
+                                                          acc_isfw > 0 ? acc_isfb / acc_isfw : 0.0);
+                         acc_isf = acc_isfn = acc_isfa = acc_isfan = acc_isff = acc_isfw = acc_isfb = 0; }
             if (g_fibh) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " fib bce %.4f dir %.4f (%.0f%% of windows)", acc_fhn > 0 ? acc_fh[0] / acc_fhn : 0.0, acc_fhn > 0 ? acc_fh[1] / acc_fhn : 0.0, 100.0 * acc_fhn / nok); }
             {   /* the KLs beside the bces (audit 2026-11-14: a soft-target bce carries its targets' entropy, ~0.39 for a cos / sin pair, ~0.47
                    for n n^T), over the same windows; the phase pair's mean angle error */
