@@ -64,7 +64,9 @@ surfp *surfp_open(const char *wraps, const char *isf, int C0, int Hp, int halo, 
         S->nw++;
     }
     free(cp);
-    if (isf_dev_init(&S->dev, C0, Hp, K, 1)) { fprintf(stderr, "predict --surf: out of GPU memory for the head\n"); surfp_free(S); return nullptr; }
+    int dep = 4; if (isf_peek(isf, nullptr, &dep, nullptr)) dep = 4;   /* (the head's depth from its file: S3 heads are depth 5) */
+    if (Hp % (1 << dep)) { fprintf(stderr, "predict --surf: --surf-P %d must be a multiple of 2^%d (the head's depth)\n", Hp, dep); surfp_free(S); return nullptr; }
+    if (isf_dev_init_d(&S->dev, C0, Hp, K, dep, 1)) { fprintf(stderr, "predict --surf: out of GPU memory for the head\n"); surfp_free(S); return nullptr; }
     int st = 0; if (isf_load(&S->dev, isf, &st)) { fprintf(stderr, "predict --surf: cannot load the surface head %s (its trunk channels x layers must be %d x %d)\n", isf, C0, K); surfp_free(S); return nullptr; }
     if (isf_win_alloc(&S->win, Hp, K, 1.f)) { surfp_free(S); return nullptr; }
     float *h = calloc((size_t)C0 * (C0 + 1), 4); for (int c = 0; c < C0; c++) h[(size_t)c * C0 + c] = 1.f;

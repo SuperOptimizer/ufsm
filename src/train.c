@@ -351,7 +351,7 @@ static size_t g_mil_reserve;   /* mgpu: config (set by the planner before the GP
    U-Net, BCE on the rays' labels x L; its AdamW at --isf-lr x the schedule; RUN/<ckpt>.isf beside every checkpoint. --isf-aug 1: each window's patch in
    one of the 8 orientations and the normal reversed half the time (unrolled wraps have any orientation / sign: predict --surf) */
 static uint64_t g_seed;   /* --seed (mgpu: config) */
-static int g_isf, g_isf_P = 256, g_isf_step = 4, g_isf_k = 4, g_isf_aug = 1; static float g_isf_lambda, g_isf_lr = 1e-3f, g_isf_wd = 0.f;
+static int g_isf, g_isf_P = 256, g_isf_step = 4, g_isf_k = 4, g_isf_aug = 1, g_isf_depth = 4; static const char *g_isf_init; static float g_isf_lambda, g_isf_lr = 1e-3f, g_isf_wd = 0.f;
 static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static float g_mil_r_um = 0.f, g_mil_R = 10.f, g_mil_step = 1.f, g_mil_tau = 0.f, g_mil_lambda = 1.f;   /* --ink-mil L
    (--ink-head): the normal-pooled MIL ink loss on each window's rays (inkmil.h): per supervised label pixel (mode 1: only those without an open face, the
    voxel target's unknowns), BCE of the pooled ink logit along the normal over +-R window voxels at step (tau 0: max; > 0: tau log mean exp), the mean
@@ -3080,10 +3080,11 @@ int cmd_train(int argc, char **argv) {
             g_mil_R = (float)atof(opt(argc,argv,"--ink-mil-r","10")); g_mil_r_um = (float)atof(opt(argc,argv,"--ink-mil-r-um","0"));   /* (0: R in window voxels as before; > 0: the reach in um, the K samples spanning it at every rung) */ g_mil_step = (float)atof(opt(argc,argv,"--ink-mil-step","1")); g_mil_tau = (float)atof(opt(argc,argv,"--ink-mil-tau","0"));
             g_isf_lambda = (float)atof(opt(argc,argv,"--ink-surf","0")); g_isf = g_isf_lambda > 0; g_isf_P = atoi(opt(argc,argv,"--isf-P","256")); g_isf_step = atoi(opt(argc,argv,"--isf-step","4"));
             g_isf_k = atoi(opt(argc,argv,"--isf-k","4")); g_isf_lr = (float)atof(opt(argc,argv,"--isf-lr","1e-3")); g_isf_wd = (float)atof(opt(argc,argv,"--isf-wd","0")); g_isf_aug = atoi(opt(argc,argv,"--isf-aug","1"));
+            g_isf_depth = atoi(opt(argc,argv,"--isf-depth","4")); g_isf_init = opt(argc,argv,"--isf-init",nullptr);   /* (S3: --isf-depth 5, the head's pools; --isf-init H.isf: the head from H when not resuming, another depth by matching convs) */
             g_mil_mode = atoi(opt(argc,argv,"--ink-mil-mode","1")); g_mil_stride = atoi(opt(argc,argv,"--ink-mil-stride","2")); g_mil_max = atoi(opt(argc,argv,"--ink-mil-max","65536")); if (ink_mil_set_max) ink_mil_set_max(g_mil_max);
             if (!(g_mil_lambda >= 0) || (g_mil && (!ink_mil_fwd_slab || !(g_mil_R > 0) || !(g_mil_step > 0) || !(g_mil_tau >= 0) || ink_mil_samples(g_mil_R, g_mil_step) > 256 || g_mil_mode < 0 || g_mil_mode > 1 || g_mil_stride < 1 || g_mil_max < 1))) {
                 fprintf(stderr, "--ink-mil L >= 0 (needs nn_inkmil in the binary), --ink-mil-r R > 0, --ink-mil-step > 0 (2R / step + 1 <= 256 samples), --ink-mil-tau >= 0, --ink-mil-mode 0|1, --ink-mil-stride >= 1, --ink-mil-max >= 1\n"); return 2; }   /* --ink-head 1: the ink logit as output channel 11 (the universal model) */
-            if (g_isf && (!g_mil || g_isf_P < 16 || g_isf_P % 16 || g_isf_step < 1 || g_isf_step % g_mil_stride || g_isf_k < 0 || g_isf_k > 16 || !(g_isf_lr >= 0))) {
+            if (g_isf && (!g_mil || g_isf_depth < 1 || g_isf_depth > 6 || g_isf_P % (1 << g_isf_depth) || g_isf_P < 16 || g_isf_P % 16 || g_isf_step < 1 || g_isf_step % g_mil_stride || g_isf_k < 0 || g_isf_k > 16 || !(g_isf_lr >= 0))) {
                 fprintf(stderr, "--ink-surf L needs --ink-mil (its rays are the patch), --isf-P a multiple of 16, --isf-step a multiple of --ink-mil-stride, --isf-k 0..16, --isf-lr >= 0\n"); return 2; }
             g_fibh_lambda = (float)atof(opt(argc,argv,"--fib-head","0")); g_fibh = g_fibh_lambda > 0; g_fd_r = atoi(opt(argc,argv,"--fib-dir-r","4"));   /* --fib-head L: the H / V fibre masks + direction (9 channels) */
             if (!(g_fibh_lambda >= 0) || g_fd_r < 2 || g_fd_r > 8 || (g_fibh && !strcmp(opt(argc,argv,"--split","0"),"z") && !strstr(opt(argc,argv,"--lat","0"),"4"))) { fprintf(stderr, "--fib-head L >= 0 (--split only with --lat 4), --fib-dir-r 2..8\n"); return 2; }
@@ -4988,12 +4989,15 @@ int cmd_train(int argc, char **argv) {
             if (g_isf) {   /* --ink-surf: the surface head (its parameters from RESUME.isf when resuming, else fresh) */
                 if (!g_head_slab || g_lsplit || ng > 1 || g_lat) { fprintf(stderr, "--ink-surf: one GPU, head slabs (unwrap2 --single), no --split / --lat\n"); exit(2); }
                 const int C0 = unet_cfg_of(d->u)->widths[0];
-                if (isf_dev_init(&d->isf, C0, g_isf_P, 2 * g_isf_k + 1, g_seed + 17)) { fprintf(stderr, "ink surf: out of GPU memory for the head\n"); exit(1); }
+                if (isf_dev_init_d(&d->isf, C0, g_isf_P, 2 * g_isf_k + 1, g_isf_depth, g_seed + 17)) { fprintf(stderr, "ink surf: out of GPU memory for the head\n"); exit(1); }
                 d->isf_on = 1; int st = 0; char ip[4200];
                 if (resume) { snprintf(ip, sizeof ip, "%s.isf", resume);
+                    int fdp = 0; if (!access(ip, F_OK) && (isf_peek(ip, nullptr, &fdp, nullptr) || fdp != g_isf_depth)) { fprintf(stderr, "ink surf: %s is a depth-%d head, --isf-depth %d\n", ip, fdp, g_isf_depth); exit(2); }
                     if (!access(ip, F_OK)) { if (isf_load(&d->isf, ip, &st)) { fprintf(stderr, "ink surf: cannot load %s\n", ip); exit(1); } fprintf(stderr, "ink surf: head from %s (step %d)\n", ip, st); }
                     else fprintf(stderr, "DEFAULTED: ink surf: %s has no surface head (%s): a fresh head\n", resume, ip); }
-                fprintf(stderr, "ink surf: patch %d px every %d label px (%d layers, %d trunk channels), head %.1f MB + %.1f MB patch, lambda %g, lr %g\n", g_isf_P, g_isf_step, 2 * g_isf_k + 1, C0,
+                else if (g_isf_init) { int nm = 0, fdp = 0; if (isf_peek(g_isf_init, nullptr, &fdp, nullptr) || isf_load_x(&d->isf, g_isf_init, &st, &nm)) { fprintf(stderr, "ink surf: cannot load --isf-init %s (its trunk channels x layers must be %d x %d)\n", g_isf_init, C0, 2 * g_isf_k + 1); exit(1); }
+                    fprintf(stderr, "ink surf: head from --isf-init %s (depth %d -> %d: %d of %d convs taken%s)\n", g_isf_init, fdp, g_isf_depth, nm, isfhead_nconv(d->isf.h), nm < isfhead_nconv(d->isf.h) ? ", the rest fresh" : ""); }
+                fprintf(stderr, "ink surf: patch %d px every %d label px (%d layers, %d trunk channels), head depth %d, %.1f MB + %.1f MB patch, lambda %g, lr %g\n", g_isf_P, g_isf_step, 2 * g_isf_k + 1, C0, g_isf_depth,
                         isfhead_bytes(d->isf.h) / 1e6, (double)C0 * (2 * g_isf_k + 1) * g_isf_P * g_isf_P * 4 / 1e6, g_isf_lambda, g_isf_lr);
             }
             d->nscratch = nn_malloc(nn_loss_scratch((shape5){1, 7, g_Pz, P, P}) + 64);
