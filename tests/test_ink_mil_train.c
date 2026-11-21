@@ -245,6 +245,16 @@ int main(int argc, char **argv) {
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/sb0 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 0 %s > %s/sb0.log 2>&1", U, d, d, common, d), "sb0");
         CHECK(!sh("for x in sb0 sb1; do grep -E '^(t\\+[0-9.]+s )?step ' %s/$x.log | sed -E 's/^t\\+[0-9.]+s //; s/ ink surf [^(]*\\([^)]*\\)//; s/ [0-9.]+ samp\\/s.*//; s/ (wait|gn) [0-9.%%]+//g' > %s/$x.txt; done; cmp -s %s/sb0.txt %s/sb1.txt", d, d, d, d),
               "the step losses differ with --ink-surf at lr 0 (%s/sb0.txt, sb1.txt)", d);
+        /* predict --surf (2026-11-21): the trunk features in 32-plane z-slabs (training's unet_head_feat_z) give the map of the whole-window
+           feature copy (UFSM_SURF_WHOLE=1, the old path, 10.3 GB at window 544) byte for byte, every patch run (an unplaced patch prints DEFAULTED, which sp0 must not) */
+        const char *pa = "--um 9.6 --level 0 --box 0,0,0,256,256,256 --shard 128 --levels 2 --threads 2 --q 0 --no-out 1 --surf-P 32 --surf-halo 4 --surf-k 2 --window 128";
+        CHECK(!sh("mkdir -p %s/sp0 %s/sp1 && %s predict %s/sf/last.ckpt %s/fx ct %s/pv0 --axis %s/fx/axis.json --surf %s/fx/seg.tifxyz --surf-out %s/sp0 %s > %s/sp0.log 2>&1",
+                  d, d, U, d, d, d, d, d, d, pa, d), "predict --surf (%s/sp0.log)", d);
+        CHECK(!sh("UFSM_SURF_WHOLE=1 %s predict %s/sf/last.ckpt %s/fx ct %s/pv1 --axis %s/fx/axis.json --surf %s/fx/seg.tifxyz --surf-out %s/sp1 %s > %s/sp1.log 2>&1",
+                  U, d, d, d, d, d, d, pa, d), "predict --surf, whole window (%s/sp1.log)", d);
+        CHECK(!sh("grep -q 'DEFAULTED: predict --surf: UFSM_SURF_WHOLE' %s/sp1.log && ! grep -q DEFAULTED %s/sp0.log", d, d), "DEFAULTED lines (%s/sp0.log, sp1.log)", d);
+        CHECK(!sh("grep -q 'patches run' %s/sp0.log && cmp %s/sp0/seg.tifxyz.tif %s/sp1/seg.tifxyz.tif", d, d, d),
+              "slab vs whole-window maps differ or patches unrun (%s/sp0, sp1)", d);
     }
     if (getenv("TIMT_KEEP")) fprintf(stderr, "kept %s (sources %s/fx/sources-mil.json)\n", d, d);
     else if (!fails) sh("rm -rf %s", d);

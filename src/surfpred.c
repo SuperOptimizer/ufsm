@@ -131,6 +131,7 @@ int surfp_window(surfp *S, unet *u, long t, const int64_t o[3], int D, int H, in
     const size_t V = (size_t)D * H * W, hw = (size_t)H * W;
     /* (2026-11-21: the trunk features in z-slabs of SURF_ZS planes, the training path's unet_head_feat_z + isf_dev_take: 32 ch x 544^3 fp16
        whole was 10.3 GB, a 32-plane slab 0.6 GB. The whole-window copy only as a DEFAULTED fallback when the slab path is not covered.) */
+    if (!S->whole && getenv("UFSM_SURF_WHOLE") && atoi(getenv("UFSM_SURF_WHOLE"))) { S->whole = 1; fprintf(stderr, "DEFAULTED: predict --surf: UFSM_SURF_WHOLE=1: the whole window's features at once (%.2f GB)\n", S->C0 * V * 2e-9); }   /* (the slab path's reference, tests) */
     int whole = S->whole;
     if (whole && S->featc < (size_t)S->C0 * V * 2) { nn_free(S->feat); S->featc = (size_t)S->C0 * V * 2; S->feat = nn_malloc(S->featc); if (!S->feat) { S->featc = 0; fprintf(stderr, "predict --surf: out of GPU memory for the window's features\n"); return -1; } }
     if (whole && unet_head_ext_fwd(u, S->idw, S->idw + (size_t)S->C0 * S->C0, S->C0, S->feat)) { fprintf(stderr, "predict --surf: the trunk's features are not covered (unet_head_ext_fwd)\n"); return -1; }
