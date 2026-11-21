@@ -212,5 +212,6 @@ int surfp_write(surfp *S, const char *dir) {
         if (tiffw_write(p, ow, oh, 1, out, 1)) { fprintf(stderr, "predict --surf: cannot write %s\n", p); rc = -1; }
         if (out != w->map) free(out); }
     fprintf(stderr, "predict --surf: %ld of %ld patches run, %d maps in %s\n", S->nrun, S->np, S->nw, dir);
+    if (S->nrun < S->nfit) fprintf(stderr, "DEFAULTED: predict --surf: %ld planned patches did not run (their windows skipped: absent CT, or no touched voxel): their pixels stay 0\n", S->nfit - S->nrun);
     return rc;
 }
