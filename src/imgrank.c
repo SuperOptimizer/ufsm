@@ -41,7 +41,11 @@ int cmd_img_rankavg(int argc, char **argv) {
                 const uint8_t *m = im[k]; const size_t w = iw[k];
                 const int nx = (int)lround(fx), ny = (int)lround(fy);
                 if (!m[(size_t)ny * w + nx]) val = 0;   /* (validity by the nearest px: no blending of data into a no-data border) */
-                else { const double b = (1 - ay) * ((1 - ax) * m[y0 * w + x0] + ax * m[y0 * w + x1]) + ay * ((1 - ax) * m[y1 * w + x0] + ax * m[y1 * w + x1]); val = (uint8_t)fmax(1, fmin(255, lround(b))); } }
+                else {   /* bilinear over the neighbours with data only (renormalised): a 0 neighbour would pull border px down and shift every rank */
+                    const uint8_t q[4] = {m[y0 * w + x0], m[y0 * w + x1], m[y1 * w + x0], m[y1 * w + x1]};
+                    const double g[4] = {(1 - ay) * (1 - ax), (1 - ay) * ax, ay * (1 - ax), ay * ax};
+                    double s = 0, sw = 0; for (int j = 0; j < 4; j++) if (q[j]) { s += g[j] * q[j]; sw += g[j]; }
+                    val = sw > 0 ? (uint8_t)fmax(1, fmin(255, lround(s / sw))) : m[(size_t)ny * w + nx]; } }
             v[i * ni + k] = val; if (!val) ok[i] = 0;
         }
     }
