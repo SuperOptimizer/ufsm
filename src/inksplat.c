@@ -2179,7 +2179,7 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
         if (bad) { free(X); free(sum); free(pk); free(mband); free(ord); free(ah); free(pick); free(fs); return -1; }
     }
     free(X); free(ord); free(pick);
-    static const char *gn[4] = {"no ink, face", "no ink, faceless", "ink, face", "ink, faceless"};
+    static const char *gn[4] = {"no ink, face", "no ink, faceless", "ink, face", "ink, faceless"};   /* mgpu: debug (ink-rayface report labels, read-only) */
     printf("ink profile: %d pixels of %zu tiles (ink face %llu, ink faceless %llu, no-ink face %llu, no-ink faceless %llu; faceless a/b/c/d %llu/%llu/%llu/%llu), t in level-0 voxels "
            "(%.3g um) along the face normal, face band [t_f %+d, t_f %+d], MIL |t| <= %.1f\n", got, nt, (unsigned long long)ng[2], (unsigned long long)ng[3], (unsigned long long)ng[0],
            (unsigned long long)ng[1], (unsigned long long)cls[0], (unsigned long long)cls[1], (unsigned long long)cls[2], (unsigned long long)cls[3], c->ct_um, fa, fb, mil);
@@ -2194,7 +2194,7 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
             printf(" | mass in the face band %.1f%%, in the MIL band %.1f%%\n", mband[ch][2] ? 100 * mband[ch][0] / mband[ch][2] : 0., mband[ch][2] ? 100 * mband[ch][1] / mband[ch][2] : 0.); }
     }
     /* AUC(t): stdout t -16 .. 16 per volume and reference, the best t; the whole table (t -40 .. 40) to auc */
-    static const char *rn[3] = {"mesh", "face", "mesh-faceless"};
+    static const char *rn[3] = {"mesh", "face", "mesh-faceless"};   /* mgpu: debug (ink-rayface report labels, read-only) */
     if (auc) fprintf(auc, "volume\tref\tt\tn_ink\tn_no\tauc\n");
     for (int ch = 0; ch < nch; ch++) for (int r = 0; r < 3; r++) {
         const char *nm = cname[ch]; double best = -1; int bt = 0; char line[2048]; int ln = 0;
