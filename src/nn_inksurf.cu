@@ -115,6 +115,8 @@ extern "C" void nn_isf2_conv_bw(const float *x, int Ci, int H, int W, const floa
     if (gb) isf2_bias_bw_k<<<(unsigned)Co, 256>>>(gy, (size_t)H * W, gb);
     KCHECK();
 }
+__global__ void isf2_add_k(float *y, const float *x, size_t n) { const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) y[i] += x[i]; }
+extern "C" void nn_isf2_add(float *y, const float *x, size_t n) { isf2_add_k<<<nblk(n, 256), 256>>>(y, x, n); KCHECK(); }
 __global__ void isf2_silu_k(const float *x, size_t n, float *y) { const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i < n) { const float v = x[i]; y[i] = v / (1.f + expf(-v)); } }
 __global__ void isf2_silu_bwd_k(const float *x, const float *gy, size_t n, float *gx) {
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= n) return;

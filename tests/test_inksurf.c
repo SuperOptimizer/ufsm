@@ -4,7 +4,9 @@
    (3) the 2-D ops against host references (convs 1x1 / 3x3, their data / weight gradients by the adjoint identity, pool, up);
    (4) the head's gradients (parameters and input) against central differences;
    (5) the toy: a curved synthetic sheet whose ink is texture only (extra zero-mean noise in the papyrus under the face, no mean change),
-       a small U-Net trunk from scratch + resample + head trained on 2-D labels alone; held-out AUC must pass 0.9.
+       a small U-Net trunk from scratch + resample + head trained on 2-D labels alone; held-out AUC must pass 0.9. The control: the 3-D
+       voxel ink head (the same trunk, splatted labels) on the same volumes; TIS_* (ink / papyrus amplitude, strokes, curvature, stacked
+       sheets, mesh error, K, TP, seed; TIS_TOY_ONLY) set the difficulty: DESIGN 2026-11-20 "inksurf" has the sweep.
    UFSM_TEST_QUICK=1: (5) with fewer steps. */
 #include "inksurf.h"
 #include "nn.h"
@@ -159,33 +161,44 @@ static void test_head_fd(void) {
 }
 
 /* ---- (5) the toy ---- */
-enum { TP = 64 };
-typedef struct { float A, f1, f2, ph1, ph2, th, sp, so; } sheet_t;
+static int TP = 64;   /* (window and patch side; TIS_TP, a multiple of 16) */
+typedef struct { float A, f1, f2, ph1, ph2, th, sp, so, f3, f4, ph3, ph4; } sheet_t;
+/* difficulty: the ink's texture amplitude against the papyrus's own (zero-mean uniform noise each), the stroke period range (px) */
+static float g_ink = 0.6f, g_bg = 0.15f, g_sp0 = 16, g_sp1 = 32, g_a0 = 3, g_a1 = 6, g_wl0 = 50, g_wl1 = 90, g_gap = 0, g_moff = 0;   /* sheet amplitude / wavelength
+   ranges; g_gap > 0: further sheets every g_gap voxels along z (their own ink, unlabelled); g_moff: the mesh's error, a smooth offset
+   of +-g_moff voxels along z from the true sheet (the labels' splat and the band read follow the mesh, as in the real data) */
+static float envf(const char *k, float d) { const char *e = getenv(k); return e && *e ? (float)atof(e) : d; }
 static float sh_z(const sheet_t *s, double y, double x) { return (float)(TP / 2.0 + s->A * sin(s->f1 * x + s->ph1) * cos(s->f2 * y + s->ph2)); }
+static float mesh_z(const sheet_t *s, double y, double x) { return sh_z(s, y, x) + (float)(g_moff * sin(s->f3 * x + s->ph3) * cos(s->f4 * y + s->ph4)); }
 static int sh_ink(const sheet_t *s, double y, double x) { return sin((x * cos(s->th) + y * sin(s->th)) * s->sp + s->so) > 0.2; }
 static void toy_volume(sheet_t *s, float *ct, float *pn, float *lab) {
-    s->A = (float)(3 + 3 * urand()); s->f1 = (float)(6.2832 / (50 + 40 * urand())); s->f2 = (float)(6.2832 / (50 + 40 * urand())); s->ph1 = (float)(6.28 * urand()); s->ph2 = (float)(6.28 * urand());
-    s->th = (float)(3.1416 * urand()); s->sp = (float)(6.2832 / (16 + 16 * urand())); s->so = (float)(6.28 * urand());
+    s->A = (float)(g_a0 + (g_a1 - g_a0) * urand()); s->f1 = (float)(6.2832 / (g_wl0 + (g_wl1 - g_wl0) * urand())); s->f2 = (float)(6.2832 / (g_wl0 + (g_wl1 - g_wl0) * urand())); s->ph1 = (float)(6.28 * urand()); s->ph2 = (float)(6.28 * urand());
+    s->th = (float)(3.1416 * urand()); s->sp = (float)(6.2832 / (g_sp0 + (g_sp1 - g_sp0) * urand())); s->so = (float)(6.28 * urand());
+    s->f3 = (float)(6.2832 / (30 + 30 * urand())); s->f4 = (float)(6.2832 / (30 + 30 * urand())); s->ph3 = (float)(6.28 * urand()); s->ph4 = (float)(6.28 * urand());
     for (int z = 0; z < TP; z++) for (int y = 0; y < TP; y++) for (int x = 0; x < TP; x++) {
-        const float d = z - sh_z(s, y, x); float v = 0.05f * frand();
-        if (fabsf(d) <= 3) { v += 1.f + 0.15f * frand(); if (d >= 0 && sh_ink(s, y, x)) v += 0.6f * frand(); }   /* ink: zero-mean texture in the papyrus's +z half */
+        float d = z - sh_z(s, y, x), v = 0.05f * frand(); int k = 0;
+        if (g_gap > 0) { k = (int)floorf(d / g_gap + 0.5f); d -= k * g_gap; }   /* (sheet k: its own stroke phase) */
+        sheet_t sk = *s; sk.so += 2.1f * k; sk.th += 0.7f * k;
+        if (fabsf(d) <= 3) { v += 1.f + g_bg * frand(); if (d >= 0 && sh_ink(&sk, y, x)) v += g_ink * frand(); }   /* ink: zero-mean texture in the papyrus's +z half */
         ct[((size_t)z * TP + y) * TP + x] = v;
     }
     for (int y = 0; y < TP; y++) for (int x = 0; x < TP; x++) {
-        const float z0 = sh_z(s, y, x), dzy = (sh_z(s, y + 0.5, x) - sh_z(s, y - 0.5, x)), dzx = (sh_z(s, y, x + 0.5) - sh_z(s, y, x - 0.5));
+        const float z0 = mesh_z(s, y, x), dzy = (mesh_z(s, y + 0.5, x) - mesh_z(s, y - 0.5, x)), dzx = (mesh_z(s, y, x + 0.5) - mesh_z(s, y, x - 0.5));
         const float l = sqrtf(1 + dzy * dzy + dzx * dzx); float *q = pn + 6 * ((size_t)y * TP + x);
         q[0] = z0; q[1] = (float)y; q[2] = (float)x; q[3] = 1 / l; q[4] = -dzy / l; q[5] = -dzx / l;
         lab[(size_t)y * TP + x] = (float)sh_ink(s, y, x);
     }
 }
-static double auc(const float *z, const float *y, int n) {
+static const float *g_az;
+static int az_cmp(const void *a, const void *b) { const float u = g_az[*(const int *)a], v = g_az[*(const int *)b]; return (u > v) - (u < v); }
+static double auc(const float *z, const float *y, int n) {   /* (ties not split: the logits are continuous) */
     double pos = 0, neg = 0, a = 0; int *o = malloc(n * sizeof *o); for (int i = 0; i < n; i++) o[i] = i;
-    for (int i = 1; i < n; i++) { int k = o[i], j = i - 1; while (j >= 0 && z[o[j]] > z[k]) { o[j + 1] = o[j]; j--; } o[j + 1] = k; }   /* (n <= 4096: insertion sort) */
+    g_az = z; qsort(o, n, sizeof *o, az_cmp);
     for (int r = 0; r < n; r++) { if (y[o[r]] > 0.5f) { a += neg; pos++; } else neg++; }
     free(o); return pos && neg ? a / (pos * neg) : 0.5;
 }
 static void test_toy(void) {
-    const int quick = getenv("UFSM_TEST_QUICK") && atoi(getenv("UFSM_TEST_QUICK")), steps = quick ? 150 : 400, K = 5, n = TP * TP; const float step = 1.f;
+    const int quick = getenv("UFSM_TEST_QUICK") && atoi(getenv("UFSM_TEST_QUICK")), steps = quick ? 150 : 400, K = (int)envf("TIS_K", 5), n = TP * TP; const float step = 1.f;
     /* the trunk at the production training precision (wtrunk's: MX-fp4 activations, MX-fp8 activation gradients, fp4 weight gradients, SR) */
     nn_set_tf32(1); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1); nn_set_gn_stored(1);
     nn_set_prec(3); CHECK(!nn_set_prec_policy("all=fp4:fp4:fp4"), "prec policy"); setenv("UFSM_F4_WGRAD", "1", 1);
@@ -196,11 +209,16 @@ static void test_toy(void) {
     float *hid = calloc((size_t)C0 * (C0 + 1), 4); for (int c = 0; c < C0; c++) hid[(size_t)c * C0 + c] = 1.f;
     float *did = dup_h2d(hid, (size_t)C0 * (C0 + 1)); void *feat = nn_malloc(V * C0 * 2), *gf = nn_malloc(V * C0 * 2), *glz = nn_malloc(V * 2); nn_zero(glz, V * 2);
     const int ft = nn_get_f16() ? ISF_F16 : ISF_BF16;
-    isfhead *h = isfhead_create(C0 * K, TP, TP, 11);
+    const int ctin = (int)envf("TIS_CTIN", 0), cin = C0 * K + (ctin ? K : 0);   /* TIS_CTIN=1: the CT's own K layers as extra patch channels */
+    isfhead *h = isfhead_create(cin, TP, TP, 11);
     float *ct = malloc(V * 4), *pn = malloc((size_t)n * 6 * 4), *lab = malloc(n * 4), *w1 = malloc(n * 4), *z = malloc(n * 4);
     for (int i = 0; i < n; i++) w1[i] = 1.f;
-    float *dct = nn_malloc(V * 4), *dpn = nn_malloc((size_t)n * 6 * 4), *dlab = nn_malloc(n * 4), *dw = dup_h2d(w1, n), *dpatch = nn_malloc((size_t)C0 * K * n * 4), *dgl = nn_malloc(n * 4);
+    float *dct = nn_malloc(V * 4), *dpn = nn_malloc((size_t)n * 6 * 4), *dlab = nn_malloc(n * 4), *dw = dup_h2d(w1, n), *dpatch = nn_malloc((size_t)cin * n * 4), *dgl = nn_malloc(n * 4);
     const shape5 xs = {1, 1, TP, TP, TP}; sheet_t sh; double t0 = 0; int bad = 0;
+    /* the control (the design's): the existing 3-D voxel ink head, the same trunk from the same init, the same volumes and steps, per-voxel
+       BCE on the 2-D label splatted into the inked half (0 <= d <= 3 along z from the mesh), read back as its mean logit over that band */
+    unet *uv = unet_create(&cfg); unet_init(uv, 5); unet_set_fp16_logits(uv, 1);
+    uint16_t *lv16 = malloc(V * 2); float *gv = malloc(V * 4), *lvf = malloc(V * 4), *dgv = nn_malloc(V * 4); void *gv16 = nn_malloc(V * 2);
     for (int it = 1; it <= steps && !bad; it++) {
         toy_volume(&sh, ct, pn, lab); nn_h2d(dct, ct, V * 4); nn_h2d(dpn, pn, (size_t)n * 6 * 4); nn_h2d(dlab, lab, n * 4);
         isf_lists L; if (isf_lists_build(pn, n, K, step, TP, TP, TP, &L)) { bad = 1; break; }
@@ -209,7 +227,7 @@ static void test_toy(void) {
         unet_zero_grad(u);
         if (!unet_forward(u, dct, xs, 1) || unet_head_ext_fwd(u, did, did + (size_t)C0 * C0, C0, feat)) { fprintf(stderr, "toy: the trunk's features are not covered\n"); bad = 1; }
         if (!bad) {
-            nn_isf_resample(feat, ft, C0, TP, TP, TP, dpn, n, K, step, dpatch);
+            nn_isf_resample(feat, ft, C0, TP, TP, TP, dpn, n, K, step, dpatch); if (ctin) nn_isf_resample(dct, ISF_F32, 1, TP, TP, TP, dpn, n, K, step, dpatch + (size_t)C0 * K * n);
             const float *zl = isfhead_forward(h, dpatch);
             nn_isf2_bce_grad(zl, dlab, dw, n, 1.f / n, dgl);
             if (it % 50 == 0) { nn_d2h(z, zl, n * 4); double l = 0; for (int i = 0; i < n; i++) { const double p = 1 / (1 + exp(-z[i])); l -= lab[i] > 0.5f ? log(p + 1e-9) : log(1 - p + 1e-9); }
@@ -220,29 +238,44 @@ static void test_toy(void) {
             if (it == 1) t0 = unet_grad_norm(u);
             unet_muon(u, 0.01f, 0.95f, 1e-3f, 0.9f, 0.999f, 1e-8f, 0.f, it);
             isfhead_adamw(h, 1e-3f, 0.f, it);
+            unet_zero_grad(uv); const void *lgv = unet_forward(uv, dct, xs, 1); nn_sync(); nn_d2h(lv16, lgv, V * 2);
+            size_t nw = 0; for (size_t q = 0; q < V; q++) { const int x = (int)(q % TP), y = (int)(q / TP % TP), zz = (int)(q / TP / TP); const float d = zz - mesh_z(&sh, y, x); nw += d >= 0 && d <= 3; }
+            for (size_t q = 0; q < V; q++) { const int x = (int)(q % TP), y = (int)(q / TP % TP), zz = (int)(q / TP / TP); const float d = zz - mesh_z(&sh, y, x);
+                gv[q] = d >= 0 && d <= 3 ? (float)((1 / (1 + exp(-h2f(lv16[q]))) - sh_ink(&sh, y, x)) / (double)nw) : 0.f; }
+            nn_h2d(dgv, gv, V * 4); nn_f32_to_h16(dgv, V, gv16, unet_bwd_gscale()); unet_backward_x(uv, gv16, 1);
+            unet_muon(uv, 0.01f, 0.95f, 1e-3f, 0.9f, 0.999f, 1e-8f, 0.f, it);
             const char *e = nn_check(); if (e) { fprintf(stderr, "toy: CUDA %s\n", e); bad = 1; }
         }
         nn_free(dv); nn_free(doff); nn_free(dent); nn_free(dew); isf_lists_free(&L);
     }
     CHECK(!bad, "toy run"); CHECK(t0 > 0 && isfinite(t0), "toy: the trunk got no gradient from the head (%.3g)", t0);
-    double sa = 0, sm = 0; const int ne = 6;
+    double sa = 0, sm = 0, sv = 0; const int ne = 6;
     for (int e = 0; e < ne && !bad; e++) {   /* held-out volumes */
         toy_volume(&sh, ct, pn, lab); nn_h2d(dct, ct, V * 4); nn_h2d(dpn, pn, (size_t)n * 6 * 4);
         unet_forward(u, dct, xs, 1); unet_head_ext_fwd(u, did, did + (size_t)C0 * C0, C0, feat);
-        nn_isf_resample(feat, ft, C0, TP, TP, TP, dpn, n, K, step, dpatch); nn_d2h(z, isfhead_forward(h, dpatch), n * 4); sa += auc(z, lab, n);
+        nn_isf_resample(feat, ft, C0, TP, TP, TP, dpn, n, K, step, dpatch); if (ctin) nn_isf_resample(dct, ISF_F32, 1, TP, TP, TP, dpn, n, K, step, dpatch + (size_t)C0 * K * n);
+        nn_d2h(z, isfhead_forward(h, dpatch), n * 4); sa += auc(z, lab, n);
         for (int p = 0; p < n; p++) { double m = 0; for (int j = 0; j <= 3; j++) { float zz, yy, xx; isf_pos(pn + 6 * p, (float)j, &zz, &yy, &xx); m += tri_ref(ct, TP, TP, TP, zz, yy, xx); } z[p] = (float)m; }
         sm += auc(z, lab, n);   /* (the control: the CT's mean over the inked half, a texture-blind reader) */
+        nn_d2h(lv16, unet_forward(uv, dct, xs, 1), V * 2); for (size_t q = 0; q < V; q++) lvf[q] = h2f(lv16[q]);
+        for (int p = 0; p < n; p++) { double m = 0; for (int j = 0; j <= 3; j++) { float zz, yy, xx; isf_pos(pn + 6 * p, (float)j, &zz, &yy, &xx); m += tri_ref(lvf, TP, TP, TP, zz, yy, xx); } z[p] = (float)m; }
+        sv += auc(z, lab, n);
     }
-    sm /= ne;
+    sm /= ne; sv /= ne;
+    fprintf(stderr, "toy (TP %d, ink %.2f, papyrus %.2f, strokes %.0f-%.0f px, sheet A %.0f-%.0f wl %.0f-%.0f gap %.0f, mesh error %.1f, K %d): surface head %.3f, 3-D voxel head %.3f, CT band mean %.3f\n", TP, g_ink, g_bg, g_sp0, g_sp1, g_a0, g_a1, g_wl0, g_wl1, g_gap, g_moff, K, sa / ne, sv, sm);
     sa /= ne; fprintf(stderr, "toy: held-out AUC %.3f after %d steps, the CT band mean (control) %.3f (trunk gradient norm at step 1 %.3g; head %.1f MB on the device)\n", sa, steps, sm, t0, isfhead_bytes(h) / 1e6);
     CHECK(sa > 0.9, "toy: held-out AUC %.3f <= 0.9", sa); CHECK(fabs(sm - 0.5) < 0.1, "toy: the CT band mean reads the ink (%.3f): not texture-only", sm);
     free(hid); free(ct); free(pn); free(lab); free(w1); free(z); nn_free(did); nn_free(feat); nn_free(gf); nn_free(glz);
-    nn_free(dct); nn_free(dpn); nn_free(dlab); nn_free(dw); nn_free(dpatch); nn_free(dgl); isfhead_free(h); unet_free(u);
+    nn_free(dct); nn_free(dpn); nn_free(dlab); nn_free(dw); nn_free(dpatch); nn_free(dgl); isfhead_free(h); unet_free(u); unet_free(uv); free(lv16); free(gv); free(lvf); nn_free(dgv); nn_free(gv16);
 }
 
 int main(void) {
     if (nn_init(0)) return 77;
-    test_resample(); test_2d(); test_head_fd(); test_toy();
+    g_ink = envf("TIS_INK", g_ink); g_bg = envf("TIS_BG", g_bg); g_sp0 = envf("TIS_SP0", g_sp0); g_sp1 = envf("TIS_SP1", g_sp1);
+    g_a0 = envf("TIS_A0", g_a0); g_a1 = envf("TIS_A1", g_a1); g_wl0 = envf("TIS_WL0", g_wl0); g_wl1 = envf("TIS_WL1", g_wl1); g_gap = envf("TIS_GAP", g_gap); g_moff = envf("TIS_MOFF", g_moff); TP = (int)envf("TIS_TP", (float)TP);
+    if (getenv("TIS_SEED")) rs = (uint64_t)atoll(getenv("TIS_SEED"));
+    if (!getenv("TIS_TOY_ONLY")) { test_resample(); test_2d(); test_head_fd(); }
+    test_toy();
     if (fails) { fprintf(stderr, "test_inksurf: %d FAILED\n", fails); return 1; }
     fprintf(stderr, "test_inksurf: PASS\n"); return 0;
 }

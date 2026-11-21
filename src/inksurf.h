@@ -28,6 +28,7 @@ void nn_isf_gather(const float *gout, int C, int K, int n, const int *vox, const
 void nn_isf2_conv(const float *x, int Ci, int H, int W, const float *w, const float *b, int Co, int k, float *y);
 void nn_isf2_conv_bd(const float *gy, int Co, int H, int W, const float *w, int Ci, int k, float *gx, int acc);
 void nn_isf2_conv_bw(const float *x, int Ci, int H, int W, const float *gy, int Co, int k, float *gw, float *gb);   /* gw, gb SET */
+void nn_isf2_add(float *y, const float *x, size_t n);   /* y += x */
 void nn_isf2_silu(const float *x, size_t n, float *y);
 void nn_isf2_silu_bwd(const float *x, const float *gy, size_t n, float *gx);   /* x: the pre-activation */
 void nn_isf2_pool(const float *x, int C, int H, int W, float *y);
@@ -43,7 +44,8 @@ void nn_isf2_adamw(float *p, const float *g, float *m, float *v, size_t n, float
 typedef struct { int nv, ne; int *vox, *off, *ent; float *ew; } isf_lists;
 int isf_lists_build(const float *pn, int n, int K, float step, int D, int H, int W, isf_lists *L);
 void isf_lists_free(isf_lists *L);
-/* the 2-D head: stem 1x1 (Cin -> 32), a 4-down U-Net (32 48 64 96, bottleneck 2 x 96, decoder 64 48 32 32), 1x1 -> 1 logit; SiLU */
+/* the 2-D head: stem 1x1 (Cin -> 32), a 4-down U-Net (32 48 64 96, bottleneck 2 x 96, decoder 64 48 32 32), 1x1 -> 1 logit; SiLU; plus a
+   linear readout (1x1 from the patch to the logit, summed) */
 typedef struct isfhead isfhead;
 isfhead *isfhead_create(int cin, int Hp, int Wp, uint64_t seed);   /* Hp, Wp multiples of 16 */
 void isfhead_free(isfhead *h);

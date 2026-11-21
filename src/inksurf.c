@@ -44,8 +44,8 @@ int isf_lists_build(const float *pn, int n, int K, float step, int D, int H, int
 void isf_lists_free(isf_lists *L) { free(L->vox); free(L->off); free(L->ent); free(L->ew); memset(L, 0, sizeof *L); }
 
 /* ---- the 2-D head ---- */
-enum { SH_NC = 12 };
-static const int sh_co[SH_NC] = {32, 32, 48, 64, 96, 96, 96, 64, 48, 32, 32, 1}, sh_k[SH_NC] = {1, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1}, sh_lv[SH_NC] = {0, 0, 1, 2, 3, 4, 4, 3, 2, 1, 0, 0};
+enum { SH_NC = 13 };   /* (conv 12: the linear readout, 1x1 from the patch straight to the logit, added to the U-Net's: a direct gradient into the trunk) */
+static const int sh_co[SH_NC] = {32, 32, 48, 64, 96, 96, 96, 64, 48, 32, 32, 1, 1}, sh_k[SH_NC] = {1, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 1}, sh_lv[SH_NC] = {0, 0, 1, 2, 3, 4, 4, 3, 2, 1, 0, 0, 0};
 struct isfhead {
     int cin, H, W, ci[SH_NC]; size_t woff[SH_NC], boff[SH_NC], np;
     float *p, *g, *m, *v;                      /* parameters, gradients, Adam moments */
@@ -60,14 +60,14 @@ static double gauss(uint64_t *s) { const double u1 = ((sm64(s) >> 11) + 0.5) / 9
 isfhead *isfhead_create(int cin, int Hp, int Wp, uint64_t seed) {
     if (cin < 1 || Hp < 16 || Wp < 16 || Hp % 16 || Wp % 16) { fprintf(stderr, "isfhead: patch %d x %d must be a multiple of 16\n", Hp, Wp); return nullptr; }
     isfhead *h = calloc(1, sizeof *h); h->cin = cin; h->H = Hp; h->W = Wp;
-    const int ci[SH_NC] = {cin, 32, 32, 48, 64, 96, 96, 96 + 96, 64 + 64, 48 + 48, 32 + 32, 32};
+    const int ci[SH_NC] = {cin, 32, 32, 48, 64, 96, 96, 96 + 96, 64 + 64, 48 + 48, 32 + 32, 32, cin};
     memcpy(h->ci, ci, sizeof ci);
     for (int i = 0; i < SH_NC; i++) { h->woff[i] = h->np; h->np += (size_t)sh_co[i] * ci[i] * sh_k[i] * sh_k[i]; h->boff[i] = h->np; h->np += (size_t)sh_co[i]; }
     float *hp = calloc(h->np, 4); uint64_t s = seed * 0x2545f4914f6cdd1dull + 1;
     for (int i = 0; i < SH_NC; i++) {   /* He normal for the SiLU convs; the output conv small, bias -1 (ink is the minority) */
-        const size_t nw = (size_t)sh_co[i] * ci[i] * sh_k[i] * sh_k[i]; const double sd = i == SH_NC - 1 ? 0.01 : sqrt(2.0 / (ci[i] * sh_k[i] * sh_k[i]));
+        const size_t nw = (size_t)sh_co[i] * ci[i] * sh_k[i] * sh_k[i]; const double sd = i >= 11 ? 0.01 : sqrt(2.0 / (ci[i] * sh_k[i] * sh_k[i]));
         for (size_t q = 0; q < nw; q++) hp[h->woff[i] + q] = (float)(sd * gauss(&s));
-        if (i == SH_NC - 1) hp[h->boff[i]] = -1.f;
+        if (i == 11) hp[h->boff[i]] = -1.f;
     }
     h->p = dalloc(h, h->np); h->g = dalloc(h, h->np); h->m = dalloc(h, h->np); h->v = dalloc(h, h->np);
     if (!h->p || !h->g || !h->m || !h->v) { free(hp); isfhead_free(h); return nullptr; }
@@ -75,20 +75,20 @@ isfhead *isfhead_create(int cin, int Hp, int Wp, uint64_t seed) {
     size_t mx = 0;
     for (int i = 0; i < SH_NC; i++) {
         const size_t o = (size_t)sh_co[i] * hw(h, sh_lv[i]), in = (size_t)ci[i] * hw(h, sh_lv[i]);
-        h->z[i] = dalloc(h, o); h->a[i] = i == SH_NC - 1 ? nullptr : dalloc(h, o); h->ga[i] = dalloc(h, o);
-        if (i) h->in[i] = (i == 1 || i == 6 || i == 11) ? nullptr : dalloc(h, in);   /* (convs 1, 6, 11 read a[0], a[5], a[10] directly) */
+        h->z[i] = dalloc(h, o); h->a[i] = i >= 11 ? nullptr : dalloc(h, o); h->ga[i] = dalloc(h, o);
+        if (i) h->in[i] = (i == 1 || i == 6 || i == 11 || i == 12) ? nullptr : dalloc(h, in);   /* (convs 1, 6, 11 read a[0], a[5], a[10] directly) */
         if (o > mx) mx = o; if (in > mx) mx = in;
     }
     h->in[1] = h->a[0]; h->in[6] = h->a[5]; h->in[11] = h->a[10];
     h->gz = dalloc(h, mx); h->gin = dalloc(h, mx); h->gx = dalloc(h, (size_t)cin * hw(h, 0));
-    for (int i = 0; i < SH_NC; i++) if (!h->z[i] || !h->ga[i] || (i < SH_NC - 1 && !h->a[i]) || (i && !h->in[i])) { isfhead_free(h); return nullptr; }
+    for (int i = 0; i < SH_NC; i++) if (!h->z[i] || !h->ga[i] || (i < 11 && !h->a[i]) || (i && i != 12 && !h->in[i])) { isfhead_free(h); return nullptr; }
     if (!h->gz || !h->gin || !h->gx) { isfhead_free(h); return nullptr; }
     return h;
 }
 void isfhead_free(isfhead *h) {
     if (!h) return;
     nn_free(h->p); nn_free(h->g); nn_free(h->m); nn_free(h->v); nn_free(h->gz); nn_free(h->gin); nn_free(h->gx);
-    for (int i = 0; i < SH_NC; i++) { nn_free(h->z[i]); nn_free(h->a[i]); nn_free(h->ga[i]); if (i != 1 && i != 6 && i != 11 && i) nn_free(h->in[i]); }
+    for (int i = 0; i < SH_NC; i++) { nn_free(h->z[i]); nn_free(h->a[i]); nn_free(h->ga[i]); if (i != 1 && i != 6 && i != 11 && i != 12 && i) nn_free(h->in[i]); }
     free(h);
 }
 size_t isfhead_nparams(const isfhead *h) { return h->np; }
@@ -116,16 +116,18 @@ const float *isfhead_forward(isfhead *h, const float *x) {
     cat(h, 9, h->a[8], 48, h->a[2], 48); conv(h, 9);
     cat(h, 10, h->a[9], 32, h->a[1], 32); conv(h, 10);
     conv(h, 11);
-    return h->z[SH_NC - 1];
+    h->in[12] = (float *)x; conv(h, 12); nn_isf2_add(h->z[11], h->z[12], hw(h, 0));
+    return h->z[11];
 }
 /* conv i backward from ga[i] (or the logit gradient): parameter gradients, d loss / d in[i] into dst (acc 0) */
-static void conv_bwd(isfhead *h, int i, const float *gout, float *dst) {
+static void conv_bwd_a(isfhead *h, int i, const float *gout, float *dst, int acc) {
     const int lv = sh_lv[i], H = h->H >> lv, W = h->W >> lv; const size_t o = (size_t)sh_co[i] * H * W;
     const float *gz = gout;
     if (h->a[i]) { nn_isf2_silu_bwd(h->z[i], gout, o, h->gz); gz = h->gz; }
     nn_isf2_conv_bw(h->in[i], h->ci[i], H, W, gz, sh_co[i], sh_k[i], h->g + h->woff[i], h->g + h->boff[i]);
-    nn_isf2_conv_bd(gz, sh_co[i], H, W, h->p + h->woff[i], h->ci[i], sh_k[i], dst, 0);
+    nn_isf2_conv_bd(gz, sh_co[i], H, W, h->p + h->woff[i], h->ci[i], sh_k[i], dst, acc);
 }
+static void conv_bwd(isfhead *h, int i, const float *gout, float *dst) { conv_bwd_a(h, i, gout, dst, 0); }
 static void uncat(isfhead *h, int i, int lo, int clo, int skip, int cs) {   /* gin = d in[i]: ga[lo] = up_bwd(first part), ga[skip] = the rest */
     const int lv = sh_lv[i], H = h->H >> lv, W = h->W >> lv;
     nn_isf2_up_bwd(h->gin, clo, H / 2, W / 2, h->ga[lo]);
@@ -144,6 +146,7 @@ const float *isfhead_backward(isfhead *h, const float *glogit) {
     }
     conv_bwd(h, 1, h->ga[1], h->ga[0]);
     conv_bwd(h, 0, h->ga[0], h->gx);
+    conv_bwd_a(h, 12, glogit, h->gx, 1);
     return h->gx;
 }
 void isfhead_adamw(isfhead *h, float lr, float wd, int step) { nn_isf2_adamw(h->p, h->g, h->m, h->v, h->np, lr, 0.9f, 0.999f, 1e-8f, wd, step); }
