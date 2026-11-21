@@ -4658,6 +4658,11 @@ int cmd_train(int argc, char **argv) {
                 fmin = fmin > g_mil_reserve ? fmin - g_mil_reserve : 0;
                 fprintf(stderr, "memory: --ink-mil keeps %.2f GB free for its buffers (%d rays x %d samples)\n", g_mil_reserve / 1e9, g_mil_max, ink_mil_samples(g_mil_R, g_mil_step));
             }
+            if (g_isf) {   /* --ink-surf: the surface head, patch and feature slabs, allocated after the plan (S3 2026-11-21: depth 5, patch 384 / 512) */
+                const size_t r = isf_reserve_bytes(cfg.widths[0], g_isf_P, 2 * g_isf_k + 1, g_isf_depth, g_Pz, P, P);
+                fmin = fmin > r ? fmin - r : 0;
+                fprintf(stderr, "memory: --ink-surf keeps %.2f GB free (head depth %d, patch %d, %d layers)\n", r / 1e9, g_isf_depth, g_isf_P, 2 * g_isf_k + 1);
+            }
             if (g_val_u) {   /* --val-P: the validation copy's inference build at N^3 stays out of the training budget */
                 g_val_reserve = unet_infer_bytes(g_val_u, (shape5){B, g_xc, g_valP, g_valP, g_valP});
                 g_val_reserve += g_val_reserve * 2 / 5 + ((size_t)256 << 20);   /* (the dry build counts ~3/4 of what it takes: 1.08 GB at 384^3) */

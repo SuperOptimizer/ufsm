@@ -88,6 +88,7 @@ typedef struct { isfhead *h; int C, Hp, K, nv; float *patch, *lab, *wt, *glog, *
                  size_t c_vox, c_off, c_ent, c_ew, c_fidx, c_fw, c_fc, c_gc, c_feat, c_rows; } isf_dev;
 int isf_dev_init(isf_dev *g, int C, int Hp, int K, uint64_t seed);
 int isf_dev_init_d(isf_dev *g, int C, int Hp, int K, int depth, uint64_t seed);
+size_t isf_reserve_bytes(int C, int Hp, int K, int depth, int D, int H, int W);   /* the planner's reservation for train --ink-surf */
 void isf_dev_free(isf_dev *g);
 size_t isf_dev_bytes(const isf_dev *g);
 int isf_dev_upload(isf_dev *g, const isf_win *w);                                   /* the window's lists and labels (synchronous) */

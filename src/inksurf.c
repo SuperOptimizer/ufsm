@@ -108,6 +108,19 @@ isfhead *isfhead_create_d(int cin, int Hp, int Wp, int L, uint64_t seed) {
     return h;
 }
 isfhead *isfhead_create(int cin, int Hp, int Wp, uint64_t seed) { return isfhead_create_d(cin, Hp, Wp, 4, seed); }
+/* the device bytes of a head (parameters, gradients, moments, activations: isfhead_create_d's allocations) without allocating */
+static size_t isfhead_est(int cin, int Hp, int Wp, int L) {
+    sh_lay y; sh_layout(&y, L, cin); size_t b = 4 * y.np * 4, mx = 0; const int O = y.nc - 2;
+    for (int i = 0; i < y.nc; i++) { const size_t n = (size_t)(Hp >> y.lv[i]) * (Wp >> y.lv[i]), o = (size_t)y.co[i] * n, in = (size_t)y.ci[i] * n;
+        b += (o * (i >= O ? 2 : 3) + (i && !sh_borrow(&y, i) ? in : 0)) * 4; if (o > mx) mx = o; if (in > mx) mx = in; }
+    return b + (2 * mx + (size_t)cin * Hp * Wp) * 4;
+}
+/* train --ink-surf's device footprint, for the memory planner: the head, the patch + its labels, a 32-plane feature slab of the D x H x W
+   window, the compact touched-voxel features + gradients (bounded by 2 voxels a sample: measured ~1.3 on S1 patches) and their lists */
+size_t isf_reserve_bytes(int C, int Hp, int K, int depth, int D, int H, int W) {
+    const size_t n = (size_t)Hp * Hp, nvx = n * K * 2 < (size_t)D * H * W ? n * K * 2 : (size_t)D * H * W;
+    return isfhead_est(C * K, Hp, Hp, depth) + ((size_t)C * K + 4) * n * 4 + (size_t)C * 32 * H * W * 2 + nvx * C * 4 * 2 + nvx * 4 * 2 + n * K * 8 * 8 * 2;
+}
 void isfhead_free(isfhead *h) {
     if (!h) return;
     nn_free(h->p); nn_free(h->g); nn_free(h->m); nn_free(h->v); nn_free(h->gz); nn_free(h->gin); nn_free(h->gx);
