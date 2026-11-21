@@ -32,6 +32,10 @@ void nn_isf_resample_c(const float *fc, int C, int nv, const int *fidx, const fl
 void nn_isf2_conv(const float *x, int Ci, int H, int W, const float *w, const float *b, int Co, int k, float *y);
 void nn_isf2_conv_bd(const float *gy, int Co, int H, int W, const float *w, int Ci, int k, float *gx, int acc);
 void nn_isf2_conv_bw(const float *x, int Ci, int H, int W, const float *gy, int Co, int k, float *gw, float *gb, int acc);   /* acc 0: gw, gb set; 1: added */
+/* the simple one-thread-per-output kernels the tiled ones above must match bit for bit (test_inksurf, bench_isfhead) */
+void nn_isf2_conv_ref(const float *x, int Ci, int H, int W, const float *w, const float *b, int Co, int k, float *y);
+void nn_isf2_conv_bd_ref(const float *gy, int Co, int H, int W, const float *w, int Ci, int k, float *gx, int acc);
+void nn_isf2_conv_bw_ref(const float *x, int Ci, int H, int W, const float *gy, int Co, int k, float *gw, float *gb, int acc);
 void nn_isf2_add(float *y, const float *x, size_t n);   /* y += x */
 void nn_isf2_silu(const float *x, size_t n, float *y);
 void nn_isf2_silu_bwd(const float *x, const float *gy, size_t n, float *gx);   /* x: the pre-activation */

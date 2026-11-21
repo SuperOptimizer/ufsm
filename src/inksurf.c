@@ -246,6 +246,18 @@ int isf_dev_take(isf_dev *g, unet *u, const isf_win *w, int z0, int z1, size_t h
     nn_isf_take(g->feat, g->C, ns, vb, g->vox, ua, ub, g->fc, g->nv);
     return 0;
 }
+/* o[m] (value, label) sorted by value, ties in their input order: what the stable insertion sort gave (no NaN values) */
+static void auc_sort(float (*o)[2], size_t m) {
+    float (*t)[2] = malloc((m ? m : 1) * sizeof *t); if (!t) { for (size_t i = 1; i < m; i++) { float a0 = o[i][0], a1 = o[i][1]; size_t j = i;
+        while (j > 0 && o[j - 1][0] > a0) { o[j][0] = o[j - 1][0]; o[j][1] = o[j - 1][1]; j--; } o[j][0] = a0; o[j][1] = a1; } return; }
+    for (size_t w = 1; w < m; w *= 2) {   /* bottom-up merge sort: left run first on ties = stable */
+        for (size_t lo = 0; lo < m; lo += 2 * w) { const size_t mid = lo + w < m ? lo + w : m, hi = lo + 2 * w < m ? lo + 2 * w : m; size_t i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) { if (o[j][0] < o[i][0]) { t[k][0] = o[j][0]; t[k][1] = o[j][1]; j++; } else { t[k][0] = o[i][0]; t[k][1] = o[i][1]; i++; } k++; }
+            while (i < mid) { t[k][0] = o[i][0]; t[k][1] = o[i][1]; i++; k++; } while (j < hi) { t[k][0] = o[j][0]; t[k][1] = o[j][1]; j++; k++; } }
+        memcpy(o, t, m * sizeof *t);
+    }
+    free(t);
+}
 double isf_dev_step(isf_dev *g, const isf_win *w, float lambda, int train, float gscale, const float *dscale, double *auc) {
     if (auc) *auc = -1;
     if (!g->nv) return -1;
@@ -258,7 +270,9 @@ double isf_dev_step(isf_dev *g, const isf_win *w, float lambda, int train, float
     if (auc) {   /* (the window's patch AUC on its labelled pixels; ties by rank order) */
         double a = 0, np = 0, nn = 0; size_t m = 0; for (size_t p = 0; p < n; p++) m += w->wt[p] > 0;
         float (*o)[2] = malloc(m * sizeof *o); size_t k = 0; for (size_t p = 0; p < n; p++) if (w->wt[p] > 0) { o[k][0] = g->zh[p]; o[k][1] = w->lab[p]; k++; }
-        for (size_t i = 1; i < m; i++) { float t0 = o[i][0], t1 = o[i][1]; size_t j = i; while (j > 0 && o[j - 1][0] > t0) { o[j][0] = o[j - 1][0]; o[j][1] = o[j - 1][1]; j--; } o[j][0] = t0; o[j][1] = t1; }
+        int nan = 0; for (size_t i = 0; i < m; i++) nan |= isnan(o[i][0]);
+        if (!nan) auc_sort(o, m);   /* (inkperf 11-21: the insertion sort's order, stable by value, in O(m log m): 15 ms -> ~1 ms at 12.5 k px) */
+        else for (size_t i = 1; i < m; i++) { float t0 = o[i][0], t1 = o[i][1]; size_t j = i; while (j > 0 && o[j - 1][0] > t0) { o[j][0] = o[j - 1][0]; o[j][1] = o[j - 1][1]; j--; } o[j][0] = t0; o[j][1] = t1; }
         for (size_t i = 0; i < m; i++) { if (o[i][1] > 0.5f) { a += nn; np++; } else nn++; }
         free(o); *auc = np && nn ? a / (np * nn) : -1;
     }
