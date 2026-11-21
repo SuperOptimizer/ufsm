@@ -10,6 +10,6 @@ surfp *surfp_open(const char *wraps, const char *isf, int C0, int Hp, int halo, 
 void surfp_free(surfp *S);
 /* the windows to run (level origins, extent n, interior margin m): one centred on each patch not yet placed, taking its neighbours that fit;
    *o malloc'd [3 per window]; returns the count. Window t's patches run in surfp_window(t) */
-long surfp_plan(surfp *S, const int64_t n[3], const int m[3], int64_t **o);
+long surfp_plan(surfp *S, const int64_t n[3], const int m[3], const int64_t *g, long ng, int64_t **o);   /* g: the box's grid window origins */
 int surfp_window(surfp *S, unet *u, long t, const int64_t o[3], int D, int H, int W);   /* after window t's forward: its patches into the maps */
 int surfp_write(surfp *S, const char *dir);   /* DIR/<wrap>.tif per wrap */

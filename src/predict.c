@@ -2850,7 +2850,11 @@ static int predict_one(int argc, char **argv) {
                             2 * opt_atoi("--surf-k", opt(argc, argv, "--surf-k", "4")) + 1, scale);
             if (!SF) return 1;
             const int64_t wn3[3] = {Wz, W, W}; const int mg[3] = {hz, halo, halo}; int64_t *to = nullptr;
-            const long nt = surfp_plan(SF, wn3, mg, &to);   /* (the windows replace the box's grid: centred on the wraps' patches) */
+            int64_t *go = malloc((size_t)(rd.ntiles ? rd.ntiles : 1) * 3 * sizeof *go); if (!go) return 1;
+            for (long i = 0; i < rd.ntiles; i++) { go[3 * i] = bo[0] + rd.tiles[i].tz; go[3 * i + 1] = bo[1] + rd.tiles[i].ty; go[3 * i + 2] = bo[2] + rd.tiles[i].tx; }
+            const long nt = surfp_plan(SF, wn3, mg, go, rd.ntiles, &to);   /* (the box's grid windows that contain patches, then windows centred on the rest) */
+            free(go);
+            if (getenv("UFSM_SURF_PLAN_ONLY") && atoi(getenv("UFSM_SURF_PLAN_ONLY"))) { free(to); fprintf(stderr, "predict --surf: UFSM_SURF_PLAN_ONLY: the plan only\n"); return 0; }
             if (nt > cap) { cap = nt; rd.tiles = ck_tiles(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
             for (long i = 0; i < nt; i++) rd.tiles[i] = (tile_t){to[3 * i] - bo[0], to[3 * i + 1] - bo[1], to[3 * i + 2] - bo[2], 0, 1, 0};
             rd.ntiles = nt; snprintf(sf_out, sizeof sf_out, "%s", sout);

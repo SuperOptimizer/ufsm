@@ -98,21 +98,50 @@ static int fits(const spp *q, const int64_t o[3], const int64_t n[3], const int 
     for (int d = 0; d < 3; d++) if (q->lo[d] < o[d] + m[d] || q->hi[d] >= o[d] + n[d] - m[d]) return 0;
     return 1;
 }
-/* the windows: greedily one centred on each patch not yet placed, which also takes the unplaced patches of the same wrap within two patch
-   rows / cols that fit its interior. *o: malloc'd origins [3 per window]; returns the window count */
-long surfp_plan(surfp *S, const int64_t n[3], const int m[3], int64_t **o) {
-    long cap = 256, nt = 0, fit = 0; *o = malloc((size_t)cap * 3 * sizeof **o);
+/* the windows (2026-11-21, lead: 1667's 18375 patch-centred windows were ~30x the voxel scorer's 601 grid windows): greedy set cover on the
+   half-step lattice of the box's grid (origins g[0] + k * h, h = the interior / 2 per axis; the even k are the voxel scorer's windows): every
+   patch fits a few lattice windows' interiors (any wrap); repeatedly the window that takes the most unplaced patches (ties: the lower
+   index). The rest (wider than h along an axis): a window centred on each still unplaced patch, taking every unplaced patch that fits.
+   *o: malloc'd origins [3 per window]; returns the window count */
+long surfp_plan(surfp *S, const int64_t n[3], const int m[3], const int64_t *g, long ng, int64_t **o) {
+    long cap = 256, nt = 0, fit = 0, nlat = 0; *o = malloc((size_t)cap * 3 * sizeof **o);
+    int64_t h[3], g0[3], k0[3], K[3]; for (int d = 0; d < 3; d++) { h[d] = (n[d] - 2 * m[d]) / 2; if (h[d] < 1) h[d] = 1; g0[d] = ng ? g[d] : -m[d]; }
+    /* per axis, the lattice k with g0 + k h + m <= lo and hi < g0 + k h + n - m */
+    #define KLO(q, d) ((int64_t)ceil((double)((q)->hi[d] - n[d] + m[d] + 1 - g0[d]) / (double)h[d]))
+    #define KHI(q, d) ((int64_t)floor((double)((q)->lo[d] - m[d] - g0[d]) / (double)h[d]))
+    for (int d = 0; d < 3; d++) { int64_t a = INT64_MAX, b = INT64_MIN; for (long p = 0; p < S->np; p++) { const int64_t x = KLO(&S->P[p], d), y = KHI(&S->P[p], d); if (x <= y) { if (x < a) a = x; if (y > b) b = y; } }
+                                  k0[d] = a <= b ? a : 0; K[d] = a <= b ? b - a + 1 : 0; }
+    const size_t nc = (size_t)K[0] * K[1] * K[2];
+    long *cnt = calloc(nc ? nc : 1, sizeof *cnt), *poff = calloc((size_t)S->np + 1, sizeof *poff); long *pc = nullptr, *coff = nullptr, *cp = nullptr;
+    for (long p = 0; p < S->np; p++) { const spp *q = &S->P[p]; long c = 1; for (int d = 0; d < 3; d++) { const int64_t x = KLO(q, d), y = KHI(q, d); c *= x <= y ? y - x + 1 : 0; } poff[p + 1] = poff[p] + c; }
+    pc = malloc((size_t)(poff[S->np] ? poff[S->np] : 1) * sizeof *pc); coff = calloc(nc + 1, sizeof *coff);
+    for (long p = 0; p < S->np; p++) { const spp *q = &S->P[p]; long e = poff[p]; if (e == poff[p + 1]) continue;
+        for (int64_t a = KLO(q, 0); a <= KHI(q, 0); a++) for (int64_t b = KLO(q, 1); b <= KHI(q, 1); b++) for (int64_t c = KLO(q, 2); c <= KHI(q, 2); c++) {
+            const long id = (long)(((a - k0[0]) * K[1] + (b - k0[1])) * K[2] + (c - k0[2])); pc[e++] = id; coff[id + 1]++; cnt[id]++; } }
+    for (size_t c = 0; c < nc; c++) coff[c + 1] += coff[c];
+    cp = malloc((size_t)(coff[nc] ? coff[nc] : 1) * sizeof *cp); { long *w = malloc((nc + 1) * sizeof *w); memcpy(w, coff, (nc + 1) * sizeof *w);
+        for (long p = 0; p < S->np; p++) for (long e = poff[p]; e < poff[p + 1]; e++) cp[w[pc[e]]++] = p; free(w); }
+    for (;;) {
+        long best = -1, bc = 0; for (size_t c = 0; c < nc; c++) if (cnt[c] > bc) { bc = cnt[c]; best = (long)c; }
+        if (best < 0) break;
+        const long kx = best % K[2], ky = (best / K[2]) % K[1], kz = best / (K[1] * K[2]);
+        const int64_t c3[3] = {g0[0] + (k0[0] + kz) * h[0], g0[1] + (k0[1] + ky) * h[1], g0[2] + (k0[2] + kx) * h[2]};
+        if (nt == cap) { cap *= 2; *o = realloc(*o, (size_t)cap * 3 * sizeof **o); }
+        memcpy(*o + 3 * nt, c3, sizeof c3);
+        for (long e = coff[best]; e < coff[best + 1]; e++) { const long p = cp[e]; if (S->P[p].tile >= 0) continue; S->P[p].tile = nt; fit++;
+            for (long f = poff[p]; f < poff[p + 1]; f++) cnt[pc[f]]--; }
+        nt++; nlat++;
+    }
+    #undef KLO
+    #undef KHI
+    free(cnt); free(poff); free(pc); free(coff); free(cp);
     for (long p = 0; p < S->np; p++) {
         spp *q = &S->P[p]; if (q->tile >= 0) continue;
         int64_t c[3]; for (int d = 0; d < 3; d++) c[d] = (q->lo[d] + q->hi[d]) / 2 - n[d] / 2;
         if (!fits(q, c, n, m)) continue;
         if (nt == cap) { cap *= 2; *o = realloc(*o, (size_t)cap * 3 * sizeof **o); }
         memcpy(*o + 3 * nt, c, sizeof c);
-        const spw *w = &S->W[q->wr];
-        for (int da = -2; da <= 2; da++) for (int db = -2; db <= 2; db++) {
-            const int a = q->pa + da, b = q->pb + db; if (a < 0 || b < 0 || a >= w->na || b >= w->nb) continue;
-            const long r = w->pid[(size_t)a * w->nb + b]; if (r < 0 || S->P[r].tile >= 0) continue;
-            if (fits(&S->P[r], c, n, m)) { S->P[r].tile = nt; fit++; } }
+        for (long r = p; r < S->np; r++) if (S->P[r].tile < 0 && fits(&S->P[r], c, n, m)) { S->P[r].tile = nt; fit++; }
         nt++;
     }
     S->nfit = fit; S->ntile = nt;
@@ -123,7 +152,7 @@ long surfp_plan(surfp *S, const int64_t n[3], const int m[3], int64_t **o) {
     for (long p = 0; p < S->np; p++) if (S->P[p].tile >= 0) S->tp[pos[S->P[p].tile]++] = p;
     free(pos);
     if (fit < S->np) fprintf(stderr, "DEFAULTED: predict --surf: %ld of %ld patches fit no window's interior (a patch curved past the window's interior): their pixels stay 0 (a smaller --surf-P or a larger --window)\n", S->np - fit, S->np);
-    fprintf(stderr, "predict --surf: %ld patches in %ld windows\n", fit, nt);
+    fprintf(stderr, "predict --surf: %ld patches in %ld windows (%ld on the grid's half-step lattice, %ld centred on patches; the box's grid has %ld)\n", fit, nt, nlat, nt - nlat, ng);
     return nt;
 }
 int surfp_window(surfp *S, unet *u, long t, const int64_t o[3], int D, int H, int W) {
