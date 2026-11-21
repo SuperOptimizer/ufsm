@@ -140,6 +140,43 @@ static size_t wb_netkey(const char *h, size_t pre, char *o, size_t cap) {
     }
     o[n] = 0; return n;
 }
+/* the --ink-surf head's sidecar IN.isf (src/inksurf.c isf_save: ISF1 header 16 B / ISF2 20 B, then parameters, Adam m, Adam v; no EMA copy):
+   when every input has one, OUT.isf = the parameters' uniform average, moments and header (step) from the last input (S2 11-21: the
+   surface-head scores swung 0.657 / 0.679 / 0.638 between snapshots). Some inputs with and some without: an error, never a silent
+   trunk-only average */
+static int ckpt_avg_isf(const char *out, const char **in, int nin) {
+    char p[4200]; int have = 0;
+    for (int k = 0; k < nin; k++) { snprintf(p, sizeof p, "%s.isf", in[k]); FILE *t = fopen(p, "rb"); if (t) { have++; fclose(t); } }
+    if (!have) return 0;
+    if (have != nin) { fprintf(stderr, "ckpt-avg: %d of %d inputs have a .isf head sidecar (all or none)\n", have, nin); return 1; }
+    FILE *f[256]; int hd0[5] = {0}; long long sz = 0; int hl = 0, rc = 0;
+    for (int k = 0; k < nin; k++) {
+        snprintf(p, sizeof p, "%s.isf", in[k]); f[k] = fopen(p, "rb"); int hd[5] = {0};
+        const size_t n = fread(hd, 4, 5, f[k]); const int l = hd[0] == 0x31465349 ? 16 : hd[0] == 0x32465349 ? 20 : 0;
+        fseek(f[k], 0, SEEK_END); const long long s = ftell(f[k]);
+        if (n < 4 || !l || (s - l) % 12) { fprintf(stderr, "ckpt-avg: %s is not an isf head\n", p); rc = 1; }
+        else if (!k) { memcpy(hd0, hd, sizeof hd); hl = l; sz = s; }
+        else if (l != hl || s != sz || hd[1] != hd0[1] || hd[2] != hd0[2] || (l == 20 && hd[4] != hd0[4])) { fprintf(stderr, "ckpt-avg: %s is not the same head as %s.isf\n", p, in[0]); rc = 1; }
+        if (rc) { for (int j = 0; j <= k; j++) fclose(f[j]); return 1; }
+    }
+    const size_t np = (size_t)(sz - hl) / 12; char tmp[4200], o_[4200]; snprintf(o_, sizeof o_, "%s.isf", out); snprintf(tmp, sizeof tmp, "%s.tmp", o_);
+    FILE *o = fopen(tmp, "wb"); float *b = malloc(np * 4); double *acc = calloc(np, sizeof(double)); char hb[20];
+    rc = !o || !b || !acc;
+    if (!rc) { fseek(f[nin - 1], 0, SEEK_SET); rc = fread(hb, 1, hl, f[nin - 1]) != (size_t)hl || fwrite(hb, 1, hl, o) != (size_t)hl; }
+    for (int k = 0; k < nin && !rc; k++) {
+        if (fseek(f[k], hl, SEEK_SET) || fread(b, 4, np, f[k]) != np) { rc = 1; break; }
+        for (size_t i = 0; i < np; i++) acc[i] += b[i];
+    }
+    if (!rc) { for (size_t i = 0; i < np; i++) b[i] = (float)(acc[i] / nin); rc = fwrite(b, 4, np, o) != np; }
+    for (int m = 0; m < 2 && !rc; m++)   /* Adam m, v of the last input */
+        rc = fseek(f[nin - 1], hl + (long)((m + 1) * np * 4), SEEK_SET) || fread(b, 4, np, f[nin - 1]) != np || fwrite(b, 4, np, o) != np;
+    for (int k = 0; k < nin; k++) fclose(f[k]);
+    free(b); free(acc);
+    if ((o && fclose(o)) || rc) { fprintf(stderr, "ckpt-avg: .isf read / write error\n"); remove(tmp); return 1; }
+    if (rename(tmp, o_)) { perror("ckpt-avg: rename .isf"); return 1; }
+    fprintf(stderr, "ckpt-avg: %d isf head(s), %zu parameters averaged -> %s\n", nin, np, o_);
+    return 0;
+}
 int cmd_ckpt_avg(int argc, char **argv) {
     int nin = 0; const char *in[256]; const char *out = argc > 2 ? argv[2] : nullptr;
     for (int i = 3; i < argc; i++) { if (!strcmp(argv[i], opt_n("--arrays"))) { i++; continue; } if (nin < 256) in[nin++] = argv[i]; }
@@ -184,5 +221,5 @@ int cmd_ckpt_avg(int argc, char **argv) {
     if (fclose(o) || rc) { fprintf(stderr, "ckpt-avg: read / write error\n"); remove(tmp); return 1; }
     if (rename(tmp, out)) { perror("ckpt-avg: rename"); return 1; }
     fprintf(stderr, "ckpt-avg: %d checkpoint(s), %zu parameters, %s averaged -> %s\n", nin, np, both ? "live + EMA weights" : "EMA weights", out);
-    return 0;
+    return ckpt_avg_isf(out, in, nin);
 }
