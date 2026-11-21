@@ -57,6 +57,7 @@ typedef struct {
     int ho_score_only;     /* inkfly_holdouts: skip the boxes marked "score": 0 (the scoring tools' --holdouts) */
     int excl_cells_only;   /* on the fly (inkfly_open): the boxes only drop draw cells (inkfly_cells); the derived array keeps the ink inside them, so
                               validation windows in a box have known ink and the sampler's holdout mask hides it from training (eval audit 11-14 #2) */
+    int soft_y;            /* on the fly (a "surf_only" source, S3 teacher maps 2026-11-21): the MIL / surface rays' y = the label byte (0 .. 255), not >= 128 */
     int unknown;           /* --unknown V (255): the byte of voxels no label reached; 0 lets a render max-projection / pairwrap read the splat as
                               a 0 / 254 map (the 3-D ink readout's positive control, 11-20) */
 } inksplat_cfg;
