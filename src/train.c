@@ -101,6 +101,7 @@ static void on_sig(int s) { (void)s; if (g_stop_upd && !g_sig) g_sig = 1; else g
 /* the head registry's aux plane roles (below) and the label stream planes: phase, winding, component, then the aux planes */
 enum { AUX_PAP, AUX_INK, AUX_FIB, AUX_FIBH, AUX_FIBV, AUX_N };
 #define NLPL (3 + AUX_N)   /* label stream planes: phase, winding, component, the aux planes */
+typedef struct { isf_win *w; const inkray *src; int na, D, H, W, rc; unsigned aug; double ms; } isf_job;   /* --ink-surf: one patch build (mil_take, a helper thread) */
 typedef struct {
     int dev;
     unet *u;
@@ -185,7 +186,7 @@ typedef struct {
     double *hs_ent, ent_h[32]; float kl_side, kl_rv, kl_norm, kl_w4, kl_ink, kl_fib[2], ang_side; unsigned long long *hsz; long hsz_pass;
     /* --ink-surf: the surface head (device), each buffer's patch (host: built from its rays at mil_take), this window's loss / unmasked fraction /
        patch AUC for the log (isf_got: the window had labelled patch pixels), the MIL's own ray subset per buffer */
-    isf_dev isf; isf_win isfw[2]; int isf_on, isf_got; double isf_l, isf_frac, isf_auc; inkray *isf_mr[2]; size_t isf_mrc[2]; long isf_nwin; double isf_bms;
+    isf_dev isf; isf_win isfw[2]; isf_job isfj[2]; pthread_t isf_th[2]; int isf_thon[2]; int isf_on, isf_got; double isf_l, isf_frac, isf_auc; inkray *isf_mr[2]; size_t isf_mrc[2]; long isf_nwin; double isf_bms;
 } gpu_state;
 /* hs_ent layout (doubles): the phase / side pair, rv pair, normal 7, ink, fibre H, V, fibre direction 7, the phase pair's angle error (sum, count) */
 enum { HE_SIDE = 0, HE_RV = 2, HE_NORM = 4, HE_INK = 11, HE_FIBH = 12, HE_FIBV = 13, HE_FDIR = 14, HE_ANG = 21, HE_N = 23 };
@@ -997,16 +998,30 @@ static void dump_win_(const batch *b, int B, int P) {
 /* --ink-mil device bytes: the rays (2 buffers), the accumulator, and inkmil's backward (8 corner pairs per sample: keys / values twice, 24 B,
    the radix sort's temp ~ the same, the per-ray loss) */
 static size_t mil_bytes(void) { const size_t n = (size_t)g_mil_max * ink_mil_samples(g_mil_R, g_mil_step); return 2 * (size_t)g_mil_max * sizeof(inkray) + n * 4 + n * 8 * 48 + (size_t)g_mil_max * 8 + ((size_t)16 << 20); }
+static void *isf_build_th(void *a) {   /* --ink-surf: one window's patch (mil_take) */
+    isf_job *J = a; const double t0 = now();
+    J->rc = isf_win_build(J->w, J->src, J->na, g_isf_P, g_isf_step, 2 * g_isf_k + 1, 1.f, J->D, J->H, J->W, J->aug);
+    J->ms = 1e3 * (now() - t0); return nullptr;
+}
+static void isf_join(gpu_state *d, int i) {   /* buffer i's patch build done (a no-op without one in flight) */
+    if (!d->isf_thon[i]) return;
+    pthread_join(d->isf_th[i], nullptr); d->isf_thon[i] = 0;
+    if (d->isfj[i].rc) { fprintf(stderr, "ink surf: the patch build failed (host memory)\n"); exit(1); }
+}
 static void mil_take(gpu_state *d, const batch *b, int i, int copy_stream) {   /* --ink-mil: buffer i's rays (the batch's host list, copied in stream order) */
     if (!g_mil) return;
     const inkray *src = b->mil && b->nmil && b->mil[0] ? (const inkray *)b->mil[0] : nullptr; int n = src ? (b->nmil[0] < g_mil_max ? b->nmil[0] : g_mil_max) : 0;
     if (g_isf) {   /* --ink-surf: the patch from every ray; the MIL its own rays (mode 1: the faceless ones), evenly thinned to the cap */
         const int na = src ? b->nmil[0] : 0;
         unsigned aug = 0; if (g_isf_aug) { uint64_t h = (g_seed + 0x9E3779B97F4A7C15ull * (uint64_t)++d->isf_nwin) ^ 0xD1B54A32D192ED03ull; h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32; aug = (unsigned)(h & 15); }
-        const double tb0 = now();
-        if (isf_win_build(&d->isfw[i], src, na, g_isf_P, g_isf_step, 2 * g_isf_k + 1, 1.f, g_Pz, d->hs_P, d->hs_P, aug)) { fprintf(stderr, "ink surf: the patch build failed (host memory)\n"); exit(1); }
+        /* the patch build (isf_win_build: 30-120 ms of host work, the CSR lists' sort) on a helper thread: it overlaps the step this
+           prefetch runs beside; isf_join(d, i) waits for it before buffer i's step reads the patch or the next build reuses it (inkperf
+           2026-11-21; the same aug bits, drawn here in window order). The synchronous upload path builds in place. */
+        isf_join(d, i);
+        isf_job *J = &d->isfj[i]; *J = (isf_job){.w = &d->isfw[i], .src = src, .na = na, .D = g_Pz, .H = d->hs_P, .W = d->hs_P, .aug = aug};
+        if (copy_stream && !pthread_create(&d->isf_th[i], nullptr, isf_build_th, J)) d->isf_thon[i] = 1; else isf_build_th(J);
+        if (!d->isf_thon[i] && J->rc) { fprintf(stderr, "ink surf: the patch build failed (host memory)\n"); exit(1); }
         if (d->isf_mrc[i] < (size_t)na) { free(d->isf_mr[i]); d->isf_mrc[i] = (size_t)na; d->isf_mr[i] = malloc((size_t)na * sizeof(inkray) + 1); if (!d->isf_mr[i]) { fprintf(stderr, "ink surf: out of host memory\n"); exit(1); } }
-        d->isf_bms = 1e3 * (now() - tb0);
         inkray *mr = d->isf_mr[i]; int m = 0; for (int k = 0; k < na; k++) if (g_mil_mode == 0 || src[k].pad) mr[m++] = src[k];   /* (per buffer: an async copy may still read the other) */
         if (m > g_mil_max) { for (int k = 0; k < g_mil_max; k++) mr[k] = mr[(size_t)k * m / g_mil_max]; m = g_mil_max; }
         src = mr; n = m;
@@ -1526,6 +1541,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
     if (mck && !pass) { free(mlg); mlg = calloc((size_t)D * hw, sizeof *mlg); free(mink); mink = calloc((size_t)D * hw, 1); }
     if (!pass) d->mil_n = 0;
     isf_win *const isw = d->isf_on ? &d->isfw[d->cur] : nullptr;   /* --ink-surf: this window's patch */
+    if (isw && !pass) { isf_join(d, d->cur); d->isf_bms = d->isfj[d->cur].ms; }
     if (isw && !pass) { d->isf_got = 0; if (isf_dev_upload(&d->isf, isw)) { fprintf(stderr, "ink surf: out of GPU memory for the window's lists\n"); exit(1); } }
     /* UFSM_HSG_ZERO=N: every Nth gradient pass of a training step, how many of the supervised voxels' fp16 logit gradients (phase / side
        pair, rv pair, wind4 pair, ink) and of the finished cell gradients are 0 or subnormal (the gradient scale's dead zone, audit
