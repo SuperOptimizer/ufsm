@@ -310,7 +310,7 @@ sources *sources_load(const char *path) {
         s->s = store_open(json_str(json_get(e, "root"), "."));
         s->ct_key = sdup(json_str(json_get(e, "ct"), ""));
         {   /* the per-source numbers: a present key of another type, or a non-finite value, is an error (mini/json 2 / 5b / 7: "weight": "2.0" trained at 1) */
-            const char *nk[] = {"um", "weight", "ink_weight", "trust_band", "iso", "papyrus", "head", "min_level", "max_level", "geometry", "crush_fine", "ct_only"};
+            const char *nk[] = {"um", "weight", "ink_weight", "surf_weight", "surf_only", "trust_band", "iso", "papyrus", "head", "min_level", "max_level", "geometry", "crush_fine", "ct_only"};
             for (size_t q = 0; q < sizeof nk / sizeof *nk; q++) { const json *v = json_get(e, nk[q]);
                 if (v && ((v->type != J_NUM && v->type != J_BOOL) || !isfinite(v->num))) {
                     fprintf(stderr, "sources: %s: \"%s\" must be a finite number\n", s->name, nk[q]); json_free(j); sources_free(S); return nullptr; } }
@@ -325,6 +325,8 @@ sources *sources_load(const char *path) {
         s->um = json_num(json_get(e, "um"), 0);
         s->weight = json_num(json_get(e, "weight"), 1.0);
         s->ink_weight = json_num(json_get(e, "ink_weight"), 1.0);
+        s->surf_weight = json_num(json_get(e, "surf_weight"), 1.0); s->surf_only = (int)json_num(json_get(e, "surf_only"), 0);
+        if (!(s->surf_weight >= 0)) { fprintf(stderr, "sources: %s: surf_weight must be >= 0\n", s->name); json_free(j); sources_free(S); return nullptr; }
         if (!(s->weight >= 0) || !(s->ink_weight >= 0) || !(s->um >= 0)) { fprintf(stderr, "sources: %s: weight, ink_weight and um must be >= 0\n", s->name); json_free(j); sources_free(S); return nullptr; }
         s->trust_band = (int)json_num(json_get(e, "trust_band"), 0);
         { const char *sc = json_str(json_get(e, "scope"), "global");
@@ -368,7 +370,7 @@ sources *sources_load(const char *path) {
             if (t->type == J_OBJ && json_get(t, "onfly")) {   /* {"onfly": {"segments", "level", "iso", "face", "holdout_file", "cache_mb"}}: the human-ink splat
                                                                  computed per chunk on first read (inksplat.h inkfly_open; == ink-splat --face --merge) */
                 if (!inkfly_open) { fprintf(stderr, "sources: %s/%s: an onfly ink target needs inksplat.o in this binary\n", s->name, CHNAME[c]); json_free(j); sources_free(S); return nullptr; }
-                const json *of = json_get(t, "onfly"); inksplat_cfg ic; inksplat_defaults(&ic); ic.face = 1;
+                const json *of = json_get(t, "onfly"); inksplat_cfg ic; inksplat_defaults(&ic); ic.face = 1; ic.soft_y = s->surf_only;
                 ic.level = (int)json_num(json_get(of, "level"), 1); ic.iso = (int)json_num(json_get(of, "iso"), s->iso > 0 ? s->iso : 64); ic.ct_um = s->um; ic.cache = g_cache;
                 { const char *vm = json_str(json_get(of, "validation"), "exclude"); ic.val_mode = !strcmp(vm, "only") ? 2 : !strcmp(vm, "off") ? 0 : 1; }   /* the segments' "validation" rasters: held out per pixel */
                 const json *fa = json_get(of, "face"); if (fa && fa->n == 2) { ic.face_a = json_num(json_at(fa, 0), -6); ic.face_b = json_num(json_at(fa, 1), 0); }

@@ -199,7 +199,7 @@ static int lists_fwd(const isf_lists *L, size_t ns, int **fidx, float **fw, size
     }
     return 0;
 }
-int isf_win_build(isf_win *w, const inkray *r, int nr, int Hp, int step, int K, float kstep, int D, int H, int W, unsigned aug) {
+int isf_win_build(isf_win *w, const inkray *r, int nr, int Hp, int step, int K, float kstep, int D, int H, int W, unsigned aug, int soft) {   /* soft: y / 255 (teacher rays), else y != 0 */
     const size_t n = (size_t)Hp * Hp;
     if (w->cap < n) { free(w->pn); free(w->lab); free(w->wt); w->pn = malloc(n * 6 * 4); w->lab = malloc(n * 4); w->wt = malloc(n * 4); w->cap = n; if (!w->pn || !w->lab || !w->wt) { w->cap = 0; return -1; } }
     w->Hp = Hp; w->K = K; w->kstep = kstep; w->np = 0; w->frac = 0; w->unit = -1; w->nouv = 0;
@@ -223,7 +223,7 @@ int isf_win_build(isf_win *w, const inkray *r, int nr, int Hp, int step, int K, 
         for (int d = 0; d < 3 && in; d++) { const float a = q->p[d] - ext * N[d], b = q->p[d] + ext * N[d]; in = a >= 0 && b >= 0 && a <= lim[d] && b <= lim[d]; }
         if (!in) continue;
         float *o = w->pn + 6 * ((size_t)i * Hp + j); for (int d = 0; d < 3; d++) { o[d] = q->p[d]; o[3 + d] = N[d]; }
-        w->lab[(size_t)i * Hp + j] = q->y ? 1.f : 0.f; w->wt[(size_t)i * Hp + j] = 1.f; w->np++;
+        w->lab[(size_t)i * Hp + j] = soft ? q->y / 255.f : q->y ? 1.f : 0.f; w->wt[(size_t)i * Hp + j] = 1.f; w->np++;
     }
     w->unit = best; w->frac = (double)w->np / n;
     return isf_win_lists(w, D, H, W);

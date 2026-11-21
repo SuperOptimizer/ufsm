@@ -1855,7 +1855,7 @@ static int tile_px_s(inkfly *f, size_t t, cpx **X, size_t *np, size_t *cap, doub
         double gu, gv, P[3], N[3]; px_grid(&G, (double)r, (double)cc, &gu, &gv);
         if (ssurf_pn(G.S, gu, gv, P, N)) continue;
         if (*np == *cap) { *cap = *cap ? 2 * *cap : 65536; cpx *q = realloc(*X, *cap * sizeof *q); if (!q) { free(lab); free(msk); return -1; } *X = q; }
-        cpx *x = &(*X)[(*np)++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = lab[(size_t)r * rw + cc] >= 128; x->t = (uint32_t)t; x->px = (uint16_t)(r * TS + cc);
+        cpx *x = &(*X)[(*np)++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = c->soft_y ? lab[(size_t)r * rw + cc] : lab[(size_t)r * rw + cc] >= 128; x->t = (uint32_t)t; x->px = (uint16_t)(r * TS + cc);
         for (int d = 0; d < 3; d++) { if (P[d] - reach < lo3[d]) lo3[d] = P[d] - reach; if (P[d] + reach > hi3[d]) hi3[d] = P[d] + reach; }
     }
     free(lab); free(msk); return 0;
@@ -2300,7 +2300,7 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
                     int ex = 0; for (int e = 0; e < c->nexcl && !ex; e++) { const int64_t *bx = c->excl[e]; ex = 1; for (int d = 0; d < 3 && ex; d++) ex = P[d] > bx[d] - ex_m && P[d] < bx[d] + bx[3 + d] + ex_m; }
                     if (ex) continue;
                     if (np == pc) { pc *= 2; X = realloc(X, pc * sizeof *X); }
-                    cpx *x = &X[np++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = lab[(size_t)(r - rr0) * rw + (cc - rc0)] >= 128;
+                    cpx *x = &X[np++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = c->soft_y ? lab[(size_t)(r - rr0) * rw + (cc - rc0)] : lab[(size_t)(r - rr0) * rw + (cc - rc0)] >= 128;
                     x->t = cand[q]; x->px = (uint16_t)((r - r0) * TS + (cc - c0));
                     for (int d = 0; d < 3; d++) { if (P[d] - reach < lo3[d]) lo3[d] = P[d] - reach; if (P[d] + reach > hi3[d]) hi3[d] = P[d] + reach; }
                 } }

@@ -101,7 +101,7 @@ static void on_sig(int s) { (void)s; if (g_stop_upd && !g_sig) g_sig = 1; else g
 /* the head registry's aux plane roles (below) and the label stream planes: phase, winding, component, then the aux planes */
 enum { AUX_PAP, AUX_INK, AUX_FIB, AUX_FIBH, AUX_FIBV, AUX_N };
 #define NLPL (3 + AUX_N)   /* label stream planes: phase, winding, component, the aux planes */
-typedef struct { isf_win *w; const inkray *src; int na, D, H, W, rc; unsigned aug; double ms; } isf_job;   /* --ink-surf: one patch build (mil_take, a helper thread) */
+typedef struct { isf_win *w; const inkray *src; int na, D, H, W, rc, soft; unsigned aug; double ms; } isf_job;   /* --ink-surf: one patch build (mil_take, a helper thread) */
 typedef struct {
     int dev;
     unet *u;
@@ -186,7 +186,7 @@ typedef struct {
     double *hs_ent, ent_h[32]; float kl_side, kl_rv, kl_norm, kl_w4, kl_ink, kl_fib[2], ang_side; unsigned long long *hsz; long hsz_pass;
     /* --ink-surf: the surface head (device), each buffer's patch (host: built from its rays at mil_take), this window's loss / unmasked fraction /
        patch AUC for the log (isf_got: the window had labelled patch pixels), the MIL's own ray subset per buffer */
-    isf_dev isf; isf_win isfw[2]; isf_job isfj[2]; pthread_t isf_th[2]; int isf_thon[2]; int isf_on, isf_got; double isf_l, isf_frac, isf_auc; inkray *isf_mr[2]; size_t isf_mrc[2]; long isf_nwin; double isf_bms;
+    isf_dev isf; isf_win isfw[2]; isf_job isfj[2]; pthread_t isf_th[2]; int isf_thon[2]; int isf_on, isf_got; double isf_l, isf_frac, isf_auc; inkray *isf_mr[2]; size_t isf_mrc[2]; long isf_nwin; double isf_bms; int isf_teach;
 } gpu_state;
 /* hs_ent layout (doubles): the phase / side pair, rv pair, normal 7, ink, fibre H, V, fibre direction 7, the phase pair's angle error (sum, count) */
 enum { HE_SIDE = 0, HE_RV = 2, HE_NORM = 4, HE_INK = 11, HE_FIBH = 12, HE_FIBV = 13, HE_FDIR = 14, HE_ANG = 21, HE_N = 23 };
@@ -332,6 +332,8 @@ static int g_gc;
 static int g_fstem, g_fs_n, g_fs_ch[32]; static float g_fs_drop = 0.25f;
 static int g_lat_dec;   /* mgpu: config. --lat-dec H: the learned sub-cell decoder (unet_cfg.lat_dec; the streamed head; latgc holds H more rows: its pre rows' gradient) */
 static sampler *g_vs_sp;   /* --vox-cap: the training sampler, for sampler_vox_scale */   /* mgpu: config */
+static int src_surf_only(int si) { return si >= 0 && g_S && si < g_S->n && g_S->src[si].surf_only; }
+static float src_surf_w(int si) { return si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].surf_weight : 1.f; }
 static float src_head_w(int si, int h) { return (si >= 0 && g_S && si < g_S->n ? g_S->src[si].head_w[h] : 1.f) * g_hmul[h] * (g_vs_sp && h != SH_INK && h != SH_FIBRE ? sampler_vox_scale(g_vs_sp, si) : 1.f); }   /* the source's "heads" multiplier x --uw */
 /* --init-from: does an unwrap2 donor keep its rv pair / ink row somewhere other than this net's channels (u1 rv 11-12 -> U2 ink 11, rv
    12-13)? Then the head is mapped by name; same places (a donor that only lacks appended heads, e.g. the fibre head) keep the positional
@@ -1000,7 +1002,7 @@ static void dump_win_(const batch *b, int B, int P) {
 static size_t mil_bytes(void) { const size_t n = (size_t)g_mil_max * ink_mil_samples(g_mil_R, g_mil_step); return 2 * (size_t)g_mil_max * sizeof(inkray) + n * 4 + n * 8 * 48 + (size_t)g_mil_max * 8 + ((size_t)16 << 20); }
 static void *isf_build_th(void *a) {   /* --ink-surf: one window's patch (mil_take) */
     isf_job *J = a; const double t0 = now();
-    J->rc = isf_win_build(J->w, J->src, J->na, g_isf_P, g_isf_step, 2 * g_isf_k + 1, 1.f, J->D, J->H, J->W, J->aug);
+    J->rc = isf_win_build(J->w, J->src, J->na, g_isf_P, g_isf_step, 2 * g_isf_k + 1, 1.f, J->D, J->H, J->W, J->aug, J->soft);
     J->ms = 1e3 * (now() - t0); return nullptr;
 }
 static void isf_join(gpu_state *d, int i) {   /* buffer i's patch build done (a no-op without one in flight) */
@@ -1011,6 +1013,7 @@ static void isf_join(gpu_state *d, int i) {   /* buffer i's patch build done (a 
 static void mil_take(gpu_state *d, const batch *b, int i, int copy_stream) {   /* --ink-mil: buffer i's rays (the batch's host list, copied in stream order) */
     if (!g_mil) return;
     const inkray *src = b->mil && b->nmil && b->mil[0] ? (const inkray *)b->mil[0] : nullptr; int n = src ? (b->nmil[0] < g_mil_max ? b->nmil[0] : g_mil_max) : 0;
+    const int so = src_surf_only(b->src ? b->src[0] : -1);   /* (a "surf_only" source, S3 teacher maps: soft patch labels, no MIL rays) */
     if (g_isf) {   /* --ink-surf: the patch from every ray; the MIL its own rays (mode 1: the faceless ones), evenly thinned to the cap */
         const int na = src ? b->nmil[0] : 0;
         unsigned aug = 0; if (g_isf_aug) { uint64_t h = (g_seed + 0x9E3779B97F4A7C15ull * (uint64_t)++d->isf_nwin) ^ 0xD1B54A32D192ED03ull; h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32; aug = (unsigned)(h & 15); }
@@ -1018,14 +1021,15 @@ static void mil_take(gpu_state *d, const batch *b, int i, int copy_stream) {   /
            prefetch runs beside; isf_join(d, i) waits for it before buffer i's step reads the patch or the next build reuses it (inkperf
            2026-11-21; the same aug bits, drawn here in window order). The synchronous upload path builds in place. */
         isf_join(d, i);
-        isf_job *J = &d->isfj[i]; *J = (isf_job){.w = &d->isfw[i], .src = src, .na = na, .D = g_Pz, .H = d->hs_P, .W = d->hs_P, .aug = aug};
+        isf_job *J = &d->isfj[i]; *J = (isf_job){.w = &d->isfw[i], .src = src, .na = na, .D = g_Pz, .H = d->hs_P, .W = d->hs_P, .aug = aug, .soft = so};
         if (copy_stream && !pthread_create(&d->isf_th[i], nullptr, isf_build_th, J)) d->isf_thon[i] = 1; else isf_build_th(J);
         if (!d->isf_thon[i] && J->rc) { fprintf(stderr, "ink surf: the patch build failed (host memory)\n"); exit(1); }
         if (d->isf_mrc[i] < (size_t)na) { free(d->isf_mr[i]); d->isf_mrc[i] = (size_t)na; d->isf_mr[i] = malloc((size_t)na * sizeof(inkray) + 1); if (!d->isf_mr[i]) { fprintf(stderr, "ink surf: out of host memory\n"); exit(1); } }
-        inkray *mr = d->isf_mr[i]; int m = 0; for (int k = 0; k < na; k++) if (g_mil_mode == 0 || src[k].pad) mr[m++] = src[k];   /* (per buffer: an async copy may still read the other) */
+        inkray *mr = d->isf_mr[i]; int m = 0; for (int k = 0; k < na && !so; k++) if (g_mil_mode == 0 || src[k].pad) mr[m++] = src[k];   /* (per buffer: an async copy may still read the other) */
         if (m > g_mil_max) { for (int k = 0; k < g_mil_max; k++) mr[k] = mr[(size_t)k * m / g_mil_max]; m = g_mil_max; }
         src = mr; n = m;
     }
+    if (so) n = 0;
     /* the copy stream (upload_async) waits for the step that last read buffer i (two back). It used to copy at once, before upload_async's
        waits, and lean modes shared one ray buffer: the next window's rays landed under the current step's backward slabs (try6 P 512
        DP 2026-11-14: "a slab's pairs exceeded its plane bound", and with UFSM_MIL_ASYNC=0 a MIL gradient from the wrong rays, silently) */
@@ -1761,7 +1765,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 nn_loss_stats_acc(LGC(1), d->t + l3 + vb, d->pm + vb, d->w + 1, one, d->hs_ds + 5);
             } else if (!g_single) nn_wind4_stats(LGC(g_w4_ch), LGC(g_w4_ch + 1), w4 + vb, wc + vb, d->sidem, ns, d->w4ds);
             FT("  s wind4 stats");
-            if (g_ink2) { nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth); if (g_ink_air && pap) nn_ink_air(pap + vb, ns, z0 + mil_zoff(d), H, W, g_ink_air, g_ink_smooth, d->inkt, d->inkm); hs_clip(d, pass, d->inkm, z0, z1, hw); nn_loss_stats_acc_e(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, d->hs_ds + 5, d->hs_ent + HE_INK); }
+            if (g_ink2) { nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth); if (g_ink_air && pap) nn_ink_air(pap + vb, ns, z0 + mil_zoff(d), H, W, g_ink_air, g_ink_smooth, d->inkt, d->inkm); hs_clip(d, pass, d->inkm, z0, z1, hw); if (src_surf_only(si)) nn_zero(d->inkm, ns); nn_loss_stats_acc_e(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, d->hs_ds + 5, d->hs_ent + HE_INK); }
             int mz0, mnz; size_t mbo;
             if (nmil && mil_clip(d, 0, z0, nz, hw, &mz0, &mnz, &mbo) && ink_mil_fwd_slab(LGC(g_ink2_ch) + mbo, 0, mz0, mnz, MD, H, W, mrays, nmil, g_mil_R, g_mil_step, d->milacc, nullptr)) { fprintf(stderr, "ink mil: fwd_slab failed\n"); exit(1); }   /* (the logits: fp16) */   /* --ink-head (the recto / ink v1 slots are free) */
             if (mck) { _Float16 *h = malloc(ns * 2); nn_sync(); nn_d2h(h, LGC(g_ink2_ch), ns * 2); for (size_t q = 0; q < ns; q++) mlg[vb + q] = (float)h[q]; free(h); nn_d2h(mink + vb, ink + vb, ns); }   /* (+ the ink target plane the loss reads) */
@@ -1794,6 +1798,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth);
             if (g_ink_air && pap) nn_ink_air(pap + vb, ns, z0 + mil_zoff(d), H, W, g_ink_air, g_ink_smooth, d->inkt, d->inkm);   /* --ink-air: + the air lattice as ink 0 */
             hs_clip(d, pass, d->inkm, z0, z1, hw);
+            if (src_surf_only(si)) nn_zero(d->inkm, ns);   /* (a surf_only source: the teacher pixels train the surface head only; no known ink voxel) */
             const float iw = g_ink_lambda * (si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f) * src_head_w(si, SH_INK);
             nn_loss_grad_only_s(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, g_ink_dice, LGC(g_ink2_ch), d->iscratch, iw);   /* (--ink-dice: + w x the soft dice of the window's known voxels; x iw in the kernel) */
             uint16_t *mgb = mck && nn_get_loss_grad_h16() ? malloc(ns * 2) : nullptr; if (mgb) { nn_sync(); nn_d2h(mgb, LGC(g_ink2_ch), ns * 2); }
@@ -1958,7 +1963,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
             }
         }
         if (isw) {   /* --ink-surf: the patch through the head; training: its gradients and the features' compact gradient (the gradient pass injects it per slab) */
-            const float iw = g_isf_lambda * (si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f) * src_head_w(si, SH_INK);
+            const float iw = g_isf_lambda * (src_surf_only(si) ? 1.f : si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f) * src_surf_w(si) * src_head_w(si, SH_INK);
+            d->isf_teach = src_surf_only(si);
             const float gs = d->hs_train && nn_get_loss_grad_h16() ? nn_get_grad_scale() : 1.f;
             const int tr = d->hs_train && nn_get_loss_grad_h16() && iw > 0;
             if (tr) isfhead_zero_grad(d->isf.h);
@@ -5552,7 +5558,7 @@ int cmd_train(int argc, char **argv) {
     double acc_siden = 0, acc_normn = 0, acc_w4n = 0;   /* windows that carry side / phase, normal, wind4 labels (their loss > 0): the logged means are over them, as ink / fib */
     double acc_fh[2] = {0}, acc_fhn = 0;   /* --fib-head: mask / direction bce sums, windows with known fibre labels */
     double acc_kl[8] = {0}, acc_kln[8] = {0};   /* head slabs: the KL (bce - the targets' entropy) of phase / side, rv, normal, wind4, ink, fibre, fibre direction; [7] the phase angle error */
-    double *viks = nullptr; double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0, acc_isf = 0, acc_isfn = 0, acc_isfa = 0, acc_isfan = 0, acc_isff = 0, acc_isfw = 0, acc_isfb = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
+    double *viks = nullptr; double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0, acc_isf = 0, acc_isfn = 0, acc_isfa = 0, acc_isfan = 0, acc_isff = 0, acc_isfw = 0, acc_isfb = 0, acc_isft = 0, acc_isftn = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
     train_unread_flags(argc, argv);
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
         if (step == step0 + 2 && g_tl_on) { tl_mark("first step"); tl_summary(); }   /* (the first batch's wait + the first step: the kernels' JIT) */
@@ -5960,7 +5966,8 @@ int cmd_train(int argc, char **argv) {
         if (step_ok) {
         if (g_unwrap) { acc_ink += G[0].iout[0]; if (G[0].norm_raw > 0) { acc_norm += G[0].norm_raw; acc_normn += 1; } }   /* (labels present: the unweighted loss, also under --norm-lambda 0) */
         if (g_mil && G[0].mil_n) { acc_mil += G[0].mil_raw; acc_miln += 1; acc_milr += G[0].mil_n; }
-        if (G[0].isf_on) { acc_isfw += 1; acc_isff += G[0].isf_frac; acc_isfb += G[0].isf_bms; if (G[0].isf_l >= 0) { acc_isf += G[0].isf_l; acc_isfn += 1; } if (G[0].isf_auc >= 0) { acc_isfa += G[0].isf_auc; acc_isfan += 1; } G[0].isf_l = G[0].isf_auc = -1; G[0].isf_frac = 0; }
+        if (G[0].isf_on) { acc_isfw += 1; acc_isff += G[0].isf_frac; acc_isfb += G[0].isf_bms; if (G[0].isf_l >= 0 && G[0].isf_teach) { acc_isft += G[0].isf_l; acc_isftn += 1; }   /* (S3: the teacher windows' BCE apart from the human ones') */
+            else { if (G[0].isf_l >= 0) { acc_isf += G[0].isf_l; acc_isfn += 1; } if (G[0].isf_auc >= 0) { acc_isfa += G[0].isf_auc; acc_isfan += 1; } } G[0].isf_l = G[0].isf_auc = -1; G[0].isf_frac = 0; }
         if (g_fibh && (G[0].fhout[0][2] > 0 || G[0].fhout[1][2] > 0)) { acc_fh[0] += G[0].fib_raw[0]; acc_fh[1] += G[0].fib_raw[1]; acc_fhn += 1; }
         if (g_fibdir > 0) acc_norm += G[0].norm_raw;
         if (g_fibn && G[0].fib_h[0] > 0) { acc_fib += G[0].fib_h[1] / G[0].fib_h[0]; acc_fibv += G[0].fib_h[0]; acc_fibn += 1; }
@@ -6201,7 +6208,8 @@ int cmd_train(int argc, char **argv) {
             if (g_isf) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink surf %.4f auc %.3f (%.0f%% of windows, patch %.0f%% unmasked, build %.0f ms)", acc_isfn > 0 ? acc_isf / acc_isfn : 0.0,
                                                           acc_isfan > 0 ? acc_isfa / acc_isfan : 0.0, acc_isfw > 0 ? 100.0 * acc_isfn / acc_isfw : 0.0, acc_isfw > 0 ? 100.0 * acc_isff / acc_isfw : 0.0,
                                                           acc_isfw > 0 ? acc_isfb / acc_isfw : 0.0);
-                         acc_isf = acc_isfn = acc_isfa = acc_isfan = acc_isff = acc_isfw = acc_isfb = 0; }
+                         if (acc_isftn > 0) { size_t nb = strlen(affs); snprintf(affs + nb, sizeof affs - nb, " teach %.4f (%.0f%% of windows)", acc_isft / acc_isftn, acc_isfw > 0 ? 100.0 * acc_isftn / acc_isfw : 0.0); }
+                         acc_isf = acc_isfn = acc_isfa = acc_isfan = acc_isff = acc_isfw = acc_isfb = acc_isft = acc_isftn = 0; }
             if (g_fibh) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " fib bce %.4f dir %.4f (%.0f%% of windows)", acc_fhn > 0 ? acc_fh[0] / acc_fhn : 0.0, acc_fhn > 0 ? acc_fh[1] / acc_fhn : 0.0, 100.0 * acc_fhn / nok); }
             {   /* the KLs beside the bces (audit 2026-11-14: a soft-target bce carries its targets' entropy, ~0.39 for a cos / sin pair, ~0.47
                    for n n^T), over the same windows; the phase pair's mean angle error */
