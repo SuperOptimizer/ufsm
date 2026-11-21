@@ -9,6 +9,13 @@ import pathlib
 import subprocess
 import tempfile
 
+import importlib.util
+import sys
+
+if importlib.util.find_spec("zarr") is None:   # the reference scripts/inkgt/wrapscore.py reads zarr (laptop suite 11-21 had none)
+    print("SKIP: no python zarr module (the reference wrapscore.py needs it)")
+    sys.exit(0)
+
 import numpy as np
 import tifffile as t
 
@@ -82,6 +89,15 @@ with tempfile.TemporaryDirectory(prefix="ufsm-wrapscore-") as tmp:
     assert "table:" in o2 and (d / "out.heldout.tsv").read_text() == first, o2
     o3 = run(*common, "--split", "heldout", "--table", d / "tab.uws", "--need", "w001", "--tiles-out", d / "tiles").stdout
     assert (d / "tiles/tiles0.txt").read_text().strip() and (d / "tiles/tiles256.txt").read_text().strip(), o3
+    # --tiles-sub 2: level-1 tiles; every one inside the 2^3 children of a coarse tile (the samples sit well inside the toy volume's tiles)
+    o4 = run(*common, "--split", "heldout", "--table", d / "tab.uws", "--need", "w001", "--tiles-out", d / "tiles2", "--tiles-sub", "2").stdout
+    rd = lambda p: {tuple(int(v) for v in l.split()) for l in p.read_text().split("\n") if l.strip()}
+    for g in ("0", "256"):
+        t1, t2 = rd(d / f"tiles/tiles{g}.txt"), rd(d / f"tiles2/tiles{g}.txt")
+        assert t2 and len(t2) <= 8 * len(t1), (g, t1, t2, o4)
+        if g == "0": assert all(tuple(c // 2 for c in t) in t1 for t in t2), (t1, t2)
+    r = run(*common, "--split", "heldout", "--table", d / "tab.uws", "--need", "w001", "--tiles-out", d / "tiles3", "--tiles-sub", "3", ok=False)
+    assert r.returncode == 2, r.stdout
     # hard failures: no tsv written
     (d / "out.heldout.tsv").unlink()
     for extra in (["--maps", f"A={d / 'nodir'}"], ["--maps", f"A={d / 'mA'}", "--need", "w001,w002"]):

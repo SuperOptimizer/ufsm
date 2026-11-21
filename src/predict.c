@@ -2840,7 +2840,7 @@ static int predict_one(int argc, char **argv) {
         free(shs);
     }
     /* --surf W1,W2,..: the surface ink head (train --ink-surf) on these unrolled wraps: the windows reduced to those holding a patch */
-    static surfp *SF; static char sf_out[1200];
+    static surfp *SF; static char sf_out[1200];   /* mgpu: main (predict --surf: one GPU, refused with --gpus > 1 / --split) */
     {   const char *sw = opt(argc, argv, "--surf", nullptr);
         if (sw) {
             const char *sout = opt(argc, argv, "--surf-out", nullptr); char ip[1500]; snprintf(ip, sizeof ip, "%s.isf", ckpt);
