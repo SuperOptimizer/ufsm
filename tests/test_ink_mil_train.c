@@ -249,14 +249,15 @@ int main(int argc, char **argv) {
         CHECK(!sh("for x in sb0 sb1; do grep -E '^(t\\+[0-9.]+s )?step ' %s/$x.log | sed -E 's/^t\\+[0-9.]+s //; s/ ink surf [^(]*\\([^)]*\\)//; s/ [0-9.]+ samp\\/s.*//; s/ (wait|gn) [0-9.%%]+//g' > %s/$x.txt; done; cmp -s %s/sb0.txt %s/sb1.txt", d, d, d, d),
               "the step losses differ with --ink-surf at lr 0 (%s/sb0.txt, sb1.txt)", d);
         /* (S3, 2026-11-21) a "surf_only" source (teacher maps): soft patch labels, its BCE logged apart (" teach "), no voxel ink and no MIL
-           ray from it; a depth-5 head from the depth-4 sf head (--isf-init, 12 of 15 convs) */
+           ray from it; a depth-5 head from the depth-4 sf head (--isf-init, 12 of 15 convs); --isf-pvox 2: the fixture's label px is one
+           window voxel, so every 2nd label px (" step 2.0") */
         {   char sp[700]; snprintf(sp, sizeof sp, "%s/fx/sources-teach.json", d); FILE *tf = fopen(sp, "w");
             if (tf) { fprintf(tf, "{\"sources\": [{\"name\": \"wind-fixture-teach\", \"root\": \"%s/fx\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/fx/axis.json\", \"weight\": 1, \"surf_only\": 1, \"surf_weight\": 0.5, \"iso\": 100,\n"
                               "  \"targets\": {\"ink\": {\"onfly\": {\"segments\": \"%s/fx/segs.json\", \"level\": 0, \"cache_dir\": \"%s/dcache_t\"}},\n"
                               "               \"band\": {\"root\": \"%s/fx/band\", \"key\": \"1\", \"radius\": 80, \"span\": 75, \"phase\": {\"root\": \"%s/fx/phase0\", \"key\": \"0\", \"level\": 0}}}}]}\n", d, d, d, d, d, d); fclose(tf); }
-            CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s --out %s/st --steps 4 --ink-mil 1 --ink-mil-mode 1 --ink-surf 1 --isf-P 32 --isf-step 2 --isf-k 2 --isf-depth 5 --isf-init %s/sf/last.ckpt.isf %s > %s/st.log 2>&1",
+            CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s --out %s/st --steps 4 --ink-mil 1 --ink-mil-mode 1 --ink-surf 1 --isf-P 32 --isf-step 2 --isf-k 2 --isf-depth 5 --isf-pvox 2 --isf-init %s/sf/last.ckpt.isf %s > %s/st.log 2>&1",
                       U, sp, d, d, common, d), "train with a surf_only source (%s/st.log)", d);
-            CHECK(!sh("grep -q 'ink surf: head from --isf-init .*(depth 4 -> 5: 12 of 15 convs taken' %s/st.log && grep -Eq '^step .* teach [0-9.]+ \\(100%% of windows\\)' %s/st.log "
+            CHECK(!sh("grep -q 'ink surf: head from --isf-init .*(depth 4 -> 5: 12 of 15 convs taken' %s/st.log && grep -Eq '^step .* step 2.0 teach [0-9.]+ \\(100%% of windows\\)' %s/st.log "
                       "&& grep -Eq '^step .* ink bce 0.0000 \\(0%% of windows\\)' %s/st.log && grep -Eq '^step .* ink mil 0.0000 \\(0%% of windows, 0 rays\\)' %s/st.log", d, d, d, d),
                   "surf_only source: --isf-init mapping, teach BCE on every window, no voxel ink / MIL (%s/st.log)", d);
         }

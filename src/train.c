@@ -186,7 +186,7 @@ typedef struct {
     double *hs_ent, ent_h[32]; float kl_side, kl_rv, kl_norm, kl_w4, kl_ink, kl_fib[2], ang_side; unsigned long long *hsz; long hsz_pass;
     /* --ink-surf: the surface head (device), each buffer's patch (host: built from its rays at mil_take), this window's loss / unmasked fraction /
        patch AUC for the log (isf_got: the window had labelled patch pixels), the MIL's own ray subset per buffer */
-    isf_dev isf; isf_win isfw[2]; isf_job isfj[2]; pthread_t isf_th[2]; int isf_thon[2]; int isf_on, isf_got; double isf_l, isf_frac, isf_auc; inkray *isf_mr[2]; size_t isf_mrc[2]; long isf_nwin; double isf_bms; int isf_teach;
+    isf_dev isf; isf_win isfw[2]; isf_job isfj[2]; pthread_t isf_th[2]; int isf_thon[2]; int isf_on, isf_got; double isf_l, isf_frac, isf_auc; inkray *isf_mr[2]; size_t isf_mrc[2]; long isf_nwin; double isf_bms, isf_stp; int isf_teach;
 } gpu_state;
 /* hs_ent layout (doubles): the phase / side pair, rv pair, normal 7, ink, fibre H, V, fibre direction 7, the phase pair's angle error (sum, count) */
 enum { HE_SIDE = 0, HE_RV = 2, HE_NORM = 4, HE_INK = 11, HE_FIBH = 12, HE_FIBV = 13, HE_FDIR = 14, HE_ANG = 21, HE_N = 23 };
@@ -353,7 +353,7 @@ static size_t g_mil_reserve;   /* mgpu: config (set by the planner before the GP
    U-Net, BCE on the rays' labels x L; its AdamW at --isf-lr x the schedule; RUN/<ckpt>.isf beside every checkpoint. --isf-aug 1: each window's patch in
    one of the 8 orientations and the normal reversed half the time (unrolled wraps have any orientation / sign: predict --surf) */
 static uint64_t g_seed;   /* --seed (mgpu: config) */
-static int g_isf, g_isf_P = 256, g_isf_step = 4, g_isf_k = 4, g_isf_aug = 1, g_isf_depth = 4; static const char *g_isf_init; static float g_isf_lambda, g_isf_lr = 1e-3f, g_isf_wd = 0.f;
+static int g_isf, g_isf_P = 256, g_isf_step = 4, g_isf_k = 4, g_isf_aug = 1, g_isf_depth = 4; static const char *g_isf_init; static float g_isf_pvox = 0.f; static float g_isf_lambda, g_isf_lr = 1e-3f, g_isf_wd = 0.f;
 static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static float g_mil_r_um = 0.f, g_mil_R = 10.f, g_mil_step = 1.f, g_mil_tau = 0.f, g_mil_lambda = 1.f;   /* --ink-mil L
    (--ink-head): the normal-pooled MIL ink loss on each window's rays (inkmil.h): per supervised label pixel (mode 1: only those without an open face, the
    voxel target's unknowns), BCE of the pooled ink logit along the normal over +-R window voxels at step (tau 0: max; > 0: tau log mean exp), the mean
@@ -1002,7 +1002,7 @@ static void dump_win_(const batch *b, int B, int P) {
 static size_t mil_bytes(void) { const size_t n = (size_t)g_mil_max * ink_mil_samples(g_mil_R, g_mil_step); return 2 * (size_t)g_mil_max * sizeof(inkray) + n * 4 + n * 8 * 48 + (size_t)g_mil_max * 8 + ((size_t)16 << 20); }
 static void *isf_build_th(void *a) {   /* --ink-surf: one window's patch (mil_take) */
     isf_job *J = a; const double t0 = now();
-    J->rc = isf_win_build(J->w, J->src, J->na, g_isf_P, g_isf_step, 2 * g_isf_k + 1, 1.f, J->D, J->H, J->W, J->aug, J->soft);
+    J->rc = isf_win_build(J->w, J->src, J->na, g_isf_P, g_isf_step, 2 * g_isf_k + 1, 1.f, J->D, J->H, J->W, J->aug, J->soft, g_isf_pvox);
     J->ms = 1e3 * (now() - t0); return nullptr;
 }
 static void isf_join(gpu_state *d, int i) {   /* buffer i's patch build done (a no-op without one in flight) */
@@ -1969,7 +1969,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             const int tr = d->hs_train && nn_get_loss_grad_h16() && iw > 0;
             if (tr) isfhead_zero_grad(d->isf.h);
             const double l = isf_dev_step(&d->isf, isw, iw, tr, gs, tr && d->hgs_on ? d->hgsd : nullptr, &d->isf_auc);
-            d->isf_got = l >= 0 && tr; d->isf_l = l; d->isf_frac = isw->frac;
+            d->isf_got = l >= 0 && tr; d->isf_l = l; d->isf_frac = isw->frac; d->isf_stp = isw->step;
         }
         nn_ent_fin(d->hs_ent, HE_N);
     } else if (fuse && light) {   /* the logged losses: the same finalisation with the gradient pass's sums (the mask sums and the active count are unchanged) */
@@ -3086,7 +3086,8 @@ int cmd_train(int argc, char **argv) {
             g_mil_R = (float)atof(opt(argc,argv,"--ink-mil-r","10")); g_mil_r_um = (float)atof(opt(argc,argv,"--ink-mil-r-um","0"));   /* (0: R in window voxels as before; > 0: the reach in um, the K samples spanning it at every rung) */ g_mil_step = (float)atof(opt(argc,argv,"--ink-mil-step","1")); g_mil_tau = (float)atof(opt(argc,argv,"--ink-mil-tau","0"));
             g_isf_lambda = (float)atof(opt(argc,argv,"--ink-surf","0")); g_isf = g_isf_lambda > 0; g_isf_P = atoi(opt(argc,argv,"--isf-P","256")); g_isf_step = atoi(opt(argc,argv,"--isf-step","4"));
             g_isf_k = atoi(opt(argc,argv,"--isf-k","4")); g_isf_lr = (float)atof(opt(argc,argv,"--isf-lr","1e-3")); g_isf_wd = (float)atof(opt(argc,argv,"--isf-wd","0")); g_isf_aug = atoi(opt(argc,argv,"--isf-aug","1"));
-            g_isf_depth = atoi(opt(argc,argv,"--isf-depth","4")); g_isf_init = opt(argc,argv,"--isf-init",nullptr);   /* (S3: --isf-depth 5, the head's pools; --isf-init H.isf: the head from H when not resuming, another depth by matching convs) */
+            g_isf_depth = atoi(opt(argc,argv,"--isf-depth","4")); g_isf_pvox = (float)atof(opt(argc,argv,"--isf-pvox","0"));   /* (--isf-pvox V: the patch px = V window voxels, the label step per window from its rays; 0: every --isf-step-th label px) */
+            g_isf_init = opt(argc,argv,"--isf-init",nullptr);   /* (S3: --isf-depth 5, the head's pools; --isf-init H.isf: the head from H when not resuming, another depth by matching convs) */
             g_mil_mode = atoi(opt(argc,argv,"--ink-mil-mode","1")); g_mil_stride = atoi(opt(argc,argv,"--ink-mil-stride","2")); g_mil_max = atoi(opt(argc,argv,"--ink-mil-max","65536")); if (ink_mil_set_max) ink_mil_set_max(g_mil_max);
             if (!(g_mil_lambda >= 0) || (g_mil && (!ink_mil_fwd_slab || !(g_mil_R > 0) || !(g_mil_step > 0) || !(g_mil_tau >= 0) || ink_mil_samples(g_mil_R, g_mil_step) > 256 || g_mil_mode < 0 || g_mil_mode > 1 || g_mil_stride < 1 || g_mil_max < 1))) {
                 fprintf(stderr, "--ink-mil L >= 0 (needs nn_inkmil in the binary), --ink-mil-r R > 0, --ink-mil-step > 0 (2R / step + 1 <= 256 samples), --ink-mil-tau >= 0, --ink-mil-mode 0|1, --ink-mil-stride >= 1, --ink-mil-max >= 1\n"); return 2; }   /* --ink-head 1: the ink logit as output channel 11 (the universal model) */
@@ -5008,6 +5009,7 @@ int cmd_train(int argc, char **argv) {
                     else fprintf(stderr, "DEFAULTED: ink surf: %s has no surface head (%s): a fresh head\n", resume, ip); }
                 else if (g_isf_init) { int nm = 0, fdp = 0; if (isf_peek(g_isf_init, nullptr, &fdp, nullptr) || isf_load_x(&d->isf, g_isf_init, &st, &nm)) { fprintf(stderr, "ink surf: cannot load --isf-init %s (its trunk channels x layers must be %d x %d)\n", g_isf_init, C0, 2 * g_isf_k + 1); exit(1); }
                     fprintf(stderr, "ink surf: head from --isf-init %s (depth %d -> %d: %d of %d convs taken%s)\n", g_isf_init, fdp, g_isf_depth, nm, isfhead_nconv(d->isf.h), nm < isfhead_nconv(d->isf.h) ? ", the rest fresh" : ""); }
+                if (g_isf_pvox > 0) fprintf(stderr, "ink surf: the patch px = %g window voxels (the label step per window from its rays; predict --surf-pvox %g)\n", g_isf_pvox, g_isf_pvox);
                 fprintf(stderr, "ink surf: patch %d px every %d label px (%d layers, %d trunk channels), head depth %d, %.1f MB + %.1f MB patch, lambda %g, lr %g\n", g_isf_P, g_isf_step, 2 * g_isf_k + 1, C0, g_isf_depth,
                         isfhead_bytes(d->isf.h) / 1e6, (double)C0 * (2 * g_isf_k + 1) * g_isf_P * g_isf_P * 4 / 1e6, g_isf_lambda, g_isf_lr);
             }
@@ -5558,7 +5560,7 @@ int cmd_train(int argc, char **argv) {
     double acc_siden = 0, acc_normn = 0, acc_w4n = 0;   /* windows that carry side / phase, normal, wind4 labels (their loss > 0): the logged means are over them, as ink / fib */
     double acc_fh[2] = {0}, acc_fhn = 0;   /* --fib-head: mask / direction bce sums, windows with known fibre labels */
     double acc_kl[8] = {0}, acc_kln[8] = {0};   /* head slabs: the KL (bce - the targets' entropy) of phase / side, rv, normal, wind4, ink, fibre, fibre direction; [7] the phase angle error */
-    double *viks = nullptr; double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0, acc_isf = 0, acc_isfn = 0, acc_isfa = 0, acc_isfan = 0, acc_isff = 0, acc_isfw = 0, acc_isfb = 0, acc_isft = 0, acc_isftn = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
+    double *viks = nullptr; double acc_inkn = 0, vik[2] = {0}, acc_mil = 0, acc_miln = 0, acc_milr = 0, acc_isf = 0, acc_isfn = 0, acc_isfa = 0, acc_isfan = 0, acc_isff = 0, acc_isfw = 0, acc_isfb = 0, acc_isft = 0, acc_isftn = 0, acc_isfs = 0;   /* --ink-mil: raw mean BCE sum / windows with rays / rays */   /* --ink-head: training windows with known ink in the log interval; validation ink bce sum / windows */
     train_unread_flags(argc, argv);
     for (int step = step0 + 1; step <= steps && !g_stop; step++) {
         if (step == step0 + 2 && g_tl_on) { tl_mark("first step"); tl_summary(); }   /* (the first batch's wait + the first step: the kernels' JIT) */
@@ -5966,7 +5968,7 @@ int cmd_train(int argc, char **argv) {
         if (step_ok) {
         if (g_unwrap) { acc_ink += G[0].iout[0]; if (G[0].norm_raw > 0) { acc_norm += G[0].norm_raw; acc_normn += 1; } }   /* (labels present: the unweighted loss, also under --norm-lambda 0) */
         if (g_mil && G[0].mil_n) { acc_mil += G[0].mil_raw; acc_miln += 1; acc_milr += G[0].mil_n; }
-        if (G[0].isf_on) { acc_isfw += 1; acc_isff += G[0].isf_frac; acc_isfb += G[0].isf_bms; if (G[0].isf_l >= 0 && G[0].isf_teach) { acc_isft += G[0].isf_l; acc_isftn += 1; }   /* (S3: the teacher windows' BCE apart from the human ones') */
+        if (G[0].isf_on) { acc_isfw += 1; acc_isff += G[0].isf_frac; acc_isfb += G[0].isf_bms; acc_isfs += G[0].isf_stp; if (G[0].isf_l >= 0 && G[0].isf_teach) { acc_isft += G[0].isf_l; acc_isftn += 1; }   /* (S3: the teacher windows' BCE apart from the human ones') */
             else { if (G[0].isf_l >= 0) { acc_isf += G[0].isf_l; acc_isfn += 1; } if (G[0].isf_auc >= 0) { acc_isfa += G[0].isf_auc; acc_isfan += 1; } } G[0].isf_l = G[0].isf_auc = -1; G[0].isf_frac = 0; }
         if (g_fibh && (G[0].fhout[0][2] > 0 || G[0].fhout[1][2] > 0)) { acc_fh[0] += G[0].fib_raw[0]; acc_fh[1] += G[0].fib_raw[1]; acc_fhn += 1; }
         if (g_fibdir > 0) acc_norm += G[0].norm_raw;
@@ -6208,8 +6210,9 @@ int cmd_train(int argc, char **argv) {
             if (g_isf) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink surf %.4f auc %.3f (%.0f%% of windows, patch %.0f%% unmasked, build %.0f ms)", acc_isfn > 0 ? acc_isf / acc_isfn : 0.0,
                                                           acc_isfan > 0 ? acc_isfa / acc_isfan : 0.0, acc_isfw > 0 ? 100.0 * acc_isfn / acc_isfw : 0.0, acc_isfw > 0 ? 100.0 * acc_isff / acc_isfw : 0.0,
                                                           acc_isfw > 0 ? acc_isfb / acc_isfw : 0.0);
+                         if (g_isf_pvox > 0 && acc_isfw > 0) { size_t nb = strlen(affs); snprintf(affs + nb, sizeof affs - nb, " step %.1f", acc_isfs / acc_isfw); }
                          if (acc_isftn > 0) { size_t nb = strlen(affs); snprintf(affs + nb, sizeof affs - nb, " teach %.4f (%.0f%% of windows)", acc_isft / acc_isftn, acc_isfw > 0 ? 100.0 * acc_isftn / acc_isfw : 0.0); }
-                         acc_isf = acc_isfn = acc_isfa = acc_isfan = acc_isff = acc_isfw = acc_isfb = acc_isft = acc_isftn = 0; }
+                         acc_isf = acc_isfn = acc_isfa = acc_isfan = acc_isff = acc_isfw = acc_isfb = acc_isft = acc_isftn = acc_isfs = 0; }
             if (g_fibh) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " fib bce %.4f dir %.4f (%.0f%% of windows)", acc_fhn > 0 ? acc_fh[0] / acc_fhn : 0.0, acc_fhn > 0 ? acc_fh[1] / acc_fhn : 0.0, 100.0 * acc_fhn / nok); }
             {   /* the KLs beside the bces (audit 2026-11-14: a soft-target bce carries its targets' entropy, ~0.39 for a cos / sin pair, ~0.47
                    for n n^T), over the same windows; the phase pair's mean angle error */

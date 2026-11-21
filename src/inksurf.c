@@ -199,18 +199,30 @@ static int lists_fwd(const isf_lists *L, size_t ns, int **fidx, float **fw, size
     }
     return 0;
 }
-int isf_win_build(isf_win *w, const inkray *r, int nr, int Hp, int step, int K, float kstep, int D, int H, int W, unsigned aug, int soft) {   /* soft: y / 255 (teacher rays), else y != 0 */
+int isf_win_build(isf_win *w, const inkray *r, int nr, int Hp, int step, int K, float kstep, int D, int H, int W, unsigned aug, int soft, float pvox) {   /* soft: y / 255 (teacher rays), else y != 0 */
     const size_t n = (size_t)Hp * Hp;
     if (w->cap < n) { free(w->pn); free(w->lab); free(w->wt); w->pn = malloc(n * 6 * 4); w->lab = malloc(n * 4); w->wt = malloc(n * 4); w->cap = n; if (!w->pn || !w->lab || !w->wt) { w->cap = 0; return -1; } }
-    w->Hp = Hp; w->K = K; w->kstep = kstep; w->np = 0; w->frac = 0; w->unit = -1; w->nouv = 0;
+    w->Hp = Hp; w->K = K; w->kstep = kstep; w->np = 0; w->frac = 0; w->unit = -1; w->nouv = 0; w->step = step; w->dvox = 0;
     isf_lists_free(&w->L);
     /* the centre: the on-grid ray nearest the window's centre (one pass of one segment: a unit's other wraps through the window lie far away on
        its label grid, outside the patch) */
     int best = -1; double bd = 1e300; const double cz = 0.5 * (D - 1), cy = 0.5 * (H - 1), cx = 0.5 * (W - 1);
-    for (int k = 0; k < nr; k++) { if (r[k].lr < 0) { w->nouv++; continue; } if (r[k].lr % step || r[k].lc % step) continue;
+    for (int k = 0; k < nr; k++) { if (r[k].lr < 0) { w->nouv++; continue; } if (!(pvox > 0) && (r[k].lr % step || r[k].lc % step)) continue;
         const double dd = (r[k].p[0] - cz) * (r[k].p[0] - cz) + (r[k].p[1] - cy) * (r[k].p[1] - cy) + (r[k].p[2] - cx) * (r[k].p[2] - cx); if (dd < bd) { bd = dd; best = k; } }
     for (size_t p = 0; p < n; p++) { float *q = w->pn + 6 * p; q[0] = q[1] = q[2] = -1e6f; q[3] = 1; q[4] = q[5] = 0; w->lab[p] = 0; w->wt[p] = 0; }
     if (best < 0) return 0;
+    if (pvox > 0) {   /* (2026-11-21) the physical patch: the rays' grid g (label px) and spacing d (window voxels per label px) next to the centre ray, the
+                         step the multiple of g nearest pvox / d (S1 / S2 took every 2nd 2.4 um px: 0.5 window voxel, predict sampled 1) */
+        int g = 0; double d = 0;
+        for (int pass = 0; pass < 2 && !g; pass++) for (int k = 0; k < nr; k++) {
+            if (r[k].unit != r[best].unit || r[k].lr < 0 || k == best) continue;
+            const int dl = pass ? r[k].lr - r[best].lr : r[k].lc - r[best].lc, same = pass ? r[k].lc == r[best].lc : r[k].lr == r[best].lr;
+            if (!same || !dl || (g && abs(dl) >= g)) continue;
+            double s2 = 0; for (int q = 0; q < 3; q++) s2 += ((double)r[k].p[q] - r[best].p[q]) * ((double)r[k].p[q] - r[best].p[q]);
+            g = abs(dl); d = sqrt(s2) / g; }
+        if (!g || !(d > 1e-6)) return 0;
+        const int m = (int)lround(pvox / d / g); step = (m > 1 ? m : 1) * g; w->step = step; w->dvox = (float)d;
+    }
     const int gr = r[best].lr - Hp / 2 * step, gc = r[best].lc - Hp / 2 * step; best = r[best].unit;
     const float ext = 0.5f * (K - 1) * kstep;
     for (int k = 0; k < nr; k++) {
