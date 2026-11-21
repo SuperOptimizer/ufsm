@@ -1007,6 +1007,8 @@ static void isf_resolve(gpu_state *d) {   /* --ink-surf: the launched head step'
     if (!d->isf_on || !d->isf.pend) return;
     const double l = isf_dev_result(&d->isf, &d->isfw[d->isf_cur], &d->isf_auc);
     d->isf_got = l >= 0 && d->isf_tr; d->isf_l = l;
+    static int dbg = -1; if (dbg < 0) dbg = ufsm_env_on("UFSM_ISF_DBG");
+    if (dbg) fprintf(stderr, "isfdbg resolve cur %d got %d l %.9g auc %.9g\n", d->isf_cur, d->isf_got, l, d->isf_auc);
 }
 static void isf_join(gpu_state *d, int i) {   /* buffer i's patch build done (a no-op without one in flight) */
     if (!d->isf_thon[i]) return;
@@ -1970,6 +1972,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (tr) isfhead_zero_grad(d->isf.h);
             isf_resolve(d); d->isf_cur = d->cur; isf_dev_launch(&d->isf, isw, iw, tr, gs, tr && d->hgs_on ? d->hgsd : nullptr);   /* (no wait: isf_resolve reads the loss where isf_got is needed) */
             d->isf_tr = tr; d->isf_got = 0; d->isf_l = d->isf_auc = -1; d->isf_frac = isw->frac;
+            static int isync = -1; if (isync < 0) isync = ufsm_env_on("UFSM_ISF_SYNC");
+            if (isync) isf_resolve(d);
         }
         nn_ent_fin(d->hs_ent, HE_N);
     } else if (fuse && light) {   /* the logged losses: the same finalisation with the gradient pass's sums (the mask sums and the active count are unchanged) */
