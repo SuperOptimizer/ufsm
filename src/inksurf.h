@@ -55,10 +55,12 @@ void isf_lists_free(isf_lists *L);
 /* the 2-D head: stem 1x1 (Cin -> 32), a 4-down U-Net (32 48 64 96, bottleneck 2 x 96, decoder 64 48 32 32), 1x1 -> 1 logit; SiLU; plus a
    linear readout (1x1 from the patch to the logit, summed) */
 typedef struct isfhead isfhead;
-isfhead *isfhead_create(int cin, int Hp, int Wp, uint64_t seed);   /* Hp, Wp multiples of 16 */
+isfhead *isfhead_create(int cin, int Hp, int Wp, uint64_t seed);   /* Hp, Wp multiples of 16; depth 4 */
+isfhead *isfhead_create_d(int cin, int Hp, int Wp, int depth, uint64_t seed);   /* depth 1 .. 6 pools (S3: 5); Hp, Wp multiples of 16 and 2^depth */
+int isfhead_depth(const isfhead *h);
 void isfhead_free(isfhead *h);
 size_t isfhead_nparams(const isfhead *h);
-int isfhead_nconv(void);
+int isfhead_nconv(const isfhead *h);
 size_t isfhead_conv_span(const isfhead *h, int i, size_t *n);   /* conv i's weights + bias: offset, count */
 float *isfhead_params(isfhead *h);   /* device */
 float *isfhead_grads(isfhead *h);
@@ -75,8 +77,8 @@ float *isfhead_moments(isfhead *h, int k);   /* Adam m (0) / v (1), device */
 #include "unet.h"
 /* one window's patch (host): Hp x Hp px on the label grid every step-th row / col of the unit with the most rays, pn [n][6] window level
    voxels (far outside: no ray / masked), lab, wt (1 labelled, 0 not), the inverse lists + forward table of the K-layer resample */
-typedef struct { int Hp, K, np, unit, nouv; float kstep; double frac; float *pn, *lab, *wt; size_t cap; isf_lists L; int *fidx; float *fw; size_t fcap; } isf_win;
-int isf_win_build(isf_win *w, const inkray *r, int nr, int Hp, int step, int K, float kstep, int D, int H, int W, unsigned aug);   /* aug: 1 transpose, 2 / 4 flip rows / cols,
+typedef struct { int Hp, K, np, unit, nouv, step; float kstep, dvox; double frac; float *pn, *lab, *wt; size_t cap; isf_lists L; int *fidx; float *fw; size_t fcap; } isf_win;
+int isf_win_build(isf_win *w, const inkray *r, int nr, int Hp, int step, int K, float kstep, int D, int H, int W, unsigned aug, int soft, float pvox);   /* pvox > 0: the patch px = pvox window voxels (the label-px step from the rays' spacing; w->step, w->dvox), else every step-th label px */   /* aug: 1 transpose, 2 / 4 flip rows / cols,
                                                                                                                                    8 reverse the normal (train --isf-aug) */
 void isf_win_free(isf_win *w);
 int isf_win_alloc(isf_win *w, int Hp, int K, float kstep);   /* pn / lab / wt for Hp x Hp (the caller fills them, sets np) */
@@ -85,6 +87,8 @@ int isf_win_lists(isf_win *w, int D, int H, int W);           /* the lists + for
 typedef struct { isfhead *h; int C, Hp, K, nv; float *patch, *lab, *wt, *glog, *zh; int *vox, *off, *ent, *fidx; float *ew, *fw, *fc, *gc; void *feat, *rows;
                  size_t c_vox, c_off, c_ent, c_ew, c_fidx, c_fw, c_fc, c_gc, c_feat, c_rows; } isf_dev;
 int isf_dev_init(isf_dev *g, int C, int Hp, int K, uint64_t seed);
+int isf_dev_init_d(isf_dev *g, int C, int Hp, int K, int depth, uint64_t seed);
+size_t isf_reserve_bytes(int C, int Hp, int K, int depth, int D, int H, int W);   /* the planner's reservation for train --ink-surf */
 void isf_dev_free(isf_dev *g);
 size_t isf_dev_bytes(const isf_dev *g);
 int isf_dev_upload(isf_dev *g, const isf_win *w);                                   /* the window's lists and labels (synchronous) */
@@ -95,6 +99,8 @@ double isf_dev_step(isf_dev *g, const isf_win *w, float lambda, int train, float
 int isf_dev_put(isf_dev *g, unet *u, const isf_win *w, int z0, int z1, size_t hw);   /* per gradient-pass slab: sets the unet's feature-gradient rows */
 int isf_save(const isf_dev *g, const char *path, int step);
 int isf_load(isf_dev *g, const char *path, int *step);
+int isf_load_x(isf_dev *g, const char *path, int *step, int *mapped);   /* another depth: the matching convs (role, level, shape), *step 0 */
+int isf_peek(const char *path, int *cin, int *depth, int *step);
 #endif
 #ifdef __cplusplus
 }

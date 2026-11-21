@@ -23,7 +23,7 @@ typedef struct { char dir[1024], name[256]; int w, h, mw, mh, na, nb; double sc;
 typedef struct { int wr, a0, b0, pa, pb; int64_t lo[3], hi[3]; long tile; } spp;
 enum { SURF_ZS = 32 };   /* the feature slab's planes (training's head slabs) */
 struct surfp {
-    spw *W; int nw; spp *P; long np; int Hp, halo, core, K, C0; double s; isf_dev dev; isf_win win; float *idw; void *feat; size_t featc; int whole;   /* whole: the whole-window feature fallback (DEFAULTED) */
+    spw *W; int nw; spp *P; long np; int Hp, halo, core, K, C0; double s; isf_dev dev; isf_win win; float *idw; void *feat; size_t featc; int whole; double pv;   /* whole: the whole-window feature fallback (DEFAULTED) */
     long *tp, *toff; long ntile, nrun, nfit; uint8_t *tdone;
 };
 static int grid_pt(const spw *w, double gu, double gv, double P[3]) {   /* the wrap's grid at (col gu, row gv), bilinear; 0: an invalid corner */
@@ -36,7 +36,7 @@ static int grid_pt(const spw *w, double gu, double gv, double P[3]) {   /* the w
 }
 /* map pixel (row a, col b) -> the level point (z, y, x) and unit normal; 0: off the surface */
 static int map_pt(const surfp *S, const spw *w, int a, int b, float q[6]) {
-    const double g = S->s * w->sc;   /* grid px per map px */
+    const double g = S->s * S->pv * w->sc;   /* grid px per map px (pv window voxels per map px) */
     double P[3], A[3], B[3], C[3], D[3];
     if (!grid_pt(w, b * g, a * g, P) || !grid_pt(w, (b + 1) * g, a * g, A) || !grid_pt(w, (b - 1) * g, a * g, B) || !grid_pt(w, b * g, (a + 1) * g, C) || !grid_pt(w, b * g, (a - 1) * g, D)) return 0;
     const double u[3] = {A[0] - B[0], A[1] - B[1], A[2] - B[2]}, v[3] = {C[0] - D[0], C[1] - D[1], C[2] - D[2]};
@@ -45,9 +45,9 @@ static int map_pt(const surfp *S, const spw *w, int a, int b, float q[6]) {
     for (int d = 0; d < 3; d++) { q[d] = (float)((P[d] - 0.5 * (S->s - 1)) / S->s); q[3 + d] = (float)(n[d] / l); }
     return 1;
 }
-surfp *surfp_open(const char *wraps, const char *isf, int C0, int Hp, int halo, int K, double s) {
+surfp *surfp_open(const char *wraps, const char *isf, int C0, int Hp, int halo, int K, double s, double pv) {
     if (Hp < 32 || Hp % 16 || halo < 0 || 2 * halo >= Hp) { fprintf(stderr, "predict --surf: --surf-P a multiple of 16 >= 32, --surf-halo < P / 2\n"); return nullptr; }
-    surfp *S = calloc(1, sizeof *S); S->Hp = Hp; S->halo = halo; S->core = Hp - 2 * halo; S->K = K; S->C0 = C0; S->s = s;
+    surfp *S = calloc(1, sizeof *S); S->Hp = Hp; S->halo = halo; S->core = Hp - 2 * halo; S->K = K; S->C0 = C0; S->s = s; S->pv = pv > 0 ? pv : 1;
     char *cp = strdup(wraps); int cap = 0;
     for (char *t = strtok(cp, ","); t; t = strtok(nullptr, ",")) {
         if (S->nw == cap) { cap = cap ? 2 * cap : 16; S->W = realloc(S->W, (size_t)cap * sizeof *S->W); }
@@ -60,11 +60,13 @@ surfp *surfp_open(const char *wraps, const char *isf, int C0, int Hp, int halo, 
         snprintf(p, sizeof p, "%s/z.tif", w->dir); w->Z = img_read_f32(p, &w3, &h3);
         snprintf(p, sizeof p, "%s/meta.json", w->dir); w->sc = tifxyz_meta_scale(p);
         if (!w->X || !w->Y || !w->Z || w2 != w->w || w3 != w->w || h2 != w->h || h3 != w->h || !(w->sc > 0)) { fprintf(stderr, "predict --surf: cannot read the tifxyz %s\n", w->dir); free(cp); surfp_free(S); return nullptr; }
-        w->mw = (int)ceil(w->w / w->sc / s); w->mh = (int)ceil(w->h / w->sc / s); w->map = calloc((size_t)w->mw * w->mh, 1);
+        w->mw = (int)ceil(w->w / w->sc / (s * S->pv)); w->mh = (int)ceil(w->h / w->sc / (s * S->pv)); w->map = calloc((size_t)w->mw * w->mh, 1);
         S->nw++;
     }
     free(cp);
-    if (isf_dev_init(&S->dev, C0, Hp, K, 1)) { fprintf(stderr, "predict --surf: out of GPU memory for the head\n"); surfp_free(S); return nullptr; }
+    int dep = 4; if (isf_peek(isf, nullptr, &dep, nullptr)) dep = 4;   /* (the head's depth from its file: S3 heads are depth 5) */
+    if (Hp % (1 << dep)) { fprintf(stderr, "predict --surf: --surf-P %d must be a multiple of 2^%d (the head's depth)\n", Hp, dep); surfp_free(S); return nullptr; }
+    if (isf_dev_init_d(&S->dev, C0, Hp, K, dep, 1)) { fprintf(stderr, "predict --surf: out of GPU memory for the head\n"); surfp_free(S); return nullptr; }
     int st = 0; if (isf_load(&S->dev, isf, &st)) { fprintf(stderr, "predict --surf: cannot load the surface head %s (its trunk channels x layers must be %d x %d)\n", isf, C0, K); surfp_free(S); return nullptr; }
     if (isf_win_alloc(&S->win, Hp, K, 1.f)) { surfp_free(S); return nullptr; }
     float *h = calloc((size_t)C0 * (C0 + 1), 4); for (int c = 0; c < C0; c++) h[(size_t)c * C0 + c] = 1.f;
@@ -198,11 +200,12 @@ int surfp_write(surfp *S, const char *dir) {
     const int native = getenv("UFSM_SURF_NATIVE") && atoi(getenv("UFSM_SURF_NATIVE"));
     for (int k = 0; k < S->nw; k++) { const spw *w = &S->W[k]; snprintf(p, sizeof p, "%s/%s.tif", dir, w->name);
         int ow = w->mw, oh = w->mh; uint8_t *out = w->map;
-        if (!native && S->s != 1) {
+        const double up = S->s * S->pv;   /* canvas px per map px */
+        if (!native && up != 1) {
             ow = (int)ceil(w->w / w->sc); oh = (int)ceil(w->h / w->sc); out = calloc((size_t)ow * oh, 1);
             if (!out) { fprintf(stderr, "predict --surf: out of memory for the canvas map\n"); return -1; }
             for (int y = 0; y < oh; y++) for (int x = 0; x < ow; x++) {
-                const double my = y / S->s, mx = x / S->s; const int y0 = (int)floor(my), x0 = (int)floor(mx); const double fy = my - y0, fx = mx - x0;
+                const double my = y / up, mx = x / up; const int y0 = (int)floor(my), x0 = (int)floor(mx); const double fy = my - y0, fx = mx - x0;
                 double sv = 0, sw = 0;
                 for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++) { const int yy = y0 + dy, xx = x0 + dx; if (yy < 0 || xx < 0 || yy >= w->mh || xx >= w->mw) continue;
                     const uint8_t v = w->map[(size_t)yy * w->mw + xx]; if (!v) continue; const double wt = (dy ? fy : 1 - fy) * (dx ? fx : 1 - fx); sv += wt * v; sw += wt; }
