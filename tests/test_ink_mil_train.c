@@ -13,6 +13,7 @@
 #include "sample.h"
 #include "spatial_augment.h"
 #include "tiffw.h"
+#include "imgops.h"
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -255,6 +256,17 @@ int main(int argc, char **argv) {
         CHECK(!sh("grep -q 'DEFAULTED: predict --surf: UFSM_SURF_WHOLE' %s/sp1.log && ! grep -q DEFAULTED %s/sp0.log", d, d), "DEFAULTED lines (%s/sp0.log, sp1.log)", d);
         CHECK(!sh("grep -q 'patches run' %s/sp0.log && cmp %s/sp0/seg.tifxyz.tif %s/sp1/seg.tifxyz.tif", d, d, d),
               "slab vs whole-window maps differ or patches unrun (%s/sp0, sp1)", d);
+        /* (2026-11-21) at level 1 (2 level-0 voxels per window voxel) the map is still written on the mesh's canvas (what ink-score reads):
+           the level-0 map's size; the 2x grid read as canvas px was the S1 0841 / P4 surface-score bug (AUC 0.03 / 0.30) */
+        CHECK(!sh("mkdir -p %s/sp2 && %s predict %s/sf/last.ckpt %s/fx ct %s/pv2 --axis %s/fx/axis.json --surf %s/fx/seg.tifxyz --surf-out %s/sp2 --um 19.2 --level 1 "
+                  "--box 0,0,0,128,128,128 --shard 128 --levels 2 --threads 2 --q 0 --no-out 1 --surf-P 32 --surf-halo 4 --surf-k 2 --window 96 > %s/sp2.log 2>&1", d, U, d, d, d, d, d, d, d),
+              "predict --surf at level 1 (%s/sp2.log)", d);
+        {   char q0[700], q2[700]; snprintf(q0, sizeof q0, "%s/sp0/seg.tifxyz.tif", d); snprintf(q2, sizeof q2, "%s/sp2/seg.tifxyz.tif", d);
+            int w0 = 0, h0 = 0, w2 = 0, h2 = 0; uint8_t *m0 = img_read_u8(q0, &w0, &h0), *m2 = img_read_u8(q2, &w2, &h2); size_t nz = 0;
+            if (m2) for (size_t i = 0; i < (size_t)w2 * h2; i++) nz += m2[i] > 0;
+            fprintf(stderr, "predict --surf: level-0 map %d x %d, level-1 map %d x %d (%.0f%% run px)\n", w0, h0, w2, h2, m2 ? 100.0 * nz / ((double)w2 * h2) : 0);
+            CHECK(m0 && m2 && w0 == w2 && h0 == h2 && nz > (size_t)w2 * h2 / 2, "level-1 map %d x %d vs the canvas %d x %d (%s)", w2, h2, w0, h0, q2);
+            free(m0); free(m2); }
     }
     if (getenv("TIMT_KEEP")) fprintf(stderr, "kept %s (sources %s/fx/sources-mil.json)\n", d, d);
     else if (!fails) sh("rm -rf %s", d);
