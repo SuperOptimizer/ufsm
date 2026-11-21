@@ -203,6 +203,7 @@ static int usage(void) {
         "  ufsm tifxyz-scale <src> <dst> <div> [--offset z,y,x]   tifxyz coordinates / div - offset (e.g. 2.4 -> 9.6 um: 4; offset in output voxels)\n"
         "  ufsm ink-compare <out.jpg> --ct CT.tif --ink LABEL=INK.tif ..   CT | ink panels (half-res JPEG) + ink statistics per render\n"
         "  ufsm img-gate IMG.tif GATE.tif [GATE.tif ..] [--out OUT.tif]   a render x max(gates) / 255 (the strip papyrus gate)\n"
+        "  ufsm img-rankavg OUT.tif A.tif B.tif [..] [--w a,b,..]   per-image mid-rank average of ink maps on A's grid (head ensembles)\n"
         "  ufsm img-stretch CTL CT1.tif INK1.tif [..]                     the strip's gated contrast stretch ca,cb,ia,ib\n"
         "  ufsm jpeg-fit IN.jpg OUT.jpg --div 2 | --max-px N                  a finished JPEG shrunk (OUT may be IN)\n"
         "  ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K]   tifxyz wraps -> surface-compressor .sfc (readers take .sfc wraps directly)\n"
@@ -4876,6 +4877,8 @@ int cmd_fields_pack(int argc, char **argv);   /* src/fieldspack.c */
 int cmd_labcomp_pack(int argc, char **argv);   /* src/labcomp_cli.c */
 int cmd_ink_gate(int argc, char **argv);   /* src/inkgate.c */
 int cmd_img_gate(int argc, char **argv);   /* src/imggate.c */
+int cmd_img_rankavg(int argc, char **argv);   /* src/imgrank.c */
+int cmd_img_rankavg(int argc, char **argv);   /* src/imgrank.c */
 int cmd_img_stretch(int argc, char **argv);   /* src/imggate.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
@@ -5022,6 +5025,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "labcomp-pack")) return cmd_labcomp_pack(argc, argv);
     if (!strcmp(cmd, "ink-gate")) return cmd_ink_gate(argc, argv);
     if (!strcmp(cmd, "img-gate")) return cmd_img_gate(argc, argv);
+    if (!strcmp(cmd, "img-rankavg")) return cmd_img_rankavg(argc, argv);
     if (!strcmp(cmd, "img-stretch")) return cmd_img_stretch(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
