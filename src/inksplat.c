@@ -1967,7 +1967,7 @@ static void inkfly_raylist_load(inkfly *f, int stride, int mode) {
         const uint64_t *off = (const uint64_t *)((const uint8_t *)mp + RL_HDR);
         if ((size_t)st.st_size != RL_HDR + (nt + 1) * 8 + off[nt] * sizeof(rlent)) { munmap(mp, (size_t)st.st_size); continue; }
         f->rl_map = mp; f->rl_len = (size_t)st.st_size; f->rl_stride = s; f->rl_mode = m; f->rl_off = off; f->rl_e = (const rlent *)(off + nt + 1); f->rl_ver = h[3] - '0';
-        if (f->rl_ver < 2) fprintf(stderr, "ink onfly: %s is a version-1 ray list (no pixel index: train --ink-surf skips its rays; ink-rayface --raylist rebuilds it)\n", pth);
+        if (f->rl_ver < 2) fprintf(stderr, "ink onfly: %s is a version-1 ray list (no pixel index: train --ink-surf's mode-2 rays take the per-window path; ink-rayface --rays 2 --rays-mode 0 builds a v2 list)\n", pth);
         return;
     }
 }
