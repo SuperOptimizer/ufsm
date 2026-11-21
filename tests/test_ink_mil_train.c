@@ -123,9 +123,10 @@ int main(int argc, char **argv) {
     const char *U = argv[1];
     char d[] = "/tmp/test_inkmil_XXXXXX"; if (!mkdtemp(d)) return 1;
     const int FN = getenv("TIMT_N") ? atoi(getenv("TIMT_N")) : 256;   /* TIMT_N / TIMT_KEEP=1 (benches): a larger fixture, kept with its MIL source */
-    /* (FX_CT_ZCUT .5: CT 0 from z 128 up, the segment's rows there have no open face: a non-empty faceless set, so MIL mode 1 (the
-       faceless rays) compares real losses below, not two zeros; lead 2026-11-20) */
-    CHECK(!sh("FX_CT_ZCUT=0.5 %s %s/fx %d 2 1 > %s/fx.log 2>&1", argv[2], d, FN, d), "fixture");
+    /* (FX_FAINT .375,.625: papyrus below the sources' iso 100 for z in [96, 160): the segment's rows there have no open face, a non-empty
+       faceless set, so MIL mode 1 (the faceless rays) compares real losses below, not two zeros (lead 2026-11-20). CT 0 there instead
+       (FX_CT_ZCUT) failed: the coarse probe rejects air windows, so no faceless ray was ever drawn, and the other sections starved) */
+    CHECK(!sh("FX_FAINT=0.375,0.625 %s %s/fx %d 2 1 > %s/fx.log 2>&1", argv[2], d, FN, d), "fixture");
     char p[700]; snprintf(p, sizeof p, "%s/fx", d);
     CHECK(!write_segment(p, FN), "segment");
     snprintf(p, sizeof p, "%s/fx/sources-mil.json", d); FILE *f = fopen(p, "w"); if (!f) return 1;
