@@ -269,8 +269,11 @@ static int head_bwd_z_impl(const float *x, const nn_gn_t *gx_gn, shape5 xs, cons
         (void)seed;
         exec_prec(2, 0);
         if (!lp_bwd_w1_mx_b_r(x, MXDT(x), xs, gy16, 2, ys, gw, gb, to_gnp(gx_gn), vb, nv)) return -1;
-        if (first) {
-            seed2 = MXDT(gx) == 4 ? sr_seed() : 0u;
+        if (first) seed2 = MXDT(gx) == 4 ? sr_seed() : 0u;
+        {   /* the transposed weights on EVERY call (11-21): built only on first, a pass whose first call of this shape had first 0 (train
+               --ink-surf: the head + feature rows only on slabs with a patch, first = z0 == 0) read a null wt (the laptop's illegal address in
+               conv1_to_mx_tc_k) or another call's / an earlier step's weights (the desk: a stale head in the feature gradient); a
+               cout x Ci flip, the same bytes for the same w */
             if (wtn < cout * xs.c) { if (wt) cudaFree(wt); CK(cudaMalloc(&wt, (size_t)cout * xs.c * 4)); wtn = cout * xs.c; }
             const size_t nw = (size_t)cout * xs.c;
             flip_w_k<<<nblk(nw, 256), 256>>>(w, wt, cout, xs.c, 1);
