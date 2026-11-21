@@ -25,7 +25,7 @@ one thread per output with no reuse (weight gradient: one block per weight, 2 x 
 - The patch build (isf_win_build, 30-120 ms of host work per window) runs on a helper thread from mil_take and overlaps the step it
   prefetches beside. It is joined before the buffer's step uploads the lists. The aug bits are still drawn in mil_take in window order,
   and the MIL subset stays per buffer.
-S2 (30 k steps from sH-50000, P 256) swapped to this binary at step 750: 43.5 Mvox/s mean over the run (wait 2.6 %), against S1's 21-22.
+S2 (30 k steps from sH-50000, P 256) swapped to the tiled-conv + AUC binary (254618bf; the threaded build came later) at step 750: 43.5 Mvox/s mean over the run (wait 2.6 %), against S1's 21-22.
 That is ~2x per step, 3 h 16 min for 29 k steps.
 What is left of the head's cost (nsys, P 192 guest, contended): the feature path's 1x1 convs (the identity forward per slab
 conv1_mx_tc_k, and the 40-row concatenated backward conv1_to_mx_tc_k + conv_bwd_w1_tc_k) ~20 ms per step, the tiled head ~14 ms, the
