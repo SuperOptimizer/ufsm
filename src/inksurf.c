@@ -215,11 +215,11 @@ int isf_dev_init(isf_dev *g, int C, int Hp, int K, uint64_t seed) {
     memset(g, 0, sizeof *g); g->C = C; g->Hp = Hp; g->K = K;
     g->h = isfhead_create(C * K, Hp, Hp, seed); if (!g->h) return -1;
     const size_t n = (size_t)Hp * Hp;
-    g->patch = nn_malloc((size_t)C * K * n * 4); g->lab = nn_malloc(n * 4); g->wt = nn_malloc(n * 4); g->glog = nn_malloc(n * 4); g->zh = malloc(n * 4);
+    g->patch = nn_malloc((size_t)C * K * n * 4); g->lab = nn_malloc(n * 4); g->wt = nn_malloc(n * 4); g->glog = nn_malloc(n * 4); g->zh = nn_host_alloc_try(n * 4); g->zev = nn_event_create();
     return g->patch && g->lab && g->wt && g->glog && g->zh ? 0 : -1;
 }
 void isf_dev_free(isf_dev *g) {
-    isfhead_free(g->h); nn_free(g->patch); nn_free(g->lab); nn_free(g->wt); nn_free(g->glog); free(g->zh);
+    isfhead_free(g->h); nn_free(g->patch); nn_free(g->lab); nn_free(g->wt); nn_free(g->glog); nn_host_free(g->zh);
     nn_free(g->vox); nn_free(g->off); nn_free(g->ent); nn_free(g->ew); nn_free(g->fidx); nn_free(g->fw); nn_free(g->fc); nn_free(g->gc); nn_free(g->feat); nn_free(g->rows);
     memset(g, 0, sizeof *g);
 }
@@ -258,13 +258,30 @@ static void auc_sort(float (*o)[2], size_t m) {
     }
     free(t);
 }
-double isf_dev_step(isf_dev *g, const isf_win *w, float lambda, int train, float gscale, const float *dscale, double *auc) {
-    if (auc) *auc = -1;
-    if (!g->nv) return -1;
+/* the head step in two halves (inkperf 2026-11-21): isf_dev_launch queues the resample, the forward, the logits' copy to pinned host memory
+   and (train) the BCE gradient, the backward and the feature gradient, without waiting; isf_dev_result waits for the logits and computes
+   the logged loss / AUC on the host as before. Training reads the result only where it needs isf_got (the gradient pass), so the GPU
+   no longer drains between the forward and the backward. The device work and the numbers are those of the old one-call step. */
+int isf_dev_launch(isf_dev *g, const isf_win *w, float lambda, int train, float gscale, const float *dscale) {
+    g->pend = 0;
+    if (!g->nv) return 0;
     const size_t n = (size_t)g->Hp * g->Hp;
+    double sw = 0; for (size_t p = 0; p < n; p++) if (w->wt[p] > 0) sw += w->wt[p];
     nn_isf_resample_c(g->fc, g->C, g->nv, g->fidx, g->fw, (int)n, g->K, g->patch);
     const float *z = isfhead_forward(g->h, g->patch);
-    nn_d2h(g->zh, z, n * 4);
+    nn_d2h_async(g->zh, z, n * 4); nn_event_record(g->zev, 0);
+    if (sw > 0 && train) {
+        nn_isf2_bce_grad(z, g->lab, g->wt, n, (float)(lambda / sw), g->glog);
+        const float *gp = isfhead_backward(g->h, g->glog);
+        nn_isf_gather(gp, g->C, g->K, (int)n, nullptr, g->off, g->ent, g->ew, g->nv, g->gc, ISF_F32, (size_t)g->nv, gscale, dscale, 0);
+    }
+    g->pend = 1; return 1;
+}
+double isf_dev_result(isf_dev *g, const isf_win *w, double *auc) {
+    if (auc) *auc = -1;
+    if (!g->pend) return -1;
+    g->pend = 0; nn_event_sync(g->zev);
+    const size_t n = (size_t)g->Hp * g->Hp;
     double l = 0, sw = 0; for (size_t p = 0; p < n; p++) { if (!(w->wt[p] > 0)) continue; const double v = g->zh[p], t = w->lab[p];
         l += w->wt[p] * (fmax(v, 0) - v * t + log1p(exp(-fabs(v)))); sw += w->wt[p]; }
     if (auc) {   /* (the window's patch AUC on its labelled pixels; ties by rank order) */
@@ -277,12 +294,11 @@ double isf_dev_step(isf_dev *g, const isf_win *w, float lambda, int train, float
         free(o); *auc = np && nn ? a / (np * nn) : -1;
     }
     if (!(sw > 0)) return -1;
-    if (train) {
-        nn_isf2_bce_grad(z, g->lab, g->wt, n, (float)(lambda / sw), g->glog);
-        const float *gp = isfhead_backward(g->h, g->glog);
-        nn_isf_gather(gp, g->C, g->K, (int)n, nullptr, g->off, g->ent, g->ew, g->nv, g->gc, ISF_F32, (size_t)g->nv, gscale, dscale, 0);
-    }
     return l / sw;
+}
+double isf_dev_step(isf_dev *g, const isf_win *w, float lambda, int train, float gscale, const float *dscale, double *auc) {
+    isf_dev_launch(g, w, lambda, train, gscale, dscale);
+    return isf_dev_result(g, w, auc);
 }
 int isf_dev_put(isf_dev *g, unet *u, const isf_win *w, int z0, int z1, size_t hw) {
     unet_set_head_feat_grad_z(u, nullptr);
