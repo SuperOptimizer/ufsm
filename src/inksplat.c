@@ -2099,8 +2099,8 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
     enum { PB = 13 }; uint64_t (*pk)[PB] = calloc((size_t)nch, sizeof *pk); double (*mband)[3] = calloc((size_t)nch, sizeof *mband);
     size_t *ord = malloc(f->nT * sizeof *ord); cpx *X = nullptr; size_t cap = 0; int got = 0;
     /* AUC(t) of every channel against the labels: ref 0 the mesh (all pixels, t), 1 the face (pixels with a face, t - t_f), 2 the mesh (faceless only) */
-    uint64_t (*ah)[3][NS][2][256] = calloc((size_t)nch, sizeof *ah); size_t *pick = malloc((size_t)PT * sizeof *pick);
-    if (!sum || !pk || !mband || !ord || !ah || !pick) { free(sum); free(pk); free(mband); free(ord); free(ah); free(pick); return -1; }
+    uint64_t (*ah)[3][NS][2][256] = calloc((size_t)nch, sizeof *ah); double (*fs)[2][NS] = calloc((size_t)nch, sizeof *fs); uint64_t fcn[2][NS] = {{0}};   /* face-aligned sums (t - t_f) */ size_t *pick = malloc((size_t)PT * sizeof *pick);
+    if (!sum || !pk || !mband || !ord || !ah || !pick || !fs) { free(sum); free(pk); free(mband); free(ord); free(ah); free(pick); free(fs); return -1; }
     size_t nt = 0; for (size_t t = 0; t < f->nT; t++) {   /* the tiles meeting the box */
         int in = 1; if (box) for (int d = 0; d < 3; d++) if (f->T[t].hi[d] < box[d] || f->T[t].lo[d] >= box[d] + box[3 + d]) in = 0;
         if (in) ord[nt++] = t; }
@@ -2159,6 +2159,8 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
                 for (int k = 0; k < NS; k++) { const int tv = k - TR; if (tv >= lo && tv <= hi) { if (sm[k] > mx) mx = sm[k]; } else if (sm[k] >= c->iso && abs(tv) < abs(near)) near = tv; }
                 cl = mx >= c->iso ? 0 : near != 1 << 20 ? 1 : mx >= c->iso / 2.f ? 2 : 3; cls[cl]++; }
             const int g = 2 * (x->y != 0) + (ft == FACE_NONE); ng[g]++; got++;
+            if (ft != FACE_NONE) for (int k = 0; k < NS; k++) { const int r = k - ft; if (r < 0 || r >= NS) continue; fcn[x->y != 0][r]++;
+                for (int ch = 0; ch < nch; ch++) fs[ch][x->y != 0][r] += fmaxf(pr[ch][k], 0); }
             for (int ch = 0; ch < nch; ch++) {
                 for (int k = 0; k < NS; k++) { sum[ch][g][k] += fmaxf(pr[ch][k], 0); if (pr[ch][k] < 0) continue; const int b = pr[ch][k] > 255 ? 255 : (int)lroundf(pr[ch][k]), yy = x->y != 0;
                     ah[ch][0][k][yy][b]++; if (ft == FACE_NONE) ah[ch][2][k][yy][b]++; else { const int r = k - ft; if (r >= 0 && r < NS) ah[ch][1][r][yy][b]++; } }
@@ -2174,7 +2176,7 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
                        for (int ch = 0; ch < nch; ch++) for (int k = 0; k < NS; k++) fprintf(tsv, "\t%.1f", pr[ch][k]); fprintf(tsv, "\n"); }
         }
         for (int ch = 0; ch <= nv; ch++) free(buf[ch]);
-        if (bad) { free(X); free(sum); free(pk); free(mband); free(ord); free(ah); free(pick); return -1; }
+        if (bad) { free(X); free(sum); free(pk); free(mband); free(ord); free(ah); free(pick); free(fs); return -1; }
     }
     free(X); free(ord); free(pick);
     static const char *gn[4] = {"no ink, face", "no ink, faceless", "ink, face", "ink, faceless"};
@@ -2185,6 +2187,8 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
         const char *nm = cname[ch];
         for (int g = 0; g < 4; g++) { if (!ng[g]) continue; printf("ink profile: %-12s %-17s mean, t -40..40 step 4:", nm, gn[g]);
             for (int k = 0; k < NS; k += 4) printf(" %.0f", sum[ch][g][k] / ng[g]); printf("\n"); }
+        for (int y = 0; y < 2; y++) { printf("ink profile: %-12s %-6s face-aligned mean, t - t_f -16..16 step 2:", nm, y ? "ink" : "no ink");
+            for (int r = TR - 16; r <= TR + 16; r += 2) printf(" %.1f", fcn[y][r] ? fs[ch][y][r] / fcn[y][r] : NAN); printf("\n"); }
         if (ng[2]) { printf("ink profile: %-12s ink, face: peak t - t_f (<-20 <-12 <-8 <-6 <-3 <0 0 <=3 <=6 <=8 <=12 <=20 >20):", nm);
             for (int b = 0; b < PB; b++) printf(" %.1f%%", 100.0 * pk[ch][b] / ng[2]);
             printf(" | mass in the face band %.1f%%, in the MIL band %.1f%%\n", mband[ch][2] ? 100 * mband[ch][0] / mband[ch][2] : 0., mband[ch][2] ? 100 * mband[ch][1] / mband[ch][2] : 0.); }
@@ -2206,7 +2210,7 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
         }
         if (best >= 0) printf("ink profile auc: %-12s %-13s t -16..16:%s | best t %+d AUC %.3f\n", nm, rn[r], line, bt, best);
     }
-    free(sum); free(pk); free(mband); free(ah);
+    free(sum); free(pk); free(mband); free(ah); free(fs);
     return got ? 0 : -1;
 }
 int inkfly_raylist_have(void *handle) { const inkfly *f = handle; return f && f->rl_map ? f->rl_stride * 2 + f->rl_mode : 0; }
