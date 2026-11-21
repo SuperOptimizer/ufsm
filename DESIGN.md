@@ -6,6 +6,40 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## 3-D ink pipeline profile; exact level-1 score tiles (ink-wrapscore --tiles-sub) (2026-11-21, branch inkperf-20261121, inkperf)
+
+Where a 3-D ink checkpoint's turnaround goes. The numbers come from the desk logs of sH / R1 / HP5 / KH (read-only) and from short guest
+runs on card 0, which S2 was sharing.
+| stage (per checkpoint) | wall | what it is |
+|---|---|---|
+| 1667 FAST, 9.6 um net (sH-50000) | 4.5 min | predicts 2 x 111 s (203 + 202 windows of 544, 0.55 s each), blend 22 s, wrapscore 20 s, ~2 s start-up per predict |
+| 1667 FAST, 4.8 um net (R1-15000, FASTLV=1) | 36 min | 1584 + 2126 windows (838 + 1075 s), blend ~90 s |
+| P4, 16 crops | 1.5 min | 72 s of windows; ~1.4 s start-up + render + ink-score per crop; 0-4.7 min waiting on score.lock / NAS before the first crop |
+| clean 0841 + 1447, 36 crops | 4.4 min | 208 s of windows, ~1.5 s overhead per crop |
+| training (sH P 256, R1 P 384, HP5) | 73-77 Mvox/s | wait 0 %: GPU-bound |
+- Predict is conv-bound. nsys, window 288, sH-50000: the conv_fwd_* kernels take ~95 % of the GPU time (f4r 2/4/1 24 %, f4r 2/4/2 24 %,
+  f4v 11 %, s2_f4 9 %, f8s 7 %), the head's conv1 4 %, input / placement < 1 %. A window costs ~0.17 s at 288 on the shared card.
+- The 8.8 GB peak at window 544 is the direct-slab path (UFSM_SLAB_DIRECT, 49-51 B per window voxel: X2 / Y2 are a second level-0 / 1
+  tensor). Copy slabs (UFSM_SLAB_DIRECT=0) take 23-24 B per voxel, about 3.7 GB at 544, and the output bytes are identical (diff -r over 14
+  windows). They cost +10 % wall (3.63 / 3.68 s against 3.32 / 3.29 s). unet already drops to copy slabs when the card has less free memory
+  than the direct path needs, so a scorer beside a trainer degrades to copy slabs rather than failing.
+- Training is GPU-bound, so the sampler is not the limit. The gpudec CT decode (k_entropy: one 32-thread block per substream request)
+  runs beside the trunk: sH did 262 substreams and 6.7 batches per step (20 k steps). Its kernels hold about one warp per SM, so they take
+  little of the trunk's throughput. A cold 60-step P 160 guest run is no steady-state measure (wait 70-80 %, k_entropy 84 % of its kernel time).
+
+The 4.8 um score was the outlier. score.sh FASTLV=1 turned each listed 9.6 um tile into its 2^3 level-1 tiles plus the 3^3 grid-256
+tiles around them. `ink-wrapscore --tiles-out DIR --tiles-sub 2` instead lists the level-1 tiles of both grids that hold the voxels the
+samples read: the --vkey voxels within VMARG of each sample point, widened to whole 16^3 volcomp blocks (at --q 4 a decoded voxel depends
+on its whole block), then their 2^3 children. Every voxel of a read block therefore keeps both grids' predictions, and the blended and
+mean-pooled values the score reads should match the expanded lists'. --tiles-sub 1 keeps the old lists byte for byte; the 1667 lists diff
+equal.
+| 1667 split | old FASTLV=1 lists (grid 0 + 256) | --tiles-sub 2 | windows |
+|---|---|---|---|
+| heldout, hold, valonly, rest (FASTREST=1) | 1624 + 2393 | 802 + 789 (a subset) | 3710 -> ~1590 |
+| heldout, hold, valonly | 1048 + 1816 | 375 + 332 | |
+Lists: /vesuvius/ufsm/inkperf/tl/tiles-1667{,-rest}-l1. Expected: R1 1667 ~36 -> ~15 min, the same AUCs (identity re-score: pending).
+test_ink_wrapscore: --tiles-sub 2 lists exist, every grid-0 level-1 tile is a child of a --tiles-sub 1 tile, S 3 is refused.
+
 ## 3-D ink: the H recipe sweep and arm K, a surface-proximity input (2026-11-20, branch inkk-20261120, inksdk)
 
 **H recipe** (wind96 widths 32..192, dec 0,32, init wind96-u2, trunk-lr-mult 0.2, lr 9e-4 / muon 9e-3, wsd constant, P 256, the six
