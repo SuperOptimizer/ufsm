@@ -6,6 +6,31 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## isfperf: the surface head's step cost, 4x faster head with the same bits (2026-11-21, branch isfperf-20261121, inkperf)
+
+S1 (--ink-surf 1, P 256) trained at 21-22 Mvox/s against sH's 73 with the same trunk. bench_isfhead (tests/bench_isfhead.c, Hp 256, cin 288
+= 32 trunk channels x 9 layers, desk card 0 shared with a scorer) and nsys of the head: the 13 nn_isf2 convs were 99.5 % of its GPU time,
+one thread per output with no reuse (weight gradient: one block per weight, 2 x HW reads each), ~160 GFLOP/s.
+- Tiled convs. A 16 x 16 pixel tile plus halo and the weights sit in shared memory, with 16 / 4 / 1 outputs per thread. The weight
+  gradient computes 2 x 2 x 9 (k 3) or 4 x 8 (k 1) weights per block from one read of gy / x. Every sum keeps the old kernels' order:
+  channel, then dy, then dx, out-of-range taps skipped, the same 256 strided partials and the same tree. So the outputs are bit-identical:
+  bench_isfhead over the 13 head shapes, and test_inksurf on 7 shapes with odd sizes, channel counts off the groups, k 1 / 3, acc 0 / 1.
+  The old kernels stay as nn_isf2_*_ref.
+| head step (256^2, cin 288) | forward | bce + backward | total |
+|---|---|---|---|
+| before | 36.7 ms | 102.4 ms | 141 ms |
+| tiled | 7.9 ms | 22.8 ms | 33 ms |
+- The patch AUC for the log: the insertion sort (O(m^2), 15 ms at 12.5 k labelled px) became a stable bottom-up merge sort. It gives the
+  same order (strictly-less moves, ties keep the input order) in ~1 ms. With a NaN logit the insertion sort is kept.
+- The patch build (isf_win_build, 30-120 ms of host work per window) runs on a helper thread from mil_take and overlaps the step it
+  prefetches beside. It is joined before the buffer's step uploads the lists. The aug bits are still drawn in mil_take in window order,
+  and the MIL subset stays per buffer.
+S2 (30 k steps from sH-50000, P 256) swapped to this binary at step 750: 43.5 Mvox/s mean over the run (wait 2.6 %), against S1's 21-22.
+That is ~2x per step, 3 h 16 min for 29 k steps.
+What is left of the head's cost (nsys, P 192 guest, contended): the feature path's 1x1 convs (the identity forward per slab
+conv1_mx_tc_k, and the 40-row concatenated backward conv1_to_mx_tc_k + conv_bwd_w1_tc_k) ~20 ms per step, the tiled head ~14 ms, the
+resample / gather / take / put ~3 ms.
+
 ## inksurf: a surface-aligned ink head beside the voxel ink losses (2026-11-20, branch inksurf-20261120, fullvram)
 
 1667's ink is only readable from wide in-plane patterns (the 4b profiles: no along-normal CT signal, texture AUC .55). So, in addition
