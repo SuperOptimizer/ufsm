@@ -444,6 +444,37 @@ static int cmd_map(int argc, char **argv) {
     return 0;
 }
 
+/* ---------- reg tifxyz: meshes (tifxyz) on one scan moved into its registered twin ----------
+   ufsm reg tifxyz <reg.json> <dst-dir> <src-tifxyz>... [--c2f]
+   Default: meshes on the FINE scan (vertices in fine L0 voxels) -> the COARSE scan's L0 voxels (rmap_f2c); --c2f the other way. Each
+   <src> (a tifxyz dir) is written to <dst-dir>/<basename(src)> ("tifxyz" as the basename: the parent's name); meta scale x div,
+   voxel_size_um x div (div = the output voxel / the input voxel), so 2-D label rasters on the mesh keep their pixel <-> vertex relation
+   through the OME pixel size or the canvas ratio (inksplat's F); an explicit per-window label_scale must be divided by div by the caller
+   (printed). (N9 2026-11-21: the human ink labels of 0139 / 0814 / 0500P2 on their 2.2-2.4 um scans onto the native 9.362 um scans) */
+static void map_f2c_cb(void *ud, const double p[3], double q[3]) { rmap_f2c(ud, p, q); }
+static void map_c2f_cb(void *ud, const double p[3], double q[3]) { rmap_c2f(ud, p, q); }
+static int cmd_tifxyz(int argc, char **argv) {
+    if (argc < 6) { fprintf(stderr, "usage: ufsm reg tifxyz <reg.json> <dst-dir> <src-tifxyz>... [--c2f]   (fine-scan meshes -> coarse L0 voxels; --c2f the other way)\n"); return 2; }
+    rctx x; if (ctx_open(&x, argv[3], nullptr, 0)) return 1;
+    const int c2f = has(argc, argv, "--c2f");
+    const double cu = json_num(json_get(json_get(x.j, "coarse"), "um"), 0), fu = json_num(json_get(json_get(x.j, "fine"), "um"), 0);
+    if (!(cu > 0) || !(fu > 0)) { fprintf(stderr, "reg tifxyz: %s needs coarse.um and fine.um\n", argv[3]); ctx_close(&x); return 1; }
+    const double div = c2f ? fu / cu : cu / fu; int rc = 0, n = 0;
+    for (int i = 5; i < argc; i++) {
+        if (!strcmp(argv[i], opt_n("--c2f"))) continue;
+        char s[1100], base[300], d[1500]; snprintf(s, sizeof s, "%s", argv[i]); size_t l = strlen(s); while (l > 1 && s[l - 1] == '/') s[--l] = 0;
+        const char *b = strrchr(s, '/'); b = b ? b + 1 : s;
+        if (!strcmp(b, "tifxyz") && b > s + 1) { char par[1100]; snprintf(par, sizeof par, "%.*s", (int)(b - 1 - s), s); const char *pb = strrchr(par, '/'); snprintf(base, sizeof base, "%s", pb ? pb + 1 : par); }
+        else snprintf(base, sizeof base, "%s", b);
+        snprintf(d, sizeof d, "%s/%s", argv[4], base); size_t nout = 0;
+        if (tifxyz_mapf(s, d, c2f ? map_c2f_cb : map_f2c_cb, &x.m, div, &nout)) { fprintf(stderr, "reg tifxyz: %s failed\n", s); rc = 1; continue; }
+        fprintf(stderr, "reg tifxyz: %s -> %s (%s, div %.6f, %zu vertices mapped invalid)\n", s, d, c2f ? "c2f" : "f2c", div, nout); n++;
+    }
+    fprintf(stderr, "reg tifxyz: %d meshes; explicit label_scale values divide by %.6f\n", n, div);
+    ctx_close(&x);
+    return rc;
+}
+
 /* ---------- label warp: labels on one scan resampled into the other scan's grid ----------
    ufsm reg warp <reg.json> <label-root> <label-key> <label-um> <out-dir> --level L [--c2f] [--boxes eval_boxes.jsonl] [--box z,y,x,nz,ny,nx]
                  [--fill 255] [--conf LO,HI [--iso I]] [--cache DIR] [--threads 8]
@@ -556,12 +587,13 @@ int cmd_reg_init(int argc, char **argv);
 int cmd_reg_render(int argc, char **argv);   /* src/reg_render.c */
 int cmd_reg_inkstat(int argc, char **argv);   /* src/reg_ink.c */
 int cmd_reg(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: ufsm reg <pair|map|warp|boxes|fit|stats|overlay|init> ...\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: ufsm reg <pair|map|warp|tifxyz|boxes|fit|stats|overlay|init> ...\n"); return 2; }
     store_global_init();
     const char *s = argv[2];
     if (!strcmp(s, "pair")) return cmd_pair(argc, argv);
     if (!strcmp(s, "map")) return cmd_map(argc, argv);
     if (!strcmp(s, "warp")) return cmd_warp(argc, argv);
+    if (!strcmp(s, "tifxyz")) return cmd_tifxyz(argc, argv);
     if (!strcmp(s, "boxes")) return cmd_boxes(argc, argv);
     if (!strcmp(s, "fit")) return cmd_fit(argc, argv);
     if (!strcmp(s, "stats")) return cmd_stats(argc, argv);

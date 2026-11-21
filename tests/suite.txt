@@ -256,6 +256,7 @@ test_mergeflag                                 |              |     3 | python3 
 test_mergeflag_gpu                             | gpu          |     5 | python3 tests/test_mergeflag.py --gpu
 test_img_gate                                  |              |     2 | python3 tests/test_img_gate.py
 test_img_rankavg                               |              |     2 | python3 tests/test_img_rankavg.py
+test_reg_tifxyz                                |              |     2 | python3 tests/test_reg_tifxyz.py
 test_ink_wrapscore                             |              |     4 | python3 tests/test_ink_wrapscore.py
 test_ink_teach                                 |              |     3 | python3 tests/test_ink_teach.py
 test_seamless                                  |              |     6 | python3 tests/test_seamless.py
