@@ -13,6 +13,7 @@
 #include "sample.h"
 #include "spatial_augment.h"
 #include "tiffw.h"
+#include "imgops.h"
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -102,6 +103,13 @@ static double log_last(const char *path, const char *key, int *found) {   /* the
     while (fgets(ln, sizeof ln, f)) { const char *q = strstr(ln, key); if (q) { v = atof(q + strlen(key)); *found = 1; } }
     fclose(f); return v;
 }
+static double log_sum(const char *path, const char *key) {   /* the step lines' values summed (a window may draw no faceless ray) */
+    FILE *f = fopen(path, "r"); if (!f) return NAN;
+    char ln[8192]; double v = 0; int n = 0;
+    while (fgets(ln, sizeof ln, f)) { const char *l = ln; if (l[0] == 't' && l[1] == '+') { const char *e = strstr(l, "s "); if (e) l = e + 2; }   /* (a "t+12.3s " prefix) */
+        const char *q = strncmp(l, "step ", 5) ? nullptr : strstr(l, key); if (q) { v += atof(q + strlen(key)); n++; } }
+    fclose(f); return n ? v : NAN;
+}
 static double log_first(const char *path, const char *key) {
     FILE *f = fopen(path, "r"); if (!f) return NAN;
     char ln[8192]; double v = NAN;
@@ -113,9 +121,13 @@ int main(int argc, char **argv) {
     test_map();
     if (argc != 3) { fprintf(stderr, "usage: test_ink_mil_train <ufsm binary> <make_wind_fixture binary>\n"); return 2; }
     const char *U = argv[1];
+    setenv("UFSM_STARTUP_TIMES", "0", 1);   /* (as run_suite: no "t+N.Ns" prefix on train's lines, which the '^memory:' / '^step' greps read; by hand = the suite) */
     char d[] = "/tmp/test_inkmil_XXXXXX"; if (!mkdtemp(d)) return 1;
     const int FN = getenv("TIMT_N") ? atoi(getenv("TIMT_N")) : 256;   /* TIMT_N / TIMT_KEEP=1 (benches): a larger fixture, kept with its MIL source */
-    CHECK(!sh("%s %s/fx %d 2 1 > %s/fx.log 2>&1", argv[2], d, FN, d), "fixture");
+    /* (FX_FAINT .375,.625: papyrus below the sources' iso 100 for z in [96, 160): the segment's rows there have no open face, a non-empty
+       faceless set, so MIL mode 1 (the faceless rays) compares real losses below, not two zeros (lead 2026-11-20). CT 0 there instead
+       (FX_CT_ZCUT) failed: the coarse probe rejects air windows, so no faceless ray was ever drawn, and the other sections starved) */
+    CHECK(!sh("FX_FAINT=0.375,0.625 %s %s/fx %d 2 1 > %s/fx.log 2>&1", argv[2], d, FN, d), "fixture");
     char p[700]; snprintf(p, sizeof p, "%s/fx", d);
     CHECK(!write_segment(p, FN), "segment");
     snprintf(p, sizeof p, "%s/fx/sources-mil.json", d); FILE *f = fopen(p, "w"); if (!f) return 1;
@@ -143,11 +155,16 @@ int main(int argc, char **argv) {
         CHECK(!sh("%s ink-rayface %s/fx/sources-mil.json --threads 2 --verify 6 --P 64 --stride 2 --seed 7 > %s/rf2.log 2>&1", U, d, d), "ink-rayface --verify stride 2 (%s/rf2.log)", d);
         CHECK(!sh("grep -q '6 of 6 windows (P 64, stride 1) byte-identical' %s/rf1.log && grep -q '6 of 6 windows (P 64, stride 2) byte-identical' %s/rf2.log", d, d), "rayface rays differ (%s/rf1.log, rf2.log)", d);
         CHECK(!sh("grep -Eq 'faced pixels' %s/rf1.log && ! grep -q ' 0 faced pixels' %s/rf1.log", d, d), "the fixture faced no pixel (%s/rf1.log): mode 1 untested", d);
-        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/m1 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 1 %s > %s/m1.log 2>&1", U, d, d, common, d), "mode 1 with the bits (%s/m1.log)", d);
-        CHECK(!sh("UFSM_INK_RAYFACE=0 UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/m0 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 1 %s > %s/m0.log 2>&1", U, d, d, common, d), "mode 1 without (%s/m0.log)", d);
-        snprintf(p, sizeof p, "%s/m1.log", d); const double l1 = log_first(p, " ink mil "); snprintf(p, sizeof p, "%s/m0.log", d); const double l0 = log_first(p, " ink mil ");
-        fprintf(stderr, "ink-rayface: mode 1 first-step ink mil %.6f with the bits, %.6f with the face search\n", l1, l0);
-        CHECK(isfinite(l1) && l1 == l0, "mode 1 ink mil with the bits %g vs the face search %g", l1, l0);
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/m1 --steps 4 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 1 %s > %s/m1.log 2>&1", U, d, d, common, d), "mode 1 with the bits (%s/m1.log)", d);
+        CHECK(!sh("UFSM_INK_RAYFACE=0 UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/m0 --steps 4 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 1 %s > %s/m0.log 2>&1", U, d, d, common, d), "mode 1 without (%s/m0.log)", d);
+        snprintf(p, sizeof p, "%s/m1.log", d); const double l1 = log_sum(p, " ink mil "); snprintf(p, sizeof p, "%s/m0.log", d); const double l0 = log_sum(p, " ink mil ");
+        fprintf(stderr, "ink-rayface: mode 1 ink mil (4 steps summed) %.6f with the bits, %.6f with the face search\n", l1, l0);
+        CHECK(isfinite(l1) && l1 > 0 && l1 == l0, "mode 1 ink mil with the bits %g vs the face search %g (0: no faceless ray drawn)", l1, l0);
+        /* (2026-11-20 inksurf) a version-2 mode-0 list (every pixel + its index) serves mode 1 through the face bits: the same loss again */
+        CHECK(!sh("%s ink-rayface %s/fx/sources-mil.json --threads 2 --rays 2 --rays-mode 0 > %s/rfm0.log 2>&1 && grep -q 'ray lists (stride 2, mode 0)' %s/rfm0.log", U, d, d, d), "ink-rayface --rays-mode 0 (%s/rfm0.log)", d);
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/m2 --steps 4 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 1 %s > %s/m2.log 2>&1", U, d, d, common, d), "mode 1 from the mode-0 list (%s/m2.log)", d);
+        snprintf(p, sizeof p, "%s/m2.log", d); const double l2 = log_sum(p, " ink mil ");
+        CHECK(isfinite(l2) && l2 > 0 && l2 == l1, "mode 1 ink mil from the mode-0 list %g vs %g", l2, l1);
     }
     /* the planner keeps the MIL buffers free (2026-11-15 try7 one card: allocated lazily after the plan, the first MIL window's cudaMalloc
        failed on the full card): the "keeps" line, and the buffers never outgrow it; again at a small ray cap the windows exceed (the cap's
@@ -209,6 +226,49 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ink draw: old %g kept / %g rejected, positive share %.3f; stratified %g / %g, %.3f\n", pr[0], rj[0], f0, pr[1], rj[1], f1);
         CHECK(ok && rj[1] < rj[0] && f1 > f0 && f1 < 0.9, "stratified draw: rejected %g vs %g, positive share %.3f vs %.3f (%s/so0.log, so1.log)", rj[1], rj[0], f1, f0, d);
         CHECK(!sh("grep -q 'sampler: wind-fixture-ink: ink draw cells: [0-9]* supervised, [1-9][0-9]* with positive labels$' %s/so1.log", d), "no per-source draw-cell line (%s/so1.log)", d);
+    }
+    {   /* train --ink-surf (2026-11-20, DESIGN "inksurf"): the surface head beside the voxel ink losses, its patch from the mode-2 rays (the MIL keeps
+           its mode-1 subset): the log's "ink surf" finite and positive on windows with a patch, the unmasked share > 0; RUN/last.ckpt.isf written
+           and taken by --resume; at lr 0 (all three; MIL mode 0, rays on the fixture) the step lines' other losses equal a run without it (the head adds only its own term;
+           the MIL's rays from the mode-2 list are mode 0's) */
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/sf --steps 6 --ckpt-every 3 --ink-mil 1 --ink-mil-mode 1 --ink-surf 1 --isf-P 32 --isf-step 2 --isf-k 2 %s > %s/sf.log 2>&1",
+                  U, d, d, common, d), "train --ink-surf (%s/sf.log)", d);
+        snprintf(p, sizeof p, "%s/sf.log", d); int fs = 0; const double sl = log_last(p, " ink surf ", &fs);
+        FILE *g = fopen(p, "r"); char ln[8192]; double win = 0, um = 0;
+        while (g && fgets(ln, sizeof ln, g)) { const char *q = strstr(ln, " ink surf "); if (!q) continue; const char *o = strchr(q, '(');
+            if (o) { const double w = atof(o + 1); if (w > win) win = w; const char *uu = strstr(o, "patch "); if (uu) { const double x = atof(uu + 6); if (x > um) um = x; } } }
+        if (g) fclose(g);
+        fprintf(stderr, "ink surf: last %.4f, up to %.0f%% of windows with a patch, up to %.0f%% unmasked\n", sl, win, um);
+        CHECK(fs && isfinite(sl) && sl > 0 && sl < 5 && win > 0 && um > 0, "ink surf logged %d value %g, windows %g%%, unmasked %g%% (%s)", fs, sl, win, um, p);
+        snprintf(p, sizeof p, "%s/sf/last.ckpt.isf", d); CHECK(!access(p, F_OK), "no %s", p);
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/sf2 --steps 2 --resume %s/sf/last.ckpt --ink-mil 1 --ink-mil-mode 1 --ink-surf 1 --isf-P 32 --isf-step 2 --isf-k 2 %s > %s/sf2.log 2>&1",
+                  U, d, d, d, common, d), "--resume with the head (%s/sf2.log)", d);
+        CHECK(!sh("grep -q 'ink surf: head from .*last.ckpt.isf (step 6)' %s/sf2.log", d), "--resume did not take the surface head (%s/sf2.log)", d);
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/sb1 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 0 --ink-surf 1 --isf-lr 0 --isf-P 32 --isf-step 2 --isf-k 2 %s > %s/sb1.log 2>&1", U, d, d, common, d), "sb1");
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/sb0 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 0 %s > %s/sb0.log 2>&1", U, d, d, common, d), "sb0");
+        CHECK(!sh("for x in sb0 sb1; do grep -E '^(t\\+[0-9.]+s )?step ' %s/$x.log | sed -E 's/^t\\+[0-9.]+s //; s/ ink surf [^(]*\\([^)]*\\)//; s/ [0-9.]+ samp\\/s.*//; s/ (wait|gn) [0-9.%%]+//g' > %s/$x.txt; done; cmp -s %s/sb0.txt %s/sb1.txt", d, d, d, d),
+              "the step losses differ with --ink-surf at lr 0 (%s/sb0.txt, sb1.txt)", d);
+        /* predict --surf (2026-11-21): the trunk features in 32-plane z-slabs (training's unet_head_feat_z) give the map of the whole-window
+           feature copy (UFSM_SURF_WHOLE=1, the old path, 10.3 GB at window 544) byte for byte, every patch run (an unplaced patch prints DEFAULTED, which sp0 must not) */
+        const char *pa = "--um 9.6 --level 0 --box 0,0,0,256,256,256 --shard 128 --levels 2 --threads 2 --q 0 --no-out 1 --surf-P 32 --surf-halo 4 --surf-k 2 --window 128";
+        CHECK(!sh("mkdir -p %s/sp0 %s/sp1 && %s predict %s/sf/last.ckpt %s/fx ct %s/pv0 --axis %s/fx/axis.json --surf %s/fx/seg.tifxyz --surf-out %s/sp0 %s > %s/sp0.log 2>&1",
+                  d, d, U, d, d, d, d, d, d, pa, d), "predict --surf (%s/sp0.log)", d);
+        CHECK(!sh("UFSM_SURF_WHOLE=1 %s predict %s/sf/last.ckpt %s/fx ct %s/pv1 --axis %s/fx/axis.json --surf %s/fx/seg.tifxyz --surf-out %s/sp1 %s > %s/sp1.log 2>&1",
+                  U, d, d, d, d, d, d, pa, d), "predict --surf, whole window (%s/sp1.log)", d);
+        CHECK(!sh("grep -q 'DEFAULTED: predict --surf: UFSM_SURF_WHOLE' %s/sp1.log && ! grep -q DEFAULTED %s/sp0.log", d, d), "DEFAULTED lines (%s/sp0.log, sp1.log)", d);
+        CHECK(!sh("grep -q 'patches run' %s/sp0.log && cmp %s/sp0/seg.tifxyz.tif %s/sp1/seg.tifxyz.tif", d, d, d),
+              "slab vs whole-window maps differ or patches unrun (%s/sp0, sp1)", d);
+        /* (2026-11-21) at level 1 (2 level-0 voxels per window voxel) the map is still written on the mesh's canvas (what ink-score reads):
+           the level-0 map's size; the 2x grid read as canvas px was the S1 0841 / P4 surface-score bug (AUC 0.03 / 0.30) */
+        CHECK(!sh("mkdir -p %s/sp2 && %s predict %s/sf/last.ckpt %s/fx ct %s/pv2 --axis %s/fx/axis.json --surf %s/fx/seg.tifxyz --surf-out %s/sp2 --um 19.2 --level 1 "
+                  "--box 0,0,0,128,128,128 --shard 128 --levels 2 --threads 2 --q 0 --no-out 1 --surf-P 32 --surf-halo 4 --surf-k 2 --window 96 > %s/sp2.log 2>&1", d, U, d, d, d, d, d, d, d),
+              "predict --surf at level 1 (%s/sp2.log)", d);
+        {   char q0[700], q2[700]; snprintf(q0, sizeof q0, "%s/sp0/seg.tifxyz.tif", d); snprintf(q2, sizeof q2, "%s/sp2/seg.tifxyz.tif", d);
+            int w0 = 0, h0 = 0, w2 = 0, h2 = 0; uint8_t *m0 = img_read_u8(q0, &w0, &h0), *m2 = img_read_u8(q2, &w2, &h2); size_t nz = 0;
+            if (m2) for (size_t i = 0; i < (size_t)w2 * h2; i++) nz += m2[i] > 0;
+            fprintf(stderr, "predict --surf: level-0 map %d x %d, level-1 map %d x %d (%.0f%% run px)\n", w0, h0, w2, h2, m2 ? 100.0 * nz / ((double)w2 * h2) : 0);
+            CHECK(m0 && m2 && w0 == w2 && h0 == h2 && nz > (size_t)w2 * h2 / 2, "level-1 map %d x %d vs the canvas %d x %d (%s)", w2, h2, w0, h0, q2);
+            free(m0); free(m2); }
     }
     if (getenv("TIMT_KEEP")) fprintf(stderr, "kept %s (sources %s/fx/sources-mil.json)\n", d, d);
     else if (!fails) sh("rm -rf %s", d);

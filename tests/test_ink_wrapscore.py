@@ -9,6 +9,13 @@ import pathlib
 import subprocess
 import tempfile
 
+import importlib.util
+import sys
+
+if importlib.util.find_spec("zarr") is None:   # the reference scripts/inkgt/wrapscore.py reads zarr (laptop suite 11-21 had none)
+    print("SKIP: no python zarr module (the reference wrapscore.py needs it)")
+    sys.exit(0)
+
 import numpy as np
 import tifffile as t
 

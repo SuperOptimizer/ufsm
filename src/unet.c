@@ -128,6 +128,7 @@ struct unet {
     void *l0r_hsk; size_t l0r_hskn;    /* the skip gradient's pinned host copy (stage S4's host mode: the device holds a ring) */
     size_t sc_w; float sc_c; float *stem_b;   /* scale_cond: offset of the conditioning vector, current scale code, effective stem bias */
     size_t gf_off; float *gf_g, *gf_g1, *gf_dg; int gf_K, gf_top, gf_dedup; void (*gf_red)(void *, float *, int); void *gf_redc;   /* cfg.gfilm: its A / B block (last), the pooled code vector, the affines before it, dg */
+    float *hfz_w, *hfz_wc; void *hfz_cat; size_t hfz_cat_n; const void *hfz_g;   /* unet_head_feat_z / unet_set_head_feat_grad_z (train --ink-surf): identity rows, the combined head's weights + gradients, gy16 rows */
     size_t ld_off; const void *ld_x; int ld_D, ld_H, ld_W, ld_ext, ld_ra, ld_rb; void *ld_pre, *ld_sc; float *ld_L, *ld_wc, *ld_gwc; size_t ld_pre_n, ld_sc_n, ld_L_n;   /* cfg.lat_dec: params, the forward's CT, scratch */
     size_t film_off, fstem_off; float film_c[4]; float *ffw;   /* cfg.film: the first A / D pair, the current codes, the forward copy of the weights (when nothing else copies them) */
     block enc[UNET_MAXLEV], dec[UNET_MAXLEV];
@@ -564,7 +565,7 @@ void unet_free(unet *u) {
     free_acts(u);
     nn_free(u->p); nn_free(u->g); nn_free(u->m); nn_free(u->v); nn_free(u->ema); nn_free(u->hf_w); nn_free(u->l0fg_mx); free(u->inh);
     nn_free(u->gn_scratch); nn_free(u->red_scratch); nn_free(u->wg_tmp);
-    nn_free(u->wm); nn_free(u->sp24_kb); if (u->muon_mom != u->v) nn_free(u->muon_mom); nn_free(u->muon_work);   /* (aliased into v: mom_alloc) */ muon_forget_table(u); nn_free(u->muon_descs); nn_free(u->mx_lrm); nn_free(u->stem_b); nn_free(u->ld_pre); nn_free(u->ld_sc); nn_free(u->ld_L); nn_free(u->ld_wc);
+    nn_free(u->wm); nn_free(u->sp24_kb); if (u->muon_mom != u->v) nn_free(u->muon_mom); nn_free(u->muon_work);   /* (aliased into v: mom_alloc) */ muon_forget_table(u); nn_free(u->muon_descs); nn_free(u->mx_lrm); nn_free(u->stem_b); nn_free(u->ld_pre); nn_free(u->ld_sc); nn_free(u->ld_L); nn_free(u->ld_wc); nn_free(u->hfz_w); nn_free(u->hfz_wc); nn_free(u->hfz_cat);
     nn_free(u->mx_mcd); nn_free(u->mx_nsd); nn_free(u->mx_pool); nn_free(u->mx_hbf); nn_free(u->mx_R); nn_free(u->mx_part); nn_free(u->mx_nmrows); nn_free(u->mx_nmoff); nn_free(u->mx_vrbuf); nn_free(u->mx_vrp); nn_kron_free(u->mx_kron); nn_free(u->qk_lmax); nn_free(u->mx_mixbuf); nn_free(u->mx_mixp);
     nn_free(u->am_dev); nn_free(u->ad_lrm); nn_free(u->ad_ema); nn_free(u->ad_dispbuf); nn_free(u->ad_dispp); nn_free(u->ad_dogst); nn_free(u->ad_part); nn_free(u->ad_ext); nn_free(u->ad_xpart); mprobe_free(u); nn_free(u->ost_dev); nn_free(u->ost_snap); free(u->ost_seg);
     free(u->gn_frz); nn_free(u->gn_frz_d); nn_free(u->ge_run); nn_free(u->ge_pv); nn_free(u->ge_tw); nn_free(u->gf_g); free(u->gn_acc); nn_free(u->l0run); nn_free(u->l0live); nn_free(u->wsp); nn_free(u->l0s_st); nn_free(u->l0s_tmp); nn_free(u->l0st_g2); nn_free(u->l0st_up); nn_free(u->l0st_poison); nn_free(u->l0h_lg); for (int i = 0; i < UNET_MAXLEV; i++) free(u->rb[i]);
@@ -3190,9 +3191,39 @@ int unet_head_fwd_z32(unet *u, int z0, int z1, float *y, size_t ly) {
     if (r || !u->cfg.lat_dec) return r;
     return latdec_rows(u, y, 1, ly ? ly : (size_t)(z1 - z0) * hwp, hc0, hnc, z0, z1);
 }
+/* dec[0]'s output as the head reads it (silu(gn(a2)) / s2) on level-0 planes [z0, z1): fp16 planes [widths[0]][(z1 - z0) h w] (identity rows
+   through the slab head kernel; train --ink-surf reads the trunk's features at the mesh from them) */
+int unet_head_feat_z(unet *u, int z0, int z1, void *y16) {
+    const float *x; nn_gn_t g; const int gn = head_src(u, &x, &g); const int w0 = u->cfg.widths[0];
+    const size_t hw = (size_t)u->ls[0].h * u->ls[0].w;
+    if (!u->hfz_w) { float *h = calloc((size_t)w0 * (w0 + 1), 4); if (!h) return -1; for (int c = 0; c < w0; c++) h[(size_t)c * w0 + c] = 1.f;
+                     u->hfz_w = nn_malloc((size_t)w0 * (w0 + 1) * 4); if (!u->hfz_w) { free(h); return -1; } nn_h2d(u->hfz_w, h, (size_t)w0 * (w0 + 1) * 4); free(h); }
+    nn_set_layer(3 * u->cfg.nlev - 2);
+    return nn_head_fwd_z(x, gn ? &g : nullptr, u->dec[0].ys, u->hfz_w, u->hfz_w + (size_t)w0 * w0, w0, y16, (size_t)z0 * hw, (size_t)(z1 - z0) * hw);
+}
+void unet_set_head_feat_grad_z(unet *u, const void *g16) { u->hfz_g = g16; }
 int unet_head_bwd_z(unet *u, int z0, int z1, const void *gy16, int first) {
     const float *x; nn_gn_t g; const int gn = head_src(u, &x, &g);
     const size_t hw = (size_t)u->ls[0].h * u->ls[0].w;
+    if (u->hfz_g) {   /* + d loss / d features (widths[0] fp16 rows in the backward's scaled domain): the head's rows and identity rows in one call
+                         (the identity rows' weight gradients are discarded) */
+        if (u->l3h || u->cfg.lat_dec || z1 < z0) return -1;
+        const int co = u->cfg.cout, w0 = u->cfg.widths[0], nr0 = co + w0, nr = nr0 <= 16 ? nr0 : (nr0 + 7) / 8 * 8; const size_t nv = (size_t)(z1 - z0) * hw;   /* (zero rows to a multiple of 8: the MX weight-gradient kernel's) */
+        if (!u->hfz_wc) { u->hfz_wc = nn_malloc((size_t)nr * (w0 + 1) * 4 * 2); if (!u->hfz_wc) return -1;
+                          float *h = calloc((size_t)nr * (w0 + 1), 4); if (!h) return -1; for (int c = 0; c < w0; c++) h[(size_t)(co + c) * w0 + c] = 1.f;
+                          nn_h2d(u->hfz_wc, h, (size_t)nr * (w0 + 1) * 4); free(h); }
+        if (u->hfz_cat_n < (size_t)nr * nv * 2) { nn_free(u->hfz_cat); u->hfz_cat_n = (size_t)nr * nv * 2; u->hfz_cat = nn_malloc(u->hfz_cat_n); if (!u->hfz_cat) { u->hfz_cat_n = 0; return -1; } }
+        float *wc = u->hfz_wc, *bc = wc + (size_t)nr * w0, *gwc = wc + (size_t)nr * (w0 + 1), *gbc = gwc + (size_t)nr * w0;
+        nn_d2d(wc, P(u, u->head.w), (size_t)co * w0 * 4); nn_d2d(bc, P(u, u->head.b), (size_t)co * 4);   /* (rows co ..: the identity, bias 0, kept from the setup) */
+        nn_d2d(gwc, u->g + u->head.w, (size_t)co * w0 * 4); nn_d2d(gbc, u->g + u->head.b, (size_t)co * 4);
+        nn_zero(gwc + (size_t)co * w0, (size_t)(nr - co) * w0 * 4); nn_zero(gbc + co, (size_t)(nr - co) * 4);   /* (the identity rows' scratch gradients) */
+        nn_d2d(u->hfz_cat, gy16, (size_t)co * nv * 2); nn_d2d((char *)u->hfz_cat + (size_t)co * nv * 2, u->hfz_g, (size_t)w0 * nv * 2);
+        if (nr > nr0) nn_zero((char *)u->hfz_cat + (size_t)nr0 * nv * 2, (size_t)(nr - nr0) * nv * 2);
+        nn_set_layer(3 * u->cfg.nlev - 2);
+        const int r = nn_head_bwd_z(x, gn ? &g : nullptr, u->dec[0].ys, u->hfz_cat, nr, wc, gwc, gbc, u->gout[0], (size_t)z0 * hw, nv, first);
+        nn_d2d(u->g + u->head.w, gwc, (size_t)co * w0 * 4); nn_d2d(u->g + u->head.b, gbc, (size_t)co * 4);
+        return r;
+    }
     if (u->l3h) {   /* (three level-0 buffers: the slab's fp16 gradient rows [cout][(z1 - z0) h w] into the whole plane [cout][d h w] in X3; the
                        backward's head-recomputing GroupNorm backward runs the head's backward on the whole, after the callback) */
         if (z0 < 0 || z1 > u->ls[0].d || z1 < z0 || u->ls[0].n != 1) return -1;
