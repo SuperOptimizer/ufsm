@@ -102,6 +102,13 @@ static double log_last(const char *path, const char *key, int *found) {   /* the
     while (fgets(ln, sizeof ln, f)) { const char *q = strstr(ln, key); if (q) { v = atof(q + strlen(key)); *found = 1; } }
     fclose(f); return v;
 }
+static double log_sum(const char *path, const char *key) {   /* the step lines' values summed (a window may draw no faceless ray) */
+    FILE *f = fopen(path, "r"); if (!f) return NAN;
+    char ln[8192]; double v = 0; int n = 0;
+    while (fgets(ln, sizeof ln, f)) { const char *l = ln; if (l[0] == 't' && l[1] == '+') { const char *e = strstr(l, "s "); if (e) l = e + 2; }   /* (a "t+12.3s " prefix) */
+        const char *q = strncmp(l, "step ", 5) ? nullptr : strstr(l, key); if (q) { v += atof(q + strlen(key)); n++; } }
+    fclose(f); return n ? v : NAN;
+}
 static double log_first(const char *path, const char *key) {
     FILE *f = fopen(path, "r"); if (!f) return NAN;
     char ln[8192]; double v = NAN;
@@ -115,7 +122,9 @@ int main(int argc, char **argv) {
     const char *U = argv[1];
     char d[] = "/tmp/test_inkmil_XXXXXX"; if (!mkdtemp(d)) return 1;
     const int FN = getenv("TIMT_N") ? atoi(getenv("TIMT_N")) : 256;   /* TIMT_N / TIMT_KEEP=1 (benches): a larger fixture, kept with its MIL source */
-    CHECK(!sh("%s %s/fx %d 2 1 > %s/fx.log 2>&1", argv[2], d, FN, d), "fixture");
+    /* (FX_CT_ZCUT .5: CT 0 from z 128 up, the segment's rows there have no open face: a non-empty faceless set, so MIL mode 1 (the
+       faceless rays) compares real losses below, not two zeros; lead 2026-11-20) */
+    CHECK(!sh("FX_CT_ZCUT=0.5 %s %s/fx %d 2 1 > %s/fx.log 2>&1", argv[2], d, FN, d), "fixture");
     char p[700]; snprintf(p, sizeof p, "%s/fx", d);
     CHECK(!write_segment(p, FN), "segment");
     snprintf(p, sizeof p, "%s/fx/sources-mil.json", d); FILE *f = fopen(p, "w"); if (!f) return 1;
@@ -143,16 +152,16 @@ int main(int argc, char **argv) {
         CHECK(!sh("%s ink-rayface %s/fx/sources-mil.json --threads 2 --verify 6 --P 64 --stride 2 --seed 7 > %s/rf2.log 2>&1", U, d, d), "ink-rayface --verify stride 2 (%s/rf2.log)", d);
         CHECK(!sh("grep -q '6 of 6 windows (P 64, stride 1) byte-identical' %s/rf1.log && grep -q '6 of 6 windows (P 64, stride 2) byte-identical' %s/rf2.log", d, d), "rayface rays differ (%s/rf1.log, rf2.log)", d);
         CHECK(!sh("grep -Eq 'faced pixels' %s/rf1.log && ! grep -q ' 0 faced pixels' %s/rf1.log", d, d), "the fixture faced no pixel (%s/rf1.log): mode 1 untested", d);
-        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/m1 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 1 %s > %s/m1.log 2>&1", U, d, d, common, d), "mode 1 with the bits (%s/m1.log)", d);
-        CHECK(!sh("UFSM_INK_RAYFACE=0 UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/m0 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 1 %s > %s/m0.log 2>&1", U, d, d, common, d), "mode 1 without (%s/m0.log)", d);
-        snprintf(p, sizeof p, "%s/m1.log", d); const double l1 = log_first(p, " ink mil "); snprintf(p, sizeof p, "%s/m0.log", d); const double l0 = log_first(p, " ink mil ");
-        fprintf(stderr, "ink-rayface: mode 1 first-step ink mil %.6f with the bits, %.6f with the face search\n", l1, l0);
-        CHECK(isfinite(l1) && l1 == l0, "mode 1 ink mil with the bits %g vs the face search %g", l1, l0);
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/m1 --steps 4 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 1 %s > %s/m1.log 2>&1", U, d, d, common, d), "mode 1 with the bits (%s/m1.log)", d);
+        CHECK(!sh("UFSM_INK_RAYFACE=0 UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/m0 --steps 4 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 1 %s > %s/m0.log 2>&1", U, d, d, common, d), "mode 1 without (%s/m0.log)", d);
+        snprintf(p, sizeof p, "%s/m1.log", d); const double l1 = log_sum(p, " ink mil "); snprintf(p, sizeof p, "%s/m0.log", d); const double l0 = log_sum(p, " ink mil ");
+        fprintf(stderr, "ink-rayface: mode 1 ink mil (4 steps summed) %.6f with the bits, %.6f with the face search\n", l1, l0);
+        CHECK(isfinite(l1) && l1 > 0 && l1 == l0, "mode 1 ink mil with the bits %g vs the face search %g (0: no faceless ray drawn)", l1, l0);
         /* (2026-11-20 inksurf) a version-2 mode-0 list (every pixel + its index) serves mode 1 through the face bits: the same loss again */
         CHECK(!sh("%s ink-rayface %s/fx/sources-mil.json --threads 2 --rays 2 --rays-mode 0 > %s/rfm0.log 2>&1 && grep -q 'ray lists (stride 2, mode 0)' %s/rfm0.log", U, d, d, d), "ink-rayface --rays-mode 0 (%s/rfm0.log)", d);
-        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/m2 --steps 2 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 1 %s > %s/m2.log 2>&1", U, d, d, common, d), "mode 1 from the mode-0 list (%s/m2.log)", d);
-        snprintf(p, sizeof p, "%s/m2.log", d); const double l2 = log_first(p, " ink mil ");
-        CHECK(isfinite(l2) && l2 == l1, "mode 1 ink mil from the mode-0 list %g vs %g", l2, l1);
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-mil.json --out %s/m2 --steps 4 --lr 0 --muon-lr 0 --det 1 --ink-mil 1 --ink-mil-mode 1 %s > %s/m2.log 2>&1", U, d, d, common, d), "mode 1 from the mode-0 list (%s/m2.log)", d);
+        snprintf(p, sizeof p, "%s/m2.log", d); const double l2 = log_sum(p, " ink mil ");
+        CHECK(isfinite(l2) && l2 > 0 && l2 == l1, "mode 1 ink mil from the mode-0 list %g vs %g", l2, l1);
     }
     /* the planner keeps the MIL buffers free (2026-11-15 try7 one card: allocated lazily after the plan, the first MIL window's cudaMalloc
        failed on the full card): the "keeps" line, and the buffers never outgrow it; again at a small ray cap the windows exceed (the cap's
