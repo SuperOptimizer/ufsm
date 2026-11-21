@@ -1161,11 +1161,11 @@ typedef struct {
     int ncx; int64_t cx[INKFLY_MAXEXCL][6];   /* the held-out boxes whose draw cells inkfly_cells drops (cfg excl; f->c.nexcl is 0 under excl_cells_only) */
     char kdir[1200];                          /* the cache key dir (index.bin, rayface.bin), "" without a disk cache */
     const uint8_t *rf; void *rf_map; size_t rf_len;   /* rayface.bin mapped: per tile 64 x 64 bits, 1 = that label pixel's ray has an open face (dropped in MIL mode 1) */
-    void *rl_map; size_t rl_len; int rl_stride, rl_mode; const uint64_t *rl_off; const struct rlent *rl_e;   /* rays-s<S>-m<M>.bin mapped (inkfly_raylist_load) */
+    void *rl_map; size_t rl_len; int rl_stride, rl_mode, rl_ver; const uint64_t *rl_off; const struct rlent *rl_e;   /* rays-s<S>-m<M>.bin mapped (inkfly_raylist_load) */
 } inkfly;
 /* a cached ray (rays-s<S>-m<M>.bin): the mesh point (level 0, double: the window's float p is computed from it as before), the unit normal
    as the float the ray stores (times the face sign there: exact for a sign of +-1), the label bit */
-typedef struct rlent { double P[3]; float N[3]; uint8_t y, pad[3]; } rlent;
+typedef struct rlent { double P[3]; float N[3]; uint8_t y, pad; uint16_t px; } rlent;   /* px: the pixel in its tile (TS x TS, row-major; "URL2" lists; URL1: 0, unknown) */
 static void inkfly_raylist_load(inkfly *f, int stride, int mode);
 static void inkfly_rayface_load(inkfly *f);
 static struct { _Atomic uint64_t reads, chunks, empty, hits, px, us, ct_us, gpu_chunks, gpu_us; } g_ifs;
@@ -1959,14 +1959,15 @@ static void inkfly_raylist_load(inkfly *f, int stride, int mode) {
         char pth[1300]; snprintf(pth, sizeof pth, "%s/rays-s%d-m%d.bin", f->kdir, s, m);
         const int fd = open(pth, O_RDONLY); if (fd < 0) continue;
         struct stat st; uint8_t h[RL_HDR]; uint32_t ss = 0, mm = 0; uint64_t nt = 0;
-        if (fstat(fd, &st) || pread(fd, h, RL_HDR, 0) != RL_HDR || memcmp(h, "URL1", 4)) { close(fd); continue; }
+        if (fstat(fd, &st) || pread(fd, h, RL_HDR, 0) != RL_HDR || (memcmp(h, "URL1", 4) && memcmp(h, "URL2", 4))) { close(fd); continue; }
         memcpy(&ss, h + 4, 4); memcpy(&mm, h + 8, 4); memcpy(&nt, h + 16, 8);
         if (nt != f->nT || (int)ss != s || (int)mm != m || (m == 1 && !f->rf)) { fprintf(stderr, "ink onfly: %s does not match (tiles / face bits): ignored\n", pth); close(fd); continue; }
         void *mp = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0); close(fd);
         if (mp == MAP_FAILED) continue;
         const uint64_t *off = (const uint64_t *)((const uint8_t *)mp + RL_HDR);
         if ((size_t)st.st_size != RL_HDR + (nt + 1) * 8 + off[nt] * sizeof(rlent)) { munmap(mp, (size_t)st.st_size); continue; }
-        f->rl_map = mp; f->rl_len = (size_t)st.st_size; f->rl_stride = s; f->rl_mode = m; f->rl_off = off; f->rl_e = (const rlent *)(off + nt + 1);
+        f->rl_map = mp; f->rl_len = (size_t)st.st_size; f->rl_stride = s; f->rl_mode = m; f->rl_off = off; f->rl_e = (const rlent *)(off + nt + 1); f->rl_ver = h[3] - '0';
+        if (f->rl_ver < 2) fprintf(stderr, "ink onfly: %s is a version-1 ray list (no pixel index: train --ink-surf's mode-2 rays take the per-window path; ink-rayface --rays 2 --rays-mode 0 builds a v2 list)\n", pth);
         return;
     }
 }
@@ -1982,7 +1983,7 @@ static void *rl_worker(void *a) {   /* pass 0: each tile's ray count; pass 1: th
         size_t ne = 0;
         for (size_t i = 0; i < np; i++) {
             if (J->mode == 1 && (f->rf[t * RF_TB + X[i].px / 8] >> (X[i].px % 8) & 1)) continue;
-            rlent *e = &E[ne++]; memset(e, 0, sizeof *e); for (int d = 0; d < 3; d++) { e->P[d] = X[i].P[d]; e->N[d] = (float)X[i].N[d]; } e->y = X[i].y;
+            rlent *e = &E[ne++]; memset(e, 0, sizeof *e); for (int d = 0; d < 3; d++) { e->P[d] = X[i].P[d]; e->N[d] = (float)X[i].N[d]; } e->y = X[i].y; e->px = X[i].px;
         }
         if (!J->pass) { J->cnt[t] = (uint32_t)ne; continue; }
         if (ne != J->cnt[t]) { atomic_store(&J->fail, 1); break; }
@@ -2004,7 +2005,7 @@ int inkfly_raylist_build(void *handle, int stride, int mode, int nthreads) {
     if (atomic_load(&J.fail)) rc = -1;
     off[0] = 0; for (size_t t = 0; t < f->nT; t++) off[t + 1] = off[t] + cnt[t];
     if (!rc) {
-        fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644); uint8_t h[RL_HDR] = {'U', 'R', 'L', '1'}; const uint32_t ss = (uint32_t)stride, mm = (uint32_t)mode; const uint64_t nt = f->nT;
+        fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644); uint8_t h[RL_HDR] = {'U', 'R', 'L', '2'}; const uint32_t ss = (uint32_t)stride, mm = (uint32_t)mode; const uint64_t nt = f->nT;
         memcpy(h + 4, &ss, 4); memcpy(h + 8, &mm, 4); memcpy(h + 16, &nt, 8);
         const size_t base = RL_HDR + (f->nT + 1) * 8;
         if (fd < 0 || pwrite(fd, h, RL_HDR, 0) != RL_HDR || pwrite(fd, off, (f->nT + 1) * 8, RL_HDR) != (ssize_t)((f->nT + 1) * 8) || ftruncate(fd, (off_t)(base + off[f->nT] * sizeof(rlent)))) rc = -1;
@@ -2229,7 +2230,7 @@ int inkfly_sample_window(void *handle, uint64_t seed, int P, int64_t o[3]) {
 }
 /* the normal-pooled MIL rays of a window (2026-11-11, villa's normal_pooled_3d): per supervised label pixel (every stride-th row / col of
    its label window) whose mesh point lies in the window, the point and the unit normal in the window's level voxels and the 2-D label.
-   mode 1: only the pixels without an open face (the ones the --face voxel target leaves unknown; the face search as inkfly_chunk's on
+   mode 2 (train --ink-surf): every pixel, pad 1 on the ones mode 1 keeps; mode 1: only the pixels without an open face (the ones the --face voxel target leaves unknown; the face search as inkfly_chunk's on
    the level's CT); mode 0: every pixel. Pixels within reach (R level voxels + 1) of a held-out box are left out. */
 int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout) {
     inkfly *f = handle; *out = nullptr; *nout = 0; if (!f) return -1;
@@ -2250,17 +2251,25 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
         }
     }
     for (size_t i = 1; i < nc; i++) { uint32_t t = cand[i]; size_t j = i; while (j > 0 && (f->T[cand[j - 1]].unit > f->T[t].unit || (f->T[cand[j - 1]].unit == f->T[t].unit && f->T[cand[j - 1]].tile > f->T[t].tile))) { cand[j] = cand[j - 1]; j--; } cand[j] = t; }
-    if (f->rl_map && f->rl_stride == stride && f->rl_mode == mode) {   /* the cached lists (rays-s<S>-m<M>.bin): the same rays in the same order */
+    /* the cached lists (rays-s<S>-m<M>.bin): the same rays in the same order. A version-2 mode-0 list (every pixel, with its index) also serves
+       mode 1 (the face bits drop the faced pixels: the mode-1 list's rays, same order) and mode 2 (all, the faceless flagged) */
+    const int rl_use = f->rl_map && f->rl_stride == stride && (f->rl_mode == mode || (f->rl_mode == 0 && f->rl_ver >= 2 && f->rf && (mode == 1 || mode == 2)));
+    if (rl_use) {
         const double sign = c->flip ? -1 : 1; size_t tot = 0; for (size_t q = 0; q < nc; q++) tot += f->rl_off[cand[q] + 1] - f->rl_off[cand[q]];
         inkray *Rr = malloc((tot ? tot : 1) * sizeof *Rr); size_t nr = 0; if (!Rr) { free(cand); return -1; }
         for (size_t q = 0; q < nc; q++) for (uint64_t k = f->rl_off[cand[q]]; k < f->rl_off[cand[q] + 1]; k++) {
-            const rlent *e = &f->rl_e[k]; int in = 1; for (int d = 0; d < 3 && in; d++) in = e->P[d] >= a0[d] && e->P[d] < b0[d];
+            const rlent *e = &f->rl_e[k]; int in = 1;
+            const int faced = f->rl_mode == 0 && mode != 0 ? f->rf[(size_t)cand[q] * RF_TB + e->px / 8] >> (e->px % 8) & 1 : 0;
+            if (mode == 1 && faced) continue; for (int d = 0; d < 3 && in; d++) in = e->P[d] >= a0[d] && e->P[d] < b0[d];
             if (!in) continue;
             int ex = 0; for (int x = 0; x < c->nexcl && !ex; x++) { const int64_t *bx = c->excl[x]; ex = 1; for (int d = 0; d < 3 && ex; d++) ex = e->P[d] > bx[d] - ex_m && e->P[d] < bx[d] + bx[3 + d] + ex_m; }
             if (ex) continue;
             inkray *r = &Rr[nr++];
             for (int d = 0; d < 3; d++) { r->p[d] = (float)((e->P[d] - f->off) / V - o[d]); r->n[d] = sign < 0 ? -e->N[d] : e->N[d]; }
-            r->y = e->y; r->w = 1; r->rs = 1; memset(r->pad, 0, sizeof r->pad);
+            r->y = e->y; r->w = 1; r->rs = 1; r->pad = mode == 2 && !faced; r->unit = (uint16_t)f->T[cand[q]].unit;
+            if (f->rl_ver >= 2) { const ifunit *uu = &f->U[f->T[cand[q]].unit]; const int tt = (int)f->T[cand[q]].tile;
+                                  r->lr = (int32_t)(uu->lr0 + (int64_t)(tt / uu->ntx) * TS + e->px / TS); r->lc = (int32_t)(uu->lc0 + (int64_t)(tt % uu->ntx) * TS + e->px % TS); }
+            else r->lr = r->lc = -1;
         }
         free(cand); *out = Rr; *nout = nr; return 0;
     }
@@ -2300,7 +2309,7 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
     }
     const double sign = c->flip ? -1 : 1;
     uint8_t *drop = nullptr;
-    if (mode == 1 && np) {   /* the face search: the precomputed bits (rayface.bin) or on the level's CT now */
+    if ((mode == 1 || mode == 2) && np) {   /* the face search: the precomputed bits (rayface.bin) or on the level's CT now (mode 2: flags only) */
         drop = calloc(np, 1); if (!drop) goto done;
         if (f->rf) for (size_t i = 0; i < np; i++) drop[i] = f->rf[(size_t)X[i].t * RF_TB + X[i].px / 8] >> (X[i].px % 8) & 1;
         else if (rays_face(f, X, np, lo3, hi3, drop)) { fprintf(stderr, "ink-onfly: rays: a CT slab read failed or a sample left its slab\n"); free(drop); goto done; }
@@ -2308,10 +2317,11 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
     inkray *Rr = malloc((np ? np : 1) * sizeof *Rr); size_t nr = 0;
     for (size_t i = 0; i < np; i++) {
         const cpx *x = &X[i];
-        if (drop && drop[i]) continue;
+        if (mode == 1 && drop && drop[i]) continue;
         inkray *r = &Rr[nr++];
         for (int d = 0; d < 3; d++) { r->p[d] = (float)((x->P[d] - f->off) / V - o[d]); r->n[d] = (float)(x->N[d] * sign); }
-        r->y = x->y; r->w = 1; r->rs = 1; memset(r->pad, 0, sizeof r->pad);
+        r->y = x->y; r->w = 1; r->rs = 1; r->pad = mode == 2 && drop && !drop[i]; { const ifunit *uu = &f->U[f->T[x->t].unit]; const int tt = (int)f->T[x->t].tile; r->unit = (uint16_t)f->T[x->t].unit;
+            r->lr = (int32_t)(uu->lr0 + (int64_t)(tt / uu->ntx) * TS + x->px / TS); r->lc = (int32_t)(uu->lc0 + (int64_t)(tt % uu->ntx) * TS + x->px % TS); }
     }
     free(drop); *out = Rr; *nout = nr; rc = 0;
 done:

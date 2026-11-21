@@ -26,7 +26,10 @@ static uint8_t fx_ct_at(int z, int y, int x) {
     const double w = fx_wind(z, y, x), f = w - floor(w);
     const uint32_t h = (uint32_t)(((uint64_t)z * 73856093u) ^ ((uint64_t)y * 19349663u) ^ ((uint64_t)x * 83492791u)) * 2654435761u;
     const int noise = (int)(h >> 27) - 16;
-    const int v = f < .3 ? 150 + noise : 45 + noise / 2;
+    static double fz0 = -1, fz1 = -1; if (fz0 < 0) { const char *e = getenv("FX_FAINT"); fz0 = fz1 = 2; if (e) sscanf(e, "%lf,%lf", &fz0, &fz1); }   /* FX_FAINT=a,b: papyrus at 75 (below
+       the MIL sources' iso 100, above the coarse probe's air) for z in [a N, b N): no open face there (MIL mode 1's faceless rays, 2026-11-21) */
+    const int pap = z >= fz0 * fx_N && z < fz1 * fx_N ? 75 : 150;
+    const int v = f < .3 ? pap + noise : 45 + noise / 2;
     return (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : v);
 }
 static int fx_write_arr(const char *dir, const int64_t shape[3], float q, int fill, uint8_t *(*gen)(int64_t, int64_t, int64_t, int, void *), void *ctx) {

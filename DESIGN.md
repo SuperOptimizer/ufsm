@@ -37,8 +37,79 @@ equal.
 |---|---|---|---|
 | heldout, hold, valonly, rest (FASTREST=1) | 1624 + 2393 | 802 + 789 (a subset) | 3710 -> ~1590 |
 | heldout, hold, valonly | 1048 + 1816 | 375 + 332 | |
-Lists: /vesuvius/ufsm/inkperf/tl/tiles-1667{,-rest}-l1. Expected: R1 1667 ~36 -> ~15 min, the same AUCs (identity re-score: pending).
+Lists: /vesuvius/ufsm/inkperf/tl/tiles-1667{,-rest}-l1, used by scorec2.sh (/vesuvius/ufsm/inkperf: scorec.sh with the two awk lines
+replaced by a copy of the lists).
+Identity check, R1-40000-l1-t288 (window 288, FASTREST=1, card 0): the old lists against scorec2 give every split's row identical to all
+printed digits (n, AUC, delta, CI). heldout 1296287 / 0.7417, hold 775029 / 0.7382, valonly 521258 / 0.7538, rest 4271015 / 0.7362.
+At window 288 the old path ran 11941 + 15245 windows (1769 + 2452 s predict, ~75 min per score). scorec2 ran its predicts in ~33 min, on
+a card shared with S3.
 test_ink_wrapscore: --tiles-sub 2 lists exist, every grid-0 level-1 tile is a child of a --tiles-sub 1 tile, S 3 is refused.
+
+## inksurf: a surface-aligned ink head beside the voxel ink losses (2026-11-20, branch inksurf-20261120, fullvram)
+
+1667's ink is only readable from wide in-plane patterns (the 4b profiles: no along-normal CT signal, texture AUC .55). So, in addition
+to the 3-D voxel ink head + MIL, a 2-D head reads the trunk's level-0 features on the segment's mesh. The patch is a flattened
+Hp x Hp square, one px per window voxel along the surface (9.6 um at the 9.6 rung), with K = 2k + 1 layers along the normal, one
+voxel apart. The head trains on the 2-D labels directly, with no splat.
+- **Kernels** (src/nn_inksurf.cu, src/inksurf.c):
+  - Resample: trilinear, fp32 / fp16 / bf16 features.
+  - Its adjoint is deterministic: a per-voxel gather over inverse lists built on the host (LSD radix sort by voxel, stable in sample
+    order). No atomics, and the same bits on every run, so A/B diffs aren't noise (lead note 2: cheap enough, kept).
+  - The 2-D head is fp32: 1x1 stem -> 32, a 4-down U-Net (32/48/64/96, 2 x 96 bottleneck, decoder 64/48/32/32), 1x1 -> 1 logit,
+    plus a linear readout (1x1 patch -> logit, summed) that gives the trunk a direct gradient.
+  - Its device memory (parameters, Adam moments, activations, gradients): 19.8 MB at 64^2, ~0.3 GB at 256^2, plus the patch
+    (C K Hp^2 x 4 B: 75 MB at C 32, K 9, 256^2). fp16 is fine here (lead note 3); the fp4 rule's exception is this size.
+- **Training path** (train --ink-surf L; needs --ink-mil, head slabs, one GPU, --accum 1):
+  - Rays: the sampler asks for MIL mode 2 (every pixel's mesh point + normal, faceless ones flagged, uncapped). The MIL keeps its
+    mode-1 subset (evenly thinned to --ink-mil-max). inkray now carries (unit, label row, col); version-2 ray lists ("URL2",
+    pixel index in rlent) give it without the label rasters. A v2 mode-0 list also serves modes 1 / 2 through rayface.bin
+    (`ink-rayface --rays 2 --rays-mode 0`).
+  - The patch: centred on the on-grid ray nearest the window centre, every --isf-step label px of that unit. A px is masked when
+    its column P +- k N leaves the window. --isf-aug 1 (default) draws one of 8 orientations and reverses the normal half the time,
+    because wraps have any orientation / sign.
+  - Features: only the voxels the patch touches. Pass 0 takes them per head slab (unet_head_feat_z: identity rows through the slab
+    head kernel) into a compact fp32 [C][nv]. The head's step after pass 0 gives the compact gradient. In the gradient pass each
+    slab's feature rows go to unet_head_bwd_z with the head's rows in one fused call (unet_set_head_feat_grad_z; zero rows to a
+    multiple of 8 for the MX weight-gradient kernel).
+  - Loss: BCE on the rays' 2-D labels x L x the source's ink weight. AdamW at --isf-lr x the schedule. RUN/<ckpt>.isf is saved
+    beside every checkpoint (ring / snapshots clone it); --resume loads it.
+  - Not yet: teacher pixels (weight 0.3), soft 4x4 labels, dec1 features.
+- **predict --surf W1,W2 --surf-out DIR** (src/surfpred.c):
+  - Each wrap's map (one px per window voxel) is cut into --surf-P patches (192, halo 32).
+  - A window is centred on each patch not yet placed and takes the neighbours that fit its interior. Those windows replace the
+    box grid.
+  - Per window: unet_head_ext_fwd (identity rows) -> the touched features -> the head -> the core's sigmoid as uint8 1..255
+    (0 = no surface). Output: DIR/<wrap>.tif, the ink-wrapscore --maps format.
+- **Tests:**
+  - test_inksurf:
+    - resample = host reference (0 diff).
+    - Adjoint identity, and the gather bit-identical run to run.
+    - 2-D op adjoints.
+    - Directional central differences (Richardson) on the input + 13 convs: worst 0.37 of the tolerance.
+    - The trainer's slab injection vs the whole-window one, at widths[0] 16 and 32: features identical, trunk gradients cosine
+      1.00000, norm ratio 1.0000.
+    - The toy: see below.
+  - test_ink_mil_train adds:
+    - --ink-surf runs, its "ink surf" log is finite.
+    - last.ckpt.isf is written and --resume takes it.
+    - At lr 0 the step lines' other losses equal a run without it (MIL mode 0).
+    - Mode 1 served from a mode-0 list equals mode 1.
+- **The toy and its control** (lead: the 3-D voxel head on the same toy): texture-only ink, a 16/32/64 trunk from scratch at
+  production precision, 400 steps, held-out AUC:
+
+| toy | surface head | 3-D voxel head |
+|---|---|---|
+| default (ink 0.6) | 0.999 | 0.997 |
+| ink 0.15 / 0.08 | 0.970 / 0.662 | 0.949 / 0.584 |
+| mesh error +-3 / +-5 vox, K 9 | 1.000 / 0.999 | 0.998 / 0.995 |
+| TP 128, strokes 48-96, ink 0.12 | 0.987 | 0.983 |
+| TP 128, strokes 64-128, ink 0.08 / 0.06 | 0.776 / 0.498 | 0.852 / 0.591 |
+| stacked sheets (gap 12), strong curvature, ink 0.15 | 0.46-0.64 | 0.69-0.83 |
+
+  A locally visible texture is learned by both heads. At the lowest SNR the voxel loss trains the trunk better than the surface
+  head's single path through a random 2-D net. So the lead's recipe keeps the voxel ink loss on (lambda 1) beside the surface loss.
+  The toy tests plumbing and learnability; the advantage has to show on real data: ink-wrapscore on 1667 / P4 (dev) and
+  0841 / 1447 (clean) vs sH at the same steps.
 
 ## 3-D ink: the H recipe sweep and arm K, a surface-proximity input (2026-11-20, branch inkk-20261120, inksdk)
 

@@ -245,8 +245,8 @@ int cmd_denselab_render(int argc, char **argv) {
    the rays from the bits vs the face search, byte for byte */
 int cmd_ink_rayface(int argc, char **argv) {
     if (argc < 3 || argv[2][0] == '-') {
-        fprintf(stderr, "usage: ufsm ink-rayface SOURCES.json [--source N1,N2] [--threads 8] [--gpu D] [--force 1] [--rays 2] [--verify N --P 256 --stride 2 --R 10 --seed 1]\n"
-                        "  --rays S: also the per-tile ray lists of MIL mode 1 at stride S (0: none); --verify compares the rays a window gets from them / the bits\n"
+        fprintf(stderr, "usage: ufsm ink-rayface SOURCES.json [--source N1,N2] [--threads 8] [--gpu D] [--force 1] [--rays 2] [--rays-mode 1] [--verify N --P 256 --stride 2 --R 10 --seed 1]\n"
+                        "  --rays S: also the per-tile ray lists of MIL mode --rays-mode (1; 0: every pixel, serves modes 1 and 2 too: train --ink-surf) at stride S (0: none); --verify compares the rays a window gets from them / the bits\n"
                         "  with the face search on the CT; --diag N: the CT profiles of N faceless pixels per source, classified (threshold vs mesh offset)\n"
                         "  --profile N --pvol NAME=ROOT|KEY|UM[;NAME=..] [--pbox z,y,x,nz,ny,nx] [--pout F.tsv] [--pauc F.tsv] [--per-tile 8] [--pfeat 1] [--mil-um 50]:\n"
                         "  N supervised pixels' (at most per-tile of each label tile) profiles along the\n"
@@ -259,7 +259,7 @@ int cmd_ink_rayface(int argc, char **argv) {
     const char *names = opt(argc, argv, "--source", nullptr);
     const int nt = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8), gpu = opt_atoi("--gpu", opt(argc, argv, "--gpu", "-1"));
     const int force = opt_atoi("--force", opt(argc, argv, "--force", "0")), nver = opt_atoi("--verify", opt(argc, argv, "--verify", "0"));
-    const int rays = opt_atoi("--rays", opt(argc, argv, "--rays", "2")), diag = opt_atoi("--diag", opt(argc, argv, "--diag", "0"));
+    const int rays_mode = opt_atoi("--rays-mode", opt(argc, argv, "--rays-mode", "1")), rays = opt_atoi("--rays", opt(argc, argv, "--rays", "2")), diag = opt_atoi("--diag", opt(argc, argv, "--diag", "0"));
     const int P = opt_atoi("--P", opt(argc, argv, "--P", "256")), stride = opt_atoi("--stride", opt(argc, argv, "--stride", "2"));
     const float R = (float)atof(opt(argc, argv, "--R", "10")); uint64_t seed = (uint64_t)opt_atoi("--seed", opt(argc, argv, "--seed", "1"));
     const int npro = opt_atoi("--profile", opt(argc, argv, "--profile", "0")); const char *pout = opt(argc, argv, "--pout", nullptr), *pvs = opt(argc, argv, "--pvol", nullptr);
@@ -294,10 +294,10 @@ int cmd_ink_rayface(int argc, char **argv) {
             const double t0 = dl_now();
             if (inkfly_rayface_build(h, nt, force || nver)) { fprintf(stderr, "ink-rayface: %s: FAILED\n", s->name); rc = 1; break; }
             printf("ink-rayface: %s: built in %.0f s\n", s->name, dl_now() - t0);
-            if (rays > 0) {   /* the per-tile ray lists of MIL mode 1 at --rays S (the trainer's --ink-mil-stride, 2) */
+            if (rays > 0) {   /* the per-tile ray lists of MIL mode --rays-mode (1; 0: every pixel, which also serves modes 1 and 2: train --ink-surf) at --rays S (the trainer's --ink-mil-stride, 2) */
                 const double t1 = dl_now();
-                if (inkfly_raylist_build(h, rays, 1, nt)) { fprintf(stderr, "ink-rayface: %s: ray lists FAILED\n", s->name); rc = 1; break; }
-                printf("ink-rayface: %s: ray lists (stride %d, mode 1) in %.0f s\n", s->name, rays, dl_now() - t1);
+                if (inkfly_raylist_build(h, rays, rays_mode, nt)) { fprintf(stderr, "ink-rayface: %s: ray lists FAILED\n", s->name); rc = 1; break; }
+                printf("ink-rayface: %s: ray lists (stride %d, mode %d) in %.0f s\n", s->name, rays, rays_mode, dl_now() - t1);
             }
             if (diag > 0 && inkfly_face_diag(h, diag, seed)) { rc = 1; break; }
             if (npro > 0) {   /* --profile: the --pvol volumes along the label pixels' normals */

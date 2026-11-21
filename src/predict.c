@@ -5,6 +5,7 @@
 #include "defaulted.h"
 #include "gnmode.h"
 #include "nn.h"
+#include "surfpred.h"
 #include "sysinfo.h"
 #include "checkpoint.h"
 #include "sheet.h"
@@ -2838,6 +2839,28 @@ static int predict_one(int argc, char **argv) {
         }
         free(shs);
     }
+    /* --surf W1,W2,..: the surface ink head (train --ink-surf) on these unrolled wraps: the windows reduced to those holding a patch */
+    static surfp *SF; static char sf_out[1200];   /* mgpu: main (predict --surf: one GPU, refused with --gpus > 1 / --split) */
+    {   const char *sw = opt(argc, argv, "--surf", nullptr);
+        if (sw) {
+            const char *sout = opt(argc, argv, "--surf-out", nullptr); char ip[1500]; snprintf(ip, sizeof ip, "%s.isf", ckpt);
+            const char *isf = opt(argc, argv, "--surf-isf", ip);
+            if (!sout || split || nwork > 1 || lat_store || seam2) { fprintf(stderr, "predict --surf: needs --surf-out DIR; one GPU, no --split / --latents / --seam-inproc\n"); return 2; }
+            SF = surfp_open(sw, isf, cfg.widths[0], opt_atoi("--surf-P", opt(argc, argv, "--surf-P", "192")), opt_atoi("--surf-halo", opt(argc, argv, "--surf-halo", "32")),
+                            2 * opt_atoi("--surf-k", opt(argc, argv, "--surf-k", "4")) + 1, scale);
+            if (!SF) return 1;
+            const int64_t wn3[3] = {Wz, W, W}; const int mg[3] = {hz, halo, halo}; int64_t *to = nullptr;
+            int64_t *go = malloc((size_t)(rd.ntiles ? rd.ntiles : 1) * 3 * sizeof *go); if (!go) return 1;
+            for (long i = 0; i < rd.ntiles; i++) { go[3 * i] = bo[0] + rd.tiles[i].tz; go[3 * i + 1] = bo[1] + rd.tiles[i].ty; go[3 * i + 2] = bo[2] + rd.tiles[i].tx; }
+            const long nt = surfp_plan(SF, wn3, mg, go, rd.ntiles, &to);   /* (the box's grid windows that contain patches, then windows centred on the rest) */
+            free(go);
+            if (getenv("UFSM_SURF_PLAN_ONLY") && atoi(getenv("UFSM_SURF_PLAN_ONLY"))) { free(to); fprintf(stderr, "predict --surf: UFSM_SURF_PLAN_ONLY: the plan only\n"); return 0; }
+            if (nt > cap) { cap = nt; rd.tiles = ck_tiles(rd.tiles, (size_t)cap * sizeof *rd.tiles); }
+            for (long i = 0; i < nt; i++) rd.tiles[i] = (tile_t){to[3 * i] - bo[0], to[3 * i + 1] - bo[1], to[3 * i + 2] - bo[2], 0, 1, 0};
+            rd.ntiles = nt; snprintf(sf_out, sizeof sf_out, "%s", sout);
+            free(to);
+        }
+    }
     static seam_t SM;
     if (seam2) {
         if (seam_init(&SM, nph, shard, ns, bo, rd.tiles, rd.ntiles)) { fprintf(stderr, "predict --seam-inproc: out of memory\n"); return 1; }
@@ -3199,6 +3222,7 @@ static int predict_one(int argc, char **argv) {
                     hz, halo, (oz_), (oy_), (ox_), (ez_), (ey_), (ex_), shard); } while (0)
             if (rvfuse && !ldir && !fzs && !lhm) { nn_rv_fuse((void *)lg, w3, half ? cfg.lat_guide != 0 : unet_logits_h16(u)); nn_ptick("rv fuse"); }
             pred_mem_out(u, o);
+            if (SF && surfp_window(SF, u, i, o, Wz, W, W)) return 1;
             if (ctpre && i + 1 < rd.ntiles && atomic_load(&rd.filled) > i + 1) {   /* the next window's CT during this forward (its slot stays held
                                                                                          until that window's statistics, as with the plain upload) */
                 if (pre_i >= 0) nn_stream_wait(1, ev_preu);   /* (the previous prefetch's device copy has read ctpre) */
@@ -3684,6 +3708,7 @@ static int predict_one(int argc, char **argv) {
     if (mch_n > 1) fprintf(stderr, "predict: --channels: %d more channel stores (%s ...) from the same windows\n", mch_n - 1, mch_out[1]);
     free(MC);
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs end-to-end, the windows %.0fs)\n", out, ntiles, now() - t0, t_win);
+    if (SF) { const int r_ = surfp_write(SF, sf_out); surfp_free(SF); SF = nullptr; if (r_) return 1; }
     /* (the share only with UFSM_SKIP_REPORT: without it the line read "... masked-1.000", taken for "every conv skipped" (latcodec 11-20); a
        masked launch runs the active tiles of its mask, not none) */
     if (skip_empty) { fprintf(stderr, "predict: --skip-empty: %ld windows with tile masks (thr %d, margin %d), %ld of %ld conv launches ran on the masks' active tiles", skip_wins, skip_thr, skip_margin, skip_masked, skip_calls);
