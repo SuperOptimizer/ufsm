@@ -648,9 +648,9 @@ static void gpu_input_settle(sample_cfg *sc, int assume_mx, int slot_skip) {   /
     if (sc->w4_dev) { w4dev_init(g_w4devs, g_w4n); fprintf(stderr, "input: the winding mod 4 labels' runs and codes on the GPU, its union-find on the host (--gpu-aug 3; the same bytes as --gpu-aug 2)\n"); }
     if (g_gpu_aug) fprintf(stderr, "input: the scanner augmentation, z-score, symmetry / warp and jitter of the CT channel on the GPU (--gpu-aug 0: on the CPU)\n");
     if (g_gpu_aug == 2) fprintf(stderr, "input: the warped windows' packed targets, phase and winding mod 4 warped on the GPU (--gpu-aug 1: on the CPU)\n");
-    if (g_gpu_aug_asked && g_gpu_aug_want && !g_gpu_aug) fprintf(stderr, "WARNING: --gpu-aug: not available here (needs --gpu-input, cubes, no --ct-aug, --side-air 0, no --overfit / --split); CPU augmentation\n");
+    if (g_gpu_aug_asked && g_gpu_aug_want && !g_gpu_aug) UFSM_DEFAULTED("--gpu-aug: CPU augmentation (needs --gpu-input, cubes, no --ct-aug / --aux-input / --cond, --side-air 0, no --overfit / --split)");
     if (g_gpu_in) fprintf(stderr, "input: the CT channel uploaded, the radial channels built on the GPU (--gpu-input 0: host-built)\n");
-    else if (g_gpu_asked) fprintf(stderr, "WARNING: --gpu-input: not available here (needs the 16-bit -> MX input conversion, whole windows, the 4 plain inputs, no warps / sheet prior); host-built input\n");
+    else if (g_gpu_asked) UFSM_DEFAULTED("--gpu-input: host-built input (needs the 16-bit -> MX input conversion, whole windows, the 4 plain inputs (not --aux-input / --cond), no warps / sheet prior)");
 }
 static int g_film;   /* --film K: the network's per-level scale FiLM (unet_cfg.film) with codes log2(um / 4.8) of the window's grid (K 1) and of the level read (K 2) */
 static float batch_umd(const batch *b, float um) {   /* the voxel size of the level a batch's first window was read at (validation copies carry no level: its grid's) */
