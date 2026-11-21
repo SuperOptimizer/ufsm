@@ -21,8 +21,9 @@ static double tifxyz_meta_scale(const char *p) {   /* meta.json scale[0] (grid v
 }
 typedef struct { char dir[1024], name[256]; int w, h, mw, mh, na, nb; double sc; float *X, *Y, *Z; uint8_t *map; long *pid; } spw;
 typedef struct { int wr, a0, b0, pa, pb; int64_t lo[3], hi[3]; long tile; } spp;
+enum { SURF_ZS = 32 };   /* the feature slab's planes (training's head slabs) */
 struct surfp {
-    spw *W; int nw; spp *P; long np; int Hp, halo, core, K, C0; double s; isf_dev dev; isf_win win; float *idw; void *feat; size_t featc;
+    spw *W; int nw; spp *P; long np; int Hp, halo, core, K, C0; double s; isf_dev dev; isf_win win; float *idw; void *feat; size_t featc; int whole;   /* whole: the whole-window feature fallback (DEFAULTED) */
     long *tp, *toff; long ntile, nrun, nfit; uint8_t *tdone;
 };
 static int grid_pt(const spw *w, double gu, double gv, double P[3]) {   /* the wrap's grid at (col gu, row gv), bilinear; 0: an invalid corner */
@@ -127,9 +128,12 @@ long surfp_plan(surfp *S, const int64_t n[3], const int m[3], int64_t **o) {
 }
 int surfp_window(surfp *S, unet *u, long t, const int64_t o[3], int D, int H, int W) {
     if (t < 0 || t >= S->ntile || S->toff[t] == S->toff[t + 1]) return 0;
-    const size_t V = (size_t)D * H * W;
-    if (S->featc < (size_t)S->C0 * V * 2) { nn_free(S->feat); S->featc = (size_t)S->C0 * V * 2; S->feat = nn_malloc(S->featc); if (!S->feat) { S->featc = 0; fprintf(stderr, "predict --surf: out of GPU memory for the window's features\n"); return -1; } }
-    if (unet_head_ext_fwd(u, S->idw, S->idw + (size_t)S->C0 * S->C0, S->C0, S->feat)) { fprintf(stderr, "predict --surf: the trunk's features are not covered (unet_head_ext_fwd)\n"); return -1; }
+    const size_t V = (size_t)D * H * W, hw = (size_t)H * W;
+    /* (2026-11-21: the trunk features in z-slabs of SURF_ZS planes, the training path's unet_head_feat_z + isf_dev_take: 32 ch x 544^3 fp16
+       whole was 10.3 GB, a 32-plane slab 0.6 GB. The whole-window copy only as a DEFAULTED fallback when the slab path is not covered.) */
+    int whole = S->whole;
+    if (whole && S->featc < (size_t)S->C0 * V * 2) { nn_free(S->feat); S->featc = (size_t)S->C0 * V * 2; S->feat = nn_malloc(S->featc); if (!S->feat) { S->featc = 0; fprintf(stderr, "predict --surf: out of GPU memory for the window's features\n"); return -1; } }
+    if (whole && unet_head_ext_fwd(u, S->idw, S->idw + (size_t)S->C0 * S->C0, S->C0, S->feat)) { fprintf(stderr, "predict --surf: the trunk's features are not covered (unet_head_ext_fwd)\n"); return -1; }
     const int Hp = S->Hp; const size_t n = (size_t)Hp * Hp;
     for (long k = S->toff[t]; k < S->toff[t + 1]; k++) {
         const spp *p = &S->P[S->tp[k]]; spw *w = &S->W[p->wr]; isf_win *iw = &S->win; iw->np = 0;
@@ -141,7 +145,11 @@ int surfp_window(surfp *S, unet *u, long t, const int64_t o[3], int D, int H, in
         }
         if (isf_win_lists(iw, D, H, W) || isf_dev_upload(&S->dev, iw)) { fprintf(stderr, "predict --surf: the patch's lists failed (memory)\n"); return -1; }
         if (!S->dev.nv) continue;
-        nn_isf_take(S->feat, S->C0, V, 0, S->dev.vox, 0, S->dev.nv, S->dev.fc, S->dev.nv);
+        if (!whole) for (int z0 = 0; z0 < D; z0 += SURF_ZS)
+            if (isf_dev_take(&S->dev, u, iw, z0, z0 + SURF_ZS < D ? z0 + SURF_ZS : D, hw)) {
+                fprintf(stderr, "DEFAULTED: predict --surf: the slab features are not covered (unet_head_feat_z): the whole window's features at once (%.2f GB)\n", S->C0 * V * 2e-9);
+                S->whole = 1; return surfp_window(S, u, t, o, D, H, W); }
+        if (whole) nn_isf_take(S->feat, S->C0, V, 0, S->dev.vox, 0, S->dev.nv, S->dev.fc, S->dev.nv);
         isf_dev_step(&S->dev, iw, 1.f, 0, 1.f, nullptr, nullptr);
         for (int i = S->halo; i < Hp - S->halo; i++) for (int j = S->halo; j < Hp - S->halo; j++) {
             const size_t q = (size_t)i * Hp + j; const int a = p->a0 + i, b = p->b0 + j; if (!(iw->wt[q] > 0) || a >= w->mh || b >= w->mw) continue;
