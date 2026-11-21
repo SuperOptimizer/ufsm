@@ -1974,6 +1974,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
             d->isf_tr = tr; d->isf_got = 0; d->isf_l = d->isf_auc = -1; d->isf_frac = isw->frac;
             static int isync = -1; if (isync < 0) isync = ufsm_env_on("UFSM_ISF_SYNC");
             if (isync) isf_resolve(d);
+            static int isw2 = -1; static void *swev; if (isw2 < 0) { isw2 = ufsm_env_on("UFSM_ISF_SW"); if (isw2) swev = nn_event_create(); }
+            if (isw2) { nn_event_record(swev, 0); nn_stream_wait(1, swev); nn_stream_wait(2, swev); }
         }
         nn_ent_fin(d->hs_ent, HE_N);
     } else if (fuse && light) {   /* the logged losses: the same finalisation with the gradient pass's sums (the mask sums and the active count are unchanged) */
@@ -5698,6 +5700,7 @@ int cmd_train(int argc, char **argv) {
                 if (!norm[g]) continue;
                 gpu_state *d = &G[g]; nn_init(d->dev);
                 if (overfit || g_bench_same) continue;           /* keep computing on the same device buffer (UFSM_BENCH_SAME: GPU step time without the loader) */
+                { static int pf = -1; if (pf < 0) pf = getenv("UFSM_ISF_PF") ? atoi(getenv("UFSM_ISF_PF")) : 0; if (pf == 2) nn_sync(); }
                 sampler_release(sp, d->pending);
                 /* prefetch the next batch into the other buffer while this step computes; several GPUs: after every GPU's step is
                    launched (waiting here for GPU 0's next batch held GPU 1's launch back whenever the sampler was behind) */
@@ -5712,6 +5715,7 @@ int cmd_train(int argc, char **argv) {
             gpu_state *d = &G[g]; nn_init(d->dev);
             eg.t_open = 0; double tw = now(); batch *nb = sampler_next_gate(sp, echo_busy, &eg); { const double tn = now(), idl = eg.t_open > 0 ? tn - eg.t_open : 0; wait += idl; gate += tn - tw - idl; g_echo_idle += idl; }   /* (logs: wait = the GPU idle for data; gate = the probe while the GPU still ran) */
             if (!nb) { fprintf(stderr, "sampler stopped before final step\n"); training_failed = 1; break; }
+            { static int pf = -1; if (pf < 0) pf = getenv("UFSM_ISF_PF") ? atoi(getenv("UFSM_ISF_PF")) : 0; if (pf == 1) nn_sync(); }
             int nxt = d->cur ^ 1; upload_async(d, nb, nxt, B, P); d->pending = nb; select_buf(d, nxt);
         }
         if (g_stop || training_failed) break;
