@@ -162,8 +162,26 @@ int surfp_window(surfp *S, unet *u, long t, const int64_t o[3], int D, int H, in
 }
 int surfp_write(surfp *S, const char *dir) {
     char p[1600]; int rc = 0;
-    for (int k = 0; k < S->nw; k++) { snprintf(p, sizeof p, "%s/%s.tif", dir, S->W[k].name);
-        if (tiffw_write(p, S->W[k].mw, S->W[k].mh, 1, S->W[k].map, 1)) { fprintf(stderr, "predict --surf: cannot write %s\n", p); rc = -1; } }
+    /* (2026-11-21) the maps at the mesh's canvas resolution (1 px = 1 level-0 voxel along the surface: what render / ink-score /
+       ink-wrapscore read), not the window-voxel grid (s level-0 voxels per px): at level 2 the 4x coarser map was read as canvas px, i.e.
+       scaled 4x about the corner (0841 AUC 0.03, P4 0.30). Canvas px x samples map coordinate x / s, bilinear over the run pixels (0 = no
+       patch: left out of the weights). UFSM_SURF_NATIVE=1: the window-voxel grid as before. */
+    const int native = getenv("UFSM_SURF_NATIVE") && atoi(getenv("UFSM_SURF_NATIVE"));
+    for (int k = 0; k < S->nw; k++) { const spw *w = &S->W[k]; snprintf(p, sizeof p, "%s/%s.tif", dir, w->name);
+        int ow = w->mw, oh = w->mh; uint8_t *out = w->map;
+        if (!native && S->s != 1) {
+            ow = (int)ceil(w->w / w->sc); oh = (int)ceil(w->h / w->sc); out = calloc((size_t)ow * oh, 1);
+            if (!out) { fprintf(stderr, "predict --surf: out of memory for the canvas map\n"); return -1; }
+            for (int y = 0; y < oh; y++) for (int x = 0; x < ow; x++) {
+                const double my = y / S->s, mx = x / S->s; const int y0 = (int)floor(my), x0 = (int)floor(mx); const double fy = my - y0, fx = mx - x0;
+                double sv = 0, sw = 0;
+                for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++) { const int yy = y0 + dy, xx = x0 + dx; if (yy < 0 || xx < 0 || yy >= w->mh || xx >= w->mw) continue;
+                    const uint8_t v = w->map[(size_t)yy * w->mw + xx]; if (!v) continue; const double wt = (dy ? fy : 1 - fy) * (dx ? fx : 1 - fx); sv += wt * v; sw += wt; }
+                if (sw > 1e-9) { const long v = lround(sv / sw); out[(size_t)y * ow + x] = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : v); }
+            }
+        }
+        if (tiffw_write(p, ow, oh, 1, out, 1)) { fprintf(stderr, "predict --surf: cannot write %s\n", p); rc = -1; }
+        if (out != w->map) free(out); }
     fprintf(stderr, "predict --surf: %ld of %ld patches run, %d maps in %s\n", S->nrun, S->np, S->nw, dir);
     return rc;
 }
