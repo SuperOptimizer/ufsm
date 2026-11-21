@@ -134,6 +134,33 @@ static void head_case(int C, int K, int D, int H, int W) {
     free(gy); free(gys); free(hpre); nn_free(x); nn_free(w); nn_free(gyd); nn_free(gysd); nn_free(pre); nn_free(gw); nn_free(gb); nn_free(gx);
 }
 
+/* (4) 11-21: the > 16-output path's transposed weights when a pass's first call of that shape comes with first 0 (train --ink-surf:
+   the head + feature rows (cout + 32 = 40) only on slabs with a patch, while first = z0 == 0). Pass A: [0, z1) first 1, [z1, D) first 0;
+   then a 32 -> 48 call with other weights (first 1: its own transposed weights and seed, drawn at the same SR counter); pass B: both
+   ranges first 0. gx of B == A byte for byte (was: B's backward-data on the 48-row head's stale weights; on a fresh thread a null wt) */
+static void head_first_case(int C, int K, int D, int H, int W) {
+    printf("(4) nn_head_bwd_z first 0 on a %d -> %d head after another shape\n", C, K);
+    shape5 xs = {1, C, D, H, W}; const size_t hw = (size_t)H * W, S = (size_t)D * hw, gxb = nn_mx4_bytes(xs); const int K2 = K + 8, z1 = D / 2;
+    void *x = mx4_of(xs, 3.f); float *w = dev_vals((size_t)K * C, 0.1f, 0.f), *w2 = dev_vals((size_t)K2 * C, 0.2f, 0.f);
+    uint16_t *gy = malloc((size_t)K2 * S * 2); for (size_t i = 0; i < (size_t)K2 * S; i++) gy[i] = f2h(4e-3f * frand());
+    void *gyd = nn_malloc((size_t)K2 * S * 2); nn_h2d(gyd, gy, (size_t)K2 * S * 2);
+    float *gw = nn_malloc((size_t)K2 * C * 4), *gb = nn_malloc((size_t)K2 * 4); void *gx = nn_malloc(gxb); uint8_t *rx[2]; int rc = 0;
+    const unsigned c0 = nn_sr_ctr();
+    for (int r = 0; r < 2; r++) {
+        if (r == 1) {   /* the other head: its transposed weights replace ours in the thread's cache */
+            nn_zero(gw, (size_t)K2 * C * 4); nn_zero(gb, (size_t)K2 * 4); nn_zero(gx, gxb); nn_set_storage(gx, gxb, 4); nn_sr_set_ctr(c0);
+            rc |= nn_head_bwd_z((const float *)x, nullptr, xs, gyd, K2, w2, gw, gb, (float *)gx, 0, S, 1);
+        }
+        rx[r] = malloc(gxb); nn_zero(gw, (size_t)K * C * 4); nn_zero(gb, (size_t)K * 4); nn_zero(gx, gxb); nn_set_storage(gx, gxb, 4); nn_sr_set_ctr(c0);
+        rc |= nn_head_bwd_z((const float *)x, nullptr, xs, gyd, K, w, gw, gb, (float *)gx, 0, (size_t)z1 * hw, r == 0);
+        rc |= nn_head_bwd_z((const float *)x, nullptr, xs, gyd, K, w, gw, gb, (float *)gx, (size_t)z1 * hw, (size_t)(D - z1) * hw, 0);
+        nn_sync(); nn_d2h(rx[r], gx, gxb);
+    }
+    check("nn_head_bwd_z covered the shapes (first 0)", rc == 0);
+    check("head gx, a pass with first 0 after another head == the first-1 pass (the transposed weights rebuilt)", !memcmp(rx[0], rx[1], gxb));
+    free(rx[0]); free(rx[1]); free(gy); nn_free(x); nn_free(w); nn_free(w2); nn_free(gyd); nn_free(gw); nn_free(gb); nn_free(gx);
+}
+
 int main(void) {
     nn_init(0); nn_set_prec(3); nn_set_tf32(1); nn_set_f16(1);
     wind4_case(1e8f, 1048576.f);   /* P 768: 128 / N = 1.3e-6, s 2^20 */
@@ -141,6 +168,7 @@ int main(void) {
     fstem_case();
     head_case(256, 160, 8, 24, 24);   /* the latent head's path (> 16 outputs: lp_bwd_w1_mx_b_r + lp_conv1_to_mx_r on the transposed weights) */
     head_case(32, 16, 8, 24, 24);     /* the fused kernel (lp_head_bwd_mx_r) */
+    head_first_case(32, 40, 8, 24, 24);   /* train --ink-surf's head + feature rows, first 0 on the pass's first call of the shape */
     printf(fails ? "test_hgscale: %d FAILED\n" : "test_hgscale: ok\n", fails);
     return fails != 0;
 }
