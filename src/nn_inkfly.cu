@@ -29,7 +29,7 @@ typedef struct {
     const uint8_t *lab, *msk; long long rh, rw, rr0, rc0, lh, lw; const int32_t *tiles; int ntiles, ntx;
     const float *X, *Y, *Z; int pu0, pv0, pw, ph, mw, mh; double scale, F; long long glr0, glc0; int nsub, nt; double tstep;
 } du_t;
-typedef struct { double offr, offc, sign, face_a, thr, V, off, slack; int lo, ns, iso, run, gap; long long a0[3], b0[3], co[3], cn[3], o[3], n[3], shape[3]; int nexcl; long long excl[INKFLY_MAXEXCL][6]; } dc_t;
+typedef struct { double offr, offc, sign, face_a, thr, V, off, slack; int lo, ns, iso, run, gap, wlo, whi; long long a0[3], b0[3], co[3], cn[3], o[3], n[3], shape[3]; int nexcl; long long excl[INKFLY_MAXEXCL][6]; } dc_t;
 typedef struct { int32_t r, c; int32_t fo; } frec;
 
 __device__ static inline void d_grid(const du_t &u, const dc_t &c, double r, double cc, double *gu, double *gv) {
@@ -63,16 +63,16 @@ __device__ static inline float d_tri(const uint8_t *b, const long long n[3], dou
     }
     return (float)s;
 }
-__device__ static int d_face_of(const float *s, int n, int lo, int iso, int run, int gap) {
+__device__ static int d_face_of(const float *s, int n, int lo, int iso, int run, int gap, int wlo, int whi) {
     for (int i = 0; i < n;) {
         if (s[i] < iso) { i++; continue; }
         int j = i; while (j < n && s[j] >= iso) j++;
         const int t0 = lo + i, t1 = lo + j - 1;
-        if (j - i >= run && t1 >= -4 && t0 <= 8) {
+        if (j - i >= run && t1 >= wlo && t0 <= whi) {
             int g = 0; while (j + g < n && s[j + g] < iso && g < gap) g++;
             return g >= gap && t1 >= -127 && t1 <= 127 ? t1 : FACE_NONE;
         }
-        if (t0 > 8) return FACE_NONE;
+        if (t0 > whi) return FACE_NONE;
         i = j;
     }
     return FACE_NONE;
@@ -90,7 +90,7 @@ __device__ static inline float d_tri_z(const uint8_t *b, const long long n[3], l
     }
     return (float)s;
 }
-typedef struct { double off, V, sign; int lo, ns, iso, run, gap; long long co[3], cn[3], z0, z1; } rp_t;
+typedef struct { double off, V, sign; int lo, ns, iso, run, gap; long long co[3], cn[3], z0, z1; int wlo, whi; } rp_t;
 /* the MIL rays' face search (inksplat.c inkfly_rays mode 1): one ray a thread */
 __global__ void k_rayface(rp_t p, const double *pn, unsigned n, const uint8_t *ct, uint8_t *drop, int *bad) {
     const unsigned id = blockIdx.x * blockDim.x + threadIdx.x; if (id >= n) return;
@@ -101,7 +101,7 @@ __global__ void k_rayface(rp_t p, const double *pn, unsigned n, const uint8_t *c
         const float v = d_tri_z(ct, p.cn, p.z0, p.z1, q[0], q[1], q[2]); if (v < -1.5f) { atomicExch(bad, 1); return; } raw[k] = v < 0 ? 0 : v;
     }
     for (int k = 0; k < p.ns; k++) sm[k] = 0.25f * (raw[k > 0 ? k - 1 : 0] + 2 * raw[k] + raw[k < p.ns - 1 ? k + 1 : p.ns - 1]);
-    drop[id] = d_face_of(sm, p.ns, p.lo, p.iso, p.run, p.gap) != FACE_NONE;
+    drop[id] = d_face_of(sm, p.ns, p.lo, p.iso, p.run, p.gap, p.wlo, p.whi) != FACE_NONE;
 }
 typedef struct { int32_t r, c; double P[3], N[3]; } nrec_t;
 /* A1: the near pixels of one unit's candidate tiles, with their point / normal, and the level-0 box their samples reach */
@@ -132,7 +132,7 @@ __global__ void k_face(const dc_t *cp, const uint8_t *ct, const nrec_t *rec, con
         const float v = d_tri(ct, c.cn, q[0], q[1], q[2]); raw[i] = v < 0 ? 0 : v;
     }
     for (int i = 0; i < c.ns; i++) sm[i] = 0.25f * (raw[i > 0 ? i - 1 : 0] + 2 * raw[i] + raw[i < c.ns - 1 ? i + 1 : c.ns - 1]);
-    const int fo = d_face_of(sm, c.ns, c.lo, c.iso, c.run, c.gap);
+    const int fo = d_face_of(sm, c.ns, c.lo, c.iso, c.run, c.gap, c.wlo, c.whi);
     if (fo == FACE_NONE) return;
     const unsigned j = atomicAdd(nout, 1u); out[j].r = R.r; out[j].c = R.c; out[j].fo = fo;
 }
@@ -207,7 +207,7 @@ static int grow(ictx *x, int i, size_t n) {
 static void to_dc(const ifg_cfg *cf, dc_t *hc) {
     memset(hc, 0, sizeof *hc);
     hc->offr = cf->offr; hc->offc = cf->offc; hc->sign = cf->sign; hc->face_a = cf->face_a; hc->thr = cf->thr; hc->V = cf->V; hc->off = cf->off; hc->slack = cf->slack;
-    hc->lo = cf->lo; hc->ns = cf->ns; hc->iso = cf->iso; hc->run = cf->run; hc->gap = cf->gap; hc->nexcl = cf->nexcl;
+    hc->lo = cf->lo; hc->ns = cf->ns; hc->iso = cf->iso; hc->run = cf->run; hc->gap = cf->gap; hc->wlo = cf->wlo; hc->whi = cf->whi; hc->nexcl = cf->nexcl;
     for (int d = 0; d < 3; d++) { hc->a0[d] = cf->a0[d]; hc->b0[d] = cf->b0[d]; hc->shape[d] = cf->shape[d]; }
     for (int e = 0; e < cf->nexcl; e++) for (int d = 0; d < 6; d++) hc->excl[e][d] = cf->excl[e][d];
 }
@@ -358,7 +358,7 @@ extern "C" int inkfly_gpu_rayface(const ifg_ray *p, const double *pn, size_t n, 
         const size_t ncv = (size_t)(p->z1 - p->z0) * p->cn[1] * p->cn[2], nd = (n + 15) & ~(size_t)15;
         if (grow(x, B_CT, ncv) || grow(x, B_RPN, n * 6 * sizeof(double)) || grow(x, B_RDR, nd + 16)) { atomic_over(); return 1; }
         ic_stage(x, STG(ncv) + STG(n * 6 * sizeof(double)) + STG(n) + STG(sizeof(int)));
-        rp_t h; h.off = p->off; h.V = p->V; h.sign = p->sign; h.lo = p->lo; h.ns = p->ns; h.iso = p->iso; h.run = p->run; h.gap = p->gap;
+        rp_t h; h.off = p->off; h.V = p->V; h.sign = p->sign; h.lo = p->lo; h.ns = p->ns; h.iso = p->iso; h.run = p->run; h.gap = p->gap; h.wlo = p->wlo; h.whi = p->whi;
         for (int d = 0; d < 3; d++) { h.co[d] = p->co[d]; h.cn[d] = p->cn[d]; } h.z0 = p->z0; h.z1 = p->z1;
         uint8_t *dd = (uint8_t *)x->b[B_RDR].p; int *db = (int *)(dd + nd);
         IG_CK(ic_h2d(x, x->b[B_CT].p, ct, ncv));

@@ -394,16 +394,18 @@ typedef struct { const geo *G; double V, off; z3 *ct; int nbx, nby, nblk; _Atomi
 static inline float tri_box(const uint8_t *b, const int64_t n[3], double z, double y, double x);
 /* the open face of one CT column s[0 .. n) (t = lo + i): the first papyrus run of >= run samples ending at t >= -4 and starting at
    t <= 8, followed by >= gap samples below iso; FACE_NONE when the column has none */
-static int face_of(const float *s, int n, int lo, int iso, int run, int gap) {
+static inline int fwlo(const inksplat_cfg *c) { return c->face_wlo || c->face_whi ? c->face_wlo : -4; }
+static inline int fwhi(const inksplat_cfg *c) { return c->face_wlo || c->face_whi ? c->face_whi : 8; }
+static int face_of_w(const float *s, int n, int lo, int iso, int run, int gap, int wlo, int whi) {
     for (int i = 0; i < n;) {
         if (s[i] < iso) { i++; continue; }
         int j = i; while (j < n && s[j] >= iso) j++;   /* papyrus run [i, j) */
         const int t0 = lo + i, t1 = lo + j - 1;
-        if (j - i >= run && t1 >= -4 && t0 <= 8) {
+        if (j - i >= run && t1 >= wlo && t0 <= whi) {
             int g = 0; while (j + g < n && s[j + g] < iso && g < gap) g++;
             return g >= gap && t1 >= -127 && t1 <= 127 ? t1 : FACE_NONE;
         }
-        if (t0 > 8) return FACE_NONE;
+        if (t0 > whi) return FACE_NONE;
         i = j;
     }
     return FACE_NONE;
@@ -437,7 +439,7 @@ static void *face_worker(void *arg) {
                 const float v = tri_box(cb, nb, q[0], q[1], q[2]); raw[i] = v < 0 ? 0 : v;
             }
             for (int i = 0; i < n; i++) sm[i] = 0.25f * (raw[i > 0 ? i - 1 : 0] + 2 * raw[i] + raw[i < n - 1 ? i + 1 : n - 1]);
-            const int f = face_of(sm, n, lo, c->iso, c->face_run, c->face_gap);
+            const int f = face_of_w(sm, n, lo, c->iso, c->face_run, c->face_gap, fwlo(c), fwhi(c));
             G->face[(size_t)r * G->lw + cc] = (int8_t)f;
             if (f != FACE_NONE) { nf++; h[f + 128]++; }
         }
@@ -1211,6 +1213,14 @@ int inkfly_map_boxes(const char *map, int64_t (*b)[6], int nb, double pad) {
     }
     return 0;
 }
+/* the open-face rule in the fine scan's voxels (R11 11-22: unscaled, a papyrus run of 3 and an air gap of 2 FINE voxels (3.4 / 2.3 um at
+   1.129 um) took cracks inside a sheet for its face and the start window t <= 8 missed 9-19 um offsets: the 1.1 um labels sat ~20-30 voxels
+   short of the ink, best face shift +27 on Paris 4): run, gap and the window [-4, 8] x ds, rounded */
+static void inkfly_map_face_rule(inksplat_cfg *c, double ds) {
+    const int wlo = fwlo(c), whi = fwhi(c);
+    c->face_run = (int)lround(c->face_run * ds); c->face_gap = (int)lround(c->face_gap * ds); c->face_wlo = (int)lround(wlo * ds); c->face_whi = (int)lround(whi * ds);
+    if (c->face_run < 1) c->face_run = 1; if (c->face_gap < 1) c->face_gap = 1; if (!c->face_wlo && !c->face_whi) c->face_whi = 1;
+}
 /* every valid vertex (ssurf_pn's rule: Z >= 0; and finite) of a loaded mesh through the map, coarse (the segments' scan) -> fine (this CT) */
 static void ssurf_map(ssurf *s, const rmap *m) {
     const size_t n = (size_t)s->w * s->h;
@@ -1286,7 +1296,7 @@ static int inkfly_chunk_gpu(inkfly *f, const int64_t o[3], const int64_t n[3], c
     }
     {
         ifg_cfg C = {0}; C.offr = c->label_off[0]; C.offc = c->label_off[1]; C.sign = c->flip ? -1 : 1; C.face_a = c->face_a; C.thr = c->thr; C.V = V; C.off = f->off; C.slack = slack;
-        C.lo = (int)floor(c->face_lo); C.ns = (int)ceil(c->face_hi) - C.lo + 1; C.iso = c->iso; C.run = c->face_run; C.gap = c->face_gap;
+        C.lo = (int)floor(c->face_lo); C.ns = (int)ceil(c->face_hi) - C.lo + 1; C.iso = c->iso; C.run = c->face_run; C.gap = c->face_gap; C.wlo = fwlo(c); C.whi = fwhi(c);
         for (int d = 0; d < 3; d++) { C.a0[d] = a0[d]; C.b0[d] = b0[d]; C.shape[d] = f->shape[d]; }
         C.nexcl = c->nexcl; C.excl = (const int64_t (*)[6])c->excl;
         uint64_t npx = 0; int64_t lo[3], hi[3]; double tg = snow();
@@ -1401,7 +1411,7 @@ static int inkfly_chunk(inkfly *f, const int64_t o[3], const int64_t n[3], uint8
                 const float v = tri_box(ctb, cn, qq[0], qq[1], qq[2]); raw[i] = v < 0 ? 0 : v;
             }
             for (int i = 0; i < ns; i++) sm[i] = 0.25f * (raw[i > 0 ? i - 1 : 0] + 2 * raw[i] + raw[i < ns - 1 ? i + 1 : ns - 1]);
-            const int fo = face_of(sm, ns, lo, c->iso, c->face_run, c->face_gap);
+            const int fo = face_of_w(sm, ns, lo, c->iso, c->face_run, c->face_gap, fwlo(c), fwhi(c));
             if (fo == FACE_NONE) continue;
             const double ta = fo + c->face_a; const uint8_t lv = g->lab[pk]; const int ink = lv >= 128;
             for (int a = 0; a < nsub; a++) for (int b = 0; b < nsub; b++) {
@@ -1543,7 +1553,7 @@ static char *inkfly_key(const inkfly *f, const inksplat_cfg *c, const char *segs
     if (c->map && *c->map) {   /* the reg map (its file and field; the scaled face distances are in the cfg line) */
         char rp[4200], dir[4200]; if (!realpath(c->map, rp)) snprintf(rp, sizeof rp, "%s", c->map);
         snprintf(dir, sizeof dir, "%s", rp); char *sl = strrchr(dir, '/'); if (sl) *sl = 0;
-        key_add(&b, &n, &cap, "map %s dist %.9g", rp, c->map_dist); key_stat(&b, &n, &cap, rp, nullptr); key_stat(&b, &n, &cap, dir, "field.f32"); key_add(&b, &n, &cap, "\n"); }
+        key_add(&b, &n, &cap, "map %s dist %.9g window %d,%d", rp, c->map_dist, fwlo(c), fwhi(c)); key_stat(&b, &n, &cap, rp, nullptr); key_stat(&b, &n, &cap, dir, "field.f32"); key_add(&b, &n, &cap, "\n"); }
     for (int e = 0; e < c->nexcl; e++) key_add(&b, &n, &cap, "exclude %lld,%lld,%lld,%lld,%lld,%lld\n", (long long)c->excl[e][0], (long long)c->excl[e][1],
                                                (long long)c->excl[e][2], (long long)c->excl[e][3], (long long)c->excl[e][4], (long long)c->excl[e][5]);
     for (int i = 0; i < f->nS; i++) { key_add(&b, &n, &cap, "mesh %s", f->Spath[i]);
@@ -1620,7 +1630,7 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
         char ck[512];
         if (inkfly_map_coarse(cfg->map, ck, sizeof ck, &map_um) || !(map = reg_map_load(cfg->map))) { fprintf(stderr, "ink onfly: %s: cannot load the map %s\n", segs_path, cfg->map); z3_close(ct); return nullptr; }
         const double ds = cfg->map_dist > 0 ? cfg->map_dist : cbrt(fabs(raff_det(&map->Ainv)));
-        cm.face_a *= ds; cm.face_b *= ds; cm.face_lo *= ds; cm.face_hi *= ds; cm.map_dist = ds;
+        cm.face_a *= ds; cm.face_b *= ds; cm.face_lo *= ds; cm.face_hi *= ds; cm.map_dist = ds; inkfly_map_face_rule(&cm, ds);
     }
     cfg = &cm;
     FILE *fp = fopen(segs_path, "rb"); if (!fp) { fprintf(stderr, "ink onfly: cannot open %s\n", segs_path); z3_close(ct); return nullptr; }
@@ -1853,7 +1863,7 @@ static int rays_face(inkfly *f, const cpx *X, size_t np, const double lo3[3], co
             if (!pn) { pn = malloc(np * 6 * sizeof *pn); gd = malloc(np); }
             if (pn && gd) {
                 for (size_t j = 0; j < m; j++) { const cpx *x = &X[ord[b0 + j]]; memcpy(pn + 6 * j, x->P, 3 * sizeof(double)); memcpy(pn + 6 * j + 3, x->N, 3 * sizeof(double)); }
-                ifg_ray rp = {f->off, V, sign, lo, ns, c->iso, c->face_run, c->face_gap, {co[0], co[1], co[2]}, {cn[0], cn[1], cn[2]}, z0, z1};
+                ifg_ray rp = {f->off, V, sign, lo, ns, c->iso, c->face_run, c->face_gap, {co[0], co[1], co[2]}, {cn[0], cn[1], cn[2]}, z0, z1, fwlo(c), fwhi(c)};
                 const int g = inkfly_gpu_rayface(&rp, pn, m, ctb, gd);
                 if (!g) { for (size_t j = 0; j < m; j++) drop[ord[b0 + j]] = gd[j]; continue; }
                 if (g == 2) { bad = 1; break; }
@@ -1867,7 +1877,7 @@ static int rays_face(inkfly *f, const cpx *X, size_t np, const double lo3[3], co
                 const float v = tri_box_z(ctb, cn, z0, z1, qq[0], qq[1], qq[2]); if (v < -1.5f) { bad = 1; break; } raw[k] = v < 0 ? 0 : v; }
             if (bad) break;
             for (int k = 0; k < ns; k++) sm[k] = 0.25f * (raw[k > 0 ? k - 1 : 0] + 2 * raw[k] + raw[k < ns - 1 ? k + 1 : ns - 1]);
-            drop[ord[j]] = face_of(sm, ns, lo, c->iso, c->face_run, c->face_gap) != FACE_NONE;
+            drop[ord[j]] = face_of_w(sm, ns, lo, c->iso, c->face_run, c->face_gap, fwlo(c), fwhi(c)) != FACE_NONE;
         }
     }
     free(cnt); free(ord); free(sl); free(ctb); free(pn); free(gd);
@@ -2211,7 +2221,7 @@ int inkfly_profile(void *handle, int nsample, uint64_t seed, int nv, z3 *const *
             /* the face as rays_face: the smoothed samples of [lo, hi] only (its smoothing clamps at the range ends) */
             float rs[256]; const int ns = hi - lo + 1; for (int k = 0; k < ns; k++) rs[k] = pr[0][lo + k + TR];
             float s2[256]; for (int k = 0; k < ns; k++) s2[k] = 0.25f * (rs[k > 0 ? k - 1 : 0] + 2 * rs[k] + rs[k < ns - 1 ? k + 1 : ns - 1]);
-            const int ft = face_of(s2, ns, lo, c->iso, c->face_run, c->face_gap);
+            const int ft = face_of_w(s2, ns, lo, c->iso, c->face_run, c->face_gap, fwlo(c), fwhi(c));
             int cl = -1;   /* faceless: (a) iso in range, rule rejects (b) iso only outside (c) papyrus under iso (d) none (inkfly_face_diag) */
             if (ft == FACE_NONE) { float mx = 0; int near = 1 << 20;
                 for (int k = 0; k < NS; k++) { const int tv = k - TR; if (tv >= lo && tv <= hi) { if (sm[k] > mx) mx = sm[k]; } else if (sm[k] >= c->iso && abs(tv) < abs(near)) near = tv; }
@@ -2864,7 +2874,7 @@ static void *au_worker(void *arg) {
                         const double tt = (lo + i) * G->sign; double q[3]; for (int d = 0; d < 3; d++) q[d] = (P[d] + tt * N[d] - of) / Vf - o[d];
                         const float v = tri_box(cb, n, q[0], q[1], q[2]); raw[i] = v < 0 ? 0 : v; }
                     if (ok) { for (int i = 0; i < nn; i++) sm[i] = 0.25f * (raw[i > 0 ? i - 1 : 0] + 2 * raw[i] + raw[i < nn - 1 ? i + 1 : nn - 1]);
-                        for (int q = 0; q < 16; q++) A->isof[sp][cls][q] += face_of(sm, nn, lo, au_iso[q], c->face_run, c->face_gap) != FACE_NONE;
+                        for (int q = 0; q < 16; q++) A->isof[sp][cls][q] += face_of_w(sm, nn, lo, au_iso[q], c->face_run, c->face_gap, fwlo(c), fwhi(c)) != FACE_NONE;
                         if (fo == FACE_NONE) A->why[sp][cls][au_why(sm, nn, lo, c->iso, c->face_run, c->face_gap)]++; }
                 }
                 if (fo == FACE_NONE) continue;
@@ -2948,7 +2958,7 @@ int cmd_ink_audit(int argc, char **argv) {
     const char *mapf = sopt(argc, argv, "--map", nullptr); const rmap *map = nullptr; double map_um = 0; char hkey[512]; snprintf(hkey, sizeof hkey, "%s", c.ct_key);
     if (mapf) {
         if (inkfly_map_coarse(mapf, hkey, sizeof hkey, &map_um) || !(map = reg_map_load(mapf))) { fprintf(stderr, "ink-audit: cannot load the map %s\n", mapf); return 1; }
-        const double ds = cbrt(fabs(raff_det(&map->Ainv))); c.face_a *= ds; c.face_b *= ds; c.face_lo *= ds; c.face_hi *= ds; c.map = mapf; c.map_dist = ds;
+        const double ds = cbrt(fabs(raff_det(&map->Ainv))); c.face_a *= ds; c.face_b *= ds; c.face_lo *= ds; c.face_hi *= ds; c.map = mapf; c.map_dist = ds; inkfly_map_face_rule(&c, ds);
     }
     { const int bs = opt_atoi("--blocks-size", sopt(argc, argv, "--blocks-size", "2048")); if (bs < 32) { fprintf(stderr, "ink-audit: --blocks-size >= 32\n"); return 2; } g_au_blk = bs; }
     inksplat_cfg hc; memset(&hc, 0, sizeof hc);
