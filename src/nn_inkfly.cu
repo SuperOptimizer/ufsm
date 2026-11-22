@@ -222,7 +222,9 @@ static void atomic_over(void) {
    workers sat in futex waits at 1.7 of 32 cores, 30-60 % trainer wait. Each chunk is 2-3 synchronous round trips, and on a default-priority
    stream every one queued behind the trainer's kernels; the pageable copies went through the driver's staging under its lock. Now: the
    device's highest stream priority (the kernels are scheduled ahead of the trainer's queue; UFSM_INKFLY_PRIO=0: the old default priority)
-   and the copies through a per-thread pinned arena (UFSM_INKFLY_PINNED=0: pageable). Scheduling and copies only: the bytes are the same.
+   and, opt-in (UFSM_INKFLY_PINNED=1), the copies through a per-thread pinned arena. Scheduling and copies only: the bytes are the same
+   (test_ink_splat's GPU-open hash equal in all four settings). Laptop A/B beside a fixture trainer: the GPU open 0.12 s pageable vs 0.19 s
+   pinned (the arena's cudaHostAlloc per new reader thread costs more than the staging saves), priority within noise on that small load. */
    A thread's context is released at its exit (its device buffers back to the budget, its pinned arena freed). */
 static pthread_key_t g_ickey;   /* mgpu: guarded (pthread_once g_ickonce) */
 static pthread_once_t g_ickonce = PTHREAD_ONCE_INIT;   /* mgpu: guarded (itself) */
@@ -237,11 +239,12 @@ static void ic_release(void *p) {
 }
 static void ic_key_init(void) { pthread_key_create(&g_ickey, ic_release); }
 static int env_off(const char *k) { const char *e = getenv(k); return e && !strcmp(e, "0"); }
+static int ufsm_pin_on(void) { const char *e = getenv("UFSM_INKFLY_PINNED"); return e && !strcmp(e, "1"); }
 /* the calling thread's context on the ink device: 0, 1 no stream (this chunk on the CPU), -1 a CUDA error */
 static int ic_open(ictx **px) {
     pthread_once(&g_ickonce, ic_key_init);
     ictx *x = t_ic;
-    if (!x) { x = t_ic = (ictx *)calloc(1, sizeof *x); if (!x) return 1; x->dev = -1; x->usepin = !env_off("UFSM_INKFLY_PINNED"); pthread_setspecific(g_ickey, x); }
+    if (!x) { x = t_ic = (ictx *)calloc(1, sizeof *x); if (!x) return 1; x->dev = -1; x->usepin = ufsm_pin_on(); pthread_setspecific(g_ickey, x); }
     *px = x;
     if (x->dev != g_dev) {
         if (cudaSetDevice(g_dev) != cudaSuccess) return -1;
