@@ -55,4 +55,8 @@ with tempfile.TemporaryDirectory(prefix="ufsm-teachup-") as tmp:
         dl = np.abs(L2.astype(int) - rl)   # up 2: exact; up 3: thirds make exact .5 ties whose rounding follows the float sum order (1 LSB)
         assert (dl == 0).all() if up == 2 else (dl.max() <= 1 and (dl > 0).mean() < 1e-3), (up, int((dl > 0).sum()), int(dl.max()))
         assert abs(j["label_scale"] - 4 / up) < 1e-6 and j["crop"] == [0, 0, W * up, H * up] and j["teach_px"] == int((rm == 255).sum())
+    r = subprocess.run([str(BIN), "ink-teach-up", str(d / "segs.json"), "rel"], cwd=d, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout
+    j = json.loads((d / "rel" / "segs-teach.json").read_text())["segments"][0]   # a relative OUT still writes absolute labels / mask paths
+    assert j["labels"].startswith("/") and j["mask"].startswith("/") and pathlib.Path(j["labels"]).parent.is_dir(), j
 print("test_ink_teach_up: PASS")

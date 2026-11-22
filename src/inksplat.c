@@ -2676,6 +2676,8 @@ int cmd_ink_teach_up(int argc, char **argv) {
     json *j = json_parse(txt, rd); free(txt); const json *sg = json_get(j, "segments");
     if (!sg || sg->type != J_ARR) { fprintf(stderr, "ink-teach-up: %s: no segments\n", segs); json_free(j); return 1; }
     if (mkdir_p(out)) { fprintf(stderr, "ink-teach-up: cannot create %s\n", out); json_free(j); return 1; }
+    char outabs[PATH_MAX]; if (!realpath(out, outabs)) { fprintf(stderr, "ink-teach-up: cannot resolve %s\n", out); json_free(j); return 1; }
+    out = outabs;   /* the json's labels / mask paths absolute: train reads them as given, not relative to the json (11-21: teach2 failed to load) */
     char jp[1400]; snprintf(jp, sizeof jp, "%s/segs-teach.json", out); FILE *jf = fopen(jp, "wb"); if (!jf) { json_free(j); return 1; }
     fprintf(jf, "{\"note\": \"%s [ink-teach-up %d: label_scale / %d, p bilinear in the mask, mask nearest]\",\n \"segments\": [\n", json_str(json_get(j, "note"), ""), up, up);
     int rc = 0, nw = 0;
