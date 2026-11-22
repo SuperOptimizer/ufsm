@@ -45,7 +45,7 @@ typedef struct {
     int profile, stride;        /* profile half range (layers), pixel stride */
     const char *summary;        /* summary JSON path (default <out>/segments/<name>.json) */
     const char *preview;        /* JPEG of the label window (supervised no ink gray-blue, ink white) */
-    int face; double face_a, face_b, face_lo, face_hi; int face_run, face_gap;
+    int face; double face_a, face_b, face_lo, face_hi; int face_run, face_gap, face_wlo, face_whi;   /* (wlo / whi: the face run must end at t >= wlo and start at t <= whi; 0 0 = -4 8) */
                                 /* --face A,B: the band is placed per label pixel relative to the sheet's open face on the +N side (the written
                                    recto face) instead of the mesh: along sign N, t in [face_lo, face_hi] level-0 voxels, the CT of the output
                                    level smoothed [1 2 1]; the first papyrus run (>= face_run samples >= iso) that ends at t >= -4 and starts

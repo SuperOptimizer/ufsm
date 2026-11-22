@@ -22,7 +22,7 @@ typedef struct {
     int nsub, nt; double tstep;
 } ifg_unit;
 typedef struct {
-    double offr, offc, sign, face_a, thr, V, off, slack; int lo, ns, iso, run, gap;
+    double offr, offc, sign, face_a, thr, V, off, slack; int lo, ns, iso, run, gap, wlo, whi;   /* (wlo / whi: face_of's run window, -4 / 8) */
     int64_t a0[3], b0[3];              /* the chunk's level-0 box [a0, b0) (the near test) */
     int64_t shape[3]; int nexcl; const int64_t (*excl)[6];
 } ifg_cfg;
@@ -36,7 +36,7 @@ __attribute__((weak)) int inkfly_gpu_finish(const ifg_cfg *c, const uint8_t *ctb
 /* the MIL rays' face search (inksplat.c inkfly_rays mode 1, 2026-11-20: 18 % of FR1's sampler CPU) on the CT slab ct of rows [z0, z1) of a
    box of cn voxels at co: per ray (pn: P[3], N[3] in level-0 units, n rays) drop[i] = 1 when it has a face. Byte for byte the CPU loop.
    Returns 0 ok, 1 not now (budget / ns: run the CPU loop), 2 a sample left the slab (the caller's margin bug), < 0 a CUDA failure */
-typedef struct { double off, V, sign; int lo, ns, iso, run, gap; int64_t co[3], cn[3], z0, z1; } ifg_ray;
+typedef struct { double off, V, sign; int lo, ns, iso, run, gap; int64_t co[3], cn[3], z0, z1; int wlo, whi; } ifg_ray;
 __attribute__((weak)) int inkfly_gpu_rayface(const ifg_ray *p, const double *pn, size_t n, const uint8_t *ct, uint8_t *drop);
 __attribute__((weak)) unsigned long long inkfly_gpu_rays(void);   /* rays faced on the GPU so far (tests) */
 __attribute__((weak)) void inkfly_gpu_device(int dev);
