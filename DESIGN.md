@@ -6,6 +6,20 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## The surface head step without a drain; --det is not deterministic under --ink-surf (2026-11-21, branch isfperf-20261121, inkperf)
+
+- isf_dev_step was one call that waited for the head's logits (the loss / AUC on the host) before training queued anything else: the GPU
+  drained once a step. Now isf_dev_launch queues the resample, forward, the logits' copy into pinned memory (event) and the backward /
+  gather; isf_resolve waits for that event only where isf_got is needed (the gradient pass's first slab, the head's AdamW, the log).
+  Same device work; laptop P 128 fixture 5.0 -> 5.4 Mvox/s.
+- Gate: 300-step --det runs on the laptop fixture, mean over steps 101-300: master 1.3867 / 1.3863, new 1.3863 / 1.3865 (loss), ink surf
+  0.6917 / 0.6926 vs 0.6923 / 0.6923: within master's run-to-run spread. Touched suites (test_inksurf, test_ink_mil_train, test_hgscale,
+  test_mgpu_lint) pass.
+- Found on the way: `--det 1` with `--ink-surf` is not run-to-run deterministic on master either. 8-step runs vs one reference: the old
+  binary (44211d86) differed in 3 of 4 runs, the async one in 2 of 4; the step lines part at step 6 (the update of step 5). The windows and
+  ray counts are the same; side-stream ordering (UFSM_ISF_SW), full syncs before the prefetch / the batch release (UFSM_ISF_PF) and
+  UFSM_H2D_SYNC did not remove it (debug branch isfdbg-20261121). Open: every surface run is unreproducible until it is found.
+
 ## inksurf S1-S3: scale, scoring at canvas resolution, head depth / context, snapshot averaging, a stale head-weight bug (2026-11-21, fullvram)
 
 Surface-head scores below: ink-wrapscore AUC of predict --surf maps over the clean crop sets (0841: 8 crops, 1447: 28, P4: 16),
