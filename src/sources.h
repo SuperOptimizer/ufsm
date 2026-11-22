@@ -113,6 +113,7 @@ typedef struct {
     int64_t hold_o[3], hold_n[3];   /* optional held-out box (level-0 voxels); hold_n[0] == 0 when absent (= hold[0]: the validation box) */
     int64_t (*hold)[6]; int nhold;  /* all held-out boxes (z y x nz ny nx, level 0): no training label inside them */
     int hold_checked;       /* the boxes were checked against the CT extent (source_ct, first open) */
+    int hold_mapped;        /* the holdout_file's boxes came through an onfly "map" (another scan's): one outside this (partial) scan holds nothing out, noted, not fatal */
     uint8_t *hold_nos;      /* per held-out box: 1 = "score": 0 in the holdout_file (masked from training, never a validation box: e.g. a second scan
                                without a registration, where a cross-scan leak cannot be ruled out) */
     uint8_t *hold_rej;      /* per held-out box (parallel to hold): 1 = rejected even in mask mode ("holdout_reject": the box names) */
