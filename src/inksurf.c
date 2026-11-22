@@ -220,6 +220,16 @@ int isf_win_build(isf_win *w, const inkray *r, int nr, int Hp, int step, int K, 
             if (!same || !dl || (g && abs(dl) >= g)) continue;
             double s2 = 0; for (int q = 0; q < 3; q++) s2 += ((double)r[k].p[q] - r[best].p[q]) * ((double)r[k].p[q] - r[best].p[q]);
             g = abs(dl); d = sqrt(s2) / g; }
+        if (g) {   /* (11-21) d over the longest same-row / -column baseline within 32 grid steps: next to the centre the up wraps' teacher rays
+                      (label_scale 4) nearly coincide in 3-D, d came out tiny and the step ~9-75 grid px (S4's teacher patches mm-wide) */
+            int bl = g; double bs = d * g;
+            for (int k = 0; k < nr; k++) {
+                if (r[k].unit != r[best].unit || r[k].lr < 0 || k == best) continue;
+                const int dr = r[k].lr - r[best].lr, dc = r[k].lc - r[best].lc, dl = dr ? (dc ? 0 : abs(dr)) : abs(dc);
+                if (!dl || dl <= bl || dl > 32 * g || dl % g) continue;
+                double s2 = 0; for (int q = 0; q < 3; q++) s2 += ((double)r[k].p[q] - r[best].p[q]) * ((double)r[k].p[q] - r[best].p[q]);
+                bl = dl; bs = sqrt(s2); }
+            d = bs / bl; }
         if (!g || !(d > 1e-6)) return 0;
         const int m = (int)lround(pvox / d / g); step = (m > 1 ? m : 1) * g; w->step = step; w->dvox = (float)d;
     }
