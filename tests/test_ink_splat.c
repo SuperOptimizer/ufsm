@@ -265,6 +265,41 @@ int main(void) {
             }
             z3_close(fly);
         }
+        {   /* the onfly "map" (2026-11-22, 1.1 um teachers from 2.4 um segments): (1) an identity reg.json == no map, byte for byte; (2) A = 2 I
+               (fine = coarse / 2) on a mesh written at 2x its coordinates == the original mesh with the face distances halved by hand (the
+               map's own scale, cbrt |det A^-1|); (3) the held-out boxes and the coarse key through the map */
+            char mI[512], m2[512], s2x[512], sjo[512], sj2[512], js2[2048];
+            snprintf(mI, sizeof mI, "%s/regI.json", dir); snprintf(m2, sizeof m2, "%s/reg2.json", dir); snprintf(s2x, sizeof s2x, "%s/seg2x.tifxyz", dir);
+            snprintf(sjo, sizeof sjo, "%s/segs_o.json", dir); snprintf(sj2, sizeof sj2, "%s/segs_2x.json", dir);
+            const char *rj = "{\"coarse\": {\"key\": \"c/ct2x.zarr/\", \"um\": 2}, \"fine\": {\"key\": \"ct.zarr\", \"um\": 1}, \"A\": [[%d, 0, 0, 0], [0, %d, 0, 0], [0, 0, %d, 0]]}";
+            FILE *g = fopen(mI, "w"); fprintf(g, rj, 1, 1, 1); fclose(g); g = fopen(m2, "w"); fprintf(g, rj, 2, 2, 2); fclose(g);
+            float *X2 = malloc(GW * GH * 4), *Y2 = malloc(GW * GH * 4), *Z2 = malloc(GW * GH * 4);
+            for (int v = 0; v < GH; v++) for (int u = 0; u < GW; u++) { double P[3]; surf_at(u, v, P); X2[v * GW + u] = (float)(2 * (float)P[2]); Y2[v * GW + u] = (float)(2 * (float)P[1]); Z2[v * GW + u] = (float)(2 * (float)P[0]); }
+            CHECK(!tifxyz_write(s2x, GW, GH, X2, Y2, Z2, STEP, 1.0, -1, "test2x"), "tifxyz 2x"); free(X2); free(Y2); free(Z2);
+            g = fopen(sjo, "w"); fprintf(g, "{\"segments\": [{\"tifxyz\": \"%s\", \"labels\": \"%s\", \"mask\": \"%s\"}]}", surf, lp, mp); fclose(g);
+            snprintf(js2, sizeof js2, "{\"segments\": [{\"tifxyz\": \"%s\", \"labels\": \"%s\", \"mask\": \"%s\"}]}", s2x, lp, mp); g = fopen(sj2, "w"); fputs(js2, g); fclose(g);
+            const size_t nv3 = (size_t)NV * NV * NV; uint8_t *buf[4]; const int64_t wo[3] = {0, 0, 0}, wn[3] = {NV, NV, NV}; long known[4] = {0};
+            for (int k = 0; k < 4; k++) {   /* 0 no map, 1 identity map, 2 the original mesh at half the face distances, 3 the 2x mesh through A = 2 I */
+                inksplat_cfg cm = c8; cm.nexcl = 0; cm.crop[2] = 0;
+                if (k == 1) cm.map = mI;
+                if (k == 2) { cm.face_a *= 0.5; cm.face_b *= 0.5; cm.face_lo *= 0.5; cm.face_hi *= 0.5; }
+                if (k == 3) cm.map = m2;
+                buf[k] = malloc(nv3); z3 *fz = inkfly_open(z3_open(cs, "ct.zarr/1", nullptr), k == 3 ? sj2 : sjo, &cm, 64, nullptr, nullptr);
+                CHECK(fz && !z3_read(fz, wo, wn, buf[k], 4), "map test: onfly %d", k);
+                for (size_t q = 0; q < nv3; q++) known[k] += buf[k][q] != 255;
+                if (fz) z3_close(fz);
+            }
+            const int s01 = !memcmp(buf[0], buf[1], nv3), s23 = !memcmp(buf[2], buf[3], nv3);
+            fprintf(stderr, "onfly map: identity %s (%ld / %ld known), A = 2 I vs the hand-halved splat %s (%ld / %ld known)\n", s01 ? "identical" : "DIFFERS", known[1], known[0],
+                    s23 ? "identical" : "DIFFERS", known[3], known[2]);
+            CHECK(s01 && known[0] > 10000, "onfly map: the identity map differs from no map (%ld known)", known[0]);
+            CHECK(s23 && known[2] > 10000, "onfly map: A = 2 I differs from the hand splat (%ld known)", known[2]);
+            for (int k = 0; k < 4; k++) free(buf[k]);
+            int64_t hb[1][6] = {{10, 20, 30, 5, 6, 7}}; char ck[512] = ""; double cu = 0;
+            CHECK(!inkfly_map_boxes(m2, hb, 1, 0) && hb[0][0] == 5 && hb[0][1] == 10 && hb[0][2] == 15 && hb[0][3] == 3 && hb[0][4] == 3 && hb[0][5] == 4,
+                  "map boxes: [%lld %lld %lld %lld %lld %lld], want [5 10 15 3 3 4]", (long long)hb[0][0], (long long)hb[0][1], (long long)hb[0][2], (long long)hb[0][3], (long long)hb[0][4], (long long)hb[0][5]);
+            CHECK(!inkfly_map_coarse(m2, ck, sizeof ck, &cu) && !strcmp(ck, "c/ct2x.zarr/") && cu == 2, "map coarse: %s %g", ck, cu);
+        }
         free(rb); if (ref) z3_close(ref); store_close(s7); store_close(cs);
     }
     /* validation rasters (per-pixel holdouts): the stored splat with --val (exclude, then only) == the on-the-fly target with the segment's

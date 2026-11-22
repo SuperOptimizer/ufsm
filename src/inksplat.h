@@ -55,6 +55,10 @@ typedef struct {
                                        supervision (training), only (2) keeps nothing else (the validation GT); 0 ignores it. On the fly: per segment "validation" */
     int nexcl; int64_t excl[INKFLY_MAXEXCL][6];   /* --exclude z,y,x,nz,ny,nx (level-0 voxels, repeatable): output voxels touching a box are never written (held-out regions) */
     int ho_score_only;     /* inkfly_holdouts: skip the boxes marked "score": 0 (the scoring tools' --holdouts) */
+    const char *map; double map_dist;   /* on the fly: "map" a reg.json (ufsm reg / the published transforms) from the segments' scan (its "coarse")
+                                           to this CT's (its "fine"): every mesh vertex through rmap_c2f at load (normals follow), the face
+                                           distances (face_a / face_b / face_lo / face_hi, level-0 voxels) x map_dist (0: the affine's linear
+                                           scale, cbrt |det A^-1|; 1: as given); excl already in this CT's coordinates (inkfly_map_boxes) */
     int excl_cells_only;   /* on the fly (inkfly_open): the boxes only drop draw cells (inkfly_cells); the derived array keeps the ink inside them, so
                               validation windows in a box have known ink and the sampler's holdout mask hides it from training (eval audit 11-14 #2) */
     int soft_y;            /* on the fly (a "surf_only" source, S3 teacher maps 2026-11-21): the MIL / surface rays' y = the label byte (0 .. 255), not >= 128 */
@@ -84,6 +88,11 @@ z3 *inkfly_open(z3 *ct, const char *segs, const inksplat_cfg *cfg, size_t cache_
 /* every on-the-fly ink source shares one cache budget (MB, default $UFSM_INK_CACHE_MB or 4096: 3/4 computed target cells, 1/4 decoded CT);
    set before the first inkfly_open (-1 after: kept). inkfly_cache_bytes: the target bytes held (ct_bytes: the CT cache's) */
 int inkfly_cache_budget(size_t mb);
+/* a reg.json's segments-side scan: its "coarse" key (the holdout files name boxes by it) and um; 0 ok */
+int inkfly_map_coarse(const char *map, char *key, size_t nkey, double *um);
+/* level-0 boxes [z, y, x, nz, ny, nx] of the map's coarse scan -> this (fine) scan: the bounding box of the 8 corners through rmap_c2f, grown
+   by pad voxels each side, origin clamped at 0 (a held-out box stays held out); in place, 0 ok */
+int inkfly_map_boxes(const char *map, int64_t (*b)[6], int nb, double pad);
 size_t inkfly_cache_bytes(size_t *ct_bytes);
 int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits);
 int inkfly_cells_sup(void *handle, int lev, const int64_t shape[3], uint8_t *bits, int stride);   /* the cells holding supervised label pixels (bit 1) / positive ones (bit 2): the sampler's draw cells */

@@ -5,6 +5,7 @@
 #include "optcheck.h"
 #include "dcache.h"
 #include "label_versions.h"
+#include "reg.h"
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -1181,6 +1182,44 @@ static int ifgpu_on(void) {
     if ((e && atoi(e)) || !inkfly_gpu_near) g = 0; else { inkfly_gpu_device(d ? atoi(d) : 0); g = 1; }
     atomic_store(&g_ifgpu, g); return g;
 }
+/* ---- the segments through a reg map (inkperf 2026-11-22: 1.1 um ink teachers from the human segments of the 2.4 um scans) ---- */
+static char *map_slurp(const char *path, size_t *n) {
+    FILE *fp = fopen(path, "rb"); if (!fp) return nullptr;
+    fseek(fp, 0, SEEK_END); const long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *t = sz >= 0 ? malloc((size_t)sz + 1) : nullptr;
+    *n = t ? fread(t, 1, (size_t)sz, fp) : 0; fclose(fp); if (t) t[*n] = 0; return t;
+}
+int inkfly_map_coarse(const char *map, char *key, size_t nkey, double *um) {
+    size_t n = 0; char *t = map ? map_slurp(map, &n) : nullptr; json *j = t ? json_parse(t, n) : nullptr; free(t);
+    const json *c = json_get(j, "coarse"); const char *k = json_str(json_get(c, "key"), nullptr);
+    if (!k) { fprintf(stderr, "ink onfly: map %s: no \"coarse\" {\"key\"}\n", map ? map : "?"); json_free(j); return -1; }
+    snprintf(key, nkey, "%s", k); if (um) *um = json_num(json_get(c, "um"), 0);
+    json_free(j); return 0;
+}
+int inkfly_map_boxes(const char *map, int64_t (*b)[6], int nb, double pad) {
+    if (!nb) return 0;
+    const rmap *m = reg_map_load(map); if (!m) return -1;
+    for (int i = 0; i < nb; i++) {
+        double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};   /* (x y z) */
+        for (int k = 0; k < 8; k++) {
+            const double c[3] = {(double)(b[i][2] + (k & 1 ? b[i][5] : 0)), (double)(b[i][1] + (k & 2 ? b[i][4] : 0)), (double)(b[i][0] + (k & 4 ? b[i][3] : 0))}; double f[3];
+            rmap_c2f(m, c, f); for (int d = 0; d < 3; d++) { if (f[d] < lo[d]) lo[d] = f[d]; if (f[d] > hi[d]) hi[d] = f[d]; }
+        }
+        for (int d = 0; d < 3; d++) {   /* (zyx box from the xyz extent) */
+            int64_t a = (int64_t)floor(lo[d] - pad), e = (int64_t)ceil(hi[d] + pad); if (a < 0) a = 0;
+            b[i][2 - d] = a; b[i][5 - d] = e > a ? e - a : 1;
+        }
+    }
+    return 0;
+}
+/* every valid vertex (ssurf_pn's rule: Z >= 0; and finite) of a loaded mesh through the map, coarse (the segments' scan) -> fine (this CT) */
+static void ssurf_map(ssurf *s, const rmap *m) {
+    const size_t n = (size_t)s->w * s->h;
+    for (size_t i = 0; i < n; i++) {
+        if (!(s->Z[i] >= 0) || !isfinite(s->X[i]) || !isfinite(s->Y[i])) continue;
+        const double c[3] = {s->X[i], s->Y[i], s->Z[i]}; double f[3]; rmap_c2f(m, c, f);
+        s->X[i] = (float)f[0]; s->Y[i] = (float)f[1]; s->Z[i] = (float)f[2];
+    }
+}
 static int inkfly_find(char (*paths)[1024], int n, const char *p) { for (int i = 0; i < n; i++) if (!strcmp(paths[i], p)) return i; return -1; }
 static void inkfly_free(void *p) {
     inkfly *f = p; if (!f) return;
@@ -1501,6 +1540,10 @@ static char *inkfly_key(const inkfly *f, const inksplat_cfg *c, const char *segs
         char cp[2100]; snprintf(cp, sizeof cp, "%s/%s", c->ct_root, c->ct_key); key_stat(&b, &n, &cap, cp, "zarr.json"); key_add(&b, &n, &cap, "\n"); }
     key_add(&b, &n, &cap, "cfg iso %d thr %.9g flip %d face %.9g,%.9g t %.9g,%.9g run %d gap %d label_scale %.9g off %.9g,%.9g val_mode %d\n", c->iso, c->thr, c->flip,
             c->face_a, c->face_b, c->face_lo, c->face_hi, c->face_run, c->face_gap, c->label_scale, c->label_off[0], c->label_off[1], c->val_mode);
+    if (c->map && *c->map) {   /* the reg map (its file and field; the scaled face distances are in the cfg line) */
+        char rp[4200], dir[4200]; if (!realpath(c->map, rp)) snprintf(rp, sizeof rp, "%s", c->map);
+        snprintf(dir, sizeof dir, "%s", rp); char *sl = strrchr(dir, '/'); if (sl) *sl = 0;
+        key_add(&b, &n, &cap, "map %s dist %.9g", rp, c->map_dist); key_stat(&b, &n, &cap, rp, nullptr); key_stat(&b, &n, &cap, dir, "field.f32"); key_add(&b, &n, &cap, "\n"); }
     for (int e = 0; e < c->nexcl; e++) key_add(&b, &n, &cap, "exclude %lld,%lld,%lld,%lld,%lld,%lld\n", (long long)c->excl[e][0], (long long)c->excl[e][1],
                                                (long long)c->excl[e][2], (long long)c->excl[e][3], (long long)c->excl[e][4], (long long)c->excl[e][5]);
     for (int i = 0; i < f->nS; i++) { key_add(&b, &n, &cap, "mesh %s", f->Spath[i]);
@@ -1571,6 +1614,15 @@ size_t inkfly_cache_bytes(size_t *ct_bytes) {
 }
 z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t cache_mb, const char *dcache_dir, void **handle) {
     const double t0 = snow();
+    /* "map": the meshes through it at load, the face distances scaled (cfg->map); the rest of the open sees the scaled copy */
+    inksplat_cfg cm = *cfg; const rmap *map = nullptr; double map_um = 0;
+    if (cfg->map && *cfg->map) {
+        char ck[512];
+        if (inkfly_map_coarse(cfg->map, ck, sizeof ck, &map_um) || !(map = reg_map_load(cfg->map))) { fprintf(stderr, "ink onfly: %s: cannot load the map %s\n", segs_path, cfg->map); z3_close(ct); return nullptr; }
+        const double ds = cfg->map_dist > 0 ? cfg->map_dist : cbrt(fabs(raff_det(&map->Ainv)));
+        cm.face_a *= ds; cm.face_b *= ds; cm.face_lo *= ds; cm.face_hi *= ds; cm.map_dist = ds;
+    }
+    cfg = &cm;
     FILE *fp = fopen(segs_path, "rb"); if (!fp) { fprintf(stderr, "ink onfly: cannot open %s\n", segs_path); z3_close(ct); return nullptr; }
     fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *txt = malloc((size_t)sz + 1); size_t rd = fread(txt, 1, (size_t)sz, fp); fclose(fp); txt[rd] = 0;
     json *j = json_parse(txt, rd); const json *sg = json_get(j, "segments"); char *sg_txt = txt;   /* (the segments text goes into the cache key) */
@@ -1584,7 +1636,7 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
         const json *e = json_at(sg, (size_t)i); const char *tx = json_str(json_get(e, "tifxyz"), nullptr), *lb = json_str(json_get(e, "labels"), nullptr), *mk = json_str(json_get(e, "mask"), nullptr);
         if (!tx || !lb) { fprintf(stderr, "ink onfly: segment %d: need tifxyz and labels\n", i); goto fail; }
         ifunit *u = &f->U[f->nU];
-        if ((u->surf = inkfly_find(f->Spath, f->nS, tx)) < 0) { if (ssurf_load(&f->S[f->nS], tx)) goto fail; snprintf(f->Spath[f->nS], 1024, "%s", tx); u->surf = f->nS++; }
+        if ((u->surf = inkfly_find(f->Spath, f->nS, tx)) < 0) { if (ssurf_load(&f->S[f->nS], tx)) goto fail; if (map) ssurf_map(&f->S[f->nS], map); snprintf(f->Spath[f->nS], 1024, "%s", tx); u->surf = f->nS++; }
         if ((u->lab = inkfly_find(f->Lpath, f->nL, lb)) < 0) { if (lsrc_open(&f->Ls[f->nL], lb, -1, cfg->cache)) goto fail; snprintf(f->Lpath[f->nL], 1024, "%s", lb); u->lab = f->nL++; }
         u->msk = -1; u->val = -1;
         if (mk && (u->msk = inkfly_find(f->Lpath, f->nL, mk)) < 0) { if (lsrc_open(&f->Ls[f->nL], mk, -1, cfg->cache)) goto fail; snprintf(f->Lpath[f->nL], 1024, "%s", mk); u->msk = f->nL++; }
@@ -1594,7 +1646,7 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
         /* the label scale exactly as inksplat_run */
         double F = cfg->label_scale; const double ew = S->w / S->scale, eh = S->h / S->scale;
         if (!(F > 0)) { F = 0.5 * (ew / (double)LL->W + eh / (double)LL->H); const double p2 = pow(2, round(log2(F))); if (fabs(F - p2) < 0.002 * p2) F = p2;
-            const double mum = S->vox_um > 0 ? S->vox_um : cfg->ct_um; if (LL->um > 0 && mum > 0) F = LL->um / mum; }
+            const double mum = S->vox_um > 0 ? S->vox_um : map_um > 0 ? map_um : cfg->ct_um; if (LL->um > 0 && mum > 0) F = LL->um / mum; }   /* (a mapped mesh: its own scan's um) */
         { const double es = json_num(json_get(e, "label_scale"), 0); if (es > 0) F = es; }   /* per window (ink-teach rasters: K x the human F) */
         u->F = F; u->lr0 = 0; u->lc0 = 0; u->lw = LL->W; u->lh = LL->H;
         const json *cr = json_get(e, "crop");

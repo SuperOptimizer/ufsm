@@ -10,6 +10,8 @@
 [[gnu::weak]] z3 *inkfly_open(z3 *, const char *, const inksplat_cfg *, size_t, const char *, void **);
 [[gnu::weak]] z3 *inkfly_open_pooled(z3 *, z3 *, int);
 [[gnu::weak]] int inkfly_holdouts(const char *, const char *, inksplat_cfg *);
+[[gnu::weak]] int inkfly_map_coarse(const char *, char *, size_t, double *);
+[[gnu::weak]] int inkfly_map_boxes(const char *, int64_t (*)[6], int, double);
 [[gnu::weak]] void inksplat_defaults(inksplat_cfg *);
 [[gnu::weak]] const char *dcache_default_dir(void);
 [[gnu::weak]] z3 *z3_open_cached(z3 *, const char *, const char *, int, size_t);
@@ -51,10 +53,14 @@ int rung_of_um(double um) { return (int)lround(log2(um / 0.6)); }
 
 /* ---- held-out boxes ---- */
 /* eval audit 11-14 #7: a malformed box is an error, not a silent skip (a held-out box that is not one leaks its labels into training) */
+static int src_add_hold_v(source *s, const int64_t v[6], int rej, int nos);
 static int src_add_hold(source *s, const json *b, int rej, int nos) {   /* one [z, y, x, nz, ny, nx] (level 0); the first one is also hold_o / hold_n */
     if (!b || b->type != J_ARR || b->n != 6) { fprintf(stderr, "sources: %s: a held-out box is not [z, y, x, nz, ny, nx] (level 0)\n", s->name); return 1; }
     int64_t v[6]; for (int d = 0; d < 6; d++) { const json *q = json_at(b, (size_t)d); if (!q || q->type != J_NUM) { fprintf(stderr, "sources: %s: held-out box entry %d is not a number\n", s->name, d); return 1; }
                                                 v[d] = (int64_t)json_num(q, 0); }
+    return src_add_hold_v(s, v, rej, nos);
+}
+static int src_add_hold_v(source *s, const int64_t v[6], int rej, int nos) {
     if (v[3] <= 0 || v[4] <= 0 || v[5] <= 0 || v[0] < 0 || v[1] < 0 || v[2] < 0) {
         fprintf(stderr, "sources: %s: held-out box [%lld %lld %lld %lld %lld %lld]: origin < 0 or extent <= 0\n", s->name, (long long)v[0], (long long)v[1], (long long)v[2], (long long)v[3], (long long)v[4], (long long)v[5]); return 1; }
     s->hold = realloc(s->hold, (size_t)(s->nhold + 1) * sizeof *s->hold); s->hold_rej = realloc(s->hold_rej, (size_t)(s->nhold + 1));
@@ -75,7 +81,7 @@ static const char *src_base(const char *p) {   /* the last path component, ignor
     }
 }
 /* "holdout_file": the boxes of a wbench holdouts.json ({"boxes": [{"ct": KEY, "l0": [6]}...]}) whose ct basename is this source's */
-static int src_hold_file(source *s, const char *path, const json *rejn) {
+static int src_hold_file(source *s, const char *path, const json *rejn, const char *map, double pad) {   /* map: boxes named by its coarse scan, mapped in */
     FILE *f = fopen(path, "rb"); if (!f) { fprintf(stderr, "sources: %s: cannot open holdout_file %s\n", s->name, path); return 1; }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); char *t = malloc((size_t)n + 1);
     const size_t got = t ? fread(t, 1, (size_t)n, f) : 0; fclose(f);
@@ -83,12 +89,18 @@ static int src_hold_file(source *s, const char *path, const json *rejn) {
     const json *bx = j ? json_get(j, "boxes") : nullptr;
     if (!bx || bx->type != J_ARR) { fprintf(stderr, "sources: %s: holdout_file %s: no \"boxes\" array\n", s->name, path); json_free(j); return 1; }
     char me[512]; snprintf(me, sizeof me, "%s", src_base(s->ct_key)); int added = 0, nrej = 0, nnos = 0;
+    if (map) { char ck[512]; if (!inkfly_map_coarse || inkfly_map_coarse(map, ck, sizeof ck, nullptr)) { json_free(j); return 1; } snprintf(me, sizeof me, "%s", src_base(ck)); }
     for (size_t k = 0; k < bx->n; k++) { const json *e = json_at(bx, k);
         if (!strcmp(src_base(json_str(json_get(e, "ct"), "")), me)) {
             const char *nm = json_str(json_get(e, "name"), ""); int rej = 0;
             for (size_t q = 0; rejn && rejn->type == J_ARR && q < rejn->n; q++) rej |= *nm && !strcmp(nm, json_str(json_at(rejn, q), ""));
             const int nos = json_num(json_get(e, "score"), 1) == 0; nnos += nos;
-            if (src_add_hold(s, json_get(e, "l0"), rej, nos)) { fprintf(stderr, "sources: %s: holdout_file %s box %zu (%s)\n", s->name, path, k, nm); json_free(j); return 1; }
+            if (map) {   /* (the coarse scan's box -> this scan's, as the onfly target's exclusions) */
+                const json *l0 = json_get(e, "l0"); int64_t v[1][6];
+                if (!l0 || l0->type != J_ARR || l0->n != 6) { fprintf(stderr, "sources: %s: holdout_file %s box %zu is not [z, y, x, nz, ny, nx]\n", s->name, path, k); json_free(j); return 1; }
+                for (int d = 0; d < 6; d++) v[0][d] = (int64_t)json_num(json_at(l0, (size_t)d), 0);
+                if (inkfly_map_boxes(map, v, 1, pad) || src_add_hold_v(s, v[0], rej, nos)) { fprintf(stderr, "sources: %s: holdout_file %s box %zu (%s) through the map\n", s->name, path, k, nm); json_free(j); return 1; }
+            } else if (src_add_hold(s, json_get(e, "l0"), rej, nos)) { fprintf(stderr, "sources: %s: holdout_file %s box %zu (%s)\n", s->name, path, k, nm); json_free(j); return 1; }
             added++; nrej += rej;
             if (rej) fprintf(stderr, "sources: %s: held-out box %s rejects training windows (holdout_reject)\n", s->name, nm); } }
     json_free(j);
@@ -376,9 +388,17 @@ sources *sources_load(const char *path) {
                 const json *fa = json_get(of, "face"); if (fa && fa->n == 2) { ic.face_a = json_num(json_at(fa, 0), -6); ic.face_b = json_num(json_at(fa, 1), 0); }
                 const char *sg = json_str(json_get(of, "segments"), nullptr), *hf = json_str(json_get(of, "holdout_file"), json_str(json_get(e, "holdout_file"), nullptr));
                 const int L = ic.level;
-                if (!sg || !(s->um > 0) || L < 0 || L + 1 >= MAXLEV || (hf && inkfly_holdouts(hf, s->ct_key, &ic))) {
-                    fprintf(stderr, "sources: %s/%s: onfly needs \"segments\", the source's \"um\", level 0..%d (and a readable holdout_file)\n", s->name, CHNAME[c], MAXLEV - 2);
+                /* "map": a reg.json from the segments' scan to this one (1.1 um teachers from the 2.4 um human segments, 2026-11-22): the meshes
+                   through it, the face distances x "map_dist" (default the affine's scale), the held-out boxes named by the map's coarse scan mapped
+                   in (inkfly_map_boxes, + "map_pad" voxels, default 4) */
+                ic.map = json_str(json_get(of, "map"), nullptr); ic.map_dist = json_num(json_get(of, "map_dist"), 0);
+                char hkey[512]; snprintf(hkey, sizeof hkey, "%s", s->ct_key);
+                if (ic.map && inkfly_map_coarse(ic.map, hkey, sizeof hkey, nullptr)) { json_free(j); sources_free(S); return nullptr; }
+                if (!sg || !(s->um > 0) || L < 0 || L + 1 >= MAXLEV || (hf && inkfly_holdouts(hf, hkey, &ic)) ||
+                    (ic.map && inkfly_map_boxes(ic.map, ic.excl, ic.nexcl, json_num(json_get(of, "map_pad"), 4)))) {
+                    fprintf(stderr, "sources: %s/%s: onfly needs \"segments\", the source's \"um\", level 0..%d (and a readable holdout_file / map)\n", s->name, CHNAME[c], MAXLEV - 2);
                     json_free(j); sources_free(S); return nullptr; }
+                if (ic.map) fprintf(stderr, "sources: %s/%s: the segments through the map %s (%d held-out boxes of %s mapped)\n", s->name, CHNAME[c], ic.map, ic.nexcl, src_base(hkey));
                 ic.excl_cells_only = 1;   /* (eval audit #2: the boxes are masked by the sampler, every label type; the ink inside them stays for validation) */
                 z3 *ct = pyramid_open_level(s->s, s->ct_key, L, s->um, g_cache), *ct1 = pyramid_open_level(s->s, s->ct_key, L + 1, s->um, g_cache);
                 ic.ct_root = json_str(json_get(e, "root"), "."); ic.ct_key = s->ct_key;   /* (named in the derived cache's key) */
@@ -643,7 +663,11 @@ sources *sources_load(const char *path) {
                 const json *of = t && t->type == J_OBJ ? json_get(t, "onfly") : nullptr; if (of) hf = json_str(json_get(of, "holdout_file"), nullptr); }
             if (hf) fprintf(stderr, "sources: %s: the onfly target's holdout_file %s holds out every label of the source\n", s->name, hf);
         }
-        if (hf && src_hold_file(s, hf, json_get(e, "holdout_reject"))) { json_free(j); sources_free(S); return nullptr; }
+        const char *hmap = nullptr; double hpad = 4;   /* an onfly target's "map": the file's boxes are the map's coarse scan's, mapped into this one */
+        { const json *tg = json_get(e, "targets");
+          for (size_t q = 0; tg && tg->type == J_OBJ && q < tg->n && !hmap; q++) { const json *t = tg->items[q];
+              const json *of = t && t->type == J_OBJ ? json_get(t, "onfly") : nullptr; if (of) { hmap = json_str(json_get(of, "map"), nullptr); hpad = json_num(json_get(of, "map_pad"), 4); } } }
+        if (hf && src_hold_file(s, hf, json_get(e, "holdout_reject"), hmap, hpad)) { json_free(j); sources_free(S); return nullptr; }
         const char *hm = json_str(json_get(e, "holdout_mode"), nullptr);
         if (hm) { s->hold_mode = !strcmp(hm, "mask") ? 1 : !strcmp(hm, "reject") ? 2 : -1;
                   if (s->hold_mode < 0) { fprintf(stderr, "sources: %s: \"holdout_mode\" is \"mask\" or \"reject\", not \"%s\"\n", s->name, hm); json_free(j); sources_free(S); return nullptr; } }
