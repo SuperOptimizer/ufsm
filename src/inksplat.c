@@ -2924,7 +2924,7 @@ int cmd_ink_audit(int argc, char **argv) {
     if (argc < 3 || ci < 0 || ci + 2 >= argc) {
         fprintf(stderr, "usage: ufsm ink-audit SEGS.json --ct ROOT KEY --ct-um U [--level 1] [--iso 64] [--face -6,0] [--face-search -6,20] [--holdouts H.json] [--val-mode off|exclude]\n"
                         "         [--pred ROOT KEY --pred-level 2] [--region z,y,x,nz,ny,nx (level-0, repeatable)] [--norm C,S] [--stride 2] [--tag T] [--out PREFIX [--blocks [--blocks-size 2048]]] [--threads 8] [--cache DIR]\n"
-                        "         [--map reg.json [--map-pad 4]]   (SEGS / --holdouts of the map's coarse scan, --ct / --pred this fine scan's)\n"
+                        "         [--map reg.json [--map-pad 4]] [--hold-only]   (SEGS / --holdouts of the map's coarse scan, --ct / --pred this fine scan's)\n"
                         "  per split (TRAIN / VAL / HOLD) along the onfly ink labels: positives, face offsets, band CT, prediction AUC per band shift, score quantiles\n"); return 2;
     }
     inksplat_cfg c; inksplat_defaults(&c); c.face = 1;
@@ -2936,7 +2936,7 @@ int cmd_ink_audit(int argc, char **argv) {
     const int Lp = opt_atoi("--pred-level", sopt(argc, argv, "--pred-level", "2")), stride = opt_atoi("--stride", sopt(argc, argv, "--stride", "2"));
     double nc = NAN, ns = NAN; { const char *nm = sopt(argc, argv, "--norm", nullptr); if (nm && sscanf(nm, "%lf,%lf", &nc, &ns) != 2) { fprintf(stderr, "ink-audit: --norm C,S\n"); return 2; } }
     const char *tag = sopt(argc, argv, "--tag", "-"), *outp = sopt(argc, argv, "--out", nullptr), *hof = sopt(argc, argv, "--holdouts", nullptr);
-    const int want_blk = sflag(argc, argv, "--blocks");
+    const int want_blk = sflag(argc, argv, "--blocks"), hold_only = sflag(argc, argv, "--hold-only");
     if (c.ct_um <= 0 || c.level < 0 || c.level > 5 || Lp < 0 || Lp > 5 || stride < 1) { fprintf(stderr, "ink-audit: bad --ct-um / --level / --pred-level / --stride\n"); return 2; }
     static int64_t reg[AU_MAXR][6]; int nreg = 0;   /* mgpu: main (ink-audit, one thread: the region table) */
     for (int i = 2; i + 1 < argc; i++) { if (strcmp(argv[i], opt_n("--region"))) continue; long long b[6];
@@ -2994,6 +2994,14 @@ int cmd_ink_audit(int argc, char **argv) {
             for (int ty = 0; ty < G.ntiles_y; ty++) for (int tx2 = 0; tx2 < G.ntiles_x; tx2++) {
                 double lo[3], hi[3]; int hit = 0;
                 if (tile_box(&G, tx2, ty, AU_T + 2, lo, hi)) for (int q = 0; q < nreg && !hit; q++) { hit = 1; for (int d = 0; d < 3; d++) hit &= hi[d] >= reg[q][d] && lo[d] < reg[q][d] + reg[q][3 + d]; }
+                if (hit) continue;
+                for (int64_t r = (int64_t)ty * TS; r < (int64_t)(ty + 1) * TS && r < G.lh; r++) memset(G.msk + (size_t)r * G.lw + (size_t)tx2 * TS, 0, (size_t)((tx2 + 1) * TS < G.lw ? TS : G.lw - (int64_t)tx2 * TS));
+            }
+        }
+        if (!bad && hold_only) {   /* --hold-only (R11's tracker): tiles clear of every held-out box unsupervised, as --region (the HOLD row unchanged, ~10x less CT) */
+            for (int ty = 0; ty < G.ntiles_y; ty++) for (int tx2 = 0; tx2 < G.ntiles_x; tx2++) {
+                double lo[3], hi[3]; int hit = 0;
+                if (tile_box(&G, tx2, ty, AU_T + 2, lo, hi)) for (int q = 0; q < hc.nexcl && !hit; q++) { hit = 1; for (int d = 0; d < 3; d++) hit &= hi[d] >= hc.excl[q][d] && lo[d] < hc.excl[q][d] + hc.excl[q][3 + d]; }
                 if (hit) continue;
                 for (int64_t r = (int64_t)ty * TS; r < (int64_t)(ty + 1) * TS && r < G.lh; r++) memset(G.msk + (size_t)r * G.lw + (size_t)tx2 * TS, 0, (size_t)((tx2 + 1) * TS < G.lw ? TS : G.lw - (int64_t)tx2 * TS));
             }
