@@ -58,6 +58,10 @@ R1-62000 alone beats reader3 on 0841 (0.898 vs 0.880); the equal-weight ensemble
 - nn_inkfly.cu: the reader threads' streams at the device's highest priority (UFSM_INKFLY_PRIO=0: off); pinned staging exists but is
   opt-in (UFSM_INKFLY_PINNED=1: slower in the laptop A/B, 0.19 vs 0.12 s); thread contexts released at exit. Same bytes (test_ink_splat
   hash in all four settings).
+- surf_only sources (branch surfonly-20261121): no voxel ink plane (train zeroed its mask anyway; --min-phase counts the rays), and the
+  rays cut to those isf_win_build reads (isf_rays_crop, the shared isf_centre; test_inksurf (6): 24 patches byte-identical). Sampler-only,
+  CPU path, 1667 human + teacher, 100 batches, 4 threads: the drawn mix 29 / 71 windows before and after; 12.3 -> 22.8 Mvox/s; derived
+  cells 6315 computed (338 s) -> 1897 (99 s); teacher rays 434 k -> 48 k a window.
 
 ## The surface head step without a drain; --det is not deterministic under --ink-surf (2026-11-21, branch isfperf-20261121, inkperf)
 
