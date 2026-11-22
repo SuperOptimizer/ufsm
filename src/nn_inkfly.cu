@@ -175,7 +175,10 @@ __global__ void k_final(const dc_t *cp, const uint8_t *ct, unsigned *ni, unsigne
 /* per calling thread: a stream and its buffers (the sampler's workers run concurrently; the device is the process's choice) */
 static int g_dev = 0;
 enum { B_CT, B_LAB, B_MSK, B_TIL, B_X, B_Y, B_Z, B_NREC, B_FREC, B_ACC, B_OUT, B_SM, B_DU, B_RPN, B_RDR, NB };
-typedef struct { int dev; cudaStream_t st; struct { void *p; size_t cap; } b[NB]; int nu; size_t base[1024]; du_t hu[1024]; } ictx;
+/* (pin: the thread's pinned staging arena; pend: device -> host copies landed in it, copied out after the stream's sync) */
+typedef struct { void *dst; size_t off, n; } ipend;
+typedef struct { int dev; cudaStream_t st; struct { void *p; size_t cap; } b[NB]; int nu; size_t base[1024]; du_t hu[1024];
+                 uint8_t *pin; size_t pinc, pino; int usepin, npend; ipend pend[8]; } ictx;
 typedef struct { dc_t c; long long bb[6]; int nonempty, bad; unsigned cnt[1024], fcnt[1024]; } sm_t;
 static __thread ictx *t_ic;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -215,6 +218,73 @@ static void atomic_over(void) {
                                "the budget free when the ink shares a training card, else lower UFSM_INKFLY_GPU_MB)", h >> 20, g_budget >> 20, g_reserve >> 20);
     if (k == 1 || k % 1000 == 0) fprintf(stderr, "inkfly gpu: %llu chunk(s) over the GPU budget (%zu of %zu MiB held, %zu MiB reserve): on the CPU\n", k, h >> 20, g_budget >> 20, g_reserve >> 20);
 }
+/* the thread's stream and staging (inkperf 2026-11-21). S4 (the 1667 teacher source beside the trainer on its card): the sampler's
+   workers sat in futex waits at 1.7 of 32 cores, 30-60 % trainer wait. Each chunk is 2-3 synchronous round trips, and on a default-priority
+   stream every one queued behind the trainer's kernels; the pageable copies went through the driver's staging under its lock. Now: the
+   device's highest stream priority (the kernels are scheduled ahead of the trainer's queue; UFSM_INKFLY_PRIO=0: the old default priority)
+   and the copies through a per-thread pinned arena (UFSM_INKFLY_PINNED=0: pageable). Scheduling and copies only: the bytes are the same.
+   A thread's context is released at its exit (its device buffers back to the budget, its pinned arena freed). */
+static pthread_key_t g_ickey;   /* mgpu: guarded (pthread_once g_ickonce) */
+static pthread_once_t g_ickonce = PTHREAD_ONCE_INIT;   /* mgpu: guarded (itself) */
+static void ic_release(void *p) {
+    ictx *x = (ictx *)p; if (!x) return;
+    if (x->dev >= 0 && cudaSetDevice(x->dev) == cudaSuccess) {
+        if (x->st) cudaStreamDestroy(x->st);
+        pthread_mutex_lock(&g_mu); for (int i = 0; i < NB; i++) if (x->b[i].p) { cudaFree(x->b[i].p); g_held -= x->b[i].cap; } pthread_mutex_unlock(&g_mu);
+    }
+    if (x->pin) cudaFreeHost(x->pin);
+    (void)cudaGetLastError(); free(x);
+}
+static void ic_key_init(void) { pthread_key_create(&g_ickey, ic_release); }
+static int env_off(const char *k) { const char *e = getenv(k); return e && !strcmp(e, "0"); }
+/* the calling thread's context on the ink device: 0, 1 no stream (this chunk on the CPU), -1 a CUDA error */
+static int ic_open(ictx **px) {
+    pthread_once(&g_ickonce, ic_key_init);
+    ictx *x = t_ic;
+    if (!x) { x = t_ic = (ictx *)calloc(1, sizeof *x); if (!x) return 1; x->dev = -1; x->usepin = !env_off("UFSM_INKFLY_PINNED"); pthread_setspecific(g_ickey, x); }
+    *px = x;
+    if (x->dev != g_dev) {
+        if (cudaSetDevice(g_dev) != cudaSuccess) return -1;
+        if (x->st) { cudaStreamDestroy(x->st); x->st = nullptr; }
+        int lo = 0, hi = 0; cudaError_t e = cudaErrorUnknown;
+        if (!env_off("UFSM_INKFLY_PRIO") && cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess) e = cudaStreamCreateWithPriority(&x->st, cudaStreamNonBlocking, hi);
+        if (e != cudaSuccess) { (void)cudaGetLastError(); if (cudaStreamCreateWithFlags(&x->st, cudaStreamNonBlocking) != cudaSuccess) { (void)cudaGetLastError(); x->st = nullptr; return 1; } }
+        x->dev = g_dev;
+    }
+    return cudaSetDevice(x->dev) == cudaSuccess ? 0 : -1;
+}
+/* a call's staging: room for n bytes of copies (each rounded to 256) before its first copy; the arena is reused once the call has synced */
+static void ic_stage(ictx *x, size_t n) {
+    x->pino = 0; x->npend = 0;
+    if (!x->usepin || x->pinc >= n) return;
+    if (x->pin) cudaFreeHost(x->pin);
+    x->pin = nullptr; x->pinc = 0; const size_t c = n + n / 4;
+    if (cudaHostAlloc((void **)&x->pin, c, cudaHostAllocDefault) != cudaSuccess) {
+        (void)cudaGetLastError(); x->pin = nullptr; x->usepin = 0;
+        UFSM_DEFAULTED("inkfly gpu: no pinned staging (%.1f MB) for this thread: its copies are pageable from here (slower, same bytes)", c / 1e6);
+        return;
+    }
+    x->pinc = c;
+}
+static size_t ic_slot(ictx *x, size_t n) {   /* an arena offset for n bytes, or SIZE_MAX: none (a pageable copy) */
+    if (!x->usepin || !x->pin || !n) return SIZE_MAX;
+    const size_t o = (x->pino + 255) & ~(size_t)255; if (o + n > x->pinc) return SIZE_MAX;
+    x->pino = o + n; return o;
+}
+static cudaError_t ic_h2d(ictx *x, void *d, const void *s, size_t n) {
+    const size_t o = ic_slot(x, n); if (o == SIZE_MAX) return cudaMemcpyAsync(d, s, n, cudaMemcpyHostToDevice, x->st);
+    memcpy(x->pin + o, s, n); return cudaMemcpyAsync(d, x->pin + o, n, cudaMemcpyHostToDevice, x->st);
+}
+static cudaError_t ic_d2h(ictx *x, void *d, const void *s, size_t n) {   /* lands in d at ic_sync */
+    const size_t o = x->npend < 8 ? ic_slot(x, n) : SIZE_MAX; if (o == SIZE_MAX) return cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToHost, x->st);
+    const ipend q = {d, o, n}; x->pend[x->npend++] = q; return cudaMemcpyAsync(x->pin + o, s, n, cudaMemcpyDeviceToHost, x->st);
+}
+static cudaError_t ic_sync(ictx *x) {
+    const cudaError_t e = cudaStreamSynchronize(x->st);
+    if (e == cudaSuccess) for (int i = 0; i < x->npend; i++) memcpy(x->pend[i].dst, x->pin + x->pend[i].off, x->pend[i].n);
+    x->npend = 0; return e;
+}
+#define STG(n) ((n) + 256)   /* (a copy's arena bytes, rounded up) */
 extern "C" unsigned long long inkfly_gpu_over(void) { pthread_mutex_lock(&g_mu); const unsigned long long k = g_over; pthread_mutex_unlock(&g_mu); return k; }
 extern "C" void inkfly_gpu_device(int dev) { g_dev = dev; }
 /* the trainer's memory planner (2026-11-20): the budget it keeps free on a training card that also runs the ink chunks, and the reserve
@@ -240,30 +310,25 @@ extern "C" void inkfly_gpu_set_reserve(size_t bytes) {
 extern "C" int inkfly_gpu_near(const ifg_unit *U, int nu, const ifg_cfg *cf, int64_t lo[3], int64_t hi[3], uint64_t *nnear) {
     int rc = 0; sm_t *hs = nullptr; ictx *x = t_ic;
     if (cf->ns > NSMAX || cf->nexcl > INKFLY_MAXEXCL || nu > 1024) return -2;
-    if (!x) { x = t_ic = (ictx *)calloc(1, sizeof *x); x->dev = -1; }
-    if (x->dev != g_dev) {
-        IG_CK(cudaSetDevice(g_dev)); if (x->st) { cudaStreamDestroy(x->st); x->st = nullptr; }
-        if (cudaStreamCreateWithFlags(&x->st, cudaStreamNonBlocking) != cudaSuccess) { (void)cudaGetLastError(); x->st = nullptr; return 1; }   /* (no stream now: this chunk on the CPU) */
-        x->dev = g_dev;
-    }
-    IG_CK(cudaSetDevice(x->dev));
+    { const int o = ic_open(&x); if (o) return o < 0 ? -1 : 1; }   /* (no stream now: this chunk on the CPU) */
     {
         size_t nl = 0, nm = 0, nt = 0, np = 0, nr = 0;
         for (int i = 0; i < nu; i++) { const ifg_unit *h = &U[i]; nl += (size_t)h->rh * h->rw; nm += h->msk ? (size_t)h->rh * h->rw : 0; nt += h->ntiles; np += (size_t)h->pw * h->ph; nr += (size_t)h->ntiles * TS * TS; }
         if (grow(x, B_LAB, nl + 1) || grow(x, B_MSK, nm + 1) || grow(x, B_TIL, 4 * nt + 4) || grow(x, B_X, 4 * np + 4) || grow(x, B_Y, 4 * np + 4) || grow(x, B_Z, 4 * np + 4) ||
             grow(x, B_NREC, nr * sizeof(nrec_t) + 64) || grow(x, B_FREC, nr * sizeof(frec) + 64) || grow(x, B_SM, sizeof(sm_t))) { atomic_over(); rc = 1; goto out; }
         hs = (sm_t *)calloc(1, sizeof *hs); to_dc(cf, &hs->c);
+        ic_stage(x, 2 * STG(sizeof(sm_t)) + nl + nm + 4 * nt + 12 * np + (size_t)nu * 6 * 256);
         for (int d = 0; d < 3; d++) { hs->bb[d] = INT64_MAX; hs->bb[3 + d] = INT64_MIN; }
         sm_t *ds = (sm_t *)x->b[B_SM].p;
-        IG_CK(cudaMemcpyAsync(ds, hs, sizeof *hs, cudaMemcpyHostToDevice, x->st));
+        IG_CK(ic_h2d(x, ds, hs, sizeof *hs));
         size_t ol = 0, om = 0, ot = 0, op = 0, orr = 0; x->nu = nu;
         for (int i = 0; i < nu; i++) {
             const ifg_unit *h = &U[i]; const size_t l = (size_t)h->rh * h->rw, p = (size_t)h->pw * h->ph; du_t &u = x->hu[i];
             uint8_t *dl = (uint8_t *)x->b[B_LAB].p + ol, *dm = h->msk ? (uint8_t *)x->b[B_MSK].p + om : nullptr; int32_t *dt = (int32_t *)x->b[B_TIL].p + ot;
             float *dx = (float *)x->b[B_X].p + op, *dy = (float *)x->b[B_Y].p + op, *dz = (float *)x->b[B_Z].p + op;
-            IG_CK(cudaMemcpyAsync(dl, h->lab, l, cudaMemcpyHostToDevice, x->st)); if (dm) IG_CK(cudaMemcpyAsync(dm, h->msk, l, cudaMemcpyHostToDevice, x->st));
-            IG_CK(cudaMemcpyAsync(dt, h->tiles, 4 * (size_t)h->ntiles, cudaMemcpyHostToDevice, x->st));
-            IG_CK(cudaMemcpyAsync(dx, h->X, 4 * p, cudaMemcpyHostToDevice, x->st)); IG_CK(cudaMemcpyAsync(dy, h->Y, 4 * p, cudaMemcpyHostToDevice, x->st)); IG_CK(cudaMemcpyAsync(dz, h->Z, 4 * p, cudaMemcpyHostToDevice, x->st));
+            IG_CK(ic_h2d(x, dl, h->lab, l)); if (dm) IG_CK(ic_h2d(x, dm, h->msk, l));
+            IG_CK(ic_h2d(x, dt, h->tiles, 4 * (size_t)h->ntiles));
+            IG_CK(ic_h2d(x, dx, h->X, 4 * p)); IG_CK(ic_h2d(x, dy, h->Y, 4 * p)); IG_CK(ic_h2d(x, dz, h->Z, 4 * p));
             u.lab = dl; u.msk = dm; u.rh = h->rh; u.rw = h->rw; u.rr0 = h->rr0; u.rc0 = h->rc0; u.lh = h->lh; u.lw = h->lw; u.tiles = dt; u.ntiles = h->ntiles; u.ntx = h->ntx;
             u.X = dx; u.Y = dy; u.Z = dz; u.pu0 = h->pu0; u.pv0 = h->pv0; u.pw = h->pw; u.ph = h->ph; u.mw = h->mw; u.mh = h->mh; u.scale = h->scale; u.F = h->F; u.glr0 = h->glr0; u.glc0 = h->glc0;
             u.nsub = h->nsub; u.nt = h->nt; u.tstep = h->tstep; x->base[i] = orr;
@@ -271,7 +336,7 @@ extern "C" int inkfly_gpu_near(const ifg_unit *U, int nu, const ifg_cfg *cf, int
             IG_CK(cudaGetLastError());
             ol += l; om += h->msk ? l : 0; ot += h->ntiles; op += p; orr += (size_t)h->ntiles * TS * TS;
         }
-        IG_CK(cudaMemcpyAsync(hs, ds, sizeof *hs, cudaMemcpyDeviceToHost, x->st)); IG_CK(cudaStreamSynchronize(x->st));
+        IG_CK(ic_d2h(x, hs, ds, sizeof *hs)); IG_CK(ic_sync(x));
         if (hs->bad) { rc = 1; goto out; }
         uint64_t s = 0; for (int i = 0; i < nu; i++) s += hs->cnt[i];
         *nnear = s; for (int d = 0; d < 3; d++) { lo[d] = hs->bb[d]; hi[d] = hs->bb[3 + d]; }
@@ -285,27 +350,22 @@ extern "C" int inkfly_gpu_rayface(const ifg_ray *p, const double *pn, size_t n, 
     int rc = 0; ictx *x = t_ic; int hbad = 0;
     if (!n) return 0;
     if (p->ns > NSMAX || n > 0xffffffffu) return 1;
-    if (!x) { x = t_ic = (ictx *)calloc(1, sizeof *x); x->dev = -1; }
-    if (x->dev != g_dev) {
-        IG_CK(cudaSetDevice(g_dev)); if (x->st) { cudaStreamDestroy(x->st); x->st = nullptr; }
-        if (cudaStreamCreateWithFlags(&x->st, cudaStreamNonBlocking) != cudaSuccess) { (void)cudaGetLastError(); x->st = nullptr; return 1; }
-        x->dev = g_dev;
-    }
-    IG_CK(cudaSetDevice(x->dev));
+    { const int o = ic_open(&x); if (o) return o < 0 ? -1 : 1; }   /* (no stream now: this chunk on the CPU) */
     {
         const size_t ncv = (size_t)(p->z1 - p->z0) * p->cn[1] * p->cn[2], nd = (n + 15) & ~(size_t)15;
         if (grow(x, B_CT, ncv) || grow(x, B_RPN, n * 6 * sizeof(double)) || grow(x, B_RDR, nd + 16)) { atomic_over(); return 1; }
+        ic_stage(x, STG(ncv) + STG(n * 6 * sizeof(double)) + STG(n) + STG(sizeof(int)));
         rp_t h; h.off = p->off; h.V = p->V; h.sign = p->sign; h.lo = p->lo; h.ns = p->ns; h.iso = p->iso; h.run = p->run; h.gap = p->gap;
         for (int d = 0; d < 3; d++) { h.co[d] = p->co[d]; h.cn[d] = p->cn[d]; } h.z0 = p->z0; h.z1 = p->z1;
         uint8_t *dd = (uint8_t *)x->b[B_RDR].p; int *db = (int *)(dd + nd);
-        IG_CK(cudaMemcpyAsync(x->b[B_CT].p, ct, ncv, cudaMemcpyHostToDevice, x->st));
-        IG_CK(cudaMemcpyAsync(x->b[B_RPN].p, pn, n * 6 * sizeof(double), cudaMemcpyHostToDevice, x->st));
+        IG_CK(ic_h2d(x, x->b[B_CT].p, ct, ncv));
+        IG_CK(ic_h2d(x, x->b[B_RPN].p, pn, n * 6 * sizeof(double)));
         IG_CK(cudaMemsetAsync(db, 0, sizeof(int), x->st));
         k_rayface<<<(unsigned)((n + 127) / 128), 128, 0, x->st>>>(h, (const double *)x->b[B_RPN].p, (unsigned)n, (const uint8_t *)x->b[B_CT].p, dd, db);
         IG_CK(cudaGetLastError());
-        IG_CK(cudaMemcpyAsync(drop, dd, n, cudaMemcpyDeviceToHost, x->st));
-        IG_CK(cudaMemcpyAsync(&hbad, db, sizeof(int), cudaMemcpyDeviceToHost, x->st));
-        IG_CK(cudaStreamSynchronize(x->st));
+        IG_CK(ic_d2h(x, drop, dd, n));
+        IG_CK(ic_d2h(x, &hbad, db, sizeof(int)));
+        IG_CK(ic_sync(x));
         if (hbad) return 2;
         pthread_mutex_lock(&g_mu); g_rays += n; pthread_mutex_unlock(&g_mu);
     }
@@ -316,13 +376,13 @@ extern "C" int inkfly_gpu_finish(const ifg_cfg *cf, const uint8_t *ctb, const in
     int rc = 0; ictx *x = t_ic; if (!x || x->dev < 0) return -2;
     const size_t cv = (size_t)n[0] * n[1] * n[2], ncv = (size_t)cn[0] * cn[1] * cn[2];
     dc_t *hc = (dc_t *)calloc(1, sizeof *hc); int hb[2] = {0, 0};
-    IG_CK(cudaSetDevice(x->dev));
+    IG_CK(cudaSetDevice(x->dev)); ic_stage(x, STG(sizeof *hc) + STG(ncv) + STG(sizeof hb) + STG(cv));
     if (grow(x, B_CT, ncv) || grow(x, B_ACC, 4 * cv * sizeof(unsigned)) || grow(x, B_OUT, cv)) { atomic_over(); rc = 1; goto out; }
     {
         to_dc(cf, hc); for (int d = 0; d < 3; d++) { hc->co[d] = co[d]; hc->cn[d] = cn[d]; hc->o[d] = o[d]; hc->n[d] = n[d]; }
         sm_t *ds = (sm_t *)x->b[B_SM].p; unsigned *acc = (unsigned *)x->b[B_ACC].p, *ni = acc, *nn = acc + cv, *pi = acc + 2 * cv, *pn = acc + 3 * cv; uint8_t *dout = (uint8_t *)x->b[B_OUT].p;
-        IG_CK(cudaMemcpyAsync(&ds->c, hc, sizeof *hc, cudaMemcpyHostToDevice, x->st));
-        IG_CK(cudaMemcpyAsync(x->b[B_CT].p, ctb, ncv, cudaMemcpyHostToDevice, x->st));
+        IG_CK(ic_h2d(x, &ds->c, hc, sizeof *hc));
+        IG_CK(ic_h2d(x, x->b[B_CT].p, ctb, ncv));
         IG_CK(cudaMemsetAsync(acc, 0, 4 * cv * sizeof(unsigned), x->st)); IG_CK(cudaMemsetAsync(dout, 255, cv, x->st));
         for (int i = 0; i < x->nu; i++) {
             const du_t &u = x->hu[i]; if (!u.ntiles) continue;
@@ -332,9 +392,9 @@ extern "C" int inkfly_gpu_finish(const ifg_cfg *cf, const uint8_t *ctb, const in
             k_final<<<(unsigned)((cv + 255) / 256), 256, 0, x->st>>>(&ds->c, (const uint8_t *)x->b[B_CT].p, ni, nn, pi, pn, dout, &ds->nonempty);
             IG_CK(cudaGetLastError());
         }
-        IG_CK(cudaMemcpyAsync(hb, &ds->nonempty, 2 * sizeof(int), cudaMemcpyDeviceToHost, x->st));
-        IG_CK(cudaMemcpyAsync(out, dout, cv, cudaMemcpyDeviceToHost, x->st));
-        IG_CK(cudaStreamSynchronize(x->st));
+        IG_CK(ic_d2h(x, hb, &ds->nonempty, 2 * sizeof(int)));
+        IG_CK(ic_d2h(x, out, dout, cv));
+        IG_CK(ic_sync(x));
         if (hb[1]) { rc = 1; goto out; }
         *nonempty = hb[0];
     }
