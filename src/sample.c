@@ -7,6 +7,7 @@
 [[gnu::weak]] int inkfly_cells_sup(void *, int, const int64_t[3], uint8_t *, int);
 [[gnu::weak]] size_t inkfly_cache_bytes(size_t *);
 [[gnu::weak]] int inkfly_rays(void *, const int64_t[3], const int64_t[3], int, int, float, inkray **, size_t *);   /* (weak: test binaries without inksplat.o; only called for an onfly target) */
+[[gnu::weak]] int isf_rays_crop(inkray *, int, int, int, int, int, int, float);   /* (inksurf.c; weak as inkfly_rays) */
 #include "band.h"
 _Static_assert(PHASE_PERIOD == 252, "draw_ counts known phase as (b & 0xfc) != 0xfc");
 #include "band_w4dev.h"
@@ -3004,6 +3005,10 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                 if (!ink_it) for (size_t k = 0; k < p3; k++) inkw[k] = ctu[k] >= it ? 254 : 0;
                 continue;
             }
+            /* a "surf_only" source (the teacher maps: the surface head's patch from the rays, train zeroes its voxel ink mask): no voxel
+               plane. Deriving it was ~45 cells / 2.2 s of a worker per 1667 teacher window (inkperf 2026-11-21, S4 at 30-60 % trainer wait);
+               --min-phase counts the window's rays instead (below) */
+            if (s->surf_only && b->mil && inkw) { memset(inkw, 255, p3); continue; }
             if (aux_read(s, c->ink_ch > 0 ? c->ink_ch : c->ink_fib && s->tgt_key[CH_FIB] ? CH_FIB : CH_SHEET, l, o, n, inkw, p3, crushed || torn || delam || curved)) return -1;
             if (getenv("UFSM_INK_DEBUG")) { size_t kn = 0, ki = 0; for (size_t k = 0; k < p3; k++) { kn += inkw[k] != 255; ki += inkw[k] != 255 && inkw[k] > 127; } fprintf(stderr, "ink window: known %zu ink %zu\n", kn, ki); }
             continue;
@@ -3657,10 +3662,14 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                                                  targets only draw anywhere in the scroll): rejected */
         const uint8_t *sd = b->side + (size_t)i * p3; size_t kn = ph_known;
         if (kn == SIZE_MAX) kn = bs_count_notall(sd, p3, 0xfc);   /* (sd[k] < PHASE_PERIOD 252) */
-        if (inkw && !c->rv_iso) { kn += bs_count_ne(b->ink + (size_t)i * p3, p3, 255); }   /* (--ink-head: known ink supervises too: ink-only sources draw) */
+        if (inkw && !c->rv_iso) { kn += s->surf_only && b->mil ? (size_t)b->nmil[i] : bs_count_ne(b->ink + (size_t)i * p3, p3, 255); }   /* (--ink-head: known ink supervises too: ink-only
+                                                                                                                                        sources draw; surf_only: its rays, the patch's labels) */
         for (int j = 0; j < c->aux_n; j++) kn += bs_count_ne(b->aux[j] + (size_t)i * p3, p3, 255);
         if ((double)kn < c->min_phase * (double)p3) { if (Tw) tp_put(Tw, (NCH + 1) * p3); atomic_fetch_add(&sp->rejected, 1); atomic_fetch_add(&sp->rej_why[2], 1); SL_ADD(SL_EMPTY); return 1; }   /* (counted as empty targets) */
     }
+    if (s->surf_only && c->isf_hp > 0 && b->mil && b->nmil[i] && isf_rays_crop)   /* --ink-surf, a surf_only source (no MIL): only the rays its patch reads (the --min-phase test above
+                                                                                     counted them all; the replay list mil0 stays whole: a replay re-draws the centre) */
+        b->nmil[i] = isf_rays_crop(b->mil[i], b->nmil[i], c->isf_hp, c->isf_step, Pz, P, P, c->isf_pvox);
     if (c->emb_ch && s->ct_only) {   /* an unlabelled ("ct_only") source supervises only the distillation: windows with < 25% of the head cells targeted are redrawn */
         const size_t ge = (size_t)(Pz / c->emb_div) * (P / c->emb_div) * (P / c->emb_div); const int8_t *eo = b->emb + (size_t)i * c->emb_ch * ge; size_t kn = 0;
         for (size_t q = 0; q < ge; q++) { int any = 0; for (int ch = 0; ch < c->emb_ch && !any; ch++) any = eo[(size_t)ch * ge + q] != 0; kn += any; }

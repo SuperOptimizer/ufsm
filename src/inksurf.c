@@ -199,18 +199,15 @@ static int lists_fwd(const isf_lists *L, size_t ns, int **fidx, float **fw, size
     }
     return 0;
 }
-int isf_win_build(isf_win *w, const inkray *r, int nr, int Hp, int step, int K, float kstep, int D, int H, int W, unsigned aug, int soft, float pvox) {   /* soft: y / 255 (teacher rays), else y != 0 */
-    const size_t n = (size_t)Hp * Hp;
-    if (w->cap < n) { free(w->pn); free(w->lab); free(w->wt); w->pn = malloc(n * 6 * 4); w->lab = malloc(n * 4); w->wt = malloc(n * 4); w->cap = n; if (!w->pn || !w->lab || !w->wt) { w->cap = 0; return -1; } }
-    w->Hp = Hp; w->K = K; w->kstep = kstep; w->np = 0; w->frac = 0; w->unit = -1; w->nouv = 0; w->step = step; w->dvox = 0;
-    isf_lists_free(&w->L);
-    /* the centre: the on-grid ray nearest the window's centre (one pass of one segment: a unit's other wraps through the window lie far away on
-       its label grid, outside the patch) */
+/* the patch's centre ray (index into r, -1: no patch) and its step (label px; *pdvox: window voxels per label px under pvox): the on-grid ray
+   nearest the window's centre (one pass of one segment: a unit's other wraps through the window lie far away on its label grid, outside the
+   patch). Shared by isf_win_build and isf_rays_crop, so the sampler's crop keeps exactly the rays the patch reads */
+int isf_centre(const inkray *r, int nr, int step, int D, int H, int W, float pvox, int *pstep, float *pdvox, int *nouv) {
     int best = -1; double bd = 1e300; const double cz = 0.5 * (D - 1), cy = 0.5 * (H - 1), cx = 0.5 * (W - 1);
-    for (int k = 0; k < nr; k++) { if (r[k].lr < 0) { w->nouv++; continue; } if (!(pvox > 0) && (r[k].lr % step || r[k].lc % step)) continue;
+    for (int k = 0; k < nr; k++) { if (r[k].lr < 0) { if (nouv) ++*nouv; continue; } if (!(pvox > 0) && (r[k].lr % step || r[k].lc % step)) continue;
         const double dd = (r[k].p[0] - cz) * (r[k].p[0] - cz) + (r[k].p[1] - cy) * (r[k].p[1] - cy) + (r[k].p[2] - cx) * (r[k].p[2] - cx); if (dd < bd) { bd = dd; best = k; } }
-    for (size_t p = 0; p < n; p++) { float *q = w->pn + 6 * p; q[0] = q[1] = q[2] = -1e6f; q[3] = 1; q[4] = q[5] = 0; w->lab[p] = 0; w->wt[p] = 0; }
-    if (best < 0) return 0;
+    *pstep = step; if (pdvox) *pdvox = 0;
+    if (best < 0) return -1;
     if (pvox > 0) {   /* (2026-11-21) the physical patch: the rays' grid g (label px) and spacing d (window voxels per label px) next to the centre ray, the
                          step the multiple of g nearest pvox / d (S1 / S2 took every 2nd 2.4 um px: 0.5 window voxel, predict sampled 1) */
         int g = 0; double d = 0;
@@ -220,9 +217,32 @@ int isf_win_build(isf_win *w, const inkray *r, int nr, int Hp, int step, int K, 
             if (!same || !dl || (g && abs(dl) >= g)) continue;
             double s2 = 0; for (int q = 0; q < 3; q++) s2 += ((double)r[k].p[q] - r[best].p[q]) * ((double)r[k].p[q] - r[best].p[q]);
             g = abs(dl); d = sqrt(s2) / g; }
-        if (!g || !(d > 1e-6)) return 0;
-        const int m = (int)lround(pvox / d / g); step = (m > 1 ? m : 1) * g; w->step = step; w->dvox = (float)d;
+        if (!g || !(d > 1e-6)) return -1;
+        const int m = (int)lround(pvox / d / g); *pstep = (m > 1 ? m : 1) * g; if (pdvox) *pdvox = (float)d;
     }
+    return best;
+}
+/* a surf_only window's rays cut to the ones isf_win_build can read (inkperf 2026-11-21, fullvram's rule): the centre ray's unit within
+   +-(Hp / 2 + 1) x step label px of it, in their order. The centre, the step and the patch are unchanged: the centre is the first nearest
+   ray (kept; no earlier ray ties it), the grid probe's nearest neighbours lie within the square, the patch reads rows / cols gr .. gr +
+   (Hp - 1) step. Without a patch (no centre) none is kept. 1667 teacher windows: ~434 k rays a window, the patch reads <= (Hp + 3)^2 */
+int isf_rays_crop(inkray *r, int nr, int Hp, int step, int D, int H, int W, float pvox) {
+    int st = step; const int best = isf_centre(r, nr, step, D, H, W, pvox, &st, nullptr, nullptr);
+    if (best < 0) return 0;
+    const int u = r[best].unit, lr = r[best].lr, lc = r[best].lc; const long R = (long)(Hp / 2 + 1) * st;
+    int k2 = 0;
+    for (int k = 0; k < nr; k++) if (r[k].unit == u && r[k].lr >= 0 && labs((long)r[k].lr - lr) <= R && labs((long)r[k].lc - lc) <= R) r[k2++] = r[k];
+    return k2;
+}
+int isf_win_build(isf_win *w, const inkray *r, int nr, int Hp, int step, int K, float kstep, int D, int H, int W, unsigned aug, int soft, float pvox) {   /* soft: y / 255 (teacher rays), else y != 0 */
+    const size_t n = (size_t)Hp * Hp;
+    if (w->cap < n) { free(w->pn); free(w->lab); free(w->wt); w->pn = malloc(n * 6 * 4); w->lab = malloc(n * 4); w->wt = malloc(n * 4); w->cap = n; if (!w->pn || !w->lab || !w->wt) { w->cap = 0; return -1; } }
+    w->Hp = Hp; w->K = K; w->kstep = kstep; w->np = 0; w->frac = 0; w->unit = -1; w->nouv = 0; w->step = step; w->dvox = 0;
+    isf_lists_free(&w->L);
+    for (size_t p = 0; p < n; p++) { float *q = w->pn + 6 * p; q[0] = q[1] = q[2] = -1e6f; q[3] = 1; q[4] = q[5] = 0; w->lab[p] = 0; w->wt[p] = 0; }
+    float dv = 0; int best = isf_centre(r, nr, step, D, H, W, pvox, &step, &dv, &w->nouv);
+    if (best < 0) return 0;
+    if (pvox > 0) { w->step = step; w->dvox = dv; }
     const int gr = r[best].lr - Hp / 2 * step, gc = r[best].lc - Hp / 2 * step; best = r[best].unit;
     const float ext = 0.5f * (K - 1) * kstep;
     for (int k = 0; k < nr; k++) {

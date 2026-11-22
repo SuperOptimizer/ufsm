@@ -3927,6 +3927,7 @@ int cmd_train(int argc, char **argv) {
     g_reject_warn = opt_atof("--reject-warn", opt(argc, argv, "--reject-warn", "100"));   /* the draws line's per-source drops per new window above which it warns */   /* 1: a weighted source the sampler cannot draw is fatal (launchers: on) */
     sc.ink_mil = g_mil; sc.mil_mode = g_isf ? 2 : g_mil_mode; sc.mil_stride = g_mil_stride; sc.mil_max = g_isf ? 0 : g_mil_max;   /* (--ink-surf: every pixel's ray, the faceless flagged, uncapped: the patch needs the whole grid; mil_take hands the MIL its own subset) */
     sc.mil_R = g_mil_R; sc.mil_r_um = g_mil_r_um;   /* --ink-mil: the windows' rays (batch.mil) */
+    if (g_isf && !g_lsplit) { sc.isf_hp = g_isf_P; sc.isf_step = g_isf_step; sc.isf_pvox = g_isf_pvox; }   /* (mil_take's isf_win_build: D g_Pz, H = W = P; a split window's halves are other boxes) */
     sc.ink_plane = IPLANE;   /* --ink-head: the sources' "ink" targets on their own plane (batch.ink); --rv: the papyrus plane there */
     sc.ink_fib = g_aux_of[AUX_FIB] == 0; sc.fib_sheet = g_fibn && !g_ink2;   /* --fib-normal-lambda: the "fibre" target, else (no ink head) the "sheet" / "ink" one */
     sc.aux_n = g_naux > 1 ? g_naux - 1 : 0;

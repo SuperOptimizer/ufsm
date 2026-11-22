@@ -78,6 +78,8 @@ float *isfhead_moments(isfhead *h, int k);   /* Adam m (0) / v (1), device */
 /* one window's patch (host): Hp x Hp px on the label grid every step-th row / col of the unit with the most rays, pn [n][6] window level
    voxels (far outside: no ray / masked), lab, wt (1 labelled, 0 not), the inverse lists + forward table of the K-layer resample */
 typedef struct { int Hp, K, np, unit, nouv, step; float kstep, dvox; double frac; float *pn, *lab, *wt; size_t cap; isf_lists L; int *fidx; float *fw; size_t fcap; } isf_win;
+int isf_centre(const inkray *r, int nr, int step, int D, int H, int W, float pvox, int *pstep, float *pdvox, int *nouv);   /* the patch's centre ray (-1: none) and step */
+int isf_rays_crop(inkray *r, int nr, int Hp, int step, int D, int H, int W, float pvox);   /* in place: the rays isf_win_build can read (same patch); the new count */
 int isf_win_build(isf_win *w, const inkray *r, int nr, int Hp, int step, int K, float kstep, int D, int H, int W, unsigned aug, int soft, float pvox);   /* pvox > 0: the patch px = pvox window voxels (the label-px step from the rays' spacing; w->step, w->dvox), else every step-th label px */   /* aug: 1 transpose, 2 / 4 flip rows / cols,
                                                                                                                                    8 reverse the normal (train --isf-aug) */
 void isf_win_free(isf_win *w);

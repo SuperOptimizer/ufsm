@@ -368,7 +368,44 @@ static void test_slab_inject(void) {
     }
 }
 
+/* (6) isf_rays_crop (inkperf 2026-11-21: the sampler cuts a surf_only window's rays to the patch's): isf_win_build on the cut list ==
+   on the whole list, byte for byte (patch normals / positions, labels, weights, step, spacing, unit), on a sheet of 3 units in shuffled
+   order with faceless rays, every-step-th and physical (pvox) patches, aug draws, a centre near the patch border of its unit */
+static void test_rays_crop(void) {
+    const int D = 64, H = 64, W = 64; int checked = 0; const uint64_t rs0 = rs;   /* (restored at the end: the other tests' draws unchanged) */
+    for (int cfgi = 0; cfgi < 6; cfgi++) {
+        const int Hp = cfgi & 1 ? 32 : 16, step = cfgi < 2 ? 1 : 2; const float pvox = cfgi >= 4 ? 0.5f : 0.f; const double sp = cfgi == 5 ? 0.21 : 0.37;
+        const int G = 220; const size_t cap = (size_t)3 * G * G + 5000; inkray *r = malloc(cap * sizeof *r), *c = malloc(cap * sizeof *c); size_t nr = 0;
+        const int lr0 = cfgi == 3 ? 40 : -30, i0 = cfgi == 3 ? 6 : G / 2;   /* (3: the window's centre near the low edge of unit 0's grid) */
+        for (int u = 0; u < 3; u++) for (int i = 0; i < G; i++) for (int j = 0; j < G; j++) {
+            const double y = 32 + (i - i0) * sp + (u ? 70.0 * u : 0), x = 32 + (j - G / 2) * sp, z = 30 + 6 * sin(0.05 * x) + 3 * cos(0.07 * y) + u * 9;
+            if (urand() < 0.08) continue;   /* (holes: unsupervised px) */
+            inkray q = {{(float)z, (float)y, (float)x}, {1.f, 0.1f * (float)frand(), 0.1f * (float)frand()}, (uint8_t)(urand() < 0.3 ? 255 : (int)(urand() * 254)), 0, (uint16_t)u, 1.f, 1.f, lr0 + i, j - 50};
+            if (urand() < 0.03) q.lr = q.lc = -1;   /* (faceless) */
+            r[nr++] = q;
+        }
+        for (size_t k = nr - 1; k > 0; k--) { const size_t m = (size_t)(urand() * (k + 1)); const inkray t = r[k]; r[k] = r[m]; r[m] = t; }
+        memcpy(c, r, nr * sizeof *r);
+        const int nc = isf_rays_crop(c, (int)nr, Hp, step, D, H, W, pvox);
+        for (unsigned aug = 0; aug < 16; aug += 5) {
+            isf_win a = {0}, b = {0};
+            const int ra = isf_win_build(&a, r, (int)nr, Hp, step, 5, 1.f, D, H, W, aug, 1, pvox), rb = isf_win_build(&b, c, nc, Hp, step, 5, 1.f, D, H, W, aug, 1, pvox);
+            const size_t n = (size_t)Hp * Hp;
+            const int same = ra == rb && a.np == b.np && a.step == b.step && a.dvox == b.dvox && a.unit == b.unit && a.frac == b.frac && (!a.np ||
+                             (!memcmp(a.pn, b.pn, n * 6 * 4) && !memcmp(a.lab, b.lab, n * 4) && !memcmp(a.wt, b.wt, n * 4) && a.L.nv == b.L.nv && a.L.ne == b.L.ne));
+            CHECK(same && a.np > Hp, "rays crop cfg %d aug %u: the patch differs (np %d / %d, step %d / %d, unit %d / %d) or is empty", cfgi, aug, a.np, b.np, a.step, b.step, a.unit, b.unit);
+            checked += same;
+            isf_win_free(&a); isf_win_free(&b);
+        }
+        fprintf(stderr, "rays crop cfg %d (Hp %d step %d pvox %.1f): %zu -> %d rays\n", cfgi, Hp, step, pvox, nr, nc);
+        CHECK(nc > 0 && (size_t)nc * 4 < nr, "rays crop cfg %d: %zu -> %d (no cut)", cfgi, nr, nc);
+        free(r); free(c);
+    }
+    fprintf(stderr, "rays crop: %d patches identical\n", checked);
+    rs = rs0;
+}
 int main(void) {
+    test_rays_crop();
     if (nn_init(0)) return 77;
     g_ink = envf("TIS_INK", g_ink); g_bg = envf("TIS_BG", g_bg); g_sp0 = envf("TIS_SP0", g_sp0); g_sp1 = envf("TIS_SP1", g_sp1);
     g_a0 = envf("TIS_A0", g_a0); g_a1 = envf("TIS_A1", g_a1); g_wl0 = envf("TIS_WL0", g_wl0); g_wl1 = envf("TIS_WL1", g_wl1); g_gap = envf("TIS_GAP", g_gap); g_moff = envf("TIS_MOFF", g_moff); TP = (int)envf("TIS_TP", (float)TP);

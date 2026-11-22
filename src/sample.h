@@ -31,6 +31,7 @@ typedef struct {
     int holdout_reject;      /* training windows that overlap a held-out box (any same-CT source's): 0 = keep the window, every label unknown
                                 inside the box grown by holdout_guard level-l voxels ("mask", the default); 1 = drop and redraw ("reject").
                                 A source's "holdout_mode" overrides it */
+    int isf_hp, isf_step; float isf_pvox;   /* --ink-surf (isf_hp > 0): a surf_only source's rays cut to the patch's (inksurf.c isf_rays_crop; isf_win_build's arguments) */
     int ink_mil, mil_mode, mil_stride, mil_max; float mil_R, mil_r_um;   /* --ink-mil: each window's normal-pooled MIL rays (inksplat.h inkfly_rays of the source's onfly ink target:
                                 mode, stride, reach R in window voxels; at most mil_max, evenly subsampled) into batch.mil / nmil, on the source grid (train maps them through the symmetry) */
     int strict_sources;      /* train --strict-sources 1: a weighted source with no eligible level ("excluded: no ... patch fits") stops sampler_start (fatal) */
