@@ -2847,7 +2847,9 @@ static int predict_one(int argc, char **argv) {
             const char *isf = opt(argc, argv, "--surf-isf", ip);
             if (!sout || split || nwork > 1 || lat_store || seam2) { fprintf(stderr, "predict --surf: needs --surf-out DIR; one GPU, no --split / --latents / --seam-inproc\n"); return 2; }
             SF = surfp_open(sw, isf, cfg.widths[0], opt_atoi("--surf-P", opt(argc, argv, "--surf-P", "192")), opt_atoi("--surf-halo", opt(argc, argv, "--surf-halo", "32")),
-                            2 * opt_atoi("--surf-k", opt(argc, argv, "--surf-k", "4")) + 1, scale, opt_atof("--surf-pvox", opt(argc, argv, "--surf-pvox", "1")));   /* (--surf-pvox: window voxels per patch px, the head's training spacing: 0.5 for S1 / S2, 1 for --isf-pvox 1 heads) */
+                            2 * opt_atoi("--surf-k", opt(argc, argv, "--surf-k", "4")) + 1, scale, opt_atof("--surf-pvox", opt(argc, argv, "--surf-pvox", "1")),
+                            opt_atof("--surf-overlap", opt(argc, argv, "--surf-overlap", "0")), !strcmp(opt(argc, argv, "--surf-blend", "linear"), "cosine"));
+            if (strcmp(opt(argc, argv, "--surf-blend", "linear"), "linear") && strcmp(opt(argc, argv, "--surf-blend", "linear"), "cosine")) { fprintf(stderr, "predict: --surf-blend linear | cosine\n"); return 2; }   /* (--surf-pvox: window voxels per patch px, the head's training spacing: 0.5 for S1 / S2, 1 for --isf-pvox 1 heads) */
             if (!SF) return 1;
             const int64_t wn3[3] = {Wz, W, W}; const int mg[3] = {hz, halo, halo}; int64_t *to = nullptr;
             int64_t *go = malloc((size_t)(rd.ntiles ? rd.ntiles : 1) * 3 * sizeof *go); if (!go) return 1;

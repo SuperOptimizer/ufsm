@@ -322,6 +322,20 @@ int main(int argc, char **argv) {
             fprintf(stderr, "predict --surf: level-0 map %d x %d, level-1 map %d x %d (%.0f%% run px)\n", w0, h0, w2, h2, m2 ? 100.0 * nz / ((double)w2 * h2) : 0);
             CHECK(m0 && m2 && w0 == w2 && h0 == h2 && nz > (size_t)w2 * h2 / 2, "level-1 map %d x %d vs the canvas %d x %d (%s)", w2, h2, w0, h0, q2);
             free(m0); free(m2); }
+        /* --surf-overlap (2026-11-21, 1447's hard patch seams): 0 = the hard tiling byte for byte (sp2); 0.5 = patches every half core,
+           feathered: it runs, says so, and covers every pixel the tiling covers (its extra edge patches in windows without CT stay unrun: DEFAULTED there is expected) */
+        {   const char *L1 = "--um 19.2 --level 1 --box 0,0,0,128,128,128 --shard 128 --levels 2 --threads 2 --q 0 --no-out 1 --surf-P 32 --surf-halo 4 --surf-k 2 --window 96";
+            CHECK(!sh("mkdir -p %s/sp4 %s/sp3 && %s predict %s/sf/last.ckpt %s/fx ct %s/pv4 --axis %s/fx/axis.json --surf %s/fx/seg.tifxyz --surf-out %s/sp4 %s --surf-overlap 0 > %s/sp4.log 2>&1 && "
+                      "cmp %s/sp2/seg.tifxyz.tif %s/sp4/seg.tifxyz.tif", d, d, U, d, d, d, d, d, d, L1, d, d, d), "--surf-overlap 0 is not the hard tiling's map (%s/sp4)", d);
+            CHECK(!sh("%s predict %s/sf/last.ckpt %s/fx ct %s/pv3 --axis %s/fx/axis.json --surf %s/fx/seg.tifxyz --surf-out %s/sp3 %s --surf-overlap 0.5 --surf-blend cosine > %s/sp3.log 2>&1 && "
+                      "grep -q 'surf-overlap 0.50: patches every 12 px, cosine feather over 12 px' %s/sp3.log", U, d, d, d, d, d, d, L1, d, d),
+                  "predict --surf --surf-overlap 0.5 (%s/sp3.log)", d);
+            char q2[700], q3[700]; snprintf(q2, sizeof q2, "%s/sp2/seg.tifxyz.tif", d); snprintf(q3, sizeof q3, "%s/sp3/seg.tifxyz.tif", d);
+            int w2 = 0, h2 = 0, w3 = 0, h3 = 0; uint8_t *m2 = img_read_u8(q2, &w2, &h2), *m3 = img_read_u8(q3, &w3, &h3); size_t lost = 0, n2 = 0, same = 0;
+            if (m2 && m3 && w2 == w3 && h2 == h3) for (size_t i = 0; i < (size_t)w2 * h2; i++) { n2 += m2[i] > 0; lost += m2[i] > 0 && !m3[i]; same += m2[i] == m3[i]; }
+            fprintf(stderr, "predict --surf-overlap 0.5: %zu of %zu tiled px kept, %.0f%% of px equal to the tiling\n", n2 - lost, n2, m2 ? 100.0 * same / ((double)w2 * h2) : 0);
+            CHECK(m2 && m3 && w2 == w3 && h2 == h3 && n2 > 0 && !lost && same < (size_t)w2 * h2, "overlap map %d x %d vs %d x %d, %zu tiled px lost (%s)", w3, h3, w2, h2, lost, q3);
+            free(m2); free(m3); }
     }
     if (getenv("TIMT_KEEP")) fprintf(stderr, "kept %s (sources %s/fx/sources-mil.json)\n", d, d);
     else if (!fails) sh("rm -rf %s", d);
