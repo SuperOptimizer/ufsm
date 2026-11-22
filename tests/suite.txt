@@ -260,6 +260,7 @@ test_reg_tifxyz                                |              |     2 | python3 
 test_ink_wrapscore                             |              |     4 | python3 tests/test_ink_wrapscore.py
 test_ink_teach                                 |              |     3 | python3 tests/test_ink_teach.py
 test_ink_teach_up                              |              |     2 | python3 tests/test_ink_teach_up.py
+test_ct_resample                               |              |     2 | python3 tests/test_ct_resample.py
 test_seamless                                  |              |     6 | python3 tests/test_seamless.py
 test_cover_training                            | gpu2,l2      |    16 | python3 tests/test_cover_training.py
 test_univ2                                     | gpu2,l2      |    40 | tests/test_univ2.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/univ2
