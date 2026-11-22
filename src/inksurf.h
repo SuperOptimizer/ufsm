@@ -84,7 +84,7 @@ void isf_win_free(isf_win *w);
 int isf_win_alloc(isf_win *w, int Hp, int K, float kstep);   /* pn / lab / wt for Hp x Hp (the caller fills them, sets np) */
 int isf_win_lists(isf_win *w, int D, int H, int W);           /* the lists + forward table of the filled pn */
 /* the device side: the head, the window's lists, the compact features fc / gradient gc [C][nv], slab scratch */
-typedef struct { isfhead *h; int C, Hp, K, nv; float *patch, *lab, *wt, *glog, *zh; int *vox, *off, *ent, *fidx; float *ew, *fw, *fc, *gc; void *feat, *rows;
+typedef struct { isfhead *h; int C, Hp, K, nv, pend; void *zev; float *patch, *lab, *wt, *glog, *zh; int *vox, *off, *ent, *fidx; float *ew, *fw, *fc, *gc; void *feat, *rows;
                  size_t c_vox, c_off, c_ent, c_ew, c_fidx, c_fw, c_fc, c_gc, c_feat, c_rows; } isf_dev;
 int isf_dev_init(isf_dev *g, int C, int Hp, int K, uint64_t seed);
 int isf_dev_init_d(isf_dev *g, int C, int Hp, int K, int depth, uint64_t seed);
@@ -96,6 +96,8 @@ int isf_dev_take(isf_dev *g, unet *u, const isf_win *w, int z0, int z1, size_t h
 /* after every slab's take: resample, head forward, the mean weighted BCE (returned; -1: no labelled px); train: the head's gradients (added)
    and the compact feature gradient x gscale x dscale[0] (device; nullptr 1). auc: the patch AUC (nullptr: not computed) */
 double isf_dev_step(isf_dev *g, const isf_win *w, float lambda, int train, float gscale, const float *dscale, double *auc);
+int isf_dev_launch(isf_dev *g, const isf_win *w, float lambda, int train, float gscale, const float *dscale);   /* isf_dev_step's device work, no wait (1: a result pending) */
+double isf_dev_result(isf_dev *g, const isf_win *w, double *auc);   /* the pending step's loss / AUC (waits for its logits) */
 int isf_dev_put(isf_dev *g, unet *u, const isf_win *w, int z0, int z1, size_t hw);   /* per gradient-pass slab: sets the unet's feature-gradient rows */
 int isf_save(const isf_dev *g, const char *path, int step);
 int isf_load(isf_dev *g, const char *path, int *step);

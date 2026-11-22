@@ -5,6 +5,14 @@ import pathlib
 import subprocess
 import tempfile
 
+import importlib.util
+import sys
+
+_miss = [m for m in ("numpy", "tifffile", "zarr") if importlib.util.find_spec(m) is None]
+if _miss:   # the numpy reference reads the outputs with zarr (the laptop suite 11-22 had none)
+    print(f"SKIP: no python {', '.join(_miss)} (the reference needs it)")
+    sys.exit(0)
+
 import numpy as np
 import tifffile as t
 import zarr
