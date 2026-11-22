@@ -6,6 +6,38 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## 1.1 um ink through a reg map: the onfly path works, the 1.1 um net (R11) lost to its 4.8 um init (2026-11-22, inkperf)
+
+- **Ink onfly through a reg map** (master 89f6e5aa): `"map": reg.json` on an onfly ink target puts the human segments of the 2.4 um scan
+  onto this source's scan (the published 1.129 -> 2.4 maps). Every mesh vertex goes through `rmap_c2f` at load, so normals and the GPU
+  path follow. The face distances are multiplied by the map's scale cbrt|det A^-1| (2.12; face [-6, 0] -> [-12.74, 0]). The held-out
+  boxes named by the 2.4 scan are mapped in (the 8 corners' bounding box + 4 vox) for both the ink exclusions and the sampler's mask. The
+  dcache key adds the map. test_ink_splat: an identity map == no map byte for byte (100430 known voxels); A = 2 I on a 2x mesh == a
+  hand-halved splat (65530).
+- **The face rule in the fine voxels** (facestep, 6c5d328b): face_of's run 3 / gap 2 / window [-4, 8] were level-0 voxels, i.e. 2.12x
+  thinner at 1.129 um. Under a map they are now scaled too, on the GPU kernels as well. test_ink_splat: A = I / 2 == the hand-doubled
+  splat (169434). Measured effect on Paris 4: small (face q50 11 -> 10 fine voxels, R1's HOLD AUC +0.001). It was not the cause of R11's
+  shift (below).
+- **Tracker for a 1.1 um net**: `ink-audit --map` (segments / holdouts of the coarse scan, CT / prediction of the fine one),
+  `--blocks-size` and `--hold-only` (the HOLD row byte-identical, ~5x less CT read). Each round predicts the same 64 held-out 512^3
+  level-0 tiles per scroll (spread over the upper half by HOLD count; `--region` caps at 64) and scores the HOLD AUC, ~5-13 min a round
+  beside the trainer.
+- **R11** (R24's recipe: widths h, P 384, init R1-62000-l1, `--um-rungs 1.1`) ran on the four 1.129 um scans streamed from the NAS
+  (53.5 Mvox/s, 29 % wait, 89 % SM busy). Same tiles, HOLD AUC:
+
+  | net | 1667 | Paris 4 | best face shift (fine vox) |
+  |---|---|---|---|
+  | R1-62000 at 4.5 um (the init, reference) | 0.803 | 0.877 | 1667 +3, P4 +14 (flat profile) |
+  | R11-2000 | 0.591 | 0.792 | +2 / +27 |
+  | R11-8000 | 0.675 | | +10 |
+  | R11-12000 | | 0.831 | +17 |
+  | R11-16000 | 0.662 | | +23 |
+
+  R11 stayed 0.05-0.14 under its own init, and its best face shift drifted outward (to +23 fine voxels = 26 um) while R1 on the same mapped
+  labels peaks near 0. So the labels are in place and the drift is R11's. Stopped at ~19.9k (lead, bar 0.78 on 1667 at 16k). The
+  snapshots are kept (lad/R11/runs/inksmokeR11/snap), with no clean score. On this data, 1.1 um input did not help a 4.8 um-initialised net
+  within 16k steps; the 1.1 um question, if reopened, is against R24 (2.4 um), not this init.
+
 ## inksurf: seams are cosmetic (feathered overlap, wider context); S4p teacher-heavy stopped; R2N9 averaged; 3-way ensembles (2026-11-22, fullvram)
 
 The S2-avg22-30 surface maps on 1447 show a hard patch grid (~96 map px tiles, saturated blobs, mismatched edges; reader3 is smooth), so
