@@ -144,8 +144,8 @@ int main(void) {
         const char *rj = "{\"coarse\": {\"key\": \"%s\", \"um\": 1}, \"fine\": {\"key\": \"ct.zarr\", \"um\": 1}, \"A\": [[1, 0, 0, %d], [0, 1, 0, %d], [0, 0, 1, %d]]}";
         snprintf(p, sizeof p, "%s/regI.json", dir); f = fopen(p, "w"); fprintf(f, rj, "x/ct.zarr", 0, 0, 0); fclose(f);
         snprintf(p, sizeof p, "%s/regT.json", dir); f = fopen(p, "w"); fprintf(f, rj, "c/coarse.zarr", tx, ty, tz); fclose(f);   /* (A rows x y z) */
-        char rep[3][4096] = {"", "", ""}; long bsum[2] = {0, 0};
-        for (int k = 0; k < 3; k++) {
+        char rep[4][4096] = {"", "", "", ""}; long bsum[2] = {0, 0};
+        for (int k = 0; k < 4; k++) {   /* (k 3: --hold-only in place of --blocks) */
             char sj[600], hj[600], mj[600], ot[600], oo[600];
             snprintf(sj, sizeof sj, "%s/%s.json", dir, k == 1 ? "segsT" : "segs"); snprintf(hj, sizeof hj, "%s/%s.json", dir, k == 1 ? "hoT" : "ho");
             snprintf(mj, sizeof mj, "%s/%s.json", dir, k == 1 ? "regT" : "regI"); snprintf(ot, sizeof ot, "%s/m%d.tsv", dir, k); snprintf(oo, sizeof oo, "%s/m%d", dir, k);
@@ -154,7 +154,7 @@ int main(void) {
             if (c3 == 0) {
                 const int fd = open(ot, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) _exit(9); dup2(fd, 1);
                 char *av[] = {"ufsm", "ink-audit", sj, "--ct", dir, "ct.zarr", "--ct-um", "1", "--level", "0", "--iso", "100", "--holdouts", hj, "--pred", dir, "pred.zarr/1",
-                              "--pred-level", "0", "--stride", "1", "--tag", "t", "--out", oo, "--blocks", "--threads", "4", "--map", mj, "--map-pad", "0", "--blocks-size", k == 2 ? "64" : "2048", nullptr};
+                              "--pred-level", "0", "--stride", "1", "--tag", "t", "--out", oo, k == 3 ? "--hold-only" : "--blocks", "--threads", "4", "--map", mj, "--map-pad", "0", "--blocks-size", k == 2 ? "64" : "2048", nullptr};
                 _exit(cmd_ink_audit(34, av));
             }
             st = 0; waitpid(c3, &st, 0); CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "ink-audit --map %d exit %d", k, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
@@ -168,6 +168,9 @@ int main(void) {
         char plain[4096] = ""; { FILE *g = fopen(tsv, "r"); size_t n = g ? fread(plain, 1, sizeof plain - 1, g) : 0; if (g) fclose(g); plain[n] = 0; }
         CHECK(*plain && !strcmp(rep[0], plain), "ink-audit: an identity --map changes the report");
         CHECK(!strcmp(rep[2], plain), "ink-audit: --blocks-size changes the report");
+        { const char *h0 = strstr(plain, "\tHOLD\t"), *h3 = strstr(rep[3], "\tHOLD\t"); const size_t n0 = h0 ? strcspn(h0, "\n") : 0, n3 = h3 ? strcspn(h3, "\n") : 0;
+          fprintf(stderr, "--hold-only: HOLD row %s\n", h0 && h3 && n0 == n3 && !memcmp(h0, h3, n0) ? "identical" : "DIFFERS");
+          CHECK(h0 && h3 && n0 == n3 && !memcmp(h0, h3, n0), "ink-audit --hold-only changes the HOLD row"); }
         CHECK(bsum[0] > 0 && bsum[0] == bsum[1], "block counts: 2048 blocks %ld vs 64 blocks %ld", bsum[0], bsum[1]);
         /* the shifted scan: rows equal up to float rounding of the shifted mesh (px within 0.5 %, AUCs within 0.01) */
         char *l0[3], *l1[3]; int n0 = 0, n1 = 0; char a0[4096], a1[4096]; snprintf(a0, sizeof a0, "%s", plain); snprintf(a1, sizeof a1, "%s", rep[1]);
