@@ -19,11 +19,12 @@ static double tifxyz_meta_scale(const char *p) {   /* meta.json scale[0] (grid v
     char *b = malloc((size_t)l + 1); const int ok = b && fread(b, 1, (size_t)l, f) == (size_t)l; fclose(f); if (!ok) { free(b); return -1; }
     json *j = json_parse(b, (size_t)l); free(b); if (!j) return -1; const double s = json_num(json_at(json_get(j, "scale"), 0), -1); json_free(j); return s;
 }
-typedef struct { char dir[1024], name[256]; int w, h, mw, mh, na, nb; double sc; float *X, *Y, *Z; uint8_t *map; long *pid; } spw;
+typedef struct { char dir[1024], name[256]; int w, h, mw, mh, na, nb; double sc; float *X, *Y, *Z; uint8_t *map; long *pid; float **blk; int bw, bh; } spw;   /* blk: --surf-overlap's
+   feathered sums, per SURF_BLK^2 block of the map (lazily: covered blocks only), [2][SURF_BLK^2] = sum w p, sum w */
 typedef struct { int wr, a0, b0, pa, pb; int64_t lo[3], hi[3]; long tile; } spp;
-enum { SURF_ZS = 32 };   /* the feature slab's planes (training's head slabs) */
+enum { SURF_ZS = 32, SURF_BLK = 128 };   /* the feature slab's planes (training's head slabs) */
 struct surfp {
-    spw *W; int nw; spp *P; long np; int Hp, halo, core, K, C0; double s; isf_dev dev; isf_win win; float *idw; void *feat; size_t featc; int whole; double pv;   /* whole: the whole-window feature fallback (DEFAULTED) */
+    spw *W; int nw; spp *P; long np; int Hp, halo, core, K, C0; double s; isf_dev dev; isf_win win; float *idw; void *feat; size_t featc; int whole; double pv; int stride, ramp, blend;   /* stride: the patch grid's step (core: hard tiling; < core: --surf-overlap, feathered over ramp px, blend 0 linear 1 cosine); whole: the whole-window feature fallback (DEFAULTED) */
     long *tp, *toff; long ntile, nrun, nfit; uint8_t *tdone;
 };
 static int grid_pt(const spw *w, double gu, double gv, double P[3]) {   /* the wrap's grid at (col gu, row gv), bilinear; 0: an invalid corner */
@@ -45,9 +46,14 @@ static int map_pt(const surfp *S, const spw *w, int a, int b, float q[6]) {
     for (int d = 0; d < 3; d++) { q[d] = (float)((P[d] - 0.5 * (S->s - 1)) / S->s); q[3 + d] = (float)(n[d] / l); }
     return 1;
 }
-surfp *surfp_open(const char *wraps, const char *isf, int C0, int Hp, int halo, int K, double s, double pv) {
+surfp *surfp_open(const char *wraps, const char *isf, int C0, int Hp, int halo, int K, double s, double pv, double ov, int blend) {
     if (Hp < 32 || Hp % 16 || halo < 0 || 2 * halo >= Hp) { fprintf(stderr, "predict --surf: --surf-P a multiple of 16 >= 32, --surf-halo < P / 2\n"); return nullptr; }
+    if (!(ov >= 0 && ov <= 0.75)) { fprintf(stderr, "predict --surf: --surf-overlap in [0, 0.75]\n"); return nullptr; }
     surfp *S = calloc(1, sizeof *S); S->Hp = Hp; S->halo = halo; S->core = Hp - 2 * halo; S->K = K; S->C0 = C0; S->s = s; S->pv = pv > 0 ? pv : 1;
+    /* --surf-overlap F (2026-11-21, lead: S2-avg's 1447 maps showed hard patch seams, column jumps 8.7x the median; each patch's trunk
+       features come from its own window's GroupNorm statistics): patches every core (1 - F) px, each core pixel's probability weighted by
+       a feather over the ramp (the overlap width) to the core's edge, the map = sum w p / sum w. F 0: hard tiling, the old bytes */
+    S->ramp = (int)lround(S->core * ov); S->stride = S->core - S->ramp; if (S->stride < 1) S->stride = 1; S->blend = blend;
     char *cp = strdup(wraps); int cap = 0;
     for (char *t = strtok(cp, ","); t; t = strtok(nullptr, ",")) {
         if (S->nw == cap) { cap = cap ? 2 * cap : 16; S->W = realloc(S->W, (size_t)cap * sizeof *S->W); }
@@ -74,10 +80,14 @@ surfp *surfp_open(const char *wraps, const char *isf, int C0, int Hp, int halo, 
     /* the patches: core tiles of every wrap's map, each with its level bbox (+ the layers' reach + 2) */
     long pcap = 0; const float ext = 0.5f * (K - 1) + 2;
     for (int k = 0; k < S->nw; k++) {
-        spw *w = &S->W[k]; w->na = (w->mh + S->core - 1) / S->core; w->nb = (w->mw + S->core - 1) / S->core; w->pid = malloc((size_t)w->na * w->nb * sizeof *w->pid);
+        spw *w = &S->W[k]; const int st = S->stride;
+        w->na = w->mh > S->core ? (w->mh - S->core + st - 1) / st + 1 : 1; w->nb = w->mw > S->core ? (w->mw - S->core + st - 1) / st + 1 : 1;   /* (st = core: ceil(m / core) as before) */
+        if (st == S->core) { w->na = (w->mh + S->core - 1) / S->core; w->nb = (w->mw + S->core - 1) / S->core; }
+        w->pid = malloc((size_t)w->na * w->nb * sizeof *w->pid);
+        if (S->ramp) { w->bw = (w->mw + SURF_BLK - 1) / SURF_BLK; w->bh = (w->mh + SURF_BLK - 1) / SURF_BLK; w->blk = calloc((size_t)w->bw * w->bh, sizeof *w->blk); }
         for (size_t q = 0; q < (size_t)w->na * w->nb; q++) w->pid[q] = -1;
         for (int pa = 0; pa < w->na; pa++) for (int pb = 0; pb < w->nb; pb++) {
-            const int a0 = pa * S->core - halo, b0 = pb * S->core - halo;
+            const int a0 = pa * S->stride - halo, b0 = pb * S->stride - halo;
             spp p = {k, a0, b0, pa, pb, {INT64_MAX, INT64_MAX, INT64_MAX}, {INT64_MIN, INT64_MIN, INT64_MIN}, -1}; int any = 0;
             for (int i = 0; i < Hp; i++) for (int j = 0; j < Hp; j++) { const int a = a0 + i, b = b0 + j; if (a < 0 || b < 0 || a >= w->mh || b >= w->mw) continue;
                 float q[6]; if (!map_pt(S, w, a, b, q)) continue;
@@ -89,11 +99,13 @@ surfp *surfp_open(const char *wraps, const char *isf, int C0, int Hp, int halo, 
         }
     }
     fprintf(stderr, "predict --surf: %d wraps, %ld patches of %d px (core %d, map px = %.0f level-0 voxels), head from %s (step %d)\n", S->nw, S->np, Hp, S->core, s, isf, st);
+    if (S->ramp) fprintf(stderr, "predict --surf: --surf-overlap %.2f: patches every %d px, %s feather over %d px\n", ov, S->stride, blend ? "cosine" : "linear", S->ramp);
     return S;
 }
 void surfp_free(surfp *S) {
     if (!S) return;
-    for (int k = 0; k < S->nw; k++) { free(S->W[k].X); free(S->W[k].Y); free(S->W[k].Z); free(S->W[k].map); free(S->W[k].pid); }
+    for (int k = 0; k < S->nw; k++) { free(S->W[k].X); free(S->W[k].Y); free(S->W[k].Z); free(S->W[k].map); free(S->W[k].pid);
+        if (S->W[k].blk) { for (size_t b = 0; b < (size_t)S->W[k].bw * S->W[k].bh; b++) free(S->W[k].blk[b]); free(S->W[k].blk); } }
     free(S->W); free(S->P); free(S->tp); free(S->toff); free(S->tdone); isf_dev_free(&S->dev); isf_win_free(&S->win); nn_free(S->idw); nn_free(S->feat); free(S);
 }
 static int fits(const spp *q, const int64_t o[3], const int64_t n[3], const int m[3]) {
@@ -184,8 +196,17 @@ int surfp_window(surfp *S, unet *u, long t, const int64_t o[3], int D, int H, in
         if (whole) nn_isf_take(S->feat, S->C0, V, 0, S->dev.vox, 0, S->dev.nv, S->dev.fc, S->dev.nv);
         isf_dev_step(&S->dev, iw, 1.f, 0, 1.f, nullptr, nullptr);
         for (int i = S->halo; i < Hp - S->halo; i++) for (int j = S->halo; j < Hp - S->halo; j++) {
-            const size_t q = (size_t)i * Hp + j; const int a = p->a0 + i, b = p->b0 + j; if (!(iw->wt[q] > 0) || a >= w->mh || b >= w->mw) continue;
-            const double pr = 1 / (1 + exp(-(double)S->dev.zh[q])); w->map[(size_t)a * w->mw + b] = (uint8_t)(1 + lrint(pr * 254)); }
+            const size_t q = (size_t)i * Hp + j; const int a = p->a0 + i, b = p->b0 + j; if (!(iw->wt[q] > 0) || a < 0 || b < 0 || a >= w->mh || b >= w->mw) continue;
+            const double pr = 1 / (1 + exp(-(double)S->dev.zh[q]));
+            if (!S->ramp) { w->map[(size_t)a * w->mw + b] = (uint8_t)(1 + lrint(pr * 254)); continue; }
+            const int ci = i - S->halo, cj = j - S->halo; double f[2];   /* the feather: 1 inside, falling over the ramp to the core's edges */
+            for (int e = 0; e < 2; e++) { const int c = e ? cj : ci; double t = fmin(c + 0.5, S->core - c - 0.5) / S->ramp; t = t > 1 ? 1 : t;
+                f[e] = S->blend ? 0.5 - 0.5 * cos(3.14159265358979323846 * t) : t; }
+            const double wt = f[0] * f[1] + 1e-6;   /* (> 0: a pixel only one patch reached keeps its value) */
+            const size_t bi = (size_t)(a / SURF_BLK) * w->bw + b / SURF_BLK;
+            if (!w->blk[bi] && !(w->blk[bi] = calloc(2 * SURF_BLK * SURF_BLK, sizeof(float)))) { fprintf(stderr, "predict --surf: out of memory for the blend sums\n"); return -1; }
+            float *B = w->blk[bi]; const size_t o = (size_t)(a % SURF_BLK) * SURF_BLK + b % SURF_BLK;
+            B[o] += (float)(wt * pr); B[SURF_BLK * SURF_BLK + o] += (float)wt; }
         S->nrun++;
     }
     (void)n;
@@ -198,6 +219,10 @@ int surfp_write(surfp *S, const char *dir) {
        scaled 4x about the corner (0841 AUC 0.03, P4 0.30). Canvas px x samples map coordinate x / s, bilinear over the run pixels (0 = no
        patch: left out of the weights). UFSM_SURF_NATIVE=1: the window-voxel grid as before. */
     const int native = getenv("UFSM_SURF_NATIVE") && atoi(getenv("UFSM_SURF_NATIVE"));
+    for (int k = 0; S->ramp && k < S->nw; k++) { spw *w = &S->W[k];   /* --surf-overlap: the feathered means into the uint8 map */
+        for (int a = 0; a < w->mh; a++) for (int b = 0; b < w->mw; b++) { const float *B = w->blk[(size_t)(a / SURF_BLK) * w->bw + b / SURF_BLK]; if (!B) continue;
+            const size_t o = (size_t)(a % SURF_BLK) * SURF_BLK + b % SURF_BLK; const float sw = B[SURF_BLK * SURF_BLK + o];
+            if (sw > 0) w->map[(size_t)a * w->mw + b] = (uint8_t)(1 + lrint((double)B[o] / sw * 254)); } }
     for (int k = 0; k < S->nw; k++) { const spw *w = &S->W[k]; snprintf(p, sizeof p, "%s/%s.tif", dir, w->name);
         int ow = w->mw, oh = w->mh; uint8_t *out = w->map;
         const double up = S->s * S->pv;   /* canvas px per map px */

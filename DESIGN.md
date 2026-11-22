@@ -6,6 +6,48 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## inksurf: seams are cosmetic (feathered overlap, wider context); S4p teacher-heavy stopped; R2N9 averaged; 3-way ensembles (2026-11-22, fullvram)
+
+The S2-avg22-30 surface maps on 1447 show a hard patch grid (~96 map px tiles, saturated blobs, mismatched edges; reader3 is smooth), so
+the stitching was tested first. Patch size and spacing already match training: predict runs --surf-P 256 --surf-pvox 0.5 as trained; the
+"96 px" tiles are the 192-px core at 2 patch px per map px (1447 at LV0 8.64 um: patch px 4.32 um; P4 / 0841 at LV2: 4.8 um; training
+2.4 - 4.8 um). New `predict --surf-overlap F --surf-blend linear|cosine` (src/surfpred.c): patches every core - round(core F) px, a
+feathered sum w p / sum w in lazily allocated 128^2 blocks; F 0 is byte-identical to the hard tiling (test_ink_mil_train sp3 / sp4).
+Wider context = --surf-halo 64 (core 128, 64 px of context each side at the trained patch 256). S2-avg22-30, w288:
+
+| predict                     | P4     | 0841   | 1447   |
+|-----------------------------|--------|--------|--------|
+| hard tiles, halo 32 (default)| 0.8905 | 0.8339 | 0.6859 |
+| overlap 0.5 linear          | 0.8914 | 0.8345 | 0.6856 |
+| overlap 0.5 cosine          | 0.8912 |        |        |
+| halo 64 + overlap 0.5 linear| 0.8915 | 0.8323 | 0.6828 |
+
+Neutral everywhere: the seams are cosmetic, not the 1447 / 0841 deficit. Default stays the hard tiling (halo 32, F 0); the options stay.
+(Per-window GroupNorm statistics in the trunk remain the likely source of the level jumps; the 2-D head has no normalisation.)
+
+S4p ("teacher-heavy": S2 recipe + teach2 + the htup human jsons, whose re-exported teach tiles outnumber the human ones 4x, so draws are
+teacher-dominated, patch step mean 1.0-1.1) fell after 4k and was stopped at 12k (rule: 12k must beat 4k; the 1667 held-out score was
+capped at 1 h and dropped, P4 decided). S4h (split human / teach sources at desk9's draw ratio, step mean 1.65) continues on card 1.
+
+| S4p snapshot | P4     | 0841   | 1447   |
+|--------------|--------|--------|--------|
+| 4k           | 0.8721 | 0.8009 | 0.6628 |
+| 8k           | 0.8799 | 0.7926 | 0.6361 |
+| 12k          | 0.8713 | 0.7826 | 0.6526 |
+
+R2N9-avg12-20 (ckpt-avg of 5 snapshots incl. the .isf heads), surface head: P4 0.8771, 0841 0.8450 (> S2-avg 0.8339), 1447 0.6777;
+its voxel head (inksdk) 1667 held-out 0.7238 / P4 0.8632 vs the best single snapshot 0.710 / 0.849. Averaging rescues again.
+
+Equal-weight img-rankavg of {S2-avg surface, R2N9-avg surface, one R1 voxel map}, w288 (the rule fixed in advance; R1-62000 = R2's teacher,
+picked on 1667 held-out 0.767 vs 40k 0.742):
+
+| set  | ens, R1-40000 | ens, R1-62000 | R1-40000 | R1-62000 | S2-avg | R2N9-avg | reader3 |
+|------|---------------|---------------|----------|----------|--------|----------|---------|
+| 0841 | 0.8614        | 0.8754        | 0.8556   | 0.8981   | 0.8339 | 0.8450   | 0.8799  |
+| 1447 | 0.6824        | 0.6688        | 0.5935   | 0.5584   | 0.6859 | 0.6777   | 0.7637  |
+
+R1-62000 alone beats reader3 on 0841 (0.898 vs 0.880); the equal-weight ensemble dilutes it there and the voxel member drags 1447.
+
 ## On-the-fly ink beside a trainer: the GPU path's stream priority; surf_only sources (2026-11-21, inkperf)
 
 - S4 with the 1667 teacher source (surf_only) ran 20.9-42 Mvox/s at 30-60 % trainer wait against 52-55 without it (wait / teacher share:
