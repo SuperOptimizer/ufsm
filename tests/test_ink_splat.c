@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <time.h>
 
 enum { NV = 256, GW = 40, GH = 44 };
 static const double STEP = 4.0;   /* voxels per grid step (scale 0.25) */
@@ -196,9 +197,12 @@ int main(void) {
             const uint64_t g0 = inkfly_gpu_chunks();
             z3 *fly = ctx ? inkfly_open(ctx, sj, &c8, 64, open == 2 ? nullptr : dcd, nullptr) : nullptr; CHECK(fly != nullptr, "inkfly_open %d", open);
             if (!fly) break;
+            struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
             for (int pass = 0; pass < 2; pass++) {   /* odd boxes */
                 const int64_t bo[3] = {37, 11, 5}, bn[3] = {NV - 60, NV - 20, NV - 9}; uint8_t *fb = malloc((size_t)bn[0] * bn[1] * bn[2]);
                 CHECK(!z3_read(fly, bo, bn, fb, 4), "read onfly");
+                if (open == 2) { uint64_t h = 1469598103934665603ull; for (size_t q = 0; q < (size_t)bn[0] * bn[1] * bn[2]; q++) h = (h ^ fb[q]) * 1099511628211ull;
+                                 fprintf(stderr, "onfly gpu pass %d: bytes fnv %016llx\n", pass, (unsigned long long)h); }
                 long diff = 0, kn = 0;
                 for (int64_t z = 0; z < bn[0]; z++) for (int64_t y = 0; y < bn[1]; y++) for (int64_t x = 0; x < bn[2]; x++) {
                     const uint8_t a = fb[(z * bn[1] + y) * bn[2] + x], b = rb[((z + bo[0]) * NV + y + bo[1]) * NV + x + bo[2]]; diff += a != b; kn += b != 255; }
@@ -209,6 +213,7 @@ int main(void) {
                 CHECK(diff <= (long)fm_allow((size_t)kn, 5e-3) && kn > 10000, "onfly == stored, open %d pass %d: %ld differ, %ld known", open, pass, diff, kn);
                 free(fb);
             }
+            { struct timespec ts1; clock_gettime(CLOCK_MONOTONIC, &ts1); fprintf(stderr, "onfly open %d: reads %.3f s\n", open, (ts1.tv_sec - ts0.tv_sec) + 1e-9 * (ts1.tv_nsec - ts0.tv_nsec)); }
             dcache_stats d1; dcache_get_stats(&d1);
             fprintf(stderr, "dcache open %d: %llu computed, %llu from disk, %llu from memory\n", open, (unsigned long long)(d1.cells_computed - d0.cells_computed),
                     (unsigned long long)(d1.cells_disk - d0.cells_disk), (unsigned long long)(d1.cells_mem - d0.cells_mem));

@@ -186,7 +186,7 @@ typedef struct {
     double *hs_ent, ent_h[32]; float kl_side, kl_rv, kl_norm, kl_w4, kl_ink, kl_fib[2], ang_side; unsigned long long *hsz; long hsz_pass;
     /* --ink-surf: the surface head (device), each buffer's patch (host: built from its rays at mil_take), this window's loss / unmasked fraction /
        patch AUC for the log (isf_got: the window had labelled patch pixels), the MIL's own ray subset per buffer */
-    isf_dev isf; isf_win isfw[2]; isf_job isfj[2]; pthread_t isf_th[2]; int isf_thon[2]; int isf_on, isf_got; double isf_l, isf_frac, isf_auc; inkray *isf_mr[2]; size_t isf_mrc[2]; long isf_nwin; double isf_bms, isf_stp; int isf_teach;
+    isf_dev isf; isf_win isfw[2]; isf_job isfj[2]; pthread_t isf_th[2]; int isf_thon[2]; int isf_on, isf_got, isf_tr, isf_cur; double isf_l, isf_frac, isf_auc; inkray *isf_mr[2]; size_t isf_mrc[2]; long isf_nwin; double isf_bms, isf_stp; int isf_teach;
 } gpu_state;
 /* hs_ent layout (doubles): the phase / side pair, rv pair, normal 7, ink, fibre H, V, fibre direction 7, the phase pair's angle error (sum, count) */
 enum { HE_SIDE = 0, HE_RV = 2, HE_NORM = 4, HE_INK = 11, HE_FIBH = 12, HE_FIBV = 13, HE_FDIR = 14, HE_ANG = 21, HE_N = 23 };
@@ -1004,6 +1004,11 @@ static void *isf_build_th(void *a) {   /* --ink-surf: one window's patch (mil_ta
     isf_job *J = a; const double t0 = now();
     J->rc = isf_win_build(J->w, J->src, J->na, g_isf_P, g_isf_step, 2 * g_isf_k + 1, 1.f, J->D, J->H, J->W, J->aug, J->soft, g_isf_pvox);
     J->ms = 1e3 * (now() - t0); return nullptr;
+}
+static void isf_resolve(gpu_state *d) {   /* --ink-surf: the launched head step's loss / AUC and isf_got (waits for its logits; a no-op without one pending) */
+    if (!d->isf_on || !d->isf.pend) return;
+    const double l = isf_dev_result(&d->isf, &d->isfw[d->isf_cur], &d->isf_auc);
+    d->isf_got = l >= 0 && d->isf_tr; d->isf_l = l;
 }
 static void isf_join(gpu_state *d, int i) {   /* buffer i's patch build done (a no-op without one in flight) */
     if (!d->isf_thon[i]) return;
@@ -1896,6 +1901,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         else if (g_lat && g_lat_guide) LGUIDE(1);   /* the coefficient planes' gradients */
         if (g_lat) nn_lat_up_adj(d->hs_lg, LUPN, D / 4, H / 4, W / 4, z0, nz, d->latg, d->nt);   /* (scratch: the normal targets, 7 bytes a voxel, are done for this slab; any channel count: groups of 28) */   /* --lat: the slab's gradient onto the cell grid */
         else { if (d->gc_on) nn_gram16(d->hs_lg, !nn_get_f16(), g_cout, ns, ns, d->gcS);
+               if (isw) isf_resolve(d);
                if (isw && d->isf_got && isf_dev_put(&d->isf, d->u, isw, z0, z1, hw)) { fprintf(stderr, "ink surf: out of GPU memory for the feature-gradient rows\n"); exit(1); }
                if (unet_head_bwd_z(d->u, z0, z1, d->hs_lg, z0 == 0)) { fprintf(stderr, "head slabs: the fused head backward is not covered (UFSM_HEAD_SLAB=0%s)\n", isw ? "; --ink-surf: the head's rows + the feature rows" : ""); abort(); }
                if (isw) unet_set_head_feat_grad_z(d->u, nullptr); }
@@ -1968,8 +1974,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
             const float gs = d->hs_train && nn_get_loss_grad_h16() ? nn_get_grad_scale() : 1.f;
             const int tr = d->hs_train && nn_get_loss_grad_h16() && iw > 0;
             if (tr) isfhead_zero_grad(d->isf.h);
-            const double l = isf_dev_step(&d->isf, isw, iw, tr, gs, tr && d->hgs_on ? d->hgsd : nullptr, &d->isf_auc);
-            d->isf_got = l >= 0 && tr; d->isf_l = l; d->isf_frac = isw->frac; d->isf_stp = isw->step;
+            isf_resolve(d); d->isf_cur = d->cur; isf_dev_launch(&d->isf, isw, iw, tr, gs, tr && d->hgs_on ? d->hgsd : nullptr);   /* (no wait: isf_resolve reads the loss where isf_got is needed) */
+            d->isf_tr = tr; d->isf_got = 0; d->isf_l = d->isf_auc = -1; d->isf_frac = isw->frac; d->isf_stp = isw->step;
         }
         nn_ent_fin(d->hs_ent, HE_N);
     } else if (fuse && light) {   /* the logged losses: the same finalisation with the gradient pass's sums (the mask sums and the active count are unchanged) */
@@ -5838,6 +5844,7 @@ int cmd_train(int argc, char **argv) {
             if (use_anvil) unet_anvil(d->u, anvil_lr * lrr, anvil_wd, ostep, steps / accum, lr, 0.9f, 0.999f, 1e-8f, wd);
             else if (use_muon) unet_muon(d->u, muon_lr * lrr, muon_beta, lr, 0.9f, 0.999f, 1e-8f, wd, ostep);   /* Muon lr follows the same schedule shape */
             else unet_adamw(d->u, lr, 0.9f, 0.999f, 1e-8f, wd, ostep);
+            isf_resolve(d);
             if (d->isf_on && d->isf_got) isfhead_adamw(d->isf.h, g_isf_lr * lrr, g_isf_wd, ostep);   /* --ink-surf: the head at its own rate x the schedule */
             if (cfg.attn_blocks > 0) {   /* QK-clip on the step's logit maxima: replicas first agree on the max over all GPUs (identical clips) */
                 if (ng > 1 && qk_tau > 0.f && g == 0) {
@@ -5969,6 +5976,7 @@ int cmd_train(int argc, char **argv) {
         if (step_ok) {
         if (g_unwrap) { acc_ink += G[0].iout[0]; if (G[0].norm_raw > 0) { acc_norm += G[0].norm_raw; acc_normn += 1; } }   /* (labels present: the unweighted loss, also under --norm-lambda 0) */
         if (g_mil && G[0].mil_n) { acc_mil += G[0].mil_raw; acc_miln += 1; acc_milr += G[0].mil_n; }
+        isf_resolve(&G[0]);
         if (G[0].isf_on) { acc_isfw += 1; acc_isff += G[0].isf_frac; acc_isfb += G[0].isf_bms; acc_isfs += G[0].isf_stp; if (G[0].isf_l >= 0 && G[0].isf_teach) { acc_isft += G[0].isf_l; acc_isftn += 1; }   /* (S3: the teacher windows' BCE apart from the human ones') */
             else { if (G[0].isf_l >= 0) { acc_isf += G[0].isf_l; acc_isfn += 1; } if (G[0].isf_auc >= 0) { acc_isfa += G[0].isf_auc; acc_isfan += 1; } } G[0].isf_l = G[0].isf_auc = -1; G[0].isf_frac = 0; }
         if (g_fibh && (G[0].fhout[0][2] > 0 || G[0].fhout[1][2] > 0)) { acc_fh[0] += G[0].fib_raw[0]; acc_fh[1] += G[0].fib_raw[1]; acc_fhn += 1; }

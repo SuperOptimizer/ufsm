@@ -6,6 +6,31 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## On-the-fly ink beside a trainer: the GPU path's stream priority; surf_only sources (2026-11-21, inkperf)
+
+- S4 with the 1667 teacher source (surf_only) ran 20.9-42 Mvox/s at 30-60 % trainer wait against 52-55 without it (wait / teacher share:
+  0-19 % teacher 42.6 Mvox/s 19 % wait, 40-59 % 26.3 / 49 %). Per teacher window ~45 derived ink cells (2.2 s of a worker, CPU repro:
+  1783 cells in 86.6 s for 40 windows) and ~434 k rays (human windows 15-48 k). On the trainer the workers sat in futex waits at 1.7 of 32
+  cores: under gdb (CPU path, no GPU) every worker computes, no lock, so the waits are the GPU ink path's synchronous round trips queued
+  behind the trainer's kernels.
+- nn_inkfly.cu: the reader threads' streams at the device's highest priority (UFSM_INKFLY_PRIO=0: off); pinned staging exists but is
+  opt-in (UFSM_INKFLY_PINNED=1: slower in the laptop A/B, 0.19 vs 0.12 s); thread contexts released at exit. Same bytes (test_ink_splat
+  hash in all four settings).
+
+## The surface head step without a drain; --det is not deterministic under --ink-surf (2026-11-21, branch isfperf-20261121, inkperf)
+
+- isf_dev_step was one call that waited for the head's logits (the loss / AUC on the host) before training queued anything else: the GPU
+  drained once a step. Now isf_dev_launch queues the resample, forward, the logits' copy into pinned memory (event) and the backward /
+  gather; isf_resolve waits for that event only where isf_got is needed (the gradient pass's first slab, the head's AdamW, the log).
+  Same device work; laptop P 128 fixture 5.0 -> 5.4 Mvox/s.
+- Gate: 300-step --det runs on the laptop fixture, mean over steps 101-300: master 1.3867 / 1.3863, new 1.3863 / 1.3865 (loss), ink surf
+  0.6917 / 0.6926 vs 0.6923 / 0.6923: within master's run-to-run spread. Touched suites (test_inksurf, test_ink_mil_train, test_hgscale,
+  test_mgpu_lint) pass.
+- Found on the way: `--det 1` with `--ink-surf` is not run-to-run deterministic on master either. 8-step runs vs one reference: the old
+  binary (44211d86) differed in 3 of 4 runs, the async one in 2 of 4; the step lines part at step 6 (the update of step 5). The windows and
+  ray counts are the same; side-stream ordering (UFSM_ISF_SW), full syncs before the prefetch / the batch release (UFSM_ISF_PF) and
+  UFSM_H2D_SYNC did not remove it (debug branch isfdbg-20261121). Open: every surface run is unreproducible until it is found.
+
 ## inksurf S1-S3: scale, scoring at canvas resolution, head depth / context, snapshot averaging, a stale head-weight bug (2026-11-21, fullvram)
 
 Surface-head scores below: ink-wrapscore AUC of predict --surf maps over the clean crop sets (0841: 8 crops, 1447: 28, P4: 16),
@@ -59,6 +84,14 @@ window 288 beside the trainer (tracker setup), unless stated.
   conv1_to_mx_tc_k) or the weights of the last pass whose slab 0 had one (desk: the voxel-head part of the 40-row backward-data a few
   steps stale; the identity rows exact). Now flipped every call (40 x 32, same bytes); test_hgscale (4) fails on the old code. S1-S3
   trained with it; S4 / R2N9 run the fixed build.
+- **Scale bug in the training patches** (found 11-21 in S4): the human sources' segs-*-HT.json carry inksdk's ink-teach windows at
+  label_scale 4 (9.6 um px on the 2.4 um scans) beside the 2.4 um human windows. At --isf-pvox 0.5 (patch px 4.8 um) a 9.6 um raster
+  cannot be sampled finer than 1 voxel / px, so S1, S2 and S3 trained their surface heads on teacher patches at twice the human
+  patches' scale (S3 at pvox 1: human 1 voxel / px, teacher too). Worse, next to the centre the up wraps' teacher rays nearly coincide
+  in 3-D, so the spacing d from the nearest ray came out tiny and the step 9-75 grid px: those patches were mm-wide low-res crops (fix:
+  d over the longest same-row / -column baseline within 32 grid steps, isfd-20261121; test_inksurf pvox step: quantised positions step
+  500 -> 2). inksdk's ink-teach-up re-exports the teach windows at label_scale 2 (p bilinear inside the mask, mask nearest: 4.8 um
+  px); S4 proper and R2N9 train on those. The S1-S3 numbers above carry both effects.
 - **Teacher pixels** (S4): source keys surf_only (no voxel ink, no MIL rays: the surface head only, soft target = the label byte / 255)
   and surf_weight (the surface loss weight, 0.5); the teacher windows' BCE is logged apart (" teach X (N% of windows)"). inksdk's armL
   1667 teacher: 44 up wraps + 6 labelled segments (teacher masks 0 on labelled blocks, held-out boxes + 64 vox, validation px):
