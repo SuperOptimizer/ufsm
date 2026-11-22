@@ -65,7 +65,7 @@ static int src_add_hold_v(source *s, const int64_t v[6], int rej, int nos) {
         fprintf(stderr, "sources: %s: held-out box [%lld %lld %lld %lld %lld %lld]: origin < 0 or extent <= 0\n", s->name, (long long)v[0], (long long)v[1], (long long)v[2], (long long)v[3], (long long)v[4], (long long)v[5]); return 1; }
     s->hold = realloc(s->hold, (size_t)(s->nhold + 1) * sizeof *s->hold); s->hold_rej = realloc(s->hold_rej, (size_t)(s->nhold + 1));
     s->hold_nos = realloc(s->hold_nos, (size_t)(s->nhold + 1)); s->hold_nos[s->nhold] = (uint8_t)(nos != 0);
-    s->hold_rej[s->nhold] = (uint8_t)(rej != 0); memcpy(s->hold[s->nhold++], v, sizeof v);
+    s->hold_rej[s->nhold] = (uint8_t)(rej != 0); memcpy(s->hold[s->nhold++], v, 6 * sizeof *v);
     if (s->nhold == 1) for (int d = 0; d < 3; d++) { s->hold_o[d] = v[d]; s->hold_n[d] = v[3 + d]; }
     return 0;
 }
