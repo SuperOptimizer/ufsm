@@ -6,6 +6,17 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## On-the-fly ink beside a trainer: the GPU path's stream priority; surf_only sources (2026-11-21, inkperf)
+
+- S4 with the 1667 teacher source (surf_only) ran 20.9-42 Mvox/s at 30-60 % trainer wait against 52-55 without it (wait / teacher share:
+  0-19 % teacher 42.6 Mvox/s 19 % wait, 40-59 % 26.3 / 49 %). Per teacher window ~45 derived ink cells (2.2 s of a worker, CPU repro:
+  1783 cells in 86.6 s for 40 windows) and ~434 k rays (human windows 15-48 k). On the trainer the workers sat in futex waits at 1.7 of 32
+  cores: under gdb (CPU path, no GPU) every worker computes, no lock, so the waits are the GPU ink path's synchronous round trips queued
+  behind the trainer's kernels.
+- nn_inkfly.cu: the reader threads' streams at the device's highest priority (UFSM_INKFLY_PRIO=0: off); pinned staging exists but is
+  opt-in (UFSM_INKFLY_PINNED=1: slower in the laptop A/B, 0.19 vs 0.12 s); thread contexts released at exit. Same bytes (test_ink_splat
+  hash in all four settings).
+
 ## The surface head step without a drain; --det is not deterministic under --ink-surf (2026-11-21, branch isfperf-20261121, inkperf)
 
 - isf_dev_step was one call that waited for the head's logits (the loss / AUC on the host) before training queued anything else: the GPU

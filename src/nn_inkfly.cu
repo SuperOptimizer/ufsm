@@ -224,7 +224,7 @@ static void atomic_over(void) {
    device's highest stream priority (the kernels are scheduled ahead of the trainer's queue; UFSM_INKFLY_PRIO=0: the old default priority)
    and, opt-in (UFSM_INKFLY_PINNED=1), the copies through a per-thread pinned arena. Scheduling and copies only: the bytes are the same
    (test_ink_splat's GPU-open hash equal in all four settings). Laptop A/B beside a fixture trainer: the GPU open 0.12 s pageable vs 0.19 s
-   pinned (the arena's cudaHostAlloc per new reader thread costs more than the staging saves), priority within noise on that small load. */
+   pinned (the arena's cudaHostAlloc per new reader thread costs more than the staging saves), priority within noise on that small load.
    A thread's context is released at its exit (its device buffers back to the budget, its pinned arena freed). */
 static pthread_key_t g_ickey;   /* mgpu: guarded (pthread_once g_ickonce) */
 static pthread_once_t g_ickonce = PTHREAD_ONCE_INIT;   /* mgpu: guarded (itself) */
