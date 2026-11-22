@@ -6,7 +6,7 @@
 typedef struct surfp surfp;
 /* wraps: comma-separated tifxyz dirs; isf: the head (train --ink-surf's CKPT.isf); C0 the trunk's level-0 width, Hp the patch side
    (multiple of 16), halo px dropped each side, K layers, s: level-0 voxels per window voxel (= per map pixel) */
-surfp *surfp_open(const char *wraps, const char *isf, int C0, int Hp, int halo, int K, double s);
+surfp *surfp_open(const char *wraps, const char *isf, int C0, int Hp, int halo, int K, double s, double pv);   /* pv: window voxels per patch px (--surf-pvox; the head's training spacing) */
 void surfp_free(surfp *S);
 /* the windows to run (level origins, extent n, interior margin m): one centred on each patch not yet placed, taking its neighbours that fit;
    *o malloc'd [3 per window]; returns the count. Window t's patches run in surfp_window(t) */

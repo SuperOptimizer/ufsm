@@ -1838,11 +1838,16 @@ static void inkfly_rayface_load(inkfly *f) {
     if (m == MAP_FAILED) return;
     f->rf_map = m; f->rf_len = (size_t)st.st_size; f->rf = (const uint8_t *)m + RF_HDR;
 }
+/* the ray stride in a unit's label px: the stride counts canvas px (level-0 voxels along the mesh), so a coarse label raster (an ink-teach
+   map, label_scale K > 1) gets its rays every max(1, stride / K) of its px (S3 2026-11-21: K 4 teacher px at stride 2 would leave 19.2 um
+   gaps in a 9.6 um patch); F = 1 rasters (every human label set) unchanged */
+static inline int ifu_stride(const ifunit *u, int stride) { if (!(u->F > 1.5)) return stride; const int s = (int)lround(stride / u->F); return s > 1 ? s : 1; }
 /* the candidate pixels of tile t (every supervised pixel with a mesh point; no window / held-out test) into *X (grown), the box */
 static int tile_px_s(inkfly *f, size_t t, cpx **X, size_t *np, size_t *cap, double lo3[3], double hi3[3], int stride);
 static int tile_px(inkfly *f, size_t t, cpx **X, size_t *np, size_t *cap, double lo3[3], double hi3[3]) { return tile_px_s(f, t, X, np, cap, lo3, hi3, 1); }
 static int tile_px_s(inkfly *f, size_t t, cpx **X, size_t *np, size_t *cap, double lo3[3], double hi3[3], int stride) {
     const inksplat_cfg *c = &f->c; const ifunit *u = &f->U[f->T[t].unit]; const int tl = (int)f->T[t].tile, tx = tl % u->ntx, ty = tl / u->ntx;
+    const int su = ifu_stride(u, stride);
     const int64_t r0 = (int64_t)ty * TS, c0 = (int64_t)tx * TS, r1 = r0 + TS < u->lh ? r0 + TS : u->lh, c1 = c0 + TS < u->lw ? c0 + TS : u->lw, rh = r1 - r0, rw = c1 - c0;
     const int reach = (int)ceil(fmax(fabs(c->face_lo), fabs(c->face_hi))) + 2;
     uint8_t *lab = malloc((size_t)rh * rw), *msk = nullptr;
@@ -1850,12 +1855,12 @@ static int tile_px_s(inkfly *f, size_t t, cpx **X, size_t *np, size_t *cap, doub
     if (u->lab01) for (size_t k = 0; k < (size_t)rh * rw; k++) lab[k] *= 255;
     geo G = {0}; G.c = c; G.S = &f->S[u->surf]; G.F = u->F; G.lab = lab; G.msk = msk; G.lw = rw; G.lh = rh; G.lr0 = u->lr0 + r0; G.lc0 = u->lc0 + c0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
     for (int64_t r = 0; r < rh; r++) for (int64_t cc = 0; cc < rw; cc++) {
-        if ((u->lr0 + r0 + r) % stride || (u->lc0 + c0 + cc) % stride) continue;
+        if ((u->lr0 + r0 + r) % su || (u->lc0 + c0 + cc) % su) continue;
         if (!px_sup(&G, r, cc)) continue;
         double gu, gv, P[3], N[3]; px_grid(&G, (double)r, (double)cc, &gu, &gv);
         if (ssurf_pn(G.S, gu, gv, P, N)) continue;
         if (*np == *cap) { *cap = *cap ? 2 * *cap : 65536; cpx *q = realloc(*X, *cap * sizeof *q); if (!q) { free(lab); free(msk); return -1; } *X = q; }
-        cpx *x = &(*X)[(*np)++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = lab[(size_t)r * rw + cc] >= 128; x->t = (uint32_t)t; x->px = (uint16_t)(r * TS + cc);
+        cpx *x = &(*X)[(*np)++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = c->soft_y ? lab[(size_t)r * rw + cc] : lab[(size_t)r * rw + cc] >= 128; x->t = (uint32_t)t; x->px = (uint16_t)(r * TS + cc);
         for (int d = 0; d < 3; d++) { if (P[d] - reach < lo3[d]) lo3[d] = P[d] - reach; if (P[d] + reach > hi3[d]) hi3[d] = P[d] + reach; }
     }
     free(lab); free(msk); return 0;
@@ -2290,8 +2295,8 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
         for (size_t q = q0; q < q1; q++) {
             const int t = (int)f->T[cand[q]].tile, tx = t % u->ntx, ty = t / u->ntx;
             const int64_t r0 = (int64_t)ty * TS, c0 = (int64_t)tx * TS, r1 = r0 + TS < u->lh ? r0 + TS : u->lh, c1 = c0 + TS < u->lw ? c0 + TS : u->lw;
-            for (int64_t r = r0; r < r1; r++) { if ((u->lr0 + r) % stride) continue;
-                for (int64_t cc = c0; cc < c1; cc++) { if ((u->lc0 + cc) % stride) continue;
+            for (int64_t r = r0; r < r1; r++) { if ((u->lr0 + r) % ifu_stride(u, stride)) continue;
+                for (int64_t cc = c0; cc < c1; cc++) { if ((u->lc0 + cc) % ifu_stride(u, stride)) continue;
                     if (!px_sup(&G, r - rr0, cc - rc0)) continue;
                     double gu, gv, P[3], N[3]; px_grid(&G, (double)(r - rr0), (double)(cc - rc0), &gu, &gv);
                     if (ssurf_pn(G.S, gu, gv, P, N)) continue;
@@ -2300,7 +2305,7 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
                     int ex = 0; for (int e = 0; e < c->nexcl && !ex; e++) { const int64_t *bx = c->excl[e]; ex = 1; for (int d = 0; d < 3 && ex; d++) ex = P[d] > bx[d] - ex_m && P[d] < bx[d] + bx[3 + d] + ex_m; }
                     if (ex) continue;
                     if (np == pc) { pc *= 2; X = realloc(X, pc * sizeof *X); }
-                    cpx *x = &X[np++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = lab[(size_t)(r - rr0) * rw + (cc - rc0)] >= 128;
+                    cpx *x = &X[np++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = c->soft_y ? lab[(size_t)(r - rr0) * rw + (cc - rc0)] : lab[(size_t)(r - rr0) * rw + (cc - rc0)] >= 128;
                     x->t = cand[q]; x->px = (uint16_t)((r - r0) * TS + (cc - c0));
                     for (int d = 0; d < 3; d++) { if (P[d] - reach < lo3[d]) lo3[d] = P[d] - reach; if (P[d] + reach > hi3[d]) hi3[d] = P[d] + reach; }
                 } }
@@ -2517,10 +2522,44 @@ int cmd_ink_teach(int argc, char **argv) {
         for (size_t q = 0; q < (size_t)SS.w * SS.h; q++) { const float z = SS.Z[q], y = SS.Y[q], x = SS.X[q]; if (!(z > 0 && y > 0 && x > 0)) continue;
             it_cadd(&LC, it_ckey((int64_t)(z / xclear), (int64_t)(y / xclear), (int64_t)(x / xclear))); }
         ssurf_free(&SS); }
-    /* pass 1 per segment: the teacher raster + the human footprint stats; kept for pass 2 (rasters are 1 / K^2 of the label grid) */
+    /* per segment: the teacher raster + the human footprint stats (rasters are 1 / K^2 of the label grid). Pass 0: the labelled segments only,
+       their calibration pairs into the reservoir, the rasters freed at once; then the weights + Platt; pass 1: every segment rebuilt, gated,
+       written and freed. One raster in memory at a time (11-21: holding all 50 1667 meshes for pass 2 took > 14 GB, OOM-killed twice); the
+       labelled ones are built twice (identical: the build is deterministic). */
     typedef struct { int64_t H, W; double F, lum; float *xt; uint8_t *valid, *hsup; float *hy; } itr;
     itr *R = calloc(ns, sizeof *R); float *px = malloc(maxp * nt * sizeof *px), *py = malloc(maxp * sizeof *py); size_t np = 0, nseen = 0; uint64_t rng = 0x9E3779B97F4A7C15ull;
-    for (int si = 0; si < ns; si++) {
+    double w[8], A = 1, B = 0; FILE *jf = nullptr; char jp[1400]; size_t tot = 0, tink = 0; int nw = 0;
+    for (int ph = 0; ph < 2; ph++) {
+      if (ph) {
+        if (np < 1000) { fprintf(stderr, "ink-teach: only %zu calibration px\n", np); return 1; }
+        /* weights from the per-teacher AUC, then Platt on the ensemble logit */
+        double ws = 0; float *xe = malloc(np * sizeof *xe), *tmp = malloc(np * sizeof *tmp);
+        for (int t = 0; t < nt; t++) { for (size_t i = 0; i < np; i++) tmp[i] = px[i * nt + t]; const double a = it_auc(tmp, py, np);
+            w[t] = eqw ? 1 : fmax(a - 0.5, 0.01); ws += w[t]; fprintf(stderr, "ink-teach: teacher %s AUC %.4f on %zu calibration px\n", tn[t], a, np); }
+        for (int t = 0; t < nt; t++) w[t] /= ws;
+        for (size_t i = 0; i < np; i++) { double x = 0; for (int t = 0; t < nt; t++) x += w[t] * px[i * nt + t]; xe[i] = (float)x; }
+        const char *pl = sopt(argc, argv, "--platt", nullptr);
+        if (pl && sscanf(pl, "%lf,%lf", &A, &B) == 2) {}
+        else for (int it = 0; it < 50; it++) {   /* Newton on the soft-label log loss */
+            double g0 = 0, g1 = 0, h00 = 1e-9, h01 = 0, h11 = 1e-9;
+            for (size_t i = 0; i < np; i++) { const double p = 1 / (1 + exp(-(A * xe[i] + B))), d = p - py[i], q = p * (1 - p); g0 += d * xe[i]; g1 += d; h00 += q * xe[i] * xe[i]; h01 += q * xe[i]; h11 += q; }
+            const double det = h00 * h11 - h01 * h01; if (!(det > 0)) break;
+            const double dA = (h11 * g0 - h01 * g1) / det, dB = (h00 * g1 - h01 * g0) / det; A -= dA; B -= dB; if (fabs(dA) + fabs(dB) < 1e-7) break; }
+        { size_t keep = 0, ok = 0, ki = 0, yi = 0; double ll = 0;
+          for (size_t i = 0; i < np; i++) { const double p = 1 / (1 + exp(-(A * xe[i] + B))); const int y = py[i] >= 0.5f; yi += y; ll -= py[i] * log(fmax(p, 1e-9)) + (1 - py[i]) * log(fmax(1 - p, 1e-9));
+              if (p <= lo || p >= hi) { keep++; ok += (p >= 0.5) == y; ki += y && p >= hi; } }
+          fprintf(stderr, "ink-teach: ensemble (w%s", eqw ? " equal" : " AUC - 0.5:"); for (int t = 0; t < nt; t++) fprintf(stderr, " %s %.3f", tn[t], w[t]);
+          fprintf(stderr, ") AUC %.4f, Platt a %.4f b %.4f (log loss %.4f); gate keeps %.1f %% of the calibration px at accuracy %.4f, ink recall %.3f\n",
+                  it_auc(xe, py, np), A, B, ll / np, 100.0 * keep / np, keep ? (double)ok / keep : 0, yi ? (double)ki / yi : 0); }
+        free(px); free(py); free(xe); free(tmp); px = py = nullptr;
+        if (mkdir_p(out)) return 1;
+        snprintf(jp, sizeof jp, "%s/segs-teach.json", out); jf = fopen(jp, "wb"); if (!jf) return 1;
+        fprintf(jf, "{\"note\": \"ink-teach: %d-teacher ensemble (", nt); for (int t = 0; t < nt; t++) fprintf(jf, "%s%s %.3f", t ? ", " : "", tn[t], w[t]);
+        fprintf(jf, "), Platt a %.5g b %.5g, gate p <= %g | p >= %g, K %d; human-supervised px (+%d) and held-out boxes (+%g voxels) removed\",\n \"segments\": [\n", A, B, lo, hi, K, hdil, hm);
+        fflush(jf);
+      }
+      for (int si = 0; si < ns; si++) {
+        if (!ph && S[si].ext) continue;   /* (extras hold no human px: nothing to calibrate) */
         it_seg *s = &S[si]; itr *r = &R[si]; ssurf SS; if (ssurf_load(&SS, s->tifxyz)) return 1;
         lsrc LL; memset(&LL, 0, sizeof LL);
         if (s->ext) {   /* no label grid: label px = 1 / K teacher px, so the raster is the teacher's own px grid (F K mesh voxels = px_um) */
@@ -2584,7 +2623,7 @@ int cmd_ink_teach(int argc, char **argv) {
         }
         size_t nsup = 0, nfull = 0;
         for (size_t k = 0; k < n; k++) { if (!cnt[k]) continue; nsup++; r->hsup[k] = 1; r->hy[k] = sum[k] / cnt[k];
-            if (cnt[k] >= K * K && r->valid[k] == 1) { nfull++;   /* a calibration pair (reservoir over the scroll) */
+            if (!ph && cnt[k] >= K * K && r->valid[k] == 1) { nfull++;   /* a calibration pair (reservoir over the scroll) */
                 size_t slot = np < maxp ? np++ : (rng ^= rng << 13, rng ^= rng >> 7, rng ^= rng << 17, (size_t)(rng % (nseen + 1)));
                 if (slot < maxp) { memcpy(px + slot * nt, r->xt + k * nt, nt * sizeof *px); py[slot] = r->hy[k]; }
                 nseen++; } }
@@ -2594,38 +2633,9 @@ int cmd_ink_teach(int argc, char **argv) {
         fprintf(stderr, "ink-teach: %s: %lld x %lld teacher px (label F %.4g, K %d), %zu valid, %zu in held-out boxes, %zu human-supervised (%zu calibration)\n",
                 s->name, (long long)r->W, (long long)r->H, F, K, nv, nh, nsup, nfull);
         ssurf_free(&SS);
-    }
-    free(LC.k);
-    if (np < 1000) { fprintf(stderr, "ink-teach: only %zu calibration px\n", np); return 1; }
-    /* weights from the per-teacher AUC, then Platt on the ensemble logit */
-    double w[8], ws = 0; float *xe = malloc(np * sizeof *xe), *tmp = malloc(np * sizeof *tmp);
-    for (int t = 0; t < nt; t++) { for (size_t i = 0; i < np; i++) tmp[i] = px[i * nt + t]; const double a = it_auc(tmp, py, np);
-        w[t] = eqw ? 1 : fmax(a - 0.5, 0.01); ws += w[t]; fprintf(stderr, "ink-teach: teacher %s AUC %.4f on %zu calibration px\n", tn[t], a, np); }
-    for (int t = 0; t < nt; t++) w[t] /= ws;
-    for (size_t i = 0; i < np; i++) { double x = 0; for (int t = 0; t < nt; t++) x += w[t] * px[i * nt + t]; xe[i] = (float)x; }
-    double A = 1, B = 0;
-    const char *pl = sopt(argc, argv, "--platt", nullptr);
-    if (pl && sscanf(pl, "%lf,%lf", &A, &B) == 2) {}
-    else for (int it = 0; it < 50; it++) {   /* Newton on the soft-label log loss */
-        double g0 = 0, g1 = 0, h00 = 1e-9, h01 = 0, h11 = 1e-9;
-        for (size_t i = 0; i < np; i++) { const double p = 1 / (1 + exp(-(A * xe[i] + B))), d = p - py[i], q = p * (1 - p); g0 += d * xe[i]; g1 += d; h00 += q * xe[i] * xe[i]; h01 += q * xe[i]; h11 += q; }
-        const double det = h00 * h11 - h01 * h01; if (!(det > 0)) break;
-        const double dA = (h11 * g0 - h01 * g1) / det, dB = (h00 * g1 - h01 * g0) / det; A -= dA; B -= dB; if (fabs(dA) + fabs(dB) < 1e-7) break; }
-    { size_t keep = 0, ok = 0, ki = 0, yi = 0; double ll = 0;
-      for (size_t i = 0; i < np; i++) { const double p = 1 / (1 + exp(-(A * xe[i] + B))); const int y = py[i] >= 0.5f; yi += y; ll -= py[i] * log(fmax(p, 1e-9)) + (1 - py[i]) * log(fmax(1 - p, 1e-9));
-          if (p <= lo || p >= hi) { keep++; ok += (p >= 0.5) == y; ki += y && p >= hi; } }
-      fprintf(stderr, "ink-teach: ensemble (w%s", eqw ? " equal" : " AUC - 0.5:"); for (int t = 0; t < nt; t++) fprintf(stderr, " %s %.3f", tn[t], w[t]);
-      fprintf(stderr, ") AUC %.4f, Platt a %.4f b %.4f (log loss %.4f); gate keeps %.1f %% of the calibration px at accuracy %.4f, ink recall %.3f\n",
-              it_auc(xe, py, np), A, B, ll / np, 100.0 * keep / np, keep ? (double)ok / keep : 0, yi ? (double)ki / yi : 0); }
-    free(px); free(py); free(xe); free(tmp);
-    /* pass 2: gate, human override, write */
-    if (mkdir_p(out)) return 1;
-    char jp[1400]; snprintf(jp, sizeof jp, "%s/segs-teach.json", out); FILE *jf = fopen(jp, "wb"); if (!jf) return 1;
-    fprintf(jf, "{\"note\": \"ink-teach: %d-teacher ensemble (", nt); for (int t = 0; t < nt; t++) fprintf(jf, "%s%s %.3f", t ? ", " : "", tn[t], w[t]);
-    fprintf(jf, "), Platt a %.5g b %.5g, gate p <= %g | p >= %g, K %d; human-supervised px (+%d) and held-out boxes (+%g voxels) removed\",\n \"segments\": [\n", A, B, lo, hi, K, hdil, hm);
-    size_t tot = 0, tink = 0;
-    for (int si = 0; si < ns; si++) {
-        it_seg *s = &S[si]; itr *r = &R[si]; const size_t n = (size_t)r->H * r->W; uint8_t *L = calloc(n, 1), *M = calloc(n, 1); size_t nk = 0, ni = 0;
+        if (!ph) { free(r->xt); free(r->valid); free(r->hsup); free(r->hy); continue; }
+        /* pass 1: gate, human override, write, free */
+        uint8_t *L = calloc(n, 1), *M = calloc(n, 1); size_t nk = 0, ni = 0;
         for (int64_t a = 0; a < r->H; a++) for (int64_t b = 0; b < r->W; b++) {
             const size_t k = (size_t)a * r->W + b; if (r->valid[k] != 1) continue;
             int hum = 0; for (int64_t da = -hdil; da <= hdil && !hum; da++) for (int64_t db = -hdil; db <= hdil && !hum; db++) {
@@ -2640,10 +2650,13 @@ int cmd_ink_teach(int argc, char **argv) {
         snprintf(d, sizeof d, "%s/%s/teachmask.zarr", out, s->name);
         if (it_write_zarr(d, M, r->H, r->W, um, 1)) { fprintf(stderr, "ink-teach: cannot write %s\n", d); return 1; }
         fprintf(jf, "  %s{\"name\": \"%s-teach\", \"tifxyz\": \"%s\", \"labels\": \"%s/%s/teach.zarr/0\", \"mask\": \"%s/%s/teachmask.zarr/0\", \"label_scale\": %.9g, \"crop\": [0, 0, %lld, %lld], "
-                    "\"teach_px\": %zu, \"teach_ink_px\": %zu}\n", si ? "," : "", s->name, s->tifxyz, out, s->name, out, s->name, r->F * K, (long long)r->W, (long long)r->H, nk, ni);
-        fprintf(stderr, "ink-teach: %s: %zu teacher label px (%.1f %% ink) = %.2f cm2\n", s->name, nk, nk ? 100.0 * ni / nk : 0, nk * pow(K * r->F * 2.399e-4, 2));   /* (label F x K canvas px of ~2.4 um mesh voxels) */
+                    "\"teach_px\": %zu, \"teach_ink_px\": %zu}\n", nw++ ? "," : "", s->name, s->tifxyz, out, s->name, out, s->name, r->F * K, (long long)r->W, (long long)r->H, nk, ni);
+        fflush(jf);
+        fprintf(stderr, "ink-teach: %s: %zu teacher label px (%.1f %% ink) = %.2f cm2 (written)\n", s->name, nk, nk ? 100.0 * ni / nk : 0, nk * pow(K * r->F * 2.399e-4, 2));   /* (label F x K canvas px of ~2.4 um mesh voxels) */
         tot += nk; tink += ni; free(L); free(M); free(r->xt); free(r->valid); free(r->hsup); free(r->hy);
+      }
     }
+    free(LC.k);
     fprintf(jf, " ]}\n"); fclose(jf);
     fprintf(stderr, "ink-teach: %zu teacher label px (%.1f %% ink) over %d segments -> %s\n", tot, tot ? 100.0 * tink / tot : 0, ns, jp);
     free(R); free(S); return 0;

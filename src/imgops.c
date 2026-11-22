@@ -362,6 +362,33 @@ out:
     return rc;
 }
 
+int tifxyz_mapf(const char *src, const char *dst, void (*f)(void *ud, const double p[3], double q[3]), void *ud, double div, size_t *n_out) {
+    char p[1400]; static const char *nm[3] = {"x", "y", "z"}; float *A[3] = {0}; int w = 0, h = 0, rc = -1; size_t nout = 0;
+    for (int k = 0; k < 3; k++) {
+        int w2, h2; snprintf(p, sizeof p, "%s/%s.tif", src, nm[k]); A[k] = img_read_f32(p, &w2, &h2);
+        if (!A[k] || (k && (w2 != w || h2 != h))) goto out;
+        w = w2; h = h2;
+    }
+    const size_t n = (size_t)w * h;
+    for (size_t i = 0; i < n; i++) {
+        if (!(A[2][i] >= 0)) { A[0][i] = A[1][i] = A[2][i] = -1.f; continue; }
+        const double a[3] = {A[0][i], A[1][i], A[2][i]}; double q[3]; f(ud, a, q);
+        if (!(q[2] >= 0) || !isfinite(q[0]) || !isfinite(q[1]) || !isfinite(q[2])) { A[0][i] = A[1][i] = A[2][i] = -1.f; nout++; continue; }
+        for (int k = 0; k < 3; k++) A[k][i] = (float)q[k];
+    }
+    snprintf(p, sizeof p, "mkdir -p '%s'", dst); if (system(p)) goto out;
+    for (int k = 0; k < 3; k++) { snprintf(p, sizeof p, "%s/%s.tif", dst, nm[k]); if (tiffw_write(p, w, h, 3, A[k], 1)) goto out; }
+    snprintf(p, sizeof p, "%s/meta.json", src); char *mb = tfx_meta_read(p); if (!mb) goto out;
+    char *ms = meta_scaled(mb, div); free(mb); if (!ms) goto out;
+    snprintf(p, sizeof p, "%s/meta.json", dst); FILE *fo = fopen(p, "w");
+    if (fo) { fputs(ms, fo); rc = fclose(fo) ? -1 : 0; }
+    free(ms);
+out:
+    for (int k = 0; k < 3; k++) free(A[k]);
+    if (n_out) *n_out = nout;
+    return rc;
+}
+
 /* ---- numpy.percentile (method linear) ---- */
 static int cmp_f64(const void *a, const void *b) { const double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
 static int cmp_f32(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }

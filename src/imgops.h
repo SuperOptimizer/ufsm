@@ -44,6 +44,10 @@ uint8_t *png_read_rgb(const char *path, int *w, int *h);
    meta.json copied with scale x div and voxel_size_um x div. Grids written deflate float32 TIFFs. 0 on success. */
 int tifxyz_scale(const char *src, const char *dst, double div, const double off[3]);
 extern int tifxyz_flip_rows;   /* tifxyz_scale: 1 = write the rows in reverse order (renders of Paris 4 wraps read upright; ufsm tifxyz-scale --flip-rows 1) */
+/* tifxyz_scale with any point map: every valid vertex (z >= 0) p = (x, y, z) -> f(ud, p, q) (q: x y z; a q with z < 0 or non-finite makes the
+   vertex invalid, -1), invalid ones stay -1; meta.json copied with scale x div and voxel_size_um x div (div = the new voxel / the old).
+   n_out: the vertices written invalid by f (may be null). 0 on success. (ufsm reg tifxyz: meshes from one scan into a registered twin) */
+int tifxyz_mapf(const char *src, const char *dst, void (*f)(void *ud, const double p[3], double q[3]), void *ud, double div, size_t *n_out);
 /* the tifxyz src copied to dst with every vertex moved d (its own units) along the vertex normal +n = (d/d column) x (d/d row)
    (central differences over valid neighbours; vertices without a normal stay); meta.json copied. toward = {y, x} (a vertical line, the
    scroll axis): +n is first flipped when most vertex normals face away from it, so D > 0 moves the sheet INWARD. 0 on success */

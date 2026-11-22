@@ -6,6 +6,64 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## inksurf S1-S3: scale, scoring at canvas resolution, head depth / context, snapshot averaging, a stale head-weight bug (2026-11-21, fullvram)
+
+Surface-head scores below: ink-wrapscore AUC of predict --surf maps over the clean crop sets (0841: 8 crops, 1447: 28, P4: 16),
+window 288 beside the trainer (tracker setup), unless stated.
+- **predict --surf for real volumes** (merged 11-21 with inksurf):
+  - Trunk features per 32-plane slab (unet_head_feat_z, as in training): 0.6 GB instead of the whole-window copy (10.3 GB at window
+    544, which failed every surface score on the desk). UFSM_SURF_WHOLE=1 keeps the old path (DEFAULTED); the two give the same map
+    byte for byte (test_ink_mil_train).
+  - Maps at canvas resolution (1 px = 1 level-0 voxel along the surface, bilinear over the patches that ran; UFSM_SURF_NATIVE=1 keeps
+    the window grid). The window-grid maps read as canvas px by ink-wrapscore scored 0841 0.031 / P4 0.303: misregistration, not a
+    weak head. A patch no window ran prints DEFAULTED.
+  - Windows by greedy set cover of the patches on the half-step lattice of the box grid (+ patch-centred windows for leftovers): 1667
+    at patch 256 ~2665 windows instead of 18375 (~20 h).
+- **Scale.** All training scans are ~2.4 um with canvas-px labels; --isf-step 2 made a patch px 4.8 um = 0.5 window voxel at the
+  9.6 rung, while predict sampled 1 window voxel. --isf-pvox V / --surf-pvox V now state the patch px in window voxels (per window the
+  label step = the rays' grid multiple nearest V / their spacing; ray stride counts canvas px). Matched spacing on S1-10000:
+
+| S1-10000 surface head | 0841 | 1447 |
+|---|---|---|
+| --surf-pvox 0.5 (trained), patch 256 | 0.807 | 0.647 |
+| --surf-pvox 1, patch 128 | 0.801 | 0.641 |
+
+  The mismatch cost ~0.006; trackers score at the trained spacing since.
+- **S2** (S1 recipe from sH-50000, 30k steps, wsd cooldown 20 %, patch 256, pvox 0.5; isfperf's head from step 758, 23 -> 43.5 Mvox/s):
+  the surface head swings 0.02-0.05 between 2k snapshots (1447: 0.692 / 0.679 / 0.638 / 0.674 / 0.650 / 0.670 / 0.678 at 18k-30k).
+  ckpt-avg now averages the .isf head too (parameters uniform, Adam moments + header of the last input; a mix of inputs with and
+  without is an error; test_ink_mil_train). The 22k-30k average beats the end:
+
+| S2 surface head | 1447 | 0841 | P4 | mean |
+|---|---|---|---|---|
+| 30k | 0.678 | 0.820 | 0.891 | 0.796 |
+| avg 22k-30k | 0.686 | 0.834 | 0.891 | 0.803 |
+
+- **S3: more in-plane context loses.** S2-avg + head depth 5 (12 of 15 convs mapped from depth 4 by role / level / shape; ISF2
+  sidecar), patch 384 at pvox 1 (3.7 mm, RF ~5 mm vs ~2.5), P 384 in lean 2 (58 Mvox/s), no teacher. The surface loss over the first
+  500 steps was below S2's (0.17 -> 0.13 vs 0.30 -> 0.21; S2 began with a fresh head), but the held-out scores fall with training:
+
+| S3 surface head (pvox 1, patch 128) | 1447 | 0841 | P4 |
+|---|---|---|---|
+| 4k | 0.651 | 0.859 | 0.882 |
+| 8k | 0.646 | 0.840 | 0.884 |
+| 12k | 0.644 | 0.817 | 0.887 |
+| S2 avg 22k-30k (pvox 0.5) | 0.686 | 0.834 | 0.891 |
+
+  Stopped after its 14k snapshot (lead); S4 / R2N9 go back to S2's recipe (depth 4, P 256, pvox 0.5) from S2-avg22-30. Snapshots kept
+  in /vesuvius/ufsm/fullvram/isf/S3/snap. Confounds: patch scale and depth changed together, and S3 ran with the stale-weight bug
+  below and with the on-the-fly ink partly on the CPU (the plan was 0.74 GB short of a mode; UFSM_GPU_DECODE_ITEMS=512 fixes that).
+- **Bug: stale / null transposed head weights** (merged 11-21, headwt): nn_head_bwd_z's > 16-output path (the --ink-surf rows: head
+  + 32 feature rows = 40) built its transposed weights only when first, and train passes first = z0 == 0, while the feature rows are
+  attached only to slabs with a patch. A pass whose slab 0 had no patch read a null wt (the laptop's illegal address in
+  conv1_to_mx_tc_k) or the weights of the last pass whose slab 0 had one (desk: the voxel-head part of the 40-row backward-data a few
+  steps stale; the identity rows exact). Now flipped every call (40 x 32, same bytes); test_hgscale (4) fails on the old code. S1-S3
+  trained with it; S4 / R2N9 run the fixed build.
+- **Teacher pixels** (S4): source keys surf_only (no voxel ink, no MIL rays: the surface head only, soft target = the label byte / 255)
+  and surf_weight (the surface loss weight, 0.5); the teacher windows' BCE is logged apart (" teach X (N% of windows)"). inksdk's armL
+  1667 teacher: 44 up wraps + 6 labelled segments (teacher masks 0 on labelled blocks, held-out boxes + 64 vox, validation px):
+  249749 supervised tiles.
+
 ## isfperf: the surface head's step cost, 4x faster head with the same bits (2026-11-21, branch isfperf-20261121, inkperf)
 
 S1 (--ink-surf 1, P 256) trained at 21-22 Mvox/s against sH's 73 with the same trunk. bench_isfhead (tests/bench_isfhead.c, Hp 256, cin 288
