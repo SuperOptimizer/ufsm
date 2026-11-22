@@ -2662,6 +2662,70 @@ int cmd_ink_teach(int argc, char **argv) {
     free(R); free(S); return 0;
 }
 
+/* ufsm ink-teach-up SEGS-TEACH.json OUT-DIR [--up 2] (lead 11-21: S4's teacher px at K 4 = 9.6 um against the surface head's 4.8 um
+   patch): every ink-teach window resampled to label_scale / up. Teacher px (R, C) covers label px [K R, K R + K); the new px (r, c) of
+   K' = K / up is centred at old (r + 0.5) / up - 0.5: teach p bilinear over the old px whose mask is 255 (renormalised, so the 0 under
+   a masked px never pulls p down at the mask edge), the mask nearest (255 / 0 stay exact). OUT/<name>/teach.zarr + teachmask.zarr
+   (OME pixel size / up), OUT/segs-teach.json (label_scale / up, crop x up, teach_px / teach_ink_px recounted). One window in memory. */
+int cmd_ink_teach_up(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm ink-teach-up SEGS-TEACH.json OUT-DIR [--up 2]   (ink-teach windows at label_scale / up: p bilinear in the mask, mask nearest)\n"); return 2; }
+    const char *segs = argv[2], *out = argv[3]; const int up = opt_atoi("--up", sopt(argc, argv, "--up", "2"));
+    if (up < 2 || up > 8) { fprintf(stderr, "ink-teach-up: --up 2..8\n"); return 2; }
+    FILE *fp = fopen(segs, "rb"); if (!fp) { fprintf(stderr, "ink-teach-up: cannot open %s\n", segs); return 1; }
+    fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *txt = malloc((size_t)sz + 1); size_t rd = fread(txt, 1, (size_t)sz, fp); fclose(fp); txt[rd] = 0;
+    json *j = json_parse(txt, rd); free(txt); const json *sg = json_get(j, "segments");
+    if (!sg || sg->type != J_ARR) { fprintf(stderr, "ink-teach-up: %s: no segments\n", segs); json_free(j); return 1; }
+    if (mkdir_p(out)) { fprintf(stderr, "ink-teach-up: cannot create %s\n", out); json_free(j); return 1; }
+    char outabs[PATH_MAX]; if (!realpath(out, outabs)) { fprintf(stderr, "ink-teach-up: cannot resolve %s\n", out); json_free(j); return 1; }
+    out = outabs;   /* the json's labels / mask paths absolute: train reads them as given, not relative to the json (11-21: teach2 failed to load) */
+    char jp[1400]; snprintf(jp, sizeof jp, "%s/segs-teach.json", out); FILE *jf = fopen(jp, "wb"); if (!jf) { json_free(j); return 1; }
+    fprintf(jf, "{\"note\": \"%s [ink-teach-up %d: label_scale / %d, p bilinear in the mask, mask nearest]\",\n \"segments\": [\n", json_str(json_get(j, "note"), ""), up, up);
+    int rc = 0, nw = 0;
+    for (int i = 0; i < sg->n && !rc; i++) {
+        const json *e = json_at(sg, i); const char *nm = json_str(json_get(e, "name"), ""), *lab = json_str(json_get(e, "labels"), ""), *msk = json_str(json_get(e, "mask"), "");
+        const double ls = json_num(json_get(e, "label_scale"), 0);
+        if (!(ls > 0) || !*msk) { fprintf(stderr, "ink-teach-up: %s has no label_scale / mask (not an ink-teach window)\n", nm); rc = 1; break; }
+        lsrc LL, LM; if (lsrc_open(&LL, lab, -1, nullptr)) { rc = 1; break; }
+        if (lsrc_open(&LM, msk, -1, nullptr)) { lsrc_close(&LL); rc = 1; break; }
+        const int64_t H = LL.H, W = LL.W, H2 = H * up, W2 = W * up;
+        { const json *cr = json_get(e, "crop"); if (cr && cr->n == 4 && (json_num(json_at(cr, 0), 0) != 0 || json_num(json_at(cr, 1), 0) != 0 || (int64_t)json_num(json_at(cr, 2), 0) != W || (int64_t)json_num(json_at(cr, 3), 0) != H))
+            { fprintf(stderr, "ink-teach-up: %s: crop is not the whole raster (%lld x %lld): unsupported\n", nm, (long long)W, (long long)H); lsrc_close(&LL); lsrc_close(&LM); rc = 1; break; } }
+        uint8_t *L = malloc((size_t)H * W), *M = malloc((size_t)H * W), *L2 = calloc((size_t)H2 * W2, 1), *M2 = calloc((size_t)H2 * W2, 1);
+        if (!L || !M || !L2 || !M2 || LM.H != H || LM.W != W || lsrc_read(&LL, 0, 0, H, W, L, 8) || lsrc_read(&LM, 0, 0, H, W, M, 8)) {
+            fprintf(stderr, "ink-teach-up: %s: read failed (or mask %lld x %lld != teach %lld x %lld)\n", nm, (long long)LM.W, (long long)LM.H, (long long)W, (long long)H); rc = 1; }
+        size_t nk = 0, ni = 0;
+        if (!rc) {
+            for (int64_t r = 0; r < H2; r++) {
+                const double fy = (r + 0.5) / up - 0.5; int64_t y0 = (int64_t)floor(fy); const double ay = fy - y0; const int64_t ny = (int64_t)(r / up);
+                for (int64_t c = 0; c < W2; c++) {
+                    const int64_t nx = c / up; if (M[(size_t)ny * W + nx] != 255) continue;   /* the mask: nearest (the old px holding this one) */
+                    const double fx = (c + 0.5) / up - 0.5; int64_t x0 = (int64_t)floor(fx); const double ax = fx - x0;
+                    double s = 0, sw = 0;
+                    for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++) {
+                        int64_t yy = y0 + dy, xx = x0 + dx; if (yy < 0) yy = 0; if (yy > H - 1) yy = H - 1; if (xx < 0) xx = 0; if (xx > W - 1) xx = W - 1;
+                        const size_t q = (size_t)yy * W + xx; if (M[q] != 255) continue;
+                        const double g = (dy ? ay : 1 - ay) * (dx ? ax : 1 - ax); s += g * L[q]; sw += g; }
+                    const uint8_t v = sw > 0 ? (uint8_t)lround(s / sw) : L[(size_t)ny * W + nx];
+                    L2[(size_t)r * W2 + c] = v; M2[(size_t)r * W2 + c] = 255; nk++; ni += v >= 128;
+                }
+            }
+            char d[1400]; const double um = LL.um > 0 ? LL.um / up : 0;
+            snprintf(d, sizeof d, "%s/%s/teach.zarr", out, nm); if (it_write_zarr(d, L2, H2, W2, um, 1)) { fprintf(stderr, "ink-teach-up: cannot write %s\n", d); rc = 1; }
+            snprintf(d, sizeof d, "%s/%s/teachmask.zarr", out, nm); if (!rc && it_write_zarr(d, M2, H2, W2, um, 1)) { fprintf(stderr, "ink-teach-up: cannot write %s\n", d); rc = 1; }
+            if (!rc) {
+                fprintf(jf, "  %s{\"name\": \"%s\", \"tifxyz\": \"%s\", \"labels\": \"%s/%s/teach.zarr/0\", \"mask\": \"%s/%s/teachmask.zarr/0\", \"label_scale\": %.9g, \"crop\": [0, 0, %lld, %lld], "
+                            "\"teach_px\": %zu, \"teach_ink_px\": %zu}\n", nw++ ? "," : "", nm, json_str(json_get(e, "tifxyz"), ""), out, nm, out, nm, ls / up, (long long)W2, (long long)H2, nk, ni);
+                fflush(jf);
+                fprintf(stderr, "ink-teach-up: %s: %lld x %lld -> %lld x %lld, label_scale %g -> %g, %zu teacher px (%.1f %% ink) (written)\n", nm, (long long)W, (long long)H, (long long)W2, (long long)H2, ls, ls / up, nk, nk ? 100.0 * ni / nk : 0);
+            }
+        }
+        free(L); free(M); free(L2); free(M2); lsrc_close(&LL); lsrc_close(&LM);
+    }
+    fprintf(jf, " ]}\n"); fclose(jf); json_free(j);
+    fprintf(stderr, "ink-teach-up: %d windows -> %s%s\n", nw, jp, rc ? " (FAILED: incomplete)" : "");
+    return rc;
+}
+
 /* ---------------- ink-audit: label / prediction / CT statistics per split along the labelled surfaces ---------------- */
 /* ufsm ink-audit SEGS.json --ct ROOT KEY --ct-um U [--level 1] [--iso 64] [--face -6,0] [--face-search -6,20] [--holdouts H.json]
      [--val-mode off|exclude] [--pred ROOT KEY --pred-level 2] [--region z,y,x,nz,ny,nx (level-0, repeatable)] [--norm C,S] [--stride 2]

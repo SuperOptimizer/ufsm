@@ -368,12 +368,29 @@ static void test_slab_inject(void) {
     }
 }
 
+/* --isf-pvox's spacing estimate (11-21): a flat 64 x 64 ray grid 0.25 window voxel per label px whose positions are quantised to whole
+   voxels plus a 1e-3 ramp (the up wraps' teacher rays: neighbours nearly coincide in 3-D). The step for pvox 0.5 must be 2 (d ~0.25), not
+   the nearest neighbour's ~500 (d 1e-3); exact positions give 2 too */
+static void test_pvox_step(void) {
+    const int G = 64, D = 64; inkray *r = calloc((size_t)G * G, sizeof *r);
+    for (int q = 0; q < 2; q++) {
+        for (int i = 0; i < G; i++) for (int j = 0; j < G; j++) { inkray *k = &r[i * G + j];
+            const double y = 16 + 0.25 * i, x = 16 + 0.25 * j;
+            k->p[0] = 32; k->p[1] = (float)(q ? floor(y) + 1e-3 * i : y); k->p[2] = (float)(q ? floor(x) + 1e-3 * j : x);
+            k->n[0] = 1; k->y = (uint8_t)(((i / 8 + j / 8) & 1) * 255); k->unit = 0; k->w = 1; k->lr = i; k->lc = j; }
+        isf_win w = {0}; const int np = isf_win_build(&w, r, G * G, 16, 1, 3, 1.f, D, D, D, 0, 0, 0.5f);
+        fprintf(stderr, "pvox step (%s positions): step %d, d %.4f, %d patch px\n", q ? "quantised" : "exact", w.step, w.dvox, np);
+        CHECK(w.step == 2 && fabsf(w.dvox - 0.25f) < 0.03f, "pvox 0.5 on %s positions: step %d d %.4f (want 2, 0.25)", q ? "quantised" : "exact", w.step, w.dvox);
+        isf_win_free(&w);
+    }
+    free(r);
+}
 int main(void) {
     if (nn_init(0)) return 77;
     g_ink = envf("TIS_INK", g_ink); g_bg = envf("TIS_BG", g_bg); g_sp0 = envf("TIS_SP0", g_sp0); g_sp1 = envf("TIS_SP1", g_sp1);
     g_a0 = envf("TIS_A0", g_a0); g_a1 = envf("TIS_A1", g_a1); g_wl0 = envf("TIS_WL0", g_wl0); g_wl1 = envf("TIS_WL1", g_wl1); g_gap = envf("TIS_GAP", g_gap); g_moff = envf("TIS_MOFF", g_moff); TP = (int)envf("TIS_TP", (float)TP);
     if (getenv("TIS_SEED")) rs = (uint64_t)atoll(getenv("TIS_SEED"));
-    if (!getenv("TIS_TOY_ONLY")) { test_resample(); test_2d(); test_2d_tiled(); test_head_fd(4); test_head_fd(5); test_isf_depth(); }
+    if (!getenv("TIS_TOY_ONLY")) { test_resample(); test_2d(); test_2d_tiled(); test_head_fd(4); test_head_fd(5); test_isf_depth(); test_pvox_step(); }
     test_toy();
     if (!getenv("TIS_TOY_ONLY")) test_slab_inject();
     if (fails) { fprintf(stderr, "test_inksurf: %d FAILED\n", fails); return 1; }
