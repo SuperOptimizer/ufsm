@@ -2825,7 +2825,8 @@ typedef struct {
     _Atomic int next, failed; int ntile; pthread_mutex_t mu; aust *A;
     int64_t bg[3]; uint64_t *blk;   /* --blocks: 2048^3 level-0 block counts [block][split][class] of face-found pixels (merged under mu) */
 } aujob;
-enum { AU_BLK = 2048 };
+static int g_au_blk = 2048;   /* ink-audit --blocks-size (mgpu: main, set once before the workers) */
+#define AU_BLK g_au_blk
 static int au_in(const double P[3], const int64_t b[6], double m) {
     for (int d = 0; d < 3; d++) if (!(P[d] >= b[d] + m && P[d] < b[d] + b[3 + d] - m)) return 0;
     return 1;
@@ -2922,7 +2923,8 @@ int cmd_ink_audit(int argc, char **argv) {
     const int ci = sidx(argc, argv, "--ct"), pi = sidx(argc, argv, "--pred");
     if (argc < 3 || ci < 0 || ci + 2 >= argc) {
         fprintf(stderr, "usage: ufsm ink-audit SEGS.json --ct ROOT KEY --ct-um U [--level 1] [--iso 64] [--face -6,0] [--face-search -6,20] [--holdouts H.json] [--val-mode off|exclude]\n"
-                        "         [--pred ROOT KEY --pred-level 2] [--region z,y,x,nz,ny,nx (level-0, repeatable)] [--norm C,S] [--stride 2] [--tag T] [--out PREFIX [--blocks]] [--threads 8] [--cache DIR]\n"
+                        "         [--pred ROOT KEY --pred-level 2] [--region z,y,x,nz,ny,nx (level-0, repeatable)] [--norm C,S] [--stride 2] [--tag T] [--out PREFIX [--blocks [--blocks-size 2048]]] [--threads 8] [--cache DIR]\n"
+                        "         [--map reg.json [--map-pad 4]]   (SEGS / --holdouts of the map's coarse scan, --ct / --pred this fine scan's)\n"
                         "  per split (TRAIN / VAL / HOLD) along the onfly ink labels: positives, face offsets, band CT, prediction AUC per band shift, score quantiles\n"); return 2;
     }
     inksplat_cfg c; inksplat_defaults(&c); c.face = 1;
@@ -2940,8 +2942,18 @@ int cmd_ink_audit(int argc, char **argv) {
     for (int i = 2; i + 1 < argc; i++) { if (strcmp(argv[i], opt_n("--region"))) continue; long long b[6];
         if (nreg >= AU_MAXR || sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6) { fprintf(stderr, "ink-audit: --region z,y,x,nz,ny,nx (at most %d)\n", AU_MAXR); return 2; }
         for (int d = 0; d < 6; d++) reg[nreg][d] = b[d]; nreg++; }
+    /* --map reg.json (2026-11-22, R11's tracker): SEGS are the map's coarse scan's (2.4 um), the CT / --pred this (fine) scan's: the meshes
+       through the map at load, the face distances x cbrt |det A^-1| (--face / --face-search as given for the coarse scan), the held-out
+       boxes named by the coarse scan mapped in (+ --map-pad 4); exactly inkfly_open's "map" */
+    const char *mapf = sopt(argc, argv, "--map", nullptr); const rmap *map = nullptr; double map_um = 0; char hkey[512]; snprintf(hkey, sizeof hkey, "%s", c.ct_key);
+    if (mapf) {
+        if (inkfly_map_coarse(mapf, hkey, sizeof hkey, &map_um) || !(map = reg_map_load(mapf))) { fprintf(stderr, "ink-audit: cannot load the map %s\n", mapf); return 1; }
+        const double ds = cbrt(fabs(raff_det(&map->Ainv))); c.face_a *= ds; c.face_b *= ds; c.face_lo *= ds; c.face_hi *= ds; c.map = mapf; c.map_dist = ds;
+    }
+    { const int bs = opt_atoi("--blocks-size", sopt(argc, argv, "--blocks-size", "2048")); if (bs < 32) { fprintf(stderr, "ink-audit: --blocks-size >= 32\n"); return 2; } g_au_blk = bs; }
     inksplat_cfg hc; memset(&hc, 0, sizeof hc);
-    if (hof && inkfly_holdouts(hof, c.ct_key, &hc)) return 1;
+    if (hof && inkfly_holdouts(hof, hkey, &hc)) return 1;
+    if (hof && map && inkfly_map_boxes(mapf, hc.excl, hc.nexcl, opt_atof("--map-pad", sopt(argc, argv, "--map-pad", "4")))) return 1;
     store_global_init();
     store *cts = store_open(c.ct_root); z3 *ct = cts ? pyramid_open_level(cts, c.ct_key, c.level, c.ct_um, c.cache) : nullptr;
     if (!ct) { fprintf(stderr, "ink-audit: CT level %d: %s\n", c.level, z3_error()); return 1; }
@@ -2958,12 +2970,12 @@ int cmd_ink_audit(int argc, char **argv) {
     for (size_t si = 0; si < sg->n; si++) {
         const json *e = json_at(sg, si); const char *tx = json_str(json_get(e, "tifxyz"), nullptr), *lb = json_str(json_get(e, "labels"), nullptr), *mk = json_str(json_get(e, "mask"), nullptr), *vl = json_str(json_get(e, "validation"), nullptr);
         if (!tx || !lb) continue;
-        if (strcmp(spath, tx)) { if (*spath) ssurf_free(&S); if (ssurf_load(&S, tx)) { *spath = 0; continue; } snprintf(spath, sizeof spath, "%s", tx); }
+        if (strcmp(spath, tx)) { if (*spath) ssurf_free(&S); if (ssurf_load(&S, tx)) { *spath = 0; continue; } if (map) ssurf_map(&S, map); snprintf(spath, sizeof spath, "%s", tx); }
         lsrc LL, LM, LV; if (lsrc_open(&LL, lb, -1, c.cache)) continue;
         const int hm = mk && !lsrc_open(&LM, mk, -1, c.cache), hv = vl && !lsrc_open(&LV, vl, -1, c.cache);
         double F = 0; const double ew = S.w / S.scale, eh = S.h / S.scale;   /* the label scale exactly as inkfly_open */
         { F = 0.5 * (ew / (double)LL.W + eh / (double)LL.H); const double p2 = pow(2, round(log2(F))); if (fabs(F - p2) < 0.002 * p2) F = p2;
-          const double mum = S.vox_um > 0 ? S.vox_um : c.ct_um; if (LL.um > 0 && mum > 0) F = LL.um / mum; }
+          const double mum = S.vox_um > 0 ? S.vox_um : map_um > 0 ? map_um : c.ct_um; if (LL.um > 0 && mum > 0) F = LL.um / mum; }
         { const double es = json_num(json_get(e, "label_scale"), 0); if (es > 0) F = es; }
         geo G = {0}; G.c = &c; G.S = &S; G.F = F; G.sign = 1; G.lw = LL.W; G.lh = LL.H;
         const json *cr = json_get(e, "crop");

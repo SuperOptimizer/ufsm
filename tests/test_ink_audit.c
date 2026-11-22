@@ -132,6 +132,57 @@ int main(void) {
     if (f) fclose(f);
     CHECK(seen == 15, "profile: pred / feature lines missing (%d)", seen);
     CHECK(ctm[0][0] && !strcmp(ctm[0], ctm[1]), "profile: the CT as a volume differs from the CT channel");
+    {   /* --map (2026-11-22, R11's tracker): (1) an identity reg.json == no map, the report byte for byte; (2) the mesh and the holdout box
+           written in a "coarse" scan shifted by t (A = [I | t]: c = f + t, the box named by the coarse key) == the plain audit within float
+           rounding; (3) --blocks-size 64: the block rows sum to the default table's counts */
+        const int tz = 3, ty = 5, tx = 7;
+        for (int v = 0; v < GH; v++) for (int u = 0; u < GW; u++) { double P[3]; surf_at(u, v, P); X[v * GW + u] = (float)(P[2] + tx); Y[v * GW + u] = (float)(P[1] + ty); Z[v * GW + u] = (float)(P[0] + tz); }
+        snprintf(p, sizeof p, "%s/segT.tifxyz", dir); CHECK(!tifxyz_write(p, GW, GH, X, Y, Z, STEP, 1.0, -1, "testT"), "tifxyz T");
+        snprintf(p, sizeof p, "%s/segsT.json", dir); f = fopen(p, "w");
+        fprintf(f, "{\"segments\": [{\"tifxyz\": \"%s/segT.tifxyz\", \"labels\": \"%s/inklabels.tif\", \"mask\": \"%s/mask.tif\"}]}\n", dir, dir, dir); fclose(f);
+        snprintf(p, sizeof p, "%s/hoT.json", dir); f = fopen(p, "w"); fprintf(f, "{\"boxes\": [{\"name\": \"h\", \"ct\": \"c/coarse.zarr\", \"l0\": [%d, %d, %d, 256, 88, 256]}]}\n", tz, ty, tx); fclose(f);
+        const char *rj = "{\"coarse\": {\"key\": \"%s\", \"um\": 1}, \"fine\": {\"key\": \"ct.zarr\", \"um\": 1}, \"A\": [[1, 0, 0, %d], [0, 1, 0, %d], [0, 0, 1, %d]]}";
+        snprintf(p, sizeof p, "%s/regI.json", dir); f = fopen(p, "w"); fprintf(f, rj, "x/ct.zarr", 0, 0, 0); fclose(f);
+        snprintf(p, sizeof p, "%s/regT.json", dir); f = fopen(p, "w"); fprintf(f, rj, "c/coarse.zarr", tx, ty, tz); fclose(f);   /* (A rows x y z) */
+        char rep[3][4096] = {"", "", ""}; long bsum[2] = {0, 0};
+        for (int k = 0; k < 3; k++) {
+            char sj[600], hj[600], mj[600], ot[600], oo[600];
+            snprintf(sj, sizeof sj, "%s/%s.json", dir, k == 1 ? "segsT" : "segs"); snprintf(hj, sizeof hj, "%s/%s.json", dir, k == 1 ? "hoT" : "ho");
+            snprintf(mj, sizeof mj, "%s/%s.json", dir, k == 1 ? "regT" : "regI"); snprintf(ot, sizeof ot, "%s/m%d.tsv", dir, k); snprintf(oo, sizeof oo, "%s/m%d", dir, k);
+            fflush(stdout); fflush(stderr);
+            const pid_t c3 = fork();
+            if (c3 == 0) {
+                const int fd = open(ot, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) _exit(9); dup2(fd, 1);
+                char *av[] = {"ufsm", "ink-audit", sj, "--ct", dir, "ct.zarr", "--ct-um", "1", "--level", "0", "--iso", "100", "--holdouts", hj, "--pred", dir, "pred.zarr/1",
+                              "--pred-level", "0", "--stride", "1", "--tag", "t", "--out", oo, "--blocks", "--threads", "4", "--map", mj, "--map-pad", "0", "--blocks-size", k == 2 ? "64" : "2048", nullptr};
+                _exit(cmd_ink_audit(34, av));
+            }
+            st = 0; waitpid(c3, &st, 0); CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "ink-audit --map %d exit %d", k, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+            FILE *g = fopen(ot, "r"); size_t n = g ? fread(rep[k], 1, sizeof rep[k] - 1, g) : 0; if (g) fclose(g); rep[k][n] = 0;
+            snprintf(p, sizeof p, "%s/m%d.blocks.tsv", dir, k); g = fopen(p, "r"); int rows = 0;
+            while (g && fgets(ln, sizeof ln, g)) { unsigned long long b[6]; char t2[16], bx[128];
+                if (sscanf(ln, "%15s %127s %llu %llu %llu %llu %llu %llu", t2, bx, b, b + 1, b + 2, b + 3, b + 4, b + 5) == 8) { rows++; if (k != 1) bsum[k == 2] += (long)(b[0] + b[1] + b[2] + b[3] + b[4] + b[5]); } }
+            if (g) fclose(g);
+            if (k == 2) CHECK(rows > 4, "--blocks-size 64: %d block rows", rows);
+        }
+        char plain[4096] = ""; { FILE *g = fopen(tsv, "r"); size_t n = g ? fread(plain, 1, sizeof plain - 1, g) : 0; if (g) fclose(g); plain[n] = 0; }
+        CHECK(*plain && !strcmp(rep[0], plain), "ink-audit: an identity --map changes the report");
+        CHECK(!strcmp(rep[2], plain), "ink-audit: --blocks-size changes the report");
+        CHECK(bsum[0] > 0 && bsum[0] == bsum[1], "block counts: 2048 blocks %ld vs 64 blocks %ld", bsum[0], bsum[1]);
+        /* the shifted scan: rows equal up to float rounding of the shifted mesh (px within 0.5 %, AUCs within 0.01) */
+        char *l0[3], *l1[3]; int n0 = 0, n1 = 0; char a0[4096], a1[4096]; snprintf(a0, sizeof a0, "%s", plain); snprintf(a1, sizeof a1, "%s", rep[1]);
+        for (char *s = strtok(a0, "\n"); s && n0 < 3; s = strtok(nullptr, "\n")) l0[n0++] = s;
+        for (char *s = strtok(a1, "\n"); s && n1 < 3; s = strtok(nullptr, "\n")) l1[n1++] = s;
+        CHECK(n0 == n1 && n0 == 3, "shifted map: %d vs %d report lines", n1, n0);
+        for (int i = 1; i < n0 && i < n1; i++) {
+            double x0[32], x1[32]; int m0 = 0, m1 = 0; char sp0[16] = "", sp1[16] = "";
+            for (char *t = l0[i], *e; *t && m0 < 32; t = *e ? e + 1 : e) { e = strchr(t, '\t'); if (!e) e = t + strlen(t); if (m0 == 1) snprintf(sp0, sizeof sp0, "%.*s", (int)(e - t), t); x0[m0++] = atof(t); }
+            for (char *t = l1[i], *e; *t && m1 < 32; t = *e ? e + 1 : e) { e = strchr(t, '\t'); if (!e) e = t + strlen(t); if (m1 == 1) snprintf(sp1, sizeof sp1, "%.*s", (int)(e - t), t); x1[m1++] = atof(t); }
+            CHECK(!strcmp(sp0, sp1) && m0 == m1, "shifted map: row %d split %s vs %s", i, sp1, sp0);
+            fprintf(stderr, "map shifted %s: px %.0f vs %.0f, AUC max %.4f vs %.4f, best face %.4f vs %.4f\n", sp1, x1[2], x0[2], x1[16], x0[16], x1[19], x0[19]);
+            CHECK(fabs(x1[2] - x0[2]) <= 0.005 * x0[2] && fabs(x1[16] - x0[16]) < 0.01 && fabs(x1[19] - x0[19]) < 0.01, "shifted map %s differs from the plain audit", sp0);
+        }
+    }
     snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) {}
     free(X); free(Y); free(Z); free(lab); free(msk); free(ct); free(pr);
     if (fails) { fprintf(stderr, "test_ink_audit: %d FAILED\n", fails); return 1; }
