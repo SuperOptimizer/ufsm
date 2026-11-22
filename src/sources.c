@@ -89,7 +89,7 @@ static int src_hold_file(source *s, const char *path, const json *rejn, const ch
     const json *bx = j ? json_get(j, "boxes") : nullptr;
     if (!bx || bx->type != J_ARR) { fprintf(stderr, "sources: %s: holdout_file %s: no \"boxes\" array\n", s->name, path); json_free(j); return 1; }
     char me[512]; snprintf(me, sizeof me, "%s", src_base(s->ct_key)); int added = 0, nrej = 0, nnos = 0;
-    if (map) { char ck[512]; if (!inkfly_map_coarse || inkfly_map_coarse(map, ck, sizeof ck, nullptr)) { json_free(j); return 1; } snprintf(me, sizeof me, "%s", src_base(ck)); }
+    if (map) { char ck[512]; if (!inkfly_map_coarse || inkfly_map_coarse(map, ck, sizeof ck, nullptr)) { json_free(j); return 1; } snprintf(me, sizeof me, "%s", src_base(ck)); s->hold_mapped = 1; }
     for (size_t k = 0; k < bx->n; k++) { const json *e = json_at(bx, k);
         if (!strcmp(src_base(json_str(json_get(e, "ct"), "")), me)) {
             const char *nm = json_str(json_get(e, "name"), ""); int rej = 0;
@@ -847,7 +847,8 @@ z3 *source_ct(source *s, int level) {
                            s->name, k, (long long)b[0], (long long)b[1], (long long)b[2], (long long)b[3], (long long)b[4], (long long)b[5], level,
                            (long long)sh[0], (long long)sh[1], (long long)sh[2],
                            (long long)(sh[0] << level), (long long)(sh[1] << level), (long long)(sh[2] << level));
-                   exit(1); }
+                   if (!s->hold_mapped) exit(1);
+                   fprintf(stderr, "sources: %s: (a box mapped from the segments' scan: outside this scan's extent it holds nothing out; kept)\n", s->name); }
     }
     if (z) z3_close(z);
     return have;
