@@ -59,6 +59,14 @@ window 288 beside the trainer (tracker setup), unless stated.
   conv1_to_mx_tc_k) or the weights of the last pass whose slab 0 had one (desk: the voxel-head part of the 40-row backward-data a few
   steps stale; the identity rows exact). Now flipped every call (40 x 32, same bytes); test_hgscale (4) fails on the old code. S1-S3
   trained with it; S4 / R2N9 run the fixed build.
+- **Scale bug in the training patches** (found 11-21 in S4): the human sources' segs-*-HT.json carry inksdk's ink-teach windows at
+  label_scale 4 (9.6 um px on the 2.4 um scans) beside the 2.4 um human windows. At --isf-pvox 0.5 (patch px 4.8 um) a 9.6 um raster
+  cannot be sampled finer than 1 voxel / px, so S1, S2 and S3 trained their surface heads on teacher patches at twice the human
+  patches' scale (S3 at pvox 1: human 1 voxel / px, teacher too). Worse, next to the centre the up wraps' teacher rays nearly coincide
+  in 3-D, so the spacing d from the nearest ray came out tiny and the step 9-75 grid px: those patches were mm-wide low-res crops (fix:
+  d over the longest same-row / -column baseline within 32 grid steps, isfd-20261121; test_inksurf pvox step: quantised positions step
+  500 -> 2). inksdk's ink-teach-up re-exports the teach windows at label_scale 2 (p bilinear inside the mask, mask nearest: 4.8 um
+  px); S4 proper and R2N9 train on those. The S1-S3 numbers above carry both effects.
 - **Teacher pixels** (S4): source keys surf_only (no voxel ink, no MIL rays: the surface head only, soft target = the label byte / 255)
   and surf_weight (the surface loss weight, 0.5); the teacher windows' BCE is logged apart (" teach X (N% of windows)"). inksdk's armL
   1667 teacher: 44 up wraps + 6 labelled segments (teacher masks 0 on labelled blocks, held-out boxes + 64 vox, validation px):
