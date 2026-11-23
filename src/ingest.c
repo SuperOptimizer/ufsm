@@ -912,3 +912,59 @@ int cmd_z3_recode(int argc, char **argv) {
     z3_close(z); store_close(s);
     return 0;
 }
+
+/* ================= mesh-tiles: the tiles a set of meshes touches (2026-11-23, inkperf: 3-D self-training predicts only near the meshes;
+   a whole 2.4 um scan at 4.8 um is up to ~7e12 voxels, PHerc0139 ~19 h on one card) =================
+   ufsm mesh-tiles OUT.txt --level L --tile T [--dilate D] [--shape Z,Y,X] [--mesh-scale S] <tifxyz|.sfc>...
+   A tile (iz, iy, ix) is T level-L voxels = T << L level-0 voxels per axis. Marked: the tile of every valid vertex and every tile meeting the
+   axis-aligned box of a vertex and its valid right / down neighbour (conservative: no tile a mesh edge crosses is missed, whatever the
+   grid step), then grown by D tiles (Chebyshev), clipped to the level-0 --shape when given. Coordinates x S (default 1: the meshes are in
+   the scan's level-0 voxels). Writes "iz iy ix" lines sorted (predict --tile-list, --tile-list-size T); prints the count. */
+static int mt_cmp(const void *a, const void *b) { const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return (x > y) - (x < y); }
+static size_t mt_uniq(uint64_t *k, size_t n) { qsort(k, n, 8, mt_cmp); size_t u = 0; for (size_t j = 0; j < n; j++) if (!u || k[j] != k[u - 1]) k[u++] = k[j]; return u; }
+int cmd_mesh_tiles(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm mesh-tiles OUT.txt --level L --tile T [--dilate 0] [--shape Z,Y,X] [--mesh-scale 1] <tifxyz|.sfc>...\n"
+                                    "  the T-voxel level-L tiles the meshes touch (vertices + their right / down edges' boxes), grown by --dilate tiles\n"); return 2; }
+    const int L = opt_atoi("--level", opt(argc, argv, "--level", "0")), T = opt_atoi("--tile", opt(argc, argv, "--tile", "512")), Dd = opt_atoi("--dilate", opt(argc, argv, "--dilate", "0"));
+    const double S = opt_atof("--mesh-scale", opt(argc, argv, "--mesh-scale", "1"));
+    long long sh[3] = {0, 0, 0}; const char *shs = opt(argc, argv, "--shape", "");
+    if (*shs && (sscanf(shs, "%lld,%lld,%lld", &sh[0], &sh[1], &sh[2]) != 3 || sh[0] <= 0 || sh[1] <= 0 || sh[2] <= 0)) { fprintf(stderr, "mesh-tiles: --shape Z,Y,X (level-0 voxels)\n"); return 2; }
+    if (L < 0 || L > 10 || T < 1 || Dd < 0 || Dd > 8 || !(S > 0)) { fprintf(stderr, "mesh-tiles: --level 0..10, --tile >= 1, --dilate 0..8, --mesh-scale > 0\n"); return 2; }
+    const double ts = (double)((int64_t)T << L);
+    int64_t nt[3] = {INT64_MAX, INT64_MAX, INT64_MAX}; if (*shs) for (int d = 0; d < 3; d++) nt[d] = (int64_t)((sh[d] + (int64_t)ts - 1) / (int64_t)ts);
+    size_t n = 0, cap = 1 << 16; uint64_t *k = malloc(cap * 8); int nm = 0;
+    #define MT_PUT(z, y, x) do { if (n == cap) { n = mt_uniq(k, n); if (2 * n > cap) { cap *= 2; k = realloc(k, cap * 8); } } k[n++] = (uint64_t)(z) << 42 | (uint64_t)(y) << 21 | (uint64_t)(x); } while (0)
+    for (int i = 2; i < argc; i++) {
+        if (argv[i][0] == '-') { i++; continue; }
+        if (i == 2) continue;   /* OUT */
+        mesh *m = load_mesh(argv[i]); if (!m) { free(k); return 1; }
+        nm++;
+        for (int r = 0; r < m->h; r++) for (int c = 0; c < m->w; c++) {
+            const size_t a = (size_t)r * m->w + c; if (!m->valid[a]) continue;
+            for (int e = 0; e < 3; e++) {   /* the vertex itself, its right and its down edge */
+                const size_t b = e == 0 ? a : e == 1 ? (c + 1 < m->w ? a + 1 : a) : (r + 1 < m->h ? a + m->w : a);
+                if (e && (b == a || !m->valid[b])) continue;
+                int64_t lo[3], hi[3];
+                for (int d = 0; d < 3; d++) { const double p = m->xyz[a * 3 + 2 - d] * S, q = m->xyz[b * 3 + 2 - d] * S;
+                    lo[d] = (int64_t)floor(fmin(p, q) / ts); hi[d] = (int64_t)floor(fmax(p, q) / ts); }
+                for (int64_t z = lo[0]; z <= hi[0]; z++) for (int64_t y = lo[1]; y <= hi[1]; y++) for (int64_t x = lo[2]; x <= hi[2]; x++)
+                    if (z >= 0 && y >= 0 && x >= 0 && z < (1 << 21) && y < (1 << 21) && x < (1 << 21)) MT_PUT(z, y, x);
+            }
+        }
+        free(m->xyz); free(m->valid); free(m->val); free(m);
+    }
+    n = mt_uniq(k, n);
+    if (Dd || *shs) {   /* grow by D tiles (Chebyshev) and clip to the shape, on the unique set */
+        const size_t n0 = n; uint64_t *k0 = malloc(n0 * 8); memcpy(k0, k, n0 * 8); n = 0;
+        for (size_t j = 0; j < n0; j++) { const int64_t z0 = (int64_t)(k0[j] >> 42), y0 = (int64_t)(k0[j] >> 21 & 0x1FFFFF), x0 = (int64_t)(k0[j] & 0x1FFFFF);
+            for (int64_t z = z0 - Dd; z <= z0 + Dd; z++) for (int64_t y = y0 - Dd; y <= y0 + Dd; y++) for (int64_t x = x0 - Dd; x <= x0 + Dd; x++)
+                if (z >= 0 && y >= 0 && x >= 0 && z < nt[0] && y < nt[1] && x < nt[2] && z < (1 << 21) && y < (1 << 21) && x < (1 << 21)) MT_PUT(z, y, x); }
+        free(k0); n = mt_uniq(k, n); }
+    #undef MT_PUT
+    const size_t u = n;
+    FILE *f = fopen(argv[2], "w"); if (!f) { fprintf(stderr, "mesh-tiles: cannot write %s\n", argv[2]); free(k); return 1; }
+    for (size_t j = 0; j < u; j++) fprintf(f, "%llu %llu %llu\n", (unsigned long long)(k[j] >> 42), (unsigned long long)(k[j] >> 21 & 0x1FFFFF), (unsigned long long)(k[j] & 0x1FFFFF));
+    if (fclose(f)) { fprintf(stderr, "mesh-tiles: write %s failed\n", argv[2]); free(k); return 1; }
+    printf("mesh-tiles: %d meshes -> %zu tiles of %d level-%d voxels (dilate %d)\n", nm, u, T, L, Dd);
+    free(k); return nm ? 0 : 2;
+}
