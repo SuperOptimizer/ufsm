@@ -6,7 +6,7 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
-## 1.1 um ink through a reg map: the onfly path works, the 1.1 um net (R11) lost to its 4.8 um init (2026-11-22, inkperf)
+## 1.1 um ink through a reg map: the onfly path works, the 1.1 um net (R11) lost to its 4.8 um init: underfitting; R11b, R11c (2026-11-22, inkperf)
 
 - **Ink onfly through a reg map** (master 89f6e5aa): `"map": reg.json` on an onfly ink target puts the human segments of the 2.4 um scan
   onto this source's scan (the published 1.129 -> 2.4 maps). Every mesh vertex goes through `rmap_c2f` at load, so normals and the GPU
@@ -34,9 +34,45 @@ Originally no teacher models; since 2026-11-15 published ink networks run as tea
   | R11-16000 | 0.662 | | +23 |
 
   R11 stayed 0.05-0.14 under its own init, and its best face shift drifted outward (to +23 fine voxels = 26 um) while R1 on the same mapped
-  labels peaks near 0. So the labels are in place and the drift is R11's. Stopped at ~19.9k (lead, bar 0.78 on 1667 at 16k). The
-  snapshots are kept (lad/R11/runs/inksmokeR11/snap), with no clean score. On this data, 1.1 um input did not help a 4.8 um-initialised net
-  within 16k steps; the 1.1 um question, if reopened, is against R24 (2.4 um), not this init.
+  labels peaks near 0. So the labels are in place and the drift is R11's. First stopped at ~19.9k (bar 0.78 on 1667 at 16k). The stop
+  was then cancelled (the user wants 1.1 um), and R11 was resumed and finally stopped at 21500 to make room for R11b. Snapshots are kept in
+  lad/R11/runs/inksmokeR11/snap; no clean score. R11-20000: 1667 0.661, P4 0.809.
+- **Why R11 lost: underfitting, not memorisation.** AUC on 64 *training* tiles per scroll: TRAIN = the trained-on px, HOLD = the
+  held-out px inside the same tiles.
+
+  | net | 1667 TRAIN | 1667 HOLD | P4 TRAIN | P4 HOLD |
+  |---|---|---|---|---|
+  | R1 w288 at 4.5 um | 0.805 | 0.834 | 0.967 | 0.969 |
+  | R11-8000 | 0.691 | 0.583 | 0.899 | 0.923 |
+  | R11-20000 | 0.735 | 0.600 | 0.859 | 0.928 |
+
+  R11 stays below R1 even on its own training px. 1667 shows a TRAIN-HOLD gap (0.135; R1 none), and P4 TRAIN fell from 8k to 20k. Raw CT
+  scores 0.46-0.55. Each net also loses one octave finer than it was trained on (1667 HOLD, 64 tiles): R1 0.803 at 4.5 vs 0.568 at 1.1,
+  R24 0.777 at 2.26 vs 0.643 at 1.1. The window is not the cause either (R1 w160 vs w288: 1667 0.798 / 0.803, P4 0.894 / 0.877).
+  Working hypothesis (lead): the receptive field is fixed in voxels (6 levels), so at 1.1 um it spans 4x fewer um than R1 does at 4.5 um.
+  A sheet plus its ink is ~45-90 fine voxels.
+- **R11b** (card 0 from 17:40):
+  - init R24-avg22-30, P 448, `--um-rungs 1.1:6,2.2:1,4.5:1`, trunk-lr-mult 0.1, 40k steps; check15 52-69 Mvox/s, lean 2 at 9.76 / 10.33 GB;
+  - sources-R11b: the human onfly labels at levels 0-2 (weight 0.7), plus native-scale teachers on the 1.129 grid: R24 at level 1
+    (0.2) and R1 at level 2 (0.1); held-out boxes mapped onto the fine scan (+16 pad, clipped; empty boxes dropped).
+  - The realised rung mix was 27 / 2 / 1 of 30 windows against the planned 52 / 29 / 19 %. Human draws are never rejected. But
+    only 3 of 21 teacher draws were accepted: the teacher volumes were one-tile-thick z slabs, so windows straddled them and failed
+    min_phase. Each rejection redraws from the whole mix, which hands the teacher share back to human (6/8 at 1.1); expected
+    ~71 / 16 / 13 % plus Poisson noise.
+  - Fix, no code: full-coverage teachers (`~/nas/teach11`; R1 at level 2 on every armK surface row, R24 at level 1 on 2-tile slabs,
+    z % 4 in {0, 1}; ~28k tiles, each group rsync -c verified), plus `--stick-src 8` at the next resume.
+- **R11c (ready, gated on R11b's 1.1 rung at 16k, < ~0.78 -> go):** a 7th U-Net level (widths 32..192,224, dec 0,32,0,0,0,0,0), so the
+  deep features cover 2x more um at 1.1, chosen over a stride-2 stem, which would be close to training at 2.2. Init R11b's newest
+  snapshot (the shared levels copied, level 6 fresh). Planner-only (UFSM_MEM_DRY, UFSM_MEM_FREE_GB 12):
+
+  | P 448 | 6 levels (R11b) | 7 levels (R11c) |
+  |---|---|---|
+  | mode | lean 2 | lean 2 |
+  | GB of 10.33 | 9.76 | 9.78 |
+  | B / voxel | 108.6 | 108.8 |
+  | host offloads each way | 4.69 GB | 4.69 GB |
+
+  Level 6 is 7^3 voxels at P 448, so its activations are nearly free; the dry run needs 24 GB of host memory (10 G was killed).
 
 ## inksurf: seams are cosmetic (feathered overlap, wider context); S4p teacher-heavy stopped; R2N9 averaged; 3-way ensembles (2026-11-22, fullvram)
 
