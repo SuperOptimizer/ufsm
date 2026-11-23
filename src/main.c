@@ -59,6 +59,7 @@ int cmd_ingest_mesh(int argc, char **argv);
 int cmd_ls(int argc, char **argv);
 int cmd_ingest_zip(int argc, char **argv);
 int cmd_raster(int argc, char **argv);
+int cmd_mesh_tiles(int argc, char **argv);   /* src/ingest.c */
 int cmd_train(int argc, char **argv);
 int cmd_restore_eval(int argc, char **argv);
 int cmd_restore_stats(int argc, char **argv);
@@ -169,6 +170,7 @@ static int usage(void) {
         "  ufsm ink-seam <zarr> --um U [--period 512] [--offset 0] [--n 24]   window-seam jump of a uint8 predict (border vs interior |dv|)\n"
         "  ufsm ingest-zip <labels.zip> <zarr-name> <out-dir> --um U  label zarr from the HF archive -> volcomp pyramid\n"
         "  ufsm raster <out-dir> --shape Z,Y,X --um U [--level L] [--T 3] <mesh.sfc|tifxyz>...  meshes -> label pyramid\n"
+        "  ufsm mesh-tiles OUT.txt --level L --tile T [--dilate D] [--shape Z,Y,X] <tifxyz|.sfc>...   the tiles meshes touch (predict --tile-list)\n"
         "  ufsm ingest-kaggle <hf-root> <out-dir> [--n N]          Kaggle cubes -> volcomp images + labels\n"
         "  ufsm ingest-mesh <root> <tifxyz-key> <out.sfc>           tifxyz -> surfcomp\n"
         "  ufsm train  <sources.json> --out DIR [--P 512 --B 1 --steps N --gpus 0 ...]   train the recto model\n"
@@ -4961,6 +4963,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "scanprep")) return cmd_scanprep(argc, argv);
     if (!strcmp(cmd, "ingest-zip")) return cmd_ingest_zip(argc, argv);
     if (!strcmp(cmd, "raster")) return cmd_raster(argc, argv);
+    if (!strcmp(cmd, "mesh-tiles")) return cmd_mesh_tiles(argc, argv);
     if (!strcmp(cmd, "train")) return cmd_train(argc, argv);
     if (!strcmp(cmd, "predict")) return cmd_predict(argc, argv);
     if (!strcmp(cmd, "eval")) return cmd_eval(argc, argv);

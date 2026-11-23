@@ -2535,12 +2535,14 @@ int cmd_ink_teach(int argc, char **argv) {
     if (!segs || !out || !nt || (hof && !ctk)) {
         fprintf(stderr, "usage: ufsm ink-teach --segs SEGS.json --teacher NAME=PATTERN(%%s = segment name) [..] --holdouts H.json --ct-key KEY --out DIR [--k 4] [--px-um 9.596]\n"
                         "         [--lo 0.1] [--hi 0.8] [--hold-margin 64] [--human-dilate 1] [--weights auc|equal] [--platt a,b] [--max-pairs 4000000]\n"
-                        "         [--extra NAME=TIFXYZ ..] [--extra-list FILE (lines: NAME TIFXYZ)] [--extra-clear 48]\n"
+                        "         [--extra NAME=TIFXYZ ..] [--extra-list FILE (lines: NAME TIFXYZ)] [--extra-clear 48] [--tw w1,..] [--calib-only 1]\n"
                         "  2-D teacher maps (ink-ext --native-only) of every segment of SEGS -> AUC-weighted logit ensemble, Platt-calibrated on the human labels\n"
                         "  outside the held-out boxes, confidence-gated (p <= lo or >= hi), human-supervised px and held-out boxes removed -> label windows\n"
                         "  DIR/<name>/teach.zarr + teachmask.zarr and DIR/segs-teach.json for the on-the-fly ink path\n"
                         "  --extra: meshes without human labels (unroll wraps, unlabelled segments): teacher labels on a teacher-px raster with the\n"
-                        "  calibration of the labelled ones, minus held-out boxes and minus px within --extra-clear level-0 voxels of a labelled mesh\n"); return 2; }
+                        "  calibration of the labelled ones, minus held-out boxes and minus px within --extra-clear level-0 voxels of a labelled mesh\n"
+                        "  --tw: fixed teacher weights; --tw + --platt: a SEGS without labelled meshes (segments []) takes that calibration\n"
+                        "  --calib-only 1: print \"tw W1,.. platt A,B\" on stdout after the calibration and stop (pool scrolls in one SEGS)\n"); return 2; }
     const int K = opt_atoi("--k", sopt(argc, argv, "--k", "4")), hdil = opt_atoi("--human-dilate", sopt(argc, argv, "--human-dilate", "1"));
     const double px_um = opt_atof("--px-um", sopt(argc, argv, "--px-um", "9.596")), lo = opt_atof("--lo", sopt(argc, argv, "--lo", "0.1")), hi = opt_atof("--hi", sopt(argc, argv, "--hi", "0.8"));
     const double hm = opt_atof("--hold-margin", sopt(argc, argv, "--hold-margin", "64")); const int eqw = !strcmp(sopt(argc, argv, "--weights", "auc"), "equal");
@@ -2593,14 +2595,20 @@ int cmd_ink_teach(int argc, char **argv) {
     double w[8], A = 1, B = 0; FILE *jf = nullptr; char jp[1400]; size_t tot = 0, tink = 0; int nw = 0;
     for (int ph = 0; ph < 2; ph++) {
       if (ph) {
-        if (np < 1000) { fprintf(stderr, "ink-teach: only %zu calibration px\n", np); return 1; }
+        /* --tw w1,..: fixed teacher weights; with --platt a,b the calibration is given (a scroll without human labels: the pooled
+           calibration of the labelled scrolls, lead 11-23 "train ink on everything"), and the calibration px only report */
+        const char *pl = sopt(argc, argv, "--platt", nullptr), *twa = sopt(argc, argv, "--tw", nullptr); int ntw = 0;
+        if (twa) { const char *q = twa; double ws = 0; while (ntw < nt && *q) { w[ntw] = atof(q); ws += w[ntw++]; q = strchr(q, ','); if (!q) break; q++; }
+            if (ntw != nt || !(ws > 0)) { fprintf(stderr, "ink-teach: --tw needs %d positive weights\n", nt); return 1; } for (int t = 0; t < nt; t++) w[t] /= ws; }
+        const int given = pl && twa && sscanf(pl, "%lf,%lf", &A, &B) == 2;
+        if (np < 1000 && !given) { fprintf(stderr, "ink-teach: only %zu calibration px (a scroll without labels needs --platt a,b and --tw)\n", np); return 1; }
+        if (np < 1000) fprintf(stderr, "ink-teach: %zu calibration px: given weights + Platt a %.5g b %.5g\n", np, A, B);
         /* weights from the per-teacher AUC, then Platt on the ensemble logit */
-        double ws = 0; float *xe = malloc(np * sizeof *xe), *tmp = malloc(np * sizeof *tmp);
-        for (int t = 0; t < nt; t++) { for (size_t i = 0; i < np; i++) tmp[i] = px[i * nt + t]; const double a = it_auc(tmp, py, np);
-            w[t] = eqw ? 1 : fmax(a - 0.5, 0.01); ws += w[t]; fprintf(stderr, "ink-teach: teacher %s AUC %.4f on %zu calibration px\n", tn[t], a, np); }
-        for (int t = 0; t < nt; t++) w[t] /= ws;
+        double ws = 0; float *xe = malloc((np + 1) * sizeof *xe), *tmp = malloc((np + 1) * sizeof *tmp);
+        for (int t = 0; t < nt && np >= 1000; t++) { for (size_t i = 0; i < np; i++) tmp[i] = px[i * nt + t]; const double a = it_auc(tmp, py, np);
+            if (!twa) { w[t] = eqw ? 1 : fmax(a - 0.5, 0.01); ws += w[t]; } fprintf(stderr, "ink-teach: teacher %s AUC %.4f on %zu calibration px\n", tn[t], a, np); }
+        if (!twa) for (int t = 0; t < nt; t++) w[t] /= ws;
         for (size_t i = 0; i < np; i++) { double x = 0; for (int t = 0; t < nt; t++) x += w[t] * px[i * nt + t]; xe[i] = (float)x; }
-        const char *pl = sopt(argc, argv, "--platt", nullptr);
         if (pl && sscanf(pl, "%lf,%lf", &A, &B) == 2) {}
         else for (int it = 0; it < 50; it++) {   /* Newton on the soft-label log loss */
             double g0 = 0, g1 = 0, h00 = 1e-9, h01 = 0, h11 = 1e-9;
@@ -2612,7 +2620,10 @@ int cmd_ink_teach(int argc, char **argv) {
               if (p <= lo || p >= hi) { keep++; ok += (p >= 0.5) == y; ki += y && p >= hi; } }
           fprintf(stderr, "ink-teach: ensemble (w%s", eqw ? " equal" : " AUC - 0.5:"); for (int t = 0; t < nt; t++) fprintf(stderr, " %s %.3f", tn[t], w[t]);
           fprintf(stderr, ") AUC %.4f, Platt a %.4f b %.4f (log loss %.4f); gate keeps %.1f %% of the calibration px at accuracy %.4f, ink recall %.3f\n",
-                  it_auc(xe, py, np), A, B, ll / np, 100.0 * keep / np, keep ? (double)ok / keep : 0, yi ? (double)ki / yi : 0); }
+                  np ? it_auc(xe, py, np) : 0, A, B, np ? ll / np : 0, np ? 100.0 * keep / np : 0, keep ? (double)ok / keep : 0, yi ? (double)ki / yi : 0); }
+        if (sopt(argc, argv, "--calib-only", nullptr)) {   /* the weights + Platt only (pooled over several scrolls' labelled meshes) */
+            printf("tw"); for (int t = 0; t < nt; t++) printf("%s%.6f", t ? "," : " ", w[t]); printf(" platt %.6f,%.6f\n", A, B);
+            free(px); free(py); free(xe); free(tmp); free(R); free(S); free(LC.k); return 0; }
         free(px); free(py); free(xe); free(tmp); px = py = nullptr;
         if (mkdir_p(out)) return 1;
         snprintf(jp, sizeof jp, "%s/segs-teach.json", out); jf = fopen(jp, "wb"); if (!jf) return 1;
