@@ -208,6 +208,12 @@ static void unpredict(uint8_t *blk, int rows, int w, int spp, int bps, int predi
                 if (!le) { a = (uint16_t)(a << 8 | a >> 8); b = (uint16_t)(b << 8 | b >> 8); }
                 a = (uint16_t)(a + b); if (!le) a = (uint16_t)(a << 8 | a >> 8); memcpy(p + i * 2, &a, 2);
             }
+            else if (bps == 4) for (size_t i = spp; i < (size_t)w * spp; i++) {   /* (32-bit words, float tifxyz too: libtiff adds them as integers;
+                                                                                   the open-data tifxyz_original grids, 2026-11-23) */
+                uint32_t a, b; memcpy(&a, p + i * 4, 4); memcpy(&b, p + (i - spp) * 4, 4);
+                if (!le) { a = __builtin_bswap32(a); b = __builtin_bswap32(b); }
+                a += b; if (!le) a = __builtin_bswap32(a); memcpy(p + i * 4, &a, 4);
+            }
         }
     } else if (predictor == 3) {
         uint8_t *tmp = malloc(rowbytes);

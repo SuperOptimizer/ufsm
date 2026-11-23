@@ -6,6 +6,32 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## HF ink labels (vincentl065/herculaneum-ink-labels) on our meshes: 5.4k mm² of new sure ink, Scroll 5 added (2026-11-23, hfink)
+
+The public 2-D set: 2218 crops at 9.362 µm/px (0 bg / 1 ink / 2 ignore / 255 outside, styles A-E), each on "its segment's 9.362 µm grid".
+That grid is not one thing. Measured per family (`ufsm ink-place` with a REF raster: Pearson r / IoU of the placed crop against our
+od human labels, best offset within ±R px):
+
+| family | the crop's grid | how placed | check |
+|---|---|---|---|
+| hum24net / can24net (name `_Y_X`, 9.6 µm units) | the official 2.4 µm render: canvas = 4 Y, 4096 / 1050 canvas px per px | exact | hum24net vs od labels IoU 1.000 (r 1.000) |
+| position_in_segment (ecarts, u1_1um) | a per-segment anisotropic rescale (1667: 0.2579 / 0.2545 pos per canvas px; Paris4 0.2562 isotropic) | least squares from the named crops of the segment | ecarts r0 0.83-0.997, u1 0.36-0.98 (model vs human) |
+| Scroll 5 YN (name in 7.91 µm render px) | the 2024 OBJ's flattened render | `ufsm obj-tifxyz` (the OBJ's uv rasterised to a tifxyz on the render's px grid) + 1 px row offset | our CT on the mesh vs their layer 32: r 0.93-0.95 on all 6 segments |
+| Paris4 GP 2023 / YN (7.91 µm render px) | the 2023 OBJ render, rows flipped vs the open-data `tifxyz_original` grid, not rigidly (per-crop shifts ±60 px) | crop -> original grid (flip, per-crop registered) -> `surf-resample` (3-D, old scan) onto the re-flattened on-7.91 µm mesh -> its 2.4 µm mesh (grid-index ratio 3.26) | per crop registered vs our od labels (or the open-data prediction) carried to the original grid; kept only r_best ≥ 0.6 (0.5 vs predictions); after placement vs od labels r 0.75-0.81, IoU 0.74-0.78 |
+| GP on 20231007101615 / 20231016151000, 1667 YN (Scroll4 7.91 µm grid), 0139 | not placed yet | | GP r 0 on the 101619 / 151002 meshes: other segments |
+
+The dataset's position_in_segment for the GP crops (pos = name × 7.91 / 9.362) assumes the 2023 render and the 2.4 µm re-registered mesh
+share a grid: they do not (r ≈ 0 at that placement, any similarity search too). The open-data mesh folder holds the chain: the
+`intermediate/tifxyz_original` grid (the OBJ), its normalized version on the old 7.91 µm scan, and the 2.4 µm mesh on the same grid
+index as the normalized one; both old-scan meshes share 3-D coordinates, so `surf-resample` carries a map between them without the old
+scan. The tifxyz_original tifs use predictor 2 on float32 (libtiff adds the words as integers): src/tiff.c read them as garbage before.
+
+Sets (all additive: `--skip-ref-sup` leaves out every px our od labels supervise), label px ≤ 4.8 µm (F 2 on 2.4 µm meshes, F 1 at 7.91):
+Scroll 5 YN 1845 mm² sure ink (new scroll, 88 / 88 crops), Paris4 GP + YN 3489 mm² (221 / 359 crops; +2650 mm² overlapping our labels left
+out), Paris4 ecarts 14 + models 77, 1667 ecarts 9 + models 180. Sources: /vesuvius/ufsm/hfink/sources-hfink-{A,C}.json (R1E onfly form).
+Tools: `ink-place` (placement + REF check + maps), `ink-find` (8 orientations × translation by cell Pearson r: found the GP row flip),
+`obj-tifxyz`. test_ink_place: three placements byte-exact against numpy, obj-tifxyz planar exact, the predictor-2 read.
+
 ## 1.1 um ink through a reg map: the onfly path works, the 1.1 um net (R11) lost to its 4.8 um init: underfitting; R11b, R11c (2026-11-22, inkperf)
 
 - **Ink onfly through a reg map** (master 89f6e5aa): `"map": reg.json` on an onfly ink target puts the human segments of the 2.4 um scan
