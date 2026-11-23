@@ -6,6 +6,34 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## ink-atlas: the First Letters ink atlas as gated pseudo ink labels, 14 of 32 surfaces kept (2026-11-23, atlasink)
+
+The HF dataset SharpMeow/first-letters-ink-atlas puts 7 public 2-D ink models (reader3, Reader v2, ink9um x2, dense_native, d9v2,
+Hecate) and their z-score ensemble on one 9.6 um canvas per traced mesh (ketchupbyheinz survey meshes, 13 First Letters scrolls +
+7 PHerc0343 references). All of it is model output, no human labels. `ufsm ink-atlas SURF MESH OUT --ct ROOT KEY` (src/inkatlas*.c)
+turns one surface into an ink-teach window (labels 255 / 0, mask, label_scale = 1 / render_scale voxels per px, level 0):
+- Registration: our render (render_wrap_chunked, depth 0, px c at grid c / gs, gs = render_scale / mesh scale) vs ct_mid.png, Pearson r
+  over 8 symmetries x +-4 px. All 32 register as given: r 0.926-0.981, symmetry 0, best shifts 0 / -1 px (their canvas is w / scale x
+  render_scale wide, ours (w - 1) gs + 1: half-px rule).
+- Reading side: the atlas page's face_votes over the alive-pair face check; kept only when the winner has >= 3 votes and >= 2 x the
+  loser. Reverse-side surfaces are written with the mesh and rasters transposed, so +N = du x dv (the face the onfly splat labels) is the
+  reading face. Assumes atlas "forward" runs along our +N (ink-ext / vc_render_tifxyz forward, R1E's teacher maps). 18 of 32 had no
+  decisive face (12 all-tie) and were dropped: 0191, 0257, 0268, 0306B, 0490A, 0813, 0846B, 1218 lose every surface.
+- Gate (fixed before any outcome, /vesuvius/ufsm/atlasink/GATE.txt): ink z >= 2.5 and >= 3 alive models at z_m >= 2; background
+  z <= 0.5; else unlabelled. Ink among labelled px 0.29-3.73 % (none near the 15 % flag).
+
+| scroll | kept / surfaces | sure ink mm2 | background mm2 | r |
+|---|---|---|---|---|
+| PHerc0125 | 1 / 1 | 2.9 | 328 | 0.965 |
+| PHerc0175B | 3 / 4 | 5.6 | 832 | 0.94-0.97 |
+| PHerc0343 | 6 / 7 | 42.6 | 2017 | 0.97-0.98 |
+| PHerc0358 | 1 / 2 | 2.6 | 325 | 0.981 |
+| PHerc0483A | 1 / 4 | 2.4 | 283 | 0.959 |
+| PHerc0483B | 1 / 2 | 1.4 | 272 | 0.957 |
+
+Sources fragment /vesuvius/ufsm/inksdk/r1e/atlas-sources.json (6 sources `<S>-atlasT`, level 0, face [-3, 0], validation off, no
+holdouts); CPU sampler-only check: 30 batches, 0 DEFAULTED, every source draws ink windows.
+
 ## 1.1 um ink through a reg map: the onfly path works, the 1.1 um net (R11) lost to its 4.8 um init: underfitting; R11b, R11c (2026-11-22, inkperf)
 
 - **Ink onfly through a reg map** (master 89f6e5aa): `"map": reg.json` on an onfly ink target puts the human segments of the 2.4 um scan
