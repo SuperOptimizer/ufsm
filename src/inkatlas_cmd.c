@@ -106,7 +106,7 @@ int cmd_ink_atlas(int argc, char **argv) {
     const char *on = order > 0 ? "forward" : "reverse";
     /* the mesh */
     float *XYZ[3] = {nullptr, nullptr, nullptr}; int mw = 0, mh = 0; double msc = 0;
-    { static const char *nm[3] = {"x", "y", "z"};
+    { const char *nm[3] = {"x", "y", "z"};
       for (int k = 0; k < 3; k++) { int w, h; snprintf(p, sizeof p, "%s/%s.tif", md, nm[k]); XYZ[k] = img_read_f32(p, &w, &h);
           if (!XYZ[k] || (k && (w != mw || h != mh))) { fprintf(stderr, "ink-atlas: %s: cannot read %s\n", id, p); return 1; } mw = w; mh = h; }
       snprintf(p, sizeof p, "%s/meta.json", md); json *mm = a_json_file(p); msc = json_num(json_at(json_get(mm, "scale"), 0), 0); json_free(mm);
