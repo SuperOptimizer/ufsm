@@ -6,7 +6,7 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
-## ink-atlas: the First Letters ink atlas as gated pseudo ink labels, 14 of 32 surfaces kept (2026-11-23, atlasink)
+## ink-atlas: the First Letters ink atlas as gated pseudo ink labels, 12 of 32 surfaces kept (2026-11-23, atlasink)
 
 The HF dataset SharpMeow/first-letters-ink-atlas puts 7 public 2-D ink models (reader3, Reader v2, ink9um x2, dense_native, d9v2,
 Hecate) and their z-score ensemble on one 9.6 um canvas per traced mesh (ketchupbyheinz survey meshes, 13 First Letters scrolls +
@@ -17,12 +17,12 @@ turns one surface into an ink-teach window (labels 255 / 0, mask, label_scale = 
   render_scale wide, ours (w - 1) gs + 1: half-px rule).
 - Reading side: the atlas page's face_votes over the alive-pair face check; kept only when the winner has >= 3 votes and >= 2 x the
   loser. Surfaces whose reading face is our -N are written with the mesh and rasters transposed, so +N = du x dv (the face the onfly
-  splat labels) is the reading face. The atlas "forward" order runs along our -N (--fwd-sign -1), measured by `ufsm ink-atlas-check`:
-  our reader3 maps of R1E's wraps (ink-ext, along +N) against the atlas reader-v3 maps where the meshes meet (<= 3 voxels, normals
-  within 37 deg), split by the sign of the normals' dot. +N predicts forward with parallel normals, -N with anti-parallel ones. The
-  forward - reverse margin, anti-parallel minus parallel, says -N on 6 of 9 surfaces with both classes, and the two clearest by far:
-  0343_5911 (anti-parallel r 0.88 forward vs 0.52 reverse; parallel 0.32 reverse vs -0.05 forward), 0343_4853 (+0.31 vs -0.19); the
-  3 others are within 0.11. A first export had assumed +N (9 of 14 surfaces on the wrong face); replaced before R1E. 18 of 32 had no
+  splat labels) is the reading face. The atlas "forward" order runs along our -N (--fwd-sign -1), settled PER SURFACE by
+  `ufsm ink-atlas-check --self`: inksdk's reader3 map of the same mesh (ink-ext along +N, R1E wrap settings) vs the atlas reader-v3
+  forward / reverse maps, every canvas px. Rule (lead, fixed before the maps): one sign must win by >= 0.15 r. The reverse map wins on
+  all 13 (r 0.75-0.93 vs forward 0.15-0.72); 12 pass the margin, 0175B_6568 does not (0.749 vs 0.664) and is dropped. A cross-mesh
+  check (our wrap maps where the meshes meet) had been mixed (6 of 9 -N): the matched surface positions differ by up to 3 voxels.
+  The first export had assumed +N (9 surfaces on the wrong face); replaced before R1E. 18 of 32 had no
   decisive face (12 all-tie) and were dropped: 0191, 0257, 0268, 0306B, 0490A, 0813, 0846B, 1218 lose every surface.
 - Gate (fixed before any outcome, /vesuvius/ufsm/atlasink/GATE.txt): ink z >= 2.5 and >= 3 alive models at z_m >= 2; background
   z <= 0.5; else unlabelled. Ink among labelled px 0.29-3.73 % (none near the 15 % flag).
@@ -30,14 +30,14 @@ turns one surface into an ink-teach window (labels 255 / 0, mask, label_scale = 
 | scroll | kept / surfaces | sure ink mm2 | background mm2 | r |
 |---|---|---|---|---|
 | PHerc0125 | 1 / 1 | 2.9 | 328 | 0.965 |
-| PHerc0175B | 3 / 4 | 5.6 | 832 | 0.94-0.97 |
+| PHerc0175B | 2 / 4 | 3.7 | 555 | 0.95-0.97 |
 | PHerc0343 | 6 / 7 | 42.6 | 2017 | 0.97-0.98 |
 | PHerc0358 | 1 / 2 | 2.6 | 325 | 0.981 |
 | PHerc0483A | 1 / 4 | 2.4 | 283 | 0.959 |
 | PHerc0483B | 1 / 2 | 1.4 | 272 | 0.957 |
 
 Sources fragment /vesuvius/ufsm/inksdk/r1e/atlas-sources.json (6 sources `<S>-atlasT`, level 0, face [-3, 0], validation off, no
-holdouts); CPU sampler-only check: 30 batches, 0 DEFAULTED, every source draws ink windows.
+holdouts); CPU sampler-only check: 30 batches, 0 DEFAULTED, every source draws ink windows; marker r1e/atlas-orient.ok.
 
 ## 1.1 um ink through a reg map: the onfly path works, the 1.1 um net (R11) lost to its 4.8 um init: underfitting; R11b, R11c (2026-11-22, inkperf)
 
