@@ -132,6 +132,7 @@ test_fblend                                    |              |     1 | ./$B/tes
 test_fields_pack                               |              |     2 | ./$B/test_fields_pack
 test_fields_phase                              | smoke        |     2 | ./$B/test_fields_phase
 test_ink_gate                                  |              |     2 | ./$B/test_ink_gate
+test_ink_atlas                                 |              |     1 | ./$B/test_ink_atlas
 test_countfield                                | gpu          |     6 | ./$B/test_countfield
 test_fit_dir                                   |              |     2 | ./$B/test_fit_dir
 test_uwfill                                    |              |     1 | ./$B/test_uwfill
