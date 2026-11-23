@@ -78,7 +78,7 @@ static int ip_write_map(const char *out, const char *seg, const char *suf, const
     for (int64_t r = 0; r < bh; r++) for (int64_t q = 0; q < bw; q++) { const size_t k = (size_t)r * bw + q; if (MK[k] && r + b0 < RH && q + a0 < RW) m[(size_t)(r + b0) * RW + q + a0] = LB[k] ? 255 : 128; }
     char p[1600]; snprintf(p, sizeof p, "%s/%s%s", out, seg, suf); const int rc = tiffw_write(p, (int)RW, (int)RH, 1, m, 1); free(m); return rc;
 }
-typedef struct { char seg[256], tx[1024], img[1024], ref[1024], refm[1024], tag[256]; double y0, x0, sy, sx; int gy, gx, ay, ax, o; } ipline;
+typedef struct { char seg[256], tx[1024], img[1024], ref[1024], refm[1024], tag[256]; double y0, x0, sy, sx, rfy, rfx; int gy, gx, ay, ax, o; } ipline;
 static void ip_orient_dims(int o, int h, int w, int *oh, int *ow);
 static inline size_t ip_orient_src(int o, int h, int w, int u, int v);
 /* the canvas (level-0 px) of a tifxyz: grid / scale; voxel um from meta.json voxel_size_um (0 if absent); su / sv: the mean 3-D length
@@ -173,6 +173,7 @@ int cmd_ink_place(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: ufsm ink-place PLACE.tsv OUT-DIR [--px-um 4.8] [--search 12] [--vox-um 2.4 (meshes without voxel_size_um)] [--skip-ref-sup] [--gray] [--tri] [--map-tif SUFFIX] [--crop-win r0,c0,h,w]\n"
                         "  PLACE.tsv: SEG TIFXYZ CROP.png Y0 X0 SY SX [REF [REFMASK [TAG]]] (canvas edge coords of the crop corner, canvas px per crop px;\n"
+                        "  12th field fy,fx: REF px k centre = canvas centre k f (default: the size ratio, edge-aligned);\n"
                         "  11th field O: the crop oriented first (bit 1 transpose, 2 flip rows, 4 flip cols; ink-find's o);\n"
                         "  Y0 / X0 as gV: V source-grid px (x SY / SX); SY / SX as aU: U um source px over the mesh's mean 3-D px length per axis;\n"
                         "  crop values 0 background / 1 ink / else unlabelled) -> OUT/<SEG>/labels.zarr + mask.zarr, OUT/segs.json (on-the-fly ink windows)\n");
@@ -188,7 +189,7 @@ int cmd_ink_place(int argc, char **argv) {
     int n = 0, cap = 64; ipline *L = calloc(cap, sizeof *L); char line[8192];
     while (fgets(line, sizeof line, fp)) {
         if (line[0] == '#' || line[0] == '\n') continue;
-        char *f[11] = {0}; int nf = 0; for (char *s = line, *t; nf < 11 && (t = strsep(&s, "\t\n"));) if (*t || nf < 7) f[nf++] = t;
+        char *f[12] = {0}; int nf = 0; for (char *s = line, *t; nf < 12 && (t = strsep(&s, "\t\n"));) if (*t || nf < 7) f[nf++] = t;
         if (nf < 7) { fprintf(stderr, "ink-place: bad line (need 7 tab-separated fields): %s", line); fclose(fp); return 1; }
         if (n == cap) { cap *= 2; L = realloc(L, cap * sizeof *L); }
         ipline *e = &L[n++]; memset(e, 0, sizeof *e);
@@ -199,6 +200,7 @@ int cmd_ink_place(int argc, char **argv) {
         if (nf > 7 && strcmp(f[7], "-")) snprintf(e->ref, sizeof e->ref, "%s", f[7]);
         if (nf > 8 && strcmp(f[8], "-")) snprintf(e->refm, sizeof e->refm, "%s", f[8]);
         snprintf(e->tag, sizeof e->tag, "%s", nf > 9 ? f[9] : ""); e->o = nf > 10 ? atoi(f[10]) & 7 : 0;
+        if (nf > 11 && sscanf(f[11], "%lf,%lf", &e->rfy, &e->rfx) != 2) e->rfy = e->rfx = 0;   /* REF px k centre = canvas centre k f (per axis; 0: the size ratio) */
         if (!(e->sy > 0 && e->sx > 0)) { fprintf(stderr, "ink-place: %s: SY / SX must be > 0\n", e->img); fclose(fp); return 1; }
     }
     fclose(fp);
@@ -273,13 +275,14 @@ int cmd_ink_place(int argc, char **argv) {
                 int64_t RHr = 0, RWr = 0; uint8_t *t1 = inksplat_label_window(e->ref, 0, 0, 1, 1, &RHr, &RWr); const int ok1 = t1 != nullptr; free(t1);
                 if (!ok1 || RHr < 1 || RWr < 1) { fprintf(stderr, "ink-place: cannot read REF %s\n", e->ref); rc = 1; free(P); break; }
                 const double Fr = 0.5 * (CH / RHr + CW / RWr);   /* canvas px per REF px */
-                int64_t ry0 = (int64_t)floor(cy0 / Fr) - 1, rx0 = (int64_t)floor(cx0 / Fr) - 1, ry1 = (int64_t)ceil((cy0 + gh * F) / Fr) + 1, rx1 = (int64_t)ceil((cx0 + gw * F) / Fr) + 1;
+                const double fy = e->rfy > 0 ? e->rfy : Fr, fx = e->rfx > 0 ? e->rfx : Fr, hy = e->rfy > 0 ? 0.5 : 0, hx = e->rfx > 0 ? 0.5 : 0;   /* (explicit: centre-aligned) */
+                int64_t ry0 = (int64_t)floor(cy0 / fy) - 2, rx0 = (int64_t)floor(cx0 / fx) - 2, ry1 = (int64_t)ceil((cy0 + gh * F) / fy) + 2, rx1 = (int64_t)ceil((cx0 + gw * F) / fx) + 2;
                 uint8_t *RV = inksplat_label_window(e->ref, ry0, rx0, ry1 - ry0, rx1 - rx0, nullptr, nullptr), *RM = e->refm[0] ? inksplat_label_window(e->refm, ry0, rx0, ry1 - ry0, rx1 - rx0, nullptr, nullptr) : nullptr;
                 if (!RV || (e->refm[0] && !RM)) { fprintf(stderr, "ink-place: cannot read REF window %s\n", e->ref); rc = 1; free(P); free(RV); free(RM); break; }
                 int rmx = 0; for (size_t k = 0; k < (size_t)(ry1 - ry0) * (rx1 - rx0); k++) if (RV[k] > rmx) rmx = RV[k];
                 int mmx = 0; if (RM) for (size_t k = 0; k < (size_t)(ry1 - ry0) * (rx1 - rx0); k++) if (RM[k] > mmx) mmx = RM[k];
                 for (int64_t r = 0; r < gh; r++) for (int64_t q = 0; q < gw; q++) {
-                    const int64_t y = (int64_t)floor((cy0 + (r + 0.5) * F) / Fr) - ry0, x = (int64_t)floor((cx0 + (q + 0.5) * F) / Fr) - rx0;
+                    const int64_t y = (int64_t)floor((cy0 + (r + 0.5) * F - hy) / fy + hy) - ry0, x = (int64_t)floor((cx0 + (q + 0.5) * F - hx) / fx + hx) - rx0;
                     const size_t k = (size_t)y * (rx1 - rx0) + x; float g = rmx == 1 ? RV[k] * 255.f : RV[k];
                     if (RM && (mmx == 1 ? RM[k] * 255 : RM[k]) < 128) g = NAN;
                     if (g_reftri) g = RV[k] < 96 ? NAN : RV[k] >= 192 ? 255.f : 0.f;
