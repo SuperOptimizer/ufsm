@@ -34,6 +34,8 @@ out), Paris4 ecarts 14 + models 77, 1667 ecarts 9 + models 180, 1667 YN 1171 (82
 (146 crops). All mm² are 3-D (the mesh's px size). Sources: /vesuvius/ufsm/hfink/sources-hfink-{A,C}.json (R1E onfly form).
 Tools: `ink-place` (placement + REF check + maps), `ink-find` (8 orientations × translation by cell Pearson r: found the GP row flip),
 `obj-tifxyz`. test_ink_place: three placements byte-exact against numpy, obj-tifxyz planar exact, the predictor-2 read.
+`ufsm sample` with no visible GPU segfaulted (cudaMallocHost failed, the sampler's halloc returned null, sym_u8 wrote through it); now
+the slots are plain malloc there with a DEFAULTED line, and a failed pinned allocation aborts with a message (test_sample_nogpu).
 
 ## ink-atlas: the First Letters ink atlas as gated pseudo ink labels, 12 of 32 surfaces kept (2026-11-23, atlasink)
 

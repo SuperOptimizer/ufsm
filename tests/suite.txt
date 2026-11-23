@@ -262,6 +262,7 @@ test_ink_wrapscore                             |              |     4 | python3 
 test_ink_teach                                 |              |     3 | python3 tests/test_ink_teach.py
 test_ink_teach_up                              |              |     2 | python3 tests/test_ink_teach_up.py
 test_ink_place                                 |              |     2 | python3 tests/test_ink_place.py
+test_sample_nogpu                              |              |     3 | tests/test_sample_nogpu.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/samplenogpu
 test_mesh_tiles                                |              |     2 | python3 tests/test_mesh_tiles.py
 test_ct_resample                               |              |     2 | python3 tests/test_ct_resample.py
 test_seamless                                  |              |     6 | python3 tests/test_seamless.py

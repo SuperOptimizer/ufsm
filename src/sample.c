@@ -264,9 +264,16 @@ static size_t P3(const sampler *sp) { return (size_t)PZ(&sp->cfg) * sp->cfg.P * 
 
 /* batch buffers: pinned (the trainer uploads asynchronously), or plain malloc with UFSM_SAMPLER_NOPIN=1 (CPU-only benchmarks) */
 static _Atomic size_t g_slot_bytes;   /* pinned (or malloc'd) batch slot bytes, every sampler (UFSM_HOSTMEM) */
+/* no visible CUDA device (CUDA_VISIBLE_DEVICES= : `ufsm sample` on a CPU-only check): plain malloc too, else cudaMallocHost fails, halloc
+   returned null and the first window's symmetry copy wrote through it (sample.c sym_u8 segfault, hfink 2026-11-23) */
 static int nopin(void) { static _Atomic int v = -1;   /* mgpu: env */
-                          int r = atomic_load(&v); if (r < 0) { const char *e = getenv("UFSM_SAMPLER_NOPIN"); r = e && atoi(e); atomic_store(&v, r); } return r; }   /* (atomic: workers race on the first call; threads audit #6) */
-static void *halloc(size_t n) { atomic_fetch_add(&g_slot_bytes, n); if (nopin()) { void *p = malloc(n ? n : 1); if (!p) abort(); memset(p, 0, n); return p; } return nn_host_alloc(n); }   /* (memset: faulted in like the pinned slots, so CPU-only benchmarks see no first-touch faults) */
+                          int r = atomic_load(&v);
+                          if (r < 0) { const char *e = getenv("UFSM_SAMPLER_NOPIN"); r = e && atoi(e);
+                                       if (!r && nn_device_count() <= 0) { r = 1; fprintf(stderr, "DEFAULTED: sampler batch slots = plain malloc (no CUDA device visible: not pinned)\n"); }
+                                       int u = -1; if (!atomic_compare_exchange_strong(&v, &u, r)) r = u; }
+                          return r; }   /* (atomic: workers race on the first call; threads audit #6) */
+static void *halloc(size_t n) { atomic_fetch_add(&g_slot_bytes, n); if (nopin()) { void *p = malloc(n ? n : 1); if (!p) abort(); memset(p, 0, n); return p; }
+                              void *p = nn_host_alloc(n); if (!p && n) { fprintf(stderr, "sampler: pinned host alloc of %zu B failed\n", n); abort(); } return p; }   /* (memset: faulted in like the pinned slots, so CPU-only benchmarks see no first-touch faults) */
 static void hfree(void *p) { if (nopin()) free(p); else nn_host_free(p); }
 /* slot_skip 4: the unpacked targets t (NCH x P^3) and loss mask m (P^3) neither allocated nor written: train sets it where the trainer
    never reads them (g_tm_unused without --pack-targets, e.g. --lat 4 --split z: 3 B per voxel per slot, 3.2 GB at P 1024), and only for
