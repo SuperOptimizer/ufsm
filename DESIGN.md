@@ -6,7 +6,7 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
-## HF ink labels (vincentl065/herculaneum-ink-labels) on our meshes: 5.4k mm² of new sure ink, Scroll 5 added (2026-11-23, hfink)
+## HF ink labels (vincentl065/herculaneum-ink-labels) on our meshes: 10.8k mm² of new sure ink, Scroll 5 added (2026-11-23, hfink)
 
 The public 2-D set: 2218 crops at 9.362 µm/px (0 bg / 1 ink / 2 ignore / 255 outside, styles A-E), each on "its segment's 9.362 µm grid".
 That grid is not one thing. Measured per family (`ufsm ink-place` with a REF raster: Pearson r / IoU of the placed crop against our
@@ -18,7 +18,9 @@ od human labels, best offset within ±R px):
 | position_in_segment (ecarts, u1_1um) | a per-segment anisotropic rescale (1667: 0.2579 / 0.2545 pos per canvas px; Paris4 0.2562 isotropic) | least squares from the named crops of the segment | ecarts r0 0.83-0.997, u1 0.36-0.98 (model vs human) |
 | Scroll 5 YN (name in 7.91 µm render px) | the 2024 OBJ's flattened render | `ufsm obj-tifxyz` (the OBJ's uv rasterised to a tifxyz on the render's px grid) + 1 px row offset | our CT on the mesh vs their layer 32: r 0.93-0.95 on all 6 segments |
 | Paris4 GP 2023 / YN (7.91 µm render px) | the 2023 OBJ render, rows flipped vs the open-data `tifxyz_original` grid, not rigidly (per-crop shifts ±60 px) | crop -> original grid (flip, per-crop registered) -> `surf-resample` (3-D, old scan) onto the re-flattened on-7.91 µm mesh -> its 2.4 µm mesh (grid-index ratio 3.26) | per crop registered vs our od labels (or the open-data prediction) carried to the original grid; kept only r_best ≥ 0.6 (0.5 vs predictions); after placement vs od labels r 0.75-0.81, IoU 0.74-0.78 |
-| GP on 20231007101615 / 20231016151000, 1667 YN (Scroll4 7.91 µm grid), 0139 | not placed yet | | GP r 0 on the 101619 / 151002 meshes: other segments |
+| 1667 YN (w018, name `__Y_X` in 9.6 µm units) | the official 2.4 µm render, canvas = 4 Y, but 4 × 1520 / 1284 = 4.735 canvas px per crop px (11.4 µm, not the stated 9.362: 3.90 gives r < 0) | name, then per crop registered (±48 canvas px; shifts reach ±40) | 54 crops overlap our labels: r0 0.79 -> r_best 0.81, 50 ≥ 0.6 kept; 35 without overlap kept at the name |
+| PHerc0139 (canon9, rv2dense, ecarts, hum9) | the open-data 9.362 µm meshes' own canvas (pos direct, 1:1) | direct, F 1 | vs our 2.4 µm od labels (REF px = canvas × (n_gt−1)/(n_od−1) per axis, `ink-place` 12th field): r0 0.97-0.99, IoU 0.96-0.99 |
+| GP on 20231007101615 / 20231016151000 | not placed | | r 0 on the 101619 / 151002 meshes: other segments |
 
 The dataset's position_in_segment for the GP crops (pos = name × 7.91 / 9.362) assumes the 2023 render and the 2.4 µm re-registered mesh
 share a grid: they do not (r ≈ 0 at that placement, any similarity search too). The open-data mesh folder holds the chain: the
@@ -28,9 +30,43 @@ scan. The tifxyz_original tifs use predictor 2 on float32 (libtiff adds the word
 
 Sets (all additive: `--skip-ref-sup` leaves out every px our od labels supervise), label px ≤ 4.8 µm (F 2 on 2.4 µm meshes, F 1 at 7.91):
 Scroll 5 YN 1845 mm² sure ink (new scroll, 88 / 88 crops), Paris4 GP + YN 3489 mm² (221 / 359 crops; +2650 mm² overlapping our labels left
-out), Paris4 ecarts 14 + models 77, 1667 ecarts 9 + models 180. Sources: /vesuvius/ufsm/hfink/sources-hfink-{A,C}.json (R1E onfly form).
+out), Paris4 ecarts 14 + models 77, 1667 ecarts 9 + models 180, 1667 YN 1171 (82 / 89 crops), 0139 ecarts + hum9 247 + canon9 / rv2dense 3987
+(146 crops). All mm² are 3-D (the mesh's px size). Sources: /vesuvius/ufsm/hfink/sources-hfink-{A,C}.json (R1E onfly form).
 Tools: `ink-place` (placement + REF check + maps), `ink-find` (8 orientations × translation by cell Pearson r: found the GP row flip),
 `obj-tifxyz`. test_ink_place: three placements byte-exact against numpy, obj-tifxyz planar exact, the predictor-2 read.
+
+## ink-atlas: the First Letters ink atlas as gated pseudo ink labels, 12 of 32 surfaces kept (2026-11-23, atlasink)
+
+The HF dataset SharpMeow/first-letters-ink-atlas puts 7 public 2-D ink models (reader3, Reader v2, ink9um x2, dense_native, d9v2,
+Hecate) and their z-score ensemble on one 9.6 um canvas per traced mesh (ketchupbyheinz survey meshes, 13 First Letters scrolls +
+7 PHerc0343 references). All of it is model output, no human labels. `ufsm ink-atlas SURF MESH OUT --ct ROOT KEY` (src/inkatlas*.c)
+turns one surface into an ink-teach window (labels 255 / 0, mask, label_scale = 1 / render_scale voxels per px, level 0):
+- Registration: our render (render_wrap_chunked, depth 0, px c at grid c / gs, gs = render_scale / mesh scale) vs ct_mid.png, Pearson r
+  over 8 symmetries x +-4 px. All 32 register as given: r 0.926-0.981, symmetry 0, best shifts 0 / -1 px (their canvas is w / scale x
+  render_scale wide, ours (w - 1) gs + 1: half-px rule).
+- Reading side: the atlas page's face_votes over the alive-pair face check; kept only when the winner has >= 3 votes and >= 2 x the
+  loser. Surfaces whose reading face is our -N are written with the mesh and rasters transposed, so +N = du x dv (the face the onfly
+  splat labels) is the reading face. The atlas "forward" order runs along our -N (--fwd-sign -1), settled PER SURFACE by
+  `ufsm ink-atlas-check --self`: inksdk's reader3 map of the same mesh (ink-ext along +N, R1E wrap settings) vs the atlas reader-v3
+  forward / reverse maps, every canvas px. Rule (lead, fixed before the maps): one sign must win by >= 0.15 r. The reverse map wins on
+  all 13 (r 0.75-0.93 vs forward 0.15-0.72); 12 pass the margin, 0175B_6568 does not (0.749 vs 0.664) and is dropped. A cross-mesh
+  check (our wrap maps where the meshes meet) had been mixed (6 of 9 -N): the matched surface positions differ by up to 3 voxels.
+  The first export had assumed +N (9 surfaces on the wrong face); replaced before R1E. 18 of 32 had no
+  decisive face (12 all-tie) and were dropped: 0191, 0257, 0268, 0306B, 0490A, 0813, 0846B, 1218 lose every surface.
+- Gate (fixed before any outcome, /vesuvius/ufsm/atlasink/GATE.txt): ink z >= 2.5 and >= 3 alive models at z_m >= 2; background
+  z <= 0.5; else unlabelled. Ink among labelled px 0.29-3.73 % (none near the 15 % flag).
+
+| scroll | kept / surfaces | sure ink mm2 | background mm2 | r |
+|---|---|---|---|---|
+| PHerc0125 | 1 / 1 | 2.9 | 328 | 0.965 |
+| PHerc0175B | 2 / 4 | 3.7 | 555 | 0.95-0.97 |
+| PHerc0343 | 6 / 7 | 42.6 | 2017 | 0.97-0.98 |
+| PHerc0358 | 1 / 2 | 2.6 | 325 | 0.981 |
+| PHerc0483A | 1 / 4 | 2.4 | 283 | 0.959 |
+| PHerc0483B | 1 / 2 | 1.4 | 272 | 0.957 |
+
+Sources fragment /vesuvius/ufsm/inksdk/r1e/atlas-sources.json (6 sources `<S>-atlasT`, level 0, face [-3, 0], validation off, no
+holdouts); CPU sampler-only check: 30 batches, 0 DEFAULTED, every source draws ink windows; marker r1e/atlas-orient.ok.
 
 ## 1.1 um ink through a reg map: the onfly path works, the 1.1 um net (R11) lost to its 4.8 um init: underfitting; R11b, R11c (2026-11-22, inkperf)
 

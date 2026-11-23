@@ -144,6 +144,8 @@ int cmd_ink_teach_up(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_place(int argc, char **argv);   /* src/inkplace.c */
 int cmd_ink_find(int argc, char **argv);   /* src/inkplace.c */
 int cmd_obj_tifxyz(int argc, char **argv);   /* src/inkplace.c */
+int cmd_ink_atlas(int argc, char **argv);   /* src/inkatlas_cmd.c */
+int cmd_ink_atlas_check(int argc, char **argv);   /* src/inkatlas_cmd.c */
 int cmd_ct_resample(int argc, char **argv);   /* src/ctresample.c */
 int cmd_ink_vscore(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_onfly(int argc, char **argv);   /* src/inksplat.c */
@@ -226,6 +228,8 @@ static int usage(void) {
         "  ufsm ink-place PLACE.tsv OUT [--px-um 4.8] [--search 12]   2-D label crops (0 / 1 / ignore) placed on mesh canvases as on-the-fly ink windows, REF check\n"
         "  ufsm ink-find REF REFMASK --crop C.png --s S [--down 64]   where a 2-D label crop lies on a labelled mesh canvas (8 orientations, cell Pearson r)\n"
         "  ufsm obj-tifxyz OBJ OUT --img W,H [--step 20] [--flip-v 1]   a flattened OBJ (uv = render px) -> tifxyz on the render's px grid\n"
+        "  ufsm ink-atlas SURF-DIR MESH-DIR OUT --ct ROOT KEY   a First Letters ink-atlas surface -> gated pseudo ink labels (ink-teach window form)\n"
+        "  ufsm ink-atlas-check SURF-DIR MESH-DIR --ref WRAP:MAP.tif:DU ..   atlas reader-v3 forward / reverse vs our +N reader3 map where the meshes meet\n"
         "  ufsm ct-resample ROOT KEY OUT --um U0 --to U [--level L] --box z,y,x,nz,ny,nx [--box ..]   a CT level trilinear to U um over boxes (one-level OME group)\n"
         "  ufsm wl-dump <weights> [key]   the tensors of a safetensors / torch zip weight file\n"
         "  ufsm dinovol-embed ROOT KEY OUT --ckpt PT --box z,y,x,nz,ny,nx   scrollprize dinovol tokens / dense / ink embeddings (zarr v3)\n"
@@ -5059,6 +5063,8 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "ink-place")) return cmd_ink_place(argc, argv);
     if (!strcmp(cmd, "ink-find")) return cmd_ink_find(argc, argv);
     if (!strcmp(cmd, "obj-tifxyz")) return cmd_obj_tifxyz(argc, argv);
+    if (!strcmp(cmd, "ink-atlas")) return cmd_ink_atlas(argc, argv);
+    if (!strcmp(cmd, "ink-atlas-check")) return cmd_ink_atlas_check(argc, argv);
     if (!strcmp(cmd, "ct-resample")) return cmd_ct_resample(argc, argv);
     if (!strcmp(cmd, "ink-vscore")) return cmd_ink_vscore(argc, argv);
     if (!strcmp(cmd, "ink-onfly")) return cmd_ink_onfly(argc, argv);
