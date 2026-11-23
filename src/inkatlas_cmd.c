@@ -9,9 +9,9 @@
    2. Reading side: the atlas page's face_votes (each alive model pair's face-check consistent_face); kept only when the winner has
       >= --min-votes (3) and >= --vote-ratio (2) x the loser, else dropped (exit 3): the labels would sit on an unknown face. forward:
       ensemble/forward.png, the c+0 forward model maps and meta ensemble.ensemble.stats; reverse: ensemble-rev/reverse.png, the reverse maps,
-      ensemble.ensemble_reverse_reading.stats, and the mesh and the label rasters written TRANSPOSED (du x dv flips: +N, the face the onfly
-      ink splat labels, becomes the reading face). Assumes the atlas forward order runs along +N = du x dv (our ink-ext / ufsm render
-      normal, vc_render_tifxyz's forward order; R1E's teacher maps use it).
+      ensemble.ensemble_reverse_reading.stats. The atlas forward order runs along --fwd-sign (-1, measured by ink-atlas-check) x our
+      +N = du x dv; when the reading face is -N the mesh and the label rasters are written TRANSPOSED (du x dv flips: +N, the face the
+      onfly ink splat labels, becomes the reading face).
    3. Gate (inkatlas.h ia_gate) over the px both CT renders cover: sure ink z >= --z-ink (2.5) with >= --agree (3) alive models at z_m >=
       --model-z (2); sure background z <= --z-bg (0.5); the rest unlabelled. Dropped (exit 3) above --max-ink (0.15) ink among the labelled px.
    Out: OUT/<id> (the mesh as tifxyz, with voxel_size_um), OUT/teach.zarr + teachmask.zarr (255 / 0, mask 255 = supervised, label_scale = canvas um /
@@ -22,6 +22,7 @@
 #include "json.h"
 #include "optcheck.h"
 #include "store.h"
+#include "tiff.h"
 #include "tiffw.h"
 #include "zarr3.h"
 #include <errno.h>
@@ -81,7 +82,7 @@ static void a_transpose(uint8_t **a, int W, int H) { uint8_t *o = malloc((size_t
 int cmd_ink_atlas(int argc, char **argv) {
     if (argc < 5) {
         fprintf(stderr, "usage: ufsm ink-atlas SURF-DIR MESH-DIR OUT-DIR --ct ROOT KEY [--z-ink 2.5] [--z-bg 0.5] [--model-z 2] [--agree 3] [--min-r 0.5]\n"
-                        "         [--min-votes 3] [--vote-ratio 2] [--max-ink 0.15] [--order auto|forward|reverse] [--threads 6] [--cache DIR]\n"
+                        "         [--min-votes 3] [--vote-ratio 2] [--max-ink 0.15] [--order auto|forward|reverse] [--fwd-sign -1] [--threads 6] [--cache DIR]\n"
                         "  one First Letters ink-atlas surface -> gated pseudo ink labels (ink-teach window form; exit 3: dropped)\n");
         return 2; }
     const char *sd = argv[2], *md = argv[3], *out = argv[4]; const char *root = nullptr, *key = nullptr;
@@ -91,6 +92,11 @@ int cmd_ink_atlas(int argc, char **argv) {
                      opt_atof("--model-z", aopt(argc, argv, "--model-z", "2")), opt_atoi("--agree", aopt(argc, argv, "--agree", "3"))};
     const double min_r = opt_atof("--min-r", aopt(argc, argv, "--min-r", "0.5")), vratio = opt_atof("--vote-ratio", aopt(argc, argv, "--vote-ratio", "2")),
                  max_ink = opt_atof("--max-ink", aopt(argc, argv, "--max-ink", "0.15"));
+    /* --fwd-sign: the atlas forward order runs along fwd_sign x our +N. -1 by ink-atlas-check (2026-11-23): our reader3 maps (ink-ext,
+       along +N) vs the atlas reader-v3 maps where the meshes meet, the forward - reverse margin with anti-parallel minus parallel normals:
+       6 of 9 surfaces say -N, the two clearest by far (0343_5911 anti-parallel r 0.88 forward vs 0.52 reverse, parallel 0.32 reverse vs
+       -0.05; 0343_4853 margin +0.31 vs -0.19), the 3 others within 0.11 */
+    const int fsign = opt_atoi("--fwd-sign", aopt(argc, argv, "--fwd-sign", "-1"));
     const int min_votes = opt_atoi("--min-votes", aopt(argc, argv, "--min-votes", "3")), nth = opt_atoi("--threads", aopt(argc, argv, "--threads", "6"));
     const char *ord_opt = aopt(argc, argv, "--order", "auto"), *cache = aopt(argc, argv, "--cache", nullptr);
     char p[1400];
@@ -158,14 +164,15 @@ int cmd_ink_atlas(int argc, char **argv) {
     if (!ni) { ROW("drop: no ink", ni, nb); return 3; }
     /* out: the mesh (transposed for the reverse side), the rasters, the window */
     int LW = CW, LH = CH, ow = mw, oh = mh;
-    if (order < 0) {
+    const int flip = order * fsign < 0;   /* the reading face is -N: transpose so it becomes +N */
+    if (flip) {
         a_transpose(&lab, CW, CH); a_transpose(&msk, CW, CH); LW = CH; LH = CW; ow = mh; oh = mw;
         for (int k = 0; k < 3; k++) { float *t = malloc((size_t)mw * mh * sizeof *t);
             for (int r = 0; r < mw; r++) for (int c = 0; c < mh; c++) t[(size_t)r * mh + c] = XYZ[k][(size_t)c * mw + r];
             free(XYZ[k]); XYZ[k] = t; }
     }
     char mdir[1400]; snprintf(mdir, sizeof mdir, "%s/%s", out, id);   /* (the tifxyz named after the surface: ink logs name meshes by their dir) */
-    if (tifxyz_write(mdir, ow, oh, XYZ[0], XYZ[1], XYZ[2], 1 / msc, vum, -1, order < 0 ? "ink-atlas: the atlas mesh transposed (reverse reading side)" : "ink-atlas: the atlas mesh")) {
+    if (tifxyz_write(mdir, ow, oh, XYZ[0], XYZ[1], XYZ[2], 1 / msc, vum, -1, flip ? "ink-atlas: the atlas mesh transposed (reading face -N)" : "ink-atlas: the atlas mesh")) {
         fprintf(stderr, "ink-atlas: %s: cannot write %s\n", id, mdir); return 1; }
     snprintf(p, sizeof p, "%s/teach.zarr", out); if (a_write_zarr(p, lab, LH, LW, cum)) { fprintf(stderr, "ink-atlas: cannot write %s\n", p); return 1; }
     snprintf(p, sizeof p, "%s/teachmask.zarr", out); if (a_write_zarr(p, msk, LH, LW, cum)) { fprintf(stderr, "ink-atlas: cannot write %s\n", p); return 1; }
@@ -179,4 +186,101 @@ int cmd_ink_atlas(int argc, char **argv) {
     free(mod); free(mu); free(sg); free(cov); free(lab); free(msk); free(ens); free(ctm); free(ours); for (int k = 0; k < 3; k++) free(XYZ[k]); json_free(M);
     return 0;
 #undef ROW
+}
+
+/* ufsm ink-atlas-check SURF-DIR MESH-DIR --shift DY,DX --ref WRAP:MAP.tif:DU .. (2026-11-23, atlasink, lead: verify the atlas "forward"
+   order = our +N): the atlas reader-v3 c+0 maps of both orders against our own reader3 map (ink-ext, read along +N of OUR wrap: R1E's
+   teacher maps; map px (x, y) at wrap grid (x DU, y DU)) where the two meshes trace the same papyrus. Every 2nd atlas canvas px (registered
+   by --shift as ink-atlas found it) is matched to the nearest wrap map px within --tol (3) voxels whose normal is within 37 deg of +-the
+   atlas normal; pairs split by the sign of the normals' dot. If the atlas forward order reads along +N: with parallel normals our map
+   correlates with "forward", with anti-parallel ones with "reverse". Prints the Pearson r of each (sign, order). */
+typedef struct { const float *X, *Y, *Z; int w, h; } ck_grid;
+static int ck_pn(const ck_grid *g, double gu, double gv, double P[3], double N[3]) {   /* (z, y, x), N = du x dv as ssurf_pn / ink-ext */
+    if (gu < 0 || gv < 0 || gu > g->w - 1 || gv > g->h - 1) return -1;
+    int c0 = (int)gu, r0 = (int)gv; if (c0 >= g->w - 1) c0 = g->w - 2; if (r0 >= g->h - 1) r0 = g->h - 2;
+    const double fu = gu - c0, fv = gv - r0; const size_t i00 = (size_t)r0 * g->w + c0, i01 = i00 + 1, i10 = i00 + g->w, i11 = i10 + 1;
+    if (g->Z[i00] < 0 || g->Z[i01] < 0 || g->Z[i10] < 0 || g->Z[i11] < 0) return -1;
+    const float *A[3] = {g->Z, g->Y, g->X}; double du[3], dv[3];
+    for (int d = 0; d < 3; d++) { const double a = A[d][i00], b = A[d][i01], c = A[d][i10], e = A[d][i11];
+        P[d] = (1 - fv) * ((1 - fu) * a + fu * b) + fv * ((1 - fu) * c + fu * e); du[d] = (1 - fv) * (b - a) + fv * (e - c); dv[d] = (1 - fu) * (c - a) + fu * (e - b); }
+    N[0] = du[1] * dv[2] - du[2] * dv[1]; N[1] = du[2] * dv[0] - du[0] * dv[2]; N[2] = du[0] * dv[1] - du[1] * dv[0];
+    const double l = sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]); if (l < 1e-12) return -1;
+    for (int d = 0; d < 3; d++) N[d] /= l;
+    return 0;
+}
+static int ck_load(const char *dir, float *G[3], int *w, int *h) {
+    const char *nm[3] = {"x", "y", "z"}; char p[1400];
+    for (int k = 0; k < 3; k++) { int a, b; snprintf(p, sizeof p, "%s/%s.tif", dir, nm[k]); G[k] = img_read_f32(p, &a, &b); if (!G[k] || (k && (a != *w || b != *h))) return -1; *w = a; *h = b; }
+    return 0;
+}
+typedef struct { float p[3], n[3]; uint8_t v; } ck_pt;
+typedef struct { double s[2][2][5]; size_t n[2][2]; } ck_acc;   /* [sign][order] sums x, y, xx, yy, xy */
+int cmd_ink_atlas_check(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm ink-atlas-check SURF-DIR MESH-DIR [--shift DY,DX] [--tol 3] --ref WRAP:MAP.tif:DU ..\n"); return 2; }
+    const char *sd = argv[2], *md = argv[3]; int sdy = 0, sdx = 0; double tol = 3;
+    for (int i = 4; i + 1 < argc; i++) { if (!strcmp(argv[i], opt_n("--shift"))) sscanf(argv[i + 1], "%d,%d", &sdy, &sdx); if (!strcmp(argv[i], opt_n("--tol"))) tol = opt_atof("--tol", argv[i + 1]); }
+    char p[1400]; snprintf(p, sizeof p, "%s/meta.json", sd); json *M = a_json_file(p); if (!M) { fprintf(stderr, "ink-atlas-check: cannot read %s\n", p); return 1; }
+    const double rs = json_num(json_path(M, "render.render_scale"), 0); const json *hw = json_path(M, "render.canvas_hw");
+    const int CH = (int)json_num(json_at(hw, 0), 0), CW = (int)json_num(json_at(hw, 1), 0);
+    float *AG[3]; int aw = 0, ah = 0; if (ck_load(md, AG, &aw, &ah)) { fprintf(stderr, "ink-atlas-check: cannot read the mesh %s\n", md); return 1; }
+    snprintf(p, sizeof p, "%s/meta.json", md); json *mm = a_json_file(p); const double msc = json_num(json_at(json_get(mm, "scale"), 0), 0); json_free(mm);
+    const double gs = rs / msc; ck_grid A = {AG[0], AG[1], AG[2], aw, ah};
+    double cy = 0, cx = 0; for (int i = 4; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n("--center"))) sscanf(argv[i + 1], "%lf,%lf", &cy, &cx);
+    if (cx > 0) {   /* the mesh's +N about the scroll axis (y, x): outward share */
+        size_t no = 0, nn = 0; for (int r = 0; r + 1 < ah; r += 2) for (int c = 0; c + 1 < aw; c += 2) { double P[3], N[3]; if (ck_pn(&A, c + 0.5, r + 0.5, P, N)) continue;
+            const double ry = P[1] - cy, rx = P[2] - cx; nn++; no += N[1] * ry + N[2] * rx > 0; }
+        printf("ink-atlas-check\t%s\tradial\t+N outward share %.3f of %zu\n", json_str(json_get(M, "id"), "?"), nn ? (double)no / nn : 0, nn); }
+    uint8_t *mp[2]; const char *on[2] = {"forward", "reverse"};
+    for (int o = 0; o < 2; o++) { int w, h; snprintf(p, sizeof p, "%s/maps/reader-v3/c+0_s1_%s.png", sd, on[o]); uint8_t *g = a_png_gray(p, &w, &h);
+        if (!g || w != CW || h != CH) { fprintf(stderr, "ink-atlas-check: %s missing\n", p); return 1; } mp[o] = a_register(g, CW, CH, 0, sdy, sdx); }
+    double lo[3] = {1e30, 1e30, 1e30}, hi[3] = {-1e30, -1e30, -1e30};
+    for (size_t i = 0; i < (size_t)aw * ah; i++) if (AG[2][i] >= 0) { const double q[3] = {AG[2][i], AG[1][i], AG[0][i]}; for (int d = 0; d < 3; d++) { if (q[d] < lo[d]) lo[d] = q[d]; if (q[d] > hi[d]) hi[d] = q[d]; } }
+    for (int d = 0; d < 3; d++) { lo[d] -= 30; hi[d] += 30; }
+    ck_acc acc; memset(&acc, 0, sizeof acc);
+    for (int a = 4; a + 1 < argc; a++) {
+        if (strcmp(argv[a], opt_n("--ref"))) continue;
+        char spec[1400]; snprintf(spec, sizeof spec, "%s", argv[a + 1]); char *c1 = strchr(spec, ':'), *c2 = c1 ? strchr(c1 + 1, ':') : nullptr;
+        if (!c2) { fprintf(stderr, "ink-atlas-check: --ref WRAP:MAP.tif:DU\n"); return 2; }
+        *c1 = 0; *c2 = 0; const double du = atof(c2 + 1);
+        float *RG[3]; int rw = 0, rh = 0; if (ck_load(spec, RG, &rw, &rh)) { fprintf(stderr, "ink-atlas-check: cannot read %s\n", spec); return 1; }
+        ck_grid R = {RG[0], RG[1], RG[2], rw, rh};
+        tiff *t = tiff_open_file(c1 + 1); tiff_page pg; if (!t || tiff_page_info(t, 0, &pg) || pg.bits != 8 || pg.spp != 1) { fprintf(stderr, "ink-atlas-check: %s not a uint8 TIFF\n", c1 + 1); return 1; }
+        uint8_t *mv = malloc((size_t)pg.w * pg.h); if (tiff_read_page(t, 0, mv)) return 1; tiff_close(t);
+        /* the wrap's map px inside the atlas box, hashed into 4-voxel cells */
+        enum { HB = 1 << 22 }; const double CS = 4; int *head = malloc(HB * sizeof *head); for (int i = 0; i < HB; i++) head[i] = -1;
+        size_t np = 0, cap = 1 << 20; ck_pt *pt = malloc(cap * sizeof *pt); int *nx = malloc(cap * sizeof *nx);
+        for (int y = 0; y < pg.h; y++) for (int x = 0; x < pg.w; x++) {
+            const uint8_t v = mv[(size_t)y * pg.w + x]; if (!v) continue;
+            const double gu = x * du, gv = y * du; const int c0 = (int)gu, r0 = (int)gv; if (c0 >= rw || r0 >= rh) continue;
+            const float z0 = RG[2][(size_t)r0 * rw + c0]; if (z0 < lo[0] || z0 > hi[0]) continue;
+            double P[3], N[3]; if (ck_pn(&R, gu, gv, P, N)) continue;
+            if (P[1] < lo[1] || P[1] > hi[1] || P[2] < lo[2] || P[2] > hi[2]) continue;
+            if (np == cap) { cap *= 2; pt = realloc(pt, cap * sizeof *pt); nx = realloc(nx, cap * sizeof *nx); }
+            for (int d = 0; d < 3; d++) { pt[np].p[d] = (float)P[d]; pt[np].n[d] = (float)N[d]; } pt[np].v = v;
+            const uint64_t k = ((uint64_t)(int64_t)floor(P[0] / CS) * 73856093u ^ (uint64_t)(int64_t)floor(P[1] / CS) * 19349663u ^ (uint64_t)(int64_t)floor(P[2] / CS) * 83492791u) & (HB - 1);
+            nx[np] = head[k]; head[k] = (int)np; np++;
+        }
+        size_t used[2] = {0, 0};
+        for (int r = 0; r < CH; r += 2) for (int c = 0; c < CW; c += 2) {
+            double P[3], N[3]; if (ck_pn(&A, c / gs, r / gs, P, N)) continue;
+            int best = -1; double bd = tol * tol;
+            for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+                const int64_t kz = (int64_t)floor(P[0] / CS) + dz, ky = (int64_t)floor(P[1] / CS) + dy, kx = (int64_t)floor(P[2] / CS) + dx;
+                const uint64_t k = ((uint64_t)kz * 73856093u ^ (uint64_t)ky * 19349663u ^ (uint64_t)kx * 83492791u) & (HB - 1);
+                for (int q = head[k]; q >= 0; q = nx[q]) { double d2 = 0; for (int d = 0; d < 3; d++) d2 += (pt[q].p[d] - P[d]) * (pt[q].p[d] - P[d]);
+                    if (d2 < bd) { const double dt = pt[q].n[0] * N[0] + pt[q].n[1] * N[1] + pt[q].n[2] * N[2]; if (fabs(dt) >= 0.8) { bd = d2; best = q; } } } }
+            if (best < 0) continue;
+            const double dt = pt[best].n[0] * N[0] + pt[best].n[1] * N[1] + pt[best].n[2] * N[2]; const int s = dt > 0 ? 0 : 1; used[s]++;
+            for (int o = 0; o < 2; o++) { const double xv = pt[best].v, yv = mp[o][(size_t)r * CW + c]; if (!yv) continue; double *S = acc.s[s][o];
+                S[0] += xv; S[1] += yv; S[2] += xv * xv; S[3] += yv * yv; S[4] += xv * yv; acc.n[s][o]++; }
+        }
+        fprintf(stderr, "ink-atlas-check: %s: %zu map px in the atlas box, %zu atlas px matched with parallel normals, %zu anti-parallel\n", spec, np, used[0], used[1]);
+        free(head); free(pt); free(nx); free(mv); for (int k = 0; k < 3; k++) free(RG[k]);
+    }
+    for (int s = 0; s < 2; s++) for (int o = 0; o < 2; o++) { const double *S = acc.s[s][o]; const double n = (double)acc.n[s][o];
+        const double va = S[2] - S[0] * S[0] / n, vb = S[3] - S[1] * S[1] / n, r = n > 100 && va > 0 && vb > 0 ? (S[4] - S[0] * S[1] / n) / sqrt(va * vb) : NAN;
+        printf("ink-atlas-check\t%s\t%s normals\tatlas %s\tpairs %zu\tr %.4f\n", json_str(json_get(M, "id"), "?"), s ? "anti-parallel" : "parallel", on[o], acc.n[s][o], r); }
+    for (int o = 0; o < 2; o++) free(mp[o]);
+    for (int k = 0; k < 3; k++) free(AG[k]);
+    json_free(M); return 0;
 }

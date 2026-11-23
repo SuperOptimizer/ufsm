@@ -16,8 +16,13 @@ turns one surface into an ink-teach window (labels 255 / 0, mask, label_scale = 
   over 8 symmetries x +-4 px. All 32 register as given: r 0.926-0.981, symmetry 0, best shifts 0 / -1 px (their canvas is w / scale x
   render_scale wide, ours (w - 1) gs + 1: half-px rule).
 - Reading side: the atlas page's face_votes over the alive-pair face check; kept only when the winner has >= 3 votes and >= 2 x the
-  loser. Reverse-side surfaces are written with the mesh and rasters transposed, so +N = du x dv (the face the onfly splat labels) is the
-  reading face. Assumes atlas "forward" runs along our +N (ink-ext / vc_render_tifxyz forward, R1E's teacher maps). 18 of 32 had no
+  loser. Surfaces whose reading face is our -N are written with the mesh and rasters transposed, so +N = du x dv (the face the onfly
+  splat labels) is the reading face. The atlas "forward" order runs along our -N (--fwd-sign -1), measured by `ufsm ink-atlas-check`:
+  our reader3 maps of R1E's wraps (ink-ext, along +N) against the atlas reader-v3 maps where the meshes meet (<= 3 voxels, normals
+  within 37 deg), split by the sign of the normals' dot. +N predicts forward with parallel normals, -N with anti-parallel ones. The
+  forward - reverse margin, anti-parallel minus parallel, says -N on 6 of 9 surfaces with both classes, and the two clearest by far:
+  0343_5911 (anti-parallel r 0.88 forward vs 0.52 reverse; parallel 0.32 reverse vs -0.05 forward), 0343_4853 (+0.31 vs -0.19); the
+  3 others are within 0.11. A first export had assumed +N (9 of 14 surfaces on the wrong face); replaced before R1E. 18 of 32 had no
   decisive face (12 all-tie) and were dropped: 0191, 0257, 0268, 0306B, 0490A, 0813, 0846B, 1218 lose every surface.
 - Gate (fixed before any outcome, /vesuvius/ufsm/atlasink/GATE.txt): ink z >= 2.5 and >= 3 alive models at z_m >= 2; background
   z <= 0.5; else unlabelled. Ink among labelled px 0.29-3.73 % (none near the 15 % flag).

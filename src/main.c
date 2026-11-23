@@ -142,6 +142,7 @@ int cmd_ink_score(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_teach(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_teach_up(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_atlas(int argc, char **argv);   /* src/inkatlas_cmd.c */
+int cmd_ink_atlas_check(int argc, char **argv);   /* src/inkatlas_cmd.c */
 int cmd_ct_resample(int argc, char **argv);   /* src/ctresample.c */
 int cmd_ink_vscore(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_onfly(int argc, char **argv);   /* src/inksplat.c */
@@ -222,6 +223,7 @@ static int usage(void) {
         "  ufsm ink-teach --segs SEGS --teacher NAME=MAP%%s .. --out DIR   2D teacher maps -> calibrated, gated soft ink label windows (on-the-fly ink)\n"
         "  ufsm ink-teach-up SEGS-TEACH.json OUT [--up 2]   ink-teach windows at label_scale / up (p bilinear in the mask, mask nearest)\n"
         "  ufsm ink-atlas SURF-DIR MESH-DIR OUT --ct ROOT KEY   a First Letters ink-atlas surface -> gated pseudo ink labels (ink-teach window form)\n"
+        "  ufsm ink-atlas-check SURF-DIR MESH-DIR --ref WRAP:MAP.tif:DU ..   atlas reader-v3 forward / reverse vs our +N reader3 map where the meshes meet\n"
         "  ufsm ct-resample ROOT KEY OUT --um U0 --to U [--level L] --box z,y,x,nz,ny,nx [--box ..]   a CT level trilinear to U um over boxes (one-level OME group)\n"
         "  ufsm wl-dump <weights> [key]   the tensors of a safetensors / torch zip weight file\n"
         "  ufsm dinovol-embed ROOT KEY OUT --ckpt PT --box z,y,x,nz,ny,nx   scrollprize dinovol tokens / dense / ink embeddings (zarr v3)\n"
@@ -5053,6 +5055,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "ink-teach")) return cmd_ink_teach(argc, argv);
     if (!strcmp(cmd, "ink-teach-up")) return cmd_ink_teach_up(argc, argv);
     if (!strcmp(cmd, "ink-atlas")) return cmd_ink_atlas(argc, argv);
+    if (!strcmp(cmd, "ink-atlas-check")) return cmd_ink_atlas_check(argc, argv);
     if (!strcmp(cmd, "ct-resample")) return cmd_ct_resample(argc, argv);
     if (!strcmp(cmd, "ink-vscore")) return cmd_ink_vscore(argc, argv);
     if (!strcmp(cmd, "ink-onfly")) return cmd_ink_onfly(argc, argv);
