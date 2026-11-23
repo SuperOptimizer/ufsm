@@ -216,7 +216,7 @@ static int ck_load(const char *dir, float *G[3], int *w, int *h) {
 typedef struct { float p[3], n[3]; uint8_t v; } ck_pt;
 typedef struct { double s[2][2][5]; size_t n[2][2]; } ck_acc;   /* [sign][order] sums x, y, xx, yy, xy */
 int cmd_ink_atlas_check(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm ink-atlas-check SURF-DIR MESH-DIR [--shift DY,DX] [--tol 3] --ref WRAP:MAP.tif:DU ..\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm ink-atlas-check SURF-DIR MESH-DIR [--shift DY,DX] [--tol 3] [--center Y,X] [--ref WRAP:MAP.tif:DU ..] [--self MAP.tif:DU]\n"); return 2; }
     const char *sd = argv[2], *md = argv[3]; int sdy = 0, sdx = 0; double tol = 3;
     for (int i = 4; i + 1 < argc; i++) { if (!strcmp(argv[i], opt_n("--shift"))) sscanf(argv[i + 1], "%d,%d", &sdy, &sdx); if (!strcmp(argv[i], opt_n("--tol"))) tol = opt_atof("--tol", argv[i + 1]); }
     char p[1400]; snprintf(p, sizeof p, "%s/meta.json", sd); json *M = a_json_file(p); if (!M) { fprintf(stderr, "ink-atlas-check: cannot read %s\n", p); return 1; }
@@ -276,6 +276,26 @@ int cmd_ink_atlas_check(int argc, char **argv) {
         }
         fprintf(stderr, "ink-atlas-check: %s: %zu map px in the atlas box, %zu atlas px matched with parallel normals, %zu anti-parallel\n", spec, np, used[0], used[1]);
         free(head); free(pt); free(nx); free(mv); for (int k = 0; k < 3; k++) free(RG[k]);
+    }
+    /* --self MAP.tif:DU: our reader3 map of THIS mesh (ink-ext along +N; map px (x, y) at grid (x DU, y DU)), each canvas px against the
+       map px nearest its grid point: the same mesh, so the order that reads +N correlates (lead 11-23: per-surface sign, the cross-mesh
+       votes above were mixed) */
+    for (int a = 4; a + 1 < argc; a++) {
+        if (strcmp(argv[a], opt_n("--self"))) continue;
+        char spec[1400]; snprintf(spec, sizeof spec, "%s", argv[a + 1]); char *c1 = strrchr(spec, ':'); if (!c1) { fprintf(stderr, "ink-atlas-check: --self MAP.tif:DU\n"); return 2; }
+        *c1 = 0; const double du = atof(c1 + 1);
+        tiff *t = tiff_open_file(spec); tiff_page pg; if (!t || tiff_page_info(t, 0, &pg) || pg.bits != 8 || pg.spp != 1) { fprintf(stderr, "ink-atlas-check: %s not a uint8 TIFF\n", spec); return 1; }
+        uint8_t *mv = malloc((size_t)pg.w * pg.h); if (tiff_read_page(t, 0, mv)) return 1; tiff_close(t);
+        double S[2][5] = {{0}}; size_t n[2] = {0, 0};
+        for (int r = 0; r < CH; r++) for (int c = 0; c < CW; c++) {
+            const int x = (int)lround(c / gs / du), y = (int)lround(r / gs / du); if (x < 0 || y < 0 || x >= pg.w || y >= pg.h) continue;
+            const double xv = mv[(size_t)y * pg.w + x]; if (!xv) continue;
+            for (int o = 0; o < 2; o++) { const double yv = mp[o][(size_t)r * CW + c]; if (!yv) continue; S[o][0] += xv; S[o][1] += yv; S[o][2] += xv * xv; S[o][3] += yv * yv; S[o][4] += xv * yv; n[o]++; }
+        }
+        double rr[2]; for (int o = 0; o < 2; o++) { const double va = S[o][2] - S[o][0] * S[o][0] / n[o], vb = S[o][3] - S[o][1] * S[o][1] / n[o];
+            rr[o] = n[o] > 100 && va > 0 && vb > 0 ? (S[o][4] - S[o][0] * S[o][1] / n[o]) / sqrt(va * vb) : NAN; }
+        printf("ink-atlas-self\t%s\t%zu\t%.4f\t%.4f\n", json_str(json_get(M, "id"), "?"), n[0], rr[0], rr[1]);
+        free(mv);
     }
     for (int s = 0; s < 2; s++) for (int o = 0; o < 2; o++) { const double *S = acc.s[s][o]; const double n = (double)acc.n[s][o];
         const double va = S[2] - S[0] * S[0] / n, vb = S[3] - S[1] * S[1] / n, r = n > 100 && va > 0 && vb > 0 ? (S[4] - S[0] * S[1] / n) / sqrt(va * vb) : NAN;
