@@ -63,4 +63,15 @@ with tempfile.TemporaryDirectory(prefix="ufsm-inkteach-") as tmp:
     (d / "dup.tsv").write_text(f"B {d / 'C/tifxyz'}\n")
     run(BIN, "ink-teach", "--segs", d / "segs.json", "--teacher", f"t1={d}/maps/%s.tif", "--out", d / "out2",
         "--extra", f"B={d / 'B/tifxyz'}", "--extra-list", d / "dup.tsv", ok=False)
+    # (11-23) a scroll without labelled meshes: --calib-only prints the labelled calibration, --tw + --platt carry it to an empty SEGS;
+    # B's labels then equal the run above byte for byte; without --platt / --tw the empty SEGS fails
+    cal = run(BIN, "ink-teach", "--segs", d / "segs.json", "--teacher", f"t1={d}/maps/%s.tif", "--out", d / "out3", "--calib-only", 1)
+    line = [l for l in cal.splitlines() if l.startswith("tw ")][0].split()
+    assert line[2] == "platt" and abs(float(line[1]) - 1) < 1e-9, line
+    (d / "empty.json").write_text('{"segments": []}')
+    run(BIN, "ink-teach", "--segs", d / "empty.json", "--teacher", f"t1={d}/maps/%s.tif", "--out", d / "out4", "--extra", f"B={d / 'B/tifxyz'}", ok=False)
+    run(BIN, "ink-teach", "--segs", d / "empty.json", "--teacher", f"t1={d}/maps/%s.tif", "--out", d / "out4", "--extra", f"B={d / 'B/tifxyz'}",
+        "--tw", line[1], "--platt", line[3])
+    b4 = {e["name"]: e for e in json.loads((d / "out4/segs-teach.json").read_text())["segments"]}["B-teach"]
+    assert abs(b4["teach_px"] - b["teach_px"]) <= 2 and abs(b4["teach_ink_px"] - b["teach_ink_px"]) <= 2, (b4, b)
 print(out.strip().splitlines()[-1]); print("test_ink_teach: ok")
