@@ -760,14 +760,15 @@ z3 *pyramid_open_level(store *st, const char *group, int level, double um0, cons
         /* relative form: every listed scale an exact power of two (1, 2, 4, ...) and none the source's um x 2^l. The old test needed level 0
            listed (scale 1.0), so a relative group without a local level 0 (the mirror's json over PHerc1667's levels 1-5, 2026-11-12) was read
            as absolute: 2.0 taken as um, every level off, the source silently excluded */
+        /* level-index names: every dataset path is its index ("0", "1", ...). Then an absolute match must sit at its own name: the mirror's
+           relative PHerc0172 (7.91 um) json lists "3" at scale 8 = 7.91 um x 2^0 within 2 %, which read the group as absolute and opened
+           level 3 as level 0 (11-24, "level 3 listed but cannot be opened" in DINO round 1). Other names (um-named "8", "16" ...) as before */
+        int idxn = 1;
+        for (int i = 0; i < nl; i++) { char *pe; const long pl = strtol(lv[i].path, &pe, 10); idxn &= pe != lv[i].path && *pe == 0 && pl == i; }
         int relf = 1, absf = 0;
         for (int i = 0; i < nl; i++) {
             const double e = log2(lv[i].um); relf &= lv[i].um >= 1.0 && fabs(e - round(e)) < 1e-9;
-            /* an absolute match must sit at its own level name when the levels are integer-named: the mirror's relative PHerc0172
-               (7.91 um) json lists level "3" at scale 8 = 7.91 um x 2^0 within 2 %, which read the group as absolute and opened level 3
-               as level 0 (11-24, "level 3 listed but cannot be opened" in DINO round 1) */
-            char *pe; const long pl = strtol(lv[i].path, &pe, 10); const int named = pe != lv[i].path && *pe == 0;
-            for (int l = 0; l < 16; l++) absf |= fabs(lv[i].um - um0 * (1 << l)) < 0.02 * um0 * (1 << l) && (!named || pl == l);
+            for (int l = 0; l < 16; l++) absf |= fabs(lv[i].um - um0 * (1 << l)) < 0.02 * um0 * (1 << l) && (!idxn || i == l);
         }
         const int rel_mode = relf && !absf;
         double want = rel_mode ? (double)(1 << level) : um0 * (1 << level);
