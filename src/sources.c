@@ -755,7 +755,11 @@ z3 *pyramid_open_level(store *st, const char *group, int level, double um0, cons
         int relf = 1, absf = 0;
         for (int i = 0; i < nl; i++) {
             const double e = log2(lv[i].um); relf &= lv[i].um >= 1.0 && fabs(e - round(e)) < 1e-9;
-            for (int l = 0; l < 16; l++) absf |= fabs(lv[i].um - um0 * (1 << l)) < 0.02 * um0 * (1 << l);
+            /* an absolute match must sit at its own level name when the levels are integer-named: the mirror's relative PHerc0172
+               (7.91 um) json lists level "3" at scale 8 = 7.91 um x 2^0 within 2 %, which read the group as absolute and opened level 3
+               as level 0 (11-24, "level 3 listed but cannot be opened" in DINO round 1) */
+            char *pe; const long pl = strtol(lv[i].path, &pe, 10); const int named = pe != lv[i].path && *pe == 0;
+            for (int l = 0; l < 16; l++) absf |= fabs(lv[i].um - um0 * (1 << l)) < 0.02 * um0 * (1 << l) && (!named || pl == l);
         }
         const int rel_mode = relf && !absf;
         double want = rel_mode ? (double)(1 << level) : um0 * (1 << level);
