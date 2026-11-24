@@ -29,6 +29,7 @@ _Static_assert(PHASE_PERIOD == 252, "draw_ counts known phase as (b & 0xfc) != 0
 static _Atomic uint64_t g_latd_n, g_latd_over;   /* --lat-direct-p: direct windows built; draws whose streams were over batch.lvcap (kept as plain unaugmented windows) */
 void sample_lat_direct_stats(uint64_t *n, uint64_t *over) { *n = g_latd_n; *over = g_latd_over; }
 #include <malloc.h>
+#include <sys/stat.h>
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -4103,8 +4104,11 @@ static occ_index label_occupancy(source *s) {
             if (ocd && *ocd) {
                 uint64_t h = 1469598103934665603ull; const size_t ng = (size_t)g[0] * g[1] * g[2];
                 for (size_t q = 0; q < ng; q++) h = (h ^ bits[q]) * 1099511628211ull;
-                snprintf(ock, sizeof ock, "occ-stored v1|%s|%s|um %.9g|levels %d %d|iso %d|ch %d %s|lc %d sh %d|g %lld %lld %lld|map %016llx", s->name ? s->name : "", s->ct_key ? s->ct_key : "",
-                         s->um, s->min_level, s->max_level, iso, ch, s->tgt_key[ch] ? s->tgt_key[ch] : "", lc, sh, (long long)g[0], (long long)g[1], (long long)g[2], (unsigned long long)h);
+                const char *rt = s->s ? store_root(s->s) : ""; char zj[1400]; struct stat zs; long long zsz = -1, zmt = -1;   /* (the CT: its root, the group json's size / mtime when local) */
+                snprintf(zj, sizeof zj, "%s/%s/zarr.json", rt ? rt : "", s->ct_key ? s->ct_key : ""); if (!stat(zj, &zs)) { zsz = (long long)zs.st_size; zmt = (long long)zs.st_mtim.tv_sec * 1000000000LL + zs.st_mtim.tv_nsec; }
+                snprintf(ock, sizeof ock, "occ-stored v1|%s|%s|%s|ct json %lld %lld|ct %lld %lld %lld|um %.9g|levels %d %d|iso %d|ch %d %s|lc %d sh %d|g %lld %lld %lld|map %016llx", s->name ? s->name : "",
+                         rt ? rt : "", s->ct_key ? s->ct_key : "", zsz, zmt, (long long)mc->shape[0], (long long)mc->shape[1], (long long)mc->shape[2], s->um, s->min_level, s->max_level, iso, ch,
+                         s->tgt_key[ch] ? s->tgt_key[ch] : "", lc, sh, (long long)g[0], (long long)g[1], (long long)g[2], (unsigned long long)h);
                 occ_index c = {nullptr, 0, -1, {0, 0, 0}};
                 if (!occ_cache_load(ocd, ock, &c) && c.lev == lc && c.shape[0] == mc->shape[0] && c.shape[1] == mc->shape[1] && c.shape[2] == mc->shape[2]) {
                     free(bits); o = c;
