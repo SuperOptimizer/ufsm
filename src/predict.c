@@ -1,5 +1,6 @@
 /* ufsm predict: sliding-window inference of a checkpoint over a CT box, written as a volcomp zarr v3
    probability pyramid (uint8 p*255, q=8) in the published layout. */
+#include "imgops.h"
 #include "scannorm.h"
 #include "optcheck.h"
 #include "defaulted.h"
@@ -2838,6 +2839,52 @@ static int predict_one(int argc, char **argv) {
             dprintf(dfd_, "%lld %lld %lld\n", (long long)(sz_ + soff[0]), (long long)(sy_ + soff[1]), (long long)(sx_ + soff[2]));
         }
         free(shs);
+    }
+    /* --near-mesh D1[,D2..] (2026-11-24, perf): only the windows whose output region (interior, clipped to its shard) lies within --near-margin
+       level voxels (default 32) of a valid vertex of these tifxyz meshes (vertex / --near-div, default 2^level, = this level's voxels). A
+       crop score renders a +-19 um band around its mesh: cleanscore's 0841 crops ran 216 windows per crop for ~1.2 Gvox of box, most of
+       them far from the sheet. The kept windows are computed exactly as without the option (each window is independent: its own
+       statistics, interior-only output); the rest are not read, run or written (fill 0). Refused with --feather / --seamless blending */
+    {   const char *nm = opt(argc, argv, "--near-mesh", nullptr);
+        if (nm) {
+            if (fea || seam2 || split || sheet_task || ffd || ffz || lat_store || sweep_out) { fprintf(stderr, "predict: --near-mesh: plain probability windows only (no --feather / --seam-inproc / --split / fields / --latents)\n"); return 2; }
+            const double ndiv = opt_atof("--near-div", opt(argc, argv, "--near-div", "0")) > 0 ? opt_atof("--near-div", opt(argc, argv, "--near-div", "0")) : (double)(1 << level);
+            const int64_t mg = opt_atoi("--near-margin", opt(argc, argv, "--near-margin", "32")), C = 8;   /* (marks on an 8-voxel cell grid over the box) */
+            int64_t gn[3]; for (int d = 0; d < 3; d++) gn[d] = (bn[d] + C - 1) / C;
+            uint8_t *mk = calloc((size_t)(gn[0] * gn[1] * gn[2]), 1); if (!mk) { fprintf(stderr, "predict: out of memory\n"); return 1; }
+            long nv = 0; char dl[4096]; snprintf(dl, sizeof dl, "%s", nm); char *sv = nullptr;
+            for (char *dir = strtok_r(dl, ",", &sv); dir; dir = strtok_r(nullptr, ",", &sv)) {
+                static const char *ax3[3] = {"z", "y", "x"}; float *A[3] = {}; int w = 0, h = 0, ok = 1;
+                for (int k = 0; k < 3 && ok; k++) { char p[4200]; int w2, h2; snprintf(p, sizeof p, "%s/%s.tif", dir, ax3[k]); A[k] = img_read_f32(p, &w2, &h2); ok = A[k] && (!k || (w2 == w && h2 == h)); w = w2; h = h2; }
+                if (!ok) { fprintf(stderr, "predict: --near-mesh: cannot read the tifxyz %s\n", dir); for (int k = 0; k < 3; k++) free(A[k]); free(mk); return 1; }
+                for (size_t i = 0; i < (size_t)w * h; i++) {
+                    if (!(A[0][i] >= 0) || !isfinite(A[1][i]) || !isfinite(A[2][i])) continue;   /* (tifxyz: z < 0 = no vertex) */
+                    int64_t lo[3], hi[3]; int in = 1;
+                    for (int d = 0; d < 3; d++) { const double v = A[d][i] / ndiv - (double)bo[d]; lo[d] = (int64_t)floor((v - mg) / C); hi[d] = (int64_t)floor((v + mg) / C);
+                        if (lo[d] < 0) lo[d] = 0; if (hi[d] >= gn[d]) hi[d] = gn[d] - 1; in &= lo[d] <= hi[d]; }
+                    if (!in) continue;
+                    nv++;
+                    for (int64_t z = lo[0]; z <= hi[0]; z++) for (int64_t y = lo[1]; y <= hi[1]; y++) memset(mk + ((size_t)z * gn[1] + (size_t)y) * gn[2] + lo[2], 1, (size_t)(hi[2] - lo[2] + 1));
+                }
+                for (int k = 0; k < 3; k++) free(A[k]);
+            }
+            long kept = 0; const long before = rd.ntiles;
+            for (long i = 0; i < rd.ntiles; i++) {
+                const tile_t *t = &rd.tiles[i]; int64_t g0[3], g1[3]; const int64_t tw[3] = {t->tz, t->ty, t->tx}, wn_[3] = {Wz, W, W}, hl_[3] = {hz, halo, halo};
+                const int64_t sh_ = t->shard >= 0 ? t->shard : 0, sidx[3] = {sh_ / (ns[1] * ns[2]), sh_ / ns[2] % ns[1], sh_ % ns[2]};
+                int any_ = 0, ok = 1;
+                for (int d = 0; d < 3; d++) {   /* the interior in this shard, box-local, in cells */
+                    int64_t lo = tw[d] + hl_[d], hi = tw[d] + wn_[d] - hl_[d]; const int64_t s0 = sidx[d] * shard, s1 = s0 + shard < bn[d] ? s0 + shard : bn[d];
+                    if (!sup && t->shard >= 0) { if (lo < s0) lo = s0; if (hi > s1) hi = s1; } else { if (lo < 0) lo = 0; if (hi > bn[d]) hi = bn[d]; }
+                    if (hi <= lo) ok = 0; g0[d] = lo / C; g1[d] = (hi - 1) / C; if (g1[d] >= gn[d]) g1[d] = gn[d] - 1;
+                }
+                for (int64_t z = g0[0]; ok && z <= g1[0] && !any_; z++) for (int64_t y = g0[1]; y <= g1[1] && !any_; y++)
+                    any_ = memchr(mk + ((size_t)z * gn[1] + (size_t)y) * gn[2] + g0[2], 1, (size_t)(g1[2] - g0[2] + 1)) != nullptr;
+                if (any_ || !ok) rd.tiles[kept++] = *t;   /* (a degenerate interior is kept: as without the option) */
+            }
+            rd.ntiles = kept; free(mk);
+            fprintf(stderr, "predict: --near-mesh: %ld of %ld windows within %lld voxels of %ld mesh vertices (/%g) kept\n", kept, before, (long long)mg, nv, ndiv);
+        }
     }
     /* --surf W1,W2,..: the surface ink head (train --ink-surf) on these unrolled wraps: the windows reduced to those holding a patch */
     static surfp *SF; static char sf_out[1200];   /* mgpu: main (predict --surf: one GPU, refused with --gpus > 1 / --split) */
