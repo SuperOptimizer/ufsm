@@ -163,6 +163,7 @@ typedef struct {
     uint8_t *slab; size_t slab_cap; uint8_t *crops, *h48, *h96; float *lut; int *keep, *org;
     long long ncrop, nair; double tgpu_wait, tct, tprep;
     uint8_t *mask; int64_t m0[3], mn[3]; int mb;
+    int gprep; int *gpz, *gcm, *dgpz, *dgcm; uint32_t *ghist, *dghist; int gcap;   /* --gpu-prep (the published-exact path's prep on the GPU) */
     int fast, T; uint8_t *dslab; size_t dslab_cap; uint32_t *dbh; size_t dbh_cap; int *dpyx, *dcmax, *hcmax, *hpyx; void *dx;   /* --fast */
 } run_ctx;
 
@@ -247,9 +248,62 @@ static int run_band(run_ctx *C, int tz0, int tz1, int y0, int y1, int x0, int x1
         { const int64_t o[3] = {nzs + keep, ys, xs}, n[3] = {G.parent - keep, (int64_t)sy, (int64_t)sx};
           if (ct_read(C, o, n, C->slab + (size_t)keep * sy * sx)) { fprintf(stderr, "ink3d-ext: CT read: %s\n", z3_error()); return -1; } }
         zs = nzs; C->tct += now_s() - tc;
+        if (C->gprep) {   /* the slab on the device (whole: a crop row's new rows are ~1 / 3 of it) */
+            const double tp = now_s();
+            const size_t sb = (size_t)G.parent * sy * sx;
+            if (sb > C->dslab_cap) { xfree_dev(C->dslab); C->dslab_cap = sb; C->dslab = xmalloc_dev(sb); }
+            xh2d(C->dslab, C->slab, sb);
+            C->tprep += now_s() - tp;
+        }
         for (int j0 = 0; j0 < nj; j0 += C->B) {
             const int n = nj - j0 < C->B ? nj - j0 : C->B;
             const double tp = now_s();
+            if (C->gprep) {   /* = prep_worker on the GPU: mask (host), crop max, the parent's histogram, p1 / p99 + lut (host, exact), crop gather */
+                if (n > C->gcap) {
+                    free(C->gpz); free(C->gcm); free(C->ghist); xfree_dev(C->dgpz); xfree_dev(C->dgcm); xfree_dev(C->dghist);
+                    C->gcap = n; C->gpz = malloc(sizeof(int) * 3 * n); C->gcm = malloc(sizeof(int) * n); C->ghist = malloc(sizeof(uint32_t) * 256 * n);
+                    C->dgpz = xmalloc_dev(sizeof(int) * 3 * n); C->dgcm = xmalloc_dev(sizeof(int) * n); C->dghist = xmalloc_dev(sizeof(uint32_t) * 256 * n);
+                    if (!C->gpz || !C->gcm || !C->ghist) { fprintf(stderr, "ink3d-ext: out of host memory (gpu prep)\n"); return -1; }
+                }
+                int nc = 0, *cj = C->keep;   /* (keep doubles as the candidates' chunk indices) */
+                for (int j = 0; j < n; j++) {
+                    if (C->mask && !mask_hit(C->mask, C->m0, C->mn, C->mb, oz, oy[j0 + j], ox[j0 + j])) continue;
+                    C->gpz[3 * nc] = (int)(2 * (int64_t)oz - G.poff - zs); C->gpz[3 * nc + 1] = (int)(2 * (int64_t)oy[j0 + j] - G.poff - ys); C->gpz[3 * nc + 2] = (int)(2 * (int64_t)ox[j0 + j] - G.poff - xs);
+                    cj[nc++] = j;
+                }
+                int m = 0;
+                if (nc) {
+                    xh2d(C->dgpz, C->gpz, sizeof(int) * 3 * nc);
+                    i3x_cmax(C->dslab, (int)sy, (int)sx, C->dgpz, nc, G.crop, G.poff, C->dgcm);
+                    xd2h(C->gcm, C->dgcm, sizeof(int) * nc);
+                    for (int c = 0; c < nc; c++) if (C->gcm[c] >= C->air) {   /* compact (ascending, as the CPU prep) */
+                        const int j = cj[c];
+                        memmove(C->gpz + 3 * m, C->gpz + 3 * c, sizeof(int) * 3);
+                        C->org[3 * m] = oz; C->org[3 * m + 1] = oy[j0 + j] - y0; C->org[3 * m + 2] = ox[j0 + j] - x0; m++;
+                    }
+                }
+                C->nair += n - m;
+                if (m) {
+                    xh2d(C->dgpz, C->gpz, sizeof(int) * 3 * m);
+                    const int st = C->l1 ? 2 : 1;
+                    i3x_hist(C->dslab, (int)sy, (int)sx, C->dgpz, m, G.parent, st, C->dghist);
+                    xd2h(C->ghist, C->dghist, sizeof(uint32_t) * 256 * m);
+                    const uint64_t np = (uint64_t)(G.parent / st) * (G.parent / st) * (G.parent / st);
+                    for (int c = 0; c < m; c++) {
+                        uint64_t hs[256]; for (int v = 0; v < 256; v++) hs[v] = C->ghist[(size_t)256 * c + v];
+                        double lo, hi; i3_percentiles(hs, np, &lo, &hi); i3_lut(lo, hi, C->lut + 256 * c);
+                    }
+                    i3x_gather(C->dslab, (int)sy, (int)sx, C->dgpz, m, G.crop, G.poff, C->dcrop);
+                }
+                C->tprep += now_s() - tp;
+                if (!m) continue;
+                xh2d(C->dlut, C->lut, (size_t)m * 1024); xh2d(C->dorg, C->org, (size_t)m * 12);
+                const float *lg = nullptr;
+                if (gb_forward(C->net, C->dcrop, C->dlut, m, &lg)) return -1;
+                i3_blend(C->acc, C->wsum, C->R, TY, TX, lg, C->dorg, m, tz0, tz1, G.out);
+                C->ncrop += m;
+                continue;
+            }
             prep_job J = {.slab = C->slab, .sy = sy, .sx = sx, .zs = zs, .ys = ys, .xs = xs, .oz = oz, .oy = oy + j0, .ox = ox + j0, .nj = n, .air = C->air, .st = C->l1 ? 2 : 1,
                           .crops = C->crops, .lut = C->lut, .keep = C->keep, .mask = C->mask, .mb = C->mb,
                           .m0 = {C->m0[0], C->m0[1], C->m0[2]}, .mn = {C->mn[0], C->mn[1], C->mn[2]}};
@@ -401,6 +455,8 @@ int cmd_ink3d_ext(int argc, char **argv) {
     if (!C.ct) { fprintf(stderr, "ink3d-ext: %s %s: %s\n", root, key, z3_error()); return 1; }
     C.l1 = opt_atoi("--ct-l1", opt(argc, argv, "--ct-l1", "0"));   /* KEY is level 1 (4.8 um: the network's own input scale); box still in level-0 voxels */
     C.fast = opt_atoi("--fast", opt(argc, argv, "--fast", "0"));   /* level-1 input on an aligned grid, prep on the GPU (gambiarra) */
+    C.gprep = opt_atoi("--gpu-prep", opt(argc, argv, "--gpu-prep", "0"));   /* 1: the published-exact path's crop prep on the GPU (byte-identical); off until it
+                                                                                 measures faster (11-24 small box: prep 3.4 s vs 1.0 s on the CPU threads) */
     C.T = opt_atoi("--tile", opt(argc, argv, "--tile", "64"));   /* --fast: crop edge at 4.8 um (64 = the published one) */
     if (C.fast && (G.pool_in != 2 || G.out != 64 || stride % 16 || C.T % 16 || C.T < 64 || C.T > 256 || stride > C.T)) { fprintf(stderr, "ink3d-ext: --fast needs gambiarra, --tile 64..256 and --stride <= tile, multiples of 16\n"); return 2; }
     if (C.fast && C.T != 64) { gb_set_tile(net, C.T); G.out = C.T; C.R = 2 * C.T; }
@@ -518,6 +574,7 @@ int cmd_ink3d_ext(int argc, char **argv) {
                     "%.2f Mvox/s at 4.8 um (box %.0f Mvox), %.2f known\n",
             nshard, C.ncrop, C.nair, el, C.tct, C.tprep, C.tgpu_wait, C.ncrop ? 1e3 * el / C.ncrop : 0.0, nv48 / el / 1e6, nv48 / 1e6, nv48 > 0 ? tot / nv48 : 0.0);
     xfree_dev(C.acc); xfree_dev(C.wsum); xfree_dev(C.d48); xfree_dev(C.d96); xfree_dev(C.dcrop); xfree_dev(C.dlut); xfree_dev(C.dorg); xfree_dev(C.dhist);
+    free(C.gpz); free(C.gcm); free(C.ghist); xfree_dev(C.dgpz); xfree_dev(C.dgcm); xfree_dev(C.dghist);
     free(C.crops); free(C.lut); free(C.keep); free(C.org); free(C.h48); free(C.h96); free(C.slab); free(C.l1buf); free(b48); free(b96);
     for (int a = 0; a < 3; a++) free(C.A[a]);
     free(C.mask);
