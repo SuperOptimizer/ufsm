@@ -6,7 +6,7 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
-## Trainer start-up: 1876 s -> 98 s cold, ~37 s warm (R1E's 57 ink sources; 2026-11-24, perf)
+## Trainer start-up: 1876 s -> 99 s cold, 12 s warm, peak RSS 8 GB warm (R1E's 57 ink sources; 2026-11-24, perf)
 
 R1E, R1E-D and R11d each spent ~30 min before step 10 (R1E: `startup: 1875.7 s`: sources 77.0 s, sampler start 1796.6 s), and their CPU
 sampler-only pre-launch checks paid it again. Reproduced CPU-only (`UFSM_SAMPLER_ONLY=20 CUDA_VISIBLE_DEVICES=` on R1E.argv, dev slice, 6
@@ -20,14 +20,19 @@ threads), each source's draw-cell build timed (new `sampler: S: draw cells in T 
 | the 57 sources one after another | 279 s summed | `sources_occupancy_all`: UFSM_OCC_THREADS workers (default the CPUs, <= 8) |
 | mesh decode (surfcomp, single thread), each source its own copy | 70 s of the 77 s "sources" | meshes in a refcounted process table (one per tifxyz) + `inkfly_prewarm` decodes all 204 on the CPUs first: 10.6 s on 6 threads |
 | the draw cells recomputed every launch | -- | trainperf's UOC2 draw-cell cache (drawcache-20261120, merged here): warm sampler start 4 s |
+| every mesh (sfc decode) and label TIFF (LZW, 85 % of the warm open) read at the open, though warm caches never touch most | warm open 22 s, 14.5 GB | lazy: headers at the open (meta + sizes; tfx meta no longer decodes the sfc), pixels at the first use (`ifs`, `lsrc_ready`); UFSM_INK_LAZY=0 the old order. Prewarm then off by default (UFSM_INK_PREWARM=1) |
 
 | R1E sampler-only (6 CPUs) | sources | sampler start | total | peak RSS |
 |---|---|---|---|---|
 | R1E trainer log (old, 32 CPUs) | 77 s | 1797 s | 1876 s | (planner 59.6 GB) |
 | cold, all fixes | 32.8 s | 65 s | 98 s | 34.8 GB |
 | warm (draw-cell cache) | ~33 s | 4 s | ~37 s | 28.2 GB |
+| cold, + lazy meshes / labels | -- | -- | 99 s | 33.3 GB |
+| warm, + lazy meshes / labels | 1.2 s | 6 s | 12 s | 8.1 GB |
 
-Identity: the 171 per-source draw-cell count lines equal the R1E log's (old binary 204a0dce) on all 57 sources; `UFSM_OCC_SCAN=check` (chunked
+Identity: `--det 1` sampler-only, 40 batches, `UFSM_SAMPLER_HASH=1` (new: per batch an FNV-1a of each window's source, level, corner, CT
+bytes and ink plane): identical between all new paths and UFSM_INK_LAZY=0 + UFSM_OCC_SCAN=full + UFSM_OCC_THREADS=1 (5:28 vs 1:39 cold).
+The 171 per-source draw-cell count lines equal the R1E log's (old binary 204a0dce) on all 57 sources; `UFSM_OCC_SCAN=check` (chunked
 vs whole-CT scan, idx and positive lists memcmp) identical on all 57; `UFSM_IFLY_CANDS_CHECK=1` (the old quadratic list as reference, lists up
 to 200 k entries) silent on the run and set in test_ink_splat; test_ink_splat checks inkfly_cells_sup against the ray list marked afterwards
 (strides 1-2, levels 1-3); test_ink_mil_train / test_fibre_onfly run with UFSM_OCC_SCAN=check. Meshes: 15.44 GB resident for R1E
