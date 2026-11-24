@@ -578,6 +578,39 @@ Why a third of the supervised pixels have no face (`--diag 2000` per source: the
 face rule's 2-sample air gap after the papyrus run is missing (dense / touching sheets) for 51-87 %, the mesh is off the papyrus by
 more than the run window [-4, 8] (mostly on the -t side) for 6-40 %, papyrus under iso 64 for <= 3 % (a per-source iso would recover
 almost nothing). Those pixels still train through the MIL rays (mode 1's rays are exactly them).
+## Ink-training speed: the sampler 7.5 -> 82 Mvox/s, the draw cells cached (191 -> 11 s start-up), 3 nets per card under MPS (2026-11-20, branches gpufb / inkgpu / drawink / drawcache, trainperf)
+
+The full-resolution ink ladder (f1 / f3 / f5: L0 8, `--mem auto`, three trainers on card 0) ran at 45 Mvox/s for the three nets together,
+and the 1.3 M net r1 at ~17 Mvox/s with 84-92 % of each step waiting for data. Fixed in this order, each merged when its tests passed:
+
+| fix | measured |
+|---|---|
+| ink on the GPU: the budget sized from free memory at the step loop (a full card had pushed it to the CPU), MIL ray face search on the GPU, gpudec into the window sink, DEFAULTED on every fallback (69c3ea43) | the silent CPU paths gone |
+| gpudec busy rule 2 s -> 0.25 s cooldown, 500 ms limit (19addc2c) | r1 had spent 210 of 563 s with CT decode on the CPU (105 slow round trips x 2 s) |
+| draw cells = the cells holding supervised label pixels, not the label tiles' boxes (19addc2c) | sampler-only, 6 workers, P 256: 7.5 -> 17 Mvox/s; 275 -> 208 windows rejected per 60 kept |
+| stratified draw `--ink-pos-frac 0.5`, stratified sources skip empty_keep (19addc2c) | 17 -> 82 Mvox/s (measured at 0.15); 2 rejected per 60; every scroll yields windows (0009B / 0814 had none: empty_keep, not the face search, which finds 44 / 74 %) |
+| draw cells cached with the occupancy cache, UOC2 = + the positive list (this branch) | start-up 191 s -> 11 s (Paris 4 alone: sampler start 180 -> 0.4 s; six scrolls ~200 s before) |
+
+Draw-cell cache key: the ink source's inputs key (its derived-label cache dir: CT, cfg, segments, every label file's size + mtime, LBL_INKFLY),
+its held-out boxes (not in that key under `excl_cells_only`), `UFSM_INK_DRAW_SUP`, and the source's CT / levels / iso. `--ink-pos-frac` is not
+in it (the list holds every positive cell, the ratio is drawn at run time). A cache hit prints the same per-source "ink draw cells" line.
+
+**Card sharing A/B** (card 0 alone, Paris 4 sources, 6 workers each, `--echo-max 4`, P 256, 60 s dmon after the first steps; Mvox/s the
+mean of the step lines after the first two):
+
+| config | Mvox/s per net | total | wait | SM |
+|---|---|---|---|---|
+| f1 (L0 8) alone, `--mem auto` (l3b) | 60 | 60 | 41 % | 92 % |
+| f1, `--mem fast` | refused: an 8-wide level 0 needs the three level-0 buffers | | | |
+| 3x r1 (L0 16), `--mem fast`, time-sliced | 41 / 35 / 35 | 111 | 23 % | 100 % |
+| 3x r1, `--mem fast`, MPS | 46 / 47 / 44 | 137 | 30 % | 98 % |
+| f ladder before (3x L0 8, auto, time-sliced, six scrolls) | ~15 | 45 | | 100 % |
+
+MPS: +23 % total over time-slicing for the same three nets (kernels of different contexts overlap; each net's small level-3..4 kernels do
+not fill the card). The pick (lead, sent to inksdk): L0 16 + `--mem fast` + MPS, three nets per card. `/vesuvius/ufsm/trainperf/mps_card.sh
+start|stop|status CARD` runs a daemon with a private pipe dir, so only trainers started with `CUDA_MPS_PIPE_DIRECTORY=/tmp/ufsm-mps-CARD` use it.
+Still open: each net's wait (23-30 %) is the sampler at 6 workers on one scroll; the shared sampler (one sampler feeding several nets) is
+decided against these numbers next.
 
 ## Dev-loop speed, part 1: the baseline; the runner starts in 0.2 s, waits cheaply, and -c selects by symbol reach (2026-11-20, branch devspeed-20261120)
 
