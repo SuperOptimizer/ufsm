@@ -284,6 +284,28 @@ int main(int argc, char **argv) {
         free(t0); free(t1); free(l0); free(l1);
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ssl.json --out %s/ssl --resume %s/ssl/last.ckpt %s %s --ssl-share 0.5 --steps 10 > %s/ssl2.log 2>&1 && grep -q 'step     10 ' %s/ssl2.log", U, d, d, d, cm, sf, d, d), "ssl resume (%s/ssl2.log)", d);
     }
+    /* (9) --ssl on the voxel net (2026-11-23, DINO pretraining for the ink nets): (a) unwrap2 with a "ct_only" copy of the fixture: finite
+       ssl terms, the teacher targets about the mask share of the level-1 cells (2^3 voxels), the header names the side head; (b) --single ink
+       takes --ssl; (c) the ink finetune's warm start: a run without --ssl --init-from the ssl checkpoint (the side head dropped) */
+    if (!wr && test_part(0)) {
+        CHECK(!sh("sed 's|}}}}]}|}}}}, {\"name\": \"wind-fixture-u\", \"root\": \"%s/fx\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/fx/axis.json\", \"weight\": 1, \"ct_only\": 1}]}|' %s/fx/sources.json > %s/fx/sources-vssl.json"
+                  " && sed 's|}}}}]}|}}}}, {\"name\": \"wind-fixture-u\", \"root\": \"%s/fx\", \"ct\": \"ct\", \"um\": 9.6, \"axis\": \"%s/fx/axis.json\", \"weight\": 1, \"ct_only\": 1}]}|' %s/fx/sources-ink.json > %s/fx/sources-vssli.json"
+                  " && grep -q ct_only %s/fx/sources-vssl.json && grep -q ct_only %s/fx/sources-vssli.json", d, d, d, d, d, d, d, d, d, d), "voxel ssl: sources with an unlabelled copy");
+        char cm[2048]; snprintf(cm, sizeof cm, "%s", common); { char *ls = strstr(cm, " --steps 4"); if (ls) memmove(ls, ls + 10, strlen(ls + 10) + 1); }
+        const char *sf = "--ssl 8 --ssl-level 1 --ssl-block 16 --ssl-share 0.5 --steps 8";
+        CHECK(!sh("UFSM_SSL_CHECK=1 UFSM_GRAD_MX8=1 %s train %s/fx/sources-vssl.json --out %s/vssl %s %s > %s/vssl.log 2>&1", U, d, d, cm, sf, d), "voxel ssl run (%s/vssl.log)", d);
+        char p[600]; snprintf(p, sizeof p, "%s/vssl.log", d); char *lg = slurp(p); int nfin = 0, nchk = 0, nbad = 0;
+        for (const char *q = lg; q && (q = strstr(q, "\nstep ")); q++) { const char *a = strstr(q, " ssl "), *e = strchr(q + 1, '\n'); if (a && (!e || a < e)) { const double v = atof(a + 5); nfin += isfinite(v) && v > 0; } }
+        for (const char *q = lg; q && (q = strstr(q, "ssl check (GPU ")); q++) { const char *a = strstr(q, "): "); const double t = a ? atof(a + 3) : -1; nchk++; nbad += !(t > 10 && t < 75); }
+        CHECK(nfin >= 2 && nchk >= 2 && !nbad, "voxel ssl: %d step lines with a finite ssl term, %d checks (%d with a targeted share outside 10..75%%)", nfin, nchk, nbad);
+        CHECK(lg && strstr(lg, "(2^3 voxels per cell"), "voxel ssl: the level-1 cell is not 2^3 voxels (%s/vssl.log)", d);
+        free(lg);
+        CHECK(!sh("head -1 %s/vssl/last.ckpt | grep -q '\"emb_lev\":1,\"emb_ch\":8'", d), "voxel ssl: header names the side head");
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-vssli.json --out %s/vssli %s %s --ink-head 1 --single ink > %s/vssli.log 2>&1 && grep -q 'step      8 .* ssl ' %s/vssli.log", U, d, d, cm, sf, d, d),
+              "voxel ssl: --single ink --ssl (%s/vssli.log)", d);
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/vssft %s --ink-head 1 --single ink --init-from %s/vssli/last.ckpt --steps 4 > %s/vssft.log 2>&1 && grep -q 'step      4 ' %s/vssft.log", U, d, d, cm, d, d, d),
+              "voxel ssl: the finetune's --init-from of the ssl checkpoint (%s/vssft.log)", d);
+    }
     if (!fails) sh("rm -rf %s", d);
     if (fails) { fprintf(stderr, "test_heads: %d FAILED (kept %s)\n", fails, d); return 1; }
     printf("test_heads: ok\n");
