@@ -376,6 +376,7 @@ static int g_distill, g_distill_lev = 3, g_distill_div; static float g_distill_w
 static ssl_heads g_sslh; static float g_sslh_w[SSLH_MAX]; static const char *g_sslh_name[SSLH_MAX];   /* --ssl-heads LIST (--ssl-ink W: "ink:W"): gated mean-teacher
                                          consistency of the output heads on the unlabelled windows' latent cells (ssl.h; DESIGN 2026-11-12) */
 static int g_ssl, g_ssl_lev = 1, g_ssl_bv = 16, g_ssl_npts = 65536; static float g_ssl_w = 0.5f, g_ssl_mask = 0.4f, g_ssl_var = 1.f, g_ssl_gamma, g_ssl_jit = 1.f; static size_t g_ssl_S;   /* --ssl D: masked self-distillation on "ct_only" windows (src/ssl.h): a D-channel side head on decoder level --ssl-level, cells of g_ssl_S per window */
+static int ssl_cell(void) { return (g_lat ? 4 : 1) << g_ssl_lev; }   /* --ssl: voxels per side-head cell (--lat: the 4^3-voxel latent grid below level 0) */
 static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64; static int g_cnt_ns; static float g_cnt_edges[8];   /* --count-strata */   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
 static float g_pg_lambda, g_pg_dist[4] = {2.f}; static int g_pg_nd = 1, g_pg_angle, g_pg_mask;   /* --pgrad-lambda / --pgrad-dist (D[,D...], up to 4): the phase wavenumber loss (nn_pgrad_slab; head slabs only) */
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
@@ -2322,15 +2323,15 @@ static void erf_probe(gpu_state *d, shape5 ls, int P) {
     exit(0);
 }
 static void ssl_teacher(gpu_state *d, shape5 ls, int P) {
-    const float *jb, *jg; float jst = 0.f; unet_lat_basis(d->u, &jb, &jg, &jst);
-    const float st_student = unet_get_lat_step(d->u);
+    const float *jb, *jg; float jst = 0.f; if (g_lat) unet_lat_basis(d->u, &jb, &jg, &jst);   /* (the voxel net: no quantiser step, the mask is the only view change) */
+    const float st_student = g_lat ? unet_get_lat_step(d->u) : 0.f;
     d->ssl_rs = rmix(d->ssl_rs + 0x9E3779B97F4A7C15ull); d->ssl_seed = d->ssl_rs;
     if (jst > 0.f) unet_set_lat_step(d->u, jst);
     unet_use_ema(d->u, 1);
     unet_forward_x(d->u, d->x, ls, 1, g_xfmt != 0); nn_ptick("ssl teacher forward");
     shape5 se; const float *ye = unet_emb_logits(d->u, &se);
     if (!ye || (size_t)se.d * se.h * se.w != g_ssl_S || se.c != g_ssl) { fprintf(stderr, "ssl: no side head outputs of %zu cells after the teacher forward\n", g_ssl_S); abort(); }
-    nn_ssl_targets(ye, se.c, se.d, se.h, se.w, 4 << g_ssl_lev, g_ssl_bv, g_ssl_mask, d->ssl_seed, d->sslmu, d->sslt);
+    nn_ssl_targets(ye, se.c, se.d, se.h, se.w, ssl_cell(), g_ssl_bv, g_ssl_mask, d->ssl_seed, d->sslmu, d->sslt);
     d->sslh_on = 0;
     if (g_sslh.nh > 0) {   /* --ssl-heads: the teacher's coarse head on the cell grid, chunk by chunk (its dec[0] output is live), into per-cell targets */
         if (!g_lat_hs || !d->lgc) { fprintf(stderr, "--ssl-heads: the streamed latent head (UFSM_LAT_HEAD_STREAM)\n"); abort(); }
@@ -2416,7 +2417,11 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         nn_ptick("trunk forward");
         if (g_lsplit) unet_split_head_halo(d->u, split_halo_k, 2);   /* (the 2 halo cells next to the cut: the head slabs' band reads them) */
     }   /* --lat: x the full-resolution CT channel */
-    else lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
+    else {
+        if (d->ssl_win) ssl_teacher(d, xs, P);   /* --ssl on the voxel net (2026-11-23): the teacher on the whole window, the student's CT masked; the
+                                                    head slabs run as on a labelled window (the unlabelled window's masks are empty: zero loss) */
+        lg = unet_forward_x(d->u, d->x, xs, train, g_xfmt != 0);
+    }
     d->lg = lg;
     mem_post(d, B, train);
     if (train && !g_half && !g_head_slab && !g_pkf) diag_nonfinite(d, "logits", lg, (size_t)B * g_cout * xs.d * P * P, unet_logits_h16(d->u) ? 1 : 0);   /* (UFSM_SYNC_CHECK) */
@@ -3134,11 +3139,11 @@ int cmd_train(int argc, char **argv) {
         {   const char *sg = opt(argc,argv,"--single","none");
             g_single = !strcmp(sg, "ink") ? 1 : !strcmp(sg, "fib") ? 2 : 0; g_scout = g_single == 2 ? 9 : 1;
             const int other = g_rv || g_fibn || atof(opt(argc,argv,"--pgrad-lambda","0")) > 0 || atof(opt(argc,argv,"--phase-trunc","0")) > 0
-                || atoi(opt(argc,argv,"--grad-cos","0")) || atoi(opt(argc,argv,"--uw","0")) || strcmp(opt(argc,argv,"--lat","0"), "0") || atoi(opt(argc,argv,"--fstem","0")) || *opt(argc,argv,"--ssl","") || *opt(argc,argv,"--ssl-heads","");
+                || atoi(opt(argc,argv,"--grad-cos","0")) || atoi(opt(argc,argv,"--uw","0")) || strcmp(opt(argc,argv,"--lat","0"), "0") || atoi(opt(argc,argv,"--fstem","0")) || *opt(argc,argv,"--ssl-heads","");   /* (--single ink takes --ssl since 2026-11-23: the voxel side head is its own) */
             if (!g_single && strcmp(sg, "none")) { fprintf(stderr, "--single: ink or fib\n"); return 2; }
             if (g_single == 1 && (!g_unwrap2 || g_ink2 != 1 || g_fibh || other)) {
-                fprintf(stderr, "--single ink: task unwrap2 --ink-head 1, no --rv / --fib-head / --fib-normal-lambda / --pgrad-lambda / --phase-trunc / --grad-cos / --uw / --lat / --fstem / --ssl\n"); return 2; }
-            if (g_single == 2 && (!g_unwrap2 || !g_fibh || g_ink2 || other || atof(opt(argc,argv,"--contact-weight","0")) > 1)) {   /* (--contact-weight reads the phase plane) */
+                fprintf(stderr, "--single ink: task unwrap2 --ink-head 1, no --rv / --fib-head / --fib-normal-lambda / --pgrad-lambda / --phase-trunc / --grad-cos / --uw / --lat / --fstem / --ssl-heads\n"); return 2; }
+            if (g_single == 2 && (!g_unwrap2 || !g_fibh || g_ink2 || other || *opt(argc,argv,"--ssl","") || atof(opt(argc,argv,"--contact-weight","0")) > 1)) {   /* (--contact-weight reads the phase plane) */
                 fprintf(stderr, "--single fib: task unwrap2 --fib-head L, no --ink-head / --rv / --fib-normal-lambda / --contact-weight / --pgrad-lambda / --phase-trunc / --grad-cos / --uw / --lat / --fstem / --ssl\n"); return 2; }
             if (g_single == 1) fprintf(stderr, "--single ink: a single-target net, the head the ink row only (the phase / normal / winding heads, losses and label planes off)\n");
             if (g_single == 2) fprintf(stderr, "--single fib: a single-target net, the head the fibre head's 9 rows only (H / V masks, the axis dyad, its family; the phase / normal / winding heads, losses and label planes off)\n");
@@ -3720,9 +3725,8 @@ int cmd_train(int argc, char **argv) {
         g_ssl_npts = opt_atoi("--ssl-points", opt(argc, argv, "--ssl-points", "65536")); g_ssl_jit = (float)opt_atof("--ssl-jit", opt(argc, argv, "--ssl-jit", "1"));
         if (resume && g_ssl) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && pc.emb_lev) { g_ssl = pc.emb_ch; g_ssl_lev = pc.emb_lev; } }
         if (g_ssl) {
-            const int cv = 4 << g_ssl_lev;
+            const int cv = ssl_cell();   /* (--lat: level-l cells of 4 << l voxels; the voxel net (2026-11-23): 1 << l) */
             if (g_distill) { fprintf(stderr, "--ssl and --distill share the side head: one of them\n"); return 2; }
-            if (!g_lat) { fprintf(stderr, "--ssl: the latent grid (--lat 4)\n"); return 2; }
             if (B != 1 || split) { fprintf(stderr, "--ssl: B 1, whole windows (no --split)\n"); return 2; }
             if (g_ssl < 2 || g_ssl > 128 || g_ssl_lev < 1 || g_ssl_lev > cfg.nlev - 2 || !(g_ssl_w > 0) || !(g_ssl_mask > 0 && g_ssl_mask < 1) || g_ssl_var < 0 || g_ssl_npts < 2) {
                 fprintf(stderr, "--ssl D (2..128), --ssl-level 1..%d, --ssl-weight > 0, --ssl-mask in (0, 1), --ssl-var >= 0, --ssl-points >= 2\n", cfg.nlev - 2); return 2;
@@ -3763,6 +3767,7 @@ int cmd_train(int argc, char **argv) {
                             e.mode == SSLH_NORM ? "|N|_F" : e.mode == SSLH_PHASE ? "|(2c - 1, 2s - 1)|" : "|p - 0.5|", e.conf, e.pap ? " of the teacher's papyrus (the rv pair)" : "");
                 }
             }
+            if (g_sslh.nh > 0 && !g_lat) { fprintf(stderr, "--ssl-heads: the latent net (--lat 4, its streamed cell-grid head)\n"); return 2; }
             g_ssl_S = (size_t)(g_Pz / cv) * (P / cv) * (P / cv);
             if ((size_t)g_ssl_npts > g_ssl_S) g_ssl_npts = (int)g_ssl_S;
             fprintf(stderr, "ssl: %d channels on decoder level %d (%d^3 voxels per cell, %zu cells), mask %g of %d^3 blocks, cosine weight %g, variance hinge %g (std >= %.3f, %d points), student step jitter %g octaves\n",
