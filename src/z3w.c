@@ -182,13 +182,16 @@ static int shard_chunk(const z3w *w, const uint8_t *data, int i, uint8_t *chunk,
     const int es = w->dtype ? w->esize : 1;
     int cz = i / (w->cg * w->cg), cy = (i / w->cg) % w->cg, cx = i % w->cg;
     int any = 0;
-    for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) {
+    uint8_t frow[128]; if (!w->dtype) memset(frow, (uint8_t)w->fill, sizeof frow);   /* (u8: a row compare instead of a byte loop; ink3d-ext's mostly-unknown
+                                                                                         1024^3 shards spent ~1/4 of its CPU here, 2026-11-20) */
+    for (int z = 0; z < 128 && !any; z++) for (int y = 0; y < 128 && !any; y++) {   /* all fill: omitted, nothing gathered */
         const uint8_t *src = data + (((size_t)(cz * 128 + z) * w->shard + (cy * 128 + y)) * w->shard + cx * 128) * es;
-        uint8_t *dst = chunk + ((size_t)z * 128 + y) * 128 * es;
-        memcpy(dst, src, (size_t)128 * es);
-        if (!any) for (int x = 0; x < 128; x++) if (w->dtype ? !elem_is_fill(src + (size_t)x * es, w->dtype, w->fillv) : src[x] != (uint8_t)w->fill) { any = 1; break; }
+        if (!w->dtype) any = memcmp(src, frow, 128) != 0;
+        else for (int x = 0; x < 128; x++) if (!elem_is_fill(src + (size_t)x * es, w->dtype, w->fillv)) { any = 1; break; }
     }
     if (!any) { *out = nullptr; *len = 0; return 0; }
+    for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++)
+        memcpy(chunk + ((size_t)z * 128 + y) * 128 * es, data + (((size_t)(cz * 128 + z) * w->shard + (cy * 128 + y)) * w->shard + cx * 128) * es, (size_t)128 * es);
     return encode_one(w, chunk, enc, bound, out, len);
 }
 static void *worker(void *arg) {
