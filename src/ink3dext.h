@@ -50,6 +50,11 @@ void i3_emit(float *acc, float *wsum, int R, int TY, int TX, int z0, int z1, uin
 void i3f_bhist(const uint8_t *slab, int Z, int Y, int X, int P, uint32_t *hist);   /* P: slab voxels per output voxel (2: level 0, 1: level 1); blocks of 16 P */
 void i3f_cmax(const uint8_t *slab, int Y, int X, int T, int P, const int *pyx_dev, int n, int *cmax_dev);
 void i3f_crops(const uint8_t *slab, int Y, int X, int T, int P, const uint32_t *hist, const int *pyx_dev, int n, void *out_half, float *lohi_dev);
+/* the published-exact path's prep on the GPU (--gpu-prep): level-0 slab [*][Y][X] on the device, crops by their parent's first voxel
+   pzyx [n][3] in slab voxels; CE crop edge at offset PO in the parent of edge PE; st the parent histogram's step (2: --ct-l1) */
+void i3x_cmax(const uint8_t *slab, int Y, int X, const int *pzyx_dev, int n, int CE, int PO, int *cmax_dev);
+void i3x_hist(const uint8_t *slab, int Y, int X, const int *pzyx_dev, int n, int PE, int st, uint32_t *hist_dev);   /* [n][256] */
+void i3x_gather(const uint8_t *slab, int Y, int X, const int *pzyx_dev, int n, int CE, int PO, uint8_t *out_dev);   /* [n][CE^3] */
 /* the network (src/ink3dext_net.c) */
 typedef struct gb_net gb_net;
 /* the network on a prepared fp16 input [B][net_in^3] (an xmalloc_dev buffer, consumed) */
