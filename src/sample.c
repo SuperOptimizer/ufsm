@@ -4020,6 +4020,9 @@ static occ_index phase_occupancy(source *s) {
     fprintf(stderr, "sampler: %s: %zu of %lld stored-phase chunks (level %d cells) hold labels\n", s->name, n, (long long)(g[0] * g[1] * g[2]), o.lev);
     return o;
 }
+[[gnu::weak]] int occ_cache_load(const char *, const char *, occ_index *);
+[[gnu::weak]] int occ_cache_save(const char *, const char *, const occ_index *);
+[[gnu::weak]] const char *dcache_default_dir(void);
 /* coarsest recto level that fits in memory: the cells containing any surface fraction (fallback: any labelled cell) */
 static occ_index label_occupancy(source *s) {
     occ_index o = {nullptr, 0, -1, {0, 0, 0}};
@@ -4093,6 +4096,22 @@ static occ_index label_occupancy(source *s) {
             const size_t pl = (size_t)mc->shape[1] * mc->shape[2], tot = pl * (size_t)mc->shape[0];
             const int iso = s->iso > 0 ? s->iso : 1;
             if (tot >= 4.29e9) { free(bits); continue; }
+            /* a stored target (not onfly ink, which source_occupancy caches by its inputs): the draw cells cached under a key holding the
+               target's chunk map itself (FNV-1a of the bits; the CT is immutable under its key), so a rewritten teacher set is a miss.
+               R11d's NAS teacher sources: 40-226 s each per launch reading the 1.1 um scans' level 5 (2026-11-24) */
+            char ock[1400] = ""; const char *ocd = !fly && occ_cache_load && occ_cache_save && dcache_default_dir && !(getenv("UFSM_OCC_CACHE") && !atoi(getenv("UFSM_OCC_CACHE"))) ? dcache_default_dir() : nullptr;
+            if (ocd && *ocd) {
+                uint64_t h = 1469598103934665603ull; const size_t ng = (size_t)g[0] * g[1] * g[2];
+                for (size_t q = 0; q < ng; q++) h = (h ^ bits[q]) * 1099511628211ull;
+                snprintf(ock, sizeof ock, "occ-stored v1|%s|%s|um %.9g|levels %d %d|iso %d|ch %d %s|lc %d sh %d|g %lld %lld %lld|map %016llx", s->name ? s->name : "", s->ct_key ? s->ct_key : "",
+                         s->um, s->min_level, s->max_level, iso, ch, s->tgt_key[ch] ? s->tgt_key[ch] : "", lc, sh, (long long)g[0], (long long)g[1], (long long)g[2], (unsigned long long)h);
+                occ_index c = {nullptr, 0, -1, {0, 0, 0}};
+                if (!occ_cache_load(ocd, ock, &c) && c.lev == lc && c.shape[0] == mc->shape[0] && c.shape[1] == mc->shape[1] && c.shape[2] == mc->shape[2]) {
+                    free(bits); o = c;
+                    fprintf(stderr, "sampler: %s: %zu level-%d draw cells from the occupancy cache (stored target chunks unchanged)\n", s->name, o.n, lc);
+                    continue; }
+                free(c.idx); free(c.pidx);
+            }
             {   /* UFSM_OCC_SCAN=full: the whole level-lc CT read and scanned (the old path); check: both, the lists compared (fatal on a difference) */
                 const char *ev = getenv("UFSM_OCC_SCAN"); const int full = ev && !strcmp(ev, "full"), chk = ev && !strcmp(ev, "check");
                 int rc = full ? occ_scan_full(cc, bits, g, fly ? -1 : sh, iso, fly, &o) : occ_scan_chunks(cc, bits, g, fly ? -1 : sh, iso, fly, &o);
@@ -4109,6 +4128,7 @@ static occ_index label_occupancy(source *s) {
                 fprintf(stderr, "sampler: %s: %zu of %zu level-%d CT cells hold papyrus inside the stored target chunks (the draw cells)\n", s->name, o.n, tot, lc); }
             fprintf(stderr, "sampler: %s: draw cells in %.1f s: tile boxes %.1f, supervised pixels %.1f, level-%d CT read %.1f, scan %.1f\n", s->name, occ_now() - tq0,
                     tq1 - tq0, tq2 - tq1, lc, tq3 - tq2, occ_now() - tq3);
+            if (*ock && o.n) { o.lev = lc; if (occ_cache_save(ocd, ock, &o)) fprintf(stderr, "sampler: %s: the occupancy cache write failed (computed again next launch)\n", s->name); }
             free(bits);
         }
         return o;

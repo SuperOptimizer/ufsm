@@ -30,6 +30,10 @@ threads), each source's draw-cell build timed (new `sampler: S: draw cells in T 
 | cold, + lazy meshes / labels | -- | -- | 99 s | 33.3 GB |
 | warm, + lazy meshes / labels | 1.2 s | 6 s | 12 s | 8.1 GB |
 
+R11d (1.1 um, 16 sources, NAS teacher targets + NAS CT): the stored-target sources had no cache and read the level-5 CT from the NAS
+(Paris 4 R1T 226 s, 1667 165 s, 0139 148 s cold; 24 s with the CT in the page cache). Their draw cells are now cached under a key holding
+the target's chunk map (FNV-1a), the CT key, levels and iso: R11d sampler-only 242 s cold -> 14 s warm (10.2 GB).
+
 Identity: `--det 1` sampler-only, 40 batches, `UFSM_SAMPLER_HASH=1` (new: per batch an FNV-1a of each window's source, level, corner, CT
 bytes and ink plane): identical between all new paths and UFSM_INK_LAZY=0 + UFSM_OCC_SCAN=full + UFSM_OCC_THREADS=1 (5:28 vs 1:39 cold).
 The 171 per-source draw-cell count lines equal the R1E log's (old binary 204a0dce) on all 57 sources; `UFSM_OCC_SCAN=check` (chunked
