@@ -6,7 +6,7 @@
 #include "sysinfo.h"
 [[gnu::weak]] int inkfly_cells(void *, int, const int64_t[3], uint8_t *);
 [[gnu::weak]] int inkfly_cells_sup(void *, int, const int64_t[3], uint8_t *, int);
-[[gnu::weak]] void inkfly_mesh_stats(uint64_t *, uint64_t *);
+[[gnu::weak]] void inkfly_mesh_stats(uint64_t *, uint64_t *, uint64_t *);
 [[gnu::weak]] size_t inkfly_cache_bytes(size_t *);
 [[gnu::weak]] int inkfly_rays(void *, const int64_t[3], const int64_t[3], int, int, float, inkray **, size_t *);   /* (weak: test binaries without inksplat.o; only called for an onfly target) */
 [[gnu::weak]] int isf_rays_crop(inkray *, int, int, int, int, int, int, float);   /* (inksurf.c; weak as inkfly_rays) */
@@ -4728,8 +4728,8 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
         }
     }
     free(pre);
-    if (inkfly_mesh_stats) { uint64_t sh = 0, by = 0; inkfly_mesh_stats(&sh, &by);
-        if (sh || by) fprintf(stderr, "sampler: ink onfly meshes: %.2f GB resident, %llu segment opens served from the shared table (inkfly_prewarm or another source)\n", by / 1e9, (unsigned long long)sh); }
+    if (inkfly_mesh_stats) { uint64_t sh = 0, by = 0, ld = 0; inkfly_mesh_stats(&sh, &by, &ld);
+        if (sh || by || ld) fprintf(stderr, "sampler: ink onfly meshes: %llu decoded so far (%.2f GB resident; the rest at their first use), %llu segment opens shared\n", (unsigned long long)ld, by / 1e9, (unsigned long long)sh); }
     /* (the replay state before the workers: a worker that finished its first window before these existed left it unreplayed, and
        --echo-max's reclaim read rq as a null pointer, 2026-11-14) */
     if (sp->cfg.replay > 1 || sp->cfg.echo_max > 0) {

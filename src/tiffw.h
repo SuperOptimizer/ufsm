@@ -22,6 +22,9 @@ int tifxyz_write(const char *dir, int w, int h, const float *x, const float *y, 
    tifxyz_set_sfc(err): tifxyz_write writes <dir>.sfc instead of the directory (joint XYZ, Euclidean tolerance err voxels; 0 = off). */
 extern float *(*tfx_axis_hook)(const char *tifpath, int *w, int *h);
 extern char *(*tfx_meta_hook)(const char *metapath);
+/* a .sfc-backed x / y / z plane's size without decoding it (0 ok; nullptr / -1: not sfc-backed), and the calling thread's decoded-surface cache freed */
+extern int (*tfx_dims_hook)(const char *tifpath, int *w, int *h);
+extern void (*tfx_release_hook)(void);
 extern int (*tfx_write_hook)(const char *sfcpath, int w, int h, const float *x, const float *y, const float *z, const char *meta, double err);
 void tifxyz_set_sfc(double err);
 /* a joint-XYZ .sfc (w x h, Euclidean tolerance err, meta) written by nthreads encoders (<= 0: the tfx_set_threads count, shared out

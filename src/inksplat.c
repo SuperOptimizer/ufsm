@@ -18,6 +18,7 @@
 #include "sysinfo.h"
 #include "imgops.h"
 #include "tiffw.h"
+#include "tiff.h"
 #include "json.h"
 #include "sources.h"
 #include "store.h"
@@ -88,6 +89,7 @@ typedef struct {
     int64_t shard[2], chunk[2]; int sharded, comp, fill;
     z2 *z; int lz;
     double um;                   /* pixel size from the parent OME group (zarr v3), 0 if unknown */
+    char *lazy; pthread_mutex_t *lmu; _Atomic int ready;   /* lsrc_open_lazy: a kind-1 TIFF decoded at its first read (lazy = its path) */
 } lsrc;
 static int ends_with(const char *s, const char *e) { size_t a = strlen(s), b = strlen(e); return a >= b && !strcasecmp(s + a - b, e); }
 static int lsrc_open(lsrc *L, const char *path, int lz, const char *cache) {
@@ -152,10 +154,33 @@ static int lsrc_open(lsrc *L, const char *path, int lz, const char *cache) {
 out:
     json_free(j); return rc;
 }
-static void lsrc_close(lsrc *L) { free(L->img); if (L->z) z2_close(L->z); if (L->s) store_close(L->s); }
+static void lsrc_close(lsrc *L) { free(L->img); if (L->z) z2_close(L->z); if (L->s) store_close(L->s); free(L->lazy); if (L->lmu) { pthread_mutex_destroy(L->lmu); free(L->lmu); } }
+/* the onfly sources' label rasters (2026-11-24): a uint8 TIFF's IFD only at the open (its size), the pixels at the first lsrc_read (R1E's
+   warm start spent 20 s of LZW decode and ~10 GB on rasters its cached indexes / chunks never read again); other kinds as lsrc_open */
+static int lsrc_open_lazy(lsrc *L, const char *path, int lz, const char *cache) {
+    const char *e = getenv("UFSM_INK_LAZY");
+    if ((e && !atoi(e)) || !(ends_with(path, ".tif") || ends_with(path, ".tiff"))) return lsrc_open(L, path, lz, cache);
+    memset(L, 0, sizeof *L);
+    tiff *t = tiff_open_lazy(path); tiff_page pg; const int ok = t && !tiff_page_info(t, 0, &pg) && pg.bits == 8 && pg.spp == 1; if (t) tiff_close(t);   /* (img_read_u8's checks) */
+    if (!ok) return lsrc_open(L, path, lz, cache);
+    L->kind = 1; L->W = pg.w; L->H = pg.h; L->lazy = strdup(path); L->lmu = malloc(sizeof *L->lmu);
+    if (!L->lazy || !L->lmu) { free(L->lazy); free(L->lmu); L->lazy = nullptr; L->lmu = nullptr; return lsrc_open(L, path, lz, cache); }
+    pthread_mutex_init(L->lmu, nullptr); return 0;
+}
+static int lsrc_ready(lsrc *L) {
+    if (!L->lazy || atomic_load_explicit(&L->ready, memory_order_acquire)) return 0;
+    pthread_mutex_lock(L->lmu); int rc = 0;
+    if (!atomic_load_explicit(&L->ready, memory_order_relaxed)) {
+        int w, h; uint8_t *im = img_read_u8(L->lazy, &w, &h);
+        if (!im || w != L->W || h != L->H) { fprintf(stderr, "ink-splat: cannot read %s (uint8 TIFF%s)\n", L->lazy, im ? ", its size changed since the open" : ""); free(im); rc = -1; }
+        else { L->img = im; atomic_store_explicit(&L->ready, 1, memory_order_release); }
+    }
+    pthread_mutex_unlock(L->lmu); return rc;
+}
 /* the box [r0, r0 + h) x [c0, c0 + w) (outside the raster: 0) */
 static int lsrc_read(lsrc *L, int64_t r0, int64_t c0, int64_t h, int64_t w, uint8_t *out, int nth) {
     memset(out, 0, (size_t)h * w);
+    if (L->kind == 1 && lsrc_ready(L)) return -1;
     if (L->kind == 1) {
         for (int64_t r = 0; r < h; r++) { const int64_t rr = r0 + r; if (rr < 0 || rr >= L->H) continue;
             for (int64_t c = 0; c < w; c++) { const int64_t cc = c0 + c; if (cc >= 0 && cc < L->W) out[(size_t)r * w + c] = L->img[(size_t)rr * L->W + cc]; } }
@@ -1154,9 +1179,10 @@ int cmd_ink_vscore(int argc, char **argv) {
 typedef struct { char tifxyz[1024], labels[1024], mask[1024]; int crop[4]; } inkfly_seg;
 typedef struct { int surf, lab, msk, val; int64_t lr0, lc0, lw, lh; int ntx, nty; double F; int lab01, msk01, val01; } ifunit;
 typedef struct { int32_t lo[3], hi[3]; uint32_t unit, tile; } iftile;
+typedef struct smesh smesh;   /* (the shared lazy meshes, below) */
 typedef struct {
     inksplat_cfg c; int L; double V, off, reach; int64_t shape[3]; z3 *base_ct; zcache *zc;   /* zc: decoded CT chunks shared by neighbouring chunks' boxes */
-    ssurf *S; int nS; char (*Spath)[1024];
+    smesh **Sm; int nS; char (*Spath)[1024];   /* (the shared lazy meshes: ifs(f, i)) */
     lsrc *Ls; int nL; char (*Lpath)[1024];
     ifunit *U; int nU;
     iftile *T; size_t nT;
@@ -1230,42 +1256,92 @@ static void ssurf_map(ssurf *s, const rmap *m) {
         s->X[i] = (float)f[0]; s->Y[i] = (float)f[1]; s->Z[i] = (float)f[2];
     }
 }
-/* The onfly meshes shared between ink sources: one load per (tifxyz, map) in the process, refcounted (R1E: 399 segment references to 204
-   meshes over its 57 sources; the coarse-scan pseudo sets reuse the same wraps, ~1 GB per set, the planner peak 59.6 GB). A mesh is
-   read-only once loaded (and mapped); inkfly_free releases its reference. */
-typedef struct { char key[2100]; ssurf s; int ref; } smesh;
-static pthread_mutex_t g_sm_mu = PTHREAD_MUTEX_INITIALIZER; static smesh *g_sm; static int g_sm_n, g_sm_cap;   /* mgpu: guarded (g_sm_mu) */
-static _Atomic uint64_t g_sm_shared, g_sm_bytes;   /* mgpu: guarded (atomics) */
-static int smesh_find(const char *key) { for (int i = 0; i < g_sm_n; i++) if (g_sm[i].ref > 0 && !strcmp(g_sm[i].key, key)) return i; return -1; }
-static int ssurf_get(ssurf *out, const char *tx, const char *mapkey, const rmap *map) {
+/* The onfly meshes shared between ink sources and loaded lazily (2026-11-24): one entry per (tifxyz, map) in the process, refcounted (R1E:
+   399 segment references to 204 meshes over its 57 sources, 15.4 GB of x / y / z planes). inkfly_open reads only the header (meta.json and
+   the planes' size: the label scale); the planes are decoded (and mapped) at the first use (ifs: an index or a chunk to compute, the MIL rays
+   without a cached list), so a launch on warm caches (index.bin, the draw cells, the derived chunks, the ray lists) decodes only the meshes
+   it computes on. Read-only once loaded. UFSM_INK_LAZY=0: every mesh decoded at the open (the old order). */
+struct smesh { char key[2100], dir[1024]; const rmap *map; ssurf s; int ref; _Atomic int loaded; pthread_mutex_t mu; };
+static pthread_mutex_t g_sm_mu = PTHREAD_MUTEX_INITIALIZER; static smesh **g_sm; static int g_sm_n, g_sm_cap;   /* mgpu: guarded (g_sm_mu) */
+static _Atomic uint64_t g_sm_shared, g_sm_bytes, g_sm_loads;   /* mgpu: guarded (atomics) */
+static int smesh_find(const char *key) { for (int i = 0; i < g_sm_n; i++) if (g_sm[i] && !strcmp(g_sm[i]->key, key)) return i; return -1; }
+/* meta.json + the planes' size, without the planes (an sfc-backed mesh); 1: not possible here (plain tifs), load it whole */
+static int ssurf_head(ssurf *s, const char *dir) {
+    memset(s, 0, sizeof *s);
+    if (!tfx_dims_hook) return 1;
+    const char *b = strrchr(dir, '/'); snprintf(s->name, sizeof s->name, "%s", b && b[1] ? b + 1 : dir);
+    { size_t l = strlen(s->name); while (l && s->name[l - 1] == '/') s->name[--l] = 0; }
+    char p[1400]; int w[3], h[3];
+    for (int k = 0; k < 3; k++) { snprintf(p, sizeof p, "%s/%c.tif", dir, "xyz"[k]);
+        if (!access(p, F_OK)) {   /* a plain float tif: its IFD only (img_read_f32's checks) */
+            tiff *t = tiff_open_lazy(p); tiff_page pg; const int ok = t && !tiff_page_info(t, 0, &pg) && pg.fmt == 3 && pg.bits == 32 && pg.spp == 1; if (t) tiff_close(t);
+            if (!ok) return 1; w[k] = pg.w; h[k] = pg.h; }
+        else if (tfx_dims_hook(p, &w[k], &h[k])) return 1; }
+    if (w[1] != w[0] || w[2] != w[0] || h[1] != h[0] || h[2] != h[0]) return 1;
+    snprintf(p, sizeof p, "%s/meta.json", dir);
+    FILE *f = tfx_meta_fopen(p); if (!f) { fprintf(stderr, "ink-splat: cannot read %s\n", p); return -1; }
+    char m[65536] = {0}; const size_t mn = fread(m, 1, sizeof m - 1, f); fclose(f);
+    json *j = json_parse(m, mn); if (!j) { fprintf(stderr, "ink-splat: bad %s\n", p); return -1; }
+    s->scale = json_num(json_at(json_get(j, "scale"), 0), 0); s->vox_um = json_num(json_get(j, "voxel_size_um"), 0);
+    json_free(j);
+    s->w = w[0]; s->h = h[0];
+    return s->w >= 2 && s->h >= 2 && s->scale > 0 ? 0 : -1;
+}
+static int smesh_body(smesh *m) {   /* the planes (once; concurrent callers wait) */
+    if (atomic_load_explicit(&m->loaded, memory_order_acquire)) return 0;
+    pthread_mutex_lock(&m->mu); int rc = 0;
+    if (!atomic_load_explicit(&m->loaded, memory_order_relaxed)) {
+        ssurf t; rc = ssurf_load(&t, m->dir);
+        if (!rc && m->s.w && (t.w != m->s.w || t.h != m->s.h || t.scale != m->s.scale || t.vox_um != m->s.vox_um)) { fprintf(stderr, "ink onfly: %s: the mesh changed since its header was read\n", m->dir); rc = -1; }
+        if (rc) ssurf_free(&t);
+        else { if (m->map) ssurf_map(&t, m->map); m->s = t; atomic_fetch_add(&g_sm_bytes, 3 * sizeof(float) * (uint64_t)t.w * t.h); atomic_fetch_add(&g_sm_loads, 1);
+               atomic_store_explicit(&m->loaded, 1, memory_order_release); }
+        if (tfx_release_hook) tfx_release_hook();   /* (the thread's decoded copy: a sampler worker would keep its last mesh twice) */
+    }
+    pthread_mutex_unlock(&m->mu); return rc;
+}
+static smesh *smesh_get(const char *tx, const char *mapkey, const rmap *map) {
     char key[2100]; snprintf(key, sizeof key, "%s|%s", tx, mapkey ? mapkey : "");
     pthread_mutex_lock(&g_sm_mu); int i = smesh_find(key);
-    if (i >= 0) { g_sm[i].ref++; *out = g_sm[i].s; pthread_mutex_unlock(&g_sm_mu); atomic_fetch_add(&g_sm_shared, 1); return 0; }
+    if (i >= 0) { smesh *m = g_sm[i]; m->ref++; pthread_mutex_unlock(&g_sm_mu); atomic_fetch_add(&g_sm_shared, 1); return m; }
     pthread_mutex_unlock(&g_sm_mu);
-    ssurf s; if (ssurf_load(&s, tx)) { ssurf_free(&s); return -1; }   /* (the load outside the lock: sources open in parallel) */
-    if (map) ssurf_map(&s, map);
+    smesh *m = calloc(1, sizeof *m); if (!m) return nullptr;
+    snprintf(m->key, sizeof m->key, "%s", key); snprintf(m->dir, sizeof m->dir, "%s", tx); m->map = map; m->ref = 1; pthread_mutex_init(&m->mu, nullptr);
+    const char *lz = getenv("UFSM_INK_LAZY"); const int hr = lz && !atoi(lz) ? 1 : ssurf_head(&m->s, tx);   /* (the header outside the lock: sources open in parallel) */
+    if (hr < 0 || (hr > 0 && smesh_body(m))) { ssurf_free(&m->s); pthread_mutex_destroy(&m->mu); free(m); return nullptr; }
+    if (hr > 0) { /* (loaded whole above) */ }
     pthread_mutex_lock(&g_sm_mu);
-    if ((i = smesh_find(key)) >= 0) { g_sm[i].ref++; *out = g_sm[i].s; pthread_mutex_unlock(&g_sm_mu); ssurf_free(&s); atomic_fetch_add(&g_sm_shared, 1); return 0; }   /* (a racing load won) */
-    for (i = 0; i < g_sm_n && g_sm[i].ref > 0; i++) {}
-    if (i == g_sm_n) { if (g_sm_n == g_sm_cap) { const int nc = g_sm_cap ? 2 * g_sm_cap : 64; smesh *w = realloc(g_sm, (size_t)nc * sizeof *w); if (!w) { pthread_mutex_unlock(&g_sm_mu); *out = s; return 0; } g_sm = w; g_sm_cap = nc; } g_sm_n++; }
-    snprintf(g_sm[i].key, sizeof g_sm[i].key, "%s", key); g_sm[i].s = s; g_sm[i].ref = 1; *out = s;
-    pthread_mutex_unlock(&g_sm_mu); atomic_fetch_add(&g_sm_bytes, 3 * sizeof(float) * (uint64_t)s.w * s.h);
-    return 0;
+    if ((i = smesh_find(key)) >= 0) { smesh *o = g_sm[i]; o->ref++; pthread_mutex_unlock(&g_sm_mu);   /* (a racing open won) */
+        if (atomic_load(&m->loaded)) { ssurf_free(&m->s); atomic_fetch_sub(&g_sm_bytes, 3 * sizeof(float) * (uint64_t)m->s.w * m->s.h); }
+        pthread_mutex_destroy(&m->mu); free(m); atomic_fetch_add(&g_sm_shared, 1); return o; }
+    for (i = 0; i < g_sm_n && g_sm[i]; i++) {}
+    if (i == g_sm_n) { if (g_sm_n == g_sm_cap) { const int nc = g_sm_cap ? 2 * g_sm_cap : 64; smesh **w = realloc(g_sm, (size_t)nc * sizeof *w);
+                           if (!w) { pthread_mutex_unlock(&g_sm_mu); return m; } g_sm = w; g_sm_cap = nc; } g_sm_n++; }   /* (not in the table: unshared) */
+    g_sm[i] = m; pthread_mutex_unlock(&g_sm_mu);
+    return m;
 }
-static void ssurf_put(ssurf *s) {
-    pthread_mutex_lock(&g_sm_mu); int hit = 0;
-    for (int i = 0; i < g_sm_n && !hit; i++) if (g_sm[i].ref > 0 && g_sm[i].s.X == s->X) { hit = 1; if (--g_sm[i].ref == 0) { ssurf_free(&g_sm[i].s); atomic_fetch_sub(&g_sm_bytes, 3 * sizeof(float) * (uint64_t)s->w * s->h); } }
+static void smesh_put(smesh *m) {
+    if (!m) return;
+    pthread_mutex_lock(&g_sm_mu); const int last = --m->ref == 0;
+    if (last) for (int i = 0; i < g_sm_n; i++) if (g_sm[i] == m) g_sm[i] = nullptr;
     pthread_mutex_unlock(&g_sm_mu);
-    if (!hit) ssurf_free(s);   /* (not in the table: a failed table grow) */
-    memset(s, 0, sizeof *s);
+    if (!last) return;
+    if (atomic_load(&m->loaded)) atomic_fetch_sub(&g_sm_bytes, 3 * sizeof(float) * (uint64_t)m->s.w * m->s.h);
+    ssurf_free(&m->s); pthread_mutex_destroy(&m->mu); free(m);
+}
+/* source f's mesh i, its planes loaded (a failure here: the mesh was readable at the open; fatal, never a silent empty mesh) */
+static const ssurf *ifs(const inkfly *f, int i) {
+    smesh *m = f->Sm[i];
+    if (!atomic_load_explicit(&m->loaded, memory_order_acquire) && smesh_body(m)) { fprintf(stderr, "ink onfly: cannot load the mesh %s (read at the open)\n", m->dir); exit(1); }
+    return &m->s;
 }
 /* inkfly_prewarm: the meshes (tifxyz, no map) of SEGS files decoded on nth workers into the shared table, each held by one extra reference
    until inkfly_prewarm_release (sources_load: before / after its serial per-source opens) */
-static ssurf *g_pw; static int g_pw_n;   /* mgpu: main (sources_load, before the per-GPU threads) */
-typedef struct { char (*tx)[1024]; int n; _Atomic int next; ssurf *out; } pw_job;
-static void *pw_worker(void *p) { pw_job *J = p; for (;;) { const int i = atomic_fetch_add(&J->next, 1); if (i >= J->n) break; if (ssurf_get(&J->out[i], J->tx[i], nullptr, nullptr)) memset(&J->out[i], 0, sizeof J->out[i]); } return nullptr; }
-int inkfly_prewarm(const char *const *segs, int nsegs, int nth) {
-    const char *e = getenv("UFSM_INK_PREWARM"); if (e && !atoi(e)) return 0;
+static smesh **g_pw; static int g_pw_n;   /* mgpu: main (sources_load, before the per-GPU threads) */
+typedef struct { char (*tx)[1024]; int n; _Atomic int next; smesh **out; } pw_job;
+static void *pw_worker(void *p) { pw_job *J = p; for (;;) { const int i = atomic_fetch_add(&J->next, 1); if (i >= J->n) break; J->out[i] = smesh_get(J->tx[i], nullptr, nullptr); if (J->out[i] && smesh_body(J->out[i])) { smesh_put(J->out[i]); J->out[i] = nullptr; } } return nullptr; }
+int inkfly_prewarm(const char *const *segs, int nsegs, int nth) {   /* (off by default since the lazy load: UFSM_INK_PREWARM=1, for launches that build the indexes) */
+    const char *e = getenv("UFSM_INK_PREWARM"); if (!e || !atoi(e)) return 0;
     int cap = 256, n = 0; char (*tx)[1024] = malloc((size_t)cap * sizeof *tx); if (!tx) return -1;
     for (int k = 0; k < nsegs; k++) {
         FILE *fp = fopen(segs[k], "rb"); if (!fp) continue;
@@ -1279,27 +1355,27 @@ int inkfly_prewarm(const char *const *segs, int nsegs, int nth) {
         json_free(j); free(txt);
     }
     if (nth <= 0) nth = ufsm_ncpu(); if (nth > 16) nth = 16; if (nth > n) nth = n;
-    pw_job J = {.tx = tx, .n = n, .out = calloc((size_t)(n ? n : 1), sizeof(ssurf))}; if (!J.out) { free(tx); return -1; }
+    pw_job J = {.tx = tx, .n = n, .out = calloc((size_t)(n ? n : 1), sizeof(smesh *))}; if (!J.out) { free(tx); return -1; }
     const double t0 = snow(); pthread_t th[16]; int st = 0;
     for (int t = 0; t < nth; t++) st += !pthread_create(&th[st], nullptr, pw_worker, &J);
     if (!st) pw_worker(&J);
     for (int t = 0; t < st; t++) pthread_join(th[t], nullptr);
-    uint64_t by = 0; int ok = 0; for (int i = 0; i < n; i++) if (J.out[i].X) { ok++; by += 3 * sizeof(float) * (uint64_t)J.out[i].w * J.out[i].h; }
+    uint64_t by = 0; int ok = 0; for (int i = 0; i < n; i++) if (J.out[i]) { ok++; by += 3 * sizeof(float) * (uint64_t)J.out[i]->s.w * J.out[i]->s.h; }
     fprintf(stderr, "ink onfly: %d meshes of %d segments files decoded in %.1f s on %d threads (%.2f GB; UFSM_INK_PREWARM=0: one by one as each source opens)\n", ok, nsegs, snow() - t0, st ? st : 1, by / 1e9);
     free(tx); inkfly_prewarm_release(); g_pw = J.out; g_pw_n = n;
     return 0;
 }
-void inkfly_prewarm_release(void) { for (int i = 0; i < g_pw_n; i++) if (g_pw[i].X) ssurf_put(&g_pw[i]); free(g_pw); g_pw = nullptr; g_pw_n = 0; }
-void inkfly_mesh_stats(uint64_t *shared, uint64_t *bytes) { *shared = atomic_load(&g_sm_shared); *bytes = atomic_load(&g_sm_bytes); }
+void inkfly_prewarm_release(void) { for (int i = 0; i < g_pw_n; i++) smesh_put(g_pw[i]); free(g_pw); g_pw = nullptr; g_pw_n = 0; }
+void inkfly_mesh_stats(uint64_t *shared, uint64_t *bytes, uint64_t *loads) { *shared = atomic_load(&g_sm_shared); *bytes = atomic_load(&g_sm_bytes); *loads = atomic_load(&g_sm_loads); }
 static int inkfly_find(char (*paths)[1024], int n, const char *p) { for (int i = 0; i < n; i++) if (!strcmp(paths[i], p)) return i; return -1; }
 static void inkfly_free(void *p) {
     inkfly *f = p; if (!f) return;
     if (f->zc) zcache_drop(f->zc, f->base_ct);   /* (the shared ink CT cache outlives this source) */
-    for (int i = 0; i < f->nS; i++) ssurf_put(&f->S[i]);
+    for (int i = 0; i < f->nS; i++) smesh_put(f->Sm[i]);
     for (int i = 0; i < f->nL; i++) lsrc_close(&f->Ls[i]);
     if (f->rf_map) munmap(f->rf_map, f->rf_len);
     if (f->rl_map) munmap(f->rl_map, f->rl_len);
-    free(f->S); free(f->Spath); free(f->Ls); free(f->Lpath); free(f->U); free(f->T); free(f->gstart); free(f->glist); free(f);
+    free(f->Sm); free(f->Spath); free(f->Ls); free(f->Lpath); free(f->U); free(f->T); free(f->gstart); free(f->glist); free(f);
 }
 static int box_hit(const int32_t lo[3], const int32_t hi[3], const int64_t a[3], const int64_t b[3]) {   /* [lo, hi] vs [a, b) */
     for (int d = 0; d < 3; d++) if (hi[d] < a[d] || lo[d] >= b[d]) return 0;
@@ -1340,7 +1416,7 @@ static int inkfly_chunk_gpu(inkfly *f, const int64_t o[3], const int64_t n[3], c
         if (!lab || lsrc_read(&f->Ls[u->lab], u->lr0 + rr0, u->lc0 + rc0, h->rh, h->rw, lab, 1) || ifu_mask(f, u, rr0, rc0, h->rh, h->rw, &msk)) goto done;
         h->msk = msk;
         if (u->lab01) for (size_t k = 0; k < (size_t)h->rh * h->rw; k++) lab[k] *= 255;
-        const ssurf *S = &f->S[u->surf];
+        const ssurf *S = ifs(f, u->surf);
         geo G = {0}; G.c = c; G.S = S; G.F = u->F; G.lw = h->rw; G.lh = h->rh; G.lr0 = u->lr0 + rr0; G.lc0 = u->lc0 + rc0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
         double gu0, gv0, gu1, gv1; px_grid(&G, -1.0, -1.0, &gu0, &gv0); px_grid(&G, (double)h->rh, (double)h->rw, &gu1, &gv1);   /* the rectangle +- 1 px (sub-samples reach 0.5) */
         int pu0 = (int)floor(gu0) - 1, pv0 = (int)floor(gv0) - 1, pu1 = (int)ceil(gu1) + 2, pv1 = (int)ceil(gv1) + 2;
@@ -1462,7 +1538,7 @@ static int inkfly_chunk(inkfly *f, const int64_t o[3], const int64_t n[3], uint8
         g->lab = malloc((size_t)g->rh * g->rw);
         if (!g->lab || lsrc_read(&f->Ls[u->lab], u->lr0 + rr0, u->lc0 + rc0, g->rh, g->rw, g->lab, 1) || ifu_mask(f, u, rr0, rc0, g->rh, g->rw, &g->msk)) goto done;
         if (u->lab01) for (size_t k = 0; k < (size_t)g->rh * g->rw; k++) g->lab[k] *= 255;
-        geo G = {0}; G.c = c; G.S = &f->S[u->surf]; G.F = u->F; G.lab = g->lab; G.msk = g->msk; G.lw = g->rw; G.lh = g->rh;
+        geo G = {0}; G.c = c; G.S = ifs(f, u->surf); G.F = u->F; G.lab = g->lab; G.msk = g->msk; G.lw = g->rw; G.lh = g->rh;
         G.lr0 = u->lr0 + rr0; G.lc0 = u->lc0 + rc0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
         size_t pcap = 1024; g->pk = malloc(pcap * sizeof *g->pk); g->PN = malloc(pcap * 6 * sizeof *g->PN);
         for (size_t q = q0; q < q1; q++) {
@@ -1495,7 +1571,7 @@ static int inkfly_chunk(inkfly *f, const int64_t o[3], const int64_t n[3], uint8
     const double hpx0 = 0.45 * V;
     for (size_t gi = 0; gi < ng; gi++) {
         ugrp *g = &UG[gi]; const ifunit *u = g->u; if (!g->np) continue;
-        geo G = {0}; G.c = c; G.S = &f->S[u->surf]; G.F = u->F; G.sign = c->flip ? -1 : 1; G.lab = g->lab; G.msk = g->msk; G.lw = g->rw; G.lh = g->rh;
+        geo G = {0}; G.c = c; G.S = ifs(f, u->surf); G.F = u->F; G.sign = c->flip ? -1 : 1; G.lab = g->lab; G.msk = g->msk; G.lw = g->rw; G.lh = g->rh;
         G.lr0 = u->lr0 + g->rr0; G.lc0 = u->lc0 + g->rc0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
         double hpx = hpx0 / u->F; if (hpx > 1) hpx = 1; const int nsub = (int)ceil(1 / hpx);
         const double span = c->face_b - c->face_a; const int nt = (int)ceil(span / (0.45 * V)) + 1; const double tstep = nt > 1 ? span / (nt - 1) : 0;
@@ -1667,7 +1743,7 @@ typedef struct { inkfly *f; const inksplat_cfg *cfg; iftile **tl; size_t *ntl; _
 static void *ifidx_worker(void *p) {
     ifidx *J = p; inkfly *f = J->f; const inksplat_cfg *cfg = J->cfg;
     for (int i; (i = atomic_fetch_add(&J->next, 1)) < f->nU && !atomic_load(&J->failed);) {
-        ifunit *u = &f->U[i]; const ssurf *S = &f->S[u->surf];
+        ifunit *u = &f->U[i]; const ssurf *S = ifs(f, u->surf);
         uint8_t *lab = malloc((size_t)u->lw * u->lh), *msk = u->msk >= 0 ? malloc((size_t)u->lw * u->lh) : nullptr;
         if (!lab || (u->msk >= 0 && !msk) || lsrc_read(&f->Ls[u->lab], u->lr0, u->lc0, u->lh, u->lw, lab, 1) || (msk && lsrc_read(&f->Ls[u->msk], u->lr0, u->lc0, u->lh, u->lw, msk, 1))) {
             free(lab); free(msk); atomic_store(&J->failed, 1); break; }
@@ -1737,19 +1813,19 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
     inkfly *f = calloc(1, sizeof *f); f->c = *cfg; f->ncx = cfg->nexcl; memcpy(f->cx, cfg->excl, sizeof f->cx); if (cfg->excl_cells_only) f->c.nexcl = 0; f->L = cfg->level; f->V = (double)(1 << f->L); f->off = (f->V - 1) / 2; f->base_ct = ct;
     memcpy(f->shape, z3_meta_of(ct)->shape, sizeof f->shape);
     f->reach = fmax(fmax(fabs(cfg->face_lo), fabs(cfg->face_hi)) + 1, fmax(fabs(cfg->face_lo + cfg->face_a), fabs(cfg->face_hi + cfg->face_b)));
-    const int nseg = (int)sg->n; f->S = calloc(nseg, sizeof *f->S); f->Spath = calloc(nseg, sizeof *f->Spath); f->Ls = calloc(3 * nseg, sizeof *f->Ls); f->Lpath = calloc(3 * nseg, sizeof *f->Lpath); f->U = calloc(nseg, sizeof *f->U);
+    const int nseg = (int)sg->n; f->Sm = calloc(nseg, sizeof *f->Sm); f->Spath = calloc(nseg, sizeof *f->Spath); f->Ls = calloc(3 * nseg, sizeof *f->Ls); f->Lpath = calloc(3 * nseg, sizeof *f->Lpath); f->U = calloc(nseg, sizeof *f->U);
     f->T = nullptr;
     for (int i = 0; i < nseg; i++) {
         const json *e = json_at(sg, (size_t)i); const char *tx = json_str(json_get(e, "tifxyz"), nullptr), *lb = json_str(json_get(e, "labels"), nullptr), *mk = json_str(json_get(e, "mask"), nullptr);
         if (!tx || !lb) { fprintf(stderr, "ink onfly: segment %d: need tifxyz and labels\n", i); goto fail; }
         ifunit *u = &f->U[f->nU];
-        if ((u->surf = inkfly_find(f->Spath, f->nS, tx)) < 0) { if (ssurf_get(&f->S[f->nS], tx, map ? cfg->map : nullptr, map)) goto fail; snprintf(f->Spath[f->nS], 1024, "%s", tx); u->surf = f->nS++; }
-        if ((u->lab = inkfly_find(f->Lpath, f->nL, lb)) < 0) { if (lsrc_open(&f->Ls[f->nL], lb, -1, cfg->cache)) goto fail; snprintf(f->Lpath[f->nL], 1024, "%s", lb); u->lab = f->nL++; }
+        if ((u->surf = inkfly_find(f->Spath, f->nS, tx)) < 0) { if (!(f->Sm[f->nS] = smesh_get(tx, map ? cfg->map : nullptr, map))) goto fail; snprintf(f->Spath[f->nS], 1024, "%s", tx); u->surf = f->nS++; }
+        if ((u->lab = inkfly_find(f->Lpath, f->nL, lb)) < 0) { if (lsrc_open_lazy(&f->Ls[f->nL], lb, -1, cfg->cache)) goto fail; snprintf(f->Lpath[f->nL], 1024, "%s", lb); u->lab = f->nL++; }
         u->msk = -1; u->val = -1;
-        if (mk && (u->msk = inkfly_find(f->Lpath, f->nL, mk)) < 0) { if (lsrc_open(&f->Ls[f->nL], mk, -1, cfg->cache)) goto fail; snprintf(f->Lpath[f->nL], 1024, "%s", mk); u->msk = f->nL++; }
+        if (mk && (u->msk = inkfly_find(f->Lpath, f->nL, mk)) < 0) { if (lsrc_open_lazy(&f->Ls[f->nL], mk, -1, cfg->cache)) goto fail; snprintf(f->Lpath[f->nL], 1024, "%s", mk); u->msk = f->nL++; }
         const char *vl = cfg->val_mode ? json_str(json_get(e, "validation"), nullptr) : nullptr;
-        if (vl && (u->val = inkfly_find(f->Lpath, f->nL, vl)) < 0) { if (lsrc_open(&f->Ls[f->nL], vl, -1, cfg->cache)) goto fail; snprintf(f->Lpath[f->nL], 1024, "%s", vl); u->val = f->nL++; }
-        const ssurf *S = &f->S[u->surf]; const lsrc *LL = &f->Ls[u->lab];
+        if (vl && (u->val = inkfly_find(f->Lpath, f->nL, vl)) < 0) { if (lsrc_open_lazy(&f->Ls[f->nL], vl, -1, cfg->cache)) goto fail; snprintf(f->Lpath[f->nL], 1024, "%s", vl); u->val = f->nL++; }
+        const ssurf *S = &f->Sm[u->surf]->s; const lsrc *LL = &f->Ls[u->lab];   /* (the header: size, scale, voxel size) */
         /* the label scale exactly as inksplat_run */
         double F = cfg->label_scale; const double ew = S->w / S->scale, eh = S->h / S->scale;
         if (!(F > 0)) { F = 0.5 * (ew / (double)LL->W + eh / (double)LL->H); const double p2 = pow(2, round(log2(F))); if (fabs(F - p2) < 0.002 * p2) F = p2;
@@ -2012,7 +2088,7 @@ static int tile_px_s(inkfly *f, size_t t, cpx **X, size_t *np, size_t *cap, doub
     uint8_t *lab = malloc((size_t)rh * rw), *msk = nullptr;
     if (!lab || lsrc_read(&f->Ls[u->lab], u->lr0 + r0, u->lc0 + c0, rh, rw, lab, 1) || ifu_mask(f, u, r0, c0, rh, rw, &msk)) { free(lab); free(msk); return -1; }
     if (u->lab01) for (size_t k = 0; k < (size_t)rh * rw; k++) lab[k] *= 255;
-    geo G = {0}; G.c = c; G.S = &f->S[u->surf]; G.F = u->F; G.lab = lab; G.msk = msk; G.lw = rw; G.lh = rh; G.lr0 = u->lr0 + r0; G.lc0 = u->lc0 + c0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
+    geo G = {0}; G.c = c; G.S = ifs(f, u->surf); G.F = u->F; G.lab = lab; G.msk = msk; G.lw = rw; G.lh = rh; G.lr0 = u->lr0 + r0; G.lc0 = u->lc0 + c0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
     for (int64_t r = 0; r < rh; r++) for (int64_t cc = 0; cc < rw; cc++) {
         if ((u->lr0 + r0 + r) % su || (u->lc0 + c0 + cc) % su) continue;
         if (!px_sup(&G, r, cc)) continue;
@@ -2452,7 +2528,7 @@ static int inkfly_rays_x(void *handle, const int64_t o[3], const int64_t n[3], i
         uint8_t *lab = malloc((size_t)rh * rw), *msk = nullptr;
         if (!lab || lsrc_read(&f->Ls[u->lab], u->lr0 + rr0, u->lc0 + rc0, rh, rw, lab, 1) || ifu_mask(f, u, rr0, rc0, rh, rw, &msk)) { free(lab); goto done; }
         if (u->lab01) for (size_t k = 0; k < (size_t)rh * rw; k++) lab[k] *= 255;
-        geo G = {0}; G.c = c; G.S = &f->S[u->surf]; G.F = u->F; G.lab = lab; G.msk = msk; G.lw = rw; G.lh = rh; G.lr0 = u->lr0 + rr0; G.lc0 = u->lc0 + rc0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
+        geo G = {0}; G.c = c; G.S = ifs(f, u->surf); G.F = u->F; G.lab = lab; G.msk = msk; G.lw = rw; G.lh = rh; G.lr0 = u->lr0 + rr0; G.lc0 = u->lc0 + rc0; G.offr = c->label_off[0]; G.offc = c->label_off[1];
         for (size_t q = q0; q < q1; q++) {
             const int t = (int)f->T[cand[q]].tile, tx = t % u->ntx, ty = t / u->ntx;
             const int64_t r0 = (int64_t)ty * TS, c0 = (int64_t)tx * TS, r1 = r0 + TS < u->lh ? r0 + TS : u->lh, c1 = c0 + TS < u->lw ? c0 + TS : u->lw;

@@ -144,6 +144,8 @@ int tifxyz_write(const char *dir, int w, int h, const float *x, const float *y, 
 
 float *(*tfx_axis_hook)(const char *, int *, int *) = nullptr;
 char *(*tfx_meta_hook)(const char *) = nullptr;
+int (*tfx_dims_hook)(const char *, int *, int *) = nullptr;
+void (*tfx_release_hook)(void) = nullptr;
 int (*tfx_write_hook)(const char *, int, int, const float *, const float *, const float *, const char *, double) = nullptr;
 static double g_sfc_err = 0;   /* the tentative definition above */
 void tifxyz_set_sfc(double err) { g_sfc_err = err; }

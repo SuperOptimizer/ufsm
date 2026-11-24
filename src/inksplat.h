@@ -95,8 +95,8 @@ int inkfly_map_coarse(const char *map, char *key, size_t nkey, double *um);
 int inkfly_map_boxes(const char *map, int64_t (*b)[6], int nb, double pad);
 size_t inkfly_cache_bytes(size_t *ct_bytes);
 int inkfly_cells(void *handle, int lev, const int64_t shape[3], uint8_t *bits);
-/* the onfly meshes shared between ink sources: loads served from another source's copy, bytes resident (x, y, z float planes) */
-void inkfly_mesh_stats(uint64_t *shared, uint64_t *bytes);
+/* the onfly meshes (shared between ink sources, decoded lazily): opens served from the table, bytes resident (x, y, z float planes), decodes */
+void inkfly_mesh_stats(uint64_t *shared, uint64_t *bytes, uint64_t *loads);
 /* the meshes (map-less tifxyz) of the given SEGS files decoded on nth workers (0: the CPUs) into the shared table, held until inkfly_prewarm_release */
 int inkfly_prewarm(const char *const *segs, int nsegs, int nth);
 void inkfly_prewarm_release(void);

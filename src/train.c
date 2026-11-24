@@ -4238,6 +4238,17 @@ int cmd_train(int argc, char **argv) {
                                                     (unsigned long long)ha_win, (unsigned long long)ha_hit, (unsigned long long)ha_vox, (unsigned long long)ha_known, ha_known ? "LEAK" : "ok");
                 if (ufsm_env_on("UFSM_SAMPLER_EMPTY") && b->ct8 && !b->use) empty_tiles_report(b, B, g_Pz, P, S);
                 if (step_ms > 0) usleep((useconds_t)step_ms * 1000);
+                {   /* UFSM_SAMPLER_HASH=1 (A/B identity, with --det 1): per batch an FNV-1a of each window's source, level, corner, CT bytes and ink plane */
+                    static int hs = -1; if (hs < 0) hs = ufsm_env_on("UFSM_SAMPLER_HASH");   /* mgpu: env */
+                    if (hs && !b->use) { const size_t nv = (size_t)g_Pz * P * P; uint64_t h = 1469598103934665603ull;
+                        for (int n = 0; n < B; n++) {
+                            const int64_t hd[5] = {b->src[n], b->level ? b->level[n] : -1, b->corner[n][0], b->corner[n][1], b->corner[n][2]};
+                            for (size_t k = 0; k < sizeof hd; k++) h = (h ^ ((const uint8_t *)hd)[k]) * 1099511628211ull;
+                            if (b->ct8) for (size_t v = 0; v < nv; v++) h = (h ^ b->ct8[n * nv + v]) * 1099511628211ull;
+                            const uint8_t *ip = g_ink2 && g_aux_of[AUX_INK] >= 0 ? AUXH(b, g_aux_of[AUX_INK]) : nullptr;
+                            if (ip) for (size_t v = 0; v < nv; v++) h = (h ^ ip[n * nv + v]) * 1099511628211ull; }
+                        fprintf(stderr, "sampler-only hash: batch %d %016llx\n", i, (unsigned long long)h); }
+                }
                 sampler_release(sq, b);
                 if ((i + 1) % 10 == 0 || i + 1 == nb) { const double dt = now() - t0 - tf; uint64_t fe, ee; sampler_echo_stats(sq, &fe, &ee);
                     fprintf(stderr, "sampler-only: %d batches, %.1f s (first %.1f s), %.1f Mvox/s after the first", i + 1, now() - t0, tf, i > 0 ? (double)i * B * g_Pz * P * P / 1e6 / dt : 0.);

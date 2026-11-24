@@ -52,11 +52,27 @@ static float *tfx_axis(const char *tifpath, int *w, int *h) {
     for (size_t i = 0; i < n; i++) a[i] = g_c.valid[i] ? g_c.xyz[3 * i + k] : -1.f;
     *w = g_c.w; *h = g_c.h; return a;
 }
-static char *tfx_meta(const char *metapath) {
+static char *tfx_meta(const char *metapath) {   /* (the header only: the metadata block without decoding the surface; the same string) */
     char sfc[1400]; const char *leaf;
-    if (!tfx_resolve(metapath, sfc, sizeof sfc, &leaf) || (strcmp(leaf, "meta.json") && strcmp(leaf, "x.tif")) || tfx_load(sfc)) return nullptr;
-    return strdup(g_c.meta ? g_c.meta : "{}");
+    if (!tfx_resolve(metapath, sfc, sizeof sfc, &leaf) || (strcmp(leaf, "meta.json") && strcmp(leaf, "x.tif"))) return nullptr;
+    if (!strcmp(g_c.path, sfc) && g_c.xyz) return strdup(g_c.meta ? g_c.meta : "{}");
+    sfc_reader *r = nullptr; if (sfc_open_file(sfc, &r)) return nullptr;
+    const uint64_t ml = sfc_metadata_size(r); char *meta = malloc(ml + 1);
+    if (!meta || (ml && sfc_read_metadata(r, meta, ml))) { free(meta); sfc_close(r); return nullptr; }
+    sfc_close(r); meta[ml] = 0;
+    return meta;
 }
+/* the x / y / z plane's size without decoding (tiffw.h tfx_dims_hook); 0 ok */
+static int tfx_dims(const char *tifpath, int *w, int *h) {
+    char sfc[1400]; const char *leaf;
+    if (!tfx_resolve(tifpath, sfc, sizeof sfc, &leaf) || (strcmp(leaf, "x.tif") && strcmp(leaf, "y.tif") && strcmp(leaf, "z.tif"))) return -1;
+    sfc_reader *r = nullptr; if (sfc_open_file(sfc, &r)) return -1;
+    int cx = sfc_find_channel(r, "x"); if (cx < 0) cx = 0;
+    const sfc_channel *c = sfc_channel_info(r, (uint32_t)cx); const int ok = c != nullptr;
+    if (ok) { *w = (int)c->width; *h = (int)c->height; }
+    sfc_close(r); return ok ? 0 : -1;
+}
+static void tfx_release(void) { free(g_c.xyz); free(g_c.valid); free(g_c.meta); memset(&g_c, 0, sizeof g_c); }   /* (this thread's decoded surface) */
 /* the threaded joint-XYZ writer (src/tiffw.h tfx_sfc_write): persistent workers claim patches in file order and fill + encode each
    into a ring slot (with its index entries' value ranges and CRC); the worker that completes the next patch in file order appends it
    and every completed one after it (under the lock: appends are strictly in patch order). Workers run up to a ring ahead of the
@@ -163,4 +179,4 @@ static int tfx_write(const char *sfcpath, int w, int h, const float *x, const fl
     tfx_grid G = {w, h, x, y, z};
     return tfx_sfc_write(sfcpath, w, h, err, meta, tfx_fill_grid, &G, 0);
 }
-__attribute__((constructor)) static void tfx_install(void) { tfx_axis_hook = tfx_axis; tfx_meta_hook = tfx_meta; tfx_write_hook = tfx_write; }
+__attribute__((constructor)) static void tfx_install(void) { tfx_axis_hook = tfx_axis; tfx_meta_hook = tfx_meta; tfx_write_hook = tfx_write; tfx_dims_hook = tfx_dims; tfx_release_hook = tfx_release; }
