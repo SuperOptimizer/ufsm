@@ -374,6 +374,7 @@ test_split_lat~gfilm                           | gpu          |    15 | UFSM_TES
 test_split_gnbwd                               | gpu,smoke    |     2 | ./$B/test_split_gnbwd
 test_formats                                   | smoke        |     1 | ./tests/test_formats.sh
 test_pyramid_rel                               |              |     1 | ./$B/test_pyramid_rel $TMPDIR/pyramid_rel
+test_ct_zslabs                                 |              |     1 | ./$B/test_ct_zslabs $TMPDIR/ct_zslabs
 test_zarr                                      | smoke        |     1 | ./tests/test_zarr.sh
 test_predict_feather                           | gpu          |    10 | ./$B/test_predict_feather ./$B/ufsm
 test_predict_det                               | gpu          |    11 | ./$B/test_predict_det ./$B/ufsm
