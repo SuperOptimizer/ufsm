@@ -4122,6 +4122,7 @@ static occ_index label_occupancy(source *s) {
                 if (!occ_cache_load(ocd, ock, &c) && c.lev == lc && c.shape[0] == mc->shape[0] && c.shape[1] == mc->shape[1] && c.shape[2] == mc->shape[2]) {
                     free(bits); o = c;
                     fprintf(stderr, "sampler: %s: %zu level-%d draw cells from the occupancy cache (stored target chunks unchanged)\n", s->name, o.n, lc);
+                    fprintf(stderr, "sampler: %s: %zu of %zu level-%d CT cells hold papyrus inside the stored target chunks (the draw cells)\n", s->name, o.n, tot, lc);   /* (the computed path's line) */
                     continue; }
                 free(c.idx); free(c.pidx);
             }

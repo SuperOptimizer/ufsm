@@ -48,4 +48,7 @@ for s in fibonly fibmix; do
   ok $s.log '^step      6 .* fib bce [0-9]\.[0-9]*' "$s: fibre losses"
 done
 grep '^step' fibmix.log | grep -Eq 'phase bce ([1-9]|0\.[1-9])' || { echo "FAIL: fibmix: no winding windows"; exit 1; }
+# the draw cells: fibmix (the occupancy cache's stored-target entry, or computed) = fibonly's (2026-11-24: a cache hit printed another line)
+c1=$(grep -o 'fib-only: [0-9]* of [0-9]* level-[0-9] CT cells hold papyrus' fibonly.log | head -1); c2=$(grep -o 'fib-only: [0-9]* of [0-9]* level-[0-9] CT cells hold papyrus' fibmix.log | head -1)
+[ -n "$c1" ] && [ "$c1" = "$c2" ] || { echo "FAIL: fibre-only draw cells differ between the runs: '$c1' vs '$c2'"; exit 1; }
 echo "test_fibhead_train: ok"
