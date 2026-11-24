@@ -6,6 +6,33 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Trainer start-up: 1876 s -> 98 s cold, ~37 s warm (R1E's 57 ink sources; 2026-11-24, perf)
+
+R1E, R1E-D and R11d each spent ~30 min before step 10 (R1E: `startup: 1875.7 s`: sources 77.0 s, sampler start 1796.6 s), and their CPU
+sampler-only pre-launch checks paid it again. Reproduced CPU-only (`UFSM_SAMPLER_ONLY=20 CUDA_VISIBLE_DEVICES=` on R1E.argv, dev slice, 6
+threads), each source's draw-cell build timed (new `sampler: S: draw cells in T s: tile boxes, supervised pixels, level-5 CT read, scan` line):
+
+| cost (R1E sources) | measured | fix |
+|---|---|---|
+| `inkfly_rays` over the whole scan (inkfly_cells_sup): the candidate tiles de-duplicated by a linear scan of the list and insertion-sorted, both O(n^2) | Paris 4 human (363 k tiles) 40 s; the 0.5-1 M-tile R1ET teacher sets minutes each (perf: 99.7 % inkfly_rays) | `ifly_cands`: sort by tile + unique, sort by (unit, tile, first meeting): the same list in O(n log n); also inkfly_chunk's per-window list |
+| the whole-scan ray list (inkfly_cells_sup): every supervised pixel at stride 8 as cpx (72 B) + inkray (48 B) | several GB per large source; 6 in parallel OOM'd the 36 GB cap | each ray marked into the cell grid as it is made (`ifmark`), mode 0 collects no pixels |
+| the level-5 CT read whole and scanned twice per source (0139: 1.65e9 cells, 6 sources of it) | 1-6 s per source, 1.65 GB each | `occ_scan_chunks`: only the 128^3 chunks under a set bit, cells sorted back to raster order |
+| the 57 sources one after another | 279 s summed | `sources_occupancy_all`: UFSM_OCC_THREADS workers (default the CPUs, <= 8) |
+| mesh decode (surfcomp, single thread), each source its own copy | 70 s of the 77 s "sources" | meshes in a refcounted process table (one per tifxyz) + `inkfly_prewarm` decodes all 204 on the CPUs first: 10.6 s on 6 threads |
+| the draw cells recomputed every launch | -- | trainperf's UOC2 draw-cell cache (drawcache-20261120, merged here): warm sampler start 4 s |
+
+| R1E sampler-only (6 CPUs) | sources | sampler start | total | peak RSS |
+|---|---|---|---|---|
+| R1E trainer log (old, 32 CPUs) | 77 s | 1797 s | 1876 s | (planner 59.6 GB) |
+| cold, all fixes | 32.8 s | 65 s | 98 s | 34.8 GB |
+| warm (draw-cell cache) | ~33 s | 4 s | ~37 s | 28.2 GB |
+
+Identity: the 171 per-source draw-cell count lines equal the R1E log's (old binary 204a0dce) on all 57 sources; `UFSM_OCC_SCAN=check` (chunked
+vs whole-CT scan, idx and positive lists memcmp) identical on all 57; `UFSM_IFLY_CANDS_CHECK=1` (the old quadratic list as reference, lists up
+to 200 k entries) silent on the run and set in test_ink_splat; test_ink_splat checks inkfly_cells_sup against the ray list marked afterwards
+(strides 1-2, levels 1-3); test_ink_mil_train / test_fibre_onfly run with UFSM_OCC_SCAN=check. Meshes: 15.44 GB resident for R1E
+(60 duplicate loads saved, ~4.5 GB); the rest of the resident set is the per-source label sources and indexes (next).
+
 ## HF ink labels (vincentl065/herculaneum-ink-labels) on our meshes: 10.8k mm² of new sure ink, Scroll 5 added (2026-11-23, hfink)
 
 The public 2-D set: 2218 crops at 9.362 µm/px (0 bg / 1 ink / 2 ignore / 255 outside, styles A-E), each on "its segment's 9.362 µm grid".
