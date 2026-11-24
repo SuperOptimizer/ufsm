@@ -454,8 +454,9 @@ int cmd_ink3d_ext(int argc, char **argv) {
     store *st = store_open(root); C.ct = st ? z3_open(st, key, opt(argc, argv, "--cache", nullptr)) : nullptr;
     if (!C.ct) { fprintf(stderr, "ink3d-ext: %s %s: %s\n", root, key, z3_error()); return 1; }
     C.l1 = opt_atoi("--ct-l1", opt(argc, argv, "--ct-l1", "0"));   /* KEY is level 1 (4.8 um: the network's own input scale); box still in level-0 voxels */
-    C.fast = opt_atoi("--fast", opt(argc, argv, "--fast", "0"));
-    C.gprep = opt_atoi("--gpu-prep", opt(argc, argv, "--gpu-prep", "1"));   /* the published-exact path's crop prep on the GPU (byte-identical; 0: the CPU threads) */   /* level-1 input on an aligned grid, prep on the GPU (gambiarra) */
+    C.fast = opt_atoi("--fast", opt(argc, argv, "--fast", "0"));   /* level-1 input on an aligned grid, prep on the GPU (gambiarra) */
+    C.gprep = opt_atoi("--gpu-prep", opt(argc, argv, "--gpu-prep", "0"));   /* 1: the published-exact path's crop prep on the GPU (byte-identical); off until it
+                                                                                 measures faster (11-24 small box: prep 3.4 s vs 1.0 s on the CPU threads) */
     C.T = opt_atoi("--tile", opt(argc, argv, "--tile", "64"));   /* --fast: crop edge at 4.8 um (64 = the published one) */
     if (C.fast && (G.pool_in != 2 || G.out != 64 || stride % 16 || C.T % 16 || C.T < 64 || C.T > 256 || stride > C.T)) { fprintf(stderr, "ink3d-ext: --fast needs gambiarra, --tile 64..256 and --stride <= tile, multiples of 16\n"); return 2; }
     if (C.fast && C.T != 64) { gb_set_tile(net, C.T); G.out = C.T; C.R = 2 * C.T; }
