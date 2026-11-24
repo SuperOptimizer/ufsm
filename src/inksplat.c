@@ -3296,3 +3296,127 @@ int cmd_ink_audit(int argc, char **argv) {
     free(A); free(blk); z3_close(ct); if (pi >= 0) { if (pv.a) z3_close(pv.a); if (pv.b) z2_close(pv.b); }
     return 0;
 }
+
+/* ufsm ink-devcrops (inksdk 11-24, lead: the 8.6-9.4 um dev set): the scoring crops of a held-out region, in the clean crops' layout
+   (cleanscore / surfscore: tifxyz at scale 0.25 = 4 canvas px per cell, labels.tif / mask.tif 0 / 255 on that canvas, crop.json,
+   crops.tsv). The canvas is the mesh's own (1 / scale px per cell; ~1 native voxel per px for every coarse set we hold), cut into
+   WIN x WIN windows; a window touching a --box (level-0, the held-out core, the guard margin excluded) scores only its cells whose four
+   vertices lie inside that box (the rest masked out), and is kept when >= --min-sup of its px are supervised there with >= --min-ink
+   ink and non-ink px. Labels per canvas px
+   nearest from the raster through the segment's label scale F (inkfly_open's rule: label_scale, else the raster / mesh extent ratio) and
+   its "crop" window; the raster's 0/1 form (max over the crop window 1) read as 0/255; ink = label >= 128; mask = mask >= 128, inside
+   the crop window, on a valid cell. */
+static int dc_bil(const ssurf *S, double gu, double gv, float out[3]) {
+    if (gu < 0 || gv < 0 || gu > S->w - 1 || gv > S->h - 1) return 0;
+    int c0 = (int)gu, r0 = (int)gv; if (c0 >= S->w - 1) c0 = S->w - 2; if (r0 >= S->h - 1) r0 = S->h - 2;
+    const double fu = gu - c0, fv = gv - r0; const size_t i00 = (size_t)r0 * S->w + c0, i01 = i00 + 1, i10 = i00 + S->w, i11 = i10 + 1;
+    if (S->Z[i00] < 0 || S->Z[i01] < 0 || S->Z[i10] < 0 || S->Z[i11] < 0) return 0;
+    const float *A[3] = {S->X, S->Y, S->Z};
+    for (int d = 0; d < 3; d++) out[d] = (float)((1 - fv) * ((1 - fu) * A[d][i00] + fu * A[d][i01]) + fv * ((1 - fu) * A[d][i10] + fu * A[d][i11]));
+    return 1;
+}
+int cmd_ink_devcrops(int argc, char **argv) {
+    const char *out = sopt(argc, argv, "--out", nullptr), *key = sopt(argc, argv, "--ct-key", nullptr), *scroll = sopt(argc, argv, "--scroll", "-"), *tag = sopt(argc, argv, "--tag", "dev");
+    const int WIN = opt_atoi("--win", sopt(argc, argv, "--win", "256")), mink = opt_atoi("--min-ink", sopt(argc, argv, "--min-ink", "200"));
+    const double minsup = opt_atof("--min-sup", sopt(argc, argv, "--min-sup", "0.2")), um = opt_atof("--um", sopt(argc, argv, "--um", "0"));
+    static int64_t box[64][6]; int nb = 0;   /* mgpu: main (ink-devcrops, one thread) */
+    for (int i = 2; i + 1 < argc; i++) { if (strcmp(argv[i], opt_n("--box"))) continue; long long b[6];
+        if (nb >= 64 || sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6 || b[3] <= 0 || b[4] <= 0 || b[5] <= 0) {
+            fprintf(stderr, "ink-devcrops: --box z,y,x,nz,ny,nx (level-0, at most 64)\n"); return 2; }
+        for (int d = 0; d < 6; d++) box[nb][d] = b[d]; nb++; }
+    { const char *mp = sopt(argc, argv, "--map-boxes", nullptr);   /* the --boxes (the map's coarse scan) mapped into its fine scan, one line each: the
+                                                                      fine-scan sources' holdouts of the same region (inkfly_map_boxes, + --map-pad) */
+      if (mp) { if (!nb) { fprintf(stderr, "ink-devcrops --map-boxes: no --box\n"); return 2; }
+          char ck[512]; if (inkfly_map_coarse(mp, ck, sizeof ck, nullptr) || inkfly_map_boxes(mp, box, nb, opt_atof("--map-pad", sopt(argc, argv, "--map-pad", "4")))) {
+              fprintf(stderr, "ink-devcrops: cannot map the boxes through %s\n", mp); return 1; }
+          for (int t = 0; t < nb; t++) printf("%lld,%lld,%lld,%lld,%lld,%lld\n", (long long)box[t][0], (long long)box[t][1], (long long)box[t][2], (long long)box[t][3], (long long)box[t][4], (long long)box[t][5]);
+          return 0; } }
+    if (argc < 3 || argv[2][0] == '-' || !out || !key || !nb || !(um > 0) || WIN < 32 || WIN % 4) {
+        fprintf(stderr, "usage: ufsm ink-devcrops SEGS.json --box z,y,x,nz,ny,nx [--box ..] --ct-key KEY --um U --out DIR [--win 256 (multiple of 4)] [--min-sup 0.2]\n"
+                        "         [--min-ink 200] [--scroll S] [--tag T]   scoring crops (clean crops' layout) of the segments' windows inside the held-out boxes\n");
+        return 2; }
+    FILE *fp = fopen(argv[2], "rb"); if (!fp) { fprintf(stderr, "ink-devcrops: cannot open %s\n", argv[2]); return 1; }
+    fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *txt = malloc((size_t)sz + 1); const size_t rd = fread(txt, 1, (size_t)sz, fp); fclose(fp); txt[rd] = 0;
+    json *j = json_parse(txt, rd); free(txt); const json *sg = j ? json_get(j, "segments") : nullptr;
+    if (!sg || sg->type != J_ARR) { fprintf(stderr, "ink-devcrops: %s: no \"segments\" array\n", argv[2]); json_free(j); return 1; }
+    if (mkdir_p(out)) { fprintf(stderr, "ink-devcrops: cannot create %s\n", out); json_free(j); return 1; }
+    char tp[1400]; snprintf(tp, sizeof tp, "%s/crops.tsv", out); const int fresh = access(tp, F_OK) != 0;
+    FILE *tsv = fopen(tp, "a"); if (!tsv) { fprintf(stderr, "ink-devcrops: cannot write %s\n", tp); json_free(j); return 1; }
+    if (fresh) fprintf(tsv, "# crop\tsegment\tsupervised_px\tink_share\tbox_l0 (z,y,x,nz,ny,nx)\tscroll\tct\n");
+    const int G = WIN / 4 + 1, N = WIN; int total = 0, rc = 0;
+    float *gx = malloc(sizeof(float) * G * G), *gy = malloc(sizeof(float) * G * G), *gz = malloc(sizeof(float) * G * G);
+    uint8_t *ol = malloc((size_t)N * N), *om = malloc((size_t)N * N), *gv = malloc((size_t)G * G);
+    for (size_t si = 0; si < sg->n; si++) {
+        const json *e = json_at(sg, si); const char *nm = json_str(json_get(e, "name"), ""), *tx = json_str(json_get(e, "tifxyz"), nullptr),
+                   *lb = json_str(json_get(e, "labels"), nullptr), *mk = json_str(json_get(e, "mask"), nullptr);
+        if (!tx || !lb) { fprintf(stderr, "ink-devcrops: segment %zu: need tifxyz and labels\n", si); rc = 1; break; }
+        ssurf S; lsrc L, M; int hm = 0;
+        if (ssurf_load(&S, tx) || lsrc_open(&L, lb, -1, nullptr)) { fprintf(stderr, "ink-devcrops: segment %s: cannot load\n", nm); rc = 1; break; }
+        if (mk) { if (lsrc_open(&M, mk, -1, nullptr)) { fprintf(stderr, "ink-devcrops: segment %s: cannot open the mask %s\n", nm, mk); lsrc_close(&L); ssurf_free(&S); rc = 1; break; } hm = 1; }
+        double F; { const double ew = S.w / S.scale, eh = S.h / S.scale;   /* inkfly_open's label scale */
+            F = 0.5 * (ew / (double)L.W + eh / (double)L.H); const double p2 = pow(2, round(log2(F))); if (fabs(F - p2) < 0.002 * p2) F = p2;
+            const double mum = S.vox_um > 0 ? S.vox_um : um; if (L.um > 0 && mum > 0) F = L.um / mum;
+            const double es = json_num(json_get(e, "label_scale"), 0); if (es > 0) F = es; }
+        int64_t lc0 = 0, lr0 = 0, lw = L.W, lh = L.H; const json *cr = json_get(e, "crop");
+        if (cr && cr->n == 4 && json_num(json_at(cr, 2), 0) > 0) { lc0 = (int64_t)json_num(json_at(cr, 0), 0); lr0 = (int64_t)json_num(json_at(cr, 1), 0);
+            lw = (int64_t)json_num(json_at(cr, 2), 0); lh = (int64_t)json_num(json_at(cr, 3), 0); }
+        if (lc0 + lw > L.W) lw = L.W - lc0; if (lr0 + lh > L.H) lh = L.H - lr0;
+        uint8_t *LA = malloc((size_t)lw * lh), *MA = hm ? malloc((size_t)lw * lh) : nullptr;
+        if (!LA || (hm && !MA) || lsrc_read(&L, lr0, lc0, lh, lw, LA, 4) || (hm && lsrc_read(&M, lr0, lc0, lh, lw, MA, 4))) {
+            fprintf(stderr, "ink-devcrops: segment %s: label / mask read failed\n", nm); free(LA); free(MA); lsrc_close(&L); if (hm) lsrc_close(&M); ssurf_free(&S); rc = 1; break; }
+        { uint8_t m = 0; for (size_t k = 0; k < (size_t)lw * lh; k++) if (LA[k] > m) m = LA[k]; if (m == 1) for (size_t k = 0; k < (size_t)lw * lh; k++) LA[k] *= 255; }
+        if (hm) { uint8_t m = 0; for (size_t k = 0; k < (size_t)lw * lh; k++) if (MA[k] > m) m = MA[k]; if (m == 1) for (size_t k = 0; k < (size_t)lw * lh; k++) MA[k] *= 255; }
+        const int64_t CW = (int64_t)floor((S.w - 1) / S.scale), CH = (int64_t)floor((S.h - 1) / S.scale); int kept = 0, inbox = 0;
+        for (int64_t v0 = 0; v0 + N <= CH; v0 += N) for (int64_t u0 = 0; u0 + N <= CW; u0 += N) {
+            int nv = 0, bi = -1; double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+            for (int a = 0; a < G; a++) for (int b = 0; b < G; b++) {   /* gv: 1 valid, 2 valid and inside the window's box (the first box a vertex hits) */
+                float p[3]; const size_t k = (size_t)a * G + b;
+                if (!dc_bil(&S, (u0 + 4.0 * b) * S.scale, (v0 + 4.0 * a) * S.scale, p)) { gx[k] = gy[k] = gz[k] = -1; gv[k] = 0; continue; }
+                gx[k] = p[0]; gy[k] = p[1]; gz[k] = p[2]; gv[k] = 1;
+                const double q[3] = {p[2], p[1], p[0]};
+                if (bi < 0) for (int t = 0; t < nb && bi < 0; t++) { int in = 1; for (int d = 0; d < 3; d++) in &= q[d] >= box[t][d] && q[d] < box[t][d] + box[t][3 + d]; if (in) bi = t; }
+                if (bi < 0) continue;
+                int in = 1; for (int d = 0; d < 3; d++) in &= q[d] >= box[bi][d] && q[d] < box[bi][d] + box[bi][3 + d];
+                if (!in) continue;
+                gv[k] = 2; nv++;
+                for (int d = 0; d < 3; d++) { if (q[d] < lo[d]) lo[d] = q[d]; if (q[d] > hi[d]) hi[d] = q[d]; }
+            }
+            if (nv < 4) continue;
+            for (size_t k = 0; k < (size_t)G * G; k++) if (gv[k] == 1 && bi >= 0) {   /* (vertices before the box was known: re-test) */
+                const double q[3] = {gz[k], gy[k], gx[k]}; int in = 1; for (int d = 0; d < 3; d++) in &= q[d] >= box[bi][d] && q[d] < box[bi][d] + box[bi][3 + d];
+                if (in) { gv[k] = 2; nv++; for (int d = 0; d < 3; d++) { if (q[d] < lo[d]) lo[d] = q[d]; if (q[d] > hi[d]) hi[d] = q[d]; } } }
+            inbox++;
+            int64_t sup = 0, ink = 0;
+            for (int r = 0; r < N; r++) for (int c = 0; c < N; c++) {
+                const size_t o = (size_t)r * N + c; ol[o] = 0; om[o] = 0;
+                const int a = r / 4, b = c / 4; if (a + 1 >= G || b + 1 >= G) continue;
+                if (gv[(size_t)a * G + b] != 2 || gv[(size_t)a * G + b + 1] != 2 || gv[(size_t)(a + 1) * G + b] != 2 || gv[(size_t)(a + 1) * G + b + 1] != 2) continue;   /* (in-box cells only) */
+                const int64_t lr = (int64_t)floor((v0 + r + 0.5) / F) - lr0, lc = (int64_t)floor((u0 + c + 0.5) / F) - lc0;
+                if (lr < 0 || lc < 0 || lr >= lh || lc >= lw) continue;
+                const size_t li = (size_t)lr * lw + lc; if (hm && MA[li] < 128) continue;
+                om[o] = 255; ol[o] = LA[li] >= 128 ? 255 : 0; sup++; ink += ol[o] != 0;
+            }
+            if (sup < minsup * N * N || ink < mink || sup - ink < mink) continue;
+            char cd[1600]; snprintf(cd, sizeof cd, "%s/%s_s%02zu_%lld_%lld", out, tag, si, (long long)(v0 / N), (long long)(u0 / N));
+            char p[1700]; int bad = tifxyz_write(cd, G, G, gx, gy, gz, 4, um, -1, "ink-devcrops");
+            snprintf(p, sizeof p, "%s/labels.tif", cd); bad |= tiffw_write(p, N, N, 1, ol, 1);
+            snprintf(p, sizeof p, "%s/mask.tif", cd); bad |= tiffw_write(p, N, N, 1, om, 1);
+            int64_t b6[6]; for (int d = 0; d < 3; d++) { b6[d] = (int64_t)floor(lo[d]) - 32; if (b6[d] < 0) b6[d] = 0; b6[d] -= b6[d] % 4; b6[3 + d] = (int64_t)ceil(hi[d]) + 32 - b6[d]; }
+            snprintf(p, sizeof p, "%s/crop.json", cd); FILE *cj = fopen(p, "w");
+            if (cj) { fprintf(cj, "{\"segment\": \"%s\", \"scroll\": \"%s\", \"ct\": \"%s\", \"um\": %.6g, \"canvas_u0\": %lld, \"canvas_v0\": %lld, \"win\": %d, \"label_scale\": %.9g, "
+                                  "\"supervised_px\": %lld, \"ink_share\": %.4f, \"hold_box\": %d, \"box_l0\": [%lld, %lld, %lld, %lld, %lld, %lld]}\n", nm, scroll, key, um, (long long)u0, (long long)v0, N, F,
+                              (long long)sup, (double)ink / sup, bi, (long long)b6[0], (long long)b6[1], (long long)b6[2], (long long)b6[3], (long long)b6[4], (long long)b6[5]); bad |= fclose(cj) != 0; } else bad = 1;
+            if (bad) { fprintf(stderr, "ink-devcrops: cannot write %s\n", cd); rc = 1; break; }
+            fprintf(tsv, "%s\t%s\t%lld\t%.3f\t%lld,%lld,%lld,%lld,%lld,%lld\t%s\t%s\n", strrchr(cd, '/') + 1, nm, (long long)sup, (double)ink / sup,
+                    (long long)b6[0], (long long)b6[1], (long long)b6[2], (long long)b6[3], (long long)b6[4], (long long)b6[5], scroll, key);
+            kept++;
+        }
+        fprintf(stderr, "ink-devcrops: %s: F %.4g, canvas %lldx%lld, %d windows inside a box, %d kept\n", nm, F, (long long)CW, (long long)CH, inbox, kept);
+        total += kept; free(LA); free(MA); lsrc_close(&L); if (hm) lsrc_close(&M); ssurf_free(&S);
+        if (rc) break;
+    }
+    free(gx); free(gy); free(gz); free(ol); free(om); free(gv); json_free(j);
+    if (fclose(tsv)) rc = 1;
+    fprintf(stderr, "ink-devcrops: %d crops -> %s\n", total, out);
+    return rc;
+}

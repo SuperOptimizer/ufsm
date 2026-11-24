@@ -1,0 +1,76 @@
+"""ink-devcrops (2026-11-24, the 8.6-9.4 um ink dev set): scoring crops of the windows inside held-out boxes. A flat tifxyz mesh on an
+8.64 um grid (scale 0.05: 20 voxels per cell, canvas 1 px per voxel), labels at label_scale 1.25 (1.25 canvas px per label px) with a
+"crop" window, ink stripes in voxel space. Checked: only windows touching the box are cut, cells outside the box masked out; the crop
+grid (scale 0.25) reproduces the mesh; labels.tif equals the stripes on the canvas through F and the crop window; supervised px / ink
+share / box_l0 in crop.json and crops.tsv; the --map-boxes identity check is in the suite's reg tests (not here)."""
+import json
+import pathlib
+import subprocess
+import tempfile
+
+import numpy as np
+import tifffile as t
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+BIN = ROOT / "build/ufsm"
+G = 41                    # grid points per side (20 voxels apart -> canvas 800 px)
+F = 1.25                  # canvas px per label px
+LW = 640                  # label px per side (800 / 1.25)
+WIN = 128
+
+
+def run(*a, ok=True):
+    r = subprocess.run([str(v) for v in a], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
+    assert (r.returncode == 0) == ok, r.stdout
+    return r.stdout
+
+
+with tempfile.TemporaryDirectory(prefix="ufsm-devcrops-") as tmp:
+    d = pathlib.Path(tmp)
+    m = d / "A/tifxyz"; m.mkdir(parents=True)
+    v, u = np.mgrid[0:G, 0:G].astype(np.float32) * 20 + 1000          # rows = y, cols = x (level-0 voxels); canvas px (cu, cv) = voxel (1000 + cu, 1000 + cv)
+    t.imwrite(m / "x.tif", u); t.imwrite(m / "y.tif", v); t.imwrite(m / "z.tif", np.full((G, G), 500, np.float32))
+    (m / "meta.json").write_text(json.dumps({"format": "tifxyz", "type": "seg", "scale": [0.05, 0.05], "voxel_size_um": 8.64}))
+    lc = (np.arange(LW) // 10 % 2).astype(np.uint8)                   # label stripes: ink where (label col // 10) is odd
+    t.imwrite(d / "A/lab.tif", np.broadcast_to(lc[None, :], (LW, LW)) * 255)
+    t.imwrite(d / "A/msk.tif", np.full((LW, LW), 1, np.uint8))         # a 0/1 mask: read as 0/255
+    crop = [0, 0, LW, 400]                                             # label rows >= 400 unsupervised (canvas rows >= 500)
+    (d / "segs.json").write_text(json.dumps({"segments": [{"name": "A", "tifxyz": str(m), "labels": str(d / "A/lab.tif"), "mask": str(d / "A/msk.tif"),
+                                                           "label_scale": F, "crop": crop}]}))
+    box = [0, 1000, 1200, 1000, 400, 300]                              # z, y, x, nz, ny, nx: canvas rows 0..399, cols 200..499
+    out = run(BIN, "ink-devcrops", d / "segs.json", "--box", ",".join(map(str, box)), "--ct-key", "S/scan.zarr", "--um", 8.64, "--out", d / "c",
+              "--win", WIN, "--min-sup", 0.05, "--min-ink", 10, "--scroll", "S", "--tag", "T")
+    rows = [l.split("\t") for l in (d / "c/crops.tsv").read_text().splitlines() if not l.startswith("#")]
+
+    def expect(v0, u0):   # the supervised px of a window: cells whose 4 corners lie in the box (canvas cols 200..499, rows 0..399), label rows < 400
+        cv, cu = np.mgrid[v0:v0 + WIN, u0:u0 + WIN]
+        cell_in = ((cu // 4 * 4) >= 200) & ((cu // 4 * 4 + 4) <= 499) & ((cv // 4 * 4 + 4) <= 399)
+        lr, lcol = np.floor((cv + 0.5) / F).astype(int), np.floor((cu + 0.5) / F).astype(int)
+        return cell_in & (lr < 400), lcol
+    want = []
+    for a in range(800 // WIN):
+        for b in range(800 // WIN):
+            sup, lcol = expect(a * WIN, b * WIN); ink = int(((lcol[sup] // 10) % 2 == 1).sum())
+            if sup.sum() >= 0.05 * WIN * WIN and ink >= 10 and sup.sum() - ink >= 10: want.append(f"T_s00_{a}_{b}")
+    assert sorted(r[0] for r in rows) == sorted(want) and len(want) >= 8, (sorted(r[0] for r in rows), want, out)
+    for r in rows:
+        c = d / "c" / r[0]; a, b = map(int, r[0].split("_")[-2:]); v0, u0 = a * WIN, b * WIN
+        X, Y, Z = (t.imread(c / f"{k}.tif") for k in "xyz")
+        assert X.shape == (WIN // 4 + 1, WIN // 4 + 1), X.shape
+        assert np.allclose(X, 1000 + u0 + 4 * np.arange(WIN // 4 + 1)[None, :], atol=1e-3) and np.allclose(Y, 1000 + v0 + 4 * np.arange(WIN // 4 + 1)[:, None], atol=1e-3)
+        assert json.loads((c / "meta.json").read_text())["scale"][0] == 0.25
+        L, M = t.imread(c / "labels.tif"), t.imread(c / "mask.tif")
+        sup, lcol = expect(v0, u0)
+        assert np.array_equal(M == 255, sup), (r[0], int((M == 255).sum()), int(sup.sum()))
+        assert np.array_equal(L[sup] == 255, (lcol[sup] // 10 % 2) == 1), r[0]
+        assert not L[~sup].any()
+        j = json.loads((c / "crop.json").read_text())
+        assert j["supervised_px"] == int(sup.sum()) == int(r[2]) and abs(j["label_scale"] - F) < 1e-9, j
+        assert abs(j["ink_share"] - (L[sup] == 255).mean()) < 1e-3, j
+        bz, by, bx, nz, ny, nx = j["box_l0"]
+        assert bz <= 500 - 32 and bz + nz >= 500 + 32 and by <= 1000 + v0 and bx <= 1000 + max(u0, 200) and bx % 4 == 0, j
+    # a box no window touches: no crops, exit 0
+    run(BIN, "ink-devcrops", d / "segs.json", "--box", "0,5000,5000,10,10,10", "--ct-key", "S/scan.zarr", "--um", 8.64, "--out", d / "e")
+    assert len((d / "e/crops.tsv").read_text().splitlines()) == 1
+    run(BIN, "ink-devcrops", d / "segs.json", "--ct-key", "S/scan.zarr", "--um", 8.64, "--out", d / "f", ok=False)   # no --box: usage
+print("test_ink_devcrops: OK")
