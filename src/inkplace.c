@@ -89,7 +89,7 @@ static int ip_canvas(const char *tx, double *H, double *W, double *vum, double *
     char m[65536] = {0}; const size_t mn = fread(m, 1, sizeof m - 1, f); fclose(f);
     json *j = json_parse(m, mn); if (!j) return -1;
     const double sc = json_num(json_at(json_get(j, "scale"), 0), 0); *vum = json_num(json_get(j, "voxel_size_um"), 0); json_free(j);
-    static const char *nm[3] = {"z", "y", "x"}; float *A[3] = {0}; int w = 0, h = 0, rc = 0;
+    static const char *const nm[3] = {"z", "y", "x"}; float *A[3] = {0}; int w = 0, h = 0, rc = 0;
     for (int k = 0; k < 3; k++) { int w2, h2; snprintf(p, sizeof p, "%s/%s.tif", tx, nm[k]); A[k] = img_read_f32(p, &w2, &h2);
         if (!A[k] || (k && (w2 != w || h2 != h))) { fprintf(stderr, "ink-place: cannot read %s\n", p); rc = -1; break; } w = w2; h = h2; }
     if (!rc && !(sc > 0)) { fprintf(stderr, "ink-place: %s: no scale\n", tx); rc = -1; }
@@ -155,9 +155,9 @@ static int ip_ct_ref(const char *spec, const ipmesh *M, double cy0, double cx0, 
         G[k] = (float)v; }
     free(B); free(P3); z3_close(z); return rc;
 }
-static long long g_ipwin[4];
-static int g_refgray;   /* --ref-gray (ink-find): REF an ink probability map, 0 = unknown */
-static int g_reftri;   /* --ref-tri: REF is a 255 ink / 128 background / 0 unknown map (a --map-tif, resampled) */   /* --crop-win r0,c0,h,w (h 0: off) */
+static long long g_ipwin[4];   /* mgpu: config (the command line, set before any worker thread) */
+static int g_refgray;   /* mgpu: config; --ref-gray (ink-find): REF an ink probability map, 0 = unknown */
+static int g_reftri;   /* mgpu: config; --ref-tri: REF is a 255 ink / 128 background / 0 unknown map (a --map-tif, resampled) */   /* --crop-win r0,c0,h,w (h 0: off) */
 static uint8_t *ip_get_crop(const ipline *e, int *w, int *h, double *y0, double *x0) {   /* the crop (cut to --crop-win) and its corner */
     uint8_t *c = ip_read_crop(e->img, w, h); *y0 = e->y0; *x0 = e->x0; if (!c || g_ipwin[2] <= 0) return c;
     const long long r0 = g_ipwin[0], c0 = g_ipwin[1], hh = g_ipwin[2], ww = g_ipwin[3]; uint8_t *o = calloc((size_t)hh * ww, 1);
