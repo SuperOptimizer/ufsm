@@ -59,6 +59,7 @@ static int ink_score(const char *dir, const char *map, const char *mask, double 
 static int hole_at(int64_t z, int64_t y, int64_t x) { return y >= 40 && y < 60 && x >= 120 && x < 150; }
 
 int main(void) {
+    setenv("UFSM_IFLY_CANDS_CHECK", "1", 1);   /* (every tile candidate list against the old quadratic build, inksplat.c ifly_cands) */
     char dir[] = "/tmp/ufsm_inksplat_XXXXXX";
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     char p[512], q[512];
@@ -235,6 +236,19 @@ int main(void) {
                 long inside = 0, ink = 0; for (size_t i = 0; i < n0; i++) { int in = 1; for (int d = 0; d < 3; d++) in &= r0[i].p[d] >= -0.5f && r0[i].p[d] < NV; inside += in; ink += r0[i].y; }
                 fprintf(stderr, "mil rays: %zu (all supervised pixels, %ld ink), %zu without a face\n", n0, ink, n1);
                 CHECK(n0 > 1000 && inside == (long)n0 && n1 < n0, "rays: %zu, %ld inside, %zu without a face", n0, inside, n1);
+                {   /* inkfly_cells_sup marks each ray as it is made (2026-11-24): the same cells as the whole-scan mode-0 ray list marked afterwards */
+                    for (int st = 1; st <= 2; st++) for (int lev = 1; lev <= 3; lev++) {
+                        inkray *ra = nullptr; size_t na = 0; const int64_t big[3] = {(int64_t)1 << 36, (int64_t)1 << 36, (int64_t)1 << 36};
+                        CHECK(!inkfly_rays(hd, wo, big, 0, st, 0.f, &ra, &na), "whole-scan rays");
+                        const int64_t g3 = (NV >> lev) + 1, sh3[3] = {g3, g3, g3}; uint8_t *ref = calloc((size_t)g3 * g3 * g3, 1), *got = calloc((size_t)g3 * g3 * g3, 1);
+                        for (size_t i = 0; i < na; i++) { int64_t c[3]; int in = 1;
+                            for (int d = 0; d < 3 && in; d++) { c[d] = (int64_t)floor((double)ra[i].p[d] / (double)(1 << lev));   /* (c8: level 0, V 1, off 0) */ in = c[d] >= 0 && c[d] < g3; }
+                            if (in) ref[((size_t)c[0] * g3 + c[1]) * g3 + c[2]] |= (uint8_t)(1 | (ra[i].y ? 2 : 0)); }
+                        const int k = inkfly_cells_sup(hd, lev, sh3, got, st); size_t kr = 0; for (size_t q = 0; q < (size_t)g3 * g3 * g3; q++) kr += ref[q] != 0;
+                        CHECK(k > 0 && (size_t)k == kr && !memcmp(ref, got, (size_t)g3 * g3 * g3), "cells_sup stride %d level %d: %d cells vs %zu from the ray list", st, lev, k, kr);
+                        free(ra); free(ref); free(got);
+                    }
+                }
                 {   /* the face search in z slabs (16-row slabs: the box in many reads) == the whole box in one: the same rays, byte for byte */
                     setenv("UFSM_INKRAY_SLAB_MB", "0.001", 1); inkray *r2 = nullptr; size_t n2 = 0;
                     CHECK(!inkfly_rays(hd, wo, wn, 1, 1, 4, &r2, &n2), "inkfly_rays slabbed");

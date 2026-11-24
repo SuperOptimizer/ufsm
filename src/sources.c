@@ -9,6 +9,8 @@
 /* weak: the sampler test binaries link sources.o without inksplat.o / dcache.o (an onfly ink target then fails to open) */
 [[gnu::weak]] z3 *inkfly_open(z3 *, const char *, const inksplat_cfg *, size_t, const char *, void **);
 [[gnu::weak]] z3 *inkfly_open_pooled(z3 *, z3 *, int);
+[[gnu::weak]] int inkfly_prewarm(const char *const *, int, int);
+[[gnu::weak]] void inkfly_prewarm_release(void);
 [[gnu::weak]] int inkfly_holdouts(const char *, const char *, inksplat_cfg *);
 [[gnu::weak]] int inkfly_map_coarse(const char *, char *, size_t, double *);
 [[gnu::weak]] int inkfly_map_boxes(const char *, int64_t (*)[6], int, double);
@@ -284,7 +286,7 @@ static z3 *onfly_phase_open(const source *s, const json *of, int extra, int plev
 static int g_strict;   /* mgpu: config */
 void sources_set_strict(int on) { g_strict = on; }
 static void sources_unread_cb(const char *p, void *u) { (void)u; fprintf(stderr, "sources: WARNING: key \"%s\" is not one sources_load reads (a typo?)\n", p); }
-sources *sources_load(const char *path) {
+static sources *sources_load_(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "sources: cannot open %s\n", path); return nullptr; }
     fseek(f, 0, SEEK_END);
@@ -309,6 +311,14 @@ sources *sources_load(const char *path) {
     if (S->cache) g_cache = S->cache;
     S->n = (int)arr->n;
     S->src = calloc(arr->n, sizeof *S->src);
+    if (inkfly_prewarm) {   /* the onfly ink meshes of every source decoded up front on parallel workers (R1E: 57 sources, 399 segments, 70 s serial) */
+        const char **sg = calloc(arr->n * NTG + 1, sizeof *sg); int ns = 0;
+        for (size_t i = 0; sg && i < arr->n; i++) { const json *tg = json_get(json_at(arr, i), "targets");
+            for (size_t k = 0; tg && tg->type == J_OBJ && k < tg->n; k++) { const json *of = tg->items[k] && tg->items[k]->type == J_OBJ ? json_get(tg->items[k], "onfly") : nullptr;
+                const char *p = of && !json_get(of, "map") ? json_str(json_get(of, "segments"), nullptr) : nullptr; if (p) sg[ns++] = p; } }
+        if (ns) inkfly_prewarm(sg, ns, 0);
+        free(sg);
+    }
     for (size_t i = 0; i < arr->n; i++) {
         const json *e = json_at(arr, i);
         source *s = &S->src[i];
@@ -1087,3 +1097,8 @@ z3 *source_region(source *s, int ch, int i) {
 }
 
 void sources_set_cache(const char *dir) { g_cache = dir; }
+sources *sources_load(const char *path) {
+    sources *S = sources_load_(path);
+    if (inkfly_prewarm_release) inkfly_prewarm_release();   /* (the meshes no source took are freed) */
+    return S;
+}

@@ -3,8 +3,10 @@
 #include "sample.h"
 #include "inksplat.h"
 #include "defaulted.h"
+#include "sysinfo.h"
 [[gnu::weak]] int inkfly_cells(void *, int, const int64_t[3], uint8_t *);
 [[gnu::weak]] int inkfly_cells_sup(void *, int, const int64_t[3], uint8_t *, int);
+[[gnu::weak]] void inkfly_mesh_stats(uint64_t *, uint64_t *);
 [[gnu::weak]] size_t inkfly_cache_bytes(size_t *);
 [[gnu::weak]] int inkfly_rays(void *, const int64_t[3], const int64_t[3], int, int, float, inkray **, size_t *);   /* (weak: test binaries without inksplat.o; only called for an onfly target) */
 [[gnu::weak]] int isf_rays_crop(inkray *, int, int, int, int, int, int, float);   /* (inksurf.c; weak as inkfly_rays) */
@@ -3903,6 +3905,106 @@ static void *worker(void *arg) {
    phase, from its shard indices (all-unknown chunks are not stored); a cell is one chunk, i.e. a voxel of level phase_level +
    log2(chunk). Windows are then drawn around labelled chunks instead of uniformly over the scan (on the desk's sparsely labelled
    scrolls ~93% of uniform draws were rejected, many after the CT read), and ufsm prefetch covers these sources. */
+static double occ_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+/* The draw cells of a target without a coarse level (label_occupancy's !tz path) from the level-lc CT chunks under a set bit only: the
+   cells k (raster order on the CT grid) with ct[k] >= iso and bits[q(k)] != 0, q(k) = k (sh < 0: bits on the CT grid, the onfly ink) or
+   k >> sh per axis (bits on the target chunk grid g), bit 2 of an onfly ink cell = a positive label (o->pidx). The same lists, in the
+   same ascending order, as reading the whole level-lc CT and scanning it twice (UFSM_OCC_FULLSCAN=1, test_occ_scan): a 2.4 um scan's
+   level 5 is up to 1.65e9 cells (PHerc0139: 1.65 GB decoded per source, 6 sources of it in R1E) for ~1e5 draw cells. */
+typedef struct { z3 *cc; const uint8_t *bits; const int64_t *g; int sh, iso, fly; const uint32_t *list; size_t nl; int64_t ng[3]; _Atomic size_t next; _Atomic int fail;
+                 uint32_t **k, **pk; size_t *nk, *npk; void *self[8]; } occ_scan_job;
+static void occ_push(uint32_t **v, size_t *n, size_t *cap, uint32_t x) {
+    if (*n == *cap) { *cap = *cap ? 2 * *cap : 4096; uint32_t *t = realloc(*v, *cap * sizeof *t); if (!t) abort(); *v = t; }
+    (*v)[(*n)++] = x; }
+static void *occ_scan_worker(void *p) {
+    occ_scan_job *J = *(occ_scan_job **)p; const int tid = (int)((void **)p - J->self);   /* (p = &J->self[tid]) */
+    const z3_meta *mc = z3_meta_of(J->cc); const int64_t C[3] = {mc->chunk[0], mc->chunk[1], mc->chunk[2]};
+    uint8_t *cb = malloc((size_t)C[0] * C[1] * C[2]); uint32_t *v = nullptr, *pv = nullptr; size_t n = 0, cap = 0, pn = 0, pcap = 0;
+    if (!cb) atomic_store(&J->fail, 1);
+    for (;;) {
+        const size_t i = atomic_fetch_add(&J->next, 1); if (i >= J->nl || atomic_load(&J->fail)) break;
+        const size_t c = J->list[i]; const int64_t cz = (int64_t)(c / ((size_t)J->ng[1] * J->ng[2])), cy = (int64_t)(c / (size_t)J->ng[2] % (size_t)J->ng[1]), cx = (int64_t)(c % (size_t)J->ng[2]);
+        int64_t o[3] = {cz * C[0], cy * C[1], cx * C[2]}, nn[3];
+        for (int d = 0; d < 3; d++) nn[d] = C[d] < mc->shape[d] - o[d] ? C[d] : mc->shape[d] - o[d];
+        if (z3_read(J->cc, o, nn, cb, 1)) { atomic_store(&J->fail, 1); break; }
+        for (int64_t z = 0; z < nn[0]; z++) for (int64_t y = 0; y < nn[1]; y++) {
+            const uint8_t *row = cb + ((size_t)z * nn[1] + (size_t)y) * nn[2]; const int64_t Z = o[0] + z, Y = o[1] + y;
+            const int64_t qz = J->sh < 0 ? Z : Z >> J->sh, qy = J->sh < 0 ? Y : Y >> J->sh;
+            if (qz >= J->g[0] || qy >= J->g[1]) continue;
+            const uint8_t *brow = J->bits + ((size_t)qz * J->g[1] + (size_t)qy) * J->g[2];
+            for (int64_t x = 0; x < nn[2]; x++) {
+                if (row[x] < J->iso) continue;
+                const int64_t X = o[2] + x, qx = J->sh < 0 ? X : X >> J->sh; if (qx >= J->g[2]) continue;
+                const uint8_t bv = brow[qx]; if (!bv) continue;
+                const uint32_t k = (uint32_t)(((size_t)Z * mc->shape[1] + (size_t)Y) * mc->shape[2] + (size_t)X);
+                occ_push(&v, &n, &cap, k); if (J->fly && (bv & 2)) occ_push(&pv, &pn, &pcap, k);
+            }
+        }
+    }
+    free(cb); J->k[tid] = v; J->nk[tid] = n; J->pk[tid] = pv; J->npk[tid] = pn;
+    return nullptr;
+}
+static int occ_u32_cmp(const void *a, const void *b) { const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return (x > y) - (x < y); }
+static _Thread_local int occ_inner_threads;   /* (sources_occupancy_all's workers: their share of the CPUs) */
+static int occ_scan_chunks(z3 *cc, const uint8_t *bits, const int64_t g[3], int sh, int iso, int fly, occ_index *out) {
+    const z3_meta *mc = z3_meta_of(cc); const int64_t C[3] = {mc->chunk[0] > 0 ? mc->chunk[0] : 64, mc->chunk[1] > 0 ? mc->chunk[1] : 64, mc->chunk[2] > 0 ? mc->chunk[2] : 64};
+    occ_scan_job J = {.cc = cc, .bits = bits, .g = g, .sh = sh, .iso = iso, .fly = fly};
+    for (int d = 0; d < 3; d++) J.ng[d] = (mc->shape[d] + C[d] - 1) / C[d];
+    const size_t nc = (size_t)J.ng[0] * J.ng[1] * J.ng[2]; uint8_t *need = calloc(nc ? nc : 1, 1); if (!need) return -1;
+    for (int64_t qz = 0; qz < g[0]; qz++) for (int64_t qy = 0; qy < g[1]; qy++) {   /* the CT chunks under the set bits (rows skipped 8 bytes at a time) */
+        const uint8_t *brow = bits + ((size_t)qz * g[1] + (size_t)qy) * g[2];
+        for (int64_t qx = 0; qx < g[2]; qx++) {
+            if (qx + 8 <= g[2] && !(qx & 7)) { uint64_t w; memcpy(&w, brow + qx, 8); if (!w) { qx += 7; continue; } }
+            if (!brow[qx]) continue;
+            const int64_t q[3] = {qz, qy, qx}; int64_t a[3], b[3]; int ok = 1;
+            for (int d = 0; d < 3; d++) { a[d] = sh < 0 ? q[d] : q[d] << sh; b[d] = sh < 0 ? q[d] : ((q[d] + 1) << sh) - 1; if (b[d] >= mc->shape[d]) b[d] = mc->shape[d] - 1; ok &= a[d] <= b[d]; }
+            if (!ok) continue;
+            for (int64_t z = a[0] / C[0]; z <= b[0] / C[0]; z++) for (int64_t y = a[1] / C[1]; y <= b[1] / C[1]; y++) for (int64_t x = a[2] / C[2]; x <= b[2] / C[2]; x++)
+                need[((size_t)z * J.ng[1] + (size_t)y) * J.ng[2] + (size_t)x] = 1;
+        }
+    }
+    size_t nl = 0; for (size_t c = 0; c < nc; c++) nl += need[c];
+    uint32_t *list = malloc((nl ? nl : 1) * sizeof *list); if (!list) { free(need); return -1; }
+    nl = 0; for (size_t c = 0; c < nc; c++) if (need[c]) list[nl++] = (uint32_t)c;
+    free(need);
+    int nth = occ_inner_threads > 0 ? occ_inner_threads : ufsm_ncpu(); if (nth > 8) nth = 8; if ((size_t)nth > nl) nth = nl ? (int)nl : 1;
+    J.list = list; J.nl = nl;
+    uint32_t *k[8] = {}, *pk[8] = {}; size_t nk[8] = {}, npk[8] = {}; J.k = k; J.pk = pk; J.nk = nk; J.npk = npk;
+    pthread_t th[8]; int started = 0;
+    for (int t = 0; t < nth; t++) { J.self[started] = &J; started += !pthread_create(&th[started], nullptr, occ_scan_worker, &J.self[started]); }
+    for (int t = 0; t < started; t++) pthread_join(th[t], nullptr);
+    free(list);
+    size_t n = 0, pn = 0; for (int t = 0; t < 8; t++) { n += nk[t]; pn += npk[t]; }
+    int rc = atomic_load(&J.fail) || !started ? -1 : 0;
+    out->n = out->pn = 0; out->idx = out->pidx = nullptr;
+    if (!rc && n) { out->idx = malloc(n * sizeof *out->idx); if (pn) out->pidx = malloc(pn * sizeof *out->pidx); if (!out->idx || (pn && !out->pidx)) rc = -1; }
+    for (int t = 0; t < 8; t++) {
+        if (!rc && n) { memcpy(out->idx + out->n, k[t], nk[t] * sizeof *k[t]); out->n += nk[t]; if (pn) { memcpy(out->pidx + out->pn, pk[t], npk[t] * sizeof *pk[t]); out->pn += npk[t]; } }
+        free(k[t]); free(pk[t]);
+    }
+    if (!rc && out->n) { qsort(out->idx, out->n, sizeof *out->idx, occ_u32_cmp); if (out->pn) qsort(out->pidx, out->pn, sizeof *out->pidx, occ_u32_cmp); }
+    return rc;
+}
+/* the old path: the whole level-lc CT read, scanned twice (count, fill) */
+static int occ_scan_full(z3 *cc, const uint8_t *bits, const int64_t g[3], int sh, int iso, int fly, occ_index *o) {
+    const z3_meta *mc = z3_meta_of(cc); const size_t tot = (size_t)mc->shape[0] * mc->shape[1] * mc->shape[2]; size_t n = 0, npos = 0;
+    o->idx = o->pidx = nullptr; o->n = o->pn = 0;
+    uint8_t *cb = malloc(tot ? tot : 1); const int64_t zo[3] = {0, 0, 0}, zn[3] = {mc->shape[0], mc->shape[1], mc->shape[2]};
+    if (!cb || z3_read(cc, zo, zn, cb, 8)) { free(cb); return -1; }
+    for (int pass = 0; pass < 2; pass++) {
+        for (int64_t z = 0; z < mc->shape[0]; z++) for (int64_t y = 0; y < mc->shape[1]; y++) for (int64_t x = 0; x < mc->shape[2]; x++) {
+            const size_t k = ((size_t)z * mc->shape[1] + (size_t)y) * mc->shape[2] + (size_t)x;
+            const int64_t qz = sh < 0 ? z : z >> sh, qy = sh < 0 ? y : y >> sh, qx = sh < 0 ? x : x >> sh;
+            if (cb[k] < iso || qz >= g[0] || qy >= g[1] || qx >= g[2]) continue;
+            const uint8_t bv = bits[((size_t)qz * g[1] + (size_t)qy) * g[2] + (size_t)qx]; if (!bv) continue;
+            const int pos = fly && (bv & 2);   /* (an onfly ink cell with a positive label: the stratified draw's positive list) */
+            if (pass) { o->idx[o->n++] = (uint32_t)k; if (pos && o->pidx) o->pidx[o->pn++] = (uint32_t)k; } else { n++; npos += pos; }
+        }
+        if (!pass && (!n || !(o->idx = malloc(n * sizeof *o->idx)))) break;
+        if (!pass && npos) o->pidx = malloc(npos * sizeof *o->pidx);
+    }
+    free(cb); return 0;
+}
 static occ_index phase_occupancy(source *s) {
     occ_index o = {nullptr, 0, -1, {0, 0, 0}};
     const z3_meta *m = z3_meta_of(s->phase); const int64_t c = m->chunk[0]; int e = 0;
@@ -3967,45 +4069,47 @@ static occ_index label_occupancy(source *s) {
             const z3_meta *m0 = z3_meta_of(t0), *mc = z3_meta_of(cc); const int cs = m0->chunk[0];
             if (cs < (1 << (lc - l0)) || (cs & (cs - 1)) || m0->chunk[1] != cs || m0->chunk[2] != cs) continue;
             const int sh = __builtin_ctz((unsigned)cs) - (lc - l0);   /* level-lc cells per target chunk edge: 2^sh */
-            int64_t g[3]; uint8_t *bits = nullptr;
+            int64_t g[3]; uint8_t *bits = nullptr; const double tq0 = occ_now(); double tq1 = tq0, tq2 = tq0, tq3 = tq0;
             if (s->ink_fly[ch]) {   /* an onfly ink target: the label tiles' boxes on the level-lc CT grid (its chunk map is the CT's) */
                 for (int d = 0; d < 3; d++) g[d] = mc->shape[d];
                 bits = calloc((size_t)g[0] * g[1] * g[2], 1);
                 if (!bits || inkfly_cells(s->ink_fly[ch], lc, g, bits) <= 0) { free(bits); continue; }
+                tq1 = occ_now();
                 /* only the cells that hold supervised label pixels (2026-11-20: the tile boxes' cells left 84 % of the ladder's windows with
                    < 0.1 % known ink, thrown away after the CT read, the augmentation and the targets); UFSM_INK_DRAW_SUP=0: the tile boxes */
                 if (inkfly_cells_sup && !(getenv("UFSM_INK_DRAW_SUP") && !strcmp(getenv("UFSM_INK_DRAW_SUP"), "0"))) {
                     const size_t nb = (size_t)g[0] * g[1] * g[2]; uint8_t *sb = calloc(nb, 1); size_t ks = 0, kb = 0;
                     const int ns = sb ? inkfly_cells_sup(s->ink_fly[ch], lc, g, sb, 8) : -1;
                     if (ns > 0) for (size_t q = 0; q < nb; q++) { kb += bits[q]; ks += bits[q] & sb[q]; }   /* (and the tile boxes: held-out cells stay out) */
-                    if (ks) { for (size_t q = 0; q < nb; q++) bits[q] = bits[q] ? sb[q] : 0;   /* (bit 1 supervised, bit 2 positive) */
+                    if (ks) { for (size_t q = 0; q < nb; q++) if (bits[q]) bits[q] = sb[q];   /* (bit 1 supervised, bit 2 positive; zero cells not written: the level-5 grid stays
+                                                                                       untouched, i.e. not resident, outside the tile boxes) */
                               fprintf(stderr, "sampler: %s: %zu of %zu level-%d tile-box cells hold supervised ink labels: the draw cells\n", s->name, ks, kb, lc); }
                     else UFSM_DEFAULTED("%s: ink draw cells = the label tiles' boxes (no supervised label pixel found: %d)", s->name, ns);
                     free(sb);
                 }
+                tq2 = occ_now();
             } else if (z3_chunk_map(t0, g, &bits) <= 0) { free(bits); continue; }
             const int fly = s->ink_fly[ch] != nullptr;
             const size_t pl = (size_t)mc->shape[1] * mc->shape[2], tot = pl * (size_t)mc->shape[0];
-            uint8_t *cb = tot < 4.29e9 ? malloc(tot) : nullptr; const int64_t zo[3] = {0, 0, 0}, zn[3] = {mc->shape[0], mc->shape[1], mc->shape[2]};
-            if (!cb || z3_read(cc, zo, zn, cb, 8)) { free(cb); free(bits); continue; }
-            const int iso = s->iso > 0 ? s->iso : 1; size_t n = 0, npos = 0;
-            for (int pass = 0; pass < 2; pass++) {
-                for (int64_t z = 0; z < mc->shape[0]; z++) for (int64_t y = 0; y < mc->shape[1]; y++) for (int64_t x = 0; x < mc->shape[2]; x++) {
-                    const size_t k = ((size_t)z * mc->shape[1] + (size_t)y) * mc->shape[2] + (size_t)x;
-                    const int64_t qz = fly ? z : z >> sh, qy = fly ? y : y >> sh, qx = fly ? x : x >> sh;
-                    if (cb[k] < iso || qz >= g[0] || qy >= g[1] || qx >= g[2]) continue;
-                    const uint8_t bv = bits[((size_t)qz * g[1] + (size_t)qy) * g[2] + (size_t)qx]; if (!bv) continue;
-                    const int pos = fly && (bv & 2);   /* (an onfly ink cell with a positive label: the stratified draw's positive list) */
-                    if (pass) { o.idx[o.n++] = (uint32_t)k; if (pos && o.pidx) o.pidx[o.pn++] = (uint32_t)k; } else { n++; npos += pos; }
-                }
-                if (!pass && (!n || !(o.idx = malloc(n * sizeof *o.idx)))) break;
-                if (!pass && npos) o.pidx = malloc(npos * sizeof *o.pidx);
+            const int iso = s->iso > 0 ? s->iso : 1;
+            if (tot >= 4.29e9) { free(bits); continue; }
+            {   /* UFSM_OCC_SCAN=full: the whole level-lc CT read and scanned (the old path); check: both, the lists compared (fatal on a difference) */
+                const char *ev = getenv("UFSM_OCC_SCAN"); const int full = ev && !strcmp(ev, "full"), chk = ev && !strcmp(ev, "check");
+                int rc = full ? occ_scan_full(cc, bits, g, fly ? -1 : sh, iso, fly, &o) : occ_scan_chunks(cc, bits, g, fly ? -1 : sh, iso, fly, &o);
+                if (!rc && chk) { occ_index r = {nullptr, 0, -1, {0, 0, 0}}; const int rr = occ_scan_full(cc, bits, g, fly ? -1 : sh, iso, fly, &r);
+                    const int same = !rr && r.n == o.n && r.pn == o.pn && (!o.n || !memcmp(r.idx, o.idx, o.n * sizeof *o.idx)) && (!o.pn || !memcmp(r.pidx, o.pidx, o.pn * sizeof *o.pidx));
+                    fprintf(stderr, "sampler: %s: UFSM_OCC_SCAN=check: chunked %zu / %zu cells, full scan %zu / %zu: %s\n", s->name, o.n, o.pn, r.n, r.pn, same ? "identical" : "DIFFERENT");
+                    free(r.idx); free(r.pidx); if (!same) { fprintf(stderr, "sampler: %s: the chunked draw-cell scan differs from the full scan\n", s->name); exit(3); } }
+                tq3 = occ_now(); free(bits); bits = nullptr;
+                if (rc) { free(o.idx); free(o.pidx); o.idx = o.pidx = nullptr; o.n = o.pn = 0; continue; }
             }
             if (fly && o.n) fprintf(stderr, "sampler: %s: ink draw cells: %zu supervised, %zu with positive labels%s\n", s->name, o.n, o.pn,
                                     o.pn ? "" : ": WARNING no positive cells, its windows hold negatives only (the stratified draw is off for it: empty_keep)");
             if (o.n) { o.lev = lc; for (int d = 0; d < 3; d++) o.shape[d] = mc->shape[d];
                 fprintf(stderr, "sampler: %s: %zu of %zu level-%d CT cells hold papyrus inside the stored target chunks (the draw cells)\n", s->name, o.n, tot, lc); }
-            free(cb); free(bits);
+            fprintf(stderr, "sampler: %s: draw cells in %.1f s: tile boxes %.1f, supervised pixels %.1f, level-%d CT read %.1f, scan %.1f\n", s->name, occ_now() - tq0,
+                    tq1 - tq0, tq2 - tq1, lc, tq3 - tq2, occ_now() - tq3);
+            free(bits);
         }
         return o;
     }
@@ -4070,6 +4174,26 @@ occ_index source_occupancy(source *s) {
     if (ck && o.n && occ_cache_save(dir, key, &o)) fprintf(stderr, "sampler: %s: the occupancy cache write failed (computed again next launch)\n", s->name);
     if (!o.n && s->mask) { free(o.idx); o = mask_occupancy(s); }
     return o;
+}
+/* every source's draw cells (source_occupancy), the sources on parallel workers (R1E: 57 sources, 1797 s serial before 2026-11-24; each source
+   is independent: its own CT / labels / onfly handle, the disk cache per key). UFSM_OCC_THREADS (default: the CPUs, at most 8); the indexes
+   are the same as the serial loop's, only the log lines interleave. nullptr: computed serially by the caller. */
+typedef struct { sources *S; occ_index *o; _Atomic int next; int inner; } occ_all_job;
+static void *occ_all_worker(void *p) {
+    occ_all_job *J = p; occ_inner_threads = J->inner;
+    for (;;) { const int i = atomic_fetch_add(&J->next, 1); if (i >= J->S->n) break; J->o[i] = source_occupancy(&J->S->src[i]); }
+    return nullptr;
+}
+occ_index *sources_occupancy_all(sources *S) {
+    const char *e = getenv("UFSM_OCC_THREADS"); int nth = e ? atoi(e) : ufsm_ncpu(); if (nth > 8) nth = 8; if (nth > S->n) nth = S->n;
+    if (nth < 2) return nullptr;
+    occ_all_job J = {.S = S, .o = calloc((size_t)S->n, sizeof *J.o), .inner = (ufsm_ncpu() + nth - 1) / nth};
+    if (!J.o) return nullptr;
+    pthread_t th[8]; int started = 0;
+    for (int t = 0; t < nth; t++) started += !pthread_create(&th[started], nullptr, occ_all_worker, &J);
+    for (int t = 0; t < started; t++) pthread_join(th[t], nullptr);
+    if (!started) { free(J.o); return nullptr; }
+    return J.o;
 }
 /* Pull the CT of every occupied cell at levels 0..maxlev through the chunk cache (training then reads from local disk).
    Cells are visited in a shuffled order so a partial prefetch is still useful; one thread per in-flight region. */
@@ -4574,8 +4698,9 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     pthread_cond_init(&sp->cv_free, nullptr);
     pthread_cond_init(&sp->cv_ready, nullptr);
     sp->occ = calloc((size_t)S->n, sizeof *sp->occ);
+    occ_index *pre = !cfg->cover && cfg->restore != 2 ? sources_occupancy_all(S) : nullptr;
     for (int i = 0; !cfg->cover && cfg->restore != 2 && i < S->n; i++) {
-        occ_index o = source_occupancy(&S->src[i]);
+        occ_index o = pre ? pre[i] : source_occupancy(&S->src[i]);
         const source *fs = &S->src[i];
         if (o.n) edge_zboost_index(sp, fs, &o);
         if (o.n && fs->focus && (cfg->focus_w > 0 || fs->focus_w > 0)) {   /* "focus": cell k drawn 1 + w x packed share times as often (repeated in the index) */
@@ -4602,6 +4727,9 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
             if (cfg->strict_sources) return nullptr;   /* (no workers started yet; the partial sampler is left to the exiting process) */
         }
     }
+    free(pre);
+    if (inkfly_mesh_stats) { uint64_t sh = 0, by = 0; inkfly_mesh_stats(&sh, &by);
+        if (sh || by) fprintf(stderr, "sampler: ink onfly meshes: %.2f GB resident, %llu segment opens served from the shared table (inkfly_prewarm or another source)\n", by / 1e9, (unsigned long long)sh); }
     /* (the replay state before the workers: a worker that finished its first window before these existed left it unreplayed, and
        --echo-max's reclaim read rq as a null pointer, 2026-11-14) */
     if (sp->cfg.replay > 1 || sp->cfg.echo_max > 0) {

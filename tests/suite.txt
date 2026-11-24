@@ -224,7 +224,7 @@ test_dcache_phase                              |              |     5 | ./$B/tes
 test_denselab                                  |              |    10 | tests/test_denselab.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/denselab
 test_label_versions                            |              |     3 | ./$B/test_label_versions $TMPDIR/label_versions
 test_ink_air                                   | gpu          |     2 | ./$B/test_ink_air
-test_ink_mil_train                             | gpu          |    40 | ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture
+test_ink_mil_train                             | gpu          |    40 | UFSM_OCC_SCAN=check UFSM_OCC_CACHE=0 ./$B/test_ink_mil_train ./$B/ufsm ./$B/make_wind_fixture
 test_accum                                     | gpu          |    20 | tests/test_accum.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/accum
 test_gscale                                    | gpu          |    55 | tests/test_gscale.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/gscale
 test_tcache                                    | gpu          |       40 | tests/test_tcache.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/tcache
@@ -407,7 +407,7 @@ test_latvol_sh                                 | gpu          |    60 | bash tes
 test_lat_direct                                | gpu          |    60 | bash tests/test_lat_direct.sh ./$B/ufsm ./$B/make_wind_fixture
 test_lat_fuse                                  | gpu          |     2 | ./$B/test_lat_fuse
 test_phase_onfly                               | gpu          |    20 | tests/test_phase_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/onfly
-test_fibre_onfly                               | gpu          |    25 | tests/test_fibre_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibonfly
+test_fibre_onfly                               | gpu          |    25 | UFSM_OCC_SCAN=check UFSM_OCC_CACHE=0 tests/test_fibre_onfly.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/fibonfly
 test_codes_onfly                               | gpu,smoke    |    10 | tests/test_codes_onfly.sh ./$B/ufsm $TMPDIR/codesonfly
 test_codes_grid                                |              |     2 | ./$B/test_codes_grid $TMPDIR/codesgrid
 test_mesh_phase                                | gpu          |     8 | tests/test_mesh_phase.sh ./$B/ufsm ./$B/test_mesh_phase $TMPDIR/meshphase

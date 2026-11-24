@@ -279,6 +279,8 @@ typedef struct sampler sampler;
 typedef struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; uint32_t *pidx; size_t pn; } occ_index;   /* coarse label cells that contain surface
     (pidx / pn: an onfly ink source's cells with positive labels: the stratified draw, cfg ink_pos_frac) */
 occ_index source_occupancy(source *s);
+/* every source's draw cells on parallel workers (UFSM_OCC_THREADS, default the CPUs <= 8): o[i] = source_occupancy(&S->src[i]); nullptr: run serially */
+occ_index *sources_occupancy_all(sources *S);
 /* warm the CT chunk cache for the labelled cells of every pyramid source (levels 0..maxlev, a fraction of the cells) */
 /* warm the CT chunk cache around every labelled cell: training windows up to P level voxels at the levels a source trains on
    (min_level .. min(maxlev, max_level)), their coarse-probe levels (+3) and every level >= 4 in full; dry: count the chunks only */

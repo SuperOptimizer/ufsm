@@ -1230,11 +1230,72 @@ static void ssurf_map(ssurf *s, const rmap *m) {
         s->X[i] = (float)f[0]; s->Y[i] = (float)f[1]; s->Z[i] = (float)f[2];
     }
 }
+/* The onfly meshes shared between ink sources: one load per (tifxyz, map) in the process, refcounted (R1E: 399 segment references to 204
+   meshes over its 57 sources; the coarse-scan pseudo sets reuse the same wraps, ~1 GB per set, the planner peak 59.6 GB). A mesh is
+   read-only once loaded (and mapped); inkfly_free releases its reference. */
+typedef struct { char key[2100]; ssurf s; int ref; } smesh;
+static pthread_mutex_t g_sm_mu = PTHREAD_MUTEX_INITIALIZER; static smesh *g_sm; static int g_sm_n, g_sm_cap;   /* mgpu: guarded (g_sm_mu) */
+static _Atomic uint64_t g_sm_shared, g_sm_bytes;   /* mgpu: guarded (atomics) */
+static int smesh_find(const char *key) { for (int i = 0; i < g_sm_n; i++) if (g_sm[i].ref > 0 && !strcmp(g_sm[i].key, key)) return i; return -1; }
+static int ssurf_get(ssurf *out, const char *tx, const char *mapkey, const rmap *map) {
+    char key[2100]; snprintf(key, sizeof key, "%s|%s", tx, mapkey ? mapkey : "");
+    pthread_mutex_lock(&g_sm_mu); int i = smesh_find(key);
+    if (i >= 0) { g_sm[i].ref++; *out = g_sm[i].s; pthread_mutex_unlock(&g_sm_mu); atomic_fetch_add(&g_sm_shared, 1); return 0; }
+    pthread_mutex_unlock(&g_sm_mu);
+    ssurf s; if (ssurf_load(&s, tx)) { ssurf_free(&s); return -1; }   /* (the load outside the lock: sources open in parallel) */
+    if (map) ssurf_map(&s, map);
+    pthread_mutex_lock(&g_sm_mu);
+    if ((i = smesh_find(key)) >= 0) { g_sm[i].ref++; *out = g_sm[i].s; pthread_mutex_unlock(&g_sm_mu); ssurf_free(&s); atomic_fetch_add(&g_sm_shared, 1); return 0; }   /* (a racing load won) */
+    for (i = 0; i < g_sm_n && g_sm[i].ref > 0; i++) {}
+    if (i == g_sm_n) { if (g_sm_n == g_sm_cap) { const int nc = g_sm_cap ? 2 * g_sm_cap : 64; smesh *w = realloc(g_sm, (size_t)nc * sizeof *w); if (!w) { pthread_mutex_unlock(&g_sm_mu); *out = s; return 0; } g_sm = w; g_sm_cap = nc; } g_sm_n++; }
+    snprintf(g_sm[i].key, sizeof g_sm[i].key, "%s", key); g_sm[i].s = s; g_sm[i].ref = 1; *out = s;
+    pthread_mutex_unlock(&g_sm_mu); atomic_fetch_add(&g_sm_bytes, 3 * sizeof(float) * (uint64_t)s.w * s.h);
+    return 0;
+}
+static void ssurf_put(ssurf *s) {
+    pthread_mutex_lock(&g_sm_mu); int hit = 0;
+    for (int i = 0; i < g_sm_n && !hit; i++) if (g_sm[i].ref > 0 && g_sm[i].s.X == s->X) { hit = 1; if (--g_sm[i].ref == 0) { ssurf_free(&g_sm[i].s); atomic_fetch_sub(&g_sm_bytes, 3 * sizeof(float) * (uint64_t)s->w * s->h); } }
+    pthread_mutex_unlock(&g_sm_mu);
+    if (!hit) ssurf_free(s);   /* (not in the table: a failed table grow) */
+    memset(s, 0, sizeof *s);
+}
+/* inkfly_prewarm: the meshes (tifxyz, no map) of SEGS files decoded on nth workers into the shared table, each held by one extra reference
+   until inkfly_prewarm_release (sources_load: before / after its serial per-source opens) */
+static ssurf *g_pw; static int g_pw_n;   /* mgpu: main (sources_load, before the per-GPU threads) */
+typedef struct { char (*tx)[1024]; int n; _Atomic int next; ssurf *out; } pw_job;
+static void *pw_worker(void *p) { pw_job *J = p; for (;;) { const int i = atomic_fetch_add(&J->next, 1); if (i >= J->n) break; if (ssurf_get(&J->out[i], J->tx[i], nullptr, nullptr)) memset(&J->out[i], 0, sizeof J->out[i]); } return nullptr; }
+int inkfly_prewarm(const char *const *segs, int nsegs, int nth) {
+    const char *e = getenv("UFSM_INK_PREWARM"); if (e && !atoi(e)) return 0;
+    int cap = 256, n = 0; char (*tx)[1024] = malloc((size_t)cap * sizeof *tx); if (!tx) return -1;
+    for (int k = 0; k < nsegs; k++) {
+        FILE *fp = fopen(segs[k], "rb"); if (!fp) continue;
+        fseek(fp, 0, SEEK_END); const long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *txt = malloc((size_t)sz + 1); const size_t rd = txt ? fread(txt, 1, (size_t)sz, fp) : 0; fclose(fp);
+        json *j = txt ? json_parse(txt, rd) : nullptr; const json *sg = json_get(j, "segments");
+        for (size_t i = 0; sg && sg->type == J_ARR && i < sg->n; i++) { const char *t = json_str(json_get(json_at(sg, i), "tifxyz"), nullptr); if (!t) continue;
+            int dup = 0; for (int q = 0; q < n && !dup; q++) dup = !strcmp(tx[q], t);
+            if (dup) continue;
+            if (n == cap) { cap *= 2; char (*w)[1024] = realloc(tx, (size_t)cap * sizeof *tx); if (!w) break; tx = w; }
+            snprintf(tx[n++], 1024, "%s", t); }
+        json_free(j); free(txt);
+    }
+    if (nth <= 0) nth = ufsm_ncpu(); if (nth > 16) nth = 16; if (nth > n) nth = n;
+    pw_job J = {.tx = tx, .n = n, .out = calloc((size_t)(n ? n : 1), sizeof(ssurf))}; if (!J.out) { free(tx); return -1; }
+    const double t0 = snow(); pthread_t th[16]; int st = 0;
+    for (int t = 0; t < nth; t++) st += !pthread_create(&th[st], nullptr, pw_worker, &J);
+    if (!st) pw_worker(&J);
+    for (int t = 0; t < st; t++) pthread_join(th[t], nullptr);
+    uint64_t by = 0; int ok = 0; for (int i = 0; i < n; i++) if (J.out[i].X) { ok++; by += 3 * sizeof(float) * (uint64_t)J.out[i].w * J.out[i].h; }
+    fprintf(stderr, "ink onfly: %d meshes of %d segments files decoded in %.1f s on %d threads (%.2f GB; UFSM_INK_PREWARM=0: one by one as each source opens)\n", ok, nsegs, snow() - t0, st ? st : 1, by / 1e9);
+    free(tx); inkfly_prewarm_release(); g_pw = J.out; g_pw_n = n;
+    return 0;
+}
+void inkfly_prewarm_release(void) { for (int i = 0; i < g_pw_n; i++) if (g_pw[i].X) ssurf_put(&g_pw[i]); free(g_pw); g_pw = nullptr; g_pw_n = 0; }
+void inkfly_mesh_stats(uint64_t *shared, uint64_t *bytes) { *shared = atomic_load(&g_sm_shared); *bytes = atomic_load(&g_sm_bytes); }
 static int inkfly_find(char (*paths)[1024], int n, const char *p) { for (int i = 0; i < n; i++) if (!strcmp(paths[i], p)) return i; return -1; }
 static void inkfly_free(void *p) {
     inkfly *f = p; if (!f) return;
     if (f->zc) zcache_drop(f->zc, f->base_ct);   /* (the shared ink CT cache outlives this source) */
-    for (int i = 0; i < f->nS; i++) ssurf_free(&f->S[i]);
+    for (int i = 0; i < f->nS; i++) ssurf_put(&f->S[i]);
     for (int i = 0; i < f->nL; i++) lsrc_close(&f->Ls[i]);
     if (f->rf_map) munmap(f->rf_map, f->rf_len);
     if (f->rl_map) munmap(f->rl_map, f->rl_len);
@@ -1322,27 +1383,63 @@ done:
     return rc;
 }
 /* one chunk [o, o + n) of the level-L grid: candidates -> CT box -> per unit: face + splat into accumulators -> finalize (max merge) */
-static int inkfly_chunk(inkfly *f, const int64_t o[3], const int64_t n[3], uint8_t *out, int *nonempty) {
-    const inksplat_cfg *c = &f->c; const double V = f->V; const size_t cv = (size_t)n[0] * n[1] * n[2];
-    memset(out, 255, cv); *nonempty = 0;
-    int64_t a0[3], b0[3]; for (int d = 0; d < 3; d++) { a0[d] = o[d] * (int64_t)V; b0[d] = (o[d] + n[d]) * (int64_t)V; }
-    /* candidate tiles (stamped by a per-call bitmap over the touched tile ids) */
-    size_t cap = 256, nc = 0; uint32_t *cand = malloc(cap * sizeof *cand);
-    int64_t g0[3], g1[3];
+/* The tiles whose box meets [a0, b0) (level-0 voxels), each once, ordered by (unit, tile), ties in the order the grid walk first met them:
+   the list the old per-candidate linear duplicate scan + insertion sort built, in O(n log n). Over a whole scan (the sampler's draw cells,
+   inkfly_cells_sup: Paris 4's 363 k tiles, a 1 M-tile teacher set) those two were quadratic: 40 s for Paris 4 alone (2026-11-24). */
+typedef struct { uint32_t t, pos, unit, tile; } ifcand;
+static int ifc_by_t(const void *a, const void *b) { const ifcand *x = a, *y = b; return x->t != y->t ? (x->t > y->t) - (x->t < y->t) : (x->pos > y->pos) - (x->pos < y->pos); }
+static int ifc_by_ut(const void *a, const void *b) { const ifcand *x = a, *y = b;
+    if (x->unit != y->unit) return (x->unit > y->unit) - (x->unit < y->unit);
+    if (x->tile != y->tile) return (x->tile > y->tile) - (x->tile < y->tile);
+    return (x->pos > y->pos) - (x->pos < y->pos); }
+static uint32_t *ifly_cands_ref(const inkfly *f, const int64_t a0[3], const int64_t b0[3], size_t *nout) {   /* the pre-2026-11-24 build (UFSM_IFLY_CANDS_CHECK) */
+    size_t cap = 256, nc = 0; uint32_t *cand = malloc(cap * sizeof *cand); int64_t g0[3], g1[3];
     for (int d = 0; d < 3; d++) { g0[d] = a0[d] / f->gcell; g1[d] = (b0[d] - 1) / f->gcell; if (g0[d] < 0) g0[d] = 0; if (g1[d] >= f->gdim[d]) g1[d] = f->gdim[d] - 1; }
     for (int64_t z = g0[0]; z <= g1[0]; z++) for (int64_t y = g0[1]; y <= g1[1]; y++) for (int64_t x = g0[2]; x <= g1[2]; x++) {
         const size_t gi = ((size_t)z * f->gdim[1] + y) * f->gdim[2] + x;
         for (uint32_t k = f->gstart[gi]; k < f->gstart[gi + 1]; k++) {
             const uint32_t t = f->glist[k]; if (!box_hit(f->T[t].lo, f->T[t].hi, a0, b0)) continue;
-            int dup = 0; for (size_t q = nc; q-- > 0 && !dup;) dup = cand[q] == t;   /* (a tile is listed in each cell it overlaps) */
+            int dup = 0; for (size_t q = nc; q-- > 0 && !dup;) dup = cand[q] == t;
             if (dup) continue;
             if (nc == cap) { cap *= 2; cand = realloc(cand, cap * sizeof *cand); }
             cand[nc++] = t;
         }
     }
-    if (!nc) { free(cand); return 0; }
-    /* sort candidates by unit */
     for (size_t i = 1; i < nc; i++) { uint32_t t = cand[i]; size_t j = i; while (j > 0 && (f->T[cand[j - 1]].unit > f->T[t].unit || (f->T[cand[j - 1]].unit == f->T[t].unit && f->T[cand[j - 1]].tile > f->T[t].tile))) { cand[j] = cand[j - 1]; j--; } cand[j] = t; }
+    *nout = nc; return cand;
+}
+static uint32_t *ifly_cands(const inkfly *f, const int64_t a0[3], const int64_t b0[3], size_t *nout) {
+    size_t cap = 256, n = 0; ifcand *v = malloc(cap * sizeof *v); *nout = 0; if (!v) return nullptr;
+    int64_t g0[3], g1[3];
+    for (int d = 0; d < 3; d++) { g0[d] = a0[d] / f->gcell; g1[d] = (b0[d] - 1) / f->gcell; if (g0[d] < 0) g0[d] = 0; if (g1[d] >= f->gdim[d]) g1[d] = f->gdim[d] - 1; }
+    for (int64_t z = g0[0]; z <= g1[0]; z++) for (int64_t y = g0[1]; y <= g1[1]; y++) for (int64_t x = g0[2]; x <= g1[2]; x++) {
+        const size_t gi = ((size_t)z * f->gdim[1] + y) * f->gdim[2] + x;
+        for (uint32_t k = f->gstart[gi]; k < f->gstart[gi + 1]; k++) {   /* (a tile is listed in each cell it overlaps) */
+            const uint32_t t = f->glist[k]; if (!box_hit(f->T[t].lo, f->T[t].hi, a0, b0)) continue;
+            if (n == cap) { cap *= 2; ifcand *w = realloc(v, cap * sizeof *v); if (!w) { free(v); return nullptr; } v = w; }
+            v[n] = (ifcand){t, (uint32_t)n, f->T[t].unit, f->T[t].tile}; n++;
+        }
+    }
+    size_t m = 0;
+    if (n) { qsort(v, n, sizeof *v, ifc_by_t); for (size_t i = 0; i < n; i++) if (!i || v[i].t != v[i - 1].t) v[m++] = v[i];   /* (the first meeting of each tile) */
+             qsort(v, m, sizeof *v, ifc_by_ut); }
+    uint32_t *out = malloc((m ? m : 1) * sizeof *out); if (!out) { free(v); return nullptr; }
+    for (size_t i = 0; i < m; i++) out[i] = v[i].t;
+    free(v); *nout = m;
+    { static int chk = -1; /* mgpu: env */ if (chk < 0) chk = getenv("UFSM_IFLY_CANDS_CHECK") && atoi(getenv("UFSM_IFLY_CANDS_CHECK"));   /* (tests: the old quadratic build as the reference) */
+      if (chk && n <= 200000) { size_t nr = 0; uint32_t *r = ifly_cands_ref(f, a0, b0, &nr);
+          if (!r || nr != m || (m && memcmp(r, out, m * sizeof *r))) { fprintf(stderr, "ink onfly: ifly_cands differs from the reference (%zu vs %zu tiles)\n", m, nr); abort(); }
+          free(r); } }
+    return out;
+}
+static int inkfly_chunk(inkfly *f, const int64_t o[3], const int64_t n[3], uint8_t *out, int *nonempty) {
+    const inksplat_cfg *c = &f->c; const double V = f->V; const size_t cv = (size_t)n[0] * n[1] * n[2];
+    memset(out, 255, cv); *nonempty = 0;
+    int64_t a0[3], b0[3]; for (int d = 0; d < 3; d++) { a0[d] = o[d] * (int64_t)V; b0[d] = (o[d] + n[d]) * (int64_t)V; }
+    /* candidate tiles (stamped by a per-call bitmap over the touched tile ids) */
+    size_t nc = 0; uint32_t *cand = ifly_cands(f, a0, b0, &nc);
+    if (!cand) return -1;
+    if (!nc) { free(cand); return 0; }
     if (ifgpu_on()) {   /* the GPU: label rectangles, mesh patches and the CT box from here; face, splat, finalize on the device (inkflygpu.h) */
         const int r = inkfly_chunk_gpu(f, o, n, cand, nc, out, nonempty);
         if (r <= 0) { free(cand); return r; }
@@ -1646,7 +1743,7 @@ z3 *inkfly_open(z3 *ct, const char *segs_path, const inksplat_cfg *cfg, size_t c
         const json *e = json_at(sg, (size_t)i); const char *tx = json_str(json_get(e, "tifxyz"), nullptr), *lb = json_str(json_get(e, "labels"), nullptr), *mk = json_str(json_get(e, "mask"), nullptr);
         if (!tx || !lb) { fprintf(stderr, "ink onfly: segment %d: need tifxyz and labels\n", i); goto fail; }
         ifunit *u = &f->U[f->nU];
-        if ((u->surf = inkfly_find(f->Spath, f->nS, tx)) < 0) { if (ssurf_load(&f->S[f->nS], tx)) goto fail; if (map) ssurf_map(&f->S[f->nS], map); snprintf(f->Spath[f->nS], 1024, "%s", tx); u->surf = f->nS++; }
+        if ((u->surf = inkfly_find(f->Spath, f->nS, tx)) < 0) { if (ssurf_get(&f->S[f->nS], tx, map ? cfg->map : nullptr, map)) goto fail; snprintf(f->Spath[f->nS], 1024, "%s", tx); u->surf = f->nS++; }
         if ((u->lab = inkfly_find(f->Lpath, f->nL, lb)) < 0) { if (lsrc_open(&f->Ls[f->nL], lb, -1, cfg->cache)) goto fail; snprintf(f->Lpath[f->nL], 1024, "%s", lb); u->lab = f->nL++; }
         u->msk = -1; u->val = -1;
         if (mk && (u->msk = inkfly_find(f->Lpath, f->nL, mk)) < 0) { if (lsrc_open(&f->Ls[f->nL], mk, -1, cfg->cache)) goto fail; snprintf(f->Lpath[f->nL], 1024, "%s", mk); u->msk = f->nL++; }
@@ -2299,31 +2396,32 @@ int inkfly_sample_window(void *handle, uint64_t seed, int P, int64_t o[3]) {
    its label window) whose mesh point lies in the window, the point and the unit normal in the window's level voxels and the 2-D label.
    mode 2 (train --ink-surf): every pixel, pad 1 on the ones mode 1 keeps; mode 1: only the pixels without an open face (the ones the --face voxel target leaves unknown; the face search as inkfly_chunk's on
    the level's CT); mode 0: every pixel. Pixels within reach (R level voxels + 1) of a held-out box are left out. */
+/* inkfly_cells_sup's sink: the ray's level-lev cell marked (bit 1; bit 2 = a positive label), the ray itself not kept */
+typedef struct { uint8_t *bits; int lev; const int64_t *shape; size_t k; } ifmark;
+static inline void ifly_mark(const inkfly *f, ifmark *m, const float p[3], uint8_t y) {
+    const double cs = (double)((int64_t)1 << m->lev); int64_t c[3];
+    for (int d = 0; d < 3; d++) { c[d] = (int64_t)floor(((double)p[d] * f->V + f->off) / cs); if (c[d] < 0 || c[d] >= m->shape[d]) return; }
+    uint8_t *q = &m->bits[((size_t)c[0] * m->shape[1] + c[1]) * m->shape[2] + c[2]]; m->k += !*q; *q |= (uint8_t)(1 | (y ? 2 : 0));
+}
+static int inkfly_rays_x(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout, ifmark *mk);
 int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout) {
+    return inkfly_rays_x(handle, o, n, mode, stride, R, out, nout, nullptr);
+}
+/* mk: each ray marked into mk instead of returned (*out stays null; mode 0: the candidate pixels are not collected either: Paris 4's whole-scan
+   call had held ~64 M pixels x (72 + 48) B, 2026-11-24) */
+static int inkfly_rays_x(void *handle, const int64_t o[3], const int64_t n[3], int mode, int stride, float R, inkray **out, size_t *nout, ifmark *mk) {
     inkfly *f = handle; *out = nullptr; *nout = 0; if (!f) return -1;
     const inksplat_cfg *c = &f->c; const double V = f->V; if (stride < 1) stride = 1;
     int64_t a0[3], b0[3]; for (int d = 0; d < 3; d++) { a0[d] = o[d] * (int64_t)V; b0[d] = (o[d] + n[d]) * (int64_t)V; }
     const double ex_m = (R + 1) * V;
-    size_t cap = 256, nc = 0; uint32_t *cand = malloc(cap * sizeof *cand);
-    int64_t g0[3], g1[3];
-    for (int d = 0; d < 3; d++) { g0[d] = a0[d] / f->gcell; g1[d] = (b0[d] - 1) / f->gcell; if (g0[d] < 0) g0[d] = 0; if (g1[d] >= f->gdim[d]) g1[d] = f->gdim[d] - 1; }
-    for (int64_t z = g0[0]; z <= g1[0]; z++) for (int64_t y = g0[1]; y <= g1[1]; y++) for (int64_t x = g0[2]; x <= g1[2]; x++) {
-        const size_t gi = ((size_t)z * f->gdim[1] + y) * f->gdim[2] + x;
-        for (uint32_t k = f->gstart[gi]; k < f->gstart[gi + 1]; k++) {
-            const uint32_t t = f->glist[k]; if (!box_hit(f->T[t].lo, f->T[t].hi, a0, b0)) continue;
-            int dup = 0; for (size_t q = nc; q-- > 0 && !dup;) dup = cand[q] == t;
-            if (dup) continue;
-            if (nc == cap) { cap *= 2; cand = realloc(cand, cap * sizeof *cand); }
-            cand[nc++] = t;
-        }
-    }
-    for (size_t i = 1; i < nc; i++) { uint32_t t = cand[i]; size_t j = i; while (j > 0 && (f->T[cand[j - 1]].unit > f->T[t].unit || (f->T[cand[j - 1]].unit == f->T[t].unit && f->T[cand[j - 1]].tile > f->T[t].tile))) { cand[j] = cand[j - 1]; j--; } cand[j] = t; }
+    size_t nc = 0; uint32_t *cand = ifly_cands(f, a0, b0, &nc);
+    if (!cand) return -1;
     /* the cached lists (rays-s<S>-m<M>.bin): the same rays in the same order. A version-2 mode-0 list (every pixel, with its index) also serves
        mode 1 (the face bits drop the faced pixels: the mode-1 list's rays, same order) and mode 2 (all, the faceless flagged) */
     const int rl_use = f->rl_map && f->rl_stride == stride && (f->rl_mode == mode || (f->rl_mode == 0 && f->rl_ver >= 2 && f->rf && (mode == 1 || mode == 2)));
     if (rl_use) {
         const double sign = c->flip ? -1 : 1; size_t tot = 0; for (size_t q = 0; q < nc; q++) tot += f->rl_off[cand[q] + 1] - f->rl_off[cand[q]];
-        inkray *Rr = malloc((tot ? tot : 1) * sizeof *Rr); size_t nr = 0; if (!Rr) { free(cand); return -1; }
+        inkray *Rr = mk ? nullptr : malloc((tot ? tot : 1) * sizeof *Rr); size_t nr = 0; if (!mk && !Rr) { free(cand); return -1; }
         for (size_t q = 0; q < nc; q++) for (uint64_t k = f->rl_off[cand[q]]; k < f->rl_off[cand[q] + 1]; k++) {
             const rlent *e = &f->rl_e[k]; int in = 1;
             const int faced = f->rl_mode == 0 && mode != 0 ? f->rf[(size_t)cand[q] * RF_TB + e->px / 8] >> (e->px % 8) & 1 : 0;
@@ -2331,6 +2429,7 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
             if (!in) continue;
             int ex = 0; for (int x = 0; x < c->nexcl && !ex; x++) { const int64_t *bx = c->excl[x]; ex = 1; for (int d = 0; d < 3 && ex; d++) ex = e->P[d] > bx[d] - ex_m && e->P[d] < bx[d] + bx[3 + d] + ex_m; }
             if (ex) continue;
+            if (mk) { float pm[3]; for (int d = 0; d < 3; d++) pm[d] = (float)((e->P[d] - f->off) / V - o[d]); ifly_mark(f, mk, pm, e->y); continue; }
             inkray *r = &Rr[nr++];
             for (int d = 0; d < 3; d++) { r->p[d] = (float)((e->P[d] - f->off) / V - o[d]); r->n[d] = sign < 0 ? -e->N[d] : e->N[d]; }
             r->y = e->y; r->w = 1; r->rs = 1; r->pad = mode == 2 && !faced; r->unit = (uint16_t)f->T[cand[q]].unit;
@@ -2366,6 +2465,8 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
                     if (!in) continue;
                     int ex = 0; for (int e = 0; e < c->nexcl && !ex; e++) { const int64_t *bx = c->excl[e]; ex = 1; for (int d = 0; d < 3 && ex; d++) ex = P[d] > bx[d] - ex_m && P[d] < bx[d] + bx[3 + d] + ex_m; }
                     if (ex) continue;
+                    if (mk && mode == 0) { float pm[3]; for (int d = 0; d < 3; d++) pm[d] = (float)((P[d] - f->off) / V - o[d]);
+                        ifly_mark(f, mk, pm, c->soft_y ? lab[(size_t)(r - rr0) * rw + (cc - rc0)] : lab[(size_t)(r - rr0) * rw + (cc - rc0)] >= 128); continue; }
                     if (np == pc) { pc *= 2; X = realloc(X, pc * sizeof *X); }
                     cpx *x = &X[np++]; memcpy(x->P, P, sizeof P); memcpy(x->N, N, sizeof N); x->y = c->soft_y ? lab[(size_t)(r - rr0) * rw + (cc - rc0)] : lab[(size_t)(r - rr0) * rw + (cc - rc0)] >= 128;
                     x->t = cand[q]; x->px = (uint16_t)((r - r0) * TS + (cc - c0));
@@ -2380,6 +2481,10 @@ int inkfly_rays(void *handle, const int64_t o[3], const int64_t n[3], int mode, 
         drop = calloc(np, 1); if (!drop) goto done;
         if (f->rf) for (size_t i = 0; i < np; i++) drop[i] = f->rf[(size_t)X[i].t * RF_TB + X[i].px / 8] >> (X[i].px % 8) & 1;
         else if (rays_face(f, X, np, lo3, hi3, drop)) { fprintf(stderr, "ink-onfly: rays: a CT slab read failed or a sample left its slab\n"); free(drop); goto done; }
+    }
+    if (mk) {   /* (mode 1 / 2: the collected pixels, marked) */
+        for (size_t i = 0; i < np; i++) { if (mode == 1 && drop && drop[i]) continue; float pm[3]; for (int d = 0; d < 3; d++) pm[d] = (float)((X[i].P[d] - f->off) / V - o[d]); ifly_mark(f, mk, pm, X[i].y); }
+        free(drop); rc = 0; goto done;
     }
     inkray *Rr = malloc((np ? np : 1) * sizeof *Rr); size_t nr = 0;
     for (size_t i = 0; i < np; i++) {
@@ -2435,17 +2540,10 @@ double ink_mil_loss_host(const float *logit, double *grad, int D, int H, int W, 
 int inkfly_cells_sup(void *handle, int lev, const int64_t shape[3], uint8_t *bits, int stride) {
     inkfly *f = handle; if (!f || f->V <= 0) return -1;
     const int64_t o[3] = {0, 0, 0}, n[3] = {(int64_t)1 << 36, (int64_t)1 << 36, (int64_t)1 << 36};
-    inkray *r = nullptr; size_t nr = 0;
-    if (inkfly_rays(handle, o, n, 0, stride, 0.f, &r, &nr)) { free(r); return -1; }
-    const double cs = (double)((int64_t)1 << lev); size_t k = 0;
-    for (size_t i = 0; i < nr; i++) {
-        int64_t c[3]; int in = 1;
-        for (int d = 0; d < 3 && in; d++) { c[d] = (int64_t)floor(((double)r[i].p[d] * f->V + f->off) / cs); in = c[d] >= 0 && c[d] < shape[d]; }
-        if (!in) continue;
-        uint8_t *q = &bits[((size_t)c[0] * shape[1] + c[1]) * shape[2] + c[2]]; k += !*q; *q |= (uint8_t)(1 | (r[i].y ? 2 : 0));   /* (bit 2: a positive label) */
-    }
+    inkray *r = nullptr; size_t nr = 0; ifmark mk = {bits, lev, shape, 0};   /* (each ray marked as it is made: the whole-scan ray list is never held) */
+    if (inkfly_rays_x(handle, o, n, 0, stride, 0.f, &r, &nr, &mk)) { free(r); return -1; }
     free(r);
-    return (int)(k > 2000000000 ? 2000000000 : k);
+    const size_t k = mk.k; return (int)(k > 2000000000 ? 2000000000 : k);
 }
 int inkfly_draw_key(void *handle, char *k, size_t nk) {
     const inkfly *f = handle; if (!f || !f->kdir[0] || nk < 64) return -1;
