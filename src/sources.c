@@ -639,6 +639,14 @@ sources *sources_load(const char *path) {
             fclose(mf);
         }
         s->ct_only = (int)json_num(json_get(e, "ct_only"), 0);
+        const json *zs = json_get(e, "ct_zslabs");   /* ct_only: [[z0, z1], ...] level-0 z ranges (half-open) its draw cells are restricted to */
+        if (zs) {
+            if (!s->ct_only || zs->type != J_ARR || !zs->n || zs->n > 8) { fprintf(stderr, "sources: %s: \"ct_zslabs\" needs \"ct_only\": 1 and 1..8 [z0, z1] ranges\n", s->name); json_free(j); sources_free(S); return nullptr; }
+            for (size_t k = 0; k < zs->n; k++) { const json *r = json_at(zs, k);
+                if (!r || r->type != J_ARR || r->n != 2 || !(json_num(json_at(r, 1), 0) > json_num(json_at(r, 0), 0))) { fprintf(stderr, "sources: %s: \"ct_zslabs\" entry %zu is not [z0, z1] with z1 > z0\n", s->name, k); json_free(j); sources_free(S); return nullptr; }
+                s->zslab[k][0] = (int64_t)json_num(json_at(r, 0), 0); s->zslab[k][1] = (int64_t)json_num(json_at(r, 1), 0); }
+            s->nzslab = (int)zs->n;
+        }
         const json *nj = json_get(e, "norm");   /* {"center": c, "scale": s}: a fixed per-scan CT normalisation instead of the window z-score */
         if (nj) {
             s->norm_c = (float)json_num(json_get(nj, "center"), 0); s->norm_s = (float)json_num(json_get(nj, "scale"), 0);
