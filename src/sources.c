@@ -639,6 +639,14 @@ sources *sources_load(const char *path) {
             fclose(mf);
         }
         s->ct_only = (int)json_num(json_get(e, "ct_only"), 0);
+        const json *zs = json_get(e, "ct_zslabs");   /* ct_only: [[z0, z1], ...] level-0 z ranges (half-open) its draw cells are restricted to */
+        if (zs) {
+            if (!s->ct_only || zs->type != J_ARR || !zs->n || zs->n > 8) { fprintf(stderr, "sources: %s: \"ct_zslabs\" needs \"ct_only\": 1 and 1..8 [z0, z1] ranges\n", s->name); json_free(j); sources_free(S); return nullptr; }
+            for (size_t k = 0; k < zs->n; k++) { const json *r = json_at(zs, k);
+                if (!r || r->type != J_ARR || r->n != 2 || !(json_num(json_at(r, 1), 0) > json_num(json_at(r, 0), 0))) { fprintf(stderr, "sources: %s: \"ct_zslabs\" entry %zu is not [z0, z1] with z1 > z0\n", s->name, k); json_free(j); sources_free(S); return nullptr; }
+                s->zslab[k][0] = (int64_t)json_num(json_at(r, 0), 0); s->zslab[k][1] = (int64_t)json_num(json_at(r, 1), 0); }
+            s->nzslab = (int)zs->n;
+        }
         const json *nj = json_get(e, "norm");   /* {"center": c, "scale": s}: a fixed per-scan CT normalisation instead of the window z-score */
         if (nj) {
             s->norm_c = (float)json_num(json_get(nj, "center"), 0); s->norm_s = (float)json_num(json_get(nj, "scale"), 0);
@@ -752,10 +760,15 @@ z3 *pyramid_open_level(store *st, const char *group, int level, double um0, cons
         /* relative form: every listed scale an exact power of two (1, 2, 4, ...) and none the source's um x 2^l. The old test needed level 0
            listed (scale 1.0), so a relative group without a local level 0 (the mirror's json over PHerc1667's levels 1-5, 2026-11-12) was read
            as absolute: 2.0 taken as um, every level off, the source silently excluded */
+        /* level-index names: every dataset path is its index ("0", "1", ...). Then an absolute match must sit at its own name: the mirror's
+           relative PHerc0172 (7.91 um) json lists "3" at scale 8 = 7.91 um x 2^0 within 2 %, which read the group as absolute and opened
+           level 3 as level 0 (11-24, "level 3 listed but cannot be opened" in DINO round 1). Other names (um-named "8", "16" ...) as before */
+        int idxn = 1;
+        for (int i = 0; i < nl; i++) { char *pe; const long pl = strtol(lv[i].path, &pe, 10); idxn &= pe != lv[i].path && *pe == 0 && pl == i; }
         int relf = 1, absf = 0;
         for (int i = 0; i < nl; i++) {
             const double e = log2(lv[i].um); relf &= lv[i].um >= 1.0 && fabs(e - round(e)) < 1e-9;
-            for (int l = 0; l < 16; l++) absf |= fabs(lv[i].um - um0 * (1 << l)) < 0.02 * um0 * (1 << l);
+            for (int l = 0; l < 16; l++) absf |= fabs(lv[i].um - um0 * (1 << l)) < 0.02 * um0 * (1 << l) && (!idxn || i == l);
         }
         const int rel_mode = relf && !absf;
         double want = rel_mode ? (double)(1 << level) : um0 * (1 << level);

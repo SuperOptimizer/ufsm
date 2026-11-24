@@ -3918,6 +3918,12 @@ static occ_index phase_occupancy(source *s) {
     fprintf(stderr, "sampler: %s: %zu of %lld stored-phase chunks (level %d cells) hold labels\n", s->name, n, (long long)(g[0] * g[1] * g[2]), o.lev);
     return o;
 }
+/* "ct_zslabs": does the level-lc cell row z overlap one of the source's level-0 z ranges (no slabs: every row) */
+static inline int zslab_in(const source *s, int64_t z, int lc) {
+    if (!s->nzslab) return 1;
+    for (int q = 0; q < s->nzslab; q++) if (s->zslab[q][0] < (z + 1) << lc && z << lc < s->zslab[q][1]) return 1;
+    return 0;
+}
 /* coarsest recto level that fits in memory: the cells containing any surface fraction (fallback: any labelled cell) */
 static occ_index label_occupancy(source *s) {
     occ_index o = {nullptr, 0, -1, {0, 0, 0}};
@@ -3936,8 +3942,11 @@ static occ_index label_occupancy(source *s) {
         for (int pass = 0; pass < 2 && !bad; pass++) {
             for (int64_t z0 = 0; z0 < mc->shape[0] && !bad; z0 += SZ) {
                 const int64_t nz = SZ < mc->shape[0] - z0 ? SZ : mc->shape[0] - z0, zo[3] = {z0, 0, 0}, zn[3] = {nz, mc->shape[1], mc->shape[2]};
+                if (s->nzslab) {   /* "ct_zslabs": rows outside every slab hold no draw cells (and their CT is not read) */
+                    int any = 0; for (int q = 0; q < s->nzslab; q++) any |= s->zslab[q][0] < (z0 + nz) << lc && (z0 << lc) < s->zslab[q][1];
+                    if (!any) continue; }
                 if (z3_read(cc, zo, zn, cb, 8)) { bad = 1; break; }
-                for (size_t k = 0; k < (size_t)nz * pl; k++) if (cb[k] >= iso) { if (!pass) n++; else if (seen++ % st == 0 && o.n < n) o.idx[o.n++] = (uint32_t)((size_t)z0 * pl + k); }
+                for (size_t k = 0; k < (size_t)nz * pl; k++) if (cb[k] >= iso && zslab_in(s, z0 + (int64_t)(k / pl), lc)) { if (!pass) n++; else if (seen++ % st == 0 && o.n < n) o.idx[o.n++] = (uint32_t)((size_t)z0 * pl + k); }
             }
             if (!pass) { st = n > ((size_t)1 << 24) ? (n + ((size_t)1 << 24) - 1) >> 24 : 1; const size_t keep = (n + st - 1) / st;
                          if (!n || !(o.idx = malloc(keep * sizeof *o.idx))) break; n = keep; }

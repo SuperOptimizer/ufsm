@@ -6,6 +6,31 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## DINO round 2 on a rented RTX PRO 6000 (96 GB): mirror CT through a disk cache, ct_zslabs, 0172 level fix (2026-11-24, podink)
+
+Round 1's recipe (`train --ssl 16` on the voxel net, `--single ink`, init wind96-u2, ssl share 0.75, 40k steps) on a pod with 13.6 CPUs
+and 124 GB RAM. CT comes from the dl.ash2txt volcomp mirror: 46 ct_only scans of 37 scrolls, now including 0332, MANB and MANBp; 0841 /
+1447 stay out. The anchors are round 1's six ink sources with human windows only (fetched upstream with the kit's gt.tsv).
+- P 512, B 1: the planner puts it at 25.4 of 99.4 GB (P 640 at 48.1 GB).
+- **Data wait = HTTP latency.** Without `UFSM_HTTP_CACHE`, every chunk read is a ranged HTTPS request, about 0.35 s to the first byte.
+  Result: 11-16 Mvox/s at 92-95 % sampler wait, the trainer at 39 % of one CPU.
+- **Fix:** `UFSM_HTTP_CACHE` on local disk, 32 workers, 16 slots, and a prefetch. Result: 156-199 Mvox/s, 0-21 % wait, SM 100 % busy,
+  1.2 step/s. Round 1 on the desk 5060 Ti: 31 Mvox/s at P 352.
+- **Prefetch speed:** the per-chunk `ufsm prefetch` reaches about 21 MB/s from the pod. Whole-shard `ufsm z3-fetch` (coalesced ranges)
+  brings the total to about 51 MB/s.
+- **New source key `"ct_zslabs": [[z0, z1], ...]`** (ct_only only; level-0 z, half-open). The needed CT at P 512 over the full scans is
+  about 2.6 TB at 2.4 um (levels 0-1, 38 / 105 KB per dense chunk) plus about 390 GB at 8.6-9.4 um (65 KB per chunk), against a 500 GB disk.
+  The key keeps a scan's draw cells (label_occupancy), and so `ufsm prefetch`, inside middle-z slabs.
+  - Budget: about 12 GB per fine scroll and 4.5 GB per coarse scroll, about 365 GB in total.
+  - Minimum slab: 1536 / 1024 level-0 voxels.
+  - Script: podink/mkslab.sh, slabs in podink/slabs.tsv.
+  - Test: test_ct_zslabs.
+- **PHerc0172 level bug.** pyramid_open_level read the mirror's relative-scale json (1, 2, 4 ... 32) as absolute because "3" = 8 lies
+  within 2 % of 7.91 um x 2^0. Level 3 was then opened as level 0: round 1's "0172 level 3 listed but cannot be opened". An absolute
+  match now must sit at its own integer level name (test_pyramid_rel). Desk runs on v2/ct, whose jsons have absolute scales
+  (R1E / R1E-D), were not affected.
+- **dinovox-20261123** (`--single ink` + `--ssl`, test_heads) had never reached master. Round 1 ran on that branch; merged here.
+
 ## HF ink labels (vincentl065/herculaneum-ink-labels) on our meshes: 10.8k mm² of new sure ink, Scroll 5 added (2026-11-23, hfink)
 
 The public 2-D set: 2218 crops at 9.362 µm/px (0 bg / 1 ink / 2 ignore / 255 outside, styles A-E), each on "its segment's 9.362 µm grid".

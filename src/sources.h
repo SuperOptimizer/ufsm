@@ -161,6 +161,8 @@ typedef struct {
                                                                      RAW.json): a source without a label occupancy index draws its windows around
                                                                      cells with code >= min (2: valid window centres, 1: any object cell) */
     int ct_only;      /* "ct_only": 1: the source is drawn without any target (every channel's w = 0, mask = CT > 0): label-free terms */
+    int nzslab; int64_t zslab[8][2];   /* optional "ct_zslabs" (ct_only): [[z0, z1], ...] level-0 z ranges; the scan's draw cells only there (a pod caching
+                                          a slab of a scan too large for its disk, podink 11-24; sample.c label_occupancy, so ufsm prefetch follows it) */
     struct srpair *srp;     /* optional "sr_pair": {"role": "train" | "val", "lut": 1, "cache": 0} (src/srpair.h): the source is a real SR pair directory ("root");
                                task restore then reads its boxes instead of the CT (no CT levels are opened) */
     int view, view_level; char *view_map;   /* optional "view": {"map": REG.json (omit: this scan itself), "level": L (default 0)}: the second-scan
