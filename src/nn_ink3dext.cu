@@ -208,3 +208,56 @@ __global__ void k_i3f_crops(const uint8_t *slab, int Y, int X, int T, int P, con
 extern "C" void i3f_crops(const uint8_t *slab, int Y, int X, int T, int P, const uint32_t *hist, const int *pyx_dev, int n, void *out_half, float *lohi_dev) {
     if (n > 0) k_i3f_crops<<<n, 256, 0, ST>>>(slab, Y, X, T, P, hist, Y / (16 * P), X / (16 * P), pyx_dev, (__half *)out_half, lohi_dev);
 }
+
+/* ---- the published-exact path's prep on the GPU (ink3d-ext --gpu-prep 1, 2026-11-20): the level-0 slab [256][Y][X] on the device; crops by
+   their parent's first voxel (pz, py, px) in the slab; parent edge PE, crop edge CE at offset PO in the parent. The host keeps the exact
+   np.percentile / lut code on the integer histograms, so the network input is byte-identical to the CPU prep (prep_worker). ---- */
+__global__ void k_i3x_cmax(const uint8_t *slab, int Y, int X, const int *pzyx, int CE, int PO, int *cmax) {
+    __shared__ int m; if (!threadIdx.x) m = 0; __syncthreads();
+    const int *p = pzyx + 3 * blockIdx.x; const int z0 = p[0] + PO, y0 = p[1] + PO, x0 = p[2] + PO;
+    uint32_t mx = 0;
+    for (int i = threadIdx.x; i < CE * CE * CE; i += blockDim.x) {   /* (x fastest: coalesced rows) */
+        const int x = i % CE, y = (i / CE) % CE, z = i / (CE * CE);
+        const uint32_t v = slab[((size_t)(z0 + z) * Y + y0 + y) * X + x0 + x]; mx = v > mx ? v : mx;
+    }
+    for (int o = 16; o; o >>= 1) { const uint32_t w = __shfl_xor_sync(0xffffffffu, mx, o); mx = w > mx ? w : mx; }
+    if (!(threadIdx.x & 31)) atomicMax(&m, (int)mx);
+    __syncthreads();
+    if (!threadIdx.x) cmax[blockIdx.x] = m;
+}
+/* the parent's histogram (every st-th voxel per axis from its first), one block per crop: 8 warp-private 256-bin histograms in shared
+   memory, summed into hist[n][256] */
+__global__ void __launch_bounds__(256) k_i3x_hist(const uint8_t *slab, int Y, int X, const int *pzyx, int PE, int st, uint32_t *hist) {
+    __shared__ uint32_t h[8][256];
+    for (int k = threadIdx.x; k < 8 * 256; k += 256) (&h[0][0])[k] = 0;
+    __syncthreads();
+    const int *p = pzyx + 3 * blockIdx.x; const int z0 = p[0], y0 = p[1], x0 = p[2], w = threadIdx.x >> 5, E = PE / st;
+    uint32_t *hw = h[w];
+    for (int zy = w; zy < E * E; zy += 8) {   /* a warp per (z, y) row */
+        const uint8_t *r = slab + ((size_t)(z0 + (zy / E) * st) * Y + y0 + (zy % E) * st) * X + x0;
+        for (int x = (threadIdx.x & 31); x < E; x += 32) atomicAdd(&hw[r[(size_t)x * st]], 1u);
+    }
+    __syncthreads();
+    const int v = threadIdx.x; uint32_t s = 0;
+    for (int k = 0; k < 8; k++) s += h[k][v];
+    hist[(size_t)blockIdx.x * 256 + v] = s;
+}
+/* the crops [CE]^3 at PO in their parents -> u8 [n][CE^3] (crop_copy) */
+__global__ void k_i3x_gather(const uint8_t *slab, int Y, int X, const int *pzyx, int CE, int PO, uint8_t *out) {
+    const int *p = pzyx + 3 * blockIdx.y; const int z0 = p[0] + PO, y0 = p[1] + PO, x0 = p[2] + PO;
+    uint8_t *o = out + (size_t)blockIdx.y * CE * CE * CE;
+    const size_t n = (size_t)CE * CE * CE;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        const int x = (int)(i % CE), y = (int)((i / CE) % CE), z = (int)(i / ((size_t)CE * CE));
+        o[i] = slab[((size_t)(z0 + z) * Y + y0 + y) * X + x0 + x];
+    }
+}
+extern "C" void i3x_cmax(const uint8_t *slab, int Y, int X, const int *pzyx_dev, int n, int CE, int PO, int *cmax_dev) {
+    if (n > 0) k_i3x_cmax<<<n, 512, 0, ST>>>(slab, Y, X, pzyx_dev, CE, PO, cmax_dev);
+}
+extern "C" void i3x_hist(const uint8_t *slab, int Y, int X, const int *pzyx_dev, int n, int PE, int st, uint32_t *hist_dev) {
+    if (n > 0) k_i3x_hist<<<n, 256, 0, ST>>>(slab, Y, X, pzyx_dev, PE, st, hist_dev);
+}
+extern "C" void i3x_gather(const uint8_t *slab, int Y, int X, const int *pzyx_dev, int n, int CE, int PO, uint8_t *out_dev) {
+    if (n > 0) k_i3x_gather<<<dim3(64, n), 256, 0, ST>>>(slab, Y, X, pzyx_dev, CE, PO, out_dev);
+}
