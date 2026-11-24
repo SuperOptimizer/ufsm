@@ -127,6 +127,7 @@ ufsm_exe(test_unroll_qa SUITE tests/test_unroll_qa.c OBJS unrollqa afv fit fit_e
 ufsm_exe(test_flatten SUITE tests/test_flatten.c OBJS flatten imgops jpegpar tiffw tiff LIBS LDLIBS)
 ufsm_exe(test_flatten_gpu SUITE tests/test_flatten.c OBJS flatten imgops jpegpar tiffw tiff nn_flat LIBS LDLIBS CUDA DEFS FLAT_GPU)
 ufsm_exe(test_formats SUITE tests/test_formats.c OBJS CORE NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_pyramid_rel SUITE tests/test_pyramid_rel.c OBJS CORE NN LP LIBS LDLIBS CUDA m)
 ufsm_exe(test_fstem SUITE tests/test_fstem.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_latdec SUITE tests/test_latdec.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_slab_tg SUITE tests/test_slab_tg.c OBJS NN LP LIBS m CUDA)
