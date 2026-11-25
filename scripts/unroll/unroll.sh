@@ -192,6 +192,12 @@ capgb() { local cg d m best=; cg=$(awk -F: '$1 == "0" {print $3}' /proc/self/cgr
           while [ -n "$cg" ] && [ "$d" != /sys/fs/cgroup ] && [ "$d" != / ]; do m=$(cat $d/memory.max 2> /dev/null); [ -n "$m" ] && [ "$m" != max ] && { m=$((m >> 30)); [ -z "$best" ] || [ $m -lt $best ] && best=$m; }; d=$(dirname $d); done
           echo ${best:-}; }
 memok() { [ "$DRY" = 1 ] && return 0; local mm=$MINMEM c; c=$(capgb); [ -n "$c" ] && [ $mm -gt $((c / 4)) ] && mm=$((c / 4)); while [ $(availgb) -lt $mm ]; do sleep 30; done; }
+# the zcache lives in /dev/shm, which is charged to this process's memory cgroup: under a memcap scope it counts against memory.max
+# like RSS. Clamp it (auto or set) to a quarter of the smallest memory.max on the cgroup path (11-24: MANB's 30 GB cache + stripimg
+# + perwrap renders under a 50G cap = OOM kill in stripimg).
+ZCCAP=$(capgb); if [ -n "$ZCCAP" ] && [ "$ZCACHE_GB" -gt $((ZCCAP / 4)) ]; then
+  echo "DEFAULTED: ZCACHE_GB $ZCACHE_GB -> $((ZCCAP / 4)) (a quarter of the cgroup memory.max ${ZCCAP} GB: /dev/shm is charged to it)" >&2
+  ZCACHE_GB=$((ZCCAP / 4)); fi
 # X LOG CMD..: a command, nice 10, timed (/usr/bin/time -v appended to LOG); DRY: printed
 X() { local l=$1; shift; if [ "$DRY" = 1 ]; then echo "    $*  > $l"; return 0; fi
       /usr/bin/time -v nice -n 10 "$@" >> $l 2>&1; }
