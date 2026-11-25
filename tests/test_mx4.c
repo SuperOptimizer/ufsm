@@ -1107,8 +1107,9 @@ int main(void) {
             (void)S;
         }
     }
-    for (int CI = 16; CI <= 96; CI += CI < 32 ? 16 : 32) for (int co = 8; co <= 16; co += co == 8 ? 1 : 7) {   /* heads of 8, 9 and 16 outputs (phase: recto + 6
-        affinities + cos + sin): 1^3 forward (fp32 and fp16 logits, plain and GN+SiLU input) and backward data into an MX-fp4 gradient */
+    for (int CI = 16; CI <= 448; CI = CI < 32 ? CI + 16 : CI < 96 ? CI + 32 : CI == 96 ? 448 : 512) for (int co = 8; co <= 16; co += co == 8 ? 1 : 7) {   /* heads of 8, 9
+        and 16 outputs (phase: recto + 6 affinities + cos + sin): 1^3 forward (fp32 and fp16 logits, plain and GN+SiLU input) and backward data into an
+        MX-fp4 gradient; 448 inputs: try9's decoder level 3 under --distill (35 KB of shared memory at 16 outputs) */
         shape5 xs = {2, CI, 6, 10, 12}, ys = xs; ys.c = co;
         const size_t nx = shape_numel(xs), ny = shape_numel(ys);
         float *x = dev_rand(nx, 2.f), *w = dev_rand((size_t)co * CI, 0.3f), *b = dev_rand(co, 0.1f);
