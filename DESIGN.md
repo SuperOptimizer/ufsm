@@ -6,6 +6,57 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## mcc pin ff7f174 -> 01873d0: guard folding, join / partial jump threading, mcudahw kernel log (2026-11-25, microc)
+- The pin moves to 01873d0 (microc branch csetdev-20261125, tag ufsm-pin-20261125b). That is ff7f174 plus two parts:
+  - jitorder's three mcudahw commits: MCUDA_PRECOMPILE compiles the largest kernels first; one process compiles a given kernel
+    text (PATH.lock); MCUDA_KLOG=FILE / MCUDA_PRECOMPILE_ONLY=@FILE, which `run_suite -J` needs for its selective warm-up.
+  - One compiler commit, device code only. Host .text of all 508 host units is byte-identical to the old pin.
+- Why: on sm_120, mcc's bwd_data_s2_mx2_k<4,4> took 1.65x nvcc 13.3's time. Its 32 x 8 unrolled guarded loads
+  (`k < bwy && ...`, `j < q4` with bw = mx_bw(C) in {8, 16, 32}) were tested 8 times per k, against nvcc's 3. Each test came
+  with 32 phi copies, and ptxas then duplicated the chain.
+- The compiler changes (each has an off switch):
+
+  | change | what it does | off switch |
+  |---|---|---|
+  | constant sets (ir.c) | an I32 made from selects / phis of constants and constant arithmetic (at most 8 values): a compare with a constant is folded when decided, else rewritten as x >= t / x < t with t a member, so equal tests become one value | MCC_NOCSET |
+  | join threading (opt.c) | a successor with other predecessors takes over B's phis as new phis | MCC_NOJTJOIN |
+  | compare implication (opt.c) | a branch on x OP c1 decides x OP c2 (interval check) | MCC_NOJTCMP |
+  | partial threading (opt.c) | a predecessor that decides B jumps straight past it; B stays for the others; loop heads excluded; B's values also wanted below are moved to its dominator | MCC_NOJTP |
+
+  - Two latent ptx.c reads of a phi's xargs index as a value (xrem_mark, range_fold) are fixed. They crashed once threading
+    made phis with many arguments.
+
+- sm_120, desk card 0, exclusive (13:10, the fixture ink net P 448, 3 steps; 3 alternating runs per build, spread < 1 %), ms per run:
+
+  | kernel | pin ff7f174 | 01873d0 | nvcc 13.3 | new / pin |
+  |---|---|---|---|---|
+  | bwd_data_s2_mx2<4,4> | 140.5 | 101.2 | 85.1 | 0.72 |
+  | conv_fwd_f8s | 327 | 318 | 305 | 0.97 |
+  | conv_fwd_f4p<1,4> | 355 | 349 | 286 | 0.98 |
+  | up2_mx_tile | 32.0 | 30.1 | 25.1 | 0.94 |
+  | conv_fwd_f4u<4> | 126 | 128.6 | 99.8 | 1.02 |
+  | all network kernels (k_entropy excluded) | 1846 | 1781 | 1662 | 0.965 |
+
+  k_entropy per launch is unchanged. Every other kernel is 0.99-1.01x.
+- Earlier the same day (desk card 1, same net), mcc ff7f174 was already ahead of nvcc on conv_fwd_f4r (0.97x), conv_bwd_w_f4ws
+  (0.91x) and k_entropy (0.94x). ff7f174's static spill bytes on f4r cost no time.
+- What is left vs nvcc is f4p<1,4> (1.22x), f4u (1.29x), bwd_data_s2 (1.19x) and gy_pre4 (1.17x).
+  - f4p is instruction-bound in every build (issue slots 64-69 %, ncu). mcc executes 6.5 G instructions against nvcc's
+    5.8 G, and 0.39 G of the difference are MOVs: a 32-register move of the accumulators into the epilogue's join, done on 4
+    paths, plus the stochastic-rounding epilogue. This is the next target.
+  - ncu reports: /vesuvius/ufsm/microc/deskab/ncu0.
+- bwd_data_s2: mcuda's per-row bound (branch s2kn-20261125, kn = min(bwy, Co - yb bwy)) lets the partial threading end the
+  k chain at the first miss. The bench_f4conv A/B, pin / 01873d0 x base / kn, is still to run.
+- Checks:
+  - arch86 fast tier on the 3070 pod: 384 PASS, 0 FAIL. test_pipeline_cli timed out on a cold JIT cache in the full run and
+    passed on rerun.
+  - ufsm builds fully on sm_120.
+  - sm_120 GPU half: see the merge commit.
+- Scripts in /vesuvius/ufsm/microc/deskab:
+  - gap0d.sh / x0.sh / y0.sh: card 0 behind inkperf's hold, nsys A/B, ncu.
+  - sassx.sh / sass120d.sh / kres2.sh: offline sm_120a SASS of a unit or a modified copy, mcc vs nvcc.
+  - hostcmp.sh: host .text compare.
+
 ## Fibre ties in count-field: AFV ties help P4 (+0.04), our own 1667 tracer ties hurt (-0.03); PAUSED (2026-11-19..25, mergeflag)
 
 Same-sheet fibre pairs as count-field rows (`--fibers F.fib --cf-fib W`, 7337a415; `--cf-fib-every 128 --cf-fib-spans 64,256`, since
