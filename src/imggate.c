@@ -90,3 +90,14 @@ int cmd_img_stretch(int argc, char **argv) {
     printf("%d,%d,%d,%d\n", ca, cb0 > ca + 1 ? cb0 : ca + 1, ia, ib0 > ia + 1 ? ib0 : ia + 1);
     return 0;
 }
+
+/* ufsm img-diff A.tif B.tif: two uint8 maps of one size compared byte for byte: "max_abs N n_diff N n N" (exit 0; 1 on a size mismatch /
+   unreadable). For cross-card checks of one recipe (reader3 on sm_86 vs sm_120, 2026-11-25: the lead's |d| <= 1 LSB bar). */
+int cmd_img_diff(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm img-diff A.tif B.tif: max |a - b|, the count of differing bytes, the byte count\n"); return 2; }
+    int w, h, w2, h2; uint8_t *a = img_read_u8(argv[2], &w, &h), *b = img_read_u8(argv[3], &w2, &h2);
+    if (!a || !b || w != w2 || h != h2) { fprintf(stderr, "img-diff: cannot read %s / %s as one size\n", argv[2], argv[3]); free(a); free(b); return 1; }
+    const size_t np = (size_t)w * h; size_t nd = 0; int mx = 0;
+    for (size_t i = 0; i < np; i++) { const int d = abs((int)a[i] - (int)b[i]); nd += d != 0; mx = d > mx ? d : mx; }
+    printf("max_abs %d n_diff %zu n %zu\n", mx, nd, np); free(a); free(b); return 0;
+}
