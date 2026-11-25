@@ -20,9 +20,23 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
    product over the axes of sin^2 of the voxel's place in its tile (fb_tile_w, as field-blend --tile), so two grids offset by half a tile
    on each axis sum to 1 and every tile border gets weight ~0. Inputs: uint8 probability groups on one grid (level named by U). Output:
    uint8 probability (volcomp --q, default 0 = lossless since 2026-11-14; was 32) with OUT's coarse levels mean-pooled. Shards where every input is absent are skipped (fill 0). */
-typedef struct { uint8_t **in; int n; const float *wz, *wy, *wx; int S; int64_t n3[3]; uint8_t *out; uint8_t *const *mk; } ib_job;   /* mk[i]: nullptr or 0 = absent */
+/* mk[i]: nullptr or 0 = absent. bp (block mode, perf 11-25): per B^3 block of the shard (nb per axis) and input, 1 = present, instead of
+   mk: a block no input is present in is written 0 without its arithmetic (the full pass gives it 0: every weight masked), the rest as
+   with the masks (the same flags, weights and order) */
+typedef struct { uint8_t **in; int n; const float *wz, *wy, *wx; int S; int64_t n3[3]; uint8_t *out; uint8_t *const *mk; const uint8_t *bp; int B, nb; } ib_job;
+static void ib_seg(const ib_job *J, int z, int64_t y, int64_t x0, int64_t x1, const uint8_t *p);
 static void ib_rows(void *a, int z0, int z1, int t) {
     (void)t; const ib_job *J = a; const int64_t ny = J->n3[1], nx = J->n3[2];
+    if (J->bp) {
+        for (int z = z0; z < z1; z++) for (int64_t y = 0; y < ny; y++)
+            for (int bx = 0; bx < J->nb; bx++) {
+                const uint8_t *p = J->bp + ((size_t)((z / J->B) * J->nb + y / J->B) * J->nb + bx) * J->n; int any = 0;
+                for (int i = 0; i < J->n; i++) any |= p[i];
+                if (any) ib_seg(J, z, y, (int64_t)bx * J->B, (int64_t)(bx + 1) * J->B, p);
+                else memset(J->out + ((size_t)z * ny + y) * nx + (size_t)bx * J->B, 0, (size_t)J->B);
+            }
+        return;
+    }
     for (int z = z0; z < z1; z++) for (int64_t y = 0; y < ny; y++) {
         const size_t r = ((size_t)z * ny + y) * nx;
         if (J->n == 2) {   /* (the unroll's two grids) the same arithmetic in the same order: wz wy per row, then x wx */
@@ -47,6 +61,31 @@ static void ib_rows(void *a, int z0, int z1, int t) {
             }
             J->out[r + x] = w > 0 ? (uint8_t)fmin(255.0, s / w + 0.5) : 0;
         }
+    }
+}
+/* one row segment [x0, x1) of block mode: inputs with p[i] = 0 skipped, as a 0 in their mask (ib_rows' arithmetic, same order) */
+static void ib_seg(const ib_job *J, int z, int64_t y, int64_t x0, int64_t x1, const uint8_t *p) {
+    const size_t r = ((size_t)z * J->n3[1] + y) * J->n3[2];
+    if (J->n == 2) {
+        volatile double wzy0v = (double)J->wz[z] * J->wy[y], wzy1v = (double)J->wz[(size_t)J->S + z] * J->wy[(size_t)J->S + y];
+        const double wzy0 = wzy0v, wzy1 = wzy1v; const int u0 = p[0], u1 = p[1];
+        const float *wx0 = J->wx, *wx1 = J->wx + J->S; const uint8_t *i0 = J->in[0] + r, *i1 = J->in[1] + r; uint8_t *o = J->out + r;
+        for (int64_t x = x0; x < x1; x++) {
+            double s = 0, w = 0;
+            if (u0) { const double wi = wzy0 * wx0[x]; s += wi * i0[x]; w += wi; }
+            if (u1) { const double wi = wzy1 * wx1[x]; s += wi * i1[x]; w += wi; }
+            o[x] = w > 0 ? (uint8_t)fmin(255.0, s / w + 0.5) : 0;
+        }
+        return;
+    }
+    for (int64_t x = x0; x < x1; x++) {
+        double s = 0, w = 0;
+        for (int i = 0; i < J->n; i++) {
+            if (!p[i]) continue;
+            const double wi = (double)J->wz[(size_t)i * J->S + z] * J->wy[(size_t)i * J->S + y] * J->wx[(size_t)i * J->S + x];
+            s += wi * J->in[i][r + x]; w += wi;
+        }
+        J->out[r + x] = w > 0 ? (uint8_t)fmin(255.0, s / w + 0.5) : 0;
     }
 }
 /* --tile-list FILE (2026-11-20, fullvram: the FAST ink score): only the output shards listed ("iz iy ix" of --shard) are blended and
@@ -114,6 +153,21 @@ int ink_blend_run(const char *out, double um, const double st[3], int n, const c
     uint8_t *buf[32]; for (int i = 0; i < n; i++) if (!(buf[i] = malloc(sv))) { fprintf(stderr, "ink-blend: out of memory\n"); return 1; }
     uint8_t *ob = malloc(sv), *mk[32] = {nullptr}; float *wv[3]; for (int d = 0; d < 3; d++) wv[d] = malloc((size_t)n * S * sizeof(float));
     int64_t ns[3]; for (int d = 0; d < 3; d++) ns[d] = (shape[d] + S - 1) / S;
+    /* block flags instead of voxel masks (perf 11-25): predict --seamless 2 writes its passes with shards S / 2 (128 for window 288 halo
+       16) and blends into the run's --shard (512): a tile-list predict fills a few 128^3 blocks of each 512^3 output shard, and every
+       input with an absent shard got a 128 MB voxel mask (memset to 1, then 0 per absent shard) and every voxel was blended (Paris4 aux,
+       1455 tiles: the blend 68 of 189 s wall, memset 18 % + ib_rows 18 % of its CPU). With every input's shards and origin on a B grid
+       (B = the smallest input shard edge, dividing S) each B^3 block lies inside one shard per input: a per-block presence flag replaces
+       the mask, blocks no input has are written 0 (the full pass gives them 0 too: every weight masked), the rest blended with the same
+       weights, values and order (byte-identical; tests/test_ink_blend_block.c). (A per-block read + blend was slower: 105 s; the
+       whole-shard reads stay.) UFSM_IB_BLOCK=0: the voxel masks. */
+    int B = S;
+    for (int i = 0; i < n; i++) { const z3_meta *m = z3_meta_of(zz[i]); for (int d = 0; d < 3; d++) if (m->shard[d] < B) B = (int)m->shard[d]; }
+    { int ok = B >= 16 && B < S && S % B == 0 && !(getenv("UFSM_IB_BLOCK") && !atoi(getenv("UFSM_IB_BLOCK")));
+      for (int i = 0; i < n && ok; i++) { const z3_meta *m = z3_meta_of(zz[i]); for (int d = 0; d < 3; d++) if (m->shard[d] % B || org[i][d] % B) ok = 0; }
+      if (!ok) B = 0; }
+    long long nlive = 0, nblk = 0; uint8_t *bpres = B ? malloc((size_t)(S / B) * (S / B) * (S / B) * n) : nullptr;
+    if (B && !bpres) { fprintf(stderr, "ink-blend: out of memory\n"); return 1; }
     int nw = 0, nskip = 0; double t0 = now();
     for (int64_t a = 0; a < ns[0]; a++) for (int64_t b = 0; b < ns[1]; b++) for (int64_t c = 0; c < ns[2]; c++) {
         const int64_t o[3] = {a * S, b * S, c * S}, nn[3] = {S, S, S};
@@ -129,10 +183,21 @@ int ink_blend_run(const char *out, double um, const double st[3], int n, const c
                         if (z3_shard_present(zz[i], za, ya, xa) == 1) any = 1;
         }
         if (!any) { nskip++; continue; }
+        int live = 0; const int nb = B ? S / B : 0, nb3 = nb * nb * nb;
+        for (int q = 0; q < nb3; q++) {   /* each block's inputs present (aligned: a block lies inside one input shard, present or absent whole) */
+            const int bz = q / (nb * nb), by = q / nb % nb, bx = q % nb; int np = 0;
+            for (int i = 0; i < n; i++) {
+                const z3_meta *m = z3_meta_of(zz[i]); int in = 1; int64_t q3[3];
+                for (int d = 0; d < 3; d++) { const int64_t l = o[d] + (int64_t)(d ? d == 1 ? by : bx : bz) * B - org[i][d]; if (l < 0 || l >= ish[i][d]) in = 0; q3[d] = l >= 0 ? l / m->shard[d] : 0; }
+                bpres[(size_t)q * n + i] = in && z3_shard_present(zz[i], q3[0], q3[1], q3[2]) == 1; np += bpres[(size_t)q * n + i];
+            }
+            live += np > 0;
+        }
         for (int i = 0; i < n; i++) {
             const int64_t lo[3] = {o[0] - org[i][0], o[1] - org[i][1], o[2] - org[i][2]};
             if (z3_read(zz[i], lo, nn, buf[i], nt)) { fprintf(stderr, "ink-blend: read %s: %s\n", in[i], z3_error()); return 1; }
-            {   /* input shards absent inside this output shard (the other input's grid, occupancy-skipped air): a voxel mask of weight 0 */
+            if (B) { free(mk[i]); mk[i] = nullptr; }   /* (block mode: the absent input shards are the blocks' presence flags, bpres) */
+            else {   /* input shards absent inside this output shard (the other input's grid, occupancy-skipped air): a voxel mask of weight 0 */
                 const z3_meta *m = z3_meta_of(zz[i]); int part = 0;
                 for (int pass = 0; pass < 2; pass++) {
                     for (int64_t za = lo[0] < 0 ? 0 : lo[0] / m->shard[0]; za * m->shard[0] < lo[0] + S && za * m->shard[0] < ish[i][0]; za++)
@@ -151,13 +216,17 @@ int ink_blend_run(const char *out, double um, const double st[3], int n, const c
             for (int d = 0; d < 3; d++) for (int k = 0; k < S; k++)   /* outside input i: weight 0 */
                 wv[d][(size_t)i * S + k] = lo[d] + k < 0 || lo[d] + k >= ish[i][d] ? 0.f : (float)fb_tile_w(o[d], 1, k, st[d], g[i][d]);
         }
-        ib_job J = {buf, n, wv[0], wv[1], wv[2], S, {S, S, S}, ob, mk};
+        ib_job J = {buf, n, wv[0], wv[1], wv[2], S, {S, S, S}, ob, mk, B ? bpres : nullptr, B, nb};
         fit_par(S, ib_rows, &J);
+        nlive += live; nblk += nb3;
         if (z3w_write_shard(w, a, b, c, ob, nt)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
         if (++nw % 50 == 0) fprintf(stderr, "ink-blend: %d shards (%d skipped) %.0f s\n", nw, nskip, now() - t0);
     }
     z3w_close(w);
-    fprintf(stderr, "ink-blend: %d shards written, %d empty, %.0f s\n", nw, nskip, now() - t0);
+    fprintf(stderr, "ink-blend: %d shards written, %d empty, %.0f s", nw, nskip, now() - t0);
+    if (B) fprintf(stderr, " (blocks of %d: %lld of %lld blended)", B, nlive, nblk);
+    fputc('\n', stderr);
+    free(bpres);
     for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um, l, shape, S, (float)q, 0, nt, attrs)) return 1;
     pyramid_write_group(out, um, nlev, "ink-blend", attrs);
     for (int i = 0; i < n; i++) { free(buf[i]); z3_close(zz[i]); store_close(ss[i]); }

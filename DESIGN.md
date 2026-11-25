@@ -6,6 +6,31 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## predict --seamless 2: spinning event waits and the blend's voxel masks (2026-11-25, branch seamblend-20261125, perf)
+
+Profiled one cascade-aux predict (inkperf casc/auxpred2.sh: R1-62000, Paris4 1.129 um level 2, window 288 halo 16, q 4, desk card 0,
+6 threads, perf record -g + time -v + dmon) on the 1455 tracker tiles (dilated by one). Base: pass a 70 s, pass b 47 s, blend 68 s
+(serial, after both passes), GPU SM 76 % mean over the run.
+- **Spinning host waits.** 50 % of the pass children's CPU was libcuda + vdso clock_gettime under cudaEventSynchronize. The
+  UFSM_CUDA_SYNC=block context flag does not cover events: an event without cudaEventBlockingSync busy-waits. nn_event_create (predict's
+  per-shard D2H events, the trainer's upload events) now adds the flag when UFSM_CUDA_SYNC=block (train / predict / ink-ext default).
+  The spin also took cores from the passes' own encode / decode threads.
+- **Blend masks.** The passes write shards S / 2 = 128 and the blend reads them into 512^3 output shards. Every input with an absent
+  shard got a 128 MB voxel mask (memset 1, then 0 per absent shard), and every voxel was blended: memset 18 % + ib_rows 18 % of the blend.
+  With input shards and origins on a B grid (B = 128 here) each B^3 block lies inside one shard per input. A per-block presence flag now
+  replaces the mask; blocks no input covers are written 0 and the rest are blended in the same order (tests/test_ink_blend_block.c:
+  byte-identical to UFSM_IB_BLOCK=0). Per-block reads were slower (105 s): the whole-shard reads stay.
+- **CT across passes.** Pass b re-decodes the CT pass a read (vfx decode ~5 % of a child's CPU, the reads from the page cache): a minor
+  share, not worth sharing. What remains of the blend is decoding the q-4 pass stores (55 %). The in-process path (UFSM_SEAM_INPROC=1,
+  GPU blend, no pass stores) would remove it, but it takes only --heads latent checkpoints, and R1 is a plain voxel net.
+
+| Paris4 aux, 1455 tiles | wall s | CPU s (user + sys) | pass a / b s | blend s |
+|---|---|---|---|---|
+| master (aab0123d) | 189 | 991 | 70 / 47 | 68 |
+| blocking events + block flags | 128 | 491 | 51 / 31 | 44 |
+
+Output shards byte-identical (diff -r of the blended level). ~7 h of seamless aux on card 0 becomes ~4.7 h.
+
 ## CPU side: the pod's CPUs are not the bottleneck; blocking host waits, gpudec priority, content dcache keys, cheaper elastic warp (2026-11-25, perf)
 - Measured first. Pod 1 (13.6 CPUs by cgroup, RTX PRO 6000) over the container's day with DINO2 + S2E: 2.9 CPUs used while active (173 k
   CPU-s, 25 % system), throttled in 5 837 of 595 k periods (1 %). S2E's wait (71 -> 23 % over 30 k steps, 30-86 Mvox/s) followed cache

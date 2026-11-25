@@ -611,7 +611,12 @@ extern "C" void nn_d2h_copy_stream(void *d, const void *s, size_t n) { CK(cudaMe
 extern "C" void nn_h2d_async(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyHostToDevice, 0)); }   /* stream 0, in order with its kernels; s pinned */
 extern "C" void nn_d2h_async(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToHost, 0)); }   /* stream 0, in order with its kernels; d pinned */
 extern "C" void nn_h2d_copy_stream(void *d, const void *s, size_t n) { CK(cudaMemcpyAsync(d, s, n, cudaMemcpyHostToDevice, copy_stream())); }   /* s must be pinned */
-extern "C" void *nn_event_create(void) { cudaEvent_t e; CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); return (void *)e; }
+/* UFSM_CUDA_SYNC=block also for events (perf 11-25): cudaEventSynchronize busy-waits unless the event has cudaEventBlockingSync, whatever
+   the context's flags; predict's writer waits on these per shard (seamless Paris4 aux: libcuda + vdso clock_gettime spinning, ~60 % of
+   each pass's CPU). Host waiting only, results unchanged. */
+extern "C" void *nn_event_create(void) {
+    const char *m = getenv("UFSM_CUDA_SYNC"); const unsigned fl = cudaEventDisableTiming | (m && !strcmp(m, "block") ? cudaEventBlockingSync : 0u);
+    cudaEvent_t e; CK(cudaEventCreateWithFlags(&e, fl)); return (void *)e; }
 static cudaStream_t aux_stream(void) {   /* device-to-device copies overlapped with compute (nn_d2d_aux) */
     static cudaStream_t st[8]; int d = 0; cudaGetDevice(&d); d &= 7;
     if (!st[d]) CK(cudaStreamCreateWithFlags(&st[d], cudaStreamNonBlocking));
