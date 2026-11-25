@@ -1717,6 +1717,128 @@ read unchanged); predict applies it from the header. FFMA path refuses it. Tests
 host-quantised weights (fp4 Hd 16 / 64, ng 2 / 7, raw; errors at the fp16 level: pre 5e-4, B 2e-3, W2 1.6e-3), test_latdec_train
 resumes the fp16 decoder into fp4 (header key, finite losses) and predicts a random-W2 fp4 net (rv differs from the fp16 one).
 
+## try9's ink head: normalisation, alignment, balance and calibration audit; `ufsm ink-audit` (2026-11-18, branch inknorm-20261118; written up 11-25)
+
+The question: is the 3-D ink head of try9 (scratch2, snapshot 15000) held back by a normalisation or calibration problem between scans,
+between the labels and the surfaces, or between training and predict? Short answer: no single normalisation issue explains it. The head is
+weak on every scroll, including Paris 4, which carries 63 % of the ink weight. Held out, it scores about what the raw CT intensity at the
+label band scores. The label side has one real defect, the fixed face iso, which loses half the labels on three scans. Every
+train / predict mismatch found moves AUC by less than 0.03.
+
+**Tool: `ufsm ink-audit SEGS.json --ct ROOT KEY --ct-um U [--pred ROOT KEY --pred-level L] [--holdouts H] [--region box ..] [--blocks]`**
+(src/inksplat.c, beside ink-splat, reusing its mesh / label / face code; test_ink_audit). It walks the onfly ink sources' segment windows
+with the trainer's own geometry: label pixel -> tifxyz point and normal; the open face f (face_of on the level-1 CT, iso 64, [1 2 1]
+smoothing, search -6 .. 20); the label band [f - 6, f]. Each pixel goes into a split. HOLD: its surface point lies in a
+holdouts-20261114 box of that CT (the sampler masks every label there). VAL: the segment's validation raster, which try9 trains on
+because its ink sources say "validation": "off". TRAIN: the rest. Along the normal (t = -56 .. 56 level-0 voxels) it samples the CT and
+the prediction. Per split it reports:
+- supervised px, ink share, face found per class, face offset quantiles;
+- band CT (raw, and z with the trainer's scan-norm), and its AUC as an ink score;
+- the prediction's band max / mean: AUC, quantiles, best-F1 threshold, F1 at 128;
+- AUC at every band shift -28 .. 28 relative to the face and to the mesh;
+- a face-relative depth profile, an iso sweep of the face search with failure reasons, and per-region / per-2048-block tables.
+
+test_ink_audit uses a synthetic segment: test_ink_splat's surface plus a CT slab whose face lies at +6. The "prediction" is a layer at
+face + 10 .. 14, splatted from the surface. The audit must give: face found 1.0, q50 +6, AUC 0.50 at the band, 1.00 at the best shift
+(face +12 / mesh +17: the mesh shift is the face shift + 6), the HOLD split from a box, and the per-split ink shares. The data runs
+(scripts in /vesuvius/ufsm/inknorm: lab1.sh labels only, pipe.sh predict + audit, q1-q5 queues) used stride 4 for the labels-only pass
+and stride 2 with a prediction.
+
+**Predict recipe** (card 1 under the 6 GB cap): level 2 (9.6 um), window 512 / halo 64 / shard 128, ink head only, EMA, one process per
+2048^3 block (4.46 GB peak; `predict --boxes` kept its pools across boxes, 5.66 GB). Window 640 peaks at 6.4 GB with one head (inksdk's
+three heads: 8.8 GB). Blocks per scroll: every block with held-out labels (the densest 40) plus the 12 densest trained blocks. The 4
+sources try9 trains without an axis are predicted with UFSM_PRED_NO_AXIS_OK=1, as trained.
+
+**Per-scroll AUC** (try9-15000 EMA; label px at stride 2; AUC of the band max; [raw band-CT AUC on the same px]):
+
+| scroll | ink weight | HOLD px | HOLD AUC | trained AUC (TRAIN / VAL) | band CT AUC | band z ink / no | p50 ink / no (of 255) |
+|---|---|---|---|---|---|---|---|
+| Paris 4 | 0.104 | 36.9 M | 0.521 | 0.566 / - | 0.54 | 0.40 / 0.36 | 58 / 55 |
+| 1667 | 0.038 | 13.6 M | 0.559 | 0.625 / 0.616 | 0.56 | 1.36 / 1.26 | 59 / 54 |
+| 0139 | 0.013 | 5.2 M | 0.522 | 0.567 / 0.584 | 0.57-0.58 | 0.94 / 0.84 | 58 / 55 |
+| 0500P2 (no axis) | 0.0025 | 3.4 M | 0.470 | - / 0.558 | 0.55-0.58 | 0.48 / 0.41 | 41 / 39 |
+| 0841 (no axis) | 0.0025 | 1.7 M | 0.601 | - / 0.537 | 0.53-0.55 | 0.55 / 0.48 | 35 / 34 |
+| MAN5 (no axis) | 0.0012 | 0.21 M | 0.603 | 0.551 / - | 0.47-0.51 | 0.23 / 0.26 | 36 / 35 |
+| 0814 | 0.0008 | 0.04 M | 0.724 | 0.621 / 0.527 | 0.38-0.58 | 0.58 / 0.48 | 52 / 47 |
+| 0009B (no axis) | 0.0032 | 0 | - | 0.622 / 0.667 | 0.63-0.66 | -0.11 / -0.29 | 38 / 33 |
+
+(ink weight: the source's sampling weight; the ink sources sum to 0.165.) Memorisation is small: TRAIN - HOLD is 0.066 on 1667, 0.045 on
+Paris 4 and 0139. 0009B has no held-out ink: its one 2.4 um holdout slab, z 19456 + 4096, misses the labelled windows. 0814 holds only
+38 k px.
+
+**Cross-scan intensity.** try9 already z-scores its input per scan and level (`--scan-norm 1`: mean / sd of the scan's nonzero voxels).
+Predict computes the same cached values, e.g. 1667 level 2: 62.9 / 37.59 in the sampler and in predict, so the two sides agree. The
+latent channels are a linear KLT of that input on 4^3 cells (nn_input_lat), so their DC channel follows the same band z.
+
+The scan-norm itself spreads the surface band, though. Raw band CT (mean over [f - 6, f], every label px) is 89 (0500P2, 111 keV),
+102 (Paris 4), 106-110 (0841, 0139, 0009B, MAN5) and 114-115 (1667, 0814): within +-0.4 of a typical sd. In z the band is -0.1
+(0009B) to +1.36 (1667). 1667's centre, 62.9, comes from its dark air, so its papyrus sits 1 sd above Paris 4's (0.40).
+
+Does AUC track it? No. 0009B (z -0.1) scores best of the trained sets, 1667 (z 1.35) sits in the middle, and Paris 4 (z 0.4, the
+training mode) scores lowest. Within a scroll, the AUC of 2048-blocks correlates weakly with the block's ink-band z (r = 0.23 on 1667, 52
+blocks; 0.28 on 0139, 43 blocks); it correlates better with the raw CT contrast between ink and no-ink (r 0.40 / 0.24).
+
+Equalisation prototype at predict time (`predict --norm C,S` replaces the scan-norm): eqA maps the scroll's band mean / sd onto Paris 4's
+band z (0.414 / 0.369; C,S per scroll in /vesuvius/ufsm/inknorm/eqA.txt), eqB gives every scroll Paris 4's level-2 scan-norm (85.8 /
+37.95). On 1667's 16 densest held-out blocks (9.0 M HOLD px), paired:
+
+| 1667 | HOLD | TRAIN | VAL (1.2 M px) |
+|---|---|---|---|
+| scan-norm (try9) | 0.570 | 0.618 | 0.626 |
+| eqA (band z 1.3 -> 0.4) | 0.561 | 0.615 | 0.663 |
+| eqB (Paris 4's C,S) | 0.567 | 0.618 | 0.643 |
+
+Moving 1667's band by about 1 sd barely changes held-out AUC. That is expected: try9 trains and predicts with live GroupNorm (per-window
+statistics), which normalises a per-window affine input change away after the first conv + GN. Linear per-scan equalisation is therefore
+a no-op for this net; only histogram-shape differences could matter, and AUC does not track those either. (The queue stopped after 1667.)
+
+**Label vs surface alignment.** The CT face lies outside the mesh by a median of +4 .. +10 level-0 voxels (q10 .. q90 -3 .. +17), so a
+mesh-relative band would miss it. The face-relative band is where the head's AUC peaks, within 0.01-0.04, on 1667 (best shift -9 .. 0),
+0139 (-3 .. +3) and 0009B (+1); MAN5 and 0814 HOLD peak at -8 .. -12 (+0.03 / +0.04). Paris 4 is the exception: TRAIN 0.592 at face + 8
+vs 0.566 at 0; HOLD 0.566 at + 12 vs 0.521. Its ink-minus-no-ink prediction contrast sits in the gap beyond the face (+3.8/255 at +8 ..
++12, +2.6 at the band), while on 1667 / 0139 it sits inside the papyrus (+5.2 at -10 .. -8). The CT itself shows the ink at the band on all
+three (ink brighter by 3-5 at f - 4), so the labels are where the ink is. At contrasts of 3-5 / 255 a per-source offset would fit noise;
+none is proposed.
+
+**Class balance.** Positives are not rare: 19-32 % of label px per scroll and split (MAN5 HOLD 38 %); the level-1 voxel targets per
+labelled block are 15-30 % ink (`ink-onfly` per block, about x0.75 the px share: the splat's majority rule and the CT >= iso gate). The ink
+BCE is a per-window mean over the known voxels, smoothing 0.1, no positive weight. With --ink-air 8 the air lattice (target 0.05) is about
+a third of a labelled window's known ink targets and the whole target elsewhere ("ink bce (100 % of windows)"); human-ink windows are
+12-18 % of updates. The MIL term sits near ln 2 (0.54-0.66 at step 15k) with rays at the 65536 cap. No positive-weight change proposed.
+
+**Face iso (labels).** The onfly face search uses iso 64 on raw CT for every scan. It finds a face for only 50-57 % of supervised px on
+0009B, 0500P2 and 0841 (66-84 % elsewhere); the rest stay unknown. The failure is almost always "no gap after the papyrus run" (45 % of
+0009B px, 37-39 % on 0500P2, 25-33 % on 0841): on those scans the inter-sheet gap stays above 64. Share of px with a face:
+
+| scroll | iso 64 | best iso | best share |
+|---|---|---|---|
+| 0009B | 0.523 | 112 | 0.749 |
+| 0841 | 0.547 | 96 | 0.652 |
+| 0500P2 | 0.526 | 80-88 | 0.616 |
+| 0814 | 0.765 | 88 | 0.814 |
+| Paris 4 | 0.661 | 80 | 0.679 |
+| 0139 | 0.733 | 80 | 0.754 |
+| 1667 | 0.689 | 72 | 0.691 |
+| MAN5 | 0.831 | 72 | 0.834 |
+
+Proposal (sources json only, the onfly entries' "iso"): 0009B 112, 0841 96, 0500P2 80, 0814 88, Paris 4 80, 0139 80, 1667 / MAN5 72:
++43 % labelled px on 0009B, +19 % on 0841, +17 % on 0500P2, +3 % on Paris 4 / 0139. Changes the labels and their dcache keys; not applied.
+
+**Calibration.** No output reaches 128 on any scroll (no-ink p99 43-80); best-F1 thresholds are 13-53 by scroll and split; the no-axis
+scrolls sit ~20 / 255 lower (p50 33-41 against 51-59). One fixed threshold cannot work; until a head separates, display per scroll with
+a p1 / p99 stretch over the scroll's papyrus band.
+
+**Other train / predict mismatches**, measured:
+- Axis: four ink sources have no "axis" (0009B-u2ink, MAN5, 0841, 0500P2-u2ink); try9 trains them with zero radial channels and
+  grid-index RoPE, predict refuses them unless --axis or UFSM_PRED_NO_AXIS_OK. 0500P2 with the wbench axis: HOLD 0.495 vs 0.470 without,
+  VAL 0.550 vs 0.558, output -5 / 255. Small either way.
+- Window: try9 trains at 768 (216 attention tokens), card-1 predict runs 512 (64). 1667 at 384 vs 512: HOLD 0.555 vs 0.559, TRAIN 0.620
+  vs 0.625 (one 0814 block moved 0.60 -> 0.66, the scroll-wide curve is flat).
+- Level 1 vs 2: queued, never ran (latent-net work paused 11-20).
+- Scan-norm statistics: identical bits in the sampler and predict (scannorm.c cache).
+
+Files: /vesuvius/ufsm/inknorm/lab1/*.tsv (labels; .iso / .blocks / .hist / .prof), pred/<scroll>-<tag>/a*.tsv, agg.sh.
+
 ## Count-constrained fill: no headroom over the mf-weighted ref (2026-11-18, branch fill-20261118, levelsolve)
 
 `ufsm fill-oracle` (src/filloracle.c): radial rays (every native z plane, arcs <= 0.7 voxel) through a box raster of the model's U; merged
