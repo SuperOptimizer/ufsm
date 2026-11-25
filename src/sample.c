@@ -4292,6 +4292,7 @@ occ_index *sources_occupancy_all(sources *S) {
 /* Prefetch the CT chunks that training touches into the chunk cache: for every coarse cell that contains surface,
    at every level the window around the cell (P wide, P/2 random offset, then snapped to the chunk grid) and the coarse
    probe window at level + 3; chunks are collected in a bitmap per level so each is fetched once, without decoding. */
+static int pf_disk_low(void);   /* (defined below; clang -std=c23 rejects the implicit declaration mcc let through: llvm presets) */
 typedef struct { z3 *ct; const uint32_t *list; size_t n; int64_t ng[3]; size_t *next, *done, *fetched, *fail; } pf_arg;
 static void *pf_worker(void *p) {   /* the marked chunks, from one shared list: they cluster around the labels, so per-thread index ranges
                                        left most threads idle (2 MB/s from the mirror at 56 threads) */
