@@ -6,6 +6,59 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## mcc pin 5744025 -> ff7f174: device jump threading, threadIdx-strided unroll, global loaded pointers, cudaopt (2026-11-25, microc)
+- The pin moves to ff7f174, microc branch jtdev-20261125 (tag ufsm-pin-20261125; not on microc main, whose 84903be still miscompiles
+  host code). It is main 285d308 plus:
+  - 77947a9: unswitch recomputes the dominator tree (the 84903be l1_solve miscompile).
+  - c3a66e2: cudaopt: device inlining 300/400, constant-table loads, vector ld/st, f16 round-trip folds.
+  - aaa23b2: device LICM, opt-in (MCC_LICMPHI).
+  - 356cb4c: constant automatic arrays become statics.
+  - f33f156: three device changes:
+    - jump threading for device code. k_entropy's bit reader kept each inlined gbr_get's bool as a value with a BSSY region and a
+      test. MCC_NOJTDEV turns it off.
+    - `for (i = threadIdx.x; i < N; i += S)` with constant N and S becomes K guarded copies. A copy that launch_bounds puts in range
+      for every thread has no test, so its loads overlap. MCC_NOTIDU turns it off.
+    - addresses loaded from global memory are global (ld/st.global, as nvcc's cvta.to.global). MCC_NOGLLOAD turns it off.
+  - ff7f174: mcudahw cudaSetDeviceFlags calls cuDevicePrimaryCtxSetFlags_v2. Before, only the flags were stored.
+    - Spin test, card 1, a 10 s kernel with BlockingSync: 10.1 -> 0.01 CPU-s waiting.
+    - nn_flat's BlockingSync now applies.
+    - nn_sync_mode's direct driver call stays and is harmless.
+- sm_120, desk card 1, exclusive, ufsm bb67bcb1:
+
+  | GPU ms | pin 5744025 | ff7f174 branch | ratio |
+  |---|---|---|---|
+  | k_entropy, 64 real PHerc0490B chunks (test_gpudec --real, q 8) | 60.4 | 44.8 | 0.74 |
+  | k_entropy per launch, small ink-net fixture training | 4.29 | 3.19 | 0.75 |
+  | every other kernel (f4p, f8s, f4ws, GN bwd, gy_pre4, conv1, ...) | | | 0.99-1.01 |
+  | fixture training (P 448, 3 steps), all kernels, 2 runs | 6890 / 7055 | 5789 / 5858 | 0.84 / 0.83 |
+
+  - gpudec bytes identical.
+  - Losses within the pin's own run-to-run spread (step 3: 0.3183 / 0.3177 vs 0.3199 / 0.3187).
+- sm_86, RTX 3070 pod, against nvcc 13.0 on the same sources (llvm-release; arch86 = software MX):
+
+  | GPU ms | nvcc | pin | cudaopt | ff7f174 |
+  |---|---|---|---|---|
+  | k_entropy, 64 real chunks | 68.6 | 93.3 | 88.0 | 62.5 |
+  | gemm_ns_k (Muon) | 11.2 | 21.5 | 21.3 | 13.2 |
+  | fixture training, all kernels | 2625 | 4578 | 2821 | 2604 |
+  | ink-ext reader3, 32 tiles | 252.2 | | | 249.9 (bytes = nvcc's) |
+
+  - The pin's 1.74x on Ampere was the software-MX kernels losing inlining (cudaopt fixes it).
+  - What is left there is conv_fwd_f4u 1.3x: emulated MMA at 255 registers with spills. Not pursued: no Ampere production work.
+- Offline sm_120a ptxas, conv_fwd_f4r_k<2,4,1>:
+  - All three compilers sit at the 128-register launch-bounds cap.
+  - mcc spills 180 B vs nvcc 96 B, but emits 44 k SASS instructions vs nvcc's 59 k.
+  - f4ws<2,2>: 96 registers, no spill.
+  - nvcc timing of these on sm_120 is not done yet.
+- Checks:
+  - Host .c objects: .text byte-identical to cudaopt (193 / 193).
+  - arch86 fast tier with the branch toolchain: 378 PASS. The 1 FAIL is test_mgpu_lint, a stale lint baseline that fails on the old toolchain too.
+  - This merge, desk CPU half (ff7f174, -g none): 166 PASS. The one FAIL is test_mgpu_lint, a source lint with a stale baseline that fails on the old toolchain too. 8 more failed only because the suite output sat on /vesuvius (symlink EIO, noexec); rerun with the output on /, all pass.
+  - This merge, pod-1 sm_120 GPU half: see the merge commit.
+- Tools:
+  - /vesuvius/ufsm/microc/pod3070: bench.sh, cmp.sh, gdbench.sh, sass.sh, suite.sh.
+  - /vesuvius/ufsm/microc/deskab: ab120.sh, sass120.sh, kres.sh, sdf/.
+
 ## CPU side: the pod's CPUs are not the bottleneck; blocking host waits, gpudec priority, content dcache keys, cheaper elastic warp (2026-11-25, perf)
 - Measured first. Pod 1 (13.6 CPUs by cgroup, RTX PRO 6000) over the container's day with DINO2 + S2E: 2.9 CPUs used while active (173 k
   CPU-s, 25 % system), throttled in 5 837 of 595 k periods (1 %). S2E's wait (71 -> 23 % over 30 k steps, 30-86 Mvox/s) followed cache
