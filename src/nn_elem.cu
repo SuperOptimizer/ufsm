@@ -184,11 +184,12 @@ extern "C" void nn_h16_to_mx(const void *x, shape5 s, void *y) {
     if (ISMX4(y)) lp_h16_to_mx4(x, g_h16 ? 2 : 1, s.n, s.c, shape_spatial(s), y); else lp_h16_to_mx8(x, g_h16 ? 2 : 1, s.n, s.c, shape_spatial(s), y);
     KCHECK();
 }
-extern "C" void nn_input_rad(const void *ct16, shape5 xs, const void *rec, void *y) {
-    if (!ISMX(y) || xs.c != 4 || xs.h != xs.w) { fprintf(stderr, "nn_input_rad: an MX input of 4 channels, square planes\n"); abort(); }
-    lp_input_rad(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(xs.d), xs.n, xs.d, xs.h, y, ISMX4(y) ? 4 : 8);
+extern "C" void nn_input_rad_aux(const void *ct16, shape5 xs, const void *rec, const void *aux, void *y) {
+    if (!ISMX(y) || xs.c != (aux ? 5 : 4) || xs.h != xs.w) { fprintf(stderr, "nn_input_rad: an MX input of 4 channels (5 with the aux boxes), square planes\n"); abort(); }
+    lp_input_rad(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(xs.d), xs.n, xs.d, xs.h, y, ISMX4(y) ? 4 : 8, aux);
     KCHECK();
 }
+extern "C" void nn_input_rad(const void *ct16, shape5 xs, const void *rec, void *y) { nn_input_rad_aux(ct16, xs, rec, nullptr, y); }
 extern "C" void nn_fakeq_w4_2d(float *w, int Co, int Ci, int T, int B) { lp_fakeq_w4(w, Co, Ci, T, B, B); KCHECK(); }
 extern "C" void nn_fakeq_w4(float *w, int Co, int Ci, int T, int Bo, int Bi) { lp_fakeq_w4(w, Co, Ci, T, Bo, Bi); KCHECK(); }
 extern "C" void nn_input_lat(const void *ct16, shape5 xs, const void *rec, void *y) {

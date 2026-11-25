@@ -1922,7 +1922,7 @@ z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine, int own_fine) {
 /* UFSM_DCACHE_KEY=content (perf 11-25): local inputs enter the key by their bytes (XXH3-64), not size + mtime, so a cache dir carried to
    another machine (a new pod re-downloads the same GT meshes with new mtimes: S2E computed 443 k ink cells, ~15 % of its workers' time)
    still hits. Off by default: the desk's keys stay as they are (switching changes every key once). Directories enter as "dir". */
-static int key_content(void) { static int on = -1; if (on < 0) { const char *e = getenv("UFSM_DCACHE_KEY"); on = e && !strcmp(e, "content"); } return on; }
+static int key_content(void) { static int on = -1; /* mgpu: env */ if (on < 0) { const char *e = getenv("UFSM_DCACHE_KEY"); on = e && !strcmp(e, "content"); } return on; }
 static unsigned long long file_xxh(const char *p, long long size) {
     if (size <= 0) return 0; int fd = open(p, O_RDONLY); if (fd < 0) return 0;
     void *m = mmap(nullptr, (size_t)size, PROT_READ, MAP_PRIVATE, fd, 0); close(fd); if (m == MAP_FAILED) return 0;

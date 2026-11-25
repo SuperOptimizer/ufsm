@@ -15,8 +15,8 @@ Originally no teacher models; since 2026-11-15 published ink networks run as tea
 - Host waits block (nn_sync_mode, train / predict / ink-ext): every GPU process spun in libcuda + clock_gettime while waiting (ink-ext ~40 %
   of its CPU, a trainer's main thread 15-20 %). mcudahw's cudaSetDeviceFlags only stores the flags (microc cuda/hw/rt.c), so nn_flat's
   BlockingSync never applied; nn_sync_mode calls the driver's cuDevicePrimaryCtxSetFlags_v2 (works on an active context) once per physical
-  device. UFSM_CUDA_SYNC=auto (the driver's spin) / spin / yield / block. gpudec's streams take the highest priority with UFSM_GPUDEC_PRIO=1 (off by default
-  until measured against the persistent f4ws wgrad kernel, which concurrent gpudec blocks slow by 60-80 %: mcuda).
+  device. UFSM_CUDA_SYNC=auto (the driver's spin) / spin / yield / block. gpudec's streams take the highest priority (UFSM_GPUDEC_PRIO=0: off;
+  neutral for the f4ws wgrad blocks concurrent decodes evict, mcuda S2E P384: step 974 / 977 ms, f4ws excess 12.4 / 9.0 ms with 0 / 1).
   S2E argv P256 on desk card 1, 300 steps, warm caches:
 
   | variant | Mvox/s | wait | trainer CPU-s | gpudec round trips |
@@ -37,6 +37,10 @@ Originally no teacher models; since 2026-11-15 published ink networks run as tea
 - Not CPU, for the record: perwrap render on the desk (Paris3) spent 162 s a wrap for 1 s of kernels and 50 GB of chunk uploads with its
   threads 85 % in D on the NAS (parked: unrolls stopped 11-25); the R11d trainer's 16 % wait: its 6 workers ~40 % in page-cache waits on
   rclone ~/nas2 (1.1 um CT + teacher zarrs, ~123 MB/s on a 2.5 GbE link).
+- z3_chunk_map reads the shard indices on UFSM_CHUNKMAP_THREADS (16) threads (each shard writes only its chunks' bits: the same map).
+  R11d's sampler start under strace: 1190 s summed in teacher-zarr opens + 132-byte index preads over rclone (142 k of them), 0.2 s in
+  steady state. bench_chunk_map on the NAS: Paris4 r24t 2.258 (60 k shards) 1 thread 1120 s cold / 32 s warm, 16 threads 20 s warm;
+  1667 r24t 16 threads 93 s cold / 7.8 s warm vs 1 thread 30 s warm. test_chunk_map: 1 / 3 / 16 threads, the same map and count.
 
 ## GPU profile of training / inference; the surface head's 1x1 rows without the identity matmuls (2026-11-25, branch isfhead-20261125, mcuda)
 
@@ -107,6 +111,19 @@ on the trainer's sources and window, logs the cache size / free disk before and 
 when the cache is incomplete (the trainer would read those chunks cold). `DRY=1` prints the chunk counts first (the cache never
 evicts, so size the sources with `ct_zslabs` / `max_level` to the disk). test_prefetch_shards: over a local range-serving HTTP root,
 the shard path caches exactly the per-chunk path's files, level 0's 4 chunks in 1 data request, coverage 1, a second run fetches 0.
+
+**Disk guard and a byte-exact dry count (same day).** R11P's prefetch (8 sources, 1.1 um, P 768, levels 0-2 + probes) was estimated at
+~60 GB from chunk counts and filled the pod disk to 9 GB free at 151 GB fetched; ctprefetch.sh checked `MIN_FREE_GB` only at start. Now
+`ufsm prefetch --min-free-gb G` (ctprefetch.sh passes `MIN_FREE_GB`, default 20) checks the cache disk (statvfs of `UFSM_HTTP_CACHE`)
+before every shard / chunk and stops all workers below it: exit 3, what came stays cached, a rerun resumes. `--dry 1` now walks the same
+shards reading only their indexes (`z3_count_shard_sel`) and prints per source x level the GB stored and still to fetch; sources over the
+same scan share chunks (R11P: 1667 hum / hfH / hfY2, P4 hum / hfH / hfG), so each array x level keeps a union and a later source counts
+only its new chunks (the plain per-source sum read 311.9 GB). R11P's dry count against the cache after the first pass: 8.4 GB left to
+fetch (P4 hfG levels 1-3), 0 index failures. What 12k steps read of it: 1.1:6 / 2.2:1 / 4.5:1 rungs = 9000 level-0 and 1500 each
+level-1 / -2 windows of 768^3 (<= 7^3 128^3-chunks each); against the unique draw-cell regions that is roughly 40 % of P4's and 50 % of
+1667's level-0 chunks, ~50 % at level 1, ~90 % at level 2: ~half the prefetched bytes are read. The draws are random, so a trimmed prefetch
+would leave the other half's windows cold; a full prefetch that fits the disk stays the rule, DRY=1 first. test_prefetch_shards: the dry
+bytes equal the bytes the prefetch then fetches, a second source over the same scan adds none, `--min-free-gb` above the free disk exits 3.
 
 ## Output fusion reader3 + 3-D nets: +0.04 on the 8.6-9.4 um dev set, worse on clean 1447 (negative result; 2026-11-25, inksdk)
 

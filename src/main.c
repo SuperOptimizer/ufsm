@@ -4964,11 +4964,12 @@ static int ufsm_main(int argc, char **argv) {
     if (argc < 3) return usage();
     const char *cmd = argv[1];
     if (!strcmp(cmd, "sample")) return cmd_sample(argc, argv);
-    if (!strcmp(cmd, "prefetch")) {   /* ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1.0] [--P 128] [--dry 0] */
-        if (argc < 3) { fprintf(stderr, "usage: ufsm prefetch <sources.json> [--levels L] [--threads N] [--fraction F] [--P window] [--dry 1 (count only)]\n"); return 2; }
+    if (!strcmp(cmd, "prefetch")) {   /* ufsm prefetch <sources.json> [--levels 1] [--threads 32] [--fraction 1.0] [--P 128] [--dry 0] [--min-free-gb 20] */
+        if (argc < 3) { fprintf(stderr, "usage: ufsm prefetch <sources.json> [--levels L] [--threads N] [--fraction F] [--P window] [--dry 1 (counts and GB to fetch, index reads only)] [--min-free-gb 20 (stop below it, exit 3)]\n"); return 2; }
         sources *S = sources_load(argv[2]); if (!S) return 1;
         return sources_prefetch(S, opt_atoi("--levels", opt(argc, argv, "--levels", "1")), ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 32), opt_atof("--fraction", opt(argc, argv, "--fraction", "1.0")),
-                                opt_atoi("--P", opt(argc, argv, "--P", "128")), opt_atoi("--dry", opt(argc, argv, "--dry", "0")));
+                                opt_atoi("--P", opt(argc, argv, "--P", "128")), opt_atoi("--dry", opt(argc, argv, "--dry", "0")),
+                                opt_atof("--min-free-gb", opt(argc, argv, "--min-free-gb", "20")));
     }
     if (!strcmp(cmd, "ingest-labels")) return cmd_ingest_labels(argc, argv);
     if (!strcmp(cmd, "z3-recode")) return cmd_z3_recode(argc, argv);

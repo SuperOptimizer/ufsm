@@ -30,6 +30,7 @@ static _Atomic uint64_t g_latd_n, g_latd_over;   /* --lat-direct-p: direct windo
 void sample_lat_direct_stats(uint64_t *n, uint64_t *over) { *n = g_latd_n; *over = g_latd_over; }
 #include <malloc.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -371,6 +372,8 @@ static batch alloc_batch(const sample_cfg *c, uint8_t *c255, int bank_own) {   /
     b.x = c->xfmt || c->restore ? nullptr : halloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
     b.x16 = c->xfmt && !c->restore && !c->gpu_aug ? halloc((size_t)c->B * xc * p3 * 2) : nullptr;   /* (--gpu-aug: the device builds the CT channel) */
     b.ct8 = c->gpu_aug ? halloc((size_t)c->B * p3) : nullptr; b.aug = c->gpu_aug ? halloc((size_t)c->B * sizeof(scan_ct_rec)) : nullptr;
+    b.auxc = c->gpu_input && c->aux ? halloc(sample_aux_bytes(c->B, c->aux_nc)) : nullptr;   /* (the cascade input: coarse boxes, nn.h nn_aux_hdr) */
+    if (b.auxc) memset(b.auxc, 0, sample_aux_bytes(c->B, c->aux_nc));
     if (b.aug) memset(b.aug, 0, (size_t)c->B * sizeof(scan_ct_rec));   /* (the records' padding is never written: zero, so equal batches hash equal) */
     const int tmu = sample_tm_unused(c);   /* (slot_skip 4: the unpacked targets and mask are never read) */
     b.t = c->pack_tm || tmu ? nullptr : halloc((size_t)c->B * (c->restore == 1 ? 1 : NCH) * p3);   /* (task restore: the clean CT alone; real pairs: target + input crop) */
@@ -416,7 +419,7 @@ static batch alloc_batch(const sample_cfg *c, uint8_t *c255, int bank_own) {   /
     return b;
 }
 
-static void free_batch(batch *b, int B) { free(b->latd); free(b->lvc); free(b->lvr); free(b->nlvr); free(b->lvn); free(b->lvz); if (b->nbank) { b->side = b->w4 = b->wcomp = b->ink = nullptr; for (int j = 0; j < 4; j++) b->aux[j] = nullptr; for (int q = 0; q < b->nbank; q++) hfree(b->bank[q]); b->nbank = 0; } if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b, int B) { free(b->latd); free(b->lvc); free(b->lvr); free(b->nlvr); free(b->lvn); free(b->lvz); if (b->nbank) { b->side = b->w4 = b->wcomp = b->ink = nullptr; for (int j = 0; j < 4; j++) b->aux[j] = nullptr; for (int q = 0; q < b->nbank; q++) hfree(b->bank[q]); b->nbank = 0; } if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->auxc) hfree(b->auxc); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -1053,7 +1056,7 @@ void sample_axis_record_spatial_test(float *r, const int64_t o[3], int P, int ha
 }
 int sample_gpu_input_ok(const sample_cfg *c) {
     const int Pz = c->Pz > 0 ? c->Pz : c->P;
-    return c->xfmt != 0 && !c->aux && !c->cond && !c->sheet && !(c->augment && c->ct_augment && Pz != c->P);   /* warps: the CT channel of
+    return c->xfmt != 0 && (!c->aux || (c->aux_nc > 0 && (c->Pz <= 0 || c->Pz == c->P))) && !c->cond && !c->sheet && !(c->augment && c->ct_augment && Pz != c->P);   /* warps: the CT channel of
                                                                                    write_spatial, the transported radial vector on the device */
 }
 int sample_gpu_aug_ok(const sample_cfg *c) {   /* the device's CT channel (nn_aug_ct): cubes, no CT appearance plan, labels that read the CT's zero set
@@ -1063,7 +1066,7 @@ int sample_gpu_aug_ok(const sample_cfg *c) {   /* the device's CT channel (nn_au
 int sample_gpu_lwarp_ok(const sample_cfg *c) {   /* --gpu-aug 2: the warped windows' labels on the device: the packed targets (and pmask: their mask bit), phase and winding only.
                                                     (--distill's targets are mapped on the host through the window's own symmetry / warp parameters,
                                                     which the device warp applies too; echoes / replays re-augment on the device: train drops their targets) */
-    return sample_gpu_aug_ok(c) && (c->pack_tm || sample_tm_unused(c)) && !c->sheet && !c->pap_head && !c->cond && !c->band && !c->aux;
+    return sample_gpu_aug_ok(c) && (c->pack_tm || sample_tm_unused(c)) && !c->sheet && !c->pap_head && !c->cond && !c->band && (!c->aux || c->aux_nc > 0);   /* (gpu_input aux: warped on the device with the CT) */
 }
 void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], float mean, float isd, int hasax, const float *cyz,
                          const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed, uint16_t *H4, uint16_t *H1, void *rec) {
@@ -1897,6 +1900,53 @@ static int aux_window(source *s, const int64_t o[3], int P, uint8_t *dst) {
     return 0;
 }
 
+/* gpu_input + aux (sample.h): the coarse box. A level-l window voxel u (source frame, window corner o) sits at aux-grid position
+   (o + u) / f + (1 / f - 1) / 2 (voxel centres, f = 2^(aux level - l)); the box starts one voxel below the window's first position and
+   covers its last + 2 (the trilinear corner), so nc = ceil((P - 1) / f) + 3. */
+int sample_aux_nc(int P, int f) { return (P - 1 + f - 1) / f + 3; }
+size_t sample_aux_bytes(int B, int nc) { return (size_t)B * 32 + (size_t)B * (((size_t)nc * nc * nc + 15) & ~(size_t)15); }
+int sample_aux_byte(const uint8_t *auxc, int n, const float u[3]) {
+#pragma clang fp contract(off) reassociate(off)   /* (the device's IEEE intrinsics in this order: nn_input_rad_aux, bit for bit) */
+    nn_aux_hdr h; memcpy(&h, auxc + (size_t)n * 32, sizeof h);
+    if (!h.on || u[0] < 0.f) return 0;
+    const int nc = h.nc; const uint8_t *bx = auxc + h.off; int b[3]; float f[3];
+    for (int d = 0; d < 3; d++) {
+        const float t = u[d] * h.inv_f, q = t + h.o[d];
+        int bb = (int)floorf(q); bb = bb < 0 ? 0 : bb > nc - 2 ? nc - 2 : bb;
+        float fr = q - (float)bb; fr = fr < 0.f ? 0.f : fr > 1.f ? 1.f : fr;
+        b[d] = bb; f[d] = fr;
+    }
+    float v = 0.f;
+    for (int k = 0; k < 8; k++) {
+        const int dz = k >> 2, dy = (k >> 1) & 1, dx = k & 1;
+        const float a = dz ? f[0] : 1.f - f[0], bb = dy ? f[1] : 1.f - f[1], cc = dx ? f[2] : 1.f - f[2];
+        const float w1 = a * bb, w = w1 * cc, t = w * (float)bx[((size_t)(b[0] + dz) * nc + (b[1] + dy)) * nc + (b[2] + dx)];
+        v = v + t;
+    }
+    const int bv = (int)(v + .5f);
+    return bv > 255 ? 255 : bv;
+}
+void sample_aux_place(const int64_t o[3], int f, nn_aux_hdr *h, int64_t oc[3]) {
+    for (int d = 0; d < 3; d++) { const double q0 = (double)o[d] / f + (1.0 / f - 1.0) / 2; oc[d] = (int64_t)floor(q0) - 1; h->o[d] = (float)(q0 - (double)oc[d]); }
+    h->inv_f = 1.f / (float)f;
+}
+/* one window's box and header into batch.auxc (slot i of B); on 0 (no aux volume, a finer aux grid than the window's, or a re-drawn
+   window whose CT the aux does not follow): every byte 0 on the device */
+static int aux_box(const sample_cfg *c, source *s, int l, const int64_t o[3], int P, int on, uint8_t *auxc, int i) {
+    nn_aux_hdr h; memset(&h, 0, sizeof h);
+    const int nc = c->aux_nc; const size_t stride = (((size_t)nc * nc * nc + 15) & ~(size_t)15);
+    h.nc = nc; h.off = (int)((size_t)c->B * 32 + (size_t)i * stride);
+    if (on && s->aux && s->aux_level >= l && sample_aux_nc(P, 1 << (s->aux_level - l)) <= nc) {
+        int64_t oc[3]; sample_aux_place(o, 1 << (s->aux_level - l), &h, oc); h.on = 1;
+        memset(auxc + h.off, 0, (size_t)nc * nc * nc);   /* (aux_window leaves the part outside the volume alone) */
+        if (aux_window(s, oc, nc, auxc + h.off)) return -1;
+    } else if (on && s->aux) {
+        static _Atomic int warned;
+        if (!atomic_exchange(&warned, 1)) UFSM_DEFAULTED("--aux-input: a window at a level finer than the box allows (aux level %d, window level %d, box %d): its aux channel is 0", s->aux_level, l, nc);
+    }
+    memcpy(auxc + (size_t)i * 32, &h, sizeof h);
+    return 0;
+}
 static double rnorm(rng *r) { double u1 = runif(r); const double u2 = runif(r); if (u1 < 1e-300) u1 = 1e-300; return sqrt(-2 * log(u1)) * cos(2 * M_PI * u2); }
 static inline void put_x(float *X, uint16_t *H, int xfmt, size_t idx, float v) {
     if (X) X[idx] = v; else if (xfmt == 1) { _Float16 hv = (_Float16)v; memcpy(&H[idx], &hv, 2); } else H[idx] = bf16_rn(v);
@@ -3665,7 +3715,9 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (c->gpu_input) rad_record((char *)b->rad + (size_t)i * NN_RAD_REC(Pz), o, Pz, P, hax, y, cyz, cxz, &spatial);   /* the radial channels: on the device */
     if (c->axis_rec > 0) axis_record(b->axr + (size_t)i * SAMPLE_AXR(Pz > P ? Pz : P), o, Pz, P, hax, y, cyz, cxz, &spatial, c->axis_rec);
     free(params); tp_put(tmscr, p3);
-    if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
+    if (c->aux && c->gpu_input) {   /* the fifth channel on the device (nn_input_rad_aux): this window's coarse box, the CT's symmetry / warp there */
+        if (aux_box(c, s, l, o, P, !(crushed || torn || delam || curved) && !(c->aux_drop > 0.f && runif(r) < c->aux_drop), b->auxc, i)) return -1;   /* (--aux-drop: no draw at 0) */
+    } else if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
         uint8_t *aw = tp_get(p3, 1), *as = tp_get(p3, 0);
         if (!aw || !as || (s->aux && s->aux_level == l && aux_window(s, o, P, aw))) { tp_put(aw, p3); tp_put(as, p3); return -1; }
         /* the CT's spatial warp too (arm K 11-20: a surface-proximity aux must stay on the CT's sheet; it was symmetry only, fine for the
@@ -4245,6 +4297,7 @@ static void *pf_worker(void *p) {   /* the marked chunks, from one shared list: 
                                        left most threads idle (2 MB/s from the mirror at 56 threads) */
     pf_arg *a = p;
     for (;;) {
+        if (pf_disk_low()) break;
         const size_t i = __atomic_fetch_add(a->next, 1, __ATOMIC_RELAXED); if (i >= a->n) break;
         const size_t k = a->list[i];
         int64_t cz = (int64_t)(k / ((size_t)a->ng[1] * a->ng[2])), cy = (int64_t)((k / (size_t)a->ng[2]) % (size_t)a->ng[1]), cx = (int64_t)(k % (size_t)a->ng[2]);
@@ -4256,20 +4309,33 @@ static void *pf_worker(void *p) {   /* the marked chunks, from one shared list: 
 }
 /* sharded arrays (2026-11-25): one coalesced fetch per shard over its marked chunks (z3_prefetch_shard_sel), the pod's data wait fix:
    per-chunk requests from the dl.ash2txt mirror ran ~20 MB/s (~0.35 s first-byte latency each, S2E waited 30-71 %), whole shards ~90 MB/s */
+/* the free-disk guard (2026-11-25: the R11P prefetch filled the pod disk to 9 GB free, ctprefetch.sh checked MIN_FREE_GB only at start):
+   before each shard / chunk the cache disk's free space (statvfs of UFSM_HTTP_CACHE); below --min-free-gb every worker stops, the run
+   ends with exit 3. What came stays cached, a rerun resumes. */
+static const char *pf_cache_dir; static double pf_min_free_gb; static atomic_int pf_stop; static atomic_llong pf_free_seen = -1;
+static int pf_disk_low(void) {
+    if (atomic_load_explicit(&pf_stop, memory_order_relaxed)) return 1;
+    if (!pf_cache_dir || pf_min_free_gb <= 0) return 0;
+    struct statvfs v; if (statvfs(pf_cache_dir, &v)) return 0;
+    const long long f = (long long)v.f_bavail * (long long)v.f_frsize; atomic_store_explicit(&pf_free_seen, f, memory_order_relaxed);
+    if ((double)f < pf_min_free_gb * 1e9) { atomic_store(&pf_stop, 1); return 1; }
+    return 0;
+}
 typedef struct { z3 *ct; const uint8_t *bits; const int64_t *ng; const int64_t *sh; size_t nsh; int64_t g[3]; size_t *next, *done, *fail;
-                 z3_pf_stats st; pthread_mutex_t *mu; z3_pf_stats *tot; } pfs_arg;
+                 z3_pf_stats st; pthread_mutex_t *mu; z3_pf_stats *tot; int dry; } pfs_arg;
 static void *pfs_worker(void *p) {
     pfs_arg *a = p; z3_pf_stats st = {0};
     for (;;) {
+        if (!a->dry && pf_disk_low()) break;
         const size_t i = __atomic_fetch_add(a->next, 1, __ATOMIC_RELAXED); if (i >= a->nsh) break;
         const int64_t s[3] = {a->sh[3 * i], a->sh[3 * i + 1], a->sh[3 * i + 2]};
         const int64_t lo[3] = {s[0] * a->g[0], s[1] * a->g[1], s[2] * a->g[2]};
         int64_t hi[3]; for (int d = 0; d < 3; d++) { hi[d] = lo[d] + a->g[d] - 1; if (hi[d] > a->ng[d] - 1) hi[d] = a->ng[d] - 1; }   /* (an edge shard: no chunks past the grid,
                                                                                                                                   whose bit index would alias the next row) */
-        if (z3_prefetch_shard_sel(a->ct, s[0], s[1], s[2], lo, hi, a->bits, a->ng, &st) < 0) __atomic_fetch_add(a->fail, 1, __ATOMIC_RELAXED);
+        if ((a->dry ? z3_count_shard_sel : z3_prefetch_shard_sel)(a->ct, s[0], s[1], s[2], lo, hi, a->bits, a->ng, &st) < 0) __atomic_fetch_add(a->fail, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(a->done, 1, __ATOMIC_RELAXED);
     }
-    pthread_mutex_lock(a->mu); a->tot->present += st.present; a->tot->cached += st.cached; a->tot->absent += st.absent; a->tot->bytes += st.bytes; pthread_mutex_unlock(a->mu);
+    pthread_mutex_lock(a->mu); a->tot->present += st.present; a->tot->cached += st.cached; a->tot->absent += st.absent; a->tot->bytes += st.bytes; a->tot->need += st.need; pthread_mutex_unlock(a->mu);
     return nullptr;
 }
 static void pf_mark(uint8_t *bits, const int64_t *ng, const int64_t *lo, const int64_t *hi) {   /* chunk index box, inclusive, clamped */
@@ -4279,15 +4345,29 @@ static void pf_mark(uint8_t *bits, const int64_t *ng, const int64_t *lo, const i
         size_t k = ((size_t)z * (size_t)ng[1] + (size_t)y) * (size_t)ng[2] + (size_t)x; bits[k >> 3] |= (uint8_t)(1u << (k & 7));
     }
 }
-int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int P, int dry) {
+/* the dry count across sources (2026-11-25): sources over the same scan (R11P: 1667 hum / hfH / hfY2, P4 hum / hfH / hfG) need many of
+   the same chunks; each array x level keeps the union of the chunks counted so far and a later source counts only its new ones, so the
+   per-source GB add up to the disk the prefetch fills (the per-source sum read 311.9 GB "stored" where the cache holds ~185 GB). */
+typedef struct { char *id; uint8_t *bits; size_t nb; } pf_seen;
+static uint8_t *pf_seen_bits(pf_seen **t, int *n, const z3 *ct, int l, size_t nb) {
+    char id[4096]; snprintf(id, sizeof id, "%s|%s|%d", z3_root(ct), z3_key(ct), l);
+    for (int i = 0; i < *n; i++) if (!strcmp((*t)[i].id, id) && (*t)[i].nb == nb) return (*t)[i].bits;
+    pf_seen *q = realloc(*t, (size_t)(*n + 1) * sizeof *q); if (!q) return nullptr; *t = q;
+    uint8_t *b = calloc(nb ? nb : 1, 1); char *d = strdup(id); if (!b || !d) { free(b); free(d); return nullptr; }
+    q[*n] = (pf_seen){d, b, nb}; ++*n; return b;
+}
+int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int P, int dry, double min_free_gb) {
+    pf_seen *seen = nullptr; int nseen = 0;
     if (P < 8) P = 128;   /* training window (level voxels); windows up to this size are covered */
-    size_t all = 0, all_fail = 0; int64_t all_bytes = 0;
-    for (int i = 0; i < S->n; i++) {
+    size_t all = 0, all_fail = 0; int64_t all_bytes = 0, all_need = 0, all_cached = 0; int unsharded = 0;
+    pf_cache_dir = getenv("UFSM_HTTP_CACHE"); if (pf_cache_dir && !*pf_cache_dir) pf_cache_dir = nullptr; pf_min_free_gb = min_free_gb; atomic_store(&pf_stop, 0);
+    if (!dry && pf_disk_low()) { fprintf(stderr, "prefetch: ALERT: %.1f GB free on the cache disk %s (< --min-free-gb %g): not started\n", (double)atomic_load(&pf_free_seen) / 1e9, pf_cache_dir, min_free_gb); return 3; }
+    for (int i = 0; i < S->n && !atomic_load(&pf_stop); i++) {
         source *s = &S->src[i];
         occ_index o = source_occupancy(s);
         if (!o.n) { fprintf(stderr, "prefetch: %s: no occupancy index (regions source?), skipped\n", s->name); continue; }
         size_t ncell = (size_t)(o.n * fraction); if (ncell < 1) ncell = 1; if (ncell > o.n) ncell = o.n;
-        for (int l = 0; l < MAXLEV; l++) {
+        for (int l = 0; l < MAXLEV && !atomic_load(&pf_stop); l++) {
             z3 *ct = source_ct(s, l); if (!ct) continue;
             const z3_meta *m = z3_meta_of(ct);
             const int top = s->max_level >= 0 && s->max_level < maxlev ? s->max_level : maxlev;   /* the levels this source trains on */
@@ -4313,10 +4393,14 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
                 }
                 pf_mark(bits, ng, lo, hi);
             }
+            size_t nshared = 0;
+            if (dry) { uint8_t *sb = pf_seen_bits(&seen, &nseen, ct, l, (total + 7) / 8);   /* (an earlier source's chunks of this array: counted there) */
+                if (sb) for (size_t k = 0; k < (total + 7) / 8; k++) { nshared += (size_t)__builtin_popcount(bits[k] & sb[k]); bits[k] &= (uint8_t)~sb[k]; sb[k] |= bits[k]; } }
             size_t nmark = 0; for (size_t k = 0; k < total; k++) nmark += (bits[k >> 3] >> (k & 7)) & 1;
             all += nmark;
-            if (dry) { fprintf(stderr, "prefetch: %s level %d: %zu chunks needed (window %d)\n", s->name, l, nmark, P); free(bits); continue; }
-            if (m->sharded && !getenv("UFSM_PREFETCH_CHUNKS")) {   /* whole shards (UFSM_PREFETCH_CHUNKS=1: the old per-chunk requests) */
+            if (dry && (!m->sharded || getenv("UFSM_PREFETCH_CHUNKS"))) {   /* (unsharded: no index to size the chunks from) */
+                fprintf(stderr, "prefetch: %s level %d: %zu chunks needed (window %d; unsharded, bytes unknown)\n", s->name, l, nmark, P); unsharded++; free(bits); continue; }
+            if (m->sharded && !getenv("UFSM_PREFETCH_CHUNKS")) {   /* dry: the same shard walk, the index only (z3_count_shard_sel) */   /* whole shards (UFSM_PREFETCH_CHUNKS=1: the old per-chunk requests) */
                 int64_t g[3], ns[3]; for (int d = 0; d < 3; d++) { g[d] = m->shard[d] / m->chunk[d]; ns[d] = (ng[d] + g[d] - 1) / g[d]; }
                 const size_t nst = (size_t)(ns[0] * ns[1] * ns[2]); uint8_t *sm = calloc(nst ? nst : 1, 1);
                 if (!sm) { fprintf(stderr, "prefetch: %s level %d: out of memory, skipped\n", s->name, l); free(bits); continue; }
@@ -4331,15 +4415,23 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
                 if (!sh || !th || !args) { fprintf(stderr, "prefetch: %s level %d: out of memory, skipped\n", s->name, l); free(sh); free(th); free(args); free(bits); continue; }
                 size_t next = 0, done = 0, fail = 0; z3_pf_stats tot = {0}; pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; int nmade = 0;
                 struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
-                for (int t = 0; t < nthreads; t++) { args[t] = (pfs_arg){ct, bits, ng, sh, nsh, {g[0], g[1], g[2]}, &next, &done, &fail, {0}, &mu, &tot};
+                for (int t = 0; t < nthreads; t++) { args[t] = (pfs_arg){ct, bits, ng, sh, nsh, {g[0], g[1], g[2]}, &next, &done, &fail, {0}, &mu, &tot, dry};
                     if (!pthread_create(&th[nmade], nullptr, pfs_worker, &args[t])) nmade++; }
                 if (!nmade) pfs_worker(&args[0]);
                 for (int t = 0; t < nmade; t++) pthread_join(th[t], nullptr);
                 clock_gettime(CLOCK_MONOTONIC, &t1); const double sec = (double)(t1.tv_sec - t0.tv_sec) + 1e-9 * (double)(t1.tv_nsec - t0.tv_nsec);
+                all_need += tot.need; all_cached += tot.need - tot.bytes;
+                if (dry) {
+                    fprintf(stderr, "prefetch: %s level %d: %zu chunks needed in %zu shards (window %d; + %zu counted with an earlier source): %lld stored, %lld absent;"
+                                    " %lld already cached; %.2f GB stored, %.2f GB to fetch (%lld B); %zu index failures\n", s->name, l, nmark, nsh, P, nshared,
+                            (long long)tot.present, (long long)tot.absent, (long long)tot.cached, (double)tot.need / 1e9, (double)tot.bytes / 1e9, (long long)tot.bytes, fail);
+                    all_fail += fail; all_bytes += tot.bytes; free(sh); free(th); free(args); free(bits); continue;
+                }
+                if (atomic_load(&pf_stop)) fail += nsh - done;   /* (the shards the disk guard left: not cached, coverage below 1) */
                 /* coverage: the share of the needed shards now wholly in the cache (a failed shard's index did not load: its chunks are not tallied) */
-                fprintf(stderr, "prefetch: %s level %d done (%zu chunks needed in %zu shards: %lld stored, %lld absent; %lld already cached, %.2f GB fetched now in %.0f s"
+                fprintf(stderr, "prefetch: %s level %d done (%zu chunks needed in %zu shards: %lld stored, %lld absent; %lld already cached, %.2f GB fetched now (%lld B) in %.0f s"
                                 " = %.0f MB/s; %zu shard failures; coverage %.4f)\n", s->name, l, nmark, nsh, (long long)tot.present, (long long)tot.absent, (long long)tot.cached,
-                        (double)tot.bytes / 1e9, sec, (double)tot.bytes / 1e6 / (sec > 0 ? sec : 1), fail, nsh ? (double)(nsh - fail) / (double)nsh : 1.0);
+                        (double)tot.bytes / 1e9, (long long)tot.bytes, sec, (double)tot.bytes / 1e6 / (sec > 0 ? sec : 1), fail, nsh ? (double)(nsh - fail) / (double)nsh : 1.0);
                 all_fail += fail; all_bytes += tot.bytes;
                 free(sh); free(th); free(args); free(bits);
                 continue;
@@ -4352,14 +4444,26 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
             for (int t = 0; t < nthreads; t++) { args[t] = (pf_arg){ct, list, nl, {ng[0], ng[1], ng[2]}, &next, &done, &fetched, &fail}; made[t] = !pthread_create(&th[t], nullptr, pf_worker, &args[t]); nmade += made[t]; }
             if (!nmade) pf_worker(&args[0]);   /* (no thread could start: the list here, so the wait below ends; joins only the threads made) */
             size_t last = 0;
-            while (last < nmark) { usleep(1000000); last = __atomic_load_n(&done, __ATOMIC_RELAXED); fprintf(stderr, "prefetch: %s level %d: %zu / %zu chunks checked, %zu fetched\r", s->name, l, last, nmark, __atomic_load_n(&fetched, __ATOMIC_RELAXED)); }
+            while (last < nmark && !atomic_load(&pf_stop)) { usleep(1000000); last = __atomic_load_n(&done, __ATOMIC_RELAXED); fprintf(stderr, "prefetch: %s level %d: %zu / %zu chunks checked, %zu fetched\r", s->name, l, last, nmark, __atomic_load_n(&fetched, __ATOMIC_RELAXED)); }
             for (int t = 0; t < nthreads; t++) if (made[t]) pthread_join(th[t], nullptr);
             free(list);
             free(th); free(args); free(made); free(bits);
+            if (atomic_load(&pf_stop)) fail += nmark - done;   /* (left by the disk guard) */
             fprintf(stderr, "\nprefetch: %s level %d done (%zu chunks needed, %zu fetched now, %zu failures)\n", s->name, l, nmark, fetched, fail);
             all_fail += fail;
         }
         free(o.idx);
+    }
+    for (int i = 0; i < nseen; i++) { free(seen[i].id); free(seen[i].bits); } free(seen);
+    if (dry) {
+        fprintf(stderr, "prefetch: %zu chunks over all sources (window %d): %.2f GB stored, %.2f GB already cached, %.2f GB to fetch%s; %zu index failures\n", all, P,
+                (double)all_need / 1e9, (double)all_cached / 1e9, (double)all_bytes / 1e9, unsharded ? " (+ unsharded arrays, bytes unknown)" : "", all_fail);
+        return all_fail ? 1 : 0;
+    }
+    if (atomic_load(&pf_stop)) {
+        fprintf(stderr, "prefetch: ALERT: stopped, %.1f GB free on the cache disk %s (< --min-free-gb %g): %.2f GB fetched now; the rest is read cold (rerun to resume)\n",
+                (double)atomic_load(&pf_free_seen) / 1e9, pf_cache_dir, pf_min_free_gb, (double)all_bytes / 1e9);
+        return 3;
     }
     fprintf(stderr, "prefetch: %zu chunks over all sources (window %d), %.2f GB fetched now (sharded arrays), %zu failures\n", all, P, (double)all_bytes / 1e9, all_fail);
     return all_fail ? 1 : 0;

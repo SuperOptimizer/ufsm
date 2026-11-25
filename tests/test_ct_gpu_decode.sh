@@ -2,7 +2,8 @@
 # train --ct-gpu-decode (DESIGN 2026-11-13): the sampler's volcomp CT decode on the GPU (src/nn_gpudec.cu through z3_read).
 #  1. ufsm read of the fixture CT (every level, whole array) with UFSM_GPU_DECODE=1 = the CPU decode, byte for byte, and the GPU decoded
 #     substreams (UFSM_GPU_DECODE_STATS > 0 subs), so the comparison is not CPU vs CPU.
-#  2. train --ct-gpu-decode 0 runs: the startup line, the decoder's statistics at exit with substreams decoded on the GPU, and under
+#  2. train --ct-gpu-decode 0 runs: the startup line, the periodic "  gpudec:" line (requests, GPU share, CPU reasons, busy round trips),
+#     the decoder's statistics at exit with substreams decoded on the GPU, and under
 #     --det 1 the same batches as the CPU-decode run: every batch plane's hash (UFSM_BATCH_HASH) and the device input of every step
 #     (UFSM_DET_TRACE "x") equal. Losses only within 2%: --det fixes the windows, not the GPU's float atomics (GN / bias sums,
 #     split-K weight gradients), so two runs of the same binary differ in the last bits of the gradients and the step-4 loss then
@@ -31,6 +32,11 @@ UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 "$U" train "$D/fx/sources.json" --out "$D/cpu
 UFSM_BATCH_HASH=1 UFSM_DET_TRACE=1 "$U" train "$D/fx/sources.json" --out "$D/gpu" $T --ct-gpu-decode 0 > "$D/gpu.tlog" 2>&1 || fail "train --ct-gpu-decode 0 ($D/gpu.tlog)"
 grep -q 'CT decode (volcomp substreams) on GPU 0' "$D/gpu.tlog" || fail "no --ct-gpu-decode startup line"
 grep -qE '[1-9][0-9]* substreams' "$D/gpu.tlog" || fail "train: no substream decoded on the GPU ($D/gpu.tlog)"
+# the periodic decoder line (2026-11-25): requests since the last log line and the GPU share; the CPU-decode run has none
+g=$(grep -E '^  gpudec: [1-9][0-9]* requests, [0-9.]+% on the GPU; CPU: [0-9.]+% near-empty, [0-9.]+% cool-off, [0-9.]+% other; [0-9]+ busy round trips' "$D/gpu.tlog" | head -1)
+[ -n "$g" ] || fail "train: no periodic '  gpudec:' line ($D/gpu.tlog)"
+grep -q '^  gpudec: ' "$D/cpu.tlog" && fail "the CPU-decode run printed a gpudec line"
+echo "train: $g"
 ha=$(grep -E '^batchhash' "$D/cpu.tlog"); hb=$(grep -E '^batchhash' "$D/gpu.tlog")
 [ -n "$ha" ] || fail "no batchhash lines"
 [ "$ha" = "$hb" ] || { diff <(echo "$ha") <(echo "$hb") | head -6; fail "the batches differ between the CPU and the GPU CT decode"; }

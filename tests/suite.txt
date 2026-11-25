@@ -215,6 +215,7 @@ test_ink_pool                                  |              |     3 | ./$B/tes
 test_ink_audit                                 |              |     3 | ./$B/test_ink_audit
 test_ink_mil                                   | gpu          |     2 | ./$B/test_ink_mil
 test_xmx                                       | gpu          |     3 | ./$B/test_xmx
+test_xmx~ig                                    | gpu          |     8 | XMX_IGTEST=1 ./$B/test_xmx
 test_xtsf                                      | gpu          |     2 | ./$B/test_xtsf
 test_grad_ar                                   | gpu          |     8 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
 test_grad_ar~2gpu                              | gpu2         |     8 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
@@ -241,6 +242,7 @@ test_volcomp                                   | smoke        |     1 | ./$B/tes
 test_volcomp_vll                               | smoke        |     1 | ./$B/test_volcomp_vll
 test_z3w_pool                                  | smoke        |     2 | ./$B/test_z3w_pool
 test_typed_zarr                                | smoke        |     7 | ./$B/test_typed_zarr
+test_chunk_map                                 | smoke        |     2 | ./$B/test_chunk_map
 test_http_reader                               |              |    29 | python3 tests/test_http_reader.py
 test_checkpoint_runtime                        | smoke        |     1 | ./$B/test_checkpoint_runtime
 test_ckring                                    |              |     1 | ./$B/test_ckring

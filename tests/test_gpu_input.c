@@ -3,7 +3,8 @@
    (z-keeping symmetries), windows with and without an axis (incl. axis centres on voxel centres: a zero radial vector), large
    corners, fp16 / bf16 batches, MX-fp8 / MX-fp4 inputs, two samples per batch with different records.
    Also the scroll-axis record (sample_axis_record, the attention stage's unet_set_attn_axis input): the in-plane direction from its
-   axis centre to every window voxel equals write_x's radial channels (fp16), for every symmetry, cubes and slabs. */
+   axis centre to every window voxel equals write_x's radial channels (fp16), for every symmetry, cubes and slabs.
+   Also --aux-input's fifth channel from coarse boxes (aux_check: nn_input_rad_aux against sample_aux_byte). */
 #include "nn.h"
 #include "sample.h"
 #include <stdio.h>
@@ -102,6 +103,39 @@ static int latc_check(const uint16_t *h4, const void *d_h1, const void *d_rec, i
     return bad;
 }
 
+/* --aux-input with --gpu-input (2026-11-25, nn_input_rad_aux): the fifth channel from per-sample coarse boxes (random f 1 / 2 / 4, box
+   position, bytes; sample 0 with on = 0 every other call) against the host chain: write_x's 4 channels + sample_aux_byte at each voxel's
+   source-frame position (the symmetry), byte / 127.5 - 1 in fp16, through nn_h16_to_mx */
+static int aux_check(const uint16_t *h4, const void *d_h1, const void *d_rec, int pm[][3], int fp[][3], int N, int D, int P, int bits, int on0) {
+    const size_t S = (size_t)D * P * P; const int f = 1 << (int)(rn() % 3), nc = sample_aux_nc(P, f);
+    const size_t ab = sample_aux_bytes(N, nc), stride = (ab - (size_t)N * 32) / (size_t)N;
+    uint8_t *auxc = calloc(ab, 1); uint16_t *h5 = malloc((size_t)N * 5 * S * 2);
+    for (int n = 0; n < N; n++) {
+        nn_aux_hdr h; memset(&h, 0, sizeof h); h.nc = nc; h.on = n ? 1 : on0; h.inv_f = 1.f / (float)f; h.off = (int)((size_t)N * 32 + (size_t)n * stride);
+        for (int d = 0; d < 3; d++) h.o[d] = 1.f + .999f * ru();
+        memcpy(auxc + (size_t)n * 32, &h, sizeof h);
+        for (size_t k = 0; k < (size_t)nc * nc * nc; k++) auxc[h.off + k] = (uint8_t)(rn() & 255);
+        for (int c = 0; c < 4; c++) memcpy(h5 + ((size_t)n * 5 + c) * S, h4 + ((size_t)n * 4 + c) * S, S * 2);
+        const int nd[3] = {D, P, P};
+        for (int iz = 0; iz < D; iz++) for (int iy = 0; iy < P; iy++) for (int ix = 0; ix < P; ix++) {
+            const int io[3] = {iz, iy, ix}; int sv[3]; for (int d = 0; d < 3; d++) sv[pm[n][d]] = fp[n][d] ? nd[d] - 1 - io[d] : io[d];
+            const float u[3] = {(float)sv[0], (float)sv[1], (float)sv[2]};
+            const _Float16 hv = (_Float16)(sample_aux_byte(auxc, n, u) / 127.5f - 1.f);
+            memcpy(h5 + ((size_t)n * 5 + 4) * S + ((size_t)iz * P + iy) * P + ix, &hv, 2);
+        }
+    }
+    const shape5 x5 = {N, 5, D, P, P}; const size_t mxb = nn_mx_bytes(x5, bits);
+    void *d_h5 = nn_malloc((size_t)N * 5 * S * 2), *d_aux = nn_malloc(ab), *d_a = nn_malloc(mxb), *d_b = nn_malloc(mxb);
+    nn_set_storage(d_a, mxb, bits); nn_set_storage(d_b, mxb, bits);
+    nn_h2d(d_h5, h5, (size_t)N * 5 * S * 2); nn_h2d(d_aux, auxc, ab);
+    nn_h16_to_mx(d_h5, x5, d_a); nn_input_rad_aux(d_h1, x5, d_rec, d_aux, d_b);
+    uint8_t *a = malloc(mxb), *b = malloc(mxb); nn_d2h(a, d_a, mxb); nn_d2h(b, d_b, mxb);
+    const int bad = MX_DIFF("aux input", a, b, mxb) != 0;
+    if (bad) { size_t k = 0; while (k < mxb && a[k] == b[k]) k++; fprintf(stderr, "aux input: f %d nc %d on0 %d: first byte %zu of %zu (%02x vs %02x)\n", f, nc, on0, k, mxb, a[k], b[k]); }
+    free(a); free(b); free(auxc); free(h5); nn_free(d_h5); nn_free(d_aux); nn_free(d_a); nn_free(d_b);
+    return bad;
+}
+
 int main(void) {
     nn_init(0); nn_set_tf32(1); nn_set_act_bf16(1);
     int fails = 0, cases = 0, arcases = 0;
@@ -123,10 +157,12 @@ int main(void) {
                     const int pi = sym % 6, fl = sym / 6;
                     if (shape == 1 && perms[pi][0] != 0) continue;   /* slabs: z-keeping symmetries */
                     for (int ax = 0; ax < 2; ax++) {
+                        int pmn[2][3], fpn[2][3];   /* (the samples' symmetries: aux_check) */
                         for (int n = 0; n < N; n++) {
                             int perm[3], flip[3];
                             const int pj = n ? (pi + 3) % 6 : pi, fj = n ? (fl ^ 5) : fl;   /* the second sample: another symmetry */
                             for (int d = 0; d < 3; d++) { perm[d] = perms[shape == 1 ? pi : pj][d]; flip[d] = ((shape == 1 ? fl : fj) >> d) & 1; }
+                            for (int d = 0; d < 3; d++) { pmn[n][d] = perm[d]; fpn[n][d] = flip[d]; }
                             const int64_t o[3] = {(int64_t)(rn() % 4000), (int64_t)(rn() % 30000), (int64_t)(rn() % 30000)};
                             float cyz[64], cxz[64];
                             for (int z = 0; z < D; z++) {
@@ -153,6 +189,10 @@ int main(void) {
                             if (fails < 5) fprintf(stderr, "FAIL: device input differs (xfmt %d MX-fp%d shape %d sym %d axis %d): first byte %zu of %zu (%02x vs %02x)\n",
                                                    xfmt, bits, shape, sym, ax, k, mxb, ya[k], yb[k]);
                             fails++;
+                        }
+                        if (xfmt == 1 && shape != 1 && (sym % 3) == 0) {   /* --aux-input: the fifth channel (cubes) */
+                            cases++;
+                            if (aux_check(h4, d_h1, d_rec, pmn, fpn, N, D, P, bits, (sym / 3 + ax) & 1)) { if (fails < 5) fprintf(stderr, "FAIL: aux input differs (MX-fp%d shape %d sym %d axis %d)\n", bits, shape, sym, ax); fails++; }
                         }
                         if (xfmt == 1 && N == 1 && (sym % 7) == 0) for (int lc = 13; lc <= 29; lc += 16) {
                             const int e = latc_check(h4, d_h1, d_rec, D, P, bits, lc, lc == 13 ? 0.f : 0.25f); cases++;

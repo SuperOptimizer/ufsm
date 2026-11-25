@@ -437,6 +437,7 @@ int unet_logits_in_gx(const unet *u);   /* the logits share the head's input-gra
 /* train --gpu-input: the next forwards' 16-bit x is the CT channel alone ([n][S]) and rec (device, n records of NN_RAD_REC(D) bytes, nn.h)
    holds each sample's radial record: the 4 MX input channels are built on the device (nn_input_rad). nullptr: x has all 4 channels */
 void unet_set_input_rad(unet *u, const void *rec);
+void unet_set_input_aux(unet *u, const void *aux);   /* --aux-input with --gpu-input: the fifth channel from these boxes (nn.h nn_input_rad_aux) */
 /* latent-grid nets (half_res 3) with the learned cell transform (latfit.h): bas [C][64], gain [C], the quantiser step (0: none); cfg.cin = C + 3.
    Saved in the checkpoint header and set again by unet_load. unet_lat_basis: C (0: plain cell means) and the device copies. */
 void unet_set_lat_basis(unet *u, const float *bas, const float *gain, int C, float step);

@@ -32,6 +32,7 @@
 #include "latvol_read.h"
 #include "embz.h"
 #include "latfit.h"
+#include "sample.h"   /* (--aux-level: sample_aux_nc / sample_aux_byte, the trainer's coarse aux box) */
 #include "winauto.h"
 #include "fblend.h"
 #include <errno.h>
@@ -1599,7 +1600,7 @@ static int predict_one(int argc, char **argv) {
         if (!q1 || !q2 || !q3 || sscanf(q2 + 10, "%lld,%lld,%lld", lz_org, lz_org + 1, lz_org + 2) != 3 || zr_open(&lzr, lat_store)) { fprintf(stderr, "predict: --latents %s is not a latcomp store (ufsm lc-encode)\n", lat_store); return 2; }
         lz_sraw = atof(q1 + 11); lz_c = atoi(q3 + 8);
         { const char *q4 = strstr(zt, "\"drop_ms\":"); lz_drop = q4 ? atof(q4 + 10) : 0; }   /* (stores before the attribute: no correction) */
-        if (degrade || opt(argc, argv, "--aux", nullptr) || !strcmp(opt(argc, argv, "--split", "0"), "z") || opt_atoi("--tta", opt(argc, argv, "--tta", "1")) > 1) {
+        if (degrade || opt(argc, argv, "--aux", nullptr) || opt(argc, argv, "--aux-zero", nullptr) || !strcmp(opt(argc, argv, "--split", "0"), "z") || opt_atoi("--tta", opt(argc, argv, "--tta", "1")) > 1) {
             fprintf(stderr, "predict: --latents: no --aug-*, --aux, --split or --tta (they read the CT itself)\n"); return 2; }   /* (--fit-ct: the rebuilt CT) */
     }
     const int fstem_off = opt_atoi("--fstem-off", opt(argc, argv, "--fstem-off", "0"));   /* --fstem-off 1: a train --fstem checkpoint without its fine stem (the ablation; the trunk's fast paths stay off) */
@@ -1823,12 +1824,19 @@ static int predict_one(int argc, char **argv) {
     if (ffd && out_ch && tta > 1) { fprintf(stderr, "predict: --channel N with --fit-* and --tta: not supported (the probability volume would come from the last symmetry pass)\n"); return 2; }
     if (ffd && (split || (ngpu > 1 && !ffz))) { fprintf(stderr, "predict: --fit-fields runs on one GPU\n"); return 2; }   /* (--fit-zarr: z-layer workers with --gpus) */   /* (--channel N: the probability volume of channel N beside the fields, e.g. --channel ink) */
     z3 *auxz = nullptr; uint8_t *auxd = nullptr, *auxh = nullptr;   /* --aux ROOT KEY: the fifth input of 5-input checkpoints (train --aux-input) */
+    const int aux_lv = opt_atoi("--aux-level", opt(argc, argv, "--aux-level", "-1"));   /* the aux volume's CT level (default: this level); coarser: the
+                                                                                         trainer's device box path, sample_aux_byte (the cascade input) */
+    const int aux_zero = opt_atoi("--aux-zero", opt(argc, argv, "--aux-zero", "0"));   /* the fifth channel all byte 0 (no aux volume: the cascade's
+                                                                                         over-reliance check, the coarse model's input withheld) */
     {   int ai = -1; for (int k = 1; k + 2 < argc; k++) if (!strcmp(argv[k], opt_n("--aux"))) ai = k;
-        if (cfg.cin == 5 && !half) {
+        if (aux_zero && (cfg.cin != 5 || half || ai >= 0)) { fprintf(stderr, "predict: --aux-zero 1: a 5-input checkpoint, without --aux\n"); return 2; }
+        if (cfg.cin == 5 && !half && aux_zero) { if (split || ngpu > 1) { fprintf(stderr, "predict: --aux-zero runs on one GPU without --split\n"); return 2; } }
+        else if (cfg.cin == 5 && !half) {
             if (ai < 0) { fprintf(stderr, "predict: %s has a fifth (aux) input: --aux ROOT KEY (the volume on this level's grid)\n", ckpt); return 2; }
             if (split || ngpu > 1) { fprintf(stderr, "predict: --aux runs on one GPU without --split\n"); return 2; }
             auxz = z3_open(store_open(argv[ai + 1]), argv[ai + 2], opt(argc, argv, "--cache", nullptr));
             if (!auxz) { fprintf(stderr, "predict: --aux: %s\n", z3_error()); return 1; }
+            if (aux_lv >= 0 && (aux_lv < level || aux_lv > level + 6)) { fprintf(stderr, "predict: --aux-level %d: the aux grid must be this level (%d) or up to 6 coarser\n", aux_lv, level); return 2; }
         } else if (ai >= 0) { fprintf(stderr, "predict: --aux needs a checkpoint trained with --aux-input\n"); return 2; }
     }
     if (nwork > 1 && !box) { fprintf(stderr, "--gpus needs --box\n"); return 2; }
@@ -2086,7 +2094,7 @@ static int predict_one(int argc, char **argv) {
         fprintf(stderr, "predict: --aug-*: cube windows up to 1024 on one GPU's plain path\n"); return 2;
     }
     if (!slab) { Wz = W; hz = halo; }
-    else if ((!win_given && !wauto) || Wz > W || Wz % (1 << (cfg.nlev - 1)) || hz >= Wz / 2 || split || half || sheet_task || auxz || sweep_out || ufsm_env_on("UFSM_PRED_HOSTPATH")) {
+    else if ((!win_given && !wauto) || Wz > W || Wz % (1 << (cfg.nlev - 1)) || hz >= Wz / 2 || split || half || sheet_task || (auxz || aux_zero) || sweep_out || ufsm_env_on("UFSM_PRED_HOSTPATH")) {
         fprintf(stderr, "predict: --window-z: at most --window (given), a multiple of %d, --halo-z under half of it; one GPU's plain path (no --split, "
                         "half-resolution, winding, --aux, --cond-sweep or UFSM_PRED_HOSTPATH)\n", 1 << (cfg.nlev - 1));
         return 2;
@@ -2368,7 +2376,7 @@ static int predict_one(int argc, char **argv) {
         if (ffct && ct_shared && !(ctcp = nn_malloc(w3))) { fprintf(stderr, "predict: no device memory for the --fit-ct CT copy\n"); return 1; }
         ctm = ct_shared ? nn_malloc((w3 + 31) / 32 * 4) : nullptr;
         ctmi = ct_shared && iso > 1 ? nn_malloc((w3 + 31) / 32 * 4) : ctm;   /* --iso: the outputs' own mask (the fit keeps ctm) */
-        xd = ct_stem || half || auxz || cfg.cin == 7 ? nullptr : h16 && !sheet_task ? unet_input_scratch(u, 4 * w3 * 2) : nullptr;
+        xd = ct_stem || half || (auxz || aux_zero) || cfg.cin == 7 ? nullptr : h16 && !sheet_task ? unet_input_scratch(u, 4 * w3 * 2) : nullptr;
         xd_shared = xd != nullptr;
         /* a latent-grid net's input goes from the CT bytes straight to the cell grid (nn_lat_pred_input): no full-resolution 4-channel
            window (8 bytes a voxel) or half-resolution intermediate (UFSM_PRED_LAT_INPUT=0: nn_pred_input_d + nn_lowres_input) */
@@ -2385,10 +2393,10 @@ static int predict_one(int argc, char **argv) {
         if (((gdir && cfg.lat_guide == 5) || (fzs && (cfg.lat_guide == 8 || cfg.fstem)) || lhm) && ct_shared && !ctcp && !(ctcp = nn_malloc(w3))) { fprintf(stderr, "predict: no device memory for the guided head's CT copy\n"); return 1; }   /* (the forward overwrites ctd) */
         { const float *b_, *g_; float s_; const int lc_ = half == 3 ? unet_lat_basis(u, &b_, &g_, &s_) : 0;   /* (--latents and the guided head's slab path read the full-resolution input; a
                                                                                                                  --lat-basis checkpoint: nn_lat_pred_input_c, fp16 storage) */
-          latin = half && hdiv == 4 && hmode == 1 && xs.c == 4 && !cfg.lat_dec && (lc_ ? nn_get_f16() != 0 : cfg.cin == 4) && h16 && !auxz && !sheet_task && (!cfg.fstem || fzs || (lhm && !ffd)) && (!cfg.lat_guide || cfg.lat_guide == 64 || gdir || fzs)   /* (the sub-cell head reads no CT; the fine stem does: from the CT bytes in the multi-head and fit-slab paths) */
+          latin = half && hdiv == 4 && hmode == 1 && xs.c == 4 && !cfg.lat_dec && (lc_ ? nn_get_f16() != 0 : cfg.cin == 4) && h16 && !(auxz || aux_zero) && !sheet_task && (!cfg.fstem || fzs || (lhm && !ffd)) && (!cfg.lat_guide || cfg.lat_guide == 64 || gdir || fzs)   /* (the sub-cell head reads no CT; the fine stem does: from the CT bytes in the multi-head and fit-slab paths) */
                   && (!getenv("UFSM_PRED_LAT_INPUT") || ufsm_env_on("UFSM_PRED_LAT_INPUT")); }
         if (!xd && !ct_stem && !latin) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
-        if (auxz) { auxd = nn_malloc(w3); auxh = malloc(w3); }
+        if (auxz || aux_zero) { auxd = nn_malloc(w3); auxh = malloc(w3); }
         if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4));   /* (lgf, and lrt with the direct latent input: at their first use; the direct latent rv path has none) */
             if (hdiv > 2 && !latin) lrt = nn_malloc(w3 / 8 * 16); }
         if (lat_store && gpath) lz_d = nn_malloc(w3 / 64 * (lz_c + 1));   /* (a voxel checkpoint too: its CT window rebuilt from the cells) */
@@ -2396,15 +2404,15 @@ static int predict_one(int argc, char **argv) {
            which the CT window is rebuilt (every reader of the CT bytes) and, when the checkpoint's transform is the store's, the trunk's
            input is taken (no CT -> latent conversion, no host decode). Host-side CT readers (--aug-*, --aux, --split z, --tta, the host
            path) and windows off the 4-voxel cell grid read the rebuilt CT through z3_read instead. UFSM_PRED_LATVOL=0: always z3_read */
-        if (!lat_store && lvc && gpath && !degrade && !auxz && !split && tta <= 1 && W % 4 == 0 && Wz % 4 == 0 && (!getenv("UFSM_PRED_LATVOL") || ufsm_env_on("UFSM_PRED_LATVOL"))) {
+        if (!lat_store && lvc && gpath && !degrade && !(auxz || aux_zero) && !split && tta <= 1 && W % 4 == 0 && Wz % 4 == 0 && (!getenv("UFSM_PRED_LATVOL") || ufsm_env_on("UFSM_PRED_LATVOL"))) {
             lvm = 1; lv_stride = lvc->C + 1; lz_d = nn_malloc(w3 / 64 * lv_stride);
         }
         if (ct_stem) fprintf(stderr, "predict: in-place slab inference from the CT window (%.1f B per window voxel)\n", (double)unet_activation_bytes(u) / w3);
         /* --tta on a latent-grid net: the direct cell input, the fit fields from the whole-window planes (fzs is off with --tta), cube windows */
         /* (a fine-stem net (--fstem, guide 64) has no direct cell input with --tta (fzs off): the xd route of the plain pass, the stem from xd) */
         tta_lat = half == 3 && (latin || (xd && h16 && hdiv == 4 && hmode == 1)) && ffd && Wz == W && !(W % 4) && (!cfg.lat_guide || cfg.lat_guide == 64) && (!cfg.fstem || (cfg.lat_guide == 64 && h16 && !latin))
-                  && !degrade && !auxz && !lat_store && !fzs;
-        if (tta > 1 && !tta_lat && (!ct_stem || !ct_shared || degrade || auxz || cfg.cin != 4)) {
+                  && !degrade && !(auxz || aux_zero) && !lat_store && !fzs;
+        if (tta > 1 && !tta_lat && (!ct_stem || !ct_shared || degrade || (auxz || aux_zero) || cfg.cin != 4)) {
             fprintf(stderr, "predict: --tta needs the CT-stem device path (no --aug-*, --aux, extra inputs) or a latent-grid net's direct cell input with fit fields and cube windows"
                             " (latent: half %d latin %d fit fields %d ct_shared %d window %d x %d lat_guide %d fstem %d)\n", half, latin, ffd != nullptr, ct_shared, Wz, W, cfg.lat_guide, cfg.fstem); return 2; }
         if (tta > 1 && tta_lat) fprintf(stderr, "predict: --tta %d on the latent-grid net: the CT window through each symmetry into the cell input, the fit fields from the whole-window planes\n", tta);
@@ -3151,7 +3159,27 @@ static int predict_one(int argc, char **argv) {
             if (!ct_stem && !latin) nn_pred_input_d(ctd, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xd, h16);
             nn_ptick("input build");
             if (cfg.cin == 7 && !half) nn_zero((char *)xd + 4 * w3 * (h16 ? 2 : 4), 3 * w3 * (h16 ? 2 : 4));   /* no condition: inputs 4-6 zero */
-            if (auxz) {   /* the fifth channel: the aux volume over this window (level coordinates as the CT; outside 0) */
+            if (aux_zero) { memset(auxh, 0, w3); nn_h2d(auxd, auxh, w3); nn_aux_input(auxd, w3, (char *)xd + 4 * w3 * (h16 ? 2 : 4), h16); }
+            else if (auxz && aux_lv > level) {   /* the fifth channel from a coarser aux grid: the trainer's box (sample.c aux_box) and per-voxel byte */
+                const int f = 1 << (aux_lv - level), nc = sample_aux_nc(Wz > W ? Wz : W, f); const z3_meta *am = z3_meta_of(auxz);
+                uint8_t *ab = calloc(sample_aux_bytes(1, nc), 1); if (!ab) return 1;
+                nn_aux_hdr h; memset(&h, 0, sizeof h); h.nc = nc; h.on = 1; h.off = 32; int64_t oc[3], ao[3], an[3]; int inb = 1;
+                sample_aux_place(o, f, &h, oc);
+                memcpy(ab, &h, sizeof h);
+                for (int d = 0; d < 3; d++) { ao[d] = oc[d] < 0 ? 0 : oc[d]; const int64_t e = oc[d] + nc < am->shape[d] ? oc[d] + nc : am->shape[d]; an[d] = e - ao[d]; if (an[d] <= 0) inb = 0; }
+                if (inb) {
+                    uint8_t *tmp = malloc((size_t)an[0] * an[1] * an[2]);
+                    if (!tmp || z3_read(auxz, ao, an, tmp, 8)) { fprintf(stderr, "predict: --aux read failed: %s\n", z3_error()); return 1; }
+                    for (int64_t a = 0; a < an[0]; a++) for (int64_t b2 = 0; b2 < an[1]; b2++)
+                        memcpy(ab + 32 + ((size_t)(a + ao[0] - oc[0]) * nc + (b2 + ao[1] - oc[1])) * nc + (ao[2] - oc[2]), tmp + ((size_t)a * an[1] + b2) * an[2], (size_t)an[2]);
+                    free(tmp);
+                }
+                for (int z = 0; z < Wz; z++) for (int y = 0; y < W; y++) for (int x = 0; x < W; x++) {
+                    const float u[3] = {(float)z, (float)y, (float)x}; auxh[((size_t)z * W + y) * W + x] = (uint8_t)sample_aux_byte(ab, 0, u); }
+                free(ab);
+                nn_h2d(auxd, auxh, w3);
+                nn_aux_input(auxd, w3, (char *)xd + 4 * w3 * (h16 ? 2 : 4), h16);
+            } else if (auxz) {   /* the fifth channel: the aux volume over this window (level coordinates as the CT; outside 0) */
                 const z3_meta *am = z3_meta_of(auxz); int64_t ao[3], an[3]; int inb = 1;
                 memset(auxh, 0, w3);
                 for (int d = 0; d < 3; d++) { ao[d] = o[d] < 0 ? 0 : o[d]; const int64_t e = o[d] + W < am->shape[d] ? o[d] + W : am->shape[d]; an[d] = e - ao[d]; if (an[d] <= 0) inb = 0; }

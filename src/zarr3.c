@@ -342,6 +342,7 @@ __attribute__((weak)) int gpudec_threads(int nthreads) { return nthreads; }
 __attribute__((weak)) int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) { (void)c; (void)mask; (void)dst; return -1; }
 __attribute__((weak)) int gpudec_decode_dev(const gd_chunk *c, uint32_t mask, uint8_t *dchunk) { (void)c; (void)mask; (void)dchunk; return -1; }
 __attribute__((weak)) int gpudec_decode_sink(const gd_chunk *c, uint32_t mask, const gd_sink *k) { (void)c; (void)mask; (void)k; return -1; }
+__attribute__((weak)) void gpudec_counts_get(gpudec_counts *o) { *o = (gpudec_counts){0}; }
 __attribute__((weak)) void gpudec_stats(uint64_t *subs, uint64_t *batches, uint64_t *redo, double *gpu_s) { if (subs) *subs = 0; if (batches) *batches = 0; if (redo) *redo = 0; if (gpu_s) *gpu_s = 0; }
 /* decode the substreams in need of a parsed lossy chunk: on the GPU when it is on (a substream the GPU cannot decode, or a device
    error: the request on the CPU, the reference status and bytes), else volcomp_fast.h. dsink (z3_read_sub_dev): a device 128^3 chunk
@@ -812,16 +813,24 @@ int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx) {
    (latency-bound), the m7 source's 17.9k chunks in 323 s */
 typedef struct { uint64_t off, len; int ci; } pf_item;
 static int pf_item_cmp(const void *a, const void *b) { const pf_item *p = a, *q = b; return (p->off > q->off) - (p->off < q->off); }
+static int shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3], const uint8_t *bits, const int64_t *ng,
+                     z3_pf_stats *st, int dry);
 int z3_prefetch_shard(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3]) {
-    return z3_prefetch_shard_sel(z, sz, sy, sx, lo, hi, nullptr, nullptr, nullptr);
+    return shard_sel(z, sz, sy, sx, lo, hi, nullptr, nullptr, nullptr, 0);
 }
+int z3_prefetch_shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3], const uint8_t *bits,
+                          const int64_t *ng, z3_pf_stats *st) { return shard_sel(z, sz, sy, sx, lo, hi, bits, ng, st, 0); }
+/* the dry count (2026-11-25: the R11P prefetch was estimated at ~60 GB from chunk counts and filled the pod disk past 151 GB): only the
+   shard index is read; st gets the same tally, need = the encoded bytes of the selected stored chunks, bytes = those not yet cached */
+int z3_count_shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3], const uint8_t *bits,
+                       const int64_t *ng, z3_pf_stats *st) { return shard_sel(z, sz, sy, sx, lo, hi, bits, ng, st, 1); }
 /* z3_prefetch_shard with an optional selection: bits (one bit per global inner chunk, row-major over ng = the array's chunk grid) limits
    the fetch to the marked chunks inside [lo, hi]; st (optional) adds the marked chunks' tally: present, already cached, absent (fill),
    and the encoded bytes fetched now. ufsm prefetch (2026-11-25, pod data wait): its per-chunk requests ran ~20 MB/s from the mirror
    (~0.35 s first-byte latency each), whole-shard coalesced reads ~90 MB/s. */
-int z3_prefetch_shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3], const uint8_t *bits,
-                          const int64_t *ng, z3_pf_stats *st) {
-    if (!z->cache || !z->m.sharded) return 0;
+static int shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3], const uint8_t *bits, const int64_t *ng,
+                     z3_pf_stats *st, int dry) {
+    if (!z->m.sharded || (!z->cache && !dry)) return 0;
     char skey[1200], item[16]; shard_key(z, sz, sy, sx, skey, sizeof skey);
     ientry *idx = malloc((size_t)z->nc * sizeof *idx); pf_item *it = malloc((size_t)z->nc * sizeof *it);
     if (!idx || !it) { free(idx); free(it); return FAIL("prefetch allocation"); }
@@ -842,8 +851,9 @@ int z3_prefetch_shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64
                     const size_t k = ((size_t)g[0] * (size_t)ng[1] + (size_t)g[1]) * (size_t)ng[2] + (size_t)g[2]; if (!((bits[k >> 3] >> (k & 7)) & 1)) continue; }
         const int ci = (a * z->cgrid[1] + b) * z->cgrid[2] + c; const ientry e = idx[ci];
         if ((e.off == UINT64_MAX && e.len == UINT64_MAX) || !e.len) { if (st) st->absent++; continue; }   /* absent (fill) */
-        if (st) st->present++;
-        snprintf(item, sizeof item, "%d", ci); if (cache_has(z, skey, item)) { if (st) st->cached++; continue; }
+        if (st) { st->present++; st->need += (int64_t)e.len; }
+        snprintf(item, sizeof item, "%d", ci); if (z->cache && cache_has(z, skey, item)) { if (st) st->cached++; continue; }
+        if (dry) { if (st) st->bytes += (int64_t)e.len; continue; }
         it[n++] = (pf_item){e.off, e.len, ci};
     }
     free(idx);
@@ -1208,6 +1218,29 @@ static int work_cmp(const void *a, const void *b) {
     return x->off < y->off ? -1 : x->off > y->off;
 }
 
+typedef struct { z3 *z; int64_t ns[3], grid[3]; uint8_t *b; _Atomic int64_t next, n; _Atomic int fail; } cm_job;
+static void *cm_worker(void *a) {
+    cm_job *J = a; z3 *z = J->z; ientry *idx = malloc((size_t)z->nc * sizeof *idx);
+    if (!idx) { atomic_store(&J->fail, 1); FAIL("chunk map allocation"); return nullptr; }
+    const int64_t nsh = J->ns[0] * J->ns[1] * J->ns[2], *grid = J->grid;
+    for (int64_t s; !atomic_load(&J->fail) && (s = atomic_fetch_add(&J->next, 1)) < nsh;) {
+        const int64_t sz = s / (J->ns[1] * J->ns[2]), sy = s / J->ns[2] % J->ns[1], sx = s % J->ns[2];
+        char skey[1200]; shard_key(z, sz, sy, sx, skey, sizeof skey);
+        const int pr = load_index(z, skey, idx);
+        if (pr < 0) { atomic_store(&J->fail, 1); break; }
+        if (!pr) continue;
+        int64_t n = 0;
+        for (int cz = 0; cz < z->cgrid[0]; cz++) for (int cy = 0; cy < z->cgrid[1]; cy++) for (int cx = 0; cx < z->cgrid[2]; cx++) {
+            const int64_t gz = sz * z->cgrid[0] + cz, gy = sy * z->cgrid[1] + cy, gx = sx * z->cgrid[2] + cx;
+            if (gz >= grid[0] || gy >= grid[1] || gx >= grid[2]) continue;
+            const ientry e = idx[(cz * z->cgrid[1] + cy) * z->cgrid[2] + cx];
+            if ((e.off == UINT64_MAX && e.len == UINT64_MAX) || !e.len) continue;
+            J->b[(gz * grid[1] + gy) * grid[2] + gx] = 1; n++;
+        }
+        atomic_fetch_add(&J->n, n);
+    }
+    free(idx); return nullptr;
+}
 int64_t z3_chunk_map(z3 *z, int64_t grid[3], uint8_t **bits) {
     if (z->derive && z->xmap) {
         if (x_map(z)) return FAIL("%s: the extent map failed", z->key);
@@ -1229,26 +1262,23 @@ int64_t z3_chunk_map(z3 *z, int64_t grid[3], uint8_t **bits) {
     }
     const z3_meta *m = &z->m; *bits = nullptr;
     if (!m->sharded) return FAIL("chunk map: not a sharded array");
-    int64_t ns[3];
-    for (int i = 0; i < 3; i++) { grid[i] = (m->shape[i] + m->chunk[i] - 1) / m->chunk[i]; ns[i] = (m->shape[i] + m->shard[i] - 1) / m->shard[i]; }
-    uint8_t *b = calloc((size_t)(grid[0] * grid[1] * grid[2]), 1); ientry *idx = malloc((size_t)z->nc * sizeof *idx);
-    if (!b || !idx) { free(b); free(idx); return FAIL("chunk map allocation"); }
-    int64_t n = 0;
-    for (int64_t sz = 0; sz < ns[0]; sz++) for (int64_t sy = 0; sy < ns[1]; sy++) for (int64_t sx = 0; sx < ns[2]; sx++) {
-        char skey[1200]; shard_key(z, sz, sy, sx, skey, sizeof skey);
-        const int pr = load_index(z, skey, idx);
-        if (pr < 0) { free(b); free(idx); return -1; }
-        if (!pr) continue;
-        for (int cz = 0; cz < z->cgrid[0]; cz++) for (int cy = 0; cy < z->cgrid[1]; cy++) for (int cx = 0; cx < z->cgrid[2]; cx++) {
-            const int64_t gz = sz * z->cgrid[0] + cz, gy = sy * z->cgrid[1] + cy, gx = sx * z->cgrid[2] + cx;
-            if (gz >= grid[0] || gy >= grid[1] || gx >= grid[2]) continue;
-            const ientry e = idx[(cz * z->cgrid[1] + cy) * z->cgrid[2] + cx];
-            if ((e.off == UINT64_MAX && e.len == UINT64_MAX) || !e.len) continue;
-            b[(gz * grid[1] + gy) * grid[2] + gx] = 1; n++;
-        }
-    }
-    free(idx); *bits = b;
-    return n;
+    cm_job J = {.z = z};
+    for (int i = 0; i < 3; i++) { grid[i] = (m->shape[i] + m->chunk[i] - 1) / m->chunk[i]; J.ns[i] = (m->shape[i] + m->shard[i] - 1) / m->shard[i]; J.grid[i] = grid[i]; }
+    J.b = calloc((size_t)(grid[0] * grid[1] * grid[2]), 1);
+    if (!J.b) return FAIL("chunk map allocation");
+    /* the shard indices read by up to UFSM_CHUNKMAP_THREADS (16) threads: one index is a tiny latency-bound read (an open + a 132-byte
+       pread on R11d's teacher zarrs over rclone ~/nas2: 142 k of them, ~2 ms each, 309 s summed per sampler start; perf 11-25). Each
+       shard writes only its own chunks' bits: the same map as the serial loop. */
+    const int64_t nsh = J.ns[0] * J.ns[1] * J.ns[2];
+    int nt = getenv("UFSM_CHUNKMAP_THREADS") ? atoi(getenv("UFSM_CHUNKMAP_THREADS")) : 16; if (nt < 1) nt = 1; if (nt > 64) nt = 64;
+    if (nt > nsh) nt = (int)(nsh > 0 ? nsh : 1);
+    pthread_t th[64]; int nth = 0;
+    for (int k = 1; k < nt; k++) if (!pthread_create(&th[nth], nullptr, cm_worker, &J)) nth++;
+    cm_worker(&J);
+    for (int k = 0; k < nth; k++) pthread_join(th[k], nullptr);
+    if (atomic_load(&J.fail)) { free(J.b); return -1; }
+    *bits = J.b;
+    return atomic_load(&J.n);
 }
 int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx) {
     if (z->derive && z->xmap) { const int64_t o[3] = {sz * z->m.shard[0], sy * z->m.shard[1], sx * z->m.shard[2]}; const int64_t sn[3] = {z->m.shard[0], z->m.shard[1], z->m.shard[2]}; return x_box(z, o, sn); }
