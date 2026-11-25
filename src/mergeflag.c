@@ -359,7 +359,7 @@ enum { EV_NZ = 16, EV_NTH = 720, EV_NF = 4 };
    pt: the --dense-pts probe pair (absolute native z y x of m - s/2 u and m + s/2 u: the interval's middle m, the ray direction u, the
    net's own local spacing s = sp h / 8 voxels; no GT position enters) */
 typedef struct { float f[EV_NF], gap, cs, pt[6]; uint8_t y; } ev_iv;
-static int ev_nf = 3;   /* the logistic's features: 3, or 4 with --dense-cos */
+static int ev_nf = 3;   /* mgpu: config. The logistic's features: 3, or 4 with --dense-cos */
 /* |cos| between the ray (sy, sx) and the GT sheet's in-slice normal at label voxel (ly, lx): the normal = the minor axis of the
    covariance of the same-code label voxels within radius r (2-D, the slice; sheets' z tilt ignored); -1 when too few voxels */
 static float ev_cos(const uint8_t *g, long long gny, long long gnx, long long ly, long long lx, int r, double sy, double sx) {

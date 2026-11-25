@@ -3263,7 +3263,7 @@ static int au_in(const double P[3], const int64_t b[6], double m) {
    (-1: none): the AUC of model 1, model 2 and of the rank average (cdf1(b1) + cdf2(b2)) / 2, each cdf the model's mid-rank over all HOLD
    pixels kept (both classes). Exact with ties (Mann-Whitney over the 65536 cells sorted by score). */
 enum { AU_EB = 6 };   /* --pred2-edge buckets (au_edge_bucket) */
-static const char *au_eb_name[AU_EB] = {"<=1", "<=2", "<=4", "<=8", "<=D", ">D"};
+static const char *const au_eb_name[AU_EB] = {"<=1", "<=2", "<=4", "<=8", "<=D", ">D"};
 typedef struct { double s; uint64_t n1, n0; } au_cell;
 static int au_cell_cmp(const void *a, const void *b) { const double x = ((const au_cell *)a)->s, y = ((const au_cell *)b)->s; return (x > y) - (x < y); }
 static void au_fuse_auc(const uint64_t *jr, int nreg, int skip, double out[3]) {
@@ -3640,7 +3640,7 @@ int cmd_ink_devcrops(int argc, char **argv) {
         if (nb >= 64 || sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6 || b[3] <= 0 || b[4] <= 0 || b[5] <= 0) {
             fprintf(stderr, "ink-devcrops: --box z,y,x,nz,ny,nx (level-0, at most 64)\n"); return 2; }
         for (int d = 0; d < 6; d++) box[nb][d] = b[d]; nb++; }
-    static int64_t exb[64][6]; int ne = 0;   /* --exclude: a window with any valid vertex in one of these boxes is dropped (training crops outside held-out boxes) */
+    static int64_t exb[64][6]; int ne = 0;   /* mgpu: config. --exclude: a window with any valid vertex in one of these boxes is dropped (training crops outside held-out boxes) */
     for (int i = 2; i + 1 < argc; i++) { if (strcmp(argv[i], opt_n("--exclude"))) continue; long long b[6];
         if (ne >= 64 || sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6 || b[3] <= 0 || b[4] <= 0 || b[5] <= 0) {
             fprintf(stderr, "ink-devcrops: --exclude z,y,x,nz,ny,nx (level-0, at most 64)\n"); return 2; }
