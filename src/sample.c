@@ -2779,6 +2779,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     if (rc == 0 && b->chid && (!cs || cs->id < 0)) { b->chid[i] = -1; b->chidx[i] = 0; b->choff[3 * i] = b->choff[3 * i + 1] = b->choff[3 * i + 2] = 0.f; }
     return rc;
 }
+static int g_histlog = -1;   /* UFSM_HISTLOG (read at the first draw; mgpu: benign race, every thread reads the same env) */
 static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs) {
     if (sp->cfg.restore == 2) return draw_restore_pair(sp, b, i, r, big);
     if (sp->cfg.restore) return draw_restore(sp, b, i, r, big);
@@ -3334,6 +3335,9 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         }
         if (g_crush.air0 && !(son & 1u << SA_AIR)) { tp_put(g_crush.air0, p3 / 8 + 1); g_crush.air0 = nullptr; }   /* (the op did not run: ctu's zeros are the air) */
         PROF_MARK(PS_SCAN);
+        if (son & 1u << SA_HIST) atomic_fetch_add(&sp->augn[AUGN_HIST], 1);   /* (inksdk 11-24: E5's hist op had no evidence it fired) */
+        if (g_histlog < 0) { const char *e = getenv("UFSM_HISTLOG"); g_histlog = e && atoi(e) > 0; }
+        if (g_histlog && !grec) fprintf(stderr, "histlog\t%s\t%g\t%d\t%.2f\t%.2f\n", s->name, s->um, !!(son & 1u << SA_HIST), mean, sd);   /* UFSM_HISTLOG=1: per CPU-augmented window, the CT mean / sd after the scanner ops */
     }
     if (grec && !grec->scan) memcpy(b->ct8 + (size_t)i * p3, ctu, p3);   /* (the bytes as read) */
     int fixed_norm = s->norm_s > 0;

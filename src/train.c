@@ -4284,7 +4284,7 @@ int cmd_train(int argc, char **argv) {
             free(lvc);
             free(cov);
             sampler_hostmem(sq, stderr, 0);
-            uint64_t prod = 0, rej = 0; sampler_stats(sq, &prod, &rej); fprintf(stderr, "sampler-only: produced %llu rejected %llu\n", (unsigned long long)prod, (unsigned long long)rej);
+            uint64_t prod = 0, rej = 0; sampler_stats(sq, &prod, &rej); fprintf(stderr, "sampler-only: produced %llu rejected %llu\n", (unsigned long long)prod, (unsigned long long)rej); if (sampler_aug_count(sq, AUGN_HIST)) fprintf(stderr, "sampler-only: scanner hist augmentation: %llu windows\n", (unsigned long long)sampler_aug_count(sq, AUGN_HIST));
             { dcache_stats dc; dcache_get_stats(&dc); phase_onfly_stats po; phase_onfly_get_stats(&po);   /* (perf2: how much of the on-the-fly labels the derived cache served) */
               fprintf(stderr, "sampler-only: derived cache %llu cells from memory, %llu from disk (%llu of them from the dense store, %.1f s), %llu computed (%.1f s); onfly phase %llu reads, %llu tiles, %.1f s in the pair rule\n",
                       (unsigned long long)dc.cells_mem, (unsigned long long)(dc.cells_disk + dc.cells_dense), (unsigned long long)dc.cells_dense, dc.s_dense, (unsigned long long)dc.cells_computed, dc.s_compute,
@@ -6379,7 +6379,7 @@ int cmd_train(int argc, char **argv) {
     fprintf(stderr, "done in %.0fs; sampler produced %llu, rejected %llu (coarse probe %llu, after the CT read %llu, empty targets %llu; holdout overlaps %llu)\n",
             now() - t0, (unsigned long long)prod, (unsigned long long)rej, (unsigned long long)why[0], (unsigned long long)why[1], (unsigned long long)why[2], (unsigned long long)why[3]);
     if (sc.crush.p > 0) fprintf(stderr, "crush augmentation: %llu crushed windows\n", (unsigned long long)sampler_crushed(sp));
-    {   static const char *an[AUGN_N] = {"xscan", "tear", "delam", "sheet-density", "curv", "inclusions"};
+    {   static const char *an[AUGN_N] = {"xscan", "tear", "delam", "sheet-density", "curv", "inclusions", "scanner hist"};
         for (int k = 0; k < AUGN_N; k++) if (sampler_aug_count(sp, k)) fprintf(stderr, "%s augmentation: %llu windows\n", an[k], (unsigned long long)sampler_aug_count(sp, k)); }
     if (g_mem) { long h = 0, mi = 0; for (int k = 0; k < 8; k++) { h += g_mb[k].hits; mi += g_mb[k].misses; }
                  fprintf(stderr, "window memory: %ld chain windows with their predecessor's memory, %ld without (evicted / out of order)\n", h, mi); }

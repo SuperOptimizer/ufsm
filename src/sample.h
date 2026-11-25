@@ -323,7 +323,7 @@ void sampler_stats(const sampler *sp, uint64_t *produced, uint64_t *rejected);
 enum { SL_HOLD, SL_EMPTY, SL_PROBE, SL_FG, SL_MASKED, SL_PROD, SL_OTHER, SL_N };   /* SL_OTHER: no level / no window position (pick_level, patch / box bounds, a shape smaller than the window; level 0's slot when no level) */
 void sampler_level_stats(sampler *sp, int si, int l, uint32_t out[SL_N]);
 uint64_t sampler_crushed(const sampler *sp);   /* --aug-crush windows drawn so far */
-enum { AUGN_XSCAN, AUGN_TEAR, AUGN_DELAM, AUGN_DENSITY, AUGN_CURV, AUGN_INCL, AUGN_N };
+enum { AUGN_XSCAN, AUGN_TEAR, AUGN_DELAM, AUGN_DENSITY, AUGN_CURV, AUGN_INCL, AUGN_HIST, AUGN_N };   /* AUGN_HIST: the scanner op hist (--aug-hist) planned */
 uint64_t sampler_aug_count(const sampler *sp, int which);   /* windows that received a scroll augmentation (AUGN_*) so far */
 /* draws dropped by reason: [0] the coarse CT probe (min_fg, before the CT read), [1] the CT read's min_fg, [2] empty targets
    (empty_keep), [3] overlapping a holdout box (training; not counted in rejected) */
