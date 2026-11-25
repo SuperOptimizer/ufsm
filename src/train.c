@@ -4914,7 +4914,7 @@ int cmd_train(int argc, char **argv) {
                 d->radb[i] = g_gpu_in ? nn_malloc(aux_dev_bytes(B) ? aux_off(B) + aux_dev_bytes(B) : rad_bytes(B)) : nullptr;
             }
             else { d->xb[i] = nn_malloc((size_t)B * g_xs * p3 * xbytes()); d->tb[i] = nn_malloc(g_pkf && g_pack ? 256 : g_lat && g_tm_unused ? 256 : (size_t)B * g_tc * p3);   /* (the direct pack
-                                                                                                       loss reads the packed codes in mb) */ d->mb[i] = nn_malloc(g_lat && g_tm_unused ? 256 : (size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * g_tc); d->radb[i] = g_gpu_in ? nn_malloc(rad_bytes(B)) : nullptr; }
+                                                                                                       loss reads the packed codes in mb) */ d->mb[i] = nn_malloc(g_lat && g_tm_unused ? 256 : (size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * g_tc); d->radb[i] = g_gpu_in ? nn_malloc(aux_dev_bytes(B) ? aux_off(B) + aux_dev_bytes(B) : rad_bytes(B)) : nullptr; }
             d->hwh[i] = g_heads ? nn_host_alloc((size_t)B * g_tc) : nullptr;
             d->ev_up[i] = nn_event_create(); d->ev_lab[i] = nn_event_create();
         }
