@@ -6,6 +6,32 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## dinovol dense features tell adjacent sheets apart better than try9's phase in the 50-100 um bin (2026-11-24, dinovol)
+
+- `ufsm merge-flag --sheet-pairs LIST --out PREFIX`: matched-distance triplets on merge-flag --eval's GT (rays from the axis, code-run
+  crossings, wrap = (code - 1) / 18 mod 14): anchor a, adjacent-wrap b along the ray (gap), same-wrap s on the ray rotated by the arc
+  = gap at a's radius (within half a gap radially). try9's score = -|phase turns| unwrapped along the straight segment (what the fitter /
+  merge-flag read). <= 1200 triplets per box, a quarter per gap bin. `dinovol-probe pfeats` (features at the points, tiles of the
+  training crop on a lattice) + `triplets` (accuracy P(cos(a, s) > cos(a, b)) and pair AUC by bin). Only point coordinates went to the pod.
+- t9-* boxes of /vesuvius/ufsm/mergeflag/evlist.tsv (try9-family pab-base fields; 1667 25, paris4 4, paris4j 28), native level 2 (9.6 um).
+  Triplet accuracy (pair AUCs in the same order):
+
+  | scroll | feature | all | 0-50 | 50-100 | 100-200 | 200+ um |
+  |---|---|---|---|---|---|---|
+  | 1667 (27.2k) | 8um dense-64 | 0.979 | 0.926 | 0.988 | 0.994 | 0.989 |
+  | | g256 dense-64 | 0.979 | 0.921 | 0.989 | 0.994 | 0.989 |
+  | | 8um tokens | 0.971 | 0.873 | 0.990 | 0.995 | 0.991 |
+  | | try9 turns | 0.940 | 0.849 | 0.930 | 0.966 | 0.981 |
+  | paris4j (27.3k) | 8um dense-64 | 0.943 | 0.672 | 0.965 | 0.990 | 0.982 |
+  | | g256 dense-64 | 0.946 | 0.707 | 0.959 | 0.989 | 0.984 |
+  | | try9 turns | 0.840 | 0.626 | 0.811 | 0.887 | 0.900 |
+  | paris4 (3.1k) | 8um dense-64 | 0.846 | 0.983 | 0.977 | 0.826 | 0.790 |
+  | | g256 dense-64 | 0.864 | 0.983 | 0.977 | 0.847 | 0.814 |
+  | | try9 turns | 0.775 | 0.933 | 0.869 | 0.755 | 0.725 |
+
+  The dinovol CT data included 1667 and Paris 4 (self-supervised; no ink / wrap labels of these boxes). Ink-32 ~= tokens < dense.
+  Next: cos(dense) across each GT interval as a merge-flag feature (its --eval AUC), then the fitter / crushed MANB.
+
 ## Upstream dinovol on coarse ink: newest checkpoint g256 ported, frozen-feature linear probe 0.76 dev vs reader3 0.87 (2026-11-24, dinovol)
 
 - Newest scrollprize dinovol (HF listing + collections, 11-24): `g256_compassrope_qknorm_step_781000` (10-29) = the 8um_ps192 run continued
