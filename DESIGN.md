@@ -6,6 +6,51 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## GPU profile of training / inference; the surface head's 1x1 rows without the identity matmuls (2026-11-25, branch isfhead-20261125, mcuda)
+
+**Profile** (nsys, desk card 1, master cdcbaa75; S2E ink trainer at P 384, steps 30-32 via UFSM_CUPROF; scripts /vesuvius/ufsm/mcuda/prof):
+
+| S2E P 384, ms per step | kernel time | share |
+|---|---|---|
+| conv fwd 3^3 (conv_fwd_f4r_k ring 23 %: L0 32 -> 32 at ~128 TFLOP/s, ~34 % of the ~380 fp4 MMA peak; f4v, s2, f8s) | 281 | 30 % |
+| conv weight gradients (conv_bwd_w_f4ws_k 17 %, f8) | 209 | 22 % |
+| gpudec CT decode (k_entropy: one 32-thread block + 40 KB tables a chunk, 2 warps an SM) | 132 | 14 % |
+| 1x1 head + the surface head's feature rows | 131 | 14 % |
+| GN / SiLU backward | 96 | 10 % |
+| surface head, aug, optimizer, backward-data, copies | ~105 | 11 % |
+
+GPU busy (union of kernel intervals) 898 ms of a 2336 ms span on the desk at 6 sampler workers: the desk run waits on its sampler;
+the pod's S2E (P 256, 24 workers) logs 5-23 % wait, so there the GPU sets the pace. The decode runs mostly in the gaps (it adds 89 ms
+to the union). Predict, fields (try9cool, Paris3 2.4 um level 2, 640 / 64): 317 ms GPU a window, 71 % conv_fwd_f4v_k (already ~70 %
+of the MMA peak, 11-17), 8 % conv_fwd_s2_f8_k, 5 % fstem; 69 % GPU busy. predict --surf (S2E-avg22-30): 74 % conv fwd, 12 % the
+identity-head feature pass.
+
+**The surface head's rows.** train --ink-surf reads the trunk features (silu(gn(dec0)), 32 fp16 planes) per head slab and feeds
+their gradient back with the head's. Both went through 1x1 matmuls with identity weights:
+- forward: unet_head_feat_z ran the head kernel (conv1_mx_tc_k, MMAs) on identity weights. lp_feat_mx_h16_r stages the same
+  fp16 activations and writes them directly. The identity head's output is exactly the staged half, except fp32 0 + -0 = +0, which
+  the kernel reproduces (h + 0.f). test_head_tc: 0 bytes differ (32 / 64 / 160 channels; no / sample / slab GN, whole / range;
+  the no-GN cases hold ~2.4 % -0 inputs). P 384 slab 2.81 -> 1.04 ms. A real predict --surf map with UFSM_FEAT_ID=0 / 1:
+  byte-identical.
+- backward: unet_head_bwd_z concatenated the logit rows and the 32 feature rows (padded to 40) and ran the general path. That
+  meant row copies, the weight gradient of all 40 rows (the identity rows' discarded), and the backward-data with K 64 on the
+  tensor cores. It now runs conv1_bwd_fused_k<.., FG> on the head's rows: gx = w^T gy + gf x (1 / s) in fp32 before the MX
+  rounding. It draws the same SR seeds (two per pass for MX-fp4 gx), so every other layer's draws are unchanged. Not
+  bit-identical (FMA vs MMA summation of gx). test_inksurf slab injection, the same draws both ways:
+
+| gradients | fused vs combined rows, parameter-gradient cosine | cosine to the whole-window reference: combined / fused |
+|---|---|---|
+| MX-fp8 | 1.00000 (norm ratio 1.0000) | 0.95623 / 0.95623 |
+| MX-fp4 (SR) | 0.951 (SR noise from the first differing element) | 0.890 / 0.896 |
+
+With a logit gradient the whole-window reference's own head backward differs from either slab path (0.956 / 0.890). With a zero
+logit gradient all paths agree at cosine 1.00000.
+
+| S2E P 384, isfhead binary, ms per step (nsys, steps 30-32) | UFSM_FEAT_ID=0 UFSM_HEAD_FG=0 (master's paths) | on |
+|---|---|---|
+| head + feature kernels | 125 | 39 |
+| GPU busy without the CT decode | 811 | 757 (-6.7 %) |
+
 ## Pod CT prefetch by whole shards, a standard launch step (2026-11-25, podink)
 
 Pod trainers read CT from the dl.ash2txt volcomp mirror through `UFSM_HTTP_CACHE`. Their data wait is cold-chunk HTTPS latency

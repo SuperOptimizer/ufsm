@@ -443,6 +443,8 @@ int nn_head_bwd_x(const float *x, const nn_gn_t *gx_gn, shape5 xs, const float *
 /* the head on voxels [vb, vb + nv) of x (trainer head slabs): fp16 logits / logit gradient as planes of nv voxels; bwd: first = the first
    slab of a backward (draws the SR seed the others reuse). -1: not covered (MX x / gx, 16-bit gradients) */
 int nn_head_fwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, const float *w, const float *b, int cout, void *y16, size_t vb, size_t nv);
+int nn_head_feat_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, void *y16, size_t vb, size_t nv);   /* the head input features as fp16 planes [xs.c][nv] (identity-head bits); 1: not covered */
+int nn_head_bwd_z_fg(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx, const void *gf16, size_t vb, size_t nv, int first);   /* nn_head_bwd_z + the fp16 feature gradient into gx (train --ink-surf); 1: not covered */
 int nn_head_fwd_z32(const float *x, const nn_gn_t *gx, shape5 xs, const float *w, const float *b, int cout, float *y, size_t vb, size_t nv, size_t ly);   /* fp32 inference head, voxels [vb, vb + nv), y plane stride ly (0: nv) */
 int nn_head_bwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx, size_t vb, size_t nv, int first);   /* fused 1^3 head backward (MX x / gx, fp16 gy); -1 = not covered */
 int nn_conv3d_bwd_weight_x(const float *x, const nn_gn_t *gx, const float *x2, const nn_gn_t *gx2, int c_split, int up, shape5 xs,

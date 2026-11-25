@@ -52,6 +52,35 @@ int main(void) {
         if (ns) lp_gn_slab_reg(mean, 0, 0, 0, 0);
         nn_free(x); nn_free(w); nn_free(b); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd);
     }
+    for (int ci = 0; ci < 3; ci++) for (int gm = 0; gm < 3; gm++) {   /* train --ink-surf's feature planes (lp_feat_mx_h16_r, 2026-11-25): byte-equal to the
+                                                                          identity head on the tensor cores (32 / 64 / 160 channels; no GN (-0 inputs), sample GN, slab GN) */
+        const int Cf = ci == 0 ? 32 : ci == 1 ? 64 : 160, D = 12, H = 40, W = 40, Gf = Cf / 4 < 32 ? Cf / 4 : 32;
+        shape5 xs = {1, Cf, D, H, W}; const size_t hw = (size_t)H * W, S = D * hw;
+        void *x = mx4_of(xs, gm == 0 ? 0.02f : 3.f);
+        float *idw = calloc((size_t)Cf * (Cf + 1), 4); for (int c = 0; c < Cf; c++) idw[(size_t)c * Cf + c] = 1.f;
+        float *w = nn_malloc((size_t)Cf * (Cf + 1) * 4); nn_h2d(w, idw, (size_t)Cf * (Cf + 1) * 4); free(idw);
+        float *gam = dev_vals(Cf, 0.5f, 1.f), *bet = dev_vals(Cf, 0.4f, 0.f);
+        const int ns = gm == 2 ? 3 : 0, zs = 4;
+        float *mean = dev_vals((size_t)(ns ? ns : 1) * Gf, 0.4f, 0.f), *rstd = dev_vals((size_t)(ns ? ns : 1) * Gf, 0.4f, 0.9f);
+        if (ns) lp_gn_slab_reg(mean, zs, 0, ns, (int)hw);
+        gnp_t gp = gnp_mk(gam, bet, mean, rstd, Gf); if (gm == 0) memset(&gp, 0, sizeof gp);
+        for (int rg = 0; rg < 2; rg++) {
+            const size_t vb = rg ? 3 * hw : 0, nv = rg ? 5 * hw + 77 : 0, Sy = nv ? nv : S, nb = (size_t)Cf * Sy * 2;
+            void *y0 = nn_malloc(nb), *y1 = nn_malloc(nb); nn_zero(y0, nb); nn_zero(y1, nb);
+            lp_set_head_tc(1); lp_conv1_fwd_mx_h16_r(x, 4, xs, w, w + (size_t)Cf * Cf, Cf, y0, gp, vb, nv);
+            const bool cov = lp_feat_mx_h16_r(x, 4, xs, y1, gp, vb, nv); nn_sync();
+            uint8_t *a = malloc(nb), *c = malloc(nb); nn_d2h(a, y0, nb); nn_d2h(c, y1, nb);
+            size_t nd = 0, nz = 0; for (size_t i = 0; i < nb; i++) nd += a[i] != c[i];
+            for (size_t i = 0; i + 1 < nb; i += 2) nz += a[i] == 0 && a[i + 1] == 0;
+            const int ok = cov && nd == 0;
+            printf("  feature planes %3d ch, %-6s GN, %-5s: %zu of %zu bytes differ from the identity head (%zu zero halves)  %s\n", Cf, gm == 0 ? "no" : gm == 1 ? "sample" : "slab",
+                   rg ? "range" : "whole", nd, nb, nz, ok ? "ok" : "FAIL"); fails += !ok;
+            free(a); free(c); nn_free(y0); nn_free(y1);
+        }
+        if (ns) lp_gn_slab_reg(mean, 0, 0, 0, 0);
+        lp_set_head_tc(-1);
+        nn_free(x); nn_free(w); nn_free(gam); nn_free(bet); nn_free(mean); nn_free(rstd);
+    }
     for (int oc = 0; oc < 8; oc++) {   /* the backward-data: K fp16 logit gradients -> C MX-fp4 channels (SR), a slab range or whole, against the FFMA kernel
                                           (oc 3..5: test_lat_head's 32 / 96 channel trunks, 144 outputs, two samples; oc 6: weights ~3e-7, below fp16's
                                           normal range: the row scales of c1b_wh_k, 2026-11-14; oc 7: the 256-channel trunk's 144-output head, one
@@ -88,6 +117,22 @@ int main(void) {
             printf("  timing: 4 x 256^2 cells, 256 -> 160, %-14s %7.3f ms (%.1f TFLOP/s)\n", tc ? "tensor cores" : "FFMA passes", best * 1e3, 2.0 * nv * C * 160 / best / 1e12);
         }
         lp_set_head_tc(-1);
+        {   /* the feature planes of a P 384 head slab (32 planes of 384^2, 32 channels, sample GN): the identity head vs lp_feat_mx_h16_r */
+            shape5 fs = {1, 32, 64, 384, 384}; const size_t fhw = 384 * 384, fnv = 32 * fhw;
+            void *fx = mx4_of(fs, 3.f); float *idw = calloc(32 * 33, 4); for (int c = 0; c < 32; c++) idw[c * 32 + c] = 1.f;
+            float *fw = nn_malloc(32 * 33 * 4); nn_h2d(fw, idw, 32 * 33 * 4); free(idw);
+            float *fg = dev_vals(32, 0.5f, 1.f), *fb = dev_vals(32, 0.4f, 0.f), *fm = dev_vals(8, 0.4f, 0.f), *fr = dev_vals(8, 0.4f, 0.9f);
+            const gnp_t fgp = gnp_mk(fg, fb, fm, fr, 8);
+            void *fy = nn_malloc((size_t)32 * fnv * 2);
+            for (int k = 0; k < 2; k++) {
+                double best = 1e9;
+                for (int r = 0; r < 5; r++) { nn_sync(); const double t = now();
+                    if (k) lp_feat_mx_h16_r(fx, 4, fs, fy, fgp, 16 * fhw, fnv); else lp_conv1_fwd_mx_h16_r(fx, 4, fs, fw, fw + 32 * 32, 32, fy, fgp, 16 * fhw, fnv);
+                    nn_sync(); if (now() - t < best) best = now() - t; }
+                printf("  timing: feature planes 32 x 384^2 x 32 ch, %-16s %7.3f ms (%.0f GB/s)\n", k ? "lp_feat_mx_h16_r" : "identity head", best * 1e3, (double)fnv * (17 + 64) / best / 1e9);
+            }
+            nn_free(fx); nn_free(fw); nn_free(fg); nn_free(fb); nn_free(fm); nn_free(fr); nn_free(fy);
+        }
         {   /* the head's backward-data at the same slab: 160 fp16 logit gradients -> 256 MX-fp4 channels (SR) */
             void *gy = nn_malloc((size_t)160 * nv * 2); { float *f = dev_vals((size_t)160 * nv, 1e-3f, 0.f); nn_f32_to_h16(f, (size_t)160 * nv, gy, 1.f); nn_free(f); }
             float *wt = dev_vals((size_t)160 * C, 0.1f, 0.f);

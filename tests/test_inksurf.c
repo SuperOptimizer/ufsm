@@ -11,6 +11,7 @@
 #include "inksurf.h"
 #include "nn.h"
 #include "unet.h"
+#include "nn_lp.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -329,22 +330,28 @@ static void slab_cb(void *p) {
     for (int z0 = 0; z0 < c->D; z0 += c->Z) { const int z1 = z0 + c->Z < c->D ? z0 + c->Z : c->D; const size_t ns = (size_t)(z1 - z0) * c->hw;
         for (int k = 0; k < c->C; k++) nn_d2d((char *)c->rows + (size_t)k * ns * 2, (const char *)c->g + ((size_t)k * c->D * c->hw + (size_t)z0 * c->hw) * 2, ns * 2);
         unet_set_head_feat_grad_z(c->u, c->rows);
-        if (unet_head_bwd_z(c->u, z0, z1, c->zero, z0 == 0)) { fprintf(stderr, "FAIL: the combined head backward is not covered\n"); fails++; }
+        if (unet_head_bwd_z(c->u, z0, z1, (const char *)c->zero + (size_t)z0 * c->hw * 2, z0 == 0)) {   /* (cout 1: the logit gradient's slab rows) */ fprintf(stderr, "FAIL: the combined head backward is not covered\n"); fails++; }
         unet_set_head_feat_grad_z(c->u, nullptr); }
 }
 static void test_slab_inject(void) {
     nn_set_tf32(1); nn_set_act_bf16(1); nn_set_grad_bf16(1); nn_set_f16(1); nn_set_grad_scale(1024); nn_set_sr(1); nn_set_gn_stored(1);
     nn_set_prec(3); CHECK(!nn_set_prec_policy("all=fp4:fp4:fp4"), "prec policy"); setenv("UFSM_F4_WGRAD", "1", 1);
-    unet_set_act_mx4(1); unet_set_grad_mx8(1); unet_set_grad_mx4(0);
-    for (int w0i = 0; w0i < 2; w0i++) {   /* widths[0] 16 (the fixture's) and 32 (sH's: 1 + 32 rows padded to 40) */
-        const int C0 = w0i ? 32 : 16, T = 32, Z = 8; unet_cfg cfg = {3, {C0, 32, 64}, 1, 1, 8, 1, 0};
+    /* cases: widths[0] 16 (the fixture's: the combined rows) and 32 (sH's: 1 + 32 rows padded to 40, or the fused head rows + feature gradient,
+       lp_set_head_fg, 2026-11-25); MX-fp8 / MX-fp4 gradients (the trainer's --fp4 2); zero or random logit gradient (lg: both terms of gx) */
+    static const int cs_[][4] = {{16, 8, 0, 0}, {32, 8, 0, 0}, {32, 8, 1, 0}, {32, 8, 0, 1}, {32, 8, 1, 1}, {32, 4, 0, 1}, {32, 4, 1, 1}};
+    double cosv[7] = {0}; float *gprev = nullptr; size_t npv = 0; uint64_t rs_pair = 0;
+    for (int ci_ = 0; ci_ < 7; ci_++) {
+        if (cs_[ci_][3] && !cs_[ci_][2]) rs_pair = rs; else if (cs_[ci_][3]) rs = rs_pair;   /* (a fused case draws its combined-rows partner's data) */
+        const int C0 = cs_[ci_][0], gq = cs_[ci_][1], fgm = cs_[ci_][2], lg = cs_[ci_][3], T = 32, Z = 8; unet_cfg cfg = {3, {C0, 32, 64}, 1, 1, 8, 1, 0};
+        unet_set_act_mx4(1); unet_set_grad_mx8(1); unet_set_grad_mx4(gq == 4); lp_set_head_fg(fgm);
         const size_t V = (size_t)T * T * T; const shape5 xs = {1, 1, T, T, T};
         float *x = malloc(V * 4); for (size_t i = 0; i < V; i++) x[i] = frand(); float *dx = dup_h2d(x, V);
         uint16_t *g = malloc(V * C0 * 2); for (size_t i = 0; i < V * C0; i++) g[i] = f2h(1024.f * 1e-3f * frand());
         void *dg = nn_malloc(V * C0 * 2); nn_h2d(dg, g, V * C0 * 2); void *zl = nn_malloc(V * 2); nn_zero(zl, V * 2);
+        if (lg) { uint16_t *l = malloc(V * 2); for (size_t i = 0; i < V; i++) l[i] = f2h(1024.f * 1e-3f * frand()); nn_h2d(zl, l, V * 2); free(l); }
         unet *a = unet_create(&cfg); unet_init(a, 9); unet_set_fp16_logits(a, 1);
         unet *b = unet_create(&cfg); unet_init(b, 9); unet_set_fp16_logits(b, 1); unet_set_head_ext(b, 1);
-        void *zero = nn_malloc(V * 2); nn_zero(zero, V * 2); void *rows = nn_malloc((size_t)Z * T * T * C0 * 2);
+        void *zero = nn_malloc(V * 2); nn_d2d(zero, zl, V * 2); void *rows = nn_malloc((size_t)Z * T * T * C0 * 2);
         slab_ctx sc = {b, dg, zero, rows, T, Z, C0, (size_t)T * T}; unet_set_head_cb(b, slab_cb, &sc);
         const size_t np = unet_nparams(a); float *ga = malloc(np * 4), *gb = malloc(np * 4);
         nn_set_sr_step(500); unet_zero_grad(a); unet_forward(a, dx, xs, 1);
@@ -361,11 +368,27 @@ static void test_slab_inject(void) {
         double fd = 0; for (size_t i = 0; i < V * C0; i++) fd = fmax(fd, fabs(h2f(ha[i]) - h2f(hb[i])));
         double ab = 0, aa = 0, bb = 0; for (size_t i = 0; i < np; i++) { ab += (double)ga[i] * gb[i]; aa += (double)ga[i] * ga[i]; bb += (double)gb[i] * gb[i]; }
         const double cs = ab / sqrt(aa * bb + 1e-300), rn = sqrt(bb / (aa + 1e-300));
-        fprintf(stderr, "slab injection (widths[0] %d): features max |slab - whole| %.2e; trunk gradients cosine %.5f, norm ratio %.4f\n", C0, fd, cs, rn);
-        CHECK(fd < 1e-3, "slab features differ (%.2e)", fd); CHECK(cs > 0.995 && fabs(rn - 1) < 0.02 && aa > 0, "slab injection: cosine %.5f norm ratio %.4f", cs, rn);
+        fprintf(stderr, "slab injection (widths[0] %d, MX-fp%d gradients, %s, %s logit gradient): features max |slab - whole| %.2e; trunk gradients cosine %.5f, norm ratio %.4f\n",
+                C0, gq, fgm ? "fused head + feature gradient" : "combined rows", lg ? "random" : "zero", fd, cs, rn);
+        cosv[ci_] = cs;
+        CHECK(fd < 1e-3, "slab features differ (%.2e)", fd);
+        if (!lg) CHECK(cs > 0.995 && fabs(rn - 1) < 0.02 && aa > 0, "slab injection: cosine %.5f norm ratio %.4f", cs, rn);
+        else CHECK(cs > 0.85 && fabs(rn - 1) < 0.03 && aa > 0, "slab injection: cosine %.5f norm ratio %.4f", cs, rn);   /* (with a logit gradient the whole-window path's own
+                                                                          head backward differs: 0.956 MX-fp8 / 0.891 MX-fp4 on the combined rows, 11-25) */
+        if (lg && fgm && gprev && npv == np) {   /* the fused head rows against the combined rows on the same draws: the same gradient up to the rounding of gx */
+            double d1 = 0, a1 = 0, b1 = 0; for (size_t i = 0; i < np; i++) { d1 += (double)gprev[i] * gb[i]; a1 += (double)gprev[i] * gprev[i]; b1 += (double)gb[i] * gb[i]; }
+            const double c1 = d1 / sqrt(a1 * b1 + 1e-300), r1 = sqrt(b1 / (a1 + 1e-300));
+            fprintf(stderr, "  fused vs combined rows (MX-fp%d gradients): parameter gradients cosine %.5f, norm ratio %.4f\n", gq, c1, r1);
+            CHECK(c1 > (gq == 4 ? 0.9 : 0.999) && fabs(r1 - 1) < 0.02, "fused vs combined rows MX-fp%d: cosine %.5f norm ratio %.4f", gq, c1, r1);   /* (fp4: SR noise from the first
+                                                                          differing gx element on, 0.951 11-25; fp8: 1.00000) */
+        }
+        free(gprev); gprev = nullptr; if (lg && !fgm) { gprev = malloc(np * 4); memcpy(gprev, gb, np * 4); npv = np; }
         free(x); free(g); free(ga); free(gb); free(hid); free(ha); free(hb); nn_free(dx); nn_free(dg); nn_free(zl); nn_free(zero); nn_free(rows); nn_free(did); nn_free(fa); nn_free(fb);
         unet_free(a); unet_free(b);
     }
+    free(gprev); lp_set_head_fg(-1); unet_set_grad_mx8(1); unet_set_grad_mx4(0);
+    CHECK(cosv[4] > cosv[3] - 1e-3, "slab injection MX-fp8: fused cosine to the whole window %.5f vs the combined rows' %.5f", cosv[4], cosv[3]);
+    CHECK(cosv[6] > cosv[5] - 0.01, "slab injection MX-fp4: fused cosine to the whole window %.5f vs the combined rows' %.5f", cosv[6], cosv[5]);
 }
 
 /* (6) isf_rays_crop (inkperf 2026-11-21: the sampler cuts a surf_only window's rays to the patch's): isf_win_build on the cut list ==
