@@ -6,6 +6,33 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fibre ties in count-field: AFV ties help P4 (+0.04), our own 1667 tracer ties hurt (-0.03); PAUSED (2026-11-19..25, mergeflag)
+
+Same-sheet fibre pairs as count-field rows (`--fibers F.fib --cf-fib W`, 7337a415; `--cf-fib-every 128 --cf-fib-spans 64,256`, since
+a scroll's AFV gives ~10^8 pairs at the default every 4), on the merge-flag-weighted ref (`--mf-w 1`), desk CPU, GT ids (gtboxes.sh).
+
+| run | ties | pairs | ties crossing mf >= 179 | ids right | \|err\| < 0.08 |
+|---|---|---|---|---|---|
+| P4 arm-B ref (u1-13790 fields, dir +1), PH1-3 + HOLD / J1-34 | none | - | - | 0.241 / 0.211 | 0.063 / 0.047 |
+| | Paris4_1mm_v2 AFV, W 1 | 4.3 M | 0.376 (endpoint 0.280) | 0.250 / 0.215 | 0.066 / 0.047 |
+| | AFV, W 4 | 4.3 M | | **0.281 / 0.241** | 0.073 / 0.053 |
+| 1667 q2 ref fields (u1-donor-13790 + rectosp, dir -1, mf 14.0 % flagged), C2 / C6 / C12 / C15 | none | - | - | 0.8029 | 0.244 |
+| | latcodec fibhv-d arm A (tracer only, no W gate), W 4 | 23.6 k | 0.129 | 0.7703 | 0.235 |
+| | arm A, W 16 | 23.6 k | | 0.7565 | 0.230 |
+
+- P4: the AFV ties raise ids by +0.04 (PH) / +0.03 (J) at W 4; W 16 was OOM-killed (34G scope), its retry stopped with the pause.
+  The pod arm-A ref (no mf weighting, GPU, 128 chunk rows) scored PH 0.199 / J 0.185; the desk no-mf control that would split the
+  mf weighting from GPU vs CPU / chunk rows did not finish (stopped).
+- 1667 arm A: our own traces lower ids by 0.03-0.05. Their lines are short (mean 0.62 mm: almost no span-256 pairs) and hop sheets
+  41 / 94 times per m (H / V, HOLD vs GT), so the ties carry wrong-sheet links.
+- Not run: arm B (q2-W gate 0.15, steered: follows the fit's W by construction, a control; 118 k pairs, 0.095 cross mf) and arm C
+  (q2-W 0.45, unsteered; HOLD hop rate 24.9 / 65.7 per m). Both broke on 11-20 when /vesuvius/ufsm/podun moved to the NAS under them;
+  the re-run was stopped on 11-25 (user 11-24: unwrapping work paused).
+- Resume: fields = q2 ref fields (NAS: ~/nas2/vesuvius/ufsm/podun/PHerc1667-q2/fields/{lat,rsp}; rsp's links became 47-byte files
+  there, copy lat + rsp/{fields.json,rsp,sp}), plus the mf plane in /vesuvius/ufsm/wgraph/c7cf/fields/mf; traces
+  /vesuvius/ufsm/fibtrace/p1667/{B,C}/{H,V}.fib; runner /vesuvius/ufsm/wgraph/c7cf/ties2.sh (re-scores the base first: 0.8029).
+  P4: /vesuvius/ufsm/wgraph/p4cf (p4.fib, pool.bin, nomf3.sh / w16.sh). Tool: `ufsm fiber-mfstat` (pairs crossing mf).
+
 ## Winding field fusion: try9 + the latent net wz896 blended (field-blend) does not beat try9 alone (2026-11-25, unroll)
 
 User question: does output fusion of try9 cooled-33333 and the latent winding net wz896-12000 beat either? Arms pre-registered in
