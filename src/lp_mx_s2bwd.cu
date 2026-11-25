@@ -46,9 +46,10 @@ __global__ void __launch_bounds__(128) bwd_data_s2_mx2_k(const uint8_t *gy, cons
             float r[32];
             mx_load_row_b<GB>(gy, scy, ((size_t)n * nby + yb) * So + vo, bwy, r);
             const float4 *wt = swq + ((size_t)tl * Co + yb * bwy) * q4;
+            const int kn = min(bwy, Co - yb * bwy);   /* one monotone bound (microc 11-25: lets mcc's jump threading end the k chain at its first miss) */
 #pragma unroll
             for (int k = 0; k < 32; k++) {
-                if (k < bwy && yb * bwy + k < Co) {
+                if (k < kn) {
                     const float g = r[k];
                     const float4 *wr = wt + (size_t)k * q4;
 #pragma unroll
