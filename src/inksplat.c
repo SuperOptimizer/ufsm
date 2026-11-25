@@ -3418,6 +3418,37 @@ int cmd_ink_devcrops(int argc, char **argv) {
               fprintf(stderr, "ink-devcrops: cannot map the boxes through %s\n", mp); return 1; }
           for (int t = 0; t < nb; t++) printf("%lld,%lld,%lld,%lld,%lld,%lld\n", (long long)box[t][0], (long long)box[t][1], (long long)box[t][2], (long long)box[t][3], (long long)box[t][4], (long long)box[t][5]);
           return 0; } }
+    {   /* --ctx-of CROPDIR --pad P (11-25, reader3 TTA with context): that crop's window grown by P canvas px on each side, sampled exactly as
+           the crop (the same segment, step 4, coordinates, voxel size), as a tifxyz at --out; the crop is its canvas window (P, P, win, win) */
+        const char *co = sopt(argc, argv, "--ctx-of", nullptr);
+        if (co) {
+            const int P = opt_atoi("--pad", sopt(argc, argv, "--pad", "512"));
+            if (argc < 3 || argv[2][0] == '-' || !out || P < 0 || P % 4) { fprintf(stderr, "ink-devcrops SEGS.json --ctx-of CROPDIR --pad P (multiple of 4) --out DIR\n"); return 2; }
+            char cp[1400]; snprintf(cp, sizeof cp, "%s/crop.json", co);
+            FILE *cf = fopen(cp, "rb"); if (!cf) { fprintf(stderr, "ink-devcrops: cannot read %s\n", cp); return 1; }
+            fseek(cf, 0, SEEK_END); const long cz = ftell(cf); fseek(cf, 0, SEEK_SET); char *ctx = malloc((size_t)cz + 1); const size_t cr_ = fread(ctx, 1, (size_t)cz, cf); fclose(cf); ctx[cr_] = 0;
+            json *cj = json_parse(ctx, cr_); free(ctx);
+            const char *sn = cj ? json_str(json_get(cj, "segment"), nullptr) : nullptr; const double cum = cj ? json_num(json_get(cj, "um"), 0) : 0;
+            const int64_t u0 = cj ? (int64_t)json_num(json_get(cj, "canvas_u0"), -1) : -1, v0 = cj ? (int64_t)json_num(json_get(cj, "canvas_v0"), -1) : -1;
+            const int win = cj ? (int)json_num(json_get(cj, "win"), 0) : 0;
+            if (!sn || u0 < 0 || v0 < 0 || win < 4 || !(cum > 0)) { fprintf(stderr, "ink-devcrops: %s: no segment / canvas_u0 / canvas_v0 / win / um\n", cp); json_free(cj); return 1; }
+            FILE *fp = fopen(argv[2], "rb"); if (!fp) { fprintf(stderr, "ink-devcrops: cannot open %s\n", argv[2]); json_free(cj); return 1; }
+            fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *txt = malloc((size_t)sz + 1); const size_t rd = fread(txt, 1, (size_t)sz, fp); fclose(fp); txt[rd] = 0;
+            json *j = json_parse(txt, rd); free(txt); const json *sg = j ? json_get(j, "segments") : nullptr; const char *tx = nullptr;
+            for (size_t si = 0; sg && si < sg->n && !tx; si++) if (!strcmp(json_str(json_get(json_at(sg, si), "name"), ""), sn)) tx = json_str(json_get(json_at(sg, si), "tifxyz"), nullptr);
+            ssurf S; if (!tx || ssurf_load(&S, tx)) { fprintf(stderr, "ink-devcrops: segment %s not in %s / not loadable\n", sn, argv[2]); json_free(j); json_free(cj); return 1; }
+            const int G2 = (win + 2 * P) / 4 + 1; float *x = malloc(sizeof(float) * G2 * G2), *y = malloc(sizeof(float) * G2 * G2), *z = malloc(sizeof(float) * G2 * G2); int nvv = 0;
+            for (int a = 0; a < G2; a++) for (int b = 0; b < G2; b++) {
+                float p[3]; const size_t k = (size_t)a * G2 + b; const double cu = u0 - P + 4.0 * b, cv = v0 - P + 4.0 * a;
+                if (cu < 0 || cv < 0 || !dc_bil(&S, cu * S.scale, cv * S.scale, p)) { x[k] = y[k] = z[k] = -1; continue; }
+                x[k] = p[0]; y[k] = p[1]; z[k] = p[2]; nvv++;
+            }
+            const int bad = tifxyz_write(out, G2, G2, x, y, z, 4, cum, -1, "ink-devcrops --ctx-of");
+            fprintf(stderr, "ink-devcrops: %s: context %d x %d grid (pad %d px), %d valid vertices -> %s\n", co, G2, G2, P, nvv, out);
+            free(x); free(y); free(z); ssurf_free(&S); json_free(j); json_free(cj);
+            return bad ? 1 : 0;
+        }
+    }
     if (argc < 3 || argv[2][0] == '-' || !out || !key || !nb || !(um > 0) || WIN < 32 || WIN % 4) {
         fprintf(stderr, "usage: ufsm ink-devcrops SEGS.json --box z,y,x,nz,ny,nx [--box ..] --ct-key KEY --um U --out DIR [--win 256 (multiple of 4)] [--min-sup 0.2]\n"
                         "         [--min-ink 200] [--scroll S] [--tag T] [--exclude z,y,x,nz,ny,nx ..]   scoring crops (clean crops' layout) of\n"
