@@ -210,6 +210,7 @@ test_dinor~full                                | gpu,slow     |   104 | ./$B/tes
 test_dino_pts                                  |              |     1 | ./$B/test_dino_pts
 test_ink_splat                                 | gpu          |    10 | ./$B/test_ink_splat
 test_ink_splat~over                            | gpu          |    10 | UFSM_INKFLY_GPU_MB=1 TIS_OVER=1 ./$B/test_ink_splat
+test_ink_splat~ckey                            | gpu          |    10 | UFSM_DCACHE_KEY=content ./$B/test_ink_splat
 test_ink_pool                                  |              |     3 | ./$B/test_ink_pool $TMPDIR/ink_pool
 test_ink_audit                                 |              |     3 | ./$B/test_ink_audit
 test_ink_mil                                   | gpu          |     2 | ./$B/test_ink_mil
