@@ -33,6 +33,38 @@ a scroll's AFV gives ~10^8 pairs at the default every 4), on the merge-flag-weig
   /vesuvius/ufsm/fibtrace/p1667/{B,C}/{H,V}.fib; runner /vesuvius/ufsm/wgraph/c7cf/ties2.sh (re-scores the base first: 0.8029).
   P4: /vesuvius/ufsm/wgraph/p4cf (p4.fib, pool.bin, nomf3.sh / w16.sh). Tool: `ufsm fiber-mfstat` (pairs crossing mf).
 
+## predict --seamless 2: spinning event waits and the blend's voxel masks (2026-11-25, branch seamblend-20261125, perf)
+
+Profiled one cascade-aux predict (inkperf casc/auxpred2.sh: R1-62000, Paris4 1.129 um level 2, window 288 halo 16, q 4, desk card 0,
+6 threads, perf record -g + time -v + dmon) on the 1455 tracker tiles (dilated by one). Base: pass a 70 s, pass b 47 s, blend 68 s
+(serial, after both passes), GPU SM 76 % mean over the run.
+- **Spinning host waits.** 50 % of the pass children's CPU was libcuda + vdso clock_gettime under cudaEventSynchronize. The
+  UFSM_CUDA_SYNC=block context flag does not cover events: an event without cudaEventBlockingSync busy-waits. nn_event_create (predict's
+  per-shard D2H events, the trainer's upload events) now adds the flag when UFSM_CUDA_SYNC=block (train / predict / ink-ext default).
+  The spin also took cores from the passes' own encode / decode threads.
+- **Blend masks.** The passes write shards S / 2 = 128 and the blend reads them into 512^3 output shards. Every input with an absent
+  shard got a 128 MB voxel mask (memset 1, then 0 per absent shard), and every voxel was blended: memset 18 % + ib_rows 18 % of the blend.
+  With input shards and origins on a B grid (B = 128 here) each B^3 block lies inside one shard per input. A per-block presence flag now
+  replaces the mask; blocks no input covers are written 0 and the rest are blended in the same order (tests/test_ink_blend_block.c:
+  byte-identical to UFSM_IB_BLOCK=0). Per-block reads were slower (105 s): the whole-shard reads stay.
+- **CT across passes.** Pass b re-decodes the CT pass a read (vfx decode ~5 % of a child's CPU, the reads from the page cache): a minor
+  share, not worth sharing. What remains of the blend is decoding the q-4 pass stores (55 %). The in-process path (UFSM_SEAM_INPROC=1,
+  GPU blend, no pass stores) would remove it, but it takes only --heads latent checkpoints, and R1 is a plain voxel net.
+
+| Paris4 aux, 1455 tiles | wall s | CPU s (user + sys) | pass a / b s | blend s |
+|---|---|---|---|---|
+| master (aab0123d) | 189 | 991 | 70 / 47 | 68 |
+| blocking events + block flags | 128 | 491 | 51 / 31 | 44 |
+
+Output shards byte-identical (diff -r of the blended level). ~7 h of seamless aux on card 0 becomes ~4.7 h.
+
+**--tile-list in pass b was off by the shift (bug, inkperf casc/st-aux288).** Each pass child ran at --grid-origin 0 / S/2, and predict
+laid the --tile-list tiles on that grid. In pass b every tile moved by S/2: at tile = shift (128-voxel tiles, window 288) the tile left
+the box ("none of its 1 tiles meets the box"); at larger tiles pass b computed the wrong half-tiles, and those tiles got pass a alone.
+Both passes now get --tile-list-origin 0,0,0 (a new predict option; default stays the grid origin). Paris4 run above: pass b 1414 of
+1455 tiles (shifted) -> 1455 of 1455, wall 155 s with the fix (pass b now does its full share). tests/test_tile_list.c covers tile =
+shift and tile = 2 shift for both passes' boxes; test_seamless.py checks the pass argument. Seamless tile-list outputs made before the
+fix lack pass b on part of every tile: rerun.
 ## Winding field fusion: try9 + the latent net wz896 blended (field-blend) does not beat try9 alone (2026-11-25, unroll)
 
 User question: does output fusion of try9 cooled-33333 and the latent winding net wz896-12000 beat either? Arms pre-registered in
