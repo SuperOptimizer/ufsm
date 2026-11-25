@@ -201,6 +201,31 @@ set(UFSM_EXTRA_CFLAGS "" CACHE STRING "extra host C flags, appended last (experi
 separate_arguments(_extra UNIX_COMMAND "${UFSM_EXTRA_CFLAGS}")
 list(APPEND UFSM_CFLAGS ${_extra})
 set(UFSM_DEFS _GNU_SOURCE)
+# The installed mcc's revision (its VERSION file, scripts/toolchain/install_mcc.sh) goes into every unit's flags, so a compiler change
+# rebuilds everything: ninja tracks command lines, not the compiler binary, and after the 11-25 pin move (5744025 -> ff7f174) every
+# existing build dir would otherwise have mixed old- and new-mcc objects. cmake re-runs when cmake/mcc.version or the VERSION file
+# changes. The default mcc (~/.local/mcc) must be at the pin; another one given on purpose (-DUFSM_MCC=, MCC_HOME) only warns.
+if(UFSM_TOOLCHAIN STREQUAL "mcc")
+  cmake_path(GET UFSM_MCC PARENT_PATH _mccd)
+  file(STRINGS ${CMAKE_SOURCE_DIR}/cmake/mcc.version _mccpin LIMIT_COUNT 1)
+  string(STRIP "${_mccpin}" _mccpin)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/mcc.version)
+  if(EXISTS ${_mccd}/VERSION)
+    file(STRINGS ${_mccd}/VERSION _mccrev LIMIT_COUNT 1)
+    string(STRIP "${_mccrev}" _mccrev)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_mccd}/VERSION)
+  else()
+    file(TIMESTAMP ${UFSM_MCC} _mccrev "%Y%m%d%H%M%S")   # (a dev build without VERSION: its binary's time)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${UFSM_MCC})
+  endif()
+  if(NOT _mccrev STREQUAL _mccpin)
+    if(_mccd STREQUAL "$ENV{HOME}/.local/mcc")
+      message(FATAL_ERROR "mcc in ${_mccd} is ${_mccrev}, the pin (cmake/mcc.version) is ${_mccpin}: run scripts/toolchain/install_mcc.sh")
+    endif()
+    message(WARNING "mcc ${UFSM_MCC} is ${_mccrev}, not the pin ${_mccpin} (an mcc chosen on purpose)")
+  endif()
+  list(APPEND UFSM_DEFS UFSM_MCC_REV=${_mccrev})
+endif()
 if(UFSM_TOOLCHAIN STREQUAL "mcc")
   # -mglibc: the machine's GNU C library (libcurl, zstd, blosc and the CUDA driver are its shared libraries). mcc takes and ignores
   # -W and most -f. -march=native (user 11-14: every machine builds its own binary): mcc reads cpuid (+ XGETBV) and defines exactly

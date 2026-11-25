@@ -4312,6 +4312,7 @@ static void *pf_worker(void *p) {   /* the marked chunks, from one shared list: 
 /* the free-disk guard (2026-11-25: the R11P prefetch filled the pod disk to 9 GB free, ctprefetch.sh checked MIN_FREE_GB only at start):
    before each shard / chunk the cache disk's free space (statvfs of UFSM_HTTP_CACHE); below --min-free-gb every worker stops, the run
    ends with exit 3. What came stays cached, a rerun resumes. */
+/* mgpu: config (pf_cache_dir / pf_min_free_gb set before the prefetch workers start, read-only after; pf_stop / pf_free_seen atomics) */
 static const char *pf_cache_dir; static double pf_min_free_gb; static atomic_int pf_stop; static atomic_llong pf_free_seen = -1;
 static int pf_disk_low(void) {
     if (atomic_load_explicit(&pf_stop, memory_order_relaxed)) return 1;

@@ -6,6 +6,141 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Fibre ties in count-field: AFV ties help P4 (+0.04), our own 1667 tracer ties hurt (-0.03); PAUSED (2026-11-19..25, mergeflag)
+
+Same-sheet fibre pairs as count-field rows (`--fibers F.fib --cf-fib W`, 7337a415; `--cf-fib-every 128 --cf-fib-spans 64,256`, since
+a scroll's AFV gives ~10^8 pairs at the default every 4), on the merge-flag-weighted ref (`--mf-w 1`), desk CPU, GT ids (gtboxes.sh).
+
+| run | ties | pairs | ties crossing mf >= 179 | ids right | \|err\| < 0.08 |
+|---|---|---|---|---|---|
+| P4 arm-B ref (u1-13790 fields, dir +1), PH1-3 + HOLD / J1-34 | none | - | - | 0.241 / 0.211 | 0.063 / 0.047 |
+| | Paris4_1mm_v2 AFV, W 1 | 4.3 M | 0.376 (endpoint 0.280) | 0.250 / 0.215 | 0.066 / 0.047 |
+| | AFV, W 4 | 4.3 M | | **0.281 / 0.241** | 0.073 / 0.053 |
+| 1667 q2 ref fields (u1-donor-13790 + rectosp, dir -1, mf 14.0 % flagged), C2 / C6 / C12 / C15 | none | - | - | 0.8029 | 0.244 |
+| | latcodec fibhv-d arm A (tracer only, no W gate), W 4 | 23.6 k | 0.129 | 0.7703 | 0.235 |
+| | arm A, W 16 | 23.6 k | | 0.7565 | 0.230 |
+
+- P4: the AFV ties raise ids by +0.04 (PH) / +0.03 (J) at W 4; W 16 was OOM-killed (34G scope), its retry stopped with the pause.
+  The pod arm-A ref (no mf weighting, GPU, 128 chunk rows) scored PH 0.199 / J 0.185; the desk no-mf control that would split the
+  mf weighting from GPU vs CPU / chunk rows did not finish (stopped).
+- 1667 arm A: our own traces lower ids by 0.03-0.05. Their lines are short (mean 0.62 mm: almost no span-256 pairs) and hop sheets
+  41 / 94 times per m (H / V, HOLD vs GT), so the ties carry wrong-sheet links.
+- Not run: arm B (q2-W gate 0.15, steered: follows the fit's W by construction, a control; 118 k pairs, 0.095 cross mf) and arm C
+  (q2-W 0.45, unsteered; HOLD hop rate 24.9 / 65.7 per m). Both broke on 11-20 when /vesuvius/ufsm/podun moved to the NAS under them;
+  the re-run was stopped on 11-25 (user 11-24: unwrapping work paused).
+- Resume: fields = q2 ref fields (NAS: ~/nas2/vesuvius/ufsm/podun/PHerc1667-q2/fields/{lat,rsp}; rsp's links became 47-byte files
+  there, copy lat + rsp/{fields.json,rsp,sp}), plus the mf plane in /vesuvius/ufsm/wgraph/c7cf/fields/mf; traces
+  /vesuvius/ufsm/fibtrace/p1667/{B,C}/{H,V}.fib; runner /vesuvius/ufsm/wgraph/c7cf/ties2.sh (re-scores the base first: 0.8029).
+  P4: /vesuvius/ufsm/wgraph/p4cf (p4.fib, pool.bin, nomf3.sh / w16.sh). Tool: `ufsm fiber-mfstat` (pairs crossing mf).
+
+## predict --seamless 2: spinning event waits and the blend's voxel masks (2026-11-25, branch seamblend-20261125, perf)
+
+Profiled one cascade-aux predict (inkperf casc/auxpred2.sh: R1-62000, Paris4 1.129 um level 2, window 288 halo 16, q 4, desk card 0,
+6 threads, perf record -g + time -v + dmon) on the 1455 tracker tiles (dilated by one). Base: pass a 70 s, pass b 47 s, blend 68 s
+(serial, after both passes), GPU SM 76 % mean over the run.
+- **Spinning host waits.** 50 % of the pass children's CPU was libcuda + vdso clock_gettime under cudaEventSynchronize. The
+  UFSM_CUDA_SYNC=block context flag does not cover events: an event without cudaEventBlockingSync busy-waits. nn_event_create (predict's
+  per-shard D2H events, the trainer's upload events) now adds the flag when UFSM_CUDA_SYNC=block (train / predict / ink-ext default).
+  The spin also took cores from the passes' own encode / decode threads.
+- **Blend masks.** The passes write shards S / 2 = 128 and the blend reads them into 512^3 output shards. Every input with an absent
+  shard got a 128 MB voxel mask (memset 1, then 0 per absent shard), and every voxel was blended: memset 18 % + ib_rows 18 % of the blend.
+  With input shards and origins on a B grid (B = 128 here) each B^3 block lies inside one shard per input. A per-block presence flag now
+  replaces the mask; blocks no input covers are written 0 and the rest are blended in the same order (tests/test_ink_blend_block.c:
+  byte-identical to UFSM_IB_BLOCK=0). Per-block reads were slower (105 s): the whole-shard reads stay.
+- **CT across passes.** Pass b re-decodes the CT pass a read (vfx decode ~5 % of a child's CPU, the reads from the page cache): a minor
+  share, not worth sharing. What remains of the blend is decoding the q-4 pass stores (55 %). The in-process path (UFSM_SEAM_INPROC=1,
+  GPU blend, no pass stores) would remove it, but it takes only --heads latent checkpoints, and R1 is a plain voxel net.
+
+| Paris4 aux, 1455 tiles | wall s | CPU s (user + sys) | pass a / b s | blend s |
+|---|---|---|---|---|
+| master (aab0123d) | 189 | 991 | 70 / 47 | 68 |
+| blocking events + block flags | 128 | 491 | 51 / 31 | 44 |
+
+Output shards byte-identical (diff -r of the blended level). ~7 h of seamless aux on card 0 becomes ~4.7 h.
+
+**--tile-list in pass b was off by the shift (bug, inkperf casc/st-aux288).** Each pass child ran at --grid-origin 0 / S/2, and predict
+laid the --tile-list tiles on that grid. In pass b every tile moved by S/2: at tile = shift (128-voxel tiles, window 288) the tile left
+the box ("none of its 1 tiles meets the box"); at larger tiles pass b computed the wrong half-tiles, and those tiles got pass a alone.
+Both passes now get --tile-list-origin 0,0,0 (a new predict option; default stays the grid origin). Paris4 run above: pass b 1414 of
+1455 tiles (shifted) -> 1455 of 1455, wall 155 s with the fix (pass b now does its full share). tests/test_tile_list.c covers tile =
+shift and tile = 2 shift for both passes' boxes; test_seamless.py checks the pass argument. Seamless tile-list outputs made before the
+fix lack pass b on part of every tile: rerun.
+## Winding field fusion: try9 + the latent net wz896 blended (field-blend) does not beat try9 alone (2026-11-25, unroll)
+
+User question: does output fusion of try9 cooled-33333 and the latent winding net wz896-12000 beat either? Arms pre-registered in
+/vesuvius/ufsm/unrollrun/sh/blendab.sh before any score: blend-mean = `field-blend` of try9 + wz896, equal weights (resultant
+confidence); blend-medoid = `field-blend --conf medoid` of try9 + wz896 + wind96 (a medoid needs 3 inputs; wind96's kept wbench fields).
+Predicts on the pod (c4a70c97, cube windows 640 / 64 for both nets: they are latent-grid; kit /vesuvius/ufsm/unrollrun/blendkit), fits
+and scoring on the desk (wbench clean boxes, SLABS=0, GPU fits), each arm paired against try9:
+
+| arm vs try9 | 1667 (49 boxes) p05x A-B [95 % CI] | 1667 ids A-B | paris4 + paris4j (32) p05x A-B | p4 ids A-B |
+|---|---|---|---|---|
+| wz896 | -0.071 [-0.085, -0.058] | -0.127 [-0.175, -0.083] | -0.024 [-0.040, -0.009] | -0.004 [-0.025, +0.019] |
+| blend-mean | -0.015 [-0.020, -0.009] | -0.026 [-0.052, +0.001] | -0.021 [-0.041, -0.003] | -0.011 [-0.031, +0.009] |
+| blend-medoid (22 boxes only) | -0.024 [-0.039, -0.007] (16) | -0.043 [-0.113, +0.029] | +0.057 [+0.008, +0.135] (paris4, 4) | +0.010 [-0.009, +0.029] |
+
+- try9 alone: 1667 p05x 0.906, ids 0.920; paris4 + paris4j p05x 0.613, ids 0.399.
+- No blend beats try9: blend-mean is worse on both groups (p05x CI entirely < 0), wz896 alone much worse on 1667. The diagnosis that
+  the latent net wins on wide sheets does not hold against try9 (it was against wind96).
+- blend-medoid ran on only 22 of 88 boxes (wind96's kept fields cover those), so it is not a full arm. Its paris4 +0.057 p05x rests
+  on 4 boxes, under the 8-box bootstrap floor; 1667 is worse. Not a lead: a 3-model medoid would need wind96 fields on all boxes.
+- Reproduction: the pod wz896 arm vs the 11-10 lat-wz896-12000 rows on the 39 shared boxes: p05x +0.004 [-0.004, +0.014], ids +0.009,
+  inside the 0.01 floor: the latent arm is not weaker than the original.
+- Rows: /vesuvius/ufsm/wbench/res/bl-{t9,wz,mean,med}.tsv; fields kept for bl-t9 and bl-wz (wbench/fields), the blends deleted.
+
+## mcc pin 5744025 -> ff7f174: device jump threading, threadIdx-strided unroll, global loaded pointers, cudaopt (2026-11-25, microc)
+- The pin moves to ff7f174, microc branch jtdev-20261125 (tag ufsm-pin-20261125; not on microc main, whose 84903be still miscompiles
+  host code). It is main 285d308 plus:
+  - 77947a9: unswitch recomputes the dominator tree (the 84903be l1_solve miscompile).
+  - c3a66e2: cudaopt: device inlining 300/400, constant-table loads, vector ld/st, f16 round-trip folds.
+  - aaa23b2: device LICM, opt-in (MCC_LICMPHI).
+  - 356cb4c: constant automatic arrays become statics.
+  - f33f156: three device changes:
+    - jump threading for device code. k_entropy's bit reader kept each inlined gbr_get's bool as a value with a BSSY region and a
+      test. MCC_NOJTDEV turns it off.
+    - `for (i = threadIdx.x; i < N; i += S)` with constant N and S becomes K guarded copies. A copy that launch_bounds puts in range
+      for every thread has no test, so its loads overlap. MCC_NOTIDU turns it off.
+    - addresses loaded from global memory are global (ld/st.global, as nvcc's cvta.to.global). MCC_NOGLLOAD turns it off.
+  - ff7f174: mcudahw cudaSetDeviceFlags calls cuDevicePrimaryCtxSetFlags_v2. Before, only the flags were stored.
+    - Spin test, card 1, a 10 s kernel with BlockingSync: 10.1 -> 0.01 CPU-s waiting.
+    - nn_flat's BlockingSync now applies.
+    - nn_sync_mode's direct driver call stays and is harmless.
+- sm_120, desk card 1, exclusive, ufsm bb67bcb1:
+
+  | GPU ms | pin 5744025 | ff7f174 branch | ratio |
+  |---|---|---|---|
+  | k_entropy, 64 real PHerc0490B chunks (test_gpudec --real, q 8) | 60.4 | 44.8 | 0.74 |
+  | k_entropy per launch, small ink-net fixture training | 4.29 | 3.19 | 0.75 |
+  | every other kernel (f4p, f8s, f4ws, GN bwd, gy_pre4, conv1, ...) | | | 0.99-1.01 |
+  | fixture training (P 448, 3 steps), all kernels, 2 runs | 6890 / 7055 | 5789 / 5858 | 0.84 / 0.83 |
+
+  - gpudec bytes identical.
+  - Losses within the pin's own run-to-run spread (step 3: 0.3183 / 0.3177 vs 0.3199 / 0.3187).
+- sm_86, RTX 3070 pod, against nvcc 13.0 on the same sources (llvm-release; arch86 = software MX):
+
+  | GPU ms | nvcc | pin | cudaopt | ff7f174 |
+  |---|---|---|---|---|
+  | k_entropy, 64 real chunks | 68.6 | 93.3 | 88.0 | 62.5 |
+  | gemm_ns_k (Muon) | 11.2 | 21.5 | 21.3 | 13.2 |
+  | fixture training, all kernels | 2625 | 4578 | 2821 | 2604 |
+  | ink-ext reader3, 32 tiles | 252.2 | | | 249.9 (bytes = nvcc's) |
+
+  - The pin's 1.74x on Ampere was the software-MX kernels losing inlining (cudaopt fixes it).
+  - What is left there is conv_fwd_f4u 1.3x: emulated MMA at 255 registers with spills. Not pursued: no Ampere production work.
+- Offline sm_120a ptxas, conv_fwd_f4r_k<2,4,1>:
+  - All three compilers sit at the 128-register launch-bounds cap.
+  - mcc spills 180 B vs nvcc 96 B, but emits 44 k SASS instructions vs nvcc's 59 k.
+  - f4ws<2,2>: 96 registers, no spill.
+  - nvcc timing of these on sm_120 is not done yet.
+- Checks:
+  - Host .c objects: .text byte-identical to cudaopt (193 / 193).
+  - arch86 fast tier with the branch toolchain: 378 PASS. The 1 FAIL is test_mgpu_lint (source lint, independent of the compiler).
+  - This merge, desk CPU half (ff7f174, -g none): 166 PASS. The one FAIL was test_mgpu_lint: untagged prefetch statics from 408e3e81, tagged on this branch (comment only); green now. 8 more failed only because the suite output sat on /vesuvius (symlink EIO, noexec); rerun with the output on /, all pass.
+  - This merge, pod-1 sm_120 GPU half: see the merge commit.
+- Tools:
+  - /vesuvius/ufsm/microc/pod3070: bench.sh, cmp.sh, gdbench.sh, sass.sh, suite.sh.
+  - /vesuvius/ufsm/microc/deskab: ab120.sh, sass120.sh, kres.sh, sdf/.
+
 ## CPU side: the pod's CPUs are not the bottleneck; blocking host waits, gpudec priority, content dcache keys, cheaper elastic warp (2026-11-25, perf)
 - Measured first. Pod 1 (13.6 CPUs by cgroup, RTX PRO 6000) over the container's day with DINO2 + S2E: 2.9 CPUs used while active (173 k
   CPU-s, 25 % system), throttled in 5 837 of 595 k periods (1 %). S2E's wait (71 -> 23 % over 30 k steps, 30-86 Mvox/s) followed cache
@@ -1640,6 +1775,128 @@ and the 3^3 conv on fp16 L, not the weights). Header: `"lat_dec":[H,raw,ng,1]`, 
 read unchanged); predict applies it from the header. FFMA path refuses it. Tests: test_latdec runs every check against a reference on
 host-quantised weights (fp4 Hd 16 / 64, ng 2 / 7, raw; errors at the fp16 level: pre 5e-4, B 2e-3, W2 1.6e-3), test_latdec_train
 resumes the fp16 decoder into fp4 (header key, finite losses) and predicts a random-W2 fp4 net (rv differs from the fp16 one).
+
+## try9's ink head: normalisation, alignment, balance and calibration audit; `ufsm ink-audit` (2026-11-18, branch inknorm-20261118; written up 11-25)
+
+The question: is the 3-D ink head of try9 (scratch2, snapshot 15000) held back by a normalisation or calibration problem between scans,
+between the labels and the surfaces, or between training and predict? Short answer: no single normalisation issue explains it. The head is
+weak on every scroll, including Paris 4, which carries 63 % of the ink weight. Held out, it scores about what the raw CT intensity at the
+label band scores. The label side has one real defect, the fixed face iso, which loses half the labels on three scans. Every
+train / predict mismatch found moves AUC by less than 0.03.
+
+**Tool: `ufsm ink-audit SEGS.json --ct ROOT KEY --ct-um U [--pred ROOT KEY --pred-level L] [--holdouts H] [--region box ..] [--blocks]`**
+(src/inksplat.c, beside ink-splat, reusing its mesh / label / face code; test_ink_audit). It walks the onfly ink sources' segment windows
+with the trainer's own geometry: label pixel -> tifxyz point and normal; the open face f (face_of on the level-1 CT, iso 64, [1 2 1]
+smoothing, search -6 .. 20); the label band [f - 6, f]. Each pixel goes into a split. HOLD: its surface point lies in a
+holdouts-20261114 box of that CT (the sampler masks every label there). VAL: the segment's validation raster, which try9 trains on
+because its ink sources say "validation": "off". TRAIN: the rest. Along the normal (t = -56 .. 56 level-0 voxels) it samples the CT and
+the prediction. Per split it reports:
+- supervised px, ink share, face found per class, face offset quantiles;
+- band CT (raw, and z with the trainer's scan-norm), and its AUC as an ink score;
+- the prediction's band max / mean: AUC, quantiles, best-F1 threshold, F1 at 128;
+- AUC at every band shift -28 .. 28 relative to the face and to the mesh;
+- a face-relative depth profile, an iso sweep of the face search with failure reasons, and per-region / per-2048-block tables.
+
+test_ink_audit uses a synthetic segment: test_ink_splat's surface plus a CT slab whose face lies at +6. The "prediction" is a layer at
+face + 10 .. 14, splatted from the surface. The audit must give: face found 1.0, q50 +6, AUC 0.50 at the band, 1.00 at the best shift
+(face +12 / mesh +17: the mesh shift is the face shift + 6), the HOLD split from a box, and the per-split ink shares. The data runs
+(scripts in /vesuvius/ufsm/inknorm: lab1.sh labels only, pipe.sh predict + audit, q1-q5 queues) used stride 4 for the labels-only pass
+and stride 2 with a prediction.
+
+**Predict recipe** (card 1 under the 6 GB cap): level 2 (9.6 um), window 512 / halo 64 / shard 128, ink head only, EMA, one process per
+2048^3 block (4.46 GB peak; `predict --boxes` kept its pools across boxes, 5.66 GB). Window 640 peaks at 6.4 GB with one head (inksdk's
+three heads: 8.8 GB). Blocks per scroll: every block with held-out labels (the densest 40) plus the 12 densest trained blocks. The 4
+sources try9 trains without an axis are predicted with UFSM_PRED_NO_AXIS_OK=1, as trained.
+
+**Per-scroll AUC** (try9-15000 EMA; label px at stride 2; AUC of the band max; [raw band-CT AUC on the same px]):
+
+| scroll | ink weight | HOLD px | HOLD AUC | trained AUC (TRAIN / VAL) | band CT AUC | band z ink / no | p50 ink / no (of 255) |
+|---|---|---|---|---|---|---|---|
+| Paris 4 | 0.104 | 36.9 M | 0.521 | 0.566 / - | 0.54 | 0.40 / 0.36 | 58 / 55 |
+| 1667 | 0.038 | 13.6 M | 0.559 | 0.625 / 0.616 | 0.56 | 1.36 / 1.26 | 59 / 54 |
+| 0139 | 0.013 | 5.2 M | 0.522 | 0.567 / 0.584 | 0.57-0.58 | 0.94 / 0.84 | 58 / 55 |
+| 0500P2 (no axis) | 0.0025 | 3.4 M | 0.470 | - / 0.558 | 0.55-0.58 | 0.48 / 0.41 | 41 / 39 |
+| 0841 (no axis) | 0.0025 | 1.7 M | 0.601 | - / 0.537 | 0.53-0.55 | 0.55 / 0.48 | 35 / 34 |
+| MAN5 (no axis) | 0.0012 | 0.21 M | 0.603 | 0.551 / - | 0.47-0.51 | 0.23 / 0.26 | 36 / 35 |
+| 0814 | 0.0008 | 0.04 M | 0.724 | 0.621 / 0.527 | 0.38-0.58 | 0.58 / 0.48 | 52 / 47 |
+| 0009B (no axis) | 0.0032 | 0 | - | 0.622 / 0.667 | 0.63-0.66 | -0.11 / -0.29 | 38 / 33 |
+
+(ink weight: the source's sampling weight; the ink sources sum to 0.165.) Memorisation is small: TRAIN - HOLD is 0.066 on 1667, 0.045 on
+Paris 4 and 0139. 0009B has no held-out ink: its one 2.4 um holdout slab, z 19456 + 4096, misses the labelled windows. 0814 holds only
+38 k px.
+
+**Cross-scan intensity.** try9 already z-scores its input per scan and level (`--scan-norm 1`: mean / sd of the scan's nonzero voxels).
+Predict computes the same cached values, e.g. 1667 level 2: 62.9 / 37.59 in the sampler and in predict, so the two sides agree. The
+latent channels are a linear KLT of that input on 4^3 cells (nn_input_lat), so their DC channel follows the same band z.
+
+The scan-norm itself spreads the surface band, though. Raw band CT (mean over [f - 6, f], every label px) is 89 (0500P2, 111 keV),
+102 (Paris 4), 106-110 (0841, 0139, 0009B, MAN5) and 114-115 (1667, 0814): within +-0.4 of a typical sd. In z the band is -0.1
+(0009B) to +1.36 (1667). 1667's centre, 62.9, comes from its dark air, so its papyrus sits 1 sd above Paris 4's (0.40).
+
+Does AUC track it? No. 0009B (z -0.1) scores best of the trained sets, 1667 (z 1.35) sits in the middle, and Paris 4 (z 0.4, the
+training mode) scores lowest. Within a scroll, the AUC of 2048-blocks correlates weakly with the block's ink-band z (r = 0.23 on 1667, 52
+blocks; 0.28 on 0139, 43 blocks); it correlates better with the raw CT contrast between ink and no-ink (r 0.40 / 0.24).
+
+Equalisation prototype at predict time (`predict --norm C,S` replaces the scan-norm): eqA maps the scroll's band mean / sd onto Paris 4's
+band z (0.414 / 0.369; C,S per scroll in /vesuvius/ufsm/inknorm/eqA.txt), eqB gives every scroll Paris 4's level-2 scan-norm (85.8 /
+37.95). On 1667's 16 densest held-out blocks (9.0 M HOLD px), paired:
+
+| 1667 | HOLD | TRAIN | VAL (1.2 M px) |
+|---|---|---|---|
+| scan-norm (try9) | 0.570 | 0.618 | 0.626 |
+| eqA (band z 1.3 -> 0.4) | 0.561 | 0.615 | 0.663 |
+| eqB (Paris 4's C,S) | 0.567 | 0.618 | 0.643 |
+
+Moving 1667's band by about 1 sd barely changes held-out AUC. That is expected: try9 trains and predicts with live GroupNorm (per-window
+statistics), which normalises a per-window affine input change away after the first conv + GN. Linear per-scan equalisation is therefore
+a no-op for this net; only histogram-shape differences could matter, and AUC does not track those either. (The queue stopped after 1667.)
+
+**Label vs surface alignment.** The CT face lies outside the mesh by a median of +4 .. +10 level-0 voxels (q10 .. q90 -3 .. +17), so a
+mesh-relative band would miss it. The face-relative band is where the head's AUC peaks, within 0.01-0.04, on 1667 (best shift -9 .. 0),
+0139 (-3 .. +3) and 0009B (+1); MAN5 and 0814 HOLD peak at -8 .. -12 (+0.03 / +0.04). Paris 4 is the exception: TRAIN 0.592 at face + 8
+vs 0.566 at 0; HOLD 0.566 at + 12 vs 0.521. Its ink-minus-no-ink prediction contrast sits in the gap beyond the face (+3.8/255 at +8 ..
++12, +2.6 at the band), while on 1667 / 0139 it sits inside the papyrus (+5.2 at -10 .. -8). The CT itself shows the ink at the band on all
+three (ink brighter by 3-5 at f - 4), so the labels are where the ink is. At contrasts of 3-5 / 255 a per-source offset would fit noise;
+none is proposed.
+
+**Class balance.** Positives are not rare: 19-32 % of label px per scroll and split (MAN5 HOLD 38 %); the level-1 voxel targets per
+labelled block are 15-30 % ink (`ink-onfly` per block, about x0.75 the px share: the splat's majority rule and the CT >= iso gate). The ink
+BCE is a per-window mean over the known voxels, smoothing 0.1, no positive weight. With --ink-air 8 the air lattice (target 0.05) is about
+a third of a labelled window's known ink targets and the whole target elsewhere ("ink bce (100 % of windows)"); human-ink windows are
+12-18 % of updates. The MIL term sits near ln 2 (0.54-0.66 at step 15k) with rays at the 65536 cap. No positive-weight change proposed.
+
+**Face iso (labels).** The onfly face search uses iso 64 on raw CT for every scan. It finds a face for only 50-57 % of supervised px on
+0009B, 0500P2 and 0841 (66-84 % elsewhere); the rest stay unknown. The failure is almost always "no gap after the papyrus run" (45 % of
+0009B px, 37-39 % on 0500P2, 25-33 % on 0841): on those scans the inter-sheet gap stays above 64. Share of px with a face:
+
+| scroll | iso 64 | best iso | best share |
+|---|---|---|---|
+| 0009B | 0.523 | 112 | 0.749 |
+| 0841 | 0.547 | 96 | 0.652 |
+| 0500P2 | 0.526 | 80-88 | 0.616 |
+| 0814 | 0.765 | 88 | 0.814 |
+| Paris 4 | 0.661 | 80 | 0.679 |
+| 0139 | 0.733 | 80 | 0.754 |
+| 1667 | 0.689 | 72 | 0.691 |
+| MAN5 | 0.831 | 72 | 0.834 |
+
+Proposal (sources json only, the onfly entries' "iso"): 0009B 112, 0841 96, 0500P2 80, 0814 88, Paris 4 80, 0139 80, 1667 / MAN5 72:
++43 % labelled px on 0009B, +19 % on 0841, +17 % on 0500P2, +3 % on Paris 4 / 0139. Changes the labels and their dcache keys; not applied.
+
+**Calibration.** No output reaches 128 on any scroll (no-ink p99 43-80); best-F1 thresholds are 13-53 by scroll and split; the no-axis
+scrolls sit ~20 / 255 lower (p50 33-41 against 51-59). One fixed threshold cannot work; until a head separates, display per scroll with
+a p1 / p99 stretch over the scroll's papyrus band.
+
+**Other train / predict mismatches**, measured:
+- Axis: four ink sources have no "axis" (0009B-u2ink, MAN5, 0841, 0500P2-u2ink); try9 trains them with zero radial channels and
+  grid-index RoPE, predict refuses them unless --axis or UFSM_PRED_NO_AXIS_OK. 0500P2 with the wbench axis: HOLD 0.495 vs 0.470 without,
+  VAL 0.550 vs 0.558, output -5 / 255. Small either way.
+- Window: try9 trains at 768 (216 attention tokens), card-1 predict runs 512 (64). 1667 at 384 vs 512: HOLD 0.555 vs 0.559, TRAIN 0.620
+  vs 0.625 (one 0814 block moved 0.60 -> 0.66, the scroll-wide curve is flat).
+- Level 1 vs 2: queued, never ran (latent-net work paused 11-20).
+- Scan-norm statistics: identical bits in the sampler and predict (scannorm.c cache).
+
+Files: /vesuvius/ufsm/inknorm/lab1/*.tsv (labels; .iso / .blocks / .hist / .prof), pred/<scroll>-<tag>/a*.tsv, agg.sh.
 
 ## Count-constrained fill: no headroom over the mf-weighted ref (2026-11-18, branch fill-20261118, levelsolve)
 
