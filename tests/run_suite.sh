@@ -165,6 +165,7 @@ if [ -n "$CHANGED" ]; then
         case $f in src/*.cu|src/*.cuh) [[ $deps == *" @cuda "* ]] && { hit=1; break; };; esac
         case $f in *.c|*.h|*.cu|*.cuh|*.inc) [[ $deps == *" ${f##*/} "* ]] && { hit=1; break; };; esac
       done
+      [ $hit = 0 ] && hastag "$n" anysrc && for f in "${CF[@]}"; do case $f in src/*) hit=1; break;; esac; done   # (whole-tree source checks: lints)
       [ $hit = 1 ] && KEEP+=("$n")
     done
     echo "run_suite: -c $CHANGED: ${#CF[@]} changed files select ${#KEEP[@]} of ${#NAMES[@]} tests ($([ $MAP = 1 ] && echo "symbol-reach map" || echo "line tables"))"

@@ -315,6 +315,16 @@ int main(int argc, char **argv) {
             printf("%-32s @%d %8.3f ms  out %016llx\n", "bdata s2 down0 16 -> 16 (mx4, acc)", P, best, (unsigned long long)fnv(gx, lp_mx4_bytes(1, 16, S)));
             nn_free(gy); nn_free(gx);
         }
+        {   /* the 8-wide net's down0 (Ci 8 -> Co 16; microc 11-25: bwd_data_s2_mx2_k's bwx 8 guards, mcc 140 vs nvcc 85 ms per 3 launches) */
+            const shape5 xs8 = {1, 8, P, P, P};
+            float *w8 = rnd((size_t)16 * 8 * 27, 0.1f, 156);
+            void *gy = mx(4, 16, Sc, 1e-3f, 157), *gx = mx(4, 8, S, 1e-3f, 158);
+            double best = 1e9;
+            for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_bwd_data_s2_mx(gy, ys, w8, xs8, gx, 1, 4, 4, 0x1234u + it); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3; }
+            nn_free(gx); gx = mx(4, 8, S, 1e-3f, 158); lp_bwd_data_s2_mx(gy, ys, w8, xs8, gx, 1, 4, 4, 0x1234u); nn_sync();
+            printf("%-32s @%d %8.3f ms  out %016llx\n", "bdata s2 down0 8 -> 16 (mx4, acc)", P, best, (unsigned long long)fnv(gx, lp_mx4_bytes(1, 8, S)));
+            nn_free(gy); nn_free(gx); nn_free(w8);
+        }
         {
             void *x = mx(4, 16, S, 2.f, 156), *gy = mx(4, 16, Sc, 1e-3f, 157);
             float *gw = nn_malloc(16 * 16 * 27 * 4), *gb = nn_malloc(16 * 4);
