@@ -37,6 +37,10 @@ Originally no teacher models; since 2026-11-15 published ink networks run as tea
 - Not CPU, for the record: perwrap render on the desk (Paris3) spent 162 s a wrap for 1 s of kernels and 50 GB of chunk uploads with its
   threads 85 % in D on the NAS (parked: unrolls stopped 11-25); the R11d trainer's 16 % wait: its 6 workers ~40 % in page-cache waits on
   rclone ~/nas2 (1.1 um CT + teacher zarrs, ~123 MB/s on a 2.5 GbE link).
+- z3_chunk_map reads the shard indices on UFSM_CHUNKMAP_THREADS (16) threads (each shard writes only its chunks' bits: the same map).
+  R11d's sampler start under strace: 1190 s summed in teacher-zarr opens + 132-byte index preads over rclone (142 k of them), 0.2 s in
+  steady state. bench_chunk_map on the NAS: Paris4 r24t 2.258 (60 k shards) 1 thread 1120 s cold / 32 s warm, 16 threads 20 s warm;
+  1667 r24t 16 threads 93 s cold / 7.8 s warm vs 1 thread 30 s warm. test_chunk_map: 1 / 3 / 16 threads, the same map and count.
 
 ## GPU profile of training / inference; the surface head's 1x1 rows without the identity matmuls (2026-11-25, branch isfhead-20261125, mcuda)
 
