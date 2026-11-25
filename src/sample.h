@@ -113,6 +113,7 @@ typedef struct {
     int aux;                 /* 1: a fifth input channel from the source's aux volume (src/sources.h), symmetry applied like the CT;
                                 batch.x / x16 then hold 5 channels per sample (with gpu_input: batch.auxc, built on the device) */
     int aux_nc;              /* gpu_input + aux: the coarse box edge (sample_aux_nc of the smallest aux / window level ratio) */
+    float aux_drop;          /* gpu_input + aux: the probability a window's aux box is off (all 0: the net must not lean on the coarse model alone) */
     int pmask;               /* 1: fill batch.pm, the papyrus mask (CT > 0, symmetry applied) for heads whose loss covers all papyrus
                                 (task unwrap: ink) */
     int cond_outside;        /* --cond-loss outside: batch.wind only where the condition does not reach (the net must count sheets there) */

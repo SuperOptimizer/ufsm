@@ -3713,7 +3713,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (c->axis_rec > 0) axis_record(b->axr + (size_t)i * SAMPLE_AXR(Pz > P ? Pz : P), o, Pz, P, hax, y, cyz, cxz, &spatial, c->axis_rec);
     free(params); tp_put(tmscr, p3);
     if (c->aux && c->gpu_input) {   /* the fifth channel on the device (nn_input_rad_aux): this window's coarse box, the CT's symmetry / warp there */
-        if (aux_box(c, s, l, o, P, !(crushed || torn || delam || curved), b->auxc, i)) return -1;
+        if (aux_box(c, s, l, o, P, !(crushed || torn || delam || curved) && !(c->aux_drop > 0.f && runif(r) < c->aux_drop), b->auxc, i)) return -1;   /* (--aux-drop: no draw at 0) */
     } else if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
         uint8_t *aw = tp_get(p3, 1), *as = tp_get(p3, 0);
         if (!aw || !as || (s->aux && s->aux_level == l && aux_window(s, o, P, aw))) { tp_put(aw, p3); tp_put(as, p3); return -1; }
