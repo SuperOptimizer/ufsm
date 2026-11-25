@@ -4,7 +4,7 @@
 # volcomp array (z3-put: 128^3 chunks in one 256^3 shard), levels 1..5 plain uint8 arrays, papyrus in z < 128 only. Checks: the shard path
 # caches exactly the chunk files the old per-chunk path (UFSM_PREFETCH_CHUNKS=1) does, with fewer level-0 data requests than chunks;
 # its summary line reports the tally and coverage 1.0000; a second run fetches 0.00 GB with every stored chunk already cached; the dry count
-# (--dry 1, index reads only) reports the GB the run then fetches; --min-free-gb above the disk's free space exits 3 without fetching.
+# (--dry 1, index reads only) reports the GB the run then fetches, a second source over the same scan adding none; --min-free-gb above the disk's free space exits 3 without fetching.
 set -u
 U=${1:?ufsm binary}; U=$(readlink -f "$U")
 D=$(mktemp -d /tmp/test_prefetch_shards_XXXXXX); SRV=
@@ -75,6 +75,10 @@ mkdir -p "$D/cs"; UFSM_OCC_CACHE=0 UFSM_HTTP_CACHE="$D/cs" "$U" prefetch "$D/src
 dry=$(grep 'level 0: .* GB to fetch' "$D/dry.log" | grep -o 'to fetch ([0-9]* B)' | grep -o '[0-9]*')
 [ -n "$dry" ] && [ "$dry" -gt 0 ] || fail "dry count: no level-0 bytes to fetch: $(cat "$D/dry.log")"
 [ -z "$(find "$D/cs/s.zarr/0" -type f ! -name '*.idx' ! -name '.validators')" ] || fail "the dry count cached level-0 chunk data: $(find "$D/cs/s.zarr/0" -type f | head -3)"
+# two sources over the same scan: the second one's chunks were counted with the first (the dry total is the disk the prefetch fills)
+sed 's/{"name":"s",\(.*\)}]}/{"name":"s",\1},{"name":"s2",\1}]}/' "$D/src.json" > "$D/src2.json"
+UFSM_OCC_CACHE=0 UFSM_HTTP_CACHE="$D/cs" "$U" prefetch "$D/src2.json" --levels 1 --P 128 --threads 4 --dry 1 > "$D/dry2.log" 2>&1 || fail "dry count, 2 sources ($D/dry2.log)"
+d2=$(grep '^prefetch: s2 level 0: ' "$D/dry2.log"); echo "$d2" | grep -q ': 0 chunks needed in 0 shards (window 128; + [1-9][0-9]* counted with an earlier source)' || fail "2 sources: s2 counted again: $d2"
 : > "$D/req.log"
 pf cs shards || fail "shard prefetch ($D/shards.log)"
 got=$(grep 'level 0 done' "$D/shards.log" | grep -o 'fetched now ([0-9]* B)' | grep -o '[0-9]*')

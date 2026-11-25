@@ -108,6 +108,19 @@ when the cache is incomplete (the trainer would read those chunks cold). `DRY=1`
 evicts, so size the sources with `ct_zslabs` / `max_level` to the disk). test_prefetch_shards: over a local range-serving HTTP root,
 the shard path caches exactly the per-chunk path's files, level 0's 4 chunks in 1 data request, coverage 1, a second run fetches 0.
 
+**Disk guard and a byte-exact dry count (same day).** R11P's prefetch (8 sources, 1.1 um, P 768, levels 0-2 + probes) was estimated at
+~60 GB from chunk counts and filled the pod disk to 9 GB free at 151 GB fetched; ctprefetch.sh checked `MIN_FREE_GB` only at start. Now
+`ufsm prefetch --min-free-gb G` (ctprefetch.sh passes `MIN_FREE_GB`, default 20) checks the cache disk (statvfs of `UFSM_HTTP_CACHE`)
+before every shard / chunk and stops all workers below it: exit 3, what came stays cached, a rerun resumes. `--dry 1` now walks the same
+shards reading only their indexes (`z3_count_shard_sel`) and prints per source x level the GB stored and still to fetch; sources over the
+same scan share chunks (R11P: 1667 hum / hfH / hfY2, P4 hum / hfH / hfG), so each array x level keeps a union and a later source counts
+only its new chunks (the plain per-source sum read 311.9 GB). R11P's dry count against the cache after the first pass: 8.4 GB left to
+fetch (P4 hfG levels 1-3), 0 index failures. What 12k steps read of it: 1.1:6 / 2.2:1 / 4.5:1 rungs = 9000 level-0 and 1500 each
+level-1 / -2 windows of 768^3 (<= 7^3 128^3-chunks each); against the unique draw-cell regions that is roughly 40 % of P4's and 50 % of
+1667's level-0 chunks, ~50 % at level 1, ~90 % at level 2: ~half the prefetched bytes are read. The draws are random, so a trimmed prefetch
+would leave the other half's windows cold; a full prefetch that fits the disk stays the rule, DRY=1 first. test_prefetch_shards: the dry
+bytes equal the bytes the prefetch then fetches, a second source over the same scan adds none, `--min-free-gb` above the free disk exits 3.
+
 ## Output fusion reader3 + 3-D nets: +0.04 on the 8.6-9.4 um dev set, worse on clean 1447 (negative result; 2026-11-25, inksdk)
 
 Question: are reader3 (2-D) and our 3-D nets complementary? `ink-score --fuse mean|rank [--weights]` averages several maps on the

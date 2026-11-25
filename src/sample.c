@@ -4292,7 +4292,19 @@ static void pf_mark(uint8_t *bits, const int64_t *ng, const int64_t *lo, const i
         size_t k = ((size_t)z * (size_t)ng[1] + (size_t)y) * (size_t)ng[2] + (size_t)x; bits[k >> 3] |= (uint8_t)(1u << (k & 7));
     }
 }
+/* the dry count across sources (2026-11-25): sources over the same scan (R11P: 1667 hum / hfH / hfY2, P4 hum / hfH / hfG) need many of
+   the same chunks; each array x level keeps the union of the chunks counted so far and a later source counts only its new ones, so the
+   per-source GB add up to the disk the prefetch fills (the per-source sum read 311.9 GB "stored" where the cache holds ~185 GB). */
+typedef struct { char *id; uint8_t *bits; size_t nb; } pf_seen;
+static uint8_t *pf_seen_bits(pf_seen **t, int *n, const z3 *ct, int l, size_t nb) {
+    char id[4096]; snprintf(id, sizeof id, "%s|%s|%d", z3_root(ct), z3_key(ct), l);
+    for (int i = 0; i < *n; i++) if (!strcmp((*t)[i].id, id) && (*t)[i].nb == nb) return (*t)[i].bits;
+    pf_seen *q = realloc(*t, (size_t)(*n + 1) * sizeof *q); if (!q) return nullptr; *t = q;
+    uint8_t *b = calloc(nb ? nb : 1, 1); char *d = strdup(id); if (!b || !d) { free(b); free(d); return nullptr; }
+    q[*n] = (pf_seen){d, b, nb}; ++*n; return b;
+}
 int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int P, int dry, double min_free_gb) {
+    pf_seen *seen = nullptr; int nseen = 0;
     if (P < 8) P = 128;   /* training window (level voxels); windows up to this size are covered */
     size_t all = 0, all_fail = 0; int64_t all_bytes = 0, all_need = 0, all_cached = 0; int unsharded = 0;
     pf_cache_dir = getenv("UFSM_HTTP_CACHE"); if (pf_cache_dir && !*pf_cache_dir) pf_cache_dir = nullptr; pf_min_free_gb = min_free_gb; atomic_store(&pf_stop, 0);
@@ -4328,6 +4340,9 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
                 }
                 pf_mark(bits, ng, lo, hi);
             }
+            size_t nshared = 0;
+            if (dry) { uint8_t *sb = pf_seen_bits(&seen, &nseen, ct, l, (total + 7) / 8);   /* (an earlier source's chunks of this array: counted there) */
+                if (sb) for (size_t k = 0; k < (total + 7) / 8; k++) { nshared += (size_t)__builtin_popcount(bits[k] & sb[k]); bits[k] &= (uint8_t)~sb[k]; sb[k] |= bits[k]; } }
             size_t nmark = 0; for (size_t k = 0; k < total; k++) nmark += (bits[k >> 3] >> (k & 7)) & 1;
             all += nmark;
             if (dry && (!m->sharded || getenv("UFSM_PREFETCH_CHUNKS"))) {   /* (unsharded: no index to size the chunks from) */
@@ -4354,9 +4369,9 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
                 clock_gettime(CLOCK_MONOTONIC, &t1); const double sec = (double)(t1.tv_sec - t0.tv_sec) + 1e-9 * (double)(t1.tv_nsec - t0.tv_nsec);
                 all_need += tot.need; all_cached += tot.need - tot.bytes;
                 if (dry) {
-                    fprintf(stderr, "prefetch: %s level %d: %zu chunks needed in %zu shards (window %d): %lld stored, %lld absent; %lld already cached; %.2f GB stored,"
-                                    " %.2f GB to fetch (%lld B); %zu index failures\n", s->name, l, nmark, nsh, P, (long long)tot.present, (long long)tot.absent, (long long)tot.cached,
-                            (double)tot.need / 1e9, (double)tot.bytes / 1e9, (long long)tot.bytes, fail);
+                    fprintf(stderr, "prefetch: %s level %d: %zu chunks needed in %zu shards (window %d; + %zu counted with an earlier source): %lld stored, %lld absent;"
+                                    " %lld already cached; %.2f GB stored, %.2f GB to fetch (%lld B); %zu index failures\n", s->name, l, nmark, nsh, P, nshared,
+                            (long long)tot.present, (long long)tot.absent, (long long)tot.cached, (double)tot.need / 1e9, (double)tot.bytes / 1e9, (long long)tot.bytes, fail);
                     all_fail += fail; all_bytes += tot.bytes; free(sh); free(th); free(args); free(bits); continue;
                 }
                 if (atomic_load(&pf_stop)) fail += nsh - done;   /* (the shards the disk guard left: not cached, coverage below 1) */
@@ -4386,6 +4401,7 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
         }
         free(o.idx);
     }
+    for (int i = 0; i < nseen; i++) { free(seen[i].id); free(seen[i].bits); } free(seen);
     if (dry) {
         fprintf(stderr, "prefetch: %zu chunks over all sources (window %d): %.2f GB stored, %.2f GB already cached, %.2f GB to fetch%s; %zu index failures\n", all, P,
                 (double)all_need / 1e9, (double)all_cached / 1e9, (double)all_bytes / 1e9, unsharded ? " (+ unsharded arrays, bytes unknown)" : "", all_fail);
