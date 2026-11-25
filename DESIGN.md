@@ -15,8 +15,8 @@ Originally no teacher models; since 2026-11-15 published ink networks run as tea
 - Host waits block (nn_sync_mode, train / predict / ink-ext): every GPU process spun in libcuda + clock_gettime while waiting (ink-ext ~40 %
   of its CPU, a trainer's main thread 15-20 %). mcudahw's cudaSetDeviceFlags only stores the flags (microc cuda/hw/rt.c), so nn_flat's
   BlockingSync never applied; nn_sync_mode calls the driver's cuDevicePrimaryCtxSetFlags_v2 (works on an active context) once per physical
-  device. UFSM_CUDA_SYNC=auto (the driver's spin) / spin / yield / block. gpudec's streams take the highest priority with UFSM_GPUDEC_PRIO=1 (off by default
-  until measured against the persistent f4ws wgrad kernel, which concurrent gpudec blocks slow by 60-80 %: mcuda).
+  device. UFSM_CUDA_SYNC=auto (the driver's spin) / spin / yield / block. gpudec's streams take the highest priority (UFSM_GPUDEC_PRIO=0: off;
+  neutral for the f4ws wgrad blocks concurrent decodes evict, mcuda S2E P384: step 974 / 977 ms, f4ws excess 12.4 / 9.0 ms with 0 / 1).
   S2E argv P256 on desk card 1, 300 steps, warm caches:
 
   | variant | Mvox/s | wait | trainer CPU-s | gpudec round trips |

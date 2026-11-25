@@ -372,6 +372,8 @@ static batch alloc_batch(const sample_cfg *c, uint8_t *c255, int bank_own) {   /
     b.x = c->xfmt || c->restore ? nullptr : halloc((size_t)c->B * xc * p3 * sizeof(float));   /* pinned: the trainer uploads asynchronously */
     b.x16 = c->xfmt && !c->restore && !c->gpu_aug ? halloc((size_t)c->B * xc * p3 * 2) : nullptr;   /* (--gpu-aug: the device builds the CT channel) */
     b.ct8 = c->gpu_aug ? halloc((size_t)c->B * p3) : nullptr; b.aug = c->gpu_aug ? halloc((size_t)c->B * sizeof(scan_ct_rec)) : nullptr;
+    b.auxc = c->gpu_input && c->aux ? halloc(sample_aux_bytes(c->B, c->aux_nc)) : nullptr;   /* (the cascade input: coarse boxes, nn.h nn_aux_hdr) */
+    if (b.auxc) memset(b.auxc, 0, sample_aux_bytes(c->B, c->aux_nc));
     if (b.aug) memset(b.aug, 0, (size_t)c->B * sizeof(scan_ct_rec));   /* (the records' padding is never written: zero, so equal batches hash equal) */
     const int tmu = sample_tm_unused(c);   /* (slot_skip 4: the unpacked targets and mask are never read) */
     b.t = c->pack_tm || tmu ? nullptr : halloc((size_t)c->B * (c->restore == 1 ? 1 : NCH) * p3);   /* (task restore: the clean CT alone; real pairs: target + input crop) */
@@ -417,7 +419,7 @@ static batch alloc_batch(const sample_cfg *c, uint8_t *c255, int bank_own) {   /
     return b;
 }
 
-static void free_batch(batch *b, int B) { free(b->latd); free(b->lvc); free(b->lvr); free(b->nlvr); free(b->lvn); free(b->lvz); if (b->nbank) { b->side = b->w4 = b->wcomp = b->ink = nullptr; for (int j = 0; j < 4; j++) b->aux[j] = nullptr; for (int q = 0; q < b->nbank; q++) hfree(b->bank[q]); b->nbank = 0; } if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b, int B) { free(b->latd); free(b->lvc); free(b->lvr); free(b->nlvr); free(b->lvn); free(b->lvz); if (b->nbank) { b->side = b->w4 = b->wcomp = b->ink = nullptr; for (int j = 0; j < 4; j++) b->aux[j] = nullptr; for (int q = 0; q < b->nbank; q++) hfree(b->bank[q]); b->nbank = 0; } if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->auxc) hfree(b->auxc); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -1054,7 +1056,7 @@ void sample_axis_record_spatial_test(float *r, const int64_t o[3], int P, int ha
 }
 int sample_gpu_input_ok(const sample_cfg *c) {
     const int Pz = c->Pz > 0 ? c->Pz : c->P;
-    return c->xfmt != 0 && !c->aux && !c->cond && !c->sheet && !(c->augment && c->ct_augment && Pz != c->P);   /* warps: the CT channel of
+    return c->xfmt != 0 && (!c->aux || (c->aux_nc > 0 && (c->Pz <= 0 || c->Pz == c->P))) && !c->cond && !c->sheet && !(c->augment && c->ct_augment && Pz != c->P);   /* warps: the CT channel of
                                                                                    write_spatial, the transported radial vector on the device */
 }
 int sample_gpu_aug_ok(const sample_cfg *c) {   /* the device's CT channel (nn_aug_ct): cubes, no CT appearance plan, labels that read the CT's zero set
@@ -1062,7 +1064,7 @@ int sample_gpu_aug_ok(const sample_cfg *c) {   /* the device's CT channel (nn_au
     return c->gpu_input && sample_gpu_input_ok(c) && (c->Pz <= 0 || c->Pz == c->P) && !c->ct_augment && c->side_air == 0 && !c->restore && !c->papyrus && c->P <= SA_MAXP;
 }
 int sample_gpu_lwarp_ok(const sample_cfg *c) {   /* --gpu-aug 2: the warped windows' labels on the device: the packed targets (and pmask: their mask bit), phase and winding only */
-    return sample_gpu_aug_ok(c) && (c->pack_tm || sample_tm_unused(c)) && !c->sheet && !c->pap_head && !c->emb_ch && !c->cond && !c->band && !c->aux;
+    return sample_gpu_aug_ok(c) && (c->pack_tm || sample_tm_unused(c)) && !c->sheet && !c->pap_head && !c->emb_ch && !c->cond && !c->band && (!c->aux || c->aux_nc > 0);   /* (gpu_input aux: warped on the device with the CT) */
 }
 void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], float mean, float isd, int hasax, const float *cyz,
                          const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed, uint16_t *H4, uint16_t *H1, void *rec) {
@@ -1896,6 +1898,53 @@ static int aux_window(source *s, const int64_t o[3], int P, uint8_t *dst) {
     return 0;
 }
 
+/* gpu_input + aux (sample.h): the coarse box. A level-l window voxel u (source frame, window corner o) sits at aux-grid position
+   (o + u) / f + (1 / f - 1) / 2 (voxel centres, f = 2^(aux level - l)); the box starts one voxel below the window's first position and
+   covers its last + 2 (the trilinear corner), so nc = ceil((P - 1) / f) + 3. */
+int sample_aux_nc(int P, int f) { return (P - 1 + f - 1) / f + 3; }
+size_t sample_aux_bytes(int B, int nc) { return (size_t)B * 32 + (size_t)B * (((size_t)nc * nc * nc + 15) & ~(size_t)15); }
+int sample_aux_byte(const uint8_t *auxc, int n, const float u[3]) {
+#pragma clang fp contract(off) reassociate(off)   /* (the device's IEEE intrinsics in this order: nn_input_rad_aux, bit for bit) */
+    nn_aux_hdr h; memcpy(&h, auxc + (size_t)n * 32, sizeof h);
+    if (!h.on || u[0] < 0.f) return 0;
+    const int nc = h.nc; const uint8_t *bx = auxc + h.off; int b[3]; float f[3];
+    for (int d = 0; d < 3; d++) {
+        const float t = u[d] * h.inv_f, q = t + h.o[d];
+        int bb = (int)floorf(q); bb = bb < 0 ? 0 : bb > nc - 2 ? nc - 2 : bb;
+        float fr = q - (float)bb; fr = fr < 0.f ? 0.f : fr > 1.f ? 1.f : fr;
+        b[d] = bb; f[d] = fr;
+    }
+    float v = 0.f;
+    for (int k = 0; k < 8; k++) {
+        const int dz = k >> 2, dy = (k >> 1) & 1, dx = k & 1;
+        const float a = dz ? f[0] : 1.f - f[0], bb = dy ? f[1] : 1.f - f[1], cc = dx ? f[2] : 1.f - f[2];
+        const float w1 = a * bb, w = w1 * cc, t = w * (float)bx[((size_t)(b[0] + dz) * nc + (b[1] + dy)) * nc + (b[2] + dx)];
+        v = v + t;
+    }
+    const int bv = (int)(v + .5f);
+    return bv > 255 ? 255 : bv;
+}
+void sample_aux_place(const int64_t o[3], int f, nn_aux_hdr *h, int64_t oc[3]) {
+    for (int d = 0; d < 3; d++) { const double q0 = (double)o[d] / f + (1.0 / f - 1.0) / 2; oc[d] = (int64_t)floor(q0) - 1; h->o[d] = (float)(q0 - (double)oc[d]); }
+    h->inv_f = 1.f / (float)f;
+}
+/* one window's box and header into batch.auxc (slot i of B); on 0 (no aux volume, a finer aux grid than the window's, or a re-drawn
+   window whose CT the aux does not follow): every byte 0 on the device */
+static int aux_box(const sample_cfg *c, source *s, int l, const int64_t o[3], int P, int on, uint8_t *auxc, int i) {
+    nn_aux_hdr h; memset(&h, 0, sizeof h);
+    const int nc = c->aux_nc; const size_t stride = (((size_t)nc * nc * nc + 15) & ~(size_t)15);
+    h.nc = nc; h.off = (int)((size_t)c->B * 32 + (size_t)i * stride);
+    if (on && s->aux && s->aux_level >= l && sample_aux_nc(P, 1 << (s->aux_level - l)) <= nc) {
+        int64_t oc[3]; sample_aux_place(o, 1 << (s->aux_level - l), &h, oc); h.on = 1;
+        memset(auxc + h.off, 0, (size_t)nc * nc * nc);   /* (aux_window leaves the part outside the volume alone) */
+        if (aux_window(s, oc, nc, auxc + h.off)) return -1;
+    } else if (on && s->aux) {
+        static _Atomic int warned;
+        if (!atomic_exchange(&warned, 1)) UFSM_DEFAULTED("--aux-input: a window at a level finer than the box allows (aux level %d, window level %d, box %d): its aux channel is 0", s->aux_level, l, nc);
+    }
+    memcpy(auxc + (size_t)i * 32, &h, sizeof h);
+    return 0;
+}
 static double rnorm(rng *r) { double u1 = runif(r); const double u2 = runif(r); if (u1 < 1e-300) u1 = 1e-300; return sqrt(-2 * log(u1)) * cos(2 * M_PI * u2); }
 static inline void put_x(float *X, uint16_t *H, int xfmt, size_t idx, float v) {
     if (X) X[idx] = v; else if (xfmt == 1) { _Float16 hv = (_Float16)v; memcpy(&H[idx], &hv, 2); } else H[idx] = bf16_rn(v);
@@ -3664,7 +3713,9 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     if (c->gpu_input) rad_record((char *)b->rad + (size_t)i * NN_RAD_REC(Pz), o, Pz, P, hax, y, cyz, cxz, &spatial);   /* the radial channels: on the device */
     if (c->axis_rec > 0) axis_record(b->axr + (size_t)i * SAMPLE_AXR(Pz > P ? Pz : P), o, Pz, P, hax, y, cyz, cxz, &spatial, c->axis_rec);
     free(params); tp_put(tmscr, p3);
-    if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
+    if (c->aux && c->gpu_input) {   /* the fifth channel on the device (nn_input_rad_aux): this window's coarse box, the CT's symmetry / warp there */
+        if (aux_box(c, s, l, o, P, !(crushed || torn || delam || curved) && !(c->aux_drop > 0.f && runif(r) < c->aux_drop), b->auxc, i)) return -1;   /* (--aux-drop: no draw at 0) */
+    } else if (c->aux) {   /* the fifth channel: the source's aux volume at this level (zeros elsewhere), the CT's symmetry, v / 127.5 - 1 */
         uint8_t *aw = tp_get(p3, 1), *as = tp_get(p3, 0);
         if (!aw || !as || (s->aux && s->aux_level == l && aux_window(s, o, P, aw))) { tp_put(aw, p3); tp_put(as, p3); return -1; }
         /* the CT's spatial warp too (arm K 11-20: a surface-proximity aux must stay on the CT's sheet; it was symmetry only, fine for the
