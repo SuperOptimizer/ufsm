@@ -289,21 +289,30 @@ int cmd_dinovol_embed(int argc, char **argv) {
     const double gbud = opt_atof("--gpu-mem", opt(argc, argv, "--gpu-mem", "9")) * 1e9 - 5.2e9;   /* the forward (192^3 tile + head chunk + caches) takes ~5 GB */
     {   /* slab depth K (cells per shard edge) and x band width Wx (cells; bands recompute one tile column each) with the fewest tiles per
            cell, (K + 1) / K x (Wx + 1) / Wx, whose accumulators + fp16 strips fit the device budget */
-        const int kmax = (512 + stride / 2) / stride > 0 ? (512 + stride / 2) / stride : 1;
+        /* the z slabs lie on the global shard grid (multiples of k cells: a shard is written once); each slab re-runs the tile row above it
+           and each x band the column left of it, so a column of the box runs nslab(k) + ncz tiles: cost = that / (ncz + 1) x the same in x.
+           k up to the box's own z cells (one slab: no tile runs twice), as far as the device budget allows (11-25: the old cap of
+           512 voxels forced k = 1 at stride 208, every tile twice) */
+        const int ncz = (int)(c1[0] - c0[0]), kmax = ncz < 64 ? ncz : 64;
         double best = 1e30; int bk = 1, bw = 1;
-        for (int k = 1; k <= kmax; k++) for (int w = k; w < ncx + k; w += k) {
-            if ((K > 0 && k != K) || (Wx > 0 && w != Wx)) continue;
+        for (int k = K > 0 ? K : 1; k <= (K > 0 ? K : kmax); k++) for (int w = k; w < ncx + k; w += k) {
+            if (Wx > 0 && w != Wx) continue;
             const int we = w < ncx ? w : ncx;
-            double bytes = 0;
+            double bytes = 2.0 * ((double)k * stride + T) * T * T;   /* the CT column (device + its upload) */
             for (int pass = 0; pass < 2; pass++) {
                 if (pass ? !need_den : !need_tok) continue;
                 const int s = pass ? ds : 8; const double CA = pass ? CD : E + 1, nz = (double)k * stride / s, NS = support / s, sy = stride / s, r = ramp / s;
                 bytes += nz * NS * NS * CA * 4 + nz * sy * r * CA * 2 + (we + 2) * 2.0 * (nz * r * sy * CA * 2 + nz * r * r * CA * 2);
             }
-            const double cost = (k + 1.0) / k * (we + 1.0) / we;
+            const int64_t nsl = (c1[0] - 1) / k - c0[0] / k + 1; int64_t nb = 0;
+            for (int64_t e1 = c0[2]; e1 < c1[2]; nb++) { const int64_t e0 = e1; e1 = w >= ncx ? c1[2] : e0 / k * k + w; if (e1 > c1[2]) e1 = c1[2]; }
+            const double cost = (double)(nsl + ncz) / (ncz + 1) * (double)(nb + ncx) / (ncx + 1);
             if (bytes <= gbud && cost < best - 1e-9) { best = cost; bk = k; bw = w; }
         }
+        if (best > 1e29) fprintf(stderr, "DEFAULTED: dinovol-embed: no slab / band choice fits --gpu-mem; 1-cell slabs and bands\n");
         K = bk; Wx = bw;
+        if (best > 1 + 1e-9 && best < 1e29) fprintf(stderr, "DEFAULTED: dinovol-embed: %d-cell z slabs / %d-cell x bands run %.0f %% more tiles than one pass over the box (%s)\n",
+                                     K, Wx, 100 * (best - 1), opt(argc, argv, "--shard-cells", nullptr) || opt(argc, argv, "--band-cells", nullptr) ? "--shard-cells / --band-cells" : "the --gpu-mem budget");
     }
     const int ps = dv_patch(net), es_t = stride / ps, es_d = stride / ds;   /* cell edge in output units */
     int ck_t = es_t, ck_d = es_d;
@@ -370,7 +379,8 @@ int cmd_dinovol_embed(int argc, char **argv) {
                     "(z slab), x bands of %d cells, dense stride %d, device %.2f GB in use\n", bv[0], bv[1], bv[2], bv[3], bv[4], bv[5], (long long)c0[0], (long long)c1[0], (long long)c0[1],
             (long long)c1[1], (long long)c0[2], (long long)c1[2], stride, T, margin, ramp, K, Wx, ds, xnet_mem_used() / 1e9);
     aqueue AQ; aq_start(&AQ, (size_t)(opt_atof("--write-buffer-gb", opt(argc, argv, "--write-buffer-gb", "1.5")) * 1e9));
-    const double t_start = dv_now(); double t_net = 0, t_head = 0, t_read = 0, t_fin = 0; long ntiles = 0, nskip = 0, ncells = 0, npoints = 0;
+    const double t_start = dv_now(); double t_net = 0, t_head = 0, t_read = 0, t_fin = 0; long ntiles = 0, nskip = 0, ncells = 0, npoints = 0, nrecomp = 0;
+    const int64_t tz = c1[0] - c0[0] + 1, ty = c1[1] - c0[1] + 1, tx = c1[2] - c0[2] + 1; uint8_t *tseen = calloc((size_t)(tz * ty * tx), 1);   /* tiles run (recomputes) */
     int rc = 0;
     extern void dv_zero_dev(void *p, size_t bytes);
     /* x bands of Wx cells (aligned to the shard grid), then slabs of K cells along z */
@@ -422,6 +432,7 @@ int cmd_dinovol_embed(int argc, char **argv) {
                 for (int64_t z = (lo - Z0) / ps; z < (hi - Z0) / ps && !v; z++) for (int i = 0; i < nyt * nyt; i++) if (mt[(size_t)z * nyt * nyt + i]) { v = 1; break; }
                 if (!v) { nskip++; continue; }
                 ntiles++; any_tile = 1;
+                { uint8_t *q = &tseen[((kz - c0[0] + 1) * ty + (ky - c0[1] + 1)) * tx + (kx - c0[2] + 1)]; nrecomp += *q; *q = 1; }
                 double t0 = dv_now();
                 if (dv_forward(net, cold + (size_t)(az - bandz0) * T * T, T, (float)S.median, (float)S.scale, (float)S.p99)) { rc = 1; break; }
                 if (need_tok) dv_tok_acc(acc_t, (int)((lo - Z0) / ps), (int)((hi - Z0) / ps), nyt, nyt, E, dv_tokens(net), T / ps, (int)((Z0 - az) / ps), margin / ps, margin / ps, ps, T, margin, ramp, mask_t);
@@ -482,9 +493,9 @@ int cmd_dinovol_embed(int argc, char **argv) {
     }
     rc |= aq_finish(&AQ);
     const double el = dv_now() - t_start;
-    fprintf(stderr, "\ndinovol-embed: %ld cells (%.1f Mvox) in %.1f s = %.2f Mvox/s; %ld tiles (%.0f ms each: net %.0f, head %.0f, finish %.0f), %ld dense points, %ld tiles skipped; peak device %.2f GB\n",
+    fprintf(stderr, "\ndinovol-embed: %ld cells (%.1f Mvox) in %.1f s = %.2f Mvox/s; %ld tiles (%.0f ms each: net %.0f, head %.0f, finish %.0f), %ld dense points, %ld tiles skipped, %ld recomputed; peak device %.2f GB\n",
             ncells, ncells * (double)stride * stride * stride / 1e6, el, ncells * (double)stride * stride * stride / el / 1e6, ntiles, ntiles ? el / ntiles * 1e3 : 0,
-            ntiles ? t_net / ntiles * 1e3 : 0, ntiles ? t_head / ntiles * 1e3 : 0, ntiles ? t_fin / ntiles * 1e3 : 0, npoints, nskip, (xnet_mem_used() + xnet_mem_cached()) / 1e9);
+            ntiles ? t_net / ntiles * 1e3 : 0, ntiles ? t_head / ntiles * 1e3 : 0, ntiles ? t_fin / ntiles * 1e3 : 0, npoints, nskip, nrecomp, (xnet_mem_used() + xnet_mem_cached()) / 1e9);
     for (int o = 0; o < O_N; o++) if (want[o]) { zw_free(&W[o]); if (has_sc[o]) zw_free(&Wsc[o]); }
     dv_free(net); z3_close(ct); store_close(st);
     return rc;
