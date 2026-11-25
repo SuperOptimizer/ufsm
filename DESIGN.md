@@ -6,6 +6,23 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## merge-flag + dinovol dense cos: no gain over amp9 / R5 / sp9 (2026-11-25, dinovol)
+
+`merge-flag --eval LIST --dense-pts DIR` writes each GT interval's probe pair: the middle of the interval ± half the net's own local
+spacing (sp h / 8) along the ray. `dinovol-probe pfeats --dense-only` embeds the pairs with g256 dense-64, on the pod, about 18 s per box.
+`--dense-cos DIR` then adds cos(dense a, dense b) as a 4th logistic feature. The run covered the 57 t9 boxes (1.61 M intervals),
+1667 + Paris 4. In the table, R@6.5 % is the recall of merged intervals when the top 6.5 % by score is flagged (the unroll's MFLAG loss).
+
+| split | base AUC | +dcos AUC | dcos alone | 0-50 base/+d | 50-100 | 100-200 | 200+ | R@6.5 % 100-200 base/+d |
+|---|---|---|---|---|---|---|---|---|
+| held-out boxes | 0.934 | 0.934 | 0.774 | 0.627 / 0.623 | 0.888 / 0.888 | 0.945 / 0.945 | 0.960 / 0.960 | 0.276 / 0.276 |
+| P4 -> rest | 0.896 | 0.894 | 0.760 | 0.371 / 0.361 | 0.804 / 0.802 | 0.939 / 0.939 | 0.953 / 0.953 | 0.533 / 0.533 |
+| rest -> P4 | 0.942 | 0.941 | 0.762 | 0.896 / 0.893 | 0.917 / 0.915 | 0.948 / 0.947 | 0.951 / 0.952 | 0.211 / 0.211 |
+
+The fitted dcos weight is small, and its sign flips between splits (-0.20, -0.23, +0.59). The sheet-identity triplets of the section
+below separate sheets well. As a merge cue, though, the dense cos is mostly redundant with what the fields already say. The feature
+stays opt-in (default off). The 1667 unroll end test was not run. Data: /vesuvius/ufsm/dinovol/mfd/{base,dense}.out.
+
 ## dinovol dense features tell adjacent sheets apart better than try9's phase in the 50-100 um bin (2026-11-24, dinovol)
 
 - `ufsm merge-flag --sheet-pairs LIST --out PREFIX`: matched-distance triplets on merge-flag --eval's GT (rays from the axis, code-run
