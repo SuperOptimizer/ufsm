@@ -69,6 +69,20 @@ with tempfile.TemporaryDirectory(prefix="ufsm-devcrops-") as tmp:
         assert abs(j["ink_share"] - (L[sup] == 255).mean()) < 1e-3, j
         bz, by, bx, nz, ny, nx = j["box_l0"]
         assert bz <= 500 - 32 and bz + nz >= 500 + 32 and by <= 1000 + v0 and bx <= 1000 + max(u0, 200) and bx % 4 == 0, j
+    # --exclude (probe training crops outside held-out boxes): the whole canvas as --box, the box above excluded: exactly the windows
+    # that would qualify without it and have no valid vertex inside the excluded box remain
+    big = "0,0,0,100000,100000,100000"
+    run(BIN, "ink-devcrops", d / "segs.json", "--box", big, "--ct-key", "S/scan.zarr", "--um", 8.64, "--out", d / "x0", "--win", WIN, "--min-sup", 0.05,
+        "--min-ink", 10, "--tag", "X")
+    run(BIN, "ink-devcrops", d / "segs.json", "--box", big, "--exclude", ",".join(map(str, box)), "--ct-key", "S/scan.zarr", "--um", 8.64, "--out", d / "x1",
+        "--win", WIN, "--min-sup", 0.05, "--min-ink", 10, "--tag", "X")
+    all_ = [l.split("\t")[0] for l in (d / "x0/crops.tsv").read_text().splitlines() if not l.startswith("#")]
+    kept = [l.split("\t")[0] for l in (d / "x1/crops.tsv").read_text().splitlines() if not l.startswith("#")]
+    def touches(name):   # a window's vertices (canvas u0 + 4 k, v0 + 4 k, k 0..WIN/4) against the box (canvas cols 200..499, rows 0..399)
+        a, b = map(int, name.split("_")[-2:]); cu = b * WIN + 4 * np.arange(WIN // 4 + 1); cv = a * WIN + 4 * np.arange(WIN // 4 + 1)
+        return bool(((cu >= 200) & (cu < 500)).any() and ((cv >= 0) & (cv < 400)).any())
+    assert sorted(kept) == sorted(n for n in all_ if not touches(n)) and 0 < len(kept) < len(all_), (kept, all_)
+    run(BIN, "ink-devcrops", d / "segs.json", "--box", big, "--exclude", "1,2,3", "--ct-key", "S/scan.zarr", "--um", 8.64, "--out", d / "x2", ok=False)
     # a box no window touches: no crops, exit 0
     run(BIN, "ink-devcrops", d / "segs.json", "--box", "0,5000,5000,10,10,10", "--ct-key", "S/scan.zarr", "--um", 8.64, "--out", d / "e")
     assert len((d / "e/crops.tsv").read_text().splitlines()) == 1

@@ -121,6 +121,7 @@ int cmd_dinovol_read(int argc, char **argv);
 int cmd_emb_pca(int argc, char **argv);
 int cmd_emb_calib(int argc, char **argv);
 int cmd_dinovol_calib(int argc, char **argv);
+int cmd_dinovol_probe(int argc, char **argv);   /* src/dvprobe.c */
 int cmd_dino_headfit(int argc, char **argv);
 int cmd_surf_eval(int argc, char **argv);   /* src/surfeval.c */
 int cmd_dino_seamprobe(int argc, char **argv);   /* src/dino.c */
@@ -244,6 +245,7 @@ static int usage(void) {
         "  ufsm dinovol-eval EMB SURF.tifxyz ...   sheet-identity check of the dense embedding along surfaces\n"
         "  ufsm surf-eval --cases LIST --ckpt PT --out DIR   the upstream kaggle_surfaces frozen-encoder surface decoder evaluation\n"
         "  ufsm dinovol-calib --ckpt PT --sources S.json   the upstream teacher's DINO / iBOT head entropy and agreement on our crops\n"
+        "  ufsm dinovol-probe feats|fit|apply ...   linear ink probe of frozen dinovol features on ink-devcrops crops\n"
         "  ufsm dino-train --sources S.json --out DIR   our dense embedding net from scratch (GT sheet identity + DINO-style SSL)\n"
         "  ufsm dino-embed CKPT ROOT KEY OUT --box ... --norm c,s   a dino-train net over a box (dinovol-eval format)\n"
         "  ufsm halves ROOT KEY-L0 OUT --box ...   two 4x-pooled views of a fine scan from disjoint sub-voxel halves\n"
@@ -5092,6 +5094,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "emb-pca")) return cmd_emb_pca(argc, argv);
     if (!strcmp(cmd, "emb-calib")) return cmd_emb_calib(argc, argv);
     if (!strcmp(cmd, "dinovol-calib")) return cmd_dinovol_calib(argc, argv);
+    if (!strcmp(cmd, "dinovol-probe")) return cmd_dinovol_probe(argc, argv);
     if (!strcmp(cmd, "dino-headfit")) return cmd_dino_headfit(argc, argv);
     if (!strcmp(cmd, "surf-eval")) return cmd_surf_eval(argc, argv);
     if (!strcmp(cmd, "dino-train")) return cmd_dino_train(argc, argv);

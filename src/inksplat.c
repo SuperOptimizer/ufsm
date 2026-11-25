@@ -3324,6 +3324,11 @@ int cmd_ink_devcrops(int argc, char **argv) {
         if (nb >= 64 || sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6 || b[3] <= 0 || b[4] <= 0 || b[5] <= 0) {
             fprintf(stderr, "ink-devcrops: --box z,y,x,nz,ny,nx (level-0, at most 64)\n"); return 2; }
         for (int d = 0; d < 6; d++) box[nb][d] = b[d]; nb++; }
+    static int64_t exb[64][6]; int ne = 0;   /* --exclude: a window with any valid vertex in one of these boxes is dropped (training crops outside held-out boxes) */
+    for (int i = 2; i + 1 < argc; i++) { if (strcmp(argv[i], opt_n("--exclude"))) continue; long long b[6];
+        if (ne >= 64 || sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6 || b[3] <= 0 || b[4] <= 0 || b[5] <= 0) {
+            fprintf(stderr, "ink-devcrops: --exclude z,y,x,nz,ny,nx (level-0, at most 64)\n"); return 2; }
+        for (int d = 0; d < 6; d++) exb[ne][d] = b[d]; ne++; }
     { const char *mp = sopt(argc, argv, "--map-boxes", nullptr);   /* the --boxes (the map's coarse scan) mapped into its fine scan, one line each: the
                                                                       fine-scan sources' holdouts of the same region (inkfly_map_boxes, + --map-pad) */
       if (mp) { if (!nb) { fprintf(stderr, "ink-devcrops --map-boxes: no --box\n"); return 2; }
@@ -3333,7 +3338,8 @@ int cmd_ink_devcrops(int argc, char **argv) {
           return 0; } }
     if (argc < 3 || argv[2][0] == '-' || !out || !key || !nb || !(um > 0) || WIN < 32 || WIN % 4) {
         fprintf(stderr, "usage: ufsm ink-devcrops SEGS.json --box z,y,x,nz,ny,nx [--box ..] --ct-key KEY --um U --out DIR [--win 256 (multiple of 4)] [--min-sup 0.2]\n"
-                        "         [--min-ink 200] [--scroll S] [--tag T]   scoring crops (clean crops' layout) of the segments' windows inside the held-out boxes\n");
+                        "         [--min-ink 200] [--scroll S] [--tag T] [--exclude z,y,x,nz,ny,nx ..]   scoring crops (clean crops' layout) of\n"
+                        "         the segments' windows inside the boxes; --exclude: windows touching these boxes are dropped (probe training crops outside the dev holdouts)\n");
         return 2; }
     FILE *fp = fopen(argv[2], "rb"); if (!fp) { fprintf(stderr, "ink-devcrops: cannot open %s\n", argv[2]); return 1; }
     fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *txt = malloc((size_t)sz + 1); const size_t rd = fread(txt, 1, (size_t)sz, fp); fclose(fp); txt[rd] = 0;
@@ -3368,12 +3374,13 @@ int cmd_ink_devcrops(int argc, char **argv) {
         if (hm) { uint8_t m = 0; for (size_t k = 0; k < (size_t)lw * lh; k++) if (MA[k] > m) m = MA[k]; if (m == 1) for (size_t k = 0; k < (size_t)lw * lh; k++) MA[k] *= 255; }
         const int64_t CW = (int64_t)floor((S.w - 1) / S.scale), CH = (int64_t)floor((S.h - 1) / S.scale); int kept = 0, inbox = 0;
         for (int64_t v0 = 0; v0 + N <= CH; v0 += N) for (int64_t u0 = 0; u0 + N <= CW; u0 += N) {
-            int nv = 0, bi = -1; double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+            int nv = 0, bi = -1, xhit = 0; double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
             for (int a = 0; a < G; a++) for (int b = 0; b < G; b++) {   /* gv: 1 valid, 2 valid and inside the window's box (the first box a vertex hits) */
                 float p[3]; const size_t k = (size_t)a * G + b;
                 if (!dc_bil(&S, (u0 + 4.0 * b) * S.scale, (v0 + 4.0 * a) * S.scale, p)) { gx[k] = gy[k] = gz[k] = -1; gv[k] = 0; continue; }
                 gx[k] = p[0]; gy[k] = p[1]; gz[k] = p[2]; gv[k] = 1;
                 const double q[3] = {p[2], p[1], p[0]};
+                for (int t = 0; t < ne; t++) { int in = 1; for (int d = 0; d < 3; d++) in &= q[d] >= exb[t][d] && q[d] < exb[t][d] + exb[t][3 + d]; if (in) xhit = 1; }
                 if (bi < 0) for (int t = 0; t < nb && bi < 0; t++) { int in = 1; for (int d = 0; d < 3; d++) in &= q[d] >= box[t][d] && q[d] < box[t][d] + box[t][3 + d]; if (in) bi = t; }
                 if (bi < 0) continue;
                 int in = 1; for (int d = 0; d < 3; d++) in &= q[d] >= box[bi][d] && q[d] < box[bi][d] + box[bi][3 + d];
@@ -3381,7 +3388,7 @@ int cmd_ink_devcrops(int argc, char **argv) {
                 gv[k] = 2; nv++;
                 for (int d = 0; d < 3; d++) { if (q[d] < lo[d]) lo[d] = q[d]; if (q[d] > hi[d]) hi[d] = q[d]; }
             }
-            if (nv < 4) continue;
+            if (nv < 4 || xhit) continue;
             for (size_t k = 0; k < (size_t)G * G; k++) if (gv[k] == 1 && bi >= 0) {   /* (vertices before the box was known: re-test) */
                 const double q[3] = {gz[k], gy[k], gx[k]}; int in = 1; for (int d = 0; d < 3; d++) in &= q[d] >= box[bi][d] && q[d] < box[bi][d] + box[bi][3 + d];
                 if (in) { gv[k] = 2; nv++; for (int d = 0; d < 3; d++) { if (q[d] < lo[d]) lo[d] = q[d]; if (q[d] > hi[d]) hi[d] = q[d]; } } }

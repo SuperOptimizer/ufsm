@@ -52,6 +52,13 @@ int dv_prof_on(void);                       /* UFSM_DV_PROF=1: per-stage device 
 void dv_prof(int stage);                    /* the time since the previous mark goes to stage */
 void dv_prof_report(double per);            /* print (divided by per) and reset */
 
+/* ufsm dinovol-probe (src/dvprobe.c): a feature row's crop / canvas cell, ink share and supervised px; the weighted logistic probe on
+   standardised features (mu / sd [F], w [F + 1], bias last; Newton steps with ridge lam) and the weighted ROC AUC of scores vs soft labels */
+typedef struct { int32_t crop; int16_t r, c; float lab, wgt; } dvf_row;
+int dvp_fit(const float *X, const dvf_row *R, long n, int F, double lam, int iters, int nthreads, double *mu, double *sd, double *w);
+double dvp_wauc(const double *s, const dvf_row *R, long n);
+int cmd_dinovol_probe(int argc, char **argv);
+
 int dv_write_dense_box(const char *group, const int64_t vol_shape[3], const int64_t box[6], int C, const int8_t *data);   /* src/dinovol.c */
 int cmd_dinovol_eval(int argc, char **argv);
 
