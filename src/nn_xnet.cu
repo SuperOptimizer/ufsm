@@ -267,7 +267,14 @@ enum { KPAD = 64 };
                      ink-ext w035 A/B x3, byte-identical: register allocation only); 1 the old bound */
 #define XN_MINB 2
 #endif
-template <int BM, int BN, int WARPS_M, int WARPS_N, int BK, int NST>
+__device__ __forceinline__ void mma16816h(unsigned *c, const unsigned *a, const unsigned *b) {   /* fp16 accumulate: the full tensor rate on GeForce */
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                 : "+r"(c[0]), "+r"(c[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+/* F16A (UFSM_XNET_F16ACC=1, 2026-11-25): each BK = 32 K step's products summed in fp16 (two m16n8k16 f16-accumulate MMAs, as k_flash48's
+   key tiles), then added to the fp32 accumulators. GeForce runs fp16 x fp16 + fp32 at half the fp16-accumulate rate, and the 128 x 128
+   tile sat at 80 % SM throughput there (ncu 11-18). Not bit-identical to F16A 0: a 32-product partial rounded to fp16 (~2^-11 relative). */
+template <int BM, int BN, int WARPS_M, int WARPS_N, int BK, int NST, int F16A = 0>
 __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, WARPS_M * WARPS_N == 8 ? (NST == 2 && BN == 64 ? 3 : XN_MINB) : 1) conv_igemm(ConvP p) {   /* (the 2-stage 128 x 64 tile: 3 blocks an SM) */
     constexpr int NTH = WARPS_M * WARPS_N * 32, WM = BM / WARPS_M, WN = BN / WARPS_N, MI = WM / 16, NI = WN / 8;
     constexpr int QC = BK / 8, RS = NTH / QC, AP = BM / RS, BP = BN >= RS ? BN / RS : 1;   /* chunks per row, rows per pass, passes (BN < RS: one, part of the threads) */
@@ -322,6 +329,35 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, WARPS_M * WARPS_N == 8
         if (ks + NST - 1 < nk) load((ks + NST - 1) % NST, ks + NST - 1);
         cp_commit();
         const __half *A = sA + slot * BM * BK, *B = sB + slot * BN * BK;
+        if constexpr (F16A) {   /* per m-tile: its fp16 partial over the K step (live: the B fragments of both k halves + one m-tile's partials) */
+            unsigned bf[BK / 16][NI][2];
+#pragma unroll
+            for (int kk = 0; kk < BK / 16; kk++)
+#pragma unroll
+                for (int nj = 0; nj < NI / 2; nj++) {
+                    const int row = wn0 + nj * 16 + (lane & 7) + ((lane >> 4) << 3); unsigned r[4];
+                    xldsm_x4(r, B + swz<BK>(row, kk * 2 + ((lane >> 3) & 1)));
+                    bf[kk][2 * nj][0] = r[0]; bf[kk][2 * nj][1] = r[1]; bf[kk][2 * nj + 1][0] = r[2]; bf[kk][2 * nj + 1][1] = r[3];
+                }
+#pragma unroll
+            for (int mi = 0; mi < MI; mi++) {
+                unsigned h[NI][2];
+#pragma unroll
+                for (int ni = 0; ni < NI; ni++) h[ni][0] = h[ni][1] = 0u;
+#pragma unroll
+                for (int kk = 0; kk < BK / 16; kk++) {
+                    unsigned af[4]; const int row = wm0 + mi * 16 + (lane & 15); xldsm_x4(af, A + swz<BK>(row, kk * 2 + (lane >> 4)));
+#pragma unroll
+                    for (int ni = 0; ni < NI; ni++) mma16816h(h[ni], af, bf[kk][ni]);
+                }
+#pragma unroll
+                for (int ni = 0; ni < NI; ni++) {
+                    const float2 lo = __half22float2(*(const __half2 *)&h[ni][0]), hi = __half22float2(*(const __half2 *)&h[ni][1]);
+                    acc[mi][ni][0] += lo.x; acc[mi][ni][1] += lo.y; acc[mi][ni][2] += hi.x; acc[mi][ni][3] += hi.y;
+                }
+            }
+            continue;
+        }
 #pragma unroll
         for (int kk = 0; kk < BK / 16; kk++) {
             unsigned af[MI][4], bf[NI][2];
@@ -696,13 +732,19 @@ __global__ void k_tshuffle3(const __half *g, const float *bias, __half *y, size_
 }
 
 /* tile shapes: UFSM_XNET_CFG selects (default 0); per variant the tile follows the output channels (64 / 128 / >= 256) */
-template <int BM, int BN, int WMn, int WNn, int BK, int NST> static void launch1(const ConvP &p, int co) {
+static int g_f16a = -1;   /* mgpu: env (UFSM_XNET_F16ACC=1: conv_igemm's K steps summed in fp16, then fp32) */
+extern "C" void xnet_set_f16acc(int v) { g_f16a = v; }
+template <int BM, int BN, int WMn, int WNn, int BK, int NST, int F16A> static void launch1f(const ConvP &p, int co) {
     const size_t sm = (size_t)NST * (BM + BN) * BK * 2;
     static unsigned attr = 0u;   /* mgpu: per-device (a bit per device: the attribute is per context; set first, then the bit, atomically) */
     int dv = 0; cudaGetDevice(&dv);
-    if (!(__atomic_load_n(&attr, __ATOMIC_ACQUIRE) >> (dv & 31) & 1u)) { cudaFuncSetAttribute(conv_igemm<BM, BN, WMn, WNn, BK, NST>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); __atomic_fetch_or(&attr, 1u << (dv & 31), __ATOMIC_RELEASE); }
+    if (!(__atomic_load_n(&attr, __ATOMIC_ACQUIRE) >> (dv & 31) & 1u)) { cudaFuncSetAttribute(conv_igemm<BM, BN, WMn, WNn, BK, NST, F16A>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); __atomic_fetch_or(&attr, 1u << (dv & 31), __ATOMIC_RELEASE); }
     dim3 g((unsigned)((p.M + BM - 1) / BM), (unsigned)((co + BN - 1) / BN));
-    conv_igemm<BM, BN, WMn, WNn, BK, NST><<<g, WMn * WNn * 32, sm, g_st>>>(p);
+    conv_igemm<BM, BN, WMn, WNn, BK, NST, F16A><<<g, WMn * WNn * 32, sm, g_st>>>(p);
+}
+template <int BM, int BN, int WMn, int WNn, int BK, int NST> static void launch1(const ConvP &p, int co) {
+    if (g_f16a < 0) g_f16a = getenv("UFSM_XNET_F16ACC") ? atoi(getenv("UFSM_XNET_F16ACC")) : 0;
+    if (g_f16a) launch1f<BM, BN, WMn, WNn, BK, NST, 1>(p, co); else launch1f<BM, BN, WMn, WNn, BK, NST, 0>(p, co);
 }
 /* ---- MX-fp4 implicit-GEMM convolution (UFSM_XNET_MX = 6: blocks of 16 K with a power-of-two ue8m0 scale, 5: NVFP4-style ue4m3 block
    scales and a per-output-channel fp32 weight scale): m16n8k64 kind::mxf4nvf4 scale_vec::4X, fp32 accumulation, fp16 output.

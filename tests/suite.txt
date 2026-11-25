@@ -214,6 +214,7 @@ test_ink_pool                                  |              |     3 | ./$B/tes
 test_ink_audit                                 |              |     3 | ./$B/test_ink_audit
 test_ink_mil                                   | gpu          |     2 | ./$B/test_ink_mil
 test_xmx                                       | gpu          |     3 | ./$B/test_xmx
+test_xmx~ig                                    | gpu          |     8 | XMX_IGTEST=1 ./$B/test_xmx
 test_xtsf                                      | gpu          |     2 | ./$B/test_xtsf
 test_grad_ar                                   | gpu          |     8 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
 test_grad_ar~2gpu                              | gpu2         |     8 | UFSM_TEST_QUICK=1 ./$B/test_grad_ar
