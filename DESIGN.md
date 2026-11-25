@@ -6,6 +6,39 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Output fusion reader3 + 3-D nets: +0.04 on the 8.6-9.4 um dev set, worse on clean 1447 (negative result; 2026-11-25, inksdk)
+
+Question: are reader3 (2-D) and our 3-D nets complementary? `ink-score --fuse mean|rank [--weights]` averages several maps on the
+label pixels they all cover (the plain mean of the probability bytes, or of per-crop normalised ranks), then takes an exact tie-aware
+AUC; each input is also scored on those pixels (NAME@c). The dev set is 99 crops of 10-15 % held-out boxes on the 7.9-9.4 um scans plus
+h116, 48 crops of 0009B's human labels mapped onto its 8.64 um 116 keV scan. Fused minus reader3, mean crop AUC, ± paired SE:
+
+| dev | h116 (48) | k116 (15) | 0343 (10) | 0172 (40) | mean4 |
+|---|---|---|---|---|---|
+| reader3 | 0.883 | 0.923 | 0.992 | 0.766 | 0.890 |
+| mean(r3, S2-avg surf) | +0.041 ±0.009 | +0.017 ±0.016 | +0.001 | +0.068 ±0.024 | -0.008 |
+| mean(r3, E0 vox) | +0.027 ±0.009 | +0.043 ±0.045 | -0.005 | +0.071 ±0.026 | +0.019 |
+| mean(r3, S2, E0) | +0.044 ±0.011 | +0.048 ±0.045 | -0.001 | +0.080 ±0.030 | +0.006 |
+
+The rank mean scored 0.003-0.03 below the plain mean. Two untuned picks were committed before any clean score
+(inksdk dev/fuse/PICKS.txt) and scored once each on the clean sets (cleanscore3's crops, labels and AUC; E0's maps predicted on the pod):
+
+| clean AUC | 1447 (28) | 0841 (8) |
+|---|---|---|
+| reader3 | 0.764 | 0.880 |
+| S2-avg surf | 0.686 | 0.834 |
+| E0 vox | 0.645 | 0.823 |
+| P1 = mean(r3, S2-avg) | 0.733 (-0.030 ±0.014, 11/28 crops up) | 0.888 (+0.008 ±0.006) |
+| P2 = mean(r3, S2-avg, E0) | 0.720 (-0.044 ±0.015, 7/28) | 0.884 (+0.004 ±0.010) |
+
+So the fusion loses on 1447 and ties on 0841. The dev gain was not real evidence:
+- h116 was not clean: S2-avg and E0 trained on 0009B's labels at 2.4 um (holding them out costs E0 0.044-0.053 on h116).
+- k116 / 0343 are atlas labels from a reader3-like teacher.
+- 0172 is 53 keV.
+Over 10 models, Spearman vs clean 1447 was 0.50 for h116 and 0.78 for 0343. Dev ranks single models acceptably but does not certify a
+reader3 combination. Also found: `predict --surf` reads only the identity pass's trunk features, so `--tta K` on the surface head gave
+the K = 1 map silently; it is now refused. Data: inksdk dev/fuse/ (fuse.tsv, picks.tsv), dev/exp/exp.log.
+
 ## merge-flag + dinovol dense cos: no gain over amp9 / R5 / sp9 (2026-11-25, dinovol)
 
 `merge-flag --eval LIST --dense-pts DIR` writes each GT interval's probe pair: the middle of the interval ± half the net's own local
