@@ -1,5 +1,6 @@
 """img-gate: a uint8 render x max(gate renders) / 255, byte for byte the numpy float32 step it replaced in scripts/strip/strip_refill.sh
 (all 65536 (ink, gate) pairs, deflate and plain inputs, in place and --out)."""
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -8,7 +9,7 @@ import numpy as np
 import tifffile as t
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-BIN = ROOT / "build/ufsm"
+BIN = pathlib.Path(os.environ.get("UFSM_BIN", ROOT / "build/ufsm"))
 
 
 def run(*a):
@@ -72,3 +73,12 @@ with tempfile.TemporaryDirectory(prefix="ufsm-imgdiff-") as tmp:
     t.imwrite(d / "c.tif", a[:-1])
     assert subprocess.run([str(BIN), "img-diff", d / "a.tif", d / "c.tif"], capture_output=True).returncode == 1
 print("img-diff: exact counts, size mismatch refused")
+
+# img-zoom: nearest-neighbour K x enlargement
+with tempfile.TemporaryDirectory(prefix="ufsm-imgzoom-") as tmp:
+    d = pathlib.Path(tmp)
+    a = rng.integers(0, 256, (37, 53)).astype(np.uint8); t.imwrite(d / "a.tif", a, compression="zlib")
+    for k in (1, 2, 3):
+        run(BIN, "img-zoom", d / "a.tif", d / "z.tif", k)
+        assert (t.imread(d / "z.tif") == np.kron(a, np.ones((k, k), np.uint8))).all(), k
+print("img-zoom: equal to np.kron")
