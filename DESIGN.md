@@ -6,6 +6,37 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## CPU side: the pod's CPUs are not the bottleneck; blocking host waits, gpudec priority, content dcache keys, cheaper elastic warp (2026-11-25, perf)
+- Measured first. Pod 1 (13.6 CPUs by cgroup, RTX PRO 6000) over the container's day with DINO2 + S2E: 2.9 CPUs used while active (173 k
+  CPU-s, 25 % system), throttled in 5 837 of 595 k periods (1 %). S2E's wait (71 -> 23 % over 30 k steps, 30-86 Mvox/s) followed cache
+  misses: derived ink cells computed per 10 steps fell 334 -> 72 with it (443 k computed over the run), HTTP chunk reads ~0.35 s first byte
+  (podink's ctprefetch fixes that half). Desk sampler-only of S2E's argv: 1.27 CPU-s per P256 window with CT decode and the ray face search
+  on the CPU (38 % + 17 % of it; both on the GPU in a run), so ~0.6 CPU-s on the pod: a ~400 Mvox/s ceiling at 13.6 CPUs.
+- Host waits block (nn_sync_mode, train / predict / ink-ext): every GPU process spun in libcuda + clock_gettime while waiting (ink-ext ~40 %
+  of its CPU, a trainer's main thread 15-20 %). mcudahw's cudaSetDeviceFlags only stores the flags (microc cuda/hw/rt.c), so nn_flat's
+  BlockingSync never applied; nn_sync_mode calls the driver's cuDevicePrimaryCtxSetFlags_v2 (works on an active context) once per physical
+  device. UFSM_CUDA_SYNC=auto (the driver's spin) / spin / yield / block. gpudec's streams take the highest priority (UFSM_GPUDEC_PRIO=0: off).
+  S2E argv P256 on desk card 1, 300 steps, warm caches:
+
+  | variant | Mvox/s | wait | trainer CPU-s | gpudec round trips |
+  |---|---|---|---|---|
+  | spin, default priority | 46.6 | 12.6 % | 275 | 160 s |
+  | gpudec high priority | 47.8 | 10.3 % | 270 | 149 s |
+  | blocking waits | 46.6 | 12.7 % | 206 | 160 s |
+  | both (the default now) | 47.2 | 9.0 % | 218 | 150 s |
+- spatial_aug_forward (sample_mil_map's two calls per MIL ray, ~1e5 rays a window; 9.6 % of S2E's sampler CPU in __sincos): the Newton
+  stops when a step leaves u unchanged (deterministic in u, so the 6-step result bit for bit) and is skipped without elastic (u - (u - w) = w
+  exactly). test_spatial_augment: 8e5 points bit-identical to the 6-step loop; S2E sampler-only 80 --det batch hashes identical; user CPU
+  101.1 -> 96.3 s for the same 80 windows (startup included).
+- UFSM_DCACHE_KEY=content (opt-in): inkfly's dcache key takes local inputs by their bytes (XXH3-64; directories as "dir") instead of size +
+  mtime, so a derived cache carried to another pod still hits (a new pod re-downloads the GT meshes with new mtimes: every cell recomputed).
+  test_ink_splat~ckey: inputs' mtimes moved, 0 computed / 8 from disk (default keys: 8 computed). A full warm pass is not the answer:
+  denselab-render of R1E's ink reach is 356 k shards (48 Tvox), ~50x the cells S2E touched. Pod recipe: the env on every run, tar
+  /root/cache/derived (15 GB after S2E) between pods.
+- Not CPU, for the record: perwrap render on the desk (Paris3) spent 162 s a wrap for 1 s of kernels and 50 GB of chunk uploads with its
+  threads 85 % in D on the NAS (parked: unrolls stopped 11-25); the R11d trainer's 16 % wait: its 6 workers ~40 % in page-cache waits on
+  rclone ~/nas2 (1.1 um CT + teacher zarrs, ~123 MB/s on a 2.5 GbE link).
+
 ## GPU profile of training / inference; the surface head's 1x1 rows without the identity matmuls (2026-11-25, branch isfhead-20261125, mcuda)
 
 **Profile** (nsys, desk card 1, master cdcbaa75; S2E ink trainer at P 384, steps 30-32 via UFSM_CUPROF; scripts /vesuvius/ufsm/mcuda/prof):
