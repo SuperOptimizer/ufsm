@@ -40,8 +40,12 @@ void spatial_aug_forward(const spatial_aug *a,const double source[3],double outp
     for (int d=0;d<3;d++) {
         double w=c; for (int j=0;j<3;j++) w+=a->R[d][j]*(q[j]-c)/a->scale;
         double u=w;
-        /* Newton solves u-e(u)=w. The bounded derivative stays positive. */
-        for (int i=0;i<6;i++) { double v=a->frequency*u+a->phase[d]; u-=(u-a->amplitude[d]*sin(v)-w)/(1-a->amplitude[d]*a->frequency*cos(v)); }
+        /* Newton solves u-e(u)=w. The bounded derivative stays positive. The iteration is deterministic in u, so once a step leaves u
+           unchanged every later one does too: stopping there gives the 6-step result bit for bit. Without elastic (amplitude 0) the
+           first step is u - (u - w) = w exactly, so the sin / cos are skipped (sample_mil_map's ~1e5 ray ends a window: 9.6 % of the
+           sampler's CPU in __sincos, S2E sampler-only 11-25) */
+        if (a->amplitude[d]==0) { output[d]=w; continue; }
+        for (int i=0;i<6;i++) { double v=a->frequency*u+a->phase[d]; const double un=u-(u-a->amplitude[d]*sin(v)-w)/(1-a->amplitude[d]*a->frequency*cos(v)); if (un==u) break; u=un; }
         output[d]=u;
     }
 }
