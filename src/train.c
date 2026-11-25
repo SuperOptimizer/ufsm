@@ -519,7 +519,7 @@ static int g_w4dev_want, g_w4devs[8], g_w4n;   /* --gpu-aug 3 (band_w4dev.h) on 
 static int g_gpu_in, g_xs = 4, g_gpu_want, g_gpu_asked, g_pack, g_gpu_aug, g_gpu_aug_want, g_gpu_aug_asked;   /* g_gpu_aug: --gpu-aug (sample.h gpu_aug: the device builds the CT channel, nn_aug_ct) */
 static int g_xs_unused_;   /* g_pack: --pack-targets (batch.tm, nn_unpack_tm on upload) */
 static size_t rad_bytes(int B) { return g_gpu_in ? (size_t)B * NN_RAD_REC(g_Pw) : 0; }   /* (g_lsplit: the record of the whole window) */
-static int g_aux_nc, g_auxB;   /* --aux-input with --gpu-input: the coarse box edge (sample_cfg.aux_nc); the boxes ride behind the radial records */
+static int g_aux_nc, g_auxB;   /* mgpu: config. --aux-input with --gpu-input (set once in gpu_input_settle, before the threads): the coarse box edge (sample_cfg.aux_nc); the boxes ride behind the radial records */
 static size_t aux_off(int B) { return (rad_bytes(B) + 255) & ~(size_t)255; }
 static size_t aux_dev_bytes(int B) { return g_gpu_in && g_aux_nc > 0 ? sample_aux_bytes(B, g_aux_nc) : 0; }
 /* the attention stage's scroll axis (unet_set_attn_axis): the sampler writes each window's record (sample_cfg.axis_rec) */
