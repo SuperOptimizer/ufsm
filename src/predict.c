@@ -1390,6 +1390,7 @@ static int pred_rc(int rc) {
     return rc;
 }
 int cmd_predict(int argc, char **argv) {
+    setenv("UFSM_CUDA_SYNC", "block", 0);   /* host waits block (nn_sync_mode, as train; UFSM_CUDA_SYNC=auto: the driver's spin) */
     const char *bf = opt(argc, argv, "--boxes", nullptr);
     if (!bf || argc < 6) return pred_rc(predict_one(argc, argv));   /* (argc < 6: the usage) */
     FILE *f = fopen(bf, "r"); if (!f) { fprintf(stderr, "predict --boxes: cannot open %s\n", bf); return 1; }

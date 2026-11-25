@@ -7,6 +7,8 @@
 #include "label_versions.h"
 #include "reg.h"
 #include <dirent.h>
+#define XXH_INLINE_ALL
+#include <xxhash.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -1775,19 +1777,32 @@ z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine, int own_fine) {
 #define INKFLY_CODE "inkfly " INKFLY_STR(LBL_INKFLY)   /* (label_versions.h LBL_INKFLY; 2 was "ink-splat --face, validation folding, 2026-11-12") */
 /* a label raster's generation: every file under it (count, bytes, newest mtime in ns; the dcache audit 2026-11-14: a directory's mtime
    does not change when chunks below it are rewritten, so key_stat of the dir and zarr.json kept the key) */
+/* UFSM_DCACHE_KEY=content (perf 11-25): local inputs enter the key by their bytes (XXH3-64), not size + mtime, so a cache dir carried to
+   another machine (a new pod re-downloads the same GT meshes with new mtimes: S2E computed 443 k ink cells, ~15 % of its workers' time)
+   still hits. Off by default: the desk's keys stay as they are (switching changes every key once). Directories enter as "dir". */
+static int key_content(void) { static int on = -1; if (on < 0) { const char *e = getenv("UFSM_DCACHE_KEY"); on = e && !strcmp(e, "content"); } return on; }
+static unsigned long long file_xxh(const char *p, long long size) {
+    if (size <= 0) return 0; int fd = open(p, O_RDONLY); if (fd < 0) return 0;
+    void *m = mmap(nullptr, (size_t)size, PROT_READ, MAP_PRIVATE, fd, 0); close(fd); if (m == MAP_FAILED) return 0;
+    madvise(m, (size_t)size, MADV_SEQUENTIAL); const unsigned long long h = XXH3_64bits(m, (size_t)size); munmap(m, (size_t)size); return h;
+}
 static void ink_arr_gen(const char *dir, int depth, long long *nf, long long *nb, long long *mt) {
     DIR *d = depth < 8 ? opendir(dir) : nullptr; if (!d) return;
     for (struct dirent *e; (e = readdir(d));) {
         if (e->d_name[0] == '.' && (!e->d_name[1] || (e->d_name[1] == '.' && !e->d_name[2]))) continue;
         char p[2400]; struct stat st; snprintf(p, sizeof p, "%s/%s", dir, e->d_name); if (stat(p, &st)) continue;
         if (S_ISDIR(st.st_mode)) { ink_arr_gen(p, depth + 1, nf, nb, mt); continue; }
-        const long long t = (long long)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec; (*nf)++; *nb += (long long)st.st_size; if (t > *mt) *mt = t;
+        (*nf)++; *nb += (long long)st.st_size;
+        if (key_content()) *mt = (long long)((unsigned long long)*mt + (file_xxh(p, st.st_size) ^ XXH3_64bits(e->d_name, strlen(e->d_name))));   /* (order-free sum) */
+        else { const long long t = (long long)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec; if (t > *mt) *mt = t; }
     }
     closedir(d);
 }
 static void key_stat(char **b, size_t *n, size_t *cap, const char *path, const char *sub) {
     char p[2100]; snprintf(p, sizeof p, "%s%s%s", path, sub ? "/" : "", sub ? sub : ""); struct stat st;
     char l[2400]; const int k = stat(p, &st) ? snprintf(l, sizeof l, " [%s: -]", sub ? sub : ".") :
+        key_content() ? (S_ISDIR(st.st_mode) ? snprintf(l, sizeof l, " [%s: dir]", sub ? sub : ".") :
+                         snprintf(l, sizeof l, " [%s: %lld x%016llx]", sub ? sub : ".", (long long)st.st_size, file_xxh(p, (long long)st.st_size))) :
         snprintf(l, sizeof l, " [%s: %lld %lld.%09ld]", sub ? sub : ".", (long long)st.st_size, (long long)st.st_mtim.tv_sec, st.st_mtim.tv_nsec);
     while (*n + (size_t)k + 1 > *cap) { *cap *= 2; *b = realloc(*b, *cap); }
     memcpy(*b + *n, l, (size_t)k + 1); *n += (size_t)k;

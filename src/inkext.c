@@ -762,6 +762,8 @@ static int surf_prep(const irun *X, isurf *S, int argc, char **argv, int quiet) 
     return gc && (sscanf(gc, "%d,%d,%d,%d", cc, cc + 1, cc + 2, cc + 3) != 4 || isurf_crop(S, cc[0], cc[1], cc[2], cc[3])) ? -1 : 0;
 }
 int cmd_ink_ext(int argc, char **argv) {
+    setenv("UFSM_CUDA_SYNC", "block", 0);   /* host waits block (nn_sync_mode via xnet_init; UFSM_CUDA_SYNC=auto: the driver's spin, ~40 % of
+                                               ink-ext's CPU in libcuda + clock_gettime, perf 11-24) */
     const char *mname = iopt(argc, argv, "--model", nullptr), *weights = iopt(argc, argv, "--weights", nullptr);
     if (!mname || !weights) {
         fprintf(stderr, "usage: ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um|reader2|dense9|rectina|trace3b|canon2|studio|tsf --weights W[,W2..] --surface TIFXYZ [--surface ..] --ct ROOT KEY --out DIR\n"
