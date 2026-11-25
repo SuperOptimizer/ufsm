@@ -100,6 +100,14 @@ CT from the NAS volcomp mirror), then R1-62000 (3-D ink, a voxel net: `latink.sh
 - Paris3 strip distortion: dist p95 0.395 > the 0.35 gate, concentrated in ws000-ws008 (p95 1.00 -> 0.36; red over the top and bottom z
   thirds of every turn, where the hand umbilicus is weakest). Ran with DISTGATE=0; those stripes are marked distorted
   (/vesuvius/ufsm/unroll/PHercParis3/DISTORTED.txt). ws009-ws041 p95 0.20-0.34, one red sector per turn (a crush line).
+- **Paris3 stopped by the user (2026-11-25 ~07:30) at 80 of 201 per-wrap renders and 8 of 42 reader3 stripe maps; all full-scroll
+  unroll work stopped.** Ink on what was rendered is blobs only (reader3 and the R1 band); the ref drifts 2.95 turns over z; the axis is
+  the hand umbilicus (/vesuvius/ufsm/unrollrun/PHercParis3-umbilicus-hand.json; the c2f centroid sat up to ~20 mm off the core); the
+  hand -1 is a weak estimator call (DIRCOH no signal). Published in /vesuvius/ufsm/unroll/PHercParis3: wraps_snap (201), wrapcheck.tsv,
+  qa, the 8 reader3 stripe maps (ink_r3_strip), distort overlays, DISTORTED.txt; local intermediates deleted.
+- perwrap re-render bug (INKMODE=r3): perwrap skipped only wraps with a final image, which is written after the one ink pass over all
+  wraps, so each restart re-rendered every wrap (Paris3: 19 of 80 outer wraps redone after a strip-only restart). b450cd97 skips wraps
+  with .rendered + CT render + up surface.
 - zcache vs memcap: `unroll.sh` sized the shared decoded-CT cache (/dev/shm) from host RAM (auto, up to 30 GB), but /dev/shm is charged
   to the memcap scope: MANB under `memcap -m 50G` was OOM-killed in stripimg + perwrap (21:22, scope peak 50 G). Since f60f4dbd the
   cache (auto or set) is clamped to a quarter of the smallest cgroup memory.max with a DEFAULTED line (memcap 20G: 30 -> 5). Peak RSS per
