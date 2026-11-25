@@ -132,6 +132,38 @@ with tempfile.TemporaryDirectory(prefix="ufsm-mflag-") as tmp:
     for l in rule:
         auc = float(l.split(" AUC ")[1].split()[0]); mer = float(l.split(" merged ")[1].split()[0])
         assert auc > 0.95 and 0.3 < mer < 0.7, l   # (about half the intervals lie in the merged half)
+    # merge-flag --sheet-pairs on the same GT rings (sheets every 8 native voxels = 76.8 um): every triplet's s lies on a's sheet, b on the
+    # adjacent one (radius from the axis), gaps ~76.8 um; the clean half's phase (try9 column) picks the right sheet, a, s matched in distance
+    run(BIN, "merge-flag", "--sheet-pairs", t / "ev.tsv", "--out", t / "sp", "--max-per-box", "400")
+    rows = [l.split('\t') for l in (t / "sp.tsv").read_text().splitlines() if l and not l.startswith(("box", "#", "name"))]
+    assert len(rows) > 100, len(rows)
+    P = {s: np.fromfile(t / f"sp.{s}.pts", np.float32).reshape(-1, 3, 3) for s in ("paris4", "1667")}
+    for s, p in P.items():
+        assert len(p) == sum(r[1] == s for r in rows), (s, len(p))
+        rad = np.hypot(p[..., 1] + 0.5 - cy * h, p[..., 2] + 0.5 - cx * h)   # (absolute native = the box's: origin 0)
+        sh = np.rint(rad / 8)
+        assert (sh[:, 0] == sh[:, 1]).all() and (np.abs(sh[:, 2] - sh[:, 0]) == 1).all(), np.argwhere(sh[:, 0] != sh[:, 1])[:5]
+    gap = np.array([float(r[2]) for r in rows]); dsm = np.array([float(r[3]) for r in rows]); dad = np.array([float(r[4]) for r in rows])
+    assert np.all(np.abs(gap - 76.8) <= 2 * 9.6), (gap.min(), gap.max())
+    assert np.all(np.abs(dsm - dad) <= np.maximum(0.5 * gap, 1)), np.abs(dsm - dad).max()
+    clean = np.array([float(r[11]) < W * h / 2 - 12 and float(r[13]) < W * h / 2 - 12 for r in rows])   # (s and b in the clean half)
+    t9s = np.array([float(r[5]) for r in rows]); t9a = np.array([float(r[6]) for r in rows])
+    acc = np.mean(t9s[clean] < t9a[clean]); print(f"sheet-pairs: {len(rows)} triplets, gap {gap.mean():.1f} um, clean-half phase picks {acc:.3f}")
+    assert clean.sum() > 20 and acc > 0.95, (clean.sum(), acc)
+    # --dense-pts / --dense-cos plumbing: probe pairs per box, then dense features (a .dvf as dinovol-probe pfeats --dense-only writes it)
+    # that say "same sheet" (cos 1) on the merged half's intervals and "other sheet" (cos 0) on the clean half's: dcos alone is then perfect
+    run(BIN, "merge-flag", "--eval", t / "ev.tsv", "--threads", "2", "--dense-pts", t)
+    for nm in ("a-B1", "b-B2"):
+        q = np.fromfile(t / f"{nm}.pts", np.float32).reshape(-1, 2, 3); n = len(q); mx = q[:, :, 2].mean(1)
+        F = 4; X = np.zeros((n, 2, F), np.float16); X[:, 0, 0] = 1; X[:, 1, 0] = np.where(mx >= W * h / 2, 1, 0); X[:, 1, 1] = np.where(mx >= W * h / 2, 0, 1)
+        hdr = b"DVPF0001" + np.array([F, 0, F, 0, 1, 0, 0, 0], np.int32).tobytes() + b"\0" * 256
+        rec = np.zeros(2 * n, dtype=[("r", "V16"), ("x", "<f2", (F,))]); rec["x"] = X.reshape(2 * n, F)
+        (t / f"{nm}.dvf").write_bytes(hdr + rec.tobytes())
+    r = subprocess.run([str(BIN), "merge-flag", "--eval", str(t / "ev.tsv"), "--threads", "2", "--dense-cos", str(t)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+    assert r.returncode == 0, r.stderr
+    dl = [l for l in r.stdout.splitlines() if "all test boxes" in l and "dcos alone" in l]; print("\n".join(dl))
+    assert len(dl) == 3 and all(float(l.split(" AUC ")[1].split()[0]) > 0.95 for l in dl), r.stdout
+    assert "c_dcos" in r.stdout and "by GT gap" in r.stdout
     # zarr fields (each plane ingested: values clipped at 254): merge-flag --weighted DIR (the unroll's MFREF ref input) equals
     # merge-flag --apply on the same fields and mf; pc ps scaled toward 128 by 1 - mf / 255, w by it (>= 1 on material), others linked
     zf = t / "zfields"; zf.mkdir()
