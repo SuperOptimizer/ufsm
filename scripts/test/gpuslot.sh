@@ -74,7 +74,16 @@ drain)
   mkdir -p "$LOCKD"; exec 7> "$LOCKD/gpu$G.excl"
   if ! flock -s -n 7; then
     h=$(lslocks -n -o PID,MODE,PATH 2> /dev/null | awk -v f="$LOCKD/gpu$G.excl" '$3 == f && $2 == "WRITE" {print $1; exit}')
-    echo "gpuslot: card $G held by pid ${h:-?} $( [ -n "$h" ] && tr '\0' ' ' < /proc/$h/cmdline 2> /dev/null | cut -c1-100): waiting <= $WMIN min"
+    hc=$( [ -n "$h" ] && tr '\0' ' ' < /proc/$h/cmdline 2> /dev/null | cut -c1-100)
+    # a trainer is exempt from the slot windows (lead 11-25): no wait, the requests wait for the next window. Exclusive non-training jobs
+    # (unrolls, benches, profiles) must be off the card in 13:00-13:15 / 21:00-21:15, so for them the drain waits <= -w minutes.
+    tr_=0; if [ -n "$h" ]; then
+      for p in $h $(pgrep -P "$h" 2> /dev/null); do grep -qE '(^| )train( |$)|train\.sh' <<< "$(tr '\0' ' ' < /proc/$p/cmdline 2> /dev/null)" && tr_=1; done; fi
+    if [ $tr_ = 1 ]; then
+      printf '%s SLOT BLOCKED by trainer: card %s, pid %s %s; %s requests wait for the next window\n' "$(date '+%m-%d %H:%M')" "$G" "$h" "$hc" \
+        "$(grep -c . "$Q")" | tee -a "$RES"
+      exit 3; fi
+    echo "gpuslot: card $G held by pid ${h:-?} $hc: waiting <= $WMIN min (exclusive non-training jobs stay off the card in the slot windows)"
     if ! flock -s -w $((WMIN * 60)) 7; then
       printf '%s SLOT BLOCKED: card %s held exclusively by pid %s %s for %s min; %s requests stay queued\n' "$(date '+%m-%d %H:%M')" "$G" "${h:-?}" \
         "$( [ -n "$h" ] && tr '\0' ' ' < /proc/$h/cmdline 2> /dev/null | cut -c1-100)" "$WMIN" "$(grep -c . "$Q")" | tee -a "$RES"
