@@ -6,6 +6,7 @@
 #include "sheet.h"
 #include "scan_augment.h"
 #include "crush.h"
+#include "nn.h"   /* (nn_aux_hdr) */
 #include <stdint.h>
 #include <stdio.h>
 
@@ -110,7 +111,8 @@ typedef struct {
     int side, side_air;      /* side: 1 fills batch.side (band.h SIDE_*: recto / verso side of the nearest labelled recto) from the same band
                                 field, 2 fills it with the winding phase (band.h PHASE_*); voxels with CT <= side_air (and CT 0) are unknown */
     int aux;                 /* 1: a fifth input channel from the source's aux volume (src/sources.h), symmetry applied like the CT;
-                                batch.x / x16 then hold 5 channels per sample */
+                                batch.x / x16 then hold 5 channels per sample (with gpu_input: batch.auxc, built on the device) */
+    int aux_nc;              /* gpu_input + aux: the coarse box edge (sample_aux_nc of the smallest aux / window level ratio) */
     int pmask;               /* 1: fill batch.pm, the papyrus mask (CT > 0, symmetry applied) for heads whose loss covers all papyrus
                                 (task unwrap: ink) */
     int cond_outside;        /* --cond-loss outside: batch.wind only where the condition does not reach (the net must count sheets there) */
@@ -239,6 +241,7 @@ typedef struct {
                                 (nn_ink_bits: the window's symmetry / warp after) */
     int16_t *ink_it;         /* cfg.ink_bits: B, the window's papyrus cutoff (> 255: no papyrus) */
     void *rad;               /* cfg.gpu_input: B radial records of NN_RAD_REC(Pz) bytes (nn.h), x / x16 then one channel per sample */
+    uint8_t *auxc;           /* cfg.gpu_input + aux: sample_aux_bytes(B, aux_nc): B nn_aux_hdr, then each window's coarse aux box (nn.h) */
     uint8_t *ct8;            /* cfg.gpu_aug: B x P^3 source-grid CT bytes (sample.h gpu_aug), else nullptr */
     void *aug;               /* cfg.gpu_aug: B scan_ct_rec (scan_augment.h) */
     float *axr;              /* cfg.axis_rec: B records of SAMPLE_AXR(P) floats */
@@ -358,3 +361,11 @@ void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], f
 int sample_write_spatial_test(const uint8_t *ctu, const uint8_t *tgt, const uint8_t *mask, int P, const int64_t o[3], float mean, float isd,
                               int hasax, const float *cyz, const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed,
                               uint64_t aug_seed, float zoom, int affine, int hard, uint16_t *H4, uint16_t *H1, void *rec, uint8_t *T, uint8_t *M);
+
+/* gpu_input + aux (2026-11-25, the cascade input): the coarse aux box of a window on the device (nn.h nn_aux_hdr). sample_aux_nc: the box
+   edge for windows f = 2^(aux level - window level) times finer than the aux grid; sample_aux_bytes: batch.auxc's size; sample_aux_byte:
+   the host reference of the device's per-voxel byte (u: the voxel's source-frame position, u[0] < 0 outside the cube) */
+int sample_aux_nc(int P, int f);
+size_t sample_aux_bytes(int B, int nc);
+int sample_aux_byte(const uint8_t *auxc, int n, const float u[3]);
+void sample_aux_place(const int64_t o[3], int f, nn_aux_hdr *h, int64_t oc[3]);   /* a window at corner o (its level), f: the box origin oc and h->o, inv_f */
