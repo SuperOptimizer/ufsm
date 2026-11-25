@@ -113,6 +113,7 @@ typedef struct {
     int aux;                 /* 1: a fifth input channel from the source's aux volume (src/sources.h), symmetry applied like the CT;
                                 batch.x / x16 then hold 5 channels per sample (with gpu_input: batch.auxc, built on the device) */
     int aux_nc;              /* gpu_input + aux: the coarse box edge (sample_aux_nc of the smallest aux / window level ratio) */
+    float aux_drop;          /* gpu_input + aux: the probability a window's aux box is off (all 0: the net must not lean on the coarse model alone) */
     int pmask;               /* 1: fill batch.pm, the papyrus mask (CT > 0, symmetry applied) for heads whose loss covers all papyrus
                                 (task unwrap: ink) */
     int cond_outside;        /* --cond-loss outside: batch.wind only where the condition does not reach (the net must count sheets there) */
@@ -287,7 +288,7 @@ occ_index *sources_occupancy_all(sources *S);
 /* warm the CT chunk cache for the labelled cells of every pyramid source (levels 0..maxlev, a fraction of the cells) */
 /* warm the CT chunk cache around every labelled cell: training windows up to P level voxels at the levels a source trains on
    (min_level .. min(maxlev, max_level)), their coarse-probe levels (+3) and every level >= 4 in full; dry: count the chunks only */
-int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int P, int dry);
+int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int P, int dry, double min_free_gb);   /* 0 ok, 1 fetch failures, 3 cache disk below min_free_gb (checked per shard) */
 /* the stored phase interpolated into a window of a 2^shift finer grid (shift >= 2): ph the grid region read (ln[0] x ln[1] x ln[2] codes,
    first voxel lo, PHASE_UNKNOWN outside the array), o the window corner, D x P x P codes out. sample_phase_interp: separable, polynomial
    atan2 (the sampler's path); _ref: 8 neighbours per voxel, atan2f (codes agree but for +-1 at float ties; tests/test_phase_interp.c) */

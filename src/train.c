@@ -519,7 +519,7 @@ static int g_w4dev_want, g_w4devs[8], g_w4n;   /* --gpu-aug 3 (band_w4dev.h) on 
 static int g_gpu_in, g_xs = 4, g_gpu_want, g_gpu_asked, g_pack, g_gpu_aug, g_gpu_aug_want, g_gpu_aug_asked;   /* g_gpu_aug: --gpu-aug (sample.h gpu_aug: the device builds the CT channel, nn_aug_ct) */
 static int g_xs_unused_;   /* g_pack: --pack-targets (batch.tm, nn_unpack_tm on upload) */
 static size_t rad_bytes(int B) { return g_gpu_in ? (size_t)B * NN_RAD_REC(g_Pw) : 0; }   /* (g_lsplit: the record of the whole window) */
-static int g_aux_nc, g_auxB;   /* --aux-input with --gpu-input: the coarse box edge (sample_cfg.aux_nc); the boxes ride behind the radial records */
+static int g_aux_nc, g_auxB;   /* mgpu: config. --aux-input with --gpu-input (set once in gpu_input_settle, before the threads): the coarse box edge (sample_cfg.aux_nc); the boxes ride behind the radial records */
 static size_t aux_off(int B) { return (rad_bytes(B) + 255) & ~(size_t)255; }
 static size_t aux_dev_bytes(int B) { return g_gpu_in && g_aux_nc > 0 ? sample_aux_bytes(B, g_aux_nc) : 0; }
 /* the attention stage's scroll axis (unet_set_attn_axis): the sampler writes each window's record (sample_cfg.axis_rec) */
@@ -657,6 +657,7 @@ static void gpu_input_settle(sample_cfg *sc, int assume_mx, int slot_skip) {   /
     g_gpu_in = g_gpu_want && (assume_mx || unet_input_converted());
     g_xs = g_gpu_in ? 1 : g_xc; sc->gpu_input = g_gpu_in;
     g_aux_nc = g_gpu_in && sc->aux ? sc->aux_nc : 0; g_auxB = sc->B;
+    if (sc->aux && sc->aux_drop > 0.f && !g_gpu_in) UFSM_DEFAULTED("--aux-drop %.2f: ignored on the host-built input (the device path only)", sc->aux_drop);
     if (g_aux_nc) fprintf(stderr, "input: the aux channel built on the GPU from %d^3 coarse boxes (%.1f MB per batch)\n", g_aux_nc, sample_aux_bytes(sc->B, g_aux_nc) / 1e6);
     g_gpu_aug = g_gpu_aug_want && g_gpu_in && sample_gpu_aug_ok(sc) ? 1 : 0;
     if (g_gpu_aug && g_gpu_aug_want == 2) { sample_cfg tc = *sc; tc.slot_skip = g_lsplit && (!getenv("UFSM_SPLIT_LWARP") || ufsm_env_on("UFSM_SPLIT_LWARP")) ? slot_skip : slot_skip & ~4; tc.gpu_aug = 2;   /* (unpacked: the latent split only; UFSM_SPLIT_LWARP=0 keeps its host warps) */
@@ -3934,6 +3935,8 @@ int cmd_train(int argc, char **argv) {
         const int fo = opt_atoi("--aux-fmin", opt(argc, argv, "--aux-fmin", "0")); if (fo > 0) fmin = fo;
         if (fmin > (1 << 10)) fmin = 1;
         sc.aux_nc = sample_aux_nc(P, fmin);
+        sc.aux_drop = (float)opt_atof("--aux-drop", opt(argc, argv, "--aux-drop", "0"));   /* (the device path only) */
+        if (!(sc.aux_drop >= 0.f && sc.aux_drop <= 1.f)) { fprintf(stderr, "--aux-drop: 0 .. 1\n"); return 2; }
     }
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = opt_atoi("--side-air", opt(argc, argv, "--side-air", "0"));
     sc.strict_sources = opt_atoi("--strict-sources", opt(argc, argv, "--strict-sources", "0"));
