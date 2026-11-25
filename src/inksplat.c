@@ -1015,12 +1015,34 @@ int cmd_ink_splat(int argc, char **argv) {
    ink-splat: the label OME pixel size / mesh voxel size, else the canvas size ratio). Each label pixel takes the mean of the map
    over its F x F canvas footprint (bilinear when F < 1.5); pixels whose surface cell is invalid are skipped. Per map: supervised
    px, ink fraction, F1 / precision / recall at the F1-optimal threshold and at p >= 0.5 (byte >= 128), ROC AUC.
-   --row TAG: one TSV line per map "TAG name n inkfrac f1best thr f1_05 prec05 rec05 auc" on stdout. */
+   --row TAG: one TSV line per map "TAG name n inkfrac f1best thr f1_05 prec05 rec05 auc" on stdout.
+   --fuse mean|rank[,..] [--weights a,b,..] (output fusion, lead 11-24: reader3 + 3-D nets): on the label pixels every map covers, the
+   weighted mean of the maps' bytes ("fuse-mean") and / or of their per-crop normalised ranks ("fuse-rank", ties averaged); also each
+   input on that common pixel set ("NAME@c"), so the fused row compares on the same pixels. Fused AUC exact over float values (tie-aware). */
+typedef struct { float v; uint8_t ink; } fpx;
+static int fpx_cmp(const void *a, const void *b) { const float x = ((const fpx *)a)->v, y = ((const fpx *)b)->v; return x < y ? -1 : x > y; }
+static double auc_float(fpx *P, size_t n) {   /* Mann-Whitney with tie ranks averaged */
+    qsort(P, n, sizeof *P, fpx_cmp);
+    double rs = 0; uint64_t ni = 0;
+    for (size_t i = 0; i < n;) { size_t e = i; while (e < n && P[e].v == P[i].v) e++; const double r = 0.5 * ((double)i + 1 + (double)e);
+        for (size_t k = i; k < e; k++) if (P[k].ink) { rs += r; ni++; } i = e; }
+    const uint64_t nn = n - ni; return ni && nn ? (rs - (double)ni * (ni + 1) / 2) / ((double)ni * nn) : 0;
+}
+typedef struct { float v; uint32_t i; } fix;
+static int fix_cmp(const void *a, const void *b) { const float x = ((const fix *)a)->v, y = ((const fix *)b)->v; return x < y ? -1 : x > y; }
+static void rank_norm(float *v, size_t n) {   /* values -> ranks in [0, 1], ties averaged */
+    fix *P = malloc(n * sizeof *P);
+    for (size_t i = 0; i < n; i++) P[i] = (fix){v[i], (uint32_t)i};
+    qsort(P, n, sizeof *P, fix_cmp);
+    for (size_t i = 0; i < n;) { size_t e = i; while (e < n && P[e].v == P[i].v) e++; const float q = n > 1 ? (float)(0.5 * ((double)i + (double)e - 1) / (double)(n - 1)) : 0.5f;
+        for (size_t k = i; k < e; k++) v[P[k].i] = q; i = e; }
+    free(P);
+}
 int cmd_ink_score(int argc, char **argv) {
     const char *surf = sopt(argc, argv, "--surface", nullptr), *lab = sopt(argc, argv, "--labels", nullptr), *msk = sopt(argc, argv, "--mask", nullptr);
     const char *cache = sopt(argc, argv, "--cache", nullptr), *row = sopt(argc, argv, "--row", nullptr);
     if (!surf || !lab || sidx(argc, argv, "--map") < 0) {
-        fprintf(stderr, "usage: ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR] [--row TAG] [--holdouts H.json --ct KEY]\n"); return 2;
+        fprintf(stderr, "usage: ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR] [--row TAG] [--holdouts H.json --ct KEY] [--fuse mean|rank[,..] [--weights a,b,..]]\n"); return 2;
     }
     ssurf S; if (ssurf_load(&S, surf)) return 1;
     { const double su = opt_atof("--surf-um", sopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* the mesh voxel size when its meta has none */
@@ -1091,6 +1113,66 @@ int cmd_ink_score(int argc, char **argv) {
         fflush(stdout);
         free(mp);
     }
+    const char *fu = sopt(argc, argv, "--fuse", nullptr);
+    if (fu && !rc) {
+        const int dm = strstr(fu, "mean") != nullptr, dr = strstr(fu, "rank") != nullptr;
+        if (!dm && !dr) { fprintf(stderr, "ink-score: --fuse mean|rank[,..]\n"); rc = 2; goto fdone; }
+        int nm = 0; const char *nmv[16], *pth[16];
+        for (int a = 2; a + 1 < argc && nm < 16; a++) if (!strcmp(argv[a], opt_n("--map"))) { const char *e = strchr(argv[a + 1], '='); nmv[nm] = argv[a + 1]; pth[nm] = e ? e + 1 : argv[a + 1]; nm++; }
+        double wt[16]; for (int k = 0; k < nm; k++) wt[k] = 1;
+        const char *ws = sopt(argc, argv, "--weights", nullptr);
+        if (ws) { int k = 0; const char *p = ws; while (k < nm && *p) { char *e; wt[k++] = strtod(p, &e); if (e == p) break; p = *e == ',' ? e + 1 : e; }
+                  if (k != nm) { fprintf(stderr, "ink-score: --weights needs %d values\n", nm); rc = 2; goto fdone; } }
+        double ws_ = 0; for (int k = 0; k < nm; k++) ws_ += wt[k];
+        if (nm < 2 || !(ws_ > 0)) { fprintf(stderr, "ink-score: --fuse needs >= 2 maps and positive weights\n"); rc = 2; goto fdone; }
+        /* the label pixels every map covers: sample each map as the per-map loop does */
+        float *V = malloc((size_t)nm * np * sizeof *V); uint8_t *ok = malloc(np); memset(ok, 1, np);
+        const int foot = F >= 1.5 ? (int)lround(F) : 0;
+        for (int k = 0; k < nm && !rc; k++) {
+            int mw, mh; uint8_t *mp = img_read_u8(pth[k], &mw, &mh); if (!mp) { fprintf(stderr, "ink-score: cannot read %s\n", pth[k]); rc = 1; break; }
+            for (int64_t r = 0; r < LL.H; r++) for (int64_t c = 0; c < LL.W; c++) {
+                const size_t i = (size_t)r * LL.W + c; if (!ok[i]) continue;
+                if (M && M[i] < 128) { ok[i] = 0; continue; }
+                const double cx = (c + 0.5) * F - 0.5, cy = (r + 0.5) * F - 0.5; double P[3], N[3];
+                if (k == 0) { if (ssurf_pn(&S, cx * S.scale, cy * S.scale, P, N)) { ok[i] = 0; continue; }
+                    if (hof) { int in = 0; for (int e = 0; e < hc.nexcl && !in; e++) { in = 1; for (int d = 0; d < 3; d++) in &= P[d] >= hc.excl[e][d] && P[d] < hc.excl[e][d] + hc.excl[e][3 + d]; } if (!in) { ok[i] = 0; continue; } } }
+                double v;
+                if (foot) { const int x0 = (int)floor(c * F), y0 = (int)floor(r * F); double s = 0; int n = 0;
+                    for (int y = y0; y < y0 + foot; y++) for (int x = x0; x < x0 + foot; x++) if (x >= 0 && y >= 0 && x < mw && y < mh) { s += mp[(size_t)y * mw + x]; n++; }
+                    if (!n) { ok[i] = 0; continue; } v = s / n;
+                } else {
+                    if (cx < 0 || cy < 0 || cx > mw - 1 || cy > mh - 1) { ok[i] = 0; continue; }
+                    const int x0 = (int)cx, y0 = (int)cy, x1 = x0 + 1 < mw ? x0 + 1 : x0, y1 = y0 + 1 < mh ? y0 + 1 : y0; const double fx = cx - x0, fy = cy - y0;
+                    v = (1 - fy) * ((1 - fx) * mp[(size_t)y0 * mw + x0] + fx * mp[(size_t)y0 * mw + x1]) + fy * ((1 - fx) * mp[(size_t)y1 * mw + x0] + fx * mp[(size_t)y1 * mw + x1]);
+                }
+                V[(size_t)k * np + i] = (float)lround(v);   /* the byte the per-map rows score */
+            }
+            free(mp);
+        }
+        size_t n = 0; for (size_t i = 0; i < np; i++) n += ok[i];
+        if (!rc && n) {
+            float *C = malloc((size_t)nm * n * sizeof *C); uint8_t *Ik = malloc(n); fpx *Q = malloc(n * sizeof *Q);
+            for (size_t i = 0, j = 0; i < np; i++) if (ok[i]) { Ik[j] = L[i] >= 128; for (int k = 0; k < nm; k++) C[(size_t)k * n + j] = V[(size_t)k * np + i]; j++; }
+            uint64_t ti = 0; for (size_t j = 0; j < n; j++) ti += Ik[j];
+            for (int k = 0; k < nm; k++) {
+                for (size_t j = 0; j < n; j++) Q[j] = (fpx){C[(size_t)k * n + j], Ik[j]};
+                const double a = auc_float(Q, n); char nb[300]; const char *e = strchr(nmv[k], '='); snprintf(nb, sizeof nb, "%.*s@c", e ? (int)(e - nmv[k]) : (int)strlen(nmv[k]), nmv[k]);
+                fprintf(stderr, "ink-score: %s: %zu common px, AUC %.4f\n", nb, n, a);
+                if (row) printf("%s\t%s\t%zu\t%.4f\t0\t0\t0\t0\t0\t%.4f\n", row, nb, n, (double)ti / n, a);
+            }
+            for (int mode = 0; mode < 2; mode++) {
+                if (!(mode ? dr : dm)) continue;
+                if (mode) for (int k = 0; k < nm; k++) rank_norm(C + (size_t)k * n, n);
+                for (size_t j = 0; j < n; j++) { double s = 0; for (int k = 0; k < nm; k++) s += wt[k] * C[(size_t)k * n + j]; Q[j] = (fpx){(float)(s / ws_), Ik[j]}; }
+                const double a = auc_float(Q, n); const char *fn = mode ? "fuse-rank" : "fuse-mean";
+                fprintf(stderr, "ink-score: %s: %zu common px, AUC %.4f\n", fn, n, a);
+                if (row) printf("%s\t%s\t%zu\t%.4f\t0\t0\t0\t0\t0\t%.4f\n", row, fn, n, (double)ti / n, a);
+            }
+            fflush(stdout); free(C); free(Ik); free(Q);
+        } else if (!rc) fprintf(stderr, "ink-score: --fuse: no label pixel covered by every map\n");
+        free(V); free(ok);
+    }
+fdone:
     free(L); free(M); lsrc_close(&LL); if (msk) lsrc_close(&LM); ssurf_free(&S);
     return rc;
 }

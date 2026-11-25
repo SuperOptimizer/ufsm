@@ -333,7 +333,16 @@ static wl_dict *load_pth(const char *path, const char *sub) {
                 if (v->t == PV_STR) m->str = strdup(v->s); else { m->isnum = 1; m->num = v->t == PV_FLOAT ? v->f : (double)v->i; }
             }
         }
-        if (sub) { for (size_t i = 0; i < top->n; i++) if (pv_s(top->keys[i]) && !strcmp(top->keys[i]->s, sub)) sd = top->items[i]; }
+        if (sub) {   /* "a.b.c": nested dicts (dinovol-refactor checkpoints keep the teacher at method.state.teacher) */
+            const pv *cur = top; char part[256]; const char *p = sub;
+            while (cur && cur->t == PV_DICT) {
+                const char *dot = strchr(p, '.'); const size_t l = dot ? (size_t)(dot - p) : strlen(p);
+                snprintf(part, sizeof part, "%.*s", (int)l, p); const pv *nx = nullptr;
+                for (size_t i = 0; i < cur->n; i++) if (pv_s(cur->keys[i]) && !strcmp(cur->keys[i]->s, part)) nx = cur->items[i];
+                cur = nx; if (!dot) break; p = dot + 1;
+            }
+            sd = cur;
+        }
         else if (is_tensor_dict(top)) sd = top;
         else {
             static const char *pref[] = {"ema_model", "model", "state_dict"};

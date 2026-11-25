@@ -9,8 +9,19 @@ backbone.forward_features(view_kind="global") with embed skips, x_norm_patchtoke
 sample_grid_points, fpn_norm, readout) at the given voxel-index points (+0.5 = continuous centers)."""
 import os, pathlib, sys, types
 
-DATA = pathlib.Path(os.environ.get("UFSM_DINOVOL", "~/ufsm-data/dinovol")).expanduser()
-CKPT = DATA / "teacher_step_640000.pt"
+def _data():   # UFSM_DINOVOL, else the first existing default (the desk's shared copy since 2026-11-24: ~/ufsm-data/dinovol was cleaned)
+    if os.environ.get("UFSM_DINOVOL"):
+        return pathlib.Path(os.environ["UFSM_DINOVOL"]).expanduser()
+    for d in ["~/ufsm-data/dinovol", "/vesuvius/ufsm/dinovol/ref"]:
+        if pathlib.Path(d).expanduser().exists():
+            return pathlib.Path(d).expanduser()
+    return pathlib.Path("~/ufsm-data/dinovol").expanduser()
+
+
+DATA = _data()
+CKPT = pathlib.Path(os.environ.get("UFSM_DINOVOL_CKPT", str(DATA / os.environ.get("UFSM_DINOVOL_CKPT_NAME", "teacher_step_640000.pt")))).expanduser()
+# UFSM_DINOVOL_CKPT: another checkpoint of the family, e.g. HF scrollprize/g256_compassrope_qknorm_step_781000 (a dinovol-refactor
+# training checkpoint: config["backbone"], teacher at method.state.teacher; Compass RoPE + QK-norm, global crops 256)
 
 
 def setup():
@@ -28,8 +39,11 @@ def build():
     setup()
     from dinovol_2.model.backbone import build_backbone
     from dinovol_2.model.model import PointDenseHead
-    ck = torch.load(str(CKPT), map_location="cpu", weights_only=True)
-    cfg = ck["config"]["model"]; ck = ck["teacher"]
+    ck = torch.load(str(CKPT), map_location="cpu", weights_only=False, mmap=True)
+    if "teacher" in ck:
+        cfg = ck["config"]["model"]; ck = ck["teacher"]
+    else:
+        cfg = ck["config"]["backbone"]; ck = ck["method"]["state"]["teacher"]
     bb = build_backbone(cfg)
     sd = {k[len("backbone."):]: v for k, v in ck.items() if isinstance(k, str) and k.startswith("backbone.")}
     bb.load_state_dict(sd, strict=True)

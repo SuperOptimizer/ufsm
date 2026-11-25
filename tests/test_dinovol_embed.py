@@ -11,7 +11,7 @@ import dinovol_ref as R
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 UFSM = ROOT / "build/ufsm"
-CT_ROOT = pathlib.Path(os.environ.get("UFSM_DINOVOL_CT", "~/ufsm-data/fitkit/p4box/ct")).expanduser()
+CT_ROOT = pathlib.Path(os.environ.get("UFSM_DINOVOL_CT", next((str(q) for q in [pathlib.Path("~/ufsm-data/fitkit/p4box/ct").expanduser(), pathlib.Path("/vesuvius/ufsm/v2/ct")] if q.exists()), "~/ufsm-data/fitkit/p4box/ct"))).expanduser()
 CT_KEY = os.environ.get("UFSM_DINOVOL_KEY", "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr/2")
 T, MARGIN, RAMP, DS = 128, 16, 16, 2
 CENTER, SCALE, HI = 84.0, 31.5, 200.0
@@ -78,7 +78,7 @@ def main():
         skip("torch / numpy missing")
     for p in [R.CKPT, R.DATA / "src/dinovol_2/eval/embed_volume.py", R.DATA / "pylib/timm", UFSM, CT_ROOT / CT_KEY]:
         if not pathlib.Path(p).exists():
-            skip(f"{p} missing")
+            skip(f"{p} missing (set UFSM_DINOVOL / UFSM_DINOVOL_CT; data dir {R.DATA})")
     cv = os.environ.get("CUDA_VISIBLE_DEVICES")   # the runner's grant (empty: none); nvidia-smi -L ignores it
     if (cv is not None and cv.strip() in ("", "-1")) or (cv is None and "GPU" not in subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout):
         skip("no GPU")

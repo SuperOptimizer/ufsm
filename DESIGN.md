@@ -6,6 +6,69 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## dinovol dense features tell adjacent sheets apart better than try9's phase in the 50-100 um bin (2026-11-24, dinovol)
+
+- `ufsm merge-flag --sheet-pairs LIST --out PREFIX`: matched-distance triplets on merge-flag --eval's GT (rays from the axis, code-run
+  crossings, wrap = (code - 1) / 18 mod 14): anchor a, adjacent-wrap b along the ray (gap), same-wrap s on the ray rotated by the arc
+  = gap at a's radius (within half a gap radially). try9's score = -|phase turns| unwrapped along the straight segment (what the fitter /
+  merge-flag read). <= 1200 triplets per box, a quarter per gap bin. `dinovol-probe pfeats` (features at the points, tiles of the
+  training crop on a lattice) + `triplets` (accuracy P(cos(a, s) > cos(a, b)) and pair AUC by bin). Only point coordinates went to the pod.
+- t9-* boxes of /vesuvius/ufsm/mergeflag/evlist.tsv (try9-family pab-base fields; 1667 25, paris4 4, paris4j 28), native level 2 (9.6 um).
+  Triplet accuracy (pair AUCs in the same order):
+
+  | scroll | feature | all | 0-50 | 50-100 | 100-200 | 200+ um |
+  |---|---|---|---|---|---|---|
+  | 1667 (27.2k) | 8um dense-64 | 0.979 | 0.926 | 0.988 | 0.994 | 0.989 |
+  | | g256 dense-64 | 0.979 | 0.921 | 0.989 | 0.994 | 0.989 |
+  | | 8um tokens | 0.971 | 0.873 | 0.990 | 0.995 | 0.991 |
+  | | try9 turns | 0.940 | 0.849 | 0.930 | 0.966 | 0.981 |
+  | paris4j (27.3k) | 8um dense-64 | 0.943 | 0.672 | 0.965 | 0.990 | 0.982 |
+  | | g256 dense-64 | 0.946 | 0.707 | 0.959 | 0.989 | 0.984 |
+  | | try9 turns | 0.840 | 0.626 | 0.811 | 0.887 | 0.900 |
+  | paris4 (3.1k) | 8um dense-64 | 0.846 | 0.983 | 0.977 | 0.826 | 0.790 |
+  | | g256 dense-64 | 0.864 | 0.983 | 0.977 | 0.847 | 0.814 |
+  | | try9 turns | 0.775 | 0.933 | 0.869 | 0.755 | 0.725 |
+
+  The dinovol CT data included 1667 and Paris 4 (self-supervised; no ink / wrap labels of these boxes). Ink-32 ~= tokens < dense.
+  Next: cos(dense) across each GT interval as a merge-flag feature (its --eval AUC), then the fitter / crushed MANB.
+
+## Upstream dinovol on coarse ink: newest checkpoint g256 ported, frozen-feature linear probe 0.76 dev vs reader3 0.87 (2026-11-24, dinovol)
+
+- Newest scrollprize dinovol (HF listing + collections, 11-24): `g256_compassrope_qknorm_step_781000` (10-29) = the 8um_ps192 run continued
+  640k -> 781k (same 480 x 10, heads of 48, conv-stem embed, PointDenseHead ink-32), with Compass RoPE, QK-norm (RMSNorm per head, eps 1e-6,
+  before RoPE) and global crops 256. Data of both (and of dinovol_ps8_9.6um): 39 scans at 7.9-9.6 um INCLUDING PHerc0841 / PHerc1447 CT, plus
+  the contrastive ink loss over open-data `ink-labels` segments (0841: 3, 0139: 8, 0814: 1, 1667, Paris4, ...). User rule: rows of these
+  models may be scored on 1447 flagged "1447 CT seen in upstream SSL", never on 0841. The 2.4 um v2 backbones (paris4_352500, ps6) are clean
+  (11 / 18 scans at 2.4 / 1.1 um, no 0841 / 1447) but differ (864 x 24, heads of 54, q/v bias, SwiGLU + LN, 8^3 conv patch): not ported.
+- Port (src/dinovol_net.c): Compass RoPE is mixed RoPE with frequencies (C + S) (r dir(azimuth, polar)) (C / S the orthonormal 24-pair DFT):
+  converted once at load to mix_frequencies, dv_rope unchanged; `dv_qknorm` (warp per token / head); wl_load "a.b.c" nested dicts (the raw
+  training checkpoint keeps the teacher at method.state.teacher: no conversion step); dv_train_tile 256. Parity (tests/test_dinovol.py with
+  UFSM_DINOVOL_CKPT, official dinovol-refactor forward, fp32 CPU, Paris4 CT on the pod): g256 T128 / T256 token cos min 0.99999, ink-32 cos
+  min 0.99998, skips / FPN mean >= 0.999999; 8um unchanged (token cos min 0.999998). 256^3 forward 870 ms on the RTX PRO 6000.
+- `ufsm dinovol-probe stats|feats|fit|apply` (src/dvprobe.c): features at the surface points of ink-devcrops crops (tokens trilinear between
+  token centres 8 k + 3.5, plus the dense-64 / ink-32 head at the point; tiles of the training crop, each point from its most central tile,
+  dinovol-embed's volume-wide robust normalisation), a weighted logistic probe (soft label = 4x4 or 8x8 cell ink share, weight = supervised
+  px; Newton + ridge 1e-3 on standardised features), maps on the 256 px canvas scored with devscore's ink-score call. Training crops:
+  `ink-devcrops --exclude` (new) on the dev set's segments outside every holdouts-dev box, <= 150 per scroll (426 crops: 0139 150, 0172 150,
+  0343 90, rest 36); no 0841 / 1447. tests/test_dvprobe.c (AUC cases, fit recovers a known logistic model), test_ink_devcrops exclude case.
+- Dev set (99 crops, dev AUC = mean of group means as devscore.sh):
+
+  | row | dev AUC | 0139 | 0172 | 0343 | small | train AUC |
+  |---|---|---|---|---|---|---|
+  | 8um tok | 0.760 | 0.694 | 0.780 | 0.814 | 0.751 | 0.877 |
+  | 8um ink-32 | 0.652 | 0.744 | 0.747 | 0.640 | 0.479 | 0.729 |
+  | 8um tok+dense+ink | 0.753 | 0.681 | 0.781 | 0.806 | 0.742 | 0.880 |
+  | g256 tok | 0.764 | 0.731 | 0.747 | 0.893 | 0.685 | 0.883 |
+  | g256 ink-32 | 0.763 | 0.769 | 0.748 | 0.919 | 0.614 | 0.716 |
+  | g256 tok+dense+ink | 0.762 | 0.734 | 0.748 | 0.891 | 0.675 | 0.886 |
+  | reader3 | 0.867 | 0.847 | 0.766 | 0.992 | 0.861 | |
+  | E0-avg vox | 0.845 | 0.788 | 0.807 | 0.935 | 0.851 | |
+  | E1-avg vox | 0.831 | 0.791 | 0.841 | 0.884 | 0.807 | |
+
+  0139 / 0814 ("small") crops may overlap the upstream ink-labels segments: 0343 / 0172 are the models' clean groups. Frozen dinovol
+  features carry ink signal (g256's ink-32 alone 0.92 on 0343) but a linear probe stays 0.08-0.10 below reader3 / E0 overall; g256 ~= 8um
+  overall (better on 0343 / 0139, worse on 0172 / small). Logs / probes: /vesuvius/ufsm/dinovol/podrun (pod run 11-24, beside an E-run).
+
 ## Trainer start-up: 1876 s -> 99 s cold, 12 s warm, peak RSS 8 GB warm (R1E's 57 ink sources; 2026-11-24, perf)
 
 R1E, R1E-D and R11d each spent ~30 min before step 10 (R1E: `startup: 1875.7 s`: sources 77.0 s, sampler start 1796.6 s), and their CPU

@@ -6,14 +6,16 @@ torch, the checkpoint, the official sources, the CT, the GPU or build/ufsm are m
 CT: a 9.6 um Paris 4 crop (UFSM_DINOVOL_CT root, UFSM_DINOVOL_KEY, default the fitkit p4box level 2). Tiles 128 (and 192 with
 UFSM_DINOVOL_FULL=1). Bounds (fp16 vs fp32; as the code checks them, 2026-11-14 doc fix: the 2026-10-21 text said 0.999 / 0.99 and
 0.995 / 0.95, the code has been tighter since): token cosine >= 0.99999 mean / 0.9999 min; CNN skips and the FPN grid >= 0.9999 mean;
-dense / ink cosine >= 0.9999 mean / 0.999 min."""
+dense / ink cosine >= 0.9999 mean / 0.999 min.
+UFSM_DINOVOL_CKPT: another checkpoint of the family (2026-11-24: g256_compassrope_qknorm_step_781000, Compass RoPE converted to mixed
+frequencies at load + QK-norm; suite test_dinovol_g256, UFSM_DINOVOL_FULL_TILE 256 for its training crop)."""
 import os, pathlib, subprocess, sys, tempfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import dinovol_ref as R
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 UFSM = ROOT / "build/ufsm"
-CT_ROOT = pathlib.Path(os.environ.get("UFSM_DINOVOL_CT", "~/ufsm-data/fitkit/p4box/ct")).expanduser()
+CT_ROOT = os.environ.get("UFSM_DINOVOL_CT", next((str(q) for q in [pathlib.Path("~/ufsm-data/fitkit/p4box/ct").expanduser(), pathlib.Path("/vesuvius/ufsm/v2/ct")] if q.exists()), "~/ufsm-data/fitkit/p4box/ct"))   # a directory or an http(s) volcomp root
 CT_KEY = os.environ.get("UFSM_DINOVOL_KEY", "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr/2")
 
 
@@ -32,15 +34,15 @@ def main():
         import numpy as np, torch
     except ImportError:
         skip("torch / numpy missing")
-    for p in [R.CKPT, R.DATA / "src/dinovol_2/model/dinov2_eva.py", R.DATA / "pylib/timm", UFSM, CT_ROOT / CT_KEY]:
+    for p in [R.CKPT, R.DATA / "src/dinovol_2/model/dinov2_eva.py", R.DATA / "pylib/timm", UFSM] + ([] if CT_ROOT.startswith("http") else [pathlib.Path(CT_ROOT) / CT_KEY]):
         if not pathlib.Path(p).exists():
-            skip(f"{p} missing")
+            skip(f"{p} missing (set UFSM_DINOVOL / UFSM_DINOVOL_CT; data dir {R.DATA})")
     cv = os.environ.get("CUDA_VISIBLE_DEVICES")   # the runner's grant (empty: none); nvidia-smi -L ignores it
     if (cv is not None and cv.strip() in ("", "-1")) or (cv is None and "GPU" not in subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout):
         skip("no GPU")
     torch.set_num_threads(int(os.environ.get("UFSM_TEST_TORCH_THREADS", "8")))
     bb, head = R.build()
-    tiles = [128] + ([192] if os.environ.get("UFSM_DINOVOL_FULL") == "1" else [])
+    tiles = [128] + ([int(os.environ.get("UFSM_DINOVOL_FULL_TILE", "192"))] if os.environ.get("UFSM_DINOVOL_FULL") == "1" else [])
     rng = np.random.default_rng(1)
     center, scale, hi = 84.0, 31.5, 200.0
     fails = 0

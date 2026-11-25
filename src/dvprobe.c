@@ -102,12 +102,12 @@ static int scan_stats(const char *dir, const char *key, z3 *ct, int nthreads, fl
 static int cmd_feats(int argc, char **argv) {
     const char *ck = opt(argc, argv, "--ckpt", nullptr), *root = opt(argc, argv, "--root", "/vesuvius/ufsm/v2/ct"), *cdir = opt(argc, argv, "--crops", nullptr),
                *list = opt(argc, argv, "--list", nullptr), *out = opt(argc, argv, "--out", nullptr), *cache = opt(argc, argv, "--cache", nullptr);
-    const int T = opt_atoi("--tile", opt(argc, argv, "--tile", "192")), M = opt_atoi("--margin", opt(argc, argv, "--margin", "32")),
+    int T = opt_atoi("--tile", opt(argc, argv, "--tile", "0")); const int M = opt_atoi("--margin", opt(argc, argv, "--margin", "32")),
               st = opt_atoi("--px-stride", opt(argc, argv, "--px-stride", "4")), onlysup = opt_atoi("--sup-only", opt(argc, argv, "--sup-only", "1")),
               maxc = opt_atoi("--max-crops", opt(argc, argv, "--max-crops", "0"));
     const int nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 6);
-    if (!ck || !cdir || !out || T % 16 || M < 0 || 2 * M >= T || st < 1) {
-        fprintf(stderr, "usage: ufsm dinovol-probe feats --ckpt PT --crops DIR [--list crops.tsv] --out F.dvf [--root CTROOT] [--tile 192] [--margin 32]\n"
+    if (!ck || !cdir || !out || T % 16 || M < 0 || (T && 2 * M >= T) || st < 1) {
+        fprintf(stderr, "usage: ufsm dinovol-probe feats --ckpt PT --crops DIR [--list crops.tsv] --out F.dvf [--root CTROOT] [--tile T (0: the model's training crop)] [--margin 32]\n"
                         "         [--px-stride 4] [--sup-only 1] [--max-crops N] [--stats-dir DIR] [--gpu 0] [--gpu-mem 7] [--threads 6] [--cache DIR]\n");
         return 2; }
     char lp[1400]; if (!list) { snprintf(lp, sizeof lp, "%s/crops.tsv", cdir); list = lp; }
@@ -122,6 +122,9 @@ static int cmd_feats(int argc, char **argv) {
     xnet_set_budget((size_t)(opt_atof("--gpu-mem", opt(argc, argv, "--gpu-mem", "7")) * 1e9));
     store_global_init();
     dv_net *net = dv_load(ck); if (!net) return 1;
+    if (!T) T = dv_train_tile(net);
+    if (2 * M >= T) { fprintf(stderr, "dinovol-probe: margin %d too large for tile %d\n", M, T); return 2; }
+    fprintf(stderr, "dinovol-probe: tile %d, margin %d\n", T, M);
     int nd = 0, ni = 0; dv_dense_dims(net, &nd, &ni); const int E = dv_embed_dim(net), F = E + nd + ni, g = T / 8;
     FILE *fo = fopen(out, "wb"); if (!fo) { fprintf(stderr, "dinovol-probe: cannot write %s\n", out); return 1; }
     dvf_head H = {{'D', 'V', 'P', 'F', '0', '0', '0', '1'}, F, E, nd, ni, nc, st, 0, 0};
@@ -356,6 +359,117 @@ static int cmd_apply(int argc, char **argv) {
     free(L); free(has); free(map); free(s); free(mu); free(sd); free(w); dvf_free(&D); return rc;
 }
 
+/* pfeats: the same features at arbitrary points (float32 [n][3] z y x, native voxels of ARRAY) in the file's order: a lattice of tiles
+   (stride tile - 2 margin, origins clamped into the volume); each point from the tile whose interior cell holds it. Rows keep crop 0,
+   label / weight 0; the dvf's single "crop" name is the array key. (merge-flag --sheet-pairs' points; the sheet-identity check) */
+typedef struct { int64_t cell; int i; } pf_ent;
+static int pf_cmp(const void *a, const void *b) { const int64_t x = ((const pf_ent *)a)->cell, y = ((const pf_ent *)b)->cell; return x < y ? -1 : x > y ? 1 : ((const pf_ent *)a)->i - ((const pf_ent *)b)->i; }
+static int cmd_pfeats(int argc, char **argv) {
+    const char *ck = opt(argc, argv, "--ckpt", nullptr), *root = opt(argc, argv, "--root", "/vesuvius/ufsm/v2/ct"), *key = opt(argc, argv, "--key", nullptr),
+               *pts = opt(argc, argv, "--points", nullptr), *out = opt(argc, argv, "--out", nullptr), *cache = opt(argc, argv, "--cache", nullptr), *sdir = opt(argc, argv, "--stats-dir", ".");
+    int T = opt_atoi("--tile", opt(argc, argv, "--tile", "0")); const int M = opt_atoi("--margin", opt(argc, argv, "--margin", "32"));
+    const int nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 6);
+    if (!ck || !key || !pts || !out || T % 16 || M < 0) {
+        fprintf(stderr, "usage: ufsm dinovol-probe pfeats --ckpt PT --root CTROOT --key ARRAY --points P.f32 --out F.dvf [--tile T] [--margin 32] [--stats-dir DIR]\n"
+                        "         [--gpu 0] [--gpu-mem 7] [--threads 6] [--cache DIR]\n"); return 2; }
+    FILE *f = fopen(pts, "rb"); if (!f) { fprintf(stderr, "dinovol-probe: cannot read %s\n", pts); return 1; }
+    fseek(f, 0, SEEK_END); const long nb = ftell(f); fseek(f, 0, SEEK_SET); const int n = (int)(nb / 12); float *P = malloc((size_t)n * 12 + 12);
+    if (fread(P, 12, (size_t)n, f) != (size_t)n) { fclose(f); return 1; } fclose(f);
+    if (xnet_init(opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")))) return 1;
+    xnet_set_budget((size_t)(opt_atof("--gpu-mem", opt(argc, argv, "--gpu-mem", "7")) * 1e9));
+    store_global_init(); store *s = store_open(root); z3 *ct = s ? z3_open(s, key, cache) : nullptr; float S[3];
+    if (!ct || scan_stats(sdir, key, ct, nthreads, S)) { fprintf(stderr, "dinovol-probe: cannot open / normalise %s %s\n", root, key); return 1; }
+    dv_net *net = dv_load(ck); if (!net) return 1;
+    if (!T) T = dv_train_tile(net);
+    if (2 * M >= T) { fprintf(stderr, "dinovol-probe: margin %d too large for tile %d\n", M, T); return 2; }
+    int nd = 0, ni = 0; dv_dense_dims(net, &nd, &ni); const int E = dv_embed_dim(net), F = E + nd + ni, g = T / 8, SS = T - 2 * M;
+    const z3_meta *zm = z3_meta_of(ct); int64_t nc[3]; for (int d = 0; d < 3; d++) nc[d] = zm->shape[d] / SS + 2;
+    pf_ent *ent = malloc(sizeof(pf_ent) * (size_t)n);
+    for (int i = 0; i < n; i++) { int64_t c[3]; for (int d = 0; d < 3; d++) { c[d] = (int64_t)floor(P[3 * i + d] / SS); if (c[d] < 0) c[d] = 0; if (c[d] >= nc[d]) c[d] = nc[d] - 1; }
+        ent[i] = (pf_ent){(c[0] * nc[1] + c[1]) * nc[2] + c[2], i}; }
+    qsort(ent, (size_t)n, sizeof *ent, pf_cmp);
+    uint16_t *rows = malloc((size_t)n * F * 2); uint8_t *u8 = malloc((size_t)T * T * T), *u8d = xmalloc_dev((size_t)T * T * T); uint16_t *tok = malloc((size_t)g * g * g * E * 2);
+    const int NP = 65536; float *pp = malloc((size_t)NP * 12), *ppd = xmalloc_dev((size_t)NP * 12), *acc = xmalloc_dev((size_t)NP * (nd + ni) * 4), *acch = malloc((size_t)NP * (nd + ni) * 4);
+    int rc = 0, ntile = 0; const double t0 = pnow();
+    for (int a = 0; a < n && !rc;) {
+        int b = a; while (b < n && ent[b].cell == ent[a].cell) b++;
+        const int64_t cell = ent[a].cell, c3[3] = {cell / (nc[1] * nc[2]), cell / nc[2] % nc[1], cell % nc[2]}; int64_t o[3];
+        for (int d = 0; d < 3; d++) { o[d] = c3[d] * SS - M; if (o[d] > zm->shape[d] - T) o[d] = zm->shape[d] - T; if (o[d] < 0) o[d] = 0; }
+        const int64_t n3[3] = {T, T, T};
+        if (z3_read(ct, o, n3, u8, nthreads)) { fprintf(stderr, "dinovol-probe: CT read: %s\n", z3_error()); rc = 1; break; }
+        xh2d(u8d, u8, (size_t)T * T * T);
+        if (dv_forward(net, u8d, T, S[0], S[1], S[2])) { rc = 1; break; }
+        xd2h(tok, dv_tokens(net), (size_t)g * g * g * E * 2); ntile++;
+        for (int c0 = a; c0 < b && !rc; c0 += NP) {
+            const int m = b - c0 < NP ? b - c0 : NP;
+            for (int q = 0; q < m; q++) for (int d = 0; d < 3; d++) pp[3 * q + d] = P[3 * ent[c0 + q].i + d] - (float)o[d];
+            xh2d(ppd, pp, (size_t)m * 12);
+            if (dv_net_points(net, ppd, nullptr, nullptr, m, acc)) { rc = 1; break; }
+            xd2h(acch, acc, (size_t)m * (nd + ni) * 4);
+            for (int q = 0; q < m; q++) {
+                uint16_t *rw = rows + (size_t)ent[c0 + q].i * F; float w8[8]; size_t ix[8]; int ci[3]; float fr[3];
+                for (int d = 0; d < 3; d++) { double u = (pp[3 * q + d] - 3.5) / 8; if (u < 0) u = 0; if (u > g - 1) u = g - 1; ci[d] = (int)u; if (ci[d] > g - 2) ci[d] = g - 2; fr[d] = (float)(u - ci[d]); }
+                for (int k = 0; k < 8; k++) { const int dz = k >> 2, dy = (k >> 1) & 1, dx = k & 1;
+                    w8[k] = (dz ? fr[0] : 1 - fr[0]) * (dy ? fr[1] : 1 - fr[1]) * (dx ? fr[2] : 1 - fr[2]); ix[k] = (((size_t)(ci[0] + dz) * g + ci[1] + dy) * g + ci[2] + dx) * E; }
+                for (int e = 0; e < E; e++) { float v = 0; for (int k = 0; k < 8; k++) v += w8[k] * h2f(tok[ix[k] + e]); rw[e] = f2h(v); }
+                for (int e = 0; e < nd + ni; e++) rw[E + e] = f2h(acch[(size_t)q * (nd + ni) + e]);
+            }
+        }
+        if (ntile % 100 == 0) fprintf(stderr, "dinovol-probe pfeats: %d / %d points, %d tiles, %.0f s\n", b, n, ntile, pnow() - t0);
+        a = b;
+    }
+    FILE *fo = rc ? nullptr : fopen(out, "wb");
+    if (!rc && fo) { dvf_head H = {{'D', 'V', 'P', 'F', '0', '0', '0', '1'}, F, E, nd, ni, 1, 0, 0, 0}; char nm[DVF_NAME] = {0}; snprintf(nm, sizeof nm, "%s", key);
+        fwrite(&H, sizeof H, 1, fo); fwrite(nm, DVF_NAME, 1, fo);
+        for (int i = 0; i < n; i++) { const dvf_row R = {0, 0, 0, 0.f, 0.f}; fwrite(&R, sizeof R, 1, fo); fwrite(rows + (size_t)i * F, 2, (size_t)F, fo); }
+        if (fclose(fo)) rc = 1; }
+    else if (!rc) { fprintf(stderr, "dinovol-probe: cannot write %s\n", out); rc = 1; }
+    fprintf(stderr, "dinovol-probe pfeats: %d points, %d tiles, %.0f s -> %s\n", n, ntile, pnow() - t0, out);
+    free(P); free(ent); free(rows); free(u8); xfree_dev(u8d); free(tok); free(pp); xfree_dev(ppd); xfree_dev(acc); free(acch); z3_close(ct); dv_free(net);
+    return rc;
+}
+
+/* triplets: sheet identity from a pfeats file of merge-flag --sheet-pairs points (rows a, s, b per triplet) and its tsv: per feature block
+   (tok, dense, ink: cosine) the triplet accuracy P(cos(a, s) > cos(a, b)) and the pair AUC (same-sheet pairs' cosines vs adjacent pairs'),
+   pooled and by GT gap bin; try9 beside it from the tsv (score -|turns|). --scroll S: the tsv rows of that scroll (the pts file's order). */
+static double cosf16(const float *a, const float *b, int n) { double ab = 0, aa = 0, bb = 0; for (int k = 0; k < n; k++) { ab += (double)a[k] * b[k]; aa += (double)a[k] * a[k]; bb += (double)b[k] * b[k]; } return ab / (sqrt(aa * bb) + 1e-30); }
+static double pair_auc(const double *pos, const double *neg, long n) {   /* P(pos > neg) over all pos x neg, ties 0.5 (rank based) */
+    auc_it *v = malloc(sizeof *v * 2 * n); for (long i = 0; i < n; i++) { v[2 * i] = (auc_it){pos[i], 1, 0}; v[2 * i + 1] = (auc_it){neg[i], 0, 1}; }
+    qsort(v, 2 * n, sizeof *v, auc_cmp); double A = 0, q = 0, P = 0, Q = 0;
+    for (long i = 0; i < 2 * n;) { long j = i; double dp = 0, dq = 0; while (j < 2 * n && v[j].s == v[i].s) { dp += v[j].p; dq += v[j].q; j++; } A += dp * (q + 0.5 * dq); q += dq; P += dp; Q += dq; i = j; }
+    free(v); return P > 0 && Q > 0 ? A / (P * Q) : NAN;
+}
+static int cmd_triplets(int argc, char **argv) {
+    const char *in = argc > 3 ? argv[3] : nullptr, *tsv = opt(argc, argv, "--pairs", nullptr), *sc = opt(argc, argv, "--scroll", nullptr), *tag = opt(argc, argv, "--tag", "");
+    if (!in || in[0] == '-' || !tsv || !sc) { fprintf(stderr, "usage: ufsm dinovol-probe triplets F.dvf --pairs PAIRS.tsv --scroll S [--tag T]\n"); return 2; }
+    dvf D; if (dvf_read(&D, in, "tok,dense,ink")) return 1;
+    FILE *f = fopen(tsv, "r"); if (!f) return 1; char ln[2048]; long n = 0, cap = 1024; float *gap = malloc(sizeof(float) * cap), *ts = malloc(sizeof(float) * cap), *tb = malloc(sizeof(float) * cap);
+    while (fgets(ln, sizeof ln, f)) { if (ln[0] == '#') continue; char box[64], s2[32]; float gg, ds, db, a1, a2;
+        if (sscanf(ln, "%63s %31s %f %f %f %f %f", box, s2, &gg, &ds, &db, &a1, &a2) != 7 || strcmp(s2, sc)) continue;
+        if (n == cap) { cap *= 2; gap = realloc(gap, sizeof(float) * cap); ts = realloc(ts, sizeof(float) * cap); tb = realloc(tb, sizeof(float) * cap); }
+        gap[n] = gg; ts[n] = a1; tb[n] = a2; n++; }
+    fclose(f);
+    if (D.n != 3 * n) { fprintf(stderr, "dinovol-probe triplets: %ld feature rows for %ld %s triplets\n", D.n, n, sc); return 1; }
+    const int blk[4][2] = {{0, D.H.E}, {D.H.E, D.H.E + D.H.nd}, {D.H.E + D.H.nd, D.H.F}, {-1, -1}}; const char *bn[4] = {"tok", "dense", "ink", "try9"};
+    const double ge[5] = {0, 50, 100, 200, 1e30}; double *ps = malloc(sizeof(double) * n), *ng = malloc(sizeof(double) * n);
+    for (int k = 0; k < 4; k++) {
+        printf("triplets %s %-10s %-6s", tag, sc, bn[k]);
+        for (int bin = -1; bin < 4; bin++) {
+            long m = 0, win = 0;
+            for (long i = 0; i < n; i++) { if (bin >= 0 && !(gap[i] >= ge[bin] && gap[i] < ge[bin + 1])) continue;
+                double cs, cb;
+                if (k < 3) { const float *a = D.X + (size_t)(3 * i) * D.Fs + blk[k][0], *s = D.X + (size_t)(3 * i + 1) * D.Fs + blk[k][0], *b = D.X + (size_t)(3 * i + 2) * D.Fs + blk[k][0];
+                    cs = cosf16(a, s, blk[k][1] - blk[k][0]); cb = cosf16(a, b, blk[k][1] - blk[k][0]); }
+                else { cs = -ts[i]; cb = -tb[i]; }
+                ps[m] = cs; ng[m] = cb; win += cs > cb; m++; }
+            if (bin < 0) printf(" | all n %6ld acc %.3f auc %.3f", m, m ? (double)win / m : NAN, pair_auc(ps, ng, m));
+            else printf(" | %g-%g n %5ld acc %.3f auc %.3f", ge[bin], ge[bin + 1] > 1e29 ? INFINITY : ge[bin + 1], m, m ? (double)win / m : NAN, pair_auc(ps, ng, m));
+        }
+        printf("\n");
+    }
+    free(ps); free(ng); free(gap); free(ts); free(tb); dvf_free(&D); return 0;
+}
+
 /* stats: the normalisation statistics of every scan a crop list uses, CPU only (so feats does not hold a GPU while it reads them) */
 static int cmd_stats(int argc, char **argv) {
     const char *root = opt(argc, argv, "--root", "/vesuvius/ufsm/v2/ct"), *cdir = opt(argc, argv, "--crops", nullptr), *list = opt(argc, argv, "--list", nullptr),
@@ -380,9 +494,11 @@ static int cmd_stats(int argc, char **argv) {
 int cmd_dinovol_probe(int argc, char **argv) {
     const char *m = argc > 2 ? argv[2] : "";
     if (!strcmp(m, "stats")) return cmd_stats(argc, argv);
+    if (!strcmp(m, "pfeats")) return cmd_pfeats(argc, argv);
+    if (!strcmp(m, "triplets")) return cmd_triplets(argc, argv);
     if (!strcmp(m, "feats")) return cmd_feats(argc, argv);
     if (!strcmp(m, "fit")) return cmd_fit(argc, argv);
     if (!strcmp(m, "apply")) return cmd_apply(argc, argv);
-    fprintf(stderr, "usage: ufsm dinovol-probe feats|fit|apply ...   linear ink probe of frozen dinovol features on ink-devcrops crops\n");
+    fprintf(stderr, "usage: ufsm dinovol-probe stats|feats|fit|apply|pfeats|triplets ...   linear ink probe of frozen dinovol features on ink-devcrops crops\n");
     return 2;
 }

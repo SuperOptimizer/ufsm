@@ -254,10 +254,12 @@ done:
 
 /* ufsm merge-flag <fields-dir> [--out DIR] [--coef b,amp,r,sp] [--thr T] [--threads N] [--weighted DIR [--mf-w 1 | --mf-cut T]] */
 static int cmd_merge_flag_eval(int argc, char **argv, const char *list);
+static int cmd_sheet_pairs(int argc, char **argv, const char *list);
 static int cmd_merge_flag_apply(int argc, char **argv, const char *src, const char *out);
 int cmd_merge_flag(int argc, char **argv) {
     if (argc >= 5 && !strcmp(argv[2], opt_n("--apply"))) return cmd_merge_flag_apply(argc, argv, argv[3], argv[4]);
     if (argc >= 4 && !strcmp(argv[2], opt_n("--eval"))) return cmd_merge_flag_eval(argc, argv, argv[3]);
+    if (argc >= 4 && !strcmp(argv[2], opt_n("--sheet-pairs"))) return cmd_sheet_pairs(argc, argv, argv[3]);
     if (argc < 3) {
         fprintf(stderr, "usage: ufsm merge-flag <fields-dir> [--out DIR] [--coef b,c_amp,c_r,c_sp] [--thr 179] [--threads N] [--gpu 0 (-1: CPU)] [--gpu-mem 3]\n"
                         "       ... --weighted DIR: also DIR = the fields with their evidence x (1 - mf / 255) (merge-flag --apply in the same pass; zarr fields)\n"
@@ -461,6 +463,101 @@ static void *ev_worker(void *a) {
     return nullptr;
 }
 /* AUC of score s (higher = merged) against y over the selected intervals (ties: average ranks) */
+
+/* ---- merge-flag --sheet-pairs LIST --out PREFIX (dinovol, lead 11-24): matched-distance sheet-identity triplets from the --eval boxes' GT ----
+   The --eval rays (EV_NZ z planes, EV_NTH angles from the fields' axis, native voxel steps; GT crossings = middles of labelled code runs,
+   wrap = (code - 1) / 18 mod 14). Anchor a = a crossing; adjacent b = the next crossing along the ray when one wrap apart (gap = their
+   distance); same s = the crossing of the SAME wrap on the ray rotated by the angle whose arc at a's radius equals the gap (alternately
+   + / -), nearest a's radius and within half a gap of it: a point on a's sheet as far away as the adjacent sheet. try9's score per pair:
+   the net phase (atan2 pc, ps of the fields' cells) unwrapped along the straight segment, |turns| (same sheet ~ 0, adjacent ~ 1).
+   Out: PREFIX.tsv (box scroll gap_um |a-s| |a-b| t9_same t9_adj az ay ax sy sx by bx, absolute native voxels of the fields' level) and
+   PREFIX.<scroll>.pts (float32 [n][3][3] z y x of a, s, b per row of that scroll, the order of the tsv's rows of that scroll). At most
+   --max-per-box triplets per box (seeded, at most a quarter per GT gap bin 0-50 / 50-100 / 100-200 / >= 200 um). */
+typedef struct { double r, y, x; int w; } sp_cross;
+static double sp_turns(const uint8_t *pc, const uint8_t *ps, long long H, long long W, int h, int zc, double y0, double x0, double y1, double x1) {
+    const double L = hypot(y1 - y0, x1 - x0); const int n = (int)ceil(L) + 1; double acc = 0, last = 0;
+    for (int i = 0; i <= n; i++) {
+        const double t = (double)i / n, y = y0 + t * (y1 - y0), x = x0 + t * (x1 - x0);
+        long long cy = (long long)(y / h), cx = (long long)(x / h); cy = cy < 0 ? 0 : cy >= H ? H - 1 : cy; cx = cx < 0 ? 0 : cx >= W ? W - 1 : cx;
+        const size_t c = ((size_t)zc * H + (size_t)cy) * W + (size_t)cx; const double p = atan2(ps[c] - 128.0, pc[c] - 128.0) / (2 * M_PI);
+        if (i) { double d = p - last; d -= round(d); acc += d; } last = p;
+    }
+    return fabs(acc);
+}
+static int cmd_sheet_pairs(int argc, char **argv, const char *list) {
+    const char *out = opt(argc, argv, "--out", nullptr); const int maxb = opt_atoi("--max-per-box", opt(argc, argv, "--max-per-box", "1500"));
+    unsigned long long seed = strtoull(opt(argc, argv, "--seed", "1"), nullptr, 10) * 0x9E3779B97F4A7C15ull + 1;
+    FILE *f = fopen(list, "r"); if (!f || !out) { fprintf(stderr, "usage: ufsm merge-flag --sheet-pairs LIST (--eval's: name scroll fields codes-root codes-um) --out PREFIX [--max-per-box 1500] [--seed 1]\n"); if (f) fclose(f); return 2; }
+    char tp[1400]; snprintf(tp, sizeof tp, "%s.tsv", out); FILE *fo = fopen(tp, "w"); if (!fo) { fprintf(stderr, "sheet-pairs: cannot write %s\n", tp); fclose(f); return 1; }
+    fprintf(fo, "# box\tscroll\tgap_um\td_same\td_adj\tt9_same\tt9_adj\taz\tay\tax\tsy\tsx\tby\tbx\n");
+    char seen[16][32]; FILE *pf[16] = {0}; int ns = 0, rc = 0; long tot = 0; char ln[4096];
+    while (fgets(ln, sizeof ln, f) && !rc) {
+        char name[64], scroll[32], fields[1024], croot[1024], ckey[64];
+        if (ln[0] == '#' || sscanf(ln, "%63s %31s %1023s %1023s %63s", name, scroll, fields, croot, ckey) != 5) continue;
+        int si = 0; while (si < ns && strcmp(seen[si], scroll)) si++;
+        if (si == ns) { if (ns == 16) continue; snprintf(seen[ns], 32, "%s", scroll); char pp[1400]; snprintf(pp, sizeof pp, "%s.%s.pts", out, scroll); if (!(pf[ns] = fopen(pp, "wb"))) { rc = 1; break; } ns++; }
+        mf_in I; if (mf_open(&I, fields)) { rc = 1; break; }
+        const long long D = I.shape[0], H = I.shape[1], W = I.shape[2]; const int h = I.h; const size_t N = (size_t)D * H * W;
+        uint8_t *pc = malloc(N), *ps = malloc(N); const char *nm[2] = {"pc", "ps"}; uint8_t *pl[2] = {pc, ps};
+        for (int k = 0; k < 2 && !rc; k++) { mf_rd r; if (mf_rd_open(&r, &I, nm[k]) || mf_rows(&r, 0, D, pl[k], 4)) rc = 1; mf_rd_close(&r); }
+        z3 *cz = rc ? nullptr : z3_open(store_open(croot), ckey, nullptr);
+        if (!rc && !cz) { fprintf(stderr, "sheet-pairs: %s: codes %s/%s: %s\n", name, croot, ckey, z3_error()); rc = 1; }
+        const double gtf = I.um / atof(ckey); const long long ny = H * h, nx = W * h, gy0 = (long long)floor(I.origin[1] * gtf), gx0 = (long long)floor(I.origin[2] * gtf);
+        const long long gny = (long long)(ny * gtf), gnx = (long long)(nx * gtf); const json *ax = json_get(I.j, "axis"); const size_t na = ax ? ax->n : 0;
+        uint8_t *g = malloc((size_t)gny * gnx); const int MC = 4096; sp_cross *cr = malloc(sizeof(sp_cross) * EV_NTH * 64); int *ncr = calloc(EV_NTH, sizeof(int));
+        typedef struct { float gap, ds, db, ts, tb, a[3], sp[3], b[3]; } trip; trip *T = nullptr; size_t nt = 0, ct = 0; (void)MC;
+        for (int iz = 0; iz < EV_NZ && !rc && na; iz++) {
+            const int zc = (int)((iz + 0.5) * D / EV_NZ); const long long zn = (long long)zc * h + h / 2;
+            const int64_t o3[3] = {(int64_t)((I.origin[0] + zn) * gtf), gy0, gx0}, n3[3] = {1, gny, gnx};
+            if (z3_read(cz, o3, n3, g, 4)) { fprintf(stderr, "sheet-pairs: %s: code read: %s\n", name, z3_error()); rc = 1; break; }
+            for (size_t i = 0; i < (size_t)gny * gnx; i++) if (g[i] > 252) g[i] = 0;
+            const json *a = json_at(ax, (size_t)zn < na ? (size_t)zn : na - 1); const double cy = json_num(json_at(a, 0), 0), cx = json_num(json_at(a, 1), 0);
+            const double R0 = hypot((double)ny, (double)nx) + fabs(cy) + fabs(cx);
+            for (int t = 0; t < EV_NTH; t++) {   /* the crossings of each ray */
+                const double th = t * 2 * M_PI / EV_NTH, sn = sin(th), cs = cos(th); ncr[t] = 0; long long r = 0;
+                while (r < (long long)R0) { const double y = cy + r * sn, x = cx + r * cs; if (y >= 0 && x >= 0 && y < ny - 0.5 && x < nx - 0.5) break; r++; }
+                for (; r < (long long)R0 && ncr[t] < 64;) {
+                    const double y = cy + r * sn, x = cx + r * cs; if (!(y >= 0 && x >= 0 && y < ny - 0.5 && x < nx - 0.5)) break;
+                    long long ly = (long long)(y * gtf), lx = (long long)(x * gtf); ly = ly < gny ? ly : gny - 1; lx = lx < gnx ? lx : gnx - 1;
+                    const uint8_t q = g[(size_t)ly * gnx + lx]; if (!q) { r++; continue; }
+                    long long e = r; for (;; e++) { const double ey = cy + e * sn, ex = cx + e * cs; if (!(ey >= 0 && ex >= 0 && ey < ny - 0.5 && ex < nx - 0.5)) break;
+                        long long my = (long long)(ey * gtf), mx = (long long)(ex * gtf); my = my < gny ? my : gny - 1; mx = mx < gnx ? mx : gnx - 1; if (g[(size_t)my * gnx + mx] != q) break; }
+                    const double rm = 0.5 * (r + e - 1); cr[t * 64 + ncr[t]++] = (sp_cross){rm, cy + rm * sn, cx + rm * cs, ((q - 1) / 18) % 14}; r = e;
+                }
+            }
+            for (int t = 0; t < EV_NTH; t++) for (int c = 0; c + 1 < ncr[t]; c++) for (int dir = 0; dir < 2; dir++) {
+                const sp_cross *A = &cr[t * 64 + c + dir], *B = &cr[t * 64 + c + 1 - dir]; const int d = ((B->w - A->w) % 14 + 14) % 14;
+                const double gap = fabs(B->r - A->r); if ((d != 1 && d != 13) || gap < 2 || A->r < 1) continue;
+                int dt = (int)lrint(gap / A->r / (2 * M_PI / EV_NTH)); if (dt < 1) dt = 1; if (dt > EV_NTH / 8) continue;
+                const int t2 = ((t + ((c + dir) & 1 ? -dt : dt)) % EV_NTH + EV_NTH) % EV_NTH; const sp_cross *S = nullptr; double best = 0.5 * gap;
+                for (int k = 0; k < ncr[t2]; k++) { const sp_cross *C = &cr[t2 * 64 + k]; if (C->w == A->w && fabs(C->r - A->r) < best) { best = fabs(C->r - A->r); S = C; } }
+                if (!S) continue;
+                if (nt == ct) { ct = ct ? 2 * ct : 4096; T = realloc(T, ct * sizeof *T); }
+                const double z = (double)(I.origin[0] + zn);
+                T[nt++] = (trip){(float)(gap * I.um), (float)hypot(S->y - A->y, S->x - A->x), (float)gap,
+                                 (float)sp_turns(pc, ps, H, W, h, zc, A->y, A->x, S->y, S->x), (float)sp_turns(pc, ps, H, W, h, zc, A->y, A->x, B->y, B->x),
+                                 {(float)z, (float)(I.origin[1] + A->y), (float)(I.origin[2] + A->x)}, {(float)z, (float)(I.origin[1] + S->y), (float)(I.origin[2] + S->x)},
+                                 {(float)z, (float)(I.origin[1] + B->y), (float)(I.origin[2] + B->x)}};
+            }
+        }
+        size_t keep = nt;
+        if (maxb > 0 && nt > (size_t)maxb) {   /* seeded shuffle, then up to maxb / 4 per GT gap bin (0-50, 50-100, 100-200, >= 200 um: the packed bins are rare) */
+            for (size_t i = 0; i + 1 < nt; i++) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; const size_t j = i + (size_t)((seed >> 33) % (nt - i)); trip x = T[i]; T[i] = T[j]; T[j] = x; }
+            int qb[4] = {0}; keep = 0;
+            for (size_t i = 0; i < nt; i++) { const int bn = T[i].gap < 50 ? 0 : T[i].gap < 100 ? 1 : T[i].gap < 200 ? 2 : 3;
+                if (qb[bn] < maxb / 4) { qb[bn]++; T[keep++] = T[i]; } }
+        }
+        for (size_t i = 0; i < keep; i++) { const trip *v = &T[i];
+            fprintf(fo, "%s\t%s\t%.1f\t%.2f\t%.2f\t%.4f\t%.4f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\n", name, scroll, v->gap, v->ds, v->db, v->ts, v->tb,
+                    v->a[0], v->a[1], v->a[2], v->sp[1], v->sp[2], v->b[1], v->b[2]);
+            fwrite(v->a, 4, 3, pf[si]); fwrite(v->sp, 4, 3, pf[si]); fwrite(v->b, 4, 3, pf[si]); }
+        fprintf(stderr, "sheet-pairs: %s (%s): %zu triplets, kept %zu\n", name, scroll, nt, keep); tot += (long)keep;
+        free(T); free(cr); free(ncr); free(g); free(pc); free(ps); if (cz) z3_close(cz); json_free(I.j);
+    }
+    fclose(f); if (fclose(fo)) rc = 1; for (int k = 0; k < ns; k++) if (pf[k] && fclose(pf[k])) rc = 1;
+    fprintf(stderr, "sheet-pairs: %ld triplets -> %s.tsv\n", tot, out);
+    return rc;
+}
 typedef struct { double s; uint8_t y; } ev_sy;
 static int ev_cmpsy(const void *a, const void *b) { const double x = ((const ev_sy *)a)->s, y = ((const ev_sy *)b)->s; return x < y ? -1 : x > y; }
 static double ev_auc(ev_sy *v, size_t n) {

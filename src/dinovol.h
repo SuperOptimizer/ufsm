@@ -25,6 +25,7 @@ void dv_add_half(float *x, const void *u, long long n);
 void dv_half_to_float(float *x, const void *u, long long n);
 void dv_avgpool2(const void *x, void *y, int D, int H, int W, int C);
 void dv_rope(void *qkv, const float *mix_dev, int N, int P, int g, int H);
+void dv_qknorm(void *qkv, const float *qw, const float *kw, float eps, int N, int H);   /* RMSNorm of every q / k head row (48), all N tokens */
 void dv_attention48(const void *qkv, void *out, int N, int H);
 void dv_glu(const void *a, void *g, long long N, int F);
 void dv_gconv8_gelu(const void *x, const float *w_dev, const float *b_dev, void *y, int n, int C);
