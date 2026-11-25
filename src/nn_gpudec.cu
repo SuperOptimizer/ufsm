@@ -63,12 +63,17 @@ __device__ __forceinline__ bool hyb(gbr &r, uint32_t tok, uint32_t &u) {
 enum { META = 33 };
 /* one CUDA block (32 threads) per request: its chunk's 10 tANS tables in shared memory, one thread per substream */
 struct gd_group { uint32_t item0, n, tab_off, pad; };
+/* GT (UFSM_GPUDEC_GTAB=1, 2026-11-25): the tables read from global memory through L1 instead of staged in 40 KB of shared memory. A
+   resident k_entropy block then no longer keeps a persistent 88 KB-smem training kernel (conv_bwd_w_f4ws_k) off its SM */
+template <bool GT>
 __global__ void __launch_bounds__(32) k_entropy(const gd_group *__restrict__ groups, const gd_item *__restrict__ items, const uint8_t *__restrict__ in,
                                                 const uint32_t *__restrict__ pos_tab, uint32_t *__restrict__ rec, uint32_t *__restrict__ meta, uint32_t *__restrict__ status) {
-    __shared__ uint32_t dt[TABW];
+    __shared__ uint32_t dts[GT ? 1 : TABW];
     const gd_group g = groups[blockIdx.x];
-    { const uint4 *src = (const uint4 *)(in + g.tab_off); uint4 *d4 = (uint4 *)dt; for (int k = threadIdx.x; k < TABW / 4; k += 32) d4[k] = __ldg(src + k); }
+    if constexpr (!GT) { const uint4 *src = (const uint4 *)(in + g.tab_off); uint4 *d4 = (uint4 *)dts; for (int k = threadIdx.x; k < TABW / 4; k += 32) d4[k] = __ldg(src + k); }
     __syncthreads();
+    const uint32_t *gtab = (const uint32_t *)(in + g.tab_off);
+    auto dtl = [&](uint32_t i) -> uint32_t { if constexpr (GT) return __ldg(gtab + i); else return dts[i]; };
     if (threadIdx.x >= g.n) return;
     const int i = (int)(g.item0 + threadIdx.x);
     const gd_item it = items[i];
@@ -79,7 +84,7 @@ __global__ void __launch_bounds__(32) k_entropy(const gd_group *__restrict__ gro
     {
         int64_t prev_dc = 0;
         for (uint32_t bl = 0; bl < 16; bl++) {
-            uint32_t e = dt[9 * 1024 + x0], t = e >> 16 & 255u;
+            uint32_t e = dtl(9 * 1024 + x0), t = e >> 16 & 255u;
             if (!gbr_get(ra, e >> 24, b)) goto done;
             x0 = (e & 0xffffu) + b;
             if (t > 20u) goto done;
@@ -92,7 +97,7 @@ __global__ void __launch_bounds__(32) k_entropy(const gd_group *__restrict__ gro
             uint32_t pos = 1;
             for (;;) {
                 const uint32_t band = pos < 128u ? 0u : pos < 1024u ? 1u : 2u;
-                e = dt[band * 1024 + x1]; t = e >> 16 & 255u;
+                e = dtl(band * 1024 + x1); t = e >> 16 & 255u;
                 if (!gbr_get(ra, e >> 24, b)) goto done;
                 x1 = (e & 0xffffu) + b;
                 if (t == 31u) break;
@@ -102,7 +107,7 @@ __global__ void __launch_bounds__(32) k_entropy(const gd_group *__restrict__ gro
                 pos += run;
                 if (pos >= (uint32_t)BLKV) goto done;
                 const uint32_t lband = pos < 128u ? 0u : pos < 1024u ? 1u : 2u;
-                e = dt[(3u + lband * 2u + (run == 0u ? 1u : 0u)) * 1024 + x0];
+                e = dtl((3u + lband * 2u + (run == 0u ? 1u : 0u)) * 1024 + x0);
                 const uint32_t lt = e >> 16 & 255u;
                 if (!gbr_get(ra, e >> 24, b)) goto done;
                 x0 = (e & 0xffffu) + b;
@@ -253,7 +258,10 @@ static int launch_batch(gd_slot *S) {
     GD_CK(cudaMemcpyAsync(S->d_in, S->h_in, S->in_used, cudaMemcpyHostToDevice, S->st));
     GD_CK(cudaMemcpyAsync(S->d_items, S->h_items, n * sizeof(gd_item), cudaMemcpyHostToDevice, S->st));
     GD_CK(cudaMemcpyAsync(S->d_groups, S->h_groups, S->nreq * sizeof(gd_group), cudaMemcpyHostToDevice, S->st));
-    k_entropy<<<S->nreq, 32, 0, S->st>>>(S->d_groups, S->d_items, S->d_in, G.d_pos, S->d_rec, S->d_meta, S->d_status);
+    static int gtab = -1;   /* mgpu: env */
+    if (gtab < 0) { const char *e = getenv("UFSM_GPUDEC_GTAB"); gtab = e && *e == '1'; }
+    if (gtab) k_entropy<true><<<S->nreq, 32, 0, S->st>>>(S->d_groups, S->d_items, S->d_in, G.d_pos, S->d_rec, S->d_meta, S->d_status);
+    else k_entropy<false><<<S->nreq, 32, 0, S->st>>>(S->d_groups, S->d_items, S->d_in, G.d_pos, S->d_rec, S->d_meta, S->d_status);
     GD_CK(cudaGetLastError());
     k_idct<<<n * 16, 256, 0, S->st>>>(S->d_items, S->d_in, G.d_pos, S->d_rec, S->d_meta, S->d_status);
     GD_CK(cudaGetLastError());
