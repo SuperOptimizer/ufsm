@@ -153,6 +153,9 @@ static int slab_nper(const gnp_t &gp, int nper) {
     return sv < nper ? (int)sv : nper;
 }
 static bool slab_small(const gnp_t &gp) { return gp.ns && gp.G && (long long)gp.zs * gp.zhw < 256; }   /* staged forward: >= 256 voxels per slab */
+/* the kernels' dynamic shared memory: up to the 48 KB every launch may take without an opt-in (11-25: the 32 KB cap refused --distill's
+   64-output head on try9's 448-channel decoder level 3, 35 KB at 16 outputs a pass) */
+enum { C1_SMEM_MAX = 48 * 1024 };
 static size_t conv1_smem(shape5 xs, int cout) { return (size_t)(2 * (xs.n > 2 ? xs.n : 2) * xs.c + (cout <= 8 ? 8 : 16) * xs.c) * sizeof(float); }   /* (>= 2 coefficient rows: slab banks) */
 template <int B, int CO, typename YT = float> static void conv1_mx_t(const void *x, shape5 xs, const float *w, const float *b, YT *y, gnp_t gp, int cout, size_t vb = 0, size_t nv = 0, int cy = 0, size_t ly = 0) {
     const size_t S = shape_spatial(xs), sm = conv1_smem(xs, cout), Sy = nv ? nv : S;
@@ -418,7 +421,7 @@ extern "C" void lp_conv1_fwd_mx_h16(const void *x, int xdt, shape5 xs, const flo
 }
 /* voxels [vb, vb + nv) of x (nv 0: all) into fp16 planes of nv voxels: the trainer's head slabs (train.c head_slab) */
 extern "C" void lp_conv1_fwd_mx_h16_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, size_t vb, size_t nv) {
-    if (conv1_smem(xs, cout < 16 ? cout : 16) > 32 * 1024) { fprintf(stderr, "lp_conv1_fwd_mx_h16: cout %d / %d inputs unsupported\n", cout, xs.c); abort(); }
+    if (conv1_smem(xs, cout < 16 ? cout : 16) > C1_SMEM_MAX) { fprintf(stderr, "lp_conv1_fwd_mx_h16: cout %d / %d inputs unsupported\n", cout, xs.c); abort(); }
     if (slab_small(gp)) { fprintf(stderr, "lp_conv1_fwd_mx_h16: slab GroupNorm with %d voxels per slab (< 256)\n", gp.zs * gp.zhw); abort(); }
     const size_t Sy = nv ? nv : shape_spatial(xs);
     if (conv1_tc(x, xdt, xs, w, b, cout, y, gp, vb, Sy)) { LPCK(); return; }   /* (> 16 outputs from MX-fp4: one tensor-core pass) */
@@ -453,7 +456,7 @@ extern "C" int lp_conv1_fwd_mx_r(const void *x, int xdt, shape5 xs, const float 
         return 0;
     }
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;   /* mgpu: env */
-    if (old || conv1_smem(xs, cout) > 32 * 1024 || slab_small(gp)) return -1;
+    if (old || conv1_smem(xs, cout) > C1_SMEM_MAX || slab_small(gp)) return -1;
 #define C1R(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; \
                                case 3: conv1_mx_t<B, 3>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; \
                                case 5: conv1_mx_t<B, 5>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, y, gp, cout, vb, nv, 0, ly); break; \
@@ -474,8 +477,8 @@ extern "C" void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *
     if (cout > 16) { fprintf(stderr, "lp_conv1_fwd_mx: cout %d > 16\n", cout); abort(); }
     size_t S = shape_spatial(xs);
     static int old = -1; if (old < 0) old = getenv("UFSM_CONV1_OLD") ? atoi(getenv("UFSM_CONV1_OLD")) : 0;
-    if (cout > 8 && (old || conv1_smem(xs, cout) > 32 * 1024)) { fprintf(stderr, "lp_conv1_fwd_mx: %d outputs need the staged kernel\n", cout); abort(); }
-    if (!old && conv1_smem(xs, cout) <= 32 * 1024 && !slab_small(gp)) {
+    if (cout > 8 && (old || conv1_smem(xs, cout) > C1_SMEM_MAX)) { fprintf(stderr, "lp_conv1_fwd_mx: %d outputs need the staged kernel\n", cout); abort(); }
+    if (!old && conv1_smem(xs, cout) <= C1_SMEM_MAX && !slab_small(gp)) {
 #define C1T(B) do { switch (cout) { case 1: conv1_mx_t<B, 1>(x, xs, w, b, y, gp, cout); break; case 2: conv1_mx_t<B, 2>(x, xs, w, b, y, gp, cout); break; \
                                case 3: conv1_mx_t<B, 3>(x, xs, w, b, y, gp, cout); break; case 4: conv1_mx_t<B, 4>(x, xs, w, b, y, gp, cout); break; \
                                case 5: conv1_mx_t<B, 5>(x, xs, w, b, y, gp, cout); break; case 6: conv1_mx_t<B, 6>(x, xs, w, b, y, gp, cout); break; \

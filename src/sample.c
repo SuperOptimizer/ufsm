@@ -1063,8 +1063,10 @@ int sample_gpu_aug_ok(const sample_cfg *c) {   /* the device's CT channel (nn_au
                                                   only (side_air 0), the plain inputs */
     return c->gpu_input && sample_gpu_input_ok(c) && (c->Pz <= 0 || c->Pz == c->P) && !c->ct_augment && c->side_air == 0 && !c->restore && !c->papyrus && c->P <= SA_MAXP;
 }
-int sample_gpu_lwarp_ok(const sample_cfg *c) {   /* --gpu-aug 2: the warped windows' labels on the device: the packed targets (and pmask: their mask bit), phase and winding only */
-    return sample_gpu_aug_ok(c) && (c->pack_tm || sample_tm_unused(c)) && !c->sheet && !c->pap_head && !c->emb_ch && !c->cond && !c->band && (!c->aux || c->aux_nc > 0);   /* (gpu_input aux: warped on the device with the CT) */
+int sample_gpu_lwarp_ok(const sample_cfg *c) {   /* --gpu-aug 2: the warped windows' labels on the device: the packed targets (and pmask: their mask bit), phase and winding only.
+                                                    (--distill's targets are mapped on the host through the window's own symmetry / warp parameters,
+                                                    which the device warp applies too; echoes / replays re-augment on the device: train drops their targets) */
+    return sample_gpu_aug_ok(c) && (c->pack_tm || sample_tm_unused(c)) && !c->sheet && !c->pap_head && !c->cond && !c->band && (!c->aux || c->aux_nc > 0);   /* (gpu_input aux: warped on the device with the CT) */
 }
 void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], float mean, float isd, int hasax, const float *cyz,
                          const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed, uint16_t *H4, uint16_t *H1, void *rec) {
@@ -4512,7 +4514,8 @@ static sym sym_inverse(sym y) { sym z; for (int d = 0; d < 3; d++) { z.perm[y.pe
 static int sym_identity(sym y) { return y.perm[0] == 0 && y.perm[1] == 1 && y.perm[2] == 2 && !y.flip[0] && !y.flip[1] && !y.flip[2]; }
 /* the configurations whose batches replay: --gpu-aug 2 cubes, every label plane a source-grid or symmetry-applied byte plane the device warps */
 int sampler_replay_ok(const sample_cfg *c) {
-    return c->gpu_aug == 2 && (c->Pz <= 0 || c->Pz == c->P) && !c->sheet && !c->band && !c->pap_head && !c->cond && !c->emb_ch && !c->view_P && !c->cover &&
+    /* (--distill: a replay / echo keeps the window's first targets, which no longer match its new augmentation: train clears them) */
+    return c->gpu_aug == 2 && (c->Pz <= 0 || c->Pz == c->P) && !c->sheet && !c->band && !c->pap_head && !c->cond && !c->view_P && !c->cover &&
            !c->papyrus && !c->restore && (!c->pmask || (c->slot_skip & 2)) && !c->chain_p;
 }
 /* window i of slot b, replay rep (1..): its records redrawn from the window's own state. The label planes of a window that was neither
@@ -4696,7 +4699,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     if (rskip_selftest()) { fprintf(stderr, "sampler: rng jump-ahead self-test failed\n"); return nullptr; }
     if (cfg->echo_max > 0 && cfg->replay > 1) { fprintf(stderr, "sampler: --echo-max and --replay K > 1 exclude each other\n"); return nullptr; }
     if (cfg->echo_max > 0 && (!sampler_replay_ok(cfg) || replay_selftest())) { fprintf(stderr, "sampler: --echo-max needs --gpu-aug 2 cube batches (as --replay)\n"); return nullptr; }
-    if (cfg->replay > 1 && (!sampler_replay_ok(cfg) || replay_selftest())) { fprintf(stderr, "sampler: --replay needs --gpu-aug 2 cube batches without sheet / band / gap / condition / distill / view / cover / chain / papyrus-mask planes\n"); return nullptr; }
+    if (cfg->replay > 1 && (!sampler_replay_ok(cfg) || replay_selftest())) { fprintf(stderr, "sampler: --replay needs --gpu-aug 2 cube batches without sheet / band / gap / condition / view / cover / chain / papyrus-mask planes\n"); return nullptr; }
     if (!S || S->n <= 0 || cfg->P <= 0 || cfg->B <= 0 || cfg->nworkers <= 0 || cfg->nbuf <= 0) { fprintf(stderr, "sampler: invalid sources, patch, batch, workers or buffer count\n"); return nullptr; }
     if (cfg->gpu_input && !sample_gpu_input_ok(cfg)) { fprintf(stderr, "sampler: --gpu-input needs 16-bit batches and no warps, sheet prior, slab appearance plan, aux or condition inputs\n"); return nullptr; }
     { int nl = 0, nw = 0; for (int i = 0; i < S->n; i++) { nl += S->src[i].scope_local == 1; nw += S->src[i].phase_wt != nullptr; }
