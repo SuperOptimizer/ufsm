@@ -10,25 +10,26 @@ D=$(mktemp -d /tmp/test_prefetch_shards_XXXXXX); SRV=
 fail() { echo "test_prefetch_shards: FAIL: $*" >&2; [ -n "$SRV" ] && kill $SRV 2> /dev/null; echo "(kept $D)" >&2; exit 1; }
 python3 -I - "$D" <<'EOF' || fail "fixture"
 import sys, os, json, numpy as np
-d = sys.argv[1]; z, y, x = np.mgrid[0:256, 0:256, 0:256]
+d = sys.argv[1]; z, y, x = np.mgrid[0:256, 0:256, 0:320]   # (x 320: level 0's second x shard is partial, chunks past the grid)
 v = ((x * 7 + y * 3 + z * 5) % 50 + 150).astype(np.uint8); v[128:] = 0   # (papyrus >= iso 64 in z < 128 only)
 v.tofile(d + "/l0.raw"); ds = []
 for l in range(6):
     s = 2.4 * 2 ** l; ds.append({"path": str(l), "coordinateTransformations": [{"scale": [s, s, s], "type": "scale"}]})
     if l == 0: continue
-    a = np.ascontiguousarray(v[::2 ** l, ::2 ** l, ::2 ** l]); n = a.shape[0]; ch = min(n, 64); p = f"{d}/s/s.zarr/{l}"; os.makedirs(p, exist_ok=True)
-    json.dump({"zarr_format": 3, "node_type": "array", "shape": [n] * 3, "data_type": "uint8", "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [ch] * 3}},
+    a = np.ascontiguousarray(v[::2 ** l, ::2 ** l, ::2 ** l]); sh = a.shape; ch = min(sh[0], 64); p = f"{d}/s/s.zarr/{l}"; os.makedirs(p, exist_ok=True)
+    g = [(n + ch - 1) // ch for n in sh]; a = np.pad(a, [(0, g[i] * ch - sh[i]) for i in range(3)])
+    json.dump({"zarr_format": 3, "node_type": "array", "shape": list(sh), "data_type": "uint8", "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [ch] * 3}},
                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}}, "fill_value": 0, "codecs": [{"name": "bytes", "configuration": {}}],
                "attributes": {}, "dimension_names": ["z", "y", "x"]}, open(p + "/zarr.json", "w"))
-    for cz in range(n // ch):
-        for cy in range(n // ch):
-            for cx in range(n // ch):
+    for cz in range(g[0]):
+        for cy in range(g[1]):
+            for cx in range(g[2]):
                 os.makedirs(f"{p}/c/{cz}/{cy}", exist_ok=True)
                 a[cz * ch:(cz + 1) * ch, cy * ch:(cy + 1) * ch, cx * ch:(cx + 1) * ch].tofile(f"{p}/c/{cz}/{cy}/{cx}")
 json.dump({"zarr_format": 3, "node_type": "group", "attributes": {"ome": {"version": "0.5", "multiscales": [{"version": "0.5",
            "axes": [{"name": a, "type": "space"} for a in "zyx"], "datasets": ds}]}}}, open(f"{d}/s/s.zarr/zarr.json", "w"))
 EOF
-"$U" z3-put "$D/s/s.zarr/0" "$D/l0.raw" --shape 256,256,256 --z0 0 --nz 256 --shard 256 > "$D/put.log" 2>&1 || fail "z3-put ($D/put.log)"
+"$U" z3-put "$D/s/s.zarr/0" "$D/l0.raw" --shape 256,256,320 --z0 0 --nz 256 --shard 256 > "$D/put.log" 2>&1 || fail "z3-put ($D/put.log)"
 python3 -I - "$D/s" "$D/port" "$D/req.log" <<'EOF' &
 import http.server, os, re, sys
 root, portf, reqf = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -71,6 +72,9 @@ nd=$(grep '/0/c/0/0/0 ' "$D/req.log" | grep -vc 'bytes=-')
 l0=$(grep 'level 0 done' "$D/shards.log")
 [ -n "$l0" ] || fail "no level-0 summary line: $(cat "$D/shards.log")"
 ns=$(echo "$l0" | sed -E 's/.*: ([0-9]+) stored.*/\1/'); [ "$ns" -ge 2 ] || fail "level 0: $ns stored chunks needed (fixture: expected >= 2): $l0"
+# the tally covers exactly the needed chunks (an edge shard's chunks past the grid once aliased other chunks' bits: stored + absent > needed)
+grep 'level [0-9]* done.* stored, ' "$D/shards.log" | sed -E 's/.*\(([0-9]+) chunks needed in [0-9]+ shards: ([0-9]+) stored, ([0-9]+) absent.*/\1 \2 \3/' | while read -r n st ab; do
+  [ $((st + ab)) = "$n" ] || { echo "tally $st stored + $ab absent != $n needed"; exit 1; }; done || fail "a level's tally does not add up to its needed chunks: $(grep 'done' "$D/shards.log" | tr '\n' ' ')"
 [ "$nd" -ge 1 ] && [ "$nd" -lt "$ns" ] || fail "level 0: $nd data requests for $ns stored chunks (expected coalesced, fewer): $l0"
 echo "$l0" | grep -q "0 shard failures; coverage 1.0000" || fail "level 0 summary: $l0"
 grep -q "0 failures$" "$D/shards.log" || fail "total line: $(tail -1 "$D/shards.log")"

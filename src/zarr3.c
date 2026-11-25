@@ -830,14 +830,16 @@ int z3_prefetch_shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64
         if (!li && st) for (int a = 0; a < z->cgrid[0]; a++) for (int b = 0; b < z->cgrid[1]; b++) for (int c = 0; c < z->cgrid[2]; c++) {
             const int64_t g[3] = {sz * z->cgrid[0] + a, sy * z->cgrid[1] + b, sx * z->cgrid[2] + c};
             if (g[0] < lo[0] || g[0] > hi[0] || g[1] < lo[1] || g[1] > hi[1] || g[2] < lo[2] || g[2] > hi[2]) continue;
-            if (bits) { const size_t k = ((size_t)g[0] * (size_t)ng[1] + (size_t)g[1]) * (size_t)ng[2] + (size_t)g[2]; if (!((bits[k >> 3] >> (k & 7)) & 1)) continue; }
+            if (bits) { if (g[0] >= ng[0] || g[1] >= ng[1] || g[2] >= ng[2]) continue;   /* (past the grid: its index would alias another chunk's bit) */
+                    const size_t k = ((size_t)g[0] * (size_t)ng[1] + (size_t)g[1]) * (size_t)ng[2] + (size_t)g[2]; if (!((bits[k >> 3] >> (k & 7)) & 1)) continue; }
             st->absent++; }
         free(idx); free(it); return li; }
     int n = 0;
     for (int a = 0; a < z->cgrid[0]; a++) for (int b = 0; b < z->cgrid[1]; b++) for (int c = 0; c < z->cgrid[2]; c++) {
         const int64_t g[3] = {sz * z->cgrid[0] + a, sy * z->cgrid[1] + b, sx * z->cgrid[2] + c};
         if (g[0] < lo[0] || g[0] > hi[0] || g[1] < lo[1] || g[1] > hi[1] || g[2] < lo[2] || g[2] > hi[2]) continue;
-        if (bits) { const size_t k = ((size_t)g[0] * (size_t)ng[1] + (size_t)g[1]) * (size_t)ng[2] + (size_t)g[2]; if (!((bits[k >> 3] >> (k & 7)) & 1)) continue; }
+        if (bits) { if (g[0] >= ng[0] || g[1] >= ng[1] || g[2] >= ng[2]) continue;   /* (past the grid: its index would alias another chunk's bit) */
+                    const size_t k = ((size_t)g[0] * (size_t)ng[1] + (size_t)g[1]) * (size_t)ng[2] + (size_t)g[2]; if (!((bits[k >> 3] >> (k & 7)) & 1)) continue; }
         const int ci = (a * z->cgrid[1] + b) * z->cgrid[2] + c; const ientry e = idx[ci];
         if ((e.off == UINT64_MAX && e.len == UINT64_MAX) || !e.len) { if (st) st->absent++; continue; }   /* absent (fill) */
         if (st) st->present++;

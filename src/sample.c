@@ -4261,7 +4261,9 @@ static void *pfs_worker(void *p) {
     for (;;) {
         const size_t i = __atomic_fetch_add(a->next, 1, __ATOMIC_RELAXED); if (i >= a->nsh) break;
         const int64_t s[3] = {a->sh[3 * i], a->sh[3 * i + 1], a->sh[3 * i + 2]};
-        const int64_t lo[3] = {s[0] * a->g[0], s[1] * a->g[1], s[2] * a->g[2]}, hi[3] = {lo[0] + a->g[0] - 1, lo[1] + a->g[1] - 1, lo[2] + a->g[2] - 1};
+        const int64_t lo[3] = {s[0] * a->g[0], s[1] * a->g[1], s[2] * a->g[2]};
+        int64_t hi[3]; for (int d = 0; d < 3; d++) { hi[d] = lo[d] + a->g[d] - 1; if (hi[d] > a->ng[d] - 1) hi[d] = a->ng[d] - 1; }   /* (an edge shard: no chunks past the grid,
+                                                                                                                                  whose bit index would alias the next row) */
         if (z3_prefetch_shard_sel(a->ct, s[0], s[1], s[2], lo, hi, a->bits, a->ng, &st) < 0) __atomic_fetch_add(a->fail, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(a->done, 1, __ATOMIC_RELAXED);
     }
