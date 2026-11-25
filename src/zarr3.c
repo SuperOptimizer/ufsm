@@ -812,16 +812,24 @@ int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx) {
    (latency-bound), the m7 source's 17.9k chunks in 323 s */
 typedef struct { uint64_t off, len; int ci; } pf_item;
 static int pf_item_cmp(const void *a, const void *b) { const pf_item *p = a, *q = b; return (p->off > q->off) - (p->off < q->off); }
+static int shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3], const uint8_t *bits, const int64_t *ng,
+                     z3_pf_stats *st, int dry);
 int z3_prefetch_shard(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3]) {
-    return z3_prefetch_shard_sel(z, sz, sy, sx, lo, hi, nullptr, nullptr, nullptr);
+    return shard_sel(z, sz, sy, sx, lo, hi, nullptr, nullptr, nullptr, 0);
 }
+int z3_prefetch_shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3], const uint8_t *bits,
+                          const int64_t *ng, z3_pf_stats *st) { return shard_sel(z, sz, sy, sx, lo, hi, bits, ng, st, 0); }
+/* the dry count (2026-11-25: the R11P prefetch was estimated at ~60 GB from chunk counts and filled the pod disk past 151 GB): only the
+   shard index is read; st gets the same tally, need = the encoded bytes of the selected stored chunks, bytes = those not yet cached */
+int z3_count_shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3], const uint8_t *bits,
+                       const int64_t *ng, z3_pf_stats *st) { return shard_sel(z, sz, sy, sx, lo, hi, bits, ng, st, 1); }
 /* z3_prefetch_shard with an optional selection: bits (one bit per global inner chunk, row-major over ng = the array's chunk grid) limits
    the fetch to the marked chunks inside [lo, hi]; st (optional) adds the marked chunks' tally: present, already cached, absent (fill),
    and the encoded bytes fetched now. ufsm prefetch (2026-11-25, pod data wait): its per-chunk requests ran ~20 MB/s from the mirror
    (~0.35 s first-byte latency each), whole-shard coalesced reads ~90 MB/s. */
-int z3_prefetch_shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3], const uint8_t *bits,
-                          const int64_t *ng, z3_pf_stats *st) {
-    if (!z->cache || !z->m.sharded) return 0;
+static int shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3], const uint8_t *bits, const int64_t *ng,
+                     z3_pf_stats *st, int dry) {
+    if (!z->m.sharded || (!z->cache && !dry)) return 0;
     char skey[1200], item[16]; shard_key(z, sz, sy, sx, skey, sizeof skey);
     ientry *idx = malloc((size_t)z->nc * sizeof *idx); pf_item *it = malloc((size_t)z->nc * sizeof *it);
     if (!idx || !it) { free(idx); free(it); return FAIL("prefetch allocation"); }
@@ -842,8 +850,9 @@ int z3_prefetch_shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64
                     const size_t k = ((size_t)g[0] * (size_t)ng[1] + (size_t)g[1]) * (size_t)ng[2] + (size_t)g[2]; if (!((bits[k >> 3] >> (k & 7)) & 1)) continue; }
         const int ci = (a * z->cgrid[1] + b) * z->cgrid[2] + c; const ientry e = idx[ci];
         if ((e.off == UINT64_MAX && e.len == UINT64_MAX) || !e.len) { if (st) st->absent++; continue; }   /* absent (fill) */
-        if (st) st->present++;
-        snprintf(item, sizeof item, "%d", ci); if (cache_has(z, skey, item)) { if (st) st->cached++; continue; }
+        if (st) { st->present++; st->need += (int64_t)e.len; }
+        snprintf(item, sizeof item, "%d", ci); if (z->cache && cache_has(z, skey, item)) { if (st) st->cached++; continue; }
+        if (dry) { if (st) st->bytes += (int64_t)e.len; continue; }
         it[n++] = (pf_item){e.off, e.len, ci};
     }
     free(idx);
