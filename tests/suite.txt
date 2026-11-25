@@ -299,6 +299,7 @@ test_ink_ext_inksdk_studio                     | gpu,slow     |    40 | python3 
 test_ink_ext_inksdk_tsf                        | gpu,slow     |    20 | python3 tests/test_ink_ext_inksdk_tsf.py
 test_ink_ext_inksdk_v8hec                      | gpu,slow     |   140 | python3 tests/test_ink_ext_inksdk_v8hec.py
 test_dinovol                                   | gpu,slow     |    86 | python3 tests/test_dinovol.py
+test_dinovol_g256                              | gpu,slow     |    90 | env UFSM_DINOVOL_CKPT=${UFSM_DINOVOL:-$HOME/ufsm-data/dinovol}/g256_compass_qknorm_checkpoint_step_781000.pt python3 tests/test_dinovol.py
 test_dinovol_embed                             | gpu,slow     |   591 | python3 tests/test_dinovol_embed.py
 test_hercuvit                                  | gpu,slow     |    77 | python3 tests/test_hercuvit.py
 # (test_surfrecto reads its CT window from the dl.ash2txt volcomp mirror unless UFSM_SURFRECTO_CT names a local root: it needs the network)

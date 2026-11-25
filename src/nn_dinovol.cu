@@ -118,6 +118,24 @@ extern "C" void dv_rope(void *qkv, const float *mix_dev, int N, int P, int g, in
     k_rope<<<nb_of((long long)(N - P) * H * 24, 256), 256, 0, ST>>>((__half *)qkv, mix_dev, N, P, g, H);
 }
 
+/* ---- QK-norm (villa dinovol-refactor EvaAttention qk_norm): nn.RMSNorm(48, eps) on each q and k head row of qkv [N][3 H 48], every token
+   (prefix included), before RoPE; one warp per (token, q|k, head), fp32 arithmetic ---- */
+__global__ void k_qknorm(__half *__restrict__ qkv, const float *__restrict__ qw, const float *__restrict__ kw, float eps, int N, int H) {
+    const long long w = (blockIdx.x * (long long)blockDim.x + threadIdx.x) >> 5; const int lane = threadIdx.x & 31;
+    if (w >= (long long)N * 2 * H) return;
+    const int h = (int)(w % H), part = (int)((w / H) % 2); const long long tok = w / (2 * H);
+    __half *r = qkv + (size_t)tok * 3 * H * 48 + (size_t)part * H * 48 + h * 48; const float *wt = part ? kw : qw;
+    const float a = __half2float(r[lane]), b = lane < 16 ? __half2float(r[32 + lane]) : 0.f;
+    float s = a * a + b * b;
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    const float rs = rsqrtf(s / 48 + eps);
+    r[lane] = __float2half_rn(a * rs * wt[lane]);
+    if (lane < 16) r[32 + lane] = __float2half_rn(b * rs * wt[32 + lane]);
+}
+extern "C" void dv_qknorm(void *qkv, const float *qw, const float *kw, float eps, int N, int H) {
+    k_qknorm<<<nb_of((long long)N * 2 * H * 32, 256), 256, 0, ST>>>((__half *)qkv, qw, kw, eps, N, H);
+}
+
 /* ---- flash attention, head dim 48: qkv [N][3 H 48] (q | k | v, head h at h 48) -> out [N][H 48]. Block = 64 queries of one head
    (4 warps x 16 rows), key / value tiles of 64 rows double-buffered through cp.async, mma.sync m16n8k16 fp16 -> fp32, online
    softmax in the exp2 domain. ---- */

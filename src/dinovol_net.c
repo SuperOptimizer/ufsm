@@ -11,7 +11,7 @@ enum { DV_E = 480, DV_H = 10, DV_HD = 48, DV_PRE = 5, DV_MAXBLK = 32, DV_MAXST =
 
 typedef struct { xconv c; float *w, *b; } cln;   /* conv + channel LayerNorm (eps 1e-5) */
 typedef struct { cln c1, c2, sk; int has_sk, stride; } bblock;
-typedef struct { float *ln1w, *ln1b, *ln2w, *ln2b, *mix; xconv qkv, proj, fc1, fc2; } vblock;
+typedef struct { float *ln1w, *ln1b, *ln2w, *ln2b, *mix, *qn, *kn; xconv qkv, proj, fc1, fc2; } vblock;   /* qn / kn: QK-norm weights [48] or nullptr */
 
 struct dv_net {
     cln stem; bblock bb[DV_MAXST * 4]; int nbb, stage_end[DV_MAXST], nstage, stage_ch[DV_MAXST]; xconv fproj;
@@ -57,7 +57,8 @@ static int cln_of(const wl_dict *d, cln *c, const char *pfx, int stride, int k, 
 }
 
 dv_net *dv_load(const char *ckpt) {
-    wl_dict *d = wl_load(ckpt, "teacher");
+    wl_dict *d = wl_load(ckpt, "teacher");   /* slim teacher files; the dinovol-refactor training checkpoints (g256_compassrope_qknorm) keep it deeper */
+    if (!d) d = wl_load(ckpt, "method.state.teacher");
     if (!d) { fprintf(stderr, "dinovol: %s: %s\n", ckpt, wl_error()); return nullptr; }
     dv_net *n = dv_load_dict(d, ckpt);
     wl_free(d);
@@ -67,6 +68,7 @@ dv_net *dv_load_dict(const wl_dict *d, const char *ckpt) {
     dv_net *n = calloc(1, sizeof *n); int rc = 0;
     const int head = wl_get(d, "dense_head.fpn_in.weight") != nullptr;   /* the PointDenseHead is optional (HercuViT carries none) */
     {   const wl_tensor *c = wl_get(d, "backbone.cls_token"), *m = wl_get(d, "backbone.blocks.0.rope_embed.mix_frequencies");
+        if (!m) m = wl_get(d, "backbone.blocks.0.rope_embed.radii");   /* Compass RoPE: radii [H][24] */
         if (!c || !m || c->numel % 48 || m->shape[0] * 48 != c->numel || c->numel > 1024) { fprintf(stderr, "dinovol: %s: unsupported width (cls %lld, heads %lld; need heads of 48)\n", ckpt, c ? (long long)c->numel : -1LL, m ? (long long)m->shape[0] : -1LL); free(n); return nullptr; }
         n->E = (int)c->numel; n->H = (int)m->shape[0]; }
     rc |= cln_of(d, &n->stem, "backbone.down_projection.stem.convs.0", 1, 3, 1);
@@ -114,10 +116,29 @@ dv_net *dv_load_dict(const wl_dict *d, const char *ckpt) {
 #define BN(s) (snprintf(p, sizeof p, "backbone.blocks.%d." s, b), p)
         V->ln1w = devf(d, BN("norm1.weight")); V->ln1b = devf(d, BN("norm1.bias"));
         V->ln2w = devf(d, BN("norm2.weight")); V->ln2b = devf(d, BN("norm2.bias"));
-        V->mix = devf(d, BN("rope_embed.mix_frequencies"));
-        rc |= !V->ln1w || !V->ln1b || !V->ln2w || !V->ln2b || !V->mix;
         const wl_tensor *mixt = wl_get(d, BN("rope_embed.mix_frequencies"));
-        if (mixt && (mixt->shape[0] != n->H || mixt->shape[1] != DV_HD / 2 || mixt->shape[2] != 3)) { fprintf(stderr, "dinovol: unexpected RoPE shape\n"); rc = -1; }
+        if (mixt) {
+            V->mix = devf(d, BN("rope_embed.mix_frequencies"));
+            if (mixt->shape[0] != n->H || mixt->shape[1] != DV_HD / 2 || mixt->shape[2] != 3) { fprintf(stderr, "dinovol: unexpected RoPE shape\n"); rc = -1; }
+        } else {   /* Compass RoPE (villa dinovol-refactor rope.py): the same phases as mixed RoPE with frequencies (C + S) (r dir(azimuth, polar)), C / S the
+                      orthonormal DFT cos / sin of the 24 pairs (the real Hartley transform); converted once to mix_frequencies [H][24][3] */
+            const wl_tensor *ra = wl_get(d, BN("rope_embed.radii")), *an = wl_get(d, BN("rope_embed.angles"));
+            if (!ra || !an || ra->shape[0] != n->H || ra->shape[1] != DV_HD / 2 || an->ndim != 3 || an->shape[2] != 2) { fprintf(stderr, "dinovol: block %d: no mixed or Compass RoPE\n", b); rc = -1; break; }
+            enum { NP = DV_HD / 2 }; float mx[n->H * NP * 3]; const double pi = 3.14159265358979323846;
+            for (int hh = 0; hh < n->H; hh++) {
+                double base[NP][3];
+                for (int q = 0; q < NP; q++) { const double r = ra->data[hh * NP + q], az = an->data[(hh * NP + q) * 2], po = an->data[(hh * NP + q) * 2 + 1];
+                    base[q][0] = r * sin(po) * cos(az); base[q][1] = r * sin(po) * sin(az); base[q][2] = r * cos(po); }
+                for (int pp = 0; pp < NP; pp++) for (int k = 0; k < 3; k++) { double acc = 0;
+                    for (int q = 0; q < NP; q++) { const double ph = 2 * pi / NP * pp * q; acc += (cos(ph) + sin(ph)) / sqrt((double)NP) * base[q][k]; }
+                    mx[(hh * NP + pp) * 3 + k] = (float)acc; }
+            }
+            V->mix = xdev_floats(mx, (size_t)n->H * NP * 3);
+        }
+        V->qn = wl_get(d, BN("attn.q_norm.weight")) ? devf(d, BN("attn.q_norm.weight")) : nullptr;   /* QK-norm: RMSNorm per head, eps 1e-6, before RoPE */
+        V->kn = V->qn ? devf(d, BN("attn.k_norm.weight")) : nullptr;
+        if (V->qn && !V->kn) rc = -1;
+        rc |= !V->ln1w || !V->ln1b || !V->ln2w || !V->ln2b || !V->mix;
         rc |= conv_of(d, &V->qkv, BN("attn.qkv.weight"), nullptr, 1, 0, nullptr, nullptr);
         /* x + gamma (W o + b): epilogue scale gamma, bias gamma b */
         const wl_tensor *g1 = need(d, BN("gamma_1")), *pb = need(d, BN("attn.proj.bias")), *g2 = need(d, BN("gamma_2")), *f2b = need(d, BN("mlp.fc2.bias"));
@@ -190,7 +211,7 @@ void dv_free(dv_net *n) {
     cln_free(&n->stem);
     for (int i = 0; i < n->nbb; i++) { cln_free(&n->bb[i].c1); cln_free(&n->bb[i].c2); if (n->bb[i].has_sk) cln_free(&n->bb[i].sk); }
     xconv_free(&n->fproj); xfree_dev(n->prefix);
-    for (int b = 0; b < n->depth; b++) { vblock *V = &n->vb[b]; xfree_dev(V->ln1w); xfree_dev(V->ln1b); xfree_dev(V->ln2w); xfree_dev(V->ln2b); xfree_dev(V->mix);
+    for (int b = 0; b < n->depth; b++) { vblock *V = &n->vb[b]; xfree_dev(V->ln1w); xfree_dev(V->ln1b); xfree_dev(V->ln2w); xfree_dev(V->ln2b); xfree_dev(V->mix); if (V->qn) { xfree_dev(V->qn); xfree_dev(V->kn); }
         xconv_free(&V->qkv); xconv_free(&V->proj); xconv_free(&V->fc1); xconv_free(&V->fc2); }
     xfree_dev(n->nw); xfree_dev(n->nb);
     xconv_free(&n->ref1);
@@ -203,7 +224,7 @@ void dv_free(dv_net *n) {
 int dv_embed_dim(const dv_net *n) { return n->E; }
 int dv_dense_dims(const dv_net *n, int *nd, int *ni) { *nd = n->nd; *ni = n->ni; return n->nd + n->ni; }
 int dv_patch(const dv_net *n) { (void)n; return DV_PATCH; }
-int dv_train_tile(const dv_net *n) { (void)n; return 192; }
+int dv_train_tile(const dv_net *n) { return n->vb[0].qn ? 256 : 192; }   /* (g256_compassrope_qknorm: global crops 256; 8um_ps192: 192; the 9.6 um model's 128 is not told apart) */
 const void *dv_tokens(const dv_net *n) { return n->tok.p; }
 const void *dv_cls(const dv_net *n) { return n->clsn; }
 const void *dv_skip(const dv_net *n, int k, int *edge, int *ch) { *edge = n->sk[k].d; *ch = n->sk[k].c; return n->sk[k].p; }
@@ -264,6 +285,7 @@ int dv_forward_norm(dv_net *n, const uint8_t *u8_dev, int T, float lo, float hi,
         xt qkv = lt ? xt_new(1, 1, 1, (int)N, 3 * n->E) : xconv_fwd(&V->qkv, h, nullptr, XA_NONE);
         if (lt && dv_gemm(h.p, (int)N, n->E, V->qkv.w, V->qkv.Kp, 3 * n->E, nullptr, qkv.p, 0, 0)) return -1;
         dv_prof(DVP_QKV);
+        if (V->qn) dv_qknorm(qkv.p, V->qn, V->kn, 1e-6f, (int)N, n->H);
         dv_rope(qkv.p, V->mix, (int)N, DV_PRE, g, n->H);
         dv_prof(DVP_ROPE);
         dv_attention48(qkv.p, o.p, (int)N, n->H);

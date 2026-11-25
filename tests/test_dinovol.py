@@ -6,7 +6,9 @@ torch, the checkpoint, the official sources, the CT, the GPU or build/ufsm are m
 CT: a 9.6 um Paris 4 crop (UFSM_DINOVOL_CT root, UFSM_DINOVOL_KEY, default the fitkit p4box level 2). Tiles 128 (and 192 with
 UFSM_DINOVOL_FULL=1). Bounds (fp16 vs fp32; as the code checks them, 2026-11-14 doc fix: the 2026-10-21 text said 0.999 / 0.99 and
 0.995 / 0.95, the code has been tighter since): token cosine >= 0.99999 mean / 0.9999 min; CNN skips and the FPN grid >= 0.9999 mean;
-dense / ink cosine >= 0.9999 mean / 0.999 min."""
+dense / ink cosine >= 0.9999 mean / 0.999 min.
+UFSM_DINOVOL_CKPT: another checkpoint of the family (2026-11-24: g256_compassrope_qknorm_step_781000, Compass RoPE converted to mixed
+frequencies at load + QK-norm; suite test_dinovol_g256, UFSM_DINOVOL_FULL_TILE 256 for its training crop)."""
 import os, pathlib, subprocess, sys, tempfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import dinovol_ref as R
@@ -40,7 +42,7 @@ def main():
         skip("no GPU")
     torch.set_num_threads(int(os.environ.get("UFSM_TEST_TORCH_THREADS", "8")))
     bb, head = R.build()
-    tiles = [128] + ([192] if os.environ.get("UFSM_DINOVOL_FULL") == "1" else [])
+    tiles = [128] + ([int(os.environ.get("UFSM_DINOVOL_FULL_TILE", "192"))] if os.environ.get("UFSM_DINOVOL_FULL") == "1" else [])
     rng = np.random.default_rng(1)
     center, scale, hi = 84.0, 31.5, 200.0
     fails = 0

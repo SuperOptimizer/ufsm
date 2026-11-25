@@ -102,12 +102,12 @@ static int scan_stats(const char *dir, const char *key, z3 *ct, int nthreads, fl
 static int cmd_feats(int argc, char **argv) {
     const char *ck = opt(argc, argv, "--ckpt", nullptr), *root = opt(argc, argv, "--root", "/vesuvius/ufsm/v2/ct"), *cdir = opt(argc, argv, "--crops", nullptr),
                *list = opt(argc, argv, "--list", nullptr), *out = opt(argc, argv, "--out", nullptr), *cache = opt(argc, argv, "--cache", nullptr);
-    const int T = opt_atoi("--tile", opt(argc, argv, "--tile", "192")), M = opt_atoi("--margin", opt(argc, argv, "--margin", "32")),
+    int T = opt_atoi("--tile", opt(argc, argv, "--tile", "0")); const int M = opt_atoi("--margin", opt(argc, argv, "--margin", "32")),
               st = opt_atoi("--px-stride", opt(argc, argv, "--px-stride", "4")), onlysup = opt_atoi("--sup-only", opt(argc, argv, "--sup-only", "1")),
               maxc = opt_atoi("--max-crops", opt(argc, argv, "--max-crops", "0"));
     const int nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 6);
-    if (!ck || !cdir || !out || T % 16 || M < 0 || 2 * M >= T || st < 1) {
-        fprintf(stderr, "usage: ufsm dinovol-probe feats --ckpt PT --crops DIR [--list crops.tsv] --out F.dvf [--root CTROOT] [--tile 192] [--margin 32]\n"
+    if (!ck || !cdir || !out || T % 16 || M < 0 || (T && 2 * M >= T) || st < 1) {
+        fprintf(stderr, "usage: ufsm dinovol-probe feats --ckpt PT --crops DIR [--list crops.tsv] --out F.dvf [--root CTROOT] [--tile T (0: the model's training crop)] [--margin 32]\n"
                         "         [--px-stride 4] [--sup-only 1] [--max-crops N] [--stats-dir DIR] [--gpu 0] [--gpu-mem 7] [--threads 6] [--cache DIR]\n");
         return 2; }
     char lp[1400]; if (!list) { snprintf(lp, sizeof lp, "%s/crops.tsv", cdir); list = lp; }
@@ -122,6 +122,9 @@ static int cmd_feats(int argc, char **argv) {
     xnet_set_budget((size_t)(opt_atof("--gpu-mem", opt(argc, argv, "--gpu-mem", "7")) * 1e9));
     store_global_init();
     dv_net *net = dv_load(ck); if (!net) return 1;
+    if (!T) T = dv_train_tile(net);
+    if (2 * M >= T) { fprintf(stderr, "dinovol-probe: margin %d too large for tile %d\n", M, T); return 2; }
+    fprintf(stderr, "dinovol-probe: tile %d, margin %d\n", T, M);
     int nd = 0, ni = 0; dv_dense_dims(net, &nd, &ni); const int E = dv_embed_dim(net), F = E + nd + ni, g = T / 8;
     FILE *fo = fopen(out, "wb"); if (!fo) { fprintf(stderr, "dinovol-probe: cannot write %s\n", out); return 1; }
     dvf_head H = {{'D', 'V', 'P', 'F', '0', '0', '0', '1'}, F, E, nd, ni, nc, st, 0, 0};

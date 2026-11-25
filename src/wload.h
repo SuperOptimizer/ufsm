@@ -3,7 +3,7 @@
    knows the tensor-rebuild opcodes (_rebuild_tensor_v2 / _rebuild_parameter over persistent-id storages, OrderedDict, plain
    containers and scalars). Every tensor is converted to a contiguous float32 array (f32 / f16 / bf16 / f64 / integer storages).
 
-   A .pth holds a dict; the state dict is the entry named `sub` (e.g. "ema_model", "model"), or with sub nullptr the top-level dict
+   A .pth holds a dict; the state dict is the entry named `sub` (e.g. "ema_model", "model"; "a.b.c" descends nested dicts), or with sub nullptr the top-level dict
    when it holds tensors, else the first of "ema_model", "model", "state_dict" or any other entry that is a dict of tensors.
    The top-level numbers and strings of a .pth (e.g. sampling_um, architecture_family) stay readable (wl_num / wl_str). */
 #pragma once
