@@ -10,7 +10,7 @@ import os, pathlib, subprocess, sys, tempfile, types
 os.environ.setdefault("UFSM_XNET_MX", "0")   # the parity tests check the fp16 port; hecate24 defaults to MX5 otherwise
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-UFSM = ROOT / "build/ufsm"
+UFSM = pathlib.Path(os.environ.get("UFSM_BIN", ROOT / "build/ufsm"))   # (UFSM_BIN: a side build)
 DATA = pathlib.Path(os.environ.get("UFSM_INKEXT", "~/ufsm-data/inkext")).expanduser()
 CT_ROOT = pathlib.Path(os.environ.get("UFSM_INKEXT_CT_ROOT", "~/ufsm-data/vol")).expanduser()
 CT_KEY = os.environ.get("UFSM_INKEXT_CT_KEY", "PHerc1299/volumes/20260309130042-2.399um-0.2m-78keV-masked.zarr")
