@@ -200,23 +200,29 @@ int main(void) {
     {   /* --pred2 (2026-11-25, the 1.1 um fusion test): the FUSE row. (1) pred2 = pred: the three AUCs equal each other and the plain audit's
            HOLD auc_max, every paired difference 0; (2) pred / pred2 swapped (CT and pred): the two single AUCs swap, the rank average is the same */
         const char *pp[3][2] = {{"pred.zarr/1", "pred.zarr/1"}, {"pa.zarr/1", "pb.zarr/1"}, {"pb.zarr/1", "pa.zarr/1"}};
-        double fr[3][9]; int okr[3] = {0, 0, 0};
+        double fr[3][9], ea[3][6][2]; int okr[3] = {0, 0, 0}, ne[3] = {0, 0, 0}, nfr[3] = {0, 0, 0}; unsigned long long esum[3] = {0, 0, 0}, fpx[3] = {0, 0, 0}; double fra[3][2];
         for (int k = 0; k < 3; k++) {
             char ot[600]; snprintf(ot, sizeof ot, "%s/f%d.tsv", dir, k); fflush(stdout); fflush(stderr);
             const pid_t c4 = fork();
             if (c4 == 0) {
                 const int fd = open(ot, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) _exit(9); dup2(fd, 1);
                 char *av[] = {"ufsm", "ink-audit", segs, "--ct", dir, "ct.zarr", "--ct-um", "1", "--level", "0", "--iso", "100", "--holdouts", ho, "--pred", dir, (char *)pp[k][0],
-                              "--pred-level", "0", "--pred2", dir, (char *)pp[k][1], "--pred2-level", "0", "--stride", "1", "--tag", "t", "--threads", "4", nullptr};
-                _exit(cmd_ink_audit(30, av));
+                              "--pred-level", "0", "--pred2", dir, (char *)pp[k][1], "--pred2-level", "0", "--pred2-edge", "12", "--stride", "1", "--tag", "t", "--threads", "4", nullptr};
+                _exit(cmd_ink_audit(32, av));
             }
             st = 0; waitpid(c4, &st, 0); CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "ink-audit --pred2 %d exit %d", k, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
             FILE *g = fopen(ot, "r");
             while (g && fgets(ln, sizeof ln, g)) { char t2[16], sp2[16]; unsigned long long npx; int nr;
                 if (sscanf(ln, "FUSE %15s %15s %llu %d %lf %lf %lf %lf %lf %lf %lf %lf %lf", t2, sp2, &npx, &nr, fr[k], fr[k] + 1, fr[k] + 2, fr[k] + 3, fr[k] + 4, fr[k] + 5, fr[k] + 6,
-                           fr[k] + 7, fr[k] + 8) == 13) { okr[k] = 1; fprintf(stderr, "FUSE %d: %llu HOLD px, %d regions: %s", k, npx, nr, strchr(ln, '\t') + 1); } }
+                           fr[k] + 7, fr[k] + 8) == 13) { okr[k] = 1; fpx[k] = npx; fprintf(stderr, "FUSE %d: %llu HOLD px, %d regions: %s", k, npx, nr, strchr(ln, '\t') + 1); }
+                char bn[16]; unsigned long long n1, n0; double a1, a2, dd; int rg;
+                if (ne[k] < 6 && sscanf(ln, "EDGE %15s %15s %llu %llu %lf %lf %lf", t2, bn, &n1, &n0, &a1, &a2, &dd) == 7) { ea[k][ne[k]][0] = a1; ea[k][ne[k]][1] = a2; ne[k]++; esum[k] += n1 + n0; }
+                if (sscanf(ln, "FREG %15s %d %llu %lf %lf %lf %lf", t2, &rg, &n1, &dd, &a1, &a2, &dd) == 7) { fra[k][0] = a1; fra[k][1] = a2; nfr[k]++; } }
             if (g) fclose(g);
             CHECK(okr[k], "ink-audit --pred2 %d: no FUSE row", k);
+            /* --pred2-edge: six EDGE buckets that partition the FUSE pixels; FREG: the one region's AUCs are the FUSE row's */
+            CHECK(ne[k] == 6 && esum[k] == fpx[k], "--pred2-edge %d: %d EDGE rows, %llu px vs FUSE %llu", k, ne[k], esum[k], fpx[k]);
+            if (okr[k]) CHECK(nfr[k] == 1 && fra[k][0] == fr[k][0] && fra[k][1] == fr[k][1], "FREG %d: %d rows, %.4f %.4f vs FUSE %.4f %.4f", k, nfr[k], fra[k][0], fra[k][1], fr[k][0], fr[k][1]);
         }
         double hold16 = NAN; { FILE *g = fopen(tsv, "r"); while (g && fgets(ln, sizeof ln, g)) if (strstr(ln, "\tHOLD\t")) { char *t = ln; for (int i = 0; i < 16 && t; i++) { t = strchr(t, '\t'); if (t) t++; } if (t) hold16 = atof(t); } if (g) fclose(g); }
         if (okr[0]) CHECK(fabs(fr[0][0] - hold16) < 1e-4 && fr[0][0] == fr[0][1] && fr[0][1] == fr[0][2] && fr[0][3] == 0 && fr[0][5] == 0 && fr[0][7] == 0,
@@ -225,6 +231,9 @@ int main(void) {
                                       "swapped: %.4f %.4f %.4f vs %.4f %.4f %.4f", fr[1][0], fr[1][1], fr[1][2], fr[2][0], fr[2][1], fr[2][2]);
             CHECK(fr[1][0] > 0.6 && fr[1][0] < 0.97 && fr[1][1] > 0.6 && fr[1][1] < 0.97 && fr[1][2] > fmax(fr[1][0], fr[1][1]) + 0.01,
                   "partial predictions: %.4f / %.4f, rank average %.4f (must beat both)", fr[1][0], fr[1][1], fr[1][2]); }
+        for (int b = 0; b < 6 && ne[0] == 6; b++) CHECK(ea[0][b][0] == ea[0][b][1] || (isnan(ea[0][b][0]) && isnan(ea[0][b][1])), "EDGE pred2 = pred bucket %d: %.4f vs %.4f", b, ea[0][b][0], ea[0][b][1]);
+        for (int b = 0; b < 6 && ne[1] == 6 && ne[2] == 6; b++) CHECK((ea[1][b][0] == ea[2][b][1] && ea[1][b][1] == ea[2][b][0]) || (isnan(ea[1][b][0]) && isnan(ea[2][b][1])),
+                                                                "EDGE swapped bucket %d: %.4f %.4f vs %.4f %.4f", b, ea[1][b][0], ea[1][b][1], ea[2][b][0], ea[2][b][1]);
     }
     snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) {}
     free(X); free(Y); free(Z); free(lab); free(msk); free(ct); free(pr); free(pa); free(pbv);

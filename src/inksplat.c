@@ -3106,6 +3106,7 @@ static int au_why(const float *s, int n, int lo, int iso, int run, int gap) {   
 typedef struct {
     const geo *G; const uint8_t *val; double a, b; int Lf, Lp, stride; z3 *ct; vol *pred;
     vol *pred2; int Lp2; uint64_t *jr;   /* --pred2: the second prediction (level Lp2); jr: HOLD joint histogram [region][class][byte 1][byte 2] (merged under mu) */
+    int edge; uint64_t *eh;   /* --pred2-edge D: HOLD band-max histograms by label-edge distance [bucket][model][class][byte] (merged under mu) */
     int nreg; const int64_t (*reg)[6]; int nho; const int64_t (*ho)[6];
     _Atomic int next, failed; int ntile; pthread_mutex_t mu; aust *A;
     int64_t bg[3]; uint64_t *blk;   /* --blocks: 2048^3 level-0 block counts [block][split][class] of face-found pixels (merged under mu) */
@@ -3119,6 +3120,8 @@ static int au_in(const double P[3], const int64_t b[6], double m) {
 /* --pred2's fusion report (see cmd_ink_audit): from the HOLD joint histograms jr[region][class][b1][b2], with region `skip` left out
    (-1: none): the AUC of model 1, model 2 and of the rank average (cdf1(b1) + cdf2(b2)) / 2, each cdf the model's mid-rank over all HOLD
    pixels kept (both classes). Exact with ties (Mann-Whitney over the 65536 cells sorted by score). */
+enum { AU_EB = 6 };   /* --pred2-edge buckets (au_edge_bucket) */
+static const char *au_eb_name[AU_EB] = {"<=1", "<=2", "<=4", "<=8", "<=D", ">D"};
 typedef struct { double s; uint64_t n1, n0; } au_cell;
 static int au_cell_cmp(const void *a, const void *b) { const double x = ((const au_cell *)a)->s, y = ((const au_cell *)b)->s; return (x > y) - (x < y); }
 static void au_fuse_auc(const uint64_t *jr, int nreg, int skip, double out[3]) {
@@ -3150,13 +3153,38 @@ static void au_fuse(const char *tag, const uint64_t *jr, int nreg) {
     printf("FUSE\ttag\tsplit\tpx\tregions\tauc_pred\tauc_pred2\tauc_rankavg\td_fuse_pred\tse\td_fuse_pred2\tse\td_pred2_pred\tse\n");
     printf("FUSE\t%s\tHOLD\t%llu\t%d\t%.4f\t%.4f\t%.4f\t%+.4f\t%.4f\t%+.4f\t%.4f\t%+.4f\t%.4f\n", tag, (unsigned long long)npx, nj, full[0], full[1], full[2],
            full[2] - full[0], sd[0], full[2] - full[1], sd[1], full[1] - full[0], sd[2]);
+    printf("FREG\ttag\tregion\tpx\tink_share\tauc_pred\tauc_pred2\td_pred2_pred\n");   /* per region: where the second model wins or loses */
+    for (int r = 0; r < nreg; r++) { const uint64_t *src = jr + (size_t)r * 2 * 65536; uint64_t n1 = 0, n0 = 0; for (int i = 0; i < 65536; i++) { n0 += src[i]; n1 += src[65536 + i]; }
+        if (!(n1 + n0)) continue; double a[3]; au_fuse_auc(src, 1, -1, a);
+        printf("FREG\t%s\t%d\t%llu\t%.4f\t%.4f\t%.4f\t%+.4f\n", tag, r, (unsigned long long)(n1 + n0), (double)n1 / (double)(n1 + n0), a[0], a[1], a[1] - a[0]); }
     fflush(stdout);
+}
+static double au_auc(const uint64_t *h1, const uint64_t *h0);
+static void au_edge(const char *tag, const uint64_t *eh, int D) {
+    printf("EDGE\ttag\tdist_px\tn_ink\tn_no\tauc_pred\tauc_pred2\td_pred2_pred\n");
+    for (int b = 0; b < AU_EB; b++) { const uint64_t *h = eh + (size_t)b * 2 * 2 * 256; uint64_t n1 = 0, n0 = 0; for (int v = 0; v < 256; v++) { n0 += h[v]; n1 += h[256 + v]; }
+        const double a1 = au_auc(h + 256, h), a2 = au_auc(h + 512 + 256, h + 512);
+        char nm[16]; if (b >= 4) snprintf(nm, sizeof nm, "%s%d", b == 4 ? "<=" : ">", D); else snprintf(nm, sizeof nm, "%s", au_eb_name[b]);
+        printf("EDGE\t%s\t%s\t%llu\t%llu\t%.4f\t%.4f\t%+.4f\n", tag, nm, (unsigned long long)n1, (unsigned long long)n0, a1, a2, a2 - a1); }
+    fflush(stdout);
+}
+/* --pred2-edge D (2026-11-25, where the 1.1 um net loses to R1): a labelled pixel's Euclidean distance in label px to the nearest supported
+   pixel of the other class, searched up to D, as bucket 0..AU_EB-1: <= 1, <= 2, <= 4, <= 8, <= D, none within D (deep inside a stroke or
+   background). Within one bucket both classes sit equally far from a label edge, so its AUC isolates edge vs interior discrimination;
+   thin strokes have all their ink in the low buckets. */
+static int au_edge_bucket(const geo *G, int64_t r, int64_t c, int cls, int D) {
+    int64_t best = (int64_t)D * D + 1;
+    for (int64_t dr = -D; dr <= D; dr++) { const int64_t rr = r + dr; if (rr < 0 || rr >= G->lh || dr * dr >= best) continue;
+        for (int64_t dc = -D; dc <= D; dc++) { const int64_t cc = c + dc, d2 = dr * dr + dc * dc; if (cc < 0 || cc >= G->lw || d2 >= best) continue;
+            if (px_sup(G, rr, cc) && (G->lab[(size_t)rr * G->lw + cc] >= 128) != cls) best = d2; } }
+    return best > (int64_t)D * D ? 5 : best <= 1 ? 0 : best <= 4 ? 1 : best <= 16 ? 2 : best <= 64 ? 3 : 4;
 }
 static void *au_worker(void *arg) {
     aujob *J = arg; const geo *G = J->G; aust *A = calloc(1, sizeof *A); if (!A) { atomic_store(&J->failed, 1); return nullptr; }
+    uint64_t *eh = J->eh ? calloc((size_t)AU_EB * 2 * 2 * 256, sizeof *eh) : nullptr; if (J->eh && !eh) { atomic_store(&J->failed, 1); free(A); return nullptr; }
     const double Vf = (double)(1 << J->Lf), Vp = (double)(1 << J->Lp), of = (Vf - 1) / 2, op = (Vp - 1) / 2;
     const double Vp2 = (double)(1 << J->Lp2), op2 = (Vp2 - 1) / 2; float pv2[AU_NT];
-    uint32_t *jr = J->jr ? calloc((size_t)AU_MAXR * 2 * 65536, sizeof *jr) : nullptr; if (J->jr && !jr) { atomic_store(&J->failed, 1); free(A); return nullptr; }
+    uint32_t *jr = J->jr ? calloc((size_t)AU_MAXR * 2 * 65536, sizeof *jr) : nullptr; if (J->jr && !jr) { atomic_store(&J->failed, 1); free(A); free(eh); return nullptr; }
     float cv[AU_NT], pv[AU_NT]; const size_t nbk = J->blk ? (size_t)(J->bg[0] * J->bg[1] * J->bg[2]) : 0; uint64_t *bk = nbk ? calloc(nbk * 6, sizeof *bk) : nullptr;
     for (int t; (t = atomic_fetch_add(&J->next, 1)) < J->ntile && !atomic_load(&J->failed);) {
         const int tx = t % G->ntiles_x, ty = t / G->ntiles_x;
@@ -3209,6 +3237,7 @@ static void *au_worker(void *arg) {
                     if (m > 0) { const int bv = (int)lround(s / m); A->ct[sp][cls][bv]++; A->rct[ri][cls][bv]++; }
                 }
                 if (!pb) continue;
+                const int eb = eh && sp == 2 ? au_edge_bucket(G, r, cc, cls, J->edge) : -1;
                 for (int ref = 0; ref < 2; ref++) for (int s = -AU_S; s <= AU_S; s++) {
                     const int t0 = (int)ceil((ref ? 0 : fo) + J->a + s), t1 = (int)floor((ref ? 0 : fo) + J->b + s);
                     double mx = -1, sm = 0; int m = 0;
@@ -3219,7 +3248,8 @@ static void *au_worker(void *arg) {
                     if (!ref && !s) A->rsc[ri][cls][bm > 255 ? 255 : bm]++;
                     if (!ref && !s && jr && sp == 2) {   /* --pred2: its band max on the same samples, the pair into the joint histogram */
                         double mx2 = -1; int m2 = 0; for (int tt = t0; tt <= t1; tt++) { const int i = tt + AU_T; if (i < 0 || i >= AU_NT || pv2[i] < 0) { m2 = -1; break; } if (pv2[i] > mx2) mx2 = pv2[i]; m2++; }
-                        if (m2 > 0) { const int b2 = (int)lround(mx2); jr[((size_t)ri * 2 + cls) * 65536 + (size_t)(bm > 255 ? 255 : bm) * 256 + (b2 > 255 ? 255 : b2)]++; } }
+                        if (m2 > 0) { const int b2 = (int)lround(mx2); jr[((size_t)ri * 2 + cls) * 65536 + (size_t)(bm > 255 ? 255 : bm) * 256 + (b2 > 255 ? 255 : b2)]++;
+                                      if (eb >= 0) { eh[(((size_t)eb * 2 + 0) * 2 + cls) * 256 + (bm > 255 ? 255 : bm)]++; eh[(((size_t)eb * 2 + 1) * 2 + cls) * 256 + (b2 > 255 ? 255 : b2)]++; } } }
                 }
             }
         }
@@ -3227,6 +3257,7 @@ static void *au_worker(void *arg) {
     }
     pthread_mutex_lock(&J->mu);
     if (jr) { for (size_t i = 0; i < (size_t)AU_MAXR * 2 * 65536; i++) J->jr[i] += jr[i]; free(jr); }
+    if (eh) { for (size_t i = 0; i < (size_t)AU_EB * 2 * 2 * 256; i++) J->eh[i] += eh[i]; free(eh); }
     if (bk) { for (size_t i = 0; i < nbk * 6; i++) J->blk[i] += bk[i]; free(bk); }
     { uint64_t *a = (uint64_t *)J->A, *b = (uint64_t *)A; const size_t nu = offsetof(aust, ctp) / sizeof(uint64_t); for (size_t i = 0; i < nu; i++) a[i] += b[i]; }
     { double *a = J->A->ctp[0][0], *b = A->ctp[0][0]; const size_t nd = 3 * (size_t)AU_SPN * 2 * AU_NT; for (size_t i = 0; i < nd; i++) a[i] += b[i]; }
@@ -3255,6 +3286,7 @@ int cmd_ink_audit(int argc, char **argv) {
         fprintf(stderr, "usage: ufsm ink-audit SEGS.json --ct ROOT KEY --ct-um U [--level 1] [--iso 64] [--face -6,0] [--face-search -6,20] [--holdouts H.json] [--val-mode off|exclude]\n"
                         "         [--pred ROOT KEY --pred-level 2] [--region z,y,x,nz,ny,nx (level-0, repeatable)] [--norm C,S] [--stride 2] [--tag T] [--out PREFIX [--blocks [--blocks-size 2048]]] [--threads 8] [--cache DIR]\n"
                         "         [--map reg.json [--map-pad 4]] [--hold-only]   (SEGS / --holdouts of the map's coarse scan, --ct / --pred this fine scan's)\n"
+                        "         [--pred2 ROOT KEY --pred2-level 2 [--pred2-edge D]]   (HOLD: FUSE row (each, rank average, jackknife SEs), FREG per region, EDGE by label-edge distance)\n"
                         "  per split (TRAIN / VAL / HOLD) along the onfly ink labels: positives, face offsets, band CT, prediction AUC per band shift, score quantiles\n"); return 2;
     }
     inksplat_cfg c; inksplat_defaults(&c); c.face = 1;
@@ -3295,6 +3327,9 @@ int cmd_ink_audit(int argc, char **argv) {
     const int p2i = sidx(argc, argv, "--pred2"), Lp2 = opt_atoi("--pred2-level", sopt(argc, argv, "--pred2-level", "2")); vol pv2; memset(&pv2, 0, sizeof pv2);
     if (p2i >= 0 && (pi < 0 || p2i + 2 >= argc || Lp2 < 0 || Lp2 > 5 || vol_open(&pv2, argv[p2i + 1], argv[p2i + 2], c.cache))) { fprintf(stderr, "ink-audit: --pred2 ROOT KEY (with --pred, --pred2-level 0..5)\n"); return 1; }
     uint64_t *jr = p2i >= 0 ? calloc((size_t)AU_MAXR * 2 * 65536, sizeof *jr) : nullptr; if (p2i >= 0 && !jr) return 1;
+    const int edgeD = opt_atoi("--pred2-edge", sopt(argc, argv, "--pred2-edge", "0"));   /* EDGE rows: AUCs by label-edge distance (au_edge_bucket) */
+    if (edgeD && (p2i < 0 || edgeD < 9 || edgeD > 64)) { fprintf(stderr, "ink-audit: --pred2-edge D needs --pred2, D 9..64 label px\n"); free(jr); return 1; }
+    uint64_t *ehist = edgeD ? calloc((size_t)AU_EB * 2 * 2 * 256, sizeof *ehist) : nullptr; if (edgeD && !ehist) { free(jr); return 1; }
     FILE *fp = fopen(argv[2], "rb"); if (!fp) { fprintf(stderr, "ink-audit: cannot open %s\n", argv[2]); return 1; }
     fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *txt = malloc((size_t)sz + 1); size_t rd = fread(txt, 1, (size_t)sz, fp); fclose(fp); txt[rd] = 0;
     json *j = json_parse(txt, rd); free(txt); const json *sg = json_get(j, "segments");
@@ -3353,7 +3388,7 @@ int cmd_ink_audit(int argc, char **argv) {
             if (atomic_load(&FJ.failed)) bad = 1;
             else {
                 aujob AJ = {0}; AJ.G = &G; AJ.val = V; AJ.a = c.face_a; AJ.b = c.face_b; AJ.Lf = c.level; AJ.Lp = Lp; AJ.stride = stride; AJ.ct = ct; AJ.pred = pi >= 0 ? &pv : nullptr;
-                AJ.pred2 = p2i >= 0 ? &pv2 : nullptr; AJ.Lp2 = Lp2; AJ.jr = jr;
+                AJ.pred2 = p2i >= 0 ? &pv2 : nullptr; AJ.Lp2 = Lp2; AJ.jr = jr; AJ.edge = edgeD; AJ.eh = ehist;
                 AJ.nreg = nreg; AJ.reg = (const int64_t (*)[6])reg; AJ.nho = hc.nexcl; AJ.ho = (const int64_t (*)[6])hc.excl; AJ.ntile = G.ntiles_x * G.ntiles_y; AJ.A = A; pthread_mutex_init(&AJ.mu, nullptr);
                 memcpy(AJ.bg, bg, sizeof bg); AJ.blk = blk;
                 for (int i = 0; i < nt; i++) pthread_create(&th[i], nullptr, au_worker, &AJ);
@@ -3430,7 +3465,8 @@ int cmd_ink_audit(int argc, char **argv) {
             fclose(f); }
     }
     if (jr) au_fuse(tag, jr, nreg ? nreg : 1);
-    free(jr); if (p2i >= 0) { if (pv2.a) z3_close(pv2.a); if (pv2.b) z2_close(pv2.b); }
+    if (ehist) au_edge(tag, ehist, edgeD);
+    free(jr); free(ehist); if (p2i >= 0) { if (pv2.a) z3_close(pv2.a); if (pv2.b) z2_close(pv2.b); }
     free(A); free(blk); z3_close(ct); if (pi >= 0) { if (pv.a) z3_close(pv.a); if (pv.b) z2_close(pv.b); }
     return 0;
 }
