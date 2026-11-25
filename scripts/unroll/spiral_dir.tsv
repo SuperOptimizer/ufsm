@@ -15,4 +15,4 @@ PHerc0813	?	unknown	no segments
 PHerc0846B	?	unknown	no segments
 PHerc1203	?	unknown	raw auto-grown segments, < 0.8 turn
 PHerc1545	?	unknown	no segments
-PHercMANB	?	unknown	no segments
+PHercMANB	-1	estimator	no segments; try9 cooled-33333 desk unroll 2026-11-24, both DIRCOH refs (whole scroll): coherence -1 0.0375 vs +1 0.0239 (under the 0.05 margin); wrap-check -1 106 real / 95 dup / 0 merged vs +1 93 / 106 / 2; unroll-qa -1 better on pw48 (9 vs 11 of 23 tiles over 0.1) and w4 (20 vs 21 of 30 under 0.8); z drift tied (4.42 vs 4.36 turns), conf_lo 44 of 48 both. Weak (crushed, S-folded slab: no rings to trace on L3 slices; the 11-12 u1 run used the default +1): replace with GT when it exists
