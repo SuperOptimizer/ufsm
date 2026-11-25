@@ -2893,6 +2893,9 @@ static int predict_one(int argc, char **argv) {
             const char *sout = opt(argc, argv, "--surf-out", nullptr); char ip[1500]; snprintf(ip, sizeof ip, "%s.isf", ckpt);
             const char *isf = opt(argc, argv, "--surf-isf", ip);
             if (!sout || split || nwork > 1 || lat_store || seam2) { fprintf(stderr, "predict --surf: needs --surf-out DIR; one GPU, no --split / --latents / --seam-inproc\n"); return 2; }
+            /* (11-25) the surface head reads the identity pass's trunk features only (surfp_window before the --tta passes): with --tta K
+               its map would silently be the K = 1 map */
+            if (tta > 1) { fprintf(stderr, "predict --surf: --tta is not applied to the surface head (it reads the identity pass only): use --tta 1\n"); return 2; }
             SF = surfp_open(sw, isf, cfg.widths[0], opt_atoi("--surf-P", opt(argc, argv, "--surf-P", "192")), opt_atoi("--surf-halo", opt(argc, argv, "--surf-halo", "32")),
                             2 * opt_atoi("--surf-k", opt(argc, argv, "--surf-k", "4")) + 1, scale, opt_atof("--surf-pvox", opt(argc, argv, "--surf-pvox", "1")),
                             opt_atof("--surf-overlap", opt(argc, argv, "--surf-overlap", "0")), !strcmp(opt(argc, argv, "--surf-blend", "linear"), "cosine"));
