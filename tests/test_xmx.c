@@ -338,6 +338,15 @@ int main(void) {
                 size_t nd = 0; if (v > 5) for (size_t j = 0; j < ny; j++) nd += y0[j] != y1[j];
                 bad += nd != 0; printf("  cfg %d %.3f ms%s", cfg, best * 1e3, nd ? " DIFFERS" : "");
             }
+            {   /* the fp16 K-step sums (UFSM_XNET_F16ACC) at the default pick: time, and the difference to fp32 accumulation */
+                xnet_set_cfg(0); xnet_set_f16acc(0); xt y = xconv_fwd(&c, x, nullptr, XA_NONE); xnet_sync(); xd2h(y0, y.p, ny * 2); xt_free(&y);
+                xnet_set_f16acc(1); double best = 1e9;
+                for (int r = 0; r < (bench ? 10 : 1); r++) { xnet_sync(); const double t0 = now(); xt y2 = xconv_fwd(&c, x, nullptr, XA_NONE); xnet_sync(); const double t = now() - t0; if (t < best) best = t; xd2h(y1, y2.p, ny * 2); xt_free(&y2); }
+                xnet_set_f16acc(0);
+                double d2 = 0, r2 = 0, md = 0, mr = 0; for (size_t j = 0; j < ny; j++) { const double a = h2f(y1[j]), b = h2f(y0[j]); d2 += (a - b) * (a - b); r2 += b * b; md = fmax(md, fabs(a - b)); mr = fmax(mr, fabs(b)); }
+                const double rel = sqrt(d2 / (r2 > 0 ? r2 : 1)); const int ok = rel < 2e-3 && md < 1e-2 * mr && isfinite(rel); bad += !ok;
+                printf("  f16acc %.3f ms rel L2 %.2e max %.2e%s", best * 1e3, rel, md / (mr > 0 ? mr : 1), ok ? "" : " FAIL");
+            }
             printf("\n"); xnet_set_cfg(0); xt_free(&x); xconv_free(&c); free(w); free(xh); free(y0); free(y1);
         }
         printf("%s\n", bad ? "FAIL" : "PASS"); return bad != 0;

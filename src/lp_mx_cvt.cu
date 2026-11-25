@@ -87,7 +87,8 @@ template <> __device__ __forceinline__ float rnd16<bf16>(float v) { return __bfl
 /* the 4 input channels of one voxel (CT, then the radial unit vector through the window's symmetry or warp), the expressions of
    input_rad_k in order (bit for bit): voxel (n, iz, iy, ix) of an N x D x P x P window, i its linear index */
 template <typename TI>
-__device__ __forceinline__ void rad_full4(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int D, int P, int n, int iz, int iy, int ix, size_t i, float *r4) {
+__device__ __forceinline__ void rad_full4(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int D, int P, int n, int iz, int iy, int ix, size_t i, float *r4,
+                                          float *src_out = nullptr) {   /* src_out: the voxel's source-frame position (the aux channel), [0] = -1 outside the cube */
     const int *h = (const int *)(recs + (size_t)n * rec_bytes);
     const float *cyz = (const float *)(h + 8), *cxz = cyz + h[2];
     const int o1 = h[0], o2 = h[1], hasax = h[4], pf = h[5];
@@ -128,6 +129,7 @@ __device__ __forceinline__ void rad_full4(const TI *ct, const uint8_t *recs, siz
         int inside = 1;
 #pragma unroll
         for (int d = 0; d < 3; d++) if (u[d] < 0.f || u[d] > fP1) inside = 0;
+        if (src_out) { for (int d = 0; d < 3; d++) src_out[d] = u[d]; if (!inside) src_out[0] = -1.f; }
         if (inside) {
             int b0 = (int)u[0]; if (b0 >= P - 1) b0 = P - 2;
             const float frac = __fsub_rn(u[0], (float)b0);
@@ -159,6 +161,7 @@ __device__ __forceinline__ void rad_full4(const TI *ct, const uint8_t *recs, siz
         for (int k = 0; k < 4; k++) r4[k] = r[k];
         return;
     }
+    if (src_out) for (int d = 0; d < 3; d++) src_out[d] = (float)s[d];
     float comp[3] = {0.f, 0.f, 0.f};
     if (hasax) {
         const float dy = __fsub_rn((float)(o1 + s[1]), cyz[s[0]]), dx = __fsub_rn((float)(o2 + s[2]), cxz[s[0]]);
@@ -169,16 +172,43 @@ __device__ __forceinline__ void rad_full4(const TI *ct, const uint8_t *recs, siz
     for (int d = 0; d < 3; d++) r[1 + d] = rnd16<TI>(__fmul_rn((pf >> (8 + d)) & 1 ? -1.f : 1.f, comp[(pf >> (2 * d)) & 3]));   /* sign x component (signed zeros as the host) */
     for (int k = 0; k < 4; k++) r4[k] = r[k];
 }
+/* train --aux-input with --gpu-input (nn.h nn_input_rad_aux, 2026-11-25 the cascade input): the fifth channel at source-frame position u
+   from the sample's coarse box (nn_aux_hdr): q = u inv_f + o, trilinear (the base corner clamped into the box), rounded to a byte, then
+   byte / 127.5 - 1 in the 16-bit type; outside the source cube or without a box (on 0): byte 0. IEEE intrinsics in the order of
+   sample.c sample_aux_byte, bit for bit. */
+__device__ __forceinline__ int aux_byte(const uint8_t *aux, int n, const float *u) {
+    const int *h = (const int *)(aux + (size_t)n * 32); const float *hf = (const float *)h;
+    if (!h[5] || u[0] < 0.f) return 0;
+    const int nc = h[4]; const uint8_t *bx = aux + h[6];
+    int b[3]; float f[3];
+#pragma unroll
+    for (int d = 0; d < 3; d++) {
+        const float q = __fadd_rn(__fmul_rn(u[d], hf[3]), hf[d]);
+        int bb = (int)floorf(q); bb = bb < 0 ? 0 : bb > nc - 2 ? nc - 2 : bb;
+        float fr = __fsub_rn(q, (float)bb); fr = fr < 0.f ? 0.f : fr > 1.f ? 1.f : fr;
+        b[d] = bb; f[d] = fr;
+    }
+    float v = 0.f;
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+        const int dz = k >> 2, dy = (k >> 1) & 1, dx = k & 1;
+        const float w = __fmul_rn(__fmul_rn(dz ? f[0] : __fsub_rn(1.f, f[0]), dy ? f[1] : __fsub_rn(1.f, f[1])), dx ? f[2] : __fsub_rn(1.f, f[2]));
+        v = __fadd_rn(v, __fmul_rn(w, (float)bx[((size_t)(b[0] + dz) * nc + (b[1] + dy)) * nc + (b[2] + dx)]));
+    }
+    const int bv = (int)__fadd_rn(v, .5f);
+    return bv > 255 ? 255 : bv;
+}
 template <int B, typename TI>
-__global__ void input_rad_k(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int D, int P, uint8_t *y, int z0 = 0, int nz = 0) {   /* grid (x blocks, y, n nz);
-                                                                     z-window: planes [z0, z0 + nz) (nz 0: all D) */
+__global__ void input_rad_k(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int D, int P, uint8_t *y, int z0 = 0, int nz = 0,
+                            const uint8_t *aux = nullptr) {   /* grid (x blocks, y, n nz); z-window: planes [z0, z0 + nz) (nz 0: all D); aux: the fifth channel */
     const int NZ = nz ? nz : D, ix = blockIdx.x * blockDim.x + threadIdx.x, iy = blockIdx.y, n = blockIdx.z / NZ, iz = z0 + (int)blockIdx.z - n * NZ;
     if (ix >= P) return;
     const size_t S = (size_t)D * P * P, i = (((size_t)n * D + iz) * P + iy) * P + ix;
-    float r[32];
+    float r[32], u[3] = {0.f, 0.f, 0.f};
 #pragma unroll
     for (int k = 0; k < 32; k++) r[k] = 0.f;
-    rad_full4<TI>(ct, recs, rec_bytes, N, D, P, n, iz, iy, ix, i, r);
+    rad_full4<TI>(ct, recs, rec_bytes, N, D, P, n, iz, iy, ix, i, r, aux ? u : nullptr);
+    if (aux) r[4] = rnd16<TI>(__fsub_rn(__fdiv_rn((float)aux_byte(aux, n, u), 127.5f), 1.f));
     mx_store_row_b<B>(y, mx_sc<B>(y, N, 4, S), i, 8, r);
 }
 /* train --lat 4 (pool4) with --gpu-input: the network's 4 input channels on the 4^3 cells of the window, each the cell mean (fp32 sum in
@@ -356,14 +386,14 @@ extern "C" void lp_input_lat(const void *ct16, int dt, const void *rec, size_t r
 #undef ILT
     LPCK();
 }
-extern "C" void lp_input_rad(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int D, int P, void *y, int bits) {
-    const uint8_t *rr = (const uint8_t *)rec; uint8_t *yy = (uint8_t *)y;
+extern "C" void lp_input_rad(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int D, int P, void *y, int bits, const void *aux) {
+    const uint8_t *rr = (const uint8_t *)rec, *ax = (const uint8_t *)aux; uint8_t *yy = (uint8_t *)y;
     const int bx = P < 128 ? (P + 31) / 32 * 32 : 128;
     int z0 = 0, z1 = D; zw_win(D, &z0, &z1);   /* z-window: the input planes [z0, z1) */
     const dim3 grid((unsigned)((P + bx - 1) / bx), (unsigned)P, (unsigned)(N * (z1 - z0)));
     const int nz = z1 - z0;
-    if (bits == 4) { if (dt == 2) input_rad_k<4, __half><<<grid, bx>>>((const __half *)ct16, rr, rec_bytes, N, D, P, yy, z0, nz); else input_rad_k<4, bf16><<<grid, bx>>>((const bf16 *)ct16, rr, rec_bytes, N, D, P, yy, z0, nz); }
-    else { if (dt == 2) input_rad_k<8, __half><<<grid, bx>>>((const __half *)ct16, rr, rec_bytes, N, D, P, yy, z0, nz); else input_rad_k<8, bf16><<<grid, bx>>>((const bf16 *)ct16, rr, rec_bytes, N, D, P, yy, z0, nz); }
+    if (bits == 4) { if (dt == 2) input_rad_k<4, __half><<<grid, bx>>>((const __half *)ct16, rr, rec_bytes, N, D, P, yy, z0, nz, ax); else input_rad_k<4, bf16><<<grid, bx>>>((const bf16 *)ct16, rr, rec_bytes, N, D, P, yy, z0, nz, ax); }
+    else { if (dt == 2) input_rad_k<8, __half><<<grid, bx>>>((const __half *)ct16, rr, rec_bytes, N, D, P, yy, z0, nz, ax); else input_rad_k<8, bf16><<<grid, bx>>>((const bf16 *)ct16, rr, rec_bytes, N, D, P, yy, z0, nz, ax); }
     LPCK();
 }
 /* consistent fp4 weights (unet_cfg.w4_2d): w[co][ci][t] rounded in place to MX-fp4 with one ue8m0 scale per B x B (co x ci) block
