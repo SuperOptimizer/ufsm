@@ -32,6 +32,7 @@
 #include "latvol_read.h"
 #include "embz.h"
 #include "latfit.h"
+#include "sample.h"   /* (--aux-level: sample_aux_nc / sample_aux_byte, the trainer's coarse aux box) */
 #include "winauto.h"
 #include "fblend.h"
 #include <errno.h>
@@ -1822,12 +1823,15 @@ static int predict_one(int argc, char **argv) {
     if (ffd && out_ch && tta > 1) { fprintf(stderr, "predict: --channel N with --fit-* and --tta: not supported (the probability volume would come from the last symmetry pass)\n"); return 2; }
     if (ffd && (split || (ngpu > 1 && !ffz))) { fprintf(stderr, "predict: --fit-fields runs on one GPU\n"); return 2; }   /* (--fit-zarr: z-layer workers with --gpus) */   /* (--channel N: the probability volume of channel N beside the fields, e.g. --channel ink) */
     z3 *auxz = nullptr; uint8_t *auxd = nullptr, *auxh = nullptr;   /* --aux ROOT KEY: the fifth input of 5-input checkpoints (train --aux-input) */
+    const int aux_lv = opt_atoi("--aux-level", opt(argc, argv, "--aux-level", "-1"));   /* the aux volume's CT level (default: this level); coarser: the
+                                                                                         trainer's device box path, sample_aux_byte (the cascade input) */
     {   int ai = -1; for (int k = 1; k + 2 < argc; k++) if (!strcmp(argv[k], opt_n("--aux"))) ai = k;
         if (cfg.cin == 5 && !half) {
             if (ai < 0) { fprintf(stderr, "predict: %s has a fifth (aux) input: --aux ROOT KEY (the volume on this level's grid)\n", ckpt); return 2; }
             if (split || ngpu > 1) { fprintf(stderr, "predict: --aux runs on one GPU without --split\n"); return 2; }
             auxz = z3_open(store_open(argv[ai + 1]), argv[ai + 2], opt(argc, argv, "--cache", nullptr));
             if (!auxz) { fprintf(stderr, "predict: --aux: %s\n", z3_error()); return 1; }
+            if (aux_lv >= 0 && (aux_lv < level || aux_lv > level + 6)) { fprintf(stderr, "predict: --aux-level %d: the aux grid must be this level (%d) or up to 6 coarser\n", aux_lv, level); return 2; }
         } else if (ai >= 0) { fprintf(stderr, "predict: --aux needs a checkpoint trained with --aux-input\n"); return 2; }
     }
     if (nwork > 1 && !box) { fprintf(stderr, "--gpus needs --box\n"); return 2; }
@@ -3150,7 +3154,26 @@ static int predict_one(int argc, char **argv) {
             if (!ct_stem && !latin) nn_pred_input_d(ctd, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xd, h16);
             nn_ptick("input build");
             if (cfg.cin == 7 && !half) nn_zero((char *)xd + 4 * w3 * (h16 ? 2 : 4), 3 * w3 * (h16 ? 2 : 4));   /* no condition: inputs 4-6 zero */
-            if (auxz) {   /* the fifth channel: the aux volume over this window (level coordinates as the CT; outside 0) */
+            if (auxz && aux_lv > level) {   /* the fifth channel from a coarser aux grid: the trainer's box (sample.c aux_box) and per-voxel byte */
+                const int f = 1 << (aux_lv - level), nc = sample_aux_nc(Wz > W ? Wz : W, f); const z3_meta *am = z3_meta_of(auxz);
+                uint8_t *ab = calloc(sample_aux_bytes(1, nc), 1); if (!ab) return 1;
+                nn_aux_hdr h; memset(&h, 0, sizeof h); h.nc = nc; h.on = 1; h.off = 32; int64_t oc[3], ao[3], an[3]; int inb = 1;
+                sample_aux_place(o, f, &h, oc);
+                memcpy(ab, &h, sizeof h);
+                for (int d = 0; d < 3; d++) { ao[d] = oc[d] < 0 ? 0 : oc[d]; const int64_t e = oc[d] + nc < am->shape[d] ? oc[d] + nc : am->shape[d]; an[d] = e - ao[d]; if (an[d] <= 0) inb = 0; }
+                if (inb) {
+                    uint8_t *tmp = malloc((size_t)an[0] * an[1] * an[2]);
+                    if (!tmp || z3_read(auxz, ao, an, tmp, 8)) { fprintf(stderr, "predict: --aux read failed: %s\n", z3_error()); return 1; }
+                    for (int64_t a = 0; a < an[0]; a++) for (int64_t b2 = 0; b2 < an[1]; b2++)
+                        memcpy(ab + 32 + ((size_t)(a + ao[0] - oc[0]) * nc + (b2 + ao[1] - oc[1])) * nc + (ao[2] - oc[2]), tmp + ((size_t)a * an[1] + b2) * an[2], (size_t)an[2]);
+                    free(tmp);
+                }
+                for (int z = 0; z < Wz; z++) for (int y = 0; y < W; y++) for (int x = 0; x < W; x++) {
+                    const float u[3] = {(float)z, (float)y, (float)x}; auxh[((size_t)z * W + y) * W + x] = (uint8_t)sample_aux_byte(ab, 0, u); }
+                free(ab);
+                nn_h2d(auxd, auxh, w3);
+                nn_aux_input(auxd, w3, (char *)xd + 4 * w3 * (h16 ? 2 : 4), h16);
+            } else if (auxz) {   /* the fifth channel: the aux volume over this window (level coordinates as the CT; outside 0) */
                 const z3_meta *am = z3_meta_of(auxz); int64_t ao[3], an[3]; int inb = 1;
                 memset(auxh, 0, w3);
                 for (int d = 0; d < 3; d++) { ao[d] = o[d] < 0 ? 0 : o[d]; const int64_t e = o[d] + W < am->shape[d] ? o[d] + W : am->shape[d]; an[d] = e - ao[d]; if (an[d] <= 0) inb = 0; }

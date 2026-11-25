@@ -193,6 +193,7 @@ struct unet {
     size_t xin_bytes; void *h_xin, *ev_xin[4];
     unet_input_hook in_hook; void *in_hook_ctx;   /* unet_set_input_hook (train --lat-direct-p) */
     float *lat_bas, *lat_gain, lat_step, lat_run_step, lat_hb[29 * 64], lat_hg[29]; int lat_C;   /* unet_set_lat_basis: the learned cell transform of a latent-grid net (cfg.cin = lat_C + 3) */
+    const void *rad_aux;                     /* unet_set_input_aux (train --aux-input with --gpu-input): the coarse aux boxes (nn.h nn_aux_hdr) */
     const void *rad;                         /* unet_set_input_rad (train --gpu-input): the 16-bit input is the CT alone, these radial records
                                                 build the 4 MX input channels (nn_input_rad) */
     int a0_share, a2_out;                    /* level-0 A in dec[0].a2's buffer; enc[0].a2 on the host from its forward to dec[0]'s conv1 weight
@@ -1834,6 +1835,7 @@ int unet_lean_nob(const unet *u) { return u->nob; }
 /* the logits sit in the buffer the head's backward-data writes (gout[0]: fp16 logits of the lean 2 MX-fp4 layout) */
 int unet_logits_in_gx(const unet *u) { return u->built && u->train && u->logits && u->logits == u->gout[0]; }
 void unet_set_input_rad(unet *u, const void *rec) { u->rad = rec; }
+void unet_set_input_aux(unet *u, const void *aux) { u->rad_aux = aux; }
 void unet_set_lat_basis(unet *u, const float *bas, const float *gain, int C, float step) {
     if (C < 1 || C > 29 || u->cfg.cin != C + 3) { fprintf(stderr, "unet: the cell transform has %d channels, the network %d inputs (C + 3)\n", C, u->cfg.cin); abort(); }
     memcpy(u->lat_hb, bas, (size_t)C * 64 * 4); memcpy(u->lat_hg, gain, (size_t)C * 4); u->lat_C = C; u->lat_step = step;
@@ -2915,7 +2917,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
                                                                         if (u->in_hook) u->in_hook(u->in_hook_ctx, u->xin, xs, x, u->rad, u->lat_gain, u->lat_C); nn_ptick("input pool"); }   /* --lat-basis: the learned cell channels */
         else if (u->rad && u->cfg.half_res == 3) { nn_input_lat(x, xs, u->rad, u->xin); nn_ptick("input pool"); }   /* train --lat 4: the 4^3 cell means, x the full-resolution CT channel */
         else if (u->rad && u->l0rx) { u->l0x_ct = x; for (int k = 0; k < 16; k++) u->l0x_held[k] = -1; }   /* (stage S4: per slab in the stream, l0x_need) */
-        else if (u->rad) nn_input_rad(x, xs, u->rad, u->xin);   /* --gpu-input: x is the CT channel, the radial channels from the records */
+        else if (u->rad) nn_input_rad_aux(x, xs, u->rad, u->rad_aux, u->xin);   /* --gpu-input: x is the CT channel, the radial channels from the records (+ the aux boxes) */
         else nn_h16_to_mx(x, xs, u->xin);
         cur = u->xin;
         if (getenv("UFSM_XIN_HASH")) {   /* diagnostic: FNV-1a of the converted input (the --gpu-input A/B compares these) */
@@ -3570,7 +3572,7 @@ static float *block_bwd_(unet *u, block *b, int level, const float *gy, float *g
     }
     const nn_gn_t gi = gn_in(u, b);
     if (b == &u->enc[0] && u->a0_share && u->xin_shared) nn_stream_wait(0, u->ev_xin[3]);
-    if (b == &u->enc[0] && u->l3_ct) PROF(4, nn_input_rad((const char *)u->l3x[1] + l3_ct_off(u), u->xs, u->rad, u->l3x[1]));   /* (the forward's input) */
+    if (b == &u->enc[0] && u->l3_ct) PROF(4, nn_input_rad_aux((const char *)u->l3x[1] + l3_ct_off(u), u->xs, u->rad, u->rad_aux, u->l3x[1]));   /* (the forward's input) */
     if (b == &u->enc[0] && u->l3b) { if (!u->ev_head) u->ev_head = nn_event_create(); nn_event_record(u->ev_head, 0); }   /* X2 (its a1 read by
                                                                     GN1's backward) and the records are free: the next batch's head may go up */
     if (gi.G && nn_get_tf32()) PROF(2, nn_conv3d_bwd_weight_gn(b->in, b->xs, gi.G, gi.gamma, gi.beta, gi.mean, gi.rstd, A, b->ys, g + b->c1.w, g + b->c1.b));
@@ -3681,7 +3683,7 @@ static void l0x_need(unet *u, int lo, int hi) {
     for (int s = lo < 0 ? 0 : lo; s <= hi && s < ns; s++) {
         if (u->l0x_held[s % R] == s) continue;
         l0st_win(u, s, 1, 3);
-        PROF(4, nn_input_rad(u->l0x_ct, u->xs, u->rad, u->xin));
+        PROF(4, nn_input_rad_aux(u->l0x_ct, u->xs, u->rad, u->rad_aux, u->xin));
         l0st_nowin();
         u->l0x_held[s % R] = s;
     }

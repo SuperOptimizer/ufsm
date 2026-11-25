@@ -519,6 +519,9 @@ static int g_w4dev_want, g_w4devs[8], g_w4n;   /* --gpu-aug 3 (band_w4dev.h) on 
 static int g_gpu_in, g_xs = 4, g_gpu_want, g_gpu_asked, g_pack, g_gpu_aug, g_gpu_aug_want, g_gpu_aug_asked;   /* g_gpu_aug: --gpu-aug (sample.h gpu_aug: the device builds the CT channel, nn_aug_ct) */
 static int g_xs_unused_;   /* g_pack: --pack-targets (batch.tm, nn_unpack_tm on upload) */
 static size_t rad_bytes(int B) { return g_gpu_in ? (size_t)B * NN_RAD_REC(g_Pw) : 0; }   /* (g_lsplit: the record of the whole window) */
+static int g_aux_nc, g_auxB;   /* --aux-input with --gpu-input: the coarse box edge (sample_cfg.aux_nc); the boxes ride behind the radial records */
+static size_t aux_off(int B) { return (rad_bytes(B) + 255) & ~(size_t)255; }
+static size_t aux_dev_bytes(int B) { return g_gpu_in && g_aux_nc > 0 ? sample_aux_bytes(B, g_aux_nc) : 0; }
 /* the attention stage's scroll axis (unet_set_attn_axis): the sampler writes each window's record (sample_cfg.axis_rec) */
 static int g_axr;
 static size_t axr_floats(int P) { return (size_t)SAMPLE_AXR(g_Pz > P ? g_Pz : P); }
@@ -653,6 +656,8 @@ static void gpu_input_settle(sample_cfg *sc, int assume_mx, int slot_skip) {   /
                                                                                     under --split instead of packed ones) */
     g_gpu_in = g_gpu_want && (assume_mx || unet_input_converted());
     g_xs = g_gpu_in ? 1 : g_xc; sc->gpu_input = g_gpu_in;
+    g_aux_nc = g_gpu_in && sc->aux ? sc->aux_nc : 0; g_auxB = sc->B;
+    if (g_aux_nc) fprintf(stderr, "input: the aux channel built on the GPU from %d^3 coarse boxes (%.1f MB per batch)\n", g_aux_nc, sample_aux_bytes(sc->B, g_aux_nc) / 1e6);
     g_gpu_aug = g_gpu_aug_want && g_gpu_in && sample_gpu_aug_ok(sc) ? 1 : 0;
     if (g_gpu_aug && g_gpu_aug_want == 2) { sample_cfg tc = *sc; tc.slot_skip = g_lsplit && (!getenv("UFSM_SPLIT_LWARP") || ufsm_env_on("UFSM_SPLIT_LWARP")) ? slot_skip : slot_skip & ~4; tc.gpu_aug = 2;   /* (unpacked: the latent split only; UFSM_SPLIT_LWARP=0 keeps its host warps) */
         if (sample_gpu_lwarp_ok(&tc)) { g_gpu_aug = 2; if (!sc->pack_tm) fprintf(stderr, "--gpu-aug 2 without packed targets: the unpacked targets are never read (slot_skip 4)\n"); } else fprintf(stderr, "--gpu-aug 2: the labels' warp needs packed targets and no sheet / pmask / gap / distill / cond / band / aux labels; --gpu-aug 1 (here: pack_tm %d sheet %d pap_head %d emb %d cond %d band %d aux %d)\n",
@@ -672,7 +677,7 @@ static float batch_umd(const batch *b, float um) {   /* the voxel size of the le
     return (float)(g_S->src[b->src[0]].um * ldexp(1.0, b->level[0]));
 }
 static void select_buf(gpu_state *d, int i) {
-    d->rad = d->radb[i]; if (g_gpu_in) unet_set_input_rad(d->u, d->rad);
+    d->rad = d->radb[i]; if (g_gpu_in) { unet_set_input_rad(d->u, d->rad); unet_set_input_aux(d->u, g_aux_nc > 0 ? (const char *)d->rad + aux_off(g_auxB) : nullptr); }
     axr_set(d, i);
     d->cur = i; d->embt = d->embb[i]; d->x = d->xb[i]; d->t = d->tb[i]; d->m = d->mb[i]; d->w = d->wb[i]; d->band = d->bandb[i]; d->sdb = d->sideb[i]; d->pm = d->pmb[i]; d->wd = d->wdb[i]; d->pap = d->papb[i]; d->w4 = d->w4b[i]; d->wc = d->wcb[i]; for (int j = 0; j < 3; j++) d->aux[j] = d->auxb[j][i]; d->um = d->umb[i]; d->umd = d->umdb[i]; }
 /* --heads: the device target row of host row r (n * NCH + c): a sample's recto target trains its source's head (channel 0, or 1 + head),
@@ -940,6 +945,7 @@ static void zc_xchg(void *ctx, int peer, const void *send_d, size_t ns, void *re
 static void zc_sum(void *ctx, void *d, int n, int type, void *stream) { (void)ctx; split_sum(d, n, type, stream); }
 static void ct_upload(const batch *b, void *x, void *rad, int B, int P, int async) {
     const size_t p3 = (size_t)g_Pz * P * P;
+    if (b->auxc && rad) { void *ad = (char *)rad + aux_off(B); if (async) nn_h2d_copy_stream(ad, b->auxc, aux_dev_bytes(B)); else nn_h2d(ad, b->auxc, aux_dev_bytes(B)); }   /* (--aux-input boxes) */
     if (b->ct8) {
         if (async) nn_h2d_copy_stream(rad, b->rad, rad_bytes(B)); else nn_h2d(rad, b->rad, rad_bytes(B));
         int z0, nz;
@@ -3918,6 +3924,15 @@ int cmd_train(int argc, char **argv) {
     if (opt_atoi("--zfix", opt(argc, argv, "--zfix", "0"))) sc.augment = 3;      /* diagnostic: symmetries that keep the z axis */
     if (opt_atoi("--intonly", opt(argc, argv, "--intonly", "0"))) sc.augment = 4;   /* diagnostic: intensity jitter, no symmetry */
     sc.aux = g_xc == 5; sc.cond = g_cond; sc.cond_outside = g_cond_outside; sc.pap_head = g_pap_head ? &g_paph : nullptr;
+    if (sc.aux) {   /* the device-built aux channel's coarse box (sample_aux_nc): sized for the finest window / aux grid ratio any source can draw
+                       (--aux-fmin F caps it: windows needing a bigger box get aux 0 with a DEFAULTED line) */
+        int fmin = 1 << 20;
+        for (int k = 0; k < S->n; k++) { const source *s = &S->src[k]; if (!s->aux) continue;
+            const int lmax = s->max_level >= 0 && s->max_level < s->aux_level ? s->max_level : s->aux_level, f = 1 << (s->aux_level - lmax); if (f < fmin) fmin = f; }
+        const int fo = opt_atoi("--aux-fmin", opt(argc, argv, "--aux-fmin", "0")); if (fo > 0) fmin = fo;
+        if (fmin > (1 << 10)) fmin = 1;
+        sc.aux_nc = sample_aux_nc(P, fmin);
+    }
     sc.band = g_aff; sc.side = g_side; sc.pmask = g_unwrap;   /* unwrap: the phase only (band codes per window, or the stored phase) */ sc.side_air = opt_atoi("--side-air", opt(argc, argv, "--side-air", "0"));
     sc.strict_sources = opt_atoi("--strict-sources", opt(argc, argv, "--strict-sources", "0"));
     sc.edge_spread = opt_atoi("--edge-spread", opt(argc, argv, "--edge-spread", "0"));
@@ -4075,7 +4090,7 @@ int cmd_train(int argc, char **argv) {
            radial pass. Needs the 16-bit -> MX input conversion, whole windows, the plain 4 inputs and write_x samples; --gpu-input 0 or
            UFSM_DUMP_BATCH (it shows the 4 channels): the host-built 4 channels as before */
         const int want = opt_atoi("--gpu-input", opt(argc, argv, "--gpu-input", "1"));
-        g_gpu_want = want && g_xfmt && unet_act_mx() && (!split || g_lsplit) && (!g_half || g_pkf) && g_xc == 4 && sample_gpu_input_ok(&sc) && !getenv("UFSM_DUMP_BATCH");
+        g_gpu_want = want && g_xfmt && unet_act_mx() && (!split || g_lsplit) && (!g_half || g_pkf) && (g_xc == 4 || (g_xc == 5 && sc.aux_nc > 0 && !split && !g_half && !g_lat)) && sample_gpu_input_ok(&sc) && !getenv("UFSM_DUMP_BATCH");
         if (g_lat && !g_gpu_want) { fprintf(stderr, "--lat 4: needs the device-built input (--gpu-input 1, MX activations, 16-bit batches)\n"); return 2; }
         g_gpu_asked = opt_atoi("--gpu-input", opt(argc, argv, "--gpu-input", "0"));   /* (an explicit request: say when it cannot apply) */
         g_gpu_aug_asked = opt(argc, argv, "--gpu-aug", nullptr) != nullptr;
@@ -4741,7 +4756,7 @@ int cmd_train(int argc, char **argv) {
                 const size_t tb = unet_train_bytes(G[0].u, xs), nbuf = cand[c].lean ? 1 : 2;
                 if (cand[c].l3 && !unet_last_dry_l3b()) continue;   /* (not this net: the mode above) */
                 const int gin = g_gpu_want && unet_input_converted();   /* this mode's input layout (gpu_input_settle after the pick) */
-                const size_t xsc = gin ? 1 : (size_t)g_xc, radb = gin ? (size_t)B * NN_RAD_REC(g_Pw) : 0;
+                const size_t xsc = gin ? 1 : (size_t)g_xc, radb = gin ? (size_t)B * NN_RAD_REC(g_Pw) + (g_xc == 5 && sc.aux_nc > 0 ? 256 + sample_aux_bytes(B, sc.aux_nc) : 0) : 0;   /* (+ the aux boxes) */
                 size_t trainer = nbuf * ((size_t)B * xsc * p3 * xbytes() + (size_t)B * g_tc * p3 + (size_t)B * p3) + (cand[c].lean || g_gl_inplace ? 0 : (size_t)B * g_cout * p3 * (g_g16 ? 2 : 4)) + nbuf * radb;
                 /* lean 2 (no buffer B): [input | targets | mask] at the end of gout[0] when they fit beside its level-0 gradient (at least w0
                    channels of the MX gradient type; the lean placement below), otherwise the input keeps a buffer of its own ("input separate":
@@ -4896,7 +4911,7 @@ int cmd_train(int argc, char **argv) {
                 d->tb[i] = (uint8_t *)tp; d->mb[i] = (uint8_t *)(tp + tbb);
                 d->xb[i] = xin_in ? (void *)(bs + xoff) : nn_malloc((size_t)B * g_xs * p3 * xbytes());
                 d->wb[i] = nn_malloc((size_t)B * g_tc);
-                d->radb[i] = g_gpu_in ? nn_malloc(rad_bytes(B)) : nullptr;
+                d->radb[i] = g_gpu_in ? nn_malloc(aux_dev_bytes(B) ? aux_off(B) + aux_dev_bytes(B) : rad_bytes(B)) : nullptr;
             }
             else { d->xb[i] = nn_malloc((size_t)B * g_xs * p3 * xbytes()); d->tb[i] = nn_malloc(g_pkf && g_pack ? 256 : g_lat && g_tm_unused ? 256 : (size_t)B * g_tc * p3);   /* (the direct pack
                                                                                                        loss reads the packed codes in mb) */ d->mb[i] = nn_malloc(g_lat && g_tm_unused ? 256 : (size_t)B * p3); d->wb[i] = nn_malloc((size_t)B * g_tc); d->radb[i] = g_gpu_in ? nn_malloc(rad_bytes(B)) : nullptr; }

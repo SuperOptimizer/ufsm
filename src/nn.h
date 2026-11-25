@@ -213,6 +213,13 @@ void nn_h16_to_mx(const void *x, shape5 s, void *y);   /* 16-bit storage-type te
    table[6 P] (spatial_aug_tables), R[9], A[9], Ainv[9] (row major, as floats), scale; the radial vector is then the transported one
    of write_spatial (zero outside the source cube), bit for bit. */
 #define NN_RAD_REC(D) ((size_t)(8 + 8 * (D) + 32) * 4)
+/* train --aux-input 1 with --gpu-input (2026-11-25, the cascade input: a coarse model's prediction as the fifth channel): xs.c 5 and aux =
+   B headers of 32 bytes, then the boxes. Per sample: float o[3], inv_f (box position q = u inv_f + o of the voxel's source-frame position
+   u, the CT's symmetry / warp), int nc (the box is nc^3 bytes, z-major), on (0: all byte 0), off (the box's byte offset from aux), 0. The
+   voxel's byte: trilinear in the box (base corner clamped to [0, nc - 2], fraction to [0, 1]), + .5 truncated; byte 0 outside the source
+   cube; the channel byte / 127.5 - 1 as the CPU --aux-input path. Bit for bit sample.c sample_aux_byte. */
+typedef struct { float o[3], inv_f; int nc, on, off, pad; } nn_aux_hdr;
+void nn_input_rad_aux(const void *ct16, shape5 xs, const void *rec, const void *aux, void *y);
 void nn_input_rad(const void *ct16, shape5 xs, const void *rec, void *y);
 /* --half-res pack: the same from the full-resolution CT channel [n][8 d h w] and records of NN_RAD_REC(2 d), into the network's
    8-channel input on the 2x2x2 blocks (xs {n, 8, d, h, h}): bit for bit write_x -> nn_half_input(mode 2) -> nn_h16_to_mx */
