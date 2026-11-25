@@ -3,7 +3,8 @@
 # (z3_prefetch_shard_sel) instead of one request per chunk. Fixture: a ct_only source over a local range-serving HTTP root; level 0 a
 # volcomp array (z3-put: 128^3 chunks in one 256^3 shard), levels 1..5 plain uint8 arrays, papyrus in z < 128 only. Checks: the shard path
 # caches exactly the chunk files the old per-chunk path (UFSM_PREFETCH_CHUNKS=1) does, with fewer level-0 data requests than chunks;
-# its summary line reports the tally and coverage 1.0000; a second run fetches 0.00 GB with every stored chunk already cached.
+# its summary line reports the tally and coverage 1.0000; a second run fetches 0.00 GB with every stored chunk already cached; the dry count
+# (--dry 1, index reads only) reports the GB the run then fetches; --min-free-gb above the disk's free space exits 3 without fetching.
 set -u
 U=${1:?ufsm binary}; U=$(readlink -f "$U")
 D=$(mktemp -d /tmp/test_prefetch_shards_XXXXXX); SRV=
@@ -66,8 +67,18 @@ H="http://127.0.0.1:$(cat "$D/port")"
 echo "{\"sources\":[{\"name\":\"s\",\"root\":\"$H\",\"ct\":\"s.zarr\",\"um\":2.4,\"iso\":64,\"ct_only\":1,\"min_level\":0,\"max_level\":0,\"weight\":1}]}" > "$D/src.json"
 pf() { UFSM_OCC_CACHE=0 UFSM_HTTP_CACHE="$D/$1" "$U" prefetch "$D/src.json" --levels 1 --P 128 --threads 4 > "$D/$2.log" 2>&1; }
 UFSM_PREFETCH_CHUNKS=1 pf cc chunks || fail "per-chunk prefetch ($D/chunks.log)"
+# the disk guard (2026-11-25): free space below --min-free-gb stops the run with exit 3 before a fetch, here at the start
+UFSM_OCC_CACHE=0 UFSM_HTTP_CACHE="$D/cg" "$U" prefetch "$D/src.json" --levels 1 --P 128 --threads 4 --min-free-gb 1e12 > "$D/guard.log" 2>&1; rc=$?
+[ $rc = 3 ] && grep -q "ALERT: .* GB free on the cache disk" "$D/guard.log" || fail "disk guard: rc $rc (expected 3): $(tail -2 "$D/guard.log")"
+# the dry count: index reads only, the GB to fetch equals what the real run fetches
+mkdir -p "$D/cs"; UFSM_OCC_CACHE=0 UFSM_HTTP_CACHE="$D/cs" "$U" prefetch "$D/src.json" --levels 1 --P 128 --threads 4 --dry 1 > "$D/dry.log" 2>&1 || fail "dry count ($D/dry.log)"
+dry=$(grep 'level 0: .* GB to fetch' "$D/dry.log" | grep -o 'to fetch ([0-9]* B)' | grep -o '[0-9]*')
+[ -n "$dry" ] && [ "$dry" -gt 0 ] || fail "dry count: no level-0 bytes to fetch: $(cat "$D/dry.log")"
+[ -z "$(find "$D/cs/s.zarr/0" -type f ! -name '*.idx' ! -name '.validators')" ] || fail "the dry count cached level-0 chunk data: $(find "$D/cs/s.zarr/0" -type f | head -3)"
 : > "$D/req.log"
 pf cs shards || fail "shard prefetch ($D/shards.log)"
+got=$(grep 'level 0 done' "$D/shards.log" | grep -o 'fetched now ([0-9]* B)' | grep -o '[0-9]*')
+[ "$dry" = "$got" ] || fail "level 0: the dry count said $dry B to fetch, the prefetch fetched $got B"
 nd=$(grep '/0/c/0/0/0 ' "$D/req.log" | grep -vc 'bytes=-')
 l0=$(grep 'level 0 done' "$D/shards.log")
 [ -n "$l0" ] || fail "no level-0 summary line: $(cat "$D/shards.log")"
@@ -83,8 +94,8 @@ grep -q "0 failures$" "$D/shards.log" || fail "total line: $(tail -1 "$D/shards.
 cmp -s "$D/cc.list" "$D/cs.list" || fail "the cached chunk files differ from the per-chunk path's: $(diff "$D/cc.list" "$D/cs.list" | head -5 | tr '\n' ' ')"
 pf cs again || fail "second prefetch ($D/again.log)"
 l1=$(grep 'level 0 done' "$D/again.log")
-echo "$l1" | grep -q "$ns stored, [0-9]* absent; $ns already cached, 0.00 GB fetched now" || fail "the second prefetch fetched again: $l1"
+echo "$l1" | grep -q "$ns stored, [0-9]* absent; $ns already cached, 0.00 GB fetched now (0 B)" || fail "the second prefetch fetched again: $l1"
 kill $SRV; wait $SRV 2> /dev/null; SRV=
-echo "test_prefetch_shards: level 0 $ns chunks in $nd data requests; $(wc -l < "$D/cs.list") cache files = the per-chunk path's; refetch 0"
+echo "test_prefetch_shards: dry count $dry B = fetched; disk guard exit 3; level 0 $ns chunks in $nd data requests; $(wc -l < "$D/cs.list") cache files = the per-chunk path's; refetch 0"
 rm -rf -- "$D"
 echo "test_prefetch_shards: OK"
