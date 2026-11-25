@@ -342,6 +342,7 @@ __attribute__((weak)) int gpudec_threads(int nthreads) { return nthreads; }
 __attribute__((weak)) int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) { (void)c; (void)mask; (void)dst; return -1; }
 __attribute__((weak)) int gpudec_decode_dev(const gd_chunk *c, uint32_t mask, uint8_t *dchunk) { (void)c; (void)mask; (void)dchunk; return -1; }
 __attribute__((weak)) int gpudec_decode_sink(const gd_chunk *c, uint32_t mask, const gd_sink *k) { (void)c; (void)mask; (void)k; return -1; }
+__attribute__((weak)) void gpudec_counts_get(gpudec_counts *o) { *o = (gpudec_counts){0}; }
 __attribute__((weak)) void gpudec_stats(uint64_t *subs, uint64_t *batches, uint64_t *redo, double *gpu_s) { if (subs) *subs = 0; if (batches) *batches = 0; if (redo) *redo = 0; if (gpu_s) *gpu_s = 0; }
 /* decode the substreams in need of a parsed lossy chunk: on the GPU when it is on (a substream the GPU cannot decode, or a device
    error: the request on the CPU, the reference status and bytes), else volcomp_fast.h. dsink (z3_read_sub_dev): a device 128^3 chunk
