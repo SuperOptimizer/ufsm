@@ -288,7 +288,8 @@ Ground-truth export scripts: `tools/pget.sh` (parallel ranged download), `tools/
 
 ```sh
 ufsm sample <sources.json> --out DIR                   # dump patch montages to eyeball the sampler
-ufsm prefetch <sources.json> [--levels 1]              # warm the CT chunk cache for the labelled cells
+ufsm prefetch <sources.json> [--levels 1]              # warm the CT chunk cache for the labelled cells (sharded: whole shards)
+scripts/pod/ctprefetch.sh <sources.json> [P]           # pods: run before every trainer launch on mirror CT (UFSM_HTTP_CACHE)
 ufsm train <sources.json> --out runs/r1 --gpus 0 --P 512 --B 1 --steps 20000
 ufsm eval <pred-root> <pred-group> <label-root> <label-group> --um U [--box ...]
 ufsm train <sources.json> --task papyrus --pap-cond 2 --pap-tau 2,8 --dice 0 ...   # papyrus vs void, labels from the CT itself

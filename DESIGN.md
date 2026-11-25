@@ -6,6 +6,31 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Pod CT prefetch by whole shards, a standard launch step (2026-11-25, podink)
+
+Pod trainers read CT from the dl.ash2txt volcomp mirror through `UFSM_HTTP_CACHE`. Their data wait is cold-chunk HTTPS latency
+(~0.35 s first byte per request), not CPU:
+
+| pod run | CT in the cache at start | wait | Mvox/s |
+|---|---|---|---|
+| S2E (ink, 2.4 + 9.6 um) | partly (per-chunk `ufsm prefetch`, ~20 MB/s) | 30-71 % | 30-86 |
+| DINO2 | z3-fetched slabs (whole shards, ~50-90 MB/s), draws restricted to them (`ct_zslabs`) | 0 % | 156-199 |
+| E0-E5 coarse ink dev | warm (S2E's cache) | 0-10 % | 67-69 |
+
+`ufsm prefetch` already marks exactly the chunks a source's sampler draws (its draw cells at the levels it trains on, the window P
+around them, the level + 3 probe, levels >= 4 whole), but it fetched them one HTTP request per chunk. On a sharded array it now
+fetches per shard: the marked chunks of each shard in coalesced range requests (`z3_prefetch_shard_sel`: z3_prefetch_shard with a
+chunk bitmap, the same gap / span merge as z3_read), and it reports per source x level the chunks needed, stored / absent / already
+cached, GB fetched, MB/s, shard failures and coverage (the share of the needed shards now cached); it exits 1 on any failure.
+`UFSM_PREFETCH_CHUNKS=1` keeps the per-chunk path. Mirror rates: whole shards 87 MB/s (MANB level 1, 43 GB in 497 s, z3-fetch,
+11-25), per chunk ~20 MB/s.
+
+`scripts/pod/ctprefetch.sh SOURCES.json [P]` is the launcher step: it refuses to start under `MIN_FREE_GB` free, runs the prefetch
+on the trainer's sources and window, logs the cache size / free disk before and after and the per-level tally, and exits non-zero
+when the cache is incomplete (the trainer would read those chunks cold). `DRY=1` prints the chunk counts first (the cache never
+evicts, so size the sources with `ct_zslabs` / `max_level` to the disk). test_prefetch_shards: over a local range-serving HTTP root,
+the shard path caches exactly the per-chunk path's files, level 0's 4 chunks in 1 data request, coverage 1, a second run fetches 0.
+
 ## Output fusion reader3 + 3-D nets: +0.04 on the 8.6-9.4 um dev set, worse on clean 1447 (negative result; 2026-11-25, inksdk)
 
 Question: are reader3 (2-D) and our 3-D nets complementary? `ink-score --fuse mean|rank [--weights]` averages several maps on the

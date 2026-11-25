@@ -101,6 +101,9 @@ void z3_thread_cpu_decode(int on);
 void z3_shared_cache_stats(uint64_t *hits, uint64_t *misses, uint64_t *stored);   /* chunk reads served from the cache vs fetched from the store */
 int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx);   /* fetch one inner chunk into the cache (no decode): 1 fetched, 0 cached/absent, -1 error */
 int z3_prefetch_shard(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3]);   /* the shard's present uncached chunks in the global inner-chunk box [lo, hi] into the cache, neighbours coalesced (no decode): fetched count, -1 error */
+typedef struct { int64_t present, cached, absent, bytes; } z3_pf_stats;   /* selected chunks: stored, of them already cached, fill (absent); bytes fetched now */
+int z3_prefetch_shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3], const uint8_t *bits,
+                          const int64_t *ng, z3_pf_stats *st);   /* the same, only chunks marked in bits (row-major over the chunk grid ng; nullptr: all), tallied into st */
 int z3_chunk_raw(z3 *z, int64_t cz, int64_t cy, int64_t cx, uint8_t **buf, size_t *n);   /* encoded inner chunk bytes (after zstd): 1 with *buf (malloc), 0 absent, -1 error; an HTTP root's chunk through the chunk cache */
 /* a latvol array's codec (the transform, step, tables: src/latvol.h), else nullptr */
 const void *z3_latvol(const z3 *z);   /* (const lv_codec *) */

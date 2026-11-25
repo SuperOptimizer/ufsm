@@ -813,19 +813,35 @@ int z3_prefetch_chunk(z3 *z, int64_t cz, int64_t cy, int64_t cx) {
 typedef struct { uint64_t off, len; int ci; } pf_item;
 static int pf_item_cmp(const void *a, const void *b) { const pf_item *p = a, *q = b; return (p->off > q->off) - (p->off < q->off); }
 int z3_prefetch_shard(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3]) {
+    return z3_prefetch_shard_sel(z, sz, sy, sx, lo, hi, nullptr, nullptr, nullptr);
+}
+/* z3_prefetch_shard with an optional selection: bits (one bit per global inner chunk, row-major over ng = the array's chunk grid) limits
+   the fetch to the marked chunks inside [lo, hi]; st (optional) adds the marked chunks' tally: present, already cached, absent (fill),
+   and the encoded bytes fetched now. ufsm prefetch (2026-11-25, pod data wait): its per-chunk requests ran ~20 MB/s from the mirror
+   (~0.35 s first-byte latency each), whole-shard coalesced reads ~90 MB/s. */
+int z3_prefetch_shard_sel(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t lo[3], const int64_t hi[3], const uint8_t *bits,
+                          const int64_t *ng, z3_pf_stats *st) {
     if (!z->cache || !z->m.sharded) return 0;
     char skey[1200], item[16]; shard_key(z, sz, sy, sx, skey, sizeof skey);
     ientry *idx = malloc((size_t)z->nc * sizeof *idx); pf_item *it = malloc((size_t)z->nc * sizeof *it);
     if (!idx || !it) { free(idx); free(it); return FAIL("prefetch allocation"); }
     const int li = load_index(z, skey, idx);
-    if (li <= 0) { free(idx); free(it); return li; }
+    if (li <= 0) {   /* (0: the shard is absent, every chunk in it fill) */
+        if (!li && st) for (int a = 0; a < z->cgrid[0]; a++) for (int b = 0; b < z->cgrid[1]; b++) for (int c = 0; c < z->cgrid[2]; c++) {
+            const int64_t g[3] = {sz * z->cgrid[0] + a, sy * z->cgrid[1] + b, sx * z->cgrid[2] + c};
+            if (g[0] < lo[0] || g[0] > hi[0] || g[1] < lo[1] || g[1] > hi[1] || g[2] < lo[2] || g[2] > hi[2]) continue;
+            if (bits) { const size_t k = ((size_t)g[0] * (size_t)ng[1] + (size_t)g[1]) * (size_t)ng[2] + (size_t)g[2]; if (!((bits[k >> 3] >> (k & 7)) & 1)) continue; }
+            st->absent++; }
+        free(idx); free(it); return li; }
     int n = 0;
     for (int a = 0; a < z->cgrid[0]; a++) for (int b = 0; b < z->cgrid[1]; b++) for (int c = 0; c < z->cgrid[2]; c++) {
         const int64_t g[3] = {sz * z->cgrid[0] + a, sy * z->cgrid[1] + b, sx * z->cgrid[2] + c};
         if (g[0] < lo[0] || g[0] > hi[0] || g[1] < lo[1] || g[1] > hi[1] || g[2] < lo[2] || g[2] > hi[2]) continue;
+        if (bits) { const size_t k = ((size_t)g[0] * (size_t)ng[1] + (size_t)g[1]) * (size_t)ng[2] + (size_t)g[2]; if (!((bits[k >> 3] >> (k & 7)) & 1)) continue; }
         const int ci = (a * z->cgrid[1] + b) * z->cgrid[2] + c; const ientry e = idx[ci];
-        if ((e.off == UINT64_MAX && e.len == UINT64_MAX) || !e.len) continue;   /* absent (fill) */
-        snprintf(item, sizeof item, "%d", ci); if (cache_has(z, skey, item)) continue;
+        if ((e.off == UINT64_MAX && e.len == UINT64_MAX) || !e.len) { if (st) st->absent++; continue; }   /* absent (fill) */
+        if (st) st->present++;
+        snprintf(item, sizeof item, "%d", ci); if (cache_has(z, skey, item)) { if (st) st->cached++; continue; }
         it[n++] = (pf_item){e.off, e.len, ci};
     }
     free(idx);
@@ -840,7 +856,8 @@ int z3_prefetch_shard(z3 *z, int64_t sz, int64_t sy, int64_t sx, const int64_t l
         const size_t len = (size_t)(end - it[i].off);
         if (len > cap) { uint8_t *q = realloc(buf, len); if (!q) { rc = FAIL("prefetch allocation"); break; } buf = q; cap = len; }
         if (store_read(z->s, skey, (int64_t)it[i].off, (int64_t)len, buf) != (int64_t)len) { rc = FAIL("prefetch range of %s", skey); break; }
-        for (int k = i; k < j; k++) { snprintf(item, sizeof item, "%d", it[k].ci); cache_put(z, skey, item, buf + (it[k].off - it[i].off), it[k].len); nf++; }
+        for (int k = i; k < j; k++) { snprintf(item, sizeof item, "%d", it[k].ci); cache_put(z, skey, item, buf + (it[k].off - it[i].off), it[k].len); nf++;
+                                      if (st) st->bytes += (int64_t)it[k].len; }
         i = j;
     }
     free(buf); free(it);
