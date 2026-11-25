@@ -2962,6 +2962,8 @@ static void health_terms(int step, const char *s) {   /* s: the step line's term
     }
 }
 int cmd_train(int argc, char **argv) {
+    setenv("UFSM_CUDA_SYNC", "block", 0);   /* host waits block (nn_sync_mode; UFSM_CUDA_SYNC=auto: the driver's spin): S2E P256 on card 1,
+                                               46.6 Mvox/s either way, the process 275 -> 206 CPU-s over 300 steps (perf 11-25) */
     g_tl0 = now(); { const char *e = getenv("UFSM_STARTUP_TIMES"); g_tl_on = !(e && !strcmp(e, "0")); }
     if (ufsm_env_on("UFSM_UW_SELFTEST")) return uw_selftest();
     g_strict_health = opt_atoi("--strict-health", opt(argc, argv, "--strict-health", "0"));   /* 1: exit 4 at a "WARNING frozen:" / "dead loss:" */

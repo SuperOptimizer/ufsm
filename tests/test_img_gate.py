@@ -1,5 +1,6 @@
 """img-gate: a uint8 render x max(gate renders) / 255, byte for byte the numpy float32 step it replaced in scripts/strip/strip_refill.sh
 (all 65536 (ink, gate) pairs, deflate and plain inputs, in place and --out)."""
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -8,7 +9,7 @@ import numpy as np
 import tifffile as t
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-BIN = ROOT / "build/ufsm"
+BIN = pathlib.Path(os.environ.get("UFSM_BIN", ROOT / "build/ufsm"))
 
 
 def run(*a):
@@ -60,3 +61,24 @@ with tempfile.TemporaryDirectory(prefix="ufsm-imgstretch-") as tmp:
         got = run(BIN, "img-stretch", 80, *args).strip(); ref = np_stretch(80, pairs)
         assert got == ref, f"trial {trial}: img-stretch {got} vs numpy {ref}"
 print("img-stretch: 12 trials equal to numpy")
+
+# img-diff: max |a - b| and the differing-byte count, deflate vs plain inputs; a size mismatch fails
+with tempfile.TemporaryDirectory(prefix="ufsm-imgdiff-") as tmp:
+    d = pathlib.Path(tmp)
+    a = rng.integers(0, 256, (257, 257)).astype(np.uint8); b = a.copy(); b[3, 5] = a[3, 5] ^ 1; b[100, 7] = (int(a[100, 7]) + 9) % 256
+    t.imwrite(d / "a.tif", a, compression="zlib"); t.imwrite(d / "b.tif", b)
+    dd = np.abs(a.astype(int) - b.astype(int))
+    assert run(BIN, "img-diff", d / "a.tif", d / "b.tif").strip() == f"max_abs {dd.max()} n_diff {(dd > 0).sum()} n {a.size}"
+    assert run(BIN, "img-diff", d / "a.tif", d / "a.tif").strip() == f"max_abs 0 n_diff 0 n {a.size}"
+    t.imwrite(d / "c.tif", a[:-1])
+    assert subprocess.run([str(BIN), "img-diff", d / "a.tif", d / "c.tif"], capture_output=True).returncode == 1
+print("img-diff: exact counts, size mismatch refused")
+
+# img-zoom: nearest-neighbour K x enlargement
+with tempfile.TemporaryDirectory(prefix="ufsm-imgzoom-") as tmp:
+    d = pathlib.Path(tmp)
+    a = rng.integers(0, 256, (37, 53)).astype(np.uint8); t.imwrite(d / "a.tif", a, compression="zlib")
+    for k in (1, 2, 3):
+        run(BIN, "img-zoom", d / "a.tif", d / "z.tif", k)
+        assert (t.imread(d / "z.tif") == np.kron(a, np.ones((k, k), np.uint8))).all(), k
+print("img-zoom: equal to np.kron")

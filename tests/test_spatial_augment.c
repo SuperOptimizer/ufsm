@@ -47,7 +47,37 @@ static int ws_cmp(const uint8_t *Ta, const uint8_t *Tb, size_t nt, const uint8_t
 void *nn_host_alloc(size_t n) { return malloc(n); }
 void nn_host_free(void *p) { free(p); }
 
+/* spatial_aug_forward against its 6-step Newton before the early stop (perf 11-25): bit-identical outputs over random warps (rotation,
+   elastic on / off, zoom, affine) and points inside and past the window */
+static void forward_ref(const spatial_aug *a,const double source[3],double output[3]) {
+    double c=.5*(a->P-1),q[3];
+    if (a->affine) for (int j=0;j<3;j++) q[j]=c+a->Ainv[j][0]*(source[0]-c)+a->Ainv[j][1]*(source[1]-c)+a->Ainv[j][2]*(source[2]-c);
+    else for (int j=0;j<3;j++) q[j]=source[j];
+    for (int d=0;d<3;d++) {
+        double w=c; for (int j=0;j<3;j++) w+=a->R[d][j]*(q[j]-c)/a->scale;
+        double u=w;
+        for (int i=0;i<6;i++) { double v=a->frequency*u+a->phase[d]; u-=(u-a->amplitude[d]*sin(v)-w)/(1-a->amplitude[d]*a->frequency*cos(v)); }
+        output[d]=u;
+    }
+}
+static void forward_check(void) {
+    size_t nd=0,np=0; uint64_t s=12345;
+    for (int t=0;t<400;t++) {
+        spatial_aug a; const int P=t%3==0?64:t%3==1?256:513;
+        spatial_aug_make(&a,0x9e37ull*t+1,P,t%5==0?0.f:15.f,t%4==0?0.f:1.f,t%2?40.f:0.f,1.f);
+        if (t%7==0) spatial_aug_zoom(&a,1.1); if (t%11==0) spatial_aug_affine(&a,t,0.1,0.05);
+        for (int k=0;k<2000;k++) {
+            double src[3],o1[3],o2[3];
+            for (int d=0;d<3;d++) { s=s*6364136223846793005ull+1442695040888963407ull; src[d]=((double)(s>>11)*0x1.0p-53*1.2-0.1)*P; }
+            spatial_aug_forward(&a,src,o1); forward_ref(&a,src,o2); np++;
+            if (memcmp(o1,o2,sizeof o1)) { if (!nd) fprintf(stderr,"FAIL spatial_aug_forward: warp %d point %d: %.17g %.17g %.17g vs %.17g %.17g %.17g\n",t,k,o1[0],o1[1],o1[2],o2[0],o2[1],o2[2]); nd++; }
+        }
+    }
+    if (nd) { fprintf(stderr,"FAIL spatial_aug_forward: %zu of %zu points differ from the 6-step Newton\n",nd,np); exit(1); }
+    printf("spatial_aug_forward: %zu points bit-identical to the 6-step Newton\n",np);
+}
 int main(void) {
+    forward_check();
     const int P=32; const size_t n=(size_t)P*P*P; const int64_t origin[3]={0};
     const int quick = getenv("UFSM_TEST_QUICK") && atoi(getenv("UFSM_TEST_QUICK"));   /* make test: the writer comparisons at P <= 128 */
     uint8_t *ct=malloc(n),*target=calloc(NCH*n,1),*mask=malloc(n),*T=malloc(NCH*n),*M=malloc(n);

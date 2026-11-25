@@ -210,6 +210,7 @@ test_dinor~full                                | gpu,slow     |   104 | ./$B/tes
 test_dino_pts                                  |              |     1 | ./$B/test_dino_pts
 test_ink_splat                                 | gpu          |    10 | ./$B/test_ink_splat
 test_ink_splat~over                            | gpu          |    10 | UFSM_INKFLY_GPU_MB=1 TIS_OVER=1 ./$B/test_ink_splat
+test_ink_splat~ckey                            | gpu          |    10 | UFSM_DCACHE_KEY=content ./$B/test_ink_splat
 test_ink_pool                                  |              |     3 | ./$B/test_ink_pool $TMPDIR/ink_pool
 test_ink_audit                                 |              |     3 | ./$B/test_ink_audit
 test_ink_mil                                   | gpu          |     2 | ./$B/test_ink_mil
@@ -263,6 +264,7 @@ test_ink_teach                                 |              |     3 | python3 
 test_ink_teach_up                              |              |     2 | python3 tests/test_ink_teach_up.py
 test_ink_devcrops                              |              |     2 | python3 tests/test_ink_devcrops.py
 test_ink_fuse                                  |              |     2 | python3 tests/test_ink_fuse.py
+test_ink_runs                                  |              |     2 | python3 tests/test_ink_runs.py
 test_dvprobe                                   |              |     3 | ./$B/test_dvprobe
 test_ink_place                                 |              |     2 | python3 tests/test_ink_place.py
 test_sample_nogpu                              |              |     3 | tests/test_sample_nogpu.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/samplenogpu
@@ -293,6 +295,7 @@ test_ink_ext_hecate                            | gpu,slow     |   421 | python3 
 test_ink_ext_reader3                           | gpu,slow     |   104 | python3 tests/test_ink_ext_reader3.py
 test_ink_ext_ink9um                            | gpu,slow     |   241 | python3 tests/test_ink_ext_ink9um.py
 test_ink_ext_tiling                            | gpu          |    24 | python3 tests/test_ink_ext_tiling.py
+test_ink_ext_ttafuse                           | gpu          |    25 | python3 tests/test_ink_ext_ttafuse.py
 test_ink_ext_inksdk_koine                      | gpu,slow     |    60 | python3 tests/test_ink_ext_inksdk_koine.py
 test_ink_ext_inksdk_canon                      | gpu,slow     |    30 | python3 tests/test_ink_ext_inksdk_canon.py
 test_ink_ext_inksdk_blend                      | gpu,slow     |    45 | python3 tests/test_ink_ext_inksdk_blend.py

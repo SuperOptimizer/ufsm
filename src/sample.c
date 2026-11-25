@@ -2828,7 +2828,7 @@ static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp
     if (rc == 0 && b->chid && (!cs || cs->id < 0)) { b->chid[i] = -1; b->chidx[i] = 0; b->choff[3 * i] = b->choff[3 * i + 1] = b->choff[3 * i + 2] = 0.f; }
     return rc;
 }
-static int g_histlog = -1;   /* UFSM_HISTLOG (read at the first draw; mgpu: benign race, every thread reads the same env) */
+static int g_histlog = -1;   /* UFSM_HISTLOG (read at the first draw; mgpu: env; a racy first read is benign, every thread reads the same env) */
 static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs) {
     if (sp->cfg.restore == 2) return draw_restore_pair(sp, b, i, r, big);
     if (sp->cfg.restore) return draw_restore(sp, b, i, r, big);

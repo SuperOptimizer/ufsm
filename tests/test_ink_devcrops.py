@@ -87,4 +87,15 @@ with tempfile.TemporaryDirectory(prefix="ufsm-devcrops-") as tmp:
     run(BIN, "ink-devcrops", d / "segs.json", "--box", "0,5000,5000,10,10,10", "--ct-key", "S/scan.zarr", "--um", 8.64, "--out", d / "e")
     assert len((d / "e/crops.tsv").read_text().splitlines()) == 1
     run(BIN, "ink-devcrops", d / "segs.json", "--ct-key", "S/scan.zarr", "--um", 8.64, "--out", d / "f", ok=False)   # no --box: usage
+    # --ctx-of (reader3 TTA with context): PAD 0 reproduces a crop's x / y / z byte for byte; PAD 16 is the window grown by 16 canvas px
+    # per side (4 grid cells), the crop its interior, vertices before canvas 0 invalid (-1)
+    c0 = sorted(r[0] for r in rows)[0]; cd = d / "c" / c0; a, b = map(int, c0.split("_")[-2:]); v0, u0 = a * WIN, b * WIN
+    run(BIN, "ink-devcrops", d / "segs.json", "--ctx-of", cd, "--pad", 0, "--out", d / "k0")
+    for k in "xyz":
+        assert (d / "k0" / f"{k}.tif").read_bytes() == (cd / f"{k}.tif").read_bytes() or np.array_equal(t.imread(d / "k0" / f"{k}.tif"), t.imread(cd / f"{k}.tif")), k
+    run(BIN, "ink-devcrops", d / "segs.json", "--ctx-of", cd, "--pad", 16, "--out", d / "k16")
+    X16 = t.imread(d / "k16/x.tif"); n = WIN // 4 + 1
+    assert X16.shape == (n + 8, n + 8) and np.array_equal(X16[4:4 + n, 4:4 + n], t.imread(cd / "x.tif")), X16.shape
+    if u0 == 0: assert (X16[:, :4] == -1).all()
+    run(BIN, "ink-devcrops", d / "segs.json", "--ctx-of", cd, "--pad", 6, "--out", d / "k6", ok=False)   # pad not a multiple of 4
 print("test_ink_devcrops: OK")
