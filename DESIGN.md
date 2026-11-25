@@ -6,6 +6,33 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Desk unrolls of PHercMANB and PHercParis3 with reader3 + R1-62000: no legible text; zcache clamped to the memcap (2026-11-25, unroll)
+
+Two full desk unrolls (try9 cooled-33333 fields, `unroll.sh` INKMODE=r3 PERWRAP=1, driver /vesuvius/ufsm/unrollrun/sh/run.sh,
+CT from the NAS volcomp mirror), then R1-62000 (3-D ink, a voxel net: `latink.sh` LATINK_CHANNEL=ink) at CT level 1 (4.8 um).
+
+| scroll | hand | wrap-check real / dup | z drift | wraps kept | strip valid | ink |
+|---|---|---|---|---|---|---|
+| PHercMANB (2.399 um, crushed S-folded slab) | -1 (estimator) | 113 / 91 | 4.42 turns (ALARM) | 80 (w029-w108) | 5139 cm2, 88 % on papyrus | reader3 all 80 wraps, R1 on a 9.8 mm mid-z band: blobs, no strokes |
+| PHercParis3 (2.400 um, hand umbilicus) | -1 (estimator) | 197 / 14 | 2.95 turns | 201 | 38568 cm2 | R1 band vs reader3 on w300 / w330: blobs, no strokes |
+
+- R1-62000 is sharper than reader3 and agrees with it where the signal is strong (corr 0.54-0.77 on MANB w060 / w069 / w074 band crops,
+  0.23 / 0.46 on Paris3 w300 / w330), but neither forms letters on either scroll. Full-scroll R1 on the pod was dropped for both.
+- The regular lattice on the rendered CT (MANB w060: rows of rectangular blocks every ~55-60 px = ~0.55 mm, vertical lines between) is
+  not a render artifact: it matches neither the mesh step (4 px, 38 um) nor the codec chunk (128 voxels, 1.23 mm), and a re-render from
+  CT level 1 on a 2x denser mesh shows the same lattice at the same physical spacing, sharper (/vesuvius/ufsm/unroll/PHercMANB/grid_L1.jpg
+  vs grid_L2.jpg). It first looked like a textile imprint, but Paris3's CT shows the same lattice (p3_w330_band.jpg there): the crossed
+  fibre layers of papyrus at this resolution.
+- Paris3 strip distortion: dist p95 0.395 > the 0.35 gate, concentrated in ws000-ws008 (p95 1.00 -> 0.36; red over the top and bottom z
+  thirds of every turn, where the hand umbilicus is weakest). Ran with DISTGATE=0; those stripes are marked distorted
+  (/vesuvius/ufsm/unroll/PHercParis3/DISTORTED.txt). ws009-ws041 p95 0.20-0.34, one red sector per turn (a crush line).
+- zcache vs memcap: `unroll.sh` sized the shared decoded-CT cache (/dev/shm) from host RAM (auto, up to 30 GB), but /dev/shm is charged
+  to the memcap scope: MANB under `memcap -m 50G` was OOM-killed in stripimg + perwrap (21:22, scope peak 50 G). Since f60f4dbd the
+  cache (auto or set) is clamped to a quarter of the smallest cgroup memory.max with a DEFAULTED line (memcap 20G: 30 -> 5). Peak RSS per
+  stage, MANB: fields 10.5, rectosp 14.5, mflag 8.6, ref 27.6, join 11.7, wraps 8.2, snap 13.8, stripimg 18.8 GB; Paris3 ref 32.3,
+  wraps 16.3 GB, perwrap scope up to 75.8 GB (SPAR=1, ZCACHE_GB=8).
+- predict --heads on a voxel checkpoint now says "not latent-grid: use --channel NAME" (the MANB R1 latink failure).
+
 ## dinovol dense features tell adjacent sheets apart better than try9's phase in the 50-100 um bin (2026-11-24, dinovol)
 
 - `ufsm merge-flag --sheet-pairs LIST --out PREFIX`: matched-distance triplets on merge-flag --eval's GT (rays from the axis, code-run
