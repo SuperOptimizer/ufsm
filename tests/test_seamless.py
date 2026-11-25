@@ -46,6 +46,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-seam-", delete=not os.environ.get(
         assert o["--window"] == str(W) and o["--halo"] == str(H) and o["--shard"] == str(S2) and o["--full-grid"] == "1", o
         assert o["--q"] == "0" and o["--levels"] == "1" and "--resume" not in o and o["--heads"] == "ink,fib" and o["--um"] == "2.4", o
     assert sorted(c["opts"]["--grid-origin"] for c in calls) == ["0,0,0", f"{S2},{S2},{S2}"], calls
+    assert all(c["opts"]["--tile-list-origin"] == "0,0,0" for c in calls), calls   # --tile-list tiles on the user grid in both passes (11-25)
     assert sorted(c["opts"]["--gpu"] for c in calls) == ["0", "1"], calls   # --gpus 0,1: one pass per GPU
     assert not (out / ".seam").exists(), "the passes must be removed"
     u = (np.arange(N) + 0.5)

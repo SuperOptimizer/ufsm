@@ -31,6 +31,14 @@ Profiled one cascade-aux predict (inkperf casc/auxpred2.sh: R1-62000, Paris4 1.1
 
 Output shards byte-identical (diff -r of the blended level). ~7 h of seamless aux on card 0 becomes ~4.7 h.
 
+**--tile-list in pass b was off by the shift (bug, inkperf casc/st-aux288).** Each pass child ran at --grid-origin 0 / S/2, and predict
+laid the --tile-list tiles on that grid. In pass b every tile moved by S/2: at tile = shift (128-voxel tiles, window 288) the tile left
+the box ("none of its 1 tiles meets the box"); at larger tiles pass b computed the wrong half-tiles, and those tiles got pass a alone.
+Both passes now get --tile-list-origin 0,0,0 (a new predict option; default stays the grid origin). Paris4 run above: pass b 1414 of
+1455 tiles (shifted) -> 1455 of 1455, wall 155 s with the fix (pass b now does its full share). tests/test_tile_list.c covers tile =
+shift and tile = 2 shift for both passes' boxes; test_seamless.py checks the pass argument. Seamless tile-list outputs made before the
+fix lack pass b on part of every tile: rerun.
+
 ## CPU side: the pod's CPUs are not the bottleneck; blocking host waits, gpudec priority, content dcache keys, cheaper elastic warp (2026-11-25, perf)
 - Measured first. Pod 1 (13.6 CPUs by cgroup, RTX PRO 6000) over the container's day with DINO2 + S2E: 2.9 CPUs used while active (173 k
   CPU-s, 25 % system), throttled in 5 837 of 595 k periods (1 %). S2E's wait (71 -> 23 % over 30 k steps, 30-86 Mvox/s) followed cache

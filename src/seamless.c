@@ -49,7 +49,7 @@ static int is_file(const char *p) { struct stat sb; return !stat(p, &sb) && S_IS
 
 /* the options a pass sets itself (each takes a value) */
 static const char *const own[] = {"--seamless", "--gpus", "--gpu", "--q", "--levels", "--full-grid", "--grid-origin", "--shard", "--window",
-                                  "--halo", "--resume", "--boxes", "--box", nullptr};
+                                  "--halo", "--resume", "--boxes", "--box", "--tile-list-origin", nullptr};
 static int g_split;   /* --split z --gpus A,B: every window split over both GPUs; the passes keep --split / --gpus and run one after the other */
 static int owned(const char *a) {
     if (g_split && (!strcmp(a, opt_n("--gpus")) || !strcmp(a, opt_n("--gpu")))) return 0;
@@ -78,7 +78,10 @@ static pid_t spawn_pass(int argc, char **argv, const char *pout, int W, int H, i
     for (int i = 0; i < 6 && i < argc; i++) v[n++] = i == 5 ? (char *)pout : argv[i];
     for (int i = 6; i < argc; i++) { if (owned(argv[i]) && i + 1 < argc) { i++; continue; } v[n++] = argv[i]; }
     char *bb = pass_box(2 * S2, shift);
-    const char *add[] = {"--box", bb, "--window", bw, "--halo", bh, "--shard", bs, "--grid-origin", bg, "--full-grid", "1", "--q", "0", "--levels", "1", "--gpu", bu};
+    /* --tile-list tiles stay on the user's grid (--tile-list-origin, default 0) in both passes, not on the pass's --grid-origin (perf 11-25: pass b
+       moved every tile by the shift, losing it at tile = shift) */
+    const char *tlo = "0,0,0"; for (int i = 6; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n("--tile-list-origin"))) tlo = argv[i + 1];
+    const char *add[] = {"--tile-list-origin", tlo, "--box", bb, "--window", bw, "--halo", bh, "--shard", bs, "--grid-origin", bg, "--full-grid", "1", "--q", "0", "--levels", "1", "--gpu", bu};
     for (size_t k = 0; k < sizeof add / sizeof *add - (g_split ? 2 : 0); k++) v[n++] = (char *)add[k];
     v[n] = nullptr;
     posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
