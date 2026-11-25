@@ -930,6 +930,10 @@ stripimg() {
 # --- per-wrap renders (p4full3.sh) and faces ---
 pw_one() {   # pw_one WRAP GPU (a background subshell: the cache env stays in it); the wraps the strip uses (wraps_snap with SNAP=1, audit 11-14 #12)
   zcon; local w=$1 gpu L=$O/logs/pw/$1 nv dc d=$O/r/$1 WD=$(wrapsdir); gpu=$(pcard $2) || return 1
+  # r3: a wrap rendered by an earlier run of this stage (.rendered, its CT render kept) is not rendered again: perwrap's own skip test
+  # is the final image, written only after the one ink pass over all wraps, so every restart re-rendered every wrap (Paris3 11-25:
+  # ~5 min per outer wrap, 80 wraps redone after a strip-only restart). r3once_ok links the skipped wraps into the residual pass.
+  [ "$INKMODE" = r3 ] && [ -e $d/.rendered ] && [ -s $d/${w}_ct.tif ] && [ -s $O/up/$w/x.tif ] && { r3geo_add $w; return 0; }
   nv=$(stat -c %s $WD/$w.sfc); dc=$(awk -v n=$nv -v m=1500000 'BEGIN { d = 1; while (n / (d * d) > m) d++; print d }')
   if [ ! -e $O/flat/$w/x.tif ]; then
     nice -n 10 $U tifxyz-scale $WD $O/orig 1 --wraps $w > $L.scale.log 2>&1 || return 1

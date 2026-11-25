@@ -104,6 +104,10 @@ def main():
         if r.returncode:
             print(r.stderr[-2000:]); print("FAIL: dinovol-embed"); return 1
         fails = 0
+        # the default slab / band choice runs every lattice tile once (11-25: 1-cell slabs had run every tile twice), and says nothing
+        rec = int(r.stderr.split(" recomputed")[0].split()[-1])
+        print(f"default run: {rec} tiles recomputed, DEFAULTED lines {r.stderr.count('DEFAULTED')}")
+        fails += rec != 0 or "DEFAULTED" in r.stderr
         for name, step in [("tokens", 8), ("dense", DS), ("ink", DS)]:
             for (zi, yi, xi), ref in sink.arrays[name]:
                 gz = z0 // step + zi   # the reference arrays start at z_range[0]; ours span the volume
@@ -124,6 +128,9 @@ def main():
                             "--band-cells", "1", "--shard-cells", "1"], capture_output=True, text=True)
         if r.returncode:
             print(r.stderr[-2000:]); print("FAIL: banded run"); return 1
+        rec2 = int(r.stderr.split(" recomputed")[0].split()[-1])
+        print(f"banded run: {rec2} tiles recomputed, DEFAULTED {'DEFAULTED' in r.stderr}")
+        fails += rec2 == 0 or "DEFAULTED" not in r.stderr   # (forced 1-cell slabs and bands: recomputes, said so)
         for name, step in [("tokens", 8), ("dense", DS), ("ink", DS)]:
             o = (z0 // step, y0 // step, x0 // step); n = (nz // step, ny // step, nx // step)
             got = []
