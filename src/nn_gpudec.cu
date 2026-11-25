@@ -234,7 +234,7 @@ static struct {
     gd_slot slot[NSLOT]; int open;
     uint32_t *d_pos;
     uint16_t scan[BLKV]; int have_scan;
-    uint64_t n_subs, n_batches, n_redo, n_busy, n_cpu_busy; double gpu_s;
+    uint64_t n_subs, n_batches, n_redo, n_busy, n_cpu_busy, n_calls, n_gpu, n_small; double gpu_s;
     double max_s, cool_s; int64_t busy_us;   /* a GPU shared with saturating kernels: round trips over max_s -> the CPU for cool_s */
 } G = {PTHREAD_ONCE_INIT, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
 
@@ -440,6 +440,12 @@ extern "C" int gpudec_threads(int nthreads) {
     const int t = e && atoi(e) > 0 ? atoi(e) : 32;
     return t > nthreads ? t : nthreads;
 }
+extern "C" void gpudec_counts_get(gpudec_counts *o) {
+    pthread_mutex_lock(&G.mu);
+    *o = (gpudec_counts){__atomic_load_n(&G.n_calls, __ATOMIC_RELAXED), __atomic_load_n(&G.n_gpu, __ATOMIC_RELAXED), __atomic_load_n(&G.n_small, __ATOMIC_RELAXED),
+                         __atomic_load_n(&G.n_cpu_busy, __ATOMIC_RELAXED), G.n_busy, G.n_redo, G.gpu_s, G.max_s};
+    pthread_mutex_unlock(&G.mu);
+}
 extern "C" void gpudec_stats(uint64_t *subs, uint64_t *batches, uint64_t *redo, double *gpu_s) {
     pthread_mutex_lock(&G.mu);
     if (subs) *subs = G.n_subs;
@@ -449,7 +455,7 @@ extern "C" void gpudec_stats(uint64_t *subs, uint64_t *batches, uint64_t *redo, 
     pthread_mutex_unlock(&G.mu);
 }
 
-static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *ddst, const gd_sink *sk) {
+static int gd_decode1(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *ddst, const gd_sink *sk) {
     if (!mask) return 0;
     if (!gpudec_enabled()) return -1;
     if ((double)__atomic_load_n(&G.busy_us, __ATOMIC_RELAXED) > now_s() * 1e6) { __atomic_fetch_add(&G.n_cpu_busy, 1, __ATOMIC_RELAXED); return -1; }   /* after a starved round trip */
@@ -460,7 +466,7 @@ static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *dd
         payload += (size_t)c->tok_n[s] + c->byp_n[s];
     }
     if (need_in > G.in_cap || need_rec > G.rec_cap || k > G.max_items) return -1;
-    if (!ddst && payload < (size_t)k * G.min_bytes) return -1;   /* near-empty substreams (flat blocks: ink, air) decode faster on the CPU than a round
+    if (!ddst && payload < (size_t)k * G.min_bytes) { __atomic_fetch_add(&G.n_small, 1, __ATOMIC_RELAXED); return -1; }   /* near-empty substreams (flat blocks: ink, air) decode faster on the CPU than a round
                                                                    trip; not into a device chunk (the bytes must reach the device anyway) */
     gd_req q = {}; q.mask = mask; q.dst = dst; q.ddst = ddst; q.nitems = k;
     const uint32_t kout = ddst ? 0 : k;
@@ -524,6 +530,13 @@ static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *dd
     if (--S->readers == 0) { S->state = S_FREE; if (G.open < 0) G.open = take_free(); pthread_cond_broadcast(&G.cv); }
     pthread_mutex_unlock(&G.mu);
     return 0;
+}
+/* every request with substreams counted: decoded on the GPU (0), or on the CPU (-1: near-empty by design, a cool-off after a busy round
+   trip, or another reason: no room in a batch, a redo, a failed device) for the periodic train log line (gpudec_counts, 2026-11-25) */
+static int gd_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst, uint8_t *ddst, const gd_sink *sk) {
+    const int rc = gd_decode1(c, mask, dst, ddst, sk);
+    if (mask && gpudec_enabled()) { __atomic_fetch_add(&G.n_calls, 1, __ATOMIC_RELAXED); if (!rc) __atomic_fetch_add(&G.n_gpu, 1, __ATOMIC_RELAXED); }
+    return rc;
 }
 extern "C" int gpudec_decode(const gd_chunk *c, uint32_t mask, uint8_t *dst) { return gd_decode(c, mask, dst, nullptr, nullptr); }
 extern "C" int gpudec_decode_sink(const gd_chunk *c, uint32_t mask, const gd_sink *k) {

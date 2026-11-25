@@ -41,6 +41,10 @@ int gpudec_decode_dev(const gd_chunk *c, uint32_t mask, uint8_t *dchunk);
 typedef struct { uint8_t *out; ptrdiff_t off; size_t zs, ys; int b0[3], b1[3]; } gd_sink;
 int gpudec_decode_sink(const gd_chunk *c, uint32_t mask, const gd_sink *k);
 void gpudec_stats(uint64_t *subs, uint64_t *batches, uint64_t *cpu_redo, double *gpu_s);
+/* the decoder's request counters (cumulative; the train log prints their deltas): requests with substreams, of them decoded on the GPU,
+   on the CPU as near-empty (by design), on the CPU in a cool-off after a busy round trip; the busy round trips (> max_s), redone requests */
+typedef struct { uint64_t calls, gpu, small, cool, busy_trips, redo; double gpu_s, max_s; } gpudec_counts;
+void gpudec_counts_get(gpudec_counts *o);
 
 #ifdef __cplusplus
 }
