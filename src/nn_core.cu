@@ -260,9 +260,32 @@ extern "C" int nn_set_devmap(int n, const int *phys) {
    physical card: train's start-up check of the device flags and the planner's same-card test (2026-11-20) */
 extern "C" int nn_device_count(void) { int n = 0; if (cudaGetDeviceCount(&n) != cudaSuccess) { (void)cudaGetLastError(); return 0; } return n; }
 extern "C" int nn_dev_phys(int d) { return ufsm_dev_phys(d); }
+/* UFSM_CUDA_SYNC=block|yield|spin|auto: how a host thread waits for the GPU (the device's primary context scheduling flags). The default
+   (auto) spins while fewer contexts than cores are live: a trainer's main thread, ink-ext and predict each burned ~1 core in libcuda +
+   clock_gettime (perf 11-24: R11d 15-20 % of its CPU, ink-ext ~40 %). mcudahw's cudaSetDeviceFlags only stores the flags (microc
+   cuda/hw/rt.c), so the driver's cuDevicePrimaryCtxSetFlags_v2 is called directly (it applies to an active context too). Once per
+   physical device; logical devices (0,0) share it. */
+extern "C" void nn_sync_mode(int dev) {
+    static int mode = -2; static unsigned done = 0; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    if (mode == -2) { const char *e = getenv("UFSM_CUDA_SYNC"); mode = !e || !*e || !strcmp(e, "auto") ? -1 : !strcmp(e, "spin") ? 1 : !strcmp(e, "yield") ? 2 : !strcmp(e, "block") ? 4 : -3;
+        if (mode == -3) { fprintf(stderr, "UFSM_CUDA_SYNC=%s: not block / yield / spin / auto: auto\n", e); mode = -1; } }
+    if (mode < 0) return;
+    const int ph = ufsm_dev_phys(dev); if (ph < 0 || ph >= 32) return;
+    pthread_mutex_lock(&mu);
+    if (!(done >> ph & 1)) {
+        done |= 1u << ph;
+        typedef int (*setf_t)(int, unsigned); typedef int (*get_t)(int *, int);
+        void *lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD); if (!lib) lib = dlopen("libcuda.so.1", RTLD_NOW);
+        setf_t setf = lib ? (setf_t)dlsym(lib, "cuDevicePrimaryCtxSetFlags_v2") : nullptr; get_t get = lib ? (get_t)dlsym(lib, "cuDeviceGet") : nullptr;
+        int cd = 0, r = !setf || !get ? -1 : get(&cd, ph); if (!r) r = setf(cd, (unsigned)mode);
+        if (r) fprintf(stderr, "cuda: WARNING: UFSM_CUDA_SYNC not applied on device %d (error %d): host waits as the driver chooses (timing only)\n", ph, r);
+        else fprintf(stderr, "cuda: device %d host waits %s (UFSM_CUDA_SYNC)\n", ph, mode == 4 ? "block" : mode == 2 ? "yield" : "spin");
+    }
+    pthread_mutex_unlock(&mu);
+}
 extern "C" int nn_init(int device) { { static int ser_done = 0;   /* mgpu: env (once per process: the first nn_init of any GPU thread, atomically) */
     if (!__atomic_exchange_n(&ser_done, 1, __ATOMIC_ACQ_REL) && ufsm_env_on("UFSM_SERIALIZE")) { setenv("CUDA_LAUNCH_BLOCKING", "1", 1); fprintf(stderr, "UFSM_SERIALIZE=1: CUDA_LAUNCH_BLOCKING=1, every launch and copy completes in program order (tests/test_serialize.sh)\n"); } }
-    if (ufsm_env_on("UFSM_ACTF32")) g_actbf = 0; if (ufsm_env_on("UFSM_GRADF32")) g_gradbf = 0; if (ufsm_env_on("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } if (cudaSetDevice(device) != cudaSuccess) return -1; if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 3) { size_t fr = 0, tot = 0; cudaFree(0); cudaMemGetInfo(&fr, &tot); fprintf(stderr, "nn_init: device used %.1f MB after the context\n", (tot - fr) / 1e6); } return 0; }
+    if (ufsm_env_on("UFSM_ACTF32")) g_actbf = 0; if (ufsm_env_on("UFSM_GRADF32")) g_gradbf = 0; if (ufsm_env_on("UFSM_F16")) { g_h16 = 1; g_gscale = getenv("UFSM_GSCALE") ? (float)atof(getenv("UFSM_GSCALE")) : 1024.f; } if (cudaSetDevice(device) != cudaSuccess) return -1; nn_sync_mode(device); if (getenv("UFSM_MEM_REPORT") && atoi(getenv("UFSM_MEM_REPORT")) >= 3) { size_t fr = 0, tot = 0; cudaFree(0); cudaMemGetInfo(&fr, &tot); fprintf(stderr, "nn_init: device used %.1f MB after the context\n", (tot - fr) / 1e6); } return 0; }
 extern "C" const char *nn_check(void) {
     cudaError_t e = g_err; const char *ef = g_err_file, *ew = g_err_what; int el = g_err_line, from = -2;
     g_err = cudaSuccess;

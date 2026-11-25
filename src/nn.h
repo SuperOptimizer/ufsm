@@ -25,6 +25,7 @@ static inline size_t shape_spatial(shape5 s) { return (size_t)s.d * s.h * s.w; }
 
 /* ---- device / memory ---- */
 int nn_init(int device);                 /* selects the device; returns 0 on success */
+void nn_sync_mode(int device);           /* UFSM_CUDA_SYNC=block|yield|spin|auto: host waits on the device (nn_init calls it) */
 const char *nn_check(void);              /* nullptr if no error since the last call, else the message */
 void nn_err_worker(int on);              /* this host thread is a per-GPU worker: its nn_check reports only its own errors (the latches are per thread;
                                             every first error is also posted process-wide, and a non-worker thread's nn_check takes a posted one) */
