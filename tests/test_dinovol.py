@@ -15,7 +15,7 @@ import dinovol_ref as R
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 UFSM = ROOT / "build/ufsm"
-CT_ROOT = os.environ.get("UFSM_DINOVOL_CT", str(pathlib.Path("~/ufsm-data/fitkit/p4box/ct").expanduser()))   # a directory or an http(s) volcomp root
+CT_ROOT = os.environ.get("UFSM_DINOVOL_CT", next((str(q) for q in [pathlib.Path("~/ufsm-data/fitkit/p4box/ct").expanduser(), pathlib.Path("/vesuvius/ufsm/v2/ct")] if q.exists()), "~/ufsm-data/fitkit/p4box/ct"))   # a directory or an http(s) volcomp root
 CT_KEY = os.environ.get("UFSM_DINOVOL_KEY", "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr/2")
 
 
@@ -36,7 +36,7 @@ def main():
         skip("torch / numpy missing")
     for p in [R.CKPT, R.DATA / "src/dinovol_2/model/dinov2_eva.py", R.DATA / "pylib/timm", UFSM] + ([] if CT_ROOT.startswith("http") else [pathlib.Path(CT_ROOT) / CT_KEY]):
         if not pathlib.Path(p).exists():
-            skip(f"{p} missing")
+            skip(f"{p} missing (set UFSM_DINOVOL / UFSM_DINOVOL_CT; data dir {R.DATA})")
     cv = os.environ.get("CUDA_VISIBLE_DEVICES")   # the runner's grant (empty: none); nvidia-smi -L ignores it
     if (cv is not None and cv.strip() in ("", "-1")) or (cv is None and "GPU" not in subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout):
         skip("no GPU")
