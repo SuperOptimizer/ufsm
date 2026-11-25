@@ -84,6 +84,9 @@ int z3_read_sub_dev_lean(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t 
 
 /* Shard-level presence: 1 if the shard object exists in the store, 0 if not, -1 on error. */
 int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx);
+/* every shard's presence at once: bits[(a * ns[1] + b) * ns[2] + c] = 1 when shard (a, b, c) exists (ns = the shard grid, filled); a local
+   sharded store is listed by directory, any other answers z3_shard_present per shard. Returns the number present, -1 on error (caller frees). */
+int64_t z3_shard_map(z3 *z, int64_t ns[3], uint8_t **bits);
 /* Inner-chunk presence of a sharded array from its shard indices alone (no chunk is read or decoded): bits[k] = 1 when chunk k
    (z-major over the chunk grid ceil(shape / chunk), grid[] filled) is stored; chunks equal to the fill value are not (z3w omits
    them). Returns the number present, -1 on error or an unsharded array. bits: grid[0] * grid[1] * grid[2] bytes (caller frees). */

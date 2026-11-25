@@ -6,6 +6,32 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## predict --seamless 2 --tile-list: the blend over shard presence maps and parallel shards; pass b's 8x is inherent (2026-11-25, branch seamtile-20261125, perf)
+
+inkperf profiled the R11d HOLD rows (w576, 1667, 64 listed 512 tiles): pass a 45 s, pass b 343 s (493 shifted windows), blend > 82 s
+on the CPU with the GPU idle.
+- **Blend.** ink_blend_run walked every output shard of the box serially. Each walk asked z3_shard_present once per input shard, an
+  index open each, mostly ENOENT. Now:
+  - z3_shard_map lists a local store's shard files once per input;
+  - the output shards with any input are blended by up to --threads workers, one whole shard each, with their own buffers; z3_read
+    and z3w_write_shard are thread-safe across shards, and inner threads = --threads / workers;
+  - the per-voxel arithmetic is unchanged, so the bytes are the same.
+
+  | blend of a seamless pass pair, --threads 6, desk | old s | new s |
+  |---|---|---|
+  | Paris4 level 2, 1455 tiles, 215 dense 512 shards (8425 empty) | 30.4 | 20.0 |
+  | the same 3-tile pair blended into 536 k shards of 128 (presence-bound) | 1.82 | 0.17 |
+
+  Output shard files byte-identical (diff -r). What is left is decoding the pass stores and encoding the output: 5.6 of 6 threads
+  busy.
+- **Pass b.** On a listed tile, full-box seamless takes pass b's values from the 8 shifted windows of full size W that overlap it. The
+  receptive field is far wider than the halo, so a cropped window changes the values. Its edge would also fall where pass b's weight
+  is ~1, which reintroduces the seam. So 493 / 64 = 7.7x is what seamless costs on isolated tiles, and no byte-identical crop exists.
+  The options went to the lead: skip the unlisted shards' head and writes (identical, small); one wider-halo pass for tile lists
+  (not identical, ~2.4x a plain row).
+- tests/test_seamless_tilelist.sh (gpu, 18 s): a real net, window 288 halo 16, 128 tiles (tile = shift) at the corner, inside and
+  adjacent. Every listed output shard file is byte-identical to the whole-box seamless run.
+
 ## Fibre ties in count-field: AFV ties help P4 (+0.04), our own 1667 tracer ties hurt (-0.03); PAUSED (2026-11-19..25, mergeflag)
 
 Same-sheet fibre pairs as count-field rows (`--fibers F.fib --cf-fib W`, 7337a415; `--cf-fib-every 128 --cf-fib-spans 64,256`, since

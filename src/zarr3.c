@@ -2,6 +2,7 @@
 #include "labcomp.h"
 #include "sysinfo.h"
 #include "json.h"
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -1294,6 +1295,34 @@ int z3_shard_present(z3 *z, int64_t sz, int64_t sy, int64_t sx) {
     }
     int64_t s = store_size(z->s, skey);
     return s == -2 ? 0 : s < 0 ? -1 : 1;
+}
+
+/* z3_shard_map: a local sharded array with '/' keys lists <root>/<key>/c/Z/Y/X (one readdir per directory: ink-blend over a
+   --seamless tile-list box asked z3_shard_present ~1 M times, each an index open, most of them ENOENT); else z3_shard_present per shard */
+static int sm_index(const char *s, int64_t n, int64_t *v) { char *e; const long long x = strtoll(s, &e, 10); if (*s < '0' || *s > '9' || *e || x < 0 || x >= n) return 0; *v = x; return 1; }
+int64_t z3_shard_map(z3 *z, int64_t ns[3], uint8_t **bits) {
+    for (int d = 0; d < 3; d++) ns[d] = (z->m.shape[d] + z->m.shard[d] - 1) / z->m.shard[d];
+    const size_t nb = (size_t)(ns[0] * ns[1] * ns[2]); *bits = calloc(nb ? nb : 1, 1); if (!*bits) return FAIL("shard map allocation");
+    int64_t n = 0;
+    if (!z->derive && z->m.sharded && z->m.sep == '/' && store_is_local(z->s)) {
+        char p[4096]; snprintf(p, sizeof p, "%s/%s/c", store_root(z->s), z->key);
+        DIR *dz = opendir(p); if (!dz) return errno == ENOENT ? 0 : FAIL("shard map: %s: %s", p, strerror(errno));
+        struct dirent *ez; const size_t lz = strlen(p);
+        while ((ez = readdir(dz))) { int64_t a, b, c; if (!sm_index(ez->d_name, ns[0], &a)) continue;
+            snprintf(p + lz, sizeof p - lz, "/%s", ez->d_name); DIR *dy = opendir(p); if (!dy) continue; struct dirent *ey; const size_t ly = strlen(p);
+            while ((ey = readdir(dy))) { if (!sm_index(ey->d_name, ns[1], &b)) continue;
+                snprintf(p + ly, sizeof p - ly, "/%s", ey->d_name); DIR *dx = opendir(p); if (!dx) continue; struct dirent *ex;
+                while ((ex = readdir(dx))) if ((ex->d_type == DT_REG || ex->d_type == DT_UNKNOWN) && sm_index(ex->d_name, ns[2], &c)) {
+                    uint8_t *e = &(*bits)[(size_t)((a * ns[1] + b) * ns[2] + c)]; if (!*e) { *e = 1; n++; } }
+                closedir(dx); p[ly] = 0; }
+            closedir(dy); p[lz] = 0; }
+        closedir(dz); return n;
+    }
+    for (int64_t a = 0; a < ns[0]; a++) for (int64_t b = 0; b < ns[1]; b++) for (int64_t c = 0; c < ns[2]; c++) {
+        const int r = z3_shard_present(z, a, b, c); if (r < 0) { free(*bits); *bits = nullptr; return -1; }
+        if (r) { (*bits)[(size_t)((a * ns[1] + b) * ns[2] + c)] = 1; n++; }
+    }
+    return n;
 }
 
 /* the fill value over the whole output box */
