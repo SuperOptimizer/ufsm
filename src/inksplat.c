@@ -1038,11 +1038,48 @@ static void rank_norm(float *v, size_t n) {   /* values -> ranks in [0, 1], ties
         for (size_t k = i; k < e; k++) v[P[k].i] = q; i = e; }
     free(P);
 }
+/* ufsm ink-runs LABELS.tif [--mask M] [--px-um U] [--row TAG] (11-25, the 116 keV diagnosis: stroke width): per ink pixel its local
+   width = min(length of the horizontal ink run through it, of the vertical one); runs that touch the image border are open (left out);
+   the mask only selects the counted ink pixels (atlas labels keep an unsupervised band around the ink, so runs end at label 0). Prints the ink pixels' width quartiles in label px and, with --px-um, in um.
+   --row: "TAG n_px p25 p50 p75 p25_um p50_um p75_um" on stdout. */
+static int runs_cmp(const void *a, const void *b) { const int32_t x = *(const int32_t *)a, y = *(const int32_t *)b; return (x > y) - (x < y); }
+int cmd_ink_runs(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: ufsm ink-runs LABELS.tif [--mask M] [--px-um U] [--row TAG]\n"); return 2; }
+    const char *msk = sopt(argc, argv, "--mask", nullptr), *row = sopt(argc, argv, "--row", nullptr); const double pu = opt_atof("--px-um", sopt(argc, argv, "--px-um", "0"));
+    lsrc LL, LM; if (lsrc_open(&LL, argv[2], -1, nullptr)) return 1;
+    if (msk && lsrc_open(&LM, msk, -1, nullptr)) { lsrc_close(&LL); return 1; }
+    const int64_t H = LL.H, W = LL.W; const size_t np = (size_t)H * W;
+    uint8_t *L = malloc(np), *M = msk ? malloc(np) : nullptr;
+    if (lsrc_read(&LL, 0, 0, H, W, L, 4) || (msk && lsrc_read(&LM, 0, 0, H, W, M, 4))) { fprintf(stderr, "ink-runs: read failed\n"); return 1; }
+    uint8_t *R[2] = {L, M};
+    for (int k = 0; k < 2; k++) { if (!R[k]) continue; uint8_t mx = 0; for (size_t i = 0; i < np; i++) if (R[k][i] > mx) mx = R[k][i]; if (mx == 1) for (size_t i = 0; i < np; i++) R[k][i] *= 255; }
+    int32_t *rw[2]; for (int d = 0; d < 2; d++) { rw[d] = malloc(np * sizeof(int32_t)); for (size_t i = 0; i < np; i++) rw[d][i] = -1; }
+    for (int d = 0; d < 2; d++) {   /* d 0: along rows, 1: along columns */
+        const int64_t nl = d ? W : H, len = d ? H : W;
+        for (int64_t l = 0; l < nl; l++) for (int64_t s = 0; s < len;) {
+            const size_t i0 = d ? (size_t)s * W + l : (size_t)l * W + s;
+            if (L[i0] < 128) { s++; continue; }
+            int64_t e = s; while (e < len) { const size_t i = d ? (size_t)e * W + l : (size_t)l * W + e; if (L[i] < 128) break; e++; }
+            if (s > 0 && e < len) for (int64_t k = s; k < e; k++) { const size_t i = d ? (size_t)k * W + l : (size_t)l * W + k; if (!M || M[i] >= 128) rw[d][i] = (int32_t)(e - s); }
+            s = e;
+        }
+    }
+    int32_t *w = malloc(np * sizeof *w); size_t n = 0;
+    for (size_t i = 0; i < np; i++) { if (rw[0][i] < 0 || rw[1][i] < 0) continue; w[n++] = rw[0][i] < rw[1][i] ? rw[0][i] : rw[1][i]; }
+    qsort(w, n, sizeof *w, runs_cmp);
+    const double q[3] = {n ? w[n / 4] : 0, n ? w[n / 2] : 0, n ? w[3 * n / 4] : 0};
+    fprintf(stderr, "ink-runs: %s: %zu ink px with closed runs both ways: width p25 / p50 / p75 = %g / %g / %g px", argv[2], n, q[0], q[1], q[2]);
+    if (pu > 0) fprintf(stderr, " = %.1f / %.1f / %.1f um", q[0] * pu, q[1] * pu, q[2] * pu);
+    fprintf(stderr, "\n");
+    if (row) printf("%s\t%zu\t%g\t%g\t%g\t%.1f\t%.1f\t%.1f\n", row, n, q[0], q[1], q[2], q[0] * pu, q[1] * pu, q[2] * pu);
+    free(w); free(rw[0]); free(rw[1]); free(L); free(M); lsrc_close(&LL); if (msk) lsrc_close(&LM);
+    return 0;
+}
 int cmd_ink_score(int argc, char **argv) {
     const char *surf = sopt(argc, argv, "--surface", nullptr), *lab = sopt(argc, argv, "--labels", nullptr), *msk = sopt(argc, argv, "--mask", nullptr);
     const char *cache = sopt(argc, argv, "--cache", nullptr), *row = sopt(argc, argv, "--row", nullptr);
     if (!surf || !lab || sidx(argc, argv, "--map") < 0) {
-        fprintf(stderr, "usage: ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR] [--row TAG] [--holdouts H.json --ct KEY] [--fuse mean|rank[,..] [--weights a,b,..]]\n"); return 2;
+        fprintf(stderr, "usage: ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR] [--row TAG] [--holdouts H.json --ct KEY] [--fuse mean|rank[,..] [--weights a,b,..]] [--edge K]\n"); return 2;
     }
     ssurf S; if (ssurf_load(&S, surf)) return 1;
     { const double su = opt_atof("--surf-um", sopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* the mesh voxel size when its meta has none */
@@ -1070,13 +1107,30 @@ int cmd_ink_score(int argc, char **argv) {
     if (hof && (!hct || inkfly_holdouts(hof, hct, &hc) || !hc.nexcl)) { fprintf(stderr, "ink-score: --holdouts needs --ct KEY and at least one box of that CT in %s\n", hof); return 1; }
     if (hof) fprintf(stderr, "ink-score: holdout-only: the pixels inside the %d held-out boxes of %s\n", hc.nexcl, hct);
     int rc = 0;
+    /* --edge K (11-25, the 116 keV diagnosis): also the AUC of the ink pixels within K label px (Chebyshev) of a label-0 pixel against all
+       negatives ("NAME:edge": stroke borders, where a blob-shaped teacher label and a sharper prediction disagree) and of the other ink
+       pixels against all negatives ("NAME:core"); the negatives are not split (atlas labels leave the pixels next to ink unsupervised) */
+    const int edk = opt_atoi("--edge", sopt(argc, argv, "--edge", "0"));
+    uint8_t *EG = nullptr;
+    if (edk > 0) {
+        uint8_t *di[2]; EG = calloc(np, 1);
+        for (int cls = 0; cls < 2; cls++) {   /* box-dilate class cls by edk (separable max) */
+            uint8_t *a = malloc(np), *t = malloc(np);
+            for (size_t i = 0; i < np; i++) a[i] = (L[i] >= 128) == cls;
+            for (int64_t r = 0; r < LL.H; r++) for (int64_t c = 0; c < LL.W; c++) { uint8_t m = 0; for (int64_t d = c - edk; d <= c + edk && !m; d++) if (d >= 0 && d < LL.W) m = a[(size_t)r * LL.W + d]; t[(size_t)r * LL.W + c] = m; }
+            for (int64_t r = 0; r < LL.H; r++) for (int64_t c = 0; c < LL.W; c++) { uint8_t m = 0; for (int64_t d = r - edk; d <= r + edk && !m; d++) if (d >= 0 && d < LL.H) m = t[(size_t)d * LL.W + c]; a[(size_t)r * LL.W + c] = m; }
+            di[cls] = a; free(t);
+        }
+        for (size_t i = 0; i < np; i++) EG[i] = L[i] >= 128 ? di[0][i] : di[1][i];   /* ink near no-ink, or no-ink near ink */
+        free(di[0]); free(di[1]);
+    }
     for (int a = 2; a + 1 < argc; a++) {
         if (strcmp(argv[a], opt_n("--map"))) continue;
         char nm[256]; const char *path = argv[a + 1], *eq = strchr(path, '=');
         if (eq && eq - path < (long)sizeof nm) { snprintf(nm, sizeof nm, "%.*s", (int)(eq - path), path); path = eq + 1; } else snprintf(nm, sizeof nm, "%s", path);
         int mw, mh; uint8_t *mp = img_read_u8(path, &mw, &mh);
         if (!mp) { fprintf(stderr, "ink-score: cannot read %s\n", path); rc = 1; continue; }
-        uint64_t hi[256] = {0}, hn[256] = {0};
+        uint64_t hi[256] = {0}, hn[256] = {0}, ehi[2][256] = {{0}}, ehn[2][256] = {{0}};   /* (--edge: [0] core, [1] edge) */
         const int foot = F >= 1.5 ? (int)lround(F) : 0;
         for (int64_t r = 0; r < LL.H; r++) for (int64_t c = 0; c < LL.W; c++) {
             const size_t i = (size_t)r * LL.W + c; if (M && M[i] < 128) continue;
@@ -1095,6 +1149,7 @@ int cmd_ink_score(int argc, char **argv) {
                 v = (1 - fy) * ((1 - fx) * mp[(size_t)y0 * mw + x0] + fx * mp[(size_t)y0 * mw + x1]) + fy * ((1 - fx) * mp[(size_t)y1 * mw + x0] + fx * mp[(size_t)y1 * mw + x1]);
             }
             const int b = (int)lround(v); if (L[i] >= 128) hi[b]++; else hn[b]++;
+            if (EG) { if (L[i] >= 128) ehi[EG[i]][b]++; else { ehn[0][b]++; ehn[1][b]++; } }   /* (every negative in both: atlas labels mask a band around the ink) */
         }
         uint64_t ti = 0, tn = 0; for (int b = 0; b < 256; b++) { ti += hi[b]; tn += hn[b]; }
         double best = 0, bthr = 0, f05 = 0, p05 = 0, r05 = 0, wrong = 0; uint64_t tp = 0, fp = 0;
@@ -1110,9 +1165,17 @@ int cmd_ink_score(int argc, char **argv) {
         fprintf(stderr, "ink-score: %s: %llu px, ink %.3f, F1 best %.4f (p >= %.3f; all-ink floor %.4f), F1@0.5 %.4f (prec %.3f rec %.3f), AUC %.4f%s\n", nm,
                 (unsigned long long)n, n ? (double)ti / n : 0, best, bthr, n ? 2.0 * ti / (n + ti) : 0, f05, p05, r05, auc, ti && tn ? "" : " (one class only: AUC undefined)");
         if (row) printf("%s\t%s\t%llu\t%.4f\t%.4f\t%.3f\t%.4f\t%.4f\t%.4f\t%.4f\n", row, nm, (unsigned long long)n, n ? (double)ti / n : 0, best, bthr, f05, p05, r05, auc);
+        for (int e = 0; EG && e < 2; e++) {   /* the same tie-aware 256-bin AUC on the edge / core pixels */
+            uint64_t ei = 0, en = 0; double w = 0, fpn = 0;
+            for (int t = 255; t >= 0; t--) { w += (double)ehi[e][t] * (fpn + 0.5 * ehn[e][t]); fpn += ehn[e][t]; ei += ehi[e][t]; en += ehn[e][t]; }
+            const double ea = ei && en ? 1 - w / ((double)ei * en) : 0;
+            fprintf(stderr, "ink-score: %s:%s: %llu px, ink %.3f, AUC %.4f\n", nm, e ? "edge" : "core", (unsigned long long)(ei + en), ei + en ? (double)ei / (ei + en) : 0, ea);
+            if (row) printf("%s\t%s:%s\t%llu\t%.4f\t0\t0\t0\t0\t0\t%.4f\n", row, nm, e ? "edge" : "core", (unsigned long long)(ei + en), ei + en ? (double)ei / (ei + en) : 0, ea);
+        }
         fflush(stdout);
         free(mp);
     }
+    free(EG);
     const char *fu = sopt(argc, argv, "--fuse", nullptr);
     if (fu && !rc) {
         const int dm = strstr(fu, "mean") != nullptr, dr = strstr(fu, "rank") != nullptr;
