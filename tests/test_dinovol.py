@@ -15,7 +15,7 @@ import dinovol_ref as R
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 UFSM = ROOT / "build/ufsm"
-CT_ROOT = pathlib.Path(os.environ.get("UFSM_DINOVOL_CT", "~/ufsm-data/fitkit/p4box/ct")).expanduser()
+CT_ROOT = os.environ.get("UFSM_DINOVOL_CT", str(pathlib.Path("~/ufsm-data/fitkit/p4box/ct").expanduser()))   # a directory or an http(s) volcomp root
 CT_KEY = os.environ.get("UFSM_DINOVOL_KEY", "PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr/2")
 
 
@@ -34,7 +34,7 @@ def main():
         import numpy as np, torch
     except ImportError:
         skip("torch / numpy missing")
-    for p in [R.CKPT, R.DATA / "src/dinovol_2/model/dinov2_eva.py", R.DATA / "pylib/timm", UFSM, CT_ROOT / CT_KEY]:
+    for p in [R.CKPT, R.DATA / "src/dinovol_2/model/dinov2_eva.py", R.DATA / "pylib/timm", UFSM] + ([] if CT_ROOT.startswith("http") else [pathlib.Path(CT_ROOT) / CT_KEY]):
         if not pathlib.Path(p).exists():
             skip(f"{p} missing")
     cv = os.environ.get("CUDA_VISIBLE_DEVICES")   # the runner's grant (empty: none); nvidia-smi -L ignores it
