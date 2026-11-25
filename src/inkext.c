@@ -328,18 +328,40 @@ typedef struct {
     uint8_t **stk; int stk_n, stk_w, stk_h;   /* --layers: a pre-rendered stack (ascending normal offsets) instead of the renderer */
     uint8_t *dump; int dump_req, render_only;  /* --dump-layers: the rendered model-grid stack [D][Hm][Wm] (run_surface allocates) */
     int norm_sheet;   /* --norm sheet (Reader / ink9um): one normalize_robust over a row sample of the whole surface for every tile */
-    int tta, tta_depth;   /* --tta K: the probability averaged over K of the 8 square symmetries of each tile; --tta-depth 1: each also with the layer order reversed */
+    int tta, tta_depth, tta_k0;   /* (tta_k0: --tta-fuse runs one view per pass, symmetry tta2_order[tta_k0]) */
+    /* --tta K: the probability averaged over K of the 8 square symmetries of each tile; --tta-depth 1: each also with the layer order reversed */
+    double goff_y, goff_x;   /* --tta-views: this pass's tile-grid phase (fractions of the stride; tile starts moved, 0 and L - T kept) */
+    const float *ad_map; double ad_tau, ad_lo, ad_hi; long long nadskip;   /* --tta-adaptive: tiles of this pass only where the first pass's map is inky or uncertain */
+    uint8_t *vis; int want_vis;   /* --tta-views: the model-grid pixels some tile of this pass covered (run_surface allocates when want_vis; the passes' weights count only there) */
 } irun;
+
+/* --tta-views N (11-25, the user's high-count reader3 TTA): view v = symmetry tta2_order[v % 8] of pass v / 8; each pass is one run of
+   the surface with its own tile-grid phase (fy, fx: fractions of the stride) and depth shift (dz layers along +N, added to --shift).
+   Fixed order: N 8 = the 8 symmetries; 16 + the half-stride grid; 32 + depth -+1 layer on both grids; 64 + the half-phase grids in y or x
+   alone and depth -+2. */
+enum { IE_VPASS = 8 };
+static const double ie_vpass[IE_VPASS][3] = {{0, 0, 0}, {0.5, 0.5, 0}, {0, 0, 1}, {0, 0, -1}, {0.5, 0.5, 1}, {0.5, 0.5, -1}, {0.5, 0, 2}, {0, 0.5, -2}};
+/* tile starts moved by off (clamped to [0, L - T]), with 0 and the old starts' extremes kept: every pixel stays covered */
+static int *ie_phase_starts(const int *s, int n, int L, int T, int off, int *pn) {
+    int *o = malloc((size_t)(n + 2) * sizeof *o), m = 0; const int hi = L - T > 0 ? L - T : 0;
+    o[m++] = 0;
+    for (int i = 0; i < n; i++) { int v = s[i] + off; if (v > hi) v = hi; if (v < 0) v = 0; o[m++] = v; }
+    o[m++] = hi;
+    for (int i = 1; i < m; i++) for (int j = i; j > 0 && o[j] < o[j - 1]; j--) { const int t = o[j]; o[j] = o[j - 1]; o[j - 1] = t; }
+    int u = 0; for (int i = 0; i < m; i++) if (!u || o[i] != o[u - 1]) o[u++] = o[i];
+    *pn = u; return o;
+}
 
 /* --tta: symmetry c of a T x T tile (bit 2 transpose, then bit 0 flip x, bit 1 flip y): the transformed tile's pixel (y, x) is the source
    pixel tta2_src(c, y, x); all 8 are distinct, so K <= 8 passes are K different views (order: identity, rot 180, transposes, flips) */
 static const int tta2_order[8] = {0, 3, 4, 7, 1, 2, 5, 6};
 static inline int tta2_src(int c, int T, int y, int x) { int a = y, b = x; if (c & 4) { const int t = a; a = b; b = t; } if (c & 1) b = T - 1 - b; if (c & 2) a = T - 1 - a; return a * T + b; }
 /* the batch through every requested view: out = the mean probability in the tiles' own orientation (tbuf, obuf: scratch of the batch size) */
+static int ie_fcmp(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
 static int ie_forward_tta(const irun *X, const uint8_t *tiles, int nb, int D, int T, float *out, uint8_t *tbuf, float *obuf) {
     const size_t TT = (size_t)T * T; int np = 0;
     for (int dpass = 0; dpass <= (X->tta_depth ? 1 : 0); dpass++) for (int k = 0; k < X->tta; k++) {
-        const int c = tta2_order[k];
+        const int c = tta2_order[X->tta_k0 + k];
         if (!c && !dpass) { if (ie_forward(X->net, tiles, nb, obuf, 0)) return -1; }
         else {
             for (int t = 0; t < nb; t++) for (int i = 0; i < D; i++) {
@@ -385,7 +407,7 @@ static void *gpu_worker(void *a) {
         if (!G->has && G->quit) { pthread_mutex_unlock(&G->mu); break; }
         pthread_mutex_unlock(&G->mu);
         const int nb = G->nb; const double t0 = inow();
-        if (X->tta > 1 || X->tta_depth) {   /* (scratch for the transformed batch and one view's output, kept across batches) */
+        if (X->tta > 1 || X->tta_depth || X->tta_k0) {   /* (scratch for the transformed batch and one view's output, kept across batches) */
             static _Thread_local uint8_t *tb; static _Thread_local float *ob; static _Thread_local size_t cap;
             const size_t need = (size_t)X->batch * D * T * T;
             if (need > cap) { free(tb); free(ob); tb = malloc(need); ob = malloc((size_t)X->batch * T * T * sizeof *ob); cap = tb && ob ? need : 0; }
@@ -560,6 +582,7 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
         free(v); free(row);
     }
     float *num = calloc((size_t)Wm * Hm, sizeof *num), *den = calloc((size_t)Wm * Hm, sizeof *den);
+    free(X->vis); X->vis = X->want_vis ? calloc((size_t)Wm * Hm, 1) : nullptr;
     free(X->dump); X->dump = X->dump_req ? calloc((size_t)D * Wm * Hm, 1) : nullptr;
     float *ctl = pctl ? calloc((size_t)Wm * Hm, sizeof *ctl) : nullptr; if (pctl) *pctl = ctl;   /* the surface layer (CT / 255) */
     uint8_t *cov = X->kind == IE_V8IN || ie_colvalid_kind(X->kind) ? calloc((size_t)Wm * Hm, 1) : nullptr;   /* max over depth > 0 (v8in: its coverage; ink-sdk lanes: valid columns) */
@@ -575,6 +598,10 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     else if (X->kind == IE_V8IN) { xs = axis_starts_v8(Wm, T, stride, &nx); ys = axis_starts_v8(Hm, T, stride, &ny); }
     else if (ie_is_koine(X->kind) || ie_colvalid_kind(X->kind)) { xs = axis_starts_koine(Wm, T, stride, &nx); ys = axis_starts_koine(Hm, T, stride, &ny); }   /* canonical grid(): the same */
     else { xs = axis_starts_hecate(Wm, T, stride, &nx); ys = axis_starts_hecate(Hm, T, stride, &ny); }
+    if (!ctx && (X->goff_x != 0 || X->goff_y != 0)) {   /* --tta-views: this pass's grid phase */
+        int n2; int *a = ie_phase_starts(xs, nx, Wm, T, (int)lround(X->goff_x * stride), &n2); free(xs); xs = a; nx = n2;
+        a = ie_phase_starts(ys, ny, Hm, T, (int)lround(X->goff_y * stride), &n2); free(ys); ys = a; ny = n2;
+    }
     /* rolling row buffer: rows [rb0, rb1); RB also holds the next tile row's new rows (rendered ahead): + the largest tile-row step.
        UFSM_IE_AHEAD=0: render each tile row when it comes (the old order) */
     static int ahead = -1; if (ahead < 0) ahead = getenv("UFSM_IE_AHEAD") ? atoi(getenv("UFSM_IE_AHEAD")) : 1;   /* mgpu: env */
@@ -628,6 +655,12 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
                 }
                 uint8_t *t = tiles + (size_t)nb * D * T * T; int anyv = 0;
                 const int ph = y0 + T <= Hm ? T : Hm - y0, pw = x0 + T <= Wm ? T : Wm - x0;
+                if (X->ad_map) {   /* --tta-adaptive: only tiles whose first-pass map has p >= tau, or >= 5 % of px uncertain (--tta-adaptive-band) */
+                    int hot = 0; size_t unc = 0;
+                    for (int y = 0; y < ph && !hot; y++) for (int x = 0; x < pw; x++) {
+                        const float q = X->ad_map[(size_t)(y0 + y) * Wm + x0 + x]; if (q >= X->ad_tau) { hot = 1; break; } unc += q >= X->ad_lo && q <= X->ad_hi; }
+                    if (!hot && unc < 0.05 * ph * pw) { X->nadskip++; continue; }
+                }
                 if (X->kind == IE_HEC24 || X->kind == IE_HEC96) for (int y = 0; y < ph; y++) for (int x = 0; x < pw; x++) den[(size_t)(y0 + y) * Wm + x0 + x] += win[y * T + x];
                 memset(t, 0, (size_t)D * T * T);
                 if (ctx) {   /* Studio: the reflect-padded window; skipped when its central OW x OW has no data column (all of it is zeroed after the blend) */
@@ -650,6 +683,7 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
                         if ((double)nv / ((double)T * T) < ie_min_valid(X->kind)) { nskip++; continue; }
                     }
                 }
+                if (X->vis) for (int y = 0; y < ph; y++) memset(X->vis + (size_t)(y0 + y) * Wm + x0, 1, (size_t)pw);
                 tx[nb] = x0; ty[nb] = y0; nb++;
             }
             if (nb == B || (ix == nx && iy == ny - 1 && nb)) {
@@ -667,7 +701,8 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
     if (G.fail) fail = 1;
     tg = G.tg; ntiles = G.ntiles;
     free(G.tiles); free(G.tx); free(G.ty); pthread_mutex_destroy(&G.mu); pthread_cond_destroy(&G.cv);
-    fprintf(stderr, "\rink-ext: %s %s: %lld tiles (%lld empty skipped), render %.1fs, net %.1fs (%.1f tiles/s), CT chunks decoded %llu\n", S->name, sp->name, ntiles, nskip, tr, tg, tg > 0 ? ntiles / tg : 0, (unsigned long long)X->lev[L].ndec);
+    fprintf(stderr, "\rink-ext: %s %s: %lld tiles (%lld empty skipped%s), render %.1fs, net %.1fs (%.1f tiles/s), CT chunks decoded %llu\n", S->name, sp->name, ntiles, nskip,
+            X->ad_map ? ", adaptive: the rest skipped as cold" : "", tr, tg, tg > 0 ? ntiles / tg : 0, (unsigned long long)X->lev[L].ndec);
     for (size_t i = 0; i < (size_t)Wm * Hm; i++) {
         const float d = den[i]; float p = ie_is_koine(X->kind) ? (d > 1e-6f ? num[i] / d : 0.f) : (d > 0 ? num[i] / d : 0.f);
         if (ie_colvalid_kind(X->kind) && !cov[i]) p = 0.f;   /* ink-sdk: no CT in the column -> 0 */
@@ -775,6 +810,9 @@ int cmd_ink_ext(int argc, char **argv) {
                         "  --zwin a,b,..: also average over these extra layer shifts (the ink_9um card's z-window ensemble, e.g. -1,0,1)\n"
                         "  --tta K: each tile's probability averaged over K (1..8) square symmetries (flips, transposes; exact, no resampling)\n"
                         "  --tta-depth 1: each view also with the layer order reversed (the read direction flipped inside the tile)\n"
+                        "  --tta-views N (1..64): N views = 8 symmetries x passes with other tile-grid phases / depth shifts (fixed order, ie_vpass); --tta-adaptive TAU:\n"
+                        "    passes after the first only on tiles where the first pass has p >= TAU or >= 5 %% of px in --tta-adaptive-band (0.4,0.8) (elsewhere the first pass alone)\n"
+                        "  --tta-fuse mean|median|trim|logit: with --tta-views, each view its own pass; per pixel the median / middle-half mean / logit mean of the views\n"
                         "  --calib: write (p - 0.25) / 0.5 clipped to [0, 1] (koine BCE label smoothing 0.5: reader3 / ink9um no-ink sits near 0.25)\n"
                         "  --native-only: only <name>_<model>_native.tif/.jpg on the model grid (px (i, j) = tifxyz grid (i, j) x du; invalid cells 0), no canvas TIF\n"); return 2;
     }
@@ -846,7 +884,19 @@ int cmd_ink_ext(int argc, char **argv) {
     X.no_overlap = iflag(argc, argv, "--no-overlap");   /* stride = the tile, uniform weights (no blending), empty tiles skipped, v8in without its coverage-mask rule */
     X.norm_sheet = !strcmp(iopt(argc, argv, "--norm", "tile"), "sheet");
     X.tta = opt_atoi("--tta", iopt(argc, argv, "--tta", "1")); X.tta_depth = opt_atoi("--tta-depth", iopt(argc, argv, "--tta-depth", "0")) != 0;
-    if (X.tta < 1 || X.tta > 8) { fprintf(stderr, "ink-ext: --tta 1..8\n"); return 2; }   /* Reader / ink9um input normalisation: tile (official, per tile) or sheet */
+    if (X.tta < 1 || X.tta > 8) { fprintf(stderr, "ink-ext: --tta 1..8\n"); return 2; }
+    const int tviews = opt_atoi("--tta-views", iopt(argc, argv, "--tta-views", "0")); const double atau = opt_atof("--tta-adaptive", iopt(argc, argv, "--tta-adaptive", "0"));
+    if (tviews && (tviews < 1 || tviews > 8 * IE_VPASS || iopt(argc, argv, "--tta", nullptr) || X.tta_depth)) { fprintf(stderr, "ink-ext: --tta-views 1..%d, not with --tta / --tta-depth\n", 8 * IE_VPASS); return 2; }
+    double alo = 0.4, ahi = 0.8;   /* the uncertain band: reader3 / ink9um no-ink sits near 0.25 (koine label smoothing), so 0.2..0.8 marked every tile (11-25 smoke) */
+    if (iopt(argc, argv, "--tta-adaptive-band", nullptr) && sscanf(iopt(argc, argv, "--tta-adaptive-band", ""), "%lf,%lf", &alo, &ahi) != 2) { fprintf(stderr, "ink-ext: --tta-adaptive-band LO,HI\n"); return 2; }
+    if (atau > 0 && tviews <= 8) { fprintf(stderr, "ink-ext: --tta-adaptive needs --tta-views > 8 (the first pass decides)\n"); return 2; }
+    /* --tta-fuse mean | median | trim | logit (11-25, the user's TTA goals: the mean of views blurs stroke borders): with a non-mean fuse every
+       view is its own pass (one symmetry, its pass's grid phase / depth shift) and each pixel fuses the views whose tiles reached it: the median,
+       the mean of the middle half (trim: floor(n / 4) dropped at each end), or the mean in logit space (p clamped to 1e-4 .. 1 - 1e-4) */
+    const char *fus = iopt(argc, argv, "--tta-fuse", "mean"); const int fuse = !strcmp(fus, "median") ? 1 : !strcmp(fus, "trim") ? 2 : !strcmp(fus, "logit") ? 3 : 0;
+    if (!fuse && strcmp(fus, "mean")) { fprintf(stderr, "ink-ext: --tta-fuse mean|median|trim|logit\n"); return 2; }
+    if (fuse && (tviews < 2 || atau > 0)) { fprintf(stderr, "ink-ext: --tta-fuse %s needs --tta-views >= 2, not with --tta-adaptive\n", fus); return 2; }
+    const int nvp = fuse ? tviews : tviews ? (tviews + 7) / 8 : 1;   /* view passes (--tta-fuse: one per view) */   /* Reader / ink9um input normalisation: tile (official, per tile) or sheet */
     X.nth = ufsm_threads(opt_atoi("--threads", iopt(argc, argv, "--threads", "0")), 16); X.px_um = opt_atof("--px-um", iopt(argc, argv, "--px-um", "0")); if (!(X.px_um > 0)) X.px_um = X.sp->px_um;
     X.ct_mem = (size_t)(opt_atof("--ct-mem", iopt(argc, argv, "--ct-mem", "3")) * (1 << 30));
     X.batch = opt_atoi("--batch", iopt(argc, argv, "--batch", "0"));
@@ -919,24 +969,59 @@ surfaces:;
         float *pm = nullptr; uint8_t *dump0 = nullptr; int npass = 0, bad = 0;
         /* --weights a,b without --zwin / --tta: one render pass, every checkpoint forwarded per batch (UFSM_IE_ENS1=0: a pass per checkpoint) */
         static int ens1 = -1; if (ens1 < 0) ens1 = getenv("UFSM_IE_ENS1") ? atoi(getenv("UFSM_IE_ENS1")) : 1;   /* mgpu: env */
-        const int one = ens1 && nnet > 1 && nzw == 1 && X.tta <= 1 && !X.tta_depth;
+        const int one = ens1 && nnet > 1 && nzw == 1 && X.tta <= 1 && !X.tta_depth && !tviews;
         X.ens = one ? nets : nullptr; X.nens = one ? nnet : 0;
-        for (int k = 0; k < (one ? 1 : nnet) && !bad; k++) for (int z = 0; z < nzw && !bad; z++) {
-            X.net = nets[k]; X.shift = shift0 + zw[z]; X.dump_req = dreq && !npass;
-            if (nnet * nzw > 1) fprintf(stderr, "ink-ext: pass %d/%d: weights %d, shift %+.2f layers\n", npass + 1, nnet * nzw, k, X.shift);
+        float *wsum = nullptr, *ad = nullptr; X.want_vis = tviews > 8 || fuse; long long adskip = 0;
+        float **fst = fuse ? calloc(nvp, sizeof *fst) : nullptr; uint8_t **fvis = fuse ? calloc(nvp, sizeof *fvis) : nullptr;   /* --tta-fuse: every view's map and coverage */   /* --tta-views > 8: per-pixel weights (sum of views over the passes covering it) */
+        for (int k = 0; k < (one ? 1 : nnet) && !bad; k++) for (int z = 0; z < nzw && !bad; z++) for (int v = 0; v < nvp && !bad; v++) {
+            const int vp = fuse ? v / 8 : v;   /* the grid phase / depth row */
+            X.net = nets[k]; X.shift = shift0 + zw[z] + (tviews ? ie_vpass[vp][2] : 0); X.dump_req = dreq && !npass;
+            if (tviews) { X.tta = fuse ? 1 : tviews - 8 * v < 8 ? tviews - 8 * v : 8; X.tta_k0 = fuse ? v % 8 : 0; X.goff_y = ie_vpass[vp][0]; X.goff_x = ie_vpass[vp][1]; }
+            X.ad_map = ad && npass ? ad : nullptr; X.ad_tau = atau; X.ad_lo = alo; X.ad_hi = ahi; X.nadskip = 0;
+            if (nnet * nzw * nvp > 1) fprintf(stderr, "ink-ext: pass %d/%d: weights %d, shift %+.2f layers%s", npass + 1, nnet * nzw * nvp, k, X.shift, tviews ? "" : "\n");
+            if (tviews) fprintf(stderr, ", %d views (from %d), grid phase %.2f,%.2f%s\n", X.tta, X.tta_k0, X.goff_y, X.goff_x, X.ad_map ? ", adaptive" : "");
             float *q = run_surface(&X, &S, &Wm, &Hm, &du, want_ct && !npass ? &ctl : nullptr);
             if (!q) { bad = 1; break; }
-            if (!npass) { pm = q; dump0 = X.dump; X.dump = nullptr; }
+            adskip += X.nadskip;
+            const float w = tviews ? (float)X.tta : 1.f;
+            if (fuse) {   /* kept per view; fused after the last */
+                if (!npass) { pm = calloc((size_t)Wm * Hm, sizeof *pm); dump0 = X.dump; X.dump = nullptr; }
+                fst[v] = q; fvis[v] = malloc((size_t)Wm * Hm); memcpy(fvis[v], X.vis, (size_t)Wm * Hm);
+            } else if (X.want_vis) {   /* weighted by the pass's view count where its tiles reached */
+                if (!wsum) wsum = calloc((size_t)Wm * Hm, sizeof *wsum);
+                if (!npass) { pm = calloc((size_t)Wm * Hm, sizeof *pm); dump0 = X.dump; X.dump = nullptr; }
+                for (size_t i = 0; i < (size_t)Wm * Hm; i++) if (X.vis[i]) { pm[i] += w * q[i]; wsum[i] += w; }
+                if (!npass && atau > 0) { ad = q; q = nullptr; }   /* the first pass's map decides the adaptive tiles */
+                free(q);
+            } else if (!npass) { pm = q; dump0 = X.dump; X.dump = nullptr; }
             else { for (size_t i = 0; i < (size_t)Wm * Hm; i++) pm[i] += q[i]; free(q); }
             npass++;
         }
-        X.dump = dump0; X.dump_req = dreq;
-        if (bad || !pm) { rc = 1; free(pm); free(ctl); free(X.dump); X.dump = nullptr; isurf_free(&S); continue; }
+        if (fuse && !bad && pm) {   /* per pixel over the views that covered it (a pixel no view reached stays 0, as the weighted mean leaves it) */
+            float *buf = malloc((size_t)nvp * sizeof *buf);
+            for (size_t i = 0; i < (size_t)Wm * Hm; i++) {
+                int n = 0; for (int j = 0; j < nvp; j++) if (fst[j] && fvis[j][i]) buf[n++] = fst[j][i];
+                if (!n) { pm[i] = 0; continue; }
+                if (fuse == 3) { double s = 0; for (int j = 0; j < n; j++) { const double p = buf[j] < 1e-4f ? 1e-4 : buf[j] > 1 - 1e-4f ? 1 - 1e-4 : buf[j]; s += log(p / (1 - p)); }
+                                 pm[i] = (float)(1 / (1 + exp(-s / n))); continue; }
+                qsort(buf, n, sizeof *buf, ie_fcmp);
+                if (fuse == 1) pm[i] = n & 1 ? buf[n / 2] : 0.5f * (buf[n / 2 - 1] + buf[n / 2]);
+                else { const int d = n / 4; double s = 0; for (int j = d; j < n - d; j++) s += buf[j]; pm[i] = (float)(s / (n - 2 * d)); }
+            }
+            free(buf); fprintf(stderr, "ink-ext: %s: --tta-fuse %s over %d views, %.1fs\n", S.name, fus, nvp, inow() - t0);
+        }
+        for (int j = 0; fuse && j < nvp; j++) { free(fst[j]); free(fvis[j]); }
+        free(fst); free(fvis); X.tta_k0 = 0;
+        X.dump = dump0; X.dump_req = dreq; X.ad_map = nullptr; X.goff_y = X.goff_x = 0; free(ad); free(X.vis); X.vis = nullptr;
+        if (bad || !pm) { rc = 1; free(pm); free(wsum); free(ctl); free(X.dump); X.dump = nullptr; isurf_free(&S); continue; }
+        if (tviews > 8) fprintf(stderr, "ink-ext: %s: --tta-views %d in %d passes, %.1fs\n", S.name, tviews, npass, inow() - t0);
+        if (atau > 0) fprintf(stderr, "ink-ext: %s: --tta-adaptive %.2f: %lld tile runs skipped as cold after the first pass\n", S.name, atau, adskip);
         for (size_t i = 0; i < (size_t)Wm * Hm; i++) {
-            float v = pm[i] / npass;
+            float v = fuse ? pm[i] : wsum ? (wsum[i] > 0 ? pm[i] / wsum[i] : 0.f) : pm[i] / npass;
             if (calib) { v = (v - 0.25f) / 0.5f; v = v < 0 ? 0.f : v > 1 ? 1.f : v; }
             pm[i] = v;
         }
+        free(wsum);
         if (ctl) {   /* --ct-tif: the model's surface layer on the render grid, <surf>_<model>_ct.tif */
             int cw, chh; uint8_t *cg = to_ref_grid(&S, ctl, Wm, Hm, du, &cw, &chh, X.nth);
             snprintf(p, sizeof p, "%s/%s_%s%s_ct.tif", outdir, nm, mname, suffix);
@@ -973,6 +1058,16 @@ surfaces:;
         if (X.stk) {   /* --layers: the stack's pixel grid is the output grid */
             ow = Wm; oh = Hm; g = malloc((size_t)Wm * Hm); for (size_t i = 0; i < (size_t)Wm * Hm; i++) g[i] = (uint8_t)lroundf(pm[i] * 255);
         } else g = to_ref_grid(&S, pm, Wm, Hm, du, &ow, &oh, X.nth);
+        {   /* --canvas-crop x,y,w,h (11-25): only that window of the canvas (zero outside it): a dev crop scored on a run with its context
+               (--grid-crop a larger window of the source segment around it) */
+            const char *cc = iopt(argc, argv, "--canvas-crop", nullptr); int q[4];
+            if (cc && g) {
+                if (sscanf(cc, "%d,%d,%d,%d", q, q + 1, q + 2, q + 3) != 4 || q[2] < 1 || q[3] < 1) { fprintf(stderr, "ink-ext: --canvas-crop x,y,w,h\n"); return 2; }
+                uint8_t *c2 = calloc((size_t)q[2] * q[3], 1);
+                for (int y = 0; y < q[3]; y++) for (int x = 0; x < q[2]; x++) { const int sx = q[0] + x, sy = q[1] + y; if (sx >= 0 && sy >= 0 && sx < ow && sy < oh) c2[(size_t)y * q[2] + x] = g[(size_t)sy * ow + sx]; }
+                free(g); g = c2; ow = q[2]; oh = q[3];
+            }
+        }
         snprintf(p, sizeof p, "%s/%s_%s%s.tif", outdir, nm, mname, suffix);
         if (!g || tiffw_write(p, ow, oh, 1, g, 1)) { fprintf(stderr, "ink-ext: cannot write %s\n", p); rc = 1; }
         /* --jpeg PATH: the half-res JPEG there (default <out>/<name>_<model><suffix>.jpg); --jpeg-stretch: p1-p99 over the surface */

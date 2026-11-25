@@ -140,6 +140,7 @@ int cmd_sheet_cut(int argc, char **argv);   /* src/sheetcut.c */
 int cmd_phase_score(int argc, char **argv);
 int cmd_ink_splat(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_score(int argc, char **argv);   /* src/inksplat.c */
+int cmd_ink_runs(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_teach(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_teach_up(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_devcrops(int argc, char **argv);   /* src/inksplat.c */
@@ -216,6 +217,8 @@ static int usage(void) {
         "  ufsm img-gate IMG.tif GATE.tif [GATE.tif ..] [--out OUT.tif]   a render x max(gates) / 255 (the strip papyrus gate)\n"
         "  ufsm img-rankavg OUT.tif A.tif B.tif [..] [--w a,b,..]   per-image mid-rank average of ink maps on A's grid (head ensembles)\n"
         "  ufsm img-stretch CTL CT1.tif INK1.tif [..]                     the strip's gated contrast stretch ca,cb,ia,ib\n"
+        "  ufsm img-diff A.tif B.tif                                      max |a - b| and differing-byte count of two uint8 maps\n"
+        "  ufsm img-zoom IN.tif OUT.tif K                                 nearest-neighbour K x enlargement of a uint8 map\n"
         "  ufsm jpeg-fit IN.jpg OUT.jpg --div 2 | --max-px N                  a finished JPEG shrunk (OUT may be IN)\n"
         "  ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K]   tifxyz wraps -> surface-compressor .sfc (readers take .sfc wraps directly)\n"
         "  ufsm sheet-cut <wraps-dir> <out-dir> [--tol 0.3] [--min-cm2 0.25] [--max 8]   square flat sheets: largest isometric rectangles of each wrap\n"
@@ -225,6 +228,7 @@ static int usage(void) {
         "  ufsm ink-audit SEGS.json --ct ROOT KEY --ct-um U [--pred ROOT KEY] [--holdouts H]   onfly ink labels per split: positives, face offsets, band CT, AUC per band shift\n"
         "  ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx   voxelwise AUC / F1 of a 3-D ink prediction vs a 3-D reference (ink-splat)\n"
         "  ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif ..   F1 / AUC of 2D ink maps vs a segment's published labels\n"
+        "  ufsm ink-runs LABELS.tif [--mask M] [--px-um U] [--row TAG]   ink stroke width quartiles (min of the row / column run per ink px)\n"
         "  ufsm ink-teach --segs SEGS --teacher NAME=MAP%%s .. --out DIR   2D teacher maps -> calibrated, gated soft ink label windows (on-the-fly ink)\n"
         "  ufsm ink-teach-up SEGS-TEACH.json OUT [--up 2]   ink-teach windows at label_scale / up (p bilinear in the mask, mask nearest)\n"
         "  ufsm ink-devcrops SEGS.json --box B --ct-key K --um U --out DIR   scoring crops (clean layout) of the windows inside held-out boxes\n"
@@ -4900,6 +4904,8 @@ int cmd_img_gate(int argc, char **argv);   /* src/imggate.c */
 int cmd_img_rankavg(int argc, char **argv);   /* src/imgrank.c */
 int cmd_img_rankavg(int argc, char **argv);   /* src/imgrank.c */
 int cmd_img_stretch(int argc, char **argv);   /* src/imggate.c */
+int cmd_img_diff(int argc, char **argv);      /* src/imggate.c */
+int cmd_img_zoom(int argc, char **argv);      /* src/imggate.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
 int cmd_gt_trans(int argc, char **argv);   /* src/gttrans.c */
@@ -5048,6 +5054,8 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "img-gate")) return cmd_img_gate(argc, argv);
     if (!strcmp(cmd, "img-rankavg")) return cmd_img_rankavg(argc, argv);
     if (!strcmp(cmd, "img-stretch")) return cmd_img_stretch(argc, argv);
+    if (!strcmp(cmd, "img-diff")) return cmd_img_diff(argc, argv);
+    if (!strcmp(cmd, "img-zoom")) return cmd_img_zoom(argc, argv);
     if (!strcmp(cmd, "phase-raster")) return cmd_phase_raster(argc, argv);
     if (!strcmp(cmd, "wraps")) return cmd_wraps(argc, argv);
     if (!strcmp(cmd, "stitch")) return cmd_stitch(argc, argv);
@@ -5062,6 +5070,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "ink-ext")) return cmd_ink_ext(argc, argv);
     if (!strcmp(cmd, "ink-splat")) return cmd_ink_splat(argc, argv);
     if (!strcmp(cmd, "ink-score")) return cmd_ink_score(argc, argv);
+    if (!strcmp(cmd, "ink-runs")) return cmd_ink_runs(argc, argv);
     if (!strcmp(cmd, "ink-teach")) return cmd_ink_teach(argc, argv);
     if (!strcmp(cmd, "ink-teach-up")) return cmd_ink_teach_up(argc, argv);
     if (!strcmp(cmd, "ink-devcrops")) return cmd_ink_devcrops(argc, argv);
