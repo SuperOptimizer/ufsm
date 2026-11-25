@@ -294,6 +294,7 @@ test_ink_ext_hecate                            | gpu,slow     |   421 | python3 
 test_ink_ext_reader3                           | gpu,slow     |   104 | python3 tests/test_ink_ext_reader3.py
 test_ink_ext_ink9um                            | gpu,slow     |   241 | python3 tests/test_ink_ext_ink9um.py
 test_ink_ext_tiling                            | gpu          |    24 | python3 tests/test_ink_ext_tiling.py
+test_ink_ext_ttafuse                           | gpu          |    25 | python3 tests/test_ink_ext_ttafuse.py
 test_ink_ext_inksdk_koine                      | gpu,slow     |    60 | python3 tests/test_ink_ext_inksdk_koine.py
 test_ink_ext_inksdk_canon                      | gpu,slow     |    30 | python3 tests/test_ink_ext_inksdk_canon.py
 test_ink_ext_inksdk_blend                      | gpu,slow     |    45 | python3 tests/test_ink_ext_inksdk_blend.py
