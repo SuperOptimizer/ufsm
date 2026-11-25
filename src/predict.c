@@ -1791,7 +1791,8 @@ static int predict_one(int argc, char **argv) {
     phead_t PH[PHEAD_MAX]; int nph = 0;
     const int lat_ok = half == 3 && hdiv == 4 && hmode == 1 && !ufsm_env_on("UFSM_PRED_HOSTPATH") && !fea && tta <= 1 && !split && !sheet_task && !slab && !sweep_out && cfg.cin != 5;   /* (--gpus workers: z layers each, audit 11-14 infer #7) */
     if (hspec) {
-        if (!lat_ok) { fprintf(stderr, "predict --heads: latent-grid (train --lat 4) checkpoints on one GPU's device path (no --feather, --tta, --split, --window-z)\n"); return 2; }
+        if (!lat_ok) { fprintf(stderr, "predict --heads: refused: takes latent-grid (train --lat 4) checkpoints on one GPU's device path only (no --feather, --tta, --split, "
+                               "--window-z); %s\n", half == 3 && hdiv == 4 ? "an option above is set" : "this checkpoint is not latent-grid: use --channel NAME"); return 2; }
         char *h = checkpoint_header_line(ckpt); const int bad = phead_parse(hspec, h, &cfg, rv2c, PH, &nph); free(h);
         if (bad) return 2;
     } else if (lat_ok && (cfg.fstem || rv2c >= 0 || (cfg.lat_guide == 64 && !rvfuse && out_ch < 2)) && !opt_atoi("--no-out", opt(argc, argv, "--no-out", "0")) && (!getenv("UFSM_PRED_HEADS") || ufsm_env_on("UFSM_PRED_HEADS"))) {
