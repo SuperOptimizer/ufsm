@@ -371,6 +371,7 @@ static int pm_used(void);   /* the papyrus-mask plane (pm) is read: unwrap, not 
 static int g_tm_unused;    /* unwrap2 head slabs: the packed recto target / mask (tm -> t, m) is never read: not uploaded, not unpacked, no 3 B per voxel (UFSM_TM_KEEP=1 keeps them) */
 static int g_hs_z;         /* its planes per slab */
 static int g_ds; static float g_ds_w = 0.5f, g_ds_frac = 1.f; static int g_ds_anneal = 1;   /* --deep-sup K: decoder levels 1..K, weight w^j x frac */
+static const int8_t *emb_host(batch *b);   /* (below: an echo's / replay's distill targets cleared) */
 static int g_distill, g_distill_lev = 3, g_distill_div; static float g_distill_w = 1.f; static float g_distill_pap;   /* --distill-papyrus F: targets only on head cells >= F papyrus */ static size_t g_distill_n;   /* --distill C: a C-channel 1^3 head on decoder level --distill-level
                                                                                                     (cells of g_distill_div^3 window voxels; g_distill_n int8 targets per batch), cosine loss x --distill-weight */
 static ssl_heads g_sslh; static float g_sslh_w[SSLH_MAX]; static const char *g_sslh_name[SSLH_MAX];   /* --ssl-heads LIST (--ssl-ink W: "ink:W"): gated mean-teacher
@@ -670,6 +671,12 @@ static int g_film;   /* --film K: the network's per-level scale FiLM (unet_cfg.f
 static float batch_umd(const batch *b, float um) {   /* the voxel size of the level a batch's first window was read at (validation copies carry no level: its grid's) */
     if (!b->level || !b->src || !g_S || b->src[0] < 0 || b->src[0] >= g_S->n || !(g_S->src[b->src[0]].um > 0)) return um;
     return (float)(g_S->src[b->src[0]].um * ldexp(1.0, b->level[0]));
+}
+/* --distill under --gpu-aug 2: the sampler maps a window's feature targets through its own symmetry / warp on the host; an --echo-max
+   echo or --replay re-draws them on the device, so its host targets no longer match: they are cleared (zero vectors: no target, no loss) */
+static const int8_t *emb_host(batch *b) {
+    if (b->use > 0) memset(b->emb, 0, g_distill_n);
+    return b->emb;
 }
 static void select_buf(gpu_state *d, int i) {
     d->rad = d->radb[i]; if (g_gpu_in) unet_set_input_rad(d->u, d->rad);
@@ -1098,7 +1105,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     if (g_cond) nn_h2d(d->wd, b->wind, (size_t)B * p3);
     if (g_unwrap2 && !g_single && (!g_lstream || g_lcheck)) lab_upload(2, b, d->w4, d->wc, b->w4, b->wcomp, d->rad, B, P, 0);
     if (!g_lstream || g_lcheck) for (int j = 0; j < g_naux; j++) lab_upload(3, b, d->aux[j], nullptr, AUXH(b, j), nullptr, d->rad, B, P, 0);
-    if (g_distill) nn_h2d(d->embt, b->emb, g_distill_n);
+    if (g_distill) nn_h2d(d->embt, emb_host(b), g_distill_n);
     if (g_pap_head) nn_h2d(d->pap, b->pap, (size_t)B * p3);
     if (b->ct8) nn_sync();   /* (--gpu-aug: nn_aug_ct / nn_label_warp copy from the pinned batch asynchronously; the caller may release it now) */
     nn_ptick("other uploads");
@@ -1164,7 +1171,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
         if (g_cond) nn_h2d_copy_stream(d->wdb[i], b->wind, (size_t)B * p3);
         if (g_unwrap2 && !g_single && (!g_lstream || g_lcheck)) lab_upload(2, b, d->w4b[i], d->wcb[i], b->w4, b->wcomp, d->radb[i], B, P, 1);
         if (!g_lstream || g_lcheck) for (int j = 0; j < g_naux; j++) lab_upload(3, b, d->auxb[j][i], nullptr, AUXH(b, j), nullptr, d->radb[i], B, P, 1);
-        if (g_distill) nn_h2d_copy_stream(d->embb[i], b->emb, g_distill_n);
+        if (g_distill) nn_h2d_copy_stream(d->embb[i], emb_host(b), g_distill_n);
         if (g_pap_head) nn_h2d_copy_stream(d->papb[i], b->pap, (size_t)B * p3);
     }
     nn_event_record(d->ev_up[i], 1);
@@ -1208,7 +1215,7 @@ static void upload_tail(gpu_state *d, int B, int P) {
         nn_h2d_copy_stream(d->mb[i], b->m, (size_t)B * p3);
     }
     nn_h2d_copy_stream(d->wb[i], trow_w(b, B, d->hwh[i]), (size_t)B * g_tc);
-    if (g_distill) nn_h2d_copy_stream(d->embb[i], b->emb, g_distill_n);
+    if (g_distill) nn_h2d_copy_stream(d->embb[i], emb_host(b), g_distill_n);
     nn_event_record(d->ev_up[i], 1);
     /* lab_early (perf2 2026-11-13): the label warp after the input, into hs_lg + lsc instead of the input buffer, so the next forward starts
        on ev_up while the warp runs on the copy stream; the head slabs wait for ev_lab (P 1024 split: ~350 ms per card a step exposed before) */

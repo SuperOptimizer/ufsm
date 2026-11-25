@@ -1060,8 +1060,10 @@ int sample_gpu_aug_ok(const sample_cfg *c) {   /* the device's CT channel (nn_au
                                                   only (side_air 0), the plain inputs */
     return c->gpu_input && sample_gpu_input_ok(c) && (c->Pz <= 0 || c->Pz == c->P) && !c->ct_augment && c->side_air == 0 && !c->restore && !c->papyrus && c->P <= SA_MAXP;
 }
-int sample_gpu_lwarp_ok(const sample_cfg *c) {   /* --gpu-aug 2: the warped windows' labels on the device: the packed targets (and pmask: their mask bit), phase and winding only */
-    return sample_gpu_aug_ok(c) && (c->pack_tm || sample_tm_unused(c)) && !c->sheet && !c->pap_head && !c->emb_ch && !c->cond && !c->band && !c->aux;
+int sample_gpu_lwarp_ok(const sample_cfg *c) {   /* --gpu-aug 2: the warped windows' labels on the device: the packed targets (and pmask: their mask bit), phase and winding only.
+                                                    (--distill's targets are mapped on the host through the window's own symmetry / warp parameters,
+                                                    which the device warp applies too; echoes / replays re-augment on the device: train drops their targets) */
+    return sample_gpu_aug_ok(c) && (c->pack_tm || sample_tm_unused(c)) && !c->sheet && !c->pap_head && !c->cond && !c->band && !c->aux;
 }
 void sample_write_x_test(const uint8_t *ctu, int D, int P, const int64_t o[3], float mean, float isd, int hasax, const float *cyz,
                          const float *cxz, const int perm[3], const int flip[3], int xfmt, uint64_t seed, uint16_t *H4, uint16_t *H1, void *rec) {
