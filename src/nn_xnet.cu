@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+extern "C" void nn_sync_mode(int device);   /* nn_core.cu (UFSM_CUDA_SYNC) */
 
 static cudaStream_t g_st = nullptr;
 static int g_dev_ok = 0, g_verbose = 0, g_dev = 0;
@@ -19,6 +20,7 @@ extern "C" double xnet_macs(void) { return g_macs; }
 extern "C" int xnet_init(int gpu) {
     if (g_dev_ok) return 0;
     if (cudaSetDevice(gpu) != cudaSuccess) { fprintf(stderr, "xnet: no GPU %d\n", gpu); return -1; }
+    nn_sync_mode(gpu);   /* (UFSM_CUDA_SYNC: ink-ext's gpu_worker spun ~40 % of its CPU in libcuda) */
     g_dev = gpu;
     if (cudaStreamCreateWithFlags(&g_st, cudaStreamNonBlocking) != cudaSuccess) return -1;
     size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);

@@ -7,6 +7,8 @@
 #include "label_versions.h"
 #include "reg.h"
 #include <dirent.h>
+#define XXH_INLINE_ALL
+#include <xxhash.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -1038,11 +1040,125 @@ static void rank_norm(float *v, size_t n) {   /* values -> ranks in [0, 1], ties
         for (size_t k = i; k < e; k++) v[P[k].i] = q; i = e; }
     free(P);
 }
+/* ufsm ink-runs LABELS.tif [--mask M] [--px-um U] [--row TAG] (11-25, the 116 keV diagnosis: stroke width): per ink pixel its local
+   width = min(length of the horizontal ink run through it, of the vertical one); runs that touch the image border are open (left out);
+   the mask only selects the counted ink pixels (atlas labels keep an unsupervised band around the ink, so runs end at label 0). Prints the ink pixels' width quartiles in label px and, with --px-um, in um.
+   --row: "TAG n_px p25 p50 p75 p25_um p50_um p75_um" on stdout. */
+static int runs_cmp(const void *a, const void *b) { const int32_t x = *(const int32_t *)a, y = *(const int32_t *)b; return (x > y) - (x < y); }
+int cmd_ink_runs(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: ufsm ink-runs LABELS.tif [--mask M] [--px-um U] [--row TAG]\n"); return 2; }
+    const char *msk = sopt(argc, argv, "--mask", nullptr), *row = sopt(argc, argv, "--row", nullptr); const double pu = opt_atof("--px-um", sopt(argc, argv, "--px-um", "0"));
+    lsrc LL, LM; if (lsrc_open(&LL, argv[2], -1, nullptr)) return 1;
+    if (msk && lsrc_open(&LM, msk, -1, nullptr)) { lsrc_close(&LL); return 1; }
+    const int64_t H = LL.H, W = LL.W; const size_t np = (size_t)H * W;
+    uint8_t *L = malloc(np), *M = msk ? malloc(np) : nullptr;
+    if (lsrc_read(&LL, 0, 0, H, W, L, 4) || (msk && lsrc_read(&LM, 0, 0, H, W, M, 4))) { fprintf(stderr, "ink-runs: read failed\n"); return 1; }
+    uint8_t *R[2] = {L, M};
+    for (int k = 0; k < 2; k++) { if (!R[k]) continue; uint8_t mx = 0; for (size_t i = 0; i < np; i++) if (R[k][i] > mx) mx = R[k][i]; if (mx == 1) for (size_t i = 0; i < np; i++) R[k][i] *= 255; }
+    int32_t *rw[2]; for (int d = 0; d < 2; d++) { rw[d] = malloc(np * sizeof(int32_t)); for (size_t i = 0; i < np; i++) rw[d][i] = -1; }
+    for (int d = 0; d < 2; d++) {   /* d 0: along rows, 1: along columns */
+        const int64_t nl = d ? W : H, len = d ? H : W;
+        for (int64_t l = 0; l < nl; l++) for (int64_t s = 0; s < len;) {
+            const size_t i0 = d ? (size_t)s * W + l : (size_t)l * W + s;
+            if (L[i0] < 128) { s++; continue; }
+            int64_t e = s; while (e < len) { const size_t i = d ? (size_t)e * W + l : (size_t)l * W + e; if (L[i] < 128) break; e++; }
+            if (s > 0 && e < len) for (int64_t k = s; k < e; k++) { const size_t i = d ? (size_t)k * W + l : (size_t)l * W + k; if (!M || M[i] >= 128) rw[d][i] = (int32_t)(e - s); }
+            s = e;
+        }
+    }
+    int32_t *w = malloc(np * sizeof *w); size_t n = 0;
+    for (size_t i = 0; i < np; i++) { if (rw[0][i] < 0 || rw[1][i] < 0) continue; w[n++] = rw[0][i] < rw[1][i] ? rw[0][i] : rw[1][i]; }
+    qsort(w, n, sizeof *w, runs_cmp);
+    const double q[3] = {n ? w[n / 4] : 0, n ? w[n / 2] : 0, n ? w[3 * n / 4] : 0};
+    fprintf(stderr, "ink-runs: %s: %zu ink px with closed runs both ways: width p25 / p50 / p75 = %g / %g / %g px", argv[2], n, q[0], q[1], q[2]);
+    if (pu > 0) fprintf(stderr, " = %.1f / %.1f / %.1f um", q[0] * pu, q[1] * pu, q[2] * pu);
+    fprintf(stderr, "\n");
+    if (row) printf("%s\t%zu\t%g\t%g\t%g\t%.1f\t%.1f\t%.1f\n", row, n, q[0], q[1], q[2], q[0] * pu, q[1] * pu, q[2] * pu);
+    free(w); free(rw[0]); free(rw[1]); free(L); free(M); lsrc_close(&LL); if (msk) lsrc_close(&LM);
+    return 0;
+}
+/* ink-score --quality (11-25, the user's heavy-TTA goals beyond AUC: ink more readable, background darker and quieter): per map, on the
+   label grid (each label pixel's map value sampled as the AUC rows do, here also outside the mask wherever the surface is valid):
+     bg  = labelled no-ink (mask and label < 128); far = unlabelled surface (mask < 128, or no mask: label < 128) >= FAR label px (Chebyshev)
+           from any ink label: mean, p95, fraction >= 0.5, speckle = mean over the set of the 9 x 9 local std taken over the set's own pixels;
+     contrast mean(ink) - mean(bg) and d' = that / sqrt((var ink + var bg) / 2);
+     recall of the ink pixels at a bg false-positive rate of 1 % and 5 % (the byte histogram, ties split linearly inside the bin);
+     sharpness = mean |grad p| (central differences, per label px) on the ink label's border pixels (in the mask, a 4-neighbour labelled
+     no-ink; atlas masks leave the band outside the ink unsupervised, so the neighbour's mask is not asked).
+   Values in p (0..1). Row: "TAG NAME:q n_ink n_bg bg_mean bg_p95 bg_f50 bg_speckle n_far far_mean far_p95 far_f50 far_speckle dmean dprime
+   rec_fpr1 rec_fpr5 sharp". */
+static int q_sample(const ssurf *S, const uint8_t *mp, int mw, int mh, double F, int foot, int64_t r, int64_t c, double *v) {
+    const double cx = (c + 0.5) * F - 0.5, cy = (r + 0.5) * F - 0.5; double P[3], N[3];
+    if (ssurf_pn(S, cx * S->scale, cy * S->scale, P, N)) return 1;
+    if (foot) { const int x0 = (int)floor(c * F), y0 = (int)floor(r * F); double s = 0; int n = 0;
+        for (int y = y0; y < y0 + foot; y++) for (int x = x0; x < x0 + foot; x++) if (x >= 0 && y >= 0 && x < mw && y < mh) { s += mp[(size_t)y * mw + x]; n++; }
+        if (!n) return 1; *v = s / n; return 0; }
+    if (cx < 0 || cy < 0 || cx > mw - 1 || cy > mh - 1) return 1;
+    const int x0 = (int)cx, y0 = (int)cy, x1 = x0 + 1 < mw ? x0 + 1 : x0, y1 = y0 + 1 < mh ? y0 + 1 : y0; const double fx = cx - x0, fy = cy - y0;
+    *v = (1 - fy) * ((1 - fx) * mp[(size_t)y0 * mw + x0] + fx * mp[(size_t)y0 * mw + x1]) + fy * ((1 - fx) * mp[(size_t)y1 * mw + x0] + fx * mp[(size_t)y1 * mw + x1]);
+    return 0;
+}
+static double q_pct(const uint64_t h[256], uint64_t n, double q) {   /* the byte at quantile q (lower) */
+    if (!n) return 0; const uint64_t k = (uint64_t)floor(q * (double)(n - 1)); uint64_t s = 0;
+    for (int b = 0; b < 256; b++) { s += h[b]; if (s > k) return b; }
+    return 255;
+}
+static double q_speckle(const float *V, const uint8_t *in, int64_t H, int64_t W) {   /* mean over `in` of the 9 x 9 std over `in` */
+    const int64_t W1 = W + 1; double *s1 = calloc((size_t)(H + 1) * W1, sizeof *s1), *s2 = calloc((size_t)(H + 1) * W1, sizeof *s2), *sn = calloc((size_t)(H + 1) * W1, sizeof *sn);
+    for (int64_t r = 0; r < H; r++) for (int64_t c = 0; c < W; c++) { const size_t i = (size_t)r * W + c, o = (size_t)(r + 1) * W1 + c + 1;
+        const double v = in[i] ? V[i] : 0, m = in[i] ? 1 : 0;
+        s1[o] = v + s1[o - 1] + s1[o - W1] - s1[o - W1 - 1]; s2[o] = v * v + s2[o - 1] + s2[o - W1] - s2[o - W1 - 1]; sn[o] = m + sn[o - 1] + sn[o - W1] - sn[o - W1 - 1]; }
+    double acc = 0; uint64_t n = 0;
+    for (int64_t r = 0; r < H; r++) for (int64_t c = 0; c < W; c++) { if (!in[(size_t)r * W + c]) continue;
+        const int64_t r0 = r - 4 < 0 ? 0 : r - 4, r1 = r + 5 > H ? H : r + 5, c0 = c - 4 < 0 ? 0 : c - 4, c1 = c + 5 > W ? W : c + 5;
+        #define QB(a) (a[(size_t)r1 * W1 + c1] - a[(size_t)r0 * W1 + c1] - a[(size_t)r1 * W1 + c0] + a[(size_t)r0 * W1 + c0])
+        const double k = QB(sn), m = QB(s1) / k, var = QB(s2) / k - m * m;
+        #undef QB
+        if (k >= 2) { acc += sqrt(var > 0 ? var : 0); n++; } }
+    free(s1); free(s2); free(sn); return n ? acc / n : 0;
+}
+static void ink_quality(const ssurf *S, const uint8_t *mp, int mw, int mh, double F, const uint8_t *L, const uint8_t *M, int64_t H, int64_t W, int far,
+                        const char *nm, const char *row) {
+    const size_t np = (size_t)H * W; const int foot = F >= 1.5 ? (int)lround(F) : 0;
+    float *V = malloc(np * sizeof *V); uint8_t *ok = calloc(np, 1), *bg = calloc(np, 1), *fr = calloc(np, 1), *nr = calloc(np, 1), *t = malloc(np);
+    for (int64_t r = 0; r < H; r++) for (int64_t c = 0; c < W; c++) { double v; const size_t i = (size_t)r * W + c; if (!q_sample(S, mp, mw, mh, F, foot, r, c, &v)) { ok[i] = 1; V[i] = (float)(v / 255); } }
+    for (size_t i = 0; i < np; i++) nr[i] = L[i] >= 128;   /* ink dilated by `far` (separable box max): "near ink" */
+    for (int64_t r = 0; r < H; r++) for (int64_t c = 0; c < W; c++) { uint8_t m = 0; for (int64_t d = c - far; d <= c + far && !m; d++) if (d >= 0 && d < W) m = nr[(size_t)r * W + d]; t[(size_t)r * W + c] = m; }
+    for (int64_t r = 0; r < H; r++) for (int64_t c = 0; c < W; c++) { uint8_t m = 0; for (int64_t d = r - far; d <= r + far && !m; d++) if (d >= 0 && d < H) m = t[(size_t)d * W + c]; nr[(size_t)r * W + c] = m; }
+    uint64_t hb[256] = {0}, hf[256] = {0}, hi[256] = {0}, nb = 0, nf = 0, ni = 0; double sb = 0, sbb = 0, si = 0, sii = 0, gs = 0; uint64_t gn = 0;
+    for (size_t i = 0; i < np; i++) { if (!ok[i]) continue; const double v = V[i]; const int b = (int)lround(v * 255); const int lab = !M || M[i] >= 128;
+        if (lab && L[i] >= 128) { hi[b]++; ni++; si += v; sii += v * v; }
+        else if (lab) { bg[i] = 1; hb[b]++; nb++; sb += v; sbb += v * v; }
+        if ((M ? M[i] < 128 : L[i] < 128) && !nr[i]) { fr[i] = 1; hf[b]++; nf++; } }
+    double ff = 0; for (size_t i = 0; i < np; i++) if (fr[i]) ff += V[i];
+    for (int64_t r = 1; r + 1 < H; r++) for (int64_t c = 1; c + 1 < W; c++) {   /* the ink label's border (atlas masks leave the band outside unsupervised) */
+        const size_t i = (size_t)r * W + c; if (!ok[i] || (M && M[i] < 128) || L[i] < 128) continue; int e = 0;
+        const size_t nb4[4] = {i - 1, i + 1, i - W, i + W};
+        for (int q = 0; q < 4; q++) if (L[nb4[q]] < 128) e = 1;
+        if (!e || !ok[i - 1] || !ok[i + 1] || !ok[i - W] || !ok[i + W]) continue;
+        const double gx = 0.5 * (V[i + 1] - V[i - 1]), gy = 0.5 * (V[i + W] - V[i - W]); gs += sqrt(gx * gx + gy * gy); gn++; }
+    const double mb = nb ? sb / nb : 0, mi = ni ? si / ni : 0, vb = nb ? sbb / nb - mb * mb : 0, vi = ni ? sii / ni - mi * mi : 0, dm = mi - mb;
+    const double dp = vb + vi > 0 ? dm / sqrt(0.5 * (vb + vi)) : 0;
+    double rec[2]; const double fpr[2] = {0.01, 0.05};
+    for (int k = 0; k < 2; k++) {   /* walk down from 255; the bin that crosses the FPR is taken in part */
+        double fp = 0, tp = 0; rec[k] = 0; if (!nb || !ni) continue;
+        for (int b = 255; b >= 0; b--) { const double f = fp + hb[b]; if (f / nb >= fpr[k]) { const double part = hb[b] ? (fpr[k] * nb - fp) / hb[b] : 0; tp += part * hi[b]; break; } fp = f; tp += hi[b]; }
+        rec[k] = tp / ni; }
+    uint64_t fb = 0, f2 = 0; for (int b = 128; b < 256; b++) { fb += hb[b]; f2 += hf[b]; }
+    const double spb = q_speckle(V, bg, H, W), spf = q_speckle(V, fr, H, W);
+    fprintf(stderr, "ink-score: %s:q: bg %llu px mean %.3f p95 %.3f >=0.5 %.4f speckle %.4f | far %llu px mean %.3f p95 %.3f >=0.5 %.4f speckle %.4f | "
+            "ink %llu px, dmean %.3f d' %.3f, recall @FPR1%% %.3f @5%% %.3f, edge |grad| %.4f /px\n", nm, (unsigned long long)nb, mb, q_pct(hb, nb, 0.95) / 255,
+            nb ? (double)fb / nb : 0, spb, (unsigned long long)nf, nf ? ff / nf : 0, q_pct(hf, nf, 0.95) / 255, nf ? (double)f2 / nf : 0, spf, (unsigned long long)ni, dm, dp, rec[0], rec[1], gn ? gs / gn : 0);
+    if (row) printf("%s\t%s:q\t%llu\t%llu\t%.4f\t%.4f\t%.4f\t%.4f\t%llu\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\n", row, nm, (unsigned long long)ni,
+                    (unsigned long long)nb, mb, q_pct(hb, nb, 0.95) / 255, nb ? (double)fb / nb : 0, spb, (unsigned long long)nf, nf ? ff / nf : 0,
+                    q_pct(hf, nf, 0.95) / 255, nf ? (double)f2 / nf : 0, spf, dm, dp, rec[0], rec[1], gn ? gs / gn : 0);
+    free(V); free(ok); free(bg); free(fr); free(nr); free(t);
+}
 int cmd_ink_score(int argc, char **argv) {
     const char *surf = sopt(argc, argv, "--surface", nullptr), *lab = sopt(argc, argv, "--labels", nullptr), *msk = sopt(argc, argv, "--mask", nullptr);
     const char *cache = sopt(argc, argv, "--cache", nullptr), *row = sopt(argc, argv, "--row", nullptr);
     if (!surf || !lab || sidx(argc, argv, "--map") < 0) {
-        fprintf(stderr, "usage: ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR] [--row TAG] [--holdouts H.json --ct KEY] [--fuse mean|rank[,..] [--weights a,b,..]]\n"); return 2;
+        fprintf(stderr, "usage: ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR] [--row TAG] [--holdouts H.json --ct KEY] [--fuse mean|rank[,..] [--weights a,b,..]] [--edge K] [--quality [--quality-far PX]]\n"); return 2;
     }
     ssurf S; if (ssurf_load(&S, surf)) return 1;
     { const double su = opt_atof("--surf-um", sopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* the mesh voxel size when its meta has none */
@@ -1070,13 +1186,31 @@ int cmd_ink_score(int argc, char **argv) {
     if (hof && (!hct || inkfly_holdouts(hof, hct, &hc) || !hc.nexcl)) { fprintf(stderr, "ink-score: --holdouts needs --ct KEY and at least one box of that CT in %s\n", hof); return 1; }
     if (hof) fprintf(stderr, "ink-score: holdout-only: the pixels inside the %d held-out boxes of %s\n", hc.nexcl, hct);
     int rc = 0;
+    /* --edge K (11-25, the 116 keV diagnosis): also the AUC of the ink pixels within K label px (Chebyshev) of a label-0 pixel against all
+       negatives ("NAME:edge": stroke borders, where a blob-shaped teacher label and a sharper prediction disagree) and of the other ink
+       pixels against all negatives ("NAME:core"); the negatives are not split (atlas labels leave the pixels next to ink unsupervised) */
+    const int edk = opt_atoi("--edge", sopt(argc, argv, "--edge", "0"));
+    const int qfar = sidx(argc, argv, "--quality") >= 0 ? opt_atoi("--quality-far", sopt(argc, argv, "--quality-far", "32")) : 0;   /* --quality: see ink_quality */
+    uint8_t *EG = nullptr;
+    if (edk > 0) {
+        uint8_t *di[2]; EG = calloc(np, 1);
+        for (int cls = 0; cls < 2; cls++) {   /* box-dilate class cls by edk (separable max) */
+            uint8_t *a = malloc(np), *t = malloc(np);
+            for (size_t i = 0; i < np; i++) a[i] = (L[i] >= 128) == cls;
+            for (int64_t r = 0; r < LL.H; r++) for (int64_t c = 0; c < LL.W; c++) { uint8_t m = 0; for (int64_t d = c - edk; d <= c + edk && !m; d++) if (d >= 0 && d < LL.W) m = a[(size_t)r * LL.W + d]; t[(size_t)r * LL.W + c] = m; }
+            for (int64_t r = 0; r < LL.H; r++) for (int64_t c = 0; c < LL.W; c++) { uint8_t m = 0; for (int64_t d = r - edk; d <= r + edk && !m; d++) if (d >= 0 && d < LL.H) m = t[(size_t)d * LL.W + c]; a[(size_t)r * LL.W + c] = m; }
+            di[cls] = a; free(t);
+        }
+        for (size_t i = 0; i < np; i++) EG[i] = L[i] >= 128 ? di[0][i] : di[1][i];   /* ink near no-ink, or no-ink near ink */
+        free(di[0]); free(di[1]);
+    }
     for (int a = 2; a + 1 < argc; a++) {
         if (strcmp(argv[a], opt_n("--map"))) continue;
         char nm[256]; const char *path = argv[a + 1], *eq = strchr(path, '=');
         if (eq && eq - path < (long)sizeof nm) { snprintf(nm, sizeof nm, "%.*s", (int)(eq - path), path); path = eq + 1; } else snprintf(nm, sizeof nm, "%s", path);
         int mw, mh; uint8_t *mp = img_read_u8(path, &mw, &mh);
         if (!mp) { fprintf(stderr, "ink-score: cannot read %s\n", path); rc = 1; continue; }
-        uint64_t hi[256] = {0}, hn[256] = {0};
+        uint64_t hi[256] = {0}, hn[256] = {0}, ehi[2][256] = {{0}}, ehn[2][256] = {{0}};   /* (--edge: [0] core, [1] edge) */
         const int foot = F >= 1.5 ? (int)lround(F) : 0;
         for (int64_t r = 0; r < LL.H; r++) for (int64_t c = 0; c < LL.W; c++) {
             const size_t i = (size_t)r * LL.W + c; if (M && M[i] < 128) continue;
@@ -1095,6 +1229,7 @@ int cmd_ink_score(int argc, char **argv) {
                 v = (1 - fy) * ((1 - fx) * mp[(size_t)y0 * mw + x0] + fx * mp[(size_t)y0 * mw + x1]) + fy * ((1 - fx) * mp[(size_t)y1 * mw + x0] + fx * mp[(size_t)y1 * mw + x1]);
             }
             const int b = (int)lround(v); if (L[i] >= 128) hi[b]++; else hn[b]++;
+            if (EG) { if (L[i] >= 128) ehi[EG[i]][b]++; else { ehn[0][b]++; ehn[1][b]++; } }   /* (every negative in both: atlas labels mask a band around the ink) */
         }
         uint64_t ti = 0, tn = 0; for (int b = 0; b < 256; b++) { ti += hi[b]; tn += hn[b]; }
         double best = 0, bthr = 0, f05 = 0, p05 = 0, r05 = 0, wrong = 0; uint64_t tp = 0, fp = 0;
@@ -1110,9 +1245,18 @@ int cmd_ink_score(int argc, char **argv) {
         fprintf(stderr, "ink-score: %s: %llu px, ink %.3f, F1 best %.4f (p >= %.3f; all-ink floor %.4f), F1@0.5 %.4f (prec %.3f rec %.3f), AUC %.4f%s\n", nm,
                 (unsigned long long)n, n ? (double)ti / n : 0, best, bthr, n ? 2.0 * ti / (n + ti) : 0, f05, p05, r05, auc, ti && tn ? "" : " (one class only: AUC undefined)");
         if (row) printf("%s\t%s\t%llu\t%.4f\t%.4f\t%.3f\t%.4f\t%.4f\t%.4f\t%.4f\n", row, nm, (unsigned long long)n, n ? (double)ti / n : 0, best, bthr, f05, p05, r05, auc);
+        for (int e = 0; EG && e < 2; e++) {   /* the same tie-aware 256-bin AUC on the edge / core pixels */
+            uint64_t ei = 0, en = 0; double w = 0, fpn = 0;
+            for (int t = 255; t >= 0; t--) { w += (double)ehi[e][t] * (fpn + 0.5 * ehn[e][t]); fpn += ehn[e][t]; ei += ehi[e][t]; en += ehn[e][t]; }
+            const double ea = ei && en ? 1 - w / ((double)ei * en) : 0;
+            fprintf(stderr, "ink-score: %s:%s: %llu px, ink %.3f, AUC %.4f\n", nm, e ? "edge" : "core", (unsigned long long)(ei + en), ei + en ? (double)ei / (ei + en) : 0, ea);
+            if (row) printf("%s\t%s:%s\t%llu\t%.4f\t0\t0\t0\t0\t0\t%.4f\n", row, nm, e ? "edge" : "core", (unsigned long long)(ei + en), ei + en ? (double)ei / (ei + en) : 0, ea);
+        }
+        if (qfar > 0) ink_quality(&S, mp, mw, mh, F, L, M, LL.H, LL.W, qfar, nm, row);
         fflush(stdout);
         free(mp);
     }
+    free(EG);
     const char *fu = sopt(argc, argv, "--fuse", nullptr);
     if (fu && !rc) {
         const int dm = strstr(fu, "mean") != nullptr, dr = strstr(fu, "rank") != nullptr;
@@ -1775,19 +1919,32 @@ z3 *inkfly_open_pooled(z3 *ct_coarse, z3 *fine, int own_fine) {
 #define INKFLY_CODE "inkfly " INKFLY_STR(LBL_INKFLY)   /* (label_versions.h LBL_INKFLY; 2 was "ink-splat --face, validation folding, 2026-11-12") */
 /* a label raster's generation: every file under it (count, bytes, newest mtime in ns; the dcache audit 2026-11-14: a directory's mtime
    does not change when chunks below it are rewritten, so key_stat of the dir and zarr.json kept the key) */
+/* UFSM_DCACHE_KEY=content (perf 11-25): local inputs enter the key by their bytes (XXH3-64), not size + mtime, so a cache dir carried to
+   another machine (a new pod re-downloads the same GT meshes with new mtimes: S2E computed 443 k ink cells, ~15 % of its workers' time)
+   still hits. Off by default: the desk's keys stay as they are (switching changes every key once). Directories enter as "dir". */
+static int key_content(void) { static int on = -1; if (on < 0) { const char *e = getenv("UFSM_DCACHE_KEY"); on = e && !strcmp(e, "content"); } return on; }
+static unsigned long long file_xxh(const char *p, long long size) {
+    if (size <= 0) return 0; int fd = open(p, O_RDONLY); if (fd < 0) return 0;
+    void *m = mmap(nullptr, (size_t)size, PROT_READ, MAP_PRIVATE, fd, 0); close(fd); if (m == MAP_FAILED) return 0;
+    madvise(m, (size_t)size, MADV_SEQUENTIAL); const unsigned long long h = XXH3_64bits(m, (size_t)size); munmap(m, (size_t)size); return h;
+}
 static void ink_arr_gen(const char *dir, int depth, long long *nf, long long *nb, long long *mt) {
     DIR *d = depth < 8 ? opendir(dir) : nullptr; if (!d) return;
     for (struct dirent *e; (e = readdir(d));) {
         if (e->d_name[0] == '.' && (!e->d_name[1] || (e->d_name[1] == '.' && !e->d_name[2]))) continue;
         char p[2400]; struct stat st; snprintf(p, sizeof p, "%s/%s", dir, e->d_name); if (stat(p, &st)) continue;
         if (S_ISDIR(st.st_mode)) { ink_arr_gen(p, depth + 1, nf, nb, mt); continue; }
-        const long long t = (long long)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec; (*nf)++; *nb += (long long)st.st_size; if (t > *mt) *mt = t;
+        (*nf)++; *nb += (long long)st.st_size;
+        if (key_content()) *mt = (long long)((unsigned long long)*mt + (file_xxh(p, st.st_size) ^ XXH3_64bits(e->d_name, strlen(e->d_name))));   /* (order-free sum) */
+        else { const long long t = (long long)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec; if (t > *mt) *mt = t; }
     }
     closedir(d);
 }
 static void key_stat(char **b, size_t *n, size_t *cap, const char *path, const char *sub) {
     char p[2100]; snprintf(p, sizeof p, "%s%s%s", path, sub ? "/" : "", sub ? sub : ""); struct stat st;
     char l[2400]; const int k = stat(p, &st) ? snprintf(l, sizeof l, " [%s: -]", sub ? sub : ".") :
+        key_content() ? (S_ISDIR(st.st_mode) ? snprintf(l, sizeof l, " [%s: dir]", sub ? sub : ".") :
+                         snprintf(l, sizeof l, " [%s: %lld x%016llx]", sub ? sub : ".", (long long)st.st_size, file_xxh(p, (long long)st.st_size))) :
         snprintf(l, sizeof l, " [%s: %lld %lld.%09ld]", sub ? sub : ".", (long long)st.st_size, (long long)st.st_mtim.tv_sec, st.st_mtim.tv_nsec);
     while (*n + (size_t)k + 1 > *cap) { *cap *= 2; *b = realloc(*b, *cap); }
     memcpy(*b + *n, l, (size_t)k + 1); *n += (size_t)k;
@@ -3121,7 +3278,7 @@ static int au_in(const double P[3], const int64_t b[6], double m) {
    (-1: none): the AUC of model 1, model 2 and of the rank average (cdf1(b1) + cdf2(b2)) / 2, each cdf the model's mid-rank over all HOLD
    pixels kept (both classes). Exact with ties (Mann-Whitney over the 65536 cells sorted by score). */
 enum { AU_EB = 6 };   /* --pred2-edge buckets (au_edge_bucket) */
-static const char *au_eb_name[AU_EB] = {"<=1", "<=2", "<=4", "<=8", "<=D", ">D"};
+static const char *const au_eb_name[AU_EB] = {"<=1", "<=2", "<=4", "<=8", "<=D", ">D"};
 typedef struct { double s; uint64_t n1, n0; } au_cell;
 static int au_cell_cmp(const void *a, const void *b) { const double x = ((const au_cell *)a)->s, y = ((const au_cell *)b)->s; return (x > y) - (x < y); }
 static void au_fuse_auc(const uint64_t *jr, int nreg, int skip, double out[3]) {
@@ -3498,7 +3655,7 @@ int cmd_ink_devcrops(int argc, char **argv) {
         if (nb >= 64 || sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6 || b[3] <= 0 || b[4] <= 0 || b[5] <= 0) {
             fprintf(stderr, "ink-devcrops: --box z,y,x,nz,ny,nx (level-0, at most 64)\n"); return 2; }
         for (int d = 0; d < 6; d++) box[nb][d] = b[d]; nb++; }
-    static int64_t exb[64][6]; int ne = 0;   /* --exclude: a window with any valid vertex in one of these boxes is dropped (training crops outside held-out boxes) */
+    static int64_t exb[64][6]; int ne = 0;   /* mgpu: config. --exclude: a window with any valid vertex in one of these boxes is dropped (training crops outside held-out boxes) */
     for (int i = 2; i + 1 < argc; i++) { if (strcmp(argv[i], opt_n("--exclude"))) continue; long long b[6];
         if (ne >= 64 || sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", b, b + 1, b + 2, b + 3, b + 4, b + 5) != 6 || b[3] <= 0 || b[4] <= 0 || b[5] <= 0) {
             fprintf(stderr, "ink-devcrops: --exclude z,y,x,nz,ny,nx (level-0, at most 64)\n"); return 2; }
@@ -3510,6 +3667,37 @@ int cmd_ink_devcrops(int argc, char **argv) {
               fprintf(stderr, "ink-devcrops: cannot map the boxes through %s\n", mp); return 1; }
           for (int t = 0; t < nb; t++) printf("%lld,%lld,%lld,%lld,%lld,%lld\n", (long long)box[t][0], (long long)box[t][1], (long long)box[t][2], (long long)box[t][3], (long long)box[t][4], (long long)box[t][5]);
           return 0; } }
+    {   /* --ctx-of CROPDIR --pad P (11-25, reader3 TTA with context): that crop's window grown by P canvas px on each side, sampled exactly as
+           the crop (the same segment, step 4, coordinates, voxel size), as a tifxyz at --out; the crop is its canvas window (P, P, win, win) */
+        const char *co = sopt(argc, argv, "--ctx-of", nullptr);
+        if (co) {
+            const int P = opt_atoi("--pad", sopt(argc, argv, "--pad", "512"));
+            if (argc < 3 || argv[2][0] == '-' || !out || P < 0 || P % 4) { fprintf(stderr, "ink-devcrops SEGS.json --ctx-of CROPDIR --pad P (multiple of 4) --out DIR\n"); return 2; }
+            char cp[1400]; snprintf(cp, sizeof cp, "%s/crop.json", co);
+            FILE *cf = fopen(cp, "rb"); if (!cf) { fprintf(stderr, "ink-devcrops: cannot read %s\n", cp); return 1; }
+            fseek(cf, 0, SEEK_END); const long cz = ftell(cf); fseek(cf, 0, SEEK_SET); char *ctx = malloc((size_t)cz + 1); const size_t cr_ = fread(ctx, 1, (size_t)cz, cf); fclose(cf); ctx[cr_] = 0;
+            json *cj = json_parse(ctx, cr_); free(ctx);
+            const char *sn = cj ? json_str(json_get(cj, "segment"), nullptr) : nullptr; const double cum = cj ? json_num(json_get(cj, "um"), 0) : 0;
+            const int64_t u0 = cj ? (int64_t)json_num(json_get(cj, "canvas_u0"), -1) : -1, v0 = cj ? (int64_t)json_num(json_get(cj, "canvas_v0"), -1) : -1;
+            const int win = cj ? (int)json_num(json_get(cj, "win"), 0) : 0;
+            if (!sn || u0 < 0 || v0 < 0 || win < 4 || !(cum > 0)) { fprintf(stderr, "ink-devcrops: %s: no segment / canvas_u0 / canvas_v0 / win / um\n", cp); json_free(cj); return 1; }
+            FILE *fp = fopen(argv[2], "rb"); if (!fp) { fprintf(stderr, "ink-devcrops: cannot open %s\n", argv[2]); json_free(cj); return 1; }
+            fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *txt = malloc((size_t)sz + 1); const size_t rd = fread(txt, 1, (size_t)sz, fp); fclose(fp); txt[rd] = 0;
+            json *j = json_parse(txt, rd); free(txt); const json *sg = j ? json_get(j, "segments") : nullptr; const char *tx = nullptr;
+            for (size_t si = 0; sg && si < sg->n && !tx; si++) if (!strcmp(json_str(json_get(json_at(sg, si), "name"), ""), sn)) tx = json_str(json_get(json_at(sg, si), "tifxyz"), nullptr);
+            ssurf S; if (!tx || ssurf_load(&S, tx)) { fprintf(stderr, "ink-devcrops: segment %s not in %s / not loadable\n", sn, argv[2]); json_free(j); json_free(cj); return 1; }
+            const int G2 = (win + 2 * P) / 4 + 1; float *x = malloc(sizeof(float) * G2 * G2), *y = malloc(sizeof(float) * G2 * G2), *z = malloc(sizeof(float) * G2 * G2); int nvv = 0;
+            for (int a = 0; a < G2; a++) for (int b = 0; b < G2; b++) {
+                float p[3]; const size_t k = (size_t)a * G2 + b; const double cu = u0 - P + 4.0 * b, cv = v0 - P + 4.0 * a;
+                if (cu < 0 || cv < 0 || !dc_bil(&S, cu * S.scale, cv * S.scale, p)) { x[k] = y[k] = z[k] = -1; continue; }
+                x[k] = p[0]; y[k] = p[1]; z[k] = p[2]; nvv++;
+            }
+            const int bad = tifxyz_write(out, G2, G2, x, y, z, 4, cum, -1, "ink-devcrops --ctx-of");
+            fprintf(stderr, "ink-devcrops: %s: context %d x %d grid (pad %d px), %d valid vertices -> %s\n", co, G2, G2, P, nvv, out);
+            free(x); free(y); free(z); ssurf_free(&S); json_free(j); json_free(cj);
+            return bad ? 1 : 0;
+        }
+    }
     if (argc < 3 || argv[2][0] == '-' || !out || !key || !nb || !(um > 0) || WIN < 32 || WIN % 4) {
         fprintf(stderr, "usage: ufsm ink-devcrops SEGS.json --box z,y,x,nz,ny,nx [--box ..] --ct-key KEY --um U --out DIR [--win 256 (multiple of 4)] [--min-sup 0.2]\n"
                         "         [--min-ink 200] [--scroll S] [--tag T] [--exclude z,y,x,nz,ny,nx ..]   scoring crops (clean crops' layout) of\n"

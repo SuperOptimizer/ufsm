@@ -1390,6 +1390,7 @@ static int pred_rc(int rc) {
     return rc;
 }
 int cmd_predict(int argc, char **argv) {
+    setenv("UFSM_CUDA_SYNC", "block", 0);   /* host waits block (nn_sync_mode, as train; UFSM_CUDA_SYNC=auto: the driver's spin) */
     const char *bf = opt(argc, argv, "--boxes", nullptr);
     if (!bf || argc < 6) return pred_rc(predict_one(argc, argv));   /* (argc < 6: the usage) */
     FILE *f = fopen(bf, "r"); if (!f) { fprintf(stderr, "predict --boxes: cannot open %s\n", bf); return 1; }
@@ -2855,7 +2856,7 @@ static int predict_one(int argc, char **argv) {
             uint8_t *mk = calloc((size_t)(gn[0] * gn[1] * gn[2]), 1); if (!mk) { fprintf(stderr, "predict: out of memory\n"); return 1; }
             long nv = 0; char dl[4096]; snprintf(dl, sizeof dl, "%s", nm); char *sv = nullptr;
             for (char *dir = strtok_r(dl, ",", &sv); dir; dir = strtok_r(nullptr, ",", &sv)) {
-                static const char *ax3[3] = {"z", "y", "x"}; float *A[3] = {}; int w = 0, h = 0, ok = 1;
+                static const char *const ax3[3] = {"z", "y", "x"}; float *A[3] = {}; int w = 0, h = 0, ok = 1;
                 for (int k = 0; k < 3 && ok; k++) { char p[4200]; int w2, h2; snprintf(p, sizeof p, "%s/%s.tif", dir, ax3[k]); A[k] = img_read_f32(p, &w2, &h2); ok = A[k] && (!k || (w2 == w && h2 == h)); w = w2; h = h2; }
                 if (!ok) { fprintf(stderr, "predict: --near-mesh: cannot read the tifxyz %s\n", dir); for (int k = 0; k < 3; k++) free(A[k]); free(mk); return 1; }
                 for (size_t i = 0; i < (size_t)w * h; i++) {

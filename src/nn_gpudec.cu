@@ -386,7 +386,16 @@ static void gd_init(void) {
         GD_CK(cudaHostAlloc(&S->h_items, G.max_items * sizeof(gd_item), cudaHostAllocPortable));
         GD_CK(cudaHostAlloc(&S->h_groups, MAXREQ * sizeof(gd_group), cudaHostAllocPortable));
         GD_CK(cudaHostAlloc(&S->h_status, G.max_items * 4, cudaHostAllocPortable));
-        GD_CK(cudaStreamCreateWithFlags(&S->st, cudaStreamNonBlocking));
+        {   /* UFSM_GPUDEC_PRIO=1: the device's highest stream priority (as inkfly's). Off by default until mcuda measures it against the
+               persistent f4ws wgrad blocks (concurrent gpudec blocks evict them: +60-80 % on that kernel, lead 11-25). So a sampler worker's decode
+               is not queued behind the trainer's kernels (S2E pod: 14.2 k s of round trips over 30 k windows; R11d desk: round trips
+               > 500 ms fell back to the CPU). S2E P256 card 1, 300 steps: round trips 160 -> 149 s, wait 12.6 -> 10.3 %, Mvox/s 46.6 ->
+               47.8 (perf 11-25). Scheduling only: the same bytes. */
+            int lo = 0, hi = 0; cudaError_t e = cudaErrorUnknown;
+            const char *pe = getenv("UFSM_GPUDEC_PRIO");
+            if (pe && *pe && strcmp(pe, "0") && cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess) e = cudaStreamCreateWithPriority(&S->st, cudaStreamNonBlocking, hi);
+            if (e != cudaSuccess) { (void)cudaGetLastError(); GD_CK(cudaStreamCreateWithFlags(&S->st, cudaStreamNonBlocking)); }
+        }
         GD_CK(cudaEventCreateWithFlags(&S->ev, cudaEventBlockingSync | cudaEventDisableTiming));   /* the completer sleeps, it does not spin */
         GD_CK(cudaMalloc(&S->d_in, G.in_cap));
         GD_CK(cudaMalloc(&S->d_out, (size_t)G.max_items * SUB_BYTES));

@@ -65,7 +65,7 @@ static int pcrop_load(pcrop *c, const char *dir) {
     n = fread(t, 1, sizeof t - 1, f); fclose(f); t[n] = 0;
     j = json_parse(t, n); if (!j) { fprintf(stderr, "dinovol-probe: bad %s\n", p); return -1; }
     c->scale = json_num(json_at(json_get(j, "scale"), 0), 0); json_free(j);
-    static const char *nm[3] = {"x", "y", "z"}; float **A[3] = {&c->X, &c->Y, &c->Z};
+    static const char *const nm[3] = {"x", "y", "z"}; float **A[3] = {&c->X, &c->Y, &c->Z};
     for (int k = 0; k < 3; k++) { int w, h; snprintf(p, sizeof p, "%s/%s.tif", dir, nm[k]); *A[k] = img_read_f32(p, &w, &h);
         if (!*A[k] || (k && (w != c->w || h != c->h))) { fprintf(stderr, "dinovol-probe: cannot read %s\n", p); return -1; } c->w = w; c->h = h; }
     int lw, lh, mw, mh; snprintf(p, sizeof p, "%s/labels.tif", dir); c->lab = img_read_u8(p, &lw, &lh);
@@ -186,7 +186,7 @@ static int cmd_feats(int argc, char **argv) {
             xd2h(tok, dv_tokens(net), (size_t)g * g * g * E * 2);
             int done = 0;
             while (done < cnt && !rc) {   /* points of this tile, in chunks of NP */
-                int m = 0; static int sel[65536];
+                int m = 0; static int sel[65536];   /* mgpu: main (dinovol-probe's tile loop, one thread) */
                 for (int i = 0, seen = 0; i < np && m < NP; i++) if (own[i] == ti) { if (seen++ < done) continue; sel[m] = i; for (int dd = 0; dd < 3; dd++) pts[3 * m + dd] = (float)(P[3 * i + dd] - o[dd]); m++; }
                 xh2d(ptsd, pts, (size_t)m * 12);
                 if (dv_net_points(net, ptsd, nullptr, nullptr, m, acc)) { rc = 1; break; }

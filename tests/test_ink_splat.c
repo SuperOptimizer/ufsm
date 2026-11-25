@@ -279,6 +279,22 @@ int main(void) {
             }
             z3_close(fly);
         }
+        {   /* the dcache key (perf 11-25): every input file's mtime moved, a fresh array over the same disk cache. Default keys (size + mtime)
+               miss and recompute; UFSM_DCACHE_KEY=content (the ~ckey suite line: a cache carried to another pod) reads every cell from disk */
+            const int content = getenv("UFSM_DCACHE_KEY") && !strcmp(getenv("UFSM_DCACHE_KEY"), "content");
+            char cmd[1400]; snprintf(cmd, sizeof cmd, "find '%s' -path '%s' -prune -o -type f -exec touch -d '2001-02-03 04:05:06' {} +", dir, dcd);
+            CHECK(system(cmd) == 0, "touch the inputs");
+            z3 *ctx = z3_open(cs, "ct.zarr/1", nullptr); dcache_stats d0; dcache_get_stats(&d0);
+            z3 *fly = ctx ? inkfly_open(ctx, sj, &c8, 64, dcd, nullptr) : nullptr; CHECK(fly != nullptr, "inkfly_open (key)");
+            const int64_t bo[3] = {37, 11, 5}, bn[3] = {NV - 60, NV - 20, NV - 9}; uint8_t *fb = malloc((size_t)bn[0] * bn[1] * bn[2]);
+            CHECK(fly && !z3_read(fly, bo, bn, fb, 4), "read onfly (key)");
+            dcache_stats d1; dcache_get_stats(&d1);
+            const unsigned long long cc = d1.cells_computed - d0.cells_computed, cd = d1.cells_disk - d0.cells_disk;
+            fprintf(stderr, "dcache key (%s): inputs' mtimes moved: %llu computed, %llu from disk\n", content ? "content" : "size + mtime", cc, cd);
+            if (content) CHECK(cc == 0 && cd > 0, "content keys: a carried cache hits after the mtimes moved (%llu computed)", cc);
+            else CHECK(cc > 0, "size + mtime keys: moved mtimes recompute");
+            free(fb); if (fly) z3_close(fly);
+        }
         {   /* the onfly "map" (2026-11-22, 1.1 um teachers from 2.4 um segments): (1) an identity reg.json == no map, byte for byte; (2) A = 2 I
                (fine = coarse / 2) on a mesh written at 2x its coordinates == the original mesh with the face distances halved by hand (the
                map's own scale, cbrt |det A^-1|); (3) the held-out boxes and the coarse key through the map */
