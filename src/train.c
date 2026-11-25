@@ -6339,6 +6339,16 @@ int cmd_train(int argc, char **argv) {
             fprintf(stderr, "step %6d lr %.2e loss %.4f bce %.4f dice %.4f%s gn %.2f %.2f samp/s %.1f Mvox/s (wait %.0f%%%s)%s%s\n", step, lr, acc_loss / nok, acc_bce / nok, acc_dice / nok, affs, acc_g / nok,
                     (double)nacc * B * nl / dt, (double)nacc * B * nl * g_Pz * P * P / 1e6 / dt, 100 * wait / dt, gs, vl >= 0 ? " val " : "", vl >= 0 ? vstr : "");
             health_terms(step, affs);   /* (dead loss terms: the per-term part; the top-level bce / dice are their aggregate) */
+            {   /* the GPU CT decoder since the last log line (lead 11-25: R11P's busy cool-off was counted only at exit): requests, the GPU share, the
+                   CPU ones by reason (near-empty by design, cool-off after a round trip over the busy limit, other), busy round trips (run total too) */
+                static gpudec_counts d0; gpudec_counts d1; gpudec_counts_get(&d1);
+                const uint64_t n = d1.calls - d0.calls;
+                if (n) { const double f = 100.0 / (double)n; const uint64_t sm = d1.small - d0.small, co = d1.cool - d0.cool, gp = d1.gpu - d0.gpu;
+                    fprintf(stderr, "  gpudec: %llu requests, %.1f%% on the GPU; CPU: %.1f%% near-empty, %.1f%% cool-off, %.1f%% other; %llu busy round trips (> %.0f ms; %llu in the run)\n",
+                            (unsigned long long)n, gp * f, sm * f, co * f, fmax(0.0, (double)n - (double)gp - (double)sm - (double)co) * f, (unsigned long long)(d1.busy_trips - d0.busy_trips), d1.max_s * 1e3,
+                            (unsigned long long)d1.busy_trips); }
+                d0 = d1;
+            }
             {   /* the on-the-fly phase since the last log line: reads, tiles (on the GPU), the pair rule's seconds per read (summed over threads) */
                 static phase_onfly_stats o0; phase_onfly_stats o1; phase_onfly_get_stats(&o1);
                 if (o1.reads > o0.reads) fprintf(stderr, "  onfly phase: %llu reads, %llu tiles (%llu GPU-decoded), %.0f ms per read in the pair rule, %.0f ms in CPU codes reads\n",
