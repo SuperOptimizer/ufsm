@@ -266,6 +266,7 @@ extern "C" int nn_dev_phys(int d) { return ufsm_dev_phys(d); }
    cuda/hw/rt.c), so the driver's cuDevicePrimaryCtxSetFlags_v2 is called directly (it applies to an active context too). Once per
    physical device; logical devices (0,0) share it. */
 extern "C" void nn_sync_mode(int dev) {
+    /* mgpu: guarded (mu: done; mode is an env read, the same value from any thread) */
     static int mode = -2; static unsigned done = 0; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     if (mode == -2) { const char *e = getenv("UFSM_CUDA_SYNC"); mode = !e || !*e || !strcmp(e, "auto") ? -1 : !strcmp(e, "spin") ? 1 : !strcmp(e, "yield") ? 2 : !strcmp(e, "block") ? 4 : -3;
         if (mode == -3) { fprintf(stderr, "UFSM_CUDA_SYNC=%s: not block / yield / spin / auto: auto\n", e); mode = -1; } }
