@@ -4252,6 +4252,24 @@ static void *pf_worker(void *p) {   /* the marked chunks, from one shared list: 
     }
     return nullptr;
 }
+/* sharded arrays (2026-11-25): one coalesced fetch per shard over its marked chunks (z3_prefetch_shard_sel), the pod's data wait fix:
+   per-chunk requests from the dl.ash2txt mirror ran ~20 MB/s (~0.35 s first-byte latency each, S2E waited 30-71 %), whole shards ~90 MB/s */
+typedef struct { z3 *ct; const uint8_t *bits; const int64_t *ng; const int64_t *sh; size_t nsh; int64_t g[3]; size_t *next, *done, *fail;
+                 z3_pf_stats st; pthread_mutex_t *mu; z3_pf_stats *tot; } pfs_arg;
+static void *pfs_worker(void *p) {
+    pfs_arg *a = p; z3_pf_stats st = {0};
+    for (;;) {
+        const size_t i = __atomic_fetch_add(a->next, 1, __ATOMIC_RELAXED); if (i >= a->nsh) break;
+        const int64_t s[3] = {a->sh[3 * i], a->sh[3 * i + 1], a->sh[3 * i + 2]};
+        const int64_t lo[3] = {s[0] * a->g[0], s[1] * a->g[1], s[2] * a->g[2]};
+        int64_t hi[3]; for (int d = 0; d < 3; d++) { hi[d] = lo[d] + a->g[d] - 1; if (hi[d] > a->ng[d] - 1) hi[d] = a->ng[d] - 1; }   /* (an edge shard: no chunks past the grid,
+                                                                                                                                  whose bit index would alias the next row) */
+        if (z3_prefetch_shard_sel(a->ct, s[0], s[1], s[2], lo, hi, a->bits, a->ng, &st) < 0) __atomic_fetch_add(a->fail, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(a->done, 1, __ATOMIC_RELAXED);
+    }
+    pthread_mutex_lock(a->mu); a->tot->present += st.present; a->tot->cached += st.cached; a->tot->absent += st.absent; a->tot->bytes += st.bytes; pthread_mutex_unlock(a->mu);
+    return nullptr;
+}
 static void pf_mark(uint8_t *bits, const int64_t *ng, const int64_t *lo, const int64_t *hi) {   /* chunk index box, inclusive, clamped */
     int64_t c0[3], c1[3];
     for (int d = 0; d < 3; d++) { c0[d] = lo[d] < 0 ? 0 : lo[d]; c1[d] = hi[d] >= ng[d] ? ng[d] - 1 : hi[d]; if (c0[d] > c1[d]) return; }
@@ -4261,7 +4279,7 @@ static void pf_mark(uint8_t *bits, const int64_t *ng, const int64_t *lo, const i
 }
 int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int P, int dry) {
     if (P < 8) P = 128;   /* training window (level voxels); windows up to this size are covered */
-    size_t all = 0;
+    size_t all = 0, all_fail = 0; int64_t all_bytes = 0;
     for (int i = 0; i < S->n; i++) {
         source *s = &S->src[i];
         occ_index o = source_occupancy(s);
@@ -4296,6 +4314,34 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
             size_t nmark = 0; for (size_t k = 0; k < total; k++) nmark += (bits[k >> 3] >> (k & 7)) & 1;
             all += nmark;
             if (dry) { fprintf(stderr, "prefetch: %s level %d: %zu chunks needed (window %d)\n", s->name, l, nmark, P); free(bits); continue; }
+            if (m->sharded && !getenv("UFSM_PREFETCH_CHUNKS")) {   /* whole shards (UFSM_PREFETCH_CHUNKS=1: the old per-chunk requests) */
+                int64_t g[3], ns[3]; for (int d = 0; d < 3; d++) { g[d] = m->shard[d] / m->chunk[d]; ns[d] = (ng[d] + g[d] - 1) / g[d]; }
+                const size_t nst = (size_t)(ns[0] * ns[1] * ns[2]); uint8_t *sm = calloc(nst ? nst : 1, 1);
+                if (!sm) { fprintf(stderr, "prefetch: %s level %d: out of memory, skipped\n", s->name, l); free(bits); continue; }
+                size_t nsh = 0;
+                for (size_t k = 0; k < total; k++) if ((bits[k >> 3] >> (k & 7)) & 1) {
+                    const int64_t z = (int64_t)(k / ((size_t)ng[1] * (size_t)ng[2])), y = (int64_t)((k / (size_t)ng[2]) % (size_t)ng[1]), x = (int64_t)(k % (size_t)ng[2]);
+                    const size_t q = (size_t)(((z / g[0]) * ns[1] + y / g[1]) * ns[2] + x / g[2]); nsh += !sm[q]; sm[q] = 1; }
+                int64_t *sh = malloc((nsh ? nsh : 1) * 3 * sizeof *sh); size_t j = 0;
+                for (size_t q = 0; q < nst && sh; q++) if (sm[q]) { sh[3 * j] = (int64_t)(q / (size_t)(ns[1] * ns[2])); sh[3 * j + 1] = (int64_t)(q / (size_t)ns[2] % (size_t)ns[1]); sh[3 * j + 2] = (int64_t)(q % (size_t)ns[2]); j++; }
+                free(sm);
+                pthread_t *th = malloc((size_t)nthreads * sizeof *th); pfs_arg *args = malloc((size_t)nthreads * sizeof *args);
+                if (!sh || !th || !args) { fprintf(stderr, "prefetch: %s level %d: out of memory, skipped\n", s->name, l); free(sh); free(th); free(args); free(bits); continue; }
+                size_t next = 0, done = 0, fail = 0; z3_pf_stats tot = {0}; pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; int nmade = 0;
+                struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+                for (int t = 0; t < nthreads; t++) { args[t] = (pfs_arg){ct, bits, ng, sh, nsh, {g[0], g[1], g[2]}, &next, &done, &fail, {0}, &mu, &tot};
+                    if (!pthread_create(&th[nmade], nullptr, pfs_worker, &args[t])) nmade++; }
+                if (!nmade) pfs_worker(&args[0]);
+                for (int t = 0; t < nmade; t++) pthread_join(th[t], nullptr);
+                clock_gettime(CLOCK_MONOTONIC, &t1); const double sec = (double)(t1.tv_sec - t0.tv_sec) + 1e-9 * (double)(t1.tv_nsec - t0.tv_nsec);
+                /* coverage: the share of the needed shards now wholly in the cache (a failed shard's index did not load: its chunks are not tallied) */
+                fprintf(stderr, "prefetch: %s level %d done (%zu chunks needed in %zu shards: %lld stored, %lld absent; %lld already cached, %.2f GB fetched now in %.0f s"
+                                " = %.0f MB/s; %zu shard failures; coverage %.4f)\n", s->name, l, nmark, nsh, (long long)tot.present, (long long)tot.absent, (long long)tot.cached,
+                        (double)tot.bytes / 1e9, sec, (double)tot.bytes / 1e6 / (sec > 0 ? sec : 1), fail, nsh ? (double)(nsh - fail) / (double)nsh : 1.0);
+                all_fail += fail; all_bytes += tot.bytes;
+                free(sh); free(th); free(args); free(bits);
+                continue;
+            }
             uint32_t *list = malloc((nmark ? nmark : 1) * sizeof *list); size_t nl = 0;
             pthread_t *th = malloc(nthreads * sizeof *th); pf_arg *args = malloc(nthreads * sizeof *args); uint8_t *made = calloc(nthreads, 1);
             if (!list || !th || !args || !made) { fprintf(stderr, "prefetch: %s level %d: out of memory, skipped\n", s->name, l); free(list); free(th); free(args); free(made); free(bits); continue; }
@@ -4309,11 +4355,12 @@ int sources_prefetch(sources *S, int maxlev, int nthreads, double fraction, int 
             free(list);
             free(th); free(args); free(made); free(bits);
             fprintf(stderr, "\nprefetch: %s level %d done (%zu chunks needed, %zu fetched now, %zu failures)\n", s->name, l, nmark, fetched, fail);
+            all_fail += fail;
         }
         free(o.idx);
     }
-    fprintf(stderr, "prefetch: %zu chunks over all sources (window %d)\n", all, P);
-    return 0;
+    fprintf(stderr, "prefetch: %zu chunks over all sources (window %d), %.2f GB fetched now (sharded arrays), %zu failures\n", all, P, (double)all_bytes / 1e9, all_fail);
+    return all_fail ? 1 : 0;
 }
 /* No coarse labels (user rule 11-03): every label a training window reads is stored on the window's own grid. A target stored coarser
    than a level the source is drawn at (a pyramid target upsampled from its finest rung, a stored phase / winding / ignore mask one or
