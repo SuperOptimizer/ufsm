@@ -52,8 +52,8 @@ Originally no teacher models; since 2026-11-15 published ink networks run as tea
   - nvcc timing of these on sm_120 is not done yet.
 - Checks:
   - Host .c objects: .text byte-identical to cudaopt (193 / 193).
-  - arch86 fast tier with the branch toolchain: 378 PASS. The 1 FAIL is test_mgpu_lint, a stale lint baseline that fails on the old toolchain too.
-  - This merge, desk CPU half (ff7f174, -g none): 166 PASS. The one FAIL is test_mgpu_lint, a source lint with a stale baseline that fails on the old toolchain too. 8 more failed only because the suite output sat on /vesuvius (symlink EIO, noexec); rerun with the output on /, all pass.
+  - arch86 fast tier with the branch toolchain: 378 PASS. The 1 FAIL is test_mgpu_lint (source lint, independent of the compiler).
+  - This merge, desk CPU half (ff7f174, -g none): 166 PASS. The one FAIL was test_mgpu_lint: untagged prefetch statics from 408e3e81, tagged on this branch (comment only); green now. 8 more failed only because the suite output sat on /vesuvius (symlink EIO, noexec); rerun with the output on /, all pass.
   - This merge, pod-1 sm_120 GPU half: see the merge commit.
 - Tools:
   - /vesuvius/ufsm/microc/pod3070: bench.sh, cmp.sh, gdbench.sh, sass.sh, suite.sh.
