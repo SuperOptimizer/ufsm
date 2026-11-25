@@ -3199,6 +3199,8 @@ int unet_head_feat_z(unet *u, int z0, int z1, void *y16) {
     if (!u->hfz_w) { float *h = calloc((size_t)w0 * (w0 + 1), 4); if (!h) return -1; for (int c = 0; c < w0; c++) h[(size_t)c * w0 + c] = 1.f;
                      u->hfz_w = nn_malloc((size_t)w0 * (w0 + 1) * 4); if (!u->hfz_w) { free(h); return -1; } nn_h2d(u->hfz_w, h, (size_t)w0 * (w0 + 1) * 4); free(h); }
     nn_set_layer(3 * u->cfg.nlev - 2);
+    const int r = nn_head_feat_z(x, gn ? &g : nullptr, u->dec[0].ys, y16, (size_t)z0 * hw, (size_t)(z1 - z0) * hw);   /* (the same bits without the MMAs) */
+    if (r != 1) return r;
     return nn_head_fwd_z(x, gn ? &g : nullptr, u->dec[0].ys, u->hfz_w, u->hfz_w + (size_t)w0 * w0, w0, y16, (size_t)z0 * hw, (size_t)(z1 - z0) * hw);
 }
 void unet_set_head_feat_grad_z(unet *u, const void *g16) { u->hfz_g = g16; }
@@ -3208,6 +3210,12 @@ int unet_head_bwd_z(unet *u, int z0, int z1, const void *gy16, int first) {
     if (u->hfz_g) {   /* + d loss / d features (widths[0] fp16 rows in the backward's scaled domain): the head's rows and identity rows in one call
                          (the identity rows' weight gradients are discarded) */
         if (u->l3h || u->cfg.lat_dec || z1 < z0) return -1;
+        {   /* the head's rows alone with the feature gradient added to gx (fused kernel, 2026-11-25): no row copies, no identity-row weight gradients */
+            nn_set_layer(3 * u->cfg.nlev - 2);
+            const int r = nn_head_bwd_z_fg(x, gn ? &g : nullptr, u->dec[0].ys, gy16, u->cfg.cout, P(u, u->head.w), u->g + u->head.w, u->g + u->head.b, u->gout[0], u->hfz_g,
+                                           (size_t)z0 * hw, (size_t)(z1 - z0) * hw, first);
+            if (r != 1) return r;
+        }
         const int co = u->cfg.cout, w0 = u->cfg.widths[0], nr0 = co + w0, nr = nr0 <= 16 ? nr0 : (nr0 + 7) / 8 * 8; const size_t nv = (size_t)(z1 - z0) * hw;   /* (zero rows to a multiple of 8: the MX weight-gradient kernel's) */
         if (!u->hfz_wc) { u->hfz_wc = nn_malloc((size_t)nr * (w0 + 1) * 4 * 2); if (!u->hfz_wc) return -1;
                           float *h = calloc((size_t)nr * (w0 + 1), 4); if (!h) return -1; for (int c = 0; c < w0; c++) h[(size_t)(co + c) * w0 + c] = 1.f;

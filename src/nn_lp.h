@@ -138,6 +138,7 @@ void lp_up2_fwd_mx_blocks(const void *x, int xdt, shape5 xs, int b0, int nbk, vo
 void lp_conv1_fwd_mx(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp);
 void lp_conv1_fwd_mx_h16(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp);   /* fp16 output */
 void lp_conv1_fwd_mx_h16_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, void *y, gnp_t gp, size_t vb, size_t nv);   /* voxels [vb, vb + nv) into planes of nv */
+bool lp_feat_mx_h16_r(const void *x, int xdt, shape5 xs, void *y, gnp_t gp, size_t vb, size_t nv);   /* the identity head (silu(gn(x)) fp16 planes) without MMAs; false: not covered */
 int lp_conv1_fwd_mx_r(const void *x, int xdt, shape5 xs, const float *w, const float *b, int cout, float *y, gnp_t gp, size_t vb, size_t nv, size_t ly);   /* fp32 voxels [vb, vb + nv), the bits of lp_conv1_fwd_mx */
 void lp_bwd_w1_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, gnp_t gp);
 int lp_bwd_w1_mx_b(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp);
@@ -145,6 +146,9 @@ int lp_set_w1_nt(int on);   /* lp_bwd_w1_mx_b_r: 4 output tiles per block on one
 int lp_bwd_w1_mx_b_r(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, float *gw, float *gb, gnp_t gp, size_t vb, size_t vn);   /* voxels [vb, vb + vn) */   /* also gb when it returns 1 */
 int lp_head_bwd_mx_r(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, const float *w, float *gw, float *gb, void *gx, int gxdt, gnp_t gp, unsigned sr,
                      size_t vb, size_t nv);   /* voxels [vb, vb + nv), gy planes of nv voxels */
+void lp_set_head_fg(int on);   /* tests: the head backward with the feature gradient fused (1) or the combined head + identity rows (0); -1: env UFSM_HEAD_FG (default 1) */
+int lp_head_bwd_mx_fg_ok(int xdt, shape5 xs, int cout, int gxdt, gnp_t gp);   /* lp_head_bwd_mx_fg_r covers these shapes (UFSM_HEAD_FG=0: never) */
+int lp_head_bwd_mx_fg_r(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, const float *w, float *gw, float *gb, void *gx, int gxdt, gnp_t gp, unsigned sr, size_t vb, size_t nv, const void *gf, const float *gfs);   /* + the fp16 feature gradient gf x *gfs into gx (train --ink-surf); 0: not covered */
 int lp_head_bwd_mx(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, const float *w, float *gw, float *gb, void *gx, int gxdt, gnp_t gp, unsigned sr);   /* fused head backward: 1 = done, 0 = not covered */
 void lp_gn_silu_bwd_mx(const void *x, int xdt, shape5 s, int G, const float *gamma, const float *beta, const float *mean, const float *rstd,
                        const void *gy, void *gx, int gdt, double *ds, float *st, float *AB);

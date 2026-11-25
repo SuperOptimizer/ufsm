@@ -286,6 +286,52 @@ template <typename YT = __half> static bool conv1_tc(const void *x, int xdt, sha
 #undef HTC
     return true;
 }
+/* train --ink-surf's feature planes (unet_head_feat_z): the head kernel above with identity weights and no bias, without the MMAs. There
+   each output is 1 x h + 0 x (the other channels) + 0 in fp32, h the staged fp16 activation, so the planes are h itself except that a
+   -0 comes out +0 (fp32 0 + -0): the same staging and GN rows per 128-cell tile, then h + 0.f rounded to fp16 -- the bits of conv1_tc's
+   output. (nsys S2E P 384 11-25: conv1_mx_tc_k<2> 2.7 ms a 32-plane slab at 36 blocks, ~140 GB/s.) */
+__global__ void __launch_bounds__(256) feat_mx_h16_k(const uint8_t *__restrict__ x, __half *__restrict__ y, int N, int Ci, size_t S, gnp_t gp, size_t vb, size_t Sy) {
+    __shared__ float2 sab[2 * 256];   /* [2][Ci <= 256] */
+    const int tid = threadIdx.x, nb = Ci / 32;
+    const size_t tpn = (Sy + HTC_N - 1) / HTC_N, tile = blockIdx.x;
+    const int n = (int)(tile / tpn); const size_t vl0 = (tile % tpn) * HTC_N;
+    const int r0 = gp.ns ? gn_row_v(gp, n, min(vb + vl0, S - 1)) : n;
+    if (gp.G) for (int i = tid; i < (gp.ns ? 2 : 1) * Ci; i += 256) { const int bk = i / Ci, ci = i % Ci; sab[i] = gn_ab(gp, gp.ns ? min(r0 + bk, n * gp.ns + gp.ns - 1) : n, ci, Ci); }
+    __syncthreads();
+    const int cell = tid & (HTC_N - 1), sh = tid >> 7;
+    const size_t vl = vl0 + cell, sv = vb + vl;
+    if (vl >= Sy || sv >= S) return;
+    const uint8_t *sc = mx_sc<4>(x, N, Ci, S);
+    const int sbank = gp.ns ? gn_row_v(gp, n, sv) - r0 : 0;
+    for (int blk = 0; blk < nb; blk++) {
+        const size_t ri = ((size_t)n * nb + blk) * S + sv;
+        const uint2 q = __ldg((const uint2 *)(x + ri * 16) + sh); const float s = mx_scale(sc[ri]); const unsigned ww[2] = {q.x, q.y};
+#pragma unroll
+        for (int j = 0; j < 2; j++)
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const float2 a = dec_e2m1x2(ww[j] >> (8 * k));
+                float v0 = a.x * s, v1 = a.y * s;
+                const int c = blk * 32 + 16 * sh + 8 * j + 2 * k;
+                if (gp.G) { const float2 ab0 = sab[sbank * Ci + c], ab1 = sab[sbank * Ci + c + 1]; v0 = act_ab(v0, ab0.x, ab0.y, true); v1 = act_ab(v1, ab1.x, ab1.y, true); }
+                const __half2 h = __floats2half2_rn(v0, v1);
+                y[((size_t)n * Ci + c) * Sy + vl] = __float2half(__low2float(h) + 0.f);
+                y[((size_t)n * Ci + c + 1) * Sy + vl] = __float2half(__high2float(h) + 0.f);
+            }
+    }
+}
+/* the feature planes [N][Ci][nv] of voxels [vb, vb + nv) as the identity head through conv1_tc writes them; false: not that kernel's case
+   (the caller runs the identity head). UFSM_FEAT_ID=0: off (the identity head, A/B). */
+extern "C" bool lp_feat_mx_h16_r(const void *x, int xdt, shape5 xs, void *y, gnp_t gp, size_t vb, size_t nv) {
+    static int on = -1; if (on < 0) on = getenv("UFSM_FEAT_ID") ? atoi(getenv("UFSM_FEAT_ID")) : 1;
+    if (g_head_tc < 0) g_head_tc = getenv("UFSM_HEAD_TC") ? atoi(getenv("UFSM_HEAD_TC")) : 1;
+    if (!on || !g_head_tc || xdt != 4 || xs.c % 32 || xs.c <= 16 || xs.c > 160 || slab_small(gp)) return false;   /* (conv1_tc's case for cout = Ci; 99 KB smem holds 160) */
+    if ((size_t)((xs.c + 15) / 16) * 16 * (xs.c + 8) * 2 + (size_t)HTC_N * HTC_KP * 2 + (size_t)2 * xs.c * sizeof(float2) > 99 * 1024) return false;
+    const size_t Sy = nv ? nv : shape_spatial(xs), ntiles = (size_t)xs.n * ((Sy + HTC_N - 1) / HTC_N);
+    feat_mx_h16_k<<<(unsigned)ntiles, 256>>>((const uint8_t *)x, (__half *)y, xs.n, xs.c, shape_spatial(xs), gp, vb, Sy);
+    LPCK();
+    return true;
+}
 /* the fp16-logit head with its weights in the constant bank (inference heads: one sample, one MX block of CI = 16 / 32 channels, whole-
    window GroupNorm): each FFMA takes its weight as a constant-bank operand, no shared-memory weight loads (conv1_mx_t_k's broadcast
    LDS.128 of the weights per input channel and voxel bound it: 18.7 ms at 384 x 640^2 x 32 -> 11, ~3x its memory floor). Two voxels per
@@ -623,9 +669,10 @@ __global__ void __launch_bounds__(256) conv_bwd_w1_tc_k(const uint8_t *x, const 
    weight and bias gradients as conv_bwd_w1_tc_k (two m16n8k16 column tiles: all outputs at once), and the input gradient
    gx[ci][v] = sum_co w[co][ci] gy[co][v] (the gradient of act(x), the head's input) on the CUDA cores into an MX row (YB bits,
    exact SR keyed by sr for fp4), as conv1_to_mx_t_k. The separate kernels read x twice (8 outputs per pass) and gy twice. */
-template <int B, int YB, int CO = 16, bool GN = true>   /* CO: the output count when known at compile time (16: any Co <= 16 at run time); GN: gp.G != 0, chosen at the launch */
+template <int B, int YB, int CO = 16, bool GN = true, bool FG = false>   /* CO: the output count when known at compile time (16: any Co <= 16 at run time); GN: gp.G != 0, chosen at the launch;
+                                                                      FG: + gf (train --ink-surf's feature gradient, fp16 planes [N][32][Sy]) x *gfs (the head plane scale's 1 / s) into gx */
 __global__ void __launch_bounds__(256, 2) conv1_bwd_fused_k(const uint8_t *x, const __half *gy, const float *w, float *gw, float *gb, uint8_t *gx, int N, size_t S, gnp_t gp,
-                                                      int nper, int Co, unsigned sr, size_t v00, size_t Sy) {   /* voxels [v00, v00 + Sy); gy planes of Sy voxels */
+                                                      int nper, int Co, unsigned sr, size_t v00, size_t Sy, const __half *gf = nullptr, const float *gfs = nullptr) {   /* voxels [v00, v00 + Sy); gy planes of Sy voxels */
     constexpr int CI = 32;
     __shared__ float ca[2][CI], cb[2][CI];   /* [bank]: slab GroupNorm, the block's first slab and the next */
     __shared__ __align__(16) float sw[16][CI];                   /* w[co][ci] (rows >= Co zero) */
@@ -674,6 +721,11 @@ __global__ void __launch_bounds__(256, 2) conv1_bwd_fused_k(const uint8_t *x, co
                     o[4 * k4] = fmaf(q.x, gv[co], o[4 * k4]); o[4 * k4 + 1] = fmaf(q.y, gv[co], o[4 * k4 + 1]);
                     o[4 * k4 + 2] = fmaf(q.z, gv[co], o[4 * k4 + 2]); o[4 * k4 + 3] = fmaf(q.w, gv[co], o[4 * k4 + 3]);
                 }
+            }
+            if constexpr (FG) if (in) {
+                const float fs = gfs ? __ldg(gfs) : 1.f;   /* (a power of two: exact) */
+#pragma unroll
+                for (int k = 0; k < CI; k++) o[k] += __half2float(gf[((size_t)n * CI + k) * Sy + (v - v00)]) * fs;
             }
             if (in) mx_store_row_b<YB>(gx, gsc, (size_t)n * S + v, CI, o, sr);
         }
@@ -740,6 +792,32 @@ extern "C" int lp_head_bwd_mx_r(const void *x, int xdt, shape5 xs, const void *g
     if (xdt == 4) { if (gxdt == 4) HBF(4, 4); else HBF(4, 8); }
     else { if (gxdt == 4) HBF(8, 4); else HBF(8, 8); }
 #undef HBF
+    LPCK();
+    return 1;
+}
+/* the same with train --ink-surf's feature gradient added to gx (gx = w^T gy + gf x *gfs, before the MX rounding): the head's rows only, in
+   place of unet_head_bwd_z's combined "head rows + identity rows" matmul (the concatenated rows, the identity rows' discarded weight gradients,
+   K 64 backward-data: ~12 ms a P 384 slab, nsys S2E 11-25). 0: not covered. */
+static int g_head_fg = -1;   /* mgpu: env / test config */
+extern "C" void lp_set_head_fg(int on) { g_head_fg = on; }
+extern "C" int lp_head_bwd_mx_fg_ok(int xdt, shape5 xs, int cout, int gxdt, gnp_t gp) {   /* lp_head_bwd_mx_fg_r covers this (UFSM_HEAD_FG=0: never, A/B) */
+    static int on = -1; if (on < 0) on = getenv("UFSM_HEAD_FUSED") ? atoi(getenv("UFSM_HEAD_FUSED")) : 1;
+    if (g_head_fg < 0) g_head_fg = getenv("UFSM_HEAD_FG") ? atoi(getenv("UFSM_HEAD_FG")) : 1;
+    const int fg = g_head_fg;
+    return on && fg && xs.c == 32 && cout <= 16 && (gxdt == 4 || gxdt == 8) && (xdt == 4 || xdt == 8) && !(gp.G && 32 % gp.G);
+}
+extern "C" int lp_head_bwd_mx_fg_r(const void *x, int xdt, shape5 xs, const void *gy, int gydt, shape5 ys, const float *w, float *gw, float *gb, void *gx, int gxdt, gnp_t gp,
+                                   unsigned sr, size_t vb, size_t nv, const void *gf, const float *gfs) {
+    if (!gf || gydt != 2 || !lp_head_bwd_mx_fg_ok(xdt, xs, ys.c, gxdt, gp)) return 0;
+    const size_t S = shape_spatial(xs), Sy = nv ? nv : S;
+    const int nper = slab_nper(gp, 8192);
+    const dim3 grid((unsigned)((Sy + nper - 1) / nper), xs.n);
+#define HBG(B, YB, G) conv1_bwd_fused_k<B, YB, 16, G, true><<<grid, 256>>>((const uint8_t *)x, (const __half *)gy, w, gw, gb, (uint8_t *)gx, xs.n, S, gp, nper, ys.c, sr, vb, Sy, (const __half *)gf, gfs)
+#define HBG2(B, YB) do { if (gp.G) HBG(B, YB, true); else HBG(B, YB, false); } while (0)
+    if (xdt == 4) { if (gxdt == 4) HBG2(4, 4); else HBG2(4, 8); }
+    else { if (gxdt == 4) HBG2(8, 4); else HBG2(8, 8); }
+#undef HBG2
+#undef HBG
     LPCK();
     return 1;
 }

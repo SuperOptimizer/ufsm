@@ -210,6 +210,15 @@ extern "C" int nn_head_fwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, co
     KCHECK();
     return 0;
 }
+/* the head's input features (silu(gn(x)) as the head reads them) as fp16 planes [xs.c][nv]: the identity head's bits without its MMAs
+   (lp_feat_mx_h16_r); 1: not covered, the caller runs nn_head_fwd_z with identity weights */
+extern "C" int nn_head_feat_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, void *y16, size_t vb, size_t nv) {
+    if (!g_tf32 || head_z16_ok(x, nullptr, xs, xs.c) || !ISMX(x)) return 1;
+    if (!lp_feat_mx_h16_r(x, MXDT(x), xs, y16, to_gnp(gx_gn), vb, nv)) return 1;
+    exec_prec(0, 0);
+    KCHECK();
+    return 0;
+}
 static int head_bwd_z_impl(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx,
                             size_t vb, size_t nv, int first);
 /* x[i] (o[i] = w[i] x, o nullptr: in place) x hp[k] (GSHP: k 0 s, 1 1 / s; a power of two, exact) */
@@ -234,6 +243,30 @@ extern "C" int nn_head_bwd_z(const float *x, const nn_gn_t *gx_gn, shape5 xs, co
     hgs_wscale_k<<<nblk(nw, 256), 256>>>(gw, nullptr, nw, hp, 1); hgs_wscale_k<<<nblk(cout, 256), 256>>>(gb, nullptr, (size_t)cout, hp, 1);
     KCHECK();
     return r;
+}
+/* nn_head_bwd_z + the feature gradient gf16 (fp16 rows [xs.c][nv], the logit gradient's scale) added to gx: the head's rows alone through
+   the fused kernel instead of unet_head_bwd_z's head + identity rows (train --ink-surf). 1: not covered (the caller runs the combined rows).
+   Two SR seeds a pass as the combined rows' path draws (the gx draw is the second), so every other layer's draws are unchanged. */
+extern "C" int nn_head_bwd_z_fg(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx,
+                                const void *gf16, size_t vb, size_t nv, int first) {
+    if (!g_tf32 || !ISMX(x) || !ISMX(gx) || !GBF || !g_h16 || xs.c != 32 || cout > 16 || MXDT(x) == 3 || MXDT(gx) == 3 || head_z16_ok(x, gx, xs, cout) ||
+        !lp_head_bwd_mx_fg_ok(MXDT(x), xs, cout, MXDT(gx), to_gnp(gx_gn))) return 1;
+    static thread_local unsigned seedd[8]; int dv = 0; cudaGetDevice(&dv); dv &= 7; unsigned &seed = seedd[dv];
+    const float *hp = GSHP;
+    static thread_local float *wsd[8]; static thread_local size_t wsn[8];
+    const size_t nw = (size_t)cout * xs.c;
+    const float *wu = w;
+    if (hp) { if (wsn[dv] < nw) { if (wsd[dv]) cudaFree(wsd[dv]); CK(cudaMalloc(&wsd[dv], nw * 4)); wsn[dv] = nw; }
+              hgs_wscale_k<<<nblk(nw, 256), 256>>>(w, wsd[dv], nw, hp, 1); wu = wsd[dv]; }
+    shape5 ys = xs; ys.c = cout;
+    if (first) { if (MXDT(gx) == 4) { (void)sr_seed(); seed = sr_seed(); } else seed = 0u; }   /* (the combined path draws fp4 ? sr_seed() : 0 twice) */
+    if (hp) { hgs_wscale_k<<<nblk(nw, 256), 256>>>(gw, nullptr, nw, hp, 0); hgs_wscale_k<<<nblk(cout, 256), 256>>>(gb, nullptr, (size_t)cout, hp, 0); }
+    const int ok = lp_head_bwd_mx_fg_r(x, MXDT(x), xs, gy16, 2, ys, wu, gw, gb, gx, MXDT(gx), to_gnp(gx_gn), seed, vb, nv, gf16, hp ? hp + 1 : nullptr);
+    if (hp) { hgs_wscale_k<<<nblk(nw, 256), 256>>>(gw, nullptr, nw, hp, 1); hgs_wscale_k<<<nblk(cout, 256), 256>>>(gb, nullptr, (size_t)cout, hp, 1); }
+    if (!ok) return -1;   /* (the seeds are drawn: a decline here after them would shift the stream) */
+    exec_prec(2, 0); exec_prec(1, 0);
+    KCHECK();
+    return 0;
 }
 static int head_bwd_z_impl(const float *x, const nn_gn_t *gx_gn, shape5 xs, const void *gy16, int cout, const float *w, float *gw, float *gb, float *gx,
                             size_t vb, size_t nv, int first) {
