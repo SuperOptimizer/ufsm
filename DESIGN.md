@@ -6,6 +6,29 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Winding field fusion: try9 + the latent net wz896 blended (field-blend) does not beat try9 alone (2026-11-25, unroll)
+
+User question: does output fusion of try9 cooled-33333 and the latent winding net wz896-12000 beat either? Arms pre-registered in
+/vesuvius/ufsm/unrollrun/sh/blendab.sh before any score: blend-mean = `field-blend` of try9 + wz896, equal weights (resultant
+confidence); blend-medoid = `field-blend --conf medoid` of try9 + wz896 + wind96 (a medoid needs 3 inputs; wind96's kept wbench fields).
+Predicts on the pod (c4a70c97, cube windows 640 / 64 for both nets: they are latent-grid; kit /vesuvius/ufsm/unrollrun/blendkit), fits
+and scoring on the desk (wbench clean boxes, SLABS=0, GPU fits), each arm paired against try9:
+
+| arm vs try9 | 1667 (49 boxes) p05x A-B [95 % CI] | 1667 ids A-B | paris4 + paris4j (32) p05x A-B | p4 ids A-B |
+|---|---|---|---|---|
+| wz896 | -0.071 [-0.085, -0.058] | -0.127 [-0.175, -0.083] | -0.024 [-0.040, -0.009] | -0.004 [-0.025, +0.019] |
+| blend-mean | -0.015 [-0.020, -0.009] | -0.026 [-0.052, +0.001] | -0.021 [-0.041, -0.003] | -0.011 [-0.031, +0.009] |
+| blend-medoid (22 boxes only) | -0.024 [-0.039, -0.007] (16) | -0.043 [-0.113, +0.029] | +0.057 [+0.008, +0.135] (paris4, 4) | +0.010 [-0.009, +0.029] |
+
+- try9 alone: 1667 p05x 0.906, ids 0.920; paris4 + paris4j p05x 0.613, ids 0.399.
+- No blend beats try9: blend-mean is worse on both groups (p05x CI entirely < 0), wz896 alone much worse on 1667. The diagnosis that
+  the latent net wins on wide sheets does not hold against try9 (it was against wind96).
+- blend-medoid ran on only 22 of 88 boxes (wind96's kept fields cover those), so it is not a full arm. Its paris4 +0.057 p05x rests
+  on 4 boxes, under the 8-box bootstrap floor; 1667 is worse. Not a lead: a 3-model medoid would need wind96 fields on all boxes.
+- Reproduction: the pod wz896 arm vs the 11-10 lat-wz896-12000 rows on the 39 shared boxes: p05x +0.004 [-0.004, +0.014], ids +0.009,
+  inside the 0.01 floor: the latent arm is not weaker than the original.
+- Rows: /vesuvius/ufsm/wbench/res/bl-{t9,wz,mean,med}.tsv; fields kept for bl-t9 and bl-wz (wbench/fields), the blends deleted.
+
 ## mcc pin 5744025 -> ff7f174: device jump threading, threadIdx-strided unroll, global loaded pointers, cudaopt (2026-11-25, microc)
 - The pin moves to ff7f174, microc branch jtdev-20261125 (tag ufsm-pin-20261125; not on microc main, whose 84903be still miscompiles
   host code). It is main 285d308 plus:
