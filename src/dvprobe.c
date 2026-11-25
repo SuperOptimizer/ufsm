@@ -243,6 +243,11 @@ static int dvf_read(dvf *D, const char *path, const char *spec) {
     free(b); free(cols); fclose(f); return 0;
 }
 static void dvf_free(dvf *D) { free(D->names); free(D->R); free(D->X); }
+/* the selected columns of a feature file as a malloc'd [n][F] float array (merge-flag --dense-cos reads the dense block this way) */
+float *dvp_read_cols(const char *path, const char *spec, long *n, int *F) {
+    dvf D; if (dvf_read(&D, path, spec)) return nullptr;
+    float *X = D.X; *n = D.n; *F = D.Fs; D.X = nullptr; dvf_free(&D); return X;
+}
 
 /* ---- the weighted logistic probe: standardised x, logit = w . z + b; Newton with ridge lam on w ---- */
 typedef struct { const float *X; const dvf_row *R; long a, b; int F; const double *mu, *sd, *w; double *g, *Hm, loss; } nt_job;
@@ -369,9 +374,10 @@ static int cmd_pfeats(int argc, char **argv) {
                *pts = opt(argc, argv, "--points", nullptr), *out = opt(argc, argv, "--out", nullptr), *cache = opt(argc, argv, "--cache", nullptr), *sdir = opt(argc, argv, "--stats-dir", ".");
     int T = opt_atoi("--tile", opt(argc, argv, "--tile", "0")); const int M = opt_atoi("--margin", opt(argc, argv, "--margin", "32"));
     const int nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 6);
+    const int donly = opt(argc, argv, "--dense-only", nullptr) != nullptr;   /* only the dense block (merge-flag --dense-cos: 128 B a row, not ~1.1 kB) */
     if (!ck || !key || !pts || !out || T % 16 || M < 0) {
         fprintf(stderr, "usage: ufsm dinovol-probe pfeats --ckpt PT --root CTROOT --key ARRAY --points P.f32 --out F.dvf [--tile T] [--margin 32] [--stats-dir DIR]\n"
-                        "         [--gpu 0] [--gpu-mem 7] [--threads 6] [--cache DIR]\n"); return 2; }
+                        "         [--gpu 0] [--gpu-mem 7] [--threads 6] [--cache DIR] [--dense-only]\n"); return 2; }
     FILE *f = fopen(pts, "rb"); if (!f) { fprintf(stderr, "dinovol-probe: cannot read %s\n", pts); return 1; }
     fseek(f, 0, SEEK_END); const long nb = ftell(f); fseek(f, 0, SEEK_SET); const int n = (int)(nb / 12); float *P = malloc((size_t)n * 12 + 12);
     if (fread(P, 12, (size_t)n, f) != (size_t)n) { fclose(f); return 1; } fclose(f);
@@ -382,14 +388,16 @@ static int cmd_pfeats(int argc, char **argv) {
     dv_net *net = dv_load(ck); if (!net) return 1;
     if (!T) T = dv_train_tile(net);
     if (2 * M >= T) { fprintf(stderr, "dinovol-probe: margin %d too large for tile %d\n", M, T); return 2; }
-    int nd = 0, ni = 0; dv_dense_dims(net, &nd, &ni); const int E = dv_embed_dim(net), F = E + nd + ni, g = T / 8, SS = T - 2 * M;
+    int nd = 0, ni = 0; dv_dense_dims(net, &nd, &ni); const int NI = ni, E = donly ? 0 : dv_embed_dim(net), g = T / 8, SS = T - 2 * M;
+    if (donly) ni = 0;
+    const int F = E + nd + ni;
     const z3_meta *zm = z3_meta_of(ct); int64_t nc[3]; for (int d = 0; d < 3; d++) nc[d] = zm->shape[d] / SS + 2;
     pf_ent *ent = malloc(sizeof(pf_ent) * (size_t)n);
     for (int i = 0; i < n; i++) { int64_t c[3]; for (int d = 0; d < 3; d++) { c[d] = (int64_t)floor(P[3 * i + d] / SS); if (c[d] < 0) c[d] = 0; if (c[d] >= nc[d]) c[d] = nc[d] - 1; }
         ent[i] = (pf_ent){(c[0] * nc[1] + c[1]) * nc[2] + c[2], i}; }
     qsort(ent, (size_t)n, sizeof *ent, pf_cmp);
-    uint16_t *rows = malloc((size_t)n * F * 2); uint8_t *u8 = malloc((size_t)T * T * T), *u8d = xmalloc_dev((size_t)T * T * T); uint16_t *tok = malloc((size_t)g * g * g * E * 2);
-    const int NP = 65536; float *pp = malloc((size_t)NP * 12), *ppd = xmalloc_dev((size_t)NP * 12), *acc = xmalloc_dev((size_t)NP * (nd + ni) * 4), *acch = malloc((size_t)NP * (nd + ni) * 4);
+    uint16_t *rows = malloc((size_t)n * F * 2); uint8_t *u8 = malloc((size_t)T * T * T), *u8d = xmalloc_dev((size_t)T * T * T); uint16_t *tok = malloc((size_t)g * g * g * (E ? E : 1) * 2);
+    const int NP = 65536; float *pp = malloc((size_t)NP * 12), *ppd = xmalloc_dev((size_t)NP * 12), *acc = xmalloc_dev((size_t)NP * (nd + NI) * 4), *acch = malloc((size_t)NP * (nd + NI) * 4);
     int rc = 0, ntile = 0; const double t0 = pnow();
     for (int a = 0; a < n && !rc;) {
         int b = a; while (b < n && ent[b].cell == ent[a].cell) b++;
@@ -399,20 +407,21 @@ static int cmd_pfeats(int argc, char **argv) {
         if (z3_read(ct, o, n3, u8, nthreads)) { fprintf(stderr, "dinovol-probe: CT read: %s\n", z3_error()); rc = 1; break; }
         xh2d(u8d, u8, (size_t)T * T * T);
         if (dv_forward(net, u8d, T, S[0], S[1], S[2])) { rc = 1; break; }
-        xd2h(tok, dv_tokens(net), (size_t)g * g * g * E * 2); ntile++;
+        if (E) xd2h(tok, dv_tokens(net), (size_t)g * g * g * E * 2);
+        ntile++;
         for (int c0 = a; c0 < b && !rc; c0 += NP) {
             const int m = b - c0 < NP ? b - c0 : NP;
             for (int q = 0; q < m; q++) for (int d = 0; d < 3; d++) pp[3 * q + d] = P[3 * ent[c0 + q].i + d] - (float)o[d];
             xh2d(ppd, pp, (size_t)m * 12);
             if (dv_net_points(net, ppd, nullptr, nullptr, m, acc)) { rc = 1; break; }
-            xd2h(acch, acc, (size_t)m * (nd + ni) * 4);
+            xd2h(acch, acc, (size_t)m * (nd + NI) * 4);
             for (int q = 0; q < m; q++) {
                 uint16_t *rw = rows + (size_t)ent[c0 + q].i * F; float w8[8]; size_t ix[8]; int ci[3]; float fr[3];
                 for (int d = 0; d < 3; d++) { double u = (pp[3 * q + d] - 3.5) / 8; if (u < 0) u = 0; if (u > g - 1) u = g - 1; ci[d] = (int)u; if (ci[d] > g - 2) ci[d] = g - 2; fr[d] = (float)(u - ci[d]); }
                 for (int k = 0; k < 8; k++) { const int dz = k >> 2, dy = (k >> 1) & 1, dx = k & 1;
                     w8[k] = (dz ? fr[0] : 1 - fr[0]) * (dy ? fr[1] : 1 - fr[1]) * (dx ? fr[2] : 1 - fr[2]); ix[k] = (((size_t)(ci[0] + dz) * g + ci[1] + dy) * g + ci[2] + dx) * E; }
                 for (int e = 0; e < E; e++) { float v = 0; for (int k = 0; k < 8; k++) v += w8[k] * h2f(tok[ix[k] + e]); rw[e] = f2h(v); }
-                for (int e = 0; e < nd + ni; e++) rw[E + e] = f2h(acch[(size_t)q * (nd + ni) + e]);
+                for (int e = 0; e < nd + ni; e++) rw[E + e] = f2h(acch[(size_t)q * (nd + NI) + e]);
             }
         }
         if (ntile % 100 == 0) fprintf(stderr, "dinovol-probe pfeats: %d / %d points, %d tiles, %.0f s\n", b, n, ntile, pnow() - t0);

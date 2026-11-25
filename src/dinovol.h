@@ -57,6 +57,7 @@ void dv_prof_report(double per);            /* print (divided by per) and reset 
    standardised features (mu / sd [F], w [F + 1], bias last; Newton steps with ridge lam) and the weighted ROC AUC of scores vs soft labels */
 typedef struct { int32_t crop; int16_t r, c; float lab, wgt; } dvf_row;
 int dvp_fit(const float *X, const dvf_row *R, long n, int F, double lam, int iters, int nthreads, double *mu, double *sd, double *w);
+float *dvp_read_cols(const char *path, const char *spec, long *n, int *F);
 double dvp_wauc(const double *s, const dvf_row *R, long n);
 int cmd_dinovol_probe(int argc, char **argv);
 

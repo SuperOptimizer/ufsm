@@ -4,6 +4,7 @@
 #include "mfgpu.h"
 #include "gpudec.h"
 #include "defaulted.h"
+#include "dinovol.h"
 #include "json.h"
 #include "optcheck.h"
 #include "store.h"
@@ -265,6 +266,7 @@ int cmd_merge_flag(int argc, char **argv) {
                         "       ... --weighted DIR: also DIR = the fields with their evidence x (1 - mf / 255) (merge-flag --apply in the same pass; zarr fields)\n"
                         "       ufsm merge-flag --apply FIELDS OUT [--mf-w 1 | --mf-cut T]   FIELDS' evidence down-weighted where merged (pc ps w x (1 - K mf / 255)) for count-field / fit\n"
                         "       ufsm merge-flag --eval LIST [--coef ..] [--threads 4]   the rule against GT intervals (LIST: name scroll fields-dir codes-root codes-key)\n"
+                        "         [--dense-pts DIR]: write each box's probe pairs (DIR/NAME.pts) for dinovol-probe pfeats; [--dense-cos DIR]: + the dinovol dense cos (DIR/NAME.dvf)\n"
                         "  the merged-sheet score of every field cell (src/mergeflag.h) as plane mf: zarr fields -> DIR/mf (zarr, 128^3 shards), raw\n"
                         "  fields -> DIR/mf.raw (DIR: default the fields directory; a crop needs --out). Prints the material share flagged (mf >= thr).\n");
         return 2;
@@ -352,8 +354,12 @@ int cmd_merge_flag(int argc, char **argv) {
    turn apart (d = 1 or 13 mod 14, >= 2 steps apart) make an interval; n = the net's phase (atan2 of the cell's pc, ps) unwrapped along
    the ray between them, signed by d, the box's sign the median's; merged = n < 0.5 (the phase misses the turn). The interval's features
    are the cell at its middle (mf_block over the whole box, borders replicated). */
-enum { EV_NZ = 16, EV_NTH = 720, EV_NF = 3 };
-typedef struct { float f[EV_NF], gap, cs; uint8_t y; } ev_iv;   /* features amp9, r5, sp9; gap (um, along the ray); cs |cos(ray, sheet normal)|; y merged */
+enum { EV_NZ = 16, EV_NTH = 720, EV_NF = 4 };
+/* features amp9, r5, sp9 (+ f[3] dcos with --dense-cos, else 0); gap (um, along the ray); cs |cos(ray, sheet normal)|; y merged;
+   pt: the --dense-pts probe pair (absolute native z y x of m - s/2 u and m + s/2 u: the interval's middle m, the ray direction u, the
+   net's own local spacing s = sp h / 8 voxels; no GT position enters) */
+typedef struct { float f[EV_NF], gap, cs, pt[6]; uint8_t y; } ev_iv;
+static int ev_nf = 3;   /* the logistic's features: 3, or 4 with --dense-cos */
 /* |cos| between the ray (sy, sx) and the GT sheet's in-slice normal at label voxel (ly, lx): the normal = the minor axis of the
    covariance of the same-code label voxels within radius r (2-D, the slice; sheets' z tilt ignored); -1 when too few voxels */
 static float ev_cos(const uint8_t *g, long long gny, long long gnx, long long ly, long long lx, int r, double sy, double sx) {
@@ -435,8 +441,13 @@ static int ev_one(ev_box *B) {
                 const int k0 = kk[c], k1 = kk[c + 1]; const int d = (((int)un[2 * k1 + 1] - (int)un[2 * k0 + 1]) % 14 + 14) % 14;
                 if ((d != 1 && d != 13) || k1 - k0 < 2) continue;
                 const int km = (k0 + k1) / 2; const size_t pi = ((size_t)(zc + MF_R) * ph + (size_t)(ry[km] / h + MF_R)) * pw + (size_t)(rx[km] / h + MF_R);
-                ev_iv v = {.f = {fa[0][pi], fa[1][pi], fa[2][pi]}, .gap = (float)((k1 - k0) * I.um),
+                ev_iv v = {.f = {fa[0][pi], fa[1][pi], fa[2][pi], 0.f}, .gap = (float)((k1 - k0) * I.um),
                            .cs = csv[c] < 0 || csv[c + 1] < 0 ? -1.f : 0.5f * (csv[c] + csv[c + 1])};
+                {   const size_t ci = ((size_t)zc * H + (size_t)(ry[km] / h)) * W + (size_t)(rx[km] / h); const double sp = pl[2][ci] ? pl[2][ci] * h / 8.0 : 10.0;
+                    const double my = ry[km] + 0.5, mx = rx[km] + 0.5, z = (double)(I.origin[0] + zn);
+                    const float q[6] = {(float)z, (float)(I.origin[1] + my - 0.5 * sp * sn), (float)(I.origin[2] + mx - 0.5 * sp * cs),
+                                        (float)z, (float)(I.origin[1] + my + 0.5 * sp * sn), (float)(I.origin[2] + mx + 0.5 * sp * cs)};
+                    memcpy(v.pt, q, sizeof q); }
                 ev_push(B, &v);
                 if (nnn == nnc) { nnc = nnc ? 2 * nnc : 4096; nn = realloc(nn, nnc * sizeof *nn); }
                 nn[nnn++] = (un[2 * k1] - un[2 * k0]) * (d == 1 ? 1 : -1);
@@ -566,44 +577,48 @@ static double ev_auc(ev_sy *v, size_t n) {
     const size_t nq = n - np; return np && nq ? (rs - np * (np + 1) / 2.0) / ((double)np * nq) : NAN;
 }
 /* models: score of interval v (higher = merged) */
-enum { EM_LOGIT, EM_COEF, EM_R5, EM_AMP, EM_SP, EM_N };
-static const char *const em_name[EM_N] = {"logistic (fitted on the split's train boxes)", "the rule (--coef / built-in)", "R5 alone (fixed: -R5)", "amp9 alone (-amp9)", "sp9 alone (-sp9)"};
+enum { EM_LOGIT, EM_COEF, EM_R5, EM_AMP, EM_SP, EM_DCOS, EM_N };
+static const char *const em_name[EM_N] = {"logistic (fitted on the split's train boxes)", "the rule (--coef / built-in)", "R5 alone (fixed: -R5)", "amp9 alone (-amp9)", "sp9 alone (-sp9)",
+                                          "dinovol dcos alone (+dcos)"};
 static double em_score(int m, const ev_iv *v, const double *w, const mf_coef *c) {
     switch (m) {
-    case EM_LOGIT: return w[0] + w[1] * v->f[0] + w[2] * v->f[1] + w[3] * v->f[2];
+    case EM_LOGIT: return w[0] + w[1] * v->f[0] + w[2] * v->f[1] + w[3] * v->f[2] + w[4] * v->f[3];
     case EM_COEF: return c->b + c->c_amp * v->f[0] + c->c_r * v->f[1] + c->c_sp * v->f[2];
     case EM_R5: return -v->f[1];
     case EM_AMP: return -v->f[0];
+    case EM_DCOS: return v->f[3];
     default: return -v->f[2];
     }
 }
-/* logistic regression on the train boxes' intervals (standardised features, Newton, l2 1e-4); w raw-unit (b, amp, r, sp) */
-static void ev_logit(ev_box *B, int nb, const uint8_t *tr, double w[4]) {
-    double mu[3] = {0}, sd[3] = {0}; size_t n = 0;
-    for (int b = 0; b < nb; b++) if (tr[b]) for (size_t i = 0; i < B[b].n; i++) { n++; for (int k = 0; k < 3; k++) mu[k] += B[b].iv[i].f[k]; }
-    for (int k = 0; k < 3; k++) mu[k] /= n ? n : 1;
-    for (int b = 0; b < nb; b++) if (tr[b]) for (size_t i = 0; i < B[b].n; i++) for (int k = 0; k < 3; k++) { const double d = B[b].iv[i].f[k] - mu[k]; sd[k] += d * d; }
-    for (int k = 0; k < 3; k++) sd[k] = sqrt(sd[k] / (n ? n : 1)) + 1e-9;
-    double v[4] = {0, 0, 0, 0};   /* (z1, z2, z3, 1) */
+/* logistic regression on the train boxes' intervals (standardised features, Newton, l2 1e-4); w raw-unit (b, amp, r, sp[, dcos]): ev_nf
+   features (3; 4 with --dense-cos) */
+static void ev_logit(ev_box *B, int nb, const uint8_t *tr, double w[5]) {
+    enum { K = EV_NF + 1 }; const int F = ev_nf, KK = F + 1; double mu[EV_NF] = {0}, sd[EV_NF] = {0}; size_t n = 0;
+    for (int b = 0; b < nb; b++) if (tr[b]) for (size_t i = 0; i < B[b].n; i++) { n++; for (int k = 0; k < F; k++) mu[k] += B[b].iv[i].f[k]; }
+    for (int k = 0; k < F; k++) mu[k] /= n ? n : 1;
+    for (int b = 0; b < nb; b++) if (tr[b]) for (size_t i = 0; i < B[b].n; i++) for (int k = 0; k < F; k++) { const double d = B[b].iv[i].f[k] - mu[k]; sd[k] += d * d; }
+    for (int k = 0; k < F; k++) sd[k] = sqrt(sd[k] / (n ? n : 1)) + 1e-9;
+    double v[K] = {0};   /* (z1 .. zF, 1) */
     for (int it = 0; it < 40; it++) {
-        double g[4] = {0}, Hm[4][4] = {{0}};
+        double g[K] = {0}, Hm[K][K] = {{0}};
         for (int b = 0; b < nb; b++) if (tr[b]) for (size_t i = 0; i < B[b].n; i++) {
-            const ev_iv *q = &B[b].iv[i]; const double x[4] = {(q->f[0] - mu[0]) / sd[0], (q->f[1] - mu[1]) / sd[1], (q->f[2] - mu[2]) / sd[2], 1};
-            double s = 0; for (int k = 0; k < 4; k++) s += v[k] * x[k];
+            const ev_iv *q = &B[b].iv[i]; double x[K]; for (int k = 0; k < F; k++) x[k] = (q->f[k] - mu[k]) / sd[k]; x[F] = 1;
+            double s = 0; for (int k = 0; k < KK; k++) s += v[k] * x[k];
             const double p = 1 / (1 + exp(-s)), e = p - q->y, ww = p * (1 - p);
-            for (int k = 0; k < 4; k++) { g[k] += e * x[k]; for (int l = 0; l < 4; l++) Hm[k][l] += ww * x[k] * x[l]; }
+            for (int k = 0; k < KK; k++) { g[k] += e * x[k]; for (int l = 0; l < KK; l++) Hm[k][l] += ww * x[k] * x[l]; }
         }
-        for (int k = 0; k < 4; k++) { g[k] /= n; for (int l = 0; l < 4; l++) Hm[k][l] /= n; if (k < 3) { g[k] += 1e-4 * v[k]; Hm[k][k] += 1e-4; } }
-        double A[4][5]; for (int k = 0; k < 4; k++) { for (int l = 0; l < 4; l++) A[k][l] = Hm[k][l]; A[k][4] = g[k]; }
-        for (int c = 0; c < 4; c++) {   /* Gauss-Jordan with partial pivoting */
-            int p = c; for (int r = c + 1; r < 4; r++) if (fabs(A[r][c]) > fabs(A[p][c])) p = r;
-            for (int l = 0; l < 5; l++) { const double t = A[c][l]; A[c][l] = A[p][l]; A[p][l] = t; }
+        for (int k = 0; k < KK; k++) { g[k] /= n; for (int l = 0; l < KK; l++) Hm[k][l] /= n; if (k < F) { g[k] += 1e-4 * v[k]; Hm[k][k] += 1e-4; } }
+        double A[K][K + 1]; for (int k = 0; k < KK; k++) { for (int l = 0; l < KK; l++) A[k][l] = Hm[k][l]; A[k][KK] = g[k]; }
+        for (int c = 0; c < KK; c++) {   /* Gauss-Jordan with partial pivoting */
+            int p = c; for (int r = c + 1; r < KK; r++) if (fabs(A[r][c]) > fabs(A[p][c])) p = r;
+            for (int l = 0; l <= KK; l++) { const double t = A[c][l]; A[c][l] = A[p][l]; A[p][l] = t; }
             if (fabs(A[c][c]) < 1e-15) continue;
-            for (int r = 0; r < 4; r++) if (r != c) { const double f = A[r][c] / A[c][c]; for (int l = c; l < 5; l++) A[r][l] -= f * A[c][l]; }
+            for (int r = 0; r < KK; r++) if (r != c) { const double f = A[r][c] / A[c][c]; for (int l = c; l <= KK; l++) A[r][l] -= f * A[c][l]; }
         }
-        for (int k = 0; k < 4; k++) if (fabs(A[k][k]) > 1e-15) v[k] -= A[k][4] / A[k][k];
+        for (int k = 0; k < KK; k++) if (fabs(A[k][k]) > 1e-15) v[k] -= A[k][KK] / A[k][k];
     }
-    w[0] = v[3]; for (int k = 0; k < 3; k++) { w[k + 1] = v[k] / sd[k]; w[0] -= v[k] * mu[k] / sd[k]; }
+    for (int k = 0; k < 5; k++) w[k] = 0;
+    w[0] = v[F]; for (int k = 0; k < F; k++) { w[k + 1] = v[k] / sd[k]; w[0] -= v[k] * mu[k] / sd[k]; }
 }
 /* one report line: model m over the test boxes (te), pooled AUC, the within-box median AUC, P / R at p >= 0.5 for the score models */
 static void ev_report(const char *tag, int m, ev_box *B, int nb, const uint8_t *te, const double *w, const mf_coef *c) {
@@ -620,6 +635,23 @@ static void ev_report(const char *tag, int m, ev_box *B, int nb, const uint8_t *
     printf("  %-28s %-46s n %8zu merged %.3f AUC %.3f within-box median %.3f (%d boxes)", tag, em_name[m], n, (double)pos / n, a, nw ? wa[nw / 2] : NAN, nw);
     if (m <= EM_COEF) printf(" | p>=0.5 flagged %.3f P %.3f R %.3f", (double)fl / n, fl ? (double)tp / fl : 0, pos ? (double)tp / pos : 0);
     printf("\n"); free(v);
+}
+/* model m over the test boxes by GT gap bin (0-50-100-200-inf um): AUC, and the recall of merged intervals when the top 6.5 % by score is
+   flagged (the unroll's MFLAG operating point: 1667 lost 6.5 % of its cells) */
+static void ev_bins(const char *tag, int m, ev_box *B, int nb, const uint8_t *te, const double *w, const mf_coef *c) {
+    const double ge[5] = {0, 50, 100, 200, 1e30}; printf("  %-28s %-14s", tag, m == EM_LOGIT ? "logistic" : em_name[m]);
+    for (int g = 0; g < 4; g++) {
+        size_t n = 0; for (int b = 0; b < nb; b++) if (te[b]) for (size_t i = 0; i < B[b].n; i++) n += B[b].iv[i].gap >= ge[g] && B[b].iv[i].gap < ge[g + 1];
+        if (!n) { printf(" | %g-%g: -", ge[g], ge[g + 1] > 1e29 ? INFINITY : ge[g + 1]); continue; }
+        ev_sy *v = malloc(n * sizeof *v); size_t k = 0, pos = 0;
+        for (int b = 0; b < nb; b++) if (te[b]) for (size_t i = 0; i < B[b].n; i++) { const ev_iv *q = &B[b].iv[i];
+            if (q->gap >= ge[g] && q->gap < ge[g + 1]) { v[k].s = em_score(m, q, w, c); v[k].y = q->y; pos += q->y; k++; } }
+        const double a = ev_auc(v, n);   /* (sorts v ascending by score) */
+        size_t top = (size_t)(0.065 * n), tp = 0; for (size_t i = 0; i < top; i++) tp += v[n - 1 - i].y;
+        printf(" | %g-%g n %zu mg %.3f AUC %.3f R@6.5%% %.3f", ge[g], ge[g + 1] > 1e29 ? INFINITY : ge[g + 1], n, (double)pos / n, a, pos ? (double)tp / pos : NAN);
+        free(v);
+    }
+    printf("\n");
 }
 static int ev_p4(const char *scroll) { return !strncmp(scroll, "paris4", 6); }
 /* ufsm merge-flag --eval LIST [--coef b,amp,r,sp] [--threads 4]: LIST lines "name scroll fields-dir codes-root codes-key" (codes key = its
@@ -645,6 +677,31 @@ static int cmd_merge_flag_eval(int argc, char **argv, const char *list) {
     for (int t = 0; t < m; t++) pthread_join(th[t], nullptr);
     size_t tot = 0; int nok = 0; for (int b = 0; b < nb; b++) if (!B[b].rc) { tot += B[b].n; nok++; } else B[b].n = 0;
     printf("merge-flag --eval: %d of %d boxes, %zu GT intervals\n", nok, nb, tot);
+    const char *dpts = opt(argc, argv, "--dense-pts", nullptr), *dcos = opt(argc, argv, "--dense-cos", nullptr);
+    if (dpts) {   /* the probe pairs per box, DIR/NAME.pts (float32 [2n][3] z y x, absolute native): dinovol-probe pfeats embeds them */
+        for (int b = 0; b < nb; b++) if (B[b].n) {
+            char fn[1200]; snprintf(fn, sizeof fn, "%s/%s.pts", dpts, B[b].name); FILE *o = fopen(fn, "wb");
+            if (!o) { fprintf(stderr, "merge-flag --eval: cannot write %s\n", fn); return 1; }
+            for (size_t i = 0; i < B[b].n; i++) fwrite(B[b].iv[i].pt, sizeof(float), 6, o);
+            fclose(o);
+        }
+        printf("merge-flag --eval: probe pairs written to %s/NAME.pts\n", dpts);
+        for (int b = 0; b < nb; b++) free(B[b].iv);
+        free(B); return 0;
+    }
+    if (dcos) {   /* f[3] = cos(dense(a), dense(b)) of each interval's probe pair; a box without its DIR/NAME.dvf leaves the run */
+        int nd = 0; size_t nx = 0;
+        for (int b = 0; b < nb; b++) if (B[b].n) {
+            char fn[1200]; snprintf(fn, sizeof fn, "%s/%s.dvf", dcos, B[b].name); long n = 0; int F = 0; float *X = dvp_read_cols(fn, "dense", &n, &F);
+            if (!X || n != 2 * (long)B[b].n) { fprintf(stderr, "merge-flag --eval: %s: %s %s (%ld rows, want %zu): box dropped\n", B[b].name, fn, X ? "row count" : "unreadable", n, 2 * B[b].n);
+                                              free(X); nx += B[b].n; B[b].n = 0; continue; }
+            for (size_t i = 0; i < B[b].n; i++) { const float *a = X + 2 * i * F, *c = a + F; double ab = 0, aa = 0, cc = 0;
+                                                  for (int k = 0; k < F; k++) { ab += (double)a[k] * c[k]; aa += (double)a[k] * a[k]; cc += (double)c[k] * c[k]; }
+                                                  B[b].iv[i].f[3] = (float)(aa > 0 && cc > 0 ? ab / sqrt(aa * cc) : 0); }
+            free(X); nd++;
+        }
+        ev_nf = 4; printf("merge-flag --eval: --dense-cos %s: %d boxes, %zu intervals dropped (no features)\n", dcos, nd, nx);
+    }
     if (opt(argc, argv, "--gap-report", nullptr)) {   /* the rule at --thr against GT sheet gaps, per scroll: P / R of "gap < G um" */
         const double G = opt_atof("--gap-report", opt(argc, argv, "--gap-report", "100")), t = (opt_atoi("--thr", opt(argc, argv, "--thr", "179")) - 0.5) / 255.0;
         const double lt = log(t / (1 - t)); char seen[64][32]; int ns = 0;
@@ -682,7 +739,7 @@ static int cmd_merge_flag_eval(int argc, char **argv, const char *list) {
         for (int b = 0; b < nb; b++) free(B[b].iv);
         free(B); return nok == nb ? 0 : 1;
     }
-    uint8_t *tr = calloc(nb, 1), *te = calloc(nb, 1); double w[4];
+    uint8_t *tr = calloc(nb, 1), *te = calloc(nb, 1); double w[5] = {0};
     /* a box listed for several nets (name NET-BOX) stays on one side of the held-out split: its rank among the distinct BOX names */
     int *rk = calloc(nb, sizeof *rk);
     for (int b = 0; b < nb; b++) {
@@ -700,8 +757,10 @@ static int cmd_merge_flag_eval(int argc, char **argv, const char *list) {
         }
         const char *sn[3] = {"held-out boxes (even -> odd)", "scroll-out: Paris 4 -> rest", "scroll-out: rest -> Paris 4"};
         ev_logit(B, nb, tr, w);
-        printf("%s: logistic b %.4f c_amp %.4f c_r %.4f c_sp %.4f\n", sn[split], w[0], w[1], w[2], w[3]);
-        for (int mm = 0; mm < EM_N; mm++) ev_report("all test boxes", mm, B, nb, te, w, &c);
+        printf("%s: logistic b %.4f c_amp %.4f c_r %.4f c_sp %.4f c_dcos %.4f\n", sn[split], w[0], w[1], w[2], w[3], w[4]);
+        for (int mm = 0; mm < EM_N - (ev_nf < 4); mm++) ev_report("all test boxes", mm, B, nb, te, w, &c);
+        ev_bins("by GT gap", EM_LOGIT, B, nb, te, w, &c);
+        if (ev_nf == 4) ev_bins("by GT gap", EM_DCOS, B, nb, te, w, &c);
         if (split == 0) {   /* per scroll of the held-out boxes */
             uint8_t *t2 = calloc(nb, 1);
             for (int p = 1; p >= 0; p--) { for (int b = 0; b < nb; b++) t2[b] = te[b] && ev_p4(B[b].scroll) == p;
