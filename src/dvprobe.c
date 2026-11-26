@@ -218,7 +218,7 @@ static int cmd_feats(int argc, char **argv) {
 typedef struct { dvf_head H; char (*names)[DVF_NAME]; long n; dvf_row *R; float *X; int Fs; } dvf;
 static int feat_cols(const dvf_head *H, const char *spec, int *cols) {   /* "tok,dense,ink" -> column indices */
     int n = 0; char b[128]; snprintf(b, sizeof b, "%s", spec);
-    for (char *t = strtok(b, ","); t; t = strtok(nullptr, ",")) {
+    char *sv = nullptr; for (char *t = strtok_r(b, ",", &sv); t; t = strtok_r(nullptr, ",", &sv)) {
         int a = -1, e = -1;
         if (!strcmp(t, "tok")) { a = 0; e = H->E; } else if (!strcmp(t, "dense")) { a = H->E; e = H->E + H->nd; } else if (!strcmp(t, "ink")) { a = H->E + H->nd; e = H->F; }
         else { fprintf(stderr, "dinovol-probe: --feat: tok, dense, ink\n"); return -1; }
@@ -515,7 +515,8 @@ int cmd_dinovol_probe(int argc, char **argv) {
    apply writes each crop's map on its own canvas (the mesh's canvas, what ink-score reads), not the 256 label grid ---- */
 static int ssl_read(dvf *D, const char *list) {   /* comma-separated .dvf files, every column, crop indices offset; one feature count */
     memset(D, 0, sizeof *D); char *cp = strdup(list); int rc = 0;
-    for (char *t = strtok(cp, ","); t && !rc; t = strtok(nullptr, ",")) {
+    char *sv = nullptr;   /* (strtok_r: dvf_read -> feat_cols tokenises too; with strtok only the first file was read, 11-26 E0-avg probe: 3 of 99 dev maps) */
+    for (char *t = strtok_r(cp, ",", &sv); t && !rc; t = strtok_r(nullptr, ",", &sv)) {
         dvf E; if (dvf_read(&E, t, "tok")) { rc = -1; break; }
         if (E.H.E != E.H.F) { fprintf(stderr, "ssl-probe: %s: %d of %d columns are tokens: give one feature set per file (E = F)\n", t, E.H.E, E.H.F); dvf_free(&E); rc = -1; break; }
         if (D->H.ncrop && (E.H.F != D->H.F || E.H.stride != D->H.stride)) { fprintf(stderr, "ssl-probe: %s: %d features / stride %d, the first file %d / %d\n", t, E.H.F, E.H.stride, D->H.F, D->H.stride); dvf_free(&E); rc = -1; break; }
