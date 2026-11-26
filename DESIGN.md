@@ -6,6 +6,29 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## DINO / ssl on ink, paired test: the ssl arm loses at 16000 steps (mean4 A − B −0.069 ± 0.022) (2026-11-26, podink)
+
+Pre-registered in podink/dino2/PAIR.txt before arm B launched. **A** (DINO round 2, `--ssl 16 --ssl-level 2 --ssl-share 0.75
+--ssl-weight 0.5 --ssl-mask 0.4 --ssl-block 16`, 6 ink anchors + 52 ct_only scans) against **B**, the same argv / init (wind96-u2) /
+seed 3 / binary 63a473e3 / schedule (WSD, constant lr to 32000) without the ssl flags and the ct_only sources, both at snapshot 16000, on
+the RTX PRO 6000 pod (B: 236-238 Mvox/s, 0 % wait, dmon 96 %, 2.6 h). Scored on the desk with devscoreC vox (dev 99 + h116 48 crops),
+paired per crop (dev/pair.sh). Pass rule: mean4 (A − B) > 2 SE.
+
+| group | n | B (control) | A (ssl) | A − B | SE |
+|---|---|---|---|---|---|
+| 0139 | 40 | 0.7086 | 0.5443 | −0.1643 | 0.0458 |
+| 0172 | 40 | 0.7523 | 0.7996 | +0.0473 | 0.0280 |
+| 0343 | 10 | 0.8780 | 0.7806 | −0.0974 | 0.0651 |
+| 0009B | 48 | 0.8949 | 0.8331 | −0.0618 | 0.0170 |
+| small | 9 | 0.8098 | 0.6469 | −0.1629 | 0.0494 |
+| **mean4** | | | | **−0.0691** | **0.0215** |
+
+- Dev AUC (mean of groups): B 0.7872, A 0.6928. h116: B 0.8949, A 0.8331.
+- **Fails** at −3.2 SE: ssl hurt at this step budget; no clean (1447 / 0841) scoring, per the rule.
+- Known confound, pre-registered: A's ssl share 0.75 gave it about a quarter of B's supervised ink windows at the same step count. The test
+  answers "ssl at a fixed step budget", not "ssl at a fixed supervised budget"; only 0172 moved the other way (+0.047, 1.7 SE).
+- Files: podink/dino2/score/{dev,h116}.tsv, score.log; snapshots podink/dino2/{run,runB}/snap/{4,8,12,16}000.ckpt.
+
 ## 41 tifxyz metas on 9.362 um scans get voxel_size_um (2026-11-26, inksdk)
 
 An inventory of the onfly ink meshes (r1e/meshinv.v3.tsv) turned up 82 meta.json files without `voxel_size_um`. 41 of them sit on 9.362 um
