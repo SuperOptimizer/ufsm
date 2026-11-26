@@ -19,14 +19,15 @@ distillgrid-20261126: the cell is (4 << level) voxels under --lat, and a head / 
   sampler gives ~485 Mvox/s (~1 window/s) against the trainer's ~0.2, so this costs no throughput.
 
 200-window CPU sampler-only dry pass of dst (the sampler-only log now prints this): distill targets cover 79.9 / 77.8 / 77.1 / 74.2 % of the
-head cells after 10 / 20 / 30 / 40 batches, against the CT-nonzero 8^3-block share of 79.9 / 77.9 / 77.2 / 74.2 %. Startup:
+head cells after 10 / 20 / 30 / 40 batches, against the CT-nonzero 8^3-block share of 79.9 / 77.9 / 77.2 / 74.2 %. After all 200 batches
+it is 77.7 % against 77.6 %, with 0 DEFAULTED. The ALERT threshold is therefore 54 %. Startup:
 "distill: 64 channels on decoder level 1 (8^3 voxels per cell, latent grid)". The store shapes match the declared levels: 1667 L2,
 1159x476^2; 0139 L0, 2622x828^2; 0500P2 L0, 883x525^2.
 
 **The pair.** Desk card 1, a master build that includes distillgrid. ctl and dst both use the 4000-step pair's argv with 8000 steps and
 --echo-max 0. dst adds --distill 64 --distill-level 1 --distill-weight 0.3, which gives 8-voxel cells, the stores' stride and g256's
 token grid. There is a new ctl on the same binary. Script: /vesuvius/ufsm/dinovol/distill/pair2.sh, runs in runs2/. The run stops with
-an ALERT if the step lines' distill cell share falls below ~70 % of the CT-nonzero share.
+an ALERT if the mean distill cell share in the first 3 step lines is below 54 % (~70 % of the CT-nonzero share).
 
 **Pre-registered (lead 11-26).** Pass = holdout ids dst - ctl > 0 by more than 2 SE (paired per box, wbench BOXES=holdout). Also
 reported: core ids, p05x on both sets, merge-flag --eval AUCs and the sheet-pair triplets.
