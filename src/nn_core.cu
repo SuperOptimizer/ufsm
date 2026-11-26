@@ -1,5 +1,6 @@
 /* CUDA ops: core section of the former nn.cu */
 #include "nn_common.cuh"
+#include "defaulted.h"
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -644,9 +645,13 @@ extern "C" void nn_d2d_aux(void *d, const void *s, size_t n) {
         return;
     }
     if (mode == 1) {
+#if defined(__NVCC__) && CUDART_VERSION < 13010   /* (nvcc toolkits before 13.1 lack cudaMemcpyWithAttributesAsync: the 13.0 pods' llvm builds) */
+        UFSM_DEFAULTED("UFSM_AUX_CE = 0 (UFSM_AUX_CE=1 asked; this nvcc build's CUDA %d has no cudaMemcpyWithAttributesAsync)", CUDART_VERSION); mode = 0;
+#else
         cudaMemcpyAttributes a = {}; a.srcAccessOrder = cudaMemcpySrcAccessOrderStream; a.flags = cudaMemcpyFlagPreferOverlapWithCompute;
         if (cudaMemcpyWithAttributesAsync(d, s, n, &a, aux_stream()) == cudaSuccess) return;
-        cudaGetLastError(); mode = 0;
+        cudaGetLastError(); mode = 0; UFSM_DEFAULTED("UFSM_AUX_CE = 0 (UFSM_AUX_CE=1 asked; cudaMemcpyWithAttributesAsync failed)");
+#endif
     }
     CK(cudaMemcpyAsync(d, s, n, cudaMemcpyDeviceToDevice, aux_stream()));
 }
