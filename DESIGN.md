@@ -6,6 +6,30 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## predict --seamless 4: two diagonal grids leave the seam-crossing lines; four per-axis phases hide them (2026-11-26, perf)
+
+After the region fix the w228 render still had steps (lead, unroll's hand crop). At the step (z 4359, y 10249, x 11284) pass a jumps
+19 -> 93 at its y seam 10240 and pass b 19 -> 30 at its z seam 4352: next to the line where a grid-0 seam plane crosses a grid-S/2 one
+both sin^2 products are ~0 (sa^3 + sb^3 is no partition of unity in 3-D; the blend's division by the weight sum does not help when
+both inputs are discontinuous there), and the blend switches from b to a within ~3 voxels. ink-seam's whole-plane means (0.2) hid it;
+`ink-seam --line R` takes only pairs within R of a perpendicular seam plane of either grid, `--box` only corners inside a box.
+
+`predict --seamless 4`: passes at the per-axis phases 000 011 101 110 (even parity; a point near seam planes on two axes always has a
+grid away from both, only isolated corners near all three are left), `--seamless 8`: all eight. Same region / blend code (n inputs);
+two-process only. Pass dirs a (000), b (111), p011 ...
+
+| inksdk's w228 box 1024^3, R11P-12000 576 / 32 | off256 planes | off256 lines (R 8) | render pixel pairs with a step > 12 (in the box) |
+|---|---|---|---|
+| 2 grids | 0.21 | 1.15 (y 1.78, x 1.25) | 66 |
+| 4 grids | 0.09 | 0.07 | 2 |
+| 8 grids | 0.10 | 0.10 | 0 |
+
+Stand-in field (per-window offsets, tests/test_seamless_region.py): lines 2.06 / -0.13 / -0.08. Crop: /vesuvius/ufsm/perf/seam8/crop.jpg
+(2 grids: the straight edges of unroll's hand crop; 4 and 8: none visible). Pick: 4 (2x the windows of seamless 2; 8 doubles it again
+for no measured gain). The ink differs a lot between the modes in that crop: the level per window is R11P's (inkperf: no GN running
+statistics in the checkpoint, so GroupNorm runs on each window's own statistics; pass a 19 vs pass b 30 on the same voxels): the
+blend can only average it, the cure is GN running stats (train --gn-ema) or larger windows.
+
 ## predict --seamless 2: the offset-256 "seams" were pass b alone beyond the box / tile list; the blend now keeps the region (2026-11-26, perf)
 
 PHerc1203 r24 reads (R11P-12000, window 576 halo 32, tile list of 512): ink-seam off0 0.25 but off256 9.32 (plain read 17.7). The

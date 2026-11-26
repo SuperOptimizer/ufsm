@@ -22,13 +22,17 @@ static double ns_opt(int argc, char **argv, const char *k, double d) {
 }
 int cmd_ink_seam(int argc, char **argv) {
     if (argc < 3 || argv[2][0] == '-') {
-        fprintf(stderr, "usage: ufsm ink-seam ZARR --um U [--key ARRAY] [--period 512] [--offset 0] [--n 24] [--min 16] [--block 0] [--line R] [--seed 1] [--threads 16]\n"); return 2; }
+        fprintf(stderr, "usage: ufsm ink-seam ZARR --um U [--key ARRAY] [--period 512] [--offset 0] [--n 24] [--min 16] [--block 0] [--line R] [--box z,y,x,nz,ny,nx] [--seed 1] [--threads 16]\n"); return 2; }
     const char *in = argv[2]; const double um = ns_opt(argc, argv, "--um", 0);
     const int P = (int)ns_opt(argc, argv, "--period", 512), off = (int)ns_opt(argc, argv, "--offset", 0), N = (int)ns_opt(argc, argv, "--n", 24),
               mn = (int)ns_opt(argc, argv, "--min", 16), nt = (int)ns_opt(argc, argv, "--threads", 16),
               blk = (int)ns_opt(argc, argv, "--block", 0), lr = (int)ns_opt(argc, argv, "--line", 0);   /* --block K: interior = only the planes at the border's phase mod K (16: the volcomp
                                                                     codec block faces of the CT and of a lossy output, ~7 on Paris 4 ink, not ~3) */
     unsigned seed = (unsigned)ns_opt(argc, argv, "--seed", 1);
+    long long bxo[3] = {0}, bxn[3] = {0}; int hb = 0;
+    for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n("--box"))) {
+        if (sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", &bxo[0], &bxo[1], &bxo[2], &bxn[0], &bxn[1], &bxn[2]) != 6) { fprintf(stderr, "ink-seam: --box z,y,x,nz,ny,nx\n"); return 2; }
+        hb = 1; }
     if (um <= 0 || P < 8 || P % 2) { fprintf(stderr, "ink-seam: --um > 0 and an even --period >= 8\n"); return 2; }
     char lv[256]; z3w_level_name(um, lv, sizeof lv);
     for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n("--key"))) snprintf(lv, sizeof lv, "%s", argv[i + 1]);   /* any uint8 array, e.g. a CT level "0" */
@@ -47,7 +51,8 @@ int cmd_ink_seam(int argc, char **argv) {
         tries++;
         int64_t o[3], b[3];
         for (int d = 0; d < 3; d++) { int64_t k = rand() % nb[d], c = 0; for (b[d] = off; ; b[d] += P) if (b[d] - P / 2 >= 0 && b[d] + P / 2 <= m->shape[d] && c++ == k) break; o[d] = b[d] - P / 2; }
-        int ok = 1;   /* every shard the cube touches present (not air) */
+        int ok = 1;   /* every shard the cube touches present (not air); --box: the cube inside it (a predict's own box, not its margins) */
+        for (int d = 0; d < 3 && hb; d++) if (o[d] < bxo[d] || o[d] + P > bxo[d] + bxn[d]) ok = 0;
         for (int64_t za = o[0] / m->shard[0]; za <= (o[0] + P - 1) / m->shard[0] && ok; za++)
             for (int64_t ya = o[1] / m->shard[1]; ya <= (o[1] + P - 1) / m->shard[1] && ok; ya++)
                 for (int64_t xa = o[2] / m->shard[2]; xa <= (o[2] + P - 1) / m->shard[2] && ok; xa++)
