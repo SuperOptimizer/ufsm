@@ -333,6 +333,8 @@ uint64_t sampler_aug_count(const sampler *sp, int which);   /* windows that rece
    (empty_keep), [3] overlapping a holdout box (training; not counted in rejected) */
 void sampler_reject_reasons(const sampler *sp, uint64_t why[4]);
 void sampler_prof_print(const sampler *sp);   /* env UFSM_SAMPLER_PROF=1: per-stage cpu ms per patch */
+/* UFSM_SAMPLER_PROF: windows built and their mean wall ms from the first draw attempt, by source class (0 labelled, 1 ct_only) */
+void sampler_class_stats(const sampler *sp, uint64_t n[2], double ms[2]);
 void sampler_set_soft(sampler *sp, float sigma);   /* change the soft-target sigma while running (annealing); patches already drawn keep theirs */
 
 sample_cfg sample_cfg_default(void);

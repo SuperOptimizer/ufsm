@@ -224,7 +224,9 @@ int main(int argc, char **argv) {
             if (aug) { c.augment = 3; c.symmetry_p = .5f; c.geometry_augment = 1; c.rotate_degrees = 5; c.rotate_p = .5f; c.elastic = 1; c.elastic_p = .5f; }
             else { c.augment = 0; c.symmetry_p = 0; c.geometry_augment = 0; c.rotate_p = 0; c.elastic_p = 0; }
             if (aug == 2) c.min_phase = .001;
+            setenv("UFSM_SAMPLER_PROF", "1", 1);   /* (the window build time by source class: perf 11-26) */
             sampler *sp = sampler_start(aug == 2 ? Su : Se, &c); if (!sp) { fprintf(stderr, "FAIL: sampler_start (emb)\n"); return 1; }
+            unsetenv("UFSM_SAMPLER_PROF");
             size_t nset = 0, nnorm = 0; double worst = 1;
             for (int i = 0; i < 16; i++) {
                 batch *b = sampler_next(sp); if (!b) { CHECK(0, "emb sampler stopped"); break; }
@@ -250,6 +252,9 @@ int main(int argc, char **argv) {
                 }
                 sampler_release(sp, b);
             }
+            { uint64_t cn[2]; double cm[2]; sampler_class_stats(sp, cn, cm); const int c = aug == 2;   /* emb-only = ct_only: class 1 */
+              printf("class stats (%s): labelled %llu (%.2f ms), ct_only %llu (%.2f ms)\n", aug == 2 ? "emb-only" : "emb", (unsigned long long)cn[0], cm[0], (unsigned long long)cn[1], cm[1]);
+              CHECK(cn[c] >= 16 && cn[!c] == 0 && cm[c] > 0, "class stats (%s): %llu / %llu windows", aug == 2 ? "emb-only" : "emb", (unsigned long long)cn[0], (unsigned long long)cn[1]); }
             sampler_stop(sp);
             printf("distill targets (%s): %zu head cells set, worst cos %.5f, %zu not unit\n", aug == 2 ? "emb-only" : aug ? "augmented" : "plain", nset, worst, nnorm);
             CHECK(nset > 1000 && nnorm == 0 && worst > 0.999, "distill targets (%s): %zu set, worst cos %g, %zu not unit", aug == 2 ? "emb-only" : aug ? "augmented" : "plain", nset, worst, nnorm);
