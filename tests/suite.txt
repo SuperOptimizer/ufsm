@@ -249,6 +249,7 @@ test_z3w_pool                                  | smoke        |     2 | ./$B/tes
 test_typed_zarr                                | smoke        |     7 | ./$B/test_typed_zarr
 test_chunk_map                                 | smoke        |     2 | ./$B/test_chunk_map
 test_wrapxsec                                  | smoke        |     2 | ./$B/test_wrapxsec
+test_wraprays                                  | smoke        |     2 | ./$B/test_wraprays
 test_ink_blend_block                           |              |     5 | ./$B/test_ink_blend_block
 test_tile_list                                 |              |     1 | ./$B/test_tile_list
 test_http_reader                               |              |    29 | python3 tests/test_http_reader.py

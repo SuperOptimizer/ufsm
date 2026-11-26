@@ -4,7 +4,7 @@
    wraps: does the fit undercount sheets? count CT laminae vs fitted wraps along ~8 radial lines, packed vs open, against count-field's
    predicted density"). The meshes (tifxyz, x y z in level-0 voxels of the CT volume) are the fitted wraps; the CT is level L of that volume.
    Per ray (angle theta0 + 360 k / rays degrees, image angle atan2(y, x) about the centre): the CT profile sampled every level voxel
-   (bilinear), smoothed ([1 2 1] / 4 twice); the object span = first .. last sample above the slice's Otsu threshold; the span cut into
+   (bilinear), smoothed ([1 2 1] / 4 twice); the object span = first .. last sample above the slice's threshold (midpoint of the Otsu split's class means); the span cut into
    --win-um windows. Per window:
      laminae  local maxima above the Otsu threshold with prominence >= --prom (grey levels, against the lower of the minima within 4 sep on
               either side), at least --sep level voxels apart (the higher kept): bright papyrus bands
@@ -60,13 +60,14 @@ static int wr_mesh(const char *dir, double Z, wr_segs *out) {
     for (int c = 0; c < 3; c++) free(X[c]);
     return rc;
 }
-static int wr_otsu(const size_t hist[256]) {
+static double wr_otsu(const size_t hist[256]) {   /* the Otsu split's two class means, their midpoint (a split's own level sits on the
+                                                     edge of the lower class: a smoothed narrow gap never reaches it) */
     double tot = 0, sum = 0; for (int k = 1; k < 256; k++) { tot += hist[k]; sum += (double)k * hist[k]; }
-    double wb = 0, sb = 0, best = -1; int t = 64;
+    double wb = 0, sb = 0, best = -1, t = 64;
     for (int k = 1; k < 255; k++) {
         wb += hist[k]; if (wb == 0) continue; const double wf = tot - wb; if (wf == 0) break;
         sb += (double)k * hist[k]; const double mb = sb / wb, mf = (sum - sb) / wf, v = wb * wf * (mb - mf) * (mb - mf);
-        if (v > best) { best = v; t = k; }
+        if (v > best) { best = v; t = 0.5 * (mb + mf); }
     }
     return t;
 }
@@ -75,8 +76,8 @@ static double wr_axis(const float *a, int na, double z) {
     const int i = (int)z; const double u = z - i; return a[i] * (1 - u) + a[i + 1] * u;
 }
 /* the count-field's W at a level-0 point (x y z) of the meshes' scan */
-static double wr_W(const fit_model *m, const rmap *map, double x, double y, double z) {
-    double f[3] = {x, y, z}, c[3] = {x, y, z};
+static double wr_W(const fit_model *m, const rmap *map, double k, double x, double y, double z) {   /* k: level-0 -> model voxels without a map */
+    double f[3] = {x, y, z}, c[3] = {x * k, y * k, z * k};
     if (map) rmap_f2c(map, f, c);
     return fit_W(m, c[2] - (double)m->origin[0], c[1] - (double)m->origin[1], c[0] - (double)m->origin[2]);
 }
@@ -84,7 +85,7 @@ static int wr_cmp_d(const void *a, const void *b) { const double x = *(const dou
 
 int cmd_wrap_rays(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: ufsm wrap-rays <out.tsv> --ct ROOT KEY --level L --z Z (level-0) --meshes DIR [--map reg.json --cf CFDIR] [--center y,x]\n"
+        fprintf(stderr, "usage: ufsm wrap-rays <out.tsv> --ct ROOT KEY --level L --z Z (level-0) [--meshes DIR] [--map reg.json --cf CFDIR] [--center y,x]\n"
                         "       [--rays 8] [--theta0 0] [--win-um 1000] [--um 2.403] [--prom 12] [--sep 3]\n");
         return 2;
     }
@@ -95,7 +96,7 @@ int cmd_wrap_rays(int argc, char **argv) {
                  th0 = atof(wr_opt(argc, argv, "--theta0", "0"));
     const char *zs = wr_opt(argc, argv, "--z", nullptr), *md = wr_opt(argc, argv, "--meshes", nullptr), *mp = wr_opt(argc, argv, "--map", nullptr),
                *cfd = wr_opt(argc, argv, "--cf", nullptr), *ctr = wr_opt(argc, argv, "--center", nullptr);
-    if (!root || !key || !zs || !md || L < 0 || nray < 1 || sep < 1 || winum <= 0) { fprintf(stderr, "wrap-rays: --ct ROOT KEY, --z and --meshes are required\n"); return 2; }
+    if (!root || !key || !zs || L < 0 || nray < 1 || sep < 1 || winum <= 0) { fprintf(stderr, "wrap-rays: --ct ROOT KEY, --z are required\n"); return 2; }
     const double Z = atof(zs), f = ldexp(1.0, -L), sum = um0 / f;   /* sum: um per level-L voxel */
     store *s = store_open(root); if (!s) { fprintf(stderr, "wrap-rays: cannot open %s\n", root); return 1; }
     z3 *v = z3_open(s, key, nullptr); if (!v) { fprintf(stderr, "wrap-rays: cannot open %s %s: %s\n", root, key, z3_error()); return 1; }
@@ -105,21 +106,22 @@ int cmd_wrap_rays(int argc, char **argv) {
     uint8_t *g = malloc((size_t)H * W); const int64_t o[3] = {zl, 0, 0}, n[3] = {1, H, W};
     if (!g || z3_read(v, o, n, g, 8)) { fprintf(stderr, "wrap-rays: slice read failed: %s\n", z3_error()); return 1; }
     size_t hist[256] = {0}; for (size_t i = 0; i < (size_t)H * W; i++) if (g[i]) hist[g[i]]++;
-    const int thr = wr_otsu(hist);
+    const double thr = wr_otsu(hist); const float at = (float)thr;
     /* the count-field model and the map */
     fit_model *cf = nullptr; const rmap *map = nullptr;
     if (cfd && !(cf = fit_load(cfd))) { fprintf(stderr, "wrap-rays: cannot load the fit model %s\n", cfd); return 1; }
     if (mp && !(map = reg_map_load(mp))) { fprintf(stderr, "wrap-rays: cannot load the map %s\n", mp); return 1; }
+    const double ck = cf && !map && cf->um > 0 ? um0 / cf->um : 1;   /* same scan, model at its own voxel (1667 u1: 9.596 um = level 2) */
     /* centre (level-0 y x of the meshes' scan) */
     double cy0 = H / f / 2, cx0 = W / f / 2; const char *csrc = "slice centre";
     if (ctr) { if (sscanf(ctr, "%lf,%lf", &cy0, &cx0) != 2) { fprintf(stderr, "wrap-rays: --center y,x\n"); return 2; } csrc = "given"; }
     else if (cf) {
         const int na = (int)(cf->D * cf->h) + 1;
         for (int it = 0; it < 4; it++) {
-            double fp[3] = {cx0, cy0, Z}, cp[3] = {cx0, cy0, Z};
+            double fp[3] = {cx0, cy0, Z}, cp[3] = {cx0 * ck, cy0 * ck, Z * ck};
             if (map) rmap_f2c(map, fp, cp);
             const double bz = cp[2] - (double)cf->origin[0];
-            double c2[3] = {wr_axis(cf->cx, na, bz) + (double)cf->origin[2], wr_axis(cf->cy, na, bz) + (double)cf->origin[1], cp[2]}, f2[3] = {c2[0], c2[1], c2[2]};
+            double c2[3] = {wr_axis(cf->cx, na, bz) + (double)cf->origin[2], wr_axis(cf->cy, na, bz) + (double)cf->origin[1], cp[2]}, f2[3] = {c2[0] / ck, c2[1] / ck, c2[2] / ck};
             if (map) rmap_c2f(map, c2, f2);
             cx0 = f2[0]; cy0 = f2[1];
         }
@@ -127,17 +129,17 @@ int cmd_wrap_rays(int argc, char **argv) {
     }
     /* the meshes' cross-sections */
     wr_segs sg = {0}; int nmesh = 0;
-    DIR *dd = opendir(md); if (!dd) { fprintf(stderr, "wrap-rays: cannot open %s\n", md); return 1; }
+    DIR *dd = md ? opendir(md) : nullptr; if (md && !dd) { fprintf(stderr, "wrap-rays: cannot open %s\n", md); return 1; }
     struct dirent *de;
-    while ((de = readdir(dd))) {
+    while (dd && (de = readdir(dd))) {
         if (de->d_name[0] == '.') continue;
         char p[2100]; snprintf(p, sizeof p, "%s/%s", md, de->d_name);
         char q[2200]; snprintf(q, sizeof q, "%s/z.tif", p); FILE *t = fopen(q, "rb"); if (!t) continue; fclose(t);
         if (wr_mesh(p, Z, &sg)) { fprintf(stderr, "wrap-rays: cannot read the mesh %s\n", p); return 1; }
         nmesh++;
     }
-    closedir(dd);
-    fprintf(stderr, "wrap-rays: slice %ld (level %d, %.2f um / voxel), Otsu %d, centre y %.0f x %.0f (%s), %d meshes, %zu segments\n",
+    if (dd) closedir(dd);
+    fprintf(stderr, "wrap-rays: slice %ld (level %d, %.2f um / voxel), threshold %.1f, centre y %.0f x %.0f (%s), %d meshes, %zu segments\n",
             (long)zl, L, sum, thr, cy0, cx0, csrc, nmesh, sg.n);
     FILE *fo = fopen(out, "w"); if (!fo) { fprintf(stderr, "wrap-rays: cannot write %s\n", out); return 1; }
     fprintf(fo, "z\ttheta_deg\tr0_um\tr1_um\tlaminae\tsheets\twraps\tcf\tair\tclass\n");
@@ -160,12 +162,12 @@ int cmd_wrap_rays(int argc, char **argv) {
             for (int i = 1; i + 1 < ns; i++) sm[i] = 0.25f * pr[i - 1] + 0.5f * pr[i] + 0.25f * pr[i + 1];
             memcpy(pr, sm, sizeof(float) * ns);
         }
-        int a0 = 0, a1 = ns - 1; while (a0 < ns && pr[a0] < thr) a0++; while (a1 > a0 && pr[a1] < thr) a1--;
+        int a0 = 0, a1 = ns - 1; while (a0 < ns && pr[a0] < at) a0++; while (a1 > a0 && pr[a1] < at) a1--;
         if (a1 - a0 < 8) continue;
         /* laminae: prominent maxima, >= sep apart (higher kept) */
         memset(pk, 0, ns); int last = -1000;
         for (int i = a0 + 1; i < a1; i++) {
-            if (!(pr[i] >= pr[i - 1] && pr[i] > pr[i + 1] && pr[i] > thr)) continue;
+            if (!(pr[i] >= pr[i - 1] && pr[i] > pr[i + 1] && pr[i] > at)) continue;
             float ml = pr[i], mr = pr[i];
             for (int j = i - 1; j >= a0 && j >= i - 4 * sep; j--) ml = fminf(ml, pr[j]);
             for (int j = i + 1; j <= a1 && j <= i + 4 * sep; j++) mr = fminf(mr, pr[j]);
@@ -178,7 +180,7 @@ int cmd_wrap_rays(int argc, char **argv) {
         for (int i = a0, prev = -1; i <= a1; i++) {
             if (!pk[i]) continue;
             float mn = pr[i]; for (int j = prev < 0 ? i : prev; j < i; j++) mn = fminf(mn, pr[j]);
-            if (prev < 0 || mn < thr) pk[i] = 2;
+            if (prev < 0 || mn < at) pk[i] = 2;
             prev = i;
         }
         /* mesh crossings along the ray (level-0 radius from the centre) */
@@ -194,10 +196,10 @@ int cmd_wrap_rays(int argc, char **argv) {
         double rl = 0, rsh = 0, rw = 0, rc = 0;
         for (int w0 = a0; w0 < a1; w0 += wn) {
             const int w1 = w0 + wn < a1 ? w0 + wn : a1; if (w1 - w0 < wn / 2) break;
-            int lam = 0, shn = 0, air = 0; for (int i = w0; i < w1; i++) { lam += pk[i] > 0; shn += pk[i] == 2; air += pr[i] < thr; }
+            int lam = 0, shn = 0, air = 0; for (int i = w0; i < w1; i++) { lam += pk[i] > 0; shn += pk[i] == 2; air += pr[i] < at; }
             const double r0 = w0 / f, r1 = w1 / f; int wr = 0; for (size_t j = 0; j < nx; j++) wr += xr[j] >= r0 && xr[j] < r1;
             double cft = NAN;
-            if (cf) cft = fabs(wr_W(cf, map, cx0 + r1 * dx, cy0 + r1 * dy, Z) - wr_W(cf, map, cx0 + r0 * dx, cy0 + r0 * dy, Z));
+            if (cf) cft = fabs(wr_W(cf, map, ck, cx0 + r1 * dx, cy0 + r1 * dy, Z) - wr_W(cf, map, ck, cx0 + r0 * dx, cy0 + r0 * dy, Z));
             const double as = (double)air / (w1 - w0); const int c = as <= 0.10 ? 0 : as >= 0.25 ? 2 : 1;
             fprintf(fo, "%.0f\t%.1f\t%.0f\t%.0f\t%d\t%d\t%d\t%.2f\t%.3f\t%s\n", Z, th * 180 / M_PI, r0 * um0, r1 * um0, lam, shn, wr, cft, as, cname[c]);
             rl += lam; rsh += shn; rw += wr; rc += isnan(cft) ? 0 : cft; cls[c][0] += lam; cls[c][1] += wr; cls[c][2] += isnan(cft) ? 0 : cft; cls[c][3] += shn;
