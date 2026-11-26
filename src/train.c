@@ -2456,6 +2456,8 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     if (g_distill && train) {   /* --distill: the head's cosine loss against the feature targets; the fp32 gradient joins its decoder level in the backward */
         shape5 se; const float *ye = unet_emb_logits(d->u, &se);
         if (!ye) { fprintf(stderr, "distill: no head outputs after the forward\n"); abort(); }
+        if ((size_t)se.n * se.c * se.d * se.h * se.w != g_distill_n) {   /* the head's grid must be the targets' (11-26: --lat 4 ran 1/64 of them) */
+            fprintf(stderr, "distill: head %d x %d x %dx%dx%d != %zu targets (%d^3 voxels per cell)\n", se.n, se.c, se.d, se.h, se.w, g_distill_n, g_distill_div); abort(); }
         nn_distill_loss(ye, d->embt, se.n, se.c, (size_t)se.d * se.h * se.w, g_distill_w, d->embg, d->embds);
         unet_set_emb_grad(d->u, d->embg);
     }
@@ -3722,11 +3724,12 @@ int cmd_train(int argc, char **argv) {
                 fprintf(stderr, "--distill C (1..512 channels), --distill-level 1..%d, --distill-weight > 0\n", cfg.nlev - 2); return 2;
             }
             if (split || g_half) { fprintf(stderr, "--distill: whole windows at full resolution (no --split z or --half-res)\n"); return 2; }
-            g_distill_div = 1 << g_distill_lev;
+            g_distill_div = (g_lat ? 4 : 1) << g_distill_lev;   /* (--lat: the net's level 0 is the 4^3-voxel latent grid, as ssl_cell; 11-26: 1 << lev
+                                                                  sized the targets 64x the head under --lat 4, so the loss read their first 1/64: 1.3 % "cells") */
             if (P % g_distill_div || g_Pz % g_distill_div) { fprintf(stderr, "--distill: P and Pz must be divisible by %d\n", g_distill_div); return 2; }
             cfg.emb_lev = g_distill_lev; cfg.emb_ch = g_distill;
             g_distill_n = (size_t)B * g_distill * (size_t)(g_Pz / g_distill_div) * (P / g_distill_div) * (P / g_distill_div);
-            fprintf(stderr, "distill: %d channels on decoder level %d (%d^3 voxels per cell), cosine weight %g\n", g_distill, g_distill_lev, g_distill_div, g_distill_w);
+            fprintf(stderr, "distill: %d channels on decoder level %d (%d^3 voxels per cell%s), cosine weight %g\n", g_distill, g_distill_lev, g_distill_div, g_lat ? ", latent grid" : "", g_distill_w);
         }
     }
     {   /* --ssl D (src/ssl.h, DESIGN 2026-11-12): masked self-distillation on the sources' "ct_only" windows. The EMA teacher's D-channel

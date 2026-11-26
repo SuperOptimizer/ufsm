@@ -184,6 +184,7 @@ test_recto_gpu                                 | gpu          |     3 | ./$B/tes
 test_faces                                     |              |     1 | ./$B/test_faces
 test_fit_emb                                   |              |    60 | ./$B/test_fit_emb
 test_distill                                   | gpu          |     1 | ./$B/test_distill
+test_distill_lat                               | gpu          |    30 | tests/test_distill_lat.sh ./$B/ufsm ./$B/make_wind_fixture ./$B/test_distill $TMPDIR/distilllat
 test_tiffw                                     | smoke        |     1 | ./$B/test_tiffw
 test_render_stream                             |              |     7 | ./$B/test_render_stream
 test_imgops                                    | smoke        |     1 | ./$B/test_imgops

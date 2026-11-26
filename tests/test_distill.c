@@ -58,7 +58,11 @@ static int write_group(const char *g, const int64_t n[3], const int64_t skip_lo[
     return rc;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 6 && !strcmp(argv[1], "--write")) {   /* test_distill --write GROUP NZ NY NX: the field's store (array "pca", 8 channels, step 8) for a train test */
+        const int64_t n[3] = {atoll(argv[3]), atoll(argv[4]), atoll(argv[5])}, none[3] = {0, 0, 0};
+        return write_group(argv[2], n, none, none) ? 1 : 0;
+    }
     /* (1) coordinates */
     {
         const int P = 48; double worst = 0;
