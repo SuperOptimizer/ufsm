@@ -6,6 +6,38 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## J1 v0 on the RTX PRO 6000 pod: launched 17:06 UTC, lost at ~step 760 when the pod ended (credits), no snapshot (2026-11-26, podink)
+
+J1 v0 (inksdk's joint winding + ink + SSL v1 net, init E0-avg + head-map, 98 sources: 63 ink / winding + 35 ct_only SSL scans) ran on
+master 72b088d4 at P 640, workers 12 / slots 12, `--onfly-slots 6`, CPU CT decode, mirror CT through `UFSM_HTTP_CACHE`. SSH refused from
+~17:35 (the container gone: the user's pod credits ran out), at ~step 760; the first snapshot was due at 5000. Nothing to recover.
+- **CT did not fit the 500 GB disk.** The 98-source prefetch dry run listed 405 GB stored (ink / winding 297, SSL 100 at a 30 % z slab).
+  The SSL ct_only sources got `ct_zslabs` (the middle 15 % of z, at least one P 640 window; inksdk + lead) and J1 launched at 48 % of its
+  chunks cached, with the rest cold. The launch gate and pseudolab's pause read the prefetch's own progress (podink/j1/pfprog.sh: stored
+  chunks x coverage over the dry's list), not cache size.
+- **perf's P sweep** (300 steps each, cold-ish cache, profile binary = 70d48b49 + sampler timing):
+
+  | P | Mvox/s | wait | GPU-side Mvox/s | sm | GPU GB |
+  |---|---|---|---|---|---|
+  | 256 | 54.2 | 63 % | 150 | 16 % | 15.4 |
+  | 384 | 103.4 | 48 % | 198 | 31 % | 24.3 |
+  | 512 | 123.1 | 42 % | 211 | 45 % | 38.6 |
+  | 640 | 137.9 | 34 % | 211 | 48 % | 61.8 |
+  | 768 | 163.4 | 21 % | 208 | 69 % | 94.8 |
+  | 256, warmer cache | 148.9 | 4 % | 156 | 24 % | 13.7 |
+  | 640, 12 / 12 workers / slots | 185.4 | 10 % | 205 | | 63.6 |
+  | 640, 24 / 16 | 180.8 | 11 % | 204 | | 70.0 |
+
+  The wait was cold HTTP CT, not CPU (2.3-4.8 of 13.6 cores). 24 workers made the labelled windows slower (targets 6.5 → 10.5 s), so the
+  2 on-the-fly GPU slots were the limit: `--onfly-slots 6`. P 640 = the largest P under inksdk's 85 GB rule.
+- **check15 (17:21, step 660):** DEFAULTED 0, errors 0, ink targets on GPU 0, dmon 86 %, 173-210 Mvox/s at 0-16 % wait; losses phase
+  0.685, normal 0.617, wind4 0.677 (acc 0.356), ink bce 0.536, ink mil 0.518; disk 142 GB free, prefetch 55.7 %.
+- **For the next pod:** CPU sampler-only needs `--onfly-gpu -1` with `CUDA_VISIBLE_DEVICES=` (the on-the-fly phase otherwise stops at
+  "no GPU pair rule"); protect sshd (`oom_score_adj -1000`) and keep one pod-side status file instead of every agent polling over SSH
+  (podink/pod/{status,statuspull,harden}.sh); snapshot early (the 5000-step first snapshot lost everything here); per-scan timeouts that
+  fit the largest scan (pseudolab's 1800 s killed Paris 4, a ~2.2 h cold read).
+- Kit: podink/j1/ (sources-J1.pod.json 15 % slabs, final.md5, launchJ1.sh, the prefetch scripts).
+
 ## DINO / ssl on ink, paired test: the ssl arm loses at 16000 steps (mean4 A − B −0.069 ± 0.022) (2026-11-26, podink)
 
 Pre-registered in podink/dino2/PAIR.txt before arm B launched. **A** (DINO round 2, `--ssl 16 --ssl-level 2 --ssl-share 0.75
