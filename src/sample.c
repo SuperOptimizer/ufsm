@@ -3052,8 +3052,8 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
             if (why) { unsigned long long lost = 0; for (int k = 1; k < 7; k++) lost += __atomic_load_n(&s->mil_n[k], __ATOMIC_RELAXED);
                 if (lost >= 16 && !(lost & (lost - 1))) {
                     unsigned long long m[7]; for (int k = 0; k < 7; k++) m[k] = __atomic_load_n(&s->mil_n[k], __ATOMIC_RELAXED);
-                    fprintf(stderr, "DEFAULTED: sampler: %s: --ink-mil: %llu of %llu windows without MIL rays (level outside [%d, %d] %llu, crushed %llu, torn %llu, "
-                                    "delam %llu, curved %llu, no ray table %llu)\n", s->name, lost, lost + m[0], L, L + 1, m[1], m[2], m[3], m[4], m[5], m[6]); } }
+                    fprintf(stderr, "DEFAULTED: mil-skip %s: level-range %llu / crushed %llu / torn %llu / delam %llu / curved %llu / no-rays %llu (%llu of %llu "
+                                    "--ink-mil windows without rays; ink level %d, rays at levels %d..%d)\n", s->name, m[1], m[2], m[3], m[4], m[5], m[6], lost, lost + m[0], L, L, L + 1); } }
             (void)nw;
         }
         if (inkfly_rays && ich >= 0 && l >= L && l <= L + 1 && !crushed && !torn && !delam && !curved) {
