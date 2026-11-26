@@ -458,6 +458,10 @@ int main(int argc, char **argv) {
             best = 1e9;
             for (int it = 0; it < 8; it++) { nn_sync(); double t0 = now(); lp_conv1_fwd_mx(x, 4, xs, wh, bh, 7, yh, gp); nn_sync(); if (it >= 2 && (now() - t0) * 1e3 < best) best = (now() - t0) * 1e3; }
             printf("%-32s @%d %8.3f ms  out %016llx\n", "fwd head 32 -> 7 (mx4 x, gn+silu)", P, best, (unsigned long long)fnv(yh, S * 7 * 4));
+            if (getenv("BENCH_DUMP")) {   /* (FILE: the fp32 logits, to compare two builds value by value where the hashes differ) */
+                float *hy = malloc(S * 7 * 4); nn_d2h(hy, yh, S * 7 * 4); FILE *fo = fopen(getenv("BENCH_DUMP"), "wb");
+                if (fo) { fwrite(hy, 4, S * 7, fo); fclose(fo); } free(hy);
+            }
             nn_free(yh); nn_free(wh); nn_free(bh);
             nn_free(x); nn_free(gyf); nn_free(gyh); nn_free(gw); nn_free(gb);
         }
