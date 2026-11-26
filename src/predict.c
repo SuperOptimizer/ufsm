@@ -2916,11 +2916,17 @@ static int predict_one(int argc, char **argv) {
         }
     }
     /* --surf W1,W2,..: the surface ink head (train --ink-surf) on these unrolled wraps: the windows reduced to those holding a patch */
-    static surfp *SF; static char sf_out[1200];   /* mgpu: main (predict --surf: one GPU, refused with --gpus > 1 / --split) */
+    static surfp *SF; static char sf_out[1200], sf_feats[1200]; static int sf_fst;   /* mgpu: main (predict --surf: one GPU, refused with --gpus > 1 / --split) */
     {   const char *sw = opt(argc, argv, "--surf", nullptr);
         if (sw) {
             const char *sout = opt(argc, argv, "--surf-out", nullptr); char ip[1500]; snprintf(ip, sizeof ip, "%s.isf", ckpt);
             const char *isf = opt(argc, argv, "--surf-isf", ip);
+            /* --surf-feats OUT.dvf (2026-11-26, ssl-probe): no head: the head's input (the trunk's level-0 features, K = 2 --surf-k + 1 layers
+               along the normal) at the wraps' (ink-devcrops crops') label lattice (--surf-feats-stride label px, default 4) as a dinovol-probe
+               feature file; ufsm ssl-probe fit / apply reads it */
+            const char *sfe = opt(argc, argv, "--surf-feats", nullptr);
+            if (sfe) { isf = nullptr; snprintf(sf_feats, sizeof sf_feats, "%s", sfe); sf_fst = opt_atoi("--surf-feats-stride", opt(argc, argv, "--surf-feats-stride", "4")); if (!sout) sout = "";
+                if (sf_fst < 1) { fprintf(stderr, "predict --surf-feats: --surf-feats-stride >= 1\n"); return 2; } }
             if (!sout || split || nwork > 1 || lat_store || seam2) { fprintf(stderr, "predict --surf: needs --surf-out DIR; one GPU, no --split / --latents / --seam-inproc\n"); return 2; }
             /* (11-25) the surface head reads the identity pass's trunk features only (surfp_window before the --tta passes): with --tta K
                its map would silently be the K = 1 map */
@@ -3809,7 +3815,7 @@ static int predict_one(int argc, char **argv) {
     if (mch_n > 1) fprintf(stderr, "predict: --channels: %d more channel stores (%s ...) from the same windows\n", mch_n - 1, mch_out[1]);
     free(MC);
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs end-to-end, the windows %.0fs)\n", out, ntiles, now() - t0, t_win);
-    if (SF) { const int r_ = surfp_write(SF, sf_out); surfp_free(SF); SF = nullptr; if (r_) return 1; }
+    if (SF) { const int r_ = sf_feats[0] ? surfp_write_feats(SF, sf_feats, sf_fst) : surfp_write(SF, sf_out); surfp_free(SF); SF = nullptr; if (r_) return 1; }
     /* (the share only with UFSM_SKIP_REPORT: without it the line read "... masked-1.000", taken for "every conv skipped" (latcodec 11-20); a
        masked launch runs the active tiles of its mask, not none) */
     if (skip_empty) { fprintf(stderr, "predict: --skip-empty: %ld windows with tile masks (thr %d, margin %d), %ld of %ld conv launches ran on the masks' active tiles", skip_wins, skip_thr, skip_margin, skip_masked, skip_calls);
