@@ -31,6 +31,124 @@ on the CPU with the GPU idle.
   (not identical, ~2.4x a plain row).
 - tests/test_seamless_tilelist.sh (gpu, 18 s): a real net, window 288 halo 16, 128 tiles (tile = shift) at the corner, inside and
   adjacent. Every listed output shard file is byte-identical to the whole-box seamless run.
+## mcc pin ff7f174 -> 01873d0: guard folding, join / partial jump threading, mcudahw kernel log (2026-11-25, microc)
+- The pin moves to 01873d0 (microc branch csetdev-20261125, tag ufsm-pin-20261125b). That is ff7f174 plus two parts:
+  - jitorder's three mcudahw commits: MCUDA_PRECOMPILE compiles the largest kernels first; one process compiles a given kernel
+    text (PATH.lock); MCUDA_KLOG=FILE / MCUDA_PRECOMPILE_ONLY=@FILE, which `run_suite -J` needs for its selective warm-up.
+  - One compiler commit, device code only. Host .text of all 508 host units is byte-identical to the old pin.
+- Why: on sm_120, mcc's bwd_data_s2_mx2_k<4,4> took 1.65x nvcc 13.3's time. Its 32 x 8 unrolled guarded loads
+  (`k < bwy && ...`, `j < q4` with bw = mx_bw(C) in {8, 16, 32}) were tested 8 times per k, against nvcc's 3. Each test came
+  with 32 phi copies, and ptxas then duplicated the chain.
+- The compiler changes (each has an off switch):
+
+  | change | what it does | off switch |
+  |---|---|---|
+  | constant sets (ir.c) | an I32 made from selects / phis of constants and constant arithmetic (at most 8 values): a compare with a constant is folded when decided, else rewritten as x >= t / x < t with t a member, so equal tests become one value | MCC_NOCSET |
+  | join threading (opt.c) | a successor with other predecessors takes over B's phis as new phis | MCC_NOJTJOIN |
+  | compare implication (opt.c) | a branch on x OP c1 decides x OP c2 (interval check) | MCC_NOJTCMP |
+  | partial threading (opt.c) | a predecessor that decides B jumps straight past it; B stays for the others; loop heads excluded; B's values also wanted below are moved to its dominator | MCC_NOJTP |
+
+  - Two latent ptx.c reads of a phi's xargs index as a value (xrem_mark, range_fold) are fixed. They crashed once threading
+    made phis with many arguments.
+
+- sm_120, desk card 0, exclusive (13:10, the fixture ink net P 448, 3 steps; 3 alternating runs per build, spread < 1 %), ms per run:
+
+  | kernel | pin ff7f174 | 01873d0 | nvcc 13.3 | new / pin |
+  |---|---|---|---|---|
+  | bwd_data_s2_mx2<4,4> | 140.5 | 101.2 | 85.1 | 0.72 |
+  | conv_fwd_f8s | 327 | 318 | 305 | 0.97 |
+  | conv_fwd_f4p<1,4> | 355 | 349 | 286 | 0.98 |
+  | up2_mx_tile | 32.0 | 30.1 | 25.1 | 0.94 |
+  | conv_fwd_f4u<4> | 126 | 128.6 | 99.8 | 1.02 |
+  | all network kernels (k_entropy excluded) | 1846 | 1781 | 1662 | 0.965 |
+
+  k_entropy per launch is unchanged. Every other kernel is 0.99-1.01x.
+- Earlier the same day (desk card 1, same net), mcc ff7f174 was already ahead of nvcc on conv_fwd_f4r (0.97x), conv_bwd_w_f4ws
+  (0.91x) and k_entropy (0.94x). ff7f174's static spill bytes on f4r cost no time.
+- What is left vs nvcc is f4p<1,4> (1.22x), f4u (1.29x), bwd_data_s2 (1.19x) and gy_pre4 (1.17x).
+  - f4p is instruction-bound in every build (issue slots 64-69 %, ncu). mcc executes 6.5 G instructions against nvcc's
+    5.8 G, and 0.39 G of the difference are MOVs: a 32-register move of the accumulators into the epilogue's join, done on 4
+    paths, plus the stochastic-rounding epilogue. This is the next target.
+  - ncu reports: /vesuvius/ufsm/microc/deskab/ncu0.
+- bwd_data_s2: mcuda's per-row bound (branch s2kn-20261125, kn = min(bwy, Co - yb bwy)) lets the partial threading end the
+  k chain at the first miss. bench_f4conv P 448 (card 0, 18:00), bdata s2 down0 8 -> 16 ms:
+
+  | | base | kn |
+  |---|---|---|
+  | pin ff7f174 | 58.3 | 56.1 |
+  | 01873d0 | 40.7 | 40.3 |
+  | nvcc 13.3 | | 31.5 |
+
+  All six hashes are equal (8ca2c659f1c6798a). 16 -> 16 is the same in every arm (5.99-6.01 ms; nvcc 5.86).
+- Production shapes (card 0, 17:53, mcuda's R11e fixture r11p.argv: R11P widths 32..224, P 448, nsys steps 12-14, one run per
+  arm): the 77 kernels matched in all arms sum to 3640 ms (pin), 3722 (01873d0), 3670 (f4pdev) and 3778 (nvcc). nvcc / mcc is
+  1.038: on R11 widths mcc is already ahead. The mcc arms are within one run's noise of each other. bench_f4conv R11 cases (ms):
+
+  | case | pin | 01873d0 | nvcc |
+  |---|---|---|---|
+  | fwd 32 -> 32 (gn+silu, stats) | 33.6 | 34.0 | 39.8 |
+  | bdata 32 -> 32 (mx4, SR) | 27.7 | 28.3 | 26.7 |
+  | wgrad 32 -> 32 (gn+silu, SR) | 56.0 | 56.0 | 58.3 |
+  | bdata s2 down0 32 -> 32 (mx8 / mx4) | 36.8 / 14.6 | 37.3 / 14.6 | 30.7 / 14.3 |
+
+  The 8-wide gaps (f4p, bwd_s2 8 -> 16) are absent at R11 widths. Production kernels still behind nvcc: conv1_bwd_fused<4,4,16>
+  (1.32x, 83 vs 64 ms over 3 steps), bdata s2 32 -> 32 mx8 (1.20x), gy_pre4<32,4> (1.09x).
+- Checks:
+  - arch86 fast tier on the 3070 pod: 384 PASS, 0 FAIL. test_pipeline_cli timed out on a cold JIT cache in the full run and
+    passed on rerun.
+  - ufsm builds fully on sm_120.
+  - sm_120 GPU half, pod 1 (podink):
+    - cold-cache tier: 224 PASS, 0 FAIL;
+    - two processes precompiling into one fresh cache: 2363 cubins, no duplicates, no stale locks. 2392 kernels were seen;
+      the 29 not compiled are left to the driver's cache (job_whole), by design;
+    - -J 4 tier: 225 PASS;
+    - mccpin2d, the tests touched by the master merge (incl. kn, on 01873d0): 225 PASS, 0 FAIL.
+- nn_core.cu: nvcc toolkits before 13.1 have no cudaMemcpyWithAttributesAsync (the 13.0 pods' llvm builds). UFSM_AUX_CE=1 then
+  falls back to the plain copy with a DEFAULTED line (as when the call fails at run time), so the pods build master unpatched.
+- Scripts in /vesuvius/ufsm/microc/deskab:
+  - gap0d.sh / x0.sh / y0.sh: card 0 behind inkperf's hold, nsys A/B, ncu.
+  - sassx.sh / sass120d.sh / kres2.sh: offline sm_120a SASS of a unit or a modified copy, mcc vs nvcc.
+  - hostcmp.sh: host .text compare.
+
+## Clean ink benchmark rescore (PICKS2) and fine nets on upsampled coarse scans (2026-11-25, inksdk)
+
+**PICKS2** (pre-registered in /vesuvius/ufsm/inksdk/clean/PICKS2.txt, settings from the dev crops only, each new row scored once on clean
+PHerc1447 (28 crops) / PHerc0841 (8)). Scorer fixes, not model changes: the 2-D readers ran on each crop's own tifxyz, so their 384 px tiles
+saw zero padding at the crop edges; now ink-ext runs on the source segment grown by ~4.9 mm (`--grid-crop`, `--canvas-crop` back to the
+crop; KCTX 0 reproduces the old maps byte for byte). TTA: `ink-ext --tta-views 8 --tta-fuse median` (dev: +0.0063 +- 0.0026 mean4 over 1
+view; trim / logit = median; 16 views = 8). The voxel nets have no gn_ema, so each window normalises with its own statistics and the
+output depends on window placement (half-stride shift: up to 142 LSB, AUC up to 0.4 on single crops); halo 64 at window 288 dropped the
+small group (-0.14 +- 0.06), so the voxel rows got `predict --tta 8` at the old window / halo instead (rule V). Voxel rows ran on pod 1
+(master 85a26781, 12 GB cap; R1-62000-l1-h64-t8 at window 544: 10755 s).
+
+| row | 1447 | delta vs old | 0841 | delta vs old |
+|---|---|---|---|---|
+| reader3-ctx-m8 (production candidate) | .7709 | +.007 +- .009 | .8908 | +.011 +- .013 |
+| reader3-ctx | .7635 | -.000 +- .008 | .8908 | +.011 +- .014 |
+| ink9um-ctx-m8 | .6495 | +.030 +- .019 | .8313 | +.092 +- .061 |
+| E0-t8 (9.6 um voxel net) | .6872 | +.042 +- .011 | .8521 | +.030 +- .011 |
+| R1E-avg22-30-t288-t8 | .6576 | +.030 +- .014 | .7872 | -.060 +- .021 |
+| R1-62000-l1-h64-t8 | .5815 | +.026 +- .017 | .9073 | +.013 +- .006 |
+
+reader3 stays the best reader on 1447 (E0-t8 -0.084); on 0841 R1-62000-h64-t8 leads. Next (PICKS3, pre-registered): E2D2 = E0's recipe on
+sources-DEV2 (0009B / 0500P2 iso fixes, 0009B 2.4 um axis), and reader3-ctx-m8 on lossless CT (pullct's dev A/B: q8 costs reader3 ~0.007).
+
+**Fine nets on upsampled coarse scans** (user: how much ink signal do the fine-resolution nets give on 8 / 9 um scans upsampled to their
+rung?). `ct-resample --mode cubic` (separable Catmull-Rom) and `--axis IN OUT` (9ee43408; both modes byte-exact vs numpy); per dev crop the
+mesh is scaled with the resampler's centre convention, only the 256-tiles it touches are resampled and predicted (`mesh-tiles`,
+`predict --tile-list --shard 256`, the native rows' window grid), rendered back at the crop's pixel grid (CT render check: corr 0.9997 vs
+native). Dev 99 + h116 48 crops, paired mean4:
+
+| arm | crop mean | vs the same net on the coarse scan | vs E0 | vs reader3 |
+|---|---|---|---|---|
+| R1-62000 (4.8 um) at 4.32 um (x2) | .7465 | -.051 +- .024 | -.133 +- .025 | |
+| R24-avg22-30 (2.4 um) at 2.4 um (x3.6) | .7026 | +.074 +- .022 | -.154 +- .018 | -.173 +- .019 |
+| R1 x2 cubic vs linear | | | | -.003 +- .019 (cubic - linear) |
+
+Twin control (PHerc0139 40 + 0814 1 crops; the 9.36 um crop meshes carried to the registered 2.4 um scan by `reg tifxyz --c2f`, CT check
+corr 0.956): on the native fine scan R1 .919 / R24 .875 (reader3 .850, E0 .788 on the same crops); on the upsampled 9.36 um scan .783 /
+.694: the fine scan's gain does not survive upsampling (R24 survival vs E0 -1.07). Caveat: 0139 / 0814 at 2.4 um are in R24 / R1's
+teacher-label training sources. Upsampling adds no usable information; no downsample-then-upsample fine-tune.
 
 ## Fibre ties in count-field: AFV ties help P4 (+0.04), our own 1667 tracer ties hurt (-0.03); PAUSED (2026-11-19..25, mergeflag)
 
