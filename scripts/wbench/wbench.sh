@@ -40,7 +40,10 @@ NFAIL=0; FAILED=""; nfail() { NFAIL=$((NFAIL + 1)); FAILED="${FAILED:+$FAILED }$
 LK=; [ -z "${NOLOCK:-}" ] && [ -n "${LOCK:-}" ] && [ "${CPU:-0}" != 1 ] && LK=$LOCK
 # through the gpuq priority queue (scripts/gpuq.sh; PRIO bg by default: at every box / slab step it lets waiting jobs in, a "now"
 # check first); plain flock users of the same lock stay excluded
-GQ=$H/gpuq.sh; [ -e $GQ ] || GQ=$H/../gpuq.sh; GPUQ_LOCK=$LOCK; . $GQ
+GQ=$H/gpuq.sh; [ -e $GQ ] || GQ=$H/../gpuq.sh
+# (11-26: a copy of this directory without scripts/gpuq.sh ran every box with "gpuq_yield: command not found": the queue silently off)
+[ -e $GQ ] || { echo "wbench: no gpuq.sh beside $H or in its parent (copy scripts/gpuq.sh next to wbench.sh)"; exit 2; }
+GPUQ_LOCK=$LOCK; . $GQ
 # The desk's shared GPU locks too (lead 11-17: the wbench lock alone let fit --gpu N run through other agents' exclusive timing
 # windows): per GPU step flock -s /tmp/ufsm-suite-locks/gpu<N>.excl, then -s /vesuvius/ufsm/opt/gpu<N>.lock (trainers hold it exclusively)
 # (run_suite's shared lock; bench bursts take it exclusively), released at every box boundary like the wbench lock. DLOCKS overrides

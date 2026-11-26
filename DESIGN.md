@@ -6,6 +6,50 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## g256 dense-64 distilled into try9 (--distill 64, level 3): null at 4000 steps, but the targets covered only 1.3 % of head cells (2026-11-26, dinovol)
+
+The question: does a cosine side-head loss against upstream dinovol g256's dense-64 features (train --distill) improve try9's winding
+fields? This is a control-paired pair on desk card 1, master 0935f899 (mcc ff7f174). Both arms init from try9cool/cooled-33333 and use
+try9cool's argv (P 768, accum 10, NorMuon, per-window EMA, --gpu-aug 3, echo 4), seed 3, WSD warmup 200, cooldown 0.2, and
+--init-lr-mult 0.3 for 2000 steps. Sources are sources-scratch1-ph80-ho restricted to 1667-gt / A48 / B48, 0139-gt and 0500P2-gt, with
+the 11-14 holdouts masked. Paris 4 and Paris 4 July are not in the sources, so all their boxes are held-out scrolls. The CT decode ran
+on the CPU, because try9's full-precision mode does not fit beside the 1.6 GB of decode buffers on the 16 GB card.
+- 4000 steps is HALF the planned 8000: at 0.19-0.22 samp/s one arm took ~5 h (lead 11-25: option b). A null here is weaker evidence.
+- dst = ctl + --distill 64 --distill-level 3 --distill-weight 0.3. The targets are g256 dense-64 at stride 8 (dinovol-embed --tile 256
+  --margin 16 --ramp 16, pod, ~22 Mvox/s). They cover the occupied 416^3 label blocks of 1667 (72 Gvox at 9.6 um), 0139 (117 Gvox) and
+  0500P2 (4 Gvox). Stores: /vesuvius/ufsm/dinovol/distill/emb.
+- Two fixes were needed first (master 5b2fb535). --distill no longer disables the device label warp: its targets are mapped on the host
+  through the window's own symmetry / warp, and the targets of echoes / replays are cleared. lp_conv1_fwd_mx's shared-memory cap went
+  from 32 to 48 KB, because the distill head's 16-output passes on the 448-channel level 3 need 35 KB.
+- Distill loss (weight x mean 1 - cos): 0.236 at step 50, 0.213 at 850, 0.242 at 1650, 0.226 at 2400, 0.206 at 3200. So 1 - cos fell
+  only from ~0.79 to ~0.69, over **1.2-1.4 % of the head cells**. The stores are correct where they exist (cells nonzero in a read-back
+  = the CT's own nonzero share in that box, 2.6 % vs 2.1 %). Masked CT zeroes the air, and the dense outputs of blocks without one
+  nonzero voxel are zero vectors (no target). Why the training windows see so few target cells is not yet explained.
+
+Paired per box, dst - ctl (SE = sd / sqrt n). wbench ran with fields kept (dvd-{ctl,dst}-{core,holdout}), no slabs:
+
+| set | metric | n | ctl | dst | dst - ctl | SE | boxes up |
+|---|---|---|---|---|---|---|---|
+| core | ids | 44 | 0.5005 | 0.5142 | +0.0137 | 0.0144 | 21 |
+| core | p05x | 44 | 0.6503 | 0.6510 | +0.0007 | 0.0074 | 26 |
+| holdout | ids | 45 | 0.6501 | 0.6390 | -0.0111 | 0.0049 | 21 |
+| holdout | p05x | 45 | 0.6576 | 0.6543 | -0.0032 | 0.0016 | 17 |
+
+merge-flag --eval on each arm's fields (the 57 t9 boxes, logistic AUC per split: held-out, its two per-scroll lines, P4 -> rest,
+rest -> P4): ctl 0.947 / 0.950 / 0.890 / 0.895 / 0.954, dst 0.944 / 0.947 / 0.893 / 0.899 / 0.952. sp9 alone: 0.766 -> 0.755.
+The phase picks the right sheet in sheet-pair triplets (merge-flag --sheet-pairs: the same GT triplets for both arms), ctl / dst, by gap
+0-50 / 50-100 / 100-200 / 200+ um:
+
+| scroll | ctl | dst |
+|---|---|---|
+| 1667 (in sample) | .851 / .933 / .973 / .981 | .855 / .930 / .971 / .980 |
+| Paris 4 (held out) | .957 / .843 / .718 / .649 | .923 / .857 / .718 / .626 |
+| Paris 4 July (held out) | .613 / .761 / .837 / .869 | .619 / .758 / .841 / .865 |
+
+Result: no gain anywhere. The holdout ids are slightly worse (-0.011, ~2 SE) and nothing else moves outside its noise. With 1.3 % target
+coverage and 4000 steps, this tested a very weak distill signal; it does not rule out distillation itself. The 8000-step ctl stopped at
+step 290 is in runs/old8k. Data: /vesuvius/ufsm/dinovol/distill/{runs,score}, wbench res dvd-*.
+
 ## Pods decode CT on the CPU (--ct-gpu-decode -1) by default: a 300-step A/B on R11P ties, and gpudec gets starved (2026-11-26, podink)
 
 Before R11P2 (R11P resumed 12000 -> 24000), pod 1 ran R11P's argv for 300 steps per arm. Both arms used `--init-from` snap/12000 and
