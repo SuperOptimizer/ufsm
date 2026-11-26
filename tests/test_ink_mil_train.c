@@ -356,6 +356,10 @@ int main(int argc, char **argv) {
             if (f) fclose(f); }
         CHECK(!sh("%s ssl-probe fit %s/f.probe %s/f0.dvf > %s/sfit.log 2>&1 && awk '/train AUC/ {a = $NF} END {exit !(a > 0.5)}' %s/sfit.log", U, d, d, d, d),
               "ssl-probe fit on the fixture's features (%s/sfit.log)", d);
+        /* (11-26) a file list: every file read (strtok inside dvf_read once cut the list to its first file) */
+        CHECK(!sh("%s ssl-probe fit %s/f2.probe %s/f0.dvf,%s/f1.dvf > %s/sfit2.log 2>&1 && grep -Eq 'fit: [0-9]+ rows over 2 crops' %s/sfit2.log && "
+                  "[ $(grep -o '[0-9]* rows over' %s/sfit2.log | cut -d' ' -f1) = $((2 * $(grep -o '[0-9]* rows over' %s/sfit.log | cut -d' ' -f1))) ]", U, d, d, d, d, d, d, d),
+              "ssl-probe fit on two files reads both (%s/sfit2.log)", d);
     }
     if (getenv("TIMT_KEEP")) fprintf(stderr, "kept %s (sources %s/fx/sources-mil.json)\n", d, d);
     else if (!fails) sh("rm -rf %s", d);
