@@ -1,7 +1,7 @@
 /* The production unwrap head over z-slabs (train.c head_slab_pass): the 1^3 head from 32 MX-fp4 channels with GroupNorm + SiLU in
    staging to 11 fp16 logit planes per slab (lp_conv1_fwd_mx_h16_r), and the fused head backward (weight / bias gradient and the
    MX-fp4 input gradient with SR, lp_head_bwd_mx_r) from an fp16 logit gradient, over every slab of a P^3 window.
-   Usage: bench_head2 [P] [Z]   (default 512, 32 planes per slab; prints ms per window pass, the minimum over repetitions, and
+   Usage: bench_head2 [P] [Z] [Co]   (default 512, 32 planes per slab, 11 logits; prints ms per window pass, the minimum over repetitions, and
    checksums of the logits and of the outputs to compare kernel variants bit for bit) */
 #include "nn.h"
 #include "nn_lp.h"
@@ -15,7 +15,9 @@ static uint64_t rs = 88172645463325252ull;
 static double urand(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (rs >> 11) * 0x1.0p-53; }
 static uint64_t fnv(const uint8_t *p, size_t n, uint64_t h) { for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; } return h; }
 int main(int argc, char **argv) {
-    const int P = argc > 1 ? atoi(argv[1]) : 512, Z = argc > 2 ? atoi(argv[2]) : 32, Ci = 32, Co = 11, G = 8;
+    const int P = argc > 1 ? atoi(argv[1]) : 512, Z = argc > 2 ? atoi(argv[2]) : 32, Ci = 32, G = 8;
+    const int Co = argc > 3 ? atoi(argv[3]) : 11;   /* (11: the unwrap head, the CO = 11 kernel; other counts <= 16 run the CO = 16 one, as the ink heads) */
+    if (Co < 1 || Co > 16) { fprintf(stderr, "bench_head2: Co %d (1 .. 16)\n", Co); return 1; }
     if (nn_init(0)) return 1;
     nn_set_f16(1); nn_set_loss_grad_h16(1); nn_set_sr(1);
     const shape5 xs = {1, Ci, P, P, P}, ys = {1, Co, P, P, P};
@@ -34,7 +36,7 @@ int main(int argc, char **argv) {
         }
         nn_h2d(xq, all, xb); nn_free(xf); nn_free(tq); free(h); free(hq); free(all);
     }
-    float gam[32], bet[32], mean[8], rstd[8], w[11 * 32], bb[11];
+    float gam[32], bet[32], mean[8], rstd[8], w[16 * 32] = {0}, bb[16] = {0};
     for (int c = 0; c < Ci; c++) { gam[c] = 1.f + 0.1f * c / Ci; bet[c] = 0.05f * c / Ci; }
     for (int g = 0; g < G; g++) { mean[g] = 0.01f * g; rstd[g] = 1.f; }
     for (int i = 0; i < Co * Ci; i++) w[i] = (float)(urand() - 0.5) * 0.5f;
@@ -69,7 +71,7 @@ int main(int argc, char **argv) {
     }
     const char *e = nn_check(); if (e) { printf("cuda: %s\n", e); return 1; }
     uint8_t *q = malloc(xb); nn_d2h(q, gx, xb);
-    float hgw[11 * 32], hgb[11]; nn_d2h(hgw, gw, sizeof hgw); nn_d2h(hgb, gb, sizeof hgb);
+    float hgw[16 * 32], hgb[16]; nn_d2h(hgw, gw, sizeof hgw); nn_d2h(hgb, gb, sizeof hgb);
     double a1 = 0; for (int i = 0; i < Co * Ci; i++) a1 += fabs(hgw[i]);
     for (int i = 0; i < Co; i++) a1 += fabs(hgb[i]);
     printf("checksums: logits fnv %016llx | gx fnv %016llx | |gw| + |gb| %.9g\n", (unsigned long long)hl, (unsigned long long)fnv(q, xb, 1469598103934665603ull), a1);
