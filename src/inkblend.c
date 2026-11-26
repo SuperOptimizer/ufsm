@@ -141,12 +141,27 @@ int cmd_ink_blend(int argc, char **argv) {
 typedef struct {
     int n, S, B; z3 **zz; const char *const *in; const double *st; const double (*g)[3]; const int64_t (*org)[3]; z3w *w;
     int64_t ish[32][3], shd[32][3], pn[32][3]; uint8_t *pm[32];   /* per input: shape, shard edge, shard grid, presence map */
-    const int64_t *job; long nj; int inner; double t0;
+    const int64_t *job; long nj; int inner; double t0; const ink_blend_region *R;   /* R: predict --seamless 2's region (ink_blend_set_region) */
     atomic_long next, done; atomic_llong nlive, nblk; atomic_int err; char msg[512]; pthread_mutex_t mu;
 } ib_ctx;
 static int ib_present(const ib_ctx *C, int i, int64_t a, int64_t b, int64_t c) {
     if (a < 0 || b < 0 || c < 0 || a >= C->pn[i][0] || b >= C->pn[i][1] || c >= C->pn[i][2]) return 0;
     return C->pm[i][(size_t)((a * C->pn[i][1] + b) * C->pn[i][2] + c)];
+}
+static int ib_tl_cmp(const void *a, const void *b) { const long long *x = a, *y = b; for (int d = 0; d < 3; d++) if (x[d] != y[d]) return x[d] < y[d] ? -1 : 1; return 0; }
+static ink_blend_region *g_ib_reg;   /* (mgpu: main; set by predict --seamless for its next blend, taken and cleared by ink_blend_run) */
+void ink_blend_set_region(ink_blend_region *r) { if (r && r->ntl) qsort(r->tl, (size_t)r->ntl, 3 * sizeof *r->tl, ib_tl_cmp); g_ib_reg = r; }
+/* block [v, v + B) of the output inside the region: in the box and meeting a listed tile (as predict's pred_tile_keep keeps a shard) */
+static int ib_reg_keep(const ink_blend_region *R, const int64_t v[3], int B) {
+    int64_t t0[3], t1[3];
+    for (int d = 0; d < 3; d++) {
+        if (v[d] + B <= R->lo[d] || v[d] >= R->hi[d]) return 0;
+        if (R->ntl) { const int64_t a = v[d] - R->tlo[d], b = v[d] + B - 1 - R->tlo[d]; t0[d] = a >= 0 ? a / R->tls : -((-a + R->tls - 1) / R->tls); t1[d] = b >= 0 ? b / R->tls : -((-b + R->tls - 1) / R->tls); }
+    }
+    if (!R->ntl) return 1;
+    for (long long z = t0[0]; z <= t1[0]; z++) for (long long y = t0[1]; y <= t1[1]; y++) for (long long x = t0[2]; x <= t1[2]; x++) {
+        const long long k[3] = {z, y, x}; if (bsearch(k, R->tl, (size_t)R->ntl, 3 * sizeof *R->tl, ib_tl_cmp)) return 1; }
+    return 0;
 }
 static void ib_fail(ib_ctx *C, const char *m) {
     pthread_mutex_lock(&C->mu); if (!atomic_load(&C->err)) snprintf(C->msg, sizeof C->msg, "%s", m); atomic_store(&C->err, 1); pthread_mutex_unlock(&C->mu);
@@ -162,10 +177,14 @@ static void *ib_worker(void *arg) {
         long long live = 0; char em[512];
         for (int q = 0; q < nb3; q++) {   /* each block's inputs present (aligned: a block lies inside one input shard, present or absent whole) */
             const int bz = q / (nb * nb), by = q / nb % nb, bx = q % nb; int np = 0;
+            const int64_t v[3] = {o[0] + (int64_t)bz * B, o[1] + (int64_t)by * B, o[2] + (int64_t)bx * B};
+            const int kept = !C->R || ib_reg_keep(C->R, v, B);
             for (int i = 0; i < n; i++) {
-                int in = 1; int64_t q3[3];
-                for (int d = 0; d < 3; d++) { const int64_t l = o[d] + (int64_t)(d ? d == 1 ? by : bx : bz) * B - C->org[i][d]; if (l < 0 || l >= C->ish[i][d]) in = 0; q3[d] = l >= 0 ? l / C->shd[i][d] : 0; }
-                bpres[(size_t)q * n + i] = in && ib_present(C, i, q3[0], q3[1], q3[2]); np += bpres[(size_t)q * n + i];
+                int in = kept; int64_t q3[3];
+                for (int d = 0; d < 3; d++) { const int64_t l = v[d] - C->org[i][d]; if (l < 0 || l >= C->ish[i][d]) in = 0; q3[d] = l >= 0 ? l / C->shd[i][d] : 0;
+                    if (C->R && (v[d] < C->R->plo[i][d] || v[d] >= C->R->phi[i][d])) in = 0; }
+                /* (region: inside the input's computed box an absent shard is its zeros, z3_read's fill) */
+                bpres[(size_t)q * n + i] = in && (C->R || ib_present(C, i, q3[0], q3[1], q3[2])); np += bpres[(size_t)q * n + i];
             }
             live += np > 0;
         }
@@ -230,14 +249,18 @@ int ink_blend_run(const char *out, double um, const double st[3], int n, const c
        whole-shard reads stay.) UFSM_IB_BLOCK=0: the voxel masks. */
     int B = S;
     for (int i = 0; i < n; i++) { const z3_meta *m = z3_meta_of(zz[i]); for (int d = 0; d < 3; d++) if (m->shard[d] < B) B = (int)m->shard[d]; }
-    { int ok = B >= 16 && B < S && S % B == 0 && !(getenv("UFSM_IB_BLOCK") && !atoi(getenv("UFSM_IB_BLOCK")));
+    /* --seamless 2's region (ink_blend_set_region) works on blocks, also B = S (one block per output shard) */
+    ink_blend_region *R = g_ib_reg; g_ib_reg = nullptr; if (R && n > 2) R = nullptr;
+    { int ok = B >= 16 && (B < S || R) && S % B == 0 && !(getenv("UFSM_IB_BLOCK") && !atoi(getenv("UFSM_IB_BLOCK")));
       for (int i = 0; i < n && ok; i++) { const z3_meta *m = z3_meta_of(zz[i]); for (int d = 0; d < 3; d++) if (m->shard[d] % B || org[i][d] % B) ok = 0; }
       if (!ok) B = 0; }
+    if (R && !B) { fprintf(stderr, "DEFAULTED: ink-blend: the --seamless region needs block mode (input shards and origins on one grid dividing --shard): "
+                                   "blended without it (pass-b margins beyond the box / tile list kept, absent shards weight 0)\n"); R = nullptr; }
     /* shard presence once per input (perf 11-25, inkperf R11d HOLD: a seamless tile-list blend walked ~70 k output shards asking
        z3_shard_present per input shard, an index open each, > 82 s on one thread with the GPU idle): z3_shard_map lists a local store's
        shard files, then the output shards with any input are blended by up to --threads workers, one shard each (same bytes: the
        per-voxel arithmetic does not depend on the split) */
-    ib_ctx C = {.n = n, .S = S, .B = B, .zz = zz, .in = in, .st = st, .g = g, .org = org, .w = w, .mu = PTHREAD_MUTEX_INITIALIZER};
+    ib_ctx C = {.n = n, .S = S, .B = B, .zz = zz, .in = in, .st = st, .g = g, .org = org, .w = w, .mu = PTHREAD_MUTEX_INITIALIZER, .R = R};
     for (int i = 0; i < n; i++) {
         for (int d = 0; d < 3; d++) { C.ish[i][d] = ish[i][d]; C.shd[i][d] = z3_meta_of(zz[i])->shard[d]; }
         if (z3_shard_map(zz[i], C.pn[i], &C.pm[i]) < 0) { fprintf(stderr, "ink-blend: shard map of %s: %s\n", in[i], z3_error()); return 1; }

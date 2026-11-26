@@ -213,6 +213,33 @@ int predict_seamless(int argc, char **argv) {
         if (need_b) { const pid_t b = spawn_pass(argc, argv, pb, W, H, S2, S2, gb, lb); if (b < 0) return 1; if ((rc = wait_pass(b, "b", lb))) goto fail; fclose(fopen(db, "w")); }
     }
     if (rc) goto fail;
+    /* the blend's region (perf 11-26, PHerc1203 r24 ink-seam off256 9.32 vs off0 0.25): a pass writes every shard of a window it
+       computes, so pass b's windows (straddling 2^3 tiles of pass a) filled shards beyond the --tile-list and S / 2 below the --box
+       with pass b alone, its own seams unblended there (inside the tiles: 0.1 - 0.5 at both offsets); and a pass's all-zero shard is
+       not written, so its zeros got weight 0 instead of their sin^2 weight. The blend keeps the user's box (on the S / 2 shards) and
+       tiles only, each pass counted inside its own box with absent shards as zeros (ink_blend_set_region) */
+    ink_blend_region reg = {0};
+    for (int d = 0; d < 3; d++) {
+        reg.lo[d] = g_lo[d] > 0 ? g_lo[d] / S2 * S2 : 0; reg.hi[d] = (g_hi[d] + S2 - 1) / S2 * S2;
+        for (int p = 0; p < 2; p++) {
+            long long lo = g_lo[d] - p * S2; lo = (lo >= 0 ? lo / S : -((-lo + S - 1) / S)) * S + p * S2; if (lo < 0) lo = p * S2;   /* pass_box */
+            reg.plo[p][d] = lo; reg.phi[p][d] = reg.hi[d];
+        }
+    }
+    { const char *tlf = sopt(argc, argv, "--tile-list", nullptr);
+      if (tlf) {
+          long long tlo[3] = {0, 0, 0}; const char *to = sopt(argc, argv, "--tile-list-origin", "0,0,0");
+          if (sscanf(to, "%lld,%lld,%lld", &tlo[0], &tlo[1], &tlo[2]) != 3) { fprintf(stderr, "predict --seamless: --tile-list-origin z,y,x\n"); return 2; }
+          reg.tls = opt_atoi("--tile-list-size", sopt(argc, argv, "--tile-list-size", "512")); for (int d = 0; d < 3; d++) reg.tlo[d] = tlo[d];
+          FILE *f = fopen(tlf, "r"); long cap = 0; long long a, b, c;
+          if (!f || reg.tls <= 0) { fprintf(stderr, "predict --seamless: cannot read --tile-list %s\n", tlf); if (f) fclose(f); return 1; }
+          while (fscanf(f, "%lld %lld %lld", &a, &b, &c) == 3) {
+              if (reg.ntl == cap) { cap = cap ? 2 * cap : 1024; long long *t = realloc(reg.tl, (size_t)cap * 3 * sizeof *t); if (!t) { fclose(f); free(reg.tl); return 1; } reg.tl = t; }
+              reg.tl[3 * reg.ntl] = a; reg.tl[3 * reg.ntl + 1] = b; reg.tl[3 * reg.ntl + 2] = c; reg.ntl++;
+          }
+          fclose(f);
+          if (!reg.ntl) { fprintf(stderr, "predict --seamless: --tile-list %s has no tiles\n", tlf); return 1; }
+      } }
     seam_store st[64]; const int ns = find_stores(pa, "", 0, st, 0, 64);
     if (!ns) { fprintf(stderr, "predict --seamless: pass a wrote no store under %s\n", pa); return 1; }
     for (int k = 0; k < ns; k++) {
@@ -228,8 +255,10 @@ int predict_seamless(int argc, char **argv) {
         const double tl[3] = {S, S, S}, g[2][3] = {{0, 0, 0}, {S2, S2, S2}}; const int64_t org[2][3] = {{0, 0, 0}, {0, 0, 0}};
         const char *in[2] = {ia, ib};
         fprintf(stderr, "predict --seamless: blend %s (%s um)\n", *r ? r : "(the output)", st[k].lv);
+        ink_blend_set_region(&reg);
         if (ink_blend_run(o, atof(st[k].lv), tl, 2, in, g, org, nlev, shard, q, nt, attrs)) { fprintf(stderr, "predict --seamless: blend of %s failed (passes kept in %s)\n", *r ? r : "the output", tmp); return 1; }
     }
+    free(reg.tl);
     if (!getenv("UFSM_SEAM_KEEP") || !atoi(getenv("UFSM_SEAM_KEEP"))) rm_rf(tmp);
     fprintf(stderr, "predict --seamless: %d store%s written under %s\n", ns, ns == 1 ? "" : "s", out);
     return 0;

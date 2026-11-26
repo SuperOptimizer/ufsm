@@ -6,6 +6,29 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## predict --seamless 2: the offset-256 "seams" were pass b alone beyond the box / tile list; the blend now keeps the region (2026-11-26, perf)
+
+PHerc1203 r24 reads (R11P-12000, window 576 halo 32, tile list of 512): ink-seam off0 0.25 but off256 9.32 (plain read 17.7). The
+blend weights were right; the per-corner lines are bimodal: corners inside listed tiles 0.1 - 0.5, corners in unlisted tiles 15 - 58.
+Cause: predict writes every shard of a window it computes (one window per 2^3 pass shards). Pass a's windows are the tiles; pass b's
+(grid 256) straddle 2^3 tiles, so they also wrote shards of unlisted tiles, and S / 2 below a --box (its box starts there), with pass
+b alone: its window borders unblended. A second, latent case: a pass writes no all-zero shard, and the blend gave an absent shard
+weight 0, so a region one pass predicted as 0 came from the other pass alone.
+
+Fix: `ink_blend_set_region` (src/inkblend.c, block mode, also one block per output shard): predict --seamless gives the blend the user's
+box (on the S / 2 shards), the tile list and each pass's computed box; blocks outside the region are 0, inside it each pass counts
+wherever its box holds the block, an absent shard read as zeros. `--seam-inproc` no longer writes shards outside the tile list / air
+(grid 1 alone). Inside the region the bytes are the old blend's wherever both passes wrote the shard.
+
+| inksdk's w228 box 1024^3 (passes kept, re-blended) | off0 | off256 |
+|---|---|---|
+| 1ea22456 blend | 0.07 (3 corners) | 10.13 (10 corners, 6 of them in pass b's margin: 15 - 43) |
+| region blend | no corner in the box | 0.21 (the 4 corners inside the box; the margin is gone) |
+
+Test: tests/test_seamless_region.py (no GPU): a stand-in pass writes a smooth field + a per-window offset with predict's window / shard
+rules; box, tile-list and all-zero-shard cases; ink-seam at both offsets < 1 (the 1ea22456 blend: corners at 128 jump 30 - 135).
+test_seamless.py: below pass b's box (z, y or x < S / 2) the stand-in's pass-b voxels no longer count.
+
 ## R11P HOLD rows: 12k is the 1.1 um pick, the 24k resume regresses, windows 768-1024 win; ssl-probe on frozen features (2026-11-26, inkperf)
 
 Record of the 11-25 / 11-26 scoring. The predict volumes and the pair / podsweep scripts were deleted for disk on 11-26; the recipe is below.
