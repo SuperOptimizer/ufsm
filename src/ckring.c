@@ -56,10 +56,13 @@ static int list_steps(const char *dir, long **steps) {
 }
 
 /* train --ink-surf: SRC.isf (the surface head) follows its checkpoint into the ring / snapshots */
-static void ck_side(const char *src, const char *dst, int allow_copy) {
-    char a[4200], b[4300]; snprintf(a, sizeof a, "%s.isf", src); snprintf(b, sizeof b, "%s.isf", dst);
-    if (access(a, F_OK)) return;
-    if (ck_clone(a, b, allow_copy) < 0) fprintf(stderr, "ckring: cannot copy %s to %s\n", a, b);
+static void ck_side(const char *src, const char *dst, int allow_copy) {   /* (and train --ssl-proto's SRC.sslp, the prototypes) */
+    static const char *const ext[2] = {"isf", "sslp"};
+    for (int k = 0; k < 2; k++) {
+        char a[4200], b[4300]; snprintf(a, sizeof a, "%s.%s", src, ext[k]); snprintf(b, sizeof b, "%s.%s", dst, ext[k]);
+        if (access(a, F_OK)) continue;
+        if (ck_clone(a, b, allow_copy) < 0) fprintf(stderr, "ckring: cannot copy %s to %s\n", a, b);
+    }
 }
 int ck_prune(const char *dir, int keep_last, int keep_every) {
     long *st; const int n = list_steps(dir, &st); int del = 0, kept = 0;
@@ -69,6 +72,7 @@ int ck_prune(const char *dir, int keep_last, int keep_every) {
         char p[4200]; snprintf(p, sizeof p, "%s/%ld.ckpt", dir, st[i]);
         if (!unlink(p)) del++;
         snprintf(p, sizeof p, "%s/%ld.ckpt.isf", dir, st[i]); unlink(p);   /* (train --ink-surf's head beside it, if any) */
+        snprintf(p, sizeof p, "%s/%ld.ckpt.sslp", dir, st[i]); unlink(p);
     }
     free(st); return del;
 }

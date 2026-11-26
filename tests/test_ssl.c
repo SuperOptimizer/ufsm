@@ -272,9 +272,26 @@ static void test_views(void) {
     nn_free(dy); nn_free(dm); nn_free(dt); nn_free(dmu); free(y); free(ht); free(gt); free(mu); free(map); free(rs); free(rw); free(rt);
 }
 
+/* (6) --ssl-proto's point selection: nn_ssl_compact keeps the sampled cells with a target in sample order; nn_ssl_tgather their unit rows */
+static void test_compact(void) {
+    const int C = 16, N = 500; const size_t S = 4096; int8_t *t = calloc((size_t)C * S, 1); int *idx = malloc(N * sizeof(int)), *want = malloc(N * sizeof(int)); int nw = 0;
+    for (size_t s2 = 0; s2 < S; s2++) if (ru() < 0.4) for (int c = 0; c < C; c++) t[(size_t)c * S + s2] = (int8_t)(lrint(rn() * 40) | 1);
+    for (int k = 0; k < N; k++) { idx[k] = (int)(((size_t)k * 2654435761u) % S); int any = 0; for (int c = 0; c < C; c++) any |= t[(size_t)c * S + idx[k]] != 0; if (any) want[nw++] = idx[k]; }
+    int8_t *dt = nn_malloc((size_t)C * S); int *di = nn_malloc(N * sizeof(int)), *dout = nn_malloc(N * sizeof(int)), *dn = nn_malloc(sizeof(int)); float *de = nn_malloc((size_t)N * C * 4);
+    nn_h2d(dt, t, (size_t)C * S); nn_h2d(di, idx, N * sizeof(int));
+    const int n = nn_ssl_compact(dt, C, S, di, N, dout, dn); int *got = malloc(N * sizeof(int)); nn_d2h(got, dout, (size_t)(n > 0 ? n : 1) * sizeof(int));
+    int bad = n != nw; for (int k = 0; k < n && k < nw; k++) bad += got[k] != want[k];
+    nn_ssl_tgather(dt, C, S, dout, n, de); float *e = malloc((size_t)N * C * 4); nn_sync(); nn_d2h(e, de, (size_t)(n > 0 ? n : 1) * C * 4); double worst = 0;
+    for (int k = 0; k < n && k < nw; k++) { double n2 = 0; for (int c = 0; c < C; c++) n2 += (double)t[(size_t)c * S + want[k]] * t[(size_t)c * S + want[k]];
+        for (int c = 0; c < C; c++) worst = fmax(worst, fabs(e[(size_t)k * C + c] - t[(size_t)c * S + want[k]] / sqrt(n2))); }
+    CHECK(!bad && n > 0 && worst < 1e-6, "ssl compact: %d kept (want %d), %d mismatches, unit rows worst %.2e", n, nw, bad, worst);
+    printf("ssl compact: %d of %d sampled cells kept, %d mismatches, unit rows worst %.2e\n", n, N, bad, worst);
+    nn_free(dt); nn_free(di); nn_free(dout); nn_free(dn); nn_free(de); free(t); free(idx); free(want); free(got); free(e);
+}
+
 int main(void) {
     if (nn_init(0)) return test_no_gpu("test_ssl", "nn_init(0) failed");
-    test_mask(2); test_mask(4); test_targets(); test_idx(); test_loss(); test_sslh(0.8f); test_sslh(1.2f); test_views();
+    test_mask(2); test_mask(4); test_targets(); test_idx(); test_loss(); test_sslh(0.8f); test_sslh(1.2f); test_views(); test_compact();
     if (fails) { printf("%d FAILED\n", fails); return 1; }
     printf("PASS\n"); return 0;
 }

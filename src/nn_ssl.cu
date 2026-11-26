@@ -86,6 +86,24 @@ extern "C" void nn_ssl2_targets(const float *y, int C, int cd, int ch, int cw, i
     k_ssl2_targets<<<nb_ssl((long long)S, 256), 256>>>(y, C, cd, ch, cw, cv, bv, ratio, seed, map, mu, t);
     SSL_CK();
 }
+/* --ssl-proto: the sampled cells with a target, in sample order (one thread: deterministic), and the teacher's unit rows of them */
+__global__ void k_ssl_compact(const int8_t *t, int C, size_t S, const int *idx, int N, int *out, int *n) {
+    int m = 0;
+    for (int k = 0; k < N; k++) { const size_t s = (size_t)idx[k]; int any = 0; for (int c = 0; c < C && !any; c++) any = t[(size_t)c * S + s] != 0; if (any) out[m++] = (int)s; }
+    *n = m;
+}
+extern "C" int nn_ssl_compact(const int8_t *t, int C, size_t S, const int *idx, int N, int *out, int *nd) {
+    k_ssl_compact<<<1, 1>>>(t, C, S, idx, N, out, nd); SSL_CK();
+    int n = 0; cudaMemcpy(&n, nd, sizeof n, cudaMemcpyDeviceToHost); return n;
+}
+__global__ void k_ssl_tgather(const int8_t *t, int C, size_t S, const int *idx, int N, float *e) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x; if (k >= N) return;
+    const size_t s = (size_t)idx[k]; double n2 = 0; for (int c = 0; c < C; c++) { const double v = t[(size_t)c * S + s]; n2 += v * v; }
+    const double inv = n2 > 0 ? 1.0 / sqrt(n2) : 0; for (int c = 0; c < C; c++) e[(size_t)k * C + c] = (float)(t[(size_t)c * S + s] * inv);
+}
+extern "C" void nn_ssl_tgather(const int8_t *t, int C, size_t S, const int *idx, int N, float *e) {
+    if (N > 0) k_ssl_tgather<<<nb_ssl(N, 256), 256>>>(t, C, S, idx, N, e); SSL_CK();
+}
 __global__ void k_ssl_idx(int *idx, int N, size_t S, size_t off, size_t stride) {
     const int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k < N) idx[k] = (int)((off + (unsigned __int128)k * stride) % S);

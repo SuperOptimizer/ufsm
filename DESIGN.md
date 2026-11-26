@@ -27,7 +27,10 @@ paired per crop (dev/pair.sh). Pass rule: mean4 (A − B) > 2 SE.
 - **Fails** at −3.2 SE: ssl hurt at this step budget; no clean (1447 / 0841) scoring, per the rule.
 - Known confound, pre-registered: A's ssl share 0.75 gave it about a quarter of B's supervised ink windows at the same step count. The test
   answers "ssl at a fixed step budget", not "ssl at a fixed supervised budget"; only 0172 moved the other way (+0.047, 1.7 SE).
-- Files: podink/dino2/score/{dev,h116}.tsv, score.log; snapshots podink/dino2/{run,runB}/snap/{4,8,12,16}000.ckpt.
+- **Post hoc (not pre-registered), matched supervised windows:** B's 4000 snapshot (about as many supervised ink windows as A-16000)
+  against A-16000, same crops and pairing: mean4 A − B = −0.0303 ± 0.0170 (−1.8 SE); 0139 −0.086, 0172 +0.023, 0343 −0.062,
+  0009B +0.004, small +0.070 (n 9). Dev AUC (mean of groups) B-4000 0.7066 vs A 0.6928; ssl is not better even at matched supervision.
+- Files: podink/dino2/score/{dev,h116}.tsv, score.log, score4k.log; snapshots podink/dino2/{run,runB}/snap/{4,8,12,16}000.ckpt.
 
 ## 41 tifxyz metas on 9.362 um scans get voxel_size_um (2026-11-26, inksdk)
 
@@ -66,6 +69,18 @@ the teacher's target only needs the two windows' radial records, so the sampler 
     and 0.013 for the teacher record. The map round trip is within 1.6e-6 voxels. The targets are byte-identical to the host's.
   - test_heads (10): a two-view fixture run gives finite ssl terms, a mapped share of 20-100 % and targeted shares of 5-90 %, with no
     DEFAULTED. The same run with --echo-max is refused.
+- **Prototype head (`--ssl-proto K`, an option; sslproto-20261126).** DINO on the side head's unit rows, at up to `--ssl-points` sampled
+  cells that carry a teacher target (`nn_ssl_compact`, deterministic in sample order). The teacher row is the int8 target as a unit
+  vector (`nn_ssl_tgather`). There are K prototypes; the teacher's are an EMA of the student's (`--ssl-proto-ema` 0.996). The teacher is
+  centred (momentum `--ssl-proto-center` 0.9) and sharpened (temperatures `--ssl-proto-ts` 0.1 / `-tt` 0.04).
+  - The loss is dn_dino (src/nn_dino.cu, tested in test_dino_loss) x --ssl-weight. The cosine term is still logged but trains nothing.
+  - The prototypes take an Adam step (`--ssl-proto-lr` 1e-3) and the centre is updated once per unlabelled window.
+  - Logs: "proto CE H batch-mean / per-cell of ln K (points)". An ALERT fires when batch-mean H < 0.25 ln K (few prototypes) or per-cell
+    H > 0.95 ln K (a uniform teacher).
+  - The sidecar RUN/<ckpt>.sslp follows the checkpoints, the ring and the snapshots; a resume without it prints DEFAULTED.
+  - Limits: --ssl 16 or 32 (dn_dino's widths) and one GPU (the prototypes are not all-reduced).
+  - Tests: test_ssl (6), compaction and unit rows against the host (0 mismatches, 3e-8). test_heads (11), a two-view proto fixture run
+    with entropies in (0, 1] and a resume from the sidecar.
 - **Gamma.** For D-dimensional unit rows the per-dimension std is at most 1/sqrt(D) (isotropic, zero mean), and that bound is v1's
   default gamma. The hinge therefore never switches off. For J1 v0 the setting is `--ssl 16 --ssl-level 2 --ssl-gamma 0.2` (0.8 of the
   maximum; the 11-12 fixture reached 0.88-0.96 of it), with `--ssl-block 16 --ssl-mask 0.5 --ssl-weight 0.5 --ssl-share 0.15`.

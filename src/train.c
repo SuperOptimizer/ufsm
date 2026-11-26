@@ -175,7 +175,9 @@ typedef struct {
     uint8_t *sslht; unsigned long long *sslhc, sslhch[32]; double *sslhs, sslhsh[2 * SSLH_MAX], sslh_loss[SSLH_MAX], ssl_heads_loss; size_t sslh_n[SSLH_MAX]; int sslh_on;   /* --ssl-heads: the teacher's
                                          per-cell targets [slot][cell] (255 none), targeted cells per slot, the student's BCE sums per head; per head its loss and targeted entries */
     int8_t *sslt; float *sslg, *ssle, *sslnrm, *sslge, *sslvo, sslvh[2]; double *sslds, *sslmu, sslh[2], ssl_loss, ssl_cells; int *sslidx, ssl_win, ssl_fresh; uint64_t ssl_rs, ssl_seed;
-    void *xtb[2], *radtb[2], *radth[2]; float *mapb[2], *maph[2]; scan_ct_rec *ssl2rec[2]; int ssl2b[2]; uint64_t ssl2_rs; double ssl2_cells;   /* --ssl-views 2: per slot the teacher view, its record, the student -> teacher cell map */
+    void *xtb[2], *radtb[2], *radth[2]; float *mapb[2], *maph[2]; scan_ct_rec *ssl2rec[2]; int ssl2b[2]; uint64_t ssl2_rs; double ssl2_cells;
+    float *pW, *pWt, *pWm, *pWv, *pgW, *pcen, *ptm, *pout, *pscr, *pe, *pnrm, *pt, *pgs, proto_h[4]; int *pidx, *pidx2, *pnd, pn; long pstep;   /* --ssl-proto: prototypes (student, teacher, Adam m / v, grad), centre, outputs */
+      /* --ssl-views 2: per slot the teacher view, its record, the student -> teacher cell map */
       /* --ssl: the teacher's int8 targets, the side head's fp32 gradient, the variance hinge's points (unit rows, norms, row gradient, out[0] loss / out[1] std), loss sums, channel means; whether this window is an unlabelled one, whether its terms ran; the mask generator */   /* --distill: feature targets (double-buffered), head gradient, loss sums (sum 1 - cos, cells) */
     uint8_t *rlow; void *rscr; size_t rscr_b; double *rst, rst_h[RP_NST]; float *rrd; restore_recipe rcp;   /* task restore: degraded input (uint8), degradation scratch,
                                                                                       loss sums (device / last fetched), the recipe of the next forward */
@@ -380,6 +382,7 @@ static ssl_heads g_sslh; static float g_sslh_w[SSLH_MAX]; static const char *g_s
                                          consistency of the output heads on the unlabelled windows' latent cells (ssl.h; DESIGN 2026-11-12) */
 static int g_ssl, g_ssl_lev = 1, g_ssl_bv = 16, g_ssl_npts = 65536; static float g_ssl_w = 0.5f, g_ssl_mask = 0.4f, g_ssl_var = 1.f, g_ssl_gamma, g_ssl_jit = 1.f; static size_t g_ssl_S;   /* --ssl D: masked self-distillation on "ct_only" windows (src/ssl.h): a D-channel side head on decoder level --ssl-level, cells of g_ssl_S per window */
 static int g_ssl_views = 1; static float g_ssl_vshift = 0.125f, g_ssl_vzoom = 1.25f;   /* mgpu: config. --ssl-views 2 (ssl.h): the teacher view a shift (fraction of P per axis) + zoom of the source cube */
+static int g_ssl_proto; static double g_ssl_lnk = 1; static float g_ssl_pts = 0.1f, g_ssl_ptt = 0.04f, g_ssl_pcm = 0.9f, g_ssl_plr = 1e-3f, g_ssl_pema = 0.996f;   /* mgpu: config. --ssl-proto K: DINO prototypes on the side head (ts / tt temperatures, centre momentum, Adam lr, teacher EMA) */
 static int ssl_cell(void) { return (g_lat ? 4 : 1) << g_ssl_lev; }   /* --ssl: voxels per side-head cell (--lat: the 4^3-voxel latent grid below level 0) */
 static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64; static int g_cnt_ns; static float g_cnt_edges[8];   /* --count-strata */   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
 static float g_pg_lambda, g_pg_dist[4] = {2.f}; static int g_pg_nd = 1, g_pg_angle, g_pg_mask;   /* --pgrad-lambda / --pgrad-dist (D[,D...], up to 4): the phase wavenumber loss (nn_pgrad_slab; head slabs only) */
@@ -2404,6 +2407,45 @@ static void ssl_teacher(gpu_state *d, shape5 ls, int P) {
         free(ht); free(hx);
     }
 }
+/* --ssl-proto (2026-11-26): dn_dino (src/dino.h; tests/test_dino_loss) on the unit rows of the sampled cells that carry a teacher target:
+   student = the side head's row, teacher = its int8 target row (centred, unit: nn_ssl_targets / nn_ssl2_targets), K prototypes (student W,
+   teacher Wt = EMA of W), teacher centring + sharpening. The rows' gradient (x --ssl-weight) into sslg; the prototypes' Adam step and the
+   centre's update per unlabelled window (not per optimiser update: they are tiny and outside the trunk's accumulation) */
+static void ssl_proto_step(gpu_state *d, const float *ye, int C, size_t S) {
+    const uint64_t r = rmix(d->ssl_seed ^ 0x51ED27A3B04E19C1ull); const int K = g_ssl_proto; const size_t kd = (size_t)K * C;
+    nn_ssl_idx(d->pidx, g_ssl_npts, S, (size_t)(r % S), ssl_stride(S, r >> 32));
+    const int n = nn_ssl_compact(d->sslt, C, S, d->pidx, g_ssl_npts, d->pidx2, d->pnd); d->pn = n;
+    nn_zero(d->pout, 4 * sizeof(float));
+    if (n < 2) return;
+    dn_gather(ye, 0, S, C, d->pidx2, n, d->pe, d->pnrm);
+    nn_ssl_tgather(d->sslt, C, S, d->pidx2, n, d->pt);
+    dn_dino(d->pe, d->pt, n, d->pW, d->pWt, d->pcen, K, C, g_ssl_pts, g_ssl_ptt, d->pgs, d->pgW, d->ptm, d->pout, d->pscr);
+    dn_scatter_grad(d->pe, d->pgs, d->pnrm, d->pidx2, n, C, S, g_ssl_w, d->sslg);
+    d->pstep++;
+    dn_adam(d->pW, d->pgW, d->pWm, d->pWv, kd, g_ssl_plr, 0.9f, 0.999f, 1e-8f, 0.f, (int)d->pstep);
+    dn_ema(d->pWt, d->pW, kd, d->pstep < 100 ? 0.9f : g_ssl_pema);
+    dn_axpby(d->pcen, d->ptm, (size_t)K, g_ssl_pcm, 1.f - g_ssl_pcm);
+}
+/* the prototypes' sidecar CKPT.sslp: "SSLP0001", int32 K, C, int64 step, float W, Wt, m, v [K C], centre [K] */
+static int ssl_proto_save(gpu_state *d, const char *ckpt) {
+    if (!g_ssl_proto) return 0;
+    char p[1500], t[1510]; snprintf(p, sizeof p, "%s.sslp", ckpt); snprintf(t, sizeof t, "%s.tmp", p);
+    const int C = g_ssl, K = g_ssl_proto; const size_t kd = (size_t)K * C; float *h = malloc((4 * kd + K) * 4); if (!h) return -1;
+    nn_sync(); nn_d2h(h, d->pW, kd * 4); nn_d2h(h + kd, d->pWt, kd * 4); nn_d2h(h + 2 * kd, d->pWm, kd * 4); nn_d2h(h + 3 * kd, d->pWv, kd * 4); nn_d2h(h + 4 * kd, d->pcen, (size_t)K * 4);
+    FILE *f = fopen(t, "wb"); const int32_t hd[2] = {K, C}; const int64_t st = d->pstep;
+    const int ok = f && fwrite("SSLP0001", 1, 8, f) == 8 && fwrite(hd, 4, 2, f) == 2 && fwrite(&st, 8, 1, f) == 1 && fwrite(h, 4, 4 * kd + K, f) == 4 * kd + K;
+    free(h); if (!f || fclose(f) || !ok || rename(t, p)) { unlink(t); fprintf(stderr, "ssl: cannot save %s\n", p); return -1; }
+    return 0;
+}
+static int ssl_proto_load(gpu_state *d, const char *ckpt) {   /* 1 loaded, 0 no sidecar, -1 bad */
+    char p[1500]; snprintf(p, sizeof p, "%s.sslp", ckpt); FILE *f = fopen(p, "rb"); if (!f) return 0;
+    const int C = g_ssl, K = g_ssl_proto; const size_t kd = (size_t)K * C; char mg[8]; int32_t hd[2]; int64_t st; float *h = malloc((4 * kd + K) * 4);
+    const int ok = h && fread(mg, 1, 8, f) == 8 && !memcmp(mg, "SSLP0001", 8) && fread(hd, 4, 2, f) == 2 && hd[0] == K && hd[1] == C && fread(&st, 8, 1, f) == 1 && fread(h, 4, 4 * kd + K, f) == 4 * kd + K;
+    fclose(f);
+    if (!ok) { free(h); fprintf(stderr, "ssl: %s is not a %d x %d prototype sidecar\n", p, K, C); return -1; }
+    nn_h2d(d->pW, h, kd * 4); nn_h2d(d->pWt, h + kd, kd * 4); nn_h2d(d->pWm, h + 2 * kd, kd * 4); nn_h2d(d->pWv, h + 3 * kd, kd * 4); nn_h2d(d->pcen, h + 4 * kd, (size_t)K * 4);
+    d->pstep = st; free(h); return 1;
+}
 static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     shape5 xs = {B, g_xc, d->side >= 0 ? g_Dl : g_Pz, P, P};
     { const int si = d->srcb[d->cur]; d->ssl_win = g_ssl && train && g_S && si >= 0 && si < g_S->n && g_S->src[si].ct_only; d->ssl_fresh = 0; }
@@ -2491,7 +2533,8 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     if (g_ssl && train) {   /* --ssl: the side head's cosine loss at the masked cells + the variance hinge on unlabelled windows; none elsewhere */
         if (d->ssl_win) {
             shape5 se; const float *ye = unet_emb_logits(d->u, &se); const int C = se.c; const size_t S = g_ssl_S;
-            nn_distill_loss(ye, d->sslt, 1, C, S, g_ssl_w, d->sslg, d->sslds);
+            nn_distill_loss(ye, d->sslt, 1, C, S, g_ssl_proto ? 0.f : g_ssl_w, d->sslg, d->sslds);   /* (--ssl-proto: the cosine logged, no gradient) */
+            if (g_ssl_proto) ssl_proto_step(d, ye, C, S);
             nn_zero(d->sslvo, 8 * 4);
             if (g_ssl_var > 0.f) {
                 const uint64_t r = rmix(d->ssl_seed ^ 0x3C6EF372FE94F82Bull);
@@ -2779,6 +2822,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
     if (g_ssl && d->ssl_fresh) {   /* --ssl: weight x mean 1 - cos over the targeted cells, the hinge's loss and the points' mean std */
         nn_d2h(d->sslh, d->sslds, 2 * sizeof(double)); nn_d2h(d->sslvh, d->sslvo, 2 * sizeof(float)); d->ssl_cells = d->sslh[1];
         d->ssl_loss = (d->sslh[1] > 0 ? g_ssl_w * d->sslh[0] / d->sslh[1] : 0) + d->sslvh[0];
+        if (g_ssl_proto) { nn_d2h(d->proto_h, d->pout, 3 * sizeof(float)); d->ssl_loss = (d->pn > 0 ? g_ssl_w * d->proto_h[0] : 0) + d->sslvh[0]; d->proto_h[3] = (float)d->pn; }
     }
     d->ds_loss = 0;
     if (g_ds && d->ds_fresh) for (int j = 1; j <= g_ds; j++) {   /* weight x mean over the active channels of bce + dice_w dice */
@@ -3771,6 +3815,10 @@ int cmd_train(int argc, char **argv) {
         g_ssl_npts = opt_atoi("--ssl-points", opt(argc, argv, "--ssl-points", "65536")); g_ssl_jit = (float)opt_atof("--ssl-jit", opt(argc, argv, "--ssl-jit", "1"));
         g_ssl_views = opt_atoi("--ssl-views", opt(argc, argv, "--ssl-views", "1")); g_ssl_vshift = (float)opt_atof("--ssl-view-shift", opt(argc, argv, "--ssl-view-shift", "0.125"));
         g_ssl_vzoom = (float)opt_atof("--ssl-view-zoom", opt(argc, argv, "--ssl-view-zoom", "1.25"));
+        g_ssl_proto = opt_atoi("--ssl-proto", opt(argc, argv, "--ssl-proto", "0")); g_ssl_pts = (float)opt_atof("--ssl-proto-ts", opt(argc, argv, "--ssl-proto-ts", "0.1"));
+        g_ssl_ptt = (float)opt_atof("--ssl-proto-tt", opt(argc, argv, "--ssl-proto-tt", "0.04")); g_ssl_pcm = (float)opt_atof("--ssl-proto-center", opt(argc, argv, "--ssl-proto-center", "0.9"));
+        g_ssl_plr = (float)opt_atof("--ssl-proto-lr", opt(argc, argv, "--ssl-proto-lr", "1e-3")); g_ssl_pema = (float)opt_atof("--ssl-proto-ema", opt(argc, argv, "--ssl-proto-ema", "0.996"));
+        if (g_ssl_proto > 1) g_ssl_lnk = log((double)g_ssl_proto);
         if (resume && g_ssl) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st) && pc.emb_lev) { g_ssl = pc.emb_ch; g_ssl_lev = pc.emb_lev; } }
         if (g_ssl) {
             const int cv = ssl_cell();   /* (--lat: level-l cells of 4 << l voxels; the voxel net (2026-11-23): 1 << l) */
@@ -3782,6 +3830,9 @@ int cmd_train(int argc, char **argv) {
             if (g_ssl_views != 1 && g_ssl_views != 2) { fprintf(stderr, "--ssl-views 1 (one view, masked) | 2 (a teacher view shifted / zoomed, the student's own warp)\n"); return 2; }
             if (g_ssl_views == 2 && (!(g_ssl_vshift >= 0 && g_ssl_vshift < 0.5f) || !(g_ssl_vzoom >= 1 && g_ssl_vzoom <= 2) || P != g_Pz)) {
                 fprintf(stderr, "--ssl-views 2: --ssl-view-shift in [0, 0.5) of P, --ssl-view-zoom in [1, 2], cube windows\n"); return 2; }
+            if (g_ssl_proto && g_ssl != 16 && g_ssl != 32) { fprintf(stderr, "--ssl-proto: --ssl 16 or 32 (dn_dino's widths)\n"); return 2; }
+            if (g_ssl_proto && (g_ssl_proto < 2 || g_ssl_proto > 65536 || !(g_ssl_pts > 0) || !(g_ssl_ptt > 0) || !(g_ssl_pcm >= 0 && g_ssl_pcm < 1) || !(g_ssl_plr > 0) || !(g_ssl_pema >= 0 && g_ssl_pema < 1))) {
+                fprintf(stderr, "--ssl-proto K (2..65536), --ssl-proto-ts / -tt > 0, --ssl-proto-center / -ema in [0, 1), --ssl-proto-lr > 0\n"); return 2; }
             if (g_ssl_bv % cv || P % g_ssl_bv || g_Pz % g_ssl_bv) { fprintf(stderr, "--ssl-block %d: a multiple of the level-%d cell (%d voxels) dividing P and Pz\n", g_ssl_bv, g_ssl_lev, cv); return 2; }
             if (cfg.l0_norm == 2) { fprintf(stderr, "--ssl: not with --l0-norm ema (the teacher forward would update the running statistics)\n"); return 2; }
             g_ssl_gamma = (float)opt_atof("--ssl-gamma", opt(argc, argv, "--ssl-gamma", "0")); if (!(g_ssl_gamma > 0)) g_ssl_gamma = 1.f / sqrtf((float)g_ssl);
@@ -3823,6 +3874,8 @@ int cmd_train(int argc, char **argv) {
             if ((size_t)g_ssl_npts > g_ssl_S) g_ssl_npts = (int)g_ssl_S;
             fprintf(stderr, "ssl: %d channels on decoder level %d (%d^3 voxels per cell, %zu cells), mask %g of %d^3 blocks, cosine weight %g, variance hinge %g (std >= %.3f, %d points), student step jitter %g octaves\n",
                     g_ssl, g_ssl_lev, cv, g_ssl_S, g_ssl_mask, g_ssl_bv, g_ssl_w, g_ssl_var, g_ssl_gamma, g_ssl_npts, g_ssl_jit);
+            if (g_ssl_proto) fprintf(stderr, "ssl: --ssl-proto %d: DINO prototypes on the unit side-head rows of %d sampled targeted cells (student temperature %g, teacher %g, centre momentum %g, "
+                                     "Adam lr %g, teacher prototypes EMA %g); the cosine term is logged only\n", g_ssl_proto, g_ssl_npts, g_ssl_pts, g_ssl_ptt, g_ssl_pcm, g_ssl_plr, g_ssl_pema);
             if (g_ssl_views == 2) fprintf(stderr, "ssl: two views: the teacher sees the source cube shifted by up to %.3f P per axis and zoomed by [1/%g, %g] (clean intensity), the student the "
                                           "sampler's own symmetry / warp / scanner augmentation, masked; targets at the student's masked cells mapped into the teacher's view\n", g_ssl_vshift, g_ssl_vzoom, g_ssl_vzoom);
         }
@@ -5009,6 +5062,25 @@ int cmd_train(int argc, char **argv) {
             d->sslidx = nn_malloc(np_ * sizeof(int)); d->ssle = nn_malloc(np_ * g_ssl * 4); d->sslge = nn_malloc(np_ * g_ssl * 4); d->sslnrm = nn_malloc(np_ * 4); d->sslvo = nn_malloc(8 * 4);
             d->ssl_rs = 0x5D1C0FFEEull ^ (uint64_t)g * 0x9E3779B97F4A7C15ull ^ (uint64_t)opt_atoll("--seed", opt(argc, argv, "--seed", "0")) * 0xD1B54A32D192ED03ull
                         ^ (uint64_t)step0 * 0x94D049BB133111EBull ^ (step0 > 0 ? 0 : (uint64_t)step_loaded * 0xBF58476D1CE4E5B9ull);   /* (a resume / fine-tune: not the first steps' teacher draws again; rng audit #2) */
+            if (g_ssl_proto) {   /* --ssl-proto: prototypes (one GPU: their gradient is not reduced across data-parallel ranks) */
+                if (ng > 1) { fprintf(stderr, "--ssl-proto: one GPU (the prototypes are per process, not all-reduced)\n"); return 2; }
+                const int K = g_ssl_proto, C = g_ssl; const size_t kd = (size_t)K * C, np2 = (size_t)g_ssl_npts;
+                d->pW = nn_malloc(kd * 4); d->pWt = nn_malloc(kd * 4); d->pWm = nn_malloc(kd * 4); d->pWv = nn_malloc(kd * 4); d->pgW = nn_malloc(kd * 4);
+                d->pcen = nn_malloc((size_t)K * 4); d->ptm = nn_malloc((size_t)K * 4); d->pout = nn_malloc(16 * 4); d->pscr = nn_malloc(dn_dino_scratch((int)np2, K));
+                d->pe = nn_malloc(np2 * C * 4); d->pnrm = nn_malloc(np2 * 4); d->pt = nn_malloc(np2 * C * 4); d->pgs = nn_malloc(np2 * C * 4);
+                d->pidx = nn_malloc(np2 * sizeof(int)); d->pidx2 = nn_malloc(np2 * sizeof(int)); d->pnd = nn_malloc(sizeof(int));
+                if (!d->pW || !d->pWt || !d->pWm || !d->pWv || !d->pgW || !d->pcen || !d->ptm || !d->pout || !d->pscr || !d->pe || !d->pnrm || !d->pt || !d->pgs || !d->pidx || !d->pidx2 || !d->pnd) {
+                    fprintf(stderr, "ssl: out of memory for the prototypes\n"); return 1; }
+                float *h = malloc(kd * 4); uint64_t q = d->ssl_rs ^ 0x2545F4914F6CDD1Dull;
+                for (size_t k = 0; k < kd; k += 2) { q = rmix(q + 0x9E3779B97F4A7C15ull); const double u1 = ((q >> 11) + 0.5) / 9007199254740992.0; q = rmix(q + 0x9E3779B97F4A7C15ull); const double u2 = ((q >> 11) + 0.5) / 9007199254740992.0;
+                    const double rr = sqrt(-2 * log(u1)); h[k] = (float)(rr * cos(6.283185307179586 * u2)); if (k + 1 < kd) h[k + 1] = (float)(rr * sin(6.283185307179586 * u2)); }
+                nn_h2d(d->pW, h, kd * 4); nn_h2d(d->pWt, h, kd * 4); free(h);
+                nn_zero(d->pWm, kd * 4); nn_zero(d->pWv, kd * 4); nn_zero(d->pcen, (size_t)K * 4); d->pstep = 0;
+                const int lr_ = resume ? ssl_proto_load(d, resume) : 0;
+                if (lr_ < 0) return 1;
+                if (resume && !lr_) UFSM_DEFAULTED("ssl: --ssl-proto: %s has no prototype sidecar (.sslp): fresh prototypes", resume);
+                if (g == 0) fprintf(stderr, "ssl: --ssl-proto %d prototypes of %d dims%s\n", K, C, lr_ > 0 ? " from the resumed checkpoint's .sslp" : " (fresh)");
+            }
             if (g_ssl_views == 2) {   /* the teacher views: CT channel, record, cell map per slot (lean: one) */
                 d->ssl2_rs = d->ssl_rs ^ 0x7F4A7C159E3779B9ull;
                 for (int i = 0; i < 2; i++) {
@@ -5673,7 +5745,7 @@ int cmd_train(int argc, char **argv) {
     float parts[8][2 * TCMAX + 1];
     double acc_fib = 0, acc_fibv = 0, acc_fibn = 0;   /* --fib-normal-lambda: mean t^T N t over the windows with fibre voxels, their mean count */
     const int mix_every = opt_atoi("--mix-every", opt(argc, argv, "--mix-every", "0")); double *mixn = nullptr, *mixrv = nullptr, *mixrvn = nullptr, *mixh = nullptr;   /* mixh: per source phase / wind4 / normal bce sums + counts (4 x 2) */
-    double acc_ssl = 0, acc_sslv = 0, acc_ssls = 0, acc_sslc = 0, acc_ssln = 0, acc_sslm = 0;   /* (acc_sslm: --ssl-views 2, the mapped share of the cells) */
+    double acc_ssl = 0, acc_sslv = 0, acc_ssls = 0, acc_sslc = 0, acc_ssln = 0, acc_sslm = 0, acc_pr[4] = {0};   /* (acc_sslm: --ssl-views 2, the mapped share of the cells) */
     double acc_sslh[SSLH_MAX] = {0}, acc_sslhg[SSLH_MAX] = {0};   /* (+ --ssl-heads: per head loss, targeted share of its channels' cells) */   /* --ssl: cosine part, hinge, std, targeted cells, unlabelled windows (all GPUs) */
     double acc_emb = 0, acc_embc = 0, acc_ds = 0, acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0, acc_ck = 0, acc_cr = 0, acc_pap = 0, acc_cnt = 0, acc_cnr = 0, acc_cbin[18] = {0}, acc_w4 = 0, acc_w4w = 0, acc_w4a = 0, acc_pg = 0, acc_rv = 0;   /* (acc_pg: --pgrad-lambda loss; acc_cnt / acc_cnr: --count-lambda loss, Tp / Tg) verso channel, side channel; --cond (loss, known / right counts); --pap-head */
     double acc_siden = 0, acc_normn = 0, acc_w4n = 0;   /* windows that carry side / phase, normal, wind4 labels (their loss > 0): the logged means are over them, as ink / fib */
@@ -6100,7 +6172,7 @@ int cmd_train(int argc, char **argv) {
           for (int k = 0; k < 8; k++) if (isfinite(kv[k])) { acc_kl[k] += kv[k]; acc_kln[k] += 1; } }
         if (g_ds) acc_ds += G[0].ds_loss;
         if (g_distill) { acc_emb += G[0].emb_loss; acc_embc += G[0].emb_cells; }
-        if (g_ssl) for (int g = 0; g < ng; g++) if (G[g].ssl_fresh) { acc_ssl += G[g].ssl_loss - G[g].sslvh[0]; acc_sslv += G[g].sslvh[0]; acc_ssls += G[g].sslvh[1]; acc_sslc += G[g].ssl_cells; acc_ssln += 1; acc_sslm += G[g].ssl2_cells;
+        if (g_ssl) for (int g = 0; g < ng; g++) if (G[g].ssl_fresh) { acc_ssl += G[g].ssl_loss - G[g].sslvh[0]; acc_sslv += G[g].sslvh[0]; acc_ssls += G[g].sslvh[1]; acc_sslc += G[g].ssl_cells; acc_ssln += 1; acc_sslm += G[g].ssl2_cells; for (int k = 0; k < 4; k++) acc_pr[k] += G[g].proto_h[k];
             for (int h = 0; h < g_sslh.nh; h++) { acc_sslh[h] += G[g].sslh_loss[h]; acc_sslhg[h] += (double)G[g].sslh_n[h] / ((double)g_sslh.h[h].nch * (g_Pz / 4) * (P / 4) * (P / 4)); } }
         if (g_cond) { acc_cond += G[0].cond_loss / (g_cond_lambda ? g_cond_lambda : 1.f); acc_ck += (double)G[0].cacc_h[0]; acc_cr += (double)G[0].cacc_h[1]; }
         if (g_pap_head) acc_pap += G[0].pout3[0];
@@ -6314,7 +6386,7 @@ int cmd_train(int argc, char **argv) {
                     fprintf(stderr, "\n");
                 }
                 if (nval && vcrit < best_val) { best_val = vcrit; char bp[1400]; snprintf(bp, sizeof bp, "%s/best.ckpt", out); if ((g_uw ? (uw_extra(checkpoint_extra, sizeof checkpoint_extra, runtime_extra), 0) : 0) || ((gns_on ? gns_extra(checkpoint_extra, sizeof checkpoint_extra, &gns, acc_auto, accum, acc_anchor, upd_base) : (void)0), trainstate_extra(checkpoint_extra, sizeof checkpoint_extra, accum, acc_anchor, upd_base, nn_get_grad_scale()), 0) || unet_save(G[0].u, bp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", bp); return 1; }
-                                                  if (G[0].isf_on) { char ip[1500]; snprintf(ip, sizeof ip, "%s.isf", bp); if (isf_save(&G[0].isf, ip, step)) { fprintf(stderr, "cannot save %s\n", ip); return 1; } } }
+                                                  if (G[0].isf_on) { char ip[1500]; snprintf(ip, sizeof ip, "%s.isf", bp); if (isf_save(&G[0].isf, ip, step)) { fprintf(stderr, "cannot save %s\n", ip); return 1; } } if (ssl_proto_save(&G[0], bp)) return 1; }
             }
             char affs[2048] = "";
             if (g_verso) snprintf(affs, 64, " verso bce %.4f dice %.4f", acc_vbce / nok, acc_vdice / nok);
@@ -6348,6 +6420,11 @@ int cmd_train(int argc, char **argv) {
             if (g_fibdir > 0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " dir bce %.4f", acc_norm / nok); }
             if (g_ds) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ds %.4f", acc_ds / nok); }
             if (g_ssl) { size_t na = strlen(affs); if (acc_ssln > 0) snprintf(affs + na, sizeof affs - na, " ssl %.4f var %.4f std %.3f (%.0f windows, %.1f%% cells)", acc_ssl / acc_ssln, acc_sslv / acc_ssln, acc_ssls / acc_ssln, acc_ssln, 100. * acc_sslc / acc_ssln / g_ssl_S);
+                if (acc_ssln > 0 && g_ssl_proto) {   /* (proto: its CE, the teacher's batch-mean and per-cell assignment entropies over ln K, the cosine logged) */
+                    const double lk = g_ssl_lnk, hm = acc_pr[1] / acc_ssln, hp = acc_pr[2] / acc_ssln; na = strlen(affs);
+                    snprintf(affs + na, sizeof affs - na, " proto %.4f H %.3f/%.3f of ln K (%.0f pts)", acc_pr[0] / acc_ssln, hm / lk, hp / lk, acc_pr[3] / acc_ssln);
+                    if (acc_pr[3] > 0 && (hm < 0.25 * lk || hp > 0.95 * lk))
+                        fprintf(stderr, "ALERT: ssl collapse: prototype assignment entropy batch-mean %.3f / per-cell %.3f of ln K at step %d (%s)\n", hm / lk, hp / lk, step, hm < 0.25 * lk ? "few prototypes" : "uniform teacher"); }
                 if (acc_ssln > 0 && g_ssl_views == 2) { na = strlen(affs); snprintf(affs + na, sizeof affs - na, " views: %.1f%% cells mapped", 100. * acc_sslm / acc_ssln); }
                 if (acc_ssln > 0 && g_ssl_var > 0.f && acc_ssls / acc_ssln < 0.3 * g_ssl_gamma)   /* (the unit rows' per-dimension std far under the hinge's gamma: the embedding collapses) */
                     fprintf(stderr, "ALERT: ssl collapse: the student's per-dimension std %.4f < 0.3 x gamma %.3f at step %d\n", acc_ssls / acc_ssln, g_ssl_gamma, step); }   /* (nothing on lines without an unlabelled window: the labelled-only layout logs as before) */
@@ -6459,7 +6536,7 @@ int cmd_train(int argc, char **argv) {
             if (log) { fprintf(log, "%d,%.3e,%.5f,%.5f,%.5f,%.0f,%.4f,%s,%.3f,%.3f,%s,%.3f\n", step, lr, acc_loss / nok, acc_bce / nok, acc_dice / nok, acc_active / nok, acc_g / nok, vstr, (double)nacc * B * nl / dt, wait, gcsv, gate); fflush(log); }
             if (prof) { fprintf(stderr, "per-op GPU ms over the last %d steps (all GPUs):\n", log_every); unet_prof_report(); }
             nn_ptick_report(log_every);
-            acc_fh[0] = acc_fh[1] = acc_fhn = 0; acc_inkn = 0; acc_fib = acc_fibv = acc_fibn = 0; acc_emb = acc_embc = 0; acc_ssl = acc_sslv = acc_ssls = acc_sslc = acc_ssln = acc_sslm = 0; for (int h = 0; h < SSLH_MAX; h++) acc_sslh[h] = acc_sslhg[h] = 0; acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = acc_w4 = acc_w4w = acc_w4a = acc_pg = acc_rv = 0; acc_siden = acc_normn = acc_w4n = 0; nacc = 0; nskl = 0; tlog = now(); wait = 0; gate = 0; acc_active = 0;
+            acc_fh[0] = acc_fh[1] = acc_fhn = 0; acc_inkn = 0; acc_fib = acc_fibv = acc_fibn = 0; acc_emb = acc_embc = 0; acc_ssl = acc_sslv = acc_ssls = acc_sslc = acc_ssln = acc_sslm = 0; for (int k = 0; k < 4; k++) acc_pr[k] = 0; for (int h = 0; h < SSLH_MAX; h++) acc_sslh[h] = acc_sslhg[h] = 0; acc_ds = 0; acc_loss = acc_bce = acc_dice = acc_g = acc_vbce = acc_vdice = acc_side = acc_ink = acc_norm = acc_cond = acc_ck = acc_cr = acc_pap = acc_cnt = acc_cnr = acc_w4 = acc_w4w = acc_w4a = acc_pg = acc_rv = 0; acc_siden = acc_normn = acc_w4n = 0; nacc = 0; nskl = 0; tlog = now(); wait = 0; gate = 0; acc_active = 0;
         }
         if (step % ckpt_every == 0 || step == steps || g_stop) {
             nn_init(G[0].dev);
@@ -6468,7 +6545,7 @@ int cmd_train(int argc, char **argv) {
             if (gns_on) gns_extra(checkpoint_extra, sizeof checkpoint_extra, &gns, acc_auto, accum, acc_anchor, upd_base);
             trainstate_extra(checkpoint_extra, sizeof checkpoint_extra, accum, acc_anchor, upd_base, nn_get_grad_scale());
             if (unet_save(G[0].u, cp, step, checkpoint_extra)) { fprintf(stderr, "cannot save %s\n", cp); return 1; }
-            if (G[0].isf_on) { char ip[1500]; snprintf(ip, sizeof ip, "%s.isf", cp); if (isf_save(&G[0].isf, ip, step)) { fprintf(stderr, "cannot save %s\n", ip); return 1; } }   /* (ck_after_save clones it with the checkpoint) */
+            if (G[0].isf_on) { char ip[1500]; snprintf(ip, sizeof ip, "%s.isf", cp); if (isf_save(&G[0].isf, ip, step)) { fprintf(stderr, "cannot save %s\n", ip); return 1; } } if (ssl_proto_save(&G[0], cp)) return 1;   /* (ck_after_save clones it with the checkpoint) */
             ck_after_save(&ckc, out, step);
         }
         if (step == step0 + 1 || step == steps || g_stop) {
@@ -6480,7 +6557,7 @@ int cmd_train(int argc, char **argv) {
     nn_init(G[0].dev);
     { char cp[1400]; snprintf(cp, sizeof cp, "%s/last.ckpt", out); if (g_uw) uw_extra(checkpoint_extra, sizeof checkpoint_extra, runtime_extra);
       if (gns_on) gns_extra(checkpoint_extra, sizeof checkpoint_extra, &gns, acc_auto, accum, acc_anchor, upd_base); trainstate_extra(checkpoint_extra, sizeof checkpoint_extra, accum, acc_anchor, upd_base, nn_get_grad_scale()); if (unet_save(G[0].u, cp, committed_step, checkpoint_extra)) return 1;
-      if (G[0].isf_on) { char ip[1500]; snprintf(ip, sizeof ip, "%s.isf", cp); if (isf_save(&G[0].isf, ip, committed_step)) return 1; }
+      if (G[0].isf_on) { char ip[1500]; snprintf(ip, sizeof ip, "%s.isf", cp); if (isf_save(&G[0].isf, ip, committed_step)) return 1; } if (ssl_proto_save(&G[0], cp)) return 1;
       if (committed_step % ckpt_every) ck_after_save(&ckc, out, committed_step); }
     if (plan) fprintf(stderr, "cover progress %llu/%llu committed tiles\n", (unsigned long long)coverage.cursor, (unsigned long long)coverage.count);
     uint64_t prod, rej; sampler_stats(sp, &prod, &rej);
