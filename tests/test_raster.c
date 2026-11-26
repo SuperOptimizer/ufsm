@@ -227,10 +227,40 @@ static void pooled_pyramid(const char *root) {
     store_close(s); free(m);
 }
 
+/* (2026-11-26 review) a prob254 target read 2x finer (read_prob_trilinear): 255 is the unknown code, not a value: a fine voxel with any
+   weight > 0 on a 255 corner reads 255, the rest the trilinear of the known codes (within 1 of a double reference). It used to blend
+   255 into its neighbours (255 next to 0 ~128, "known"). */
+static void prob_unknown(const char *root) {
+    char dir[1100]; snprintf(dir, sizeof dir, "%s/prob", root);
+    const int64_t shape[3] = {128, 128, 128}; const size_t n = 128 * 128 * 128;
+    uint8_t *m = malloc(n); for (size_t k = 0; k < n; k++) m[k] = random_u32() % 20 == 0 ? 255 : (uint8_t)(random_u32() % 255);
+    z3w *w = z3w_create(dir, shape, 128, 0.f, 0, nullptr);
+    if (!w || z3w_write_shard(w, 0, 0, 0, m, 1) || z3w_close(w)) { fprintf(stderr, "prob unknown: write failed\n"); failures++; free(m); return; }
+    store *st = store_open(dir); z3 *z = st ? z3_open(st, ".", nullptr) : nullptr;
+    const int64_t o[3] = {-1, 40, 100}, nn[3] = {20, 24, 70}; uint8_t *got = malloc((size_t)nn[0] * nn[1] * nn[2]); int bad = 0, unk = 0, kn = 0;
+    if (!z || z3_read_label_grid(z, 0, 1, o, nn, got, 1)) { fprintf(stderr, "prob unknown: read failed\n"); failures++; bad = 1; }
+    for (int64_t a = 0; a < nn[0] && !bad; a++) for (int64_t b = 0; b < nn[1] && !bad; b++) for (int64_t c = 0; c < nn[2] && !bad; c++) {
+        const int64_t g[3] = {o[0] + a, o[1] + b, o[2] + c}; int64_t i0[3]; double t[3];
+        for (int d = 0; d < 3; d++) { const double u = (g[d] + 0.5) / 2 - 0.5; int64_t q = (int64_t)floor(u); double f = u - q;
+            if (q < 0) { q = 0; f = 0; } if (q >= shape[d] - 1) { q = shape[d] - 1; f = 0; } i0[d] = q; t[d] = f; }
+        double v = 0; int u255 = 0;
+        for (int k = 0; k < 8; k++) { const int dz = k >> 2 & 1, dy = k >> 1 & 1, dx = k & 1;
+            const double wgt = (dz ? t[0] : 1 - t[0]) * (dy ? t[1] : 1 - t[1]) * (dx ? t[2] : 1 - t[2]); if (wgt <= 0) continue;
+            const uint8_t cv = m[((size_t)(i0[0] + dz) * 128 + (i0[1] + dy)) * 128 + (i0[2] + dx)]; if (cv == 255) u255 = 1; v += wgt * cv; }
+        const uint8_t e = u255 ? 255 : (uint8_t)lround(v), gv = got[((size_t)a * nn[1] + b) * nn[2] + c];
+        if (u255 ? gv != 255 : (gv == 255 || abs((int)gv - (int)e) > 1)) {
+            fprintf(stderr, "prob unknown: at %lld,%lld,%lld read %d, expected %d (%s)\n", (long long)g[0], (long long)g[1], (long long)g[2], gv, e, u255 ? "a 255 corner" : "known");
+            failures++; bad = 1; }
+        unk += u255; kn += !u255;
+    }
+    if (!bad) printf("prob254 read 2x finer: %d voxels on a 255 corner unknown, %d known within 1 of the trilinear\n", unk, kn);
+    free(got); free(m); z3_close(z); if (st) store_close(st);
+}
+
 int main(void) {
     char root[] = "/tmp/ufsm-raster-test-XXXXXX";
     if (!mkdtemp(root)) return 2;
-    distances(); binary_pool(); volumes(root); dist_volumes(root); pooled_pyramid(root);
+    distances(); binary_pool(); volumes(root); dist_volumes(root); pooled_pyramid(root); prob_unknown(root);
     printf("CPU raster tests: %s (%s)\n", failures ? "FAIL" : "PASS", root);
     return failures != 0;
 }

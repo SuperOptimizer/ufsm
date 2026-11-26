@@ -1242,14 +1242,27 @@ int cmd_ink_score(int argc, char **argv) {
         }
         const double auc = ti && tn ? 1 - wrong / ((double)ti * tn) : 0;
         const uint64_t n = ti + tn;
+        {   /* (2026-11-26, lead review of the fail-loud line) one class only, or a constant map over the scored pixels (an empty / unrendered
+               map): the AUC 0.5 / 0 such a row carried read like scores in devscoreC / cleanscore3 / surfscore2 (their stderr went to /dev/null) */
+            int nzb = 0, bv = 0; for (int b = 0; b < 256; b++) if (hi[b] + hn[b]) { nzb++; bv = b; }
+            if ((!ti || !tn || nzb <= 1) && !getenv("UFSM_SCORE_DEGENERATE_OK")) {
+                fprintf(stderr, "ink-score: ALERT: scoring failed: %s (%s): %llu ink / %llu no-ink px, %s (byte %d); no row (UFSM_SCORE_DEGENERATE_OK=1 reports it)\n", nm,
+                        path, (unsigned long long)ti, (unsigned long long)tn, nzb <= 1 ? (nzb ? "the map is constant over them" : "no map value") : "one class only", bv);
+                free(mp); rc = 1; continue;
+            }
+        }
         fprintf(stderr, "ink-score: %s: %llu px, ink %.3f, F1 best %.4f (p >= %.3f; all-ink floor %.4f), F1@0.5 %.4f (prec %.3f rec %.3f), AUC %.4f%s\n", nm,
                 (unsigned long long)n, n ? (double)ti / n : 0, best, bthr, n ? 2.0 * ti / (n + ti) : 0, f05, p05, r05, auc, ti && tn ? "" : " (one class only: AUC undefined)");
         if (row) printf("%s\t%s\t%llu\t%.4f\t%.4f\t%.3f\t%.4f\t%.4f\t%.4f\t%.4f\n", row, nm, (unsigned long long)n, n ? (double)ti / n : 0, best, bthr, f05, p05, r05, auc);
         for (int e = 0; EG && e < 2; e++) {   /* the same tie-aware 256-bin AUC on the edge / core pixels */
             uint64_t ei = 0, en = 0; double w = 0, fpn = 0;
             for (int t = 255; t >= 0; t--) { w += (double)ehi[e][t] * (fpn + 0.5 * ehn[e][t]); fpn += ehn[e][t]; ei += ehi[e][t]; en += ehn[e][t]; }
-            const double ea = ei && en ? 1 - w / ((double)ei * en) : 0;
-            fprintf(stderr, "ink-score: %s:%s: %llu px, ink %.3f, AUC %.4f\n", nm, e ? "edge" : "core", (unsigned long long)(ei + en), ei + en ? (double)ei / (ei + en) : 0, ea);
+            int enz = 0; for (int t = 0; t < 256; t++) enz += ehi[e][t] + ehn[e][t] > 0;
+            const int edeg = !ei || !en || enz < 1;   /* (2026-11-26 review) one class on the subset: n/a (AUC nan), not 0.5 / 0. (The whole map is not
+                                                      constant here (the main row's check); flat over the subset is a real "no information" 0.5) */
+            const double ea = edeg ? NAN : 1 - w / ((double)ei * en);
+            if (edeg) fprintf(stderr, "ink-score: %s:%s: n/a: %llu ink / %llu no-ink px%s (AUC nan)\n", nm, e ? "edge" : "core", (unsigned long long)ei, (unsigned long long)en, enz < 1 ? ", no map value" : "");
+            else fprintf(stderr, "ink-score: %s:%s: %llu px, ink %.3f, AUC %.4f\n", nm, e ? "edge" : "core", (unsigned long long)(ei + en), ei + en ? (double)ei / (ei + en) : 0, ea);
             if (row) printf("%s\t%s:%s\t%llu\t%.4f\t0\t0\t0\t0\t0\t%.4f\n", row, nm, e ? "edge" : "core", (unsigned long long)(ei + en), ei + en ? (double)ei / (ei + en) : 0, ea);
         }
         if (qfar > 0) ink_quality(&S, mp, mw, mh, F, L, M, LL.H, LL.W, qfar, nm, row);
@@ -3054,16 +3067,18 @@ int cmd_ink_teach(int argc, char **argv) {
       for (int si = 0; si < ns; si++) {
         if (!ph && S[si].ext) continue;   /* (extras hold no human px: nothing to calibrate) */
         it_seg *s = &S[si]; itr *r = &R[si]; ssurf SS; if (ssurf_load(&SS, s->tifxyz)) return 1;
+        /* (2026-11-26 review) a mesh without voxel_size_um in its meta: the 2.4 um scans' 2.399 was assumed silently */
+        const double mum0 = SS.vox_um > 0 ? SS.vox_um : (fprintf(stderr, "DEFAULTED: ink-teach: %s has no voxel_size_um in its meta: 2.399 um assumed\n", s->tifxyz), 2.399);
         lsrc LL; memset(&LL, 0, sizeof LL);
         if (s->ext) {   /* no label grid: label px = 1 / K teacher px, so the raster is the teacher's own px grid (F K mesh voxels = px_um) */
-            const double mum = SS.vox_um > 0 ? SS.vox_um : 2.399; LL.um = px_um / K; LL.W = (int64_t)ceil(SS.w / SS.scale / (LL.um / mum)); LL.H = (int64_t)ceil(SS.h / SS.scale / (LL.um / mum)); }
+            const double mum = mum0; LL.um = px_um / K; LL.W = (int64_t)ceil(SS.w / SS.scale / (LL.um / mum)); LL.H = (int64_t)ceil(SS.h / SS.scale / (LL.um / mum)); }
         else if (lsrc_open(&LL, s->lab, -1, nullptr)) return 1;
         double F; { const double ew = SS.w / SS.scale, eh = SS.h / SS.scale; F = 0.5 * (ew / (double)LL.W + eh / (double)LL.H); const double p2 = pow(2, round(log2(F))); if (fabs(F - p2) < 0.002 * p2) F = p2;
-            const double mum = SS.vox_um > 0 ? SS.vox_um : 2.399; if (LL.um > 0 && mum > 0) F = LL.um / mum; }
+            const double mum = mum0; if (LL.um > 0 && mum > 0) F = LL.um / mum; }
         r->F = F; r->lum = LL.um; r->H = (LL.H + K - 1) / K; r->W = (LL.W + K - 1) / K; const size_t n = (size_t)r->H * r->W;
         r->xt = calloc(n * nt, sizeof *r->xt); r->valid = calloc(n, 1); r->hsup = calloc(n, 1); r->hy = calloc(n, sizeof *r->hy);
         /* teachers */
-        const double mum = SS.vox_um > 0 ? SS.vox_um : 2.399, du = px_um / (mum / SS.scale);
+        const double mum = mum0, du = px_um / (mum / SS.scale);
         for (int t = 0; t < nt; t++) {
             char p[1400]; snprintf(p, sizeof p, tp[t], s->name); int mw, mh; uint8_t *m = img_read_u8(p, &mw, &mh);
             if (!m) { fprintf(stderr, "ink-teach: cannot read %s\n", p); return 1; }
