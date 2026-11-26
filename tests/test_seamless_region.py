@@ -17,7 +17,7 @@ import json, os, pathlib, subprocess, sys
 import numpy as np
 N, S, C = %d, %d, %d
 a = sys.argv; out = pathlib.Path(a[5]); o = {a[i]: a[i + 1] for i in range(6, len(a) - 1) if a[i].startswith("--")}
-g = int(o["--grid-origin"].split(",")[0]); sh = int(o["--shard"]); assert sh == C, o
+G = [int(v) for v in o["--grid-origin"].split(",")]; sh = int(o["--shard"]); assert sh == C, o
 bx = [int(v) for v in o["--box"].split(",")]
 lo = [max(0, bx[d] // sh * sh) for d in range(3)]; hi = [min(N, -(-(bx[d] + bx[3 + d]) // sh) * sh) for d in range(3)]
 ns = N // sh; keep = np.zeros((ns,) * 3, bool)
@@ -31,7 +31,7 @@ else: keep[:] = True
 inbox = np.zeros_like(keep); inbox[lo[0] // sh:hi[0] // sh, lo[1] // sh:hi[1] // sh, lo[2] // sh:hi[2] // sh] = True; keep &= inbox
 wr = np.zeros_like(keep)   # every shard of a window that has a kept shard (predict's super-shard windows), inside the box
 for s in zip(*np.nonzero(keep)):
-    w0 = [(s[d] * sh - g) // S * S + g for d in range(3)]
+    w0 = [(s[d] * sh - G[d]) // S * S + G[d] for d in range(3)]
     wr[max(0, w0[0] // sh):(w0[0] + S) // sh, max(0, w0[1] // sh):(w0[1] + S) // sh, max(0, w0[2] // sh):(w0[2] + S) // sh] = True
 wr &= inbox
 zero = os.environ.get("SEAM_ZERO", "")   # "PASS:z,y,x": that pass writes the shard as zeros (absent)
@@ -41,9 +41,9 @@ lv.joinpath(".zarray").write_text(json.dumps({"shape": [N] * 3, "chunks": [C] * 
 def field(z0, y0, x0):
     z, y, x = [np.arange(v, v + C, dtype=np.float64) for v in (z0, y0, x0)]   # (separable: broadcast, not a meshgrid)
     base = (70 + 15 * np.sin(z / 97.0))[:, None, None] + (15 * np.sin(y / 131.0 + 1))[None, :, None] + (15 * np.sin(x / 113.0 + 2))[None, None, :]
-    k = ((np.floor((z - g) / S) * 7)[:, None, None] + (np.floor((y - g) / S) * 3)[None, :, None] + np.floor((x - g) / S)[None, None, :]) %% 3
+    k = ((np.floor((z - G[0]) / S) * 7)[:, None, None] + (np.floor((y - G[1]) / S) * 3)[None, :, None] + np.floor((x - G[2]) / S)[None, None, :]) %% 3
     return np.clip(base + 30 * k, 1, 254).astype(np.uint8)
-p = "a" if g == 0 else "b"
+p = "a" if G == [0, 0, 0] else "b" if G == [S // 2] * 3 else "p"
 for s in zip(*np.nonzero(wr)):
     if zero == "%%s:%%d,%%d,%%d" %% (p, *s): continue
     d = lv / str(s[0]) / str(s[1]); d.mkdir(parents=True, exist_ok=True); (d / str(s[2])).write_bytes(field(*(v * C for v in s)).tobytes())
@@ -59,16 +59,16 @@ def run(env, *a):
     return r.returncode, r.stdout
 
 
-def seam(env, out, off):
-    rc, txt = run(env, BIN, "ink-seam", out / "ink", "--um", "9.6", "--period", S, "--offset", off, "--n", 16, "--threads", 4)
+def seam(env, out, off, line=0):
+    rc, txt = run(env, BIN, "ink-seam", out / "ink", "--um", "9.6", "--period", S, "--offset", off, "--n", 16, "--line", line, "--threads", 4)
     assert rc == 0, txt
     jumps = [max(abs(float(v)) for v in l.split("jump")[1].replace("z", "").replace("y", "").replace("x", "").split()) for l in txt.splitlines() if l.startswith("ink-seam: corner")]
     mean = float(txt.split("mean jump")[1].split()[0])
     return jumps, mean, txt
 
 
-def predict(env, out, *extra):
-    rc, txt = run(env, BIN, "predict", "ck.ckpt", "root", "key", out, "--um", "2.4", "--level", "2", "--heads", "ink", "--seamless", "2",
+def predict(env, out, *extra, mode=2):
+    rc, txt = run(env, BIN, "predict", "ck.ckpt", "root", "key", out, "--um", "2.4", "--level", "2", "--heads", "ink", "--seamless", mode,
                   "--window", W, "--halo", H, "--q", "0", "--levels", "1", "--shard", S, "--threads", 4, *extra)
     assert rc == 0, txt
     return txt
@@ -82,13 +82,20 @@ with tempfile.TemporaryDirectory(prefix="ufsm-seamreg-", delete=not os.environ.g
     # every neighbouring tile
     TL = [(z, y, x) for z in (1, 2) for y in (1, 2) for x in (1, 2)] + [(0, 1, 1)]
     tiles = t / "tiles.txt"; tiles.write_text("".join(f"{z} {y} {x}\n" for z, y, x in TL))
+    # --seamless 2 on the box; --seamless 4 (even-parity phases) on the box and the tiles. Whole planes: both modes < 1 at both offsets
+    # (before the region: box off 128 corners at 128 jump ~25). The seam-crossing lines (ink-seam --line 8): 2 grids leave them (~2),
+    # 4 grids hide them (< 0.3; 8 grids: the same)
     cases = {"box": ("--box", "256,256,256,512,512,512"), "tiles": ("--tile-list", tiles, "--tile-list-size", S)}
-    for name, extra in cases.items():
-        out = t / name; predict(env, out, *extra)
+    QUICK = os.environ.get("UFSM_TEST_QUICK") == "1"   # (fast tier: the box in both modes and the zero shard; ~full adds the tiles)
+    for name, mode in (("box", 2), ("box", 4)) + ((() if QUICK else (("tiles", 4),))):
+        extra = cases[name]; out = t / f"{name}{mode}"; txt = predict(env, out, *extra, mode=mode)
+        assert f"{mode} passes" in txt, txt
         for off in (0, S2):
             j, m, txt = seam(env, out, off)
-            assert j and max(j) < 2.0 and abs(m) < 1.0, (name, off, txt)   # (before the fix: box off 128 corners at 128 jump ~25)
-        rr = t / f"{name}.raw"; rc, txt = run(env, BIN, "read", out / "ink", "9.6", 0, 0, 0, N, N, N, rr, "--threads", 4); assert rc == 0, txt
+            assert j and max(j) < 2.0 and abs(m) < 1.0, (name, mode, off, txt)
+            j, m, txt = seam(env, out, off, 8)
+            assert (m > 1.0) if mode == 2 else (abs(m) < 0.3 and max(j) < 1.0), (name, mode, off, "lines", txt)
+        rr = t / f"{name}{mode}.raw"; rc, txt = run(env, BIN, "read", out / "ink", "9.6", 0, 0, 0, N, N, N, rr, "--threads", 4); assert rc == 0, txt
         v = np.fromfile(rr, np.uint8).reshape(N, N, N)
         for z in range(3):
             for y in range(3):
@@ -97,7 +104,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-seamreg-", delete=not os.environ.g
                     assert b.all() if inr else not b.any(), (name, z, y, x, "the region whole" if inr else "pass b alone beyond the region")
     # 2: pass a's shard 3,3,3 (voxels 384..512) all zero, so not written: its zeros blend with weight wa (before: weight 0, pass b alone)
     out = t / "zero"; predict(dict(env, SEAM_ZERO="a:3,3,3"), out, *cases["box"])
-    ref = np.fromfile(t / "box.raw", np.uint8).reshape(N, N, N).astype(np.float64)
+    ref = np.fromfile(t / "box2.raw", np.uint8).reshape(N, N, N).astype(np.float64)
     rr = t / "zero.raw"; rc, txt = run(env, BIN, "read", out / "ink", "9.6", 0, 0, 0, N, N, N, rr, "--threads", 4); assert rc == 0, txt
     v = np.fromfile(rr, np.uint8).reshape(N, N, N).astype(np.float64)
     u = np.arange(N) + 0.5; wa1 = np.maximum(np.sin(np.pi * (u % S) / S) ** 2, 1e-6); wb1 = np.maximum(np.sin(np.pi * ((u - S2) % S) / S) ** 2, 1e-6)

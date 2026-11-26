@@ -1,5 +1,6 @@
 /* predict --seamless 2: seam-free whole-volume prediction as two passes on tile grids offset by half a tile, blended with sin^2 tile
-   weights (2026-11-12, DESIGN "Latent ink head: window seams").
+   weights (2026-11-12, DESIGN "Latent ink head: window seams"). --seamless 4 / 8 (perf 11-26): four (even-parity per-axis phases) or
+   eight passes, see predict_seamless: two diagonal grids leave the lines where their seam planes cross.
 
    Why: the latent nets' outputs carry a per-window level (inkpod-9000 ink: plane-mean steps of 10-30 / 255 at the window seams on a
    1299 corner, at halo 16 .. 256, with --gn-frozen, at level 1 and level 2, with and without the per-window dice loss): the stride-4
@@ -62,19 +63,20 @@ static int owned(const char *a) {
    pass-b origin that would fall below 0 starts at shift instead (the voxels below shift come from pass a alone: ink_blend_run gives an
    absent shard weight 0) */
 static long long g_lo[3], g_hi[3];
-static char *pass_box(int S, int shift) {
+static long long pass_lo(int S, int d, int shift) { long long lo = g_lo[d] - shift; lo = (lo >= 0 ? lo / S : -((-lo + S - 1) / S)) * S + shift; return lo < 0 ? shift : lo; }
+static char *pass_box(int S, const int shift[3]) {
     long long o[3], n[3];
     for (int d = 0; d < 3; d++) {
-        long long lo = g_lo[d] - shift; lo = (lo >= 0 ? lo / S : -((-lo + S - 1) / S)) * S + shift; if (lo < 0) lo = shift;
+        const long long lo = pass_lo(S, d, shift[d]);
         o[d] = lo; n[d] = g_hi[d] > lo ? g_hi[d] - lo : 1;
     }
     char b[160]; snprintf(b, sizeof b, "%lld,%lld,%lld,%lld,%lld,%lld", o[0], o[1], o[2], n[0], n[1], n[2]); return strdup(b);
 }
-static pid_t spawn_pass(int argc, char **argv, const char *pout, int W, int H, int S2, int shift, int gpu, const char *logp) {
+static pid_t spawn_pass(int argc, char **argv, const char *pout, int W, int H, int S2, const int shift[3], int gpu, const char *logp) {
     char **v = calloc((size_t)argc + 32, sizeof *v); int n = 0;
     static char sw[16], sh[16], ss[16], sg[48], sgpu[16];
     char *bw = strdup((snprintf(sw, sizeof sw, "%d", W), sw)), *bh = strdup((snprintf(sh, sizeof sh, "%d", H), sh)), *bs = strdup((snprintf(ss, sizeof ss, "%d", S2), ss));
-    char *bg = strdup((snprintf(sg, sizeof sg, "%d,%d,%d", shift, shift, shift), sg)), *bu = strdup((snprintf(sgpu, sizeof sgpu, "%d", gpu), sgpu));
+    char *bg = strdup((snprintf(sg, sizeof sg, "%d,%d,%d", shift[0], shift[1], shift[2]), sg)), *bu = strdup((snprintf(sgpu, sizeof sgpu, "%d", gpu), sgpu));
     for (int i = 0; i < 6 && i < argc; i++) v[n++] = i == 5 ? (char *)pout : argv[i];
     for (int i = 6; i < argc; i++) { if (owned(argv[i]) && i + 1 < argc) { i++; continue; } v[n++] = argv[i]; }
     char *bb = pass_box(2 * S2, shift);
@@ -172,7 +174,7 @@ static int seamless_inproc(int argc, char **argv, int W, int H, int S2, int gpu)
 
 int predict_seamless(int argc, char **argv) {
     const int mode = opt_atoi("--seamless", sopt(argc, argv, "--seamless", "0"));
-    if (mode != 2) { fprintf(stderr, "predict --seamless: 2 (two passes on half-tile-shifted grids, sin^2 blend) is the one mode\n"); return 2; }
+    if (mode != 2 && mode != 4 && mode != 8) { fprintf(stderr, "predict --seamless: 2 (two passes, grids 000 + 111 shifted by half a tile), 4 (the even-parity phases 000 011 101 110) or 8 (all per-axis phases)\n"); return 2; }
     if (argc < 6) { fprintf(stderr, "predict --seamless: needs the positional arguments (ufsm predict CKPT ROOT KEY OUT ...)\n"); return 2; }
     const int inproc = getenv("UFSM_SEAM_INPROC") && atoi(getenv("UFSM_SEAM_INPROC"));
     if (*sopt(argc, argv, "--boxes", "") || (*sopt(argc, argv, "--fit-zarr", "") && !inproc) || *sopt(argc, argv, "--feather", "")) {
@@ -188,29 +190,39 @@ int predict_seamless(int argc, char **argv) {
     int ga = opt_atoi("--gpu", sopt(argc, argv, "--gpu", "0")), gb = ga, par = 0;
     const char *gl = sopt(argc, argv, "--gpus", nullptr);
     if (gl && !g_split) { if (sscanf(gl, "%d,%d", &ga, &gb) == 2 && ga != gb) par = 1; else if (sscanf(gl, "%d", &ga) == 1) gb = ga; }
+    if (inproc && mode != 2) { fprintf(stderr, "predict --seamless %d: two-process only (UFSM_SEAM_INPROC=1 runs --seamless 2)\n", mode); return 2; }
     if (inproc) return seamless_inproc(argc, argv, W, H, S2, ga);
     const char *out = argv[5]; const double q = opt_atof("--q", sopt(argc, argv, "--q", "8")); const int nlev = opt_atoi("--levels", sopt(argc, argv, "--levels", "4"));
     const int shard = opt_atoi("--shard", sopt(argc, argv, "--shard", "512")), nt = opt_atoi("--threads", sopt(argc, argv, "--threads", "8"));
     if (shard < 128 || shard % 128 || nlev < 1 || q < 0) { fprintf(stderr, "predict --seamless: --shard a multiple of 128, --levels >= 1, --q >= 0\n"); return 2; }
-    char tmp[1400], pa[1500], pb[1500], la[1600], lb[1600], da[1600], db[1600];
-    snprintf(tmp, sizeof tmp, "%s/.seam", out); snprintf(pa, sizeof pa, "%s/a", tmp); snprintf(pb, sizeof pb, "%s/b", tmp);
-    snprintf(la, sizeof la, "%s/a.log", tmp); snprintf(lb, sizeof lb, "%s/b.log", tmp); snprintf(da, sizeof da, "%s/.done", pa); snprintf(db, sizeof db, "%s/.done", pb);
+    /* the passes: per-axis grid phases (0 or S / 2). --seamless 2: 000 + 111 (pass dirs a, b); --seamless 4: the even-parity set 000 011
+       101 110; --seamless 8: all eight. Two diagonal grids leave every line where a grid-0 seam plane crosses a grid-S/2 one with ~0 weight
+       in both (sin^2 products; perf 11-26, w228: pass a 19 -> 93 at its y seam, pass b 19 -> 30 at its z seam, the step visible in the
+       render; ink-seam --line 8: 1.15 against 0.21 on whole planes). Four grids give every point near at most two seam planes a grid
+       away from both, leaving only isolated corners; eight are exact */
+    static const int pat2[2] = {0, 7}, pat4[4] = {0, 3, 5, 6}, pat8[8] = {0, 7, 1, 2, 4, 3, 5, 6};
+    const int np = mode, *pat = mode == 2 ? pat2 : mode == 4 ? pat4 : pat8;
+    char tmp[1400], pd[8][1500], pl[8][1600], pdn[8][1600], pn[8][8];
+    snprintf(tmp, sizeof tmp, "%s/.seam", out);
+    for (int i = 0; i < np; i++) {
+        if (pat[i] == 0 || pat[i] == 7) snprintf(pn[i], sizeof pn[i], "%s", pat[i] ? "b" : "a");
+        else snprintf(pn[i], sizeof pn[i], "p%d%d%d", pat[i] >> 2 & 1, pat[i] >> 1 & 1, pat[i] & 1);
+        snprintf(pd[i], sizeof pd[i], "%s/%s", tmp, pn[i]); snprintf(pl[i], sizeof pl[i], "%s/%s.log", tmp, pn[i]); snprintf(pdn[i], sizeof pdn[i], "%s/.done", pd[i]);
+    }
     if (mkdir_p(tmp)) { fprintf(stderr, "predict --seamless: cannot create %s: %s\n", tmp, strerror(errno)); return 1; }
     setenv("UFSM_SEAM_CHILD", "1", 1);
-    fprintf(stderr, "predict --seamless 2: window %d halo %d, tile %d, passes on grids 0 and %d (shards %d), %s; logs %s/{a,b}.log\n", W, H, S, S2, S2,
-            par ? "one per GPU at once" : g_split ? "one after the other, each window split (--split, --gpus kept)" : "one after the other", tmp);
-    const int need_a = !is_file(da), need_b = !is_file(db); int rc = 0;
-    if (need_a) rm_rf(pa);
-    if (need_b) rm_rf(pb);
-    if (par) {
-        const pid_t a = need_a ? spawn_pass(argc, argv, pa, W, H, S2, 0, ga, la) : 0, b = need_b ? spawn_pass(argc, argv, pb, W, H, S2, S2, gb, lb) : 0;
-        if (a < 0 || b < 0) return 1;
-        const int ra = a ? wait_pass(a, "a", la) : 0, rb = b ? wait_pass(b, "b", lb) : 0; rc = ra ? ra : rb;
-        if (!ra && a) fclose(fopen(da, "w"));
-        if (!rb && b) fclose(fopen(db, "w"));
-    } else {
-        if (need_a) { const pid_t a = spawn_pass(argc, argv, pa, W, H, S2, 0, ga, la); if (a < 0) return 1; if ((rc = wait_pass(a, "a", la))) goto fail; fclose(fopen(da, "w")); }
-        if (need_b) { const pid_t b = spawn_pass(argc, argv, pb, W, H, S2, S2, gb, lb); if (b < 0) return 1; if ((rc = wait_pass(b, "b", lb))) goto fail; fclose(fopen(db, "w")); }
+    fprintf(stderr, "predict --seamless %d: window %d halo %d, tile %d, %d passes on per-axis grid phases 0 / %d (shards %d), %s; logs %s/*.log\n", mode, W, H, S, np, S2, S2,
+            par ? "two at once, one per GPU" : g_split ? "one after the other, each window split (--split, --gpus kept)" : "one after the other", tmp);
+    int rc = 0;
+    for (int i = 0; i < np && !rc; i += par ? 2 : 1) {   /* (--gpus A,B: passes i and i + 1 at once) */
+        pid_t pid[2] = {0, 0};
+        for (int j = 0; j < (par ? 2 : 1) && i + j < np; j++) {
+            const int k = i + j; if (is_file(pdn[k])) continue;
+            rm_rf(pd[k]);
+            const int sh[3] = {(pat[k] >> 2 & 1) * S2, (pat[k] >> 1 & 1) * S2, (pat[k] & 1) * S2};
+            if ((pid[j] = spawn_pass(argc, argv, pd[k], W, H, S2, sh, j ? gb : ga, pl[k])) < 0) return 1;
+        }
+        for (int j = 0; j < 2; j++) if (pid[j] > 0) { const int r = wait_pass(pid[j], pn[i + j], pl[i + j]); if (r) rc = r; else fclose(fopen(pdn[i + j], "w")); }
     }
     if (rc) goto fail;
     /* the blend's region (perf 11-26, PHerc1203 r24 ink-seam off256 9.32 vs off0 0.25): a pass writes every shard of a window it
@@ -221,10 +233,7 @@ int predict_seamless(int argc, char **argv) {
     ink_blend_region reg = {0};
     for (int d = 0; d < 3; d++) {
         reg.lo[d] = g_lo[d] > 0 ? g_lo[d] / S2 * S2 : 0; reg.hi[d] = (g_hi[d] + S2 - 1) / S2 * S2;
-        for (int p = 0; p < 2; p++) {
-            long long lo = g_lo[d] - p * S2; lo = (lo >= 0 ? lo / S : -((-lo + S - 1) / S)) * S + p * S2; if (lo < 0) lo = p * S2;   /* pass_box */
-            reg.plo[p][d] = lo; reg.phi[p][d] = reg.hi[d];
-        }
+        for (int i = 0; i < np; i++) { reg.plo[i][d] = pass_lo(S, d, (pat[i] >> (2 - d) & 1) * S2); reg.phi[i][d] = reg.hi[d]; }   /* (pass_box) */
     }
     { const char *tlf = sopt(argc, argv, "--tile-list", nullptr);
       if (tlf) {
@@ -240,29 +249,34 @@ int predict_seamless(int argc, char **argv) {
           fclose(f);
           if (!reg.ntl) { fprintf(stderr, "predict --seamless: --tile-list %s has no tiles\n", tlf); return 1; }
       } }
-    seam_store st[64]; const int ns = find_stores(pa, "", 0, st, 0, 64);
-    if (!ns) { fprintf(stderr, "predict --seamless: pass a wrote no store under %s\n", pa); return 1; }
+    seam_store st[64]; const int ns = find_stores(pd[0], "", 0, st, 0, 64);
+    if (!ns) { fprintf(stderr, "predict --seamless: pass a wrote no store under %s\n", pd[0]); return 1; }
     for (int k = 0; k < ns; k++) {
-        char ia[1800], ib[1800], o[1800], attrs[600]; const char *r = st[k].rel;
-        snprintf(ia, sizeof ia, "%s%s%s", pa, *r ? "/" : "", r); snprintf(ib, sizeof ib, "%s%s%s", pb, *r ? "/" : "", r);
+        char ip[8][1800], o[1800], attrs[700], gs[160] = ""; const char *r = st[k].rel;
+        for (int i = 0; i < np; i++) {
+            snprintf(ip[i], sizeof ip[i], "%s%s%s", pd[i], *r ? "/" : "", r);
+            char z[1900]; snprintf(z, sizeof z, "%s/%s/zarr.json", ip[i], st[k].lv); if (!is_file(z)) { fprintf(stderr, "predict --seamless: pass %s has no %s\n", pn[i], z); return 1; }
+            snprintf(gs + strlen(gs), sizeof gs - strlen(gs), "%s\"%d%d%d\"", i ? "," : "", pat[i] >> 2 & 1, pat[i] >> 1 & 1, pat[i] & 1);
+        }
         snprintf(o, sizeof o, "%s%s%s", out, *r ? "/" : "", r);
-        { char z[1900]; snprintf(z, sizeof z, "%s/%s/zarr.json", ib, st[k].lv); if (!is_file(z)) { fprintf(stderr, "predict --seamless: pass b has no %s\n", z); return 1; } }
         if (*r) rm_rf(o);
         else { char z[1900]; snprintf(z, sizeof z, "%s/%s", out, st[k].lv); rm_rf(z); }
         if (mkdir_p(o)) { fprintf(stderr, "predict --seamless: cannot create %s\n", o); return 1; }
-        snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s probability (predict --seamless 2: two passes on grids 0 and %d, tile %d, sin^2 blend)\","
+        if (mode == 2) snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s probability (predict --seamless 2: two passes on grids 0 and %d, tile %d, sin^2 blend)\","
                  "\"seamless\":{\"mode\":2,\"window\":%d,\"halo\":%d,\"tile\":%d,\"grids\":[0,%d]}}}", *r ? r : "prediction", S2, S, W, H, S, S2);
-        const double tl[3] = {S, S, S}, g[2][3] = {{0, 0, 0}, {S2, S2, S2}}; const int64_t org[2][3] = {{0, 0, 0}, {0, 0, 0}};
-        const char *in[2] = {ia, ib};
+        else snprintf(attrs, sizeof attrs, "{\"ufsm\":{\"content\":\"%s probability (predict --seamless %d: %d passes on per-axis grid phases 0 / %d, tile %d, sin^2 blend)\","
+                 "\"seamless\":{\"mode\":%d,\"window\":%d,\"halo\":%d,\"tile\":%d,\"shift\":%d,\"phases\":[%s]}}}", *r ? r : "prediction", mode, np, S2, S, mode, W, H, S, S2, gs);
+        double tl[3] = {S, S, S}, g[8][3]; int64_t org[8][3] = {{0}}; const char *in[8];
+        for (int i = 0; i < np; i++) { in[i] = ip[i]; for (int d = 0; d < 3; d++) g[i][d] = (pat[i] >> (2 - d) & 1) * S2; }
         fprintf(stderr, "predict --seamless: blend %s (%s um)\n", *r ? r : "(the output)", st[k].lv);
         ink_blend_set_region(&reg);
-        if (ink_blend_run(o, atof(st[k].lv), tl, 2, in, g, org, nlev, shard, q, nt, attrs)) { fprintf(stderr, "predict --seamless: blend of %s failed (passes kept in %s)\n", *r ? r : "the output", tmp); return 1; }
+        if (ink_blend_run(o, atof(st[k].lv), tl, np, in, (const double (*)[3])g, (const int64_t (*)[3])org, nlev, shard, q, nt, attrs)) { fprintf(stderr, "predict --seamless: blend of %s failed (passes kept in %s)\n", *r ? r : "the output", tmp); return 1; }
     }
     free(reg.tl);
     if (!getenv("UFSM_SEAM_KEEP") || !atoi(getenv("UFSM_SEAM_KEEP"))) rm_rf(tmp);
     fprintf(stderr, "predict --seamless: %d store%s written under %s\n", ns, ns == 1 ? "" : "s", out);
     return 0;
 fail:
-    fprintf(stderr, "predict --seamless: a pass failed; see %s/{a,b}.log (finished passes are kept: rerun resumes)\n", tmp);
+    fprintf(stderr, "predict --seamless: a pass failed; see %s/*.log (finished passes are kept: rerun resumes)\n", tmp);
     return rc ? rc : 1;
 }
