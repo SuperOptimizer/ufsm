@@ -48,8 +48,6 @@ static float h2f(uint16_t h) {
 }
 
 /* ---- feature file: header, crop names, rows {crop, r, c, label, weight, F fp16} ---- */
-typedef struct { char magic[8]; int32_t F, E, nd, ni, ncrop, stride, win, pad; } dvf_head;
-enum { DVF_NAME = 256 };
 
 /* a crop: surface grid, labels / mask on the canvas, its CT key and voxel size */
 typedef struct { int w, h, N; float *X, *Y, *Z; double scale; uint8_t *lab, *msk; char ct[512]; double um; } pcrop;
@@ -220,7 +218,7 @@ static int cmd_feats(int argc, char **argv) {
 typedef struct { dvf_head H; char (*names)[DVF_NAME]; long n; dvf_row *R; float *X; int Fs; } dvf;
 static int feat_cols(const dvf_head *H, const char *spec, int *cols) {   /* "tok,dense,ink" -> column indices */
     int n = 0; char b[128]; snprintf(b, sizeof b, "%s", spec);
-    for (char *t = strtok(b, ","); t; t = strtok(nullptr, ",")) {
+    char *sv = nullptr; for (char *t = strtok_r(b, ",", &sv); t; t = strtok_r(nullptr, ",", &sv)) {
         int a = -1, e = -1;
         if (!strcmp(t, "tok")) { a = 0; e = H->E; } else if (!strcmp(t, "dense")) { a = H->E; e = H->E + H->nd; } else if (!strcmp(t, "ink")) { a = H->E + H->nd; e = H->F; }
         else { fprintf(stderr, "dinovol-probe: --feat: tok, dense, ink\n"); return -1; }
@@ -509,5 +507,91 @@ int cmd_dinovol_probe(int argc, char **argv) {
     if (!strcmp(m, "fit")) return cmd_fit(argc, argv);
     if (!strcmp(m, "apply")) return cmd_apply(argc, argv);
     fprintf(stderr, "usage: ufsm dinovol-probe stats|feats|fit|apply|pfeats|triplets ...   linear ink probe of frozen dinovol features on ink-devcrops crops\n");
+    return 2;
+}
+
+/* ---- ufsm ssl-probe (2026-11-26, the DINO-for-ink plan): the same weighted logistic probe on any feature file set (dinovol-probe feats,
+   predict --surf-feats: our trunk's level-0 features on the crops' surface lattice), several files concatenated (one per crop run);
+   apply writes each crop's map on its own canvas (the mesh's canvas, what ink-score reads), not the 256 label grid ---- */
+static int ssl_read(dvf *D, const char *list) {   /* comma-separated .dvf files, every column, crop indices offset; one feature count */
+    memset(D, 0, sizeof *D); char *cp = strdup(list); int rc = 0;
+    char *sv = nullptr;   /* (strtok_r: dvf_read -> feat_cols tokenises too; with strtok only the first file was read, 11-26 E0-avg probe: 3 of 99 dev maps) */
+    for (char *t = strtok_r(cp, ",", &sv); t && !rc; t = strtok_r(nullptr, ",", &sv)) {
+        dvf E; if (dvf_read(&E, t, "tok")) { rc = -1; break; }
+        if (E.H.E != E.H.F) { fprintf(stderr, "ssl-probe: %s: %d of %d columns are tokens: give one feature set per file (E = F)\n", t, E.H.E, E.H.F); dvf_free(&E); rc = -1; break; }
+        if (D->H.ncrop && (E.H.F != D->H.F || E.H.stride != D->H.stride)) { fprintf(stderr, "ssl-probe: %s: %d features / stride %d, the first file %d / %d\n", t, E.H.F, E.H.stride, D->H.F, D->H.stride); dvf_free(&E); rc = -1; break; }
+        const int c0 = D->H.ncrop; if (!c0) D->H = E.H, D->H.ncrop = 0; D->Fs = E.Fs;
+        D->names = realloc(D->names, (size_t)(c0 + E.H.ncrop) * DVF_NAME); memcpy(D->names + c0, E.names, (size_t)E.H.ncrop * DVF_NAME);
+        D->R = realloc(D->R, sizeof(dvf_row) * (D->n + E.n)); D->X = realloc(D->X, sizeof(float) * (size_t)(D->n + E.n) * E.Fs);
+        for (long i = 0; i < E.n; i++) { D->R[D->n + i] = E.R[i]; D->R[D->n + i].crop += c0; }
+        memcpy(D->X + (size_t)D->n * E.Fs, E.X, sizeof(float) * (size_t)E.n * E.Fs);
+        D->n += E.n; D->H.ncrop = c0 + E.H.ncrop; dvf_free(&E);
+    }
+    free(cp);
+    if (!rc && !D->n) { fprintf(stderr, "ssl-probe: no rows in %s\n", list); rc = -1; }
+    return rc;
+}
+static int ssl_fit(int argc, char **argv) {
+    const char *out = argc > 3 ? argv[3] : nullptr, *in = argc > 4 ? argv[4] : nullptr;
+    const double lam = opt_atof("--l2", opt(argc, argv, "--l2", "1e-3")); const int iters = opt_atoi("--iters", opt(argc, argv, "--iters", "12"));
+    const int nthreads = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 6);
+    if (!out || !in || out[0] == '-' || in[0] == '-') { fprintf(stderr, "usage: ufsm ssl-probe fit OUT.probe A.dvf[,B.dvf,..] [--l2 1e-3] [--iters 12] [--threads 6]   (training crops' feature files)\n"); return 2; }
+    dvf D; if (ssl_read(&D, in)) return 1;
+    const int F = D.Fs; double *mu = malloc(sizeof(double) * F), *sd = malloc(sizeof(double) * F), *w = malloc(sizeof(double) * (F + 1)), *s = malloc(sizeof(double) * D.n);
+    double W = 0, Y = 0; for (long i = 0; i < D.n; i++) { W += D.R[i].wgt; Y += D.R[i].wgt * D.R[i].lab; }
+    fprintf(stderr, "ssl-probe fit: %ld rows over %d crops, %d features, ink share %.3f, l2 %g\n", D.n, D.H.ncrop, F, W > 0 ? Y / W : 0, lam);
+    if (!(Y > 0) || !(W - Y > 0)) { fprintf(stderr, "ssl-probe fit: ALERT: the training rows hold one class only\n"); return 1; }
+    if (dvp_fit(D.X, D.R, D.n, F, lam, iters, nthreads, mu, sd, w)) return 1;
+    dvp_scores(D.X, D.n, F, mu, sd, w, s);
+    fprintf(stderr, "ssl-probe fit: train AUC %.4f\n", dvp_wauc(s, D.R, D.n));
+    FILE *f = fopen(out, "w"); if (!f) { fprintf(stderr, "ssl-probe: cannot write %s\n", out); return 1; }
+    fprintf(f, "dvprobe1 tok %d\n", F); for (int k = 0; k < F; k++) fprintf(f, "%.17g %.17g %.17g\n", mu[k], sd[k], w[k]); fprintf(f, "%.17g\n", w[F]);
+    const int rc = fclose(f) != 0;
+    free(mu); free(sd); free(w); free(s); dvf_free(&D); return rc;
+}
+static int ssl_apply(int argc, char **argv) {
+    const char *pf = argc > 3 ? argv[3] : nullptr, *in = argc > 4 ? argv[4] : nullptr, *cdir = opt(argc, argv, "--crops", nullptr), *out = opt(argc, argv, "--out", nullptr);
+    if (!pf || !in || pf[0] == '-' || in[0] == '-' || !cdir || !out) { fprintf(stderr, "usage: ufsm ssl-probe apply PROBE A.dvf[,B.dvf,..] --crops DIR --out MAPDIR   (MAPDIR/<crop>.tif on the crop's canvas)\n"); return 2; }
+    FILE *f = fopen(pf, "r"); char spec[128]; int F = 0;
+    if (!f || fscanf(f, "dvprobe1 %127s %d", spec, &F) != 2 || F <= 0) { fprintf(stderr, "ssl-probe: bad probe %s\n", pf); if (f) fclose(f); return 1; }
+    double *mu = malloc(sizeof(double) * F), *sd = malloc(sizeof(double) * F), *w = malloc(sizeof(double) * (F + 1));
+    for (int k = 0; k < F; k++) if (fscanf(f, "%lf %lf %lf", &mu[k], &sd[k], &w[k]) != 3) { fclose(f); return 1; }
+    if (fscanf(f, "%lf", &w[F]) != 1) { fclose(f); return 1; } fclose(f);
+    dvf D; if (ssl_read(&D, in)) return 1;
+    if (D.Fs != F) { fprintf(stderr, "ssl-probe: %s has %d features, the probe %d\n", in, D.Fs, F); return 1; }
+    double *s = malloc(sizeof(double) * D.n); dvp_scores(D.X, D.n, F, mu, sd, w, s);
+    mkdir(out, 0755);
+    const int st = D.H.stride; int rc = 0, nmap = 0;
+    long *first = malloc(sizeof(long) * (D.H.ncrop + 1)); for (int c = 0; c <= D.H.ncrop; c++) first[c] = D.n;
+    for (long i = D.n - 1; i >= 0; i--) first[D.R[i].crop] = i;
+    for (int c = 0; c < D.H.ncrop && !rc; c++) {
+        char d[1400]; snprintf(d, sizeof d, "%s/%s", cdir, D.names[c]); pcrop C; if (pcrop_load(&C, d)) { rc = 1; break; }
+        const int G = C.N / st, cw = (int)ceil(C.w / C.scale), chh = (int)ceil(C.h / C.scale); const double Fl = 0.5 * ((double)cw / C.N + (double)chh / C.N);
+        double *L = malloc(sizeof(double) * G * G); uint8_t *has = calloc((size_t)G * G, 1), *map = calloc((size_t)cw * chh, 1); int any = 0;
+        for (long i = first[c]; i < D.n && D.R[i].crop == c; i++) { const int a = D.R[i].r, b = D.R[i].c; if (a < G && b < G) { L[a * G + b] = s[i]; has[a * G + b] = 1; any = 1; } }
+        if (any) {
+            for (int k = 0; k < G * G; k++) if (!has[k]) {   /* (cells without a row: the nearest row's logit, for the bilinear blend) */
+                const int a = k / G, b = k % G; int bd = 1 << 30; for (int q = 0; q < G * G; q++) if (has[q]) { const int dd = (q / G - a) * (q / G - a) + (q % G - b) * (q % G - b); if (dd < bd) { bd = dd; L[k] = L[q]; } } }
+            for (int y = 0; y < chh; y++) for (int x = 0; x < cw; x++) {
+                const double ly = (y + 0.5) / Fl - 0.5, lx = (x + 0.5) / Fl - 0.5;   /* the canvas px's label-grid point, then the lattice cell coordinate */
+                double u = (ly - (st - 1) * 0.5) / st, v = (lx - (st - 1) * 0.5) / st; if (u < 0) u = 0; if (v < 0) v = 0; if (u > G - 1) u = G - 1; if (v > G - 1) v = G - 1;
+                int a = (int)u, b = (int)v; if (a > G - 2) a = G - 2; if (b > G - 2) b = G - 2; const double fu = u - a, fv = v - b;
+                const double t = (1 - fu) * ((1 - fv) * L[a * G + b] + fv * L[a * G + b + 1]) + fu * ((1 - fv) * L[(a + 1) * G + b] + fv * L[(a + 1) * G + b + 1]);
+                map[(size_t)y * cw + x] = (uint8_t)(1 + lrint(254 / (1 + exp(-t))));
+            }
+            char p[1400]; snprintf(p, sizeof p, "%s/%s.tif", out, D.names[c]); if (tiffw_write(p, cw, chh, 1, map, 1)) { fprintf(stderr, "ssl-probe: cannot write %s\n", p); rc = 1; } else nmap++;
+        } else fprintf(stderr, "ssl-probe apply: ALERT: %s has no feature rows: no map\n", D.names[c]);
+        free(L); free(has); free(map); pcrop_free(&C);
+    }
+    fprintf(stderr, "ssl-probe apply: %ld rows, %d maps, pooled lattice AUC %.4f -> %s\n", D.n, nmap, dvp_wauc(s, D.R, D.n), out);
+    free(first); free(s); free(mu); free(sd); free(w); dvf_free(&D); return rc;
+}
+int cmd_ssl_probe(int argc, char **argv) {
+    const char *m = argc > 2 ? argv[2] : "";
+    if (!strcmp(m, "fit")) return ssl_fit(argc, argv);
+    if (!strcmp(m, "apply")) return ssl_apply(argc, argv);
+    fprintf(stderr, "usage: ufsm ssl-probe fit|apply ...   linear ink probe on feature files (predict --surf-feats, dinovol-probe feats)\n"
+                    "  ufsm ssl-probe fit OUT.probe A.dvf[,B.dvf,..] [--l2 1e-3] [--iters 12] [--threads 6]\n"
+                    "  ufsm ssl-probe apply PROBE A.dvf[,..] --crops DIR --out MAPDIR\n");
     return 2;
 }

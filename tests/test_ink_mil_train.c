@@ -336,6 +336,30 @@ int main(int argc, char **argv) {
             fprintf(stderr, "predict --surf-overlap 0.5: %zu of %zu tiled px kept, %.0f%% of px equal to the tiling\n", n2 - lost, n2, m2 ? 100.0 * same / ((double)w2 * h2) : 0);
             CHECK(m2 && m3 && w2 == w3 && h2 == h3 && n2 > 0 && !lost && same < (size_t)w2 * h2, "overlap map %d x %d vs %d x %d, %zu tiled px lost (%s)", w3, h3, w2, h2, lost, q3);
             free(m2); free(m3); }
+        /* --surf-feats (2026-11-26, ssl-probe): no head, the head's input (C0 x K = 2 --surf-k + 1 layers) at the crop's label lattice as a .dvf:
+           slab path = whole-window path byte for byte, no DEFAULTED but the off-surface cells' (the canvas's last row / column of label px past the mesh: 304 of 14700), F a multiple of K, features vary across
+           rows; ssl-probe fit runs on them (the checkerboard labels are not in the fixture's CT: train AUC 0.55 > 0.5) */
+        CHECK(!sh("cp %s/fx/inklabels.tif %s/fx/seg.tifxyz/labels.tif && cp %s/fx/mask.tif %s/fx/seg.tifxyz/mask.tif", d, d, d, d), "label copies");
+        CHECK(!sh("%s predict %s/sf/last.ckpt %s/fx ct %s/pf0 --axis %s/fx/axis.json --surf %s/fx/seg.tifxyz --surf-feats %s/f0.dvf --surf-feats-stride 4 %s > %s/sf0.log 2>&1 && "
+                  "UFSM_SURF_WHOLE=1 %s predict %s/sf/last.ckpt %s/fx ct %s/pf1 --axis %s/fx/axis.json --surf %s/fx/seg.tifxyz --surf-feats %s/f1.dvf --surf-feats-stride 4 %s > %s/sf1.log 2>&1 && "
+                  "cmp %s/f0.dvf %s/f1.dvf && ! grep DEFAULTED %s/sf0.log | grep -vq 'cells had no predicted map px'", U, d, d, d, d, d, d, pa, d, U, d, d, d, d, d, d, pa, d, d, d, d),
+              "predict --surf-feats: slab vs whole-window feature files differ or DEFAULTED (%s/sf0.log, sf1.log)", d);
+        {   char q[700]; snprintf(q, sizeof q, "%s/f0.dvf", d); FILE *f = fopen(q, "rb"); int32_t h[10] = {0}; long nr = 0, nvar = 0, nbad = 0; char nm[256];
+            if (f && fread(h, 4, 10, f) == 10 && !memcmp(h, "DVPF0001", 8) && h[6] == 1 && fread(nm, 1, 256, f) == 256) {
+                const int F = h[2]; uint16_t *r0 = malloc((size_t)F * 2), *r = malloc((size_t)F * 2); unsigned char rh[16];
+                while (fread(rh, 1, 16, f) == 16 && fread(r, 2, (size_t)F, f) == (size_t)F) {
+                    for (int k = 0; k < F; k++) { nbad += (r[k] & 0x7c00) == 0x7c00; if (nr && r[k] != r0[k]) { nvar++; break; } }
+                    if (!nr) memcpy(r0, r, (size_t)F * 2); nr++; }
+                fprintf(stderr, "predict --surf-feats: %ld rows of %d features (%d = C0 x %d), %ld rows differ from the first, %ld non-finite\n", nr, F, h[2], h[9], nvar, nbad);
+                CHECK(F > 0 && h[9] == 5 && F % 5 == 0 && h[3] == F && nr > 100 && nvar > nr / 2 && !nbad, "feature file %s: F %d K %d, %ld rows, %ld varying, %ld non-finite", q, F, h[9], nr, nvar, nbad);
+                free(r0); free(r); } else CHECK(0, "feature file %s header", q);
+            if (f) fclose(f); }
+        CHECK(!sh("%s ssl-probe fit %s/f.probe %s/f0.dvf > %s/sfit.log 2>&1 && awk '/train AUC/ {a = $NF} END {exit !(a > 0.5)}' %s/sfit.log", U, d, d, d, d),
+              "ssl-probe fit on the fixture's features (%s/sfit.log)", d);
+        /* (11-26) a file list: every file read (strtok inside dvf_read once cut the list to its first file) */
+        CHECK(!sh("%s ssl-probe fit %s/f2.probe %s/f0.dvf,%s/f1.dvf > %s/sfit2.log 2>&1 && grep -Eq 'fit: [0-9]+ rows over 2 crops' %s/sfit2.log && "
+                  "[ $(grep -o '[0-9]* rows over' %s/sfit2.log | cut -d' ' -f1) = $((2 * $(grep -o '[0-9]* rows over' %s/sfit.log | cut -d' ' -f1))) ]", U, d, d, d, d, d, d, d),
+              "ssl-probe fit on two files reads both (%s/sfit2.log)", d);
     }
     if (getenv("TIMT_KEEP")) fprintf(stderr, "kept %s (sources %s/fx/sources-mil.json)\n", d, d);
     else if (!fails) sh("rm -rf %s", d);

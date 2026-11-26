@@ -8,7 +8,7 @@
    basename} at it).
    --holdouts H.json --hold-ct KEY [--hold-scale F]: every box of a wbench holdouts.json ({"boxes": [{"ct", "l0": [z,y,x,nz,ny,nx]}]})
    whose ct basename is KEY's is written unknown (255), human labels too (F: level-0 voxels per --like voxel, e.g. 4 for a 9.6 um grid of a
-   2.4 um scan; boxes rounded outwards): teacher targets never cover held-out GT, whatever the trainer's own holdout_file does. */
+   2.4 um scan; boxes rounded outwards; --hold-pad P: grown by P --like voxels each side, a guard): teacher targets never cover held-out GT, whatever the trainer's own holdout_file does. */
 #include <math.h>
 #include "optcheck.h"
 #include <pthread.h>
@@ -97,13 +97,13 @@ static void *fp_worker(void *a) {
 }
 
 int cmd_fields_phase(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm fields-phase OUT_DIR --like ROOT KEY [--ref ROOT KEY] [--conf 0.5] [--threads 16] [--holdouts H.json --hold-ct KEY [--hold-scale F]] FIELDS_DIR...\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm fields-phase OUT_DIR --like ROOT KEY [--ref ROOT KEY] [--conf 0.5] [--threads 16] [--holdouts H.json --hold-ct KEY [--hold-scale F] [--hold-pad P]] FIELDS_DIR...\n"); return 2; }
     const char *out = argv[2], *lr = nullptr, *lk = nullptr, *rr = nullptr, *rk = nullptr; const char *dirs[256]; int nd = 0;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], opt_n("--like")) && i + 2 < argc) { lr = argv[i + 1]; lk = argv[i + 2]; i += 2; }
         else if (!strcmp(argv[i], opt_n("--ref")) && i + 2 < argc) { rr = argv[i + 1]; rk = argv[i + 2]; i += 2; }
         else if ((!strcmp(argv[i], opt_n("--conf")) || !strcmp(argv[i], opt_n("--threads")) || !strcmp(argv[i], opt_n("--holdouts")) || !strcmp(argv[i], opt_n("--hold-ct"))
-                  || !strcmp(argv[i], opt_n("--hold-scale"))) && i + 1 < argc) i++;
+                  || !strcmp(argv[i], opt_n("--hold-scale")) || !strcmp(argv[i], opt_n("--hold-pad"))) && i + 1 < argc) i++;
         else if (argv[i][0] != '-' && nd < 256) dirs[nd++] = argv[i];
     }
     if (!lr || !nd) { fprintf(stderr, "fields-phase: --like ROOT KEY and at least one FIELDS_DIR\n"); return 2; }
@@ -111,10 +111,10 @@ int cmd_fields_phase(int argc, char **argv) {
     z3 *zl = z3_open(store_open(lr), lk, nullptr); if (!zl) { fprintf(stderr, "fields-phase: %s\n", z3_error()); return 1; }
     const int64_t *shape = z3_meta_of(zl)->shape;
     z3 *zr = nullptr; if (rr && !(zr = z3_open(store_open(rr), rk, nullptr))) { fprintf(stderr, "fields-phase: %s\n", z3_error()); return 1; }
-    const char *hp = fp_opt(argc, argv, "--holdouts", nullptr), *hct = fp_opt(argc, argv, "--hold-ct", nullptr); const double hsc = opt_atof("--hold-scale", fp_opt(argc, argv, "--hold-scale", "1"));
+    const char *hp = fp_opt(argc, argv, "--holdouts", nullptr), *hct = fp_opt(argc, argv, "--hold-ct", nullptr); const double hsc = opt_atof("--hold-scale", fp_opt(argc, argv, "--hold-scale", "1")); const int hpad = opt_atoi("--hold-pad", fp_opt(argc, argv, "--hold-pad", "0"));
     int nh = 0; int64_t *hb = nullptr;
     if (hp) {   /* the held-out boxes of this scan, in --like voxels (rounded outwards) */
-        if (!hct || !(hsc > 0)) { fprintf(stderr, "fields-phase: --holdouts needs --hold-ct KEY (and --hold-scale > 0)\n"); return 2; }
+        if (!hct || !(hsc > 0) || hpad < 0) { fprintf(stderr, "fields-phase: --holdouts needs --hold-ct KEY (and --hold-scale > 0, --hold-pad >= 0)\n"); return 2; }
         FILE *f = fopen(hp, "rb"); if (!f) { fprintf(stderr, "fields-phase: cannot open %s\n", hp); return 1; }
         fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET); char *t = malloc((size_t)n + 1);
         const size_t got = t ? fread(t, 1, (size_t)n, f) : 0; fclose(f);
@@ -125,38 +125,55 @@ int cmd_fields_phase(int argc, char **argv) {
             if (strcmp(fp_base(json_str(json_get(e, "ct"), "")), me)) continue;
             if (!l0 || l0->type != J_ARR || l0->n != 6) { fprintf(stderr, "fields-phase: %s box %zu is not [z, y, x, nz, ny, nx]\n", hp, k); json_free(j); return 1; }
             for (int a = 0; a < 3; a++) { const double b0 = json_num(json_at(l0, a), 0), bn = json_num(json_at(l0, 3 + a), 0);
-                hb[6 * nh + a] = (int64_t)floor(b0 / hsc); hb[6 * nh + 3 + a] = (int64_t)ceil((b0 + bn) / hsc); }
+                hb[6 * nh + a] = (int64_t)floor(b0 / hsc) - hpad; hb[6 * nh + 3 + a] = (int64_t)ceil((b0 + bn) / hsc) + hpad; }
             nh++;
         }
         json_free(j);
-        fprintf(stderr, "fields-phase: %d held-out boxes of %s (%s, scale %g) written unknown\n", nh, me, hp, hsc);
+        fprintf(stderr, "fields-phase: %d held-out boxes of %s (%s, scale %g) written unknown (guard %d voxels)\n", nh, me, hp, hsc, hpad);
     }
     fit_fields_skip_planes(1 | 2 | 4 | 8); fit_fields_ct_planes(0);
-    fit_fields_buf *B = calloc(nd, sizeof *B);
-    for (int d = 0; d < nd; d++) if (fit_fields_load(dirs[d], 0, 0, 1, &B[d])) { fprintf(stderr, "fields-phase: cannot load %s\n", dirs[d]); return 1; }
+    /* the field sets' geometry only (pool 0): their planes are read one z shard row at a time below (a whole-scroll set is ~24 GB of
+       pc / ps: 1667 at 19.2 um cells peaked at 33.7 GB and was OOM-killed in a 36 GB scope, 2026-11-26) */
+    fit_fields_buf *G = calloc(nd, sizeof *G), *B = calloc(nd, sizeof *B);
+    for (int d = 0; d < nd; d++) if (fit_fields_load(dirs[d], 0, 0, 0, &G[d])) { fprintf(stderr, "fields-phase: cannot read %s\n", dirs[d]); return 1; }
     const int S = 512; const int64_t g[3] = {(shape[0] + S - 1) / S, (shape[1] + S - 1) / S, (shape[2] + S - 1) / S};
     char at[256]; snprintf(at, sizeof at, "{\"ufsm\": {\"content\": \"fields-phase teacher pseudo-labels\", \"conf\": %g, \"ref\": %s}}", cmin, zr ? "true" : "false");
     z3w *w = z3w_create(out, shape, S, 0.f, 255, at); if (!w) { fprintf(stderr, "fields-phase: %s\n", z3w_error()); return 1; }
-    /* the shards that overlap a field box, then one worker per thread (own S^3 buffer; z3w_write_shard is thread-safe across shards) */
-    int64_t *list = malloc(sizeof(int64_t) * 3 * (size_t)(g[0] * g[1] * g[2])); int64_t nl = 0;
-    for (int64_t sz = 0; sz < g[0]; sz++) for (int64_t sy = 0; sy < g[1]; sy++) for (int64_t sx = 0; sx < g[2]; sx++) {
-        const int64_t o[3] = {sz * S, sy * S, sx * S}; int hit = 0;
-        for (int d = 0; d < nd && !hit; d++) {
-            const long long *bo = B[d].origin; const int64_t be[3] = {bo[0] + (int64_t)B[d].f.D * B[d].h, bo[1] + (int64_t)B[d].f.H * B[d].h, bo[2] + (int64_t)B[d].f.W * B[d].h};
-            hit = o[0] < be[0] && o[0] + S > bo[0] && o[1] < be[1] && o[1] + S > bo[1] && o[2] < be[2] && o[2] + S > bo[2];
-        }
-        if (hit) { list[3 * nl] = sz; list[3 * nl + 1] = sy; list[3 * nl + 2] = sx; nl++; }
-    }
-    fp_job J = {.B = B, .nd = nd, .zr = zr, .w = w, .shape = shape, .S = S, .cmin = cmin, .list = list, .nl = nl, .nh = nh, .hb = hb};
+    /* per z shard row: each field set's rows that reach it (one cell of margin for the trilinear taps) loaded, the row's shards that
+       overlap a field box, one worker per thread (own S^3 buffer; z3w_write_shard is thread-safe across shards) */
+    int64_t *list = malloc(sizeof(int64_t) * 3 * (size_t)(g[1] * g[2])); long long nsh = 0;
+    fp_job J = {.B = B, .nd = nd, .zr = zr, .w = w, .shape = shape, .S = S, .cmin = cmin, .list = list, .nh = nh, .hb = hb};
     const int nw = nt < 1 ? 1 : nt > 32 ? 32 : nt; pthread_t th[32];
-    for (int i = 0; i < nw; i++) pthread_create(&th[i], nullptr, fp_worker, &J);
-    for (int i = 0; i < nw; i++) pthread_join(th[i], nullptr);
+    for (int64_t sz = 0; sz < g[0] && !J.fail; sz++) {
+        const int64_t z0 = sz * S, z1 = z0 + S < shape[0] ? z0 + S : shape[0]; int any = 0;
+        for (int d = 0; d < nd; d++) {
+            const fit_fields_buf *q = &G[d]; const int h = q->h; memset(&B[d], 0, sizeof B[d]);
+            long long f0 = (long long)floor((double)(z0 - q->origin[0]) / h) - 1, f1 = (long long)ceil((double)(z1 - q->origin[0]) / h) + 1;
+            if (f0 < 0) f0 = 0; if (f1 > q->shape[0]) f1 = q->shape[0];
+            if (f0 >= f1) { B[d].h = h; B[d].f.D = 0; for (int a2 = 0; a2 < 3; a2++) B[d].origin[a2] = q->origin[a2]; continue; }   /* (no rows here: every voxel test fails) */
+            if (fit_fields_load(dirs[d], (int)f0, (int)f1, 1, &B[d])) { fprintf(stderr, "fields-phase: cannot load %s rows %lld..%lld\n", dirs[d], f0, f1); return 1; }
+            any = 1;
+        }
+        int64_t nl = 0;
+        for (int64_t sy = 0; any && sy < g[1]; sy++) for (int64_t sx = 0; sx < g[2]; sx++) {
+            const int64_t o[3] = {z0, sy * S, sx * S}; int hit = 0;
+            for (int d = 0; d < nd && !hit; d++) {
+                const long long *bo = G[d].origin; const int64_t be[3] = {bo[0] + (int64_t)G[d].shape[0] * G[d].h, bo[1] + (int64_t)G[d].shape[1] * G[d].h, bo[2] + (int64_t)G[d].shape[2] * G[d].h};
+                hit = o[0] < be[0] && o[0] + S > bo[0] && o[1] < be[1] && o[1] + S > bo[1] && o[2] < be[2] && o[2] + S > bo[2];
+            }
+            if (hit) { list[3 * nl] = sz; list[3 * nl + 1] = sy; list[3 * nl + 2] = sx; nl++; }
+        }
+        J.nl = nl; atomic_store(&J.next, 0);
+        if (nl) { for (int i = 0; i < nw; i++) pthread_create(&th[i], nullptr, fp_worker, &J); for (int i = 0; i < nw; i++) pthread_join(th[i], nullptr); }
+        nsh += nl;
+        for (int d = 0; d < nd; d++) if (B[d].f.D) fit_fields_free(&B[d]);
+    }
     free(list);
     if (J.fail) { fprintf(stderr, "fields-phase: a shard failed (read or write)\n"); return 1; }
-    const long long nsh = nl, nref = J.nref, nteach = J.nteach, nlow = J.nlow, nhold = J.nhold; free(hb);
+    const long long nref = J.nref, nteach = J.nteach, nlow = J.nlow, nhold = J.nhold; free(hb);
     z3w_close(w);
     printf("fields-phase: %lld shards, voxels: %lld human labels kept, %lld teacher labels (conf >= %g), %lld teacher voxels below conf, %lld held out -> %s\n", nsh, nref, nteach, cmin, nlow, nhold, out);
-    for (int d = 0; d < nd; d++) fit_fields_free(&B[d]);
-    free(B);
+    for (int d = 0; d < nd; d++) fit_fields_free(&G[d]);
+    free(B); free(G);
     return 0;
 }
