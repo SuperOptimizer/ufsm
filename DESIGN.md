@@ -113,6 +113,31 @@ on the CPU with the GPU idle.
   - sassx.sh / sass120d.sh / kres2.sh: offline sm_120a SASS of a unit or a modified copy, mcc vs nvcc.
   - hostcmp.sh: host .text compare.
 
+## PICKS3: E2D2 (E0's recipe on fixed sources) ties E0; q8 CT costs reader3 0.035 on 1447; fusion with E0 adds nothing (2026-11-26, inksdk)
+
+Pre-registered in /vesuvius/ufsm/inksdk/clean/PICKS3-E2D2.txt before launch: E2D2 = E0's argv byte for byte on sources-DEV2 (0009B iso 112
++ its 2.4 um axis, 0500P2 iso 80: face found .538 -> .767 / .642), init S2-avg22-30, 12000 steps on desk card 1 (master 4fdfaea0, 69 min,
+DEFAULTED 0, CT decode on the GPU). The one pick: ckpt-avg of snapshots 10k / 11k / 12k, scored once with E0-t8's settings (vox w288 h16,
+`--tta 8`, 0841 level 2). Amendment 1: reader3-ctx-m8 also on lossless CT (S3 bytes at volcomp q0 under the clean crops, pullct).
+
+| row (paired per crop) | 1447 (28) | 0841 (8) |
+|---|---|---|
+| E2D2-t8 | .6822 | .8578 |
+| vs E0-t8 | -.005 +- .009 (16 / 28 up) | +.006 +- .014 |
+| vs reader3-ctx-m8 (q8 CT) | -.089 +- .013 | -.033 +- .022 |
+| vs reader3-ctx-m8-ll (lossless CT, .8057 / .8907) | -.124 +- .018 | -.033 +- .021 |
+| reader3-ctx-m8-ll vs reader3-ctx-m8 | +.035 +- .009 (25 / 28 up) | -.000 +- .003 |
+
+The source fixes do not move the 9.6 um voxel net; the 3-D net stays ~0.09-0.12 below reader3 on 1447. The volcomp q8 mirror costs reader3
+0.035 AUC on 1447 (0841, read at level 2 = 4x mean-pooled, is unaffected): the fair 2-D bar on 1447 is .806. E2D2-t8-ll (the 3-D net on
+lossless CT, amendment 2) waits for pullct's 3-D cover of the clean boxes.
+
+Output fusion, dev only (99 + h116 48 crops, paired mean4): reader3 ctx r8 median map and E0-avg's voxel map blended per crop by
+`img-rankavg` (weighted mid-rank mean on the joint-valid px; E0 weight 0 = control, equal to reader3 alone +0.0001): E0 weight 0.25
+-0.0005 +- 0.0016, 0.5 -0.016 +- 0.005, 0.75 -0.047 +- 0.010 (E0 alone -0.086 +- 0.014). No weight beats reader3 by > 2 SE: nothing
+pre-registered for the clean pair. R11d (1.1 um) on the x8-upsampled coarse scans, clean subset: 0172 .566 / 0343 .651 (vs E0 -0.24 +- 0.02
+/ -0.28 +- 0.07): the worst upsampling arm.
+
 ## Clean ink benchmark rescore (PICKS2) and fine nets on upsampled coarse scans (2026-11-25, inksdk)
 
 **PICKS2** (pre-registered in /vesuvius/ufsm/inksdk/clean/PICKS2.txt, settings from the dev crops only, each new row scored once on clean
