@@ -46,12 +46,40 @@ Originally no teacher models; since 2026-11-15 published ink networks run as tea
     paths, plus the stochastic-rounding epilogue. This is the next target.
   - ncu reports: /vesuvius/ufsm/microc/deskab/ncu0.
 - bwd_data_s2: mcuda's per-row bound (branch s2kn-20261125, kn = min(bwy, Co - yb bwy)) lets the partial threading end the
-  k chain at the first miss. The bench_f4conv A/B, pin / 01873d0 x base / kn, is still to run.
+  k chain at the first miss. bench_f4conv P 448 (card 0, 18:00), bdata s2 down0 8 -> 16 ms:
+
+  | | base | kn |
+  |---|---|---|
+  | pin ff7f174 | 58.3 | 56.1 |
+  | 01873d0 | 40.7 | 40.3 |
+  | nvcc 13.3 | | 31.5 |
+
+  All six hashes are equal (8ca2c659f1c6798a). 16 -> 16 is the same in every arm (5.99-6.01 ms; nvcc 5.86).
+- Production shapes (card 0, 17:53, mcuda's R11e fixture r11p.argv: R11P widths 32..224, P 448, nsys steps 12-14, one run per
+  arm): the 77 kernels matched in all arms sum to 3640 ms (pin), 3722 (01873d0), 3670 (f4pdev) and 3778 (nvcc). nvcc / mcc is
+  1.038: on R11 widths mcc is already ahead. The mcc arms are within one run's noise of each other. bench_f4conv R11 cases (ms):
+
+  | case | pin | 01873d0 | nvcc |
+  |---|---|---|---|
+  | fwd 32 -> 32 (gn+silu, stats) | 33.6 | 34.0 | 39.8 |
+  | bdata 32 -> 32 (mx4, SR) | 27.7 | 28.3 | 26.7 |
+  | wgrad 32 -> 32 (gn+silu, SR) | 56.0 | 56.0 | 58.3 |
+  | bdata s2 down0 32 -> 32 (mx8 / mx4) | 36.8 / 14.6 | 37.3 / 14.6 | 30.7 / 14.3 |
+
+  The 8-wide gaps (f4p, bwd_s2 8 -> 16) are absent at R11 widths. Production kernels still behind nvcc: conv1_bwd_fused<4,4,16>
+  (1.32x, 83 vs 64 ms over 3 steps), bdata s2 32 -> 32 mx8 (1.20x), gy_pre4<32,4> (1.09x).
 - Checks:
   - arch86 fast tier on the 3070 pod: 384 PASS, 0 FAIL. test_pipeline_cli timed out on a cold JIT cache in the full run and
     passed on rerun.
   - ufsm builds fully on sm_120.
-  - sm_120 GPU half: see the merge commit.
+  - sm_120 GPU half, pod 1 (podink):
+    - cold-cache tier: 224 PASS, 0 FAIL;
+    - two processes precompiling into one fresh cache: 2363 cubins, no duplicates, no stale locks. 2392 kernels were seen;
+      the 29 not compiled are left to the driver's cache (job_whole), by design;
+    - -J 4 tier: 225 PASS;
+    - mccpin2d, the tests touched by the master merge (incl. kn, on 01873d0): 225 PASS, 0 FAIL.
+- nn_core.cu: nvcc toolkits before 13.1 have no cudaMemcpyWithAttributesAsync (the 13.0 pods' llvm builds). UFSM_AUX_CE=1 then
+  falls back to the plain copy with a DEFAULTED line (as when the call fails at run time), so the pods build master unpatched.
 - Scripts in /vesuvius/ufsm/microc/deskab:
   - gap0d.sh / x0.sh / y0.sh: card 0 behind inkperf's hold, nsys A/B, ncu.
   - sassx.sh / sass120d.sh / kres2.sh: offline sm_120a SASS of a unit or a modified copy, mcc vs nvcc.
