@@ -20,6 +20,7 @@ static const char *xs_opt(int argc, char **argv, const char *name, const char *d
 }
 static int xs_is_opt(const char *a) { return !strcmp(a, opt_n("--ct")) || !strcmp(a, opt_n("--level")) || !strcmp(a, opt_n("--z")) || !strcmp(a, opt_n("--crop")) || !strcmp(a, opt_n("--max-px")) || !strcmp(a, opt_n("--dot")); }
 
+
 int cmd_wrap_xsec(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: ufsm wrap-xsec <out.jpg> --ct ROOT KEY --level L --z Z (level-0) [--crop y,x,h,w (level voxels)] [--max-px 4000] [--dot 1] R,G,B:TIFXYZ ...\n");
@@ -79,3 +80,86 @@ int cmd_wrap_xsec(int argc, char **argv) {
     free(g); free(rgb); z3_close(v); store_close(s);
     return 0;
 }
+
+/* ---- ufsm wrap-align <tifxyz> --ct ROOT KEY --level L [--every 8] [--r 3] [--block 512] [--cos 0.9] [--out PREFIX]
+   How well a mesh follows the CT's lamination (lead 11-26, PHerc1203: the global spiral cuts across folded bundles; read first where it
+   follows the sheets). Every --every-th grid vertex (both directions): the mesh normal (cross product of the grid's row / column central
+   differences) against the sheet normal of the CT at level L, the dominant eigenvector (power iteration) of the gradient structure tensor
+   sum g g^T over the (2r + 1)^3 level-L voxels around the vertex (central differences of the raw uint8). |cos| >= --cos counts as aligned.
+   Vertices on air (tensor trace below 1 % of the block's median... simply: mean |g|^2 < 4) or outside the volume are skipped.
+   The grid is cut into --block x --block vertex blocks (each block's CT read once: its vertices' bounding box at level L + r + 1):
+   PREFIX.tsv (row0 col0 rows cols n_samples n_aligned mean_cos aligned_share) and PREFIX.pgm (one pixel per block: aligned share x 255,
+   0 = no sample); stderr: the whole mesh's aligned share. Output pixels of ufsm render --scale 1 on this mesh = grid vertices / scale. */
+static double xs_dot(const double a[3], const double b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+int cmd_wrap_align(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm wrap-align <tifxyz> --ct ROOT KEY --level L [--every 8] [--r 3] [--block 512] [--cos 0.9] [--out PREFIX]\n"); return 2; }
+    const char *dir = argv[2], *root = nullptr, *key = nullptr;
+    for (int i = 3; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--ct"))) { root = argv[i + 1]; key = argv[i + 2]; }
+    const int L = atoi(xs_opt(argc, argv, "--level", "2")), ev = atoi(xs_opt(argc, argv, "--every", "8")), R = atoi(xs_opt(argc, argv, "--r", "3")), B = atoi(xs_opt(argc, argv, "--block", "512"));
+    const double cth = atof(xs_opt(argc, argv, "--cos", "0.9")), f = ldexp(1.0, -L); const char *pre = xs_opt(argc, argv, "--out", nullptr);
+    if (!root || !key || ev < 1 || R < 1 || B < ev) { fprintf(stderr, "wrap-align: --ct ROOT KEY required; --every >= 1, --r >= 1, --block >= --every\n"); return 2; }
+    char p[2100]; int w[3], h[3]; float *X[3]; const char *nmx[3] = {"x", "y", "z"};
+    for (int c = 0; c < 3; c++) { snprintf(p, sizeof p, "%s/%s.tif", dir, nmx[c]); if (!(X[c] = img_read_f32(p, &w[c], &h[c]))) { fprintf(stderr, "wrap-align: cannot read %s\n", p); return 1; } }
+    const int gw = w[0], gh = h[0];
+    store *s = store_open(root); z3 *v = s ? z3_open(s, key, nullptr) : nullptr; if (!v) { fprintf(stderr, "wrap-align: cannot open %s %s\n", root, key); return 1; }
+    const z3_meta *m = z3_meta_of(v);
+    const int nbr = (gh + B - 1) / B, nbc = (gw + B - 1) / B; uint8_t *map = calloc((size_t)nbr * nbc, 1);
+    FILE *tf = nullptr; if (pre) { snprintf(p, sizeof p, "%s.tsv", pre); tf = fopen(p, "w"); if (!tf) { fprintf(stderr, "wrap-align: cannot write %s\n", p); return 1; } fprintf(tf, "row0\tcol0\trows\tcols\tn\taligned\tmean_cos\tshare\n"); }
+    size_t tn = 0, ta = 0;
+    #define XV(c, r_, k_) X[c][(size_t)(r_) * gw + (k_)]
+    for (int br = 0; br < nbr; br++) for (int bc = 0; bc < nbc; bc++) {
+        const int r0 = br * B, c0 = bc * B, r1 = r0 + B < gh ? r0 + B : gh, c1 = c0 + B < gw ? c0 + B : gw;
+        double lo[3] = {1e30, 1e30, 1e30}, hi[3] = {-1e30, -1e30, -1e30}; int any = 0;
+        for (int r = r0; r < r1; r += ev) for (int k = c0; k < c1; k += ev) { if (XV(2, r, k) < 0) continue; any = 1;
+            for (int c = 0; c < 3; c++) { const double q = XV(c, r, k) * f; if (q < lo[c]) lo[c] = q; if (q > hi[c]) hi[c] = q; } }
+        if (!any) continue;
+        int64_t o[3], n[3]; const int ax[3] = {2, 1, 0};   /* zyx box from xyz */
+        for (int d = 0; d < 3; d++) { const int c = ax[d]; int64_t a = (int64_t)floor(lo[c]) - R - 1, b = (int64_t)ceil(hi[c]) + R + 2;
+            if (a < 0) a = 0; if (b > m->shape[d]) b = m->shape[d]; o[d] = a; n[d] = b - a; }
+        if (n[0] <= 0 || n[1] <= 0 || n[2] <= 0 || n[0] * n[1] * n[2] > (int64_t)1 << 31) continue;
+        uint8_t *vol = malloc((size_t)(n[0] * n[1] * n[2])); if (!vol || z3_read(v, o, n, vol, 8)) { free(vol); continue; }
+        size_t bn = 0, ba = 0; double bsum = 0;
+        for (int r = r0; r < r1; r += ev) for (int k = c0; k < c1; k += ev) {
+            if (XV(2, r, k) < 0) continue;
+            const int ra = r > 0 && XV(2, r - 1, k) >= 0 ? r - 1 : r, rb = r + 1 < gh && XV(2, r + 1, k) >= 0 ? r + 1 : r;
+            const int ka = k > 0 && XV(2, r, k - 1) >= 0 ? k - 1 : k, kb = k + 1 < gw && XV(2, r, k + 1) >= 0 ? k + 1 : k;
+            if (ra == rb || ka == kb) continue;
+            double du[3], dv[3], nw[3];
+            for (int c = 0; c < 3; c++) { du[c] = XV(c, r, kb) - XV(c, r, ka); dv[c] = XV(c, rb, k) - XV(c, ra, k); }
+            nw[0] = du[1] * dv[2] - du[2] * dv[1]; nw[1] = du[2] * dv[0] - du[0] * dv[2]; nw[2] = du[0] * dv[1] - du[1] * dv[0];
+            const double nl = sqrt(xs_dot(nw, nw)); if (!(nl > 0)) continue;
+            for (int c = 0; c < 3; c++) nw[c] /= nl;
+            const int64_t cz = (int64_t)lround(XV(2, r, k) * f) - o[0], cy = (int64_t)lround(XV(1, r, k) * f) - o[1], cx = (int64_t)lround(XV(0, r, k) * f) - o[2];
+            if (cz - R - 1 < 0 || cy - R - 1 < 0 || cx - R - 1 < 0 || cz + R + 1 >= n[0] || cy + R + 1 >= n[1] || cx + R + 1 >= n[2]) continue;
+            double T[3][3] = {{0}}; int cnt = 0;
+            for (int64_t zz = cz - R; zz <= cz + R; zz++) for (int64_t yy = cy - R; yy <= cy + R; yy++) for (int64_t xx = cx - R; xx <= cx + R; xx++) {
+                #define VV(a, b, c) (double)vol[((a) * n[1] + (b)) * n[2] + (c)]
+                const double g[3] = {VV(zz, yy, xx + 1) - VV(zz, yy, xx - 1), VV(zz, yy + 1, xx) - VV(zz, yy - 1, xx), VV(zz + 1, yy, xx) - VV(zz - 1, yy, xx)};   /* x y z */
+                #undef VV
+                for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) T[a][b] += g[a] * g[b];
+                cnt++;
+            }
+            if ((T[0][0] + T[1][1] + T[2][2]) / cnt < 16) continue;   /* air / flat: mean |grad|^2 < 16 (|g| < 4 grey levels over 2 voxels) */
+            /* the power iteration starts from T's largest column (inside the dominant eigenvector's span; a start at the mesh normal
+               itself stays there when T is rank-1 and orthogonal to it: a mesh across the sheets then read as aligned) */
+            int jc = 0; double best = -1; for (int j = 0; j < 3; j++) { const double cn = T[0][j] * T[0][j] + T[1][j] * T[1][j] + T[2][j] * T[2][j]; if (cn > best) { best = cn; jc = j; } }
+            double e[3] = {T[0][jc], T[1][jc], T[2][jc]}; { const double el = sqrt(xs_dot(e, e)); for (int a = 0; a < 3; a++) e[a] /= el; }
+            for (int it = 0; it < 24; it++) { double q[3]; for (int a = 0; a < 3; a++) q[a] = T[a][0] * e[0] + T[a][1] * e[1] + T[a][2] * e[2];
+                const double ql = sqrt(xs_dot(q, q)); if (!(ql > 0)) break; for (int a = 0; a < 3; a++) e[a] = q[a] / ql; }
+            const double cs = fabs(xs_dot(e, nw));
+            bn++; bsum += cs; if (cs >= cth) ba++;
+        }
+        free(vol);
+        if (!bn) continue;
+        tn += bn; ta += ba; map[(size_t)br * nbc + bc] = (uint8_t)(1 + lround(254.0 * ba / bn));
+        if (tf) fprintf(tf, "%d\t%d\t%d\t%d\t%zu\t%zu\t%.4f\t%.4f\n", r0, c0, r1 - r0, c1 - c0, bn, ba, bsum / bn, (double)ba / bn);
+    }
+    #undef XV
+    if (tf) fclose(tf);
+    if (pre) { snprintf(p, sizeof p, "%s.pgm", pre); FILE *g = fopen(p, "wb"); if (g) { fprintf(g, "P5\n%d %d\n255\n", nbc, nbr); fwrite(map, 1, (size_t)nbr * nbc, g); fclose(g); } }
+    fprintf(stderr, "wrap-align: %s: %zu samples, aligned (|cos| >= %.2f) %.4f, %d x %d blocks of %d vertices\n", dir, tn, cth, tn ? (double)ta / tn : 0.0, nbr, nbc, B);
+    for (int c = 0; c < 3; c++) free(X[c]);
+    free(map); z3_close(v); store_close(s);
+    return 0;
+}
+

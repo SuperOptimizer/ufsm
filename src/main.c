@@ -280,6 +280,7 @@ static int usage(void) {
         "  ufsm gt-trans ROOT CTKEY CTUM CODEROOT CODEKEY CODEUM CENTREKEY CENTREUM BOXES SCROLL BOXUM OUT.tsv [--rv R K] [--fh R K --fv R K]   CT peaks / recto-verso / fibre flips per GT turn by gap\n"
         "  ufsm wrap-check <model> <fields-dir> [--ct ROOT KEY --ct-um U] [--codes ROOT KEY]   duplicate / merged wraps: CT peaks between adjacent wraps along radial rays\n"
         "  ufsm wrap-xsec <out.jpg> --ct ROOT KEY --level L --z Z [--crop y,x,h,w] R,G,B:TIFXYZ ...   mesh cross-sections drawn on one axial CT slice\n"
+        "  ufsm wrap-align <tifxyz> --ct ROOT KEY --level L [--every 8] [--block 512] [--out PREFIX]   share of a mesh whose normal follows the CT lamination (structure tensor)\n"
         "  ufsm unroll-qa --fields DIR --model SET [--ct ROOT KEY] [--fibres F.fib] [--box ..]... [--out DIR] [--strict]   label-free sheet-identity gates (phase confidence, phase-unwrap witness, wind4, fibres)\n"
         "  ufsm surf-snap <wraps-in> <wraps-out> --volume ROOT KEY --vol-um U   tifxyz vertices onto the nearest papyrus ridge\n"
         "  ufsm wrap-snap <wraps-in> <wraps-out> --axis F --axis-um U0 --ct ROOT KEY --ct-um U   .sfc wraps moved along their rays onto the sheets (smooth, order-kept)\n"
@@ -4912,6 +4913,7 @@ int cmd_img_zoom(int argc, char **argv);      /* src/imggate.c */
 int cmd_fit_join(int argc, char **argv);   /* src/fitjoin.c */
 int cmd_wrap_check(int argc, char **argv);   /* src/wrapcheck.c */
 int cmd_wrap_xsec(int argc, char **argv);   /* src/wrapxsec.c */
+int cmd_wrap_align(int argc, char **argv);   /* src/wrapxsec.c */
 int cmd_gt_trans(int argc, char **argv);   /* src/gttrans.c */
 int cmd_fields_derive(int argc, char **argv);   /* src/fieldsderive.c */
 int cmd_annotate_serve(int argc, char **argv);   /* src/annot.c */
@@ -4997,6 +4999,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "fit-join")) return cmd_fit_join(argc, argv);
     if (!strcmp(cmd, "wrap-check")) return cmd_wrap_check(argc, argv);
     if (!strcmp(cmd, "wrap-xsec")) return cmd_wrap_xsec(argc, argv);
+    if (!strcmp(cmd, "wrap-align")) return cmd_wrap_align(argc, argv);
     if (!strcmp(cmd, "gt-trans")) return cmd_gt_trans(argc, argv);
     if (!strcmp(cmd, "fields-derive")) return cmd_fields_derive(argc, argv);
     if (!strcmp(cmd, "annotate-serve")) return cmd_annotate_serve(argc, argv);
