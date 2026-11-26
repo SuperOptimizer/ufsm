@@ -6,7 +6,7 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
-## g256 dense-64 distilled into try9 (--distill 64, level 3): null at 4000 steps, but the targets covered only 1.3 % of head cells (2026-11-26, dinovol)
+## g256 dense-64 distilled into try9 (--distill 64, level 3): null at 4000 steps (1.3 % target coverage); line closed (2026-11-26, dinovol)
 
 The question: does a cosine side-head loss against upstream dinovol g256's dense-64 features (train --distill) improve try9's winding
 fields? This is a control-paired pair on desk card 1, master 0935f899 (mcc ff7f174). Both arms init from try9cool/cooled-33333 and use
@@ -47,7 +47,9 @@ The phase picks the right sheet in sheet-pair triplets (merge-flag --sheet-pairs
 | Paris 4 July (held out) | .613 / .761 / .837 / .869 | .619 / .758 / .841 / .865 |
 
 Result: no gain anywhere. The holdout ids are slightly worse (-0.011, ~2 SE) and nothing else moves outside its noise. With 1.3 % target
-coverage and 4000 steps, this tested a very weak distill signal; it does not rule out distillation itself. The 8000-step ctl stopped at
+coverage and 4000 steps, this tested a very weak distill signal; it does not rule out distillation itself. **Closed (lead 11-26):** no measured gain path for our
+winding net is left (a longer run or another lambda at ~1 % target coverage cannot move it), and by the user's rule (11-26) no effort goes
+into fine-tuning or improving the upstream dinovol itself. The 8000-step ctl stopped at
 step 290 is in runs/old8k. Data: /vesuvius/ufsm/dinovol/distill/{runs,score}, wbench res dvd-*.
 
 ## Pods decode CT on the CPU (--ct-gpu-decode -1) by default: a 300-step A/B on R11P ties, and gpudec gets starved (2026-11-26, podink)
