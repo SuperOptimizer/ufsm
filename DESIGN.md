@@ -32,6 +32,9 @@ on the CPU with the GPU idle.
 - tests/test_seamless_tilelist.sh (gpu, 18 s): a real net, window 288 halo 16, 128 tiles (tile = shift) at the corner, inside and
   adjacent. Every listed output shard file is byte-identical to the whole-box seamless run.
 ## mcc pin ff7f174 -> 01873d0: guard folding, join / partial jump threading, mcudahw kernel log (2026-11-25, microc)
+- Result: neutral on production. In the R11e fixture (R11P widths, P 448, sm_120) the network kernels of the pin, 01873d0 and
+  f4pdev are within one run's noise of each other, and all of them beat nvcc 13.3 (nvcc / mcc 1.038). The 0.72x below is
+  bwd_data_s2 in the 8-wide fixture net only: a shape production does not use. f4pdev is parked until it shows a production gain.
 - The pin moves to 01873d0 (microc branch csetdev-20261125, tag ufsm-pin-20261125b). That is ff7f174 plus two parts:
   - jitorder's three mcudahw commits: MCUDA_PRECOMPILE compiles the largest kernels first; one process compiles a given kernel
     text (PATH.lock); MCUDA_KLOG=FILE / MCUDA_PRECOMPILE_ONLY=@FILE, which `run_suite -J` needs for its selective warm-up.
