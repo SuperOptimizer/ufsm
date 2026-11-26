@@ -27,7 +27,10 @@ paired per crop (dev/pair.sh). Pass rule: mean4 (A − B) > 2 SE.
 - **Fails** at −3.2 SE: ssl hurt at this step budget; no clean (1447 / 0841) scoring, per the rule.
 - Known confound, pre-registered: A's ssl share 0.75 gave it about a quarter of B's supervised ink windows at the same step count. The test
   answers "ssl at a fixed step budget", not "ssl at a fixed supervised budget"; only 0172 moved the other way (+0.047, 1.7 SE).
-- Files: podink/dino2/score/{dev,h116}.tsv, score.log; snapshots podink/dino2/{run,runB}/snap/{4,8,12,16}000.ckpt.
+- **Post hoc (not pre-registered), matched supervised windows:** B's 4000 snapshot (about as many supervised ink windows as A-16000)
+  against A-16000, same crops and pairing: mean4 A − B = −0.0303 ± 0.0170 (−1.8 SE); 0139 −0.086, 0172 +0.023, 0343 −0.062,
+  0009B +0.004, small +0.070 (n 9). Dev AUC (mean of groups) B-4000 0.7066 vs A 0.6928; ssl is not better even at matched supervision.
+- Files: podink/dino2/score/{dev,h116}.tsv, score.log, score4k.log; snapshots podink/dino2/{run,runB}/snap/{4,8,12,16}000.ckpt.
 
 ## 41 tifxyz metas on 9.362 um scans get voxel_size_um (2026-11-26, inksdk)
 
