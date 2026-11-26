@@ -3263,6 +3263,7 @@ static int au_why(const float *s, int n, int lo, int iso, int run, int gap) {   
 typedef struct {
     const geo *G; const uint8_t *val; double a, b; int Lf, Lp, stride; z3 *ct; vol *pred;
     vol *pred2; int Lp2; uint64_t *jr;   /* --pred2: the second prediction (level Lp2); jr: HOLD joint histogram [region][class][byte 1][byte 2] (merged under mu) */
+    uint64_t *p2h;   /* --pred2: histogram of every sampled --pred2 byte along the profiles (all shifts; the constancy check; merged under mu) */
     int edge; uint64_t *eh;   /* --pred2-edge D: HOLD band-max histograms by label-edge distance [bucket][model][class][byte] (merged under mu) */
     int nreg; const int64_t (*reg)[6]; int nho; const int64_t (*ho)[6];
     _Atomic int next, failed; int ntile; pthread_mutex_t mu; aust *A;
@@ -3340,7 +3341,7 @@ static void *au_worker(void *arg) {
     aujob *J = arg; const geo *G = J->G; aust *A = calloc(1, sizeof *A); if (!A) { atomic_store(&J->failed, 1); return nullptr; }
     uint64_t *eh = J->eh ? calloc((size_t)AU_EB * 2 * 2 * 256, sizeof *eh) : nullptr; if (J->eh && !eh) { atomic_store(&J->failed, 1); free(A); return nullptr; }
     const double Vf = (double)(1 << J->Lf), Vp = (double)(1 << J->Lp), of = (Vf - 1) / 2, op = (Vp - 1) / 2;
-    const double Vp2 = (double)(1 << J->Lp2), op2 = (Vp2 - 1) / 2; float pv2[AU_NT];
+    const double Vp2 = (double)(1 << J->Lp2), op2 = (Vp2 - 1) / 2; float pv2[AU_NT]; uint64_t p2h[256] = {0};
     uint32_t *jr = J->jr ? calloc((size_t)AU_MAXR * 2 * 65536, sizeof *jr) : nullptr; if (J->jr && !jr) { atomic_store(&J->failed, 1); free(A); free(eh); return nullptr; }
     float cv[AU_NT], pv[AU_NT]; const size_t nbk = J->blk ? (size_t)(J->bg[0] * J->bg[1] * J->bg[2]) : 0; uint64_t *bk = nbk ? calloc(nbk * 6, sizeof *bk) : nullptr;
     for (int t; (t = atomic_fetch_add(&J->next, 1)) < J->ntile && !atomic_load(&J->failed);) {
@@ -3385,7 +3386,8 @@ static void *au_worker(void *arg) {
                     const double tt = (i - AU_T) * G->sign; double q[3], qp[3];
                     for (int d = 0; d < 3; d++) { q[d] = (P[d] + tt * N[d] - of) / Vf - o[d]; qp[d] = (P[d] + tt * N[d] - op) / Vp - po[d]; }
                     cv[i] = tri_box(cb, n, q[0], q[1], q[2]); pv[i] = pb ? tri_box(pb, pn, qp[0], qp[1], qp[2]) : -1.f;
-                    if (qb) { double q2[3]; for (int d = 0; d < 3; d++) q2[d] = (P[d] + tt * N[d] - op2) / Vp2 - qo[d]; pv2[i] = tri_box(qb, qn, q2[0], q2[1], q2[2]); }
+                    if (qb) { double q2[3]; for (int d = 0; d < 3; d++) q2[d] = (P[d] + tt * N[d] - op2) / Vp2 - qo[d]; pv2[i] = tri_box(qb, qn, q2[0], q2[1], q2[2]);
+                               if (pv2[i] >= 0) { const int b2 = (int)lround(pv2[i]); p2h[b2 > 255 ? 255 : b2]++; } }
                     const int rt = i - AU_T - fo + AU_T;   /* t - f */
                     if (rt >= 0 && rt < AU_NT && cv[i] >= 0) { A->ctp[sp][cls][rt] += cv[i]; A->np[sp][cls][rt]++; if (pv[i] >= 0) A->pp[sp][cls][rt] += pv[i]; }
                 }
@@ -3415,6 +3417,7 @@ static void *au_worker(void *arg) {
     pthread_mutex_lock(&J->mu);
     if (jr) { for (size_t i = 0; i < (size_t)AU_MAXR * 2 * 65536; i++) J->jr[i] += jr[i]; free(jr); }
     if (eh) { for (size_t i = 0; i < (size_t)AU_EB * 2 * 2 * 256; i++) J->eh[i] += eh[i]; free(eh); }
+    if (J->p2h) for (int v = 0; v < 256; v++) J->p2h[v] += p2h[v];
     if (bk) { for (size_t i = 0; i < nbk * 6; i++) J->blk[i] += bk[i]; free(bk); }
     { uint64_t *a = (uint64_t *)J->A, *b = (uint64_t *)A; const size_t nu = offsetof(aust, ctp) / sizeof(uint64_t); for (size_t i = 0; i < nu; i++) a[i] += b[i]; }
     { double *a = J->A->ctp[0][0], *b = A->ctp[0][0]; const size_t nd = 3 * (size_t)AU_SPN * 2 * AU_NT; for (size_t i = 0; i < nd; i++) a[i] += b[i]; }
@@ -3486,6 +3489,8 @@ int cmd_ink_audit(int argc, char **argv) {
     uint64_t *jr = p2i >= 0 ? calloc((size_t)AU_MAXR * 2 * 65536, sizeof *jr) : nullptr; if (p2i >= 0 && !jr) return 1;
     const int edgeD = opt_atoi("--pred2-edge", sopt(argc, argv, "--pred2-edge", "0"));   /* EDGE rows: AUCs by label-edge distance (au_edge_bucket) */
     if (edgeD && (p2i < 0 || edgeD < 9 || edgeD > 64)) { fprintf(stderr, "ink-audit: --pred2-edge D needs --pred2, D 9..64 label px\n"); free(jr); return 1; }
+    static uint64_t p2hist[256];   /* mgpu: main (ink-audit: the --pred2 constancy histogram over all segments) */
+    memset(p2hist, 0, sizeof p2hist);
     uint64_t *ehist = edgeD ? calloc((size_t)AU_EB * 2 * 2 * 256, sizeof *ehist) : nullptr; if (edgeD && !ehist) { free(jr); return 1; }
     FILE *fp = fopen(argv[2], "rb"); if (!fp) { fprintf(stderr, "ink-audit: cannot open %s\n", argv[2]); return 1; }
     fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET); char *txt = malloc((size_t)sz + 1); size_t rd = fread(txt, 1, (size_t)sz, fp); fclose(fp); txt[rd] = 0;
@@ -3545,7 +3550,7 @@ int cmd_ink_audit(int argc, char **argv) {
             if (atomic_load(&FJ.failed)) bad = 1;
             else {
                 aujob AJ = {0}; AJ.G = &G; AJ.val = V; AJ.a = c.face_a; AJ.b = c.face_b; AJ.Lf = c.level; AJ.Lp = Lp; AJ.stride = stride; AJ.ct = ct; AJ.pred = pi >= 0 ? &pv : nullptr;
-                AJ.pred2 = p2i >= 0 ? &pv2 : nullptr; AJ.Lp2 = Lp2; AJ.jr = jr; AJ.edge = edgeD; AJ.eh = ehist;
+                AJ.pred2 = p2i >= 0 ? &pv2 : nullptr; AJ.Lp2 = Lp2; AJ.jr = jr; AJ.edge = edgeD; AJ.eh = ehist; AJ.p2h = p2i >= 0 ? p2hist : nullptr;
                 AJ.nreg = nreg; AJ.reg = (const int64_t (*)[6])reg; AJ.nho = hc.nexcl; AJ.ho = (const int64_t (*)[6])hc.excl; AJ.ntile = G.ntiles_x * G.ntiles_y; AJ.A = A; pthread_mutex_init(&AJ.mu, nullptr);
                 memcpy(AJ.bg, bg, sizeof bg); AJ.blk = blk;
                 for (int i = 0; i < nt; i++) pthread_create(&th[i], nullptr, au_worker, &AJ);
@@ -3569,10 +3574,9 @@ int cmd_ink_audit(int argc, char **argv) {
             if (h) { nzb++; bv = v; tot += h; } }
         if (tot && nzb <= 1) { fprintf(stderr, "ink-audit: ALERT: scoring failed: --pred %s %s is constant (byte %d) over all %llu scored samples at every face shift (an empty / "
                                        "unpredicted volume?); UFSM_AUDIT_CONST_OK=1 reports it anyway\n", argv[pi + 1], argv[pi + 2], bv, (unsigned long long)tot); return 1; }
-        if (jr) { uint64_t m2[256] = {0}; for (int r = 0; r < (nreg ? nreg : 1); r++) for (int cl = 0; cl < 2; cl++) for (int i = 0; i < 65536; i++) m2[i & 255] += jr[((size_t)r * 2 + cl) * 65536 + i];
-            nzb = 0; tot = 0; for (int v = 0; v < 256; v++) if (m2[v]) { nzb++; bv = v; tot += m2[v]; }
-            if (tot && nzb <= 1 && bv == 0) {   /* (byte 0 = the fill: the joint histogram has only the band at shift 0, where a real prediction beyond the band can be flat) */
-                 fprintf(stderr, "ink-audit: ALERT: scoring failed: --pred2 %s %s is constant (byte %d) over all %llu HOLD samples (an empty / "
+        if (p2i >= 0) {   /* --pred2: every sampled byte along the profiles (all shifts, all splits), as --pred's every-shift check */
+            nzb = 0; tot = 0; for (int v = 0; v < 256; v++) if (p2hist[v]) { nzb++; bv = v; tot += p2hist[v]; }
+            if (tot && nzb <= 1) { fprintf(stderr, "ink-audit: ALERT: scoring failed: --pred2 %s %s is constant (byte %d) over all %llu sampled profile points (an empty / "
                                            "unpredicted volume?); UFSM_AUDIT_CONST_OK=1 reports it anyway\n", argv[p2i + 1], argv[p2i + 2], bv, (unsigned long long)tot); return 1; } }
     }
     printf("tag\tsplit\tsup_px\tink_share\tface_ink\tface_noink\tface_q10\tface_q50\tface_q90\tct_ink\tct_ink_sd\tct_no\tct_no_sd\tz_ink\tz_no\tct_auc"
