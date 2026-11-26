@@ -379,7 +379,7 @@ static int g_distill, g_distill_lev = 3, g_distill_div; static float g_distill_w
 static ssl_heads g_sslh; static float g_sslh_w[SSLH_MAX]; static const char *g_sslh_name[SSLH_MAX];   /* --ssl-heads LIST (--ssl-ink W: "ink:W"): gated mean-teacher
                                          consistency of the output heads on the unlabelled windows' latent cells (ssl.h; DESIGN 2026-11-12) */
 static int g_ssl, g_ssl_lev = 1, g_ssl_bv = 16, g_ssl_npts = 65536; static float g_ssl_w = 0.5f, g_ssl_mask = 0.4f, g_ssl_var = 1.f, g_ssl_gamma, g_ssl_jit = 1.f; static size_t g_ssl_S;   /* --ssl D: masked self-distillation on "ct_only" windows (src/ssl.h): a D-channel side head on decoder level --ssl-level, cells of g_ssl_S per window */
-static int g_ssl_views = 1; static float g_ssl_vshift = 0.125f, g_ssl_vzoom = 1.25f;   /* --ssl-views 2 (ssl.h): the teacher view a shift (fraction of P per axis) + zoom of the source cube */
+static int g_ssl_views = 1; static float g_ssl_vshift = 0.125f, g_ssl_vzoom = 1.25f;   /* mgpu: config. --ssl-views 2 (ssl.h): the teacher view a shift (fraction of P per axis) + zoom of the source cube */
 static int ssl_cell(void) { return (g_lat ? 4 : 1) << g_ssl_lev; }   /* --ssl: voxels per side-head cell (--lat: the 4^3-voxel latent grid below level 0) */
 static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64; static int g_cnt_ns; static float g_cnt_edges[8];   /* --count-strata */   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
 static float g_pg_lambda, g_pg_dist[4] = {2.f}; static int g_pg_nd = 1, g_pg_angle, g_pg_mask;   /* --pgrad-lambda / --pgrad-dist (D[,D...], up to 4): the phase wavenumber loss (nn_pgrad_slab; head slabs only) */
