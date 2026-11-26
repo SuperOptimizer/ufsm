@@ -806,7 +806,9 @@ void unet_set_slab_ovl(int on) { g_slab_ovl = on; }
    a2: X, Y), instead of a slab temp copied into X plane by plane afterwards. +1 level-0 tensor (and level-1 one) of memory, minus the
    temps; the coarse offload (unet.p3) is off with it. Desk 5060 Ti: wind96 window -14%, ift3 ink -18% (10-31). UFSM_SLAB_DIRECT=0 off */
 static int g_slab_dir = -1;
-static int slab_direct(void) { if (g_slab_dir < 0) g_slab_dir = getenv("UFSM_SLAB_DIRECT") ? ufsm_env_on("UFSM_SLAB_DIRECT") : 1; return g_slab_dir; }
+static int slab_direct(void) {   /* UFSM_SLAB_DIRECT: 0 off, 1 on when free memory allows (default), 2 on without the free-memory check */
+    if (g_slab_dir < 0) { const char *e = getenv("UFSM_SLAB_DIRECT"); g_slab_dir = e ? (atoi(e) == 2 ? 2 : ufsm_env_on("UFSM_SLAB_DIRECT")) : 1; }
+    return g_slab_dir; }
 void unet_set_slab_direct(int on) { g_slab_dir = on; }   /* 2: on without the free-memory check (predict --window auto sized the window for it) */
 int unet_ct_stem(const unet *u) { return u->built && !u->train && u->ct_stem; }
 void unet_set_ct_input(unet *u, int on) { if (u->ct_mode != on && u->built && !u->train) free_acts(u); u->ct_mode = on; }

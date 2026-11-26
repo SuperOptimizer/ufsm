@@ -6,6 +6,103 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## predict --seamless 2: the offset-256 "seams" were pass b alone beyond the box / tile list; the blend now keeps the region (2026-11-26, perf)
+
+PHerc1203 r24 reads (R11P-12000, window 576 halo 32, tile list of 512): ink-seam off0 0.25 but off256 9.32 (plain read 17.7). The
+blend weights were right; the per-corner lines are bimodal: corners inside listed tiles 0.1 - 0.5, corners in unlisted tiles 15 - 58.
+Cause: predict writes every shard of a window it computes (one window per 2^3 pass shards). Pass a's windows are the tiles; pass b's
+(grid 256) straddle 2^3 tiles, so they also wrote shards of unlisted tiles, and S / 2 below a --box (its box starts there), with pass
+b alone: its window borders unblended. A second, latent case: a pass writes no all-zero shard, and the blend gave an absent shard
+weight 0, so a region one pass predicted as 0 came from the other pass alone.
+
+Fix: `ink_blend_set_region` (src/inkblend.c, block mode, also one block per output shard): predict --seamless gives the blend the user's
+box (on the S / 2 shards), the tile list and each pass's computed box; blocks outside the region are 0, inside it each pass counts
+wherever its box holds the block, an absent shard read as zeros. `--seam-inproc` no longer writes shards outside the tile list / air
+(grid 1 alone). Inside the region the bytes are the old blend's wherever both passes wrote the shard.
+
+| inksdk's w228 box 1024^3 (passes kept, re-blended) | off0 | off256 |
+|---|---|---|
+| 1ea22456 blend | 0.07 (3 corners) | 10.13 (10 corners, 6 of them in pass b's margin: 15 - 43) |
+| region blend | no corner in the box | 0.21 (the 4 corners inside the box; the margin is gone) |
+
+Test: tests/test_seamless_region.py (no GPU): a stand-in pass writes a smooth field + a per-window offset with predict's window / shard
+rules; box, tile-list and all-zero-shard cases; ink-seam at both offsets < 1 (the 1ea22456 blend: corners at 128 jump 30 - 135).
+test_seamless.py: below pass b's box (z, y or x < S / 2) the stand-in's pass-b voxels no longer count.
+
+## R11P HOLD rows: 12k is the 1.1 um pick, the 24k resume regresses, windows 768-1024 win; ssl-probe on frozen features (2026-11-26, inkperf)
+
+Record of the 11-25 / 11-26 scoring. The predict volumes and the pair / podsweep scripts were deleted for disk on 11-26; the recipe is below.
+
+**Recipe.** Every row is HOLD only: `ink-audit --hold-only` on the 64 tracker tiles per scroll, PHerc1667 and Paris 4, from a local
+rsync -rcn-verified copy of the tiles' CT, levels 0-2. AUC is column 17.
+Predict: `predict CK ROOT KEY OUT --um 1.129 --level L --box <tile hull> --tile-list T --full-grid 1 --channel ink --ema 0 --window W
+--halo 32 --q 0 --levels 1`, plus `--seamless 2` on the seam rows. Rung 1.1 = level 0, rung 2.2 = level 1. The net is scale-conditioned
+on um x 2^level, so no rung flag is needed.
+Pairs: `ink-audit --pred A --pred2 B`, FUSE rows, ± per-region jackknife SE. The tracker was r11ptrack9 and r11p2track2, the window
+sweep was podsweep / podscore3 on the pod, the pairs pair4 and p2.
+A 0-tile predict or a constant map now fails loudly (failloud / p2const / inkfix): pair3's R1 rows had scored 0.5 on a copy without
+level 2.
+
+**R11P by snapshot, rung 1.1, plain, h32** (1667 / P4; references R1-62000 at 4.5 um 0.803 / 0.877, R11d-avg 0.787 / 0.866):
+
+| ckpt | w320 | w576 | w768 | w1024 | w1280 |
+|---|---|---|---|---|---|
+| R11P-4000 | .764 / .828 | .773 / .854 | .767 / .849 | | |
+| R11P-8000 | — / .855 | .837 / .863 | .841 / .858 | | |
+| R11P-12000 | .816 / .870 | .868 / .888 | .896 / .891 | .907 / .886 | .894 / .881 |
+| R11d-avg12-16 | | | | .838 / .878 | .817 / .874 |
+
+- **Seamless 2** at 12k: w320 .822 / .874, w576 .870 / .889. That is +0.001 to +0.006 for 8x the pass-b tiles, so seamless is used
+  only on a final snapshot.
+- **Rung 2.2** (level 1) at 12k: w320 .846 / .856, w576 .874 / .848. The single-rung R24@2.26 gets 1667 .777, which is why the user
+  kept the multi-rung line.
+
+**Pairs** (w768 unless named, A − B ± SE, 1667 / P4):
+
+| A − B | 1667 | P4 |
+|---|---|---|
+| R11P12k − R11d | +0.051 ± 0.022 | +0.006 ± 0.009 |
+| R11P12k − R1 w576 (R1's best) | +0.066 ± 0.028 | −0.007 ± 0.019 |
+| R11P12k − R1 w768 | +0.073 ± 0.028 | +0.004 ± 0.014 |
+| R11P12k − R1 w1024 | +0.097 ± 0.028 | +0.005 ± 0.015 |
+| R11P2-24k − R11P12k | −0.027 ± 0.026 | −0.006 ± 0.008 |
+| R11P2 ckpt-avg 20-24k − R11P12k | −0.036 ± 0.019 | +0.002 ± 0.007 |
+
+R1 by window (w288 / 448 / 576 / 768 / 1024): 1667 .805 / .801 / .831 / .824 / .799, P4 .879 / .897 / .898 / .888 / .887.
+R11P2 resumed 12k to 24k with a fresh WSD tail (re-warm, hold, cooldown to 0 at 24k; checked in the pod's log.csv), so its regression
+is not an uncooled snapshot. **R11P-12000 stays the 1.1 um pick**: windows 768-1024, and 576 at 2.2.
+
+**ssl-probe** (`predict --surf-feats`, `ufsm ssl-probe fit|apply`). The trunk's level-0 features (32 x 9 layers along the normal,
+devscoreC's surf geometry: P 256, halo 32, pvox 0.5) are taken at the crops' label lattice (training stride 8, dev stride 4). A
+weighted logistic (dvprobe, l2 1e-3) is fitted on dinovol's list150 training crops and scored per crop with devscoreC's ink-score
+call. Driver: /vesuvius/ufsm/inkperf/ssl/probe4.sh, then disj.sh.
+list150 shares 13 of its 39 segments with dev 99; disj.sh refits on the 26 disjoint segments (215 crops), and that fit is the default.
+h116 is disjoint by segment and scroll.
+
+| features | dev 99 (mean of group means), all / disj fit | h116 48, all / disj | trained head (surf mode) dev / h116 |
+|---|---|---|---|
+| E0-avg | .829 / .829 | .904 / .899 | .809 / .894 |
+| S2-avg | .830 / .824 | .914 / .911 | .822 / .904 |
+| wind96-u2 | .619 / .609 | .516 / .548 | — |
+
+- **Probe (disj) − head, paired by crop:** E0 +0.017 ± 0.008 on dev (mostly 0139: +0.030) and +0.005 ± 0.004 on h116. S2 +0.008
+  ± 0.007 on dev and +0.006 ± 0.005 on h116.
+- **DINO2A (ssl) − DINO2B (control), disj probes:** dev −0.061 ± 0.024 by crop and −0.071 ± 0.024 by group mean (0172 +0.059 is the
+  only group for A); h116 −0.062 ± 0.014. This matches podink's head scores (−0.069 ± 0.022).
+- Bug found on the way: ssl-probe once read only the first file of a `.dvf` list (strtok inside dvf_read). Fixed in sslfix with a
+  two-file test.
+
+**GroupNorm and the window (perf 11-26).** On PHerc1203, R11P's output at one voxel differs between two windows by up to ~5x (w576
+pass a jumps 19 → 93 across a border at y 10240). R11P has no GroupNorm running statistics: its header has gn_stored 1 but no gn_ema /
+ge_n. So predict normalises every GroupNorm with the window's own statistics, and a voxel's level depends on what its window holds.
+This also explains why HOLD follows the window size: R11P trained at P 768, and HOLD is best at w768-1024 (1667 .896-.907, against .816
+at w320).
+- Recipe (lead): every R-line run gets `--gn-ema 1 --gn-ema-warm 1000000000` (in r11/d/trainarm5d.sh as GNX). Training is unchanged,
+  since it still uses each window's statistics, but the checkpoint carries pooled running statistics for a window-independent predict.
+- Training on the running statistics (a finite warm) is only for its own A/B: the 11-14 admuon control blew up at the switch.
+- For R11P: post-hoc pooled statistics (`predict --gn-save` at w768, then `--gn-frozen`), A/B on HOLD against window mode, and the seam
+  jump on PHerc1203 (gn/gnab.sh, gn1203.sh). Results follow when they land.
+
 ## J1 v0 on the RTX PRO 6000 pod: launched 17:06 UTC, lost at ~step 760 when the pod ended (credits), no snapshot (2026-11-26, podink)
 
 J1 v0 (inksdk's joint winding + ink + SSL v1 net, init E0-avg + head-map, 98 sources: 63 ink / winding + 35 ct_only SSL scans) ran on

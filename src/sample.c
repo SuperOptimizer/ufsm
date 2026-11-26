@@ -245,6 +245,7 @@ struct sampler {
     int64_t *slot_j;         /* deterministic mode: batch index held by each slot */
     int64_t next_claim, next_take;   /* deterministic mode: next batch index to fill / to hand out (under mu) */
     atomic_uint_fast64_t prof_ns[24];
+    atomic_uint_fast64_t cls_ns[2], cls_n[2];   /* (UFSM_SAMPLER_PROF) wall ns from a sample's first draw to its accepted window, by its source: 0 labelled, 1 ct_only */
     unsigned char (*lvl_ok)[2][MAXLEV];   /* per source: cached level availability (0 unknown, 1 no, 2 yes) */   /* per-stage nanoseconds (env UFSM_SAMPLER_PROF): read, targets, dilate, soft, trust, encode, zscore, augment, x16, other */
     int prof;
     double *cum;   /* cumulative source weights */
@@ -706,6 +707,14 @@ static int g_rt = 1;   /* mgpu: env (set once, sampler_env_once) */   /* UFSM_SA
 static int g_prof_cpu;   /* mgpu: env (set once, sampler_env_once) */   /* UFSM_SAMPLER_PROF=2: the stages in thread CPU time (else wall time: I/O waits and contention count) */
 static void sampler_env_once(void) { const char *e = getenv("UFSM_SAMPLER_PROF"); g_prof_cpu = e && atoi(e) == 2; e = getenv("UFSM_SAMPLER_RT"); g_rt = e && atoi(e) > 1 ? atoi(e) : 1; }
 static double tnow(void) { struct timespec t; clock_gettime(g_prof_cpu ? CLOCK_THREAD_CPUTIME_ID : CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+/* UFSM_SAMPLER_PROF: window build time by source class (perf 11-26, J1: the SSL windows of ct_only scans vs the labelled ink / winding
+   draws, cold SSL CT beside a prefetch): wall time from a sample's first draw attempt to its accepted window, to the accepted source */
+static double cls_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static void cls_add(sampler *sp, const batch *b, int i, double *ts0) {
+    const double t = cls_now(); const int si = b->src ? b->src[i] : -1;
+    if (si >= 0 && si < sp->S->n) { const int c = sp->S->src[si].ct_only != 0; atomic_fetch_add(&sp->cls_ns[c], (uint_fast64_t)((t - *ts0) * 1e9)); atomic_fetch_add(&sp->cls_n[c], 1); }
+    *ts0 = t;
+}
 #define PROF_MARK(stage) do { if (sp->prof) { double t_ = tnow(); atomic_fetch_add(&sp->prof_ns[stage], (uint_fast64_t)((t_ - pt) * 1e9)); pt = t_; } } while (0)
 enum { PS_SRC, PS_LEVEL, PS_PICK, PS_PROBE, PS_READ, PS_STATS, PS_TARGETS, PS_DILATE, PS_SOFT, PS_TRUST, PS_ENCODE, PS_ZSCORE, PS_AUGMENT, PS_X16, PS_SCAN, PS_SYMPACK, PS_PHREAD, PS_WIND4, PS_PHOUT, PS_N };   /* (the last four: parts of the old "augment") */
 static const char *prof_names[PS_N] = {"src", "level", "pick", "probe", "ctread", "ctstats", "targets", "dilate", "soft", "trust", "encode", "zscore", "augment", "x16", "scan", "sympack", "phread", "wind4", "phout"};
@@ -3947,13 +3956,14 @@ static void *worker(void *arg) {
         if (k < 0) break;
         batch *b = &sp->slots[k];
         int fail = 0, filled = 0; unsigned spin = 0;
+        double ts0 = sp->prof ? cls_now() : 0;   /* (the class timing: rejected and failed draws count to the accepted window) */
         for (int i = 0; i < sp->cfg.B && !atomic_load(&sp->stop);) {
             if (det && (sp->cfg.cover || (spin == 0 && fail == 0))) rseed(&r, sp->cfg.seed * 0x9e3779b97f4a7c15ull + (sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i)) * 1000003ull + 1);   /* per-sample stream */
             const rng r_before = r;   /* --det: a draw that failed to read is retried from the same state (rng audit #4: the batch no longer depends on the I/O error history) */
             int rc = draw(sp, b, i, &r, xtmp, ttmp, big, sp->cfg.cover_start + (uint64_t)(jb * sp->cfg.B + i), noise_state, chs ? chs + i : nullptr);
             if (rc < 0 && det) r = r_before;
             if (tp_log()) { fprintf(stderr, "tplog draw rc %d big res by p3:", rc); for (int q = 0; q < 10; q++) fprintf(stderr, " %.2f", resident_bytes(big + q * p3, p3) / (double)p3); fprintf(stderr, " ttmp %.2f\n", resident_bytes(ttmp, 2 * p3) / (double)p3); }
-            if (rc == 0) { i++; filled = i; fail = 0; spin = 0; }
+            if (rc == 0) { if (sp->prof) cls_add(sp, b, i, &ts0); i++; filled = i; fail = 0; spin = 0; }
             else if (rc > 0 && ++spin == (1u << 22)) { fprintf(stderr, "sampler: %u consecutive draws rejected or impossible (P=%d), stopping\n", spin, sp->cfg.P); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); }
             else if (rc < 0) { fprintf(stderr, "sampler: %s\n", z3_error()); if (++fail > 20) { fprintf(stderr, "sampler: 20 consecutive read failures, stopping\n"); atomic_store(&sp->failed, 1); atomic_store(&sp->stop, 1); } }
         }
@@ -5171,8 +5181,10 @@ void sampler_prof_print(const sampler *sp) {
     fprintf(stderr, "sampler profile (ms per produced patch, cpu time summed over workers):");
     for (int k = 0; k < PS_N; k++) fprintf(stderr, " %s %.1f", prof_names[k], atomic_load(&sp->prof_ns[k]) / 1e6 / (double)n);
     { uint64_t h, r; z3_io_stats(&h, &r); fprintf(stderr, " | chunk reads: %llu cached, %llu from the store", (unsigned long long)h, (unsigned long long)r); }
+    for (int c = 0; c < 2; c++) { const uint64_t m = atomic_load(&sp->cls_n[c]); if (m) fprintf(stderr, " | %s windows: %llu, %.1f ms wall each", c ? "ct_only (ssl)" : "labelled", (unsigned long long)m, atomic_load(&sp->cls_ns[c]) / 1e6 / (double)m); }
     fprintf(stderr, "\n");
 }
+void sampler_class_stats(const sampler *sp, uint64_t n[2], double ms[2]) { for (int c = 0; c < 2; c++) { n[c] = atomic_load(&sp->cls_n[c]); ms[c] = n[c] ? atomic_load(&sp->cls_ns[c]) / 1e6 / (double)n[c] : 0; } }
 void sampler_reject_reasons(const sampler *sp, uint64_t why[4]) { for (int k = 0; k < 4; k++) why[k] = atomic_load(&sp->rej_why[k]); }
 uint64_t sampler_crushed(const sampler *sp) { return atomic_load(&sp->crushed); }
 uint64_t sampler_aug_count(const sampler *sp, int which) { return which >= 0 && which < AUGN_N ? atomic_load(&sp->augn[which]) : 0; }

@@ -3580,6 +3580,9 @@ static int predict_one(int argc, char **argv) {
                 for (int64_t qz = Q0[0]; qz < Q0[0] + kss && qz < ns[0]; qz++) for (int64_t qy = Q0[1]; qy < Q0[1] + kss && qy < ns[1]; qy++)
                 for (int64_t qx = Q0[2]; qx < Q0[2] + kss && qx < ns[2]; qx++) {
                     const int64_t qo[3] = {qz * shard, qy * shard, qx * shard}, qe[3] = {qo[0] + shard < bn[0] ? qo[0] + shard : bn[0], qo[1] + shard < bn[1] ? qo[1] + shard : bn[1], qo[2] + shard < bn[2] ? qo[2] + shard : bn[2]};
+                    /* --seam-inproc: a shard outside the --tile-list (or air) is not written: grid 1's windows straddle the tiles and wrote
+                       their 2^3 shards alone there, unblended (perf 11-26, as the two-process blend's region) */
+                    if (seam2 && sskip && sskip[(qz * ns[1] + qy) * ns[2] + qx] == 2) continue;
                     if (lhm) {   /* every head into its own shard of this super-shard */
                         for (int j = 0; j < nph; j++) phead_fresh(&PH[j], phd);
                         PHEADS_PLACE((int)(tz - qo[0]), (int)(ty - qo[1]), (int)(tx - qo[2]), (int)(qe[0] - qo[0]), (int)(qe[1] - qo[1]), (int)(qe[2] - qo[2]));

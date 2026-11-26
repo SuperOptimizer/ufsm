@@ -74,7 +74,7 @@ __global__ void __launch_bounds__(256) bwd_data_s2_tc_k(const uint8_t *__restric
         constexpr int TQ = CB * GROW / 8;   /* uint4 per tap tile */
         for (int i = threadIdx.x; i < ntap * TQ; i += blockDim.x) {
             const int tl = i / TQ, j = i % TQ;
-            const int a = tl / (ny * nx), bb = (tl / nx) % ny, c = tl % nx;
+            const int c = px ? tl & 1 : 0, bb = py ? (tl >> px) & 1 : 0, a = pz ? tl >> (px + py) : 0;   /* (nx, ny in {1, 2}: tl / (ny nx), (tl / nx) % ny, tl % nx) */
             const int kz = pz ? (a ? 2 : 0) : 1, ky = py ? (bb ? 2 : 0) : 1, kx = px ? (c ? 2 : 0) : 1;
             ((uint4 *)(wt + (size_t)tl * CB * GROW))[j] = __ldg((const uint4 *)(wtg + ((size_t)((kz * 3 + ky) * 3 + kx) * C + ci0) * GROW) + j);
         }
@@ -100,7 +100,7 @@ __global__ void __launch_bounds__(256) bwd_data_s2_tc_k(const uint8_t *__restric
 #pragma unroll
             for (int m = 0; m < MT; m++) acc[m][0] = acc[m][1] = acc[m][2] = acc[m][3] = 0.f;
             for (int tl = 0; tl < ntap; tl++) {
-                const int a = tl / (ny * nx), bb = (tl / nx) % ny, c = tl % nx;
+                const int c = px ? tl & 1 : 0, bb = py ? (tl >> px) & 1 : 0, a = pz ? tl >> (px + py) : 0;
                 const int dz = pz && !a ? 1 : 0, dy = py && !bb ? 1 : 0, dx = px && !c ? 1 : 0;
                 /* B: k = co, n = voxel g of the tile; the gy row of class position (rz, ry, 8 xh + g) shifted by d */
                 const __nv_bfloat16 *brow = gyt + ((size_t)((rz + dz) * GY + ry + dy) * GX + 8 * xh + g + dx) * GROW;

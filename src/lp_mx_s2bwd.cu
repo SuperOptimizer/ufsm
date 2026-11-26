@@ -22,7 +22,7 @@ __global__ void __launch_bounds__(128) bwd_data_s2_mx2_k(const uint8_t *gy, cons
     float *sw = (float *)swq;
     for (int i = threadIdx.x; i < ntap * Co * bwx; i += blockDim.x) {
         const int cc = i % bwx, co = (i / bwx) % Co, tl = i / (bwx * Co);
-        const int a = tl / (ny * nx), bb = (tl / nx) % ny, c = tl % nx;
+        const int c = px ? tl & 1 : 0, bb = py ? (tl >> px) & 1 : 0, a = pz ? tl >> (px + py) : 0;   /* (= tl / (ny nx), (tl / nx) % ny, tl % nx: nx, ny in {1, 2}) */
         const int kz = pz ? (a ? 2 : 0) : 1, ky = py ? (bb ? 2 : 0) : 1, kx = px ? (c ? 2 : 0) : 1;
         const int ci = blk * bwx + cc;
         sw[i] = ci < Ci ? w[((size_t)co * Ci + ci) * 27 + (kz * 3 + ky) * 3 + kx] : 0.f;
@@ -38,7 +38,7 @@ __global__ void __launch_bounds__(128) bwd_data_s2_mx2_k(const uint8_t *gy, cons
 #pragma unroll
     for (int k = 0; k < 32; k++) acc[k] = 0.f;
     for (int tl = 0; tl < ntap; tl++) {
-        const int a = tl / (ny * nx), bb = (tl / nx) % ny, c = tl % nx;
+        const int c = px ? tl & 1 : 0, bb = py ? (tl >> px) & 1 : 0, a = pz ? tl >> (px + py) : 0;   /* (= tl / (ny nx), (tl / nx) % ny, tl % nx: nx, ny in {1, 2}) */
         const int oz = mz + (pz && !a ? 1 : 0), oy = my + (py && !bb ? 1 : 0), ox = mx + (px && !c ? 1 : 0);
         if (oz >= Do || oy >= Ho || ox >= Wo) continue;
         const size_t vo = ((size_t)oz * Ho + oy) * Wo + ox;
