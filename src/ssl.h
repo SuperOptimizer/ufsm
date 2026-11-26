@@ -66,6 +66,10 @@ void nn_sslh_grad(const void *lg, const ssl_heads *hs, size_t n, size_t off, siz
    centred side-head vector is trilinear at the mapped coordinate (base corner clamped to [0, n - 2], fraction to [0, 1]), at masked
    student cells with a mapping only. */
 void nn_ssl2_targets(const float *y, int C, int cd, int ch, int cw, int cv, int bv, float ratio, uint64_t seed, const float *map, double *mu, int8_t *t);
+/* --ssl-proto K (DINO prototypes on the side head): of N sampled cell indices, those with a teacher target (t != 0) in sample order ->
+   out; returns their count (nd: one device int of scratch). nn_ssl_tgather: their teacher rows as unit floats e [n][C] */
+int nn_ssl_compact(const int8_t *t, int C, size_t S, const int *idx, int N, int *out, int *nd);
+void nn_ssl_tgather(const int8_t *t, int C, size_t S, const int *idx, int N, float *e);
 /* host (src/ssl2.c): rec = one NN_RAD_REC(P) radial record of a cube window */
 int ssl2_pull(const void *rec, int P, const double io[3], double V[3]);   /* output position io (continuous) -> source V; 1 inside the source cube */
 void ssl2_teacher_rec(const void *srec, void *trec, int P, const double shift[3], double zoom);   /* the teacher's record: srec's header / axis, the warp io -> c + zoom (io - c - shift) */

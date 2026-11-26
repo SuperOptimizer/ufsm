@@ -66,6 +66,18 @@ the teacher's target only needs the two windows' radial records, so the sampler 
     and 0.013 for the teacher record. The map round trip is within 1.6e-6 voxels. The targets are byte-identical to the host's.
   - test_heads (10): a two-view fixture run gives finite ssl terms, a mapped share of 20-100 % and targeted shares of 5-90 %, with no
     DEFAULTED. The same run with --echo-max is refused.
+- **Prototype head (`--ssl-proto K`, an option; sslproto-20261126).** DINO on the side head's unit rows, at up to `--ssl-points` sampled
+  cells that carry a teacher target (`nn_ssl_compact`, deterministic in sample order). The teacher row is the int8 target as a unit
+  vector (`nn_ssl_tgather`). There are K prototypes; the teacher's are an EMA of the student's (`--ssl-proto-ema` 0.996). The teacher is
+  centred (momentum `--ssl-proto-center` 0.9) and sharpened (temperatures `--ssl-proto-ts` 0.1 / `-tt` 0.04).
+  - The loss is dn_dino (src/nn_dino.cu, tested in test_dino_loss) x --ssl-weight. The cosine term is still logged but trains nothing.
+  - The prototypes take an Adam step (`--ssl-proto-lr` 1e-3) and the centre is updated once per unlabelled window.
+  - Logs: "proto CE H batch-mean / per-cell of ln K (points)". An ALERT fires when batch-mean H < 0.25 ln K (few prototypes) or per-cell
+    H > 0.95 ln K (a uniform teacher).
+  - The sidecar RUN/<ckpt>.sslp follows the checkpoints, the ring and the snapshots; a resume without it prints DEFAULTED.
+  - Limits: --ssl 16 or 32 (dn_dino's widths) and one GPU (the prototypes are not all-reduced).
+  - Tests: test_ssl (6), compaction and unit rows against the host (0 mismatches, 3e-8). test_heads (11), a two-view proto fixture run
+    with entropies in (0, 1] and a resume from the sidecar.
 - **Gamma.** For D-dimensional unit rows the per-dimension std is at most 1/sqrt(D) (isotropic, zero mean), and that bound is v1's
   default gamma. The hinge therefore never switches off. For J1 v0 the setting is `--ssl 16 --ssl-level 2 --ssl-gamma 0.2` (0.8 of the
   maximum; the 11-12 fixture reached 0.88-0.96 of it), with `--ssl-block 16 --ssl-mask 0.5 --ssl-weight 0.5 --ssl-share 0.15`.
