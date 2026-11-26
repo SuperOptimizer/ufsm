@@ -132,31 +132,48 @@ int cmd_fields_phase(int argc, char **argv) {
         fprintf(stderr, "fields-phase: %d held-out boxes of %s (%s, scale %g) written unknown\n", nh, me, hp, hsc);
     }
     fit_fields_skip_planes(1 | 2 | 4 | 8); fit_fields_ct_planes(0);
-    fit_fields_buf *B = calloc(nd, sizeof *B);
-    for (int d = 0; d < nd; d++) if (fit_fields_load(dirs[d], 0, 0, 1, &B[d])) { fprintf(stderr, "fields-phase: cannot load %s\n", dirs[d]); return 1; }
+    /* the field sets' geometry only (pool 0): their planes are read one z shard row at a time below (a whole-scroll set is ~24 GB of
+       pc / ps: 1667 at 19.2 um cells peaked at 33.7 GB and was OOM-killed in a 36 GB scope, 2026-11-26) */
+    fit_fields_buf *G = calloc(nd, sizeof *G), *B = calloc(nd, sizeof *B);
+    for (int d = 0; d < nd; d++) if (fit_fields_load(dirs[d], 0, 0, 0, &G[d])) { fprintf(stderr, "fields-phase: cannot read %s\n", dirs[d]); return 1; }
     const int S = 512; const int64_t g[3] = {(shape[0] + S - 1) / S, (shape[1] + S - 1) / S, (shape[2] + S - 1) / S};
     char at[256]; snprintf(at, sizeof at, "{\"ufsm\": {\"content\": \"fields-phase teacher pseudo-labels\", \"conf\": %g, \"ref\": %s}}", cmin, zr ? "true" : "false");
     z3w *w = z3w_create(out, shape, S, 0.f, 255, at); if (!w) { fprintf(stderr, "fields-phase: %s\n", z3w_error()); return 1; }
-    /* the shards that overlap a field box, then one worker per thread (own S^3 buffer; z3w_write_shard is thread-safe across shards) */
-    int64_t *list = malloc(sizeof(int64_t) * 3 * (size_t)(g[0] * g[1] * g[2])); int64_t nl = 0;
-    for (int64_t sz = 0; sz < g[0]; sz++) for (int64_t sy = 0; sy < g[1]; sy++) for (int64_t sx = 0; sx < g[2]; sx++) {
-        const int64_t o[3] = {sz * S, sy * S, sx * S}; int hit = 0;
-        for (int d = 0; d < nd && !hit; d++) {
-            const long long *bo = B[d].origin; const int64_t be[3] = {bo[0] + (int64_t)B[d].f.D * B[d].h, bo[1] + (int64_t)B[d].f.H * B[d].h, bo[2] + (int64_t)B[d].f.W * B[d].h};
-            hit = o[0] < be[0] && o[0] + S > bo[0] && o[1] < be[1] && o[1] + S > bo[1] && o[2] < be[2] && o[2] + S > bo[2];
-        }
-        if (hit) { list[3 * nl] = sz; list[3 * nl + 1] = sy; list[3 * nl + 2] = sx; nl++; }
-    }
-    fp_job J = {.B = B, .nd = nd, .zr = zr, .w = w, .shape = shape, .S = S, .cmin = cmin, .list = list, .nl = nl, .nh = nh, .hb = hb};
+    /* per z shard row: each field set's rows that reach it (one cell of margin for the trilinear taps) loaded, the row's shards that
+       overlap a field box, one worker per thread (own S^3 buffer; z3w_write_shard is thread-safe across shards) */
+    int64_t *list = malloc(sizeof(int64_t) * 3 * (size_t)(g[1] * g[2])); long long nsh = 0;
+    fp_job J = {.B = B, .nd = nd, .zr = zr, .w = w, .shape = shape, .S = S, .cmin = cmin, .list = list, .nh = nh, .hb = hb};
     const int nw = nt < 1 ? 1 : nt > 32 ? 32 : nt; pthread_t th[32];
-    for (int i = 0; i < nw; i++) pthread_create(&th[i], nullptr, fp_worker, &J);
-    for (int i = 0; i < nw; i++) pthread_join(th[i], nullptr);
+    for (int64_t sz = 0; sz < g[0] && !J.fail; sz++) {
+        const int64_t z0 = sz * S, z1 = z0 + S < shape[0] ? z0 + S : shape[0]; int any = 0;
+        for (int d = 0; d < nd; d++) {
+            const fit_fields_buf *q = &G[d]; const int h = q->h; memset(&B[d], 0, sizeof B[d]);
+            long long f0 = (long long)floor((double)(z0 - q->origin[0]) / h) - 1, f1 = (long long)ceil((double)(z1 - q->origin[0]) / h) + 1;
+            if (f0 < 0) f0 = 0; if (f1 > q->shape[0]) f1 = q->shape[0];
+            if (f0 >= f1) { B[d].h = h; B[d].f.D = 0; for (int a2 = 0; a2 < 3; a2++) B[d].origin[a2] = q->origin[a2]; continue; }   /* (no rows here: every voxel test fails) */
+            if (fit_fields_load(dirs[d], (int)f0, (int)f1, 1, &B[d])) { fprintf(stderr, "fields-phase: cannot load %s rows %lld..%lld\n", dirs[d], f0, f1); return 1; }
+            any = 1;
+        }
+        int64_t nl = 0;
+        for (int64_t sy = 0; any && sy < g[1]; sy++) for (int64_t sx = 0; sx < g[2]; sx++) {
+            const int64_t o[3] = {z0, sy * S, sx * S}; int hit = 0;
+            for (int d = 0; d < nd && !hit; d++) {
+                const long long *bo = G[d].origin; const int64_t be[3] = {bo[0] + (int64_t)G[d].shape[0] * G[d].h, bo[1] + (int64_t)G[d].shape[1] * G[d].h, bo[2] + (int64_t)G[d].shape[2] * G[d].h};
+                hit = o[0] < be[0] && o[0] + S > bo[0] && o[1] < be[1] && o[1] + S > bo[1] && o[2] < be[2] && o[2] + S > bo[2];
+            }
+            if (hit) { list[3 * nl] = sz; list[3 * nl + 1] = sy; list[3 * nl + 2] = sx; nl++; }
+        }
+        J.nl = nl; atomic_store(&J.next, 0);
+        if (nl) { for (int i = 0; i < nw; i++) pthread_create(&th[i], nullptr, fp_worker, &J); for (int i = 0; i < nw; i++) pthread_join(th[i], nullptr); }
+        nsh += nl;
+        for (int d = 0; d < nd; d++) if (B[d].f.D) fit_fields_free(&B[d]);
+    }
     free(list);
     if (J.fail) { fprintf(stderr, "fields-phase: a shard failed (read or write)\n"); return 1; }
-    const long long nsh = nl, nref = J.nref, nteach = J.nteach, nlow = J.nlow, nhold = J.nhold; free(hb);
+    const long long nref = J.nref, nteach = J.nteach, nlow = J.nlow, nhold = J.nhold; free(hb);
     z3w_close(w);
     printf("fields-phase: %lld shards, voxels: %lld human labels kept, %lld teacher labels (conf >= %g), %lld teacher voxels below conf, %lld held out -> %s\n", nsh, nref, nteach, cmin, nlow, nhold, out);
-    for (int d = 0; d < nd; d++) fit_fields_free(&B[d]);
-    free(B);
+    for (int d = 0; d < nd; d++) fit_fields_free(&G[d]);
+    free(B); free(G);
     return 0;
 }
