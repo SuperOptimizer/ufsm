@@ -9,6 +9,8 @@
 #include "z3w.h"
 #include "zarr3.h"
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -134,6 +136,74 @@ int cmd_ink_blend(int argc, char **argv) {
     g_ib_keep = nullptr; free(keep); return rc;
 }
 
+/* ink_blend_run's shared state and its workers (perf 11-25): each worker takes the next output shard and reads, blends and writes it
+   alone (its own buffers; z3_read and z3w_write_shard are thread-safe across shards; inner threads = --threads / workers) */
+typedef struct {
+    int n, S, B; z3 **zz; const char *const *in; const double *st; const double (*g)[3]; const int64_t (*org)[3]; z3w *w;
+    int64_t ish[32][3], shd[32][3], pn[32][3]; uint8_t *pm[32];   /* per input: shape, shard edge, shard grid, presence map */
+    const int64_t *job; long nj; int inner; double t0;
+    atomic_long next, done; atomic_llong nlive, nblk; atomic_int err; char msg[512]; pthread_mutex_t mu;
+} ib_ctx;
+static int ib_present(const ib_ctx *C, int i, int64_t a, int64_t b, int64_t c) {
+    if (a < 0 || b < 0 || c < 0 || a >= C->pn[i][0] || b >= C->pn[i][1] || c >= C->pn[i][2]) return 0;
+    return C->pm[i][(size_t)((a * C->pn[i][1] + b) * C->pn[i][2] + c)];
+}
+static void ib_fail(ib_ctx *C, const char *m) {
+    pthread_mutex_lock(&C->mu); if (!atomic_load(&C->err)) snprintf(C->msg, sizeof C->msg, "%s", m); atomic_store(&C->err, 1); pthread_mutex_unlock(&C->mu);
+}
+static void *ib_worker(void *arg) {
+    ib_ctx *C = arg; const int n = C->n, S = C->S, B = C->B, nb = B ? S / B : 0, nb3 = nb * nb * nb; const size_t sv = (size_t)S * S * S;
+    uint8_t *buf[32] = {nullptr}, *mk[32] = {nullptr}, *ob = malloc(sv), *bpres = B ? malloc((size_t)nb3 * n) : nullptr; float *wv[3]; int ok = ob && (!B || bpres);
+    for (int d = 0; d < 3; d++) { wv[d] = malloc((size_t)n * S * sizeof(float)); ok &= wv[d] != nullptr; }
+    for (int i = 0; i < n; i++) { buf[i] = malloc(sv); ok &= buf[i] != nullptr; }
+    if (!ok) ib_fail(C, "ink-blend: out of memory");
+    for (long j; ok && !atomic_load(&C->err) && (j = atomic_fetch_add(&C->next, 1)) < C->nj;) {
+        const int64_t a = C->job[3 * j], b = C->job[3 * j + 1], c = C->job[3 * j + 2], o[3] = {a * S, b * S, c * S}, nn[3] = {S, S, S};
+        long long live = 0; char em[512];
+        for (int q = 0; q < nb3; q++) {   /* each block's inputs present (aligned: a block lies inside one input shard, present or absent whole) */
+            const int bz = q / (nb * nb), by = q / nb % nb, bx = q % nb; int np = 0;
+            for (int i = 0; i < n; i++) {
+                int in = 1; int64_t q3[3];
+                for (int d = 0; d < 3; d++) { const int64_t l = o[d] + (int64_t)(d ? d == 1 ? by : bx : bz) * B - C->org[i][d]; if (l < 0 || l >= C->ish[i][d]) in = 0; q3[d] = l >= 0 ? l / C->shd[i][d] : 0; }
+                bpres[(size_t)q * n + i] = in && ib_present(C, i, q3[0], q3[1], q3[2]); np += bpres[(size_t)q * n + i];
+            }
+            live += np > 0;
+        }
+        for (int i = 0; i < n && ok; i++) {
+            const int64_t lo[3] = {o[0] - C->org[i][0], o[1] - C->org[i][1], o[2] - C->org[i][2]};
+            if (z3_read(C->zz[i], lo, nn, buf[i], C->inner)) { snprintf(em, sizeof em, "ink-blend: read %s: %s", C->in[i], z3_error()); ib_fail(C, em); ok = 0; break; }
+            if (B) { free(mk[i]); mk[i] = nullptr; }   /* (block mode: the absent input shards are the blocks' presence flags, bpres) */
+            else {   /* input shards absent inside this output shard (the other input's grid, occupancy-skipped air): a voxel mask of weight 0 */
+                int part = 0;
+                for (int pass = 0; pass < 2; pass++) {
+                    for (int64_t za = lo[0] < 0 ? 0 : lo[0] / C->shd[i][0]; za * C->shd[i][0] < lo[0] + S && za * C->shd[i][0] < C->ish[i][0]; za++)
+                        for (int64_t ya = lo[1] < 0 ? 0 : lo[1] / C->shd[i][1]; ya * C->shd[i][1] < lo[1] + S && ya * C->shd[i][1] < C->ish[i][1]; ya++)
+                            for (int64_t xa = lo[2] < 0 ? 0 : lo[2] / C->shd[i][2]; xa * C->shd[i][2] < lo[2] + S && xa * C->shd[i][2] < C->ish[i][2]; xa++) {
+                                if (ib_present(C, i, za, ya, xa)) continue;
+                                if (!pass) { part = 1; continue; }
+                                int64_t a0[3], a1[3]; const int64_t qa[3] = {za, ya, xa};
+                                for (int d = 0; d < 3; d++) { a0[d] = qa[d] * C->shd[i][d] - lo[d]; a1[d] = a0[d] + C->shd[i][d]; if (a0[d] < 0) a0[d] = 0; if (a1[d] > S) a1[d] = S; }
+                                for (int64_t z = a0[0]; z < a1[0]; z++) for (int64_t y = a0[1]; y < a1[1]; y++) memset(mk[i] + ((size_t)z * S + y) * S + a0[2], 0, (size_t)(a1[2] - a0[2]));
+                            }
+                    if (!pass) { if (!part) break; if (!mk[i] && !(mk[i] = malloc(sv))) { ib_fail(C, "ink-blend: out of memory"); ok = 0; break; } memset(mk[i], 1, sv); }
+                }
+                if (!part && mk[i]) { free(mk[i]); mk[i] = nullptr; }
+            }
+            for (int d = 0; d < 3; d++) for (int k = 0; k < S; k++)   /* outside input i: weight 0 */
+                wv[d][(size_t)i * S + k] = lo[d] + k < 0 || lo[d] + k >= C->ish[i][d] ? 0.f : (float)fb_tile_w(o[d], 1, k, C->st[d], C->g[i][d]);
+        }
+        if (!ok) break;
+        ib_job J = {buf, n, wv[0], wv[1], wv[2], S, {S, S, S}, ob, mk, B ? bpres : nullptr, B, nb};
+        if (C->inner > 1) fit_par(S, ib_rows, &J); else ib_rows(&J, 0, S, 0);
+        atomic_fetch_add(&C->nlive, live); atomic_fetch_add(&C->nblk, nb3);
+        if (z3w_write_shard(C->w, a, b, c, ob, C->inner)) { snprintf(em, sizeof em, "%s", z3w_error()); ib_fail(C, em); break; }
+        const long k = atomic_fetch_add(&C->done, 1) + 1;
+        if (k % 50 == 0) fprintf(stderr, "ink-blend: %ld of %ld shards %.0f s\n", k, C->nj, now() - C->t0);
+    }
+    free(ob); free(bpres); for (int d = 0; d < 3; d++) free(wv[d]); for (int i = 0; i < n; i++) { free(buf[i]); free(mk[i]); }
+    return nullptr;
+}
+
 /* the blend itself (ink-blend; predict --seamless): n uint8 probability groups (level named by um) on overlapping tile grids (tile st,
    grid offsets g, level voxels; input voxel + org = output voxel) -> out/<um> + nlev - 1 mean-pooled levels, shards of S, volcomp q */
 int ink_blend_run(const char *out, double um, const double st[3], int n, const char *const *in, const double (*g)[3], const int64_t (*org)[3],
@@ -149,9 +219,6 @@ int ink_blend_run(const char *out, double um, const double st[3], int n, const c
     char odir[1400]; snprintf(odir, sizeof odir, "%s/%s", out, lv);
     z3w *w = z3w_create(odir, shape, S, (float)q, 0, attrs);
     if (!w) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
-    const size_t sv = (size_t)S * S * S;
-    uint8_t *buf[32]; for (int i = 0; i < n; i++) if (!(buf[i] = malloc(sv))) { fprintf(stderr, "ink-blend: out of memory\n"); return 1; }
-    uint8_t *ob = malloc(sv), *mk[32] = {nullptr}; float *wv[3]; for (int d = 0; d < 3; d++) wv[d] = malloc((size_t)n * S * sizeof(float));
     int64_t ns[3]; for (int d = 0; d < 3; d++) ns[d] = (shape[d] + S - 1) / S;
     /* block flags instead of voxel masks (perf 11-25): predict --seamless 2 writes its passes with shards S / 2 (128 for window 288 halo
        16) and blends into the run's --shard (512): a tile-list predict fills a few 128^3 blocks of each 512^3 output shard, and every
@@ -166,70 +233,46 @@ int ink_blend_run(const char *out, double um, const double st[3], int n, const c
     { int ok = B >= 16 && B < S && S % B == 0 && !(getenv("UFSM_IB_BLOCK") && !atoi(getenv("UFSM_IB_BLOCK")));
       for (int i = 0; i < n && ok; i++) { const z3_meta *m = z3_meta_of(zz[i]); for (int d = 0; d < 3; d++) if (m->shard[d] % B || org[i][d] % B) ok = 0; }
       if (!ok) B = 0; }
-    long long nlive = 0, nblk = 0; uint8_t *bpres = B ? malloc((size_t)(S / B) * (S / B) * (S / B) * n) : nullptr;
-    if (B && !bpres) { fprintf(stderr, "ink-blend: out of memory\n"); return 1; }
-    int nw = 0, nskip = 0; double t0 = now();
+    /* shard presence once per input (perf 11-25, inkperf R11d HOLD: a seamless tile-list blend walked ~70 k output shards asking
+       z3_shard_present per input shard, an index open each, > 82 s on one thread with the GPU idle): z3_shard_map lists a local store's
+       shard files, then the output shards with any input are blended by up to --threads workers, one shard each (same bytes: the
+       per-voxel arithmetic does not depend on the split) */
+    ib_ctx C = {.n = n, .S = S, .B = B, .zz = zz, .in = in, .st = st, .g = g, .org = org, .w = w, .mu = PTHREAD_MUTEX_INITIALIZER};
+    for (int i = 0; i < n; i++) {
+        for (int d = 0; d < 3; d++) { C.ish[i][d] = ish[i][d]; C.shd[i][d] = z3_meta_of(zz[i])->shard[d]; }
+        if (z3_shard_map(zz[i], C.pn[i], &C.pm[i]) < 0) { fprintf(stderr, "ink-blend: shard map of %s: %s\n", in[i], z3_error()); return 1; }
+    }
+    int64_t *job = malloc((size_t)(ns[0] * ns[1] * ns[2] > 0 ? ns[0] * ns[1] * ns[2] : 1) * 3 * sizeof *job); long nj = 0; int nskip = 0;
+    if (!job) { fprintf(stderr, "ink-blend: out of memory\n"); return 1; }
     for (int64_t a = 0; a < ns[0]; a++) for (int64_t b = 0; b < ns[1]; b++) for (int64_t c = 0; c < ns[2]; c++) {
-        const int64_t o[3] = {a * S, b * S, c * S}, nn[3] = {S, S, S};
         if (g_ib_keep && (a >= g_ib_kn[0] || b >= g_ib_kn[1] || c >= g_ib_kn[2] || !g_ib_keep[((size_t)a * g_ib_kn[1] + b) * g_ib_kn[2] + c])) { nskip++; continue; }
-        int any = 0;
+        const int64_t o[3] = {a * S, b * S, c * S}; int any = 0;
         for (int i = 0; i < n && !any; i++) {   /* any input shard holding this output shard's box (input-local voxels o - origin, clipped) */
-            const z3_meta *m = z3_meta_of(zz[i]); int64_t lo[3], hi[3]; int ok = 1;
+            int64_t lo[3], hi[3]; int ok = 1;
             for (int d = 0; d < 3; d++) { lo[d] = o[d] - org[i][d]; hi[d] = lo[d] + S - 1; if (lo[d] < 0) lo[d] = 0; if (hi[d] > ish[i][d] - 1) hi[d] = ish[i][d] - 1; if (lo[d] > hi[d]) ok = 0; }
             if (!ok) continue;
-            for (int64_t za = lo[0] / m->shard[0]; za <= hi[0] / m->shard[0] && !any; za++)
-                for (int64_t ya = lo[1] / m->shard[1]; ya <= hi[1] / m->shard[1] && !any; ya++)
-                    for (int64_t xa = lo[2] / m->shard[2]; xa <= hi[2] / m->shard[2] && !any; xa++)
-                        if (z3_shard_present(zz[i], za, ya, xa) == 1) any = 1;
+            for (int64_t za = lo[0] / C.shd[i][0]; za <= hi[0] / C.shd[i][0] && !any; za++)
+                for (int64_t ya = lo[1] / C.shd[i][1]; ya <= hi[1] / C.shd[i][1] && !any; ya++)
+                    for (int64_t xa = lo[2] / C.shd[i][2]; xa <= hi[2] / C.shd[i][2] && !any; xa++) any = ib_present(&C, i, za, ya, xa);
         }
         if (!any) { nskip++; continue; }
-        int live = 0; const int nb = B ? S / B : 0, nb3 = nb * nb * nb;
-        for (int q = 0; q < nb3; q++) {   /* each block's inputs present (aligned: a block lies inside one input shard, present or absent whole) */
-            const int bz = q / (nb * nb), by = q / nb % nb, bx = q % nb; int np = 0;
-            for (int i = 0; i < n; i++) {
-                const z3_meta *m = z3_meta_of(zz[i]); int in = 1; int64_t q3[3];
-                for (int d = 0; d < 3; d++) { const int64_t l = o[d] + (int64_t)(d ? d == 1 ? by : bx : bz) * B - org[i][d]; if (l < 0 || l >= ish[i][d]) in = 0; q3[d] = l >= 0 ? l / m->shard[d] : 0; }
-                bpres[(size_t)q * n + i] = in && z3_shard_present(zz[i], q3[0], q3[1], q3[2]) == 1; np += bpres[(size_t)q * n + i];
-            }
-            live += np > 0;
-        }
-        for (int i = 0; i < n; i++) {
-            const int64_t lo[3] = {o[0] - org[i][0], o[1] - org[i][1], o[2] - org[i][2]};
-            if (z3_read(zz[i], lo, nn, buf[i], nt)) { fprintf(stderr, "ink-blend: read %s: %s\n", in[i], z3_error()); return 1; }
-            if (B) { free(mk[i]); mk[i] = nullptr; }   /* (block mode: the absent input shards are the blocks' presence flags, bpres) */
-            else {   /* input shards absent inside this output shard (the other input's grid, occupancy-skipped air): a voxel mask of weight 0 */
-                const z3_meta *m = z3_meta_of(zz[i]); int part = 0;
-                for (int pass = 0; pass < 2; pass++) {
-                    for (int64_t za = lo[0] < 0 ? 0 : lo[0] / m->shard[0]; za * m->shard[0] < lo[0] + S && za * m->shard[0] < ish[i][0]; za++)
-                        for (int64_t ya = lo[1] < 0 ? 0 : lo[1] / m->shard[1]; ya * m->shard[1] < lo[1] + S && ya * m->shard[1] < ish[i][1]; ya++)
-                            for (int64_t xa = lo[2] < 0 ? 0 : lo[2] / m->shard[2]; xa * m->shard[2] < lo[2] + S && xa * m->shard[2] < ish[i][2]; xa++) {
-                                if (z3_shard_present(zz[i], za, ya, xa) == 1) continue;
-                                if (!pass) { part = 1; continue; }
-                                int64_t a0[3], a1[3]; const int64_t qa[3] = {za, ya, xa};
-                                for (int d = 0; d < 3; d++) { a0[d] = qa[d] * m->shard[d] - lo[d]; a1[d] = a0[d] + m->shard[d]; if (a0[d] < 0) a0[d] = 0; if (a1[d] > S) a1[d] = S; }
-                                for (int64_t z = a0[0]; z < a1[0]; z++) for (int64_t y = a0[1]; y < a1[1]; y++) memset(mk[i] + ((size_t)z * S + y) * S + a0[2], 0, (size_t)(a1[2] - a0[2]));
-                            }
-                    if (!pass) { if (!part) break; if (!mk[i] && !(mk[i] = malloc(sv))) { fprintf(stderr, "ink-blend: out of memory\n"); return 1; } memset(mk[i], 1, sv); }
-                }
-                if (!part && mk[i]) { free(mk[i]); mk[i] = nullptr; }
-            }
-            for (int d = 0; d < 3; d++) for (int k = 0; k < S; k++)   /* outside input i: weight 0 */
-                wv[d][(size_t)i * S + k] = lo[d] + k < 0 || lo[d] + k >= ish[i][d] ? 0.f : (float)fb_tile_w(o[d], 1, k, st[d], g[i][d]);
-        }
-        ib_job J = {buf, n, wv[0], wv[1], wv[2], S, {S, S, S}, ob, mk, B ? bpres : nullptr, B, nb};
-        fit_par(S, ib_rows, &J);
-        nlive += live; nblk += nb3;
-        if (z3w_write_shard(w, a, b, c, ob, nt)) { fprintf(stderr, "%s\n", z3w_error()); return 1; }
-        if (++nw % 50 == 0) fprintf(stderr, "ink-blend: %d shards (%d skipped) %.0f s\n", nw, nskip, now() - t0);
+        job[3 * nj] = a; job[3 * nj + 1] = b; job[3 * nj + 2] = c; nj++;
     }
+    int nwk = nt < 1 ? 1 : nt > 64 ? 64 : nt; if (nwk > nj) nwk = nj > 0 ? (int)nj : 1;
+    C.job = job; C.nj = nj; C.inner = nt / nwk > 1 ? nt / nwk : 1; C.t0 = now();
+    pthread_t th[64]; int nth = 0;
+    for (int k = 1; k < nwk; k++) if (!pthread_create(&th[nth], nullptr, ib_worker, &C)) nth++;
+    ib_worker(&C);
+    for (int k = 0; k < nth; k++) pthread_join(th[k], nullptr);
+    for (int i = 0; i < n; i++) free(C.pm[i]);
+    free(job);
+    if (atomic_load(&C.err)) { fprintf(stderr, "%s\n", C.msg); return 1; }
     z3w_close(w);
-    fprintf(stderr, "ink-blend: %d shards written, %d empty, %.0f s", nw, nskip, now() - t0);
-    if (B) fprintf(stderr, " (blocks of %d: %lld of %lld blended)", B, nlive, nblk);
+    fprintf(stderr, "ink-blend: %ld shards written, %d empty, %.0f s (%d workers)", nj, nskip, now() - C.t0, nth + 1);
+    if (B) fprintf(stderr, " (blocks of %d: %lld of %lld blended)", B, (long long)atomic_load(&C.nlive), (long long)atomic_load(&C.nblk));
     fputc('\n', stderr);
-    free(bpres);
     for (int l = 1; l < nlev; l++) if (pyramid_build_level(out, um, l, shape, S, (float)q, 0, nt, attrs)) return 1;
     pyramid_write_group(out, um, nlev, "ink-blend", attrs);
-    for (int i = 0; i < n; i++) { free(buf[i]); z3_close(zz[i]); store_close(ss[i]); }
-    free(ob); for (int i = 0; i < n; i++) free(mk[i]); for (int d = 0; d < 3; d++) free(wv[d]);
+    for (int i = 0; i < n; i++) { z3_close(zz[i]); store_close(ss[i]); }
     return 0;
 }
