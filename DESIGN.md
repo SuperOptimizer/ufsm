@@ -314,6 +314,19 @@ and scoring on the desk (wbench clean boxes, SLABS=0, GPU fits), each arm paired
   - /vesuvius/ufsm/microc/deskab: ab120.sh, sass120.sh, kres.sh, sdf/.
 
 ## CPU side: the pod's CPUs are not the bottleneck; blocking host waits, gpudec priority, content dcache keys, cheaper elastic warp (2026-11-25, perf)
+- **Pod CT decode is on the CPU (--ct-gpu-decode -1) from 2026-11-26 (perf / mcuda / podink).**
+  - What R11P showed (~10.5 h, P768 ink, RTX PRO 6000 at its power cap): gpudec decoded 1.57 M substreams in 67 k batches; 8234 round
+    trips took over 500 ms (14516 s in total, ~0.22 s per batch, against ~1 ms per isolated k_entropy batch, i.e. queueing behind the
+    trainer). The cool-offs sent 5.26 M requests to the CPU.
+  - A/B on pod 1 (R11P argv from snap/12000, master 5b6d871d, 13.6-CPU cgroup, 300 steps per arm):
+
+    | arm | Mvox/s | wait | CPU cores | dmon sm | DEFAULTED |
+    |---|---|---|---|---|---|
+    | --ct-gpu-decode 0 | 233.0 | 0.0 % | 2.18 | 90 % | 1 (0.3 % of 23.6 k requests on the GPU; 31 % in cool-off) |
+    | --ct-gpu-decode -1 | 232.6 | 0.0 % | 2.31 | 90 % | 0 |
+
+  - A tie, so CPU decode: it costs 0.13 cores of ~7 idle, frees gpudec's device memory (1.6 GB on the desk, which had pushed inkfly to
+    the CPU), and gives no DEFAULTED line. gpudec stays for CPU-starved hosts. The cool-off is not tuned.
 - Measured first. Pod 1 (13.6 CPUs by cgroup, RTX PRO 6000) over the container's day with DINO2 + S2E: 2.9 CPUs used while active (173 k
   CPU-s, 25 % system), throttled in 5 837 of 595 k periods (1 %). S2E's wait (71 -> 23 % over 30 k steps, 30-86 Mvox/s) followed cache
   misses: derived ink cells computed per 10 steps fell 334 -> 72 with it (443 k computed over the run), HTTP chunk reads ~0.35 s first byte
