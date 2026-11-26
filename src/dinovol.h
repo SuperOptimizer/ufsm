@@ -56,6 +56,10 @@ void dv_prof_report(double per);            /* print (divided by per) and reset 
 /* ufsm dinovol-probe (src/dvprobe.c): a feature row's crop / canvas cell, ink share and supervised px; the weighted logistic probe on
    standardised features (mu / sd [F], w [F + 1], bias last; Newton steps with ridge lam) and the weighted ROC AUC of scores vs soft labels */
 typedef struct { int32_t crop; int16_t r, c; float lab, wgt; } dvf_row;
+/* the feature file (.dvf): this header ("DVPF0001"; F features = E tokens + nd dense + ni ink, ncrop names of DVF_NAME bytes, the canvas
+   lattice stride), then rows {dvf_row, F fp16}. Written by dinovol-probe feats and predict --surf-feats (E = F: our trunk's features) */
+typedef struct { char magic[8]; int32_t F, E, nd, ni, ncrop, stride, win, pad; } dvf_head;
+enum { DVF_NAME = 256 };
 int dvp_fit(const float *X, const dvf_row *R, long n, int F, double lam, int iters, int nthreads, double *mu, double *sd, double *w);
 float *dvp_read_cols(const char *path, const char *spec, long *n, int *F);
 double dvp_wauc(const double *s, const dvf_row *R, long n);
