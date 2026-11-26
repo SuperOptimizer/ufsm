@@ -2,6 +2,8 @@
 #include "sample_emb.h"
 #include "embz.h"
 #include "json.h"
+#include "defaulted.h"
+#include <stdatomic.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +28,9 @@ void sample_emb_coords(int Pz, int P, int div, const int perm[3], const int flip
 }
 
 _Atomic size_t g_emb_pap_cleared, g_emb_pap_kept;
+static _Atomic unsigned long g_emb_dropped;   /* head-grid planes whose store region exceeds SE_CAP even alone */
+static size_t se_cap(void) { const char *e = getenv("UFSM_EMB_REGION_KB"); return (size_t)(e && atol(e) > 0 ? atol(e) : 65536) << 10; }   /* (a test shrinks it) */
+#define SE_CAP se_cap()
 
 /* per-thread open groups */
 typedef struct { const source *s; int k; emb e; int step, ok; } eh_t;
@@ -66,51 +71,61 @@ int sample_emb_window(const source *s, int C, int div, int l, const int64_t o[3]
         if (h->e.a.C != C) { fprintf(stderr, "distill: %s: %s has %d channels, the head %d\n", s->name, s->emb_grp[k], h->e.a.C, C); rc = -1; break; }
         const double st = h->step;
         /* the cell lattice coordinate of every open cell centre (cell i covers embedding voxels [i st, (i + 1) st), centre i st + (st - 1) / 2) */
-        int64_t lo[3] = {INT64_MAX, INT64_MAX, INT64_MAX}, hi[3] = {INT64_MIN, INT64_MIN, INT64_MIN};
-        for (size_t q = 0; q < ng; q++) {
-            if (done[q]) continue;
-            for (int d = 0; d < 3; d++) {
-                const double e = (o[d] + V[3 * q + d] + .5) * f - .5, c = (e - (st - 1) * .5) / st;
-                cu[3 * q + d] = (float)c;
-                const int64_t a = (int64_t)floor(c);
-                if (a < lo[d]) lo[d] = a;
-                if (a + 1 > hi[d]) hi[d] = a + 1;
-            }
+        for (size_t q = 0; q < ng; q++) for (int d = 0; d < 3; d++) {
+            const double e = (o[d] + V[3 * q + d] + .5) * f - .5;
+            cu[3 * q + d] = (float)((e - (st - 1) * .5) / st);
         }
-        if (lo[0] > hi[0]) { pass = 2; break; }   /* every cell done */
-        for (int d = 0; d < 3; d++) { if (lo[d] < 0) lo[d] = 0; if (hi[d] >= h->e.a.shape[d]) hi[d] = h->e.a.shape[d] - 1; }
-        if (lo[0] > hi[0] || lo[1] > hi[1] || lo[2] > hi[2]) continue;   /* outside this group's array */
-        const int64_t rn[3] = {hi[0] - lo[0] + 1, hi[1] - lo[1] + 1, hi[2] - lo[2] + 1};
-        const size_t rb = (size_t)rn[0] * rn[1] * rn[2] * C;
-        if (rb > ((size_t)256 << 20)) continue;   /* (a window far larger than the head grid: none) */
-        int8_t *reg = malloc(rb);
-        if (!reg || zr_read_i8(&h->e.a, lo, rn, reg)) { free(reg); rc = -1; break; }
-        for (size_t q = 0; q < ng; q++) {
-            if (done[q]) continue;
-            int64_t i0[3]; double fr[3];
-            for (int d = 0; d < 3; d++) { const double c = cu[3 * q + d]; i0[d] = (int64_t)floor(c); fr[d] = c - (double)i0[d]; }
-            for (int k2 = 0; k2 < C; k2++) acc[k2] = 0.f;
-            double ws = 0;
-            for (int a = 0; a < 8; a++) {
-                const int64_t z = i0[0] + (a >> 2) - lo[0], y = i0[1] + ((a >> 1) & 1) - lo[1], x = i0[2] + (a & 1) - lo[2];
-                if (z < 0 || y < 0 || x < 0 || z >= rn[0] || y >= rn[1] || x >= rn[2]) continue;
-                const double w = ((a >> 2) ? fr[0] : 1 - fr[0]) * (((a >> 1) & 1) ? fr[1] : 1 - fr[1]) * ((a & 1) ? fr[2] : 1 - fr[2]);
-                if (w <= 0) continue;
-                const int8_t *sv = reg + (((size_t)z * rn[1] + y) * rn[2] + x) * C;
-                double l2 = 0; for (int k2 = 0; k2 < C; k2++) l2 += (double)sv[k2] * sv[k2];
+        /* the store region under the open cells, read in z slabs of the head grid: a whole window's box (rotation + zoom at P 768,
+           a level-0 store: ~300 MB) is halved until it fits SE_CAP (11-26: one 256 MB box cap used to drop such windows' targets) */
+        const size_t G12 = (size_t)G[1] * G[2]; int sz = G[0];
+        for (int g0 = 0; g0 < G[0] && !rc;) {
+            const int g1 = g0 + sz < G[0] ? g0 + sz : G[0];
+            int64_t lo[3] = {INT64_MAX, INT64_MAX, INT64_MAX}, hi[3] = {INT64_MIN, INT64_MIN, INT64_MIN};
+            for (size_t q = (size_t)g0 * G12; q < (size_t)g1 * G12; q++) {
+                if (done[q]) continue;
+                for (int d = 0; d < 3; d++) { const int64_t a = (int64_t)floor(cu[3 * q + d]); if (a < lo[d]) lo[d] = a; if (a + 1 > hi[d]) hi[d] = a + 1; }
+            }
+            if (lo[0] > hi[0]) { g0 = g1; continue; }   /* every cell of the slab done */
+            for (int d = 0; d < 3; d++) { if (lo[d] < 0) lo[d] = 0; if (hi[d] >= h->e.a.shape[d]) hi[d] = h->e.a.shape[d] - 1; }
+            if (lo[0] > hi[0] || lo[1] > hi[1] || lo[2] > hi[2]) { g0 = g1; continue; }   /* outside this group's array */
+            const int64_t rn[3] = {hi[0] - lo[0] + 1, hi[1] - lo[1] + 1, hi[2] - lo[2] + 1};
+            const size_t rb = (size_t)rn[0] * rn[1] * rn[2] * C;
+            if (rb > SE_CAP && sz > 1) { sz = (sz + 1) / 2; continue; }   /* (the same slab start, half as deep) */
+            if (rb > SE_CAP) {   /* (one head-grid plane still too large: a degenerate warp) */
+                const unsigned long nd = atomic_fetch_add(&g_emb_dropped, 1) + 1;
+                if ((nd & (nd - 1)) == 0) UFSM_DEFAULTED("distill: %s: %lu head-grid planes without targets (store region %zu KB > %zu KB)", s->name, nd, rb >> 10, (size_t)SE_CAP >> 10);
+                g0 = g1; continue;
+            }
+            int8_t *reg = malloc(rb);
+            if (!reg || zr_read_i8(&h->e.a, lo, rn, reg)) { free(reg); rc = -1; break; }
+            for (size_t q = (size_t)g0 * G12; q < (size_t)g1 * G12; q++) {
+                if (done[q]) continue;
+                int64_t i0[3]; double fr[3];
+                for (int d = 0; d < 3; d++) { const double c = cu[3 * q + d]; i0[d] = (int64_t)floor(c); fr[d] = c - (double)i0[d]; }
+                for (int k2 = 0; k2 < C; k2++) acc[k2] = 0.f;
+                double ws = 0;
+                for (int a = 0; a < 8; a++) {
+                    const int64_t z = i0[0] + (a >> 2) - lo[0], y = i0[1] + ((a >> 1) & 1) - lo[1], x = i0[2] + (a & 1) - lo[2];
+                    if (z < 0 || y < 0 || x < 0 || z >= rn[0] || y >= rn[1] || x >= rn[2]) continue;
+                    const double w = ((a >> 2) ? fr[0] : 1 - fr[0]) * (((a >> 1) & 1) ? fr[1] : 1 - fr[1]) * ((a & 1) ? fr[2] : 1 - fr[2]);
+                    if (w <= 0) continue;
+                    const int8_t *sv = reg + (((size_t)z * rn[1] + y) * rn[2] + x) * C;
+                    double l2 = 0; for (int k2 = 0; k2 < C; k2++) l2 += (double)sv[k2] * sv[k2];
+                    if (!(l2 > 0)) continue;
+                    const float wn = (float)(w / sqrt(l2));   /* each corner as a unit vector */
+                    for (int k2 = 0; k2 < C; k2++) acc[k2] += wn * sv[k2];
+                    ws += w;
+                }
+                if (ws < (pass ? .5 : .999)) continue;   /* (pass 1: most of the stencil with a vector; else a later group or pass) */
+                double l2 = 0; for (int k2 = 0; k2 < C; k2++) l2 += (double)acc[k2] * acc[k2];
                 if (!(l2 > 0)) continue;
-                const float wn = (float)(w / sqrt(l2));   /* each corner as a unit vector */
-                for (int k2 = 0; k2 < C; k2++) acc[k2] += wn * sv[k2];
-                ws += w;
+                const double inv = 127.0 / sqrt(l2); int any = 0;
+                for (int k2 = 0; k2 < C; k2++) { const long t = lround(acc[k2] * inv); const int8_t b2 = (int8_t)(t > 127 ? 127 : t < -127 ? -127 : t); out[(size_t)k2 * ng + q] = b2; any |= b2; }
+                done[q] = any != 0;
             }
-            if (ws < (pass ? .5 : .999)) continue;   /* (pass 1: most of the stencil with a vector; else a later group or pass) */
-            double l2 = 0; for (int k2 = 0; k2 < C; k2++) l2 += (double)acc[k2] * acc[k2];
-            if (!(l2 > 0)) continue;
-            const double inv = 127.0 / sqrt(l2); int any = 0;
-            for (int k2 = 0; k2 < C; k2++) { const long t = lround(acc[k2] * inv); const int8_t b = (int8_t)(t > 127 ? 127 : t < -127 ? -127 : t); out[(size_t)k2 * ng + q] = b; any |= b; }
-            done[q] = any != 0;
+            free(reg);
+            g0 = g1;
         }
-        free(reg);
     }
     free(V); free(cu); free(acc); free(done);
     return rc;

@@ -2456,6 +2456,8 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
     if (g_distill && train) {   /* --distill: the head's cosine loss against the feature targets; the fp32 gradient joins its decoder level in the backward */
         shape5 se; const float *ye = unet_emb_logits(d->u, &se);
         if (!ye) { fprintf(stderr, "distill: no head outputs after the forward\n"); abort(); }
+        if ((size_t)se.n * se.c * se.d * se.h * se.w != g_distill_n) {   /* the head's grid must be the targets' (11-26: --lat 4 ran 1/64 of them) */
+            fprintf(stderr, "distill: head %d x %d x %dx%dx%d != %zu targets (%d^3 voxels per cell)\n", se.n, se.c, se.d, se.h, se.w, g_distill_n, g_distill_div); abort(); }
         nn_distill_loss(ye, d->embt, se.n, se.c, (size_t)se.d * se.h * se.w, g_distill_w, d->embg, d->embds);
         unet_set_emb_grad(d->u, d->embg);
     }
@@ -3722,11 +3724,12 @@ int cmd_train(int argc, char **argv) {
                 fprintf(stderr, "--distill C (1..512 channels), --distill-level 1..%d, --distill-weight > 0\n", cfg.nlev - 2); return 2;
             }
             if (split || g_half) { fprintf(stderr, "--distill: whole windows at full resolution (no --split z or --half-res)\n"); return 2; }
-            g_distill_div = 1 << g_distill_lev;
+            g_distill_div = (g_lat ? 4 : 1) << g_distill_lev;   /* (--lat: the net's level 0 is the 4^3-voxel latent grid, as ssl_cell; 11-26: 1 << lev
+                                                                  sized the targets 64x the head under --lat 4, so the loss read their first 1/64: 1.3 % "cells") */
             if (P % g_distill_div || g_Pz % g_distill_div) { fprintf(stderr, "--distill: P and Pz must be divisible by %d\n", g_distill_div); return 2; }
             cfg.emb_lev = g_distill_lev; cfg.emb_ch = g_distill;
             g_distill_n = (size_t)B * g_distill * (size_t)(g_Pz / g_distill_div) * (P / g_distill_div) * (P / g_distill_div);
-            fprintf(stderr, "distill: %d channels on decoder level %d (%d^3 voxels per cell), cosine weight %g\n", g_distill, g_distill_lev, g_distill_div, g_distill_w);
+            fprintf(stderr, "distill: %d channels on decoder level %d (%d^3 voxels per cell%s), cosine weight %g\n", g_distill, g_distill_lev, g_distill_div, g_lat ? ", latent grid" : "", g_distill_w);
         }
     }
     {   /* --ssl D (src/ssl.h, DESIGN 2026-11-12): masked self-distillation on the sources' "ct_only" windows. The EMA teacher's D-channel
@@ -4230,7 +4233,7 @@ int cmd_train(int argc, char **argv) {
             train_unread_flags(argc, argv);   /* (after the last read: --replay / --replay-gap warned falsely before; mini audit opts 4) */
             const int step_ms = getenv("UFSM_SAMPLER_STEP_MS") ? atoi(getenv("UFSM_SAMPLER_STEP_MS")) : 0;   /* (a simulated GPU step per batch: the echo share at that pace) */
             sampler *sq = sampler_start(S, &sc); if (!sq) { fprintf(stderr, "cannot start the sampler\n"); return 1; }
-            const int nb = atoi(so); const double t0 = now(); double tf = 0, twait = 0;   /* (twait: in sampler_next after the first batch) */
+            const int nb = atoi(so); const double t0 = now(); double tf = 0, twait = 0; double so_emb[4] = {0, 0, 0, 0};   /* (twait: in sampler_next after the first batch; so_emb: --distill target / CT-block counts) */
             /* per source: windows, and per window the shares of material (CT > 0), known phase and known winding mod 4 (w4 per voxel only
                without --w4 runs: UFSM_W4_RUNS=0) over the window's voxels (source grid) */
             double (*cov)[5] = calloc((size_t)S->n, sizeof *cov); int (*lvc)[MAXLEV] = calloc((size_t)S->n, sizeof *lvc); double (*lvm)[MAXLEV][2] = calloc((size_t)S->n, sizeof *lvm);
@@ -4281,11 +4284,27 @@ int cmd_train(int argc, char **argv) {
                             if (ip) for (size_t v = 0; v < nv; v++) h = (h ^ ip[n * nv + v]) * 1099511628211ull; }
                         fprintf(stderr, "sampler-only hash: batch %d %016llx\n", i, (unsigned long long)h); }
                 }
+                if (g_distill && b->emb) {   /* --distill: the head cells with a target vs the div^3 CT blocks holding a nonzero voxel (11-26:
+                                                   a pre-launch check that the targets cover what the store can cover) */
+                    const int dv = g_distill_div; const size_t G0 = g_Pz / dv, G1 = P / dv, ng = G0 * G1 * G1;
+                    for (int n = 0; n < B; n++) {
+                        const int8_t *e = b->emb + (size_t)n * g_distill * ng;
+                        for (size_t q = 0; q < ng; q++) { int any = 0; for (int c = 0; c < g_distill && !any; c++) any = e[(size_t)c * ng + q] != 0; so_emb[0] += any; }
+                        so_emb[1] += ng;
+                        if (b->ct8) { const uint8_t *ct = b->ct8 + (size_t)n * g_Pz * P * P;
+                            for (size_t z = 0; z < G0; z++) for (size_t y = 0; y < G1; y++) for (size_t x = 0; x < G1; x++) { int any = 0;
+                                for (int a = 0; a < dv && !any; a++) for (int bb = 0; bb < dv && !any; bb++) { const uint8_t *r = ct + ((z * dv + a) * P + y * dv + bb) * P + x * dv;
+                                    for (int c = 0; c < dv; c++) if (r[c]) { any = 1; break; } }
+                                so_emb[2] += any; } so_emb[3] += ng; }
+                    }
+                }
                 sampler_release(sq, b);
                 if ((i + 1) % 10 == 0 || i + 1 == nb) { const double dt = now() - t0 - tf; uint64_t fe, ee; sampler_echo_stats(sq, &fe, &ee);
                     fprintf(stderr, "sampler-only: %d batches, %.1f s (first %.1f s), %.1f Mvox/s after the first", i + 1, now() - t0, tf, i > 0 ? (double)i * B * g_Pz * P * P / 1e6 / dt : 0.);
                     if (fe + ee) fprintf(stderr, " (echo %.0f%%: %llu new, %llu echoes)", 100.0 * ee / (fe + ee), (unsigned long long)fe, (unsigned long long)ee);
                     fprintf(stderr, ", waited %.1f s", twait);
+                    if (so_emb[1] > 0) fprintf(stderr, ", distill targets on %.1f%% of the head cells (CT-nonzero %d^3 blocks %.1f%%)", 100.0 * so_emb[0] / so_emb[1], g_distill_div,
+                                               so_emb[3] > 0 ? 100.0 * so_emb[2] / so_emb[3] : NAN);
                     fprintf(stderr, "\n");
                     sampler_hostmem(sq, stderr, 0); }   /* (the host memory by owner every 10 batches: slow growth shows where) */
             }
