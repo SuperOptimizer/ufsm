@@ -6,6 +6,27 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Pods decode CT on the CPU (--ct-gpu-decode -1) by default: a 300-step A/B on R11P ties, and gpudec gets starved (2026-11-26, podink)
+
+Before R11P2 (R11P resumed 12000 -> 24000), pod 1 ran R11P's argv for 300 steps per arm. Both arms used `--init-from` snap/12000 and
+master 5b6d871d (mcc 01873d0), on an RTX PRO 6000 with a 13.6-CPU cgroup. The step lines were averaged after step 50, CPU is the
+cgroup's cpu.stat delta over the arm, and GPU busy is the dmon sm mean:
+
+| arm | Mvox/s | wait | CPU cores | dmon sm | DEFAULTED | gpudec (periodic line) |
+|---|---|---|---|---|---|---|
+| A `--ct-gpu-decode 0` (GPU) | 233.0 | 0.0 % | 2.18 | 90 % | 1 (cool-off) | 23.6k requests, 0.3 % on the GPU; CPU 68.4 % near-empty, 31.3 % cool-off |
+| B `--ct-gpu-decode -1` (CPU) | 232.6 | 0.0 % | 2.31 | 90 % | 0 | - |
+
+A tie (-0.2 %, +0.13 cores). Beside a saturating trainer, gpudec's round trips queue behind the training kernels. The isolated
+k_entropy takes ~1 ms; under contention a batch takes 0.22 s. On R11P (12k steps) gpudec made 8234 round trips over 500 ms and sent
+5.26 M requests to the CPU in its cool-offs, against 1.57 M substreams decoded on the GPU. On R11P2 it made 9645 round trips and
+sent 8.6 M requests to the CPU. So on pods the GPU decoder mostly holds 1.6 GB of device memory and a stream for nothing, while
+the pod cgroup has ~7 idle cores (6.6 of 13.6 used, 0.2 % throttled).
+
+Decision (lead, perf, mcuda): pod launches use `--ct-gpu-decode -1` from now on, with no cool-off tuning. gpudec stays for
+CPU-starved hosts. Train's `opt()` takes the first occurrence of a flag, so an A/B edits `--ct-gpu-decode` in place in the run's argv.
+An appended copy would be ignored.
+
 ## predict --seamless 2 --tile-list: the blend over shard presence maps and parallel shards; pass b's 8x is inherent (2026-11-25, branch seamtile-20261125, perf)
 
 inkperf profiled the R11d HOLD rows (w576, 1667, 64 listed 512 tiles): pass a 45 s, pass b 343 s (493 shifted windows), blend > 82 s
