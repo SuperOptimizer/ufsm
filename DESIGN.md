@@ -6,7 +6,32 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
-## g256 dense-64 distilled into try9 (--distill 64, level 3): null at 4000 steps (1.3 % target coverage); line closed (2026-11-26, dinovol)
+## g256 distill rerun: 8000 steps on the fixed --lat grid, pre-registered (2026-11-26, dinovol)
+
+The 4000-step null below was a bug, not a measurement. Under --lat 4 the net's level 0 is the 4^3-voxel latent grid, but train sized the
+targets as 1 << level voxels per cell. The targets were 64x the head, and the loss read their first 1/64: the "1.3 % cells". Fixed on
+distillgrid-20261126: the cell is (4 << level) voxels under --lat, and a head / target size mismatch aborts. Before the rerun, the review
+(rv-dinodist) found two more problems:
+- **Big warps dropped their targets silently.** sample_emb read the store box under a window in one piece and skipped boxes over 256 MB.
+  P 768 at level 1 with rotation + zoom 1.25 is ~290 MB from a level-0 store. Now the reads go in head-grid z slabs, halved until each
+  fits 64 MB. A single plane still too large prints DEFAULTED. test_distill~split runs the check with a 24 KB cap.
+- **Echoes dilute the targets.** Echoes re-augment on the device, so their targets are cleared. Both arms now run --echo-max 0. The CPU
+  sampler gives ~485 Mvox/s (~1 window/s) against the trainer's ~0.2, so this costs no throughput.
+
+200-window CPU sampler-only dry pass of dst (the sampler-only log now prints this): distill targets cover 79.9 / 77.8 / 77.1 / 74.2 % of the
+head cells after 10 / 20 / 30 / 40 batches, against the CT-nonzero 8^3-block share of 79.9 / 77.9 / 77.2 / 74.2 %. Startup:
+"distill: 64 channels on decoder level 1 (8^3 voxels per cell, latent grid)". The store shapes match the declared levels: 1667 L2,
+1159x476^2; 0139 L0, 2622x828^2; 0500P2 L0, 883x525^2.
+
+**The pair.** Desk card 1, a master build that includes distillgrid. ctl and dst both use the 4000-step pair's argv with 8000 steps and
+--echo-max 0. dst adds --distill 64 --distill-level 1 --distill-weight 0.3, which gives 8-voxel cells, the stores' stride and g256's
+token grid. There is a new ctl on the same binary. Script: /vesuvius/ufsm/dinovol/distill/pair2.sh, runs in runs2/. The run stops with
+an ALERT if the step lines' distill cell share falls below ~70 % of the CT-nonzero share.
+
+**Pre-registered (lead 11-26).** Pass = holdout ids dst - ctl > 0 by more than 2 SE (paired per box, wbench BOXES=holdout). Also
+reported: core ids, p05x on both sets, merge-flag --eval AUCs and the sheet-pair triplets.
+
+## g256 dense-64 distilled into try9 (--distill 64, level 3): 4000-step pair VOID (a --lat grid bug: 1.3 % target coverage) (2026-11-26, dinovol)
 
 The question: does a cosine side-head loss against upstream dinovol g256's dense-64 features (train --distill) improve try9's winding
 fields? This is a control-paired pair on desk card 1, master 0935f899 (mcc ff7f174). Both arms init from try9cool/cooled-33333 and use
@@ -24,7 +49,7 @@ on the CPU, because try9's full-precision mode does not fit beside the 1.6 GB of
 - Distill loss (weight x mean 1 - cos): 0.236 at step 50, 0.213 at 850, 0.242 at 1650, 0.226 at 2400, 0.206 at 3200. So 1 - cos fell
   only from ~0.79 to ~0.69, over **1.2-1.4 % of the head cells**. The stores are correct where they exist (cells nonzero in a read-back
   = the CT's own nonzero share in that box, 2.6 % vs 2.1 %). Masked CT zeroes the air, and the dense outputs of blocks without one
-  nonzero voxel are zero vectors (no target). Why the training windows see so few target cells is not yet explained.
+  nonzero voxel are zero vectors (no target). The few target cells were the --lat grid bug (above).
 
 Paired per box, dst - ctl (SE = sd / sqrt n). wbench ran with fields kept (dvd-{ctl,dst}-{core,holdout}), no slabs:
 
@@ -47,9 +72,9 @@ The phase picks the right sheet in sheet-pair triplets (merge-flag --sheet-pairs
 | Paris 4 July (held out) | .613 / .761 / .837 / .869 | .619 / .758 / .841 / .865 |
 
 Result: no gain anywhere. The holdout ids are slightly worse (-0.011, ~2 SE) and nothing else moves outside its noise. With 1.3 % target
-coverage and 4000 steps, this tested a very weak distill signal; it does not rule out distillation itself. **Closed (lead 11-26):** no measured gain path for our
-winding net is left (a longer run or another lambda at ~1 % target coverage cannot move it), and by the user's rule (11-26) no effort goes
-into fine-tuning or improving the upstream dinovol itself. The 8000-step ctl stopped at
+coverage and 4000 steps, this tested a very weak distill signal; it does not rule out distillation itself. ~~Closed (lead 11-26)~~ **Void:** the 1.3 % was the --lat grid bug
+(the section above), so this pair never tested distillation. The rerun is above. By the user's rule (11-26), no effort goes into
+fine-tuning or improving the upstream dinovol itself; the rerun only trains our own net against its frozen features. The 8000-step ctl stopped at
 step 290 is in runs/old8k. Data: /vesuvius/ufsm/dinovol/distill/{runs,score}, wbench res dvd-*.
 
 ## Pods decode CT on the CPU (--ct-gpu-decode -1) by default: a 300-step A/B on R11P ties, and gpudec gets starved (2026-11-26, podink)
