@@ -103,6 +103,43 @@ at w320).
 - For R11P: post-hoc pooled statistics (`predict --gn-save` at w768, then `--gn-frozen`), A/B on HOLD against window mode, and the seam
   jump on PHerc1203 (gn/gnab.sh, gn1203.sh). Results follow when they land.
 
+## PHerc1203 sheet count: CT bands vs fitted wraps vs count-field, calibrated on 1667 (2026-11-26, unroll)
+
+Question (lead): wrap-xsec on the 1203 band (ws009, wraps 224-229) showed 2-3 CT laminae between consecutive fitted wraps. Does the fit
+undercount sheets ~3x there? If so, no render could stay on one sheet, and we would need a 2.4 um winding net or a denser count reference.
+Tool: `ufsm wrap-rays` (src/wraprays.c, test_wraprays). It walks radial rays from the count-field axis on one axial slice (level 1,
+4.8 um), with the profile smoothed and split into 1 mm windows. Per window it counts:
+- **bands:** prominent CT maxima, prominence 12, >= 3 voxels apart;
+- **air-separated bands:** bands whose valley to the previous band drops below the threshold, the midpoint of the Otsu split's class means;
+- **wraps:** mesh crossings;
+- **cf:** the count-field's |dW|;
+- **air share,** which sets the class: open >= 0.25, packed <= 0.10, else mid.
+
+Runs:
+- 1203: fine z 3300 / 3750 / 4200 / 4600, 8 rays each, the -p arm's 119 band wraps (orig24), its ref-cf through fit2's map.
+- 1667: z 4000 / 8000 / 12000 / 16000, the u1 ref-cf, which counts right against GT (1.024 fitted turns per GT turn, fix0332).
+- Data: /vesuvius/ufsm/unrollrun/lam/{z,g1667_z}*.tsv.
+
+| scroll, class | windows | um per turn | bands / turn | air-separated / turn | wraps / cf |
+|---|---|---|---|---|---|
+| 1203 open | 336 | 186 | 2.30 | 1.33 | 0.95 |
+| 1203 mid | 132 | 152 | 2.29 | 0.88 | 0.96 |
+| 1203 packed | 54 | 170 | 2.45 | 0.49 | 0.98 |
+| 1667 (all open), per u1 cf turn | 302 | 319 | 2.40 | 1.63 | - |
+
+- **Bands are not sheets.** About 2.3-2.4 bands per turn on both scrolls, with 1667 counted right. A sheet's two fibre layers (recto
+  / verso) give ~2, so "2-3 laminae between wraps" is within-sheet structure. The band count also depends on the prominence: 1.4 / 2.3 /
+  3.1 per 1203 wrap at prominence 20 / 12 / 8.
+- **Air-separated bands follow the gap.** They give 1.33 per 1203 wrap (open, 186 um) vs 1.63 per 1667 turn (319 um). That is the same
+  rise with gap as the GT curve ("The curve on three scrolls": 1.20-1.34 at 150-230 um, 2.1 above 230). So 1203's count is consistent
+  with a correct count, not a 3x undercount. Packed regions have no air gaps, so this counter cannot see them there.
+- **The fit follows the count-field:** wraps / cf 0.95-0.98. The count reference is what these numbers check.
+- **The -p arm's gates warn on half the boxes:** w4 24 / 48, pw48 21 / 33, conf_lo 44 / 48.
+
+Decision input: sheet density alone does not call for a 2.4 um winding net on 1203. The ws009 repeats come from an oblique pass through a
+crushed zone (wrap-xsec: face-on fibre grid on the right side), not from merged wraps. As with fix0332, CT band counts are diagnostics,
+never a count target or gate.
+
 ## J1 v0 on the RTX PRO 6000 pod: launched 17:06 UTC, lost at ~step 760 when the pod ended (credits), no snapshot (2026-11-26, podink)
 
 J1 v0 (inksdk's joint winding + ink + SSL v1 net, init E0-avg + head-map, 98 sources: 63 ink / winding + 35 ct_only SSL scans) ran on
