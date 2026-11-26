@@ -14,4 +14,5 @@ long surfp_plan(surfp *S, const int64_t n[3], const int m[3], const int64_t *g, 
 int surfp_window(surfp *S, unet *u, long t, const int64_t o[3], int D, int H, int W);   /* after window t's forward: its patches into the maps */
 int surfp_write(surfp *S, const char *dir);   /* DIR/<wrap>.tif per wrap */
 /* --surf-feats (isf nullptr at surfp_open): the trunk's resampled features at the wraps' lattice cells as a dinovol-probe feature file (ssl-probe's input) */
+int surfp_feats_init(surfp *S, int stride);   /* after surfp_open, before the windows: the lattice's feature slots */
 int surfp_write_feats(surfp *S, const char *path, int stride);

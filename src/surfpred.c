@@ -20,14 +20,14 @@ static double tifxyz_meta_scale(const char *p) {   /* meta.json scale[0] (grid v
     char *b = malloc((size_t)l + 1); const int ok = b && fread(b, 1, (size_t)l, f) == (size_t)l; fclose(f); if (!ok) { free(b); return -1; }
     json *j = json_parse(b, (size_t)l); free(b); if (!j) return -1; const double s = json_num(json_at(json_get(j, "scale"), 0), -1); json_free(j); return s;
 }
-typedef struct { char dir[1024], name[256]; int w, h, mw, mh, na, nb; double sc; float *X, *Y, *Z; uint8_t *map; long *pid; float **blk; int bw, bh; uint16_t *ft; uint8_t *fh; } spw;   /* ft / fh: --surf-feats' features [mh][mw][F] fp16 and their presence */   /* blk: --surf-overlap's
+typedef struct { char dir[1024], name[256]; int w, h, mw, mh, na, nb; double sc; float *X, *Y, *Z; uint8_t *map; long *pid; float **blk; int bw, bh; uint16_t *ft; uint8_t *fh; int32_t *slot; long nslot; } spw;   /* --surf-feats: slot [mh][mw] (-1: no lattice cell reads it), ft [nslot][F] fp16, fh [nslot] presence */   /* blk: --surf-overlap's
    feathered sums, per SURF_BLK^2 block of the map (lazily: covered blocks only), [2][SURF_BLK^2] = sum w p, sum w */
 typedef struct { int wr, a0, b0, pa, pb; int64_t lo[3], hi[3]; long tile; } spp;
 enum { SURF_ZS = 32, SURF_BLK = 128 };   /* the feature slab's planes (training's head slabs) */
 struct surfp {
     spw *W; int nw; spp *P; long np; int Hp, halo, core, K, C0; double s; isf_dev dev; isf_win win; float *idw; void *feat; size_t featc; int whole; double pv; int stride, ramp, blend;   /* stride: the patch grid's step (core: hard tiling; < core: --surf-overlap, feathered over ramp px, blend 0 linear 1 cosine); whole: the whole-window feature fallback (DEFAULTED) */
     long *tp, *toff; long ntile, nrun, nfit; uint8_t *tdone;
-    int feats; float *hpatch;   /* --surf-feats (isf nullptr): the resampled trunk features instead of the head, hpatch [F][Hp^2] host */
+    int feats, fst; float *hpatch;   /* --surf-feats (isf nullptr): the resampled trunk features instead of the head, hpatch [F][Hp^2] host */
 };
 static int grid_pt(const spw *w, double gu, double gv, double P[3]) {   /* the wrap's grid at (col gu, row gv), bilinear; 0: an invalid corner */
     int c0 = (int)floor(gu), r0 = (int)floor(gv); if (c0 < 0 || r0 < 0 || c0 >= w->w - 1 || r0 >= w->h - 1) return 0;
@@ -86,8 +86,6 @@ surfp *surfp_open(const char *wraps, const char *isf, int C0, int Hp, int halo, 
         snprintf(p, sizeof p, "%s/meta.json", w->dir); w->sc = tifxyz_meta_scale(p);
         if (!w->X || !w->Y || !w->Z || w2 != w->w || w3 != w->w || h2 != w->h || h3 != w->h || !(w->sc > 0)) { fprintf(stderr, "predict --surf: cannot read the tifxyz %s\n", w->dir); free(cp); surfp_free(S); return nullptr; }
         w->mw = (int)ceil(w->w / w->sc / (s * S->pv)); w->mh = (int)ceil(w->h / w->sc / (s * S->pv)); w->map = calloc((size_t)w->mw * w->mh, 1);
-        if (S->feats) { w->ft = calloc((size_t)w->mw * w->mh * C0 * K, 2); w->fh = calloc((size_t)w->mw * w->mh, 1);
-            if (!w->ft || !w->fh) { fprintf(stderr, "predict --surf-feats: out of memory for %s's features\n", w->dir); free(cp); S->nw++; surfp_free(S); return nullptr; } }
         S->nw++;
     }
     free(cp);
@@ -128,7 +126,7 @@ surfp *surfp_open(const char *wraps, const char *isf, int C0, int Hp, int halo, 
 }
 void surfp_free(surfp *S) {
     if (!S) return;
-    for (int k = 0; k < S->nw; k++) { free(S->W[k].X); free(S->W[k].Y); free(S->W[k].Z); free(S->W[k].map); free(S->W[k].pid); free(S->W[k].ft); free(S->W[k].fh);
+    for (int k = 0; k < S->nw; k++) { free(S->W[k].X); free(S->W[k].Y); free(S->W[k].Z); free(S->W[k].map); free(S->W[k].pid); free(S->W[k].ft); free(S->W[k].fh); free(S->W[k].slot);
         if (S->W[k].blk) { for (size_t b = 0; b < (size_t)S->W[k].bw * S->W[k].bh; b++) free(S->W[k].blk[b]); free(S->W[k].blk); } }
     free(S->W); free(S->P); free(S->tp); free(S->toff); free(S->tdone); free(S->hpatch); isf_dev_free(&S->dev); isf_win_free(&S->win); nn_free(S->idw); nn_free(S->feat); free(S);
 }
@@ -224,8 +222,9 @@ int surfp_window(surfp *S, unet *u, long t, const int64_t o[3], int D, int H, in
             nn_d2h(S->hpatch, S->dev.patch, (size_t)F * n * 4);
             for (int i = S->halo; i < Hp - S->halo; i++) for (int j = S->halo; j < Hp - S->halo; j++) {
                 const size_t q = (size_t)i * Hp + j; const int a = p->a0 + i, b = p->b0 + j; if (!(iw->wt[q] > 0) || a < 0 || b < 0 || a >= w->mh || b >= w->mw) continue;
-                uint16_t *o16 = w->ft + ((size_t)a * w->mw + b) * F; for (int f = 0; f < F; f++) o16[f] = surf_f2h(S->hpatch[(size_t)f * n + q]);
-                w->fh[(size_t)a * w->mw + b] = 1; }
+                const int32_t sl = w->slot[(size_t)a * w->mw + b]; if (sl < 0) continue;
+                uint16_t *o16 = w->ft + (size_t)sl * F; for (int f = 0; f < F; f++) o16[f] = surf_f2h(S->hpatch[(size_t)f * n + q]);
+                w->fh[sl] = 1; }
             S->nrun++; continue;
         }
         isf_dev_step(&S->dev, iw, 1.f, 0, 1.f, nullptr, nullptr);
@@ -277,12 +276,46 @@ int surfp_write(surfp *S, const char *dir) {
     if (S->nrun < S->nfit) fprintf(stderr, "DEFAULTED: predict --surf: %ld planned patches did not run (their windows skipped: absent CT, or no touched voxel): their pixels stay 0\n", S->nfit - S->nrun);
     return rc;
 }
+/* the map px a lattice cell (row a, col b of st x st label px; label grid lw x lh on the wrap's canvas) reads: the bilinear corner (y0, x0) and weights */
+static void cell_map(const spw *w, double up, int lw, int lh, int st, int a, int b, int *y0, int *x0, double *fy, double *fx) {
+    const double ew = w->w / w->sc, eh = w->h / w->sc, Fl = 0.5 * (ew / lw + eh / lh);   /* canvas px per label px */
+    const double ly = a * st + (st - 1) * 0.5, lx = b * st + (st - 1) * 0.5, my = ((ly + 0.5) * Fl - 0.5) / up, mx = ((lx + 0.5) * Fl - 0.5) / up;
+    *y0 = (int)floor(my); *x0 = (int)floor(mx); *fy = my - *y0; *fx = mx - *x0;
+}
+/* --surf-feats: before the windows, the map px the supervised lattice cells read get feature slots (a crop's whole map at F = 288 fp16
+   was ~0.5 GB: a scroll's 150 training crops in one predict did not fit; the slots are ~4 per cell, ~2 MB a crop at stride 8) */
+int surfp_feats_init(surfp *S, int st) {
+    if (!S->feats || st < 1) return -1;
+    S->fst = st; const int F = S->C0 * S->K; const double up = S->s * S->pv; long tot = 0;
+    for (int k = 0; k < S->nw; k++) {
+        spw *w = &S->W[k]; char p[1300]; int lw, lh, mw2, mh2;
+        snprintf(p, sizeof p, "%s/labels.tif", w->dir); uint8_t *lab = img_read_u8(p, &lw, &lh);
+        snprintf(p, sizeof p, "%s/mask.tif", w->dir); uint8_t *msk = img_read_u8(p, &mw2, &mh2);
+        if (!lab || !msk || mw2 != lw || mh2 != lh) { fprintf(stderr, "predict --surf-feats: %s: no labels.tif / mask.tif of one size (an ink-devcrops crop dir?)\n", w->dir); free(lab); free(msk); return -1; }
+        w->slot = malloc((size_t)w->mw * w->mh * 4); if (!w->slot) { free(lab); free(msk); return -1; }
+        for (size_t i = 0; i < (size_t)w->mw * w->mh; i++) w->slot[i] = -1;
+        w->nslot = 0;
+        for (int a = 0; a < lh / st; a++) for (int b = 0; b < lw / st; b++) {
+            int sup = 0; for (int y = a * st; y < (a + 1) * st && !sup; y++) for (int x = b * st; x < (b + 1) * st; x++) if (msk[(size_t)y * lw + x] >= 128) { sup = 1; break; }
+            if (!sup) continue;
+            int y0, x0; double fy, fx; cell_map(w, up, lw, lh, st, a, b, &y0, &x0, &fy, &fx);
+            for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++) { const int yy = y0 + dy, xx = x0 + dx;
+                if (yy >= 0 && xx >= 0 && yy < w->mh && xx < w->mw && w->slot[(size_t)yy * w->mw + xx] < 0) w->slot[(size_t)yy * w->mw + xx] = (int32_t)w->nslot++; }
+        }
+        free(lab); free(msk);
+        w->ft = calloc((size_t)(w->nslot ? w->nslot : 1) * F, 2); w->fh = calloc((size_t)(w->nslot ? w->nslot : 1), 1);
+        if (!w->ft || !w->fh) { fprintf(stderr, "predict --surf-feats: out of memory for %s's features (%ld slots)\n", w->dir, w->nslot); return -1; }
+        tot += w->nslot;
+    }
+    fprintf(stderr, "predict --surf-feats: %ld map px slots (%.2f GB of features) for the lattice of %d label px\n", tot, tot * F * 2e-9, st);
+    return 0;
+}
 /* --surf-feats (2026-11-26, ssl-probe): the features as a dinovol-probe feature file (dinovol.h dvf_head, E = F = C0 x K): per wrap (an
    ink-devcrops crop dir: labels.tif / mask.tif on its label grid) the lattice of st x st label-px cells with supervised px, each a row
    {crop, cell r, c, ink share, supervised px} + the features bilinear over the map px at the cell centre's canvas point (label px centre
    (c + 0.5) F - 0.5 canvas px, F canvas px per label px; map px = canvas / (s pv)), present corners only; cells with none are left out */
 int surfp_write_feats(surfp *S, const char *path, int st) {
-    if (!S->feats || st < 1) return -1;
+    if (!S->feats || st != S->fst) return -1;
     const int F = S->C0 * S->K; FILE *fo = fopen(path, "wb"); if (!fo) { fprintf(stderr, "predict --surf-feats: cannot write %s\n", path); return -1; }
     dvf_head H = {{'D', 'V', 'P', 'F', '0', '0', '0', '1'}, F, F, 0, 0, S->nw, st, S->Hp, S->K};
     char (*names)[DVF_NAME] = calloc((size_t)S->nw, DVF_NAME); for (int k = 0; k < S->nw; k++) snprintf(names[k], DVF_NAME, "%s", S->W[k].name);
@@ -293,17 +326,16 @@ int surfp_write_feats(surfp *S, const char *path, int st) {
         snprintf(p, sizeof p, "%s/labels.tif", w->dir); uint8_t *lab = img_read_u8(p, &lw, &lh);
         snprintf(p, sizeof p, "%s/mask.tif", w->dir); uint8_t *msk = img_read_u8(p, &mw2, &mh2);
         if (!lab || !msk || mw2 != lw || mh2 != lh) { fprintf(stderr, "predict --surf-feats: %s: no labels.tif / mask.tif of one size (an ink-devcrops crop dir?)\n", w->dir); free(lab); free(msk); rc = -1; break; }
-        const double ew = w->w / w->sc, eh = w->h / w->sc, Fl = 0.5 * (ew / lw + eh / lh);   /* canvas px per label px */
         for (int a = 0; a < lh / st && !rc; a++) for (int b = 0; b < lw / st; b++) {
             int sup = 0, ink = 0;
             for (int y = a * st; y < (a + 1) * st; y++) for (int x = b * st; x < (b + 1) * st; x++) { const size_t i = (size_t)y * lw + x; if (msk[i] >= 128) { sup++; ink += lab[i] >= 128; } }
             if (!sup) continue;
-            const double ly = a * st + (st - 1) * 0.5, lx = b * st + (st - 1) * 0.5, my = ((ly + 0.5) * Fl - 0.5) / up, mx = ((lx + 0.5) * Fl - 0.5) / up;
-            const int y0 = (int)floor(my), x0 = (int)floor(mx); const double fy = my - y0, fx = mx - x0; double sw = 0;
+            int y0, x0; double fy, fx; cell_map(w, up, lw, lh, st, a, b, &y0, &x0, &fy, &fx); double sw = 0;
             memset(acc, 0, (size_t)F * 4);
-            for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++) { const int yy = y0 + dy, xx = x0 + dx; if (yy < 0 || xx < 0 || yy >= w->mh || xx >= w->mw || !w->fh[(size_t)yy * w->mw + xx]) continue;
+            for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++) { const int yy = y0 + dy, xx = x0 + dx; if (yy < 0 || xx < 0 || yy >= w->mh || xx >= w->mw) continue;
+                const int32_t sl = w->slot[(size_t)yy * w->mw + xx]; if (sl < 0 || !w->fh[sl]) continue;
                 const double wt = (dy ? fy : 1 - fy) * (dx ? fx : 1 - fx); if (!(wt > 0)) continue; sw += wt;
-                const uint16_t *src = w->ft + ((size_t)yy * w->mw + xx) * F; for (int f = 0; f < F; f++) acc[f] += (float)(wt * surf_h2f(src[f])); }
+                const uint16_t *src = w->ft + (size_t)sl * F; for (int f = 0; f < F; f++) acc[f] += (float)(wt * surf_h2f(src[f])); }
             if (!(sw > 1e-9)) { nskip++; continue; }
             for (int f = 0; f < F; f++) row[f] = surf_f2h((float)(acc[f] / sw));
             const dvf_row R = {k, (int16_t)a, (int16_t)b, (float)ink / sup, (float)sup};

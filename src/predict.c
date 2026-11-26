@@ -2936,6 +2936,7 @@ static int predict_one(int argc, char **argv) {
                             opt_atof("--surf-overlap", opt(argc, argv, "--surf-overlap", "0")), !strcmp(opt(argc, argv, "--surf-blend", "linear"), "cosine"));
             if (strcmp(opt(argc, argv, "--surf-blend", "linear"), "linear") && strcmp(opt(argc, argv, "--surf-blend", "linear"), "cosine")) { fprintf(stderr, "predict: --surf-blend linear | cosine\n"); return 2; }   /* (--surf-pvox: window voxels per patch px, the head's training spacing: 0.5 for S1 / S2, 1 for --isf-pvox 1 heads) */
             if (!SF) return 1;
+            if (sf_feats[0] && surfp_feats_init(SF, sf_fst)) return 1;
             const int64_t wn3[3] = {Wz, W, W}; const int mg[3] = {hz, halo, halo}; int64_t *to = nullptr;
             int64_t *go = malloc((size_t)(rd.ntiles ? rd.ntiles : 1) * 3 * sizeof *go); if (!go) return 1;
             for (long i = 0; i < rd.ntiles; i++) { go[3 * i] = bo[0] + rd.tiles[i].tz; go[3 * i + 1] = bo[1] + rd.tiles[i].ty; go[3 * i + 2] = bo[2] + rd.tiles[i].tx; }
