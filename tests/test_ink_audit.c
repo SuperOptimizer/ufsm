@@ -237,21 +237,24 @@ int main(void) {
     }
     {   /* (2026-11-26) a constant prediction (an unpredicted all-fill volume) is "scoring failed" (rc 1, no rows), as --pred and as --pred2,
            never an AUC 0.5 row (pair3's void R1 rows) */
-        uint8_t *cz = malloc((size_t)NV * NV * NV); memset(cz, 0, (size_t)NV * NV * NV);
-        snprintf(p, sizeof p, "%s/cz.zarr", dir); snprintf(q, sizeof q, "%s/1", p); z3w *w = z3w_create(q, sh, 256, 0, 0, nullptr);
-        if (!w || z3w_write_shard(w, 0, 0, 0, cz, 4) || z3w_close(w)) { fprintf(stderr, "write cz.zarr failed\n"); return 1; } z3w_write_group(p, um, 1, "t", nullptr); free(cz);
-        for (int k = 0; k < 2; k++) {
+        uint8_t *cz = malloc((size_t)NV * NV * NV);
+        for (int z = 0; z < 2; z++) {   /* cz: all 0 (the fill); c77: a flat non-zero value (2026-11-26: --pred2 checked over every profile point) */
+            memset(cz, z ? 77 : 0, (size_t)NV * NV * NV);
+            snprintf(p, sizeof p, "%s/%s", dir, z ? "c77.zarr" : "cz.zarr"); snprintf(q, sizeof q, "%s/1", p); z3w *w = z3w_create(q, sh, 256, 0, 0, nullptr);
+            if (!w || z3w_write_shard(w, 0, 0, 0, cz, 4) || z3w_close(w)) { fprintf(stderr, "write %s failed\n", p); return 1; } z3w_write_group(p, um, 1, "t", nullptr); }
+        free(cz);
+        for (int k = 0; k < 3; k++) {
             char ctsv[700]; snprintf(ctsv, sizeof ctsv, "%s/c%d.tsv", dir, k); fflush(stdout); fflush(stderr);
             const pid_t c5 = fork();
             if (c5 == 0) {
                 const int fd = open(ctsv, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) _exit(9); dup2(fd, 1);
                 char *av[] = {"ufsm", "ink-audit", segs, "--ct", dir, "ct.zarr", "--ct-um", "1", "--level", "0", "--iso", "100", "--holdouts", ho, "--pred", dir,
-                              k ? "pred.zarr/1" : "cz.zarr/1", "--pred-level", "0", "--pred2", dir, "cz.zarr/1", "--pred2-level", "0", "--stride", "1", "--tag", "t", "--threads", "4", nullptr};
+                              k ? "pred.zarr/1" : "cz.zarr/1", "--pred-level", "0", "--pred2", dir, k == 2 ? "c77.zarr/1" : "cz.zarr/1", "--pred2-level", "0", "--stride", "1", "--tag", "t", "--threads", "4", nullptr};
                 _exit(cmd_ink_audit(30, av));
             }
-            int s5 = 0; waitpid(c5, &s5, 0); CHECK(WIFEXITED(s5) && WEXITSTATUS(s5) == 1, "constant %s: ink-audit exit %d (want 1)", k ? "--pred2" : "--pred", WIFEXITED(s5) ? WEXITSTATUS(s5) : -1);
+            int s5 = 0; waitpid(c5, &s5, 0); CHECK(WIFEXITED(s5) && WEXITSTATUS(s5) == 1, "constant %s: ink-audit exit %d (want 1)", k == 2 ? "--pred2 (77)" : k ? "--pred2" : "--pred", WIFEXITED(s5) ? WEXITSTATUS(s5) : -1);
             f = fopen(ctsv, "r"); int rows = 0; while (f && fgets(ln, sizeof ln, f)) rows += !strncmp(ln, "t\t", 2) || !strncmp(ln, "FUSE\tt", 6); if (f) fclose(f);
-            CHECK(rows == 0, "constant %s: %d report rows (want none)", k ? "--pred2" : "--pred", rows);
+            CHECK(rows == 0, "constant %s: %d report rows (want none)", k == 2 ? "--pred2 (77)" : k ? "--pred2" : "--pred", rows);
         }
     }
     snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) {}
