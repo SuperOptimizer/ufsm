@@ -318,6 +318,17 @@ int main(int argc, char **argv) {
         free(lg);
         CHECK(sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-vssl.json --out %s/vss2x %s %s --echo-max 2 > %s/vss2x.log 2>&1", U, d, d, cm, sv, d) && !sh("grep -q 'ssl-views 2: --gpu-aug' %s/vss2x.log", d),
               "ssl-views 2 with --echo-max: not refused (%s/vss2x.log)", d);
+        /* (11) --ssl-proto 16 (2026-11-26): DINO prototypes on the two-view targets: finite proto terms with entropies in (0, 1] of ln K and
+           sampled points, the .sslp sidecar beside the checkpoint, a resume that loads it */
+        const char *spv = "--ssl 16 --ssl-level 1 --ssl-block 16 --ssl-share 0.5 --steps 8 --ssl-views 2 --ssl-mask 0.7 --gpu-aug 1 --rotate-p 0.5 --symmetry-p 0.5 --ssl-proto 16";
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-vssl.json --out %s/vsp %s %s > %s/vsp.log 2>&1 && test -s %s/vsp/last.ckpt.sslp", U, d, d, cm, spv, d, d),
+              "ssl-proto run or its sidecar (%s/vsp.log)", d);
+        snprintf(p, sizeof p, "%s/vsp.log", d); lg = slurp(p); int npr = 0, pbad = 0;
+        for (const char *q = lg; q && (q = strstr(q, " proto ")); q++) { double l = 0, a = 0, b = 0, np_ = 0; if (sscanf(q, " proto %lf H %lf/%lf of ln K (%lf pts)", &l, &a, &b, &np_) == 4) { npr++; pbad += !(isfinite(l) && l > 0 && a > 0 && a <= 1.001 && b > 0 && b <= 1.001 && np_ >= 2); } }
+        CHECK(npr >= 2 && !pbad, "ssl-proto: %d step lines with the term, %d out of range (%s/vsp.log)", npr, pbad, d);
+        free(lg);
+        CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-vssl.json --out %s/vsp --resume %s/vsp/last.ckpt %s --steps 10 %s > %s/vsp2.log 2>&1 && grep -q \"from the resumed checkpoint's .sslp\" %s/vsp2.log"
+                  " && grep -q 'step     10 ' %s/vsp2.log", U, d, d, d, cm, spv, d, d, d), "ssl-proto resume from the sidecar (%s/vsp2.log)", d);
     }
     if (!fails) sh("rm -rf %s", d);
     if (fails) { fprintf(stderr, "test_heads: %d FAILED (kept %s)\n", fails, d); return 1; }
