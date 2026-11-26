@@ -92,6 +92,17 @@ h116 is disjoint by segment and scroll.
 - Bug found on the way: ssl-probe once read only the first file of a `.dvf` list (strtok inside dvf_read). Fixed in sslfix with a
   two-file test.
 
+**GroupNorm and the window (perf 11-26).** On PHerc1203, R11P's output at one voxel differs between two windows by up to ~5x (w576
+pass a jumps 19 → 93 across a border at y 10240). R11P has no GroupNorm running statistics: its header has gn_stored 1 but no gn_ema /
+ge_n. So predict normalises every GroupNorm with the window's own statistics, and a voxel's level depends on what its window holds.
+This also explains why HOLD follows the window size: R11P trained at P 768, and HOLD is best at w768-1024 (1667 .896-.907, against .816
+at w320).
+- Recipe (lead): every R-line run gets `--gn-ema 1 --gn-ema-warm 1000000000` (in r11/d/trainarm5d.sh as GNX). Training is unchanged,
+  since it still uses each window's statistics, but the checkpoint carries pooled running statistics for a window-independent predict.
+- Training on the running statistics (a finite warm) is only for its own A/B: the 11-14 admuon control blew up at the switch.
+- For R11P: post-hoc pooled statistics (`predict --gn-save` at w768, then `--gn-frozen`), A/B on HOLD against window mode, and the seam
+  jump on PHerc1203 (gn/gnab.sh, gn1203.sh). Results follow when they land.
+
 ## J1 v0 on the RTX PRO 6000 pod: launched 17:06 UTC, lost at ~step 760 when the pod ended (credits), no snapshot (2026-11-26, podink)
 
 J1 v0 (inksdk's joint winding + ink + SSL v1 net, init E0-avg + head-map, 98 sources: 63 ink / winding + 35 ct_only SSL scans) ran on
