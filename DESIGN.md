@@ -6,6 +6,17 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## 41 tifxyz metas on 9.362 um scans get voxel_size_um (2026-11-26, inksdk)
+
+An inventory of the onfly ink meshes (r1e/meshinv.v3.tsv) turned up 82 meta.json files without `voxel_size_um`. 41 of them sit on 9.362 um
+scans: 0139-hfHA 11/16 meshes (source weight .02), 0139-hfMA 30/34 (.03), 0139-9362-human 27/27 (.05) and 0814-9362-human 1/1 (.05). Training
+reads them correctly anyway, because the onfly label scale falls back to the source's ct_um (inksplat.c:2071), and no R1ET / R3T / atlasT
+window is affected. ink-teach and ink-ext, though, fall back to 2.399 um (inksplat.c:3059, inkext.c:48), so a tool run on one of these meshes
+would silently work at the wrong scale. inksdk/fixmeta2.sh adds the key only (`"voxel_size_um": 9.362`) and keeps each original as
+meta.json.orig. It waits until N9R / N9Rk release card 1 (n9r/card1.free) and until no running trainer's sources reference one of the
+meshes, because smesh_body reloads a mesh lazily mid-run and refuses one whose voxel size changed. The other 41 are on 2.4 um scans,
+where the 2.399 fallback is correct; they are left as they are.
+
 ## g256 dense-64 distilled into try9 (--distill 64, level 3): null at 4000 steps (1.3 % target coverage); line closed (2026-11-26, dinovol)
 
 The question: does a cosine side-head loss against upstream dinovol g256's dense-64 features (train --distill) improve try9's winding
