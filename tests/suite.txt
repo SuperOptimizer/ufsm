@@ -281,6 +281,7 @@ test_sample_nogpu                              |              |     3 | tests/te
 test_mesh_tiles                                |              |     2 | python3 tests/test_mesh_tiles.py
 test_ct_resample                               |              |     2 | python3 tests/test_ct_resample.py
 test_seamless                                  |              |     6 | python3 tests/test_seamless.py
+test_seamless_region                           |              |    25 | python3 tests/test_seamless_region.py
 test_cover_training                            | gpu2,l2      |    16 | python3 tests/test_cover_training.py
 test_univ2                                     | gpu2,l2      |    40 | tests/test_univ2.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/univ2
 test_dp_equiv                                  | gpu2,l2      |    20 | tests/test_dp_equiv.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/dpequiv

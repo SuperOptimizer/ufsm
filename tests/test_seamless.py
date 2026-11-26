@@ -51,6 +51,7 @@ with tempfile.TemporaryDirectory(prefix="ufsm-seam-", delete=not os.environ.get(
     assert not (out / ".seam").exists(), "the passes must be removed"
     u = (np.arange(N) + 0.5)
     wa1 = np.maximum(np.sin(np.pi * (u % S) / S) ** 2, 1e-6); wb1 = np.maximum(np.sin(np.pi * ((u - S2) % S) / S) ** 2, 1e-6)
+    wb1[u < S2] = 0   # (pass b's box starts at S / 2: below it the blend region has pass a alone, whatever this stand-in wrote there; 11-26)
     for head in ("ink", "fib/H"):
         rr = t / f"{head.replace('/', '_')}.raw"
         rc, txt = run(env, BIN, "read", out / head, "9.6", 0, 0, 0, N, N, N, rr, "--threads", "2"); assert rc == 0, txt
