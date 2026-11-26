@@ -63,6 +63,28 @@ int main(void) {
         CHECK(nbad == 0, "teacher codes off the field phase: %lld", nbad);
         CHECK(nweak == 0, "weak cells labelled: %lld", nweak);
         CHECK(nout == 0, "voxels outside the box labelled: %lld", nout);
+        /* --holdouts: a box of this scan (level-0 voxels, --hold-scale 2) is written unknown, the human label inside it too; a box of
+           another scan and everything outside the box stay as above */
+        char hj[700], o2[600]; snprintf(hj, sizeof hj, "%s/holdouts.json", tmp); snprintf(o2, sizeof o2, "%s/out2", tmp);
+        FILE *f = fopen(hj, "w"); CHECK(f != nullptr, "holdouts json");
+        if (f) { fprintf(f, "{\"boxes\": [{\"name\": \"B1\", \"ct\": \"PHercX/scan-a.zarr\", \"l0\": [20, 36, 36, 8, 24, 24]},"
+                             " {\"name\": \"B2\", \"ct\": \"PHercY/scan-b.zarr\", \"l0\": [0, 0, 0, 128, 192, 192]}]}\n"); fclose(f); }
+        char *av2[] = {"ufsm", "fields-phase", o2, "--like", tmp, "like", "--ref", tmp, "like", "--conf", "0.5", "--threads", "2",
+                       "--holdouts", hj, "--hold-ct", "PHercX/volumes/scan-a.zarr/2", "--hold-scale", "2", fd};
+        CHECK(cmd_fields_phase((int)(sizeof av2 / sizeof *av2), av2) == 0, "fields-phase --holdouts rc");
+        z3 *z2 = z3_open(store_open(tmp), "out2", nullptr); CHECK(z2 != nullptr, "open out2");
+        if (z2) {
+            uint8_t *v2 = malloc((size_t)LZ * LY * LX); CHECK(z3_read(z2, o, n, v2, 1) == 0, "read out2");
+            long long nin = 0, nleak = 0, ndiff = 0;
+            for (int zz = 0; zz < LZ; zz++) for (int yy = 0; yy < LY; yy++) for (int xx = 0; xx < LX; xx++) {
+                const size_t i = ((size_t)zz * LY + yy) * LX + xx; const int hb = zz >= 10 && zz < 14 && yy >= 18 && yy < 30 && xx >= 18 && xx < 30;
+                if (hb) { nin++; if (v2[i] != 255) nleak++; } else if (v2[i] != v[i]) ndiff++;
+            }
+            CHECK(nin == 4 * 12 * 12 && nleak == 0, "held-out box written unknown: %lld of %lld labelled", nleak, nin);
+            CHECK(ndiff == 0, "voxels outside the held-out box changed: %lld", ndiff);
+            CHECK(v[((size_t)hz * LY + hy) * LX + hx] == 77 && v2[((size_t)hz * LY + hy) * LX + hx] == 255, "the human label inside the box is held out too");
+            free(v2);
+        }
         free(v);
     }
     free(s);
