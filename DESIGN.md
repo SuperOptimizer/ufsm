@@ -6,6 +6,69 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## R11P HOLD rows: 12k is the 1.1 um pick, the 24k resume regresses, windows 768-1024 win; ssl-probe on frozen features (2026-11-26, inkperf)
+
+Record of the 11-25 / 11-26 scoring. The predict volumes and the pair / podsweep scripts were deleted for disk on 11-26; the recipe is below.
+
+**Recipe.** Every row is HOLD only: `ink-audit --hold-only` on the 64 tracker tiles per scroll, PHerc1667 and Paris 4, from a local
+rsync -rcn-verified copy of the tiles' CT, levels 0-2. AUC is column 17.
+Predict: `predict CK ROOT KEY OUT --um 1.129 --level L --box <tile hull> --tile-list T --full-grid 1 --channel ink --ema 0 --window W
+--halo 32 --q 0 --levels 1`, plus `--seamless 2` on the seam rows. Rung 1.1 = level 0, rung 2.2 = level 1. The net is scale-conditioned
+on um x 2^level, so no rung flag is needed.
+Pairs: `ink-audit --pred A --pred2 B`, FUSE rows, ± per-region jackknife SE. The tracker was r11ptrack9 and r11p2track2, the window
+sweep was podsweep / podscore3 on the pod, the pairs pair4 and p2.
+A 0-tile predict or a constant map now fails loudly (failloud / p2const / inkfix): pair3's R1 rows had scored 0.5 on a copy without
+level 2.
+
+**R11P by snapshot, rung 1.1, plain, h32** (1667 / P4; references R1-62000 at 4.5 um 0.803 / 0.877, R11d-avg 0.787 / 0.866):
+
+| ckpt | w320 | w576 | w768 | w1024 | w1280 |
+|---|---|---|---|---|---|
+| R11P-4000 | .764 / .828 | .773 / .854 | .767 / .849 | | |
+| R11P-8000 | — / .855 | .837 / .863 | .841 / .858 | | |
+| R11P-12000 | .816 / .870 | .868 / .888 | .896 / .891 | .907 / .886 | .894 / .881 |
+| R11d-avg12-16 | | | | .838 / .878 | .817 / .874 |
+
+- **Seamless 2** at 12k: w320 .822 / .874, w576 .870 / .889. That is +0.001 to +0.006 for 8x the pass-b tiles, so seamless is used
+  only on a final snapshot.
+- **Rung 2.2** (level 1) at 12k: w320 .846 / .856, w576 .874 / .848. The single-rung R24@2.26 gets 1667 .777, which is why the user
+  kept the multi-rung line.
+
+**Pairs** (w768 unless named, A − B ± SE, 1667 / P4):
+
+| A − B | 1667 | P4 |
+|---|---|---|
+| R11P12k − R11d | +0.051 ± 0.022 | +0.006 ± 0.009 |
+| R11P12k − R1 w576 (R1's best) | +0.066 ± 0.028 | −0.007 ± 0.019 |
+| R11P12k − R1 w768 | +0.073 ± 0.028 | +0.004 ± 0.014 |
+| R11P12k − R1 w1024 | +0.097 ± 0.028 | +0.005 ± 0.015 |
+| R11P2-24k − R11P12k | −0.027 ± 0.026 | −0.006 ± 0.008 |
+| R11P2 ckpt-avg 20-24k − R11P12k | −0.036 ± 0.019 | +0.002 ± 0.007 |
+
+R1 by window (w288 / 448 / 576 / 768 / 1024): 1667 .805 / .801 / .831 / .824 / .799, P4 .879 / .897 / .898 / .888 / .887.
+R11P2 resumed 12k to 24k with a fresh WSD tail (re-warm, hold, cooldown to 0 at 24k; checked in the pod's log.csv), so its regression
+is not an uncooled snapshot. **R11P-12000 stays the 1.1 um pick**: windows 768-1024, and 576 at 2.2.
+
+**ssl-probe** (`predict --surf-feats`, `ufsm ssl-probe fit|apply`). The trunk's level-0 features (32 x 9 layers along the normal,
+devscoreC's surf geometry: P 256, halo 32, pvox 0.5) are taken at the crops' label lattice (training stride 8, dev stride 4). A
+weighted logistic (dvprobe, l2 1e-3) is fitted on dinovol's list150 training crops and scored per crop with devscoreC's ink-score
+call. Driver: /vesuvius/ufsm/inkperf/ssl/probe4.sh, then disj.sh.
+list150 shares 13 of its 39 segments with dev 99; disj.sh refits on the 26 disjoint segments (215 crops), and that fit is the default.
+h116 is disjoint by segment and scroll.
+
+| features | dev 99 (mean of group means), all / disj fit | h116 48, all / disj | trained head (surf mode) dev / h116 |
+|---|---|---|---|
+| E0-avg | .829 / .829 | .904 / .899 | .809 / .894 |
+| S2-avg | .830 / .824 | .914 / .911 | .822 / .904 |
+| wind96-u2 | .619 / .609 | .516 / .548 | — |
+
+- **Probe (disj) − head, paired by crop:** E0 +0.017 ± 0.008 on dev (mostly 0139: +0.030) and +0.005 ± 0.004 on h116. S2 +0.008
+  ± 0.007 on dev and +0.006 ± 0.005 on h116.
+- **DINO2A (ssl) − DINO2B (control), disj probes:** dev −0.061 ± 0.024 by crop and −0.071 ± 0.024 by group mean (0172 +0.059 is the
+  only group for A); h116 −0.062 ± 0.014. This matches podink's head scores (−0.069 ± 0.022).
+- Bug found on the way: ssl-probe once read only the first file of a `.dvf` list (strtok inside dvf_read). Fixed in sslfix with a
+  two-file test.
+
 ## J1 v0 on the RTX PRO 6000 pod: launched 17:06 UTC, lost at ~step 760 when the pod ended (credits), no snapshot (2026-11-26, podink)
 
 J1 v0 (inksdk's joint winding + ink + SSL v1 net, init E0-avg + head-map, 98 sources: 63 ink / winding + 35 ct_only SSL scans) ran on
