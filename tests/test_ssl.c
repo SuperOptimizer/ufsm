@@ -3,7 +3,11 @@
    (2) nn_ssl_targets == the host's centred, unit-normalised int8 targets (byte for byte), zero outside the masked blocks;
    (3) nn_ssl_idx: distinct indices for coprime strides (N = S);
    (4) the whole --ssl loss on the side head's outputs y [C][S] (nn_distill_loss at the targeted cells + the variance hinge on the
-       unit rows of N sampled cells, dn_gather / dn_varreg / dn_scatter_grad) against central differences of a double host loss. */
+       unit rows of N sampled cells, dn_gather / dn_varreg / dn_scatter_grad) against central differences of a double host loss;
+   (5) --ssl-views 2 (2026-11-26): ssl2_pull (the host's continuous pull through a radial record) == the device CT warp (nn_aug_ct on
+       ramps z / y / x: trilinear of a linear source is exact, so the output voxel IS its source coordinate) for a symmetric, a warped
+       (rotation + affine + zoom + elastic + symmetry) and a teacher record; ssl2_map's teacher coordinate pulls back (through the
+       teacher record) onto the student cell's source point; nn_ssl2_targets == the host's trilinear, centred, unit int8 targets. */
 #include "ssl.h"
 #include "dino.h"
 #include "nn.h"
@@ -12,11 +16,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include "test_gpu.h"
+#include "scan_augment.h"
 
 static uint64_t rs = 0x9E3779B97F4A7C15ull;
 static double ru(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (rs >> 11) * (1.0 / 9007199254740992.0); }
 static double rn(void) { return sqrt(-2 * log(ru() + 1e-12)) * cos(2 * M_PI * ru()); }
 static int fails = 0;
+static float h2f_(uint16_t h) { _Float16 v; memcpy(&v, &h, 2); return (float)v; }
 #define CHECK(c, ...) do { if (!(c)) { printf("FAIL: " __VA_ARGS__); printf("\n"); fails++; } } while (0)
 
 static void test_mask(int es) {
@@ -194,9 +200,81 @@ static void test_sslh(float ncf) {
     nn_free(dl); nn_free(dg); nn_free(dt); nn_free(dc); nn_free(ds); free(lg); free(ht); free(gt); free(gg);
 }
 
+/* (5) --ssl-views 2 */
+static void rec_sym(void *r, int P, int sb) { memset(r, 0, NN_RAD_REC(P)); int32_t *h = r; h[2] = P; h[3] = P; h[5] = sb; }
+static void rec_warp(void *r, int P, int sb, double ang, int affine, double sc, double amp) {
+    rec_sym(r, P, sb); int32_t *h = r; h[6] = 1 | affine << 1;
+    float *tb = (float *)r + 8 + 2 * (size_t)P, *R = tb + 6 * (size_t)P;
+    for (int d = 0; d < 3; d++) for (int u = 0; u < P; u++) { tb[d * P + u] = (float)(amp * sin(0.13 * u + d)); tb[(3 + d) * P + u] = (float)(amp * 0.13 * cos(0.13 * u + d)); }
+    const double c = cos(ang), s_ = sin(ang), Rm[9] = {c, -s_, 0, s_, c, 0, 0, 0, 1};   /* (a rotation about the first axis pair) */
+    const double Am[9] = {1.05, 0.03, 0, -0.02, 0.97, 0.04, 0.01, 0, 1.02};
+    for (int k = 0; k < 9; k++) { R[k] = (float)Rm[k]; R[9 + k] = (float)(affine ? Am[k] : (k % 4 == 0)); }
+    R[27] = (float)sc;
+}
+static void test_pull(const char *what, const void *rec, int P) {   /* device warp of the ramps vs ssl2_pull at every voxel */
+    const size_t p3 = (size_t)P * P * P; uint8_t *in = malloc(p3); uint16_t *o16 = malloc(p3 * 2); float *got[3];
+    scan_ct_rec sr; memset(&sr, 0, sizeof sr); sr.fixed = 1; sr.fmean = 0.f; sr.fisd = 1.f; sr.xfmt = 1;
+    void *rd = nn_malloc(NN_RAD_REC(P)), *ct = nn_malloc(p3 * 2); nn_h2d(rd, rec, NN_RAD_REC(P));
+    for (int a = 0; a < 3; a++) {
+        for (size_t k = 0; k < p3; k++) { const size_t z = k / ((size_t)P * P), y = k / P % P, x = k % P; in[k] = (uint8_t)(a == 0 ? z : a == 1 ? y : x); }
+        nn_aug_ct(in, &sr, rd, P, ct, 0); nn_sync(); nn_d2h(o16, ct, p3 * 2);
+        got[a] = malloc(p3 * 4); for (size_t k = 0; k < p3; k++) got[a][k] = h2f_(o16[k]);
+    }
+    size_t n = 0, bad = 0; double worst = 0;
+    for (size_t k = 0; k < p3; k++) {
+        const double io[3] = {(double)(k / ((size_t)P * P)), (double)(k / P % P), (double)(k % P)}; double V[3];
+        if (!ssl2_pull(rec, P, io, V)) continue;
+        int edge = 0; for (int d = 0; d < 3; d++) edge |= V[d] < 0.5 || V[d] > P - 1.5; if (edge) continue;   /* (the device's 0 outside vs a real 0 at the face) */
+        n++; for (int d = 0; d < 3; d++) { const double e = fabs(got[d][k] - V[d]); if (e > worst) worst = e; bad += e > 0.02 + V[d] * 1e-3; }
+    }
+    CHECK(n > p3 / 4 && !bad, "ssl2_pull %s: %zu of %zu interior voxels off the device warp (worst %.4f)", what, bad, n, worst);
+    printf("ssl2_pull %s: %zu voxels, worst |device - host| %.4f\n", what, n, worst);
+    for (int a = 0; a < 3; a++) free(got[a]);
+    nn_free(rd); nn_free(ct); free(in); free(o16);
+}
+static void test_views(void) {
+    const int P = 64, cv = 8, G = P / cv; uint8_t *rs = malloc(NN_RAD_REC(P)), *rw = malloc(NN_RAD_REC(P)), *rt = malloc(NN_RAD_REC(P));
+    rec_sym(rs, P, 2 | 0 << 2 | 1 << 4 | 1 << 8 | 1 << 10);   /* perm (2, 0, 1), flips z and x */
+    rec_warp(rw, P, 1 | 2 << 2 | 0 << 4 | 1 << 9, 0.3, 1, 1.15, 1.5);
+    const double sh[3] = {5.5, -3.0, 2.25}; ssl2_teacher_rec(rw, rt, P, sh, 0.85);
+    test_pull("symmetry", rs, P); test_pull("warp", rw, P); test_pull("teacher", rt, P);
+    /* the map: each student cell's teacher coordinate, pushed back through the teacher record, lands on the student's source point */
+    const void *st[2] = {rs, rw}; float *map = malloc((size_t)G * G * G * 3 * 4);
+    for (int k = 0; k < 2; k++) {
+        const long nm = ssl2_map(st[k], rt, P, cv, map); double worst = 0; long nchk = 0;
+        for (int z = 0; z < G; z++) for (int y = 0; y < G; y++) for (int x = 0; x < G; x++) {
+            const float *m = map + 3 * (((size_t)z * G + y) * G + x); if (isnan(m[0])) continue;
+            const double io[3] = {z * cv + 3.5, y * cv + 3.5, x * cv + 3.5}, it[3] = {m[0] * cv + 3.5, m[1] * cv + 3.5, m[2] * cv + 3.5}; double Vs[3], Vt[3];
+            ssl2_pull(st[k], P, io, Vs); ssl2_pull(rt, P, it, Vt); for (int d = 0; d < 3; d++) worst = fmax(worst, fabs(Vs[d] - Vt[d])); nchk++; }
+        CHECK(nm > 0 && nm == nchk && worst < 1e-3, "ssl2_map %d: %ld mapped, %ld checked, worst round trip %.2e voxels", k, nm, nchk, worst);
+        printf("ssl2_map %s: %ld of %d cells mapped, worst round trip %.2e voxels\n", k ? "warp" : "symmetry", nm, G * G * G, worst);
+    }
+    /* nn_ssl2_targets vs the host */
+    const int C = 12, bv = 16; const float ratio = 0.6f; const uint64_t seed = 7; const size_t S = (size_t)G * G * G, n = (size_t)C * S;
+    float *y = malloc(n * 4); for (size_t i = 0; i < n; i++) y[i] = (float)(rn() + 0.5 * (i / S));
+    ssl2_map(rw, rt, P, cv, map);
+    int8_t *ht = calloc(n, 1), *gt = malloc(n); double *mu = calloc(C, sizeof *mu);
+    for (int c = 0; c < C; c++) for (size_t s2 = 0; s2 < S; s2++) mu[c] += y[(size_t)c * S + s2];
+    const int nn3[3] = {G, G, G}; size_t on = 0;
+    for (size_t s2 = 0; s2 < S; s2++) {
+        const int x = (int)(s2 % G), yy = (int)(s2 / G % G), z = (int)(s2 / ((size_t)G * G)); const float *m = map + 3 * s2;
+        if (!ssl_blk_masked(seed, z * cv / bv, yy * cv / bv, x * cv / bv, ratio) || isnan(m[0])) continue;
+        int b[3]; double f[3]; for (int d = 0; d < 3; d++) { int i = (int)floor(m[d]); if (i > G - 2) i = G - 2; if (i < 0) i = 0; double fr = m[d] - i; fr = fr < 0 ? 0 : fr > 1 ? 1 : fr; b[d] = i; f[d] = fr; }
+        double n2 = 0, v[64]; for (int c = 0; c < C; c++) { v[c] = ssl2_tri(y + (size_t)c * S, nn3, b, f) - mu[c] / (double)S; n2 += v[c] * v[c]; }
+        const double nv = sqrt(n2); if (!(nv > 1e-6)) continue; on++;
+        for (int c = 0; c < C; c++) ht[(size_t)c * S + s2] = (int8_t)lrint(fmin(127.0, fmax(-127.0, 127.0 * v[c] / nv)));
+    }
+    float *dy = nn_malloc(n * 4), *dm = nn_malloc(S * 3 * 4); int8_t *dt = nn_malloc(n); double *dmu = nn_malloc(C * sizeof(double));
+    nn_h2d(dy, y, n * 4); nn_h2d(dm, map, S * 3 * 4); nn_ssl2_targets(dy, C, G, G, G, cv, bv, ratio, seed, dm, dmu, dt); nn_sync(); nn_d2h(gt, dt, n);
+    size_t bad = 0; for (size_t i = 0; i < n; i++) bad += ht[i] != gt[i];
+    CHECK(!bad && on > 0 && on < S, "ssl2 targets: %zu of %zu bytes differ, %zu of %zu cells targeted", bad, n, on, S);
+    printf("ssl2 targets: %zu of %zu cells targeted, %zu bytes differ\n", on, S, bad);
+    nn_free(dy); nn_free(dm); nn_free(dt); nn_free(dmu); free(y); free(ht); free(gt); free(mu); free(map); free(rs); free(rw); free(rt);
+}
+
 int main(void) {
     if (nn_init(0)) return test_no_gpu("test_ssl", "nn_init(0) failed");
-    test_mask(2); test_mask(4); test_targets(); test_idx(); test_loss(); test_sslh(0.8f); test_sslh(1.2f);
+    test_mask(2); test_mask(4); test_targets(); test_idx(); test_loss(); test_sslh(0.8f); test_sslh(1.2f); test_views();
     if (fails) { printf("%d FAILED\n", fails); return 1; }
     printf("PASS\n"); return 0;
 }

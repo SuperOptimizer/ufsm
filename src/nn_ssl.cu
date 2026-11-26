@@ -58,6 +58,34 @@ extern "C" void nn_ssl_targets(const float *y, int C, int cd, int ch, int cw, in
     k_ssl_targets<<<nb_ssl((long long)S, 256), 256>>>(y, C, cd, ch, cw, cv, bv, ratio, seed, mu, t);
     SSL_CK();
 }
+__global__ void k_ssl2_targets(const float *y, int C, int cd, int ch, int cw, int cv, int bv, float ratio, uint64_t seed, const float *map, const double *mu, int8_t *t) {
+    const size_t S = (size_t)cd * ch * cw; const int nn[3] = {cd, ch, cw};
+    for (size_t s = blockIdx.x * (size_t)blockDim.x + threadIdx.x; s < S; s += (size_t)gridDim.x * blockDim.x) {
+        const int x = (int)(s % cw), yy = (int)((s / cw) % ch), z = (int)(s / ((size_t)cw * ch));
+        const float *m = map + 3 * s;
+        int on = ssl_blk_masked(seed, z * cv / bv, yy * cv / bv, x * cv / bv, ratio) && !isnan(m[0]);
+        int b[3]; double f[3];
+        for (int d = 0; on && d < 3; d++) { const double v = m[d]; int i = (int)floor(v); if (i > nn[d] - 2) i = nn[d] - 2; if (i < 0) i = 0; double fr = v - i; if (fr < 0) fr = 0; if (fr > 1) fr = 1;
+            if (nn[d] < 2) { i = 0; fr = 0; } b[d] = i; f[d] = fr; }
+        double n2 = 0;
+        if (on) for (int c = 0; c < C; c++) { const double v = ssl2_tri(y + (size_t)c * S, nn, b, f) - mu[c] / (double)S; n2 += v * v; }
+        const double nv = sqrt(n2);
+        if (!on || !(nv > 1e-6)) { for (int c = 0; c < C; c++) t[(size_t)c * S + s] = 0; continue; }
+        for (int c = 0; c < C; c++) {
+            const double v = (ssl2_tri(y + (size_t)c * S, nn, b, f) - mu[c] / (double)S) / nv;
+            t[(size_t)c * S + s] = (int8_t)lrint(fmin(127.0, fmax(-127.0, 127.0 * v)));
+        }
+    }
+}
+extern "C" void nn_ssl2_targets(const float *y, int C, int cd, int ch, int cw, int cv, int bv, float ratio, uint64_t seed, const float *map, double *mu, int8_t *t) {
+    if (bv % cv) { fprintf(stderr, "nn_ssl2_targets: the mask block (%d voxels) is not a multiple of the cell (%d)\n", bv, cv); abort(); }
+    const size_t S = (size_t)cd * ch * cw;
+    cudaMemsetAsync(mu, 0, (size_t)C * sizeof(double));
+    k_ssl_mean<<<dim3(nb_ssl((long long)S, 256) > 256 ? 256 : nb_ssl((long long)S, 256), C), 256>>>(y, C, S, mu);
+    SSL_CK();
+    k_ssl2_targets<<<nb_ssl((long long)S, 256), 256>>>(y, C, cd, ch, cw, cv, bv, ratio, seed, map, mu, t);
+    SSL_CK();
+}
 __global__ void k_ssl_idx(int *idx, int N, size_t S, size_t off, size_t stride) {
     const int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k < N) idx[k] = (int)((off + (unsigned __int128)k * stride) % S);
