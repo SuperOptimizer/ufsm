@@ -316,7 +316,7 @@ ufsm_exe(test_spiralfit SUITE tests/test_spiralfit.c OBJS countfield afv ctcal f
 ufsm_exe(test_split SUITE tests/test_split.c OBJS unet split NN LP LIBS m CUDA)
 ufsm_exe(test_split_gnbwd SUITE tests/test_split_gnbwd.c OBJS split NN LP LIBS m CUDA)
 ufsm_exe(test_split_lat SUITE tests/test_split_lat.c OBJS unet split NN LP LIBS m CUDA)
-ufsm_exe(test_ssl SUITE tests/test_ssl.c OBJS NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_ssl SUITE tests/test_ssl.c OBJS NN LP ssl2 LIBS LDLIBS CUDA m)
 ufsm_exe(test_sslstat SUITE tests/test_sslstat.c LIBS m DEPS)
 ufsm_exe(test_stem_precision SUITE tests/test_stem_precision.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_stitch SUITE tests/test_stitch.c OBJS stitch fit fit_emb embz fit_ct l1pot coreline json zarr3 store z3w tiffw NN LP LIBS

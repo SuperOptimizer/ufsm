@@ -305,6 +305,19 @@ int main(int argc, char **argv) {
               "voxel ssl: --single ink --ssl (%s/vssli.log)", d);
         CHECK(!sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-ink.json --out %s/vssft %s --ink-head 1 --single ink --init-from %s/vssli/last.ckpt --steps 4 > %s/vssft.log 2>&1 && grep -q 'step      4 ' %s/vssft.log", U, d, d, cm, d, d, d),
               "voxel ssl: the finetune's --init-from of the ssl checkpoint (%s/vssft.log)", d);
+        /* (10) --ssl-views 2 (2026-11-26): the teacher on its own shifted / zoomed view of the source cube, the student on the sampler's warp,
+           masked; finite ssl terms, a mapped cell share, targets at some masked mapped cells; refused with echoes (their warp is re-drawn on the device) */
+        const char *sv = "--ssl 8 --ssl-level 1 --ssl-block 16 --ssl-share 0.5 --steps 8 --ssl-views 2 --ssl-mask 0.7 --gpu-aug 1 --rotate-p 0.5 --symmetry-p 0.5";
+        CHECK(!sh("UFSM_SSL_CHECK=1 UFSM_GRAD_MX8=1 %s train %s/fx/sources-vssl.json --out %s/vss2 %s %s > %s/vss2.log 2>&1", U, d, d, cm, sv, d), "ssl-views 2 run (%s/vss2.log)", d);
+        snprintf(p, sizeof p, "%s/vss2.log", d); lg = slurp(p); nfin = 0; nchk = 0; nbad = 0; int nmap = 0, mbad = 0;
+        for (const char *q = lg; q && (q = strstr(q, "\nstep ")); q++) { const char *a = strstr(q, " ssl "), *e = strchr(q + 1, '\n'); if (a && (!e || a < e)) { const double v = atof(a + 5); nfin += isfinite(v) && v > 0; }
+            const char *m = strstr(q, " views: "); if (m && (!e || m < e)) { const double v = atof(m + 8); nmap++; mbad += !(v > 20 && v <= 100); } }
+        for (const char *q = lg; q && (q = strstr(q, "ssl check (GPU ")); q++) { const char *a = strstr(q, "): "); const double t = a ? atof(a + 3) : -1; nchk++; nbad += !(t > 5 && t < 90); }
+        CHECK(nfin >= 2 && nmap >= 2 && !mbad && nchk >= 2 && !nbad, "ssl-views 2: %d finite ssl terms, %d mapped shares (%d outside 20..100%%), %d checks (%d targeted outside 5..90%%) (%s/vss2.log)", nfin, nmap, mbad, nchk, nbad, d);
+        CHECK(lg && strstr(lg, "ssl: two views") && !strstr(lg, "DEFAULTED"), "ssl-views 2: no two-view line, or a DEFAULTED (%s/vss2.log)", d);
+        free(lg);
+        CHECK(sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources-vssl.json --out %s/vss2x %s %s --echo-max 2 > %s/vss2x.log 2>&1", U, d, d, cm, sv, d) && !sh("grep -q 'ssl-views 2: --gpu-aug' %s/vss2x.log", d),
+              "ssl-views 2 with --echo-max: not refused (%s/vss2x.log)", d);
     }
     if (!fails) sh("rm -rf %s", d);
     if (fails) { fprintf(stderr, "test_heads: %d FAILED (kept %s)\n", fails, d); return 1; }

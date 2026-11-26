@@ -20,6 +20,16 @@ static inline SSL_HD int ssl_blk_masked(uint64_t seed, int bz, int by, int bx, f
     return (double)(h >> 40) < (double)ratio * 16777216.0;
 }
 
+/* trilinear over one channel y [n0][n1][n2] at base b, fractions f (corners (z, y, x) in index order 0..7; host and device alike) */
+static inline SSL_HD double ssl2_tri(const float *y, const int n[3], const int b[3], const double f[3]) {
+    double a = 0;
+    for (int k = 0; k < 8; k++) {
+        const int dz = k >> 2, dy = k >> 1 & 1, dx = k & 1, z = b[0] + dz * (n[0] > 1), yy = b[1] + dy * (n[1] > 1), x = b[2] + dx * (n[2] > 1);
+        const double w = (dz ? f[0] : 1 - f[0]) * (dy ? f[1] : 1 - f[1]) * (dx ? f[2] : 1 - f[2]);
+        a += w * y[((size_t)z * n[1] + yy) * n[2] + x];
+    }
+    return a;
+}
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -48,6 +58,18 @@ void nn_sslh_targets(const void *lg, const ssl_heads *hs, int rv_ch, size_t n, s
 /* the student's soft BCE against them: lg [nch][n] its chunk logits (fp16), g [nch][n] (fp16, zeroed by the caller): every targeted
    channel c of head h gets hs->scale[h] x (sigmoid(z) - t / 254); sums (device, 2 doubles per head) += sum BCE, targeted entries */
 void nn_sslh_grad(const void *lg, const ssl_heads *hs, size_t n, size_t off, size_t S, const uint8_t *t, void *g, double *sums);
+/* --ssl-views 2 (2026-11-26, lead: DINO-style SSL for the ink nets): two views of one window's source cube. The student's view is the
+   sampler's own (its radial record: cube symmetry, rotation / zoom / elastic warp, scanner augmentation), masked; the teacher's is a
+   translation + zoom of the same source cube (a warped record with R = A = I, constant tables: ssl2_teacher_rec) with clean intensity.
+   Each student cell centre is pulled into the source cube through its record and pushed into the teacher's window (ssl2_map): map [S][3]
+   holds its teacher cell-grid coordinate (NAN where the pull leaves either cube). nn_ssl2_targets: as nn_ssl_targets, but the teacher's
+   centred side-head vector is trilinear at the mapped coordinate (base corner clamped to [0, n - 2], fraction to [0, 1]), at masked
+   student cells with a mapping only. */
+void nn_ssl2_targets(const float *y, int C, int cd, int ch, int cw, int cv, int bv, float ratio, uint64_t seed, const float *map, double *mu, int8_t *t);
+/* host (src/ssl2.c): rec = one NN_RAD_REC(P) radial record of a cube window */
+int ssl2_pull(const void *rec, int P, const double io[3], double V[3]);   /* output position io (continuous) -> source V; 1 inside the source cube */
+void ssl2_teacher_rec(const void *srec, void *trec, int P, const double shift[3], double zoom);   /* the teacher's record: srec's header / axis, the warp io -> c + zoom (io - c - shift) */
+long ssl2_map(const void *srec, const void *trec, int P, int cv, float *map);   /* map [(P / cv)^3][3]; returns the mapped cells */
 #ifdef __cplusplus
 }
 #endif
