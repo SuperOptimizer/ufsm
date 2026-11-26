@@ -55,6 +55,18 @@ with tempfile.TemporaryDirectory(prefix="ufsm-runs-") as tmp:
     assert int(rows["M:core"][2]) == (core & sup).sum() + (~ink & sup).sum(), rows["M:core"]
     assert int(rows["M:edge"][2]) == (edge & sup).sum() + (~ink & sup).sum(), rows["M:edge"]
     assert abs(float(rows["M:core"][-1]) - 1.0) < 1e-9 and abs(float(rows["M:edge"][-1]) - 0.5) < 1e-9, rows
+    # (2026-11-26 review) a constant map: the main row is refused (rc 1, no row). A one-class subset reads n/a (AUC nan), never 0.5 / 0:
+    # a mask without edge-free ink (only the edge ink and the negatives supported) leaves the core subset with no ink
+    t.imwrite(d / "flat.tif", np.full((H, W), 90, np.uint8))
+    a2 = [str(v) for v in (BIN, "ink-score", "--surface", m, "--labels", d / "lab.tif", "--mask", d / "msk.tif", "--map", f"F={d / 'flat.tif'}", "--edge", "1", "--row", "T")]
+    r = subprocess.run(a2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+    assert r.returncode == 1 and not r.stdout.strip() and "scoring failed" in r.stderr, (r.returncode, r.stdout, r.stderr)
+    t.imwrite(d / "msk2.tif", np.where(sup & ~core, 255, 0).astype(np.uint8))
+    m3 = mp.copy(); m3[~ink & (np.indices((H, W)).sum(0) % 2 == 0)] = 40; t.imwrite(d / "map3.tif", m3)   # (not constant over the scored px)
+    r = subprocess.run([str(v) for v in (BIN, "ink-score", "--surface", m, "--labels", d / "lab.tif", "--mask", d / "msk2.tif", "--map", f"M={d / 'map3.tif'}",
+                        "--edge", "1", "--row", "T")], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+    fr = {l.split("\t")[1]: l.split("\t") for l in r.stdout.splitlines()}
+    assert r.returncode == 0 and fr["M:core"][-1] == "nan" and fr["M:edge"][-1] != "nan", (r.returncode, r.stdout, r.stderr)
     # --quality (TTA goals beyond AUC): a noisy map, every metric against numpy
     rng = np.random.default_rng(3)
     mq = np.clip(rng.normal(70, 12, (H, W)) + 120 * ink, 0, 255).astype(np.uint8); mq[ink & (rng.random((H, W)) < 0.2)] = 60

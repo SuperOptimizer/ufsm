@@ -2281,6 +2281,11 @@ static void warp_w4_pack(const uint8_t *w4, const uint8_t *cp, uint16_t *wq, siz
    torn, ...) windows */
 static int aux_read(source *s, int ch, int l, const int64_t o[3], const int64_t n[3], uint8_t *dst, size_t p3, int redrawn) {
     z3 *tz = s->tgt_key[ch] && s->tgt_prob[ch] && !redrawn ? source_tgt_for_level(s, ch, l, nullptr) : nullptr;
+    if (!tz && s->tgt_key[ch] && s->tgt_prob[ch] && !redrawn && l >= 0 && l < MAXLEV) {   /* (2026-11-26 review) a target without this level: all unknown */
+        const unsigned long long bit = 1ull << (ch * MAXLEV + l);
+        if (!(__atomic_fetch_or(&s->aux_dflt, bit, __ATOMIC_RELAXED) & bit))
+            fprintf(stderr, "DEFAULTED: sampler: %s: target channel %d (%s) has no level %d: its windows' plane is all unknown (255)\n", s->name, ch, s->tgt_key[ch], l);
+    }
     if (!tz) { memset(dst, 255, p3); return 0; }
     return source_read_target(s, ch, l, o, n, dst, g_rt) ? -1 : 0;
 }
@@ -3041,6 +3046,16 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         b->nmil[i] = b->nmil0[i] = 0;
         int ich = -1; for (int q = 0; q < NTG && ich < 0; q++) if (s->ink_fly[q]) ich = q;   /* (the source's onfly ink target, whichever channel holds it) */
         const int L = ich >= 0 ? s->tgt_min_level[ich] : 0;
+        if (ich >= 0) {   /* (2026-11-26 review) windows that lose MIL: counted per source, a DEFAULTED summary at 2^k losses (k >= 4) */
+            const int why = !(l >= L && l <= L + 1) ? 1 : crushed ? 2 : torn ? 3 : delam ? 4 : curved ? 5 : !inkfly_rays ? 6 : 0;
+            const unsigned long long nw = __atomic_add_fetch(&s->mil_n[why], 1, __ATOMIC_RELAXED);
+            if (why) { unsigned long long lost = 0; for (int k = 1; k < 7; k++) lost += __atomic_load_n(&s->mil_n[k], __ATOMIC_RELAXED);
+                if (lost >= 16 && !(lost & (lost - 1))) {
+                    unsigned long long m[7]; for (int k = 0; k < 7; k++) m[k] = __atomic_load_n(&s->mil_n[k], __ATOMIC_RELAXED);
+                    fprintf(stderr, "DEFAULTED: sampler: %s: --ink-mil: %llu of %llu windows without MIL rays (level outside [%d, %d] %llu, crushed %llu, torn %llu, "
+                                    "delam %llu, curved %llu, no ray table %llu)\n", s->name, lost, lost + m[0], L, L + 1, m[1], m[2], m[3], m[4], m[5], m[6]); } }
+            (void)nw;
+        }
         if (inkfly_rays && ich >= 0 && l >= L && l <= L + 1 && !crushed && !torn && !delam && !curved) {
             const int f = 1 << (l - L); const int64_t o2[3] = {o[0] * f, o[1] * f, o[2] * f}, n2[3] = {n[0] * f, n[1] * f, n[2] * f};
             inkray *rs = nullptr; size_t nr = 0;

@@ -971,7 +971,9 @@ static int64_t label_cell(int64_t q, int shift, int pooled, int64_t size) {
 }
 
 /* a probability target stored 2^shift coarser: trilinear between the coarse cell centres (cell j's centre sits at fine
-   coordinate f j + (f - 1) / 2, a pooled grid's), clamped at the edges; separable, two interpolated coarse planes at a time */
+   coordinate f j + (f - 1) / 2, a pooled grid's), clamped at the edges; separable, two interpolated coarse planes at a time.
+   (2026-11-26 review) 255 is the unknown code, not a probability: a fine voxel with any weight > 0 on a 255 corner is unknown (255)
+   (it used to blend 255 into the known codes: 255 next to 0 gave ~128, "known"); the unknown flags ride the same separable passes */
 static int read_prob_trilinear(z3 *z, int shift, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     const z3_meta *m = z3_meta_of(z); const int64_t f = (int64_t)1 << shift;
     int64_t lo[3], cnt[3];
@@ -992,8 +994,9 @@ static int read_prob_trilinear(z3 *z, int shift, const int64_t o[3], const int64
     }
     const size_t cplane = (size_t)cnt[1] * cnt[2], fplane = (size_t)n[1] * n[2];
     uint8_t *low = malloc((size_t)cnt[0] * cplane); float *rx = malloc((size_t)cnt[1] * n[2] * sizeof *rx), *pl[2] = {malloc(fplane * sizeof(float)), malloc(fplane * sizeof(float))};
+    uint8_t *ux = malloc((size_t)cnt[1] * n[2]), *pu[2] = {malloc(fplane), malloc(fplane)};   /* unknown flags of rx / pl */
     int rc = -1; int32_t have[2] = {-1, -1};
-    if (!low || !rx || !pl[0] || !pl[1] || z3_read(z, lo, cnt, low, nthreads)) goto done;
+    if (!low || !rx || !pl[0] || !pl[1] || !ux || !pu[0] || !pu[1] || z3_read(z, lo, cnt, low, nthreads)) goto done;
     for (int64_t zc = 0; zc < n[0]; zc++) {
         const int32_t za = i0[0][zc], zb = za + (wt[0][zc] > 0); const float tz = wt[0][zc];
         for (int s = 0; s < 2; s++) {   /* the two coarse planes this output plane needs, each interpolated in y and x once */
@@ -1004,22 +1007,27 @@ static int read_prob_trilinear(z3 *z, int shift, const int64_t o[3], const int64
             for (int64_t yl = 0; yl < cnt[1]; yl++) for (int64_t x = 0; x < n[2]; x++) {
                 const int32_t xa = i0[2][x]; const float tx = wt[2][x]; const uint8_t *r = L + (size_t)yl * cnt[2];
                 rx[(size_t)yl * n[2] + x] = tx > 0 ? r[xa] + tx * ((float)r[xa + 1] - r[xa]) : r[xa];
+                ux[(size_t)yl * n[2] + x] = r[xa] == 255 || (tx > 0 && r[xa + 1] == 255);
             }
-            float *P = pl[slot];
+            float *P = pl[slot]; uint8_t *PU = pu[slot];
             for (int64_t y = 0; y < n[1]; y++) {
                 const int32_t ya = i0[1][y]; const float ty = wt[1][y]; const float *ra = rx + (size_t)ya * n[2], *rb = ty > 0 ? ra + n[2] : ra;
-                float *q = P + (size_t)y * n[2];
-                for (int64_t x = 0; x < n[2]; x++) q[x] = ra[x] + ty * (rb[x] - ra[x]);
+                const uint8_t *ua = ux + (size_t)ya * n[2], *ub = ty > 0 ? ua + n[2] : ua;
+                float *q = P + (size_t)y * n[2]; uint8_t *qu = PU + (size_t)y * n[2];
+                for (int64_t x = 0; x < n[2]; x++) { q[x] = ra[x] + ty * (rb[x] - ra[x]); qu[x] = ua[x] | ub[x]; }
             }
             have[slot] = want;
         }
         const float *A = pl[have[0] == za ? 0 : 1], *Bp = pl[have[0] == zb ? 0 : 1];
+        const uint8_t *AU = pu[have[0] == za ? 0 : 1], *BU = pu[have[0] == zb ? 0 : 1];
         uint8_t *dst = out + (size_t)zc * fplane;
-        for (size_t k = 0; k < fplane; k++) { const float v = A[k] + tz * (Bp[k] - A[k]); dst[k] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v + 0.5f); }
+        for (size_t k = 0; k < fplane; k++) {
+            if (AU[k] || (tz > 0 && BU[k])) { dst[k] = 255; continue; }
+            const float v = A[k] + tz * (Bp[k] - A[k]); dst[k] = (uint8_t)(v < 0 ? 0 : v > 254 ? 254 : v + 0.5f); }
     }
     rc = 0;
 done:
-    free(low); free(rx); free(pl[0]); free(pl[1]);
+    free(low); free(rx); free(pl[0]); free(pl[1]); free(ux); free(pu[0]); free(pu[1]);
     for (int d = 0; d < 3; d++) { free(i0[d]); free(wt[d]); }
     return rc;
 }
