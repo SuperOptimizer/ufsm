@@ -2853,6 +2853,12 @@ static int predict_one(int argc, char **argv) {
             rd.tiles[kept++] = *t;
         }
         if (nair) fprintf(stderr, "predict: %ld windows over absent CT chunks only skipped before reading (%ld to run)\n", nair, kept);
+        /* (2026-11-26, inkperf) a --tile-list names tiles to predict: all of them over absent chunks is a wrong level / an unstaged store
+           (pair3's R1 rows read a copy without level 2: 0 windows, an all-zero output, AUC 0.5 downstream), never a result */
+        if (tlf && nair && !kept && !ufsm_env_on("UFSM_PRED_EMPTY_OK")) {
+            fprintf(stderr, "predict: ALERT: all %ld windows of --tile-list %s lie over absent CT chunks (level %d of %s/%s): nothing to predict "
+                            "(a missing level / unstaged store?); UFSM_PRED_EMPTY_OK=1 accepts it\n", nair, tlf, level, root, key);
+            free(shs); return 1; }
         rd.ntiles = kept;
         /* --resume: a shard all of whose windows went is done (all air, nothing written: as the loop's "all air: done" rows), else a --gpus
            worker owning only such shards logged nothing (test_pipeline_cli air-gpus: the '0 0 0' row missing) */

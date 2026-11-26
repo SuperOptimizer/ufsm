@@ -3561,6 +3561,20 @@ int cmd_ink_audit(int argc, char **argv) {
     json_free(j);
     /* ---- the report ---- */
     const int haveP = pi >= 0;
+    /* (2026-11-26, inkperf) a constant prediction over every scored sample (an all-zero volume: predict ran no windows, a missing level,
+       an unstaged store) gives AUC 0.5000 that reads like a score (pair3's R1 rows): scoring failed, no report, rc 1 */
+    if (haveP && !getenv("UFSM_AUDIT_CONST_OK")) {
+        int nzb = 0, bv = -1; uint64_t tot = 0;
+        for (int v = 0; v < 256; v++) { uint64_t h = 0; for (int sp = 0; sp < AU_SPN; sp++) for (int s = 0; s < AU_NS; s++) h += A->sc[sp][0][0][s][1][v] + A->sc[sp][0][0][s][0][v];   /* (every face shift: a band that misses the layer is still a score) */
+            if (h) { nzb++; bv = v; tot += h; } }
+        if (tot && nzb <= 1) { fprintf(stderr, "ink-audit: ALERT: scoring failed: --pred %s %s is constant (byte %d) over all %llu scored samples at every face shift (an empty / "
+                                       "unpredicted volume?); UFSM_AUDIT_CONST_OK=1 reports it anyway\n", argv[pi + 1], argv[pi + 2], bv, (unsigned long long)tot); return 1; }
+        if (jr) { uint64_t m2[256] = {0}; for (int r = 0; r < (nreg ? nreg : 1); r++) for (int cl = 0; cl < 2; cl++) for (int i = 0; i < 65536; i++) m2[i & 255] += jr[((size_t)r * 2 + cl) * 65536 + i];
+            nzb = 0; tot = 0; for (int v = 0; v < 256; v++) if (m2[v]) { nzb++; bv = v; tot += m2[v]; }
+            if (tot && nzb <= 1 && bv == 0) {   /* (byte 0 = the fill: the joint histogram has only the band at shift 0, where a real prediction beyond the band can be flat) */
+                 fprintf(stderr, "ink-audit: ALERT: scoring failed: --pred2 %s %s is constant (byte %d) over all %llu HOLD samples (an empty / "
+                                           "unpredicted volume?); UFSM_AUDIT_CONST_OK=1 reports it anyway\n", argv[p2i + 1], argv[p2i + 2], bv, (unsigned long long)tot); return 1; } }
+    }
     printf("tag\tsplit\tsup_px\tink_share\tface_ink\tface_noink\tface_q10\tface_q50\tface_q90\tct_ink\tct_ink_sd\tct_no\tct_no_sd\tz_ink\tz_no\tct_auc"
            "\tauc_max\tauc_mean\tbest_shift_face\tauc_best_face\tbest_shift_mesh\tauc_best_mesh\tp_ink_q10\tp_ink_q50\tp_ink_q90\tp_no_q50\tp_no_q90\tp_no_q99\tf1_best\tthr_best\tf1_128\n");
     for (int sp = 0; sp < AU_SPN; sp++) {
