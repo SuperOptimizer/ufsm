@@ -17,6 +17,38 @@ meta.json.orig. It waits until N9R / N9Rk release card 1 (n9r/card1.free) and un
 meshes, because smesh_body reloads a mesh lazily mid-run and refuses one whose voxel size changed. The other 41 are on 2.4 um scans,
 where the 2.399 fallback is correct; they are left as they are.
 
+## SSL v2: two views (`train --ssl-views 2`); the v1 setting for J1 (2026-11-26, dinovol)
+
+Lead 11-26 (user go: DINO-style SSL for our ink nets, then the joint winding + ink + SSL net J1). v1 (`--ssl`, 11-12) has the teacher and
+the student see the same window; only the mask and the latent step differ. v2 adds a geometric view change. Mapping a student cell to
+the teacher's target only needs the two windows' radial records, so the sampler is unchanged.
+- **Teacher view.** The same source cube shifted uniformly by up to `--ssl-view-shift` x P per axis (default 0.125) and zoomed
+  log-uniformly in [1/Z, Z] (`--ssl-view-zoom`, default 1.25). This is a warped record with R = A = I and constant tables. Its
+  intensity is clean: no scanner plan, no jitter. It is built on the device from the same source bytes as the student, at upload time,
+  into per-slot buffers (`ssl2_upload`).
+- **Student view.** The sampler's own record: symmetry, rotation / affine / zoom / elastic, and the scanner augmentation. It is masked
+  as in v1: `--ssl-mask` of the `--ssl-block`^3 blocks.
+- **Targets.** Each masked student cell centre is pulled into the source cube through its record (`ssl2_pull`: aug_write_k's map in
+  double, the elastic table linear between its entries), then pushed into the teacher's window (`ssl2_map`). There it reads the
+  teacher's centred side-head vector, trilinear on the cell grid, unit-normalised and stored as int8 (`nn_ssl2_targets`). A cell whose
+  pull leaves either cube gets no target.
+- **Loss and logs.** The loss is v1's: cosine at the targeted cells plus the variance hinge. The step lines add "views: X% cells
+  mapped", and an ALERT fires when the unit rows' per-dimension std falls below 0.3 gamma (collapse).
+- **Refusals.** `--echo-max` > 0, `--replay` > 1, the axis / view records (`--attn-pe scroll`, `--attn-view`) and `--aux-input`. In
+  the first two the device re-draws the warp, so the host records no longer match the window. The last three are the student's records.
+- Under --skip-empty the teacher runs dense.
+- Tests:
+  - test_ssl (5): ssl2_pull against the device CT warp on coordinate ramps. Trilinear interpolation of a linear source is exact, so
+    each output voxel is its own source coordinate. Worst error 0 for the symmetry record, 0.016 for the warped record (fp16 at 63)
+    and 0.013 for the teacher record. The map round trip is within 1.6e-6 voxels. The targets are byte-identical to the host's.
+  - test_heads (10): a two-view fixture run gives finite ssl terms, a mapped share of 20-100 % and targeted shares of 5-90 %, with no
+    DEFAULTED. The same run with --echo-max is refused.
+- **Gamma.** For D-dimensional unit rows the per-dimension std is at most 1/sqrt(D) (isotropic, zero mean), and that bound is v1's
+  default gamma. The hinge therefore never switches off. For J1 v0 the setting is `--ssl 16 --ssl-level 2 --ssl-gamma 0.2` (0.8 of the
+  maximum; the 11-12 fixture reached 0.88-0.96 of it), with `--ssl-block 16 --ssl-mask 0.5 --ssl-weight 0.5 --ssl-share 0.15`.
+- The ct_only list: /vesuvius/ufsm/dinovol/ssl/ssl-ctonly.json, 35 mirror volumes without 0841 / 1447 / 0175A, every box of
+  holdouts-20261114 + holdouts-dev rejected (ssl/mksrc.sh).
+
 ## g256 distill rerun: 8000 steps on the fixed --lat grid, pre-registered (2026-11-26, dinovol)
 
 The 4000-step null below was a bug, not a measurement. Under --lat 4 the net's level 0 is the 4^3-voxel latent grid, but train sized the
