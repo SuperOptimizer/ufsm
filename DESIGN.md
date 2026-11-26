@@ -6,6 +6,46 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Clean ink benchmark rescore (PICKS2) and fine nets on upsampled coarse scans (2026-11-25, inksdk)
+
+**PICKS2** (pre-registered in /vesuvius/ufsm/inksdk/clean/PICKS2.txt, settings from the dev crops only, each new row scored once on clean
+PHerc1447 (28 crops) / PHerc0841 (8)). Scorer fixes, not model changes: the 2-D readers ran on each crop's own tifxyz, so their 384 px tiles
+saw zero padding at the crop edges; now ink-ext runs on the source segment grown by ~4.9 mm (`--grid-crop`, `--canvas-crop` back to the
+crop; KCTX 0 reproduces the old maps byte for byte). TTA: `ink-ext --tta-views 8 --tta-fuse median` (dev: +0.0063 +- 0.0026 mean4 over 1
+view; trim / logit = median; 16 views = 8). The voxel nets have no gn_ema, so each window normalises with its own statistics and the
+output depends on window placement (half-stride shift: up to 142 LSB, AUC up to 0.4 on single crops); halo 64 at window 288 dropped the
+small group (-0.14 +- 0.06), so the voxel rows got `predict --tta 8` at the old window / halo instead (rule V). Voxel rows ran on pod 1
+(master 85a26781, 12 GB cap; R1-62000-l1-h64-t8 at window 544: 10755 s).
+
+| row | 1447 | delta vs old | 0841 | delta vs old |
+|---|---|---|---|---|
+| reader3-ctx-m8 (production candidate) | .7709 | +.007 +- .009 | .8908 | +.011 +- .013 |
+| reader3-ctx | .7635 | -.000 +- .008 | .8908 | +.011 +- .014 |
+| ink9um-ctx-m8 | .6495 | +.030 +- .019 | .8313 | +.092 +- .061 |
+| E0-t8 (9.6 um voxel net) | .6872 | +.042 +- .011 | .8521 | +.030 +- .011 |
+| R1E-avg22-30-t288-t8 | .6576 | +.030 +- .014 | .7872 | -.060 +- .021 |
+| R1-62000-l1-h64-t8 | .5815 | +.026 +- .017 | .9073 | +.013 +- .006 |
+
+reader3 stays the best reader on 1447 (E0-t8 -0.084); on 0841 R1-62000-h64-t8 leads. Next (PICKS3, pre-registered): E2D2 = E0's recipe on
+sources-DEV2 (0009B / 0500P2 iso fixes, 0009B 2.4 um axis), and reader3-ctx-m8 on lossless CT (pullct's dev A/B: q8 costs reader3 ~0.007).
+
+**Fine nets on upsampled coarse scans** (user: how much ink signal do the fine-resolution nets give on 8 / 9 um scans upsampled to their
+rung?). `ct-resample --mode cubic` (separable Catmull-Rom) and `--axis IN OUT` (9ee43408; both modes byte-exact vs numpy); per dev crop the
+mesh is scaled with the resampler's centre convention, only the 256-tiles it touches are resampled and predicted (`mesh-tiles`,
+`predict --tile-list --shard 256`, the native rows' window grid), rendered back at the crop's pixel grid (CT render check: corr 0.9997 vs
+native). Dev 99 + h116 48 crops, paired mean4:
+
+| arm | crop mean | vs the same net on the coarse scan | vs E0 | vs reader3 |
+|---|---|---|---|---|
+| R1-62000 (4.8 um) at 4.32 um (x2) | .7465 | -.051 +- .024 | -.133 +- .025 | |
+| R24-avg22-30 (2.4 um) at 2.4 um (x3.6) | .7026 | +.074 +- .022 | -.154 +- .018 | -.173 +- .019 |
+| R1 x2 cubic vs linear | | | | -.003 +- .019 (cubic - linear) |
+
+Twin control (PHerc0139 40 + 0814 1 crops; the 9.36 um crop meshes carried to the registered 2.4 um scan by `reg tifxyz --c2f`, CT check
+corr 0.956): on the native fine scan R1 .919 / R24 .875 (reader3 .850, E0 .788 on the same crops); on the upsampled 9.36 um scan .783 /
+.694: the fine scan's gain does not survive upsampling (R24 survival vs E0 -1.07). Caveat: 0139 / 0814 at 2.4 um are in R24 / R1's
+teacher-label training sources. Upsampling adds no usable information; no downsample-then-upsample fine-tune.
+
 ## Fibre ties in count-field: AFV ties help P4 (+0.04), our own 1667 tracer ties hurt (-0.03); PAUSED (2026-11-19..25, mergeflag)
 
 Same-sheet fibre pairs as count-field rows (`--fibers F.fib --cf-fib W`, 7337a415; `--cf-fib-every 128 --cf-fib-spans 64,256`, since
