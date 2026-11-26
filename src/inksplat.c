@@ -1242,6 +1242,15 @@ int cmd_ink_score(int argc, char **argv) {
         }
         const double auc = ti && tn ? 1 - wrong / ((double)ti * tn) : 0;
         const uint64_t n = ti + tn;
+        {   /* (2026-11-26, lead review of the fail-loud line) one class only, or a constant map over the scored pixels (an empty / unrendered
+               map): the AUC 0.5 / 0 such a row carried read like scores in devscoreC / cleanscore3 / surfscore2 (their stderr went to /dev/null) */
+            int nzb = 0, bv = 0; for (int b = 0; b < 256; b++) if (hi[b] + hn[b]) { nzb++; bv = b; }
+            if ((!ti || !tn || nzb <= 1) && !getenv("UFSM_SCORE_DEGENERATE_OK")) {
+                fprintf(stderr, "ink-score: ALERT: scoring failed: %s (%s): %llu ink / %llu no-ink px, %s (byte %d); no row (UFSM_SCORE_DEGENERATE_OK=1 reports it)\n", nm,
+                        path, (unsigned long long)ti, (unsigned long long)tn, nzb <= 1 ? (nzb ? "the map is constant over them" : "no map value") : "one class only", bv);
+                free(mp); rc = 1; continue;
+            }
+        }
         fprintf(stderr, "ink-score: %s: %llu px, ink %.3f, F1 best %.4f (p >= %.3f; all-ink floor %.4f), F1@0.5 %.4f (prec %.3f rec %.3f), AUC %.4f%s\n", nm,
                 (unsigned long long)n, n ? (double)ti / n : 0, best, bthr, n ? 2.0 * ti / (n + ti) : 0, f05, p05, r05, auc, ti && tn ? "" : " (one class only: AUC undefined)");
         if (row) printf("%s\t%s\t%llu\t%.4f\t%.4f\t%.3f\t%.4f\t%.4f\t%.4f\t%.4f\n", row, nm, (unsigned long long)n, n ? (double)ti / n : 0, best, bthr, f05, p05, r05, auc);

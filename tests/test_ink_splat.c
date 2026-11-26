@@ -413,7 +413,7 @@ int main(void) {
     snprintf(p, sizeof p, "%s/out.zarr/segments/seg.tifxyz.json", dir);
     CHECK(access(p, R_OK) == 0, "summary %s", p);
     {   /* ink-score on the canvas labels: the labels themselves as the map score F1 1 / AUC 1, the inverted labels AUC 0, a constant map
-           AUC 0.5; with the mask, the masked rows count for nothing (the same perfect score) */
+           refused (scoring failed); with the mask, the masked rows count for nothing (the same perfect score) */
         const int CW = (int)(GW * STEP), CHh = (int)(GH * STEP); uint8_t *m = malloc((size_t)CW * CHh); double f1 = 0, auc = 0;
         char mp[512], kp[512]; snprintf(mp, sizeof mp, "%s/map.tif", dir); snprintf(kp, sizeof kp, "%s/mask.tif", dir);
         for (int r = 0; r < CHh; r++) for (int c = 0; c < CW; c++) m[r * CW + c] = ink_at(r, c) ? 230 : 20;
@@ -423,9 +423,18 @@ int main(void) {
         for (size_t k = 0; k < (size_t)CW * CHh; k++) m[k] = 250 - m[k];
         tiffw_write(mp, CW, CHh, 1, m, 1);
         CHECK(!ink_score(dir, mp, nullptr, &f1, &auc) && auc < 0.03, "ink-score inverted map: AUC %.4f (want ~0)", auc);
+        /* (2026-11-26) degenerate inputs are "scoring failed" (rc 1, no row), never an AUC 0.5 / 0 row: a mask keeping only no-ink pixels
+           (one class), then a constant map */
+        char k1[512]; snprintf(k1, sizeof k1, "%s/mask-noink.tif", dir); uint8_t *m1 = malloc((size_t)CW * CHh);
+        for (int r = 0; r < CHh; r++) for (int c = 0; c < CW; c++) m1[r * CW + c] = ink_at(r, c) ? 0 : 255;
+        tiffw_write(k1, CW, CHh, 1, m1, 1); free(m1);
+        char so[600]; snprintf(so, sizeof so, "%s/score.tsv", dir); FILE *sf;
+        CHECK(ink_score(dir, mp, k1, &f1, &auc) == -1, "ink-score one-class pixels: scored (AUC %.4f), want scoring failed", auc);
+        sf = fopen(so, "r"); int ch = sf ? fgetc(sf) : EOF; if (sf) fclose(sf); CHECK(ch == EOF, "ink-score one-class pixels: a row was written");
         memset(m, 128, (size_t)CW * CHh); tiffw_write(mp, CW, CHh, 1, m, 1);
-        CHECK(!ink_score(dir, mp, nullptr, &f1, &auc) && fabs(auc - 0.5) < 1e-6, "ink-score constant map: AUC %.6f (want 0.5)", auc);
-        fprintf(stderr, "ink-score: perfect / masked / inverted / constant maps scored as expected\n");
+        CHECK(ink_score(dir, mp, nullptr, &f1, &auc) == -1, "ink-score constant map: scored (AUC %.6f), want scoring failed", auc);
+        sf = fopen(so, "r"); ch = sf ? fgetc(sf) : EOF; if (sf) fclose(sf); CHECK(ch == EOF, "ink-score constant map: a row was written");
+        fprintf(stderr, "ink-score: perfect / masked / inverted maps scored, one-class / constant inputs refused, as expected\n");
         free(m);
     }
     snprintf(p, sizeof p, "rm -rf '%s'", dir); if (system(p)) {}
