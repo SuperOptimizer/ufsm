@@ -85,6 +85,22 @@ int main(void) {
             CHECK(v[((size_t)hz * LY + hy) * LX + hx] == 77 && v2[((size_t)hz * LY + hy) * LX + hx] == 255, "the human label inside the box is held out too");
             free(v2);
         }
+        /* --hold-pad 1: the box grown by one --like voxel each side */
+        char o3[600]; snprintf(o3, sizeof o3, "%s/out3", tmp);
+        char *av3[] = {"ufsm", "fields-phase", o3, "--like", tmp, "like", "--ref", tmp, "like", "--conf", "0.5", "--threads", "2",
+                       "--holdouts", hj, "--hold-ct", "PHercX/volumes/scan-a.zarr/2", "--hold-scale", "2", "--hold-pad", "1", fd};
+        CHECK(cmd_fields_phase((int)(sizeof av3 / sizeof *av3), av3) == 0, "fields-phase --hold-pad rc");
+        z3 *z3o = z3_open(store_open(tmp), "out3", nullptr); CHECK(z3o != nullptr, "open out3");
+        if (z3o) {
+            uint8_t *v3 = malloc((size_t)LZ * LY * LX); CHECK(z3_read(z3o, o, n, v3, 1) == 0, "read out3");
+            long long nleak = 0, ndiff = 0;
+            for (int zz = 0; zz < LZ; zz++) for (int yy = 0; yy < LY; yy++) for (int xx = 0; xx < LX; xx++) {
+                const size_t i = ((size_t)zz * LY + yy) * LX + xx; const int hb = zz >= 9 && zz < 15 && yy >= 17 && yy < 31 && xx >= 17 && xx < 31;
+                if (hb) { if (v3[i] != 255) nleak++; } else if (v3[i] != v[i]) ndiff++;
+            }
+            CHECK(nleak == 0 && ndiff == 0, "--hold-pad 1: %lld labelled in the grown box, %lld changed outside", nleak, ndiff);
+            free(v3);
+        }
         free(v);
     }
     free(s);

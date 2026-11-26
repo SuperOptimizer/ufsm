@@ -8,7 +8,7 @@
    basename} at it).
    --holdouts H.json --hold-ct KEY [--hold-scale F]: every box of a wbench holdouts.json ({"boxes": [{"ct", "l0": [z,y,x,nz,ny,nx]}]})
    whose ct basename is KEY's is written unknown (255), human labels too (F: level-0 voxels per --like voxel, e.g. 4 for a 9.6 um grid of a
-   2.4 um scan; boxes rounded outwards): teacher targets never cover held-out GT, whatever the trainer's own holdout_file does. */
+   2.4 um scan; boxes rounded outwards; --hold-pad P: grown by P --like voxels each side, a guard): teacher targets never cover held-out GT, whatever the trainer's own holdout_file does. */
 #include <math.h>
 #include "optcheck.h"
 #include <pthread.h>
@@ -97,13 +97,13 @@ static void *fp_worker(void *a) {
 }
 
 int cmd_fields_phase(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: ufsm fields-phase OUT_DIR --like ROOT KEY [--ref ROOT KEY] [--conf 0.5] [--threads 16] [--holdouts H.json --hold-ct KEY [--hold-scale F]] FIELDS_DIR...\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: ufsm fields-phase OUT_DIR --like ROOT KEY [--ref ROOT KEY] [--conf 0.5] [--threads 16] [--holdouts H.json --hold-ct KEY [--hold-scale F] [--hold-pad P]] FIELDS_DIR...\n"); return 2; }
     const char *out = argv[2], *lr = nullptr, *lk = nullptr, *rr = nullptr, *rk = nullptr; const char *dirs[256]; int nd = 0;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], opt_n("--like")) && i + 2 < argc) { lr = argv[i + 1]; lk = argv[i + 2]; i += 2; }
         else if (!strcmp(argv[i], opt_n("--ref")) && i + 2 < argc) { rr = argv[i + 1]; rk = argv[i + 2]; i += 2; }
         else if ((!strcmp(argv[i], opt_n("--conf")) || !strcmp(argv[i], opt_n("--threads")) || !strcmp(argv[i], opt_n("--holdouts")) || !strcmp(argv[i], opt_n("--hold-ct"))
-                  || !strcmp(argv[i], opt_n("--hold-scale"))) && i + 1 < argc) i++;
+                  || !strcmp(argv[i], opt_n("--hold-scale")) || !strcmp(argv[i], opt_n("--hold-pad"))) && i + 1 < argc) i++;
         else if (argv[i][0] != '-' && nd < 256) dirs[nd++] = argv[i];
     }
     if (!lr || !nd) { fprintf(stderr, "fields-phase: --like ROOT KEY and at least one FIELDS_DIR\n"); return 2; }
@@ -111,10 +111,10 @@ int cmd_fields_phase(int argc, char **argv) {
     z3 *zl = z3_open(store_open(lr), lk, nullptr); if (!zl) { fprintf(stderr, "fields-phase: %s\n", z3_error()); return 1; }
     const int64_t *shape = z3_meta_of(zl)->shape;
     z3 *zr = nullptr; if (rr && !(zr = z3_open(store_open(rr), rk, nullptr))) { fprintf(stderr, "fields-phase: %s\n", z3_error()); return 1; }
-    const char *hp = fp_opt(argc, argv, "--holdouts", nullptr), *hct = fp_opt(argc, argv, "--hold-ct", nullptr); const double hsc = opt_atof("--hold-scale", fp_opt(argc, argv, "--hold-scale", "1"));
+    const char *hp = fp_opt(argc, argv, "--holdouts", nullptr), *hct = fp_opt(argc, argv, "--hold-ct", nullptr); const double hsc = opt_atof("--hold-scale", fp_opt(argc, argv, "--hold-scale", "1")); const int hpad = opt_atoi("--hold-pad", fp_opt(argc, argv, "--hold-pad", "0"));
     int nh = 0; int64_t *hb = nullptr;
     if (hp) {   /* the held-out boxes of this scan, in --like voxels (rounded outwards) */
-        if (!hct || !(hsc > 0)) { fprintf(stderr, "fields-phase: --holdouts needs --hold-ct KEY (and --hold-scale > 0)\n"); return 2; }
+        if (!hct || !(hsc > 0) || hpad < 0) { fprintf(stderr, "fields-phase: --holdouts needs --hold-ct KEY (and --hold-scale > 0, --hold-pad >= 0)\n"); return 2; }
         FILE *f = fopen(hp, "rb"); if (!f) { fprintf(stderr, "fields-phase: cannot open %s\n", hp); return 1; }
         fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET); char *t = malloc((size_t)n + 1);
         const size_t got = t ? fread(t, 1, (size_t)n, f) : 0; fclose(f);
@@ -125,11 +125,11 @@ int cmd_fields_phase(int argc, char **argv) {
             if (strcmp(fp_base(json_str(json_get(e, "ct"), "")), me)) continue;
             if (!l0 || l0->type != J_ARR || l0->n != 6) { fprintf(stderr, "fields-phase: %s box %zu is not [z, y, x, nz, ny, nx]\n", hp, k); json_free(j); return 1; }
             for (int a = 0; a < 3; a++) { const double b0 = json_num(json_at(l0, a), 0), bn = json_num(json_at(l0, 3 + a), 0);
-                hb[6 * nh + a] = (int64_t)floor(b0 / hsc); hb[6 * nh + 3 + a] = (int64_t)ceil((b0 + bn) / hsc); }
+                hb[6 * nh + a] = (int64_t)floor(b0 / hsc) - hpad; hb[6 * nh + 3 + a] = (int64_t)ceil((b0 + bn) / hsc) + hpad; }
             nh++;
         }
         json_free(j);
-        fprintf(stderr, "fields-phase: %d held-out boxes of %s (%s, scale %g) written unknown\n", nh, me, hp, hsc);
+        fprintf(stderr, "fields-phase: %d held-out boxes of %s (%s, scale %g) written unknown (guard %d voxels)\n", nh, me, hp, hsc, hpad);
     }
     fit_fields_skip_planes(1 | 2 | 4 | 8); fit_fields_ct_planes(0);
     /* the field sets' geometry only (pool 0): their planes are read one z shard row at a time below (a whole-scroll set is ~24 GB of
