@@ -259,7 +259,7 @@ int cmd_atlas_import(int argc, char **argv) {
 
 /* ---------------------------------------------------------------------------------------------------------------------------------
    ufsm atlas-audit INDEX.tsv [--ref DIR]... [--value q.tif] [--scroll S] [--radius 20] [--on 4] [--holdouts H.json]... [--out T.tsv]
-                    [--threads T] [--gate-cover 0.3] [--gate-d 2] [--gate-le 0.7] [--gate-big 0.95] [--gate-sw 0.002] [--sub 1]
+                    [--threads T] [--gate-cover 0.3] [--gate-d 2] [--gate-le 0.7] [--gate-big 0.95] [--gate-sw 0.002] [--sub 1] [--tile T]
    The imported patches (INDEX.tsv from atlas-import; the tifxyz beside it) against reference sheets, CPU only:
    - each --ref DIR is one set of meshes in one level-0 frame (tifxyz directories or .sfc wraps): GT q meshes (--value q.tif: the set's
      own winding gauge, sheets differ by whole turns) or our fitted wraps (no value file: the winding id from the name's digits, w123 -> 123).
@@ -286,7 +286,13 @@ static int au_fcmp(const void *a, const void *b) { const float x = *(const float
 
 typedef struct {
     au_v *v; size_t nv, cap; au_k *k; double R; int nsets;
+    uint8_t *occ; int64_t oc[3]; double ocell, olo[3];   /* cells (ocell voxels) within one cell of a patch node: only their vertices are kept */
 } au_ref;
+static int au_occ_at(const au_ref *r, const float p[3]) {
+    if (!r->occ) return 1;
+    int64_t c[3]; for (int a = 0; a < 3; a++) { c[a] = (int64_t)floor((p[a] - r->olo[a]) / r->ocell); if (c[a] < 0 || c[a] >= r->oc[a]) return 0; }
+    const size_t i = ((size_t)c[2] * r->oc[1] + c[1]) * r->oc[0] + c[0]; return r->occ[i >> 3] >> (i & 7) & 1;
+}
 
 static int au_add_mesh(au_ref *r, const char *P, const char *value, int set, const double lo[3], const double hi[3], size_t *nmesh) {
     char p[2400]; int w = 0, h = 0, w2, h2; float *X[3] = {nullptr, nullptr, nullptr}, *Q = nullptr;
@@ -306,6 +312,7 @@ static int au_add_mesh(au_ref *r, const char *P, const char *value, int set, con
         if (Q && !isfinite(Q[i])) continue;
         int out = 0; for (int a = 0; a < 3; a++) if (X[a][i] < lo[a] || X[a][i] > hi[a]) out = 1;
         if (out) continue;
+        { const float pp[3] = {X[0][i], X[1][i], X[2][i]}; if (!au_occ_at(r, pp)) continue; }
         au_v V = {{X[0][i], X[1][i], X[2][i]}, {0, 0, 0}, Q ? Q[i] : (float)lab, set};
         /* normal: central differences on the grid (one-sided at holes / borders) */
         double du[3] = {0}, dv[3] = {0}; int okU = 0, okV = 0;
@@ -322,7 +329,9 @@ static int au_add_mesh(au_ref *r, const char *P, const char *value, int set, con
         r->v[r->nv++] = V;
     }
     for (int a = 0; a < 3; a++) free(X[a]);
-    free(Q); (*nmesh)++; return 0;
+    free(Q); (*nmesh)++;
+    if (tfx_release_hook) tfx_release_hook();   /* (the thread's decoded .sfc copy) */
+    return 0;
 bad:
     for (int a = 0; a < 3; a++) free(X[a]);
     free(Q); fprintf(stderr, "atlas-audit: cannot read the mesh %s\n", P); return -1;
@@ -389,30 +398,47 @@ static int64_t au_near(const au_ref *r, const float q[3], double *dpl, double *d
     return bi;
 }
 
-typedef struct { const au_ref *ref; const au_patch *P; size_t np; const char *dir; const au_box *box; size_t nbox; int sub; double on;
+typedef struct { const au_ref *ref; const au_patch *P; size_t np; const char *dir; const au_box *box; size_t nbox; int sub, tile; double on;
                  double gc, gd, gle, gbig, gsw; size_t *next; pthread_mutex_t *mu; FILE *out; size_t *pass, *nocover, *fail, *held; } au_job;
 
 static int uf_find(int *p, int a) { while (p[a] != a) { p[a] = p[p[a]]; a = p[a]; } return a; }
 
+static void au_stats(au_job *J, const au_patch *P, const char *rid, float *X[3], int w, int h, const char *hold);
 static void au_patch_one(au_job *J, const au_patch *P) {
-    char d[2400], p[2600]; int w = 0, h = 0, w2, h2; float *X[3] = {nullptr, nullptr, nullptr};
+    char d[2400], p[2600]; int w = 0, h = 0, w2 = -1, h2 = -1; float *X[3] = {nullptr, nullptr, nullptr};
     snprintf(d, sizeof d, "%s/%s/%s.tifxyz", J->dir, P->scroll, P->id);
     static const char *nm[3] = {"x.tif", "y.tif", "z.tif"};
     for (int a = 0; a < 3; a++) { snprintf(p, sizeof p, "%s/%s", d, nm[a]); X[a] = img_read_f32(p, a ? &w2 : &w, a ? &h2 : &h); }
+    if (!X[0] || !X[1] || !X[2] || w2 != w || h2 != h) { fprintf(stderr, "atlas-audit: cannot read %s\n", d); for (int a = 0; a < 3; a++) free(X[a]); return; }
     char hold[512] = "";
     for (size_t b = 0; b < J->nbox; b++) {
         const au_box *B = &J->box[b]; if (strcmp(B->ct, P->scan)) continue;
         const int64_t bz = B->b[0], by = B->b[1], bx = B->b[2], nz = B->b[3], ny = B->b[4], nx = B->b[5]; const double g = 16;
         if (P->hi[0] + g < bx || P->lo[0] - g > bx + nx || P->hi[1] + g < by || P->lo[1] - g > by + ny || P->hi[2] + g < bz || P->lo[2] - g > bz + nz) continue;
+        if (strstr(hold, B->name)) continue;   /* (one name once: the holdout files overlap) */
         const size_t l = strlen(hold); if (l + strlen(B->name) + 2 < sizeof hold) snprintf(hold + l, sizeof hold - l, "%s%s", l ? "," : "", B->name);
     }
+    if (J->tile <= 0) au_stats(J, P, P->id, X, w, h, hold);
+    else {   /* --tile T: T x T-node tiles of the patch, one row each (id#row,col; a calibration surface at the ATLAS patch scale) */
+        const int T = J->tile; float *S[3] = {malloc(sizeof(float) * T * T), malloc(sizeof(float) * T * T), malloc(sizeof(float) * T * T)};
+        for (int r0 = 0; S[0] && S[1] && S[2] && r0 < h; r0 += T) for (int c0 = 0; c0 < w; c0 += T) {
+            const int th = h - r0 < T ? h - r0 : T, tw = w - c0 < T ? w - c0 : T; size_t nv = 0;
+            for (int a = 0; a < 3; a++) for (int r = 0; r < th; r++) for (int c = 0; c < tw; c++) { S[a][r * tw + c] = X[a][(size_t)(r0 + r) * w + c0 + c]; nv += a == 2 && S[2][r * tw + c] >= 0; }
+            if (nv * 4 < (size_t)T * T) continue;   /* (tiles at least a quarter valid) */
+            char rid[300]; snprintf(rid, sizeof rid, "%s#%d,%d", P->id, r0 / T, c0 / T);
+            au_stats(J, P, rid, S, tw, th, hold);
+        }
+        for (int a = 0; a < 3; a++) free(S[a]);
+    }
+    for (int a = 0; a < 3; a++) free(X[a]);
+}
+static void au_stats(au_job *J, const au_patch *P, const char *rid, float *X[3], int w, int h, const char *hold) {
     size_t nodes = 0, matched = 0, onsheet = 0, amb = 0, le2 = 0, le4 = 0, edges = 0, sw = 0, sheets5 = 0; double p50 = NAN, p90 = NAN, big = NAN; int dset = -1;
-    if (!X[0] || !X[1] || !X[2] || w2 != w || h2 != h) { fprintf(stderr, "atlas-audit: cannot read %s\n", d); goto done; }
     if (J->ref) {
         const int S = J->sub, gw = (w + S - 1) / S, gh = (h + S - 1) / S; const size_t G = (size_t)gw * gh;
         float *dpl = malloc(G * 4), *lab = malloc(G * 4); int *set = malloc(G * sizeof(int)), *uf = malloc(G * sizeof(int));
         float *ds = malloc(G * 4); size_t nd = 0;
-        if (!dpl || !lab || !set || !uf || !ds) { free(dpl); free(lab); free(set); free(uf); free(ds); goto done; }
+        if (!dpl || !lab || !set || !uf || !ds) { free(dpl); free(lab); free(set); free(uf); free(ds); fprintf(stderr, "atlas-audit: out of memory\n"); return; }
         for (int gy = 0; gy < gh; gy++) for (int gx = 0; gx < gw; gx++) {
             const size_t g = (size_t)gy * gw + gx, i = (size_t)gy * S * w + (size_t)gx * S; set[g] = -1; uf[g] = (int)g; dpl[g] = INFINITY;
             if (X[2][i] < 0) continue;
@@ -464,17 +490,15 @@ static void au_patch_one(au_job *J, const au_patch *P) {
         }
         free(root); free(cl); free(cs); free(cn); free(dpl); free(lab); free(set); free(uf); free(ds);
     }
-done:;
     const double cover = nodes ? (double)matched / nodes : 0, swr = edges ? (double)sw / edges : NAN;
     const char *gate = !J->ref ? "-" : cover < J->gc ? "nocover"
                      : (p50 <= J->gd && (double)le4 / (matched ? matched : 1) >= J->gle && big >= J->gbig && swr <= J->gsw) ? "pass" : "fail";
     pthread_mutex_lock(J->mu);
-    fprintf(J->out, "%s\t%s\t%zu\t%zu\t%.4f\t%.3f\t%.3f\t%.4f\t%.4f\t%zu\t%zu\t%zu\t%zu\t%.5f\t%zu\t%.4f\t%d\t%s\t%s\n", P->id, P->scroll, nodes, matched, cover,
+    fprintf(J->out, "%s\t%s\t%zu\t%zu\t%.4f\t%.3f\t%.3f\t%.4f\t%.4f\t%zu\t%zu\t%zu\t%zu\t%.5f\t%zu\t%.4f\t%d\t%s\t%s\n", rid, P->scroll, nodes, matched, cover,
             p50, p90, matched ? (double)le2 / matched : 0, matched ? (double)le4 / matched : 0, onsheet, amb, edges, sw, swr, sheets5, big, dset, gate, *hold ? hold : "-");
     if (!strcmp(gate, "pass")) (*J->pass)++; else if (!strcmp(gate, "nocover")) (*J->nocover)++; else if (!strcmp(gate, "fail")) (*J->fail)++;
     if (*hold) (*J->held)++;
     pthread_mutex_unlock(J->mu);
-    for (int a = 0; a < 3; a++) free(X[a]);
 }
 static void *au_main(void *a) {
     au_job *J = a;
@@ -506,7 +530,7 @@ int cmd_atlas_audit(int argc, char **argv) {
     const char *index = argv[2], *only = at_opt(argc, argv, "--scroll", nullptr), *value = at_opt(argc, argv, "--value", nullptr), *outp = at_opt(argc, argv, "--out", nullptr);
     const double R = atof(at_opt(argc, argv, "--radius", "20")), on = atof(at_opt(argc, argv, "--on", "4"));
     int nt = atoi(at_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = ufsm_ncpu(); if (nt > 64) nt = 64;
-    const int sub = atoi(at_opt(argc, argv, "--sub", "1"));
+    const int sub = atoi(at_opt(argc, argv, "--sub", "1")), tile = atoi(at_opt(argc, argv, "--tile", "0"));
     if (!(R > 0) || !(on > 0) || sub < 1) { fprintf(stderr, "atlas-audit: --radius, --on > 0, --sub >= 1\n"); return 2; }
     char dir[2048]; snprintf(dir, sizeof dir, "%s", index); char *sl = strrchr(dir, '/'); if (sl) *sl = 0; else snprintf(dir, sizeof dir, ".");
     FILE *f = fopen(index, "r"); if (!f) { fprintf(stderr, "atlas-audit: cannot read %s\n", index); return 1; }
@@ -527,13 +551,38 @@ int cmd_atlas_audit(int argc, char **argv) {
     au_box *box = nullptr; size_t nbox = 0;
     for (int a = 3; a + 1 < argc; a++) if (!strcmp(argv[a], opt_n("--holdouts")) && au_holdouts(argv[a + 1], &box, &nbox)) return 1;
     au_ref ref = {.R = R}; int haveref = 0;
+    for (int a = 3; a + 1 < argc; a++) if (!strcmp(argv[a], opt_n("--ref"))) haveref = 1;
+    if (haveref) {   /* occupancy of the patches' nodes (cells of max(R, 16) voxels, dilated by one cell): whole-scroll wraps keep only nearby vertices */
+        ref.ocell = fmax(R, 16);
+        for (int k = 0; k < 3; k++) { ref.olo[k] = lo[k] - 2 * ref.ocell; ref.oc[k] = (int64_t)ceil((hi[k] - lo[k] + 4 * ref.ocell) / ref.ocell) + 1; }
+        const size_t ncell = (size_t)ref.oc[0] * ref.oc[1] * ref.oc[2];
+        uint8_t *o = calloc(ncell / 8 + 1, 1); ref.occ = calloc(ncell / 8 + 1, 1);
+        if (!o || !ref.occ) { fprintf(stderr, "atlas-audit: out of memory (occupancy)\n"); return 1; }
+        for (size_t k = 0; k < np; k++) {
+            char d[2600]; float *X[3]; int w = 0, h = 0, w2, h2; static const char *nm[3] = {"x.tif", "y.tif", "z.tif"};
+            for (int a = 0; a < 3; a++) { snprintf(d, sizeof d, "%s/%s/%s.tifxyz/%s", dir, P[k].scroll, P[k].id, nm[a]); X[a] = img_read_f32(d, a ? &w2 : &w, a ? &h2 : &h); }
+            if (X[0] && X[1] && X[2] && w2 == w && h2 == h)
+                for (size_t i = 0; i < (size_t)w * h; i++) {
+                    if (X[2][i] < 0) continue;
+                    int64_t c[3]; for (int a = 0; a < 3; a++) c[a] = (int64_t)floor((X[a][i] - ref.olo[a]) / ref.ocell);
+                    const size_t q = ((size_t)c[2] * ref.oc[1] + c[1]) * ref.oc[0] + c[0]; o[q >> 3] |= (uint8_t)(1 << (q & 7));
+                }
+            for (int a = 0; a < 3; a++) free(X[a]);
+        }
+        for (int64_t z = 1; z + 1 < ref.oc[2]; z++) for (int64_t y = 1; y + 1 < ref.oc[1]; y++) for (int64_t x = 1; x + 1 < ref.oc[0]; x++) {
+            const size_t q = ((size_t)z * ref.oc[1] + y) * ref.oc[0] + x; if (!(o[q >> 3] >> (q & 7) & 1)) continue;
+            for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+                const size_t t = ((size_t)(z + dz) * ref.oc[1] + (y + dy)) * ref.oc[0] + (x + dx); ref.occ[t >> 3] |= (uint8_t)(1 << (t & 7)); }
+        }
+        free(o); haveref = 0;
+    }
     const double lo2[3] = {lo[0] - R, lo[1] - R, lo[2] - R}, hi2[3] = {hi[0] + R, hi[1] + R, hi[2] + R};
     for (int a = 3; a + 1 < argc; a++) if (!strcmp(argv[a], opt_n("--ref"))) { if (au_load_set(&ref, argv[a + 1], value, ref.nsets, lo2, hi2)) return 1; ref.nsets++; haveref = 1; }
     if (haveref) { if (ref.nv > 0xffffffffu) { fprintf(stderr, "atlas-audit: too many reference vertices\n"); return 1; } au_index(&ref); }
     FILE *out = outp ? fopen(outp, "w") : stdout; if (!out) { fprintf(stderr, "atlas-audit: cannot write %s\n", outp); return 1; }
     fprintf(out, "id\tscroll\tnodes\tmatched\tcover\tp50\tp90\tle2\tle4\tonsheet\tamb\tedges\tswitches\tsw_rate\tsheets5\tbig\tset\tgate\thold\n");
     pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; size_t next = 0, pass = 0, nocover = 0, failn = 0, held = 0;
-    au_job J = {haveref ? &ref : nullptr, P, np, dir, box, nbox, sub, on, atof(at_opt(argc, argv, "--gate-cover", "0.3")), atof(at_opt(argc, argv, "--gate-d", "2")),
+    au_job J = {haveref ? &ref : nullptr, P, np, dir, box, nbox, sub, tile, on, atof(at_opt(argc, argv, "--gate-cover", "0.3")), atof(at_opt(argc, argv, "--gate-d", "2")),
                 atof(at_opt(argc, argv, "--gate-le", "0.7")), atof(at_opt(argc, argv, "--gate-big", "0.95")), atof(at_opt(argc, argv, "--gate-sw", "0.002")),
                 &next, &mu, out, &pass, &nocover, &failn, &held};
     pthread_t th[64]; const int T = (size_t)nt < np ? nt : (int)np;
@@ -542,6 +591,6 @@ int cmd_atlas_audit(int argc, char **argv) {
     if (outp && fclose(out)) return 1;
     fprintf(stderr, "atlas-audit: %zu patches%s%s, %zu reference vertices in %d sets: pass %zu, fail %zu, nocover %zu; %zu touch a holdout box\n", np, only ? " of " : "",
             only ? only : "", ref.nv, ref.nsets, pass, failn, nocover, held);
-    free(ref.v); free(ref.k); free(P); free(box);
+    free(ref.v); free(ref.k); free(ref.occ); free(P); free(box);
     return 0;
 }
