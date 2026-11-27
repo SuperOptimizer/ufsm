@@ -45,7 +45,7 @@ static int write_file(const char *dir, const char *name, const void *p, size_t n
 /* the 256^3 parent's histogram -> lut; st 2: every other voxel per axis (a 2x nearest-upsampled level 1 aligned on even voxels: exactly
    the level-1 parent's histogram, 1 / 8 of the work) */
 static i3_geom G;   /* the model's crop geometry (gb_load) */
-int ie_surface_points(const char *path, float **zyx, size_t *n, double *vox_um);   /* src/inkext.c */
+int ie_surface_points(const char *path, float **zyx, size_t *n, double *vox_um, int argc, char **argv);   /* src/inkext.c (--surf-um; -2: no voxel size) */
 
 static void parent_lut(const uint8_t *base, size_t sy, size_t sx, int st, float lut[256], double *lo, double *hi) {
     uint32_t h[4][256]; memset(h, 0, sizeof h);
@@ -484,7 +484,7 @@ int cmd_ink3d_ext(int argc, char **argv) {
         char sl[4096]; snprintf(sl, sizeof sl, "%s", opt(argc, argv, "--surface", "")); size_t nb = 0, npt = 0;
         for (char *sv = nullptr, *t = strtok_r(sl, ",", &sv); t; t = strtok_r(nullptr, ",", &sv)) {
             float *P; size_t np; double vu;
-            if (ie_surface_points(t, &P, &np, &vu)) { fprintf(stderr, "ink3d-ext: cannot read surface %s\n", t); return 1; }
+            { const int e = ie_surface_points(t, &P, &np, &vu, argc, argv); if (e) { if (e == -1) fprintf(stderr, "ink3d-ext: cannot read surface %s\n", t); return e == -2 ? 2 : 1; } }
             const double f = vu / (2 * ctum);   /* surface voxels -> 4.8 um output voxels */
             for (size_t i = 0; i < np; i++) {
                 int64_t b0[3], b1[3]; int ok = 1;

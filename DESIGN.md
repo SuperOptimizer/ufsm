@@ -6,6 +6,19 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## ink-ext / ink3d-ext / tifxyz-crop: no default surface voxel size (2026-11-26, branch surfum-20261126, inksdk)
+A tifxyz meta.json without `voxel_size_um` was silently read as 2.399 um voxels. The public HercUeNet VC3D mesh of PHerc1203 (9.362 um frame)
+has none, so ink-ext scaled it x 0.256 against the 9.362 um scan and read empty CT (unroll's hercue reader3 run, 11-26; its 2.4 um mapping
+was unaffected only because surf_prep skips rescales within 1 %). The lead's rule: refuse instead of guessing.
+- isurf_load leaves the size unknown (0); `ie_surf_um` resolves it: `--surf-um` (overrides the meta), else the meta's voxel_size_um, else
+  (ink-ext only) an explicit `--ct-um` (the mesh taken in the CT's level-0 voxels, said on stderr), else exit 2 with the reason.
+- ink-ext checks every `--surface` meta before the GPU, weights and CT are opened (a refused run costs nothing); ink3d-ext `--surface` and
+  tifxyz-crop take `--surf-um` the same way (tifxyz-crop wrote the guessed 2.399 into the crop's meta; now the given size, or refuses).
+- Test: tests/test_ink_ext_surfum.py (fast tier, CPU, no GPU / weights): refuse without a size, pass with --surf-um / --ct-um / the meta,
+  tifxyz-crop refuses / carries --surf-um into the crop meta.
+Scripts that ran on meta-less meshes without --ct-um now stop with exit 2 instead of reading at 2.399 (desk 1667 / 0139 VC3D meshes: add
+--surf-um, or voxel_size_um to the meta as inksdk/fixmeta2.sh does for the N9R list).
+
 ## predict --seamless 2: the offset-256 "seams" were pass b alone beyond the box / tile list; the blend now keeps the region (2026-11-26, perf)
 
 PHerc1203 r24 reads (R11P-12000, window 576 halo 32, tile list of 512): ink-seam off0 0.25 but off256 9.32 (plain read 17.7). The
