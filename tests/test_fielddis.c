@@ -72,7 +72,7 @@ int main(void) {
     CHECK(!fit_fields_load(pa, 0, 0, 1, &A) && !fit_fields_load(pb, 0, 0, 1, &B) && !fit_fields_load(ps, 0, 0, 1, &S) && !fit_fields_load(pd, 0, 0, 1, &Dn) && !fit_fields_load(pw, 0, 0, 1, &W4), "load fields");
     if (fails) return 1;
     fit_set_threads(4);
-    const fdis_cfg c = {.conf = 0.2, .gt_conf = 0.3, .ray_um = 100, .step_um = 0, .stride = 1};
+    const fdis_cfg c = {.conf = 0.2, .gt_conf = 0.3, .ray_um = 100, .step_um = 0, .stride = 1, .metrics = 7};
     fdis_out o; double in, out;
     {   /* the same sheets at 9.6 and 2.4 um: no disagreement, on every cell */
         const fit_fields_buf *P[2] = {&A, &B};
@@ -83,7 +83,7 @@ int main(void) {
         CHECK(o.ndis == 0 && mp < 0.03 * 510 && mc < 0.1 * 64 && mw < 0.05 * 128, "same: dis %zu, max pos %zu cnt %zu w4 %zu", o.ndis, mp, mc, mw);
         fdis_free(&o);
         /* the reference may be the finer set (every 4th cell) */
-        const fit_fields_buf *Q[2] = {&B, &A}; const fdis_cfg c4 = {.conf = 0.2, .gt_conf = 0.3, .ray_um = 100, .stride = 4};
+        const fit_fields_buf *Q[2] = {&B, &A}; const fdis_cfg c4 = {.conf = 0.2, .gt_conf = 0.3, .ray_um = 100, .stride = 4, .metrics = 7};
         CHECK(!fdis_run(2, Q, nullptr, &c4, &o) && o.D == 64 && o.ndis == 0 && o.nvalid == (size_t)64 * 64 * 64, "fine ref, stride 4: D %d dis %zu valid %zu", o.D, o.ndis, o.nvalid);
         fdis_free(&o);
     }
@@ -97,6 +97,7 @@ int main(void) {
         const fdis_gtstat *g = &o.gt; const double prec = (double)g->flag_wrong[3] / g->flag[3], rec = (double)g->flag_wrong[3] / g->nwrong;
         CHECK(g->n == o.nvalid && g->wrong_k[0] == 0 && g->nwrong == g->wrong_k[1] && g->nboth == 0, "gt tallies n %zu valid %zu wrong A %zu B %zu both %zu", g->n, o.nvalid, g->wrong_k[0], g->wrong_k[1], g->nboth);
         CHECK(prec > 0.95 && rec > 0.95 && fabs((double)g->nwrong / g->n - 0.25) < 0.06, "gt: precision %.3f recall %.3f base %.3f", prec, rec, (double)g->nwrong / g->n);
+        CHECK(g->w4n > g->n / 10 && g->w4wrong * 100 < g->w4n, "gt w4: %zu of %zu cells scored (all three axes inside the box), %zu off", g->w4n, g->n, g->w4wrong);
         fdis_free(&o);
     }
     {   /* denser sheets in one half: cnt there; w4 too (the winding gradient differs), nothing far from it */
@@ -108,16 +109,20 @@ int main(void) {
     }
     {   /* a one-turn winding mod 4 error in a slab one 2.4 um baseline thick: w4 there (same baseline: B against it; 9.6 um A: the 2.4 um
            planes chained over A's 4x longer baseline, so the cells within 3 baselines below the slab see it too), pos / cnt nowhere */
-        const fit_fields_buf *P[2] = {&B, &W4}; const fdis_cfg c4 = {.conf = 0.2, .gt_conf = 0.3, .ray_um = 100, .stride = 4};
+        const fit_fields_buf *P[2] = {&B, &W4}; const fdis_cfg c4 = {.conf = 0.2, .gt_conf = 0.3, .ray_um = 100, .stride = 4, .metrics = 7};
         CHECK(!fdis_run(2, P, nullptr, &c4, &o), "run w4 same baseline");
         shares(&o, o.w4, 64, sel_w4s, &in, &out); CHECK(in > 0.98, "w4 same baseline inside %.3f", in);
         shares(&o, o.w4, 64, sel_w4s_far, &out, &in); CHECK(out < 0.01, "w4 same baseline far %.3f", out);
         fdis_free(&o);
         const fit_fields_buf *Q[2] = {&A, &W4};
-        CHECK(!fdis_run(2, Q, nullptr, &c, &o), "run w4 chained");
+        CHECK(!fdis_run(2, Q, &A, &c, &o), "run w4 chained");
         shares(&o, o.w4, 64, sel_w4c, &in, &out); CHECK(in > 0.98, "w4 chained inside %.3f", in);
         shares(&o, o.w4, 64, sel_w4c_far, &out, &in); CHECK(out < 0.01, "w4 chained far %.3f", out);
         size_t np = 0, nc = 0, n = (size_t)o.D * o.H * o.W; for (size_t i = 0; i < n; i++) { np += o.pos[i] >= 128; nc += o.cnt[i] >= 32; }
+        const fdis_gtstat *g = &o.gt;   /* against A's phase as the GT: W4's winding is off, A's is not, and the w4 flags find it */
+        CHECK(g->w4n_k[0] == g->w4n && g->w4wrong_k[0] == 0 && g->w4wrong_k[1] > g->w4n / 4 && g->w4flag_wrong * 100 > 98 * g->w4flag && g->w4flag_wrong * 100 > 98 * g->w4wrong,
+              "gt w4: scored %zu, A off %zu, W4 off %zu, flagged %zu, both %zu", g->w4n, g->w4wrong_k[0], g->w4wrong_k[1], g->w4flag, g->w4flag_wrong);
+        CHECK(g->nwrong == 0, "w4 case: %zu sheet errors", g->nwrong);
         CHECK(np == 0 && nc == 0 && o.nw4 > n / 3 && o.nw4 < n, "w4 case: pos %zu cnt %zu flagged, w4 valid %zu of %zu (the chain leaves the box near the top)", np, nc, o.nw4, n);
         fdis_free(&o);
     }

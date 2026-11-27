@@ -76,6 +76,24 @@ double fdis_w4_pair(const fit_fields_buf *A, const double *ta, const fit_fields_
     }
     return best;
 }
+/* set F's relative winding along axis a over Dl um from p (its planes chained Dl / D times; 0: not an integer ratio or a sample invalid) */
+static int fd_chain(const fit_fields_buf *F, const double p[3], int a, double Dl, double *T) {
+    const double D = F->f.w4_d * F->um; const int k = (int)lround(Dl / D); if (k < 1 || fabs(k * D - Dl) > 0.02 * Dl) return 0;
+    double s = 0;
+    for (int m = 0; m < k; m++) { double q[3] = {p[0], p[1], p[2]}, t[3]; q[a] += m * D; if (!fd_w4(F, q, t)) return 0; s += t[a]; }
+    *T = s; return 1;
+}
+/* the GT's unwrapped phase change along axis a over Dl um from p (steps of st; 0: a sample without GT) */
+static int fd_gt_axis(const fit_fields_buf *G, double cmin, const double p[3], int a, double Dl, double st, double *U) {
+    const int K = (int)ceil(Dl / st); double last = 0, u = 0;
+    for (int k = 0; k <= K; k++) {
+        double q[3] = {p[0], p[1], p[2]}, ph; q[a] += Dl * k / K;
+        if (!fd_phase(G, q, cmin, &ph)) return 0;
+        if (k) u += fd_wrap(ph - last);
+        last = ph;
+    }
+    *U = u; return 1;
+}
 /* the principal axis of the nearest cell's n n^T (power iteration, fit-compare's fc_axis); 0 without a normal */
 static int fd_normal(const fit_fields_buf *F, const double p[3], double v[3]) {
     double q[3]; if (!fd_cc(F, p, q)) return 0;
@@ -112,7 +130,7 @@ static double fd_ray(int n, const fit_fields_buf *const *S, const double *cmin, 
 
 typedef struct {
     int n; const fit_fields_buf *const *in; const fit_fields_buf *gt; const fdis_cfg *c; fdis_out *o; double st;
-    fdis_gtstat *gs; size_t (*cnt)[4];
+    fdis_gtstat *gs; size_t (*cnt)[4]; size_t dbg;
 } fd_job;
 static uint8_t fd_u8(double v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_t)lround(v); }
 static void fd_rows(void *ctx, int z0, int z1, int t) {
@@ -135,7 +153,13 @@ static void fd_rows(void *ctx, int z0, int z1, int t) {
         for (int i = 0; i < n; i++) if (fd_w4(S[i], p, tw[nw])) wk[nw++] = i;
         for (int a = 0; a < nw; a++) for (int b = a + 1; b < nw; b++) dw4 = fmax(dw4, fdis_w4_pair(S[wk[a]], tw[a], S[wk[b]], tw[b], p));
         const int w4ok = dw4 >= 0; if (w4ok) fl |= 4;
-        double m = dpos / 0.25; if (ray) m = fmax(m, dcnt / 0.5); if (w4ok) m = fmax(m, dw4 / 0.5);
+        if (J->dbg && nw >= 2 && (oi * 2654435761u) % J->dbg == 0) {   /* UFSM_FDIS_DEBUG=K: about 1 in K cells' raw values */
+            fprintf(stderr, "fdis-debug cell %d %d %d: ph", z, y, x); for (int i = 0; i < n; i++) fprintf(stderr, " %.3f", ph[i]);
+            fprintf(stderr, " du"); for (int i = 0; i < n && ray; i++) fprintf(stderr, " %.2f", du[i]);
+            for (int a = 0; a < nw; a++) fprintf(stderr, " | w4 set %d D %.0f um: %.2f %.2f %.2f", wk[a], S[wk[a]]->f.w4_d * S[wk[a]]->um, tw[a][0], tw[a][1], tw[a][2]);
+            fprintf(stderr, " | dw4 %.2f\n", dw4);
+        }
+        double m = c->metrics & 1 ? dpos / 0.25 : 0; if (ray && c->metrics & 2) m = fmax(m, dcnt / 0.5); if (w4ok && c->metrics & 4) m = fmax(m, dw4 / 0.5);
         const uint8_t dis = fd_u8(m / 2 * 255);
         o->pos[oi] = fd_u8(dpos * 510); o->cnt[oi] = ray ? fd_u8(dcnt * 64) : 0; o->w4[oi] = w4ok ? fd_u8(dw4 * 128) : 0; o->dis[oi] = dis;
         J->cnt[t][0]++; J->cnt[t][1] += ray != 0; J->cnt[t][2] += w4ok; J->cnt[t][3] += dis >= 128;
@@ -148,6 +172,20 @@ static void fd_rows(void *ctx, int z0, int z1, int t) {
                 wrong |= w;
             }
             G->n++; G->nwrong += wrong; G->nboth += nwr == n; G->nray += rg;
+            if (nw >= 2) {   /* winding mod 4 against the GT's unwrapped phase along each axis over the longest baseline */
+                double Dl = 0; for (int a = 0; a < nw; a++) Dl = fmax(Dl, S[wk[a]]->f.w4_d * S[wk[a]]->um);
+                int all = 1, any = 0;
+                for (int a = 0; a < nw; a++) {
+                    double e = -1;
+                    for (int ax = 0; ax < 3; ax++) {   /* (all three axes or none: the pair metric then saw the same ones) */
+                        double T, U; if (!fd_chain(S[wk[a]], p, ax, Dl, &T) || !fd_gt_axis(J->gt, c->gt_conf, p, ax, Dl, J->st, &U)) { e = -1; break; }
+                        e = fmax(e, fabs(fd_wrap4(T - U)));
+                    }
+                    if (e < 0) { all = 0; continue; }
+                    G->w4n_k[wk[a]]++; if (e >= 0.5) { G->w4wrong_k[wk[a]]++; any = 1; }
+                }
+                if (all) { G->w4n++; G->w4wrong += any; G->w4flag += w4ok && dw4 >= 0.5; G->w4flag_wrong += w4ok && dw4 >= 0.5 && any; }
+            }
             const int f[4] = {dpos > 0.25, ray && dcnt >= 0.5, w4ok && dw4 >= 0.5, dis >= 128};
             for (int k = 0; k < 4; k++) { G->flag[k] += f[k]; G->flag_wrong[k] += f[k] && wrong; }
             G->dis_hist[dis >> 4]++; G->dis_hist_wrong[dis >> 4] += wrong;
@@ -161,7 +199,7 @@ void fdis_cell_um(const fdis_out *o, int z, int y, int x, double p[3]) {
 }
 int fdis_run(int n, const fit_fields_buf *const *in, const fit_fields_buf *gt, const fdis_cfg *c, fdis_out *o) {
     memset(o, 0, sizeof *o);
-    if (n < 2 || n > FD_NMAX || c->stride < 1 || !(c->ray_um > 0)) return -2;
+    if (n < 2 || n > FD_NMAX || c->stride < 1 || !(c->ray_um > 0) || !(c->metrics & 7)) return -2;
     const fit_fields_buf *R = in[0]; double mc = 1e9;
     for (int i = 0; i < n; i++) mc = fmin(mc, in[i]->h * in[i]->um);
     const double st = c->step_um > 0 ? c->step_um : fmin(8, fmax(2, mc));
@@ -173,13 +211,14 @@ int fdis_run(int n, const fit_fields_buf *const *in, const fit_fields_buf *gt, c
     const int nt = fit_par_threads(o->D);
     fdis_gtstat *gs = calloc((size_t)nt + 1, sizeof *gs); size_t (*cnt)[4] = calloc((size_t)nt + 1, sizeof *cnt);
     if (!o->pos || !o->cnt || !o->w4 || !o->dis || !o->flag || !gs || !cnt) { free(gs); free(cnt); fdis_free(o); return -1; }
-    fd_job J = {n, in, gt, c, o, st, gs, cnt};
+    fd_job J = {n, in, gt, c, o, st, gs, cnt, getenv("UFSM_FDIS_DEBUG") ? (size_t)atoll(getenv("UFSM_FDIS_DEBUG")) : 0};
     const int ntr = fit_par(o->D, fd_rows, &J);
     for (int t = 0; t < ntr; t++) {
         o->nvalid += cnt[t][0]; o->nray += cnt[t][1]; o->nw4 += cnt[t][2]; o->ndis += cnt[t][3];
         fdis_gtstat *g = &gs[t], *G = &o->gt;
         G->n += g->n; G->nwrong += g->nwrong; G->nboth += g->nboth; G->nray += g->nray;
-        for (int k = 0; k < FD_NMAX; k++) G->wrong_k[k] += g->wrong_k[k];
+        G->w4n += g->w4n; G->w4wrong += g->w4wrong; G->w4flag += g->w4flag; G->w4flag_wrong += g->w4flag_wrong;
+        for (int k = 0; k < FD_NMAX; k++) { G->wrong_k[k] += g->wrong_k[k]; G->w4n_k[k] += g->w4n_k[k]; G->w4wrong_k[k] += g->w4wrong_k[k]; }
         for (int k = 0; k < 4; k++) { G->flag[k] += g->flag[k]; G->flag_wrong[k] += g->flag_wrong[k]; }
         for (int k = 0; k < 16; k++) { G->dis_hist[k] += g->dis_hist[k]; G->dis_hist_wrong[k] += g->dis_hist_wrong[k]; }
     }
@@ -251,7 +290,7 @@ int cmd_field_disagree(int argc, char **argv) {
     if (argc < 5) {
         fprintf(stderr, "usage: ufsm field-disagree OUT FIELDS1 FIELDS2 [FIELDS3 ..] [--stride 1] [--conf 0.2] [--ray-um 100] [--step-um 0]\n"
                         "         [--gt ORACLE-FIELDS [--gt-conf 0.3]] [--region 512] [--frame-um U] [--min-cover 0.25]\n"
-                        "         [--labelled ROOT KEY --lab-um U] [--near 0.1] [--tag T] [--threads 6]\n"
+                        "         [--labelled ROOT KEY --lab-um U] [--near 0.1] [--metrics pos,cnt,w4] [--tag T] [--threads 6]\n"
                         "  where fit-field sets of several models disagree (src/fielddis.h): OUT/{dis,pos,cnt,w4,flag} zarr arrays on FIELDS1's cells,\n"
                         "  OUT/regions.tsv (regions of --region frame voxels ranked by disagreement x (1 - labelled) x closeness to labels),\n"
                         "  with --gt: OUT/gt.tsv, does disagreement find where a model is wrong (precision / recall per metric)\n"); return 2;
@@ -265,7 +304,12 @@ int cmd_field_disagree(int argc, char **argv) {
     if (n < 2) { fprintf(stderr, "field-disagree: two or more field sets\n"); return 2; }
     fdis_cfg c = {.conf = opt_atof("--conf", fd_opt(argc, argv, "--conf", "0.2")), .gt_conf = opt_atof("--gt-conf", fd_opt(argc, argv, "--gt-conf", "0.3")),
                   .ray_um = opt_atof("--ray-um", fd_opt(argc, argv, "--ray-um", "100")), .step_um = opt_atof("--step-um", fd_opt(argc, argv, "--step-um", "0")),
-                  .stride = opt_atoi("--stride", fd_opt(argc, argv, "--stride", "1"))};
+                  .stride = opt_atoi("--stride", fd_opt(argc, argv, "--stride", "1")), .metrics = 0};
+    {   const char *ms = fd_opt(argc, argv, "--metrics", "pos,cnt,w4");
+        if (strstr(ms, "pos")) c.metrics |= 1;
+        if (strstr(ms, "cnt")) c.metrics |= 2;
+        if (strstr(ms, "w4")) c.metrics |= 4;
+        if (!c.metrics) { fprintf(stderr, "field-disagree: --metrics: a list of pos, cnt, w4\n"); return 2; } }
     const char *gtd = fd_opt(argc, argv, "--gt", nullptr), *tag = fd_opt(argc, argv, "--tag", out);
     const int nth = ufsm_threads(opt_atoi("--threads", fd_opt(argc, argv, "--threads", "6")), 6); fit_set_threads(nth);
     const char *lroot = nullptr, *lkey = nullptr;
@@ -308,13 +352,24 @@ int cmd_field_disagree(int argc, char **argv) {
             fprintf(f, "%s\t%s\t%zu\t%.4f\t%.4f\t%.4f\t%.4f\t%.2f\n", tag, mn[k], g->n, base, g->n ? (double)g->flag[k] / g->n : 0, prec, rec, base > 0 ? prec / base : 0);
         }
         for (int b = 0; b < 16; b++) fprintf(f, "%s\tdis_bin%02d\t%zu\t%.4f\t%.4f\t%.4f\t\t\n", tag, b, g->dis_hist[b], base, g->n ? (double)g->dis_hist[b] / g->n : 0, g->dis_hist[b] ? (double)g->dis_hist_wrong[b] / g->dis_hist[b] : 0);
-        fclose(f);
         printf("  vs GT: %zu cells (ray %.3f): some model wrong %.3f, every model wrong %.3f;", g->n, g->n ? (double)g->nray / g->n : 0, base, g->n ? (double)g->nboth / g->n : 0);
         for (int i = 0; i < n; i++) printf(" model %d wrong %.3f", i, g->n ? (double)g->wrong_k[i] / g->n : 0);
         printf("\n");
+        if (g->w4n) {
+            printf("  winding mod 4 vs the GT's phase along the axes (%zu cells): some model off >= 0.5 turn %.3f;", g->w4n, (double)g->w4wrong / g->w4n);
+            for (int i = 0; i < n; i++) if (g->w4n_k[i]) printf(" model %d %.3f", i, (double)g->w4wrong_k[i] / g->w4n_k[i]);
+            printf("; w4 flagged %.3f: precision %.3f recall %.3f\n", (double)g->w4flag / g->w4n, g->w4flag ? (double)g->w4flag_wrong / g->w4flag : 0, g->w4wrong ? (double)g->w4flag_wrong / g->w4wrong : 0);
+            fprintf(f, "%s\tw4_vs_gtw4\t%zu\t%.4f\t%.4f\t%.4f\t%.4f\t%.2f\n", tag, g->w4n, (double)g->w4wrong / g->w4n, (double)g->w4flag / g->w4n,
+                    g->w4flag ? (double)g->w4flag_wrong / g->w4flag : 0, g->w4wrong ? (double)g->w4flag_wrong / g->w4wrong : 0,
+                    g->w4wrong && g->w4flag ? (double)g->w4flag_wrong / g->w4flag / ((double)g->w4wrong / g->w4n) : 0);
+            for (int i = 0; i < n; i++) if (g->w4n_k[i]) fprintf(f, "%s\tw4_wrong_model%d\t%zu\t%.4f\t\t\t\t\n", tag, i, g->w4n_k[i], (double)g->w4wrong_k[i] / g->w4n_k[i]);
+        }
+        for (int i = 0; i < n; i++) fprintf(f, "%s\twrong_model%d\t%zu\t%.4f\t\t\t\t\n", tag, i, g->n, g->n ? (double)g->wrong_k[i] / g->n : 0);
+        fprintf(f, "%s\tevery_model_wrong\t%zu\t%.4f\t\t\t\t\n", tag, g->n, g->n ? (double)g->nboth / g->n : 0);
         for (int k = 0; k < 4; k++) printf("  %-3s flagged %.3f: precision %.3f recall %.3f (lift %.2f)\n", mn[k], g->n ? (double)g->flag[k] / g->n : 0,
                                            g->flag[k] ? (double)g->flag_wrong[k] / g->flag[k] : 0, g->nwrong ? (double)g->flag_wrong[k] / g->nwrong : 0,
                                            base > 0 && g->flag[k] ? (double)g->flag_wrong[k] / g->flag[k] / base : 0);
+        fclose(f);
     }
     /* regions: --region frame voxels (--frame-um, default the reference's native voxels) on a grid anchored at 0 */
     const double fum = opt_atof("--frame-um", fd_opt(argc, argv, "--frame-um", "0")) > 0 ? opt_atof("--frame-um", fd_opt(argc, argv, "--frame-um", "0")) : o.um;
