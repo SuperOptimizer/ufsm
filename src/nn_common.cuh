@@ -2249,9 +2249,9 @@ template <typename GT, typename LT> __device__ __forceinline__ GT loss_grad_v(co
 static inline dim3 lg_grid(size_t S, int NC) { return dim3((unsigned)((S + 256 * LG_V - 1) / (256 * LG_V)), (unsigned)NC); }
 template <typename GT, typename LT = float> __global__ void __launch_bounds__(256) loss_grad_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N,
                             int C, size_t S, const float *st, float dice_w, const float *fin, GT *gl, float pw, float gscale, int tol, const uint8_t *code, int D, int H,
-                            int W, float rec_w = 0.f, int unit_c = -1, const float *hp = nullptr) {   /* unit_c: the channel whose mask weight counts as 0 / 1 (nn_set_loss_unit_ch7); hp: GSHP */
+                            int W, float rec_w = 0.f, int unit_c = -1, const float *hp = nullptr, int gap_c = -1, int gap_t = 0) {   /* unit_c: the channel whose mask weight counts as 0 / 1 (nn_set_loss_unit_ch7); hp: GSHP; gap_c / gap_t: nn_set_loss_dgap */
     gscale = hgs_mul(gscale, hp);
-    const int nc = blockIdx.y, n = nc / C; const bool unit = nc % C == unit_c;
+    const int nc = blockIdx.y, n = nc / C; const bool unit = nc % C == unit_c, gap = nc % C == gap_c;
     const size_t v0 = (size_t)blockIdx.x * (256 * LG_V) + threadIdx.x, b0 = (size_t)nc * S;
     const bool on = w[nc] != 0;
     float x[LG_V]; unsigned tb[LG_V], mb[LG_V];
@@ -2259,7 +2259,7 @@ template <typename GT, typename LT = float> __global__ void __launch_bounds__(25
     for (int k = 0; k < LG_V; k++) {
         const size_t v = v0 + 256 * k;
         x[k] = 0.f; tb[k] = 0u; mb[k] = 0u;
-        if (v < S && on) { mb[k] = m[(size_t)n * S + v]; if (unit && mb[k]) mb[k] = 1u; if (mb[k]) { x[k] = lgv(lg, b0 + v); tb[k] = t[b0 + v]; } }
+        if (v < S && on) { mb[k] = m[(size_t)n * S + v]; if (unit && mb[k]) mb[k] = 1u; if (mb[k]) { x[k] = lgv(lg, b0 + v); tb[k] = t[b0 + v]; if (gap && (int)tb[k] >= gap_t) { mb[k] = 0u; tb[k] = 0u; x[k] = 0.f; } } }
     }
 #pragma unroll
     for (int k = 0; k < LG_V; k++) {

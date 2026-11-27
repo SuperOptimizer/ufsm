@@ -133,6 +133,72 @@ Overlap:
    - on the held ATLAS slab, the distance of B's predicted recto to the patches (atlas-audit with the predicted wraps as --ref).
 5. Gate: wbench p05x Δ ≥ -0.01 (CI) and the ATLAS-holdout distance improves. Otherwise ATLAS stays out.
 
+## Density uncertainty and the min-gap rule from upstream villa: opt-in train / predict / count-field paths (2026-11-27, branch densvar-20261127, densvar)
+
+This ports idea 2 of the villa scan (/vesuvius/ufsm/research/villa.md; upstream `winding_targets.density_loss`, `density_supervision_mask`).
+All of it is opt-in. With the flags off every path runs the same calls as before.
+
+- **`train --density-nll L`** (task unwrap2, head slabs): one more output channel, the density's learned log-variance s.
+  - Its logit is s, clamped to [-12, 6], with no gradient outside the clamp.
+  - The loss is the beta-NLL 0.5 (e^-s r^2 + s) x e^(beta s) (the last factor detached), with r = sigmoid(z_density) - t / 255 in the
+    density code space. The mean NLL over the supervised voxels is multiplied by L x the source's density weight.
+  - `--density-nll-beta` (0.5, upstream's value).
+  - `--density-nll-mean 1`: the density BCE gradient is also scaled per voxel by a / mean(a), a = e^-(1-beta) s (the beta-NLL attenuation,
+    renormalised over the window). The default 0 leaves the mean's BCE unchanged.
+  - The kernels are in src/nn_dvar.cu. The log line gets `dvnll` and the mean s; runtime json `density_nll` gives the channel.
+- **Checkpoint layout.** In a `--fib-head` net (w24) the channel takes the first pad slot (23), so the net keeps 32 outputs and w24
+  checkpoints load unchanged. Without pads it is appended last. It is not in the fine-stem list, so the stem's parameters keep their shape.
+- **`train --density-min-gap-um G`.** No density supervision (BCE and NLL) on voxels whose labelled spacing is under G um.
+  - Upstream's `density_min_gap_wv` is 4 voxels at 9.6 um = 38.4 um. In our code it drops the density targets whose code is >= the code
+    of spacing G at the window's voxel size: `nn_set_loss_dgap`, a thread-local hook in the slab stats / grad loss kernels for channel 6.
+  - It is the alternative to `--packed-weight 8`, so the A/B arm adds `--density-packed 0`; the normal planes keep the packed weight.
+- **Restrictions.** Both training flags need the unfused head chain: the fused latent kernel has no variance or gap terms. With them
+  g_lat_fuse is off and the trainer says so; the arithmetic is the same, only slower. No `--split`, `--single` or `--count-lambda`.
+- **`predict --fit-dv 1`** writes the fit-field plane `dv` = (mean s over the cell's material + 12) x 255 / 18.
+  - It uses the plane path, not the fused fit kernel (whose other planes are byte-identical, per test_fit_lat).
+  - No `--tta` and no `--fit-ct` with it.
+- **`count-field --dv-w K --dv-ref S`.** Every field load scales w by min(1, e^-K(s - S)), keeping w >= 1 on material, as `--mf-w` does.
+  In count-field the magnitude of w enters only the density evidence's weight (cf_pool c = w / 255 x ramps).
+- **test_dvar** (gpu) covers:
+  - the NLL sums against the host;
+  - the s gradient against the host formula and a central difference;
+  - the mean factors and their scaling;
+  - the gap hook: planes 0..5 bit-identical, plane 6 equal to the masked 1-plane loss, the off setting bit-identical to unset;
+  - the dv plane against the host pooled mean.
+
+Validation (pending):
+- Shared card-0 slot n2 with topoloss: arms from w24 snap/4000 to 5000, UFSM_LAT_FUSE=0: (A) control, (B) topo, (C) `--density-nll 1`,
+  (D) `--density-min-gap-um 38.4 --density-packed 0`.
+- Then wbench ids / ids0 / p05x of C and D against A, and count-field `--dv-w` on C's fields (seed models into the wbench fit).
+
+## Predict at WIN 1152 / 1280 on 16 GB: the per-chunk head under the fused fit kernel, one head buffer, the input in the net's scratch (2026-11-27, branch vram-20261127, vramperf)
+
+w24 (native 2.4 um, latent grid --lat 4, lat_guide 64, 160 head outputs) context test: WIN 1152 asked one 15.29 GB cudaMalloc. That was the
+whole window's fp32 cell logits (160 x 288^3 x 4 B). wbench's DLV -2 sets --fit-h 8, so predict took the fused fit kernel (nn_fit_accum_lat),
+and the per-chunk head (unet_head_fwd_z32, 11-17) was only wired into the plane path.
+
+| change | device GB at WIN 1152 | numbers |
+|---|---|---|
+| chunk head under the fused kernel: `nn_fit_accum_lat_planes(q0, qd, stride)` makes it read the held cell planes | 15.29 -> 2 x 1.38 | the head's bits (see below) |
+| one chunk-head buffer; the held overlap moves down plane by plane, ascending, stream-ordered | -1.38 | byte-identical |
+| the 32-channel cell input x2 in the net's a1 scratch (unet_input_scratch; only the input conversion reads it) | -1.53 | byte-identical |
+| next-window CT prefetch allocated at window 2, only with w3 + 0.5 GB free (else a DEFAULTED line, plain uploads) | -1.53 | byte-identical |
+| chunk head + winding-pair planes allocated before the first forward; `nn_ws_keep_free` (UFSM_PRED_WS_KEEP_MB, default 1024): the fp4 / s2 prenorm copies stop growing at 1 GB free | 1280 ran out after window 1 without it (the copy had taken 2.37 GB, 0 MB left) | smaller prenorm slabs: same bits |
+
+What remains at 1152: the net's build 8.8 GB (two level-0 tensors of 3.25 GB), CT window + its fstem copy (ctcp) 1.53 each, the chunk head 1.38,
+FiLM 0.42, prenorm ~1.1, mask 0.19. Free after window 1: 1.15 GB at 1152, 1.14 at 1280 (the 1280 build holds one 4.46 GB level-0 tensor).
+
+Gate (card 1, the 2000-step snapshot, 1667 level 0, a 1024^3 box at the C10 corner):
+- WIN 640 with UFSM_HEAD_TC_R=0 (the FFMA head, bit-equal to the whole-window head): the 13 field arrays are byte-identical to master (diff -r).
+- With the default TC head the fields differ slightly, as the plane path's have since the 11-17 head change: the first window's fp16 logits
+  are ~1 ulp off (max 0.006) at ~60 % of the voxels; pc mean 104.56 vs 104.59, Pearson 1.0000. Before this change, fit-h 8 ran the whole-window
+  FFMA head, so DLV -2 fields move by that much.
+- test_fit_lat: the held-planes case (planes [2, 24) at a padded channel stride) matches the whole-window kernel bit for bit at h 8 / 4 / 2,
+  with and without the stem and the sub-cell term.
+
+Time, 1024 x 2048^2 box, window seconds: master 640 18 s; branch 640 17, 1152 20, 1280 26. The box is small: at 1152 / 1280 the 4 windows
+mostly compute halo.
+
 ## Wrap-count (topology) loss `--topo-lambda` and the phase-near component filter (2026-11-27, branch topoloss-20261127, topoloss)
 
 **Why.** w24 puts confident extra sheets into packed 1667 boxes: at phase-near conf > 0.6, C10 pred → GT is 19.8 um vs 4.8 for try9, with
