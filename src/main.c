@@ -347,7 +347,7 @@ static int usage(void) {
         "  ufsm fiber-trace <root> <key-prefix> <out.fib> --box Z,Y,X,NZ,NY,NX [--scaledown 3]   streamlines through a published fibre prediction (presence, nx, ny) -> UFIB\n"
         "  ufsm fiber-raster <fibres.afv|.fib> OUT --um U (--shape Z,Y,X | --ct ROOT KEY)   H / V fibre mask labels (prob254) on the CT grid\n"
         "  ufsm fiber-onfly <fibres.afv|.fib> --ct ROOT KEY [--ref H V KEY]   the fibre planes on the fly (sources \"fibre\" targets): ms / window, diffs\n"
-        "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..] [--tile SZ,SY,SX --grids z,y,x:..] [--conf mean] [--paste F [--box z,y,x,nz,ny,nx]]  fit fields averaged (phase: confidence-weighted complex mean; --tile: overlapping predicts, centre-weighted)\n"
+        "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..] [--tile SZ,SY,SX --grids z,y,x:..] [--conf mean] [--paste F [--box z,y,x,nz,ny,nx]] [--plane-w GROUP=a,b,..:..]  fit fields averaged (phase: confidence-weighted complex mean; --tile: overlapping predicts, centre-weighted)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
         "  ufsm z3-diff <root-a> <key-a> <root-b> <key-b> [--box ..]   two uint8 arrays: differing voxels, |a-b| histogram, flips across 128\n"
@@ -3673,9 +3673,11 @@ static int cmd_surfsnap(int argc, char **argv) {
    per-cell weights sin^2 of the cell's place in its interior (fb_tile_w). --conf mean: the mean input confidence as the length;
    --conf medoid: the phase of the input closest to the others, unchanged (a median of 3+ models).
    --paste F [--box z,y,x,nz,ny,nx]: IN2.. are sub-box predicts pasted over IN1 with F-cell feathered faces (src/fblend.h); --box
-   writes only that part of IN1 (shard-aligned), for scripts/spiralqa/field_paste_link.sh to overlay on IN1's shards. */
+   writes only that part of IN1 (shard-aligned), for scripts/spiralqa/field_paste_link.sh to overlay on IN1's shards.
+   --plane-w GROUP=w1,w2,..[:GROUP=..] (field fusion): per plane group (phase normal sp w w4 r) its own input weights; weight 0 (there or
+   in --weights) leaves the input out of the plane. E.g. try9 + w24: --weights 1,0 --plane-w phase=0,1 (src/fblend.h). */
 static int cmd_field_blend(int argc, char **argv) {
-    const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr, *tile = nullptr, *grids = nullptr, *conf = "resultant", *paste = nullptr, *box = nullptr; int nt = ufsm_threads(0, 8);
+    const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr, *tile = nullptr, *grids = nullptr, *conf = "resultant", *paste = nullptr, *box = nullptr, *pws = nullptr; int nt = ufsm_threads(0, 8);
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], opt_n("--weights")) && i + 1 < argc) { ws = argv[++i]; continue; }
         if (!strcmp(argv[i], opt_n("--threads")) && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
@@ -3684,6 +3686,7 @@ static int cmd_field_blend(int argc, char **argv) {
         if (!strcmp(argv[i], opt_n("--conf")) && i + 1 < argc) { conf = argv[++i]; continue; }
         if (!strcmp(argv[i], opt_n("--paste")) && i + 1 < argc) { paste = argv[++i]; continue; }
         if (!strcmp(argv[i], opt_n("--box")) && i + 1 < argc) { box = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--plane-w")) && i + 1 < argc) { pws = argv[++i]; continue; }
         if (!strncmp(argv[i], "--", 2)) { fprintf(stderr, "field-blend: unknown option %s\n", argv[i]); return 2; }
         if (!out) out = argv[i]; else if (n < 32) in[n++] = argv[i]; else { fprintf(stderr, "field-blend: at most 32 inputs\n"); return 2; }
     }
@@ -3704,6 +3707,19 @@ static int cmd_field_blend(int argc, char **argv) {
         free(t);
         if (k != n) { fprintf(stderr, "field-blend: %d grids for %d inputs\n", k, n); return 2; }
         o.tile = 1;
+    }
+    if (pws) {   /* GROUP=w1,w2,..:GROUP=.. */
+        char *t = strdup(pws), *sv = nullptr;
+        for (char *q = strtok_r(t, ":", &sv); q; q = strtok_r(nullptr, ":", &sv)) {
+            char *eq = strchr(q, '='); if (eq) *eq = 0;
+            const int g = eq ? fb_group_id(q) : -1;
+            if (g < 0) { fprintf(stderr, "field-blend: --plane-w GROUP=w1,w2,..[:GROUP=..], GROUP phase|normal|sp|w|w4|r (got %s)\n", q); free(t); return 2; }
+            int k = 0; char *sv2 = nullptr;
+            for (char *v = strtok_r(eq + 1, ",", &sv2); v; v = strtok_r(nullptr, ",", &sv2)) { if (k < 32) o.pw[g][k] = (float)atof(v); k++; }
+            if (k != n) { fprintf(stderr, "field-blend: --plane-w %s: %d weights for %d inputs\n", q, k, n); free(t); return 2; }
+            o.pw_on[g] = 1;
+        }
+        free(t);
     }
     if (paste) { o.paste = 1; o.feather = atof(paste); if (!(o.feather >= 1) || tile || ws) { fprintf(stderr, "field-blend: --paste F (cells >= 1), without --tile / --weights\n"); return 2; } }
     if (box) {
