@@ -84,6 +84,28 @@ Per box (16 1667 boxes), Spearman of the dis share against 1 - wbench ids is 0.6
 
 Two 9.6 um nets with the same data share most of their errors. Disagreement is precise but finds only a tenth of the errors, and it does not rank regions. The 2.4 um net makes the committee useful: its errors are different. try9 vs wz on w4: precision 0.81 (lift 1.7), so w4 can carry signal between same-baseline nets.
 
+**Against a random choice at equal labelled volume** (lead, nnActive 2025; randbase.awk). Pick the top K % of the GT regions by dis share and count the GT-wrong cells found per region cell, against the mean over all regions (a uniform random pick of as many equal-volume regions):
+
+| committee | top 5 % | top 10 % | top 25 % | top 50 % |
+|---|---|---|---|---|
+| try9 vs w24 (pos + cnt) | 1.53x | 1.54x | 1.39x | 1.23x |
+| try9 + w24 + wz896 | 1.55x | 1.56x | 1.43x | 1.27x |
+| try9 vs wz896 | 1.29x | 1.21x | 1.08x | 1.04x |
+
+So the region-level gain is real but modest: about 1.5x random in the top tenth, against a cell-level lift of 5. Most wrong cells are spread through every region.
+
+**What disagreement cannot find** (GT-wrong cells where every model is wrong, as a share of all GT-wrong cells):
+
+| committee | share |
+|---|---|
+| try9 vs w24 | 28 % (4.4 of 15.7 %) |
+| try9 + w24 + wz896 | 19 % (3.1 of 16.2 %) |
+| try9 vs wz896 | 55 % (7.8 of 14.3 %) |
+
+The nets share training data. A random share of the labelling budget (e.g. 1 region in 4) keeps those shared errors reachable and gives the unbiased check.
+
+**Labelling format** (research/active.md idea 1, Gotkowski et al. 2025, arXiv 2403.12834): sparse traces trained with a partial-label loss (the loss only on annotated voxels) match dense labels in 3-D segmentation. So a worklist region needs a few traced sheets with their winding, not a dense label. Our on-the-fly labels from meshes already train only where the pair rule knows the phase.
+
 **Worklist** (/vesuvius/ufsm/disagree/worklist.tsv).
 - Candidate boxes (pick.awk): 2048^3 level-0 boxes richest in unlabelled tiles next to GT tiles (unrollperf/w11 tiles-*.txt).
 - Paris 4's frontier boxes were air: its GT covers its papyrus. Its boxes are therefore picked at gaps between GT tiles along an axis (pick2.awk GAP=3).
