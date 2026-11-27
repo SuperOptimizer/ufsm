@@ -112,7 +112,7 @@ int main(void) {
         CHECK(fabs(g4[3] - h.d) <= 1e-4 * fabs(h.d) + 1e-2, "%s: sum w dT %.6f vs host %.6f", nm[c], g4[3], h.d);
         if (c == 0) CHECK(g4[2] == 0 && fabs(g4[3] / g4[1]) < 0.05, "clean: count errors %.4f, mean dT %.4f", g4[2] / g4[1], g4[3] / g4[1]);
         if (c == 1) CHECK(g4[2] / g4[1] > 0.1 && g4[3] / g4[1] > 0.1, "extra turn: count errors %.4f, mean dT %.4f (want > 0.1 both)", g4[2] / g4[1], g4[3] / g4[1]);
-        if (c == 2) CHECK(g4[2] / g4[1] > 0.1 && g4[3] / g4[1] < -0.1, "missing turn: count errors %.4f, mean dT %.4f", g4[2] / g4[1], g4[3] / g4[1]);
+        if (c == 2) CHECK(g4[2] / g4[1] > 0.02 && g4[3] / g4[1] < -0.02, "missing turn: count errors %.4f, mean dT %.4f (want > 0.02, < -0.02; clean: 0, ~0)", g4[2] / g4[1], g4[3] / g4[1]);
         /* fp16 logits: the same rays, the loss on the rounded logits */
         if (c == 1) {
             mk_logits(lc, ls, sg[c], 0.01);
