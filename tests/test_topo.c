@@ -5,7 +5,7 @@
    (3) the lattice offsets 0 .. k^3 - 1 together take every ray of the k = 1 lattice exactly once;
    (4) the slab gradient against central differences of the host loss (fp32 logits);
    (5) what it measures: a prediction equal to the label up to noise has no count errors, one with an extra turn (an extra sheet) a mean
-       dT near +1 on the rays that cross it, one with a turn missing near -1;
+       dT of +1 on the rays that cross it whole, one with a turn missing (the phase standing still over a label turn) -0.95;
    (6) nn_pgrad_apply adds lambda / sums[1] times the gradient into fp16 logit gradients and zeroes the accumulator. */
 #include "nn.h"
 #include <math.h>
@@ -63,9 +63,10 @@ static tsum topo_host(const float *lc, const float *ls, const uint8_t *ph, const
 }
 /* the label: concentric sheets ~10 voxels apart around an axis outside the box (normals mostly in the plane, as in a scroll), a little z tilt */
 static double wt(int z, int y, int x) { const double r = sqrt((y + 30.0) * (y + 30.0) + (x - 20.0) * (x - 20.0)); return r / 10.0 + 0.02 * z; }
-static double bump(int z, int y, int x, double sgn) {   /* in the half y < 24 only, across a radius band: + one extra turn over ~6 voxels (smoothstep);
-                                                          - one turn removed over the 10 voxels of a label turn (linear: the phase stands still there, a missed sheet) */
-    (void)z; if (y >= 24 || sgn == 0) return 0; const double r = sqrt((y + 30.0) * (y + 30.0) + (x - 20.0) * (x - 20.0)), u = (r - 52.0) / (sgn > 0 ? 6.0 : 10.0);
+static double bump(int z, int y, int x, double sgn) {   /* on the side x >= 20 of a radial line (the rays run along it, not across), across the radius
+                                                          band from 40: + one extra turn over ~6 voxels (smoothstep); - one turn removed over the 10 voxels
+                                                          of a label turn (linear: the phase stands still there, a missed sheet) */
+    (void)z; if (x < 20 || sgn == 0) return 0; const double r = sqrt((y + 30.0) * (y + 30.0) + (x - 20.0) * (x - 20.0)), u = (r - 40.0) / (sgn > 0 ? 6.0 : 10.0);
     return u <= 0 ? 0 : u >= 1 ? sgn : sgn > 0 ? u * u * (3 - 2 * u) : -u;
 }
 /* logits of a phasor r e^{2 pi i v}: per channel the logit of (1 + component) / 2 */
@@ -76,6 +77,34 @@ static void mk_logits(float *lc, float *ls, double sgn, double noise) {
         const double pc = 0.5 + 0.5 * r * cos(2 * M_PI * v), ps = 0.5 + 0.5 * r * sin(2 * M_PI * v);
         lc[i] = (float)log(pc / (1 - pc)); ls[i] = (float)log(ps / (1 - ps));
     }
+}
+
+/* (5b) the rays that cross the whole defect band [r0, r1] (both ends on its side x >= 20, one end inside r0, the other beyond r1): their mean
+   dT should be the defect itself, +1 (extra turn) / -1 (missed turn) / 0 (clean); the window means above are diluted by the rays that miss it */
+static double cross_dT(const float *lc, const float *ls, const uint8_t *ph, const uint8_t *wm, int len, double r0, double r1, long *nr) {
+    const size_t HW = (size_t)H * Wd; const uint8_t *sp = ph + (size_t)Z0 * HW; double s = 0; *nr = 0;
+    for (int z = Z0; z < Z1; z++) for (int y = S; y < H - S; y++) for (int x = S; x < Wd - S; x++) {
+        if (z < S || z >= D - S) continue;
+        const size_t li = (size_t)(z - Z0) * HW + (size_t)y * Wd + x; if (!wm[li] || sp[li] >= 252) continue;
+        const size_t gi = (size_t)Z0 * HW + li;
+        const int a6[6] = {ph[gi + HW], ph[gi - HW], ph[gi + Wd], ph[gi - Wd], ph[gi + 1], ph[gi - 1]}; int ok = 1; for (int q = 0; q < 6; q++) ok &= a6[q] < 252; if (!ok) continue;
+        const int i0 = pdiff(a6[0], a6[1]), i1 = pdiff(a6[2], a6[3]), i2 = pdiff(a6[4], a6[5]); if (!i0 && !i1 && !i2) continue;
+        const float gn = sqrtf((float)(i0 * i0 + i1 * i1 + i2 * i2)), n[3] = {(float)i0 / gn, (float)i1 / gn, (float)i2 / gn};
+        int nb = 0, nf = 0;
+        for (int t = 1; t <= len; t++) { const long q = at(z, y, x, n, -t); if (q < 0 || !wm[q] || sp[q] >= 252) break; nb = t; }
+        for (int t = 1; t <= len; t++) { const long q = at(z, y, x, n, t); if (q < 0 || !wm[q] || sp[q] >= 252) break; nf = t; }
+        if (nb + nf < len) continue;
+        const long qa = at(z, y, x, n, -nb), qb = at(z, y, x, n, nf);
+        const int ya = (int)(qa / Wd % H), xa = (int)(qa % Wd), yb = (int)(qb / Wd % H), xb = (int)(qb % Wd);
+        double ra = sqrt((ya + 30.0) * (ya + 30.0) + (xa - 20.0) * (xa - 20.0)), rb = sqrt((yb + 30.0) * (yb + 30.0) + (xb - 20.0) * (xb - 20.0));
+        if (ra > rb) { const double t_ = ra; ra = rb; rb = t_; }
+        if (xa < 20 || xb < 20 || ra > r0 || rb < r1) continue;
+        int tg = 0, pv = sp[qa]; for (int t = -nb + 1; t <= nf; t++) { const int v = sp[at(z, y, x, n, t)]; tg += abs(pdiff(v, pv)); pv = v; }
+        double Tp = 0, ar = 2 * sig(lc[qa]) - 1, ai = 2 * sig(ls[qa]) - 1;
+        for (int t = -nb + 1; t <= nf; t++) { const long q = at(z, y, x, n, t); const double br = 2 * sig(lc[q]) - 1, bi = 2 * sig(ls[q]) - 1; Tp += fabs(atan2(ar * bi - ai * br, ar * br + ai * bi)); ar = br; ai = bi; }
+        s += Tp / (2 * M_PI) - tg / 252.0; (*nr)++;
+    }
+    return *nr ? s / *nr : NAN;
 }
 
 int main(void) {
@@ -106,13 +135,16 @@ int main(void) {
         printf("topo %-12s: %ld rays, sum w %.0f (host %.0f), loss %.5f (host %.5f), count errors %.4f (host %.4f), mean dT %+.4f (host %+.4f)\n",
                nm[c], h.nr, g4[1], h.w, g4[0] / g4[1], h.l / h.w, g4[2] / g4[1], h.e / h.w, g4[3] / g4[1], h.d / h.w);
         CHECK(h.nr > 2000, "%s: too few rays (%ld)", nm[c], h.nr);
+        { long nx; const double cx = cross_dT(lc, ls, ph, wm, len, 40, c == 1 ? 46 : 50, &nx);
+          printf("topo %-12s: %ld rays cross the whole band, mean dT %+.3f\n", nm[c], nx, cx);
+          CHECK(nx >= 1000 && (c == 0 ? fabs(cx) < 0.05 : c == 1 ? cx > 0.9 : cx < -0.9), "%s: the band-crossing rays' mean dT %+.3f (%ld rays; want 0 / > 0.9 / < -0.9)", nm[c], cx, nx); }
         CHECK(g4[1] == h.w, "%s: sum w %.1f vs host %.1f (the ray sets differ)", nm[c], g4[1], h.w);
         CHECK(fabs(g4[0] - h.l) <= 1e-4 * h.l + 1e-3, "%s: sum w loss %.6f vs host %.6f", nm[c], g4[0], h.l);
         CHECK(fabs(g4[2] - h.e) <= 8.5, "%s: count-error weight %.1f vs host %.1f", nm[c], g4[2], h.e);   /* (one ray at the 0.5 threshold may flip) */
         CHECK(fabs(g4[3] - h.d) <= 1e-4 * fabs(h.d) + 1e-2, "%s: sum w dT %.6f vs host %.6f", nm[c], g4[3], h.d);
         if (c == 0) CHECK(g4[2] == 0 && fabs(g4[3] / g4[1]) < 0.05, "clean: count errors %.4f, mean dT %.4f", g4[2] / g4[1], g4[3] / g4[1]);
         if (c == 1) CHECK(g4[2] / g4[1] > 0.1 && g4[3] / g4[1] > 0.1, "extra turn: count errors %.4f, mean dT %.4f (want > 0.1 both)", g4[2] / g4[1], g4[3] / g4[1]);
-        if (c == 2) CHECK(g4[2] / g4[1] > 0.02 && g4[3] / g4[1] < -0.02, "missing turn: count errors %.4f, mean dT %.4f (want > 0.02, < -0.02; clean: 0, ~0)", g4[2] / g4[1], g4[3] / g4[1]);
+        if (c == 2) CHECK(g4[2] / g4[1] > 0.1 && g4[3] / g4[1] < -0.1, "missing turn: count errors %.4f, mean dT %.4f (want > 0.1, < -0.1)", g4[2] / g4[1], g4[3] / g4[1]);
         /* fp16 logits: the same rays, the loss on the rounded logits */
         if (c == 1) {
             mk_logits(lc, ls, sg[c], 0.01);
