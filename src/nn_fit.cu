@@ -502,7 +502,7 @@ struct fl_args {
 };
 static float *g_fl_dbg;
 extern "C" void nn_fit_accum_lat_debug(float *planes) { g_fl_dbg = planes; }
-static int g_fl_q0, g_fl_qd; static size_t g_fl_cs;
+static thread_local int g_fl_q0, g_fl_qd; static thread_local size_t g_fl_cs;   /* (the calling thread's next calls: one predict thread per GPU) */
 extern "C" void nn_fit_accum_lat_planes(int q0, int qd, size_t cstride) { g_fl_q0 = q0; g_fl_qd = qd; g_fl_cs = cstride; }
 template <typename T>
 __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg, const float *__restrict__ sp, const uint8_t *__restrict__ ctx, const uint8_t *__restrict__ ct,
