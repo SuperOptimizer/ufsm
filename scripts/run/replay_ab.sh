@@ -25,7 +25,7 @@ S0=$(head -c 200000 "$W/start.ckpt" | head -1 | grep -o '"step":[0-9]*' | head -
 read -ra A <<< "$ARGS"; B=(); skip=0
 for a in "${A[@]}"; do
   [ $skip = 1 ] && { skip=0; continue; }
-  case $a in --out|--steps|--resume|--ckpt-every|--val-batches|--val-every|--lr|--muon-lr|--det|--warmup) skip=1; continue;; esac
+  case $a in --out|--steps|--resume|--ckpt-every|--val-batches|--val-every|--lr|--muon-lr|--det|--warmup|--log-every|--ckpt-ring) skip=1; continue;; esac   # (opt() takes the first: a run's --log-every 50 left 1 logged step in 20, w24 11-27)
   B+=("$a")
 done
 for v in old new; do
