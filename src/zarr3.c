@@ -64,8 +64,10 @@ struct z3 {
     struct ient_slot { char *key; ientry_t *idx; int present; } *itab;
     size_t icap, icount;
     /* z3_open_derived: values computed from base by derive (z3_read), the chunk map / box tests / shard presence from base */
+    /* (cover: one per extra phase set; was 4 until w24 2026-11-26, which capped an onfly "sets" spec at 5 sets though it takes 64:
+       PHerc0814's 15 gauge-free per-segment sets failed with "phase fuse: set 5 has another shape") */
     z3 *base; z3_derive_fn derive; void *dctx; void (*dfree)(void *);
-    z3 *cover[4]; int ncover; int bborrow;   /* z3_derived_borrow: z3_close leaves base open */
+    z3 *cover[Z3_MAX_COVER]; int ncover; int bborrow;   /* z3_derived_borrow: z3_close leaves base open */
     lv_codec *lv;   /* a latvol array's codec (latvol.bin beside zarr.json) */
     int (*xmap)(void *ctx, const int64_t grid[3], const int chunk[3], uint8_t *bits); void *xctx; uint8_t *xbits; int64_t xgrid[3]; int xstate;   /* z3_derived_extent */   /* z3_derived_cover: more arrays whose chunks the derived values reach (owned) */
 };
@@ -230,6 +232,7 @@ z3 *z3_open_derived(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*c
 z3 *z3_base_of(const z3 *z) { return z ? z->base : nullptr; }
 z3 *z3_derived_cover_at(const z3 *z, int k) { return z && z->derive && k >= 0 && k < z->ncover ? z->cover[k] : nullptr; }
 void *z3_derived_ctx(const z3 *z) { return z && z->derive ? z->dctx : nullptr; }
+z3_derive_fn z3_derived_fn(const z3 *z) { return z ? z->derive : nullptr; }
 void z3_derived_borrow(z3 *z) { if (z && z->derive) z->bborrow = 1; }
 int z3_derived_extent(z3 *z, int (*fn)(void *ctx, const int64_t grid[3], const int chunk[3], uint8_t *bits), void *ctx) {
     if (!z || !z->derive || !fn) return -1;
@@ -269,7 +272,7 @@ z3 *z3_open_derived_pool2(z3 *base, int fill, z3_derive_fn derive, void *ctx, vo
     return z;
 }
 int z3_derived_cover(z3 *z, z3 *cover) {
-    if (!z || !z->derive || !cover || z->ncover == 4) return -1;
+    if (!z || !z->derive || !cover || z->ncover == Z3_MAX_COVER) return -1;
     for (int d = 0; d < 3; d++) if (cover->m.shape[d] != z->m.shape[d]) return -1;
     z->cover[z->ncover++] = cover; return 0;
 }

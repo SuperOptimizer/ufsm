@@ -17,5 +17,9 @@ z3 *mesh_codes_open(const char *dir, const char *value, const char *map, int lev
    name, the map and its field>-L<level>"; the caller appends its own rule parameters (e.g. the pair radius). Lives as long as z. */
 const char *mesh_codes_key(const z3 *z);
 void mesh_codes_gpu_config(int dev);   /* the stamp on GPU dev (< 0: the CPU) for every mesh codes array of the process */
+/* the codes of the box o / n of a mesh codes array z stamped on the device straight into the box at dof (z, y, x) of the dn-shaped device
+   array dst on device ddev (the pair rule's tile; nothing copied down, w24 2026-11-27). 0 ok; 2 no mesh tile reaches the box (dst untouched);
+   -2 not a mesh codes array / the stamp not on that GPU (the caller reads on the host); -1 a failure */
+int mesh_codes_stamp_dev(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *dst, int ddev, const int dn[3], const int dof[3]);
 void mesh_codes_stats(uint64_t *gpu_reads, uint64_t *cpu_reads, uint64_t *gpu_fail, double *gpu_s, double *cpu_s);
 int cmd_codes_onfly(int argc, char **argv);   /* ufsm codes-onfly: the derived codes over windows, ms and byte diffs vs a stored raster */

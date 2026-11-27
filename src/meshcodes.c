@@ -203,7 +203,8 @@ void mesh_codes_stats(uint64_t *gpu_reads, uint64_t *cpu_reads, uint64_t *gpu_fa
     *gpu_reads = g_mcs.gpu_reads; *cpu_reads = g_mcs.cpu_reads; *gpu_fail = g_mcs.gpu_fail; *gpu_s = g_mcs.us_gpu * 1e-6; *cpu_s = g_mcs.us_cpu * 1e-6;
 }
 static thread_local struct { mcg_tile *t; size_t tc; float *xyz, *val; uint8_t *valid; size_t vc; } t_mg;
-static int mc_read_gpu(const mc_ctx *X, const int64_t o[3], const int64_t n[3], uint8_t *out) {
+/* the vertex blocks of the tiles that reach the box o / n into t_mg (*nt tiles, *nv vertices); 0 ok, -1 out of memory */
+static int mc_gather(const mc_ctx *X, const int64_t o[3], const int64_t n[3], size_t *ntp, size_t *nvp) {
     const double sc = X->scale, lo[3] = {(double)o[0] - 1, (double)o[1] - 1, (double)o[2] - 1}, hi[3] = {(double)(o[0] + n[0]), (double)(o[1] + n[1]), (double)(o[2] + n[2])};
     size_t nt = 0, nv = 0;
     for (size_t ti = 0; ti < X->nt; ti++) {   /* (mc_stamp's tile cull for the whole box; tiles keep their order) */
@@ -224,8 +225,12 @@ static int mc_read_gpu(const mc_ctx *X, const int64_t o[3], const int64_t n[3], 
             memcpy(t_mg.xyz + 3 * nv, m->xyz + 3 * s, (size_t)nc * 12); memcpy(t_mg.val + nv, m->val + s, (size_t)nc * 4); memcpy(t_mg.valid + nv, m->valid + s, (size_t)nc); nv += (size_t)nc; }
         if (nv > UINT32_MAX - 4096) return -1;
     }
+    *ntp = nt; *nvp = nv; return 0;
+}
+static int mc_read_gpu(const mc_ctx *X, const int64_t o[3], const int64_t n[3], uint8_t *out) {
+    size_t nt = 0, nv = 0; if (mc_gather(X, o, n, &nt, &nv)) return -1;
     if (!nt) { memset(out, 0, (size_t)n[0] * n[1] * n[2]); return 0; }
-    return mesh_codes_gpu_stamp(t_mg.t, (int)nt, t_mg.xyz, t_mg.val, t_mg.valid, nv, sc, o, n, out);
+    return mesh_codes_gpu_stamp(t_mg.t, (int)nt, t_mg.xyz, t_mg.val, t_mg.valid, nv, X->scale, o, n, out);
 }
 static int mc_read(void *vp, z3 *base, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     (void)base; const mc_ctx *X = vp; const double t0 = mc_now();
@@ -242,6 +247,15 @@ static int mc_read(void *vp, z3 *base, const int64_t o[3], const int64_t n[3], u
     for (int i = 1; i < T; i++) if (th[i]) pthread_join(th[i], nullptr);
     atomic_fetch_add(&g_mcs.cpu_reads, 1); atomic_fetch_add(&g_mcs.us_cpu, (uint64_t)(1e6 * (mc_now() - t0)));
     return 0;
+}
+int mesh_codes_stamp_dev(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *dst, int ddev, const int dn[3], const int dof[3]) {
+    if (z3_derived_fn(z) != mc_read || !mc_gpu_on() || !mesh_codes_gpu_stamp_into) return -2;
+    const mc_ctx *X = z3_derived_ctx(z); const double t0 = mc_now();
+    size_t nt = 0, nv = 0; if (mc_gather(X, o, n, &nt, &nv)) return -1;
+    if (!nt) return 2;
+    const int r = mesh_codes_gpu_stamp_into(t_mg.t, (int)nt, t_mg.xyz, t_mg.val, t_mg.valid, nv, X->scale, o, n, dst, ddev, dn, dof);
+    if (!r) { atomic_fetch_add(&g_mcs.gpu_reads, 1); atomic_fetch_add(&g_mcs.us_gpu, (uint64_t)(1e6 * (mc_now() - t0))); }
+    return r;
 }
 static int mc_extent(void *vp, const int64_t grid[3], const int chunk[3], uint8_t *bits) {
     const mc_ctx *X = vp;

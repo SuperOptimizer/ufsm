@@ -19,12 +19,16 @@ cat > mesh.json <<J
 {"sources": [{"name": "mesh", "root": "$P", "ct": "ct", "um": 2.4, "targets": {"band": {"phase": {"level": 0,
   "onfly": {"meshes": {"dir": "$P/m", "value": "q.tif"}, "rmax": 12, "cache_dir": "$P/dc"}}}}}]}
 J
+cat > meshnc.json <<J
+{"sources": [{"name": "meshnc", "root": "$P", "ct": "ct", "um": 2.4, "targets": {"band": {"phase": {"level": 0,
+  "onfly": {"meshes": {"dir": "$P/m", "value": "q.tif"}, "rmax": 12, "cache": 0}}}}}]}
+J
 cat > st0.json <<J
 {"sources": [{"name": "st0", "root": "$P", "ct": "ct", "um": 2.4, "targets": {"band": {"phase": {"level": 0, "onfly": {"root": "$P/st0", "key": "2.4", "rmax": 12}}}}}]}
 J
 cat > st1.json <<J
 {"sources": [{"name": "st1", "root": "$P", "ct": "ct", "um": 2.4, "targets": {"band": {"phase": {"level": 1, "onfly": {"root": "$P/st1", "key": "4.8", "rmax": 6}}}}}]}
 J
-UFSM_MESHCODES_CACHE="$P/mc" "$T" mesh.json st0.json st1.json > t.log 2>&1 || { echo "FAIL: test_mesh_phase ($D/t.log)"; tail -6 t.log; exit 1; }
-grep -E 'differ|dcache' t.log
+UFSM_MESHCODES_CACHE="$P/mc" "$T" mesh.json st0.json st1.json meshnc.json > t.log 2>&1 || { echo "FAIL: test_mesh_phase ($D/t.log)"; tail -6 t.log; exit 1; }
+grep -E 'differ|dcache|gpu:|GPU leg' t.log
 echo "test_mesh_phase: OK"

@@ -5,6 +5,8 @@
    UFSM_STRICT_MATH; within cmp's bound under fast math), over windows not
    aligned to the cache cells; a second load of MESH.json reads them back from the disk cache (no recompute) with the same bytes. */
 #include "band.h"
+#include "band_onfly.h"
+#include "nn.h"
 #include "dcache.h"
 #include "fm_tol.h"
 #include "sources.h"
@@ -35,7 +37,7 @@ static int cmp(z3 *a, z3 *b, const char *what, size_t *known) {
     return bad;
 }
 int main(int argc, char **argv) {
-    if (argc != 4) { fprintf(stderr, "usage: test_mesh_phase MESH.json STORED.json STORED1.json\n"); return 2; }
+    if (argc != 4 && argc != 5) { fprintf(stderr, "usage: test_mesh_phase MESH.json STORED.json STORED1.json [MESH_NOCACHE.json]\n"); return 2; }
     store_global_init();
     sources *M = sources_load(argv[1]), *S0 = sources_load(argv[2]), *S1 = sources_load(argv[3]);
     if (!M || !S0 || !S1) { fprintf(stderr, "FAIL: sources_load\n"); return 1; }
@@ -51,6 +53,19 @@ int main(int argc, char **argv) {
     fprintf(stderr, "dcache: first load %llu cells computed, second load %llu more computed, %llu from disk\n", (unsigned long long)a.cells_computed,
             (unsigned long long)(b.cells_computed - a.cells_computed), (unsigned long long)(b.cells_disk - a.cells_disk));
     if (!a.cells_computed || b.cells_computed != a.cells_computed || b.cells_disk == a.cells_disk) { fprintf(stderr, "FAIL: the second load did not read the disk cache\n"); fails++; }
+    /* the GPU pair rule on the meshes' (derived) codes (band_onfly.c tile_gpu_derived, w24 2026-11-26: these tiles used to fall to the CPU):
+       the same phase as the stored codes' at both levels, every computed tile on the GPU. Skipped without a GPU. */
+    if (argc == 5 && nn_device_count() > 0) {
+        if (phase_onfly_config(0, 2, 64, 0)) { fprintf(stderr, "FAIL: phase_onfly_config on GPU 0\n"); fails++; }
+        phase_onfly_stats g0; phase_onfly_get_stats(&g0);
+        sources *MG = sources_load(argv[4]); size_t kg = 0;
+        fails += !MG || cmp(MG->src[0].phase, S0->src[0].phase, "level 0 on the GPU: meshes vs stored codes", &kg);
+        fails += !MG || !MG->src[0].phase_pl[1] || cmp(MG->src[0].phase_pl[1], S1->src[0].phase, "level 1 on the GPU", nullptr);
+        phase_onfly_stats g1; phase_onfly_get_stats(&g1);
+        fprintf(stderr, "gpu: %llu tiles computed, %llu on the GPU\n", (unsigned long long)(g1.tiles - g0.tiles), (unsigned long long)(g1.gpu_tiles - g0.gpu_tiles));
+        if (!kg || g1.tiles == g0.tiles || g1.gpu_tiles - g0.gpu_tiles != g1.tiles - g0.tiles) { fprintf(stderr, "FAIL: the meshes' tiles did not all run on the GPU\n"); fails++; }
+        sources_free(MG);
+    } else if (argc == 5) fprintf(stderr, "test_mesh_phase: no GPU, the GPU leg skipped\n");
     sources_free(M); sources_free(M2); sources_free(S0); sources_free(S1);
     fprintf(stderr, "%s\n", fails ? "test_mesh_phase: FAILED" : "test_mesh_phase: ok");
     return fails != 0;

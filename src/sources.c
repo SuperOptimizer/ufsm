@@ -200,6 +200,8 @@ static z3 *onfly_codes_open(const source *s, const json *e, const json *of, int 
         const char *md = json_str(json_get(mj, "dir"), nullptr), *mv = json_str(json_get(mj, "value"), "q.tif"), *mm = json_str(json_get(mj, "map"), nullptr);
         int lv = (int)json_num(json_get(mj, "level"), plev) + extra, pool = 0;
         z3 *ct = md && lv >= 0 && lv < MAXLEV && s->s ? pyramid_open_level(s->s, s->ct_key, lv, s->um, g_cache) : nullptr;
+        /* (the CT level only gives the codes' grid: a level only the "ct_mirror" holds, e.g. level 0 of a 2.4 um scan kept on the NAS, w24 2026-11-26) */
+        if (!ct && md && lv >= 0 && lv < MAXLEV && s->ct_ms) ct = pyramid_open_level(s->ct_ms, s->ct_mkey, lv, s->um, g_cache);
         if (!ct && extra > 0 && md && s->s && (ct = pyramid_open_level(s->s, s->ct_key, lv - extra, s->um, g_cache))) { lv -= extra; pool = extra; }   /* (no CT level there: the level's codes pooled) */
         cz = ct && mesh_codes_open ? mesh_codes_open(md, mv, mm, lv, ct, 0) : nullptr;
         if (ct && !mesh_codes_open) z3_close(ct);
