@@ -6,6 +6,7 @@
 #include "meshcodesgpu.h"
 #include <cuda_runtime.h>
 #include <stdio.h>
+#include <pthread.h>
 #include <stdlib.h>
 
 #define MG_CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "mesh codes gpu: %s (%s:%d)\n", cudaGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
@@ -81,16 +82,11 @@ static int mg_grow(mgctx *x, int i, size_t n) {
 }
 extern "C" void mesh_codes_gpu_device(int dev) { g_dev = dev; }
 /* out (host) or, with dst (device, on device ddev), straight into the box at dof of a dn array there (no copy down; w24 2026-11-27) */
-static int mg_stamp(const mcg_tile *t, int nt, const float *xyz, const float *val, const uint8_t *valid, size_t nv, double sc,
-                    const int64_t o[3], const int64_t n[3], uint8_t *out, uint8_t *dst, int ddev, const int dn[3], const int dof[3]) {
-    if (nt <= 0 || nt >= (1 << 22) || !nv) return 2;
-    if (dst && ddev != g_dev) return -2;
-    mgctx *x = t_mg;
-    if (!x) { x = t_mg = (mgctx *)calloc(1, sizeof *x); if (!x) return -1; x->dev = -1; }
+static int mg_stamp(mgctx *x, size_t kmb, const mcg_tile *t, int nt, const float *xyz, const float *val, const uint8_t *valid, size_t nv, double sc,
+                    const int64_t o[3], const int64_t n[3], uint8_t *out, uint8_t *dst, const int dn[3], const int dof[3]) {
     if (x->dev != g_dev) { MG_CK(cudaSetDevice(g_dev)); if (x->st) cudaStreamDestroy(x->st); MG_CK(cudaStreamCreateWithFlags(&x->st, cudaStreamNonBlocking)); x->dev = g_dev; }
     MG_CK(cudaSetDevice(x->dev));
-    /* the slab: the keys of up to $UFSM_MESHCODES_GPU_MB (256) MB of voxels (8 bytes each), whole z planes */
-    static size_t kmb = 0; if (!kmb) { const char *e = getenv("UFSM_MESHCODES_GPU_MB"); kmb = e && atoi(e) > 0 ? (size_t)atoi(e) : 256; }
+    /* the slab: the keys of up to kmb MB of voxels (8 bytes each), whole z planes; every slab walks all the read's tiles */
     const size_t plane = (size_t)n[1] * n[2]; long long S = (long long)((kmb << 20) / 8 / (plane ? plane : 1)); if (S < 1) S = 1;
     if (S > n[0]) S = n[0];
     if (mg_grow(x, MB_T, (size_t)nt * sizeof *t) || mg_grow(x, MB_XYZ, nv * 12) || mg_grow(x, MB_VAL, nv * 4) || mg_grow(x, MB_VALID, nv) ||
@@ -117,11 +113,32 @@ static int mg_stamp(const mcg_tile *t, int nt, const float *xyz, const float *va
     MG_CK(cudaStreamSynchronize(x->st));
     return 0;
 }
+static size_t env_mb(const char *k, size_t d) { const char *e = getenv(k); return e && atoi(e) > 0 ? (size_t)atoi(e) : d; }
 extern "C" int mesh_codes_gpu_stamp(const mcg_tile *t, int nt, const float *xyz, const float *val, const uint8_t *valid, size_t nv, double sc,
                                     const int64_t o[3], const int64_t n[3], uint8_t *out) {
-    return mg_stamp(t, nt, xyz, val, valid, nv, sc, o, n, out, nullptr, 0, nullptr, nullptr);
+    if (nt <= 0 || nt >= (1 << 22) || !nv) return 2;
+    mgctx *x = t_mg;   /* (per calling thread: the host-path reads of every sampler worker; $UFSM_MESHCODES_GPU_MB, 256, of keys each) */
+    if (!x) { x = t_mg = (mgctx *)calloc(1, sizeof *x); if (!x) return -1; x->dev = -1; }
+    static size_t kmb = 0; if (!kmb) kmb = env_mb("UFSM_MESHCODES_GPU_MB", 256);
+    return mg_stamp(x, kmb, t, nt, xyz, val, valid, nv, sc, o, n, out, nullptr, nullptr, nullptr);
 }
+/* the into-path's contexts: a small shared pool, not one per thread (it runs inside the pair rule's slots, at most their count at once), so
+   its slab keys can be large: $UFSM_MESHCODES_INTO_MB (512) MB each. At 64 MB a 580^3 tile took ~25 slabs, each walking every mesh tile:
+   the stamp was ~480 of a tile's ~620 GPU ms at rmax 160 (w24 2026-11-27) */
+enum { MG_POOL = 4 };
+static mgctx g_pool[MG_POOL]; static int g_pool_busy[MG_POOL], g_pool_init;
+static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pool_cv = PTHREAD_COND_INITIALIZER;
 extern "C" int mesh_codes_gpu_stamp_into(const mcg_tile *t, int nt, const float *xyz, const float *val, const uint8_t *valid, size_t nv, double sc,
                                          const int64_t o[3], const int64_t n[3], uint8_t *dst, int ddev, const int dn[3], const int dof[3]) {
-    return mg_stamp(t, nt, xyz, val, valid, nv, sc, o, n, nullptr, dst, ddev, dn, dof);
+    if (nt <= 0 || nt >= (1 << 22) || !nv) return 2;
+    if (ddev != g_dev) return -2;
+    static size_t kmb = 0; if (!kmb) kmb = env_mb("UFSM_MESHCODES_INTO_MB", 512);
+    int k = -1;
+    pthread_mutex_lock(&g_pool_mu);
+    if (!g_pool_init) { for (int i = 0; i < MG_POOL; i++) g_pool[i].dev = -1; g_pool_init = 1; }
+    for (;;) { for (int i = 0; i < MG_POOL; i++) if (!g_pool_busy[i]) { k = i; break; } if (k >= 0) break; pthread_cond_wait(&g_pool_cv, &g_pool_mu); }
+    g_pool_busy[k] = 1; pthread_mutex_unlock(&g_pool_mu);
+    const int r = mg_stamp(&g_pool[k], kmb, t, nt, xyz, val, valid, nv, sc, o, n, nullptr, dst, dn, dof);
+    pthread_mutex_lock(&g_pool_mu); g_pool_busy[k] = 0; pthread_cond_signal(&g_pool_cv); pthread_mutex_unlock(&g_pool_mu);
+    return r;
 }
