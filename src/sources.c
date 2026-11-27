@@ -680,6 +680,12 @@ static sources *sources_load_(const char *path) {
             s->emb_name = strdup(json_str(json_get(ej, "name"), "pca64")); s->emb_level = (int)json_num(json_get(ej, "level"), -1);
             if (!s->nemb || s->emb_level < 0) { fprintf(stderr, "sources: %s: \"emb\" needs \"groups\": [DIR, ...] and \"level\" >= 0\n", s->name); json_free(j); sources_free(S); return nullptr; }
         }
+        const json *cj = json_get(e, "cond");   /* {"fields": [DIR, ...]}: train --cond-fields conditioning planes (sample_cond.h) */
+        if (cj) {
+            const json *fj = json_get(cj, "fields");
+            if (fj && fj->type == J_ARR) for (size_t k = 0; k < fj->n && s->ncond < 16; k++) { const char *g = json_str(json_at(fj, k), nullptr); if (g) s->cond_dir[s->ncond++] = strdup(g); }
+            if (!s->ncond) { fprintf(stderr, "sources: %s: \"cond\" needs \"fields\": [DIR, ...]\n", s->name); json_free(j); sources_free(S); return nullptr; }
+        }
         const json *ho = json_get(e, "holdout"); int hbad = 0;
         if (ho && ho->type == J_ARR && ho->n == 6 && json_at(ho, 0)->type != J_ARR) hbad = src_add_hold(s, ho, 0, 0);
         else if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n && !hbad; k++) hbad = src_add_hold(s, json_at(ho, k), 0, 0);
@@ -764,6 +770,7 @@ void sources_free(sources *S) {
         free(s->lv_key); if (s->lv_s) store_close(s->lv_s);
         for (int k = 0; k < s->nxs; k++) free(s->xs_map[k]);
         for (int k = 0; k < s->nemb; k++) free(s->emb_grp[k]);
+        for (int k = 0; k < s->ncond; k++) free(s->cond_dir[k]);
         free(s->emb_name);
         store_close(s->s);
     }

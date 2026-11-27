@@ -180,6 +180,7 @@ static int usage(void) {
         "  ufsm ink-seam <zarr> --um U [--period 512] [--offset 0] [--n 24]   window-seam jump of a uint8 predict (border vs interior |dv|)\n"
         "  ufsm ingest-zip <labels.zip> <zarr-name> <out-dir> --um U  label zarr from the HF archive -> volcomp pyramid\n"
         "  ufsm raster <out-dir> --shape Z,Y,X --um U [--level L] [--T 3] <mesh.sfc|tifxyz>...  meshes -> label pyramid\n"
+        "  ufsm occ-tiles <sources.json> <out-prefix> [--level 2] [--tile 512] [--margin 64]   per source the tiles near its labelled cells (predict --tile-list)\n"
         "  ufsm mesh-tiles OUT.txt --level L --tile T [--dilate D] [--shape Z,Y,X] <tifxyz|.sfc>...   the tiles meshes touch (predict --tile-list)\n"
         "  ufsm ingest-kaggle <hf-root> <out-dir> [--n N]          Kaggle cubes -> volcomp images + labels\n"
         "  ufsm ingest-mesh <root> <tifxyz-key> <out.sfc>           tifxyz -> surfcomp\n"
@@ -3666,6 +3667,41 @@ static int cmd_surfsnap(int argc, char **argv) {
     return nw ? 0 : 1;
 }
 
+/* ufsm occ-tiles <sources.json> <out-prefix> [--level 2] [--tile 512] [--margin 64] (2026-11-27, condnet): per source the predict --tile-list
+   (OUT-PREFIX.<name>.txt, "iz iy ix" tiles of --tile level-L voxels from 0) of every tile within --margin level-L voxels of a labelled cell of
+   the sampler's occupancy index (the cells windows are drawn around): which tiles a stored conditioning field (try9 fit fields for train
+   --cond-fields) must cover. Prints the tiles and their level-L voxels per source. */
+static int cmd_occ_tiles(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm occ-tiles <sources.json> <out-prefix> [--level 2] [--tile 512] [--margin 64]\n"); return 2; }
+    const int L = opt_atoi("--level", opt(argc, argv, "--level", "2")), T = opt_atoi("--tile", opt(argc, argv, "--tile", "512")), M = opt_atoi("--margin", opt(argc, argv, "--margin", "64"));
+    if (L < 0 || T < 1 || M < 0) { fprintf(stderr, "occ-tiles: --level >= 0, --tile >= 1, --margin >= 0\n"); return 2; }
+    sources *S = sources_load(argv[2]); if (!S) return 1;
+    int rc = 0; double all = 0;
+    for (int i = 0; i < S->n; i++) {
+        source *s = &S->src[i]; occ_index o = source_occupancy(s);
+        if (!o.n) { fprintf(stderr, "occ-tiles: %s: no occupancy index, skipped\n", s->name); continue; }
+        const double f = ldexp(1.0, o.lev - L);   /* level-L voxels per occupancy cell */
+        int64_t nt[3]; for (int d = 0; d < 3; d++) nt[d] = (int64_t)ceil(o.shape[d] * f / T) + 1;
+        const size_t ntot = (size_t)nt[0] * nt[1] * nt[2]; uint8_t *mk = calloc(ntot, 1); if (!mk) { rc = 1; break; }
+        for (size_t k = 0; k < o.n; k++) {
+            const uint32_t id = o.idx[k]; const int64_t c[3] = {(int64_t)(id / (o.shape[1] * o.shape[2])), (int64_t)((id / o.shape[2]) % o.shape[1]), (int64_t)(id % o.shape[2])};
+            int64_t lo[3], hi[3];
+            for (int d = 0; d < 3; d++) {
+                const double a = c[d] * f - M, b = (c[d] + 1) * f + M - 1;
+                lo[d] = a < 0 ? 0 : (int64_t)floor(a / T); hi[d] = (int64_t)floor(b / T); if (hi[d] >= nt[d]) hi[d] = nt[d] - 1;
+            }
+            for (int64_t z = lo[0]; z <= hi[0]; z++) for (int64_t y = lo[1]; y <= hi[1]; y++) for (int64_t x = lo[2]; x <= hi[2]; x++) mk[((size_t)z * nt[1] + y) * nt[2] + x] = 1;
+        }
+        char fn[2048]; snprintf(fn, sizeof fn, "%s.%s.txt", argv[3], s->name); FILE *fo = fopen(fn, "w");
+        if (!fo) { fprintf(stderr, "occ-tiles: cannot write %s\n", fn); free(mk); rc = 1; break; }
+        size_t n = 0; for (size_t q = 0; q < ntot; q++) if (mk[q]) { fprintf(fo, "%zu %zu %zu\n", q / ((size_t)nt[1] * nt[2]), q / (size_t)nt[2] % (size_t)nt[1], q % (size_t)nt[2]); n++; }
+        fclose(fo); free(mk);
+        const double gv = (double)n * T * T * T / 1e9; all += gv;
+        printf("occ-tiles: %s: %zu labelled cells (level %d) -> %zu tiles of %d^3 at level %d (margin %d): %.1f Gvox -> %s\n", s->name, o.n, o.lev, n, T, L, M, gv, fn);
+    }
+    printf("occ-tiles: %.1f Gvox at level %d over all sources (shared scans counted per source)\n", all, L);
+    sources_free(S); return rc;
+}
 /* ufsm field-blend OUT IN1 IN2 ... [--weights a,b,...] [--tile SZ,SY,SX --grids z,y,x:z,y,x:...] [--conf resultant|mean|medoid] [--threads N]:
    fit-field sets of several models on one grid blended into OUT (src/fblend.h: the phase as the confidence-weighted complex mean,
    its length the new confidence). --tile: the inputs are overlapping predicts of one model on tile interiors of SZ x SY x SX level
@@ -5014,6 +5050,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "ingest-zip")) return cmd_ingest_zip(argc, argv);
     if (!strcmp(cmd, "raster")) return cmd_raster(argc, argv);
     if (!strcmp(cmd, "mesh-tiles")) return cmd_mesh_tiles(argc, argv);
+    if (!strcmp(cmd, "occ-tiles")) return cmd_occ_tiles(argc, argv);
     if (!strcmp(cmd, "train")) return cmd_train(argc, argv);
     if (!strcmp(cmd, "predict")) return cmd_predict(argc, argv);
     if (!strcmp(cmd, "eval")) return cmd_eval(argc, argv);

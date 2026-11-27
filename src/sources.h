@@ -178,6 +178,8 @@ typedef struct {
     int nemb, emb_level; char *emb_grp[8], *emb_name;   /* optional "emb": {"groups": [DIR, ...] (<= 8), "name": "pca64", "level": L}: unit-vector feature
                                targets (dinovol-embed / emb-pca zarr groups in global cells of this scan; the embedding voxel = a level-L voxel) for
                                train --distill (sample_cfg.emb_ch); where several groups cover a cell the first with a vector wins */
+    int ncond; char *cond_dir[16];   /* optional "cond": {"fields": [DIR, ...] (<= 16)}: fit-field sets (predict --fit-zarr: fields.json + zarr planes; another
+                               model's, e.g. try9's) on this scan, the conditioning input of train --cond-fields (src/sample_cond.h); the first set holding a cell wins */
     unsigned long long aux_dflt;   /* sample.c aux_read: DEFAULTED printed once per (target channel, level): bit ch * MAXLEV + l (atomic builtins) */
     unsigned long long mil_n[7];   /* sample.c --ink-mil windows of this source: [0] with rays, [1..6] without (level, crushed, torn, delam, curved,
                                       no ray table) (atomic builtins; the DEFAULTED summary) */

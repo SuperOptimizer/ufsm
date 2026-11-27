@@ -23,6 +23,7 @@ _Static_assert(PHASE_PERIOD == 252, "draw_ counts known phase as (b & 0xfc) != 0
 #include "view.h"
 #include "scrollaug.h"
 #include "sample_emb.h"
+#include "sample_cond.h"
 #include "nn_latvol.h"
 /* (latvol_read.c: weak, so binaries without it link; --lat-direct-p then draws no direct window) */
 [[gnu::weak]] int lv_read_box(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *buf, size_t cap, lv_chunk_ref *refs, int maxref, size_t *bytes, int nthreads);
@@ -416,11 +417,12 @@ static batch alloc_batch(const sample_cfg *c, uint8_t *c255, int bank_own) {   /
         || (c->w4_runs && !b.w4r) || (c->ink_bits && !b.ink_it) || (c->ink_mil && (!b.mil || !b.nmil || !b.mil0 || !b.nmil0))) {
         fprintf(stderr, "sampler: out of host memory (batch slot records)\n"); abort(); }   /* (audit mini/alloc #8) */
 #undef RHALLOC
+    b.cnd = c->cnd_div ? halloc((size_t)c->B * COND_K * (size_t)(PZ(c) / c->cnd_div) * (c->P / c->cnd_div) * (c->P / c->cnd_div)) : nullptr;
     b.emb = c->emb_ch ? halloc((size_t)c->B * c->emb_ch * (size_t)(PZ(c) / c->emb_div) * (c->P / c->emb_div) * (c->P / c->emb_div)) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b, int B) { free(b->latd); free(b->lvc); free(b->lvr); free(b->nlvr); free(b->lvn); free(b->lvz); if (b->nbank) { b->side = b->w4 = b->wcomp = b->ink = nullptr; for (int j = 0; j < 4; j++) b->aux[j] = nullptr; for (int q = 0; q < b->nbank; q++) hfree(b->bank[q]); b->nbank = 0; } if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->auxc) hfree(b->auxc); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b, int B) { free(b->latd); free(b->lvc); free(b->lvr); free(b->nlvr); free(b->lvn); free(b->lvz); if (b->nbank) { b->side = b->w4 = b->wcomp = b->ink = nullptr; for (int j = 0; j < 4; j++) b->aux[j] = nullptr; for (int q = 0; q < b->nbank; q++) hfree(b->bank[q]); b->nbank = 0; } if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->auxc) hfree(b->auxc); if (b->emb) hfree(b->emb); if (b->cnd) hfree(b->cnd); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -3710,6 +3712,13 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         else if (sample_emb_window(s, c->emb_ch, c->emb_div, l, o, Pz, P, y.perm, y.flip, &spatial, eo)) return -1;
         else if (embp2) { size_t kept = 0; const size_t cl = sample_emb_papyrus(c->emb_ch, c->emb_div, Pz, P, y.perm, y.flip, &spatial, embp2, c->emb_pap, eo, &kept);
             atomic_fetch_add(&g_emb_pap_cleared, cl); atomic_fetch_add(&g_emb_pap_kept, kept); }
+    }
+    if (c->cnd_div) {   /* train --cond-fields: the conditioning planes through the same symmetry and warp; dropped windows keep none */
+        const size_t gc = (size_t)(Pz / c->cnd_div) * (P / c->cnd_div) * (P / c->cnd_div);
+        int8_t *co = b->cnd + (size_t)i * COND_K * gc;
+        const int drop = runif(r) < c->cnd_drop;
+        if (drop || crushed || torn || delam || curved) memset(co, 0, gc * COND_K);
+        else if (sample_cond_window(s, c->cnd_div, l, o, Pz, P, y.perm, y.flip, &spatial, co)) return -1;
     }
     if (embp2) tp_put(embp2, p3 / 8);
     PROF_MARK(PS_AUGMENT);
