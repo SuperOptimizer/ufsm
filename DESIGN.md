@@ -65,8 +65,18 @@ Everything stays local: the clone and runs are in /vesuvius/ufsm/upspiral, nothi
   both directions), so 13.7 ms/step (c2) stands.
 - **800-slice band** (z 8500-9300, ACW, 30k steps, c2 + cache miss + first compile): 1488 s wall, ~44.6 ms/step, peak GPU memory 2.5 GB.
   - A new band end to end: track extraction 131 s + ingest 294 s + fit 1488 s ≈ 32 min (ingest alone was 37 min before).
-- **Not done:** the whole-step CUDA graph is held for the user. It needs the native CPU track-crossing sampler (.item / nonzero /
-  repeat_interleave per step) drawn off-graph into padded static buffers.
+- **Whole-step CUDA graph: built, accurate, parked (lead's stop rule: not ≥ 10 % faster than cp).** On local branch fast-20261126:
+  - **Stage 1** (FIT_SPIRAL_GRAPH_SAFE): eager pre-step (all draws, theta refresh, padded track buffers) + sync-free core; CPU
+    meshes byte-identical.
+  - **Stage 2** (FIT_SPIRAL_CUDA_GRAPH): the core captured once (fwd, every family backward, fused capturable AdamW). First replay vs
+    eager core: loss 0, grads ≤ 1.4e-5.
+  - **Stage 3:** next step's host samples drawn during replay; CUDA draws in the core.
+  - **Same-slot ABAB** (3000 steps, z 8800-9000): cp (c2 + prefetch) 14.8 / 14.4 ms/step vs graph 21.6 / 21.7. Pre-step host time
+    is down to ~1 ms, but the replay itself costs 19.9 ms of GPU time per step, more than cp's whole eager step. The graph-safe core
+    does more GPU work (tracks padded ~34 %, static-buffer plumbing). The next lever would be an nsys look at the replay's kernels.
+  - **Same-seed noise floor:** 6 eager runs, 15 pairs: loss rel 0.027 / 0.049 (median / max), mesh mean 4.8 / 7.1, p95 14.6 / 21.8 vox.
+    Graph-safe and graph arms with the upstream draw order are inside it. Prefetch / overlap change the RNG stream: cp and g7 are
+    outside the same-seed floor (loss 0.06-0.15), so judging them needs a different-seed floor. The accepted speedup is c2.
 
 ## predict --seamless 2: the offset-256 "seams" were pass b alone beyond the box / tile list; the blend now keeps the region (2026-11-26, perf)
 
