@@ -28,3 +28,22 @@ extern "C" int nn_devmath_probe(const double *x, int n, double *out) {
     cudaFree(dx); cudaFree(d);
     return (int)e;
 }
+
+/* a kernel calling a device function nothing defines must stop the program at its launch (mcudahw's load_fatal, microc 11-27), not
+   come back with a latched error: nn_devmath_undef launches one and returns 0 if it came back (test_devmath runs it in a child). Only
+   mcc builds have it: nvcc rejects the undefined extern at build time (-2) */
+#if defined(__mcc_glibc__)
+extern "C" __device__ int ufsm_test_nothing_defines_this(int);
+__global__ void devmath_undef_k(int *p) { p[threadIdx.x] = ufsm_test_nothing_defines_this(p[threadIdx.x]); }
+extern "C" int nn_devmath_undef(void) {
+    int *d = nullptr;
+    if (cudaMalloc(&d, 128)) return 1;
+    devmath_undef_k<<<1, 32>>>(d);
+    (void)cudaGetLastError();   /* (a caller that latches and goes on) */
+    (void)cudaDeviceSynchronize();
+    cudaFree(d);
+    return 0;
+}
+#else
+extern "C" int nn_devmath_undef(void) { return -2; }
+#endif

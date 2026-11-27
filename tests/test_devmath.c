@@ -2,13 +2,17 @@
    in double, sincospif in float, on special values, random arguments and the FFT twiddles 2 m / P of nn_aug.cu's four_tab_k (P = 64,
    640, 768, 1024). Double: at most 2 ulp (CUDA's documented bound for sincospi / sincos; mcc's are within 1), exact on multiples of
    1/4 (sign of zero included); sincospi equal to sinpi / cospi bit for bit; float: at most 2 ulp. Until mcc e0e23d0 the launch itself
-   failed (no double sinpi / cospi in the device library). */
+   failed (no double sinpi / cospi in the device library), and the error was only latched, so the caller went on with garbage: first, in a
+   child (before this process touches CUDA), a kernel calling a device function nothing defines must stop the program at its launch. */
 #include "nn.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static const long double PI_L = 3.14159265358979323846264338327950288L;
 
@@ -46,6 +50,13 @@ int main(void) {
         const double u = (double)(st >> 11) * 0x1p-53, sg = st & 1 ? -1.0 : 1.0;
         x[n++] = (st & 6) == 0 ? sg * u * 0x1p20 : (st & 6) == 2 ? sg * u * 0x1p-20 : sg * u * 4.0;
     }
+    int undef_ok = 1;
+    { const pid_t pid = fork();
+      if (pid == 0) { const int r = nn_devmath_undef(); _exit(r == -2 ? 77 : r == 0 ? 0 : 3); }
+      int st = 0; waitpid(pid, &st, 0);
+      if (WIFEXITED(st) && WEXITSTATUS(st) == 77) printf("undefined device function: not built here (nvcc rejects it at build time)\n");
+      else if (WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT) printf("undefined device function: the launch stopped the program (ok)\n");
+      else { undef_ok = 0; printf("undefined device function: FAIL: the child %s %d instead of stopping at the launch\n", WIFEXITED(st) ? "exited" : "got signal", WIFEXITED(st) ? WEXITSTATUS(st) : WTERMSIG(st)); } }
     const int rc = nn_devmath_probe(x, n, o);
     if (rc) { printf("test_devmath: FAIL: the kernel did not run (CUDA error %d; before mcc e0e23d0: no double sinpi / cospi on the device)\n", rc); return 1; }
     int64_t w_pi = 0, w_sc = 0, w_f = 0; int bad = 0, incons = 0, nsc = 0;
@@ -78,7 +89,7 @@ int main(void) {
     }
     printf("test_devmath: %d arguments: sincospi worst %lld ulp, sincos worst %lld ulp (%d args), sincospif worst %lld ulp; %d sincospi != sinpi / cospi\n",
            n, (long long)w_pi, (long long)w_sc, nsc, (long long)w_f, incons);
-    const int fail = bad || incons;
+    const int fail = bad || incons || !undef_ok;
     printf(fail ? "test_devmath: FAIL (%d bad)\n" : "test_devmath: ok\n", bad);
     return fail;
 }

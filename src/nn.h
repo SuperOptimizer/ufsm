@@ -148,6 +148,7 @@ int nn_cluster_selftest(int n, int mode, size_t dsm, int *nbad);
 /* nn_devmath.cu: the device library's sincospi / sinpi / cospi / sincos (double) and sincospif for n arguments, 8 doubles each into out
    (tests/test_devmath.c); 0 or the CUDA error */
 int nn_devmath_probe(const double *x, int n, double *out);
+int nn_devmath_undef(void);               /* launches a kernel calling an undefined device function: 0 if it came back (it must not), -2 not built (nvcc) */
 void nn_mask24m(const float *w, float *out, int co, int ci, int taps, int mode);
 void nn_srste24m(float *g, const float *w, int co, int ci, int taps, float lambda, int mode);
 void nn_mask24x(const float *w, float *out, float r, float *aux, double *e2, int co, int ci, int taps, int mode, uint8_t *kb, int kin);   /* pruned x r into out, aux zeroed where pruned, energy {all, kept} into e2; kb: keep bytes out (kin 0) / in (kin 1) */

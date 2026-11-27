@@ -249,6 +249,20 @@ extern "C" void nn_err_post(int e, const char *file, int line, const char *what)
     pthread_mutex_unlock(&g_errp_mu);
 }
 extern "C" void nn_err_worker(int on) { g_err_worker = on; }
+/* CK / LPCK on a kernel that cannot be loaded (NN_LOAD_ERR): the launch fails every time, so latching it let a caller that reads
+   nn_check late (or never: test_gpu_aug) go on with unwritten buffers (11-27: four_tab_k's sincospi, no double sinpi in mcc's device
+   library; mcudahw now stops there itself). UFSM_CUDA_LOAD_SOFT=1 latches it as before, with a DEFAULTED line. */
+extern "C" void nn_err_load_fatal(int e, const char *file, int line, const char *what) {
+    if (ufsm_env_on("UFSM_CUDA_LOAD_SOFT")) {
+        static int said;   /* mgpu: racy-ok (one line) */
+        if (!said) { said = 1; fprintf(stderr, "DEFAULTED: UFSM_CUDA_LOAD_SOFT: a kernel that cannot be loaded (CUDA %d at %s:%d, %s) is latched, not fatal\n", e, file, line, what); }
+        return;
+    }
+    fprintf(stderr, "FATAL: CUDA error %d (%s) at %s:%d (%s): a kernel that cannot be loaded (build / toolchain error); stopping (UFSM_CUDA_LOAD_SOFT=1: latch it)\n",
+            e, cudaGetErrorString((cudaError_t)e), file, line, what);
+    fflush(stderr);
+    abort();
+}
 #define CKR(x) do { const int had_ = g_err != cudaSuccess; CK(x); if (!had_ && g_err != cudaSuccess) g_err_ra = __builtin_return_address(0); } while (0)
 extern "C" const char *nn_check_site(void) { return g_err_site; }
 /* logical devices (src/ufsm_dev.cuh, ops audit #8): set once before the GPU threads start (mgpu: process) */
