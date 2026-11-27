@@ -18,11 +18,14 @@ defaults at 30k steps, apart from the inputs 1203 lacks:
 Everything stays local: the clone and runs are in /vesuvius/ufsm/upspiral, nothing was uploaded (1203 is prize-eligible).
 
 **Hand.** Fitted on z 8800-9000, both senses.
-- Measured in the shared voxel frame with θ = atan2(y − cy, x − cx): their CW turns outward to +θ (98/98 seams) and their ACW to −θ
-  (76/77). Our -p (+1) turns to −θ (89/97 wraps at the θ cut), so **our +1 = their ACW**.
-- This contradicts reading count-field's U = W + dir θ/2π in tifxyz x / y, which suggests its native y / x is transposed.
+- Their CW turns outward to +θ (98/98 seams; θ = atan2(y − cy, x − cx), shared voxel frame), their ACW to −θ (76/77): **their CW =
+  our +1** (radius grows with θ; unroll's test_dir_convention, no transpose). Our -p wraps are +1 by construction (`ufsm wrap-w`: W = k
+  ± 0.16 along each wrap) and by dr/dθ (83/36 rows about the count-field axis). Corrected 11-26 with unroll: an earlier "our +1 = their
+  ACW" came from the radius step at our θ cut (+11 vox at ±180°), which sits in a fold where the sheets run along the ray; it measures the
+  fold, not the pitch. Slope over a whole turn is also shape-dominated on this crushed band (it reverses the seam result on upstream).
 - Their loss weakly prefers CW: mean total over steps ≥ 26000 is 201.3 ± 7.6 vs 215.9 ± 7.5 (1.4σ, driven by patch_dt and the track
-  terms). This was computed before looking at our verdict; it disagrees with our hand but is not decisive.
+  terms). This was computed before looking at our verdict; it agrees with our +1 but is not decisive (our own physical evidence for +1 on
+  1203 is weak too: DIRCOH 0.030 vs 0.012).
 
 **Geometry vs ours, z 8800-9000** (cmp/ in the upspiral dir):
 
