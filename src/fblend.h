@@ -44,7 +44,22 @@ double fb_tile_w(long long o, int h, int c, double S, double g);
    1 - their sum (floor 1e-6); w is then a weighted mean, and the winding mod 4 planes come from in[0] unless w4_d x um agrees.
    --box z,y,x,nz,ny,nx (in[0]'s cells; starts on its 128-cell shards): only that part of in[0] is written (field-paste-link
    overlays it on in[0]'s shards) */
-typedef struct { int tile; double stride[3], grid[32][3]; int conf; int paste; double feather; int box; long long b0[3], bn[3]; } fb_opts;
+/* --plane-w GROUP=w1,w2,..[:GROUP=..] (field fusion, 2026-11-27): per plane group its own input weights in place of --weights; an input of
+   weight 0 (here or in --weights) does not take part in that group (it is not read; before 11-27 a --weights 0 input still counted in the
+   material max). Groups: phase (pc ps), normal (t0..t5), sp, w, w4 (dz dy dx dq), r. E.g.
+   try9 (9.6 um) + w24 (2.4 um) on the same 19.2 um cells: --weights 1,0 --plane-w phase=0,1 takes the sheet position from w24, the rest from try9.
+   The winding mod 4 planes measure W over w4_d native voxels: inputs whose w4_d x um differs from the first contributing input's are left
+   out of w4 (DEFAULTED), and the output's w4_d is that offset in in[0]'s voxels (refused when not whole). */
+enum { FB_G_PHASE, FB_G_NORMAL, FB_G_SP, FB_G_W, FB_G_W4, FB_G_R, FB_NGRP };
+typedef struct { int tile; double stride[3], grid[32][3]; int conf; int paste; double feather; int box; long long b0[3], bn[3]; int pw_on[FB_NGRP]; float pw[FB_NGRP][32]; double snap_um; } fb_opts;
+/* --snap R (um, 2026-11-27, lead: "take the sheet count from try9, use w24 only to place each try9 sheet"): the phase of in[0] turned to
+   in[1]'s where the two sheets lie within R of each other (|dphi| / 2 pi x in[0]'s sheet spacing sp h / 8 native voxels x um <= R), else
+   in[0]'s unchanged; in[0]'s confidence (length) kept. Never adds a wrap: far from an in[0] sheet (> R) in[1] is ignored. Cells with no
+   in[0] / in[1] phase or no spacing keep in[0]. r_vox: R in in[0]'s native voxels, h its cell size. */
+void fb_phase_snap(const uint8_t *pca, const uint8_t *psa, const uint8_t *pcb, const uint8_t *psb, const uint8_t *sp, int h, double r_vox, size_t ncell,
+                   uint8_t *opc, uint8_t *ops);
+int fb_plane_group(const char *plane);   /* the FB_G_* group of a plane name, -1 none (passed-through planes) */
+int fb_group_id(const char *name);       /* "phase" "normal" "sp" "w" "w4" "r" -> FB_G_*, -1 unknown */
 
 /* blend the field directories in[0..n) (same cells: shape, h x um and origin x um equal; raw or zarr, with zarr_offset / raw_offset
    crops) into out (zarr arrays when in[0] is zarr, else raw), with fields.json from in[0] (format, recto, w4_d and a "blend" record
