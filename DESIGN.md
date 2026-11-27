@@ -780,6 +780,96 @@ Per-z distance from the reference, mm (median / p90 / max; CPU, 6 threads, 1-3 m
   - Their PTX differs from the pin in 117 of the 132 units (every lp_*, most nn_*).
   - 285d308 itself has been in the pin since before 01873d0 (an ancestor). Only the note asking for its review is outside.
 
+## Model disagreement as a labelling query: `ufsm field-disagree`, checked against the GT; a labelling worklist (2026-11-27, branch disagree-20261127, disagree)
+
+Idea (lead): human sheet labels are scarce, and we have several winding models. Label where they disagree (query by committee;
+/vesuvius/ufsm/research/active.md idea 2).
+
+**Tool.** `ufsm field-disagree OUT FIELDS1 FIELDS2 ..` (src/fielddis.c). The first set is the grid; the others are sampled at its cell centres in physical um (any level or --fit-h: try9 9.6 um, w24 2.4 um). Per cell:
+- pos: the largest pairwise circular phase difference (sheet position, turns).
+- cnt: each model's unwrapped phase change along the reference normal over ±100 um, on the stretch where every model is valid (the wrap count along the normal).
+- w4: winding mod 4 from the dz / dy / dx planes. Different baselines (try9 32 x 9.6 = 307 um, w24 32 x 2.4 = 77 um) are compared mod 4 over the longer one, with the shorter set's planes chained 4 times along the axis. Scaling the gradient instead would multiply a 1-turn error into 4, which is invisible mod 4 (test_fielddis catches it).
+- dis = max(pos / 0.25, cnt / 0.5, w4 / 0.5) over `--metrics`, so dis >= 128 means some metric is past its threshold.
+
+Outputs: zarr arrays dis / pos / cnt / w4 / flag. `regions.tsv` lists `--region` boxes (frame voxels of `--frame-um`, on a grid anchored at 0), ranked by score = dis share x (1 - labelled share) x (0.5 + 0.5 min(1, labelled share of the 26 neighbours / 0.1)). The labelled shares come from a GT phase raster (`--labelled`).
+
+`--gt ORACLE` checks the flags against oracle fields (fields-oracle --fill none). A model is wrong at a cell if |phase - GT| > 0.25 turn or its count differs from the GT's on the same ray by >= 0.5. w4 is checked against the GT phase unwrapped along each axis over the longest baseline (all three axes or none).
+
+test_fielddis (CPU, 9.6 / 2.4 um synthetic sheets) checks:
+- agreement after the resolution mapping;
+- a half-turn shift flags pos only in its quarter, precision and recall > 0.95 against the GT;
+- denser sheets flag cnt;
+- a 1-turn w4 error in a one-baseline slab is flagged at the same baseline and when chained;
+- the command's arrays, and that the shifted regions rank first.
+
+**GT.** The 11-14 phase rasters had been deleted; gtphase.sh rebuilt them on the CPU (~40 s a box):
+- `phase-raster`, pair rule, gs 4, radius 160;
+- 1667 from codes 4.798, Paris 4 from q-9p6 (--codes-grid 1).
+
+Fields: the kept wbench fields bl-t9 (try9) and w24-2000 (w24 snap 2000, DLV -2) on the 20 boxes both cover (16 1667, HOLD, PH1-3), 19.2 um cells.
+
+**Cell level, try9 vs w24** (140 M cells with valid phase and GT). Base: some model wrong 15.7 %; try9 6.3 %, w24 13.8 %, both 4.4 %.
+
+| flag | flagged | precision (someone wrong) | recall | lift |
+|---|---|---|---|---|
+| pos > 0.25 turn | 6.6 % | 0.793 | 0.334 | 5.1 |
+| cnt >= 0.5 turn | 2.8 % | 0.742 | 0.134 | 4.7 |
+| w4 >= 0.5 turn | 94.4 % | 0.157 | 0.943 | 1.0 |
+| dis (pos + cnt) | 8.2 % | 0.752 | 0.391 | 4.8 |
+
+- 1667 vs Paris 4, pos: precision 0.80 / 0.76, recall 0.36 / 0.18. PH1-3 are bad for both nets (both wrong on 9.1 % of 19.6 %), and disagreement cannot see an error both share.
+- w4 is noise for w24. Its dz / dy / dx are mostly ~0 (UFSM_FDIS_DEBUG raw values), and it is off from the GT phase on 97 % of the scored cells (try9 33 %, part of which is the proxy: 19.2 um phase unwrapped over 307 um). The worklist uses pos + cnt.
+
+**Region and box level.** 512^3 level-0 regions with GT on >= 20 % of their cells (926), dis share of the material cells vs the GT wrong share:
+- Spearman 0.56;
+- wrong share 0.227 in the top quarter by dis vs 0.094 in the bottom quarter.
+
+Per box (16 1667 boxes), Spearman of the dis share against 1 - wbench ids is 0.65 for w24 and 0.48 for try9. C10, the worst w24 box (ids 0.29), has the highest dis share.
+
+**Other committees** (stride 2):
+
+| committee | dis precision | recall | both / all wrong | region Spearman |
+|---|---|---|---|---|
+| try9 vs wz896 (both 9.6 um, pos) | 0.84 | 0.10 | 7.8 % of 14.3 % | 0.04 |
+| try9 + w24 + wz896 (pos + cnt) | 0.66 | 0.48 | 3.1 % of 16.2 % | 0.59 |
+
+Two 9.6 um nets with the same data share most of their errors. Disagreement is precise but finds only a tenth of the errors, and it does not rank regions. The 2.4 um net makes the committee useful: its errors are different. try9 vs wz on w4: precision 0.81 (lift 1.7), so w4 can carry signal between same-baseline nets.
+
+**Against a random choice at equal labelled volume** (lead, nnActive 2025; randbase.awk). Pick the top K % of the GT regions by dis share and count the GT-wrong cells found per region cell, against the mean over all regions (a uniform random pick of as many equal-volume regions):
+
+| committee | top 5 % | top 10 % | top 25 % | top 50 % |
+|---|---|---|---|---|
+| try9 vs w24 (pos + cnt) | 1.53x | 1.54x | 1.39x | 1.23x |
+| try9 + w24 + wz896 | 1.55x | 1.56x | 1.43x | 1.27x |
+| try9 vs wz896 | 1.29x | 1.21x | 1.08x | 1.04x |
+
+So the region-level gain is real but modest: about 1.5x random in the top tenth, against a cell-level lift of 5. Most wrong cells are spread through every region.
+
+**What disagreement cannot find** (GT-wrong cells where every model is wrong, as a share of all GT-wrong cells):
+
+| committee | share |
+|---|---|
+| try9 vs w24 | 28 % (4.4 of 15.7 %) |
+| try9 + w24 + wz896 | 19 % (3.1 of 16.2 %) |
+| try9 vs wz896 | 55 % (7.8 of 14.3 %) |
+
+The nets share training data. A random share of the labelling budget (e.g. 1 region in 4) keeps those shared errors reachable and gives the unbiased check.
+
+**Labelling format** (research/active.md idea 1, Gotkowski et al. 2025, arXiv 2403.12834): sparse traces trained with a partial-label loss (the loss only on annotated voxels) match dense labels in 3-D segmentation. So a worklist region needs a few traced sheets with their winding, not a dense label. Our on-the-fly labels from meshes already train only where the pair rule knows the phase.
+
+**Worklist** (/vesuvius/ufsm/disagree/worklist.tsv).
+- Candidate boxes (pick.awk): 2048^3 level-0 boxes richest in unlabelled tiles next to GT tiles (unrollperf/w11 tiles-*.txt).
+- Paris 4's frontier boxes were air: its GT covers its papyrus. Its boxes are therefore picked at gaps between GT tiles along an axis (pick2.awk GAP=3).
+- try9 and w24 were predicted on card 1 in ~25 min (wbench production arguments). GT phase around the boxes for lab / near.
+- Rows kept: no GT tile, labelled share <= 0.02, material >= 0.3. Each row is a 512^3 box in the native zarr frame of the scan's 2.4 um volume.
+- Result: 474 regions, all on 1667 (32 candidate boxes; 15 with material).
+  - Top 50: dis on 16.4 % of the material cells (material 0.89), from 11 boxes. All 474: 8.6 %.
+  - By the eval, about 0.75 of the flagged cells are cells where some model is wrong.
+- Paris 4 gives no rows. Its gap boxes are mostly air or masked: the 31 regions with material >= 0.3 are labelled (lab 0.6-0.9). No labels were made.
+- Caveats: the GT check is at 19.2 um cells. try9 and w24 share 4.4 % of the errors (28 % of try9's), and the worklist cannot point at those.
+
+Scripts and rows: /vesuvius/ufsm/disagree (gtphase.sh, eval.sh, summ.awk, regsumm.awk, pick*.awk, candpred*.sh, p4g.sh, worklist.sh; ev/*/eval.tsv).
+
 ## Two-level pair rule for the 2.4 um labels (option 3) and the w24 trainer memory fixes (2026-11-27, branch opt3-20261127, unrollperf)
 
 **Pair rule.** At rmax 160 the level-0 rule needs a 162-voxel halo: a 3072 MB tile (edge 588) keeps only a 264^3 interior.
