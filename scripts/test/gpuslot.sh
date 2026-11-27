@@ -112,6 +112,12 @@ drain)
     # (BUSY / NOGPU / slot timeout: stays queued; a pass, a failure or a bad selection leave. rc 3 with nothing BUSY / NOGPU / TIMEOUT is
     #  only NEED2 (2-GPU tests a one-card slot cannot run): done too, else it reran every round, laminae / 5f2371c8 x3 on 11-26)
     case $rc in 0|1|2) ;; 3) [[ "$sum" =~ BUSY|NOGPU|TIMEOUT|no\ results ]] && qline >> "$Q.left";; *) qline >> "$Q.left";; esac
+    # unrun 2-GPU tests are a gap, not a pass (lead 11-27): ROOT/need2.txt keeps "OPEN date ticket ref sha tests"; scripts/test/need2.sh runs
+    # them on a later master when both cards are free and marks the lines CLOSED
+    if [ "$rc" = 3 ] && ! [[ "$sum" =~ BUSY|NOGPU|TIMEOUT|no\ results ]]; then
+      n2=$(awk -F'\t' '$2 == "NEED2" {printf "%s%s", s, $1; s = ","}' "$O/results.tsv" 2> /dev/null)
+      [ -n "$n2" ] && printf 'OPEN %s %s %s %s %s\n' "$(date '+%m-%d %H:%M')" "$T" "$REF" "$SHA" "$n2" >> "$ROOT/need2.txt"
+    fi
   done < "$Q"
   mv -f "$Q.left" "$Q"
   ;;
