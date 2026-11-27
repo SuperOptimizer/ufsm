@@ -27,6 +27,7 @@ t=$(printf '%s\n' "2026-11-18 03:20:05 rectosp start" "2026-11-18 03:20:11 recto
 ck "podq2 stage table row${t:+ ($t)}" '[ "$t" = "$(printf "rectosp\t2026-11-18 03:20:05\t2026-11-18 03:20:11\t6\t32\t5.6")" ]'
 ck "per-wrap reader3 maps are not CT-gated (unfilled per-wrap CT, 11-18)" 'grep -q "R3GATE=\${R3PWGATE:-0} R3PRE=\$O/ink/r3/up bash \$H/r3ink.sh" scripts/unroll/unroll.sh'
 ck "unroll slab overlap defaults to 8 (SLABOV A/B 11-18)" 'grep -q "I=\${SLABI:-64}; OV=\${SLABOV:-8}" scripts/unroll/unroll.sh'
+ck "unroll's predict ink pass defaults to --seamless 2 (halo / seamless A/B 11-27), INKSEAM=0 the feather" 'grep -q "\[ \"\${INKSEAM:-2}\" = 0 \] && seam=\"--feather \${INKF:-32}\" || seam=\"--seamless \${INKSEAM:-2}\"" scripts/unroll/unroll.sh && grep -q "\$seam --full-grid 1 --resume 1" scripts/unroll/unroll.sh'
 UR=scripts/unroll/unroll.sh; ln_() { grep -n "$1" $UR | head -1 | cut -d: -f1; }
 ck "merge-flag runs in the background after rectosp, before the ref (11-18: off the critical path)" '[ -n "$(ln_ "^mfbg ")" ] && [ "$(ln_ "^mfbg ")" -gt "$(ln_ "F=\$O/fields/rsp")" ] && [ "$(ln_ "^mfbg ")" -lt "$(ln_ "stage ref ref")" ] && grep -q "( stage mflag mflag || " $UR'
 ck "no serial merge-flag in check" '! awk "/^check\(\) \{/,/^}\$/" $UR | grep -q "merge-flag \$F"'

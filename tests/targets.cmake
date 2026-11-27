@@ -430,5 +430,5 @@ ufsm_exe(s2b_replay tests/s2b_replay.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_widen SUITE tests/test_widen.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_sampbias SUITE tests/test_sampbias.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush
          scrollaug cover json store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb
-         embz LIBS LDLIBS)
+         embz hardmap optcheck LIBS LDLIBS)
 ufsm_exe(test_occ_cache SUITE tests/test_occ_cache.c OBJS occcache dcache zarr3 store z3w json LIBS LDLIBS)
