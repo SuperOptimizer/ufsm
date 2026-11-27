@@ -6,6 +6,34 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Predict at WIN 1152 / 1280 on 16 GB: the per-chunk head under the fused fit kernel, one head buffer, the input in the net's scratch (2026-11-27, branch vram-20261127, vramperf)
+
+w24 (native 2.4 um, latent grid --lat 4, lat_guide 64, 160 head outputs) context test: WIN 1152 asked one 15.29 GB cudaMalloc. That was the
+whole window's fp32 cell logits (160 x 288^3 x 4 B). wbench's DLV -2 sets --fit-h 8, so predict took the fused fit kernel (nn_fit_accum_lat),
+and the per-chunk head (unet_head_fwd_z32, 11-17) was only wired into the plane path.
+
+| change | device GB at WIN 1152 | numbers |
+|---|---|---|
+| chunk head under the fused kernel: `nn_fit_accum_lat_planes(q0, qd, stride)` makes it read the held cell planes | 15.29 -> 2 x 1.38 | the head's bits (see below) |
+| one chunk-head buffer; the held overlap moves down plane by plane, ascending, stream-ordered | -1.38 | byte-identical |
+| the 32-channel cell input x2 in the net's a1 scratch (unet_input_scratch; only the input conversion reads it) | -1.53 | byte-identical |
+| next-window CT prefetch allocated at window 2, only with w3 + 0.5 GB free (else a DEFAULTED line, plain uploads) | -1.53 | byte-identical |
+| chunk head + winding-pair planes allocated before the first forward; `nn_ws_keep_free` (UFSM_PRED_WS_KEEP_MB, default 1024): the fp4 / s2 prenorm copies stop growing at 1 GB free | 1280 ran out after window 1 without it (the copy had taken 2.37 GB, 0 MB left) | smaller prenorm slabs: same bits |
+
+What remains at 1152: the net's build 8.8 GB (two level-0 tensors of 3.25 GB), CT window + its fstem copy (ctcp) 1.53 each, the chunk head 1.38,
+FiLM 0.42, prenorm ~1.1, mask 0.19. Free after window 1: 1.15 GB at 1152, 1.14 at 1280 (the 1280 build holds one 4.46 GB level-0 tensor).
+
+Gate (card 1, the 2000-step snapshot, 1667 level 0, a 1024^3 box at the C10 corner):
+- WIN 640 with UFSM_HEAD_TC_R=0 (the FFMA head, bit-equal to the whole-window head): the 13 field arrays are byte-identical to master (diff -r).
+- With the default TC head the fields differ slightly, as the plane path's have since the 11-17 head change: the first window's fp16 logits
+  are ~1 ulp off (max 0.006) at ~60 % of the voxels; pc mean 104.56 vs 104.59, Pearson 1.0000. Before this change, fit-h 8 ran the whole-window
+  FFMA head, so DLV -2 fields move by that much.
+- test_fit_lat: the held-planes case (planes [2, 24) at a padded channel stride) matches the whole-window kernel bit for bit at h 8 / 4 / 2,
+  with and without the stem and the sub-cell term.
+
+Time, 1024 x 2048^2 box, window seconds: master 640 18 s; branch 640 17, 1152 20, 1280 26. The box is small: at 1152 / 1280 the 4 windows
+mostly compute halo.
+
 ## Wrap-count (topology) loss `--topo-lambda` and the phase-near component filter (2026-11-27, branch topoloss-20261127, topoloss)
 
 **Why.** w24 puts confident extra sheets into packed 1667 boxes: at phase-near conf > 0.6, C10 pred → GT is 19.8 um vs 4.8 for try9, with

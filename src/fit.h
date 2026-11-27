@@ -282,6 +282,8 @@ int nn_fit_accum_lat_w4p(const void *lg, int lh16, int d, int h, int w, int sbas
                          const uint32_t *bits, float mean, float isd, int hz, int halo, int tz, int ty, int tx, const int box[3], int fh, const int F[3],
                          int ch_recto, int ch_phase, int ch_normal, int ch_density, float dscale, int dcode, float *acc, int ch_w4, int dd, float *acc4,
                          void *wl, int wz0, int wnz);
+void nn_fit_accum_lat_planes(int q0, int qd, size_t cstride);   /* the next calls: lg holds only cell planes [q0, q0 + qd) of the window, channel stride cstride
+                                                                  cells (predict's per-chunk head, unet_head_fwd_z32); qd 0: the whole window [c][d][h][w] */
 void nn_fit_accum_lat_debug(float *planes);   /* (tests: the next calls also write their region-0 logits, [channels][D H W] fp32; null: off) */
 /* W (or U = W + dir theta / 2 pi when with_theta) on a grid: row a at box-local native z rows[a].z, voxel (b, c) at y0 + (b + 0.5)
    step, x0 + (c + 0.5) step; per row model a (z - za) blended with model b (z - zb) by t: (1 - t) W_a + t W_b. ms: device array of
