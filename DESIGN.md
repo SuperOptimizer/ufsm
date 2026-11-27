@@ -6,6 +6,58 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## q2 CT shell for coarse-scan ink: built from S3 around the inked surfaces, reader3 +0.028 on clean 1447 (2026-11-27, branch ctshell-20261127, inkeval)
+
+Lead decision after the lossless addendum (per-scroll ink eval section): the unroll's ink stage on a coarse scan builds a q2 copy of
+level 0 around the surfaces it will ink, from the S3 original, and reads ink from it. Pooled-level reads (2.4 um scans at L2) are left
+alone, because the mirror's L2 is already q2.
+
+**How it works:**
+- `ink-ext --shell-list FILE` loads no net and needs no GPU. It writes the 128^3 chunks every `--surface` render reads (render_keys, the
+  renderer's own set) as one box per 1024^3 shard, under a header `# level L shard 1024`.
+- `--shell-prev OLD` merges an existing shell's boxes. Shards whose box grows are listed in FILE.redo: their shard file must go before
+  latvol rewrites it.
+- `latvol --volcomp 2 --boxes FILE --resume 1` encodes the shell from S3. latvol now refuses more than 4096 boxes; before, it dropped the
+  rest silently.
+- `ink-ext --ct-shell ROOT` reads ROOT/KEY/L for the chunks inside ROOT/KEY/shell.boxes and the main store for the rest, and the
+  prefetcher skips the shell's chunks. At the end it prints the counts, plus `DEFAULTED: ink-ext: N of M level-L CT chunks outside the
+  shell` when N > 0. An unusable shell (no shell.boxes, wrong shape or chunking) prints DEFAULTED and every chunk comes from the main store.
+- unroll.sh `r3pre` calls `ctshell` first. The shell lives at `$O/ink/ctshell`, under the unroll dir (/vesuvius or the NAS).
+  - Default CTSHELL=auto, which means on for UM >= 7, i.e. reader3 reads level 0.
+  - It is shared by the run's r3pre calls under `flock $SHD.lock`: exclusive while it grows, shared while ink-ext reads it.
+  - Any failure (list, group json, latvol, lock wait SHELLWAIT 7200 s) logs `DEFAULTED: ctshell: ... ink from the q8 store` and the
+    stage runs on q8.
+- `--render-only` no longer needs a GPU or weights either.
+- Test: test_ink_shell (CPU, fast tier). It uses a two-shard (z) volume with main 100 and shell 200 and checks:
+  - the per-shard boxes, the .redo list and the box-per-shard rule;
+  - rows inside the shell read 200 and rows outside read 100, with the DEFAULTED count;
+  - a full shell reads all 200 with no DEFAULTED;
+  - a missing shell gives DEFAULTED and all 100.
+- Bug caught on real data: the first grouping key overflowed (ckey << 22 lost the z shard), so boxes spanned z shards and the reader
+  refused them. The test volume now spans z shards.
+
+**Measured** (1447 w058 + w060, 8.64 um, the clean benchmark's segments, 2 x 22 cm², desk, S3 over the internet, 6 threads):
+
+| step | chunks read by ink | encoded (shard boxes) | shell | time |
+|---|---|---|---|---|
+| w058 alone | 3590 (7.5 Gvox) | 51 boxes, 16.7 Gvox | 1.43 GB | 236 s (S3 read 226 s, ~74 Mvox/s) |
+| + w060 (`--shell-prev`, 28 shards rewritten) | 4110 (8.6 Gvox) | 52 boxes, 18.5 Gvox | 1.58 GB | 157 s |
+| list step | | | | 0.1-0.2 s |
+| ink read through the shell | 7280 chunks from the shell, 0 from q8 | | | |
+
+- **Ink (paired by crop, 28 clean 1447 crops; reader3 1 view, no context, same binary):** q8 .7637, q2 shell .7912, **+.0275 ± .0069
+  (24/28 up)**. That is the lossless gain of the addendum (+.027 E2D2, +.035 reader3 ctx-m8), so q2 suffices on 1447 too.
+- **Per-scan cost of a full unroll.** A whole-scroll unroll's wraps fill the papyrus, so its shell tends to the whole level 0 at q2:
+  - size about 2.8x the q8 L0 (inkeval/llsize.out): 1447 ~29 GB, 0139 ~24 GB, 0841 ~25 GB, 1203 ~22 GB, 0490B ~15 GB, 1451 ~11 GB,
+    0009B ~4 GB, 0172 ~71 GB; all 31 coarse scans ~0.73 TB;
+  - time, upper bound at the measured 74 Mvox/s over the shard boxes (air included): 1447 ~6.4 h, 0172 ~4.8 h, 0139 ~3.5 h, 0490B
+    ~2.8 h, 0009B ~2.2 h. It runs once per run; later r3pre calls only add new shards.
+  - A segment-scale ink pass costs ~0.07 GB and ~11 s per cm² (w058).
+- **Open:** shard boxes encode ~2.2x the chunks ink reads (bounding box per 1024^3 shard). Reading box by box in latvol (or 512^3 shards)
+  would cut the segment-scale time. Full-scan q2 mirrors only on request.
+
+Files: /vesuvius/ufsm/inkeval/{shellmeas.sh, shellmeas.out, shellab.sh, shellab.out, shab/rows.tsv}.
+
 ## 1667 comparison unrolls: robust (L1) count-field +0.010 GT ids, made the unroll default; fz-phbm fusion −0.033 (2026-11-27, unroll)
 
 Question (lead, for the user): what do the new ideas change in a real unroll, scored on GT? Same region and downstream steps for each
